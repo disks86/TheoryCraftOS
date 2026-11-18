@@ -215,9 +215,10 @@ const char* pramin_init(INvRegisters& r, const Chip& chip, uint32_t* saved_windo
 
 // nvkm_pci_rom_shadow: bit 0 of PCI config 0x50 (through BAR0's mirror of the config space) maps the ROM shadow over PROM; clear it to see
 // the ROM itself.
-void rom_shadow(INvRegisters& r, const Chip& chip, bool shadow) {
+// Returns whether the shadow was on before, so that prom_fini can put it back as the firmware left it (nouveau switches it on unconditionally).
+bool rom_shadow(INvRegisters& r, const Chip& chip, bool shadow) {
   const uint32_t reg = (chip.card_type < 0x40 ? NvBiosShadow::kPciMirrorNv04 : NvBiosShadow::kPciMirrorNv40) + NvBiosShadow::kPciRomShadow;
-  r.mask(reg, 1, shadow ? 1 : 0);
+  return (r.mask(reg, 1, shadow ? 1 : 0) & 1) != 0;
 }
 
 // What the expansion ROM BAR gives: the window, switched on (pci_enable_rom + pci_map_rom). False and a reason if it cannot be.
@@ -259,10 +260,10 @@ Score try_source(BiosSource source, const NvBiosSources& s, ByteBuffer& data) {
     case BiosSource::Prom: {
       if (!s.registers) { none.reason = "no BAR0"; return none; }
       if (s.chip.card_type == 0x40 && s.chip.chipset >= 0x4c) { none.reason = "the NV4x IGPs have no PROM"; return none; }
-      rom_shadow(*s.registers, s.chip, false);
+      const bool was_shadowed = rom_shadow(*s.registers, s.chip, false);
       Bar0Reader reader(*s.registers, NvBiosShadow::kPromBase);
       const Score score = score_chain(reader, data, SourceTraits{false, false}, 0);
-      rom_shadow(*s.registers, s.chip, true);                      // prom_fini
+      (void)rom_shadow(*s.registers, s.chip, was_shadowed);        // prom_fini: as the firmware left it
       return score;
     }
     case BiosSource::AcpiFast:

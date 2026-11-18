@@ -47,6 +47,7 @@ bool NvidiaGpu::initialize() {
     if (n + 1 < sizeof name_) name_[n++] = ')';
     name_[n] = 0;
     if (native_->vram_bytes()) set_video_memory_total(native_->vram_bytes());
+    order_connectors();
   }
   engage();
   return true;
@@ -91,5 +92,54 @@ void NvidiaGpu::shutdown() {
 }
 
 int32_t NvidiaGpu::temperature_millicelsius() { return native_ ? native_->temperature_millicelsius() : -1; }
+
+// ------------------------------------------------------------------ the monitors
+
+
+bool NvidiaGpu::use_native_connectors() const {
+  if (!native_ || native_->connector_count() == 0) return false;
+  for (uint32_t i = 0; i < native_->connector_count(); ++i)
+    if (native_->connector(i)->edid_bytes) return true;
+  return false;                                         // (no EDID came over the GPU's own buses: the firmware's view is the better one)
+}
+
+void NvidiaGpu::order_connectors() {
+  ordered_ = 0;
+  if (!native_ || native_->connector_count() == 0) return;
+  uint8_t firmware_edid[nv::NvidiaNative::kMaxEdid];
+  const uint32_t firmware_bytes = UefiGopGpu::read_edid(0, ByteView(firmware_edid));
+  ordered_ = nv::order_connectors(native_->connectors(), ConstByteView(firmware_edid).first(firmware_bytes), ArrayView<uint8_t>(order_));
+}
+
+uint32_t NvidiaGpu::connector_count() const { return use_native_connectors() ? ordered_ : UefiGopGpu::connector_count(); }
+
+bool NvidiaGpu::connector_info(uint32_t connector, ConnectorInfo* out) const {
+  if (!use_native_connectors()) return UefiGopGpu::connector_info(connector, out);
+  if (connector >= ordered_ || !out) return false;
+  const nv::NvidiaNative::Connector* c = native_->connector(order_[connector]);
+  *out = ConnectorInfo();
+  out->connected = c->connected;
+  out->type = nv::connector_type_for_dcb(c->dcb_type);
+  uint32_t same = 1;                                    // how many of that kind came before
+  for (uint32_t i = 0; i < connector; ++i)
+    if (nv::connector_type_for_dcb(native_->connector(order_[i])->dcb_type) == out->type) ++same;
+  nv::connector_label(out->type, same, ArrayView<char>(out->name));
+  return true;
+}
+
+uint32_t NvidiaGpu::read_edid(uint32_t connector, ByteView out) {
+  if (!use_native_connectors()) return UefiGopGpu::read_edid(connector, out);
+  if (connector >= ordered_) return 0;
+  const nv::NvidiaNative::Connector* c = native_->connector(order_[connector]);
+  const ConstByteView edid = ConstByteView(c->edid).first(c->edid_bytes).at_most(out.size());
+  out.first(edid.size()).copy_from(edid);
+  return static_cast<uint32_t>(edid.size());
+}
+
+bool NvidiaGpu::refresh_connectors() {
+  if (!native_ || !native_->refresh_connectors()) return false;
+  order_connectors();
+  return true;
+}
 
 }  // namespace hardware

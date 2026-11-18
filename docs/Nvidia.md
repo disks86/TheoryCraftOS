@@ -27,11 +27,20 @@ What a chip needs is flagged in `Chip`: `needs_gsp` (Ampere and later), `display
 
 `NvidiaGpu` (the boot display's driver for vendor 0x10DE) holds an `nv::NvidiaNative` (`NVIDIA/NvidiaNative.*`), which puts the Nvkm parts together.
 
-**Always (read-only):**
+**Always:**
 - BAR0 mapped, the chip identified from `NV_PMC_BOOT_0`/`BOOT_42`. This covers every generation, so an older card or one missing from the device-ID table gets a real name: "NVIDIA GK104 (Kepler)".
 - The VRAM size read (`probe_vram`), shown as the GPU's memory in the Computer Manager.
-- The temperature sensor (`NvThermMonitor`), shown as the GPU temperature.
-- Nothing is written, except the sensor set-up nouveau does on G84-era chips.
+- **The video BIOS read and parsed** (`NvBiosShadow::fetch`, `parse_board`): PRAMIN, PROM, or the legacy shadow at 0xC0000.
+  - The PRAMIN window (0x1700) and the ROM shadow bit (0x88050) are put back exactly as the firmware left them. Nouveau switches the shadow on unconditionally; this driver restores the old value.
+  - The expansion ROM BAR is not tried, because switching it on is a write to the function's configuration space, which the GPU context does not give.
+  - Without an image there are no board tables and no connectors; the rest works.
+- The temperature sensor (`NvThermMonitor`, shown as the GPU temperature), now with the board's GPIO table, so the fan's tachometer line is known.
+- **The connectors and their monitors' EDID.** The board's connector table is listed with each connector's EDID, read over its own DDC bus or DisplayPort AUX channel (`read_connector_edid`; DP over AUX first, then DDC for DP++).
+  - EDIDs are read at start, and again only when a connector's hot-plug GPIO changes (`refresh_connectors()`), so the monitor layer's periodic refresh costs a few GPIO reads.
+  - `NvidiaGpu` lists the connectors as the monitor source when at least one EDID came over the GPU's own buses. The connector whose EDID matches the firmware's comes first (the display the firmware shows), then the other connected ones, then the rest. Names are "DP-1", "HDMI-1", "DVI-1", "eDP-1"...
+  - The screen is still the firmware's one display, so the mode calls go to it whatever connector they name.
+  - Without a GPU-side EDID the firmware's single connector stays, as before.
+- Writes in this part: the two registers above, put back, and the I2C/AUX/pad registers that an EDID read drives (as nouveau does when it probes connectors).
 - A GPU that reads all ones (powered down) or a chip nobody knows is left alone.
 
 **With `-DTCOS_NVIDIA_NATIVE=ON` (off by default):** `NvidiaGpu` takes the display over (`NvNativeDisplay`, Tesla to Turing).
@@ -41,14 +50,17 @@ What a chip needs is flagged in `Chip`: `needs_gsp` (Ampere and later), `display
 - Mode changes and shutdown give the screen back to the firmware first, as AmdGpu does.
 
 **Not wired in yet:**
-- the VBIOS (`NvBiosShadow`/`NvBios`), so the board tables, fan tachometer GPIO and DP drive levels are not used;
-- EDID over the GPU's own I2C/AUX (the monitor layer still takes the firmware's EDID);
+- the VBIOS's DP drive-level table (BIT 'd'), so mode setting uses placeholder drive levels;
 - mode setting beyond the firmware's modes;
 - the memory/MMU/FIFO/copy-engine stack;
 - secondary NVIDIA GPUs (a laptop's dGPU): only the boot display gets `NvidiaGpu`.
 
 `tests/run_host_tests.sh NvidiaNativeTest` covers:
-- the read-only start: chip, untouched BAR0, powered down, unknown chip, no mapper, unmappable BAR0;
+- the start: chip, BAR0 untouched without a VBIOS, powered down, unknown chip, no mapper, unmappable BAR0;
+- the VBIOS through the real fetch (a Kepler image where PROM reads it): the board's tables and three connectors, the PRAMIN window and ROM shadow put back, no image at all;
+- the connector helpers: DCB types, labels, and the order (the firmware's EDID first).
+
+The EDID transfers themselves are tested in `NvI2cTest` against its I2C/AUX models.
 - the BAR1 heap;
 - the takeover's refusals before any write: Ampere, a framebuffer outside BAR1, no room.
 
