@@ -1355,7 +1355,7 @@ if(TCOS_ARCH STREQUAL "x86_64")
       dbghelp psapi wininet winhttp wintrust netapi32 dwmapi uxtheme mswsock gdiplus msimg32 opengl32 glu32 dnsapi mpr wtsapi32 powrprof cfgmgr32 d3d9 d3d11 d3d12 dxgi dwrite shcore
       vulkan-1 avrt winspool wevtapi pdh wldap32 urlmon msi propsys hid usp10 winscard odbc32 xinput1_4 dsound dinput8 d2d1 d3dcompiler_47 lz32 oleacc oledlg credui ntdsapi samlib
       activeds normaliz sensapi authz rasapi32
-      bcryptprimitives combase mfplat mf mfreadwrite dcomp uiautomationcore dhcpcsvc esent mmdevapi ndfapi tbs winusb cryptui bthprops xaudio2_9 xaudio2_8 shfolder)
+      bcryptprimitives combase mfplat mf mfreadwrite dcomp uiautomationcore dhcpcsvc esent mmdevapi ndfapi tbs winusb cryptui bthprops xaudio2_9 xaudio2_8 shfolder msxml3 msxml6)
   # win32u.dll holds the system-call stubs of win32k (NtUser*, NtGdi*: src/Windows/win32u/services.inc).
   add_custom_command(OUTPUT ${WINDOWS_DIR}/win32u.dll
     COMMAND ${CMAKE_COMMAND} -E make_directory ${WINDOWS_DIR}
@@ -1382,6 +1382,7 @@ if(TCOS_ARCH STREQUAL "x86_64")
   set(WINDOWS_IMPORTS_mmdevapi ole32)      # (CoTaskMemAlloc for the strings, formats and property values it hands out)
   set(WINDOWS_IMPORTS_xaudio2_9 ole32)      # (CoTaskMemAlloc for the XAPOs' registration properties and formats)
   set(WINDOWS_IMPORTS_xaudio2_8 ole32)
+  set(WINDOWS_IMPORTS_msxml3 oleaut32)      # (the strings of the XML document object model are BSTRs)
   set(WINDOWS_STUB_RESULT_vulkan-1 0xFFFFFFF8u)   # (VK_ERROR_FEATURE_NOT_PRESENT for the exports that are not implemented)
   foreach(_library ${WINDOWS_STUB_LIBRARIES})
     if(DEFINED WINDOWS_STUB_RESULT_${_library})
@@ -1651,7 +1652,7 @@ if(TCOS_ARCH STREQUAL "x86_64" AND MKFS_FAT AND TCOS_HOST_CXX)
   find_program(TCOS_WOW64_CC i686-w64-mingw32-gcc)
   # (the same list, in the order of building, is LIBRARIES in scripts/build-wow64-dlls.sh)
   set(WOW64_LIBRARIES ntdll kernel32 msvcrt advapi32 win32u gdi32 user32 comctl32 version oleaut32 ole32 shlwapi shcore shell32
-      rpcrt4 secur32 bcrypt crypt32 ncrypt userenv setupapi iphlpapi psapi wininet winhttp wintrust netapi32 dwmapi uxtheme mswsock gdiplus msimg32 opengl32 glu32 dnsapi mpr wtsapi32 powrprof cfgmgr32 d3d9 d3d11 d3d12 dxgi dwrite avrt winspool wevtapi pdh winmm dsound mmdevapi xaudio2_8 xaudio2_9 imm32 dbghelp wldap32 urlmon msi propsys hid usp10 winscard odbc32 xinput1_4 dinput8 d2d1 d3dcompiler_47 lz32 oleacc oledlg credui ntdsapi samlib activeds normaliz sensapi authz rasapi32 bcryptprimitives combase mfplat mf mfreadwrite dcomp uiautomationcore dhcpcsvc esent ndfapi tbs winusb cryptui bthprops comdlg32 ws2_32 shfolder)
+      rpcrt4 secur32 bcrypt crypt32 ncrypt userenv setupapi iphlpapi psapi wininet winhttp wintrust netapi32 dwmapi uxtheme mswsock gdiplus msimg32 opengl32 glu32 dnsapi mpr wtsapi32 powrprof cfgmgr32 d3d9 d3d11 d3d12 dxgi dwrite avrt winspool wevtapi pdh winmm dsound mmdevapi xaudio2_8 xaudio2_9 imm32 dbghelp wldap32 urlmon msi propsys hid usp10 winscard odbc32 xinput1_4 dinput8 d2d1 d3dcompiler_47 lz32 oleacc oledlg credui ntdsapi samlib activeds normaliz sensapi authz rasapi32 bcryptprimitives combase mfplat mf mfreadwrite dcomp uiautomationcore dhcpcsvc esent ndfapi tbs winusb cryptui bthprops comdlg32 ws2_32 shfolder msxml3 msxml6)
   set(_wow64_outputs "")
   if(TCOS_WOW64_CC)
     set(WOW64_DIR ${CMAKE_BINARY_DIR}/windows32)

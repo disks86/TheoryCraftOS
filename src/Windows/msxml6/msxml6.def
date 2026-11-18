@@ -1,0 +1,8 @@
+LIBRARY msxml6.dll
+EXPORTS
+; msxml6.dll: MSXML 6.0. Its classes (DOMDocument60, FreeThreadedDOMDocument60) are the document of msxml3.dll (src/Windows/msxml3/msxml3.c), so the
+; library is its four exports, all msxml3.dll's.
+DllCanUnloadNow = msxml3.DllCanUnloadNow
+DllGetClassObject = msxml3.DllGetClassObject
+DllRegisterServer = msxml3.DllRegisterServer
+DllUnregisterServer = msxml3.DllUnregisterServer
