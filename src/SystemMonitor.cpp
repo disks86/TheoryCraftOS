@@ -18,6 +18,7 @@
 
 #include "SystemMonitor.hpp"
 #include "Hardware/CentralProcessingUnit/CpuTemperature.hpp"
+#include "Hardware/HardwareMonitor/SystemHardwareMonitor.hpp"
 #include "Kernel/Thread.hpp"
 #include "Kernel/UserMode.hpp"
 #include "Utility/AllocatedView.hpp"
@@ -82,7 +83,22 @@ desktop::TaskMemory SystemMonitor::memory() {
   return m;
 }
 
-int32_t SystemMonitor::cpu_temperature_millicelsius() { return hardware::cpu_temperature_millicelsius(pci_); }
+int32_t SystemMonitor::cpu_temperature_millicelsius() {
+  const int32_t own = hardware::cpu_temperature_millicelsius(pci_);
+  if (own >= 0) return own;
+  hardware::SystemHardwareMonitor* board = hardware::system_hardware_monitor();
+  if (!board) return -1;
+  const Optional<int32_t> reading = board->cpu_temperature_millicelsius();
+  return reading && *reading >= 0 ? *reading : -1;
+}
+
+int32_t SystemMonitor::fan_rpm() {
+  hardware::SystemHardwareMonitor* board = hardware::system_hardware_monitor();
+  if (!board) return -1;
+  const Optional<uint32_t> rpm = board->fan_rpm();
+  if (!rpm || *rpm > 0x7FFFFFFFu) return -1;
+  return static_cast<int32_t>(*rpm);
+}
 
 desktop::TaskGpu SystemMonitor::gpu() {
   desktop::TaskGpu g;

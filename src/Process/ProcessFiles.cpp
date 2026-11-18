@@ -16,6 +16,7 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 #include "Process/ProcessFiles.hpp"
+#include "Process/LinuxInput.hpp"
 #include "Process/UnixSockets.hpp"
 #include "Process/Objects.hpp"
 #include "FileSystem/SystemLayout.hpp"
@@ -509,6 +510,7 @@ DescriptorKind ProcessFiles::device_at(StringView virtual_path) const {
   if (virtual_path == StringView("/dev/urandom") || virtual_path == StringView("/dev/random")) return DescriptorKind::Random;
   if (virtual_path == StringView("/dev/tty")) return DescriptorKind::ConsoleOutput;
   if (virtual_path == StringView("/dev/dxg")) return DescriptorKind::Dxg;
+  if (linuxabi::input_device_exists(virtual_path)) return DescriptorKind::InputDevice;      // /dev/input/eventN, jsN (LinuxInput.hpp)
   return DescriptorKind::Closed;
 }
 

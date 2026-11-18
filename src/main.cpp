@@ -55,6 +55,9 @@
 #include "Hardware/MmioMapper.hpp"
 #include "Hardware/MidiDevice/X86MidiPortIo.hpp"
 #include "Hardware/MidiDevice/Usb/UsbMidiService.hpp"
+#include "Hardware/GameController/GameControllerService.hpp"
+#include "Hardware/GameController/WindowsGamepadService.hpp"
+#include "Hardware/LinuxGamepads.hpp"
 #include "Kernel/Paging.hpp"
 #include "CPUScheduler/Scheduler.hpp"
 #include "console.hpp"
@@ -1423,13 +1426,33 @@ static efi::Status kernel_main(efi::Handle image, efi::SystemTable* st) {
     else Entry(Level::Info, "VMware").text("the host has no tools message channel; power commands and window size are not followed");
   }
 
+  // Game controllers: Xbox 360 and Xbox One/Series pads, DualShock 4, DualSense, Switch Pro and HID joysticks on USB, in player slots (those
+  // plugged in later too). Windows programs read them through XInput (xinput1_4.dll over NtTcosGamepad); the keyboard and mouse drivers below
+  // leave them alone.
+  hardware::GameControllerService game_controllers(&usb, shared_allocator);
+  game_controllers.set_notifier([](void*, StringView text) {
+    console::debug_puts("Game controller: ");
+    console::debug_puts(text);
+    console::debug_puts("\n");
+  }, nullptr);
+  hardware::install_windows_gamepad(&game_controllers);
+  hardware::install_linux_gamepads(&game_controllers);      // /dev/input/eventN and jsN for Linux programs (src/Process/LinuxInput.hpp)
+
   // Input devices: PS/2, USB HID and virtio-input, merged into one keyboard and mouse.
   hardware::SystemInput input(pci, usb, shared_allocator, st);
+  input.set_usb_filter([](void*, hardware::IUsbHostController& host, uint32_t port) { return hardware::GameControllerService::is_game_controller(host, port); },
+                       nullptr);
 #ifdef TCOS_BLUETOOTH
   hardware::HidOverGatt bluetooth_hid(shared_allocator);      // Bluetooth keyboards and mice: a profile for the Bluetooth manager and a source of input devices for SystemInput (it outlives both)
 #endif
   input.set_vmmdev(guest.virtualbox());
   input.initialize();
+  if (!game_controllers.start()) Entry(Level::Warning, "Gamepad").text("could not start the game controller service; pads plugged in later are not seen");
+  for (uint32_t player = 0; player < hardware::GameControllerService::kMaxPlayers; ++player) {
+    hardware::gamepad::Info info;
+    if (game_controllers.info(player, &info))
+      Entry(Level::Ok, "Gamepad").text(info.name).text(" (").text(hardware::gamepad::protocol_name(info.protocol)).text("): player ").dec(player + 1);
+  }
   // The touchpad and the touchscreen of a laptop are HID devices on an I2C bus behind the chipset (ACPI PNP0C50): found through the ACPI tables, and added to the mouse.
   hardware::AcpiTables i2c_acpi_tables(st);
   hardware::SystemAcpiHost i2c_acpi_host(&pci, paging_ok ? &mmio : nullptr);

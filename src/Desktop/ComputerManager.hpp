@@ -113,6 +113,9 @@ class ISystemMonitor {
   virtual TaskMemory memory() = 0;
   // The processor's temperature in thousandths of a degree Celsius, or -1 if the machine cannot tell.
   virtual int32_t cpu_temperature_millicelsius() { return -1; }
+  // The CPU fan's speed in revolutions per minute (or the fastest fan's when the board does not say which is the CPU's), -1 if the machine
+  // cannot tell.
+  virtual int32_t fan_rpm() { return -1; }
   virtual TaskGpu gpu() { return TaskGpu(); }
   virtual TaskNpu npu() { return TaskNpu(); }
   virtual TaskBattery battery() { return TaskBattery(); }
@@ -203,6 +206,10 @@ class ComputerManager : public gui::Frame {
   gui::Label& cpu_temp_label() { return cpu_temp_row_.value; }
   gui::LevelMeter& gpu_temp_meter() { return gpu_temp_row_.meter; }
   gui::Label& gpu_temp_label() { return gpu_temp_row_.value; }
+  // The fan row; it shows only while the machine reports a fan speed.
+  gui::LevelMeter& fan_meter() { return fan_row_.meter; }
+  gui::Label& fan_label() { return fan_row_.value; }
+  bool fan_row_visible() const { return fan_row_.row.visible(); }
   // The battery row: charge level (meter) and "85% - Charging" (label).
   // The scrolling area that holds the core rows.
   gui::ScrollPanel& core_scroll() { return core_scroll_; }
@@ -320,7 +327,7 @@ class ComputerManager : public gui::Frame {
   gui::Label cpu_title_, cpu_value_, memory_title_, memory_value_, info_;
   gui::LevelMeter cpu_meter_, memory_meter_;
   gui::DataGrid grid_, process_grid_;
-  CoreRow gpu_row_, npu_row_, vram_row_, cpu_temp_row_, gpu_temp_row_, battery_row_;
+  CoreRow gpu_row_, npu_row_, vram_row_, cpu_temp_row_, gpu_temp_row_, fan_row_, battery_row_;
   List<UniquePointer<CoreRow>> core_rows_;
   Model model_;
   ProcessModel process_model_;

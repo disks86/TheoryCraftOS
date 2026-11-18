@@ -1653,6 +1653,8 @@ struct FakeMonitor final : desktop::ISystemMonitor {
   desktop::TaskNpu npu_info;
   desktop::TaskNpu npu() override { return npu_info; }
   int32_t cpu_temperature_millicelsius() override { return cpu_temp; }
+  int32_t fan = -1;
+  int32_t fan_rpm() override { return fan; }
   desktop::TaskGpu gpu() override { return gpu_info; }
 };
 
@@ -1754,6 +1756,14 @@ static void test_computer_manager() {
     CHECK(tm.gpu_label().text().equals("40%") && tm.gpu_meter().level() == 40);
     CHECK(tm.vram_label().text().equals("256.0 MB / 1.0 GB") && tm.vram_meter().level() == 25);
     CHECK(tm.gpu_temp_label().text().equals("71.0 C") && tm.gpu_temp_meter().level() == 71);
+    // The fan row: hidden while no fan speed is known, then RPM with the meter full at 3000.
+    CHECK(!tm.fan_row_visible());
+    mon.fan = 1500;
+    tm.update(1000000);
+    CHECK(tm.fan_row_visible() && tm.fan_label().text().equals("1500 RPM") && tm.fan_meter().level() == 50);
+    mon.fan = -1;
+    tm.update(1000000);
+    CHECK(!tm.fan_row_visible());
     mon.gpu_info.memory_total_bytes = 0;     // a virtual GPU: used is known, the total is not
     tm.update(1000000);
     CHECK(tm.vram_label().text().equals("256.0 MB used") && tm.vram_meter().level() == 0);

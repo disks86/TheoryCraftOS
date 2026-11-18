@@ -159,6 +159,7 @@ add_executable(BOOTX64
   src/Hardware/Mouse/Usb/UsbHidMouse.cpp
   src/Hardware/Mouse/Virtio/VirtioMouse.cpp
   src/Hardware/SystemInput.cpp
+  src/Hardware/LinuxGamepads.cpp
   src/Hardware/ImageSignalProcessor/IspMath.cpp
   src/Hardware/ImageSignalProcessor/Software/SoftwareImageSignalProcessor.cpp
   src/Hardware/ImageSignalProcessor/SystemImageSignalProcessor.cpp
@@ -575,6 +576,14 @@ add_executable(BOOTX64
   src/Hardware/Chipset/Intel/IntelPchChipset.cpp
   src/Hardware/Chipset/AMD/AmdChipsets.cpp
   src/Hardware/Chipset/AMD/AmdFchChipset.cpp
+  src/Hardware/HardwareMonitor/PortIo.cpp
+  src/Hardware/HardwareMonitor/SuperIo.cpp
+  src/Hardware/HardwareMonitor/NuvotonNct67xx.cpp
+  src/Hardware/HardwareMonitor/NuvotonNct668x.cpp
+  src/Hardware/HardwareMonitor/Ite87xx.cpp
+  src/Hardware/HardwareMonitor/FintekF718xx.cpp
+  src/Hardware/HardwareMonitor/HardwareMonitorSet.cpp
+  src/Hardware/HardwareMonitor/SystemHardwareMonitor.cpp
   src/Hardware/GraphicsProcessingUnit/AMD/AmdGpu.cpp
   src/Hardware/GraphicsProcessingUnit/AMD/AmdDcn1.cpp
   src/Hardware/GraphicsProcessingUnit/AMD/AmdScanout.cpp
@@ -790,6 +799,16 @@ add_executable(BOOTX64
   src/Hardware/MidiDevice/Usb/UsbMidiDescriptors.cpp
   src/Hardware/MidiDevice/Usb/UsbMidiDevice.cpp
   src/Hardware/MidiDevice/Usb/UsbMidiService.cpp
+  src/Hardware/GameController/GameControllerCatalog.cpp
+  src/Hardware/GameController/GameControllerService.cpp
+  src/Hardware/GameController/GamepadServiceCall.cpp
+  src/Hardware/GameController/HidGamepad.cpp
+  src/Hardware/GameController/SonyProtocol.cpp
+  src/Hardware/GameController/SwitchProtocol.cpp
+  src/Hardware/GameController/WindowsGamepadService.cpp
+  src/Hardware/GameController/XboxProtocol.cpp
+  src/Hardware/GameController/Usb/UsbGameController.cpp
+  src/Hardware/GameController/Usb/UsbXbox360Wireless.cpp
   src/Midi/LiveSynth.cpp
   src/Media/Audio/Pcm.cpp
   src/Media/Audio/Wav.cpp
@@ -843,6 +862,7 @@ add_executable(BOOTX64
   src/Process/WindowsOpenGl.cpp
   src/Process/WindowsAudio.cpp
   src/Process/WindowsCabinet.cpp
+  src/Process/WindowsGamepad.cpp
   src/Process/WindowsMemory.cpp
   src/Process/WindowsSockets.cpp
   src/Process/WindowsUnixSockets.cpp
@@ -903,6 +923,7 @@ add_executable(BOOTX64
   src/Process/LinuxAio.cpp
   src/Process/LinuxIpc.cpp
   src/Process/LinuxSignals.cpp
+  src/Process/LinuxInput.cpp
   src/Process/ProcessFiles.cpp
   src/Process/WindowsFiles.cpp
   src/Process/ProgramEnvironment.cpp

@@ -38,7 +38,10 @@ bool read_smn_locked(void* context, uint32_t address, uint32_t* value) {
 }
 }  // namespace
 
-SystemChipset::~SystemChipset() { set_amd_smn_reader(nullptr, nullptr); }
+SystemChipset::~SystemChipset() {
+  set_amd_smn_reader(nullptr, nullptr);
+  if (system_hardware_monitor() == &board_sensors_) set_system_hardware_monitor(nullptr);
+}
 
 void SystemChipset::probe(const ChipsetCpu& cpu, const IPciBus& pci, IRegisterMapper* mapper) {
   set_amd_smn_reader(nullptr, nullptr);
@@ -65,6 +68,10 @@ void SystemChipset::probe(const ChipsetCpu& cpu, const IPciBus& pci, IRegisterMa
       if (intel_.found()) active_ = &intel_;
     }
   }
+  // The Super I/O at 0x2E / 0x4E: there on desktop boards whichever chipset they have (laptops keep their sensors in the embedded controller).
+  set_system_hardware_monitor(nullptr);
+  board_sensors_.probe();
+  set_system_hardware_monitor(&board_sensors_);
   // AMD Zen: the nodes behind SMN and the Data Fabric.
   if (cpu.vendor == ChipsetVendor::Amd || amd_.found()) {
     const uint32_t nodes = amd_nodes_.with([&](AmdNodes& n) {
