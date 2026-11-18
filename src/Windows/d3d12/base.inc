@@ -180,6 +180,8 @@ struct Dev {
   int software;
   LONG removed;
   UINT null_target;        /* a 1 x 1 render target: the pass of a draw that has no target (stream output only) */
+  struct SharedShader *shared;      /* the kernel's shaders the pipelines have, each once (pso.inc) */
+  UINT shared_count, shared_capacity;
   UINT next_pixel_base;    /* TcosD3D12PipelineOptions: for the next graphics pipeline, where the pixel shader's constant buffers begin (16-byte registers) */
   UINT next_shader_kind;   /* ... and the kernel's kind of its shaders (0: DXBC / DXIL) */
 };

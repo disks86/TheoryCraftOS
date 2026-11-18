@@ -30,7 +30,7 @@ static void caps_fill(D3DCAPS9 *caps) {
   caps->DevCaps = D3DDEVCAPS_DRAWPRIMITIVES2EX | D3DDEVCAPS_DRAWPRIMTLVERTEX | D3DDEVCAPS_HWTRANSFORMANDLIGHT | D3DDEVCAPS_HWRASTERIZATION | D3DDEVCAPS_TEXTUREVIDEOMEMORY |
                   D3DDEVCAPS_TLVERTEXVIDEOMEMORY | D3DDEVCAPS_TLVERTEXSYSTEMMEMORY;
   caps->PrimitiveMiscCaps = D3DPMISCCAPS_MASKZ | D3DPMISCCAPS_CULLNONE | D3DPMISCCAPS_CULLCW | D3DPMISCCAPS_CULLCCW | D3DPMISCCAPS_COLORWRITEENABLE | D3DPMISCCAPS_BLENDOP |
-                            D3DPMISCCAPS_SEPARATEALPHABLEND;
+                            D3DPMISCCAPS_SEPARATEALPHABLEND | D3DPMISCCAPS_TSSARGTEMP | D3DPMISCCAPS_PERSTAGECONSTANT;
   caps->MaxActiveLights = FFL_LIGHTS;
   caps->VertexProcessingCaps = D3DVTXPCAPS_DIRECTIONALLIGHTS | D3DVTXPCAPS_POSITIONALLIGHTS | D3DVTXPCAPS_MATERIALSOURCE7 | D3DVTXPCAPS_LOCALVIEWER | D3DVTXPCAPS_TEXGEN | D3DVTXPCAPS_TEXGEN_SPHEREMAP;
   caps->RasterCaps = D3DPRASTERCAPS_ZTEST | D3DPRASTERCAPS_SCISSORTEST | D3DPRASTERCAPS_MIPMAPLODBIAS | D3DPRASTERCAPS_FOGVERTEX | D3DPRASTERCAPS_FOGTABLE | D3DPRASTERCAPS_FOGRANGE | D3DPRASTERCAPS_ZFOG | D3DPRASTERCAPS_WFOG;
@@ -51,9 +51,13 @@ static void caps_fill(D3DCAPS9 *caps) {
   caps->GuardBandLeft = caps->GuardBandTop = -32768.0f;
   caps->GuardBandRight = caps->GuardBandBottom = 32768.0f;
   caps->StencilCaps = 0xFF;
-  caps->FVFCaps = TEXTURE_SETS | D3DFVFCAPS_PSIZE;      /* (the sets of texture coordinates a vertex can have; two stages read them) */
+  caps->FVFCaps = TEXTURE_SETS | D3DFVFCAPS_PSIZE;      /* (the sets of texture coordinates a vertex can have) */
+  /* (every operation of the texture stages but the bump environment ones and D3DTOP_PREMODULATE: ff_stages.h) */
   caps->TextureOpCaps = D3DTEXOPCAPS_DISABLE | D3DTEXOPCAPS_SELECTARG1 | D3DTEXOPCAPS_SELECTARG2 | D3DTEXOPCAPS_MODULATE | D3DTEXOPCAPS_MODULATE2X | D3DTEXOPCAPS_MODULATE4X |
-                        D3DTEXOPCAPS_ADD;
+                        D3DTEXOPCAPS_ADD | D3DTEXOPCAPS_ADDSIGNED | D3DTEXOPCAPS_ADDSIGNED2X | D3DTEXOPCAPS_SUBTRACT | D3DTEXOPCAPS_ADDSMOOTH | D3DTEXOPCAPS_BLENDDIFFUSEALPHA |
+                        D3DTEXOPCAPS_BLENDTEXTUREALPHA | D3DTEXOPCAPS_BLENDFACTORALPHA | D3DTEXOPCAPS_BLENDTEXTUREALPHAPM | D3DTEXOPCAPS_BLENDCURRENTALPHA |
+                        D3DTEXOPCAPS_MODULATEALPHA_ADDCOLOR | D3DTEXOPCAPS_MODULATECOLOR_ADDALPHA | D3DTEXOPCAPS_MODULATEINVALPHA_ADDCOLOR |
+                        D3DTEXOPCAPS_MODULATEINVCOLOR_ADDALPHA | D3DTEXOPCAPS_DOTPRODUCT3 | D3DTEXOPCAPS_MULTIPLYADD | D3DTEXOPCAPS_LERP;
   caps->MaxTextureBlendStages = STAGES;
   caps->MaxSimultaneousTextures = STAGES;
   caps->MaxPrimitiveCount = INDEX_RING / 12;
@@ -370,6 +374,7 @@ static void dev_destroy(DxObj *o) {
   state_release(&d->state);
   targets_release(d);
   if (d->blank) { take_device_reference(d); dx_Release(OBJ(d->blank)); }
+  for (UINT i = 0; i < d->fixed_count; ++i) { take_device_reference(d); dx_Release(OBJ(d->fixed[i].shader)); }
   for (UINT i = 0; i < d->pipeline_count; ++i) if (d->pipelines[i].state) ID3D12PipelineState_Release(d->pipelines[i].state);
   if (d->vertex_ring) ID3D12Resource_Release(d->vertex_ring);
   if (d->index_ring) ID3D12Resource_Release(d->index_ring);
@@ -406,7 +411,7 @@ static HRESULT dev_start(Dev *d) {
   if (SUCCEEDED(hr)) hr = ID3D12Device_CreateCommandList(d->d12, 0, D3D12_COMMAND_LIST_TYPE_DIRECT, d->allocator, NULL, &IID_ID3D12GraphicsCommandList, (void **)&d->list);
   if (FAILED(hr)) return D3DERR_NOTAVAILABLE;
 
-  if (!root_get(d, STAGES)) return D3DERR_NOTAVAILABLE;      /* (the root signature of the fixed-function pixel shader; the others when a shader needs them) */
+  if (!root_get(d, 2)) return D3DERR_NOTAVAILABLE;      /* (the root signature of a pixel shader with one or two textures; the others when a shader needs them) */
 
   hr = make_heap(d, D3D12_DESCRIPTOR_HEAP_TYPE_RTV, RTV_SLOTS, FALSE, &d->rtv_heap);
   if (SUCCEEDED(hr)) hr = make_heap(d, D3D12_DESCRIPTOR_HEAP_TYPE_DSV, DSV_SLOTS, FALSE, &d->dsv_heap);

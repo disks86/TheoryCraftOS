@@ -92,8 +92,8 @@ static void test_object(void) {
   check(IDirect3D9_GetAdapterCount(g_d3d) == 1 && SUCCEEDED(IDirect3D9_GetAdapterIdentifier(g_d3d, 0, 0, &id)) && id.Description[0] != 0, "one adapter, with a description");
   check(SUCCEEDED(IDirect3D9_GetAdapterDisplayMode(g_d3d, 0, &mode)) && mode.Width >= 320 && mode.Height >= 200 && mode.Format == D3DFMT_X8R8G8B8, "the display mode");
   check(IDirect3D9_GetAdapterModeCount(g_d3d, 0, D3DFMT_X8R8G8B8) >= 1 && SUCCEEDED(IDirect3D9_EnumAdapterModes(g_d3d, 0, D3DFMT_X8R8G8B8, 0, &mode)), "the modes of the adapter");
-  check(SUCCEEDED(IDirect3D9_GetDeviceCaps(g_d3d, 0, D3DDEVTYPE_HAL, &caps)) && caps.MaxSimultaneousTextures == 2 && caps.MaxTextureWidth >= 2048 &&
-        caps.VertexShaderVersion == D3DVS_VERSION(3, 0) && caps.PixelShaderVersion == D3DPS_VERSION(3, 0), "the caps: two texture stages, shaders up to 3.0");
+  check(SUCCEEDED(IDirect3D9_GetDeviceCaps(g_d3d, 0, D3DDEVTYPE_HAL, &caps)) && caps.MaxSimultaneousTextures == 8 && caps.MaxTextureBlendStages == 8 && caps.MaxTextureWidth >= 2048 &&
+        caps.VertexShaderVersion == D3DVS_VERSION(3, 0) && caps.PixelShaderVersion == D3DPS_VERSION(3, 0), "the caps: eight texture stages, shaders up to 3.0");
   check(IDirect3D9_CheckDeviceFormat(g_d3d, 0, D3DDEVTYPE_HAL, D3DFMT_X8R8G8B8, 0, D3DRTYPE_TEXTURE, D3DFMT_A8R8G8B8) == D3D_OK &&
         IDirect3D9_CheckDeviceFormat(g_d3d, 0, D3DDEVTYPE_HAL, D3DFMT_X8R8G8B8, 0, D3DRTYPE_TEXTURE, D3DFMT_DXT1) == D3DERR_NOTAVAILABLE &&
         IDirect3D9_CheckDeviceFormat(g_d3d, 0, D3DDEVTYPE_HAL, D3DFMT_X8R8G8B8, D3DUSAGE_DEPTHSTENCIL, D3DRTYPE_SURFACE, D3DFMT_D24S8) == D3D_OK,
@@ -1160,6 +1160,217 @@ static void test_texture_coordinates(void) {
   IDirect3DDevice9_SetRenderState(g_device, D3DRS_CULLMODE, D3DCULL_CCW);
 }
 
+/* ---- the texture stages ------------------------------------------------------------------------------------------------------------------------------ */
+
+/* A texture of one colour. */
+static IDirect3DTexture9 *solid_texture(DWORD colour) {
+  const DWORD texels[4] = {colour, colour, colour, colour};
+  return make_texture(D3DFMT_A8R8G8B8, texels, 4);
+}
+static void stage(DWORD n, DWORD colour_op, DWORD colour1, DWORD colour2, DWORD alpha_op, DWORD alpha1, DWORD alpha2) {
+  IDirect3DDevice9_SetTextureStageState(g_device, n, D3DTSS_COLOROP, colour_op);
+  IDirect3DDevice9_SetTextureStageState(g_device, n, D3DTSS_COLORARG1, colour1);
+  IDirect3DDevice9_SetTextureStageState(g_device, n, D3DTSS_COLORARG2, colour2);
+  IDirect3DDevice9_SetTextureStageState(g_device, n, D3DTSS_ALPHAOP, alpha_op);
+  IDirect3DDevice9_SetTextureStageState(g_device, n, D3DTSS_ALPHAARG1, alpha1);
+  IDirect3DDevice9_SetTextureStageState(g_device, n, D3DTSS_ALPHAARG2, alpha2);
+}
+/* The stages as a device starts with them, and no textures. */
+static void reset_stages(void) {
+  for (DWORD n = 0; n < 8; ++n) {
+    stage(n, n == 0 ? D3DTOP_MODULATE : D3DTOP_DISABLE, D3DTA_TEXTURE, D3DTA_CURRENT, n == 0 ? D3DTOP_SELECTARG1 : D3DTOP_DISABLE, D3DTA_TEXTURE, D3DTA_CURRENT);
+    IDirect3DDevice9_SetTextureStageState(g_device, n, D3DTSS_COLORARG0, D3DTA_CURRENT);
+    IDirect3DDevice9_SetTextureStageState(g_device, n, D3DTSS_ALPHAARG0, D3DTA_CURRENT);
+    IDirect3DDevice9_SetTextureStageState(g_device, n, D3DTSS_RESULTARG, D3DTA_CURRENT);
+    IDirect3DDevice9_SetTextureStageState(g_device, n, D3DTSS_TEXCOORDINDEX, n);
+    IDirect3DDevice9_SetTexture(g_device, n, NULL);
+  }
+}
+/* The whole picture in one diffuse and one specular colour, through the stages as they are set; the pixel in its middle. */
+static DWORD staged_pixel(DWORD diffuse, DWORD specular) {
+  typedef struct { float x, y, z, rhw; DWORD diffuse, specular; float u, v; } Vertex;
+  const Vertex v[4] = {{0, 0, 0.5f, 1, diffuse, specular, 0, 0}, {64, 0, 0.5f, 1, diffuse, specular, 1, 0}, {0, 64, 0.5f, 1, diffuse, specular, 0, 1},
+                       {64, 64, 0.5f, 1, diffuse, specular, 1, 1}};
+  clear(0xFF000000);
+  IDirect3DDevice9_SetFVF(g_device, D3DFVF_XYZRHW | D3DFVF_DIFFUSE | D3DFVF_SPECULAR | D3DFVF_TEX1);
+  const HRESULT hr = IDirect3DDevice9_DrawPrimitiveUP(g_device, D3DPT_TRIANGLESTRIP, 2, v, sizeof v[0]);
+  if (FAILED(hr)) printf("d3d9test: (the draw failed: %08lx)\n", (unsigned long)hr);
+  read_back();
+  return pixel(32, 32);
+}
+static void test_stages(void) {
+  D3DCAPS9 caps;
+  IDirect3DTexture9 *grey = solid_texture(0xFF808080), *dim = solid_texture(0xFF202020), *red_one = solid_texture(0xFFFF0000), *step = solid_texture(0xFF101010);
+  IDirect3DTexture9 *green_one = solid_texture(0xFF00FF00), *white = solid_texture(0xFFFFFFFF), *bright = solid_texture(0xFFC0C0C0), *thin = solid_texture(0x40FF3000);
+  IDirect3DTexture9 *way = solid_texture(0xFFFF8080);
+  const DWORD texels[4] = {0xFFFF0000, 0xFF00FF00, 0xFF0000FF, 0xFFFFFFFF};
+  IDirect3DTexture9 *four = make_texture(D3DFMT_A8R8G8B8, texels, 4);
+  memset(&caps, 0, sizeof caps);
+  IDirect3DDevice9_GetDeviceCaps(g_device, &caps);
+  if (!grey || !dim || !red_one || !step || !green_one || !white || !bright || !thin || !way || !four) {
+    check(0, "textures for the texture stages");
+    return;
+  }
+  IDirect3DDevice9_SetRenderState(g_device, D3DRS_CULLMODE, D3DCULL_NONE);
+  check(caps.MaxTextureBlendStages == 8 && caps.MaxSimultaneousTextures == 8 && (caps.TextureOpCaps & D3DTEXOPCAPS_LERP) && (caps.TextureOpCaps & D3DTEXOPCAPS_DOTPRODUCT3) &&
+        (caps.PrimitiveMiscCaps & D3DPMISCCAPS_TSSARGTEMP), "the device says it has eight texture stages and their operations");
+
+  /* three stages, each with its texture: grey, plus a little, times red */
+  reset_stages();
+  IDirect3DDevice9_SetTexture(g_device, 0, (IDirect3DBaseTexture9 *)grey);
+  IDirect3DDevice9_SetTexture(g_device, 1, (IDirect3DBaseTexture9 *)dim);
+  IDirect3DDevice9_SetTexture(g_device, 2, (IDirect3DBaseTexture9 *)red_one);
+  stage(0, D3DTOP_SELECTARG1, D3DTA_TEXTURE, D3DTA_CURRENT, D3DTOP_SELECTARG1, D3DTA_TEXTURE, D3DTA_CURRENT);
+  stage(1, D3DTOP_ADD, D3DTA_TEXTURE, D3DTA_CURRENT, D3DTOP_SELECTARG2, D3DTA_TEXTURE, D3DTA_CURRENT);
+  stage(2, D3DTOP_MODULATE, D3DTA_TEXTURE, D3DTA_CURRENT, D3DTOP_SELECTARG2, D3DTA_TEXTURE, D3DTA_CURRENT);
+  check(near_colour(staged_pixel(0xFF000000, 0), 0xA0, 0, 0), "three texture stages, one after the other");
+  /* ... and the stage in the middle with no texture passes on what it is given */
+  IDirect3DDevice9_SetTexture(g_device, 1, NULL);
+  check(near_colour(staged_pixel(0xFF000000, 0), 0x80, 0, 0), "a stage with no texture passes on what it is given, and the next goes on");
+  /* ... and switched off, it ends the stages */
+  IDirect3DDevice9_SetTexture(g_device, 1, (IDirect3DBaseTexture9 *)dim);
+  IDirect3DDevice9_SetTextureStageState(g_device, 1, D3DTSS_COLOROP, D3DTOP_DISABLE);
+  check(near_colour(staged_pixel(0xFF000000, 0), 0x80, 0x80, 0x80), "a stage that is switched off ends the stages");
+
+  /* eight stages, each adding a sixteenth */
+  reset_stages();
+  for (DWORD n = 0; n < 8; ++n) {
+    IDirect3DDevice9_SetTexture(g_device, n, (IDirect3DBaseTexture9 *)step);
+    stage(n, D3DTOP_ADD, D3DTA_TEXTURE, D3DTA_CURRENT, D3DTOP_SELECTARG2, D3DTA_TEXTURE, D3DTA_CURRENT);
+  }
+  check(near_colour(staged_pixel(0xFF000000, 0), 0x80, 0x80, 0x80), "eight texture stages add up");
+  /* the last of them reads the set of coordinates its state names: the first set, or its own, which these vertices have not (0, 0) */
+  IDirect3DDevice9_SetTexture(g_device, 7, (IDirect3DBaseTexture9 *)four);
+  stage(7, D3DTOP_SELECTARG1, D3DTA_TEXTURE, D3DTA_CURRENT, D3DTOP_SELECTARG2, D3DTA_TEXTURE, D3DTA_CURRENT);
+  staged_pixel(0xFF000000, 0);
+  const int own = pixel(8, 8) == 0xFF0000 && pixel(56, 8) == 0xFF0000 && pixel(56, 56) == 0xFF0000;
+  IDirect3DDevice9_SetTextureStageState(g_device, 7, D3DTSS_TEXCOORDINDEX, 0);
+  staged_pixel(0xFF000000, 0);
+  check(own && four_texels(), "the eighth stage has coordinates of its own, or reads the set its state names");
+
+  /* the arguments: the texture factor, the specular colour, a stage's constant, 1 - an argument, an argument's alpha */
+  reset_stages();
+  IDirect3DDevice9_SetRenderState(g_device, D3DRS_TEXTUREFACTOR, 0x40204060);
+  stage(0, D3DTOP_SELECTARG1, D3DTA_TFACTOR, D3DTA_CURRENT, D3DTOP_SELECTARG1, D3DTA_DIFFUSE, D3DTA_CURRENT);
+  check(near_colour(staged_pixel(0xFFFFFFFF, 0), 0x20, 0x40, 0x60), "the texture factor as a stage's argument");
+  stage(0, D3DTOP_SELECTARG1, D3DTA_SPECULAR, D3DTA_CURRENT, D3DTOP_SELECTARG1, D3DTA_DIFFUSE, D3DTA_CURRENT);
+  check(near_colour(staged_pixel(0xFFFFFFFF, 0x00336699), 0x33, 0x66, 0x99), "the specular colour as a stage's argument");
+  IDirect3DDevice9_SetTextureStageState(g_device, 0, D3DTSS_CONSTANT, 0xFF102030);
+  stage(0, D3DTOP_SELECTARG1, D3DTA_CONSTANT, D3DTA_CURRENT, D3DTOP_SELECTARG1, D3DTA_DIFFUSE, D3DTA_CURRENT);
+  check((caps.PrimitiveMiscCaps & D3DPMISCCAPS_PERSTAGECONSTANT) && near_colour(staged_pixel(0xFFFFFFFF, 0), 0x10, 0x20, 0x30), "a stage's own constant as its argument");
+  IDirect3DDevice9_SetTexture(g_device, 0, (IDirect3DBaseTexture9 *)thin);
+  stage(0, D3DTOP_SELECTARG1, D3DTA_TEXTURE | D3DTA_COMPLEMENT, D3DTA_CURRENT, D3DTOP_SELECTARG1, D3DTA_DIFFUSE, D3DTA_CURRENT);
+  const int complement = near_colour(staged_pixel(0xFFFFFFFF, 0), 0x00, 0xCF, 0xFF);
+  stage(0, D3DTOP_SELECTARG1, D3DTA_TEXTURE | D3DTA_ALPHAREPLICATE, D3DTA_CURRENT, D3DTOP_SELECTARG1, D3DTA_DIFFUSE, D3DTA_CURRENT);
+  const int replicate = near_colour(staged_pixel(0xFFFFFFFF, 0), 0x40, 0x40, 0x40);
+  stage(0, D3DTOP_SELECTARG1, D3DTA_TEXTURE | D3DTA_ALPHAREPLICATE | D3DTA_COMPLEMENT, D3DTA_CURRENT, D3DTOP_SELECTARG1, D3DTA_DIFFUSE, D3DTA_CURRENT);
+  check(complement && replicate && near_colour(staged_pixel(0xFFFFFFFF, 0), 0xBF, 0xBF, 0xBF), "an argument's complement and its alpha in all components");
+
+  /* the operations: on a light grey texture (c0) and a dark grey diffuse colour (40) */
+  reset_stages();
+  IDirect3DDevice9_SetTexture(g_device, 0, (IDirect3DBaseTexture9 *)bright);
+  static const struct { DWORD op; int value; const char *what; } operations[] = {
+      {D3DTOP_MODULATE, 0x30, "modulate"}, {D3DTOP_MODULATE2X, 0x60, "modulate twice"}, {D3DTOP_MODULATE4X, 0xC1, "modulate four times"}, {D3DTOP_ADD, 0xFF, "add"},
+      {D3DTOP_ADDSIGNED, 0x80, "add signed"}, {D3DTOP_ADDSIGNED2X, 0xFF, "add signed twice"}, {D3DTOP_SUBTRACT, 0x80, "subtract"}, {D3DTOP_ADDSMOOTH, 0xD0, "add smooth"}};
+  int all = 1;
+  for (unsigned i = 0; i < sizeof operations / sizeof operations[0]; ++i) {
+    stage(0, operations[i].op, D3DTA_TEXTURE, D3DTA_DIFFUSE, D3DTOP_SELECTARG2, D3DTA_TEXTURE, D3DTA_DIFFUSE);
+    const int ok = near_colour(staged_pixel(0xFF404040, 0), operations[i].value, operations[i].value, operations[i].value);
+    if (!ok) printf("d3d9test: (the operation: %s)\n", operations[i].what);
+    all = all && ok;
+  }
+  check(all, "the operations that multiply, add and subtract");
+  /* blends: a red texture over a blue diffuse colour, by the factor's alpha, the diffuse colour's, the texture's, and what the stage was given */
+  IDirect3DDevice9_SetTexture(g_device, 0, (IDirect3DBaseTexture9 *)red_one);
+  IDirect3DDevice9_SetRenderState(g_device, D3DRS_TEXTUREFACTOR, 0x40FFFFFF);
+  stage(0, D3DTOP_BLENDFACTORALPHA, D3DTA_TEXTURE, D3DTA_DIFFUSE, D3DTOP_SELECTARG2, D3DTA_TEXTURE, D3DTA_DIFFUSE);
+  const int by_factor = near_colour(staged_pixel(0xFF0000FF, 0), 0x40, 0, 0xBF);
+  stage(0, D3DTOP_BLENDDIFFUSEALPHA, D3DTA_TEXTURE, D3DTA_DIFFUSE, D3DTOP_SELECTARG2, D3DTA_TEXTURE, D3DTA_DIFFUSE);
+  const int by_diffuse = near_colour(staged_pixel(0xC00000FF, 0), 0xC0, 0, 0x3F);
+  stage(0, D3DTOP_BLENDCURRENTALPHA, D3DTA_TEXTURE, D3DTA_DIFFUSE, D3DTOP_SELECTARG2, D3DTA_TEXTURE, D3DTA_DIFFUSE);
+  const int by_current = near_colour(staged_pixel(0x800000FF, 0), 0x80, 0, 0x7F);
+  IDirect3DDevice9_SetTexture(g_device, 0, (IDirect3DBaseTexture9 *)thin);      /* (alpha 40, colour ff3000) */
+  stage(0, D3DTOP_BLENDTEXTUREALPHA, D3DTA_TEXTURE, D3DTA_DIFFUSE, D3DTOP_SELECTARG2, D3DTA_TEXTURE, D3DTA_DIFFUSE);
+  const int by_texture = near_colour(staged_pixel(0xFF0000FF, 0), 0x40, 0x0C, 0xBF);
+  stage(0, D3DTOP_BLENDTEXTUREALPHAPM, D3DTA_TEXTURE, D3DTA_DIFFUSE, D3DTOP_SELECTARG2, D3DTA_TEXTURE, D3DTA_DIFFUSE);
+  check(by_factor && by_diffuse && by_current && by_texture && near_colour(staged_pixel(0xFF000080, 0), 0xFF, 0x30, 0x60), "the operations that blend by an alpha");
+  /* three arguments: the factor's part of white and the rest of the diffuse colour; the diffuse colour plus texture times factor */
+  IDirect3DDevice9_SetTexture(g_device, 0, (IDirect3DBaseTexture9 *)white);
+  IDirect3DDevice9_SetRenderState(g_device, D3DRS_TEXTUREFACTOR, 0xFF804020);
+  stage(0, D3DTOP_LERP, D3DTA_TEXTURE, D3DTA_DIFFUSE, D3DTOP_SELECTARG2, D3DTA_TEXTURE, D3DTA_DIFFUSE);
+  IDirect3DDevice9_SetTextureStageState(g_device, 0, D3DTSS_COLORARG0, D3DTA_TFACTOR);
+  const int lerp = near_colour(staged_pixel(0xFF000000, 0), 0x80, 0x40, 0x20);
+  stage(0, D3DTOP_MULTIPLYADD, D3DTA_TEXTURE, D3DTA_TFACTOR, D3DTOP_SELECTARG2, D3DTA_TEXTURE, D3DTA_DIFFUSE);
+  IDirect3DDevice9_SetTextureStageState(g_device, 0, D3DTSS_COLORARG0, D3DTA_DIFFUSE);
+  check(lerp && near_colour(staged_pixel(0xFF101010, 0), 0x90, 0x50, 0x30), "the operations of three arguments");
+  /* the dot product of two colours as vectors (each component less a half), times four, in every component */
+  IDirect3DDevice9_SetTexture(g_device, 0, (IDirect3DBaseTexture9 *)way);      /* (ff8080: half along x) */
+  IDirect3DDevice9_SetRenderState(g_device, D3DRS_TEXTUREFACTOR, 0xFFC08080);
+  stage(0, D3DTOP_DOTPRODUCT3, D3DTA_TEXTURE, D3DTA_TFACTOR, D3DTOP_SELECTARG2, D3DTA_TEXTURE, D3DTA_DIFFUSE);
+  check(near_colour(staged_pixel(0xFF000000, 0), 0x81, 0x81, 0x81), "the dot product of two colours");
+
+  /* the temporary register: green is put by, red goes on, and the last stage adds the two */
+  reset_stages();
+  IDirect3DDevice9_SetTexture(g_device, 0, (IDirect3DBaseTexture9 *)green_one);
+  IDirect3DDevice9_SetTexture(g_device, 1, (IDirect3DBaseTexture9 *)red_one);
+  stage(0, D3DTOP_SELECTARG1, D3DTA_TEXTURE, D3DTA_CURRENT, D3DTOP_SELECTARG1, D3DTA_TEXTURE, D3DTA_CURRENT);
+  IDirect3DDevice9_SetTextureStageState(g_device, 0, D3DTSS_RESULTARG, D3DTA_TEMP);
+  stage(1, D3DTOP_SELECTARG1, D3DTA_TEXTURE, D3DTA_CURRENT, D3DTOP_SELECTARG2, D3DTA_TEXTURE, D3DTA_CURRENT);
+  const int kept = near_colour(staged_pixel(0xFF000040, 0), 0xFF, 0, 0);
+  stage(2, D3DTOP_ADD, D3DTA_CURRENT, D3DTA_TEMP, D3DTOP_SELECTARG1, D3DTA_CURRENT, D3DTA_CURRENT);
+  check(kept && near_colour(staged_pixel(0xFF000040, 0), 0xFF, 0xFF, 0), "a stage's result put by in the temporary register");
+
+  /* the alpha goes through the stages by their own operations: a quarter, plus a quarter - which the alpha test sees */
+  reset_stages();
+  IDirect3DDevice9_SetRenderState(g_device, D3DRS_TEXTUREFACTOR, 0x40FFFFFF);
+  stage(0, D3DTOP_SELECTARG1, D3DTA_DIFFUSE, D3DTA_CURRENT, D3DTOP_SELECTARG1, D3DTA_TFACTOR, D3DTA_CURRENT);
+  stage(1, D3DTOP_SELECTARG1, D3DTA_CURRENT, D3DTA_CURRENT, D3DTOP_ADD, D3DTA_CURRENT, D3DTA_TFACTOR);
+  IDirect3DDevice9_SetRenderState(g_device, D3DRS_ALPHATESTENABLE, TRUE);
+  IDirect3DDevice9_SetRenderState(g_device, D3DRS_ALPHAFUNC, D3DCMP_GREATEREQUAL);
+  IDirect3DDevice9_SetRenderState(g_device, D3DRS_ALPHAREF, 0x78);
+  const int drawn = staged_pixel(0xFF00FF00, 0) == 0x00FF00;
+  IDirect3DDevice9_SetRenderState(g_device, D3DRS_ALPHAREF, 0x88);
+  const int left_out = staged_pixel(0xFF00FF00, 0) == 0x000000;
+  IDirect3DDevice9_SetTextureStageState(g_device, 1, D3DTSS_COLOROP, D3DTOP_DISABLE);      /* (one stage: a quarter) */
+  IDirect3DDevice9_SetRenderState(g_device, D3DRS_ALPHAREF, 0x48);
+  const int one_stage = staged_pixel(0xFF00FF00, 0) == 0x000000;
+  IDirect3DDevice9_SetRenderState(g_device, D3DRS_ALPHATESTENABLE, FALSE);
+  check(drawn && left_out && one_stage, "the alpha goes through the stages by their alpha operations");
+
+  /* more set-ups of the stages than the device keeps shaders and pipelines for: eighty, each a different choice of which of seven stages add a
+   * sixteenth - and the first of them again */
+  reset_stages();
+  IDirect3DDevice9_SetRenderState(g_device, D3DRS_TEXTUREFACTOR, 0xFF101010);
+  stage(0, D3DTOP_SELECTARG1, D3DTA_DIFFUSE, D3DTA_CURRENT, D3DTOP_SELECTARG1, D3DTA_DIFFUSE, D3DTA_CURRENT);
+  int many = 1;
+  for (unsigned i = 1; i <= 81 && many; ++i) {
+    const unsigned choice = i <= 80 ? i : 1;
+    int added = 0;
+    for (DWORD n = 1; n < 8; ++n) {
+      const int adds = (choice >> (n - 1) & 1) != 0;
+      added += adds;
+      stage(n, adds ? D3DTOP_ADD : D3DTOP_SELECTARG1, D3DTA_CURRENT, D3DTA_TFACTOR, D3DTOP_SELECTARG1, D3DTA_CURRENT, D3DTA_CURRENT);
+    }
+    many = near_colour(staged_pixel(0xFF000000, 0), added * 0x10, added * 0x10, added * 0x10);
+  }
+  check(many, "more set-ups of the stages than the device keeps, one after the other");
+
+  /* the specular colour is added after all the stages */
+  reset_stages();
+  IDirect3DDevice9_SetTexture(g_device, 0, (IDirect3DBaseTexture9 *)grey);
+  IDirect3DDevice9_SetTexture(g_device, 1, (IDirect3DBaseTexture9 *)dim);
+  stage(1, D3DTOP_ADD, D3DTA_TEXTURE, D3DTA_CURRENT, D3DTOP_SELECTARG2, D3DTA_TEXTURE, D3DTA_CURRENT);
+  IDirect3DDevice9_SetRenderState(g_device, D3DRS_SPECULARENABLE, TRUE);
+  check(near_colour(staged_pixel(0xFF808080, 0x00100000), 0x70, 0x60, 0x60), "the specular colour is added after the stages");
+  IDirect3DDevice9_SetRenderState(g_device, D3DRS_SPECULARENABLE, FALSE);
+
+  reset_stages();
+  IDirect3DDevice9_SetRenderState(g_device, D3DRS_TEXTUREFACTOR, 0xFFFFFFFF);
+  IDirect3DDevice9_SetRenderState(g_device, D3DRS_CULLMODE, D3DCULL_CCW);
+  IDirect3DTexture9_Release(grey); IDirect3DTexture9_Release(dim); IDirect3DTexture9_Release(red_one); IDirect3DTexture9_Release(step); IDirect3DTexture9_Release(green_one);
+  IDirect3DTexture9_Release(white); IDirect3DTexture9_Release(bright); IDirect3DTexture9_Release(thin); IDirect3DTexture9_Release(way); IDirect3DTexture9_Release(four);
+}
+
 static void test_render_to_texture(void) {
   IDirect3DTexture9 *target = NULL;
   IDirect3DSurface9 *surface = NULL, *back = NULL, *depth = NULL;
@@ -1241,6 +1452,7 @@ int main(void) {
     test_fog();
     test_lighting();
     test_texture_coordinates();
+    test_stages();
     test_render_to_texture();
     test_present_and_reset();
     check(IDirect3DDevice9_Release(g_device) == 0, "the device is gone with its last reference");

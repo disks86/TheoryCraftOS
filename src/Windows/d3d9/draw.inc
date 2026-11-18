@@ -85,12 +85,13 @@ static BOOL attribute_inside(const Attribute *a, const Source *sources, UINT fir
 typedef struct Coordinates {
   FflTextureStage stage[STAGES];
   UINT set[STAGES];              /* the set of the vertex's a stage reads */
+  UINT sets;                     /* the stages a vertex gets coordinates for */
   float world_view[4][4], normal[3][3];
   int normalize, for_program, needs_normal;
 } Coordinates;
 /* Decodes `count` vertices from `first` for the fixed-function shaders; with `lit` their colours are what the lights make of them. */
 static void decode_vertices(const Layout *l, const Source *sources, UINT first, UINT count, BYTE *out, const FflSetup *lit, const Coordinates *c) {
-  for (UINT v = 0; v < count; ++v, out += VERTEX_BYTES) {
+  for (UINT v = 0; v < count; ++v, out += VERTEX_BYTES(c->sets)) {
     float *f = (float *)out, value[4];
     f[3] = 1.0f;      /* (the fourth of a position that are pixels is 1 / w; one of three numbers has none) */
     decode_element(l->position.type, sources[l->position.stream].data + (SIZE_T)(first + v) * sources[l->position.stream].stride + l->position.offset, f);
@@ -99,23 +100,23 @@ static void decode_vertices(const Layout *l, const Source *sources, UINT first, 
     float normal[4] = {0.0f, 0.0f, 0.0f, 0.0f};
     if ((lit || c->needs_normal) && l->normal.type != 255)
       decode_element(l->normal.type, sources[l->normal.stream].data + (SIZE_T)(first + v) * sources[l->normal.stream].stride + l->normal.offset, normal);
-    for (UINT t = 0; t < STAGES; ++t) {
+    for (UINT t = 0; t < c->sets; ++t) {
       const Attribute *a = &l->texture[c->set[t]];
       value[0] = value[1] = value[2] = 0.0f;
       value[3] = 1.0f;
       if (a->type != 255) decode_element(a->type, sources[a->stream].data + (SIZE_T)(first + v) * sources[a->stream].stride + a->offset, value);
       ffl_texture_coordinates(&c->stage[t], c->world_view, c->normal, c->normalize, f, normal, value, a->type != 255 ? type_components(a->type) : 0, c->for_program,
-                              f + 8 + 4 * t);
+                              f + 12 + 4 * t);
     }
     /* the second colour, and the fog factor a vertex brings, which is its alpha; a vertex without one brings none (1) */
     float second[4] = {0.0f, 0.0f, 0.0f, 1.0f};
     if (l->specular.type != 255)
       decode_element(l->specular.type, sources[l->specular.stream].data + (SIZE_T)(first + v) * sources[l->specular.stream].stride + l->specular.offset, second);
-    f[16] = second[3];
-    f[17] = second[0]; f[18] = second[1]; f[19] = second[2];
+    f[8] = second[3];
+    f[9] = second[0]; f[10] = second[1]; f[11] = second[2];
     if (lit) {
       const float first_colour[4] = {f[4], f[5], f[6], f[7]};
-      ffl_light_vertex(lit, f, normal, l->colour.type != 255 ? first_colour : NULL, l->specular.type != 255 ? second : NULL, f + 4, f + 17);
+      ffl_light_vertex(lit, f, normal, l->colour.type != 255 ? first_colour : NULL, l->specular.type != 255 ? second : NULL, f + 4, f + 9);
     }
   }
 }
@@ -149,11 +150,13 @@ static void decode_shader_vertices(const Attribute *a, UINT inputs, const Source
 static D3D12_BLEND blend_of(DWORD value) { return value >= D3DBLEND_ZERO && value <= D3DBLEND_SRCALPHASAT ? (D3D12_BLEND)value : D3D12_BLEND_ONE; }      /* (the same numbers) */
 static UINT op_of(DWORD value, UINT lowest, UINT highest, UINT otherwise) { return value >= lowest && value <= highest ? value : otherwise; }
 
-/* The textures a draw's tables hold: the two stages of the fixed-function pixel shader, or the samplers a program's reads, as 2, 4, 8 or 16. */
+/* The textures a draw's tables hold: the samplers its pixel shader reads, as 2, 4, 8 or 16. */
 static UINT texture_slots(const Shader *ps) {
-  const UINT count = ps ? ps->sampler_count : STAGES;
+  const UINT count = ps->sampler_count;
   return count <= 2 ? 2 : count <= 4 ? 4 : count <= 8 ? 8 : 16;
 }
+/* The sets of texture coordinates the vertices of the fixed-function vertex shader have for a pixel shader: what it reads, as 2, 4 or 8. */
+static UINT coordinate_sets(const Shader *ps) { return ps->coordinates <= 2 ? 2 : ps->coordinates <= 4 ? 4 : 8; }
 /* The root signature for so many textures: the block of constants (b0), the textures (t0 ..) and their samplers (s0 ..). NULL: it cannot be made. */
 static ID3D12RootSignature *root_get(Dev *d, UINT slots) {
   ID3D12RootSignature **root = &d->roots[slots <= 2 ? 0 : slots <= 4 ? 1 : slots <= 8 ? 2 : 3];
@@ -182,13 +185,15 @@ static ID3D12RootSignature *root_get(Dev *d, UINT slots) {
   return *root;
 }
 
-/* The Direct3D 12 pipeline state of the shaders (NULL: the fixed-function one) and the render states that are set; NULL when it cannot be made. */
+/* The Direct3D 12 pipeline state of the shaders (no vertex shader: the fixed-function one) and the render states that are set; NULL when it
+ * cannot be made. */
 static ID3D12PipelineState *pipeline_get(Dev *d, const Shader *vs, const Shader *ps) {
   const DWORD *rs = d->state.rs;
   Pipeline key;
   memset(&key, 0, sizeof key);
   key.vs = vs ? vs->c.id : 0;
-  key.ps = ps ? ps->c.id : 0;
+  key.ps = ps->c.id;
+  key.sets = vs ? 0 : coordinate_sets(ps);
   key.cull = rs[D3DRS_CULLMODE];
   key.z = rs[D3DRS_ZENABLE] != D3DZB_FALSE && d->depth != NULL;
   key.zwrite = rs[D3DRS_ZWRITEENABLE] != 0;
@@ -219,11 +224,15 @@ static ID3D12PipelineState *pipeline_get(Dev *d, const Shader *vs, const Shader 
     if (p->last_used < oldest->last_used) oldest = p;
   }
 
-  static const D3D12_INPUT_ELEMENT_DESC layout[5] = {{"POSITION", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 0, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
-                                                     {"COLOR", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 16, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
-                                                     {"TEXCOORD", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 32, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
-                                                     {"TEXCOORD", 1, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 48, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
-                                                     {"TEXCOORD", 2, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 64, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0}};
+  /* The fixed-function vertex shader's inputs: the position, the colour, the fog factor and specular colour (TEXCOORD8), and the eight sets of
+   * texture coordinates - of which the vertices of this draw have `key.sets`; the others read the last that is there, and nothing reads them. */
+  D3D12_INPUT_ELEMENT_DESC layout[3 + TEXTURE_SETS] = {{"POSITION", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 0, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
+                                                       {"COLOR", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 16, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
+                                                       {"TEXCOORD", 8, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 32, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0}};
+  for (UINT i = 0; !vs && i < TEXTURE_SETS; ++i) {
+    const D3D12_INPUT_ELEMENT_DESC set = {"TEXCOORD", i, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 48 + 16 * (i < key.sets ? i : key.sets - 1), D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0};
+    layout[3 + i] = set;
+  }
   D3D12_GRAPHICS_PIPELINE_STATE_DESC pd;
   memset(&pd, 0, sizeof pd);
   /* (a program's vertex shader: its inputs are "ATTR" and the number of the register, each four floats, in the order the vertices are decoded in) */
@@ -236,8 +245,8 @@ static ID3D12PipelineState *pipeline_get(Dev *d, const Shader *vs, const Shader 
   if (!pd.pRootSignature) return NULL;
   pd.VS.pShaderBytecode = vs ? vs->dxbc : g_ff_vs;
   pd.VS.BytecodeLength = vs ? vs->dxbc_bytes : sizeof g_ff_vs;
-  pd.PS.pShaderBytecode = ps ? ps->dxbc : g_ff_ps;
-  pd.PS.BytecodeLength = ps ? ps->dxbc_bytes : sizeof g_ff_ps;
+  pd.PS.pShaderBytecode = ps->dxbc;
+  pd.PS.BytecodeLength = ps->dxbc_bytes;
   pd.SampleMask = 0xFFFFFFFFu;
   D3D12_RENDER_TARGET_BLEND_DESC *blend = &pd.BlendState.RenderTarget[0];
   blend->BlendEnable = key.blend;
@@ -265,7 +274,7 @@ static ID3D12PipelineState *pipeline_get(Dev *d, const Shader *vs, const Shader 
   pd.DepthStencilState.FrontFace.StencilFunc = (D3D12_COMPARISON_FUNC)key.sfunc;
   pd.DepthStencilState.BackFace = pd.DepthStencilState.FrontFace;
   pd.InputLayout.pInputElementDescs = vs ? inputs : layout;
-  pd.InputLayout.NumElements = vs ? vs->input_count : 5;
+  pd.InputLayout.NumElements = vs ? vs->input_count : 3 + TEXTURE_SETS;
   pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
   pd.NumRenderTargets = 1;
   pd.RTVFormats[0] = DXGI_FORMAT_B8G8R8A8_UNORM;
@@ -273,9 +282,20 @@ static ID3D12PipelineState *pipeline_get(Dev *d, const Shader *vs, const Shader 
   pd.SampleDesc.Count = 1;
   ID3D12PipelineState *state = NULL;
   TcosD3D12PipelineOptions(d->d12, vs ? vs->registers : VERTEX_REGISTERS, 0);      /* (the pixel shader's constants come after the vertex shader's) */
-  if (FAILED(ID3D12Device_CreateGraphicsPipelineState(d->d12, &pd, &IID_ID3D12PipelineState, (void **)&state)) || !state) return NULL;
-  Pipeline *slot = d->pipeline_count < PIPELINES ? &d->pipelines[d->pipeline_count++] : oldest;
-  if (slot == oldest && slot->state) {
+  if (FAILED(ID3D12Device_CreateGraphicsPipelineState(d->d12, &pd, &IID_ID3D12PipelineState, (void **)&state)) || !state) {
+    /* (the system has only so many shaders at a time: without the pipelines that are kept there may be room) */
+    if (!d->pipeline_count) return NULL;
+    flush(d);      /* (a recorded draw may use one of them) */
+    for (UINT i = 0; i < d->pipeline_count; ++i) ID3D12PipelineState_Release(d->pipelines[i].state);
+    d->pipeline_count = 0;
+    oldest = &d->pipelines[0];
+    state = NULL;
+    TcosD3D12PipelineOptions(d->d12, vs ? vs->registers : VERTEX_REGISTERS, 0);
+    if (FAILED(ID3D12Device_CreateGraphicsPipelineState(d->d12, &pd, &IID_ID3D12PipelineState, (void **)&state)) || !state) return NULL;
+  }
+  const BOOL full = d->pipeline_count >= PIPELINES;
+  Pipeline *slot = full ? oldest : &d->pipelines[d->pipeline_count++];
+  if (full) {
     flush(d);      /* (a recorded draw may use the one that goes) */
     ID3D12PipelineState_Release(slot->state);
   }
@@ -287,21 +307,51 @@ static ID3D12PipelineState *pipeline_get(Dev *d, const Shader *vs, const Shader 
 
 /* ---- the constants of a draw ------------------------------------------------------------------------------------------------------------------------ */
 
-/* What a texture stage does, as the pixel shader's three weights (ff_ps.hlsl): x texture * current, y texture, z current. */
-static void stage_weights(DWORD op, DWORD arg1, DWORD arg2, float out[4]) {
-  const BOOL texture1 = (arg1 & D3DTA_SELECTMASK) == D3DTA_TEXTURE, texture2 = (arg2 & D3DTA_SELECTMASK) == D3DTA_TEXTURE;
-  out[0] = out[1] = out[3] = 0.0f;
-  out[2] = 1.0f;      /* (the stage changes nothing: switched off, or an operation this runtime has not) */
-  switch (op) {
-    case D3DTOP_SELECTARG1: if (texture1) { out[1] = 1.0f; out[2] = 0.0f; } break;
-    case D3DTOP_SELECTARG2: if (texture2) { out[1] = 1.0f; out[2] = 0.0f; } break;
-    case D3DTOP_MODULATE: case D3DTOP_MODULATE2X: case D3DTOP_MODULATE4X:
-      if (texture1 != texture2) { out[0] = op == D3DTOP_MODULATE ? 1.0f : op == D3DTOP_MODULATE2X ? 2.0f : 4.0f; out[2] = 0.0f; }
-      else if (texture1) { out[1] = 1.0f; out[2] = 0.0f; }
-      break;
-    case D3DTOP_ADD: if (texture1 != texture2) out[1] = 1.0f; break;
-    default: break;
+/* The pixel shader of the texture stages as they are set (ff_stages.h): one for each set-up a draw came with, kept by its key. NULL: it cannot be
+ * made. */
+static HRESULT shader_make(Dev *d, const DWORD *code, BOOL vertex, Shader **out);
+static const Shader *fixed_shader_get(Dev *d) {
+  const State *s = &d->state;
+  FfsKey key;
+  unsigned textured = 0;
+  memset(&key, 0, sizeof key);
+  key.specular = s->rs[D3DRS_SPECULARENABLE] != 0;
+  for (UINT n = 0; n < STAGES; ++n) {
+    const DWORD *t = s->stage[n];
+    FfsStage *stage = &key.stage[n];
+    /* (what is not a number of an operation switches the stage off, like D3DTOP_DISABLE) */
+    stage->colour_op = (uint8_t)(t[D3DTSS_COLOROP] <= FFS_LERP ? t[D3DTSS_COLOROP] : FFS_DISABLE);
+    stage->alpha_op = (uint8_t)(t[D3DTSS_ALPHAOP] <= FFS_LERP ? t[D3DTSS_ALPHAOP] : FFS_DISABLE);
+    stage->colour_arg[0] = (uint8_t)t[D3DTSS_COLORARG0]; stage->colour_arg[1] = (uint8_t)t[D3DTSS_COLORARG1]; stage->colour_arg[2] = (uint8_t)t[D3DTSS_COLORARG2];
+    stage->alpha_arg[0] = (uint8_t)t[D3DTSS_ALPHAARG0]; stage->alpha_arg[1] = (uint8_t)t[D3DTSS_ALPHAARG1]; stage->alpha_arg[2] = (uint8_t)t[D3DTSS_ALPHAARG2];
+    stage->to_temp = (t[D3DTSS_RESULTARG] & D3DTA_SELECTMASK) == D3DTA_TEMP;
+    if (s->tex[n] && s->tex[n]->res && !s->tex[n]->depth) textured |= 1u << n;
   }
+  ffs_normalize(&key, textured);
+  FixedShader *oldest = &d->fixed[0];
+  for (UINT i = 0; i < d->fixed_count; ++i) {
+    FixedShader *f = &d->fixed[i];
+    if (memcmp(&f->key, &key, sizeof key) == 0) {
+      f->last_used = ++d->fixed_clock;
+      return f->shader;
+    }
+    if (f->last_used < oldest->last_used) oldest = f;
+  }
+  DWORD *tokens = mem_alloc(FFS_MAX_TOKENS * sizeof(DWORD));      /* (too many for the stack) */
+  Shader *shader = NULL;
+  if (tokens && (!ffs_tokens(&key, (uint32_t *)tokens, FFS_MAX_TOKENS) || FAILED(shader_make(d, tokens, FALSE, &shader)))) shader = NULL;
+  mem_free(tokens);
+  if (!shader) return NULL;
+  InterlockedDecrement(&d->o.ref);      /* (the device's own objects hold no reference of the device) */
+  FixedShader *slot = d->fixed_count < FIXED_SHADERS ? &d->fixed[d->fixed_count++] : oldest;
+  if (slot == oldest && slot->shader) {      /* (the pipelines made of the one that goes are not found again, and go in their turn) */
+    InterlockedIncrement(&d->o.ref);
+    dx_Release(OBJ(slot->shader));
+  }
+  slot->key = key;
+  slot->shader = shader;
+  slot->last_used = ++d->fixed_clock;
+  return shader;
 }
 /* The constants of a program's shader, as its translation reads them: the floats c0 .. and, if it reads bools, 16 registers whose first word is
  * all ones for a bool that is set. */
@@ -424,11 +474,12 @@ static void lighting_of(const State *s, FflSetup *out) {
 /* How the coordinates of the texture stages are made for a draw, out of the stage states: which set of the vertex's a stage reads or what is
  * generated in its place (D3DTSS_TEXCOORDINDEX), and the stage's texture matrix where D3DTSS_TEXTURETRANSFORMFLAGS asks for it. Positions that
  * are pixels already have their own sets, as they are. */
-static void coordinates_of(const State *s, const Layout *l, BOOL for_program, Coordinates *out) {
+static void coordinates_of(const State *s, const Layout *l, BOOL for_program, UINT sets, Coordinates *out) {
   memset(out, 0, sizeof *out);
   out->for_program = for_program;
+  out->sets = sets;
   out->normalize = s->rs[D3DRS_NORMALIZENORMALS] != 0;
-  for (UINT t = 0; t < STAGES; ++t) {
+  for (UINT t = 0; t < sets; ++t) {
     const DWORD index = s->stage[t][D3DTSS_TEXCOORDINDEX], flags = s->stage[t][D3DTSS_TEXTURETRANSFORMFLAGS];
     FflTextureStage *stage = &out->stage[t];
     out->set[t] = index & (TEXTURE_SETS - 1);
@@ -452,9 +503,17 @@ static void coordinates_of(const State *s, const Layout *l, BOOL for_program, Co
   }
 }
 /* The registers a draw's block of constants has: the vertex shader's, then the pixel shader's. */
-static UINT constant_registers(const Shader *vs, const Shader *ps) { return (vs ? vs->registers : VERTEX_REGISTERS) + (ps ? ps->registers : PIXEL_REGISTERS); }
-/* Writes the block of constants of the draw and gives its address. (The ring has room for a whole block: draw() saw to it.) */
-static UINT64 constants_of(Dev *d, const Layout *l, const Shader *vs, const Shader *ps) {
+static UINT constant_registers(const Shader *vs, const Shader *ps) { return (vs ? vs->registers : VERTEX_REGISTERS) + ps->registers; }
+/* A colour of a render or stage state as four numbers. */
+static void colour_of_state(DWORD colour, float out[4]) {
+  out[0] = ((colour >> 16) & 255) / 255.0f;
+  out[1] = ((colour >> 8) & 255) / 255.0f;
+  out[2] = (colour & 255) / 255.0f;
+  out[3] = (colour >> 24) / 255.0f;
+}
+/* Writes the block of constants of the draw and gives its address. (The ring has room for a whole block: draw() saw to it.) `ps` is the
+ * program's pixel shader, or - `fixed` - the one of the texture stages. */
+static UINT64 constants_of(Dev *d, const Layout *l, const Shader *vs, const Shader *ps, BOOL fixed) {
   const State *s = &d->state;
   const UINT vertex_registers = vs ? vs->registers : VERTEX_REGISTERS;
   const UINT bytes = (constant_registers(vs, ps) * 16 + 255) & ~255u;
@@ -487,22 +546,14 @@ static UINT64 constants_of(Dev *d, const Layout *l, const Shader *vs, const Shad
     }
   }
   float *pixel = block + vertex_registers * 4;
-  if (ps) {
-    shader_constants(pixel, ps, s->ps_float, PS_FLOATS, s->ps_bool);
-    shader_state(pixel + ps->state * 4, s, ps->major < 3, TRUE, fog_by_w(s));
-  } else {
-    BOOL on = TRUE;      /* (a stage that is switched off switches off the ones after it) */
-    for (UINT stage = 0; stage < STAGES; ++stage) {
-      const DWORD *t = s->stage[stage];
-      on = on && t[D3DTSS_COLOROP] != D3DTOP_DISABLE;
-      /* (a stage with no texture set passes on what it is given: untextured triangles keep their colour and their alpha, whatever the stage says) */
-      const BOOL textured = on && s->tex[stage] && s->tex[stage]->res && !s->tex[stage]->depth;
-      stage_weights(textured ? t[D3DTSS_COLOROP] : D3DTOP_DISABLE, t[D3DTSS_COLORARG1], t[D3DTSS_COLORARG2], pixel + 8 * stage);
-      stage_weights(textured ? t[D3DTSS_ALPHAOP] : D3DTOP_DISABLE, t[D3DTSS_ALPHAARG1], t[D3DTSS_ALPHAARG2], pixel + 8 * stage + 4);
-    }
-    pixel[3] = s->rs[D3DRS_SPECULARENABLE] ? 1.0f : 0.0f;      /* (the specular colour is added after the stages) */
-    shader_state(pixel + PIXEL_STATE_REGISTER * 4, s, TRUE, TRUE, fog_by_w(s));
-  }
+  if (fixed) {      /* (ff_stages.h: the texture factor, a register the shader has its own numbers in, and the constants of the stages) */
+    float stages[FFS_CONSTANTS][4];
+    memset(stages, 0, sizeof stages);
+    colour_of_state(s->rs[D3DRS_TEXTUREFACTOR], stages[0]);
+    for (UINT stage = 0; stage < STAGES; ++stage) colour_of_state(s->stage[stage][D3DTSS_CONSTANT], stages[2 + stage]);
+    shader_constants(pixel, ps, stages, FFS_CONSTANTS, 0);
+  } else shader_constants(pixel, ps, s->ps_float, PS_FLOATS, s->ps_bool);
+  shader_state(pixel + ps->state * 4, s, ps->major < 3, TRUE, fog_by_w(s));
   if (!d->constant_valid || d->constant_last_bytes != bytes || memcmp(d->constant_data + d->constant_last, block, bytes) != 0) {
     d->constant_last = d->constant_used;
     d->constant_last_bytes = bytes;
@@ -600,7 +651,9 @@ static HRESULT draw(Dev *d, D3DPRIMITIVETYPE type, UINT primitives, const Source
   if (d->state.decl) layout = d->state.decl->layout;
   else layout_of_elements(fvf, fvf_elements(d->state.fvf, fvf), &layout);
   /* The shaders of the draw. Positions that are pixels already pass no vertex shader, as Direct3D 9 has it. */
-  const Shader *vs = layout.transformed ? NULL : d->state.vs, *ps = d->state.ps;
+  const Shader *vs = layout.transformed ? NULL : d->state.vs, *ps = d->state.ps ? d->state.ps : fixed_shader_get(d);
+  if (!ps) return D3DERR_INVALIDCALL;
+  const UINT sets = coordinate_sets(ps);
   Attribute inputs[SHADER_INPUTS];
   if (!indices) vertices = elements;
   if (vs) {
@@ -610,12 +663,12 @@ static HRESULT draw(Dev *d, D3DPRIMITIVETYPE type, UINT primitives, const Source
   } else {
     if (layout.position.type == 255) return D3DERR_INVALIDCALL;
     if (!attribute_inside(&layout.position, sources, first_vertex, vertices) || !attribute_inside(&layout.colour, sources, first_vertex, vertices) ||
-        !attribute_inside(&layout.texture[d->state.stage[0][D3DTSS_TEXCOORDINDEX] & (TEXTURE_SETS - 1)], sources, first_vertex, vertices) ||
-        !attribute_inside(&layout.texture[d->state.stage[1][D3DTSS_TEXCOORDINDEX] & (TEXTURE_SETS - 1)], sources, first_vertex, vertices) ||
         !attribute_inside(&layout.specular, sources, first_vertex, vertices) || !attribute_inside(&layout.normal, sources, first_vertex, vertices))
       return D3DERR_INVALIDCALL;
+    for (UINT t = 0; t < sets; ++t)
+      if (!attribute_inside(&layout.texture[d->state.stage[t][D3DTSS_TEXCOORDINDEX] & (TEXTURE_SETS - 1)], sources, first_vertex, vertices)) return D3DERR_INVALIDCALL;
   }
-  const UINT stride = vs ? 16 * (vs->input_count ? vs->input_count : 1) : VERTEX_BYTES;
+  const UINT stride = vs ? 16 * (vs->input_count ? vs->input_count : 1) : VERTEX_BYTES(sets);
   const UINT slots = texture_slots(ps);
   const BOOL fan = type == D3DPT_TRIANGLEFAN;
   const UINT out_indices = fan ? primitives * 3 : indices ? elements : 0;
@@ -638,7 +691,7 @@ static HRESULT draw(Dev *d, D3DPRIMITIVETYPE type, UINT primitives, const Source
     const BOOL lit = d->state.rs[D3DRS_LIGHTING] && !layout.transformed;
     if (lit) lighting_of(&d->state, &lighting);
     Coordinates coordinates;
-    coordinates_of(&d->state, &layout, ps != NULL, &coordinates);
+    coordinates_of(&d->state, &layout, d->state.ps != NULL, sets, &coordinates);
     decode_vertices(&layout, sources, first_vertex, vertices, d->vertex_data + vertex_at, lit ? &lighting : NULL, &coordinates);
   }
   d->vertex_used += vertices * stride;
@@ -690,7 +743,7 @@ static HRESULT draw(Dev *d, D3DPRIMITIVETYPE type, UINT primitives, const Source
   ID3D12GraphicsCommandList_OMSetStencilRef(list, d->state.rs[D3DRS_STENCILREF] & 0xFF);
   D3D12_VERTEX_BUFFER_VIEW vertex_view = {ID3D12Resource_GetGPUVirtualAddress(d->vertex_ring) + vertex_at, vertices * stride, stride};
   ID3D12GraphicsCommandList_IASetVertexBuffers(list, 0, 1, &vertex_view);
-  ID3D12GraphicsCommandList_SetGraphicsRootConstantBufferView(list, 0, constants_of(d, &layout, vs, ps));
+  ID3D12GraphicsCommandList_SetGraphicsRootConstantBufferView(list, 0, constants_of(d, &layout, vs, ps, d->state.ps == NULL));
   tables_of(d, slots);
   D3D12_GPU_DESCRIPTOR_HANDLE views = {d->table_views}, samplers = {d->table_samplers};
   ID3D12GraphicsCommandList_SetGraphicsRootDescriptorTable(list, 1, views);

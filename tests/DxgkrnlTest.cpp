@@ -1380,12 +1380,12 @@ void test_d3d9_bytecode() {
   // The binding slots are a limited resource that is given back.
   std::vector<Handle> shaders;
   NtStatus last = 0;
-  for (int i = 0; i < 40; ++i) {
+  for (int i = 0; i < 160; ++i) {
     Handle h = d3d9_shader(e, color_ps(), &last);
     if (last != status::kSuccess) break;
     shaders.push_back(h);
   }
-  CHECK(last == status::kInsufficientResources && shaders.size() >= 20 && shaders.size() < 40);
+  CHECK(last == status::kInsufficientResources && shaders.size() >= 100 && shaders.size() < 160);
   CHECK(e.kernel.destroy_shader(kPid, shaders.back()) == status::kSuccess);
   d3d9_shader(e, color_ps(), &last);
   CHECK(last == status::kSuccess);
@@ -7806,14 +7806,12 @@ void test_dxbc_system_values() {
       const std::vector<uint8_t> cbuf_blob = read_blob("ps_cbuf.dxbc");
       UniquePointer<D3d9Program> cp = compile_dxbc(allocator, cbuf_blob, &st);
       CHECK(cp && st == status::kSuccess);
-      // The two shaders of d3d9.dll's fixed-function pipeline (src/Windows/d3d9/shaders.inc, made from ff_vs.hlsl and ff_ps.hlsl): the kernel takes
-      // them, the vertex shader with 11 registers of constants and the pixel shader with its 9 after those.
+      // The vertex shader of d3d9.dll's fixed-function pipeline (src/Windows/d3d9/shaders.inc, made from ff_vs.hlsl): the kernel takes it, with 11
+      // registers of constants. (The pixel shaders of that pipeline are made of the texture stages as it runs: tests/FfStagesTest.cpp.)
       {
-        UniquePointer<D3d9Program> fixed_vs, fixed_ps;
+        UniquePointer<D3d9Program> fixed_vs;
         CHECK(D3d9Program::compile_dxbc(allocator, ConstByteView(g_ff_vs, sizeof(g_ff_vs)), &fixed_vs) == status::kSuccess && fixed_vs && fixed_vs->constant_bytes() == 11 * 16);
-        CHECK(D3d9Program::compile_dxbc(allocator, ConstByteView(g_ff_ps, sizeof(g_ff_ps)), &fixed_ps, 11) == status::kSuccess && fixed_ps && fixed_ps->constant_bytes() == 20 * 16);
-        CHECK(fixed_vs && fixed_vs->stage() == graphics::ShaderStage::Vertex && fixed_ps && fixed_ps->stage() == graphics::ShaderStage::Fragment);
-        CHECK(fixed_ps && fixed_ps->texture_unit_mask() == 3);
+        CHECK(fixed_vs && fixed_vs->stage() == graphics::ShaderStage::Vertex);
       }
       // The same shader with its constant buffers placed after another stage's (a Direct3D 11 pipeline's pixel shader, after the vertex shader's 4
       // registers): the block is that much longer, the text reads the registers from there on, and a place past the block is refused.

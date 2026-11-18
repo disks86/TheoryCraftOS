@@ -65,6 +65,7 @@ static void state_defaults(State *s, BOOL depth, UINT width, UINT height) {
     s->stage[i][D3DTSS_ALPHAOP] = i == 0 ? D3DTOP_SELECTARG1 : D3DTOP_DISABLE;
     s->stage[i][D3DTSS_COLORARG1] = s->stage[i][D3DTSS_ALPHAARG1] = D3DTA_TEXTURE;
     s->stage[i][D3DTSS_COLORARG2] = s->stage[i][D3DTSS_ALPHAARG2] = D3DTA_CURRENT;
+    s->stage[i][D3DTSS_COLORARG0] = s->stage[i][D3DTSS_ALPHAARG0] = D3DTA_CURRENT;
     s->stage[i][D3DTSS_TEXCOORDINDEX] = i;
     s->stage[i][D3DTSS_RESULTARG] = D3DTA_CURRENT;
     s->texture[i] = g_identity;
@@ -364,6 +365,7 @@ static HRESULT shader_make(Dev *d, const DWORD *code, BOOL vertex, Shader **out)
       s->major = translated->major;
       s->state = translated->state_register;
       for (UINT i = 0; i < 16; ++i) if (translated->sampler_mask >> i & 1) s->sampler_count = i + 1;
+      for (UINT i = 0; i < TEXTURE_SETS; ++i) if (translated->varying_mask >> (SM_SLOT_TEXCOORD + i) & 1) s->coordinates = i + 1;
       s->input_count = translated->input_count;
       memcpy(s->inputs, translated->inputs, sizeof s->inputs);
       *out = s;

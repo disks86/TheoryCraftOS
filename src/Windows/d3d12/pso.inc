@@ -349,6 +349,7 @@ struct Pso {
 
 static const GUID *const g_pso_iids[] = {&IID_ID3D12Object, &IID_ID3D12DeviceChild, &IID_ID3D12Pageable, &IID_ID3D12PipelineState, NULL};
 
+static void release_shader(Dev *dev, UINT handle);
 static void pso_destroy(DxObj *o) {
   Pso *p = (Pso *)o;
   for (UINT i = 0; i < p->pipe_count; ++i) {
@@ -360,26 +361,69 @@ static void pso_destroy(DxObj *o) {
     dev_escape(p->d.dev, request, 2, NULL, 0);
   }
   for (UINT i = 0; i < 6; ++i)
-    if (p->shaders[i]) {
-      UINT request[2] = {ESC_DESTROY_SHADER, p->shaders[i]};
-      dev_escape(p->d.dev, request, 2, NULL, 0);
-    }
+    if (p->shaders[i]) release_shader(p->d.dev, p->shaders[i]);
   if (p->rs) dx_Release(OBJ(p->rs));
   dobj_child_destroy(o);
 }
 
+/* The kernel's shaders, each once: pipelines made of the same bytecode - a runtime above makes one for every combination of render states - share
+ * the shader, of which the kernel has only so many at a time where it runs them itself. */
+typedef struct SharedShader {
+  UINT handle, references;
+  UINT kind, stage, bytes;       /* what the kernel was asked for: the kind word, the stage, and the bytecode's length ... */
+  UINT64 hash;                   /* ... and a hash of it */
+  BYTE *code;
+} SharedShader;
+static SRWLOCK g_shared_lock = SRWLOCK_INIT;
+static UINT64 shader_hash(const BYTE *p, SIZE_T n) {
+  UINT64 h = 0xCBF29CE484222325ull;
+  for (SIZE_T i = 0; i < n; ++i) h = (h ^ p[i]) * 0x100000001B3ull;
+  return h;
+}
+/* Gives back a shader make_shader gave: the kernel's goes when no pipeline has it any more. */
+static void release_shader(Dev *dev, UINT handle) {
+  BOOL destroy = TRUE;
+  AcquireSRWLockExclusive(&g_shared_lock);
+  for (UINT i = 0; i < dev->shared_count; ++i) {
+    SharedShader *s = &dev->shared[i];
+    if (s->handle != handle) continue;
+    destroy = --s->references == 0;
+    if (destroy) {
+      mem_free(s->code);
+      *s = dev->shared[--dev->shared_count];
+    }
+    break;
+  }
+  ReleaseSRWLockExclusive(&g_shared_lock);
+  if (destroy) {
+    UINT request[2] = {ESC_DESTROY_SHADER, handle};
+    dev_escape(dev, request, 2, NULL, 0);
+  }
+}
 static HRESULT make_shader(Dev *dev, const D3D12_SHADER_BYTECODE *code, UINT stage, UINT *handle) {
   *handle = 0;
   if (!code->pShaderBytecode || !code->BytecodeLength) return S_OK;
   if (code->BytecodeLength > 60000) return DXGI_ERROR_UNSUPPORTED;
+  /* ShaderKind::Dxbc (DXBC and the DXIL of Shader Model 6), or what the runtime above asked for (TcosD3D12PipelineOptions); above the kind, where a
+   * pixel shader's constant buffers begin */
+  const UINT kind = (dev->next_shader_kind ? dev->next_shader_kind : 7) | (stage == 1 && !dev->next_shader_kind ? dev->next_pixel_base << 8 : 0);
+  const UINT64 hash = shader_hash(code->pShaderBytecode, code->BytecodeLength);
+  AcquireSRWLockExclusive(&g_shared_lock);
+  for (UINT i = 0; i < dev->shared_count; ++i) {
+    SharedShader *s = &dev->shared[i];
+    if (s->hash != hash || s->kind != kind || s->stage != stage || s->bytes != code->BytecodeLength || memcmp(s->code, code->pShaderBytecode, s->bytes) != 0) continue;
+    ++s->references;
+    *handle = s->handle;
+    break;
+  }
+  ReleaseSRWLockExclusive(&g_shared_lock);
+  if (*handle) return S_OK;
   const UINT words = 4 + (UINT)((code->BytecodeLength + 3) / 4);
   UINT *request = mem_alloc((SIZE_T)(words + 2) * 4);
   UINT reply[1] = {0};
   if (!request) return E_OUTOFMEMORY;
   request[0] = ESC_CREATE_SHADER;
-  /* ShaderKind::Dxbc (DXBC and the DXIL of Shader Model 6), or what the runtime above asked for (TcosD3D12PipelineOptions); above the kind, where a
-   * pixel shader's constant buffers begin */
-  request[1] = (dev->next_shader_kind ? dev->next_shader_kind : 7) | (stage == 1 && !dev->next_shader_kind ? dev->next_pixel_base << 8 : 0);
+  request[1] = kind;
   request[2] = stage;
   request[3] = (UINT)code->BytecodeLength;
   memcpy(request + 4, code->pShaderBytecode, code->BytecodeLength);
@@ -387,6 +431,31 @@ static HRESULT make_shader(Dev *dev, const D3D12_SHADER_BYTECODE *code, UINT sta
   mem_free(request);
   if (!KMT_OK(st)) return hr_from(st) == E_FAIL ? E_INVALIDARG : hr_from(st);
   *handle = reply[0];
+  /* (kept for the pipelines after this one; a shader that cannot be kept is this pipeline's alone, which release_shader gives back all the same) */
+  BYTE *copy = mem_alloc(code->BytecodeLength);
+  AcquireSRWLockExclusive(&g_shared_lock);
+  if (copy && dev->shared_count == dev->shared_capacity) {
+    const UINT capacity = dev->shared_capacity ? dev->shared_capacity * 2 : 16;
+    SharedShader *grown = mem_grow(dev->shared, (SIZE_T)capacity * sizeof *grown);
+    if (grown) {
+      dev->shared = grown;
+      dev->shared_capacity = capacity;
+    }
+  }
+  if (copy && dev->shared_count < dev->shared_capacity) {
+    SharedShader *s = &dev->shared[dev->shared_count++];
+    memcpy(copy, code->pShaderBytecode, code->BytecodeLength);
+    s->handle = reply[0];
+    s->references = 1;
+    s->kind = kind;
+    s->stage = stage;
+    s->bytes = (UINT)code->BytecodeLength;
+    s->hash = hash;
+    s->code = copy;
+    copy = NULL;
+  }
+  ReleaseSRWLockExclusive(&g_shared_lock);
+  mem_free(copy);
   return S_OK;
 }
 

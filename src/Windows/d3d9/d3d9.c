@@ -22,11 +22,14 @@
  * A device is a Direct3D 12 device, one command queue and one command list; drawing records into the list, and the list is sent when something has
  * to be seen (Present, a lock that reads, the end of what a ring of memory holds). What the program hands over is kept in plain memory - vertex and
  * index buffers, the levels of textures - and a draw brings it into the one form the two shaders here take:
- *   vertices    whatever the program's layout (an FVF code or a declaration), each vertex a draw reads is decoded into a position, a colour and two
- *               texture coordinates (48 bytes) and written into a ring of upload memory; indices are copied into another, counted from the first
- *               vertex the draw reads, and a triangle fan becomes a list.
- *   shaders     one vertex shader (the world, view and projection matrices as one, or positions that are pixels already) and one pixel shader (two
- *               texture stages as weights, the alpha test, fog by the vertex shader's factor or the pixel's depth), written in HLSL and compiled ahead (ff_vs.hlsl, ff_ps.hlsl -> shaders.inc).
+ *   vertices    whatever the program's layout (an FVF code or a declaration), each vertex a draw reads is decoded into a position, a colour (lit
+ *               here, where there is lighting), a fog factor and specular colour and the texture coordinates of the stages (made here: the
+ *               texture matrices, generated coordinates) and written into a ring of upload memory; indices are copied into another, counted from
+ *               the first vertex the draw reads, and a triangle fan becomes a list.
+ *   shaders     one vertex shader (the world, view and projection matrices as one, or positions that are pixels already; fog by the vertex),
+ *               written in HLSL and compiled ahead (ff_vs.hlsl -> shaders.inc), and for each set-up of the texture stages a draw comes with a
+ *               pixel shader 2.0 written out when it is first met (ff_stages.h: eight stages, every operation but the bump environment ones)
+ *               and translated like a program's own.
  *   a program's a vertex or pixel shader of the program's is translated to Shader Model 4 when it is made (sm_to_dxbc.h). A draw with a vertex
  *   shaders     shader decodes the vertices into one register of four floats for each input the shader declares; the constants the program set
  *               are the draw's block (the vertex shader's registers, then the pixel shader's); either stage may be the fixed-function one.
@@ -36,9 +39,8 @@
  *   textures    a Direct3D 12 texture of B8G8R8A8 whatever the program's format; a level is sent when it is unlocked.
  *   Present     the back buffer's pixels are read and put into the window (SetDIBitsToDevice), as dxgi.dll does for its swap chains.
  *
- * Not there: what the translator refuses of a program's shaders (loops, cube and volume samplers, more: docs/Direct3D9.md),
- * more than two texture stages, the stage operations beyond
- * select, modulate and add, cube and volume textures, compressed formats, multisampling, queries, clip planes, point sprites. */
+ * Not there: what the translator refuses of a program's shaders (loops, cube and volume samplers, more: docs/Direct3D9.md), bump environment
+ * mapping, cube and volume textures, compressed formats, multisampling, queries, clip planes, point sprites. */
 #define INITGUID
 #define COBJMACROS
 #define CONST_VTABLE
@@ -52,6 +54,7 @@
 #include <stdint.h>
 #include "sm_to_dxbc.h"
 #include "ff_lighting.h"
+#include "ff_stages.h"
 
 #pragma GCC diagnostic ignored "-Wunused-function"
 #pragma GCC diagnostic ignored "-Wincompatible-pointer-types"
@@ -62,19 +65,18 @@ __asm__(".text\n.globl ___chkstk_ms\n___chkstk_ms:\n ret\n");
 #include "shaders.inc"
 
 #define OBJ(x) ((DxObj *)(x))
-#define STAGES 2u                      /* the texture stages the pixel shader has */
+#define STAGES FFS_STAGES              /* the texture stages of the fixed-function pipeline */
 #define TEXTURE_SLOTS 16u              /* the stages a program may set textures and states of: the samplers of a pixel shader */
 #define ROOTS 4u                       /* root signatures: for 2, 4, 8 and 16 textures */
 #define STREAMS 4u
-#define VERTEX_BYTES 80u               /* a decoded vertex: position (4 floats), colour (4), the coordinates of the two stages (4 + 4), the fog factor it brings and its specular colour (1 + 3) */
+#define VERTEX_BYTES(sets) (48u + 16u * (sets))      /* a decoded vertex: position (4 floats), colour (4), the fog factor it brings and its specular colour (1 + 3), and so many sets of texture coordinates (4 each) */
 #define TEXTURE_SETS 8u                /* the sets of texture coordinates a vertex can have */
 #define LIGHTS 32u                     /* the lights a program can set, by their numbers; FFL_LIGHTS of them shine at once */
 #define VERTEX_RING (1u << 20)       /* (21845 vertices a draw at most. The rings are kept small: each is there three times - here, in the kernel, on the device) */
 #define INDEX_RING (256u << 10)
 #define CONSTANT_RING (256u << 10)
 #define VERTEX_REGISTERS 11u           /* the constants of the fixed-function vertex shader, in registers of four floats */
-#define PIXEL_REGISTERS 9u             /* ... of the fixed-function pixel shader, which follow the vertex shader's in the block of a draw */
-#define PIXEL_STATE_REGISTER 4u        /* ... of which the last five are the alpha test and fog, as at the end of a program's pixel shader */
+#define FIXED_SHADERS 48u              /* the pixel shaders of texture stage set-ups that are kept */
 #define CONSTANT_REGISTERS 256u        /* the block of a draw, at most */
 #define VS_FLOATS 256u                 /* the float constants a program sets for its vertex shaders, */
 #define PS_FLOATS 224u                 /* ... and for its pixel shaders */
@@ -167,6 +169,7 @@ typedef struct Shader {
   UINT major;                    /* its shader model */
   UINT state;                    /* a pixel shader: the first of its state registers (the alpha test and fog: sm_to_dxbc.h) */
   UINT sampler_count;            /* a pixel shader: the highest sampler it reads, and one */
+  UINT coordinates;              /* ... and the highest set of texture coordinates */
   SmInput inputs[SHADER_INPUTS]; /* a vertex shader: what each input register is */
   UINT input_count;
 } Shader;
@@ -196,11 +199,15 @@ typedef struct State {
 typedef struct StateBlock { Child c; State state; } StateBlock;
 
 typedef struct Pipeline {
-  DWORD vs, ps;                  /* the shaders' numbers (Child.id); 0: the fixed-function one */
+  DWORD vs, ps;                  /* the shaders' numbers (Child.id); 0: the fixed-function vertex shader */
+  DWORD sets;                    /* ... which has so many sets of texture coordinates in its vertices */
   DWORD cull, z, zwrite, zfunc, blend, src, dst, op, separate, src_alpha, dst_alpha, op_alpha, write, stencil, sfail, szfail, spass, sfunc, smask, swrite;
   ID3D12PipelineState *state;
   UINT last_used;
 } Pipeline;
+
+/* The pixel shader of a set-up of the texture stages (ff_stages.h), made when a draw first came with it. */
+typedef struct FixedShader { FfsKey key; Shader *shader; UINT last_used; } FixedShader;
 
 typedef struct PendingClear { Tex *depth; UINT flags; FLOAT z; UINT8 stencil; } PendingClear;
 
@@ -236,6 +243,8 @@ struct Dev {
   int targets_dirty;             /* the next draw sets the render target, the viewport and the scissor rectangle again */
   Pipeline pipelines[PIPELINES];
   UINT pipeline_count, pipeline_clock;
+  FixedShader fixed[FIXED_SHADERS];      /* (the shaders hold no reference of the device) */
+  UINT fixed_count, fixed_clock;
   PendingClear clears[4];
   UINT clear_count;
   Tex *back, *auto_depth;        /* the back buffer, and the depth buffer made with the device (or NULL) */

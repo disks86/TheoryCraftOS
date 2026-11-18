@@ -1346,7 +1346,7 @@ void D3d9Program::run_compute_group(const graphics::ComputeContext& context, con
 
 namespace {
 
-constexpr uint32_t kSlots = 32;
+constexpr uint32_t kSlots = 128;   // (the programs of a stage that are alive at once, over all processes, on a device that runs them through the interpreter)
 const D3d9Program* g_vertex[kSlots];
 const D3d9Program* g_fragment[kSlots];
 const D3d9Program* g_textured[kSlots];
