@@ -78,12 +78,18 @@ RenderLease GraphicsPool::acquire(const hardware::GpuSelectionInput& input) {
   int32_t pick = gpus_.manager().select(input);
   if (pick < 0) return RenderLease();
   if (!slots_[pick].render || !slots_[pick].render->accelerated()) {
+    bool found = false;
     for (uint32_t i = 0; i < gpus_.count(); ++i) {
       if (slots_[i].render && slots_[i].render->accelerated()) {
         pick = static_cast<int32_t>(i);
+        found = true;
         break;
       }
     }
+    // Nothing renders on a GPU, and the chosen one has no driver either (so cannot even show the result): the work runs on the CPU wherever it
+    // goes, so it goes to the display GPU, which is awake anyway, rather than waking a discrete GPU (and its power) for nothing.
+    const hardware::GpuNode* chosen = gpus_.node(static_cast<uint32_t>(pick));
+    if (!found && chosen && !chosen->gpu && display_index_ >= 0 && static_cast<uint32_t>(display_index_) < gpus_.count() && slots_[display_index_].render) pick = display_index_;
   }
   return acquire_node(static_cast<uint32_t>(pick));
 }

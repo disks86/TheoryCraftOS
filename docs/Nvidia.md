@@ -402,3 +402,82 @@ without touching a register.
   VMM per channel is the caller's choice (shared VMMs work), 32 channels at most, RawNvLock masks interrupts while PRAMIN-zeroing a large
   object (a 1 MiB NV50 page table is 256 Ki window writes).
 - Nothing is wired into `NvidiaGpu` yet.
+
+## Devinit scripts
+
+A GPU nobody POSTed (a secondary card, or the discrete GPU of a hybrid laptop after a D3cold power cycle: the system firmware only POSTs
+it at boot, if at all) has its memory controller, clocks and straps unprogrammed. nouveau then runs the video BIOS's init scripts itself
+(nvkm/subdev/bios/init.c, `nvbios_post`); so does this driver, for Tesla to Maxwell GM10x.
+
+### Files
+
+- `Nvkm/NvInitScript.hpp/.cpp`: the interpreter (`NvInitScript`), the init table pointers (`find_init_tables`: BIT 'I' version 1, or
+  BMP 5.10+ at bmp + 75: script table +0x00, macro index +0x02, macro +0x04, condition +0x06, I/O condition +0x08, I/O flag condition
+  +0x0a, function table +0x0c, the "unknown" script +0x0e, xlat +0x10), the VGA byte access (`INvVgaIo`: `MmioNvVgaIo` for hardware,
+  `RegistersNvVgaIo` over the 32-bit `INvRegisters`), the hooks (`INvInitHooks`) and the trace (`INvInitTrace`).
+- `Nvkm/NvDevinit.hpp/.cpp`: `NvDevinit::post(const PostInputs&) -> PostReport`, next to the unchanged `detect()`.
+
+### The interpreter
+
+Every opcode of nouveau's table (0x32 .. 0xaa) with nouveau's semantics: the execute flag (`init_exec`: a failed CONDITION /
+IO_CONDITION / IO_FLAG_CONDITION / STRAP_CONDITION / RAM_CONDITION / GENERIC_CONDITION / CONDITION_TIME / I2C_IF / I2C_LONG_IF turns
+execution off; RESUME turns it on; NOT inverts it; I2C_IF, COMPUTE_MEM, RESET and CONFIGURE_PREINIT force it on for their own accesses);
+SUB / SUB_DIRECT / REPEAT nest the executor; JUMP only when executing; DONE ends the script. Register addresses are mangled as
+`init_nvreg` does (NV50+: bit 31 + head * 0x800, bit 30 + OR * 0x800, bit 29 + link * 0x80), PMC_ENABLE bit 0 is never cleared by
+ZM_REG, GT215/216/218 skip the registers of absent memory partitions (`gt215_devinit_mmio`, 0x001540). VGA ports follow
+`nvkm_rdport/wrport`: NV50+ at 0x601000 + port; before, CRTC/attribute/input status at 0x601000 + head * 0x2000, misc/sequencer/graphics
+at 0x0c0000 (+ head * 0x2000 from NV40), CR44 selecting the head.
+
+Untrusted image: every byte goes through `NvBios::rd08/16/32` and a read outside the image stops the run (`Truncated`; nouveau reads 0
+and goes on). A step budget (default 1,000,000 opcodes, backwards JUMPs included) and a nesting limit (16) stop loops and recursion;
+an unknown opcode stops with its value and offset; delays are capped (100 ms each, 10 s per run, `DelayBudget` past it); registers
+outside BAR0 are not touched.
+
+Not done by the interpreter, through `INvInitHooks` (defaults: nothing, counted in `NvInitResult`): PLL programming (`set_pll(type, khz)`,
+nouveau's `nvkm_devinit_pll_set`: needs the BIOS PLL limits table and the nv04/gt215 PLL calculators; `NvClk` only reads clocks),
+I2C (`i2c_bus(index)` returning an `II2cBus`: `NvI2cBus` or `NvAuxChannel` fit; 0x80/0x81 = the primary/secondary default port), AUX
+(`aux_channel(i2c_index)` returning an `IDpcdAux`: `NvAuxChannel`), GPIO resets (`gpio_reset(function)`, 0xff = all; `NvGpio` has no
+reset yet), the NV04-era memory init (`meminit()`).
+
+Dry run (`NvInitOptions::dry_run`): the same walk, nothing written: each write goes to the trace and to a 256-entry shadow so later
+reads of that register in the run see it. VGA ports, I2C and AUX are not accessed at all in a dry run (they read back the shadow, or 0).
+`execute = false` is nouveau's parse-only mode.
+
+Deliberate differences from nouveau: ZM_REG_INDIRECT writes the register (nouveau writes to the image offset, which its own trace line
+shows is a slip); ZM_TMDS_GROUP with an unknown selector writes nothing (nouveau writes 0x000004/0x000000); a failed I2C_IF read is
+"condition not met" (nouveau compares the low byte of -ENODEV); INIT_IO reads its mask/data bytes with 8-bit reads (nouveau's 16-bit
+reads look one byte past the opcode); I2C_LONG_IF does no transfer in a dry run.
+
+### post()
+
+`PostInputs`: the image (`NvBios`), BAR0 (`INvRegisters`), the VGA byte access (`INvVgaIo`; `MmioNvVgaIo` over the BAR0 `MmioRegion` on
+hardware), the chip, the board tables (for GPIO_NE), hooks, trace, `dry_run`, `force` (nouveau's NvForcePost), the step budget.
+Order (nvkm_devinit_preinit + post): unlock the extended CRTC registers (CR3f = 0x57); decide whether a POST is needed (Fermi+:
+0x2240c bit 1 clear, unless the display engine is present (0x022500 / GM107 0x021c04 bit 0) and CR00 or CR1A is non-zero; Tesla: no
+display engine, or CR00 and CR1A both 0); run the script table's entries in order, then the script at 'I' + 0x0e; on Fermi+ read 0x2240c
+again (`posted_after`). `PostOutcome`: Ran, DryRun, AlreadyPosted, Refused (nothing written), Failed (the script's error and offset).
+
+Refused: pre-Tesla (VGA owner and the nv04/nv10/nv20 memory init are not done), GM20x to Volta (nouveau's `gm200_devinit_post` uploads
+the VBIOS's DEVINIT application to the PMU falcon and runs it there: not done), Turing+ (FWSEC), Tegra (already up).
+
+### Tests (`tests/NvInitScriptTest.cpp`, `tests/run_host_tests.sh NvInitScriptTest`)
+
+A Kepler image from `NvBiosImages.hpp` with an init table, condition / I/O condition / macro / xlat tables, a BIT 'M' entry and
+hand-written scripts, a register model, a VGA index/data port model and fake I2C/AUX/PLL/GPIO hooks. Covered: the register opcodes
+(ZM_REG, NV_REG, ZM_REG_SEQUENCE, ZM_REG_GROUP, ZM_REG16, ANDN/OR_REG, COPY_ZM_REG, ZM_MASK_ADD, COPY_NV_REG, XLAT, MACRO,
+ZM_REG_INDIRECT, the reserved ones), conditions with NOT/RESUME (and what does not run while off: SUB, JUMP, delays), CONDITION_TIME
+polling, VGA opcodes at the NV50 mirror and the pre-NV50 PRMVIO/head mapping with CR44, the 32-bit VGA adapter, SUB/SUB_DIRECT/REPEAT/
+JUMP through post, delays and their caps, PLL/I2C/I2C_IF/AUX/GPIO/GPIO_NE/COMPUTE_MEM/RAM_RESTRICT_* through the hooks and the RAM strap,
+dry run giving the same write sequence as the live run, parse mode; endless JUMP, recursive SUB / SUB_DIRECT, nested REPEATs, unknown
+opcode, delay budget; the sample image cut at every length and 400 images with random bit flips (ASan/UBSan); post() for a not-POSTed
+Kepler, a POSTed one (and forced), the CRTC fallback, Tesla with and without VGA access, dry run, the refused generations, a failing
+script, an image without an init table.
+
+### Not done / unverified
+
+- Never run on hardware. The VGA access through `RegistersNvVgaIo` (32-bit read-modify-write) is right for a model only; on hardware
+  `MmioNvVgaIo` (byte MMIO) is the one to use.
+- No PLL programming (the run counts `plls_unsupported`; a board whose memory clock is set by INIT_PLL* will not come up without it),
+  no GPIO reset, no NV04-era memory init, INIT_CONFIGURE_MEM/CLK on BIOS major <= 2 stop with `Unsupported`.
+- nv50_devinit_init's per-output encoder scripts (`PostReport::encoder_scripts_pending`) are left to the display code.
+- GM20x/Pascal/Volta PMU devinit, and nothing is wired into `NvidiaNative`/`NvidiaGpu` yet (the coordinator's part).

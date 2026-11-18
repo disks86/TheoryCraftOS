@@ -40,7 +40,9 @@
 #include "Hardware/GraphicsProcessingUnit/NVIDIA/Nvkm/NvBiosTables.hpp"
 #include "Hardware/GraphicsProcessingUnit/NVIDIA/Nvkm/NvI2cEdid.hpp"
 #include "Hardware/GraphicsProcessingUnit/NVIDIA/Nvkm/NvChip.hpp"
+#include "Hardware/GraphicsProcessingUnit/NVIDIA/Nvkm/NvDevinit.hpp"
 #include "Hardware/GraphicsProcessingUnit/NVIDIA/Nvkm/NvDisplay.hpp"
+#include "Hardware/GraphicsProcessingUnit/NVIDIA/Nvkm/NvInitScript.hpp"
 #include "Hardware/GraphicsProcessingUnit/NVIDIA/Nvkm/NvFb.hpp"
 #include "Hardware/GraphicsProcessingUnit/NVIDIA/Nvkm/NvGpio.hpp"
 #include "Hardware/GraphicsProcessingUnit/NVIDIA/Nvkm/NvRegisters.hpp"
@@ -81,6 +83,17 @@ class NvidiaNative {
   ~NvidiaNative();
 
   [[nodiscard]] bool start();
+  // For a GPU that is not the boot display (a laptop's discrete GPU), before start(): its video BIOS is not the one shadowed at 0xC0000, and
+  // laptops whose discrete GPU has no ROM of its own hand it out through the ACPI _ROM method (`acpi_rom`, may be nullptr; must outlive this).
+  void configure_secondary(INvAcpiRom* acpi_rom) { boot_display_ = false; acpi_rom_ = acpi_rom; }
+  bool boot_display() const { return boot_display_; }
+  // After the GPU was powered off and on again (D3cold): checks that it answers and is the same chip, and starts the sensors again (what
+  // start() read from the VBIOS and the connectors is kept). False if it does not answer.
+  [[nodiscard]] bool resume();
+  // A secondary GPU the system firmware did not POST (common for a hybrid laptop's discrete GPU, and always after a power cut) needs the VBIOS's
+  // init scripts run (Nvkm/NvDevinit::post). They write to the card, so they only run with TCOS_NVIDIA_NATIVE; otherwise start() walks them
+  // dry and this says what a POST would have done (an empty reason until start() has looked; nothing for the boot display).
+  const PostReport& post_report() const { return post_; }
   const Chip& chip() const { return chip_; }
   // The video BIOS: where it came from (None if no source had one) and what its tables say (empty without one).
   BiosSource bios_source() const { return bios_source_; }
@@ -135,6 +148,11 @@ class NvidiaNative {
   UniquePointer<NvGpio> gpio_;
   UniquePointer<NvThermMonitor> therm_;
   RawNvLock memory_lock_;
+  bool boot_display_ = true;
+  MmioRegion bar0_{};
+  PostReport post_;
+  bool run_post();
+  INvAcpiRom* acpi_rom_ = nullptr;
   UniquePointer<Bar1VramMemory> memory_;
   UniquePointer<NvNativeDisplay> display_;
 };

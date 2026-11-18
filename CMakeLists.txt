@@ -563,8 +563,15 @@ add_executable(BOOTX64
   src/Hardware/GraphicsProcessingUnit/Multi/GpuTopology.cpp
   src/Hardware/GraphicsProcessingUnit/Multi/GpuPowerPolicy.cpp
   src/Hardware/GraphicsProcessingUnit/Multi/GpuManager.cpp
+  src/Hardware/GraphicsProcessingUnit/Multi/Acpi/AmdAtpx.cpp
+  src/Hardware/GraphicsProcessingUnit/Multi/Acpi/GpuAcpiNamespace.cpp
+  src/Hardware/GraphicsProcessingUnit/Multi/Acpi/GpuAcpiPower.cpp
+  src/Hardware/GraphicsProcessingUnit/Multi/AppleGmux.cpp
+  src/Hardware/GraphicsProcessingUnit/Multi/AppleGmuxPorts.cpp
+  src/Hardware/GraphicsProcessingUnit/Multi/PcieLink.cpp
   src/Hardware/GraphicsProcessingUnit/Multi/GpuPool.cpp
   src/Hardware/GraphicsProcessingUnit/Multi/GpuNativeDrivers.cpp
+  src/Hardware/GraphicsProcessingUnit/Multi/GpuProbes.cpp
   src/Hardware/GraphicsProcessingUnit/UEFI/UefiGopGpu.cpp
   src/Hardware/GraphicsProcessingUnit/AMD/AmdGpuGenerations.cpp
   src/Hardware/Platform/AMD/AmdRyzenPlatform.cpp
@@ -620,6 +627,7 @@ add_executable(BOOTX64
   src/Hardware/GraphicsProcessingUnit/NVIDIA/Nvkm/NvBios.cpp
   src/Hardware/GraphicsProcessingUnit/NVIDIA/Nvkm/NvBiosShadow.cpp
   src/Hardware/GraphicsProcessingUnit/NVIDIA/Nvkm/NvDevinit.cpp
+  src/Hardware/GraphicsProcessingUnit/NVIDIA/Nvkm/NvInitScript.cpp
   src/Hardware/GraphicsProcessingUnit/Intel/IntelGpuGenerations.cpp
   src/Hardware/GraphicsProcessingUnit/Intel/IntelGpu.cpp
   src/Hardware/GraphicsProcessingUnit/Intel/IntelDisplay.cpp
