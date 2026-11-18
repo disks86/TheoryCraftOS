@@ -537,6 +537,20 @@ bool XhciController::start_bulk_in_stream(uint32_t port, uint8_t endpoint_addres
   return start_in_endpoint(port, endpoint_address, max_packet, 0, true);
 }
 
+// xHCI interval is 2^n * 125 us. Full/low speed bInterval counts 1 ms frames;
+// high/super speed bInterval is already an exponent plus one.
+uint32_t XhciController::interval_exponent(const Device& d, uint8_t interval) {
+  uint32_t n;
+  if (d.speed_id <= 2) {
+    n = 3;
+    while (n < 10 && (1u << (n - 3)) < interval) ++n;
+  } else {
+    n = interval ? interval - 1 : 0;
+    if (n > 15) n = 15;
+  }
+  return n;
+}
+
 bool XhciController::start_in_endpoint(uint32_t port, uint8_t endpoint_address, uint16_t max_packet, uint8_t interval, bool bulk) {
   kernel::ScopedMutex lock_guard(lock_);
   if (port >= ports_ || !devices_[port].present || !(endpoint_address & 0x80)) return false;
@@ -569,16 +583,7 @@ bool XhciController::start_in_endpoint(uint32_t port, uint8_t endpoint_address, 
   slot.copy_from(context_at(d.output_context, 0).first(8));
   slot[0] = (slot[0] & ~(0x1Fu << 27)) | (uint32_t{d.context_entries} << 27);
 
-  // xHCI interval is 2^n * 125 us. Full/low speed bInterval counts 1 ms frames;
-  // high/super speed bInterval is already an exponent plus one.
-  uint32_t n;
-  if (d.speed_id <= 2) {
-    n = 3;
-    while (n < 10 && (1u << (n - 3)) < interval) ++n;
-  } else {
-    n = interval ? interval - 1 : 0;
-    if (n > 15) n = 15;
-  }
+  const uint32_t n = interval_exponent(d, interval);
   const ArrayView<uint32_t> ep = context_at(d.input_context, dci + 1);
   ep[0] = bulk ? 0 : n << 16;
   ep[1] = (3u << 1) | ((bulk ? 6u : 7u) << 3) | (uint32_t{max_packet} << 16);  // CErr 3, bulk IN or interrupt IN
@@ -665,6 +670,32 @@ bool XhciController::start_bulk_endpoint(uint32_t port, uint8_t endpoint_address
   return start_bulk(port, endpoint_address, max_packet, 0);
 }
 
+// An interrupt OUT endpoint shares the bulk endpoints' slots and their synchronous transfer (bulk_transfer); only its context differs
+// (endpoint type 3 with a service interval), and it keeps a DMA buffer of its own that interrupt_out() copies the packet into.
+bool XhciController::start_interrupt_out(uint32_t port, uint8_t endpoint_address, uint16_t max_packet, uint8_t interval) {
+  if (endpoint_address & 0x80) return false;
+  return start_bulk(port, endpoint_address, max_packet, 0, interval);
+}
+
+bool XhciController::interrupt_out(uint32_t port, uint8_t endpoint_address, ConstByteView data) {
+  ByteView staging;
+  {
+    kernel::ScopedMutex lock_guard(lock_);
+    if (port >= ports_ || !devices_[port].present) return false;
+    for (BulkEndpoint& e : devices_[port].bulk) {
+      if (!e.active || e.address != endpoint_address || e.out_buffer.empty()) continue;
+      if (data.size() > e.out_buffer.size()) return false;
+      staging = e.out_buffer.first(data.size());
+      staging.copy_from(data);
+      break;
+    }
+  }
+  if (staging.empty() && data.size() != 0) return false;
+  // (One driver owns the endpoint and sends from one thread, so the staging buffer is not written again before the transfer ends.)
+  uint32_t sent = 0;
+  return bulk_transfer(port, endpoint_address, staging, &sent) && sent == data.size();
+}
+
 uint32_t XhciController::max_bulk_streams(uint32_t port) const {
   kernel::ScopedMutex lock_guard(lock_);
   if (port >= ports_ || !devices_[port].present || devices_[port].speed_id < 4 || max_stream_array_ < 2) return 0;   // (SuperSpeed and above only)
@@ -679,6 +710,7 @@ bool XhciController::start_bulk_endpoint_streams(uint32_t port, uint8_t endpoint
 
 void XhciController::release_bulk(BulkEndpoint& e) {
   e.ring.release(allocator_);
+  release_view(allocator_, e.out_buffer);
   for (xhci::ProducerRing& r : e.stream_rings) r.release(allocator_);
   release_view(allocator_, e.stream_contexts);
   e = BulkEndpoint{};
@@ -686,7 +718,7 @@ void XhciController::release_bulk(BulkEndpoint& e) {
 
 // Configure Endpoint for a bulk endpoint; with streams its dequeue pointer is a linear primary stream array (2^(MaxPStreams + 1) entries)
 // whose entries 1..streams point at a transfer ring each (SCT 1: a primary transfer ring).
-bool XhciController::start_bulk(uint32_t port, uint8_t endpoint_address, uint16_t max_packet, uint32_t streams) {
+bool XhciController::start_bulk(uint32_t port, uint8_t endpoint_address, uint16_t max_packet, uint32_t streams, int32_t interrupt_interval) {
   kernel::ScopedMutex lock_guard(lock_);
   if (port >= ports_ || !devices_[port].present || !max_packet || streams > BulkEndpoint::kMaxStreams) return false;
   Device& d = devices_[port];
@@ -721,6 +753,18 @@ bool XhciController::start_bulk(uint32_t port, uint8_t endpoint_address, uint16_
   } else if (!e->ring.init(allocator_)) {
     return false;
   }
+  const bool interrupt = interrupt_interval >= 0;
+  if (interrupt && streams) {
+    release_bulk(*e);
+    return false;
+  }
+  if (interrupt) {
+    e->out_buffer = allocate_dma_view<uint8_t>(allocator_, max_packet < 64 ? 64 : max_packet, 64);
+    if (e->out_buffer.empty() || !dma_reachable(e->out_buffer.data())) {
+      release_bulk(*e);
+      return false;
+    }
+  }
 
   const bool in = endpoint_address & 0x80;
   const uint8_t dci = (endpoint_address & 0x0F) * 2 + (in ? 1 : 0);
@@ -735,14 +779,16 @@ bool XhciController::start_bulk(uint32_t port, uint8_t endpoint_address, uint16_
   slot.copy_from(context_at(d.output_context, 0).first(8));
   slot[0] = (slot[0] & ~(0x1Fu << 27)) | (uint32_t{d.context_entries} << 27);
 
-  constexpr uint32_t kEndpointTypeBulkOut = 2, kEndpointTypeBulkIn = 6;
+  constexpr uint32_t kEndpointTypeBulkOut = 2, kEndpointTypeInterruptOut = 3, kEndpointTypeBulkIn = 6;
   const ArrayView<uint32_t> ep = context_at(d.input_context, dci + 1);
   ep[0] = streams ? (max_pstreams << 10) | (1u << 15) : 0;   // MaxPStreams, LSA (a linear array: no secondary ones)
-  ep[1] = (3u << 1) | ((in ? kEndpointTypeBulkIn : kEndpointTypeBulkOut) << 3) | (uint32_t{max_packet} << 16);
+  if (interrupt) ep[0] = interval_exponent(d, static_cast<uint8_t>(interrupt_interval)) << 16;
+  const uint32_t type = interrupt ? kEndpointTypeInterruptOut : in ? kEndpointTypeBulkIn : kEndpointTypeBulkOut;
+  ep[1] = (3u << 1) | (type << 3) | (uint32_t{max_packet} << 16);
   const uint64_t dequeue = streams ? reinterpret_cast<uint64_t>(e->stream_contexts.data()) : e->ring.address() | e->ring.cycle();
   ep[2] = static_cast<uint32_t>(dequeue);
   ep[3] = static_cast<uint32_t>(dequeue >> 32);
-  ep[4] = 4096;  // average TRB length
+  ep[4] = interrupt ? (uint32_t{max_packet} << 16) | max_packet : 4096;  // (interrupt:) max ESIT payload; average TRB length
 
   Trb completion;
   if (!run_command(reinterpret_cast<uint64_t>(d.input_context.data()),

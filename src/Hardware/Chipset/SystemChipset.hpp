@@ -28,6 +28,7 @@
 #include "Hardware/Chipset/Smbus/SmbusHost.hpp"
 #include "Hardware/Chipset/Smbus/SmbusIoPorts.hpp"
 #include "Hardware/Chipset/Smbus/Spd.hpp"
+#include "Hardware/HardwareMonitor/SystemHardwareMonitor.hpp"
 #include "Hardware/RegisterMapper.hpp"
 #include "Synchronization/Synchronized.hpp"
 #include "Utility/Optional.hpp"
@@ -80,7 +81,7 @@ struct MemoryModuleSlot {
 
 class SystemChipset {
  public:
-  explicit SystemChipset(const ICentralProcessingUnit& cpu) : smbus_(cpu), amd_nodes_(cpu), watchdog_(cpu) {}
+  explicit SystemChipset(const ICentralProcessingUnit& cpu) : smbus_(cpu), amd_nodes_(cpu), watchdog_(cpu), board_sensors_(cpu) {}
   ~SystemChipset();
   SystemChipset(const SystemChipset&) = delete;
   SystemChipset& operator=(const SystemChipset&) = delete;
@@ -118,6 +119,10 @@ class SystemChipset {
   }
   const WatchdogReport& watchdog_report() const { return watchdog_report_; }
 
+  // The board's Super I/O sensor chips (temperatures, fans, voltages, fan control), probed with the chipset whatever its vendor. Also installed as
+  // system_hardware_monitor() for the system monitor.
+  SystemHardwareMonitor& board_sensors() { return board_sensors_; }
+
   // Reads the SPD of every memory module on the SMBus (addresses 0x50..0x57) into `out`; returns how many answered and decoded. The lock is taken
   // per module, so other users are not held off for the whole scan. Why nothing was scanned goes to `reason` (null when the scan ran).
   uint32_t read_memory_modules(ArrayView<MemoryModuleSlot> out, const char** reason);
@@ -135,6 +140,7 @@ class SystemChipset {
   Optional<TcoIoPorts> tco_ports_;
   Synchronized<IntelTcoWatchdog> watchdog_;
   WatchdogReport watchdog_report_;
+  SystemHardwareMonitor board_sensors_;
 };
 
 }  // namespace hardware

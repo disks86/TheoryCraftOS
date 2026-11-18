@@ -28,6 +28,7 @@
 #include "Process/WindowsOpenGl.hpp"
 #include "Process/WindowsAudio.hpp"
 #include "Process/WindowsCabinet.hpp"
+#include "Process/WindowsGamepad.hpp"
 #include "Process/WindowsMailslots.hpp"
 #include "Process/WindowsRegistry.hpp"
 #include "Process/WindowsMemory.hpp"
@@ -285,6 +286,7 @@ class WindowsSyscalls final : public ISyscallInterface {
       case WindowsSyscallNumber::NtTcosOpenGl: return windowsabi::nt_tcos_opengl(process, r);
       case WindowsSyscallNumber::NtTcosAudio: return windowsabi::nt_tcos_audio(process, r);
       case WindowsSyscallNumber::NtTcosCabinet: return windowsabi::nt_tcos_cabinet(process, r);
+      case WindowsSyscallNumber::NtTcosGamepad: return windowsabi::nt_tcos_gamepad(process, r);
       case WindowsSyscallNumber::NtCancelSynchronousIoFile: return windowsabi::nt_cancel_synchronous_io_file(process, r);
       case WindowsSyscallNumber::NtFsControlFile: return windowsabi::nt_fs_control_file(process, r);
       case WindowsSyscallNumber::NtQueryObject: return windowsabi::nt_query_object(process, r);

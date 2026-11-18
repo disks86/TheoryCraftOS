@@ -57,6 +57,7 @@ void SystemInput::find_ps2() {
 // Brings up the keyboards and mice among the HID interfaces of the device on a root port. Returns how many were taken up.
 uint32_t SystemInput::take_up(IUsbHostController& host_controller, uint32_t port) {
   IUsbHostController* host = &host_controller;
+  if (usb_filter_ && usb_filter_(usb_filter_context_, host_controller, port)) return 0;   // (another driver's)
   uint8_t config[256];
   uint16_t length = 0;
   if (!host->configuration_descriptor(port, ByteView(config), &length)) return 0;  // length is the full size

@@ -64,6 +64,8 @@ class XhciController final : public IXhciController {
   bool start_interrupt_in(uint32_t port, uint8_t endpoint_address, uint16_t max_packet,
                           uint8_t interval) override;
   bool poll_interrupt_in(uint32_t port, uint8_t endpoint_address, ByteView buffer, uint16_t* length) override;
+  bool start_interrupt_out(uint32_t port, uint8_t endpoint_address, uint16_t max_packet, uint8_t interval) override;
+  bool interrupt_out(uint32_t port, uint8_t endpoint_address, ConstByteView data) override;
   bool start_bulk_in_stream(uint32_t port, uint8_t endpoint_address, uint16_t max_packet) override;
   bool start_bulk_endpoint(uint32_t port, uint8_t endpoint_address, uint16_t max_packet) override;
   bool bulk_transfer(uint32_t port, uint8_t endpoint_address, ByteView data, uint32_t* transferred) override;
@@ -108,6 +110,7 @@ class XhciController final : public IXhciController {
     uint32_t streams = 0;                       // with: stream ids 1..streams, each its own ring
     ByteView stream_contexts;                   // the stream context array (16 bytes an entry, entry 0 reserved)
     xhci::ProducerRing stream_rings[kMaxStreams];   // stream i on stream_rings[i - 1]
+    ByteView out_buffer;                        // an interrupt OUT endpoint's staging buffer (DMA)
   };
 
   // An asynchronous bulk transfer (submit_bulk) until poll_bulk collects it; completed by the event pump.
@@ -185,7 +188,9 @@ class XhciController final : public IXhciController {
   void pump_events();
   void arm_endpoint(Device& d, InterruptEndpoint& e);
   bool start_in_endpoint(uint32_t port, uint8_t endpoint_address, uint16_t max_packet, uint8_t interval, bool bulk);
-  bool start_bulk(uint32_t port, uint8_t endpoint_address, uint16_t max_packet, uint32_t streams);
+  // interrupt_interval >= 0: an interrupt OUT endpoint with that bInterval instead of a bulk one.
+  bool start_bulk(uint32_t port, uint8_t endpoint_address, uint16_t max_packet, uint32_t streams, int32_t interrupt_interval = -1);
+  static uint32_t interval_exponent(const Device& d, uint8_t interval);
   void release_bulk(BulkEndpoint& e);
   void release_device(Device& d);
 

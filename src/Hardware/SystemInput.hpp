@@ -67,6 +67,11 @@ class SystemInput {
   using Notifier = void (*)(void* context, StringView text);
   void set_notifier(Notifier notifier, void* context) { notifier_ = notifier; notifier_context_ = context; }
 
+  // Devices another driver takes over (game controllers, whose HID reports would otherwise look like a mouse's): asked for every USB device before
+  // its HID interfaces are tried, it says true for the ones to leave alone. Called from the thread that polls. Call before initialize(); may be null.
+  using UsbFilter = bool (*)(void* context, IUsbHostController& host, uint32_t port);
+  void set_usb_filter(UsbFilter filter, void* context) { usb_filter_ = filter; usb_filter_context_ = context; }
+
   // The VirtualBox guest device, if there is one: its host-sent pointer position replaces the PS/2 mouse's movement. Call before initialize().
   void set_vmmdev(VmmDev* vmm) { vmm_ = vmm; }
 
@@ -145,6 +150,8 @@ class SystemInput {
   IInputDeviceSource* sources_[kMaxSources] = {};
   Notifier notifier_ = nullptr;
   void* notifier_context_ = nullptr;
+  UsbFilter usb_filter_ = nullptr;
+  void* usb_filter_context_ = nullptr;
   kernel::Thread* service_ = nullptr;
   bool stop_ = false;
 };
