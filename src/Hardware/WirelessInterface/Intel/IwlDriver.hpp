@@ -33,31 +33,14 @@
 #include "Hardware/WirelessInterface/Intel/IwlPcie.hpp"
 #include "Hardware/WirelessInterface/Intel/IwlScan.hpp"
 #include "Hardware/WirelessInterface/Intel/IwlTransport.hpp"
+#include "Hardware/WirelessInterface/WifiFirmwareSource.hpp"
 #include "Utility/ByteBuffer.hpp"
 #include "Utility/UniquePointer.hpp"
 
 namespace hardware {
 
-// Where firmware files come from. The system's is the "/firmware" folder of the file system.
-class IIwlFirmwareSource {
- public:
-  // Replaces `out` with the whole file called `name`; false if there is no such file (or it is empty or too large).
-  virtual bool read(const char* name, ByteBuffer& out) = 0;
-
- protected:
-  constexpr IIwlFirmwareSource() = default;
-  ~IIwlFirmwareSource() = default;
-};
-
-class FileSystemFirmwareSource final : public IIwlFirmwareSource {
- public:
-  FileSystemFirmwareSource(filesystem::IFileSystem& file_system, allocators::IAllocator& allocator) : file_system_(file_system), allocator_(allocator) {}
-  bool read(const char* name, ByteBuffer& out) override;
-
- private:
-  filesystem::IFileSystem& file_system_;
-  allocators::IAllocator& allocator_;
-};
+// (Intel names its firmware source as the other drivers do.)
+using IIwlFirmwareSource = IWifiFirmwareSource;
 
 class IwlDriver {
  public:

@@ -23,26 +23,8 @@
 namespace hardware {
 
 namespace {
-constexpr uint64_t kMaxFirmwareBytes = 4u << 20;
 constexpr uint16_t kPciCommand = 0x04;
 }  // namespace
-
-bool FileSystemFirmwareSource::read(const char* name, ByteBuffer& out) {
-  String path(allocator_);
-  if (!path.assign("/firmware/") || !path.append(StringView(name))) return false;
-  UniquePointer<filesystem::IFile> file;
-  if (file_system_.open_file(StringView(path.c_str()), filesystem::OpenMode::Read, &file) != filesystem::Status::Ok || !file) return false;
-  const uint64_t size = file->size();
-  if (size == 0 || size > kMaxFirmwareBytes) return false;
-  out.clear();
-  if (!out.put_zeros(size)) return false;
-  uint64_t got = 0;
-  if (file->read(0, out.writable_view(), &got) != filesystem::Status::Ok || got != size) {
-    out.clear();
-    return false;
-  }
-  return true;
-}
 
 const char* IwlDriver::outcome_name(Outcome outcome) {
   switch (outcome) {

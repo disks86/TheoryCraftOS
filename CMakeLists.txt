@@ -1073,6 +1073,40 @@ add_executable(BOOTX64
   src/Hardware/Bluetooth/HciController.cpp
   src/Hardware/Bluetooth/IntelBluetooth.cpp
   src/Hardware/Bluetooth/BluetoothService.cpp
+  src/Hardware/WirelessInterface/WifiAdapterCatalog.cpp
+  src/Hardware/WirelessInterface/WifiAdapterProbe.cpp
+  src/Hardware/WirelessInterface/WifiChipFactory.cpp
+  src/Hardware/WirelessInterface/WifiFirmwareSource.cpp
+  src/Hardware/WirelessInterface/Intel/IntelWifiModels.cpp
+  src/Hardware/WirelessInterface/Intel/IntelWifiChip.cpp
+  src/Hardware/WirelessInterface/Realtek/RealtekUsbRegisters.cpp
+  src/Hardware/WirelessInterface/Realtek/RealtekWifi.cpp
+  src/Hardware/WirelessInterface/Realtek/RealtekWifiModels.cpp
+  src/Hardware/WirelessInterface/Realtek/RtwEfuse.cpp
+  src/Hardware/WirelessInterface/Realtek/RtwFirmware.cpp
+  src/Hardware/WirelessInterface/Realtek/RtwPowerSequence.cpp
+  src/Hardware/WirelessInterface/MediaTek/MediaTekWifi.cpp
+  src/Hardware/WirelessInterface/MediaTek/MediaTekWifiModels.cpp
+  src/Hardware/WirelessInterface/MediaTek/Mt7921Chip.cpp
+  src/Hardware/WirelessInterface/MediaTek/Mt7921Pcie.cpp
+  src/Hardware/WirelessInterface/MediaTek/MtFirmware.cpp
+  src/Hardware/WirelessInterface/MediaTek/MtMcu.cpp
+  src/Hardware/WirelessInterface/MediaTek/MtUsb.cpp
+  src/Hardware/WirelessInterface/Qualcomm/Ath10kBmi.cpp
+  src/Hardware/WirelessInterface/Qualcomm/Ath10kChip.cpp
+  src/Hardware/WirelessInterface/Qualcomm/Ath10kHw.cpp
+  src/Hardware/WirelessInterface/Qualcomm/Ath10kPci.cpp
+  src/Hardware/WirelessInterface/Qualcomm/Ath11kChip.cpp
+  src/Hardware/WirelessInterface/Qualcomm/AthFirmware.cpp
+  src/Hardware/WirelessInterface/Qualcomm/AthMhi.cpp
+  src/Hardware/WirelessInterface/Qualcomm/QualcommWifi.cpp
+  src/Hardware/WirelessInterface/Qualcomm/QualcommWifiModels.cpp
+  src/Hardware/WirelessInterface/Broadcom/BrcmfBackplane.cpp
+  src/Hardware/WirelessInterface/Broadcom/BrcmfChip.cpp
+  src/Hardware/WirelessInterface/Broadcom/BrcmfFirmware.cpp
+  src/Hardware/WirelessInterface/Broadcom/BrcmfPcie.cpp
+  src/Hardware/WirelessInterface/Broadcom/BrcmfSdio.cpp
+  src/Hardware/WirelessInterface/Broadcom/BroadcomWifiModels.cpp
   src/Hardware/WirelessInterface/Intel/IwlDevices.cpp
   src/Hardware/WirelessInterface/Intel/IwlErrorLog.cpp
   src/Hardware/WirelessInterface/RateScaler.cpp
@@ -1547,6 +1581,10 @@ endif()
 option(TCOS_INTEL_WIFI "Start the Intel Wireless-AC 9000 series card (firmware from /firmware, initialisation, hardware address and channels; no scanning or joining yet; not yet run on a real card)" OFF)
 if(TCOS_INTEL_WIFI)
   target_compile_definitions(BOOTX64 PRIVATE TCOS_INTEL_WIFI)
+endif()
+option(TCOS_WIFI_CHIPS "Start the chip drivers of the Wi-Fi adapters found (Intel 7000/8000/AX200/AX210/BE200, Realtek, MediaTek, Qualcomm, Broadcom): identification, firmware from /firmware as far as each family goes; they do not join networks; not yet run on real adapters" OFF)
+if(TCOS_WIFI_CHIPS)
+  target_compile_definitions(BOOTX64 PRIVATE TCOS_WIFI_CHIPS)
 endif()
 option(TCOS_INTEL_NPU "Start the Intel NPU (Meteor Lake and later) with the firmware from /Linux/lib/firmware/intel/vpu: power-up, MMU, firmware boot, interrupt by MSI, jobs through the executor; the tensor math stays on the CPU (it needs a graph compiler); not yet run on a real NPU" OFF)
 if(TCOS_INTEL_NPU)

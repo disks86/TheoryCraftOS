@@ -25,6 +25,10 @@
 #include <vector>
 #include "Hardware/WirelessInterface/Software/SoftwareWirelessInterface.hpp"
 
+namespace hardware {
+void delay_us(uint64_t) {}     // (the vendor chip drivers linked with the catalogue wait on registers)
+}  // namespace hardware
+
 using namespace hardware;
 
 struct TestAllocator final : allocators::IAllocator {
