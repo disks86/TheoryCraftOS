@@ -854,6 +854,193 @@ static void test_fog(void) {
   IDirect3DDevice9_SetRenderState(g_device, D3DRS_CULLMODE, D3DCULL_CCW);
 }
 
+/* A rectangle over the middle of the target that faces the camera, with normals; `colour` 0 for vertices without a colour. */
+static void lit_quad(float z, DWORD colour) {
+  const struct { float x, y, z, nx, ny, nz; DWORD colour; } v[4] = {{-0.5f, 0.5f, z, 0, 0, -1, colour}, {0.5f, 0.5f, z, 0, 0, -1, colour},
+                                                                    {-0.5f, -0.5f, z, 0, 0, -1, colour}, {0.5f, -0.5f, z, 0, 0, -1, colour}};
+  const struct { float x, y, z, nx, ny, nz; } plain[4] = {{-0.5f, 0.5f, z, 0, 0, -1}, {0.5f, 0.5f, z, 0, 0, -1}, {-0.5f, -0.5f, z, 0, 0, -1}, {0.5f, -0.5f, z, 0, 0, -1}};
+  IDirect3DDevice9_SetFVF(g_device, colour ? D3DFVF_XYZ | D3DFVF_NORMAL | D3DFVF_DIFFUSE : D3DFVF_XYZ | D3DFVF_NORMAL);
+  if (colour) IDirect3DDevice9_DrawPrimitiveUP(g_device, D3DPT_TRIANGLESTRIP, 2, v, sizeof v[0]);
+  else IDirect3DDevice9_DrawPrimitiveUP(g_device, D3DPT_TRIANGLESTRIP, 2, plain, sizeof plain[0]);
+}
+static void test_lighting(void) {
+  D3DCAPS9 caps;
+  D3DMATERIAL9 material;
+  D3DLIGHT9 light, back;
+  BOOL on = FALSE;
+  memset(&caps, 0, sizeof caps);
+  memset(&material, 0, sizeof material);
+  memset(&light, 0, sizeof light);
+  IDirect3DDevice9_GetDeviceCaps(g_device, &caps);
+  IDirect3DDevice9_SetRenderState(g_device, D3DRS_CULLMODE, D3DCULL_NONE);
+  /* the lights are kept: what is set comes back, and a light that is switched on without being set is a white one along z */
+  light.Type = D3DLIGHT_DIRECTIONAL;
+  light.Diffuse.r = light.Diffuse.g = light.Diffuse.b = 1.0f;
+  light.Direction.z = 1.0f;
+  const HRESULT set = IDirect3DDevice9_SetLight(g_device, 0, &light);
+  memset(&back, 0x55, sizeof back);
+  check(caps.MaxActiveLights >= 8 && set == D3D_OK && IDirect3DDevice9_GetLight(g_device, 0, &back) == D3D_OK && memcmp(&back, &light, sizeof light) == 0 &&
+            IDirect3DDevice9_GetLightEnable(g_device, 0, &on) == D3D_OK && !on && IDirect3DDevice9_GetLight(g_device, 5, &back) == D3DERR_INVALIDCALL,
+        "a light that is set comes back, switched off; one that was not set is not there");
+  IDirect3DDevice9_LightEnable(g_device, 5, TRUE);
+  check(IDirect3DDevice9_GetLight(g_device, 5, &back) == D3D_OK && back.Type == D3DLIGHT_DIRECTIONAL && back.Diffuse.r == 1.0f && back.Direction.z == 1.0f &&
+            IDirect3DDevice9_GetLightEnable(g_device, 5, &on) == D3D_OK && on,
+        "switching on a light nobody set makes a white one that shines along z");
+  IDirect3DDevice9_LightEnable(g_device, 5, FALSE);
+
+  /* lighting on, nothing shines, no material: black; with the global ambient on the material's ambient colour, that */
+  IDirect3DDevice9_SetRenderState(g_device, D3DRS_LIGHTING, TRUE);
+  IDirect3DDevice9_SetMaterial(g_device, &material);
+  clear(0xFF202020);
+  world_quad(0.25f);
+  read_back();
+  const int black = pixel(32, 32) == 0 && pixel(4, 32) == 0x202020;
+  material.Ambient.r = 1.0f, material.Ambient.g = 0.5f, material.Ambient.b = 0.25f;
+  IDirect3DDevice9_SetMaterial(g_device, &material);
+  IDirect3DDevice9_SetRenderState(g_device, D3DRS_AMBIENT, 0x00808080);
+  clear(0xFF202020);
+  world_quad(0.25f);
+  read_back();
+  check(black && near_colour(pixel(32, 32), 128, 64, 32), "lit vertices that nothing shines on are black, or the ambient light on the material");
+  IDirect3DDevice9_SetRenderState(g_device, D3DRS_AMBIENT, 0);
+
+  /* a directional light straight at the rectangle: the material's diffuse colour; turned 60 degrees away, half of it; from behind, none */
+  memset(&material, 0, sizeof material);
+  material.Diffuse.r = 1.0f, material.Diffuse.g = 0.5f, material.Diffuse.b = 0.25f, material.Diffuse.a = 1.0f;
+  IDirect3DDevice9_SetMaterial(g_device, &material);
+  IDirect3DDevice9_LightEnable(g_device, 0, TRUE);
+  clear(0xFF000000);
+  lit_quad(0.25f, 0);
+  read_back();
+  check(near_colour(pixel(32, 32), 255, 128, 64) && pixel(4, 32) == 0, "a directional light on the material's diffuse colour");
+  light.Direction.y = -1.7320508f, light.Direction.z = 1.0f;      /* (not of length 1: the light's direction is brought to it) */
+  IDirect3DDevice9_SetLight(g_device, 0, &light);
+  clear(0xFF000000);
+  lit_quad(0.25f, 0);
+  read_back();
+  const int half = near_colour(pixel(32, 32), 128, 64, 32);
+  light.Direction.y = 0.0f, light.Direction.z = -1.0f;
+  IDirect3DDevice9_SetLight(g_device, 0, &light);
+  clear(0xFF000000);
+  lit_quad(0.25f, 0);
+  read_back();
+  check(half && pixel(32, 32) == 0, "the light by the angle it falls at: half at 60 degrees, none from behind");
+  light.Direction.z = 1.0f;
+  IDirect3DDevice9_SetLight(g_device, 0, &light);
+
+  /* the diffuse colour is the vertex's where it has one; D3DRS_COLORVERTEX off or the source set to the material: the material's again */
+  clear(0xFF000000);
+  lit_quad(0.25f, 0xFF00FF00);
+  read_back();
+  const int from_vertex = near_colour(pixel(32, 32), 0, 255, 0);
+  IDirect3DDevice9_SetRenderState(g_device, D3DRS_COLORVERTEX, FALSE);
+  clear(0xFF000000);
+  lit_quad(0.25f, 0xFF00FF00);
+  read_back();
+  const int from_material = near_colour(pixel(32, 32), 255, 128, 64);
+  IDirect3DDevice9_SetRenderState(g_device, D3DRS_COLORVERTEX, TRUE);
+  IDirect3DDevice9_SetRenderState(g_device, D3DRS_DIFFUSEMATERIALSOURCE, D3DMCS_MATERIAL);
+  clear(0xFF000000);
+  lit_quad(0.25f, 0xFF00FF00);
+  read_back();
+  check(from_vertex && from_material && near_colour(pixel(32, 32), 255, 128, 64), "the diffuse colour comes from the vertex or the material, as the states say");
+  IDirect3DDevice9_SetRenderState(g_device, D3DRS_DIFFUSEMATERIALSOURCE, D3DMCS_COLOR1);
+
+  /* the world matrix turns the normals with the rectangle: turned to face away from the light, it is dark */
+  D3DMATRIX turned, identity;
+  memset(&turned, 0, sizeof turned);
+  memset(&identity, 0, sizeof identity);
+  identity.m[0][0] = identity.m[1][1] = identity.m[2][2] = identity.m[3][3] = 1.0f;
+  turned.m[0][0] = -1.0f, turned.m[1][1] = 1.0f, turned.m[2][2] = -1.0f, turned.m[3][3] = 1.0f;      /* half a turn about y */
+  turned.m[3][2] = 0.5f;                                                                              /* ... and back to where it was */
+  IDirect3DDevice9_SetTransform(g_device, D3DTS_WORLD, &turned);
+  clear(0xFF202020);
+  lit_quad(0.25f, 0);
+  read_back();
+  check(pixel(32, 32) == 0 && pixel(4, 32) == 0x202020, "the world matrix turns the normals: the rectangle's back is dark");
+  IDirect3DDevice9_SetTransform(g_device, D3DTS_WORLD, &identity);
+
+  /* a point light on the axis, 2 in front of the rectangle: its corners are sqrt(4.5) away, the light falls at them at 2 / sqrt(4.5), and
+   * it is divided by a quarter of the distance squared - 0.838 of the material's white */
+  material.Diffuse.g = material.Diffuse.b = 1.0f;
+  IDirect3DDevice9_SetMaterial(g_device, &material);
+  memset(&light, 0, sizeof light);
+  light.Type = D3DLIGHT_POINT;
+  light.Diffuse.r = light.Diffuse.g = light.Diffuse.b = 1.0f;
+  light.Position.z = -1.75f;
+  light.Range = 10.0f;
+  light.Attenuation2 = 0.25f;
+  IDirect3DDevice9_SetLight(g_device, 0, &light);
+  clear(0xFF000000);
+  lit_quad(0.25f, 0);
+  read_back();
+  const int point = near_colour(pixel(32, 32), 214, 214, 214);
+  light.Range = 2.0f;
+  IDirect3DDevice9_SetLight(g_device, 0, &light);
+  clear(0xFF000000);
+  lit_quad(0.25f, 0);
+  read_back();
+  check(point && pixel(32, 32) == 0, "a point light by its distance, and none beyond its range");
+
+  /* a spotlight from the same place along z: the corners are 19.5 degrees off its axis - inside a wide cone, outside a narrow one */
+  light.Type = D3DLIGHT_SPOT;
+  light.Range = 10.0f;
+  light.Direction.z = 1.0f;
+  light.Theta = 1.0f, light.Phi = 1.2f, light.Falloff = 1.0f;
+  IDirect3DDevice9_SetLight(g_device, 0, &light);
+  clear(0xFF000000);
+  lit_quad(0.25f, 0);
+  read_back();
+  const int wide = near_colour(pixel(32, 32), 214, 214, 214);
+  light.Theta = 0.2f, light.Phi = 0.4f;
+  IDirect3DDevice9_SetLight(g_device, 0, &light);
+  clear(0xFF000000);
+  lit_quad(0.25f, 0);
+  read_back();
+  check(wide && pixel(32, 32) == 0, "a spotlight lights what is inside its cone");
+
+  /* the specular colour: the light and the camera straight in front, so all of the material's specular colour - added after the stages */
+  memset(&material, 0, sizeof material);
+  material.Specular.r = 0.5f, material.Specular.g = 1.0f, material.Specular.b = 0.25f;
+  material.Power = 8.0f;
+  IDirect3DDevice9_SetMaterial(g_device, &material);
+  memset(&light, 0, sizeof light);
+  light.Type = D3DLIGHT_DIRECTIONAL;
+  light.Specular.r = light.Specular.g = light.Specular.b = 1.0f;
+  light.Direction.z = 1.0f;
+  IDirect3DDevice9_SetLight(g_device, 0, &light);
+  IDirect3DDevice9_SetRenderState(g_device, D3DRS_LOCALVIEWER, FALSE);
+  clear(0xFF202020);
+  lit_quad(0.25f, 0);
+  read_back();
+  const int without = pixel(32, 32) == 0;
+  IDirect3DDevice9_SetRenderState(g_device, D3DRS_SPECULARENABLE, TRUE);
+  clear(0xFF202020);
+  lit_quad(0.25f, 0);
+  read_back();
+  check(without && near_colour(pixel(32, 32), 128, 255, 64), "the specular colour, where D3DRS_SPECULARENABLE asks for it");
+  IDirect3DDevice9_SetRenderState(g_device, D3DRS_LOCALVIEWER, TRUE);
+  IDirect3DDevice9_LightEnable(g_device, 0, FALSE);
+  IDirect3DDevice9_SetRenderState(g_device, D3DRS_LIGHTING, FALSE);
+
+  /* without lighting the specular colour is the vertex's second colour */
+  {
+    const struct { float x, y, z; DWORD colour, specular; } v[4] = {{-0.5f, 0.5f, 0.25f, 0xFF400000, 0x00004080}, {0.5f, 0.5f, 0.25f, 0xFF400000, 0x00004080},
+                                                                    {-0.5f, -0.5f, 0.25f, 0xFF400000, 0x00004080}, {0.5f, -0.5f, 0.25f, 0xFF400000, 0x00004080}};
+    clear(0xFF000000);
+    IDirect3DDevice9_SetFVF(g_device, D3DFVF_XYZ | D3DFVF_DIFFUSE | D3DFVF_SPECULAR);
+    IDirect3DDevice9_DrawPrimitiveUP(g_device, D3DPT_TRIANGLESTRIP, 2, v, sizeof v[0]);
+    read_back();
+    const int added = near_colour(pixel(32, 32), 64, 64, 128);
+    IDirect3DDevice9_SetRenderState(g_device, D3DRS_SPECULARENABLE, FALSE);
+    clear(0xFF000000);
+    IDirect3DDevice9_DrawPrimitiveUP(g_device, D3DPT_TRIANGLESTRIP, 2, v, sizeof v[0]);
+    read_back();
+    check(added && near_colour(pixel(32, 32), 64, 0, 0), "unlit vertices bring their specular colour, which is added where it is asked for");
+  }
+  IDirect3DDevice9_SetRenderState(g_device, D3DRS_CULLMODE, D3DCULL_CCW);
+}
+
 static void test_render_to_texture(void) {
   IDirect3DTexture9 *target = NULL;
   IDirect3DSurface9 *surface = NULL, *back = NULL, *depth = NULL;
@@ -933,6 +1120,7 @@ int main(void) {
     test_state_blocks();
     test_shaders();
     test_fog();
+    test_lighting();
     test_render_to_texture();
     test_present_and_reset();
     check(IDirect3DDevice9_Release(g_device) == 0, "the device is gone with its last reference");

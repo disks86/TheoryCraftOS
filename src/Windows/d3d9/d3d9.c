@@ -36,8 +36,8 @@
  *   textures    a Direct3D 12 texture of B8G8R8A8 whatever the program's format; a level is sent when it is unlocked.
  *   Present     the back buffer's pixels are read and put into the window (SetDIBitsToDevice), as dxgi.dll does for its swap chains.
  *
- * Not there: what the translator refuses of a program's shaders (loops, cube and volume samplers, more: docs/Direct3D9.md), lighting (a vertex has
- * its diffuse colour, or white), fog, texture transforms and generated coordinates, more than two texture stages, the stage operations beyond
+ * Not there: what the translator refuses of a program's shaders (loops, cube and volume samplers, more: docs/Direct3D9.md),
+ * texture transforms and generated coordinates, more than two texture stages, the stage operations beyond
  * select, modulate and add, cube and volume textures, compressed formats, multisampling, queries, clip planes, point sprites. */
 #define INITGUID
 #define COBJMACROS
@@ -51,6 +51,7 @@
 #include "../tcosdx.h"
 #include <stdint.h>
 #include "sm_to_dxbc.h"
+#include "ff_lighting.h"
 
 #pragma GCC diagnostic ignored "-Wunused-function"
 #pragma GCC diagnostic ignored "-Wincompatible-pointer-types"
@@ -65,7 +66,8 @@ __asm__(".text\n.globl ___chkstk_ms\n___chkstk_ms:\n ret\n");
 #define TEXTURE_SLOTS 16u              /* the stages a program may set textures and states of: the samplers of a pixel shader */
 #define ROOTS 4u                       /* root signatures: for 2, 4, 8 and 16 textures */
 #define STREAMS 4u
-#define VERTEX_BYTES 56u               /* a decoded vertex: position (4 floats), colour (4), two texture coordinates (2 + 2), the fog factor it brings (1 + 1 unused) */
+#define VERTEX_BYTES 64u               /* a decoded vertex: position (4 floats), colour (4), two texture coordinates (2 + 2), the fog factor it brings and its specular colour (1 + 3) */
+#define LIGHTS 32u                     /* the lights a program can set, by their numbers; FFL_LIGHTS of them shine at once */
 #define VERTEX_RING (1u << 20)       /* (21845 vertices a draw at most. The rings are kept small: each is there three times - here, in the kernel, on the device) */
 #define INDEX_RING (256u << 10)
 #define CONSTANT_RING (256u << 10)
@@ -138,6 +140,7 @@ typedef struct Attribute { BYTE stream, type; WORD offset; } Attribute;
 typedef struct Layout {
   Attribute position, colour, texture[2];
   Attribute specular;            /* the second colour: its alpha is the fog factor the vertex brings */
+  Attribute normal;              /* for lighting */
   int transformed;               /* the positions are pixels (XYZRHW) */
 } Layout;
 typedef struct Decl {
@@ -176,6 +179,8 @@ typedef struct State {
   D3DVIEWPORT9 viewport;
   RECT scissor;
   D3DMATERIAL9 material;
+  D3DLIGHT9 light[LIGHTS];
+  DWORD light_set, light_on;     /* a bit for each light that was set, and that shines */
   DWORD fvf;
   Decl *decl;
   Stream stream[STREAMS];

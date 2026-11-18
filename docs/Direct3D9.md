@@ -12,8 +12,9 @@ program hands over is kept in plain memory, and a draw brings it into the one fo
 | Direct3D 9 | here |
 |---|---|
 | vertex and index buffers | plain memory; `Lock` hands it out. |
-| a draw | each vertex it reads is decoded - whatever the layout, an FVF code or a declaration, and whatever the types - into a position, a colour, two sets of texture coordinates and the fog factor it brings - the alpha of its second colour (56 bytes), in a ring of upload memory; the indices are copied into another ring, counted from the first vertex the draw reads. A triangle fan becomes a list. `DrawPrimitiveUP` and `DrawIndexedPrimitiveUP` take the same way from the program's memory. |
+| a draw | each vertex it reads is decoded - whatever the layout, an FVF code or a declaration, and whatever the types - into a position, a colour, two sets of texture coordinates and the fog factor it brings - the alpha of its second colour - and a specular colour (64 bytes), in a ring of upload memory; the indices are copied into another ring, counted from the first vertex the draw reads. A triangle fan becomes a list. `DrawPrimitiveUP` and `DrawIndexedPrimitiveUP` take the same way from the program's memory. |
 | the fixed-function pipeline | one vertex shader and one pixel shader, written in HLSL and compiled ahead (below). The vertex shader multiplies by world * view * projection, or takes positions that are pixels already (XYZRHW; Direct3D 9 has the pixels' centres at whole numbers, the rasterizer here at halves: half a pixel is added). The vertex shader also works out the fog factor where fog is by the vertex (`D3DRS_FOGVERTEXMODE`: linear, exponential, exponential squared, of the depth in view space - or, with `D3DRS_RANGEFOGENABLE`, of the distance from the eye), and passes on the factor the vertex brings where fog is by the vertex and there is no mode, or the positions are pixels. Positions that are pixels keep their fourth number, 1 / w: what is between the vertices is as the perspective has it, and fog by the pixel's depth can go by that w. The pixel shader does two texture stages, then the alpha test and fog as a program's pixel shader ends with them (below). |
+| lighting | on the CPU, where the vertices are decoded (`ff_lighting.h`, which needs no library: the DLL has no C runtime). With `D3DRS_LIGHTING` a vertex's colour is the emissive colour, the ambient light on the ambient colour, and for each light that shines (the first 8 that are switched on, of 32 numbers) its diffuse light by the angle it falls at; with `D3DRS_SPECULARENABLE` a specular colour too, which the pixel shader adds after the stages. Directional lights, point lights (range, attenuation) and spotlights (the two cones and the falloff); the material, and each of its colours from the vertex instead where `D3DRS_COLORVERTEX` and the four material sources say so and the vertex has that colour; `D3DRS_AMBIENT`, `D3DRS_NORMALIZENORMALS`, `D3DRS_LOCALVIEWER`. Normals go through the inverse of world * view, transposed. Vertices that are pixels already, and a program's vertex shader, are not lit. Without lighting the specular colour is the vertex's second colour. |
 | texture stages | what a stage does is three weights for the colour and three for the alpha: `x * texture * current + y * texture + z * current` - modulate (also 2x and 4x), select either argument, add, off. A stage with no texture passes on what it is given. |
 | render states | a Direct3D 12 pipeline for each combination of the states a pipeline holds (culling, depth test and write, blending with separate alpha, the colour write mask, stencil), in a cache of 64. The alpha test is a constant of the pixel shader; the scissor rectangle and the viewport are set with the target. |
 | textures and surfaces | a Direct3D 12 texture of B8G8R8A8 whatever the program's format (A8R8G8B8, X8R8G8B8, R8G8B8, R5G6B5, X1R5G5B5, A1R5G5B5, A4R4G4B4, A8, L8, A8L8); the program's copy of a level is converted and sent when it is unlocked. A surface in system memory is memory only. Locking something that is drawn into fetches its pixels. |
@@ -86,8 +87,9 @@ in the program, in the kernel, on the device - and the kernel could not make rin
   white. The caps say 3.0 although not every 3.0 shader can be made.
 - Of fog: range fog is the fixed-function vertex stage's only, as in Direct3D 9. A vertex without a second colour brings the fog
   factor 1 (no fog), which is a choice made here and not checked against Direct3D 9 itself.
-- Lighting: a vertex has its diffuse colour, or white. Materials and lights are taken and not used.
-- Specular, texture transforms and generated texture coordinates, the texture factor, more than two texture stages, the stage
+- Of lighting: more than 8 lights at once, light numbers above 31, vertex blending (the blend weights are skipped), and the fog factor
+  lit vertices would get from the specular alpha is the vertex's own.
+- Texture transforms and generated texture coordinates, the texture factor, more than two texture stages, the stage
   operations beyond the ones above, bump mapping.
 - Cube and volume textures, compressed formats (DXT), 16-bit and floating-point targets, multisampling.
 - Clears of a part of a target; `StretchRect` and `UpdateSurface` of a part or between sizes; `GetDC` of a surface.
@@ -109,12 +111,16 @@ Direct3D 9 bytecode makes of the same shader; shaders written token by token giv
 and texture registers, and the alpha test and fog at a pixel shader's end); what is refused; every shortened shader and 30000
 with a bit turned.
 
-`tests/windows/d3d9test.c` (105 checks): the Direct3D object and the adapter, a device on a window, clears, vertices that are pixels (to
+`tests/FfLightingTest.cpp` (host, ASan and UBSan): the square root, cosine and power of `ff_lighting.h` against the host's, the matrix
+for normals, each kind of light with numbers worked out by hand, 4000 random set-ups against the same sums written with the host's
+functions, and 3000 set-ups with infinities and NaN in them, whose colours must still be 0 .. 1.
+
+`tests/windows/d3d9test.c` (116 checks): the Direct3D object and the adapter, a device on a window, clears, vertices that are pixels (to
 the pixel) and vertices through the matrices, vertex and index buffers, culling, fans, textures of 32 and 16 bits, the stage operations,
 the alpha test, blending, depth, the scissor rectangle, state blocks, the program's shaders (a vertex shader with the fixed-function pixel
 stage, vertex and pixel shaders of 1.1, 2.0 and 3.0 from FVF vertices and from a vertex buffer through a declaration, constants of both
 stages, a pixel shader that samples and discards, a pixel shader after the fixed-function vertex stage, pixel shaders 1.1 and 1.4, the alpha test and fog - by depth and by a vertex shader's factor - after a pixel shader), the fixed-function pipeline's alpha test
 with each kind of function and its fog by the pixel's depth (by z, and by w under a perspective projection) and by the vertex (also by the distance: range fog; and by what vertices that are pixels bring - their w, and the factor in the second colour's alpha), drawing into a texture and sampling it, `GetRenderTargetData`,
-`Present`, `Reset`, and that everything is gone with its last reference. Run in the real kernel on its CPU renderer:
+`Present`, `Reset`, lighting (the lights kept and read back, ambient, a directional light by its angle, the colour sources, normals through the world matrix, a point light's distance and range, a spotlight's cone, the specular colour lit and unlit), and that everything is gone with its last reference. Run in the real kernel on its CPU renderer:
 `tests/wow64_qemu.sh d3d9test` (32-bit); the same source built for x86-64 passes too. `DxgkrnlTest` checks that the kernel compiles the
 two shaders.
