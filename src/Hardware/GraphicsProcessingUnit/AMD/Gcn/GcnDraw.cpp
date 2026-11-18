@@ -152,9 +152,10 @@ class Machine final : public IEnvironment {
   ITexelMemory* texel_memory_ = nullptr;
   const BlendState* blend_ = nullptr;
   uint64_t exported_ = 0;                  // the lanes of the pixel wave that wrote a colour
-  float src0_[kWaveSize][4] = {};          // the colours the wave exported (COLOR[0], and COLOR[1] as the second source)
-  float src1_[kWaveSize][4] = {};
-  uint32_t enable0_ = 0;
+  // The colours the wave exported: COLOR[n] for render target n (COLOR[1] is also the second source of dual source blending), and the components each export wrote.
+  float colors_[abi::kMaxColorExports][kWaveSize][4] = {};
+  uint32_t enable_[abi::kMaxColorExports] = {};
+  uint32_t exports_ = 0;                   // bit n: the wave exported COLOR[n]
   bool fault_ = false;
 
   // blends and writes the colours of the lanes that exported one (after the wave)
@@ -162,21 +163,25 @@ class Machine final : public IEnvironment {
     const BlendState& b = *blend_;
     for (uint32_t lane = 0; lane < count; ++lane) {
       if (!(exported_ >> lane & 1)) continue;
-      float* px = target_->pixel(pixel_x_[lane], pixel_y_[lane]);
-      if (!px) continue;
-      float src[4] = {src0_[lane][0], src0_[lane][1], src0_[lane][2], src0_[lane][3]};
-      if (b.enable) {
-        const float dst[4] = {px[0], px[1], px[2], px[3]};
-        float out[4];
-        for (uint32_t c = 0; c < 4; ++c) {
-          const bool alpha = c == 3 && b.separate_alpha;
-          const uint32_t sf = alpha ? b.alpha_src : b.color_src, df = alpha ? b.alpha_dst : b.color_dst, op = alpha ? b.alpha_op : b.color_op;
-          out[c] = blend_combine(op, src[c], blend_factor(sf, src, dst, b.constant, src1_[lane], c), dst[c], blend_factor(df, src, dst, b.constant, src1_[lane], c));
+      // (each target the framebuffer has and the shader exported a colour for, with the one blend state)
+      for (uint32_t n = 0; n < target_->targets(); ++n) {
+        if (!(exports_ >> n & 1)) continue;
+        float* px = target_->pixel(pixel_x_[lane], pixel_y_[lane], n);
+        if (!px) continue;
+        float src[4] = {colors_[n][lane][0], colors_[n][lane][1], colors_[n][lane][2], colors_[n][lane][3]};
+        if (b.enable) {
+          const float dst[4] = {px[0], px[1], px[2], px[3]};
+          float out[4];
+          for (uint32_t c = 0; c < 4; ++c) {
+            const bool alpha = c == 3 && b.separate_alpha;
+            const uint32_t sf = alpha ? b.alpha_src : b.color_src, df = alpha ? b.alpha_dst : b.color_dst, op = alpha ? b.alpha_op : b.color_op;
+            out[c] = blend_combine(op, src[c], blend_factor(sf, src, dst, b.constant, colors_[1][lane], c), dst[c], blend_factor(df, src, dst, b.constant, colors_[1][lane], c));
+          }
+          for (uint32_t c = 0; c < 4; ++c) src[c] = out[c];
         }
-        for (uint32_t c = 0; c < 4; ++c) src[c] = out[c];
+        for (uint32_t c = 0; c < 4; ++c)
+          if ((enable_[n] >> c & 1) && (b.write_mask >> c & 1)) px[c] = src[c];
       }
-      for (uint32_t c = 0; c < 4; ++c)
-        if ((enable0_ >> c & 1) && (b.write_mask >> c & 1)) px[c] = src[c];
     }
   }
 
@@ -234,16 +239,17 @@ class Machine final : public IEnvironment {
     if (compressed) return;
     if (pixel_stage_) {
       // the colours wait for the end of the wave: the blend needs both when the shader exports a second one
-      if (target != kExpMrt0 && target != kExpMrt0 + 1) return;
-      const bool second = target != kExpMrt0;
+      if (target < kExpMrt0 || target - kExpMrt0 >= abi::kMaxColorExports) return;
+      const uint32_t n = target - kExpMrt0;
       for (uint32_t lane = 0; lane < kWaveSize; ++lane) {
         if (!(lanes >> lane & 1)) continue;
-        if (!second && !target_->pixel(pixel_x_[lane], pixel_y_[lane])) continue;
-        if (!second) exported_ |= uint64_t{1} << lane;
-        float* dst = second ? src1_[lane] : src0_[lane];
+        if (n == 0 && !target_->pixel(pixel_x_[lane], pixel_y_[lane])) continue;
+        if (n == 0) exported_ |= uint64_t{1} << lane;
+        float* dst = colors_[n][lane];
         for (uint32_t c = 0; c < 4; ++c) dst[c] = enable >> c & 1 ? bits_to_float(values[lane][c]) : 0.0f;
       }
-      if (!second) enable0_ = enable;
+      enable_[n] = enable;
+      exports_ |= 1u << n;
       return;
     }
     float* out = nullptr;
@@ -271,8 +277,8 @@ struct Screen {
 
 }  // namespace
 
-Framebuffer::Framebuffer(allocators::IAllocator& allocator, uint32_t width, uint32_t height) : rgba_(allocator), width_(width), height_(height) {
-  valid_ = width != 0 && height != 0 && width <= 16384 && height <= 16384 && fill_f(rgba_, static_cast<uint64_t>(width) * height * 4);
+Framebuffer::Framebuffer(allocators::IAllocator& allocator, uint32_t width, uint32_t height, uint32_t targets) : rgba_(allocator), width_(width), height_(height), targets_(targets) {
+  valid_ = width != 0 && height != 0 && width <= 16384 && height <= 16384 && targets >= 1 && targets <= abi::kMaxColorExports && fill_f(rgba_, static_cast<uint64_t>(width) * height * 4 * targets);
 }
 
 void Framebuffer::clear(float r, float g, float b, float a) {
@@ -417,6 +423,7 @@ DrawStatus draw(allocators::IAllocator& allocator, const DrawCall& call, Framebu
       w.set_vgpr_f(1, l, pj[l]);
     }
     m.exported_ = 0;
+    m.exports_ = 0;
     const bool ok = w.run(call.pixel_code, m) == Status::Done && !m.fault_;
     if (ok) m.resolve(pending);
     // the pixels that wrote a colour pass: the stencil operation for passing and the depth

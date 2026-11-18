@@ -74,6 +74,11 @@ struct VegaDrawRequest {
   // What the planes hold before the draw instead of the clear values, in the layout draw() returns them in (target_bytes(), depth_bytes() and stencil_bytes() long): how a second draw
   // goes on from the first one's picture. An empty view: cleared.
   ConstByteView initial_target, initial_depth, initial_stencil;
+  // More colour targets: render targets 1 .. target_count - 1, in the layout, pitch and size of the first one (target_bytes() each). The pixel shader exports a colour for
+  // each (ShaderInfo::color_outputs is at least target_count); all are blended and masked as the first. initial_extra[n - 1] is what target n holds before the draw (empty:
+  // the clear colour).
+  uint32_t target_count = 1;
+  ConstByteView initial_extra[gcn::kMaxColorTargets - 1];
 };
 
 class AmdVegaDraw {
@@ -102,7 +107,9 @@ class AmdVegaDraw {
   // Runs the draw. `staging` is system memory the card can reach (the memory upload() copies from), at least area_bytes() long; `pixels` receives the colour buffer (target_bytes() long;
   // system memory the card can reach), `depth` and `stencil` the planes the request uses (depth_bytes() and stencil_bytes() long; an empty view is not filled). `area_offset` is a
   // multiple of 256 in the framebuffer area. False if the request is not expressible, does not fit the area, a transfer or the graphics ring fails; the buffers are then not valid.
-  static bool draw(AmdVegaM& card, const VegaDrawRequest& request, uint64_t area_offset, ByteView staging, ByteView pixels, ByteView depth = ByteView(), ByteView stencil = ByteView());
+  // `extra_pixels[n - 1]` receives colour target n (target_bytes() long each; there must be target_count - 1 of them).
+  static bool draw(AmdVegaM& card, const VegaDrawRequest& request, uint64_t area_offset, ByteView staging, ByteView pixels, ByteView depth = ByteView(), ByteView stencil = ByteView(),
+                   ArrayView<ByteView> extra_pixels = ArrayView<ByteView>());
 };
 
 }  // namespace hardware

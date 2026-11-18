@@ -3287,6 +3287,59 @@ static void test_back_end_on_card() {
     one_colour.pixel_info = req.pixel_info;
     CHECK(!AmdVegaDraw::draw(vega, one_colour, 4096, ByteView(staging, AmdVegaDraw::area_bytes(one_colour)), ByteView(pixels, AmdVegaDraw::target_bytes(one_colour))));
   }
+  // eight render targets on the card: the pixel shader's COLOR[n] is constant row n, and each target comes back holding its own row (the clear colour where nothing is drawn)
+  {
+    List<uint32_t> mrt_ps(rig.alloc);
+    gcn::ShaderInfo mrt_info;
+    CHECK(compile_gcn(rig.alloc,
+                      "FRAG\nDCL IN[0], GENERIC[0], PERSPECTIVE\nDCL OUT[0], COLOR\nDCL OUT[1], COLOR[1]\nDCL OUT[2], COLOR[2]\nDCL OUT[3], COLOR[3]\nDCL OUT[4], COLOR[4]\nDCL OUT[5], COLOR[5]\n"
+                      "DCL OUT[6], COLOR[6]\nDCL OUT[7], COLOR[7]\nDCL CONST[0..7]\n  0: MOV OUT[0], CONST[0]\n  1: MOV OUT[1], CONST[1]\n  2: MOV OUT[2], CONST[2]\n  3: MOV OUT[3], CONST[3]\n"
+                      "  4: MOV OUT[4], CONST[4]\n  5: MOV OUT[5], CONST[5]\n  6: MOV OUT[6], CONST[6]\n  7: MOV OUT[7], CONST[7]\n  8: END\n",
+                      mrt_ps, &mrt_info));
+    CHECK(mrt_info.color_outputs == 8);
+    static float rows[8][4];
+    for (int n = 0; n < 8; ++n) { rows[n][0] = (n + 1) / 16.0f; rows[n][1] = 1.0f - n / 8.0f; rows[n][2] = n / 32.0f; rows[n][3] = 1.0f; }
+    static const float half[21] = {-1, -1, 0, 1, 0, 0, 0.25f, 1, -1, 0, 1, 0, 0, 0.25f, -1, 1, 0, 1, 0, 0, 0.25f};      // (the half of the target on one side of a diagonal)
+    VegaDrawRequest mr = tex;
+    mr.textures[0] = VegaTexture();
+    mr.pixel_code = ArrayView<const uint32_t>(mrt_ps.view().data(), mrt_ps.count());
+    mr.pixel_info = mrt_info;
+    mr.pixel_constants = ArrayView<const float>(&rows[0][0], 32);
+    mr.vertex_data = ArrayView<const uint32_t>(reinterpret_cast<const uint32_t*>(half), 21);
+    mr.clear[0] = 0; mr.clear[1] = 0; mr.clear[2] = 1; mr.clear[3] = 1;
+    mr.target_count = 8;
+    const uint64_t bytes = AmdVegaDraw::target_bytes(mr);
+    // (the targets come back into system memory the card can reach: the pool, after the first target's room)
+    const uint64_t room = (bytes + 4095) / 4096 * 4096;
+    uint8_t* extra[7];
+    ByteView extra_views[7];
+    for (int n = 0; n < 7; ++n) {
+      extra[n] = pixels + room * (n + 1);
+      extra_views[n] = ByteView(extra[n], bytes);
+    }
+    CHECK(static_cast<uint64_t>(pixels - pool.memory.data()) + room * 8 <= pool.memory.size());
+    CHECK(AmdVegaDraw::area_bytes(mr) != 0);
+    CHECK(AmdVegaDraw::draw(vega, mr, 4096, ByteView(staging, AmdVegaDraw::area_bytes(mr)), ByteView(pixels, bytes), ByteView(), ByteView(), ArrayView<ByteView>(extra_views, 7)));
+    // (clip space y is up here: the triangle covers the corner at the bottom left of the picture, not the one at the top right)
+    const uint32_t in_x = 2, in_y = mr.height - 3, out_x = mr.width - 3, out_y = 2;
+    int right = 0, untouched = 0;
+    for (int n = 0; n < 8; ++n) {
+      const uint8_t* plane = n == 0 ? pixels : extra[n - 1];
+      float v[4], o[4];
+      memcpy(v, plane + AmdVegaDraw::pixel_offset(mr, in_x, in_y), 16);
+      memcpy(o, plane + AmdVegaDraw::pixel_offset(mr, out_x, out_y), 16);
+      right += v[0] == rows[n][0] && v[1] == rows[n][1] && v[2] == rows[n][2] && v[3] == 1.0f;
+      untouched += o[0] == 0.0f && o[1] == 0.0f && o[2] == 1.0f && o[3] == 1.0f;
+    }
+    printf("  eight render targets on the card: %d hold their own colour inside the triangle, %d the clear colour outside it\n", right, untouched);
+    CHECK(right == 8 && untouched == 8);
+    // more targets than the shader has colours, or no room given for one of them: refused
+    VegaDrawRequest too_many = mr;
+    too_many.pixel_code = req.pixel_code;
+    too_many.pixel_info = req.pixel_info;
+    CHECK(AmdVegaDraw::area_bytes(too_many) == 0);
+    CHECK(!AmdVegaDraw::draw(vega, mr, 4096, ByteView(staging, AmdVegaDraw::area_bytes(mr)), ByteView(pixels, bytes), ByteView(), ByteView(), ArrayView<ByteView>(extra_views, 6)));
+  }
   // refused before anything is submitted: texels that are not the size of the texture, a texture in a layout that is not implemented, a plane layout the registers cannot name
   const uint32_t calls = draws;
   VegaDrawRequest bad = tex;

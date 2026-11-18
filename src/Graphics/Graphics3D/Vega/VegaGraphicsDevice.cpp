@@ -243,9 +243,11 @@ struct VegaGraphicsDevice::Scratch {
     release_view(allocator, initial_stencil);
     for (ByteView& v : texture) release_view(allocator, v);
     release_view(allocator, vertices);
+    for (ByteView& v : extra_target) release_view(allocator, v);
+    for (ByteView& v : initial_extra) release_view(allocator, v);
   }
   allocators::IAllocator& allocator;
-  ByteView area, target, depth, stencil, initial_target, initial_depth, initial_stencil, texture[gcn::abi::kMaxSamplers], vertices;
+  ByteView area, target, depth, stencil, initial_target, initial_depth, initial_stencil, texture[gcn::abi::kMaxSamplers], vertices, extra_target[gcn::kMaxColorTargets - 1], initial_extra[gcn::kMaxColorTargets - 1];
   List<uint32_t> indices;
 };
 
@@ -253,6 +255,8 @@ struct VegaGraphicsDevice::Scratch {
 struct VegaGraphicsDevice::DrawArgs {
   const VegaPipeline* pipeline = nullptr;
   VegaImage* color = nullptr;
+  VegaImage* extra_colors[gcn::kMaxColorTargets - 1] = {};   // the pass's colour targets 1 .. target_count - 1
+  uint32_t target_count = 1;
   VegaImage* depth = nullptr;
   Rect2D scissor;
   Viewport viewport;   // (in the target's pixels; the whole target when no viewport was set)
@@ -335,7 +339,7 @@ IPipeline* VegaGraphicsDevice::create_graphics_pipeline(const GraphicsPipelineDe
   const VegaModule* vs = static_cast<const VegaModule*>(desc.vertex_shader);
   const VegaModule* fs = static_cast<const VegaModule*>(desc.fragment_shader);
   if (!vs || !fs || vs->stage() != ShaderStage::Vertex || fs->stage() != ShaderStage::Fragment) return nullptr;
-  if (desc.color_target_count != 1 || desc.independent_blend || desc.texture_count > gcn::abi::kMaxSamplers || desc.attribute_count > gcn::abi::kMaxAttributes) return nullptr;
+  if (desc.color_target_count == 0 || desc.color_target_count > gcn::kMaxColorTargets || desc.independent_blend || desc.texture_count > gcn::abi::kMaxSamplers || desc.attribute_count > gcn::abi::kMaxAttributes) return nullptr;
   // (the vertices are handed to the card repacked - run_draw - so an attribute may be of any format, at any offset, in any of the vertex buffer slots; not stepped by instance)
   uint32_t locations = 0;
   for (uint32_t i = 0; i < desc.attribute_count; ++i) {
@@ -346,7 +350,8 @@ IPipeline* VegaGraphicsDevice::create_graphics_pipeline(const GraphicsPipelineDe
     locations |= 1u << at.location;
   }
   if ((vs->info.attributes_used & ~locations) != 0) return nullptr;   // (an input of the vertex shader that nothing feeds)
-  if (fs->info.color_outputs != 1 || (fs->info.samplers_used >> desc.texture_count) != 0) return nullptr;
+  // (a colour of the pixel shader for every target the pipeline draws into; a shader with more exports them to nothing)
+  if (fs->info.color_outputs < desc.color_target_count || (fs->info.samplers_used >> desc.texture_count) != 0) return nullptr;
   // Each attribute the pixel shader reads comes from the vertex shader's output of the same meaning (GENERIC[n] from GENERIC[n]), wherever the two declare it; a pixel shader input
   // the vertex shader does not write is refused.
   uint8_t ps_param[16] = {};
@@ -396,6 +401,8 @@ bool VegaGraphicsDevice::run_draw(const DrawArgs& a) {
   r.pixel_info = pipe.pixel_info;
   r.width = width;
   r.height = height;
+  if (pd.color_target_count > a.target_count) return fail("a pipeline of more colour targets than the pass has");
+  r.target_count = pd.color_target_count;
   r.device_clip_space = true;
   r.viewport = {true, a.viewport.x, a.viewport.y, a.viewport.width, a.viewport.height, a.viewport.min_depth, a.viewport.max_depth};
   r.blend = pipe.blend;
@@ -509,6 +516,10 @@ bool VegaGraphicsDevice::run_draw(const DrawArgs& a) {
   if (!ensure(allocator_, &s.area, area) || !ensure(allocator_, &s.target, target_bytes) || !ensure(allocator_, &s.initial_target, target_bytes)) return fail("out of memory");
   if (depth_bytes && (!ensure(allocator_, &s.depth, depth_bytes) || !ensure(allocator_, &s.initial_depth, depth_bytes))) return fail("out of memory");
   if (stencil_bytes && (!ensure(allocator_, &s.stencil, stencil_bytes) || !ensure(allocator_, &s.initial_stencil, stencil_bytes))) return fail("out of memory");
+  for (uint32_t n = 1; n < r.target_count; ++n) {
+    if (!ensure(allocator_, &s.extra_target[n - 1], target_bytes) || !ensure(allocator_, &s.initial_extra[n - 1], target_bytes)) return fail("out of memory");
+    s.initial_extra[n - 1].first(target_bytes).fill(0);
+  }
   s.initial_target.first(target_bytes).fill(0);
   if (depth_bytes) s.initial_depth.first(depth_bytes).fill(0);
   if (stencil_bytes) s.initial_stencil.first(stencil_bytes).fill(0);
@@ -516,6 +527,10 @@ bool VegaGraphicsDevice::run_draw(const DrawArgs& a) {
     for (uint32_t x = 0; x < width; ++x) {
       const Vec4 c = unpack_color(a.color->color()[uint64_t{y} * width + x]);
       put_floats(s.initial_target, AmdVegaDraw::pixel_offset(r, x, y), {c.x, c.y, c.z, c.w});
+      for (uint32_t n = 1; n < r.target_count; ++n) {
+        const Vec4 e = unpack_color(a.extra_colors[n - 1]->color()[uint64_t{y} * width + x]);
+        put_floats(s.initial_extra[n - 1], AmdVegaDraw::pixel_offset(r, x, y), {e.x, e.y, e.z, e.w});
+      }
       if (depth_bytes) {
         ByteWriter w(s.initial_depth.subview(AmdVegaDraw::depth_offset(r, x, y), 4));
         w.le32(__builtin_bit_cast(uint32_t, a.depth->depth()[uint64_t{y} * width + x]));
@@ -527,7 +542,13 @@ bool VegaGraphicsDevice::run_draw(const DrawArgs& a) {
   if (depth_bytes) r.initial_depth = ConstByteView(s.initial_depth.data(), depth_bytes);
   if (stencil_bytes) r.initial_stencil = ConstByteView(s.initial_stencil.data(), stencil_bytes);
 
-  if (!AmdVegaDraw::draw(card_, r, area_offset_, s.area.first(area), s.target.first(target_bytes), depth_bytes ? s.depth.first(depth_bytes) : ByteView(), stencil_bytes ? s.stencil.first(stencil_bytes) : ByteView()))
+  ByteView extra_pixels[gcn::kMaxColorTargets - 1];
+  for (uint32_t n = 1; n < r.target_count; ++n) {
+    r.initial_extra[n - 1] = ConstByteView(s.initial_extra[n - 1].data(), target_bytes);
+    extra_pixels[n - 1] = s.extra_target[n - 1].first(target_bytes);
+  }
+  if (!AmdVegaDraw::draw(card_, r, area_offset_, s.area.first(area), s.target.first(target_bytes), depth_bytes ? s.depth.first(depth_bytes) : ByteView(), stencil_bytes ? s.stencil.first(stencil_bytes) : ByteView(),
+                         ArrayView<ByteView>(extra_pixels, r.target_count - 1)))
     return fail("the card did not run the draw");
   ++draws_;
 
@@ -539,6 +560,10 @@ bool VegaGraphicsDevice::run_draw(const DrawArgs& a) {
       const uint64_t at = uint64_t{py} * width + px;
       const uint64_t o = AmdVegaDraw::pixel_offset(r, px, py);
       a.color->color()[at] = pack_color({get_float(s.target, o), get_float(s.target, o + 4), get_float(s.target, o + 8), get_float(s.target, o + 12)});
+      for (uint32_t n = 1; n < r.target_count; ++n) {
+        const ByteView& e = s.extra_target[n - 1];
+        a.extra_colors[n - 1]->color()[at] = pack_color({get_float(e, o), get_float(e, o + 4), get_float(e, o + 8), get_float(e, o + 12)});
+      }
       if (depth_bytes) a.depth->depth()[at] = get_float(s.depth, AmdVegaDraw::depth_offset(r, px, py));
       if (stencil_bytes) a.depth->stencil()[at] = s.stencil[AmdVegaDraw::stencil_offset(r, px, py)];
     }
@@ -565,9 +590,24 @@ bool VegaGraphicsDevice::submit(ICommandBuffer* commands) {
       case RecordedCommand::Type::BeginRenderPass: {
         VegaImage* color = static_cast<VegaImage*>(cmd.pass.color);
         VegaImage* depth = static_cast<VegaImage*>(cmd.pass.depth);
-        if (in_pass || !color || cmd.pass.extra_colors[0]) return fail("a render pass this device cannot run");
+        if (in_pass || !color) return fail("a render pass this device cannot run");
         if (!(color->usage() & kImageColorAttachment) || color->color().empty()) return fail("a render target that is not a colour attachment");
         if (depth && (depth->depth().empty() || depth->extent().width != color->extent().width || depth->extent().height != color->extent().height)) return fail("a depth image that does not match the target");
+        // (the other colour targets: colour attachments of the first one's size, each once, with no gap)
+        a.target_count = 1;
+        for (uint32_t n = 0; n + 1 < kMaxColorTargets; ++n) {
+          VegaImage* extra = static_cast<VegaImage*>(cmd.pass.extra_colors[n]);
+          a.extra_colors[n] = nullptr;
+          if (!extra) continue;
+          if (n + 1 != a.target_count || n + 1 >= gcn::kMaxColorTargets) return fail("colour targets with a gap, or more than the card has");
+          if (!(extra->usage() & kImageColorAttachment) || extra->color().empty() || extra == color || extra->extent().width != color->extent().width || extra->extent().height != color->extent().height)
+            return fail("a colour target that does not match the first");
+          for (uint32_t k = 0; k < n; ++k)
+            if (a.extra_colors[k] == extra) return fail("a colour target used twice");
+          a.extra_colors[n] = extra;
+          a.target_count = n + 2;
+          if (cmd.pass.clear_color) extra->color().fill(pack_color(cmd.pass.clear_color_value));
+        }
         if (cmd.pass.clear_color) color->color().fill(pack_color(cmd.pass.clear_color_value));
         if (depth && cmd.pass.clear_depth) depth->depth().fill(cmd.pass.clear_depth_value);
         if (depth && cmd.pass.clear_stencil && !depth->stencil().empty()) depth->stencil().fill(cmd.pass.clear_stencil_value);

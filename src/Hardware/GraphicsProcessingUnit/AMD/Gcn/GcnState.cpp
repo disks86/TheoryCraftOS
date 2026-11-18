@@ -107,8 +107,15 @@ bool emit_draw(Pm4Writer& w, const DrawState& s) {
                   t.pitch_pixels >= t.width && t.pitch_pixels % 8 == 0 && t.pitch_pixels <= kMaxTargetDimension && (t.address & 0xFF) == 0 && fits(t.address) && t.address != 0 &&
                   pi.ps_inputs <= kMaxInterpolants && vi.param_exports <= kMaxInterpolants && s.index_count != 0 && (!indexed || (fits(s.index_address) && s.index_max >= s.index_count)) &&
                   (s.fence_address == 0 || ((s.fence_address & 7) == 0 && fits(s.fence_address))) && surface_ok(t.tile_index, ColorTarget::kPixelBytes, t.pitch_pixels, t.address) && blend_ok(s.blend) &&
-                  pi.color_outputs >= 1 && pi.color_outputs <= 2 && (!s.blend.uses_second_source() || pi.color_outputs == 2) && viewport_ok(s.viewport);
+                  pi.color_outputs >= 1 && pi.color_outputs <= kMaxColorTargets && s.target_count >= 1 && s.target_count <= pi.color_outputs &&
+                  (!s.blend.uses_second_source() || (pi.color_outputs >= 2 && s.target_count == 1)) && viewport_ok(s.viewport);
   if (!ok) return false;
+  for (uint32_t n = 1; n < s.target_count; ++n) {
+    const ColorTarget& e = s.extra_targets[n - 1];
+    if (e.width != t.width || e.height != t.height || e.pitch_pixels < e.width || e.pitch_pixels % 8 != 0 || e.pitch_pixels > kMaxTargetDimension || (e.address & 0xFF) != 0 || !fits(e.address) || e.address == 0 ||
+        !surface_ok(e.tile_index, ColorTarget::kPixelBytes, e.pitch_pixels, e.address))
+      return false;
+  }
   const DepthTarget& dt = s.depth;
   const bool has_z = dt.z_address != 0, has_stencil = dt.stencil_address != 0;
   if (!depth_stencil_ok(s.depth_stencil, dt)) return false;
@@ -144,8 +151,14 @@ bool emit_draw(Pm4Writer& w, const DrawState& s) {
   // what the shaders export and take: the position (4 components), the colour as 32 bit floats; the parameters and the interpolants
   w.set_context_reg(mmSPI_SHADER_POS_FORMAT, kSPI_SHADER_4COMP << SPI_SHADER_POS_FORMAT__POS0_EXPORT_FORMAT__SHIFT);
   w.set_context_reg(mmSPI_SHADER_Z_FORMAT, kSPI_SHADER_ZERO);
-  const bool dual = pi.color_outputs == 2;           // a second colour export: the second source of dual source blending
-  w.set_context_reg(mmSPI_SHADER_COL_FORMAT, (kSPI_SHADER_32_ABGR << SPI_SHADER_COL_FORMAT__COL0_EXPORT_FORMAT__SHIFT) | (dual ? kSPI_SHADER_32_ABGR << SPI_SHADER_COL_FORMAT__COL1_EXPORT_FORMAT__SHIFT : 0u));
+  // (every colour the shader exports, four bits each: a render target's, or the second source of dual source blending)
+  uint32_t col_format = 0, shader_mask = 0, target_mask = 0;
+  for (uint32_t n = 0; n < pi.color_outputs; ++n) {
+    col_format |= kSPI_SHADER_32_ABGR << (SPI_SHADER_COL_FORMAT__COL0_EXPORT_FORMAT__SHIFT + 4 * n);
+    shader_mask |= 0xFu << (4 * n);
+  }
+  for (uint32_t n = 0; n < s.target_count; ++n) target_mask |= static_cast<uint32_t>(s.blend.write_mask & 0xF) << (4 * n);
+  w.set_context_reg(mmSPI_SHADER_COL_FORMAT, col_format);
   w.set_context_reg(mmSPI_VS_OUT_CONFIG, (vi.param_exports == 0 ? 0 : vi.param_exports - 1) << SPI_VS_OUT_CONFIG__VS_EXPORT_COUNT__SHIFT);
   w.set_context_reg(mmPA_CL_VS_OUT_CNTL, 0);
   w.set_context_reg(mmSPI_PS_INPUT_ENA, pi.ps_input_enable);
@@ -166,8 +179,14 @@ bool emit_draw(Pm4Writer& w, const DrawState& s) {
   const uint32_t color[] = {static_cast<uint32_t>(t.address >> 8), pitch_tiles << CB_COLOR0_PITCH__TILE_MAX__SHIFT, slice_tiles << CB_COLOR0_SLICE__TILE_MAX__SHIFT, 0, info,
                             t.tile_index << CB_COLOR0_ATTRIB__TILE_MODE_INDEX__SHIFT};
   w.set_context_reg(mmCB_COLOR0_BASE, ArrayView<const uint32_t>(color, 6));
-  w.set_context_reg(mmCB_TARGET_MASK, s.blend.write_mask);
-  w.set_context_reg(mmCB_SHADER_MASK, dual ? 0xFFu : 0xFu);
+  for (uint32_t n = 1; n < s.target_count; ++n) {   // (the other targets: the same format and blending, their own memory)
+    const ColorTarget& e = s.extra_targets[n - 1];
+    const uint32_t extra[] = {static_cast<uint32_t>(e.address >> 8), (e.pitch_pixels / 8 - 1) << CB_COLOR0_PITCH__TILE_MAX__SHIFT,
+                              (e.pitch_pixels * ((e.height + 7) / 8 * 8) / 64 - 1) << CB_COLOR0_SLICE__TILE_MAX__SHIFT, 0, info, e.tile_index << CB_COLOR0_ATTRIB__TILE_MODE_INDEX__SHIFT};
+    w.set_context_reg(mmCB_COLOR0_BASE + n * kColorTargetRegisters, ArrayView<const uint32_t>(extra, 6));
+  }
+  w.set_context_reg(mmCB_TARGET_MASK, target_mask);
+  w.set_context_reg(mmCB_SHADER_MASK, shader_mask);
   w.set_context_reg(mmCB_COLOR_CONTROL, (kCB_NORMAL << CB_COLOR_CONTROL__MODE__SHIFT) | (0xCCu << CB_COLOR_CONTROL__ROP3__SHIFT));
   // blending: the colour factors and function, the alpha's own when separate (else the colour's), and the constant colour
   const BlendState& b = s.blend;
@@ -176,7 +195,7 @@ bool emit_draw(Pm4Writer& w, const DrawState& s) {
                          (static_cast<uint32_t>(b.color_dst) << CB_BLEND0_CONTROL__COLOR_DESTBLEND__SHIFT) | (alpha_src << CB_BLEND0_CONTROL__ALPHA_SRCBLEND__SHIFT) |
                          (alpha_op << CB_BLEND0_CONTROL__ALPHA_COMB_FCN__SHIFT) | (alpha_dst << CB_BLEND0_CONTROL__ALPHA_DESTBLEND__SHIFT) |
                          ((b.separate_alpha ? 1u : 0u) << CB_BLEND0_CONTROL__SEPARATE_ALPHA_BLEND__SHIFT) | ((b.enable ? 1u : 0u) << CB_BLEND0_CONTROL__ENABLE__SHIFT);
-  w.set_context_reg(mmCB_BLEND0_CONTROL, blend);
+  for (uint32_t n = 0; n < s.target_count; ++n) w.set_context_reg(mmCB_BLEND0_CONTROL + n, blend);
   const uint32_t constant[] = {float_bits(b.constant[0]), float_bits(b.constant[1]), float_bits(b.constant[2]), float_bits(b.constant[3])};
   w.set_context_reg(mmCB_BLEND_RED, ArrayView<const uint32_t>(constant, 4));
 

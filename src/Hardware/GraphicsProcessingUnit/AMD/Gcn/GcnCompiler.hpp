@@ -24,7 +24,7 @@
 //   vertex shader: v0 the vertex index; the attributes are fetched with buffer_load_format_xyzw through the V# at table offset 16 * i (attribute i = TGSI IN[i]); the exports are the
 //   position (pos0) and one parameter (param n) per other output, in the order of the outputs.
 //   pixel shader: s4 the primitive mask (M0 for the interpolation); v0, v1 the barycentric coordinates i and j (SPI_PS_INPUT_ENA with PERSP_CENTER only); input i is attribute i, in
-//   the order of the inputs; the colour goes out as export mrt0 with the valid mask bit; a texture is the T# at table offset kImageOffset + 32 * i and the sampler the S# at kSamplerOffset + 16 * i.
+//   the order of the inputs; the colours go out as exports mrt0, mrt1 ... (COLOR[n] as mrt n), the last with the valid mask bit; a texture is the T# at table offset kImageOffset + 32 * i and the sampler the S# at kSamplerOffset + 16 * i.
 //
 // The TGSI registers live in vector registers, four per register (a temporary, an input, an output); constants in scalar registers loaded at the start. Each instruction is done per
 // written component, with the operands legalized for the GFX8 encodings (one scalar operand per vector instruction, no literals in the 64 bit forms).
@@ -44,6 +44,7 @@ constexpr uint32_t kMaxSamplers = 16;
 constexpr uint32_t kSamplerOffset = kImageOffset + kMaxSamplers * kImageBytes, kSamplerBytes = 16;
 constexpr uint32_t kTableBytes = kSamplerOffset + kMaxSamplers * kSamplerBytes;
 constexpr uint32_t kPsInputEnablePerspCenter = 1u << 1;          // SPI_PS_INPUT_ENA.PERSP_CENTER_ENA
+constexpr uint32_t kMaxColorExports = 8;                           // the colours a pixel shader exports: mrt0 .. mrt7
 }  // namespace abi
 
 struct ShaderInfo {
@@ -57,7 +58,7 @@ struct ShaderInfo {
   uint32_t ps_input_enable = 0;                // pixel shader: SPI_PS_INPUT_ENA
   uint32_t attributes_used = 0;                // vertex shader: bit i when attribute i is fetched
   uint32_t samplers_used = 0;                  // pixel shader: bit i when sampler i is used
-  uint32_t color_outputs = 1;                  // pixel shader: the colours it exports, 1 (COLOR[0]) or 2 (COLOR[1] too: the second source of dual source blending)
+  uint32_t color_outputs = 1;                  // pixel shader: the colours it exports, COLOR[0] .. COLOR[n - 1] as mrt0 .. (1 to 8): a render target each, or with two and dual source blending the second source
   uint32_t const_rows = 0;                     // the constant rows read (the highest + 1)
   bool kills = false;
   uint32_t code_dwords = 0;

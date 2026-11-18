@@ -43,6 +43,10 @@ struct ShaderProgram {
   ShaderInfo info;
 };
 
+constexpr uint32_t kMaxColorTargets = abi::kMaxColorExports;
+// The registers of colour target n are those of target 0 plus n times this (CB_COLOR1_BASE is CB_COLOR0_BASE + 15: sid.h); CB_BLENDn_CONTROL is CB_BLEND0_CONTROL + n.
+constexpr uint32_t kColorTargetRegisters = 15;
+
 // A float RGBA colour target (CB format 32_32_32_32). `tile_index` is the GB_TILE_MODE entry: 8 linear (ARRAY_LINEAR_ALIGNED), 9 1D tiled for display.
 struct ColorTarget {
   uint64_t address = 0;               // 256 byte aligned
@@ -78,6 +82,10 @@ struct DrawState {
   uint64_t pixel_constants = 0;
   uint64_t descriptor_table = 0;
   ColorTarget target;
+  // More colour targets (render targets 1 .. target_count - 1), of the first one's size: the pixel shader's COLOR[n] goes to target n, blended and masked as target 0 is.
+  // With more than one target there is no dual source blending (the second colour is target 1's).
+  ColorTarget extra_targets[kMaxColorTargets - 1];
+  uint32_t target_count = 1;
   BlendState blend;
   DepthStencilState depth_stencil;
   DepthTarget depth;

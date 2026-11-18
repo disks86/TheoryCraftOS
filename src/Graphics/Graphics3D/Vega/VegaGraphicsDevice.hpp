@@ -48,15 +48,15 @@ class VegaGraphicsDevice final : public IGraphicsDevice {
   const char* last_error() const { return error_; }
 
   // What it takes: the vertex inputs and texture units the shader compiler's tables have (gcn::abi), any vertex format in any of the vertex buffer slots (the vertices are
-  // repacked for the card), the sampler address modes. One colour target; the interpolants are the TGSI shader's outputs but the position.
+  // repacked for the card), the sampler address modes, eight colour targets of one blend state. The interpolants are the TGSI shader's outputs but the position.
   DeviceInfo info() const override {
     DeviceLimits limits;
     limits.vertex_attributes = gcn::abi::kMaxAttributes;
     limits.texture_units = gcn::abi::kMaxSamplers;
     limits.vertex_buffers = kMaxVertexBuffers;
-    limits.color_targets = 1;
+    limits.color_targets = gcn::kMaxColorTargets;
     limits.varyings = 12;
-    return {"Radeon RX Vega M (graphics engine)", DeviceKind::Gpu, true, 128, kFeatureBlendState | kFeatureVertexFormats | kFeatureAddressModes, 0, limits};
+    return {"Radeon RX Vega M (graphics engine)", DeviceKind::Gpu, true, 128, kFeatureBlendState | kFeatureVertexFormats | kFeatureAddressModes | kFeatureMultipleTargets, 0, limits};
   }
 
   IBuffer* create_buffer(uint64_t size, uint32_t usage) override;

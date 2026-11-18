@@ -489,23 +489,30 @@ bool Compiler::epilogue() {
   struct Export {
     uint32_t target, reg;
   };
-  Export list[2 + TgsiShader::kMaxOutputs];
+  Export list[abi::kMaxColorExports + TgsiShader::kMaxOutputs];
   uint32_t count = 0;
   if (s_.fragment) {
-    int color[2] = {-1, -1};
+    // The colours go out as mrt0, mrt1, ...: COLOR[n] is render target n's (or, with one target and dual source blending, COLOR[1] is the second source). They are COLOR[0]
+    // up to the highest the shader has, with none left out.
+    int color[abi::kMaxColorExports];
+    for (int& c : color) c = -1;
+    uint32_t colors = 0;
     for (uint32_t k = 0; k < s_.outputs; ++k) {
       if (s_.output_semantic[k] == TgsiSemantic::Color) {
         const uint32_t index = s_.output_semantic_index[k];
-        if (index > 1 || color[index] >= 0) return fail("at most two colour outputs, COLOR[0] and COLOR[1], are supported");
+        if (index >= abi::kMaxColorExports || color[index] >= 0) return fail("a colour output beyond COLOR[7], or declared twice");
         color[index] = static_cast<int>(k);
+        if (index + 1 > colors) colors = index + 1;
       } else if (s_.output_semantic[k] == TgsiSemantic::Position) {
         return fail("depth output is not supported");
       }
     }
-    if (color[0] < 0) return fail(color[1] >= 0 ? "COLOR[1] without a COLOR[0] colour output" : "no colour output");
-    list[count++] = {kExpMrt0, out_reg(static_cast<uint32_t>(color[0]), 0)};
-    if (color[1] >= 0) list[count++] = {kExpMrt0 + 1, out_reg(static_cast<uint32_t>(color[1]), 0)};
-    info_->color_outputs = color[1] >= 0 ? 2 : 1;
+    if (colors == 0) return fail("no colour output");
+    for (uint32_t n = 0; n < colors; ++n) {
+      if (color[n] < 0) return fail(n == 0 ? "COLOR[1] without a COLOR[0] colour output" : "a colour output is missing between COLOR[0] and the highest");
+      list[count++] = {kExpMrt0 + n, out_reg(static_cast<uint32_t>(color[n]), 0)};
+    }
+    info_->color_outputs = colors;
   } else {
     bool position = false;
     uint32_t param = 0;

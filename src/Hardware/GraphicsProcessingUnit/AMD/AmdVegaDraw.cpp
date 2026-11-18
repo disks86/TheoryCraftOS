@@ -29,7 +29,7 @@ uint64_t align_to(uint64_t v, uint64_t a) { return (v + a - 1) / a * a; }
 uint64_t align_up(uint64_t v) { return align_to(v, AmdVegaDraw::kAlignment); }
 
 struct Plan {
-  uint64_t vertex_code, pixel_code, vertex_constants, pixel_constants, table, vertices, indices, target, depth, stencil, textures[abi::kMaxSamplers], total, alignment;
+  uint64_t vertex_code, pixel_code, vertex_constants, pixel_constants, table, vertices, indices, target, extra[kMaxColorTargets - 1], depth, stencil, textures[abi::kMaxSamplers], total, alignment;
 };
 
 bool layout_of(uint32_t tile_index, TileLayout* layout) { return resolve_tile_index(tile_index, layout); }
@@ -75,6 +75,7 @@ bool texture_ok(const VegaTexture& t) {
 constexpr uint64_t kConstantBytes = TgsiShader::kMaxConsts * 16;
 
 bool make_plan(const VegaDrawRequest& r, Plan* p) {
+  if (r.target_count == 0 || r.target_count > kMaxColorTargets || r.target_count > r.pixel_info.color_outputs) return false;
   if (r.width == 0 || r.height == 0 || r.width > 16384 || r.height > 16384 || r.vertex_code.size() == 0 || r.pixel_code.size() == 0 || r.vertex_data.size() == 0 || r.vertex_stride == 0) return false;
   if (r.vertex_info.const_rows * 4ull > r.vertex_constants.size() || r.pixel_info.const_rows * 4ull > r.pixel_constants.size() || r.vertex_constants.size() > kConstantBytes / 4 ||
       r.pixel_constants.size() > kConstantBytes / 4)
@@ -99,6 +100,7 @@ bool make_plan(const VegaDrawRequest& r, Plan* p) {
   p->vertices = place(r.vertex_data.size() * 4ull);
   p->indices = place(r.indices.size() == 0 ? 4 : r.indices.size() * 4ull);
   p->target = place(AmdVegaDraw::target_bytes(r), color_align);
+  for (uint32_t n = 1; n < kMaxColorTargets; ++n) p->extra[n - 1] = n < r.target_count ? place(AmdVegaDraw::target_bytes(r), color_align) : 0;
   p->depth = p->stencil = 0;
   TileLayout z_layout, s_layout;
   if (AmdVegaDraw::uses_depth(r)) {
@@ -186,11 +188,14 @@ uint64_t AmdVegaDraw::area_bytes(const VegaDrawRequest& r) {
   return make_plan(r, &p) ? p.total : 0;
 }
 
-bool AmdVegaDraw::draw(AmdVegaM& card, const VegaDrawRequest& r, uint64_t area_offset, ByteView staging, ByteView pixels, ByteView depth, ByteView stencil) {
+bool AmdVegaDraw::draw(AmdVegaM& card, const VegaDrawRequest& r, uint64_t area_offset, ByteView staging, ByteView pixels, ByteView depth, ByteView stencil, ArrayView<ByteView> extra_pixels) {
   Plan p;
   // (the card places a surface by its address: the area must start where the most demanding layout wants it)
   if (!card.up() || !make_plan(r, &p) || area_offset % p.alignment != 0 || card.framebuffer_gpu_address() % p.alignment != 0) return false;
   if (staging.size() < p.total || pixels.size() < target_bytes(r) || (depth.size() != 0 && depth.size() < depth_bytes(r)) || (stencil.size() != 0 && stencil.size() < stencil_bytes(r)) || area_offset > card.layout().framebuffer_bytes || p.total > card.layout().framebuffer_bytes - area_offset) return false;
+  if (extra_pixels.size() != r.target_count - 1) return false;
+  for (const ByteView& extra : extra_pixels)
+    if (extra.size() < target_bytes(r)) return false;
   const uint32_t vertex_count = r.indices.size() != 0 ? static_cast<uint32_t>(r.indices.size()) : r.vertex_count;
   if (vertex_count == 0 || vertex_count % 3 != 0 || r.indices.size() > 0x10000000u) return false;
   const uint64_t base = card.framebuffer_gpu_address() + area_offset;
@@ -224,13 +229,23 @@ bool AmdVegaDraw::draw(AmdVegaM& card, const VegaDrawRequest& r, uint64_t area_o
   if (r.indices.size() != 0) put_words(p.indices, r.indices);
   // the colour buffer (all of it, the padding too) and the planes hold the clear values, the same whatever the layout
   for (uint64_t i = 0; i < target_bytes(r) / ColorTarget::kPixelBytes; ++i)
-    for (uint32_t c = 0; c < 4; ++c) { const uint32_t v = float_word(r.clear[c]); put_words(p.target + (i * 4 + c) * 4, ArrayView<const uint32_t>(&v, 1)); }
+    for (uint32_t c = 0; c < 4; ++c) {
+      const uint32_t v = float_word(r.clear[c]);
+      put_words(p.target + (i * 4 + c) * 4, ArrayView<const uint32_t>(&v, 1));
+      for (uint32_t n = 1; n < r.target_count; ++n) put_words(p.extra[n - 1] + (i * 4 + c) * 4, ArrayView<const uint32_t>(&v, 1));
+    }
   for (uint64_t i = 0; i < depth_bytes(r) / DepthTarget::kZBytes; ++i) { const uint32_t v = float_word(r.clear_depth); put_words(p.depth + i * 4, ArrayView<const uint32_t>(&v, 1)); }
   for (uint64_t i = 0; i < stencil_bytes(r); ++i) { const uint8_t b = r.clear_stencil; w.patch_bytes(p.stencil + i, ConstByteView(&b, 1)); }
   // ... unless the request brings the contents they start from
   if (r.initial_target.size() != 0) {
     if (r.initial_target.size() != target_bytes(r)) return false;
     w.patch_bytes(p.target, r.initial_target);
+  }
+  for (uint32_t n = 1; n < r.target_count; ++n) {
+    const ConstByteView initial = r.initial_extra[n - 1];
+    if (initial.size() == 0) continue;
+    if (initial.size() != target_bytes(r)) return false;
+    w.patch_bytes(p.extra[n - 1], initial);
   }
   if (r.initial_depth.size() != 0) {
     if (r.initial_depth.size() != depth_bytes(r)) return false;
@@ -276,6 +291,11 @@ bool AmdVegaDraw::draw(AmdVegaM& card, const VegaDrawRequest& r, uint64_t area_o
   s.target.height = r.height;
   s.target.pitch_pixels = target_pitch(r);
   s.target.tile_index = r.target_tile_index;
+  s.target_count = r.target_count;
+  for (uint32_t n = 1; n < r.target_count; ++n) {
+    s.extra_targets[n - 1] = s.target;
+    s.extra_targets[n - 1].address = base + p.extra[n - 1];
+  }
   s.blend = r.blend;
   s.depth_stencil = r.depth_stencil;
   s.depth.pitch_pixels = plane_pitch(r);
@@ -296,6 +316,8 @@ bool AmdVegaDraw::draw(AmdVegaM& card, const VegaDrawRequest& r, uint64_t area_o
   if (!emit_draw(out, s) || !out.ok()) return false;
   if (!card.submit_graphics(out.words())) return false;
   if (!card.download(ByteView(pixels.data(), target_bytes(r)), area_offset + p.target)) return false;
+  for (uint32_t n = 1; n < r.target_count; ++n)
+    if (!card.download(extra_pixels[n - 1].first(target_bytes(r)), area_offset + p.extra[n - 1])) return false;
   if (depth.size() != 0 && uses_depth(r) && !card.download(ByteView(depth.data(), depth_bytes(r)), area_offset + p.depth)) return false;
   if (stencil.size() != 0 && uses_stencil(r) && !card.download(ByteView(stencil.data(), stencil_bytes(r)), area_offset + p.stencil)) return false;
   return true;

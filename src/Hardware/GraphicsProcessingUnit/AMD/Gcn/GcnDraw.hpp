@@ -56,17 +56,19 @@ class ITextureSource {
 // The colour target: float RGBA, row 0 at the top.
 class Framebuffer {
  public:
-  Framebuffer(allocators::IAllocator& allocator, uint32_t width, uint32_t height);
+  // `targets`: the colour targets it holds, all of one size (render target n is the pixel shader's COLOR[n]; a draw writes as many as its shader exports, at most these).
+  Framebuffer(allocators::IAllocator& allocator, uint32_t width, uint32_t height, uint32_t targets = 1);
+  uint32_t targets() const { return targets_; }
   bool valid() const { return valid_; }
   uint32_t width() const { return width_; }
   uint32_t height() const { return height_; }
   void clear(float r, float g, float b, float a);
-  const float* pixel(uint32_t x, uint32_t y) const { return x < width_ && y < height_ ? &rgba_[(static_cast<uint64_t>(y) * width_ + x) * 4] : nullptr; }
-  float* pixel(uint32_t x, uint32_t y) { return x < width_ && y < height_ ? &rgba_[(static_cast<uint64_t>(y) * width_ + x) * 4] : nullptr; }
+  const float* pixel(uint32_t x, uint32_t y, uint32_t target = 0) const { return x < width_ && y < height_ && target < targets_ ? &rgba_[((static_cast<uint64_t>(target) * height_ + y) * width_ + x) * 4] : nullptr; }
+  float* pixel(uint32_t x, uint32_t y, uint32_t target = 0) { return x < width_ && y < height_ && target < targets_ ? &rgba_[((static_cast<uint64_t>(target) * height_ + y) * width_ + x) * 4] : nullptr; }
 
  private:
   List<float> rgba_;
-  uint32_t width_, height_;
+  uint32_t width_, height_, targets_;
   bool valid_ = true;
 };
 

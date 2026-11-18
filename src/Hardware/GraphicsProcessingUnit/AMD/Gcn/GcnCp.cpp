@@ -17,6 +17,7 @@
  */
 
 #include "Hardware/GraphicsProcessingUnit/AMD/Gcn/GcnCp.hpp"
+#include "Hardware/GraphicsProcessingUnit/AMD/Gcn/GcnState.hpp"
 #include "Hardware/GraphicsProcessingUnit/AMD/Gcn/GcnTiling.hpp"
 
 namespace gcn {
@@ -167,14 +168,30 @@ CommandProcessorModel::Result CommandProcessorModel::draw(bool indexed, const Pm
   const uint32_t color_control = context_reg(mmCB_COLOR_CONTROL);
   if (field(color_control, CB_COLOR_CONTROL__MODE_MASK, CB_COLOR_CONTROL__MODE__SHIFT) != kCB_NORMAL || field(color_control, CB_COLOR_CONTROL__ROP3_MASK, CB_COLOR_CONTROL__ROP3__SHIFT) != 0xCC)
     return R::Unsupported;
-  // one colour (shader mask 0xF) or two, the second the source of dual source blending (0xFF); only target 0 is written
-  const bool dual = context_reg(mmCB_SHADER_MASK) == 0xFF;
-  if ((context_reg(mmCB_SHADER_MASK) != 0xF && !dual) || (context_reg(mmCB_TARGET_MASK) & ~0xFu) != 0) return R::Unsupported;
+  // The colours the shader exports (a nibble of the shader mask each, 0xF, from colour 0 up with none left out) and the targets written (a nibble of the target mask each,
+  // the same write mask for all, from target 0 up). Two colours and one target: the second colour is the second source of dual source blending.
+  uint32_t color_outputs = 0, target_count = 1;
+  {
+    const uint32_t shader_mask = context_reg(mmCB_SHADER_MASK), target_mask = context_reg(mmCB_TARGET_MASK);
+    while (color_outputs < abi::kMaxColorExports && (shader_mask >> (4 * color_outputs) & 0xF) == 0xF) ++color_outputs;
+    if (color_outputs == 0 || (color_outputs < abi::kMaxColorExports && (shader_mask >> (4 * color_outputs)) != 0)) return R::Unsupported;
+    while (target_count < abi::kMaxColorExports && (target_mask >> (4 * target_count) & 0xF) != 0) ++target_count;
+    if (target_count < abi::kMaxColorExports && (target_mask >> (4 * target_count)) != 0) return R::Unsupported;
+    for (uint32_t n = 1; n < target_count; ++n)
+      if ((target_mask >> (4 * n) & 0xF) != (target_mask & 0xF)) return R::Unsupported;
+    if (target_count > color_outputs) return R::Unsupported;
+  }
+  const bool dual = color_outputs >= 2 && target_count == 1;
+  for (uint32_t n = 1; n < target_count; ++n) {   // (the other targets are as target 0: the format, the blending)
+    const uint32_t info_n = context_reg(mmCB_COLOR0_INFO + n * kColorTargetRegisters);
+    if (info_n != context_reg(mmCB_COLOR0_INFO) || context_reg(mmCB_BLEND0_CONTROL + n) != context_reg(mmCB_BLEND0_CONTROL)) return R::Unsupported;
+  }
   if (context_reg(mmSPI_PS_INPUT_ENA) != abi::kPsInputEnablePerspCenter || context_reg(mmSPI_PS_INPUT_ADDR) != abi::kPsInputEnablePerspCenter) return R::Unsupported;
   if (field(context_reg(mmSPI_SHADER_POS_FORMAT), SPI_SHADER_POS_FORMAT__POS0_EXPORT_FORMAT_MASK, SPI_SHADER_POS_FORMAT__POS0_EXPORT_FORMAT__SHIFT) != kSPI_SHADER_4COMP ||
-      field(context_reg(mmSPI_SHADER_COL_FORMAT), SPI_SHADER_COL_FORMAT__COL0_EXPORT_FORMAT_MASK, SPI_SHADER_COL_FORMAT__COL0_EXPORT_FORMAT__SHIFT) != kSPI_SHADER_32_ABGR ||
-      field(context_reg(mmSPI_SHADER_COL_FORMAT), SPI_SHADER_COL_FORMAT__COL1_EXPORT_FORMAT_MASK, SPI_SHADER_COL_FORMAT__COL1_EXPORT_FORMAT__SHIFT) != (dual ? kSPI_SHADER_32_ABGR : 0u))
+      field(context_reg(mmSPI_SHADER_COL_FORMAT), SPI_SHADER_COL_FORMAT__COL0_EXPORT_FORMAT_MASK, SPI_SHADER_COL_FORMAT__COL0_EXPORT_FORMAT__SHIFT) != kSPI_SHADER_32_ABGR)
     return R::Unsupported;
+  for (uint32_t n = 0; n < abi::kMaxColorExports; ++n)   // (a 32 bit float export for each colour the shader has, none for the others)
+    if ((context_reg(mmSPI_SHADER_COL_FORMAT) >> (4 * n) & 0xF) != (n < color_outputs ? kSPI_SHADER_32_ABGR : 0u)) return R::Unsupported;
 
   DrawCall call;
   // blending (the blend bypass bit of the target turns it off whatever the blend register says)
@@ -272,7 +289,7 @@ CommandProcessorModel::Result CommandProcessorModel::draw(bool indexed, const Pm
   call.vertex_info.fragment = false;
   call.vertex_info.param_exports = field(context_reg(mmSPI_VS_OUT_CONFIG), SPI_VS_OUT_CONFIG__VS_EXPORT_COUNT_MASK, SPI_VS_OUT_CONFIG__VS_EXPORT_COUNT__SHIFT) + 1;
   call.pixel_info.fragment = true;
-  call.pixel_info.color_outputs = dual ? 2 : 1;
+  call.pixel_info.color_outputs = color_outputs;
   call.pixel_info.ps_inputs = field(context_reg(mmSPI_PS_IN_CONTROL), SPI_PS_IN_CONTROL__NUM_INTERP_MASK, SPI_PS_IN_CONTROL__NUM_INTERP__SHIFT);
   if (call.pixel_info.ps_inputs > 16) return R::Unsupported;
   for (uint32_t k = 0; k < call.pixel_info.ps_inputs; ++k) {
@@ -417,11 +434,28 @@ CommandProcessorModel::Result CommandProcessorModel::draw(bool indexed, const Pm
   Surface color(allocator_);
   r = color.load(memory_, color_base, color_layout, 16, pitch, width, height);
   if (r != R::Ok) return r;
-  Framebuffer fb(allocator_, width, height);
+  Framebuffer fb(allocator_, width, height, target_count);
   if (!fb.valid()) return R::OutOfMemory;
   for (uint32_t y = 0; y < height; ++y)
     for (uint32_t x = 0; x < width; ++x)
       for (uint32_t c = 0; c < 4; ++c) fb.pixel(x, y)[c] = bits_float(color.get32(x, y, c));
+  // (the other targets: each its own memory, pitch and layout, the size of target 0)
+  auto extra_surface = [&](uint32_t n, Surface& surface) {
+    const uint32_t reg = n * kColorTargetRegisters;
+    TileLayout layout;
+    if (!resolve_tile_index(field(context_reg(mmCB_COLOR0_ATTRIB + reg), CB_COLOR0_ATTRIB__TILE_MODE_INDEX_MASK, CB_COLOR0_ATTRIB__TILE_MODE_INDEX__SHIFT), &layout)) return R::Unsupported;
+    const uint32_t extra_pitch = (field(context_reg(mmCB_COLOR0_PITCH + reg), CB_COLOR0_PITCH__TILE_MAX_MASK, CB_COLOR0_PITCH__TILE_MAX__SHIFT) + 1) * 8;
+    if (width > extra_pitch) return R::Unsupported;
+    return surface.load(memory_, static_cast<uint64_t>(context_reg(mmCB_COLOR0_BASE + reg)) << 8, layout, 16, extra_pitch, width, height);
+  };
+  for (uint32_t n = 1; n < target_count; ++n) {
+    Surface extra(allocator_);
+    r = extra_surface(n, extra);
+    if (r != R::Ok) return r;
+    for (uint32_t y = 0; y < height; ++y)
+      for (uint32_t x = 0; x < width; ++x)
+        for (uint32_t c = 0; c < 4; ++c) fb.pixel(x, y, n)[c] = bits_float(extra.get32(x, y, c));
+  }
 
   // the depth and stencil planes the tests use
   DepthBuffer depth(allocator_, depth_used ? width : 1, depth_used ? height : 1);
@@ -469,6 +503,15 @@ CommandProcessorModel::Result CommandProcessorModel::draw(bool indexed, const Pm
         color.set32(x, y, cv.u, c);
       }
   if (!color.store(memory_)) return R::MemoryFault;
+  for (uint32_t n = 1; n < target_count; ++n) {
+    Surface extra(allocator_);
+    r = extra_surface(n, extra);
+    if (r != R::Ok) return r;
+    for (uint32_t y = 0; y < height; ++y)
+      for (uint32_t x = 0; x < width; ++x)
+        for (uint32_t c = 0; c < 4; ++c) extra.set32(x, y, __builtin_bit_cast(uint32_t, fb.pixel(x, y, n)[c]), c);
+    if (!extra.store(memory_)) return R::MemoryFault;
+  }
   if (ds.depth_test && ds.depth_write) {
     for (uint32_t y = 0; y < height; ++y)
       for (uint32_t x = 0; x < width; ++x) {

@@ -445,8 +445,9 @@ static void test_refusals() {
       {"kill in vertex shader", "VERT\nDCL IN[0]\nDCL OUT[0], POSITION\n  0: KILL\n  1: MOV OUT[0], IN[0]\n  2: END\n", "discard"},
       {"unbalanced if", "FRAG\nDCL IN[0], GENERIC[0], PERSPECTIVE\nDCL OUT[0], COLOR\n  0: IF IN[0].xxxx\n  1: MOV OUT[0], IN[0]\n  2: END\n", "ENDIF"},
       {"too deep", "FRAG\nDCL IN[0], GENERIC[0], PERSPECTIVE\nDCL OUT[0], COLOR\n  0: IF IN[0].xxxx\n  1: IF IN[0].xxxx\n  2: IF IN[0].xxxx\n  3: IF IN[0].xxxx\n  4: IF IN[0].xxxx\n  5: IF IN[0].xxxx\n  6: IF IN[0].xxxx\n  7: IF IN[0].xxxx\n  8: IF IN[0].xxxx\n  9: MOV OUT[0], IN[0]\n  10: ENDIF\n  11: ENDIF\n  12: ENDIF\n  13: ENDIF\n  14: ENDIF\n  15: ENDIF\n  16: ENDIF\n  17: ENDIF\n  18: ENDIF\n  19: END\n", "deeply"},
-      {"three colours", "FRAG\nDCL IN[0], GENERIC[0], PERSPECTIVE\nDCL OUT[0], COLOR\nDCL OUT[1], COLOR[1]\nDCL OUT[2], COLOR[2]\n  0: MOV OUT[0], IN[0]\n  1: MOV OUT[1], IN[0]\n  2: MOV OUT[2], IN[0]\n  3: END\n", "two colour"},
-      {"the same colour twice", "FRAG\nDCL IN[0], GENERIC[0], PERSPECTIVE\nDCL OUT[0], COLOR\nDCL OUT[1], COLOR\n  0: MOV OUT[0], IN[0]\n  1: MOV OUT[1], IN[0]\n  2: END\n", "two colour"},
+      {"a colour left out", "FRAG\nDCL IN[0], GENERIC[0], PERSPECTIVE\nDCL OUT[0], COLOR\nDCL OUT[1], COLOR[2]\n  0: MOV OUT[0], IN[0]\n  1: MOV OUT[1], IN[0]\n  2: END\n", "missing"},
+      {"a ninth colour", "FRAG\nDCL IN[0], GENERIC[0], PERSPECTIVE\nDCL OUT[0], COLOR\nDCL OUT[1], COLOR[8]\n  0: MOV OUT[0], IN[0]\n  1: MOV OUT[1], IN[0]\n  2: END\n", "COLOR[7]"},
+      {"the same colour twice", "FRAG\nDCL IN[0], GENERIC[0], PERSPECTIVE\nDCL OUT[0], COLOR\nDCL OUT[1], COLOR\n  0: MOV OUT[0], IN[0]\n  1: MOV OUT[1], IN[0]\n  2: END\n", "declared twice"},
       {"only the second colour", "FRAG\nDCL IN[0], GENERIC[0], PERSPECTIVE\nDCL OUT[0], COLOR[1]\n  0: MOV OUT[0], IN[0]\n  1: END\n", "COLOR[1]"},
   };
   TestAllocator alloc;
@@ -470,6 +471,18 @@ static void test_refusals() {
     Code code(alloc);
     ShaderInfo info;
     CHECK(parse_tgsi(alloc, StringView(texts[order]), &sh, &error, &line) && compile_tgsi(sh, code, &info, &error) && info.color_outputs == 2);
+  }
+  // eight colour outputs: one export for each render target
+  {
+    TgsiShader sh(alloc);
+    const char* error = nullptr;
+    uint32_t line = 0;
+    const char* text = "FRAG\nDCL IN[0], GENERIC[0], PERSPECTIVE\nDCL OUT[0], COLOR\nDCL OUT[1], COLOR[1]\nDCL OUT[2], COLOR[2]\nDCL OUT[3], COLOR[3]\nDCL OUT[4], COLOR[4]\nDCL OUT[5], COLOR[5]\n"
+                       "DCL OUT[6], COLOR[6]\nDCL OUT[7], COLOR[7]\n  0: MOV OUT[0], IN[0]\n  1: MOV OUT[1], IN[0]\n  2: MOV OUT[2], IN[0]\n  3: MOV OUT[3], IN[0]\n  4: MOV OUT[4], IN[0]\n  5: MOV OUT[5], IN[0]\n"
+                       "  6: MOV OUT[6], IN[0]\n  7: MOV OUT[7], IN[0]\n  8: END\n";
+    Code code(alloc);
+    ShaderInfo info;
+    CHECK(parse_tgsi(alloc, StringView(text), &sh, &error, &line) && compile_tgsi(sh, code, &info, &error) && info.color_outputs == 8);
   }
   // the targets of sampler views are kept
   {
