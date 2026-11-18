@@ -19,6 +19,7 @@
 #include "Hardware/GameController/GameControllerService.hpp"
 #include "Hardware/GameController/Usb/UsbGameController.hpp"
 #include "Hardware/GameController/Usb/UsbXbox360Wireless.hpp"
+#include "Hardware/GameController/Usb/XboxWirelessAdapter.hpp"
 #include "Kernel/Thread.hpp"
 #include "Utility/String.hpp"
 
@@ -96,6 +97,19 @@ int32_t GameControllerService::place(UniquePointer<IGameController> controller) 
 }
 
 void GameControllerService::take_up(IUsbHostController& host, uint32_t port) {
+  // An Xbox Wireless Adapter: a pad per client slot, each waiting until a controller associates (the adapter starts once its firmware can be read).
+  {
+    UsbDeviceDescriptor d;
+    if (host.device_descriptor(port, &d)) {
+      const uint16_t vendor = d.vendor_id, product = d.product_id;   // (copies: the descriptor is packed)
+      if (is_xbox_wireless_adapter(vendor, product)) {
+        UniquePointer<IGameController> pads[XboxWirelessAdapter::kMaxClients];
+        const uint32_t n = open_xbox_wireless_adapter(host, port, allocator_, ArrayView<UniquePointer<IGameController>>(pads));
+        for (uint32_t i = 0; i < n && i < XboxWirelessAdapter::kMaxClients; ++i) park(util::move(pads[i]));
+        return;
+      }
+    }
+  }
   // An Xbox 360 Wireless Receiver: a pad per channel, each waiting until a pad pairs with it.
   uint8_t config[512];
   uint16_t length = 0;

@@ -42,7 +42,7 @@ namespace hardware {
 class GameControllerService {
  public:
   static constexpr uint32_t kMaxPlayers = 8;
-  static constexpr uint32_t kMaxIdle = 16;          // pads that are plugged in but not connected (a wireless receiver's unpaired channels)
+  static constexpr uint32_t kMaxIdle = 24;          // pads that are plugged in but not connected (a wireless receiver's or adapter's unpaired channels)
   static constexpr uint32_t kRoundsPerScan = 64;     // (a round is about 4 ms)
 
   // `usb` may be null: then only added controllers are served.

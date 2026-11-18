@@ -143,7 +143,17 @@ void HciController::process_incoming() {
     uint8_t params[7];
     ByteWriter out{ByteView(params)};
     out.bytes(ConstByteView(request.address.b, 6));
-    if (accept_incoming_) {
+    const bool acl = request.link_type == 1;
+    if (acl && incoming_filter_ && incoming_filter_(incoming_context_, request.address, request.class_of_device)) {
+      out.u8(0);                                                   // become the central of the link (a role switch): the host keeps the piconet
+      for (uint32_t i = 0; i < 4; ++i) {
+        if (accepted_used_[i] && accepted_[i] != request.address) continue;
+        accepted_used_[i] = true;
+        accepted_[i] = request.address;
+        break;
+      }
+      command(kOpAcceptConnection, out.written(), 1000);
+    } else if (acl && accept_incoming_) {
       out.u8(1);                                                   // stay the peripheral of the link
       command(kOpAcceptConnection, out.written(), 1000);
     } else {
@@ -209,14 +219,94 @@ void HciController::handle_event(const Event& event) {
     case kEvConnectionComplete: {
       ConnectionComplete c;
       if (!parse_connection_complete(event, &c)) { ++malformed_; return; }
-      if (c.status == 0) add_link(c.handle, c.address, false, 0, true);
+      bool incoming = false;
+      for (uint32_t i = 0; i < 4; ++i)
+        if (accepted_used_[i] && accepted_[i] == c.address) { accepted_used_[i] = false; incoming = true; }
+      if (c.status == 0) {
+        if (HciLink* l = add_link(c.handle, c.address, false, 0, true)) l->incoming = incoming;
+      } else {
+        HciSecurityEvent e;
+        e.kind = HciSecurityKind::ConnectionFailed;
+        e.address = c.address;
+        e.status = c.status;
+        queue_security(e);
+      }
       break;
     }
     case kEvConnectionRequest: {
       ConnectionRequest r;
       if (!parse_connection_request(event, &r)) { ++malformed_; return; }
+      if (r.link_type == 1) note_device(r.address, false, 0, r.class_of_device, 127, ConstByteView(), 0);     // (a device that connects is listed, bonded or not)
       for (Incoming& slot : incoming_)
-        if (!slot.used) { slot.used = true; slot.address = r.address; break; }
+        if (!slot.used) { slot.used = true; slot.address = r.address; slot.class_of_device = r.class_of_device; slot.link_type = r.link_type; break; }
+      break;
+    }
+    case kEvLinkKeyRequest:
+    case kEvPinCodeRequest:
+    case kEvIoCapabilityRequest:
+    case kEvUserPasskeyRequest: {
+      ByteReader in(event.params);
+      HciSecurityEvent e;
+      in.read_into(ByteView(e.address.b, 6));
+      if (!in.ok()) { ++malformed_; return; }
+      e.kind = event.code == kEvLinkKeyRequest ? HciSecurityKind::LinkKeyRequest : event.code == kEvPinCodeRequest ? HciSecurityKind::PinCodeRequest
+             : event.code == kEvIoCapabilityRequest ? HciSecurityKind::IoCapabilityRequest : HciSecurityKind::UserPasskeyRequest;
+      queue_security(e);
+      break;
+    }
+    case kEvLinkKeyNotification: {
+      ByteReader in(event.params);
+      HciSecurityEvent e;
+      e.kind = HciSecurityKind::LinkKeyNotification;
+      in.read_into(ByteView(e.address.b, 6));
+      in.read_into(ByteView(e.key));
+      e.key_type = in.u8();
+      if (!in.ok()) { ++malformed_; return; }
+      queue_security(e);
+      break;
+    }
+    case kEvIoCapabilityResponse: {
+      ByteReader in(event.params);
+      HciSecurityEvent e;
+      e.kind = HciSecurityKind::IoCapabilityResponse;
+      in.read_into(ByteView(e.address.b, 6));
+      e.io_capability = in.u8();
+      in.skip(1);                                                  // (out of band data present)
+      e.authentication = in.u8();
+      if (!in.ok()) { ++malformed_; return; }
+      queue_security(e);
+      break;
+    }
+    case kEvUserConfirmationRequest:
+    case kEvUserPasskeyNotification: {
+      ByteReader in(event.params);
+      HciSecurityEvent e;
+      e.kind = event.code == kEvUserConfirmationRequest ? HciSecurityKind::UserConfirmationRequest : HciSecurityKind::UserPasskeyNotification;
+      in.read_into(ByteView(e.address.b, 6));
+      e.value = in.le32();
+      if (!in.ok()) { ++malformed_; return; }
+      queue_security(e);
+      break;
+    }
+    case kEvSimplePairingComplete: {
+      ByteReader in(event.params);
+      HciSecurityEvent e;
+      e.kind = HciSecurityKind::SimplePairingComplete;
+      e.status = in.u8();
+      in.read_into(ByteView(e.address.b, 6));
+      if (!in.ok()) { ++malformed_; return; }
+      queue_security(e);
+      break;
+    }
+    case kEvAuthenticationComplete: {
+      ByteReader in(event.params);
+      HciSecurityEvent e;
+      e.kind = HciSecurityKind::AuthenticationComplete;
+      e.status = in.u8();
+      e.handle = in.le16() & 0x0FFF;
+      if (!in.ok()) { ++malformed_; return; }
+      if (const HciLink* l = link(e.handle)) e.address = l->address;
+      queue_security(e);
       break;
     }
     case kEvDisconnectionComplete: {
@@ -331,6 +421,7 @@ HciLink* HciController::add_link(uint16_t handle, const BdAddr& address, bool le
   slot->address_type = address_type;
   slot->central = central;
   slot->encrypted = false;
+  slot->incoming = false;
   if (link_handler_) link_handler_(link_context_, *slot, true);
   return slot;
 }
@@ -448,6 +539,75 @@ HciResult HciController::send_acl(uint16_t handle, ConstByteView data, uint32_t 
     sent += chunk;
   }
   return HciResult::Ok;
+}
+
+// ------------------------------------------------------------------ classic security
+
+void HciController::queue_security(const HciSecurityEvent& event) {
+  if (security_count_ == kMaxSecurityEvents) {                     // (full: the oldest goes; its question times out in the controller)
+    security_head_ = (security_head_ + 1) % kMaxSecurityEvents;
+    --security_count_;
+    ++security_dropped_;
+  }
+  security_[(security_head_ + security_count_) % kMaxSecurityEvents] = event;
+  ++security_count_;
+}
+
+bool HciController::take_security_event(HciSecurityEvent* out) {
+  if (security_count_ == 0) return false;
+  *out = security_[security_head_];
+  security_head_ = (security_head_ + 1) % kMaxSecurityEvents;
+  --security_count_;
+  return true;
+}
+
+HciResult HciController::address_command(uint16_t opcode, const BdAddr& address, ConstByteView more) {
+  uint8_t params[6 + 32];
+  if (more.size() > 32) return HciResult::NoRoom;
+  ByteWriter out{ByteView(params)};
+  out.bytes(ConstByteView(address.b, 6));
+  out.bytes(more);
+  return command(opcode, out.written());
+}
+
+HciResult HciController::authenticate(uint16_t handle) {
+  const uint8_t params[2] = {static_cast<uint8_t>(handle), static_cast<uint8_t>(handle >> 8)};
+  return command(kOpAuthenticationRequested, ConstByteView(params, 2));
+}
+
+HciResult HciController::link_key_reply(const BdAddr& address, const uint8_t key[16]) { return address_command(kOpLinkKeyReply, address, ConstByteView(key, 16)); }
+HciResult HciController::link_key_negative_reply(const BdAddr& address) { return address_command(kOpLinkKeyNegativeReply, address); }
+HciResult HciController::pin_code_negative_reply(const BdAddr& address) { return address_command(kOpPinCodeNegativeReply, address); }
+HciResult HciController::user_passkey_negative_reply(const BdAddr& address) { return address_command(kOpUserPasskeyNegativeReply, address); }
+
+HciResult HciController::pin_code_reply(const BdAddr& address, ConstByteView pin) {
+  if (pin.empty() || pin.size() > 16) return HciResult::Malformed;
+  uint8_t more[17] = {};
+  more[0] = static_cast<uint8_t>(pin.size());
+  ByteView(more).subview(1, pin.size()).copy_from(pin);
+  return address_command(kOpPinCodeReply, address, ConstByteView(more, 17));
+}
+
+HciResult HciController::io_capability_reply(const BdAddr& address, uint8_t io_capability, uint8_t authentication) {
+  const uint8_t more[3] = {io_capability, 0, authentication};      // (no out of band data)
+  return address_command(kOpIoCapabilityReply, address, ConstByteView(more, 3));
+}
+
+HciResult HciController::io_capability_negative_reply(const BdAddr& address, uint8_t reason) { return address_command(kOpIoCapabilityNegativeReply, address, ConstByteView(&reason, 1)); }
+
+HciResult HciController::user_confirmation_reply(const BdAddr& address, bool accept) {
+  return address_command(accept ? kOpUserConfirmationReply : kOpUserConfirmationNegativeReply, address);
+}
+
+HciResult HciController::user_passkey_reply(const BdAddr& address, uint32_t passkey) {
+  const uint8_t more[4] = {static_cast<uint8_t>(passkey), static_cast<uint8_t>(passkey >> 8), static_cast<uint8_t>(passkey >> 16), static_cast<uint8_t>(passkey >> 24)};
+  return address_command(kOpUserPasskeyReply, address, ConstByteView(more, 4));
+}
+
+HciResult HciController::write_scan_enable(uint8_t mode) {
+  const HciResult r = command(kOpWriteScanEnable, ConstByteView(&mode, 1));
+  if (r == HciResult::Ok) scan_enable_ = mode;
+  return r;
 }
 
 // ------------------------------------------------------------------ finding
@@ -583,8 +743,15 @@ HciResult HciController::initialize() {
     const uint8_t le_mask[8] = {0x1F, 0, 0, 0, 0, 0, 0, 0};          // connection complete, advertising reports, update complete, remote features, long term key request
     command(kOpLeSetEventMask, ConstByteView(le_mask, 8));
   }
+  if (info_.classic_supported) {
+    const uint8_t policy[2] = {0x01, 0x00};                        // role switches allowed (an incoming link is taken as its central)
+    command(kOpWriteDefaultLinkPolicy, ConstByteView(policy, 2));
+  }
   const uint8_t not_discoverable = 0;
   command(kOpWriteScanEnable, ConstByteView(&not_discoverable, 1)); // (the machine neither answers inquiries nor accepts connections until it is told to)
+  scan_enable_ = 0;
+  security_count_ = security_head_ = 0;
+  for (bool& used : accepted_used_) used = false;
   acl_credits_ = info_.acl_packets;
   le_credits_ = info_.le_packets;
   initialized_ = true;

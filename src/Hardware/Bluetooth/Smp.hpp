@@ -48,9 +48,20 @@ struct SmBond {
   bool has_identity = false;
 };
 
+// A classic (BR/EDR) bond: the link key the controllers made when the device paired.
+struct ClassicBond {
+  bool used = false;
+  hci::BdAddr address;
+  uint8_t key[16] = {};
+  uint8_t key_type = 0;                 // as the Link Key Notification gave it (4 and 7: unauthenticated, 5 and 8: authenticated, 0: legacy PIN)
+  bool authenticated = false;
+};
+
 class SmBondStore {
  public:
-  static constexpr uint32_t kMaxBonds = 16;
+  static constexpr uint32_t kMaxBonds = 16, kMaxClassicBonds = 16;
+  static constexpr uint8_t kClassicVersion = 1;
+  static constexpr uint32_t kClassicRecordBytes = 24;                  // address (6), key (16), key type, flags
   static constexpr uint32_t kHeaderBytes = 5, kRecordBytes = 58;      // the serialised form: "BTBD" and the count, then this many bytes a bond
   // The bond for a device: by identity or link address, or, failing that, by resolving a private address with each bond's IRK.
   const SmBond* find(const hci::BdAddr& address, uint8_t address_type) const;
@@ -62,8 +73,24 @@ class SmBondStore {
   bool serialize(ByteBuffer& out) const;
   uint32_t parse(ConstByteView data);
 
+  // Classic link keys, kept apart from the LE bonds (a dual-mode device has both). Their serialised form is a section of its own that follows the rest of the file: "BTLK", a version,
+  // the record length, the count, then each record (kClassicRecordBytes; a newer version's longer records are read as far as this one knows them). A reader that does not know the
+  // section ignores it.
+  const ClassicBond* find_classic(const hci::BdAddr& address) const;
+  bool store_classic(const ClassicBond& bond);
+  bool remove_classic(const hci::BdAddr& address);
+  uint32_t classic_count() const;
+  const ClassicBond* classic_at(uint32_t index) const { return index < kMaxClassicBonds && classic_[index].used ? &classic_[index] : nullptr; }
+  [[nodiscard]] bool serialize_classic(ByteBuffer& out) const;    // appends the section
+  // Reads a section that starts at `section` (its tag); returns how many keys it took. A damaged or truncated record ends it.
+  uint32_t parse_classic(ConstByteView data);
+  // Grows on every change of either table (what tells the owner the file needs writing).
+  uint32_t revision() const { return revision_; }
+
  private:
   SmBond bonds_[kMaxBonds];
+  ClassicBond classic_[kMaxClassicBonds];
+  uint32_t revision_ = 0;
 };
 
 class ISmUserInterface {

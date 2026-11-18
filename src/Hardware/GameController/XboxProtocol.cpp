@@ -173,6 +173,25 @@ GipResult decode_gip(ConstByteView m, gamepad::State* state) {
   }
 }
 
+// A, B, (none), X, Y, (none), LB, RB, (none), (none), View, Menu, Guide, LS, RS, (none).
+const uint32_t kBluetoothButtonMap[kBluetoothButtons] = {
+    gamepad::kSouth, gamepad::kEast, 0, gamepad::kWest, gamepad::kNorth, 0, gamepad::kLeftShoulder, gamepad::kRightShoulder,
+    0, 0, gamepad::kBack, gamepad::kStart, gamepad::kGuide, gamepad::kLeftStick, gamepad::kRightStick, 0};
+
+uint32_t encode_bt_rumble(uint16_t low_frequency, uint16_t high_frequency, ByteView out) {
+  ByteWriter w(out);
+  w.u8(0x03);
+  w.u8(0x0F);                                          // every motor
+  w.u8(0x00);                                          // left trigger
+  w.u8(0x00);                                          // right trigger
+  w.u8(static_cast<uint8_t>(low_frequency / 656));     // strong (left), 0..100
+  w.u8(static_cast<uint8_t>(high_frequency / 656));    // weak (right)
+  w.u8(0xFF);                                          // as long as possible
+  w.u8(0x00);                                          // no delay
+  w.u8(0x00);                                          // once
+  return finish(w);
+}
+
 uint32_t encode_gip_power_on(uint8_t sequence, ByteView out) {
   ByteWriter w(out);
   w.u8(kGipPower);

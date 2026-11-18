@@ -809,6 +809,9 @@ add_executable(BOOTX64
   src/Hardware/GameController/XboxProtocol.cpp
   src/Hardware/GameController/Usb/UsbGameController.cpp
   src/Hardware/GameController/Usb/UsbXbox360Wireless.cpp
+  src/Hardware/GameController/Usb/XboxWirelessAdapter.cpp
+  src/Hardware/GameController/Usb/XboxWirelessFrames.cpp
+  src/Hardware/GameController/Bluetooth/BluetoothGamepad.cpp
   src/Midi/LiveSynth.cpp
   src/Media/Audio/Pcm.cpp
   src/Media/Audio/Wav.cpp
@@ -1089,6 +1092,8 @@ add_executable(BOOTX64
   src/Hardware/Bluetooth/Smp.cpp
   src/Hardware/Bluetooth/HciBluetoothAdapter.cpp
   src/Hardware/Bluetooth/HidOverGatt.cpp
+  src/Hardware/Bluetooth/Sdp.cpp
+  src/Hardware/Bluetooth/HidpHost.cpp
   src/Hardware/Bluetooth/HciPackets.cpp
   src/Hardware/Bluetooth/UsbHciTransport.cpp
   src/Hardware/Bluetooth/HciController.cpp

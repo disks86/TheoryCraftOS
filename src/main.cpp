@@ -57,6 +57,7 @@
 #include "Hardware/MidiDevice/Usb/UsbMidiService.hpp"
 #include "Hardware/GameController/GameControllerService.hpp"
 #include "Hardware/GameController/WindowsGamepadService.hpp"
+#include "Hardware/GameController/Usb/XboxWirelessAdapter.hpp"
 #include "Hardware/LinuxGamepads.hpp"
 #include "Kernel/Paging.hpp"
 #include "CPUScheduler/Scheduler.hpp"
@@ -147,6 +148,7 @@
 #ifdef TCOS_BLUETOOTH
 #include "Hardware/Bluetooth/BluetoothService.hpp"
 #include "Hardware/Bluetooth/HidOverGatt.hpp"
+#include "Hardware/Bluetooth/HidpHost.hpp"
 #include "Hardware/WirelessInterface/Intel/IwlDriver.hpp"      // (FileSystemFirmwareSource reads /firmware)
 #endif
 #include "Hardware/WirelessInterface/WifiAdapterProbe.hpp"   // (and WifiFirmwareSource.hpp: FileSystemFirmwareSource)
@@ -1444,6 +1446,9 @@ static efi::Status kernel_main(efi::Handle image, efi::SystemTable* st) {
                        nullptr);
 #ifdef TCOS_BLUETOOTH
   hardware::HidOverGatt bluetooth_hid(shared_allocator);      // Bluetooth keyboards and mice: a profile for the Bluetooth manager and a source of input devices for SystemInput (it outlives both)
+  bluetooth_hid.set_game_controllers(&game_controllers);      // (LE game controllers go to the player slots instead)
+  hardware::HidpHost bluetooth_classic_hid(shared_allocator);  // classic HID (HIDP): DualShock 4, DualSense, Switch Pro and other classic pads, keyboards and mice
+  bluetooth_classic_hid.set_game_controllers(&game_controllers);
 #endif
   input.set_vmmdev(guest.virtualbox());
   input.initialize();
@@ -1704,6 +1709,20 @@ static efi::Status kernel_main(efi::Handle image, efi::SystemTable* st) {
     sync_wall_clock(st);
     filesystem::set_unix_clock(wall_clock_seconds, nullptr);   // before the volumes are mounted: they stamp what they create
     SystemFileSystem explorer_files(shared_allocator, storage);
+    // The Xbox Wireless Adapter's firmware (Microsoft's, which the user copies to /firmware: docs/GameControllers.md) can be read from now on;
+    // an adapter the game controller service took up before this starts at its next poll.
+    hardware::FileSystemFirmwareSource xbox_adapter_firmware(explorer_files.file_system(), shared_allocator);
+    hardware::XboxWirelessEnvironment xbox_adapter_environment;
+    xbox_adapter_environment.firmware = &xbox_adapter_firmware;
+    xbox_adapter_environment.log = [](void*, StringView text) {
+      console::debug_puts("Game controller: ");
+      console::debug_puts(text);
+      console::debug_puts("\n");
+    };
+    hardware::set_xbox_wireless_environment(&xbox_adapter_environment);
+    struct XboxAdapterEnvironmentGuard {
+      ~XboxAdapterEnvironmentGuard() { hardware::set_xbox_wireless_environment(nullptr); }   // (before the file system goes)
+    } xbox_adapter_environment_guard;
     desktop::KernelProgramLauncher program_launcher(shared_allocator);      // what the terminals run programs with
 #ifdef TCOS_INTEL_NPU
     // The Intel NPU: the firmware from /Linux/lib/firmware/intel/vpu is loaded and started (power-up, MMU, boot, ready message), its interrupt is an MSI to this core, and from then
@@ -1859,8 +1878,10 @@ static efi::Status kernel_main(efi::Handle image, efi::SystemTable* st) {
       inventory.set_bluetooth(bluetooth.get());
       bluetooth->add_profile(&bluetooth_hid);
       input.add_source(&bluetooth_hid);
+      bluetooth->add_profile(&bluetooth_classic_hid);
+      input.add_source(&bluetooth_classic_hid);
       bluetooth->start();
-      bluetooth_bonds_saved = bluetooth->bonds().count();
+      bluetooth_bonds_saved = bluetooth->bonds().revision();
       for (uint32_t i = 0; i < bluetooth->count(); ++i) {
         const hardware::BluetoothService::Entry* e = bluetooth->entry(i);
         Entry log(e->state == hardware::BluetoothState::Ready ? Level::Ok : Level::Warning, "Bluetooth");
@@ -2957,8 +2978,8 @@ static efi::Status kernel_main(efi::Handle image, efi::SystemTable* st) {
         if (++bluetooth_idle >= 25) {                                // (about every 100 ms: events read, controllers plugged in or pulled out noticed)
           bluetooth_idle = 0;
           bluetooth->step(true);
-          if (bluetooth->bonds().count() != bluetooth_bonds_saved) {                  // (a device was paired: the keys are kept)
-            bluetooth_bonds_saved = bluetooth->bonds().count();
+          if (bluetooth->bonds().revision() != bluetooth_bonds_saved) {               // (a device was paired or forgotten: the keys are kept)
+            bluetooth_bonds_saved = bluetooth->bonds().revision();
             bluetooth->save_bonds();
           }
         }

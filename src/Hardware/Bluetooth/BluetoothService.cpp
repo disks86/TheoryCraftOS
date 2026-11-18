@@ -31,12 +31,12 @@ void set_message(char (&out)[96], const char* text) {
 BluetoothService::BluetoothService(IUsbBus* usb, IBluetoothFirmwareSource* firmware, allocators::IAllocator& allocator, crypto::IRandom* random, IBluetoothBondStorage* bonds)
     : usb_(usb), firmware_(firmware), allocator_(allocator), random_(random), bond_storage_(bonds), entries_(allocator) {}
 
-// The file is the bonds (SmBondStore's form) followed by the settings: "BTST" and a byte of flags (bit 0: reconnect bonded devices automatically). A file without them (written before
-// there were settings) leaves the defaults.
+// The file is the bonds (SmBondStore's form) followed by the settings: "BTST" and a byte of flags (bit 0: reconnect bonded devices automatically), then the classic link keys (the
+// "BTLK" section). A file without them (written before there were settings or classic bonds) leaves the defaults; an older system reading a newer file stops after the settings.
 bool BluetoothService::save_bonds() {
   if (!bond_storage_) return false;
   ByteBuffer bytes(allocator_);
-  if (!bonds_.serialize(bytes) || !bytes.put_tag("BTST") || !bytes.put8(auto_reconnect_ ? 1 : 0)) return false;
+  if (!bonds_.serialize(bytes) || !bytes.put_tag("BTST") || !bytes.put8(auto_reconnect_ ? 1 : 0) || !bonds_.serialize_classic(bytes)) return false;
   return bond_storage_->save(bytes.view());
 }
 
@@ -56,7 +56,10 @@ void BluetoothService::start() {
       const ConstByteView all = bytes.view();
       if (all.size() >= SmBondStore::kHeaderBytes && all[4] <= SmBondStore::kMaxBonds) {
         const uint64_t at = SmBondStore::kHeaderBytes + uint64_t{all[4]} * SmBondStore::kRecordBytes;
-        if (all.size() >= at + 5 && all[at] == 'B' && all[at + 1] == 'T' && all[at + 2] == 'S' && all[at + 3] == 'T') auto_reconnect_ = (all[at + 4] & 1) != 0;
+        if (all.size() >= at + 5 && all[at] == 'B' && all[at + 1] == 'T' && all[at + 2] == 'S' && all[at + 3] == 'T') {
+          auto_reconnect_ = (all[at + 4] & 1) != 0;
+          if (all.size() > at + 5) bonds_.parse_classic(all.subview(at + 5));
+        }
       }
     }
   }

@@ -17,10 +17,14 @@
  */
 
 #include "Hardware/Bluetooth/HidOverGatt.hpp"
+#include "Hardware/GameController/Bluetooth/BluetoothGamepad.hpp"
+#include "Hardware/GameController/GameControllerService.hpp"
 
 namespace hardware {
 
 namespace {
+constexpr uint16_t kDeviceInformation = 0x180A, kPnpId = 0x2A50;
+constexpr uint8_t kReportInput = 1, kReportOutput = 2;
 constexpr uint16_t kHidService = 0x1812, kReportMap = 0x2A4B, kReport = 0x2A4D, kBootKeyboardInput = 0x2A22, kBootMouseInput = 0x2A33, kProtocolMode = 0x2A4E, kReportReference = 0x2908;
 
 void copy_text(char* out, uint32_t capacity, const char* text) {
@@ -182,6 +186,130 @@ void BluetoothHidMouse::on_release_all() {
   push(e);
 }
 
+// ------------------------------------------------------------------ game controllers
+
+bool GattPadLink::add_output(uint8_t id, int characteristic, bool without_response) {
+  kernel::ScopedMutex guard(mutex_);
+  if (count_ == kMaxOutputs) return false;
+  Output& o = outputs_[count_++];
+  o.id = id;
+  o.characteristic = characteristic;
+  o.without_response = without_response;
+  return true;
+}
+
+bool GattPadLink::send_output(ConstByteView report) {
+  if (report.empty() || report.size() - 1 > kMaxOutput) return false;
+  kernel::ScopedMutex guard(mutex_);
+  for (uint32_t i = 0; i < count_; ++i) {
+    Output& o = outputs_[i];
+    if (o.id != report[0]) continue;
+    const ConstByteView value = report.dropped(1);     // (over GATT the id is the characteristic's, not part of the value)
+    ByteView(o.data).first(value.size()).copy_from(value);
+    o.length = static_cast<uint32_t>(value.size());
+    o.pending = true;
+    return true;
+  }
+  return false;
+}
+
+void GattPadLink::flush(IBluetoothRemote& remote) {
+  for (uint32_t i = 0; i < kMaxOutputs; ++i) {
+    uint8_t value[kMaxOutput];
+    uint32_t length = 0;
+    int characteristic = -1;
+    bool with_response = true;
+    {
+      kernel::ScopedMutex guard(mutex_);
+      if (i >= count_ || !outputs_[i].pending) continue;
+      Output& o = outputs_[i];
+      ByteView(value).first(o.length).copy_from(ConstByteView(o.data).first(o.length));
+      length = o.length;
+      characteristic = o.characteristic;
+      with_response = !o.without_response;
+      o.pending = false;
+    }
+    (void)remote.write(characteristic, ConstByteView(value).first(length), with_response);   // (the lock is not held for the traffic)
+  }
+}
+
+// A game controller: its input reports routed to a channel, its output reports to a link, the pad to the game controller service.
+bool HidOverGatt::attach_pad(IBluetoothRemote& remote, Record& record, ConstByteView descriptor, const hid::ReportMap& map) {
+  if (!game_controllers_) return false;
+  const GattDatabase& db = remote.database();
+  BluetoothPadIdentity identity;
+  identity.le = true;
+  identity.name = remote.info().name;
+  const int pnp = db.find_characteristic(Uuid::from16(kPnpId), Uuid::from16(kDeviceInformation));
+  uint8_t id_value[8];
+  uint32_t id_length = 0;
+  if (pnp >= 0 && remote.read(pnp, ByteView(id_value), &id_length) == AttStatus::Ok && id_length >= 5) {   // source, vendor, product, version
+    identity.vendor_id = static_cast<uint16_t>(id_value[1] | (id_value[2] << 8));
+    identity.product_id = static_cast<uint16_t>(id_value[3] | (id_value[4] << 8));
+  }
+  if (!is_bluetooth_gamepad(identity, descriptor)) return false;
+
+  const int service = db.find_service(Uuid::from16(kHidService));
+  SharedPointer<GattPadLink> link = SharedPointer<GattPadLink>::make(allocator_);
+  SharedPointer<HidPadChannel> channel = SharedPointer<HidPadChannel>::make(allocator_);
+  if (!link || !channel) return false;
+  int route_characteristic[kMaxReports] = {};
+  uint32_t routes = 0;
+  for (uint32_t c = 0; c < db.characteristic_count; ++c) {
+    const GattCharacteristic& ch = db.characteristics[c];
+    if (ch.service != service || ch.uuid != Uuid::from16(kReport)) continue;
+    uint16_t reference = 0;
+    for (uint32_t d = 0; d < db.descriptor_count; ++d)
+      if (db.descriptors[d].characteristic == c && db.descriptors[d].uuid == Uuid::from16(kReportReference)) reference = db.descriptors[d].handle;
+    uint8_t ref[4];
+    uint32_t ref_length = 0;
+    if (reference == 0 || remote.read_descriptor(reference, ByteView(ref), &ref_length) != AttStatus::Ok || ref_length < 2) continue;
+    if (ref[1] == kReportInput && (ch.properties & gatt::kPropNotify) && routes < kMaxReports && map.find(ref[0])) {
+      Route route;
+      route.value_handle = ch.value_handle;
+      route.pad = true;
+      route.report_id = ref[0];
+      route_characteristic[routes] = static_cast<int>(c);
+      record.routes[routes++] = route;
+    } else if (ref[1] == kReportOutput && (ch.properties & (gatt::kPropWrite | gatt::kPropWriteWithoutResponse))) {
+      (void)link->add_output(ref[0], static_cast<int>(c), (ch.properties & gatt::kPropWriteWithoutResponse) != 0);
+    }
+  }
+  if (routes == 0) return false;
+  channel->attach(link.get());
+  UniquePointer<IGameController> pad = make_bluetooth_gamepad(allocator_, channel, identity, descriptor);
+  if (!pad) {
+    channel->detach();
+    return false;
+  }
+  {
+    kernel::ScopedMutex guard(mutex_);
+    record.route_count = routes;
+    record.channel = channel;
+    record.link = link;
+  }
+  uint32_t subscribed = 0;
+  for (uint32_t i = 0; i < routes; ++i)
+    if (remote.subscribe(route_characteristic[i], false, this) == AttStatus::Ok) ++subscribed;
+  if (subscribed == 0 || game_controllers_->add(util::move(pad)) < 0) {   // (every slot taken: the pad is not served, the device is let go)
+    kernel::ScopedMutex guard(mutex_);
+    record.route_count = 0;
+    return false;
+  }
+  return true;
+}
+
+void HidOverGatt::service(IBluetoothRemote& remote) {
+  SharedPointer<GattPadLink> link;
+  {
+    kernel::ScopedMutex guard(mutex_);
+    Record* record = record_for(remote.id());
+    if (!record || record->gone || !record->link) return;
+    link = record->link;          // (a reference of its own: the record may be cleared meanwhile)
+  }
+  link->flush(remote);
+}
+
 // ------------------------------------------------------------------ the profile
 
 bool HidOverGatt::matches(const BluetoothDeviceInfo&, const GattDatabase& database) const { return database.find_service(Uuid::from16(kHidService)) >= 0; }
@@ -228,6 +356,8 @@ bool HidOverGatt::attach_reports(IBluetoothRemote& remote, Record& record) {
   if (remote.read(map_index, ByteView(descriptor), &length) != AttStatus::Ok || length == 0) return false;
   UniquePointer<hid::ReportMap> map = UniquePointer<hid::ReportMap>::make(allocator_);
   if (!map || !hid::parse_report_map(ConstByteView(descriptor, length), map.get())) return false;
+  if (attach_pad(remote, record, ConstByteView(descriptor, length), *map)) return true;
+  if (record.channel) return false;      // (a pad that could not be served is not a keyboard either)
 
   bool want_keyboard = false, want_mouse = false, want_consumer = false;
   int route_characteristic[kMaxReports] = {};
@@ -325,7 +455,15 @@ void HidOverGatt::on_notification(IBluetoothRemote& remote, uint16_t value_handl
   for (uint32_t i = 0; i < record->route_count; ++i) {
     Route& route = record->routes[i];
     if (route.value_handle != value_handle) continue;
-    if (route.keyboard) {
+    if (route.pad) {
+      if (!record->channel) return;
+      uint8_t report[HidPadChannel::kMaxReport];
+      uint32_t at = 0;
+      if (route.report_id != 0) report[at++] = route.report_id;
+      const ConstByteView kept = value.at_most(sizeof report - at);
+      ByteView(report).subview(at, kept.size()).copy_from(kept);
+      record->channel->deliver(ConstByteView(report).first(at + kept.size()));
+    } else if (route.keyboard) {
       hid::KeyboardState state;
       if (record->keyboard && route.keyboard_decoder.decode(value, &state)) record->keyboard->deliver(state);
     } else if (route.consumer) {
@@ -341,7 +479,10 @@ void HidOverGatt::on_notification(IBluetoothRemote& remote, uint16_t value_handl
 
 void HidOverGatt::detach(IBluetoothRemote& remote) {
   kernel::ScopedMutex guard(mutex_);
-  if (Record* record = record_for(remote.id())) record->gone = true;
+  Record* record = record_for(remote.id());
+  if (!record) return;
+  record->gone = true;
+  if (record->channel) record->channel->detach();   // (the pad leaves its slot; nothing calls the link from now on)
 }
 
 uint32_t HidOverGatt::poll(IInputSink& sink) {

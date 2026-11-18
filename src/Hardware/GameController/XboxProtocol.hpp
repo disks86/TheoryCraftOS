@@ -55,6 +55,12 @@ uint32_t encode_360_rumble(uint16_t low_frequency, uint16_t high_frequency, Byte
 // The LED message (3 bytes): player 1..4 lights that quadrant of the ring, 0 turns it off.
 uint32_t encode_360_led(uint8_t player, ByteView out);
 
+// Xbox pads over Bluetooth (One S, Series, Elite 2): a HID gamepad (HidGamepad decodes it) whose buttons come in this order, and rumble as
+// output report 3: motor enables, the trigger motors, the main motors (0..100), duration, delay and repeat.
+constexpr uint32_t kBluetoothButtons = 16;
+extern const uint32_t kBluetoothButtonMap[kBluetoothButtons];
+uint32_t encode_bt_rumble(uint16_t low_frequency, uint16_t high_frequency, ByteView out);   // (9 bytes, report id first)
+
 // GIP commands.
 constexpr uint8_t kGipAcknowledge = 0x01, kGipStatus = 0x03, kGipPower = 0x05, kGipGuide = 0x07, kGipRumble = 0x09, kGipLed = 0x0A,
                   kGipInput = 0x20;

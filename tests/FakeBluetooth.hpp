@@ -33,6 +33,27 @@ typedef std::vector<uint8_t> Bytes;
 
 inline ConstByteView view(const Bytes& b) { return ConstByteView(b.data(), b.size()); }
 
+// The link manager of a classic device on the other end of the controller's ACL link: what the two controllers settle between themselves (link keys, Secure Simple Pairing,
+// legacy PIN pairing, encryption) seen as the HCI events the host gets. Set Controller::lmp to use it.
+struct ClassicLmp {
+  uint8_t address[6] = {0x31, 0x32, 0x33, 0x34, 0x35, 0x36};
+  uint16_t handle = 1;
+  bool ssp = true;                        // false: legacy pairing with a PIN
+  uint8_t io_capability = 3;              // the device's: 0 display only, 1 display yes/no, 2 keyboard only, 3 none
+  uint32_t numeric = 123456;              // the number both sides show (numeric comparison)
+  uint32_t passkey = 654321;              // the passkey the host shows for a keyboard to type
+  Bytes pin = {'0', '0', '0', '0'};      // legacy: the PIN the device expects
+  bool refuse_pairing = false, device_accepts = true;
+  bool has_key = false;                   // the key the device keeps for the host
+  uint8_t key[16] = {};
+  // what happened
+  uint32_t pairings = 0, key_replies = 0, negative_key_replies = 0, encryptions = 0, confirmations = 0, rejections = 0;
+  uint8_t host_io = 0xFF, host_authentication = 0xFF;
+  Bytes last_pin;
+  bool encrypted = false;
+  bool just_works() const { return host_io == 3 || io_capability == 3; }
+};
+
 struct Controller {
   // what it is
   uint8_t hci_version = 9, lmp_version = 9;
@@ -50,6 +71,10 @@ struct Controller {
   uint32_t payload_expected = 0, payload_received = 0;
   bool intel_fail_download = false, intel_no_bootup = false;
   uint16_t dev_revid = 0x23;
+  ClassicLmp* lmp = nullptr;              // a classic device's link manager (pairing and encryption on its link)
+  bool complete_accepted = false;         // an accepted incoming connection completes (with the lmp's handle)
+  const char* remote_name_text = "Speaker Y";
+  uint8_t scan_enable = 0;
   // what it was asked
   std::vector<Bytes> commands, acl_from_host;
   std::vector<uint16_t> opcodes;
@@ -103,7 +128,8 @@ struct Controller {
       case kOpReadLocalFeatures: { Bytes f(features, features + 8); if (!le) f[4] &= ~0x40; complete(op, 0, f); return; }
       case kOpSetEventMask: case kOpWriteInquiryMode: case kOpWriteSimplePairingMode: case kOpWriteLeHostSupported: case kOpLeSetEventMask:
       case kOpLeSetScanParameters: case kOpWriteLocalName: complete(op, 0); return;
-      case kOpWriteScanEnable: ++scan_enable_writes; complete(op, 0); return;
+      case kOpWriteScanEnable: ++scan_enable_writes; if (!params.empty()) scan_enable = params[0]; complete(op, 0); return;
+      case kOpWriteDefaultLinkPolicy: complete(op, 0); return;
       case kOpLeReadBufferSize: complete(op, 0, {static_cast<uint8_t>(le_mtu), static_cast<uint8_t>(le_mtu >> 8), static_cast<uint8_t>(le_packets)}); return;
       case kOpLeReadLocalFeatures: complete(op, 0, {1, 0, 0, 0, 0, 0, 0, 0}); return;
       case kOpInquiry: inquiry(); return;
@@ -143,12 +169,141 @@ struct Controller {
         push(kEvEncryptionChange, {static_cast<uint8_t>(ok ? 0 : 0x06), params[0], params[1], static_cast<uint8_t>(ok ? 1 : 0)});
         return;
       }
-      case kOpAcceptConnection: last_accept = params; status_event(op, 0); return;
+      case kOpAcceptConnection: {
+        last_accept = params;
+        status_event(op, 0);
+        if (complete_accepted && lmp && params.size() >= 6) {
+          Bytes p = {0, static_cast<uint8_t>(lmp->handle), static_cast<uint8_t>(lmp->handle >> 8)};
+          p.insert(p.end(), params.begin(), params.begin() + 6);
+          p.push_back(1);
+          p.push_back(0);
+          push(kEvConnectionComplete, p);
+        }
+        return;
+      }
       case kOpRejectConnection: last_reject = params; status_event(op, 0); return;
       default: break;
     }
+    if (lmp && classic_security(op, params)) return;
     if (intel) intel_command(op, params);
     else complete(op, hci::kStatusUnknownCommand);
+  }
+
+  // ---- the classic device's link manager
+  // A bonded device that reconnects by itself (a pad whose button was pressed): its connection request.
+  void incoming_request(uint32_t class_of_device = 0x002508) {
+    Bytes p = addr(lmp->address);
+    p.insert(p.end(), {static_cast<uint8_t>(class_of_device), static_cast<uint8_t>(class_of_device >> 8), static_cast<uint8_t>(class_of_device >> 16), 1});
+    push(hci::kEvConnectionRequest, p);
+  }
+  // The device drops the link (switched off, or out of range).
+  void remote_disconnect(uint8_t reason = 0x13) {
+    push(hci::kEvDisconnectionComplete, {0, static_cast<uint8_t>(lmp->handle), static_cast<uint8_t>(lmp->handle >> 8), reason});
+    lmp->encrypted = false;
+  }
+  void auth_complete(uint8_t status) { push(hci::kEvAuthenticationComplete, {status, static_cast<uint8_t>(lmp->handle), static_cast<uint8_t>(lmp->handle >> 8)}); }
+  void pairing_failed(uint8_t status) {
+    if (lmp->ssp) { Bytes p = {status}; Bytes a = addr(lmp->address); p.insert(p.end(), a.begin(), a.end()); push(hci::kEvSimplePairingComplete, p); }
+    auth_complete(status);
+  }
+  void pairing_done(bool authenticated) {
+    ++lmp->pairings;
+    lmp->has_key = true;
+    for (int i = 0; i < 16; ++i) lmp->key[i] = static_cast<uint8_t>(0x50 + i + lmp->pairings * 3);
+    const uint8_t type = !lmp->ssp ? 0x00 : authenticated ? 0x05 : 0x04;
+    if (lmp->ssp) { Bytes p = {0}; Bytes a = addr(lmp->address); p.insert(p.end(), a.begin(), a.end()); push(hci::kEvSimplePairingComplete, p); }
+    Bytes n = addr(lmp->address);
+    n.insert(n.end(), lmp->key, lmp->key + 16);
+    n.push_back(type);
+    push(hci::kEvLinkKeyNotification, n);
+    auth_complete(0);
+  }
+  bool classic_security(uint16_t op, const Bytes& params) {
+    using namespace hci;
+    ClassicLmp& d = *lmp;
+    const Bytes a = addr(d.address);
+    switch (op) {
+      case kOpAuthenticationRequested:
+        status_event(op, 0);
+        push(kEvLinkKeyRequest, a);
+        return true;
+      case kOpLinkKeyReply: {
+        complete(op, 0, a);
+        ++d.key_replies;
+        const bool same = d.has_key && params.size() >= 22 && memcmp(params.data() + 6, d.key, 16) == 0;
+        auth_complete(same ? 0 : kStatusPinOrKeyMissing);
+        return true;
+      }
+      case kOpLinkKeyNegativeReply:
+        complete(op, 0, a);
+        ++d.negative_key_replies;
+        if (d.refuse_pairing) { auth_complete(kStatusPairingNotAllowed); return true; }
+        push(d.ssp ? kEvIoCapabilityRequest : kEvPinCodeRequest, a);
+        return true;
+      case kOpIoCapabilityReply: {
+        complete(op, 0, a);
+        d.host_io = params.size() > 6 ? params[6] : 0xFF;
+        d.host_authentication = params.size() > 8 ? params[8] : 0xFF;
+        Bytes r = a;
+        r.insert(r.end(), {d.io_capability, 0, 0x04});
+        push(kEvIoCapabilityResponse, r);
+        if (d.io_capability == 2 && d.host_io <= 1) {                        // a keyboard: the host shows a passkey, its user types it (here: at once, correctly)
+          Bytes n = a;
+          n.insert(n.end(), {static_cast<uint8_t>(d.passkey), static_cast<uint8_t>(d.passkey >> 8), static_cast<uint8_t>(d.passkey >> 16), static_cast<uint8_t>(d.passkey >> 24)});
+          push(kEvUserPasskeyNotification, n);
+          pairing_done(true);
+          return true;
+        }
+        Bytes c = a;
+        c.insert(c.end(), {static_cast<uint8_t>(d.numeric), static_cast<uint8_t>(d.numeric >> 8), static_cast<uint8_t>(d.numeric >> 16), static_cast<uint8_t>(d.numeric >> 24)});
+        push(kEvUserConfirmationRequest, c);
+        return true;
+      }
+      case kOpIoCapabilityNegativeReply:
+        complete(op, 0, a);
+        pairing_failed(kStatusPairingNotAllowed);
+        return true;
+      case kOpUserConfirmationReply:
+        complete(op, 0, a);
+        ++d.confirmations;
+        if (d.device_accepts) pairing_done(!d.just_works());
+        else pairing_failed(kStatusAuthenticationFailure);
+        return true;
+      case kOpUserConfirmationNegativeReply:
+        complete(op, 0, a);
+        ++d.rejections;
+        pairing_failed(kStatusAuthenticationFailure);
+        return true;
+      case kOpUserPasskeyReply:
+        complete(op, 0, a);
+        pairing_done(true);
+        return true;
+      case kOpUserPasskeyNegativeReply:
+        complete(op, 0, a);
+        pairing_failed(kStatusAuthenticationFailure);
+        return true;
+      case kOpPinCodeReply: {
+        complete(op, 0, a);
+        const uint8_t n = params.size() > 6 ? params[6] : 0;
+        d.last_pin = Bytes(params.begin() + 7, params.begin() + 7 + (n <= 16 && params.size() >= 7u + n ? n : 0));
+        if (d.last_pin == d.pin) pairing_done(false);
+        else auth_complete(kStatusAuthenticationFailure);
+        return true;
+      }
+      case kOpPinCodeNegativeReply:
+        complete(op, 0, a);
+        auth_complete(kStatusPinOrKeyMissing);
+        return true;
+      case kOpSetConnectionEncryption:
+        status_event(op, 0);
+        if (!d.has_key) { push(kEvEncryptionChange, {kStatusPinOrKeyMissing, params[0], params[1], 0}); return true; }
+        ++d.encryptions;
+        d.encrypted = true;
+        push(kEvEncryptionChange, {0, params[0], params[1], 1});
+        return true;
+      default:
+        return false;
+    }
   }
 
   void intel_command(uint16_t op, const Bytes& params) {
@@ -220,7 +375,7 @@ struct Controller {
     status_event(hci::kOpRemoteNameRequest, 0);
     Bytes p = {0};
     p.insert(p.end(), params.begin(), params.begin() + 6);
-    const char* name = "Speaker Y";
+    const char* name = remote_name_text;
     p.insert(p.end(), name, name + strlen(name));
     p.resize(7 + 248, 0);
     push(hci::kEvRemoteNameRequestComplete, p);

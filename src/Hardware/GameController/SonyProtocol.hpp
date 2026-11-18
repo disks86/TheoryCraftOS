@@ -40,5 +40,19 @@ constexpr uint32_t kDualShock4OutputSize = 32, kDualSenseOutputSize = 48;
 uint32_t encode_dualshock4_output(const gamepad::Output& output, ByteView out);
 uint32_t encode_dualsense_output(const gamepad::Output& output, ByteView out);
 
+// --- Bluetooth. Both pads start with a reduced report 0x01 (sticks, buttons and triggers in the USB report's first ten bytes, no battery) and
+// switch to the full one once the host reads a feature report: 0x02 (DualShock 4: then report 0x11, the USB layout two bytes on) or 0x05
+// (DualSense: report 0x31, the USB layout one byte on). Output reports are 78 bytes ending in a CRC-32 over 0xA2 and the report.
+constexpr uint8_t kDualShock4BtInput = 0x11, kDualSenseBtInput = 0x31, kDualShock4BtOutput = 0x11, kDualSenseBtOutput = 0x31;
+constexpr uint8_t kDualShock4BtEnableFeature = 0x02, kDualSenseBtEnableFeature = 0x05;
+constexpr uint32_t kBtOutputSize = 78;
+[[nodiscard]] bool decode_bt_reduced(ConstByteView report, gamepad::State* state);     // report 0x01 of either pad over Bluetooth
+[[nodiscard]] bool decode_dualshock4_bt(ConstByteView report, gamepad::State* state);   // report 0x11
+[[nodiscard]] bool decode_dualsense_bt(ConstByteView report, gamepad::State* state);    // report 0x31
+uint32_t encode_dualshock4_bt_output(const gamepad::Output& output, ByteView out);
+uint32_t encode_dualsense_bt_output(const gamepad::Output& output, uint8_t sequence, ByteView out);
+// Whether a Bluetooth output report's CRC is right (for tests and for checking what a pad echoes).
+bool bt_output_crc_ok(ConstByteView report);
+
 }  // namespace sony
 }  // namespace hardware

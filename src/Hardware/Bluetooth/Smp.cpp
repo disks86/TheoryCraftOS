@@ -69,13 +69,80 @@ bool SmBondStore::store(const SmBond& bond) {
   if (!slot) return false;
   *slot = bond;
   slot->used = true;
+  ++revision_;
   return true;
 }
 
 bool SmBondStore::remove(const hci::BdAddr& address, uint8_t address_type) {
   for (SmBond& b : bonds_)
-    if (b.used && b.address == address && b.address_type == address_type) { b.used = false; return true; }
+    if (b.used && b.address == address && b.address_type == address_type) { b.used = false; ++revision_; return true; }
   return false;
+}
+
+const ClassicBond* SmBondStore::find_classic(const hci::BdAddr& address) const {
+  for (const ClassicBond& b : classic_)
+    if (b.used && b.address == address) return &b;
+  return nullptr;
+}
+
+bool SmBondStore::store_classic(const ClassicBond& bond) {
+  ClassicBond* slot = nullptr;
+  for (ClassicBond& b : classic_) {
+    if (b.used && b.address == bond.address) { slot = &b; break; }
+    if (!b.used && !slot) slot = &b;
+  }
+  if (!slot) return false;
+  *slot = bond;
+  slot->used = true;
+  ++revision_;
+  return true;
+}
+
+bool SmBondStore::remove_classic(const hci::BdAddr& address) {
+  for (ClassicBond& b : classic_)
+    if (b.used && b.address == address) { b.used = false; ++revision_; return true; }
+  return false;
+}
+
+uint32_t SmBondStore::classic_count() const {
+  uint32_t n = 0;
+  for (const ClassicBond& b : classic_) n += b.used;
+  return n;
+}
+
+// "BTLK", version, record length, count, then each record: address (6), link key (16), key type, flags (bit 0: authenticated). A later version may make records longer
+// (fields added at the end): the record length lets this one read what it knows of each and skip the rest.
+bool SmBondStore::serialize_classic(ByteBuffer& out) const {
+  if (!out.put_tag("BTLK") || !out.put8(kClassicVersion) || !out.put8(kClassicRecordBytes) || !out.put8(static_cast<uint8_t>(classic_count()))) return false;
+  for (const ClassicBond& b : classic_) {
+    if (!b.used) continue;
+    if (!out.append(ConstByteView(b.address.b, 6)) || !out.append(ConstByteView(b.key, 16)) || !out.put8(b.key_type) || !out.put8(b.authenticated ? 1 : 0)) return false;
+  }
+  return true;
+}
+
+uint32_t SmBondStore::parse_classic(ConstByteView section) {
+  ByteReader in(section);
+  const ConstByteView tag = in.take(4);
+  const uint8_t version = in.u8();
+  const uint8_t record = in.u8();
+  const uint8_t count = in.u8();
+  if (!in.ok() || tag[0] != 'B' || tag[1] != 'T' || tag[2] != 'L' || tag[3] != 'K' || version == 0 || record < kClassicRecordBytes) return 0;
+  uint32_t taken = 0;
+  for (uint32_t i = 0; i < count && i < kMaxClassicBonds; ++i) {
+    ByteReader r(in.take(record));
+    if (!in.ok()) break;                                                  // (truncated)
+    ClassicBond b;
+    r.read_into(ByteView(b.address.b, 6));
+    r.read_into(ByteView(b.key));
+    b.key_type = r.u8();
+    const uint8_t flags = r.u8();
+    if (!r.ok() || b.key_type > 8 || b.address.is_zero()) break;
+    b.authenticated = flags & 1;
+    b.used = true;
+    if (store_classic(b)) ++taken;
+  }
+  return taken;
 }
 
 uint32_t SmBondStore::count() const {

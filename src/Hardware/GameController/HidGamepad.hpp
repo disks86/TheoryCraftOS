@@ -41,10 +41,13 @@ const InputReport* find_gamepad_report(const ReportMap& map);
 
 class GamepadDecoder {
  public:
-  static constexpr uint32_t kMaxButtons = 13;
+  static constexpr uint32_t kMaxButtons = 16;
 
   // Finds the axes, the hat and the buttons; false if the report has neither two axes nor a button.
   [[nodiscard]] bool init(const InputReport& report);
+  // The standard button each HID button (1..kMaxButtons) stands for, for a pad whose order is known (Xbox over Bluetooth), in place of the
+  // convention above. Entries past `map` are no button. Call after init(). The digital trigger fallback (buttons 7 and 8) is then off.
+  void set_button_map(ArrayView<const uint32_t> map);
   bool valid() const { return valid_; }
   uint32_t capabilities() const;   // gamepad::Capability bits the layout supports
   // The state a report (its data, after the id byte) describes; false if the report is too short for the layout.
@@ -66,6 +69,8 @@ class GamepadDecoder {
   InputField button_bits_[kMaxButtons];   // ... or one field per button, as a descriptor with single usages has them
   bool has_button_bit_[kMaxButtons] = {};
   uint32_t min_bytes_ = 0;
+  uint32_t map_[kMaxButtons] = {};
+  bool custom_map_ = false;
 };
 
 }  // namespace hid

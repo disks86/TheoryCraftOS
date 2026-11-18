@@ -21,7 +21,10 @@
 //
 //   Bring-up:      initialize() resets the controller and reads what it is (version, address, buffers, features) and switches on the events the host handles.
 //   Finding:       start_inquiry() (Bluetooth classic) and start_le_scan() fill a table of devices; request_name() asks a classic device for its name.
-//   Links:         connect() / connect_le() / disconnect(); incoming classic connections are refused unless accept_incoming(true), nothing is paired or encrypted here.
+//   Links:         connect() / connect_le() / disconnect(); incoming classic connections are refused unless accept_incoming(true) or the incoming filter takes them (then with a
+//                  role switch: this side becomes the central).
+//   Classic security: what the controller asks about a classic link's authentication (link keys, IO capabilities, numbers to compare, PIN codes) is queued as HciSecurityEvents, which
+//                  the owner takes with take_security_event() outside the event handling and answers with the reply commands. Nothing is decided here.
 //   Data:          send_acl() splits a packet to the controller's buffer size and waits for a free buffer (flow control by the credits the controller hands out); what arrives goes to the
 //                  ACL handler, whole packets with the link they came on.
 #pragma once
@@ -64,7 +67,33 @@ struct HciLink {
   hci::BdAddr address;
   bool le = false;
   uint8_t address_type = 0;
-  bool central = true;            // we initiated it
+  bool central = true;            // we initiated it (classic: true also for a link the peer opened and we took with a role switch)
+  bool incoming = false;          // classic: the peer connected to us (a bonded device reconnecting)
+};
+
+// Classic security events (Core spec vol 4 part E 7.7): what the controller asks the host or tells it while a classic link is authenticated.
+enum class HciSecurityKind : uint8_t {
+  LinkKeyRequest,            // answer with link_key_reply() or link_key_negative_reply()
+  LinkKeyNotification,       // a new link key (`key`, `key_type`): keep it
+  PinCodeRequest,            // legacy pairing: answer with pin_code_reply() or pin_code_negative_reply()
+  IoCapabilityRequest,       // Secure Simple Pairing: answer with io_capability_reply() or io_capability_negative_reply()
+  IoCapabilityResponse,      // the peer's IO capability and authentication requirements
+  UserConfirmationRequest,   // `value`: the number to compare (Just Works too, where nobody is shown it); answer with user_confirmation_reply()
+  UserPasskeyRequest,        // answer with user_passkey_reply() or user_passkey_negative_reply()
+  UserPasskeyNotification,   // `value`: the passkey to show; the peer's user types it
+  SimplePairingComplete,     // `status`
+  AuthenticationComplete,    // `handle`, `status`
+  ConnectionFailed,          // a Create Connection ended with `status` (page timeout...)
+};
+struct HciSecurityEvent {
+  HciSecurityKind kind = HciSecurityKind::LinkKeyRequest;
+  hci::BdAddr address;
+  uint16_t handle = 0;
+  uint8_t status = 0;
+  uint32_t value = 0;
+  uint8_t key[16] = {};
+  uint8_t key_type = 0;
+  uint8_t io_capability = 0, authentication = 0;
 };
 
 using HciAclHandler = void (*)(void* context, const HciLink& link, uint8_t boundary, ConstByteView data);
@@ -74,12 +103,14 @@ using HciLinkHandler = void (*)(void* context, const HciLink& link, bool up);
 using HciEncryptionHandler = void (*)(void* context, uint16_t handle, uint8_t status, bool enabled);
 // The controller (as the peripheral's side of a bond, or ours) asks for the long term key of a link to start encryption: fill `ltk` and return true, or false to refuse.
 using HciKeyRequestHandler = bool (*)(void* context, uint16_t handle, const uint8_t random[8], uint16_t ediv, uint8_t ltk[16]);
+// An incoming classic connection: true to take it (with a role switch), false to leave it to accept_incoming().
+using HciIncomingFilter = bool (*)(void* context, const hci::BdAddr& address, uint32_t class_of_device);
 // Sees every event first; true takes it (the vendor events of firmware loading are handled this way).
 using HciEventHook = bool (*)(void* context, const hci::Event& event);
 
 class HciController {
  public:
-  static constexpr uint32_t kMaxDevices = 32, kMaxLinks = 8;
+  static constexpr uint32_t kMaxDevices = 32, kMaxLinks = 8, kMaxSecurityEvents = 8;
   HciController(IHciTransport& transport, allocators::IAllocator& allocator) : transport_(transport), allocator_(allocator) {}
   HciController(const HciController&) = delete;
   HciController& operator=(const HciController&) = delete;
@@ -123,6 +154,10 @@ class HciController {
   HciResult cancel_connect_le() { return command(hci::kOpLeCreateConnectionCancel); }
   HciResult disconnect(uint16_t handle, uint8_t reason = hci::kStatusRemoteUserTerminated);
   void accept_incoming(bool accept) { accept_incoming_ = accept; }
+  void set_incoming_filter(HciIncomingFilter filter, void* context) { incoming_filter_ = filter; incoming_context_ = context; }
+  // Page scan (bit 1: accept connections) and inquiry scan (bit 0: answer inquiries).
+  HciResult write_scan_enable(uint8_t mode);
+  uint8_t scan_enable() const { return scan_enable_; }
   const HciLink* link(uint16_t handle) const;
   const HciLink* find_link(const hci::BdAddr& address) const;
   uint32_t link_count() const;
@@ -138,6 +173,20 @@ class HciController {
   HciResult start_encryption(uint16_t handle, const uint8_t random[8], uint16_t ediv, const uint8_t ltk[16]);
   // Classic: switches encryption on a link on (needs a link key the controller holds).
   HciResult set_connection_encryption(uint16_t handle, bool on);
+  // --- classic security (the answers to HciSecurityEvents)
+  [[nodiscard]] bool take_security_event(HciSecurityEvent* out);
+  HciResult authenticate(uint16_t handle);                                     // Authentication Requested: the link key, or pairing if there is none
+  HciResult link_key_reply(const hci::BdAddr& address, const uint8_t key[16]);
+  HciResult link_key_negative_reply(const hci::BdAddr& address);
+  HciResult pin_code_reply(const hci::BdAddr& address, ConstByteView pin);    // 1 to 16 bytes
+  HciResult pin_code_negative_reply(const hci::BdAddr& address);
+  HciResult io_capability_reply(const hci::BdAddr& address, uint8_t io_capability, uint8_t authentication);
+  HciResult io_capability_negative_reply(const hci::BdAddr& address, uint8_t reason);
+  HciResult user_confirmation_reply(const hci::BdAddr& address, bool accept);
+  HciResult user_passkey_reply(const hci::BdAddr& address, uint32_t passkey);
+  HciResult user_passkey_negative_reply(const hci::BdAddr& address);
+  uint32_t security_events_dropped() const { return security_dropped_; }
+
   // Sends one L2CAP packet (or any ACL payload) on a link in as many fragments as the controller's buffers need.
   HciResult send_acl(uint16_t handle, ConstByteView data, uint32_t timeout_ms = 2000);
 
@@ -159,6 +208,8 @@ class HciController {
   void process_incoming();
   uint32_t drain_events();
   HciResult simple(uint16_t opcode, ConstByteView params) { return command(opcode, params); }
+  HciResult address_command(uint16_t opcode, const hci::BdAddr& address, ConstByteView more = ConstByteView());
+  void queue_security(const HciSecurityEvent& event);
 
   IHciTransport& transport_;
   allocators::IAllocator& allocator_;
@@ -177,8 +228,15 @@ class HciController {
   HciLink links_[kMaxLinks];
   uint16_t acl_credits_ = 0, le_credits_ = 0;
   bool inquiring_ = false, le_scanning_ = false, accept_incoming_ = false;
-  struct Incoming { bool used = false; hci::BdAddr address; };
+  struct Incoming { bool used = false; hci::BdAddr address; uint32_t class_of_device = 0; uint8_t link_type = 1; };
   Incoming incoming_[4];
+  hci::BdAddr accepted_[4];                // incoming connections accepted and not complete yet (their links are marked incoming)
+  bool accepted_used_[4] = {};
+  HciIncomingFilter incoming_filter_ = nullptr;
+  void* incoming_context_ = nullptr;
+  uint8_t scan_enable_ = 0;
+  HciSecurityEvent security_[kMaxSecurityEvents];
+  uint32_t security_head_ = 0, security_count_ = 0, security_dropped_ = 0;
   struct KeyRequest { bool used = false; uint16_t handle = 0; uint8_t random[8] = {}; uint16_t ediv = 0; };
   KeyRequest key_requests_[2];
   HciLinkHandler link_handler_ = nullptr;
