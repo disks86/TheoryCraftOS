@@ -1,0 +1,17 @@
+LIBRARY cabinet.dll
+EXPORTS
+; The ordinals Windows gives these exports (as Wine's cabinet.spec lists them)
+GetDllVersion @1
+DllGetVersion @2
+Extract @3
+DeleteExtractedFiles @4
+FCICreate @10
+FCIAddFile @11
+FCIFlushFolder @12
+FCIFlushCabinet @13
+FCIDestroy @14
+FDICreate @20
+FDIIsCabinet @21
+FDICopy @22
+FDIDestroy @23
+FDITruncateCabinet @24

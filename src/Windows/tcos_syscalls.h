@@ -117,6 +117,7 @@
 #define NT_SERVICE_NtTcosFont 508
 #define NT_SERVICE_NtTcosOpenGl 509
 #define NT_SERVICE_NtTcosAudio 510
+#define NT_SERVICE_NtTcosCabinet 511
 #define NT_SERVICE_NtCreateSocket 87
 #define NT_SERVICE_NtBindSocket 88
 #define NT_SERVICE_NtConnectSocket 89
@@ -2074,7 +2075,7 @@
 #define NT_SERVICE_NtUserTcosGetUpcall 5636
 #define NT_SERVICE_NtUserTcosUpcallDone 5637
 #define NT_SERVICE_NtUserTcosResume 5638
-#define NT_SERVICE_COUNT 511
+#define NT_SERVICE_COUNT 512
 #define NT_SERVICE_WIN32K_BASE 4096
 #define NT_SERVICE_WIN32K_END 5639
 #endif

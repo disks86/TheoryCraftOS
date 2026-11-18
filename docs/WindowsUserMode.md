@@ -683,6 +683,18 @@ Not done (they answer `STATUS_NOT_SUPPORTED`, or stay stubs): MD2, DES/3DES/RC2,
 on decryption or with chained calls, SP800-108/TLS PRF/CAPI KDFs, and the context and provider registration functions (`src/Windows/stubs/bcrypt.inc`). Tests: `SyscallTest` (known answers
 of every operation, bit flips and bad pointers) and `tests/windows/bcrypttest.c` (the DLL itself, run on the emulator with `tests/emulated_windows.sh tests/windows/bcrypttest.c`).
 
+## cabinet.dll
+
+`src/Windows/cabinet/cabinet.c` implements the File Decompression Interface: `FDICreate`, `FDIIsCabinet`, `FDICopy`, `FDIDestroy` (cdecl on x86-64 and i386), which setup programs expand
+their cabinets with - Chrome's `mini_installer` loads `%WINDIR%\system32\cabinet.dll` by path and expands its `setup.ex_` with `FDICopy`. The DLL has no decompressor: `FDICopy` reads the
+whole cabinet into memory through its caller's file functions and the kernel decodes it with the cabinet reader (`src/Media/Cabinet.hpp`: stored, MSZIP, LZX), through one service,
+**`NtTcosCabinet`** (service 511, `src/Process/WindowsCabinet.hpp`, the work in `src/Media/CabinetService.cpp`). It takes a pointer to 8 numbers: 1 describes the cabinet (one record of
+280 bytes a file: size, name, date, time, attributes, folder), 2 decodes one file into the program's buffer. Nothing is kept between calls, so each file decodes its folder from the start.
+The notifications are FDI's: `fdintCABINET_INFO`, then per file `fdintCOPY_FILE` (0 passes the file over, -1 stops) and `fdintCLOSE_FILE_INFO`; every failure is in the `ERF`.
+Not done: cabinets that are one of a set (`FDIERROR_CABINET_NOT_FOUND`; no `fdintNEXT_CABINET`/`fdintPARTIAL_FILE`), Quantum, `fdintENUMERATE`, `FDITruncateCabinet`, `Extract`, all of
+FCI (`FCICreate` fails) and the Compression API (stubs). Tests: `CabinetTest` and `SyscallTest` (the service: every fixture, short buffers, wrong indices, cabinets cut short and with bits
+flipped, bad pointers) and `tests/windows/cab32.c` (the DLL on the real kernel, as a 32-bit and a 64-bit program: `tests/wow64_qemu.sh cab32 cab64`).
+
 ## shcore.dll
 
 `src/Windows/shcore/shcore.c` implements the shell core library: DPI (`GetDpiForMonitor`, `Get/SetProcessDpiAwareness`, `GetScaleFactorForMonitor/Device`, `GetDpiForShellUIComponent`)

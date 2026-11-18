@@ -30,6 +30,7 @@
 #include <string>
 #include <vector>
 #include "Media/Cabinet.hpp"
+#include "Media/CabinetService.hpp"
 #include "Media/Lzx.hpp"
 
 struct TestAllocator final : allocators::IAllocator {
@@ -425,6 +426,102 @@ static void test_real_cabinets(const char* list) {
   if (system(remove.c_str()) != 0) printf("  could not remove %s\n", base.c_str());
 }
 
+// What cabinet.dll asks of the kernel (NtTcosCabinet's two operations, src/Media/CabinetService.hpp): the records of the files and each file by its number,
+// against the manifest; then buffers that are too small, numbers past the end, and cabinets cut short or with a bit flipped.
+static uint64_t record_number(const Bytes& records, size_t record, size_t at, size_t bytes) {
+  uint64_t value = 0;
+  for (size_t i = 0; i < bytes; ++i) value |= uint64_t{records[record * media::kCabinetRecordSize + at + i]} << (8 * i);
+  return value;
+}
+
+static void test_service(Fixture& fixture) {
+  using media::CabinetServiceStatus;
+  TestAllocator allocator;
+  {
+    const ConstByteView cabinet = view_of(fixture.cabinet);
+    const uint64_t count = fixture.expected.size();
+    ByteBuffer records(allocator);
+    uint64_t files = 99;
+    CHECK(media::describe_cabinet(allocator, cabinet, count * media::kCabinetRecordSize, &records, &files) == CabinetServiceStatus::Ok);
+    CHECK(files == count && records.size() == count * media::kCabinetRecordSize);
+    if (files != count || records.size() != count * media::kCabinetRecordSize) return;
+    const Bytes raw(records.view().begin(), records.view().end());
+    for (size_t i = 0; i < count; ++i) {
+      const Expected& e = fixture.expected[i];
+      CHECK(record_number(raw, i, 0, 8) == e.size);
+      CHECK(record_number(raw, i, 8, 4) == e.name.size());
+      CHECK(record_number(raw, i, 16, 2) == e.attributes);
+      CHECK(record_number(raw, i, 18, 2) == e.folder);
+      CHECK(record_number(raw, i, 20, 4) == ((e.attributes & media::CabinetEntry::kNameIsUtf8) ? media::kCabinetRecordUtf8 : 0u));
+      CHECK(e.name.size() <= media::kCabinetRecordName && memcmp(raw.data() + i * media::kCabinetRecordSize + 24, e.name.data(), e.name.size()) == 0);
+      for (size_t at = 24 + e.name.size(); at < media::kCabinetRecordSize; ++at) CHECK(raw[i * media::kCabinetRecordSize + at] == 0);
+    }
+    // Room for one record too few, and for none: the count comes back and nothing is appended.
+    ByteBuffer few(allocator);
+    files = 99;
+    CHECK(media::describe_cabinet(allocator, cabinet, count * media::kCabinetRecordSize - 1, &few, &files) == CabinetServiceStatus::BufferTooSmall);
+    CHECK(files == count && few.size() == 0);
+    CHECK(media::describe_cabinet(allocator, cabinet, 0, &few, &files) == CabinetServiceStatus::BufferTooSmall && files == count && few.size() == 0);
+
+    for (size_t i = 0; i < count; ++i) {
+      const Expected& e = fixture.expected[i];
+      ByteBuffer out(allocator);
+      uint64_t size = 99;
+      CHECK(out.put8(0x5A));      // (the file is appended to what the buffer holds)
+      CHECK(media::extract_cabinet_file(allocator, cabinet, i, e.size, &out, &size) == CabinetServiceStatus::Ok);
+      CHECK(size == e.size && out.size() == e.size + 1 && out.view()[0] == 0x5A);
+      CHECK(media::crc32(out.view().subview(1)) == e.crc);
+      if (e.size != 0) {
+        ByteBuffer small(allocator);
+        size = 99;
+        CHECK(media::extract_cabinet_file(allocator, cabinet, i, e.size - 1, &small, &size) == CabinetServiceStatus::BufferTooSmall);
+        CHECK(size == e.size && small.size() == 0);
+      }
+    }
+    ByteBuffer none(allocator);
+    uint64_t size = 99;
+    CHECK(media::extract_cabinet_file(allocator, cabinet, count, ~uint64_t{0}, &none, &size) == CabinetServiceStatus::InvalidParameter && size == 0);
+    CHECK(media::extract_cabinet_file(allocator, cabinet, ~uint64_t{0}, ~uint64_t{0}, &none, &size) == CabinetServiceStatus::InvalidParameter);
+    CHECK(media::extract_cabinet_file(allocator, cabinet, uint64_t{1} << 32, ~uint64_t{0}, &none, &size) == CabinetServiceStatus::InvalidParameter);
+    CHECK(none.size() == 0);
+
+    // Cut short: never a crash, never more than was asked for; what does come out whole is the right file.
+    for (int round = 0; round < 60; ++round) {
+      const uint64_t length = round < 40 ? uint64_t(round) : next_random() % fixture.cabinet.size();
+      const ConstByteView part = cabinet.first(length);
+      ByteBuffer r(allocator);
+      const CabinetServiceStatus described = media::describe_cabinet(allocator, part, ~uint64_t{0}, &r, &files);
+      CHECK(described == CabinetServiceStatus::Ok || (described == CabinetServiceStatus::BadData && r.size() == 0));
+      if (length < 36) CHECK(described == CabinetServiceStatus::BadData);
+      const size_t index = size_t(next_random() % count);
+      ByteBuffer out(allocator);
+      const CabinetServiceStatus extracted = media::extract_cabinet_file(allocator, part, index, ~uint64_t{0}, &out, &size);
+      CHECK(extracted == CabinetServiceStatus::Ok || (extracted == CabinetServiceStatus::BadData && out.size() == 0));
+      if (extracted == CabinetServiceStatus::Ok) CHECK(out.size() == fixture.expected[index].size && media::crc32(out.view()) == fixture.expected[index].crc);
+    }
+    // A bit flipped: the same, except that a flip may change what the cabinet says is in it (a size, a name), so only the bounds are checked.
+    for (int round = 0; round < 120; ++round) {
+      Bytes damaged = fixture.cabinet;
+      const uint64_t at = round < 60 ? next_random() % 200 % damaged.size() : next_random() % damaged.size();      // (half of them in the header and the directory)
+      damaged[at] ^= uint8_t(1u << (next_random() % 8));
+      ByteBuffer r(allocator);
+      const CabinetServiceStatus described = media::describe_cabinet(allocator, view_of(damaged), ~uint64_t{0}, &r, &files);
+      CHECK(described == CabinetServiceStatus::Ok || described == CabinetServiceStatus::BadData);
+      CHECK(r.size() == (described == CabinetServiceStatus::Ok ? files * media::kCabinetRecordSize : 0));
+      ByteBuffer out(allocator);
+      const uint64_t capacity = 100000;
+      const CabinetServiceStatus extracted = media::extract_cabinet_file(allocator, view_of(damaged), next_random() % (count + 1), capacity, &out, &size);
+      CHECK(extracted == CabinetServiceStatus::Ok || extracted == CabinetServiceStatus::BadData || extracted == CabinetServiceStatus::BufferTooSmall ||
+            extracted == CabinetServiceStatus::InvalidParameter);
+      CHECK(out.size() == (extracted == CabinetServiceStatus::Ok ? size : 0) && out.size() <= capacity);
+    }
+    // More than the service takes.
+    CHECK(media::describe_cabinet(allocator, ConstByteView(fixture.cabinet.data(), media::kCabinetServiceMaxCabinet + 1), ~uint64_t{0}, &few, &files) ==
+          CabinetServiceStatus::InvalidParameter);
+  }
+  CHECK(allocator.live == 0);
+}
+
 int main() {
   std::vector<Fixture> fixtures;
   if (!load_manifest(&fixtures)) {
@@ -438,6 +535,7 @@ int main() {
     if (g_failed) break;      // (the tests after this one compare with what it read)
     test_truncation(fixture);
     test_bit_flips(fixture);
+    test_service(fixture);
   }
   test_lzx_decoder();
   if (const char* list = getenv("CABINET_TEST_FILES")) test_real_cabinets(list);

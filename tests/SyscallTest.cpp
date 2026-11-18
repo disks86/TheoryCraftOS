@@ -20,6 +20,8 @@
 #include <string>
 #include <vector>
 #include "FileSystem/Ram/RamFileSystem.hpp"
+#include "Media/CabinetService.hpp"
+#include "Media/Zip.hpp"
 #include "Process/Process.hpp"
 #include "Process/HostArch.hpp"
 #include "Process/Syscall.hpp"
@@ -416,7 +418,7 @@ static void test_windows() {
   CHECK(st(p.syscall(nt(WindowsSyscallNumber::NtDelayExecution, 0, 0))) == kNtAccessViolation);
 
   CHECK(st(p.syscall(nt(static_cast<WindowsSyscallNumber>(kWindowsServiceCount)))) == kNtNoService);      // the first number past the list
-  CHECK(st(p.syscall(nt(static_cast<WindowsSyscallNumber>(kWindowsServiceCount - 8)))) == kNtNotImpl);      // a service without code here (NtTcosToken, whose code is in the kernel)
+  CHECK(st(p.syscall(nt(static_cast<WindowsSyscallNumber>(static_cast<uint32_t>(WindowsSyscallNumber::NtTcosToken))))) == kNtNotImpl);      // a service without code here (NtTcosToken, whose code is in the kernel)
   CHECK(st(p.syscall(nt(static_cast<WindowsSyscallNumber>(kWin32kServiceBase)))) == kNtNotImpl);          // win32k's first and last service
   CHECK(st(p.syscall(nt(static_cast<WindowsSyscallNumber>(kWin32kServiceEnd - 1)))) == kNtNotImpl);
   CHECK(st(p.syscall(nt(static_cast<WindowsSyscallNumber>(kWin32kServiceBase - 1)))) == kNtNoService);     // the gap between the two tables
@@ -526,6 +528,87 @@ static void test_crypto() {
   CHECK(run({99}) == kNtInvalidParameter);
   CHECK(st(p.syscall(nt(WindowsSyscallNumber::NtTcosCrypto, 0xDEAD0000))) == kNtAccessViolation);
   CHECK(run({7, 0, 2, D, 0, D, 0, D, D, 0}) == kNtInvalidParameter);            // empty RSA key
+  CHECK(A.live >= 0);
+}
+
+// NtTcosCabinet (cabinet.dll's FDI): a cabinet of the cabinet reader's fixtures in the program's memory is described and its files taken out, then bad
+// pointers, lengths, indices and a damaged cabinet. (tests/CabinetTest.cpp has the reader and the service's two functions against every fixture.)
+static void test_cabinet() {
+  FakeMemory mem; FakeHost host;
+  Process p(12, binding_for(SyscallAbi::Windows, UserArch::X86_64), mem, host);
+  filesystem::RamFileSystem fs(A);
+  p.files().attach(A, fs, StringView("/Windows"));
+  auto run = [&](std::initializer_list<uint64_t> words) {
+    uint64_t at = kBase;
+    for (uint64_t w : words) { mem.put64(at, w); at += 8; }
+    for (; at < kBase + 8 * 8; at += 8) mem.put64(at, 0);
+    return st(p.syscall(nt(WindowsSyscallNumber::NtTcosCabinet, kBase)));
+  };
+  CHECK(run({1, kBase + 0x100, 64, kBase + 0x200, 280}) == 0xC00000BBu);      // nothing serves it yet: STATUS_NOT_SUPPORTED
+  media::install_windows_cabinet();
+
+  // lzx21.cab: one LZX folder with one.txt (9000 bytes), two.bin (768) and three.bin (400); see tests/data/cabinet/manifest.txt.
+  Bytes cabinet;
+  if (FILE* f = fopen("tests/data/cabinet/lzx21.cab", "rb")) {
+    uint8_t chunk[4096];
+    size_t n;
+    while ((n = fread(chunk, 1, sizeof chunk, f)) > 0) cabinet.insert(cabinet.end(), chunk, chunk + n);
+    fclose(f);
+  }
+  CHECK(cabinet.size() > 36 && cabinet.size() < 0x2000);
+  if (cabinet.size() <= 36 || cabinet.size() >= 0x2000) return;
+  mem.bytes.assign(0x8000, 0);
+  const uint64_t C = kBase + 0x1000, R = kBase + 0x3000, O = kBase + 0x4000, N = cabinet.size(), kEnd = kBase + 0x8000;
+  for (size_t i = 0; i < cabinet.size(); ++i) mem.bytes[C - kBase + i] = cabinet[i];
+  const uint32_t kTooSmall = 0xC0000023u, kCorrupt = 0xC0000102u;
+
+  CHECK(run({1, C, N, R, 3 * 280}) == 0);
+  CHECK(mem.get64(kBase + 5 * 8) == 3 && mem.get64(kBase + 6 * 8) == 280);
+  CHECK(mem.get64(R) == 9000 && mem.get64(R + 280) == 768 && mem.get64(R + 560) == 400);
+  CHECK((mem.get64(R + 8) & 0xFFFFFFFFu) == 7 && hex_of(mem, R + 24, 8) == "6f6e652e74787400");      // "one.txt"
+  CHECK((mem.get64(R + 16) & 0xFFFF) == 0x20 && hex_of(mem, R + 560 + 24, 10) == "74687265652e62696e00");      // archive; "three.bin"
+  mem.bytes[R - kBase] = 0xEE;
+  CHECK(run({1, C, N, R, 3 * 280 - 1}) == kTooSmall && mem.get64(kBase + 5 * 8) == 3 && mem.bytes[R - kBase] == 0xEE);      // the count, and nothing written
+  CHECK(run({1, C, N, 0, 0}) == kTooSmall && mem.get64(kBase + 5 * 8) == 3);      // how a caller asks how many there are
+  CHECK(run({1, C, N, 0xDEAD0000, 3 * 280}) == kNtAccessViolation);
+  CHECK(run({1, C, N, kEnd - 280, 3 * 280}) == kNtAccessViolation);      // the records would run past the program's memory
+
+  const uint64_t sizes[3] = {9000, 768, 400};
+  const uint32_t crcs[3] = {0x6f97c30eu, 0xb0c0df2au, 0x65451b8cu};
+  for (uint64_t i = 0; i < 3; ++i) {
+    for (uint64_t at = O; at < kEnd; ++at) mem.bytes[at - kBase] = 0xEE;
+    CHECK(run({2, C, N, i, O, 0x4000}) == 0 && mem.get64(kBase + 6 * 8) == sizes[i]);
+    CHECK(media::crc32(ConstByteView(mem.bytes.data() + (O - kBase), sizes[i])) == crcs[i]);
+    CHECK(mem.bytes[O - kBase + sizes[i]] == 0xEE);      // nothing past the file
+    CHECK(run({2, C, N, i, O, sizes[i]}) == 0);          // room for exactly the file
+    mem.bytes[O - kBase] = 0xEE;
+    CHECK(run({2, C, N, i, O, sizes[i] - 1}) == kTooSmall && mem.get64(kBase + 6 * 8) == sizes[i] && mem.bytes[O - kBase] == 0xEE);
+  }
+  CHECK(run({2, C, N, 3, O, 0x4000}) == kNtInvalidParameter);                 // no such file
+  CHECK(run({2, C, N, ~uint64_t{0}, O, 0x4000}) == kNtInvalidParameter);
+  CHECK(run({2, C, N, 0, 0xDEAD0000, 0x4000}) == kNtAccessViolation);         // nowhere to put it
+  CHECK(run({2, C, N, 0, kEnd - 100, ~uint64_t{0}}) == kNtAccessViolation);   // a capacity that is a lie
+  // the cabinet itself: bad pointers and lengths
+  CHECK(run({1, 0xDEAD0000, N, R, 3 * 280}) == kNtAccessViolation);
+  CHECK(run({1, C, 0, R, 3 * 280}) == kNtInvalidParameter);
+  CHECK(run({1, C, ~uint64_t{0}, R, 3 * 280}) == kNtInvalidParameter);          // far too long
+  CHECK(run({1, C, (uint64_t{512} << 20) + 1, R, 3 * 280}) == kNtInvalidParameter);
+  CHECK(run({1, kEnd - 16, N, R, 3 * 280}) == kNtAccessViolation);              // runs past the program's memory
+  CHECK(run({1, C, 35, R, 3 * 280}) == kCorrupt);                               // not even a header
+  CHECK(run({1, C, N / 2, R, 3 * 280}) == 0);                                   // cut short: the directory is still there ...
+  CHECK(run({2, C, N / 2, 2, O, 0x4000}) == kCorrupt);                          // ... the last file's data is not
+  CHECK(run({2, C, N - 1, 2, O, 0x4000}) == kCorrupt);
+  mem.bytes[C - kBase] ^= 1;                                                    // not "MSCF"
+  CHECK(run({1, C, N, R, 3 * 280}) == kCorrupt && run({2, C, N, 0, O, 0x4000}) == kCorrupt);
+  mem.bytes[C - kBase] ^= 1;
+  mem.bytes[C - kBase + 118 + 5] ^= 0x80;                                       // the data block's header: more compressed bytes than a block can have
+  CHECK(run({1, C, N, R, 3 * 280}) == 0 && run({2, C, N, 2, O, 0x4000}) == kCorrupt);
+  mem.bytes[C - kBase + 118 + 5] ^= 0x80;
+  CHECK(run({2, C, N, 2, O, 0x4000}) == 0);
+  // operations that do not exist, arguments that are not there
+  CHECK(run({0, C, N, R, 3 * 280}) == kNtInvalidParameter && run({3, C, N, R, 3 * 280}) == kNtInvalidParameter);
+  CHECK(st(p.syscall(nt(WindowsSyscallNumber::NtTcosCabinet, 0xDEAD0000))) == kNtAccessViolation);
+  CHECK(st(p.syscall(nt(WindowsSyscallNumber::NtTcosCabinet, kEnd - 56))) == kNtAccessViolation);      // seven of the eight numbers
   CHECK(A.live >= 0);
 }
 
@@ -686,6 +769,7 @@ int main() {
   test_linux_generic_table();
   test_windows();
   test_crypto();
+  test_cabinet();
   test_isolation();
   test_service_numbers_agree();
   CHECK(A.live == 0);

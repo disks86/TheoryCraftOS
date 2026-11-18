@@ -1343,6 +1343,13 @@ EXPORT LONG NTAPI NtTcosAudio(ULONG64 * a0) {
   return status;
 }
 EXPORT LONG NTAPI ZwTcosAudio(ULONG64 * a0) { return NtTcosAudio(a0); }
+EXPORT NTSTATUS NTAPI NtTcosCabinet(ULONG64 * a0) {
+  ULONG64 v[4] = {0};
+  v[0] = (ULONG64)(ULONG_PTR)a0;
+  const NTSTATUS status = (NTSTATUS)wow_service(NT_SERVICE_NtTcosCabinet, v);
+  return status;
+}
+EXPORT NTSTATUS NTAPI ZwTcosCabinet(ULONG64 * a0) { return NtTcosCabinet(a0); }
 EXPORT NTSTATUS NTAPI NtTcosCommonDialog(void * a0) {
   ULONG64 v[4] = {0};
   v[0] = (ULONG64)(ULONG_PTR)a0;

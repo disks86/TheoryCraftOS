@@ -168,7 +168,7 @@ uint32_t UserProgram::load_module(ConstByteView file, StringView canonical_name,
     // (said on the log: a program that gives up after this says nothing about why)
     case LoadStatus::Unsupported: process_log("library not loaded (not one for this kind of program): "); process_log(canonical_name); process_log(detail.view()); return kNotSupported;
     case LoadStatus::Malformed: process_log("library not loaded (not a well-formed image): "); process_log(canonical_name); return kBadImage;
-    default: return kDllNotFound;
+    default: process_log("library not loaded (a library it needs is missing): "); process_log(canonical_name); process_log(detail.view()); return kDllNotFound;
   }
   const uint64_t fresh = modules_->init_count() - init_first;
   if (fresh > capacity) {

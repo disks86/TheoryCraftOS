@@ -141,7 +141,7 @@ for t in "${WANTED[@]}"; do
     CetTest) build_and_run CetTest tests/CetTest.cpp src/Emulation/*.cpp src/Process/*.cpp src/Crypto/*.cpp src/Executable/*.cpp src/FileSystem/FileSystemTypes.cpp src/FileSystem/Ram/*.cpp src/Kernel/Sync.cpp tests/KernelStubs.cpp ;;
     AvxTest) build_and_run AvxTest tests/AvxTest.cpp src/Emulation/*.cpp src/Process/*.cpp src/Crypto/*.cpp src/Executable/*.cpp src/FileSystem/FileSystemTypes.cpp src/FileSystem/Ram/*.cpp src/Kernel/Sync.cpp tests/KernelStubs.cpp ;;
     X87Test) build_and_run X87Test tests/X87Test.cpp src/Emulation/*.cpp src/Process/*.cpp src/Crypto/*.cpp src/Executable/*.cpp src/FileSystem/FileSystemTypes.cpp src/FileSystem/Ram/*.cpp src/Kernel/Sync.cpp tests/KernelStubs.cpp ;;
-    SyscallTest) build_and_run SyscallTest tests/SyscallTest.cpp src/Process/*.cpp src/Crypto/*.cpp src/Executable/*.cpp src/FileSystem/FileSystemTypes.cpp src/FileSystem/Ram/*.cpp src/Kernel/Sync.cpp tests/KernelStubs.cpp ;;
+    SyscallTest) build_and_run SyscallTest tests/SyscallTest.cpp src/Media/Cabinet.cpp src/Media/CabinetService.cpp src/Media/Lzx.cpp src/Media/Zip.cpp src/Media/Zlib.cpp src/Process/*.cpp src/Crypto/*.cpp src/Executable/*.cpp src/FileSystem/FileSystemTypes.cpp src/FileSystem/Ram/*.cpp src/Kernel/Sync.cpp tests/KernelStubs.cpp ;;
     WindowsExceptionTest) build_and_run WindowsExceptionTest tests/WindowsExceptionTest.cpp src/Process/*.cpp src/Crypto/*.cpp src/Executable/*.cpp src/FileSystem/FileSystemTypes.cpp src/FileSystem/Ram/*.cpp src/Kernel/Sync.cpp tests/KernelStubs.cpp ;;
     WindowsThreadTest) build_and_run WindowsThreadTest tests/WindowsThreadTest.cpp src/Process/*.cpp src/Crypto/*.cpp src/Executable/*.cpp src/FileSystem/FileSystemTypes.cpp src/FileSystem/Ram/*.cpp src/Kernel/Sync.cpp tests/KernelStubs.cpp ;;
     WindowsSocketTest) build_and_run WindowsSocketTest tests/WindowsSocketTest.cpp src/Process/*.cpp src/Crypto/*.cpp src/Executable/*.cpp src/FileSystem/FileSystemTypes.cpp src/FileSystem/Ram/*.cpp src/Kernel/Sync.cpp tests/KernelStubs.cpp \
@@ -496,7 +496,7 @@ for t in "${WANTED[@]}"; do
     XzLz4Test) build_and_run XzLz4Test tests/XzLz4Test.cpp src/Media/Xz.cpp src/Media/Lz4.cpp src/Media/Lzo.cpp src/Crypto/Crypto.cpp tests/KernelStubs.cpp ;;
     MsiTest) build_and_run MsiTest tests/MsiTest.cpp src/Msi/MsiDatabase.cpp src/Msi/MsiExpression.cpp src/Msi/MsiInstaller.cpp src/Media/CompoundFile.cpp src/Media/Cabinet.cpp \
                src/Media/Lzx.cpp src/Media/Zip.cpp src/Media/Zlib.cpp tests/KernelStubs.cpp src/Kernel/Sync.cpp src/FileSystem/FileSystemTypes.cpp src/FileSystem/Ram/*.cpp ;;
-    CabinetTest) build_and_run CabinetTest tests/CabinetTest.cpp src/Media/Cabinet.cpp src/Media/Lzx.cpp src/Media/Zip.cpp src/Media/Zlib.cpp tests/KernelStubs.cpp ;;
+    CabinetTest) build_and_run CabinetTest tests/CabinetTest.cpp src/Media/Cabinet.cpp src/Media/CabinetService.cpp src/Process/WindowsCabinet.cpp src/Media/Lzx.cpp src/Media/Zip.cpp src/Media/Zlib.cpp tests/KernelStubs.cpp ;;
     DwarfsTest)
       # The test re-compresses images with the reference liblzma / liblz4 and checks XXH3 against libxxhash, each when found here.
       dwarfs_libs=""

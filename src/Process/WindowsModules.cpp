@@ -83,7 +83,14 @@ uint32_t nt_load_module(Process& p, const SyscallRequest& r) {
     }
   }
   ByteBuffer file(p.files().allocator());
-  if (!read_program_file(p, from, &file, &status)) return status == 0xC0000034u || status == 0xC000003Au ? kDllNotFound : status;
+  if (!read_program_file(p, from, &file, &status)) {
+#ifdef TCOS_TRACE_SERVICE_FAILURES
+    // (with the trace of failing services: which library it was - the service's arguments are pointers, and a program that gives up after this says nothing)
+    process_log("library not found: ");
+    process_log(from);
+#endif
+    return status == 0xC0000034u || status == 0xC000003Au ? kDllNotFound : status;
+  }
   {
     exe::PeFile checked(p.files().allocator());
     if (const uint32_t header = image_section_status(file.view(), checked)) return header;

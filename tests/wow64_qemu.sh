@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 32-bit Windows programs on the real kernel under QEMU (docs/Wow64.md). Twelve programs, each started by the kernel's autorun in a boot of its own:
+# 32-bit Windows programs on the real kernel under QEMU (docs/Wow64.md). Fourteen programs, each started by the kernel's autorun in a boot of its own:
 #   hello32  tests/windows/hello32.c: PE32 for i386 with no libraries. It runs in the CPU's compatibility mode and calls the NT services through INT 2E.
 #   crt32    tests/windows/crt32.c: built the ordinary way, with a C runtime; it runs on the 32-bit ntdll.dll, kernel32.dll and msvcrt.dll of
 #            C:\Windows\SysWOW64 (the heap, files, the environment, thread-local storage, threads, a library loaded while it runs).
@@ -19,16 +19,20 @@
 #   com64    the same source built for x86-64 (the one 64-bit program here: the code that passes calls on is different for each processor).
 #   xml32    tests/windows/xml32.c: MSXML's document object model (msxml3.dll, msxml6.dll) - every DOMDocument class, an update response walked the way
 #            Chromium's updater walks one, entities, CDATA, namespaces, white space, files, and documents that are not well formed.
+#   cab32    tests/windows/cab32.c: cabinet.dll's FDI the way Chrome's mini_installer uses it - the library loaded by its path, three of the cabinet
+#            reader's fixtures (stored, MSZIP, LZX) expanded through the program's own file functions and compared with the fixtures' manifest, files
+#            passed over, a caller that stops, what is no cabinet, cabinets cut short. The kernel decodes (NtTcosCabinet).
+#   cab64    the same source built for x86-64 (mini_installer is a 64-bit program).
 # Passes if all the checks of each pass and the autorun sees exit code 42. Uses its own build folder (build-wow64-qemu) so the normal build keeps no
 # autorun. Needs i686-w64-mingw32-gcc.
-# Usage: tests/wow64_qemu.sh [hello32] [crt32] [seh32] [gui32] [lib32] [old32] [dx32] [d3d11test] [d3d9test] [com32] [com64] [xml32]      (no arguments: all)
+# Usage: tests/wow64_qemu.sh [hello32] [crt32] [seh32] [gui32] [lib32] [old32] [dx32] [d3d11test] [d3d9test] [com32] [com64] [xml32] [cab32] [cab64]      (no arguments: all)
 set -euo pipefail
 cd "$(dirname "$0")/.."
 build=${BUILD:-build-wow64-qemu}
 work=${TMPDIR:-/tmp}/tcos-wow64-qemu
 rm -rf "$work"; mkdir -p "$work"
 programs=("$@")
-[ ${#programs[@]} -eq 0 ] && programs=(hello32 crt32 seh32 gui32 lib32 old32 dx32 d3d11test d3d9test com32 com64 xml32)
+[ ${#programs[@]} -eq 0 ] && programs=(hello32 crt32 seh32 gui32 lib32 old32 dx32 d3d11test d3d9test com32 com64 xml32 cab32 cab64)
 i686-w64-mingw32-gcc -O1 -ffreestanding -nostdlib -Isrc/Windows -Wl,--entry=_start32 -Wl,--subsystem,console -o "$work/hello32.exe" tests/windows/hello32.c
 i686-w64-mingw32-gcc -O1 -o "$work/crt32.exe" tests/windows/crt32.c
 i686-w64-mingw32-gcc -O1 -shared -o "$work/plug32.dll" tests/windows/plug32.c      # (a library crt32 loads while it runs)
@@ -58,6 +62,31 @@ if command -v x86_64-w64-mingw32-gcc >/dev/null; then
   x86_64-w64-mingw32-gcc -O1 -I "$work/64" -o "$work/com64.exe" tests/windows/com32.c "$work/64/com32_i.c" "$work/64/com32res.o" -lole32 -loleaut32 -ladvapi32 -lshell32 -luuid
 fi
 i686-w64-mingw32-gcc -O1 -o "$work/xml32.exe" tests/windows/xml32.c -lole32 -loleaut32
+# (the cabinets cab32 expands, as C arrays, with what tests/data/cabinet/manifest.txt says their files are)
+python3 - "$work/cabfixtures.h" <<'PY'
+import struct, sys
+out = open(sys.argv[1], "w")
+manifest = [line.split() for line in open("tests/data/cabinet/manifest.txt") if line.strip()]
+out.write("typedef struct { const char *name; unsigned size, crc; unsigned short attributes, folder; } CabFile;\n")
+out.write("typedef struct { const char *name; const unsigned char *data; unsigned size; const CabFile *files; int count; int folders, set_id, reserve; } CabFixture;\n")
+names = ("mszip", "stored", "lzx21")
+for n in names:
+    data = open("tests/data/cabinet/%s.cab" % n, "rb").read()
+    out.write("static const unsigned char cab_%s_data[] = {%s};\n" % (n, ",".join(str(b) for b in data)))
+    out.write("static const CabFile cab_%s_files[] = {\n" % n)
+    for cabinet, folder, size, crc, attributes, name in manifest:
+        if cabinet == n + ".cab":
+            out.write('  {"%s", %s, 0x%su, 0x%s, %s},\n' % ("".join("\\x%02x" % b for b in bytes.fromhex(name)), size, crc, attributes, folder))
+    out.write("};\n")
+out.write("static const CabFixture cab_fixtures[] = {\n")
+for n in names:
+    data = open("tests/data/cabinet/%s.cab" % n, "rb").read()
+    folders, files, flags, set_id = struct.unpack_from("<HHHH", data, 26)
+    out.write('  {"cabtest_%s.cab", cab_%s_data, sizeof cab_%s_data, cab_%s_files, %d, %d, %d, %d},\n' % (n, n, n, n, files, folders, set_id, 1 if flags & 4 else 0))
+out.write("};\n#define CAB_FIXTURES %d\n" % len(names))
+PY
+i686-w64-mingw32-gcc -O1 -I "$work" -o "$work/cab32.exe" tests/windows/cab32.c
+if command -v x86_64-w64-mingw32-gcc >/dev/null; then x86_64-w64-mingw32-gcc -O1 -I "$work" -o "$work/cab64.exe" tests/windows/cab32.c; fi
 status=0
 for program in "${programs[@]}"; do
   cmake -S . -B "$build" -G Ninja "-DTCOS_AUTORUN=/Windows/$program.exe" -DTCOS_AUTORUN_ARGUMENTS= -DTCOS_AUTORUN_ELEVATED=OFF -DTCOS_TRACE_SERVICE_FAILURES=OFF >/dev/null      # (no arguments, not elevated: whatever an earlier build of this folder had)

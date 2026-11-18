@@ -114,6 +114,7 @@ NT_SERVICE(NtTcosCrypto);
 NT_SERVICE(NtTcosFont);
 NT_SERVICE(NtTcosOpenGl);
 NT_SERVICE(NtTcosAudio);
+NT_SERVICE(NtTcosCabinet);
 NT_SERVICE(NtCreateSocket);
 NT_SERVICE(NtBindSocket);
 NT_SERVICE(NtConnectSocket);

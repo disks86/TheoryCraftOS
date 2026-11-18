@@ -127,6 +127,7 @@
 #include "Kernel/Apic.hpp"
 #include "Kernel/Interrupts.hpp"
 #endif
+#include "Media/CabinetService.hpp"
 #include "Media/MediaCodecs.hpp"
 #include "Hardware/Guest/SystemGuestServices.hpp"
 #include "Hardware/HyperV/SystemHyperV.hpp"
@@ -877,6 +878,7 @@ static efi::Status kernel_main(efi::Handle image, efi::SystemTable* st) {
   static opengl::GlService system_gl(shared_allocator);
   opengl::install_windows_gl(system_gl);
   opengl::install_linux_gl(system_gl);
+  media::install_windows_cabinet();      // (cabinet.dll's FDI reaches the cabinet reader with NtTcosCabinet)
   desktop::install_linux_builtin_shell();      // (the Linux tree's /bin/sh: launcher scripts run by the OS's own shell)
   system_gl.set_report([](uint64_t pid, const webgl::GlContext::HardwareStats& stats) {
     Entry e(Level::Info, "OpenGL");
