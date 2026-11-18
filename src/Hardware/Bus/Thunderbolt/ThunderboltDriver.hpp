@@ -48,7 +48,9 @@ class ThunderboltDriver {
   ThunderboltDriver(const ThunderboltDriver&) = delete;
   ThunderboltDriver& operator=(const ThunderboltDriver&) = delete;
 
-  static bool supports(const PciDeviceInfo& device) { return tb_find_nhi(device.vendor_id, device.device_id) != nullptr; }
+  static bool supports(const PciDeviceInfo& device) {
+    return tb_find_host(device.vendor_id, device.device_id, device.class_code, device.subclass, device.prog_if) != nullptr;
+  }
 
   Outcome start(IPciBus& pci, const PciDeviceInfo& device, IRegisterMapper& mapper);
   // The part after the registers are reachable (tests bring their own).

@@ -189,10 +189,12 @@ GET_CURRENT_CAM, and it does not use MESSAGE OUT. A UCSI 2.x PPM whose mailbox i
 - hot-plug through `UsbSerialPorts` and `SystemSerialPorts`;
 - every LED matrix command on the wire.
 
+## USB4 / Thunderbolt
+
+The Intel boards' Thunderbolt 4 and the AMD boards' USB4 controllers both run on the system's software connection manager (`Usb4Domain`; AMD's are matched by the USB4 host interface class). Docks get USB 3 and display tunnels at once, and PCIe after the user allows the device. See the Thunderbolt part of [DellXps9575.md](DellXps9575.md). It is opt-in (`-DTCOS_THUNDERBOLT=ON`) and not validated on hardware.
+
 ## Not done
 
 - **Fingerprint reader** (Goodix 27C6:609C): an encrypted, vendor-specific protocol, not attempted.
 - **Laptop 16 graphics module** (Radeon RX 7700S, RDNA3): the AMD GPU driver covers GCN and Vega only.
-- **Intel Thunderbolt 4 / USB4 on the Intel boards:** needs a software connection manager; the Thunderbolt driver knows Alpine Ridge's
-  firmware connection manager.
 - **No user interface yet** for the charge limit or the LED matrix.

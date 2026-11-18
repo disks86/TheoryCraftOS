@@ -84,6 +84,8 @@ inline constexpr const char* kWindowsInstallerCache = "/Windows/Windows/Installe
 
 // The Thunderbolt driver's one-time keys, one file of 32 bytes per device named by its UUID in hex (the "Thunderbolt" application's folder in the AppStore).
 inline constexpr const char* kThunderboltKeys = "/AppStore/Thunderbolt/Keys";
+// The USB4 devices the user allowed PCIe to (always allow): one line per device, its 64-bit router unique id in hex (the same application's folder).
+inline constexpr const char* kThunderboltApproved = "/AppStore/Thunderbolt/Approved";
 
 // The Bluetooth bonds: the keys of the devices this machine has paired with, one file (the "Bluetooth" application's folder in the AppStore).
 inline constexpr const char* kBluetoothBonds = "/AppStore/Bluetooth/bonds.bin";

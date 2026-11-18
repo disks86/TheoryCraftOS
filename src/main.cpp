@@ -171,6 +171,8 @@
 #include "Hardware/Bus/Pci/PciMsix.hpp"
 #include "Hardware/Bus/Thunderbolt/ThunderboltDriver.hpp"
 #include "Hardware/Bus/Thunderbolt/ThunderboltNet.hpp"
+#include "Hardware/Bus/Thunderbolt/Usb4Policy.hpp"
+#include "Desktop/ThunderboltPrompts.hpp"
 #include "Kernel/Apic.hpp"
 #include "Kernel/Interrupts.hpp"
 #endif
@@ -290,6 +292,21 @@ static kernel::Frame* on_intel_npu_interrupt(kernel::Frame* frame, void*) {
 #endif
 
 #ifdef TCOS_THUNDERBOLT
+// The desktop's PCIe questions answered through the USB4 connection policy.
+struct Usb4Approvals final : desktop::IThunderboltApprovals {
+  hardware::Usb4Policy* policy = nullptr;
+  bool next_request(Request* out) override {
+    hardware::Usb4DeviceInfo info;
+    if (!policy || !policy->next_request(&info)) return false;
+    out->id = info.uid;
+    __builtin_memcpy(out->vendor, info.vendor, sizeof out->vendor);
+    __builtin_memcpy(out->name, info.name, sizeof out->name);
+    return true;
+  }
+  void approve(uint64_t id, bool always) override { if (policy) policy->approve(id, always); }
+  void deny(uint64_t id) override { if (policy) policy->deny(id); }
+};
+
 // Moves the Thunderbolt interrupt (MSI-X or MSI, whichever is on) to another core, when the scheduler finds its work runs there (kernel::set_io_device_retarget).
 struct ThunderboltInterruptRoute {
   UniquePointer<hardware::PciMsix>* msix = nullptr;
@@ -1951,6 +1968,12 @@ static efi::Status kernel_main(efi::Handle image, efi::SystemTable* st) {
     UniquePointer<hardware::FileTbKeyStore> thunderbolt_keys;       // the keys of devices approved at the secure level
     UniquePointer<hardware::ThunderboltNet> thunderbolt_net;        // networking to another host on the cable (after the driver: it goes first)
     hardware::ThunderboltNetLink* thunderbolt_link = nullptr;       // its entry in the list of network interfaces, which outlives them both
+    // USB4 hosts (the software connection manager): USB 3 and DisplayPort tunnels for every device, PCIe only for those the user allows
+    // (asked on the desktop, "always" kept in /AppStore/Thunderbolt/Approved).
+    UniquePointer<hardware::FileUsb4ApprovalStore> usb4_approved;
+    UniquePointer<hardware::Usb4Policy> usb4_policy;
+    Usb4Approvals usb4_approvals;
+    UniquePointer<desktop::ThunderboltPrompts> thunderbolt_prompts;
     uint64_t thunderbolt_devices = 0;
     hardware::PciAddress thunderbolt_address = {0, 0, 0};
     UniquePointer<hardware::PciMsix> thunderbolt_msix;              // its MSI-X, when the machine delivers it
@@ -2024,6 +2047,10 @@ static efi::Status kernel_main(efi::Handle image, efi::SystemTable* st) {
             e.text(", software connection manager: ").dec(thunderbolt->usb4()->present_count()).text(" router(s)");
             if (thunderbolt->usb4()->preboot_tunnels_closed()) e.text(", ").dec(thunderbolt->usb4()->preboot_tunnels_closed()).text(" tunnel(s) of the BIOS closed");
             e.text("; no PCIe tunnel is made until one is approved");
+            usb4_approved = UniquePointer<hardware::FileUsb4ApprovalStore>::make(shared_allocator, explorer_files.file_system(), shared_allocator);
+            usb4_policy = UniquePointer<hardware::Usb4Policy>::make(shared_allocator, *thunderbolt->usb4(), usb4_approved.get());
+            usb4_approvals.policy = usb4_policy.get();
+            if (usb4_policy) thunderbolt_prompts = UniquePointer<desktop::ThunderboltPrompts>::make(shared_allocator, shared_allocator, desktop.windows(), usb4_approvals);
           }
         } else {
           Entry(Level::Warning, "Thunderbolt").text(thunderbolt->model() ? thunderbolt->model()->name : "controller").text(" not started: ").text(thunderbolt->message());
@@ -3166,6 +3193,7 @@ static efi::Status kernel_main(efi::Handle image, efi::SystemTable* st) {
           tb_idle = 0;
           thunderbolt->poll();
           if (thunderbolt->usb4()) thunderbolt->usb4()->tick(hardware::uptime_us() / 1000);       // (the bandwidth groups' timers)
+          if (usb4_policy) usb4_policy->step();                                                   // (tunnels for new devices, the user's answers, displays)
           if (thunderbolt_net) thunderbolt_net->poll();
         }
 #ifdef TCOS_THUNDERBOLT_RUNTIME_PM
@@ -3190,10 +3218,11 @@ static efi::Status kernel_main(efi::Handle image, efi::SystemTable* st) {
             thunderbolt->poll();                                     // (what woke it is in the control channel)
           }
         }
+        if (thunderbolt_prompts) thunderbolt_prompts->pump();
         const uint64_t now_devices = thunderbolt->device_count();
         if (now_devices != thunderbolt_devices) {
-          desktop.notify(StringView("Thunderbolt"), StringView(now_devices > thunderbolt_devices ? "A Thunderbolt device was connected (not authorized: no PCIe tunnel)" : "A Thunderbolt device was removed"),
-                         gui::NoticeKind::Information);
+          const char* connected = usb4_policy ? "A USB4 or Thunderbolt device was connected" : "A Thunderbolt device was connected (not authorized: no PCIe tunnel)";
+          desktop.notify(StringView("Thunderbolt"), StringView(now_devices > thunderbolt_devices ? connected : "A Thunderbolt device was removed"), gui::NoticeKind::Information);
           thunderbolt_devices = now_devices;
         }
       }

@@ -33,6 +33,7 @@
 #include "Hardware/Bus/Thunderbolt/ThunderboltNvm.hpp"
 #include "Hardware/Bus/Thunderbolt/Usb4Domain.hpp"
 #include "FakeUsb4.hpp"
+#include "Hardware/Bus/Thunderbolt/Usb4Policy.hpp"
 #include "Hardware/Bus/Thunderbolt/ThunderboltXdomain.hpp"
 #include "Hardware/Bus/Thunderbolt/ThunderboltControl.hpp"
 #include "Hardware/Bus/Pci/PciMsix.hpp"
@@ -2350,7 +2351,7 @@ static void test_msix() {
     CHECK(!msix.enabled() && !(fn.msix_control & 0xC000) && fn.msix_table[3] == 1 && fn.msix_table[4 * 2 + 3] == 1);
     msix.disable();                                                           // (again: nothing)
     // refused: more entries than the table has, none asked for, a core that does not fit, a table whose BAR is not assigned or cannot be mapped, no capability
-    CHECK(!msix.enable(address, vectors, 17, 0) && !msix.enable(address, vectors, 0, 0) && !msix.enable(address, vectors, 1, 256));
+    CHECK(!msix.enable(address, vectors, 17u, 0u) && !msix.enable(address, vectors, 0u, 0u) && !msix.enable(address, vectors, 1u, 256u));   // (unsigned: 0 alone could be the apic_ids pointer of the other overload)
     fn.msix_bar_assigned = false;
     CHECK(!msix.enable(address, vectors, 1, 0));
     fn.msix_bar_assigned = true;
@@ -4135,6 +4136,111 @@ static void test_usb4_dp_policy() {
   control.stop();
 }
 
+// --- The connection policy and the hosts of other makers --------------------------------------------------
+
+struct MemoryApprovals final : IUsb4ApprovalStore {
+  std::vector<uint64_t> ids;
+  bool contains(uint64_t uid) override { for (uint64_t i : ids) if (i == uid) return true; return false; }
+  bool add(uint64_t uid) override { if (!contains(uid)) ids.push_back(uid); return true; }
+  void remove(uint64_t uid) override { for (size_t i = 0; i < ids.size(); ++i) if (ids[i] == uid) { ids.erase(ids.begin() + static_cast<long>(i)); return; } }
+};
+
+static void test_usb4_policy() {
+  Usb4Rig rig;
+  Usb4Domain domain(rig.control, rig.nhi, rig.alloc);
+  CHECK(domain.start(nullptr));
+  MemoryApprovals store;
+  Usb4Policy policy(domain, &store);
+  // The first step: USB 3 tunnels at once (the dock, then the device behind it), no PCIe; the dock is asked about, the device behind it not yet.
+  policy.step();
+  CHECK(policy.device_count() == 2 && domain.usb3_tunnelled(1) && !domain.pcie_tunnelled(1) && !domain.pcie_tunnelled(2));
+  Usb4DeviceInfo dock, behind, request;
+  CHECK(policy.device(0, &dock) && policy.device(1, &behind));
+  CHECK(dock.depth == 1 && dock.pcie_capable && dock.usb3 && dock.state == Usb4DeviceState::Waiting && dock.parent_uid == 0 && dock.uid == domain.router(1)->uid);
+  CHECK(behind.depth == 2 && behind.parent_uid == dock.uid && behind.state == Usb4DeviceState::Waiting);
+  CHECK(policy.next_request(&request) && request.uid == dock.uid);
+  // Allowed always: the tunnel, the store; then the device behind it is asked about, and denied.
+  const uint32_t before = policy.changes();
+  policy.approve(dock.uid, true);
+  CHECK(!policy.next_request(&request) || request.uid != dock.uid);     // (an answer queued: not asked again)
+  policy.step();
+  CHECK(domain.pcie_tunnelled(1) && store.contains(dock.uid) && policy.changes() > before);
+  CHECK(policy.device(0, &dock) && dock.state == Usb4DeviceState::Allowed && dock.remembered);
+  CHECK(policy.next_request(&request) && request.uid == behind.uid);
+  policy.deny(behind.uid);
+  policy.step();
+  CHECK(!domain.pcie_tunnelled(2) && policy.device(1, &behind) && behind.state == Usb4DeviceState::Denied && !policy.next_request(&request));
+  // Unplugged: forgotten. Plugged in again: the dock is let in at once (remembered), the device behind it asked about again.
+  rig.fabric.unlink(0, 1, Usb4Rig::kD1);
+  rig.chip.send_plug_event(0, 1, true);
+  domain.poll();
+  policy.step();
+  CHECK(policy.device_count() == 0);
+  rig.fabric.link(0, 1, Usb4Rig::kD1);
+  rig.chip.send_plug_event(0, 1, false);
+  domain.poll();
+  policy.step();
+  CHECK(policy.device_count() == 2 && domain.pcie_tunnelled(1) && !domain.pcie_tunnelled(2));
+  CHECK(policy.next_request(&request) && request.uid == behind.uid);
+  policy.approve(behind.uid, false);                                     // this once
+  policy.step();
+  CHECK(domain.pcie_tunnelled(2) && !store.contains(behind.uid));
+  // Forgotten: off the list of the always allowed (the tunnel stays until it is unplugged).
+  policy.forget(dock.uid);
+  policy.step();
+  CHECK(!store.contains(dock.uid) && domain.pcie_tunnelled(1) && policy.device(0, &dock) && !dock.remembered);
+  // Answers about devices that are not there do nothing; more answers than the queue holds are dropped.
+  for (int i = 0; i < 40; ++i) policy.approve(0x1234 + static_cast<uint64_t>(i), true);
+  policy.step();
+  CHECK(store.ids.empty());
+  // Without a store: nothing is remembered, nothing breaks.
+  Usb4Policy forgetful(domain, nullptr);
+  forgetful.step();
+  CHECK(forgetful.device_count() == 2);
+}
+
+static void test_usb4_approval_file() {
+  uint64_t ids[8];
+  const char* text = "00000000a0a0a0a1\nnot hex\n  \n0b0b0b0ba0a0a0a1\r\n00000000a0a0a0a1\n123456789abcdef01\nFFFF";
+  CHECK(FileUsb4ApprovalStore::parse(ConstByteView(reinterpret_cast<const uint8_t*>(text), strlen(text)), ids, 8) == 3);
+  CHECK(ids[0] == 0xA0A0A0A1ull && ids[1] == 0x0B0B0B0BA0A0A0A1ull && ids[2] == 0xFFFF);     // (the duplicate, the line of 17 digits and the junk skipped)
+  CHECK(FileUsb4ApprovalStore::parse(ConstByteView(reinterpret_cast<const uint8_t*>(text), strlen(text)), ids, 1) == 1);
+  uint8_t out[64];
+  const uint32_t n = FileUsb4ApprovalStore::format(ids, 3, ByteView(out));
+  CHECK(n == 51 && out[16] == '\n' && memcmp(out, "00000000a0a0a0a1", 16) == 0);
+  CHECK(FileUsb4ApprovalStore::format(ids, 3, ByteView(out).first(20)) == 17);
+  TestAllocator alloc;
+  {
+    filesystem::RamFileSystem files(alloc);
+    FileUsb4ApprovalStore store(files, alloc);
+    CHECK(!store.contains(7) && store.add(7) && store.add(9) && store.add(7) && store.contains(7) && store.contains(9));
+    store.remove(7);
+    CHECK(!store.contains(7) && store.contains(9));
+    for (uint64_t i = 100; i < 100 + FileUsb4ApprovalStore::kMaxApproved; ++i) CHECK(store.add(i));
+    CHECK(!store.contains(9) && store.contains(100 + FileUsb4ApprovalStore::kMaxApproved - 1));   // (full: the oldest went)
+  }
+}
+
+static void test_usb4_other_hosts() {
+  // Intel's by id; any other maker's by the USB4 host interface class; nothing else.
+  const TbNhiDevice* intel = tb_find_host(0x8086, 0x9A1B, 0x08, 0x80, 0x00);
+  CHECK(intel && intel->generation == TbGeneration::Usb4);
+  const TbNhiDevice* amd = tb_find_host(0x1022, 0x162E, 0x0C, 0x03, 0x40);
+  CHECK(amd && amd->generation == TbGeneration::Usb4 && strstr(amd->name, "Rembrandt"));
+  const TbNhiDevice* other = tb_find_host(0x1B21, 0x2425, 0x0C, 0x03, 0x40);
+  CHECK(other && other->generation == TbGeneration::Usb4 && strcmp(other->name, "USB4 host interface") == 0);
+  CHECK(!tb_find_host(0x1022, 0x162E, 0x0C, 0x03, 0x30) && !tb_find_host(0x1B21, 0x2425, 0x0C, 0x03, 0x30));   // (an xHCI)
+  PciDeviceInfo d{};
+  d.vendor_id = 0x1022;
+  d.device_id = 0x1669;
+  d.class_code = 0x0C;
+  d.subclass = 0x03;
+  d.prog_if = 0x40;
+  CHECK(ThunderboltDriver::supports(d));
+  d.prog_if = 0x30;
+  CHECK(!ThunderboltDriver::supports(d));
+}
+
 static void test_usb4_usb3_and_dp_bandwidth() {
   // a USB 3 stream holds 9000 Mb/s on a single lane link of 20 Gb/s, using 2000; a DisplayPort stream asks for 8000
   TestAllocator alloc;
@@ -4224,6 +4330,9 @@ int main() {
   test_usb4_dp();
   test_usb4_asymmetric();
   test_usb4_clx();
+  test_usb4_policy();
+  test_usb4_approval_file();
+  test_usb4_other_hosts();
   test_usb4_titan_ridge_clx();
   test_usb4_tbt3_extras();
   test_usb4_tbt3_drom();
