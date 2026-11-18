@@ -623,7 +623,14 @@ static HRESULT STDMETHODCALLTYPE dev_CreateComputePipelineState(Dev *This, const
   return query_out((IUnknown *)p, riid, out);
 }
 
-static HRESULT STDMETHODCALLTYPE pso_GetCachedBlob(Pso *This, ID3DBlob **blob) { if (blob) *blob = NULL; return E_NOTIMPL; }
+/* The cached form of a pipeline. Pipelines are made from their descriptions each time (the kernel keeps each shader once: SharedShader), so there is nothing to cache: the
+ * blob is a mark that a program can store and hand back in CachedPSO, which is not looked at. */
+static HRESULT STDMETHODCALLTYPE pso_GetCachedBlob(Pso *This, ID3DBlob **blob) {
+  static const char mark[16] = "TCOS-PSO-CACHE1";
+  if (!blob) return E_INVALIDARG;
+  *blob = (ID3DBlob *)blob_new(mark, sizeof mark);
+  return *blob ? S_OK : E_OUTOFMEMORY;
+}
 
 /* ---- the translation of the fixed state to the kernel's -------------------------------------------------------------------------------------------------------------------------- */
 

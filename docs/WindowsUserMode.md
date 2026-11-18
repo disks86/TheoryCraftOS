@@ -636,7 +636,7 @@ functions named `<prefix>_<Method>` in the sources (run it after adding a method
   `UpdateTileMappings`, `QuerySync` (a fence's value; Direct3D 12's `GetCompletedValue`) and the destroy ones (`DxgKernel.hpp`). Host tests: `DxgkrnlTest` `test_d3d12_copies_and_escapes`.
 - **Tests.** `tests/emulated_dx.sh` builds the host emulator with the kernel's Direct3D under it (win32k + `dxgk::Kernel` with the CPU renderer) and runs `tests/windows/d3d12test.c`, the real
   DLLs end to end: adapters and outputs, a triangle with a root signature and pipeline state read back, a textured quad (descriptor table, static sampler), depth testing with an index buffer and a
-  root constant buffer view, a compute shader, copies, fences and events, the swap chain, the serializer and device queries (283 checks: with queries, indirect execution, a bundle, tiled buffers and mip-chain textures, predication and stream output). Not validated on a real GPU or by Wine's tests.
+  root constant buffer view, a compute shader, copies, fences and events, the swap chain, the serializer and device queries (570 checks: with queries, indirect execution, a bundle, tiled buffers and mip-chain textures, predication, stream output, the address modes of a sampler, mipmaps, vertex formats, depth-only passes and multisampling). `tests/d3d12_qemu.sh` runs the same program on the real kernel in QEMU with `virtio-gpu-gl`, where the kernel's Direct3D draws through virglrenderer on the host's GPU: the same 570 checks pass there (`docs/Direct3DKernelMode.md`, "Direct3D 12 on the 3D hardware"). Not run on other GPUs or by Wine's tests.
 
 ## dwmapi.dll
 

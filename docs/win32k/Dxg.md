@@ -89,6 +89,9 @@ limits into `AdapterCaps` (the UMDRIVERPRIVATE blob has the colour targets and v
 its colour outputs) and stream ops (texture units, extra pass targets, vertex buffer slots) to them. The escape `CreatePipeline` has an optional last part for attributes beyond four, vertex
 buffer slots and per-slot strides, and the blend state of targets 4 .. 7; `BindVertexBuffer` has an optional third word, the slot; `ICommandBuffer::bind_vertex_buffer_slot` is the device side.
 TGSI is emitted with the device's number of interpolants (the vertex and pixel shaders of a pipeline must agree on them).
+A vertex attribute's format word is a `graphics::VertexFormat` (floats, and with the device's `kFeatureVertexFormats` bytes, 16-bit numbers, half floats and integers); a sampler's
+address word is `address_word()` of `DxgTypes.hpp` (wrap, clamp, mirror, border, mirror once, and the border colour). `docs/Direct3DKernelMode.md`, "Direct3D 12 on the 3D hardware", says
+what virgl takes and how `tests/d3d12_qemu.sh` checks it.
 
 ### Mapping notes
 

@@ -26,12 +26,21 @@
  *
  * What Direct3D 12 has that this does not (the device says so with DXGI_ERROR_UNSUPPORTED, E_NOTIMPL or by ignoring the call, as the part's file says). The counts of vertex inputs,
  * interpolants, texture units, render targets and vertex buffers are the adapter's (DeviceInfo::limits of the kernel's graphics device, read with the UMDRIVERPRIVATE query): the CPU
- * renderer takes 16, 16, 16, 8 and 8, a GPU backend what its encoder was made for. Whatever the device:
- *   - vertex attributes are one to four 32-bit floats, four unordered access buffers and four buffer SRVs, no depth-only passes (a clear of a depth buffer waits for the next pass
- *     with a colour target), no multisampling or 1D textures, mip chains and arrays only on sampled textures, no texture UAVs, buffer SRVs only on buffers made with unordered
- *     access, sampler addresses repeat and clamp only
+ * renderer takes 16, 16, 16, 8 and 8; virgl (a GPU through virglrenderer) 16, 14 or 15, 16, 8 and 8, which is feature level 11_0 here; the other GPU backends what their
+ * encoders were made for (feature level 9_x, so D3D12CreateDevice with the usual minimum of 11_0 is refused on them). tests/d3d12_qemu.sh runs the test program on virgl.
+ * Whatever the device:
+ *   - four unordered access buffers and four buffer SRVs, no 1D textures, mip chains and arrays only on sampled textures (a render target or depth buffer has one level and
+ *     one layer, and a depth buffer cannot be sampled), no texture UAVs, buffer SRVs only on buffers made with unordered access, texture formats of four channels only
+ *     (base.inc g_formats: no one- or two-channel, packed-float or block-compressed formats), a blend factor, depth bias and a back-face stencil state are not applied,
+ *     one viewport and scissor
+ *   - a pass with a depth buffer and no render target draws into a colour image of the buffer's size that nothing reads (cmdlist.inc depth_companion): it costs that memory
+ *   - sampler border colours are the three of a static sampler (another colour is the nearest of them); a device with wrap and clamp alone uses the nearer of those
+ *   - multisampled images are render targets and depth buffers of the adapter's sample counts, drawn into and resolved (not read by shaders through this DLL)
  *   - pipeline statistics and stream output queries, tiled depth/multisampled/array resources, shared handles, resource state validation (barriers are accepted and not looked at,
- *     except aliasing), the debug layer, the root signature deserializers
+ *     except aliasing), the debug layer, the root signature deserializers, WriteToSubresource / ReadFromSubresource, the interfaces after ID3D12Device and
+ *     ID3D12GraphicsCommandList
+ *   - vertex elements: 32-bit floats on every device; bytes, 16-bit numbers, half floats and 32-bit integers (pso.inc vertex_format) where the device reads them (the CPU
+ *     renderer and virgl)
  *     (queries are occlusion, binary occlusion and timestamps; ExecuteIndirect is made when the list is executed; bundles replay their calls: extras.inc)
  *   - Shader Model 6.x features beyond what the kernel's DXIL translator reads (it reads vertex, pixel, geometry, hull, domain and compute shaders; see Dxg.md)
  * Built freestanding over kernel32.dll, gdi32.dll and dxgi.dll's interfaces with the OS's mingw compiler. */
