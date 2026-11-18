@@ -49,7 +49,8 @@ struct IwlCommandVersion {
 
 class IwlFirmware {
  public:
-  static constexpr uint32_t kMaxSections = 64, kApiWords = 8;
+  // (sections per image: the 9000 series has 12 or so, the Wi-Fi 7 files of linux-firmware up to 75)
+  static constexpr uint32_t kMaxSections = 128, kApiWords = 8;
   static constexpr uint32_t kMagic = 0x0a4c5749;
 
   explicit IwlFirmware(allocators::IAllocator& allocator) : regular_(allocator), init_(allocator), wowlan_(allocator) {}

@@ -201,7 +201,7 @@ static void test_firmware() {
   put32(many, 0);
   put32(many, IwlFirmware::kMagic);
   many.insert(many.end(), 88 - 8, 0);
-  for (int i = 0; i < 70; ++i) tlv(many, 19, section(static_cast<uint32_t>(i) * 16, 4, 1));
+  for (uint32_t i = 0; i <= IwlFirmware::kMaxSections; ++i) tlv(many, 19, section(i * 16, 4, 1));
   CHECK(!fw.parse(ConstByteView(many.data(), many.size()), &error));
 }
 

@@ -146,6 +146,7 @@
 #include "Hardware/Bluetooth/HidOverGatt.hpp"
 #include "Hardware/WirelessInterface/Intel/IwlDriver.hpp"      // (FileSystemFirmwareSource reads /firmware)
 #endif
+#include "Hardware/WirelessInterface/WifiAdapterProbe.hpp"   // (and WifiFirmwareSource.hpp: FileSystemFirmwareSource)
 #ifdef TCOS_INTEL_NPU
 #include "Hardware/Bus/Pci/PciMsi.hpp"
 #include "Kernel/Apic.hpp"
@@ -1721,6 +1722,43 @@ static efi::Status kernel_main(efi::Handle image, efi::SystemTable* st) {
       }
     }
 #endif
+    // The Wi-Fi adapters on the PCI and USB buses, by their IDs (WifiAdapterCatalog: Intel, Realtek, MediaTek, Qualcomm and Broadcom), listed in the boot log. Only IDs are
+    // read. With -DTCOS_WIFI_CHIPS=ON each one's chip driver is started too (identification, firmware from /firmware, as far as its family goes; nothing joins a network):
+    // opt-in, as none of them has run on a real adapter. The Intel 9000 series is left to its own driver (TCOS_INTEL_WIFI, below).
+    hardware::DetectedWifiAdapter wifi_adapters[8];
+    const uint32_t wifi_adapter_count = hardware::find_wifi_adapters(&pci, &usb, ArrayView<hardware::DetectedWifiAdapter>(wifi_adapters));
+#ifdef TCOS_WIFI_CHIPS
+    UniquePointer<hardware::WifiChipSlot> wifi_chips[8];
+    hardware::FileSystemFirmwareSource wifi_chip_firmware(explorer_files.file_system(), shared_allocator);
+#endif
+    for (uint32_t i = 0; i < wifi_adapter_count && i < 8; ++i) {
+      const hardware::WifiAdapterModel& m = *wifi_adapters[i].model;
+      Entry e(Level::Info, "Wi-Fi");
+      e.text(hardware::wifi_vendor_name(m.vendor)).text(" ").text(m.chip).text(" (").text(m.product).text("), ").text(hardware::wifi_standard_name(m.standard)).text(", ")
+          .text(hardware::wifi_bus_name(m.bus)).text(" ").hex(m.vendor_id).text(":").hex(m.device_id).text(", driver family ").text(hardware::wifi_driver_family_name(m.family));
+#ifdef TCOS_WIFI_CHIPS
+      if (m.family == hardware::WifiDriverFamily::IwlMvm9000 || !clock_ok || !paging_ok) continue;
+      wifi_chips[i] = UniquePointer<hardware::WifiChipSlot>::make(shared_allocator, shared_allocator);
+      if (!wifi_chips[i]) continue;
+      hardware::WifiChipSlot::Inputs chip_inputs;
+      chip_inputs.pci = &pci;
+      chip_inputs.mapper = &register_mapper;
+      chip_inputs.usb = &usb;
+      const hardware::WifiChipResult result = wifi_chips[i]->start(wifi_adapters[i], chip_inputs, wifi_chip_firmware);
+      const hardware::IWifiChip* chip = wifi_chips[i]->chip();
+      Entry c(result == hardware::WifiChipResult::Ok ? Level::Ok : Level::Warning, "Wi-Fi");
+      c.text(m.chip).text(": ");
+      if (!chip) {
+        c.text("no chip driver for this family yet");
+        continue;
+      }
+      c.text(hardware::wifi_chip_state_name(chip->state())).text(", chip ").hex(chip->identity().chip_id).text(" rev ").dec(chip->identity().revision);
+      if (chip->firmware_name()[0]) c.text(", firmware ").text(chip->firmware_name());
+      if (chip->identity().firmware_version[0]) c.text(" (").text(chip->identity().firmware_version).text(")");
+      c.text(": ").text(hardware::wifi_chip_result_name(result));
+      if (chip->message()[0]) c.text(" - ").text(chip->message());
+#endif
+    }
 #ifdef TCOS_INTEL_WIFI
     // The Intel Wireless-AC 9560 (and the rest of the 9000 series) as a network interface: the firmware from /firmware is started, and the card then scans and joins networks through the
     // Wi-Fi window; its network stack gets an address (DHCP) whenever it is joined. Opt-in (-DTCOS_INTEL_WIFI=ON): none of it has run on a real card.
