@@ -81,11 +81,85 @@ bool NvidiaNative::start() {
   chip_ = identify_chip(boot0, regs_->read32(kPmcBoot42));
   if (chip_.family == Family::Unknown) return fail("a chip this driver does not know");
   vram_ = probe_vram(*regs_, chip_);                       // (reads only)
+  (void)read_bios();                                       // (without one: no board tables, no connectors; the rest works)
   gpio_ = UniquePointer<NvGpio>::make(allocator_, *regs_, chip_, board_);
   if (gpio_) therm_ = UniquePointer<NvThermMonitor>::make(allocator_, *regs_, chip_, *gpio_);
   if (therm_ && !therm_->initialize()) therm_ = UniquePointer<NvThermMonitor>();
+  (void)refresh_connectors(true);
   status_ = "identified";
   return true;
+}
+
+bool NvidiaNative::read_bios() {
+  NvBiosSources sources;
+  sources.registers = regs_.get();
+  sources.chip = chip_;
+  sources.mapper = context_.registers;
+  sources.function = context_.device.address;
+  sources.boot_display = true;                              // (NvidiaGpu is the boot display's driver)
+  sources.device_id = context_.device.device_id;
+  sources.allocator = &allocator_;
+  // (No expansion ROM BAR: switching it on is a write to the function's configuration space, which the GPU context does not give.)
+  bios_image_ = UniquePointer<ByteBuffer>::make(allocator_, allocator_);
+  if (!bios_image_) return false;
+  NvBiosFetchReport report;
+  bios_source_ = NvBiosShadow::fetch(sources, bios_image_.get(), &report);
+  if (bios_source_ == BiosSource::None) {
+    bios_image_ = UniquePointer<ByteBuffer>();
+    return false;
+  }
+  const NvBios bios(bios_image_->view());
+  board_result_ = parse_board(bios, chip_, &board_);
+  return board_result_.has_dcb;
+}
+
+bool NvidiaNative::read_connector(uint32_t index) {
+  Connector& c = connectors_[index];
+  ByteBuffer edid(allocator_);
+  c.edid_source = read_connector_edid(*regs_, chip_, board_, index, &edid);
+  c.edid_bytes = 0;
+  if (c.edid_source != EdidSource::None) {
+    const ConstByteView got = edid.view().at_most(kMaxEdid);
+    ByteView(c.edid).first(got.size()).copy_from(got);
+    c.edid_bytes = static_cast<uint32_t>(got.size());
+  }
+  c.connected = c.edid_bytes != 0 || (c.hpd != 0xff && c.hpd_state);
+  return true;
+}
+
+bool NvidiaNative::refresh_connectors(bool all) {
+  if (!regs_) return false;
+  bool changed = false;
+  if (all) {
+    connector_count_ = board_.connector_count < BoardInfo::kMaxConnectors ? board_.connector_count : BoardInfo::kMaxConnectors;
+    for (uint32_t i = 0; i < connector_count_; ++i) {
+      Connector& c = connectors_[i];
+      c = Connector();
+      c.dcb_type = board_.connectors[i].type;
+      c.hpd = board_.connectors[i].hpd;
+      c.displayport = connector_route(board_, i).displayport;
+    }
+    changed = true;
+  }
+  for (uint32_t i = 0; i < connector_count_; ++i) {
+    Connector& c = connectors_[i];
+    bool look = all;
+    if (c.hpd != 0xff && gpio_) {
+      const Optional<bool> plugged = gpio_->hot_plug(c.hpd);
+      if (plugged && *plugged != c.hpd_state) {
+        c.hpd_state = *plugged;
+        look = true;
+      } else if (all && plugged) {
+        c.hpd_state = *plugged;
+      }
+    }
+    if (!look) continue;
+    const bool was = c.connected;
+    const uint32_t bytes_before = c.edid_bytes;
+    (void)read_connector(i);
+    changed = changed || was != c.connected || bytes_before != c.edid_bytes;
+  }
+  return changed;
 }
 
 int32_t NvidiaNative::temperature_millicelsius() {
@@ -121,6 +195,48 @@ bool NvidiaNative::engage(const NvFirmwareFramebuffer& firmware, uint64_t firmwa
 
 void NvidiaNative::disengage() {
   if (display_ && display_->display_engaged()) display_->disengage_display();
+}
+
+ConnectorType connector_type_for_dcb(uint8_t dcb) {
+  switch (dcb) {
+    case 0x00: return ConnectorType::Vga;
+    case 0x10: case 0x11: case 0x12: case 0x13: return ConnectorType::Composite;   // TV (composite, S-video, component ...)
+    case 0x20: return ConnectorType::Component;
+    case 0x30: case 0x31: return ConnectorType::Dvi;
+    case 0x40: case 0x41: case 0x47: return ConnectorType::Internal;               // LVDS, LVDS SPWG, eDP
+    case 0x46: case 0x48: return ConnectorType::DisplayPort;                       // DP, mini DP
+    case 0x60: case 0x61: case 0x62: case 0x63: case 0x64: return ConnectorType::Hdmi;
+    default: return ConnectorType::Unknown;
+  }
+}
+
+uint32_t order_connectors(ArrayView<const NvidiaNative::Connector> connectors, ConstByteView firmware_edid, ArrayView<uint8_t> order) {
+  const uint32_t count = static_cast<uint32_t>(connectors.size());
+  uint32_t n = 0;
+  int first = -1;
+  if (firmware_edid.size() >= 128)
+    for (uint32_t i = 0; i < count && first < 0; ++i)
+      if (connectors[i].edid_bytes >= 128 && ConstByteView(connectors[i].edid).first(128).equals(firmware_edid.first(128))) first = static_cast<int>(i);
+  if (first >= 0 && n < order.size()) order[n++] = static_cast<uint8_t>(first);
+  for (uint32_t pass = 0; pass < 2; ++pass)                 // the connected ones, then the rest
+    for (uint32_t i = 0; i < count && n < order.size(); ++i) {
+      if (static_cast<int>(i) == first || connectors[i].connected != (pass == 0)) continue;
+      order[n++] = static_cast<uint8_t>(i);
+    }
+  return n;
+}
+
+void connector_label(ConnectorType type, uint32_t ordinal, ArrayView<char> out) {
+  if (out.empty()) return;
+  const char* name = type == ConnectorType::DisplayPort ? "DP" : type == ConnectorType::Internal ? "eDP" : connector_type_name(type);
+  char digits[10];
+  uint32_t d = 0;
+  do { digits[d++] = static_cast<char>('0' + ordinal % 10); ordinal /= 10; } while (ordinal && d < sizeof digits);
+  uint64_t at = 0;
+  for (const char* p = name; *p && at + 1 < out.size(); ++p) out[at++] = *p;
+  if (at + 1 < out.size()) out[at++] = '-';
+  while (d && at + 1 < out.size()) out[at++] = digits[--d];
+  out[at] = 0;
 }
 
 }  // namespace nv

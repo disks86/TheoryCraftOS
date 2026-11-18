@@ -18,9 +18,14 @@
 
 // The native NVIDIA driver's parts for one GPU (Nvkm/*), put together for NvidiaGpu.
 //
-//   - start() is read-only: BAR0 mapped, the chip identified from NV_PMC_BOOT_0/42 (every generation from NV04 on), the VRAM size read,
-//     and the temperature and fan sensors started (their first reads; nothing is written). This runs on every NVIDIA GPU that is the boot
-//     display. A GPU that does not answer (powered down: BOOT_0 all ones) or a chip nobody knows is left alone.
+//   - start(): BAR0 mapped, the chip identified from NV_PMC_BOOT_0/42 (every generation from NV04 on), the VRAM size read, the video BIOS
+//     read (Nvkm/NvBios: PRAMIN, PROM or the legacy shadow; the PRAMIN window and the ROM shadow bit are put back as they were, as nouveau
+//     does on every boot) and its board tables parsed (outputs, I2C, GPIO, connectors), and the temperature and fan sensors started. This
+//     runs on every NVIDIA GPU that is the boot display. A GPU that does not answer (powered down: BOOT_0 all ones) or a chip nobody knows
+//     is left alone.
+//   - The connectors (the board's connector table) and the EDID of what is plugged into each, over the connector's own DDC bus or
+//     DisplayPort AUX channel (Nvkm/NvI2cEdid): read at start and again when a connector's hot plug line changes (refresh_connectors()),
+//     so NvidiaGpu can list every monitor, not only the one the firmware shows.
 //   - engage() is the display takeover (Nvkm/NvDisplay: the firmware's mode stays, the head is pointed at a framebuffer of the OS's own in
 //     VRAM). It writes to the display engine, so NvidiaGpu only calls it with TCOS_NVIDIA_NATIVE (off by default: nothing of it has run on a
 //     real card). Its VRAM comes from a window of BAR1 right after the firmware's framebuffer: the firmware leaves BAR1 mapping VRAM
@@ -31,13 +36,16 @@
 #include <stdint.h>
 #include "Allocators/IAllocator.hpp"
 #include "Hardware/GraphicsProcessingUnit/GpuContext.hpp"
+#include "Hardware/GraphicsProcessingUnit/NVIDIA/Nvkm/NvBios.hpp"
 #include "Hardware/GraphicsProcessingUnit/NVIDIA/Nvkm/NvBiosTables.hpp"
+#include "Hardware/GraphicsProcessingUnit/NVIDIA/Nvkm/NvI2cEdid.hpp"
 #include "Hardware/GraphicsProcessingUnit/NVIDIA/Nvkm/NvChip.hpp"
 #include "Hardware/GraphicsProcessingUnit/NVIDIA/Nvkm/NvDisplay.hpp"
 #include "Hardware/GraphicsProcessingUnit/NVIDIA/Nvkm/NvFb.hpp"
 #include "Hardware/GraphicsProcessingUnit/NVIDIA/Nvkm/NvGpio.hpp"
 #include "Hardware/GraphicsProcessingUnit/NVIDIA/Nvkm/NvRegisters.hpp"
 #include "Hardware/GraphicsProcessingUnit/NVIDIA/Nvkm/NvTherm.hpp"
+#include "Hardware/Monitor/MonitorTypes.hpp"
 #include "Utility/UniquePointer.hpp"
 
 namespace hardware {
@@ -74,6 +82,28 @@ class NvidiaNative {
 
   [[nodiscard]] bool start();
   const Chip& chip() const { return chip_; }
+  // The video BIOS: where it came from (None if no source had one) and what its tables say (empty without one).
+  BiosSource bios_source() const { return bios_source_; }
+  const BoardInfo& board() const { return board_; }
+  const BoardParseResult& board_result() const { return board_result_; }
+
+  // --- Connectors (as the board's connector table lists them; none without a VBIOS).
+  static constexpr uint32_t kMaxEdid = 512;
+  struct Connector {
+    uint8_t dcb_type = 0xff;         // DCB_CONNECTOR_*
+    uint8_t hpd = 0xff;              // the hot plug GPIO function (0xff: none: looked at only at start)
+    bool displayport = false;
+    bool connected = false;          // an EDID was read (or, with no route to read one, the hot plug line says so)
+    bool hpd_state = false;
+    EdidSource edid_source = EdidSource::None;
+    uint8_t edid[kMaxEdid] = {};
+    uint32_t edid_bytes = 0;
+  };
+  uint32_t connector_count() const { return connector_count_; }
+  const Connector* connector(uint32_t index) const { return index < connector_count_ ? &connectors_[index] : nullptr; }
+  ArrayView<const Connector> connectors() const { return ArrayView<const Connector>(connectors_).first(connector_count_); }
+  // Reads the EDID of every connector again whose hot plug line changed (all of them with `all`); true if anything differs.
+  bool refresh_connectors(bool all = false);
   const char* status() const { return status_; }
   uint64_t vram_bytes() const { return vram_.ok() ? vram_.info.bytes : 0; }
   int32_t temperature_millicelsius();
@@ -92,14 +122,31 @@ class NvidiaNative {
   const char* status_ = "not started";
   UniquePointer<MmioNvRegisters> regs_;
   Chip chip_;
-  BoardInfo board_;                         // (empty until the VBIOS is read: the sensors work without it, the fan's tachometer line not)
+  bool read_bios();
+  bool read_connector(uint32_t index);
+
+  BoardInfo board_;                         // (empty when no VBIOS was found: the sensors work without it, the fan's tachometer line not)
+  BoardParseResult board_result_;
+  BiosSource bios_source_ = BiosSource::None;
+  UniquePointer<ByteBuffer> bios_image_;    // the image the tables were read from (NvBios keeps views into it)
   VramProbe vram_;
+  Connector connectors_[BoardInfo::kMaxConnectors];
+  uint32_t connector_count_ = 0;
   UniquePointer<NvGpio> gpio_;
   UniquePointer<NvThermMonitor> therm_;
   RawNvLock memory_lock_;
   UniquePointer<Bar1VramMemory> memory_;
   UniquePointer<NvNativeDisplay> display_;
 };
+
+// --- What NvidiaGpu shows the monitor layer (pure: tested on the host).
+// The monitor layer's kind of connector for a DCB connector type (DCB_CONNECTOR_*).
+ConnectorType connector_type_for_dcb(uint8_t dcb_type);
+// The order connectors are listed in: the one whose EDID is the firmware's first (the display the firmware shows; `firmware_edid` empty:
+// none), then the other connected ones, then the rest, each group in the board's order. Fills `order` with board indices; returns how many.
+uint32_t order_connectors(ArrayView<const NvidiaNative::Connector> connectors, ConstByteView firmware_edid, ArrayView<uint8_t> order);
+// "DP-1", "HDMI-2", "eDP-1" ...: the kind's short name and `ordinal` (1 for the first of that kind), cut to fit `out` (always terminated).
+void connector_label(ConnectorType type, uint32_t ordinal, ArrayView<char> out);
 
 }  // namespace nv
 }  // namespace hardware

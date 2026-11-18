@@ -27,6 +27,7 @@
 #include "Hardware/Bus/Pci/IPciBus.hpp"
 #include "Hardware/GraphicsProcessingUnit/NVIDIA/NvidiaNative.hpp"
 #include "Hardware/RegisterMapper.hpp"
+#include "NvBiosImages.hpp"
 
 namespace hardware {
 void delay_us(uint64_t) {}   // (the drivers' pauses: nothing to wait for against host memory)
@@ -73,6 +74,9 @@ struct FakeCard final : IPciBus, IRegisterMapper {
   bool map_registers(uint64_t physical, uint64_t length, MmioRegion* region) override {
     ++maps;
     if (!map_ok) return false;
+    // Only the card's own BARs exist here (the legacy shadow at 0xC0000, which the fetch also asks for, is not host memory).
+    auto inside = [&](uint64_t base, uint64_t bytes) { return physical >= base && length <= bytes && physical - base <= bytes - length; };
+    if (!inside(bar0_address(), bar0.size() * 4) && !inside(bar1_address(), bar1.size())) return false;
     *region = MmioRegion(physical, length);
     return true;
   }
@@ -205,10 +209,86 @@ static void test_engage_refusals() {
   CHECK(a.live == 0);
 }
 
+// The video BIOS read at start through the real fetch (the PROM source here: the image where BAR0 0x300000 shows the ROM), the board's
+// connectors listed from it, and the registers the fetch touches put back as they were.
+static void test_bios_and_connectors() {
+  TestAllocator a;
+  {
+    FakeCard card(1u << 20);
+    card.bar0[0] = 0x0e4000a1;                                    // GK104
+    const Bytes image = kepler_image(false);
+    memcpy(reinterpret_cast<uint8_t*>(card.bar0.data()) + 0x300000, image.data(), image.size());
+    card.bar0[0x088050 / 4] = 1;                                  // the firmware left the ROM shadow on
+    card.bar0[0x001700 / 4] = 0x1234;                             // and the PRAMIN window here
+    NvidiaNative native(context_for(card, a), a);
+    CHECK(native.start());
+    CHECK(native.bios_source() == BiosSource::Prom && native.board_result().has_dcb);
+    CHECK(native.board().output_count >= 4 && native.board().connector_count == 3 && native.board().i2c_count >= 3);
+    CHECK(card.bar0[0x088050 / 4] == 1 && card.bar0[0x001700 / 4] == 0x1234);   // put back
+    CHECK(native.connector_count() == 3);
+    const NvidiaNative::Connector* dp = native.connector(0);
+    const NvidiaNative::Connector* hdmi = native.connector(1);
+    const NvidiaNative::Connector* dvi = native.connector(2);
+    CHECK(dp && dp->dcb_type == 0x46 && dp->displayport && hdmi && hdmi->dcb_type == 0x61 && !hdmi->displayport && dvi && dvi->dcb_type == 0x30);
+    CHECK(!dp->connected && dp->edid_bytes == 0);                 // (nothing answers on these buses: no monitor)
+    CHECK(!native.connector(3) && native.connectors().size() == 3);
+    CHECK(!native.refresh_connectors());                          // nothing changed
+  }
+  {
+    // No image anywhere: no board tables, no connectors; the chip and the rest still work.
+    FakeCard card(1u << 20);
+    card.bar0[0] = 0x0e4000a1;
+    NvidiaNative native(context_for(card, a), a);
+    CHECK(native.start() && native.bios_source() == BiosSource::None && native.connector_count() == 0 && native.board().connector_count == 0);
+  }
+  CHECK(a.live == 0);
+}
+
+static void test_connector_helpers() {
+  CHECK(connector_type_for_dcb(0x46) == ConnectorType::DisplayPort && connector_type_for_dcb(0x61) == ConnectorType::Hdmi &&
+        connector_type_for_dcb(0x30) == ConnectorType::Dvi && connector_type_for_dcb(0x47) == ConnectorType::Internal &&
+        connector_type_for_dcb(0x00) == ConnectorType::Vga && connector_type_for_dcb(0xEE) == ConnectorType::Unknown);
+  char name[16];
+  connector_label(ConnectorType::DisplayPort, 2, ArrayView<char>(name));
+  CHECK(strcmp(name, "DP-2") == 0);
+  connector_label(ConnectorType::Internal, 1, ArrayView<char>(name));
+  CHECK(strcmp(name, "eDP-1") == 0);
+  connector_label(ConnectorType::Hdmi, 12, ArrayView<char>(name));
+  CHECK(strcmp(name, "HDMI-12") == 0);
+  char tiny[4];
+  connector_label(ConnectorType::DisplayPort, 123, ArrayView<char>(tiny));
+  CHECK(strlen(tiny) == 3);                                        // cut to fit, terminated
+
+  // Order: the firmware's display (its EDID) first, then the other connected ones, then the rest.
+  static NvidiaNative::Connector list[4];
+  for (auto& c : list) c = NvidiaNative::Connector();
+  list[0].connected = false;
+  list[1].connected = true;
+  list[1].edid_bytes = 128;
+  memset(list[1].edid, 0x11, 128);
+  list[2].connected = true;
+  list[2].edid_bytes = 128;
+  memset(list[2].edid, 0x22, 128);
+  list[3].connected = false;
+  uint8_t firmware[128];
+  memset(firmware, 0x22, sizeof firmware);
+  uint8_t order[8];
+  CHECK(order_connectors(ArrayView<const NvidiaNative::Connector>(list), ConstByteView(firmware), ArrayView<uint8_t>(order)) == 4);
+  CHECK(order[0] == 2 && order[1] == 1 && order[2] == 0 && order[3] == 3);
+  CHECK(order_connectors(ArrayView<const NvidiaNative::Connector>(list), ConstByteView(), ArrayView<uint8_t>(order)) == 4);
+  CHECK(order[0] == 1 && order[1] == 2 && order[2] == 0);           // (no firmware EDID: the connected ones in the board's order)
+  memset(firmware, 0x33, sizeof firmware);
+  CHECK(order_connectors(ArrayView<const NvidiaNative::Connector>(list), ConstByteView(firmware), ArrayView<uint8_t>(order)) == 4 && order[0] == 1);
+  uint8_t two[2];
+  CHECK(order_connectors(ArrayView<const NvidiaNative::Connector>(list), ConstByteView(), ArrayView<uint8_t>(two)) == 2);   // cut to fit
+}
+
 int main() {
   test_start();
   test_bar1_heap();
   test_engage_refusals();
+  test_bios_and_connectors();
+  test_connector_helpers();
   printf("NvidiaNativeTest: %d checks, %d failed\n", g_checks, g_failed);
   return g_failed ? 1 : 0;
 }
