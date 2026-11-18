@@ -60,7 +60,17 @@
 //   remove:   runs the recorded uninstall command (with the quiet switches of its kind, unless it is the registry's QuietUninstallString), then
 //             forgets the package.
 //
-// Packages of other kinds (MSI, MSIX, WiX Burn, ...), setup programs this system cannot run (a 32-bit Nullsoft or Inno Setup program is run; a 32-bit
+// A package that is a Windows Installer package ("msi", "wix") is not a program: it is a description (tables of files, registry values, shortcuts and a
+// list of actions) that this system installs by itself, with the engine of Msi/MsiInstaller.hpp, where there is an ISetupHost for the registry and the
+// programs the package runs:
+//
+//   install:  steps 1 and 2; the .msi is downloaded into C:\Windows\Temp\WinGet\<identifier>.<version>, checked, and its execute sequence is run with the
+//             properties the manifest's switches set (NAME=value). An older version that is another product is removed first. The package is then
+//             kept as C:\Windows\Installer\<product code>.msi and the record names it; what the engine skipped (DLL custom actions, services, ...)
+//             is in the record as notes. A failure takes away again what was put in place.
+//   remove:   runs the kept package's sequence as a removal, then forgets the package.
+//
+// Packages of other kinds (MSIX, WiX Burn, ...), setup programs this system cannot run (a 32-bit Nullsoft or Inno Setup program is run; a 32-bit
 // "exe" one is not: docs/Wow64.md), and "exe" installers without a silent switch are refused: Result::NotSupported, with the reason in the detail. Calls block:
 // run them on a thread of their own.
 namespace desktop::appman {
@@ -151,6 +161,8 @@ class WingetInstaller {
   struct SetupRecord;
   Result place_setup(const WingetManifest& manifest, const WingetInstallerEntry& entry, Progress* progress, String* detail);
   Result remove_setup(StringView id, const SetupRecord& record, String* detail);
+  Result place_msi(const WingetManifest& manifest, const WingetInstallerEntry& entry, Progress* progress, String* detail);
+  Result run_msi_removal(StringView package, StringView upgrading, String* detail);
   bool read_setup_record(StringView id, WingetInstalled* app, SetupRecord* record) const;
   bool setup_record_path(StringView id, String* out) const;
   bool is_for_this_processor(StringView path) const;

@@ -558,7 +558,7 @@ static void test_sqlite_and_catalog() {
     appman::WingetCatalog catalog(a);
     CHECK(catalog.parse_index(data_of(msix)));
     // 13 packages and 400 fillers; the one with the overlong name and the one with the bad identifier are left out.
-    CHECK(catalog.count() == 414);
+    CHECK(catalog.count() == 415);
     const appman::WingetPackage* tool = catalog.find("test.portable");      // (any case)
     CHECK(tool && tool->id.view().equals("Test.Portable") && tool->name.view().equals("Portable Tool") && tool->moniker.view().equals("ptool") && tool->version.view().equals("2.0"));
     CHECK(catalog.find("Allen&Heath.Mixer") && !catalog.find("Long.Name") && !catalog.find("Bad/Identifier") && !catalog.find("Test.Port"));
@@ -570,10 +570,10 @@ static void test_sqlite_and_catalog() {
     List<uint64_t> found(a);
     List<uint8_t> tiers(a);
     uint64_t total = 0;
-    CHECK(catalog.search("", 1000, &found, &total) && total == 414 && found.count() == 414);
+    CHECK(catalog.search("", 1000, &found, &total) && total == 415 && found.count() == 415);
     CHECK(catalog.search("ptool", 10, &found, &total, &tiers) && total == 1 && tiers[0] == 0 && catalog.at(found[0]).id.view().equals("Test.Portable"));
     CHECK(catalog.search("ZIP", 10, &found, &total, &tiers) && total == 1 && catalog.at(found[0]).name.view().equals("Zip Suite") && tiers[0] == 0);
-    CHECK(catalog.search("test.", 100, &found, &total, &tiers) && total == 13 && tiers[0] == 2);      // (identifiers only)
+    CHECK(catalog.search("test.", 100, &found, &total, &tiers) && total == 14 && tiers[0] == 2);      // (identifiers only)
     CHECK(catalog.search("filler 39", 5, &found, &total, &tiers) && total == 14 && found.count() == 5 && catalog.at(found[0]).name.view().equals("Filler 390") && tiers[0] == 0);      // (both words anywhere; the names that start with the query first)
     CHECK(catalog.search("39 filler", 100, &found, &total, &tiers) && total == 14 && tiers[0] == 2 && catalog.at(found[0]).name.view().equals("Filler 039"));
     CHECK(catalog.search("no such thing", 5, &found, &total) && total == 0 && found.count() == 0);
@@ -611,7 +611,7 @@ static void test_sqlite_and_catalog() {
       if (columns.size() >= 8 && columns[2].text().size() > r.longest) r.longest = columns[2].text().size();
       return columns.size() == 8 && columns[0].kind == appman::SqliteValue::Kind::Null && columns[7].kind == appman::SqliteValue::Kind::Blob && columns[7].bytes.size() == 32;
     }, &rows));
-    CHECK(rows.count == 416 && rows.longest == 6000 && rows.ordered);
+    CHECK(rows.count == 417 && rows.longest == 6000 && rows.ordered);
     const std::string database = sv(StringView(db.view()));
     for (const std::string& junk : {std::string(), std::string("SQLite format 3"), std::string(4096, '\0'), database.substr(0, 100)}) {
       appman::WingetCatalog c(a);
@@ -730,7 +730,9 @@ static void test_winget_manifests() {
     // The x64 ones are a Windows Installer package and not a web address, the x86 one is a 32-bit program: the neutral one it is.
     chosen = appman::WingetInstaller::choose_installer(manifest, appman::WingetInstaller::kNative | appman::WingetInstaller::kSetup, &why);
     CHECK(chosen && chosen->architecture.view().equals("neutral") && chosen->nested.count() == 1 && chosen->nested[0]->path.view().equals("shared.exe"));
-    CHECK(!appman::WingetInstaller::choose_installer(manifest, appman::WingetInstaller::kSetup, &why) && why.view().contains("does not come as a setup program"));
+    // Where packages can be run (not only put in place), the Windows Installer package is one that can be: this system installs it by its description.
+    chosen = appman::WingetInstaller::choose_installer(manifest, appman::WingetInstaller::kSetup, &why);
+    CHECK(chosen && chosen->type.view().equals("msi") && chosen->url.view().equals("https://example.org/x64.msi"));
     // A setup program: its switches, success codes and product code; taken only where setup programs can be run, and after a portable one.
     const char* setups =
         "PackageIdentifier: A.S\nPackageName: S\nPackageVersion: 1\nInstallerSwitches:\n  SilentWithProgress: /passive\n  Custom: /ALL\nInstallerSuccessCodes:\n- 3010\n- nonsense\n"
@@ -1000,6 +1002,41 @@ struct FakeSetupHost final : appman::ISetupHost {
     }
     return true;
   }
+  // The registry a Windows Installer package is installed into: "root|key|name" in lower case -> type and data.
+  std::map<std::string, std::pair<uint32_t, std::string>> registry;
+  static std::string place(msi::RegistryRoot root, StringView key, StringView name) {
+    std::string out = std::to_string(int(root)) + "|" + sv(key) + "|" + sv(name);
+    for (char& c : out) if (c >= 'A' && c <= 'Z') c = char(c + 32);
+    return out;
+  }
+  // A value that is text, as ASCII ("<none>" if there is no such value).
+  std::string registry_text(msi::RegistryRoot root, const char* key, const char* name) const {
+    const auto found = registry.find(place(root, key, name));
+    if (found == registry.end()) return "<none>";
+    std::string out;
+    for (size_t i = 0; i + 1 < found->second.second.size() && found->second.second[i] != '\0'; i += 2) out += found->second.second[i];
+    return out;
+  }
+  bool registry_set(msi::RegistryRoot root, StringView key, StringView name, uint32_t type, ConstByteView data) override {
+    registry[place(root, key, name)] = {type, std::string(reinterpret_cast<const char*>(data.data()), data.size())};
+    return true;
+  }
+  bool registry_get(msi::RegistryRoot root, StringView key, StringView name, uint32_t* type, ByteBuffer* data) override {
+    const auto found = registry.find(place(root, key, name));
+    if (found == registry.end()) return false;
+    *type = found->second.first;
+    data->clear();
+    return data->append(ConstByteView(reinterpret_cast<const uint8_t*>(found->second.second.data()), found->second.second.size()));
+  }
+  void registry_delete_value(msi::RegistryRoot root, StringView key, StringView name) override { registry.erase(place(root, key, name)); }
+  void registry_delete_key(msi::RegistryRoot root, StringView key, bool only_if_empty) override {
+    const std::string at = place(root, key, "");      // ("root|key|": its values; "root|key\\": the keys under it)
+    const std::string under = at.substr(0, at.size() - 1) + "\\";
+    bool empty = true;
+    for (const auto& v : registry) empty &= v.first.compare(0, at.size(), at) != 0 && v.first.compare(0, under.size(), under) != 0;
+    if (only_if_empty && !empty) return;
+    for (auto v = registry.begin(); v != registry.end();) v = (v->first.compare(0, at.size(), at) == 0 || v->first.compare(0, under.size(), under) == 0) ? registry.erase(v) : ++v;
+  }
   bool uninstall_entries(List<UniquePointer<appman::UninstallEntry>>* out) override {
     out->clear();
     for (const Entry& e : entries) {
@@ -1096,7 +1133,8 @@ static void test_winget_setup_programs() {
     // Refusals: nothing is run, nothing stays.
     host.runs.clear();
     CHECK(run(installer.install(package("Test.ExeNoSwitch"), &progress, &detail), appman::Result::NotSupported) && detail.view().contains("without asking questions"));
-    CHECK(run(installer.install(package("Test.Msi"), &progress, &detail), appman::Result::NotSupported) && detail.view().contains("Windows Installer"));
+    // (a download that calls itself a Windows Installer package and is none)
+    CHECK(run(installer.install(package("Test.Msi"), &progress, &detail), appman::Result::NotAnAppImage) && detail.view().contains("not a Windows Installer package"));
     CHECK(run(installer.install(package("Test.Setup32"), &progress, &detail), appman::Result::NotSupported) && detail.view().contains("32-bit"));
     CHECK(host.runs.empty() && temp_empty() && installer.list_installed(&apps) && apps.count() == 0);
     // A 32-bit setup program of Nullsoft's kind is run (and so is its uninstaller, which is 32-bit too); the one of no known kind above was refused.
@@ -1169,6 +1207,124 @@ static void test_winget_setup_programs() {
     CHECK(run(plain.update(package("Test.Setup"), &progress, &detail), appman::Result::NotSupported));
     CHECK(run(plain.remove("Test.Setup", &detail), appman::Result::NotSupported) && plain.installed("Test.Setup"));
     CHECK(run(installer.remove("Test.Setup", &detail), appman::Result::Ok));
+  }
+  CHECK(a.live == 0);
+}
+
+// A package that is a Windows Installer package (.msi): this system installs it from its description (src/Msi; tests/MsiTest.cpp has the engine's own
+// tests). Here: the way from the catalog to the installed product, the kept package, updating to a version that is another product, and removing.
+static void test_winget_msi() {
+  TestAllocator a;
+  {
+    RamFileSystem fs(a);
+    for (const char* d : {"/Windows", "/Windows/Program Files", "/Windows/ProgramData", "/Windows/Windows", "/AppStore"}) (void)fs.create_directory(d);
+    FakeNetwork net;
+    load_winget_site(&net);
+    appman::WingetCatalog catalog(a);
+    CHECK(catalog.parse_index(data_of(fixture("source2.msix"))));
+    FakeSetupHost host(fs, a);
+    appman::WingetInstaller installer(a, fs, net, &host);
+    String detail(a);
+    appman::Progress progress;
+    List<appman::WingetInstalled> apps(a);
+    const appman::WingetPackage* latest = catalog.find("Test.MsiApp");
+    CHECK(latest != nullptr);
+    if (!latest) return;
+    auto run = [&](appman::Result r, appman::Result want) {
+      if (r != want) printf("  got: %s (%s)\n", sv(appman::result_name(r)).c_str(), sv(detail.view()).c_str());
+      return r == want;
+    };
+    const char* kRecord = "/AppStore/AppMan/Winget/Test.MsiApp.txt";
+    const char* kApp = "/Windows/Program Files/Vendor Name/App";
+    const char* kMenu = "/Windows/ProgramData/Microsoft/Windows/Start Menu/Programs/Vendor App/Vendor App.lnk";
+    const char* kKept1 = "/Windows/Windows/Installer/{8A69D345-D564-463C-AFF1-A69D9E530F96}.msi";
+    const char* kKept2 = "/Windows/Windows/Installer/{1B2C3D4E-0000-4111-8222-ABCDEFABCDEF}.msi";
+    const char* kUninstall1 = "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\{8A69D345-D564-463C-AFF1-A69D9E530F96}";
+    const char* kUninstall2 = "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\{1B2C3D4E-0000-4111-8222-ABCDEFABCDEF}";
+    const msi::RegistryRoot machine = msi::RegistryRoot::LocalMachine;
+    auto temp_empty = [&] {
+      UniquePointer<IDirectory> listing;
+      DirectoryEntry e;
+      return fs.open_directory("/Windows/Windows/Temp/WinGet", &listing) != Status::Ok || listing->next(&e) != Status::Ok;
+    };
+    auto runs_with = [&](const char* piece) {
+      size_t count = 0;
+      for (const std::string& line : host.runs) count += line.find(piece) != std::string::npos;
+      return count;
+    };
+
+    // Without a way into the Windows world (no registry, no programs) it is refused, as before.
+    appman::WingetInstaller plain(a, fs, net);
+    CHECK(run(plain.install(*latest, &progress, &detail), appman::Result::NotSupported) && detail.view().contains("Windows Installer package"));
+
+    // Version 1.2.3: downloaded, checked, installed; the manifest's switches set a property (RUNOPTIONAL=yes makes the package run one more program).
+    appman::WingetPackage older(a);
+    CHECK(older.copy_from(*latest) && older.version.assign("1.2.3"));
+    static bool saw_running = false;
+    saw_running = false;
+    progress.changed = [](void*, const appman::Progress& p) { saw_running |= p.running_setup; };
+    CHECK(run(installer.install(older, &progress, &detail), appman::Result::Ok));
+    progress.changed = nullptr;
+    CHECK(saw_running && !progress.running_setup && temp_empty());
+    CHECK(exists(fs, (std::string(kApp) + "/Vendor App.exe").c_str()) && exists(fs, (std::string(kApp) + "/data/big.bin").c_str()) && !exists(fs, (std::string(kApp) + "/extra.txt").c_str()));
+    CHECK(host.registry_text(machine, "SOFTWARE\\Vendor\\App", "InstallDir") == "C:\\Program Files\\Vendor Name\\App\\" && host.registry_text(machine, kUninstall1, "DisplayVersion") == "1.2.3");
+    // The program the package keeps was run with its arguments as words (the quoted one whole), in the folder Windows Installer unpacks such programs to.
+    CHECK(host.runs.size() == 3 && host.runs[0] == "/Windows/Windows/Installer/MSIDoInstall.exe|/install|dir=C:\\Program Files\\Vendor Name\\App\\&name=Vendor App|/quiet");
+    CHECK(runs_with("MSIOptionalRun.exe|/optional") == 1 && runs_with("helper.exe|/by-property") == 1);
+    // A real shortcut in the Start menu, which is what puts the program in the desktop's.
+    ShellLinkInfo link(a);
+    const std::string shortcut = read_ram(fs, kMenu);
+    CHECK(parse_shell_link(data_of(shortcut), &link) && link.target.view().equals("C:\\Program Files\\Vendor Name\\App\\Vendor App.exe") &&
+          link.working_directory.view().equals("C:\\Program Files\\Vendor Name\\App"));
+    List<InstalledApp> menu(a);
+    bool in_menu = false;
+    CHECK(find_installed_apps(fs, a, &menu));
+    for (const InstalledApp& app : static_cast<const List<InstalledApp>&>(menu).view()) in_menu |= app.program.view().equals("/Windows/Program Files/Vendor Name/App/Vendor App.exe");
+    CHECK(in_menu);
+    // The record: what it is, the kept package, what the engine could not do.
+    const std::string record = read_ram(fs, kRecord);
+    CHECK(record.find("PackageIdentifier: Test.MsiApp\nPackageName: Vendor App\nPackageVersion: 1.2.3\nInstallerType: msi\n") == 0 &&
+          record.find("ProductCode: {8A69D345-D564-463C-AFF1-A69D9E530F96}\nPackage: " + std::string(kKept1) + "\n") != std::string::npos &&
+          record.find("Note: its services were not installed\n") != std::string::npos && record.find("Note: a step of the package that is a library (DLL) was skipped: DllStep\n") != std::string::npos);
+    CHECK(exists(fs, kKept1) && installer.installed("Test.MsiApp") && installer.list_installed(&apps) && apps.count() == 1 && apps[0].name.view().equals("Vendor App") &&
+          apps[0].version.view().equals("1.2.3"));
+
+    // Updating to 2.0.0, which is another product: the old one is removed as "being upgraded" (its own program for removal is not run), the new one installed.
+    host.runs.clear();
+    CHECK(run(installer.update(*latest, &progress, &detail), appman::Result::Ok));
+    CHECK(runs_with("/stop") == 0 && runs_with("MSIDoInstall.exe|/install") == 1 && !exists(fs, kKept1) && exists(fs, kKept2) && temp_empty());
+    CHECK(host.registry_text(machine, kUninstall1, "DisplayVersion") == "<none>" && host.registry_text(machine, kUninstall2, "DisplayVersion") == "2.0.0" &&
+          exists(fs, (std::string(kApp) + "/Vendor App.exe").c_str()));
+    CHECK(read_ram(fs, kRecord).find("PackageVersion: 2.0.0\n") != std::string::npos && run(installer.update(*latest, &progress, &detail), appman::Result::UpToDate));
+
+    // Removing: the kept package is run the other way (the program it runs when it goes included), then forgotten.
+    host.runs.clear();
+    CHECK(run(installer.remove("Test.MsiApp", &detail), appman::Result::Ok));
+    CHECK(host.runs.size() == 1 && host.runs[0] == std::string(kApp) + "/helper.exe|/stop|C:\\Program Files\\Vendor Name\\App\\readme.txt");
+    CHECK(!exists(fs, "/Windows/Program Files/Vendor Name") && !exists(fs, kMenu) && !exists(fs, kKept2) && !exists(fs, kRecord) && !installer.installed("Test.MsiApp") &&
+          host.registry_text(machine, kUninstall2, "DisplayVersion") == "<none>" && host.registry_text(machine, "SOFTWARE\\Vendor\\App", "InstallDir") == "<none>");
+
+    // A program of the package that fails: the installation fails with what the engine says, and what was put in place is taken away again.
+    host.exit_code = 1603;
+    CHECK(run(installer.install(*latest, &progress, &detail), appman::Result::SetupFailed) && detail.view().equals("the program of its step DoInstall ended with code 1603"));
+    CHECK(!exists(fs, "/Windows/Program Files/Vendor Name") && !exists(fs, kMenu) && !exists(fs, kRecord) && !exists(fs, kKept2) && temp_empty() && !installer.installed("Test.MsiApp") &&
+          host.registry_text(machine, "SOFTWARE\\Vendor\\App", "InstallDir") == "<none>");
+    host.exit_code = 0;
+    // Cancelled while its program runs.
+    host.cancel_when_run = &progress.cancel;
+    CHECK(run(installer.install(*latest, &progress, &detail), appman::Result::Cancelled) && !exists(fs, "/Windows/Program Files/Vendor Name") && !exists(fs, kRecord) && temp_empty());
+    host.cancel_when_run = nullptr;
+    progress.cancel = false;
+
+    // A record that names a "kept package" somewhere else is not believed (the record is a file anyone can edit); a kept package that is gone means
+    // the product was removed some other way, and it is forgotten.
+    CHECK(run(installer.install(*latest, &progress, &detail), appman::Result::Ok));
+    host.write(kRecord, "PackageIdentifier: Test.MsiApp\nPackageVersion: 2.0.0\nInstallerType: msi\nPackage: /Windows/Windows/Installer/../../Program Files/x.msi\n");
+    host.runs.clear();
+    CHECK(run(installer.remove("Test.MsiApp", &detail), appman::Result::NoUninstaller) && host.runs.empty());
+    host.write(kRecord, std::string("PackageIdentifier: Test.MsiApp\nPackageVersion: 2.0.0\nInstallerType: msi\nProductCode: {1B2C3D4E-0000-4111-8222-ABCDEFABCDEF}\nPackage: ") + kKept2 + "\n");
+    (void)fs.remove(kKept2);
+    CHECK(run(installer.remove("Test.MsiApp", &detail), appman::Result::Ok) && !installer.installed("Test.MsiApp"));
   }
   CHECK(a.live == 0);
 }
@@ -1294,7 +1450,10 @@ static int winget_real(const char* source, bool install, int count, char** ids) 
     RamFileSystem fs(a);
     for (const char* d : {"/Windows", "/Windows/Program Files", "/Windows/ProgramData"}) (void)fs.create_directory(d);
     CurlNetwork net;
-    appman::WingetInstaller installer(a, fs, net);
+    // (a Windows Installer package is installed by this system itself, so it can be tried here: the programs it runs are only listed. A setup program
+    // is a program for the real system, and is not tried.)
+    FakeSetupHost host(fs, a);
+    appman::WingetInstaller installer(a, fs, net, &host);
     for (int i = 0; i < count; ++i) {
       const appman::WingetPackage* package = catalog.find(ids[i]);
       if (!package) { printf("%s: not in the catalog\n", ids[i]); ++failed; continue; }
@@ -1306,6 +1465,10 @@ static int winget_real(const char* source, bool install, int count, char** ids) 
       printf("%s %s \"%s\": %llu installers; %s\n", sv(manifest.id.view()).c_str(), sv(manifest.version.view()).c_str(), sv(manifest.name.view()).c_str(),
              (unsigned long long)manifest.installers.count(), entry ? (sv(entry->type.view()) + " " + sv(entry->architecture.view()) + " " + sv(entry->url.view())).c_str() : sv(why.view()).c_str());
       if (!install || !entry) continue;
+      const bool described = entry->type.view().equals_ignore_case("msi") || entry->type.view().equals_ignore_case("wix");
+      const bool placed = entry->type.view().equals_ignore_case("portable") || entry->type.view().equals_ignore_case("zip");
+      if (!described && !placed) { printf("  (a setup program: not run on this machine)\n"); continue; }
+      host.runs.clear();
       appman::Progress progress;
       const appman::Result r = installer.install(*package, &progress, &detail);
       printf("  install: %s %s (%llu bytes)\n", sv(appman::result_name(r)).c_str(), sv(detail.view()).c_str(), (unsigned long long)progress.done);
@@ -1313,6 +1476,12 @@ static int winget_real(const char* source, bool install, int count, char** ids) 
       List<InstalledApp> apps(a);
       if (find_installed_apps(fs, a, &apps))
         for (const InstalledApp& app : apps.view()) printf("  start menu: %s -> %s\n", sv(app.label.view()).c_str(), sv(app.program.view()).c_str());
+      for (const std::string& line : host.runs) printf("  ran: %s\n", line.c_str());
+      if (described) {
+        const std::string record = read_ram(fs, ("/AppStore/AppMan/Winget/" + sv(package->id.view()) + ".txt").c_str());
+        for (size_t at = record.find("Note: "); at != std::string::npos; at = record.find("Note: ", at + 1)) printf("  %s\n", record.substr(at, record.find('\n', at) - at).c_str());
+        printf("  registry: %zu values\n", host.registry.size());
+      }
       if (installer.remove(package->id.view(), &detail) != appman::Result::Ok) { printf("  remove failed\n"); ++failed; }
     }
   }
@@ -1346,6 +1515,7 @@ int main(int argc, char** argv) {
   test_winget_installer();
   printf("winget: setup programs\n");
   test_winget_setup_programs();
+  test_winget_msi();
   test_real_winget_source();
   printf(g_failed ? "AppManTest: %d of %d checks FAILED\n" : "AppManTest: all %d checks passed\n", g_failed ? g_failed : g_checks, g_checks);
   return g_failed ? 1 : 0;

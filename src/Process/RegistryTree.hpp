@@ -32,6 +32,8 @@ constexpr uint32_t kRegSuccess = 0, kRegNameNotFound = 0xC0000034u, kRegNameColl
                    kRegCannotDelete = 0xC0000121u, kRegNoMemory = 0xC0000017u, kRegInvalidHandle = 0xC0000008u, kRegNoMoreEntries = 0x8000001Au, kRegPathSyntax = 0xC000003Bu;
 constexpr uint32_t kRegMaxNameChars = 255, kRegMaxValueNameChars = 16383, kRegMaxDepth = 512;
 constexpr uint32_t kRegMaxValueBytes = 1u << 20;
+// The key of the one user programs run as (HKEY_CURRENT_USER).
+inline constexpr StringView kRegistryUserKey = "\\REGISTRY\\USER\\S-1-5-21-0-0-0-1000";
 
 struct RegValue {
   explicit RegValue(allocators::IAllocator& allocator) : name(allocator), data(allocator) {}
@@ -59,6 +61,7 @@ class RegistryTree {
   static constexpr uint32_t kRoot = 0;
   // Makes the root "REGISTRY" with the usual hives (MACHINE with HARDWARE, SAM, SECURITY, SOFTWARE and SYSTEM; USER with .DEFAULT and the user of the session).
   RegistryTree(allocators::IAllocator& allocator, uint64_t now);
+  allocators::IAllocator& allocator() { return allocator_; }
 
   // Finds or makes the key named by `path` (components separated by '\'), starting at `base`. A path that starts with '\' is absolute: its first component must be the root's name,
   // and `base` is ignored. NTSTATUS; *created says whether `create` made the last key.

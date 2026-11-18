@@ -28,6 +28,7 @@ g++ -std=c++20 -O1 -g -fsanitize=address,undefined -I src -I tests -w tests/AppM
     src/FileSystem/Ram/*.cpp src/FileSystem/Squash/*.cpp src/FileSystem/Dwarfs/*.cpp src/FileSystem/Iso/*.cpp src/FileSystem/Mount/GraftFileSystem.cpp src/Executable/AppImage.cpp src/Program/AppRunScript.cpp \
     src/Program/ShellTools.cpp src/Program/AppImageLaunch.cpp src/Regex/Regex.cpp src/Process/ProgramEnvironment.cpp src/Media/Zlib.cpp src/Media/Zip.cpp src/Media/Zstd.cpp src/Media/Xxh3.cpp src/Media/Xz.cpp \
     src/Media/Lz4.cpp src/Media/Lzo.cpp src/Crypto/Crypto.cpp src/Desktop/AppMan/AppManCatalog.cpp src/Desktop/AppMan/AppManInstaller.cpp src/Desktop/AppMan/InstallFiles.cpp \
+    src/Msi/MsiDatabase.cpp src/Msi/MsiExpression.cpp src/Msi/MsiInstaller.cpp src/Media/CompoundFile.cpp src/Media/Cabinet.cpp src/Media/Lzx.cpp \
     src/Desktop/AppMan/SqliteReader.cpp src/Desktop/AppMan/WingetCatalog.cpp src/Desktop/AppMan/WingetInstaller.cpp src/Desktop/AppMan/Yaml.cpp src/Desktop/InstalledApps.cpp \
     src/Executable/ExecutableKind.cpp src/Executable/ElfFile.cpp src/Executable/PeFile.cpp $libs -o "$out/AppManTest"
 

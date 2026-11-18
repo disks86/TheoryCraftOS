@@ -120,9 +120,27 @@ with `run_program` and reads the registry's Uninstall keys (`list_uninstall_entr
 package. If the uninstaller is no longer on the disk the package is just forgotten. If the setup program registered no uninstaller, Remove says so;
 choosing Remove a second time forgets the package.
 
+### Packages that are Windows Installer packages (.msi)
+
+A package of the kind `msi` or `wix` is not a program but a description, and the App Manager installs it itself with this system's own
+Windows Installer engine (see WindowsInstaller.md), as `msiexec /i ... /qn` would:
+
+1. Steps 1 and 2 above, then the `.msi` is **downloaded** into `C:\Windows\Temp\WinGet\<identifier>.<version>` and its SHA-256 checked.
+2. Its **execute sequence is run**: files out of the cabinets inside it, registry values, shortcuts, the entry of installed programs, and the
+   programs the package itself runs (the status line says "Running the setup program" meanwhile, and Cancel stops it). The manifest's switches
+   that are `NAME=value` become properties of the installation; the switches of `msiexec` itself (`/qn`, `/norestart`) say nothing this does
+   not do anyway.
+3. The package is **kept** as `C:\Windows\Installer\<product code>.msi`, because removing the product is running the same package the other
+   way. The **record** (`/AppStore/AppMan/Winget/<identifier>.txt`) has `InstallerType: msi`, the product code, the kept package, and a
+   `Note:` line for everything the engine skipped (custom actions that are DLLs, services, environment variables, ...).
+
+If an action fails, what was put in place is taken away again and the message says which step failed. **Update** installs the new version;
+when that is another product (most are), the old one is removed first as "being upgraded". **Remove** runs the kept package as a removal and
+then forgets it. Where a setup program of a kind that is known to run here is offered as well (`inno`, `nullsoft`), that one is taken.
+
 Refused, with the reason in the message:
 
-- `msi`, `wix`, `burn`, `msix`, `appx` and Store packages (there is no Windows Installer here);
+- `burn`, `msix`, `appx` and Store packages; a Windows Installer package whose files are not inside it, or that is for another processor;
 - a setup program that is a 32-bit program of no known kind (`exe`). Many setup programs are 32-bit, even for 64-bit applications - of five
   popular ones looked at, 7-Zip's and Git's are 64-bit, Firefox's, Visual Studio Code's and HandBrake's are 32-bit - and the 32-bit ones of
   Nullsoft (`nullsoft`) and Inno Setup (`inno`) are run (see Wow64.md for what 32-bit programs have here);
@@ -157,8 +175,10 @@ Windows side:
   - the catalog: identifiers, search order, the kept list;
   - manifests, the choice of installer, archive member names, and a shortcut written and read back;
   - setup programs, with a stand-in for the Windows layer: the switches of each kind and of the manifest, success codes, which registry entry
-    is the package's, the record, update, remove, a 32-bit Nullsoft setup program and its uninstaller, and the refusals and failures (a 32-bit Inno Setup program, MSI, no silent switch, a wrong checksum, an exit code,
+    is the package's, the record, update, remove, a 32-bit Nullsoft setup program and its uninstaller, and the refusals and failures (a 32-bit Inno Setup program, a download that is no package, no silent switch, a wrong checksum, an exit code,
     a program that does not start, cancelling, a missing or failing uninstaller, no uninstaller, an edited record);
+  - a Windows Installer package (two versions that are two products): install, the programs it runs, the Start menu, the record and the kept
+    package, update, remove, a failing step and a cancelled one that leave nothing, an edited record;
   - the installer on a RAM file system: a portable program, update (cancelled, done, up to date), an archive of two programs, an archive of
     one, an identifier that is escaped in the address, remove, and the refusals (a setup program, ARM only, a wrong checksum, an archive with
     `../`, a download that is not a program, a forged version list and manifest, a missing download, a cancelled install, a full disk). None of
@@ -176,6 +196,15 @@ Windows side:
   - `jqlang.jq` (a portable program): 16,396 packages in the index, 1 MB installed, "jq (Windows)" in the Start menu, removed;
   - `7zip.7zip` (a 64-bit setup program): downloaded, run with `/S`, "7-Zip File Manager (Windows)" in the Start menu, then removed by its own
     uninstaller.
+
+  - `KeePassXCTeam.KeePassXC` (a Windows Installer package, 69 MB, an LZX cabinet): installed by this system's own engine, "KeePassXC (Windows)"
+    in the Start menu, removed again with the kept package. Its first run found that the kernel's registry makes only the last key of a path;
+    the installer's registry functions now make a key's parents one by one.
+  - `Google.Chrome` is a Windows Installer package that only wraps Google's updater: the engine unpacks `updater.exe` and runs it with the
+    command line the package builds, as `msiexec` would. In QEMU (with the checksum check off for the experiment, because Google had already
+    replaced the file the manifest names) that 32-bit program stops with an access violation in the Windows layer, and the installation fails
+    with "the program of its step DoInstall ended with code 3221225477". Chrome does not install yet; what is missing is in the Windows layer
+    (see Wow64.md), not in the package handling.
 
   The 7-Zip run found two faults that are fixed: this system's `msvcrt.dll` did not export the data `_fmode`, `_commode` and `_acmdln` that the
   startup code of older programs imports (the setup program crashed at once), and a program that an ended program had started went on using what
@@ -206,12 +235,17 @@ Linux side:
 
 Windows:
 
-- **Setup programs only where the Windows layer can run them.** Of the 32-bit ones Nullsoft's and Inno Setup's; no MSI, MSIX or Burn (see above). What a setup
+- **Windows Installer packages are installed as far as their tables say** (WindowsInstaller.md): no DLL or script custom actions, services,
+  environment variables, COM registration or file types. A package that is a wrapper around a setup program runs that program, and whether
+  it works is up to the Windows layer.
+- **Setup programs only where the Windows layer can run them.** Of the 32-bit ones Nullsoft's and Inno Setup's; no MSIX or Burn (see above). What a setup
   program wrote to the registry is gone after a restart (the registry is kept in memory), so a program that needs its registry settings may not
   start then; the App Manager's own record, and with it Remove, is kept.
 - **A setup program's shortcuts and files are its own business.** The App Manager does not check what it installed, and a setup program that
   shows a window although asked not to waits for the user.
-- **A few packages have been through QEMU** (see Tests): a portable program (jq), a 64-bit setup program (7-Zip), 32-bit Nullsoft ones
+- **A download that changed is refused.** Some vendors (Google for Chrome, for one) replace the file behind a fixed address with every release,
+  and until winget's manifest follows, the SHA-256 does not match and the package cannot be installed - by the real winget either.
+- **A few packages have been through QEMU** (see Tests): a Windows Installer package (KeePassXC), a portable program (jq), a 64-bit setup program (7-Zip), 32-bit Nullsoft ones
   (qBittorrent) and 32-bit Inno Setup ones (WinMerge, TreeSize Free). That is
   four setup programs out of thousands; the App Manager's window has not been clicked through there, and no installed program has been
   started from the Start menu there.

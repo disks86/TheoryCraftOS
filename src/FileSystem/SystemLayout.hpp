@@ -78,6 +78,9 @@ inline constexpr const char* kWindowsWingetPackages = "/Windows/Program Files/Wi
 // Windows keeps that, does not outlast a restart here), and where it downloads a setup program to before running it (winget's %TEMP%\WinGet).
 inline constexpr const char* kWingetRecords = "/AppStore/AppMan/Winget";
 inline constexpr const char* kWindowsWingetTemp = "/Windows/Windows/Temp/WinGet";
+// Where Windows Installer keeps the packages (.msi) of the products it installed, to change or remove them with later (C:\Windows\Installer), and
+// unpacks the programs a package runs while it installs. The App Manager's Windows Installer engine (src/Msi) does the same.
+inline constexpr const char* kWindowsInstallerCache = "/Windows/Windows/Installer";
 
 // The Thunderbolt driver's one-time keys, one file of 32 bytes per device named by its UUID in hex (the "Thunderbolt" application's folder in the AppStore).
 inline constexpr const char* kThunderboltKeys = "/AppStore/Thunderbolt/Keys";

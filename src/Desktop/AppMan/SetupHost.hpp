@@ -19,14 +19,17 @@
 #pragma once
 #include <stdint.h>
 #include "Allocators/IAllocator.hpp"
+#include "Msi/MsiInstaller.hpp"
 #include "ObjectContainer/List.hpp"
 #include "Utility/ArrayView.hpp"
+#include "Utility/ByteBuffer.hpp"
 #include "Utility/String.hpp"
 #include "Utility/StringView.hpp"
 #include "Utility/UniquePointer.hpp"
 
 // What the App Manager needs of the Windows world to install a package that comes as a setup program (WingetInstaller.hpp): running the program and
-// waiting for it, and the list of installed programs that setup programs keep in the registry, which is where a program's uninstaller is found.
+// waiting for it, and the list of installed programs that setup programs keep in the registry, which is where a program's uninstaller is found. A
+// Windows Installer package (.msi) is installed by this system itself and needs the registry to write the package's values into.
 namespace desktop::appman {
 
 // An entry of the registry's Uninstall keys (HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\<key>, the same under WOW6432Node, and each user's).
@@ -46,6 +49,18 @@ class ISetupHost {
   [[nodiscard]] virtual bool run(StringView program, ArrayView<const StringView> arguments, const bool* cancel, uint32_t* exit_code, String* message) = 0;
   // The Uninstall entries the registry has now. False if memory ran out.
   [[nodiscard]] virtual bool uninstall_entries(List<UniquePointer<UninstallEntry>>* entries) = 0;
+  // The registry itself, for a package this program installs by its description (a Windows Installer package, Msi/MsiInstaller.hpp, whose IHost these are
+  // the registry part of). A host without a registry leaves them as they are: nothing is written and nothing is found.
+  [[nodiscard]] virtual bool registry_set(msi::RegistryRoot root, StringView key, StringView name, uint32_t type, ConstByteView data) {
+    (void)root, (void)key, (void)name, (void)type, (void)data;
+    return false;
+  }
+  [[nodiscard]] virtual bool registry_get(msi::RegistryRoot root, StringView key, StringView name, uint32_t* type, ByteBuffer* data) {
+    (void)root, (void)key, (void)name, (void)type, (void)data;
+    return false;
+  }
+  virtual void registry_delete_value(msi::RegistryRoot root, StringView key, StringView name) { (void)root, (void)key, (void)name; }
+  virtual void registry_delete_key(msi::RegistryRoot root, StringView key, bool only_if_empty) { (void)root, (void)key, (void)only_if_empty; }
 
  protected:
   ~ISetupHost() = default;

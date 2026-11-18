@@ -972,4 +972,68 @@ bool list_uninstall_entries(allocators::IAllocator& allocator, List<UniquePointe
   return true;
 }
 
+namespace {
+// With the lock held: the full name of `key` under `hive`.
+bool hive_path(RegistryHive hive, StringView key, String* out) {
+  static constexpr StringView kRoots[] = {"\\REGISTRY\\MACHINE\\SOFTWARE\\Classes", kRegistryUserKey, "\\REGISTRY\\MACHINE", "\\REGISTRY\\USER"};
+  const uint32_t index = static_cast<uint32_t>(hive);
+  if (index >= 4 || !out->assign(kRoots[index])) return false;
+  while (key.starts_with('\\')) key = key.without_prefix(1);
+  while (key.ends_with('\\')) key = key.without_suffix(1);
+  return key.empty() || (out->push_back('\\') && out->append(key));
+}
+}  // namespace
+
+bool registry_set_value(allocators::IAllocator& allocator, RegistryHive hive, StringView key, StringView name, uint32_t type, ConstByteView data) {
+  Guard guard;
+  if (!g_tree) g_tree = new (static_cast<void*>(g_storage)) RegistryTree(allocator, kUnixToNt);
+  String path(allocator);
+  uint32_t id = 0;
+  bool created = false;
+  if (!hive_path(hive, key, &path)) return false;
+  // The tree makes only the last key of a path, so the keys are made one level at a time ("\\REGISTRY" itself is there).
+  const StringView full = path.view();
+  for (uint64_t end = full.find('\\', 1); end != StringView::npos;) {
+    end = full.find('\\', end + 1);
+    if (g_tree->resolve(RegistryTree::kRoot, end == StringView::npos ? full : full.first(end), true, kUnixToNt, &id, &created) != kRegSuccess) return false;
+  }
+  return g_tree->set_value(id, name, type, data, kUnixToNt) == kRegSuccess;
+}
+
+bool registry_get_value(RegistryHive hive, StringView key, StringView name, uint32_t* type, ByteBuffer* data) {
+  Guard guard;
+  if (!g_tree) return false;
+  String path(data->allocator());
+  uint32_t id = 0;
+  bool created = false;
+  if (!hive_path(hive, key, &path) || g_tree->resolve(RegistryTree::kRoot, path.view(), false, 0, &id, &created) != kRegSuccess) return false;
+  const RegValue* value = g_tree->find_value(id, name);
+  if (!value) return false;
+  *type = value->type;
+  data->clear();
+  return data->append(value->data.view());
+}
+
+void registry_delete_value(RegistryHive hive, StringView key, StringView name) {
+  Guard guard;
+  if (!g_tree) return;
+  String path(g_tree->allocator());
+  uint32_t id = 0;
+  bool created = false;
+  if (hive_path(hive, key, &path) && g_tree->resolve(RegistryTree::kRoot, path.view(), false, 0, &id, &created) == kRegSuccess) (void)g_tree->delete_value(id, name, kUnixToNt);
+}
+
+void registry_delete_key(RegistryHive hive, StringView key, bool only_if_empty) {
+  Guard guard;
+  if (!g_tree || key.empty()) return;      // (never a whole root)
+  String path(g_tree->allocator());
+  uint32_t id = 0;
+  bool created = false;
+  if (!hive_path(hive, key, &path) || g_tree->resolve(RegistryTree::kRoot, path.view(), false, 0, &id, &created) != kRegSuccess) return;
+  const RegKey* found = g_tree->key(id);
+  if (!found) return;
+  if (!only_if_empty) (void)g_tree->delete_tree(id);
+  else if (found->values.count() == 0) (void)g_tree->delete_key(id);      // (which refuses a key that has keys under it)
+}
+
 }  // namespace process::windowsabi

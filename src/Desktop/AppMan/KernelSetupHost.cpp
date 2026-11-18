@@ -85,4 +85,25 @@ bool KernelSetupHost::uninstall_entries(List<UniquePointer<UninstallEntry>>* ent
   return true;
 }
 
+namespace {
+process::windowsabi::RegistryHive hive_of(msi::RegistryRoot root) {
+  switch (root) {
+    case msi::RegistryRoot::ClassesRoot: return process::windowsabi::RegistryHive::ClassesRoot;
+    case msi::RegistryRoot::CurrentUser: return process::windowsabi::RegistryHive::CurrentUser;
+    case msi::RegistryRoot::Users: return process::windowsabi::RegistryHive::Users;
+    case msi::RegistryRoot::LocalMachine: break;
+  }
+  return process::windowsabi::RegistryHive::LocalMachine;
+}
+}  // namespace
+
+bool KernelSetupHost::registry_set(msi::RegistryRoot root, StringView key, StringView name, uint32_t type, ConstByteView data) {
+  return process::windowsabi::registry_set_value(allocator_, hive_of(root), key, name, type, data);
+}
+bool KernelSetupHost::registry_get(msi::RegistryRoot root, StringView key, StringView name, uint32_t* type, ByteBuffer* data) {
+  return process::windowsabi::registry_get_value(hive_of(root), key, name, type, data);
+}
+void KernelSetupHost::registry_delete_value(msi::RegistryRoot root, StringView key, StringView name) { process::windowsabi::registry_delete_value(hive_of(root), key, name); }
+void KernelSetupHost::registry_delete_key(msi::RegistryRoot root, StringView key, bool only_if_empty) { process::windowsabi::registry_delete_key(hive_of(root), key, only_if_empty); }
+
 }  // namespace desktop::appman

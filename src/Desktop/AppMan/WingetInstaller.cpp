@@ -25,6 +25,8 @@
 #include "FileSystem/SystemLayout.hpp"
 #include "Media/Zip.hpp"
 #include "Media/Zlib.hpp"
+#include "Msi/MsiDatabase.hpp"
+#include "Msi/MsiInstaller.hpp"
 #include "Utility/ByteBuffer.hpp"
 #include "Utility/ByteStream.hpp"
 #include "Utility/Move.hpp"
@@ -187,6 +189,20 @@ bool is_setup(const WingetInstallerEntry& entry) {
   return equals_folded(entry.type.view(), "exe") && !entry.silent.empty();
 }
 
+// A Windows Installer package: not a program to run but a description this system installs by (Msi/MsiInstaller.hpp).
+bool is_msi(const WingetInstallerEntry& entry) {
+  if (!web_address(entry.url.view()) || entry.sha256.size() != 64) return false;
+  return equals_folded(entry.type.view(), "msi") || equals_folded(entry.type.view(), "wix");
+}
+
+// "{8A69D345-D564-463C-AFF1-A69D9E530F96}": a product code, which names the kept package's file.
+bool product_code(StringView text) {
+  if (text.size() != 38 || text[0] != '{' || text[37] != '}') return false;
+  for (const char c : text.substr(1, 36))
+    if (!((c >= '0' && c <= '9') || (c >= 'A' && c <= 'F') || (c >= 'a' && c <= 'f') || c == '-')) return false;
+  return true;
+}
+
 // The last part of a registry key's name.
 StringView key_leaf(StringView key) {
   const uint64_t slash = key.rfind('\\');
@@ -205,11 +221,65 @@ int architecture_rank(StringView architecture) {
 
 // What is remembered of a package a setup program installed.
 struct WingetInstaller::SetupRecord {
-  explicit SetupRecord(allocators::IAllocator& allocator) : type(allocator), uninstall(allocator) {}
+  explicit SetupRecord(allocators::IAllocator& allocator) : type(allocator), uninstall(allocator), package(allocator), product(allocator) {}
   String type;            // InstallerType
   String uninstall;       // the uninstall command line ("" if the setup program registered none)
   bool quiet = false;     // it is the registry's QuietUninstallString: no switches are added
+  // Of a Windows Installer package:
+  String package;         // the kept package (a file in layout::kWindowsInstallerCache), which removes the product ("" if it could not be kept)
+  String product;         // its product code
 };
+
+namespace {
+
+// The Windows world as the Windows Installer engine needs it, out of what the App Manager has: the setup host (programs and the registry) and the
+// file system (shortcuts).
+class MsiHost final : public msi::IHost {
+ public:
+  MsiHost(allocators::IAllocator& allocator, filesystem::IFileSystem& files, ISetupHost& setup, const bool* cancel) : allocator_(allocator), files_(files), setup_(setup), cancel_(cancel) {}
+
+  [[nodiscard]] bool run(StringView program, StringView arguments, StringView working_folder, uint32_t* exit_code, String* message) override {
+    (void)working_folder;      // (a program is started in its own folder)
+    List<String> words(allocator_);
+    List<StringView> views(allocator_);
+    bool ok = WingetInstaller::split_command_line(allocator_, arguments, nullptr, &words);
+    for (const String& word : static_cast<const List<String>&>(words).view()) ok = ok && views.push_back(word.view());
+    if (!ok) {
+      message->assign("there is not enough memory");
+      return false;
+    }
+    return setup_.run(program, static_cast<const List<StringView>&>(views).view(), cancel_, exit_code, message);
+  }
+  [[nodiscard]] bool registry_set(msi::RegistryRoot root, StringView key, StringView name, uint32_t type, ConstByteView data) override { return setup_.registry_set(root, key, name, type, data); }
+  [[nodiscard]] bool registry_get(msi::RegistryRoot root, StringView key, StringView name, uint32_t* type, ByteBuffer* data) override { return setup_.registry_get(root, key, name, type, data); }
+  void registry_delete_value(msi::RegistryRoot root, StringView key, StringView name) override { setup_.registry_delete_value(root, key, name); }
+  void registry_delete_key(msi::RegistryRoot root, StringView key, bool only_if_empty) override { setup_.registry_delete_key(root, key, only_if_empty); }
+  [[nodiscard]] bool write_shortcut(StringView link, StringView target, StringView working_folder) override {
+    ByteBuffer bytes(allocator_);
+    return write_shell_link(target, working_folder, &bytes) && write_bytes(files_, link, bytes.view());
+  }
+
+ private:
+  allocators::IAllocator& allocator_;
+  filesystem::IFileSystem& files_;
+  ISetupHost& setup_;
+  const bool* cancel_;
+};
+
+Result result_of(msi::Outcome outcome) {
+  switch (outcome) {
+    case msi::Outcome::Ok: return Result::Ok;
+    case msi::Outcome::NotSupported: return Result::NotSupported;
+    case msi::Outcome::Refused:
+    case msi::Outcome::Failed: return Result::SetupFailed;
+    case msi::Outcome::FileError: return Result::FileError;
+    case msi::Outcome::Cancelled: return Result::Cancelled;
+    case msi::Outcome::OutOfMemory: break;
+  }
+  return Result::OutOfMemory;
+}
+
+}  // namespace
 
 struct WingetInstaller::Program {
   explicit Program(allocators::IAllocator& allocator) : path(allocator), label(allocator) {}
@@ -347,12 +417,13 @@ const WingetInstallerEntry* WingetInstaller::choose_installer(const WingetManife
   for (const UniquePointer<WingetInstallerEntry>& entry : manifest.installers.view()) {
     const int architecture = architecture_rank(entry->architecture.view());
     if (architecture < 0) continue;
-    const bool native = (kinds & kNative) && is_native(*entry), setup = (kinds & kSetup) && is_setup(*entry);
-    if (!native && !setup) {
+    const bool native = (kinds & kNative) && is_native(*entry), setup = (kinds & kSetup) && is_setup(*entry), package = (kinds & kSetup) && is_msi(*entry);
+    if (!native && !setup && !package) {
       if (!other) other = entry.get();
       continue;
     }
-    const int rank = (native ? 0 : 10) + architecture;
+    // (a setup program of a kind that is known to run here before a package this system installs by its description, which may ask for more than it does)
+    const int rank = (native ? 0 : setup ? 10 : 20) + architecture;
     if (!best || rank < best_rank) best = entry.get(), best_rank = rank;
   }
   if (best) return best;
@@ -362,7 +433,7 @@ const WingetInstallerEntry* WingetInstaller::choose_installer(const WingetManife
     (void)why->assign("this version does not come as a setup program, as the installed one did; remove it and install it again");
   } else if ((kinds & kSetup) && equals_folded(other->type.view(), "exe")) {
     (void)why->assign("its setup program has no way to run without asking questions");
-  } else if (is_setup(*other)) {
+  } else if (is_setup(*other) || is_msi(*other)) {
     (void)(why->assign("it is installed by ") && why->append(kind_name(other->type.view())) && why->append(kinds & kNative ? ", which cannot be run here yet" : ", not put in place as the installed version was; remove it and install it again"));
   } else {
     const StringView type = equals_folded(other->type.view(), "zip") && !other->nested_type.empty() && !equals_folded(other->nested_type.view(), "portable") ? other->nested_type.view() : other->type.view();
@@ -463,6 +534,14 @@ bool WingetInstaller::read_setup_record(StringView id, WingetInstalled* app, Set
     else if (key.equals("InstallerType")) ok = record->type.assign(value);
     else if (key.equals("Uninstall")) ok = record->uninstall.assign(value);
     else if (key.equals("QuietUninstall")) record->quiet = value.equals("yes");
+    else if (key.equals("ProductCode") && product_code(value)) ok = record->product.assign(value);
+    else if (key.equals("Package")) {
+      // (a file in the folder of kept packages and nothing else: the record is a file anyone can edit)
+      const StringView folder(filesystem::layout::kWindowsInstallerCache);
+      if (value.starts_with(folder) && value.size() > folder.size() + 1 && value[folder.size()] == '/' && !value.substr(folder.size() + 1).contains('/') && value.ends_with(".msi") &&
+          !value.contains(".."))
+        ok = record->package.assign(value);
+    }
   }
   return ok && named;
 }
@@ -599,7 +678,8 @@ Result WingetInstaller::install(const WingetPackage& package, Progress* progress
   const uint32_t kinds = was_native ? uint32_t{kNative} : was_setup ? can_run : kNative | can_run;
   const WingetInstallerEntry* entry = choose_installer(manifest, kinds, detail);
   if (!entry) return Result::NotSupported;
-  return is_native(*entry) ? place(manifest, *entry, was_native, progress, detail) : place_setup(manifest, *entry, progress, detail);
+  if (is_native(*entry)) return place(manifest, *entry, was_native, progress, detail);
+  return is_msi(*entry) ? place_msi(manifest, *entry, progress, detail) : place_setup(manifest, *entry, progress, detail);
 }
 
 Result WingetInstaller::update(const WingetPackage& package, Progress* progress, String* detail) {
@@ -1009,10 +1089,182 @@ Result WingetInstaller::place_setup(const WingetManifest& manifest, const Winget
   return finish(Result::Ok);
 }
 
+// A package that is a Windows Installer package: downloaded, checked, and installed by this system from its description. The package is kept (as
+// Windows keeps it) because removing the product is running the same package the other way.
+Result WingetInstaller::place_msi(const WingetManifest& manifest, const WingetInstallerEntry& entry, Progress* progress, String* detail) {
+  if (!setup_) return Result::NotSupported;
+  const StringView id = manifest.id.view();
+  String folder(allocator_), version(allocator_), name(allocator_), package(allocator_), record_path(allocator_);
+  if (!setup_record_path(id, &record_path)) return Result::InvalidName;
+  if (!safe_name(manifest.version.view(), &version)) return Result::OutOfMemory;
+  StringView leaf = entry.url.view();
+  const uint64_t query = leaf.find('?');
+  if (query != StringView::npos) leaf = leaf.first(query);
+  if (!safe_name(leaf_of(leaf), &name) || (name.empty() && !name.assign("package"))) return Result::OutOfMemory;
+  if ((name.size() < 4 || !equals_folded(name.view().substr(name.size() - 4), ".msi")) && !name.append(".msi")) return Result::OutOfMemory;
+  if (!join(&folder, filesystem::layout::kWindowsWingetTemp, "/", id, ".") || !folder.append(version.view()) || !join(&package, folder.view(), "/", name.view())) return Result::OutOfMemory;
+  if (!make_folders(files_, folder.view())) {
+    detail->assign(folder.view());
+    return Result::FileError;
+  }
+  auto finish = [&](Result result) {
+    if (progress) __atomic_store_n(&progress->running_setup, false, __ATOMIC_RELAXED);
+    (void)remove_tree(files_, allocator_, folder.view());
+    return result;
+  };
+
+  crypto::Hasher hasher(crypto::HashKind::Sha256);
+  const Result fetched = download_to_file(files_, network_, entry.url.view(), package.view(), progress, &hasher, detail);
+  if (fetched != Result::Ok) return finish(fetched);
+  uint8_t hash[32];
+  hasher.finish(hash);
+  String hex(allocator_);
+  if (!append_hex(&hex, ConstByteView(hash))) return finish(Result::OutOfMemory);
+  if (!equals_folded(hex.view(), entry.sha256.view())) {
+    detail->assign(entry.url.view());
+    return finish(Result::BadChecksum);
+  }
+
+  // The properties the manifest's switches set (NAME=value; the switches of msiexec itself, /qn and the like, say nothing this system does not do anyway).
+  List<String> words(allocator_), more(allocator_);
+  if (!split_command_line(allocator_, entry.silent.view(), nullptr, &words) || !split_command_line(allocator_, entry.custom.view(), nullptr, &more)) return finish(Result::OutOfMemory);
+  List<StringView> properties(allocator_);
+  auto add_properties = [&](const List<String>& list) {
+    for (const String& word : list.view())
+      if (!word.view().starts_with('/') && !word.view().starts_with('-') && word.view().contains('=') && !properties.push_back(word.view())) return false;
+    return true;
+  };
+  if (!add_properties(words) || !add_properties(more)) return finish(Result::OutOfMemory);
+
+  const bool* cancel = progress ? &progress->cancel : nullptr;
+  MsiHost host(allocator_, files_, *setup_, cancel);
+  String code(allocator_), windows_package(allocator_), notes(allocator_);
+  if (!windows_path(package.view(), &windows_package)) return (Result::OutOfMemory);
+  // (in a function of its own: the package's file is closed again before anything is done with the file itself)
+  auto run_package = [&]() -> Result {
+    UniquePointer<filesystem::IFile> file;
+    if (files_.open_file(package.view(), filesystem::OpenMode::Read, &file) != Status::Ok) {
+      detail->assign(package.view());
+      return (Result::FileError);
+    }
+    FileZipSource source(*file);
+    msi::Database database(allocator_, source);
+    if (!database.open()) {
+      detail->assign("the download is not a Windows Installer package, or is damaged");
+      return (Result::NotAnAppImage);
+    }
+    const msi::Table* own = database.table("Property");
+    const uint32_t code_row = own ? own->find("Property", "ProductCode") : msi::kNoColumn;
+    if (code_row != msi::kNoColumn && !code.assign(own->text(code_row, "Value"))) return (Result::OutOfMemory);
+
+    // An older version that is another product goes first (its package says how), as "being upgraded": what it keeps for the new one stays.
+    WingetInstalled old(allocator_);
+    SetupRecord old_record(allocator_);
+    if (read_setup_record(id, &old, &old_record) && !old_record.package.empty() && !equals_folded(old_record.product.view(), code.view())) {
+      String ignored(allocator_);
+      (void)run_msi_removal(old_record.package.view(), code.view(), &ignored);
+      (void)files_.remove(old_record.package.view());
+    }
+
+    if (progress) {
+      __atomic_store_n(&progress->running_setup, true, __ATOMIC_RELAXED);
+      if (progress->changed) progress->changed(progress->context, *progress);
+    }
+    msi::Installer installer(allocator_, files_, host, database);
+    msi::Options options;
+    options.properties = static_cast<const List<StringView>&>(properties).view();
+    options.package_path = windows_package.view();
+    options.cancel = cancel;
+    const msi::Outcome outcome = installer.run(options, detail);
+    if (outcome != msi::Outcome::Ok) {
+      // What was put in place before it stopped is taken away again with the same package (not if the package was refused: nothing was done).
+      if (outcome != msi::Outcome::NotSupported && outcome != msi::Outcome::Refused) {
+        msi::Installer undo(allocator_, files_, host, database);
+        msi::Options removal;
+        removal.remove = true;
+        removal.undo = true;
+        removal.package_path = windows_package.view();
+        String ignored(allocator_);
+        (void)undo.run(removal, &ignored);
+      }
+      return (result_of(outcome));
+    }
+    for (const String& note : installer.notes())
+      if (!notes.append("Note: ") || !notes.append(note.view()) || !notes.push_back('\n')) return (Result::OutOfMemory);
+    return Result::Ok;
+  };
+  const Result ran = run_package();
+  if (ran != Result::Ok) return finish(ran);
+
+  // The package is kept under its product code, and the record says where.
+  String kept(allocator_);
+  if (product_code(code.view()) && make_folders(files_, filesystem::layout::kWindowsInstallerCache) && join(&kept, filesystem::layout::kWindowsInstallerCache, "/", code.view(), ".msi")) {
+    (void)files_.remove(kept.view());
+    if (files_.rename(package.view(), kept.view()) != Status::Ok) kept.clear();
+  } else {
+    kept.clear();
+  }
+  String record(allocator_);
+  if (!join(&record, "PackageIdentifier: ", id, "\nPackageName: ", manifest.name.view()) || !record.append("\nPackageVersion: ") || !record.append(manifest.version.view()) ||
+      !record.append("\nInstallerType: msi\nInstallerUrl: ") || !record.append(entry.url.view()) || !record.push_back('\n'))
+    return finish(Result::OutOfMemory);
+  if (!kept.empty() && (!record.append("ProductCode: ") || !record.append(code.view()) || !record.append("\nPackage: ") || !record.append(kept.view()) || !record.push_back('\n')))
+    return finish(Result::OutOfMemory);
+  if (!record.append(notes.view())) return finish(Result::OutOfMemory);
+  String asked(allocator_);
+  if (join(&asked, record_path.view(), ".asked")) (void)files_.remove(asked.view());
+  if (!make_folders(files_, filesystem::layout::kWingetRecords) || !write_text_file(files_, record_path.view(), record.view())) {
+    detail->assign(record_path.view());
+    return finish(Result::FileError);
+  }
+  return finish(Result::Ok);
+}
+
+// Runs the kept package at `package` the other way: the product it installed is removed. `upgrading`: the product code of the version that replaces it.
+Result WingetInstaller::run_msi_removal(StringView package, StringView upgrading, String* detail) {
+  if (!setup_) {
+    detail->assign("its package cannot be run here");
+    return Result::NotSupported;
+  }
+  UniquePointer<filesystem::IFile> file;
+  if (files_.open_file(package, filesystem::OpenMode::Read, &file) != Status::Ok) {
+    detail->assign(package);
+    return Result::FileError;
+  }
+  FileZipSource source(*file);
+  msi::Database database(allocator_, source);
+  if (!database.open()) {
+    detail->assign("the package that was kept to remove it with cannot be read");
+    return Result::SetupFailed;
+  }
+  MsiHost host(allocator_, files_, *setup_, nullptr);
+  msi::Installer installer(allocator_, files_, host, database);
+  msi::Options options;
+  String windows_package(allocator_);
+  if (!windows_path(package, &windows_package)) return Result::OutOfMemory;
+  options.remove = true;
+  options.package_path = windows_package.view();
+  options.upgrading_product = upgrading;
+  return result_of(installer.run(options, detail));
+}
+
 // Runs the uninstaller the setup program registered, then forgets the package.
 Result WingetInstaller::remove_setup(StringView id, const SetupRecord& record, String* detail) {
   String record_path(allocator_), windows_program(allocator_), program(allocator_);
   if (!setup_record_path(id, &record_path)) return Result::InvalidName;
+  if (equals_folded(record.type.view(), "msi") && !record.package.empty()) {
+    // A Windows Installer package: the kept package removes the product. (One that is gone was removed some other way: the product is forgotten.)
+    if (exists(files_, record.package.view())) {
+      const Result removed = run_msi_removal(record.package.view(), StringView(), detail);
+      if (removed != Result::Ok) return removed;
+      (void)files_.remove(record.package.view());
+    }
+    if (files_.remove(record_path.view()) != Status::Ok) {
+      detail->assign(record_path.view());
+      return Result::FileError;
+    }
+    return Result::Ok;
+  }
   if (record.uninstall.empty()) {
     detail->assign("remove it with its own means, then choose Remove again");
     // (asked a second time, the package is forgotten: there is nothing else this program can do)

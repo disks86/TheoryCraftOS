@@ -651,6 +651,9 @@ add_executable(BOOTX64
   src/Desktop/AppMan/Yaml.cpp
   src/Desktop/AppMan/HttpNetwork.cpp
   src/Desktop/AppMan/KernelSetupHost.cpp
+  src/Msi/MsiDatabase.cpp
+  src/Msi/MsiExpression.cpp
+  src/Msi/MsiInstaller.cpp
   src/Desktop/TodoStore.cpp
   src/Desktop/FileProperties.cpp
   src/Desktop/CopyProgressDialog.cpp
@@ -749,6 +752,9 @@ add_executable(BOOTX64
   src/Media/ImageCodecs.cpp
   src/Media/Zlib.cpp
   src/Media/Zip.cpp
+  src/Media/CompoundFile.cpp
+  src/Media/Cabinet.cpp
+  src/Media/Lzx.cpp
   src/Media/Zstd.cpp
   src/Media/Xxh3.cpp
   src/Media/Xz.cpp

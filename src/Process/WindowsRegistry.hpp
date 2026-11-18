@@ -18,6 +18,7 @@
 #pragma once
 #include <stdint.h>
 #include "ObjectContainer/List.hpp"
+#include "Utility/ByteBuffer.hpp"
 #include "Utility/String.hpp"
 #include "Utility/UniquePointer.hpp"
 #include "Process/Process.hpp"
@@ -70,5 +71,18 @@ struct RegistryUninstallEntry {
 };
 // Appends them to `out`. False only if memory ran out. Before any Windows program has run there is no registry, and nothing is appended.
 [[nodiscard]] bool list_uninstall_entries(allocators::IAllocator& allocator, List<UniquePointer<RegistryUninstallEntry>>* out);
+
+// The registry for kernel code that installs Windows programs itself (the App Manager's Windows Installer engine, src/Msi): values read, written and
+// deleted by the path of their key under one of the roots a program names (HKEY_CLASSES_ROOT is the machine's SOFTWARE\Classes, HKEY_CURRENT_USER the
+// key of the one user programs run as). Text is UTF-8 here; `data` is what the registry keeps (text as UTF-16LE with its terminator). Not system services.
+enum class RegistryHive : uint8_t { ClassesRoot, CurrentUser, LocalMachine, Users };
+// Sets a value, making its key (and the registry itself, if no program has run yet: with `allocator`, which must be the kernel's own, as the registry
+// lives as long as the system). False if the name or the path is not valid, or memory ran out.
+[[nodiscard]] bool registry_set_value(allocators::IAllocator& allocator, RegistryHive hive, StringView key, StringView name, uint32_t type, ConstByteView data);
+// False if there is no registry, no such key or no such value.
+[[nodiscard]] bool registry_get_value(RegistryHive hive, StringView key, StringView name, uint32_t* type, ByteBuffer* data);
+void registry_delete_value(RegistryHive hive, StringView key, StringView name);
+// Deletes the key with everything under it; with `only_if_empty`, only a key that has no values and no keys under it.
+void registry_delete_key(RegistryHive hive, StringView key, bool only_if_empty);
 
 }  // namespace process::windowsabi

@@ -32,6 +32,10 @@ class KernelSetupHost final : public ISetupHost {
 
   [[nodiscard]] bool run(StringView program, ArrayView<const StringView> arguments, const bool* cancel, uint32_t* exit_code, String* message) override;
   [[nodiscard]] bool uninstall_entries(List<UniquePointer<UninstallEntry>>* entries) override;
+  [[nodiscard]] bool registry_set(msi::RegistryRoot root, StringView key, StringView name, uint32_t type, ConstByteView data) override;
+  [[nodiscard]] bool registry_get(msi::RegistryRoot root, StringView key, StringView name, uint32_t* type, ByteBuffer* data) override;
+  void registry_delete_value(msi::RegistryRoot root, StringView key, StringView name) override;
+  void registry_delete_key(msi::RegistryRoot root, StringView key, bool only_if_empty) override;
 
  private:
   allocators::IAllocator& allocator_;
