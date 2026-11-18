@@ -26,7 +26,6 @@ using V = SuperIoVendor;
 using C = SuperIoChip;
 constexpr SuperIoSupport kYes = SuperIoSupport::Supported, kNo = SuperIoSupport::IdentifiedOnly;
 constexpr uint8_t kNctDevice = 0x0B, kIteDevice = 0x04, kFintekDevice = 0x04;
-constexpr const char* kNctEc = "EC-style interface (pages through base+4..7), not implemented";
 
 // Ids as Linux's drivers know them. Nuvoton parts keep a revision in the low bits: NCT6796 and NCT6798 differ only in bit 3, so those are matched
 // with 0xFFF8 (as nct6775 does) and the NCT668x with 0xFFF0 (as nct6683 does).
@@ -42,9 +41,9 @@ constexpr SuperIoChipInfo kChips[] = {
     {0xD450, 0xFFF8, V::Nuvoton, C::Nct6797, "NCT6797", kNctDevice, kYes, true, nullptr},
     {0xD428, 0xFFF8, V::Nuvoton, C::Nct6798, "NCT6798", kNctDevice, kYes, true, nullptr},
     {0xD800, 0xFFF8, V::Nuvoton, C::Nct6799, "NCT6799", kNctDevice, kYes, true, nullptr},
-    {0xC730, 0xFFF0, V::Nuvoton, C::Nct6683, "NCT6683", kNctDevice, kNo, false, kNctEc},
-    {0xD440, 0xFFF0, V::Nuvoton, C::Nct6686, "NCT6686", kNctDevice, kNo, false, kNctEc},
-    {0xD590, 0xFFF0, V::Nuvoton, C::Nct6687, "NCT6687", kNctDevice, kNo, false, kNctEc},
+    {0xC730, 0xFFF0, V::Nuvoton, C::Nct6683, "NCT6683", kNctDevice, kYes, false, nullptr},
+    {0xD440, 0xFFF0, V::Nuvoton, C::Nct6686, "NCT6686", kNctDevice, kYes, false, nullptr},
+    {0xD590, 0xFFF0, V::Nuvoton, C::Nct6687, "NCT6687", kNctDevice, kYes, false, nullptr},
 
     {0x8620, 0xFFFF, V::Ite, C::It8620, "IT8620", kIteDevice, kYes, false, nullptr},
     {0x8622, 0xFFFF, V::Ite, C::It8622, "IT8622", kIteDevice, kYes, false, nullptr},

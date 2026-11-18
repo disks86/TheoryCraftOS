@@ -37,6 +37,17 @@ constexpr uint8_t kInterfaceClass = 0xFF;
 constexpr uint8_t kXbox360Subclass = 0x5D, kXbox360Protocol = 0x01;
 constexpr uint8_t kGipSubclass = 0x47, kGipProtocol = 0xD0;
 
+// The Xbox 360 Wireless Receiver (045E:0719, 045E:0291): one interface of class 0xFF, subclass 0x5D, protocol 0x81 per pad it can pair (four),
+// each with its own interrupt IN and OUT endpoints. A pad's interface stays silent until it is asked (encode_360w_inquiry); then it says when
+// a pad pairs or leaves (a message with bit 3 of byte 0 set; bit 7 of byte 1: a pad is there) and carries the pad's input as the wired
+// report's body from byte 4 on (byte 1 bit 0 set).
+constexpr uint8_t kXbox360WirelessProtocol = 0x81;
+enum class WirelessEvent : uint8_t { None, Connected, Disconnected, Input };
+[[nodiscard]] WirelessEvent decode_360w(ConstByteView message, gamepad::State* state);
+uint32_t encode_360w_inquiry(ByteView out);                                          // "is a pad there?" (12 bytes)
+uint32_t encode_360w_led(uint8_t player, ByteView out);                              // the ring of a paired pad (12 bytes)
+uint32_t encode_360w_rumble(uint16_t low_frequency, uint16_t high_frequency, ByteView out);   // (12 bytes)
+
 // Xbox 360: decodes an input message (type 0x00, length 0x14). False for the other messages (LED and rumble status) and short ones.
 [[nodiscard]] bool decode_360(ConstByteView message, gamepad::State* state);
 // The rumble message (8 bytes) for the two motors; returns the bytes written, 0 if `out` is too small.

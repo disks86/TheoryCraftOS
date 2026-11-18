@@ -52,7 +52,7 @@ struct NuvotonLayout {
   uint8_t pwm_count;
 };
 
-// The layout for a chip, or nullptr for one this driver does not handle (the NCT668x).
+// The layout for a chip, or nullptr for one this driver does not handle (the NCT668x: NuvotonNct668x).
 const NuvotonLayout* nuvoton_layout(SuperIoChip chip);
 
 class NuvotonNct67xx final : public IHardwareMonitor {

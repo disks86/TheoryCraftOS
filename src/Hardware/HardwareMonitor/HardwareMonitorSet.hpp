@@ -26,6 +26,7 @@
 #include <stdint.h>
 #include "Hardware/HardwareMonitor/FintekF718xx.hpp"
 #include "Hardware/HardwareMonitor/Ite87xx.hpp"
+#include "Hardware/HardwareMonitor/NuvotonNct668x.hpp"
 #include "Hardware/HardwareMonitor/NuvotonNct67xx.hpp"
 #include "Utility/ArrayView.hpp"
 
@@ -74,9 +75,10 @@ class HardwareMonitorSet {
   struct Slot {
     SuperIoChipFound found;
     Optional<NuvotonNct67xx> nuvoton;
+    Optional<NuvotonNct668x> nuvoton_ec;   // NCT6683/6686/6687
     Optional<Ite87xx> ite;
     Optional<FintekF718xx> fintek;
-    IHardwareMonitor* monitor = nullptr;   // into one of the three above
+    IHardwareMonitor* monitor = nullptr;   // into one of the four above
     const char* problem = nullptr;
   };
   void start(IPortIo& io, Slot& slot);

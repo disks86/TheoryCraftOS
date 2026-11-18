@@ -45,7 +45,8 @@ PathResult resolve_path(PathStyle style, StringView cwd, StringView path, String
 // What a descriptor (Linux file descriptor, Windows handle) refers to.
 enum class DescriptorKind : uint8_t { Closed, ConsoleInput, ConsoleOutput, ConsoleError, File, Directory, Null, Zero, Random, Thread, Event, Mutex, Semaphore, Process, Pipe, Timer, Section, Job, Socket, ChangeNotification, Mailslot, Key, MountManager, DebugObject, Token, KeyedEvent, IoCompletion, Reserve, ObjectDirectory, SymbolicLink, Port,
                                     Dxg /* /dev/dxg: the kernel-mode Direct3D layer for a Linux process (DxgDevice.h) */,
-                                    UnixSocket /* an AF_UNIX socket (UnixSockets.hpp), shared with Windows programs */ };
+                                    UnixSocket /* an AF_UNIX socket (UnixSockets.hpp), shared with Windows programs */,
+                                    InputDevice /* /dev/input/eventN or jsN: a game controller for a Linux process (LinuxInput.hpp) */ };
 
 // How open() treats the path. (The Linux O_* and Windows dispositions both reduce to these.)
 struct OpenFlags {
@@ -62,6 +63,7 @@ struct OpenFlags {
 class MemoryFile;
 class DxgBufferFile;
 class DxgSyncFile;
+class InputClient;
 
 struct OpenObject {
   explicit OpenObject(allocators::IAllocator& allocator) : path(allocator), pattern(allocator) {}
@@ -69,6 +71,7 @@ struct OpenObject {
   MemoryFile* memory = nullptr;      // `file` is a file in memory (memfd_create, MemoryFile.hpp): this is it (not owned; it can be mapped)
   DxgBufferFile* gpu_buffer = nullptr;      // `file` is a GPU image (a dmabuf of /dev/dxg, DxgBufferFile.hpp): this is it (not owned)
   DxgSyncFile* gpu_sync = nullptr;          // `file` is a fence (a sync object's timeline of /dev/dxg, DxgBufferFile.hpp): this is it (not owned)
+  UniquePointer<InputClient> input;         // an InputDevice descriptor's own state (a /dev/input node, LinuxInput.hpp)
   UniquePointer<filesystem::IDirectory> directory;
   String path;                       // the cleaned virtual path it was opened by
   String pattern;                    // directory listing: only names matching this (Windows wildcards); empty = all

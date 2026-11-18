@@ -30,6 +30,8 @@
 //                    << 16, [6] = the capabilities (1 rumble, 2 light bar, 4 player LEDs, 8 battery, 16 analog triggers, 32 right stick),
 //                    [7] = battery kind (0 unknown, 1 wired, 2 alkaline, 3 rechargeable) | percent << 8 | charging << 16.
 //   4 SET_LIGHT      [2] red | green << 8 | blue << 16: the light bar's colour.
+//   5 GET_NAME       [2] a buffer, [3] its size (at most 4096); [7] = the length of the pad's name (UTF-8, no terminator), of which as much as
+//                    fits is written to [2].
 // STATUS_DEVICE_NOT_CONNECTED for an empty slot, STATUS_NOT_SUPPORTED for what the pad does not have (or without the handler),
 // STATUS_INVALID_PARAMETER for a slot past 7 or an unknown operation, STATUS_ACCESS_VIOLATION for memory the program does not have.
 #pragma once

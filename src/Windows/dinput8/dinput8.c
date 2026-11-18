@@ -16,14 +16,17 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-/* dinput8.dll for TheoryCraftOS: DirectInput 8 with no devices behind it. DirectInput8Create hands out a real IDirectInput8A/W object (a stub answered DI_OK and left the
- * pointer NULL, and programs that enumerate game controllers right after - Godot's joypad code, SDL - called through it). The object enumerates no devices, finds none and
- * creates none (DIERR_DEVICENOTREG), so a program falls back to its other input paths (window messages for the keyboard and mouse, XInput for gamepads). Not done: the system
- * keyboard and mouse devices (GUID_SysKeyboard / GUID_SysMouse), action mapping (ConfigureDevices answers DIERR_UNSUPPORTED) and the c_dfDI* data formats. CLSID_DirectInput8 has a class factory
+/* dinput8.dll for TheoryCraftOS: DirectInput 8 with the machine's game controllers behind it. DirectInput8Create hands out a real IDirectInput8A/W object (a stub
+ * answered DI_OK and left the pointer NULL, and programs that enumerate game controllers right after - Godot's joypad code, SDL - called through it). EnumDevices lists
+ * one gamepad per occupied player slot of the kernel's game controller service and CreateDevice makes an IDirectInputDevice8 of it (joystick.inc: data formats,
+ * polled and buffered data, ranges, dead zones). Not done: the system keyboard and mouse devices (GUID_SysKeyboard / GUID_SysMouse: DIERR_DEVICENOTREG, so a program
+ * falls back to window messages), force feedback, action mapping (ConfigureDevices answers DIERR_UNSUPPORTED) and the c_dfDI* data formats exported by name. CLSID_DirectInput8 has a class factory
  * (ole32 finds it in this library) for programs that make the object with CoCreateInstance. Built freestanding over kernel32.dll and ntdll.dll. */
 #define WIN32_LEAN_AND_MEAN
 #define DIRECTINPUT_VERSION 0x0800
 #include <windows.h>
+#include <stddef.h>
+#include <winternl.h>
 #include <dinput.h>
 
 #define EXPORT __declspec(dllexport)
@@ -51,6 +54,9 @@ typedef struct {
   BOOL initialized;
 } DirectInput;
 
+static HRESULT check_version(HINSTANCE instance, DWORD version);
+#include "joystick.inc"
+
 static DirectInput *from_a(void *iface) { return (DirectInput *)iface; }
 static DirectInput *from_w(void *iface) { return (DirectInput *)((BYTE *)iface - offsetof(DirectInput, vtbl_w)); }
 
@@ -77,22 +83,24 @@ static ULONG release(DirectInput *d) {
   if (left == 0) HeapFree(GetProcessHeap(), 0, d);
   return (ULONG)left;
 }
-static HRESULT create_device(DirectInput *d, const GUID *guid, void **device, IUnknown *outer) {
-  (void)outer;
+static HRESULT create_device(DirectInput *d, const GUID *guid, void **device, IUnknown *outer, BOOL wide) {
   if (!device) return E_POINTER;
   *device = NULL;
   if (!guid) return E_POINTER;
-  return d->initialized ? DIERR_DEVICENOTREG : DIERR_NOTINITIALIZED;
+  if (outer) return CLASS_E_NOAGGREGATION;
+  if (!d->initialized) return DIERR_NOTINITIALIZED;
+  return create_pad(guid, device, wide);      /* (a game controller, or DIERR_DEVICENOTREG) */
 }
-static HRESULT enum_devices(DirectInput *d, DWORD type, void *callback, DWORD flags) {
+static HRESULT enum_devices(DirectInput *d, DWORD type, void *callback, void *context, DWORD flags, BOOL wide) {
   if (!callback || (flags & ~DIEDFL_VALID_) != 0) return DIERR_INVALIDPARAM;
   if (type > DI8DEVCLASS_GAMECTRL && (type & 0xFF) < DI8DEVTYPE_DEVICE) return DIERR_INVALIDPARAM;      /* neither a class nor a device type */
   if (!d->initialized) return DIERR_NOTINITIALIZED;
-  return DI_OK;      /* (no device to tell the callback about) */
+  return enum_pads(type, callback, context, flags, wide);
 }
 static HRESULT device_status(DirectInput *d, const GUID *guid) {
   if (!guid) return E_POINTER;
-  return d->initialized ? DIERR_DEVICENOTREG : DIERR_NOTINITIALIZED;
+  if (!d->initialized) return DIERR_NOTINITIALIZED;
+  return pad_attached(guid) ? DI_OK : DIERR_DEVICENOTREG;
 }
 static HRESULT initialize(DirectInput *d, HINSTANCE instance, DWORD version) {
   const HRESULT hr = check_version(instance, version);
@@ -113,8 +121,8 @@ static HRESULT enum_semantics(DirectInput *d, void *format, void *callback, DWOR
 static HRESULT WINAPI a_query(IDirectInput8A *i, REFIID riid, void **out) { return query(from_a(i), riid, out); }
 static ULONG WINAPI a_add_ref(IDirectInput8A *i) { return add_ref(from_a(i)); }
 static ULONG WINAPI a_release(IDirectInput8A *i) { return release(from_a(i)); }
-static HRESULT WINAPI a_create_device(IDirectInput8A *i, REFGUID g, LPDIRECTINPUTDEVICE8A *dev, LPUNKNOWN outer) { return create_device(from_a(i), g, (void **)dev, outer); }
-static HRESULT WINAPI a_enum_devices(IDirectInput8A *i, DWORD type, LPDIENUMDEVICESCALLBACKA cb, LPVOID ctx, DWORD flags) { (void)ctx; return enum_devices(from_a(i), type, (void *)cb, flags); }
+static HRESULT WINAPI a_create_device(IDirectInput8A *i, REFGUID g, LPDIRECTINPUTDEVICE8A *dev, LPUNKNOWN outer) { return create_device(from_a(i), g, (void **)dev, outer, FALSE); }
+static HRESULT WINAPI a_enum_devices(IDirectInput8A *i, DWORD type, LPDIENUMDEVICESCALLBACKA cb, LPVOID ctx, DWORD flags) { return enum_devices(from_a(i), type, (void *)cb, ctx, flags, FALSE); }
 static HRESULT WINAPI a_get_device_status(IDirectInput8A *i, REFGUID g) { return device_status(from_a(i), g); }
 static HRESULT WINAPI a_run_control_panel(IDirectInput8A *i, HWND owner, DWORD flags) { (void)i; (void)owner; return flags ? DIERR_INVALIDPARAM : DI_OK; }
 static HRESULT WINAPI a_initialize(IDirectInput8A *i, HINSTANCE inst, DWORD version) { return initialize(from_a(i), inst, version); }
@@ -134,8 +142,8 @@ static const IDirectInput8AVtbl kVtblA = {a_query, a_add_ref, a_release, a_creat
 static HRESULT WINAPI w_query(IDirectInput8W *i, REFIID riid, void **out) { return query(from_w(i), riid, out); }
 static ULONG WINAPI w_add_ref(IDirectInput8W *i) { return add_ref(from_w(i)); }
 static ULONG WINAPI w_release(IDirectInput8W *i) { return release(from_w(i)); }
-static HRESULT WINAPI w_create_device(IDirectInput8W *i, REFGUID g, LPDIRECTINPUTDEVICE8W *dev, LPUNKNOWN outer) { return create_device(from_w(i), g, (void **)dev, outer); }
-static HRESULT WINAPI w_enum_devices(IDirectInput8W *i, DWORD type, LPDIENUMDEVICESCALLBACKW cb, LPVOID ctx, DWORD flags) { (void)ctx; return enum_devices(from_w(i), type, (void *)cb, flags); }
+static HRESULT WINAPI w_create_device(IDirectInput8W *i, REFGUID g, LPDIRECTINPUTDEVICE8W *dev, LPUNKNOWN outer) { return create_device(from_w(i), g, (void **)dev, outer, TRUE); }
+static HRESULT WINAPI w_enum_devices(IDirectInput8W *i, DWORD type, LPDIENUMDEVICESCALLBACKW cb, LPVOID ctx, DWORD flags) { return enum_devices(from_w(i), type, (void *)cb, ctx, flags, TRUE); }
 static HRESULT WINAPI w_get_device_status(IDirectInput8W *i, REFGUID g) { return device_status(from_w(i), g); }
 static HRESULT WINAPI w_run_control_panel(IDirectInput8W *i, HWND owner, DWORD flags) { (void)i; (void)owner; return flags ? DIERR_INVALIDPARAM : DI_OK; }
 static HRESULT WINAPI w_initialize(IDirectInput8W *i, HINSTANCE inst, DWORD version) { return initialize(from_w(i), inst, version); }

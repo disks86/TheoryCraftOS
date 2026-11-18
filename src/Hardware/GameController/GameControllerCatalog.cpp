@@ -27,6 +27,8 @@ constexpr CatalogEntry kCatalog[] = {
     // Microsoft
     {0x045E, 0x028E, Protocol::Xbox360, "Xbox 360 Controller"},
     {0x045E, 0x028F, Protocol::Xbox360, "Xbox 360 Wireless Controller (cable)"},
+    {0x045E, 0x0719, Protocol::Xbox360, "Xbox 360 Wireless Controller"},       // (the receiver: its pads carry this name)
+    {0x045E, 0x0291, Protocol::Xbox360, "Xbox 360 Wireless Controller"},
     {0x045E, 0x02D1, Protocol::XboxOne, "Xbox One Controller"},
     {0x045E, 0x02DD, Protocol::XboxOne, "Xbox One Controller"},
     {0x045E, 0x02E3, Protocol::XboxOne, "Xbox One Elite Controller"},

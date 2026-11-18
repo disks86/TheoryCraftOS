@@ -159,6 +159,7 @@ add_executable(BOOTX64
   src/Hardware/Mouse/Usb/UsbHidMouse.cpp
   src/Hardware/Mouse/Virtio/VirtioMouse.cpp
   src/Hardware/SystemInput.cpp
+  src/Hardware/LinuxGamepads.cpp
   src/Hardware/ImageSignalProcessor/IspMath.cpp
   src/Hardware/ImageSignalProcessor/Software/SoftwareImageSignalProcessor.cpp
   src/Hardware/ImageSignalProcessor/SystemImageSignalProcessor.cpp
@@ -578,6 +579,7 @@ add_executable(BOOTX64
   src/Hardware/HardwareMonitor/PortIo.cpp
   src/Hardware/HardwareMonitor/SuperIo.cpp
   src/Hardware/HardwareMonitor/NuvotonNct67xx.cpp
+  src/Hardware/HardwareMonitor/NuvotonNct668x.cpp
   src/Hardware/HardwareMonitor/Ite87xx.cpp
   src/Hardware/HardwareMonitor/FintekF718xx.cpp
   src/Hardware/HardwareMonitor/HardwareMonitorSet.cpp
@@ -806,6 +808,7 @@ add_executable(BOOTX64
   src/Hardware/GameController/WindowsGamepadService.cpp
   src/Hardware/GameController/XboxProtocol.cpp
   src/Hardware/GameController/Usb/UsbGameController.cpp
+  src/Hardware/GameController/Usb/UsbXbox360Wireless.cpp
   src/Midi/LiveSynth.cpp
   src/Media/Audio/Pcm.cpp
   src/Media/Audio/Wav.cpp
@@ -920,6 +923,7 @@ add_executable(BOOTX64
   src/Process/LinuxAio.cpp
   src/Process/LinuxIpc.cpp
   src/Process/LinuxSignals.cpp
+  src/Process/LinuxInput.cpp
   src/Process/ProcessFiles.cpp
   src/Process/WindowsFiles.cpp
   src/Process/ProgramEnvironment.cpp

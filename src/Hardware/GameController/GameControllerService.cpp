@@ -18,6 +18,7 @@
 
 #include "Hardware/GameController/GameControllerService.hpp"
 #include "Hardware/GameController/Usb/UsbGameController.hpp"
+#include "Hardware/GameController/Usb/UsbXbox360Wireless.hpp"
 #include "Kernel/Thread.hpp"
 #include "Utility/String.hpp"
 
@@ -60,8 +61,21 @@ void GameControllerService::notify(const char* name, const char* what, int32_t p
   notifier_(notifier_context_, text.view());
 }
 
+void GameControllerService::park(UniquePointer<IGameController> controller) {
+  for (UniquePointer<IGameController>& idle : idle_) {
+    if (idle) continue;
+    idle = util::move(controller);
+    return;
+  }
+  controller->shutdown();
+}
+
 int32_t GameControllerService::place(UniquePointer<IGameController> controller) {
   if (!controller) return -1;
+  if (!controller->connected()) {             // (not there yet: it waits)
+    park(util::move(controller));
+    return -1;
+  }
   for (uint32_t i = 0; i < kMaxPlayers; ++i) {
     Slot& s = slots_[i];
     if (s.controller) continue;
@@ -82,6 +96,22 @@ int32_t GameControllerService::place(UniquePointer<IGameController> controller) 
 }
 
 void GameControllerService::take_up(IUsbHostController& host, uint32_t port) {
+  // An Xbox 360 Wireless Receiver: a pad per channel, each waiting until a pad pairs with it.
+  uint8_t config[512];
+  uint16_t length = 0;
+  UsbDeviceDescriptor device;
+  UsbWirelessChannel channels[4];
+  uint32_t wireless = 0;
+  if (host.device_descriptor(port, &device) && host.configuration_descriptor(port, ByteView(config), &length))
+    wireless = find_xbox360_wireless_channels(ConstByteView(config).at_most(length), ArrayView<UsbWirelessChannel>(channels));
+  if (wireless > 0) {
+    const uint16_t vendor = device.vendor_id, product = device.product_id;   // (copies: the descriptor is packed)
+    for (uint32_t i = 0; i < wireless && i < 4; ++i) {
+      UniquePointer<UsbXbox360WirelessPad> pad = UniquePointer<UsbXbox360WirelessPad>::make(allocator_, host, port, channels[i], vendor, product);
+      if (pad && pad->initialize()) park(UniquePointer<IGameController>(util::move(pad)));
+    }
+    return;
+  }
   UniquePointer<UsbGameController> pad = UsbGameController::open(host, port, allocator_);
   if (pad) (void)place(UniquePointer<IGameController>(util::move(pad)));
 }
@@ -91,6 +121,29 @@ void GameControllerService::scan_all() {
   for (uint32_t c = 0; c < usb_->controller_count(); ++c) {
     IUsbHostController* host = usb_->host_controller(c);
     for (uint32_t p = 0; host && p < host->port_count(); ++p) take_up(*host, p);
+  }
+}
+
+void GameControllerService::follow_connections() {
+  for (uint32_t i = 0; i < kMaxPlayers; ++i) {
+    Slot& s = slots_[i];
+    if (!s.controller || !s.controller->present() || s.controller->connected()) continue;
+    notify(s.controller->info().name, "disconnected,", static_cast<int32_t>(i));
+    ++s.packet;
+    ++removed_;
+    park(util::move(s.controller));
+    s.controller = UniquePointer<IGameController>();
+  }
+  for (UniquePointer<IGameController>& idle : idle_) {
+    if (!idle) continue;
+    if (!idle->present()) {                   // its device left
+      idle->shutdown();
+      idle = UniquePointer<IGameController>();
+    } else if (idle->connected()) {
+      UniquePointer<IGameController> pad = util::move(idle);
+      idle = UniquePointer<IGameController>();
+      (void)place(util::move(pad));
+    }
   }
 }
 
@@ -133,6 +186,10 @@ void GameControllerService::stop() {
     if (s.controller) s.controller->shutdown();
     s.controller = UniquePointer<IGameController>();
   }
+  for (UniquePointer<IGameController>& idle : idle_) {
+    if (idle) idle->shutdown();
+    idle = UniquePointer<IGameController>();
+  }
   started_ = false;
 }
 
@@ -153,6 +210,9 @@ void GameControllerService::step(bool scan) {
     s.controller->poll();
     if (!same_state(before, s.controller->state())) ++s.packet;
   }
+  for (UniquePointer<IGameController>& idle : idle_)
+    if (idle) idle->poll();
+  follow_connections();
   if (scan) {
     drop_gone();
     watcher_.scan([&](uint32_t, IUsbHostController& host, uint32_t port) { take_up(host, port); });

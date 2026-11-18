@@ -74,4 +74,17 @@ uint32_t gamepad_service_call(GameControllerService& service, ArrayView<uint64_t
   }
 }
 
+uint32_t gamepad_service_name(GameControllerService& service, uint64_t player, ByteView out, uint32_t* length) {
+  *length = 0;
+  if (player >= GameControllerService::kMaxPlayers) return kInvalidParameter;
+  gamepad::Info info;
+  if (!service.info(static_cast<uint32_t>(player), &info)) return kDeviceNotConnected;
+  uint32_t n = 0;
+  while (n < sizeof(info.name) && info.name[n]) ++n;
+  *length = n;
+  const ConstByteView name(reinterpret_cast<const uint8_t*>(info.name), n);   // (char and uint8_t share their representation)
+  out.copy_from(name.at_most(out.size()));
+  return kSuccess;
+}
+
 }  // namespace hardware

@@ -31,6 +31,7 @@
 #include "Hardware/GameController/SonyProtocol.hpp"
 #include "Hardware/GameController/SwitchProtocol.hpp"
 #include "Hardware/GameController/Usb/UsbGameController.hpp"
+#include "Hardware/GameController/Usb/UsbXbox360Wireless.hpp"
 #include "Hardware/GameController/WindowsGamepadService.hpp"
 #include "Hardware/GameController/XboxProtocol.hpp"
 
@@ -358,10 +359,12 @@ static Bytes hid_config(uint16_t report_length, bool out_endpoint) {
 struct FakeHost final : IUsbHostController {
   Bytes config, report_descriptor;
   uint16_t vendor = 0, product = 0;
-  bool present = true, out_supported = true;
+  bool present = true, out_supported = true, wireless = false;
   uint32_t generation = 1;
   std::deque<Bytes> in_queue;
+  std::deque<Bytes> in_by_endpoint[16];   // (used instead of in_queue for the endpoints that have something here)
   std::vector<Bytes> sent;           // interrupt OUT
+  std::vector<uint8_t> sent_to;      // (the endpoint of each)
   std::vector<Bytes> set_reports;    // SET_REPORT data
   int in_started = 0, out_started = 0, idles = 0;
 
@@ -403,18 +406,20 @@ struct FakeHost final : IUsbHostController {
     return true;
   }
   bool start_interrupt_in(uint32_t, uint8_t, uint16_t, uint8_t) override { ++in_started; return present; }
-  bool poll_interrupt_in(uint32_t, uint8_t, ByteView buffer, uint16_t* length) override {
-    if (!present || in_queue.empty()) return false;
-    const Bytes b = in_queue.front();
-    in_queue.pop_front();
+  bool poll_interrupt_in(uint32_t, uint8_t endpoint, ByteView buffer, uint16_t* length) override {
+    std::deque<Bytes>& queue = !in_by_endpoint[endpoint & 0x0F].empty() ? in_by_endpoint[endpoint & 0x0F] : in_queue;
+    if (!present || queue.empty() || (&queue == &in_queue && wireless)) return false;
+    const Bytes b = queue.front();
+    queue.pop_front();
     for (size_t i = 0; i < b.size() && i < buffer.size(); ++i) buffer[i] = b[i];
     *length = static_cast<uint16_t>(b.size());
     return true;
   }
   bool start_interrupt_out(uint32_t, uint8_t, uint16_t, uint8_t) override { ++out_started; return present && out_supported; }
-  bool interrupt_out(uint32_t, uint8_t, ConstByteView data) override {
+  bool interrupt_out(uint32_t, uint8_t endpoint, ConstByteView data) override {
     if (!present || !out_supported) return false;
     sent.push_back(Bytes(data.data(), data.data() + data.size()));
+    sent_to.push_back(endpoint);
     return true;
   }
   bool start_bulk_endpoint(uint32_t, uint8_t, uint16_t) override { return false; }
@@ -422,7 +427,7 @@ struct FakeHost final : IUsbHostController {
   bool reset_bulk_endpoint(uint32_t, uint8_t) override { return false; }
   uint32_t port_generation(uint32_t) const override { return generation; }
 
-  void plug(uint16_t v, uint16_t p, const Bytes& c) { vendor = v; product = p; config = c; present = true; ++generation; sent.clear(); set_reports.clear(); }
+  void plug(uint16_t v, uint16_t p, const Bytes& c) { vendor = v; product = p; config = c; present = true; ++generation; sent.clear(); sent_to.clear(); set_reports.clear(); }
   void unplug() { present = false; ++generation; }
 };
 
@@ -621,6 +626,90 @@ static void test_service() {
   CHECK(a.live == 0);
 }
 
+// --- The Xbox 360 Wireless Receiver -------------------------------------------------------------------
+
+static Bytes receiver_config() {
+  Config c;
+  for (uint8_t i = 0; i < 4; ++i) {
+    c.add({4, static_cast<uint8_t>(i * 2), 0, 2, 0xFF, 0x5D, 0x81, 0});                         // pad i
+    c.add({5, static_cast<uint8_t>(0x81 + i * 2), 3, 32, 0, 1});
+    c.add({5, static_cast<uint8_t>(0x01 + i * 2), 3, 32, 0, 8});
+    c.add({4, static_cast<uint8_t>(i * 2 + 1), 0, 2, 0xFF, 0x5D, 0x82, 0});                     // its headset
+    c.add({5, static_cast<uint8_t>(0x82 + i * 2), 3, 32, 0, 2});
+  }
+  return c.done();
+}
+
+static Bytes wireless_input(uint16_t buttons, int16_t lx) {
+  Bytes m = {0x00, 0x01, 0x00, 0xF0, 0x00, 0x13, static_cast<uint8_t>(buttons), static_cast<uint8_t>(buttons >> 8), 0, 0,
+             static_cast<uint8_t>(lx), static_cast<uint8_t>(static_cast<uint16_t>(lx) >> 8)};
+  m.resize(29, 0);
+  return m;
+}
+
+static void test_wireless() {
+  // The protocol.
+  State s;
+  const Bytes paired = {0x08, 0x80}, gone = {0x08, 0x00}, headset_only = {0x08, 0x40};
+  CHECK(xbox::decode_360w(view(paired), &s) == xbox::WirelessEvent::Connected);
+  CHECK(xbox::decode_360w(view(headset_only), &s) == xbox::WirelessEvent::Disconnected);
+  CHECK(xbox::decode_360w(view(wireless_input(0x1000 | 0x0400, -77)), &s) == xbox::WirelessEvent::Input && s.buttons == (kSouth | kGuide) && s.left_x == -77);
+  CHECK(xbox::decode_360w(view(gone), &s) == xbox::WirelessEvent::Disconnected && s.buttons == 0);
+  fuzz(wireless_input(0xFFFF, 5), 0, [](ConstByteView v, State* st) { return xbox::decode_360w(v, st) == xbox::WirelessEvent::Input; });
+  uint8_t out[16];
+  CHECK(xbox::encode_360w_inquiry(ByteView(out)) == 12 && out[0] == 0x08 && out[2] == 0x0F && out[3] == 0xC0);
+  CHECK(xbox::encode_360w_led(3, ByteView(out)) == 12 && out[2] == 0x08 && out[3] == 0x48);
+  CHECK(xbox::encode_360w_rumble(0xFF00, 0x0100, ByteView(out)) == 12 && out[1] == 0x01 && out[5] == 0xFF && out[6] == 0x01);
+  CHECK(xbox::encode_360w_led(1, ByteView(out).first(11)) == 0);
+
+  UsbWirelessChannel channels[8];
+  const Bytes config = receiver_config();
+  CHECK(find_xbox360_wireless_channels(view(config), ArrayView<UsbWirelessChannel>(channels)) == 4);
+  CHECK(channels[2].interface_number == 4 && channels[2].in_endpoint == 0x85 && channels[2].out_endpoint == 0x05);
+  for (size_t n = 0; n < config.size(); ++n) {        // cut short anywhere: never more channels than there are
+    Bytes cut(config.begin(), config.begin() + n);
+    CHECK(find_xbox360_wireless_channels(view(cut), ArrayView<UsbWirelessChannel>(channels)) <= 4);
+  }
+
+  // The service: four channels wait; pads take slots as they pair and give them back as they leave.
+  TestAllocator a;
+  {
+    FakeHost receiver;
+    receiver.wireless = true;
+    receiver.plug(0x045E, 0x0719, receiver_config());
+    FakeBus bus;
+    bus.hosts = {&receiver};
+    GameControllerService service(&bus, a);
+    CHECK(service.start());
+    CHECK(service.count() == 0 && receiver.sent.size() == 4 && receiver.sent[0][0] == 0x08);   // an inquiry on each channel
+    receiver.in_by_endpoint[0x83 & 0x0F].push_back(paired);              // a pad pairs with channel 1
+    service.step(false);
+    CHECK(service.count() == 1);
+    Info info;
+    CHECK(service.info(0, &info) && strcmp(info.name, "Xbox 360 Wireless Controller") == 0);
+    CHECK(receiver.sent_to.back() == 0x03 && receiver.sent.back()[3] == 0x46);   // its ring shows player 1, on its own channel
+    receiver.in_by_endpoint[0x87 & 0x0F].push_back(wireless_input(0x2000, 0));   // input on channel 3 without a pairing message
+    service.step(false);
+    CHECK(service.count() == 2);
+    service.step(false);                       // (the pad in slot 1 has reported east once)
+    State st;
+    uint32_t packet = 0;
+    CHECK(service.snapshot(1, &st, &packet) && st.buttons == kEast);
+    CHECK(service.set_vibration(0, 0x8000, 0) && receiver.sent_to.back() == 0x03 && receiver.sent.back()[5] == 0x80);
+    receiver.in_by_endpoint[0x83 & 0x0F].push_back(gone);                // channel 1's pad switched off
+    service.step(false);
+    CHECK(service.count() == 1 && !service.snapshot(0, &st, &packet) && service.snapshot(1, &st, &packet));
+    receiver.in_by_endpoint[0x83 & 0x0F].push_back(paired);              // and on again: the first free slot
+    service.step(false);
+    CHECK(service.count() == 2 && service.snapshot(0, &st, &packet));
+    receiver.unplug();                                                    // the receiver itself pulled out
+    service.step(true);
+    CHECK(service.count() == 0);
+    service.stop();
+  }
+  CHECK(a.live == 0);
+}
+
 // --- NtTcosGamepad's words ------------------------------------------------------------------------------
 
 static void test_service_call() {
@@ -660,6 +749,12 @@ static void test_service_call() {
     CHECK(gamepad_service_call(service, ArrayView<uint64_t>(light)) == 0 && sony_host.sent.back()[6] == 1 && sony_host.sent.back()[8] == 3);
     uint64_t no_light[kGamepadServiceWords] = {4, 0, 0x030201};
     CHECK(gamepad_service_call(service, ArrayView<uint64_t>(no_light)) == 0xC00000BBu);   // STATUS_NOT_SUPPORTED
+    uint8_t name[64];
+    uint32_t length = 0;
+    CHECK(gamepad_service_name(service, 0, ByteView(name), &length) == 0 && length == strlen("Xbox 360 Controller") && memcmp(name, "Xbox 360", 8) == 0);
+    CHECK(gamepad_service_name(service, 1, ByteView(name).first(4), &length) == 0 && length == strlen("DualShock 4") && memcmp(name, "Dual", 4) == 0);
+    CHECK(gamepad_service_name(service, 2, ByteView(name), &length) == 0xC000009Du && length == 0);
+    CHECK(gamepad_service_name(service, 9, ByteView(name), &length) == 0xC000000Du);
     uint64_t short_words[2] = {1, 0};
     CHECK(gamepad_service_call(service, ArrayView<uint64_t>(short_words)) == 0xC000000Du);
   }
@@ -678,6 +773,7 @@ int main() {
   test_usb_hid();
   test_service();
   test_service_call();
+  test_wireless();
   printf("GameControllerTest: %d checks, %d failed\n", g_checks, g_failed);
   return g_failed ? 1 : 0;
 }

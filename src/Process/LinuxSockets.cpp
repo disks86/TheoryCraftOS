@@ -15,6 +15,7 @@
  * You should have received a copy of the GNU Affero General Public License
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
+#include "Process/LinuxInput.hpp"
 #include "Process/LinuxNetlink.hpp"
 #include "Process/LinuxPacket.hpp"
 #include "Process/LinuxSockets.hpp"
@@ -531,6 +532,7 @@ uint64_t clock_now(Process& p, uint32_t clock) { return clock == 0 || clock == 8
 
 constexpr uint64_t kNever = ~uint64_t{0};
 constexpr uint64_t kInetPollNs = 2000000;      // how often a wait looks at a network socket again (see poll_events_locked)
+constexpr uint64_t kInputPollNs = 4000000;     // the same for a game controller (the service polls the pads every 4 ms)
 
 // A timer brought up to now (the lock held): its expirations counted. *due (when given): made no later than when it next fires, on the monotonic clock.
 void advance_timer_locked(Process& p, UnixSocketManager& m, uint32_t id, uint64_t* due) {
@@ -593,6 +595,15 @@ uint16_t poll_events_locked(Process& p, UnixSocketManager* m, const Watched& w, 
     }
     return now;
   }
+  if (w.kind == DescriptorKind::InputDevice) {      // a game controller's node (LinuxInput.cpp): looked at again every 4 ms while it has nothing
+    const uint16_t now = input_poll(p, w.id);
+    const uint16_t out = now & (events | kPollHup | kPollErr | kPollNval);
+    if (!(out & (kPollIn | kPollRdNorm | kPollHup | kPollErr)) && due) {
+      const uint64_t mono = p.host().monotonic_ns(), again = mono > kNever - 1 - kInputPollNs ? kNever - 1 : mono + kInputPollNs;
+      if (again < *due) *due = again;
+    }
+    return out;
+  }
   if (w.kind != DescriptorKind::UnixSocket || !m) return events & (kPollIn | kPollOut | kPollRdNorm | kPollWrNorm);
   advance_timer_locked(p, *m, w.id, due);
   if (const uint64_t look = refresh_linked_locked(p, *m, w.id); look != 0 && due) {
@@ -654,6 +665,7 @@ Watched watch(Process& p, uint64_t fd) {
   Watched w;
   w.kind = p.files().kind(fd);
   if (w.kind == DescriptorKind::UnixSocket || w.kind == DescriptorKind::Socket) w.id = uint32_t(p.files().token(fd));
+  if (w.kind == DescriptorKind::InputDevice) w.id = uint32_t(fd);      // (input_poll finds its client by the descriptor)
   return w;
 }
 

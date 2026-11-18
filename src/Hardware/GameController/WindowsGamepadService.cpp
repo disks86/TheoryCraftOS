@@ -25,7 +25,8 @@
 namespace hardware {
 
 namespace {
-constexpr uint32_t kAccessViolation = 0xC0000005u, kNotSupported = 0xC00000BBu;
+constexpr uint32_t kAccessViolation = 0xC0000005u, kNotSupported = 0xC00000BBu, kInvalidParameter = 0xC000000Du;
+constexpr uint64_t kGetName = 5, kMaxNameBuffer = 4096;
 GameControllerService* g_service = nullptr;
 }  // namespace
 
@@ -38,7 +39,21 @@ uint32_t windows_gamepad_service(process::Process& p, const process::SyscallRequ
   uint64_t w[kGamepadServiceWords];
   ByteReader in{ConstByteView(raw, sizeof raw)};
   for (uint64_t& word : w) word = in.le64();
-  const uint32_t status = gamepad_service_call(*service, ArrayView<uint64_t>(w));
+  uint32_t status;
+  if (w[0] == kGetName) {
+    // The name goes straight to the program's buffer (at most 48 bytes are ever written: the name is that long at most).
+    if (w[3] > kMaxNameBuffer) return kInvalidParameter;
+    uint8_t name[sizeof(gamepad::Info::name)];
+    uint32_t length = 0;
+    status = gamepad_service_name(*service, w[1], ByteView(name), &length);
+    if (status == 0) {
+      const uint64_t copy = length < w[3] ? length : w[3];
+      if (copy && !p.write_user(w[2], ConstByteView(name).first(copy))) return kAccessViolation;
+      w[7] = length;
+    }
+  } else {
+    status = gamepad_service_call(*service, ArrayView<uint64_t>(w));
+  }
   ByteWriter out{ByteView(raw, sizeof raw)};
   for (uint64_t word : w) out.le64(word);
   // (Only the result words change; all eight go back, which the program's memory held a moment ago.)

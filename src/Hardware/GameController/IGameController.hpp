@@ -34,6 +34,9 @@ class IGameController : public IHardware {
   [[nodiscard]] virtual bool set_output(const gamepad::Output& output) = 0;
   // False once the pad was unplugged (its driver is then dropped).
   virtual bool present() const = 0;
+  // False while a pad that can come and go without its device leaving (one paired with a wireless receiver) is not there: it then holds no
+  // player slot, and gets one again when it pairs.
+  virtual bool connected() const { return true; }
 
  protected:
   IGameController() = default;

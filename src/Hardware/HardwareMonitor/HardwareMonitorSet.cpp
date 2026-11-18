@@ -25,6 +25,7 @@ void HardwareMonitorSet::clear() {
     slot.monitor = nullptr;
     slot.problem = nullptr;
     slot.nuvoton.reset();
+    slot.nuvoton_ec.reset();
     slot.ite.reset();
     slot.fintek.reset();
     slot.found = SuperIoChipFound();
@@ -37,7 +38,10 @@ void HardwareMonitorSet::start(IPortIo& io, Slot& slot) {
   if (slot.problem || !slot.found.info) return;
   IHardwareMonitor* monitor = nullptr;
   switch (slot.found.info->vendor) {
-    case SuperIoVendor::Nuvoton: monitor = &slot.nuvoton.emplace(io, slot.found); break;
+    case SuperIoVendor::Nuvoton:
+      if (nct668x_layout(slot.found.info->chip)) monitor = &slot.nuvoton_ec.emplace(io, slot.found);
+      else monitor = &slot.nuvoton.emplace(io, slot.found);
+      break;
     case SuperIoVendor::Ite: monitor = &slot.ite.emplace(io, slot.found); break;
     case SuperIoVendor::Fintek: monitor = &slot.fintek.emplace(io, slot.found); break;
   }
@@ -47,6 +51,7 @@ void HardwareMonitorSet::start(IPortIo& io, Slot& slot) {
   }
   slot.problem = "the sensor window did not answer as this chip's should";
   slot.nuvoton.reset();
+  slot.nuvoton_ec.reset();
   slot.ite.reset();
   slot.fintek.reset();
 }

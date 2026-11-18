@@ -21,6 +21,9 @@
 // DualSense and Switch player LEDs, the PlayStation light bar's colour). Programs read the slots: the Windows layer's XInput (slots 0..3 are
 // XInput's four users), and anything else through snapshot().
 //
+// A pad that can be there or not while its device stays plugged in (one paired with an Xbox 360 Wireless Receiver: IGameController::connected())
+// waits among the idle pads, polled with the others, and takes a slot when it pairs.
+//
 // A thread polls the pads every 4 ms and looks for new ones four times a second (step() does one round, for tests and machines without threads).
 // One mutex covers the slots and the drivers, so a program's call (snapshot, rumble) never meets a pad being polled or dropped halfway.
 #pragma once
@@ -39,6 +42,7 @@ namespace hardware {
 class GameControllerService {
  public:
   static constexpr uint32_t kMaxPlayers = 8;
+  static constexpr uint32_t kMaxIdle = 16;          // pads that are plugged in but not connected (a wireless receiver's unpaired channels)
   static constexpr uint32_t kRoundsPerScan = 64;     // (a round is about 4 ms)
 
   // `usb` may be null: then only added controllers are served.
@@ -85,6 +89,8 @@ class GameControllerService {
   void scan_all();                                   // (locked) every port
   void take_up(IUsbHostController& host, uint32_t port);   // (locked)
   void drop_gone();                                  // (locked)
+  void park(UniquePointer<IGameController> controller);   // (locked) into the idle pads, or shut down when they are full
+  void follow_connections();                         // (locked) idle pads that connected get a slot; slotted ones that left go idle
   int32_t place(UniquePointer<IGameController> controller);   // (locked)
   void notify(const char* name, const char* what, int32_t player);
 
@@ -92,6 +98,7 @@ class GameControllerService {
   allocators::IAllocator& allocator_;
   mutable kernel::Mutex mutex_;
   Slot slots_[kMaxPlayers];
+  UniquePointer<IGameController> idle_[kMaxIdle];
   UsbPortWatcher watcher_;
   Notifier notifier_ = nullptr;
   void* notifier_context_ = nullptr;

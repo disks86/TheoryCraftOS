@@ -21,6 +21,7 @@
 #include "Process/AddressSpace.hpp"
 #include "Process/DxgDevice.h"
 #include "Process/Fifo.hpp"
+#include "Process/LinuxInput.hpp"
 #include "Process/MemoryFile.hpp"
 #include "Process/Objects.hpp"
 #include "Process/UnixSockets.hpp"
@@ -181,6 +182,7 @@ int64_t describe_descriptor(Process& p, uint64_t fd, String* out) {
     case DescriptorKind::Zero: return out->assign("/dev/zero") ? 0 : -kEnomem;
     case DescriptorKind::Random: return out->assign("/dev/urandom") ? 0 : -kEnomem;
     case DescriptorKind::Dxg: return out->assign("/dev/dxg") ? 0 : -kEnomem;
+    case DescriptorKind::InputDevice: return files.object(fd) && out->assign(files.object(fd)->path.view()) ? 0 : -kEnomem;
     case DescriptorKind::UnixSocket: return named(is_pipe_descriptor(p, fd) ? "pipe" : "socket", files.token(fd));
     default: break;
   }
@@ -296,6 +298,17 @@ Meta device_meta(uint32_t mode, uint64_t ino) {
   return m;
 }
 
+// /dev/input and its nodes (LinuxInput.hpp).
+Meta input_meta(const InputNodeMeta& n) {
+  Meta m;
+  m.mode = n.mode;
+  m.ino = n.ino;
+  m.rdev = n.rdev;
+  m.modified = m.created = n.modified;
+  m.size = n.directory ? 4096 : 0;
+  return m;
+}
+
 // struct stat as the kernel of each CPU lays it out (144 bytes on x86-64, 128 on the others).
 uint64_t write_stat(Process& p, UserArch arch, const Meta& m, uint64_t address) {
   uint8_t buffer[144] = {};
@@ -355,6 +368,7 @@ int64_t meta_of_fd(Process& p, uint64_t fd, Meta* m) {
     case DescriptorKind::Socket: *m = device_meta(kSIfSock | 0777, 0x10000 + p.files().token(fd)); return 0;      // (a network socket)
     default: break;
   }
+  if (InputNodeMeta input; input_descriptor_meta(p, fd, &input)) { *m = input_meta(input); return 0; }      // (a game controller's node, or /dev/input)
   OpenObject* object = p.files().object(fd);
   DirectoryEntry entry;
   if (object->memory || object->gpu_buffer || object->gpu_sync) {      // (a file in memory, a GPU image or a fence has no path to look at: a regular file of its size)
@@ -407,6 +421,12 @@ uint64_t sys_openat(Process& p, UserArch arch, uint64_t dirfd, uint64_t path, ui
   const int64_t r = resolve_at(p, dirfd, path, false, &virtual_path);
   if (r < 0) return error(-r);
   const bool cloexec = flags & kOCloexec;
+  if (InputNodeMeta input; const int64_t at = input_node_at(virtual_path.view(), &input, p.host().realtime_ns() / 1000000000ull)) {      // /dev/input (LinuxInput.hpp)
+    if (at < 0) return error(-at);
+    if ((flags & kOCreat) && (flags & kOExcl)) return error(kEexist);
+    const int64_t fd = input_open(p, virtual_path.view(), flags, cloexec, flags & (arch == UserArch::AArch64 ? 0x4000u : 0x10000u));
+    return fd < 0 ? error(-fd) : uint64_t(fd);
+  }
   const DescriptorKind device = files.device_at(virtual_path.view());
   if (device != DescriptorKind::Closed) {
     const int64_t fd = device == DescriptorKind::ConsoleOutput ? files.duplicate(1, 0) : files.open_device(device);
@@ -471,6 +491,7 @@ uint64_t read_from(Process& p, uint64_t fd, uint64_t buffer, uint64_t count, boo
     case DescriptorKind::ConsoleError: return error(kEbadf);
     case DescriptorKind::Directory: return error(kEisdir);
     case DescriptorKind::Dxg: return error(kEinval);      // (only ioctl)
+    case DescriptorKind::InputDevice: return positional ? error(kEspipe) : input_read(p, fd, buffer, count);
     case DescriptorKind::UnixSocket: return positional ? error(kEspipe) : socket_read(p, fd, buffer, count);
     case DescriptorKind::Socket: return positional ? error(kEspipe) : inet_recvfrom(p, fd, buffer, count, 0, 0, 0);
     case DescriptorKind::Null: return 0;
@@ -525,6 +546,7 @@ uint64_t write_to(Process& p, uint64_t fd, uint64_t buffer, uint64_t count, bool
     }
     case DescriptorKind::Directory: return error(kEisdir);
     case DescriptorKind::Dxg: return error(kEinval);      // (only ioctl)
+    case DescriptorKind::InputDevice: return positional ? error(kEspipe) : input_write(p, fd, buffer, count);
     case DescriptorKind::UnixSocket: return positional ? error(kEspipe) : socket_write(p, fd, buffer, count);
     case DescriptorKind::Socket: return positional ? error(kEspipe) : inet_sendto(p, fd, buffer, count, 0, 0, 0);
     case DescriptorKind::Null:
@@ -630,6 +652,8 @@ uint64_t sys_statat(Process& p, UserArch arch, uint64_t dirfd, uint64_t path, ui
   if (r < 0) return error(-r);
   if (no_follow && link_meta(p, virtual_path.view(), &m)) return write_stat(p, arch, m, buffer);
   if (no_follow && follow_proc_self(p, &virtual_path) < 0) return error(kEnoent);
+  if (InputNodeMeta input; const int64_t at = input_node_at(virtual_path.view(), &input, p.host().realtime_ns() / 1000000000ull))
+    return at < 0 ? error(-at) : write_stat(p, arch, input_meta(input), buffer);
   const DescriptorKind device = files.device_at(virtual_path.view());
   if (device != DescriptorKind::Closed) return write_stat(p, arch, device_meta(kSIfChr | 0666, 3), buffer);
   DirectoryEntry entry;
@@ -660,6 +684,9 @@ uint64_t sys_statx(Process& p, uint64_t dirfd, uint64_t path, uint64_t flags, ui
       // (a link: m is set)
     } else if (no_follow && follow_proc_self(p, &virtual_path) < 0) {
       return error(kEnoent);
+    } else if (InputNodeMeta input; const int64_t at = input_node_at(virtual_path.view(), &input, p.host().realtime_ns() / 1000000000ull)) {
+      if (at < 0) return error(-at);
+      m = input_meta(input);
     } else if (device != DescriptorKind::Closed) {
       m = device_meta(kSIfChr | 0666, 3);
     } else {
@@ -870,6 +897,7 @@ uint64_t sys_faccessat(Process& p, uint64_t dirfd, uint64_t path, uint64_t mode)
   const int64_t r = resolve_at(p, dirfd, path, false, &virtual_path);
   if (r < 0) return error(-r);
   if (files.device_at(virtual_path.view()) != DescriptorKind::Closed) return 0;
+  if (InputNodeMeta input; const int64_t at = input_node_at(virtual_path.view(), &input, 0)) return at < 0 ? error(-at) : 0;
   DirectoryEntry entry;
   const Status status = files.stat(virtual_path.view(), &entry);
   if (status != Status::Ok) return errno_of(status);
@@ -1234,11 +1262,13 @@ uint64_t sys_fcntl(Process& p, uint64_t fd, uint64_t command, uint64_t argument)
       }
       OpenObject* object = files.object(fd);
       if (!object) return files.kind(fd) == DescriptorKind::ConsoleInput ? 0 : kORdWr;
-      return (object->readable && object->writable ? kORdWr : object->writable ? kOWrite : 0) | (object->append ? kOAppend : 0);
+      return (object->readable && object->writable ? kORdWr : object->writable ? kOWrite : 0) | (object->append ? kOAppend : 0) |
+             (files.kind(fd) == DescriptorKind::InputDevice && input_non_blocking(p, fd) ? kONonBlock : 0);
     }
     case 4:        // F_SETFL: O_NONBLOCK of a socket; nothing else here can change
       if (files.kind(fd) == DescriptorKind::UnixSocket) set_socket_non_blocking(p, fd, (argument & kONonBlock) != 0);
       if (files.kind(fd) == DescriptorKind::Socket) set_inet_non_blocking(p, fd, (argument & kONonBlock) != 0);
+      if (files.kind(fd) == DescriptorKind::InputDevice) set_input_non_blocking(p, fd, (argument & kONonBlock) != 0);
       return 0;
     case 1031:     // F_SETPIPE_SZ / F_GETPIPE_SZ: a pipe's buffer is always kFifoBytes
     case 1032:
@@ -1458,6 +1488,7 @@ uint64_t sys_ioctl(Process& p, uint64_t fd, uint64_t request, uint64_t argument)
   if (kind == DescriptorKind::Closed) return error(kEbadf);
   if (kind == DescriptorKind::UnixSocket || kind == DescriptorKind::Socket) return socket_ioctl(p, fd, request, argument);      // (FIONREAD, FIONBIO: LinuxSockets.cpp)
   if (kind == DescriptorKind::File) return dmabuf_ioctl(p, fd, request, argument);
+  if (kind == DescriptorKind::InputDevice) return input_ioctl(p, fd, request, argument);      // (evdev and joydev: LinuxInput.cpp)
   if (kind != DescriptorKind::Dxg) return error(kEnotty);
   const uint32_t code = uint32_t(request);      // (the request is an unsigned int: the upper half is not part of it)
   if (code == TCOS_DXG_IOCTL_EXPORT) return dxg_export(p, argument);

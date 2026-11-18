@@ -274,8 +274,10 @@ joypad code called through the NULL `IDirectInput8` that `DirectInput8Create` "s
   [GameControllers.md](GameControllers.md)): XInput users 0-3 are the service's player slots 0-3, with state, rumble, capabilities, battery and key presses.
   An empty slot is `ERROR_DEVICE_NOT_CONNECTED`, a slot past 3 `ERROR_BAD_ARGUMENTS`. The ordinal-only exports @100-104 and @108 are there; every other
   name of the library (`xinput1_3`, `xinput9_1_0`, `xinputuap`) loads this one (`canonical_library_name`).
-- **dinput8** (`src/Windows/dinput8`): `DirectInput8Create` hands out a real `IDirectInput8A/W` with no devices (`EnumDevices` calls nothing back, `CreateDevice` is
-  `DIERR_DEVICENOTREG`); `CoCreateInstance(CLSID_DirectInput8)` reaches its class factory (ole32 knows the class). Not done: the system keyboard and mouse devices, action mapping.
+- **dinput8** (`src/Windows/dinput8`): `DirectInput8Create` hands out a real `IDirectInput8A/W`. `EnumDevices` lists the game controllers (one gamepad per
+  occupied slot of the kernel's game controller service) and `CreateDevice` makes an `IDirectInputDevice8A/W` of one (`joystick.inc`; see
+  [GameControllers.md](GameControllers.md)). `CoCreateInstance(CLSID_DirectInput8)` reaches its class factory (ole32 knows the class). Not done: the system
+  keyboard and mouse devices, force feedback, action mapping.
 - **avrt** (`src/Windows/avrt`): MMCSS registration for the standard task names (a time-critical thread priority until reverted; handles checked against a table).
 - **iphlpapi** (`src/Windows/iphlpapi`): the loopback adapter (index 1) and one Ethernet adapter per kernel interface, whose IPv4 configuration comes from `NtSocketControl`
   operation 5 (new): `GetAdaptersAddresses` (Windows' layout; the size does not depend on the flags), `GetAdaptersInfo`, `GetIfTable`, `GetIfEntry(2)`, `GetIpAddrTable`,

@@ -57,6 +57,7 @@
 #include "Hardware/MidiDevice/Usb/UsbMidiService.hpp"
 #include "Hardware/GameController/GameControllerService.hpp"
 #include "Hardware/GameController/WindowsGamepadService.hpp"
+#include "Hardware/LinuxGamepads.hpp"
 #include "Kernel/Paging.hpp"
 #include "CPUScheduler/Scheduler.hpp"
 #include "console.hpp"
@@ -1435,6 +1436,7 @@ static efi::Status kernel_main(efi::Handle image, efi::SystemTable* st) {
     console::debug_puts("\n");
   }, nullptr);
   hardware::install_windows_gamepad(&game_controllers);
+  hardware::install_linux_gamepads(&game_controllers);      // /dev/input/eventN and jsN for Linux programs (src/Process/LinuxInput.hpp)
 
   // Input devices: PS/2, USB HID and virtio-input, merged into one keyboard and mouse.
   hardware::SystemInput input(pci, usb, shared_allocator, st);

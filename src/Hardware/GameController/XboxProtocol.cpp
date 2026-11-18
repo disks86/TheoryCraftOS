@@ -30,8 +30,8 @@ uint16_t le16(ConstByteView m, uint32_t offset) { return static_cast<uint16_t>(m
 uint32_t finish(const ByteWriter& w) { return w.ok() ? static_cast<uint32_t>(w.position()) : 0; }
 }  // namespace
 
-bool decode_360(ConstByteView m, gamepad::State* state) {
-  if (m.size() < 14 || m[0] != 0x00 || m[1] < 0x14) return false;
+// The body of a 360 report: buttons at 2, triggers at 4 and 5, sticks from 6 (the wired report's offsets; the wireless one has them 4 later).
+static void decode_360_body(ConstByteView m, gamepad::State* state) {
   state->buttons = (state->buttons & ~gamepad::kXInputButtonMask) | (le16(m, 2) & gamepad::kXInputButtonMask);
   state->left_trigger = m[4];
   state->right_trigger = m[5];
@@ -39,8 +39,59 @@ bool decode_360(ConstByteView m, gamepad::State* state) {
   state->left_y = le16s(m, 8);
   state->right_x = le16s(m, 10);
   state->right_y = le16s(m, 12);
+}
+
+bool decode_360(ConstByteView m, gamepad::State* state) {
+  if (m.size() < 14 || m[0] != 0x00 || m[1] < 0x14) return false;
+  decode_360_body(m, state);
   state->battery_kind = gamepad::BatteryKind::Wired;
   return true;
+}
+
+WirelessEvent decode_360w(ConstByteView m, gamepad::State* state) {
+  if (m.size() < 2) return WirelessEvent::None;
+  if (m[0] & 0x08) {                                   // (dis)connection
+    if (m[1] & 0x80) return WirelessEvent::Connected;
+    *state = gamepad::State();
+    return WirelessEvent::Disconnected;
+  }
+  if (!(m[1] & 0x01) || m.size() < 4 + 14) return WirelessEvent::None;
+  decode_360_body(m.dropped(4), state);
+  state->battery_kind = gamepad::BatteryKind::Unknown;   // (the level comes in a status message not read here)
+  return WirelessEvent::Input;
+}
+
+uint32_t encode_360w_inquiry(ByteView out) {
+  ByteWriter w(out);
+  w.u8(0x08);
+  w.u8(0x00);
+  w.u8(0x0F);
+  w.u8(0xC0);
+  w.zeros(8);
+  return finish(w);
+}
+
+uint32_t encode_360w_led(uint8_t player, ByteView out) {
+  ByteWriter w(out);
+  w.u8(0x00);
+  w.u8(0x00);
+  w.u8(0x08);
+  w.u8(static_cast<uint8_t>(0x40 | (player >= 1 && player <= 4 ? 5 + player : 0)));
+  w.zeros(8);
+  return finish(w);
+}
+
+uint32_t encode_360w_rumble(uint16_t low_frequency, uint16_t high_frequency, ByteView out) {
+  ByteWriter w(out);
+  w.u8(0x00);
+  w.u8(0x01);
+  w.u8(0x0F);
+  w.u8(0xC0);
+  w.u8(0x00);
+  w.u8(static_cast<uint8_t>(low_frequency >> 8));
+  w.u8(static_cast<uint8_t>(high_frequency >> 8));
+  w.zeros(5);
+  return finish(w);
 }
 
 uint32_t encode_360_rumble(uint16_t low_frequency, uint16_t high_frequency, ByteView out) {
