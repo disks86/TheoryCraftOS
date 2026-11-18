@@ -410,7 +410,7 @@ static const Attribute g_no_attribute = {0, 255, 0};
 
 /* What the shaders take, out of a declaration's elements. */
 static void layout_of_elements(const D3DVERTEXELEMENT9 *e, UINT count, Layout *l) {
-  l->position = l->colour = l->specular = l->texture[0] = l->texture[1] = g_no_attribute;
+  l->position = l->colour = l->specular = l->normal = l->texture[0] = l->texture[1] = g_no_attribute;
   l->transformed = 0;
   for (UINT i = 0; i < count && e[i].Stream != 0xFF; ++i) {
     const Attribute a = {(BYTE)e[i].Stream, e[i].Type, e[i].Offset};
@@ -420,6 +420,7 @@ static void layout_of_elements(const D3DVERTEXELEMENT9 *e, UINT count, Layout *l
       l->transformed = e[i].Usage == D3DDECLUSAGE_POSITIONT;
     } else if (e[i].Usage == D3DDECLUSAGE_COLOR && e[i].UsageIndex == 0) l->colour = a;
     else if (e[i].Usage == D3DDECLUSAGE_COLOR && e[i].UsageIndex == 1) l->specular = a;
+    else if (e[i].Usage == D3DDECLUSAGE_NORMAL && e[i].UsageIndex == 0) l->normal = a;
     else if (e[i].Usage == D3DDECLUSAGE_TEXCOORD && e[i].UsageIndex < 2) l->texture[e[i].UsageIndex] = a;
   }
 }

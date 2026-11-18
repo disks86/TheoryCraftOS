@@ -76,7 +76,8 @@ static BOOL attribute_inside(const Attribute *a, const Source *sources, UINT fir
   return first <= 0xFFFFFFFFu - count && last <= s->bytes;
 }
 /* Decodes `count` vertices from `first` into the shaders' layout. */
-static void decode_vertices(const Layout *l, const Source *sources, UINT first, UINT count, BYTE *out) {
+/* Decodes `count` vertices from `first` for the fixed-function shaders; with `lit` their colours are what the lights make of them. */
+static void decode_vertices(const Layout *l, const Source *sources, UINT first, UINT count, BYTE *out, const FflSetup *lit) {
   for (UINT v = 0; v < count; ++v, out += VERTEX_BYTES) {
     float *f = (float *)out, value[4];
     f[3] = 1.0f;      /* (the fourth of a position that are pixels is 1 / w; one of three numbers has none) */
@@ -90,13 +91,17 @@ static void decode_vertices(const Layout *l, const Source *sources, UINT first, 
       f[8 + 2 * t] = value[0];
       f[9 + 2 * t] = value[1];
     }
-    /* the fog factor a vertex brings is the alpha of its second colour; a vertex without one brings none (1) */
-    f[12] = 1.0f;
-    f[13] = 0.0f;
-    if (l->specular.type != 255) {
-      value[3] = 1.0f;
-      decode_element(l->specular.type, sources[l->specular.stream].data + (SIZE_T)(first + v) * sources[l->specular.stream].stride + l->specular.offset, value);
-      f[12] = value[3];
+    /* the second colour, and the fog factor a vertex brings, which is its alpha; a vertex without one brings none (1) */
+    float second[4] = {0.0f, 0.0f, 0.0f, 1.0f};
+    if (l->specular.type != 255)
+      decode_element(l->specular.type, sources[l->specular.stream].data + (SIZE_T)(first + v) * sources[l->specular.stream].stride + l->specular.offset, second);
+    f[12] = second[3];
+    f[13] = second[0]; f[14] = second[1]; f[15] = second[2];
+    if (lit) {
+      float normal[4] = {0.0f, 0.0f, 0.0f, 0.0f}, first_colour[4] = {f[4], f[5], f[6], f[7]};
+      if (l->normal.type != 255)
+        decode_element(l->normal.type, sources[l->normal.stream].data + (SIZE_T)(first + v) * sources[l->normal.stream].stride + l->normal.offset, normal);
+      ffl_light_vertex(lit, f, normal, l->colour.type != 255 ? first_colour : NULL, l->specular.type != 255 ? second : NULL, f + 4, f + 13);
     }
   }
 }
@@ -204,7 +209,7 @@ static ID3D12PipelineState *pipeline_get(Dev *d, const Shader *vs, const Shader 
                                                      {"COLOR", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 16, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
                                                      {"TEXCOORD", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 32, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
                                                      {"TEXCOORD", 1, DXGI_FORMAT_R32G32_FLOAT, 0, 40, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
-                                                     {"TEXCOORD", 2, DXGI_FORMAT_R32G32_FLOAT, 0, 48, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0}};
+                                                     {"TEXCOORD", 2, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 48, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0}};
   D3D12_GRAPHICS_PIPELINE_STATE_DESC pd;
   memset(&pd, 0, sizeof pd);
   /* (a program's vertex shader: its inputs are "ATTR" and the number of the register, each four floats, in the order the vertices are decoded in) */
@@ -351,6 +356,57 @@ static BOOL fog_by_w(const State *s) {
   const D3DMATRIX *p = &s->projection;
   return (p->m[0][3] != 0.0f || p->m[1][3] != 0.0f || p->m[2][3] != 0.0f || p->m[3][3] != 1.0f);
 }
+/* A colour of Direct3D 9 as three numbers. */
+static void colour_of(const D3DCOLORVALUE *c, float out[3]) { out[0] = c->r; out[1] = c->g; out[2] = c->b; }
+/* What lights the vertices of a draw (ff_lighting.h), out of the state: the matrices, the material and where its colours come from, and the
+ * first FFL_LIGHTS lights that shine, brought into view space. */
+static void lighting_of(const State *s, FflSetup *out) {
+  memset(out, 0, sizeof *out);
+  const D3DMATRIX world_view = matrix_multiply(&s->world, &s->view);
+  memcpy(out->world_view, world_view.m, sizeof out->world_view);
+  ffl_normal_matrix(out->world_view, out->normal);
+  const DWORD ambient = s->rs[D3DRS_AMBIENT];
+  out->ambient[0] = ((ambient >> 16) & 255) / 255.0f;
+  out->ambient[1] = ((ambient >> 8) & 255) / 255.0f;
+  out->ambient[2] = (ambient & 255) / 255.0f;
+  colour_of(&s->material.Diffuse, out->material_diffuse);
+  out->material_diffuse[3] = s->material.Diffuse.a;
+  colour_of(&s->material.Ambient, out->material_ambient);
+  colour_of(&s->material.Specular, out->material_specular);
+  colour_of(&s->material.Emissive, out->material_emissive);
+  out->power = s->material.Power;
+  if (s->rs[D3DRS_COLORVERTEX]) {      /* (D3DMCS_MATERIAL, _COLOR1, _COLOR2 are 0, 1, 2; without this state all is the material's) */
+    out->diffuse_source = (int)s->rs[D3DRS_DIFFUSEMATERIALSOURCE];
+    out->ambient_source = (int)s->rs[D3DRS_AMBIENTMATERIALSOURCE];
+    out->specular_source = (int)s->rs[D3DRS_SPECULARMATERIALSOURCE];
+    out->emissive_source = (int)s->rs[D3DRS_EMISSIVEMATERIALSOURCE];
+  }
+  out->specular = s->rs[D3DRS_SPECULARENABLE] != 0;
+  out->normalize = s->rs[D3DRS_NORMALIZENORMALS] != 0;
+  out->local_viewer = s->rs[D3DRS_LOCALVIEWER] != 0;
+  for (UINT i = 0; i < LIGHTS && out->lights < FFL_LIGHTS; ++i) {
+    if (!(s->light_on >> i & 1)) continue;
+    const D3DLIGHT9 *from = &s->light[i];
+    FflLight *light = &out->light[out->lights++];
+    light->type = from->Type == D3DLIGHT_DIRECTIONAL ? FFL_DIRECTIONAL : from->Type == D3DLIGHT_SPOT ? FFL_SPOT : FFL_POINT;
+    colour_of(&from->Diffuse, light->diffuse);
+    colour_of(&from->Specular, light->specular);
+    colour_of(&from->Ambient, light->ambient);
+    const float place[3] = {from->Position.x, from->Position.y, from->Position.z}, way[3] = {from->Direction.x, from->Direction.y, from->Direction.z};
+    for (int k = 0; k < 3; ++k) {
+      light->position[k] = place[0] * s->view.m[0][k] + place[1] * s->view.m[1][k] + place[2] * s->view.m[2][k] + s->view.m[3][k];
+      light->to_light[k] = -(way[0] * s->view.m[0][k] + way[1] * s->view.m[1][k] + way[2] * s->view.m[2][k]);
+    }
+    ffl_normalize(light->to_light);
+    light->range = from->Range;
+    light->attenuation[0] = from->Attenuation0;
+    light->attenuation[1] = from->Attenuation1;
+    light->attenuation[2] = from->Attenuation2;
+    light->cos_inner = ffl_cos(from->Theta * 0.5f);
+    light->cos_outer = ffl_cos(from->Phi * 0.5f);
+    light->falloff = from->Falloff;
+  }
+}
 /* The registers a draw's block of constants has: the vertex shader's, then the pixel shader's. */
 static UINT constant_registers(const Shader *vs, const Shader *ps) { return (vs ? vs->registers : VERTEX_REGISTERS) + (ps ? ps->registers : PIXEL_REGISTERS); }
 /* Writes the block of constants of the draw and gives its address. (The ring has room for a whole block: draw() saw to it.) */
@@ -400,6 +456,7 @@ static UINT64 constants_of(Dev *d, const Layout *l, const Shader *vs, const Shad
       stage_weights(textured ? t[D3DTSS_COLOROP] : D3DTOP_DISABLE, t[D3DTSS_COLORARG1], t[D3DTSS_COLORARG2], pixel + 8 * stage);
       stage_weights(textured ? t[D3DTSS_ALPHAOP] : D3DTOP_DISABLE, t[D3DTSS_ALPHAARG1], t[D3DTSS_ALPHAARG2], pixel + 8 * stage + 4);
     }
+    pixel[3] = s->rs[D3DRS_SPECULARENABLE] ? 1.0f : 0.0f;      /* (the specular colour is added after the stages) */
     shader_state(pixel + PIXEL_STATE_REGISTER * 4, s, TRUE, TRUE, fog_by_w(s));
   }
   if (!d->constant_valid || d->constant_last_bytes != bytes || memcmp(d->constant_data + d->constant_last, block, bytes) != 0) {
@@ -510,7 +567,7 @@ static HRESULT draw(Dev *d, D3DPRIMITIVETYPE type, UINT primitives, const Source
     if (layout.position.type == 255) return D3DERR_INVALIDCALL;
     if (!attribute_inside(&layout.position, sources, first_vertex, vertices) || !attribute_inside(&layout.colour, sources, first_vertex, vertices) ||
         !attribute_inside(&layout.texture[0], sources, first_vertex, vertices) || !attribute_inside(&layout.texture[1], sources, first_vertex, vertices) ||
-        !attribute_inside(&layout.specular, sources, first_vertex, vertices))
+        !attribute_inside(&layout.specular, sources, first_vertex, vertices) || !attribute_inside(&layout.normal, sources, first_vertex, vertices))
       return D3DERR_INVALIDCALL;
   }
   const UINT stride = vs ? 16 * (vs->input_count ? vs->input_count : 1) : VERTEX_BYTES;
@@ -530,7 +587,13 @@ static HRESULT draw(Dev *d, D3DPRIMITIVETYPE type, UINT primitives, const Source
   /* the vertices, and the indices counted from the first of them */
   const UINT vertex_at = d->vertex_used, index_at = d->index_used;
   if (vs) decode_shader_vertices(inputs, vs->input_count, sources, first_vertex, vertices, d->vertex_data + vertex_at);
-  else decode_vertices(&layout, sources, first_vertex, vertices, d->vertex_data + vertex_at);
+  else {
+    /* (lighting is the fixed-function vertex stage's, for positions that are not pixels already) */
+    FflSetup lighting;
+    const BOOL lit = d->state.rs[D3DRS_LIGHTING] && !layout.transformed;
+    if (lit) lighting_of(&d->state, &lighting);
+    decode_vertices(&layout, sources, first_vertex, vertices, d->vertex_data + vertex_at, lit ? &lighting : NULL);
+  }
   d->vertex_used += vertices * stride;
   if (out_indices) {
     UINT *out = (UINT *)(d->index_data + index_at);

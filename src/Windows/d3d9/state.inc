@@ -45,6 +45,10 @@ static void state_defaults(State *s, BOOL depth, UINT width, UINT height) {
   s->rs[D3DRS_TEXTUREFACTOR] = 0xFFFFFFFFu;
   s->rs[D3DRS_LIGHTING] = TRUE;
   s->rs[D3DRS_COLORVERTEX] = TRUE;
+  s->rs[D3DRS_LOCALVIEWER] = TRUE;
+  s->rs[D3DRS_DIFFUSEMATERIALSOURCE] = D3DMCS_COLOR1;
+  s->rs[D3DRS_SPECULARMATERIALSOURCE] = D3DMCS_COLOR2;
+  s->rs[D3DRS_AMBIENTMATERIALSOURCE] = s->rs[D3DRS_EMISSIVEMATERIALSOURCE] = D3DMCS_MATERIAL;
   s->rs[D3DRS_CLIPPING] = TRUE;
   s->rs[D3DRS_COLORWRITEENABLE] = 0xF;
   s->rs[D3DRS_BLENDOP] = s->rs[D3DRS_BLENDOPALPHA] = D3DBLENDOP_ADD;
@@ -70,6 +74,8 @@ static void state_defaults(State *s, BOOL depth, UINT width, UINT height) {
   s->viewport = viewport;
   SetRect(&s->scissor, 0, 0, (int)width, (int)height);
   memset(&s->material, 0, sizeof s->material);
+  memset(s->light, 0, sizeof s->light);
+  s->light_set = s->light_on = 0;
   s->fvf = 0;
   memset(s->vs_float, 0, sizeof s->vs_float);
   memset(s->ps_float, 0, sizeof s->ps_float);
@@ -201,9 +207,37 @@ static HRESULT STDMETHODCALLTYPE dev_GetMaterial(Dev *d, D3DMATERIAL9 *material)
   *material = d->state.material;
   return D3D_OK;
 }
-/* (lights are taken and not used: nothing is lit) */
-static HRESULT STDMETHODCALLTYPE dev_SetLight(Dev *d, DWORD index, const D3DLIGHT9 *light) { (void)d; (void)index; return light ? D3D_OK : D3DERR_INVALIDCALL; }
-static HRESULT STDMETHODCALLTYPE dev_LightEnable(Dev *d, DWORD index, BOOL enable) { (void)d; (void)index; (void)enable; return D3D_OK; }
+/* The lights, by their numbers (LIGHTS of them); draw.inc lights the vertices of the fixed-function pipeline with the ones that shine. */
+static HRESULT STDMETHODCALLTYPE dev_SetLight(Dev *d, DWORD index, const D3DLIGHT9 *light) {
+  if (!light || index >= LIGHTS || light->Type < D3DLIGHT_POINT || light->Type > D3DLIGHT_DIRECTIONAL) return D3DERR_INVALIDCALL;
+  d->state.light[index] = *light;
+  d->state.light_set |= 1u << index;
+  return D3D_OK;
+}
+static HRESULT STDMETHODCALLTYPE dev_GetLight(Dev *d, DWORD index, D3DLIGHT9 *light) {
+  if (!light || index >= LIGHTS || !(d->state.light_set >> index & 1)) return D3DERR_INVALIDCALL;
+  *light = d->state.light[index];
+  return D3D_OK;
+}
+static HRESULT STDMETHODCALLTYPE dev_LightEnable(Dev *d, DWORD index, BOOL enable) {
+  if (index >= LIGHTS) return D3DERR_INVALIDCALL;
+  if (!(d->state.light_set >> index & 1)) {      /* (a light nobody set is a white one that shines along z) */
+    D3DLIGHT9 *light = &d->state.light[index];
+    memset(light, 0, sizeof *light);
+    light->Type = D3DLIGHT_DIRECTIONAL;
+    light->Diffuse.r = light->Diffuse.g = light->Diffuse.b = 1.0f;
+    light->Direction.z = 1.0f;
+    d->state.light_set |= 1u << index;
+  }
+  if (enable) d->state.light_on |= 1u << index;
+  else d->state.light_on &= ~(1u << index);
+  return D3D_OK;
+}
+static HRESULT STDMETHODCALLTYPE dev_GetLightEnable(Dev *d, DWORD index, BOOL *enable) {
+  if (!enable || index >= LIGHTS || !(d->state.light_set >> index & 1)) return D3DERR_INVALIDCALL;
+  *enable = (d->state.light_on >> index & 1) ? TRUE : FALSE;
+  return D3D_OK;
+}
 static HRESULT STDMETHODCALLTYPE dev_SetClipPlane(Dev *d, DWORD index, const float *plane) { (void)d; (void)index; (void)plane; return D3D_OK; }
 static HRESULT STDMETHODCALLTYPE dev_SetNPatchMode(Dev *d, float segments) { (void)d; (void)segments; return D3D_OK; }
 static float STDMETHODCALLTYPE dev_GetNPatchMode(Dev *d) { (void)d; return 0.0f; }

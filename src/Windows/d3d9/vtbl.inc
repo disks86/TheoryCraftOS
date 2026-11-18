@@ -25,8 +25,6 @@ static HRESULT STDMETHODCALLTYPE dev_vtbl_none_GetRasterStatus(IDirect3DDevice9 
 static HRESULT STDMETHODCALLTYPE dev_vtbl_none_CreateVolumeTexture(IDirect3DDevice9 *This, UINT Width, UINT Height, UINT Depth, UINT Levels, DWORD Usage, D3DFORMAT Format, D3DPOOL Pool, IDirect3DVolumeTexture9** ppVolumeTexture, HANDLE* pSharedHandle) { return E_NOTIMPL; }
 static HRESULT STDMETHODCALLTYPE dev_vtbl_none_CreateCubeTexture(IDirect3DDevice9 *This, UINT EdgeLength, UINT Levels, DWORD Usage, D3DFORMAT Format, D3DPOOL Pool, IDirect3DCubeTexture9** ppCubeTexture, HANDLE* pSharedHandle) { return E_NOTIMPL; }
 static HRESULT STDMETHODCALLTYPE dev_vtbl_none_GetFrontBufferData(IDirect3DDevice9 *This, UINT iSwapChain, IDirect3DSurface9* pDestSurface) { return E_NOTIMPL; }
-static HRESULT STDMETHODCALLTYPE dev_vtbl_none_GetLight(IDirect3DDevice9 *This, DWORD Index, D3DLIGHT9*) { return E_NOTIMPL; }
-static HRESULT STDMETHODCALLTYPE dev_vtbl_none_GetLightEnable(IDirect3DDevice9 *This, DWORD Index, WINBOOL* pEnable) { return E_NOTIMPL; }
 static HRESULT STDMETHODCALLTYPE dev_vtbl_none_GetClipPlane(IDirect3DDevice9 *This, DWORD Index, float* pPlane) { return E_NOTIMPL; }
 static HRESULT STDMETHODCALLTYPE dev_vtbl_none_SetClipStatus(IDirect3DDevice9 *This, const D3DCLIPSTATUS9 *clip_status) { return E_NOTIMPL; }
 static HRESULT STDMETHODCALLTYPE dev_vtbl_none_GetClipStatus(IDirect3DDevice9 *This, D3DCLIPSTATUS9* pClipStatus) { return E_NOTIMPL; }
@@ -92,9 +90,9 @@ const IDirect3DDevice9Vtbl dev_vtbl = {
     .SetMaterial = (__typeof__(((IDirect3DDevice9Vtbl *)0)->SetMaterial))dev_SetMaterial,
     .GetMaterial = (__typeof__(((IDirect3DDevice9Vtbl *)0)->GetMaterial))dev_GetMaterial,
     .SetLight = (__typeof__(((IDirect3DDevice9Vtbl *)0)->SetLight))dev_SetLight,
-    .GetLight = (__typeof__(((IDirect3DDevice9Vtbl *)0)->GetLight))dev_vtbl_none_GetLight,
+    .GetLight = (__typeof__(((IDirect3DDevice9Vtbl *)0)->GetLight))dev_GetLight,
     .LightEnable = (__typeof__(((IDirect3DDevice9Vtbl *)0)->LightEnable))dev_LightEnable,
-    .GetLightEnable = (__typeof__(((IDirect3DDevice9Vtbl *)0)->GetLightEnable))dev_vtbl_none_GetLightEnable,
+    .GetLightEnable = (__typeof__(((IDirect3DDevice9Vtbl *)0)->GetLightEnable))dev_GetLightEnable,
     .SetClipPlane = (__typeof__(((IDirect3DDevice9Vtbl *)0)->SetClipPlane))dev_SetClipPlane,
     .GetClipPlane = (__typeof__(((IDirect3DDevice9Vtbl *)0)->GetClipPlane))dev_vtbl_none_GetClipPlane,
     .SetRenderState = (__typeof__(((IDirect3DDevice9Vtbl *)0)->SetRenderState))dev_SetRenderState,
