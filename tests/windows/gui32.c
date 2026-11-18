@@ -178,6 +178,24 @@ int main(void) {
   SHGetFileInfoW(L"C:\\Windows", 0, &file_info, sizeof(file_info), SHGFI_DISPLAYNAME);
   check(1, "SHGetFileInfoW returns");
   IShellLinkW *link = NULL;
+  /* COM's options for the whole process (what Chromium's programs set first of all: "do not handle my servers' exceptions"). */
+  {
+    static const GUID clsid_options = {0x0000034B, 0, 0, {0xC0, 0, 0, 0, 0, 0, 0, 0x46}}, iid_options = {0x0000015B, 0, 0, {0xC0, 0, 0, 0, 0, 0, 0, 0x46}};
+    struct Options;
+    struct OptionsVtbl {
+      HRESULT (WINAPI *QueryInterface)(struct Options *, REFIID, void **);
+      ULONG (WINAPI *AddRef)(struct Options *);
+      ULONG (WINAPI *Release)(struct Options *);
+      HRESULT (WINAPI *Set)(struct Options *, DWORD, ULONG_PTR);
+      HRESULT (WINAPI *Query)(struct Options *, DWORD, ULONG_PTR *);
+    };
+    struct Options { const struct OptionsVtbl *lpVtbl; } *options = NULL;
+    ULONG_PTR value = 0;
+    const HRESULT got = CoCreateInstance(&clsid_options, NULL, CLSCTX_INPROC_SERVER, &iid_options, (void **)&options);
+    check(SUCCEEDED(got) && options != NULL && options->lpVtbl->Set(options, 1 /* COMGLB_EXCEPTION_HANDLING */, 1 /* ..._DONOT_HANDLE */) == S_OK &&
+          options->lpVtbl->Query(options, 1, &value) == S_OK && value == 1 && FAILED(options->lpVtbl->Set(options, 99, 0)), "CoCreateInstance(CLSID_GlobalOptions): an option set and read back");
+    if (options) options->lpVtbl->Release(options);
+  }
   HRESULT made = CoCreateInstance(&CLSID_ShellLink, NULL, CLSCTX_INPROC_SERVER, &IID_IShellLinkW, (void **)&link);
   check(SUCCEEDED(made) && link != NULL, "CoCreateInstance(CLSID_ShellLink)");
   if (link) {

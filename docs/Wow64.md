@@ -199,6 +199,12 @@ Not done yet, in the order planned:
    another matter: TreeSize Free's setup program installs a 64-bit TreeSizeFree.exe and starts it, and that program faults (a call through a
    null pointer, after `NtOpenKey` answered "invalid handle" several times) - a gap of the 64-bit libraries, not of this layer. oleaut32 parses
    numbers exactly only up to 2^62 in a 32-bit program (i386 has no 128-bit integers).
+   **Chromium's programs** (Google's 32-bit updater, which installs Chrome) start: what they needed is the loader lock named in the 32-bit
+   PEB (offset 0xA0; they read through it at start-up), `CreateProcess` with a list of handles to inherit (the 32-bit `TcosCreateUserProcess`
+   passed kernel32's startup block to the kernel unconverted, which only went well while the block held nothing but zeros), the status block of
+   pipe and lock calls in the 32-bit layout (the kernel wrote 16 bytes: a 32-bit `ReadFile` on a pipe saw "0 bytes read" and lost 8 bytes
+   behind the block), and COM's `CLSID_GlobalOptions`. `tests/windows/crt32.c` and `gui32.c` check each. The updater then needs COM between
+   processes, which `ole32` does not have (docs/AppManager.md).
 5. **Other machines**: on ARM and RISC-V the x86 emulator (src/Emulation, src/EmulationJit) would need a 32-bit mode; nothing is done there.
 
 ## Finding out why a program gives up

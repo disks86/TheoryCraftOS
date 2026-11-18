@@ -24,6 +24,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <windows.h>
+#include <intrin.h>
 
 static int g_passed, g_failed;
 static void check(int ok, const char *what) {
@@ -52,6 +53,7 @@ static DWORD WINAPI worker(LPVOID parameter) {
 
 int main(int argc, char **argv) {
   if (argc >= 2 && strcmp(argv[1], "child") == 0) return 7;      /* (started by itself, below: a 32-bit program starting a 32-bit program) */
+  if (argc >= 3 && strcmp(argv[1], "event") == 0) return SetEvent((HANDLE)(UINT_PTR)strtoul(argv[2], NULL, 10)) ? 9 : 8;      /* (and with a handle it inherits) */
   printf("crt32: a 32-bit program with a C runtime is running\n");
   check(sizeof(void *) == 4 && argc >= 1 && argv[0] && strstr(argv[0], "crt32") != NULL, "32-bit pointers, and the program's name in argv[0]");
 
@@ -188,6 +190,72 @@ int main(int argc, char **argv) {
   check(child_started && WaitForSingleObject(child.hProcess, 20000) == WAIT_OBJECT_0 && GetExitCodeProcess(child.hProcess, &child_code) && child_code == 7,
         "CreateProcess starts a 32-bit program, which gets its argument and gives its exit code");
   if (child_started) { CloseHandle(child.hThread); CloseHandle(child.hProcess); }
+
+  /* What Chromium's programs do when they start (Google's updater stopped at each of these). The loader lock is where a 32-bit program looks for it: its own
+     PEB at FS:[0x30], offset 0xA0, a critical section whose owner can be read. */
+  {
+    const BYTE *peb = (const BYTE *)__readfsdword(0x30);
+    const RTL_CRITICAL_SECTION *loader_lock = *(RTL_CRITICAL_SECTION *const *)(peb + 0xA0);
+    check(loader_lock != NULL && (DWORD)(UINT_PTR)loader_lock->OwningThread != GetCurrentThreadId(), "the PEB names the loader lock, which this thread does not hold");
+  }
+  /* A named pipe read says how many bytes it read (the status block is the 32-bit one, 8 bytes: nothing behind it is written). */
+  {
+    const HANDLE server = CreateNamedPipeA("\\\\.\\pipe\\crt32-test", PIPE_ACCESS_DUPLEX, PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE, 1, 512, 512, 0, NULL);
+    const HANDLE client = CreateFileA("\\\\.\\pipe\\crt32-test", GENERIC_READ | GENERIC_WRITE, 0, NULL, OPEN_EXISTING, 0, NULL);
+    struct { DWORD read; DWORD guard; } counted = {0, 0x5AFE5AFE};
+    char message[36], answer[36];
+    DWORD written = 0, mode = PIPE_READMODE_MESSAGE;
+    memset(message, 'm', sizeof(message));
+    memset(answer, 0, sizeof(answer));
+    const BOOL sent = server != INVALID_HANDLE_VALUE && client != INVALID_HANDLE_VALUE && SetNamedPipeHandleState(client, &mode, NULL, NULL) &&
+                      WriteFile(client, message, sizeof(message), &written, NULL) && written == sizeof(message);
+    const BOOL got = sent && ReadFile(server, answer, sizeof(answer), &counted.read, NULL);
+    check(got && counted.read == sizeof(message) && counted.guard == 0x5AFE5AFE && memcmp(answer, message, sizeof(message)) == 0, "a pipe read gives the message and its length");
+    if (client != INVALID_HANDLE_VALUE) CloseHandle(client);
+    if (server != INVALID_HANDLE_VALUE) CloseHandle(server);
+  }
+  /* A handle opened to append (and not to write elsewhere) writes at the end, whatever the file's other handles did. */
+  {
+    char path[MAX_PATH], back[16];
+    DWORD done = 0;
+    GetTempPathA(MAX_PATH, path);
+    strcat(path, "crt32-append.txt");
+    HANDLE first = CreateFileA(path, GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, CREATE_ALWAYS, 0, NULL);
+    BOOL ok = first != INVALID_HANDLE_VALUE && WriteFile(first, "one", 3, &done, NULL);
+    HANDLE append = CreateFileA(path, FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_ALWAYS, 0, NULL);
+    ok = ok && append != INVALID_HANDLE_VALUE && WriteFile(append, "two", 3, &done, NULL) && WriteFile(first, "1", 1, &done, NULL) && WriteFile(append, "3", 1, &done, NULL);
+    if (first != INVALID_HANDLE_VALUE) CloseHandle(first);
+    if (append != INVALID_HANDLE_VALUE) CloseHandle(append);
+    first = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
+    memset(back, 0, sizeof(back));
+    ok = ok && first != INVALID_HANDLE_VALUE && ReadFile(first, back, sizeof(back) - 1, &done, NULL);
+    /* ("one"; "two" appended; "1" by the first handle at its own place, over the 't'; "3" appended) */
+    check(ok && done == 7 && strcmp(back, "one1wo3") == 0, "a handle opened to append writes at the end");
+    if (first != INVALID_HANDLE_VALUE) CloseHandle(first);
+    DeleteFileA(path);
+  }
+  /* A child that inherits only the handles of a list (how a crash handler is started): it starts, and gets the handle. */
+  {
+    SECURITY_ATTRIBUTES inheritable = {sizeof(inheritable), NULL, TRUE};
+    HANDLE listed = CreateEventA(&inheritable, TRUE, FALSE, NULL);
+    SIZE_T size = 0;
+    struct { STARTUPINFOA info; LPPROC_THREAD_ATTRIBUTE_LIST list; } extended;
+    PROCESS_INFORMATION made;
+    DWORD code = 0;
+    InitializeProcThreadAttributeList(NULL, 1, 0, &size);
+    LPPROC_THREAD_ATTRIBUTE_LIST list = malloc(size);
+    memset(&extended, 0, sizeof(extended));
+    extended.info.cb = sizeof(extended);
+    extended.list = list;
+    sprintf(command_line, "\"%s\" event %lu", own_path, (unsigned long)(UINT_PTR)listed);
+    const BOOL started = list && InitializeProcThreadAttributeList(list, 1, 0, &size) && UpdateProcThreadAttribute(list, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, &listed, sizeof(listed), NULL, NULL) &&
+                         CreateProcessA(NULL, command_line, NULL, NULL, TRUE, EXTENDED_STARTUPINFO_PRESENT, NULL, NULL, &extended.info, &made);
+    check(started && WaitForSingleObject(made.hProcess, 20000) == WAIT_OBJECT_0 && GetExitCodeProcess(made.hProcess, &code) && code == 9 &&
+          WaitForSingleObject(listed, 0) == WAIT_OBJECT_0, "CreateProcess with a list of handles to inherit: the child sets the event it was handed");
+    if (started) { CloseHandle(made.hThread); CloseHandle(made.hProcess); }
+    free(list);
+    CloseHandle(listed);
+  }
 
   /* What a 32-bit program is told about itself and the machine: it runs "under WOW64" on a 64-bit processor. */
   BOOL wow = FALSE;

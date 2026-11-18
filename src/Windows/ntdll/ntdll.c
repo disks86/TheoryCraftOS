@@ -425,6 +425,14 @@ static RTL_CRITICAL_SECTION g_loader_section = {NULL, -1, 0, NULL, NULL, 0};
 static void loader_publish(void) {
   PRTL_CRITICAL_SECTION *slot = (PRTL_CRITICAL_SECTION *)(PEB_RAW() + 0x110);
   if (*slot != &g_loader_section) *slot = &g_loader_section;
+#ifdef __i386__
+  /* A 32-bit program reads its own PEB (the one FS:[0x30] names), where LoaderLock is at 0xA0: Chromium's code asks "does this thread hold the loader lock" at
+   * start-up and reads through the pointer without a check. */
+  {
+    BYTE *peb32 = *(BYTE **)((BYTE *)NtCurrentTeb() + 0x30);
+    if (peb32 && *(PRTL_CRITICAL_SECTION *)(peb32 + 0xA0) != &g_loader_section) *(PRTL_CRITICAL_SECTION *)(peb32 + 0xA0) = &g_loader_section;
+  }
+#endif
 }
 static void loader_lock(void) {
   loader_publish();

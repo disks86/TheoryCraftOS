@@ -200,11 +200,14 @@ Windows side:
   - `KeePassXCTeam.KeePassXC` (a Windows Installer package, 69 MB, an LZX cabinet): installed by this system's own engine, "KeePassXC (Windows)"
     in the Start menu, removed again with the kept package. Its first run found that the kernel's registry makes only the last key of a path;
     the installer's registry functions now make a key's parents one by one.
-  - `Google.Chrome` is a Windows Installer package that only wraps Google's updater: the engine unpacks `updater.exe` and runs it with the
-    command line the package builds, as `msiexec` would. In QEMU (with the checksum check off for the experiment, because Google had already
-    replaced the file the manifest names) that 32-bit program stops with an access violation in the Windows layer, and the installation fails
-    with "the program of its step DoInstall ended with code 3221225477". Chrome does not install yet; what is missing is in the Windows layer
-    (see Wow64.md), not in the package handling.
+  - `Google.Chrome` is a Windows Installer package that only wraps Google's updater: the engine unpacks the updater's setup program and runs it
+    with the command line the package builds, as `msiexec` would. That program (32-bit, Chromium code) now starts, unpacks itself, starts its
+    crash handler and sets itself up; getting there fixed five faults of the Windows layer (the loader lock in a 32-bit program's PEB, the
+    startup block of a 32-bit `CreateProcess` with a list of handles, status blocks of pipe calls written in the 64-bit layout for 32-bit
+    programs, handles opened only to append, and COM's `CLSID_GlobalOptions`). It then stops with its error 75003 ("updater registration
+    failed"): the updater does its work in a second process that it reaches through COM (`CoCreateInstance` of a class served by a Windows
+    service), and this system's `ole32` has no COM between processes. Chrome does not install until it has. (The run was made with the
+    checksum check off, because Google had already replaced the file the manifest names.)
 
   The 7-Zip run found two faults that are fixed: this system's `msvcrt.dll` did not export the data `_fmode`, `_commode` and `_acmdln` that the
   startup code of older programs imports (the setup program crashed at once), and a program that an ended program had started went on using what

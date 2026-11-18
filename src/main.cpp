@@ -2536,7 +2536,17 @@ static efi::Status kernel_main(efi::Handle image, efi::SystemTable* st) {
           if (p.running_setup) console::puts("winget-selftest: running the setup program\n");
         };
         String detail(*t.allocator);
+        // While a setup program runs: what its threads are doing, every 30 seconds (a program that waits for something that never comes shows here).
+        static bool installing = false;
+        installing = true;
+        kernel::detach(kernel::spawn([](void*) {
+          for (uint32_t s = 1; __atomic_load_n(&installing, __ATOMIC_RELAXED); ++s) {
+            kernel::sleep_ms(1000);
+            if (__atomic_load_n(&installing, __ATOMIC_RELAXED) && s % 30 == 0) kernel::usermode::report();
+          }
+        }, nullptr, "winget-report"));
         const desktop::appman::Result r = package ? installer.install(*package, &progress, &detail) : desktop::appman::Result::NoManifest;
+        __atomic_store_n(&installing, false, __ATOMIC_RELAXED);
         console::puts("winget-selftest: install " TCOS_WINGET_SELFTEST ": ");
         console::puts(desktop::appman::result_name(r));
         console::puts(" (");

@@ -281,9 +281,7 @@ uint32_t nt_create_named_pipe_file(Process& p, const SyscallRequest& r) {
   if (status != kSuccess) { objects->release_pipe_end(c.id, 0); return status; }
   set_pipe_rights(p, handle, uint32_t(r.args[1]));
   if (!p.write_user_u64(r.args[0], handle)) { p.close_descriptor(handle / 4 - 1); return kAccessViolation; }
-  uint8_t iosb[16] = {};
-  iosb[8] = 2;      // FILE_CREATED
-  p.write_user(status_block, ConstByteView(iosb, 16));
+  put_io_status(p, status_block, kSuccess, 2);      // FILE_CREATED
   return kSuccess;
 }
 
@@ -303,8 +301,7 @@ uint32_t nt_cancel_synchronous_io_file(Process& p, const SyscallRequest& r) {
     thread = p.files().token(slot);
   }
   const uint32_t status = objects->pipe_cancel_synchronous(thread, r.args[1]) ? kSuccess : kNotFound;
-  uint8_t iosb[16] = {uint8_t(status), uint8_t(status >> 8), uint8_t(status >> 16), uint8_t(status >> 24)};
-  p.write_user(r.args[2], ConstByteView(iosb, 16));
+  put_io_status(p, r.args[2], status, 0);
   return status;
 }
 
@@ -478,15 +475,11 @@ uint32_t pipe_io(Process& p, uint64_t slot, bool write, uint64_t status_block, u
   }
   if (status != kSuccess) {
     if (status_block != 0 && status != 0xC0) {
-      uint8_t iosb[16] = {uint8_t(status), uint8_t(status >> 8), uint8_t(status >> 16), uint8_t(status >> 24)};
-      if (status == kMoreData) for (uint32_t i = 0; i < 8; ++i) iosb[8 + i] = uint8_t(done >> (8 * i));      // (the part that was read)
-      p.write_user(status_block, ConstByteView(iosb, 16));
+      put_io_status(p, status_block, status, status == kMoreData ? done : 0);      // (the part that was read)
     }
     return status;
   }
-  uint8_t iosb[16] = {};
-  for (uint32_t i = 0; i < 8; ++i) iosb[8 + i] = uint8_t(done >> (8 * i));
-  if (status_block != 0 && !p.write_user(status_block, ConstByteView(iosb, 16))) return kAccessViolation;
+  if (!put_io_status(p, status_block, kSuccess, done)) return kAccessViolation;
   return kSuccess;
 }
 
@@ -599,9 +592,7 @@ uint32_t pipe_query_information(Process& p, uint64_t slot, uint32_t info_class, 
   if (length < size) return kInfoLengthMismatch;
   if (!p.write_user(buffer, ConstByteView(out, size))) return kAccessViolation;
   if (status_block != 0) {
-    uint8_t iosb[16] = {};
-    iosb[8] = uint8_t(size);
-    p.write_user(status_block, ConstByteView(iosb, 16));
+    put_io_status(p, status_block, kSuccess, size);
   }
   return kSuccess;
 }
@@ -820,9 +811,7 @@ uint32_t fs_control_core(Process& p, const SyscallRequest& r, uint64_t slot, con
     default: status = kInvalidDeviceRequest; break;
   }
   if (status_block != 0 && status != 0xC0) {
-    uint8_t iosb[16] = {uint8_t(status), uint8_t(status >> 8), uint8_t(status >> 16), uint8_t(status >> 24)};
-    for (uint32_t i = 0; i < 8; ++i) iosb[8 + i] = uint8_t(information >> (8 * i));
-    p.write_user(status_block, ConstByteView(iosb, 16));
+    put_io_status(p, status_block, status, information);
   }
   return status;
 }

@@ -557,7 +557,10 @@ uint32_t file_io_core(Process& p, const SyscallRequest& r, bool write, const IoC
   if (status != kSuccess) return status;
   if (int64_t(requested) < 0 && requested != kUseFilePointer && requested != kWriteToEnd) return kInvalidParameter;      // (a negative offset other than the two special ones)
   uint64_t at = requested == kUseFilePointer ? object.position : requested;
-  if (requested == kWriteToEnd) {
+  // A handle that may append and may not write elsewhere (FILE_APPEND_DATA without FILE_WRITE_DATA: how a program opens a log that others write too) writes at the
+  // end, wherever it was asked to.
+  const bool appends = write && (object.granted_access & kFileAppendData) && !(object.granted_access & (kFileWriteData | kGenericWrite | kGenericAll));
+  if (requested == kWriteToEnd || appends) {
     if (!write) return kInvalidParameter;
     at = files.size_of(object);
   }
@@ -1472,6 +1475,12 @@ uint32_t nt_device_io_control_file(Process& p, const SyscallRequest& r) {
   }
   if (!p.write_user(output, ConstByteView(image, at))) return kAccessViolation;
   return store_io_status(p, status_block, kSuccess, at) ? kSuccess : kAccessViolation;
+}
+
+bool put_io_status(Process& p, uint64_t address, uint32_t status, uint64_t information) {
+  if (address == 0) return true;
+  if (p.arch() == UserArch::X86_32) return p.write_user_u32(address, status) && p.write_user_u32(address + 4, static_cast<uint32_t>(information));
+  return p.write_user_u64(address, status) && p.write_user_u64(address + 8, information);
 }
 
 }  // namespace process::windowsabi

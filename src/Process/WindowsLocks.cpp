@@ -61,7 +61,7 @@ uint32_t nt_lock_file(Process& p, const SyscallRequest& r) {
       default: return no_wait ? uint64_t{kLockNotGranted} : kWaitPending;
     }
   });
-  if (status_block != 0) { uint8_t iosb[16] = {uint8_t(status), uint8_t(status >> 8), uint8_t(status >> 16), uint8_t(status >> 24)}; p.write_user(status_block, ConstByteView(iosb, 16)); }
+  put_io_status(p, status_block, status, 0);
   return status;
 }
 
@@ -77,7 +77,7 @@ uint32_t nt_unlock_file(Process& p, const SyscallRequest& r) {
   uint32_t status = kSuccess;
   if (!file_and_range(p, r, r.args[2], r.args[3], &path, &owner, &offset, &length, &status)) return status;
   status = objects->unlock_range(path.view(), owner, offset, length) ? kSuccess : kRangeNotLocked;
-  if (r.args[1] != 0) { uint8_t iosb[16] = {uint8_t(status), uint8_t(status >> 8), uint8_t(status >> 16), uint8_t(status >> 24)}; p.write_user(r.args[1], ConstByteView(iosb, 16)); }
+  put_io_status(p, r.args[1], status, 0);
   return status;
 }
 

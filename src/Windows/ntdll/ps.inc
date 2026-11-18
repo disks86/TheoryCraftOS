@@ -19,14 +19,36 @@
    Included by ntdll.c after atom.inc. */
 
 #ifdef __i386__
-/* (the 32-bit ntdll.dll: widened by hand, as wow64.inc does for the others; `startup` is passed as it is) */
+/* (the 32-bit ntdll.dll: widened by hand, as wow64.inc does for the others. The startup block is kernel32's, with the handles and pointers of a 32-bit program: twelve
+   words, the console, the title and the desktop, the process that stands in for the parent and the list of handles to inherit. The kernel reads the same with 64-bit
+   handles and pointers, so it is made anew - passed as it was, a block with a handle list sent the kernel to addresses made of two fields each.) */
 EXPORT NTSTATUS NTAPI TcosCreateUserProcess(PHANDLE process, PHANDLE thread, PUNICODE_STRING image, PUNICODE_STRING command, PUNICODE_STRING cwd, PVOID environment, ULONG flags,
                                             PULONG process_id, PULONG thread_id, HANDLE std_in, HANDLE std_out, HANDLE std_err, PVOID startup) {
+  enum { kMostInherited = 64 };      /* (the kernel takes no more) */
+  typedef struct { ULONG words[12]; HANDLE console; PUNICODE_STRING title, desktop; HANDLE parent; HANDLE *inherit_list; ULONG inherit_count, reserved; } Startup32;
+  struct { ULONG words[12]; ULONG64 console, title, desktop, parent, inherit_list; ULONG inherit_count, reserved; } wide_startup;
+  ULONG64 wide_list[kMostInherited];
   ULONG64 wide_process = 0, wide_thread = 0;
-  UNICODE_STRING64 wide_image, wide_command, wide_cwd;
+  UNICODE_STRING64 wide_image, wide_command, wide_cwd, wide_title, wide_desktop;
+  const Startup32 *given = startup;
+  if (given) {
+    memset(&wide_startup, 0, sizeof(wide_startup));
+    memcpy(wide_startup.words, given->words, sizeof(wide_startup.words));
+    wide_startup.words[0] = sizeof(wide_startup);
+    wide_startup.console = WOW_HANDLE(given->console);
+    wide_startup.title = wow_unicode_string(&wide_title, given->title);
+    wide_startup.desktop = wow_unicode_string(&wide_desktop, given->desktop);
+    wide_startup.parent = WOW_HANDLE(given->parent);
+    if (given->inherit_list && given->inherit_count) {
+      if (given->inherit_count > kMostInherited) return (NTSTATUS)0xC000000Du;      /* STATUS_INVALID_PARAMETER */
+      for (ULONG i = 0; i < given->inherit_count; ++i) wide_list[i] = WOW_HANDLE(given->inherit_list[i]);
+      wide_startup.inherit_list = WOW_POINTER(wide_list);
+      wide_startup.inherit_count = given->inherit_count;
+    }
+  }
   const ULONG64 v[13] = {WOW_POINTER(&wide_process), WOW_POINTER(&wide_thread), wow_unicode_string(&wide_image, image), wow_unicode_string(&wide_command, command),
                          wow_unicode_string(&wide_cwd, cwd), WOW_POINTER(environment), flags, WOW_POINTER(process_id), WOW_POINTER(thread_id),
-                         WOW_HANDLE(std_in), WOW_HANDLE(std_out), WOW_HANDLE(std_err), WOW_POINTER(startup)};
+                         WOW_HANDLE(std_in), WOW_HANDLE(std_out), WOW_HANDLE(std_err), given ? WOW_POINTER(&wide_startup) : 0};
   const NTSTATUS status = wow_service(NT_SERVICE_NtCreateUserProcess, v);
   if (process) *process = (HANDLE)(ULONG_PTR)wide_process;
   if (thread) *thread = (HANDLE)(ULONG_PTR)wide_thread;

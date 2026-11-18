@@ -676,5 +676,49 @@ static HRESULT git_create_instance(IUnknown *outer, REFIID riid, void **out) {
   return git_qi(&g_git.iface, riid, out);
 }
 
+/* The global options of COM in this process (CLSID_GlobalOptions, IGlobalOptions): a few numbers a program sets before it uses COM, such as "do not swallow the
+   exceptions of my servers" (COMGLB_EXCEPTION_HANDLING), which Chromium's programs insist on at start-up. They are kept and given back; nothing here swallows
+   exceptions anyway. */
+static const GUID kClsidGlobalOptions = {0x0000034B, 0, 0, {0xC0, 0, 0, 0, 0, 0, 0, 0x46}};
+static const GUID kIidGlobalOptions = {0x0000015B, 0, 0, {0xC0, 0, 0, 0, 0, 0, 0, 0x46}};
+typedef struct GlobalOptions GlobalOptions;
+typedef struct GlobalOptionsVtbl {
+  HRESULT (WINAPI *QueryInterface)(GlobalOptions *, REFIID, void **);
+  ULONG (WINAPI *AddRef)(GlobalOptions *);
+  ULONG (WINAPI *Release)(GlobalOptions *);
+  HRESULT (WINAPI *Set)(GlobalOptions *, DWORD property, ULONG_PTR value);
+  HRESULT (WINAPI *Query)(GlobalOptions *, DWORD property, ULONG_PTR *value);
+} GlobalOptionsVtbl;
+struct GlobalOptions { const GlobalOptionsVtbl *lpVtbl; };
+enum { kGlobalOptionCount = 7 };      /* COMGLB_EXCEPTION_HANDLING = 1 ... COMGLB_PROPERTIES_RESERVED3 = 6 */
+static ULONG_PTR g_global_options[kGlobalOptionCount];
+static HRESULT WINAPI global_options_qi(GlobalOptions *me, REFIID riid, void **out) {
+  if (!out) return E_POINTER;
+  *out = NULL;
+  if (IsEqualGUID(riid, &IID_IUnknown) || IsEqualGUID(riid, &kIidGlobalOptions)) { *out = me; return S_OK; }
+  return E_NOINTERFACE;
+}
+static ULONG WINAPI global_options_addref(GlobalOptions *me) { (void)me; return 2; }
+static ULONG WINAPI global_options_release(GlobalOptions *me) { (void)me; return 1; }
+static HRESULT WINAPI global_options_set(GlobalOptions *me, DWORD property, ULONG_PTR value) {
+  (void)me;
+  if (property == 0 || property >= kGlobalOptionCount) return E_INVALIDARG;
+  g_global_options[property] = value;
+  return S_OK;
+}
+static HRESULT WINAPI global_options_query(GlobalOptions *me, DWORD property, ULONG_PTR *value) {
+  (void)me;
+  if (!value || property == 0 || property >= kGlobalOptionCount) return E_INVALIDARG;
+  *value = g_global_options[property];
+  return S_OK;
+}
+static const GlobalOptionsVtbl g_global_options_vtbl = {global_options_qi, global_options_addref, global_options_release, global_options_set, global_options_query};
+static GlobalOptions g_global_options_object = {&g_global_options_vtbl};
+static HRESULT global_options_create_instance(IUnknown *outer, REFIID riid, void **out) {
+  if (outer) return CLASS_E_NOAGGREGATION;
+  return global_options_qi(&g_global_options_object, riid, out);
+}
+
 /* the classes of this file that can be created by class id */
-#define BUILTIN_CLASSES_MARSHAL(X) X(kClsidStdMarshal, std_marshal_create_instance) X(kClsidInProcFreeMarshaler, ftm_create_instance) X(kClsidGlobalInterfaceTable, git_create_instance)
+#define BUILTIN_CLASSES_MARSHAL(X) X(kClsidStdMarshal, std_marshal_create_instance) X(kClsidInProcFreeMarshaler, ftm_create_instance) X(kClsidGlobalInterfaceTable, git_create_instance) \
+  X(kClsidGlobalOptions, global_options_create_instance)

@@ -85,18 +85,22 @@ uint32_t io_call_begin(Process& p, uint64_t slot, const SyscallRequest& r, IoCal
     const uint32_t status = objects->reset_event(call->event_object, &previous);
     if (status != kSuccess) return status;
   }
-  if ((call->event_handle != 0 || call->apc != 0 || p.files().kind(slot) == DescriptorKind::Pipe) && call->status_block != 0) call->saved = p.read_user(call->status_block, ByteView(call->status_block_before, 16));
+  if ((call->event_handle != 0 || call->apc != 0 || p.files().kind(slot) == DescriptorKind::Pipe) && call->status_block != 0) call->saved = p.read_user(call->status_block, ByteView(call->status_block_before, p.arch() == UserArch::X86_32 ? 8 : 16));      // (a 32-bit program's block is 8 bytes)
   return kSuccess;
 }
 
 uint32_t io_call_end(Process& p, uint64_t slot, const IoCall& call, uint32_t status, bool apc_allowed, bool completes_with_error) {
   if (status == 0x103) return status;
   if (((status >> 30) == 3 && !completes_with_error) || status == kUserApc) {      // an error: nothing completes
-    if (call.saved) p.write_user(call.status_block, ConstByteView(call.status_block_before, 16));
+    if (call.saved) p.write_user(call.status_block, ConstByteView(call.status_block_before, p.arch() == UserArch::X86_32 ? 8 : 16));
     return status;
   }
   uint64_t information = 0;
-  if (call.status_block != 0) p.read_user_u64(call.status_block + 8, &information);
+  if (call.status_block != 0) {      // (what the call wrote, where a program of that width has it)
+    uint8_t narrow[4] = {};
+    if (p.arch() != UserArch::X86_32) p.read_user_u64(call.status_block + 8, &information);
+    else if (p.read_user(call.status_block + 4, ByteView(narrow, 4))) information = uint32_t{narrow[0]} | uint32_t{narrow[1]} << 8 | uint32_t{narrow[2]} << 16 | uint32_t{narrow[3]} << 24;
+  }
   if (call.event_handle != 0 || call.apc != 0 || call.context != 0) {
     IoCall completed = call;
     if (!apc_allowed) completed.apc = 0;

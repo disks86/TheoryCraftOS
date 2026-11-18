@@ -61,4 +61,9 @@ uint32_t nt_create_change_notification(Process& p, const SyscallRequest& r);
 // life. Event, if given, is set on success; ApcRoutine, if given, is queued as an ordinary APC (like ReadFileEx), run when the thread next waits alertably.
 uint32_t nt_notify_change_directory_file(Process& p, const SyscallRequest& r);
 
+// Writes an IO_STATUS_BLOCK at `address` (0: none wanted) in the layout of the program that asked: status and information, 16 bytes for a 64-bit program, 8 for a
+// 32-bit one (whose Information is at offset 4: the 64-bit layout written there loses the count and overwrites what lies behind the block). False if the memory is not the
+// program's to write.
+bool put_io_status(Process& p, uint64_t address, uint32_t status, uint64_t information);
+
 }  // namespace process::windowsabi
