@@ -1041,6 +1041,125 @@ static void test_lighting(void) {
   IDirect3DDevice9_SetRenderState(g_device, D3DRS_CULLMODE, D3DCULL_CCW);
 }
 
+/* A rectangle over the whole target, through the matrices, with two sets of texture coordinates: the first runs 0 .. 1 with the picture, the
+ * second runs against it across. `sets` 0: positions alone. */
+static void mapped_quad(int sets) {
+  const struct { float x, y, z, u, v, u1, v1; } v[4] = {{-1, 1, 0.5f, 0, 0, 1, 0}, {1, 1, 0.5f, 1, 0, 0, 0}, {-1, -1, 0.5f, 0, 1, 1, 1}, {1, -1, 0.5f, 1, 1, 0, 1}};
+  const struct { float x, y, z, u, v; } one[4] = {{-1, 1, 0.5f, 0, 0}, {1, 1, 0.5f, 1, 0}, {-1, -1, 0.5f, 0, 1}, {1, -1, 0.5f, 1, 1}};
+  const struct { float x, y, z; } none[4] = {{-1, 1, 0.5f}, {1, 1, 0.5f}, {-1, -1, 0.5f}, {1, -1, 0.5f}};
+  if (sets == 2) {
+    IDirect3DDevice9_SetFVF(g_device, D3DFVF_XYZ | D3DFVF_TEX2);
+    IDirect3DDevice9_DrawPrimitiveUP(g_device, D3DPT_TRIANGLESTRIP, 2, v, sizeof v[0]);
+  } else if (sets == 1) {
+    IDirect3DDevice9_SetFVF(g_device, D3DFVF_XYZ | D3DFVF_TEX1);
+    IDirect3DDevice9_DrawPrimitiveUP(g_device, D3DPT_TRIANGLESTRIP, 2, one, sizeof one[0]);
+  } else {
+    IDirect3DDevice9_SetFVF(g_device, D3DFVF_XYZ);
+    IDirect3DDevice9_DrawPrimitiveUP(g_device, D3DPT_TRIANGLESTRIP, 2, none, sizeof none[0]);
+  }
+}
+/* The texture's four texels in the four quarters of the target: red, green / blue, white. */
+static int four_texels(void) {
+  const int ok = pixel(8, 8) == 0xFF0000 && pixel(56, 8) == 0x00FF00 && pixel(8, 56) == 0x0000FF && pixel(56, 56) == 0xFFFFFF;
+  if (!ok) printf("d3d9test: (the four corners are %06lx %06lx %06lx %06lx)\n", (unsigned long)pixel(8, 8), (unsigned long)pixel(56, 8), (unsigned long)pixel(8, 56), (unsigned long)pixel(56, 56));
+  return ok;
+}
+static void test_texture_coordinates(void) {
+  const DWORD texels[4] = {0xFFFF0000, 0xFF00FF00, 0xFF0000FF, 0xFFFFFFFF};
+  IDirect3DTexture9 *texture = make_texture(D3DFMT_A8R8G8B8, texels, 4);
+  D3DCAPS9 caps;
+  D3DMATRIX identity, m;
+  memset(&caps, 0, sizeof caps);
+  memset(&identity, 0, sizeof identity);
+  identity.m[0][0] = identity.m[1][1] = identity.m[2][2] = identity.m[3][3] = 1.0f;
+  IDirect3DDevice9_GetDeviceCaps(g_device, &caps);
+  if (!texture) {
+    check(0, "a texture for the texture coordinates");
+    return;
+  }
+  IDirect3DDevice9_SetRenderState(g_device, D3DRS_CULLMODE, D3DCULL_NONE);
+  IDirect3DDevice9_SetTexture(g_device, 0, (IDirect3DBaseTexture9 *)texture);
+  clear(0xFF000000);
+  mapped_quad(1);
+  read_back();
+  check((caps.VertexProcessingCaps & D3DVTXPCAPS_TEXGEN) && four_texels(), "a textured rectangle through the matrices");
+
+  /* a texture matrix on two numbers: they are (u, v, 1, 0), so the third row moves them - by half a texture, which swaps the texels across */
+  m = identity;
+  m.m[2][0] = 0.5f;
+  IDirect3DDevice9_SetTransform(g_device, D3DTS_TEXTURE0, &m);
+  clear(0xFF000000);
+  mapped_quad(1);
+  read_back();
+  const int ignored = four_texels();      /* (the stage does not ask for the matrix yet) */
+  IDirect3DDevice9_SetTextureStageState(g_device, 0, D3DTSS_TEXTURETRANSFORMFLAGS, D3DTTFF_COUNT2);
+  clear(0xFF000000);
+  mapped_quad(1);
+  read_back();
+  check(ignored && pixel(8, 8) == 0x00FF00 && pixel(56, 8) == 0xFF0000 && pixel(8, 56) == 0xFFFFFF && pixel(56, 56) == 0x0000FF,
+        "a texture matrix moves the coordinates where the stage asks for it, two numbers by its third row");
+  m = identity;
+  m.m[3][0] = 0.5f;      /* (the fourth row does nothing to two numbers) */
+  m.m[0][0] = 2.0f;      /* twice across: the texture is there two times */
+  IDirect3DDevice9_SetTransform(g_device, D3DTS_TEXTURE0, &m);
+  clear(0xFF000000);
+  mapped_quad(1);
+  read_back();
+  check(pixel(8, 8) == 0xFF0000 && pixel(24, 8) == 0x00FF00 && pixel(40, 8) == 0xFF0000 && pixel(56, 8) == 0x00FF00 && pixel(8, 56) == 0x0000FF,
+        "a texture matrix that scales, and its fourth row left out for two numbers");
+  /* vertices that are pixels already keep their coordinates */
+  clear(0xFF000000);
+  textured_quad(0, 0, 64, 64, 0xFFFFFFFF);
+  read_back();
+  check(four_texels(), "vertices that are pixels are not put through the texture matrix");
+
+  /* projected: three numbers, divided by the third in the pixel stage - (2u, 2v, 2) is the picture as it was; not divided, it is there twice */
+  m = identity;
+  m.m[0][0] = m.m[1][1] = m.m[2][2] = 2.0f;
+  IDirect3DDevice9_SetTransform(g_device, D3DTS_TEXTURE0, &m);
+  IDirect3DDevice9_SetTextureStageState(g_device, 0, D3DTSS_TEXTURETRANSFORMFLAGS, D3DTTFF_COUNT3);
+  clear(0xFF000000);
+  mapped_quad(1);
+  read_back();
+  const int twice = pixel(8, 8) == 0xFF0000 && pixel(24, 8) == 0x00FF00 && pixel(8, 24) == 0x0000FF && pixel(40, 40) == 0xFF0000;
+  IDirect3DDevice9_SetTextureStageState(g_device, 0, D3DTSS_TEXTURETRANSFORMFLAGS, D3DTTFF_COUNT3 | D3DTTFF_PROJECTED);
+  clear(0xFF000000);
+  mapped_quad(1);
+  read_back();
+  check((caps.TextureCaps & D3DPTEXTURECAPS_PROJECTED) && twice && four_texels(), "projected coordinates are divided by the last of them");
+  IDirect3DDevice9_SetTextureStageState(g_device, 0, D3DTSS_TEXTURETRANSFORMFLAGS, D3DTTFF_DISABLE);
+  IDirect3DDevice9_SetTransform(g_device, D3DTS_TEXTURE0, &identity);
+
+  /* the stage reads the set its state names: the second runs against the picture across */
+  clear(0xFF000000);
+  mapped_quad(2);
+  read_back();
+  const int first = four_texels();
+  IDirect3DDevice9_SetTextureStageState(g_device, 0, D3DTSS_TEXCOORDINDEX, 1);
+  clear(0xFF000000);
+  mapped_quad(2);
+  read_back();
+  check(first && pixel(8, 8) == 0x00FF00 && pixel(56, 8) == 0xFF0000 && pixel(8, 56) == 0xFFFFFF && pixel(56, 56) == 0x0000FF, "a stage reads the set of coordinates its state names");
+
+  /* generated coordinates: the position in view space, -1 .. 1, brought to 0 .. 1 by the matrix (three numbers: its fourth row moves them) */
+  m = identity;
+  m.m[0][0] = 0.5f, m.m[1][1] = -0.5f;
+  m.m[3][0] = m.m[3][1] = 0.5f;
+  IDirect3DDevice9_SetTransform(g_device, D3DTS_TEXTURE0, &m);
+  IDirect3DDevice9_SetTextureStageState(g_device, 0, D3DTSS_TEXCOORDINDEX, D3DTSS_TCI_CAMERASPACEPOSITION);
+  IDirect3DDevice9_SetTextureStageState(g_device, 0, D3DTSS_TEXTURETRANSFORMFLAGS, D3DTTFF_COUNT2);
+  clear(0xFF000000);
+  mapped_quad(0);
+  read_back();
+  check(four_texels(), "coordinates generated from the position in view space");
+  IDirect3DDevice9_SetTextureStageState(g_device, 0, D3DTSS_TEXCOORDINDEX, 0);
+  IDirect3DDevice9_SetTextureStageState(g_device, 0, D3DTSS_TEXTURETRANSFORMFLAGS, D3DTTFF_DISABLE);
+  IDirect3DDevice9_SetTransform(g_device, D3DTS_TEXTURE0, &identity);
+  IDirect3DDevice9_SetTexture(g_device, 0, NULL);
+  IDirect3DTexture9_Release(texture);
+  IDirect3DDevice9_SetRenderState(g_device, D3DRS_CULLMODE, D3DCULL_CCW);
+}
+
 static void test_render_to_texture(void) {
   IDirect3DTexture9 *target = NULL;
   IDirect3DSurface9 *surface = NULL, *back = NULL, *depth = NULL;
@@ -1121,6 +1240,7 @@ int main(void) {
     test_shaders();
     test_fog();
     test_lighting();
+    test_texture_coordinates();
     test_render_to_texture();
     test_present_and_reset();
     check(IDirect3DDevice9_Release(g_device) == 0, "the device is gone with its last reference");

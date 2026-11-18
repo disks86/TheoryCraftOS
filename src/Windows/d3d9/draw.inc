@@ -40,6 +40,11 @@ static UINT type_bytes(BYTE type) {
   static const BYTE bytes[17] = {4, 8, 12, 16, 4, 4, 4, 8, 4, 4, 8, 4, 8, 4, 4, 4, 8};
   return type < 17 ? bytes[type] : 0;
 }
+/* The numbers an element of a declaration type has. */
+static int type_components(BYTE type) {
+  static const BYTE components[17] = {1, 2, 3, 4, 4, 4, 2, 4, 4, 2, 4, 2, 4, 3, 3, 2, 4};
+  return type < 17 ? components[type] : 0;
+}
 /* An element as four floats; what the element has not is 0, 0, 0, 1. */
 static void decode_element(BYTE type, const BYTE *p, float out[4]) {
   short s[4];
@@ -76,32 +81,41 @@ static BOOL attribute_inside(const Attribute *a, const Source *sources, UINT fir
   return first <= 0xFFFFFFFFu - count && last <= s->bytes;
 }
 /* Decodes `count` vertices from `first` into the shaders' layout. */
+/* How the coordinates of the texture stages are made for a draw (ffl_texture_coordinates). */
+typedef struct Coordinates {
+  FflTextureStage stage[STAGES];
+  UINT set[STAGES];              /* the set of the vertex's a stage reads */
+  float world_view[4][4], normal[3][3];
+  int normalize, for_program, needs_normal;
+} Coordinates;
 /* Decodes `count` vertices from `first` for the fixed-function shaders; with `lit` their colours are what the lights make of them. */
-static void decode_vertices(const Layout *l, const Source *sources, UINT first, UINT count, BYTE *out, const FflSetup *lit) {
+static void decode_vertices(const Layout *l, const Source *sources, UINT first, UINT count, BYTE *out, const FflSetup *lit, const Coordinates *c) {
   for (UINT v = 0; v < count; ++v, out += VERTEX_BYTES) {
     float *f = (float *)out, value[4];
     f[3] = 1.0f;      /* (the fourth of a position that are pixels is 1 / w; one of three numbers has none) */
     decode_element(l->position.type, sources[l->position.stream].data + (SIZE_T)(first + v) * sources[l->position.stream].stride + l->position.offset, f);
     f[4] = f[5] = f[6] = f[7] = 1.0f;
-    f[8] = f[9] = f[10] = f[11] = 0.0f;
     if (l->colour.type != 255) decode_element(l->colour.type, sources[l->colour.stream].data + (SIZE_T)(first + v) * sources[l->colour.stream].stride + l->colour.offset, f + 4);
-    for (UINT t = 0; t < 2; ++t) {
-      if (l->texture[t].type == 255) continue;
-      decode_element(l->texture[t].type, sources[l->texture[t].stream].data + (SIZE_T)(first + v) * sources[l->texture[t].stream].stride + l->texture[t].offset, value);
-      f[8 + 2 * t] = value[0];
-      f[9 + 2 * t] = value[1];
+    float normal[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    if ((lit || c->needs_normal) && l->normal.type != 255)
+      decode_element(l->normal.type, sources[l->normal.stream].data + (SIZE_T)(first + v) * sources[l->normal.stream].stride + l->normal.offset, normal);
+    for (UINT t = 0; t < STAGES; ++t) {
+      const Attribute *a = &l->texture[c->set[t]];
+      value[0] = value[1] = value[2] = 0.0f;
+      value[3] = 1.0f;
+      if (a->type != 255) decode_element(a->type, sources[a->stream].data + (SIZE_T)(first + v) * sources[a->stream].stride + a->offset, value);
+      ffl_texture_coordinates(&c->stage[t], c->world_view, c->normal, c->normalize, f, normal, value, a->type != 255 ? type_components(a->type) : 0, c->for_program,
+                              f + 8 + 4 * t);
     }
     /* the second colour, and the fog factor a vertex brings, which is its alpha; a vertex without one brings none (1) */
     float second[4] = {0.0f, 0.0f, 0.0f, 1.0f};
     if (l->specular.type != 255)
       decode_element(l->specular.type, sources[l->specular.stream].data + (SIZE_T)(first + v) * sources[l->specular.stream].stride + l->specular.offset, second);
-    f[12] = second[3];
-    f[13] = second[0]; f[14] = second[1]; f[15] = second[2];
+    f[16] = second[3];
+    f[17] = second[0]; f[18] = second[1]; f[19] = second[2];
     if (lit) {
-      float normal[4] = {0.0f, 0.0f, 0.0f, 0.0f}, first_colour[4] = {f[4], f[5], f[6], f[7]};
-      if (l->normal.type != 255)
-        decode_element(l->normal.type, sources[l->normal.stream].data + (SIZE_T)(first + v) * sources[l->normal.stream].stride + l->normal.offset, normal);
-      ffl_light_vertex(lit, f, normal, l->colour.type != 255 ? first_colour : NULL, l->specular.type != 255 ? second : NULL, f + 4, f + 13);
+      const float first_colour[4] = {f[4], f[5], f[6], f[7]};
+      ffl_light_vertex(lit, f, normal, l->colour.type != 255 ? first_colour : NULL, l->specular.type != 255 ? second : NULL, f + 4, f + 17);
     }
   }
 }
@@ -207,9 +221,9 @@ static ID3D12PipelineState *pipeline_get(Dev *d, const Shader *vs, const Shader 
 
   static const D3D12_INPUT_ELEMENT_DESC layout[5] = {{"POSITION", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 0, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
                                                      {"COLOR", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 16, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
-                                                     {"TEXCOORD", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 32, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
-                                                     {"TEXCOORD", 1, DXGI_FORMAT_R32G32_FLOAT, 0, 40, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
-                                                     {"TEXCOORD", 2, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 48, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0}};
+                                                     {"TEXCOORD", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 32, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
+                                                     {"TEXCOORD", 1, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 48, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
+                                                     {"TEXCOORD", 2, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 64, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0}};
   D3D12_GRAPHICS_PIPELINE_STATE_DESC pd;
   memset(&pd, 0, sizeof pd);
   /* (a program's vertex shader: its inputs are "ATTR" and the number of the register, each four floats, in the order the vertices are decoded in) */
@@ -407,6 +421,36 @@ static void lighting_of(const State *s, FflSetup *out) {
     light->falloff = from->Falloff;
   }
 }
+/* How the coordinates of the texture stages are made for a draw, out of the stage states: which set of the vertex's a stage reads or what is
+ * generated in its place (D3DTSS_TEXCOORDINDEX), and the stage's texture matrix where D3DTSS_TEXTURETRANSFORMFLAGS asks for it. Positions that
+ * are pixels already have their own sets, as they are. */
+static void coordinates_of(const State *s, const Layout *l, BOOL for_program, Coordinates *out) {
+  memset(out, 0, sizeof *out);
+  out->for_program = for_program;
+  out->normalize = s->rs[D3DRS_NORMALIZENORMALS] != 0;
+  for (UINT t = 0; t < STAGES; ++t) {
+    const DWORD index = s->stage[t][D3DTSS_TEXCOORDINDEX], flags = s->stage[t][D3DTSS_TEXTURETRANSFORMFLAGS];
+    FflTextureStage *stage = &out->stage[t];
+    out->set[t] = index & (TEXTURE_SETS - 1);
+    if (l->transformed) continue;
+    switch (index & 0xFFFF0000u) {
+      case D3DTSS_TCI_CAMERASPACENORMAL: stage->from = FFL_FROM_NORMAL; break;
+      case D3DTSS_TCI_CAMERASPACEPOSITION: stage->from = FFL_FROM_POSITION; break;
+      case D3DTSS_TCI_CAMERASPACEREFLECTIONVECTOR: stage->from = FFL_FROM_REFLECTION; break;
+      case D3DTSS_TCI_SPHEREMAP: stage->from = FFL_FROM_SPHERE; break;
+      default: break;
+    }
+    if (stage->from != FFL_FROM_VERTEX) out->needs_normal = 1;
+    stage->count = (int)(flags & 0xFF) > 4 ? 4 : (int)(flags & 0xFF);
+    stage->projected = (flags & D3DTTFF_PROJECTED) != 0;
+    memcpy(stage->matrix, s->texture[t].m, sizeof stage->matrix);
+  }
+  if (out->needs_normal) {
+    const D3DMATRIX world_view = matrix_multiply(&s->world, &s->view);
+    memcpy(out->world_view, world_view.m, sizeof out->world_view);
+    ffl_normal_matrix(out->world_view, out->normal);
+  }
+}
 /* The registers a draw's block of constants has: the vertex shader's, then the pixel shader's. */
 static UINT constant_registers(const Shader *vs, const Shader *ps) { return (vs ? vs->registers : VERTEX_REGISTERS) + (ps ? ps->registers : PIXEL_REGISTERS); }
 /* Writes the block of constants of the draw and gives its address. (The ring has room for a whole block: draw() saw to it.) */
@@ -566,7 +610,8 @@ static HRESULT draw(Dev *d, D3DPRIMITIVETYPE type, UINT primitives, const Source
   } else {
     if (layout.position.type == 255) return D3DERR_INVALIDCALL;
     if (!attribute_inside(&layout.position, sources, first_vertex, vertices) || !attribute_inside(&layout.colour, sources, first_vertex, vertices) ||
-        !attribute_inside(&layout.texture[0], sources, first_vertex, vertices) || !attribute_inside(&layout.texture[1], sources, first_vertex, vertices) ||
+        !attribute_inside(&layout.texture[d->state.stage[0][D3DTSS_TEXCOORDINDEX] & (TEXTURE_SETS - 1)], sources, first_vertex, vertices) ||
+        !attribute_inside(&layout.texture[d->state.stage[1][D3DTSS_TEXCOORDINDEX] & (TEXTURE_SETS - 1)], sources, first_vertex, vertices) ||
         !attribute_inside(&layout.specular, sources, first_vertex, vertices) || !attribute_inside(&layout.normal, sources, first_vertex, vertices))
       return D3DERR_INVALIDCALL;
   }
@@ -592,7 +637,9 @@ static HRESULT draw(Dev *d, D3DPRIMITIVETYPE type, UINT primitives, const Source
     FflSetup lighting;
     const BOOL lit = d->state.rs[D3DRS_LIGHTING] && !layout.transformed;
     if (lit) lighting_of(&d->state, &lighting);
-    decode_vertices(&layout, sources, first_vertex, vertices, d->vertex_data + vertex_at, lit ? &lighting : NULL);
+    Coordinates coordinates;
+    coordinates_of(&d->state, &layout, ps != NULL, &coordinates);
+    decode_vertices(&layout, sources, first_vertex, vertices, d->vertex_data + vertex_at, lit ? &lighting : NULL, &coordinates);
   }
   d->vertex_used += vertices * stride;
   if (out_indices) {

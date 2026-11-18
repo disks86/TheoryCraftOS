@@ -21,6 +21,8 @@
 //   - the matrix for normals;
 //   - vertices lit by each kind of light, with the numbers worked out here, and random set-ups against the same sums written with the host's
 //     functions;
+//   - the coordinates of a texture stage: the vertex's own set through a texture matrix (with the 1 Direct3D 9 puts after the numbers a set
+//     has), the counts, projection, and each kind of generated coordinates;
 //   - numbers that are no numbers (infinities, NaN) give colours of 0 .. 1 all the same (the test runs under ASan and UBSan).
 #include <math.h>
 #include <stddef.h>
@@ -328,9 +330,127 @@ static void test_lights() {
   printf("  %u random set-ups compared, %u with numbers that are none\n", compared, cases);
 }
 
+static void test_texture_coordinates() {
+  FflSetup s;
+  identity(&s);
+  FflTextureStage stage;
+  memset(&stage, 0, sizeof stage);
+  for (int i = 0; i < 4; ++i) stage.matrix[i][i] = 1.0f;
+  const float position[3] = {1, 2, 4}, normal[3] = {0, 0, -1};
+  const float uv[4] = {0.25f, 0.75f, 0, 1};
+  float out[4];
+  auto run = [&](const float* vertex, int components, int for_program) {
+    ffl_texture_coordinates(&stage, s.world_view, s.normal, s.normalize, position, normal, vertex, components, for_program, out);
+  };
+  // no matrix: the set as it is; for a program's pixel shader what the set has not is 0 and 1
+  run(uv, 2, 0);
+  CHECK(out[0] == 0.25f && out[1] == 0.75f && out[2] == 0.0f && out[3] == 1.0f);
+  const float uvw[4] = {0.25f, 0.75f, 0.5f, 1};
+  run(uvw, 3, 1);
+  CHECK(out[0] == 0.25f && out[1] == 0.75f && out[2] == 0.5f && out[3] == 1.0f);
+  run(uvw, 3, 0);
+  CHECK(out[2] == 0.0f && out[3] == 1.0f);
+  const float nothing[4] = {0, 0, 0, 1};
+  run(nothing, 0, 0);
+  CHECK(out[0] == 0.0f && out[1] == 0.0f && out[3] == 1.0f);
+  // a matrix on two numbers: they are (u, v, 1, 0), so the third row moves them and the fourth does nothing
+  stage.count = 2;
+  stage.matrix[0][0] = 2.0f;
+  stage.matrix[2][0] = 0.5f, stage.matrix[2][1] = -0.25f;
+  stage.matrix[3][0] = 100.0f, stage.matrix[3][1] = 100.0f;
+  run(uv, 2, 0);
+  CHECK(near_value(out[0], 1.0) && near_value(out[1], 0.5) && out[2] == 0.0f && out[3] == 1.0f);
+  // ... on three, the fourth row does; on one, the second
+  run(uvw, 3, 0);
+  CHECK(near_value(out[0], 0.25 * 2 + 0.5 * 0.5 + 100) && near_value(out[1], 0.75 - 0.5 * 0.25 + 100));
+  stage.matrix[1][0] = 7.0f;
+  run(uv, 1, 0);
+  CHECK(near_value(out[0], 0.25 * 2 + 7));
+  stage.matrix[1][0] = 0.0f;
+  // the count: one number leaves v 0; for a program the numbers past the count are 0 and 1
+  stage.count = 1;
+  run(uv, 2, 0);
+  CHECK(near_value(out[0], 1.0) && out[1] == 0.0f && out[3] == 1.0f);
+  stage.count = 3;
+  stage.matrix[2][2] = 3.0f;
+  run(uv, 2, 1);
+  CHECK(near_value(out[0], 1.0) && near_value(out[1], 0.5) && near_value(out[2], 3.0) && out[3] == 1.0f);
+  stage.count = 9;      // (more than there are: four)
+  run(uv, 2, 1);
+  CHECK(near_value(out[2], 3.0) && out[3] == 0.0f);
+  // projected: the pixel stage divides by the last of the numbers; a program does that itself
+  stage.count = 3, stage.projected = 1;
+  run(uv, 2, 0);
+  CHECK(near_value(out[0], 1.0) && near_value(out[1], 0.5) && out[2] == 0.0f && near_value(out[3], 3.0));
+  stage.count = 4;
+  stage.matrix[0][3] = 4.0f;
+  run(uv, 2, 0);
+  CHECK(near_value(out[3], 1.0));      // (u * 4)
+  stage.count = 2;
+  run(uv, 2, 0);
+  CHECK(near_value(out[3], out[1]));
+  run(uv, 2, 1);
+  CHECK(out[3] == 1.0f);
+
+  // generated coordinates, through a world * view that moves by (0, 0, 1) and doubles x
+  memset(&stage, 0, sizeof stage);
+  for (int i = 0; i < 4; ++i) stage.matrix[i][i] = 1.0f;
+  s.world_view[0][0] = 2.0f;
+  s.world_view[3][2] = 1.0f;
+  ffl_normal_matrix(s.world_view, s.normal);
+  stage.from = FFL_FROM_POSITION;
+  run(uv, 2, 1);
+  CHECK(near_value(out[0], 2.0) && near_value(out[1], 2.0) && near_value(out[2], 5.0) && out[3] == 1.0f);
+  stage.count = 3;      // three numbers: the fourth row moves them
+  stage.matrix[3][2] = -5.0f;
+  run(uv, 2, 1);
+  CHECK(near_value(out[2], 0.0));
+  stage.count = 0;
+  stage.from = FFL_FROM_NORMAL;
+  const float slanted[3] = {2, 0, -2};
+  ffl_texture_coordinates(&stage, s.world_view, s.normal, 0, position, slanted, uv, 2, 1, out);
+  CHECK(near_value(out[0], 1.0) && near_value(out[1], 0.0) && near_value(out[2], -2.0));      // (x through the inverse of the doubling)
+  ffl_texture_coordinates(&stage, s.world_view, s.normal, 1, position, slanted, uv, 2, 1, out);
+  CHECK(near_value(out[0], 1 / sqrt(5.0)) && near_value(out[2], -2 / sqrt(5.0)));
+  // the reflection: straight at a wall that faces the camera it comes straight back; at a slanted one it goes off to the side
+  identity(&s);
+  stage.from = FFL_FROM_REFLECTION;
+  const float ahead[3] = {0, 0, 3};
+  ffl_texture_coordinates(&stage, s.world_view, s.normal, 1, ahead, normal, uv, 2, 1, out);
+  CHECK(near_value(out[0], 0.0) && near_value(out[1], 0.0) && near_value(out[2], -1.0));
+  const float diagonal[3] = {-0.70710678f, 0, -0.70710678f};
+  ffl_texture_coordinates(&stage, s.world_view, s.normal, 1, ahead, diagonal, uv, 2, 1, out);
+  CHECK(near_value(out[0], -1.0) && near_value(out[1], 0.0) && near_value(out[2], 0.0, 1e-4));
+  // the sphere map: the reflection straight back is the middle of the map; (-1, 0, 0) is r / (2 sqrt 2) left of it
+  stage.from = FFL_FROM_SPHERE;
+  ffl_texture_coordinates(&stage, s.world_view, s.normal, 1, ahead, diagonal, uv, 2, 0, out);
+  CHECK(near_value(out[0], 0.5 - 1 / (2 * sqrt(2.0)), 1e-4) && near_value(out[1], 0.5) && out[3] == 1.0f);
+  const float behind[3] = {0, 0, 1};      // (a wall that faces away: the reflection goes on along z, where the map has no place - its middle)
+  const float sideways[3] = {1, 0, 0};
+  ffl_texture_coordinates(&stage, s.world_view, s.normal, 1, ahead, sideways, uv, 2, 0, out);
+  CHECK(out[0] >= 0.0f && out[0] <= 1.0f && out[1] == 0.5f);
+  (void)behind;
+
+  // numbers that are none do no harm (nothing here reads outside its arrays whatever they are)
+  const float bad[] = {INFINITY, -INFINITY, NAN, 1e38f, -1e38f, 1e-45f, 0.0f};
+  unsigned cases = 0;
+  for (int round = 0; round < 2000; ++round) {
+    stage.from = round % 5;
+    stage.count = round % 7 - 1;
+    stage.projected = round & 1;
+    for (int i = 0; i < 4; ++i)
+      for (int j = 0; j < 4; ++j) stage.matrix[i][j] = (round + i * 4 + j) % 5 == 0 ? bad[(round + i + j) % 7] : random_float(-2, 2);
+    const float at[3] = {bad[round % 7], 1, bad[(round / 7) % 7]}, n[3] = {bad[(round / 3) % 7], 0, -1}, set[4] = {bad[(round / 5) % 7], 0.5f, 0.5f, 1};
+    ffl_texture_coordinates(&stage, s.world_view, s.normal, round & 1, at, n, set, round % 6 - 1, (round >> 1) & 1, out);
+    ++cases;
+  }
+  CHECK(cases == 2000);
+}
+
 int main() {
   test_functions();
   test_lights();
+  test_texture_coordinates();
   if (g_failed) {
     printf("FfLightingTest: %d of %d checks FAILED\n", g_failed, g_checks);
     return 1;

@@ -18,9 +18,10 @@ SamplerState sampler0 : register(s0);
 SamplerState sampler1 : register(s1);
 float4 main(float4 position : SV_Position, float4 colour : COLOR0, float4 specular : COLOR1, float4 coordinate0 : TEXCOORD0, float4 coordinate1 : TEXCOORD1, float4 vertex_fog : TEXCOORD8) : SV_Target {
   float4 current = colour;
-  float4 texel = texture0.Sample(sampler0, coordinate0.xy);
+  // (a stage's coordinates are u, v and the number they are divided by: 1, or what a projecting texture matrix gave)
+  float4 texel = texture0.Sample(sampler0, coordinate0.xy / coordinate0.w);
   current = float4(colour0.x * texel.rgb * current.rgb + colour0.y * texel.rgb + colour0.z * current.rgb, alpha0.x * texel.a * current.a + alpha0.y * texel.a + alpha0.z * current.a);
-  texel = texture1.Sample(sampler1, coordinate1.xy);
+  texel = texture1.Sample(sampler1, coordinate1.xy / coordinate1.w);
   current = float4(colour1.x * texel.rgb * current.rgb + colour1.y * texel.rgb + colour1.z * current.rgb, alpha1.x * texel.a * current.a + alpha1.y * texel.a + alpha1.z * current.a);
   current.rgb += specular.rgb * colour0.w;
   current = saturate(current);

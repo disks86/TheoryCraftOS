@@ -28,7 +28,10 @@
  *
  * each light's share weighed by its attenuation (1 / (a0 + a1 d + a2 d^2) inside its range, for the lights that have a place) and, for a
  * spotlight, by where the vertex is in its cone. N is the normal, L the direction to the light, H half way between L and the direction
- * to the camera. The alpha is the diffuse colour's. Both results are clamped to 0 .. 1. */
+ * to the camera. The alpha is the diffuse colour's. Both results are clamped to 0 .. 1.
+ *
+ * The texture coordinates of a stage are made here too (ffl_texture_coordinates): the vertex's own set or one generated from its place in
+ * view space, through the stage's texture matrix. */
 #ifndef TCOS_D3D9_FF_LIGHTING_H
 #define TCOS_D3D9_FF_LIGHTING_H
 
@@ -216,6 +219,91 @@ static void ffl_light_vertex(const FflSetup *s, const float position[3], const f
     specular[i] = s->specular ? ffl_clamp(cs[i] * specular_sum[i]) : 0.0f;
   }
   diffuse[3] = ffl_clamp(cd[3]);
+}
+
+/* ---- texture coordinates ------------------------------------------------------------------------------------------------------------------------------ */
+
+/* Where a stage's coordinates come from. */
+enum {
+  FFL_FROM_VERTEX = 0,     /* a set of the vertex's */
+  FFL_FROM_NORMAL = 1,     /* the normal in view space (D3DTSS_TCI_CAMERASPACENORMAL) */
+  FFL_FROM_POSITION = 2,   /* the position in view space (D3DTSS_TCI_CAMERASPACEPOSITION) */
+  FFL_FROM_REFLECTION = 3, /* the direction from the camera, mirrored at the normal (D3DTSS_TCI_CAMERASPACEREFLECTIONVECTOR) */
+  FFL_FROM_SPHERE = 4      /* ... as the place in a sphere map (D3DTSS_TCI_SPHEREMAP) */
+};
+
+typedef struct FflTextureStage {
+  int from;                /* FFL_FROM_* */
+  int count;               /* 0: no texture matrix; else the numbers the matrix gives, 1 .. 4 (D3DTTFF_COUNT1 ..) */
+  int projected;           /* the coordinates are divided by the last of those numbers (D3DTTFF_PROJECTED) */
+  float matrix[4][4];      /* a row vector times this */
+} FflTextureStage;
+
+/* The coordinates of one stage for one vertex. `vertex` is the set the stage reads, as four numbers, of which the vertex has `components`
+ * (0: it has no such set); `world_view` and `normal_matrix` are the ones of FflSetup, read only where coordinates are generated.
+ *
+ * Direct3D 9 puts a 1 after the numbers a set has before the matrix is applied - (u, v) is (u, v, 1, 0) - so a matrix moves two numbers by
+ * its third row. Generated coordinates are three numbers.
+ *
+ * `out` for the fixed-function pixel stage (`for_program` 0) is u, v, 0 and the number the pixel stage divides u and v by (1 unless the
+ * coordinates are projected); for a program's pixel shader it is the numbers as they are, 0 0 0 1 where there are none. */
+static void ffl_texture_coordinates(const FflTextureStage *stage, const float world_view[4][4], const float normal_matrix[3][3], int normalize, const float position[3],
+                                    const float normal[3], const float *vertex, int components, int for_program, float out[4]) {
+  float in[4] = {0.0f, 0.0f, 0.0f, 1.0f};
+  int have = 3;
+  if (stage->from == FFL_FROM_VERTEX) {
+    have = components < 0 ? 0 : components > 4 ? 4 : components;
+    for (int i = 0; i < have; ++i) in[i] = vertex[i];
+  } else {
+    float place[3], n[3];
+    for (int i = 0; i < 3; ++i) {
+      place[i] = position[0] * world_view[0][i] + position[1] * world_view[1][i] + position[2] * world_view[2][i] + world_view[3][i];
+      n[i] = normal[0] * normal_matrix[0][i] + normal[1] * normal_matrix[1][i] + normal[2] * normal_matrix[2][i];
+    }
+    if (normalize) ffl_normalize(n);
+    if (stage->from == FFL_FROM_NORMAL) {
+      for (int i = 0; i < 3; ++i) in[i] = n[i];
+    } else if (stage->from == FFL_FROM_POSITION) {
+      for (int i = 0; i < 3; ++i) in[i] = place[i];
+    } else {
+      /* the way from the camera to the vertex, mirrored at the normal: I - 2 (N . I) N */
+      float way[3] = {place[0], place[1], place[2]}, mirrored[3];
+      ffl_normalize(way);
+      const float along = 2.0f * ffl_dot(n, way);
+      for (int i = 0; i < 3; ++i) mirrored[i] = way[i] - along * n[i];
+      if (stage->from == FFL_FROM_REFLECTION) {
+        for (int i = 0; i < 3; ++i) in[i] = mirrored[i];
+      } else {
+        const float m = 2.0f * ffl_sqrt(mirrored[0] * mirrored[0] + mirrored[1] * mirrored[1] + (mirrored[2] + 1.0f) * (mirrored[2] + 1.0f));
+        in[0] = m > 0.0f ? mirrored[0] / m + 0.5f : 0.5f;
+        in[1] = m > 0.0f ? mirrored[1] / m + 0.5f : 0.5f;
+        in[2] = 0.0f;
+      }
+    }
+  }
+  if (stage->count <= 0) {
+    out[0] = in[0];
+    out[1] = in[1];
+    out[2] = for_program ? in[2] : 0.0f;
+    out[3] = for_program ? in[3] : 1.0f;
+    return;
+  }
+  /* (the 1 after the numbers there are; three numbers have it where it is already) */
+  if (have < 3) {
+    in[have] = 1.0f;
+    in[3] = 0.0f;
+  }
+  const int count = stage->count > 4 ? 4 : stage->count;
+  float moved[4];
+  for (int i = 0; i < 4; ++i) moved[i] = in[0] * stage->matrix[0][i] + in[1] * stage->matrix[1][i] + in[2] * stage->matrix[2][i] + in[3] * stage->matrix[3][i];
+  if (for_program) {
+    for (int i = 0; i < 4; ++i) out[i] = i < count ? moved[i] : i == 3 ? 1.0f : 0.0f;
+    return;
+  }
+  out[0] = moved[0];
+  out[1] = count >= 2 ? moved[1] : 0.0f;
+  out[2] = 0.0f;
+  out[3] = stage->projected ? moved[count - 1] : 1.0f;
 }
 
 #endif
