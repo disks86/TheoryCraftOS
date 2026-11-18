@@ -61,6 +61,15 @@ bool parse_acpi_resources(ConstByteView d, AcpiResources* out) {
         out->memory[out->memory_count].length = le32(d, body + 5);
         ++out->memory_count;
       }
+    } else if ((type == 0x07 && length >= 23) || (type == 0x0A && length >= 43)) {   // DWord / QWord address space: memory ranges below 4 GiB
+      const bool qword = type == 0x0A;
+      const uint64_t minimum = qword ? (uint64_t{le32(d, body + 15)} << 32) | le32(d, body + 11) : le32(d, body + 7);
+      const uint64_t range = qword ? (uint64_t{le32(d, body + 39)} << 32) | le32(d, body + 35) : le32(d, body + 19);
+      if (d[body] == 0 && range != 0 && minimum <= 0xFFFFFFFFull && range <= 0xFFFFFFFFull - minimum + 1 && out->memory_count < AcpiResources::kMaxMemory) {
+        out->memory[out->memory_count].base = static_cast<uint32_t>(minimum);
+        out->memory[out->memory_count].length = static_cast<uint32_t>(range);
+        ++out->memory_count;
+      }
     } else if (type == 0x09 && length >= 6) {                     // extended interrupt: flags, count, numbers
       const uint32_t count = d[body + 1];
       for (uint32_t i = 0; i < count && body + 2 + 4ull * (i + 1) <= end; ++i)

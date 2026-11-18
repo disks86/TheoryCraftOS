@@ -74,6 +74,33 @@ bool decode_full_report(ConstByteView r, gamepad::State* state) {
   return true;
 }
 
+bool decode_simple_report(ConstByteView r, gamepad::State* state) {
+  if (r.size() < 12 || r[0] != kSimpleReport) return false;
+  const uint8_t a = r[1], b = r[2];
+  uint32_t buttons = gamepad::hat_to_dpad(r[3]);
+  if (a & 0x01) buttons |= gamepad::kSouth;          // B
+  if (a & 0x02) buttons |= gamepad::kEast;           // A
+  if (a & 0x04) buttons |= gamepad::kWest;           // Y
+  if (a & 0x08) buttons |= gamepad::kNorth;          // X
+  if (a & 0x10) buttons |= gamepad::kLeftShoulder;   // L
+  if (a & 0x20) buttons |= gamepad::kRightShoulder;  // R
+  if (b & 0x01) buttons |= gamepad::kBack;           // -
+  if (b & 0x02) buttons |= gamepad::kStart;          // +
+  if (b & 0x04) buttons |= gamepad::kLeftStick;
+  if (b & 0x08) buttons |= gamepad::kRightStick;
+  if (b & 0x10) buttons |= gamepad::kGuide;          // home
+  if (b & 0x20) buttons |= gamepad::kMisc;           // capture
+  state->buttons = buttons;
+  state->left_trigger = (a & 0x40) ? 255 : 0;        // ZL
+  state->right_trigger = (a & 0x80) ? 255 : 0;       // ZR
+  auto axis = [&](uint32_t at, bool flip) { return gamepad::axis_from_range(r[at] | (r[at + 1] << 8), 0, 65535, flip); };
+  state->left_x = axis(4, false);
+  state->left_y = axis(6, true);                     // (down is the larger value here)
+  state->right_x = axis(8, false);
+  state->right_y = axis(10, true);
+  return true;
+}
+
 uint32_t encode_subcommand(uint8_t counter, uint8_t subcommand, uint8_t argument, ByteView out) {
   ByteWriter w(out);
   w.u8(0x01);

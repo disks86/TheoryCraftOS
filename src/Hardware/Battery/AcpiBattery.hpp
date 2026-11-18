@@ -56,6 +56,8 @@ class AcpiBattery {
   uint32_t tables_loaded() const { return tables_loaded_; }
   uint32_t tables_faulty() const { return tables_faulty_; }
   const char* last_load_error() const { return load_error_; }
+  // The interpreter that holds the loaded tables (for a driver that looks for its device in the namespace, or must keep the AML out while it works).
+  acpi::AmlInterpreter& interpreter() { return vm_; }
   // Reads the batteries now (a few reads of the embedded controller). Safe to call from several threads (one reads at a time). `present` is false when the machine has none (or none is inserted).
   BatteryStatus read();
 

@@ -121,6 +121,11 @@ add_executable(BOOTX64
   src/Hardware/Acpi/SystemAcpiHost.cpp
   src/Hardware/Acpi/AcpiEvents.cpp
   src/Hardware/Acpi/DellWmiHotkeys.cpp
+  src/Hardware/UsbTypeC/UcsiProtocol.cpp
+  src/Hardware/UsbTypeC/UcsiCore.cpp
+  src/Hardware/UsbTypeC/AcpiUcsiTransport.cpp
+  src/Hardware/UsbTypeC/UsbTypeCSystem.cpp
+  src/Hardware/UsbTypeC/UsbTypeCText.cpp
   src/Hardware/Backlight/AcpiBacklight.cpp
   src/Hardware/Backlight/IntelPchBacklight.cpp
   src/Hardware/Acpi/IoApic.cpp
@@ -584,6 +589,12 @@ add_executable(BOOTX64
   src/Hardware/HardwareMonitor/FintekF718xx.cpp
   src/Hardware/HardwareMonitor/HardwareMonitorSet.cpp
   src/Hardware/HardwareMonitor/SystemHardwareMonitor.cpp
+  src/Hardware/EmbeddedController/ChromeEc/ChromeEcTransport.cpp
+  src/Hardware/EmbeddedController/ChromeEc/ChromeEc.cpp
+  src/Hardware/EmbeddedController/ChromeEc/FrameworkEc.cpp
+  src/Hardware/EmbeddedController/ChromeEc/ChromeEcDevices.cpp
+  src/Hardware/EmbeddedController/ChromeEc/ChromeEcStack.cpp
+  src/Hardware/EmbeddedController/ChromeEc/SystemChromeEc.cpp
   src/Hardware/GraphicsProcessingUnit/AMD/AmdGpu.cpp
   src/Hardware/GraphicsProcessingUnit/AMD/AmdDcn1.cpp
   src/Hardware/GraphicsProcessingUnit/AMD/AmdScanout.cpp
@@ -796,6 +807,11 @@ add_executable(BOOTX64
   src/Hardware/SerialPort/SerialRing.cpp
   src/Hardware/SerialPort/Uart16550.cpp
   src/Hardware/SerialPort/SystemSerialPorts.cpp
+  src/Hardware/SerialPort/Usb/UsbCdcAcm.cpp
+  src/Hardware/SerialPort/Usb/UsbSerialPorts.cpp
+  src/Hardware/Firmware/Smbios.cpp
+  src/Hardware/Platform/Framework/FrameworkPlatform.cpp
+  src/Hardware/Platform/Framework/LedMatrix.cpp
   src/Hardware/MidiDevice/Usb/UsbMidiDescriptors.cpp
   src/Hardware/MidiDevice/Usb/UsbMidiDevice.cpp
   src/Hardware/MidiDevice/Usb/UsbMidiService.cpp
@@ -809,6 +825,9 @@ add_executable(BOOTX64
   src/Hardware/GameController/XboxProtocol.cpp
   src/Hardware/GameController/Usb/UsbGameController.cpp
   src/Hardware/GameController/Usb/UsbXbox360Wireless.cpp
+  src/Hardware/GameController/Usb/XboxWirelessAdapter.cpp
+  src/Hardware/GameController/Usb/XboxWirelessFrames.cpp
+  src/Hardware/GameController/Bluetooth/BluetoothGamepad.cpp
   src/Midi/LiveSynth.cpp
   src/Media/Audio/Pcm.cpp
   src/Media/Audio/Wav.cpp
@@ -1065,6 +1084,7 @@ add_executable(BOOTX64
   src/Hardware/Sensor/SensorHub.cpp
   src/Hardware/Sensor/HidSensor.cpp
   src/Hardware/Sensor/AcpiAmbientLight.cpp
+  src/Hardware/Sensor/AmdSfh/AmdSfhDriver.cpp
   src/Hardware/Mouse/I2c/PlatformI2cHid.cpp
   src/Hardware/Bus/Thunderbolt/ThunderboltDevices.cpp
   src/Hardware/Bus/Pci/PciMsix.cpp
@@ -1089,6 +1109,8 @@ add_executable(BOOTX64
   src/Hardware/Bluetooth/Smp.cpp
   src/Hardware/Bluetooth/HciBluetoothAdapter.cpp
   src/Hardware/Bluetooth/HidOverGatt.cpp
+  src/Hardware/Bluetooth/Sdp.cpp
+  src/Hardware/Bluetooth/HidpHost.cpp
   src/Hardware/Bluetooth/HciPackets.cpp
   src/Hardware/Bluetooth/UsbHciTransport.cpp
   src/Hardware/Bluetooth/HciController.cpp
@@ -1626,6 +1648,10 @@ endif()
 option(TCOS_ISH "Start the Intel Integrated Sensor Hub (PCI 8086:9D35 / A135): resets its IPC, brings up ISHTP and the HID client, adds the sensors to the sensor hub; not yet run on a real machine" OFF)
 if(TCOS_ISH)
   target_compile_definitions(BOOTX64 PRIVATE TCOS_ISH)
+endif()
+option(TCOS_AMD_SFH "Start the AMD Sensor Fusion Hub (PCI 1022:15E4 / 164A, Ryzen laptops): enables the sensors the MP2 reports and adds them to the sensor hub; register layout written from memory of Linux amd_sfh, not yet run on a real machine" OFF)
+if(TCOS_AMD_SFH)
+  target_compile_definitions(BOOTX64 PRIVATE TCOS_AMD_SFH)
 endif()
 option(TCOS_BLUETOOTH "Start the Bluetooth controllers on the USB ports (Intel firmware from /firmware/ibt-*.sfi, bring-up, events; nothing is scanned or paired; not yet run on a real controller)" OFF)
 if(TCOS_BLUETOOTH)

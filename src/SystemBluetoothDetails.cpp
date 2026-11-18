@@ -184,7 +184,7 @@ uint32_t SystemBluetoothDetails::devices(uint32_t id, BluetoothDeviceRow* out, u
     r.signal_percent = static_cast<int8_t>(signal_percent(d.rssi));
     r.state = state_of(d.state);
     r.paired = d.paired;
-    r.supported = d.le;
+    r.supported = d.le || d.paired || ((d.class_of_device >> 8) & 0x1F) == 0x05 || d.class_of_device == 0;   // (classic: HID devices, the peripheral class - pads, keyboards, mice - or those whose class is not known)
     copy_text(r.failure, sizeof r.failure, d.failure);
     copy_text(r.profiles, sizeof r.profiles, d.profiles);
     ++n;

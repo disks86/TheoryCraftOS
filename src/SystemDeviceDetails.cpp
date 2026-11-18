@@ -348,6 +348,16 @@ bool SystemInventory::describe(HardwareGroup group, uint32_t id, desktop::Device
     }
     case HardwareGroup::Usb: {
       const uint32_t controller = id >> 16, port = id & 0xFFFF;
+      if ((id & 0xFFFF0000u) == kUsbTypeCIdBase) {   // a USB-C connector
+        hardware::IUsbTypeC* type_c = usb_type_c();
+        hardware::UsbTypeCConnector connector;
+        if (!type_c || !type_c->connector(port, &connector)) return false;
+        text.assign("USB-C port ");
+        text.append_uint(connector.number);
+        set_title(out, text.view());
+        hardware::usb_type_c_describe(connector, sink);
+        return true;
+      }
       if (!usb_ || controller >= usb_->controller_count()) return false;
       if (port == kUsbControllerPort) {
         set_title(out, usb_controller_name(usb_->controller_kind(controller)));

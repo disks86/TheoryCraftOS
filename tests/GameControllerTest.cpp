@@ -25,6 +25,8 @@
 #include <deque>
 #include <string>
 #include <vector>
+#include "Hardware/Bluetooth/HidOverGatt.hpp"
+#include "Hardware/GameController/Bluetooth/BluetoothGamepad.hpp"
 #include "Hardware/GameController/GameControllerCatalog.hpp"
 #include "Hardware/GameController/GameControllerService.hpp"
 #include "Hardware/GameController/HidGamepad.hpp"
@@ -34,6 +36,10 @@
 #include "Hardware/GameController/Usb/UsbXbox360Wireless.hpp"
 #include "Hardware/GameController/WindowsGamepadService.hpp"
 #include "Hardware/GameController/XboxProtocol.hpp"
+
+namespace hardware {
+void delay_us(uint64_t) {}   // (the Bluetooth stack's waits: nothing to wait for against fakes)
+}  // namespace hardware
 
 using namespace hardware;
 using namespace hardware::gamepad;
@@ -710,6 +716,292 @@ static void test_wireless() {
   CHECK(a.live == 0);
 }
 
+// --- Bluetooth pads ------------------------------------------------------------------------------------
+
+struct FakeLink final : IHidReportLink {
+  std::vector<Bytes> outputs;
+  std::vector<uint8_t> features;      // the feature reports asked for
+  bool answer = true;
+  bool send_output(ConstByteView report) override { outputs.push_back(Bytes(report.data(), report.data() + report.size())); return true; }
+  bool get_feature(uint8_t id, ByteView out, uint32_t* length) override {
+    features.push_back(id);
+    if (!answer || out.size() < 2) return false;
+    out[0] = id;
+    out[1] = 0x55;
+    *length = 2;
+    return true;
+  }
+};
+
+// The report map of an Xbox pad over Bluetooth (as its firmware describes it): report 1 with 16-bit sticks X/Y/Z/Rz, 10-bit brake and
+// accelerator, a hat 1..8 and 15 buttons.
+static const Bytes kXboxBtMap = {
+    0x05, 0x01, 0x09, 0x05, 0xA1, 0x01, 0x85, 0x01,
+    0x09, 0x01, 0xA1, 0x00, 0x09, 0x30, 0x09, 0x31, 0x15, 0x00, 0x27, 0xFF, 0xFF, 0x00, 0x00, 0x95, 0x02, 0x75, 0x10, 0x81, 0x02, 0xC0,
+    0x09, 0x01, 0xA1, 0x00, 0x09, 0x32, 0x09, 0x35, 0x15, 0x00, 0x27, 0xFF, 0xFF, 0x00, 0x00, 0x95, 0x02, 0x75, 0x10, 0x81, 0x02, 0xC0,
+    0x05, 0x02, 0x09, 0xC5, 0x15, 0x00, 0x26, 0xFF, 0x03, 0x95, 0x01, 0x75, 0x0A, 0x81, 0x02, 0x15, 0x00, 0x25, 0x00, 0x75, 0x06, 0x95, 0x01, 0x81, 0x03,
+    0x05, 0x02, 0x09, 0xC4, 0x15, 0x00, 0x26, 0xFF, 0x03, 0x95, 0x01, 0x75, 0x0A, 0x81, 0x02, 0x15, 0x00, 0x25, 0x00, 0x75, 0x06, 0x95, 0x01, 0x81, 0x03,
+    0x05, 0x01, 0x09, 0x39, 0x15, 0x01, 0x25, 0x08, 0x35, 0x00, 0x46, 0x3B, 0x01, 0x66, 0x14, 0x00, 0x75, 0x04, 0x95, 0x01, 0x81, 0x42,
+    0x75, 0x04, 0x95, 0x01, 0x15, 0x00, 0x25, 0x00, 0x35, 0x00, 0x45, 0x00, 0x65, 0x00, 0x81, 0x03,
+    0x05, 0x09, 0x19, 0x01, 0x29, 0x0F, 0x15, 0x00, 0x25, 0x01, 0x75, 0x01, 0x95, 0x0F, 0x81, 0x02,
+    0x15, 0x00, 0x25, 0x00, 0x75, 0x01, 0x95, 0x01, 0x81, 0x03,
+    0xC0};
+
+static void test_bluetooth() {
+  // Sony over Bluetooth: the full reports are the USB ones shifted; the output reports carry a CRC.
+  State s;
+  Bytes ds4 = ds4_report();
+  Bytes ds4bt(ds4.size() + 2, 0);
+  ds4bt[0] = sony::kDualShock4BtInput;
+  ds4bt[1] = 0xC0;
+  for (size_t i = 1; i < ds4.size(); ++i) ds4bt[i + 2] = ds4[i];
+  CHECK(sony::decode_dualshock4_bt(view(ds4bt), &s) && (s.buttons & kTouchpad) && s.left_trigger == 200 && s.charging && s.battery_percent == 50);
+  fuzz(ds4bt, 33, [](ConstByteView v, State* st) { return sony::decode_dualshock4_bt(v, st); });
+  Bytes ds = dualsense_report();
+  Bytes dsbt(ds.size() + 1, 0);
+  dsbt[0] = sony::kDualSenseBtInput;
+  for (size_t i = 1; i < ds.size(); ++i) dsbt[i + 1] = ds[i];
+  CHECK(sony::decode_dualsense_bt(view(dsbt), &s) && (s.buttons & kMisc) && s.left_trigger == 33 && s.battery_percent == 100);
+  fuzz(dsbt, 55, [](ConstByteView v, State* st) { return sony::decode_dualsense_bt(v, st); });
+  const Bytes reduced = {0x01, 0x80, 0x00, 0x80, 0x80, 0x08 | 0x20, 0x00, 0x01, 10, 20};
+  CHECK(sony::decode_bt_reduced(view(reduced), &s) && s.buttons == (kSouth | kGuide) && s.left_y == 32767 && s.right_trigger == 20);
+  Output o;
+  o.low_frequency = 0xFF00;
+  o.red = 7;
+  o.player = 1;
+  uint8_t out[96];
+  CHECK(sony::encode_dualshock4_bt_output(o, ByteView(out)) == 78 && out[0] == 0x11 && out[1] == 0xC0 && out[7] == 0xFF && out[8] == 7);
+  CHECK(sony::bt_output_crc_ok(ConstByteView(out).first(78)));
+  out[20] ^= 1;
+  CHECK(!sony::bt_output_crc_ok(ConstByteView(out).first(78)));
+  CHECK(sony::encode_dualsense_bt_output(o, 3, ByteView(out)) == 78 && out[0] == 0x31 && out[1] == 0x30 && out[2] == 0x10 && out[6] == 0xFF &&
+        out[47] == 7 && out[46] == 0x04);
+  CHECK(sony::bt_output_crc_ok(ConstByteView(out).first(78)));
+  CHECK(sony::encode_dualsense_bt_output(o, 0, ByteView(out).first(77)) == 0);
+
+  // Switch Pro's simple report.
+  Bytes simple = {0x3F, 0x02 | 0x80, 0x10, 0x02, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x80, 0x00, 0x80};
+  CHECK(nintendo::decode_simple_report(view(simple), &s) && s.buttons == (kEast | kGuide | kDpadRight) && s.right_trigger == 255);
+  CHECK(s.left_x == 32767 && s.left_y == 32767 && s.right_x >= -1 && s.right_x <= 1);
+  fuzz(simple, 12, [](ConstByteView v, State* st) { return nintendo::decode_simple_report(v, st); });
+
+  // Routing: by ids, else by the report map.
+  BluetoothPadIdentity ds4id{sony::kVendor, sony::kDualShock4v2, "Wireless Controller", false};
+  BluetoothPadIdentity xboxid{0x045E, 0x0B13, "Xbox Wireless Controller", true};
+  BluetoothPadIdentity keyboard{0x046D, 0xB342, "Keyboard", true};
+  const Bytes kb_map = {0x05, 0x01, 0x09, 0x06, 0xA1, 0x01, 0x05, 0x07, 0x19, 0xE0, 0x29, 0xE7, 0x15, 0x00, 0x25, 0x01, 0x75, 0x01, 0x95, 0x08, 0x81, 0x02, 0xC0};
+  CHECK(is_bluetooth_gamepad(ds4id, ConstByteView()) && is_bluetooth_gamepad(xboxid, view(kXboxBtMap)) && !is_bluetooth_gamepad(keyboard, view(kb_map)));
+  CHECK(!is_bluetooth_gamepad(xboxid, ConstByteView()));          // (a Microsoft device without a gamepad map: a keyboard, a mouse)
+  for (size_t n = 0; n < kXboxBtMap.size(); ++n) {                  // cut-short maps never crash and never claim more than they have
+    Bytes cut(kXboxBtMap.begin(), kXboxBtMap.begin() + n);
+    (void)is_bluetooth_gamepad(xboxid, view(cut));
+  }
+
+  TestAllocator a;
+  {
+    GameControllerService service(nullptr, a);
+    CHECK(service.start());
+    // An Xbox Series pad over LE.
+    FakeLink xlink;
+    SharedPointer<HidPadChannel> xchannel = SharedPointer<HidPadChannel>::make(a);
+    xchannel->attach(&xlink);
+    CHECK(service.add(make_bluetooth_gamepad(a, xchannel, xboxid, view(kXboxBtMap))) == 0);
+    Info info;
+    CHECK(service.info(0, &info) && info.protocol == Protocol::XboxOne && strcmp(info.name, "Xbox Series X|S Controller") != 0);   // (0B13 is the BT id: not the USB one)
+    CHECK(xlink.outputs.size() == 1 && xlink.outputs[0][0] == 0x03);          // shown its number: the motors (off) are its only output
+    // X 65535, Y 0 (up), Z/Rz centred, brake 1023, accelerator 0, hat 3 (right), buttons A (1) and Menu (12).
+    Bytes report = {0x01, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x80, 0x00, 0x80, 0xFF, 0x03, 0x00, 0x00, 0x03,
+                    static_cast<uint8_t>(0x01), static_cast<uint8_t>(0x08), 0x00};
+    xchannel->deliver(view(report));
+    service.step(false);
+    State st;
+    uint32_t packet = 0;
+    CHECK(service.snapshot(0, &st, &packet));
+    CHECK(st.buttons == (kSouth | kStart | kDpadRight) && st.left_x == 32767 && st.left_y == 32767 && st.left_trigger == 255 && st.right_trigger == 0);
+    CHECK(service.set_vibration(0, 0xFFFF, 0x8000) && xlink.outputs.back().size() == 9 && xlink.outputs.back()[4] == 99 && xlink.outputs.back()[5] == 49);
+
+    // A DualShock 4 over classic: the feature read on the first poll, then full reports.
+    FakeLink slink;
+    SharedPointer<HidPadChannel> schannel = SharedPointer<HidPadChannel>::make(a);
+    schannel->attach(&slink);
+    CHECK(service.add(make_bluetooth_gamepad(a, schannel, ds4id, ConstByteView())) == 1);
+    CHECK(slink.outputs.size() == 1 && slink.outputs[0][0] == 0x11 && sony::bt_output_crc_ok(view(slink.outputs[0])));   // light bar: player 2's red
+    schannel->deliver(view(reduced));
+    service.step(false);
+    CHECK(slink.features.size() == 1 && slink.features[0] == 0x02);
+    CHECK(service.snapshot(1, &st, &packet) && (st.buttons & kSouth));
+    schannel->deliver(view(ds4bt));
+    service.step(false);
+    CHECK(service.snapshot(1, &st, &packet) && (st.buttons & kTouchpad) && st.battery_percent == 50);
+    CHECK(slink.features.size() == 1);                                        // (only once)
+    CHECK(service.set_light(1, 1, 2, 3) && slink.outputs.back()[8] == 1 && slink.outputs.back()[10] == 3);
+
+    // More reports than the ring holds between polls: the newest survive.
+    for (int i = 0; i < 40; ++i) xchannel->deliver(view(report));
+    CHECK(xchannel->dropped() > 0);
+    service.step(false);
+
+    // The link goes: the pads leave their slots at the next scan.
+    xchannel->detach();
+    CHECK(!xchannel->send_output(view(report)));
+    service.step(true);
+    CHECK(service.count() == 1 && !service.snapshot(0, &st, &packet));
+    schannel->detach();
+    service.step(true);
+    CHECK(service.count() == 0);
+    // Not a pad: nothing made.
+    SharedPointer<HidPadChannel> kchannel = SharedPointer<HidPadChannel>::make(a);
+    CHECK(!make_bluetooth_gamepad(a, kchannel, keyboard, view(kb_map)));
+    CHECK(!make_bluetooth_gamepad(a, SharedPointer<HidPadChannel>(), ds4id, ConstByteView()));
+    service.stop();
+  }
+  CHECK(a.live == 0);
+}
+
+// --- An Xbox pad over LE, through HID over GATT -------------------------------------------------------
+
+// A GATT remote shaped like an Xbox pad: Device Information with its PnP ID, the HID service with the report map, input report 1 (notify)
+// and output report 3 (write without response), each with its Report Reference.
+struct FakeGattPad final : IBluetoothRemote {
+  BluetoothDeviceInfo device;
+  GattDatabase db;
+  uint32_t connection = 7;
+  IBluetoothNotificationSink* sink = nullptr;
+  std::vector<std::pair<int, Bytes>> writes;
+  Bytes map = kXboxBtMap;
+  uint16_t product = 0x0B13;
+  enum { kPnp, kMap, kInput, kOutput };
+
+  FakeGattPad() {
+    strcpy(device.name, "Xbox Wireless Controller");
+    db.services[0] = {1, 4, Uuid::from16(0x180A)};
+    db.services[1] = {5, 20, Uuid::from16(0x1812)};
+    db.service_count = 2;
+    auto ch = [&](int index, uint16_t value, uint8_t props, uint8_t service, uint16_t uuid) {
+      GattCharacteristic& c = db.characteristics[index];
+      c.declaration = static_cast<uint16_t>(value - 1);
+      c.value_handle = value;
+      c.end_handle = static_cast<uint16_t>(value + 2);
+      c.properties = props;
+      c.service = service;
+      c.uuid = Uuid::from16(uuid);
+    };
+    ch(kPnp, 3, gatt::kPropRead, 0, 0x2A50);
+    ch(kMap, 7, gatt::kPropRead, 1, 0x2A4B);
+    ch(kInput, 10, gatt::kPropRead | gatt::kPropNotify, 1, 0x2A4D);
+    ch(kOutput, 14, gatt::kPropRead | gatt::kPropWriteWithoutResponse, 1, 0x2A4D);
+    db.characteristic_count = 4;
+    db.descriptors[0] = {12, kInput, Uuid::from16(0x2908)};
+    db.descriptors[1] = {15, kOutput, Uuid::from16(0x2908)};
+    db.descriptor_count = 2;
+  }
+  const BluetoothDeviceInfo& info() const override { return device; }
+  uint32_t id() const override { return connection; }
+  bool connected() const override { return true; }
+  bool encrypted() const override { return true; }
+  const GattDatabase& database() const override { return db; }
+  AttStatus read(int characteristic, ByteView out, uint32_t* length) override {
+    Bytes v;
+    if (characteristic == kPnp) v = {0x02, 0x5E, 0x04, static_cast<uint8_t>(product), static_cast<uint8_t>(product >> 8), 0x01, 0x05};
+    else if (characteristic == kMap) v = map;
+    else return AttStatus::Error;
+    if (v.size() > out.size()) v.resize(out.size());
+    for (size_t i = 0; i < v.size(); ++i) out[i] = v[i];
+    *length = static_cast<uint32_t>(v.size());
+    return AttStatus::Ok;
+  }
+  AttStatus read_descriptor(uint16_t handle, ByteView out, uint32_t* length) override {
+    if (out.size() < 2) return AttStatus::Error;
+    if (handle == 12) { out[0] = 1; out[1] = 1; }          // report 1, input
+    else if (handle == 15) { out[0] = 3; out[1] = 2; }     // report 3, output
+    else return AttStatus::Error;
+    *length = 2;
+    return AttStatus::Ok;
+  }
+  AttStatus write(int characteristic, ConstByteView value, bool) override {
+    writes.push_back({characteristic, Bytes(value.data(), value.data() + value.size())});
+    return AttStatus::Ok;
+  }
+  AttStatus subscribe(int characteristic, bool, IBluetoothNotificationSink* s) override {
+    if (characteristic != kInput) return AttStatus::Error;
+    sink = s;
+    return AttStatus::Ok;
+  }
+  void notify(const Bytes& value) { if (sink) sink->on_notification(*this, 10, view(value), false); }
+};
+
+struct NullInputSink final : IInputSink {
+  int keyboards = 0, mice = 0;
+  bool add_keyboard(IKeyboard*) override { ++keyboards; return true; }
+  bool remove_keyboard(IKeyboard*) override { --keyboards; return true; }
+  bool add_mouse(IMouse*) override { ++mice; return true; }
+  bool remove_mouse(IMouse*) override { --mice; return true; }
+  void notify(StringView) override {}
+};
+
+static void test_hid_over_gatt_pad() {
+  TestAllocator a;
+  {
+    GameControllerService service(nullptr, a);
+    CHECK(service.start());
+    HidOverGatt profile(a);
+    FakeGattPad pad;
+    // Without a game controller service the pad is not taken (and is no keyboard either).
+    CHECK(!profile.attach(pad));
+    profile.set_game_controllers(&service);
+    CHECK(profile.matches(pad.info(), pad.database()) && profile.attach(pad));
+    CHECK(service.count() == 1 && pad.sink != nullptr);
+    Info info;
+    CHECK(service.info(0, &info) && info.protocol == Protocol::XboxOne && info.vendor_id == 0x045E && info.product_id == 0x0B13);
+    // The notification carries the report without its id: the profile puts it back.
+    pad.notify({0xFF, 0xFF, 0x00, 0x00, 0x00, 0x80, 0x00, 0x80, 0x00, 0x00, 0xFF, 0x03, 0x00, 0x02, 0x00});   // (button 2: B)
+    service.step(false);
+    State st;
+    uint32_t packet = 0;
+    CHECK(service.snapshot(0, &st, &packet) && st.buttons == kEast && st.left_x == 32767 && st.right_trigger == 255);
+    // Rumble is queued by the pad's thread and written when the adapter's thread calls service().
+    const size_t before = pad.writes.size();
+    CHECK(service.set_vibration(0, 0xFFFF, 0));
+    CHECK(pad.writes.size() == before);
+    profile.service(pad);
+    CHECK(pad.writes.size() == before + 1 && pad.writes.back().first == FakeGattPad::kOutput && pad.writes.back().second.size() == 8 &&
+          pad.writes.back().second[0] == 0x0F && pad.writes.back().second[3] == 99);
+    profile.service(pad);
+    CHECK(pad.writes.size() == before + 1);                                    // (nothing new: nothing written)
+    NullInputSink sink;
+    CHECK(profile.poll(sink) == 0 && sink.keyboards == 0 && sink.mice == 0);   // a pad is no keyboard or mouse
+    // The link drops: the pad leaves its slot.
+    profile.detach(pad);
+    CHECK(!service.set_vibration(0, 1, 1) || true);
+    service.step(true);
+    CHECK(service.count() == 0);
+    (void)profile.poll(sink);
+    // A cut-short or bit-flipped report map never crashes the attach.
+    for (size_t n = 0; n < kXboxBtMap.size(); n += 3) {
+      FakeGattPad cut;
+      cut.connection = static_cast<uint32_t>(100 + n);
+      cut.map = Bytes(kXboxBtMap.begin(), kXboxBtMap.begin() + n);
+      if (profile.attach(cut)) profile.detach(cut);
+      service.step(true);
+      (void)profile.poll(sink);
+    }
+    for (size_t bit = 0; bit < kXboxBtMap.size() * 8; bit += 7) {
+      FakeGattPad flipped;
+      flipped.connection = static_cast<uint32_t>(1000 + bit);
+      flipped.map[bit / 8] ^= static_cast<uint8_t>(1u << (bit % 8));
+      if (profile.attach(flipped)) {
+        flipped.notify({0x01, 0x02, 0x03});
+        service.step(false);
+        profile.detach(flipped);
+      }
+      service.step(true);
+      (void)profile.poll(sink);
+    }
+    service.stop();
+  }
+  CHECK(a.live == 0);
+}
+
 // --- NtTcosGamepad's words ------------------------------------------------------------------------------
 
 static void test_service_call() {
@@ -774,6 +1066,8 @@ int main() {
   test_service();
   test_service_call();
   test_wireless();
+  test_bluetooth();
+  test_hid_over_gatt_pad();
   printf("GameControllerTest: %d checks, %d failed\n", g_checks, g_failed);
   return g_failed ? 1 : 0;
 }

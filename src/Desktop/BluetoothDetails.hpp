@@ -38,7 +38,7 @@ struct BluetoothDeviceRow {
   int8_t signal_percent = -1;         // -1: not known
   BluetoothDeviceState state = BluetoothDeviceState::Disconnected;
   bool paired = false;
-  bool supported = true;              // false: a kind of device this system cannot connect to yet (classic Bluetooth)
+  bool supported = true;              // false: a kind of device this system cannot connect to yet (classic Bluetooth devices other than HID ones)
   char failure[64] = {};              // why the last attempt failed (state Failed)
   char profiles[48] = {};             // what serves it once connected ("HID over GATT")
 };

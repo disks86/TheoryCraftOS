@@ -57,6 +57,7 @@
 #include "Hardware/MidiDevice/Usb/UsbMidiService.hpp"
 #include "Hardware/GameController/GameControllerService.hpp"
 #include "Hardware/GameController/WindowsGamepadService.hpp"
+#include "Hardware/GameController/Usb/XboxWirelessAdapter.hpp"
 #include "Hardware/LinuxGamepads.hpp"
 #include "Kernel/Paging.hpp"
 #include "CPUScheduler/Scheduler.hpp"
@@ -116,6 +117,9 @@
 #include "Hardware/AudioDevice/SystemAudioDevices.hpp"
 #include "Hardware/Camera/SystemCameras.hpp"
 #include "Hardware/SerialPort/SystemSerialPorts.hpp"
+#include "Hardware/SerialPort/Usb/UsbSerialPorts.hpp"
+#include "Hardware/Firmware/Smbios.hpp"
+#include "Hardware/Platform/Framework/FrameworkPlatform.hpp"
 #include "Hardware/SerialPort/X86SerialPortIo.hpp"
 #include "Hardware/Clock/TscClock.hpp"
 #include "Hardware/Platform/AMD/AmdRyzenPlatform.hpp"
@@ -141,12 +145,14 @@
 #include "Hardware/Tpm/TpmDriver.hpp"
 #include "Hardware/Power/Thermal.hpp"
 #include "Hardware/Bus/Ish/IshDriver.hpp"
+#include "Hardware/Sensor/AmdSfh/AmdSfhDriver.hpp"
 #include "Hardware/Pen/PenMouse.hpp"
 #include "Hardware/Sensor/AcpiAmbientLight.hpp"
 #include "Hardware/Sensor/SensorHub.hpp"
 #ifdef TCOS_BLUETOOTH
 #include "Hardware/Bluetooth/BluetoothService.hpp"
 #include "Hardware/Bluetooth/HidOverGatt.hpp"
+#include "Hardware/Bluetooth/HidpHost.hpp"
 #include "Hardware/WirelessInterface/Intel/IwlDriver.hpp"      // (FileSystemFirmwareSource reads /firmware)
 #endif
 #include "Hardware/WirelessInterface/WifiAdapterProbe.hpp"   // (and WifiFirmwareSource.hpp: FileSystemFirmwareSource)
@@ -184,11 +190,16 @@
 #include "Hardware/Acpi/SystemAcpiPorts.hpp"
 #include "Hardware/Acpi/AcpiEvents.hpp"
 #include "Hardware/Acpi/DellWmiHotkeys.hpp"
+#include "Hardware/UsbTypeC/AcpiUcsiTransport.hpp"
+#include "Hardware/UsbTypeC/KernelUcsiClock.hpp"
+#include "Hardware/UsbTypeC/UsbTypeCSystem.hpp"
 #include "Hardware/Backlight/AcpiBacklight.hpp"
 #include "Hardware/Backlight/AcpiVideoKeys.hpp"
 #include "Hardware/Backlight/IntelPchBacklight.hpp"
 #include "Hardware/Acpi/IoApic.hpp"
 #include "Hardware/Battery/AcpiBattery.hpp"
+#include "Hardware/EmbeddedController/ChromeEc/SettingsChargeLimitStore.hpp"
+#include "Hardware/EmbeddedController/ChromeEc/SystemChromeEc.hpp"
 #include "SystemMonitor.hpp"
 #include "FileSystem/SystemLayout.hpp"
 #include "SystemPrintService.hpp"
@@ -772,6 +783,17 @@ static efi::Status kernel_main(efi::Handle image, efi::SystemTable* st) {
   if (!run_container_demo(allocator)) console::puts("container self-check failed\n");
 #endif
 
+  // What the machine is (SMBIOS): its maker and model, and for a Framework laptop which one, read once and kept for the drivers that care.
+  if (hardware::read_system_smbios(st)) {
+    const hardware::SmbiosInfo& smbios = *hardware::system_smbios();
+    Entry(Level::Ok, "System").text(smbios.manufacturer).text(" ").text(smbios.product).text(" (").text(hardware::smbios_chassis_type_name(smbios.chassis_type))
+        .text("), BIOS ").text(smbios.bios_version).text(" ").text(smbios.bios_date).text(", SMBIOS ").dec(smbios.major).text(".").dec(smbios.minor);
+    if (const hardware::framework::ModelInfo* framework_model = hardware::framework::identify(smbios))
+      Entry(Level::Info, "System").text(framework_model->name).text(", ").dec(framework_model->expansion_card_bays).text(" expansion card bays");
+  } else {
+    Entry(Level::Info, "System").text("no SMBIOS table: the machine's model is not known");
+  }
+
   scheduling::Scheduler scheduler(cpu, shared_allocator);
 
   // From here on the OS is preemptively multithreaded on every core.
@@ -1286,8 +1308,18 @@ static efi::Status kernel_main(efi::Handle image, efi::SystemTable* st) {
   hardware::SystemSerialPorts serial_ports(serial_io, shared_allocator);
   serial_ports.initialize();
   for (uint32_t i = 0; i < serial_ports.count(); ++i) Entry(Level::Ok, "Serial").text(serial_ports.at(i)->name());
-  if (serial_ports.count() == 0) Entry(Level::Info, "Serial").text("no serial port");
-  else if (!serial_ports.start_service()) Entry(Level::Warning, "Serial").text("could not start the serial service; ports do not move bytes");
+  // USB serial ports (CDC-ACM: microcontroller boards, modems, the Framework Laptop 16's LED matrix), those plugged in later too.
+  hardware::UsbSerialPorts usb_serial(&usb, serial_ports, shared_allocator);
+  usb_serial.set_notifier([](void*, StringView text) {
+    console::debug_puts("Serial: ");
+    console::debug_puts(text);
+    console::debug_puts("\n");
+  }, nullptr);
+  const uint32_t usb_serial_count = usb_serial.initialize();
+  if (usb_serial_count) Entry(Level::Ok, "Serial").dec(usb_serial_count).text(" USB serial port(s)");
+  if (serial_ports.count() == 0 && usb_serial_count == 0) Entry(Level::Info, "Serial").text("no serial port yet");
+  if (!serial_ports.start_service()) Entry(Level::Warning, "Serial").text("could not start the serial service; ports do not move bytes");
+  if (!usb_serial.start_service()) Entry(Level::Warning, "Serial").text("could not watch for USB serial ports plugged in later");
 #ifdef TCOS_SELFTESTS
   UniquePointer<NetworkStackDemo> stack_demo;
   if (clock_ok && !run_async_demo(clock, shared_allocator)) console::puts("  async self-check incomplete\n");
@@ -1444,6 +1476,9 @@ static efi::Status kernel_main(efi::Handle image, efi::SystemTable* st) {
                        nullptr);
 #ifdef TCOS_BLUETOOTH
   hardware::HidOverGatt bluetooth_hid(shared_allocator);      // Bluetooth keyboards and mice: a profile for the Bluetooth manager and a source of input devices for SystemInput (it outlives both)
+  bluetooth_hid.set_game_controllers(&game_controllers);      // (LE game controllers go to the player slots instead)
+  hardware::HidpHost bluetooth_classic_hid(shared_allocator);  // classic HID (HIDP): DualShock 4, DualSense, Switch Pro and other classic pads, keyboards and mice
+  bluetooth_classic_hid.set_game_controllers(&game_controllers);
 #endif
   input.set_vmmdev(guest.virtualbox());
   input.initialize();
@@ -1488,6 +1523,22 @@ static efi::Status kernel_main(efi::Handle image, efi::SystemTable* st) {
       Entry(outcome == hardware::IshDriver::Outcome::Started ? Level::Ok : Level::Warning, "Sensor").text("Intel sensor hub: ").text(hardware::IshDriver::outcome_name(outcome));
       if (outcome == hardware::IshDriver::Outcome::Started) Entry(Level::Info, "Sensor").dec(ish->sensor_count()).text(" sensor(s) through the ISH");
       else ish = UniquePointer<hardware::IshDriver>();
+    }
+  }
+#endif
+#ifdef TCOS_AMD_SFH
+  // The AMD Sensor Fusion Hub (Ryzen laptops: the Framework Laptop's ambient light sensor, the motion sensors of convertibles): its sensors join the others.
+  UniquePointer<hardware::AmdSfhDriver> sfh;
+  if (paging_ok) {
+    for (uint32_t i = 0; i < pci.device_count() && !sfh; ++i) {
+      hardware::PciDeviceInfo d;
+      if (!pci.pci_device(i, &d) || !hardware::AmdSfhDriver::supports(d)) continue;
+      sfh = UniquePointer<hardware::AmdSfhDriver>::make(shared_allocator, shared_allocator);
+      if (!sfh) break;
+      const hardware::AmdSfhDriver::Outcome outcome = sfh->start(pci, d, register_mapper, &sensors);
+      Entry(outcome == hardware::AmdSfhDriver::Outcome::Started ? Level::Ok : Level::Warning, "Sensor").text("AMD sensor fusion hub (").text(hardware::AmdSfhDriver::generation_name(sfh->generation())).text("): ").text(hardware::AmdSfhDriver::outcome_name(outcome));
+      if (outcome == hardware::AmdSfhDriver::Outcome::Started) Entry(Level::Info, "Sensor").dec(sfh->sensor_count()).text(" sensor(s) through the SFH");
+      else sfh = UniquePointer<hardware::AmdSfhDriver>();
     }
   }
 #endif
@@ -1704,6 +1755,20 @@ static efi::Status kernel_main(efi::Handle image, efi::SystemTable* st) {
     sync_wall_clock(st);
     filesystem::set_unix_clock(wall_clock_seconds, nullptr);   // before the volumes are mounted: they stamp what they create
     SystemFileSystem explorer_files(shared_allocator, storage);
+    // The Xbox Wireless Adapter's firmware (Microsoft's, which the user copies to /firmware: docs/GameControllers.md) can be read from now on;
+    // an adapter the game controller service took up before this starts at its next poll.
+    hardware::FileSystemFirmwareSource xbox_adapter_firmware(explorer_files.file_system(), shared_allocator);
+    hardware::XboxWirelessEnvironment xbox_adapter_environment;
+    xbox_adapter_environment.firmware = &xbox_adapter_firmware;
+    xbox_adapter_environment.log = [](void*, StringView text) {
+      console::debug_puts("Game controller: ");
+      console::debug_puts(text);
+      console::debug_puts("\n");
+    };
+    hardware::set_xbox_wireless_environment(&xbox_adapter_environment);
+    struct XboxAdapterEnvironmentGuard {
+      ~XboxAdapterEnvironmentGuard() { hardware::set_xbox_wireless_environment(nullptr); }   // (before the file system goes)
+    } xbox_adapter_environment_guard;
     desktop::KernelProgramLauncher program_launcher(shared_allocator);      // what the terminals run programs with
 #ifdef TCOS_INTEL_NPU
     // The Intel NPU: the firmware from /Linux/lib/firmware/intel/vpu is loaded and started (power-up, MMU, boot, ready message), its interrupt is an MSI to this core, and from then
@@ -1859,8 +1924,10 @@ static efi::Status kernel_main(efi::Handle image, efi::SystemTable* st) {
       inventory.set_bluetooth(bluetooth.get());
       bluetooth->add_profile(&bluetooth_hid);
       input.add_source(&bluetooth_hid);
+      bluetooth->add_profile(&bluetooth_classic_hid);
+      input.add_source(&bluetooth_classic_hid);
       bluetooth->start();
-      bluetooth_bonds_saved = bluetooth->bonds().count();
+      bluetooth_bonds_saved = bluetooth->bonds().revision();
       for (uint32_t i = 0; i < bluetooth->count(); ++i) {
         const hardware::BluetoothService::Entry* e = bluetooth->entry(i);
         Entry log(e->state == hardware::BluetoothState::Ready ? Level::Ok : Level::Warning, "Bluetooth");
@@ -2680,6 +2747,25 @@ static efi::Status kernel_main(efi::Handle image, efi::SystemTable* st) {
         else e2.text(", ").dec(static_cast<uint32_t>(first.percent)).text("%").text(first.state == hardware::BatteryState::Charging ? ", charging" : first.state == hardware::BatteryState::Discharging ? ", discharging" : first.state == hardware::BatteryState::Full ? ", full" : "");
       }
     }
+    // The Chrome EC of a Framework laptop or a Chromebook (docs/FrameworkLaptop.md): only when the ACPI tables name it or its memory map signature reads
+    // back. Its sensors and fans join the hardware monitor; the battery charge limit kept in the system settings is given to it again.
+    hardware::SystemChromeEc chrome_ec;
+    hardware::SettingsChargeLimitStore charge_limit_store(settings);
+    if (chrome_ec.probe(battery.object_count() ? &battery.interpreter() : nullptr)) {
+      hardware::ChromeEcStack& ec_stack = chrome_ec.stack();
+      Entry e(Level::Ok, "EC");
+      e.text("Chrome EC ").text(ec_stack.ec()->version().read_write.c_str()).text(ec_stack.ec()->transport_kind() == hardware::EcTransportKind::Mec ? " (Microchip EMI" : " (LPC");
+      e.text(chrome_ec.found_in_acpi() ? ", ACPI)" : ", memory map signature)");
+      if (hardware::ChromeEcHardwareMonitor* sensors = ec_stack.monitor())
+        e.text(", ").dec(sensors->channel_count(hardware::MonitorChannel::Temperature)).text(" sensors, ").dec(sensors->channel_count(hardware::MonitorChannel::Fan)).text(" fan(s)");
+      if (ec_stack.keyboard_backlight()) e.text(", keyboard backlight");
+      if (ec_stack.restore_charge_limit(charge_limit_store)) Entry(Level::Info, "EC").text("battery charge limit restored");
+      if (const Optional<hardware::FrameworkChargeLimit> limit = ec_stack.charge_limit()) Entry(Level::Info, "EC").text("battery charge limit ").dec(limit->max_percent).text("%");
+      if (const Optional<hardware::FrameworkPrivacySwitches> privacy = ec_stack.privacy_switches())
+        Entry(Level::Info, "EC").text("privacy switches: camera ").text(privacy->camera_connected ? "on" : "off").text(", microphone ").text(privacy->microphone_connected ? "on" : "off");
+    } else if (chrome_ec.found_in_acpi()) {
+      Entry(Level::Warning, "EC").text("the ACPI tables name a Chrome EC but it did not answer: ").text(chrome_ec.problem());
+    }
 #ifdef TCOS_ACPI_EVENTS
     // The ACPI events: the general purpose events and the fixed buttons are read by the loop (and when the SCI arrives, at once), the embedded controller's events are asked for, and the
     // buttons of the laptop (power, sleep, lid) are reported. With the Thunderbolt controller its _PRW wake event is armed too: the firmware's method for the event says Notify(device, 2).
@@ -2696,6 +2782,7 @@ static efi::Status kernel_main(efi::Handle image, efi::SystemTable* st) {
       if (acpi_events && acpi_events->initialize(acpi_tables) && acpi_events->enable_acpi_mode()) {
         acpi_events->set_button_listener(&acpi_buttons);
         const bool has_ec = acpi_events->enable_embedded_controller();
+        chrome_ec.add_interpreter(acpi_events->interpreter());   // (its _Qxx methods may send Chrome EC host commands too)
         const uint32_t buttons = acpi_events->enable_buttons();
         Entry(Level::Info, "ACPI").text("events: ").text(has_ec ? "embedded controller armed, " : "no embedded controller events, ").dec(buttons).text(" button source(s)");
         bool lid = false;
@@ -2782,6 +2869,34 @@ static efi::Status kernel_main(efi::Handle image, efi::SystemTable* st) {
           [](void* d, uint8_t key) { if (key != hardware::kDellMicMute) static_cast<desktop::Desktop*>(d)->handle_media_key(key); }, &desktop, !acpi_backlight_ptr);
       if (dell_hotkeys && dell_hotkeys->scan() != 0 && acpi_events->add_listener(dell_hotkeys.get()))
         Entry(Level::Ok, "Keyboard").text("Dell hotkeys through ACPI-WMI (").dec(dell_hotkeys->device_count()).text(" device)");
+    }
+#endif
+#ifdef TCOS_ACPI_EVENTS
+    // USB-C connectors through UCSI (the PNP0CA0 / USBC000 device): its own thread starts the policy manager and follows the changes the firmware
+    // notifies (or that it finds by looking); the computer manager's hardware list shows the connectors.
+    hardware::KernelUcsiClock ucsi_clock;
+    UniquePointer<hardware::AcpiUcsiTransport> ucsi_transport;
+    UniquePointer<hardware::UcsiCore> ucsi_core;
+    UniquePointer<hardware::UsbTypeCSystem> usb_type_c;
+    kernel::Thread* usb_type_c_thread = nullptr;
+    if (acpi_events) {
+      acpi::Node* ucsi_device[1] = {};
+      if (hardware::AcpiUcsiTransport::find_devices(acpi_events->interpreter(), ArrayView<acpi::Node*>(ucsi_device)) != 0) {
+        ucsi_transport = UniquePointer<hardware::AcpiUcsiTransport>::make(shared_allocator, acpi_events->interpreter(), acpi_host, ucsi_device[0]);
+        if (ucsi_transport && ucsi_transport->initialize()) {
+          ucsi_core = UniquePointer<hardware::UcsiCore>::make(shared_allocator, *ucsi_transport, ucsi_clock);
+          if (ucsi_core) usb_type_c = UniquePointer<hardware::UsbTypeCSystem>::make(shared_allocator, shared_allocator, *ucsi_core, ucsi_clock, ucsi_device[0]);
+        }
+        if (usb_type_c) {
+          const bool notified = acpi_events->add_listener(usb_type_c.get());
+          inventory.set_usb_type_c(usb_type_c.get());
+          if (kernel::running()) usb_type_c_thread = kernel::spawn(&hardware::UsbTypeCSystem::thread_main, usb_type_c.get(), "usb-c");
+          Entry(Level::Ok, "USB-C").text("UCSI ").dec(ucsi_transport->version() >> 8).text(".").dec((ucsi_transport->version() >> 4) & 15).text(", mailbox at ").hex(ucsi_transport->mailbox_address())
+              .text(notified ? ", firmware notifications" : ", polled");
+        } else {
+          Entry(Level::Info, "USB-C").text("a UCSI device is described but its mailbox or _DSM is not usable");
+        }
+      }
     }
 #endif
     if (!acpi_backlight_ptr) {
@@ -2957,8 +3072,8 @@ static efi::Status kernel_main(efi::Handle image, efi::SystemTable* st) {
         if (++bluetooth_idle >= 25) {                                // (about every 100 ms: events read, controllers plugged in or pulled out noticed)
           bluetooth_idle = 0;
           bluetooth->step(true);
-          if (bluetooth->bonds().count() != bluetooth_bonds_saved) {                  // (a device was paired: the keys are kept)
-            bluetooth_bonds_saved = bluetooth->bonds().count();
+          if (bluetooth->bonds().revision() != bluetooth_bonds_saved) {               // (a device was paired or forgotten: the keys are kept)
+            bluetooth_bonds_saved = bluetooth->bonds().revision();
             bluetooth->save_bonds();
           }
         }
@@ -2995,6 +3110,7 @@ static efi::Status kernel_main(efi::Handle image, efi::SystemTable* st) {
       }
 #endif
 #ifdef TCOS_ACPI_EVENTS
+      if (usb_type_c && !usb_type_c_thread) usb_type_c->poll(hardware::uptime_us() / 1000);   // (no thread: the loop looks at USB-C)
       if (acpi_events) {
         static uint32_t acpi_idle = 0;
         // the events are read when the SCI came, and every so often regardless (about every 100 ms: a few port reads), in case it did not
@@ -3103,6 +3219,11 @@ static efi::Status kernel_main(efi::Handle image, efi::SystemTable* st) {
       hardware::delay_us(4000);
     }
 #ifdef TCOS_ACPI_EVENTS
+    if (usb_type_c_thread) {                                         // (its waits are all bounded: it ends within a command timeout)
+      usb_type_c->request_stop();
+      kernel::join(usb_type_c_thread);
+    }
+    inventory.set_usb_type_c(nullptr);
     if (acpi_sci_working && acpi_ioapic) {                           // (before the handler's state goes)
       acpi_ioapic->mask(acpi_sci.gsi, true);
       kernel::set_device_interrupt_handler(kernel::kVectorAcpiSci, acpi_sci_device, nullptr, nullptr);
@@ -3148,6 +3269,7 @@ static efi::Status kernel_main(efi::Handle image, efi::SystemTable* st) {
   capture_hub.reset();
   mixer.reset();   // the mixer thread ends before its audio device goes
   cameras.stop_service();
+  usb_serial.stop_service();      // (before the ports it adds to stop)
   serial_ports.stop_service();
   guest.stop_service();
   hyperv.stop_service();

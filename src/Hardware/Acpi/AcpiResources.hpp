@@ -17,7 +17,7 @@
  */
 
 
-// The resource descriptors a device's _CRS returns (ACPI 6.4, section 6.4): the ones a platform device on an I2C bus needs - the fixed memory ranges of a controller, the I2C serial
+// The resource descriptors a device's _CRS returns (ACPI 6.4, section 6.4): the ones a platform device on an I2C bus needs - the memory ranges of a controller (32 bit fixed, or DWord/QWord address space below 4 GiB), the I2C serial
 // bus connection of a device (its address and speed, and the controller it sits behind named by a path), the GPIO interrupt connection (a pin of a GPIO controller named by a path,
 // its polarity and trigger) and the interrupts. Everything else is skipped by its length. The bytes come from firmware: every length is checked.
 #pragma once

@@ -38,6 +38,10 @@ constexpr uint32_t kHandshakeSteps = 4;
 // Decodes the full input report 0x30 (report id included). False for other reports (0x81 handshake replies, 0x21 subcommand replies) and short ones.
 [[nodiscard]] bool decode_full_report(ConstByteView report, gamepad::State* state);
 
+// Over Bluetooth the pad starts with the simple report 0x3F (buttons, a hat and 16-bit sticks) until subcommand 0x03 asks for full reports.
+constexpr uint8_t kSimpleReport = 0x3F;
+[[nodiscard]] bool decode_simple_report(ConstByteView report, gamepad::State* state);
+
 // Output report 0x01: neutral rumble and one subcommand with a one-byte argument. `counter` is the sender's running count (low 4 bits).
 // Returns the report's size (0 if `out` is too small).
 uint32_t encode_subcommand(uint8_t counter, uint8_t subcommand, uint8_t argument, ByteView out);

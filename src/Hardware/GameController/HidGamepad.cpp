@@ -28,7 +28,7 @@ constexpr uint16_t kUsageAccelerator = 0xC4, kUsageBrake = 0xC5;
 // The standard button each HID button (1-based) stands for; the triggers (7, 8) are handled apart.
 constexpr uint32_t kButtonMap[GamepadDecoder::kMaxButtons] = {
     gamepad::kSouth, gamepad::kEast, gamepad::kWest, gamepad::kNorth, gamepad::kLeftShoulder, gamepad::kRightShoulder,
-    0, 0, gamepad::kBack, gamepad::kStart, gamepad::kLeftStick, gamepad::kRightStick, gamepad::kGuide};
+    0, 0, gamepad::kBack, gamepad::kStart, gamepad::kLeftStick, gamepad::kRightStick, gamepad::kGuide, 0, 0, 0};
 
 bool is_signed(const InputField& f) { return f.logical_min < 0; }
 uint32_t field_end(const InputField& f) { return f.bit_offset + f.bit_size * (f.count ? f.count : 1); }
@@ -39,8 +39,14 @@ const InputReport* find_gamepad_report(const ReportMap& map) {
   return map.find_application(kPageGenericDesktop, kUsageJoystick);
 }
 
+void GamepadDecoder::set_button_map(ArrayView<const uint32_t> map) {
+  for (uint32_t i = 0; i < kMaxButtons; ++i) map_[i] = i < map.size() ? map[i] : 0;
+  custom_map_ = true;
+}
+
 bool GamepadDecoder::init(const InputReport& report) {
   *this = GamepadDecoder();
+  for (uint32_t i = 0; i < kMaxButtons; ++i) map_[i] = kButtonMap[i];
   Axis x, y, z, rx, ry, rz, accel, brake;
   for (uint32_t i = 0; i < report.field_count; ++i) {
     const InputField& f = report.fields[i];
@@ -145,9 +151,9 @@ bool GamepadDecoder::decode(ConstByteView data, gamepad::State* out) const {
   for (uint32_t b = 0; b < kMaxButtons; ++b)
     if (has_button_bit_[b]) pressed[b] = pressed[b] || extract_bits(data, button_bits_[b].bit_offset, 1, false) != 0;
   for (uint32_t b = 0; b < kMaxButtons; ++b)
-    if (pressed[b]) s.buttons |= kButtonMap[b];
-  if (!lt_.present && pressed[6]) s.left_trigger = 255;      // digital triggers: buttons 7 and 8
-  if (!rt_.present && pressed[7]) s.right_trigger = 255;
+    if (pressed[b]) s.buttons |= map_[b];
+  if (!custom_map_ && !lt_.present && pressed[6]) s.left_trigger = 255;      // digital triggers: buttons 7 and 8
+  if (!custom_map_ && !rt_.present && pressed[7]) s.right_trigger = 255;
   *out = s;
   return true;
 }

@@ -47,20 +47,25 @@ constexpr uint16_t kOpInquiry = opcode(kOgfLink, 0x0001), kOpInquiryCancel = opc
                    kOpLeClearFilterAcceptList = opcode(kOgfLe, 0x0010), kOpLeConnectionUpdate = opcode(kOgfLe, 0x0013), kOpLeStartEncryption = opcode(kOgfLe, 0x0019),
                    kOpLeLongTermKeyReply = opcode(kOgfLe, 0x001A), kOpLeLongTermKeyNegativeReply = opcode(kOgfLe, 0x001B), kOpLeRand = opcode(kOgfLe, 0x0018),
                    kOpLeEncrypt = opcode(kOgfLe, 0x0017), kOpLeReadFilterAcceptListSize = opcode(kOgfLe, 0x000F), kOpLeReadSupportedStates = opcode(kOgfLe, 0x001C),
-                   kOpLeSetDefaultPhy = opcode(kOgfLe, 0x0031);
+                   kOpLeSetDefaultPhy = opcode(kOgfLe, 0x0031),
+                   kOpUserPasskeyReply = opcode(kOgfLink, 0x002E), kOpUserPasskeyNegativeReply = opcode(kOgfLink, 0x002F),
+                   kOpIoCapabilityNegativeReply = opcode(kOgfLink, 0x0034), kOpWriteDefaultLinkPolicy = opcode(kOgfPolicy, 0x000F),
+                   kOpWritePageTimeout = opcode(kOgfController, 0x0018);
 
 // Event codes.
 constexpr uint8_t kEvInquiryComplete = 0x01, kEvInquiryResult = 0x02, kEvConnectionComplete = 0x03, kEvConnectionRequest = 0x04, kEvDisconnectionComplete = 0x05,
                   kEvAuthenticationComplete = 0x06, kEvRemoteNameRequestComplete = 0x07, kEvEncryptionChange = 0x08, kEvReadRemoteFeaturesComplete = 0x0B,
                   kEvCommandComplete = 0x0E, kEvCommandStatus = 0x0F, kEvHardwareError = 0x10, kEvNumberOfCompletedPackets = 0x13, kEvPinCodeRequest = 0x16,
                   kEvLinkKeyRequest = 0x17, kEvLinkKeyNotification = 0x18, kEvInquiryResultWithRssi = 0x22, kEvExtendedInquiryResult = 0x2F, kEvIoCapabilityRequest = 0x31,
-                  kEvIoCapabilityResponse = 0x32, kEvUserConfirmationRequest = 0x33, kEvSimplePairingComplete = 0x36, kEvLeMeta = 0x3E, kEvVendor = 0xFF;
+                  kEvIoCapabilityResponse = 0x32, kEvUserConfirmationRequest = 0x33, kEvUserPasskeyRequest = 0x34, kEvSimplePairingComplete = 0x36,
+                  kEvUserPasskeyNotification = 0x3B, kEvLeMeta = 0x3E, kEvVendor = 0xFF;
 constexpr uint8_t kLeConnectionComplete = 0x01, kLeAdvertisingReport = 0x02, kLeConnectionUpdateComplete = 0x03, kLeLongTermKeyRequest = 0x05, kLeEnhancedConnectionComplete = 0x0A;
 
 // Status codes that matter to the host.
 constexpr uint8_t kStatusSuccess = 0x00, kStatusUnknownCommand = 0x01, kStatusUnknownConnection = 0x02, kStatusHardwareFailure = 0x03, kStatusPageTimeout = 0x04,
                   kStatusAuthenticationFailure = 0x05, kStatusPinOrKeyMissing = 0x06, kStatusMemoryFull = 0x07, kStatusConnectionTimeout = 0x08, kStatusCommandDisallowed = 0x0C,
-                  kStatusInvalidParameters = 0x12, kStatusRemoteUserTerminated = 0x13, kStatusLocalHostTerminated = 0x16;
+                  kStatusInvalidParameters = 0x12, kStatusRemoteUserTerminated = 0x13, kStatusLocalHostTerminated = 0x16,
+                  kStatusPairingNotAllowed = 0x18, kStatusUnacceptableAddress = 0x0F;
 
 // A device address as the controller sends it: least significant byte first.
 struct BdAddr {

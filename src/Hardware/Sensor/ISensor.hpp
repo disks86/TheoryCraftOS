@@ -29,6 +29,7 @@ enum class SensorKind : uint8_t {
   Gyroscope,         // x, y, z in degrees per second
   Magnetometer,      // x, y, z in gauss
   AmbientLight,      // x = illuminance in lux
+  HumanPresence,     // x = 1 when someone is in front of the screen, else 0
 };
 
 struct SensorReading {
@@ -54,6 +55,7 @@ inline const char* sensor_kind_name(SensorKind kind) {
     case SensorKind::Gyroscope: return "gyroscope";
     case SensorKind::Magnetometer: return "magnetometer";
     case SensorKind::AmbientLight: return "ambient light sensor";
+    case SensorKind::HumanPresence: return "presence sensor";
   }
   return "sensor";
 }

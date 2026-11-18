@@ -1125,14 +1125,15 @@ static void test_hid_end_to_end() {
     CHECK(w.adapter->connect(w.peer()) == BluetoothResult::Ok && w.run_until(w.peer(), BluetoothLinkState::Failed));
     CHECK(w.adapter->find_device(w.peer(), &info) && strstr(info.failure, "does not support pairing") && w.sink.keyboards.count() == 0 && w.adapter->connected_count() == 0);
     w.p->reject_pairing = false;
-    // a classic device cannot be connected to
+    // a classic device is connected to with Create Connection (ClassicHidTest follows it further)
     w.host.controller.inquiry();
     w.c->poll();
     BluetoothDeviceInfo classic;
     bool found_classic = false;
     for (uint32_t i = 0; i < w.adapter->device_count(); ++i)
       if (w.adapter->device(i, &classic) && !classic.le) { found_classic = true; break; }
-    CHECK(found_classic && w.adapter->connect(classic.address) == BluetoothResult::Unsupported);
+    CHECK(found_classic && w.adapter->connect(classic.address) == BluetoothResult::Ok && w.host.controller.opcodes.back() == hci::kOpCreateConnection);
+    CHECK(w.adapter->disconnect(classic.address) == BluetoothResult::Ok);
   }
   {   // a device that never answers the service discovery: the attempt fails with a reason, and nothing is left connected
     HidWorld w;
@@ -1240,17 +1241,19 @@ static void test_system_details() {
     desktop::BluetoothDeviceRow rows[desktop::IBluetoothDetails::kMaxDevices];
     const uint32_t n = details.devices(0, rows, desktop::IBluetoothDetails::kMaxDevices);
     CHECK(n == 6);
-    // the supported ones first, by signal: the keyboard (-53 dBm), then the beacon (-80 dBm), then the classic devices
+    // the supported ones first, by signal: the keyboard (-53 dBm), the classic peripheral (class 0x240510, -71 dBm), the beacon (-80 dBm), the classic peripheral without a
+    // signal; then the classic devices that are not HID (a phone, a headset)
     CHECK(strcmp(rows[0].name, "Keyboard") == 0 && strcmp(rows[0].kind, "Keyboard") == 0 && rows[0].signal_percent == 94 && rows[0].supported && !rows[0].paired && strcmp(rows[0].address, "C6:C5:C4:C3:C2:C1") == 0 && rows[0].key[0] == 0xC1);
-    CHECK(strcmp(rows[1].kind, "Device") == 0 && rows[1].signal_percent == 40 && rows[1].name[0] == 0);
+    CHECK(rows[1].supported && rows[1].key[0] == 7);
+    CHECK(strcmp(rows[2].kind, "Device") == 0 && rows[2].signal_percent == 40 && rows[2].name[0] == 0);
     uint32_t classic = 0;
-    for (uint32_t i = 2; i < n; ++i) classic += !rows[i].supported;
-    CHECK(classic == 4);
+    for (uint32_t i = 0; i < n; ++i) classic += !rows[i].supported;
+    CHECK(classic == 2 && !rows[4].supported && !rows[5].supported);
     bool saw_phone = false, saw_headset_ext = false;
-    for (uint32_t i = 2; i < n; ++i) { saw_phone = saw_phone || strcmp(rows[i].kind, "Phone") == 0; saw_headset_ext = saw_headset_ext || strcmp(rows[i].name, "Headset X") == 0; }
+    for (uint32_t i = 4; i < n; ++i) { saw_phone = saw_phone || strcmp(rows[i].kind, "Phone") == 0; saw_headset_ext = saw_headset_ext || strcmp(rows[i].name, "Headset X") == 0; }
     CHECK(saw_phone && saw_headset_ext);
     CHECK(details.devices(0, rows, 2) == 2 && details.devices(1, rows, 2) == 0);
-    CHECK(details.connect(0, rows[2].key) == desktop::BluetoothResult::Unsupported && details.connect(1, rows[0].key) == desktop::BluetoothResult::NotReady);
+    CHECK(details.connect(1, rows[0].key) == desktop::BluetoothResult::NotReady);
     uint8_t nobody[6] = {9, 9, 9, 9, 9, 9};
     CHECK(details.connect(0, nobody) == desktop::BluetoothResult::NoSuchDevice);
     details.set_discovery(0, false);

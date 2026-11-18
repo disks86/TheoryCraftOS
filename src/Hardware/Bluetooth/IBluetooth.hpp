@@ -23,13 +23,18 @@
 //   IBluetoothProfile   a driver for a kind of remote device (HID over GATT, a battery service, a heart rate sensor...). Registered with the manager once; offered every device that
 //                       connects, it attaches to those it understands. Adding a profile changes nothing else: no adapter, no desktop code, and the devices a profile makes (a keyboard)
 //                       reach the system through their own interface (IInputDeviceSource for input).
-//   IBluetoothRemote    what a profile may do with a connected device: read and write its characteristics, subscribe to notifications.
+//   IBluetoothRemote    what a profile may do with a connected device: read and write its characteristics, subscribe to notifications; for a classic device (classic() is not
+//                       null) open L2CAP channels to it and take the ones it opened.
+//
+// Threads: the adapter, its remotes and the profiles' attach/detach/service calls all run on the thread that polls the adapter. A profile that is called from other threads (a pad's
+// rumble from the game controller service) queues the work and does it in service().
 //
 // Operations that take time (connect, pair) start and return; the adapter's poll() carries them on and `device()` says how far they got. Nothing here blocks except what is said to.
 #pragma once
 #include <stdint.h>
 #include "Hardware/Bluetooth/Gatt.hpp"
 #include "Hardware/Bluetooth/HciTypes.hpp"
+#include "Hardware/Bluetooth/L2cap.hpp"
 #include "Hardware/IHardware.hpp"
 
 namespace hardware {
@@ -39,7 +44,7 @@ enum class BluetoothLinkState : uint8_t { Disconnected, Connecting, Pairing, Set
 struct BluetoothDeviceInfo {
   hci::BdAddr address;
   uint8_t address_type = 0;         // LE: public (0) or random (1)
-  bool le = true;                   // false: a classic device (found by inquiry; this system cannot connect to them yet)
+  bool le = true;                   // false: a classic (BR/EDR) device, found by inquiry or connecting to us
   char name[40] = {};
   int8_t rssi = 127;                // 127: not known
   uint32_t class_of_device = 0;     // classic
@@ -76,8 +81,28 @@ class IBluetoothNotificationSink {
   ~IBluetoothNotificationSink() = default;
 };
 
+// The classic side of a connected BR/EDR device: its ACL link, on which profiles open L2CAP channels (basic mode) and take the ones the device opened. Valid while the remote is.
+class IBluetoothClassicRemote {
+ public:
+  virtual uint16_t acl_handle() const = 0;
+  // The device connected to us (a bonded device that reconnected by itself, as pads do when their button is pressed) rather than we to it.
+  virtual bool incoming() const = 0;
+  virtual L2cap& l2cap() = 0;
+  virtual HciController& controller() = 0;
+  // A channel the device opened to us on `psm` (one of the profile's incoming_psms(), held by the adapter until taken), handed to `handler` from now on; null if there is none.
+  virtual L2capChannel* take_incoming(uint16_t psm, IL2capChannelHandler* handler) = 0;
+  // Asks the adapter to disconnect the device once the current call has returned, and with `forget` to delete its bond too (HID's virtual cable unplug).
+  virtual void request_disconnect(bool forget) = 0;
+
+ protected:
+  IBluetoothClassicRemote() = default;
+  ~IBluetoothClassicRemote() = default;
+};
+
 class IBluetoothRemote {
  public:
+  // The classic side of a BR/EDR device; null for an LE one (which has no GATT database's worth of services over BR/EDR here either: database() is empty).
+  virtual IBluetoothClassicRemote* classic() { return nullptr; }
   virtual const BluetoothDeviceInfo& info() const = 0;
   virtual uint32_t id() const = 0;                         // different for every connection; 0 is never used
   virtual bool connected() const = 0;
@@ -104,6 +129,11 @@ class IBluetoothProfile {
   virtual bool attach(IBluetoothRemote& remote) = 0;
   // The device is gone (its link dropped, or it was disconnected): let go of everything about it. `remote` can no longer be used.
   virtual void detach(IBluetoothRemote& remote) = 0;
+  // Called from the adapter's thread on every poll() for each remote this profile is attached to, so a profile can send what other threads queued.
+  virtual void service(IBluetoothRemote& remote) { (void)remote; }
+  // Classic profiles: the PSMs on which the adapter accepts the channels a device opens before (or while) the profile attaches; they are taken with
+  // IBluetoothClassicRemote::take_incoming(). Fills `out`, returns how many.
+  virtual uint32_t incoming_psms(ArrayView<uint16_t> out) const { (void)out; return 0; }
 
  protected:
   IBluetoothProfile() = default;

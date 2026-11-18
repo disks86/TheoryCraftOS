@@ -198,6 +198,18 @@ void SystemInventory::collect(desktop::HardwareList* list) {
       }
     }
   }
+  if (hardware::IUsbTypeC* type_c = usb_type_c()) {
+    for (uint32_t i = 0; i < type_c->connector_count(); ++i) {
+      hardware::UsbTypeCConnector connector;
+      if (!type_c->connector(i, &connector)) continue;
+      char summary[96];
+      hardware::usb_type_c_summary(connector, ArrayView<char>(summary));
+      scratch_.assign(summary);
+      name.assign("USB-C port ");
+      name.append_uint(connector.number);
+      add(list, HardwareGroup::Usb, name.view(), kUsbTypeCIdBase | i);
+    }
+  }
   if (printers_) {
     for (uint32_t i = 0; i < printers_->count(); ++i)
       if (hardware::IPrinter* p = printers_->at(i)) {
