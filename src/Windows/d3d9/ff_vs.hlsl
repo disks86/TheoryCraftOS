@@ -10,7 +10,7 @@ cbuffer vertex_constants : register(b0) {
   float4 fog_across;    // range fog: the position dot this and dot the next are its x and y in view space, and the depth is the distance
   float4 fog_up;        // from the eye; both are 0 otherwise, which leaves the depth
 };
-struct VertexIn { float4 position : POSITION; float4 colour : COLOR0; float2 texture0 : TEXCOORD0; float2 texture1 : TEXCOORD1; float4 extra : TEXCOORD2; };      // x: the fog factor, y z w: the specular colour
+struct VertexIn { float4 position : POSITION; float4 colour : COLOR0; float4 texture0 : TEXCOORD0; float4 texture1 : TEXCOORD1; float4 extra : TEXCOORD2; };      // x: the fog factor, y z w: the specular colour
 // (each set of coordinates has a register of its own between the stages: two sets in the halves of one register do not reach the pixel shader here)
 struct VertexOut { float4 position : SV_Position; float4 colour : COLOR0; float4 specular : COLOR1; float4 texture0 : TEXCOORD0; float4 texture1 : TEXCOORD1; float4 fog_factor : TEXCOORD8; };
 VertexOut main(VertexIn i) {
@@ -24,8 +24,8 @@ VertexOut main(VertexIn i) {
   o.position = lerp(transformed, pixels * w, screen.z);
   o.colour = i.colour;
   o.specular = float4(i.extra.yzw, 0);
-  o.texture0 = float4(i.texture0, 0, 1);
-  o.texture1 = float4(i.texture1, 0, 1);
+  o.texture0 = i.texture0;      // (u, v and in w what the pixel shader divides them by: d3d9.c has been through the texture matrices)
+  o.texture1 = i.texture1;
   // The fog factor, where fog is by the vertex: 1 is no fog. (The pixel shader takes it, or makes its own of the pixel's depth.)
   float4 place = float4(i.position.xyz, 1);
   float depth = length(float3(dot(place, fog_across), dot(place, fog_up), dot(place, fog_depth)));
