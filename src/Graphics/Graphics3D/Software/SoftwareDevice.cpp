@@ -20,6 +20,7 @@
 #include <new>
 #include "Graphics/Graphics2D/Software/SoftwareRenderer2D.hpp"
 #include "Graphics/Graphics3D/Software/Tessellator.hpp"
+#include "Graphics/Graphics3D/VertexFetch.hpp"
 #include "Graphics/WidePixels.hpp"
 #include "Utility/AllocatedView.hpp"
 
@@ -605,46 +606,6 @@ float read_float(ConstByteView bytes, uint64_t offset) {
   return v;
 }
 
-// An unsigned little-endian number of `bytes` bytes (1, 2 or 4) at `offset`; 0 when it is not all inside the buffer.
-uint32_t read_unsigned(ConstByteView bytes, uint64_t offset, uint32_t count) {
-  ConstByteView field;
-  if (!bytes.try_subview(offset, count, &field)) return 0;
-  uint32_t v = 0;
-  for (uint32_t i = 0; i < count; ++i) v |= uint32_t{field[i]} << (8 * i);
-  return v;
-}
-
-// One vertex attribute as the shader's input register (VertexFormat says how each kind arrives).
-Vec4 read_attribute(ConstByteView bytes, uint64_t offset, VertexFormat format) {
-  if (format == VertexFormat::Bgra8Unorm) {
-    const uint32_t v = read_unsigned(bytes, offset, 4);
-    return {static_cast<float>((v >> 16) & 0xFF) / 255.0f, static_cast<float>((v >> 8) & 0xFF) / 255.0f, static_cast<float>(v & 0xFF) / 255.0f, static_cast<float>(v >> 24) / 255.0f};
-  }
-  if (format == VertexFormat::Rgb10A2Unorm) {
-    const uint32_t v = read_unsigned(bytes, offset, 4);
-    return {static_cast<float>(v & 0x3FF) / 1023.0f, static_cast<float>((v >> 10) & 0x3FF) / 1023.0f, static_cast<float>((v >> 20) & 0x3FF) / 1023.0f, static_cast<float>(v >> 30) / 3.0f};
-  }
-  const VertexType type = vertex_format_type(format);
-  const uint32_t size = vertex_type_bytes(type), components = vertex_format_components(format);
-  const bool integer = vertex_format_is_integer(format);
-  float v[4] = {0, 0, 0, integer ? __builtin_bit_cast(float, uint32_t{1}) : 1.0f};
-  for (uint32_t k = 0; k < components; ++k) {
-    const uint32_t raw = read_unsigned(bytes, offset + uint64_t{size} * k, size);
-    const int32_t wide = size == 1 ? static_cast<int8_t>(raw) : size == 2 ? static_cast<int16_t>(raw) : static_cast<int32_t>(raw);   // (the value sign extended)
-    switch (type) {
-      case VertexType::Float: v[k] = __builtin_bit_cast(float, raw); break;
-      case VertexType::Half: v[k] = half_to_float(static_cast<uint16_t>(raw)); break;
-      case VertexType::Unorm8: v[k] = static_cast<float>(raw) / 255.0f; break;
-      case VertexType::Unorm16: v[k] = static_cast<float>(raw) / 65535.0f; break;
-      case VertexType::Snorm8: v[k] = wide < -127 ? -1.0f : static_cast<float>(wide) / 127.0f; break;
-      case VertexType::Snorm16: v[k] = wide < -32767 ? -1.0f : static_cast<float>(wide) / 32767.0f; break;
-      case VertexType::Uint8: case VertexType::Uint16: case VertexType::Uint32: v[k] = __builtin_bit_cast(float, raw); break;
-      case VertexType::Sint8: case VertexType::Sint16: case VertexType::Sint32: v[k] = __builtin_bit_cast(float, static_cast<uint32_t>(wide)); break;
-    }
-  }
-  return {v[0], v[1], v[2], v[3]};
-}
-
 bool stencil_compare(CompareOp op, uint32_t reference, uint32_t stored) {
   switch (op) {
     case CompareOp::Never: return false;
@@ -1151,7 +1112,7 @@ ClipVertex run_vertex_shader(const SoftwarePipeline& pipeline, const VertexStrea
     const uint32_t slot = at.slot < kMaxVertexBuffers ? at.slot : 0;
     const uint32_t stride = slot == 0 ? pd.vertex_stride : pd.slot_strides[slot];
     const uint64_t base = streams.offset[slot] + (at.per_instance ? instance : vertex) * stride;
-    attributes[at.location] = read_attribute(streams.data[slot], base + at.offset, at.format);
+    attributes[at.location] = read_vertex_attribute(streams.data[slot], base + at.offset, at.format);
   }
   ShaderIo io;
   if (pipeline.vertex_ex()) pipeline.vertex_ex()(attributes, constants, context, &io);

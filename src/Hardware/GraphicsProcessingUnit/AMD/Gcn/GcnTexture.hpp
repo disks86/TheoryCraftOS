@@ -71,7 +71,7 @@ struct ImageDescriptor {
 };
 
 struct SamplerDescriptor {
-  uint8_t clamp_x = 0, clamp_y = 0, clamp_z = 0;    // SQ_TEX_WRAP 0, MIRROR 1, CLAMP_LAST_TEXEL 2, CLAMP_BORDER 6
+  uint8_t clamp_x = 0, clamp_y = 0, clamp_z = 0;    // SQ_TEX_WRAP 0, MIRROR 1, CLAMP_LAST_TEXEL 2, MIRROR_ONCE_LAST_TEXEL 3, CLAMP_BORDER 6
   bool bilinear = false;               // the magnify filter (and the minify filter unless `min_bilinear_set`)
   bool min_bilinear_set = false;
   bool min_bilinear = false;           // the minify filter, when `min_bilinear_set`

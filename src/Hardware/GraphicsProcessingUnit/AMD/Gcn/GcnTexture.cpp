@@ -58,6 +58,8 @@ int64_t floor_i(float v) {
   return static_cast<float>(t) > v ? t - 1 : t;
 }
 
+constexpr uint32_t kMirrorOnceLastTexel = 3;   // SQ_TEX_MIRROR_ONCE_LAST_TEXEL
+
 // The texel an address mode picks for coordinate i of n; false for the border.
 bool address(uint32_t mode, int64_t i, int64_t n, int64_t* out) {
   switch (mode) {
@@ -68,6 +70,11 @@ bool address(uint32_t mode, int64_t i, int64_t n, int64_t* out) {
       return true;
     }
     case kSQ_TEX_CLAMP_LAST_TEXEL: *out = i < 0 ? 0 : i >= n ? n - 1 : i; return true;
+    case kMirrorOnceLastTexel: {                             // (mirrored about zero, then the last texel)
+      const int64_t m = i < 0 ? -1 - i : i;
+      *out = m >= n ? n - 1 : m;
+      return true;
+    }
     default:                                                 // CLAMP_BORDER
       if (i < 0 || i >= n) return false;
       *out = i;
@@ -75,7 +82,7 @@ bool address(uint32_t mode, int64_t i, int64_t n, int64_t* out) {
   }
 }
 
-bool mode_ok(uint32_t mode) { return mode == kSQ_TEX_WRAP || mode == kSQ_TEX_MIRROR || mode == kSQ_TEX_CLAMP_LAST_TEXEL || mode == kSQ_TEX_CLAMP_BORDER; }
+bool mode_ok(uint32_t mode) { return mode == kSQ_TEX_WRAP || mode == kSQ_TEX_MIRROR || mode == kSQ_TEX_CLAMP_LAST_TEXEL || mode == kMirrorOnceLastTexel || mode == kSQ_TEX_CLAMP_BORDER; }
 
 uint32_t next_pow2(uint32_t v) {
   uint32_t p = 1;

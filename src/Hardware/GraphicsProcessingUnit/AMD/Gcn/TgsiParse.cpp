@@ -139,6 +139,11 @@ constexpr OpName kOps[] = {
     {"CMP", TgsiOp::Cmp, 3}, {"SEQ", TgsiOp::Seq, 2}, {"SNE", TgsiOp::Sne, 2}, {"SGE", TgsiOp::Sge, 2}, {"SLT", TgsiOp::Slt, 2}, {"SGT", TgsiOp::Sgt, 2}, {"SLE", TgsiOp::Sle, 2},
     {"TEX", TgsiOp::Tex, 1}, {"TXB", TgsiOp::Txb, 1}, {"TXL", TgsiOp::Txl, 1}, {"KILL", TgsiOp::Kill, 0}, {"KILL_IF", TgsiOp::KillIf, 1}, {"IF", TgsiOp::If, 1}, {"ELSE", TgsiOp::Else, 0},
     {"ENDIF", TgsiOp::EndIf, 0}, {"END", TgsiOp::End, 0},
+    {"FSEQ", TgsiOp::Fseq, 2}, {"FSNE", TgsiOp::Fsne, 2}, {"FSLT", TgsiOp::Fslt, 2}, {"FSGE", TgsiOp::Fsge, 2}, {"USEQ", TgsiOp::Useq, 2}, {"USNE", TgsiOp::Usne, 2}, {"USLT", TgsiOp::Uslt, 2},
+    {"USGE", TgsiOp::Usge, 2}, {"ISLT", TgsiOp::Islt, 2}, {"ISGE", TgsiOp::Isge, 2}, {"UADD", TgsiOp::Uadd, 2}, {"UMUL", TgsiOp::Umul, 2}, {"UMUL_HI", TgsiOp::UmulHi, 2}, {"UMAD", TgsiOp::Umad, 3}, {"INEG", TgsiOp::Ineg, 1},
+    {"IMAX", TgsiOp::Imax, 2}, {"IMIN", TgsiOp::Imin, 2}, {"UMAX", TgsiOp::Umax, 2}, {"UMIN", TgsiOp::Umin, 2}, {"AND", TgsiOp::And, 2}, {"OR", TgsiOp::Or, 2}, {"XOR", TgsiOp::Xor, 2},
+    {"NOT", TgsiOp::Not, 1}, {"SHL", TgsiOp::Shl, 2}, {"USHR", TgsiOp::Ushr, 2}, {"ISHR", TgsiOp::Ishr, 2}, {"F2I", TgsiOp::F2i, 1}, {"F2U", TgsiOp::F2u, 1}, {"I2F", TgsiOp::I2f, 1},
+    {"U2F", TgsiOp::U2f, 1}, {"UCMP", TgsiOp::Ucmp, 3}, {"UIF", TgsiOp::Uif, 1},
 };
 
 bool swizzle_letter(char c, uint8_t* out) {
@@ -309,12 +314,21 @@ bool parse_tgsi(allocators::IAllocator& allocator, StringView text, TgsiShader* 
       sc.pos = 4;
       uint32_t index = 0;
       StringView type;
-      if (!sc.uint_value(&index) || !sc.accept(']') || !sc.word(&type) || !type.equals(StringView("FLT32")) || !sc.accept('{')) { err = "malformed IMM"; break; }
+      if (!sc.uint_value(&index) || !sc.accept(']') || !sc.word(&type) || !sc.accept('{')) { err = "malformed IMM"; break; }
+      const bool integers = type.equals(StringView("UINT32")) || type.equals(StringView("INT32"));
+      if (!integers && !type.equals(StringView("FLT32"))) { err = "malformed IMM"; break; }
       if (index != out->immediates.count() || index >= TgsiShader::kMaxImmediates) { err = "immediates must be declared in order"; break; }
       TgsiImmediate imm;
       for (uint32_t k = 0; k < 4; ++k) {
         if (k && !sc.accept(',')) { err = "an immediate has four values"; break; }
-        if (!sc.float_value(&imm.value[k])) { err = "malformed immediate value"; break; }
+        if (integers) {   // (the integer's bits are the value: a register holds 32 bits of either kind)
+          uint32_t bits = 0;
+          sc.skip_space();
+          const bool negative = sc.peek() == '-';
+          if (negative) ++sc.pos;
+          if (!sc.uint_value(&bits)) { err = "malformed immediate value"; break; }
+          imm.value[k] = __builtin_bit_cast(float, negative ? 0u - bits : bits);
+        } else if (!sc.float_value(&imm.value[k])) { err = "malformed immediate value"; break; }
       }
       if (err) break;
       if (!sc.accept('}') || !out->immediates.push_back(imm)) { err = "malformed IMM"; break; }
@@ -342,7 +356,7 @@ bool parse_tgsi(allocators::IAllocator& allocator, StringView text, TgsiShader* 
     TgsiInst inst;
     inst.op = found->op;
     inst.line = line_no;
-    const bool has_dst = found->op != TgsiOp::Kill && found->op != TgsiOp::KillIf && found->op != TgsiOp::If && found->op != TgsiOp::Else && found->op != TgsiOp::EndIf && found->op != TgsiOp::End;
+    const bool has_dst = found->op != TgsiOp::Kill && found->op != TgsiOp::KillIf && found->op != TgsiOp::If && found->op != TgsiOp::Uif && found->op != TgsiOp::Else && found->op != TgsiOp::EndIf && found->op != TgsiOp::End;
     if (has_dst) {
       TgsiFile f;
       uint32_t idx;

@@ -679,8 +679,13 @@ Status Wave::exec_valu(uint32_t w0, uint32_t w1, uint32_t literal) {
           else r = (ia & 0xFFFFFF) * (ib & 0xFFFFFF) + ic;
           break;
         }
+        case Vop3::v_mul_lo_u32: case Vop3::v_mul_hi_u32: {   // (the low and the high half of the 64 bit product; VOP3 only on GFX8)
+          if (!isrc(0, lane, &ia) || !isrc(1, lane, &ib)) return fail(Status::BadInstruction);
+          const uint64_t product = uint64_t{ia} * ib;
+          r = static_cast<uint32_t>(o == Vop3::v_mul_lo_u32 ? product : product >> 32);
+          break;
+        }
         default:
-          // (v_mul_lo_u32 / v_mul_hi_u32 are VOP3 only on GFX8 but not used: they are not in the Vop3 enum)
           return fail(Status::BadInstruction);
       }
     }

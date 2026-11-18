@@ -100,7 +100,7 @@ struct Interp {
     std::vector<size_t> else_of(sh.instructions.count(), 0), end_of(sh.instructions.count(), 0), stack;
     for (size_t n = 0; n < sh.instructions.count(); ++n) {
       const TgsiOp op = sh.instructions[n].op;
-      if (op == TgsiOp::If) stack.push_back(n);
+      if (op == TgsiOp::If || op == TgsiOp::Uif) stack.push_back(n);
       else if (op == TgsiOp::Else) else_of[stack.back()] = n;
       else if (op == TgsiOp::EndIf) { end_of[stack.back()] = n; if (else_of[stack.back()]) end_of[else_of[stack.back()]] = n; stack.pop_back(); }
     }
@@ -158,6 +158,41 @@ struct Interp {
         case TgsiOp::Tex: sample_fn(7 + i.sampler * 100, 3 + i.sampler * 10, a[0], a[1], r); break;
         case TgsiOp::Txb: sample_fn(7 + i.sampler * 100, 3 + i.sampler * 10, a[0], a[1], r); break;
         case TgsiOp::Txl: sample_fn(7 + i.sampler * 100, 3 + i.sampler * 10, a[0], a[1], r); break;
+        // integers and masks: the registers' bits
+#define BITS(expr) for (int k = 0; k < 4; ++k) { const uint32_t ua = f_bits(a[k]), ub = f_bits(b[k]), uc = f_bits(c[k]); const int32_t ia = (int32_t)ua, ib = (int32_t)ub; (void)ub; (void)uc; (void)ia; (void)ib; r[k] = bits_f((uint32_t)(expr)); }
+        case TgsiOp::Fseq: BITS(a[k] == b[k] ? ~0u : 0u) break;
+        case TgsiOp::Fsne: BITS(!(a[k] == b[k]) ? ~0u : 0u) break;
+        case TgsiOp::Fslt: BITS(a[k] < b[k] ? ~0u : 0u) break;
+        case TgsiOp::Fsge: BITS(a[k] >= b[k] ? ~0u : 0u) break;
+        case TgsiOp::Useq: BITS(ua == ub ? ~0u : 0u) break;
+        case TgsiOp::Usne: BITS(ua != ub ? ~0u : 0u) break;
+        case TgsiOp::Uslt: BITS(ua < ub ? ~0u : 0u) break;
+        case TgsiOp::Usge: BITS(ua >= ub ? ~0u : 0u) break;
+        case TgsiOp::Islt: BITS(ia < ib ? ~0u : 0u) break;
+        case TgsiOp::Isge: BITS(ia >= ib ? ~0u : 0u) break;
+        case TgsiOp::Uadd: BITS(ua + ub) break;
+        case TgsiOp::Umul: BITS(ua * ub) break;
+        case TgsiOp::UmulHi: BITS(((uint64_t)ua * ub) >> 32) break;
+        case TgsiOp::Umad: BITS(ua * ub + uc) break;
+        case TgsiOp::Ineg: BITS(0u - ua) break;
+        case TgsiOp::Imax: BITS(ia > ib ? ia : ib) break;
+        case TgsiOp::Imin: BITS(ia < ib ? ia : ib) break;
+        case TgsiOp::Umax: BITS(ua > ub ? ua : ub) break;
+        case TgsiOp::Umin: BITS(ua < ub ? ua : ub) break;
+        case TgsiOp::And: BITS(ua & ub) break;
+        case TgsiOp::Or: BITS(ua | ub) break;
+        case TgsiOp::Xor: BITS(ua ^ ub) break;
+        case TgsiOp::Not: BITS(~ua) break;
+        case TgsiOp::Shl: BITS(ua << (ub & 31)) break;
+        case TgsiOp::Ushr: BITS(ua >> (ub & 31)) break;
+        case TgsiOp::Ishr: BITS(ia >> (ub & 31)) break;
+        case TgsiOp::F2i: BITS(a[k] != a[k] ? 0 : a[k] >= 2147483648.0f ? 0x7FFFFFFF : a[k] <= -2147483648.0f ? (int32_t)0x80000000 : (int32_t)a[k]) break;
+        case TgsiOp::F2u: BITS(!(a[k] > 0) ? 0u : a[k] >= 4294967296.0f ? ~0u : (uint32_t)a[k]) break;
+        case TgsiOp::I2f: for (int k = 0; k < 4; ++k) r[k] = (float)(int32_t)f_bits(a[k]); break;
+        case TgsiOp::U2f: for (int k = 0; k < 4; ++k) r[k] = (float)f_bits(a[k]); break;
+        case TgsiOp::Ucmp: BITS(ua != 0 ? ub : uc) break;
+#undef BITS
+        case TgsiOp::Uif: write = false; if (f_bits(a[0]) == 0) n = (else_of[n] ? else_of[n] : end_of[n]); break;
         case TgsiOp::Kill: l.killed = true; write = false; break;
         case TgsiOp::KillIf: for (int k = 0; k < 4; ++k) if (a[k] < 0) l.killed = true; write = false; break;
         case TgsiOp::If: write = false; if (a[0] == 0) n = (else_of[n] ? else_of[n] : end_of[n]); break;
@@ -333,6 +368,7 @@ static Result check_shader(const char* name, const char* text, float tolerance =
 
 // Vertex shader template: inputs IN[0..3], outputs position and one varying; the body is given
 #define VS(body) "VERT\nDCL IN[0]\nDCL IN[1]\nDCL IN[2]\nDCL IN[3]\nDCL OUT[0], POSITION\nDCL OUT[1], GENERIC[0]\nDCL CONST[0..5]\nDCL TEMP[0..7]\nIMM[0] FLT32 {0.5, 2.0, -1.0, 0.0}\nIMM[1] FLT32 {3.14159, 0.1234567, 100.0, -7.5}\n" body "  99: END\n"
+#define VSI(body) "VERT\nDCL IN[0]\nDCL IN[1]\nDCL IN[2]\nDCL IN[3]\nDCL OUT[0], POSITION\nDCL OUT[1], GENERIC[0]\nDCL CONST[0..5]\nDCL TEMP[0..7]\nIMM[0] FLT32 {0.5, 2.0, -1.0, 0.0}\nIMM[1] FLT32 {3.14159, 0.1234567, 100.0, -7.5}\nIMM[2] UINT32 {3, 2, 16777215, 0}\n" body "  99: END\n"
 #define FS(body) "FRAG\nDCL IN[0], GENERIC[0], PERSPECTIVE\nDCL IN[1], GENERIC[1], PERSPECTIVE\nDCL OUT[0], COLOR\nDCL SAMP[0]\nDCL SAMP[1]\nDCL SVIEW[0], 2D, FLOAT\nDCL CONST[0..5]\nDCL TEMP[0..7]\nIMM[0] FLT32 {0.5, 2.0, -1.0, 0.0}\nIMM[1] FLT32 {3.14159, 0.1234567, 100.0, -7.5}\n" body "  99: END\n"
 
 static void test_arithmetic() {
@@ -356,6 +392,23 @@ static void test_arithmetic() {
   };
   for (const Case& c : cases) {
     const Result r = check_shader(c.name, c.text, c.tolerance);
+    if (!r.compiled) { printf("FAILED %s: did not compile: %s\n", c.name, r.error.c_str()); ++g_failed; }
+  }
+}
+
+// Integers and masks: the results are brought back to floats (a mask selects between floats, an integer is converted) so that they compare.
+static void test_integers() {
+  struct Case { const char* name; const char* text; };
+  const Case cases[] = {
+      {"float comparisons to masks, selected", VSI("0: FSLT TEMP[0], IN[0], IN[1]\n1: FSGE TEMP[1], IN[0], IN[1]\n2: FSEQ TEMP[2], IN[2], IN[2]\n3: FSNE TEMP[3], IN[2], IN[3]\n4: UCMP TEMP[4], TEMP[0], IN[2], IN[3]\n5: UCMP TEMP[5], TEMP[1], IN[2], IN[3]\n6: AND TEMP[6], TEMP[2], IN[0]\n7: AND TEMP[7], TEMP[3], IN[1]\n8: ADD TEMP[4], TEMP[4], TEMP[5]\n9: ADD OUT[0], TEMP[4], TEMP[6]\n10: MOV OUT[1], TEMP[7]\n")},
+      {"conversions and integer arithmetic", VSI("0: MUL TEMP[0], IN[0], IMM[1].zzzz\n1: F2I TEMP[1], TEMP[0]\n2: MUL TEMP[2], IN[1], IMM[1].zzzz\n3: F2I TEMP[2], TEMP[2]\n4: UADD TEMP[3], TEMP[1], TEMP[2]\n5: UMUL TEMP[4], TEMP[1], TEMP[2]\n6: UMAD TEMP[5], TEMP[1], TEMP[2], TEMP[3]\n7: UMUL_HI TEMP[6], TEMP[1], TEMP[5]\n8: I2F TEMP[3], TEMP[3]\n9: I2F TEMP[4], TEMP[4]\n10: I2F TEMP[5], TEMP[5]\n11: I2F TEMP[6], TEMP[6]\n12: ADD TEMP[3], TEMP[3], TEMP[4]\n13: ADD OUT[0], TEMP[3], TEMP[5]\n14: MOV OUT[1], TEMP[6]\n")},
+      {"unsigned conversions, minimum and maximum", VSI("0: ABS TEMP[0], IN[0]\n1: MUL TEMP[0], TEMP[0], IMM[1].zzzz\n2: F2U TEMP[1], TEMP[0]\n3: MUL TEMP[2], IN[1], IMM[1].zzzz\n4: F2I TEMP[2], TEMP[2]\n5: UMAX TEMP[3], TEMP[1], TEMP[2]\n6: UMIN TEMP[4], TEMP[1], TEMP[2]\n7: IMAX TEMP[5], TEMP[1], TEMP[2]\n8: IMIN TEMP[6], TEMP[1], TEMP[2]\n9: U2F TEMP[3], TEMP[3]\n10: U2F TEMP[4], TEMP[4]\n11: I2F TEMP[5], TEMP[5]\n12: I2F TEMP[6], TEMP[6]\n13: ADD TEMP[3], TEMP[3], TEMP[4]\n14: ADD OUT[0], TEMP[3], TEMP[5]\n15: MOV OUT[1], TEMP[6]\n")},
+      {"bitwise operations and shifts", VSI("0: MUL TEMP[0], IN[0], IMM[1].zzzz\n1: F2I TEMP[0], TEMP[0]\n2: MUL TEMP[1], IN[1], IMM[1].zzzz\n3: F2I TEMP[1], TEMP[1]\n4: OR TEMP[2], TEMP[0], TEMP[1]\n5: XOR TEMP[3], TEMP[0], TEMP[1]\n6: NOT TEMP[4], TEMP[0]\n7: SHL TEMP[5], TEMP[0], IMM[2].xxxx\n8: USHR TEMP[6], TEMP[1], IMM[2].yyyy\n9: ISHR TEMP[7], TEMP[1], IMM[2].yyyy\n10: AND TEMP[5], TEMP[5], IMM[2].zzzz\n11: I2F TEMP[2], TEMP[2]\n12: I2F TEMP[3], TEMP[3]\n13: I2F TEMP[4], TEMP[4]\n14: I2F TEMP[5], TEMP[5]\n15: U2F TEMP[6], TEMP[6]\n16: I2F TEMP[7], TEMP[7]\n17: ADD TEMP[2], TEMP[2], TEMP[3]\n18: ADD TEMP[2], TEMP[2], TEMP[4]\n19: ADD OUT[0], TEMP[2], TEMP[5]\n20: ADD OUT[1], TEMP[6], TEMP[7]\n")},
+      {"integer comparisons", VSI("0: MUL TEMP[0], IN[0], IMM[1].zzzz\n1: F2I TEMP[0], TEMP[0]\n2: MUL TEMP[1], IN[1], IMM[1].zzzz\n3: F2I TEMP[1], TEMP[1]\n4: USEQ TEMP[2], TEMP[0], TEMP[0]\n5: USNE TEMP[3], TEMP[0], TEMP[1]\n6: USLT TEMP[4], TEMP[0], TEMP[1]\n7: USGE TEMP[5], TEMP[0], TEMP[1]\n8: ISLT TEMP[6], TEMP[0], TEMP[1]\n9: ISGE TEMP[7], TEMP[0], TEMP[1]\n10: AND TEMP[2], TEMP[2], IMM[1].xxxx\n11: AND TEMP[3], TEMP[3], IMM[1].yyyy\n12: AND TEMP[4], TEMP[4], IMM[1].wwww\n13: AND TEMP[5], TEMP[5], IMM[0].yyyy\n14: AND TEMP[6], TEMP[6], IN[2]\n15: AND TEMP[7], TEMP[7], IN[3]\n16: ADD TEMP[2], TEMP[2], TEMP[3]\n17: ADD TEMP[2], TEMP[2], TEMP[4]\n18: ADD OUT[0], TEMP[2], TEMP[5]\n19: ADD OUT[1], TEMP[6], TEMP[7]\n")},
+      {"if on a mask", VSI("0: FSLT TEMP[0], IN[0], IN[1]\n1: MOV TEMP[1], IN[2]\n2: UIF TEMP[0].xxxx\n3: ADD TEMP[1], IN[2], IN[3]\n4: ELSE\n5: FSGE TEMP[2], IN[2], IN[3]\n6: UIF TEMP[2].yyyy\n7: MUL TEMP[1], IN[2], IN[3]\n8: ENDIF\n9: ENDIF\n10: MOV OUT[0], TEMP[1]\n11: MOV OUT[1], IN[0]\n")},
+  };
+  for (const Case& c : cases) {
+    const Result r = check_shader(c.name, c.text, 0);
     if (!r.compiled) { printf("FAILED %s: did not compile: %s\n", c.name, r.error.c_str()); ++g_failed; }
   }
 }
@@ -476,6 +529,7 @@ static void test_builtin_shaders() {
 
 int main() {
   test_arithmetic();
+  test_integers();
   test_fragment();
   test_refusals();
   test_builtin_shaders();

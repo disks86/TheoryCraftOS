@@ -38,9 +38,9 @@ namespace gcn {
 
 namespace abi {
 constexpr uint32_t kUserSgprs = 4;
-constexpr uint32_t kMaxAttributes = 8, kVertexBufferBytes = 16;
+constexpr uint32_t kMaxAttributes = 16, kVertexBufferBytes = 16;
 constexpr uint32_t kImageOffset = kMaxAttributes * kVertexBufferBytes, kImageBytes = 32;
-constexpr uint32_t kMaxSamplers = 8;
+constexpr uint32_t kMaxSamplers = 16;
 constexpr uint32_t kSamplerOffset = kImageOffset + kMaxSamplers * kImageBytes, kSamplerBytes = 16;
 constexpr uint32_t kTableBytes = kSamplerOffset + kMaxSamplers * kSamplerBytes;
 constexpr uint32_t kPsInputEnablePerspCenter = 1u << 1;          // SPI_PS_INPUT_ENA.PERSP_CENTER_ENA

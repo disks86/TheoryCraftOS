@@ -17,6 +17,7 @@
  */
 
 #include "Graphics/Graphics3D/Vega/VegaGraphicsDevice.hpp"
+#include "Graphics/Graphics3D/VertexFetch.hpp"
 #include <new>
 #include "Hardware/GraphicsProcessingUnit/AMD/Gcn/GcnCompiler.hpp"
 #include "ObjectContainer/List.hpp"
@@ -45,6 +46,17 @@ void destroy(allocators::IAllocator& allocator, T* object) {
 }
 
 // A view of `bytes` bytes that lives as long as the caller keeps it (grown when a draw needs more, never shrunk).
+// SQ_TEX_CLAMP_*: wrap 0, mirror 1, clamp to the last texel 2, mirror once then the last texel 3, the border colour 6.
+uint8_t wrap_mode(AddressMode mode) {
+  switch (mode) {
+    case AddressMode::Repeat: return 0;
+    case AddressMode::MirrorRepeat: return 1;
+    case AddressMode::MirrorOnce: return 3;
+    case AddressMode::ClampToBorder: return 6;
+    default: return 2;
+  }
+}
+
 bool ensure(allocators::IAllocator& allocator, ByteView* view, uint64_t bytes) {
   if (view->size() >= bytes) return true;
   release_view(allocator, *view);
@@ -230,9 +242,10 @@ struct VegaGraphicsDevice::Scratch {
     release_view(allocator, initial_depth);
     release_view(allocator, initial_stencil);
     for (ByteView& v : texture) release_view(allocator, v);
+    release_view(allocator, vertices);
   }
   allocators::IAllocator& allocator;
-  ByteView area, target, depth, stencil, initial_target, initial_depth, initial_stencil, texture[kBaseTextureUnits];
+  ByteView area, target, depth, stencil, initial_target, initial_depth, initial_stencil, texture[gcn::abi::kMaxSamplers], vertices;
   List<uint32_t> indices;
 };
 
@@ -243,8 +256,8 @@ struct VegaGraphicsDevice::DrawArgs {
   VegaImage* depth = nullptr;
   Rect2D scissor;
   Viewport viewport;   // (in the target's pixels; the whole target when no viewport was set)
-  IBuffer* vertex_buffer = nullptr;
-  uint64_t vertex_offset = 0;
+  IBuffer* vertex_buffers[kMaxVertexBuffers] = {};   // by slot
+  uint64_t vertex_offsets[kMaxVertexBuffers] = {};
   IBuffer* index_buffer = nullptr;
   uint64_t index_offset = 0;
   IndexType index_type = IndexType::Uint16;
@@ -253,8 +266,8 @@ struct VegaGraphicsDevice::DrawArgs {
   int32_t base_vertex = 0;
   const float* constants = nullptr;   // rows of four
   uint32_t constant_rows = 0;
-  VegaImage* textures[kBaseTextureUnits] = {};
-  SamplerDesc samplers[kBaseTextureUnits];
+  VegaImage* textures[gcn::abi::kMaxSamplers] = {};
+  SamplerDesc samplers[gcn::abi::kMaxSamplers];
 };
 
 VegaGraphicsDevice::VegaGraphicsDevice(allocators::IAllocator& allocator, hardware::AmdVegaM& card) : allocator_(allocator), card_(card) {
@@ -322,10 +335,17 @@ IPipeline* VegaGraphicsDevice::create_graphics_pipeline(const GraphicsPipelineDe
   const VegaModule* vs = static_cast<const VegaModule*>(desc.vertex_shader);
   const VegaModule* fs = static_cast<const VegaModule*>(desc.fragment_shader);
   if (!vs || !fs || vs->stage() != ShaderStage::Vertex || fs->stage() != ShaderStage::Fragment) return nullptr;
-  if (desc.color_target_count != 1 || desc.independent_blend || desc.texture_count > kBaseTextureUnits || desc.attribute_count > kBaseVertexAttributes || desc.vertex_stride == 0 || desc.vertex_stride % 4 != 0)
-    return nullptr;
-  for (uint32_t i = 0; i < desc.attribute_count; ++i)
-    if (desc.attributes[i].location >= gcn::abi::kMaxAttributes || desc.attributes[i].per_instance || desc.attributes[i].offset % 4 != 0) return nullptr;
+  if (desc.color_target_count != 1 || desc.independent_blend || desc.texture_count > gcn::abi::kMaxSamplers || desc.attribute_count > gcn::abi::kMaxAttributes) return nullptr;
+  // (the vertices are handed to the card repacked - run_draw - so an attribute may be of any format, at any offset, in any of the vertex buffer slots; not stepped by instance)
+  uint32_t locations = 0;
+  for (uint32_t i = 0; i < desc.attribute_count; ++i) {
+    const VertexAttribute& at = desc.attributes[i];
+    if (at.location >= gcn::abi::kMaxAttributes || at.per_instance || at.slot >= kMaxVertexBuffers || static_cast<uint32_t>(at.format) >= kVertexFormatCount || (locations >> at.location & 1)) return nullptr;
+    const uint32_t stride = at.slot == 0 ? desc.vertex_stride : desc.slot_strides[at.slot];
+    if (stride == 0 || at.offset > stride || vertex_format_bytes(at.format) > stride - at.offset) return nullptr;
+    locations |= 1u << at.location;
+  }
+  if ((vs->info.attributes_used & ~locations) != 0) return nullptr;   // (an input of the vertex shader that nothing feeds)
   if (fs->info.color_outputs != 1 || (fs->info.samplers_used >> desc.texture_count) != 0) return nullptr;
   // Each attribute the pixel shader reads comes from the vertex shader's output of the same meaning (GENERIC[n] from GENERIC[n]), wherever the two declare it; a pixel shader input
   // the vertex shader does not write is refused.
@@ -386,23 +406,31 @@ bool VegaGraphicsDevice::run_draw(const DrawArgs& a) {
   } else if (pd.stencil.enable && a.depth->stencil().empty()) {
     return fail("a stencil test without a stencil plane");
   }
-  for (uint32_t i = 0; i < pd.attribute_count; ++i) {
-    const VertexAttribute& at = pd.attributes[i];
-    r.attributes[at.location] = {static_cast<uint32_t>(at.format) + 1, at.offset};
-  }
-  r.vertex_stride = pd.vertex_stride;
   for (uint32_t k = 0; k < 16; ++k) r.ps_param[k] = pipe.ps_param[k];   // (linked by meaning when the pipeline was made)
   // the constants: the same rows for both stages
   r.vertex_constants = ArrayView<const float>(a.constants, uint64_t{a.constant_rows} * 4);
   r.pixel_constants = r.vertex_constants;
 
-  // the vertices, and the indices as 32 bit values with the base vertex added
-  const ByteView vertices = a.vertex_buffer->map();
-  if (a.vertex_offset > vertices.size()) return fail("the vertex buffer offset is outside the buffer");
-  ByteView region;
-  if (!vertices.try_subview(a.vertex_offset, vertices.size() - a.vertex_offset, &region)) return fail("the vertex buffer offset is outside the buffer");
-  const uint64_t stride = pd.vertex_stride;
-  uint64_t first_vertex_byte = 0;
+  // The vertices. The card gets them repacked: one record for each vertex the draw can reach, with every attribute of the pipeline as four 32-bit values one after the other
+  // (what the shader's input register holds: read_vertex_attribute). So the attributes may be of any VertexFormat and come from any of the vertex buffer slots, and the
+  // shader fetches input n at byte 16 * n of a record. The indices go as 32 bit values with the base vertex added.
+  ConstByteView streams[kMaxVertexBuffers];
+  uint32_t strides[kMaxVertexBuffers] = {};
+  uint64_t reachable = ~uint64_t{0};   // vertices every slot in use has
+  for (uint32_t i = 0; i < pd.attribute_count; ++i) {
+    const uint32_t slot = pd.attributes[i].slot;
+    if (strides[slot]) continue;
+    if (!a.vertex_buffers[slot]) return fail("a vertex buffer slot the pipeline reads has no buffer");
+    const ByteView mapped = a.vertex_buffers[slot]->map();
+    ByteView region;
+    if (a.vertex_offsets[slot] > mapped.size() || !mapped.try_subview(a.vertex_offsets[slot], mapped.size() - a.vertex_offsets[slot], &region)) return fail("the vertex buffer offset is outside the buffer");
+    streams[slot] = ConstByteView(region.data(), region.size());
+    strides[slot] = slot == 0 ? pd.vertex_stride : pd.slot_strides[slot];
+    const uint64_t records = region.size() / strides[slot];
+    if (records < reachable) reachable = records;
+  }
+  if (pd.attribute_count == 0) return fail("a pipeline without vertex attributes");
+  uint64_t first_vertex = 0, vertex_records = 0;
   if (a.indexed) {
     const ByteView index_memory = a.index_buffer->map();
     const uint32_t index_size = a.index_type == IndexType::Uint16 ? 2 : 4;
@@ -413,19 +441,46 @@ bool VegaGraphicsDevice::run_draw(const DrawArgs& a) {
       uint32_t v = index_memory[at] | (uint32_t{index_memory[at + 1]} << 8);
       if (index_size == 4) v |= (uint32_t{index_memory[at + 2]} << 16) | (uint32_t{index_memory[at + 3]} << 24);
       const int64_t with_base = int64_t{v} + a.base_vertex;
-      if (with_base < 0 || (static_cast<uint64_t>(with_base) + 1) * stride > region.size()) return fail("an index beyond the vertex buffer");
+      if (with_base < 0 || static_cast<uint64_t>(with_base) >= reachable) return fail("an index beyond the vertex buffer");
+      if (static_cast<uint64_t>(with_base) + 1 > vertex_records) vertex_records = static_cast<uint64_t>(with_base) + 1;
       if (!s.indices.push_back(static_cast<uint32_t>(with_base))) return fail("out of memory");
     }
     r.indices = ArrayView<const uint32_t>(s.indices.view().data(), s.indices.count());
   } else {
-    first_vertex_byte = uint64_t{a.first} * stride;
-    if (first_vertex_byte > region.size() || uint64_t{a.count} * stride > region.size() - first_vertex_byte) return fail("a draw beyond the vertex buffer");
+    first_vertex = a.first;
+    if (first_vertex > reachable || a.count > reachable - first_vertex) return fail("a draw beyond the vertex buffer");
+    vertex_records = a.count;
     r.vertex_count = a.count;
   }
-  ByteView vertex_bytes = region.subview(first_vertex_byte, region.size() - first_vertex_byte);
-  vertex_bytes = vertex_bytes.first(vertex_bytes.size() / 4 * 4);
+  // (a record ends with the last input the vertex shader reads: nothing after it is fetched)
+  uint32_t inputs = 0;
+  for (uint32_t location = 0; location < gcn::abi::kMaxAttributes; ++location)
+    if (pipe.vertex_info.attributes_used >> location & 1) inputs = location + 1;
+  if (inputs == 0) return fail("a vertex shader that reads no vertex input");
+  const uint32_t record_bytes = 16 * inputs;
+  if (vertex_records > (uint64_t{64} << 20) / record_bytes || !ensure(allocator_, &s.vertices, vertex_records * record_bytes)) return fail("out of memory");
+  {
+    ByteWriter w(s.vertices.first(vertex_records * record_bytes));
+    for (uint64_t v = 0; v < vertex_records; ++v) {
+      Vec4 values[gcn::abi::kMaxAttributes] = {};
+      for (uint32_t i = 0; i < pd.attribute_count; ++i) {
+        const VertexAttribute& at = pd.attributes[i];
+        values[at.location] = read_vertex_attribute(streams[at.slot], (first_vertex + v) * strides[at.slot] + at.offset, at.format);
+      }
+      for (uint32_t location = 0; location < inputs; ++location) {
+        const Vec4& value = values[location];
+        w.le32(__builtin_bit_cast(uint32_t, value.x));
+        w.le32(__builtin_bit_cast(uint32_t, value.y));
+        w.le32(__builtin_bit_cast(uint32_t, value.z));
+        w.le32(__builtin_bit_cast(uint32_t, value.w));
+      }
+    }
+    if (!w.ok()) return fail("out of memory");
+  }
+  for (uint32_t location = 0; location < gcn::abi::kMaxAttributes; ++location) r.attributes[location] = {4, 16 * location};
+  r.vertex_stride = record_bytes;
   ArrayView<uint32_t> vertex_words;
-  if (!vertex_bytes.try_cast<uint32_t>(&vertex_words)) return fail("the vertex buffer is not aligned to words");
+  if (!s.vertices.first(vertex_records * record_bytes).try_cast<uint32_t>(&vertex_words)) return fail("the vertex memory is not aligned to words");
   r.vertex_data = ArrayView<const uint32_t>(vertex_words.data(), vertex_words.size());
 
   // the textures: 2D RGBA8, the rows as they are
@@ -443,8 +498,9 @@ bool VegaGraphicsDevice::run_draw(const DrawArgs& a) {
     vt.tile_index = 8;
     vt.texels = ConstByteView(s.texture[u].data(), count * 4);
     vt.sampler.bilinear = a.samplers[u].filter == Filter::Linear;
-    vt.sampler.clamp_x = a.samplers[u].address_u == AddressMode::Repeat ? 0 : 2;
-    vt.sampler.clamp_y = a.samplers[u].address_v == AddressMode::Repeat ? 0 : 2;
+    vt.sampler.clamp_x = wrap_mode(a.samplers[u].address_u);
+    vt.sampler.clamp_y = wrap_mode(a.samplers[u].address_v);
+    vt.sampler.border = static_cast<uint8_t>(a.samplers[u].border);   // (BorderColor is numbered as the sampler's border colour type: transparent black, opaque black, opaque white)
   }
 
   // the planes as the draw starts
@@ -530,8 +586,9 @@ bool VegaGraphicsDevice::submit(ICommandBuffer* commands) {
         a.pipeline = static_cast<const VegaPipeline*>(cmd.pipeline);
         break;
       case RecordedCommand::Type::BindVertexBuffer:
-        a.vertex_buffer = cmd.buffer;
-        a.vertex_offset = cmd.offset;
+        if (cmd.unit >= kMaxVertexBuffers) return fail("a bad vertex buffer slot");
+        a.vertex_buffers[cmd.unit] = cmd.buffer;
+        a.vertex_offsets[cmd.unit] = cmd.offset;
         break;
       case RecordedCommand::Type::BindIndexBuffer:
         a.index_buffer = cmd.buffer;
@@ -548,7 +605,7 @@ bool VegaGraphicsDevice::submit(ICommandBuffer* commands) {
       }
       case RecordedCommand::Type::BindTexture: {
         VegaImage* image = static_cast<VegaImage*>(cmd.image);
-        if (cmd.unit >= kBaseTextureUnits || !image) return fail("a bad texture binding");
+        if (cmd.unit >= gcn::abi::kMaxSamplers || !image) return fail("a bad texture binding");
         a.textures[cmd.unit] = image;
         a.samplers[cmd.unit] = cmd.sampler;
         break;
@@ -574,7 +631,7 @@ bool VegaGraphicsDevice::submit(ICommandBuffer* commands) {
         return fail("occlusion queries");
       case RecordedCommand::Type::Draw:
       case RecordedCommand::Type::DrawIndexed: {
-        if (!in_pass || !a.pipeline || !a.vertex_buffer) return fail("a draw without a pass, a pipeline or vertices");
+        if (!in_pass || !a.pipeline) return fail("a draw without a pass or a pipeline");
         const bool indexed = cmd.type == RecordedCommand::Type::DrawIndexed;
         if (indexed && !a.index_buffer) return fail("an indexed draw without indices");
         if (topology != PrimitiveTopology::TriangleList) return fail("lines and points");

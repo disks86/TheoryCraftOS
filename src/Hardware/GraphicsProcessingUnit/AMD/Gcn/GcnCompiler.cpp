@@ -27,6 +27,7 @@ constexpr uint32_t kScratch = 12;              // vector registers for intermedi
 constexpr uint32_t kStage = 8;
 constexpr uint32_t kMaxDepth = 8;              // nesting of IF
 constexpr uint32_t kSgprLimit = 102;
+constexpr uint32_t kOwnAttributes = 8, kOwnSamplers = 4;   // the descriptors a shader keeps in registers of their own (more: one shared set, loaded before each use)
 constexpr float kInvTwoPi = 0.15915494309189533577f;
 
 inline uint32_t popcount4(uint32_t m) { return (m & 1) + ((m >> 1) & 1) + ((m >> 2) & 1) + ((m >> 3) & 1); }
@@ -81,6 +82,9 @@ class Compiler {
   void compare(Vopc op, uint32_t sdst, Opd a, Opd b);
   void select(uint32_t d, Opd if_false, Opd if_true, uint32_t mask_pair);
   void set_bool(uint32_t d, Vopc op, Opd a, Opd b);
+  static Opd integer(int32_t value);
+  void set_mask(uint32_t d, Vopc op, Opd a, Opd b);
+  void mul_lo(uint32_t d, Opd a, Opd b, bool high = false);
   void clamp01(uint32_t d);
 
   bool analyze();
@@ -116,6 +120,9 @@ class Compiler {
   uint32_t temps_used_ = 0;
   bool sampler_used_[TgsiShader::kMaxSamplers] = {};
   uint32_t image_sgpr_[TgsiShader::kMaxSamplers] = {}, sampler_sgpr_[TgsiShader::kMaxSamplers] = {}, vbuf_sgpr_[TgsiShader::kMaxInputs] = {};
+  // A shader that reads more than kOwnAttributes vertex inputs or kOwnSamplers textures has no scalar registers to keep every descriptor in: it has one set of registers for
+  // them, loaded from the table before each fetch or lookup.
+  bool shared_descriptors_ = false;
   bool uses_kill_ = false;
   uint32_t live_ = 0;                    // SGPR pair: the lanes not killed
   uint32_t pair_a_ = 0, pair_b_ = 0;     // SGPR pairs for masks
@@ -259,6 +266,25 @@ void Compiler::set_bool(uint32_t d, Vopc op, Opd a, Opd b) {
   select(d, constant(0.0f), constant(1.0f), kCodeVccLo);
 }
 
+// An integer as an operand, and a comparison's result as a mask: all ones where it holds, zero where it does not.
+Opd Compiler::integer(int32_t value) {
+  Opd o;
+  o.src = imm_int(value);
+  return o;
+}
+
+void Compiler::set_mask(uint32_t d, Vopc op, Opd a, Opd b) {
+  compare(op, kCodeVccLo, a, b);
+  select(d, integer(0), integer(-1), kCodeVccLo);
+}
+
+// The low (or the high) 32 bits of an unsigned product (a VOP3 instruction of two operands).
+void Compiler::mul_lo(uint32_t d, Opd a, Opd b, bool high) {
+  Opd ops[2] = {a, b};
+  legalize(ops, 2);
+  c_.vop3(high ? Vop3::v_mul_hi_u32 : Vop3::v_mul_lo_u32, d, ops[0].src, ops[1].src, Src(), mods_of(ops, 2));
+}
+
 void Compiler::clamp01(uint32_t d) {
   c_.vop3_of(Vop2::v_max_f32, d, vgpr(d), vgpr(d), Mods{0, 0, true, 0});
 }
@@ -321,7 +347,7 @@ bool Compiler::analyze() {
       if (!s_.fragment) return fail("discard in a vertex shader");
       uses_kill_ = true;
     }
-    if (i.op == TgsiOp::If) {
+    if (i.op == TgsiOp::If || i.op == TgsiOp::Uif) {
       if (++depth > kMaxDepth) return fail("IF nested too deeply");
       if (depth > max_depth_) max_depth_ = depth;
     } else if (i.op == TgsiOp::EndIf) {
@@ -354,15 +380,25 @@ bool Compiler::prologue() {
   for (uint32_t r = 0; r < TgsiShader::kMaxConsts; ++r)
     if (const_used_[r] && !alloc_sgpr(4, 4, &const_sgpr_[r])) return false;
   if (!s_.fragment) {
+    uint32_t used = 0, shared = 0;
+    for (uint32_t k = 0; k < s_.inputs; ++k) used += in_used_[k] ? 1 : 0;
+    shared_descriptors_ = used > kOwnAttributes;
+    if (shared_descriptors_ && !alloc_sgpr(4, 4, &shared)) return false;
     for (uint32_t k = 0; k < s_.inputs; ++k)
       if (in_used_[k]) {
-        if (!alloc_sgpr(4, 4, &vbuf_sgpr_[k])) return false;
+        if (shared_descriptors_) vbuf_sgpr_[k] = shared;
+        else if (!alloc_sgpr(4, 4, &vbuf_sgpr_[k])) return false;
         info_->attributes_used |= 1u << k;
       }
   } else {
+    uint32_t used = 0, shared_image = 0, shared_sampler = 0;
+    for (uint32_t k = 0; k < abi::kMaxSamplers; ++k) used += sampler_used_[k] ? 1 : 0;
+    shared_descriptors_ = used > kOwnSamplers;
+    if (shared_descriptors_ && (!alloc_sgpr(8, 4, &shared_image) || !alloc_sgpr(4, 4, &shared_sampler))) return false;
     for (uint32_t k = 0; k < abi::kMaxSamplers; ++k)
       if (sampler_used_[k]) {
-        if (!alloc_sgpr(8, 4, &image_sgpr_[k]) || !alloc_sgpr(4, 4, &sampler_sgpr_[k])) return false;
+        if (shared_descriptors_) image_sgpr_[k] = shared_image, sampler_sgpr_[k] = shared_sampler;
+        else if (!alloc_sgpr(8, 4, &image_sgpr_[k]) || !alloc_sgpr(4, 4, &sampler_sgpr_[k])) return false;
         info_->samplers_used |= 1u << k;
       }
     if (uses_kill_ && !alloc_sgpr(2, 2, &live_)) return false;
@@ -393,7 +429,7 @@ bool Compiler::prologue() {
       loaded = true;
     }
   if (!s_.fragment) {
-    for (uint32_t k = 0; k < s_.inputs; ++k)
+    for (uint32_t k = 0; k < s_.inputs && !shared_descriptors_; ++k)
       if (in_used_[k]) {
         c_.smem(Smem::s_load_dwordx4, vbuf_sgpr_[k], 2, k * abi::kVertexBufferBytes);
         loaded = true;
@@ -402,12 +438,17 @@ bool Compiler::prologue() {
     bool fetched = false;
     for (uint32_t k = 0; k < s_.inputs; ++k)
       if (in_used_[k]) {
+        if (shared_descriptors_) {   // (the one set of registers: this input's descriptor, then its fetch, before the next descriptor replaces it)
+          c_.smem(Smem::s_load_dwordx4, vbuf_sgpr_[k], 2, k * abi::kVertexBufferBytes);
+          c_.waitcnt(15, 7, 0);
+        }
         c_.mubuf(Mubuf::buffer_load_format_xyzw, in_reg(k, 0), 0, vbuf_sgpr_[k], imm_int(0), Code::BufferMode{false, true, false, false, 0});
+        if (shared_descriptors_) c_.waitcnt(0, 7, 15);
         fetched = true;
       }
-    if (fetched) c_.waitcnt(0, 7, 15);
+    if (fetched && !shared_descriptors_) c_.waitcnt(0, 7, 15);
   } else {
-    for (uint32_t k = 0; k < abi::kMaxSamplers; ++k)
+    for (uint32_t k = 0; k < abi::kMaxSamplers && !shared_descriptors_; ++k)
       if (sampler_used_[k]) {
         c_.smem(Smem::s_load_dwordx8, image_sgpr_[k], 2, abi::kImageOffset + k * abi::kImageBytes);
         c_.smem(Smem::s_load_dwordx4, sampler_sgpr_[k], 2, abi::kSamplerOffset + k * abi::kSamplerBytes);
@@ -558,6 +599,48 @@ bool Compiler::componentwise(const TgsiInst& i) {
       case TgsiOp::Slt: set_bool(d, Vopc::v_cmp_lt_f32, a, b); break;
       case TgsiOp::Sgt: set_bool(d, Vopc::v_cmp_gt_f32, a, b); break;
       case TgsiOp::Sle: set_bool(d, Vopc::v_cmp_le_f32, a, b); break;
+      // masks from comparisons of floats and of integers
+      case TgsiOp::Fseq: set_mask(d, Vopc::v_cmp_eq_f32, a, b); break;
+      case TgsiOp::Fsne: set_mask(d, Vopc::v_cmp_neq_f32, a, b); break;
+      case TgsiOp::Fslt: set_mask(d, Vopc::v_cmp_lt_f32, a, b); break;
+      case TgsiOp::Fsge: set_mask(d, Vopc::v_cmp_ge_f32, a, b); break;
+      case TgsiOp::Useq: set_mask(d, Vopc::v_cmp_eq_u32, a, b); break;
+      case TgsiOp::Usne: set_mask(d, Vopc::v_cmp_ne_u32, a, b); break;
+      case TgsiOp::Uslt: set_mask(d, Vopc::v_cmp_lt_u32, a, b); break;
+      case TgsiOp::Usge: set_mask(d, Vopc::v_cmp_ge_u32, a, b); break;
+      case TgsiOp::Islt: set_mask(d, Vopc::v_cmp_lt_i32, a, b); break;
+      case TgsiOp::Isge: set_mask(d, Vopc::v_cmp_ge_i32, a, b); break;
+      // integer arithmetic (the reversed forms take the second operand first)
+      case TgsiOp::Uadd: f2(Vop2::v_add_u32, d, a, b); break;
+      case TgsiOp::Umul: mul_lo(d, a, b); break;
+      case TgsiOp::UmulHi: mul_lo(d, a, b, true); break;
+      case TgsiOp::Umad: {
+        const uint32_t t = new_scratch();
+        mul_lo(t, a, b);
+        f2(Vop2::v_add_u32, d, vreg_operand(t), c);
+        break;
+      }
+      case TgsiOp::Ineg: f2(Vop2::v_subrev_u32, d, a, integer(0)); break;
+      case TgsiOp::Imax: f2(Vop2::v_max_i32, d, a, b); break;
+      case TgsiOp::Imin: f2(Vop2::v_min_i32, d, a, b); break;
+      case TgsiOp::Umax: f2(Vop2::v_max_u32, d, a, b); break;
+      case TgsiOp::Umin: f2(Vop2::v_min_u32, d, a, b); break;
+      case TgsiOp::And: f2(Vop2::v_and_b32, d, a, b); break;
+      case TgsiOp::Or: f2(Vop2::v_or_b32, d, a, b); break;
+      case TgsiOp::Xor: f2(Vop2::v_xor_b32, d, a, b); break;
+      case TgsiOp::Not: f1(Vop1::v_not_b32, d, a); break;
+      case TgsiOp::Shl: f2(Vop2::v_lshlrev_b32, d, b, a); break;
+      case TgsiOp::Ushr: f2(Vop2::v_lshrrev_b32, d, b, a); break;
+      case TgsiOp::Ishr: f2(Vop2::v_ashrrev_i32, d, b, a); break;
+      case TgsiOp::F2i: f1(Vop1::v_cvt_i32_f32, d, a); break;
+      case TgsiOp::F2u: f1(Vop1::v_cvt_u32_f32, d, a); break;
+      case TgsiOp::I2f: f1(Vop1::v_cvt_f32_i32, d, a); break;
+      case TgsiOp::U2f: f1(Vop1::v_cvt_f32_u32, d, a); break;
+      case TgsiOp::Ucmp: {      // a != 0 ? b : c
+        compare(Vopc::v_cmp_ne_u32, kCodeVccLo, a, integer(0));
+        select(d, c, b, kCodeVccLo);
+        break;
+      }
       default: return fail("an instruction the compiler does not know");
     }
   }
@@ -685,6 +768,11 @@ bool Compiler::tex(const TgsiInst& i) {
   }
   const uint32_t result = base + 4;
   // whole quad mode for the implicit derivatives, then the active lanes again
+  if (shared_descriptors_) {   // (the one set of registers holds this lookup's texture and sampler)
+    c_.smem(Smem::s_load_dwordx8, image_sgpr_[i.sampler], 2, abi::kImageOffset + i.sampler * abi::kImageBytes);
+    c_.smem(Smem::s_load_dwordx4, sampler_sgpr_[i.sampler], 2, abi::kSamplerOffset + i.sampler * abi::kSamplerBytes);
+    c_.waitcnt(15, 7, 0);
+  }
   c_.sop1(Sop1::s_mov_b64, pair_a_, exec());
   c_.sop1(Sop1::s_wqm_b64, kCodeExecLo, exec());
   c_.mimg(op, result, base, image_sgpr_[i.sampler], sampler_sgpr_[i.sampler], 15);
@@ -721,14 +809,16 @@ bool Compiler::kill(const TgsiInst& i) {
 
 // IF / ELSE / ENDIF with the execution mask: the then lanes are those where the condition (the x component, not zero) holds; the else lanes the rest of those that were active
 bool Compiler::control(const TgsiInst& i) {
-  if (i.op == TgsiOp::If) {
+  if (i.op == TgsiOp::If || i.op == TgsiOp::Uif) {
     if (depth_ >= kMaxDepth) return fail("IF nested too deeply");
     Branch& b = stack_[depth_];
     b.save = cf_pairs_[depth_][0];
     b.then = cf_pairs_[depth_][1];
     b.has_else = false;
     scratch_used_ = 0;
-    compare(Vopc::v_cmp_neq_f32, b.then, operand(i.src[0], 0), constant(0.0f));       // (the lanes in exec whose condition holds)
+    // (the lanes in exec whose condition holds: a float that is not zero, or for UIF any bit set - a mask is not a number)
+    if (i.op == TgsiOp::Uif) compare(Vopc::v_cmp_ne_u32, b.then, operand(i.src[0], 0), integer(0));
+    else compare(Vopc::v_cmp_neq_f32, b.then, operand(i.src[0], 0), constant(0.0f));
     c_.sop1(Sop1::s_and_saveexec_b64, b.save, sgpr(b.then));                          // save = exec; exec = then
     b.if_branch = c_.branch(Sopp::s_cbranch_execz);
     b.else_branch = 0;
@@ -765,7 +855,7 @@ bool Compiler::instruction(const TgsiInst& i) {
     case TgsiOp::Rcp: case TgsiOp::Rsq: case TgsiOp::Sqrt: case TgsiOp::Ex2: case TgsiOp::Lg2: case TgsiOp::Sin: case TgsiOp::Cos: case TgsiOp::Pow: return scalar(i);
     case TgsiOp::Tex: case TgsiOp::Txb: case TgsiOp::Txl: return tex(i);
     case TgsiOp::Kill: case TgsiOp::KillIf: return kill(i);
-    case TgsiOp::If: case TgsiOp::Else: case TgsiOp::EndIf: return control(i);
+    case TgsiOp::If: case TgsiOp::Uif: case TgsiOp::Else: case TgsiOp::EndIf: return control(i);
     case TgsiOp::End: return true;
     default: return componentwise(i);
   }

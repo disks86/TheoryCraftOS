@@ -3332,6 +3332,7 @@ struct Scene {
   bool blend = false;
   bool two_passes = false;   // a second draw in the same pass: a translucent quad over the first picture
   bool scissor = false;
+  bool split = false;        // the positions in one vertex buffer, the colours as four normalised bytes in another (slot 1)
   float angle = 0.7f;
 };
 
@@ -3347,6 +3348,13 @@ static bool render(IGraphicsDevice& device, const Scene& scene, uint32_t w, uint
   d.cull_mode = scene.cull;
   d.front_face = scene.front;
   d.depth_test = d.depth_write = true;
+  if (scene.split) {
+    d.attribute_count = 2;
+    d.attributes[0] = {0, VertexFormat::Float3, 0, false, 0};
+    d.attributes[1] = {1, VertexFormat::Unorm8x4, 0, false, 1};
+    d.vertex_stride = 12;
+    d.slot_strides[1] = 4;
+  }
   IPipeline* pipeline = vs && fs ? device.create_graphics_pipeline(d) : nullptr;
   GraphicsPipelineDesc q;   // the translucent quad: no depth, alpha blended
   describe_colored_pipeline(&q);
@@ -3372,16 +3380,28 @@ static bool render(IGraphicsDevice& device, const Scene& scene, uint32_t w, uint
   IBuffer* vb = device.create_buffer(scene.textured ? sizeof textured : sizeof colored, kBufferVertex);
   IBuffer* ib = device.create_buffer(sizeof indices, kBufferIndex);
   IBuffer* qb = device.create_buffer(sizeof quad, kBufferVertex);
+  float split_positions[kCubeVertices][3];
+  uint8_t split_colors[kCubeVertices][4];
+  for (uint32_t i = 0; i < kCubeVertices; ++i) {
+    for (uint32_t k = 0; k < 3; ++k) split_positions[i][k] = colored[i].position[k];
+    for (uint32_t k = 0; k < 4; ++k) split_colors[i][k] = static_cast<uint8_t>(colored[i].color[k] * 255.0f + 0.5f);
+  }
+  IBuffer* pb = scene.split ? device.create_buffer(sizeof split_positions, kBufferVertex) : nullptr;
+  IBuffer* cbuf = scene.split ? device.create_buffer(sizeof split_colors, kBufferVertex) : nullptr;
   IImage* color = device.create_image({{w, h}, Format::B8G8R8A8Unorm, kImageColorAttachment});
   IImage* depth = device.create_image({{w, h}, Format::D32Float, kImageDepthAttachment});
   IImage* texture = scene.textured ? device.create_image({{16, 16}, Format::B8G8R8A8Unorm, kImageSampled}) : nullptr;
   ICommandBuffer* cb = device.create_command_buffer();
-  bool ok = pipeline && quad_pipeline && vb && ib && qb && color && depth && cb && (!scene.textured || texture);
+  bool ok = pipeline && quad_pipeline && vb && ib && qb && color && depth && cb && (!scene.textured || texture) && (!scene.split || (pb && cbuf));
   if (ok) {
     ByteView v = vb->map(), i = ib->map(), qm = qb->map();
     v.copy_from(scene.textured ? ConstByteView(reinterpret_cast<const uint8_t*>(textured), sizeof textured) : ConstByteView(reinterpret_cast<const uint8_t*>(colored), sizeof colored));
     i.copy_from(ConstByteView(reinterpret_cast<const uint8_t*>(indices), sizeof indices));
     qm.copy_from(ConstByteView(reinterpret_cast<const uint8_t*>(quad), sizeof quad));
+    if (scene.split) {
+      pb->map().copy_from(ConstByteView(reinterpret_cast<const uint8_t*>(split_positions), sizeof split_positions));
+      cbuf->map().copy_from(ConstByteView(reinterpret_cast<const uint8_t*>(split_colors), sizeof split_colors));
+    }
     if (texture) {
       uint32_t texels[256];
       for (uint32_t k = 0; k < 256; ++k) texels[k] = 0xFF000000u | ((k % 16) * 16 << 16) | ((k / 16) * 16 << 8) | (((k % 16) ^ (k / 16)) & 1 ? 0xC0 : 0x30);
@@ -3402,7 +3422,12 @@ static bool render(IGraphicsDevice& device, const Scene& scene, uint32_t w, uint
     cb->begin_render_pass(pass);
     if (scene.scissor) cb->set_scissor({int32_t(w / 4), int32_t(h / 4), w / 2, h / 2});
     cb->bind_pipeline(pipeline);
-    cb->bind_vertex_buffer(vb);
+    if (scene.split) {
+      cb->bind_vertex_buffer_slot(0, pb, 0);
+      cb->bind_vertex_buffer_slot(1, cbuf, 0);
+    } else {
+      cb->bind_vertex_buffer(vb);
+    }
     cb->bind_index_buffer(ib, IndexType::Uint16);
     if (scene.textured) cb->bind_texture(0, texture, sampler);
     cb->push_constants(&mvp, sizeof mvp);
@@ -3420,6 +3445,8 @@ static bool render(IGraphicsDevice& device, const Scene& scene, uint32_t w, uint
   if (texture) device.destroy_image(texture);
   if (depth) device.destroy_image(depth);
   if (color) device.destroy_image(color);
+  if (cbuf) device.destroy_buffer(cbuf);
+  if (pb) device.destroy_buffer(pb);
   if (qb) device.destroy_buffer(qb);
   if (ib) device.destroy_buffer(ib);
   if (vb) device.destroy_buffer(vb);
@@ -3480,7 +3507,10 @@ static void test_graphics_device() {
   Scene blended{"a translucent quad over the cube"};
   blended.two_passes = true;
   Scene scissored{"scissored", false, graphics::CullMode::Back, graphics::FrontFace::CounterClockwise, false, true, true};
-  const Scene scenes[] = {flat, logo, cull_front, clockwise, no_cull, blended, scissored};
+  Scene split = flat;
+  split.name = "positions and byte colours in two vertex buffers";
+  split.split = true;
+  const Scene scenes[] = {flat, logo, cull_front, clockwise, no_cull, blended, scissored, split};
   for (const Scene& scene : scenes) {
     got.fill(0);
     want.fill(0);

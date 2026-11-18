@@ -18,7 +18,7 @@
 
 
 // TGSI text (the shader language of Gallium, and of this OS's GLSL / WGSL translator, src/WebGl/TgsiTranslator.hpp) read into a list of instructions the GCN compiler works on. The
-// dialect is what the translator and the built-in shaders write: VERT / FRAG, PROPERTY lines (ignored), DCL of IN / OUT / CONST / TEMP / SAMP / SVIEW, IMM[n] FLT32 {a, b, c, d}, and the
+// dialect is what the translator and the built-in shaders write: VERT / FRAG, PROPERTY lines (ignored), DCL of IN / OUT / CONST / TEMP / SAMP / SVIEW, IMM[n] FLT32 {a, b, c, d} (and UINT32 / INT32: the integers' bits), and the
 // instructions "[n:] OP dst.mask, [-]file[i].swizzle ..." with an optional |abs| and a .SAT suffix, ending in END. Anything else is an error with a message and a line number.
 #pragma once
 
@@ -36,6 +36,11 @@ enum class TgsiOp : uint8_t {
   Rcp, Rsq, Sqrt, Ex2, Lg2, Pow, Sin, Cos, Dp2, Dp3, Dp4, Xpd, Cmp,
   Seq, Sne, Sge, Slt, Sgt, Sle,
   Tex, Txb, Txl, Kill, KillIf, If, Else, EndIf, End,
+  // Integers and masks (a register holds any 32 bits; a comparison's result is all ones or zero): the float comparisons that give masks, the integer comparisons, arithmetic,
+  // bitwise operations, shifts (by the low five bits of the count), conversions, the select by a mask, and IF on a mask.
+  Fseq, Fsne, Fslt, Fsge, Useq, Usne, Uslt, Usge, Islt, Isge,
+  Uadd, Umul, UmulHi, Umad, Ineg, Imax, Imin, Umax, Umin, And, Or, Xor, Not, Shl, Ushr, Ishr,
+  F2i, F2u, I2f, U2f, Ucmp, Uif,
 };
 
 struct TgsiSrc {
