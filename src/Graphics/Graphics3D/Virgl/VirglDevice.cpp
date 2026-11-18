@@ -234,7 +234,7 @@ class VirglImage final : public IImage {
                             : desc.kind == TextureKind::Texture2DArray ? virgl::kTargetTexture2dArray : virgl::kTargetTexture2d;
     ResourceCreate3d create{header(kCmdResourceCreate3d), id_, target,
                             depth ? depth_format : color_format_, bind,
-                            desc.extent.width, desc.extent.height, desc.kind == TextureKind::Texture3D ? layers : 1u, desc.kind == TextureKind::Texture3D || desc.kind == TextureKind::Texture2D ? 1u : layers, 0, desc.samples > 1 ? desc.samples : 0u,
+                            desc.extent.width, desc.extent.height, desc.kind == TextureKind::Texture3D ? layers : 1u, desc.kind == TextureKind::Texture3D || desc.kind == TextureKind::Texture2D ? 1u : layers, desc.mip_levels - 1 /* last level */, desc.samples > 1 ? desc.samples : 0u,
                             sampled ? 0u : kResourceFlagY0Top, 0};
     CtxResource ctx{header(kCmdCtxAttachResource), id_, 0};
     ok_ = gpu.command(as_bytes(create)) && gpu.command(as_bytes(ctx));
@@ -247,12 +247,12 @@ class VirglImage final : public IImage {
       const uint32_t cmd[] = {virgl::header(virgl::kCreateObject, virgl::kObjectSurface, 5), surface_, id_, fmt, 0, 0};
       ok_ = device.send_commands(cmd, 6);
     }
-    // The sampler view is what a texture unit is bound to: the whole resource, level 0, components in order.
+    // The sampler view is what a texture unit is bound to: the whole resource, all of its levels, components in order.
     if (ok_ && sampled) {
       view_ = device.new_handle();
       // (the layers the view shows: all of an array's or a cube's; a volume's slices are not layers)
       const uint32_t last_layer = desc.kind == TextureKind::Texture2DArray || desc.kind == TextureKind::TextureCube ? layers - 1 : 0;
-      const uint32_t cmd[] = {virgl::header(virgl::kCreateObject, virgl::kObjectSamplerView, 6), view_, id_, color_format_, last_layer << 16, 0, virgl::kSwizzleRgba};
+      const uint32_t cmd[] = {virgl::header(virgl::kCreateObject, virgl::kObjectSamplerView, 6), view_, id_, color_format_, last_layer << 16, (desc.mip_levels - 1) << 8 /* first level | last level << 8 */, virgl::kSwizzleRgba};
       ok_ = device.send_commands(cmd, 7);
     }
   }
@@ -282,6 +282,18 @@ class VirglImage final : public IImage {
   uint32_t color_format() const { return color_format_; }
   bool stencil() const { return desc_.stencil; }
   uint32_t layer_count() const override { return desc_.kind == TextureKind::Texture2D ? 1 : desc_.kind == TextureKind::TextureCube ? 6 : desc_.layers; }
+  uint32_t mip_levels() const override { return desc_.mip_levels; }
+  // A level above 0 of a mipmapped texture: staged at the start of the backing (which has room for level 0, the largest), from where the host copies it into the level.
+  bool write_mip_pixels(uint32_t level, ArrayView<const uint32_t> pixels) override {
+    if (level == 0) return write_pixels(pixels);
+    const uint32_t width = mip_extent(desc_.extent.width, level), height = mip_extent(desc_.extent.height, level);
+    const uint64_t count = uint64_t{width} * height;
+    if (level >= desc_.mip_levels || pixels.size() != count || !ensure_backing(uint64_t{desc_.extent.width} * desc_.extent.height)) return false;
+    const ArrayView<uint32_t> staged = backing_.cast<uint32_t>();
+    for (uint64_t i = 0; i < count; ++i) staged[i] = pixels[i];
+    TransferHost3d transfer{header(kCmdTransferToHost3d), {0, 0, 0, width, height, 1}, 0, id_, level, width * 4, 0};
+    return device_.gpu().command(as_bytes(transfer), /*fence=*/false);
+  }
   // A layer (a slice, a face) goes through the one-layer backing: the host copies from or into it at the layer's place in the resource.
   bool write_layer_pixels(uint32_t layer, ArrayView<const uint32_t> pixels) override {
     const uint64_t count = uint64_t{desc_.extent.width} * desc_.extent.height;
@@ -762,25 +774,43 @@ bool VirglDevice::wait_for_gpu() {
 }
 
 VirglDevice::~VirglDevice() {
-  for (uint32_t handle : sampler_states_) destroy_object(handle);
+  for (uint32_t i = 0; i < sampler_state_count_; ++i) destroy_object(sampler_states_[i].handle);
 }
 
 uint32_t VirglDevice::sampler_state(const SamplerDesc& sampler) {
-  // (PIPE_TEX_WRAP_*: repeat 0, clamp to edge 2, clamp to border 3, mirror repeat 4, mirror clamp to edge 6)
+  // (PIPE_TEX_WRAP_*: repeat 0, clamp to edge 2, clamp to border 3, mirror repeat 4, mirror clamp to edge 6; PIPE_TEX_MIPFILTER_*: nearest 0, linear 1, none 2)
   static const uint32_t kWrap[] = {virgl::kWrapRepeat, virgl::kWrapClampToEdge, 4, 3, 6};
-  const uint32_t u = static_cast<uint32_t>(sampler.address_u), v = static_cast<uint32_t>(sampler.address_v), border = static_cast<uint32_t>(sampler.border);
-  if (u > 4 || v > 4 || border > 2) return 0;
+  static const uint32_t kMip[] = {virgl::kMipFilterNone, 0, 1};
+  const uint32_t u = static_cast<uint32_t>(sampler.address_u), v = static_cast<uint32_t>(sampler.address_v), border = static_cast<uint32_t>(sampler.border), mip = static_cast<uint32_t>(sampler.mip_filter);
+  if (u > 4 || v > 4 || border > 2 || mip > 2) return 0;
   const bool bordered = sampler.address_u == AddressMode::ClampToBorder || sampler.address_v == AddressMode::ClampToBorder;
-  const uint32_t key = (sampler.filter == Filter::Linear ? 1u : 0u) | (u << 1) | (v << 4) | ((bordered ? border : 0u) << 7);
-  if (sampler_states_[key]) return sampler_states_[key];
+  // The states are kept by what they are. The levels of detail only matter with mipmaps and are kept in sixteenths, the range the host's levels can have.
+  auto sixteenths = [](float lod, float low, float high) { return static_cast<int32_t>((lod != lod ? 0.0f : lod < low ? low : lod > high ? high : lod) * 16.0f); };
+  SamplerState wanted;
+  wanted.bits = (sampler.filter == Filter::Linear ? 1u : 0u) | (u << 1) | (v << 4) | ((bordered ? border : 0u) << 7) | (mip << 9);
+  if (sampler.mip_filter != MipFilter::None) {
+    wanted.bias = sixteenths(sampler.lod_bias, -16.0f, 16.0f);
+    wanted.min_lod = sixteenths(sampler.min_lod, 0.0f, 16.0f);
+    wanted.max_lod = sixteenths(sampler.max_lod, 0.0f, 16.0f);
+  }
+  uint32_t similar = 0;
+  for (uint32_t i = 0; i < sampler_state_count_; ++i) {
+    const SamplerState& have = sampler_states_[i];
+    if (have.bits != wanted.bits) continue;
+    if (have.bias == wanted.bias && have.min_lod == wanted.min_lod && have.max_lod == wanted.max_lod) return have.handle;
+    similar = have.handle;
+  }
+  // (a program with more kinds of sampler than the table holds gets one that differs in its levels of detail at most; the states are the device's until it ends)
+  if (sampler_state_count_ == kSamplerStates) return similar ? similar : sampler_states_[0].handle;
   const uint32_t handle = new_handle();
   const uint32_t filter = sampler.filter == Filter::Linear ? virgl::kFilterLinear : virgl::kFilterNearest;
-  // No mipmaps: the minification filter is the magnification one and no level is chosen between.
-  const uint32_t s0 = kWrap[u] | (kWrap[v] << 3) | (virgl::kWrapClampToEdge << 6) /* r: the slices of a volume are clamped */ | (filter << 9) | (virgl::kMipFilterNone << 11) | (filter << 13) | (1u << 19) /* seamless cube maps: Direct3D always filters across the edges of a cube */;
+  const uint32_t s0 = kWrap[u] | (kWrap[v] << 3) | (virgl::kWrapClampToEdge << 6) /* r: the slices of a volume are clamped */ | (filter << 9) | (kMip[mip] << 11) | (filter << 13) | (1u << 19) /* seamless cube maps: Direct3D always filters across the edges of a cube */;
   const Vec4 color = border_color_value(sampler.border);
-  const uint32_t cmd[] = {virgl::header(virgl::kCreateObject, virgl::kObjectSamplerState, 9), handle, s0, 0, 0, 0, float_bits(color.x), float_bits(color.y), float_bits(color.z), float_bits(color.w)};
+  const uint32_t cmd[] = {virgl::header(virgl::kCreateObject, virgl::kObjectSamplerState, 9), handle, s0, float_bits(static_cast<float>(wanted.bias) / 16.0f), float_bits(static_cast<float>(wanted.min_lod) / 16.0f),
+                          float_bits(sampler.mip_filter != MipFilter::None ? static_cast<float>(wanted.max_lod) / 16.0f : 0.0f), float_bits(color.x), float_bits(color.y), float_bits(color.z), float_bits(color.w)};
   if (!send_commands(cmd, 10)) return 0;
-  sampler_states_[key] = handle;
+  wanted.handle = handle;
+  sampler_states_[sampler_state_count_++] = wanted;
   return handle;
 }
 
@@ -802,7 +832,11 @@ IBuffer* VirglDevice::create_buffer(uint64_t size, uint32_t usage) {
 void VirglDevice::destroy_buffer(IBuffer* buffer) { destroy(gpu_.allocator(), static_cast<VirglBuffer*>(buffer)); }
 
 IImage* VirglDevice::create_image(const ImageDesc& desc) {
-  if (desc.mip_levels != 1) return nullptr;   // (no mipmaps either)
+  // (mipmaps: a plain texture of 8-bit colour that is only sampled, as the kernel's own; its levels are written one by one)
+  if (desc.mip_levels == 0 || desc.mip_levels > mip_level_limit(desc.extent)) return nullptr;
+  if (desc.mip_levels != 1 && (desc.usage != kImageSampled || desc.kind != TextureKind::Texture2D || desc.samples != 1 || desc.layers != 1 ||
+                               (desc.format != Format::B8G8R8A8Unorm && desc.format != Format::B8G8R8A8Srgb && desc.format != Format::R8G8B8A8Unorm && desc.format != Format::R8G8B8A8Srgb)))
+    return nullptr;
   if (desc.samples != 1) {
     // (a multisampled image is an 8-bit colour image, which a shader may read with texel fetches, or a depth attachment alone: resolved)
     const bool depth = desc.format == Format::D32Float;

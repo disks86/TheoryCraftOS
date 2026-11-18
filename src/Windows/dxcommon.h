@@ -210,6 +210,7 @@ typedef struct KmtCaps {
   UINT max_texture_dimension, max_vertex_attributes, max_varyings, max_texture_units, max_push_constant_bytes, max_vertex_stride, flags, features;
   char name[64];
   UINT max_color_targets, max_vertex_buffers;      /* (what the device takes: DeviceInfo::limits of the kernel's graphics device) */
+  UINT sample_counts, device_kind, vendor_id, device_id;      /* bit n of sample_counts: images of n samples; the kind (0 the CPU renderer, 1 a virtual GPU, 2 a GPU) and PCI-style numbers */
 } KmtCaps;
 #define KMT_CAPS_ACCELERATED 1u
 #define KMT_CAPS_STENCIL 2u

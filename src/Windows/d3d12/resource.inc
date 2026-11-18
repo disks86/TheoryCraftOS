@@ -255,7 +255,12 @@ static HRESULT resource_make(Dev *dev, const D3D12_HEAP_PROPERTIES *props, D3D12
   ad.mips = 1;
   ad.samples = 1;
   ad.layers = 1;
-  if (desc->SampleDesc.Count > 1) return DXGI_ERROR_UNSUPPORTED;
+  /* (a multisampled image: a render target or depth buffer of two dimensions and one level, with a sample count the adapter has; drawn into and resolved) */
+  const UINT samples = desc->SampleDesc.Count > 1 ? desc->SampleDesc.Count : 1;
+  if (samples > 1 && (samples >= 32 || !((dev->caps.sample_counts >> samples) & 1) || desc->Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || desc->DepthOrArraySize > 1 || desc->MipLevels > 1 || mode == 2 ||
+                      !(desc->Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL))))
+    return samples < 32 && ((dev->caps.sample_counts >> samples) & 1) ? E_INVALIDARG : DXGI_ERROR_UNSUPPORTED;
+  ad.samples = samples;
   /* (mode: 0 an ordinary resource, 2 a reserved one, which has the 64 KiB layouts) */
   const int reserved = mode == 2;
   if (!reserved && desc->Layout != D3D12_TEXTURE_LAYOUT_UNKNOWN && desc->Layout != D3D12_TEXTURE_LAYOUT_ROW_MAJOR) return E_INVALIDARG;
@@ -284,7 +289,7 @@ static HRESULT resource_make(Dev *dev, const D3D12_HEAP_PROPERTIES *props, D3D12
     if (!fi || !fi->kernel || !!fi->depth != want_depth) { hr = fi && fi->kernel ? E_INVALIDARG : DXGI_ERROR_UNSUPPORTED; goto fail; }
     if (desc->Width == 0 || desc->Height == 0 || desc->Width > KMAX_TEXTURE_DIMENSION || desc->Height > KMAX_TEXTURE_DIMENSION) { hr = E_INVALIDARG; goto fail; }
     r->fmt = fi;
-    r->mips = desc->MipLevels ? desc->MipLevels : mip_count_for((UINT)desc->Width, desc->Height);
+    r->mips = samples > 1 ? 1 : desc->MipLevels ? desc->MipLevels : mip_count_for((UINT)desc->Width, desc->Height);
     r->layers = 1;
     r->kind = 0;
     if (desc->Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D) { r->kind = 1; r->layers = depth_or_array; }

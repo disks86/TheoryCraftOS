@@ -119,7 +119,8 @@ static HRESULT STDMETHODCALLTYPE dev_CheckFeatureSupport(Dev *This, D3D12_FEATUR
     case D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS: {
       D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS *m = data;
       if (size != sizeof *m) return E_INVALIDARG;
-      m->NumQualityLevels = m->SampleCount == 1 ? 1 : 0;
+      /* (one quality level - the standard sample pattern - for the counts the adapter has, on the formats a render target or depth buffer can have) */
+      m->NumQualityLevels = m->SampleCount == 1 || (m->SampleCount < 32 && ((This->caps.sample_counts >> m->SampleCount) & 1) && format_info(m->Format) && format_info(m->Format)->bytes == 4) ? 1 : 0;
       return S_OK;
     }
     case D3D12_FEATURE_FORMAT_INFO: {

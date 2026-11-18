@@ -91,7 +91,16 @@ class VirglDevice final : public IGraphicsDevice {
   hardware::VirtioGpu& gpu_;
   uint32_t next_handle_ = 1;  // object handles share one namespace per context
   uint64_t all_used_until_ = 0;   // the last work of a submit that used too many buffers to note each one (see in_flight)
-  uint32_t sampler_states_[512] = {};   // by filter (1 bit), the two address modes (3 bits each) and the border colour (2 bits); 0 until made
+  // The host's sampler state objects, by what they are: filter (bit 0), the two address modes (3 bits each), the border colour (2 bits), the mip filter (2 bits), and the
+  // level-of-detail bias and limits in sixteenths.
+  struct SamplerState {
+    uint32_t bits = 0;
+    int32_t bias = 0, min_lod = 0, max_lod = 0;
+    uint32_t handle = 0;
+  };
+  static constexpr uint32_t kSamplerStates = 256;
+  SamplerState sampler_states_[kSamplerStates];
+  uint32_t sampler_state_count_ = 0;
 };
 
 }  // namespace graphics

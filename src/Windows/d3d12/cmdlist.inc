@@ -882,7 +882,18 @@ static void STDMETHODCALLTYPE list_CopyResource(CmdList *l, ID3D12Resource *dst,
     packet(l, OP_COPY_REGION, payload, 8);
   }
 }
-static void STDMETHODCALLTYPE list_ResolveSubresource(CmdList *l, ID3D12Resource *d, UINT ds, ID3D12Resource *s, UINT ss, DXGI_FORMAT f) {}
+/* The samples of a multisampled image into an ordinary one of the same format and size: a colour image's are averaged, a depth buffer's first sample is taken (the kernel's
+ * ResolveRegion; it refuses formats or sizes that differ). */
+static void STDMETHODCALLTYPE list_ResolveSubresource(CmdList *l, ID3D12Resource *dst, UINT ds, ID3D12Resource *src, UINT ss, DXGI_FORMAT f) {
+  Resource *d = (Resource *)dst, *s = (Resource *)src;
+  if (!d || !s || !d->alloc || !s->alloc || ds != 0 || ss != 0 || l->bundle) return;
+  if (s->desc.SampleDesc.Count < 2 || d->desc.SampleDesc.Count > 1) return;
+  end_pass(l);
+  ensure_room(l, 64, 4);
+  const int depth = (s->desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL) != 0;
+  UINT payload[3] = {alloc_index(l, d->alloc), alloc_index(l, s->alloc), 1 /* graphics::ResolveMode::Sample0 */};
+  packet(l, OP_RESOLVE_REGION, payload, depth ? 3 : 2);
+}
 
 /* ---- barriers, queries, markers ------------------------------------------------------------------------------------------------------------------------------------ */
 

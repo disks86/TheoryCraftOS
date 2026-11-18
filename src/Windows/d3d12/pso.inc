@@ -341,6 +341,7 @@ struct Pso {
   DXGI_FORMAT dsv_format;
   D3D12_PRIMITIVE_TOPOLOGY_TYPE topology_type;
   UINT so_entries, so_rasterized, so_strides[4];
+  UINT samples;                /* of the targets it draws into (1: not multisampled) */
   UINT so_entry[16][2];        /* the words of the kernel's description of each captured output */
   PsoPipe pipes[MAX_PSO_PIPELINES];
   UINT pipe_count;
@@ -514,7 +515,7 @@ static int vertex_format(DXGI_FORMAT f, UINT *bytes) {
 static HRESULT STDMETHODCALLTYPE dev_CreateGraphicsPipelineState(Dev *This, const D3D12_GRAPHICS_PIPELINE_STATE_DESC *desc, REFIID riid, void **out) {
   extern const ID3D12PipelineStateVtbl pso_vtbl;
   if (!desc || !desc->pRootSignature || !desc->VS.pShaderBytecode) return E_INVALIDARG;
-  if (desc->SampleDesc.Count > 1) return DXGI_ERROR_UNSUPPORTED;
+  if (desc->SampleDesc.Count > 1 && (desc->SampleDesc.Count >= 32 || !((This->caps.sample_counts >> desc->SampleDesc.Count) & 1))) return DXGI_ERROR_UNSUPPORTED;
   if (desc->StreamOutput.NumEntries > 16 || desc->StreamOutput.NumStrides > 4) return DXGI_ERROR_UNSUPPORTED;
   Pso *p = dobj_new(sizeof *p, This, &pso_vtbl, g_pso_iids, pso_destroy);
   if (!p) return E_OUTOFMEMORY;
@@ -524,6 +525,7 @@ static HRESULT STDMETHODCALLTYPE dev_CreateGraphicsPipelineState(Dev *This, cons
   p->raster = desc->RasterizerState;
   p->depth = desc->DepthStencilState;
   p->render_targets = desc->NumRenderTargets;
+  p->samples = desc->SampleDesc.Count > 1 ? desc->SampleDesc.Count : 1;
   memcpy(p->rtv_formats, desc->RTVFormats, sizeof p->rtv_formats);
   p->dsv_format = desc->DSVFormat;
   p->topology_type = desc->PrimitiveTopologyType;
@@ -706,7 +708,7 @@ static UINT pso_pipeline(Pso *p, const UINT strides[8], UINT stencil_ref) {
     r[w++] = blend_op(b->BlendOpAlpha);
     r[w++] = b->RenderTargetWriteMask & 0xF;
   }
-  r[w++] = 0;      /* multisample */
+  r[w++] = p->samples > 1 ? (1u | (p->blend.AlphaToCoverageEnable ? 2u : 0u)) : 0u;      /* multisample: coverage for each sample, alpha to coverage */
   r[w++] = p->shaders[2];
   r[w++] = p->shaders[3];
   r[w++] = p->shaders[4];
