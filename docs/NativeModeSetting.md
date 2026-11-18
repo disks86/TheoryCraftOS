@@ -8,7 +8,7 @@ The UEFI GOP framebuffer is the fallback for every GPU. A vendor class can take 
 | Intel DG1, Arc, Meteor Lake and later | Firmware framebuffer: their display engine sits elsewhere or is laid out differently. |
 | AMD Raven family, 15D8 / 15DD (`AmdGpu`, `AmdDcn1`, `AmdScanout`) | **Own framebuffer only, not run on real hardware.** No resolution choice of its own: the firmware sets every mode (see below). |
 | Other AMD | Firmware framebuffer. A mode change needs the Display Mode Library (DML) to compute the plane's request and timing registers, which this OS does not have. |
-| NVIDIA | Firmware framebuffer. Turing and newer program their display through the signed GSP firmware, which is not documented. |
+| NVIDIA | Firmware framebuffer by default. With `-DTCOS_NVIDIA_NATIVE=ON`, Tesla to Turing take the display over (the firmware's mode stays, the head shows the OS's own framebuffer in VRAM; Fermi-Pascal can also set modes), after nouveau: see [Nvidia.md](Nvidia.md). Ampere and later need the GSP firmware, which is not run yet. |
 
 ## How the Intel path works
 
