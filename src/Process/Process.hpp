@@ -209,6 +209,7 @@ class IProcessRuntime {
     uint64_t argument = 0, stack_size = 0, thread_id = 0;      // CreateThread (thread_id comes back); ThreadStatus: exit code (STILL_ACTIVE if it runs) comes back in `size`
     bool suspended = false;
     X86Context* context = nullptr;        // GetContext/SetContext: the registers of thread_id (a single object of the caller, only used during the call)
+    SharedPointer<OpenObject> object;     // TakeHandle/Duplicate of a handle whose kind keeps an open object (a file, a directory): the object both handles share
   };
   virtual uint32_t remote_operation(uint64_t pid, RemoteOp& op) { (void)pid; (void)op; return 0xC0000002u; }
   // The live threads and the loaded modules of the running program with this process id (the program first among the modules); each returns how many it wrote.

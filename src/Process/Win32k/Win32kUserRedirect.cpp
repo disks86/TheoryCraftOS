@@ -265,6 +265,14 @@ uint32_t top_level_surface_locked(uint32_t hwnd) {
   return on_desktop(w) ? w->surface : 0;
 }
 
+SurfaceBlend top_level_surface_blend_locked(uint32_t hwnd) {
+  if (!state_or_null()) return SurfaceBlend::Opaque;
+  const Window* w = find_window(hwnd);
+  if (!w || !(w->ex_style & wn::WS_EX_LAYERED)) return SurfaceBlend::Opaque;
+  if (w->layered_updated) return w->layered_per_pixel ? SurfaceBlend::PerPixelAlpha : SurfaceBlend::Opaque;
+  return w->layered_flags != 0 ? SurfaceBlend::Opaque : SurfaceBlend::Hidden;      // (SetLayeredWindowAttributes: painted as usual; its constant alpha is not applied)
+}
+
 bool window_redirected_locked(uint32_t hwnd) {
   if (!state_or_null()) return false;
   const Window* w = find_window(hwnd);

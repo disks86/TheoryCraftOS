@@ -169,13 +169,19 @@ EXPORT BOOL WINAPI GetScrollBarInfo(HANDLE hwnd, LONG object, SCROLLBARINFO_ *in
 }
 
 /* ---- layered windows ------------------------------------------------------------------------------------------------------------------------------------------------ */
-/* The attributes are kept with the window (properties); the window manager does not blend anything, so a layered window is shown as an ordinary one. */
+/* The attributes are kept with the window (properties) and given to the window manager. A layered window is invisible until it has attributes or a picture;
+ * with attributes it is painted as usual (the constant alpha and the colour key are not applied). UpdateLayeredWindow puts the picture of a DC on the window,
+ * which the desktop blends by its alpha (ULW_ALPHA with AC_SRC_ALPHA, or a SourceConstantAlpha below 255). */
 #define WS_EX_LAYERED_ 0x80000
+SVC NtUserSetLayeredWindowAttributes(ULONG_PTR hwnd, ULONG_PTR key, ULONG_PTR alpha, ULONG_PTR flags);
+SVC NtUserUpdateLayeredWindow(ULONG_PTR hwnd, ULONG_PTR hdc_dst, ULONG_PTR dst, ULONG_PTR size, ULONG_PTR hdc_src, ULONG_PTR src, ULONG_PTR key, ULONG_PTR blend, ULONG_PTR flags,
+                              ULONG_PTR dirty);
 EXPORT BOOL WINAPI SetLayeredWindowAttributes(HANDLE hwnd, DWORD key, BYTE alpha, DWORD flags) {
   if (!IsWindow(hwnd)) { SetLastError(ERROR_INVALID_WINDOW_HANDLE_); return FALSE; }
   if (!(GetWindowLongW(hwnd, -20 /* GWL_EXSTYLE */) & WS_EX_LAYERED_) || (flags & ~3u)) { SetLastError(ERROR_INVALID_PARAMETER); return FALSE; }
   SetPropW(hwnd, L"TcosLayeredKey", (HANDLE)(ULONG_PTR)key);
   SetPropW(hwnd, L"TcosLayered", (HANDLE)(ULONG_PTR)(0x10000u | ((flags & 3u) << 8) | alpha));
+  NtUserSetLayeredWindowAttributes((ULONG_PTR)hwnd, key, alpha, flags ? flags : 0x100u /* (no flag: still "attributes set") */);
   return TRUE;
 }
 EXPORT BOOL WINAPI GetLayeredWindowAttributes(HANDLE hwnd, DWORD *key, BYTE *alpha, DWORD *flags) {
@@ -188,8 +194,32 @@ EXPORT BOOL WINAPI GetLayeredWindowAttributes(HANDLE hwnd, DWORD *key, BYTE *alp
   return TRUE;
 }
 EXPORT BOOL WINAPI UpdateLayeredWindow(HANDLE hwnd, HANDLE hdc_dst, const POINT_ *dst, const SIZE_ *size, HANDLE hdc_src, const POINT_ *src, DWORD key, const void *blend, DWORD flags) {
-  (void)hdc_dst; (void)dst; (void)size; (void)hdc_src; (void)src; (void)key; (void)blend; (void)flags;
   if (!IsWindow(hwnd)) { SetLastError(ERROR_INVALID_WINDOW_HANDLE_); return FALSE; }
   if (!(GetWindowLongW(hwnd, -20) & WS_EX_LAYERED_)) { SetLastError(ERROR_INVALID_PARAMETER); return FALSE; }
-  return TRUE;
+  if (dst || size) {      /* where the window goes and how big it is, before its picture */
+    RECT_ r;
+    GetWindowRect(hwnd, &r);
+    const int x = dst ? dst->x : r.left, y = dst ? dst->y : r.top;
+    const int cx = size ? size->cx : r.right - r.left, cy = size ? size->cy : r.bottom - r.top;
+    if (x != r.left || y != r.top || cx != r.right - r.left || cy != r.bottom - r.top)
+      SetWindowPos(hwnd, NULL, x, y, cx, cy, 0x0004 /* SWP_NOZORDER */ | 0x0010 /* SWP_NOACTIVATE */ | (size ? 0 : 0x0001 /* SWP_NOSIZE */) | (dst ? 0 : 0x0002 /* SWP_NOMOVE */));
+  }
+  return (NtUserUpdateLayeredWindow((ULONG_PTR)hwnd, (ULONG_PTR)hdc_dst, (ULONG_PTR)dst, (ULONG_PTR)size, (ULONG_PTR)hdc_src, (ULONG_PTR)src, key, (ULONG_PTR)blend, flags, 0) &
+          0xFFFFFFFFu) != 0;
+}
+typedef struct {
+  DWORD cbSize;
+  HANDLE hdcDst;
+  const POINT_ *pptDst;
+  const SIZE_ *psize;
+  HANDLE hdcSrc;
+  const POINT_ *pptSrc;
+  DWORD crKey;
+  const void *pblend;
+  DWORD dwFlags;
+  const RECT_ *prcDirty;
+} UPDATELAYEREDWINDOWINFO_;
+EXPORT BOOL WINAPI UpdateLayeredWindowIndirect(HANDLE hwnd, const UPDATELAYEREDWINDOWINFO_ *info) {
+  if (!info || info->cbSize != sizeof(*info)) { SetLastError(ERROR_INVALID_PARAMETER); return FALSE; }      /* (the dirty rectangle only says what changed: the whole picture is taken) */
+  return UpdateLayeredWindow(hwnd, info->hdcDst, info->pptDst, info->psize, info->hdcSrc, info->pptSrc, info->crKey, info->pblend, info->dwFlags & 7u);
 }

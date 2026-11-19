@@ -454,7 +454,7 @@ uint32_t run_remote(Process& target, IProcessRuntime::RemoteOp& op) {
     case IProcessRuntime::RemoteOp::Unmap: return unmap_view_in(target, op.address);
     case IProcessRuntime::RemoteOp::MapView: return map_view_in(target, uint32_t(op.thread_id), op.argument, &op.address, &op.size, op.protect);
     case IProcessRuntime::RemoteOp::TakeHandle: return take_object_handle_from(target, op);
-    case IProcessRuntime::RemoteOp::Duplicate: return give_object_handle_in(target, op.type, op.argument, op.protect, op.suspended, &op.address);
+    case IProcessRuntime::RemoteOp::Duplicate: return give_object_handle_in(target, op.type, op.argument, op.protect, op.suspended, &op.address, op.object);
     case IProcessRuntime::RemoteOp::ProcessInfo: {
       op.address = 0;
       target.read_user_u64(target.gs_base() + 0x60, &op.address);      // TEB.ProcessEnvironmentBlock

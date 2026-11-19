@@ -154,6 +154,55 @@ uint64_t NtGdiBitBlt(Call& c) {
   return ret_bool(stretch_surface(*dst, dr, empty, Rect(), rop, dst->s.text_color, dst->s.bk_color));
 }
 
+}  // namespace
+
+bool copy_to_layered_surface(Call& c, uint32_t source_handle, int32_t sx, int32_t sy, int32_t width, int32_t height, uint32_t surface, int32_t dx, int32_t dy, bool per_pixel,
+                             uint8_t constant) {
+  Source src;
+  if (!source_dc(c, source_handle, &src)) return false;
+  uint32_t sw = 0, sh = 0;
+  ByteView out = window_surface_bytes(surface, &sw, &sh);
+  if (out.empty()) return false;
+  const Point ps = lp_to_dp(*src.dc, Point{sx, sy});
+  const int32_t ox = sat_add(ps.x, src.dc->origin_x), oy = sat_add(ps.y, src.dc->origin_y);
+  const Rect target = rect_and(Rect{dx, dy, sat_add(dx, width), sat_add(dy, height)}, Rect{0, 0, int32_t(sw), int32_t(sh)});
+  for (int32_t y = target.top; y < target.bottom; ++y) {
+    for (int32_t x = target.left; x < target.right; ++x) {
+      const int32_t fx = sat_add(ox, x - dx), fy = sat_add(oy, y - dy);
+      uint32_t a = 255, r = 0, g = 0, b = 0;
+      if (per_pixel && src.s.bpp == 32) {      // premultiplied: the colour is divided back by the alpha
+        const uint32_t v = src.s.get_raw32(fx, fy);
+        a = v >> 24;
+        b = v & 0xFF;
+        g = (v >> 8) & 0xFF;
+        r = (v >> 16) & 0xFF;
+        if (a == 0) r = g = b = 0;
+        else if (a < 255) {
+          b = b * 255 / a > 255 ? 255 : b * 255 / a;
+          g = g * 255 / a > 255 ? 255 : g * 255 / a;
+          r = r * 255 / a > 255 ? 255 : r * 255 / a;
+        }
+      } else {
+        const ColorRef cr = src.s.get(fx, fy);
+        r = cr & 0xFF;
+        g = (cr >> 8) & 0xFF;
+        b = (cr >> 16) & 0xFF;
+      }
+      a = a * constant / 255;
+      const uint64_t o = (uint64_t(uint32_t(y)) * sw + uint32_t(x)) * 4;
+      if (o + 4 > out.size()) continue;
+      out[o] = uint8_t(b);
+      out[o + 1] = uint8_t(g);
+      out[o + 2] = uint8_t(r);
+      out[o + 3] = uint8_t(a);
+    }
+  }
+  if (!rect_empty(target)) window_surface_damaged(surface, target);
+  return true;
+}
+
+namespace {
+
 uint64_t NtGdiStretchBlt(Call& c) {
   Dc* dst = dc_arg(c, c.arg32(0));
   if (!dst) return 0;

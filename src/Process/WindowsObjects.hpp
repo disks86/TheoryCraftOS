@@ -38,7 +38,7 @@ uint32_t map_section_handle(Process& p, uint64_t handle, uint64_t offset, uint64
 // RemoteOp::TakeHandle in the program that owns the handle op.address: its kind, token and denied rights come back in op.type, op.argument and op.protect, and the copy
 // is counted (op.suspended: the handle is closed after, DUPLICATE_CLOSE_SOURCE).
 uint32_t take_object_handle_from(Process& source, IProcessRuntime::RemoteOp& op);
-uint32_t give_object_handle_in(Process& target, uint32_t kind, uint64_t token, uint32_t denied, bool inherit, uint64_t* handle);
+uint32_t give_object_handle_in(Process& target, uint32_t kind, uint64_t token, uint32_t denied, bool inherit, uint64_t* handle, const SharedPointer<OpenObject>& object = SharedPointer<OpenObject>());
 
 // Ports (WindowsPorts.cpp): make a named port object (a handle is written to handle_at; *id is its object), find one by the UNICODE_STRING at `unicode_name` (a reference is taken), give the
 // process a handle for an object it holds a reference of (the reference goes to the handle, or is given up on failure), the object of a port handle, and make an unnamed port.

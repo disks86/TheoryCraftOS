@@ -705,9 +705,17 @@ uint32_t nt_wait_for_multiple_objects(Process& p, const SyscallRequest& r) {
   return wait_for(p, items, count, type == 0, timeout, (r.args[3] & 0xFF) != 0);
 }
 
-// The handle in source_slot of this process, given to another running program (a process object handle names it).
-uint32_t give_object_handle_in(Process& target, uint32_t kind, uint64_t token, uint32_t denied, bool inherit, uint64_t* handle) {
-  const int64_t copy = target.files().open_token(DescriptorKind(kind), token);
+// Kinds whose handles another program can be given by sharing the open object (a file or directory with its position and I/O port, a device) and the token's use count
+// (sockets, keys, mailslots): what CreateProcess inheritance shares too. Not threads (a thread handle names a thread of its own program) nor console handles.
+static bool shares_open_object(DescriptorKind k) {
+  return k == DescriptorKind::File || k == DescriptorKind::Directory || k == DescriptorKind::Null || k == DescriptorKind::Zero || k == DescriptorKind::Random || k == DescriptorKind::Socket ||
+         k == DescriptorKind::Mailslot || k == DescriptorKind::Key || k == DescriptorKind::UnixSocket || k == DescriptorKind::MountManager;
+}
+
+// The handle in source_slot of this process, given to another running program (a process object handle names it). `object`: the open object of a kind that
+// shares_open_object (the caller holds the token's use for the new handle).
+uint32_t give_object_handle_in(Process& target, uint32_t kind, uint64_t token, uint32_t denied, bool inherit, uint64_t* handle, const SharedPointer<OpenObject>& object) {
+  const int64_t copy = shares_open_object(DescriptorKind(kind)) ? target.files().install(DescriptorKind(kind), object, token) : target.files().open_token(DescriptorKind(kind), token);
   if (copy < 0) return kNoResources;
   target.files().set_denied_access(uint64_t(copy), denied);
   target.files().set_handle_flags(uint64_t(copy), inherit, false);
@@ -720,13 +728,14 @@ uint32_t take_object_handle_from(Process& source, IProcessRuntime::RemoteOp& op)
   if (!slot_of(op.address, &slot) || source.files().kind(slot) == DescriptorKind::Closed) return kInvalidHandle;
   const DescriptorKind kind = source.files().kind(slot);
   const uint64_t token = source.files().token(slot);
-  if (kind != DescriptorKind::Pipe && !is_object_kind(kind)) return kNotImplemented;      // (the kinds with a count in the object manager or the pipes' ends)
+  if (kind != DescriptorKind::Pipe && !is_object_kind(kind) && !shares_open_object(kind)) return kNotImplemented;      // (the kinds with a count in the object manager, the pipes' ends, shared open objects)
   ObjectManager* objects = system_objects();
   if (!objects) return kNotImplemented;
   op.type = uint32_t(kind);
   op.argument = token;
   op.protect = source.files().denied_access(slot);
-  if (kind == DescriptorKind::Pipe) pipe_token_add(token);
+  if (shares_open_object(kind)) { op.object = source.files().shared_object(slot); descriptor_token_add(kind, token); }
+  else if (kind == DescriptorKind::Pipe) pipe_token_add(token);
   else objects->add_ref(uint32_t(token));
   if (op.suspended && !source.files().protected_from_close(slot)) source.close_descriptor(slot);      // DUPLICATE_CLOSE_SOURCE
   return kSuccess;
@@ -755,12 +764,13 @@ uint32_t duplicate_from_other(Process& p, const SyscallRequest& r, uint64_t targ
       return kAccessDeniedStatus;
     }
   }
-  const uint32_t denied = (options & 2) ? op.protect : (op.protect | ~mapped_access(DescriptorKind(op.type), uint32_t(desired_access)));
+  const uint32_t denied = ((options & 2) || shares_open_object(DescriptorKind(op.type))) ? op.protect : (op.protect | ~mapped_access(DescriptorKind(op.type), uint32_t(desired_access)));      // (a file keeps its rights, as a copy in the same program does)
   uint64_t handle = 0;
-  uint32_t given = give_object_handle_in(p, op.type, op.argument, denied, (options & 4) ? false : (attributes & 2) != 0, &handle);
+  uint32_t given = give_object_handle_in(p, op.type, op.argument, denied, (options & 4) ? false : (attributes & 2) != 0, &handle, op.object);
   if (given == kSuccess && target_at != 0 && !p.write_user_u64(target_at, handle)) { p.close_descriptor(handle / 4 - 1); return kAccessViolation; }
   if (given != kSuccess) {      // (the count the other program made for the copy)
-    if (DescriptorKind(op.type) == DescriptorKind::Pipe) pipe_token_release(op.argument);
+    if (shares_open_object(DescriptorKind(op.type))) descriptor_token_release(DescriptorKind(op.type), op.argument);
+    else if (DescriptorKind(op.type) == DescriptorKind::Pipe) pipe_token_release(op.argument);
     else if (ObjectManager* objects = system_objects()) objects->release(uint32_t(op.argument));
   }
   return given;
@@ -781,19 +791,25 @@ uint32_t duplicate_between_others(Process& p, const SyscallRequest& r, uint64_t 
   take.suspended = (options & 1) != 0;
   if (const uint32_t status = p.runtime()->remote_operation(source_pid, take)) return status;
   ObjectManager* objects = system_objects();
-  if (!objects || !is_object_kind(DescriptorKind(take.type))) return kNotImplemented;
+  auto drop_take = [&]() {      // (the use the source program's side made for the copy)
+    if (DescriptorKind(take.type) == DescriptorKind::Pipe) pipe_token_release(take.argument);
+    else if (shares_open_object(DescriptorKind(take.type))) descriptor_token_release(DescriptorKind(take.type), take.argument);
+    else if (objects) objects->release(uint32_t(take.argument));
+  };
+  if (!objects) { drop_take(); return kNotImplemented; }
   if (!(options & 2) && caller_is_impersonating(p) && caller_reduced(p)) {
     KindAccess a;
-    if (kind_access(DescriptorKind(take.type), &a) && (mapped_access(DescriptorKind(take.type), uint32_t(desired_access)) & a.valid & take.protect)) { objects->release(uint32_t(take.argument)); return kAccessDeniedStatus; }
+    if (kind_access(DescriptorKind(take.type), &a) && (mapped_access(DescriptorKind(take.type), uint32_t(desired_access)) & a.valid & take.protect)) { drop_take(); return kAccessDeniedStatus; }
   }
   IProcessRuntime::RemoteOp put;
   put.kind = IProcessRuntime::RemoteOp::Duplicate;
   put.type = take.type;
   put.argument = take.argument;
-  put.protect = (options & 2) ? take.protect : (take.protect | ~mapped_access(DescriptorKind(take.type), uint32_t(desired_access)));
+  put.protect = ((options & 2) || shares_open_object(DescriptorKind(take.type))) ? take.protect : (take.protect | ~mapped_access(DescriptorKind(take.type), uint32_t(desired_access)));
   put.suspended = (options & 4) ? false : (attributes & 2) != 0;
+  put.object = take.object;
   const uint32_t status = p.runtime()->remote_operation(target_pid, put);
-  if (status != kSuccess) { objects->release(uint32_t(take.argument)); return status; }
+  if (status != kSuccess) { drop_take(); return status; }
   if (target_at != 0 && !p.write_user_u64(target_at, put.address)) return kAccessViolation;
   return kSuccess;
 }
@@ -810,15 +826,17 @@ uint32_t duplicate_to_other(Process& p, const SyscallRequest& r, uint64_t target
   const DescriptorKind kind = p.files().kind(slot);
   ObjectManager* objects = system_objects();
   const bool pipe = kind == DescriptorKind::Pipe;      // (a pipe handle is copied with its token: the other program holds the end too)
-  if ((!is_object_kind(kind) && !pipe) || !objects) return kNotImplemented;
+  const bool shared = shares_open_object(kind);       // (a file, directory, socket...: the other program's handle shares the open object)
+  if ((!is_object_kind(kind) && !pipe && !shared) || !objects) return kNotImplemented;
   const uint64_t token = p.files().token(slot);
   const uint32_t id = uint32_t(token);
   const uint32_t original = p.files().denied_access(slot);
   IProcessRuntime::RemoteOp op;
   op.kind = IProcessRuntime::RemoteOp::Duplicate;
   op.type = uint32_t(kind);
-  op.argument = pipe ? token : id;
-  op.protect = (options & 2) ? original : (original | ~mapped_access(kind, uint32_t(desired_access)));
+  op.argument = (pipe || shared) ? token : id;
+  if (shared) op.object = p.files().shared_object(slot);
+  op.protect = ((options & 2) || shared) ? original : (original | ~mapped_access(kind, uint32_t(desired_access)));
   if (!(options & 2)) {      // a program that runs under a restricted token only gets the rights the handle holds
     ByteBuffer blob(*objects->allocator());
     security::TokenView token;
@@ -827,9 +845,9 @@ uint32_t duplicate_to_other(Process& p, const SyscallRequest& r, uint64_t target
         (mapped_access(kind, uint32_t(desired_access)) & a.valid & original)) return kAccessDeniedStatus;
   }
   op.suspended = (options & 4) ? p.files().inheritable(slot) : (attributes & 2) != 0;
-  if (pipe) pipe_token_add(token); else objects->add_ref(id);
+  if (shared) descriptor_token_add(kind, token); else if (pipe) pipe_token_add(token); else objects->add_ref(id);
   const uint32_t status = p.runtime()->remote_operation(pid, op);
-  if (status != kSuccess) { if (pipe) pipe_token_release(token); else objects->release(id); return status; }
+  if (status != kSuccess) { if (shared) descriptor_token_release(kind, token); else if (pipe) pipe_token_release(token); else objects->release(id); return status; }
   if (target_at != 0 && !p.write_user_u64(target_at, op.address)) return kAccessViolation;      // (the copy stays, as the handle was already made)
   if (options & 1) p.close_descriptor(slot);      // DUPLICATE_CLOSE_SOURCE
   return kSuccess;

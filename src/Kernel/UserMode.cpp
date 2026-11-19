@@ -211,6 +211,25 @@ void trace_service_failure(process::Process& process, const process::SyscallRequ
   console::put_hex(request.args[0]);
   console::puts(" ");
   console::put_hex(request.args[1]);
+  if (request.number == 41 && request.args[0] == ~uint64_t{0} && request.args[1] % 4 == 0 && request.args[1] != 0) {      // NtDuplicateObject of an own handle: its kind
+    console::puts(" kind ");
+    console::put_dec(static_cast<int64_t>(process.files().kind(request.args[1] / 4 - 1)));
+  }
+  if (request.number == 302 || request.number == 303) {      // NtOpenKey / NtOpenKeyEx: the key's name (OBJECT_ATTRIBUTES.ObjectName -> UNICODE_STRING)
+    uint64_t name = 0, buffer = 0, length = 0;
+    if (process.read_user_u64(request.args[2] + 0x10, &name) && name && process.read_user_u64(name, &length) && process.read_user_u64(name + 8, &buffer)) {
+      char text[120];
+      uint32_t n = 0;
+      for (uint64_t at = 0; at + 2 <= (length & 0xFFFFu) && n + 1 < sizeof(text); at += 2) {
+        uint8_t unit[2] = {};
+        if (!process.read_user(buffer + at, ByteView(unit, 2))) break;
+        text[n++] = (unit[1] == 0 && unit[0] >= 0x20 && unit[0] < 0x7F) ? static_cast<char>(unit[0]) : '?';
+      }
+      text[n] = 0;
+      console::puts(" key ");
+      console::puts(text);
+    }
+  }
   console::puts("\n");
 }
 #else
