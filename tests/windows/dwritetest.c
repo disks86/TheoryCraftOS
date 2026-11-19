@@ -213,6 +213,18 @@ static void test_face(void) {
       check(FAILED(IDWriteFontFileStream_ReadFileFragment(stream, &frag, total, 1, &fctx)), "reading past the end");
       IDWriteFontFileStream_Release(stream);
     }
+    /* The path of a system font through its local loader: the length first (Chrome's font service asks it that way; it once never returned). */
+    IDWriteLocalFontFileLoader *local = NULL;
+    if (loader && SUCCEEDED(IDWriteFontFileLoader_QueryInterface(loader, &IID_IDWriteLocalFontFileLoader, (void **)&local)) && local) {
+      UINT32 length = 0;
+      WCHAR path[MAX_PATH];
+      check(IDWriteLocalFontFileLoader_GetFilePathLengthFromKey(local, key, key_size, &length) == S_OK && length > 0 && length < MAX_PATH, "the length of the system font's path");
+      check(IDWriteLocalFontFileLoader_GetFilePathFromKey(local, key, key_size, path, MAX_PATH) == S_OK && (UINT32)lstrlenW(path) == length, "the system font's path");
+      check_hr(IDWriteLocalFontFileLoader_GetFilePathFromKey(local, key, key_size, path, length), E_NOT_SUFFICIENT_BUFFER, "a path buffer one too small");
+      IDWriteLocalFontFileLoader_Release(local);
+    } else {
+      check(0, "the system font loader is a local one");
+    }
     IDWriteFontFileLoader_Release(loader);
     IDWriteFontFile_Release(file);
   }

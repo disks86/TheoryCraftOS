@@ -1239,7 +1239,19 @@ uint32_t Task::spawn_process(const process::ChildSpec& spec) {
   process::UserProgram& p = *child->program;
   p.address_space().set_reserved(reserved_ranges());
   p.set_file_system(program.file_system());
-  if (abi == process::SyscallAbi::Windows) p.set_library_provider(program.library_provider());
+  if (abi == process::SyscallAbi::Windows) {
+    // A program in the same folder shares its parent's DLL search (and the libraries it has read: Chrome starts dozens of itself). One elsewhere searches its own
+    // folder and the private assemblies its manifest names, as on Windows (a launcher starting chrome.exe, which finds chrome_elf.dll through its manifest).
+    auto folder = [](StringView path) { const uint64_t slash = path.rfind('/'); return slash == StringView::npos ? StringView() : path.first(slash); };
+    if (!spec.program_file.empty() && !folder(spec.program_file).equals_ignore_case(folder(program.program_file()))) {
+      auto own = SharedPointer<process::FileLibraryProvider>::make(allocator_, allocator_, program.file_system());
+      if (!own || !own->add_program(spec.program_file, spec.image)) { discard(); return kNoMemory; }
+      p.set_library_provider(own);
+    } else {
+      p.share_library_provider(program);
+    }
+    p.set_program_file(spec.program_file.empty() ? program.program_file() : spec.program_file);
+  }
   p.set_working_directory(spec.working_directory);
   p.set_processor_count(processor_count());
   p.defer_loading(spec.suspended);

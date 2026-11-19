@@ -239,6 +239,7 @@ RunResult run_loaded(const ProgramRun& run, uint32_t* exit_code, String* message
   if (plan == Plan::Native) program.address_space().set_reserved(kernel::usermode::reserved_ranges());      // (pages the CPU's own page tables need; an emulated program has none)
 #endif
   program.set_file_system(run.files);
+  program.set_program_file(run.path);
   process::FileLibraryProvider libraries(allocator, run.files);      // every DLL, ntdll.dll and kernel32.dll included, comes from C:\Windows\System32
   if (abi == process::SyscallAbi::Windows && !libraries.add_program(run.path, image.view())) {      // ... after the program's own folder and the private assemblies its manifest names
     fail(message, "could not start the program (out of memory)");
@@ -296,6 +297,9 @@ RunResult run_loaded(const ProgramRun& run, uint32_t* exit_code, String* message
   uint32_t code = 0;
   bool killed = false, faulted = false;
   uint64_t fault_vector = 0, fault_address = 0, fault_rip = 0;
+  // The program's file as other programs ask for it (QueryFullProcessImageName on a handle to it: Chrome looks at the program that started it), as CreateProcess notes it.
+  if (abi == process::SyscallAbi::Windows && ensure_system_objects(allocator))
+    if (process::ObjectManager* objects = process::system_objects()) objects->process_image_note(id, name.view());
   if (plan == Plan::Emulated) {
     if (!ensure_system_objects(allocator)) {
       fail(message, "not enough memory to start the program");

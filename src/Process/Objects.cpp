@@ -171,6 +171,21 @@ ObjectManager::Created ObjectManager::open_process(uint64_t pid, bool create) {
 }
 
 void ObjectManager::process_exited(uint64_t pid, uint32_t code) {
+#ifdef TCOS_TRACE_SERVICE_FAILURES
+  {
+    // (with the trace of failing services: how each process ended, to go with "process started")
+    char line[64] = "process exited: ";
+    uint32_t at = 16;
+    char digits[24];
+    uint32_t count = 0;
+    for (uint64_t v = pid; v || count == 0; v /= 10) digits[count++] = static_cast<char>('0' + v % 10);
+    while (count) line[at++] = digits[--count];
+    const char* hex = "0123456789ABCDEF";
+    line[at++] = ' '; line[at++] = '0'; line[at++] = 'x';
+    for (int shift = 28; shift >= 0; shift -= 4) line[at++] = hex[(code >> shift) & 15];
+    process_log(StringView(line, at));
+  }
+#endif
   Locked hold(sync_);
   job_forget_locked(pid);
   for (Object& o : objects_) {

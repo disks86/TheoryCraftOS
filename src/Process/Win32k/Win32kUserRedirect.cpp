@@ -42,7 +42,7 @@ bool on_desktop(const Window* w) {
   return w && d && w->parent && w->parent == d->root;
 }
 
-bool has_frame(const Window* w) { return (w->style & wn::WS_CAPTION) == wn::WS_CAPTION; }
+bool has_caption_style(const Window* w) { return (w->style & wn::WS_CAPTION) == wn::WS_CAPTION; }
 
 // Every window of a tree, `w` first.
 template <typename F>
@@ -56,6 +56,17 @@ RedirectConfig g_redirect;
 }  // namespace
 
 RedirectConfig& redirect_config() { return g_redirect; }
+
+// The desktop draws the frame of a top-level with a caption, unless the program draws its own: its client area (what WM_NCCALCSIZE left) reaches up
+// over where the title bar would be (Google Chrome, Edge and other custom-frame programs paint their tabs and caption buttons there). Such a window's
+// surface is the whole window.
+bool has_frame(const Window* w) {
+  if (!has_caption_style(w)) return false;
+  if (w->style & wn::WS_MINIMIZE) return true;
+  int32_t border = 0, title = 0;
+  frame_of(w, &border, &title);
+  return client_rect_screen(w).top >= window_rect_screen(w).top + border + title / 2;
+}
 
 void frame_of(const Window* top, int32_t* border, int32_t* title) {
   if (top && top->monitor_scale != 0 && g_redirect.border_units != 0) {

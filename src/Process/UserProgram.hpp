@@ -23,6 +23,7 @@
 #include "Process/ModuleLoader.hpp"
 #include "Process/Process.hpp"
 #include "Utility/ArrayView.hpp"
+#include "Utility/SharedPointer.hpp"
 #include "Utility/StringView.hpp"
 #include "Utility/UniquePointer.hpp"
 
@@ -49,7 +50,7 @@ class UserProgram final : public IModuleHost {
  public:
   UserProgram(allocators::IAllocator& allocator, uint64_t id, IProcessHost& host, uint64_t memory_limit = AddressSpace::kNoLimit)
       : allocator_(allocator), id_(id), host_(host), space_(allocator, memory_limit), detail_(allocator), working_directory_(allocator), command_line_(allocator), startup_title_(allocator), startup_desktop_(allocator),
-        executable_path_(allocator) {}
+        executable_path_(allocator), program_file_(allocator) {}
   UserProgram(const UserProgram&) = delete;
   UserProgram& operator=(const UserProgram&) = delete;
 
@@ -59,6 +60,19 @@ class UserProgram final : public IModuleHost {
 
   // Where the DLLs a Windows program imports come from (nullptr: none, a program with imports is then refused). Set before load(). It must outlive the program.
   void set_library_provider(ILibraryProvider* provider) { libraries_ = provider; }
+  // The same with a provider the program keeps alive (with the programs it hands it on to: share_library_provider()).
+  void set_library_provider(const SharedPointer<FileLibraryProvider>& provider) {
+    owned_libraries_ = provider;
+    libraries_ = provider.get();
+  }
+  // The provider `parent` has, kept alive as long as this program needs it when the parent keeps it alive.
+  void share_library_provider(const UserProgram& parent) {
+    owned_libraries_ = parent.owned_libraries_;
+    libraries_ = parent.libraries_;
+  }
+  // The program file in the OS file system ("/Windows/Program Files/App/app.exe"), when known: whose folder its libraries are searched in.
+  void set_program_file(StringView path) { program_file_.assign(path); }
+  StringView program_file() const { return program_file_.view(); }
   // The program's current folder, as a path inside its world ("/" or "/home/me", also for a Windows program: C:\home\me). Set before load().
   void set_working_directory(StringView path) { working_directory_.assign(path); }
 
@@ -128,6 +142,8 @@ class UserProgram final : public IModuleHost {
   AddressSpace space_;
   filesystem::IFileSystem* files_ = nullptr;
   ILibraryProvider* libraries_ = nullptr;
+  SharedPointer<FileLibraryProvider> owned_libraries_;      // (declared before the modules: they may read from it while unloading)
+  String program_file_;
   UniquePointer<ModuleSet> modules_;
   String detail_, working_directory_, command_line_, startup_title_, startup_desktop_, executable_path_;
   StartupSpec startup_;
