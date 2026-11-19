@@ -115,7 +115,7 @@ AppManager::AppManager(allocators::IAllocator& allocator)
   list_update_item_ = list_menu_.add_item("Update", {&AppManager::on_update, this});
   list_remove_item_ = list_menu_.add_item("Remove", {&AppManager::on_remove, this});
   list_.set_context_menu(&list_menu_);
-  ask_.on_result({&AppManager::on_remove_answer, this});
+  ask_.on_result({&AppManager::on_answer, this});
 
   search_label_.set_text("Search:");      // (a colon: the label carries the access key of the box after it)
   show_label_.set_text("Show:");
@@ -442,7 +442,7 @@ void AppManager::select_row(int32_t row) {
 }
 
 // ---------------------------------------------------------------- jobs
-bool AppManager::start(Job job, AppPlatform platform, StringView name) {
+bool AppManager::start(Job job, AppPlatform platform, StringView name, bool ignore_checksum) {
   if (!network_ || (job != Job::Catalog && (!installer_ || !windows_installer_))) {
     say("Applications cannot be installed because the network or the disk is not available.");
     return false;
@@ -456,6 +456,7 @@ bool AppManager::start(Job job, AppPlatform platform, StringView name) {
     job_ = job;
     job_platform_ = platform;
     job_name_.assign(name);
+    job_ignore_checksum_ = ignore_checksum;
   }
   __atomic_store_n(&progress_state_.cancel, false, __ATOMIC_RELAXED);
   __atomic_store_n(&progress_state_.running_setup, false, __ATOMIC_RELAXED);
@@ -501,14 +502,35 @@ bool AppManager::ask_remove() {
   String line(allocator_);
   const StringView name = remove_name_.view();
   format_message(&line, "Remove \"%1\"?", name.size() > 30 ? name.first(30) : name);
+  question_ = Question::Remove;
+  asked_job_ = Job::Remove;
   ask_.set_texts(title(), line.view(), "Its files are deleted from this computer.", "Remove", "Cancel");
   ask_.set_default_choice(MessageDialog::Choice::Decline);
   return ask_.show(*manager());
 }
 
-void AppManager::on_remove_answer(void* self, Control&) {
+// A publisher that serves its newest file at a fixed link (Google Chrome) changes that file before winget's list catches up, so the download no longer
+// has the SHA-256 the list names. It may also be a file someone changed on the way, so the list's answer stands unless the user says otherwise; the
+// default answer installs nothing. It is asked even if another window is in front by now (unlike a notice): without an answer the install the user
+// started can go no further. (On the worker thread: the UI lock keeps the question's fields from the Remove question.)
+bool AppManager::ask_ignore_checksum(Job job, StringView id, StringView name) {
+  UiGuard lock(this);
+  if (!manager() || ask_.showing()) return false;
+  if (!remove_name_.assign(id)) return false;
+  remove_platform_ = AppPlatform::Windows;
+  question_ = Question::IgnoreChecksum;
+  asked_job_ = job;
+  String line(allocator_);
+  format_message(&line, "\"%1\" is not the file in the list.", name.size() > 24 ? name.first(24) : name);
+  ask_.set_texts(title(), line.view(), "It may be newer, or altered. Use it anyway?", job == Job::Update ? "Update Anyway" : "Install Anyway", "Cancel");
+  ask_.set_default_choice(MessageDialog::Choice::Decline);
+  return ask_.show(*manager());
+}
+
+void AppManager::on_answer(void* self, Control&) {
   auto* m = static_cast<AppManager*>(self);
-  if (m->ask_.accepted() && !m->remove_name_.empty()) m->start(Job::Remove, m->remove_platform_, m->remove_name_.view());
+  if (!m->ask_.accepted() || m->remove_name_.empty()) return;
+  m->start(m->asked_job_, m->remove_platform_, m->remove_name_.view(), m->question_ == Question::IgnoreChecksum);
 }
 
 void AppManager::cancel() {
@@ -551,10 +573,11 @@ void AppManager::run_job(void* self, Control&) {
   AppPlatform platform;
   String name(m->allocator_), detail(m->allocator_), text(m->allocator_);
   appman::WingetPackage package(m->allocator_);      // (a copy: the catalog may be replaced while the job runs)
-  bool have_package = false;
+  bool have_package = false, ignore_checksum = false;
   {
     kernel::ScopedMutex lock(m->state_mutex_);
     job = m->job_;
+    ignore_checksum = m->job_ignore_checksum_;
     platform = m->job_platform_;
     name.assign(m->job_name_.view());
     if (platform == AppPlatform::Windows && job != Job::Catalog) {
@@ -609,8 +632,8 @@ void AppManager::run_job(void* self, Control&) {
   } else {
     if (platform == AppPlatform::Windows) {
       switch (job) {
-        case Job::Install: result = have_package ? m->windows_installer_->install(package, &m->progress_state_, &detail) : appman::Result::NoManifest; break;
-        case Job::Update: result = have_package ? m->windows_installer_->update(package, &m->progress_state_, &detail) : appman::Result::NoManifest; break;
+        case Job::Install: result = have_package ? m->windows_installer_->install(package, &m->progress_state_, &detail, ignore_checksum) : appman::Result::NoManifest; break;
+        case Job::Update: result = have_package ? m->windows_installer_->update(package, &m->progress_state_, &detail, ignore_checksum) : appman::Result::NoManifest; break;
         case Job::Remove: result = m->windows_installer_->remove(name.view(), &detail); break;
         default: break;
       }
@@ -662,7 +685,11 @@ void AppManager::run_job(void* self, Control&) {
     if (row >= 0) m->list_.select_item(row);
   }
   m->update_controls();
-  if (tell) m->report(kind, text.view());
+  // A download that is not the file the list names, over HTTPS: the user may install it anyway (asked instead of the notice).
+  const bool may_override = platform == AppPlatform::Windows && have_package && result == appman::Result::BadChecksum && !ignore_checksum &&
+                            (job == Job::Install || job == Job::Update) && appman::WingetInstaller::may_ignore_checksum(detail.view());
+  if (may_override && m->ask_ignore_checksum(job, package.id.view(), name.view())) m->say(text.view());
+  else if (tell) m->report(kind, text.view());
   else m->say(text.view());
 }
 

@@ -76,6 +76,14 @@ bool web_address(StringView url) {
   return true;
 }
 
+// Whether a download whose SHA-256 is `hex` may be installed as `entry`: it is the file the manifest names, or the user chose to install it anyway and it
+// came over HTTPS from the manifest's own link (a publisher that serves its newest file at a fixed link, as Google does for Chrome, changes the file
+// before winget's catalog catches up; winget itself has --ignore-security-hash for that).
+bool checksum_accepted(StringView hex, const WingetInstallerEntry& entry, bool ignore_checksum) {
+  if (equals_folded(hex, entry.sha256.view())) return true;
+  return ignore_checksum && WingetInstaller::may_ignore_checksum(entry.url.view());
+}
+
 // A name for a file or a shortcut out of `text`: what Windows does not allow in a name becomes '_'. "" if nothing is left.
 bool safe_name(StringView text, String* out) {
   out->clear();
@@ -665,7 +673,7 @@ Result WingetInstaller::resolve(const WingetPackage& package, WingetManifest* ma
   return Result::Ok;
 }
 
-Result WingetInstaller::install(const WingetPackage& package, Progress* progress, String* detail) {
+Result WingetInstaller::install(const WingetPackage& package, Progress* progress, String* detail, bool ignore_checksum) {
   WingetManifest manifest(allocator_);
   const Result r = resolve(package, &manifest, detail);
   if (r != Result::Ok) return r;
@@ -678,17 +686,17 @@ Result WingetInstaller::install(const WingetPackage& package, Progress* progress
   const uint32_t kinds = was_native ? uint32_t{kNative} : was_setup ? can_run : kNative | can_run;
   const WingetInstallerEntry* entry = choose_installer(manifest, kinds, detail);
   if (!entry) return Result::NotSupported;
-  if (is_native(*entry)) return place(manifest, *entry, was_native, progress, detail);
-  return is_msi(*entry) ? place_msi(manifest, *entry, progress, detail) : place_setup(manifest, *entry, progress, detail);
+  if (is_native(*entry)) return place(manifest, *entry, was_native, ignore_checksum, progress, detail);
+  return is_msi(*entry) ? place_msi(manifest, *entry, ignore_checksum, progress, detail) : place_setup(manifest, *entry, ignore_checksum, progress, detail);
 }
 
-Result WingetInstaller::update(const WingetPackage& package, Progress* progress, String* detail) {
+Result WingetInstaller::update(const WingetPackage& package, Progress* progress, String* detail, bool ignore_checksum) {
   detail->clear();
   WingetInstalled current(allocator_);
   SetupRecord record(allocator_);
   if (!read_record(package.id.view(), &current, nullptr) && !read_setup_record(package.id.view(), &current, &record)) return Result::NotInstalled;
   if (current.version.view().equals(package.version.view())) return Result::UpToDate;
-  return install(package, progress, detail);
+  return install(package, progress, detail, ignore_checksum);
 }
 
 void WingetInstaller::remove_shortcuts(const List<String>& shortcuts) {
@@ -717,7 +725,7 @@ bool WingetInstaller::clear_folder(StringView folder, StringView keep) {
 }
 
 // Steps 4 and 5.
-Result WingetInstaller::place(const WingetManifest& manifest, const WingetInstallerEntry& entry, bool was_installed, Progress* progress, String* detail) {
+Result WingetInstaller::place(const WingetManifest& manifest, const WingetInstallerEntry& entry, bool was_installed, bool ignore_checksum, Progress* progress, String* detail) {
   const StringView id = manifest.id.view();
   const bool archive = equals_folded(entry.type.view(), "zip");
   String folder(allocator_), part(allocator_);
@@ -742,7 +750,7 @@ Result WingetInstaller::place(const WingetManifest& manifest, const WingetInstal
   hasher.finish(hash);
   String hex(allocator_);
   if (!append_hex(&hex, ConstByteView(hash))) return give_up(Result::OutOfMemory);
-  if (!equals_folded(hex.view(), entry.sha256.view())) {
+  if (!checksum_accepted(hex.view(), entry, ignore_checksum)) {
     detail->assign(entry.url.view());
     return give_up(Result::BadChecksum);
   }
@@ -966,7 +974,7 @@ bool WingetInstaller::log_tail(StringView path, String* out) const {
 }
 
 // A package that comes as a setup program: downloaded, checked, run, and what it registered remembered.
-Result WingetInstaller::place_setup(const WingetManifest& manifest, const WingetInstallerEntry& entry, Progress* progress, String* detail) {
+Result WingetInstaller::place_setup(const WingetManifest& manifest, const WingetInstallerEntry& entry, bool ignore_checksum, Progress* progress, String* detail) {
   if (!setup_) return Result::NotSupported;
   const StringView id = manifest.id.view();
   String folder(allocator_), version(allocator_), name(allocator_), program(allocator_), record_path(allocator_);
@@ -996,7 +1004,7 @@ Result WingetInstaller::place_setup(const WingetManifest& manifest, const Winget
   hasher.finish(hash);
   String hex(allocator_);
   if (!append_hex(&hex, ConstByteView(hash))) return finish(Result::OutOfMemory);
-  if (!equals_folded(hex.view(), entry.sha256.view())) {
+  if (!checksum_accepted(hex.view(), entry, ignore_checksum)) {
     detail->assign(entry.url.view());
     return finish(Result::BadChecksum);
   }
@@ -1091,7 +1099,7 @@ Result WingetInstaller::place_setup(const WingetManifest& manifest, const Winget
 
 // A package that is a Windows Installer package: downloaded, checked, and installed by this system from its description. The package is kept (as
 // Windows keeps it) because removing the product is running the same package the other way.
-Result WingetInstaller::place_msi(const WingetManifest& manifest, const WingetInstallerEntry& entry, Progress* progress, String* detail) {
+Result WingetInstaller::place_msi(const WingetManifest& manifest, const WingetInstallerEntry& entry, bool ignore_checksum, Progress* progress, String* detail) {
   if (!setup_) return Result::NotSupported;
   const StringView id = manifest.id.view();
   String folder(allocator_), version(allocator_), name(allocator_), package(allocator_), record_path(allocator_);
@@ -1120,7 +1128,7 @@ Result WingetInstaller::place_msi(const WingetManifest& manifest, const WingetIn
   hasher.finish(hash);
   String hex(allocator_);
   if (!append_hex(&hex, ConstByteView(hash))) return finish(Result::OutOfMemory);
-  if (!equals_folded(hex.view(), entry.sha256.view())) {
+  if (!checksum_accepted(hex.view(), entry, ignore_checksum)) {
     detail->assign(entry.url.view());
     return finish(Result::BadChecksum);
   }
