@@ -4737,32 +4737,6 @@ EXPORT BOOL WINAPI SetSearchPathMode(DWORD flags) {
   return FALSE;
 }
 
-/* ---- error texts ---------------------------------------------------------------------------------------------------------------------------------------- */
-
-static const char *error_text(DWORD error) {
-  switch (error) {
-    case ERROR_SUCCESS: return "The operation completed successfully.";
-    case ERROR_FILE_NOT_FOUND: return "The system cannot find the file specified.";
-    case ERROR_PATH_NOT_FOUND: return "The system cannot find the path specified.";
-    case ERROR_ACCESS_DENIED: return "Access is denied.";
-    case ERROR_INVALID_HANDLE: return "The handle is invalid.";
-    case ERROR_NOT_ENOUGH_MEMORY: return "Not enough memory resources are available to process this command.";
-    case ERROR_NO_MORE_FILES: return "There are no more files.";
-    case ERROR_SHARING_VIOLATION: return "The process cannot access the file because it is being used by another process.";
-    case ERROR_FILE_EXISTS: return "The file exists.";
-    case ERROR_INVALID_PARAMETER: return "The parameter is incorrect.";
-    case ERROR_INSUFFICIENT_BUFFER: return "The data area passed to a system call is too small.";
-    case ERROR_INVALID_NAME: return "The filename, directory name, or volume label syntax is incorrect.";
-    case ERROR_MOD_NOT_FOUND: return "The specified module could not be found.";
-    case ERROR_PROC_NOT_FOUND: return "The specified procedure could not be found.";
-    case ERROR_DIR_NOT_EMPTY: return "The directory is not empty.";
-    case ERROR_ALREADY_EXISTS: return "Cannot create a file when that file already exists.";
-    case ERROR_DIRECTORY: return "The directory name is invalid.";
-    case ERROR_DISK_FULL: return "There is not enough space on the disk.";
-    case ERROR_HANDLE_EOF: return "Reached the end of the file.";
-    default: return NULL;
-  }
-}
 /* ---- start ------------------------------------------------------------------------------------------------------------------------------------------------ */
 
 BOOL WINAPI DllMain(HANDLE module, DWORD reason, PVOID reserved) {
