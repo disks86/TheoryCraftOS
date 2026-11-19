@@ -34,7 +34,9 @@ does what the AppImage's own runtime would do, without running the runtime. It d
    - A shell-script `AppRun` (electron-builder, linuxdeploy, most hand-made AppImages) is interpreted by a small built-in shell. The Linux
      layer has no fork or exec, so real bash could neither run the command substitutions these scripts use nor hand over to the program.
      - The built-in shell covers variables, exports, arrays, parameter expansion, quoting, globbing, `if`/`while`/`for`, functions,
-       `trap … EXIT`, `source`, `eval` and `test`/`[[ ]]`.
+       `trap … EXIT`, `source`, `eval` and `test`/`[[ ]]`. Redirections are parsed and ignored. A process substitution (`<( … )`,
+       `>( … )`) is not run: the word becomes `/dev/fd/63`, as bash names it, which lets Google's own `google-chrome` wrapper (`exec >
+       >(exec cat)`) through.
      - In `$( )` it supports dirname, basename, readlink -f, realpath, pwd, echo, printf, uname and id.
      - The script hands over through `exec prog …`, or by running a program that lies inside the image. That program is the result, with
        every exported variable. If that program is itself a script, it is interpreted in turn.
@@ -98,7 +100,8 @@ Files of several extents are read as one. Interleaved files, zisofs2 and sparse 
   - 8 threads reading at once;
   - the AppImage header parser, including 32-bit, big-endian and damaged headers;
   - the graft;
-  - AppRun scripts in the style of electron-builder and linuxdeploy, hand-written launchers and fuzzed scripts;
+  - AppRun scripts in the style of electron-builder and linuxdeploy, ivan-hc's Chrome AppImage (Google's wrapper script), process
+    substitutions, hand-written launchers and fuzzed scripts (`AppImageTest --only-apprun` runs just these, in seconds);
   - an end-to-end `AppImageSession` on a RAM file system;
   - ISO images made by `genisoimage` (Rock Ridge with relocated deep folders, Rock Ridge + Joliet, Joliet only, plain) and `xorriso`
     (Rock Ridge + Joliet, and zisofs with 32, 64 and 128 KiB blocks), plus truncated and bit-flipped ones and 8 threads on one shared

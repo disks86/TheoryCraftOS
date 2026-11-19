@@ -47,6 +47,9 @@ bool is_name_char(char c) { return is_name_start(c) || (c >= '0' && c <= '9'); }
 bool is_digit(char c) { return c >= '0' && c <= '9'; }
 bool is_blank(char c) { return c == ' ' || c == '\t' || c == '\r'; }
 bool is_operator_char(char c) { return c == ';' || c == '&' || c == '|' || c == '(' || c == ')' || c == '<' || c == '>' || c == '\n'; }
+
+// A process substitution, <( list ) or >( list ), starts at text[i].
+bool is_process_substitution(StringView text, uint64_t i) { return i + 1 < text.size() && (text[i] == '<' || text[i] == '>') && text[i + 1] == '('; }
 bool is_glob_char(char c) { return c == '*' || c == '?' || c == '['; }
 
 bool is_name(StringView text) {
@@ -220,7 +223,8 @@ bool tokenize(Script* script) {
     // Redirections: [n]> [n]>> [n]< <> >& &> &>> << <<- <<<, with their target.
     uint64_t r = i;
     while (r < text.size() && is_digit(text[r])) ++r;
-    const bool redirect = (r < text.size() && (text[r] == '<' || text[r] == '>')) || (c == '&' && i + 1 < text.size() && text[i + 1] == '>');
+    const bool redirect = ((r < text.size() && (text[r] == '<' || text[r] == '>')) || (c == '&' && i + 1 < text.size() && text[i + 1] == '>')) &&
+                          !(r == i && is_process_substitution(text, i));      // (<( list ) is a word)
     if (redirect && (r == i || r < text.size())) {
       const uint64_t start = i;
       uint64_t j = r == i ? i : r;
@@ -244,8 +248,11 @@ bool tokenize(Script* script) {
       } else {
         while (j < text.size() && is_blank(text[j])) ++j;
         const uint64_t word = j;
-        while (j < text.size() && !is_blank(text[j]) && !is_operator_char(text[j])) {
-          if (text[j] == '\'' || text[j] == '"') {
+        while (j < text.size() && !is_blank(text[j]) && (!is_operator_char(text[j]) || is_process_substitution(text, j))) {
+          if (is_process_substitution(text, j)) {      // exec > >(exec cat): the target is a process substitution
+            j = skip_group(text, j + 1);
+            if (j == npos) return false;
+          } else if (text[j] == '\'' || text[j] == '"') {
             j = skip_piece(text, j);
             if (j == npos) return false;
           } else {
@@ -261,7 +268,7 @@ bool tokenize(Script* script) {
       i = j;
       continue;
     }
-    if (is_operator_char(c)) {
+    if (is_operator_char(c) && !is_process_substitution(text, i)) {
       uint64_t j = i + 1;
       if (j < text.size() && ((c == '&' && text[j] == '&') || (c == '|' && text[j] == '|') || (c == ';' && text[j] == ';'))) ++j;
       if (!push(TokenKind::Op, i, j)) return false;
@@ -270,9 +277,14 @@ bool tokenize(Script* script) {
     }
     // A word.
     const uint64_t start = i;
-    while (i < text.size() && !is_blank(text[i]) && !is_operator_char(text[i])) {
+    while (i < text.size() && !is_blank(text[i]) && (!is_operator_char(text[i]) || is_process_substitution(text, i))) {
       const char d = text[i];
       if (d == '\\') { i += 2; continue; }
+      if (is_process_substitution(text, i)) {
+        i = skip_group(text, i + 1);
+        if (i == npos) return false;
+        continue;
+      }
       if (d == '\'' || d == '"' || d == '`') {
         i = skip_piece(text, i);
         if (i == npos) return false;
@@ -1694,6 +1706,16 @@ class Shell {
         const uint64_t consumed = dollar(b, raw.substr(i), in_quotes, mode, out);
         if (consumed == 0) return false;
         i += consumed;
+        continue;
+      }
+      if (!in_quotes && is_process_substitution(raw, i)) {
+        // <( list ) and >( list ): bash runs the list with a pipe and puts the pipe's name in the word. Nothing here reads from or writes to it, so
+        // the list is not run; the word gets the name bash gives the first one.
+        const uint64_t end = skip_group(raw, i + 1);
+        if (end == npos) return false;
+        if (!append_literal(b, "/dev/fd/63", true)) return fail_memory() == 0;
+        b.have = true;
+        i = end;
         continue;
       }
       if (c == '~' && i == 0 && !in_quotes && (raw.size() == 1 || raw[1] == '/')) {
