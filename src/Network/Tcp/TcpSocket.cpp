@@ -143,6 +143,21 @@ uint32_t TcpSocket::receive(ByteView buffer) {
   return n;
 }
 
+void TcpSocket::describe(char* out, uint32_t capacity) const {
+  if (capacity == 0) return;
+  uint32_t at = 0;
+  auto put = [&](const char* t) { while (*t && at + 1 < capacity) out[at++] = *t++; };
+  auto num = [&](uint64_t v) { char d[24]; uint32_t n = 0; do { d[n++] = char('0' + v % 10); v /= 10; } while (v); while (n && at + 1 < capacity) out[at++] = d[--n]; };
+  put("tcp "); num(local_port()); put(" > "); num(remote_port());
+  put(" state "); num(static_cast<uint64_t>(state()));
+  put(" unread "); num(available());
+  put(" unacked "); num(unsent_or_unacknowledged());
+  put(" room "); num(receive_room());
+  put(" advertised "); num(__atomic_load_n(&last_advertised_window_, __ATOMIC_RELAXED));
+  put(" peer window "); num(__atomic_load_n(&snd_wnd_, __ATOMIC_RELAXED));
+  out[at] = 0;
+}
+
 void TcpSocket::close() {
   Owner owner(*this);
   switch (state_) {

@@ -138,6 +138,8 @@ bool TcpManager::pacing() const {
   return false;
 }
 
+void (*g_tcp_debug_log)(const char* line) = nullptr;
+
 uint32_t TcpManager::next_initial_sequence() {
   // RFC 793 suggests a counter ticking every 4 microseconds; milliseconds times
   // 250 is the same thing, plus a bump so two connections in one tick differ.
@@ -271,6 +273,14 @@ void TcpManager::poll() {
   List<Snapshot> all(allocator_);
   snapshot(&all);
   for (Snapshot& s : all) s.socket->on_timer(now);
+  if (g_tcp_debug_log && now - last_debug_report_ms_ >= 20000) {
+    last_debug_report_ms_ = now;
+    char line[160];
+    for (Snapshot& s : all) {
+      s.socket->describe(line, sizeof(line));
+      g_tcp_debug_log(line);
+    }
+  }
   // A connection nobody but the manager holds any more (this pass's copy aside) is closed - the application let go of it. (A node a table retired
   // but has not freed yet still counts: such a socket waits for the next pass.)
   for (Snapshot& s : all)

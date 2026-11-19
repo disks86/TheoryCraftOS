@@ -304,6 +304,18 @@ uint32_t nt_socket_control(Process& p, const SyscallRequest& r) {
       if (out_length < 4) return kInfoLengthMismatch;
       return p.write_user_u32(out_at, sockets->readable(uint32_t(id))) ? kSuccess : kAccessViolation;
     }
+    case 11: {   // ReadState (Out: ULONG bytes readable, BOOLEAN the peer closed and all was read, BOOLEAN the connection failed, 2 bytes padding)
+      if (out_length < 8) return kInfoLengthMismatch;
+      uint32_t available = 0;
+      bool peer_closed = false, failed = false;
+      sockets->read_state(uint32_t(id), &available, &peer_closed, &failed);
+      uint8_t out[8] = {};
+      ByteWriter w{ByteView(out)};
+      w.le32(available);
+      w.u8(peer_closed ? 1 : 0);
+      w.u8(failed ? 1 : 0);
+      return p.write_user(out_at, ConstByteView(out, 8)) ? kSuccess : kAccessViolation;
+    }
     case 5: {    // InterfaceConfiguration (In: ULONG index; Out: address, netmask, gateway, DNS server, each as a sockaddr_in carries it)
       uint32_t index = 0;
       if (const uint32_t status = read_u32_in(p, r.args[2], in_length, &index); status != kSuccess) return status;

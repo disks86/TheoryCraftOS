@@ -36,6 +36,9 @@ namespace network {
 // socket's lock may be held when the table's is taken (a listen() claims its port),
 // never the other way round; a listener's lock may be held when one of its new
 // connections' is taken, never the other way round.
+// A debug report of every TCP connection, every 20 seconds, when the kernel sets this (a build that traces failing services does).
+extern void (*g_tcp_debug_log)(const char* line);
+
 class TcpManager {
  public:
   TcpManager(IIpLayer& ip, allocators::IAllocator& allocator)
@@ -97,6 +100,7 @@ class TcpManager {
   Dictionary<uint32_t, uint32_t> port_uses_;   // local port -> listeners and connections on it
   uint16_t next_port_ = 49152;
   uint32_t iss_counter_ = 0;
+  uint64_t last_debug_report_ms_ = 0;
 };
 
 }  // namespace network

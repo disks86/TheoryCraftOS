@@ -106,6 +106,7 @@
 #include "Hardware/StorageDevice/SystemStorageDevices.hpp"
 #include "Hardware/SystemHardware.hpp"
 #include "Network/NetworkStackSet.hpp"
+#include "Network/Tcp/TcpManager.hpp"
 #include "Process/Sockets.hpp"
 #include "Network/Ftp/FtpFileSystem.hpp"
 #include "Network/NetworkVolume.hpp"
@@ -947,6 +948,7 @@ static efi::Status kernel_main(efi::Handle image, efi::SystemTable* st) {
   if (system_graphics.accelerated() && dxg_kernel.add_adapter(system_graphics.software_device(), dxgk::AdapterConfig()) != dxgk::kInvalidIndex) ++dxg_adapters;
   dxgk::set_system_kernel(&dxg_kernel);
 #ifdef TCOS_TRACE_SERVICE_FAILURES
+  network::g_tcp_debug_log = [](const char* line) { console::puts(line); console::puts("\n"); };      // (and every TCP connection's state now and then)
   // (with the failing services of Windows programs: a Direct3D command stream that is refused, and at which command)
   dxgk::set_stream_trace([](uint32_t op, uint32_t status, uint32_t commands_before, uint32_t line) {
     console::puts("direct3d stream refused: command ");

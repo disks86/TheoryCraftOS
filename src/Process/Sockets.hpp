@@ -121,6 +121,9 @@ class SocketManager {
   bool has_ipv6_route() const;
   // How many bytes (TCP) or whole datagrams (UDP) are waiting; for select()'s read set and FIONREAD.
   uint32_t readable(uint32_t id) const;
+  // A stream socket's receive side: the bytes it holds, and whether the peer has closed and everything was read, or the connection failed. (Only these say
+  // "closed": readability with nothing to read is no proof - the program may have just taken the bytes.)
+  void read_state(uint32_t id, uint32_t* available, bool* peer_closed, bool* failed) const;
   bool is_tcp(uint32_t id) const;
   bool exists(uint32_t id) const { return at(id) != nullptr; }
   // True if accept()/receive() would not block right now (connected or has data, for a TCP listener: has a waiting connection); for select()'s read set.
