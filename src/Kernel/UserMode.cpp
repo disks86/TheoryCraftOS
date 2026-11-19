@@ -491,6 +491,7 @@ void log_exception(Task* task, uint32_t code, uint64_t rip, uint64_t address, ui
       console::puts("    it called a function that is not there: ");
       console::puts(missing.view());
       console::puts("\n");
+      owner->host().missing_function_called(missing.view());      // (the terminal says it when the program ends)
     }
   }
   if (code == 0xC000001Du || code == 0xC0000096u) {      // an instruction the processor refused: the bytes of it, to tell what it was

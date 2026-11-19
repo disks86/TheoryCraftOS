@@ -125,6 +125,9 @@ class PeFile {
   const PeExport* find_export_by_ordinal(uint32_t ordinal) const;
   // The file offset of a relative virtual address; false if it is in no section (or past the raw data of one).
   bool rva_to_offset(uint32_t rva, uint64_t* offset) const;
+  // The bytes of the resource of type `type` (RT_MANIFEST = 24, ...) in `file` (the buffer parse() was given): the entry with the numeric id `id` if
+  // it has one, else the first entry of that type, and its first language. False if there is none or the resource directory is damaged.
+  [[nodiscard]] bool find_resource(ConstByteView file, uint32_t type, uint32_t id, ConstByteView* out) const;
 
  private:
   bool parse_all(ConstByteView file);

@@ -240,7 +240,10 @@ RunResult run_loaded(const ProgramRun& run, uint32_t* exit_code, String* message
 #endif
   program.set_file_system(run.files);
   process::FileLibraryProvider libraries(allocator, run.files);      // every DLL, ntdll.dll and kernel32.dll included, comes from C:\Windows\System32
-  if (const uint64_t slash = run.path.rfind('/'); slash != StringView::npos && slash > 0) libraries.add_directory(run.path.first(slash));      // ... after the program's own folder
+  if (abi == process::SyscallAbi::Windows && !libraries.add_program(run.path, image.view())) {      // ... after the program's own folder and the private assemblies its manifest names
+    fail(message, "could not start the program (out of memory)");
+    return RunResult::CouldNotRun;
+  }
   if (abi == process::SyscallAbi::Windows) program.set_library_provider(&libraries);
   String directory(allocator);
   if (process::world_directory(abi, run.working_directory, &directory)) program.set_working_directory(directory.view());

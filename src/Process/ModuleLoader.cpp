@@ -86,7 +86,146 @@ struct FileLibraryProvider::Entry {
   Entry* next = nullptr;
 };
 
-FileLibraryProvider::FileLibraryProvider(allocators::IAllocator& allocator, filesystem::IFileSystem* files) : allocator_(allocator), files_(files), directories_(allocator) {}
+FileLibraryProvider::FileLibraryProvider(allocators::IAllocator& allocator, filesystem::IFileSystem* files)
+    : allocator_(allocator), files_(files), directories_(allocator), redirects_(allocator) {}
+
+namespace {
+bool is_space(char c) { return c == ' ' || c == '\t' || c == '\r' || c == '\n'; }
+
+// The value of the attribute `key` of the start tag `tag` ("<file name='x.dll' hash='...'/"), or false. Values in ' or " quotes.
+bool tag_attribute(StringView tag, StringView key, StringView* value) {
+  uint64_t i = 1;
+  while (i < tag.size() && !is_space(tag[i]) && tag[i] != '/' && tag[i] != '>') ++i;      // (the element's name)
+  while (i < tag.size()) {
+    while (i < tag.size() && (is_space(tag[i]) || tag[i] == '/')) ++i;
+    const uint64_t name_at = i;
+    while (i < tag.size() && !is_space(tag[i]) && tag[i] != '=' && tag[i] != '/' && tag[i] != '>') ++i;
+    const StringView name = tag.substr(name_at, i - name_at);
+    while (i < tag.size() && is_space(tag[i])) ++i;
+    if (i >= tag.size() || tag[i] != '=') return false;
+    ++i;
+    while (i < tag.size() && is_space(tag[i])) ++i;
+    if (i >= tag.size() || (tag[i] != '\'' && tag[i] != '"')) return false;
+    const char quote = tag[i++];
+    const uint64_t end = tag.find(quote, i);
+    if (end == StringView::npos) return false;
+    if (name.equals(key)) {
+      *value = tag.substr(i, end - i);
+      return true;
+    }
+    i = end + 1;
+  }
+  return false;
+}
+
+// The start tags of the element `element` ("<file"), each up to its '>', after `from` and before `end`.
+template <typename Each>
+bool for_each_tag(StringView xml, StringView element, uint64_t from, uint64_t end, Each each) {
+  for (uint64_t at = xml.find(element, from); at != StringView::npos && at < end; at = xml.find(element, at + 1)) {
+    const uint64_t after = at + element.size();
+    if (after >= xml.size() || !(is_space(xml[after]) || xml[after] == '/' || xml[after] == '>')) continue;      // ("<fileX")
+    const uint64_t close = xml.find('>', after);
+    if (close == StringView::npos || close >= end) return true;
+    if (!each(xml.substr(at, close - at))) return false;
+  }
+  return true;
+}
+
+bool plain_name(StringView name) {
+  return !name.empty() && name.size() <= 255 && !name.contains('/') && !name.contains('\\') && !name.contains(':') && !name.equals(".") && !name.equals("..");
+}
+
+bool add_name(StringView name, List<String>* names, allocators::IAllocator& allocator) {
+  if (!plain_name(name)) return true;
+  for (const String& have : names->view()) if (have.view().equals_ignore_case(name)) return true;
+  String copy(allocator);
+  return copy.assign(name) && names->push_back(static_cast<String&&>(copy));
+}
+}  // namespace
+
+bool manifest_private_assemblies(StringView xml, allocators::IAllocator& allocator, List<String>* names) {
+  for (uint64_t at = xml.find("<dependentAssembly"); at != StringView::npos; at = xml.find("<dependentAssembly", at + 1)) {
+    uint64_t end = xml.find("</dependentAssembly", at);
+    if (end == StringView::npos) end = xml.size();
+    bool ok = true;
+    if (!for_each_tag(xml, "<assemblyIdentity", at, end, [&](StringView tag) {
+          StringView name, token, type;
+          if (!tag_attribute(tag, "name", &name) || tag_attribute(tag, "publicKeyToken", &token)) return true;      // (a shared assembly: not a folder of the program's)
+          if (tag_attribute(tag, "type", &type) && !type.equals_ignore_case("win32")) return true;
+          ok = add_name(name, names, allocator);
+          return ok;
+        }))
+      return false;
+    if (!ok) return false;
+  }
+  return true;
+}
+
+bool manifest_files(StringView xml, allocators::IAllocator& allocator, List<String>* names) {
+  return for_each_tag(xml, "<file", 0, xml.size(), [&](StringView tag) {
+    StringView name;
+    return !tag_attribute(tag, "name", &name) || add_name(name, names, allocator);
+  });
+}
+
+bool FileLibraryProvider::read_text(StringView path, uint64_t limit, String* out) {
+  UniquePointer<filesystem::IFile> file;
+  if (!files_ || files_->open_file(path, filesystem::OpenMode::Read, &file) != filesystem::Status::Ok) return false;
+  const uint64_t size = file->size();
+  if (size == 0 || size > limit) return false;
+  ByteBuffer bytes(allocator_);
+  if (!bytes.put_zeros(size)) return false;
+  for (uint64_t done = 0; done < size;) {
+    uint64_t got = 0;
+    if (file->read(done, bytes.writable_view().subview(done), &got) != filesystem::Status::Ok || got == 0) return false;
+    done += got;
+  }
+  return out->assign(StringView(bytes.view()));
+}
+
+bool FileLibraryProvider::add_program(StringView path, ConstByteView image) {
+  const uint64_t slash = path.rfind('/');
+  if (slash == StringView::npos || slash == 0) return true;
+  const StringView folder = path.first(slash);
+  if (!add_directory(folder)) return false;
+  exe::PeFile pe(allocator_);
+  ConstByteView manifest;
+  if (!pe.parse(image) || !pe.find_resource(image, 24, 1, &manifest)) return true;      // RT_MANIFEST, CREATEPROCESS_MANIFEST_RESOURCE_ID
+  List<String> assemblies(allocator_);
+  if (!manifest_private_assemblies(StringView(manifest), allocator_, &assemblies)) return false;
+  constexpr uint64_t kMaxManifestBytes = 1u << 20;
+  for (const String& assembly : assemblies.view()) {
+    // Windows looks for "<assembly>.manifest" next to the program, then in the folder "<assembly>"; the DLLs are next to the manifest found.
+    String directory(allocator_), manifest_path(allocator_), text(allocator_);
+    bool found = false;
+    for (int place = 0; place < 2 && !found; ++place) {
+      if (!directory.assign(folder) || !directory.push_back('/')) return false;
+      if (place == 1 && (!directory.append(assembly.view()) || !directory.push_back('/'))) return false;
+      if (!manifest_path.assign(directory.view()) || !manifest_path.append(assembly.view()) || !manifest_path.append(".manifest")) return false;
+      found = read_text(manifest_path.view(), kMaxManifestBytes, &text);
+    }
+    if (!found) continue;
+    List<String> files(allocator_);
+    if (!manifest_files(text.view(), allocator_, &files)) return false;
+    kernel::ScopedMutex hold(lock_);
+    for (const String& name : files.view()) {
+      Redirect redirect(allocator_);
+      if (!redirect.name.assign(name.view()) || !redirect.directory.assign(directory.view())) return false;
+      for (uint64_t i = 0; i < redirect.name.size(); ++i) redirect.name.set(i, lower(redirect.name[i]));
+      bool have = false;
+      for (const Redirect& r : redirects_.view()) have = have || r.name.view().equals(redirect.name.view());
+      if (!have && !redirects_.push_back(static_cast<Redirect&&>(redirect))) return false;
+    }
+  }
+  return true;
+}
+
+void FileLibraryProvider::remember_directory(StringView os) {
+  // The folder as the program sees it: the Windows world is the OS folder /Windows, drive C.
+  if (os.size() > 9 && os.first(9).equals("/Windows/") && entries_->directory.assign("C:\\")) {
+    for (char ch : os.without_prefix(9)) entries_->directory.push_back(ch == '/' ? '\\' : ch);
+  }
+}
 
 FileLibraryProvider::~FileLibraryProvider() {
   while (entries_) {
@@ -116,13 +255,15 @@ bool FileLibraryProvider::find(StringView canonical_name, ConstByteView* image) 
   }
   if (!files_ || canonical_name.contains('/') || canonical_name.contains('\\')) return false;      // a plain file name only
   String path(allocator_);
+  for (const Redirect& r : redirects_.view()) {      // a DLL of a private assembly the program's manifest names
+    if (r.name.view().equals(canonical_name) && path.assign(r.directory.view()) && path.append(canonical_name) && load(path.view(), canonical_name, image)) {
+      remember_directory(r.directory.view());
+      return true;
+    }
+  }
   for (const String& directory : directories_.view()) {
     if (path.assign(directory.view()) && path.append(canonical_name) && load(path.view(), canonical_name, image)) {
-      // The folder as the program sees it: the Windows world is the OS folder /Windows, drive C.
-      const StringView os = directory.view();
-      if (os.size() > 9 && os.first(9).equals("/Windows/") && entries_->directory.assign("C:\\")) {
-        for (char ch : os.without_prefix(9)) entries_->directory.push_back(ch == '/' ? '\\' : ch);
-      }
+      remember_directory(directory.view());
       return true;
     }
   }

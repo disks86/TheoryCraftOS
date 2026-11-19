@@ -2744,7 +2744,11 @@ static efi::Status kernel_main(efi::Handle image, efi::SystemTable* st) {
             if (__atomic_load_n(&installing, __ATOMIC_RELAXED) && s % 30 == 0) kernel::usermode::report();
           }
         }, nullptr, "winget-report"));
-        const desktop::appman::Result r = package ? installer.install(*package, &progress, &detail) : desktop::appman::Result::NoManifest;
+        desktop::appman::Result r = package ? installer.install(*package, &progress, &detail) : desktop::appman::Result::NoManifest;
+        if (r == desktop::appman::Result::BadChecksum) {   // (as a user answering "Install Anyway": winget's manifest often lags the vendor's file)
+          console::puts("winget-selftest: checksum differs from the manifest; installing anyway\n");
+          r = installer.install(*package, &progress, &detail, true);
+        }
         __atomic_store_n(&installing, false, __ATOMIC_RELAXED);
         console::puts("winget-selftest: install " TCOS_WINGET_SELFTEST ": ");
         console::puts(desktop::appman::result_name(r));
@@ -2764,6 +2768,34 @@ static efi::Status kernel_main(efi::Handle image, efi::SystemTable* st) {
             console::puts(app.program.view());
             console::puts("\n");
           }
+#ifdef TCOS_WINGET_SELFTEST_RUN
+        // The build asked for the installed programs to be started too (tests/winget_qemu.sh with RUN=1): each one runs for up to a minute.
+        if (r == desktop::appman::Result::Ok && t.setup)
+          for (const desktop::InstalledApp& app : apps.view()) {
+            if (app.platform != desktop::AppPlatform::Windows) continue;
+            static bool stop_program = false;
+            __atomic_store_n(&stop_program, false, __ATOMIC_RELAXED);
+            kernel::detach(kernel::spawn([](void*) {
+              kernel::sleep_ms(60000);
+              __atomic_store_n(&stop_program, true, __ATOMIC_RELAXED);
+            }, nullptr, "winget-run-timer"));
+            uint32_t exit_code = 0;
+            String message(*t.allocator);
+            const bool ran = t.setup->run(app.program.view(), {}, &stop_program, &exit_code, &message);
+            console::puts("winget-selftest: run ");
+            console::puts(app.program.view());
+            console::puts(": ");
+            if (ran) {
+              console::puts("exit code ");
+              console::put_hex(exit_code);
+            } else {
+              console::puts("not run or stopped (");
+              console::puts(message.view());
+              console::puts(")");
+            }
+            console::puts("\n");
+          }
+#endif
         if (r == desktop::appman::Result::Ok) {
           const desktop::appman::Result removed = installer.remove(package->id.view(), &detail);
           console::puts("winget-selftest: remove: ");

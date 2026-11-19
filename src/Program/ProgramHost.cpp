@@ -158,6 +158,15 @@ void ProgramHost::unhandled_syscall(process::SyscallAbi abi, uint64_t number) {
   unhandled_.append_uint(number);
 }
 
+void ProgramHost::missing_function_called(StringView name) {
+  kernel::ScopedMutex lock(mutex_);
+  if (missing_count_ >= 8) return;      // (counted apart from the system calls: one program may need both kinds)
+  ++missing_count_;
+  if (!unhandled_.empty()) unhandled_.append(", ");
+  unhandled_.append("the function ");
+  unhandled_.append(name);
+}
+
 bool ProgramHost::take_unhandled(String* out) {
   kernel::ScopedMutex lock(mutex_);
   if (unhandled_.empty()) return false;
