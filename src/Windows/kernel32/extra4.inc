@@ -511,6 +511,15 @@ static int mitigation_size(int policy) {
 }
 EXPORT BOOL WINAPI GetProcessMitigationPolicy(HANDLE process, int policy, PVOID buffer, SIZE_T length) {
   BOOL self;
+  if (policy == 5) {
+    /* ProcessMitigationOptionsMask: which PROCESS_CREATION_MITIGATION_POLICY bits CreateProcess takes (one to three DWORD64s, as many as the caller's Windows
+       knows). CreateProcess here takes them all (kept, not enforced: see UpdateProcThreadAttribute). Chromium's sandbox asks before it starts a child and stops
+       if this fails. */
+    if (!buffer || (length != 8 && length != 16 && length != 24)) { set_error(ERROR_INVALID_PARAMETER); return FALSE; }
+    if (!process_handle_is(process, &self)) return FALSE;
+    memset(buffer, 0xFF, length);
+    return TRUE;
+  }
   if (!buffer || mitigation_size(policy) == 0 || length != (SIZE_T)mitigation_size(policy)) { set_error(ERROR_INVALID_PARAMETER); return FALSE; }
   if (!process_handle_is(process, &self)) return FALSE;
   memset(buffer, 0, length);

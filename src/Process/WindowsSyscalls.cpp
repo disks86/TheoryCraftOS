@@ -81,6 +81,19 @@ uint32_t nt_continue(Process& process, const SyscallRequest& r) {
   return kStatusSuccess;
 }
 
+// NtTcosWrapped: the exported name of a service that ntdll.dll implements in C (it does work of its own around the kernel's service, such as giving a new
+// object its security) is a stub of the shape Windows' ntdll.dll has ("mov r10, rcx; mov eax, number; syscall; ret", 32 bytes), so that programs that
+// check or copy the stubs (Chromium's sandbox patches NtCreateFile and others in its children) find what they expect. Its number is this service, and the 8 bytes
+// after its RET hold the address of the C function: the thread goes on there, as if the stub had jumped to it. A copy of the 32 bytes elsewhere works too.
+uint32_t nt_tcos_wrapped(Process& process, const SyscallRequest& r) {
+  uint64_t target = 0;
+  if (r.user_pc == 0 || r.user_pc > ~uint64_t{0} - 9 || !process.read_user_u64(r.user_pc + 1, &target)) return kStatusAccessViolation;
+  AddressSpace* space = process.address_space();
+  if (!space || !space->check(target, 1, kProtExecute)) return kStatusAccessViolation;      // (only code: the program cannot be sent to its data this way)
+  process.request_resume_at(target);
+  return kStatusSuccess;
+}
+
 // NtRaiseException(PEXCEPTION_RECORD, PCONTEXT, BOOLEAN FirstChance) as the kernel sees it: ntdll looks for handlers itself, so a call that gets here is the last chance. The
 // process ends with the exception code as its exit code.
 uint32_t nt_raise_exception_final(Process& process, const SyscallRequest& r) {
@@ -287,6 +300,7 @@ class WindowsSyscalls final : public ISyscallInterface {
       case WindowsSyscallNumber::NtTcosAudio: return windowsabi::nt_tcos_audio(process, r);
       case WindowsSyscallNumber::NtTcosCabinet: return windowsabi::nt_tcos_cabinet(process, r);
       case WindowsSyscallNumber::NtTcosGamepad: return windowsabi::nt_tcos_gamepad(process, r);
+      case WindowsSyscallNumber::NtTcosWrapped: return nt_tcos_wrapped(process, r);
       case WindowsSyscallNumber::NtCancelSynchronousIoFile: return windowsabi::nt_cancel_synchronous_io_file(process, r);
       case WindowsSyscallNumber::NtFsControlFile: return windowsabi::nt_fs_control_file(process, r);
       case WindowsSyscallNumber::NtQueryObject: return windowsabi::nt_query_object(process, r);

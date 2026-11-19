@@ -2781,7 +2781,15 @@ static efi::Status kernel_main(efi::Handle image, efi::SystemTable* st) {
             }, nullptr, "winget-run-timer"));
             uint32_t exit_code = 0;
             String message(*t.allocator);
-            const bool ran = t.setup->run(app.program.view(), {}, &stop_program, &exit_code, &message);
+            StringView words[16];
+            uint64_t count = 0;
+            for (StringView rest(TCOS_WINGET_SELFTEST_RUN_ARGUMENTS); !rest.empty() && count < 16;) {
+              StringView word, after;
+              if (!rest.split_once('|', &word, &after)) { word = rest; after = StringView(); }
+              if (!word.empty()) words[count++] = word;
+              rest = after;
+            }
+            const bool ran = t.setup->run(app.program.view(), ArrayView<const StringView>(words, count), &stop_program, &exit_code, &message);
             console::puts("winget-selftest: run ");
             console::puts(app.program.view());
             console::puts(": ");
@@ -2796,7 +2804,16 @@ static efi::Status kernel_main(efi::Handle image, efi::SystemTable* st) {
             console::puts("\n");
           }
 #endif
-        if (r == desktop::appman::Result::Ok) {
+#ifdef TCOS_WINGET_SELFTEST_KEEP
+        constexpr bool keep = true;
+#else
+        constexpr bool keep = false;
+#endif
+        if (keep && r == desktop::appman::Result::Ok) {
+          console::puts("winget-selftest: the package stays installed (TCOS_WINGET_SELFTEST_KEEP)\n");
+          (void)t.files->flush();
+        }
+        if (!keep && r == desktop::appman::Result::Ok) {
           const desktop::appman::Result removed = installer.remove(package->id.view(), &detail);
           console::puts("winget-selftest: remove: ");
           console::puts(desktop::appman::result_name(removed));

@@ -401,6 +401,11 @@ Frame* on_syscall(Frame* frame, void*) {
       alive = false;
     }
   }
+  uint64_t resume_at = 0;
+  if (alive && !thread_ends && process->take_resume_at(&resume_at)) {      // NtTcosWrapped: on to ntdll's C function, with its first argument back in RCX
+    frame->rip = resume_at;
+    frame->rcx = frame->r10;
+  }
   if (alive && !thread_ends && process->abi() == process::SyscallAbi::Linux) {
     // rt_sigreturn: the registers the handler interrupted come back from its frame. Then, for any call: the signals that wait for this thread.
     const bool returned = process->take_signal_return();

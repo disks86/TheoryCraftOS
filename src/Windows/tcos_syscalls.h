@@ -119,6 +119,16 @@
 #define NT_SERVICE_NtTcosAudio 510
 #define NT_SERVICE_NtTcosCabinet 511
 #define NT_SERVICE_NtTcosGamepad 512
+#define NT_SERVICE_NtTcosWrapped 513
+/* A service ntdll.dll implements in C around the kernel's (NtCreateFile, NtCreateSection): on x86-64 its exported name is a Windows-shaped stub that goes on in
+ * the C function (NT_SERVICE_WRAPPED in ntdll.c, NtTcosWrapped in the kernel), so the C function has a name of its own and is not exported itself. */
+#ifdef __x86_64__
+#define TCOS_WRAPPED_NAME(name) TcosWrapped##name
+#define TCOS_WRAPPED_EXPORT
+#else
+#define TCOS_WRAPPED_NAME(name) name
+#define TCOS_WRAPPED_EXPORT __declspec(dllexport)
+#endif
 #define NT_SERVICE_NtCreateSocket 87
 #define NT_SERVICE_NtBindSocket 88
 #define NT_SERVICE_NtConnectSocket 89
@@ -2076,7 +2086,7 @@
 #define NT_SERVICE_NtUserTcosGetUpcall 5636
 #define NT_SERVICE_NtUserTcosUpcallDone 5637
 #define NT_SERVICE_NtUserTcosResume 5638
-#define NT_SERVICE_COUNT 513
+#define NT_SERVICE_COUNT 514
 #define NT_SERVICE_WIN32K_BASE 4096
 #define NT_SERVICE_WIN32K_END 5639
 #endif

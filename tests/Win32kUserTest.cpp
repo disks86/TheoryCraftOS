@@ -992,6 +992,18 @@ void test_hooks_and_stations() {
   CHECK(t.svc32(N::NtUserSetThreadDesktop, {desk}) == 0 && prog.memory.get32(kScratch + 0x7000 + 0x68) == 170);      // t has windows
   CHECK(t.svc32(N::NtUserCloseDesktop, {desk}) == 1 && t.svc32(N::NtUserCloseDesktop, {desk}) == 0);
   CHECK(t.svc32(N::NtUserGetProcessWindowStation) != 0);
+  // a station without a name gets one of its own each time (Chromium's sandbox: CreateWindowStationW(NULL, ...)), and a desktop can be made in it
+  const uint32_t anon1 = t.svc32(N::NtUserCreateWindowStation, {make_attr("", 0), 0, 0, 0, 0, 0, 0});
+  CHECK(anon1 != 0 && t.svc32(N::NtUserGetObjectInformation, {anon1, 2, info, 64, need}) == 1);
+  const std::string anon_name = prog.memory.get_wide_z(info);
+  CHECK(anon_name.rfind("Service-0x0-", 0) == 0 && anon_name.back() == '$');
+  const uint32_t anon2 = t.svc32(N::NtUserCreateWindowStation, {make_attr("", 0), 0, 0, 0, 0, 0, 0});
+  CHECK(anon2 != 0 && t.svc32(N::NtUserGetObjectInformation, {anon2, 2, info, 64, need}) == 1 && prog.memory.get_wide_z(info) != anon_name);
+  const uint32_t original = t.svc32(N::NtUserGetProcessWindowStation);
+  CHECK(t.svc32(N::NtUserSetProcessWindowStation, {anon1}) == 1);
+  const uint32_t sbox = t.svc32(N::NtUserCreateDesktopEx, {make_attr("sbox_alternate_desktop_0x51", anon1), 0, 0, 0, 0, 0});
+  CHECK(sbox != 0 && t.svc32(N::NtUserSetProcessWindowStation, {original}) == 1);
+  CHECK(t.svc32(N::NtUserGetObjectInformation, {sbox, 2, info, 64, need}) == 1 && prog.memory.get_wide_z(info) == "sbox_alternate_desktop_0x51");
   user::reset_state();
 }
 

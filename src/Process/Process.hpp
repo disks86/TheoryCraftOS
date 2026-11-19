@@ -312,6 +312,10 @@ class Process {
   void set_exception_dispatcher(uint64_t address) { exception_dispatcher_ = address; }
   void request_context_restore(uint64_t address) { context_restore_ = address; context_restore_pending_ = true; }
   bool take_context_restore(uint64_t* address) { *address = context_restore_; const bool p = context_restore_pending_; context_restore_pending_ = false; return p; }
+  // NtTcosWrapped: the thread goes on at `address` instead of after the call, with RCX = R10 (its first argument again) and the other registers as they were
+  // (whoever runs the program applies it after the call: take_resume_at()).
+  void request_resume_at(uint64_t address) { resume_at_ = address; resume_pending_ = true; }
+  bool take_resume_at(uint64_t* address) { *address = resume_at_; const bool p = resume_pending_; resume_pending_ = false; return p; }
 
   // --- threads (Windows). The table lives here; the runtime starts the CPU's threads.
   static constexpr uint32_t kMaxThreads = 64;
@@ -470,6 +474,8 @@ class Process {
   bool fs_changed_ = false, gs_changed_ = false;
   uint64_t exception_dispatcher_ = 0, context_restore_ = 0;
   bool context_restore_pending_ = false;
+  uint64_t resume_at_ = 0;
+  bool resume_pending_ = false;
   AddressSpace* space_ = nullptr;
   uint64_t heap_start_ = 0, heap_break_ = 0, mmap_cursor_ = 0x00007F0000000000ull;
   ProcessFiles files_;

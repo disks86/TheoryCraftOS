@@ -21,6 +21,7 @@
 #include <cstdlib>
 #include <string>
 #include <vector>
+#include "Process/AddressSpace.hpp"
 #include "Process/Process.hpp"
 #include "Process/Syscall.hpp"
 #include "Process/WindowsException.hpp"
@@ -212,6 +213,52 @@ static void test_services() {
   CHECK(p.exception_dispatcher() == 0x180001000);
 }
 
+struct MallocAllocator final : allocators::IAllocator {
+  void* allocate(uint64_t size) override { return malloc(size); }
+  void* allocate_aligned(uint64_t size, uint64_t align) override { return aligned_alloc(align, (size + align - 1) / align * align); }
+  void deallocate(void* p) override { free(p); }
+};
+
+// NtTcosWrapped: a Windows-shaped stub of a function ntdll.dll implements in C; the address after its RET says where the thread goes on (the C function).
+static void test_wrapped_stub() {
+  FakeMemory mem;
+  Host host;
+  MallocAllocator allocator;
+  AddressSpace space(allocator);
+  constexpr uint64_t kCode = 0x180001000ull, kData = 0x180010000ull;
+  CHECK(space.map(kCode, 0x1000, kProtRead | kProtExecute) && space.map(kData, 0x1000, kProtRead | kProtWrite));
+  Process p(1, ProcessBinding{SyscallAbi::Windows, UserArch::X86_64, syscall_interface(SyscallAbi::Windows, UserArch::X86_64)}, mem, host);
+  p.attach_address_space(space, 0x10000000);
+  const ISyscallInterface* iface = syscall_interface(SyscallAbi::Windows, UserArch::X86_64);
+  // the stub at kBase + 0x3000: 4C 8B D1 | B8 01 02 00 00 | 0F 05 | C3 | <address of the C function>
+  const uint64_t stub = kBase + 0x3000;
+  const uint8_t head[11] = {0x4C, 0x8B, 0xD1, 0xB8, 0x01, 0x02, 0x00, 0x00, 0x0F, 0x05, 0xC3};
+  for (int i = 0; i < 11; ++i) mem.bytes[stub - kBase + i] = head[i];
+  mem.put64(stub + 11, kCode + 0x40);
+  SyscallRequest r;
+  r.number = uint64_t(WindowsSyscallNumber::NtTcosWrapped);
+  r.user_pc = stub + 10;      // (after SYSCALL: the RET)
+  r.args[0] = 0x1111;
+  uint64_t where = 0;
+  CHECK(iface->dispatch(p, r) == 0 && p.take_resume_at(&where) && where == kCode + 0x40 && !p.take_resume_at(&where));
+  // a decoded SYSCALL knows where it was made: RCX
+  X86UserRegisters regs;
+  regs.rax = uint64_t(WindowsSyscallNumber::NtTcosWrapped); regs.rcx = stub + 10; regs.r10 = 0x1111;
+  SyscallRequest decoded;
+  CHECK(decode_x86_64(SyscallAbi::Windows, regs, &decoded) && decoded.user_pc == stub + 10 && decoded.args[0] == 0x1111);
+  // never to data, nor to what is not mapped, nor from a stub that cannot be read
+  mem.put64(stub + 11, kData);
+  CHECK(iface->dispatch(p, r) == 0xC0000005u && !p.take_resume_at(&where));
+  mem.put64(stub + 11, 0x7000000000ull);
+  CHECK(iface->dispatch(p, r) == 0xC0000005u && !p.take_resume_at(&where));
+  r.user_pc = kBase + kSize - 4;      // (its 8 bytes run past the memory)
+  CHECK(iface->dispatch(p, r) == 0xC0000005u && !p.take_resume_at(&where));
+  r.user_pc = ~uint64_t{0} - 2;      // (wraps)
+  CHECK(iface->dispatch(p, r) == 0xC0000005u && !p.take_resume_at(&where));
+  r.user_pc = 0;
+  CHECK(iface->dispatch(p, r) == 0xC0000005u && !p.take_resume_at(&where));
+}
+
 // ---- a 32-bit program (i386): its own CONTEXT (0x2CC bytes) and EXCEPTION_RECORD (0x50 bytes) ----
 static ProcessBinding binding32() { return ProcessBinding{SyscallAbi::Windows, UserArch::X86_32, syscall_interface(SyscallAbi::Windows, UserArch::X86_32)}; }
 static X86Context registers32() {
@@ -355,6 +402,7 @@ static void test_flips32() {
 }
 
 int main() {
+  test_wrapped_stub();
   test_mapping();
   test_dispatch();
   test_apply();

@@ -238,6 +238,11 @@ static void test_settings(void) {
   PROCESS_MITIGATION_STRICT_HANDLE_CHECK_POLICY got = {0};
   check(GetProcessMitigationPolicy(GetCurrentProcess(), ProcessStrictHandleCheckPolicy, &got, sizeof(got)) && got.RaiseExceptionOnInvalidHandleReference == 1, "the policy stays set");
   check(!SetProcessMitigationPolicy(ProcessStrictHandleCheckPolicy, &sh, 3), "a wrong size is refused");
+  /* ProcessMitigationOptionsMask (5): what CreateProcess takes, in 8, 16 or 24 bytes (Chromium's sandbox asks with 16 before it starts a child) */
+  ULONG64 options[3] = {0, 0, 0};
+  check(GetProcessMitigationPolicy(GetCurrentProcess(), (PROCESS_MITIGATION_POLICY)5, options, 16) && options[0] != 0 && options[1] != 0 && options[2] == 0, "the options mask");
+  check(GetProcessMitigationPolicy(GetCurrentProcess(), (PROCESS_MITIGATION_POLICY)5, options, 8) && GetProcessMitigationPolicy(GetCurrentProcess(), (PROCESS_MITIGATION_POLICY)5, options, 24), "the options mask, 8 and 24 bytes");
+  check(!GetProcessMitigationPolicy(GetCurrentProcess(), (PROCESS_MITIGATION_POLICY)5, options, 12), "the options mask, a wrong size");
   MEMORY_PRIORITY_INFORMATION mp = {MEMORY_PRIORITY_LOW};
   check(SetProcessInformation(GetCurrentProcess(), ProcessMemoryPriority, &mp, sizeof(mp)), "SetProcessInformation memory priority");
   MEMORY_PRIORITY_INFORMATION back = {0};

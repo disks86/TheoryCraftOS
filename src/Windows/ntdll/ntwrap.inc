@@ -31,7 +31,7 @@ static NTSTATUS wrap_open_for_query(POBJECT_ATTRIBUTES attributes, PHANDLE file)
   IO_STATUS_BLOCK iosb;
   return NtOpenFile(file, 0x80 /* FILE_READ_ATTRIBUTES */ | 0x00100000, attributes, &iosb, 7, 0x20 /* FILE_SYNCHRONOUS_IO_NONALERT */ | 0x00004000 /* FILE_OPEN_FOR_BACKUP_INTENT */);
 }
-EXPORT NTSTATUS NTAPI NtQueryFullAttributesFile(POBJECT_ATTRIBUTES attributes, PVOID information) {
+TCOS_WRAPPED_EXPORT NTSTATUS NTAPI TCOS_WRAPPED_NAME(NtQueryFullAttributesFile)(POBJECT_ATTRIBUTES attributes, PVOID information) {
   HANDLE file = NULL;
   NTSTATUS status = wrap_open_for_query(attributes, &file);
   if (!NT_SUCCESS(status)) return status;

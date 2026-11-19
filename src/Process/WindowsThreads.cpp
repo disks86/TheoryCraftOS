@@ -812,13 +812,8 @@ uint32_t nt_query_information_thread(Process& p, const SyscallRequest& r) {
 // only has to name a core that exists), and hiding from a debugger (17: nothing to hide from).
 uint32_t nt_set_information_thread(Process& p, const SyscallRequest& r) {
   if (thread_handle_lacks(p, r.args[0], uint32_t(r.args[1]) == 38 ? (0x20 | 0x400) : 0x20)) return 0xC0000022u;      // THREAD_SET_INFORMATION (THREAD_SET_LIMITED_INFORMATION is enough to name a thread)
-  uint64_t remote_id = 0;
-  if (remote_thread_handle(p, r.args[0], &remote_id)) return kSuccess;      // (the scheduling of another program's thread is that program's own: accepted, not applied)
-  Process::ThreadRecord* record = thread_of(p, r.args[0]);
-  if (!record) return kInvalidHandle;
   const uint32_t info_class = uint32_t(r.args[1]), length = uint32_t(r.args[3]);
-  uint8_t in[16] = {};
-  if (info_class == 5) {      // ThreadImpersonationToken: the thread impersonates the token (0: it stops)
+  if (info_class == 5) {      // ThreadImpersonationToken: the thread impersonates the token (0: it stops); any thread, another program's too (the token service finds it)
     if (length != 8) return kInfoLengthMismatch;
     uint64_t token = 0;
     if (!p.read_user_u64(r.args[2], &token)) return kAccessViolation;
@@ -829,6 +824,11 @@ uint32_t nt_set_information_thread(Process& p, const SyscallRequest& r) {
     forward.user_stack = r.user_stack;
     return nt_tcos_token(p, forward);
   }
+  uint64_t remote_id = 0;
+  if (remote_thread_handle(p, r.args[0], &remote_id)) return kSuccess;      // (the scheduling of another program's thread is that program's own: accepted, not applied)
+  Process::ThreadRecord* record = thread_of(p, r.args[0]);
+  if (!record) return kInvalidHandle;
+  uint8_t in[16] = {};
   if (info_class == 38) {      // ThreadNameInformation: the name is what the UNICODE_STRING in the buffer points to
     if (length != 16) return kInfoLengthMismatch;
     uint8_t head[16];

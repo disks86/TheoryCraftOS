@@ -2545,7 +2545,8 @@ uint32_t ObjectManager::job_set(uint32_t job, const JobInfo& in, bool extended) 
   if (in.limit_flags & ~kJobLimitAll) return kInvalid;
   if ((in.limit_flags & kJobLimitKillOnClose) && !extended) return kInvalid;      // (only the extended structure can ask for it)
   if ((in.limit_flags & kJobLimitBreakawayOk) && (in.limit_flags & kJobLimitSilentBreakawayOk)) { /* both are allowed */ }
-  if ((in.limit_flags & kJobLimitActiveProcess) && in.active_limit == 0) return kInvalid;
+  // (an active process limit of 0 is allowed, as on Windows: no process can join any more, the ones in the job stay. Chromium's sandbox sets it once its
+  // child is in the job.)
   if ((in.limit_flags & kJobLimitAffinity) && in.affinity == 0) return kInvalid;
   if ((in.limit_flags & kJobLimitPriorityClass) && (in.priority_class < 1 || in.priority_class > 6) && in.priority_class != 0x20 && in.priority_class != 0x40 && in.priority_class != 0x80 && in.priority_class != 0x100 && in.priority_class != 0x4000 && in.priority_class != 0x8000) return kInvalid;
   JobInfo& d = j->info;

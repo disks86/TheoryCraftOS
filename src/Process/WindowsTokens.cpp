@@ -263,6 +263,16 @@ bool thread_of(Process& p, uint64_t handle, uint64_t* tid) {
   if (handle == kCurrentThread || handle == 0) { *tid = p.runtime() ? p.runtime()->current_thread_id() : p.id(); return true; }
   if (remote_thread_handle(p, handle, tid)) return true;
   uint64_t slot = 0;
+  {      // the thread handle CreateProcess gave out: the new process's object, whose id is also the id of its main thread (Chromium's sandbox gives that
+         // thread an impersonation token before it lets the process run)
+    bool exited = false;
+    uint32_t code = 0;
+    uint64_t pid = 0;
+    if (process_handle_info(p, handle, &exited, &code, &pid) && pid != p.id()) {
+      *tid = pid;
+      return true;
+    }
+  }
   if (!slot_of(handle, &slot) || p.files().kind(slot) != DescriptorKind::Thread) return false;
   *tid = p.files().token(slot);
   return true;

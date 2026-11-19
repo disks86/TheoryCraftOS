@@ -35,19 +35,29 @@ __asm__(".text\n.globl ___chkstk_ms\n___chkstk_ms:\n ret\n");
  * generated wow64_services.inc), so the stub macros below make nothing. The services the kernel has no code for are not exported. */
 #define NT_SERVICE(name)
 #define NT_SERVICE_RAW(name)
+#define NT_SERVICE_WRAPPED(name)
 #define ZW_SERVICE(nt, zw)
 #define ZW_ALIAS(nt, zw)
 #include "wow64.inc"
 #else
-/* The service stubs: "mov r10, rcx; mov eax, number; syscall; ret". Arguments past the fourth stay on the stack where the caller put them. */
+/* The service stubs: "mov r10, rcx; mov eax, number; syscall; ret". Arguments past the fourth stay on the stack where the caller put them. They have the bytes and
+ * the size of Windows' (4C 8B D1 B8 <number> 0F 05 C3, 32 bytes each): programs read them (Chromium's sandbox copies a stub into its child and writes a jump over
+ * the first 16 bytes, which must not reach the next stub). */
+#define NT_STUB_START(name) ".text\n.p2align 5, 0xcc\n.globl " #name "\n" #name ":\n .byte 0x4c, 0x8b, 0xd1\n"
+#define NT_STUB_END ".p2align 5, 0xcc\n"
 #define NT_SERVICE(name)                                                                                                                                      \
-  __asm__(".text\n.globl " #name "\n" #name ":\n mov %rcx, %r10\n mov $" _STR(NT_SERVICE_##name) ", %eax\n syscall\n ret\n.section .drectve\n.ascii \" -export:" #name "\"\n.text\n")
+  __asm__(NT_STUB_START(name) " mov $" _STR(NT_SERVICE_##name) ", %eax\n syscall\n ret\n" NT_STUB_END ".section .drectve\n.ascii \" -export:" #name "\"\n.text\n")
+/* The exported name of a service ntdll.dll implements in C (TCOS_WRAPPED_NAME in tcos_syscalls.h): the same stub with the number of NtTcosWrapped, and the C
+ * function's address in the 8 bytes after the RET, where the kernel finds it and goes on there. */
+#define NT_SERVICE_WRAPPED(name)                                                                                                                              \
+  __asm__(NT_STUB_START(name) " mov $" _STR(NT_SERVICE_NtTcosWrapped) ", %eax\n syscall\n ret\n .quad TcosWrapped" #name "\n" NT_STUB_END                     \
+          ".section .drectve\n.ascii \" -export:" #name "\"\n.text\n")
 /* The services that can end with STATUS_USER_APC are called through wrappers below that run the queued APCs first; these are the bare stubs. */
 #define NT_SERVICE_RAW(name)                                                                                                                                  \
   __asm__(".text\n.globl Raw" #name "\nRaw" #name ":\n mov %rcx, %r10\n mov $" _STR(NT_SERVICE_##name) ", %eax\n syscall\n ret\n.text\n")
 /* A Zw name of a service: in user mode it is the same call as the Nt one. */
 #define ZW_SERVICE(nt, zw)                                                                                                                                    \
-  __asm__(".text\n.globl " #zw "\n" #zw ":\n mov %rcx, %r10\n mov $" _STR(NT_SERVICE_##nt) ", %eax\n syscall\n ret\n.section .drectve\n.ascii \" -export:" #zw "\"\n.text\n")
+  __asm__(NT_STUB_START(zw) " mov $" _STR(NT_SERVICE_##nt) ", %eax\n syscall\n ret\n" NT_STUB_END ".section .drectve\n.ascii \" -export:" #zw "\"\n.text\n")
 #define ZW_ALIAS(nt, zw) __asm__(".text\n.globl " #zw "\n" #zw ":\n jmp " #nt "\n.section .drectve\n.ascii \" -export:" #zw "\"\n.text\n")
 #endif
 #define _STR(x) _STR2(x)
@@ -88,6 +98,7 @@ NT_SERVICE(NtSetTimerResolution);
 NT_SERVICE(NtOpenThread);
 NT_SERVICE(NtOpenProcess);
 NT_SERVICE_RAW(NtCreateSection);
+NT_SERVICE_WRAPPED(NtCreateSection);      /* (the C function is in token.c) */
 NT_SERVICE(NtOpenSection);
 NT_SERVICE(NtMapViewOfSection);
 NT_SERVICE(NtUnmapViewOfSection);
@@ -153,6 +164,13 @@ NT_SERVICE(NtAllocateVirtualMemory);
 NT_SERVICE(NtFreeVirtualMemory);
 NT_SERVICE(NtProtectVirtualMemory);
 NT_SERVICE_RAW(NtCreateFile);
+NT_SERVICE_WRAPPED(NtCreateFile);
+/* The other services Chromium's sandbox patches in its children that ntdll.dll implements in C (token.c, ntwrap.inc): they have to look like services too. */
+NT_SERVICE_WRAPPED(NtOpenProcessToken);
+NT_SERVICE_WRAPPED(NtOpenProcessTokenEx);
+NT_SERVICE_WRAPPED(NtOpenThreadToken);
+NT_SERVICE_WRAPPED(NtOpenThreadTokenEx);
+NT_SERVICE_WRAPPED(NtQueryFullAttributesFile);
 NT_SERVICE(NtOpenFile);
 NT_SERVICE(NtQueryInformationFile);
 NT_SERVICE(NtSetInformationFile);
@@ -705,7 +723,7 @@ static BOOL console_device_name(const UNICODE_STRING *name, LONG *kind) {
 }
 extern void NTAPI RtlTcosNewObjectSecurity(HANDLE handle, const OBJECT_ATTRIBUTES *attributes, BOOLEAN container, int kind);
 extern NTSTATUS NTAPI RawNtCreateFile(PHANDLE, ULONG, POBJECT_ATTRIBUTES, PIO_STATUS_BLOCK, PLARGE_INTEGER, ULONG, ULONG, ULONG, ULONG, PVOID, ULONG);
-EXPORT NTSTATUS NTAPI NtCreateFile(PHANDLE handle, ULONG access, POBJECT_ATTRIBUTES attributes, PIO_STATUS_BLOCK iosb, PLARGE_INTEGER size, ULONG file_attributes, ULONG share, ULONG disposition,
+TCOS_WRAPPED_EXPORT NTSTATUS NTAPI TCOS_WRAPPED_NAME(NtCreateFile)(PHANDLE handle, ULONG access, POBJECT_ATTRIBUTES attributes, PIO_STATUS_BLOCK iosb, PLARGE_INTEGER size, ULONG file_attributes, ULONG share, ULONG disposition,
                                    ULONG options, PVOID ea, ULONG ea_length) {
   LONG kind;
   if (attributes && attributes->Length >= sizeof(OBJECT_ATTRIBUTES) && !attributes->RootDirectory && handle && iosb && console_device_name(attributes->ObjectName, &kind)) {
