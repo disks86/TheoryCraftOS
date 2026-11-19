@@ -207,7 +207,14 @@ struct Model final : INvRegisters {
       return;
     }
     // PUT
-    if (pre() && off == 0x640000) { core.put = v; process(core, push_address(0), false, 0); return; }
+    if (pre() && off == 0x640000) {
+      // (written while the channel is being set up again, PUT-enable on but not started: the channel's pointers start over, GET with PUT)
+      const uint32_t ctrl = regs[cls == DisplayClass::Nv50 ? 0x610200 : 0x610490];
+      if ((ctrl & 0x10) && (ctrl & 3) != 3) { core.put = core.get = v; return; }
+      core.put = v;
+      process(core, push_address(0), false, 0);
+      return;
+    }
     if (!pre() && off == 0x680000) { core.put = v; process(core, push_address(0), false, 0); return; }
     if (!pre() && off >= 0x690000 && off < 0x690000 + 32 * 0x1000 && (off & 0xfff) == 0) {
       const uint32_t w = (off - 0x690000) / 0x1000;

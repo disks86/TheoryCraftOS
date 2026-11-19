@@ -128,6 +128,8 @@ bool NvidiaNative::run_post() {
 #else
   in.dry_run = true;                                        // (MMIO reads only: what would be written is counted, not written)
 #endif
+  // Turing and later: post() only waits for the GPU's own firmware (GFW_BOOT) and writes nothing, so it waits for real either way.
+  if (chip_.card_type >= 0x160) in.dry_run = false;
   post_ = NvDevinit::post(in);
   return post_.outcome == PostOutcome::Ran || post_.outcome == PostOutcome::AlreadyPosted || post_.outcome == PostOutcome::DryRun;
 }

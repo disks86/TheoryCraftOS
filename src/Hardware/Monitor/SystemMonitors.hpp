@@ -28,9 +28,18 @@
 // fit, and the desktop the programs see ("logical", the monitors' rectangles at their scales and places) is mapped onto it by whoever presents
 // the pictures (MonitorDisplay). The size of both can change at any time; a monitor pulled out keeps its place (disabled) and gets it back when
 // plugged in again; one that was not there at start-up is listed but not used until the next start, because there is no room for it.
+//
+// Several GPUs: the display device comes first (its monitors keep the ids and the order they have on a machine with one GPU), then every other GPU
+// that has a display driver (add_gpu(), before initialize()): its monitors from its IMonitorSource, or its whole screen as one monitor when it has
+// none. They go to the right of the display device's in the default row, and are arranged, scaled and given modes like any other; a mode change
+// goes to that GPU's driver (IMonitorSource::set_display_mode() or IGraphicsProcessingUnit::set_mode()). Each GPU has a surface of its own (its
+// monitors' pixels in a row, starting at 0): physical_placements() gives each monitor's place on its own GPU's surface, and targets() says which
+// monitors are not on the display device, so that MonitorDisplay copies their part of the desktop to their GPU's screen. A monitor's id says which
+// GPU it is on: the display device's are its connector numbers, the k-th other GPU's are k * kIdsPerGpu + connector.
 #pragma once
 #include "Hardware/GraphicsProcessingUnit/IGraphicsProcessingUnit.hpp"
 #include "Hardware/Monitor/Monitor.hpp"
+#include "Hardware/Monitor/MonitorDisplay.hpp"
 #include "Hardware/Monitor/MonitorLayout.hpp"
 #include "ObjectContainer/List.hpp"
 
@@ -42,8 +51,22 @@ class SystemMonitors {
   static constexpr uint64_t kMaxDesktopPixels = 16u << 20;
   static constexpr uint32_t kMaxMonitorWidth = 3840, kMaxMonitorHeight = 2400;
 
+  // How many GPUs the desktop can span (the display device and the others), and the id range each has.
+  static constexpr uint32_t kMaxGpus = 8;
+  static constexpr uint32_t kIdsPerGpu = IMonitorSource::kMaxConnectors;
+
   // `gpu` may be null (no monitors then). It must outlive this object.
-  SystemMonitors(IGraphicsProcessingUnit* gpu, allocators::IAllocator& allocator) : gpu_(gpu), monitors_(allocator), layout_(allocator) {}
+  SystemMonitors(IGraphicsProcessingUnit* gpu, allocators::IAllocator& allocator) : gpu_(gpu), monitors_(allocator), layout_(allocator) {
+    sources_[0].gpu = gpu;
+  }
+
+  // The display device's index in the machine's GPU list (GpuPool), recorded in its monitors (default 0).
+  void set_display_gpu_index(uint32_t gpu_index) { sources_[0].gpu_index = gpu_index; }
+  // Another GPU with a display driver whose monitors the desktop spans too (`gpu_index`: its index in GpuPool). Call before initialize(). False if
+  // `gpu` is null or the display device, or kMaxGpus are there. `gpu` must outlive this object.
+  [[nodiscard]] bool add_gpu(IGraphicsProcessingUnit* gpu, uint32_t gpu_index);
+  // The display device and the GPUs added.
+  uint32_t gpu_count() const { return source_count_; }
 
   void initialize();
 
@@ -56,13 +79,24 @@ class SystemMonitors {
   const MonitorLayout& layout() const { return layout_; }
   // True if the display device can show more than one monitor.
   bool multi_display() const { return multi_; }
+  // The GPU that drives a monitor (its index in GpuPool), its driver and the driver's name; the display device's for an unknown id.
+  uint32_t gpu_of(uint32_t id) const { return sources_[source_index(id)].gpu_index; }
+  IGraphicsProcessingUnit* device_of(uint32_t id) const { return sources_[source_index(id)].gpu; }
+  const char* device_name(uint32_t id) const;
+  // True when some monitor in use is on another GPU than the display device.
+  bool spans_gpus() const;
+  // The monitors in use that another GPU drives (for MonitorDisplay::update(); no guards are filled in). Returns how many.
+  uint32_t targets(MonitorTarget* out, uint32_t capacity) const;
+  // The size of the surface of the GPU that drives monitor `id`, as last applied.
+  uint32_t surface_width_of(uint32_t id) const { return source_index(id) == 0 ? surface_width_ : sources_[source_index(id)].surface_width; }
+  uint32_t surface_height_of(uint32_t id) const { return source_index(id) == 0 ? surface_height_ : sources_[source_index(id)].surface_height; }
 
   // Makes the display device show the layout: the surface is built to hold every enabled monitor's pixels in a row, and each monitor shows its
   // part of it. The desktop (the layout's bounds) keeps its own size. False if the device cannot (it keeps showing what it showed, and only the
   // primary monitor is in use).
   bool apply();
   // Where each enabled monitor's pixels are on the surface: a row in the order of the monitors' places (left to right, then top to bottom), tops
-  // aligned. Fills `out` and returns how many.
+  // aligned; one row per GPU, each on that GPU's own surface. `connector` is the monitor's id. Fills `out` and returns how many.
   uint32_t physical_placements(ScanoutPlacement* out, uint32_t capacity) const;
   // The size of the surface (the pixels of all the monitors side by side) as last applied; and whether the desktop has to be drawn to one size and
   // shown on the surface at another (some monitor scaled, or the monitors not in a row of equal tops): then a MonitorDisplay does the copying.
@@ -78,7 +112,7 @@ class SystemMonitors {
   // The refresh rates (thousandths of a hertz, highest first) the monitor takes at that resolution and the device can set. A device that cannot set
   // the rate gives just the one in use; 0 stands for "not known".
   uint32_t compatible_refresh_rates(uint32_t id, uint32_t width, uint32_t height, uint32_t* out, uint32_t capacity) const;
-  bool can_set_refresh(uint32_t id) const { return source_ && source_->can_set_refresh(id); }
+  bool can_set_refresh(uint32_t id) const;
   // The scales (percent) that leave the desktop of the monitor at least 640x480 (at its resolution, or at `width` x `height` when given): 100, 125, 150,
   // 175, 200, 250, 300, 400.
   uint32_t compatible_scales(uint32_t id, uint32_t* out, uint32_t capacity, uint32_t width = 0, uint32_t height = 0) const;
@@ -109,7 +143,7 @@ class SystemMonitors {
   // Shows the layout again after it was edited (monitors reordered, another one made primary); the desktop surface keeps its size, so only the
   // rectangles the monitors show change. False if the device cannot.
   bool reapply();
-  // Looks for monitors that came or went. True if anything changed; the layout is updated (and shown) to match.
+  // Looks for monitors that came or went (on every GPU). True if anything changed; the layout is updated (and shown) to match.
   bool poll();
   // The size of the desktop - the layout's bounds, in the units the programs draw in - as last applied (0 before apply()).
   uint32_t desktop_width() const { return desktop_width_; }
@@ -120,16 +154,37 @@ class SystemMonitors {
   uint32_t generation() const { return generation_; }
 
  private:
-  void add_connector(uint32_t index, const ConnectorInfo& info);
+  // A GPU whose monitors are on the desktop: [0] is the display device (gpu_, source_ and multi_ are its), the others were added.
+  struct Source {
+    IGraphicsProcessingUnit* gpu = nullptr;
+    IMonitorSource* source = nullptr;
+    uint32_t gpu_index = 0;
+    bool multi = false;
+    uint32_t surface_width = 0, surface_height = 0;
+  };
+
+  uint32_t source_index(uint32_t id) const {
+    const uint32_t s = id / kIdsPerGpu;
+    return s < source_count_ ? s : 0;
+  }
+  static uint32_t connector_of(uint32_t id) { return id % kIdsPerGpu; }
+  void add_connector(uint32_t source, uint32_t index, const ConnectorInfo& info);
+  uint32_t fallback_number(uint32_t id) const;
+  void enumerate(uint32_t source);
+  bool poll_source(uint32_t source);
   Monitor* find_mutable(uint32_t id);
   bool add_to_layout(uint32_t id);
   uint32_t best_refresh(const Monitor& monitor, uint32_t width, uint32_t height) const;
   MonitorMode mode_for(const Monitor& monitor) const;
-  bool show();
-  bool sync_device_mode();
+  bool show() { return show_source(0); }
+  bool show_source(uint32_t source);
+  bool show_secondaries();
+  bool sync_device_mode(uint32_t source = 0);
 
   IGraphicsProcessingUnit* gpu_;
   IMonitorSource* source_ = nullptr;
+  Source sources_[kMaxGpus];
+  uint32_t source_count_ = 1;
   List<Monitor> monitors_;
   MonitorLayout layout_;
   bool multi_ = false;

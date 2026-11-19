@@ -86,7 +86,7 @@ class Dpcd {
     bool coding_8b10b = false;             // DP_MAIN_LINK_CHANNEL_CODING: 8b/10b
     uint8_t edp_revision = kNoEdp;         // DP_EDP_DPCD_REV when read for an eDP connector: 0 is 1.1, 1 is 1.2, 2 is 1.3, 3 is 1.4
     uint32_t edp_rate_count = 0;           // the eDP panel's own link rates (eDP 1.4), the ones listed before the first zero
-    uint32_t edp_rates_khz[kMaxEdpRates] = {};   // each a link rate per lane in kHz (the register's 200 kHz units times 200): 162000, 270000, 540000, ...
+    uint32_t edp_rates_khz[kMaxEdpRates] = {};   // each the link clock in kHz, as max_link_rate_khz() (the register's 200 kHz bit-rate units * 200 / 10): 162000, 270000, 540000, ...
 
     uint32_t max_link_rate_khz() const { return uint32_t{max_link_rate_code} * 27000; }          // the link clock the DRM helpers use: 162000, 270000, 540000, 810000
     uint32_t max_link_rate_kbps() const { return uint32_t{max_link_rate_code} * 270000; }    // per lane, raw bits per second / 1000 (0x0A: 2 700 000)

@@ -131,6 +131,13 @@ static bool crtc_switch(AtomBios& bios, uint32_t table, uint8_t crtc, bool on) {
 bool AmdModeSet::enable_crtc(uint8_t crtc, bool enable) { return crtc_switch(bios_, kEnableCrtc, crtc, enable); }
 bool AmdModeSet::lock_crtc(uint8_t crtc, bool lock) { return crtc_switch(bios_, kUpdateDoubleBuffer, crtc, lock); }
 bool AmdModeSet::powergate_crtc(uint8_t crtc, bool enable) { return crtc_switch(bios_, kEnableDispPowerGating, crtc, enable); }
+bool AmdModeSet::powergate_init() {
+  constexpr uint32_t kAtomInit = 7;     // ATOM_INIT
+  uint8_t crev = 0;
+  if (!revision(bios_, kEnableDispPowerGating, &crev)) return false;
+  uint32_t words[1] = {kAtomInit << 8};
+  return run(bios_, kEnableDispPowerGating, words, 1);
+}
 
 // BLANK_CRTC_PARAMETERS, 8 bytes: ucCRTC, ucBlanking (ATOM_BLANKING 1, ATOM_BLANKINGOFF 0), the black colour as three words (zero)
 bool AmdModeSet::blank_crtc(uint8_t crtc, bool blank) {

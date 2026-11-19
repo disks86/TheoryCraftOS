@@ -494,7 +494,7 @@ INIT_PLL, delegation, dry run); the image cut at every length and 400 images wit
 
 ### GM20x to Volta: devinit on the PMU (`NvDevinit::post`)
 
-`gm200_devinit_post` as nouveau does it, for chipsets 0x120 .. 0x140 (GM20x, GP100, GP10x, GV100; Turing+ stays refused):
+`gm200_devinit_post` as nouveau does it, for chipsets 0x120 .. 0x140 (GM20x, GP100, GP10x, GV100; Turing+ waits for the GPU's own boot instead, below):
 
 1. Checks, before anything is written: BIT 'I' version 1 with at least 0x1c bytes, its +0x14/+0x16 (init tables) and +0x18/+0x1a (boot
    scripts) ranges inside the image, and a usable DEVINIT application (`find_pmu_app(bios, kPmuAppDevinit)`: BIT 'p' version 2's table,
@@ -522,6 +522,27 @@ tags, DMEM contents including the whole last word, the start after the uploads, 
 engine-reset chips, GP100, the timeout, a stuck scrub, an application or table target that does not fit, dry run, POSTed / forced,
 the refusals, Turing; the image cut at every length and 400 bit-flipped tables (live and dry).
 
+### Turing and later: waiting for GFW_BOOT (`NvDevinit::post`)
+
+From TU10x on, the GPU boots itself after every reset: its ROM's FWSEC firmware (signed, run by the GPU's security processor) executes the
+devinit scripts, and the host may not. nouveau's `tu102_devinit_post` therefore only waits (`tu102_devinit_wait`), and nova-core does the
+same (`gfw.rs`, `wait_gfw_boot_completion`). `post()` for `card_type >= 0x160`:
+
+1. Poll `NV_PGC6_AON_SECURE_SCRATCH_GROUP_05_PRIV_LEVEL_MASK` (0x118128) until bit 0 (`read_protection_level0`: FWSEC lowered the group's
+   read protection) is set; only then read `NV_PGC6_AON_SECURE_SCRATCH_GROUP_05_0` (0x118234), whose bits 7:0 are the GFW boot progress,
+   0xff when done.
+2. Every `gfw_poll_us` (1 ms) for at most `gfw_timeout_us` (4 s, nova-core's figure; nouveau allows about 2 s).
+3. Done at the first read: `AlreadyPosted`; done while waiting: `Ran`; not in time: `Failed` (the reason says whether the protection was
+   never lowered or the progress stuck, `PostReport::gfw` has the last progress, the polls and the time). 0x118128 reading all ones (no
+   device) is `Failed` at once. A dry run reads once (`AlreadyPosted` or `DryRun`).
+
+Nothing is written, so `NvidiaNative::run_post` does the real wait even in the default build: a Turing/Ampere/Ada dGPU is waited for after
+a D3cold power cut before the probe reads it again. nouveau then starts the VBIOS's PRE_OS application on the PMU (`gm200_devinit_preos`);
+that is not done (on Turing+ the PMU belongs to the firmware; GSP is out of scope).
+
+Confidence in the registers: high. 0x118128 bit 0 and 0x118234 bits 7:0 == 0xff are what nouveau's tu102.c polls and what nova-core's
+`regs.rs` names; the order (protection bit first, then the progress) is nova-core's. Not validated on a real card.
+
 ### Tests (`tests/NvInitScriptTest.cpp`, `tests/run_host_tests.sh NvInitScriptTest`)
 
 A Kepler image from `NvBiosImages.hpp` with an init table, condition / I/O condition / macro / xlat tables, a BIT 'M' entry and
@@ -533,7 +554,7 @@ JUMP through post, delays and their caps, PLL/I2C/I2C_IF/AUX/GPIO/GPIO_NE/COMPUT
 dry run giving the same write sequence as the live run, parse mode; endless JUMP, recursive SUB / SUB_DIRECT, nested REPEATs, unknown
 opcode, delay budget; the sample image cut at every length and 400 images with random bit flips (ASan/UBSan); post() for a not-POSTed
 Kepler, a POSTed one (and forced), the CRTC fallback, Tesla with and without VGA access, dry run, the refused generations, a failing
-script, an image without an init table.
+script, an image without an init table; the Turing+ GFW_BOOT wait (`test_gfw_boot`).
 
 ### Not done / unverified
 
@@ -543,6 +564,8 @@ script, an image without an init table.
   limits (VPLLs only from GT215 on, as nouveau). No GPIO reset, no NV04-era memory init, INIT_CONFIGURE_MEM/CLK on BIOS major <= 2 stop
   with `Unsupported`.
 - nv50_devinit_init's per-output encoder scripts (`PostReport::encoder_scripts_pending`) are left to the display code.
+- Turing+ GFW_BOOT wait: tested against a register model (done at once, after some polls, never, read-protected for good, dry run, a dead
+  GPU, uneven poll intervals, TU104/GA102/AD104); PRE_OS is not started afterwards.
 - GM20x/Pascal/Volta PMU devinit: tested against a falcon model only (the register layout follows nouveau's gm200.c/falcon code; no
   real VBIOS DEVINIT application has been run). `NvPllInitHooks` is not wired into `NvidiaNative`/`NvidiaGpu` yet (the coordinator's
   part); `NvidiaNative::run_post` reaches the PMU path through `post()` (a dry run in the default build).
@@ -567,7 +590,7 @@ yet; the pool holds a power lease for it, so the GPU stays awake while it exists
 4. Maps the first `Bar1LinearVram::linear_bytes_for(vram)` bytes of PCI BAR1 (128 MiB, less with little VRAM) for the CPU.
 5. `NvSecondaryDisplay::start()` (pure: everything through `Inputs`, so the host test drives it against the display model):
    - the display engine's `probe()` (reads only);
-   - the output: the first connected connector with an EDID that is not an internal panel (LVDS/eDP belong to the integrated GPU); of its
+   - the output: the first connected connector with an EDID that is not an internal panel (LVDS/eDP: see "The built-in panel"); of its
      DCB outputs the DisplayPort one when the EDID came over AUX, the TMDS one when it came over DDC (a DP++ port lists both);
    - the modes: every detailed timing of the EDID's base block and CTA extensions (`decode_detailed_timing`, drm_mode_detailed's rules),
      one per size, filtered by what the output carries at 24 bpp (`max_output_clock_khz`: single-link TMDS 165 MHz, dual-link 330 MHz,
@@ -590,6 +613,42 @@ the driven connector (`device_modes`, `set_display_mode`).
 supervisor whose stages are only acknowledged), the display engine's channels stopped and its push buffer, instance memory and notifier
 released, the surface released, and `NvBar::fini()` (bit 31 of 0x001704 and 0x001714 cleared: BAR1 back to its reset state). The BARs' own
 page tables stay in the heap until the next start or the destructor.
+
+### The built-in panel (muxed laptops, `IPanelOutput`)
+
+On a laptop with a display mux the discrete GPU's DCB lists the panel's output (eDP: a DP output on a connector of type 0x47; LVDS: an LVDS
+output on 0x40/0x41). `NvidiaSecondaryGpu` implements `IPanelOutput` (`Multi/GpuMuxPanel.hpp`) for `Multi/GpuMuxSwitch`:
+
+- **Standby**: when `initialize()` finds no external monitor but the DCB has a panel output (`find_panel_output`), it succeeds with nothing lit
+  ("panel standby"), so the pool keeps the driver for the switch (and, through its lease, the GPU awake: a cost only with the flag).
+  `GpuNativeDrivers.cpp` stores `panel_output()` in `GpuNode::panel`.
+- `light_panel()`: refused (`Busy`) while an external monitor is driven (one head at a time); otherwise an `NvSecondaryDisplay` with
+  `Inputs::panel` set (kept once made, lit or not, so its power sequencer remembers when the panel went off): the panel output and its SOR (reads only), BAR1, then `Nvkm/NvPanelPower`: the power line, the waits, the EDID read
+  again over the panel's AUX/DDC (`NvidiaNative::reread_connector`; an eDP panel answers only with power; the connector's EDID from start is
+  the fallback), the modes (LVDS up to 400 MHz as `nouveau_conn_mode_valid`), the mode set with `Request::edp` and `panel_powered`, and the
+  backlight. `NvSecondaryDisplay::panel_result()` says how a failure ended (`NoPanel`, `PowerFailed`, `NoEdid`, `NoMode`, `LinkTraining`,
+  `ModeSet`); everything powered is switched off again.
+- The driver's display lock (a recursive mutex) is held while the display is used or replaced: the switch lights the panel from its own thread
+  while the desktop presents. A lit panel holds it for the whole power sequence.
+- `release_panel()`: the display's `shutdown()`: backlight off, T9, the head blanked and the SOR let go, the channels stopped, BAR1 off, T10, the
+  power line off.
+- **Power** (`NvPanelPower`): DCB GPIO function 0x01 (`DCB_GPIO_PANEL_POWER`) switched on only when it reads off and off again only if it was
+  switched on here (nouveau's `nvkm_dp_enable` / `aux_pwr_pu`); a board without the function gets the waits alone. The waits are the
+  specifications' upper limits, as Linux's `intel_pps.c` falls back to them: eDP T1+T3 210 ms, T8 50, T9 50, T10 500, T11+T12 510; LVDS (SPWG)
+  60 / 200 / 200 / 50 / 510. The power cycle: with `Inputs::now_us` only the rest of T11+T12 since the last power-off, without a clock all of
+  it. nouveau waits 300 ms after an eDP panel's power; the panel's own delays in the VBIOS are not read.
+- **Backlight**: the SOR's PWM as `nouveau_backlight.c`'s `nva3_set_intensity` (0x61c080 divider, 0x61c084 control + SOR x 0x800, bits 31 and
+  30 with the level): the level the panel had, or full; 0 on release. A divider of 0 means the backlight is elsewhere (DPCD, the EC): nothing is
+  written. `[S]` confidence.
+- **eDP link training** (`train_dp_link` in `Nvkm/NvDisplayMode`): the eDP DPCD (revision 0x700); an eDP 1.4 panel's rate table (0x010) is
+  trained on instead of the bandwidth codes, fastest first (nouveau's `dp->rate[]`), each set by DP_LINK_RATE_SET with DP_LINK_BW_SET 0 and
+  on the SOR as rate / 27 MHz (rates that are not a multiple, or above the DCB limit, skipped), the lanes down from the most for each.
+
+Not done: the VBIOS's LVDS/eDP scripts (the LVDS link configuration and IED scripts: an LVDS panel is set up by the mode methods alone),
+the panel's VBIOS power delays, DPCD (eDP AUX) backlight control, a panel without an EDID (the VBIOS LVDS mode table), the panel together with
+an external monitor. `Dpcd::parse_capabilities` (AMD code) multiplies the rate table's entries by 200 into "kHz" (a 1.62 Gbit/s entry,
+8100, becomes 1 620 000, not the 162 000 the rest of the code uses); `train_dp_link` divides such values by 10, so real panels work either
+way, and the tests encode the table in the parser's units.
 
 ### How BAR1 and VRAM are mapped (and why)
 
@@ -640,7 +699,17 @@ invalidate status on top of the model, so the page tables land in the model's VR
   no bad release; a second shutdown writes nothing; a start again works; nothing leaks after destruction.
 - `NvVpllClock`: heads past the fourth and a zero clock refused; no write without a PLL limits table.
 - `NvidiaSecondaryGpu` on the fake card: with the flag, a Kepler with no monitor fails with "no monitor" and takes everything down, an Ampere
-  is refused, no register mapper is refused; without the flag, refused with BAR0 untouched and nothing mapped.
+  is refused, no register mapper is refused; without the flag, refused with BAR0 untouched and nothing mapped. Its `IPanelOutput` on a board
+  without a panel output (`NoPanel`), and without the flag (`NotSupported`, nothing touched).
+- The panel (eDP-1 of the Kepler board as the panel; a power line, an eDP 1.4 sink that answers only with power, an EDID hook): the order
+  power line, T1+T3, first AUX access, mode set, T8, PWM; SOR 3 as DP A; the rate table's 5.4 Gbit/s entry set by index with BW_SET 0 and
+  the SOR at 0x14; the PWM at the panel's old level; shutdown in the order PWM 0, T9, the blanking UPDATE, T10, power line off; restarted at
+  once the whole power cycle first, with a clock only its rest, long after none; a line already on (left on), one that cannot be read back, no
+  line, a stuck line (`PowerFailed`, nothing lit), no PWM; no EDID (`NoEdid`, unpowered again), the EDID from start used, every rate failing
+  (`LinkTraining`), the fastest failing (3.24 Gbit/s, SOR 0x0c), no panel output (`NoPanel`, nothing written); LVDS (the SPWG waits, LVDS
+  protocol on the SOR, no AUX).
+- The display model resets the core channel's GET with PUT when PUT is written while the channel is being set up (before, a second
+  `start()` on one model counted push-buffer errors).
 
 ### Not done / unverified
 
@@ -648,7 +717,7 @@ invalidate status on top of the model, so the page tables land in the model's VR
   confidence there); the display model is typed from the same memory.
 - `NvidiaSecondaryGpu::initialize()` end to end with a monitor is not tested (the fake card's buses answer nothing); its parts are.
 - VBIOS IED scripts (supervisor 2.x / 3.0) and the DP drive-level table: not run / placeholders; some boards need them for TMDS/DP.
-- HDMI 2.0 (scrambling above 340 MHz), infoframes, audio; DP MST; DSC; deep colour; several heads at once; the internal panel.
+- HDMI 2.0 (scrambling above 340 MHz), infoframes, audio; DP MST; DSC; deep colour; several heads at once; the internal panel's gaps above.
 - Hot plug: a monitor plugged in after the driver started is listed (`refresh_connectors`) but not lit; one unplugged keeps its head running.
 - The virtual BARs are not restored after a GPU power cycle (the pool never power-cycles a GPU with a display driver).
 - An `NvBar::init` that fails half-way can leave BAR2 pointing at tables that are then freed.

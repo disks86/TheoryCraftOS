@@ -2084,7 +2084,7 @@ static void test_train_link() {
   auxcard.unpowered_channel = 0;
   // an eDP 1.4 panel with its own rate table (1.62 and 2.7 GHz, in units of 200 kHz at 0x010): set by the index, the bandwidth code written 0, the encoder told the table's rate
   dpcd[0x700] = 0x03;
-  const uint8_t rates[6] = {0x2A, 0x03, 0x46, 0x05, 0x00, 0x00};
+  const uint8_t rates[6] = {0xA4, 0x1F, 0xBC, 0x34, 0x00, 0x00};   // 8100 and 13500
   for (size_t i = 0; i < 6; ++i) dpcd[0x10 + i] = rates[i];
   auxcard.dig_calls.clear();
   auxcard.sink.dpcd_writes.clear();
@@ -2462,7 +2462,7 @@ static void test_read_dpcd() {
   auxcard.unpowered_channel = 0x92;
   rig.card.gfx.set_reg(0x1898, 0x2);
   CHECK(!auxcard.panel_on && vega.read_dpcd(edp, &caps, &status) && auxcard.panel_on && auxcard.panel_writes == 1 && auxcard.panel_params == 0x0C000000u);
-  CHECK(caps.edp_revision == 3 && caps.edp_rate_count == 2 && caps.edp_rates_khz[0] == 1620000 && caps.edp_rates_khz[1] == 2160000);
+  CHECK(caps.edp_revision == 3 && caps.edp_rate_count == 2 && caps.edp_rates_khz[0] == 162000 && caps.edp_rates_khz[1] == 216000);
   CHECK(auxcard.sink.requests.back().channel == 0x92 && auxcard.sink.requests.back().hpd == 0);
   auxcard.unpowered_channel = 0;
   // a DisplayPort connector does not read the eDP registers

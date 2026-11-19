@@ -360,6 +360,56 @@ NvPmuAppStatus find_pmu_app(const NvBios& bios, uint8_t type, NvPmuApp* out) {
   return NvPmuAppStatus::NotFound;
 }
 
+namespace {
+
+// tu102_devinit_wait (nouveau) / wait_gfw_boot_completion (nova-core gfw.rs): nothing is written, FWSEC does the work.
+PostReport gfw_boot_wait(const PostInputs& in, PostReport& report) {
+  INvRegisters& r = *in.registers;
+  GfwBootReport& g = report.gfw;
+  g.used = true;
+  const uint32_t step = in.gfw_poll_us ? in.gfw_poll_us : 1;
+  for (;;) {
+    ++g.polls;
+    const uint32_t level = r.read32(NvDevinit::kDevinitStatusTu102);
+    if (level == 0xFFFFFFFFu) {
+      report.outcome = PostOutcome::Failed;
+      report.reason = "the GPU does not answer (0x118128 reads all ones)";
+      return report;
+    }
+    g.protection_lowered = (level & NvDevinit::kGfwReadLevel0) != 0;
+    if (g.protection_lowered) {
+      // (read only once the protection is lowered: before that the scratch group reads as a priv error, not the progress)
+      g.progress = r.read32(NvDevinit::kDevinitDoneTu102) & NvDevinit::kGfwProgressMask;
+      g.completed = g.progress == NvDevinit::kGfwProgressDone;
+    }
+    if (g.completed) {
+      report.needed = g.polls > 1;
+      report.outcome = g.polls == 1 ? PostOutcome::AlreadyPosted : PostOutcome::Ran;
+      report.reason = g.polls == 1 ? "Turing+: the GPU's firmware had already finished its boot (GFW_BOOT 0xff)"
+                                   : "Turing+: the GPU's firmware finished its boot while we waited (GFW_BOOT 0xff)";
+      report.posted_after_known = true;
+      report.posted_after = true;
+      return report;
+    }
+    report.needed = true;
+    if (in.dry_run) {
+      report.outcome = PostOutcome::DryRun;
+      report.reason = g.protection_lowered ? "Turing+: the GPU's firmware has not finished its boot (dry run: read once, no wait)"
+                                           : "Turing+: GFW_BOOT is still read-protected (dry run: read once, no wait)";
+      return report;
+    }
+    if (g.waited_us >= in.gfw_timeout_us) break;
+    r.delay_us(step);
+    g.waited_us = in.gfw_timeout_us - g.waited_us < step ? in.gfw_timeout_us : g.waited_us + step;
+  }
+  report.outcome = PostOutcome::Failed;
+  report.reason = g.protection_lowered ? "Turing+: the GPU's firmware did not finish its boot in time (GFW_BOOT progress not 0xff)"
+                                       : "Turing+: FWSEC never lowered GFW_BOOT's read protection (0x118128 bit 0 stayed clear)";
+  return report;
+}
+
+}  // namespace
+
 PostReport NvDevinit::post(const PostInputs& in) {
   PostReport report;
   if (!in.bios || !in.registers) {
@@ -382,10 +432,7 @@ PostReport NvDevinit::post(const PostInputs& in) {
     report.reason = "pre-Tesla devinit (VGA owner selection, nv04/nv10/nv20 memory init) is not implemented";
     return report;
   }
-  if (chip.card_type >= 0x160) {
-    report.reason = "Turing and later: devinit is NVIDIA's signed FWSEC firmware (tu102_devinit_post), not done here";
-    return report;
-  }
+  if (chip.card_type >= 0x160) return gfw_boot_wait(in, report);
   if (report.before.state == PostState::Unknown && chip.card_type >= 0xc0) {
     // (0x2240c read all ones: the GPU is not answering)
     report.reason = report.before.reason;

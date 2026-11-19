@@ -216,31 +216,57 @@ bool NvSorDp::set_drive(uint8_t lane_set) {
 DpTrainResult train_dp_link(IDpcdAux& aux, NvSorDp& sor, const Dpcd::Capabilities& caps, const DcbOutput& output, uint64_t data_kBps) {
   DpTrainResult result;
   if (!caps.valid) return result;
+  uint32_t lanes_limit = caps.max_lanes;
+  if (output.dp_max_lanes && output.dp_max_lanes < lanes_limit) lanes_limit = output.dp_max_lanes;
+  lanes_limit = lanes_limit >= 4 ? 4 : lanes_limit >= 2 ? 2 : 1;
+  auto attempt = [&](uint8_t sor_rate, uint32_t lanes, uint8_t rate_index) {
+    if (result.attempts < DpTrainResult::kMaxAttempts) {
+      result.tried_bandwidth[result.attempts] = sor_rate;
+      result.tried_lanes[result.attempts] = static_cast<uint8_t>(lanes);
+    }
+    ++result.attempts;
+    if (!sor.set_link(sor_rate, lanes, caps.enhanced_framing)) return false;
+    const DpLinkTrainer::Outcome o =
+        DpLinkTrainer::train(aux, sor, caps, rate_index == DpLinkConfig::kNoRateIndex ? sor_rate : 0, lanes, rate_index);
+    result.last = o.result;
+    if (!o.trained()) return false;
+    result.trained = true;
+    result.bandwidth_code = sor_rate;
+    result.rate_index = rate_index;
+    result.lanes = lanes;
+    return true;
+  };
+  if (caps.edp_revision != Dpcd::kNoEdp && caps.edp_revision >= Dpcd::kEdp14 && caps.edp_rate_count > 0) {
+    // The panel's own rates, fastest first (each once), in the link clock's kHz (162000 for 1.62 Gbit/s, as Dpcd's parser gives them).
+    const uint32_t count = caps.edp_rate_count < Dpcd::kMaxEdpRates ? caps.edp_rate_count : Dpcd::kMaxEdpRates;
+    uint32_t rates[Dpcd::kMaxEdpRates] = {};
+    for (uint32_t i = 0; i < count; ++i) rates[i] = caps.edp_rates_khz[i];
+    bool used[Dpcd::kMaxEdpRates] = {};
+    for (uint32_t round = 0; round < count; ++round) {
+      uint32_t best = count;
+      for (uint32_t i = 0; i < count; ++i)
+        if (!used[i] && (best == count || rates[i] > rates[best])) best = i;
+      used[best] = true;
+      const uint32_t khz = rates[best];
+      if (khz == 0 || khz % 27000 != 0) continue;                // the SOR's link speed is a multiple of 0.27 Gbit/s
+      const uint32_t code = khz / 27000;
+      if ((code << kSorClockSpeedShift) & ~kSorClockSpeedMask) continue;
+      if (output.dp_max_link_rate && code > output.dp_max_link_rate) continue;
+      for (uint32_t lanes = lanes_limit; lanes >= 1; lanes >>= 1) {
+        if (uint64_t{lanes} * khz < data_kBps) break;
+        if (attempt(static_cast<uint8_t>(code), lanes, static_cast<uint8_t>(best))) return result;
+      }
+    }
+    return result;
+  }
   static constexpr uint8_t kRates[] = {0x1e, 0x14, 0x0a, 0x06};
   uint8_t max_rate = caps.max_link_rate_code;
   if (output.dp_max_link_rate && output.dp_max_link_rate < max_rate) max_rate = output.dp_max_link_rate;
-  uint32_t max_lanes = caps.max_lanes;
-  if (output.dp_max_lanes && output.dp_max_lanes < max_lanes) max_lanes = output.dp_max_lanes;
-  if (max_lanes >= 4) max_lanes = 4;
-  else if (max_lanes >= 2) max_lanes = 2;
   for (const uint8_t rate : kRates) {
     if (rate > max_rate) continue;
-    for (uint32_t lanes = max_lanes; lanes >= 1; lanes >>= 1) {
+    for (uint32_t lanes = lanes_limit; lanes >= 1; lanes >>= 1) {
       if (uint64_t{lanes} * rate * 27000 < data_kBps) break;     // fewer lanes carry less still
-      if (result.attempts < DpTrainResult::kMaxAttempts) {
-        result.tried_bandwidth[result.attempts] = rate;
-        result.tried_lanes[result.attempts] = static_cast<uint8_t>(lanes);
-      }
-      ++result.attempts;
-      if (!sor.set_link(rate, lanes, caps.enhanced_framing)) continue;
-      const DpLinkTrainer::Outcome o = DpLinkTrainer::train(aux, sor, caps, rate, lanes);
-      result.last = o.result;
-      if (o.trained()) {
-        result.trained = true;
-        result.bandwidth_code = rate;
-        result.lanes = lanes;
-        return result;
-      }
+      if (attempt(rate, lanes, DpLinkConfig::kNoRateIndex)) return result;
     }
   }
   return result;
@@ -396,7 +422,7 @@ DisplayStatus NvModeSetter::set_mode(const Request& request) {
     return DisplayStatus::UnsupportedSurface;
 
   INvRegisters& r = engine_.registers();
-  if (route.panel) {   // nouveau powers an eDP/LVDS panel before it trains or lights it (nvkm_dp_enable / the LVDS script)
+  if (route.panel && !request.panel_powered) {   // nouveau powers an eDP/LVDS panel before it trains or lights it (nvkm_dp_enable / the LVDS script)
     if (!gpio_ || !gpio_->set_function(kGpioPanelPower, true)) return DisplayStatus::NoOutput;
     r.delay_us(200000);
   }

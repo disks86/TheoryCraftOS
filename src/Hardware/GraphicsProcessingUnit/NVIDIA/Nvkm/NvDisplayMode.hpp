@@ -31,6 +31,7 @@
 #include "Hardware/GraphicsProcessingUnit/AMD/Dpcd.hpp"
 #include "Hardware/GraphicsProcessingUnit/NVIDIA/Nvkm/NvBiosTables.hpp"
 #include "Hardware/GraphicsProcessingUnit/NVIDIA/Nvkm/NvDisplay.hpp"
+#include "Utility/Optional.hpp"
 
 namespace hardware {
 namespace nv {
@@ -92,6 +93,8 @@ class INvPixelClock {
 class INvGpio {
  public:
   [[nodiscard]] virtual bool set_function(uint8_t function, bool on) = 0;
+  // nvkm_gpio_get: whether `function` is on now; empty when the board has no such function (or the implementation cannot tell).
+  [[nodiscard]] virtual Optional<bool> get_function(uint8_t function) { (void)function; return Optional<bool>(); }
 
  protected:
   INvGpio() = default;
@@ -141,7 +144,8 @@ class NvSorDp final : public IDpSource {
 struct DpTrainResult {
   static constexpr uint32_t kMaxAttempts = 16;
   bool trained = false;
-  uint8_t bandwidth_code = 0;
+  uint8_t bandwidth_code = 0;       // the SOR's link speed (the rate in 0.27 Gbit/s units, also for a rate from an eDP panel's table)
+  uint8_t rate_index = DpLinkConfig::kNoRateIndex;   // eDP 1.4: the entry of the panel's rate table set (DP_LINK_RATE_SET), else none
   uint32_t lanes = 0;
   uint32_t attempts = 0;
   uint8_t tried_bandwidth[kMaxAttempts] = {};
@@ -150,6 +154,9 @@ struct DpTrainResult {
 };
 // nouveau's nvkm_dp_train loop: the link rates from the fastest the sink and the DCB entry allow down, and for each the lanes from the most
 // down to one, skipping configurations that cannot carry `data_kBps` (the pixel clock times bytes per pixel); the first that trains is kept.
+// An eDP 1.4 panel with a rate table (Capabilities::edp_rates_khz) is trained on the table's rates instead (nouveau's dp->rate[] from
+// DPCD_SUPPORTED_LINK_RATES): fastest first, each set by its index (DP_LINK_RATE_SET, DP_LINK_BW_SET 0) and on the SOR as rate / 27 MHz;
+// rates that are not a whole multiple of 0.27 Gbit/s, or above the DCB's limit, are skipped.
 [[nodiscard]] DpTrainResult train_dp_link(IDpcdAux& aux, NvSorDp& sor, const Dpcd::Capabilities& caps, const DcbOutput& output, uint64_t data_kBps);
 
 // The DP transfer unit and the symbols left for audio in the blanking (nv50_disp_super_2_2_dp).
@@ -170,6 +177,7 @@ class NvModeSetter final : public IDisplayPoller {
     ScanoutSurface surface;         // what the head shows (offset relative to VRAM)
     uint32_t depth_bpp = 24;
     bool edp = false;               // a DP output that is an internal panel (power it through the GPIO first)
+    bool panel_powered = false;     // the caller powered the panel already (NvPanelPower, with its own delays): no GPIO, no wait here
   };
 
   // `clock`, `gpio`, `aux` may be null when the output does not need them (aux for DP, gpio for panels; without `clock` the VPLL is left).

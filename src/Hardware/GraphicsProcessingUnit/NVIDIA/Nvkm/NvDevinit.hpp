@@ -111,6 +111,20 @@ struct PostInputs {
   uint32_t pmu_timeout_us = 2000000;
   uint32_t pmu_poll_us = 10;
   bool run_preos = true;
+  // Turing and later (the GFW_BOOT wait): how long the GPU's own firmware may take to boot it after a reset (nova-core waits 4 s,
+  // nouveau about 2 s) and the poll interval (both: 1 ms).
+  uint32_t gfw_timeout_us = 4000000;
+  uint32_t gfw_poll_us = 1000;
+};
+
+// Turing and later: what the wait for the GPU's own boot (GFW_BOOT: FWSEC runs the devinit scripts from the ROM after every reset) saw.
+struct GfwBootReport {
+  bool used = false;                  // post() took this path (TU10x and later)
+  bool protection_lowered = false;    // 0x118128 bit 0: FWSEC lowered the scratch group's read protection (else 0x118234 is not readable)
+  uint32_t progress = 0;              // 0x118234 bits 7:0 at the last read (0xff: done); 0 while the group was read-protected
+  bool completed = false;
+  uint32_t polls = 0;                 // reads of the pair (1: done at the first look)
+  uint32_t waited_us = 0;
 };
 
 struct PostReport {
@@ -125,14 +139,18 @@ struct PostReport {
   // display code has to (it knows the outputs).
   bool encoder_scripts_pending = false;
   PmuPostReport pmu;                     // GM20x .. GV100
+  GfwBootReport gfw;                     // Turing and later
 };
 
 class NvDevinit {
  public:
   // gf100_devinit_preinit: bit 1 of 0x2240c is set by devinit and goes back to 0 on suspend.
   static constexpr uint32_t kPostedGf100 = 0x02240c, kPostedBit = 0x2;
-  // tu102_devinit_wait: 0x118128 bit 0 and 0x118234 bits 7:0 == 0xff once devinit has finished.
+  // tu102_devinit_wait / nova-core's wait_gfw_boot_completion: NV_PGC6_AON_SECURE_SCRATCH_GROUP_05_PRIV_LEVEL_MASK (0x118128) bit 0 is set
+  // once FWSEC has lowered the group's read protection, and NV_PGC6_AON_SECURE_SCRATCH_GROUP_05_0 (0x118234) bits 7:0 are the GFW boot
+  // progress, 0xff when it has finished.
   static constexpr uint32_t kDevinitStatusTu102 = 0x118128, kDevinitDoneTu102 = 0x118234;
+  static constexpr uint32_t kGfwReadLevel0 = 0x1, kGfwProgressMask = 0xff, kGfwProgressDone = 0xff;
 
   [[nodiscard]] static PostStatus detect(INvRegisters& registers, const Chip& chip);
   // The PMU falcon (gm200_devinit.c's registers, BAR0 offsets).
@@ -146,7 +164,12 @@ class NvDevinit {
   //   - GM20x, Pascal and Volta (gm200_devinit_post): reset the PMU falcon, upload the VBIOS's DEVINIT application (BIT 'p' type 0x04),
   //     the init tables and boot scripts (BIT 'I' +0x14 .. +0x1a) into its DMEM where the application's argument block says, start it and
   //     wait (bounded) for it to report completion; then start the PRE_OS application (type 0x01) if the image has one.
-  // Refused: pre-Tesla (VGA owner and memory init not done), Turing and later (FWSEC, under GSP control), Tegra (the SoC's firmware),
+  //   - Turing and later (tu102_devinit_post): no scripts, the GPU boots itself from its ROM (FWSEC) after every reset; a bounded wait for
+  //     that to finish: the read protection lowered (0x118128 bit 0), then the progress byte (0x118234) at 0xff. AlreadyPosted when it was
+  //     done at the first look, Ran when it finished while waiting, Failed when it did not in gfw_timeout_us (or the protection was never
+  //     lowered). Nothing is written; a dry run reads once (AlreadyPosted or DryRun). nouveau then starts the PRE_OS application on the
+  //     PMU (gm200_devinit_preos): not done here.
+  // Refused: pre-Tesla (VGA owner and memory init not done), Tegra (the SoC's firmware),
   // and on the PMU path an image without BIT 'I' (version 1, 0x1c bytes) or a usable DEVINIT application (checked before anything is
   // written).
   [[nodiscard]] static PostReport post(const PostInputs& inputs);

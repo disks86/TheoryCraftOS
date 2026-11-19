@@ -19,6 +19,7 @@
 // The native display drivers a GpuPool can build for a GPU that is not the boot display. Apart from GpuPool.cpp so that what needs no driver code
 // (the pool's bookkeeping) can be built and tested without every driver.
 #include <new>
+#include "Hardware/GraphicsProcessingUnit/AMD/AmdSecondaryGpu.hpp"
 #include "Hardware/GraphicsProcessingUnit/GpuContext.hpp"
 #include "Hardware/GraphicsProcessingUnit/Multi/GpuPool.hpp"
 #include "Hardware/GraphicsProcessingUnit/NVIDIA/NvidiaSecondaryGpu.hpp"
@@ -40,6 +41,7 @@ void destroy_driver(GpuNode& node, allocators::IAllocator& allocator) {
   node.gpu = nullptr;
   node.virtio = nullptr;
   node.vmware = nullptr;
+  node.panel = nullptr;
   node.destroy = nullptr;
 }
 
@@ -81,7 +83,14 @@ const DriverRow kDrivers[] = {
      }},
     // A non-boot NVIDIA GPU: mode setting from scratch (GF119..Pascal, only with TCOS_NVIDIA_NATIVE; otherwise it fails and the probe takes over).
     {[](const PciDeviceInfo& d) { return NvidiaSecondaryGpu::supports(d); },
-     [](GpuNode& n, const GpuContext& c, allocators::IAllocator& a) { return build_driver<NvidiaSecondaryGpu>(n, c, a) != nullptr; }},
+     [](GpuNode& n, const GpuContext& c, allocators::IAllocator& a) {
+       NvidiaSecondaryGpu* gpu = build_driver<NvidiaSecondaryGpu>(n, c, a);
+       if (gpu) n.panel = gpu->panel_output();   // (the built-in panel of a muxed laptop, for the display switch)
+       return gpu != nullptr;
+     }},
+    // A non-boot AMD Polaris / Vega M GPU (DCE 11.2): POST, apertures and a mode set from scratch (only with TCOS_AMD_NATIVE; otherwise it fails and the probe takes over).
+    {[](const PciDeviceInfo& d) { return AmdSecondaryGpu::supports(d); },
+     [](GpuNode& n, const GpuContext& c, allocators::IAllocator& a) { return build_driver<AmdSecondaryGpu>(n, c, a) != nullptr; }},
 };
 }  // namespace
 

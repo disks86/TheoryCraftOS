@@ -100,7 +100,7 @@ void AmdGmc8::program_golden_registers() {
   }
 }
 
-bool AmdGmc8::mc_program(uint32_t timeout_us) {
+bool AmdGmc8::mc_program(uint32_t timeout_us, bool lock_out_vga) {
   // Initialize HDP
   for (uint32_t i = 0, j = 0; i < 32; ++i, j += 0x6) {
     wr(0xb05 + j, 0x00000000);
@@ -111,6 +111,10 @@ bool AmdGmc8::mc_program(uint32_t timeout_us) {
   }
   wr(mmHDP_REG_COHERENCY_FLUSH_CNTL, 0);
   bool idle = wait_for_idle(timeout_us);   // (the driver only warns)
+  if (lock_out_vga) {      // (adev->mode_info.num_crtc: lockout access through the VGA aperture, VGA rendering off)
+    wr(kVgaHdpControl, rd(kVgaHdpControl) | kVgaMemoryDisable);
+    wr(kVgaRenderControl, rd(kVgaRenderControl) & ~kVgaVstatusCntl);
+  }
   // Update configuration
   wr(mmMC_VM_SYSTEM_APERTURE_LOW_ADDR, static_cast<uint32_t>(plan_.vram_start >> 12));
   wr(mmMC_VM_SYSTEM_APERTURE_HIGH_ADDR, static_cast<uint32_t>(plan_.vram_end >> 12));
@@ -248,6 +252,16 @@ AmdGmc8::Result AmdGmc8::start(const AmdGmc8GartPlan& plan, const Memory& memory
   gart_enable();
   started_ = true;
   return idle ? Result::Ok : Result::NotIdle;
+}
+
+AmdGmc8::Result AmdGmc8::program_apertures(const AmdGmc8GartPlan& plan, uint64_t scratch_page_gpu_address, bool lock_out_vga, uint32_t timeout_us) {
+  if (plan.vram_end <= plan.vram_start || plan.vram_end > kAmdGmc8McMask || (scratch_page_gpu_address & (kAmdGmc8PageBytes - 1)) != 0 || scratch_page_gpu_address > kAmdGmc8McMask)
+    return Result::BadArgument;
+  plan_ = plan;
+  memory_ = Memory();
+  memory_.scratch_page_gpu_address = scratch_page_gpu_address;
+  program_golden_registers();
+  return mc_program(timeout_us, lock_out_vga) ? Result::Ok : Result::NotIdle;
 }
 
 void AmdGmc8::stop() {

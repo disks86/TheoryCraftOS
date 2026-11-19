@@ -31,11 +31,10 @@ namespace {
 constexpr uint64_t kSurfaceAlign = 64 * 1024;
 constexpr uint32_t kMaxPitch = 0x3ff00;          // what the head's storage method holds
 constexpr uint32_t kTmdsSingleLinkKhz = 165000, kTmdsDualLinkKhz = 330000;
+constexpr uint32_t kLvdsMaxKhz = 400000;         // nouveau_conn_mode_valid's LVDS limit
 constexpr uint8_t kDefaultDpRate = 0x14, kDefaultDpLanes = 4;
 
 uint64_t align_up(uint64_t value, uint64_t alignment) { return (value + alignment - 1) & ~(alignment - 1); }
-
-bool is_panel_connector(uint8_t dcb_type) { return dcb_type == 0x40 || dcb_type == 0x41 || dcb_type == 0x47; }   // LVDS, LVDS SPWG, eDP
 
 uint32_t refresh_of(const DisplayTiming& t) {
   const uint64_t pixels = uint64_t{t.htotal} * t.vtotal;
@@ -133,6 +132,7 @@ uint32_t edid_modes(ConstByteView edid, ArrayView<EdidMode> out) {
 uint32_t max_output_clock_khz(const DcbOutput& output) {
   switch (output.type) {
     case DcbOutputType::Tmds: return output.sorconf_link == 3 ? kTmdsDualLinkKhz : kTmdsSingleLinkKhz;
+    case DcbOutputType::Lvds: return kLvdsMaxKhz;
     case DcbOutputType::Dp: {
       const uint32_t rate = output.dp_max_link_rate ? output.dp_max_link_rate : kDefaultDpRate;
       const uint32_t lanes = output.dp_max_lanes ? output.dp_max_lanes : kDefaultDpLanes;
@@ -278,28 +278,82 @@ bool NvSecondaryDisplay::pick_output() {
     }
     if (found < 0) continue;
     const DcbOutput& output = board.outputs[static_cast<uint32_t>(found)];
-    EdidMode all[kMaxModes];
-    const uint32_t n = edid_modes(ConstByteView(c.edid).first(c.edid_bytes), ArrayView<EdidMode>(all));
-    const uint32_t limit = max_output_clock_khz(output);
-    mode_count_ = 0;
-    for (uint32_t m = 0; m < n; ++m) {
-      HeadRaster raster;
-      const DisplayTiming& t = all[m].timing;
-      if (t.clock_khz > limit || !compute_head_raster(t, &raster) || uint64_t{t.hdisplay} * 4 > kMaxPitch) continue;
-      modes_[mode_count_++] = all[m];
-    }
-    if (mode_count_ == 0) continue;
-    const Optional<uint32_t> start = choose_mode(ArrayView<const EdidMode>(modes_).first(mode_count_), limit);
-    OutputRoute route;
-    if (!start || !route_output(output, engine_->sor_mask(), engine_->head_mask(), 0, modes_[*start].timing.clock_khz, &route)) continue;
+    if (!filter_modes(ConstByteView(c.edid).first(c.edid_bytes), output)) continue;
     connector_ = static_cast<int32_t>(i);
-    output_ = output;
-    route_ = route;
-    current_ = *start;
     return true;
   }
   mode_count_ = 0;
   connector_ = -1;
+  return false;
+}
+
+// The modes of `edid` that `output` carries and the head can scan out, the one to start in, and the route for it.
+bool NvSecondaryDisplay::filter_modes(ConstByteView edid, const DcbOutput& output) {
+  EdidMode all[kMaxModes];
+  const uint32_t n = edid_modes(edid, ArrayView<EdidMode>(all));
+  const uint32_t limit = max_output_clock_khz(output);
+  mode_count_ = 0;
+  for (uint32_t m = 0; m < n; ++m) {
+    HeadRaster raster;
+    const DisplayTiming& t = all[m].timing;
+    if (t.clock_khz > limit || !compute_head_raster(t, &raster) || uint64_t{t.hdisplay} * 4 > kMaxPitch) continue;
+    modes_[mode_count_++] = all[m];
+  }
+  if (mode_count_ == 0) return false;
+  const Optional<uint32_t> start = choose_mode(ArrayView<const EdidMode>(modes_).first(mode_count_), limit);
+  OutputRoute route;
+  if (!start || !route_output(output, engine_->sor_mask(), engine_->head_mask(), 0, modes_[*start].timing.clock_khz, &route)) {
+    mode_count_ = 0;
+    return false;
+  }
+  output_ = output;
+  route_ = route;
+  current_ = *start;
+  return true;
+}
+
+bool NvSecondaryDisplay::pick_panel() {
+  uint32_t connector = 0;
+  DcbOutput output;
+  if (!find_panel_output(*in_.board, in_.connectors, &connector, &output)) return false;
+  // (the route and the modes come once the panel has power and has sent its EDID; the SOR must exist on this display)
+  OutputRoute route;
+  if (!route_output(output, engine_->sor_mask(), engine_->head_mask(), 0, 1, &route)) return false;
+  connector_ = static_cast<int32_t>(connector);
+  output_ = output;
+  route_ = route;
+  mode_count_ = 0;
+  return true;
+}
+
+bool NvSecondaryDisplay::panel_modes() {
+  const uint32_t c = static_cast<uint32_t>(connector_);
+  uint32_t bytes = in_.panel_edid ? in_.panel_edid->read_panel_edid(c, ByteView(panel_edid_)) : 0;
+  if (bytes > sizeof panel_edid_) bytes = 0;
+  ConstByteView edid = ConstByteView(panel_edid_).first(bytes);
+  if (bytes < 128 && c < in_.connectors.size() && in_.connectors[c].edid_bytes >= 128)
+    edid = ConstByteView(in_.connectors[c].edid).first(in_.connectors[c].edid_bytes);   // (an LVDS panel's EDID read at start, over DDC)
+  if (edid.size() < 128) {
+    no_edid_ = true;
+    return false;
+  }
+  return filter_modes(edid, output_);
+}
+
+bool find_panel_output(const BoardInfo& board, ArrayView<const NvidiaNative::Connector> connectors, uint32_t* connector, DcbOutput* output) {
+  const uint32_t outputs = board.output_count < BoardInfo::kMaxOutputs ? board.output_count : BoardInfo::kMaxOutputs;
+  for (uint32_t i = 0; i < connectors.size(); ++i) {
+    const uint8_t type = connectors[i].dcb_type;
+    if (!is_panel_connector(type)) continue;
+    const DcbOutputType want = type == 0x47 ? DcbOutputType::Dp : DcbOutputType::Lvds;
+    for (uint32_t o = 0; o < outputs; ++o) {
+      const DcbOutput& out = board.outputs[o];
+      if (out.connector != i || out.location != 0 || out.type != want || (out.or_mask & 0xff) == 0) continue;
+      if (connector) *connector = i;
+      if (output) *output = out;
+      return true;
+    }
+  }
   return false;
 }
 
@@ -334,6 +388,8 @@ DisplayStatus NvSecondaryDisplay::program(const EdidMode& mode, const Surface& s
   NvModeSetter setter(*engine_, in_.clock, nullptr, aux_);
   NvModeSetter::Request request;
   request.output = output_;
+  request.edp = in_.panel && output_.type == DcbOutputType::Dp;
+  request.panel_powered = in_.panel;               // (NvPanelPower did it, with the panel's waits)
   request.head = route.head;
   request.timing = mode.timing;
   request.surface = surface.scanout;
@@ -346,6 +402,8 @@ DisplayStatus NvSecondaryDisplay::program(const EdidMode& mode, const Surface& s
 
 DisplayStatus NvSecondaryDisplay::start() {
   shutdown();
+  panel_result_ = PanelLightStatus::ModeSet;          // (until something better is known)
+  no_edid_ = false;
   if (!in_.registers || !in_.board || !in_.allocator) return fail(DisplayStatus::BadArgument, "no registers, board tables or allocator");
   Bar1Locks locks = in_.locks;
   if (!locks.complete()) locks = Bar1Locks{&kernel_locks_[0], &kernel_locks_[1], &kernel_locks_[2], &kernel_locks_[3], &kernel_locks_[4]};
@@ -363,9 +421,11 @@ DisplayStatus NvSecondaryDisplay::start() {
     shutdown();
     return fail(DisplayStatus::NotImplemented, "mode setting from scratch is done for the GF119..Pascal display only");
   }
-  if (!pick_output()) {
+  if (in_.panel ? !pick_panel() : !pick_output()) {
+    panel_result_ = PanelLightStatus::NoPanel;
     shutdown();
-    return fail(DisplayStatus::NoOutput, "no monitor on an output this driver drives (HDMI, DVI or DisplayPort with an EDID)");
+    return fail(DisplayStatus::NoOutput, in_.panel ? "no built-in panel output (eDP or LVDS on a SOR) on this board"
+                                                   : "no monitor on an output this driver drives (HDMI, DVI or DisplayPort with an EDID)");
   }
   const uint64_t linear = Bar1LinearVram::linear_bytes_for(in_.vram);
   if (!linear || in_.bar1.size() < linear) {
@@ -390,6 +450,33 @@ DisplayStatus NvSecondaryDisplay::start() {
     return fail(DisplayStatus::NoMemory, "BAR1 could not be set up");
   }
   running_ = true;
+  if (in_.panel) {
+    // The panel's power (its AUX channel answers only then), its EDID and modes.
+    INvGpio* gpio = in_.gpio;
+    if (!gpio) {
+      if (!own_gpio_) own_gpio_ = UniquePointer<NvBoardGpio>::make(*in_.allocator, *in_.registers, in_.chip, *in_.board);
+      gpio = own_gpio_.get();
+    }
+    if (!panel_power_) {
+      const PanelPowerTimings timings = in_.panel_timings ? *in_.panel_timings
+                                        : output_.type == DcbOutputType::Lvds ? PanelPowerTimings::lvds() : PanelPowerTimings::edp();
+      panel_power_ = UniquePointer<NvPanelPower>::make(*in_.allocator, *in_.registers, gpio, timings, in_.now_us);
+    }
+    if (!panel_power_) {
+      shutdown();
+      return fail(DisplayStatus::NoMemory, "out of memory");
+    }
+    if (!panel_power_->power_on()) {
+      panel_result_ = PanelLightStatus::PowerFailed;
+      shutdown();
+      return fail(DisplayStatus::NoOutput, "the panel's power line would not switch on");
+    }
+    if (!panel_modes()) {
+      panel_result_ = mode_count_ == 0 && no_edid_ ? PanelLightStatus::NoEdid : PanelLightStatus::NoMode;
+      shutdown();
+      return fail(DisplayStatus::NoOutput, "the panel sent no EDID with a mode this output carries");
+    }
+  }
   // The chosen mode, and when the link cannot carry it, the others from the fastest down.
   uint32_t tried = 0, next = current_;
   DisplayStatus s = DisplayStatus::NoOutput;
@@ -405,6 +492,8 @@ DisplayStatus NvSecondaryDisplay::start() {
         current_ = next;
         last_ = s;
         status_ = "running";
+        if (in_.panel && panel_power_) panel_power_->backlight_on(route_.sor);
+        panel_result_ = PanelLightStatus::Ok;
         return s;
       }
       release_surface(surface);
@@ -420,6 +509,7 @@ DisplayStatus NvSecondaryDisplay::start() {
     if (pick < 0) break;
     next = static_cast<uint32_t>(pick);
   }
+  if (s == DisplayStatus::LinkTraining) panel_result_ = PanelLightStatus::LinkTraining;
   shutdown();
   return fail(s, nullptr);
 }
@@ -445,6 +535,7 @@ DisplayStatus NvSecondaryDisplay::set_mode(uint32_t index) {
 }
 
 void NvSecondaryDisplay::shutdown() {
+  if (panel_power_) panel_power_->backlight_off();   // (backlight first: T9 before the video stops)
   if (engine_ && mode_set_ && engine_->claimed()) {
     NvModeSetter setter(*engine_, nullptr, nullptr, nullptr);
     (void)setter.disable(route_.head, route_.sor);
@@ -455,6 +546,7 @@ void NvSecondaryDisplay::shutdown() {
   aux_ = nullptr;
   own_aux_ = UniquePointer<NvAuxChannel>();
   if (memory_) memory_->fini();                       // (the tables stay allocated until the next start or the destructor)
+  if (panel_power_) panel_power_->power_off();        // (T10 after the video stopped, then the power line)
   running_ = false;
 }
 
@@ -467,6 +559,19 @@ void NvSecondaryDisplay::flush() {
 // ---------------------------------------------------------------------------------------------------------------------------------------
 // NvidiaSecondaryGpu
 // ---------------------------------------------------------------------------------------------------------------------------------------
+namespace {
+// Holds the driver's display lock for a scope (a RecursiveMutex: set_display_mode() calls set_mode()).
+class DisplayGuard {
+ public:
+  explicit DisplayGuard(kernel::RecursiveMutex& m) : m_(m) { m_.lock(); }
+  ~DisplayGuard() { m_.unlock(); }
+  DisplayGuard(const DisplayGuard&) = delete;
+  DisplayGuard& operator=(const DisplayGuard&) = delete;
+
+ private:
+  kernel::RecursiveMutex& m_;
+};
+}  // namespace
 NvidiaSecondaryGpu::NvidiaSecondaryGpu(const GpuContext& context) : context_(context) {}
 
 NvidiaSecondaryGpu::~NvidiaSecondaryGpu() { shutdown(); }
@@ -476,6 +581,7 @@ bool NvidiaSecondaryGpu::fail(const char* why) {
   display_ = UniquePointer<nv::NvSecondaryDisplay>();
   clock_ = UniquePointer<nv::NvVpllClock>();
   native_ = UniquePointer<nv::NvidiaNative>();
+  bar1_ = ByteView();
   ordered_ = 0;
   set_framebuffer(ByteView(), 0, 0, 0, true);
   return false;
@@ -507,35 +613,135 @@ bool NvidiaSecondaryGpu::initialize() {
   if (!linear || !bar1) return fail("no BAR1 or too little VRAM");
   MmioRegion bar1_region;
   if (!context_.registers->map_registers(bar1, linear, &bar1_region)) return fail("BAR1 not mapped");
-  nv::NvSecondaryDisplay::Inputs in;
-  in.registers = native_->registers();
-  in.chip = chip;
-  in.board = &native_->board();
-  in.connectors = native_->connectors();
-  in.vram = vram;
-  in.bar1 = nv::mmio_bytes(bar1_region);
-  in.allocator = &allocator;
+  bar1_ = nv::mmio_bytes(bar1_region);
   if (!native_->bios_image().empty()) clock_ = UniquePointer<nv::NvVpllClock>::make(allocator, native_->bios_image(), chip, *native_->registers());
   if (!clock_) return fail("no video BIOS: the pixel clock's PLL limits are not known");
-  in.clock = clock_.get();
-  display_ = UniquePointer<nv::NvSecondaryDisplay>::make(allocator, in);
-  if (!display_) return fail("out of memory");
-  if (display_->start() != nv::DisplayStatus::Ok) return fail(display_->status());
   set_video_memory_total(vram.bytes);
+  display_ = UniquePointer<nv::NvSecondaryDisplay>::make(allocator, display_inputs(false));
+  if (!display_) return fail("out of memory");
+  if (display_->start() != nv::DisplayStatus::Ok) {
+    // A muxed laptop with nothing on the external ports: up in panel standby, for the display switch to light the built-in panel.
+    if (display_->last_status() == nv::DisplayStatus::NoOutput && has_panel_output()) {
+      display_ = UniquePointer<nv::NvSecondaryDisplay>();
+      order();
+      show();
+      status_ = "panel standby: nothing on the external ports, the built-in panel waits for the display switch";
+      panel_status_ = "standby";
+      return true;
+    }
+    return fail(display_->status());
+  }
   order();
   show();
   status_ = "running";
+  panel_status_ = "an external monitor is driven";
   return true;
 #endif
 }
 
+nv::NvSecondaryDisplay::Inputs NvidiaSecondaryGpu::display_inputs(bool panel) {
+  nv::NvSecondaryDisplay::Inputs in;
+  in.registers = native_->registers();
+  in.chip = native_->chip();
+  in.board = &native_->board();
+  in.connectors = native_->connectors();
+  in.vram = native_->vram().info;
+  in.bar1 = bar1_;
+  in.allocator = context_.allocator;
+  in.clock = clock_.get();
+  in.panel = panel;
+  in.panel_edid = this;
+  return in;
+}
+
+bool NvidiaSecondaryGpu::has_panel_output() const {
+  DisplayGuard g(display_lock_);
+  return native_ && nv::find_panel_output(native_->board(), native_->connectors(), nullptr, nullptr);
+}
+
+bool NvidiaSecondaryGpu::panel_lit() const {
+  DisplayGuard g(display_lock_);
+  return display_ && display_->running() && display_->panel();
+}
+
+bool NvidiaSecondaryGpu::can_light_panel() const {
+  DisplayGuard g(display_lock_);
+#ifndef TCOS_NVIDIA_NATIVE
+  return false;
+#else
+  return has_panel_output() && clock_ && !bar1_.empty() && (!display_ || !display_->running() || display_->panel());
+#endif
+}
+
+PanelLightStatus NvidiaSecondaryGpu::light_panel() {
+  DisplayGuard g(display_lock_);
+#ifndef TCOS_NVIDIA_NATIVE
+  panel_status_ = "built without TCOS_NVIDIA_NATIVE";
+  return PanelLightStatus::NotSupported;
+#else
+  if (panel_lit()) return PanelLightStatus::Ok;
+  if (!native_ || !has_panel_output()) {
+    panel_status_ = "the board's tables list no built-in panel output";
+    return PanelLightStatus::NoPanel;
+  }
+  if (display_ && display_->running()) {
+    panel_status_ = "an external monitor is driven (one head at a time)";
+    return PanelLightStatus::Busy;
+  }
+  if (!clock_ || bar1_.empty()) {
+    panel_status_ = "no BAR1 or no pixel clock";
+    return PanelLightStatus::NotSupported;
+  }
+  // (A panel display is kept once made, lit or not: its NvPanelPower knows when the panel was switched off, for the power cycle time.)
+  if (!display_ || !display_->panel()) display_ = UniquePointer<nv::NvSecondaryDisplay>::make(*context_.allocator, display_inputs(true));
+  if (!display_) {
+    panel_status_ = "out of memory";
+    return PanelLightStatus::ModeSet;
+  }
+  const nv::DisplayStatus s = display_->start();
+  if (s != nv::DisplayStatus::Ok) {
+    panel_status_ = display_->status();
+    const PanelLightStatus why = display_->panel_result();
+    show();                                          // (start() took everything down again, the panel's power included)
+    return why == PanelLightStatus::Ok ? PanelLightStatus::ModeSet : why;
+  }
+  order();
+  show();
+  status_ = "running";
+  panel_status_ = "the built-in panel is lit";
+  return PanelLightStatus::Ok;
+#endif
+}
+
+void NvidiaSecondaryGpu::release_panel() {
+  DisplayGuard g(display_lock_);
+  if (!panel_lit()) return;
+  display_->shutdown();                              // backlight, head and SOR, power (with the panel's waits); the object stays (see light_panel)
+  order();
+  show();
+  status_ = "panel standby: the built-in panel was let go";
+  panel_status_ = "released";
+}
+
+uint32_t NvidiaSecondaryGpu::read_panel_edid(uint32_t connector, ByteView out) {
+  if (!native_ || !native_->reread_connector(connector)) return 0;
+  const nv::NvidiaNative::Connector* c = native_->connector(connector);
+  if (!c) return 0;
+  const ConstByteView edid = ConstByteView(c->edid).first(c->edid_bytes).at_most(out.size());
+  out.first(edid.size()).copy_from(edid);
+  return static_cast<uint32_t>(edid.size());
+}
+
 void NvidiaSecondaryGpu::shutdown() {
+  DisplayGuard g(display_lock_);
   if (display_) display_->shutdown();
   display_ = UniquePointer<nv::NvSecondaryDisplay>();
   clock_ = UniquePointer<nv::NvVpllClock>();
   native_ = UniquePointer<nv::NvidiaNative>();
+  bar1_ = ByteView();
   ordered_ = 0;
   set_framebuffer(ByteView(), 0, 0, 0, true);
+  panel_status_ = "not started";
 }
 
 void NvidiaSecondaryGpu::show() {
@@ -543,9 +749,13 @@ void NvidiaSecondaryGpu::show() {
   else set_framebuffer(ByteView(), 0, 0, 0, true);
 }
 
-uint32_t NvidiaSecondaryGpu::mode_count() const { return display_ && display_->running() ? display_->mode_count() : 0; }
+uint32_t NvidiaSecondaryGpu::mode_count() const {
+  DisplayGuard g(display_lock_);
+  return display_ && display_->running() ? display_->mode_count() : 0;
+}
 
 bool NvidiaSecondaryGpu::mode_info(uint32_t index, DisplayMode* out) const {
+  DisplayGuard g(display_lock_);
   if (!out || index >= mode_count()) return false;
   const nv::EdidMode* m = display_->mode(index);
   out->width = m->timing.hdisplay;
@@ -553,9 +763,13 @@ bool NvidiaSecondaryGpu::mode_info(uint32_t index, DisplayMode* out) const {
   return true;
 }
 
-uint32_t NvidiaSecondaryGpu::current_mode() const { return display_ ? display_->current_mode() : 0; }
+uint32_t NvidiaSecondaryGpu::current_mode() const {
+  DisplayGuard g(display_lock_);
+  return display_ ? display_->current_mode() : 0;
+}
 
 bool NvidiaSecondaryGpu::set_mode(uint32_t index) {
+  DisplayGuard g(display_lock_);
   if (!display_ || !display_->running()) return false;
   const bool ok = display_->set_mode(index) == nv::DisplayStatus::Ok;
   show();
@@ -563,6 +777,7 @@ bool NvidiaSecondaryGpu::set_mode(uint32_t index) {
 }
 
 void NvidiaSecondaryGpu::present() {
+  DisplayGuard g(display_lock_);
   if (display_) display_->flush();
 }
 
@@ -578,7 +793,7 @@ void NvidiaSecondaryGpu::order() {
   ordered_ = 0;
   if (!native_) return;
   ConstByteView shown;                             // the driven connector's EDID: order_connectors puts it first
-  if (display_ && display_->connector() >= 0) {
+  if (display_ && display_->running() && display_->connector() >= 0) {
     const nv::NvidiaNative::Connector* c = native_->connector(static_cast<uint32_t>(display_->connector()));
     if (c) shown = ConstByteView(c->edid).first(c->edid_bytes);
   }
@@ -590,6 +805,7 @@ bool NvidiaSecondaryGpu::driven(uint32_t connector) const {
 }
 
 bool NvidiaSecondaryGpu::connector_info(uint32_t connector, ConnectorInfo* out) const {
+  DisplayGuard g(display_lock_);
   if (!native_ || !nv::describe_connector(native_->connectors(), ArrayView<const uint8_t>(order_).first(ordered_), connector, out)) return false;
   if (driven(connector)) {
     for (uint32_t i = 0; i < display_->mode_count(); ++i)
@@ -602,6 +818,7 @@ bool NvidiaSecondaryGpu::connector_info(uint32_t connector, ConnectorInfo* out) 
 }
 
 uint32_t NvidiaSecondaryGpu::read_edid(uint32_t connector, ByteView out) {
+  DisplayGuard g(display_lock_);
   if (!native_ || connector >= ordered_) return 0;
   const nv::NvidiaNative::Connector* c = native_->connector(order_[connector]);
   if (!c) return 0;
@@ -611,12 +828,14 @@ uint32_t NvidiaSecondaryGpu::read_edid(uint32_t connector, ByteView out) {
 }
 
 bool NvidiaSecondaryGpu::refresh_connectors() {
+  DisplayGuard g(display_lock_);
   if (!native_ || !native_->refresh_connectors()) return false;
   order();
   return true;
 }
 
 bool NvidiaSecondaryGpu::mode_available(uint32_t connector, uint32_t width, uint32_t height) const {
+  DisplayGuard g(display_lock_);
   if (!driven(connector)) return false;
   for (uint32_t i = 0; i < display_->mode_count(); ++i)
     if (display_->mode(i)->timing.hdisplay == width && display_->mode(i)->timing.vdisplay == height) return true;
@@ -624,6 +843,7 @@ bool NvidiaSecondaryGpu::mode_available(uint32_t connector, uint32_t width, uint
 }
 
 uint32_t NvidiaSecondaryGpu::device_modes(uint32_t connector, MonitorMode* out, uint32_t capacity) const {
+  DisplayGuard g(display_lock_);
   if (!driven(connector) || !out) return 0;
   const ArrayView<MonitorMode> list(out, capacity);
   uint32_t n = 0;
@@ -641,6 +861,7 @@ uint32_t NvidiaSecondaryGpu::device_modes(uint32_t connector, MonitorMode* out, 
 }
 
 bool NvidiaSecondaryGpu::set_display_mode(uint32_t connector, uint32_t width, uint32_t height) {
+  DisplayGuard g(display_lock_);
   if (!driven(connector)) return false;
   for (uint32_t i = 0; i < display_->mode_count(); ++i)
     if (display_->mode(i)->timing.hdisplay == width && display_->mode(i)->timing.vdisplay == height) return set_mode(i);
