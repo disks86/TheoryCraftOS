@@ -621,9 +621,12 @@ __declspec(dllexport) BOOLEAN EVNTAPI EventProviderEnabled(REGHANDLE h, UCHAR le
 }
 __declspec(dllexport) ULONG EVNTAPI EventSetInformation(REGHANDLE h, EVENT_INFO_CLASS c, PVOID info, ULONG length)
 {
+    /* The classes of Windows 10 (mingw's header stops at EventProviderBinaryTrackInfo): 0 binary track info, 1 reserved, 2 provider traits (TraceLogging
+     * metadata: Chromium's TlmProvider fails its registration without it), 3 descriptor type, 4 keyword enabled events. Accepted; nothing is kept. */
+    enum { kEventInfoClasses = 5 };
     (void)info; (void)length;
     if (!provider_of(h)) return ERROR_INVALID_HANDLE;
-    if (c < 0 || c >= MaxEventInfo) return ERROR_INVALID_PARAMETER;
+    if ((ULONG)c >= kEventInfoClasses) return ERROR_NOT_SUPPORTED;
     return ERROR_SUCCESS;
 }
 

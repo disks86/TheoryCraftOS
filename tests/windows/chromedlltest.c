@@ -21,15 +21,19 @@
  * (winspool.drv, folded to winspool.dll), CompareObjectHandles and the interrupt-time clocks (kernel32), and the exports Chrome imports by ordinal (shell32 #2, #4,
  * #680, d3d12 #101, winspool #203). Build:
  *   x86_64-w64-mingw32-windres tests/windows/chromedlltest.rc -O coff -o chromedlltest_rc.o
- *   x86_64-w64-mingw32-gcc -O1 -o chromedlltest.exe tests/windows/chromedlltest.c chromedlltest_rc.o -lversion -lruntimeobject -lnetapi32 -lwinspool -lbcryptprimitives -luuid
+ *   x86_64-w64-mingw32-gcc -O1 -o chromedlltest.exe tests/windows/chromedlltest.c chromedlltest_rc.o -lversion -lruntimeobject -lnetapi32 -lwinspool -lbcryptprimitives -luuid -lws2_32 -ladvapi32
  * Prints "chromedlltest: N checks, M failed"; the exit code is the number of failures. */
 #define COBJMACROS
+#include <winsock2.h>      /* (before windows.h) */
+#include <ws2tcpip.h>
 #include <windows.h>
 #include <winstring.h>
 #include <roapi.h>
 #include <lm.h>
 #include <dsrole.h>
 #include <winspool.h>
+#include <nspapi.h>
+#include <evntprov.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -213,6 +217,97 @@ static void test_ordinals(void) {
   check(LoadLibraryW(L"bthprops.cpl") != NULL, "bthprops.cpl loads");
 }
 
+/* What Chromium's logging and network code ask at startup: FormatMessage of common system errors (else "Error (0x13D) while retrieving error"), the TraceLogging
+ * provider traits (EventSetInformation class 2, which mingw's header does not name), the NLA name space (WSALookupServiceBegin(NS_NLA)) and the Tcpip key the
+ * DNS watcher opens. */
+static void test_startup_queries(void) {
+  static const DWORD codes[] = {ERROR_BROKEN_PIPE, ERROR_SHARING_VIOLATION, ERROR_PIPE_NOT_CONNECTED, ERROR_NO_DATA, ERROR_IO_PENDING, ERROR_NOT_FOUND, WSAECONNREFUSED,
+                                0x80040154u /* REGDB_E_CLASSNOTREG */, 0x8007006Du /* HRESULT_FROM_WIN32(ERROR_BROKEN_PIPE) */};
+  for (unsigned i = 0; i < sizeof codes / sizeof codes[0]; ++i) {
+    char text[512], what[64];
+    const DWORD n = FormatMessageA(FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS, NULL, codes[i], 0, text, sizeof text, NULL);
+    snprintf(what, sizeof what, "FormatMessage of system message 0x%lX", codes[i]);
+    check(n > 2 && text[n - 1] == '\n', what);
+  }
+  char text[64];
+  SetLastError(0);
+  check(FormatMessageA(FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS, NULL, 0x0FFFFFFF, 0, text, sizeof text, NULL) == 0 &&
+            GetLastError() == ERROR_MR_MID_NOT_FOUND, "FormatMessage of an unknown code: ERROR_MR_MID_NOT_FOUND");
+
+  static const GUID provider = {0x1d0e7b8c, 0x5a4f, 0x4c3b, {0x9e, 0x2d, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66}};
+  REGHANDLE reg = 0;
+  check(EventRegister(&provider, NULL, NULL, &reg) == ERROR_SUCCESS, "EventRegister");
+  BYTE traits[16] = {9, 0, 't', 'c', 'o', 's', '.', 't', 0};
+  check(EventSetInformation(reg, (EVENT_INFO_CLASS)2 /* EventProviderSetTraits */, traits, 9) == ERROR_SUCCESS, "EventSetInformation(EventProviderSetTraits)");
+  check(EventUnregister(reg) == ERROR_SUCCESS, "EventUnregister");
+
+  WSADATA wsa;
+  check(WSAStartup(MAKEWORD(2, 2), &wsa) == 0, "WSAStartup");
+  WSAQUERYSETW query;
+  memset(&query, 0, sizeof query);
+  query.dwSize = sizeof query;
+  query.dwNameSpace = NS_NLA;
+  HANDLE lookup = NULL;
+  check(WSALookupServiceBeginW(&query, LUP_RETURN_ALL, &lookup) == 0 && lookup != NULL, "WSALookupServiceBegin(NS_NLA)");
+  if (lookup) {
+    union { WSAQUERYSETW set; char bytes[sizeof(WSAQUERYSETW) + 256]; } result;
+    DWORD length = 0;
+    const int first = WSALookupServiceNextW(lookup, LUP_RETURN_NAME, &length, &result.set);      /* (no buffer: the size needed, or no network at all) */
+    const int error = first ? WSAGetLastError() : 0;
+    check(first == SOCKET_ERROR && (error == WSAEFAULT || error == WSA_E_NO_MORE), "WSALookupServiceNext without room");
+    if (error == WSAEFAULT) {
+      check(length > sizeof(WSAQUERYSETW) && length <= sizeof result, "WSALookupServiceNext says what it needs");
+      length = sizeof result;
+      check(WSALookupServiceNextW(lookup, LUP_RETURN_NAME, &length, &result.set) == 0 && result.set.lpszServiceInstanceName && result.set.lpszServiceInstanceName[0],
+            "WSALookupServiceNext names a network");
+    }
+    check(WSALookupServiceEnd(lookup) == 0, "WSALookupServiceEnd");
+  }
+  SOCKET v6 = socket(AF_INET6, SOCK_DGRAM, IPPROTO_UDP);
+  check(v6 != INVALID_SOCKET, "an IPv6 UDP socket");
+  if (v6 != INVALID_SOCKET) {      /* (what Chromium's address sorter does with every DNS answer: IPv4 as mapped IPv6) */
+    SOCKADDR_STORAGE addresses[2];
+    memset(addresses, 0, sizeof addresses);
+    static const BYTE ipv4[4] = {93, 184, 216, 34};
+    SOCKADDR_IN6 *a = (SOCKADDR_IN6 *)&addresses[0];
+    a->sin6_family = AF_INET6;
+    a->sin6_addr.s6_addr[10] = a->sin6_addr.s6_addr[11] = 0xFF;
+    memcpy(&a->sin6_addr.s6_addr[12], ipv4, 4);
+    SOCKADDR_IN6 *b = (SOCKADDR_IN6 *)&addresses[1];
+    b->sin6_family = AF_INET6;
+    b->sin6_addr.s6_addr[0] = 0x20;
+    b->sin6_addr.s6_addr[1] = 0x01;
+    b->sin6_addr.s6_addr[2] = 0x0d;
+    b->sin6_addr.s6_addr[3] = 0xb8;
+    b->sin6_addr.s6_addr[15] = 1;
+    union { SOCKET_ADDRESS_LIST list; BYTE bytes[sizeof(SOCKET_ADDRESS_LIST) + sizeof(SOCKET_ADDRESS)]; } input, output;
+    input.list.iAddressCount = 2;
+    input.list.Address[0].lpSockaddr = (LPSOCKADDR)a;
+    input.list.Address[0].iSockaddrLength = sizeof *a;
+    input.list.Address[1].lpSockaddr = (LPSOCKADDR)b;
+    input.list.Address[1].iSockaddrLength = sizeof *b;
+    DWORD returned = 0;
+    check(WSAIoctl(v6, SIO_ADDRESS_LIST_SORT, &input, sizeof input, &output, sizeof output, &returned, NULL, NULL) == 0, "SIO_ADDRESS_LIST_SORT");
+    check(output.list.iAddressCount == 2 && ((output.list.Address[0].lpSockaddr == (LPSOCKADDR)a && output.list.Address[1].lpSockaddr == (LPSOCKADDR)b) ||
+                                             (output.list.Address[0].lpSockaddr == (LPSOCKADDR)b && output.list.Address[1].lpSockaddr == (LPSOCKADDR)a)),
+          "SIO_ADDRESS_LIST_SORT keeps both addresses");
+    closesocket(v6);
+  }
+  query.dwNameSpace = NS_DNS;
+  lookup = NULL;
+  check(WSALookupServiceBeginW(&query, LUP_RETURN_ALL, &lookup) == SOCKET_ERROR && WSAGetLastError() == WSASERVICE_NOT_FOUND, "no DNS name-space provider");
+  WSACleanup();
+
+  HKEY key = NULL;
+  check(RegOpenKeyExW(HKEY_LOCAL_MACHINE, L"SYSTEM\\CurrentControlSet\\Services\\Tcpip\\Parameters", 0, KEY_NOTIFY, &key) == ERROR_SUCCESS, "the Tcpip parameters key exists");
+  if (key) {
+    HANDLE changed = CreateEventW(NULL, TRUE, FALSE, NULL);
+    check(RegNotifyChangeKeyValue(key, TRUE, REG_NOTIFY_CHANGE_LAST_SET | REG_NOTIFY_CHANGE_NAME, changed, TRUE) == ERROR_SUCCESS, "watch the Tcpip key");
+    RegCloseKey(key);
+    CloseHandle(changed);
+  }
+}
+
 int main(void) {
   test_prng();
   test_version();
@@ -221,6 +316,7 @@ int main(void) {
   test_spooler();
   test_kernel32();
   test_ordinals();
+  test_startup_queries();
   printf("chromedlltest: %d checks, %d failed\n", g_checks, g_failed);
   return g_failed;
 }

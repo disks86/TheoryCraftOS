@@ -83,7 +83,7 @@ echo "built $out/user32test.exe (user32 windows over win32k: classes, creation m
 $cc -O1 -Wall -Wextra -Wno-unused-parameter -o "$out/shell32test.exe" tests/windows/shell32test.c -lshell32 -lole32 -lshlwapi -ladvapi32 -luuid
 echo "built $out/shell32test.exe (shell32 and ole32: command lines, special folders, item id lists, shell items, file operations, ShellExecute, shortcuts; procchild.exe in System32)"
 x86_64-w64-mingw32-windres tests/windows/chromedlltest.rc -O coff -o "$out/chromedlltest_rc.o"
-$cc -O1 -Wall -Wextra -o "$out/chromedlltest.exe" tests/windows/chromedlltest.c "$out/chromedlltest_rc.o" -lversion -lruntimeobject -lnetapi32 -lwinspool -lbcryptprimitives -luuid
+$cc -O1 -Wall -Wextra -o "$out/chromedlltest.exe" tests/windows/chromedlltest.c "$out/chromedlltest_rc.o" -lversion -lruntimeobject -lnetapi32 -lwinspool -lbcryptprimitives -luuid -lws2_32 -ladvapi32
 echo "built $out/chromedlltest.exe (Chrome's startup libraries: ProcessPrng, version resources, HSTRINGs, netapi32, winspool, interrupt time, imports by ordinal)"
 $cc -O1 -Wall -o "$out/ws2eventtest.exe" tests/windows/ws2eventtest.c -lws2_32
 echo "built $out/ws2eventtest.exe (ws2_32: WSA events, WSAEventSelect, overlapped WSARecv/WSASend, WSAIoctl, protocol catalogue, GetAddrInfoExW)"

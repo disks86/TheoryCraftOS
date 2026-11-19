@@ -103,6 +103,7 @@ typedef struct { LONG tv_sec, tv_usec; } TIMEVAL_, *PTIMEVAL_;
 /* From kernel32.dll / ntdll.dll. */
 IMPORT void *memset(void *, int, size_t_);
 IMPORT void *memcpy(void *, const void *, size_t_);
+IMPORT int memcmp(const void *, const void *, size_t_);
 
 static int g_started = 0;      /* WSAStartup/WSACleanup are reference counted, like the real ones (nested libraries each call their own pair) */
 
@@ -881,24 +882,101 @@ EXPORT int WSAAPI GetNameInfoW(const SOCKADDR *address, int length, WCHAR *host,
   return 0;
 }
 
-/* The name-space lookups (WSALookupService*): no name-space provider is installed, so a lookup finds nothing (a stub answered success, and callers looping over
- * WSALookupServiceNext until it fails never stopped). */
+/* The name-space lookups (WSALookupService*). The one name space answered is NS_NLA (network location awareness): one entry for each configured interface that has
+ * an IPv4 address, named "Network <n>", which is how programs (Chromium's network change notifier) learn whether the machine is connected. Any other name space has no
+ * provider (WSASERVICE_NOT_FOUND). A lookup is a heap block whose handle is its address, checked by a tag. */
 #define WSASERVICE_NOT_FOUND_ 10108
 #define WSA_E_NO_MORE_ 10110
-EXPORT int WSAAPI WSALookupServiceBeginA(void *query, DWORD flags, HANDLE *lookup) {
-  (void)query; (void)flags;
-  if (lookup) *lookup = NULL;
-  set_wsa_error(WSASERVICE_NOT_FOUND_);
-  return SOCKET_ERROR;
+#define NS_ALL_ 0
+#define NS_NLA_ 15
+#define LUP_RETURN_NAME_ 0x0010
+#define NLA_LOOKUP_TAG_ 0x4E4C414Bu      /* 'NLAK' */
+#define NLA_MAX_NETWORKS_ 8
+#define WSA_INVALID_HANDLE_ 6
+typedef struct {      /* WSAQUERYSETA / WSAQUERYSETW: the same layout, the strings differ */
+  DWORD dwSize;
+  void *lpszServiceInstanceName;
+  void *lpServiceClassId;
+  void *lpVersion;
+  void *lpszComment;
+  DWORD dwNameSpace;
+  void *lpNSProviderId;
+  void *lpszContext;
+  DWORD dwNumberOfProtocols;
+  void *lpafpProtocols;
+  void *lpszQueryString;
+  DWORD dwNumberOfCsAddrs;
+  void *lpcsaBuffer;
+  DWORD dwOutputFlags;
+  void *lpBlob;
+} WSAQUERYSET_;
+typedef struct { DWORD tag, flags, count, next; ULONG networks[NLA_MAX_NETWORKS_]; } NlaLookup;
+
+static NlaLookup *nla_lookup_of(HANDLE lookup) {
+  NlaLookup *l = (NlaLookup *)lookup;
+  return l && l->tag == NLA_LOOKUP_TAG_ ? l : NULL;
 }
-EXPORT int WSAAPI WSALookupServiceBeginW(void *query, DWORD flags, HANDLE *lookup) { return WSALookupServiceBeginA(query, flags, lookup); }
-EXPORT int WSAAPI WSALookupServiceNextA(HANDLE lookup, DWORD flags, DWORD *length, void *results) {
-  (void)lookup; (void)flags; (void)length; (void)results;
-  set_wsa_error(WSA_E_NO_MORE_);
-  return SOCKET_ERROR;
+static int lookup_service_begin(const WSAQUERYSET_ *query, DWORD flags, HANDLE *lookup) {
+  if (!query || !lookup || query->dwSize < sizeof(WSAQUERYSET_)) { set_wsa_error(WSAEFAULT_); return SOCKET_ERROR; }
+  *lookup = NULL;
+  if (query->dwNameSpace != NS_NLA_ && query->dwNameSpace != NS_ALL_) { set_wsa_error(WSASERVICE_NOT_FOUND_); return SOCKET_ERROR; }
+  NlaLookup *l = HeapAlloc(GetProcessHeap(), 0, sizeof *l);
+  if (!l) { set_wsa_error(WSA_NOT_ENOUGH_MEMORY_); return SOCKET_ERROR; }
+  memset(l, 0, sizeof *l);
+  l->tag = NLA_LOOKUP_TAG_;
+  l->flags = flags;
+  HANDLE probe = NULL;
+  if (NtCreateSocket(AF_INET_, SOCK_DGRAM_, IPPROTO_UDP_, &probe) >= 0) {
+    for (ULONG i = 0; i < NLA_MAX_NETWORKS_; ++i) {
+      UCHAR config[16];
+      if (NtSocketControl(probe, 5 /* InterfaceConfiguration */, &i, sizeof i, config, sizeof config) != 0) break;
+      if (config[0] | config[1] | config[2] | config[3]) l->networks[l->count++] = i;
+    }
+    NtClose(probe);
+  }
+  *lookup = (HANDLE)l;
+  return 0;
 }
-EXPORT int WSAAPI WSALookupServiceNextW(HANDLE lookup, DWORD flags, DWORD *length, void *results) { return WSALookupServiceNextA(lookup, flags, length, results); }
-EXPORT int WSAAPI WSALookupServiceEnd(HANDLE lookup) { (void)lookup; return 0; }
+static int lookup_service_next(HANDLE lookup, DWORD flags, DWORD *length, WSAQUERYSET_ *results, int wide) {
+  NlaLookup *l = nla_lookup_of(lookup);
+  if (!l) { set_wsa_error(WSA_INVALID_HANDLE_); return SOCKET_ERROR; }
+  if (!length) { set_wsa_error(WSAEFAULT_); return SOCKET_ERROR; }
+  if (l->next >= l->count) { set_wsa_error(WSA_E_NO_MORE_); return SOCKET_ERROR; }
+  char name[24] = "Network ";
+  ULONG number = l->networks[l->next] + 1, at = 8;
+  char digits[12];
+  int d = 0;
+  do { digits[d++] = (char)('0' + number % 10); number /= 10; } while (number && d < 11);
+  while (d) name[at++] = digits[--d];
+  name[at] = 0;
+  const int want_name = ((flags | l->flags) & LUP_RETURN_NAME_) != 0;
+  const DWORD name_bytes = want_name ? (at + 1) * (wide ? 2u : 1u) : 0;
+  const DWORD need = (DWORD)sizeof(WSAQUERYSET_) + name_bytes;
+  if (!results || *length < need) { *length = need; set_wsa_error(WSAEFAULT_); return SOCKET_ERROR; }
+  memset(results, 0, sizeof *results);
+  results->dwSize = sizeof *results;
+  results->dwNameSpace = NS_NLA_;
+  if (want_name) {
+    BYTE *text = (BYTE *)(results + 1);
+    for (ULONG i = 0; i <= at; ++i) {
+      if (wide) ((WCHAR *)text)[i] = (WCHAR)(BYTE)name[i]; else text[i] = (BYTE)name[i];
+    }
+    results->lpszServiceInstanceName = text;
+  }
+  ++l->next;
+  return 0;
+}
+EXPORT int WSAAPI WSALookupServiceBeginA(void *query, DWORD flags, HANDLE *lookup) { return lookup_service_begin((const WSAQUERYSET_ *)query, flags, lookup); }
+EXPORT int WSAAPI WSALookupServiceBeginW(void *query, DWORD flags, HANDLE *lookup) { return lookup_service_begin((const WSAQUERYSET_ *)query, flags, lookup); }
+EXPORT int WSAAPI WSALookupServiceNextA(HANDLE lookup, DWORD flags, DWORD *length, void *results) { return lookup_service_next(lookup, flags, length, (WSAQUERYSET_ *)results, 0); }
+EXPORT int WSAAPI WSALookupServiceNextW(HANDLE lookup, DWORD flags, DWORD *length, void *results) { return lookup_service_next(lookup, flags, length, (WSAQUERYSET_ *)results, 1); }
+EXPORT int WSAAPI WSALookupServiceEnd(HANDLE lookup) {
+  NlaLookup *l = nla_lookup_of(lookup);
+  if (!l) { set_wsa_error(WSA_INVALID_HANDLE_); return SOCKET_ERROR; }
+  l->tag = 0;
+  HeapFree(GetProcessHeap(), 0, l);
+  return 0;
+}
 
 /* ---- socket options -----------------------------------------------------------------------------------------------------------------------------------------------------
  * IPV6_V6ONLY is real (it decides whether an AF_INET6 socket also carries IPv4). The other common options are accepted and change nothing - the network stack has one
@@ -1685,7 +1763,7 @@ EXPORT BOOL WSAAPI WSAGetOverlappedResult(SOCKET s, OVERLAPPED *ov, DWORD *bytes
 
 /* ---- WSAIoctl ---------------------------------------------------------------------------------------------------------------------------------------------------------
  * FIONBIO / FIONREAD as ioctlsocket; the keep-alive and UDP reset settings are accepted (there are no keep-alives, and an ICMP port-unreachable never fails a UDP receive here);
- * the base handle of a socket is itself (there are no layered providers). No extension functions (AcceptEx, ConnectEx, ...: mswsock.dll has only stubs of them): WSAEINVAL,
+ * the base handle of a socket is itself (there are no layered providers); SIO_ADDRESS_LIST_SORT orders destinations (Chromium's DNS answers go through it). No extension functions (AcceptEx, ConnectEx, ...: mswsock.dll has only stubs of them): WSAEINVAL,
  * which callers take for "use the plain calls". Anything else is WSAEOPNOTSUPP. */
 #define SIO_GET_EXTENSION_FUNCTION_POINTER_ 0xC8000006u
 #define SIO_KEEPALIVE_VALS_ 0x98000004u
@@ -1696,6 +1774,52 @@ EXPORT BOOL WSAAPI WSAGetOverlappedResult(SOCKET s, OVERLAPPED *ov, DWORD *bytes
 #define SIO_BSP_HANDLE_SELECT_ 0x4800001Cu
 #define SIO_BSP_HANDLE_POLL_ 0x4800001Du
 #define SIO_AF_UNIX_GETPEERPID_ 0x58000100u      /* <afunix.h>: _WSAIOR(IOC_VENDOR, 256) */
+#define SIO_ADDRESS_LIST_SORT_ 0xC8000019u
+/* SIO_ADDRESS_LIST_SORT: the destinations of a SOCKET_ADDRESS_LIST (sockaddr_in6, IPv4 ones mapped) in the order of RFC 6724's precedence table, the ones this machine
+ * cannot reach (IPv6 without an IPv6 route) last, equal ones in their given order. The output list points at the caller's addresses, as Windows' does. */
+typedef struct { void *lpSockaddr; int iSockaddrLength; } SOCKET_ADDRESS_;
+static int destination_rank(const SOCKET_ADDRESS_ *a, BOOL v6_route) {
+  if (!a->lpSockaddr || a->iSockaddrLength < 24 || ((const USHORT *)a->lpSockaddr)[0] != AF_INET6_) return 0;      /* (not an IPv6 sockaddr: last) */
+  const UCHAR *ip = (const UCHAR *)a->lpSockaddr + 8;
+  static const UCHAR loopback[16] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1};
+  static const UCHAR mapped[12] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xFF, 0xFF};
+  if (memcmp(ip, loopback, 16) == 0) return 1000 + 50;
+  if (memcmp(ip, mapped, 12) == 0) return 1000 + (ip[12] == 127 ? 50 : 35);      /* (IPv4 is reachable when there is a network; its loopback ranks as ::1) */
+  int precedence = 40;      /* ::/0 */
+  if (ip[0] == 0x20 && ip[1] == 0x02) precedence = 30;                                   /* 2002::/16 (6to4) */
+  else if (ip[0] == 0x20 && ip[1] == 0x01 && ip[2] == 0 && ip[3] == 0) precedence = 5;   /* 2001::/32 (Teredo) */
+  else if ((ip[0] & 0xFE) == 0xFC) precedence = 3;                                      /* fc00::/7 (unique local) */
+  else if ((ip[0] == 0xFE && (ip[1] & 0xC0) == 0xC0) || (ip[0] == 0x3F && ip[1] == 0xFE)) precedence = 1;      /* fec0::/10, 3ffe::/16 */
+  else { int zero = 1; for (int i = 0; i < 12; ++i) zero &= ip[i] == 0; if (zero) precedence = 1; }      /* ::/96 (IPv4-compatible) */
+  const BOOL link_local = ip[0] == 0xFE && (ip[1] & 0xC0) == 0x80;
+  return (v6_route || link_local ? 1000 : 0) + precedence;
+}
+static int sort_address_list(const void *in, DWORD in_size, void *out, DWORD out_size, DWORD *bytes) {
+  const DWORD header = (DWORD)sizeof(void *);      /* iAddressCount, padded to the array */
+  if (!in || !out || in_size < header) { set_wsa_error(WSAEFAULT_); return SOCKET_ERROR; }
+  int count = 0;
+  memcpy(&count, in, sizeof count);
+  if (count < 0 || (DWORD)count > (in_size - header) / sizeof(SOCKET_ADDRESS_)) { set_wsa_error(WSAEINVAL_); return SOCKET_ERROR; }
+  const DWORD need = header + (DWORD)count * (DWORD)sizeof(SOCKET_ADDRESS_);
+  if (out_size < need) { if (bytes) *bytes = need; set_wsa_error(WSAEFAULT_); return SOCKET_ERROR; }
+  SOCKET_ADDRESS_ *list = HeapAlloc(GetProcessHeap(), 0, (size_t_)(count ? count : 1) * sizeof *list);
+  if (!list) { set_wsa_error(WSA_NOT_ENOUGH_MEMORY_); return SOCKET_ERROR; }
+  memcpy(list, (const BYTE *)in + header, (size_t_)count * sizeof *list);
+  const BOOL v6_route = has_ipv6_route();
+  for (int i = 1; i < count; ++i) {      /* a stable insertion sort, highest rank first (lists are a handful of addresses) */
+    const SOCKET_ADDRESS_ moving = list[i];
+    const int rank = destination_rank(&moving, v6_route);
+    int j = i;
+    while (j > 0 && destination_rank(&list[j - 1], v6_route) < rank) { list[j] = list[j - 1]; --j; }
+    list[j] = moving;
+  }
+  memset(out, 0, header);
+  memcpy(out, &count, sizeof count);
+  memcpy((BYTE *)out + header, list, (size_t_)count * sizeof *list);
+  HeapFree(GetProcessHeap(), 0, list);
+  if (bytes) *bytes = need;
+  return 0;
+}
 EXPORT int WSAAPI WSAIoctl(SOCKET s, DWORD code, void *in, DWORD in_size, void *out, DWORD out_size, DWORD *returned, OVERLAPPED *ov, COMPLETION_ROUTINE_ routine) {
   SOCKET_INFO_ info;
   if (!socket_info(s, &info)) return SOCKET_ERROR;
@@ -1736,6 +1860,10 @@ EXPORT int WSAAPI WSAIoctl(SOCKET s, DWORD code, void *in, DWORD in_size, void *
       bytes = sizeof pid;
       break;
     }
+    case SIO_ADDRESS_LIST_SORT_:
+      if (info.family != AF_INET6_) { set_wsa_error(WSAEINVAL_); return SOCKET_ERROR; }
+      if (sort_address_list(in, in_size, out, out_size, &bytes) != 0) return SOCKET_ERROR;
+      break;
     case SIO_GET_EXTENSION_FUNCTION_POINTER_:
       if (out && out_size >= sizeof(void *)) memset(out, 0, sizeof(void *));
       set_wsa_error(WSAEINVAL_);

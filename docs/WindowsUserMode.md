@@ -812,6 +812,21 @@ asked:
   the RET: the kernel goes on at that address with RCX = R10 (`nt_tcos_wrapped`, `Process::take_resume_at`), so the call and the sandbox's copy of it both reach
   the C function.
 
+What its log complained about at startup, and what answers it now (checked by `tests/windows/chromedlltest.c`):
+
+- **`Provider resistration failure`**: `EventSetInformation(EventProviderSetTraits)` was refused because mingw's `EVENT_INFO_CLASS` ends at class 1; advapi32 takes
+  classes 0-4.
+- **`WSALookupServiceBegin failed with: 10108`**: ws2_32 answers the NLA name space (`NS_NLA`) with one "Network <n>" entry per interface with an IPv4 address, which
+  is how the network change notifier decides whether the machine is online. Other name spaces still have no provider.
+- **`DNS registry watch failed to start`**: the registry has `HKLM\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters` (and `Tcpip6`, `Dnscache`) from the start.
+- **`SIO_ADDRESS_LIST_SORT failed 10045`**: every DNS answer goes through that ioctl; ws2_32 orders the list by RFC 6724's precedence table.
+- **`Error (0x13D) while retrieving error`**: FormatMessage had ~20 system texts; `kernel32/errtext.inc` has ~250 Win32, Winsock and COM ones (binary search).
+- Expected and left alone: `GPUPersistentCache ... being used by another process` (the GPU process dies at start, ANGLE has no D3D11 renderer, and its successor
+  asks for the cache while the old one still holds it; the retry gets it), `app_bound_encryption` and geolocation `Class not registered` (Chrome's elevation
+  service and WinRT capability classes are not there), the Hyper-V PDH counter. Open: `token_service_table ... invalid SQL statement` - `Web Data` stays one empty
+  2 KiB page across runs although SQLite itself works on the kernel's files (journal TRUNCATE/DELETE/WAL, exclusive locking, 2 KiB pages: checked in QEMU), and the
+  crashpad `TransactNamedPipe: Error (0x6D)` seen once when Chrome was started from the Terminal did not come back under autorun.
+
 Trying it: `RUN=ON KEEP=ON RUN_ARGS='--enable-logging|--v=1|--log-file=C:/chrome.log' tests/winget_qemu.sh Google.Chrome` installs it, starts it for a minute and
 leaves it on the image. Chrome's log lines (`[pid:tid:...:ERROR:...]`) go to the debug console. A sandbox failure shows as `GPU process launch failed: error_code=N`,
 N being a `sandbox::ResultCode` (sandbox/win/src/sandbox_types.h).

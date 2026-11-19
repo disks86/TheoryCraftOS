@@ -25,27 +25,7 @@
 #define FMT_HEAP() heap()
 #include "../fmtengine.inc"
 
-/* The text of a system message for a code (an HRESULT of the Win32 facility is its error), or NULL. */
-static const char *fmt_system_text(DWORD id) {
-  switch (id) {
-    case 0x80004001u: return "Not implemented";
-    case 0x80004002u: return "No such interface supported";
-    case 0x80004003u: return "Invalid pointer";
-    case 0x80004005u: return "Unspecified error";
-    case 0x8000FFFFu: return "Catastrophic failure";
-    case 0x8007000Eu: return "Not enough memory resources are available to complete this operation.";
-    case 0x80070057u: return "The parameter is incorrect.";
-    case 0x800B0100u: return "No signature was present in the subject.";
-    case 0x80092009u: return "Cannot find the requested object.";
-    case 0x887A0001u: return "The application made a call that is invalid. Either the parameters of the call or the state of some object was incorrect.\r\nEnable the D3D debug layer in order to see details via debug messages.";
-    case 0x887A0022u: return "The application does not have access to the requested resource.";
-    case 7: return "The storage control blocks were destroyed.";
-    case 193: return "%1 is not a valid Win32 application.";
-    default: break;
-  }
-  if ((id & 0xFFFF0000u) == 0x80070000u) id &= 0xFFFFu;
-  return error_text(id);
-}
+#include "errtext.inc"
 
 static DWORD fmt_message(DWORD flags, LPCVOID source, DWORD id, void *buffer, DWORD size, PVOID arguments, int narrow) {
   const int alloc = (flags & FMT_ALLOCATE_BUFFER) != 0, ignore = (flags & FMT_IGNORE_INSERTS) != 0;
@@ -71,7 +51,7 @@ static DWORD fmt_message(DWORD flags, LPCVOID source, DWORD id, void *buffer, DW
       template_text = (WCHAR *)source;
     }
   } else {
-    const char *text = fmt_system_text(id);
+    const char *text = system_message_text(id);
     if (!text) { set_error(317); return 0; }      /* ERROR_MR_MID_NOT_FOUND */
     size_t_ n = 0;
     while (text[n] && n < 300) { system_text[n] = (WCHAR)(BYTE)text[n]; ++n; }
