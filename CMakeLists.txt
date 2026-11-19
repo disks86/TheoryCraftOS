@@ -1753,9 +1753,13 @@ add_custom_target(esp ALL
 # filled by the OS's own FAT driver (tools/PrimaryImage.cpp, built for this machine). An image that exists keeps its files, so the disk the OS writes to survives builds;
 # the listed files are put on it again each time. Write it to a disk or a USB stick, or let the run targets attach it.
 set(TCOS_PRIMARY_IMAGE ${CMAKE_BINARY_DIR}/primary.img)
-# (10 GiB: room for the applications the App Manager installs. The file is sparse - it takes the space of what is written to it - and an image that
-  # exists keeps its size: delete it to have it made anew.)
-  set(TCOS_PRIMARY_IMAGE_SIZE 10G CACHE STRING "Size of the primary disk image (when it is made)")
+# (10 GiB: room for the applications the App Manager installs. The file is sparse - it takes the space of what is written to it. An image that exists
+# keeps its files; one smaller than this is grown, see scripts/make-primary-image.sh.)
+set(TCOS_PRIMARY_IMAGE_SIZE 10G CACHE STRING "Size of the primary disk image")
+# A build folder from before the 10 GiB default has the old 256 MiB cached, which large packages (Google Chrome's is 140 MB) do not fit on.
+if(TCOS_PRIMARY_IMAGE_SIZE STREQUAL "256M")
+  set(TCOS_PRIMARY_IMAGE_SIZE 10G CACHE STRING "Size of the primary disk image" FORCE)
+endif()
 find_program(MKFS_FAT mkfs.fat)
 find_program(TCOS_HOST_CXX NAMES c++ g++ clang++)
 if(TCOS_ARCH STREQUAL "x86_64" AND MKFS_FAT AND TCOS_HOST_CXX)

@@ -75,6 +75,7 @@ StringView result_name(Result result) {
     case Result::BadChecksum: return "what was downloaded is not the file the package list describes";
     case Result::SetupFailed: return "its setup program did not finish its work";
     case Result::NoUninstaller: return "its setup program left no uninstaller";
+    case Result::DiskFull: return "there is not enough room left on the disk";
   }
   return "";
 }

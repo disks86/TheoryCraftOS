@@ -42,7 +42,7 @@ namespace desktop::appman {
 
 // Downloads `url` into the file at `path` (made or replaced), reporting to `progress` (which may be null) and stopping when it says cancel. `hasher`
 // (which may be null) is fed every byte. On anything but Ok the file is deleted again and *detail says what went wrong:
-// Cancelled, FileError (the file could not be written) or DownloadFailed (the network, or an empty answer).
+// Cancelled, DiskFull (it did not fit), FileError (the file could not be written otherwise) or DownloadFailed (the network, or an empty answer).
 [[nodiscard]] Result download_to_file(filesystem::IFileSystem& files, INetwork& network, StringView url, StringView path, Progress* progress, crypto::Hasher* hasher,
                                       String* detail);
 

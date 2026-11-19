@@ -3,8 +3,8 @@
 # portable program; try 7zip.7zip for a setup program) fetches winget's index over https once the network is up, installs the package with the kernel's
 # HTTP client - a setup program is run in the Windows layer - reports what the Start menu lists, and removes the package again. Passes if the install did.
 # Uses its own build folder (build-winget-qemu). Needs QEMU's user network to reach the internet.
-# IMAGE_SIZE=20G makes the disk image anew with that size (the default is 10 GiB; a build folder from before that default keeps its 256 MiB image, which
-# a large package does not fit: qBittorrent.qBittorrent, whose setup program is a 32-bit Nullsoft one, needs about 400 MiB).
+# IMAGE_SIZE=20G makes the disk image anew with that size (the default is 10 GiB; scripts/make-primary-image.sh grows a smaller image, keeping its files.
+# A 256 MiB image does not fit large packages: qBittorrent.qBittorrent, whose setup program is a 32-bit Nullsoft one, needs about 400 MiB).
 set -euo pipefail
 cd "$(dirname "$0")/.."
 package=${1:-jqlang.jq}

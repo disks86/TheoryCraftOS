@@ -73,6 +73,7 @@ enum class Result : uint8_t {
   BadChecksum,       // the download is not the file the manifest names (its SHA-256 differs)
   SetupFailed,       // the package's setup program (or its uninstaller) could not be run, or ended with an error
   NoUninstaller,     // the package's setup program left no uninstaller to remove it with
+  DiskFull,          // a download did not fit on the disk it is written to
 };
 StringView result_name(Result result);
 

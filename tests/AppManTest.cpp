@@ -434,8 +434,10 @@ static void test_installer() {
     String detail(a);
     appman::Progress progress;
     const appman::Result r = installer.install("big", &progress, &detail);
-    if (r != appman::Result::FileError) printf("  full disk: %s (%s)\n", sv(appman::result_name(r)).c_str(), sv(detail.view()).c_str());
-    CHECK(r == appman::Result::FileError);
+    if (r != appman::Result::DiskFull) printf("  full disk: %s (%s)\n", sv(appman::result_name(r)).c_str(), sv(detail.view()).c_str());
+    // (said as a full disk, naming the file and how much room it needs, not as some write error)
+    CHECK(r == appman::Result::DiskFull);
+    CHECK(detail.view().starts_with("downloading /Linux/opt/big/") && detail.view().ends_with(" MB"));
     DirectoryEntry e;
     CHECK(small.stat("/Linux/opt/big/big.part", &e) == Status::NotFound && small.stat("/Linux/opt/big/big", &e) == Status::NotFound);
   }
@@ -939,7 +941,7 @@ static void test_winget_installer() {
     for (const char* d : {"/Windows", "/Windows/Program Files", "/Windows/ProgramData"}) (void)tiny.create_directory(d);
     appman::WingetInstaller cramped(a, tiny, net);
     const appman::Result full = cramped.install(package("Test.Zipped"), &progress, &detail);
-    CHECK(full == appman::Result::FileError && !cramped.installed("Test.Zipped"));
+    CHECK(full == appman::Result::DiskFull && !cramped.installed("Test.Zipped"));
   }
   CHECK(a.live == 0);
 }

@@ -34,14 +34,17 @@ struct Writer {
   const uint64_t* total = nullptr;      // (filled in by the network before the first bytes)
   uint64_t offset = 0, reported = 0;
   bool failed = false;
+  Status status = Status::Ok;      // (why writing failed)
 };
 
 bool write_chunk(void* context, ConstByteView data) {
   Writer& w = *static_cast<Writer*>(context);
   if (w.progress && __atomic_load_n(&w.progress->cancel, __ATOMIC_RELAXED)) return false;
   uint64_t done = 0;
-  if (w.file->write(w.offset, data, &done) != Status::Ok || done != data.size()) {
+  const Status s = w.file->write(w.offset, data, &done);
+  if (s != Status::Ok || done != data.size()) {
     w.failed = true;
+    w.status = s == Status::Ok ? Status::NoSpace : s;      // (a short write: the volume filled up)
     return false;
   }
   if (w.hasher) w.hasher->update(data);
@@ -133,15 +136,18 @@ Result download_to_file(filesystem::IFileSystem& files, INetwork& network, Strin
   const bool ok = network.download(url, &write_chunk, &writer, &total);
   if (progress && total) __atomic_store_n(&progress->total, total, __ATOMIC_RELAXED);
   if (progress && progress->changed) progress->changed(progress->context, *progress);
-  const bool flushed = file->flush() == Status::Ok;
+  const Status flush = file->flush();
+  const bool flushed = flush == Status::Ok;
   file = UniquePointer<filesystem::IFile>();
   if (ok && flushed && writer.offset != 0) return Result::Ok;
   (void)files.remove(path);
   if (progress && __atomic_load_n(&progress->cancel, __ATOMIC_RELAXED)) return Result::Cancelled;
   if (writer.failed || !flushed) {
-    detail->assign("writing ");
-    detail->append(path);
-    return Result::FileError;
+    const bool full = (writer.failed ? writer.status : flush) == Status::NoSpace;
+    (void)(full ? detail->assign("downloading ") : detail->assign("writing "));
+    (void)detail->append(path);
+    if (full && total) (void)(detail->append(", which needs ") && detail->append_uint(total / 1000000 + 1) && detail->append(" MB"));
+    return full ? Result::DiskFull : Result::FileError;
   }
   detail->assign(url);
   return Result::DownloadFailed;
