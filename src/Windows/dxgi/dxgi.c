@@ -321,8 +321,11 @@ static HRESULT STDMETHODCALLTYPE adp_EnumOutputs(Adapter *This, UINT index, IDXG
 }
 static void fill_desc(Adapter *a, WCHAR *name, UINT *vendor, UINT *device, UINT *subsys, UINT *revision, SIZE_T *dedicated_video, SIZE_T *dedicated_system, SIZE_T *shared, LUID *luid) {
   memcpy(name, a->info.name, sizeof a->info.name);
-  *vendor = a->info.software ? 0x1414 : 0;       /* (Microsoft Basic Render Driver for the CPU renderer) */
-  *device = a->info.software ? 0x8C : 0;
+  /* The CPU renderer is Microsoft's Basic Render Driver (what WARP shows); a GPU shows the PCI numbers the kernel has for it (programs choose their paths and
+   * workarounds by them: Chrome takes 0x1414:0x8C for software and composites on the CPU). The kernel's own numbers past 0xFFFF are not PCI vendors: 0. */
+  const UINT kernel_vendor = a->info.caps.vendor_id <= 0xFFFF ? a->info.caps.vendor_id : 0;
+  *vendor = a->info.software ? 0x1414 : kernel_vendor;
+  *device = a->info.software ? 0x8C : (kernel_vendor ? a->info.caps.device_id : 0);
   *subsys = 0;
   *revision = 0;
   *dedicated_video = (SIZE_T)a->info.segments[0];
@@ -362,9 +365,15 @@ static HRESULT STDMETHODCALLTYPE adp_GetDesc3(Adapter *This, DXGI_ADAPTER_DESC3 
   return S_OK;
 }
 /* The user-mode driver the adapter has: d3d12.dll for the Direct3D 12 and 11on12 interfaces (the version is that of this system's driver model, WDDM 1.3 = 1300 in 16.16). */
+static const GUID kIID_ID3D10Device = {0x9b7e4c0f, 0x342c, 0x4106, {0xa1, 0x9f, 0x4f, 0x27, 0x04, 0xf6, 0x89, 0xf0}};      /* (d3d10.h's IID_ID3D10Device) */
 static HRESULT STDMETHODCALLTYPE adp_CheckInterfaceSupport(Adapter *This, REFGUID guid, LARGE_INTEGER *umd) {
   if (!guid || !umd) return DXGI_ERROR_INVALID_CALL;
-  if (guid_eq(guid, &IID_IDXGIDevice) || guid_eq(guid, &IID_IDXGIDevice1)) return DXGI_ERROR_UNSUPPORTED;
+  /* (the version of the user-mode driver, which programs read as the driver's: Chrome and ANGLE ask with IDXGIDevice. These libraries are the driver; 31 is a
+   * WDDM 3.x driver's first number, as on Windows 11) */
+  if (guid_eq(guid, &IID_IDXGIDevice) || guid_eq(guid, &IID_IDXGIDevice1) || guid_eq(guid, &kIID_ID3D10Device)) {
+    umd->QuadPart = (LONGLONG)(((ULONGLONG)31 << 48) | ((ULONGLONG)0 << 32) | ((ULONGLONG)101 << 16) | 1);      /* 31.0.101.1 */
+    return S_OK;
+  }
   return DXGI_ERROR_UNSUPPORTED;
 }
 static HRESULT STDMETHODCALLTYPE adp_QueryVideoMemoryInfo(Adapter *This, UINT node, DXGI_MEMORY_SEGMENT_GROUP group, DXGI_QUERY_VIDEO_MEMORY_INFO *info) {

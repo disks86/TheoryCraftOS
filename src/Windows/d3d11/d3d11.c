@@ -47,6 +47,7 @@
 #include <d3d11.h>
 #include <d3d12.h>
 #include <dxgi1_3.h>
+#include <dxgi1_2.h>
 #include "../tcosdx.h"
 
 #pragma GCC diagnostic ignored "-Wunused-function"
@@ -98,13 +99,15 @@ struct Tex {
   D3D11_TEXTURE2D_DESC desc;
   DXGI_FORMAT stored;          /* the format of the Direct3D 12 texture */
   UINT bpp, stored_bpp;        /* bytes a pixel: as the program has it, as it is kept */
-  int expand;                  /* 0: kept as it is; 1: R8 kept as RGBA; 2: A8 kept as RGBA */
+  int expand;                  /* 0: kept as it is; 1: R8 kept as RGBA (r, 0, 0, 1); 2: A8 kept as RGBA (0, 0, 0, a); 3: RG8 kept as RGBA (r, g, 0, 1) */
   int depth;                   /* a depth buffer: the CPU does not reach it */
   ID3D12Resource *res;
   UINT used;
   UINT sampled;                /* the command list that has a draw sampling it */
   BYTE **shadow;               /* by subresource: the copy a Map hands out (NULL until one is mapped) */
   D3D11_MAP *mapped;           /* by subresource: how it is mapped now (0: not) */
+  IDXGIResource1 dxgi_res;     /* the same object, for DXGI (dxgi_resource.inc) */
+  IDXGISurface2 dxgi_surf;
 };
 
 typedef struct View {          /* a render target, depth-stencil or shader resource view: the texture, and its descriptor for the first two */
@@ -145,6 +148,8 @@ typedef struct Pipeline {
   D3D11_DEPTH_STENCIL_DESC depth;
   D3D11_RASTERIZER_DESC raster;
   UINT targets, has_depth;
+  UINT samples;                       /* the targets' sample count */
+  DXGI_FORMAT formats[8], depth_format;      /* (a pipeline is made for its targets' formats) */
   ID3D12PipelineState *state;
   UINT last_used;
 } Pipeline;
@@ -346,12 +351,20 @@ static BOOL format_of(DXGI_FORMAT format, UINT bind, DXGI_FORMAT *stored, UINT *
     case DXGI_FORMAT_R32G32B32A32_FLOAT:
       *bpp = *stored_bpp = 16;
       return !*depth;
-    case DXGI_FORMAT_R8_UNORM: case DXGI_FORMAT_A8_UNORM:
-      *expand = format == DXGI_FORMAT_R8_UNORM ? 1 : 2;
+    /* One- and two-channel formats are kept as RGBA8 (the kernel's images have four channels): sampled they read as Direct3D reads them, and a draw into
+     * one writes only its channels (pipeline_get masks the others), so the rest stay 0 and 1. Chrome keeps the planes of video frames in R8 and RG8. */
+    case DXGI_FORMAT_R8_UNORM: case DXGI_FORMAT_R8_TYPELESS: case DXGI_FORMAT_A8_UNORM:
+      *expand = format == DXGI_FORMAT_A8_UNORM ? 2 : 1;
       *stored = DXGI_FORMAT_R8G8B8A8_UNORM;
       *bpp = 1;
       *stored_bpp = 4;
-      return !*depth && !(bind & D3D11_BIND_RENDER_TARGET);
+      return !*depth && !(format == DXGI_FORMAT_A8_UNORM && (bind & D3D11_BIND_RENDER_TARGET));
+    case DXGI_FORMAT_R8G8_UNORM: case DXGI_FORMAT_R8G8_TYPELESS:
+      *expand = 3;
+      *stored = DXGI_FORMAT_R8G8B8A8_UNORM;
+      *bpp = 2;
+      *stored_bpp = 4;
+      return !*depth;
     case DXGI_FORMAT_D32_FLOAT: case DXGI_FORMAT_D24_UNORM_S8_UINT: case DXGI_FORMAT_R32_TYPELESS: case DXGI_FORMAT_R24G8_TYPELESS:
       *bpp = *stored_bpp = 4;
       return *depth;
@@ -412,9 +425,11 @@ static HRESULT tex_write(Dev *d, Tex *t, UINT sub, UINT x, UINT y, UINT w, UINT 
     BYTE *to = memory + (SIZE_T)row * row_pitch;
     if (!t->expand) memcpy(to, in, row_bytes);
     else for (UINT i = 0; i < w; ++i) {
-      to[4 * i] = t->expand == 1 ? in[i] : 0;
-      to[4 * i + 1] = to[4 * i + 2] = 0;
-      to[4 * i + 3] = t->expand == 1 ? 255 : in[i];
+      const BYTE *p = in + (SIZE_T)i * t->bpp;
+      to[4 * i] = t->expand == 2 ? 0 : p[0];
+      to[4 * i + 1] = t->expand == 3 ? p[1] : 0;
+      to[4 * i + 2] = 0;
+      to[4 * i + 3] = t->expand == 2 ? p[0] : 255;
     }
   }
   ID3D12Resource_Unmap(upload, 0, NULL);
@@ -468,7 +483,10 @@ static HRESULT tex_read(Dev *d, Tex *t, UINT sub, BYTE *rows) {
       const BYTE *in = memory + (SIZE_T)row * row_pitch;
       BYTE *to_row = rows + (SIZE_T)row * w * t->bpp;
       if (!t->expand) memcpy(to_row, in, (SIZE_T)w * t->bpp);
-      else for (UINT i = 0; i < w; ++i) to_row[i] = in[4 * i + (t->expand == 1 ? 0 : 3)];
+      else for (UINT i = 0; i < w; ++i) {
+        if (t->expand == 3) { to_row[2 * i] = in[4 * i]; to_row[2 * i + 1] = in[4 * i + 1]; }
+        else to_row[i] = in[4 * i + (t->expand == 1 ? 0 : 3)];
+      }
     }
     ID3D12Resource_Unmap(readback, 0, NULL);
   } else if (SUCCEEDED(hr)) hr = E_FAIL;
@@ -490,23 +508,51 @@ static void STDMETHODCALLTYPE tex_SetEvictionPriority(Tex *t, UINT priority) { (
 static UINT STDMETHODCALLTYPE tex_GetEvictionPriority(Tex *t) { (void)t; return 0; }
 static void STDMETHODCALLTYPE tex_GetDesc(Tex *t, D3D11_TEXTURE2D_DESC *desc) { if (desc) *desc = t->desc; }
 
+static void tex_dxgi_init(Tex *t);      /* (dxgi_resource.inc) */
+
+/* A texture this library cannot make, said once for each format (what a program wanted that is missing). */
+static void tex_refused(const D3D11_TEXTURE2D_DESC *desc, const char *why) {
+  static volatile LONG said[256];
+  const UINT f = (UINT)desc->Format < 256 ? (UINT)desc->Format : 255;
+  if (InterlockedExchange((LONG *)&said[f], 1)) return;
+  char text[240];
+  SIZE_T n = 0;
+  const char *parts[8] = {"dx: refused: ID3D11Device::CreateTexture2D format ", " bind ", " misc ", " size ", "x", " layers ", " samples ", " levels "};
+  const UINT values[8] = {(UINT)desc->Format, desc->BindFlags, desc->MiscFlags, desc->Width, desc->Height, desc->ArraySize, desc->SampleDesc.Count, desc->MipLevels};
+  for (UINT i = 0; i < 8; ++i) {
+    for (const char *c = parts[i]; *c && n + 1 < sizeof text; ++c) text[n++] = *c;
+    char digits[12];
+    UINT k = 0, v = values[i];
+    do { digits[k++] = (char)('0' + v % 10); v /= 10; } while (v && k < sizeof digits);
+    while (k && n + 1 < sizeof text) text[n++] = digits[--k];
+  }
+  if (n + 3 < sizeof text) { text[n++] = ':'; text[n++] = ' '; }
+  for (const char *c = why; *c && n + 1 < sizeof text; ++c) text[n++] = *c;
+  text[n] = 0;
+  dx_say(text);
+}
+
 /* A texture object around `res` (a reference is taken), or around a new Direct3D 12 texture when it is NULL. */
 static HRESULT tex_make(Dev *d, const D3D11_TEXTURE2D_DESC *in, ID3D12Resource *res, Tex **out) {
   D3D11_TEXTURE2D_DESC desc = *in;
   *out = NULL;
-  if (desc.Width == 0 || desc.Height == 0 || desc.Width > 4096 || desc.Height > 4096 || desc.ArraySize == 0) return E_INVALIDARG;
-  if (desc.SampleDesc.Count > 1) return DXGI_ERROR_UNSUPPORTED;
-  if (desc.MiscFlags & D3D11_RESOURCE_MISC_TEXTURECUBE) return DXGI_ERROR_UNSUPPORTED;
+  if (desc.Width == 0 || desc.Height == 0 || desc.ArraySize == 0) return E_INVALIDARG;
+  if (desc.Width > 4096 || desc.Height > 4096) { tex_refused(&desc, "larger than 4096"); return E_INVALIDARG; }
+  if (desc.MiscFlags & D3D11_RESOURCE_MISC_TEXTURECUBE) { tex_refused(&desc, "a cube"); return DXGI_ERROR_UNSUPPORTED; }
   const BOOL target = (desc.BindFlags & (D3D11_BIND_RENDER_TARGET | D3D11_BIND_DEPTH_STENCIL)) != 0;
+  /* (a multisampled texture: a render target or depth buffer of one level and one layer, drawn into and resolved; the adapter says which counts it has) */
+  if (desc.SampleDesc.Count == 0) return E_INVALIDARG;
+  if (desc.SampleDesc.Count > 1 && (!target || desc.ArraySize != 1 || desc.CPUAccessFlags || desc.Usage != D3D11_USAGE_DEFAULT)) { tex_refused(&desc, "multisampled"); return E_INVALIDARG; }
   UINT full = 1;
   for (UINT size = desc.Width > desc.Height ? desc.Width : desc.Height; size > 1; size >>= 1) ++full;
   /* (a render target has one level here: the kernel draws into those only) */
-  if (target || desc.ArraySize > 1) desc.MipLevels = 1;
+  if (target || desc.ArraySize > 1 || desc.SampleDesc.Count > 1) desc.MipLevels = 1;
   else if (desc.MipLevels == 0 || desc.MipLevels > full) desc.MipLevels = full;
   Tex *t = child_new(sizeof *t, d, &tex_vtbl, g_tex_iids, tex_destroy);
   if (!t) return E_OUTOFMEMORY;
+  tex_dxgi_init(t);
   t->desc = desc;
-  if (!format_of(desc.Format, desc.BindFlags, &t->stored, &t->bpp, &t->stored_bpp, &t->expand, &t->depth)) { dx_Release(OBJ(t)); return E_INVALIDARG; }
+  if (!format_of(desc.Format, desc.BindFlags, &t->stored, &t->bpp, &t->stored_bpp, &t->expand, &t->depth)) { tex_refused(&desc, "the format, for that use"); dx_Release(OBJ(t)); return E_INVALIDARG; }
   t->shadow = mem_alloc(sizeof(BYTE *) * tex_subresources(t));
   t->mapped = mem_alloc(sizeof(D3D11_MAP) * tex_subresources(t));
   if (!t->shadow || !t->mapped) { dx_Release(OBJ(t)); return E_OUTOFMEMORY; }
@@ -515,12 +561,12 @@ static HRESULT tex_make(Dev *d, const D3D11_TEXTURE2D_DESC *in, ID3D12Resource *
     t->res = res;
   } else {
     D3D12_HEAP_PROPERTIES props = {D3D12_HEAP_TYPE_DEFAULT, D3D12_CPU_PAGE_PROPERTY_UNKNOWN, D3D12_MEMORY_POOL_UNKNOWN, 1, 1};
-    D3D12_RESOURCE_DESC rd = {D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, desc.Width, desc.Height, (UINT16)desc.ArraySize, (UINT16)desc.MipLevels, t->stored, {1, 0},
+    D3D12_RESOURCE_DESC rd = {D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, desc.Width, desc.Height, (UINT16)desc.ArraySize, (UINT16)desc.MipLevels, t->stored, {desc.SampleDesc.Count, 0},
                               D3D12_TEXTURE_LAYOUT_UNKNOWN, D3D12_RESOURCE_FLAG_NONE};
     if (desc.BindFlags & D3D11_BIND_RENDER_TARGET) rd.Flags |= D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
     if (t->depth) rd.Flags |= D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
     const HRESULT hr = ID3D12Device_CreateCommittedResource(d->d12, &props, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_COMMON, NULL, &IID_ID3D12Resource, (void **)&t->res);
-    if (FAILED(hr) || !t->res) { dx_Release(OBJ(t)); return FAILED(hr) ? hr : E_FAIL; }
+    if (FAILED(hr) || !t->res) { tex_refused(&desc, "Direct3D 12 below refused it"); dx_Release(OBJ(t)); return FAILED(hr) ? hr : E_FAIL; }
   }
   *out = t;
   return S_OK;
@@ -601,7 +647,11 @@ static HRESULT STDMETHODCALLTYPE dev_CreateRenderTargetView(Dev *d, ID3D11Resour
   else { v->desc.rtv.Format = t->desc.Format; v->desc.rtv.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D; }
   v->handle = ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(d->rtv_heap);
   v->handle.ptr += (SIZE_T)v->slot * ID3D12Device_GetDescriptorHandleIncrementSize(d->d12, D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
-  ID3D12Device_CreateRenderTargetView(d->d12, t->res, NULL, v->handle);
+  if (t->desc.SampleDesc.Count > 1) {
+    v->desc.rtv.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2DMS;
+    D3D12_RENDER_TARGET_VIEW_DESC ms = {t->stored, D3D12_RTV_DIMENSION_TEXTURE2DMS, {{0}}};
+    ID3D12Device_CreateRenderTargetView(d->d12, t->res, &ms, v->handle);
+  } else ID3D12Device_CreateRenderTargetView(d->d12, t->res, NULL, v->handle);
   return give(v, (void **)out);
 }
 static HRESULT STDMETHODCALLTYPE dev_CreateDepthStencilView(Dev *d, ID3D11Resource *resource, const D3D11_DEPTH_STENCIL_VIEW_DESC *desc, ID3D11DepthStencilView **out) {
@@ -620,14 +670,15 @@ static HRESULT STDMETHODCALLTYPE dev_CreateDepthStencilView(Dev *d, ID3D11Resour
   else { v->desc.dsv.Format = t->desc.Format; v->desc.dsv.ViewDimension = D3D11_DSV_DIMENSION_TEXTURE2D; }
   v->handle = ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(d->dsv_heap);
   v->handle.ptr += (SIZE_T)v->slot * ID3D12Device_GetDescriptorHandleIncrementSize(d->d12, D3D12_DESCRIPTOR_HEAP_TYPE_DSV);
-  ID3D12Device_CreateDepthStencilView(d->d12, t->res, NULL, v->handle);
+  if (t->desc.SampleDesc.Count > 1) v->desc.dsv.ViewDimension = D3D11_DSV_DIMENSION_TEXTURE2DMS;
+  ID3D12Device_CreateDepthStencilView(d->d12, t->res, NULL, v->handle);      /* (the view follows the resource: a multisampled one is seen as such) */
   return give(v, (void **)out);
 }
 static HRESULT STDMETHODCALLTYPE dev_CreateShaderResourceView(Dev *d, ID3D11Resource *resource, const D3D11_SHADER_RESOURCE_VIEW_DESC *desc, ID3D11ShaderResourceView **out) {
   if (out) *out = NULL;
   Tex *t = tex_of_resource(resource);
   if (!t) return resource ? E_NOTIMPL : E_INVALIDARG;      /* (a buffer as a shader resource) */
-  if (t->depth || !(t->desc.BindFlags & D3D11_BIND_SHADER_RESOURCE)) return E_INVALIDARG;
+  if (!(t->desc.BindFlags & D3D11_BIND_SHADER_RESOURCE)) return E_INVALIDARG;      /* (a depth buffer made to be read too has one: ANGLE makes them for its depth renderbuffers) */
   View *v = child_new(sizeof *v, d, &srv_vtbl, g_srv_iids, srv_destroy);
   if (!v) return E_OUTOFMEMORY;
   dx_AddRef(OBJ(t));
@@ -839,4 +890,5 @@ static UINT64 query_now(void) {
 
 #include "context.inc"
 #include "device.inc"
+#include "dxgi_resource.inc"
 #include "vtbl.inc"

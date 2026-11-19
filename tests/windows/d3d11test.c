@@ -545,6 +545,111 @@ static void test_swap_chain(void) {
   DestroyWindow(window);
 }
 
+/* Multisampling, as Skia (Chrome's compositor) wants it of an OpenGL ES 3 context: a 4x render target drawn into and resolved into an ordinary texture.
+ * An adapter without 4x says so and refuses the texture. */
+static void test_multisample(void) {
+  UINT levels = 0;
+  check(SUCCEEDED(ID3D11Device_CheckMultisampleQualityLevels(g_device, DXGI_FORMAT_B8G8R8A8_UNORM, 4, &levels)), "CheckMultisampleQualityLevels for 4 samples");
+  D3D11_TEXTURE2D_DESC desc = {SIZE, SIZE, 1, 1, DXGI_FORMAT_B8G8R8A8_UNORM, {4, 0}, D3D11_USAGE_DEFAULT, D3D11_BIND_RENDER_TARGET, 0, 0};
+  ID3D11Texture2D *ms = NULL;
+  const HRESULT made = ID3D11Device_CreateTexture2D(g_device, &desc, NULL, &ms);
+  UINT support = 0;
+  ID3D11Device_CheckFormatSupport(g_device, DXGI_FORMAT_B8G8R8A8_UNORM, &support);
+  if (levels == 0) {
+    printf("d3d11test: (this adapter has no 4x multisampling)\n");
+    check(FAILED(made) && !ms && !(support & D3D11_FORMAT_SUPPORT_MULTISAMPLE_RENDERTARGET), "... so a 4x texture is refused and the format does not claim it");
+    if (ms) ID3D11Texture2D_Release(ms);
+    return;
+  }
+  check(SUCCEEDED(made) && ms && (support & D3D11_FORMAT_SUPPORT_MULTISAMPLE_RENDERTARGET) && (support & D3D11_FORMAT_SUPPORT_MULTISAMPLE_RESOLVE),
+        "a 4x render target, and the format says it can be one");
+  ID3D11RenderTargetView *view = NULL;
+  check(ms && SUCCEEDED(ID3D11Device_CreateRenderTargetView(g_device, (ID3D11Resource *)ms, NULL, &view)) && view, "... its view");
+  if (!view) { if (ms) ID3D11Texture2D_Release(ms); return; }
+  D3D11_RENDER_TARGET_VIEW_DESC vd;
+  ID3D11RenderTargetView_GetDesc(view, &vd);
+  check(vd.ViewDimension == D3D11_RTV_DIMENSION_TEXTURE2DMS, "... which is a multisampled view");
+  begin(NULL);
+  ID3D11DeviceContext_OMSetRenderTargets(g_context, 1, &view, NULL);
+  const float sky[4] = {0, 0, 1, 1};
+  ID3D11DeviceContext_ClearRenderTargetView(g_context, view, sky);
+  ID3D11Buffer *vertices = triangle(0.5f, 0, 1, 0);
+  bind_floats(vertices);
+  ID3D11DeviceContext_PSSetShader(g_context, g_ps_color, NULL, 0);
+  ID3D11DeviceContext_Draw(g_context, 3, 0);
+  ID3D11DeviceContext_ResolveSubresource(g_context, (ID3D11Resource *)g_target, 0, (ID3D11Resource *)ms, 0, DXGI_FORMAT_B8G8R8A8_UNORM);
+  check(read_target(), "ResolveSubresource into the ordinary target, read back");
+  int green_inside = 0, mixed = 0;
+  for (int i = 0; i < SIZE * SIZE; ++i) {
+    const UINT32 p = g_pixels[i];
+    if (green(p) > 250 && blue(p) < 5) ++green_inside;
+    else if (green(p) > 20 && blue(p) > 20) ++mixed;      /* (an edge pixel: some samples green, some blue) */
+  }
+  printf("d3d11test: (resolved: corner %08x, middle %08x, %d green, %d on the edges)\n", (unsigned)pixel(0, 0), (unsigned)pixel(32, 32), green_inside, mixed);
+  check(blue(pixel(0, 0)) > 250 && green(pixel(0, 0)) < 5 && green(pixel(32, 32)) > 250 && green_inside > 600, "the triangle drawn over the clear colour");
+  check(mixed > 0, "edge pixels mix both colours (the samples were kept apart and averaged)");
+  ID3D11Buffer_Release(vertices);
+  ID3D11RenderTargetView_Release(view);
+  ID3D11Texture2D_Release(ms);
+  begin(NULL);
+}
+
+/* One- and two-channel textures, as Chrome keeps the planes of video frames: an R8 render target cleared and drawn into (only red is written), and RG8 data
+ * that comes back as it went in. */
+static void test_small_formats(void) {
+  D3D11_TEXTURE2D_DESC desc = {SIZE, SIZE, 1, 1, DXGI_FORMAT_R8_UNORM, {1, 0}, D3D11_USAGE_DEFAULT, D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE, 0, 0};
+  D3D11_TEXTURE2D_DESC staging = {SIZE, SIZE, 1, 1, DXGI_FORMAT_R8_UNORM, {1, 0}, D3D11_USAGE_STAGING, 0, D3D11_CPU_ACCESS_READ, 0};
+  ID3D11Texture2D *r8 = NULL, *r8_read = NULL;
+  ID3D11RenderTargetView *view = NULL;
+  UINT support = 0;
+  check(SUCCEEDED(ID3D11Device_CheckFormatSupport(g_device, DXGI_FORMAT_R8_UNORM, &support)) && (support & D3D11_FORMAT_SUPPORT_RENDER_TARGET), "R8 can be a render target");
+  check(SUCCEEDED(ID3D11Device_CreateTexture2D(g_device, &desc, NULL, &r8)) && SUCCEEDED(ID3D11Device_CreateTexture2D(g_device, &staging, NULL, &r8_read)) &&
+        SUCCEEDED(ID3D11Device_CreateRenderTargetView(g_device, (ID3D11Resource *)r8, NULL, &view)), "an R8 render target, its view and an R8 staging texture");
+  if (view && r8_read) {
+    begin(NULL);
+    ID3D11DeviceContext_OMSetRenderTargets(g_context, 1, &view, NULL);
+    const float half[4] = {0.5f, 0.75f, 0.25f, 0.5f};
+    ID3D11DeviceContext_ClearRenderTargetView(g_context, view, half);
+    ID3D11Buffer *vertices = triangle(0.5f, 1, 1, 1);      /* (white: 1 into red) */
+    bind_floats(vertices);
+    ID3D11DeviceContext_PSSetShader(g_context, g_ps_color, NULL, 0);
+    ID3D11DeviceContext_Draw(g_context, 3, 0);
+    ID3D11DeviceContext_CopyResource(g_context, (ID3D11Resource *)r8_read, (ID3D11Resource *)r8);
+    D3D11_MAPPED_SUBRESOURCE m;
+    int corner = -1, middle = -1;
+    if (SUCCEEDED(ID3D11DeviceContext_Map(g_context, (ID3D11Resource *)r8_read, 0, D3D11_MAP_READ, 0, &m))) {
+      const BYTE *b = m.pData;
+      corner = b[0];
+      middle = b[32 * m.RowPitch + 32];
+      ID3D11DeviceContext_Unmap(g_context, (ID3D11Resource *)r8_read, 0);
+    }
+    printf("d3d11test: (R8 target: corner %d, middle %d)\n", corner, middle);
+    check(corner >= 127 && corner <= 128 && middle == 255, "an R8 target holds the clear's red and the draw's red, one byte a pixel");
+    ID3D11Buffer_Release(vertices);
+    begin(NULL);
+  }
+  if (view) ID3D11RenderTargetView_Release(view);
+  if (r8) ID3D11Texture2D_Release(r8);
+  if (r8_read) ID3D11Texture2D_Release(r8_read);
+
+  BYTE rg[4 * 2 * 2];
+  for (int i = 0; i < 8; ++i) { rg[2 * i] = (BYTE)(10 + i); rg[2 * i + 1] = (BYTE)(200 - i); }
+  D3D11_TEXTURE2D_DESC rg_desc = {4, 2, 1, 1, DXGI_FORMAT_R8G8_UNORM, {1, 0}, D3D11_USAGE_STAGING, 0, D3D11_CPU_ACCESS_READ | D3D11_CPU_ACCESS_WRITE, 0};
+  D3D11_SUBRESOURCE_DATA initial = {rg, 8, 0};
+  ID3D11Texture2D *rg8 = NULL;
+  int same = 0;
+  if (SUCCEEDED(ID3D11Device_CreateTexture2D(g_device, &rg_desc, &initial, &rg8)) && rg8) {
+    D3D11_MAPPED_SUBRESOURCE m;
+    if (SUCCEEDED(ID3D11DeviceContext_Map(g_context, (ID3D11Resource *)rg8, 0, D3D11_MAP_READ, 0, &m))) {
+      same = 1;
+      for (int y = 0; y < 2; ++y) for (int x = 0; x < 8; ++x) same &= ((const BYTE *)m.pData)[y * m.RowPitch + x] == rg[y * 8 + x];
+      ID3D11DeviceContext_Unmap(g_context, (ID3D11Resource *)rg8, 0);
+    }
+    ID3D11Texture2D_Release(rg8);
+  }
+  check(same, "an RG8 texture gives back the two bytes a pixel it was made with");
+}
+
 int main(void) {
   test_device();
   if (g_device && g_context) {
@@ -556,6 +661,8 @@ int main(void) {
       test_texture();
       test_depth_and_blend();
       test_indexed();
+      test_multisample();
+      test_small_formats();
     }
     ID3D11DeviceContext_ClearState(g_context);
     ID3D11DeviceContext_Flush(g_context);

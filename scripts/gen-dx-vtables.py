@@ -137,17 +137,55 @@ def check_arguments(dll, fn, after, parameters):
     if have != want:
         problems.append('%s: %s takes %d parameters, the interface gives it %d' % (dll, fn, have, want))
 
-def stub(var, name, result, parameters):
+def stub(iface, var, name, result, parameters):
     """A method nobody wrote, with the method's own signature: in a 32-bit program a method takes its arguments off the stack, so one function cannot
     stand in for them all. It answers E_NOTIMPL, or nothing (0, NULL) where the method has no HRESULT."""
     fn = '%s_none_%s' % (var, name)
+    said = 'static volatile LONG said; dx_unimplemented(&said, "%s::%s");' % (iface, name)      # (what a program missed: said once, see dxcommon.h)
     if result == 'void':
-        body = ''
+        body = said
     elif result == 'HRESULT':
-        body = 'return E_NOTIMPL;'
+        body = said + ' return E_NOTIMPL;'
     else:
-        body = 'return (%s)0;' % result
+        body = said + ' return (%s)0;' % result
     return fn, 'static %s STDMETHODCALLTYPE %s(%s) { %s }' % (result, fn, parameters, body)
+
+def parameter_names(parameters):
+    """The names of a method's parameters (This first), from its declaration list."""
+    names, depth, part = [], 0, ''
+    for ch in parameters + ',':
+        if ch == ',' and depth == 0:
+            words = re.findall(r'[A-Za-z_]\w*', re.sub(r'\[[^\]]*\]', '', part))
+            if words:
+                names.append(words[-1])
+            part = ''
+            continue
+        depth += ch in '([' ; depth -= ch in ')]'
+        part += ch
+    return names
+
+def all_named(parameters):
+    """Every parameter has a name (some headers leave them out: such a method is not wrapped)."""
+    depth, part, parts = 0, '', []
+    for ch in parameters + ',':
+        if ch == ',' and depth == 0:
+            parts.append(part.strip()); part = ''; continue
+        depth += ch in '([' ; depth -= ch in ')]'
+        part += ch
+    for p in parts:
+        bare = re.sub(r'\[[^\]]*\]', '', p).strip()
+        words = [w for w in re.findall(r'[A-Za-z_]\w*', bare) if w not in ('const', 'struct', 'enum', 'unsigned', 'signed', 'volatile')]
+        if bare.endswith('*') or len(words) < 2:
+            return False
+    return True
+
+def checked(iface, var, name, impl, parameters):
+    """A written method that answers an HRESULT, wrapped so its first failures are said (dx_failed in dxcommon.h): what made a program give up."""
+    fn = '%s_checked_%s' % (var, name)
+    names = parameter_names(parameters)
+    call = '%s(%s)' % (impl, ', '.join(['(void *)' + names[0]] + names[1:]))      # (the object as the implementation takes it: the rest have the interface's types)
+    return fn, ('static HRESULT STDMETHODCALLTYPE %s(%s) { const HRESULT hr = %s; if (FAILED(hr)) { static volatile LONG said; dx_failed(&said, "%s::%s", hr); } '
+                'return hr; }') % (fn, parameters, call, iface, name)
 
 for dll, specs in SPECS.items():
     folder = os.path.join(ROOT, dll)
@@ -169,7 +207,10 @@ for dll, specs in SPECS.items():
                         check_arguments(dll, fn, source[found.end():], parameters)
                     break
             if impl is None:
-                impl, definition = stub(var, name, result, parameters)
+                impl, definition = stub(iface, var, name, result, parameters)
+                out.append(definition)
+            elif result == 'HRESULT' and name != 'QueryInterface' and all_named(parameters):      # (interfaces not there are said by the QueryInterfaces)
+                impl, definition = checked(iface, var, name, impl, parameters)
                 out.append(definition)
             table.append('    .%s = (__typeof__(((%sVtbl *)0)->%s))%s,' % (name, iface, name, impl))
         out += table + ['};']
