@@ -23,7 +23,25 @@ Nothing here is limited to two GPUs: the machine's GPUs are a list of up to `Gpu
 
 `main.cpp` builds the pool and the graphics pool after `SystemGraphics` and logs the GPUs when there are several.
 
-## Laptops: runtime power of the discrete GPU
+## The desktop across GPUs
+
+The desktop spans the monitors of every GPU that has a display driver (test: `tests/run_host_tests.sh MultiGpuMonitorTest`, ASan and TSan).
+
+- `main.cpp` hands `SystemMonitors` every `GpuPool` node with a driver besides the display GPU (`add_gpu(driver, pool index)`). The display GPU's monitors
+  come first and keep their ids (their connector numbers) and order, so one GPU behaves as before; the k-th other GPU's monitors get the ids
+  `k * 16 + connector`, from its `IMonitorSource`, or its whole screen as one monitor when it has none. `Monitor::gpu()` is the pool index; the boot log
+  and the Display settings page say which GPU drives each monitor.
+- The default row puts the other GPUs' monitors to the right, GPU after GPU; they are dragged, scaled, made primary and given modes like any other. A
+  mode change goes to that GPU's driver: `IMonitorSource::set_display_mode`, `apply_layout` for a GPU with several monitors, or
+  `IGraphicsProcessingUnit::set_mode` (its own mode list) for a GPU that tells nothing about monitors.
+- Each GPU has a surface of its own: `physical_placements()` puts each monitor in its own GPU's row, and `targets()` lists the monitors that are not on the
+  display GPU. `MonitorDisplay::update(..., targets)` then copies those monitors' part of every rectangle the desktop's renderer blits (its damage) to
+  their GPU's screen through the driver's `blit()`, resampled when scaled, and `present()` presents each GPU that got something. The software pointer is
+  part of the desktop's picture, so it is drawn on every screen. A copy to another GPU holds that GPU's `GraphicsPool::present_lock`, the lock
+  `present_image` takes. With no other GPU nothing of this runs.
+- Hot plug works as on the display GPU: `poll()` asks every GPU's monitor source.
+
+
 
 What Linux does with runtime PM and vga_switcheroo, in `GpuManager` (test: `tests/run_host_tests.sh GpuRuntimePowerTest`, ASan and TSan):
 
@@ -34,27 +52,44 @@ What Linux does with runtime PM and vga_switcheroo, in `GpuManager` (test: `test
 | D3cold | With an `IGpuPlatformPower` attached and `allow_cold` set, `service()` takes a D3hot GPU on to D3cold. The type 0 header of the GPU and its functions is saved before and written back after the power returns (BARs, ROM BAR, interrupt line, command last). |
 | Power source | `set_power_status` (from the battery read every 10 s) fills in what a `select()` caller leaves Unknown: on battery below 30 % or with power saver, heavy work goes to the integrated GPU. |
 | Probes | `GpuPool::bind_probes` gives a driverless GPU an `IGpuProbe` (`Multi/GpuProbe.hpp`, `GpuProbes.cpp`): NVIDIA through the native driver's read-only start (chip, VRAM, VBIOS, sensors, the EDID of monitors on the GPU's own ports), AMD and Intel discrete chips through register reads (see "AMD and Intel probes" below). A probe sets itself up again after a wake, so a GPU with only a probe may go cold. `probe_temperature` never wakes a GPU. |
-| POST | A secondary NVIDIA GPU that the firmware did not POST (and every one after a power cut) needs its VBIOS init scripts (`Nvkm/NvInitScript`, PLLs through `Nvkm/NvPll`) or, on GM20x to Volta, the VBIOS's DEVINIT application run on the PMU falcon (`NvDevinit::post`, see [Nvidia.md](Nvidia.md)). Both write to the card, so they run only with `TCOS_NVIDIA_NATIVE`; otherwise they are walked dry and the boot log says so. Turing+ (FWSEC) is refused. |
+| POST | A secondary NVIDIA GPU that the firmware did not POST (and every one after a power cut) needs its VBIOS init scripts (`Nvkm/NvInitScript`, PLLs through `Nvkm/NvPll`) or, on GM20x to Volta, the VBIOS's DEVINIT application run on the PMU falcon (`NvDevinit::post`, see [Nvidia.md](Nvidia.md)). Both write to the card, so they run only with `TCOS_NVIDIA_NATIVE`; otherwise they are walked dry and the boot log says so. Turing+ boots itself from its ROM (FWSEC): `post()` waits (bounded, reads only, so in every build) for the GFW_BOOT flags (0x118128 bit 0, then 0x118234 = 0xff). |
 | Render choice | `GraphicsPool::acquire` no longer wakes a discrete GPU with no driver and no 3D engine (the work would run on the CPU anyway): the display GPU gets it. |
 | PCI Express link | `enable_aspm(i)` turns on the L0s/L1/clock-PM states both ends of the GPU's link support (`main.cpp` does it for the discrete GPUs of hybrid machines). The Express capability's Device/Link Control registers are saved and restored with the header across a power cut. `set_link_off_when_cold(i)` disables the root port's link before the cut and retrains it (waiting for the data link) after; off by default. |
 
 The platform handlers (attached in `main.cpp` once the ACPI tables are loaded, one per sleeping discrete GPU):
 
+- Display mux switch (`Multi/GpuMuxSwitch`, `Multi/GpuMuxPanel.hpp`; test `GpuMuxSwitchTest`, ASan and TSan): vga_switcheroo's switch.
+  `GpuMuxSwitch(mux, leases, integrated_index, discrete_index, boot_side)` with each side's `IPanelOutput` attached; `switch_to(side)`
+  checks (a mux, a driver on both sides, the target has a panel output and can light it, no switch in flight: a second caller gets `Busy`),
+  takes a lease on the target (`GpuManagerLeases`: the GPU wakes), moves DDC first where the mux can, lets the target light the panel, moves
+  the mux, then the old side releases the panel and its lease goes back (the discrete GPU may sleep). A failure is undone in reverse; a
+  rollback that fails leaves the state unknown (`active()` false) until a mux that can tell (gmux) or `set_known_active()` settles it.
+  `can_switch_to(side, &why)` is for a settings page. `main.cpp` keeps the gmux or the `GpuAcpiPower::find_mux` object, builds the switcher
+  (integrated side `GopPanelOutput`, discrete side `GpuNode::panel`), publishes it (`GpuMuxSwitch::published()`) and logs the mux kind.
 - [MultiGpuAcpi.md](MultiGpuAcpi.md): `Multi/Acpi/`: finding the GPU's ACPI device, `_PR3`/`_PR0` power resources with `_PS3`/`_PS0`, NVIDIA Optimus / JT / the old hybrid `_DSM`, AMD ATPX (power and mux). Test `GpuAcpiPowerTest`.
 - [MultiGpuPlatform.md](MultiGpuPlatform.md): Apple gmux (`Multi/AppleGmux`: mux, discrete power, backlight) and the PCI Express link (`Multi/PcieLink`: upstream bridge, device functions, link disable/retrain, ASPM negotiation). Tests `AppleGmuxTest`, `PcieLinkTest`.
 
 ## Not done
 
 - **Display drivers for a second GPU:** NVIDIA has one (`NVIDIA/NvidiaSecondaryGpu`: mode set from the EDID, BAR1 page tables, TMDS and DisplayPort on the GF119
-  display class; Kepler to Pascal), behind `TCOS_NVIDIA_NATIVE` and never run on a card. Tesla, Volta and later NVIDIA, and every AMD and Intel discrete GPU, have only a
+  display class; Kepler to Pascal), behind `TCOS_NVIDIA_NATIVE` and never run on a card. AMD Polaris 10/11/12 and Vega M have one too (`AMD/AmdSecondaryGpu`: POST,
+  memory controller apertures, EDID mode set through the video BIOS's command tables on DCE 11.2, HDMI/DVI and DisplayPort with link training; see NativeModeSetting.md),
+  behind `TCOS_AMD_NATIVE` and never run on a card. Tesla, Volta and later NVIDIA, AMD Vega 10 and Navi and later (DCE 12 / DCN), and every Intel discrete GPU, have only a
   probe: they cannot show anything and render only on the CPU. Each display driver plugs into `GpuNativeDrivers.cpp` (display) and `RenderNodeAccel.cpp` (3D).
-- The desktop does not span monitors on several GPUs: `SystemMonitors` and the monitor compositor still drive the display GPU only, so a monitor lit by the
-  secondary NVIDIA driver shows only what is presented to it (`present_image`, `renderer_2d(i)`).
+- Spanning (see "The desktop across GPUs"): the desktop is drawn once, on the CPU, and copied to the other GPUs' screens (no rendering on the GPU that drives
+  the monitor); monitors at different scales on several GPUs are resampled from one picture instead of each drawn at its own scale (`MonitorRenderers` is
+  for the display GPU only); a monitor hot-plugged on another GPU is seen only if that GPU's monitor source reports connector changes
+  (`refresh_connectors`); the console after the desktop shows on the display GPU only, the other screens keep the desktop's last picture.
 - A GPU with a display driver is never power-cycled (the drivers cannot restore their state), so it stays awake.
-- The mux is found (gmux, ATPX, NVIDIA hybrid `_DSM`) but nothing switches the panel.
-- Link disable around D3cold is available but off by default; Turing+ NVIDIA POST (FWSEC); jack sensing while the GPU's HD audio sleeps.
+- The mux switch (`Multi/GpuMuxSwitch`, below) is an API only: no settings page calls it, and moving the desktop onto the other GPU's framebuffer
+  is not done. The integrated side is the firmware's framebuffer (`GopPanelOutput`): the panel can go to the discrete GPU and not come back
+  until a restart. Only `NvidiaSecondaryGpu` (with `TCOS_NVIDIA_NATIVE`) implements `IPanelOutput`; none of it has run on a muxed laptop.
+- Link disable around D3cold is available but off by default; Turing+ NVIDIA POST is only the GFW_BOOT wait (nouveau's PRE_OS start after it
+  is not done); jack sensing while the GPU's HD audio sleeps (with the GPU's power cut its own hot-plug detection is dark too, and how a
+  laptop reports a new monitor then is board specific).
 - Cross-GPU copies are a read-back plus a blit through the CPU (no peer-to-peer DMA, no shared surfaces).
-- Tested against fake PCI buses, register models, fake AML and fake ports, and built for UEFI, but not run on real hybrid hardware or in QEMU with several GPUs.
+- Tested against fake PCI buses, register models, fake AML and fake ports, and built for UEFI. In QEMU only spanning was run (QEMU VGA + a second virtio-gpu,
+  both heads checked by screendump); nothing has run on real hybrid hardware.
 
 ## AMD and Intel probes
 

@@ -95,6 +95,14 @@ class AmdGmc8 {
   Result start(const AmdGmc8GartPlan& plan, const Memory& memory, uint32_t timeout_us = kDefaultTimeoutUs);
   // gmc_v8_0_gart_disable.
   void stop();
+  // gmc_v8_0_mc_program alone, for a driver that only drives the display (the secondary GPU's, AmdSecondaryGpu) and has no GART: the golden registers, the HDP initialised, with
+  // `lock_out_vga` the VGA aperture locked out and VGA rendering off (what the driver does when the card has display controllers), the system aperture over video memory
+  // (plan.vram_start .. plan.vram_end, where the display reads without translation; unmapped accesses go to `scratch_page_gpu_address`), no AGP window, the BIF framebuffer access on,
+  // the HDP set up. VM contexts are not touched. BadArgument for a plan with no video memory or a scratch page that is not a page of the 40-bit space; NotIdle if the memory controller
+  // never went idle (everything is written all the same, as the driver only warns).
+  Result program_apertures(const AmdGmc8GartPlan& plan, uint64_t scratch_page_gpu_address, bool lock_out_vga, uint32_t timeout_us = kDefaultTimeoutUs);
+  // dce_v11_0.c / vid.h: VGA_HDP_CONTROL.VGA_MEMORY_DISABLE and VGA_RENDER_CONTROL.VGA_VSTATUS_CNTL (the display block's registers mc_program writes)
+  static constexpr uint32_t kVgaHdpControl = 0xCA, kVgaMemoryDisable = 0x10, kVgaRenderControl = 0xC0, kVgaVstatusCntl = 0x30000;
 
   // Maps the pages at `gpu_page_addresses` (each page aligned, inside the 40-bit space) to the GART pages from `first_page` on, with `pte_flags`, then flushes the host data
   // path and the GPU's TLBs. False if the range leaves the GART or an address is not a valid page (nothing is written then).
@@ -114,7 +122,7 @@ class AmdGmc8 {
   void wr(uint32_t reg, uint32_t value) { registers_.write(reg, value); }
   bool wait_for_idle(uint32_t timeout_us);
   void program_golden_registers();
-  bool mc_program(uint32_t timeout_us);
+  bool mc_program(uint32_t timeout_us, bool lock_out_vga = false);
   void gart_enable();
 
   IVcnRegisters& registers_;

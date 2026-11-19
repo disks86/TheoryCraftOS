@@ -39,6 +39,7 @@ namespace hardware {
 class VirtioGpu;
 class VmwareSvgaGpu;
 class SystemGpu;
+class IPanelOutput;
 struct GpuNode;
 
 // Gives back what a driver built by the pool took. Set by the pool only.
@@ -49,6 +50,7 @@ struct GpuNode {
   IGraphicsProcessingUnit* gpu = nullptr;  // the display driver; nullptr when this GPU has none
   VirtioGpu* virtio = nullptr;             // the same driver, when it is a virtio-gpu (the 3D command channel)
   VmwareSvgaGpu* vmware = nullptr;         // ... or a VMware SVGA adapter
+  IPanelOutput* panel = nullptr;           // the driver's built-in panel output (Multi/GpuMuxPanel.hpp), for the display mux switch; or none
   GpuDestroyFn destroy = nullptr;          // non-null for a driver the pool built (and so frees)
   bool leased_for_driver = false;          // the pool holds a power lease for the driver
   IGpuProbe* probe = nullptr;              // for a GPU with no driver: what can be read off it (owned by the pool)

@@ -100,6 +100,9 @@ class GraphicsPool {
   // Shows a finished image (0xAARRGGBB when read back) on the screen of GPU `target` with its top left at (x, y), clipped to that screen. False if the
   // image is empty, `target` has no display driver, or memory ran out. `source` is the image's device.
   bool present_image(IImage& image, uint32_t target, uint32_t x = 0, uint32_t y = 0);
+  // The lock present_image() holds while it draws on GPU `index`'s screen; whoever else draws there (the desktop spanning that GPU's monitors) takes
+  // it too. nullptr for a bad index.
+  kernel::Mutex* present_lock(uint32_t index) { return index < gpus_.count() ? &slots_[index].present_lock : nullptr; }
 
   // The 2D renderer that draws to the screen of GPU `index`; nullptr if it has no display driver. See Renderer2DSlot.
   IRenderer2D* renderer_2d(uint32_t index);

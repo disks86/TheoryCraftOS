@@ -42,13 +42,86 @@ MonitorMode SystemMonitors::mode_for(const Monitor& monitor) const {
   return m;
 }
 
-void SystemMonitors::add_connector(uint32_t index, const ConnectorInfo& info) {
+bool SystemMonitors::add_gpu(IGraphicsProcessingUnit* gpu, uint32_t gpu_index) {
+  if (!gpu || gpu == gpu_ || source_count_ >= kMaxGpus) return false;
+  for (uint32_t s = 1; s < source_count_; ++s)
+    if (sources_[s].gpu == gpu) return false;
+  Source& added = sources_[source_count_++];
+  added = Source();
+  added.gpu = gpu;
+  added.gpu_index = gpu_index;
+  return true;
+}
+
+const char* SystemMonitors::device_name(uint32_t id) const {
+  const IGraphicsProcessingUnit* g = device_of(id);
+  return g ? g->name() : "";
+}
+
+bool SystemMonitors::spans_gpus() const {
+  for (uint32_t i = 0; i < layout_.count(); ++i)
+    if (layout_.at(i).enabled && source_index(layout_.at(i).id) != 0) return true;
+  return false;
+}
+
+uint32_t SystemMonitors::targets(MonitorTarget* out, uint32_t capacity) const {
+  uint32_t n = 0;
+  for (uint32_t i = 0; i < layout_.count() && n < capacity; ++i) {
+    const MonitorSlot& slot = layout_.at(i);
+    const uint32_t s = source_index(slot.id);
+    if (!slot.enabled || s == 0) continue;
+    out[n] = MonitorTarget();
+    out[n].id = slot.id;
+    out[n].gpu = sources_[s].gpu;
+    out[n].gpu_index = sources_[s].gpu_index;
+    ++n;
+  }
+  return n;
+}
+
+// "Display N" for a monitor that does not say its name: the display device's are numbered by connector, the other GPUs' after them.
+uint32_t SystemMonitors::fallback_number(uint32_t id) const {
+  const uint32_t source = source_index(id);
+  uint32_t before = 0;
+  for (uint64_t i = 0; i < monitors_.count(); ++i)
+    if (source_index(monitors_[i].id()) < source) ++before;
+  return before + connector_of(id) + 1;
+}
+
+void SystemMonitors::add_connector(uint32_t source, uint32_t index, const ConnectorInfo& info) {
+  IMonitorSource* from = sources_[source].source;
   uint8_t edid[1024];
-  const uint32_t length = info.connected && source_ ? source_->read_edid(index, ByteView(edid)) : 0;
+  const uint32_t length = info.connected && from ? from->read_edid(index, ByteView(edid)) : 0;
+  const uint32_t id = source * kIdsPerGpu + index;
   Monitor monitor;
-  monitor.set(index, info, ConstByteView(edid, length), index + 1);
+  monitor.set(id, info, ConstByteView(edid, length), fallback_number(id));
   monitor.set_current_mode(mode_for(monitor));
+  monitor.set_gpu(sources_[source].gpu_index);
   monitors_.push_back(monitor);
+}
+
+// The monitors of one GPU: the connectors its monitor source lists, or the screen as the one monitor when it tells nothing.
+void SystemMonitors::enumerate(uint32_t source) {
+  Source& src = sources_[source];
+  src.source = src.gpu ? src.gpu->monitor_source() : nullptr;
+  src.multi = false;
+  if (!src.gpu) return;
+  const uint64_t before = monitors_.count();
+  if (src.source) {
+    const uint32_t connectors = src.source->connector_count() < IMonitorSource::kMaxConnectors ? src.source->connector_count() : IMonitorSource::kMaxConnectors;
+    for (uint32_t i = 0; i < connectors; ++i) {
+      ConnectorInfo info;
+      if (!src.source->connector_info(i, &info)) continue;
+      add_connector(source, i, info);
+    }
+    src.multi = src.source->supports_multiple_displays();
+  }
+  if (monitors_.count() == before) {   // a device with nothing to say: the screen is the one monitor
+    Monitor monitor;
+    monitor.set_unknown(source * kIdsPerGpu, src.gpu->width(), src.gpu->height());
+    monitor.set_gpu(src.gpu_index);
+    monitors_.push_back(monitor);
+  }
 }
 
 // A monitor that was plugged in: its place is to the right of the others, unless that makes the desktop bigger than can be built.
@@ -68,22 +141,11 @@ void SystemMonitors::initialize() {
   layout_.clear();
   applied_ = false;
   multi_ = false;
-  source_ = gpu_ ? gpu_->monitor_source() : nullptr;
+  sources_[0].gpu = gpu_;
+  enumerate(0);
+  source_ = sources_[0].source;
+  multi_ = sources_[0].multi;
   if (!gpu_) return;
-  if (source_) {
-    const uint32_t connectors = source_->connector_count() < IMonitorSource::kMaxConnectors ? source_->connector_count() : IMonitorSource::kMaxConnectors;
-    for (uint32_t i = 0; i < connectors; ++i) {
-      ConnectorInfo info;
-      if (!source_->connector_info(i, &info)) continue;
-      add_connector(i, info);
-    }
-    multi_ = source_->supports_multiple_displays();
-  }
-  if (monitors_.count() == 0) {   // a device with nothing to say: the screen is the one monitor
-    Monitor monitor;
-    monitor.set_unknown(0, gpu_->width(), gpu_->height());
-    monitors_.push_back(monitor);
-  }
   // The row: every monitor that is plugged in (only the first one on a device that cannot show several), the largest total that is built.
   uint64_t pixels = 0;
   for (uint64_t i = 0; i < monitors_.count(); ++i) {
@@ -97,18 +159,41 @@ void SystemMonitors::initialize() {
   }
   if (layout_.count() == 0 && monitors_.count()) {   // nothing reports as connected: show the first anyway
     const MonitorMode mode = monitors_[0].current_mode();
+    pixels += uint64_t{mode.width ? mode.width : 1024} * (mode.height ? mode.height : 768);
     layout_.add(monitors_[0].id(), mode.width ? mode.width : 1024, mode.height ? mode.height : 768);
   }
-  if (layout_.count() == 1) {   // one display: it is shown at the size the screen has, whatever its EDID prefers
-    const uint32_t id = layout_.at(0).id;
-    layout_.resize(id, gpu_->width(), gpu_->height());
-    for (uint64_t i = 0; i < monitors_.count(); ++i)
-      if (monitors_[i].id() == id) {
-        MonitorMode m = monitors_[i].current_mode();
-        m.width = gpu_->width();
-        m.height = gpu_->height();
-        monitors_[i].set_current_mode(m);
+  // The other GPUs' monitors, to the right, GPU after GPU (while the desktop has room).
+  for (uint32_t s = 1; s < source_count_; ++s) {
+    const uint64_t first = monitors_.count();
+    enumerate(s);
+    uint32_t added = 0;
+    for (uint64_t i = first; i < monitors_.count(); ++i) {
+      const Monitor& m = monitors_[i];
+      if (!m.connected()) continue;
+      if (!sources_[s].multi && added >= 1) break;
+      const MonitorMode mode = m.current_mode();
+      if (pixels + uint64_t{mode.width} * mode.height > kMaxDesktopPixels || layout_.count() >= MonitorLayout::kMaxMonitors) break;
+      pixels += uint64_t{mode.width} * mode.height;
+      if (layout_.add(m.id(), mode.width, mode.height)) ++added;
+    }
+  }
+  // A GPU that shows one display: it is shown at the size the screen has, whatever its EDID prefers.
+  for (uint32_t s = 0; s < source_count_; ++s) {
+    uint32_t count = 0, id = 0;
+    for (uint32_t i = 0; i < layout_.count(); ++i)
+      if (source_index(layout_.at(i).id) == s) {
+        ++count;
+        id = layout_.at(i).id;
       }
+    if (count != 1) continue;
+    const uint32_t width = sources_[s].gpu->width(), height = sources_[s].gpu->height();
+    layout_.resize(id, width, height);
+    if (Monitor* m = find_mutable(id)) {
+      MonitorMode mode = m->current_mode();
+      mode.width = width;
+      mode.height = height;
+      m->set_current_mode(mode);
+    }
   }
   waiting_ = 0;
   ++generation_;
@@ -128,11 +213,12 @@ uint32_t SystemMonitors::physical_placements(ScanoutPlacement* out, uint32_t cap
       order[k] = order[k - 1];
       order[k - 1] = t;
     }
-  uint32_t x = 0, count = 0;
+  uint32_t x[kMaxGpus] = {}, count = 0;   // (each GPU's row on its own surface)
   for (uint32_t i = 0; i < n && count < capacity; ++i) {
     const MonitorSlot& s = layout_.at(order[i]);
-    out[count++] = {s.id, x, 0, s.physical_width, s.physical_height};
-    x += s.physical_width;
+    uint32_t& at = x[source_index(s.id)];
+    out[count++] = {s.id, at, 0, s.physical_width, s.physical_height};
+    at += s.physical_width;
   }
   return count;
 }
@@ -147,6 +233,7 @@ uint32_t SystemMonitors::render_percent() const {
 }
 
 bool SystemMonitors::needs_compositing() const {
+  if (spans_gpus()) return true;   // (the other GPUs' monitors are copied to their screens)
   ScanoutPlacement places[MonitorLayout::kMaxMonitors];
   const uint32_t n = physical_placements(places, MonitorLayout::kMaxMonitors);
   for (uint32_t i = 0; i < n; ++i) {
@@ -157,19 +244,58 @@ bool SystemMonitors::needs_compositing() const {
   return false;
 }
 
-bool SystemMonitors::show() {
-  if (!source_ || !multi_) return false;
-  ScanoutPlacement places[IMonitorSource::kMaxConnectors];
-  const uint32_t n = physical_placements(places, IMonitorSource::kMaxConnectors);
-  uint32_t width = 0, height = 0;
-  for (uint32_t i = 0; i < n; ++i) {
-    width += places[i].width;
-    if (places[i].height > height) height = places[i].height;
+// Shows one GPU's monitors: its surface is made to hold their pixels in a row (from physical_placements()), and each shows its part.
+bool SystemMonitors::show_source(uint32_t source) {
+  Source& src = sources_[source];
+  if (!src.source || !src.multi) return false;
+  ScanoutPlacement all[MonitorLayout::kMaxMonitors], places[IMonitorSource::kMaxConnectors];
+  const uint32_t count = physical_placements(all, MonitorLayout::kMaxMonitors);
+  uint32_t n = 0, width = 0, height = 0;
+  for (uint32_t i = 0; i < count && n < IMonitorSource::kMaxConnectors; ++i) {
+    if (source_index(all[i].connector) != source) continue;
+    places[n] = all[i];
+    places[n].connector = connector_of(all[i].connector);
+    width += places[n].width;
+    if (places[n].height > height) height = places[n].height;
+    ++n;
   }
-  if (!source_->apply_layout(places, n, width, height)) return false;
-  surface_width_ = width;
-  surface_height_ = height;
+  if (!src.source->apply_layout(places, n, width, height)) return false;
+  src.surface_width = width;
+  src.surface_height = height;
+  if (source == 0) {
+    surface_width_ = width;
+    surface_height_ = height;
+  }
   return true;
+}
+
+// The other GPUs show their monitors: several through their layout, one by switching the screen to its size. A GPU that refuses a layout goes on
+// showing one display (its first monitor, at the size its screen has). False if any refused.
+bool SystemMonitors::show_secondaries() {
+  bool ok = true;
+  for (uint32_t s = 1; s < source_count_; ++s) {
+    Source& src = sources_[s];
+    if (src.multi) {
+      if (show_source(s)) continue;
+      ok = false;
+      uint32_t keep = 0;
+      bool found = false;
+      for (uint32_t i = layout_.count(); i > 0; --i) {   // (the first of its monitors stays)
+        const uint32_t id = layout_.at(i - 1).id;
+        if (source_index(id) != s) continue;
+        if (found) layout_.remove(keep);
+        keep = id;
+        found = true;
+      }
+      src.multi = false;
+      if (found) layout_.resize(keep, src.gpu->width(), src.gpu->height());
+    } else if (!sync_device_mode(s)) {
+      ok = false;
+    }
+    src.surface_width = src.gpu->width();
+    src.surface_height = src.gpu->height();
+  }
+  return ok;
 }
 
 bool SystemMonitors::apply() {
@@ -177,49 +303,77 @@ bool SystemMonitors::apply() {
   const MonitorRect box = layout_.bounds();
   desktop_width_ = box.width;
   desktop_height_ = box.height;
+  bool ok;
   if (!source_ || !multi_) {   // one display: the screen, switched to the size the monitor is to show
-    const bool ok = sync_device_mode();
+    ok = sync_device_mode();
     surface_width_ = gpu_ ? gpu_->width() : 0;
     surface_height_ = gpu_ ? gpu_->height() : 0;
     applied_ = true;
-    ++generation_;
-    return ok;
+  } else {
+    applied_ = show();
+    ok = applied_;
+    if (!applied_) {   // the device refused: it goes on showing one display, the size it has
+      const MonitorSlot* keep = layout_.primary();
+      uint32_t keep_id = keep ? keep->id : 0;
+      if (source_index(keep_id) != 0)   // (the primary is on another GPU: the display device keeps its first monitor)
+        for (uint32_t i = 0; i < layout_.count(); ++i)
+          if (source_index(layout_.at(i).id) == 0) {
+            keep_id = layout_.at(i).id;
+            break;
+          }
+      for (uint32_t i = layout_.count(); i > 0; --i)
+        if (layout_.at(i - 1).id != keep_id && source_index(layout_.at(i - 1).id) == 0) layout_.remove(layout_.at(i - 1).id);
+      layout_.resize(keep_id, gpu_->width(), gpu_->height());
+      multi_ = false;
+      sources_[0].multi = false;
+      surface_width_ = gpu_->width();
+      surface_height_ = gpu_->height();
+      if (source_count_ == 1) {
+        desktop_width_ = surface_width_;
+        desktop_height_ = surface_height_;
+      }
+    }
   }
-  applied_ = show();
-  if (!applied_) {   // the device refused: it goes on showing one display, the size it has
-    const MonitorSlot* keep = layout_.primary();
-    const uint32_t keep_id = keep ? keep->id : 0;
-    for (uint32_t i = layout_.count(); i > 0; --i)
-      if (layout_.at(i - 1).id != keep_id) layout_.remove(layout_.at(i - 1).id);
-    layout_.resize(keep_id, gpu_->width(), gpu_->height());
-    multi_ = false;
-    desktop_width_ = surface_width_ = gpu_->width();
-    desktop_height_ = surface_height_ = gpu_->height();
+  if (source_count_ > 1) {
+    if (!show_secondaries()) ok = false;
+    layout_.repair();
+    layout_.normalize();
+    const MonitorRect all = layout_.bounds();
+    desktop_width_ = all.width;
+    desktop_height_ = all.height;
   }
   ++generation_;
-  return applied_;
+  return ok;
 }
 
 // A device that shows one display changes the size of its screen when the monitor is to show another: done here, when the desktop is rebuilt
 // (nothing draws then), not when the setting is chosen. False if the device would not.
-bool SystemMonitors::sync_device_mode() {
-  if (!gpu_ || !source_) return true;
+bool SystemMonitors::sync_device_mode(uint32_t source) {
+  const Source& src = sources_[source];
+  if (!src.gpu || (source == 0 && !src.source)) return true;
   for (uint32_t i = 0; i < layout_.count(); ++i) {
     const MonitorSlot& s = layout_.at(i);
-    if (!s.enabled) continue;
-    if (s.physical_width == gpu_->width() && s.physical_height == gpu_->height()) return true;
-    return source_->set_display_mode(s.id, s.physical_width, s.physical_height);
+    if (!s.enabled || source_index(s.id) != source) continue;
+    if (s.physical_width == src.gpu->width() && s.physical_height == src.gpu->height()) return true;
+    if (src.source) return src.source->set_display_mode(connector_of(s.id), s.physical_width, s.physical_height);
+    for (uint32_t m = 0; m < src.gpu->mode_count(); ++m) {   // (another GPU that tells nothing about monitors: one of its own modes)
+      DisplayMode mode;
+      if (src.gpu->mode_info(m, &mode) && mode.width == s.physical_width && mode.height == s.physical_height) return src.gpu->set_mode(m);
+    }
+    return false;
   }
   return true;
 }
 
 bool SystemMonitors::reapply() {
-  if (!applied_ || !multi_) return false;
+  if (!applied_ || (!multi_ && source_count_ == 1)) return false;
   layout_.normalize();
   const MonitorRect box = layout_.bounds();
   desktop_width_ = box.width;
   desktop_height_ = box.height;
-  const bool ok = show();
+  bool ok = !multi_ || show();
+  for (uint32_t s = 1; s < source_count_; ++s)
+    if (sources_[s].multi && !show_source(s)) ok = false;
   ++generation_;
   return ok;
 }
@@ -238,47 +392,54 @@ bool SystemMonitors::show_single_display() {
 }
 
 bool SystemMonitors::poll() {
-  if (!source_ || !source_->refresh_connectors()) return false;
   bool changed = false;
-  const uint32_t connectors = source_->connector_count() < IMonitorSource::kMaxConnectors ? source_->connector_count() : IMonitorSource::kMaxConnectors;
+  for (uint32_t s = 0; s < source_count_; ++s)
+    if (poll_source(s)) changed = true;
+  if (changed) {
+    layout_.repair();   // (monitors that were held together by one that is gone are put in a row)
+    reapply();
+  }
+  return changed;
+}
+
+bool SystemMonitors::poll_source(uint32_t source) {
+  IMonitorSource* from = sources_[source].source;
+  if (!from || !from->refresh_connectors()) return false;
+  bool changed = false;
+  const uint32_t connectors = from->connector_count() < IMonitorSource::kMaxConnectors ? from->connector_count() : IMonitorSource::kMaxConnectors;
   for (uint32_t i = 0; i < connectors; ++i) {
     ConnectorInfo info;
-    if (!source_->connector_info(i, &info)) continue;
-    Monitor* known = nullptr;
-    for (uint64_t k = 0; k < monitors_.count(); ++k)
-      if (monitors_[k].id() == i) known = &monitors_[k];
+    if (!from->connector_info(i, &info)) continue;
+    const uint32_t id = source * kIdsPerGpu + i;
+    Monitor* known = find_mutable(id);
     if (!known) {   // a connector that was not there before
-      add_connector(i, info);
-      if (info.connected && !add_to_layout(i)) ++waiting_;
+      add_connector(source, i, info);
+      if (info.connected && !add_to_layout(id)) ++waiting_;
       changed = true;
       continue;
     }
     if (known->connected() == info.connected) continue;
     changed = true;
-    const int32_t slot = layout_.find(i);
+    const int32_t slot = layout_.find(id);
     if (info.connected) {   // plugged in: perhaps a different monitor than before
       uint8_t edid[1024];
-      const uint32_t length = source_->read_edid(i, ByteView(edid));
+      const uint32_t length = from->read_edid(i, ByteView(edid));
       const MonitorMode kept = known->current_mode();
-      known->set(i, info, ConstByteView(edid, length), i + 1);
+      known->set(id, info, ConstByteView(edid, length), fallback_number(id));
       if (slot >= 0) {   // its place is still there: it shows at the size the place has
         MonitorMode m = kept;
         m.preferred = false;
         known->set_current_mode(m);
-        layout_.set_enabled(i, true);
+        layout_.set_enabled(id, true);
       } else {
         known->set_current_mode(mode_for(*known));
-        if (!add_to_layout(i)) ++waiting_;
+        if (!add_to_layout(id)) ++waiting_;
       }
     } else {
       known->set_connected(false);
-      if (slot >= 0) layout_.set_enabled(i, false);
+      if (slot >= 0) layout_.set_enabled(id, false);
       else if (waiting_) --waiting_;
     }
-  }
-  if (changed) {
-    layout_.repair();   // (monitors that were held together by one that is gone are put in a row)
-    reapply();
   }
   return changed;
 }
@@ -313,10 +474,12 @@ uint32_t SystemMonitors::best_refresh(const Monitor& monitor, uint32_t width, ui
 uint32_t SystemMonitors::compatible_resolutions(uint32_t id, MonitorMode* out, uint32_t capacity) const {
   const Monitor* m = find(id);
   if (!m || !capacity) return 0;
+  const Source& src = sources_[source_index(id)];
+  const uint32_t connector = connector_of(id);
   uint32_t n = 0;
   auto add = [&](uint32_t w, uint32_t h, bool preferred) {
     if (w < 640 || h < 480 || w > kMaxMonitorWidth || h > kMaxMonitorHeight) return;
-    if (source_ && !source_->mode_available(id, w, h)) return;
+    if (src.source && !src.source->mode_available(connector, w, h)) return;
     for (uint32_t k = 0; k < n; ++k)
       if (out[k].width == w && out[k].height == h) {
         out[k].preferred = out[k].preferred || preferred;
@@ -333,10 +496,15 @@ uint32_t SystemMonitors::compatible_resolutions(uint32_t id, MonitorMode* out, u
   const EdidInfo* edid = m->edid();
   if (edid && edid->timing_count) {
     for (uint32_t i = 0; i < edid->timing_count; ++i) add(edid->timings[i].width, edid->timings[i].height, edid->timings[i].preferred);
-  } else if (source_) {
+  } else if (src.source) {
     MonitorMode device[32];
-    const uint32_t count = source_->device_modes(id, device, 32);
+    const uint32_t count = src.source->device_modes(connector, device, 32);
     for (uint32_t i = 0; i < count; ++i) add(device[i].width, device[i].height, false);
+  } else if (source_index(id) != 0 && src.gpu) {   // another GPU that tells nothing about monitors: the modes of its driver
+    for (uint32_t i = 0; i < src.gpu->mode_count(); ++i) {
+      DisplayMode mode;
+      if (src.gpu->mode_info(i, &mode)) add(mode.width, mode.height, false);
+    }
   }
   const MonitorMode now = m->current_mode();
   if (now.width && now.height) {   // what runs now is, by being there, compatible
@@ -360,6 +528,11 @@ uint32_t SystemMonitors::compatible_resolutions(uint32_t id, MonitorMode* out, u
       out[k - 1] = t;
     }
   return n;
+}
+
+bool SystemMonitors::can_set_refresh(uint32_t id) const {
+  const Source& src = sources_[source_index(id)];
+  return src.source && src.source->can_set_refresh(connector_of(id));
 }
 
 uint32_t SystemMonitors::compatible_refresh_rates(uint32_t id, uint32_t width, uint32_t height, uint32_t* out, uint32_t capacity) const {
@@ -413,7 +586,7 @@ uint32_t SystemMonitors::scale_of(uint32_t id) const {
 bool SystemMonitors::set_resolution(uint32_t id, uint32_t width, uint32_t height) {
   Monitor* m = find_mutable(id);
   const int32_t slot = layout_.find(id);
-  if (!m || slot < 0 || !source_) return false;
+  if (!m || slot < 0 || (!sources_[source_index(id)].source && source_index(id) == 0)) return false;
   MonitorMode modes[64];
   const uint32_t count = compatible_resolutions(id, modes, 64);
   bool ok = false;
@@ -444,13 +617,14 @@ bool SystemMonitors::set_resolution(uint32_t id, uint32_t width, uint32_t height
 
 bool SystemMonitors::set_refresh(uint32_t id, uint32_t refresh_millihz) {
   Monitor* m = find_mutable(id);
-  if (!m || !source_ || !source_->can_set_refresh(id)) return false;
+  IMonitorSource* from = sources_[source_index(id)].source;
+  if (!m || !from || !from->can_set_refresh(connector_of(id))) return false;
   const MonitorMode now = m->current_mode();
   uint32_t rates[16];
   const uint32_t count = compatible_refresh_rates(id, now.width, now.height, rates, 16);
   bool ok = false;
   for (uint32_t i = 0; i < count; ++i) ok = ok || rates[i] == refresh_millihz;
-  if (!ok || !source_->set_refresh(id, refresh_millihz)) return false;
+  if (!ok || !from->set_refresh(connector_of(id), refresh_millihz)) return false;
   MonitorMode mode = now;
   mode.refresh_millihz = refresh_millihz;
   m->set_current_mode(mode);

@@ -61,7 +61,7 @@ class AmdModeSet {
   // ATOM_ENCODER_CMD_*
   static constexpr uint8_t kEncoderSetup = 0x0F, kEncoderSetupPanelMode = 0x10, kEncoderDpVideoOff = 0x0C, kEncoderDpVideoOn = 0x0D;
   // ATOM_TRANSMITTER_ACTION_*
-  static constexpr uint8_t kTransmitterDisable = 0, kTransmitterEnable = 1, kTransmitterSetupVsEmph = 11;
+  static constexpr uint8_t kTransmitterDisable = 0, kTransmitterEnable = 1, kTransmitterInit = 7, kTransmitterSetupVsEmph = 11;
   static constexpr uint8_t kPpll1 = 0, kPpll2 = 1, kPpll0 = 2, kDpDto = 11, kComboPhyPll0 = 20, kPllInvalid = 0xFF;
   static constexpr uint8_t kCrtcInvalid = 0xFF;
   static constexpr uint8_t kModeDp = 0, kModeLvds = 1, kModeDvi = 2, kModeHdmi = 3, kModeDpMst = 5;
@@ -79,6 +79,7 @@ class AmdModeSet {
   bool blank_crtc(uint8_t crtc, bool blank);
   bool lock_crtc(uint8_t crtc, bool lock);
   bool powergate_crtc(uint8_t crtc, bool enable);                                         // EnableDispPowerGating
+  bool powergate_init();                                                                  // amdgpu_atombios_crtc_powergate_init: EnableDispPowerGating with ATOM_INIT (pipe 0)
   // amdgpu_atombios_encoder_setup_dig_encoder: the DIGx encoder control with an action (kEncoderSetup, the panel mode with `panel_mode`, the training commands of AmdDpSource, DP video on / off)
   bool encoder(const ModeSetOutput& out, const CrtcMode& mode, uint8_t action, uint8_t panel_mode = 0);
   // amdgpu_atombios_encoder_setup_dig_transmitter: the UNIPHY transmitter control with an action (kTransmitterEnable, kTransmitterDisable, SETUP_VSEMPH with `lane_set` for all lanes)

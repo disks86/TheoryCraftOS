@@ -568,6 +568,7 @@ add_executable(BOOTX64
   src/Hardware/GraphicsProcessingUnit/Multi/Acpi/GpuAcpiPower.cpp
   src/Hardware/GraphicsProcessingUnit/Multi/AppleGmux.cpp
   src/Hardware/GraphicsProcessingUnit/Multi/AppleGmuxPorts.cpp
+  src/Hardware/GraphicsProcessingUnit/Multi/GpuMuxSwitch.cpp
   src/Hardware/GraphicsProcessingUnit/Multi/PcieLink.cpp
   src/Hardware/GraphicsProcessingUnit/Multi/GpuPool.cpp
   src/Hardware/GraphicsProcessingUnit/Multi/GpuNativeDrivers.cpp
@@ -605,6 +606,7 @@ add_executable(BOOTX64
   src/Hardware/GraphicsProcessingUnit/AMD/AmdGpu.cpp
   src/Hardware/GraphicsProcessingUnit/AMD/AmdDcn1.cpp
   src/Hardware/GraphicsProcessingUnit/AMD/AmdScanout.cpp
+  src/Hardware/GraphicsProcessingUnit/AMD/AmdSecondaryGpu.cpp
   src/Hardware/GraphicsProcessingUnit/NVIDIA/NvidiaGpuGenerations.cpp
   src/Hardware/GraphicsProcessingUnit/NVIDIA/NvidiaGpu.cpp
   src/Hardware/GraphicsProcessingUnit/NVIDIA/NvidiaSecondaryGpu.cpp
@@ -617,6 +619,7 @@ add_executable(BOOTX64
   src/Hardware/GraphicsProcessingUnit/NVIDIA/Nvkm/NvCe.cpp
   src/Hardware/GraphicsProcessingUnit/NVIDIA/Nvkm/NvDisplay.cpp
   src/Hardware/GraphicsProcessingUnit/NVIDIA/Nvkm/NvDisplayMode.cpp
+  src/Hardware/GraphicsProcessingUnit/NVIDIA/Nvkm/NvPanelPower.cpp
   src/Hardware/GraphicsProcessingUnit/NVIDIA/Nvkm/NvRegisters.cpp
   src/Hardware/GraphicsProcessingUnit/NVIDIA/Nvkm/NvChip.cpp
   src/Hardware/GraphicsProcessingUnit/NVIDIA/Nvkm/NvGpio.cpp
@@ -1629,6 +1632,10 @@ endif()
 option(TCOS_AMD_VEGAM "Bring up the Radeon RX Vega M (Kaby Lake-G): memory controller and GART, interrupt ring, microcode through the SMC, graphics engine with compute queues, SDMA, and the display surface (not yet run on a real card)" OFF)
 if(TCOS_AMD_VEGAM)
   target_compile_definitions(BOOTX64 PRIVATE TCOS_AMD_VEGAM)
+endif()
+option(TCOS_AMD_NATIVE "AMD Polaris / Vega M (DCE 11.2) that is not the boot display: POST, memory controller apertures, connectors, EDID and a mode set from scratch through the video BIOS's command tables (AmdSecondaryGpu). The read-only probe (chip, VRAM size, temperature) runs without it. Not yet run on a real card" OFF)
+if(TCOS_AMD_NATIVE)
+  target_compile_definitions(BOOTX64 PRIVATE TCOS_AMD_NATIVE)
 endif()
 option(TCOS_NVIDIA_NATIVE "NVIDIA (Tesla to Turing): take the display over from the firmware - the firmware's mode stays, the screen shows a framebuffer of the OS's own in VRAM (Nvkm/NvDisplay). The read-only parts (chip, VRAM size, temperature) run without it. Not yet run on a real card" OFF)
 if(TCOS_NVIDIA_NATIVE)

@@ -35,6 +35,9 @@ class Monitor final : public IMonitor {
   void set_current_mode(const MonitorMode& mode) { current_ = mode; }
   // A monitor with no information of its own (no connector list: the whole screen is one display).
   void set_unknown(uint32_t id, uint32_t width, uint32_t height);
+  // Which GPU drives the monitor: its index in the machine's GPU list (GpuPool), as SystemMonitors was told; 0 when nothing said.
+  void set_gpu(uint32_t gpu_index) { gpu_ = gpu_index; }
+  uint32_t gpu() const { return gpu_; }
 
   uint32_t id() const override { return id_; }
   const char* name() const override { return name_; }
@@ -63,6 +66,7 @@ class Monitor final : public IMonitor {
   uint32_t mode_count_ = 0;
   MonitorMode current_;
   uint32_t reported_width_ = 0, reported_height_ = 0;
+  uint32_t gpu_ = 0;
 };
 
 }  // namespace hardware

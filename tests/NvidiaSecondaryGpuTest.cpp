@@ -26,6 +26,7 @@
 // must refuse before touching the card, so the pool falls back to the probe).
 #include <stdio.h>
 #include <string.h>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <vector>
@@ -118,6 +119,10 @@ struct Card final : INvRegisters {
   FakeMemory mem;
   Model model;
   std::vector<std::pair<uint32_t, uint32_t>> writes;
+  // Everything in order for the panel tests: 'w' a register write (its offset), 'd' a wait of 10 ms or more (microseconds), 'g' the panel's
+  // power line switched (1 on, 0 off), 'a' the first DPCD access after the panel got power.
+  std::vector<std::pair<char, uint32_t>> events;
+  void delay_us(uint32_t us) override { if (us >= 10000) events.push_back({'d', us}); }
   explicit Card(DisplayClass cls = DisplayClass::Gf119) : model(cls, mem) { model.regs[0x100c80] = 0x00ff8000; }
   static bool pramin(uint32_t off) { return off >= 0x700000 && off < 0x800000; }
   uint64_t pramin_address(uint32_t off) { return (uint64_t{model.regs[0x001700]} << 16) + (off - 0x700000); }
@@ -130,6 +135,7 @@ struct Card final : INvRegisters {
   }
   void write32(uint32_t off, uint32_t v) override {
     writes.push_back({off, v});
+    events.push_back({'w', off});
     if (pramin(off)) {
       const uint64_t a = pramin_address(off);
       if (a + 4 <= mem.vram.size()) mem.wr(a, v);
@@ -457,7 +463,334 @@ static void test_shutdown() {
   CHECK(rig.card.writes.size() == writes);
   CHECK(display->start() == DisplayStatus::Ok && model.scanout[0] == display->surface().offset);   // and up again
   display.reset();
+  CHECK(model.errors == 0);                                             // (the restarted core channel's pointers began again at 0)
   CHECK(rig.allocator.live == 0 && (rig.card.last_write(0x001704) & 0x80000000u) == 0);
+}
+// --- The built-in panel (a muxed laptop's discrete GPU) ----------------------------------------------------------------------------------
+namespace {
+// The panel's power line (DCB GPIO function 0x01); `readable` false: an INvGpio that cannot read it back; `present` false: the board has none.
+struct PanelGpio final : INvGpio {
+  Card* card = nullptr;
+  bool on = false, present = true, readable = true, stuck = false;
+  uint32_t sets = 0;
+  bool set_function(uint8_t function, bool value) override {
+    if (function != 0x01 || !present || stuck) return false;
+    ++sets;
+    on = value;
+    if (card) card->events.push_back({'g', value ? 1u : 0u});
+    return true;
+  }
+  Optional<bool> get_function(uint8_t function) override {
+    if (function != 0x01 || !present || !readable) return Optional<bool>();
+    return on;
+  }
+};
+
+// An eDP panel's DPCD: answers only while powered (`gpio->on`), eDP 1.4 with a rate table; clock recovery fails on the lanes of `broken`
+// at an effective rate (the bandwidth code, or the table entry's rate / 27 MHz when DP_LINK_RATE_SET was used).
+struct EdpSink final : IDpcdAux {
+  std::vector<uint8_t> dpcd = std::vector<uint8_t>(0x800, 0);
+  std::map<uint8_t, uint8_t> broken;
+  PanelGpio* gpio = nullptr;
+  Card* card = nullptr;
+  bool told = false;
+  uint32_t unpowered = 0;
+  EdpSink() {
+    dpcd[0x000] = 0x14;
+    dpcd[0x001] = 0x14;
+    dpcd[0x002] = 0x84;
+    dpcd[0x003] = 0x01;
+    dpcd[0x006] = 0x01;
+    dpcd[0x700] = 0x03;                      // eDP 1.4
+    // the rate table in DPCD units (200 kHz of bit rate): 1.62, 2.7, 3.24, 5.4 Gbit/s
+    const uint16_t rates[] = {8100, 13500, 16200, 27000};
+    for (int i = 0; i < 4; ++i) {
+      dpcd[0x010 + i * 2] = static_cast<uint8_t>(rates[i]);
+      dpcd[0x011 + i * 2] = static_cast<uint8_t>(rates[i] >> 8);
+    }
+  }
+  uint8_t effective_rate() const {
+    if (dpcd[0x100]) return dpcd[0x100];
+    const uint32_t i = dpcd[0x115];
+    if (i >= 8) return 0;
+    const uint32_t khz = (dpcd[0x010 + i * 2] | uint32_t{dpcd[0x011 + i * 2]} << 8) * 200u / 10;   // the link clock
+    return static_cast<uint8_t>(khz / 27000);
+  }
+  void model() {
+    const uint8_t rate = effective_rate(), lanes = dpcd[0x101] & 0x1f, pattern = dpcd[0x102] & 3;
+    bool all = true;
+    for (uint32_t l = 0; l < 4; ++l) {
+      uint8_t nibble = 0;
+      if (l < lanes) {
+        const bool ok = pattern != 0 && !(broken[rate] & (1u << l));
+        nibble = ok ? (pattern >= 2 ? 7 : 1) : 0;
+        if (!ok || pattern < 2) all = false;
+      }
+      const uint32_t at = 0x202 + l / 2, shift = l % 2 * 4;
+      dpcd[at] = static_cast<uint8_t>((dpcd[at] & ~(0xf << shift)) | (nibble << shift));
+    }
+    dpcd[0x204] = all ? 1 : 0;
+    dpcd[0x206] = dpcd[0x207] = 0;
+  }
+  bool powered() {
+    if (gpio && !gpio->on && gpio->present) {
+      ++unpowered;
+      return false;
+    }
+    if (!told && card) card->events.push_back({'a', 0});
+    told = true;
+    return true;
+  }
+  bool dpcd_read(uint32_t address, ByteView out) override {
+    if (!powered() || address + out.size() > dpcd.size()) return false;
+    if (address == 0x200 || address == 0x202) model();
+    for (size_t i = 0; i < out.size(); ++i) out[i] = dpcd[address + i];
+    return true;
+  }
+  bool dpcd_write(uint32_t address, ConstByteView data) override {
+    if (!powered() || address + data.size() > dpcd.size()) return false;
+    for (size_t i = 0; i < data.size(); ++i) dpcd[address + i] = data[i];
+    return true;
+  }
+};
+
+// The EDID once the panel has power (an eDP panel's AUX answers only then).
+struct PanelEdid final : INvPanelEdid {
+  Bytes edid;
+  PanelGpio* gpio = nullptr;
+  uint32_t reads = 0, unpowered = 0;
+  uint32_t read_panel_edid(uint32_t connector, ByteView out) override {
+    ++reads;
+    if (connector != 3 || (gpio && gpio->present && !gpio->on)) {
+      ++unpowered;
+      return 0;
+    }
+    const size_t n = edid.size() < out.size() ? edid.size() : out.size();
+    out.first(n).copy_from(ConstByteView(edid.data(), n));
+    return static_cast<uint32_t>(n);
+  }
+};
+
+uint64_t g_now_us = 0;
+uint64_t fake_now() { return g_now_us; }
+
+// The Kepler board of the other tests, its eDP-1 (connector 3, DP on SOR 3) as the panel.
+struct PanelRig {
+  Rig rig;
+  PanelGpio gpio;
+  EdpSink sink;
+  PanelEdid edid;
+  PanelRig() {
+    gpio.card = &rig.card;
+    sink.gpio = &gpio;
+    sink.card = &rig.card;
+    edid.gpio = &gpio;
+    edid.edid = monitor_edid(put_1080p, put_720p);
+    rig.card.model.regs[0x61c080 + 3 * 0x800] = 0x1000;   // the SOR's backlight PWM divider
+    rig.card.model.regs[0x61c084 + 3 * 0x800] = 0x0800;   // ... at half
+  }
+  NvSecondaryDisplay::Inputs inputs() {
+    NvSecondaryDisplay::Inputs in = rig.inputs(kKepler);
+    in.panel = true;
+    in.gpio = &gpio;
+    in.aux = &sink;
+    in.panel_edid = &edid;
+    return in;
+  }
+  std::vector<std::pair<char, uint32_t>>& events() { return rig.card.events; }
+  int find(char kind, uint32_t value, int from = 0) const {
+    const auto& e = rig.card.events;
+    for (size_t i = static_cast<size_t>(from); i < e.size(); ++i)
+      if (e[i].first == kind && e[i].second == value) return static_cast<int>(i);
+    return -1;
+  }
+  int find_write(uint32_t off, int from = 0) const { return find('w', off, from); }
+};
+
+constexpr uint32_t kPwmCtl3 = 0x61c084 + 3 * 0x800;
+}  // namespace
+
+// eDP: the power line before any AUX transaction, T1+T3, the EDID read once powered, link training on the panel's rate table, T8, the
+// backlight; the reverse on shutdown with T9 and T10; the power cycle time before the next start.
+static void test_panel_edp() {
+  PanelRig p;
+  auto display = std::make_unique<NvSecondaryDisplay>(p.inputs());
+  CHECK(display->start() == DisplayStatus::Ok);
+  CHECK(display->panel() && display->panel_result() == PanelLightStatus::Ok && display->connector() == 3);
+  CHECK(display->output().type == DcbOutputType::Dp && display->route().sor == 3 && display->route().dp && display->width() == 1920);
+  Model& model = p.rig.card.model;
+  CHECK(model.errors == 0 && model.scanout[0] == display->surface().offset);
+  CHECK(model.core.arm[0x0200 + 3 * 0x20] == (0x1u | 0x8u << 8));          // SOR 3 as DP link A on head 0
+  // Order: power line, T1+T3 (210 ms), then the first DPCD access, the mode set, T8 (50 ms), the PWM.
+  const int g1 = p.find('g', 1), up = p.find('d', 210000), aux = p.find('a', 0), t8 = p.find('d', 50000), bl = p.find_write(kPwmCtl3);
+  CHECK(g1 >= 0 && up > g1 && aux > up && t8 > aux && bl > t8);
+  CHECK(p.find_write(0x6101d0) > aux && p.find_write(0x6101d0) < t8);       // the supervisor ran between training and the backlight
+  CHECK(p.sink.unpowered == 0 && p.edid.reads == 1 && p.edid.unpowered == 0);
+  CHECK(model.regs[kPwmCtl3] == (0x0800u | 0xc0000000u));                  // the level the panel had, NEW | bit 30
+  CHECK(display->panel_power()->powered() && display->panel_power()->switched_line() && display->panel_power()->backlight());
+  CHECK(display->panel_power()->waited_ms() == 260);
+  // eDP 1.4: the fastest entry of the panel's table (5.4 Gbit/s, index 3) set by DP_LINK_RATE_SET with DP_LINK_BW_SET 0; the SOR at 0x14.
+  CHECK(p.sink.dpcd[0x100] == 0 && p.sink.dpcd[0x115] == 3 && (p.sink.dpcd[0x101] & 0x1f) == 4);
+  CHECK((model.regs[0x612300 + 3 * 0x800] & 0x007c0000) == 0x14u << 18);
+
+  // Shutdown: PWM to 0, T9, the head blanked and the SOR let go, T10, then the power line off.
+  const size_t before = p.events().size();
+  display->shutdown();
+  const int off = p.find_write(kPwmCtl3, static_cast<int>(before)), t9 = p.find('d', 50000, off), t10 = p.find('d', 500000, off),
+            g0 = p.find('g', 0, off);
+  const int blank = p.find_write(0x6101d0, off);
+  CHECK(off >= 0 && t9 > off && blank > t9 && t10 > blank && g0 > t10);
+  CHECK(model.regs[kPwmCtl3] == 0xc0000000u && !p.gpio.on && model.core.arm[0x0200 + 3 * 0x20] == 0);
+  CHECK(!display->panel_power()->powered() && !display->panel_power()->backlight());
+
+  // Up again at once: without a clock the whole power cycle (T11+T12, 510 ms) comes before the power line.
+  const size_t again = p.events().size();
+  CHECK(display->start() == DisplayStatus::Ok);
+  const int cycle = p.find('d', 510000, static_cast<int>(again)), on = p.find('g', 1, static_cast<int>(again));
+  CHECK(cycle >= 0 && on > cycle);
+  CHECK(model.regs[kPwmCtl3] == (0x0800u | 0xc0000000u));                  // the level kept across the release
+  display.reset();                                                         // (the destructor turns it off)
+  CHECK(!p.gpio.on);
+  CHECK(model.errors == 0);
+}
+
+// The power cycle with a clock: only what is left of it is waited; a power line that was on already is left alone, and one the GpioI cannot
+// read back is taken as ours.
+static void test_panel_power_cases() {
+  {
+    PanelRig p;
+    NvSecondaryDisplay::Inputs in = p.inputs();
+    in.now_us = fake_now;
+    g_now_us = 1000000;
+    auto display = std::make_unique<NvSecondaryDisplay>(in);
+    CHECK(display->start() == DisplayStatus::Ok);
+    display->shutdown();
+    g_now_us += 200000;                                                    // 200 ms later: 310 ms of the cycle left
+    size_t mark = p.events().size();
+    CHECK(display->start() == DisplayStatus::Ok && p.find('d', 310000, static_cast<int>(mark)) >= 0);
+    CHECK(p.find('d', 510000, static_cast<int>(mark)) < 0);
+    display->shutdown();
+    g_now_us += 2000000;                                                   // long enough: nothing to wait
+    mark = p.events().size();
+    CHECK(display->start() == DisplayStatus::Ok);
+    const int first_g = p.find('g', 1, static_cast<int>(mark));
+    bool waited_before = false;
+    for (int i = static_cast<int>(mark); i < first_g; ++i) waited_before |= p.events()[static_cast<size_t>(i)].first == 'd';
+    CHECK(first_g >= 0 && !waited_before);
+  }
+  {
+    PanelRig p;                                                            // the firmware left the panel powered
+    p.gpio.on = true;
+    auto display = std::make_unique<NvSecondaryDisplay>(p.inputs());
+    CHECK(display->start() == DisplayStatus::Ok && p.gpio.sets == 0 && !display->panel_power()->switched_line());
+    CHECK(display->panel_power()->has_line() && p.find('d', 210000) >= 0);   // the wait is made anyway (nouveau)
+    display->shutdown();
+    CHECK(p.gpio.on && p.gpio.sets == 0);                                  // not switched off: this did not switch it on
+  }
+  {
+    PanelRig p;                                                            // a line that cannot be read back
+    p.gpio.readable = false;
+    auto display = std::make_unique<NvSecondaryDisplay>(p.inputs());
+    CHECK(display->start() == DisplayStatus::Ok && display->panel_power()->switched_line());
+    display->shutdown();
+    CHECK(!p.gpio.on && p.gpio.sets == 2);
+  }
+  {
+    PanelRig p;                                                            // no power line on the board: only the waits
+    p.gpio.present = false;
+    auto display = std::make_unique<NvSecondaryDisplay>(p.inputs());
+    CHECK(display->start() == DisplayStatus::Ok && !display->panel_power()->has_line() && p.find('d', 210000) >= 0);
+  }
+  {
+    PanelRig p;                                                            // the line will not switch: refused before anything is lit
+    p.gpio.stuck = true;
+    auto display = std::make_unique<NvSecondaryDisplay>(p.inputs());
+    CHECK(display->start() == DisplayStatus::NoOutput && display->panel_result() == PanelLightStatus::PowerFailed && !display->running());
+    CHECK(p.find_write(kPwmCtl3) < 0 && p.rig.card.model.core.arm[0x0200 + 3 * 0x20] == 0);
+  }
+  {
+    PanelRig p;                                                            // no backlight PWM on the SOR: nothing written there
+    p.rig.card.model.regs[0x61c080 + 3 * 0x800] = 0;
+    auto display = std::make_unique<NvSecondaryDisplay>(p.inputs());
+    CHECK(display->start() == DisplayStatus::Ok && !display->panel_power()->pwm() && p.find_write(kPwmCtl3) < 0);
+  }
+  // The timings themselves.
+  const PanelPowerTimings e = PanelPowerTimings::edp(), l = PanelPowerTimings::lvds();
+  CHECK(e.power_up_ms == 210 && e.backlight_on_ms == 50 && e.backlight_off_ms == 50 && e.power_down_ms == 500 && e.power_cycle_ms == 510);
+  CHECK(l.power_up_ms == 60 && l.backlight_on_ms == 200 && l.backlight_off_ms == 200 && l.power_down_ms == 50);
+}
+
+// The failures: no EDID, a link that never trains, no panel on the board; each leaves the panel unpowered and nothing lit.
+static void test_panel_failures() {
+  {
+    PanelRig p;
+    p.edid.edid.clear();                                                   // the panel sends nothing (and none was read at start)
+    auto display = std::make_unique<NvSecondaryDisplay>(p.inputs());
+    CHECK(display->start() == DisplayStatus::NoOutput && display->panel_result() == PanelLightStatus::NoEdid && !display->running());
+    CHECK(!p.gpio.on && p.find('g', 0) > p.find('g', 1) && p.find_write(kPwmCtl3) < 0);
+    CHECK(display->memory()->heap().allocation_count() == display->memory()->table_allocations());
+  }
+  {
+    PanelRig p;                                                            // the EDID came at start (LVDS-style, over DDC) and is used
+    p.edid.edid.clear();
+    p.rig.plug(3, monitor_edid(put_720p, nullptr), EdidSource::Aux);
+    auto display = std::make_unique<NvSecondaryDisplay>(p.inputs());
+    CHECK(display->start() == DisplayStatus::Ok && display->width() == 1280);
+  }
+  {
+    PanelRig p;                                                            // every rate of the table fails
+    for (uint8_t r : {uint8_t{0x06}, uint8_t{0x0a}, uint8_t{0x0c}, uint8_t{0x14}}) p.sink.broken[r] = 0xf;
+    auto display = std::make_unique<NvSecondaryDisplay>(p.inputs());
+    CHECK(display->start() == DisplayStatus::LinkTraining && display->panel_result() == PanelLightStatus::LinkTraining);
+    CHECK(!p.gpio.on && p.find_write(kPwmCtl3) < 0 && !display->running());
+  }
+  {
+    PanelRig p;                                                            // the fastest entry fails: 3.24 Gbit/s (index 2, SOR 0x0c) carries 1080p
+    p.sink.broken[0x14] = 0xf;
+    auto display = std::make_unique<NvSecondaryDisplay>(p.inputs());
+    CHECK(display->start() == DisplayStatus::Ok && p.sink.dpcd[0x115] == 2 && p.sink.dpcd[0x100] == 0);
+    CHECK((p.rig.card.model.regs[0x612300 + 3 * 0x800] & 0x007c0000) == 0x0cu << 18);
+  }
+  {
+    PanelRig p;                                                            // the same table written again (8100 = 1.62 Gbit/s ... 27000 = 5.4): the fastest is used
+    const uint16_t real[] = {8100, 13500, 16200, 27000};
+    for (int i = 0; i < 4; ++i) {
+      p.sink.dpcd[0x010 + i * 2] = static_cast<uint8_t>(real[i]);
+      p.sink.dpcd[0x011 + i * 2] = static_cast<uint8_t>(real[i] >> 8);
+    }
+    auto display = std::make_unique<NvSecondaryDisplay>(p.inputs());
+    CHECK(display->start() == DisplayStatus::Ok && p.sink.dpcd[0x115] == 3);
+    CHECK((p.rig.card.model.regs[0x612300 + 3 * 0x800] & 0x007c0000) == 0x14u << 18);
+  }
+  {
+    PanelRig p;                                                            // a board without a panel output
+    p.rig.board.connectors[3].type = 0x61;
+    p.rig.connectors[3].dcb_type = 0x61;
+    auto display = std::make_unique<NvSecondaryDisplay>(p.inputs());
+    CHECK(display->start() == DisplayStatus::NoOutput && display->panel_result() == PanelLightStatus::NoPanel && p.rig.card.writes.empty());
+    CHECK(!find_panel_output(p.rig.board, ArrayView<const NvidiaNative::Connector>(p.rig.connectors), nullptr, nullptr));
+  }
+}
+
+// LVDS: the DCB's LVDS output on a SOR, the SPWG waits, the LVDS protocol on the SOR.
+static void test_panel_lvds() {
+  PanelRig p;
+  BoardInfo& b = p.rig.board;
+  b.connectors[3].type = 0x40;
+  p.rig.connectors[3].dcb_type = 0x40;
+  p.rig.connectors[3].displayport = false;
+  b.outputs[4].type = DcbOutputType::Lvds;
+  b.outputs[4].sorconf_link = 1;
+  uint32_t connector = 0;
+  DcbOutput out;
+  CHECK(find_panel_output(b, ArrayView<const NvidiaNative::Connector>(p.rig.connectors), &connector, &out) && connector == 3 && out.type == DcbOutputType::Lvds);
+  auto display = std::make_unique<NvSecondaryDisplay>(p.inputs());
+  CHECK(display->start() == DisplayStatus::Ok && display->route().panel && !display->route().dp && display->route().protocol == disp_hw::kProtocolLvds);
+  CHECK(p.rig.card.model.core.arm[0x0200 + 3 * 0x20] == 0x1u);              // SOR 3 owned by head 0, protocol LVDS (0)
+  CHECK(p.find('d', 60000) >= 0 && p.find('d', 200000) > p.find('d', 60000) && p.sink.told == false);   // no AUX for LVDS
+  CHECK(display->panel_power()->waited_ms() == 260);
+  display->shutdown();
+  CHECK(!p.gpio.on && p.find('d', 200000, p.find_write(kPwmCtl3, p.find('d', 200000) + 1)) >= 0);
 }
 #endif  // TCOS_NVIDIA_NATIVE
 
@@ -496,8 +829,11 @@ static void test_gpu() {
     CHECK(!NvidiaSecondaryGpu::supports(other));
 #ifdef TCOS_NVIDIA_NATIVE
     NvidiaSecondaryGpu gpu(context);
-    CHECK(!gpu.initialize() && strstr(gpu.status(), "no monitor"));  // started, but nothing to show on
+    CHECK(!gpu.initialize() && strstr(gpu.status(), "no monitor"));  // started, but nothing to show on (and no panel output: no standby)
     CHECK(!gpu.native() && !gpu.display() && gpu.mode_count() == 0 && gpu.connector_count() == 0 && gpu.width() == 0);
+    IPanelOutput& panel = *gpu.panel_output();
+    CHECK(!panel.has_panel_output() && !panel.can_light_panel() && !panel.panel_lit() && panel.light_panel() == PanelLightStatus::NoPanel);
+    panel.release_panel();                                           // (nothing lit: nothing happens)
     gpu.shutdown();
     // An Ampere card: its display is the GSP's.
     card.bar0[0] = 0x172000a1;
@@ -515,6 +851,7 @@ static void test_gpu() {
     NvidiaSecondaryGpu gpu(context);
     CHECK(!gpu.initialize() && strstr(gpu.status(), "TCOS_NVIDIA_NATIVE"));
     CHECK(card.maps == 0 && card.bar0 == before && !gpu.native() && gpu.mode_count() == 0 && gpu.connector_count() == 0);
+    CHECK(!gpu.panel_output()->can_light_panel() && gpu.panel_output()->light_panel() == PanelLightStatus::NotSupported && card.bar0 == before);
     gpu.shutdown();
 #endif
     PciAddress where;
@@ -532,6 +869,10 @@ int main() {
   test_start_dp();
   test_refusals();
   test_shutdown();
+  test_panel_edp();
+  test_panel_power_cases();
+  test_panel_failures();
+  test_panel_lvds();
 #endif
   test_vpll();
   test_gpu();

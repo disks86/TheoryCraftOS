@@ -29,11 +29,15 @@ void MonitorDisplay::release() {
   maps_ = row_ = nullptr;
   row_capacity_ = 0;
   count_ = 0;
+  device_count_ = 0;
 }
 
-bool MonitorDisplay::update(const MonitorLayout& layout, const ScanoutPlacement* physical, uint32_t count, uint32_t render_percent) {
+bool MonitorDisplay::update(const MonitorLayout& layout, const ScanoutPlacement* physical, uint32_t count, uint32_t render_percent,
+                            ArrayView<const MonitorTarget> targets) {
   const uint32_t k = graphics::clamp_scale_percent(render_percent);
   Entry fresh[MonitorLayout::kMaxMonitors];
+  Device devices[MonitorLayout::kMaxMonitors];
+  uint32_t device_count = 0;
   uint32_t n = 0;
   uint64_t map_words = 0;
   uint32_t widest = 0;
@@ -57,7 +61,21 @@ bool MonitorDisplay::update(const MonitorLayout& layout, const ScanoutPlacement*
     e.pw = place->width;
     e.ph = place->height;
     e.scale = s.scale_percent ? s.scale_percent : 100;
-    if (e.scale != e.unit || e.lx != static_cast<int32_t>(e.px) || e.ly != static_cast<int32_t>(e.py) || e.lw != e.pw || e.lh != e.ph) scaling = true;
+    for (const MonitorTarget& t : targets) {   // (a monitor of another GPU: its pixels are on that GPU's surface)
+      if (t.id != s.id) continue;
+      if (!t.gpu) return false;
+      if (t.gpu == &gpu_) break;
+      uint32_t d = 0;
+      while (d < device_count && devices[d].gpu != t.gpu) ++d;
+      if (d == device_count) {
+        devices[d].gpu = t.gpu;
+        devices[d].guard = t.guard;
+        ++device_count;
+      }
+      e.device = d + 1;
+      break;
+    }
+    if (e.scale != e.unit || e.lx != static_cast<int32_t>(e.px) || e.ly != static_cast<int32_t>(e.py) || e.lw != e.pw || e.lh != e.ph || e.device) scaling = true;
     if (e.scale != e.unit) map_words += uint64_t{e.pw} + e.ph;
     if (e.pw > widest) widest = e.pw;
     if (e.lx + static_cast<int32_t>(e.lw) > right) right = e.lx + static_cast<int32_t>(e.lw);
@@ -90,6 +108,8 @@ bool MonitorDisplay::update(const MonitorLayout& layout, const ScanoutPlacement*
   row_capacity_ = widest;
   count_ = n;
   for (uint32_t i = 0; i < n; ++i) entries_[i] = fresh[i];
+  for (uint32_t i = 0; i < device_count; ++i) devices_[i] = devices[i];
+  device_count_ = device_count;
   width_ = static_cast<uint32_t>(right);
   height_ = static_cast<uint32_t>(bottom);
   scaling_ = scaling;
@@ -105,27 +125,53 @@ void MonitorDisplay::blit(uint32_t bx, uint32_t by, uint32_t bw, uint32_t bh, co
     const int64_t ix0 = x0 > e.lx ? x0 : e.lx, iy0 = y0 > e.ly ? y0 : e.ly;
     const int64_t ix1 = x1 < int64_t{e.lx} + e.lw ? x1 : int64_t{e.lx} + e.lw, iy1 = y1 < int64_t{e.ly} + e.lh ? y1 : int64_t{e.ly} + e.lh;
     if (ix1 <= ix0 || iy1 <= iy0) continue;
-    if (e.scale == e.unit) {   // one copy
-      gpu_.blit(e.px + static_cast<uint32_t>(ix0 - e.lx), e.py + static_cast<uint32_t>(iy0 - e.ly), static_cast<uint32_t>(ix1 - ix0), static_cast<uint32_t>(iy1 - iy0),
-                pixels + (iy0 - y0) * pitch + (ix0 - x0), pitch);
+    if (e.device == 0) {
+      copy(e, gpu_, x0, y0, ix0, iy0, ix1, iy1, pixels, pitch);
       continue;
     }
-    // Resampled: the monitor's pixel columns / rows that show the desktop columns / rows of the rectangle (see update(): pixel p shows floor(p * unit / scale)).
-    const int64_t rx0 = ix0 - e.lx, rx1 = ix1 - e.lx, ry0 = iy0 - e.ly, ry1 = iy1 - e.ly;
-    const int64_t u = e.unit;
-    int64_t pxa = (rx0 * e.scale + u - 1) / u, pxb = (rx1 * e.scale + u - 1) / u;
-    int64_t pya = (ry0 * e.scale + u - 1) / u, pyb = (ry1 * e.scale + u - 1) / u;
-    if (rx1 == int64_t{e.lw}) pxb = e.pw;      // (the last columns and rows, which update() points at the edge of the picture)
-    if (ry1 == int64_t{e.lh}) pyb = e.ph;
-    if (pxb > e.pw) pxb = e.pw;
-    if (pyb > e.ph) pyb = e.ph;
-    if (pxb <= pxa || pyb <= pya) continue;
-    const uint32_t columns = static_cast<uint32_t>(pxb - pxa);
-    for (int64_t py = pya; py < pyb; ++py) {
-      const uint32_t* source = pixels + (e.ly + static_cast<int64_t>(e.ymap[py]) - y0) * pitch + (e.lx - x0);
-      for (int64_t px = pxa; px < pxb; ++px) row_[px - pxa] = source[e.xmap[px]];
-      gpu_.blit(e.px + static_cast<uint32_t>(pxa), e.py + static_cast<uint32_t>(py), columns, 1, row_, columns);
-    }
+    Device& d = devices_[e.device - 1];   // (another GPU: its screen, under its guard)
+    if (d.guard) d.guard->acquire();
+    copy(e, *d.gpu, x0, y0, ix0, iy0, ix1, iy1, pixels, pitch);
+    d.dirty = true;
+    if (d.guard) d.guard->release();
+  }
+}
+
+// Copies the part (ix0, iy0)-(ix1, iy1) of the rectangle whose top left is (x0, y0) to the monitor's pixels on `to`.
+void MonitorDisplay::copy(const Entry& e, IGraphicsProcessingUnit& to, int64_t x0, int64_t y0, int64_t ix0, int64_t iy0, int64_t ix1, int64_t iy1,
+                          const uint32_t* pixels, uint32_t pitch) {
+  if (e.scale == e.unit) {   // one copy
+    to.blit(e.px + static_cast<uint32_t>(ix0 - e.lx), e.py + static_cast<uint32_t>(iy0 - e.ly), static_cast<uint32_t>(ix1 - ix0), static_cast<uint32_t>(iy1 - iy0),
+            pixels + (iy0 - y0) * pitch + (ix0 - x0), pitch);
+    return;
+  }
+  // Resampled: the monitor's pixel columns / rows that show the desktop columns / rows of the rectangle (see update(): pixel p shows floor(p * unit / scale)).
+  const int64_t rx0 = ix0 - e.lx, rx1 = ix1 - e.lx, ry0 = iy0 - e.ly, ry1 = iy1 - e.ly;
+  const int64_t u = e.unit;
+  int64_t pxa = (rx0 * e.scale + u - 1) / u, pxb = (rx1 * e.scale + u - 1) / u;
+  int64_t pya = (ry0 * e.scale + u - 1) / u, pyb = (ry1 * e.scale + u - 1) / u;
+  if (rx1 == int64_t{e.lw}) pxb = e.pw;      // (the last columns and rows, which update() points at the edge of the picture)
+  if (ry1 == int64_t{e.lh}) pyb = e.ph;
+  if (pxb > e.pw) pxb = e.pw;
+  if (pyb > e.ph) pyb = e.ph;
+  if (pxb <= pxa || pyb <= pya) return;
+  const uint32_t columns = static_cast<uint32_t>(pxb - pxa);
+  for (int64_t py = pya; py < pyb; ++py) {
+    const uint32_t* source = pixels + (e.ly + static_cast<int64_t>(e.ymap[py]) - y0) * pitch + (e.lx - x0);
+    for (int64_t px = pxa; px < pxb; ++px) row_[px - pxa] = source[e.xmap[px]];
+    to.blit(e.px + static_cast<uint32_t>(pxa), e.py + static_cast<uint32_t>(py), columns, 1, row_, columns);
+  }
+}
+
+void MonitorDisplay::present() {
+  gpu_.present();
+  for (uint32_t i = 0; i < device_count_; ++i) {   // (the other GPUs that got something)
+    Device& d = devices_[i];
+    if (!d.dirty) continue;
+    if (d.guard) d.guard->acquire();
+    d.gpu->present();
+    d.dirty = false;
+    if (d.guard) d.guard->release();
   }
 }
 

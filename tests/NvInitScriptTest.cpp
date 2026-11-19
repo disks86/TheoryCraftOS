@@ -724,7 +724,7 @@ static void test_devinit_post() {
     CHECK(trace.count(NvInitAccess::Mmio) > 5);
   }
   {   // refused generations: nothing written
-    const uint32_t boots[] = {0x124000a1 /* GM204 */, 0x134000a1 /* GP104 */, 0x164000a1 /* TU104 */, 0x046000a1 /* NV46 */};
+    const uint32_t boots[] = {0x124000a1 /* GM204 */, 0x134000a1 /* GP104 */, 0x046000a1 /* NV46 */};
     for (uint32_t boot0 : boots) {
       FakeRegs regs;
       FakeVga vga;
@@ -1073,9 +1073,12 @@ static void test_pmu_post() {
     PmuRun ry(by, kGm204);
     CHECK(ry.run().outcome == PostOutcome::Refused && ry.regs.writes.empty());
   }
-  {   // Turing stays refused
+  {   // Turing takes the GFW_BOOT wait, not the PMU path: nothing written (the model's 0x118128 reads 0: never unprotected)
     PmuRun r(bios, chip_of(0x164000a1, 0x16400000));
-    CHECK(r.run().outcome == PostOutcome::Refused && r.regs.writes.empty());
+    r.in.gfw_timeout_us = 50;
+    r.in.gfw_poll_us = 10;
+    const PostReport& rep = r.run();
+    CHECK(rep.outcome == PostOutcome::Failed && !rep.pmu.used && rep.gfw.used && r.regs.writes.empty());
   }
 }
 
@@ -1125,6 +1128,109 @@ static void test_pmu_hostile() {
   }
 }
 
+// --- Turing and later: the wait for the GPU's own boot (GFW_BOOT) -----------------------------------------------------------------------------
+
+// 0x118128 bit 0 goes up after `unprotect_after` reads of it, 0x118234 reads 0xff after `done_after` reads of it (a value below 0xff before
+// that, the progress); -1 = never. Reading 0x118234 while still protected counts as a mistake.
+struct GfwRegs final : INvRegisters {
+  int unprotect_after = 0, done_after = 0;
+  int level_reads = 0, progress_reads = 0, protected_reads = 0, writes = 0;
+  uint64_t delayed = 0;
+  bool dead = false;
+  uint32_t read32(uint32_t offset) override {
+    if (dead) return 0xFFFFFFFFu;
+    if (offset == NvDevinit::kDevinitStatusTu102) {
+      ++level_reads;
+      return unprotect_after >= 0 && level_reads > unprotect_after ? 0xfffffff1u /* other bits set too */ : 0xfffffff0u;
+    }
+    if (offset == NvDevinit::kDevinitDoneTu102) {
+      if (!(unprotect_after >= 0 && level_reads > unprotect_after)) ++protected_reads;
+      ++progress_reads;
+      return done_after >= 0 && progress_reads > done_after ? 0x123400ffu : 0x12340080u;
+    }
+    return 0;
+  }
+  void write32(uint32_t, uint32_t) override { ++writes; }
+  void delay_us(uint32_t us) override { delayed += us; }
+};
+
+static void test_gfw_boot() {
+  Bytes v = pmu_image();
+  NvBios bios(view(v));
+  const uint32_t turings[] = {0x164000a1 /* TU104 */, 0x172000a1 /* GA102 */, 0x194000a1 /* AD104 */};
+  for (uint32_t boot0 : turings) {
+    auto inputs = [&](GfwRegs& g) {
+      PostInputs in;
+      in.bios = &bios;
+      in.registers = &g;
+      in.chip = chip_of(boot0, boot0 & 0xfff00000u);
+      in.gfw_timeout_us = 1000;
+      in.gfw_poll_us = 10;
+      return in;
+    };
+    {   // done at the first look
+      GfwRegs g;
+      const PostReport rep = NvDevinit::post(inputs(g));
+      CHECK(rep.outcome == PostOutcome::AlreadyPosted && rep.gfw.used && rep.gfw.completed && rep.gfw.polls == 1);
+      CHECK(rep.gfw.protection_lowered && rep.gfw.progress == 0xff && !rep.needed && g.writes == 0 && g.delayed == 0);
+      CHECK(!rep.pmu.used && rep.script.scripts == 0);
+    }
+    {   // the protection drops after 3 reads (detect() makes the first), the progress reaches 0xff on its 5th read
+      GfwRegs g;
+      g.unprotect_after = 3;
+      g.done_after = 4;
+      const PostReport rep = NvDevinit::post(inputs(g));
+      CHECK(rep.outcome == PostOutcome::Ran && rep.needed && rep.gfw.completed);
+      CHECK(rep.gfw.polls == 7 && rep.gfw.waited_us == 60 && g.delayed == 60);
+      CHECK(g.protected_reads == 0 && g.writes == 0 && rep.posted_after);
+    }
+    {   // never finishes: Failed after the timeout, the progress reported
+      GfwRegs g;
+      g.done_after = -1;
+      const PostReport rep = NvDevinit::post(inputs(g));
+      CHECK(rep.outcome == PostOutcome::Failed && !rep.gfw.completed && rep.gfw.protection_lowered && rep.gfw.progress == 0x80);
+      CHECK(rep.gfw.waited_us == 1000 && g.delayed == 1000 && rep.gfw.polls == 101 && g.writes == 0);
+    }
+    {   // read-protected for good: Failed, and the progress register is never read
+      GfwRegs g;
+      g.unprotect_after = -1;
+      const PostReport rep = NvDevinit::post(inputs(g));
+      CHECK(rep.outcome == PostOutcome::Failed && !rep.gfw.protection_lowered && g.progress_reads == 0 && g.protected_reads == 0);
+      CHECK(rep.gfw.waited_us == 1000);
+    }
+    {   // a dry run reads once and does not wait
+      GfwRegs g;
+      g.unprotect_after = 5;
+      PostInputs in = inputs(g);
+      in.dry_run = true;
+      const PostReport rep = NvDevinit::post(in);
+      CHECK(rep.outcome == PostOutcome::DryRun && rep.gfw.polls == 1 && g.delayed == 0 && g.writes == 0);
+      GfwRegs done;
+      in.registers = &done;
+      CHECK(NvDevinit::post(in).outcome == PostOutcome::AlreadyPosted);
+    }
+    {   // a GPU that does not answer
+      GfwRegs g;
+      g.dead = true;
+      const PostReport rep = NvDevinit::post(inputs(g));
+      CHECK(rep.outcome == PostOutcome::Failed && rep.gfw.polls == 1 && g.delayed == 0);
+    }
+    {   // a poll interval that does not divide the timeout ends exactly at the timeout; a zero interval still terminates
+      GfwRegs g;
+      g.done_after = -1;
+      PostInputs in = inputs(g);
+      in.gfw_poll_us = 300;
+      CHECK(NvDevinit::post(in).gfw.waited_us == 1000);
+      GfwRegs z;
+      z.done_after = -1;
+      in.registers = &z;
+      in.gfw_poll_us = 0;
+      in.gfw_timeout_us = 5;
+      CHECK(NvDevinit::post(in).outcome == PostOutcome::Failed && z.delayed == 5);
+    }
+  }
+}
+
 int main() {
   test_tables();
   test_register_opcodes();
@@ -1140,6 +1246,7 @@ int main() {
   test_pmu_table();
   test_pmu_post();
   test_pmu_hostile();
+  test_gfw_boot();
   if (g_failed) {
     printf("NvInitScriptTest: %d FAILED\n", g_failed);
     return 1;

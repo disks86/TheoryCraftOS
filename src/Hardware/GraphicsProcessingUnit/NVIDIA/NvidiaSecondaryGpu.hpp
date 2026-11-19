@@ -24,6 +24,11 @@
 //   - The first connected connector whose output a SOR can drive (TMDS for HDMI/DVI, DisplayPort with link training over the connector's AUX
 //     channel; internal panels are left to the integrated GPU), the EDID's preferred mode (src/Hardware/Monitor/Edid) with its detailed
 //     timing, or the largest mode of the EDID the output can carry.
+//   - Or, on a muxed laptop, the built-in panel (IPanelOutput, for Multi/GpuMuxSwitch): the DCB's eDP (DP on a connector of type 0x47) or
+//     LVDS output, the panel's power sequence (Nvkm/NvPanelPower: the DCB GPIO function 0x01, the specifications' T1..T12 waits, the SOR's
+//     backlight PWM), the EDID read again once the panel has power (an eDP panel's AUX answers only then), eDP link training (the eDP
+//     DPCD, an eDP 1.4 panel's own rate table), and the reverse on release. With no external monitor but a panel output in the DCB, the
+//     driver starts in panel standby: up, nothing lit, waiting for the display switch (the pool's lease keeps the GPU awake meanwhile).
 //   - VRAM through BAR1 set up the way nouveau does it (Nvkm/NvBar: BAR1 and BAR2 instance blocks and page tables built through the PRAMIN
 //     window, 0x001704/0x001714 pointed at them): the first Bar1LinearVram::linear_bytes_for() bytes of BAR1 map VRAM 1:1, so every display
 //     object (scanout surface, push buffer, instance memory, notifier) is at BAR1 + its VRAM offset for the CPU. Not the legacy "BAR1 is
@@ -38,8 +43,10 @@
 // The head's VPLL is set in supervisor 2.1 through Nvkm/NvPll (NvVpllClock: the VBIOS's PLL limits table, gf100_devinit_pll_set).
 //
 // Not done: Tesla (NV50 display, no virtual BAR here), Volta/Turing (their mode setting is not written), Ampere+ (GSP); the VBIOS IED scripts
-// and DP drive levels (placeholders); HDMI infoframes/audio; several heads at once; hot plug re-routing (a monitor plugged in later is not
-// lit until the driver is built again).
+// and DP drive levels (placeholders); HDMI infoframes/audio; several heads at once (the panel and an external monitor together); hot plug
+// re-routing (a monitor plugged in later is not lit until the driver is built again); the panel's own power sequence delays from the VBIOS
+// and its LVDS link scripts (an LVDS panel is set up by the mode methods alone, which real boards likely need the scripts for); a panel
+// without an EDID (the VBIOS's LVDS mode table).
 #pragma once
 #include <stdint.h>
 #include "Allocators/IAllocator.hpp"
@@ -52,8 +59,11 @@
 #include "Hardware/GraphicsProcessingUnit/NVIDIA/Nvkm/NvDisplayMode.hpp"
 #include "Hardware/GraphicsProcessingUnit/NVIDIA/Nvkm/NvFb.hpp"
 #include "Hardware/GraphicsProcessingUnit/NVIDIA/Nvkm/NvInstmem.hpp"
+#include "Hardware/GraphicsProcessingUnit/NVIDIA/Nvkm/NvPanelPower.hpp"
 #include "Hardware/GraphicsProcessingUnit/NVIDIA/Nvkm/NvPll.hpp"
+#include "Hardware/GraphicsProcessingUnit/Multi/GpuMuxPanel.hpp"
 #include "Hardware/Monitor/IMonitorSource.hpp"
+#include "Kernel/Sync.hpp"
 #include "Utility/UniquePointer.hpp"
 
 namespace hardware {
@@ -160,6 +170,23 @@ class NvVpllClock final : public INvPixelClock {
   NvPllSetReport last_;
 };
 
+// Reads a built-in panel's EDID once it is powered (NvidiaSecondaryGpu: NvidiaNative::reread_connector). Returns the bytes copied into `out`,
+// 0 when nothing answered.
+class INvPanelEdid {
+ public:
+  virtual uint32_t read_panel_edid(uint32_t connector, ByteView out) = 0;
+
+ protected:
+  INvPanelEdid() = default;
+  ~INvPanelEdid() = default;
+};
+
+// Whether a DCB connector type is a built-in panel's (LVDS, LVDS SPWG, eDP).
+inline bool is_panel_connector(uint8_t dcb_type) { return dcb_type == 0x40 || dcb_type == 0x41 || dcb_type == 0x47; }
+// The board's built-in panel: its connector (a position in BoardInfo::connectors) and the DCB output of it this driver drives (DP for an
+// eDP connector, LVDS for an LVDS one, on a SOR). False when the board has none.
+[[nodiscard]] bool find_panel_output(const BoardInfo& board, ArrayView<const NvidiaNative::Connector> connectors, uint32_t* connector, DcbOutput* output);
+
 // ---------------------------------------------------------------------------------------------------------------------------------------
 // The display (testable without PCI: everything comes in through Inputs)
 // ---------------------------------------------------------------------------------------------------------------------------------------
@@ -181,6 +208,12 @@ class NvSecondaryDisplay {
     DisplayTimeouts timeouts;
     NvTimeouts memory_timeouts;
     Bar1Locks locks;                                    // (not complete: the display's own kernel locks)
+    // The built-in panel instead of an external monitor (a muxed laptop; see the file comment).
+    bool panel = false;
+    INvGpio* gpio = nullptr;                            // the panel's power line (null: the board's GPIO table, NvBoardGpio)
+    INvPanelEdid* panel_edid = nullptr;                 // the EDID read once powered (null, or nothing read: the connector's from Inputs)
+    const PanelPowerTimings* panel_timings = nullptr;   // (null: PanelPowerTimings::edp() or ::lvds())
+    NvPanelPower::ClockFn now_us = nullptr;             // for the panel's power cycle time (null: the whole time is waited)
   };
 
   explicit NvSecondaryDisplay(const Inputs& inputs) : in_(inputs) {}
@@ -189,12 +222,18 @@ class NvSecondaryDisplay {
   NvSecondaryDisplay& operator=(const NvSecondaryDisplay&) = delete;
 
   // Which connector, which modes (reads only: the display engine's probe), then BAR1 and the mode set (writes). On a failure everything that
-  // was set up is taken down again and status() says why.
+  // was set up is taken down again and status() says why. With Inputs::panel: the panel's output, BAR1, the panel's power, its EDID and
+  // modes, the mode set and link training, the backlight.
   [[nodiscard]] DisplayStatus start();
   // Another mode of the list: a new surface, the mode set, the old surface released (on a failure the old mode is set again).
   [[nodiscard]] DisplayStatus set_mode(uint32_t index);
-  // Blanks the head, stops the display's channels, releases every VRAM object and turns the virtual BARs off.
+  // Blanks the head, stops the display's channels, releases every VRAM object and turns the virtual BARs off; a panel's backlight goes off
+  // first and its power last.
   void shutdown();
+  bool panel() const { return in_.panel; }
+  // With Inputs::panel: how the last start() ended (Ok once lit).
+  PanelLightStatus panel_result() const { return panel_result_; }
+  NvPanelPower* panel_power() { return panel_power_.get(); }
   bool running() const { return running_; }
 
   uint32_t mode_count() const { return mode_count_; }
@@ -224,6 +263,10 @@ class NvSecondaryDisplay {
   };
   DisplayStatus fail(DisplayStatus status, const char* why);
   bool pick_output();
+  bool pick_panel();
+  // The panel's modes from its EDID (read again now that it has power, else the connector's); false when none fits.
+  bool panel_modes();
+  bool filter_modes(ConstByteView edid, const DcbOutput& output);
   [[nodiscard]] bool allocate_surface(const EdidMode& mode, Surface* out);
   void release_surface(Surface& surface);
   DisplayStatus program(const EdidMode& mode, const Surface& surface);
@@ -240,6 +283,11 @@ class NvSecondaryDisplay {
   UniquePointer<NvDisplayEngine> engine_;              // (after memory_: destroyed first, its objects released into the heap)
   UniquePointer<NvAuxChannel> own_aux_;
   IDpcdAux* aux_ = nullptr;
+  UniquePointer<NvBoardGpio> own_gpio_;
+  UniquePointer<NvPanelPower> panel_power_;            // kept across start/shutdown (the power cycle time)
+  uint8_t panel_edid_[NvidiaNative::kMaxEdid] = {};
+  PanelLightStatus panel_result_ = PanelLightStatus::ModeSet;
+  bool no_edid_ = false;
   Surface surface_;
   bool running_ = false;
   bool mode_set_ = false;
@@ -252,7 +300,7 @@ class NvSecondaryDisplay {
 // ---------------------------------------------------------------------------------------------------------------------------------------
 // The IGraphicsProcessingUnit the GpuPool builds for a non-boot NVIDIA GPU (GpuNativeDrivers.cpp)
 // ---------------------------------------------------------------------------------------------------------------------------------------
-class NvidiaSecondaryGpu final : public FramebufferGpu, public IMonitorSource {
+class NvidiaSecondaryGpu final : public FramebufferGpu, public IMonitorSource, public IPanelOutput, private nv::INvPanelEdid {
  public:
   static constexpr uint16_t kPciVendor = 0x10DE;
   static bool supports(const PciDeviceInfo& device) { return device.vendor_id == kPciVendor && device.class_code == kPciClassDisplay; }
@@ -291,7 +339,21 @@ class NvidiaSecondaryGpu final : public FramebufferGpu, public IMonitorSource {
   uint32_t device_modes(uint32_t connector, MonitorMode* out, uint32_t capacity) const override;
   bool set_display_mode(uint32_t connector, uint32_t width, uint32_t height) override;
 
+  // IPanelOutput (Multi/GpuMuxSwitch): the built-in panel of a muxed laptop. light_panel() refuses (Busy) while an external monitor is
+  // driven: one head at a time.
+  IPanelOutput* panel_output() { return this; }
+  bool has_panel_output() const override;
+  bool panel_lit() const override;
+  bool can_light_panel() const override;
+  [[nodiscard]] PanelLightStatus light_panel() override;
+  void release_panel() override;
+  const char* panel_status() const override { return panel_status_; }
+  // Up with nothing lit, waiting for the display switch (see the file comment).
+  bool panel_standby() const { return native_ && mode_count() == 0; }
+
  private:
+  uint32_t read_panel_edid(uint32_t connector, ByteView out) override;
+  nv::NvSecondaryDisplay::Inputs display_inputs(bool panel);
   bool fail(const char* why);
   void order();
   bool driven(uint32_t connector) const;
@@ -305,6 +367,11 @@ class NvidiaSecondaryGpu final : public FramebufferGpu, public IMonitorSource {
   uint8_t order_[16] = {};
   uint32_t ordered_ = 0;
   const char* status_ = "not started";
+  const char* panel_status_ = "not started";
+  // Held while display_ is used or replaced: the display switch lights and releases the panel from its own thread while the desktop presents
+  // and asks for modes.
+  mutable kernel::RecursiveMutex display_lock_;
+  ByteView bar1_;                                  // the CPU's view of BAR1 (mapped once, at initialize)
 };
 
 }  // namespace hardware

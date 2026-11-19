@@ -120,6 +120,8 @@ class NvidiaNative {
   ArrayView<const Connector> connectors() const { return ArrayView<const Connector>(connectors_).first(connector_count_); }
   // Reads the EDID of every connector again whose hot plug line changed (all of them with `all`); true if anything differs.
   bool refresh_connectors(bool all = false);
+  // Reads one connector's EDID again now (a built-in panel's, once it is powered: its AUX channel answers only then). False for a bad index.
+  bool reread_connector(uint32_t index) { return regs_ && index < connector_count_ && read_connector(index); }
   const char* status() const { return status_; }
   uint64_t vram_bytes() const { return vram_.ok() ? vram_.info.bytes : 0; }
   // What probe_vram read (the size and the regions the firmware keeps), for a driver that manages the VRAM itself (NvidiaSecondaryGpu).

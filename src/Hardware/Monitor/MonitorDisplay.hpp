@@ -24,6 +24,10 @@
 // the same arrangement as their pixels cost a single copy each.
 //
 // Drawing calls other than blit() and present() are not used by the renderer and go straight to the device (in surface coordinates).
+//
+// Several GPUs: a monitor driven by another GPU than the display device (MonitorTarget) gets its part of the desktop copied to that GPU's screen
+// instead, through its driver's blit(), at the place of its pixels on that GPU's own surface. Only what the renderer blits (its damage) is copied,
+// and present() presents each other GPU that was drawn on since the last present. With no targets nothing differs from one GPU.
 #pragma once
 #include "Allocators/IAllocator.hpp"
 #include "Hardware/GraphicsProcessingUnit/IGraphicsProcessingUnit.hpp"
@@ -31,6 +35,25 @@
 #include "Hardware/Monitor/MonitorLayout.hpp"
 
 namespace hardware {
+
+// Someone else may draw on another GPU's screen too (GraphicsPool::present_image): the guard is held around every copy to it and its present.
+class IScreenGuard {
+ public:
+  virtual void acquire() = 0;
+  virtual void release() = 0;
+
+ protected:
+  constexpr IScreenGuard() = default;
+  ~IScreenGuard() = default;
+};
+
+// A monitor that another GPU than the display device drives: the monitor's id, that GPU's driver and its index in the machine's GPU list.
+struct MonitorTarget {
+  uint32_t id = 0;
+  IGraphicsProcessingUnit* gpu = nullptr;
+  uint32_t gpu_index = 0;
+  IScreenGuard* guard = nullptr;   // optional
+};
 
 class MonitorDisplay final : public IGraphicsProcessingUnit {
  public:
@@ -43,10 +66,15 @@ class MonitorDisplay final : public IGraphicsProcessingUnit {
   // (`physical`, `count` entries, matched by the monitors' ids). False (nothing changes) if a monitor has no place on the surface or memory ran out.
   // `render_percent` (HiDPI): the desktop's pictures are the layout at that scale (Graphics/DeviceScale.hpp's mapping; the desktop draws at the largest
   // scale of its monitors, SystemMonitors::render_percent): a monitor at that scale shows them 1:1, one at another scale resampled.
-  bool update(const MonitorLayout& layout, const ScanoutPlacement* physical, uint32_t count, uint32_t render_percent = 100);
+  // `targets` (may be empty) names the monitors that another GPU drives; their `physical` places are on that GPU's surface. False also if a target
+  // has no driver.
+  bool update(const MonitorLayout& layout, const ScanoutPlacement* physical, uint32_t count, uint32_t render_percent = 100,
+              ArrayView<const MonitorTarget> targets = {});
   uint32_t render_percent() const { return render_percent_; }
   // True when copying is not a plain pass-through (a scaled monitor or monitors not laid out like their pixels).
   bool scaling() const { return scaling_; }
+  // How many other GPUs' screens the desktop is copied to.
+  uint32_t target_count() const { return device_count_; }
 
   const char* name() const override { return "monitor compositor"; }
   bool initialize() override { return true; }
@@ -62,7 +90,7 @@ class MonitorDisplay final : public IGraphicsProcessingUnit {
   void copy_rect(uint32_t sx, uint32_t sy, uint32_t dx, uint32_t dy, uint32_t w, uint32_t h) override { gpu_.copy_rect(sx, sy, dx, dy, w, h); }
   void clear(uint32_t color) override { gpu_.clear(color); }
   void blit(uint32_t x, uint32_t y, uint32_t w, uint32_t h, const uint32_t* pixels, uint32_t pitch_pixels) override;
-  void present() override { gpu_.present(); }
+  void present() override;
   uint32_t glyph_width() const override { return gpu_.glyph_width(); }
   uint32_t glyph_height() const override { return gpu_.glyph_height(); }
   void draw_char(uint32_t x, uint32_t y, char c, uint32_t fg, uint32_t bg) override { gpu_.draw_char(x, y, c, fg, bg); }
@@ -77,14 +105,23 @@ class MonitorDisplay final : public IGraphicsProcessingUnit {
     uint32_t unit = 100;
     uint32_t* xmap = nullptr;                  // for each pixel column / row of the monitor, the column / row of the desktop (relative to lx / ly)
     uint32_t* ymap = nullptr;
+    uint32_t device = 0;                       // 0: the display device; k: devices_[k - 1]
+  };
+  struct Device {
+    IGraphicsProcessingUnit* gpu = nullptr;
+    IScreenGuard* guard = nullptr;
+    bool dirty = false;                        // drawn on since its last present
   };
 
   void release();
+  void copy(const Entry& e, IGraphicsProcessingUnit& to, int64_t x0, int64_t y0, int64_t ix0, int64_t iy0, int64_t ix1, int64_t iy1, const uint32_t* pixels, uint32_t pitch);
 
   IGraphicsProcessingUnit& gpu_;
   allocators::IAllocator& allocator_;
   Entry entries_[MonitorLayout::kMaxMonitors];
   uint32_t count_ = 0;
+  Device devices_[MonitorLayout::kMaxMonitors];
+  uint32_t device_count_ = 0;
   uint32_t* maps_ = nullptr;
   uint32_t* row_ = nullptr;
   uint32_t row_capacity_ = 0;

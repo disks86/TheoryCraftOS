@@ -281,6 +281,13 @@ void DisplaySettings::update_details() {
   text.assign(m->name());
   text.append(" on ");
   text.append(m->connector_name()[0] ? StringView(m->connector_name()) : StringView("the display"));
+  if (monitors_->gpu_count() > 1) {   // (the desktop spans several GPUs: which one drives this monitor)
+    text.append(", driven by GPU ");
+    text.append_uint(m->gpu());
+    text.append(" (");
+    text.append(monitors_->device_name(m->id()));
+    text.push_back(')');
+  }
   if (slot >= 0 && monitors_->layout().at(static_cast<uint32_t>(slot)).primary) text.append(" - the primary monitor");
   info_[0].set_text(text.view());
   const hardware::EdidInfo* edid = m->edid();

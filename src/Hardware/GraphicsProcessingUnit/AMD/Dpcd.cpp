@@ -81,7 +81,7 @@ bool Dpcd::parse_capabilities(ConstByteView receiver, uint8_t edp_revision, Cons
     for (uint32_t i = 0; i < kMaxEdpRates && i * 2 + 1 < edp_rates.size(); ++i) {
       const uint32_t rate = uint32_t{edp_rates[i * 2]} | (uint32_t{edp_rates[i * 2 + 1]} << 8);
       if (rate == 0) break;
-      c.edp_rates_khz[c.edp_rate_count++] = rate * kEdpRateUnitKhz;
+      c.edp_rates_khz[c.edp_rate_count++] = rate * kEdpRateUnitKhz / 10;   // (the link clock, as DRM: val * 200 / 10, so 8100 -> 162000)
     }
   }
   c.valid = true;

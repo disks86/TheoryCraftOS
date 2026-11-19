@@ -69,6 +69,7 @@
 #include "Hardware/GraphicsProcessingUnit/Multi/GpuFunctionPower.hpp"
 #include "Hardware/GraphicsProcessingUnit/Multi/Acpi/GpuAcpiPower.hpp"
 #include "Hardware/GraphicsProcessingUnit/Multi/AppleGmux.hpp"
+#include "Hardware/GraphicsProcessingUnit/Multi/GpuMuxSwitch.hpp"
 #include "Hardware/GraphicsProcessingUnit/Multi/PcieLink.hpp"
 #include "Hardware/GraphicsProcessingUnit/SystemGpu.hpp"
 #include "Hardware/Monitor/Edid.hpp"
@@ -815,8 +816,16 @@ static efi::Status kernel_main(efi::Handle image, efi::SystemTable* st) {
 
   // The monitors the display device has (their EDIDs tell what they are) and how they are arranged on the desktop. The layout is applied
   // just before the desktop starts, so that the boot console stays a plain screen.
+  // The desktop spans the monitors of every other GPU with a display driver too (to the right of the display device's; see SystemMonitors.hpp).
   hardware::SystemMonitors monitors(gpu, shared_allocator);
   if (gpu) {
+    const int32_t display_gpu = gpu_pool.manager().display_index();
+    monitors.set_display_gpu_index(display_gpu >= 0 ? static_cast<uint32_t>(display_gpu) : 0);
+    for (uint32_t i = 0; i < gpu_pool.count(); ++i) {
+      hardware::IGraphicsProcessingUnit* other = gpu_pool.node(i)->gpu;
+      if (static_cast<int32_t>(i) != display_gpu && other && other != gpu && other->width() && other->height() && !monitors.add_gpu(other, i))
+        Entry(Level::Warning, "Monitor").text("too many GPUs; the monitors of ").text(other->name()).text(" are not used");
+    }
     monitors.initialize();
     for (uint32_t i = 0; i < monitors.count(); ++i) {
       const hardware::Monitor& m = monitors.monitor(i);
@@ -827,6 +836,7 @@ static efi::Status kernel_main(efi::Handle image, efi::SystemTable* st) {
       else e.text(", not connected");
       if (m.edid() && m.width_mm()) e.text(", ").dec(m.width_mm()).text("x").dec(m.height_mm()).text(" mm");
       if (!m.edid() && m.connected() && monitors.multi_display()) e.text(", no EDID");
+      if (monitors.gpu_count() > 1) e.text(", on GPU ").dec(m.gpu()).text(" (").text(monitors.device_name(m.id())).text(")");
     }
   }
 
@@ -1682,6 +1692,12 @@ static efi::Status kernel_main(efi::Handle image, efi::SystemTable* st) {
   // the device's one at that size under a ScaledRenderer2D, which the desktop keeps (its coordinates stay the layout's); programs that draw at the scale are
   // drawn 1:1 through it (IRenderer2D::device()).
   // Monitors at different scales are each drawn at their own (MonitorRenderers: a view per monitor, the desktop's calls going to all of them).
+  // Monitors on another GPU: the desktop's damage is copied to that GPU's screen under the lock GraphicsPool::present_image() takes there.
+  struct PoolScreenGuard final : hardware::IScreenGuard {
+    kernel::Mutex* lock = nullptr;
+    void acquire() override { if (lock) lock->lock(); }
+    void release() override { if (lock) lock->unlock(); }
+  };
   struct DisplayPipeline {
     hardware::SystemMonitors* monitors;
     graphics::SystemGraphics* graphics;
@@ -1690,14 +1706,23 @@ static efi::Status kernel_main(efi::Handle image, efi::SystemTable* st) {
     hardware::MonitorRenderers* views;
     graphics::ICellTextFace* text;
     bool per_monitor = false;
+    graphics::GraphicsPool* pool = nullptr;
+    PoolScreenGuard guards[hardware::GpuTopology::kMaxAdapters];
     static graphics::IRenderer2D* apply(void* context) {
       auto* self = static_cast<DisplayPipeline*>(context);
       if (!self->monitors->apply()) return nullptr;
       hardware::ScanoutPlacement placements[16];
       const uint32_t count = self->monitors->physical_placements(placements, 16);
       const uint32_t k = self->monitors->render_percent();
+      hardware::MonitorTarget targets[hardware::MonitorLayout::kMaxMonitors];
+      const uint32_t target_count = self->monitors->targets(targets, hardware::MonitorLayout::kMaxMonitors);
+      for (uint32_t i = 0; i < target_count; ++i)
+        if (self->pool && targets[i].gpu_index < hardware::GpuTopology::kMaxAdapters) {
+          self->guards[targets[i].gpu_index].lock = self->pool->present_lock(targets[i].gpu_index);
+          targets[i].guard = &self->guards[targets[i].gpu_index];
+        }
       self->per_monitor = false;
-      if (self->views && self->scaled && hardware::MonitorRenderers::mixed_scales(self->monitors->layout()) &&
+      if (self->views && self->scaled && target_count == 0 && hardware::MonitorRenderers::mixed_scales(self->monitors->layout()) &&
           self->views->update(self->monitors->layout(), placements, count, self->text,
                               self->graphics->render_node().accelerated() ? self->graphics->render_node().gpu_device() : nullptr)) {      // (on the GPU when there is one)
         self->graphics->set_display_override(nullptr);
@@ -1706,7 +1731,8 @@ static efi::Status kernel_main(efi::Handle image, efi::SystemTable* st) {
         self->per_monitor = true;
         return self->scaled;
       }
-      const bool compose = self->monitors->needs_compositing() && self->display->update(self->monitors->layout(), placements, count, k);
+      const bool compose = self->monitors->needs_compositing() &&
+                           self->display->update(self->monitors->layout(), placements, count, k, ArrayView<const hardware::MonitorTarget>(targets, target_count));
       self->graphics->set_display_override(compose ? self->display : nullptr);
       self->graphics->reset_renderer();
       graphics::IRenderer2D* device = self->graphics->renderer_2d();
@@ -1726,9 +1752,11 @@ static efi::Status kernel_main(efi::Handle image, efi::SystemTable* st) {
   UniquePointer<hardware::MonitorRenderers> monitor_views = gpu ? UniquePointer<hardware::MonitorRenderers>::make(shared_allocator, *gpu, shared_allocator) : UniquePointer<hardware::MonitorRenderers>();
   DisplayPipeline display_pipeline{&monitors, &system_graphics, monitor_display.get(), scaled_renderer.get(), monitor_views.get(),
                                    cell_text && cell_text->ready() ? cell_text.get() : nullptr};
+  display_pipeline.pool = &graphics_pool;
   if (gpu && monitor_display && (monitors.layout().count() > 1 || monitors.needs_compositing())) {
     if (DisplayPipeline::apply(&display_pipeline)) {
-      Entry(Level::Ok, "Monitors").dec(monitors.layout().enabled_count()).text(" monitors, desktop ").dec(monitors.desktop_width()).text("x").dec(monitors.desktop_height());
+      Entry(Level::Ok, "Monitors").dec(monitors.layout().enabled_count()).text(" monitors, desktop ").dec(monitors.desktop_width()).text("x").dec(monitors.desktop_height())
+          .text(monitor_display->target_count() ? ", spanning " : "").text(monitor_display->target_count() ? "several GPUs" : "");
     } else {
       Entry(Level::Warning, "Monitors").text("the display device cannot show the monitors separately; using one");
     }
@@ -2947,6 +2975,12 @@ static efi::Status kernel_main(efi::Handle image, efi::SystemTable* st) {
     hardware::X86GmuxPorts gmux_ports;
     UniquePointer<hardware::AppleGmux> gmux;
     UniquePointer<hardware::IGpuPlatformPower> gpu_platform_power[hardware::GpuTopology::kMaxAdapters];
+    // The display mux (vga_switcheroo's switch): found and kept here, switched only on request (GpuMuxSwitch::published(), for a display
+    // settings page). The integrated GPU's side is the firmware's framebuffer: the panel can go to the discrete GPU, not come back.
+    UniquePointer<hardware::IGpuMux> gpu_acpi_mux;
+    hardware::GpuManagerLeases gpu_mux_leases(gpu_pool.manager());
+    hardware::GopPanelOutput integrated_panel;
+    UniquePointer<hardware::GpuMuxSwitch> gpu_mux_switch;
     if (acpi_events && gpu_pool.manager().is_hybrid()) {
       acpi::AmlInterpreter& aml = acpi_events->interpreter();
       if (acpi::Node* gmux_device = hardware::AppleGmux::find_device(aml)) {
@@ -2976,6 +3010,35 @@ static efi::Status kernel_main(efi::Handle image, efi::SystemTable* st) {
             .text(hardware::gpu_power_mechanism_name(power->mechanism()));
       }
       if (gmux) Entry(Level::Info, "GPU").text("Apple gmux ").dec(gmux->version_major()).text(".").dec(gmux->version_minor()).text(" (display switch)");
+      int32_t mux_discrete = -1;
+      for (uint32_t i = 0; i < gpu_pool.count() && mux_discrete < 0; ++i)
+        if (topology.adapter(i).kind == hardware::GpuKind::Discrete && static_cast<int32_t>(i) != gpu_pool.manager().display_index()) mux_discrete = static_cast<int32_t>(i);
+      const char* mux_kind = gmux ? "Apple gmux" : nullptr;
+      if (!gmux && mux_discrete >= 0) {
+        const hardware::GpuAdapter& a = topology.adapter(static_cast<uint32_t>(mux_discrete));
+        hardware::PciAddress bridge;
+        const Optional<hardware::PciAddress> bridge_hint = hardware::pci_find_upstream_bridge(pci, a.device.address, &bridge) ? Optional<hardware::PciAddress>(bridge) : Optional<hardware::PciAddress>();
+        const Optional<hardware::PciAddress> igpu = integrated >= 0 ? Optional<hardware::PciAddress>(topology.adapter(static_cast<uint32_t>(integrated)).device.address) : Optional<hardware::PciAddress>();
+        gpu_acpi_mux = hardware::GpuAcpiPower::find_mux(aml, a.device.address, bridge_hint, a.device.vendor_id, shared_allocator, igpu, [](uint32_t ms) { kernel::sleep_ms(ms); });
+        if (gpu_acpi_mux) mux_kind = a.device.vendor_id == hardware::GpuAcpiPower::kVendorAmd ? "AMD ATPX" : "NVIDIA hybrid _DSM";
+      }
+      hardware::IGpuMux* mux = gmux ? static_cast<hardware::IGpuMux*>(gmux.get()) : gpu_acpi_mux.get();
+      if (mux && mux_discrete >= 0 && integrated >= 0) {
+        const bool on_integrated = gpu_pool.manager().display_index() == integrated;
+        gpu_mux_switch = UniquePointer<hardware::GpuMuxSwitch>::make(shared_allocator, *mux, &gpu_mux_leases, integrated, mux_discrete,
+                                                                     on_integrated ? hardware::GpuMuxTarget::Integrated : hardware::GpuMuxTarget::Discrete);
+        if (gpu_mux_switch) {
+          if (on_integrated) gpu_mux_switch->attach_output(hardware::GpuMuxTarget::Integrated, &integrated_panel);
+          hardware::IPanelOutput* discrete_panel = gpu_pool.node(static_cast<uint32_t>(mux_discrete))->panel;
+          gpu_mux_switch->attach_output(hardware::GpuMuxTarget::Discrete, discrete_panel);
+          hardware::GpuMuxSwitch::publish(gpu_mux_switch.get());
+          const char* why = "";
+          const bool can = gpu_mux_switch->can_switch_to(hardware::GpuMuxTarget::Discrete, &why);
+          Entry(Level::Info, "GPU").text("display switch: ").text(mux_kind).text(", the panel on the ")
+              .text(hardware::gpu_mux_target_name(on_integrated ? hardware::GpuMuxTarget::Integrated : hardware::GpuMuxTarget::Discrete))
+              .text(can ? "; the discrete GPU can take it" : "; switching not possible: ").text(can ? "" : why);
+        }
+      }
     }
 #endif
 #ifdef TCOS_ACPI_EVENTS

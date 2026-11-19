@@ -165,12 +165,12 @@ void test_edp() {
   for (size_t i = 0; i < 8; ++i) { s.dpcd[0x10 + i * 2] = static_cast<uint8_t>(table[i]); s.dpcd[0x11 + i * 2] = static_cast<uint8_t>(table[i] >> 8); }
   Dpcd::Capabilities c;
   CHECK(Dpcd::read_capabilities(s, true, &c) && c.edp_revision == 3 && c.edp_rate_count == 6 && s.reads == 3);
-  const uint32_t want[] = {1620000, 2160000, 2430000, 2700000, 3240000, 4320000};
+  const uint32_t want[] = {162000, 216000, 243000, 270000, 324000, 432000};   // the link clock, as DRM
   for (uint32_t i = 0; i < 6; ++i) CHECK(c.edp_rates_khz[i] == want[i]);
   CHECK(c.edp_rates_khz[6] == 0 && c.edp_rates_khz[7] == 0);
   // eight rates fill the table, with no terminator
   for (size_t i = 0; i < 8; ++i) { s.dpcd[0x10 + i * 2] = static_cast<uint8_t>(8100 + i); s.dpcd[0x11 + i * 2] = static_cast<uint8_t>((8100 + i) >> 8); }
-  CHECK(Dpcd::read_capabilities(s, true, &c) && c.edp_rate_count == 8 && c.edp_rates_khz[7] == 8107u * 200);
+  CHECK(Dpcd::read_capabilities(s, true, &c) && c.edp_rate_count == 8 && c.edp_rates_khz[7] == 8107u * 200 / 10);
   // an older panel (eDP 1.3, revision 2) has no table, even if its bytes are not zero; a DisplayPort connector never reads it
   set(s, 0x700, {0x02});
   s.reads = 0;
@@ -193,7 +193,7 @@ void test_edp() {
   // a table with a short view: only the whole entries are used
   uint8_t rcv[16] = {0x14, 0x0A, 0x02};
   uint8_t rates[5] = {0x10, 0x00, 0x20, 0x00, 0x30};
-  CHECK(Dpcd::parse_capabilities(ConstByteView(rcv, 16), 3, ConstByteView(rates, 5), &c) && c.edp_rate_count == 2 && c.edp_rates_khz[1] == 32u * 200);
+  CHECK(Dpcd::parse_capabilities(ConstByteView(rcv, 16), 3, ConstByteView(rates, 5), &c) && c.edp_rate_count == 2 && c.edp_rates_khz[1] == 32u * 200 / 10);
 }
 
 void test_link_status() {
