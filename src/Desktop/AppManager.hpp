@@ -125,12 +125,14 @@ class AppManager : public gui::Frame {
   static void on_linux_only(void* self, gui::Control&);
   static void on_windows_only(void* self, gui::Control&);
   static void on_about(void* self, gui::Control&);
-  static void on_remove_answer(void* self, gui::Control&);
+  static void on_answer(void* self, gui::Control&);
   void report(gui::NoticeKind kind, StringView text);   // a result the user must not miss
   static void run_job(void* self, gui::Control&);
   static void on_progress(void* self, const appman::Progress& progress);
 
-  bool start(Job job, AppPlatform platform, StringView name);
+  bool start(Job job, AppPlatform platform, StringView name, bool ignore_checksum = false);
+  // After a Windows download failed its checksum: asks whether to install it anyway (from the worker thread). False if it could not ask.
+  bool ask_ignore_checksum(Job job, StringView id, StringView name);
   bool start_selected(Job job);
   bool load_cached_catalog();
   void reload_installed();
@@ -144,7 +146,11 @@ class AppManager : public gui::Frame {
   gui::ContextMenu list_menu_;
   gui::MenuItem *installed_only_item_ = nullptr, *linux_only_item_ = nullptr, *windows_only_item_ = nullptr, *refresh_item_ = nullptr, *install_item_ = nullptr, *update_item_ = nullptr, *remove_item_ = nullptr,
                 *cancel_item_ = nullptr, *about_item_ = nullptr, *list_install_item_ = nullptr, *list_update_item_ = nullptr, *list_remove_item_ = nullptr;
-  gui::MessageDialog ask_;                      // "Remove <name>?"
+  // The question ask_ shows: "Remove <name>?", or "Install <name> anyway?" after its download failed the checksum.
+  enum class Question : uint8_t { Remove, IgnoreChecksum };
+  gui::MessageDialog ask_;
+  Question question_ = Question::Remove;
+  Job asked_job_ = Job::Remove;                 // the job a yes starts
   String remove_name_;                          // the application the question is about
   AppPlatform remove_platform_ = AppPlatform::Linux;
   gui::NoticeDialog* notices_ = nullptr;
@@ -179,6 +185,7 @@ class AppManager : public gui::Frame {
   Job job_ = Job::None;                         // (state_mutex_) the job the worker is to run, and for what
   String job_name_;                             // (state_mutex_)
   AppPlatform job_platform_ = AppPlatform::Linux;      // (state_mutex_)
+  bool job_ignore_checksum_ = false;            // (state_mutex_) the user chose to install a download that failed its checksum
   appman::Progress progress_state_;
   bool busy_ = false;
   HandlerThread worker_;                        // (last: stopped first when the window goes)

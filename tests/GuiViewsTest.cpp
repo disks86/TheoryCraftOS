@@ -9106,6 +9106,19 @@ static void test_app_manager() {
     CHECK(fs.stat("/Windows/Program Files/WinGet/Packages/Test.Single_Microsoft.Winget.Source_8wekyb3d8bbwe", &e) == filesystem::Status::NotFound);
     CHECK(fs.stat("/Linux/opt/notes/notes", &e) == filesystem::Status::Ok);
     m->set_filter(desktop::AppManager::kShowAll);
+    // A download that is not the file the list names (a publisher that changed it at a fixed link): asked, and nothing is installed unless the user says so.
+    m->set_query("bad sum");
+    CHECK(m->list().item_count() == 1 && m->row_name(0, &name) && name.view().equals("Test.BadSum"));
+    m->select_row(0);
+    CHECK(m->install_selected() && m->status().contains("not the file the package list describes") && m->remove_dialog().showing());
+    CHECK(m->remove_dialog().accept_button().text().equals("Install Anyway") && m->remove_dialog().default_choice() == gui::MessageDialog::Choice::Decline);
+    m->remove_dialog().decline_button().click();
+    CHECK(!m->remove_dialog().showing() && !m->busy() && !m->remove_button().enabled());
+    CHECK(m->install_selected() && m->remove_dialog().showing());
+    m->remove_dialog().accept_button().click();
+    CHECK(!m->remove_dialog().showing() && m->status().contains("\"Bad Sum\" is installed") && m->remove_button().enabled());
+    CHECK(m->remove_selected() && m->status().contains("\"Bad Sum\" was removed"));
+    m->set_query("");
     // A package that comes as a setup program says so.
     m->set_query("setup program");
     m->select_row(0);

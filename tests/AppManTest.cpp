@@ -887,6 +887,11 @@ static void test_winget_installer() {
     CHECK(net.downloaded.empty() || net.downloaded.back() != "https://example.org/dl/setup-9.0.exe");      // (not even downloaded: this installer has no way to run a setup program)
     CHECK(run(installer.install(package("Test.ArmOnly"), &progress, &detail), appman::Result::NotSupported) && detail.view().contains("this kind of computer") && nothing_left("Test.ArmOnly"));
     CHECK(run(installer.install(package("Test.BadSum"), &progress, &detail), appman::Result::BadChecksum) && nothing_left("Test.BadSum"));
+    // The user may install it anyway (a publisher that changed the file at a fixed link before the list caught up), but only over HTTPS.
+    CHECK(detail.view().equals("https://example.org/dl/badsum.exe") && appman::WingetInstaller::may_ignore_checksum(detail.view()));
+    CHECK(!appman::WingetInstaller::may_ignore_checksum("http://example.org/dl/badsum.exe") && !appman::WingetInstaller::may_ignore_checksum(""));
+    CHECK(run(installer.install(package("Test.BadSum"), &progress, &detail, true), appman::Result::Ok) && installer.installed("Test.BadSum"));
+    CHECK(run(installer.remove("Test.BadSum", &detail), appman::Result::Ok) && nothing_left("Test.BadSum"));
     CHECK(run(installer.install(package("Test.Evil"), &progress, &detail), appman::Result::NotAnAppImage) && detail.view().contains("not safe") && nothing_left("Test.Evil"));
     CHECK(!exists(fs, (std::string(kPackages) + "/evil.exe").c_str()) && !exists(fs, "/Windows/Program Files/WinGet/evil.exe"));
     CHECK(run(installer.install(package("Test.NotPe"), &progress, &detail), appman::Result::NotAnAppImage) && detail.view().contains("not a Windows program") && nothing_left("Test.NotPe"));
@@ -1172,6 +1177,10 @@ static void test_winget_setup_programs() {
     const std::string good = download;
     download[600] ^= 1;
     CHECK(run(installer.install(package("Test.Setup"), &progress, &detail), appman::Result::BadChecksum) && host.runs.empty() && temp_empty());
+    // ...unless the user chose to install it anyway.
+    CHECK(run(installer.install(package("Test.Setup"), &progress, &detail, true), appman::Result::Ok) && host.runs.size() == 1 && temp_empty());
+    CHECK(run(installer.remove("Test.Setup", &detail), appman::Result::Ok) && !installer.installed("Test.Setup"));
+    host.runs.clear();
     download = good;
 
     // The uninstaller is gone (the program was removed some other way): the package is forgotten.

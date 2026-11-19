@@ -128,8 +128,12 @@ class WingetInstaller {
   WingetInstaller(allocators::IAllocator& allocator, filesystem::IFileSystem& files, INetwork& network, ISetupHost* setup = nullptr)
       : allocator_(allocator), files_(files), network_(network), setup_(setup) {}
 
-  [[nodiscard]] Result install(const WingetPackage& package, Progress* progress, String* detail);
-  [[nodiscard]] Result update(const WingetPackage& package, Progress* progress, String* detail);
+  // `ignore_checksum`: install the download even if its SHA-256 is not the manifest's (the user's choice after Result::BadChecksum, as winget's
+  // --ignore-security-hash). Only a download over HTTPS is taken that way (may_ignore_checksum); everything else is checked as always.
+  [[nodiscard]] Result install(const WingetPackage& package, Progress* progress, String* detail, bool ignore_checksum = false);
+  [[nodiscard]] Result update(const WingetPackage& package, Progress* progress, String* detail, bool ignore_checksum = false);
+  // Whether a download from `url` that failed its checksum may be installed anyway, if the user says so.
+  static bool may_ignore_checksum(StringView url) { return url.starts_with("https://"); }
   [[nodiscard]] Result remove(StringView id, String* detail);
   // Steps 1 and 2: the manifest of the package's latest version, fetched and checked.
   [[nodiscard]] Result resolve(const WingetPackage& package, WingetManifest* manifest, String* detail);
@@ -156,12 +160,12 @@ class WingetInstaller {
 
  private:
   struct Program;
-  Result place(const WingetManifest& manifest, const WingetInstallerEntry& entry, bool was_installed, Progress* progress, String* detail);
+  Result place(const WingetManifest& manifest, const WingetInstallerEntry& entry, bool was_installed, bool ignore_checksum, Progress* progress, String* detail);
   Result unpack(StringView archive, StringView folder, String* detail);
   struct SetupRecord;
-  Result place_setup(const WingetManifest& manifest, const WingetInstallerEntry& entry, Progress* progress, String* detail);
+  Result place_setup(const WingetManifest& manifest, const WingetInstallerEntry& entry, bool ignore_checksum, Progress* progress, String* detail);
   Result remove_setup(StringView id, const SetupRecord& record, String* detail);
-  Result place_msi(const WingetManifest& manifest, const WingetInstallerEntry& entry, Progress* progress, String* detail);
+  Result place_msi(const WingetManifest& manifest, const WingetInstallerEntry& entry, bool ignore_checksum, Progress* progress, String* detail);
   Result run_msi_removal(StringView package, StringView upgrading, String* detail);
   bool read_setup_record(StringView id, WingetInstalled* app, SetupRecord* record) const;
   bool setup_record_path(StringView id, String* out) const;

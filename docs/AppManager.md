@@ -79,6 +79,11 @@ package, so the next start does not unpack a database.
    Otherwise a setup program, see below.
 4. **Download it** into the package's folder, through `download.part`, and check its SHA-256 against the manifest. Every byte that is installed
    is therefore the one the catalog names, from the index down.
+   Some publishers serve their newest file at a fixed link (Google Chrome's `googlechromestandaloneenterprise64.msi`), so the file changes
+   before winget's manifest does and the check fails. The App Manager then asks whether to install it anyway ("Install Anyway" / "Cancel",
+   Cancel the default), like winget's `--ignore-security-hash`. Only a download over HTTPS from the manifest's own link can be taken that way
+   (`WingetInstaller::may_ignore_checksum`); the version list and the manifest are always checked. The same applies to setup programs and
+   `.msi` packages below.
 5. **Put it in place**, in `C:\Program Files\WinGet\Packages\<identifier>_Microsoft.Winget.Source_8wekyb3d8bbwe`, which is where winget puts
    portable packages installed for all users:
    - a portable program is named after its command (`jq.exe`), else after the downloaded file;
