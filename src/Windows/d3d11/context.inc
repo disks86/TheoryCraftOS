@@ -50,11 +50,21 @@ static ID3D12PipelineState *pipeline_get(Dev *d, Ctx *c) {
   key.raster.ScissorEnable = 0;      /* (not the pipeline's: the scissor rectangle is set with the viewport) */
   key.targets = c->rtv_count;
   key.has_depth = c->dsv != NULL;
+  key.samples = 1;
+  for (UINT i = 0; i < c->rtv_count && i < 8; ++i) {
+    key.formats[i] = c->rtv[i]->tex->desc.Format;      /* (as the program made it: an R8 target is kept as RGBA8 but masked) */
+    if (c->rtv[i]->tex->desc.SampleDesc.Count > 1) key.samples = c->rtv[i]->tex->desc.SampleDesc.Count;
+  }
+  if (c->dsv) {
+    key.depth_format = c->dsv->tex->stored;
+    if (c->dsv->tex->desc.SampleDesc.Count > 1) key.samples = c->dsv->tex->desc.SampleDesc.Count;
+  }
   if (!c->dsv) { key.depth.DepthEnable = FALSE; key.depth.StencilEnable = FALSE; }
   Pipeline *oldest = &d->pipelines[0];
   for (UINT i = 0; i < d->pipeline_count; ++i) {
     Pipeline *p = &d->pipelines[i];
-    if (p->vs == key.vs && p->ps == key.ps && p->layout == key.layout && p->targets == key.targets && p->has_depth == key.has_depth &&
+    if (p->vs == key.vs && p->ps == key.ps && p->layout == key.layout && p->targets == key.targets && p->has_depth == key.has_depth && p->samples == key.samples &&
+        memcmp(p->formats, key.formats, sizeof key.formats) == 0 && p->depth_format == key.depth_format &&
         memcmp(&p->blend, &key.blend, sizeof key.blend) == 0 && memcmp(&p->depth, &key.depth, sizeof key.depth) == 0 && memcmp(&p->raster, &key.raster, sizeof key.raster) == 0) {
       p->last_used = ++d->pipeline_clock;
       return p->state;
@@ -84,6 +94,16 @@ static ID3D12PipelineState *pipeline_get(Dev *d, Ctx *c) {
     out->LogicOp = D3D12_LOGIC_OP_NOOP;
     out->RenderTargetWriteMask = in->RenderTargetWriteMask;
   }
+  for (UINT i = 0; i < c->rtv_count && i < 8; ++i) {      /* a target kept wider than its format: only its own channels are written */
+    const int e = c->rtv[i]->tex->expand;
+    if (!e) continue;
+    if (!pd.BlendState.IndependentBlendEnable) {
+      for (UINT j = 1; j < 8; ++j) pd.BlendState.RenderTarget[j] = pd.BlendState.RenderTarget[0];
+      pd.BlendState.IndependentBlendEnable = TRUE;
+    }
+    pd.BlendState.RenderTarget[i].RenderTargetWriteMask &= (UINT8)(e == 1 ? D3D12_COLOR_WRITE_ENABLE_RED : e == 3 ? (D3D12_COLOR_WRITE_ENABLE_RED | D3D12_COLOR_WRITE_ENABLE_GREEN)
+                                                                                             : D3D12_COLOR_WRITE_ENABLE_ALPHA);
+  }
   pd.RasterizerState.FillMode = (D3D12_FILL_MODE)key.raster.FillMode;
   pd.RasterizerState.CullMode = (D3D12_CULL_MODE)key.raster.CullMode;
   pd.RasterizerState.FrontCounterClockwise = key.raster.FrontCounterClockwise;
@@ -105,7 +125,7 @@ static ID3D12PipelineState *pipeline_get(Dev *d, Ctx *c) {
   for (UINT i = 0; i < c->rtv_count; ++i) pd.RTVFormats[i] = c->rtv[i]->tex->stored;
   if (c->dsv) pd.DSVFormat = c->dsv->tex->stored == DXGI_FORMAT_R24G8_TYPELESS ? DXGI_FORMAT_D24_UNORM_S8_UINT
                            : c->dsv->tex->stored == DXGI_FORMAT_R32_TYPELESS ? DXGI_FORMAT_D32_FLOAT : c->dsv->tex->stored;
-  pd.SampleDesc.Count = 1;
+  pd.SampleDesc.Count = key.samples;
   ID3D12PipelineState *state = NULL;
   TcosD3D12PipelineOptions(d->d12, c->vs->registers, 0);      /* (the pixel shader's constant buffers come after the vertex shader's) */
   if (FAILED(ID3D12Device_CreateGraphicsPipelineState(d->d12, &pd, &IID_ID3D12PipelineState, (void **)&state)) || !state) return NULL;
@@ -327,7 +347,10 @@ static ULONG STDMETHODCALLTYPE ctx_Release(Ctx *c) {
 static HRESULT STDMETHODCALLTYPE ctx_QueryInterface(Ctx *c, REFIID riid, void **out) {
   if (!out) return E_POINTER;
   *out = NULL;
-  if (!guid_eq(riid, &IID_IUnknown) && !guid_eq(riid, &IID_ID3D11DeviceChild) && !guid_eq(riid, &IID_ID3D11DeviceContext)) return E_NOINTERFACE;
+  if (!guid_eq(riid, &IID_IUnknown) && !guid_eq(riid, &IID_ID3D11DeviceChild) && !guid_eq(riid, &IID_ID3D11DeviceContext)) {
+    dx_no_interface("ID3D11DeviceContext", riid);
+    return E_NOINTERFACE;
+  }
   ctx_AddRef(c);
   *out = c;
   return S_OK;
@@ -490,7 +513,11 @@ static void STDMETHODCALLTYPE ctx_ClearRenderTargetView(Ctx *c, ID3D11RenderTarg
   View *v = (View *)view;
   if (!v || !colour) return;
   LOCK(c);
-  ID3D12GraphicsCommandList_ClearRenderTargetView(c->dev->list, v->handle, colour, 0, NULL);
+  FLOAT kept[4] = {colour[0], colour[1], colour[2], colour[3]};      /* (a target kept wider than its format: the channels it does not have stay 0 and 1) */
+  if (v->tex->expand == 1) kept[1] = kept[2] = 0, kept[3] = 1;
+  else if (v->tex->expand == 3) kept[2] = 0, kept[3] = 1;
+  else if (v->tex->expand == 2) kept[0] = kept[1] = kept[2] = 0;
+  ID3D12GraphicsCommandList_ClearRenderTargetView(c->dev->list, v->handle, kept, 0, NULL);
   v->tex->used = c->dev->epoch;
   c->dev->recorded = 1;
   UNLOCK(c);
@@ -660,6 +687,19 @@ static void STDMETHODCALLTYPE ctx_CopyResource(Ctx *c, ID3D11Resource *to, ID3D1
   UNLOCK(c);
 }
 static void STDMETHODCALLTYPE ctx_GenerateMips(Ctx *c, ID3D11ShaderResourceView *view) { (void)c; (void)view; }
+/* A multisampled texture into an ordinary one of its size and format: the samples of each pixel averaged (Direct3D 12's ResolveSubresource below). */
+static void STDMETHODCALLTYPE ctx_ResolveSubresource(Ctx *c, ID3D11Resource *to, UINT to_sub, ID3D11Resource *from, UINT from_sub, DXGI_FORMAT format) {
+  (void)format;
+  Dev *d = c->dev;
+  Tex *tt = tex_of_resource(to), *tf = tex_of_resource(from);
+  if (!tt || !tf || to_sub != 0 || from_sub != 0 || tf->desc.SampleDesc.Count < 2 || tt->desc.SampleDesc.Count > 1 || tt->desc.Width != tf->desc.Width ||
+      tt->desc.Height != tf->desc.Height || tt->stored != tf->stored) return;
+  LOCK(c);
+  ID3D12GraphicsCommandList_ResolveSubresource(d->list, tt->res, 0, tf->res, 0, tt->stored);      /* (the stored format: a typed view of it asked for is the same bytes) */
+  tt->used = tf->used = d->epoch;
+  d->recorded = 1;
+  UNLOCK(c);
+}
 
 static void STDMETHODCALLTYPE ctx_Flush(Ctx *c) {
   LOCK(c);

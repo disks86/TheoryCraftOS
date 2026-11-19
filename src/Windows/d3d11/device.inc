@@ -28,7 +28,7 @@ static HRESULT STDMETHODCALLTYPE dev_QueryInterface(Dev *d, REFIID riid, void **
   else if (guid_eq(riid, &IID_IDXGIObject) || guid_eq(riid, &IID_IDXGIDevice) || guid_eq(riid, &IID_IDXGIDevice1) || guid_eq(riid, &IID_IDXGIDevice2) ||
            guid_eq(riid, &IID_IDXGIDevice3)) *out = &d->dxgi;      /* (DXGI 1.2: ANGLE needs it to present to another process's window) */
   else if (guid_eq(riid, &IID_ITcosPresenter)) *out = &d->presenter;
-  else return E_NOINTERFACE;
+  else { dx_no_interface("ID3D11Device", riid); return E_NOINTERFACE; }
   dx_AddRef(OBJ(d));
   return S_OK;
 }
@@ -42,8 +42,20 @@ static void STDMETHODCALLTYPE dev_GetImmediateContext(Dev *d, ID3D11DeviceContex
   ctx_AddRef(d->ctx);
   *out = (ID3D11DeviceContext *)d->ctx;
 }
+/* The quality levels of a multisampled target of `format` with `samples` samples: what Direct3D 12 below says for the format the texture is stored in (one, the
+ * standard pattern, for the counts the adapter draws with; 0 for the others). */
+static UINT dev_ms_levels(Dev *d, DXGI_FORMAT format, UINT samples) {
+  if (samples == 1) return 1;
+  DXGI_FORMAT stored;
+  UINT bpp, stored_bpp;
+  int expand, depth;
+  if (!format_of(format, D3D11_BIND_RENDER_TARGET, &stored, &bpp, &stored_bpp, &expand, &depth) &&
+      !format_of(format, D3D11_BIND_DEPTH_STENCIL, &stored, &bpp, &stored_bpp, &expand, &depth)) return 0;
+  D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS q = {stored, samples, D3D12_MULTISAMPLE_QUALITY_LEVELS_FLAG_NONE, 0};
+  if (FAILED(ID3D12Device_CheckFeatureSupport(d->d12, D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS, &q, sizeof q))) return 0;
+  return q.NumQualityLevels;
+}
 static HRESULT STDMETHODCALLTYPE dev_CheckFormatSupport(Dev *d, DXGI_FORMAT format, UINT *support) {
-  (void)d;
   DXGI_FORMAT stored;
   UINT bpp, stored_bpp;
   int expand, depth, convert;
@@ -52,17 +64,19 @@ static HRESULT STDMETHODCALLTYPE dev_CheckFormatSupport(Dev *d, DXGI_FORMAT form
   if (format_of(format, 0, &stored, &bpp, &stored_bpp, &expand, &depth)) {
     *support |= D3D11_FORMAT_SUPPORT_TEXTURE2D | D3D11_FORMAT_SUPPORT_SHADER_SAMPLE | D3D11_FORMAT_SUPPORT_SHADER_LOAD | D3D11_FORMAT_SUPPORT_CPU_LOCKABLE;
     if (!expand) *support |= D3D11_FORMAT_SUPPORT_RENDER_TARGET | D3D11_FORMAT_SUPPORT_BLENDABLE | D3D11_FORMAT_SUPPORT_DISPLAY;
+    else if (expand != 2) *support |= D3D11_FORMAT_SUPPORT_RENDER_TARGET | D3D11_FORMAT_SUPPORT_BLENDABLE;      /* (R8 and RG8: masked RGBA8) */
   } else if (format_of(format, D3D11_BIND_DEPTH_STENCIL, &stored, &bpp, &stored_bpp, &expand, &depth)) {
     *support |= D3D11_FORMAT_SUPPORT_TEXTURE2D | D3D11_FORMAT_SUPPORT_DEPTH_STENCIL;
   }
   if (element_floats(format, &convert)) *support |= D3D11_FORMAT_SUPPORT_IA_VERTEX_BUFFER;
   if (format == DXGI_FORMAT_R16_UINT || format == DXGI_FORMAT_R32_UINT) *support |= D3D11_FORMAT_SUPPORT_IA_INDEX_BUFFER;
+  if ((*support & (D3D11_FORMAT_SUPPORT_RENDER_TARGET | D3D11_FORMAT_SUPPORT_DEPTH_STENCIL)) && dev_ms_levels(d, format, 4))
+    *support |= D3D11_FORMAT_SUPPORT_MULTISAMPLE_RENDERTARGET | D3D11_FORMAT_SUPPORT_MULTISAMPLE_RESOLVE;      /* (drawn into and resolved, not read by shaders) */
   return *support ? S_OK : E_FAIL;
 }
 static HRESULT STDMETHODCALLTYPE dev_CheckMultisampleQualityLevels(Dev *d, DXGI_FORMAT format, UINT samples, UINT *levels) {
-  (void)d; (void)format;
   if (!levels) return E_INVALIDARG;
-  *levels = samples == 1 ? 1 : 0;
+  *levels = samples >= 1 && samples <= D3D11_MAX_MULTISAMPLE_SAMPLE_COUNT ? dev_ms_levels(d, format, samples) : 0;
   return S_OK;
 }
 static HRESULT STDMETHODCALLTYPE dev_CheckFeatureSupport(Dev *d, D3D11_FEATURE feature, void *data, UINT size) {

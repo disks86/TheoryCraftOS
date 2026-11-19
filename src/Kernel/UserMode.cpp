@@ -215,9 +215,14 @@ void trace_service_failure(process::Process& process, const process::SyscallRequ
     console::puts(" kind ");
     console::put_dec(static_cast<int64_t>(process.files().kind(request.args[1] / 4 - 1)));
   }
-  if (request.number == 302 || request.number == 303) {      // NtOpenKey / NtOpenKeyEx: the key's name (OBJECT_ATTRIBUTES.ObjectName -> UNICODE_STRING)
+  // the name of what was opened: NtOpenKey / NtOpenKeyEx / NtCreateFile (OBJECT_ATTRIBUTES third), NtQueryAttributesFile (first): OBJECT_ATTRIBUTES.ObjectName -> UNICODE_STRING
+  // (NtLoadModule, 50: its first argument is the UNICODE_STRING of the path itself)
+  const int attributes_at = (request.number == 302 || request.number == 303 || request.number == 10) ? 2 : (request.number == 15 || request.number == 50) ? 0 : -1;
+  if (attributes_at >= 0) {
     uint64_t name = 0, buffer = 0, length = 0;
-    if (process.read_user_u64(request.args[2] + 0x10, &name) && name && process.read_user_u64(name, &length) && process.read_user_u64(name + 8, &buffer)) {
+    const bool direct = request.number == 50;
+    if ((direct ? (name = request.args[0]) != 0 : process.read_user_u64(request.args[attributes_at] + 0x10, &name)) && name && process.read_user_u64(name, &length) &&
+        process.read_user_u64(name + 8, &buffer)) {
       char text[120];
       uint32_t n = 0;
       for (uint64_t at = 0; at + 2 <= (length & 0xFFFFu) && n + 1 < sizeof(text); at += 2) {
@@ -226,7 +231,7 @@ void trace_service_failure(process::Process& process, const process::SyscallRequ
         text[n++] = (unit[1] == 0 && unit[0] >= 0x20 && unit[0] < 0x7F) ? static_cast<char>(unit[0]) : '?';
       }
       text[n] = 0;
-      console::puts(" key ");
+      console::puts(request.number == 302 || request.number == 303 ? " key " : " name ");
       console::puts(text);
     }
   }
@@ -1702,6 +1707,18 @@ bool Task::start_first_thread() {
 }
 
 void request_kill(Task& task, uint32_t exit_code) {
+#ifdef TCOS_TRACE_SERVICE_FAILURES
+  if (task.program.loaded()) {      // who ends whom (a program that ends another one says so; its own end is "process exited")
+    UserThread* by = current_user_thread();
+    console::puts("process ");
+    console::put_dec(static_cast<int64_t>(task.program.process()->id()));
+    console::puts(" told to end with ");
+    console::put_hex(exit_code);
+    console::puts(" by ");
+    if (by && by->task && by->task->program.loaded()) console::put_dec(static_cast<int64_t>(by->task->program.process()->id())); else console::puts("the kernel");
+    console::puts("\n");
+  }
+#endif
   task.kill_code = exit_code;
   __atomic_store_n(&task.kill_requested, true, __ATOMIC_RELEASE);
   task.changed.notify_all();      // a thread waiting for another one must see it

@@ -63,6 +63,61 @@ static SIZE_T wlen(const WCHAR *s) { SIZE_T n = 0; while (s[n]) ++n; return n; }
 static SIZE_T alen(const char *s) { SIZE_T n = 0; while (s[n]) ++n; return n; }
 static int guid_eq(const GUID *a, const GUID *b) { return memcmp(a, b, sizeof(GUID)) == 0; }
 
+/* What a program asked of these libraries that they do not have: a method nobody wrote, an interface no object answers. Said once each to the debug channel
+ * (NtTcosDebugException with DBG_PRINTEXCEPTION_C, which the kernel's service trace prints as "debug text" whether or not a debugger is attached), so a program
+ * that gives up, such as Chrome's GPU process deciding a device is not good enough, shows what it missed. */
+static void dx_say(const char *text) {
+  typedef LONG (NTAPI *DebugExceptionFn)(EXCEPTION_RECORD *, BOOLEAN, void *);
+  static DebugExceptionFn report;
+  if (!report) report = (DebugExceptionFn)(void (*)(void))GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtTcosDebugException");
+  if (!report) return;
+  EXCEPTION_RECORD record;
+  memset(&record, 0, sizeof record);
+  record.ExceptionCode = 0x40010006u;      /* DBG_PRINTEXCEPTION_C */
+  record.NumberParameters = 2;
+  SIZE_T n = 0;
+  while (text[n]) ++n;
+  record.ExceptionInformation[0] = n + 1;
+  record.ExceptionInformation[1] = (ULONG_PTR)text;
+  report(&record, TRUE, NULL);
+}
+static void dx_unimplemented(volatile LONG *said, const char *what) {
+  if (InterlockedExchange((LONG *)said, 1)) return;
+  char text[160] = "dx: not implemented: ";
+  SIZE_T n = 21;
+  for (SIZE_T i = 0; what[i] && n + 1 < sizeof text; ++i) text[n++] = what[i];
+  text[n] = 0;
+  dx_say(text);
+}
+/* A method that failed: its first few failures each, with the HRESULT. */
+static void dx_failed(volatile LONG *said, const char *what, HRESULT hr) {
+  if (InterlockedIncrement((LONG *)said) > 4) return;
+  static const char hex[] = "0123456789abcdef";
+  char text[160] = "dx: failed: ";
+  SIZE_T n = 12;
+  for (SIZE_T i = 0; what[i] && n + 12 < sizeof text; ++i) text[n++] = what[i];
+  text[n++] = ' ';
+  for (int shift = 28; shift >= 0; shift -= 4) text[n++] = hex[((ULONG)hr >> shift) & 15];
+  text[n] = 0;
+  dx_say(text);
+}
+static void dx_no_interface(const char *object, const GUID *g) {
+  static const char hex[] = "0123456789abcdef";
+  char text[160] = "dx: no interface ";
+  SIZE_T n = 17;
+  const BYTE *b = (const BYTE *)g;
+  const int order[16] = {3, 2, 1, 0, 5, 4, 7, 6, 8, 9, 10, 11, 12, 13, 14, 15};
+  for (int i = 0; i < 16; ++i) {
+    if (i == 4 || i == 6 || i == 8 || i == 10) text[n++] = '-';
+    text[n++] = hex[b[order[i]] >> 4];
+    text[n++] = hex[b[order[i]] & 15];
+  }
+  text[n++] = ' ';
+  for (SIZE_T i = 0; object[i] && n + 1 < sizeof text; ++i) text[n++] = object[i];
+  text[n] = 0;
+  dx_say(text);
+}
+
 /* ---- fields of the structures of the thunks, by offset --------------------------------------------------------------------------------------------------------------------- */
 
 #define KPUT32(block, offset, value) (*(UINT32 *)((BYTE *)(block) + (offset)) = (UINT32)(value))
@@ -463,6 +518,7 @@ static HRESULT STDMETHODCALLTYPE dx_QueryInterface(DxObj *o, REFIID riid, void *
   if (guid_eq(riid, &IID_IUnknown)) goto found;
   for (const GUID *const *i = o->iids; i && *i; ++i)
     if (guid_eq(riid, *i)) goto found;
+  dx_no_interface("(an object)", riid);
   return E_NOINTERFACE;
 found:
   InterlockedIncrement(&o->ref);
