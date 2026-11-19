@@ -22,7 +22,7 @@
 //
 // A driver is built for a non-boot GPU only where a native one exists (QEMU/VirtualBox VGA, VMware SVGA, virtio-gpu): the Intel, AMD and NVIDIA
 // classes drive the UEFI framebuffer, and that belongs to the boot display alone. Such a GPU has a node with no driver, and cannot show or render
-// anything until a native driver for it exists. Adding a driver means adding a row to the table in GpuPool.cpp.
+// anything until a native driver for it exists. Adding a driver means adding a row to the table in GpuNativeDrivers.cpp.
 #pragma once
 #include <stdint.h>
 #include "Allocators/IAllocator.hpp"
@@ -66,10 +66,11 @@ class GpuPool {
   // Takes a driver that someone else owns (the boot display's, from SystemGpu) as the driver of the adapter at `index`.
   bool adopt(uint32_t index, IGraphicsProcessingUnit* gpu, VirtioGpu* virtio = nullptr, VmwareSvgaGpu* vmware = nullptr);
   // Adopts the boot display's driver from `boot`, then builds a driver for every other adapter that has a native one. Returns how many nodes
-  // have a driver afterwards.
-  uint32_t bind(efi::SystemTable* st, const IPciBus& pci, SystemGpu& boot);
+  // have a driver afterwards. `registers` maps a GPU's register BARs for the drivers that program the hardware themselves (nullptr: those
+  // drivers fail and the GPU is left to its probe).
+  uint32_t bind(efi::SystemTable* st, const IPciBus& pci, SystemGpu& boot, IRegisterMapper* registers = nullptr);
   // Builds drivers for the adapters that have none yet, and have a native one.
-  uint32_t bind_native_drivers(efi::SystemTable* st, const IPciBus& pci);
+  uint32_t bind_native_drivers(efi::SystemTable* st, const IPciBus& pci, IRegisterMapper* registers = nullptr);
 
   // Gives every node that has no driver a probe from `factory` (the GPU is woken for it and put back to sleep), and lets each driverless GPU
   // lose its power while it sleeps (a probe sets itself up again after a wake). `registers` maps the GPU's register BAR (nullptr: probes that

@@ -5,6 +5,12 @@
 #include "Hardware/Bus/Virtio/Virtqueue.hpp"
 #include "Hardware/IoPort.hpp"
 #include "Kernel/Delay.hpp"
+#include "console.hpp"
+
+// (weak: a test that links the real console, or a stub of its own, keeps that one)
+namespace console {
+__attribute__((weak)) void debug_puts(StringView) {}
+}  // namespace console
 
 namespace hardware {
 uint8_t IoPort::read8() const { return 0; }

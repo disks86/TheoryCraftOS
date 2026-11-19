@@ -19,6 +19,8 @@
 // Host-side tests for rendering on, and presenting to, any number of GPUs: a pool of N fake GPUs (1 to 4 here) with fake display drivers, the power lease
 // around rendering, the policy choosing the GPU, an image rendered on one GPU shown on the screen of another, and a 2D renderer on a GPU of its own.
 #include <stdio.h>
+#include <atomic>
+#include <thread>
 #include <vector>
 #include "FakeGpuPci.hpp"
 #include "Graphics/GraphicsPool.hpp"
@@ -37,7 +39,7 @@ static int g_failed = 0;
 
 namespace {
 struct HostAllocator final : allocators::IAllocator {
-  int live = 0;
+  std::atomic<int> live{0};
   void* allocate(uint64_t size) override { ++live; return malloc(size); }
   void* allocate_aligned(uint64_t size, uint64_t alignment) override {
     void* p = nullptr;
@@ -207,6 +209,30 @@ void run_machine(uint32_t n, const bool* with_driver) {
       CHECK(lease && lease.node() == i && gpus.manager().leases(i) == 1);
     }
     CHECK(!pool.acquire_node(n));
+
+    // Several threads present to every GPU and take leases at the same time: each target is drawn by one thread at a time (its own lock and
+    // staging buffer), the leases add up to nothing at the end, and every GPU without a lease sleeps again.
+    if (n > 1) {
+      std::vector<IImage*> images;
+      RenderLease maker = pool.acquire_node(display);
+      for (int t = 0; t < 4; ++t) images.push_back(maker.device().create_image({{static_cast<uint32_t>(4 + t), 3}, Format::B8G8R8A8Unorm, kImageColorAttachment | kImagePresent}));
+      std::atomic<int> failures{0};
+      std::vector<std::thread> threads;
+      for (int t = 0; t < 4; ++t)
+        threads.emplace_back([&, t] {
+          for (uint32_t k = 0; k < 300; ++k) {
+            const uint32_t target = (k + static_cast<uint32_t>(t)) % n;
+            RenderLease lease = pool.acquire_node((k * 7 + static_cast<uint32_t>(t)) % n);
+            if (!lease) ++failures;
+            if (pool.present_image(*images[t], target, k % 5, 0) != with_driver[target]) ++failures;
+            if (pool.renderer_2d(target) == nullptr && with_driver[target] && static_cast<int32_t>(target) != gpus.manager().display_index()) ++failures;
+          }
+        });
+      for (std::thread& th : threads) th.join();
+      CHECK(failures == 0);
+      for (IImage* image : images) maker.device().destroy_image(image);
+    }
+    for (uint32_t i = 0; i < n; ++i) CHECK(gpus.manager().leases(i) == 0);
 
     // Presenting to a GPU without a driver, or an empty image, fails.
     for (uint32_t t = 0; t < n; ++t) {

@@ -20,6 +20,7 @@
 #include "Allocators/IAllocator.hpp"
 #include "Hardware/AudioDevice/IAudioDevice.hpp"
 #include "Hardware/Bus/Pci/IPciBus.hpp"
+#include "Hardware/Bus/Pci/PciFunctionPower.hpp"
 #include "Hardware/Bus/Usb/IUsbBus.hpp"
 #include "Hardware/Bus/Usb/UsbPortWatcher.hpp"
 #include "Hardware/Clock/IClock.hpp"
@@ -43,6 +44,8 @@ struct AudioEvent {
   bool hardware = true;                    // false for the software fallback
   SharedPointer<IAudioDevice> device;      // a removed device is shut down and present() is false; it lives while anyone holds this
 };
+
+class IntelHdaAudioDevice;
 
 class SystemAudioDevices {
  public:
@@ -69,16 +72,26 @@ class SystemAudioDevices {
   // hundred milliseconds from one thread. A new device is already initialized and in the list (at the end); a removed one has been taken out
   // of the list and shut down, and is freed once everyone has let go of the event's pointer. When the last device that plays sound goes, the
   // software fallback is brought up (and reported as added), so there is always something to play to.
+  // (poll() also runs service_power() first.)
   bool poll(AudioEvent* event);
+
+  // Runtime power of the HD-audio controllers (IntelHdaAudioDevice::service): each one that has been idle long enough suspends. Called by
+  // poll(); call it yourself when poll() is not called.
+  void service_power(uint64_t now_ms);
+  // `observer` learns when the HD-audio controller on PCI function `function` goes idle (suspended) and busy (resumed), and that controller's
+  // idle policy is turned on (after `idle_ms` without sound; see IntelHdaAudioDevice::set_power_observer). Null detaches it. False if no
+  // HD-audio controller of this list sits on that function. The observer must stay valid until it is detached or the devices are shut down.
+  [[nodiscard]] bool attach_power_observer(PciAddress function, IPciFunctionPowerObserver* observer, uint32_t idle_ms = 5000);
 
  private:
   struct Entry {
     uint32_t id = 0;
     bool hardware = true;
     SharedPointer<IAudioDevice> device;
+    IntelHdaAudioDevice* hda = nullptr;   // the same device when it is an HD-audio controller (for runtime power), else null
   };
 
-  void adopt(SharedPointer<IAudioDevice> device, bool hardware, bool report);
+  void adopt(SharedPointer<IAudioDevice> device, bool hardware, bool report, IntelHdaAudioDevice* hda = nullptr);
   bool has_output() const;       // (locked by the caller)
   void add_fallback(bool report);
   void sweep_removed();

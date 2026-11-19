@@ -26,13 +26,19 @@
 //    drives (and the other way round).
 //  - Draw 2D on a GPU of its own: renderer_2d(i) draws to the screen of GPU i.
 //
-// Presenting needs a driver on the target GPU; a GPU without one can render (on the CPU) but not show anything. Not thread safe: one thread presents.
+// Presenting needs a driver on the target GPU; a GPU without one can render (on the CPU) but not show anything.
+//
+// Thread safety: leases may be taken and dropped on any core (the GpuManager serializes the power side). present_image() may be called from several
+// threads: each target GPU has a lock of its own (its staging buffer and its driver's blit/present are used by one thread at a time), so presents to
+// different GPUs run in parallel. renderer_2d() creates its renderer once under a lock; drawing through the renderer it returns is the caller's to
+// serialize, as for any IRenderer2D.
 #pragma once
 #include "Allocators/IAllocator.hpp"
 #include "Graphics/RenderNode.hpp"
 #include "Graphics/Renderer2DSlot.hpp"
 #include "Graphics/IDisplayGraphics.hpp"
 #include "Hardware/GraphicsProcessingUnit/Multi/GpuPool.hpp"
+#include "Kernel/Sync.hpp"
 
 namespace graphics {
 
@@ -104,6 +110,8 @@ class GraphicsPool {
     RenderNode* render = nullptr;
     bool owns_render = false;
     Renderer2DSlot* renderer = nullptr;
+    kernel::Mutex present_lock;           // the staging buffer and the target driver's blit/present
+    ArrayView<uint32_t> staging;          // the read-back of the last image shown on this GPU (guarded by present_lock)
   };
 
   allocators::IAllocator& allocator_;
@@ -111,7 +119,7 @@ class GraphicsPool {
   IDisplayGraphics& display_;
   int32_t display_index_;
   Slot slots_[hardware::GpuTopology::kMaxAdapters];
-  ArrayView<uint32_t> staging_;
+  kernel::Mutex renderer_lock_;           // renderer_2d()'s creation of a slot's renderer
 };
 
 inline RenderNode& RenderLease::render_node() const { return *pool_->slots_[index_].render; }

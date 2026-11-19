@@ -365,7 +365,7 @@ void NvModeSetter::poll() {
     stages_ |= 1;     // 1.0: nothing to write
   } else if (pending & 0x2) {
     stages_ |= 2;
-    supervisor_2(masks);
+    if (!disabling_) supervisor_2(masks);
   } else if (pending & 0x4) {
     stages_ |= 4;     // 3.0: the IED "on" scripts (not done)
   }
@@ -427,6 +427,28 @@ DisplayStatus NvModeSetter::set_mode(const Request& request) {
   // The armed state has to hold the new raster.
   const uint32_t h = route.head * m907d::kHeadStride;
   if (r.read32(kGf119Armed + m907d::kHeadRasterSize + h) != raster.raster_size() || r.read32(kGf119Armed + m907d::kHeadPixelClock + h) != raster.clock_khz * 1000)
+    return DisplayStatus::NotLatched;
+  return DisplayStatus::Ok;
+}
+
+DisplayStatus NvModeSetter::disable(uint32_t head, uint32_t sor) {
+  stages_ = 0;
+  if (engine_.display_class() != DisplayClass::Gf119) return DisplayStatus::NotImplemented;
+  if (!engine_.claimed()) return DisplayStatus::NotClaimed;
+  if (head >= NvDisplayEngine::kMaxHeads || !(engine_.head_mask() & (1u << head)) || sor >= NvDisplayEngine::kMaxSors) return DisplayStatus::BadArgument;
+  MethodList methods;
+  if (!methods.add(m907d::kSorControl + sor * m907d::kSorStride, 0) || !methods.add(m907d::kHeadIso + head * m907d::kHeadStride, 0))
+    return DisplayStatus::BadArgument;
+  disabling_ = true;
+  active_ = true;
+  engine_.set_poller(this);
+  const DisplayStatus status = engine_.core_update(methods);
+  engine_.set_poller(nullptr);
+  active_ = false;
+  disabling_ = false;
+  if (status != DisplayStatus::Ok) return status;
+  INvRegisters& r = engine_.registers();
+  if (r.read32(kGf119Armed + m907d::kSorControl + sor * m907d::kSorStride) != 0 || r.read32(kGf119Armed + m907d::kHeadIso + head * m907d::kHeadStride) != 0)
     return DisplayStatus::NotLatched;
   return DisplayStatus::Ok;
 }

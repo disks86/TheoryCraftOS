@@ -32,7 +32,8 @@
 //   - registers outside BAR0's 16 MiB are neither read nor written.
 //
 // PLLs, I2C, DisplayPort AUX, GPIO resets and the NV04-era memory init are not done here: they go through INvInitHooks, whose defaults do
-// nothing and report "unsupported" (nouveau only warns when a PLL cannot be set, and carries on; so does this).
+// nothing and report "unsupported" (nouveau only warns when a PLL cannot be set, and carries on; so does this). NvPllInitHooks
+// (Nvkm/NvPll.hpp) does the PLLs.
 //
 // Dry run: the script is walked with the same execute rules, but nothing is written: every write it would make is reported to the trace
 // (INvInitTrace) and remembered, so that a later read of the same register in the run sees the value it would have had. Registers are
@@ -109,7 +110,7 @@ constexpr uint8_t kInitGpioAll = 0xff;
 class INvInitHooks {
  public:
   // nvkm_devinit_pll_set: program PLL `type` (a register address, or a BIOS PLL type below 0x100) to `khz`. False: not done (the run goes
-  // on, as nouveau's does, and the result counts it).
+  // on, as nouveau's does, and the result counts it). NvPllInitHooks (Nvkm/NvPll.hpp) implements it.
   [[nodiscard]] virtual bool set_pll(uint32_t type, uint32_t khz) { (void)type; (void)khz; return false; }
   // The I2C bus for `index` (a DCB I2C table index, kInitI2cPrimary or kInitI2cSecondary): NvI2cBus or NvAuxChannel (I2C over AUX) fit.
   // nullptr: no such bus (the opcode's accesses fail as nouveau's do with -ENODEV).

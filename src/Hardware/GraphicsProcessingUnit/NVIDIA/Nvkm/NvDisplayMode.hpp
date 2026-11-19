@@ -177,6 +177,9 @@ class NvModeSetter final : public IDisplayPoller {
       : engine_(engine), clock_(clock), gpio_(gpio), aux_(aux), drive_(drive ? *drive : placeholder_dp_drive_table()) {}
 
   [[nodiscard]] DisplayStatus set_mode(const Request& request);
+  // Blanks `head` and lets go of `sor` (nouveau's atomic disable: sor907d_ctrl with no owner, head907d_core_clr taking the surface away), an
+  // UPDATE through the supervisor (whose stages are acknowledged without touching clocks). GF119..Pascal; the display must be claimed.
+  [[nodiscard]] DisplayStatus disable(uint32_t head, uint32_t sor);
   const DpTrainResult& dp_result() const { return dp_; }
   uint32_t supervisor_stages() const { return stages_; }   // the stages (bit 0 = 1, bit 1 = 2, bit 2 = 3) handled during the last set_mode
   const DpTransferUnit& transfer_unit() const { return tu_; }
@@ -193,6 +196,7 @@ class NvModeSetter final : public IDisplayPoller {
   IDpcdAux* aux_;
   const DpDriveTable& drive_;
   bool active_ = false;
+  bool disabling_ = false;          // disable(): the supervisor's stages are only acknowledged
   OutputRoute route_;
   HeadRaster raster_;
   uint32_t depth_ = 24;

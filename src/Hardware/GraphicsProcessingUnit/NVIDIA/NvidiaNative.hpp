@@ -47,6 +47,7 @@
 #include "Hardware/GraphicsProcessingUnit/NVIDIA/Nvkm/NvGpio.hpp"
 #include "Hardware/GraphicsProcessingUnit/NVIDIA/Nvkm/NvRegisters.hpp"
 #include "Hardware/GraphicsProcessingUnit/NVIDIA/Nvkm/NvTherm.hpp"
+#include "Hardware/Monitor/IMonitorSource.hpp"
 #include "Hardware/Monitor/MonitorTypes.hpp"
 #include "Utility/UniquePointer.hpp"
 
@@ -99,6 +100,8 @@ class NvidiaNative {
   BiosSource bios_source() const { return bios_source_; }
   const BoardInfo& board() const { return board_; }
   const BoardParseResult& board_result() const { return board_result_; }
+  // The video BIOS image the tables were read from (empty without one), for what else reads it (the PLL limits of the mode setting).
+  ConstByteView bios_image() const { return bios_image_ ? bios_image_->view() : ConstByteView(); }
 
   // --- Connectors (as the board's connector table lists them; none without a VBIOS).
   static constexpr uint32_t kMaxEdid = 512;
@@ -119,6 +122,10 @@ class NvidiaNative {
   bool refresh_connectors(bool all = false);
   const char* status() const { return status_; }
   uint64_t vram_bytes() const { return vram_.ok() ? vram_.info.bytes : 0; }
+  // What probe_vram read (the size and the regions the firmware keeps), for a driver that manages the VRAM itself (NvidiaSecondaryGpu).
+  const VramProbe& vram() const { return vram_; }
+  // BAR0 (null before start() or after a failed one), for the drivers built on this one (NvidiaSecondaryGpu's display engine).
+  INvRegisters* registers() { return regs_.get(); }
   int32_t temperature_millicelsius();
   NvThermMonitor* sensors() { return therm_.get(); }
 
@@ -165,6 +172,12 @@ ConnectorType connector_type_for_dcb(uint8_t dcb_type);
 uint32_t order_connectors(ArrayView<const NvidiaNative::Connector> connectors, ConstByteView firmware_edid, ArrayView<uint8_t> order);
 // "DP-1", "HDMI-2", "eDP-1" ...: the kind's short name and `ordinal` (1 for the first of that kind), cut to fit `out` (always terminated).
 void connector_label(ConnectorType type, uint32_t ordinal, ArrayView<char> out);
+// What the monitor layer is told about connector `index` of a list in `order` (board indices, as order_connectors fills it): connected, its
+// kind, and its label numbered among the ones of the same kind before it. False if `index` is past the list.
+[[nodiscard]] bool describe_connector(ArrayView<const NvidiaNative::Connector> connectors, ArrayView<const uint8_t> order, uint32_t index, ConnectorInfo* out);
+
+// A mapped BAR as bytes (the one place an MMIO window becomes a pointer; see NvidiaNative.cpp).
+ByteView mmio_bytes(const MmioRegion& region);
 
 }  // namespace nv
 }  // namespace hardware

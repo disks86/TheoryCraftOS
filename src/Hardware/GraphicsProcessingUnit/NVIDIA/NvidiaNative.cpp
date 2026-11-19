@@ -17,6 +17,7 @@
  */
 
 #include "Hardware/GraphicsProcessingUnit/NVIDIA/NvidiaNative.hpp"
+#include "Hardware/GraphicsProcessingUnit/NVIDIA/Nvkm/NvPll.hpp"
 
 namespace hardware {
 namespace nv {
@@ -24,13 +25,13 @@ namespace nv {
 namespace {
 constexpr uint64_t kAlign = 1u << 20;
 uint64_t align_up(uint64_t value, uint64_t alignment) { return (value + alignment - 1) & ~(alignment - 1); }
+}  // namespace
 
 // A mapped BAR as bytes: the one place an MMIO window becomes a pointer. Safe because the window stays mapped (uncached) for as long as the
 // driver lives and the view is exactly as long as the mapping.
 ByteView mmio_bytes(const MmioRegion& region) {
   return ByteView(reinterpret_cast<uint8_t*>(static_cast<uintptr_t>(region.address())), region.length());
 }
-}  // namespace
 
 bool Bar1VramMemory::init() {
   if (first_ >= window_.size()) return false;
@@ -120,6 +121,8 @@ bool NvidiaNative::run_post() {
   in.vga = &vga;
   in.chip = chip_;
   in.board = &board_;
+  NvPllInitHooks plls(bios, chip_, *regs_);                // (INIT_PLL* program the PLLs from the VBIOS's limits table; never called in a dry run)
+  in.hooks = &plls;
 #ifdef TCOS_NVIDIA_NATIVE
   in.dry_run = false;
 #else
@@ -264,6 +267,19 @@ uint32_t order_connectors(ArrayView<const NvidiaNative::Connector> connectors, C
       order[n++] = static_cast<uint8_t>(i);
     }
   return n;
+}
+
+bool describe_connector(ArrayView<const NvidiaNative::Connector> connectors, ArrayView<const uint8_t> order, uint32_t index, ConnectorInfo* out) {
+  if (!out || index >= order.size() || order[index] >= connectors.size()) return false;
+  const NvidiaNative::Connector& c = connectors[order[index]];
+  *out = ConnectorInfo();
+  out->connected = c.connected;
+  out->type = connector_type_for_dcb(c.dcb_type);
+  uint32_t same = 1;                                    // how many of that kind came before
+  for (uint32_t i = 0; i < index; ++i)
+    if (order[i] < connectors.size() && connector_type_for_dcb(connectors[order[i]].dcb_type) == out->type) ++same;
+  connector_label(out->type, same, ArrayView<char>(out->name));
+  return true;
 }
 
 void connector_label(ConnectorType type, uint32_t ordinal, ArrayView<char> out) {

@@ -31,6 +31,10 @@
 //    power returns, since the device comes back reset. Allowed only while no function of the GPU is used by a driver that cannot set the device up
 //    again (allow_cold() says so per adapter; mark_function_busy() vetoes it).
 //  - The power source (mains or battery, and the charge) is kept here and fills in what a caller of select() leaves Unknown.
+//  - The PCI Express link (Multi/PcieLink): enable_aspm() turns on the link power states both ends support (L0s/L1, clock PM) and they are put back
+//    after a power cut, together with the PCI Express capability's Device and Link Control registers; with set_link_off_when_cold() the upstream
+//    port's link is disabled before the power goes and retrained (waiting for the data link to come up) when it returns, for platforms whose
+//    power methods leave the link alone.
 #pragma once
 #include <stdint.h>
 #include "Hardware/GraphicsProcessingUnit/Multi/GpuPlatformPower.hpp"
@@ -111,6 +115,15 @@ class GpuManager {
   // asleep adapters that may lose power on to D3cold. Returns how many adapters changed level.
   uint32_t service(uint64_t now_ms);
 
+  // Turns on the ASPM link states the GPU's link supports at both ends (and every function of the GPU accepts); kept across power cuts.
+  // False when the GPU or its port has no PCI Express capability or nothing could be enabled.
+  bool enable_aspm(uint32_t index);
+  bool aspm_enabled(uint32_t index) const { kernel::ScopedMutex g(lock_); return index < topology_.count() && aspm_[index]; }
+  // Disable the upstream port's link before cutting the GPU's power and retrain it after. False when the GPU has no upstream bridge.
+  bool set_link_off_when_cold(uint32_t index, bool enabled);
+  // The bridge above the adapter (its root port), when there is one.
+  bool upstream_bridge(uint32_t index, PciAddress* out) const;
+
   // What the machine runs on, for select(). Thread-safe.
   void set_power_status(PowerSource source, uint8_t battery_percent, bool battery_saver);
 
@@ -129,6 +142,8 @@ class GpuManager {
   void find_companions(uint32_t index);
   void save_config(PciAddress function, uint32_t* out) const;
   void restore_config(PciAddress function, const uint32_t* saved) const;
+  void save_express(PciAddress function, uint32_t* out) const;
+  void restore_express(PciAddress function, const uint32_t* saved) const;
 
   mutable kernel::Mutex lock_;   // serializes the lease count and level transitions across cores
   const IPciBus& pci_;
@@ -144,6 +159,14 @@ class GpuManager {
   Companions companions_[GpuTopology::kMaxAdapters];
   // Config headers saved for D3cold: the GPU's and each companion's.
   uint32_t saved_[GpuTopology::kMaxAdapters][1 + kMaxCompanions][kSavedConfigDwords] = {};
+  // The PCI Express capability's Device Control, Link Control, Device Control 2 and Link Control 2, per function, saved with the header.
+  static constexpr uint32_t kSavedExpressDwords = 4;
+  uint32_t saved_express_[GpuTopology::kMaxAdapters][1 + kMaxCompanions][kSavedExpressDwords] = {};
+  PciAddress bridge_[GpuTopology::kMaxAdapters] = {};
+  bool has_bridge_[GpuTopology::kMaxAdapters] = {};
+  bool aspm_[GpuTopology::kMaxAdapters] = {};
+  bool link_off_[GpuTopology::kMaxAdapters] = {};
+  bool link_is_off_[GpuTopology::kMaxAdapters] = {};
   uint32_t autosuspend_ms_ = 0;
   PowerSource power_source_ = PowerSource::Unknown;
   uint8_t battery_percent_ = 100;

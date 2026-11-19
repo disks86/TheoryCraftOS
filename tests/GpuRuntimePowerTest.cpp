@@ -45,6 +45,10 @@ struct Function {
   bool has_pm = true;
   bool powered = true;
   uint32_t writes = 0;
+  uint16_t express = 0;            // offset of the PCI Express capability, 0: none
+  bool behind_port = false;        // reachable only while the root port's link is up
+  bool has_defaults = false;
+  uint32_t defaults[64] = {};      // what a reset leaves (when set; otherwise the fields cut() writes by hand)
 };
 
 class FakePci final : public IPciBus {
@@ -79,6 +83,10 @@ class FakePci final : public IPciBus {
       // Back from a reset: the IDs and read-only fields return, what the OS had programmed is gone, the PM state is D0.
       const uint32_t id = f.info.vendor_id | (uint32_t{f.info.device_id} << 16);
       const uint32_t cls = (uint32_t{f.info.class_code} << 24) | (uint32_t{f.info.subclass} << 16);
+      if (f.has_defaults) {
+        memcpy(f.config, f.defaults, sizeof f.config);
+        continue;
+      }
       memset(f.config, 0, sizeof f.config);
       f.config[0] = id;
       f.config[2] = cls;
@@ -91,25 +99,42 @@ class FakePci final : public IPciBus {
   void shutdown() override {}
   uint32_t device_count() const override { return static_cast<uint32_t>(functions.size()); }
   bool pci_device(uint32_t i, PciDeviceInfo* out) const override { if (i >= functions.size()) return false; *out = functions[i].info; return true; }
+  // The root port's link is down (Link Control's Link Disable): what is behind it does not answer.
+  bool link_down() const {
+    for (const Function& f : functions)
+      if (f.express && f.info.class_code == 0x06 && (f.config[(f.express + 0x10) / 4] & (1u << 4))) return true;
+    return false;
+  }
   uint32_t read32(PciAddress a, uint16_t offset) const override {
     std::lock_guard<std::mutex> g(mutex);
     Function* f = find(a);
-    if (!f || !f->powered || offset >= 256) return 0xFFFFFFFFu;
+    if (!f || !f->powered || offset >= 256 || (f->behind_port && link_down())) return 0xFFFFFFFFu;
     return f->config[offset / 4];
   }
   void write32(PciAddress a, uint16_t offset, uint32_t value) const override {
     std::lock_guard<std::mutex> g(mutex);
     Function* f = find(a);
-    if (!f || !f->powered || offset >= 256) return;
+    if (!f || !f->powered || offset >= 256 || (f->behind_port && link_down())) return;
     ++f->writes;
     if (offset < 0x04 || offset == 0x08 || offset == 0x2C || offset == 0x34) return;   // read-only
+    if (f->express && (offset == f->express || offset == f->express + 0x04 || offset == f->express + 0x0C)) return;   // capabilities: read-only
+    if (f->express && offset == f->express + 0x10) {
+      // Link Control; the Status half is the hardware's: Data Link Layer Link Active while the link is not disabled (bit 5 Retrain reads 0).
+      const uint32_t control = value & 0xFFDF;
+      const uint32_t status = (control & (1u << 4)) ? 0 : (1u << 13);
+      f->config[offset / 4] = control | (status << 16);
+      return;
+    }
     f->config[offset / 4] = value;
   }
   uint64_t memory_bar(PciAddress, uint8_t) const override { return 0; }
   uint16_t find_capability(PciAddress a, uint8_t id) const override {
     std::lock_guard<std::mutex> g(mutex);
     Function* f = find(a);
-    return f && f->powered && f->has_pm && id == 0x01 ? kPm : 0;
+    if (!f || !f->powered || (f->behind_port && link_down())) return 0;
+    if (id == 0x01) return f->has_pm ? kPm : 0;
+    if (id == 0x10) return f->express;
+    return 0;
   }
   uint32_t pm_state(PciAddress a) const { return read32(a, kPm + 4) & 3; }
 };
@@ -154,6 +179,74 @@ struct Laptop {
     pci.add(1, 0, 2, 0x10DE, 0x1AEC, 0x0C, 0x03, 0x0);      // its USB-C controller
   }
 };
+
+// A laptop whose dGPU (01:00.0 with audio 01:00.1) sits behind a root port at 00:01.0, everything PCI Express: L0s and L1 on both ends.
+constexpr uint16_t kExpress = 0x60;
+struct ExpressLaptop {
+  FakePci pci;
+  PciAddress port{0, 1, 0}, dgpu{1, 0, 0}, hda{1, 0, 1};
+  static void express(Function& f, uint8_t type, bool dll_reporting) {
+    f.express = kExpress;
+    f.config[(kPm) / 4] = 0x01 | (kExpress << 8);                  // PM capability, next: PCI Express
+    f.config[kExpress / 4] = 0x10 | (0x0002u << 16) | (uint32_t{type} << 20);   // id, version 2, port type
+    f.config[(kExpress + 0x04) / 4] = (7u << 6) | (7u << 9);        // Device Capabilities: any L0s/L1 latency is acceptable
+    f.config[(kExpress + 0x0C) / 4] = (3u << 10) | (2u << 12) | (2u << 15) | (dll_reporting ? (1u << 20) : 0);   // L0s+L1, exit latencies
+    f.config[(kExpress + 0x10) / 4] = 1u << (13 + 16);              // link up
+  }
+  ExpressLaptop() {
+    pci.add(0, 2, 0, 0x8086, 0x9A49, 0x03, 0x00, 0x7);
+    Function& port_f = pci.add(0, 1, 0, 0x8086, 0x9A09, 0x06, 0x04, 0x7);
+    port_f.config[0x0C / 4] = 0x00010000;                           // header type 1: a bridge
+    port_f.config[0x18 / 4] = 0x00010100;                           // primary 0, secondary 1, subordinate 1
+    express(port_f, 0x4, true);
+    for (uint8_t fn = 0; fn < 2; ++fn) {
+      Function& f = pci.add(1, 0, fn, 0x10DE, fn == 0 ? 0x28E0 : 0x22BE, fn == 0 ? 0x03 : 0x04, fn == 0 ? 0x00 : 0x03, 0);
+      express(f, 0x0, false);
+      f.behind_port = true;
+      memcpy(f.defaults, f.config, sizeof f.defaults);
+      f.defaults[1] = 0;
+      f.defaults[0x10 / 4] = f.defaults[0x14 / 4] = 0;
+      f.has_defaults = true;
+    }
+  }
+  uint16_t link_control(PciAddress a) const { return static_cast<uint16_t>(pci.read32(a, kExpress + 0x10)); }
+};
+
+void test_link() {
+  ExpressLaptop l;
+  GpuManager m(l.pci, count_delay);
+  m.initialize();
+  CHECK(m.count() == 2 && m.display_index() == 0);
+  PciAddress bridge{};
+  CHECK(m.upstream_bridge(1, &bridge) && bridge.bus == 0 && bridge.device == 1);
+  CHECK(!m.upstream_bridge(0, &bridge) && !m.set_link_off_when_cold(0, true));
+  CHECK(m.acquire(1));
+  CHECK(m.enable_aspm(1) && m.aspm_enabled(1));
+  CHECK((l.link_control(l.port) & 3) == 3 && (l.link_control(l.dgpu) & 3) == 3 && (l.link_control(l.hda) & 3) == 3);
+  l.pci.write32(l.dgpu, kExpress + 0x08, 0x2810);   // Device Control as the firmware set it (max payload / read request)
+  l.pci.write32(l.dgpu, 0x10, 0xD2000000u);
+  m.release(1);
+  FakePower power(l.pci, 1, 0);
+  CHECK(m.attach_platform_power(1, &power));
+  m.allow_cold(1, true);
+  CHECK(m.set_link_off_when_cold(1, true));
+  CHECK(m.service(0) == 1 && m.power_level(1) == GpuPowerLevel::D3Cold);
+  CHECK((l.link_control(l.port) & (1u << 4)) != 0);                 // the link went down with it
+  CHECK(l.pci.read32(l.dgpu, 0) == 0xFFFFFFFFu);
+  // Back: the link is retrained before anything is read from the GPU, and its Express registers come back with the header.
+  CHECK(m.acquire(1) && m.power_level(1) == GpuPowerLevel::On);
+  CHECK((l.link_control(l.port) & (1u << 4)) == 0 && (l.pci.read32(l.port, kExpress + 0x10) >> 16 & (1u << 13)) != 0);
+  CHECK((l.link_control(l.dgpu) & 3) == 3 && (l.link_control(l.hda) & 3) == 3);
+  CHECK((l.pci.read32(l.dgpu, kExpress + 0x08) & 0xFFFF) == 0x2810 && l.pci.read32(l.dgpu, 0x10) == 0xD2000000u);
+  m.release(1);
+  // A handler that refuses the power-off: the link is brought back up, the GPU stays in D3hot.
+  power.fail_off = true;
+  CHECK(m.service(10) == 0 && m.power_level(1) == GpuPowerLevel::D3Hot && (l.link_control(l.port) & (1u << 4)) == 0);
+  // Without the option the link is left alone.
+  power.fail_off = false;
+  CHECK(m.set_link_off_when_cold(1, false));
+  CHECK(m.service(20) == 1 && m.power_level(1) == GpuPowerLevel::D3Cold && (l.link_control(l.port) & (1u << 4)) == 0);
+}
 
 void test_companions_and_autosuspend() {
   Laptop l;
@@ -380,6 +473,7 @@ int main() {
   test_power_source();
   test_pool_probes();
   test_threads();
+  test_link();
   if (g_failed) { printf("GpuRuntimePowerTest: %d check(s) FAILED\n", g_failed); return 1; }
   printf("GpuRuntimePowerTest: ok\n");
   return 0;

@@ -21,7 +21,10 @@
 // root port (_PS3 / _OFF last first / _STA skips / _PR0 / _ON first first / _PS0), NVIDIA Optimus (the caps call: UUID bytes, revision,
 // function, argument; skipped where _PR3 exists), JT, the old hybrid mux _DSM, AMD ATPX (verify, parameters, power control, mux switch, the
 // hybrid rule) and firmware that faults or answers garbage. Every method records what it was called with in root Names the test reads back.
+#include <atomic>
 #include <random>
+#include <thread>
+#include <vector>
 #include "AcpiTestSupport.hpp"
 #include "Hardware/GraphicsProcessingUnit/Multi/Acpi/GpuAcpiPower.hpp"
 
@@ -61,6 +64,7 @@ static Bytes power_resources() {
   return cat({res("PG00", "\\P0ST", 6, 5), res("PG01", "\\P1ST", 8, 7)});
 }
 
+static Bytes fault_method_off() { return method("_OFF", 0, fault()); }
 static Bytes ps(const char* n, int id, bool faults = false) { return method(n, 0, faults ? fault() : log_to("\\PLOG", num(id))); }
 
 struct DsmAnswer {
@@ -97,6 +101,7 @@ struct Machine {
   Bytes gpu_pr3 = package(1, path("\\_SB.PG00"));
   Bytes bridge_pr3 = package(1, path("\\_SB.PG00"));
   Bytes gpu_extra, igpu_extra, bridge_extra;
+  Bytes rp01_extra;   // on the Wi-Fi card's root port RP01
 };
 
 static Bytes machine_table(const Machine& m) {
@@ -112,7 +117,7 @@ static Bytes machine_table(const Machine& m) {
   if (m.pr3_on_bridge) peg0 = cat({peg0, name_def("_PR0", m.bridge_pr3), name_def("_PR3", m.bridge_pr3)});
   peg0 = cat({peg0, m.bridge_extra, device("PEGP", pegp)});
   const Bytes pci0 = cat({name_def("_HID", num(0x080AD041)), name_def("_CID", num(0x030AD041)), device("GFX0", cat({name_def("_ADR", num(0x00020000)), m.igpu_extra})),
-                          device("RP01", cat({name_def("_ADR", num(0x001C0000)), device("PXSX", name_def("_ADR", num(0)))})), device("PEG0", peg0)});
+                          device("RP01", cat({name_def("_ADR", num(0x001C0000)), m.rp01_extra, device("PXSX", name_def("_ADR", num(0)))})), device("PEG0", peg0)});
   const Bytes pci1 = cat({name_def("_HID", num(0x080AD041)), name_def("_BBN", num(0x40)), device("DEV3", name_def("_ADR", num(0x00030000)))});
   return make_table("DSDT", cat({recorder_names(), scope("\\_SB", cat({power_resources(), device("PCI0", pci0), device("PCI1", pci1)}))}));
 }
@@ -122,7 +127,10 @@ struct Vm {
   FakeHost host;
   Bytes table;
   AmlInterpreter vm{allocator, host};
-  explicit Vm(const Machine& m) : table(machine_table(m)) { CHECK(vm.load_table(ConstByteView(table.data(), table.size()))); }
+  explicit Vm(const Machine& m) : table(machine_table(m)) {
+    AcpiPowerResourceRegistry::global().clear();   // (the nodes of the previous machine are gone)
+    CHECK(vm.load_table(ConstByteView(table.data(), table.size())));
+  }
   uint64_t integer(const char* name) {
     uint64_t v = ~0ull;
     CHECK(vm.evaluate_integer(name, &v));
@@ -570,6 +578,235 @@ static void test_dsm_helpers() {
   CHECK(!AcpiDsm::call_u32(v.vm, v.vm.find("\\PLOG"), kNvidiaOptimusDsmUuid, 0x100, 7, DsmArgument::Integer, 0));   // not a method
 }
 
+// --- Shared power resources
+
+// A Wi-Fi card's root port RP01 on the GPU's rail: its _PR0/_PR3 name PG00 too.
+static Machine shared_rail() {
+  Machine m;
+  m.rp01_extra = cat({name_def("_PR0", package(1, path("\\_SB.PG00"))), name_def("_PR3", package(1, path("\\_SB.PG00")))});
+  return m;
+}
+
+static void test_shared_resources() {
+  Machine m = shared_rail();
+  Vm v(m);
+  AcpiPowerResourceRegistry& registry = AcpiPowerResourceRegistry::global();
+  acpi::Node* pg00 = v.vm.find("\\_SB.PG00");
+  acpi::Node* pegp = v.vm.find("\\_SB.PCI0.PEG0.PEGP");
+  acpi::Node* pxsx = v.vm.find("\\_SB.PCI0.RP01.PXSX");
+  GpuPowerResourceSet gpu, wifi;
+  const GpuAcpiNodes nodes = GpuAcpiNamespace::find_gpu(v.vm, kGpu, kRootPort);
+  gpu.read(v.vm, nodes.device, nodes.bridge);
+  CHECK(gpu.identity() == pegp && gpu.on_bridge());
+  CHECK(registry.holders_needing(pg00) == 1 && registry.needs(pg00, pegp));
+  gpu.read(v.vm, nodes.device, nodes.bridge);   // (a second read changes nothing)
+  CHECK(registry.holders_needing(pg00) == 1);
+  wifi.read(v.vm, pxsx, v.vm.find("\\_SB.PCI0.RP01"));
+  CHECK(wifi.identity() == pxsx && wifi.on_bridge());
+  CHECK(registry.holders_needing(pg00) == 2);
+
+  // The GPU goes to D3cold: its _PS3 methods run, but PG00 stays on for the Wi-Fi card.
+  CHECK(gpu.power_off(v.vm));
+  CHECK(v.integer("\\PLOG") == 0x13);
+  CHECK(v.integer("\\P0ST") == 1);
+  CHECK(registry.holders_needing(pg00) == 1 && !registry.needs(pg00, pegp) && registry.needs(pg00, pxsx));
+  // The Wi-Fi card goes too (its root port has no _PS3): now PG00 is turned off.
+  CHECK(wifi.power_off(v.vm));
+  CHECK(v.integer("\\PLOG") == 0x135);
+  CHECK(v.integer("\\P0ST") == 0);
+  CHECK(registry.holders_needing(pg00) == 0);
+  // The GPU comes back: PG00 on; the Wi-Fi card after it finds it on already.
+  CHECK(gpu.power_on(v.vm));
+  CHECK(v.integer("\\PLOG") == 0x135642);
+  CHECK(wifi.power_on(v.vm));
+  CHECK(v.integer("\\PLOG") == 0x135642);
+  CHECK(registry.holders_needing(pg00) == 2);
+
+  // Through the handler GpuAcpiPower::find makes: the same.
+  UniquePointer<IGpuPlatformPower> p = GpuAcpiPower::find(v.vm, kGpu, kRootPort, 0x8086, v.allocator);
+  CHECK(p && p->mechanism() == GpuPowerMechanism::AcpiPowerResources);
+  if (p) {
+    CHECK(p->power_off());
+    CHECK(v.integer("\\P0ST") == 1);   // still needed by the Wi-Fi card
+    CHECK(p->power_on());
+  }
+
+  // A private registry (use_registry): the global one is not involved.
+  AcpiPowerResourceRegistry own;
+  GpuPowerResourceSet alone;
+  alone.use_registry(own);
+  alone.read(v.vm, nodes.device, nodes.bridge);
+  CHECK(own.holders_needing(pg00) == 1);
+  CHECK(alone.power_off(v.vm));
+  CHECK(v.integer("\\P0ST") == 0);   // nobody else in that registry
+  CHECK(alone.power_on(v.vm));
+  CHECK(v.integer("\\P0ST") == 1);
+
+  // An _OFF that faults: the GPU stays in D3hot and keeps its claim.
+  Machine f;
+  f.bridge_extra = power_resource("PGFX", cat({method("_STA", 0, ret(num(1))), method("_ON_", 0, ret(num(0))), fault_method_off()}));
+  f.bridge_pr3 = package(1, path("\\_SB.PCI0.PEG0.PGFX"));
+  Vm w(f);
+  GpuPowerResourceSet faulty;
+  const GpuAcpiNodes wn = GpuAcpiNamespace::find_gpu(w.vm, kGpu, kRootPort);
+  faulty.read(w.vm, wn.device, wn.bridge);
+  acpi::Node* pgfx = w.vm.find("\\_SB.PCI0.PEG0.PGFX");
+  CHECK(pgfx && registry.holders_needing(pgfx) == 1);
+  CHECK(!faulty.power_off(w.vm));
+  CHECK(registry.needs(pgfx, faulty.identity()));
+}
+
+// Stand-ins for namespace nodes, for the registry alone: distinct addresses that are never dereferenced (the registry only compares them).
+static acpi::Node* fake_node(uint8_t* storage, uint32_t index) { return reinterpret_cast<acpi::Node*>(storage + index); }
+
+static void test_registry() {
+  static uint8_t storage[256];
+  AcpiPowerResourceRegistry r;
+  acpi::Node* res = fake_node(storage, 0);
+  acpi::Node* a = fake_node(storage, 100);
+  acpi::Node* c = fake_node(storage, 101);
+  CHECK(r.holders_needing(res) == 0);
+  r.introduce(res, a);
+  r.introduce(res, a);
+  CHECK(r.holders_needing(res) == 1);
+  CHECK(r.drop(res, a) == 0);
+  r.introduce(res, a);   // (known: still not needing)
+  CHECK(r.holders_needing(res) == 0 && !r.needs(res, a));
+  CHECK(r.need(res, a) == 1);
+  CHECK(r.need(res, c) == 2);
+  CHECK(r.need(res, c) == 2);   // (a holder counts once)
+  CHECK(r.drop(res, a) == 1);
+  CHECK(r.drop(res, a) == 1);
+  CHECK(r.drop(res, c) == 0);
+  CHECK(r.drop(fake_node(storage, 50), a) == 0);   // an unknown resource
+  CHECK(r.need(nullptr, a) == 1 && r.drop(nullptr, a) == 0);
+  // Full: the resource table, then a resource's holder list. Untracked behaves as without counting.
+  for (uint32_t i = 1; i < AcpiPowerResourceRegistry::kMaxResources; ++i) CHECK(r.need(fake_node(storage, i), a) == 1);
+  CHECK(r.need(fake_node(storage, 60), a) == 1 && r.need(fake_node(storage, 60), c) == 1);   // (no room: each sees itself alone)
+  CHECK(r.drop(fake_node(storage, 60), a) == 0);
+  r.clear();
+  CHECK(r.holders_needing(res) == 0);
+  for (uint32_t h = 0; h < AcpiPowerResourceRegistry::kMaxHolders; ++h) CHECK(r.need(res, fake_node(storage, 120 + h)) == h + 1);
+  CHECK(r.need(res, fake_node(storage, 200)) == 1);   // (no room in the list)
+  CHECK(r.drop(res, fake_node(storage, 200)) == AcpiPowerResourceRegistry::kMaxHolders);   // the others still need it: it stays on
+  r.clear();
+
+  // Several threads take and drop their own holders on shared resources: at the end every count is what the last calls left.
+  std::vector<std::thread> threads;
+  std::atomic<uint32_t> wrong{0};
+  for (uint32_t t = 0; t < 6; ++t)
+    threads.emplace_back([&, t] {
+      acpi::Node* me = fake_node(storage, 150 + t);
+      for (uint32_t i = 0; i < 20000; ++i) {
+        acpi::Node* resource = fake_node(storage, i % 4);
+        const uint32_t n = r.need(resource, me);
+        if (n < 1 || n > 6) ++wrong;
+        if (!r.needs(resource, me)) ++wrong;
+        if (i % 3 != 0 && r.drop(resource, me) > 5) ++wrong;
+      }
+    });
+  for (std::thread& t : threads) t.join();
+  CHECK(wrong.load() == 0);
+  for (uint32_t i = 0; i < 4; ++i) {
+    uint32_t expected = 0;
+    for (uint32_t t = 0; t < 6; ++t) {
+      // The last iteration that touched resource i: the largest k < 20000 with k % 4 == i; the holder still needs it when k % 3 == 0.
+      uint32_t k = 19999;
+      while (k % 4 != i) --k;
+      if (k % 3 == 0) ++expected;
+      CHECK(r.needs(fake_node(storage, i), fake_node(storage, 150 + t)) == (k % 3 == 0));
+    }
+    CHECK(r.holders_needing(fake_node(storage, i)) == expected);
+  }
+}
+
+// --- Device readiness durations (PCI firmware _DSM function 9)
+
+static DsmUuidAnswers readiness_answers(const Bytes& function9, uint8_t function0_high = 0x02) {
+  return DsmUuidAnswers{kPciFirmwareDsmUuid, {{0, ret(buf(b({0x01, function0_high})))}, {9, function9}}};
+}
+static Bytes durations(const Bytes& elements, uint8_t count = 5) { return ret(package(count, elements)); }
+
+static void test_readiness() {
+  {
+    // On the GPU's Device: reset 20 ms, DL_Up 50 ms, FLR 100 ms, D3hot 10 ms, VF enable 0.
+    Machine m;
+    m.gpu_extra = dsm({readiness_answers(durations(cat({num(20000), num(50000), num(100000), num(10000), num(0)})))});
+    Vm v(m);
+    const Optional<PciDeviceReadiness> r = AcpiPciReadiness::read(v.vm, v.vm.find("\\_SB.PCI0.PEG0.PEGP"));
+    CHECK(r);
+    if (r) {
+      CHECK(r->reset_us && *r->reset_us == 20000 && r->dl_up_us && *r->dl_up_us == 50000 && r->flr_us && *r->flr_us == 100000);
+      CHECK(r->d3hot_to_d0_us && *r->d3hot_to_d0_us == 10000 && r->vf_enable_us && *r->vf_enable_us == 0);
+    }
+    CHECK(v.integer("\\FUNC") == 9 && v.integer("\\REVN") == 3 && v.buffer("\\UUID") == uuid_bytes(kPciFirmwareDsmUuid));
+    CHECK(v.integer("\\A3TY") == 4);   // Arg3: an (empty) package
+    CHECK(AcpiPciReadiness::d3cold_delay_ms(r) == 50);   // the longer of reset and DL_Up
+    UniquePointer<IGpuPlatformPower> p = GpuAcpiPower::find(v.vm, kGpu, kRootPort, 0x8086, v.allocator);
+    CHECK(p && p->power_on_delay_ms() == 50);
+  }
+  {
+    // On the root port only (the GPU has no _DSM): taken from there.
+    Machine m;
+    m.bridge_extra = dsm({readiness_answers(durations(cat({num(1500), num(0), num(0), num(0), num(0)})))});
+    Vm v(m);
+    UniquePointer<IGpuPlatformPower> p = GpuAcpiPower::find(v.vm, kGpu, kRootPort, 0x8086, v.allocator);
+    CHECK(p && p->power_on_delay_ms() == 2);   // 1.5 ms, rounded up
+  }
+  {
+    // Function 9 not listed by function 0; a package of four; times above the default; a reset time that is a string.
+    Machine m;
+    m.gpu_extra = dsm({readiness_answers(durations(cat({num(1000), num(1000), num(1000), num(1000), num(1000)})), 0x00)});
+    Vm v(m);
+    acpi::Node* gpu = v.vm.find("\\_SB.PCI0.PEG0.PEGP");
+    CHECK(!AcpiPciReadiness::read(v.vm, gpu));
+    UniquePointer<IGpuPlatformPower> p = GpuAcpiPower::find(v.vm, kGpu, kRootPort, 0x8086, v.allocator);
+    CHECK(p && p->power_on_delay_ms() == 100);
+  }
+  {
+    Machine m;
+    m.gpu_extra = dsm({readiness_answers(durations(cat({num(1000), num(1000), num(1000), num(1000)}), 4))});
+    Vm v(m);
+    CHECK(!AcpiPciReadiness::read(v.vm, v.vm.find("\\_SB.PCI0.PEG0.PEGP")));
+  }
+  {
+    Machine m;
+    m.gpu_extra = dsm({readiness_answers(durations(cat({num(250000), num(0), num(0), num(0), num(0)})))});
+    Vm v(m);
+    const Optional<PciDeviceReadiness> r = AcpiPciReadiness::read(v.vm, v.vm.find("\\_SB.PCI0.PEG0.PEGP"));
+    CHECK(r && r->reset_us && *r->reset_us == 250000);
+    CHECK(AcpiPciReadiness::d3cold_delay_ms(r) == 100);   // never longer than the default
+    CHECK(AcpiPciReadiness::d3cold_delay_ms(r, 300) == 250);
+  }
+  {
+    Machine m;
+    m.gpu_extra = dsm({readiness_answers(durations(cat({b({0x0D, 'x', 0x00}), num(7000), num(0), num(0), num(0)})))});
+    Vm v(m);
+    const Optional<PciDeviceReadiness> r = AcpiPciReadiness::read(v.vm, v.vm.find("\\_SB.PCI0.PEG0.PEGP"));
+    CHECK(r && !r->reset_us && r->dl_up_us && *r->dl_up_us == 7000);
+    CHECK(AcpiPciReadiness::d3cold_delay_ms(r) == 7);
+  }
+  {
+    // The other handlers: NVIDIA's hybrid _DSM (on the GPU, next to the PCI firmware UUID) and ATPX.
+    Machine m;
+    m.pr3_on_bridge = false;
+    m.gpu_ps = false;
+    m.gpu_extra = dsm({DsmUuidAnswers{kNvidiaMuxDsmUuid, {{0, ret(num(0x0F))}, {3, ret(num(0))}}},
+                       readiness_answers(durations(cat({num(30000), num(0), num(0), num(0), num(0)})))});
+    Vm v(m);
+    UniquePointer<IGpuPlatformPower> p = GpuAcpiPower::find(v.vm, kGpu, kRootPort, GpuAcpiPower::kVendorNvidia, v.allocator);
+    CHECK(p && p->mechanism() == GpuPowerMechanism::NvidiaHybridDsm && p->power_on_delay_ms() == 30);
+  }
+  CHECK(AcpiPciReadiness::d3cold_delay_ms({}) == 100);
+  CHECK(AcpiPciReadiness::d3cold_delay_ms(PciDeviceReadiness{}) == 100);   // (neither time given)
+  AmdAtpxInfo info;
+  info.power_control = true;
+  Machine m;
+  Vm v(m);
+  CHECK(AmdAtpx(v.vm, nullptr, info).power_on_delay_ms() == 100);
+  CHECK(AmdAtpx(v.vm, nullptr, info, nullptr, 40).power_on_delay_ms() == 40);
+}
+
 int main() {
   (void)&make_fadt;   // (AcpiTestSupport.hpp's builders this test does not use)
   (void)&notify;
@@ -583,6 +820,9 @@ int main() {
   test_atpx();
   test_atpx_parsers();
   test_dsm_helpers();
+  test_shared_resources();
+  test_registry();
+  test_readiness();
   if (g_failed) {
     printf("GpuAcpiPowerTest: %d failed\n", g_failed);
     return 1;

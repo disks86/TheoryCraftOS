@@ -607,6 +607,7 @@ add_executable(BOOTX64
   src/Hardware/GraphicsProcessingUnit/AMD/AmdScanout.cpp
   src/Hardware/GraphicsProcessingUnit/NVIDIA/NvidiaGpuGenerations.cpp
   src/Hardware/GraphicsProcessingUnit/NVIDIA/NvidiaGpu.cpp
+  src/Hardware/GraphicsProcessingUnit/NVIDIA/NvidiaSecondaryGpu.cpp
   src/Hardware/GraphicsProcessingUnit/NVIDIA/NvidiaNative.cpp
   src/Hardware/GraphicsProcessingUnit/NVIDIA/Nvkm/NvFb.cpp
   src/Hardware/GraphicsProcessingUnit/NVIDIA/Nvkm/NvMmu.cpp
@@ -628,7 +629,9 @@ add_executable(BOOTX64
   src/Hardware/GraphicsProcessingUnit/NVIDIA/Nvkm/NvBiosShadow.cpp
   src/Hardware/GraphicsProcessingUnit/NVIDIA/Nvkm/NvDevinit.cpp
   src/Hardware/GraphicsProcessingUnit/NVIDIA/Nvkm/NvInitScript.cpp
+  src/Hardware/GraphicsProcessingUnit/NVIDIA/Nvkm/NvPll.cpp
   src/Hardware/GraphicsProcessingUnit/Intel/IntelGpuGenerations.cpp
+  src/Hardware/GraphicsProcessingUnit/Intel/IntelGpuProbe.cpp
   src/Hardware/GraphicsProcessingUnit/Intel/IntelGpu.cpp
   src/Hardware/GraphicsProcessingUnit/Intel/IntelDisplay.cpp
   src/Hardware/GraphicsProcessingUnit/Intel/IntelScanout.cpp
@@ -1081,6 +1084,7 @@ add_executable(BOOTX64
   src/Hardware/GraphicsProcessingUnit/AMD/AmdIh3.cpp
   src/Hardware/Bus/Pci/PciMsi.cpp
   src/Hardware/GraphicsProcessingUnit/AMD/AmdVbios.cpp
+  src/Hardware/GraphicsProcessingUnit/AMD/AmdGpuProbe.cpp
   src/Hardware/GraphicsProcessingUnit/AMD/AtomBios.cpp
   src/Hardware/GraphicsProcessingUnit/AMD/AtomConnectors.cpp
   src/Hardware/GraphicsProcessingUnit/AMD/AtomI2c.cpp

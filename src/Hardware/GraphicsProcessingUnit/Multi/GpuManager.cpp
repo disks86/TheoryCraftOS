@@ -17,6 +17,7 @@
  */
 
 #include "Hardware/GraphicsProcessingUnit/Multi/GpuManager.hpp"
+#include "Hardware/GraphicsProcessingUnit/Multi/PcieLink.hpp"
 
 namespace hardware {
 
@@ -78,8 +79,15 @@ void GpuManager::initialize() {
     idle_since_[i] = 0;
     idle_pending_[i] = false;
     companions_[i] = Companions{};
+    has_bridge_[i] = false;
+    aspm_[i] = false;
+    link_off_[i] = false;
+    link_is_off_[i] = false;
   }
-  for (uint32_t i = 0; i < topology_.count(); ++i) find_companions(i);
+  for (uint32_t i = 0; i < topology_.count(); ++i) {
+    find_companions(i);
+    has_bridge_[i] = pci_find_upstream_bridge(pci_, topology_.adapter(i).device.address, &bridge_[i]);
+  }
   // Only a machine with a choice has anything to save; a lone adapter is the display.
   if (!topology_.is_hybrid()) return;
   for (uint32_t i = 0; i < topology_.count(); ++i)
@@ -190,6 +198,49 @@ bool GpuManager::mark_function_busy(PciAddress function, bool busy) {
   return false;
 }
 
+bool GpuManager::enable_aspm(uint32_t index) {
+  kernel::ScopedMutex g(lock_);
+  if (index >= topology_.count() || level_[index] == GpuPowerLevel::D3Cold) return false;
+  PcieAspmPlan plan;
+  if (!pcie_aspm_configure(pci_, topology_.adapter(index).device.address, &plan)) return false;
+  aspm_[index] = plan.l0s || plan.l1 || plan.clock_pm;
+  return aspm_[index];
+}
+
+bool GpuManager::set_link_off_when_cold(uint32_t index, bool enabled) {
+  kernel::ScopedMutex g(lock_);
+  if (index >= topology_.count() || !has_bridge_[index]) return false;
+  link_off_[index] = enabled;
+  return true;
+}
+
+bool GpuManager::upstream_bridge(uint32_t index, PciAddress* out) const {
+  kernel::ScopedMutex g(lock_);
+  if (index >= topology_.count() || !has_bridge_[index]) return false;
+  *out = bridge_[index];
+  return true;
+}
+
+void GpuManager::save_express(PciAddress function, uint32_t* out) const {
+  const uint16_t cap = pci_.find_capability(function, pcie::kCapabilityExpress);
+  for (uint32_t d = 0; d < kSavedExpressDwords; ++d) out[d] = 0;
+  if (cap == 0) return;
+  out[0] = pci_.read32(function, static_cast<uint16_t>(cap + 0x08)) & 0xFFFF;   // Device Control (the Status half is write-1-to-clear)
+  out[1] = pci_.read32(function, static_cast<uint16_t>(cap + 0x10)) & 0xFFFF;   // Link Control (ditto)
+  out[2] = pci_.read32(function, static_cast<uint16_t>(cap + 0x28)) & 0xFFFF;   // Device Control 2
+  out[3] = pci_.read32(function, static_cast<uint16_t>(cap + 0x30)) & 0xFFFF;   // Link Control 2
+}
+
+void GpuManager::restore_express(PciAddress function, const uint32_t* saved) const {
+  const uint16_t cap = pci_.find_capability(function, pcie::kCapabilityExpress);
+  if (cap == 0) return;
+  pci_.write32(function, static_cast<uint16_t>(cap + 0x08), saved[0]);
+  pci_.write32(function, static_cast<uint16_t>(cap + 0x28), saved[2]);
+  pci_.write32(function, static_cast<uint16_t>(cap + 0x30), saved[3]);
+  // (ASPM is enabled at the port end first; the port kept its Link Control, so the function's goes back as it was.)
+  pci_.write32(function, static_cast<uint16_t>(cap + 0x10), saved[1] & ~uint32_t{pcie::kLinkCtlRetrain | pcie::kLinkCtlDisable});
+}
+
 bool GpuManager::cold_possible(uint32_t index) const {
   if (!power_[index] || !cold_allowed_[index] || leases_[index] != 0) return false;
   const Companions& c = companions_[index];
@@ -233,9 +284,20 @@ void GpuManager::restore_config(PciAddress function, const uint32_t* saved) cons
 
 bool GpuManager::go_cold(uint32_t index) {
   const Companions& c = companions_[index];
-  save_config(topology_.adapter(index).device.address, saved_[index][0]);
-  for (uint32_t k = 0; k < c.count; ++k) save_config(c.function[k], saved_[index][1 + k]);
-  if (!power_[index]->power_off()) return false;   // still in D3hot, which is where it was
+  const PciAddress gpu = topology_.adapter(index).device.address;
+  save_config(gpu, saved_[index][0]);
+  save_express(gpu, saved_express_[index][0]);
+  for (uint32_t k = 0; k < c.count; ++k) {
+    save_config(c.function[k], saved_[index][1 + k]);
+    save_express(c.function[k], saved_express_[index][1 + k]);
+  }
+  // The link goes down before the power, so the port does not see a surprise link loss.
+  link_is_off_[index] = link_off_[index] && has_bridge_[index] && pcie_link_disable(pci_, bridge_[index]);
+  if (!power_[index]->power_off()) {
+    if (link_is_off_[index]) (void)pcie_link_enable(pci_, bridge_[index], delay_);
+    link_is_off_[index] = false;
+    return false;   // still in D3hot, which is where it was
+  }
   level_[index] = GpuPowerLevel::D3Cold;
   return true;
 }
@@ -247,10 +309,19 @@ bool GpuManager::wake(uint32_t index) {
     if (!power_[index] || !power_[index]->power_on()) return false;
     const uint32_t wait = power_[index]->power_on_delay_ms();
     if (delay_) delay_(wait > kMaxPowerOnDelayMs ? kMaxPowerOnDelayMs : wait);
+    if (link_is_off_[index]) {
+      // Retrain and wait for the data link (pcie_link_enable bounds the wait); a link that never comes up leaves the GPU unreachable.
+      if (!pcie_link_enable(pci_, bridge_[index], delay_)) return false;
+      link_is_off_[index] = false;
+    }
     if ((pci_.read32(gpu, 0) & 0xFFFF) == 0xFFFF) return false;   // nothing answers: the power did not come back
     restore_config(gpu, saved_[index][0]);
-    for (uint32_t k = 0; k < c.count; ++k)
-      if ((pci_.read32(c.function[k], 0) & 0xFFFF) != 0xFFFF) restore_config(c.function[k], saved_[index][1 + k]);
+    restore_express(gpu, saved_express_[index][0]);
+    for (uint32_t k = 0; k < c.count; ++k) {
+      if ((pci_.read32(c.function[k], 0) & 0xFFFF) == 0xFFFF) continue;
+      restore_config(c.function[k], saved_[index][1 + k]);
+      restore_express(c.function[k], saved_express_[index][1 + k]);
+    }
     level_[index] = GpuPowerLevel::D3Hot;   // a reset device starts in D0; the PM writes below are then harmless
   }
   if (!pci_set_power_state(pci_, gpu, PciPowerState::D0)) return false;

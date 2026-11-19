@@ -66,6 +66,7 @@
 #include "Hardware/Bus/Usb/UsbBus.hpp"
 #include "Hardware/Printer/SystemPrinters.hpp"
 #include "Hardware/GraphicsProcessingUnit/Multi/GpuPool.hpp"
+#include "Hardware/GraphicsProcessingUnit/Multi/GpuFunctionPower.hpp"
 #include "Hardware/GraphicsProcessingUnit/Multi/Acpi/GpuAcpiPower.hpp"
 #include "Hardware/GraphicsProcessingUnit/Multi/AppleGmux.hpp"
 #include "Hardware/GraphicsProcessingUnit/Multi/PcieLink.hpp"
@@ -771,13 +772,22 @@ static efi::Status kernel_main(efi::Handle image, efi::SystemTable* st) {
   // GPU beside the CPU's graphics sleeps until something needs it.
   hardware::GpuPool gpu_pool(pci, shared_allocator);
   gpu_pool.initialize();
-  gpu_pool.bind(st, pci, system_gpu);
+  gpu_pool.bind(st, pci, system_gpu, paging_ok ? &register_mapper : nullptr);
   // A discrete GPU with no driver gets a probe (the chip, its memory and sensors, read while it is awake), and sleeps 5 s after its last use,
   // as Linux's runtime power management does; with a platform power handler (attached once the ACPI tables are loaded) its power is cut too.
   gpu_pool.manager().set_autosuspend_ms(hardware::GpuManager::kDefaultAutosuspendMs);
   (void)gpu_pool.bind_probes(st, pci, paging_ok ? &register_mapper : nullptr, hardware::make_vendor_gpu_probe);
-  // A GPU's HD-audio function (HDMI/DisplayPort audio of a discrete card) gets the HD-audio driver, which cannot follow the GPU through a power
-  // cut: it stays awake, and its GPU sleeps in D3hot only.
+  // On a hybrid machine the discrete GPU's link may idle in L0s/L1 where both ends support it (and every function accepts the exit latency); the
+  // setting is put back after each power cut. (The firmware's choice is kept on machines with a single GPU.)
+  if (gpu_pool.manager().is_hybrid())
+    for (uint32_t i = 0; i < gpu_pool.count(); ++i)
+      if (gpu_pool.node(i)->adapter.kind == hardware::GpuKind::Discrete && static_cast<int32_t>(i) != gpu_pool.manager().display_index() &&
+          gpu_pool.manager().acquire(i)) {
+        (void)gpu_pool.manager().enable_aspm(i);
+        gpu_pool.manager().release(i);
+      }
+  // A GPU's HD-audio function (HDMI/DisplayPort audio of a discrete card) gets the HD-audio driver: busy until that driver says it sleeps
+  // (see the audio set-up below), so the GPU is not cut off under it.
   for (uint32_t i = 0; i < gpu_pool.count(); ++i)
     for (uint32_t k = 0; k < gpu_pool.manager().companion_count(i); ++k) {
       const hardware::PciAddress f = gpu_pool.manager().companion(i, k);
@@ -798,6 +808,7 @@ static efi::Status kernel_main(efi::Handle image, efi::SystemTable* st) {
       e.text(n.gpu ? "" : n.probe ? ", no display driver" : ", no driver");
       if (n.probe && !StringView(n.probe->status()).equals(StringView("identified"))) e.text(", ").text(n.probe->status());
       if (gpu_pool.manager().companion_count(i)) e.text(", ").dec(gpu_pool.manager().companion_count(i)).text(" more function(s)");
+      if (gpu_pool.manager().aspm_enabled(i)) e.text(", link power saving");
       e.text(")");
     }
   }
@@ -1270,6 +1281,13 @@ static efi::Status kernel_main(efi::Handle image, efi::SystemTable* st) {
   // Audio outputs: native drivers (HD Audio, AC'97, virtio-sound), or a silent software device.
   hardware::SystemAudioDevices audio(pci, clock, shared_allocator, st, &usb);
   audio.initialize();
+  // A discrete GPU's HD-audio controller suspends itself after 5 s without sound and tells the GPU manager, which may then cut the GPU's power;
+  // the first sound brings the power back before the controller is touched.
+  hardware::GpuFunctionPowerBridge gpu_audio_power(gpu_pool.manager());
+  for (uint32_t i = 0; i < gpu_pool.count(); ++i)
+    for (uint32_t k = 0; k < gpu_pool.manager().companion_count(i); ++k)
+      if (audio.attach_power_observer(gpu_pool.manager().companion(i, k), &gpu_audio_power))
+        Entry(Level::Info, "Audio").text("the HD audio of GPU ").dec(i).text(" sleeps when silent, so the GPU can lose its power");
   for (uint32_t i = 0; i < audio.count(); ++i) {
     hardware::IAudioDevice& device = *audio.at(i);
     if (audio.is_hardware(i)) {
