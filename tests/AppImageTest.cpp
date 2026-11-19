@@ -22,6 +22,7 @@
 // interpreter on launcher scripts shaped like electron-builder's and linuxdeploy's; and the whole AppImageSession on a RAM file system.
 //
 //   AppImageTest                       the tests
+//   AppImageTest --only-apprun         only the AppRun interpreter tests
 //   AppImageTest --dump <AppImage>     lists the image (for tests/appimage_interop.sh, which compares with the runtime's own --appimage-extract)
 //   AppImageTest --apprun <AppImage> [args...]   prints what its AppRun would start
 //   AppImageTest --cat <AppImage> <path>         prints one file of the image (SquashFS, DwarFS or ISO 9660)
@@ -860,6 +861,52 @@ static void test_apprun() {
     CHECK(r.env["CWD"] == "/tmp/.mount_t/usr");
     CHECK(r.env["INNER_ZERO"] == "launcher");
   }
+  // ivan-hc's Chrome AppImage: AppRun execs Google's own google-chrome wrapper (a bash script, abridged here), which redirects its output through process
+  // substitutions, makes the mimeapps folder and ends in `exec -a "$0"`.
+  {
+    Run r;
+    put_file(r.fs, std::string(kMount) + "/AppRun",
+             "#!/bin/sh\nAPP=google-chrome\nHERE=\"$(dirname \"$(readlink -f \"${0}\")\")\"\nexport UNION_PRELOAD=\"${HERE}\"\nexec \"${HERE}\"/$APP \"$@\"\n");
+    put_file(r.fs, std::string(kMount) + "/google-chrome",
+             "#!/bin/bash\n"
+             "export CHROME_WRAPPER=\"`readlink -f \"$0\"`\"\n"
+             "HERE=\"`dirname \"$CHROME_WRAPPER\"`\"\n"
+             "xdg_app_dir=\"${XDG_DATA_HOME:-$HOME/.local/share/applications}\"\n"
+             "mkdir -p \"$xdg_app_dir\"\n"
+             "[ -f \"$xdg_app_dir/mimeapps.list\" ] || touch \"$xdg_app_dir/mimeapps.list\"\n"
+             "export CHROME_VERSION_EXTRA=\"stable\"\n"
+             "export GNOME_DISABLE_CRASH_DIALOG=SET_BY_GOOGLE_CHROME\n"
+             "exec < /dev/null\n"
+             "exec > >(exec cat)\n"
+             "exec 2> >(exec cat >&2)\n"
+             "# Note: exec -a below is a bashism.\n"
+             "exec -a \"$0\" \"$HERE/chrome\" \"$@\"\n");
+    put_file(r.fs, std::string(kMount) + "/chrome", kElf);
+    r.go("/tmp/.mount_t/AppRun", {"https://example.com"});
+    CHECK(r.result == AppRunResult::Launch);
+    CHECK(r.program == "/tmp/.mount_t/chrome");
+    CHECK((r.args == std::vector<std::string>{"https://example.com"}));
+    CHECK(r.env["CHROME_WRAPPER"] == "/tmp/.mount_t/google-chrome");
+    CHECK(r.env["CHROME_VERSION_EXTRA"] == "stable" && r.env["UNION_PRELOAD"] == "/tmp/.mount_t");
+  }
+  // Process substitutions as words: bash's /dev/fd name, inside a word too; a quoted one is plain text; one that never closes is a syntax error.
+  {
+    Run r;
+    put_file(r.fs, std::string(kMount) + "/AppRun",
+             "#!/bin/bash\nexport A=<(true) B=x>(cat >&2)y C=\"<(no)\"\ncat <(echo a) > /dev/null\nwhile read l; do :; done < <(echo hi)\nexec \"$APPDIR/x\" <(ls) 2>/dev/null\n");
+    put_file(r.fs, std::string(kMount) + "/x", kElf);
+    r.go("/tmp/.mount_t/AppRun", {});
+    CHECK(r.result == AppRunResult::Launch && r.program == "/tmp/.mount_t/x");
+    CHECK((r.args == std::vector<std::string>{"/dev/fd/63"}));
+    CHECK(r.env["A"] == "/dev/fd/63" && r.env["B"] == "x/dev/fd/63y" && r.env["C"] == "<(no)");
+  }
+  {
+    Run r;
+    put_file(r.fs, std::string(kMount) + "/AppRun", "#!/bin/bash\nexec > >(cat\nexec \"$APPDIR/x\"\n");
+    put_file(r.fs, std::string(kMount) + "/x", kElf);
+    r.go("/tmp/.mount_t/AppRun", {});
+    CHECK(r.result == AppRunResult::NoProgram);
+  }
   // A script that ends without starting anything, a missing program, an infinite loop, a syntax error: no launch, no hang.
   for (const char* script : {"#!/bin/sh\necho nothing to do\n", "#!/bin/sh\nexec \"$APPDIR/missing\"\n", "#!/bin/sh\nwhile true; do :; done\n",
                              "#!/bin/sh\nif [ 1 = 1 ]; then\n", "#!/bin/sh\necho \"unterminated\n", "#!/bin/sh\nf() { f; }\nf\n", "#!/bin/sh\nexit 0\nexec \"$APPDIR/x\"\n"}) {
@@ -1561,6 +1608,11 @@ int main(int argc, char** argv) {
   if (argc == 4 && std::string(argv[1]) == "--make") return make_appimage(argv[2], argv[3]);
   if (argc == 4 && std::string(argv[1]) == "--make1") return make_type1(argv[2], argv[3]);
   if (argc >= 3 && (std::string(argv[1]) == "--dump" || std::string(argv[1]) == "--apprun" || std::string(argv[1]) == "--cat")) return real_appimage(argc, argv);
+  if (argc == 2 && std::string(argv[1]) == "--only-apprun") {      // (the AppRun interpreter alone, in seconds)
+    test_apprun();
+    printf(g_failed ? "AppImageTest: %d of %d checks FAILED\n" : "AppImageTest: all %d checks passed\n", g_failed ? int(g_failed) : g_checks, g_checks);
+    return g_failed ? 1 : 0;
+  }
   printf("squashfs images\n");
   test_images();
   printf("damaged images\n");
