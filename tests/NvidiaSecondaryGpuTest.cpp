@@ -20,7 +20,9 @@
 // whole start against the GF119 display engine model of NvDisplayModel.hpp (behind it the PRAMIN window and the MMU's invalidate, so the BAR1
 // page tables land in the model's VRAM): BAR1 and BAR2 set up and BAR1 mapping VRAM 1:1, the head and SOR programmed for the mode and pointed
 // at the surface, drawing through the CPU's view, another mode, a DisplayPort output trained, the refusals before any write (no monitor,
-// a display class whose modes are not set here), and the shutdown. Then NvidiaSecondaryGpu itself on the fake card of NvTestCard.hpp.
+// a display class whose modes are not set here), and the shutdown. The same from scratch on Turing (c57d) and GA10x (c67d): BAR1 on the
+// GP100 tables through Turing's BAR/TLB registers, the core at the c37d offsets, the window and window immediate channels, HDMI and DP (the
+// per-class SOR registers), the eDP panel on Turing; Ada refused. Then NvidiaSecondaryGpu itself on the fake card of NvTestCard.hpp.
 //
 // Built twice by tests/run_host_tests.sh: with -DTCOS_NVIDIA_NATIVE (everything above) and without it (NvidiaSecondaryGpuOffTest: the driver
 // must refuse before touching the card, so the pool falls back to the probe).
@@ -141,6 +143,7 @@ struct Card final : INvRegisters {
       if (a + 4 <= mem.vram.size()) mem.wr(a, v);
       return;
     }
+    if (off == 0xb830b0) { model.regs[off] = v & ~0x80000000u; return; }   // Turing/GA10x MMU invalidate: done at once
     model.write32(off, v);
   }
   int index_of(uint32_t off) const {
@@ -226,6 +229,9 @@ struct Rig {
 };
 
 const Chip kKepler = identify_chip(0x0e4000a1, 0);   // GK104
+const Chip kTuring = identify_chip(0x164000a1, 0x16400000);   // TU104
+const Chip kAmpere = identify_chip(0x174000a1, 0x17400000);   // GA104
+const Chip kAda = identify_chip(0x194000a1, 0x19400000);      // AD104
 
 bool is(const Optional<uint32_t>& got, uint32_t want) { return got && *got == want; }
 
@@ -415,10 +421,18 @@ static void test_refusals() {
     CHECK(display->start() == DisplayStatus::NoOutput && rig.card.writes.empty());
   }
   {
-    Rig rig(DisplayClass::Gv100);                                      // Volta: its mode setting is not written
+    Rig rig(DisplayClass::Gsp);                                        // Ada: the GSP's (nouveau has no other way)
     rig.plug(1, monitor_edid(put_1080p, put_720p), EdidSource::Ddc);
-    auto display = std::make_unique<NvSecondaryDisplay>(rig.inputs(identify_chip(0x140000a1, 0)));
-    CHECK(display->start() == DisplayStatus::NotImplemented && strstr(display->status(), "GF119") && rig.card.writes.empty());
+    auto display = std::make_unique<NvSecondaryDisplay>(rig.inputs(kAda));
+    CHECK(display->start() == DisplayStatus::NeedsGsp && strstr(display->status(), "GSP") && rig.card.writes.empty());
+    CHECK(!sets_modes(DisplayClass::Gsp) && !sets_modes(DisplayClass::Nv50) && strstr(refusal(DisplayClass::Nv50), "Tesla"));
+    CHECK(sets_modes(DisplayClass::Gf119) && sets_modes(DisplayClass::Gv100) && sets_modes(DisplayClass::Tu102) && sets_modes(DisplayClass::Ga102));
+  }
+  {
+    Rig rig(DisplayClass::Nv50);                                       // Tesla: its mode setting is not written
+    rig.plug(1, monitor_edid(put_1080p, put_720p), EdidSource::Ddc);
+    auto display = std::make_unique<NvSecondaryDisplay>(rig.inputs(identify_chip(0x084000a1, 0)));
+    CHECK(display->start() == DisplayStatus::NotImplemented && strstr(display->status(), "Tesla") && rig.card.writes.empty());
   }
   {
     Rig rig;                                                           // too little VRAM for a surface
@@ -466,6 +480,118 @@ static void test_shutdown() {
   CHECK(model.errors == 0);                                             // (the restarted core channel's pointers began again at 0)
   CHECK(rig.allocator.live == 0 && (rig.card.last_write(0x001704) & 0x80000000u) == 0);
 }
+
+// --- Turing and GA10x from scratch (window channels) ------------------------------------------------------------------------------------
+
+// HDMI on Turing (c57d) or GA104 (c67d): BAR1 through Turing's BAR/TLB registers on GP100 tables, the core methods at the c37d offsets, the
+// window channel of head 0's window 0 and its immediate channel, the image scanned out, the per-class SOR clock; another mode; the shutdown.
+static void test_window_class_hdmi(const Chip& chip, DisplayClass cls) {
+  Rig rig(cls);
+  rig.plug(1, monitor_edid(put_1080p, put_720p), EdidSource::Ddc);
+  auto display = std::make_unique<NvSecondaryDisplay>(rig.inputs(chip));
+  CHECK(display->start() == DisplayStatus::Ok);
+  CHECK(display->engine() && display->engine()->display_class() == cls);
+  CHECK(display->connector() == 1 && display->output().type == DcbOutputType::Tmds && display->route().sor == 1 && display->route().head == 0);
+  CHECK(display->width() == 1920 && display->height() == 1080 && display->pitch_bytes() == 7680);
+  Card& c = rig.card;
+  Model& model = c.model;
+  CHECK(model.errors == 0);
+
+  // BAR2 then BAR1 at 0xb80f48 / 0xb80f40 (not 0x001714 / 0x001704), the TLB invalidated through 0xb830b0 after; GP100 tables 1:1.
+  Bar1LinearVram* memory = display->memory();
+  CHECK(memory && memory->ready() && memory->linear_bytes() == (31u << 20));
+  const int bar2 = c.index_of(0xb80f48), bar1 = c.index_of(0xb80f40);
+  CHECK(bar2 >= 0 && bar1 > bar2 && c.index_of(0x001704) < 0 && c.index_of(0x001714) < 0);
+  CHECK(c.last_write(0xb80f48) == (0x80000000u | static_cast<uint32_t>(memory->bar().bar2_instance().gpu_address >> 12)));
+  CHECK(c.last_write(0xb80f40) == (0x80000000u | static_cast<uint32_t>(memory->bar().bar1_instance().gpu_address >> 12)));
+  CHECK(c.index_of(0xb830b0) > bar1 && c.index_of(0x100cbc) < 0);
+  CHECK(memory->bar().bar1().layout().format == VmmFormat::Gp100 && memory->bar().bar1().layout().subcontexts);
+  const uint64_t surface = display->surface().offset;
+  for (const uint64_t va : {surface, surface + 0x123000, uint64_t{1u << 20}, uint64_t{(31u << 20) - 4096}}) {
+    const Optional<NvVmm::Translation> tr = memory->bar().bar1().translate(va);
+    CHECK(tr && tr->address == va && tr->target == MemoryTarget::Vram);
+  }
+  CHECK(!memory->bar().bar1().translate(31u << 20));
+  // The instance block: the PDB with the GP100 "version 2" and 64 KiB bits, and the subcontext PDBs (gv100_vmm_join).
+  const uint64_t inst = memory->bar().bar1_instance().gpu_address;
+  CHECK((c.px(inst + 0x200) & 0xc00) == 0xc00 && c.px(inst + 0x298) != 0);
+
+  // The display engine: 8 KiB RAMHT, the core channel and window 0's channels (window slot 1, immediate slot 33)
+  CHECK(model.regs[0x610010] == 0x9 && (model.regs[0x610b00] & 0x30000) == 0x10000);
+  CHECK(model.regs[0x610b00 + 1 * 0x10] == 0x11 && model.regs[0x610b00 + 33 * 0x10] == 0x11);
+  CHECK(model.regs[0x640008] == 0x21);                                        // tu102_disp_init's lock pins (also GA102)
+  // The core: SOR 1 owned by head 0 as TMDS A, the windows' owners, the head at 0x2000.
+  CHECK(model.core.arm[0x0300 + 1 * 0x20] == (0x1u | 0x1u << 8));
+  CHECK(model.core.arm[0x1000] == 0 && model.core.arm[0x1000 + 0x80] == 0 && model.core.arm[0x1000 + 2 * 0x80] == 1);
+  CHECK(model.core.arm[0x1004] == 0x0f && model.core.arm[0x1010] == 0x00117fff);   // corec57d's usage bounds
+  CHECK(model.core.arm[0x2004] == (1u | 4u << 4));                                  // positive syncs, 24 bpp
+  CHECK(model.core.arm[0x2064] == (1125u << 16 | 2200) && model.core.arm[0x2068] == (4u << 16 | 43));
+  CHECK(model.core.arm[0x206c] == (40u << 16 | 191) && model.core.arm[0x2070] == (1120u << 16 | 2111));
+  CHECK(model.core.arm[0x200c] == 148500000u && model.core.arm[0x2028] == 148500000u && model.core.arm[0x2030] == 0x1014);
+  CHECK(model.core.arm[0x204c] == (1080u << 16 | 1920));
+  // The window: the surface pitch-linear X8R8G8B8, the VRAM context DMA, scanned out; placed at 0,0 by its immediate channel.
+  CHECK(model.win[0].arm[0x0224] == (1080u << 16 | 1920) && model.win[0].arm[0x0228] == 1u << 4 && model.win[0].arm[0x022c] == 0xe6);
+  CHECK(model.win[0].arm[0x0230] == 7680u / 64 && model.win[0].arm[0x0240] == 0xf0000001u && model.win[0].arm[0x0260] == surface >> 8);
+  CHECK(model.window_scanout[0] == surface);
+  CHECK(model.win[Model::kWimm].updates == 1 && Model::has_method(model.win[Model::kWimm], 0x0208, 0));
+  CHECK(rig.clock.calls.size() == 1 && rig.clock.calls[0].first == 0 && rig.clock.calls[0].second == 148500);
+  CHECK(model.super_acks == 3 && (model.regs[0x611c30] & 7) == 0);
+  if (cls == DisplayClass::Ga102) CHECK(c.index_of(0x00ec04 + 0x10) >= 0 && (model.regs[0x612300 + 0x800] & 0x007c0000) == 0);   // ga102_sor_clock
+  else CHECK((model.regs[0x612300 + 0x800] & 0x007c0000) == 0x0au << 18);                                                         // gf119_sor_clock
+
+  // Drawing through the CPU's view lands where the window reads.
+  ByteView px = display->pixels();
+  px[0] = 0x11; px[1] = 0x22; px[2] = 0x33;
+  CHECK(c.px(surface) == 0x00332211);
+  display->flush();
+  CHECK(c.writes.back().first == 0x070000);
+
+  // Another mode: the window shows the new surface, the old one went back.
+  const uint32_t allocations = display->memory()->heap().allocation_count();
+  CHECK(display->set_mode(1) == DisplayStatus::Ok && display->width() == 1280);
+  CHECK(model.core.arm[0x2064] == (750u << 16 | 1650) && model.window_scanout[0] == display->surface().offset && display->surface().offset != surface);
+  CHECK(display->memory()->heap().allocation_count() == allocations && rig.clock.calls.size() == 2);
+  CHECK(model.errors == 0);
+
+  // Shutdown: the window's image off, the SOR let go through the supervisor, every channel stopped, both BARs off.
+  const uint32_t acks = model.super_acks;
+  display->shutdown();
+  CHECK(model.win[0].arm[0x0240] == 0 && model.window_scanout[0] == 0 && model.core.arm[0x0300 + 0x20] == 0 && model.super_acks == acks + 3);
+  CHECK((model.regs[0x610b00] & 3) == 0 && (model.regs[0x610b10] & 3) == 0 && (model.regs[0x610b00 + 33 * 0x10] & 3) == 0);
+  CHECK((c.last_write(0xb80f40) & 0x80000000u) == 0 && (c.last_write(0xb80f48) & 0x80000000u) == 0);
+  CHECK(display->memory()->heap().allocation_count() == display->memory()->table_allocations() && display->memory()->heap().bad_releases() == 0);
+  CHECK(display->start() == DisplayStatus::Ok && model.window_scanout[0] == display->surface().offset);   // and up again
+  display.reset();
+  CHECK(model.errors == 0);
+  CHECK(rig.allocator.live == 0);
+}
+
+// DisplayPort on the DP++ port: trained at HBR2 x4 with the class's SOR registers (Turing: the code and the link enables after 40 ms;
+// GA102: the rate as index 2), lanes 0..3 in order, the DP watermark at gv100's register.
+static void test_window_class_dp(const Chip& chip, DisplayClass cls) {
+  Rig rig(cls);
+  rig.plug(0, monitor_edid(put_1080p, put_720p, true), EdidSource::Aux);
+  auto display = std::make_unique<NvSecondaryDisplay>(rig.inputs(chip));
+  CHECK(display->start() == DisplayStatus::Ok);
+  CHECK(display->connector() == 0 && display->output().type == DcbOutputType::Dp && display->route().sor == 0 && display->mode_count() == 3);
+  Model& model = rig.card.model;
+  CHECK(model.core.arm[0x0300] == (0x1u | 0x8u << 8));                       // SOR 0, DP link A
+  CHECK(rig.sink.dpcd[0x100] == 0x14 && (rig.sink.dpcd[0x101] & 0x1f) == 4);
+  const uint32_t clk = model.regs[0x612300];
+  CHECK(((clk >> 18) & 0x1f) == (cls == DisplayClass::Ga102 ? 2u : 0x14u));
+  CHECK((clk & 0x30000) == 0x10000 && (model.regs[0x61c10c] & 3) == 1 && (model.regs[0x61c10c] & 0x001f0000) == 0x000f0000);
+  CHECK((model.regs[0x61c130] & 0xf) == 0xf);
+  bool waited = false;
+  for (const auto& e : rig.card.events) waited |= e.first == 'd' && e.second == 40000;
+  CHECK(waited);                                                              // tu102/ga102_sor_dp_links' 40 ms
+  CHECK((model.regs[0x616550] & 0x08000000) != 0);                            // gv100_sor_dp_watermark (head 0)
+  CHECK(model.window_scanout[0] == display->surface().offset && model.errors == 0);
+}
+
+// The built-in eDP panel on a muxed Turing laptop: the power sequence as on Kepler, the panel's rate table, SOR 3 as DP A at the c57d
+// offset, the window scanned out, the backlight; the shutdown in order.
+static void test_panel_edp_turing();
+
 // --- The built-in panel (a muxed laptop's discrete GPU) ----------------------------------------------------------------------------------
 namespace {
 // The panel's power line (DCB GPIO function 0x01); `readable` false: an INvGpio that cannot read it back; `present` false: the board has none.
@@ -577,10 +703,11 @@ uint64_t fake_now() { return g_now_us; }
 // The Kepler board of the other tests, its eDP-1 (connector 3, DP on SOR 3) as the panel.
 struct PanelRig {
   Rig rig;
+  Chip chip;
   PanelGpio gpio;
   EdpSink sink;
   PanelEdid edid;
-  PanelRig() {
+  explicit PanelRig(DisplayClass cls = DisplayClass::Gf119, const Chip& c = kKepler) : rig(cls), chip(c) {
     gpio.card = &rig.card;
     sink.gpio = &gpio;
     sink.card = &rig.card;
@@ -590,7 +717,7 @@ struct PanelRig {
     rig.card.model.regs[0x61c084 + 3 * 0x800] = 0x0800;   // ... at half
   }
   NvSecondaryDisplay::Inputs inputs() {
-    NvSecondaryDisplay::Inputs in = rig.inputs(kKepler);
+    NvSecondaryDisplay::Inputs in = rig.inputs(chip);
     in.panel = true;
     in.gpio = &gpio;
     in.aux = &sink;
@@ -772,6 +899,33 @@ static void test_panel_failures() {
   }
 }
 
+static void test_panel_edp_turing() {
+  PanelRig p(DisplayClass::Tu102, kTuring);
+  auto display = std::make_unique<NvSecondaryDisplay>(p.inputs());
+  CHECK(display->start() == DisplayStatus::Ok);
+  CHECK(display->panel() && display->panel_result() == PanelLightStatus::Ok && display->connector() == 3 && display->route().sor == 3);
+  Model& model = p.rig.card.model;
+  CHECK(model.errors == 0 && model.window_scanout[0] == display->surface().offset);
+  CHECK(model.core.arm[0x0300 + 3 * 0x20] == (0x1u | 0x8u << 8));          // SOR 3 as DP link A on head 0
+  const int g1 = p.find('g', 1), up = p.find('d', 210000), aux = p.find('a', 0), t8 = p.find('d', 50000), bl = p.find_write(kPwmCtl3);
+  CHECK(g1 >= 0 && up > g1 && aux > up && t8 > aux && bl > t8);
+  CHECK(p.find_write(0x6107a8) > aux && p.find_write(0x6107a8) < t8);       // the (Volta+) supervisor ran between training and the backlight
+  CHECK(p.sink.dpcd[0x100] == 0 && p.sink.dpcd[0x115] == 3 && (p.sink.dpcd[0x101] & 0x1f) == 4);
+  CHECK((model.regs[0x612300 + 3 * 0x800] & 0x007c0000) == 0x14u << 18 && (model.regs[0x612300 + 3 * 0x800] & 0x30000) == 0x10000);
+  CHECK(model.regs[kPwmCtl3] == (0x0800u | 0xc0000000u));
+  const size_t before = p.events().size();
+  display->shutdown();
+  const int off = p.find_write(kPwmCtl3, static_cast<int>(before)), t9 = p.find('d', 50000, off), t10 = p.find('d', 500000, off),
+            g0 = p.find('g', 0, off), blank = p.find_write(0x6107a8, off);
+  CHECK(off >= 0 && t9 > off && blank > t9 && t10 > blank && g0 > t10);
+  CHECK(!p.gpio.on && model.core.arm[0x0300 + 3 * 0x20] == 0 && model.window_scanout[0] == 0 && model.errors == 0);
+  // GA10x: the same panel, the 5.4 Gbit/s entry as GA102's rate index 2
+  PanelRig a(DisplayClass::Ga102, kAmpere);
+  auto ga = std::make_unique<NvSecondaryDisplay>(a.inputs());
+  CHECK(ga->start() == DisplayStatus::Ok && a.sink.dpcd[0x115] == 3);
+  CHECK((a.rig.card.model.regs[0x612300 + 3 * 0x800] & 0x007c0000) == 2u << 18 && a.rig.card.model.errors == 0);
+}
+
 // LVDS: the DCB's LVDS output on a SOR, the SPWG waits, the LVDS protocol on the SOR.
 static void test_panel_lvds() {
   PanelRig p;
@@ -835,11 +989,27 @@ static void test_gpu() {
     CHECK(!panel.has_panel_output() && !panel.can_light_panel() && !panel.panel_lit() && panel.light_panel() == PanelLightStatus::NoPanel);
     panel.release_panel();                                           // (nothing lit: nothing happens)
     gpu.shutdown();
-    // An Ampere card: its display is the GSP's.
-    card.bar0[0] = 0x172000a1;
-    NvidiaSecondaryGpu ampere(context);
-    CHECK(!ampere.initialize() && strstr(ampere.status(), "GF119"));
-    ampere.shutdown();
+    // An Ada card: its display is the GSP's.
+    card.bar0[0] = 0x194000a1;
+    card.bar0[0xa00 / 4] = 0x19400000;
+    NvidiaSecondaryGpu ada(context);
+    CHECK(!ada.initialize() && strstr(ada.status(), "GSP"));
+    ada.shutdown();
+    // A GA104 and a TU104: past the class and the VRAM size (GA10x: 0x1183a4) to the monitors, of which there are none.
+    card.bar0[0x1183a4 / 4] = 1024;
+    card.bar0[0x02243c / 4] = 1;                                     // (Turing: one FBPA of 1 GiB, gp100's sizing)
+    card.bar0[0x90020c / 4] = 1024;
+    for (const uint32_t boot0 : {0x174000a1u, 0x164000a1u}) {
+      card.bar0[0] = boot0;
+      card.bar0[0xa00 / 4] = boot0 & 0xfff00000u;
+      NvidiaSecondaryGpu gpu2(context);
+      const bool ok = gpu2.initialize();
+      CHECK(!ok && !strstr(gpu2.status(), "GSP") && !strstr(gpu2.status(), "VRAM"));
+      if (ok || strstr(gpu2.status(), "GSP") || strstr(gpu2.status(), "VRAM")) printf("  %08x: %s\n", boot0, gpu2.status());
+      gpu2.shutdown();
+    }
+    card.bar0[0] = 0x0e4000a1;
+    card.bar0[0xa00 / 4] = 0;
     // No register mapper.
     GpuContext none = context;
     none.registers = nullptr;
@@ -853,6 +1023,19 @@ static void test_gpu() {
     CHECK(card.maps == 0 && card.bar0 == before && !gpu.native() && gpu.mode_count() == 0 && gpu.connector_count() == 0);
     CHECK(!gpu.panel_output()->can_light_panel() && gpu.panel_output()->light_panel() == PanelLightStatus::NotSupported && card.bar0 == before);
     gpu.shutdown();
+    // ... and so are the newly covered Turing and GA10x cards.
+    for (const uint32_t boot0 : {0x164000a1u, 0x174000a1u}) {
+      card.bar0[0] = boot0;
+      card.bar0[0xa00 / 4] = boot0 & 0xfff00000u;
+      const std::vector<uint32_t> was = card.bar0;
+      const uint32_t maps = card.maps;
+      NvidiaSecondaryGpu newer(context);
+      CHECK(NvidiaSecondaryGpu::supports(context.device));
+      CHECK(!newer.initialize() && strstr(newer.status(), "TCOS_NVIDIA_NATIVE") && card.maps == maps && card.bar0 == was);
+      newer.shutdown();
+    }
+    card.bar0[0] = 0x0e4000a1;
+    card.bar0[0xa00 / 4] = 0;
 #endif
     PciAddress where;
     NvidiaSecondaryGpu located(context);
@@ -873,6 +1056,11 @@ int main() {
   test_panel_power_cases();
   test_panel_failures();
   test_panel_lvds();
+  test_window_class_hdmi(kTuring, DisplayClass::Tu102);
+  test_window_class_hdmi(kAmpere, DisplayClass::Ga102);
+  test_window_class_dp(kTuring, DisplayClass::Tu102);
+  test_window_class_dp(kAmpere, DisplayClass::Ga102);
+  test_panel_edp_turing();
 #endif
   test_vpll();
   test_gpu();

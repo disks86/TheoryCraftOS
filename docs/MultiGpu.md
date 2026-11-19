@@ -65,31 +65,92 @@ The platform handlers (attached in `main.cpp` once the ACPI tables are loaded, o
   the mux, then the old side releases the panel and its lease goes back (the discrete GPU may sleep). A failure is undone in reverse; a
   rollback that fails leaves the state unknown (`active()` false) until a mux that can tell (gmux) or `set_known_active()` settles it.
   `can_switch_to(side, &why)` is for a settings page. `main.cpp` keeps the gmux or the `GpuAcpiPower::find_mux` object, builds the switcher
-  (integrated side `GopPanelOutput`, discrete side `GpuNode::panel`), publishes it (`GpuMuxSwitch::published()`) and logs the mux kind.
+  (discrete side `GpuNode::panel`; integrated side below), publishes it (`GpuMuxSwitch::published()`) and logs the mux kind.
+  - Integrated side: `IntelGpu::panel_output()` (`IntelPanelOutput`, `Intel/IntelGpu.hpp`) where Intel native mode setting runs (Gen9.5, Gen11,
+    Xe-LP) and the firmware lit an eDP panel; else `GopPanelOutput`, which cannot light the panel again (the switch back is refused until a
+    restart). `IntelPanelOutput` follows i915: release = backlight off (PP_CONTROL, PCH PWM) and T9, plane saved, transcoder off (state bit),
+    DDI function off, port off (DP_TP_CTL, DDI_BUF_CTL idle bit), panel power off through the panel power sequencer (it makes T10 and the power
+    cycle); light = power cycle waited out, panel power on (PP_STATUS on), port on with training pattern 1, eDP training without an AUX
+    handshake (pattern 1, 2, idle, normal), DDI function and transcoder on as the firmware had them, the plane put back (`Display::restore`),
+    T8 and the backlight. The PLL and the transcoder's timings are never touched, so the panel comes back at the mode the firmware lit.
+    Each failing step leaves nothing on (`PowerFailed`, `LinkTraining`, `ModeSet`). Test: `GpuMuxSwitchTest` (a register model).
+  - The desktop follows (`GpuMuxDesktop`, the `IBuiltInScreenSwitch` a settings page sees): after the switch, `SystemMonitors::move_panel(from,
+    to)` takes the panel's monitor off the old GPU's monitors (not connected there, and ignored by `poll()` while away) and puts the new GPU's
+    (its Internal connector, read again; on a GPU without Internal connectors its only free connected one) in the same layout slot: place,
+    scale and primary kept, the size of the new GPU's screen. The next `apply()` gives it a `targets()` entry, so `MonitorDisplay` copies its
+    part of the desktop to the new GPU (or, back on the display device, draws it there directly). If the monitors find no panel on the new GPU
+    the panel is switched back. `main.cpp` also spans a GPU with a zero-sized screen when its driver has a panel output (a discrete GPU in
+    panel standby): none of its monitors is used until the panel moves there. Tests: `GpuMuxSwitchTest`, `MultiGpuMonitorTest`.
+  - Display Settings' Graphics group (`Desktop/DisplaySettings`, shown when `Desktop::set_graphics_switch` got one): "The built-in screen is
+    driven by <GPU> (the integrated GPU)", a button "Use <other GPU> for the Built-in Screen" (unavailable with "Not available because ..."
+    under it when `can_switch_to` says no, or while new display settings wait for Keep/Revert), a confirmation (Switch / Cancel, Cancel the
+    default: the screen goes dark for a moment), then drawing stops (`Desktop` stops its render loop), the switch, the monitors made real on
+    the new GPU, drawing again; a failure is an error notice saying why and where the screen is (or that it may stay dark), and making the
+    monitors real failing switches back. Test: `UiGuideTest` (Settings).
 - [MultiGpuAcpi.md](MultiGpuAcpi.md): `Multi/Acpi/`: finding the GPU's ACPI device, `_PR3`/`_PR0` power resources with `_PS3`/`_PS0`, NVIDIA Optimus / JT / the old hybrid `_DSM`, AMD ATPX (power and mux). Test `GpuAcpiPowerTest`.
 - [MultiGpuPlatform.md](MultiGpuPlatform.md): Apple gmux (`Multi/AppleGmux`: mux, discrete power, backlight) and the PCI Express link (`Multi/PcieLink`: upstream bridge, device functions, link disable/retrain, ASPM negotiation). Tests `AppleGmuxTest`, `PcieLinkTest`.
 
 ## Not done
 
 - **Display drivers for a second GPU:** NVIDIA has one (`NVIDIA/NvidiaSecondaryGpu`: mode set from the EDID, BAR1 page tables, TMDS and DisplayPort on the GF119
-  display class; Kepler to Pascal), behind `TCOS_NVIDIA_NATIVE` and never run on a card. AMD Polaris 10/11/12 and Vega M have one too (`AMD/AmdSecondaryGpu`: POST,
-  memory controller apertures, EDID mode set through the video BIOS's command tables on DCE 11.2, HDMI/DVI and DisplayPort with link training; see NativeModeSetting.md),
-  behind `TCOS_AMD_NATIVE` and never run on a card. Tesla, Volta and later NVIDIA, AMD Vega 10 and Navi and later (DCE 12 / DCN), and every Intel discrete GPU, have only a
+  display class (Kepler to Pascal) and on the window-channel classes c37d/c57d/c67d (Volta, Turing, GA102..GA107 without GSP, as nouveau)), behind
+  `TCOS_NVIDIA_NATIVE` and never run on a card. AMD Polaris 10/11/12, Vega M and Vega 10/12/20 have one too (`AMD/AmdSecondaryGpu`: POST,
+  memory controller apertures, EDID mode set through the video BIOS's command tables on DCE 11.2, and on DCE 12 the ATOM firmware tables with the display core's register
+  sequences (`AMD/AmdDce12`), HDMI/DVI and DisplayPort with link training; see NativeModeSetting.md),
+  behind `TCOS_AMD_NATIVE` and never run on a card. Intel Arc Alchemist (DG2) has one too (`Intel/IntelSecondaryGpu`: power wells, CDCLK, SNPS PHY MPLLB,
+  DDI A-D, transcoder/pipe/plane from scratch, the surface in local memory behind GGTT entries, HDMI or DisplayPort with link training; see NativeModeSetting.md),
+  behind `TCOS_INTEL_DGPU_NATIVE` and never run on a card. Tesla and Ada and later NVIDIA (Ada: nouveau drives its display only through GSP), AMD Navi and later (DCN), and Intel DG1 and Battlemage, have only a
   probe: they cannot show anything and render only on the CPU. Each display driver plugs into `GpuNativeDrivers.cpp` (display) and `RenderNodeAccel.cpp` (3D).
 - Spanning (see "The desktop across GPUs"): the desktop is drawn once, on the CPU, and copied to the other GPUs' screens (no rendering on the GPU that drives
   the monitor); monitors at different scales on several GPUs are resampled from one picture instead of each drawn at its own scale (`MonitorRenderers` is
   for the display GPU only); a monitor hot-plugged on another GPU is seen only if that GPU's monitor source reports connector changes
   (`refresh_connectors`); the console after the desktop shows on the display GPU only, the other screens keep the desktop's last picture.
 - A GPU with a display driver is never power-cycled (the drivers cannot restore their state), so it stays awake.
-- The mux switch (`Multi/GpuMuxSwitch`, below) is an API only: no settings page calls it, and moving the desktop onto the other GPU's framebuffer
-  is not done. The integrated side is the firmware's framebuffer (`GopPanelOutput`): the panel can go to the discrete GPU and not come back
-  until a restart. Only `NvidiaSecondaryGpu` (with `TCOS_NVIDIA_NATIVE`) implements `IPanelOutput`; none of it has run on a muxed laptop.
+- The mux switch (`Multi/GpuMuxSwitch`, above): none of it has run on a muxed laptop. The integrated side lights the panel again only on Intel
+  Gen9.5/Gen11/Xe-LP with native mode setting and an eDP panel the firmware lit (`IntelPanelOutput`, unverified on hardware: register offsets
+  from i915, link training without AUX, so a panel that needs AUX training stays dark); AMD integrated and every other case are
+  `GopPanelOutput` (no way back until a restart). The discrete side is `NvidiaSecondaryGpu` (with `TCOS_NVIDIA_NATIVE`) only. While the panel
+  is on the discrete GPU the desktop is still drawn on the display device and copied over (no rendering on the discrete GPU, no change of the
+  display device); the console after the desktop goes to the display device only. The switch blocks the settings page's handler thread for
+  the panel power sequence (well under a second) and cannot be cancelled once started.
 - Link disable around D3cold is available but off by default; Turing+ NVIDIA POST is only the GFW_BOOT wait (nouveau's PRE_OS start after it
-  is not done); jack sensing while the GPU's HD audio sleeps (with the GPU's power cut its own hot-plug detection is dark too, and how a
-  laptop reports a new monitor then is board specific).
+  is not done).
+- Hot plug on a sleeping GPU (see "Monitors plugged into a sleeping GPU"): only GPEs named by the GPU's or its root port's `_PRW` are armed
+  (`AcpiEvents` does not enable every `_Lxx`/`_Exx` GPE as Linux does at boot, so a board that routes the port's hot-plug line to a GPIO GPE with no
+  `_PRW` reports nothing until something else arms that GPE); the HD-audio codec's unsolicited responses are not used (it re-reads its pins only when
+  told); only the NVIDIA probe reads connectors (AMD and Intel probes cannot tell, so their notifications are passed on unchecked); a check runs on
+  the main loop and stalls it for the wake (up to the D3cold power-on delay). Not run on hardware.
 - Cross-GPU copies are a read-back plus a blit through the CPU (no peer-to-peer DMA, no shared surfaces).
 - Tested against fake PCI buses, register models, fake AML and fake ports, and built for UEFI. In QEMU only spanning was run (QEMU VGA + a second virtio-gpu,
   both heads checked by screendump); nothing has run on real hybrid hardware.
+
+## Monitors plugged into a sleeping GPU
+
+`Multi/GpuHotplug` (test: `tests/run_host_tests.sh GpuHotplugTest`, ASan and TSan). While a discrete GPU sleeps (D3hot, or D3cold with its power
+cut) its own hot-plug detection is dark, so a monitor plugged into an HDMI or DisplayPort port wired to it goes unnoticed. As Linux does:
+
+- **ACPI notifications.** `watch_acpi(gpu, aml, address, bridge)` finds the GPU's Device, its root port and the Devices below the GPU's (its
+  outputs) through `GpuAcpiNamespace`; `GpuHotplug` is an `IAcpiNotifyListener` (`AcpiEvents::add_listener`). What counts (`is_output_notification`):
+  on the GPU 0x02 (device wake, a PME from the sleeping GPU), 0x80, 0x81; on an output 0x80, 0x81; on the root port 0x00 (bus check), 0x01 (device
+  check), 0x02; on the integrated GPU's ACPI video Device (`GpuAcpiRole::OtherAdapter`) 0x81 only. `on_notify` only marks the GPU. `main.cpp` arms
+  the GPU's and the root port's `_PRW` wake events (`AcpiEvents::enable_wake`).
+- **Polling**, as DRM polls connectors that cannot interrupt: `set_poll_policy(GpuOutputPollPolicy)`, **off by default**. When on, every watched
+  GPU whose probe can read outputs is looked at every `period_ms` (10 s; at least 1 s). Each look wakes the GPU, which then stays up for the
+  autosuspend time (5 s), so a 10 s period keeps it powered about half the time; that is why it is off. On battery below `min_battery_percent` (30 %)
+  or with battery saver, a sleeping GPU is not woken for a poll (an awake one is still looked at; a firmware notification always is).
+- **The check.** `service(now_ms)` (from the main loop, next to `GpuManager::service`) takes `GpuPool::refresh_outputs(i)`: a lease (the GPU wakes,
+  through D3cold if need be), `IGpuProbe::resume()` if the GPU was woken since the probe last saw it, `IGpuProbe::refresh_outputs()` (NVIDIA:
+  `NvidiaNative::refresh_connectors`, the connectors whose hot-plug line changed and their EDIDs), the lease back. A GPU with a display driver is not
+  touched (it never sleeps; `SystemMonitors::poll` watches its monitor source), and neither is one whose probe cannot see outputs
+  (`IGpuProbe::reads_outputs`, false for AMD and Intel): a notification for them is passed on unchecked (`GpuOutputCheck::CannotTell`).
+- **Listeners.** `IGpuOutputListener::outputs_changed(gpu)` is called once per change, from `service()`. `main.cpp`'s listener has every companion
+  function of the GPU re-read its codec (`SystemAudioDevices::connections_changed` -> `IntelHdaAudioDevice::connections_changed`: a running controller
+  retargets, a suspended one is resumed, which reads the pins and ELD again, and goes idle after 5 s); the loop then runs `SystemMonitors::poll`
+  (with `Desktop::apply_monitor_changes`) and, for a GPU with only a probe, logs the monitors on its outputs and says that it cannot show them yet.
+
+Threads: `on_notify` from any thread (a short lock and a bit); `service()` passes are serialized; listeners are added and removed from any thread,
+and `remove_listener` returns once no call to that listener is in flight (a listener must not call `remove_listener` or `service` itself). Lock order:
+the service lock, the pool's `probe_lock_` (now also taken by `probe_temperature`), the manager's lock; then the dispatch lock, the listener list.
 
 ## AMD and Intel probes
 
@@ -109,7 +170,7 @@ again after a power cut: `resume()` checks that the GPU answers and reads the me
 Not done or not verified: none of it has run on real hardware. The RDNA 1/2 temperature is a register the Linux driver does not use (it asks the SMU firmware for a
 metrics table), so a reading is only believed between 1 and 150 degrees. RDNA 3/4 put the THM block where the IP discovery table says, so they have no temperature.
 The VBIOS of Vega and later (ROM through SMUIO, or ATRM/VFCT, which need the ACPI tables the pool does not have) is not read. No probe reports connected outputs
-(that needs the connector table and the hot plug pins). The DG1 temperature register is xe's DG2 offset under i915's DG1 name.
+(that needs the connector table and the hot plug pins), so `GpuHotplug` passes their notifications on unchecked. The DG1 temperature register is xe's DG2 offset under i915's DG1 name.
 
 ## HD audio runtime power
 
@@ -168,5 +229,6 @@ D3hot to D0. A link reset wipes the simulated codec. The test covers:
 
 - Not run on hardware or in QEMU.
 - The controller does not suspend while its capture side runs, because recording has no "open" to wake it with.
-- Jacks are not watched while suspended. A resume rediscovers the pin instead.
+- Jacks are not watched while suspended (no unsolicited responses). A resume rediscovers the pin, and `connections_changed()` (called when
+  `GpuHotplug` reports a display change on the GPU) resumes the controller or retargets it so the pins and ELD are read again.
 - Only the type 0 header is saved, not Intel's TCSEL or the vendor registers Linux restores.

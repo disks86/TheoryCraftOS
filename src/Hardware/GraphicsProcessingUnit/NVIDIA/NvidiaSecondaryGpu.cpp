@@ -255,6 +255,25 @@ bool NvVpllClock::set_vpll(uint32_t head, uint32_t khz) {
 // ---------------------------------------------------------------------------------------------------------------------------------------
 // NvSecondaryDisplay
 // ---------------------------------------------------------------------------------------------------------------------------------------
+bool sets_modes(DisplayClass display_class) {
+  switch (display_class) {
+    case DisplayClass::Gf119:
+    case DisplayClass::Gv100:
+    case DisplayClass::Tu102:
+    case DisplayClass::Ga102: return true;
+    default: return false;
+  }
+}
+
+const char* refusal(DisplayClass display_class) {
+  switch (display_class) {
+    case DisplayClass::Nv50: return "mode setting from scratch is not done for the Tesla (NV50) display: GF119..Pascal, Volta, Turing and GA10x only";
+    case DisplayClass::Gsp: return "the display of Ada and later needs the GSP firmware (nouveau has no GSP-less display path for them)";
+    case DisplayClass::None: return "no display engine this driver knows";
+    default: return "ok";
+  }
+}
+
 DisplayStatus NvSecondaryDisplay::fail(DisplayStatus status, const char* why) {
   last_ = status;
   status_ = why ? why : display_status_text(status);
@@ -417,9 +436,10 @@ DisplayStatus NvSecondaryDisplay::start() {
     shutdown();
     return fail(probed, nullptr);
   }
-  if (engine_->display_class() != DisplayClass::Gf119) {
+  const DisplayClass cls = engine_->display_class();
+  if (!sets_modes(cls)) {
     shutdown();
-    return fail(DisplayStatus::NotImplemented, "mode setting from scratch is done for the GF119..Pascal display only");
+    return fail(DisplayStatus::NotImplemented, refusal(cls));
   }
   if (in_.panel ? !pick_panel() : !pick_output()) {
     panel_result_ = PanelLightStatus::NoPanel;
@@ -605,9 +625,13 @@ bool NvidiaSecondaryGpu::initialize() {
   for (const char* part : parts)
     for (const char* p = part; p && *p && n + 1 < out.size(); ++p) out[n++] = *p;
   out[n] = 0;
-  if (nv::display_class(chip) != nv::DisplayClass::Gf119) return fail("mode setting from scratch is done for GF119..Pascal displays only");
-  if (!native_->vram().ok() || !native_->registers()) return fail("the VRAM size could not be read");
-  const nv::VramInfo& vram = native_->vram().info;
+  if (!nv::sets_modes(nv::display_class(chip))) return fail(nv::refusal(nv::display_class(chip)));
+  if (!native_->registers()) return fail("the VRAM size could not be read");
+  // (GA10x: probe_vram says NeedsGsp for the chip as a whole; the display's own objects only need the size, ga102_ram_new's register)
+  const nv::VramProbe probe = nv::probe_vram_display(*native_->registers(), chip);
+  if (!probe.ok()) return fail("the VRAM size could not be read");
+  vram_ = probe.info;
+  const nv::VramInfo& vram = vram_;
   const uint64_t linear = nv::Bar1LinearVram::linear_bytes_for(vram);
   const uint64_t bar1 = context_.pci->memory_bar(context_.device.address, 1);
   if (!linear || !bar1) return fail("no BAR1 or too little VRAM");
@@ -645,7 +669,7 @@ nv::NvSecondaryDisplay::Inputs NvidiaSecondaryGpu::display_inputs(bool panel) {
   in.chip = native_->chip();
   in.board = &native_->board();
   in.connectors = native_->connectors();
-  in.vram = native_->vram().info;
+  in.vram = vram_;
   in.bar1 = bar1_;
   in.allocator = context_.allocator;
   in.clock = clock_.get();

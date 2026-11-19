@@ -16,9 +16,10 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-// Follows nouveau (MIT license): dispnv50/head.c (nv50_head_atomic_check_mode), head907d.c, sor907d.c, disp.c (the SOR protocol choice),
-// nvkm/engine/disp/nv50.c (nv50_disp_super_2_1, _2_2, _2_2_dp), gf119.c (gf119_disp_super, gf119_head_rgclk), gf119_sor.c / g94_sor.c
-// (the DP link, pattern, drive and power registers) and dp.c (the link configuration loop). Numbers are in NvDisplayHw.hpp.
+// Follows nouveau (MIT license): dispnv50/head.c (nv50_head_atomic_check_mode), head907d.c, sor907d.c, corec37d.c, corec57d.c, headc37d.c,
+// headc57d.c, sorc37d.c, wndwc37e.c, wimmc37b.c, disp.c (the SOR protocol choice), nvkm/engine/disp/nv50.c (nv50_disp_super_2_1, _2_2, _2_2_dp),
+// gf119.c (gf119_disp_super, gf119_head_rgclk), gv100.c (gv100_disp_super), gf119_sor.c / g94_sor.c / gm200 / gv100 / tu102 / ga102 sor
+// (the DP link, pattern, drive and power registers, the SOR clock) and dp.c (the link configuration loop). Numbers are in NvDisplayHw.hpp.
 #include "Hardware/GraphicsProcessingUnit/NVIDIA/Nvkm/NvDisplayMode.hpp"
 #include "Hardware/GraphicsProcessingUnit/NVIDIA/Nvkm/NvDisplayHw.hpp"
 
@@ -138,6 +139,59 @@ bool gf119_mode_methods(const NvDisplayEngine& engine, uint32_t head, const Head
   return !out->overflowed();
 }
 
+bool gv100_mode_methods(const NvDisplayEngine& engine, uint32_t head, const HeadRaster& raster, const OutputRoute& route, uint32_t depth_bpp,
+                        bool hsync_negative, bool vsync_negative, MethodList* out) {
+  const DisplayClass cls = engine.display_class();
+  if (!out || (cls != DisplayClass::Gv100 && cls != DisplayClass::Tu102 && cls != DisplayClass::Ga102) || head >= NvDisplayEngine::kMaxHeads ||
+      route.sor >= NvDisplayEngine::kMaxSors)
+    return false;
+  const bool c37d = cls == DisplayClass::Gv100;
+  uint32_t depth = 0;
+  switch (depth_bpp) {
+    case 18: depth = mc37d::kDepth18; break;
+    case 24: depth = mc37d::kDepth24; break;
+    case 30: depth = mc37d::kDepth30; break;
+    default: return false;
+  }
+  bool ok = true;
+  // corec37d_init and corec37d_wndw_owner: every window's usage bounds, and its owner (two per head; one of a head the display lacks: none)
+  for (uint32_t w = 0; w < mc37d::kWindowsAssigned && ok; ++w) {
+    if (!(engine.window_mask() & (1u << w))) continue;
+    const uint32_t b = w * mc37d::kWindowStride, owner = w / mc37d::kWindowsPerHead;
+    ok = out->add(mc37d::kWindowControl + b, (engine.head_mask() & (1u << owner)) ? owner : mc37d::kWindowOwnerNone) &&
+         out->add(mc37d::kWindowFormatUsage + b, c37d ? mc37d::kWindowFormatUsageC37d : mc37d::kWindowFormatUsageC57d) &&
+         out->add(mc37d::kWindowRotatedUsage + b, 0) && out->add(mc37d::kWindowUsage + b, c37d ? mc37d::kWindowUsageC37d : mc37d::kWindowUsageC57d);
+  }
+  const uint32_t h = head * mc37d::kHeadStride;
+  const uint32_t hz = raster.clock_khz * 1000;
+  const uint32_t view = raster.vdisplay << 16 | raster.hdisplay;
+  ok = ok && out->add(mc37d::kSorControl + route.sor * mc37d::kSorStride, (1u << head) | route.protocol << 8) &&
+       out->add(mc37d::kHeadProcamp + h, c37d ? mc37d::kProcampC37dDefault : 0) &&
+       out->add(mc37d::kHeadOutputResource + h, mc37d::kOrCrcComplete | (hsync_negative ? 1u : 0) << mc37d::kOrHsyncShift |
+                                                     (vsync_negative ? 1u : 0) << mc37d::kOrVsyncShift | depth << mc37d::kOrDepthShift) &&
+       out->add(mc37d::kHeadControl + h, raster.interlaced ? 1 : 0) && out->add(mc37d::kHeadPixelClock + h, hz) &&
+       out->add(mc37d::kHeadPixelClockMax + h, hz) &&
+       out->add(mc37d::kHeadUsageBounds + h, c37d ? mc37d::kHeadUsageBoundsC37d : mc37d::kHeadUsageBoundsC57d) &&
+       out->add(mc37d::kHeadViewportSizeIn + h, view) && out->add(mc37d::kHeadViewportPointOutAdjust + h, 0) &&
+       out->add(mc37d::kHeadViewportSizeOut + h, view) && out->add(mc37d::kHeadViewportSizeOutMin + h, view) &&
+       out->add(mc37d::kHeadRasterSize + h, raster.raster_size()) && out->add(mc37d::kHeadSyncEnd + h, raster.sync_end()) &&
+       out->add(mc37d::kHeadBlankEnd + h, raster.blank_end()) && out->add(mc37d::kHeadBlankStart + h, raster.blank_start()) &&
+       out->add(mc37d::kHeadVertBlank2 + h, raster.vert_blank2());
+  return ok && !out->overflowed();
+}
+
+bool gv100_window_methods(const NvDisplayEngine& engine, const ScanoutSurface& surface, MethodList* out) {
+  if (!out || !engine.volta_or_later()) return false;
+  const bool ok = out->add(mc37e::kPresentControl, mc37e::kPresentInterval1) &&
+                  out->add(mc37e::kCompositionControl, mc37e::kCompositionDepthOpaque) &&
+                  out->add(mc37e::kCompositionConstantAlpha, mc37e::kCompositionK1Opaque) &&
+                  out->add(mc37e::kCompositionFactorSelect, mc37e::kCompositionFactorsOpaque) &&
+                  out->add(mc37e::kCompositionMaxZ, mc37e::kCompositionMaxZValue);
+  if (!ok) return false;
+  engine.surface_methods(0, surface, out);      // (the window's methods do not depend on the head)
+  return !out->overflowed();
+}
+
 // ---------------------------------------------------------------------------------------------------------------------------------------
 // DisplayPort
 // ---------------------------------------------------------------------------------------------------------------------------------------
@@ -157,14 +211,42 @@ const DpDriveTable& placeholder_dp_drive_table() {
   return table;
 }
 
+SorVariant sor_variant(DisplayClass display_class) {
+  switch (display_class) {
+    case DisplayClass::Gv100: return SorVariant::Gv100;
+    case DisplayClass::Tu102: return SorVariant::Tu102;
+    case DisplayClass::Ga102: return SorVariant::Ga102;
+    default: return SorVariant::Gf119;
+  }
+}
+
+Optional<uint32_t> ga102_link_rate_index(uint8_t bandwidth_code) {
+  for (uint32_t i = 0; i < sizeof kGa102DpRateCodes; ++i)
+    if (kGa102DpRateCodes[i] == bandwidth_code) return i;
+  return Optional<uint32_t>();
+}
+
+uint32_t NvSorDp::lane_byte(uint32_t lane) const { return variant_ == SorVariant::Gf119 ? kGf119DpLaneMap[lane & 3] : kGm200DpLaneMap[lane & 3]; }
+
 bool NvSorDp::set_link(uint8_t bandwidth_code, uint32_t lanes, bool enhanced_framing) {
   if (lanes != 1 && lanes != 2 && lanes != 4) return false;
   if (bandwidth_code == 0 || (bandwidth_code << kSorClockSpeedShift) & ~kSorClockSpeedMask) return false;
-  r_.mask(kGf119SorClock + sor_base(), kSorClockSpeedMask, uint32_t{bandwidth_code} << kSorClockSpeedShift);
+  uint32_t speed = bandwidth_code;
+  if (variant_ == SorVariant::Ga102) {          // ga102_sor_dp_links: the rate's index
+    const Optional<uint32_t> index = ga102_link_rate_index(bandwidth_code);
+    if (!index) return false;
+    speed = *index;
+  }
+  r_.mask(kGf119SorClock + sor_base(), kSorClockSpeedMask, speed << kSorClockSpeedShift);
+  if (variant_ == SorVariant::Tu102 || variant_ == SorVariant::Ga102) {   // tu102/ga102_sor_dp_links: "XXX"
+    r_.delay_us(kTu102DpLinkDelayUs);
+    r_.mask(kGf119SorClock + sor_base(), kTu102SorClockEnableMask, kTu102SorClockEnable);
+    r_.mask(kSorDpCtrl + link_base(), kTu102SorDpEnableMask, kTu102SorDpEnable);
+  }
   r_.mask(kSorDpCtrl + link_base(), kSorDpCtrlMask, ((1u << lanes) - 1) << 16 | (enhanced_framing ? kSorDpEnhancedFraming : 0));
   // g94_sor_dp_power: the lanes in use powered, then the change kicked and waited for
   uint32_t power = 0;
-  for (uint32_t i = 0; i < lanes; ++i) power |= 1u << kGf119DpLaneMap[i];
+  for (uint32_t i = 0; i < lanes; ++i) power |= 1u << lane_byte(i);
   r_.mask(kSorDpLaneEnable + link_base(), kSorDpPowerLaneMask, power);
   r_.mask(kSorDpPower + sor_base(), kSorDpPowerPending, kSorDpPowerPending);
   bool done = false;
@@ -198,12 +280,15 @@ bool NvSorDp::set_drive(uint8_t lane_set) {
   const uint32_t pre = (lane_set & Dpcd::kTrainPreEmphasisMask) >> Dpcd::kTrainPreEmphasisShift;
   const DpDriveLevel& level = drive_.level[swing][pre];
   const uint32_t l = link_base();
+  // gf119_sor_dp_drive: TX_PU 15:8; gm200_sor_dp_drive (Volta and later here): pu & 0x0f in 11:8
+  const uint32_t pu_mask = variant_ == SorVariant::Gf119 ? 0x0000ff00u : kGm200DpTxPuMask;
+  const uint32_t pu = (uint32_t{level.tx_pu} << 8) & pu_mask;
   for (uint32_t lane = 0; lane < lanes_; ++lane) {
-    const uint32_t shift = kGf119DpLaneMap[lane] * 8;
+    const uint32_t shift = lane_byte(lane) * 8;
     const uint32_t current = r_.read32(kSorDpDriveCurrent + l) & ~(0xffu << shift);
     const uint32_t emphasis = r_.read32(kSorDpPreEmphasis + l) & ~(0xffu << shift);
     uint32_t enable = r_.read32(kSorDpLaneEnable + l);
-    if ((enable & 0x0000ff00) < (uint32_t{level.tx_pu} << 8) || lane == 0) enable = (enable & ~0x0000ff00u) | uint32_t{level.tx_pu} << 8;
+    if ((enable & pu_mask) < pu || lane == 0) enable = (enable & ~pu_mask) | pu;
     r_.write32(kSorDpDriveCurrent + l, current | uint32_t{level.drive_current} << shift);
     r_.write32(kSorDpPreEmphasis + l, emphasis | uint32_t{level.pre_emphasis} << shift);
     r_.write32(kSorDpLaneEnable + l, enable);
@@ -354,7 +439,8 @@ void NvModeSetter::supervisor_2(uint32_t masks[NvDisplayEngine::kMaxHeads]) {
   // 2.1: the VPLL of every head whose clock changes, at the clock now in its assembly state
   for (uint32_t h = 0; h < NvDisplayEngine::kMaxHeads; ++h) {
     if (!(masks[h] & kSuperHeadClock)) continue;
-    const uint32_t hz = r.read32(kGf119Assembly + m907d::kHeadPixelClock + h * m907d::kHeadStride);
+    const uint32_t hz = gv100() ? r.read32(kGv100Assembly + mc37d::kHeadPixelClock + h * mc37d::kHeadStride)
+                                : r.read32(kGf119Assembly + m907d::kHeadPixelClock + h * m907d::kHeadStride);
     if (hz && clock_ && !clock_->set_vpll(h, hz / 1000)) vpll_failed_ = true;
   }
   // 2.2: the head being set (the IED scripts nouveau runs here are not)
@@ -364,29 +450,38 @@ void NvModeSetter::supervisor_2(uint32_t masks[NvDisplayEngine::kMaxHeads]) {
   const uint32_t soff = route_.sor * kSorStride;
   const uint32_t loff = soff + (route_.link == 2 ? kSorLinkBStride : 0);
   if (route_.dp && tu_.valid) {
-    r.mask(kGf119DpAudioH + h * 0x800, 0x0000ffff, tu_.hblank_symbols & 0xffff);
-    r.mask(kGf119DpAudioV + h * 0x800, 0x00ffffff, tu_.vblank_symbols & 0xffffff);
+    r.mask((gv100() ? kGv100DpAudioH : kGf119DpAudioH) + h * 0x800, 0x0000ffff, tu_.hblank_symbols & 0xffff);
+    r.mask((gv100() ? kGv100DpAudioV : kGf119DpAudioV) + h * 0x800, 0x00ffffff, tu_.vblank_symbols & 0xffffff);
     r.mask(kSorDpCtrl + loff, kSorDpTuMask, (tu_.tu & 0x7f) << 2);
     r.mask(kSorDpActiveSym + loff, kSorDpActiveSymMask, tu_.vtu_a << 24 | (tu_.vtu_f & 0xf) << 16 | (tu_.vtu_i & 0x7f) << 8);
-    r.mask(kGf119DpWatermark + h * 0x800, 0x0800003f, 0x08000000 | (tu_.watermark & 0x3f));
+    if (gv100()) r.mask(kGv100DpWatermark + h * 0x800, 0x0c00003f, 0x08000000 | (tu_.watermark & 0x3f));
+    else r.mask(kGf119DpWatermark + h * 0x800, 0x0800003f, 0x08000000 | (tu_.watermark & 0x3f));
   }
-  // gf119_sor_clock
+  if (engine_.display_class() == DisplayClass::Ga102) {
+    // ga102_sor_clock: div2 only for TMDS high speed (not done here), through the SOR's clock block at 0x00ec00
+    r.write32(kGa102SorClockUnk + route_.sor * kGa102SorClockStride, 0);
+    r.write32(kGa102SorClockDiv + route_.sor * kGa102SorClockStride, 0);
+    return;
+  }
+  // gf119_sor_clock (also Volta's and Turing's)
   const uint32_t div1 = route_.link == 3 ? 1 : 0, div2 = div1;
   if (route_.protocol == kProtocolTmdsA || route_.protocol == kProtocolTmdsB || route_.protocol == kProtocolDualTmds)
     r.mask(kGf119SorClock + soff, kSorClockSpeedMask, 0x0au << kSorClockSpeedShift);
   r.mask(kGf119SorClock + soff, kSorClockDivMask, div2 << 8 | div1);
 }
 
-// gf119_disp_super, called from the UPDATE's wait: one stage per call.
+// gf119_disp_super / gv100_disp_super, called from the UPDATE's wait: one stage per call.
 void NvModeSetter::poll() {
   if (!active_) return;
   INvRegisters& r = engine_.registers();
-  const uint32_t pending = r.read32(kGf119SuperStatus) & 0x7;
+  const bool v = gv100();
+  const uint32_t pending = r.read32(v ? kGv100SuperStatus : kGf119SuperStatus) & 0x7;
   if (pending == 0) return;
-  r.write32(kGf119SuperStatus, pending);          // as the interrupt handler clears it
+  r.write32(v ? kGv100SuperClear : kGf119SuperStatus, pending);   // as the interrupt handler clears it
+  const uint32_t mask_at = v ? kGv100SuperHeadMask : kGf119SuperHeadMask, mask_stride = v ? 4 : 0x800;
   uint32_t masks[NvDisplayEngine::kMaxHeads] = {};
   for (uint32_t h = 0; h < NvDisplayEngine::kMaxHeads; ++h)
-    if (engine_.head_mask() & (1u << h)) masks[h] = r.read32(kGf119SuperHeadMask + h * 0x800);
+    if (engine_.head_mask() & (1u << h)) masks[h] = r.read32(mask_at + h * mask_stride);
   if (pending & 0x1) {
     stages_ |= 1;     // 1.0: nothing to write
   } else if (pending & 0x2) {
@@ -396,8 +491,8 @@ void NvModeSetter::poll() {
     stages_ |= 4;     // 3.0: the IED "on" scripts (not done)
   }
   for (uint32_t h = 0; h < NvDisplayEngine::kMaxHeads; ++h)
-    if (engine_.head_mask() & (1u << h)) r.write32(kGf119SuperHeadMask + h * 0x800, 0);
-  r.write32(kGf119SuperAck, kSuperAckValue);
+    if (engine_.head_mask() & (1u << h)) r.write32(mask_at + h * mask_stride, 0);
+  r.write32(v ? kGv100SuperAck : kGf119SuperAck, kSuperAckValue);
 }
 
 DisplayStatus NvModeSetter::set_mode(const Request& request) {
@@ -405,17 +500,22 @@ DisplayStatus NvModeSetter::set_mode(const Request& request) {
   vpll_failed_ = false;
   dp_ = DpTrainResult();
   tu_ = DpTransferUnit();
-  if (engine_.display_class() != DisplayClass::Gf119) return DisplayStatus::NotImplemented;
-  if (!engine_.claimed()) {
-    const DisplayStatus s = engine_.claim();
-    if (s != DisplayStatus::Ok) return s;
-  }
+  const DisplayClass cls = engine_.display_class();
+  if (cls != DisplayClass::Gf119 && cls != DisplayClass::Gv100 && cls != DisplayClass::Tu102 && cls != DisplayClass::Ga102)
+    return DisplayStatus::NotImplemented;
   HeadRaster raster;
   if (!compute_head_raster(request.timing, &raster)) return DisplayStatus::BadArgument;
   if (request.depth_bpp != 18 && request.depth_bpp != 24 && request.depth_bpp != 30) return DisplayStatus::BadArgument;
   OutputRoute route;
   if (!route_output(request.output, engine_.sor_mask(), engine_.head_mask(), request.head, request.timing.clock_khz, &route)) return DisplayStatus::NoOutput;
   if (request.edp && route.dp) route.panel = true;
+  if (!engine_.claimed()) {
+    // (Volta+: the core channel and the window channel of the head's first window)
+    const DisplayStatus s = engine_.claim(gv100() ? window_for_head(route.head) : 0);
+    if (s != DisplayStatus::Ok) return s;
+  } else if (gv100() && engine_.claimed_window() != static_cast<int32_t>(window_for_head(route.head))) {
+    return DisplayStatus::NotImplemented;   // (one window channel: another head would need its own)
+  }
   const ScanoutSurface& s = request.surface;
   if (!s.valid() || !s.linear_32bpp() || (s.offset & 0xff) || (s.pitch_bytes & 0xff) || s.pitch_bytes > 0x3ff00 || s.width != request.timing.hdisplay ||
       s.height != request.timing.vdisplay || uint64_t{s.width} * 4 > s.pitch_bytes)
@@ -430,11 +530,12 @@ DisplayStatus NvModeSetter::set_mode(const Request& request) {
     if (!aux_) return DisplayStatus::NoOutput;
     Dpcd::Capabilities caps;
     if (!Dpcd::read_capabilities(*aux_, request.edp, &caps)) return DisplayStatus::LinkTraining;
-    NvSorDp sor(r, route.sor, route.link, drive_, engine_.timeouts());
+    NvSorDp sor(r, route.sor, route.link, drive_, engine_.timeouts(), sor_variant(cls));
     dp_ = train_dp_link(*aux_, sor, caps, request.output, uint64_t{request.timing.clock_khz} * request.depth_bpp / 8);
     if (!dp_.trained) return DisplayStatus::LinkTraining;
     tu_ = compute_dp_transfer_unit(raster, dp_.bandwidth_code, dp_.lanes, caps.enhanced_framing, request.depth_bpp);
   }
+  if (gv100()) return set_mode_gv100(request, raster, route);
   MethodList methods;
   ScanoutSurface surface = s;
   if (surface.context_dma == 0) surface.context_dma = NvDisplayEngine::vram_handle();
@@ -457,11 +558,81 @@ DisplayStatus NvModeSetter::set_mode(const Request& request) {
   return DisplayStatus::Ok;
 }
 
+// Volta+: the core methods through the supervisor first (the head runs, showing the background), then the image on the head's window, then
+// the window's place on the head (its immediate channel). The window is not interlocked with the core: it follows the core's UPDATE.
+DisplayStatus NvModeSetter::set_mode_gv100(const Request& request, const HeadRaster& raster, const OutputRoute& route) {
+  INvRegisters& r = engine_.registers();
+  MethodList methods;
+  if (!gv100_mode_methods(engine_, route.head, raster, route, request.depth_bpp, request.timing.hsync_negative, request.timing.vsync_negative, &methods))
+    return DisplayStatus::BadArgument;
+  ScanoutSurface surface = request.surface;
+  if (surface.context_dma == 0) surface.context_dma = NvDisplayEngine::vram_handle();
+  surface.point_in = 0;
+  surface.size_in = surface.size_out = surface.height << 16 | (surface.width & 0xffff);
+  MethodList window;
+  if (!gv100_window_methods(engine_, surface, &window)) return DisplayStatus::BadArgument;
+  route_ = route;
+  raster_ = raster;
+  depth_ = request.depth_bpp;
+  active_ = true;
+  engine_.set_poller(this);
+  DisplayStatus status = engine_.core_update(methods);
+  engine_.set_poller(nullptr);
+  active_ = false;
+  if (status != DisplayStatus::Ok) return status;
+  if (vpll_failed_) return DisplayStatus::NotLatched;
+  const uint32_t h = route.head * mc37d::kHeadStride;
+  if (r.read32(kGv100Armed + mc37d::kHeadRasterSize + h) != raster.raster_size() ||
+      r.read32(kGv100Armed + mc37d::kHeadPixelClock + h) != raster.clock_khz * 1000)
+    return DisplayStatus::NotLatched;
+  status = engine_.window_update(window);
+  if (status != DisplayStatus::Ok) return status;
+  MethodList point;
+  if (!point.add(mc37b::kPointOut, 0)) return DisplayStatus::BadArgument;
+  status = engine_.window_immediate_update(point);
+  if (status != DisplayStatus::Ok) return status;
+  const uint32_t w = window_for_head(route.head) * kWindowUserStride;
+  if (r.read32(kGv100WindowArmed + w + mc37e::kIso) != surface.context_dma ||
+      r.read32(kGv100WindowArmed + w + mc37e::kOffset) != static_cast<uint32_t>(surface.offset >> 8) ||
+      r.read32(kGv100WindowArmed + w + mc37e::kSize) != surface.size_in)
+    return DisplayStatus::NotLatched;
+  return DisplayStatus::Ok;
+}
+
+// Volta+: the image taken off the window (wndwc37e_image_clr: no ISO context DMA), then the SOR let go through the supervisor.
+DisplayStatus NvModeSetter::disable_gv100(uint32_t head, uint32_t sor) {
+  INvRegisters& r = engine_.registers();
+  const int32_t window = engine_.claimed_window();
+  if (window >= 0) {
+    MethodList clear;
+    if (!clear.add(mc37e::kPresentControl, 0) || !clear.add(mc37e::kIso, 0)) return DisplayStatus::BadArgument;
+    const DisplayStatus s = engine_.window_update(clear);
+    if (s != DisplayStatus::Ok) return s;
+  }
+  MethodList methods;
+  if (!methods.add(mc37d::kSorControl + sor * mc37d::kSorStride, 0)) return DisplayStatus::BadArgument;
+  (void)head;
+  disabling_ = true;
+  active_ = true;
+  engine_.set_poller(this);
+  const DisplayStatus status = engine_.core_update(methods);
+  engine_.set_poller(nullptr);
+  active_ = false;
+  disabling_ = false;
+  if (status != DisplayStatus::Ok) return status;
+  if (r.read32(kGv100Armed + mc37d::kSorControl + sor * mc37d::kSorStride) != 0) return DisplayStatus::NotLatched;
+  if (window >= 0 && r.read32(kGv100WindowArmed + static_cast<uint32_t>(window) * kWindowUserStride + mc37e::kIso) != 0) return DisplayStatus::NotLatched;
+  return DisplayStatus::Ok;
+}
+
 DisplayStatus NvModeSetter::disable(uint32_t head, uint32_t sor) {
   stages_ = 0;
-  if (engine_.display_class() != DisplayClass::Gf119) return DisplayStatus::NotImplemented;
+  const DisplayClass cls = engine_.display_class();
+  if (cls != DisplayClass::Gf119 && cls != DisplayClass::Gv100 && cls != DisplayClass::Tu102 && cls != DisplayClass::Ga102)
+    return DisplayStatus::NotImplemented;
   if (!engine_.claimed()) return DisplayStatus::NotClaimed;
   if (head >= NvDisplayEngine::kMaxHeads || !(engine_.head_mask() & (1u << head)) || sor >= NvDisplayEngine::kMaxSors) return DisplayStatus::BadArgument;
+  if (gv100()) return disable_gv100(head, sor);
   MethodList methods;
   if (!methods.add(m907d::kSorControl + sor * m907d::kSorStride, 0) || !methods.add(m907d::kHeadIso + head * m907d::kHeadStride, 0))
     return DisplayStatus::BadArgument;

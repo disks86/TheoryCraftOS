@@ -563,6 +563,7 @@ add_executable(BOOTX64
   src/Hardware/GraphicsProcessingUnit/Multi/GpuTopology.cpp
   src/Hardware/GraphicsProcessingUnit/Multi/GpuPowerPolicy.cpp
   src/Hardware/GraphicsProcessingUnit/Multi/GpuManager.cpp
+  src/Hardware/GraphicsProcessingUnit/Multi/GpuHotplug.cpp
   src/Hardware/GraphicsProcessingUnit/Multi/Acpi/AmdAtpx.cpp
   src/Hardware/GraphicsProcessingUnit/Multi/Acpi/GpuAcpiNamespace.cpp
   src/Hardware/GraphicsProcessingUnit/Multi/Acpi/GpuAcpiPower.cpp
@@ -607,6 +608,7 @@ add_executable(BOOTX64
   src/Hardware/GraphicsProcessingUnit/AMD/AmdDcn1.cpp
   src/Hardware/GraphicsProcessingUnit/AMD/AmdScanout.cpp
   src/Hardware/GraphicsProcessingUnit/AMD/AmdSecondaryGpu.cpp
+  src/Hardware/GraphicsProcessingUnit/AMD/AmdDce12.cpp
   src/Hardware/GraphicsProcessingUnit/NVIDIA/NvidiaGpuGenerations.cpp
   src/Hardware/GraphicsProcessingUnit/NVIDIA/NvidiaGpu.cpp
   src/Hardware/GraphicsProcessingUnit/NVIDIA/NvidiaSecondaryGpu.cpp
@@ -637,6 +639,9 @@ add_executable(BOOTX64
   src/Hardware/GraphicsProcessingUnit/Intel/IntelGpuProbe.cpp
   src/Hardware/GraphicsProcessingUnit/Intel/IntelGpu.cpp
   src/Hardware/GraphicsProcessingUnit/Intel/IntelDisplay.cpp
+  src/Hardware/GraphicsProcessingUnit/Intel/IntelSecondaryGpu.cpp
+  src/Hardware/GraphicsProcessingUnit/Intel/IntelDg2Display.cpp
+  src/Hardware/GraphicsProcessingUnit/Intel/IntelSnpsPhy.cpp
   src/Hardware/GraphicsProcessingUnit/Intel/IntelScanout.cpp
   src/Hardware/GraphicsProcessingUnit/Intel/IntelGtt.cpp
   src/Hardware/GraphicsProcessingUnit/Intel/IntelLrc.cpp
@@ -1640,6 +1645,10 @@ endif()
 option(TCOS_NVIDIA_NATIVE "NVIDIA (Tesla to Turing): take the display over from the firmware - the firmware's mode stays, the screen shows a framebuffer of the OS's own in VRAM (Nvkm/NvDisplay). The read-only parts (chip, VRAM size, temperature) run without it. Not yet run on a real card" OFF)
 if(TCOS_NVIDIA_NATIVE)
   target_compile_definitions(BOOTX64 PRIVATE TCOS_NVIDIA_NATIVE)
+endif()
+option(TCOS_INTEL_DGPU_NATIVE "Intel Arc Alchemist (DG2, display version 13) that is not the boot display: power wells, CDCLK, the SNPS PHY's MPLLB, DDI, transcoder, pipe and plane programmed from scratch, the surface in local memory behind GGTT entries, DP link training or HDMI (IntelSecondaryGpu). DG1 and Battlemage are refused. The read-only probe (chip, VRAM size, temperature) runs without it. Not yet run on a real card" OFF)
+if(TCOS_INTEL_DGPU_NATIVE)
+  target_compile_definitions(BOOTX64 PRIVATE TCOS_INTEL_DGPU_NATIVE)
 endif()
 # A program on the primary disk to start once the desktop is up (an OS path such as "/Windows/Program Files/Chromium/chrome.exe"), with its arguments (a ;-separated list):
 # what it prints goes to the debug console. For trying a big program in QEMU without driving the desktop (see scripts/run-program.sh).

@@ -632,6 +632,151 @@ static void ui_guide_settings() {
   }
   CHECK(a.live == 0);
 
+  // --- Display Settings, Graphics (9.3, 11.2, 11.8, 4, 1.5): on a laptop with a display switch the built-in screen's GPU is shown and the other
+  // one offered by a button with an access key; the switch is confirmed first with Cancel as the default (the screen goes dark for a moment),
+  // drawing stops while it runs, the line under the button says how it went, a failure is an error notice that says what happened, why and
+  // where the screen is; the button is unavailable, with the reason shown, when the switch cannot be made (and while new settings wait).
+  {
+    struct FakeSwitch final : hardware::IBuiltInScreenSwitch {
+      hardware::GpuMuxTarget at = hardware::GpuMuxTarget::Integrated;
+      bool can = true, ok = true, back_ok = true, known = true;
+      const char* why = "the discrete GPU would not wake";
+      int switches = 0;
+      std::vector<hardware::GpuMuxTarget> asked;
+      bool active(hardware::GpuMuxTarget* out) const override { if (known) *out = at; return known; }
+      const char* gpu_name(hardware::GpuMuxTarget side) const override { return side == hardware::GpuMuxTarget::Discrete ? "GeForce GTX 1650" : "UHD Graphics 630"; }
+      bool can_switch_to(hardware::GpuMuxTarget, const char** out) const override { if (!can && out) *out = why; return can; }
+      Result switch_to(hardware::GpuMuxTarget side) override {
+        asked.push_back(side);
+        Result r;
+        if (!ok && asked.size() == 1) {
+          r.reason = "that GPU would not wake";
+          r.rolled_back = back_ok;
+          return r;
+        }
+        at = side;
+        ++switches;
+        r.ok = true;
+        return r;
+      }
+    };
+    struct Pauses {
+      std::vector<bool> calls;
+      static void fn(void* self, bool stop) { static_cast<Pauses*>(self)->calls.push_back(stop); }
+    };
+    struct Applier {
+      int calls = 0, fail_first = 0;
+      static bool fn(void* self) { auto* a = static_cast<Applier*>(self); ++a->calls; return a->calls > a->fail_first; }
+    };
+    fakemon::FakeSource source;
+    source.add("eDP-1", fakemon::small_edid(), true, hardware::ConnectorType::Internal);
+    fakemon::FakeGpu gpu;
+    gpu.source = &source;
+    hardware::SystemMonitors monitors(&gpu, a);
+    monitors.initialize();
+    CHECK(monitors.apply());
+    Screen screen(a, 900, 760);
+    Theme theme;
+    Window w(a, screen.renderer, theme, {900, 760});
+    WindowManager mgr(a);
+    mgr.set_dock(DockStyle::Fill);
+    w.add(&mgr);
+    w.layout();
+    MessageDialog confirm(a);
+    NoticeDialog notices(a);
+    FakeSwitch sw;
+    Pauses pauses;
+    Applier applier;
+    desktop::DisplaySettings ds(a);
+    ds.set_monitors(&monitors);
+    ds.set_confirm_dialog(&confirm);
+    ds.set_notice_dialog(&notices);
+    ds.set_pauser(&Pauses::fn, &pauses);
+    ds.set_applier(&Applier::fn, &applier);
+    CHECK(!ds.graphics_shown());      // (no display switch: no group)
+    const uint32_t plain_height = ds.bounds().height;
+    ds.set_graphics_switch(&sw);
+    CHECK(mgr.add_window(&ds));
+    w.layout();
+    CHECK(ds.graphics_shown() && ds.bounds().height > plain_height);
+    CHECK(ds.graphics_line().text().equals("The built-in screen is driven by UHD Graphics 630 (the integrated GPU)."));
+    CHECK(ds.graphics_button().text().equals("Use GeForce GTX 1650 for the Built-in Screen") && ds.graphics_button().enabled() && !ds.graphics_button().is_default());
+    CHECK(ds.graphics_note().text().equals("The built-in screen goes dark for a moment while it switches."));
+    // Its access key: Alt+letter asks first. Cancel is the default and has the focus, so Enter and Escape change nothing.
+    ds.assign_access_keys();
+    const char key_letter = AccessKeys::key_of(ds.graphics_button().access_label(0), ds.graphics_button().access_index(0));
+    CHECK(key_letter != 0);
+    alt(w, key_letter);
+    CHECK(confirm.showing() && confirm.default_choice() == MessageDialog::Choice::Decline && w.focus() == &confirm.decline_button() &&
+          confirm.accept_button().text().equals("Switch") && confirm.decline_button().text().equals("Cancel") && !confirm.alternate_button().visible());
+    press(w, key::kEnter);
+    CHECK(!confirm.showing() && sw.asked.empty() && pauses.calls.empty() && applier.calls == 0);
+    // With a single click (the button), then Switch: drawing stops, the panel moves, the monitors are made real, drawing goes on.
+    click_center(w, ds.graphics_button());
+    CHECK(confirm.showing());
+    click_center(w, confirm.accept_button());
+    CHECK(!confirm.showing() && sw.switches == 1 && sw.asked.size() == 1 && sw.asked[0] == hardware::GpuMuxTarget::Discrete && applier.calls == 1);
+    CHECK(pauses.calls.size() == 2 && pauses.calls[0] && !pauses.calls[1] && !notices.showing());
+    CHECK(ds.graphics_line().text().equals("The built-in screen is driven by GeForce GTX 1650 (the discrete GPU)."));
+    CHECK(ds.graphics_button().text().equals("Use UHD Graphics 630 for the Built-in Screen") && ds.graphics_button().enabled());
+    CHECK(ds.graphics_note().text().equals("The built-in screen is now driven by GeForce GTX 1650."));
+    // From the keyboard alone: Space on the focused button, then Alt+S (Switch) - and back it goes.
+    w.set_focus(&ds.graphics_button());
+    press(w, key::kSpace);
+    CHECK(confirm.showing());
+    alt(w, 's');
+    CHECK(!confirm.showing() && sw.at == hardware::GpuMuxTarget::Integrated && sw.switches == 2);
+    // A switch that fails (undone by the switcher): an error notice says what happened, why and where the screen is; the line says so too.
+    sw.ok = false;
+    sw.asked.clear();
+    CHECK(ds.switch_graphics() == false && sw.at == hardware::GpuMuxTarget::Integrated);
+    CHECK(notices.showing() && notices.kind() == NoticeKind::Error && notices.title().equals("Display Settings"));
+    CHECK(notices.message().equals("The built-in screen could not be switched to GeForce GTX 1650 because that GPU would not wake. It stays on UHD Graphics 630."));
+    CHECK(ds.graphics_note().text().equals(notices.message()));
+    press(w, key::kEnter);
+    CHECK(!notices.showing());
+    // ... one that could not be undone either: the notice says the screen may stay dark.
+    sw.asked.clear();
+    sw.back_ok = false;
+    CHECK(!ds.switch_graphics() && notices.showing() && strstr(std::string(notices.message().data(), notices.message().size()).c_str(), "If it stays dark, restart the computer."));
+    press(w, key::kEnter);
+    // The desktop cannot be shown on the new GPU (the applier fails): the panel is switched back and the user is told.
+    sw.ok = true;
+    sw.back_ok = true;
+    sw.asked.clear();
+    applier.calls = 0;
+    applier.fail_first = 1;
+    CHECK(!ds.switch_graphics() && sw.asked.size() == 2 && sw.asked[1] == hardware::GpuMuxTarget::Integrated && sw.at == hardware::GpuMuxTarget::Integrated && applier.calls == 2);
+    CHECK(notices.showing() && strstr(std::string(notices.message().data(), notices.message().size()).c_str(), "the desktop could not be shown on it"));
+    press(w, key::kEnter);
+    applier.fail_first = 0;
+    // Unavailable, not failing: the reason is shown, and the button does nothing.
+    sw.can = false;
+    ds.refresh();
+    CHECK(!ds.graphics_button().enabled() && ds.graphics_note().text().equals("Not available because the discrete GPU would not wake."));
+    sw.asked.clear();
+    CHECK(!ds.ask_switch_graphics() && !confirm.showing() && sw.asked.empty());
+    sw.can = true;
+    sw.known = false;
+    ds.refresh();
+    CHECK(!ds.graphics_button().enabled() && ds.graphics_line().text().equals("Which GPU drives the built-in screen is not known."));
+    sw.known = true;
+    ds.refresh();
+    CHECK(ds.graphics_button().enabled());
+    // While new display settings wait for Keep or Revert, the switch waits too.
+    alt(w, 'r');
+    press(w, ds.resolution_list().selected_index() == 0 ? key::kDown : key::kUp);
+    if (ds.pending()) {
+      alt(w, 'a');
+      CHECK(ds.asking() && !ds.graphics_button().enabled());
+      press(w, key::kEscape);
+      CHECK(!ds.asking() && ds.graphics_button().enabled());
+    }
+    ds.cancel();
+    CHECK(!ds.manager());
+  }
+  CHECK(a.live == 0);
+
   // --- Computer Manager (8): the menus in the standard order with access keys, Help ending in About; every command of the context menus is
   // also in the Device menu and unavailable where it does not apply; Alt+Enter is Properties; the context menus end in Properties.
   {

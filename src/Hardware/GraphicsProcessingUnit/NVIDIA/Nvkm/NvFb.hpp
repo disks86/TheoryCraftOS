@@ -75,6 +75,10 @@ struct VramProbe {
 // Reads the VRAM size, type and reserved regions for `chip` (registers in NvFb.cpp's table). `bios_type` is the memory type the VBIOS
 // strap/ramcfg gives (nouveau's nvkm_fb_bios_memtype), Unknown when it was not read.
 [[nodiscard]] VramProbe probe_vram(INvRegisters& regs, const Chip& chip, RamType bios_type = RamType::Unknown);
+// probe_vram for a driver of the display alone (NvidiaSecondaryGpu): the same, except that GA102..GA107, whose display nouveau drives without
+// GSP, get their size (0x1183a4, as ga102_ram_new) and reserved regions with FbError::None instead of NeedsGsp. The VRAM is then this
+// driver's only for the display's objects; nothing else of the chip is run.
+[[nodiscard]] VramProbe probe_vram_display(INvRegisters& regs, const Chip& chip, RamType bios_type = RamType::Unknown);
 
 // The frame buffer's MMU setup that has to happen before the first page table is used (gf100_fb_init / gm200_fb_init): the big page
 // size (Fermi..Maxwell: 16 or 17; Pascal on says it per page directory) and the system-memory flush page (`sysmem_flush_page`, a bus

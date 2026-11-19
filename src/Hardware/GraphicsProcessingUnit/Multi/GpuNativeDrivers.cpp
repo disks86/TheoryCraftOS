@@ -21,6 +21,7 @@
 #include <new>
 #include "Hardware/GraphicsProcessingUnit/AMD/AmdSecondaryGpu.hpp"
 #include "Hardware/GraphicsProcessingUnit/GpuContext.hpp"
+#include "Hardware/GraphicsProcessingUnit/Intel/IntelSecondaryGpu.hpp"
 #include "Hardware/GraphicsProcessingUnit/Multi/GpuPool.hpp"
 #include "Hardware/GraphicsProcessingUnit/NVIDIA/NvidiaSecondaryGpu.hpp"
 #include "Hardware/GraphicsProcessingUnit/QEMU/QemuStdVgaGpu.hpp"
@@ -91,6 +92,10 @@ const DriverRow kDrivers[] = {
     // A non-boot AMD Polaris / Vega M GPU (DCE 11.2): POST, apertures and a mode set from scratch (only with TCOS_AMD_NATIVE; otherwise it fails and the probe takes over).
     {[](const PciDeviceInfo& d) { return AmdSecondaryGpu::supports(d); },
      [](GpuNode& n, const GpuContext& c, allocators::IAllocator& a) { return build_driver<AmdSecondaryGpu>(n, c, a) != nullptr; }},
+    // A non-boot discrete Intel GPU: Arc Alchemist (DG2) display from scratch (only with TCOS_INTEL_DGPU_NATIVE; DG1 and Battlemage are refused, and
+    // without the flag it fails too, so the probe takes over).
+    {[](const PciDeviceInfo& d) { return IntelSecondaryGpu::supports(d); },
+     [](GpuNode& n, const GpuContext& c, allocators::IAllocator& a) { return build_driver<IntelSecondaryGpu>(n, c, a) != nullptr; }},
 };
 }  // namespace
 

@@ -78,7 +78,9 @@ class AtomConnectors {
   static uint32_t name(const Connector& connector, ArrayView<char> buffer);
 
   // Reads the connectors of the video BIOS image into `out` (at most out.size(), and kMaxConnectors are looked for) and returns how many. 0 if the image is no AtomBIOS image, has no
-  // object table, or the table is older than revision 2.
+  // object table, or the table is older than revision 2. An ATOM firmware image (Vega: display_object_info_table_v1_4, read as bios_parser2.c does) has one path per connector with
+  // its records (I2C, HPD) and its GPU encoder and bridge; the hot plug pin comes from the 8-byte entries of gpio_pin_lut v2.1 (the DCE 12 DC_GPIO_HPD_A bits). Table 1.5 (Navi) is
+  // not read (0).
   static uint32_t parse(ConstByteView bios, ArrayView<Connector> out);
 
   // The connector on a hot plug pin, or null.

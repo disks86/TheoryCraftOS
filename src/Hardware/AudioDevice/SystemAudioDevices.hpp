@@ -82,6 +82,10 @@ class SystemAudioDevices {
   // idle policy is turned on (after `idle_ms` without sound; see IntelHdaAudioDevice::set_power_observer). Null detaches it. False if no
   // HD-audio controller of this list sits on that function. The observer must stay valid until it is detached or the devices are shut down.
   [[nodiscard]] bool attach_power_observer(PciAddress function, IPciFunctionPowerObserver* observer, uint32_t idle_ms = 5000);
+  // A display came or went on the GPU whose HD-audio controller sits on PCI function `function` (Multi/GpuHotplug): that controller reads its
+  // pins and ELD again (IntelHdaAudioDevice::connections_changed; a suspended one is resumed for it, which may wait for the GPU to wake). False
+  // if no HD-audio controller of this list is on that function, or it could not re-read them.
+  [[nodiscard]] bool connections_changed(PciAddress function);
 
  private:
   struct Entry {
@@ -92,6 +96,8 @@ class SystemAudioDevices {
   };
 
   void adopt(SharedPointer<IAudioDevice> device, bool hardware, bool report, IntelHdaAudioDevice* hda = nullptr);
+  // The HD-audio controller on `function` (and the pointer that keeps it alive), or null.
+  IntelHdaAudioDevice* find_hda(PciAddress function, SharedPointer<IAudioDevice>* keep) const;
   bool has_output() const;       // (locked by the caller)
   void add_fallback(bool report);
   void sweep_removed();

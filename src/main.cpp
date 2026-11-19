@@ -70,6 +70,7 @@
 #include "Hardware/GraphicsProcessingUnit/Multi/Acpi/GpuAcpiPower.hpp"
 #include "Hardware/GraphicsProcessingUnit/Multi/AppleGmux.hpp"
 #include "Hardware/GraphicsProcessingUnit/Multi/GpuMuxSwitch.hpp"
+#include "Hardware/GraphicsProcessingUnit/Multi/GpuHotplug.hpp"
 #include "Hardware/GraphicsProcessingUnit/Multi/PcieLink.hpp"
 #include "Hardware/GraphicsProcessingUnit/SystemGpu.hpp"
 #include "Hardware/Monitor/Edid.hpp"
@@ -823,7 +824,9 @@ static efi::Status kernel_main(efi::Handle image, efi::SystemTable* st) {
     monitors.set_display_gpu_index(display_gpu >= 0 ? static_cast<uint32_t>(display_gpu) : 0);
     for (uint32_t i = 0; i < gpu_pool.count(); ++i) {
       hardware::IGraphicsProcessingUnit* other = gpu_pool.node(i)->gpu;
-      if (static_cast<int32_t>(i) != display_gpu && other && other != gpu && other->width() && other->height() && !monitors.add_gpu(other, i))
+      // (a GPU with nothing lit yet that can drive the built-in panel is spanned too: its monitor appears when the display switch moves the panel)
+      const bool waits_for_panel = gpu_pool.node(i)->panel && gpu_pool.node(i)->panel->has_panel_output();
+      if (static_cast<int32_t>(i) != display_gpu && other && other != gpu && ((other->width() && other->height()) || waits_for_panel) && !monitors.add_gpu(other, i))
         Entry(Level::Warning, "Monitor").text("too many GPUs; the monitors of ").text(other->name()).text(" are not used");
     }
     monitors.initialize();
@@ -2975,12 +2978,15 @@ static efi::Status kernel_main(efi::Handle image, efi::SystemTable* st) {
     hardware::X86GmuxPorts gmux_ports;
     UniquePointer<hardware::AppleGmux> gmux;
     UniquePointer<hardware::IGpuPlatformPower> gpu_platform_power[hardware::GpuTopology::kMaxAdapters];
-    // The display mux (vga_switcheroo's switch): found and kept here, switched only on request (GpuMuxSwitch::published(), for a display
-    // settings page). The integrated GPU's side is the firmware's framebuffer: the panel can go to the discrete GPU, not come back.
+    // The display mux (vga_switcheroo's switch): found and kept here, switched only on request (Display Settings' Graphics group, through
+    // GpuMuxDesktop, which moves the panel's monitor along; GpuMuxSwitch::published() for others). The integrated GPU's side is the Intel driver's
+    // eDP panel where native mode setting runs (it can light the panel again), else the firmware's framebuffer: the panel can go to the discrete
+    // GPU, not come back.
     UniquePointer<hardware::IGpuMux> gpu_acpi_mux;
     hardware::GpuManagerLeases gpu_mux_leases(gpu_pool.manager());
     hardware::GopPanelOutput integrated_panel;
     UniquePointer<hardware::GpuMuxSwitch> gpu_mux_switch;
+    UniquePointer<hardware::GpuMuxDesktop> gpu_mux_desktop;
     if (acpi_events && gpu_pool.manager().is_hybrid()) {
       acpi::AmlInterpreter& aml = acpi_events->interpreter();
       if (acpi::Node* gmux_device = hardware::AppleGmux::find_device(aml)) {
@@ -3028,10 +3034,19 @@ static efi::Status kernel_main(efi::Handle image, efi::SystemTable* st) {
         gpu_mux_switch = UniquePointer<hardware::GpuMuxSwitch>::make(shared_allocator, *mux, &gpu_mux_leases, integrated, mux_discrete,
                                                                      on_integrated ? hardware::GpuMuxTarget::Integrated : hardware::GpuMuxTarget::Discrete);
         if (gpu_mux_switch) {
-          if (on_integrated) gpu_mux_switch->attach_output(hardware::GpuMuxTarget::Integrated, &integrated_panel);
+          hardware::IPanelOutput* integrated_output = &integrated_panel;
+          if (hardware::IntelGpu* intel = on_integrated ? system_gpu.intel_gpu() : nullptr; intel && intel->panel_output()) {
+            intel->set_panel_delay([](uint32_t us) { kernel::sleep_us(us); });
+            integrated_output = intel->panel_output();      // (native mode setting: the eDP panel can be lit again)
+          }
+          if (on_integrated) gpu_mux_switch->attach_output(hardware::GpuMuxTarget::Integrated, integrated_output);
           hardware::IPanelOutput* discrete_panel = gpu_pool.node(static_cast<uint32_t>(mux_discrete))->panel;
           gpu_mux_switch->attach_output(hardware::GpuMuxTarget::Discrete, discrete_panel);
           hardware::GpuMuxSwitch::publish(gpu_mux_switch.get());
+          gpu_mux_desktop = UniquePointer<hardware::GpuMuxDesktop>::make(shared_allocator, *gpu_mux_switch, monitors, on_integrated ? gpu : nullptr,
+                                                                        gpu_pool.node(static_cast<uint32_t>(mux_discrete))->gpu);
+          desktop.set_graphics_switch(gpu_mux_desktop.get());
+          if (integrated_output != &integrated_panel) Entry(Level::Info, "GPU").text("display switch: the integrated GPU drives the built-in panel natively (it can take it back)");
           const char* why = "";
           const bool can = gpu_mux_switch->can_switch_to(hardware::GpuMuxTarget::Discrete, &why);
           Entry(Level::Info, "GPU").text("display switch: ").text(mux_kind).text(", the panel on the ")
@@ -3041,6 +3056,51 @@ static efi::Status kernel_main(efi::Handle image, efi::SystemTable* st) {
       }
     }
 #endif
+    // --- GPU hot plug (Multi/GpuHotplug): monitors plugged into a sleeping discrete GPU, whose own hot-plug detection is dark. The firmware's
+    // notifications on the GPU, its outputs, its root port (their _PRW wake event armed) or the integrated GPU's ACPI video are checked from the
+    // loop (a lease wakes the GPU, its probe reads the connectors); polling is available but off (GpuOutputPollPolicy). A change has the GPU's
+    // HD audio read its pins and ELD again, and the desktop look for monitors.
+    hardware::GpuHotplug gpu_hotplug(gpu_pool);
+    struct GpuOutputSink final : hardware::IGpuOutputListener {
+      hardware::GpuPool* pool = nullptr;
+      hardware::SystemAudioDevices* audio = nullptr;
+      uint32_t changed = 0;   // a bit per GPU, taken by the loop (atomic)
+      void outputs_changed(uint32_t index) override {
+        for (uint32_t k = 0; k < pool->manager().companion_count(index); ++k) (void)audio->connections_changed(pool->manager().companion(index, k));
+        __atomic_fetch_or(&changed, 1u << index, __ATOMIC_ACQ_REL);
+      }
+    } gpu_output_sink;
+    gpu_output_sink.pool = &gpu_pool;
+    gpu_output_sink.audio = &audio;
+    if (gpu_pool.manager().is_hybrid()) {
+      uint32_t watched = 0, acpi_nodes = 0;
+      for (uint32_t i = 0; i < gpu_pool.count(); ++i) {
+        const hardware::GpuAdapter& a = gpu_pool.manager().topology().adapter(i);
+        if (a.kind != hardware::GpuKind::Discrete || static_cast<int32_t>(i) == gpu_pool.manager().display_index() || !gpu_hotplug.watch(i)) continue;
+        ++watched;
+#ifdef TCOS_ACPI_EVENTS
+        if (acpi_events) {
+          hardware::PciAddress bridge;
+          const Optional<hardware::PciAddress> bridge_hint = hardware::pci_find_upstream_bridge(pci, a.device.address, &bridge) ? Optional<hardware::PciAddress>(bridge) : Optional<hardware::PciAddress>();
+          const hardware::GpuAcpiNodes nodes = gpu_hotplug.watch_acpi(i, acpi_events->interpreter(), a.device.address, bridge_hint);
+          if (nodes.device) { ++acpi_nodes; (void)acpi_events->enable_wake(nodes.device); }
+          if (nodes.bridge) { ++acpi_nodes; (void)acpi_events->enable_wake(nodes.bridge); }
+          const int32_t igpu = gpu_pool.manager().topology().find_first(hardware::GpuKind::Integrated);
+          if (igpu >= 0)
+            if (acpi::Node* video = acpi_events->find_pci_device(pci, gpu_pool.manager().topology().adapter(static_cast<uint32_t>(igpu)).device.address))
+              (void)gpu_hotplug.watch_node(i, video, hardware::GpuAcpiRole::OtherAdapter);
+        }
+#endif
+      }
+      if (watched) {
+        (void)gpu_hotplug.add_listener(&gpu_output_sink);
+#ifdef TCOS_ACPI_EVENTS
+        if (acpi_events && acpi_nodes && !acpi_events->add_listener(&gpu_hotplug)) acpi_nodes = 0;
+#endif
+        Entry(Level::Info, "GPU").text("hot plug on the discrete GPU: ").text(acpi_nodes ? "ACPI notifications" : "no ACPI notifications (the tables name no GPU device)")
+            .text(", polling off");
+      }
+    }
 #ifdef TCOS_ACPI_EVENTS
     // USB-C connectors through UCSI (the PNP0CA0 / USBC000 device): its own thread starts the policy manager and follows the changes the firmware
     // notifies (or that it finds by looking); the computer manager's hardware list shows the connectors.
@@ -3260,6 +3320,19 @@ static efi::Status kernel_main(efi::Handle image, efi::SystemTable* st) {
           gpu_service_ms = now_ms;
           (void)gpu_pool.manager().service(now_ms);
         }
+        // Monitors plugged into a sleeping GPU: what the firmware reported (and polls, when on) is checked; a change is shown.
+        (void)gpu_hotplug.service(now_ms);
+        const uint32_t outputs_changed = __atomic_exchange_n(&gpu_output_sink.changed, 0u, __ATOMIC_ACQ_REL);
+        if (outputs_changed) {
+          if (monitors.poll()) desktop.apply_monitor_changes();
+          for (uint32_t i = 0; i < gpu_pool.count(); ++i) {
+            if (!(outputs_changed & (1u << i)) || gpu_pool.node(i)->gpu || !gpu_pool.node(i)->probe) continue;
+            const uint32_t connected = gpu_pool.probe_connected_outputs(i);
+            Entry(Level::Info, "GPU").text(gpu_pool.node(i)->probe->name()).text(": ").dec(connected).text(" monitor(s) on its own outputs");
+            if (connected) desktop.notify(StringView("Display"), StringView("A monitor is connected to a port of the discrete GPU; this system cannot show a picture on it yet"),
+                                          gui::NoticeKind::Information);
+          }
+        }
       }
 #ifdef TCOS_POWER
       {
@@ -3434,6 +3507,9 @@ static efi::Status kernel_main(efi::Handle image, efi::SystemTable* st) {
     Entry(Level::Info, "Shutdown").text("input service stopped");
     desktop.stop();  // before anything else draws on the screen: the render thread is the renderer's only user
     Entry(Level::Info, "Shutdown").text("desktop threads stopped");
+#ifdef TCOS_ACPI_EVENTS
+    desktop.set_graphics_switch(nullptr);   // (the switch goes before the desktop)
+#endif
     });
   } else {
     console::puts("No desktop (no graphics display). Press any key to shut down.\n");

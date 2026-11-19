@@ -42,7 +42,7 @@ namespace {
 // NV50        0x100c80 = engine << 16 | 1, wait for bit 0 to clear; engine 0 GR, 6 BAR (nv50_vmm_flush)                                unsure (engine ids)
 // GF100..GV100 wait 0x100c80 & 0x00ff0000 (free slots), 0x100cb8 = (PD >> 12) << 4 | target, (GP100+: 0x100cec = upper 32 bits),
 //             0x100cbc = 0x80000000 | type, wait 0x100c80 & 0x00008000. type: 1 PAGE_ALL, 4 HUB_ONLY, GP100+ (5 - depth) << 24     fairly sure
-// TU102       0xb830a0 = PD >> 8, 0xb830a4 = upper bits, 0x100e68 = 0, 0xb830b0 = 0x80000000 | type, wait bit 31 to clear           fairly sure
+// TU102, GA10x 0xb830a0 = PD >> 8, 0xb830a4 = upper bits, 0x100e68 = 0, 0xb830b0 = 0x80000000 | type, wait bit 31 to clear           fairly sure
 constexpr uint32_t kNv50Flush = 0x100c80;
 constexpr uint32_t kGfMmuCtrl = 0x100c80, kGfPdb = 0x100cb8, kGfTrigger = 0x100cbc, kGpPdbHi = 0x100cec;
 constexpr uint32_t kTuPdbLo = 0xb830a0, kTuPdbHi = 0xb830a4, kTuUnknown = 0x100e68, kTuTrigger = 0xb830b0;
@@ -85,7 +85,8 @@ VmmLayout vmm_layout(const Chip& chip, uint32_t big_page_shift) {
       l.pdb_big_64k = big == 16 && chip.family == Family::Maxwell && chip.chipset >= 0x120;
       break;
     }
-    case Family::Pascal: case Family::Volta: case Family::Turing:
+    // GA10x: nouveau's ga100_vmm is the GP100 ("v2") format with gv100's join (subcontexts) and tu102's flush; Hopper's v3 is not done.
+    case Family::Pascal: case Family::Volta: case Family::Turing: case Family::Ampere:
       l.format = VmmFormat::Gp100;
       l.va_bits = 49;
       l.big_shift = 16;
@@ -187,7 +188,7 @@ bool NvTlb::invalidate(const GpuMemory& root, bool hub_only) {
       regs_.write32(kGfTrigger, 0x80000000u | type);
       return poll(kGfMmuCtrl, 0x00008000, 0, false);
     }
-    case Family::Turing: {
+    case Family::Turing: case Family::Ampere: {   // (ga100_vmm.flush = tu102_vmm_flush)
       const uint64_t addr = root.gpu_address >> 8;
       regs_.write32(kTuPdbLo, static_cast<uint32_t>(addr));
       regs_.write32(kTuPdbHi, static_cast<uint32_t>(addr >> 32));

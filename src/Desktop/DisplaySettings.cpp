@@ -77,6 +77,13 @@ DisplaySettings::DisplaySettings(allocators::IAllocator& allocator)
       gap_a_(allocator),
       gap_b_(allocator),
       gap_c_(allocator),
+      graphics_(allocator),
+      graphics_row_(allocator),
+      graphics_heading_(allocator),
+      graphics_line_(allocator),
+      graphics_note_(allocator),
+      graphics_button_(allocator),
+      graphics_result_(allocator),
       map_menu_(allocator),
       info_{Label(allocator), Label(allocator), Label(allocator), Label(allocator), Label(allocator)},
       resolution_label_(allocator),
@@ -91,7 +98,7 @@ DisplaySettings::DisplaySettings(allocators::IAllocator& allocator)
       cancel_button_(allocator),
       apply_button_(allocator) {
   set_title("Display Settings");
-  set_bounds({110, 40, 600, 500});
+  set_bounds({110, 40, 600, kHeight});
   set_padding(Insets::all(8));
   set_minimize_enabled(false);     // a secondary frame: no Minimize or Maximize
   set_maximize_enabled(false);
@@ -167,12 +174,33 @@ DisplaySettings::DisplaySettings(allocators::IAllocator& allocator)
   settings_.add(&refresh_row_);
   settings_.add(&scale_row_);
 
+  // Graphics (only with a display switch): which GPU drives the built-in screen, the button for the other one, and a line on what it can do or did.
+  graphics_.set_style(PanelStyle::Transparent);
+  graphics_.set_size(0, kGraphicsHeight);
+  graphics_.set_padding({0, 6, 0, 0});
+  graphics_.set_visible(false);
+  graphics_heading_.set_text("Graphics");
+  graphics_line_.set_text(StringView());
+  graphics_note_.set_text(StringView());
+  graphics_row_.set_style(PanelStyle::Transparent);
+  graphics_row_.set_padding({0, 2, 0, 2});
+  graphics_button_.set_dock(DockStyle::Left);
+  graphics_button_.on_click({&DisplaySettings::on_graphics, this});
+  graphics_row_.add(&graphics_button_);
+  Control* const graphics_parts[] = {&graphics_heading_, &graphics_line_, &graphics_row_, &graphics_note_};
+  for (Control* part : graphics_parts) {
+    part->set_dock(DockStyle::Top);
+    part->set_size(0, part == &graphics_row_ ? 32 : 22);
+    graphics_.add(part);
+  }
+
   filler_.set_style(PanelStyle::Transparent);
   filler_.set_dock(DockStyle::Fill);
   body_.set_dock(DockStyle::Fill);
   body_.add(&map_);
   body_.add(&details_);
   body_.add(&settings_);
+  body_.add(&graphics_);
   body_.add(&filler_);
   body_.add(&buttons_);
   add(&body_);
@@ -207,6 +235,113 @@ void DisplaySettings::refresh() {
   filling_ = false;
   fill_lists();
   update_details();
+}
+
+// --- Graphics (the built-in screen's GPU) ---------------------------------------------------------------
+
+void DisplaySettings::set_graphics_switch(hardware::IBuiltInScreenSwitch* graphics) {
+  {
+    UiGuard lock(this);
+    graphics_switch_ = graphics;
+    graphics_result_.clear();
+    graphics_.set_visible(graphics != nullptr);
+    const Rect2D b = bounds();
+    set_bounds({b.x, b.y, b.width, graphics ? kHeight + kGraphicsHeight - kGraphicsSlack : kHeight});
+  }
+  update_graphics();
+  invalidate();
+}
+
+void DisplaySettings::update_graphics() {
+  UiGuard lock(this);
+  if (!graphics_switch_) return;
+  using hardware::GpuMuxTarget;
+  GpuMuxTarget now = GpuMuxTarget::Integrated;
+  const bool known = graphics_switch_->active(&now);
+  graphics_target_ = now == GpuMuxTarget::Discrete ? GpuMuxTarget::Integrated : GpuMuxTarget::Discrete;
+  String text(allocator());
+  if (known)
+    format_message(&text, now == GpuMuxTarget::Discrete ? "The built-in screen is driven by %1 (the discrete GPU)." : "The built-in screen is driven by %1 (the integrated GPU).",
+                   graphics_switch_->gpu_name(now));
+  else
+    text.assign("Which GPU drives the built-in screen is not known.");
+  graphics_line_.set_text(text.view());
+  format_message(&text, "Use %1 for the Built-in Screen", graphics_switch_->gpu_name(graphics_target_));
+  graphics_button_.set_text(text.view());
+  const int32_t room = bounds().width > 40 ? static_cast<int32_t>(bounds().width) - 40 : 120;
+  int32_t width = Painter::text_width(text.view()) + 28;
+  if (width < 120) width = 120;
+  if (width > room) width = room;
+  graphics_button_.set_size(width, 0);
+  const char* why = "";
+  const bool can = known && !asking_ && graphics_switch_->can_switch_to(graphics_target_, &why);
+  graphics_button_.set_enabled(can);
+  if (!can) {
+    format_message(&text, "Not available because %1.", known ? (asking_ ? "the new display settings are waiting for your answer" : why) : "an earlier switch could not be undone");
+    graphics_note_.set_text(text.view());
+  } else if (!graphics_result_.empty()) {
+    graphics_note_.set_text(graphics_result_.view());
+  } else {
+    graphics_note_.set_text("The built-in screen goes dark for a moment while it switches.");
+  }
+  graphics_.layout();
+}
+
+void DisplaySettings::on_graphics(void* self, Control&) { static_cast<DisplaySettings*>(self)->ask_switch_graphics(); }
+
+bool DisplaySettings::ask_switch_graphics() {
+  if (!graphics_switch_ || !graphics_button_.enabled() || asking_) return false;
+  if (!confirm_ || !manager()) return switch_graphics();
+  String line(allocator());
+  format_message(&line, "Use %1 for the built-in screen?", graphics_switch_->gpu_name(graphics_target_));
+  confirm_->set_texts("Display Settings", line.view(), "The screen goes dark for a moment while it switches.", "Switch", "Cancel");
+  confirm_->set_default_choice(MessageDialog::Choice::Decline);   // (Cancel: nothing happens unless it is chosen)
+  question_ = Question::SwitchGraphics;
+  confirm_->on_result({&DisplaySettings::on_confirm_result, this});
+  if (!confirm_->show(*manager())) {
+    question_ = Question::None;
+    return false;
+  }
+  return true;
+}
+
+bool DisplaySettings::switch_graphics() {
+  // (no UI lock here: making the monitors real stops the render thread, which needs it)
+  if (!graphics_switch_ || asking_) return false;
+  const hardware::GpuMuxTarget target = graphics_target_;
+  hardware::GpuMuxTarget from = hardware::GpuMuxTarget::Integrated;
+  const bool known = graphics_switch_->active(&from);
+  String target_name(allocator()), from_name(allocator());
+  target_name.assign(graphics_switch_->gpu_name(target));
+  from_name.assign(graphics_switch_->gpu_name(from));
+  graphics_button_.set_enabled(false);      // (feedback while it switches: the button is unavailable and the line says what happens)
+  format_message(&graphics_result_, "Switching the built-in screen to %1...", target_name.view());
+  graphics_note_.set_text(graphics_result_.view());
+  if (pauser_) pauser_(pauser_context_, true);   // nothing draws while the panel, its monitor and the renderer change
+  hardware::IBuiltInScreenSwitch::Result r = graphics_switch_->switch_to(target);
+  bool shown = r.ok && make_real();
+  if (r.ok && !shown) {                     // the new GPU's screen could not be set up: back to the old one
+    const hardware::IBuiltInScreenSwitch::Result back = graphics_switch_->switch_to(from);
+    if (back.ok) make_real();
+    r.ok = false;
+    r.rolled_back = back.ok;
+    r.reason = "the desktop could not be shown on it";
+  }
+  if (pauser_) pauser_(pauser_context_, false);
+  String message(allocator());
+  if (shown) {
+    format_message(&graphics_result_, "The built-in screen is now driven by %1.", target_name.view());
+  } else if (r.rolled_back && known) {
+    format_message(&message, "The built-in screen could not be switched to %1 because %2. It stays on %3.", target_name.view(), r.reason, from_name.view());
+    graphics_result_.assign(message.view());
+  } else {
+    format_message(&message, "The built-in screen could not be switched to %1 because %2, and it could not be put back. If it stays dark, restart the computer.",
+                   target_name.view(), r.reason);
+    graphics_result_.assign(message.view());
+  }
+  refresh();                                // (the panel's monitor is on the other GPU now: the picture and the details follow)
+  if (!shown && notices_ && manager()) NoticeDialog::post(notices_, manager(), NoticeKind::Error, message.view(), "Display Settings");
+  return shown;
 }
 
 void DisplaySettings::fill_lists() {
@@ -353,6 +488,7 @@ void DisplaySettings::update_buttons() {
   primary_button_.set_enabled(slot >= 0 && !monitors_->layout().at(static_cast<uint32_t>(slot)).primary);
   apply_button_.set_enabled(m != nullptr && !asking_ && pending());   // (nothing to apply: unavailable)
   restore_button_.set_enabled(previous_.valid() && !asking_);
+  update_graphics();   // (unavailable while the keep question is open)
 }
 
 bool DisplaySettings::pending() const {
@@ -583,6 +719,11 @@ void DisplaySettings::on_confirm_result(void* self, Control&) {
   auto* d = static_cast<DisplaySettings*>(self);
   const MessageDialog::Choice choice = d->confirm_ ? d->confirm_->choice() : MessageDialog::Choice::Decline;
   const Question question = d->question_;
+  if (question == Question::SwitchGraphics) {
+    d->question_ = Question::None;
+    if (choice == MessageDialog::Choice::Accept) d->switch_graphics();   // (Cancel, Escape and the close button: nothing happens)
+    return;
+  }
   if (question == Question::ApplyOnClose) {
     d->question_ = Question::None;
     if (choice == MessageDialog::Choice::Accept) d->accept();           // apply, then close

@@ -27,7 +27,7 @@ namespace {
 //   Fermi..Volta   0x001704 BAR1 instance: bit 31 valid, bits 29:28 target (VRAM 0), 27:0 address >> 12            confident
 //                  0x001714 BAR2 instance, same layout (bit 30: "bar2_halve", not used)                              confident
 //                  0x001710 bind status: bits 1:0 BAR1 busy, 3:2 BAR2 busy (waited on from GM107)                    fairly sure
-//   Turing         0xb80f40 BAR1 instance, 0xb80f48 BAR2 instance, 0xb80f50 bind status (same bits)                    fairly sure
+//   Turing, GA10x  0xb80f40 BAR1 instance, 0xb80f48 BAR2 instance, 0xb80f50 bind status (same bits; ga102 = tu102_bar) fairly sure
 //   all (G84+)     0x070000 = 1 flushes the BAR write path; bit 1 reads 1 while it runs                                confident
 constexpr uint32_t kGfBar1Inst = 0x001704, kGfBar2Inst = 0x001714, kGfBarStatus = 0x001710;
 constexpr uint32_t kTuBar1Inst = 0xb80f40, kTuBar2Inst = 0xb80f48, kTuBarStatus = 0xb80f50;
@@ -52,7 +52,7 @@ bool NvBar::poll_clear(uint32_t offset, uint32_t mask) {
 }
 
 BarStatus NvBar::init(uint64_t bar1_bytes, uint64_t bar2_bytes, uint64_t keep_linear_bytes) {
-  if (chip_.family < Family::Fermi || chip_.family > Family::Turing) return BarStatus::Unsupported;
+  if (chip_.family < Family::Fermi || chip_.family > Family::Ampere) return BarStatus::Unsupported;
   if (ready_ || bar1_bytes < (1u << 20) || bar2_bytes < (1u << 20) || (bar1_bytes & (bar1_bytes - 1)) || (bar2_bytes & (bar2_bytes - 1)))
     return BarStatus::BadSize;
   keep_linear_bytes = (keep_linear_bytes + 0xFFFF) & ~uint64_t{0xFFFF};
@@ -72,7 +72,7 @@ BarStatus NvBar::init(uint64_t bar1_bytes, uint64_t bar2_bytes, uint64_t keep_li
   if (!bar2_.join(bar2_inst_) || !bar1_.join(bar1_inst_)) return BarStatus::NoMemory;
   tables_.flush(bar2_inst_);
 
-  const bool turing = chip_.family == Family::Turing;
+  const bool turing = chip_.family >= Family::Turing;
   const bool wait = chip_.family >= Family::Maxwell;   // gm107_bar_bar*_wait
   const uint32_t status = turing ? kTuBarStatus : kGfBarStatus;
   regs_.write32(turing ? kTuBar2Inst : kGfBar2Inst, 0x80000000u | static_cast<uint32_t>(bar2_inst_.gpu_address >> 12));
@@ -85,7 +85,7 @@ BarStatus NvBar::init(uint64_t bar1_bytes, uint64_t bar2_bytes, uint64_t keep_li
 
 void NvBar::fini() {
   if (!ready_) return;
-  const bool turing = chip_.family == Family::Turing;
+  const bool turing = chip_.family >= Family::Turing;
   regs_.mask(turing ? kTuBar1Inst : kGfBar1Inst, 0x80000000u, 0);
   regs_.mask(turing ? kTuBar2Inst : kGfBar2Inst, 0x80000000u, 0);
   ready_ = false;

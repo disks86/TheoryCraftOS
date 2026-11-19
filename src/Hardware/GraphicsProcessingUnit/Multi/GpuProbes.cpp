@@ -75,6 +75,9 @@ class NvidiaGpuProbe final : public IGpuProbe {
       if (c.connected) ++connected;
     return connected;
   }
+  bool reads_outputs() const override { return !native_.connectors().empty(); }
+  // The connectors whose hot-plug line changed are read again (their EDID over DDC / AUX).
+  bool refresh_outputs() override { return native_.refresh_connectors(); }
 
  private:
   nv::NvidiaNative native_;

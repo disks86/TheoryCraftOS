@@ -167,11 +167,20 @@ remembered (no source was at hand) and has run only against the host test's mode
 |---|---|---|---|
 | `Nv50` (507d family) | Tesla, GF100..GF110 (nouveau: `gt215_disp`) | done | not done |
 | `Gf119` (907d family) | GF117/GF119, Kepler, Maxwell, Pascal | done | done (TMDS, DP/eDP, LVDS) |
-| `Gv100` (c37d + c37e) | Volta | done (window channel) | not done |
-| `Tu102` (c57d + c57e) | Turing | done (window channel) | not done |
-| `Gsp` | Ampere and later | refused (`NeedsGsp`) | refused |
+| `Gv100` (c37d + c37e) | Volta | done (window channel) | done (window + immediate channel; TMDS, DP/eDP) |
+| `Tu102` (c57d + c57e) | Turing | done (window channel) | done (as Volta; Turing's SOR link enables, VPLL) |
+| `Ga102` (c67d + c67e) | GA102..GA107 (no GSP, as nouveau's `ga102_disp`) | refused (the boot display stays the firmware's) | done (as Turing; GA102's SOR rate index and clock, VPLL) |
+| `Gsp` | GA100 (no display), Ada and later | refused (`NeedsGsp`) | refused |
 
-A chip whose `Chip::display_native` is false is refused (`NotNative`) before any register is written.
+A chip whose `Chip::display_native` is false is refused (`NotNative`) before any register is written, except GA10x: `display_native` keeps
+meaning "Tesla..Turing" (the boot-display takeover), GA102's class is probed regardless and only mode setting from scratch uses it.
+
+**Ampere and Ada without GSP.** GA102..GA107: nouveau has driven their display without GSP-RM since GA102 support came in (Linux 5.11-ish,
+"display only"): `ga102_chipset` uses `ga102_disp` (= `tu102_disp_init`, gv100's channels and supervisor, `ga102_sor`), `ga100_devinit` (the
+VPLL; POST is the GFW_BOOT wait), `tu102_bar`, `ga100_mmu` (GP100 tables) and `ga102_ram` (the size at 0x1183a4); the display engine, PRAMIN,
+the BARs and the AUX channels are reached from the host directly. Confidence: high that this path exists and works in nouveau; medium for the
+register details below (from memory). AD10x (Ada): nouveau supports it only with GSP-RM (`ad102_chipset` has r535 entries only), so there is no
+reference for a GSP-less Ada display; this driver refuses it (`NeedsGsp`). Confidence: medium-high.
 
 ### How it works
 
@@ -226,6 +235,31 @@ holds the context DMA the armed state names). `display_status()` says why an eng
   The drive levels come from a `DpDriveTable`; until the VBIOS DP table (BIT 'd') is parsed, a placeholder table is used.
 - LVDS and eDP panels are powered first through `INvGpio::set_function(0x01 /* DCB_GPIO_PANEL_POWER */, true)`.
 
+**Volta, Turing, GA10x** (`gv100_mode_methods`, `gv100_window_methods`, `NvModeSetter::set_mode_gv100`): the display is claimed with the
+window channel of the head's first window (window 2h: `corec37d_wndw_owner` gives windows 2h and 2h+1 to head h).
+
+1. Core channel (one UPDATE, through the supervisor): every window's owner and usage bounds (`corec37d_init`: format 0x1f / 0x0f on c57d+,
+   rotated 0, usage 0x00127fff / 0x00117fff at 0x1004/0x1008/0x1010 + w * 0x80), SOR_SET_CONTROL (0x0300 + sor * 0x20, owner mask and the
+   907d protocol codes), the head at 0x2000 + head * 0x400: PROCAMP (c37d: saturation 0x400; c57d+: 0), OUTPUT_RESOURCE (CRC 1, sync polarities
+   bits 2/3, depth 7:4 = 1/4/5 for 18/24/30 bpp), CONTROL (interlace), PIXEL_CLOCK 0x200c and its maximum 0x2028 (Hz), HEAD_USAGE_BOUNDS 0x2030
+   (0x124 / 0x1014), viewport in 0x204c, point-out adjust / size out / size out min 0x2058..0x2060, raster 0x2064..0x2074.
+2. Supervisor (polled): 0x611c30 bits 2:0, cleared through 0x611860; head masks 0x6107ac + head * 4; ack 0x6107a8 = 0x80000000. 2.1: the
+   VPLL from the assembly pixel clock (0x682000 + 0x0c); 2.2: RG divider, DP audio symbols 0x616568/0x61656c and watermark 0x616550 (+ head *
+   0x800, gv100's), the transfer unit as GF119, the SOR clock: `gf119_sor_clock` on Volta/Turing, `ga102_sor_clock` on GA10x (0x00ec08 = 0,
+   0x00ec04 = div2 per SOR at stride 0x10).
+3. Window channel: SET_PRESENT_CONTROL 0x0308 = 1, composition 0x02ec..0x02f8 (opaque: depth 255, K1 0xff, K1 / NEG_K1), the image (size,
+   pitch layout, X8R8G8B8, pitch / 64, the VRAM context DMA, offset >> 8, point and sizes) and UPDATE; not interlocked with the core (it
+   follows the core's UPDATE). The armed window state is read back.
+4. Window immediate channel (c37b, chid 33 + w: ctrl 0x610b00 + chid * 0x10, user 0x690000 + (chid - 1) * 0x1000, brought up on first use):
+   SET_POINT_OUT 0x0208 = 0, UPDATE.
+5. `disable()`: the window's present control and ISO context DMA to 0 (window UPDATE), then SOR_SET_CONTROL 0 through the supervisor.
+
+SOR differences (`SorVariant`, `NvSorDp`): Volta+ lanes in order 0..3 (GF119's are 2,1,0,3) and a 4-bit TX_PU (`gm200_sor_dp_drive`);
+Turing and GA10x after the link rate wait 40 ms and set 0x612300 bits 17:16 = 1 and 0x61c10c bits 1:0 = 1 (`tu102_sor_dp_links`' "XXX");
+GA10x writes the link rate as an index (RBR 0, HBR 1, HBR2 2, HBR3 3, eDP 2.16/2.43/3.24/4.32 Gbit/s 4..7), a rate without one is refused
+and the trainer goes on. RAMHT on Volta+: 8 KiB (`ramht_size = 0x2000`, 10-bit hash). Context DMAs are still used on GA102 (the handle-less
+surface addresses came with Blackwell's ca7d).
+
 ### Integration (for `NvidiaGpu`)
 
 1. After chip identification, create `nv::NvNativeDisplay` (registers = the BAR0 `MmioNvRegisters`, memory = the `INvMemory` of
@@ -244,9 +278,12 @@ holds the context DMA the armed state names). `display_status()` says why an eng
   registers. Check them against nouveau and the class headers before the first run on hardware.
 - The takeover assumes the firmware's ISO context DMA starts at VRAM 0 (its offsets are reused with this driver's VRAM context DMA); the
   firmware's RAMHT is not read.
-- Not done: NV50 and Volta/Turing mode setting (supervisors, Volta's usage bounds), the VBIOS IED scripts of supervisor 2.x and 3.0,
-  DACs/PIORs, HDMI (infoframes, audio, 340 MHz+ high speed), DP MST and DSC, the cursor and overlay channels, interrupts (all polled),
-  GA102+ display without GSP (nouveau can, this driver refuses Ampere and later).
+- Not done: NV50 mode setting, the VBIOS IED scripts of supervisor 2.x and 3.0, DACs/PIORs, HDMI (infoframes, audio, 340 MHz+ high speed:
+  TMDS is DVI-style on every class), DP MST and DSC, the cursor and overlay channels, interrupts (all polled), Volta+ heads other than the
+  one claimed (one window channel), the window interlocked with the core, Ada and later (GSP only in nouveau), the takeover on GA10x.
+- Volta+ numbers marked [?]/[R] in `NvDisplayHw.hpp` that matter most on hardware: the head usage bounds values, the PROCAMP default, the
+  OUTPUT_RESOURCE field layout, the composition methods 0x02ec..0x02f8, the RAMHT size, GA102's rate index table and SOR clock block, and
+  whether 0x611c30 shows the supervisor's stages with its interrupt left disabled (the GF119 path assumes the same of 0x6100ac).
 
 ## I2C, AUX, GPIO, sensors and fans
 
@@ -333,7 +370,9 @@ core (GPC), ROP, hubs, PMU, video and memory from the source selects (0x137100, 
 The counterpart of nouveau's `subdev/fb`, `subdev/instmem`, `subdev/mmu`, `subdev/bar`, `engine/fifo` and `engine/ce`, written from memory of
 nouveau and envytools (nothing downloaded). Each `.cpp` starts with one table of the registers and layouts it uses, each marked
 confident / fairly sure / unsure. The working path is Kepler..Turing (Turing without GSP, as nouveau ran it before GSP: the copy engines need
-no firmware there, GR would need NVIDIA's signed firmware); Ampere and later are identified and refused with `NeedsGsp`.
+no firmware there, GR would need NVIDIA's signed firmware); Ampere and later are identified and refused with `NeedsGsp`, except for what the
+GA10x display needs: `probe_vram_display` (the size at 0x1183a4, `ga102_ram_new`), the GP100 page-table format (`ga100_vmm`), Turing's TLB flush
+and Turing's BAR registers (`tu102_bar`).
 
 ### Pieces
 
@@ -475,8 +514,10 @@ After nouveau's bios/pll.c, clk/pllnv04.c, clk/pllgt215.c and the devinit `pll_s
   `gt215_pll_calc` (N/M/P, and the fractional N of the first M that fits) are pure functions over `NvPllLimits`.
 - `nv_pll_set(inputs, type, khz)` per family (`pll_family`): Nv50 (NV50, G84, G98: VPLL 0x10000611 + M1/N1 + P/M2/N2, the memory PLL
   with its bias, other PLLs P + N1/M1), Gt215 (GT215/216/218, MCP89: VPLL0/1 only), Gf100 (GF100 to Pascal; GM107 and GM200 use it:
-  VPLL0..3 only, +0x0c bit 8, +0x04 P/N/M, +0x10 fN << 16), Gv100 (VPLLs at 0x00ef04/0x00ef10 + head * 0x40). Other types: Unimplemented
-  (nouveau's "unimplemented"); pre-NV50, Turing+ and Tegra: NoFamily. Every write through `INvRegisters` (and the optional trace).
+  VPLL0..3 only, +0x0c bit 8, +0x04 P/N/M, +0x10 fN << 16), Gv100 (VPLLs at 0x00ef04/0x00ef10 + head * 0x40), Tu102 (as Gv100, then 0x00ef0c =
+  0x900 and 0x00ef00 = 0x02000014), Ga100 (GA102..GA107: 0x00ef00 = 0x02080004, 0x00ef18 = N << 16 | fN, 0x00ef04 = P << 16 | M, 0x00e9c0 + head * 4
+  = 1). Other types: Unimplemented (nouveau's "unimplemented"); pre-NV50, GA100, Ada and later and Tegra: NoFamily. (Turing+ never run scripts:
+  the PLLs are set only for the display's VPLLs.) Every write through `INvRegisters` (and the optional trace).
 - `NvPllInitHooks(bios, chip, registers, inner, crystal_khz, trace)`: an `INvInitHooks` whose `set_pll` is `nv_pll_set`; I2C, AUX, GPIO
   resets and meminit go to `inner` (nullptr: none). Pass it as `PostInputs::hooks`. The interpreter never calls hooks in a dry run.
   `last()`, `programmed()`, `failed()` say what happened.
@@ -584,9 +625,11 @@ yet; the pool holds a power lease for it, so the GPU stays awake while it exists
 
 1. `NvidiaNative` starts as a secondary GPU (`configure_secondary(nullptr)`: the VBIOS from the card, the init scripts when it was not
    POSTed), reads the connectors and their EDIDs.
-2. Refuses (and the probe takes over) unless the display class is GF119 (GF119/GF117, Kepler, Maxwell, Pascal): Tesla has no virtual BAR here
-   and its mode setting is not written; Volta/Turing mode setting is not written; Ampere+ needs the GSP.
-3. Needs the VRAM size (`probe_vram`) and a video BIOS (the VPLL's limits come from it).
+2. Refuses (and the probe takes over) unless the display class is GF119 (GF119/GF117, Kepler, Maxwell, Pascal), GV100, TU102 or GA102
+   (GA102..GA107; `nv::sets_modes`, the reason in `nv::refusal`): Tesla has no virtual BAR here and its mode setting is not written; Ada and
+   later need the GSP.
+3. Needs the VRAM size (`probe_vram_display`: `probe_vram`, or on GA10x the firmware's usable size) and a video BIOS (the VPLL's limits come
+   from it).
 4. Maps the first `Bar1LinearVram::linear_bytes_for(vram)` bytes of PCI BAR1 (128 MiB, less with little VRAM) for the CPU.
 5. `NvSecondaryDisplay::start()` (pure: everything through `Inputs`, so the host test drives it against the display model):
    - the display engine's `probe()` (reads only);
@@ -658,9 +701,10 @@ The **nouveau way, with page tables** (`Bar1LinearVram`), not the legacy linear 
   `linear`). Every object this driver makes comes from it, so all of them lie in the linear part.
 - The page tables and the BAR instance blocks come from the same heap through `NvVramMemory` over the **PRAMIN window** (BAR0 0x700000,
   0x001700), which needs no BAR set up.
-- `NvBar::init(256 MiB, 32 MiB, linear)`: BAR2 (instance 0x001714) and BAR1 (0x001704) instance blocks, their VMMs (GF100 format on
-  Fermi/Kepler/Maxwell, GP100 on Pascal), BAR1's VA `[0, linear)` mapped 1:1 onto VRAM `[0, linear)` with 4 KiB pages; then both VMMs' TLBs
-  invalidated (hub only). So for the CPU every object is at BAR1 + its VRAM offset, and the display engine gets the plain VRAM offset.
+- `NvBar::init(256 MiB, 32 MiB, linear)`: BAR2 (instance 0x001714; Turing and GA10x 0xb80f48) and BAR1 (0x001704; 0xb80f40) instance
+  blocks, their VMMs (GF100 format on Fermi/Kepler/Maxwell, GP100 on Pascal, Volta, Turing and GA10x, the last three with the subcontext PDBs),
+  BAR1's VA `[0, linear)` mapped 1:1 onto VRAM `[0, linear)` with 4 KiB pages; then both VMMs' TLBs invalidated (hub only; 0x100cbc up to Volta,
+  0xb830b0 on Turing and GA10x). So for the CPU every object is at BAR1 + its VRAM offset, and the display engine gets the plain VRAM offset.
 - Why not the legacy mode: the boot display relies on "BAR1 is a linear view of VRAM while 0x001704 is not valid", which the GOP framebuffer
   proves for that GPU. Nothing proves it for a secondary GPU: its VBIOS, a previous OS or a resume may have left the virtual BAR on with
   page tables of its own. Building the tables makes BAR1 show exactly what the driver says, whatever state it was in; `translate()` on the
@@ -709,12 +753,29 @@ invalidate status on top of the model, so the page tables land in the model's VR
   (`LinkTraining`), the fastest failing (3.24 Gbit/s, SOR 0x0c), no panel output (`NoPanel`, nothing written); LVDS (the SPWG waits, LVDS
   protocol on the SOR, no AUX).
 - The display model resets the core channel's GET with PUT when PUT is written while the channel is being set up (before, a second
-  `start()` on one model counted push-buffer errors).
+  `start()` on one model counted push-buffer errors); on Volta+ the same for every channel whose control word is not enabled.
+- Turing (TU104) and GA10x (GA104) from scratch, HDMI: BAR2 then BAR1 at 0xb80f48/0xb80f40 (nothing at 0x001704/0x001714), the TLB through
+  0xb830b0 after them, GP100 tables with subcontexts translating 1:1; the 8 KiB RAMHT, the core channel and window 0's window (slot 1) and
+  immediate (slot 33) channels, Turing's lock pins; SOR 1 owned by head 0 at 0x0320, the windows' owners and corec57d's usage bounds, the
+  output resource, raster, pixel clock and maximum, head usage bounds and viewport at the c37d offsets; window 0's image armed and scanned out,
+  placed by its immediate channel; one VPLL call, three supervisor acks at 0x6107a8; the SOR clock (gf119's on Turing, 0x00ec00 on GA104);
+  drawing; 720p and the old surface released; shutdown (window image off, SOR let go through the supervisor, all three channels stopped,
+  both BARs off, the heap back to the tables) and up again; nothing leaks.
+- Turing and GA10x DisplayPort on the DP++ port: HBR2 x4, the SOR at code 0x14 (Turing) or index 2 (GA102), the link enables and the
+  40 ms wait, lanes 0..3, gv100's watermark register.
+- The eDP panel on a Turing laptop (the Kepler panel test's sequence: power, T1+T3, AUX, the supervisor at 0x6107a8, T8, PWM; the rate table's
+  5.4 Gbit/s entry, SOR 3 at 0x0360; shutdown in order) and on GA10x (the entry as rate index 2).
+- Refusals: Ada (`NeedsGsp`, nothing written), Tesla (`NotImplemented`); `NvidiaSecondaryGpu` on the fake card: Ada refused with the GSP reason,
+  TU104 and GA104 past the class and the VRAM size to "no monitor"; without the flag, TU104 and GA104 refused with BAR0 untouched.
+- NvDisplayTest: the class map (GA102..GA107 `Ga102`, GA100 and Ada `Gsp`), the GA10x takeover refused, a mode set on Volta, Turing and GA102
+  at the engine level (every c37d method offset, the window after the core, the SOR clock per class, disable), the SOR variants (lane bytes,
+  TX_PU width, link enables, GA102's rate index; a rate GA102 has no index for refused).
 
 ### Not done / unverified
 
 - **Nothing of it has run on a real card.** The register and method numbers are NvDisplayHw.hpp's (remembered from nouveau, marked by
-  confidence there); the display model is typed from the same memory.
+  confidence there); the display model is typed from the same memory. The Volta/Turing/GA10x path most of all: see "Display engine / Not
+  done" for the numbers to check first.
 - `NvidiaSecondaryGpu::initialize()` end to end with a monitor is not tested (the fake card's buses answer nothing); its parts are.
 - VBIOS IED scripts (supervisor 2.x / 3.0) and the DP drive-level table: not run / placeholders; some boards need them for TMDS/DP.
 - HDMI 2.0 (scrambling above 340 MHz), infoframes, audio; DP MST; DSC; deep colour; several heads at once; the internal panel's gaps above.

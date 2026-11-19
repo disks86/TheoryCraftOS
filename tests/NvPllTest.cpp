@@ -428,6 +428,24 @@ static void test_programming() {
     CHECK(nv_pll_set(in, kPllVpll1, 148500).ok());
     CHECK(regs.writes.size() == 2 && regs.writes[0].first == 0x00ef50 && regs.writes[0].second == 0x10000000);
     CHECK(regs.writes[1].first == 0x00ef44 && regs.writes[1].second == 0x00053602);
+    // Turing (tu102_devinit_pll_set): the same two words, then 0x00ef0c = 0x900 and 0x00ef00 = 0x02000014
+    FakeRegs tu;
+    in.chip = chip_of(0x164000a1, 0x16400000);
+    in.registers = &tu;
+    CHECK(pll_family(in.chip) == NvPllFamily::Tu102 && nv_pll_set(in, kPllVpll1, 148500).ok());
+    CHECK(tu.writes.size() == 4 && tu.writes[0].first == 0x00ef50 && tu.writes[0].second == 0x10000000);
+    CHECK(tu.writes[1].first == 0x00ef44 && tu.writes[1].second == 0x00053602);
+    CHECK(tu.writes[2].first == 0x00ef4c && tu.writes[2].second == 0x00000900 && tu.writes[3].first == 0x00ef40 && tu.writes[3].second == 0x02000014);
+    // GA10x (ga100_devinit_pll_set): 0x00ef00 first, N << 16 | fN at 0x00ef18, P << 16 | M at 0x00ef04, then 0x00e9c0 + head * 4
+    FakeRegs ga;
+    in.chip = chip_of(0x174000a1, 0x17400000);
+    in.registers = &ga;
+    CHECK(pll_family(in.chip) == NvPllFamily::Ga100 && nv_pll_set(in, kPllVpll1, 148500).ok());
+    CHECK(ga.writes.size() == 4 && ga.writes[0].first == 0x00ef40 && ga.writes[0].second == 0x02080004);
+    CHECK(ga.writes[1].first == 0x00ef58 && ga.writes[1].second == 0x00361000);
+    CHECK(ga.writes[2].first == 0x00ef44 && ga.writes[2].second == 0x00050002);
+    CHECK(ga.writes[3].first == 0x00e9c4 && ga.writes[3].second == 1);
+    CHECK(nv_pll_set(in, kPllCore, 148500).status != NvPllSetStatus::Ok);       // (only the VPLLs)
   }
   // NV50 family (G84): a 0x30 table with a single-stage core PLL, a two-stage VPLL and the memory PLL.
   {
@@ -481,7 +499,8 @@ static void test_programming() {
     const Limits40 e[1] = {kVpll0};
     table40(v, e, 1);
     NvBios bios(view(v));
-    const Chip none[] = {chip_of(0x046000a1), chip_of(0x164000a1, 0x16400000), chip_of(0x0ea000a1) /* GK20A */};
+    const Chip none[] = {chip_of(0x046000a1), chip_of(0x170000a1, 0x17000000) /* GA100 */, chip_of(0x192000a1, 0x19200000) /* AD102 */,
+                         chip_of(0x0ea000a1) /* GK20A */};
     for (const Chip& c : none) {
       FakeRegs regs;
       NvPllSetInputs in;

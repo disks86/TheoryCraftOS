@@ -56,6 +56,15 @@ struct GpuNode {
   IGpuProbe* probe = nullptr;              // for a GPU with no driver: what can be read off it (owned by the pool)
 };
 
+// What GpuPool::refresh_outputs() found.
+enum class GpuOutputCheck : uint8_t {
+  Unchanged,    // the probe looked: nothing came or went
+  Changed,      // the probe looked: a monitor came or went (or its EDID changed)
+  CannotTell,   // nothing here can look (a display driver, which its own monitor source polls; no probe; a probe that cannot see outputs)
+  NoWake,       // the GPU did not wake, or its probe could not set itself up again
+  NoGpu,        // a bad index
+};
+
 class GpuPool {
  public:
   GpuPool(const IPciBus& pci, allocators::IAllocator& allocator, GpuManager::DelayFn delay = nullptr) : allocator_(allocator), manager_(pci, delay) {}
@@ -80,6 +89,15 @@ class GpuPool {
   uint32_t bind_probes(efi::SystemTable* st, const IPciBus& pci, IRegisterMapper* registers, GpuProbeFactory factory);
   // The probe's temperature, if the GPU is awake (a sensor is not worth waking a GPU for): -1 when it sleeps, has no probe or cannot tell.
   int32_t probe_temperature(uint32_t index);
+  // Takes a lease on the GPU (waking it, through D3cold if it lost its power), has its probe look at its outputs again (IGpuProbe::refresh_outputs,
+  // after resume() when the GPU was woken since the probe last saw it), and gives the lease back (the GPU sleeps again after the autosuspend
+  // time). A GPU with a display driver is not touched (CannotTell): the driver keeps it awake and SystemMonitors polls its monitor source.
+  // Thread-safe: the probe is used by one caller at a time.
+  [[nodiscard]] GpuOutputCheck refresh_outputs(uint32_t index);
+  // Whether refresh_outputs() can tell anything for this GPU (a probe that reads outputs, and no driver).
+  bool outputs_readable(uint32_t index) const;
+  // The monitors the probe saw at its last look (no wake), 0 without a probe.
+  uint32_t probe_connected_outputs(uint32_t index) const;
 
   uint32_t count() const { return manager_.count(); }
   GpuNode* node(uint32_t index) { return index < manager_.count() ? &nodes_[index] : nullptr; }
@@ -95,7 +113,8 @@ class GpuPool {
   GpuNode nodes_[GpuTopology::kMaxAdapters];
   UniquePointer<IGpuProbe> probes_[GpuTopology::kMaxAdapters];
   uint32_t probe_wakes_[GpuTopology::kMaxAdapters] = {};   // the manager's wake count the probe last saw (a new wake: resume() it)
-  bool resume_probe(uint32_t index);
+  bool resume_probe(uint32_t index);   // (probe_lock_ held)
+  mutable kernel::Mutex probe_lock_;   // one caller at a time uses a probe (temperature, outputs) and its probe_wakes_; taken after a lease, before the manager's lock
 };
 
 }  // namespace hardware

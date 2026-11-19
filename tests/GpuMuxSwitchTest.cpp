@@ -19,8 +19,13 @@
 // The display mux switch (Multi/GpuMuxSwitch): the vga_switcheroo order (lease, DDC, light, mux, release), every failing step undone in
 // reverse, the refusals (no mux answer needed, no driver, no panel output, a firmware framebuffer that cannot light the panel again, an
 // earlier rollback that failed), the GOP side, the real GpuManager waking and sleeping the discrete GPU through the lease, and several
-// threads switching at once (only one in flight, the others Busy, the mux never seen half-moved).
+// threads switching at once (only one in flight, the others Busy, the mux never seen half-moved). The Intel integrated GPU's eDP panel output
+// (IntelPanelOutput) against a model of its registers: what the firmware left found, let go and lit again in i915's order with the panel's waits,
+// each failing step leaving nothing on, and the switch back to it that the firmware framebuffer refuses. GpuMuxDesktop: the panel's monitor
+// moving with the panel between the GPUs' monitors (fake drivers), and the panel switched back when the monitors cannot follow.
 #include <stdio.h>
+#include <stdlib.h>
+#include <map>
 #include <string.h>
 #include <atomic>
 #include <mutex>
@@ -29,6 +34,8 @@
 #include <vector>
 #include "Hardware/GraphicsProcessingUnit/Multi/GpuManager.hpp"
 #include "Hardware/GraphicsProcessingUnit/Multi/GpuMuxSwitch.hpp"
+#include "Hardware/GraphicsProcessingUnit/Intel/IntelGpu.hpp"
+#include "FakeMonitors.hpp"
 
 using namespace hardware;
 
@@ -322,7 +329,7 @@ static void test_gop_side() {
   CHECK(sw.switch_to(kD).ok() && !gop.panel_lit() && !gop.can_light_panel());
   log.clear();
   const char* why = nullptr;
-  CHECK(!sw.can_switch_to(kI, &why) && strstr(why, "cannot light the panel again"));
+  CHECK(!sw.can_switch_to(kI, &why) && strstr(why, "until the computer restarts"));
   const GpuMuxSwitchReport back = sw.switch_to(kI);
   CHECK(back.status == GpuMuxSwitchStatus::CannotLight && strstr(back.reason, "firmware") && log.joined().empty());
   CHECK(d.lit && mux.display == kD && leases.held[1] == 1);
@@ -481,6 +488,372 @@ static void test_threads() {
   printf("  threads: %d switched, %d busy\n", switched.load(), busy.load());
 }
 
+// --- The Intel integrated GPU's eDP panel (IntelPanelOutput) ------------------------------------------------------------------------------
+
+namespace {
+
+using P = IntelPanelOutput;
+
+// The registers of an Intel display engine with the firmware's eDP panel lit on pipe A, and the parts of them that act: the panel power
+// sequencer (on and off take a while, and after off the power cycle time runs), the DDI buffer's idle bit, the transcoder's state bit.
+struct IntelRegs final : intel_gt::IRegisterBank {
+  std::map<uint64_t, uint32_t> r;
+  std::vector<std::string> writes;          // "name=value" in order, for the registers the panel sequence writes
+  uint64_t now_us = 0, cycle_until_us = 0;
+  bool power_stuck = false, port_stuck = false, pipe_stuck = false;
+  bool xe = false;
+  uint64_t func = 0, conf = 0, tp = 0;
+  static IntelRegs* current;
+
+  explicit IntelRegs(bool xe_lp = false) : xe(xe_lp) {
+    func = xe ? P::kTransDdiFuncCtlA : P::kTransDdiFuncCtlEdp;
+    conf = xe ? P::kTransConfA : P::kTransConfEdp;
+    tp = xe ? P::kTglDpTpCtlA : P::kDpTpCtlA;
+    r[intel_display::kPipeConfA] = intel_display::kPipeEnable;
+    r[intel_display::kPlaneCtlA] = intel_display::kPlaneEnable | intel_display::kPlaneFormatXrgb8888;
+    r[intel_display::kTransHtotalA] = (2199u << 16) | 1919u;
+    r[intel_display::kTransVtotalA] = (1124u << 16) | 1079u;
+    r[intel_display::kPipeSrcA] = (1919u << 16) | 1079u;
+    r[intel_display::kPlaneSurfA] = 0x00400000;
+    r[func] = xe ? P::kFuncEnable | P::kFuncModeDpSst | (1u << 27) | 0x40 : P::kFuncEnable | P::kFuncModeDpSst | (0u << 28) | (0u << 12) | 0x40;
+    r[conf] = P::kConfEnable | P::kConfState;
+    r[P::kDdiBufCtlA] = P::kDdiBufEnable | 0x6;                 // (4 lanes as the firmware set them)
+    r[tp] = P::kDpTpEnable | P::kDpTpNormal | (1u << 18);
+    r[P::kPpStatus] = P::kPpOn;
+    r[P::kPpControl] = P::kPowerTargetOn | P::kPowerReset | P::kBacklightEnable;
+    r[P::kPpOnDelays] = (2100u << 16) | 500u;                   // T1+T3 210 ms, T8 50 ms
+    r[P::kPpOffDelays] = (5000u << 16) | 300u;                  // T10 500 ms, T9 30 ms
+    r[P::kBlcPwmPchCtl1] = P::kBlcPwmEnable | 0x1234;
+  }
+  const char* name(uint64_t o) const {
+    if (o == P::kPpControl) return "pp";
+    if (o == P::kBlcPwmPchCtl1) return "blc";
+    if (o == P::kDdiBufCtlA) return "ddi";
+    if (o == tp) return "tp";
+    if (o == func) return "func";
+    if (o == conf) return "conf";
+    if (o == intel_display::kPlaneSurfA) return "surf";
+    return nullptr;
+  }
+  uint32_t read32(uint64_t o) override {
+    if (o == P::kPpStatus) {
+      uint32_t v = r[o];
+      if (now_us < cycle_until_us) v |= P::kPpCycleDelayActive;
+      return v;
+    }
+    auto it = r.find(o);
+    return it == r.end() ? 0 : it->second;
+  }
+  void write32(uint64_t o, uint32_t v) override {
+    if (const char* n = name(o)) {
+      char text[48];
+      snprintf(text, sizeof text, "%s=%x", n, v);
+      writes.push_back(text);
+    }
+    r[o] = v;
+    if (o == P::kPpControl) {
+      const bool on = (v & P::kPowerTargetOn) != 0, was = (r[P::kPpStatus] & P::kPpOn) != 0;
+      if (on && !power_stuck) r[P::kPpStatus] = P::kPpOn;
+      if (!on && was) {
+        r[P::kPpStatus] = 0;
+        cycle_until_us = now_us + 500000;                           // (T11+T12, the sequencer's)
+      }
+    } else if (o == P::kDdiBufCtlA) {
+      r[o] = (v & P::kDdiBufEnable) && !port_stuck ? (v & ~P::kDdiBufIdle) : (v | P::kDdiBufIdle);
+    } else if (o == conf) {
+      r[o] = (v & P::kConfEnable) && !pipe_stuck ? (v | P::kConfState) : (v & ~P::kConfState);
+    }
+  }
+  std::string joined() const {
+    std::string s;
+    for (const std::string& w : writes) s += (s.empty() ? "" : " ") + w;
+    return s;
+  }
+  // The position of the first write that starts with `prefix` (-1: none).
+  int first(const std::string& prefix) const {
+    for (size_t i = 0; i < writes.size(); ++i)
+      if (writes[i].compare(0, prefix.size(), prefix) == 0) return static_cast<int>(i);
+    return -1;
+  }
+};
+IntelRegs* IntelRegs::current = nullptr;
+void fake_delay(uint32_t us) { if (IntelRegs::current) IntelRegs::current->now_us += us; }
+
+std::string hex(uint32_t v) { char t[16]; snprintf(t, sizeof t, "%x", v); return t; }
+
+}  // namespace
+
+static void test_intel_panel() {
+  {   // Gen9.5: found, let go, lit again
+    IntelRegs regs;
+    IntelRegs::current = &regs;
+    intel_display::Display display(regs, IntelGpuArchitecture::Gen9_5);
+    CHECK(display.probe() && display.pipe() == 0);
+    IntelPanelOutput panel(regs, display, IntelGpuArchitecture::Gen9_5, &fake_delay);
+    CHECK(panel.probe() && panel.has_panel_output() && panel.panel_lit() && panel.can_light_panel() && panel.transcoder() == P::kEdpTranscoder && panel.port() == 0);
+    CHECK(panel.light_panel() == PanelLightStatus::Ok && regs.writes.empty());      // (lit already: nothing written)
+    const uint32_t fw_ddi = regs.r[P::kDdiBufCtlA], fw_func = regs.r[regs.func], fw_conf = regs.r[regs.conf];
+    // Let go, in i915's order: backlight (PP_CONTROL, then the PWM), the transcoder, its DDI function, the port, the panel power.
+    panel.release_panel();
+    CHECK(!panel.panel_lit() && panel.can_light_panel() && strcmp(panel.panel_status(), "released") == 0);
+    const int pp_blc = regs.first("pp="), blc = regs.first("blc="), conf = regs.first("conf="), func = regs.first("func="), tp = regs.first("tp="), ddi = regs.first("ddi=");
+    CHECK(pp_blc == 0 && blc == 1 && conf > blc && func > conf && tp > func && ddi > tp && regs.writes.back() == "pp=0");
+    CHECK(!(regs.r[P::kPpStatus] & P::kPpOn) && !(regs.r[regs.conf] & P::kConfEnable) && !(regs.r[P::kDdiBufCtlA] & P::kDdiBufEnable) &&
+          !(regs.r[regs.func] & P::kFuncEnable) && !(regs.r[P::kBlcPwmPchCtl1] & P::kBlcPwmEnable));
+    CHECK(panel.waited_us() >= 30000);                      // T9 from PP_OFF_DELAYS
+    panel.release_panel();                                  // (not lit: nothing)
+    // Lit again: the power cycle time waited out, power, the port with pattern 1, training, the transcoder, the plane, T8, the backlight.
+    regs.writes.clear();
+    const uint64_t before = panel.waited_us();
+    regs.r[intel_display::kPlaneSurfA] = 0;                 // (to see the plane put back)
+    CHECK(panel.light_panel() == PanelLightStatus::Ok && panel.panel_lit() && strcmp(panel.panel_status(), "lit") == 0);
+    CHECK(regs.now_us >= regs.cycle_until_us && panel.waited_us() - before >= 50000 + 1000 + 600);
+    CHECK(regs.writes[0] == "pp=3" && regs.writes[1] == "tp=" + hex(P::kDpTpEnable | P::kDpTpPattern1 | (1u << 18)) && regs.writes[2] == "ddi=" + hex(fw_ddi));
+    CHECK(regs.writes[3] == "tp=" + hex(P::kDpTpEnable | P::kDpTpPattern2 | (1u << 18)) && regs.writes[4] == "tp=" + hex(P::kDpTpEnable | P::kDpTpIdle | (1u << 18)));
+    CHECK(regs.writes[5] == "func=" + hex(fw_func) && regs.writes[6] == "conf=" + hex(fw_conf | P::kConfEnable) &&
+          regs.writes[7] == "tp=" + hex(P::kDpTpEnable | P::kDpTpNormal | (1u << 18)));
+    const int surf = regs.first("surf="), blc_on = regs.first("blc=");
+    CHECK(surf > 7 && blc_on > surf && regs.writes.back() == "pp=7" && regs.r[intel_display::kPlaneSurfA] == 0x00400000);
+    CHECK(regs.r[P::kBlcPwmPchCtl1] == (P::kBlcPwmEnable | 0x1234) && (regs.r[regs.conf] & P::kConfState) && (regs.r[P::kPpStatus] & P::kPpOn));
+  }
+  {   // Each failing step leaves nothing on.
+    for (int step = 0; step < 3; ++step) {
+      IntelRegs regs;
+      IntelRegs::current = &regs;
+      intel_display::Display display(regs, IntelGpuArchitecture::Gen11);
+      CHECK(display.probe());
+      IntelPanelOutput panel(regs, display, IntelGpuArchitecture::Gen11, &fake_delay);
+      CHECK(panel.probe());
+      panel.release_panel();
+      regs.power_stuck = step == 0;
+      regs.port_stuck = step == 1;
+      regs.pipe_stuck = step == 2;
+      const PanelLightStatus st = panel.light_panel();
+      CHECK(st == (step == 0 ? PanelLightStatus::PowerFailed : step == 1 ? PanelLightStatus::LinkTraining : PanelLightStatus::ModeSet));
+      CHECK(!panel.panel_lit() && !(regs.r[P::kPpControl] & P::kPowerTargetOn) && !(regs.r[P::kDdiBufCtlA] & P::kDdiBufEnable) &&
+            !(regs.r[regs.conf] & P::kConfEnable) && !(regs.r[P::kBlcPwmPchCtl1] & P::kBlcPwmEnable) && !(regs.r[P::kPpControl] & P::kBacklightEnable));
+      regs.power_stuck = regs.port_stuck = regs.pipe_stuck = false;
+      CHECK(panel.light_panel() == PanelLightStatus::Ok && panel.panel_lit());      // (and it works once the hardware does)
+    }
+  }
+  {   // Not lit at boot (the OS started with the panel on the discrete GPU), or a pipe that feeds no eDP: nothing to offer.
+    IntelRegs off;
+    IntelRegs::current = &off;
+    off.r[P::kPpStatus] = 0;
+    intel_display::Display d1(off, IntelGpuArchitecture::Gen9_5);
+    CHECK(d1.probe());
+    IntelPanelOutput p1(off, d1, IntelGpuArchitecture::Gen9_5, &fake_delay);
+    CHECK(!p1.probe() && !p1.has_panel_output() && !p1.can_light_panel() && strstr(p1.panel_status(), "not lit") && p1.light_panel() == PanelLightStatus::NoPanel);
+    IntelRegs other;                                        // (bit flip: the eDP transcoder's input is pipe B, the firmware's pipe is A)
+    IntelRegs::current = &other;
+    other.r[other.func] |= 5u << 12;
+    intel_display::Display d2(other, IntelGpuArchitecture::Gen9_5);
+    CHECK(d2.probe());
+    IntelPanelOutput p2(other, d2, IntelGpuArchitecture::Gen9_5, &fake_delay);
+    CHECK(!p2.probe() && !p2.has_panel_output() && other.writes.empty());
+    IntelRegs nothing;                                      // (no pipe on at all)
+    IntelRegs::current = &nothing;
+    nothing.r[intel_display::kPipeConfA] = 0;
+    intel_display::Display d3(nothing, IntelGpuArchitecture::Gen9_5);
+    IntelPanelOutput p3(nothing, d3, IntelGpuArchitecture::Gen9_5, &fake_delay);
+    CHECK(!d3.probe() && !p3.probe());
+    IntelRegs fine;                                         // (no way to wait: found, but not lit again)
+    IntelRegs::current = &fine;
+    intel_display::Display d4(fine, IntelGpuArchitecture::Gen9_5);
+    CHECK(d4.probe());
+    IntelPanelOutput p4(fine, d4, IntelGpuArchitecture::Gen9_5, nullptr);
+    CHECK(p4.probe() && !p4.can_light_panel());
+    p4.release_panel();
+    CHECK(p4.light_panel() == PanelLightStatus::NotSupported && !p4.panel_lit());
+    p4.set_delay(&fake_delay);
+    CHECK(p4.can_light_panel() && p4.light_panel() == PanelLightStatus::Ok);
+  }
+  {   // Xe-LP: the pipe's own transcoder on DDI A, DP_TP_CTL of the transcoder.
+    IntelRegs regs(true);
+    IntelRegs::current = &regs;
+    intel_display::Display display(regs, IntelGpuArchitecture::XeLp);
+    CHECK(display.probe());
+    IntelPanelOutput panel(regs, display, IntelGpuArchitecture::XeLp, &fake_delay);
+    CHECK(panel.probe() && panel.transcoder() == 0 && panel.port() == 0);
+    panel.release_panel();
+    CHECK(!(regs.r[P::kTglDpTpCtlA] & P::kDpTpEnable) && !(regs.r[P::kTransConfA] & P::kConfEnable));
+    CHECK(panel.light_panel() == PanelLightStatus::Ok && (regs.r[P::kTglDpTpCtlA] & P::kDpTpPatternMask) == P::kDpTpNormal && (regs.r[P::kTransConfA] & P::kConfState));
+    IntelRegs hdmi(true);                                   // (the pipe drives HDMI on DDI B: not the panel)
+    IntelRegs::current = &hdmi;
+    hdmi.r[hdmi.func] = P::kFuncEnable | (2u << 27);
+    intel_display::Display d(hdmi, IntelGpuArchitecture::XeLp);
+    CHECK(d.probe());
+    IntelPanelOutput p(hdmi, d, IntelGpuArchitecture::XeLp, &fake_delay);
+    CHECK(!p.probe());
+  }
+  {   // In the mux switch: the panel goes to the discrete GPU and, unlike with the firmware framebuffer, comes back.
+    IntelRegs regs;
+    IntelRegs::current = &regs;
+    intel_display::Display display(regs, IntelGpuArchitecture::Gen9_5);
+    CHECK(display.probe());
+    IntelPanelOutput panel(regs, display, IntelGpuArchitecture::Gen9_5, &fake_delay);
+    CHECK(panel.probe());
+    Log log;
+    FakeMux mux(log);
+    FakeOutput d(log, kD);
+    GpuMuxSwitch sw(mux, nullptr, 0, 1);
+    sw.attach_output(kI, &panel);
+    sw.attach_output(kD, &d);
+    CHECK(sw.switch_to(kD).ok() && !panel.panel_lit() && d.lit && mux.display == kD);
+    const char* why = nullptr;
+    CHECK(sw.can_switch_to(kI, &why));
+    const GpuMuxSwitchReport back = sw.switch_to(kI);
+    CHECK(back.status == GpuMuxSwitchStatus::Switched && panel.panel_lit() && !d.lit && mux.display == kI);
+    // The panel that would not light: the switch is undone, the panel stays with the discrete GPU.
+    CHECK(sw.switch_to(kD).ok());
+    regs.power_stuck = true;
+    const GpuMuxSwitchReport failed = sw.switch_to(kI);
+    CHECK(failed.status == GpuMuxSwitchStatus::LightFailed && failed.light == PanelLightStatus::PowerFailed && failed.rolled_back && failed.rollback_clean);
+    CHECK(d.lit && !panel.panel_lit() && mux.display == kD);
+  }
+  IntelRegs::current = nullptr;
+}
+
+// --- The desktop's monitor of the panel (GpuMuxDesktop over SystemMonitors) ----------------------------------------------------------------
+
+namespace {
+
+struct HostAllocator final : allocators::IAllocator {
+  std::atomic<int> live{0};
+  void* allocate(uint64_t size) override { if (!size) return nullptr; ++live; return aligned_alloc(64, (size + 63) / 64 * 64); }
+  void* allocate_aligned(uint64_t size, uint64_t alignment) override {
+    if (!size) return nullptr;
+    ++live;
+    if (alignment < 64) alignment = 64;
+    return aligned_alloc(alignment, (size + alignment - 1) / alignment * alignment);
+  }
+  void deallocate(void* p) override { if (p) { --live; free(p); } }
+};
+
+// A GPU's panel output that drives a fake GPU: lighting gives its screen the panel's size and marks the connector connected.
+struct ScreenOutput final : IPanelOutput {
+  fakemon::FakeGpu& gpu;
+  fakemon::FakeSource& source;
+  uint32_t connector;
+  bool lit = false, relight = true, show_connector = true;
+  ScreenOutput(fakemon::FakeGpu& g, fakemon::FakeSource& s, uint32_t c, bool lit_now) : gpu(g), source(s), connector(c), lit(lit_now) {}
+  bool has_panel_output() const override { return true; }
+  bool panel_lit() const override { return lit; }
+  bool can_light_panel() const override { return relight || lit; }
+  PanelLightStatus light_panel() override {
+    lit = true;
+    gpu.w = 1920;
+    gpu.h = 1080;
+    if (show_connector) source.connectors[connector].info.connected = true;
+    return PanelLightStatus::Ok;
+  }
+  void release_panel() override {
+    lit = false;
+    source.connectors[connector].info.connected = false;
+  }
+  const char* panel_status() const override { return lit ? "lit" : "released"; }
+};
+
+}  // namespace
+
+static void test_desktop_follows() {
+  HostAllocator a;
+  {
+    // The integrated GPU (index 0) shows the panel as its one display (the firmware's framebuffer: an Unknown connector); the discrete GPU
+    // (index 1) waits with nothing lit, its eDP connector empty.
+    fakemon::FakeSource isrc, dsrc;
+    isrc.multi = false;
+    isrc.add("Display-0", fakemon::small_edid(), true, ConnectorType::Unknown);
+    dsrc.multi = false;
+    dsrc.add("eDP-1", fakemon::small_edid(), false, ConnectorType::Internal);
+    dsrc.add("HDMI-1", fakemon::Bytes(), false, ConnectorType::Hdmi);
+    fakemon::FakeGpu igpu, dgpu;
+    igpu.source = &isrc;
+    igpu.w = 1920;
+    igpu.h = 1080;
+    dgpu.source = &dsrc;
+    dgpu.w = dgpu.h = 0;
+    SystemMonitors monitors(&igpu, a);
+    CHECK(monitors.add_gpu(&dgpu, 1));
+    monitors.initialize();
+    CHECK(monitors.layout().count() == 1 && monitors.layout().at(0).id == 0 && monitors.apply());
+    CHECK(monitors.set_scale(0, 125) && monitors.apply());
+    const MonitorRect rect = monitors.layout().at(0).rect;
+    Log log;
+    FakeMux mux(log);
+    ScreenOutput i(igpu, isrc, 0, true), d(dgpu, dsrc, 0, false);
+    GpuMuxSwitch sw(mux, nullptr, 0, 1);
+    sw.attach_output(kI, &i);
+    sw.attach_output(kD, &d);
+    GpuMuxDesktop desk(sw, monitors, &igpu, &dgpu);
+    const char* why = nullptr;
+    GpuMuxTarget at = kD;
+    CHECK(desk.active(&at) && at == kI && desk.can_switch_to(kD, &why) && strcmp(desk.gpu_name(kD), "fake gpu") == 0);
+    // To the discrete GPU: the panel's monitor is the discrete GPU's eDP now, in the same place at the same scale, and primary.
+    IBuiltInScreenSwitch::Result r = desk.switch_to(kD);
+    CHECK(r.ok && mux.display == kD && d.lit && !i.lit);
+    CHECK(monitors.layout().count() == 1 && monitors.layout().at(0).id == SystemMonitors::kIdsPerGpu && monitors.panel_id() == SystemMonitors::kIdsPerGpu);
+    CHECK(monitors.layout().at(0).scale_percent == 125 && monitors.layout().at(0).primary && monitors.layout().at(0).rect.width == rect.width &&
+          monitors.layout().at(0).rect.height == rect.height);
+    CHECK(!monitors.find(0)->connected() && monitors.find(SystemMonitors::kIdsPerGpu)->connected() && monitors.find(SystemMonitors::kIdsPerGpu)->gpu() == 1);
+    MonitorTarget targets[4];
+    CHECK(monitors.targets(targets, 4) == 1 && targets[0].gpu == &dgpu && targets[0].gpu_index == 1);
+    CHECK(monitors.apply() && monitors.needs_compositing());
+    // A poll that sees the firmware's display still "connected" does not take the panel back.
+    isrc.changed = true;
+    (void)monitors.poll();
+    CHECK(monitors.layout().count() == 1 && monitors.layout().at(0).id == SystemMonitors::kIdsPerGpu);
+    // And back: the integrated GPU's monitor again, same place and scale; nothing is copied to the discrete GPU any more.
+    r = desk.switch_to(kI);
+    CHECK(r.ok && mux.display == kI && i.lit && !d.lit);
+    CHECK(monitors.layout().count() == 1 && monitors.layout().at(0).id == 0 && monitors.layout().at(0).scale_percent == 125 && monitors.layout().at(0).primary);
+    CHECK(monitors.targets(targets, 4) == 0 && monitors.find(0)->connected() && !monitors.find(SystemMonitors::kIdsPerGpu)->connected());
+    CHECK(monitors.apply());
+    // The monitors cannot follow (the discrete GPU lists no panel once lit): the panel is switched back, the layout as it was.
+    d.show_connector = false;
+    log.clear();
+    r = desk.switch_to(kD);
+    CHECK(!r.ok && r.rolled_back && strstr(r.reason, "did not appear") && mux.display == kI && i.lit && !d.lit);
+    CHECK(monitors.layout().count() == 1 && monitors.layout().at(0).id == 0);
+    // With the firmware framebuffer on the integrated side the panel cannot come back: the page is told why.
+    d.show_connector = true;
+    i.relight = false;
+    CHECK(desk.switch_to(kD).ok && !desk.can_switch_to(kI, &why) && why && *why);
+    CHECK(!desk.switch_to(kI).ok && monitors.layout().at(0).id == SystemMonitors::kIdsPerGpu);
+  }
+  {
+    // A side the desktop has no driver for, and a discrete GPU the monitors were not told about (added when the panel moves there).
+    fakemon::FakeSource isrc, dsrc;
+    isrc.multi = false;
+    isrc.add("Display-0", fakemon::small_edid(), true, ConnectorType::Unknown);
+    dsrc.multi = false;
+    dsrc.add("eDP-1", fakemon::small_edid(), false, ConnectorType::Internal);
+    fakemon::FakeGpu igpu, dgpu;
+    igpu.source = &isrc;
+    igpu.w = 1920;
+    igpu.h = 1080;
+    dgpu.source = &dsrc;
+    dgpu.w = dgpu.h = 0;
+    SystemMonitors monitors(&igpu, a);
+    monitors.initialize();
+    Log log;
+    FakeMux mux(log);
+    ScreenOutput i(igpu, isrc, 0, true), d(dgpu, dsrc, 0, false);
+    GpuMuxSwitch none(mux, nullptr, 0, -1);
+    none.attach_output(kI, &i);
+    none.attach_output(kD, &d);
+    GpuMuxDesktop no_driver(none, monitors, &igpu, nullptr);
+    const char* why = nullptr;
+    CHECK(!no_driver.can_switch_to(kD, &why) && strstr(why, "no display driver") && !no_driver.switch_to(kD).ok && mux.display == kI);
+    GpuMuxSwitch sw(mux, nullptr, 0, 3);
+    sw.attach_output(kI, &i);
+    sw.attach_output(kD, &d);
+    GpuMuxDesktop late(sw, monitors, &igpu, &dgpu);
+    CHECK(monitors.gpu_count() == 1 && late.switch_to(kD).ok && monitors.gpu_count() == 2 && monitors.gpu_of(monitors.layout().at(0).id) == 3);
+  }
+  CHECK(a.live == 0);
+}
+
 int main() {
   test_success();
   test_failures();
@@ -488,6 +861,8 @@ int main() {
   test_gop_side();
   test_real_manager();
   test_threads();
+  test_intel_panel();
+  test_desktop_follows();
   printf("GpuMuxSwitchTest: %d checks, %d failed\n", g_checks, g_failed);
   return g_failed ? 1 : 0;
 }

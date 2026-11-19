@@ -36,6 +36,11 @@
 // monitors' pixels in a row, starting at 0): physical_placements() gives each monitor's place on its own GPU's surface, and targets() says which
 // monitors are not on the display device, so that MonitorDisplay copies their part of the desktop to their GPU's screen. A monitor's id says which
 // GPU it is on: the display device's are its connector numbers, the k-th other GPU's are k * kIdsPerGpu + connector.
+//
+// A muxed laptop's built-in panel moves between GPUs (Multi/GpuMuxSwitch): move_panel() then takes the panel's monitor off the GPU that let it go and
+// puts it on the one that lit it, in the same place of the layout at the same scale (and primary if it was), so the next apply() shows it on the new
+// GPU (its targets() entry, or none when it came back to the display device). A GPU added with a zero-sized screen (a discrete GPU waiting with
+// nothing lit for the panel) shows none of its monitors until then.
 #pragma once
 #include "Hardware/GraphicsProcessingUnit/IGraphicsProcessingUnit.hpp"
 #include "Hardware/Monitor/Monitor.hpp"
@@ -62,11 +67,25 @@ class SystemMonitors {
 
   // The display device's index in the machine's GPU list (GpuPool), recorded in its monitors (default 0).
   void set_display_gpu_index(uint32_t gpu_index) { sources_[0].gpu_index = gpu_index; }
-  // Another GPU with a display driver whose monitors the desktop spans too (`gpu_index`: its index in GpuPool). Call before initialize(). False if
-  // `gpu` is null or the display device, or kMaxGpus are there. `gpu` must outlive this object.
+  // Another GPU with a display driver whose monitors the desktop spans too (`gpu_index`: its index in GpuPool). Normally called before initialize();
+  // one added after it has its monitors listed but none of them in the layout (move_panel() and poll() put them there). False if `gpu` is null or
+  // the display device, or kMaxGpus are there. `gpu` must outlive this object.
   [[nodiscard]] bool add_gpu(IGraphicsProcessingUnit* gpu, uint32_t gpu_index);
   // The display device and the GPUs added.
   uint32_t gpu_count() const { return source_count_; }
+  // The driver of the GPU with that index in GpuPool (the display device or one added), or null.
+  IGraphicsProcessingUnit* gpu_driver(uint32_t gpu_index) const;
+
+  // --- A muxed laptop's built-in panel moved from the GPU `from_gpu_index` to `to_gpu_index` (both GpuPool indices): its monitor goes from the old
+  // GPU's monitors (marked not connected there, and not taken back by poll() while it is away) to the new GPU's (whose connectors are read again),
+  // keeping its place in the layout, its scale and whether it is primary; the new GPU shows it at the size its screen has (a GPU that shows one
+  // display) or the mode it had. `to_driver` adds the new GPU first when it is not on the desktop yet. Call apply() after. False (nothing changed)
+  // when no monitor on the old GPU is the panel (an Internal connector, else the only one in use) or the new GPU lists none (an Internal connector
+  // that is connected; on a GPU without Internal connectors the only connected one not in use, or its screen).
+  [[nodiscard]] bool move_panel(uint32_t from_gpu_index, uint32_t to_gpu_index, IGraphicsProcessingUnit* to_driver = nullptr);
+  // The id of the monitor move_panel() last put on a GPU (kNoMonitor before).
+  static constexpr uint32_t kNoMonitor = 0xFFFFFFFFu;
+  uint32_t panel_id() const { return panel_id_; }
 
   void initialize();
 
@@ -161,6 +180,7 @@ class SystemMonitors {
     uint32_t gpu_index = 0;
     bool multi = false;
     uint32_t surface_width = 0, surface_height = 0;
+    uint32_t released = kNoMonitor;   // the built-in panel's monitor while the panel is on another GPU (poll() leaves it alone)
   };
 
   uint32_t source_index(uint32_t id) const {
@@ -180,6 +200,10 @@ class SystemMonitors {
   bool show_source(uint32_t source);
   bool show_secondaries();
   bool sync_device_mode(uint32_t source = 0);
+  int32_t source_of_gpu(uint32_t gpu_index) const;
+  bool source_has_monitors(uint32_t source) const;
+  // Reads every connector of a GPU again into its monitors (a connector not seen before is added); the layout is not touched.
+  void rescan(uint32_t source);
 
   IGraphicsProcessingUnit* gpu_;
   IMonitorSource* source_ = nullptr;
@@ -189,6 +213,8 @@ class SystemMonitors {
   MonitorLayout layout_;
   bool multi_ = false;
   bool applied_ = false;
+  bool initialized_ = false;
+  uint32_t panel_id_ = kNoMonitor;
   uint32_t desktop_width_ = 0, desktop_height_ = 0, surface_width_ = 0, surface_height_ = 0;
   uint32_t waiting_ = 0, generation_ = 0;
 };

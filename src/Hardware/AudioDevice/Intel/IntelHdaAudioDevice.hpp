@@ -132,6 +132,12 @@ class IntelHdaAudioDevice final : public RingAudioDevice {
   // outlive the device or be replaced by null first.
   void set_power_observer(IPciFunctionPowerObserver* observer, uint32_t idle_ms = kDefaultIdleSuspendMs);
   PowerState power_state() const { return static_cast<PowerState>(__atomic_load_n(&power_state_, __ATOMIC_ACQUIRE)); }
+  // A display came or went on the GPU this controller belongs to (Multi/GpuHotplug: the GPU's hot-plug detection was dark while it slept, and
+  // the codec's unsolicited responses are not used here). The codec's pins are read again (presence detect and ELD valid) and the output moves
+  // to the pin with a display, as retarget() does; a suspended controller is resumed for it (its resume rediscovers the codec) and goes idle
+  // again after the idle period. True if it runs afterwards with an output pin; false when it has failed or was never running.
+  [[nodiscard]] bool connections_changed();
+  uint32_t connection_changes() const { return __atomic_load_n(&connection_changes_, __ATOMIC_RELAXED); }
   // The PCI function (zero for a controller given by its registers alone).
   PciAddress pci_address() const { return device_.address; }
   // How many suspends and resumes there were (statistics, tests).
@@ -194,6 +200,7 @@ class IntelHdaAudioDevice final : public RingAudioDevice {
   bool reset_controller();
   [[nodiscard]] bool suspend_locked();          // (power_mutex_ held)
   [[nodiscard]] bool resume_locked();
+  [[nodiscard]] bool retarget_locked();          // (power_mutex_ held)
   void wake_function();                         // observer busy, D0, the saved header back (power_mutex_ held)
   bool hardware_usable() const { return !__atomic_load_n(&hw_suspended_, __ATOMIC_ACQUIRE); }
   void set_hardware_usable(bool usable) { __atomic_store_n(&hw_suspended_, !usable, __ATOMIC_RELEASE); }   // (mutex_ held)
@@ -267,6 +274,7 @@ class IntelHdaAudioDevice final : public RingAudioDevice {
   bool timer_started_ = false;             // (power_mutex_) last_active_ms_ is set
   PciSavedHeader saved_header_;            // (power_mutex_) the function's header from the last suspend
   uint32_t suspends_ = 0, resumes_ = 0;    // (atomic)
+  uint32_t connection_changes_ = 0;        // (atomic) connections_changed() calls that re-read the pins
 };
 
 }  // namespace hardware

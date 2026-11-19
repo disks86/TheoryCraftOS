@@ -16,7 +16,7 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-// The sequences follow nouveau (MIT license): nvkm/engine/disp/nv50.c, gf119.c, gv100.c, tu102.c (the *_disp_init and *_core_init/fini
+// The sequences follow nouveau (MIT license): nvkm/engine/disp/nv50.c, gf119.c, gv100.c, tu102.c, ga102.c (the *_disp_init and *_core_init/fini
 // functions), nvkm/core/ramht.c, nvkm/engine/dma/user*.c and dispnv50/core*.c / wndwc37e.c (the update and surface methods). All numbers are
 // in NvDisplayHw.hpp.
 #include "Hardware/GraphicsProcessingUnit/NVIDIA/Nvkm/NvDisplay.hpp"
@@ -60,7 +60,8 @@ DisplayClass display_class(const Chip& chip) {
     case Family::Pascal: return DisplayClass::Gf119;
     case Family::Volta: return DisplayClass::Gv100;
     case Family::Turing: return DisplayClass::Tu102;
-    case Family::Ampere:
+    // GA102..GA107: nouveau drives their display without GSP (ga102_disp). GA100 has none.
+    case Family::Ampere: return chip.chipset == 0x170 ? DisplayClass::Gsp : DisplayClass::Ga102;
     case Family::Hopper:
     case Family::Ada:
     case Family::Blackwell: return DisplayClass::Gsp;
@@ -74,6 +75,7 @@ const char* display_class_name(DisplayClass display_class) {
     case DisplayClass::Gf119: return "GF119 (907d)";
     case DisplayClass::Gv100: return "GV100 (c37d)";
     case DisplayClass::Tu102: return "TU102 (c57d)";
+    case DisplayClass::Ga102: return "GA102 (c67d)";
     case DisplayClass::Gsp: return "GSP-managed";
     default: return "none";
   }
@@ -83,7 +85,7 @@ const char* display_status_text(DisplayStatus status) {
   switch (status) {
     case DisplayStatus::Ok: return "ok";
     case DisplayStatus::NotNative: return "the display engine of this chip is not programmed natively";
-    case DisplayStatus::NeedsGsp: return "the display of Ampere and later chips runs through the GSP firmware";
+    case DisplayStatus::NeedsGsp: return "the display of Ada and later chips runs through the GSP firmware";
     case DisplayStatus::NoHeads: return "the display reports no heads";
     case DisplayStatus::NoMemory: return "no video memory for the display engine";
     case DisplayStatus::OwnershipTimeout: return "the VBIOS did not hand the display over";
@@ -158,7 +160,8 @@ DisplayStatus NvDisplayEngine::probe() {
   class_ = nv::display_class(chip_);
   probed_ = false;
   if (class_ == DisplayClass::Gsp) return fail(DisplayStatus::NeedsGsp, nullptr);
-  if (class_ == DisplayClass::None || !chip_.display_native) return fail(DisplayStatus::NotNative, nullptr);
+  // (Chip::display_native covers Tesla..Turing, the chips whose boot display is taken over; GA102's display is driven only from scratch.)
+  if (class_ == DisplayClass::None || (class_ != DisplayClass::Ga102 && !chip_.display_native)) return fail(DisplayStatus::NotNative, nullptr);
   switch (class_) {
     case DisplayClass::Nv50: {
       heads_ = kNv50Heads;
@@ -178,7 +181,8 @@ DisplayStatus NvDisplayEngine::probe() {
       break;
     }
     case DisplayClass::Gv100:
-    case DisplayClass::Tu102: {
+    case DisplayClass::Tu102:
+    case DisplayClass::Ga102: {
       const uint32_t counts = r_.read32(kGv100Counts), present = r_.read32(kGv100Present);
       if (counts == 0xffffffffu || present == 0xffffffffu) return fail(DisplayStatus::NoHeads, "the display engine does not answer");
       heads_ = counts & 0xf;
@@ -237,7 +241,8 @@ bool NvDisplayEngine::armed_surface(uint32_t head, ScanoutSurface* out, uint32_t
       break;
     }
     case DisplayClass::Gv100:
-    case DisplayClass::Tu102: {
+    case DisplayClass::Tu102:
+    case DisplayClass::Ga102: {
       bool found = false;
       for (uint32_t w = 0; w < kMaxWindows && !found; ++w) {
         if (!(window_mask_ & (1u << w))) continue;
@@ -292,8 +297,9 @@ void NvDisplayEngine::write_capabilities() {
       break;
     }
     case DisplayClass::Gv100:
-    case DisplayClass::Tu102: {
-      const bool turing = class_ == DisplayClass::Tu102;
+    case DisplayClass::Tu102:
+    case DisplayClass::Ga102: {
+      const bool turing = class_ == DisplayClass::Tu102 || class_ == DisplayClass::Ga102;   // (ga102_disp.init = tu102_disp_init)
       r_.write32(kGv100LockPinsMirror, turing ? kTu102LockPinsValue : r_.read32(kGv100LockPins));
       for (uint32_t i = 0; i < kMaxSors; ++i) {
         if (!(sor_mask_ & (1u << i))) continue;
@@ -351,12 +357,14 @@ bool NvDisplayEngine::push_target(const GpuMemory& memory, uint32_t* target) con
   return false;
 }
 
-// The RAMHT (nvkm_ramht_hash / nvkm_ramht_insert): the handle folded into kRamhtBits, the channel id mixed in, linear probing.
+// The RAMHT (nvkm_ramht_hash / nvkm_ramht_insert): the handle folded into the table's bits, the channel id mixed in, linear probing.
+// 4 KiB (9 bits) before Volta, 8 KiB (10 bits) from Volta on.
 bool NvDisplayEngine::ramht_insert(uint32_t chid, uint32_t handle, uint32_t object_offset) {
-  const uint32_t entries = kRamhtBytes / 8;
+  const uint32_t entries = ramht_bytes() / 8;
+  const uint32_t bits = pre_volta() ? kRamhtBits : kGv100RamhtBits;
   uint32_t hash = 0;
-  for (uint32_t h = handle; h; h >>= kRamhtBits) hash ^= h & (entries - 1);
-  hash ^= chid << (kRamhtBits - 4);
+  for (uint32_t h = handle; h; h >>= bits) hash ^= h & (entries - 1);
+  hash ^= chid << (bits - 4);
   hash &= entries - 1;
   uint32_t context = 0;
   switch (class_) {
@@ -411,7 +419,7 @@ DisplayStatus NvDisplayEngine::setup_instance() {
     return fail(DisplayStatus::NoMemory, "no video memory for the display's instance memory or notifier");
   instance_.cpu.fill(0);
   notifier_.cpu.fill(0);
-  instance_used_ = kRamhtBytes;
+  instance_used_ = ramht_bytes();
   if (pre_volta()) {
     r_.write32(kInstance, static_cast<uint32_t>(instance_.gpu_address >> 8) | kInstanceEnableNv50);
   } else {
@@ -489,6 +497,40 @@ DisplayStatus NvDisplayEngine::start_window(uint32_t window) {
   return DisplayStatus::Ok;
 }
 
+// The window's immediate channel (gv100_disp_wimm: a DMA channel like the window's, without context DMAs: it names no memory).
+DisplayStatus NvDisplayEngine::start_window_immediate() {
+  if (wimm_.up) return DisplayStatus::Ok;
+  if (pre_volta() || !window_.up) return fail(DisplayStatus::NotClaimed, "no window channel");
+  if (!wimm_.push.valid()) wimm_.push = memory_.allocate(MemoryTarget::Vram, kPushBytes, kPushBytes);
+  uint32_t target = 0;
+  if (!wimm_.push.valid() || wimm_.push.cpu.size() < kPushBytes || !push_target(wimm_.push, &target) || (wimm_.push.gpu_address >> 40) != 0) {
+    if (wimm_.push.valid()) memory_.release(wimm_.push);
+    wimm_.push = GpuMemory();
+    return fail(DisplayStatus::NoMemory, "no memory for the window immediate channel's push buffer");
+  }
+  wimm_.push.cpu.fill(0);
+  memory_.flush(wimm_.push);
+  const uint32_t w = window_.window;
+  wimm_.chid = kGv100WimmChid + w;
+  wimm_.window = w;
+  wimm_.cursor = 0;
+  wimm_.user = kWindowUserGv100 + (wimm_.chid - 1) * kWindowUserStride;
+  const uint32_t poff = wimm_.chid * kGv100ChannelStride;
+  r_.write32(kGv100PushLow + poff, target | static_cast<uint32_t>(wimm_.push.gpu_address >> 8));
+  r_.write32(kGv100PushHigh + poff, 0);
+  r_.write32(kGv100Push2 + poff, kGv100Push2Value);
+  r_.write32(kGv100Push3 + poff, kGv100Push3Value);
+  r_.write32(wimm_.user + kUserPut, 0);
+  r_.write32(kGv100CoreCtrl + poff, kGv100WindowStart);
+  if (!wait_register(kGv100WindowIdle + (wimm_.chid - 1) * 4, kGv100WindowIdleMask, kGv100WindowIdleValue)) {
+    wimm_.up = true;      // (stopped and released by stop_channel)
+    stop_channel(wimm_);
+    return fail(DisplayStatus::ChannelTimeout, "the window immediate channel did not start");
+  }
+  wimm_.up = true;
+  return DisplayStatus::Ok;
+}
+
 DisplayStatus NvDisplayEngine::claim(uint32_t window) {
   if (!probed_) return fail(DisplayStatus::NotClaimed, "claim before probe");
   if (claimed_) return DisplayStatus::Ok;
@@ -546,6 +588,7 @@ void NvDisplayEngine::stop_channel(Channel& channel) {
 }
 
 void NvDisplayEngine::shutdown() {
+  stop_channel(wimm_);
   stop_channel(window_);
   stop_channel(core_);
   claimed_ = false;
@@ -634,6 +677,22 @@ DisplayStatus NvDisplayEngine::core_send(const MethodList& methods) {
   return submit(core_, methods);
 }
 
+DisplayStatus NvDisplayEngine::window_update(const MethodList& methods) {
+  if (!claimed_ || pre_volta() || !window_.up) return fail(DisplayStatus::NotClaimed, nullptr);
+  return update(window_, methods, true);
+}
+
+DisplayStatus NvDisplayEngine::window_immediate_update(const MethodList& methods) {
+  if (!claimed_ || pre_volta()) return fail(DisplayStatus::NotClaimed, nullptr);
+  DisplayStatus s = start_window_immediate();
+  if (s != DisplayStatus::Ok) return s;
+  MethodList list;
+  bool ok = true;
+  for (uint32_t i = 0; i < methods.size() && ok; ++i) ok = list.add(methods.method(i), methods.value(i));
+  if (!ok || methods.overflowed() || !list.add(mc37b::kUpdate, mc37b::kUpdateValue)) return fail(DisplayStatus::BadArgument, "too many methods in one update");
+  return submit(wimm_, list);
+}
+
 void NvDisplayEngine::surface_methods(uint32_t head, const ScanoutSurface& s, MethodList* out) const {
   const uint32_t size = s.height << 16 | (s.width & 0xffff);
   switch (class_) {
@@ -712,6 +771,8 @@ bool NvNativeDisplay::engage_display(const NvFirmwareFramebuffer& firmware, Byte
   if (!firmware.pixels.empty() && firmware.pixels.size() < picture) return fail("the firmware's framebuffer is smaller than its mode");
   DisplayStatus s = engine_.probe();
   if (s != DisplayStatus::Ok) return fail(engine_.reason());
+  if (engine_.display_class() == DisplayClass::Ga102)   // (the boot display of an Ampere card: its GOP mode stays, no GSP is booted here)
+    return fail("the takeover is not done on GA102: its boot display stays the firmware's (no GSP is run; mode setting from scratch only)");
 
   // The heads that show the firmware's picture (several when it is cloned), all from the same surface.
   uint32_t heads = 0, window = 0;

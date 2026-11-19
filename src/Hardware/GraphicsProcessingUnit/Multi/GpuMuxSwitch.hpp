@@ -35,8 +35,9 @@
 // With the firmware's framebuffer as the integrated GPU's driver (GopPanelOutput), the switch to the discrete GPU works (the integrated GPU's
 // picture simply stops reaching the panel) and the switch back is refused: nothing can light the panel on that side again.
 //
-// Moving the desktop onto the other GPU's framebuffer is the caller's job (a settings page): this only moves the panel. Thread-safe: every
-// call may come from any core; a switch holds the lock for its whole length (the panel power sequence takes several hundred milliseconds).
+// This only moves the panel. GpuMuxDesktop (below) moves the desktop's monitor of it along (SystemMonitors::move_panel), for the Display settings
+// page; making the monitors real on the new GPU (the next frame there) is the page's applier. Thread-safe: every call may come from any core; a
+// switch holds the lock for its whole length (the panel power sequence takes several hundred milliseconds).
 #pragma once
 #include <stdint.h>
 #include "Hardware/GraphicsProcessingUnit/Multi/GpuMuxPanel.hpp"
@@ -46,6 +47,8 @@
 namespace hardware {
 
 class GpuManager;
+class IGraphicsProcessingUnit;
+class SystemMonitors;
 
 // Keeps a GPU awake while the panel is on it.
 class IGpuLeases {
@@ -129,6 +132,8 @@ class GpuMuxSwitch {
   uint32_t switches() const { return __atomic_load_n(&switches_, __ATOMIC_RELAXED); }
   // Whether the switcher holds a lease on that side's GPU (the side the panel moved to, after a switch).
   bool holds_lease(GpuMuxTarget side) const;
+  // That side's GPU (its index in GpuPool, -1 for none), as given to the constructor.
+  int32_t gpu_index(GpuMuxTarget side) const { return index_[slot(side)]; }
 
   // The machine's switcher, for a display settings page: set once at boot (main.cpp), null when the machine has no mux. Cleared when that
   // switcher is destroyed.
@@ -154,6 +159,30 @@ class GpuMuxSwitch {
   bool known_ = true;
   bool in_flight_ = false;
   uint32_t switches_ = 0;
+};
+
+// The switch with the desktop's monitors (IBuiltInScreenSwitch, for the Display settings page): switch_to() moves the panel (GpuMuxSwitch), then its
+// monitor from the old GPU's monitors to the new one's (SystemMonitors::move_panel); if the monitors find no panel on the new GPU the panel is
+// switched back. `integrated` / `discrete` are the two GPUs' display drivers (may be null: the one the monitors know by its index, or none); a
+// driver the monitors do not span yet (a discrete GPU added with nothing lit) is added when the panel moves there. Everything must outlive this.
+class GpuMuxDesktop final : public IBuiltInScreenSwitch {
+ public:
+  GpuMuxDesktop(GpuMuxSwitch& mux_switch, SystemMonitors& monitors, IGraphicsProcessingUnit* integrated, IGraphicsProcessingUnit* discrete)
+      : switch_(mux_switch), monitors_(monitors) {
+    driver_[0] = integrated;
+    driver_[1] = discrete;
+  }
+  [[nodiscard]] bool active(GpuMuxTarget* out) const override { return switch_.active(out); }
+  const char* gpu_name(GpuMuxTarget side) const override;
+  [[nodiscard]] bool can_switch_to(GpuMuxTarget side, const char** why) const override;
+  [[nodiscard]] Result switch_to(GpuMuxTarget side) override;
+
+ private:
+  IGraphicsProcessingUnit* driver(GpuMuxTarget side) const;
+
+  GpuMuxSwitch& switch_;
+  SystemMonitors& monitors_;
+  IGraphicsProcessingUnit* driver_[2] = {};
 };
 
 }  // namespace hardware

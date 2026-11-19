@@ -38,6 +38,18 @@ class AtomI2c {
   };
   // The entry with this id (ATOM_I2C_ID_CONFIG_ACCESS.ucAccess), or an invalid Bus if there is none.
   static Bus lookup(ConstByteView bios, uint8_t id);
+
+  // ATOM firmware images (data table format 2.1: Vega and later) have no GPIO_I2C_Info table: the I2C record's id names an entry of the gpio_pin_lut table
+  // (atom_gpio_pin_lut_v2_1, 8-byte atom_gpio_pin_assignment entries, content revision 1), the first one whose hardware capable bit, engine id and lane mux agree with the id
+  // (bios_parser2.c's get_gpio_i2c_info). The entry gives the clock pad's A register (an absolute register number) and its bit; the display engine's own table says which
+  // DDC line that is (amd_dce12::ddc_line_of) and where the line's other registers are. found is false if the image has no such table or entry.
+  struct PinV21 {
+    bool found = false;
+    uint32_t a_register = 0;
+    uint8_t shift = 0;
+    uint8_t gpio_id = 0;
+  };
+  static PinV21 lookup_v21(ConstByteView bios, uint8_t i2c_id);
 };
 
 }  // namespace hardware
