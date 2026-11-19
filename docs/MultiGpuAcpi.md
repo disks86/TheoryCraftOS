@@ -44,7 +44,7 @@ code does not need the interpreter's `NodeKind`, so the interpreter was not chan
 
   It keeps going after a fault, so that as much as possible comes up, and then returns false.
 
-There is no reference counting between devices that share a resource.
+Resources shared with other devices are reference counted: see "Shared power resources" below.
 
 ## NVIDIA (`find()` with vendor `0x10DE`)
 
@@ -120,9 +120,67 @@ into root Names. It covers:
 
 - **Not checked on hardware.** The AML is test-built.
 - `_SEG`, deeper bridge hierarchies, and the case where no hint is given (see above).
-- Power-resource reference counting.
-- The root port's `_DSM` function 9 (a shorter D3cold-to-D0 delay). `power_on_delay_ms()` stays at 100.
 - JT power control (`JT_FUNC_POWERCONTROL`) and GC6.
 - Optimus `_DSM` quirks: the DMI lists Linux keeps.
 - ATPX functions 8 and 9 (connector mapping).
 - The `GpuPowerMechanism` list has no entry for the old NVIDIA hybrid `_DSM`, so `NvidiaHybridDsm` reports `NvidiaOptimus`.
+
+## Shared power resources
+
+ACPI 6 (7.2) lets several devices share a power resource; it may only be turned off when no device that needs it is in a state that needs
+it. Linux keeps a reference count per resource (`drivers/acpi/power.c`). Here that is `AcpiPowerResourceRegistry`
+(`GpuAcpiNamespace.hpp`), one per machine (`AcpiPowerResourceRegistry::global()`, constant-initialized):
+
+- It records, per resource node, the holders (namespace Devices) and whether each needs the resource now. Up to 32 resources, 8 holders each.
+- `introduce(resource, holder)`: the first sighting counts the holder as needing the resource (it was found in D0); later calls change nothing.
+- `need()` / `drop()` change one holder and return how many need it now / how many others still do. `holders_needing()` and `needs()` read it.
+- A full table means "not tracked": `need()` says 1 and `drop()` says 0, which is the old behaviour (the resource is turned off).
+- Thread safe with its own `kernel::Mutex`. The decision and the `_ON`/`_OFF` that follows run under the interpreter's lock, so another
+  holder cannot change things in between.
+
+`GpuPowerResourceSet` uses it:
+
+- `read()` introduces the GPU as holder of its `_PR0` and `_PR3` resources. The holder (`identity()`) is the GPU's Device, or the Device that
+  holds the resources when the GPU has none.
+- `power_off()` drops the GPU from all of them and runs `_OFF` only for `_PR3` resources no other holder needs (another GPU, another device's
+  root port on the same rail). If an `_OFF` faults, the GPU stays in D3hot and takes its claim back.
+- `power_on()` takes them all again before turning them on.
+- `use_registry()` points a set at a private registry (tests).
+
+Other code (the HD-audio function, a Wi-Fi root port) can register as a holder with `introduce()`/`need()`/`drop()` on the global registry.
+Nothing does yet: today only GPU sets are holders.
+
+## Device readiness durations (PCI firmware `_DSM` function 9)
+
+The PCI Firmware Specification (3.3, 4.6.9, "_DSM for Specifying Device Readiness Durations") defines function 9 of the PCI `_DSM`, UUID
+`E5C937D0-3553-4D7A-9117-EA4D19C3434D` (`kPciFirmwareDsmUuid`), revision 3. It returns a Package of five Integers, each a time in microseconds
+after which the function answers configuration requests:
+
+1. after a Conventional Reset,
+2. after the link comes up (DL_Up),
+3. after a Function Level Reset,
+4. after D3hot to D0,
+5. after VF Enable is set.
+
+`AcpiPciReadiness::read()` calls it only when function 0 (same UUID and revision) lists bit 9, and only accepts a package of at least five
+elements. An element that is not an integer or does not fit 32 bits is left empty. `d3cold_delay_ms()` takes the longer of the reset and
+DL_Up times, rounds up to milliseconds, and uses it only when it is shorter than the default of 100 ms (the firmware can shorten the wait, never
+lengthen it). Linux does the same in `pci_acpi_optimize_delay()`, though it uses only the reset time.
+
+`GpuPowerResourceSet::read()` reads it from the GPU's own Device first, which is where the specification and Linux put it, and then from the
+root port's. Every handler's `power_on_delay_ms()` returns that value: `AcpiGpuPowerResources`, `NvidiaOptimusPower` and `NvidiaJtPower` take
+it from their set, and `NvidiaHybridDsm` and `AmdAtpx` get it as a constructor argument from `find()`. The D3hot-to-D0 time (element 4) is read
+but not used. The GPU manager's D3hot wait is its own.
+
+Tests (`GpuAcpiPowerTest`):
+
+- shared rail: the GPU and a Wi-Fi root port on one resource; off only after both, on again; through `find()`; a private registry; an `_OFF`
+  that faults;
+- the registry on its own: idempotent introduce, counting, full tables, and six threads (also run under ThreadSanitizer by hand);
+- readiness: on the GPU, on the root port only, function 0 without bit 9, a short package, times above the default, a string element, and the
+  NVIDIA hybrid and ATPX handlers.
+
+Not done or not verified:
+
+- The function 9 layout is from the specification text as remembered and from Linux's reader; it has not been checked against firmware.
+- Table loads that free nodes would need `clear()`; the interpreter never frees them today.

@@ -68,6 +68,7 @@ class AcpiGpuPowerResources final : public IGpuPlatformPower {
   GpuPowerMechanism mechanism() const override { return mechanism_; }
   [[nodiscard]] bool power_off() override { return set_.power_off(aml_); }
   [[nodiscard]] bool power_on() override { return set_.power_on(aml_); }
+  uint32_t power_on_delay_ms() const override { return set_.power_on_delay_ms(); }
   const GpuPowerResourceSet& resources() const { return set_; }
 
  private:
@@ -86,6 +87,7 @@ class NvidiaOptimusPower final : public IGpuPlatformPower {
   GpuPowerMechanism mechanism() const override { return GpuPowerMechanism::NvidiaOptimus; }
   [[nodiscard]] bool power_off() override;
   [[nodiscard]] bool power_on() override { return set_.power_on(aml_); }
+  uint32_t power_on_delay_ms() const override { return set_.power_on_delay_ms(); }
   uint64_t functions() const { return functions_; }
   // Function 0x1A with 0, read when the handler was made.
   uint32_t capabilities() const { return capabilities_; }
@@ -107,6 +109,7 @@ class NvidiaJtPower final : public IGpuPlatformPower {
   GpuPowerMechanism mechanism() const override { return GpuPowerMechanism::NvidiaJt; }
   [[nodiscard]] bool power_off() override { return set_.power_off(aml_); }
   [[nodiscard]] bool power_on() override { return set_.power_on(aml_); }
+  uint32_t power_on_delay_ms() const override { return set_.power_on_delay_ms(); }
   uint32_t capabilities() const { return capabilities_; }
   uint32_t jt_revision() const { return capabilities_ >> 20; }   // JTREV, bits 20-31
   const GpuPowerResourceSet& resources() const { return set_; }
@@ -121,8 +124,11 @@ class NvidiaJtPower final : public IGpuPlatformPower {
 // (2), function 2 moves the mux (0x11 integrated, 0x12 discrete). The method has no reliable query; active() reports the last switch.
 class NvidiaHybridDsm final : public IGpuPlatformPower, public IGpuMux {
  public:
-  NvidiaHybridDsm(acpi::AmlInterpreter& aml, acpi::Node* dsm, uint64_t functions) : aml_(aml), dsm_(dsm), functions_(functions) {}
+  // `power_on_delay_ms`: from the PCI firmware _DSM's readiness durations (GpuPowerResourceSet::power_on_delay_ms), 100 without them.
+  NvidiaHybridDsm(acpi::AmlInterpreter& aml, acpi::Node* dsm, uint64_t functions, uint32_t power_on_delay_ms = AcpiPciReadiness::kDefaultD3coldDelayMs)
+      : aml_(aml), dsm_(dsm), functions_(functions), power_on_delay_ms_(power_on_delay_ms) {}
   GpuPowerMechanism mechanism() const override { return GpuPowerMechanism::NvidiaHybridDsm; }
+  uint32_t power_on_delay_ms() const override { return power_on_delay_ms_; }
   [[nodiscard]] bool power_off() override { return call(NvidiaDsm::kMuxPower, NvidiaDsm::kMuxPowerStamina); }
   [[nodiscard]] bool power_on() override { return call(NvidiaDsm::kMuxPower, NvidiaDsm::kMuxPowerSpeed); }
   [[nodiscard]] bool active(GpuMuxTarget* out) override;
@@ -136,13 +142,14 @@ class NvidiaHybridDsm final : public IGpuPlatformPower, public IGpuMux {
   acpi::AmlInterpreter& aml_;
   acpi::Node* dsm_;
   uint64_t functions_;
+  uint32_t power_on_delay_ms_;
   Optional<GpuMuxTarget> active_;
 };
 
 // What was found on a GPU, for the log and the tests.
 struct GpuAcpiProbe {
   GpuAcpiNodes nodes;
-  GpuPowerResourceSet resources;
+  GpuPowerResourceSet resources;      // (with the readiness durations of the PCI firmware _DSM, also when there are no resources)
   acpi::Node* dsm = nullptr;          // the GPU Device's _DSM
   uint64_t optimus_functions = 0;     // function-0 bitmaps (0: not there)
   uint64_t jt_functions = 0;
@@ -164,6 +171,8 @@ class GpuAcpiPower {
   //  - AMD (0x1002): the power resources when ATPX says hybrid graphics (bit 14 of its parameters: newer amdgpu turns ATPX power control off
   //    there) or when the GPU or its root port has _PR3 at all, else ATPX power control, else nothing;
   //  - anything else: the power resources.
+  // Every handler's power_on_delay_ms() is the PCI firmware _DSM's (function 9) D3cold delay when the GPU's or its root port's Device has
+  // one, else 100 ms.
   // `parent_bridge_hint`: the PCI bridge above the GPU (see GpuAcpiNamespace). `integrated_gpu`: where ATPX and the NVIDIA mux _DSM may sit
   // as well. `sleep_ms` waits the 200 ms ATPX needs after power off (nullptr: no wait).
   [[nodiscard]] static UniquePointer<IGpuPlatformPower> find(acpi::AmlInterpreter& aml, PciAddress gpu, const Optional<PciAddress>& parent_bridge_hint,

@@ -21,6 +21,7 @@
 #include <new>
 #include "Hardware/GraphicsProcessingUnit/GpuContext.hpp"
 #include "Hardware/GraphicsProcessingUnit/Multi/GpuPool.hpp"
+#include "Hardware/GraphicsProcessingUnit/NVIDIA/NvidiaSecondaryGpu.hpp"
 #include "Hardware/GraphicsProcessingUnit/QEMU/QemuStdVgaGpu.hpp"
 #include "Hardware/GraphicsProcessingUnit/SystemGpu.hpp"
 #include "Hardware/GraphicsProcessingUnit/VMware/VmwareSvgaGpu.hpp"
@@ -78,20 +79,23 @@ const DriverRow kDrivers[] = {
        n.virtio = build_driver<VirtioGpu>(n, c, a);
        return n.virtio != nullptr;
      }},
+    // A non-boot NVIDIA GPU: mode setting from scratch (GF119..Pascal, only with TCOS_NVIDIA_NATIVE; otherwise it fails and the probe takes over).
+    {[](const PciDeviceInfo& d) { return NvidiaSecondaryGpu::supports(d); },
+     [](GpuNode& n, const GpuContext& c, allocators::IAllocator& a) { return build_driver<NvidiaSecondaryGpu>(n, c, a) != nullptr; }},
 };
 }  // namespace
 
-uint32_t GpuPool::bind(efi::SystemTable* st, const IPciBus& pci, SystemGpu& boot) {
+uint32_t GpuPool::bind(efi::SystemTable* st, const IPciBus& pci, SystemGpu& boot, IRegisterMapper* registers) {
   const int32_t display = manager_.display_index();
   if (display >= 0 && boot.gpu()) adopt(static_cast<uint32_t>(display), boot.gpu(), boot.virtio_gpu(), boot.vmware_gpu());
-  return bind_native_drivers(st, pci);
+  return bind_native_drivers(st, pci, registers);
 }
 
-uint32_t GpuPool::bind_native_drivers(efi::SystemTable* st, const IPciBus& pci) {
+uint32_t GpuPool::bind_native_drivers(efi::SystemTable* st, const IPciBus& pci, IRegisterMapper* registers) {
   for (uint32_t i = 0; i < manager_.count(); ++i) {
     GpuNode& n = nodes_[i];
     if (n.gpu) continue;
-    const GpuContext context{st, &pci, n.adapter.device, &allocator_};
+    const GpuContext context{st, &pci, n.adapter.device, &allocator_, registers};
     for (const DriverRow& row : kDrivers) {
       if (!row.matches(n.adapter.device)) continue;
       // The device has to be awake while the driver sets it up, and stays so as long as the driver exists (a driver has no way yet to take

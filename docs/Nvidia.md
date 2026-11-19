@@ -53,7 +53,7 @@ What a chip needs is flagged in `Chip`: `needs_gsp` (Ampere and later), `display
 - the VBIOS's DP drive-level table (BIT 'd'), so mode setting uses placeholder drive levels;
 - mode setting beyond the firmware's modes;
 - the memory/MMU/FIFO/copy-engine stack;
-- secondary NVIDIA GPUs (a laptop's dGPU): only the boot display gets `NvidiaGpu`.
+- secondary NVIDIA GPUs (a laptop's dGPU) get `NvidiaSecondaryGpu` only with `TCOS_NVIDIA_NATIVE` (see "Secondary GPU display" below); otherwise the GpuPool's read-only probe.
 
 `tests/run_host_tests.sh NvidiaNativeTest` covers:
 - the start: chip, BAR0 untouched without a VBIOS, powered down, unknown chip, no mapper, unmappable BAR0;
@@ -434,7 +434,7 @@ an unknown opcode stops with its value and offset; delays are capped (100 ms eac
 outside BAR0 are not touched.
 
 Not done by the interpreter, through `INvInitHooks` (defaults: nothing, counted in `NvInitResult`): PLL programming (`set_pll(type, khz)`,
-nouveau's `nvkm_devinit_pll_set`: needs the BIOS PLL limits table and the nv04/gt215 PLL calculators; `NvClk` only reads clocks),
+nouveau's `nvkm_devinit_pll_set`: `NvPllInitHooks` in `Nvkm/NvPll`, see "PLL programming" below),
 I2C (`i2c_bus(index)` returning an `II2cBus`: `NvI2cBus` or `NvAuxChannel` fit; 0x80/0x81 = the primary/secondary default port), AUX
 (`aux_channel(i2c_index)` returning an `IDpcdAux`: `NvAuxChannel`), GPIO resets (`gpio_reset(function)`, 0xff = all; `NvGpio` has no
 reset yet), the NV04-era memory init (`meminit()`).
@@ -457,8 +457,70 @@ Order (nvkm_devinit_preinit + post): unlock the extended CRTC registers (CR3f = 
 display engine, or CR00 and CR1A both 0); run the script table's entries in order, then the script at 'I' + 0x0e; on Fermi+ read 0x2240c
 again (`posted_after`). `PostOutcome`: Ran, DryRun, AlreadyPosted, Refused (nothing written), Failed (the script's error and offset).
 
-Refused: pre-Tesla (VGA owner and the nv04/nv10/nv20 memory init are not done), GM20x to Volta (nouveau's `gm200_devinit_post` uploads
-the VBIOS's DEVINIT application to the PMU falcon and runs it there: not done), Turing+ (FWSEC), Tegra (already up).
+GM20x, Pascal and Volta take the PMU path instead of the scripts (see "GM20x to Volta" below). Refused: pre-Tesla (VGA owner and the
+nv04/nv10/nv20 memory init are not done), Turing+ (FWSEC), Tegra (already up).
+
+### PLL programming (`Nvkm/NvPll.hpp/.cpp`, `tests/NvPllTest.cpp`)
+
+After nouveau's bios/pll.c, clk/pllnv04.c, clk/pllgt215.c and the devinit `pll_set` functions:
+
+- `parse_pll_limits(bios, chip, crystal_khz, type, &limits)` is `nvbios_pll_parse`: the table from BIT 'C' (version 1: 16-bit pointer at
+  +8; version 2: 32-bit pointer at +0) or the BMP 5.24+ pointer at bmp + 142; versions 0x10/0x11 (u32 kHz limits, fixed M/N ranges by
+  BIOS chip), 0x20/0x21 (entries starting with their register, reference clock at +31 when the entry is longer than 0x22), 0x30 (type,
+  limits pointer, register), 0x40 (the same plus the reference clock in MHz at +9) and 0x50 (Volta: no register, limits in the entry);
+  tables before 0x30 go through nouveau's type <-> register maps (nv04, nv40, nv50, g84; none for GT215+, as nouveau). `type` is a
+  `kPll*` value or, above 0xff, a register (INIT_PLL passes registers). No table at all: nouveau's BMP defaults. A reference clock of 0
+  in the table means the crystal (`crystal_khz_from_strap`). Not done: C51's VPLL reference override (VGA CR27).
+- `nv04_pll_calc` (single and two-stage M/N/P search, with the pre-NV50 M limits and N2/M2 ratio rule by BIOS version) and
+  `gt215_pll_calc` (N/M/P, and the fractional N of the first M that fits) are pure functions over `NvPllLimits`.
+- `nv_pll_set(inputs, type, khz)` per family (`pll_family`): Nv50 (NV50, G84, G98: VPLL 0x10000611 + M1/N1 + P/M2/N2, the memory PLL
+  with its bias, other PLLs P + N1/M1), Gt215 (GT215/216/218, MCP89: VPLL0/1 only), Gf100 (GF100 to Pascal; GM107 and GM200 use it:
+  VPLL0..3 only, +0x0c bit 8, +0x04 P/N/M, +0x10 fN << 16), Gv100 (VPLLs at 0x00ef04/0x00ef10 + head * 0x40). Other types: Unimplemented
+  (nouveau's "unimplemented"); pre-NV50, Turing+ and Tegra: NoFamily. Every write through `INvRegisters` (and the optional trace).
+- `NvPllInitHooks(bios, chip, registers, inner, crystal_khz, trace)`: an `INvInitHooks` whose `set_pll` is `nv_pll_set`; I2C, AUX, GPIO
+  resets and meminit go to `inner` (nullptr: none). Pass it as `PostInputs::hooks`. The interpreter never calls hooks in a dry run.
+  `last()`, `programmed()`, `failed()` say what happened.
+
+Deliberate differences: a read outside the image fails the parse (`Truncated`); the calculators use 64-bit arithmetic, cap log2 P at
+16 and refuse a zero reference clock, M, P or input range (nouveau would divide by zero or overflow; real tables give identical
+results); a register outside BAR0 or unaligned is not written (`BadRegister`); GV100 takes the head from the table entry's type, not
+the caller's argument (which is a register when INIT_PLL calls it).
+
+Tests: every table version through BIT 'C' v1/v2, by type and by register, the map fallbacks (first entry, absent from the map, no map
+on GT215), the BMP defaults by crystal; the calculators against hand-derived coefficients (148.5 and 160 MHz fractional and integer,
+135/100/270 MHz and the 1 GHz VCO edge single-stage, 108 MHz two-stage, fixed gain), unreachable frequencies, the divide-by-zero
+guards; the register sequences of all four families, the strap crystal, a hostile register; the hooks under `NvInitScript` (INIT_PLL2,
+INIT_PLL, delegation, dry run); the image cut at every length and 400 images with bit flips (ASan/UBSan, writes inside BAR0).
+
+### GM20x to Volta: devinit on the PMU (`NvDevinit::post`)
+
+`gm200_devinit_post` as nouveau does it, for chipsets 0x120 .. 0x140 (GM20x, GP100, GP10x, GV100; Turing+ stays refused):
+
+1. Checks, before anything is written: BIT 'I' version 1 with at least 0x1c bytes, its +0x14/+0x16 (init tables) and +0x18/+0x1a (boot
+   scripts) ranges inside the image, and a usable DEVINIT application (`find_pmu_app(bios, kPmuAppDevinit)`: BIT 'p' version 2's table,
+   the first entry of type 0x04 with a descriptor; `nvbios_pmuRm`'s fields, every section checked to lie inside the image, rounded to
+   words, without wrapping). A failure is `Refused` (or `AlreadyPosted` when 0x2240c says POSTed; nouveau fails the device instead).
+2. The preinit decision as on Fermi+ (0x2240c bit 1, the CRTC fallback).
+3. Falcon reset (`nvkm_falcon_reset`): 0x10a048 &= ~3, 0x10a014 = ~0, then PMC_ENABLE bit 13 off/on (gm200_pmu: GM20x, GP100) or two
+   pulses of 0x10a3c0 bit 0 (gp102_pmu: GP102 .. GV100), the memory scrub (0x10a10c bits 1-2, 10 ms), 0x10a084 = BOOT_0.
+4. Upload: boot code (non-secure) and code (secure) through the IMEM port (0x10a180 with auto-increment, a tag at 0x10a188 every 256
+   bytes, padded to 256 bytes), data through the DMEM port (0x10a1c0/0x10a1c4); then the argument block's two DMEM targets
+   (`pmu_args(args + 8, 8)` and `(args + 8, 0x10)`) receive the init tables and the boot scripts. Before writing, the application
+   and both targets are checked against the falcon's IMEM/DMEM sizes from HWCFG (0x10a108; nouveau does not check).
+5. Start: mailbox 0x10a040 = 0x5000, boot vector, DMACTL 0, CPUCTL 2; poll 0x10a040 bit 13 for `pmu_timeout_us` (2 s) every
+   `pmu_poll_us`: a timeout is `Failed`.
+6. PRE_OS (type 0x01), if present and `run_preos`: reset, upload, start, not waited for (gm200_devinit_preos; failures ignored).
+
+Nouveau runs no host scripts after this; the per-output encoder scripts stay `encoder_scripts_pending`. `PostReport::pmu` records the
+applications, the DMEM targets, the words written, started/completed/waited. Dry run: nothing written; the DMEM targets are resolved
+from the image's data section (which is what the falcon's DMEM would hold), the word counts and PRE_OS presence reported. nouveau's
+gp102/gv100 have no devinit of their own beyond gv100's pll_set, so there is no fuse or secure-boot check to make here.
+
+Tests (`NvInitScriptTest`): the 'p' table (found, decoy entry without a descriptor, no table / wrong version / zero pointer, sections
+outside the image, boot end before start, truncation); a falcon model checked word by word (IMEM contents and secure flags, padding,
+tags, DMEM contents including the whole last word, the start after the uploads, only falcon/PMC registers written), PRE_OS, the
+engine-reset chips, GP100, the timeout, a stuck scrub, an application or table target that does not fit, dry run, POSTed / forced,
+the refusals, Turing; the image cut at every length and 400 bit-flipped tables (live and dry).
 
 ### Tests (`tests/NvInitScriptTest.cpp`, `tests/run_host_tests.sh NvInitScriptTest`)
 
@@ -477,7 +539,116 @@ script, an image without an init table.
 
 - Never run on hardware. The VGA access through `RegistersNvVgaIo` (32-bit read-modify-write) is right for a model only; on hardware
   `MmioNvVgaIo` (byte MMIO) is the one to use.
-- No PLL programming (the run counts `plls_unsupported`; a board whose memory clock is set by INIT_PLL* will not come up without it),
-  no GPIO reset, no NV04-era memory init, INIT_CONFIGURE_MEM/CLK on BIOS major <= 2 stop with `Unsupported`.
+- PLLs are programmed only when the caller passes `NvPllInitHooks` (otherwise the run counts `plls_unsupported`); see the PLL section's
+  limits (VPLLs only from GT215 on, as nouveau). No GPIO reset, no NV04-era memory init, INIT_CONFIGURE_MEM/CLK on BIOS major <= 2 stop
+  with `Unsupported`.
 - nv50_devinit_init's per-output encoder scripts (`PostReport::encoder_scripts_pending`) are left to the display code.
-- GM20x/Pascal/Volta PMU devinit, and nothing is wired into `NvidiaNative`/`NvidiaGpu` yet (the coordinator's part).
+- GM20x/Pascal/Volta PMU devinit: tested against a falcon model only (the register layout follows nouveau's gm200.c/falcon code; no
+  real VBIOS DEVINIT application has been run). `NvPllInitHooks` is not wired into `NvidiaNative`/`NvidiaGpu` yet (the coordinator's
+  part); `NvidiaNative::run_post` reaches the PMU path through `post()` (a dry run in the default build).
+
+## Secondary GPU display
+
+`NVIDIA/NvidiaSecondaryGpu.*` is the display driver of an NVIDIA GPU that is not the boot display (a hybrid laptop's discrete GPU, which often
+drives the HDMI and USB-C ports, or a second card). There is no firmware framebuffer and no mode the firmware left: everything is set up from
+scratch. The GpuPool builds it from the row in `Multi/GpuNativeDrivers.cpp` (vendor 0x10DE, PCI class 0x03) for any adapter that has no driver
+yet; the pool holds a power lease for it, so the GPU stays awake while it exists.
+
+**Off by default.** Everything that writes to the card is inside `#ifdef TCOS_NVIDIA_NATIVE`, as `NvidiaGpu::engage` is. Without the flag
+`initialize()` fails before mapping or reading anything, the pool releases the GPU and `bind_probes` gives it the read-only probe as before.
+
+### What it does (`initialize()` with the flag)
+
+1. `NvidiaNative` starts as a secondary GPU (`configure_secondary(nullptr)`: the VBIOS from the card, the init scripts when it was not
+   POSTed), reads the connectors and their EDIDs.
+2. Refuses (and the probe takes over) unless the display class is GF119 (GF119/GF117, Kepler, Maxwell, Pascal): Tesla has no virtual BAR here
+   and its mode setting is not written; Volta/Turing mode setting is not written; Ampere+ needs the GSP.
+3. Needs the VRAM size (`probe_vram`) and a video BIOS (the VPLL's limits come from it).
+4. Maps the first `Bar1LinearVram::linear_bytes_for(vram)` bytes of PCI BAR1 (128 MiB, less with little VRAM) for the CPU.
+5. `NvSecondaryDisplay::start()` (pure: everything through `Inputs`, so the host test drives it against the display model):
+   - the display engine's `probe()` (reads only);
+   - the output: the first connected connector with an EDID that is not an internal panel (LVDS/eDP belong to the integrated GPU); of its
+     DCB outputs the DisplayPort one when the EDID came over AUX, the TMDS one when it came over DDC (a DP++ port lists both);
+   - the modes: every detailed timing of the EDID's base block and CTA extensions (`decode_detailed_timing`, drm_mode_detailed's rules),
+     one per size, filtered by what the output carries at 24 bpp (`max_output_clock_khz`: single-link TMDS 165 MHz, dual-link 330 MHz,
+     DP the DCB's link rate x lanes, HBR2 x4 when it says nothing) and by the raster/pitch limits; the preferred one is what `parse_edid`
+     (`Monitor/Edid.cpp`) calls preferred, else the first base-block timing. Start mode: the preferred one if it fits, else the most pixels
+     (`choose_mode`);
+   - nothing has been written up to here: no monitor, no fitting mode, too little VRAM or BAR1, the wrong display class all fail cleanly;
+   - BAR1 (below), a scanout surface (pitch = width x 4 rounded to 256, 64 KiB aligned, X8R8G8B8 pitch-linear), and the mode set through
+     `NvModeSetter` (Nvkm/NvDisplayMode: claim, SOR control, head output resource/control, raster, pixel clock, viewport, surface, UPDATE with
+     the supervisor polled; the VPLL in supervisor 2.1 through `NvVpllClock` over `Nvkm/NvPll`'s `nv_pll_set(kPllVpll0 + head)`; DP link
+     training with nouveau's fallback from the fastest configuration). When DP training fails at every configuration for a mode, the next
+     slower mode is tried.
+6. `FramebufferGpu` draws into the surface through the CPU's BAR1 view; `present()` flushes the BAR write path (0x070000).
+
+`set_mode()` allocates a surface for the new mode, sets it and releases the old one; on a failure the old mode is set again. `IMonitorSource`
+lists every connector of the board (the driven one first, then connected, then the rest; `describe_connector`), the EDIDs, and the modes of
+the driven connector (`device_modes`, `set_display_mode`).
+
+`shutdown()` (also the destructor): `NvModeSetter::disable(head, sor)` (SOR control 0, the head's ISO context DMA 0, an UPDATE through the
+supervisor whose stages are only acknowledged), the display engine's channels stopped and its push buffer, instance memory and notifier
+released, the surface released, and `NvBar::fini()` (bit 31 of 0x001704 and 0x001714 cleared: BAR1 back to its reset state). The BARs' own
+page tables stay in the heap until the next start or the destructor.
+
+### How BAR1 and VRAM are mapped (and why)
+
+The **nouveau way, with page tables** (`Bar1LinearVram`), not the legacy linear BAR1:
+
+- An `NvFb` heap over `[reserved_head, linear)` of VRAM (`probe_vram`'s VGA reserve below; the VBIOS/VGA-workspace tail above is outside
+  `linear`). Every object this driver makes comes from it, so all of them lie in the linear part.
+- The page tables and the BAR instance blocks come from the same heap through `NvVramMemory` over the **PRAMIN window** (BAR0 0x700000,
+  0x001700), which needs no BAR set up.
+- `NvBar::init(256 MiB, 32 MiB, linear)`: BAR2 (instance 0x001714) and BAR1 (0x001704) instance blocks, their VMMs (GF100 format on
+  Fermi/Kepler/Maxwell, GP100 on Pascal), BAR1's VA `[0, linear)` mapped 1:1 onto VRAM `[0, linear)` with 4 KiB pages; then both VMMs' TLBs
+  invalidated (hub only). So for the CPU every object is at BAR1 + its VRAM offset, and the display engine gets the plain VRAM offset.
+- Why not the legacy mode: the boot display relies on "BAR1 is a linear view of VRAM while 0x001704 is not valid", which the GOP framebuffer
+  proves for that GPU. Nothing proves it for a secondary GPU: its VBIOS, a previous OS or a resume may have left the virtual BAR on with
+  page tables of its own. Building the tables makes BAR1 show exactly what the driver says, whatever state it was in; `translate()` on the
+  BAR1 VMM checks it in the host test.
+- Assumed, not checked: PCI BAR1 is at least `linear` (128 MiB) long (every card with a native display has 256 MiB or more; the BAR size is not
+  probed, because sizing writes the BAR in configuration space) and BAR2 at least 32 MiB of VA (nothing is mapped in BAR2; the CPU never
+  touches it).
+- No write combining: the BAR1 mapping is uncached MMIO (as `Bar1VramMemory`), so drawing is slow; zeroing a surface writes bytes.
+
+### Pool wiring
+
+- `GpuContext` already had `IRegisterMapper* registers`. `GpuPool::bind(st, pci, boot, IRegisterMapper* registers = nullptr)` and
+  `bind_native_drivers(st, pci, IRegisterMapper* registers = nullptr)` pass it into every driver's context; `main.cpp` passes
+  `paging_ok ? &register_mapper : nullptr` (as for `bind_probes`). The other drivers in the table ignore it.
+- One row appended to `kDrivers`: `NvidiaSecondaryGpu::supports` (vendor 0x10DE, class 0x03), built with `build_driver<NvidiaSecondaryGpu>`.
+
+### Tests (`tests/run_host_tests.sh NvidiaSecondaryGpuTest`, ASan/UBSan)
+
+Built twice: with `-DTCOS_NVIDIA_NATIVE` and without (`NvidiaSecondaryGpuOffTest`). The display model of NvDisplayTest moved to
+`tests/NvDisplayModel.hpp`, NvidiaNativeTest's fake card and allocator to `tests/NvTestCard.hpp`; the test adds the PRAMIN window and the MMU's
+invalidate status on top of the model, so the page tables land in the model's VRAM and BAR1 is that same VRAM.
+
+- EDID modes: the detailed timing decoder (progressive, interlaced, stereo, monitor descriptors, no sync width, truncated), base and CTA
+  timings, the duplicate size dropped, the preferred mark, truncation at every 7th byte and a flip of every 3rd bit; `max_output_clock_khz`;
+  `choose_mode` (preferred, too fast for single-link TMDS, nothing fits).
+- HDMI from scratch: 0x001714 then 0x001704 with the instance addresses, the TLB invalidated after them, BAR1 translating the surface and the
+  ends of the linear part 1:1 and nothing past it; SOR 1 owned by head 0 as TMDS A, the 1080p raster, sync, blank, pixel clock, viewport,
+  surface size/storage/format, the model scanning out the surface, one VPLL call at 148.5 MHz, three supervisor acks, the TMDS link speed;
+  pixels written through the CPU view found in VRAM; `flush()` writes 0x070000.
+- Another mode (720p) and back, the old surface released, a bad index; a mode that never latches: the old one set again and kept.
+- DisplayPort: the DP output of a DP++ port trained at HBR2 x4 on a model sink, 2160p30 offered over DP; the same monitor over DDC on that
+  port goes to the TMDS output and 2160p30 is not offered.
+- Refusals with no register written: no monitor, only the internal panel connected, connected without an EDID, every mode too fast, a Volta
+  display, too little VRAM, a BAR1 window too small; a DP sink that never trains (every mode tried, the display taken down again).
+- Shutdown: SOR and head ISO armed 0 through the supervisor, the core channel stopped, both BARs off, the heap back to the BAR tables only,
+  no bad release; a second shutdown writes nothing; a start again works; nothing leaks after destruction.
+- `NvVpllClock`: heads past the fourth and a zero clock refused; no write without a PLL limits table.
+- `NvidiaSecondaryGpu` on the fake card: with the flag, a Kepler with no monitor fails with "no monitor" and takes everything down, an Ampere
+  is refused, no register mapper is refused; without the flag, refused with BAR0 untouched and nothing mapped.
+
+### Not done / unverified
+
+- **Nothing of it has run on a real card.** The register and method numbers are NvDisplayHw.hpp's (remembered from nouveau, marked by
+  confidence there); the display model is typed from the same memory.
+- `NvidiaSecondaryGpu::initialize()` end to end with a monitor is not tested (the fake card's buses answer nothing); its parts are.
+- VBIOS IED scripts (supervisor 2.x / 3.0) and the DP drive-level table: not run / placeholders; some boards need them for TMDS/DP.
+- HDMI 2.0 (scrambling above 340 MHz), infoframes, audio; DP MST; DSC; deep colour; several heads at once; the internal panel.
+- Hot plug: a monitor plugged in after the driver started is listed (`refresh_connectors`) but not lit; one unplugged keeps its head running.
+- The virtual BARs are not restored after a GPU power cycle (the pool never power-cycles a GPU with a display driver).
+- An `NvBar::init` that fails half-way can leave BAR2 pointing at tables that are then freed.

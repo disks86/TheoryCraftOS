@@ -55,8 +55,8 @@ GraphicsPool::~GraphicsPool() {
       s.render->~RenderNode();
       allocator_.deallocate(s.render);
     }
+    release_view(allocator_, s.staging);
   }
-  release_view(allocator_, staging_);
 }
 
 RenderNode* GraphicsPool::render_node(uint32_t index) { return index < gpus_.count() ? slots_[index].render : nullptr; }
@@ -100,13 +100,15 @@ bool GraphicsPool::present_image(IImage& image, uint32_t target, uint32_t x, uin
   const Extent2D size = image.extent();
   if (size.width == 0 || size.height == 0) return false;
   const uint64_t pixels = uint64_t{size.width} * size.height;
-  if (staging_.size() < pixels) {
-    release_view(allocator_, staging_);
-    staging_ = allocate_view<uint32_t>(allocator_, pixels);
-    if (staging_.empty()) return false;
+  Slot& s = slots_[target];
+  kernel::ScopedMutex guard(s.present_lock);
+  if (s.staging.size() < pixels) {
+    release_view(allocator_, s.staging);
+    s.staging = allocate_view<uint32_t>(allocator_, pixels);
+    if (s.staging.empty()) return false;
   }
-  if (!image.read_pixels(staging_.subview(0, pixels))) return false;
-  node->gpu->blit(x, y, size.width, size.height, staging_.data(), size.width);
+  if (!image.read_pixels(s.staging.subview(0, pixels))) return false;
+  node->gpu->blit(x, y, size.width, size.height, s.staging.data(), size.width);
   node->gpu->present();
   return true;
 }
@@ -117,6 +119,7 @@ IRenderer2D* GraphicsPool::renderer_2d(uint32_t index) {
   Slot& s = slots_[index];
   hardware::GpuNode* n = gpus_.node(index);
   if (!s.render || !n->gpu) return nullptr;
+  kernel::ScopedMutex guard(renderer_lock_);
   if (!s.renderer) {
     void* memory = allocator_.allocate(sizeof(Renderer2DSlot));
     if (!memory) return nullptr;

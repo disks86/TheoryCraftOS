@@ -80,13 +80,15 @@ class AmdAtpx final : public IGpuPlatformPower, public IGpuMux {
   // Calls `function` with `input` (empty: the integer 0, as amdgpu passes no parameters). False if the method faulted. Takes the lock.
   [[nodiscard]] static bool call(acpi::AmlInterpreter& aml, acpi::Node* method, uint32_t function, ConstByteView input);
 
-  AmdAtpx(acpi::AmlInterpreter& aml, acpi::Node* method, const AmdAtpxInfo& info, SleepFn sleep_ms = nullptr)
-      : aml_(aml), method_(method), info_(info), sleep_ms_(sleep_ms) {}
+  // `power_on_delay_ms`: the D3cold -> D0 wait (the PCI firmware _DSM's readiness durations, see AcpiPciReadiness), 100 ms by default.
+  AmdAtpx(acpi::AmlInterpreter& aml, acpi::Node* method, const AmdAtpxInfo& info, SleepFn sleep_ms = nullptr, uint32_t power_on_delay_ms = 100)
+      : aml_(aml), method_(method), info_(info), sleep_ms_(sleep_ms), power_on_delay_ms_(power_on_delay_ms) {}
 
   GpuPowerMechanism mechanism() const override { return GpuPowerMechanism::AmdAtpx; }
   // POWER_CONTROL; false where ATPX may not be used for power (info().power_control).
   [[nodiscard]] bool power_off() override;
   [[nodiscard]] bool power_on() override;
+  uint32_t power_on_delay_ms() const override { return power_on_delay_ms_; }
 
   [[nodiscard]] bool active(GpuMuxTarget* out) override;
   // Switch start (where supported), display mux, I2C mux (where supported), switch end, as amdgpu_atpx_switchto().
@@ -103,6 +105,7 @@ class AmdAtpx final : public IGpuPlatformPower, public IGpuMux {
   acpi::Node* method_;
   AmdAtpxInfo info_;
   SleepFn sleep_ms_;
+  uint32_t power_on_delay_ms_;
   Optional<GpuMuxTarget> active_;
 };
 

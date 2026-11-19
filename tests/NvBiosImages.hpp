@@ -88,6 +88,16 @@ static inline void bit_table(Bytes& v, size_t at, size_t info, const uint8_t ver
   put8(v, info + 0, version[3]); put8(v, info + 1, version[2]); put8(v, info + 2, version[1]); put8(v, info + 3, version[0]); put8(v, info + 4, version[4]);
 }
 
+// Appends an entry to the BIT table at `bit` (as bit_table builds it: entries of 6 bytes from +12) and raises its count; returns where the
+// entry went.
+static inline size_t add_bit_entry(Bytes& v, size_t bit, uint8_t id, uint8_t version, uint16_t length, uint16_t offset) {
+  const uint8_t count = v[bit + 10];
+  const size_t e = bit + 12 + size_t{count} * 6;
+  put8(v, e + 0, id); put8(v, e + 1, version); put16(v, e + 2, length); put16(v, e + 4, offset);
+  put8(v, bit + 10, count + 1u);
+  return e;
+}
+
 static inline uint32_t conn_word(uint8_t type, uint8_t i2c, uint8_t heads, uint8_t connector, uint8_t bus, uint8_t location, uint8_t ors) {
   return uint32_t{ors} << 24 | uint32_t{location} << 20 | uint32_t{bus} << 16 | uint32_t{connector} << 12 | uint32_t{heads} << 8 | uint32_t{i2c} << 4 | type;
 }

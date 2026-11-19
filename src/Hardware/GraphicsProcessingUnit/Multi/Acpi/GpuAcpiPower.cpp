@@ -124,12 +124,14 @@ UniquePointer<IGpuPlatformPower> GpuAcpiPower::find(acpi::AmlInterpreter& aml, P
                                                         DsmArgument::Buffer32, 0);
       return UniquePointer<IGpuPlatformPower>::make_as<NvidiaOptimusPower>(allocator, aml, p.dsm, p.optimus_functions, caps ? *caps : 0u, r);
     }
-    if (p.mux_functions) return UniquePointer<IGpuPlatformPower>::make_as<NvidiaHybridDsm>(allocator, aml, p.mux_dsm, p.mux_functions);
+    if (p.mux_functions)
+      return UniquePointer<IGpuPlatformPower>::make_as<NvidiaHybridDsm>(allocator, aml, p.mux_dsm, p.mux_functions, r.power_on_delay_ms());
     return plain();
   }
   if (vendor_id == kVendorAmd && p.atpx_info) {
     if (p.atpx_info->hybrid || r.has_resources()) return plain();   // hybrid graphics: D3cold through _PR3, ATPX power control is off
-    if (p.atpx_info->power_control) return UniquePointer<IGpuPlatformPower>::make_as<AmdAtpx>(allocator, aml, p.atpx, *p.atpx_info, sleep_ms);
+    if (p.atpx_info->power_control)
+      return UniquePointer<IGpuPlatformPower>::make_as<AmdAtpx>(allocator, aml, p.atpx, *p.atpx_info, sleep_ms, r.power_on_delay_ms());
     return {};
   }
   return plain();

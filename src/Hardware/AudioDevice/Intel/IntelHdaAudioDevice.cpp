@@ -128,8 +128,15 @@ bool IntelHdaAudioDevice::start_command_rings() {
   write8(kCorbSize, static_cast<uint8_t>(corb_code));
   write8(kRirbSize, static_cast<uint8_t>(rirb_code));
 
-  corb_ = allocate_dma_view<uint8_t>(allocator_, uint64_t{corb_entries_} * 4, 128);
-  rirb_ = allocate_dma_view<uint8_t>(allocator_, uint64_t{rirb_entries_} * 8, 128);
+  // (a resume keeps the rings of the first start: the sizes the controller supports do not change)
+  if (corb_.size() != uint64_t{corb_entries_} * 4) {
+    release_view(allocator_, corb_);
+    corb_ = allocate_dma_view<uint8_t>(allocator_, uint64_t{corb_entries_} * 4, 128);
+  }
+  if (rirb_.size() != uint64_t{rirb_entries_} * 8) {
+    release_view(allocator_, rirb_);
+    rirb_ = allocate_dma_view<uint8_t>(allocator_, uint64_t{rirb_entries_} * 8, 128);
+  }
   if (corb_.empty() || rirb_.empty() || !dma_reachable(reinterpret_cast<uint64_t>(corb_.data()), corb_.size()) ||
       !dma_reachable(reinterpret_cast<uint64_t>(rirb_.data()), rirb_.size()))
     return false;
@@ -358,17 +365,21 @@ bool IntelHdaAudioDevice::configure_path() {
   verb(dac, (kSetFormat << 16) | kFormat48k16bitStereo, nullptr);
 
   // The volume control: the converter's amplifier if it has gain steps, else the pin's.
-  volume_nid_ = 0;
+  uint8_t volume_nid = 0;
+  Amplifier volume_amp;
   const uint8_t candidates[2] = {dac, pin};
   for (uint8_t nid : candidates) {
     if (!(widget_caps_[nid] & kCapsOutputAmp)) continue;
     const Amplifier amp = amplifier(nid, kParamOutputAmpCaps);
     if (amp.steps > 0 || amp.can_mute) {
-      volume_nid_ = nid;
-      volume_amp_ = amp;
+      volume_nid = nid;
+      volume_amp = amp;
       break;
     }
   }
+  kernel::ScopedMutex guard(mutex_);   // (set_volume() reads them under it)
+  volume_nid_ = volume_nid;
+  volume_amp_ = volume_amp;
   return true;
 }
 
@@ -398,7 +409,8 @@ void IntelHdaAudioDevice::silence_path() {
 }
 
 bool IntelHdaAudioDevice::retarget() {
-  if (!running_ || !regs_) return false;
+  kernel::ScopedMutex power(power_mutex_);
+  if (!running_ || !regs_ || power_state() != PowerState::Active) return false;   // (a resume finds the pin again by itself)
   silence_path();
   path_length_ = 0;
   digital_ = false;
@@ -413,7 +425,7 @@ bool IntelHdaAudioDevice::retarget() {
 // (allocated and filled here), and starts it.
 bool IntelHdaAudioDevice::run_stream(uint32_t stream, ArrayView<BufferDescriptor>& descriptors, uint64_t ring_address,
                                      uint8_t tag) {
-  descriptors = allocate_dma_view<BufferDescriptor>(allocator_, kEntries, 128);
+  if (descriptors.empty()) descriptors = allocate_dma_view<BufferDescriptor>(allocator_, kEntries, 128);   // (kept across a resume)
   if (descriptors.empty() ||
       !dma_reachable(reinterpret_cast<uint64_t>(descriptors.data()), descriptors.size() * sizeof(BufferDescriptor)) ||
       !dma_reachable(ring_address, kRingBytes))
@@ -492,8 +504,17 @@ bool IntelHdaAudioDevice::initialize() {
 }
 
 void IntelHdaAudioDevice::shutdown() {
+  kernel::ScopedMutex power(power_mutex_);
+  if (power_state() != PowerState::Active) {
+    wake_function();   // (the function back in D0 for the firmware, and the observer told before the registers below are written)
+    set_power_state(PowerState::Active);
+  }
   capture_.stop();
-  running_ = false;
+  {
+    kernel::ScopedMutex guard(mutex_);
+    running_ = false;
+    set_hardware_usable(true);
+  }
   if (regs_ && controller_owned_) {
     write8(stream_ + kSdControl, 0);
     write8(kCorbControl, 0);
@@ -513,7 +534,7 @@ void IntelHdaAudioDevice::shutdown() {
 }
 
 void IntelHdaAudioDevice::apply_volume() {
-  if (!running_ || !volume_nid_) return;
+  if (!running_ || !volume_nid_ || !hardware_usable()) return;   // (suspended: the resume applies it)
   const bool silent = muted_ || volume_ == 0;
   const uint32_t top = volume_amp_.offset ? volume_amp_.offset : volume_amp_.steps;  // gain value for 0 dB
   uint32_t gain = volume_ * top / kAudioMaxVolume;
@@ -526,6 +547,163 @@ void IntelHdaAudioDevice::apply_volume() {
 }
 
 uint32_t IntelHdaAudioDevice::hardware_position() { return read32(stream_ + kSdPosition) % kRingBytes; }
+
+// --- Runtime power
+
+void IntelHdaAudioDevice::refresh() {
+  if (running_ && hardware_usable()) ring_.advance(hardware_position());   // (suspended: nothing plays, the ring is empty)
+}
+
+uint32_t IntelHdaAudioDevice::write(ConstByteView pcm) {
+  if (pcm.empty()) {
+    kernel::ScopedMutex guard(mutex_);
+    refresh();
+    return 0;
+  }
+  __atomic_add_fetch(&activity_, 1, __ATOMIC_RELAXED);
+  // A suspend may slip in between the resume and the lock (it needs an empty ring and an idle period, so hardly ever): then round again.
+  for (int attempt = 0; attempt < 4; ++attempt) {
+    if (!hardware_usable() && !resume()) break;
+    kernel::ScopedMutex guard(mutex_);
+    if (!running_) break;
+    if (!hardware_usable()) continue;
+    refresh();
+    const uint32_t taken = ring_.write(pcm);
+    if (taken == 0) ++write_failures_;
+    return taken;
+  }
+  kernel::ScopedMutex guard(mutex_);
+  ++write_failures_;
+  return 0;
+}
+
+bool IntelHdaAudioDevice::suspend() {
+  kernel::ScopedMutex power(power_mutex_);
+  return suspend_locked();
+}
+
+bool IntelHdaAudioDevice::resume() {
+  kernel::ScopedMutex power(power_mutex_);
+  return resume_locked();
+}
+
+void IntelHdaAudioDevice::set_idle_suspend_ms(uint32_t milliseconds) {
+  kernel::ScopedMutex power(power_mutex_);
+  __atomic_store_n(&idle_ms_, milliseconds, __ATOMIC_RELAXED);
+  idle_ms_set_ = true;
+  timer_started_ = false;
+}
+
+void IntelHdaAudioDevice::set_power_observer(IPciFunctionPowerObserver* observer, uint32_t idle_ms) {
+  kernel::ScopedMutex power(power_mutex_);
+  observer_ = observer;
+  if (observer && !idle_ms_set_) {
+    __atomic_store_n(&idle_ms_, idle_ms, __ATOMIC_RELAXED);
+    timer_started_ = false;
+  }
+  if (observer && power_state() == PowerState::Suspended) observer->function_idle(device_.address);
+}
+
+void IntelHdaAudioDevice::service(uint64_t now_ms) {
+  kernel::ScopedMutex power(power_mutex_);
+  const uint64_t activity = __atomic_load_n(&activity_, __ATOMIC_RELAXED);
+  if (!timer_started_ || activity != seen_activity_ || now_ms < last_active_ms_) {   // (a clock that went back: start again)
+    seen_activity_ = activity;
+    last_active_ms_ = now_ms;
+    timer_started_ = true;
+    return;
+  }
+  const uint32_t idle = idle_suspend_ms();
+  if (idle == 0 || power_state() != PowerState::Active || now_ms - last_active_ms_ < idle) return;
+  (void)suspend_locked();   // (refused while audio is queued: tried again on the next call)
+}
+
+bool IntelHdaAudioDevice::suspend_locked() {
+  if (power_state() == PowerState::Suspended) return true;
+  if (power_state() != PowerState::Active || !regs_ || !controller_owned_ || capture_.active()) return false;
+  {
+    kernel::ScopedMutex guard(mutex_);
+    if (!running_) return false;
+    refresh();
+    if (ring_.queued() > 0) return false;   // still playing
+    set_hardware_usable(false);             // from here on the playback path leaves the registers alone
+  }
+  // The output stream, the codec's function group (D3), the command rings and the link; then the function itself (D3hot, the header saved).
+  write8(stream_ + kSdControl, 0);
+  (void)wait_register(stream_ + kSdControl, kSdRun, 0, 10000);
+  if (function_group_) verb(function_group_, (kSetPower << 8) | 3, nullptr);
+  write8(kCorbControl, 0);
+  write8(kRirbControl, 0);
+  write32(kGctl, 0);
+  (void)wait_register(kGctl, kGctlReset, 0, 100000);
+  if (pci_) {
+    saved_header_ = pci_save_header(*pci_, device_.address);
+    (void)pci_set_function_power(*pci_, device_.address, PciFunctionPowerState::D3Hot);   // (no PM capability: the link reset is all there is)
+  }
+  set_power_state(PowerState::Suspended);
+  __atomic_add_fetch(&suspends_, 1, __ATOMIC_RELAXED);
+  if (observer_) observer_->function_idle(device_.address);   // (not before: the registers were still being written)
+  return true;
+}
+
+void IntelHdaAudioDevice::wake_function() {
+  if (observer_) observer_->function_busy(device_.address);   // (first: it may have to power the GPU up for the function to answer at all)
+  if (!pci_) return;
+  if (pci_set_function_power(*pci_, device_.address, PciFunctionPowerState::D0)) hardware::delay_us(kPciD3hotToD0Us);
+  pci_restore_header(*pci_, device_.address, saved_header_);
+}
+
+bool IntelHdaAudioDevice::resume_locked() {
+  if (power_state() == PowerState::Active) return true;
+  if (power_state() == PowerState::Failed) return false;
+  wake_function();
+  // As initialize(): the codec is found again (it lost everything with the link reset, and a display may have come or gone meanwhile).
+  path_length_ = 0;
+  digital_ = false;
+  display_present_ = false;
+  function_group_ = 0;
+  const char* failed = nullptr;
+  if (!reset_controller()) failed = "no codec answered after the resume";
+  else if (!start_command_rings()) failed = "could not start the command rings after the resume";
+  else if (!find_output_path()) failed = "no output pin after the resume";
+  else if (!configure_path()) failed = "the converter cannot play 48 kHz 16-bit after the resume";
+  if (!failed) {
+    {
+      kernel::ScopedMutex guard(mutex_);
+      ring_.reset(0);   // (empty when it was suspended; the stream starts at the beginning again)
+    }
+    if (!run_stream(stream_, descriptors_, ring_.address(), kStreamTag)) failed = "could not start the output stream after the resume";
+  }
+  if (failed) {
+    console::debug_puts("hda: ");
+    console::debug_puts(failed);
+    console::debug_puts("\n");
+    {
+      kernel::ScopedMutex guard(mutex_);
+      running_ = false;
+    }
+    // Left as a suspend leaves it (link in reset, function in D3hot): nothing will use it, and the GPU need not stay up for it.
+    write8(stream_ + kSdControl, 0);
+    write8(kCorbControl, 0);
+    write8(kRirbControl, 0);
+    write32(kGctl, 0);
+    (void)wait_register(kGctl, kGctlReset, 0, 100000);
+    if (pci_) (void)pci_set_function_power(*pci_, device_.address, PciFunctionPowerState::D3Hot);
+    set_power_state(PowerState::Failed);
+    if (observer_) observer_->function_idle(device_.address);
+    return false;
+  }
+  write32(kIntctl, 0);
+  {
+    kernel::ScopedMutex guard(mutex_);
+    set_hardware_usable(true);
+    apply_volume();
+  }
+  set_power_state(PowerState::Active);
+  __atomic_add_fetch(&resumes_, 1, __ATOMIC_RELAXED);
+  timer_started_ = false;   // (the idle period starts again)
+  return true;
+}
 
 
 // Depth-first from a converter towards an input pin (of the kind `wanted_device`, or any if 0xFF).

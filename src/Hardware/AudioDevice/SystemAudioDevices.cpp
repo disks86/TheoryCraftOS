@@ -30,23 +30,27 @@ constexpr uint8_t kPciClassMultimedia = 0x04;
 constexpr uint8_t kPciSubclassAudio = 0x01, kPciSubclassHda = 0x03;
 
 // Builds a T, initializes it, and keeps it in `list` only if that all works.
+// Returns the device (still owned by the list) or null.
 template <class T, class... Args>
-void try_add(List<UniquePointer<IAudioDevice>>& list, allocators::IAllocator& allocator, Args&&... args) {
+T* try_add(List<UniquePointer<IAudioDevice>>& list, allocators::IAllocator& allocator, Args&&... args) {
   UniquePointer<T> device = UniquePointer<T>::make(allocator, static_cast<Args&&>(args)...);
-  if (!device) return;
+  if (!device) return nullptr;
   if (!device->initialize()) {
     device->shutdown();  // hands the device back to the firmware
-    return;
+    return nullptr;
   }
+  T* raw = device.get();
   list.push_back(UniquePointer<IAudioDevice>(util::move(device)));
+  return raw;
 }
 }  // namespace
 
-void SystemAudioDevices::adopt(SharedPointer<IAudioDevice> device, bool hardware, bool report) {
+void SystemAudioDevices::adopt(SharedPointer<IAudioDevice> device, bool hardware, bool report, IntelHdaAudioDevice* hda) {
   if (!device) return;
   Entry entry;
   entry.id = next_id_++;
   entry.hardware = hardware;
+  entry.hda = hda;
   entry.device = device;
   AudioEvent event;
   event.kind = AudioEvent::Kind::Added;
@@ -81,17 +85,22 @@ void SystemAudioDevices::add_fallback(bool report) {
 void SystemAudioDevices::initialize() {
   // PCI sound hardware first, then the USB devices that play, then the software fallback if nothing plays, then the USB devices that only record.
   List<UniquePointer<IAudioDevice>> found(allocator_);
+  List<IntelHdaAudioDevice*> found_hda(allocator_);   // (parallel to found: the HD-audio controller, or null)
   PciDeviceInfo d;
   for (uint32_t i = 0; pci_.pci_device(i, &d); ++i) {
+    const uint64_t before = found.count();
+    IntelHdaAudioDevice* hda = nullptr;
     if (d.vendor_id == kVirtioPciVendor && d.device_id == kVirtioSoundDevice)
-      try_add<VirtioSoundDevice>(found, allocator_, pci_, d, allocator_, st_);
+      (void)try_add<VirtioSoundDevice>(found, allocator_, pci_, d, allocator_, st_);
     else if (d.class_code == kPciClassMultimedia && d.subclass == kPciSubclassHda)
-      try_add<IntelHdaAudioDevice>(found, allocator_, pci_, d, allocator_, st_);
+      hda = try_add<IntelHdaAudioDevice>(found, allocator_, pci_, d, allocator_, st_);
     else if (d.class_code == kPciClassMultimedia && d.subclass == kPciSubclassAudio &&
              Ac97AudioDevice::supports(d.vendor_id, d.device_id))
-      try_add<Ac97AudioDevice>(found, allocator_, pci_, d, allocator_, st_);
+      (void)try_add<Ac97AudioDevice>(found, allocator_, pci_, d, allocator_, st_);
+    if (found.count() > before) found_hda.push_back(hda);
   }
-  for (uint64_t i = 0; i < found.count(); ++i) adopt(SharedPointer<IAudioDevice>::from(util::move(found[i])), true, false);
+  for (uint64_t i = 0; i < found.count(); ++i)
+    adopt(SharedPointer<IAudioDevice>::from(util::move(found[i])), true, false, i < found_hda.count() ? found_hda[i] : nullptr);
 
   List<UniquePointer<UsbAudioDevice>> usb_audio(allocator_);
   if (usb_) UsbAudioDevice::discover(*usb_, allocator_, usb_audio);
@@ -172,7 +181,42 @@ void SystemAudioDevices::sweep_removed() {
   if (need_fallback) add_fallback(true);
 }
 
+void SystemAudioDevices::service_power(uint64_t now_ms) {
+  // The controllers are served outside the list's lock: a suspend calls the power observer (the GPU manager) and waits for the mixer's write.
+  List<SharedPointer<IAudioDevice>> keep(allocator_);
+  List<IntelHdaAudioDevice*> controllers(allocator_);
+  {
+    kernel::ScopedMutex guard(mutex_);
+    for (const Entry& e : devices_.view()) {
+      if (!e.hda) continue;
+      if (keep.push_back(e.device)) (void)controllers.push_back(e.hda);
+    }
+  }
+  for (IntelHdaAudioDevice* hda : controllers.view()) hda->service(now_ms);
+}
+
+bool SystemAudioDevices::attach_power_observer(PciAddress function, IPciFunctionPowerObserver* observer, uint32_t idle_ms) {
+  SharedPointer<IAudioDevice> keep;
+  IntelHdaAudioDevice* hda = nullptr;
+  {
+    kernel::ScopedMutex guard(mutex_);
+    for (const Entry& e : devices_.view()) {
+      if (!e.hda) continue;
+      const PciAddress a = e.hda->pci_address();
+      if (a.bus == function.bus && a.device == function.device && a.function == function.function) {
+        keep = e.device;
+        hda = e.hda;
+        break;
+      }
+    }
+  }
+  if (!hda) return false;
+  hda->set_power_observer(observer, idle_ms);   // (outside the lock: it may tell the observer at once)
+  return true;
+}
+
 bool SystemAudioDevices::poll(AudioEvent* event) {
+  service_power(clock_.now_ms());
   for (int rounds = 0; rounds < 64; ++rounds) {
     {
       kernel::ScopedMutex guard(mutex_);

@@ -31,6 +31,7 @@
 #include <stdint.h>
 #include "Hardware/Acpi/AmlInterpreter.hpp"
 #include "Hardware/Bus/Pci/IPciBus.hpp"
+#include "Kernel/Sync.hpp"
 #include "Utility/ArrayView.hpp"
 #include "Utility/Optional.hpp"
 
@@ -97,16 +98,97 @@ class AcpiDsm {
   [[nodiscard]] static uint64_t supported(acpi::AmlInterpreter& aml, acpi::Node* dsm, const AcpiDsmUuid& uuid, uint32_t revision);
 };
 
+// --- The PCI firmware _DSM (PCI Firmware Specification 3.3, 4.6): E5C937D0-3553-4D7A-9117-EA4D19C3434D on a PCI function's or bridge's Device.
+
+extern const AcpiDsmUuid kPciFirmwareDsmUuid;
+
+// Function 9, "_DSM for Specifying Device Readiness Durations" (revision 3 and later): a Package of five Integers, each a time in
+// microseconds the function needs before it answers configuration requests after (1) a Conventional Reset, (2) the link coming up (DL_Up),
+// (3) a Function Level Reset, (4) D3hot -> D0, (5) setting VF Enable. A value that is not an integer (or does not fit 32 bits) is absent.
+// Linux reads it on every PCI device (pci_acpi_optimize_delay) and uses the reset time as the D3cold -> D0 delay and the D3hot -> D0 time
+// as the D3hot delay, each only when it is shorter than the default (100 and 10 ms).
+struct PciDeviceReadiness {
+  Optional<uint32_t> reset_us, dl_up_us, flr_us, d3hot_to_d0_us, vf_enable_us;
+};
+
+class AcpiPciReadiness {
+ public:
+  static constexpr uint32_t kRevision = 3, kFunction = 9;
+  static constexpr uint32_t kDefaultD3coldDelayMs = 100;   // PCI_PM_D3COLD_WAIT: what the PCIe base spec allows a function after a reset
+
+  // Function 9 of `device`'s own _DSM (only when function 0 lists it). Empty if there is none, it faulted, or the answer is not a package of
+  // at least five elements. Takes the lock.
+  [[nodiscard]] static Optional<PciDeviceReadiness> read(acpi::AmlInterpreter& aml, acpi::Node* device);
+  // The wait after the power comes back before the function answers: the longer of the reset and DL_Up times, rounded up to milliseconds,
+  // when that is shorter than `default_ms`; else `default_ms` (the firmware may shorten the wait, never lengthen it, as in Linux).
+  [[nodiscard]] static uint32_t d3cold_delay_ms(const Optional<PciDeviceReadiness>& readiness, uint32_t default_ms = kDefaultD3coldDelayMs);
+};
+
 // --- Power resources.
+
+// Which devices need which power resource, for the whole machine (ACPI 6, 7.2: a power resource may be shared by several devices and is
+// turned off only when no device that needs it is in a state that needs it; Linux counts references per resource in drivers/acpi/power.c).
+// A holder is the namespace Device on whose behalf a resource is on: a GPU (or, when the GPU has no Device of its own, the root port holding
+// its _PR3), the HD-audio function, another root port. A holder becomes known with introduce() (it is then counted as needing the
+// resource: it was found in D0) and changes with need() and drop(). The interpreter's lock must be held around a decision and the _ON / _OFF
+// that follows it, so no other holder's change slips in between (GpuPowerResourceSet does). Thread safe on its own; a sleeping lock (the
+// callers are threads evaluating AML, which sleep anyway). Nodes are never freed by the interpreter, so they are stable keys. When the table
+// is full a resource is not tracked: need() reports 1 holder and drop() 0 others, which is the behaviour without counting.
+class AcpiPowerResourceRegistry {
+ public:
+  static constexpr uint32_t kMaxResources = 32, kMaxHolders = 8;
+
+  constexpr AcpiPowerResourceRegistry() = default;
+  AcpiPowerResourceRegistry(const AcpiPowerResourceRegistry&) = delete;
+  AcpiPowerResourceRegistry& operator=(const AcpiPowerResourceRegistry&) = delete;
+
+  // The machine's registry (what GpuPowerResourceSet uses unless told otherwise).
+  static AcpiPowerResourceRegistry& global();
+
+  // `holder` uses `resource`; the first time it is counted as needing it, later calls change nothing.
+  void introduce(acpi::Node* resource, acpi::Node* holder);
+  // `holder` needs `resource` (on). Returns how many holders need it now, this one included.
+  uint32_t need(acpi::Node* resource, acpi::Node* holder);
+  // `holder` no longer needs `resource`. Returns how many other holders still do (0: it may be turned off).
+  uint32_t drop(acpi::Node* resource, acpi::Node* holder);
+  // How many holders need `resource` now.
+  [[nodiscard]] uint32_t holders_needing(acpi::Node* resource) const;
+  [[nodiscard]] bool needs(acpi::Node* resource, acpi::Node* holder) const;
+  // Forgets everything (tests; an interpreter that was thrown away).
+  void clear();
+
+ private:
+  struct Holder {
+    acpi::Node* node = nullptr;
+    bool needs = false;
+  };
+  struct Entry {
+    acpi::Node* resource = nullptr;
+    Holder holders[kMaxHolders] = {};
+    uint32_t count = 0;
+  };
+  Entry* find_locked(acpi::Node* resource);
+  const Entry* find_locked(acpi::Node* resource) const;
+  Entry* add_locked(acpi::Node* resource);
+  static Holder* holder_in(Entry& e, acpi::Node* holder, bool create);
+  static uint32_t needing(const Entry& e);
+
+  mutable kernel::Mutex mutex_;
+  Entry entries_[kMaxResources] = {};
+  uint32_t count_ = 0;
+};
 
 // The power resources of a GPU and how to take it to D3cold and back. The resources are those of the GPU's own _PR3 or, when it has none,
 // those of its parent bridge (many laptops describe the GPU's power rail on the root port): ACPI powers a device down by turning off what
 // its D3hot state needs (_PR3) and up by turning on what D0 needs (_PR0). Without any resources the set only runs _PS3/_PS0, which some
 // firmware uses to cut the power itself (NVIDIA Optimus).
 //
-// Not done: reference counting between devices that share a resource (the audio function of the GPU, another device on the same rail). The
-// manager has put every function of the GPU in D3hot before power_off(); a resource shared with an unrelated device would be cut under it,
-// which firmware for a GPU rail does not do in practice.
+// Shared resources are counted (AcpiPowerResourceRegistry): read() introduces the GPU as a holder of its _PR0 and _PR3 resources,
+// power_off() drops it and runs _OFF only for those no other holder needs (another GPU, another device's root port on the same rail),
+// power_on() takes them again. The holder is the GPU's Device, or the Device holding the resources when the GPU has none.
+//
+// read() also reads the PCI firmware _DSM's readiness durations (function 9) of the GPU's Device, else of the bridge's, for
+// power_on_delay_ms().
 class GpuPowerResourceSet {
  public:
   static constexpr uint32_t kMaxResources = 8;
@@ -123,12 +205,22 @@ class GpuPowerResourceSet {
   ArrayView<acpi::Node* const> d0_resources() const { return ArrayView<acpi::Node* const>(d0_, d0_count_); }
   acpi::Node* device() const { return device_; }
   acpi::Node* holder() const { return holder_; }
+  // The holder this set counts as in the registry (the GPU's Device, else the Device holding the resources).
+  acpi::Node* identity() const { return device_ ? device_ : holder_; }
+  // Counts in `registry` instead of the global one (before read(); tests). Not owned; must outlive the set.
+  void use_registry(AcpiPowerResourceRegistry& registry) { registry_ = &registry; }
+  AcpiPowerResourceRegistry& registry() const { return *registry_; }
+  // Function 9 of the PCI firmware _DSM (the GPU's own, else the bridge's), and the D3cold -> D0 wait it gives (100 ms without it).
+  const Optional<PciDeviceReadiness>& readiness() const { return readiness_; }
+  uint32_t power_on_delay_ms() const { return AcpiPciReadiness::d3cold_delay_ms(readiness_); }
 
   // _PS3 of the GPU (then of the bridge, when it holds the resources), then _OFF of every _PR3 resource that is on (by _STA, a resource
-  // without _STA counts as on), last first. Stops at the first fault: the GPU stays in D3hot. Takes the lock.
+  // without _STA counts as on) and that no other holder needs, last first. Stops at the first fault: the GPU stays in D3hot (and keeps
+  // its claim on the resources). Takes the lock.
   [[nodiscard]] bool power_off(acpi::AmlInterpreter& aml) const;
-  // _ON of every resource of _PR0 and then of the _PR3 ones not in _PR0 that are off, first first, then _PS0 of the bridge (when it holds
-  // the resources) and of the GPU. Goes on after a fault (to bring up as much as possible) and returns false. Takes the lock.
+  // The GPU needs every resource again; _ON of every resource of _PR0 and then of the _PR3 ones not in _PR0 that are off, first first,
+  // then _PS0 of the bridge (when it holds the resources) and of the GPU. Goes on after a fault (to bring up as much as possible) and
+  // returns false. Takes the lock.
   [[nodiscard]] bool power_on(acpi::AmlInterpreter& aml) const;
 
  private:
@@ -141,6 +233,8 @@ class GpuPowerResourceSet {
   acpi::Node* d0_[kMaxResources] = {};
   uint32_t d3_count_ = 0, d0_count_ = 0;
   bool ps3_ = false;
+  AcpiPowerResourceRegistry* registry_ = &AcpiPowerResourceRegistry::global();
+  Optional<PciDeviceReadiness> readiness_;
 };
 
 }  // namespace hardware

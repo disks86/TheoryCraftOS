@@ -19,6 +19,8 @@
 // The vendor probes a GpuPool gives the GPUs it has no driver for. Apart from GpuPool.cpp so that the pool's bookkeeping builds and is tested
 // without the driver code.
 #include "Hardware/GraphicsProcessingUnit/Multi/GpuProbe.hpp"
+#include "Hardware/GraphicsProcessingUnit/AMD/AmdGpuProbe.hpp"
+#include "Hardware/GraphicsProcessingUnit/Intel/IntelGpuProbe.hpp"
 #include "Hardware/GraphicsProcessingUnit/NVIDIA/NvidiaNative.hpp"
 #include "Utility/ArrayView.hpp"
 
@@ -27,6 +29,8 @@ namespace hardware {
 namespace {
 
 constexpr uint16_t kNvidiaVendor = 0x10DE;
+constexpr uint16_t kAmdVendor = 0x1002;
+constexpr uint16_t kIntelVendor = 0x8086;
 
 // Appends `text` to the string in `out` at `*n`, keeping it terminated.
 void append(ArrayView<char> out, uint32_t* n, const char* text) {
@@ -81,6 +85,12 @@ class NvidiaGpuProbe final : public IGpuProbe {
 
 UniquePointer<IGpuProbe> make_vendor_gpu_probe(const GpuContext& context, allocators::IAllocator& allocator) {
   if (context.device.vendor_id == kNvidiaVendor && context.registers) return UniquePointer<IGpuProbe>::make_as<NvidiaGpuProbe>(allocator, context, allocator);
+  // AMD and Intel: only the discrete chips the identification knows (AmdGpuProbe / IntelGpuProbe: chip, memory size, temperature; for AMD the VBIOS strings).
+  const uint16_t device = context.device.device_id;
+  if (context.device.vendor_id == kAmdVendor && context.registers && context.pci && AmdGpuProbe::supported(device))
+    return UniquePointer<IGpuProbe>::make_as<AmdGpuProbe>(allocator, context, allocator);
+  if (context.device.vendor_id == kIntelVendor && context.registers && context.pci && IntelGpuProbe::supported(device))
+    return UniquePointer<IGpuProbe>::make_as<IntelGpuProbe>(allocator, context);
   return UniquePointer<IGpuProbe>();
 }
 
