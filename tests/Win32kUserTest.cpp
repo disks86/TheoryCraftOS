@@ -2156,6 +2156,91 @@ void test_redirection() {
 
 }  // namespace
 
+// Layered windows (WS_EX_LAYERED): invisible until they have attributes or a picture; SetLayeredWindowAttributes is applied by the desktop (colour key, constant
+// alpha); UpdateLayeredWindow puts a DC's premultiplied picture on the surface with straight alpha, a ULW_COLORKEY colour left out.
+void test_layered_windows() {
+  Program prog(93);
+  Th t(prog, 93, kScratch);
+  t.proc = def_proc;
+  DesktopBridge bridge;
+  bridge.attach(6, 19);
+  const desktop::IWindowsSession::Monitor one[1] = {{{0, 0, 1024, 768}, {0, 0, 1024, 740}}};
+  bridge.set_display(1024, 768, ArrayView<const desktop::IWindowsSession::Monitor>(one, 1));
+  CHECK(t.atom_class("Layered") >= 0xC000);
+  const uint32_t w = t.create("Layered", WS_POPUP | WS_VISIBLE, 50, 60, 4, 2, 0, 0x80000 /* WS_EX_LAYERED */, "Bubble");
+  CHECK(w != 0);
+  CHECK(user::top_level_surface_blend_locked(w).mode == user::SurfaceBlend::Hidden);      // (nothing yet: not drawn)
+  const uint32_t plain = t.create("Layered", WS_POPUP | WS_VISIBLE, 0, 0, 4, 2, 0, 0, "Plain");
+  CHECK(user::top_level_surface_blend_locked(plain).mode == user::SurfaceBlend::Opaque);
+
+  // SetLayeredWindowAttributes: LWA_ALPHA 128, then LWA_COLORKEY of red (COLORREF 0x0000FF)
+  CHECK(t.svc32(N::NtUserSetLayeredWindowAttributes, {w, 0, 128, 2}) == 1);
+  user::SurfaceBlendInfo b = user::top_level_surface_blend_locked(w);
+  CHECK(b.mode == user::SurfaceBlend::Attributes && !b.keyed && b.alpha == 128);
+  CHECK(t.svc32(N::NtUserSetLayeredWindowAttributes, {w, 0x0000FF, 0, 1}) == 1);
+  b = user::top_level_surface_blend_locked(w);
+  CHECK(b.mode == user::SurfaceBlend::Attributes && b.keyed && b.key == 0xFF0000 && b.alpha == 255);      // (the key as the surface has it: 0x00RRGGBB)
+  CHECK(t.svc32(N::NtUserSetLayeredWindowAttributes, {w, 0, 255, 2}) == 1);
+  CHECK(user::top_level_surface_blend_locked(w).mode == user::SurfaceBlend::Opaque);      // (opaque attributes: drawn as it is)
+
+  // UpdateLayeredWindow from a 4 x 2 32-bit bitmap, premultiplied B, G, R, A: opaque blue, half-transparent white, transparent, green
+  const uint64_t bits = t.tmp(0x1000);
+  const uint32_t pixels[8] = {0xFF0000FFu, 0x80808080u, 0x00000000u, 0xFF00FF00u, 0xFF0000FFu, 0x80808080u, 0x00000000u, 0xFF112233u};
+  for (uint32_t i = 0; i < 8; ++i) t.mem().put32(bits + 4 * i, pixels[i]);
+  const uint32_t dc = t.svc32(N::NtGdiCreateCompatibleDC, {0});
+  const uint32_t bm = t.svc32(N::NtGdiCreateBitmap, {4, 2, 1, 32, bits});
+  CHECK(dc != 0 && bm != 0);
+  t.svc(N::NtGdiSelectBitmap, {dc, bm});
+  const uint64_t blend = t.tmp(0x1100), size = t.tmp(0x1110), src = t.tmp(0x1120);
+  t.mem().put32(blend, 0x01FF0000u);      // AC_SRC_OVER, 0, SourceConstantAlpha 255, AC_SRC_ALPHA
+  t.mem().put32(size, 4);
+  t.mem().put32(size + 4, 2);
+  t.mem().put32(src, 0);
+  t.mem().put32(src + 4, 0);
+  CHECK(t.svc32(N::NtUserUpdateLayeredWindow, {w, 0, 0, size, dc, src, 0, blend, 2 /* ULW_ALPHA */, 0}) == 1);
+  CHECK(user::top_level_surface_blend_locked(w).mode == user::SurfaceBlend::PerPixelAlpha);
+  user::TopLevelInfo info;
+  uint32_t sw = 0, sh = 0;
+  CHECK(user::top_level_info(w, &info, nullptr) && info.surface_id != 0);
+  const ArrayView<uint32_t> px = gdi::window_surface_pixels(info.surface_id, &sw, &sh);
+  CHECK(sw == 4 && sh == 2);
+  if (sw == 4 && sh == 2) {
+    CHECK(px[0] == 0xFF0000FFu && px[3] == 0xFF00FF00u && (px[2] >> 24) == 0);
+    CHECK((px[1] >> 24) == 0x80 && (px[1] & 0xFF) == 0xFF && ((px[1] >> 16) & 0xFF) == 0xFF);      // (white again, its alpha kept)
+  }
+  // ULW_COLORKEY: the green pixel (COLORREF 0x00FF00) is left out, the rest stays
+  CHECK(t.svc32(N::NtUserUpdateLayeredWindow, {w, 0, 0, size, dc, src, 0x00FF00, blend, 3 /* ULW_COLORKEY | ULW_ALPHA */, 0}) == 1);
+  if (sw == 4 && sh == 2) CHECK((px[3] >> 24) == 0 && px[0] == 0xFF0000FFu);
+  // a constant alpha of 128 over an opaque picture (ULW_ALPHA without AC_SRC_ALPHA)
+  t.mem().put32(blend, 0x00800000u);
+  CHECK(t.svc32(N::NtUserUpdateLayeredWindow, {w, 0, 0, size, dc, src, 0, blend, 2, 0}) == 1);
+  if (sw == 4 && sh == 2) CHECK((px[0] >> 24) == 0x80 && (px[7] & 0xFFFFFF) == 0x112233u);      // (B 33, G 22, R 11: 0x00RRGGBB)
+  // what is not layered is refused
+  CHECK(t.svc32(N::NtUserUpdateLayeredWindow, {plain, 0, 0, size, dc, src, 0, blend, 2, 0}) == 0);
+
+  // the desktop draws it: over black, a constant alpha of 128 halves the blue; then the colour key of blue (COLORREF 0xFF0000) leaves it out
+  auto draw = [&](uint32_t* out) {
+    for (uint32_t i = 0; i < 8; ++i) out[i] = 0xFF000000u;
+    graphics::Surface target;
+    target.pixels = ArrayView<uint32_t>(out, 8);
+    target.width = target.pitch = 4;
+    target.height = 2;
+    graphics::SoftwareRenderer2D renderer(target);
+    uint32_t dw = 0, dh = 0;
+    return bridge.draw_window(w, renderer, 0, 0, &dw, &dh) && dw == 4 && dh == 2;
+  };
+  uint32_t canvas[8];
+  CHECK(t.svc32(N::NtUserSetLayeredWindowAttributes, {w, 0, 128, 2}) == 1);
+  CHECK(draw(canvas));
+  CHECK((canvas[0] & 0xFF) >= 0x7E && (canvas[0] & 0xFF) <= 0x81 && (canvas[0] & 0xFFFF00) == 0);
+  CHECK(t.svc32(N::NtUserSetLayeredWindowAttributes, {w, 0xFF0000, 0, 1}) == 1);
+  CHECK(draw(canvas));
+  CHECK((canvas[0] & 0xFFFFFF) == 0 && (canvas[7] & 0xFFFFFF) == 0x112233u);      // (the key's pixel left out, the others as they are)
+  bridge.detach();
+  user::reset_state();
+  gdi::shutdown();
+}
+
 int main() {
   System sys;
   test_classes();
@@ -2170,6 +2255,7 @@ int main() {
   test_process_exit_and_bad_pointers();
   test_props_longs_text();
   test_redirection();
+  test_layered_windows();
   test_dpi_virtualization();
   test_system_aware_scale_change();
   test_device_edge();

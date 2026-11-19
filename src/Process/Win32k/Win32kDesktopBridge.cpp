@@ -390,6 +390,40 @@ bool DesktopBridge::fill_info(const user::TopLevelInfo& info, desktop::WindowsWi
 // The surface of an unaware program's window is in units (drawn as it is); an aware one's is in device pixels, shrunk here to units (the desktop at scale
 // 1, or a renderer that cannot draw on the device) or drawn 1:1 by draw_window_scaled. A system-aware program's, after the scale grew, is in pixels of
 // the scale it started at: resampled to units here, or enlarged by the ratio on the device.
+namespace {
+
+// A layered window with SetLayeredWindowAttributes is painted as usual; it is drawn from a copy whose every pixel has its alpha: 0 for the colour key, else the
+// constant alpha. False: no memory (the window is then drawn as it is).
+bool attributed_copy(ArrayView<uint32_t> pixels, const user::SurfaceBlendInfo& blend, List<uint32_t>* out) {
+  if (!out->reserve(pixels.size())) return false;
+  for (uint32_t p : pixels) {
+    const uint32_t rgb = p & 0x00FFFFFFu;
+    const uint32_t a = (blend.keyed && rgb == blend.key) ? 0 : blend.alpha;
+    if (!out->push_back(rgb | (a << 24))) return false;
+  }
+  return true;
+}
+
+// Sets the surface `s` the desktop draws for the window and the blending to draw it with. False: nothing to draw (a hidden layered window).
+bool prepare_blend(uint32_t window, graphics::Surface* s, List<uint32_t>* scratch, graphics::BlendMode* mode) {
+  const user::SurfaceBlendInfo blend = user::top_level_surface_blend_locked(window);
+  *mode = graphics::BlendMode::Replace;
+  switch (blend.mode) {
+    case user::SurfaceBlend::Hidden: return false;
+    case user::SurfaceBlend::Opaque: return true;
+    case user::SurfaceBlend::PerPixelAlpha: *mode = graphics::BlendMode::Alpha; return true;
+    case user::SurfaceBlend::Attributes:
+      if (attributed_copy(s->pixels, blend, scratch)) {
+        s->pixels = scratch->view();
+        *mode = graphics::BlendMode::Alpha;
+      }
+      return true;
+  }
+  return true;
+}
+
+}  // namespace
+
 bool DesktopBridge::draw_window(uint32_t window, graphics::IRenderer2D& renderer, int32_t x, int32_t y, uint32_t* width, uint32_t* height) {
   user_misc::SystemLock lock;
   const uint32_t id = user::top_level_surface_locked(window);
@@ -408,9 +442,12 @@ bool DesktopBridge::draw_window(uint32_t window, graphics::IRenderer2D& renderer
   const uint32_t uh = resample ? uint32_t(graphics::device_to_units(graphics::units_to_device(int32_t(h), k), km)) : h;
   *width = uw;
   *height = uh;
-  const user::SurfaceBlend blend = user::top_level_surface_blend_locked(window);
-  if (blend == user::SurfaceBlend::Hidden) return true;      // (a layered window with nothing to show yet)
-  renderer.set_blend(blend == user::SurfaceBlend::PerPixelAlpha ? graphics::BlendMode::Alpha : graphics::BlendMode::Replace);
+  allocators::IAllocator* allocator = system_allocator();
+  if (!allocator) return false;
+  List<uint32_t> scratch(*allocator);
+  graphics::BlendMode mode = graphics::BlendMode::Replace;
+  if (!prepare_blend(window, &s, &scratch, &mode)) return true;      // (a layered window with nothing to show yet)
+  renderer.set_blend(mode);
   if (resample) renderer.draw_image_scaled(s, {0, 0, float(w), float(h)}, {x, y, uw, uh}, graphics::ImageFilter::Bilinear);
   else renderer.draw_image(s, {0, 0, w, h}, x, y);
   renderer.set_blend(graphics::BlendMode::Alpha);
@@ -435,9 +472,12 @@ bool DesktopBridge::draw_window_scaled(uint32_t window, graphics::IRenderer2D& d
   s.height = h;
   *width = uint32_t(graphics::device_to_units(int32_t(w), scale));
   *height = uint32_t(graphics::device_to_units(int32_t(h), scale));
-  const user::SurfaceBlend blend = user::top_level_surface_blend_locked(window);
-  if (blend == user::SurfaceBlend::Hidden) return true;
-  device.set_blend(blend == user::SurfaceBlend::PerPixelAlpha ? graphics::BlendMode::Alpha : graphics::BlendMode::Replace);
+  allocators::IAllocator* allocator = system_allocator();
+  if (!allocator) return false;
+  List<uint32_t> scratch(*allocator);
+  graphics::BlendMode mode = graphics::BlendMode::Replace;
+  if (!prepare_blend(window, &s, &scratch, &mode)) return true;
+  device.set_blend(mode);
   device.draw_image(s, {0, 0, w, h}, x, y);
   device.set_blend(graphics::BlendMode::Alpha);
   return true;

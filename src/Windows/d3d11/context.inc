@@ -691,3 +691,50 @@ static void STDMETHODCALLTYPE ctx_ClearState(Ctx *c) {
   c->dev->dirty = DIRTY_ALL;
   UNLOCK(c);
 }
+
+/* ---- queries (see d3d11.c) ------------------------------------------------------------------------------------------------------------------------------ */
+
+static Query *query_of(ID3D11Asynchronous *a) {
+  if (!a || ((DxObj *)a)->lpVtbl != (const void *)&query_vtbl) return NULL;      /* (only this library's queries: predicates and counters are not made) */
+  return (Query *)a;
+}
+static void STDMETHODCALLTYPE ctx_Begin(Ctx *c, ID3D11Asynchronous *async) {
+  (void)c;
+  Query *q = query_of(async);
+  if (!q || q->desc.Query == D3D11_QUERY_EVENT || q->desc.Query == D3D11_QUERY_TIMESTAMP) return;      /* (those only End) */
+  q->begun = TRUE;
+  q->ended = FALSE;
+  q->start = query_now();
+}
+static void STDMETHODCALLTYPE ctx_End(Ctx *c, ID3D11Asynchronous *async) {
+  Query *q = query_of(async);
+  if (!q) return;
+  flush(c->dev);      /* (what came before is done) */
+  q->stop = query_now();
+  q->ended = TRUE;
+}
+static HRESULT STDMETHODCALLTYPE ctx_GetData(Ctx *c, ID3D11Asynchronous *async, void *data, UINT size, UINT flags) {
+  (void)c; (void)flags;
+  Query *q = query_of(async);
+  if (!q) return E_INVALIDARG;
+  const UINT need = query_data_size(q->desc.Query);
+  if (data && size != need && size != 0) return E_INVALIDARG;
+  if (!q->ended) return DXGI_ERROR_INVALID_CALL;
+  if (!data || size == 0) return S_OK;
+  switch (q->desc.Query) {
+    case D3D11_QUERY_EVENT: *(BOOL *)data = TRUE; break;
+    case D3D11_QUERY_OCCLUSION: *(UINT64 *)data = 1; break;
+    case D3D11_QUERY_TIMESTAMP: *(UINT64 *)data = q->stop; break;
+    case D3D11_QUERY_TIMESTAMP_DISJOINT: {
+      D3D11_QUERY_DATA_TIMESTAMP_DISJOINT *t = data;
+      LARGE_INTEGER f;
+      QueryPerformanceFrequency(&f);
+      t->Frequency = (UINT64)f.QuadPart;
+      t->Disjoint = FALSE;
+      break;
+    }
+    default: return E_INVALIDARG;
+  }
+  return S_OK;
+}
+

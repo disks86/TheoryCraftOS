@@ -46,7 +46,7 @@
 #include <stddef.h>
 #include <d3d11.h>
 #include <d3d12.h>
-#include <dxgi1_2.h>
+#include <dxgi1_3.h>
 #include "../tcosdx.h"
 
 #pragma GCC diagnostic ignored "-Wunused-function"
@@ -137,6 +137,7 @@ typedef struct Blend { Child c; D3D11_BLEND_DESC desc; } Blend;
 typedef struct Depth { Child c; D3D11_DEPTH_STENCIL_DESC desc; } Depth;
 typedef struct Raster { Child c; D3D11_RASTERIZER_DESC desc; } Raster;
 typedef struct Sampler { Child c; D3D11_SAMPLER_DESC desc; } Sampler;
+typedef struct Query { Child c; D3D11_QUERY_DESC desc; BOOL begun, ended; UINT64 start, stop; } Query;      /* stop/start: QueryPerformanceCounter */
 
 typedef struct Pipeline {
   UINT vs, ps, layout;
@@ -275,6 +276,7 @@ extern const ID3D11BlendStateVtbl blend_vtbl;
 extern const ID3D11DepthStencilStateVtbl depth_vtbl;
 extern const ID3D11RasterizerStateVtbl raster_vtbl;
 extern const ID3D11SamplerStateVtbl sampler_vtbl;
+extern const ID3D11QueryVtbl query_vtbl;
 
 static const GUID *const g_dev_iids[] = {&IID_ID3D11Device, NULL};
 static const GUID *const g_ctx_iids[] = {&IID_ID3D11DeviceChild, &IID_ID3D11DeviceContext, NULL};
@@ -290,6 +292,7 @@ static const GUID *const g_blend_iids[] = {&IID_ID3D11DeviceChild, &IID_ID3D11Bl
 static const GUID *const g_depth_iids[] = {&IID_ID3D11DeviceChild, &IID_ID3D11DepthStencilState, NULL};
 static const GUID *const g_raster_iids[] = {&IID_ID3D11DeviceChild, &IID_ID3D11RasterizerState, NULL};
 static const GUID *const g_sampler_iids[] = {&IID_ID3D11DeviceChild, &IID_ID3D11SamplerState, NULL};
+static const GUID *const g_query_iids[] = {&IID_ID3D11DeviceChild, &IID_ID3D11Asynchronous, &IID_ID3D11Query, NULL};
 
 /* ---- the command list ------------------------------------------------------------------------------------------------------------------------------- */
 
@@ -799,6 +802,39 @@ static HRESULT STDMETHODCALLTYPE dev_CreateSamplerState(Dev *d, const D3D11_SAMP
   if (!s) return E_OUTOFMEMORY;
   s->desc = *desc;
   return give(s, (void **)out);
+}
+
+/* ---- queries ---------------------------------------------------------------------------------------------------------------------------------------- */
+/* The queue runs each command list before it returns, so a query is answered once the work recorded before its End is sent: an event is then done, a
+ * timestamp is the time of the End. Occlusion is not counted: a query says some samples passed (what a renderer may assume when it cannot know). */
+
+static UINT query_data_size(D3D11_QUERY q) {
+  switch (q) {
+    case D3D11_QUERY_EVENT: return sizeof(BOOL);
+    case D3D11_QUERY_OCCLUSION: case D3D11_QUERY_TIMESTAMP: return sizeof(UINT64);
+    case D3D11_QUERY_TIMESTAMP_DISJOINT: return sizeof(D3D11_QUERY_DATA_TIMESTAMP_DISJOINT);
+    case D3D11_QUERY_OCCLUSION_PREDICATE: return sizeof(BOOL);
+    default: return 0;
+  }
+}
+static HRESULT STDMETHODCALLTYPE dev_CreateQuery(Dev *d, const D3D11_QUERY_DESC *desc, ID3D11Query **out) {
+  if (out) *out = NULL;
+  if (!desc || desc->MiscFlags & ~(UINT)D3D11_QUERY_MISC_PREDICATEHINT) return E_INVALIDARG;
+  if (query_data_size(desc->Query) == 0 || desc->Query == D3D11_QUERY_OCCLUSION_PREDICATE) return E_INVALIDARG;      /* (a predicate is made with CreatePredicate) */
+  if (!out) return S_FALSE;
+  Query *q = child_new(sizeof *q, d, &query_vtbl, g_query_iids, child_destroy);
+  if (!q) return E_OUTOFMEMORY;
+  q->desc = *desc;
+  q->begun = q->ended = FALSE;
+  q->start = q->stop = 0;
+  return give(q, (void **)out);
+}
+static void STDMETHODCALLTYPE query_GetDesc(Query *q, D3D11_QUERY_DESC *desc) { if (desc) *desc = q->desc; }
+static UINT STDMETHODCALLTYPE query_GetDataSize(Query *q) { return query_data_size(q->desc.Query); }
+static UINT64 query_now(void) {
+  LARGE_INTEGER t;
+  QueryPerformanceCounter(&t);
+  return (UINT64)t.QuadPart;
 }
 
 #include "context.inc"

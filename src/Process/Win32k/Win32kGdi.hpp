@@ -67,9 +67,9 @@ ArrayView<uint32_t> window_surface_pixels(uint32_t surface, uint32_t* width, uin
 void window_surface_damaged(uint32_t surface, const Rect& dirty);
 // UpdateLayeredWindow: the pixels of the source DC (from its logical point sx, sy; width x height) onto the window surface at (dx, dy). With per_pixel the source is
 // premultiplied B, G, R, A (ULW_ALPHA with AC_SRC_ALPHA) and the surface gets straight alpha (0xAARRGGBB); otherwise the pixels are opaque. Each alpha is then scaled
-// by `constant` (BLENDFUNCTION.SourceConstantAlpha). False: no such DC or surface.
+// by `constant` (BLENDFUNCTION.SourceConstantAlpha). With `keyed`, a source pixel of colour `key` (COLORREF) gets alpha 0. False: no such DC or surface.
 bool copy_to_layered_surface(Call& c, uint32_t source_handle, int32_t sx, int32_t sy, int32_t width, int32_t height, uint32_t surface, int32_t dx, int32_t dy, bool per_pixel,
-                             uint8_t constant);
+                             uint8_t constant, bool keyed = false, uint32_t key = 0);
 // The surface's bytes (B, G, R, X; rows width * 4 bytes apart), for writing them.
 ByteView window_surface_bytes(uint32_t surface, uint32_t* width, uint32_t* height);
 class IWindowSurfaceSink {
