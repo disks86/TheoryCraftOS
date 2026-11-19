@@ -1115,8 +1115,11 @@ uint32_t nt_create_section(Process& p, const SyscallRequest& r) {
   ObjectManager* objects = system_objects();
   if (!objects) return kNotImplemented;
   const uint32_t page = uint32_t(page_protection);
+  const bool image_section = (uint32_t(attributes) & 0x1000000u) != 0;      // SEC_IMAGE
   bool copy = false;
-  if (protection_of_page(page, &copy) == 0 || page == kPageExecute) return kInvalidParameter;      // (no access and execute-only sections do not exist)
+  // (no access and execute-only data sections do not exist; an image section may be asked for as PAGE_EXECUTE, as Chromium's sandbox does for the DLLs a
+  // renderer may load: its pages get their protection from the image)
+  if (protection_of_page(page, &copy) == 0 || (page == kPageExecute && !image_section)) return kInvalidParameter;
   if (!p.write_user_u64(r.args[0], 0)) return kAccessViolation;
   Named named;
   if (const uint32_t status = resolve_name(p, *objects, r.args[2], true, false, &named)) return status;
@@ -1132,7 +1135,9 @@ uint32_t nt_create_section(Process& p, const SyscallRequest& r) {
     OpenObject* file = p.files().object(slot);
     if (!file || !p.files().host_path_of(file->path.view(), &host)) return kInvalidHandle;
     fs = p.files().file_system();
-    if (!file->readable || file->no_data_access) return 0xC0000022u;      // a file that cannot be read cannot be mapped
+    // A file that cannot be read cannot be mapped; an image is mapped with execute access to its file (FILE_EXECUTE or GENERIC_EXECUTE) as well.
+    const bool executable = image_section && (file->granted_access & (0x20u | 0x20000000u | 0x10000000u)) != 0;
+    if ((!file->readable && !executable) || file->no_data_access) return 0xC0000022u;
     if (!file->writable && (page == kPageReadWrite || page == kPageExecuteReadWrite || page == kPageExecuteRead || page == kPageExecuteWriteCopy)) return 0xC0000022u;      // STATUS_ACCESS_DENIED
     file_size = p.files().size_of(*file);
     const bool section_writes = page == kPageReadWrite || page == kPageExecuteReadWrite;      // only a section that can be written grows the file
@@ -1720,6 +1725,20 @@ uint32_t nt_query_object(Process& p, const SyscallRequest& r) {
       const DescriptorKind kind = p.files().kind(slot);
       if (objects && kind == DescriptorKind::ObjectDirectory) {
         chars = objects->object_text(uint32_t(p.files().token(slot)), text, sizeof(text));
+      } else if (kind == DescriptorKind::File || kind == DescriptorKind::Directory) {
+        // The NT name of a file: "\Device\HarddiskVolume1\dir\file" (drive C:'s volume; FileNameInformation gives the part after it). Chromium's sandbox
+        // builds its rules from these names (the DLLs a renderer may load).
+        const OpenObject* object = p.files().object(slot);
+        if (object) {
+          String spelled(p.files().allocator());
+          if (!p.files().canonical_path(object->path.view(), &spelled) && !spelled.assign(object->path.view())) return 0xC0000017u;      // STATUS_NO_MEMORY
+          static const char kDevice[] = "\\Device\\HarddiskVolume1";
+          for (uint32_t i = 0; kDevice[i] && chars < sizeof(text); ++i) text[chars++] = kDevice[i];
+          for (char ch : spelled.view()) {
+            if (chars >= sizeof(text)) return 0xC0000106u;      // STATUS_NAME_TOO_LONG
+            text[chars++] = ch == '/' ? '\\' : ch;
+          }
+        }
       } else if (kind == DescriptorKind::Key) {
         String full(p.files().allocator());
         if (key_full_name(p, p.files().token(slot), &full)) {
