@@ -23,6 +23,7 @@
 #include "Process/AddressSpace.hpp"
 #include "Process/ModuleLoader.hpp"
 #include "Process/ImageCache.hpp"
+#include "FileSystem/Ram/RamFileSystem.hpp"
 
 using namespace process;
 
@@ -51,6 +52,7 @@ struct Import { std::string dll, name; uint16_t ordinal = 0; bool by_ordinal = f
 struct Export { std::string name; std::string forwarder; uint32_t ordinal = 0; };
 struct Spec {
   bool dll = true;
+  std::string manifest;      // an RT_MANIFEST resource #1 (the program's side-by-side manifest), if not empty
   uint64_t base = 0x180000000ull;
   std::vector<Export> exports;
   std::vector<Import> imports;
@@ -144,6 +146,16 @@ static Built build(const Spec& spec) {
       table += 8 * (2 * (count + 1));
     }
     put(b, o + 120, 0x1800, 4); put(b, o + 124, 20 * (dlls.size() + 1), 4);
+  }
+  // resources: type 24 -> id 1 -> language 1033 -> data (the tree at section offset 0x1A00, the manifest's text at 0x1400)
+  if (!spec.manifest.empty()) {
+    const uint64_t r = s0 + 0x1A00;
+    put(b, r + 14, 1, 2); put(b, r + 16, 24, 4); put(b, r + 20, 0x80000000u | 0x18, 4);
+    put(b, r + 0x18 + 14, 1, 2); put(b, r + 0x18 + 16, 1, 4); put(b, r + 0x18 + 20, 0x80000000u | 0x30, 4);
+    put(b, r + 0x30 + 14, 1, 2); put(b, r + 0x30 + 16, 1033, 4); put(b, r + 0x30 + 20, 0x48, 4);
+    put(b, r + 0x48, 0x1000 + 0x1400, 4); put(b, r + 0x48 + 4, spec.manifest.size(), 4);
+    put_text(b, s0 + 0x1400, spec.manifest);
+    put(b, o + 128, 0x1000 + 0x1A00, 4); put(b, o + 132, 0x58, 4);      // directory 2: resources
   }
   // a pointer inside the image, fixed by a relocation
   put(b, s0 + 0x1F00, spec.base + 0x1234, 8);
@@ -390,8 +402,104 @@ static void test_shared_images() {
   set_image_cache(nullptr);
 }
 
+static std::vector<std::string> strings(const List<String>& list) {
+  std::vector<std::string> out;
+  for (const String& s : list.view()) out.push_back(str(s.view()));
+  return out;
+}
+
+static void write_file(filesystem::IFileSystem& fs, const char* path, const Bytes& bytes) {
+  UniquePointer<filesystem::IFile> file;
+  uint64_t done = 0;
+  CHECK(fs.open_file(path, filesystem::OpenMode::CreateTruncate, &file) == filesystem::Status::Ok);
+  if (file) CHECK(file->write(0, ConstByteView(bytes.data(), bytes.size()), &done) == filesystem::Status::Ok && done == bytes.size());
+}
+static void write_file(filesystem::IFileSystem& fs, const char* path, const std::string& text) { write_file(fs, path, Bytes(text.begin(), text.end())); }
+
+// Side-by-side manifests: a program's private assemblies (Chrome: chrome.exe -> "<version>\\<version>.manifest" -> chrome_elf.dll in that folder).
+static void test_private_assemblies() {
+  const std::string program_manifest =
+      "<?xml version='1.0' encoding='UTF-8' standalone='yes'?>\n<assembly xmlns='urn:schemas-microsoft-com:asm.v1' manifestVersion='1.0'>\n"
+      "<dependency><dependentAssembly><assemblyIdentity type='win32' name='Microsoft.Windows.Common-Controls' version='6.0.0.0' processorArchitecture='*' "
+      "publicKeyToken='6595b64144ccf1df' language='*'/></dependentAssembly></dependency>\n"
+      "<dependency>\n  <dependentAssembly>\n    <assemblyIdentity name=\"131.0.6778.86\" version=\"131.0.6778.86\" type=\"win32\"/>\n  </dependentAssembly>\n</dependency>\n"
+      "<dependency><dependentAssembly><assemblyIdentity name='..' type='win32'/></dependentAssembly></dependency>\n"
+      "<dependency><dependentAssembly><assemblyIdentity name='a/b' type='win32'/></dependentAssembly></dependency>\n"
+      "</assembly>\n";
+  {
+    List<String> names(A);
+    CHECK(manifest_private_assemblies(StringView(program_manifest.c_str()), A, &names));
+    CHECK(strings(names) == std::vector<std::string>{"131.0.6778.86"});      // (the shared one has a token; ".." and "a/b" are no folder names)
+    List<String> files(A);
+    CHECK(manifest_files(StringView("<assembly><assemblyIdentity name='x'/><file name='chrome_elf.dll'/><file  name = \"Other.DLL\" hash='1'></file>"
+                                    "<fileX name='no.dll'/><file name='../up.dll'/><file name='chrome_elf.dll'/></assembly>"), A, &files));
+    CHECK(strings(files) == std::vector<std::string>{"chrome_elf.dll", "Other.DLL"});
+    // Truncated or broken text: nothing found, nothing read past the end.
+    for (size_t cut = 0; cut < program_manifest.size(); cut += 7) {
+      List<String> some(A);
+      CHECK(manifest_private_assemblies(StringView(program_manifest.substr(0, cut).c_str()), A, &some));
+      for (const String& n : some.view()) CHECK(str(n.view()) == "131.0.6778.86");
+    }
+  }
+  // The resource is found in the image; a damaged resource directory is no resource.
+  Spec program_spec;
+  program_spec.dll = false;
+  program_spec.base = 0x140000000ull;
+  program_spec.manifest = program_manifest;
+  program_spec.imports = {{"chrome_elf.dll", "IsBrowserProcess"}};
+  const Built program = build(program_spec);
+  {
+    exe::PeFile pe(A);
+    ConstByteView found;
+    CHECK(pe.parse(ConstByteView(program.bytes.data(), program.bytes.size())));
+    CHECK(pe.find_resource(ConstByteView(program.bytes.data(), program.bytes.size()), 24, 1, &found) && str(StringView(found)) == program_manifest);
+    CHECK(!pe.find_resource(ConstByteView(program.bytes.data(), program.bytes.size()), 16, 1, &found));      // (no version resource)
+    for (uint64_t at = 0x400 + 0x1A00; at < 0x400 + 0x1A00 + 0x50; ++at) {      // a bit flipped anywhere in the tree: found or not, never out of bounds
+      for (int bit = 0; bit < 8; ++bit) {
+        Bytes flipped = program.bytes;
+        flipped[at] ^= uint8_t(1u << bit);
+        exe::PeFile damaged(A);
+        ConstByteView any;
+        if (damaged.parse(ConstByteView(flipped.data(), flipped.size())) && damaged.find_resource(ConstByteView(flipped.data(), flipped.size()), 24, 1, &any))
+          CHECK(any.data() >= flipped.data() && any.data() + any.size() <= flipped.data() + flipped.size());
+      }
+    }
+  }
+  // The provider finds the assembly's DLL in its folder, before the program's folder and System32.
+  {
+    filesystem::RamFileSystem fs(A);
+    for (const char* d : {"/Windows", "/Windows/Windows", "/Windows/Windows/System32", "/Windows/App", "/Windows/App/131.0.6778.86"}) CHECK(fs.create_directory(d) == filesystem::Status::Ok);
+    Spec elf;
+    elf.exports = {{"IsBrowserProcess", "", 0}};
+    elf.dll_name = "chrome_elf.dll";
+    Bytes elf_bytes = build(elf).bytes;
+    write_file(fs, "/Windows/App/131.0.6778.86/chrome_elf.dll", elf_bytes);
+    Bytes decoy = elf_bytes;
+    decoy[0x400] = 0xCC;
+    write_file(fs, "/Windows/App/chrome_elf.dll.old", decoy);
+    write_file(fs, "/Windows/App/131.0.6778.86/131.0.6778.86.manifest",
+               std::string("<assembly><assemblyIdentity name='131.0.6778.86' version='131.0.6778.86' type='win32'/><file name='chrome_elf.dll'/></assembly>"));
+    write_file(fs, "/Windows/App/chrome.exe", program.bytes);
+    FileLibraryProvider provider(A, &fs);
+    CHECK(provider.add_program("/Windows/App/chrome.exe", ConstByteView(program.bytes.data(), program.bytes.size())));
+    ConstByteView image;
+    CHECK(provider.find("chrome_elf.dll", &image) && image.size() == elf_bytes.size() && image[0x400] == elf_bytes[0x400]);
+    String directory(A);
+    CHECK(provider.directory_of("chrome_elf.dll", &directory) && str(directory.view()) == "C:\\App\\131.0.6778.86\\");
+    CHECK(!provider.find("other.dll", &image));
+    // A program without a manifest only adds its folder.
+    FileLibraryProvider plain(A, &fs);
+    Spec no_manifest = program_spec;
+    no_manifest.manifest.clear();
+    const Built bare = build(no_manifest);
+    CHECK(plain.add_program("/Windows/App/chrome.exe", ConstByteView(bare.bytes.data(), bare.bytes.size())));
+    CHECK(!plain.find("chrome_elf.dll", &image));
+  }
+}
+
 int main() {
   test_names();
+  test_private_assemblies();
   test_load();
   test_failures();
   test_shared_images();

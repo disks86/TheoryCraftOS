@@ -105,6 +105,7 @@ bool decode_x86_64(SyscallAbi abi, const X86UserRegisters& regs, SyscallRequest*
   } else if (abi == SyscallAbi::Windows) {
     request.number = regs.rax & 0xFFFFFFFFu;       // the service number is the low 32 bits of EAX; the upper half is ignored
     request.args[0] = regs.r10; request.args[1] = regs.rdx; request.args[2] = regs.r8; request.args[3] = regs.r9;
+    request.user_pc = regs.rcx;      // (SYSCALL put the return address there; the stub moved the first argument to R10 first)
   } else {
     return false;
   }

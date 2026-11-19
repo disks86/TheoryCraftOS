@@ -2963,6 +2963,12 @@ __declspec(dllexport) DWORD WINAPI SetSecurityInfo(HANDLE handle, SE_OBJECT_TYPE
         }
         break;
 
+    case SE_WINDOW_OBJECT:
+        /* A desktop or a window station has no kernel object here (see GetSecurityInfo), so there is no descriptor to change: the change is taken. Chromium's
+           sandbox gives the desktop it makes for its renderers a DACL of its own and does not start without it. */
+        status = STATUS_SUCCESS;
+        break;
+
     default:
         status = STATUS_INVALID_PARAMETER;
         break;

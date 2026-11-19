@@ -401,6 +401,11 @@ Frame* on_syscall(Frame* frame, void*) {
       alive = false;
     }
   }
+  uint64_t resume_at = 0;
+  if (alive && !thread_ends && process->take_resume_at(&resume_at)) {      // NtTcosWrapped: on to ntdll's C function, with its first argument back in RCX
+    frame->rip = resume_at;
+    frame->rcx = frame->r10;
+  }
   if (alive && !thread_ends && process->abi() == process::SyscallAbi::Linux) {
     // rt_sigreturn: the registers the handler interrupted come back from its frame. Then, for any call: the signals that wait for this thread.
     const bool returned = process->take_signal_return();
@@ -491,6 +496,7 @@ void log_exception(Task* task, uint32_t code, uint64_t rip, uint64_t address, ui
       console::puts("    it called a function that is not there: ");
       console::puts(missing.view());
       console::puts("\n");
+      owner->host().missing_function_called(missing.view());      // (the terminal says it when the program ends)
     }
   }
   if (code == 0xC000001Du || code == 0xC0000096u) {      // an instruction the processor refused: the bytes of it, to tell what it was

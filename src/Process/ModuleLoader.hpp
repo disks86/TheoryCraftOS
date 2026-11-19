@@ -75,6 +75,13 @@ class ChainedLibraryProvider final : public ILibraryProvider {
 // added with add_directory() are searched first, in the order given (the program's own folder: an application's DLLs next to its .exe, as Windows looks there first).
 // The files are read when first asked for and kept until the provider is destroyed. The provider may be shared by programs that run at once (a program and the ones it
 // starts), so finding is serialised.
+// Side-by-side manifests, as far as the loader needs them. A program's manifest (its RT_MANIFEST resource) names the private assemblies it depends on
+// (a <dependentAssembly> whose <assemblyIdentity> has no publicKeyToken); such an assembly is a folder next to the program with a manifest of its own
+// whose <file name=.../> entries are DLLs found there (Chrome: chrome.exe beside "131.0.6778.86\131.0.6778.86.manifest" listing chrome_elf.dll).
+// Only plain names come out (no folder separators, not "." or ".."). False if memory ran out.
+[[nodiscard]] bool manifest_private_assemblies(StringView xml, allocators::IAllocator& allocator, List<String>* names);
+[[nodiscard]] bool manifest_files(StringView xml, allocators::IAllocator& allocator, List<String>* names);
+
 class FileLibraryProvider final : public ILibraryProvider {
  public:
   FileLibraryProvider(allocators::IAllocator& allocator, filesystem::IFileSystem* files);
@@ -84,14 +91,26 @@ class FileLibraryProvider final : public ILibraryProvider {
   bool directory_of(StringView canonical_name, String* windows_directory) override;
   // A folder of the OS file system ("/Windows/Program Files/App") to look in before System32.
   bool add_directory(StringView directory);
+  // The program at `path` (OS file system) with the file `image`: its folder (add_directory), and the DLLs of the private assemblies its manifest
+  // depends on, found in the assembly's folder ("<folder>/<assembly>/") before anywhere else. False if memory ran out; a missing or unreadable
+  // manifest is no failure (the program runs with what is found).
+  bool add_program(StringView path, ConstByteView image);
 
  private:
   struct Entry;
+  struct Redirect {
+    explicit Redirect(allocators::IAllocator& allocator) : name(allocator), directory(allocator) {}
+    String name;           // canonical (lower case) file name
+    String directory;      // OS folder, ending in '/'
+  };
   bool load(StringView path, StringView canonical_name, ConstByteView* image);
+  bool read_text(StringView path, uint64_t limit, String* out);
+  void remember_directory(StringView os_directory);      // entries_ (just loaded) came from there
   allocators::IAllocator& allocator_;
   filesystem::IFileSystem* files_;
   Entry* entries_ = nullptr;
   List<String> directories_;
+  List<Redirect> redirects_;
   kernel::Mutex lock_;
 };
 

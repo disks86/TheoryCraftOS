@@ -273,15 +273,15 @@ static NTSTATUS open_process_token(HANDLE process, ACCESS_MASK access, ULONG att
     if (!token) return STATUS_ACCESS_VIOLATION_;
     return NtTcosToken(TCOS_TOKEN_OPEN_PROCESS, (ULONG_PTR)process, access, (ULONG_PTR)token, (attributes & OBJ_INHERIT) ? 1 : 0, 0);
 }
-__declspec(dllexport) NTSTATUS NTAPI NtOpenProcessTokenEx(HANDLE process, ACCESS_MASK access, ULONG attributes, PHANDLE token) { return open_process_token(process, access, attributes, token); }
-__declspec(dllexport) NTSTATUS NTAPI NtOpenProcessToken(HANDLE process, ACCESS_MASK access, PHANDLE token) { return open_process_token(process, access, 0, token); }
-__declspec(dllexport) NTSTATUS NTAPI NtOpenThreadTokenEx(HANDLE thread, ACCESS_MASK access, BOOLEAN self, ULONG attributes, PHANDLE token)
+TCOS_WRAPPED_EXPORT NTSTATUS NTAPI TCOS_WRAPPED_NAME(NtOpenProcessTokenEx)(HANDLE process, ACCESS_MASK access, ULONG attributes, PHANDLE token) { return open_process_token(process, access, attributes, token); }
+TCOS_WRAPPED_EXPORT NTSTATUS NTAPI TCOS_WRAPPED_NAME(NtOpenProcessToken)(HANDLE process, ACCESS_MASK access, PHANDLE token) { return open_process_token(process, access, 0, token); }
+TCOS_WRAPPED_EXPORT NTSTATUS NTAPI TCOS_WRAPPED_NAME(NtOpenThreadTokenEx)(HANDLE thread, ACCESS_MASK access, BOOLEAN self, ULONG attributes, PHANDLE token)
 {
     (void)self;
     if (!token) return STATUS_ACCESS_VIOLATION_;
     return NtTcosToken(TCOS_TOKEN_OPEN_THREAD, (ULONG_PTR)thread, access, (ULONG_PTR)token, (attributes & OBJ_INHERIT) ? 1 : 0, 0);
 }
-__declspec(dllexport) NTSTATUS NTAPI NtOpenThreadToken(HANDLE thread, ACCESS_MASK access, BOOLEAN self, PHANDLE token) { return NtOpenThreadTokenEx(thread, access, self, 0, token); }
+TCOS_WRAPPED_EXPORT NTSTATUS NTAPI TCOS_WRAPPED_NAME(NtOpenThreadToken)(HANDLE thread, ACCESS_MASK access, BOOLEAN self, PHANDLE token) { return TCOS_WRAPPED_NAME(NtOpenThreadTokenEx)(thread, access, self, 0, token); }
 
 static void qos_of(const OBJECT_ATTRIBUTES *attr, BOOL *have, DWORD *level, BOOL *effective_only)
 {
@@ -1841,7 +1841,7 @@ __declspec(dllexport) NTSTATUS NTAPI NtCreateTimer(PHANDLE h, ACCESS_MASK access
     if (status == STATUS_SUCCESS) RtlTcosNewObjectSecurity(*h, attr, FALSE, SD_TIMER);
     return status;
 }
-__declspec(dllexport) NTSTATUS NTAPI NtCreateSection(PHANDLE h, ACCESS_MASK access, POBJECT_ATTRIBUTES attr, PLARGE_INTEGER size, ULONG protect, ULONG flags, HANDLE file)
+TCOS_WRAPPED_EXPORT NTSTATUS NTAPI TCOS_WRAPPED_NAME(NtCreateSection)(PHANDLE h, ACCESS_MASK access, POBJECT_ATTRIBUTES attr, PLARGE_INTEGER size, ULONG protect, ULONG flags, HANDLE file)
 {
     NTSTATUS status = RawNtCreateSection(h, access, attr, size, protect, flags, file);
     if (status == STATUS_SUCCESS) RtlTcosNewObjectSecurity(*h, attr, FALSE, SD_SECTION);

@@ -113,6 +113,43 @@ bool PeFile::read_string_at(ConstByteView file, uint32_t rva, String* out) const
   return rva_to_offset(rva, &offset) && read_c_string(file, offset, out);
 }
 
+bool PeFile::find_resource(ConstByteView file, uint32_t type, uint32_t id, ConstByteView* out) const {
+  uint32_t root_rva = 0, root_size = 0;
+  uint64_t root = 0;
+  if (!directory(2, &root_rva, &root_size) || root_rva == 0 || root_size < 16 || !rva_to_offset(root_rva, &root) || root >= file.size()) return false;
+  const ConstByteView tree = file.subview(root, file.size() - root < root_size ? file.size() - root : root_size);
+  // One level of IMAGE_RESOURCE_DIRECTORY: the entry with the numeric id `want` (any entry when `any`, the first one) -> its offset in the tree and
+  // whether it is a subdirectory. The entries are (name or id, offset | 0x80000000 for a subdirectory).
+  auto pick = [&](uint32_t level, uint32_t want, bool any, uint32_t* next, bool* is_directory) {
+    ByteReader r(tree);
+    if (!r.seek(level) || !r.skip(12)) return false;
+    const uint32_t named = r.le16(), numbered = r.le16();
+    for (uint32_t i = 0; r.ok() && i < named + numbered; ++i) {
+      const uint32_t name = r.le32(), where = r.le32();
+      if (!r.ok()) return false;
+      if (any || (i >= named && name == want)) {
+        *next = where & 0x7FFFFFFFu;
+        *is_directory = (where & 0x80000000u) != 0;
+        return *next < tree.size();
+      }
+    }
+    return false;
+  };
+  uint32_t names = 0, languages = 0, data = 0;
+  bool directory_names = false, directory_languages = false, directory_data = false;
+  if (!pick(0, type, false, &names, &directory_names) || !directory_names) return false;
+  if (!pick(names, id, false, &languages, &directory_languages) && !pick(names, 0, true, &languages, &directory_languages)) return false;
+  if (!directory_languages || !pick(languages, 0, true, &data, &directory_data) || directory_data) return false;
+  // IMAGE_RESOURCE_DATA_ENTRY: the data's RVA (anywhere in the image, not only in the tree) and size.
+  ByteReader r(tree);
+  if (!r.seek(data)) return false;
+  const uint32_t data_rva = r.le32(), data_size = r.le32();
+  uint64_t at = 0;
+  if (!r.ok() || !rva_to_offset(data_rva, &at) || at > file.size() || data_size > file.size() - at) return false;
+  *out = file.subview(at, data_size);
+  return true;
+}
+
 bool PeFile::parse(ConstByteView file) {
   clear();
   if (parse_all(file)) return true;

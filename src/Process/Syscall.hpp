@@ -43,6 +43,7 @@ struct SyscallRequest {
   uint64_t number = 0;
   uint64_t args[6] = {};
   uint64_t user_stack = 0;    // the program's stack pointer at the call: the Windows ABI passes arguments past the fourth there
+  uint64_t user_pc = 0;       // x86-64: where the program goes on after the call (the instruction after SYSCALL, which left it in RCX); 0 if not known
 };
 
 class Process;

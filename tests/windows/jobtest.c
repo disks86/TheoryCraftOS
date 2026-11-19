@@ -86,7 +86,11 @@ int main(void) {
   DWORD returned = 0;
   check(QueryInformationJobObject(job, JobObjectExtendedLimitInformation, &back, sizeof(back), &returned) && returned == sizeof(back) && back.BasicLimitInformation.ActiveProcessLimit == 2, "read it back");
   limits.BasicLimitInformation.ActiveProcessLimit = 0;
-  check(!SetInformationJobObject(job, JobObjectExtendedLimitInformation, &limits, sizeof(limits)) && GetLastError() == ERROR_INVALID_PARAMETER, "a limit of zero is refused");
+  check(SetInformationJobObject(job, JobObjectExtendedLimitInformation, &limits, sizeof(limits)), "a limit of zero is taken (Chromium's sandbox sets it)");
+  PROCESS_INFORMATION none;
+  check(start("procchild.exe spin", CREATE_SUSPENDED, &none) && !AssignProcessToJobObject(job, none.hProcess) && GetLastError() == ERROR_NOT_ENOUGH_QUOTA, "with a limit of zero nobody joins");
+  TerminateProcess(none.hProcess, 9);
+  close_process(&none);
   limits.BasicLimitInformation.ActiveProcessLimit = 2;
   SetInformationJobObject(job, JobObjectExtendedLimitInformation, &limits, sizeof(limits));
   PROCESS_INFORMATION a, b, c;

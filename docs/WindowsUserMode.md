@@ -789,3 +789,29 @@ its own (build/chromium.img) and starts it (`TCOS_AUTORUN`). The debug console (
 addresses), every failed CreateProcess, and every 20 seconds what each thread of each program waits in. `build/tools/primary_image build/chromium.img
 get:/Windows/chrome.log=chrome.log` copies Chromium's own log out. `CHROMIUM_GDB=1234` starts QEMU's gdb stub (hardware breakpoints on user addresses work).
 `scripts/check-imports.py <pe files>` lists imports our DLLs lack or only stub.
+
+### Google Chrome with its sandbox
+
+Google Chrome as the App Manager installs it (`/Windows/Program Files/Google/Chrome/Application`, started from the Start menu, no flags) runs with Chromium's
+sandbox: the browser window, its toolbar and omnibox show and the sandboxed GPU process starts. The page area stays empty (as with the snapshot above), and ANGLE's
+Direct3D 11 renderer does not start (`eglInitialize: No available renderers`), so the GPU process falls back to software. What the sandbox needed, in the order it
+asked:
+
+- **Private assemblies.** chrome.exe's manifest (its RT_MANIFEST resource) depends on an assembly named after the version, a folder next to it whose own manifest
+  lists `chrome_elf.dll`. `FileLibraryProvider::add_program` reads both and looks for those DLLs there first (`PeFile::find_resource`, `manifest_private_assemblies`,
+  `manifest_files`). Before, every import of chrome_elf.dll was a stub and chrome.exe stopped at once with 0xC000001D; the terminal now names a missing function
+  a Windows program calls.
+- **A window station without a name** gets one (`Service-0x0-<n>$`), and `SetSecurityInfo` on a window station or desktop is taken (they keep no descriptor).
+- **`GetProcessMitigationPolicy(ProcessMitigationOptionsMask)`** answers that every creation mitigation can be asked for (they are taken and kept, not enforced).
+- **The impersonation token of a new process's main thread** (`SetThreadToken` on the thread handle CreateProcess gave): the token service finds the thread.
+- **A job's active process limit of 0** is allowed, as on Windows (the sandbox sets it once its child is in the job).
+- **The service stubs have Windows' bytes and size.** The broker patches NtOpenProcess, NtOpenThread, NtSetInformationThread, the token-opening services and, with
+  file rules, NtCreateFile and its kin in each child: it checks that each one reads `4C 8B D1 B8 <number> 0F 05 C3`, copies 32 bytes of it as the original, and
+  writes a 16-byte jump over it. So every stub is that, 32 bytes apart. The services ntdll.dll implements in C (NtCreateFile, NtCreateSection, NtOpenProcessToken(Ex),
+  NtOpenThreadToken(Ex), NtQueryFullAttributesFile) export such a stub with the number of **`NtTcosWrapped`** (513) and the C function's address in the 8 bytes after
+  the RET: the kernel goes on at that address with RCX = R10 (`nt_tcos_wrapped`, `Process::take_resume_at`), so the call and the sandbox's copy of it both reach
+  the C function.
+
+Trying it: `RUN=ON KEEP=ON RUN_ARGS='--enable-logging|--v=1|--log-file=C:/chrome.log' tests/winget_qemu.sh Google.Chrome` installs it, starts it for a minute and
+leaves it on the image. Chrome's log lines (`[pid:tid:...:ERROR:...]`) go to the debug console. A sandbox failure shows as `GPU process launch failed: error_code=N`,
+N being a `sandbox::ResultCode` (sandbox/win/src/sandbox_types.h).

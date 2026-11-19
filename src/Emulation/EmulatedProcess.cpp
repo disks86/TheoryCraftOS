@@ -423,6 +423,18 @@ void EmulatedProcess::thread_loop(Slot& slot, bool main) {
     if (fs_changed || gs_changed) cpu.set_thread_pointers(fs_changed, fs, gs_changed, gs);      // arch_prctl
     uint32_t thread_code = 0;
     if (!process_->exited() && process_->take_thread_exit(&thread_code)) break;      // this thread is done (the exit call or NtTerminateThread dealt with the rest)
+    uint64_t resume_at = 0;
+    if (!process_->exited() && process_->take_resume_at(&resume_at)) {      // NtTcosWrapped: on to ntdll's C function, with its first argument back in RCX
+      process::X86Context context;
+      if (cpu.get_x86_context(&context)) {
+        context.rip = resume_at;
+        context.gpr[process::X86Context::kRcx] = context.gpr[process::X86Context::kR10];
+        if (cpu.set_x86_context(context)) continue;
+      }
+      process_->terminate(process::kStatusAccessViolation);
+      sync_.notify_all();
+      break;
+    }
     uint64_t context_at = 0;
     if (!process_->exited() && process_->take_context_restore(&context_at)) {      // NtContinue: load the CONTEXT into the registers
       process::X86Context context;

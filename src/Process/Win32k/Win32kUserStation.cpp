@@ -74,9 +74,23 @@ uint64_t nt_create_window_station(Call& call) {
   uint64_t root = 0;
   if (!attributes_name(call, call.arg(0), &name, &root)) return call.fail(kErrorInvalidParameter);
   default_desktop();
+  if (name.empty()) {
+    // No name: Windows makes one up from a logon session id ("Service-0x0-3e7$"); here from the first number no station has (Chromium's sandbox makes
+    // its renderers' station this way).
+    for (uint32_t number = 0x1000; name.empty() || find_station(name.view()); ++number) {
+      if (number == 0) return call.fail(kErrorNotEnoughMemory);      // (every number taken)
+      char text[24] = "Service-0x0-";
+      uint32_t at = 12;
+      for (int shift = 28; shift >= 0; shift -= 4)
+        if ((number >> shift) != 0 || shift == 0) text[at++] = "0123456789abcdef"[(number >> shift) & 15];
+      text[at++] = '$';
+      text[at] = 0;
+      name.clear();
+      if (!name.append_ascii(text)) return call.fail(kErrorNotEnoughMemory);
+    }
+  }
   WinSta* st = find_station(name.view());
   if (!st) {
-    if (name.empty()) return call.fail(kErrorInvalidParameter);
     st = s.stations.create(s.alloc);
     if (!st) return call.fail(kErrorNotEnoughMemory);
     st->name.append(name.view());

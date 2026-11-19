@@ -59,6 +59,10 @@ static void test_host() {
   CHECK(!host.take_unhandled(&list));
   for (uint64_t n = 200; n < 215; ++n) host.unhandled_syscall(process::SyscallAbi::Linux, n);
   CHECK(host.take_unhandled(&list) && str(list.view()).find("Linux system call 200") == 0 && str(list.view()).find("207") != std::string::npos && str(list.view()).find("208") == std::string::npos);
+  // a Windows program that called an import no library provides: named, so the terminal can say which
+  list.clear();
+  host.missing_function_called("chrome_elf.dll!IsBrowserProcess");
+  CHECK(host.take_unhandled(&list) && str(list.view()) == "the function chrome_elf.dll!IsBrowserProcess");
   // time moves forward, sleeping and yielding are harmless
   const uint64_t t0 = host.monotonic_ns();
   host.sleep_ns(0);

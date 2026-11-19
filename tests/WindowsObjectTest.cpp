@@ -418,10 +418,14 @@ static void test_jobs() {
     CHECK(p.call(WindowsSyscallNumber::NtSetInformationJobObject, job, 2, buffer, 64) == 0xC000000Du);
     put32(p.memory, buffer + 16, 0x8);
     put32(p.memory, buffer + 40, 0);
-    CHECK(p.call(WindowsSyscallNumber::NtSetInformationJobObject, job, 2, buffer, 64) == 0xC000000Du);      // an active process limit of 0
+    CHECK(p.call(WindowsSyscallNumber::NtSetInformationJobObject, job, 2, buffer, 64) == 0);      // an active process limit of 0: nobody joins any more
     // what the manager does with children
     const uint32_t id = objects.job_of_process(1);
-    CHECK(id != 0 && objects.job_assign(id, 2) == 0xC0000044u);      // the limit is one
+    CHECK(id != 0 && objects.job_assign(id, 2) == 0xC0000044u);      // the limit is 0 (and the process already in the job stays)
+    CHECK(objects.job_of_process(1) == id);
+    put32(p.memory, buffer + 40, 1);
+    CHECK(p.call(WindowsSyscallNumber::NtSetInformationJobObject, job, 2, buffer, 64) == 0);
+    CHECK(objects.job_assign(id, 2) == 0xC0000044u);      // the limit is one
     CHECK(objects.job_inherit(1, 5, false) == 0xC0000044u);
     put32(p.memory, buffer + 40, 3);
     CHECK(p.call(WindowsSyscallNumber::NtSetInformationJobObject, job, 2, buffer, 64) == 0);
