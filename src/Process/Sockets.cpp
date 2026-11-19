@@ -619,6 +619,15 @@ uint32_t SocketManager::readable(uint32_t id) const {
   return s->held_count() + (s->tcp ? s->tcp->available() : 0);
 }
 
+void SocketManager::read_state(uint32_t id, uint32_t* available, bool* peer_closed, bool* failed) const {
+  *available = readable(id);
+  *peer_closed = *failed = false;
+  const Socket* s = at(id);
+  if (!s || s->proto != SocketProto::Tcp || !s->tcp || s->listening) return;
+  *peer_closed = s->tcp->peer_closed();
+  *failed = s->tcp->failed();
+}
+
 bool SocketManager::is_tcp(uint32_t id) const {
   const Socket* s = at(id);
   return s && s->proto == SocketProto::Tcp;

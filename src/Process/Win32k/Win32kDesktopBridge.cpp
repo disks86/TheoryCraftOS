@@ -386,7 +386,7 @@ bool DesktopBridge::fill_info(const user::TopLevelInfo& info, desktop::WindowsWi
 }
 
 // The surface is drawn from where it lives, under the lock (no program draws on it meanwhile). Its pixels are B, G, R, X bytes, which is the desktop's own format
-// (0x..RRGGBB words): Replace copies each row as it is.
+// (0x..RRGGBB words): Replace copies each row as it is. A layered window given a picture with per-pixel alpha (0xAARRGGBB, straight) is blended over what is below.
 // The surface of an unaware program's window is in units (drawn as it is); an aware one's is in device pixels, shrunk here to units (the desktop at scale
 // 1, or a renderer that cannot draw on the device) or drawn 1:1 by draw_window_scaled. A system-aware program's, after the scale grew, is in pixels of
 // the scale it started at: resampled to units here, or enlarged by the ratio on the device.
@@ -406,12 +406,14 @@ bool DesktopBridge::draw_window(uint32_t window, graphics::IRenderer2D& renderer
   const bool resample = k != km;      // (a surface in units is drawn as it is)
   const uint32_t uw = resample ? uint32_t(graphics::device_to_units(graphics::units_to_device(int32_t(w), k), km)) : w;
   const uint32_t uh = resample ? uint32_t(graphics::device_to_units(graphics::units_to_device(int32_t(h), k), km)) : h;
-  renderer.set_blend(graphics::BlendMode::Replace);
+  *width = uw;
+  *height = uh;
+  const user::SurfaceBlend blend = user::top_level_surface_blend_locked(window);
+  if (blend == user::SurfaceBlend::Hidden) return true;      // (a layered window with nothing to show yet)
+  renderer.set_blend(blend == user::SurfaceBlend::PerPixelAlpha ? graphics::BlendMode::Alpha : graphics::BlendMode::Replace);
   if (resample) renderer.draw_image_scaled(s, {0, 0, float(w), float(h)}, {x, y, uw, uh}, graphics::ImageFilter::Bilinear);
   else renderer.draw_image(s, {0, 0, w, h}, x, y);
   renderer.set_blend(graphics::BlendMode::Alpha);
-  *width = uw;
-  *height = uh;
   return true;
 }
 
@@ -431,11 +433,13 @@ bool DesktopBridge::draw_window_scaled(uint32_t window, graphics::IRenderer2D& d
   s.pixels = pixels;
   s.width = s.pitch = w;
   s.height = h;
-  device.set_blend(graphics::BlendMode::Replace);
-  device.draw_image(s, {0, 0, w, h}, x, y);
-  device.set_blend(graphics::BlendMode::Alpha);
   *width = uint32_t(graphics::device_to_units(int32_t(w), scale));
   *height = uint32_t(graphics::device_to_units(int32_t(h), scale));
+  const user::SurfaceBlend blend = user::top_level_surface_blend_locked(window);
+  if (blend == user::SurfaceBlend::Hidden) return true;
+  device.set_blend(blend == user::SurfaceBlend::PerPixelAlpha ? graphics::BlendMode::Alpha : graphics::BlendMode::Replace);
+  device.draw_image(s, {0, 0, w, h}, x, y);
+  device.set_blend(graphics::BlendMode::Alpha);
   return true;
 }
 

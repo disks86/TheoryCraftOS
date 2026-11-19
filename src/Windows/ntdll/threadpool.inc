@@ -71,6 +71,7 @@ typedef struct TP_OBJ_ {
   HANDLE handle;                /* wait: the object waited for; io: the file */
   PVOID rtl;                    /* the Rtl interface over the object (see below) */
   volatile LONG started;        /* io: operations started and not finished */
+  volatile ULONG_PTR callback_thread;      /* the thread running the object's Rtl callback now (0: none): ending it from there does not wait for itself */
 } TP_OBJ_;
 
 typedef struct TP_CLEANUP_ {
@@ -894,7 +895,9 @@ static void tp_rtl_callback(TP_OBJ_ *object, TP_TASK_ *task) {
     case TP_RTL_WORK_: ((WORKER_FUNCTION_)r->function)(object->context); break;
     case TP_RTL_TIMER_: ((WAITORTIMERCALLBACK_)r->function)(object->context, TRUE); break;
     case TP_RTL_WAIT_: {
+      object->callback_thread = (ULONG_PTR)TEB_CLIENT_THREAD(NtCurrentTeb());
       ((WAITORTIMERCALLBACK_)r->function)(object->context, task->a == 0x102);
+      object->callback_thread = 0;
       if (!(r->flags & WT_EXECUTEONLYONCE_) && !object->released) {      /* a wait that is not for once is set again, with the same timeout */
         LARGE_INTEGER timeout;
         timeout.QuadPart = -(LONGLONG)(LONG)(ULONG_PTR)object->period * 10000;
@@ -979,6 +982,8 @@ EXPORT NTSTATUS NTAPI RtlUpdateTimer(HANDLE queue, HANDLE timer, ULONG due, ULON
 /* Ends a timer. completion: NULL = do not wait (STATUS_PENDING if a callback runs), INVALID_HANDLE_VALUE = wait for the callbacks, else an event set when they are over. */
 static NTSTATUS tp_end(TP_OBJ_ *object, HANDLE completion) {
   tp_unset(object);
+  /* (from the object's own callback a wait for its callbacks would never end: as with no event - it goes when the callback returns) */
+  if (completion == (HANDLE)(LONG_PTR)-1 && object->callback_thread && object->callback_thread == (ULONG_PTR)TEB_CLIENT_THREAD(NtCurrentTeb())) completion = NULL;
   NTSTATUS status = STATUS_SUCCESS;
   if (completion == (HANDLE)(LONG_PTR)-1) tp_wait_idle(object);
   else if (object->outstanding > 0) {

@@ -128,6 +128,9 @@ class TcpSocket final : public ITcpSocket {
     kernel::ScopedMutex guard(receive_lock_);
     return receive_buffer_.size();
   }
+  // One line about the connection for a debug report: ports, state, bytes waiting for the application, bytes not yet acknowledged, the room this
+  // side has and last advertised, and the peer's window. Reads without lock_ (a snapshot; the fields may be changing).
+  void describe(char* out, uint32_t capacity) const;
   uint32_t unsent_or_unacknowledged() const override {
     kernel::ScopedMutex guard(send_lock_);
     return send_buffer_.size();

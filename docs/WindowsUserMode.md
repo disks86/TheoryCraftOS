@@ -793,8 +793,8 @@ get:/Windows/chrome.log=chrome.log` copies Chromium's own log out. `CHROMIUM_GDB
 ### Google Chrome with its sandbox
 
 Google Chrome as the App Manager installs it (`/Windows/Program Files/Google/Chrome/Application`, started from the Start menu, no flags) runs with Chromium's
-sandbox: the browser window, its toolbar and omnibox show and the sandboxed GPU process starts. The page area stays empty (as with the snapshot above), and ANGLE's
-Direct3D 11 renderer does not start (`eglInitialize: No available renderers`), so the GPU process falls back to software. What the sandbox needed, in the order it
+sandbox: the browser window, its toolbar and omnibox show and the sandboxed GPU process starts. ANGLE's Direct3D 11 renderer does not start
+(`eglInitialize: No available renderers`), so pages need `--disable-gpu` (see "Pages and YouTube" below). What the sandbox needed, in the order it
 asked:
 
 - **Private assemblies.** chrome.exe's manifest (its RT_MANIFEST resource) depends on an assembly named after the version, a folder next to it whose own manifest
@@ -826,6 +826,30 @@ What its log complained about at startup, and what answers it now (checked by `t
   service and WinRT capability classes are not there), the Hyper-V PDH counter. Open: `token_service_table ... invalid SQL statement` - `Web Data` stays one empty
   2 KiB page across runs although SQLite itself works on the kernel's files (journal TRUNCATE/DELETE/WAL, exclusive locking, 2 KiB pages: checked in QEMU), and the
   crashpad `TransactNamedPipe: Error (0x6D)` seen once when Chrome was started from the Terminal did not come back under autorun.
+
+#### Pages and YouTube
+
+With `--disable-gpu --disable-software-rasterizer` (ANGLE's Direct3D 11 renderer still does not start, so the default GPU mode has no compositor) Chrome draws
+pages through its software output device (a DIB section blitted to the window), and plays YouTube videos (AV1 + Opus through MSE). What it took, besides the
+sandbox work above:
+
+- **Handles between processes.** mojo hands a file the browser opened for a sandboxed service (`storage.mojom.Directory::OpenFile`, the LevelDB files of
+  localStorage) with `DuplicateHandle(self, file, service, ..., DUPLICATE_SAME_ACCESS | DUPLICATE_CLOSE_SOURCE)`. `NtDuplicateObject` into or out of another program
+  copied only object-manager objects and pipes; a file failed with STATUS_NOT_IMPLEMENTED, mojo dropped the reply, the storage service waited for it forever and so
+  did every page that touched `localStorage` (YouTube's stayed on its poster). Files, directories, devices, sockets, keys and mailslots now go across sharing their
+  open object (`RemoteOp::object`, as CreateProcess inheritance does): the copies share the file position. `tests/windows/duphandletest.c`.
+- **Sockets.** ws2_32 decided that a socket that polled readable with no bytes waiting was closed and stopped watching it, so downloads stalled at 16 KiB;
+  `NtSocketControl` ReadState (11) now says how many bytes wait and whether the peer closed. Overlapped `WSASend` queues what does not fit and completes it from the
+  poll pass instead of answering WSAEWOULDBLOCK. `tests/windows/wsadownloadtest.c` reads downloads the way `TCPSocketWin` does.
+- **Waits.** `RegisterWaitForSingleObject` goes through the thread pool's `RtlRegisterWait` (not a thread per wait); a wait callback may end its own wait.
+- **Windows.** A child with `WS_EX_TRANSPARENT` does not clip its parent's painting; a top-level whose client area reaches over its title bar (a custom frame) gets
+  no desktop frame; a layered window (`WS_EX_LAYERED`) is invisible until it has attributes or a picture, and `UpdateLayeredWindow` puts the picture on the window's
+  surface with its alpha, which the desktop blends (Chrome's bubbles and menus are such windows). The colour key and the constant alpha of
+  `SetLayeredWindowAttributes` are not applied.
+- **Limits.** 256 threads a process, 8192 handles, `ProcessHandleTable` for the sandbox's handle closer, NT names of files for `NtQueryObject`, image sections of
+  files opened for execute only.
+
+Seen and not fixed: a few percent of the frames are dropped (software AV1 decoding in QEMU, 2% in a 2-minute run); `googlevideo.com` probe hosts with made-up names do not resolve (as anywhere).
 
 Trying it: `RUN=ON KEEP=ON RUN_ARGS='--enable-logging|--v=1|--log-file=C:/chrome.log' tests/winget_qemu.sh Google.Chrome` installs it, starts it for a minute and
 leaves it on the image. Chrome's log lines (`[pid:tid:...:ERROR:...]`) go to the debug console. A sandbox failure shows as `GPU process launch failed: error_code=N`,

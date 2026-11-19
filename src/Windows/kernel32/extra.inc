@@ -817,38 +817,21 @@ EXPORT void WINAPI SetThreadpoolWait(PVOID wait, HANDLE handle, PFILETIME timeou
 EXPORT void WINAPI WaitForThreadpoolWaitCallbacks(PVOID wait, BOOL cancel_pending) { TpWait *w = wait; if (cancel_pending && w->thread) SetThreadpoolWait(w, NULL, NULL); WaitForSingleObject(w->idle, INFINITE); }
 EXPORT void WINAPI CloseThreadpoolWait(PVOID wait) { wait_free(wait); }
 
+/* Registered waits are ntdll's (RtlRegisterWait), as on Windows: a few manager threads watch up to 63 handles each and hand the callbacks to the pool.
+ * (A thread of its own for each wait ran a busy program - Google Chrome's network service registers one for every socket read that has to wait - out of
+ * threads, and a wait whose thread could not be made never fired.) */
+IMPORT NTSTATUS NTAPI RtlRegisterWait(PHANDLE out, HANDLE handle, PVOID function, PVOID context, ULONG timeout, ULONG flags);
+IMPORT NTSTATUS NTAPI RtlDeregisterWaitEx(HANDLE wait, HANDLE completion);
 EXPORT BOOL WINAPI RegisterWaitForSingleObject(PHANDLE new_wait, HANDLE object, WAITORTIMERCALLBACK_ callback, PVOID context, ULONG timeout_ms, ULONG flags) {
-  TpWait *w = wait_new();
-  if (!w) return FALSE;
-  w->simple = callback;
-  w->context = context;
-  w->handle = object;
-  w->timeout = timeout_ms;
-  w->flags = flags;
-  w->once = (flags & 8) != 0;      /* WT_EXECUTEONLYONCE: the wait ends after the first callback; otherwise it keeps waiting */
-  w->thread = CreateThread(NULL, 0, wait_thread, w, 0, NULL);
-  *new_wait = w;
-  return TRUE;
+  if (!new_wait) { set_error(ERROR_INVALID_PARAMETER); return FALSE; }
+  *new_wait = NULL;
+  const NTSTATUS status = RtlRegisterWait(new_wait, object, (PVOID)callback, context, timeout_ms, flags);
+  return NT_SUCCESS(status) ? TRUE : fail_nt(status);
 }
 EXPORT BOOL WINAPI UnregisterWaitEx(HANDLE wait, HANDLE completion) {
-  TpWait *w = wait;
-  if (!w) { set_error(ERROR_INVALID_HANDLE); return FALSE; }
-  w->closing = 1;
-  SetEvent(w->stop);
-  if (w->callback_thread == GetCurrentThreadId()) {      /* from its own callback: it goes when the callback returns */
-    w->completion = (completion && completion != INVALID_HANDLE_VALUE) ? completion : NULL;
-    w->delete_requested = 1;
-    return TRUE;
-  }
-  if (w->pending != 0 && completion != INVALID_HANDLE_VALUE) {      /* a callback is running: the wait goes when it has finished */
-    w->completion = completion;
-    w->delete_requested = 1;
-    if (w->pending == 0 && InterlockedCompareExchange(&w->delete_requested, 0, 1) == 1) { wait_destroy_deferred(w, FALSE); return TRUE; }
-    set_error(997 /* ERROR_IO_PENDING */);
-    return FALSE;
-  }
-  wait_free(w);
-  if (completion && completion != INVALID_HANDLE_VALUE) SetEvent(completion);
-  return TRUE;
+  if (!wait) { set_error(ERROR_INVALID_HANDLE); return FALSE; }
+  const NTSTATUS status = RtlDeregisterWaitEx(wait, completion);
+  if (status == (NTSTATUS)0x103) { set_error(997 /* ERROR_IO_PENDING: a callback is still running; the wait goes when it is over */); return FALSE; }
+  return NT_SUCCESS(status) ? TRUE : fail_nt(status);
 }
 EXPORT BOOL WINAPI UnregisterWait(HANDLE wait) { return UnregisterWaitEx(wait, NULL); }

@@ -105,6 +105,7 @@ struct ChildSpec {
   uint64_t pid = 0;                      // chosen beforehand (IProcessRuntime::allocate_process_id)
   ConstByteView image;                   // the executable file
   StringView image_path;                 // as the program sees it ("C:\\dir\\program.exe")
+  StringView program_file;               // the same file in the OS file system ("/Windows/dir/program.exe"), where known: a Windows program's DLL search
   StringView command_line;
   StringView working_directory;          // in the program's world ("/dir" is C:\\dir)
   ArrayView<const StringView> environment;      // "NAME=value" each
@@ -208,6 +209,7 @@ class IProcessRuntime {
     uint64_t argument = 0, stack_size = 0, thread_id = 0;      // CreateThread (thread_id comes back); ThreadStatus: exit code (STILL_ACTIVE if it runs) comes back in `size`
     bool suspended = false;
     X86Context* context = nullptr;        // GetContext/SetContext: the registers of thread_id (a single object of the caller, only used during the call)
+    SharedPointer<OpenObject> object;     // TakeHandle/Duplicate of a handle whose kind keeps an open object (a file, a directory): the object both handles share
   };
   virtual uint32_t remote_operation(uint64_t pid, RemoteOp& op) { (void)pid; (void)op; return 0xC0000002u; }
   // The live threads and the loaded modules of the running program with this process id (the program first among the modules); each returns how many it wrote.
@@ -317,8 +319,9 @@ class Process {
   void request_resume_at(uint64_t address) { resume_at_ = address; resume_pending_ = true; }
   bool take_resume_at(uint64_t* address) { *address = resume_at_; const bool p = resume_pending_; resume_pending_ = false; return p; }
 
-  // --- threads (Windows). The table lives here; the runtime starts the CPU's threads.
-  static constexpr uint32_t kMaxThreads = 64;
+  // --- threads (Windows). The table lives here; the runtime starts the CPU's threads. Google Chrome's browser process alone runs more than 64 at once
+  // (a thread it cannot start is a CHECK failure), so the table holds 256 (about 2 KiB each).
+  static constexpr uint32_t kMaxThreads = 256;
   struct ThreadRecord {
     uint64_t id = 0;
     bool used = false, started = false, finished = false;

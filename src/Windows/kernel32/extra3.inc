@@ -1332,6 +1332,25 @@ EXPORT BOOL WINAPI K32GetModuleInformation(HANDLE process, HMODULE module, MODUL
 typedef struct { DWORD cb, PageFaultCount; SIZE_T PeakWorkingSetSize, WorkingSetSize, QuotaPeakPagedPoolUsage, QuotaPagedPoolUsage, QuotaPeakNonPagedPoolUsage, QuotaNonPagedPoolUsage, PagefileUsage, PeakPagefileUsage, PrivateUsage; } PROCESS_MEMORY_COUNTERS_EX_;
 EXPORT BOOL WINAPI K32GetProcessMemoryInfo(HANDLE process, PROCESS_MEMORY_COUNTERS_EX_ *counters, DWORD cb) {
   if (!counters || cb < 40) { set_error(ERROR_INSUFFICIENT_BUFFER); return FALSE; }
+  /* The process's own VM_COUNTERS_EX (ProcessVmCounters): the list of every process of the system is not walked for one of them (Chrome's renderers ask
+   * every few seconds, and the list waits for each process). */
+  ULONG_PTR vm[12];
+  memset(vm, 0, sizeof(vm));
+  if (NT_SUCCESS(NtQueryInformationProcess(process, 3 /* ProcessVmCounters */, vm, sizeof(vm), NULL))) {
+    memset(counters, 0, cb < sizeof(*counters) ? cb : sizeof(*counters));
+    counters->cb = cb;
+    counters->PageFaultCount = (DWORD)vm[2];
+    counters->PeakWorkingSetSize = vm[3];
+    counters->WorkingSetSize = vm[4];
+    counters->QuotaPeakPagedPoolUsage = vm[5];
+    counters->QuotaPagedPoolUsage = vm[6];
+    counters->QuotaPeakNonPagedPoolUsage = vm[7];
+    counters->QuotaNonPagedPoolUsage = vm[8];
+    counters->PagefileUsage = vm[9];
+    counters->PeakPagefileUsage = vm[10];
+    if (cb >= sizeof(*counters)) counters->PrivateUsage = vm[11];
+    return TRUE;
+  }
   const DWORD pid = process_id_of(process);
   ULONG length = 0;
   BYTE *buffer = query_process_information(&length);

@@ -246,6 +246,8 @@ static uint32_t create_user_process(Process& p, const SyscallRequest& r) {
   if (directory.empty() ? !world_directory.assign(p.files().cwd()) : p.files().resolve(directory.view(), &world_directory) != PathResult::Ok) return kObjectNameNotFound;
   ByteBuffer image(allocator);
   if (!read_program_file(p, image_path.view(), &image, &status)) return status;
+  String program_virtual(allocator), program_file(allocator);      // (where the child's own DLLs are looked for; a failure here only leaves the parent's search)
+  if (p.files().resolve(image_path.view(), &program_virtual) != PathResult::Ok || !p.files().host_path_of(program_virtual.view(), &program_file)) program_file.clear();
   StringView entries[kMaxEnvironmentEntries];
   uint32_t found = 0;
   for (uint64_t at = 0; at < environment.size() && found < entry_count;) {
@@ -282,6 +284,7 @@ static uint32_t create_user_process(Process& p, const SyscallRequest& r) {
   if (spec.pid == 0) return kNoResources;
   spec.image = image.view();
   spec.image_path = image_path.view();
+  spec.program_file = program_file.view();
   spec.command_line = command_line.view();
   spec.working_directory = world_directory.view();
   spec.environment = ArrayView<const StringView>(entries, found);
@@ -363,6 +366,20 @@ static uint32_t create_user_process(Process& p, const SyscallRequest& r) {
   objects->add_ref(created.id);      // (one reference for each of the two handles)
   token_inherit(parent_pid, spec.pid);      // (the child starts with a copy of the token of its parent)
   status = parent_pid == p.id() ? runtime->spawn_process(spec) : runtime->spawn_process_for(parent_pid, spec);
+#ifdef TCOS_TRACE_SERVICE_FAILURES
+  {
+    // (with the trace of failing services: which program each new process is - a process's failures are said by its id only)
+    char head[48] = "process started: ";
+    uint32_t at = 17;
+    char digits[24];
+    uint32_t count = 0;
+    for (uint64_t v = spec.pid; v || count == 0; v /= 10) digits[count++] = static_cast<char>('0' + v % 10);
+    while (count) head[at++] = digits[--count];
+    head[at++] = ' ';
+    String line(allocator);
+    if (line.assign(StringView(head, at)) && line.append(command_line.view())) process_log(line.view());
+  }
+#endif
   if (status != kSuccess) {
     token_process_exited(spec.pid);
     objects->job_forget(spec.pid);
@@ -518,6 +535,30 @@ uint32_t nt_query_information_process(Process& p, const SyscallRequest& r) {
   // The classes a handle with the limited right only may not ask for: the debugger's things and the cookie.
   if (process_handle_lacks(p, r.args[0], 0x400) && (info_class == 7 || info_class == 30 || info_class == 31 || info_class == 34 || info_class == 36)) return 0xC0000022u;
   if (info_class == 27 || info_class == 43) return image_file_name(p, r.args[2], length, returned, self, child_pid, info_class == 27);
+  if (info_class == 58) {      // ProcessHandleTable: the values of the process's open handles, a ULONG each (Chromium's sandbox walks it to close handles before lockdown)
+    if (!self) return kNotImplemented;      // (only the own table: the handles of another program are its runtime's)
+    uint32_t open = 0;
+    for (uint64_t slot = 0; slot < ProcessFiles::kMaxDescriptors; ++slot) if (p.files().kind(slot) != DescriptorKind::Closed) ++open;
+    const uint64_t size = uint64_t{open} * 4;
+    if (returned != 0 && !p.write_user_u32(returned, uint32_t(size))) return kAccessViolation;
+    if (length < size) return kInfoLengthMismatch;
+    uint8_t chunk[256];
+    uint32_t used = 0;
+    uint64_t at = r.args[2];
+    for (uint64_t slot = 0; slot < ProcessFiles::kMaxDescriptors; ++slot) {
+      if (p.files().kind(slot) == DescriptorKind::Closed) continue;
+      const uint32_t handle = uint32_t((slot + 1) * 4);
+      for (uint32_t i = 0; i < 4; ++i) chunk[used + i] = uint8_t(handle >> (8 * i));
+      used += 4;
+      if (used == sizeof(chunk)) {
+        if (!p.write_user(at, ConstByteView(chunk, used))) return kAccessViolation;
+        at += used;
+        used = 0;
+      }
+    }
+    if (used != 0 && !p.write_user(at, ConstByteView(chunk, used))) return kAccessViolation;
+    return kSuccess;
+  }
   if (!self && child_exited && info_class == 37) return 0xC000010Au;      // STATUS_PROCESS_IS_TERMINATING
   if (!self && info_class == 7) {      // ProcessDebugPort of another program: -1 when a debugger is attached
     if (length < 8) return kInfoLengthMismatch;

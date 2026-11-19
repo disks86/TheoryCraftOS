@@ -211,6 +211,25 @@ void trace_service_failure(process::Process& process, const process::SyscallRequ
   console::put_hex(request.args[0]);
   console::puts(" ");
   console::put_hex(request.args[1]);
+  if (request.number == 41 && request.args[0] == ~uint64_t{0} && request.args[1] % 4 == 0 && request.args[1] != 0) {      // NtDuplicateObject of an own handle: its kind
+    console::puts(" kind ");
+    console::put_dec(static_cast<int64_t>(process.files().kind(request.args[1] / 4 - 1)));
+  }
+  if (request.number == 302 || request.number == 303) {      // NtOpenKey / NtOpenKeyEx: the key's name (OBJECT_ATTRIBUTES.ObjectName -> UNICODE_STRING)
+    uint64_t name = 0, buffer = 0, length = 0;
+    if (process.read_user_u64(request.args[2] + 0x10, &name) && name && process.read_user_u64(name, &length) && process.read_user_u64(name + 8, &buffer)) {
+      char text[120];
+      uint32_t n = 0;
+      for (uint64_t at = 0; at + 2 <= (length & 0xFFFFu) && n + 1 < sizeof(text); at += 2) {
+        uint8_t unit[2] = {};
+        if (!process.read_user(buffer + at, ByteView(unit, 2))) break;
+        text[n++] = (unit[1] == 0 && unit[0] >= 0x20 && unit[0] < 0x7F) ? static_cast<char>(unit[0]) : '?';
+      }
+      text[n] = 0;
+      console::puts(" key ");
+      console::puts(text);
+    }
+  }
   console::puts("\n");
 }
 #else
@@ -1239,7 +1258,19 @@ uint32_t Task::spawn_process(const process::ChildSpec& spec) {
   process::UserProgram& p = *child->program;
   p.address_space().set_reserved(reserved_ranges());
   p.set_file_system(program.file_system());
-  if (abi == process::SyscallAbi::Windows) p.set_library_provider(program.library_provider());
+  if (abi == process::SyscallAbi::Windows) {
+    // A program in the same folder shares its parent's DLL search (and the libraries it has read: Chrome starts dozens of itself). One elsewhere searches its own
+    // folder and the private assemblies its manifest names, as on Windows (a launcher starting chrome.exe, which finds chrome_elf.dll through its manifest).
+    auto folder = [](StringView path) { const uint64_t slash = path.rfind('/'); return slash == StringView::npos ? StringView() : path.first(slash); };
+    if (!spec.program_file.empty() && !folder(spec.program_file).equals_ignore_case(folder(program.program_file()))) {
+      auto own = SharedPointer<process::FileLibraryProvider>::make(allocator_, allocator_, program.file_system());
+      if (!own || !own->add_program(spec.program_file, spec.image)) { discard(); return kNoMemory; }
+      p.set_library_provider(own);
+    } else {
+      p.share_library_provider(program);
+    }
+    p.set_program_file(spec.program_file.empty() ? program.program_file() : spec.program_file);
+  }
   p.set_working_directory(spec.working_directory);
   p.set_processor_count(processor_count());
   p.defer_loading(spec.suspended);

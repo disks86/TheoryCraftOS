@@ -543,16 +543,31 @@ static void refresh_provider(Provider *p)
         }
     }
 }
+static void check_generation(void)
+{
+    DWORD g = read_generation(), i;
+    if (g != g_seen_generation) {
+        g_seen_generation = g;
+        for (i = 0; i < MAX_PROVIDERS; ++i) if (g_providers[i].magic == PROVIDER_MAGIC) refresh_provider(&g_providers[i]);
+    }
+}
+/* Waits for a change of the TcosEtw key (a registry change notification, armed before the generation is read so no change is missed). A process that can
+ * neither open nor create the key (no session was ever made, sandboxed) looks again once a second instead. */
 static DWORD WINAPI generation_watcher(LPVOID unused)
 {
+    HANDLE changed = CreateEventW(NULL, FALSE, FALSE, NULL);
+    HKEY key = NULL;
     (void)unused;
     for (;;) {
-        DWORD g = read_generation(), i;
-        if (g != g_seen_generation) {
-            g_seen_generation = g;
-            for (i = 0; i < MAX_PROVIDERS; ++i) if (g_providers[i].magic == PROVIDER_MAGIC) refresh_provider(&g_providers[i]);
+        if (!key && RegOpenKeyExW(HKEY_LOCAL_MACHINE, ETW_KEY, 0, KEY_READ | KEY_NOTIFY, &key) != ERROR_SUCCESS &&
+            RegCreateKeyExW(HKEY_LOCAL_MACHINE, ETW_KEY, 0, NULL, 0, KEY_READ | KEY_NOTIFY, NULL, &key, NULL) != ERROR_SUCCESS) key = NULL;
+        if (key && changed && RegNotifyChangeKeyValue(key, TRUE, REG_NOTIFY_CHANGE_NAME | REG_NOTIFY_CHANGE_LAST_SET, changed, TRUE) == ERROR_SUCCESS) {
+            check_generation();
+            WaitForSingleObject(changed, INFINITE);
+            continue;
         }
-        Sleep(50);
+        check_generation();
+        Sleep(1000);
     }
     return 0;
 }

@@ -141,7 +141,7 @@ static UINT32 sysloader_path(UINT32 face, WCHAR *path) {      /* "C:\\Windows\\F
   UINT32 n = 0, o = 0, v = face;
   do { digits[n++] = (WCHAR)('0' + v % 10); v /= 10; } while (v);
   for (UINT32 i = 0; prefix[i]; ++i) { if (path) path[o] = prefix[i]; ++o; }
-  while (n) { if (path) path[o] = digits[--n]; ++o; }
+  while (n) { --n; if (path) path[o] = digits[n]; ++o; }      /* (the count goes down whether or not the path is written: a length query must end too) */
   for (const WCHAR *e = L".ttf"; *e; ++e) { if (path) path[o] = *e; ++o; }
   if (path) path[o] = 0;
   return o;

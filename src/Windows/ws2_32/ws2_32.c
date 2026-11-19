@@ -1239,7 +1239,9 @@ EXPORT int WSAAPI WSAStringToAddressW(WCHAR *text, int family, void *protocol_in
  * the network, so the poller waits at most POLL_100NS in each select and re-reads the table; with nothing to watch it sleeps on an event of its own.
  * Overlapped WSARecv/WSARecvFrom complete at once when data is waiting; otherwise they are left with the poller, which receives into the caller's buffers when the socket
  * becomes readable and completes the OVERLAPPED (Internal: the NTSTATUS, InternalHigh: the bytes), its event and its completion routine (an APC of the thread that asked).
- * Sends never wait (the stack takes the data or fails), so the send calls always complete inline. Not done: completion ports for sockets, WSAAsyncSelect, FD_OOB/QOS. */
+ * An overlapped send completes at once when the stack takes all of it; the rest waits with the poller, which sends it when the socket can be written and then
+ * completes the OVERLAPPED (as Windows does: an overlapped send is never refused for a full buffer - Google Chrome took WSAEWOULDBLOCK for "pending" and then
+ * waited for ever). Not done: completion ports for sockets, WSAAsyncSelect, FD_OOB/QOS. */
 IMPORT HANDLE WINAPI CreateEventW(SECURITY_ATTRIBUTES *attributes, BOOL manual, BOOL initial, const WCHAR *name);
 IMPORT BOOL WINAPI SetEvent(HANDLE event);
 IMPORT BOOL WINAPI ResetEvent(HANDLE event);
@@ -1299,6 +1301,19 @@ typedef struct {
 #define MAX_PENDING 256
 static SelectRecord g_records[MAX_RECORDS];
 static PendingReceive g_pending[MAX_PENDING];
+/* An overlapped send the stack did not take all of yet: the rest of its bytes (a copy), sent in order before any later send on the socket. */
+typedef struct {
+  SOCKET socket;              /* 0: free */
+  OVERLAPPED *overlapped;
+  char *data;                 /* the bytes not sent yet (from the process heap) */
+  DWORD size, done, before;   /* its length, what has gone of it, and what went at once in the call */
+  COMPLETION_ROUTINE_ routine;
+  HANDLE thread;
+  ULONG sequence;             /* the order of the sends of one socket */
+  BOOL busy, cancelled;       /* the poller is sending it now (the slot stays taken: later sends keep their turn); closed meanwhile */
+} PendingSend;
+static PendingSend g_sends[MAX_PENDING];
+static ULONG g_send_sequence;
 static SRWLOCK g_select_lock = {0};
 static HANDLE g_wake = NULL;                  /* set when the table changed: the poller looks again */
 static volatile LONG g_poller_state = 0;      /* 0 not started, 1 starting, 2 running */
@@ -1455,13 +1470,18 @@ static BOOL evaluate(SelectRecord *r, BOOL readable, BOOL writable, BOOL failed)
       if (r->mask & FD_ACCEPT_) record_event(r, FD_ACCEPT_, 0, &signal);
       else if (!r->tcp) record_event(r, FD_READ_, 0, &signal);
       else {
-        ULONG available = 0;
-        NtSocketControl((HANDLE)(UINT_PTR)r->socket, 4 /*BytesReadable*/, NULL, 0, &available, sizeof available);
-        if (available > 0) record_event(r, FD_READ_, 0, &signal);
-        else {      /* readable with nothing to read: the peer closed (or the connection failed). FD_CLOSE is recorded once, whatever was enumerated before. */
+        /* (ReadState: the bytes there, and whether the peer closed. Readable with nothing to read is no close by itself: the program may have taken the bytes
+         * since the select - taken as a close, the socket was never read again, and Google Chrome's connections stopped halfway.) */
+        struct { ULONG available; UCHAR peer_closed, broken, pad[2]; } state = {0, 0, 0, {0, 0}};
+        if (!NT_SUCCESS(NtSocketControl((HANDLE)(UINT_PTR)r->socket, 11 /*ReadState*/, NULL, 0, &state, sizeof state))) {
+          NtSocketControl((HANDLE)(UINT_PTR)r->socket, 4 /*BytesReadable*/, NULL, 0, &state.available, sizeof state.available);
+          state.peer_closed = state.available == 0;
+        }
+        if (state.available > 0) record_event(r, FD_READ_, 0, &signal);
+        else if (state.peer_closed || state.broken || failed) {      /* the peer closed (or the connection failed). FD_CLOSE is recorded once, whatever was enumerated before. */
           r->closed = TRUE;
           r->armed |= r->mask & FD_CLOSE_;
-          record_event(r, FD_CLOSE_, failed ? WSAECONNRESET_ : 0, &signal);
+          record_event(r, FD_CLOSE_, (failed || state.broken) ? WSAECONNRESET_ : 0, &signal);
         }
       }
     }
@@ -1496,6 +1516,7 @@ static int poll_pass(SOCKET only, LONGLONG timeout) {
     if (r->tcp && (want_read || want_write)) add_handle(h, excepts, &except_count);      /* (a failure is only news for a socket watched for something) */
   }
   for (UINT i = 0; i < MAX_PENDING; ++i) if (g_pending[i].socket && (!only || g_pending[i].socket == only)) add_handle((ULONG)g_pending[i].socket, reads, &read_count);
+  for (UINT i = 0; i < MAX_PENDING; ++i) if (g_sends[i].socket && (!only || g_sends[i].socket == only)) add_handle((ULONG)g_sends[i].socket, writes, &write_count);
   ReleaseSRWLockExclusive(&g_select_lock);
   if (!read_count && !write_count && !except_count) return -1;
   ULONG ready = 0;
@@ -1535,6 +1556,47 @@ static int poll_pass(SOCKET only, LONGLONG timeout) {
       if (slot < MAX_PENDING) continue;
     }
     complete_overlapped(p->overlapped, result, bytes, p->routine, p->thread);
+    changed = 1;
+  }
+  /* Waiting sends of sockets that can be written now: the oldest of each socket goes on (the others wait their turn behind it). */
+  PendingSend *work[32];
+  UINT work_count = 0;
+  AcquireSRWLockExclusive(&g_select_lock);
+  for (UINT i = 0; i < MAX_PENDING && work_count < 32; ++i) {
+    PendingSend *c = &g_sends[i];
+    if (!c->socket || c->busy || (only && c->socket != only) || !in_list((ULONG)c->socket, writes, write_count)) continue;
+    BOOL oldest = TRUE;
+    for (UINT k = 0; k < MAX_PENDING && oldest; ++k) if (k != i && g_sends[k].socket == c->socket && (LONG)(g_sends[k].sequence - c->sequence) < 0) oldest = FALSE;
+    if (!oldest) continue;
+    c->busy = TRUE;
+    work[work_count++] = c;
+  }
+  ReleaseSRWLockExclusive(&g_select_lock);
+  for (UINT i = 0; i < work_count; ++i) {
+    PendingSend *c = work[i];
+    NTSTATUS result = 0;
+    while (c->done < c->size && !c->cancelled) {
+      ULONG sent = 0;
+      result = NtSendSocket((HANDLE)(UINT_PTR)c->socket, c->data + c->done, c->size - c->done, &sent, NULL, 0);
+      if (!NT_SUCCESS(result) || sent == 0) break;
+      c->done += sent;
+    }
+    const BOOL blocked = !NT_SUCCESS(result) && wsa_error_for(result) == WSAEWOULDBLOCK_;
+    if (!c->cancelled && c->done < c->size && (blocked || NT_SUCCESS(result))) {      /* (the buffer is full again: the rest waits for the next pass) */
+      AcquireSRWLockExclusive(&g_select_lock);
+      c->busy = FALSE;
+      ReleaseSRWLockExclusive(&g_select_lock);
+      continue;
+    }
+    PendingSend done_send = *c;
+    AcquireSRWLockExclusive(&g_select_lock);
+    c->socket = 0;
+    c->busy = FALSE;
+    c->cancelled = FALSE;
+    ReleaseSRWLockExclusive(&g_select_lock);
+    HeapFree(GetProcessHeap(), 0, done_send.data);
+    const NTSTATUS status = done_send.cancelled ? STATUS_CANCELLED_ : (done_send.done < done_send.size ? result : 0);
+    complete_overlapped(done_send.overlapped, status, done_send.before + done_send.done, done_send.routine, done_send.thread);
     changed = 1;
   }
   return changed;
@@ -1582,8 +1644,26 @@ static void select_forget(SOCKET s) {
     AcquireSRWLockExclusive(&g_select_lock);
     for (UINT i = 0; i < MAX_PENDING && n < 16; ++i) if (g_pending[i].socket == s) { cancelled[n++] = g_pending[i]; g_pending[i].socket = 0; }
     ReleaseSRWLockExclusive(&g_select_lock);
-    if (!n) return;
+    if (!n) break;
     for (UINT i = 0; i < n; ++i) complete_overlapped(cancelled[i].overlapped, STATUS_CANCELLED_, 0, cancelled[i].routine, cancelled[i].thread);
+  }
+  /* (its waiting sends too: one the poller is sending now is completed by the poller, as cancelled) */
+  for (;;) {
+    PendingSend cancelled[16];
+    UINT n = 0;
+    AcquireSRWLockExclusive(&g_select_lock);
+    for (UINT i = 0; i < MAX_PENDING && n < 16; ++i) {
+      if (g_sends[i].socket != s) continue;
+      if (g_sends[i].busy) { g_sends[i].cancelled = TRUE; continue; }
+      cancelled[n++] = g_sends[i];
+      g_sends[i].socket = 0;
+    }
+    ReleaseSRWLockExclusive(&g_select_lock);
+    if (!n) return;
+    for (UINT i = 0; i < n; ++i) {
+      HeapFree(GetProcessHeap(), 0, cancelled[i].data);
+      complete_overlapped(cancelled[i].overlapped, STATUS_CANCELLED_, cancelled[i].before, cancelled[i].routine, cancelled[i].thread);
+    }
   }
 }
 
@@ -1729,9 +1809,68 @@ EXPORT int WSAAPI WSARecv(SOCKET s, WSABUF_ *buffers, DWORD count, DWORD *bytes,
 EXPORT int WSAAPI WSARecvFrom(SOCKET s, WSABUF_ *buffers, DWORD count, DWORD *bytes, DWORD *flags, SOCKADDR *from, int *from_length, OVERLAPPED *ov, COMPLETION_ROUTINE_ routine) {
   return receive_call(s, buffers, count, bytes, flags, from, from_length, ov, routine);
 }
+/* What an overlapped send of a stream socket did not get into the stack at once (`before` bytes went): a copy goes to the poller, which sends it in order
+ * (after any send of the socket that waits already) and completes the OVERLAPPED with all the bytes. *queued tells whether it waits. */
+static int queue_send_rest(SOCKET s, const WSABUF_ *buffers, DWORD count, DWORD before, OVERLAPPED *ov, COMPLETION_ROUTINE_ routine, BOOL *queued) {
+  *queued = FALSE;
+  size_t_ rest = 0;
+  for (DWORD i = 0; i < count; ++i) { if (buffers[i].len > 0x7FFFFFFFu - rest) { set_wsa_error(WSAEINVAL_); return SOCKET_ERROR; } rest += buffers[i].len; }
+  if (!start_poller()) { set_wsa_error(WSAENOBUFS_); return SOCKET_ERROR; }
+  char *data = HeapAlloc(GetProcessHeap(), 0, rest ? rest : 1);
+  if (!data) { set_wsa_error(WSAENOBUFS_); return SOCKET_ERROR; }
+  size_t_ at = 0;
+  for (DWORD i = 0; i < count; ++i) { memcpy(data + at, buffers[i].buf, buffers[i].len); at += buffers[i].len; }
+  HANDLE thread = routine ? own_thread_handle() : NULL;
+  ov->Internal = STATUS_PENDING_;
+  ov->InternalHigh = 0;
+  AcquireSRWLockExclusive(&g_select_lock);
+  PendingSend *p = NULL;
+  for (UINT i = 0; i < MAX_PENDING && !p; ++i) if (!g_sends[i].socket) p = &g_sends[i];
+  if (p) {
+    memset(p, 0, sizeof *p);
+    p->socket = s; p->overlapped = ov; p->data = data; p->size = (DWORD)rest; p->before = before; p->routine = routine; p->thread = thread;
+    p->sequence = ++g_send_sequence;
+  }
+  ReleaseSRWLockExclusive(&g_select_lock);
+  if (!p) { HeapFree(GetProcessHeap(), 0, data); if (thread) CloseHandle(thread); set_wsa_error(WSAENOBUFS_); return SOCKET_ERROR; }
+  wake_poller();
+  *queued = TRUE;
+  set_wsa_error(WSA_IO_PENDING_);
+  return SOCKET_ERROR;
+}
+
 EXPORT int WSAAPI WSASend(SOCKET s, WSABUF_ *buffers, DWORD count, DWORD *bytes_out, DWORD flags, OVERLAPPED *ov, COMPLETION_ROUTINE_ routine) {
   (void)flags;
   if (!buffers || !count) { set_wsa_error(WSAEINVAL_); return SOCKET_ERROR; }
+  if (ov) {
+    /* (an overlapped send waits for room instead of failing: done here by sending it straight away and leaving what did not go to the poller) */
+    SOCKET_INFO_ info;
+    if (socket_info(s, &info) && info.type == SOCK_STREAM_) {
+      AcquireSRWLockExclusive(&g_select_lock);
+      BOOL behind = FALSE;
+      for (UINT i = 0; i < MAX_PENDING && !behind; ++i) behind = g_sends[i].socket == s;
+      ReleaseSRWLockExclusive(&g_select_lock);
+      DWORD bytes = 0;
+      NTSTATUS status = 0;
+      if (!behind) {
+        status = send_from(s, buffers, count, &bytes, NULL, 0);
+        size_t_ total = 0;
+        for (DWORD i = 0; i < count; ++i) total += buffers[i].len;
+        if ((NT_SUCCESS(status) && bytes == total) || (!NT_SUCCESS(status) && wsa_error_for(status) != WSAEWOULDBLOCK_)) return finish_call(status, bytes, bytes_out, ov, routine);
+      }
+      /* the rest (all of it, behind another send) waits */
+      WSABUF_ rest[MAX_BUFFERS];
+      DWORD rest_count = 0, skip = bytes;
+      for (DWORD i = 0; i < count && rest_count < MAX_BUFFERS; ++i) {
+        if (skip >= buffers[i].len) { skip -= buffers[i].len; continue; }
+        rest[rest_count].buf = buffers[i].buf + skip; rest[rest_count].len = buffers[i].len - skip; skip = 0; ++rest_count;
+      }
+      BOOL queued = FALSE;
+      const int r = queue_send_rest(s, rest, rest_count, bytes, ov, routine, &queued);
+      if (queued || r == SOCKET_ERROR) return r;
+      return finish_call(status, bytes, bytes_out, ov, routine);
+    }
+  }
   DWORD bytes = 0;
   const NTSTATUS status = send_from(s, buffers, count, &bytes, NULL, 0);
   return finish_call(status, bytes, bytes_out, ov, routine);

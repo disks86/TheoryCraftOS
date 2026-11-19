@@ -58,7 +58,10 @@ bool visible_region(const Window* w, bool client_area, bool clip_children, bool 
     if (out->count() == 0) return true;
   }
   if (clip_children) {
-    for (const Window* c = w->first_child; c; c = c->next) if (c->style & wn::WS_VISIBLE) region_subtract(*out, window_rect_screen(c));
+    // (a WS_EX_TRANSPARENT child is not cut out, as with siblings: the parent draws under it - Chrome's GPU process paints the page through the parent's
+    // DC under the transparent child window that only serves accessibility)
+    for (const Window* c = w->first_child; c; c = c->next)
+      if ((c->style & wn::WS_VISIBLE) && !(c->ex_style & wn::WS_EX_TRANSPARENT)) region_subtract(*out, window_rect_screen(c));
   }
   if (w->region != 0 && gdi::is_region(w->region)) {
     List<Rect> shape(S().alloc);

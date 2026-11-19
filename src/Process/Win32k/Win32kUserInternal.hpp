@@ -168,8 +168,10 @@ struct Window {
   List<uint8_t> extra;           // cbWndExtra bytes
   ScrollBar scroll[2];
   uint32_t fnid = 0, help_id = 0, dpi_context = 0, display_affinity = 0, region = 0;
-  uint32_t layered_key = 0, layered_flags = 0;
+  uint32_t layered_key = 0, layered_flags = 0;      // SetLayeredWindowAttributes (layered_flags != 0: it was called)
   uint8_t layered_alpha = 255;
+  bool layered_updated = false;      // UpdateLayeredWindow put the window's picture on its surface (with its alpha when layered_per_pixel)
+  bool layered_per_pixel = false;
   uint64_t dialog_info = 0, mdi_info = 0;
   uint64_t menu = 0, sys_menu = 0;
   uint64_t private_data[4] = {};

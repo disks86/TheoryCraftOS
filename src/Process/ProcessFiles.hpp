@@ -96,7 +96,9 @@ struct OpenObject {
 // The descriptor table and file operations of one process. Console descriptors 0..2 exist from the start; the file system is attached once.
 class ProcessFiles {
  public:
-  static constexpr uint32_t kMaxDescriptors = 1024;
+  // (Google Chrome's browser process holds well over a thousand handles - pipes, sections, jobs and tokens for each sandboxed child - and treats a
+  // handle it cannot get as fatal; about 40 bytes each)
+  static constexpr uint32_t kMaxDescriptors = 8192;
 
   explicit ProcessFiles(PathStyle style);
   ProcessFiles(const ProcessFiles&) = delete;

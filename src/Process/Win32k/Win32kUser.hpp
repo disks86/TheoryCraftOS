@@ -112,6 +112,10 @@ bool move_top_level(uint32_t hwnd, const gdi::Rect& window);
 bool activate_top_level(uint32_t hwnd);                                     // 0: no Windows window is active (the desktop's own is)
 uint32_t top_level_surface_locked(uint32_t hwnd);
 uint32_t top_level_surface_scale_locked(uint32_t hwnd);
+// How the desktop draws a top-level's surface: as it is, blended by the alpha of each pixel (a layered window given its picture with UpdateLayeredWindow and
+// ULW_ALPHA), or not at all (a layered window that was given neither a picture nor attributes: invisible, as on Windows).
+enum class SurfaceBlend : uint8_t { Opaque, PerPixelAlpha, Hidden };
+SurfaceBlend top_level_surface_blend_locked(uint32_t hwnd);
 uint32_t top_level_monitor_scale_locked(uint32_t hwnd);      // the scale of the monitor it is on (the system's when the monitors share one)      // device pixels per surface pixel, in percent (100: the surface is in device pixels)
 // Mixed DPI hosting (Win32kUserDpi.cpp): a window surface changed. When it is a mixed child's own surface, its pixels are scaled into its top-level's
 // surface and the top-level and the part of it that changed are given (true); when it is a top-level's, its mixed children are put back over it (false).
