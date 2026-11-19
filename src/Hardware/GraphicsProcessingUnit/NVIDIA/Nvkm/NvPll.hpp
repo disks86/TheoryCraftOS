@@ -22,7 +22,7 @@
 //   - nvkm/subdev/clk/pllnv04.c (nv04_pll_calc: single and two-stage M/N/P search) and pllgt215.c (gt215_pll_calc: M/N/P with the
 //     fractional N of the GT215+ VPLLs), as pure functions;
 //   - the devinit pll_set of each family: nv50.c (NV50, G84, G98), gt215.c (GT215, MCP89), gf100.c (Fermi to Pascal: GF100, GM107, GM200
-//     use it), gv100.c (Volta);
+//     use it), gv100.c (Volta), tu102.c (Turing), ga100.c (GA10x: nouveau's ga102 chipsets take ga100_devinit);
 //   - NvPllInitHooks: an INvInitHooks whose set_pll does the above, so that NvDevinit::post's caller can hand it to the interpreter.
 //
 // The image is untrusted: every byte goes through NvBios::rd08/16/32, a read outside the image fails the parse (Truncated; nouveau reads 0),
@@ -110,11 +110,13 @@ struct NvPllCoefs {
 // --- Programming (nvkm_devinit_pll_set) --------------------------------------------------------------------------------------------------
 
 enum class NvPllFamily : uint8_t {
-  None,     // pre-NV50 (nv04_devinit_pll_set and its setPLL_single/double are not done), Turing and later (GSP/FWSEC), Tegra
+  None,     // pre-NV50 (nv04_devinit_pll_set and its setPLL_single/double are not done), GA100, Ada and later (GSP), Tegra
   Nv50,     // nv50_devinit_pll_set: NV50, G84, G98 (nv04_pll_calc)
   Gt215,    // gt215_devinit_pll_set: GT215/216/218, MCP89 (VPLLs only)
   Gf100,    // gf100_devinit_pll_set: GF100 .. GP10x (GK, GM107 and GM200 use it; VPLLs only)
   Gv100,    // gv100_devinit_pll_set: GV100 (VPLLs at 0x00ef00 + head * 0x40)
+  Tu102,    // tu102_devinit_pll_set: TU10x (as GV100, then 0x00ef0c = 0x900 and 0x00ef00 = 0x02000014: nouveau's "XXX")
+  Ga100,    // ga100_devinit_pll_set: GA102..GA107 (0x00ef00 = 0x02080004, N << 16 | fN at 0x00ef18, P << 16 | M at 0x00ef04, 0x00e9c0 + head * 4 = 1)
 };
 [[nodiscard]] NvPllFamily pll_family(const Chip& chip);
 const char* pll_family_name(NvPllFamily family);

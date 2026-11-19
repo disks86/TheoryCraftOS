@@ -19,7 +19,9 @@
 // Follows the Linux amdgpu driver (Copyright Advanced Micro Devices, Inc.; MIT license) where it has a counterpart: amdgpu_device.c
 // (amdgpu_device_need_post, amdgpu_device_asic_init), gmc_v8_0.c (gmc_v8_0_mc_program), dce_v11_0.c (dce_v11_0_hw_init, the crtc and encoder
 // helpers' prepare / mode_set / commit / disable), amdgpu_atombios_encoders.c (amdgpu_atombios_encoder_init_dig, _setup_dig) and
-// amdgpu_atombios_dp.c (amdgpu_atombios_dp_get_panel_mode, the link training).
+// amdgpu_atombios_dp.c (amdgpu_atombios_dp_get_panel_mode, the link training). The DCE 12 path: amdgpu_device.c (amdgpu_device_asic_init for GC 9.0 - 9.4.0),
+// amdgpu_atomfirmware.c (amdgpu_atomfirmware_scratch_regs_init) and the display core's dce110_hwseq.c (dce110_apply_ctx_to_hw, dce110_enable_stream_timing,
+// dce110_program_front_end_for_pipe), link_dpms.c's enable order, dce_link_encoder.c and dce_clock_source.c (see AmdDce12.hpp for the register parts).
 #include "Hardware/GraphicsProcessingUnit/AMD/AmdSecondaryGpu.hpp"
 #include "Hardware/Acpi/AcpiTables.hpp"
 #include "Hardware/GraphicsProcessingUnit/AMD/AmdAux.hpp"
@@ -38,6 +40,11 @@ namespace {
 constexpr uint32_t kTmdsSingleLinkKhz = 165000;
 constexpr uint32_t kFirmwareInfoTable = 4;                      // GetIndexIntoMasterTable(DATA, FirmwareInfo)
 constexpr uint32_t kFwiDefaultSclk = 8, kFwiDefaultMclk = 12;   // ATOM_FIRMWARE_INFO: ulDefaultEngineClock, ulDefaultMemoryClock (10 kHz)
+// atom_firmware_info_v3_1 (atomfirmware.h): bootup_sclk_in10khz, bootup_mclk_in10khz at the same offsets; bios_scratch_reg_startaddr after the capability and the parser entry
+constexpr uint32_t kFwiV3ScratchStart = 0x18, kFwiV3MinBytes = 0x1C;
+constexpr uint32_t kMaxRegisterDword = static_cast<uint32_t>(amd_dce12::kRegisterBytes / 4);
+constexpr uint8_t kAtomCrtcInvalid = 0xFF, kEncoderModeCrt = 15;             // ATOM_CRTC_INVALID, ATOM_ENCODER_MODE_CRT (the mode of SIGNAL_TYPE_NONE)
+constexpr uint8_t kHpdSourceUnknown = 7;                                    // HPD_SOURCEID_UNKNOWN (grph_object_defs.h)
 
 uint64_t align_up(uint64_t value, uint64_t alignment) { return (value + alignment - 1) / alignment * alignment; }
 
@@ -188,11 +195,23 @@ const char* status_name(Status status) {
     case Status::NoConnectors: return "the video BIOS lists no connectors";
     case Status::NoMonitor: return "no monitor on an external connector";
     case Status::NoMode: return "no mode of the monitor fits the output";
+    case Status::NoPipe: return "every display pipe is fused off";
     case Status::ModeSet: return "the mode set failed";
     case Status::NotRunning: return "not running";
     case Status::BadIndex: return "no such mode";
   }
   return "?";
+}
+
+Optional<Engine> engine_of(uint16_t device_id, bool* pipe_harvesting) {
+  if (pipe_harvesting) *pipe_harvesting = false;
+  const AmdGpuInfo info = amd_gpu_identify(device_id);
+  if (!info.discrete) return Optional<Engine>();
+  if (info.architecture == AmdGpuArchitecture::Polaris) return Optional<Engine>(Engine::Dce11);
+  if (info.architecture != AmdGpuArchitecture::Vega) return Optional<Engine>();
+  // Vega 10 (0x6860..0x687F), Vega 12 (0x69A0..0x69AF), Vega 20 (0x66A0..0x66AF: dce121, pipe harvesting)
+  if (pipe_harvesting) *pipe_harvesting = device_id >= 0x66A0 && device_id <= 0x66AF;
+  return Optional<Engine>(Engine::Dce12);
 }
 
 // ---------------------------------------------------------------------------------------------------------------------------------------
@@ -228,28 +247,56 @@ Status Display::start() {
   bios_ = UniquePointer<AtomBios>::make(allocator, *host_, vbios_->view(), allocator);
   if (!bios_ || !bios_->valid()) return fail(Status::NoBios, status_name(Status::NoBios));
 
-  // amdgpu_device_need_post (CIK and later): the video BIOS marks the end of its ASIC_Init in BIOS_SCRATCH_7
+  const bool dce12 = in_.engine == Engine::Dce12;
+  // amdgpu_device_need_post (CIK and later): the video BIOS marks the end of its ASIC_Init in BIOS_SCRATCH_7 (on an ATOM firmware card at the address its
+  // firmware_info 3.1 gives)
+  uint32_t scratch7 = AmdVbios::kBiosScratch7;
+  if (dce12) {
+    uint32_t start = 0;
+    if (!scratch_start(&start)) return fail(Status::NoBios, "not an ATOM firmware video BIOS (no firmware_info 3.x with the BIOS scratch registers)");
+    scratch7 = start + 7;
+  }
   posted_ = false;
-  if (!(r.read(AmdVbios::kBiosScratch7) & AmdVbios::kAsicInitComplete)) {
-    const AtomBios::Status post = bios_->asic_init();
+  if (!(r.read(scratch7) & AmdVbios::kAsicInitComplete)) {
+    const AtomBios::Status post = bios_->asic_init();     // (amdgpu_atom_asic_init on DCE 12 too: amdgpu_device_asic_init for GC 9.0 - 9.4.0)
     if (post != AtomBios::Status::Ok) return fail(Status::PostFailed, AtomBios::status_name(post));
     posted_ = true;
   }
 
-  // the memory controller: where the POST put video memory, the system aperture over it (gmc_v8_0_mc_program)
-  map_ = amd_read_gmc8_memory_map(r);
-  if (!map_.read) return fail(Status::NoMemoryMap, status_name(Status::NoMemoryMap));
-  if (map_.video_memory_bytes < kApertureBytes) return fail(Status::TooLittleMemory, status_name(Status::TooLittleMemory));
-  AmdGmc8GartPlan plan;
-  plan.vram_start = map_.gpu_base;
-  plan.vram_end = map_.gpu_base + map_.video_memory_bytes - 1;
-  AmdGmc8 gmc(r, *in_.clock);
-  if (gmc.program_apertures(plan, map_.gpu_base + kScratchOffset, true) == AmdGmc8::Result::BadArgument) return fail(Status::MemoryController, status_name(Status::MemoryController));
+  if (dce12) {
+    // gmc_v9_0 / mmhub_v1_0: where the POST put video memory, the apertures, the HDP and the display hub (amd_dce12::program_memory)
+    map12_ = amd_dce12::read_memory_map(r);
+    if (!map12_.read) return fail(Status::NoMemoryMap, status_name(Status::NoMemoryMap));
+    map_.read = true;
+    map_.video_memory_bytes = map12_.video_memory_bytes;
+    map_.gpu_base = map12_.gpu_base;
+    map_.gpu_top = map12_.gpu_top + (16ull << 20);
+    if (map_.video_memory_bytes < kApertureBytes) return fail(Status::TooLittleMemory, status_name(Status::TooLittleMemory));
+    if (!amd_dce12::program_memory(r, map12_, map12_.gpu_base + kScratchOffset)) return fail(Status::MemoryController, status_name(Status::MemoryController));
+    // read_pipe_fuses (Vega 20): the first pipe that is not fused off
+    crtc_ = 0;
+    if (in_.pipe_harvesting) {
+      const uint32_t fuses = amd_dce12::pipe_fuses(r);
+      while (crtc_ < amd_dce12::kMaxPipes && (fuses >> crtc_ & 1)) ++crtc_;
+      if (crtc_ >= amd_dce12::kMaxPipes) return fail(Status::NoPipe, status_name(Status::NoPipe));
+    }
+  } else {
+    // the memory controller: where the POST put video memory, the system aperture over it (gmc_v8_0_mc_program)
+    map_ = amd_read_gmc8_memory_map(r);
+    if (!map_.read) return fail(Status::NoMemoryMap, status_name(Status::NoMemoryMap));
+    if (map_.video_memory_bytes < kApertureBytes) return fail(Status::TooLittleMemory, status_name(Status::TooLittleMemory));
+    AmdGmc8GartPlan plan;
+    plan.vram_start = map_.gpu_base;
+    plan.vram_end = map_.gpu_base + map_.video_memory_bytes - 1;
+    AmdGmc8 gmc(r, *in_.clock);
+    if (gmc.program_apertures(plan, map_.gpu_base + kScratchOffset, true) == AmdGmc8::Result::BadArgument) return fail(Status::MemoryController, status_name(Status::MemoryController));
+  }
 
   // the connectors, the display block, the monitors
   connector_count_ = AtomConnectors::parse(vbios_->view(), ArrayView<AtomConnectors::Connector>(connectors_, AtomConnectors::kMaxConnectors));
   if (connector_count_ == 0) return fail(Status::NoConnectors, status_name(Status::NoConnectors));
-  init_display_block();
+  if (dce12) init_display_block12();
+  else init_display_block();
   for (uint32_t i = 0; i < connector_count_; ++i) read_monitor(i);
   if (!pick_output()) return fail(last_, status_);
 
@@ -257,8 +304,9 @@ Status Display::start() {
   const AtomConnectors::Connector& c = connectors_[driven_];
   const CrtcMode& m = modes_[current_].timing;
   bpc_ = monitor_bpc(c.type, true, dp_sink_, monitor_, m.pixel_clock_khz, false);
+  if (dce12 && !AtomConnectors::uses_aux(c.type)) bpc_ = 8;     // (no deep colour on TMDS: the DTO resync is not ported)
   if (!plane_surface(m)) return fail(Status::ModeSet, "the surface does not fit");
-  stage_ = program(c, m);
+  stage_ = dce12 ? program12(c, m) : program(c, m);
   if (stage_ != ModeStage::Done) return fail(Status::ModeSet, status_name(Status::ModeSet));
   running_ = true;
   last_ = Status::Ok;
@@ -280,7 +328,7 @@ bool Display::init_display_block() {
     const uint8_t dig = AtomConnectors::dig_encoder(c);
     if (dig == AtomConnectors::kNoDig || dig > 6 || (done >> dig & 1) || !encoder_mode_of(c.type, &mode)) continue;
     done |= 1u << dig;
-    ok = set.transmitter(output_of(c, kCrtc, mode, 8, AmdModeSet::kPllInvalid), CrtcMode(), AmdModeSet::kTransmitterInit) && ok;
+    ok = set.transmitter(output_of(c, crtc_, mode, 8, AmdModeSet::kPllInvalid), CrtcMode(), AmdModeSet::kTransmitterInit) && ok;
   }
   amd_dce11::Interrupts irq(*in_.registers);
   for (uint32_t i = 0; i < connector_count_; ++i) {
@@ -298,11 +346,13 @@ bool Display::read_monitor(uint32_t index) {
   edid_sizes_[index] = 0;
   const AtomConnectors::Connector& c = connectors_[index];
   if (!drivable(c.type) || !c.has_ddc) return false;
-  const AtomI2c::Bus bus = AtomI2c::lookup(vbios_->view(), c.ddc_id);
-  if (!bus.valid) return false;
+  const AtomI2c::Bus bus = in_.engine == Engine::Dce12 ? AtomI2c::Bus() : AtomI2c::lookup(vbios_->view(), c.ddc_id);
+  if (in_.engine != Engine::Dce12 && !bus.valid) return false;
   ByteBuffer edid(*in_.allocator);
   bool ok;
-  if (AtomConnectors::uses_aux(c.type)) {
+  if (in_.engine == Engine::Dce12) {
+    ok = read_ddc12(c, &edid);
+  } else if (AtomConnectors::uses_aux(c.type)) {
     AmdAux aux(*host_, *bios_, c.ddc_id, c.hpd_pin);
     ok = aux.read_edid(&edid);
   } else {
@@ -388,22 +438,22 @@ ModeStage Display::program(const AtomConnectors::Connector& c, const CrtcMode& m
   uint8_t pll = AmdModeSet::pick_pll(encoder_mode, AtomConnectors::encoder_id(c), AtomConnectors::link_b(c));
   if (pll == AmdModeSet::kPllInvalid) return ModeStage::Unsupported;
   pll_ = pll;
-  ModeSetOutput o = output_of(c, kCrtc, encoder_mode, bpc_, pll);
+  ModeSetOutput o = output_of(c, crtc_, encoder_mode, bpc_, pll);
   o.dual_link = encoder_mode == AmdModeSet::kModeDvi && mode.pixel_clock_khz > kTmdsSingleLinkKhz;
   AmdModeSet set(*host_, *bios_);
   const auto optional = [&](uint32_t table) { uint8_t frev = 0, crev = 0; return !bios_->cmd_table_header(table, &frev, &crev); };
   amd_dce11::Scanout display(*in_.registers);
   mode_set_ = true;      // (from here on a failure leaves something to switch off: shutdown() runs the disable sequence)
   // dce_v11_0_crtc_prepare: power gating off, the CRTC locked, dpms off (blanked if it was on, disabled)
-  if ((!optional(AmdModeSet::kEnableDispPowerGating) && !set.powergate_crtc(kCrtc, false)) || (!optional(AmdModeSet::kUpdateDoubleBuffer) && !set.lock_crtc(kCrtc, true)))
+  if ((!optional(AmdModeSet::kEnableDispPowerGating) && !set.powergate_crtc(crtc_, false)) || (!optional(AmdModeSet::kUpdateDoubleBuffer) && !set.lock_crtc(crtc_, true)))
     return ModeStage::Prepare;
   bool off = true;
   if (crtc_enabled_) {
-    display.vga_enable(kCrtc, true);
-    off = set.blank_crtc(kCrtc, true);
-    display.vga_enable(kCrtc, false);
+    display.vga_enable(crtc_, true);
+    off = set.blank_crtc(crtc_, true);
+    display.vga_enable(crtc_, false);
   }
-  if (!set.enable_crtc(kCrtc, false) || !off) return ModeStage::Prepare;
+  if (!set.enable_crtc(crtc_, false) || !off) return ModeStage::Prepare;
   crtc_enabled_ = false;
   // the DisplayPort link configuration (made when the driver fixes the mode up)
   UniquePointer<AmdAux> aux;
@@ -418,12 +468,12 @@ ModeStage Display::program(const AtomConnectors::Connector& c, const CrtcMode& m
     link_.panel_mode = panel_mode_of(c, *aux);
   }
   // dce_v11_0_encoder_prepare: the CRTC's source, the FMT block
-  if (!set.select_crtc_source(o) || !display.program_fmt(kCrtc, bpc_, false)) return ModeStage::CrtcSource;
+  if (!set.select_crtc_source(o) || !display.program_fmt(crtc_, bpc_, false)) return ModeStage::CrtcSource;
   // dce_v11_0_crtc_mode_set: the pixel clock, the timing, the base (the surface), the bandwidth, the overscan and the scaler
   if (!set.set_pixel_clock(o, mode)) return ModeStage::PixelClock;
   if (!set.set_dtd_timing(o, mode)) return ModeStage::Timing;
-  if (!display.set(kCrtc, surface_)) return ModeStage::Scanout;
-  heads_[kCrtc] = {true, mode.h_display, mode.h_total, mode.pixel_clock_khz, mode.interlaced};
+  if (!display.set(crtc_, surface_)) return ModeStage::Scanout;
+  heads_[crtc_] = {true, mode.h_display, mode.h_total, mode.pixel_clock_khz, mode.interlaced};
   update_watermarks();
   if (!optional(AmdModeSet::kSetCrtcOverscan) && !set.overscan_setup(o)) return ModeStage::Overscan;
   if (!optional(AmdModeSet::kEnableScaler) && !set.scaler_setup(o)) return ModeStage::Scaler;
@@ -431,14 +481,14 @@ ModeStage Display::program(const AtomConnectors::Connector& c, const CrtcMode& m
   bool encoder_off = true;
   if (dp) encoder_off = set.encoder(o, mode, AmdModeSet::kEncoderDpVideoOff);
   if (!set.transmitter(o, mode, AmdModeSet::kTransmitterDisable) || !encoder_off) return ModeStage::EncoderOff;
-  display.set_interleave(kCrtc, mode.interlaced);
+  display.set_interleave(crtc_, mode.interlaced);
   // dce_v11_0_crtc_commit: enabled, unblanked, unlocked
-  if (!set.enable_crtc(kCrtc, true)) return ModeStage::CrtcEnable;
+  if (!set.enable_crtc(crtc_, true)) return ModeStage::CrtcEnable;
   crtc_enabled_ = true;
-  display.vga_enable(kCrtc, true);
-  const bool unblanked = set.blank_crtc(kCrtc, false);
-  display.vga_enable(kCrtc, false);
-  if (!unblanked || (!optional(AmdModeSet::kUpdateDoubleBuffer) && !set.lock_crtc(kCrtc, false))) return ModeStage::Unblank;
+  display.vga_enable(crtc_, true);
+  const bool unblanked = set.blank_crtc(crtc_, false);
+  display.vga_enable(crtc_, false);
+  if (!unblanked || (!optional(AmdModeSet::kUpdateDoubleBuffer) && !set.lock_crtc(crtc_, false))) return ModeStage::Unblank;
   // dce_v11_0_encoder_commit: setup_dig(ATOM_ENABLE)
   if (!set.encoder(o, mode, AmdModeSet::kEncoderSetup)) return ModeStage::EncoderSetup;
   if (!set.encoder(o, mode, AmdModeSet::kEncoderSetupPanelMode, dp ? link_.panel_mode : AmdModeSet::kPanelModeExternalDp)) return ModeStage::PanelMode;
@@ -470,7 +520,7 @@ void Display::disable(const AtomConnectors::Connector& c) {
   if (!encoder_mode_of(c.type, &encoder_mode)) return;
   AmdModeSet set(*host_, *bios_);
   const CrtcMode none;
-  const ModeSetOutput o = output_of(c, kCrtc, encoder_mode, bpc_, pll_);
+  const ModeSetOutput o = output_of(c, crtc_, encoder_mode, bpc_, pll_);
   if (encoder_mode == AmdModeSet::kModeDp) {
     (void)set.encoder(o, none, AmdModeSet::kEncoderDpVideoOff);
     AmdAux aux(*host_, *bios_, c.ddc_id, c.hpd_pin);
@@ -484,25 +534,186 @@ void Display::disable(const AtomConnectors::Connector& c) {
   (void)set.transmitter(o, none, AmdModeSet::kTransmitterDisable);
   amd_dce11::Scanout display(*in_.registers);
   if (crtc_enabled_) {
-    display.vga_enable(kCrtc, true);
-    (void)set.blank_crtc(kCrtc, true);
-    display.vga_enable(kCrtc, false);
+    display.vga_enable(crtc_, true);
+    (void)set.blank_crtc(crtc_, true);
+    display.vga_enable(crtc_, false);
   }
-  (void)set.enable_crtc(kCrtc, false);
+  (void)set.enable_crtc(crtc_, false);
   crtc_enabled_ = false;
-  heads_[kCrtc] = amd_dce11::WatermarkHead();
+  heads_[crtc_] = amd_dce11::WatermarkHead();
   update_watermarks();
-  (void)display.disable(kCrtc);
+  (void)display.disable(crtc_);
   uint8_t frev = 0, crev = 0;
-  if (bios_->cmd_table_header(AmdModeSet::kEnableDispPowerGating, &frev, &crev)) (void)set.powergate_crtc(kCrtc, true);
+  if (bios_->cmd_table_header(AmdModeSet::kEnableDispPowerGating, &frev, &crev)) (void)set.powergate_crtc(crtc_, true);
   const bool combo = pll_ >= AmdModeSet::kComboPhyPll0 && pll_ < AmdModeSet::kComboPhyPll0 + 6;
   if (pll_ <= AmdModeSet::kPpll0 || combo) {      // (the DP DTO is left alone, as in dce_v11_0_crtc_disable)
     ModeSetOutput clock_off;
-    clock_off.crtc = combo ? AmdModeSet::kCrtcInvalid : kCrtc;
+    clock_off.crtc = combo ? AmdModeSet::kCrtcInvalid : crtc_;
     clock_off.pll = pll_;
     clock_off.encoder_mode = 0;
     (void)set.set_pixel_clock(clock_off, CrtcMode());
   }
+}
+
+// ---------------------------------------------------------------------------------------------------------------------------------------
+// DCE 12 (Vega 10, 12, 20)
+// ---------------------------------------------------------------------------------------------------------------------------------------
+
+// amdgpu_atomfirmware_scratch_regs_init: firmware_info 3.x's bios_scratch_reg_startaddr (a register of the BAR; 0 or beyond it is refused).
+bool Display::scratch_start(uint32_t* scratch) {
+  uint16_t start = 0, size = 0;
+  uint8_t frev = 0, crev = 0;
+  if (!bios_->data_table_header(kFirmwareInfoTable, &size, &frev, &crev, &start) || frev != 3 || size < kFwiV3MinBytes) return false;
+  ConstByteView word;
+  if (!vbios_->view().try_subview(uint64_t{start} + kFwiV3ScratchStart, 4, &word)) return false;
+  const uint32_t value = word[0] | uint32_t{word[1]} << 8 | uint32_t{word[2]} << 16 | uint32_t{word[3]} << 24;
+  if (value == 0 || value >= kMaxRegisterDword - 8) return false;
+  *scratch = value;
+  return true;
+}
+
+// The transmitter parameters of a connector as dce110_link_encoder builds them: the PHY (the DIG's: UNIPHY A..G), its hot plug select (HPD n + 1, 0 none), the connector.
+amd_dce12::CommandTables::Transmitter Display::transmitter12(const AtomConnectors::Connector& c, uint8_t action, uint8_t encoder_mode) const {
+  amd_dce12::CommandTables::Transmitter t;
+  t.phy = AtomConnectors::dig_encoder(c);
+  t.action = action;
+  t.mode_or_lane_set = encoder_mode;          // ATOM_TRANSMITTER_DIGMODE_V6_DP 0, _DVI 2, _HDMI 3: the encoder modes' numbers
+  t.hpd_select = c.hpd_pin < amd_dce12::kMaxHpd ? static_cast<uint8_t>(c.hpd_pin + 1) : 0;
+  t.connector_object_id = c.object_id;
+  return t;
+}
+
+// dce110_link_encoder_hw_init for each DIG (the transmitter INIT with no front end, four lanes, the DIG mode of SIGNAL_TYPE_NONE - DVI - or DP for eDP), its back end's hot plug
+// select (hpd_initialize), and the hot plug pins on.
+bool Display::init_display_block12() {
+  amd_dce12::CommandTables tables(*bios_);
+  amd_dce12::Pipe pipe(*in_.registers, *in_.clock);
+  bool ok = true;
+  uint32_t done = 0;
+  for (uint32_t i = 0; i < connector_count_; ++i) {
+    const AtomConnectors::Connector& c = connectors_[i];
+    const uint8_t dig = AtomConnectors::dig_encoder(c);
+    if (dig >= amd_dce12::kMaxDigs || (done >> dig & 1)) continue;
+    done |= 1u << dig;
+    amd_dce12::CommandTables::Transmitter t =
+        transmitter12(c, AmdModeSet::kTransmitterInit, c.type == AtomConnectors::Type::EmbeddedDisplayPort ? AmdModeSet::kModeDp : AmdModeSet::kModeDvi);
+    t.lanes = 4;
+    ok = tables.transmitter(t) && ok;
+    ok = pipe.set_hpd_select(dig, c.hpd_pin < amd_dce12::kMaxHpd ? c.hpd_pin : kHpdSourceUnknown) && ok;
+  }
+  for (uint32_t i = 0; i < connector_count_; ++i) (void)pipe.hpd_enable(connectors_[i].hpd_pin, true);
+  hpd_on_ = true;
+  return ok;
+}
+
+// The EDID over the connector's DDC pads (the gpio_pin_lut entry of its I2C record names the line) or, for DisplayPort, I2C over AUX.
+bool Display::read_ddc12(const AtomConnectors::Connector& c, ByteBuffer* edid) {
+  if (AtomConnectors::uses_aux(c.type)) {
+    AmdAux aux(*host_, *bios_, c.ddc_id, c.hpd_pin);
+    return aux.read_edid(edid);
+  }
+  const AtomI2c::PinV21 pin = AtomI2c::lookup_v21(vbios_->view(), c.ddc_id);
+  if (!pin.found || pin.shift != 0) return false;           // (the clock pad is bit 0 of its A register: DC_GPIO_DDCnCLK_A)
+  const uint32_t line = amd_dce12::ddc_line_of(pin.a_register);
+  if (line >= amd_dce12::kMaxDdc) return false;
+  AtomI2c::Bus bus = amd_dce12::ddc_bus(line);
+  bus.hw_capable = (c.ddc_id & 0x80) != 0;                  // I2C_HW_CAP: the pad pair is switched to DDC mode first
+  return AmdDdc(*in_.registers, *in_.clock, bus).read_edid(edid);
+}
+
+// The mode set in the display core's order for one stream on CRTC crtc_ (dce110_apply_ctx_to_hw, dce110_enable_stream_timing, dce110_apply_single_controller_ctx_to_hw,
+// dce110_program_front_end_for_pipe, link_set_dpms_on), with the encoder table for the stream and the link training (see AmdDce12.hpp).
+ModeStage Display::program12(const AtomConnectors::Connector& c, const CrtcMode& mode) {
+  link_ = LinkTraining();
+  uint8_t encoder_mode = 0;
+  const uint8_t dig = AtomConnectors::dig_encoder(c);
+  if (!encoder_mode_of(c.type, &encoder_mode) || dig > 5 || mode.pixel_clock_khz == 0 || mode.interlaced || mode.double_scan || mode.pixel_clock_khz > 0xFFFFFFFFu / 10)
+    return ModeStage::Unsupported;
+  const bool dp = encoder_mode == AmdModeSet::kModeDp;
+  // the clock source (dce112 find_matching_pll / the DP clock source): DP DTO, else the combo PHY PLL of the transmitter (A..F: 20..25)
+  const uint8_t pll = AmdModeSet::pick_pll(encoder_mode, AtomConnectors::encoder_id(c), AtomConnectors::link_b(c));
+  if (pll == AmdModeSet::kPllInvalid) return ModeStage::Unsupported;
+  pll_ = pll;
+  const bool dual_link = encoder_mode == AmdModeSet::kModeDvi && mode.pixel_clock_khz > kTmdsSingleLinkKhz;
+  amd_dce12::CommandTables tables(*bios_);
+  amd_dce12::Pipe pipe(*in_.registers, *in_.clock);
+  mode_set_ = true;      // (from here on a failure leaves something to switch off)
+  // dce110_apply_ctx_to_hw: the safe display marks; dce110_enable_stream_timing: blanked first ("otherwise CRTC will be hung in bad state")
+  (void)pipe.safe_watermarks(crtc_);
+  (void)pipe.set_blank(crtc_, true);
+  // the DisplayPort link configuration (decided before the stream is enabled)
+  UniquePointer<AmdAux> aux;
+  if (dp) {
+    if (!c.has_ddc) return ModeStage::SinkCapabilities;
+    aux = UniquePointer<AmdAux>::make(*in_.allocator, *host_, *bios_, c.ddc_id, c.hpd_pin);
+    if (!aux || !Dpcd::read_capabilities(*aux, false, &link_.caps)) return ModeStage::SinkCapabilities;
+    link_.config = DpLinkConfig::choose(link_.caps, mode.pixel_clock_khz, bpc_ * 3);
+    if (link_.config.lanes == 0 || link_.config.rate_index != DpLinkConfig::kNoRateIndex) return ModeStage::SinkCapabilities;
+    link_.panel_mode = panel_mode_of(c, *aux);
+  }
+  // dce112_program_pix_clk (SetPixelClock 1.7), the timing (SetCRTC_UsingDTDTiming 3) with the advanced request, dce120_timing_generator_enable_crtc
+  if (!tables.set_pixel_clock(crtc_, pll, AtomConnectors::encoder_id(c), encoder_mode, mode.pixel_clock_khz * 10, dual_link ? amd_dce12::CommandTables::kPixelClockDualLink : 0))
+    return ModeStage::PixelClock;
+  if (!tables.set_crtc_timing(crtc_, mode) || !pipe.advanced_request(crtc_, mode)) return ModeStage::Timing;
+  (void)pipe.prepare_enable(crtc_);
+  if (!tables.enable_crtc(crtc_, true)) return ModeStage::CrtcEnable;
+  crtc_enabled_ = true;
+  // the output's FMT block; the front end: DMIF buffers, the VGA mode off, the plane
+  (void)pipe.program_fmt(crtc_, bpc_);
+  if (!pipe.allocate_dmif(crtc_, mode) || !pipe.disable_vga(crtc_) || !pipe.set_surface(crtc_, surface_)) return ModeStage::Scanout;
+  // link_set_dpms_on: the DIG front end on the CRTC and the back end on the front end, the stream (encoder table), the PHY, the link
+  if (!pipe.connect(dig, crtc_, true)) return ModeStage::CrtcSource;
+  const uint32_t lanes = dp ? link_.config.lanes : (dual_link ? 8u : 4u);
+  if (!tables.encoder_stream_setup(dig, encoder_mode, static_cast<uint8_t>(lanes), mode.pixel_clock_khz, AmdModeSet::panel_bpc(bpc_), dp ? link_.config.rate_khz : 0))
+    return ModeStage::EncoderSetup;
+  if (dp && !tables.encoder_panel_mode(dig, link_.panel_mode)) return ModeStage::PanelMode;
+  amd_dce12::CommandTables::Transmitter t = transmitter12(c, AmdModeSet::kTransmitterEnable, encoder_mode);
+  t.lanes = static_cast<uint8_t>(lanes);
+  t.symbol_clock_khz = dp ? link_.config.rate_khz : mode.pixel_clock_khz;     // (enable_dp_output: the link rate; enable_tmds_output: the pixel clock)
+  if (!tables.transmitter(t)) return ModeStage::TransmitterEnable;
+  if (dp) {
+    amd_dce12::CommandTables::Transmitter drive = transmitter12(c, AmdModeSet::kTransmitterSetupVsEmph, encoder_mode);
+    drive.lanes = static_cast<uint8_t>(lanes);
+    drive.symbol_clock_khz = link_.config.rate_khz;
+    amd_dce12::DpSource source(*host_, tables, dig, drive);
+    link_.outcome = DpLinkTrainer::train(*aux, source, link_.caps, link_.config.bandwidth_code(), link_.config.lanes, link_.config.rate_index,
+                                         link_.panel_mode == AmdModeSet::kPanelModeInternalDp2);
+    if (!link_.outcome.trained()) return ModeStage::LinkTraining;
+    if (!tables.encoder_command(dig, AmdModeSet::kEncoderDpVideoOn)) return ModeStage::VideoOn;
+  }
+  // unblanked (dce110_unblank_stream / program_surface_visibility)
+  if (!pipe.set_blank(crtc_, false)) return ModeStage::Unblank;
+  return ModeStage::Done;
+}
+
+// The stream taken down (dce110_disable_stream, the link off, dce110_reset_hw_ctx_wrap): DP video off and the sink to D3, the transmitter off, the front end let go, blanked,
+// the CRTC off, the plane off and its DMIF buffers freed, the combo PHY PLL powered down (dce110_clock_source_power_down; the DP DTO is left alone).
+void Display::disable12(const AtomConnectors::Connector& c) {
+  uint8_t encoder_mode = 0;
+  const uint8_t dig = AtomConnectors::dig_encoder(c);
+  if (!encoder_mode_of(c.type, &encoder_mode) || dig >= amd_dce12::kMaxDigs) return;
+  amd_dce12::CommandTables tables(*bios_);
+  amd_dce12::Pipe pipe(*in_.registers, *in_.clock);
+  if (encoder_mode == AmdModeSet::kModeDp) {
+    (void)tables.encoder_command(dig, AmdModeSet::kEncoderDpVideoOff);
+    AmdAux aux(*host_, *bios_, c.ddc_id, c.hpd_pin);
+    Dpcd::Capabilities caps;
+    if (c.has_ddc && Dpcd::read_capabilities(aux, false, &caps) && caps.revision >= 0x11) {
+      const uint8_t d3 = Dpcd::kPowerD3;
+      (void)aux.dpcd_write(Dpcd::kSetPower, ConstByteView(&d3, 1));
+      host_->delay_us(1000);
+    }
+  }
+  (void)tables.transmitter(transmitter12(c, AmdModeSet::kTransmitterDisable, encoder_mode));
+  (void)pipe.connect(dig, crtc_, false);
+  (void)pipe.set_blank(crtc_, true);
+  if (crtc_enabled_) (void)tables.enable_crtc(crtc_, false);
+  crtc_enabled_ = false;
+  (void)pipe.disable_surface(crtc_);
+  (void)pipe.free_dmif(crtc_);
+  const bool combo = pll_ >= AmdModeSet::kComboPhyPll0 && pll_ < AmdModeSet::kComboPhyPll0 + 6;
+  if (combo) (void)tables.set_pixel_clock(kAtomCrtcInvalid, pll_, 0, kEncoderModeCrt, 0, amd_dce12::CommandTables::kPixelClockForcePll);
+  mode_set_ = false;
 }
 
 Status Display::set_mode(uint32_t index) {
@@ -513,8 +724,10 @@ Status Display::set_mode(uint32_t index) {
   const auto apply = [&](uint32_t i) {
     const CrtcMode& m = modes_[i].timing;
     bpc_ = monitor_bpc(c.type, true, dp_sink_, monitor_, m.pixel_clock_khz, false);
+    if (in_.engine == Engine::Dce12 && !AtomConnectors::uses_aux(c.type)) bpc_ = 8;
+    if (in_.engine == Engine::Dce12 && mode_set_) disable12(c);     // (DC takes the stream down before it sets the new one)
     if (!plane_surface(m)) return ModeStage::Scanout;
-    return program(c, m);
+    return in_.engine == Engine::Dce12 ? program12(c, m) : program(c, m);
   };
   stage_ = apply(index);
   if (stage_ == ModeStage::Done) {
@@ -532,13 +745,21 @@ Status Display::set_mode(uint32_t index) {
 }
 
 void Display::flush() {
-  if (in_.registers && map_.read) amd_gmc8_flush_hdp(*in_.registers);
+  if (!in_.registers || !map_.read) return;
+  if (in_.engine == Engine::Dce12) amd_dce12::flush_hdp(*in_.registers);
+  else amd_gmc8_flush_hdp(*in_.registers);
 }
 
 void Display::shutdown() {
-  if (mode_set_ && driven_ >= 0 && host_ && bios_) disable(connectors_[driven_]);
+  if (mode_set_ && driven_ >= 0 && host_ && bios_) {
+    if (in_.engine == Engine::Dce12) disable12(connectors_[driven_]);
+    else disable(connectors_[driven_]);
+  }
   mode_set_ = false;
-  if (hpd_on_ && in_.registers) {
+  if (hpd_on_ && in_.registers && in_.clock && in_.engine == Engine::Dce12) {
+    amd_dce12::Pipe pipe(*in_.registers, *in_.clock);
+    for (uint32_t i = 0; i < connector_count_; ++i) (void)pipe.hpd_enable(connectors_[i].hpd_pin, false);
+  } else if (hpd_on_ && in_.registers) {
     amd_dce11::Interrupts irq(*in_.registers);
     for (uint32_t i = 0; i < connector_count_; ++i)
       if (connectors_[i].hpd_pin < amd_dce11::Interrupts::kMaxHpd) irq.hpd_fini(connectors_[i].hpd_pin);
@@ -550,6 +771,7 @@ void Display::shutdown() {
   driven_ = -1;
   mode_count_ = 0;
   current_ = 0;
+  crtc_ = 0;
   bios_ = UniquePointer<AtomBios>();
   host_ = UniquePointer<Host>();
   vbios_ = UniquePointer<ByteBuffer>();
@@ -564,8 +786,7 @@ void Display::shutdown() {
 // ---------------------------------------------------------------------------------------------------------------------------------------
 bool AmdSecondaryGpu::supports(const PciDeviceInfo& device) {
   if (device.vendor_id != kPciVendor || device.class_code != kPciClassDisplay) return false;
-  const AmdGpuInfo info = amd_gpu_identify(device.device_id);
-  return info.discrete && info.architecture == AmdGpuArchitecture::Polaris;
+  return static_cast<bool>(amd_secondary::engine_of(device.device_id));
 }
 
 AmdSecondaryGpu::AmdSecondaryGpu(const GpuContext& context) : context_(context) {
@@ -614,7 +835,10 @@ bool AmdSecondaryGpu::initialize() {
   return fail("built without TCOS_AMD_NATIVE: the display of a secondary AMD GPU is not driven");
 #else
   if (!context_.allocator || !context_.registers || !context_.pci) return fail("no allocator, register mapper or PCI bus");
-  if (!supports(context_.device)) return fail("not a Polaris-family GPU (DCE 11.2)");
+  bool harvesting = false;
+  const Optional<amd_secondary::Engine> engine = amd_secondary::engine_of(context_.device.device_id, &harvesting);
+  if (!engine) return fail("not a Polaris-family (DCE 11.2) or Vega 10/12/20 (DCE 12) GPU");
+  const bool dce12 = *engine == amd_secondary::Engine::Dce12;
   allocators::IAllocator& allocator = *context_.allocator;
   const IPciBus& pci = *context_.pci;
   const PciAddress address = context_.device.address;
@@ -624,12 +848,13 @@ bool AmdSecondaryGpu::initialize() {
   if (!(command & kMemorySpace)) pci.write32(address, kPciCommand, command | kMemorySpace);
   const uint64_t bar5 = pci.memory_bar(address, 5), bar0 = pci.memory_bar(address, 0);
   MmioRegion register_window, aperture_window;
-  if (!bar5 || !bar0 || !context_.registers->map_registers(bar5, kAmdGmc8RegisterBytes, &register_window)) return fail("BAR 5 not mapped");
+  if (!bar5 || !bar0 || !context_.registers->map_registers(bar5, dce12 ? amd_dce12::kRegisterBytes : kAmdGmc8RegisterBytes, &register_window)) return fail("BAR 5 not mapped");
   if (!context_.registers->map_registers(bar0, amd_secondary::kApertureBytes, &aperture_window) || aperture_window.length() < amd_secondary::kApertureBytes)
     return fail("BAR 0 not mapped");
   registers_ = UniquePointer<MmioVcnRegisters>::make(allocator, register_window);
   if (!registers_) return fail("out of memory");
-  if (registers_->read(AmdVbios::kBiosScratch7) == 0xFFFFFFFFu) return fail("the GPU does not answer (powered down?)");
+  if (registers_->read(dce12 ? amd_dce12::kNbioBase[2] + 0xC3 : AmdVbios::kBiosScratch7) == 0xFFFFFFFFu)    // (RCC_CONFIG_MEMSIZE on DCE 12)
+    return fail("the GPU does not answer (powered down?)");
   // The video BIOS: the firmware's copy in the ACPI VFCT table (what laptops with a discrete card use), the copy in video memory (only on a card
   // that was POSTed), the card's ROM through the SMC. (The ATRM method needs the AML interpreter and the expansion ROM a writable PCI bus: not here.)
   ByteBuffer vbios(allocator);
@@ -637,7 +862,7 @@ bool AmdSecondaryGpu::initialize() {
   AcpiTables tables(context_.st);
   if (context_.st && tables.initialize()) sources.vfct = tables.find("VFCT");
   sources.mapper = context_.registers;
-  sources.registers = registers_.get();
+  sources.registers = dce12 ? nullptr : registers_.get();     // (the copy in video memory and the ROM read use the Volcanic Islands registers: not for a Vega)
   sources.bar0_physical = bar0;
   sources.bar0_bytes = amd_secondary::kApertureBytes;
   sources.allocator = &allocator;
@@ -651,6 +876,8 @@ bool AmdSecondaryGpu::initialize() {
   in.allocator = &allocator;
   in.vbios = vbios.view();     // (copied by start())
   in.aperture = amd_secondary::bar_view(aperture_window);
+  in.engine = *engine;
+  in.pipe_harvesting = harvesting;
   return start_display(in);
 #endif
 }

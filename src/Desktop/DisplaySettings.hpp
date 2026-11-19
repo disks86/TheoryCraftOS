@@ -37,6 +37,14 @@
 //    a kept mode, another primary monitor or a monitor moved.
 // The monitors are moved with the pointer (drag in the picture), or with Ctrl+arrow in the picture, or with the Move commands of a monitor's
 // context menu (Menu key), which also has Make Primary.
+//
+// Graphics: on a laptop with a display switch (a mux: the built-in screen can be driven by the integrated or the discrete GPU), a group under the
+// lists says which GPU drives the built-in screen and offers the other one ("Use <GPU> for the Built-in Screen"). The button is unavailable, with
+// the reason under it, when the switch cannot be made now (the other GPU's driver cannot light the screen, a switch is already under way, ...). It
+// asks first, with Cancel as the default button, because the screen goes dark for a moment; then drawing stops (the pauser), the panel and its
+// monitor move (IBuiltInScreenSwitch), the monitors are made real on the new GPU (the applier) and drawing starts again. The line under the button
+// says how it went; a failure is also reported in an error notice (the switch was undone, or, if that failed too, that the screen may stay dark).
+// Switching back is the same button, which then names the first GPU.
 #pragma once
 #include "Desktop/StackPanel.hpp"
 #include "Gui/Controls/Button.hpp"
@@ -45,8 +53,10 @@
 #include "Gui/Controls/Label.hpp"
 #include "Gui/Controls/Panel.hpp"
 #include "Gui/MessageDialog.hpp"
+#include "Gui/NoticeDialog.hpp"
 #include "Gui/Windows/Frame.hpp"
 #include "Desktop/MonitorMap.hpp"
+#include "Hardware/GraphicsProcessingUnit/Multi/GpuMuxPanel.hpp"
 #include "Hardware/Monitor/SystemMonitors.hpp"
 
 namespace desktop {
@@ -54,6 +64,8 @@ namespace desktop {
 class DisplaySettings : public gui::Frame {
  public:
   static constexpr uint32_t kInfoLines = 5, kMaxResolutions = 64, kMaxRates = 16, kMaxScales = 8, kConfirmSeconds = 15, kMoreSeconds = 60;
+  // The window's height, and what the Graphics group adds to it (the group takes most of the free space under the lists first).
+  static constexpr uint32_t kHeight = 500, kGraphicsHeight = 104, kGraphicsSlack = 44;
 
   explicit DisplaySettings(allocators::IAllocator& allocator);
 
@@ -66,6 +78,13 @@ class DisplaySettings : public gui::Frame {
   // Where "keep these settings?" and "apply the changes?" are asked (nullptr: new settings are kept without asking, and closing drops what was
   // not applied). It must outlive the window.
   void set_confirm_dialog(gui::MessageDialog* dialog) { confirm_ = dialog; }
+  // A laptop's display switch for the built-in screen (nullptr: there is none, and the Graphics group is not shown). It must outlive the window.
+  void set_graphics_switch(hardware::IBuiltInScreenSwitch* graphics);
+  // How drawing is stopped while the built-in screen changes GPU (`stop` true) and started again (false). Without one nothing is stopped.
+  using Pauser = void (*)(void* context, bool stop);
+  void set_pauser(Pauser pauser, void* context) { pauser_ = pauser; pauser_context_ = context; }
+  // Where a switch that failed is reported (nullptr: only under the button). It must outlive the window.
+  void set_notice_dialog(gui::NoticeDialog* notices) { notices_ = notices; }
   // Fills the picture, the details and the lists from the monitors again (keeps the selection where it can).
   void refresh();
   // Called once a second (the desktop does): counts down the time left to answer the question about new settings.
@@ -92,6 +111,13 @@ class DisplaySettings : public gui::Frame {
   // What OK and Cancel do.
   void accept();
   void cancel();
+  // The Graphics group's button: asks whether to drive the built-in screen with the other GPU (without a confirm dialog, switches at once).
+  bool ask_switch_graphics();
+  // The switch itself (the answer to that question): false if it failed (and was undone where it could be).
+  bool switch_graphics();
+  bool graphics_shown() const { return graphics_switch_ != nullptr; }
+  // The side the button offers (the one not driving the screen).
+  hardware::GpuMuxTarget graphics_target() const { return graphics_target_; }
 
   const hardware::Monitor* selected_monitor() const;
   MonitorMap& map() { return map_; }
@@ -104,6 +130,9 @@ class DisplaySettings : public gui::Frame {
   gui::Button& ok_button() { return ok_button_; }
   gui::Button& cancel_button() { return cancel_button_; }
   gui::Button& restore_button() { return restore_button_; }
+  gui::Button& graphics_button() { return graphics_button_; }
+  gui::Label& graphics_line() { return graphics_line_; }
+  gui::Label& graphics_note() { return graphics_note_; }
   // The context menu of a monitor in the picture: Make Primary and the four Move commands.
   gui::ContextMenu& map_menu() { return map_menu_; }
 
@@ -128,6 +157,8 @@ class DisplaySettings : public gui::Frame {
   static void on_move_down(void* self, gui::Control&);
   static void on_map_menu_opening(void* self, gui::Control&);
   static void on_confirm_result(void* self, gui::Control&);
+  static void on_graphics(void* self, gui::Control&);
+  void update_graphics();            // the Graphics group, from the switch's state
   void show_keep_question();         // (again, with the seconds that are left)
   void fill_lists();                 // the three lists for the selected monitor (what is in use is chosen)
   void fill_dependent_lists();       // the refresh rates and scales for the resolution chosen in the first list
@@ -139,10 +170,19 @@ class DisplaySettings : public gui::Frame {
   Applier applier_ = nullptr;
   void* applier_context_ = nullptr;
   gui::MessageDialog* confirm_ = nullptr;
+  gui::NoticeDialog* notices_ = nullptr;
+  hardware::IBuiltInScreenSwitch* graphics_switch_ = nullptr;
+  Pauser pauser_ = nullptr;
+  void* pauser_context_ = nullptr;
   MonitorMap map_;
   StackColumn body_;       // top to bottom, the order Tab takes: the picture, the details, the lists, the buttons
   StackRow buttons_;       // left to right: Make Primary, Restore Previous, the space, OK, Cancel, Apply
   gui::Panel details_, settings_, resolution_row_, refresh_row_, scale_row_, filler_, spacer_, gap_a_, gap_b_, gap_c_;
+  gui::Panel graphics_, graphics_row_;   // the Graphics group, and the row its button is in (left aligned)
+  gui::Label graphics_heading_, graphics_line_, graphics_note_;
+  gui::Button graphics_button_;
+  hardware::GpuMuxTarget graphics_target_ = hardware::GpuMuxTarget::Discrete;
+  String graphics_result_;               // how the last switch went ("" before one)
   gui::ContextMenu map_menu_;
   gui::MenuItem *primary_item_ = nullptr, *move_items_[4] = {};
   gui::Label info_[kInfoLines];
@@ -159,7 +199,7 @@ class DisplaySettings : public gui::Frame {
   bool filling_ = false;
   hardware::SystemMonitors::State before_;     // while the keep question is open: what Revert puts back
   hardware::SystemMonitors::State previous_;   // what Restore Previous puts back
-  enum class Question : uint8_t { None, Keep, ApplyOnClose };
+  enum class Question : uint8_t { None, Keep, ApplyOnClose, SwitchGraphics };
   Question question_ = Question::None;
   bool close_when_kept_ = false;               // OK: the window closes once the new settings are kept
   bool asking_ = false;

@@ -410,6 +410,19 @@ void IntelHdaAudioDevice::silence_path() {
 
 bool IntelHdaAudioDevice::retarget() {
   kernel::ScopedMutex power(power_mutex_);
+  return retarget_locked();
+}
+
+bool IntelHdaAudioDevice::connections_changed() {
+  kernel::ScopedMutex power(power_mutex_);
+  bool ok = false;
+  if (power_state() == PowerState::Suspended) ok = resume_locked();   // (the resume reads the pins again: nothing more to do)
+  else if (power_state() == PowerState::Active) ok = retarget_locked();
+  if (ok) __atomic_add_fetch(&connection_changes_, 1, __ATOMIC_RELAXED);
+  return ok;
+}
+
+bool IntelHdaAudioDevice::retarget_locked() {
   if (!running_ || !regs_ || power_state() != PowerState::Active) return false;   // (a resume finds the pin again by itself)
   silence_path();
   path_length_ = 0;

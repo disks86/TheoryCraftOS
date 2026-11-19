@@ -65,7 +65,8 @@ class NvBar {
   NvBar& operator=(const NvBar&) = delete;
 
   // Builds both BARs' instance blocks and page directories and points the GPU at them (BAR2 first, as nouveau does). The sizes are
-  // the PCI BAR sizes (BAR1: resource 1, BAR2: resource 3). Fermi..Turing; Tesla's DMA-object BARs are not done (Unsupported).
+  // the PCI BAR sizes (BAR1: resource 1, BAR2: resource 3). Fermi..Ampere (GA10x as Turing: nouveau's ga102 uses tu102_bar and the GP100
+  // page table format); Tesla's DMA-object BARs and Ada and later are not done (Unsupported).
   [[nodiscard]] BarStatus init(uint64_t bar1_bytes, uint64_t bar2_bytes, uint64_t keep_linear_bytes = 0);
   // Turns the virtual BARs off again (bit 31 of the instance registers); BAR1 goes back to the firmware's linear mapping.
   void fini();

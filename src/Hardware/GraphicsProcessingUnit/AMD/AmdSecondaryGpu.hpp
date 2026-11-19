@@ -44,6 +44,29 @@
 //   - Drawing by the CPU through the memory BAR (FramebufferGpu); present() flushes the host data path. set_mode() programs another mode of
 //     the list on the same CRTC; shutdown() switches the output and CRTC off, power gates the CRTC and turns its PLL off.
 //
+// The discrete Vega GPUs (Vega 10, Vega 12, Vega 20: DCE 12.0 / 12.1) take a second path through the same steps, with the SOC15 registers and the ATOM firmware (format 2.1)
+// video BIOS, following amdgpu's display core (DC: dce120) where the legacy code has no Vega support (Engine::Dce12, amd_dce12 in AmdDce12.hpp):
+//
+//   - The POST as amdgpu_device_asic_init does it for GC 9.0 / 9.2 / 9.4.0 (amdgpu_atom_asic_init: ASIC_Init with firmware_info 3.1's boot-up engine and memory clocks, at the
+//     same offsets as the legacy table's defaults) when the BIOS scratch register 7, at the address firmware_info 3.1 gives (amdgpu_atomfirmware_scratch_regs_init), lacks
+//     ATOM_S7_ASIC_INIT_COMPLETE.
+//   - The memory: MMHUB's FB location and the NBIO's memory size (gmc_v9_0 / mmhub_v1_0), the system aperture, TLB, HDP, BIF and the display hub's AGP aperture
+//     (amd_dce12::program_memory). Vega 20 pipes that are fused off (CC_DC_PIPE_DIS) are skipped: the first good one is the CRTC.
+//   - The connectors from display_object_info_table 1.4 and gpio_pin_lut 2.1 (AtomConnectors), the DDC pads by the DCE 12 GPIO registers (AtomI2c::lookup_v21,
+//     amd_dce12::ddc_bus), DisplayPort through ProcessAuxChannelTransaction (AmdAux, the same parameters).
+//   - The display block's start as DC's dce110_link_encoder_hw_init: DIG1TransmitterControl 1.6 INIT for each DIG (no front end, four lanes), the back end's hot plug select,
+//     the hot plug pins on. No power gating (dce120 has it disabled).
+//   - The mode set in DC's order (dce110_apply_ctx_to_hw, dce110_enable_stream_timing, the front end, core_link_enable_stream): the safe watermarks, blank, SetPixelClock 1.7,
+//     SetCRTC_UsingDTDTiming 3 and the advanced request, EnableCRTC 1, the FMT block, the DMIF buffers, the plane (amd_dce12::Pipe), the DIG front end on the CRTC and the back
+//     end on it; then DIG1EncoderControl 1.5 (stream setup, panel mode for DisplayPort), the transmitter on, for DisplayPort the link trained (amd_dce12::DpSource) and the video
+//     on; unblank. HDMI and DVI are driven at 8 bits per colour (the deep colour DTO resync, dce112_program_pixel_clk_resync, is not ported).
+//   - Shutdown: DP video off, the sink to D3, the transmitter off, the front end let go, blank, the CRTC off, the plane off, the DMIF freed, the combo PHY PLL powered down
+//     (SetPixelClock with no CRTC, no clock and FORCE_PROG_PPLL, dce110_clock_source_power_down).
+//
+// The video BIOS of a Vega comes from the ACPI VFCT table only: the copy in video memory and the ROM read are written for the Volcanic Islands registers.
+// The DCN display of Navi and later (DCN 2.0+) is not covered: it needs the display mode library (DML) for every mode, other register sets (HUBP, DPP, MPC, OPTC), and on
+// DCN 2.1 and later the DMCUB microcontroller's firmware.
+//
 // Everything that writes to the card is built only with TCOS_AMD_NATIVE (off by default: none of it has run on a real card). Without it,
 // initialize() fails before touching the GPU, so the GpuPool gives the card the read-only probe (AmdGpuProbe) instead.
 //
@@ -56,6 +79,7 @@
 #include "Allocators/IAllocator.hpp"
 #include "Hardware/Clock/IClock.hpp"
 #include "Hardware/GraphicsProcessingUnit/AMD/AmdDce11.hpp"
+#include "Hardware/GraphicsProcessingUnit/AMD/AmdDce12.hpp"
 #include "Hardware/GraphicsProcessingUnit/AMD/AmdModeSet.hpp"
 #include "Hardware/GraphicsProcessingUnit/AMD/AmdMonitor.hpp"
 #include "Hardware/GraphicsProcessingUnit/AMD/AtomBios.hpp"
@@ -93,6 +117,12 @@ uint32_t edid_modes(ConstByteView edid, const ModeCheck* check, ArrayView<Mode> 
 uint32_t refresh_millihz(const CrtcMode& mode);
 // The mode to start in: the preferred one, else the one with the most pixels (then the highest refresh). Empty for an empty list.
 Optional<uint32_t> choose_mode(ArrayView<const Mode> modes);
+// The display engine of a GPU this driver drives: DCE 11.2 (Polaris 10/11/12, Vega M) or DCE 12 (Vega 10, Vega 12, Vega 20).
+enum class Engine : uint8_t { Dce11, Dce12 };
+// The engine of a discrete AMD GPU by its PCI device ID; empty for one this driver does not drive (an APU, Navi and later, unknown). `pipe_harvesting`: Vega 20, whose display
+// pipes may be fused off.
+Optional<Engine> engine_of(uint16_t device_id, bool* pipe_harvesting = nullptr);
+
 // A connector this driver lights: HDMI, DVI and DisplayPort (DIG outputs); not the internal panels (eDP, LVDS), not the analogue ones.
 bool drivable(AtomConnectors::Type type);
 // ATOM_ENCODER_MODE_* of a DIG output (false for any other connector).
@@ -110,6 +140,7 @@ enum class Status : uint8_t {
   NoConnectors,        // the video BIOS's object table lists none
   NoMonitor,           // no external connector has a monitor (no EDID)
   NoMode,              // a monitor, but none of its modes can be carried
+  NoPipe,              // every display pipe is fused off (Vega 20)
   ModeSet,             // a command table, the scanout or the link training failed (mode_stage() says which)
   NotRunning,
   BadIndex,
@@ -140,6 +171,8 @@ class Display {
     allocators::IAllocator* allocator = nullptr;
     ConstByteView vbios;                     // the card's video BIOS (copied by start())
     ByteView aperture;                       // the CPU's view of BAR 0 from offset 0, at least kApertureBytes
+    Engine engine = Engine::Dce11;
+    bool pipe_harvesting = false;            // DCE 12: read the pipe fuses (Vega 20)
   };
   struct LinkTraining {
     Dpcd::Capabilities caps;
@@ -171,7 +204,8 @@ class Display {
   uint32_t mode_count() const { return mode_count_; }
   const Mode* mode(uint32_t index) const { return index < mode_count_ ? &modes_[index] : nullptr; }
   uint32_t current_mode() const { return current_; }
-  uint8_t crtc() const { return kCrtc; }
+  uint8_t crtc() const { return crtc_; }
+  Engine engine() const { return in_.engine; }
   uint8_t pll() const { return pll_; }
   uint32_t bpc() const { return bpc_; }
   ModeStage mode_stage() const { return stage_; }
@@ -190,7 +224,6 @@ class Display {
   Status last_status() const { return last_; }
 
  private:
-  static constexpr uint8_t kCrtc = 0;
   class Host;
   Status fail(Status status, const char* why);
   bool init_display_block();
@@ -201,6 +234,13 @@ class Display {
   bool plane_surface(const CrtcMode& mode);
   void update_watermarks();
   uint32_t default_clock_10khz(uint32_t offset);
+  // DCE 12
+  bool scratch_start(uint32_t* scratch);
+  bool init_display_block12();
+  bool read_ddc12(const AtomConnectors::Connector& connector, ByteBuffer* edid);
+  ModeStage program12(const AtomConnectors::Connector& connector, const CrtcMode& mode);
+  void disable12(const AtomConnectors::Connector& connector);
+  amd_dce12::CommandTables::Transmitter transmitter12(const AtomConnectors::Connector& connector, uint8_t action, uint8_t encoder_mode) const;
 
   Inputs in_;
   UniquePointer<ByteBuffer> vbios_;
@@ -226,6 +266,8 @@ class Display {
   bool running_ = false;
   bool posted_ = false;
   bool hpd_on_ = false;
+  uint8_t crtc_ = 0;                         // the CRTC (pipe) driven: 0, or on DCE 12 the first one not fused off
+  amd_dce12::MemoryMap map12_;
   amd_dce11::ScanoutSurface surface_;
   ByteView pixels_;
   amd_dce11::WatermarkHead heads_[amd_dce11::kMaxCrtcs];
@@ -243,7 +285,7 @@ class Display {
 class AmdSecondaryGpu final : public FramebufferGpu, public IMonitorSource {
  public:
   static constexpr uint16_t kPciVendor = 0x1002;
-  // A discrete Polaris-family GPU (Polaris 10/11/12, Vega M): the DCE 11.2 display this driver sets modes on.
+  // A discrete Polaris-family GPU (Polaris 10/11/12, Vega M: DCE 11.2) or a discrete Vega 10, 12 or 20 (DCE 12): the displays this driver sets modes on.
   static bool supports(const PciDeviceInfo& device);
 
   explicit AmdSecondaryGpu(const GpuContext& context);

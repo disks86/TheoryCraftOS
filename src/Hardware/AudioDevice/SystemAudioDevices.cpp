@@ -195,21 +195,28 @@ void SystemAudioDevices::service_power(uint64_t now_ms) {
   for (IntelHdaAudioDevice* hda : controllers.view()) hda->service(now_ms);
 }
 
-bool SystemAudioDevices::attach_power_observer(PciAddress function, IPciFunctionPowerObserver* observer, uint32_t idle_ms) {
-  SharedPointer<IAudioDevice> keep;
-  IntelHdaAudioDevice* hda = nullptr;
-  {
-    kernel::ScopedMutex guard(mutex_);
-    for (const Entry& e : devices_.view()) {
-      if (!e.hda) continue;
-      const PciAddress a = e.hda->pci_address();
-      if (a.bus == function.bus && a.device == function.device && a.function == function.function) {
-        keep = e.device;
-        hda = e.hda;
-        break;
-      }
+IntelHdaAudioDevice* SystemAudioDevices::find_hda(PciAddress function, SharedPointer<IAudioDevice>* keep) const {
+  kernel::ScopedMutex guard(mutex_);
+  for (const Entry& e : devices_.view()) {
+    if (!e.hda) continue;
+    const PciAddress a = e.hda->pci_address();
+    if (a.bus == function.bus && a.device == function.device && a.function == function.function) {
+      *keep = e.device;
+      return e.hda;
     }
   }
+  return nullptr;
+}
+
+bool SystemAudioDevices::connections_changed(PciAddress function) {
+  SharedPointer<IAudioDevice> keep;
+  IntelHdaAudioDevice* hda = find_hda(function, &keep);
+  return hda && hda->connections_changed();   // (outside the lock: a resume waits for the GPU)
+}
+
+bool SystemAudioDevices::attach_power_observer(PciAddress function, IPciFunctionPowerObserver* observer, uint32_t idle_ms) {
+  SharedPointer<IAudioDevice> keep;
+  IntelHdaAudioDevice* hda = find_hda(function, &keep);
   if (!hda) return false;
   hda->set_power_observer(observer, idle_ms);   // (outside the lock: it may tell the observer at once)
   return true;

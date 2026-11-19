@@ -232,6 +232,8 @@ Desktop::Desktop(allocators::IAllocator& allocator, graphics::IRenderer2D& rende
   window_.show_cursor(mouse != nullptr);
   display_settings_.set_applier(&Desktop::apply_changes_thunk, this);
   display_settings_.set_confirm_dialog(&display_confirm_dialog_);
+  display_settings_.set_pauser(&Desktop::pause_drawing_thunk, this);
+  display_settings_.set_notice_dialog(&notice_dialog_);
   computer_manager_.on_open_display_settings({&Desktop::on_display_settings, this});
   computer_manager_.on_open_network_properties({&Desktop::on_network_properties, this});
   computer_manager_.on_open_wireless_properties({&Desktop::on_wireless_properties, this});
@@ -1203,6 +1205,17 @@ void Desktop::on_explorer_properties(void* self, Control& sender) {
 
 void Desktop::on_display_settings(void* self, Control&) { static_cast<Desktop*>(self)->open_display_settings(); }
 bool Desktop::apply_changes_thunk(void* self) { return static_cast<Desktop*>(self)->apply_monitor_changes(); }
+
+void Desktop::pause_drawing_thunk(void* self, bool stop) {
+  auto* d = static_cast<Desktop*>(self);
+  if (stop) {
+    d->drawing_paused_ = d->render_loop_.running();
+    if (d->drawing_paused_) d->render_loop_.stop();
+  } else if (d->drawing_paused_) {
+    d->drawing_paused_ = false;
+    d->render_loop_.start();
+  }
+}
 
 // --- Monitors ---------------------------------------------------------------------------------------
 

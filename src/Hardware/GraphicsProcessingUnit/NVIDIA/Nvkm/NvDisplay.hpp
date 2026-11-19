@@ -28,8 +28,9 @@
 //   Tesla (NV50..GT21x and GF100..GF110, class 507d family): core channel; a head's surface is a core channel method.
 //   GF119..Pascal (907d family): the same with other method numbers and a linear readback of the armed state at 0x640000.
 //   Volta/Turing (c37d/c57d + c37e/c57e): the surface belongs to a window channel owned by a head; the core channel does the rest.
-//   Ampere and later: the display is run by the GSP firmware here (nouveau programs GA102's display directly, but this driver does not
-//   yet): refused.
+//   GA102..GA107 (c67d + c67e): Turing's channels and registers (nouveau's ga102_disp is tu102_disp_init + gv100's channels, without GSP),
+//   other SOR link and clock registers (NvDisplayMode). Driven only from scratch (NvidiaSecondaryGpu): the takeover refuses it.
+//   Ada and later: nouveau has no GSP-less display path for them (ad102 is r535-only): refused.
 //
 // Taking over (claim) follows *_disp_init: the capability mirrors, the handshake that takes the display from the VBIOS, the instance memory
 // with the RAMHT and the context DMAs, the core channel (and on Volta+ the window channel that shows the firmware's picture), no interrupts
@@ -54,7 +55,8 @@ enum class DisplayClass : uint8_t {
   Gf119,      // 907d family: GF119/GF117, Kepler, Maxwell, Pascal
   Gv100,      // c37d + c37e
   Tu102,      // c57d + c57e
-  Gsp,        // Ampere and later: refused
+  Ga102,      // c67d + c67e: GA102..GA107 (GA100 has no display)
+  Gsp,        // Ada and later (and Hopper/Blackwell): refused
 };
 DisplayClass display_class(const Chip& chip);
 const char* display_class_name(DisplayClass display_class);
@@ -62,7 +64,7 @@ const char* display_class_name(DisplayClass display_class);
 enum class DisplayStatus : uint8_t {
   Ok,
   NotNative,          // the chip's display is not one this driver programs (Chip::display_native false, unknown family)
-  NeedsGsp,           // Ampere and later
+  NeedsGsp,           // Ada and later (and the takeover on GA102)
   NoHeads,            // the display reports no heads
   NoMemory,           // instance memory, push buffer, notifier or framebuffer could not be had (or the CPU cannot see it)
   OwnershipTimeout,   // the VBIOS did not let go of the display
@@ -168,6 +170,13 @@ class NvDisplayEngine {
   void set_poller(IDisplayPoller* poller) { poller_ = poller; }
   // Sends methods on the core channel without an UPDATE (completion is waited for: GET reaches PUT).
   [[nodiscard]] DisplayStatus core_send(const MethodList& methods);
+  // Volta+: `methods` on the window channel claim() brought up, an UPDATE (not interlocked with the core) and its notifier.
+  [[nodiscard]] DisplayStatus window_update(const MethodList& methods);
+  // Volta+: `methods` and an UPDATE on that window's immediate channel (c37b; brought up on first use, no notifier: GET reaching PUT).
+  [[nodiscard]] DisplayStatus window_immediate_update(const MethodList& methods);
+  // Volta+: the window claim() brought up (-1 before Volta or before claim).
+  int32_t claimed_window() const { return window_.up ? static_cast<int32_t>(window_.window) : -1; }
+  bool volta_or_later() const { return !pre_volta(); }
 
   // Stops the channels (nouveau's *_fini), leaving the armed state on the screen. Called by the destructor.
   void shutdown();
@@ -200,6 +209,8 @@ class NvDisplayEngine {
   [[nodiscard]] bool ramht_insert(uint32_t chid, uint32_t handle, uint32_t object_offset);
   DisplayStatus start_core();
   DisplayStatus start_window(uint32_t window);
+  DisplayStatus start_window_immediate();
+  uint32_t ramht_bytes() const { return pre_volta() ? 0x1000u : 0x2000u; }
   void stop_channel(Channel& channel);
   DisplayStatus submit(Channel& channel, const MethodList& methods);
   DisplayStatus update(Channel& channel, const MethodList& methods, bool window);
@@ -221,6 +232,7 @@ class NvDisplayEngine {
   uint32_t instance_used_ = 0;      // bytes of the instance memory given out (the RAMHT first)
   Channel core_;
   Channel window_;
+  Channel wimm_;                    // the window's immediate channel (Volta+, mode setting only)
   IDisplayPoller* poller_ = nullptr;
   const char* reason_ = "not probed";
 };

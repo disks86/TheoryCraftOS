@@ -47,18 +47,25 @@ static void test_classes() {
   CHECK(display_class(chip_of(Family::Pascal, 0x132)) == DisplayClass::Gf119);
   CHECK(display_class(chip_of(Family::Volta, 0x140)) == DisplayClass::Gv100);
   CHECK(display_class(chip_of(Family::Turing, 0x162)) == DisplayClass::Tu102);
-  CHECK(display_class(chip_of(Family::Ampere, 0x172)) == DisplayClass::Gsp);
+  CHECK(display_class(chip_of(Family::Ampere, 0x172)) == DisplayClass::Ga102);   // GA102..GA107: nouveau's GSP-less ga102_disp
+  CHECK(display_class(chip_of(Family::Ampere, 0x177)) == DisplayClass::Ga102);
+  CHECK(display_class(chip_of(Family::Ampere, 0x170)) == DisplayClass::Gsp);     // GA100: no display
+  CHECK(display_class(chip_of(Family::Ada, 0x192)) == DisplayClass::Gsp);        // AD10x: GSP only in nouveau
   CHECK(display_class(chip_of(Family::Nv40, 0x40)) == DisplayClass::None);
 
-  // Ampere: refused before a register is touched
+  // Ampere: the takeover refused before a register is touched (GA102 is set up from scratch only); Ada: the GSP's
   FakeMemory mem;
-  Model model(DisplayClass::Gf119, mem);
+  Model model(DisplayClass::Ga102, mem);
   Firmware fw;
   NvNativeDisplay ampere(model, mem, chip_of(Family::Ampere, 0x172), kQuick);
   ByteView view;
   CHECK(!ampere.engage_display(fw.fb(), &view));
   CHECK(strstr(ampere.display_status(), "GSP") != nullptr);
   CHECK(model.writes.empty());
+  NvNativeDisplay ada(model, mem, chip_of(Family::Ada, 0x192), kQuick);
+  CHECK(!ada.engage_display(fw.fb(), &view) && strstr(ada.display_status(), "GSP") != nullptr && model.writes.empty());
+  NvDisplayEngine ga102(model, mem, chip_of(Family::Ampere, 0x174, false), kQuick);   // (Chip::display_native is false on GA10x: probed anyway)
+  CHECK(ga102.probe() == DisplayStatus::Ok && ga102.display_class() == DisplayClass::Ga102 && ga102.head_count() == 4 && model.writes.empty());
   // a chip whose display the chip table says is not native
   NvNativeDisplay off(model, mem, chip_of(Family::Kepler, 0xe4, false), kQuick);
   CHECK(!off.engage_display(fw.fb(), &view) && model.writes.empty());
@@ -432,12 +439,124 @@ static void test_modeset_tmds() {
   req.depth_bpp = 24;
   req.surface.width = 1280;
   CHECK(setter.set_mode(req) == DisplayStatus::UnsupportedSurface);
-  // Volta and NV50 mode setting is not done
-  Model volta(DisplayClass::Gv100, mem);
-  NvDisplayEngine ve(volta, mem, chip_of(Family::Volta, 0x140), kQuick);
-  CHECK(ve.probe() == DisplayStatus::Ok);
-  NvModeSetter vs(ve, &clock, nullptr, nullptr);
-  CHECK(vs.set_mode(req) == DisplayStatus::NotImplemented);
+  // NV50 mode setting is not done
+  FakeMemory nv50_mem;
+  Model nv50(DisplayClass::Nv50, nv50_mem);
+  NvDisplayEngine ne(nv50, nv50_mem, chip_of(Family::Tesla, 0x50), kQuick);
+  CHECK(ne.probe() == DisplayStatus::Ok);
+  NvModeSetter ns(ne, &clock, nullptr, nullptr);
+  CHECK(ns.set_mode(req) == DisplayStatus::NotImplemented && nv50.writes.empty());
+}
+
+// Volta, Turing and GA102 from scratch: the core methods at the c37d offsets (head 1 at 0x2400), the windows' owners and usage bounds, the
+// supervisor at 0x611c30 / 0x6107a8, then the image on window 2 (head 1's first) and its immediate channel; disable takes it all off again.
+static void test_modeset_window_classes(DisplayClass cls, Family family, uint32_t chipset) {
+  FakeMemory mem;
+  Model model(cls, mem);
+  NvDisplayEngine engine(model, mem, chip_of(family, chipset, family != Family::Ampere), kQuick);
+  CHECK(engine.probe() == DisplayStatus::Ok && engine.display_class() == cls);
+  Clock clock;
+  NvModeSetter setter(engine, &clock, nullptr, nullptr);
+  NvModeSetter::Request req;
+  req.output.type = DcbOutputType::Tmds;
+  req.output.heads = 0x3;
+  req.output.or_mask = 0x2;
+  req.output.sorconf_link = 1;
+  req.head = 1;
+  req.timing = mode_1080p();
+  req.timing.hsync_negative = true;
+  req.surface.offset = 0x1000000;
+  req.surface.width = 1920;
+  req.surface.height = 1080;
+  req.surface.pitch_bytes = 7680;
+  req.surface.format = 0xe6;
+  req.surface.pitch_linear = true;
+  CHECK(setter.set_mode(req) == DisplayStatus::Ok);
+  CHECK(model.errors == 0);
+  CHECK(engine.claimed_window() == 2 && model.regs[0x610b00 + 3 * 0x10] == 0x11);   // window 2's channel (ctrl slot 3)
+  CHECK(model.regs[0x610b00 + (33 + 2) * 0x10] == 0x11 && (model.regs[0x610b24 + 35 * 0x10] & 3) == 1);   // its immediate channel
+  CHECK(setter.supervisor_stages() == 7 && model.super_acks == 3 && (model.regs[0x611c30] & 7) == 0 && model.regs[0x6107ac + 4] == 0);
+  CHECK(clock.calls.size() == 1 && clock.calls[0].first == 1 && clock.calls[0].second == 148500);
+  const bool c37d = cls == DisplayClass::Gv100;
+  const uint32_t h = 0x400;
+  CHECK(model.core.arm[0x0300 + 0x20] == (0x2u | 0x1u << 8));                 // SOR 1: head 1, TMDS A
+  CHECK(model.core.arm[0x2004 + h] == (1u | 1u << 2 | 4u << 4));               // CRC complete, negative hsync, 24 bpp
+  CHECK(model.core.arm[0x2000 + h] == (c37d ? 0x4000u : 0u));                  // procamp: c37d's saturation, c57d+ none
+  CHECK(model.core.arm[0x2064 + h] == (1125u << 16 | 2200) && model.core.arm[0x2068 + h] == (4u << 16 | 43));
+  CHECK(model.core.arm[0x206c + h] == (40u << 16 | 191) && model.core.arm[0x2070 + h] == (1120u << 16 | 2111) && model.core.arm[0x2074 + h] == 1);
+  CHECK(model.core.arm[0x200c + h] == 148500000u && model.core.arm[0x2028 + h] == 148500000u);
+  CHECK(model.core.arm[0x2030 + h] == (c37d ? 0x124u : 0x1014u));
+  CHECK(model.core.arm[0x204c + h] == (1080u << 16 | 1920) && model.core.arm[0x205c + h] == (1080u << 16 | 1920) && model.core.arm[0x2060 + h] == (1080u << 16 | 1920));
+  for (uint32_t w = 0; w < 8; ++w) {
+    CHECK(model.core.arm[0x1000 + w * 0x80] == w / 2);
+    CHECK(model.core.arm[0x1004 + w * 0x80] == (c37d ? 0x1fu : 0x0fu) && model.core.arm[0x1010 + w * 0x80] == (c37d ? 0x00127fffu : 0x00117fffu));
+  }
+  // the window: present control, composition, the image; armed after the core's UPDATE
+  const Model::Chan& w = model.win[2];
+  CHECK(w.arm.at(0x0308) == 1 && w.arm.at(0x02ec) == 0xff0u && w.arm.at(0x02f0) == 0xffu && w.arm.at(0x02f4) == 0x4422u);
+  CHECK(w.arm.at(0x0224) == (1080u << 16 | 1920) && w.arm.at(0x0228) == 1u << 4 && w.arm.at(0x022c) == 0xe6u && w.arm.at(0x0230) == 7680u / 64);
+  CHECK(w.arm.at(0x0240) == 0xf0000001u && w.arm.at(0x0260) == 0x1000000u >> 8 && w.arm.at(0x0298) == (1080u << 16 | 1920));
+  CHECK(model.window_scanout[2] == 0x1000000);
+  CHECK(model.win[Model::kWimm + 2].updates == 1 && Model::has_method(model.win[Model::kWimm + 2], 0x0208, 0));
+  int core_update = -1, window_update = -1;
+  for (size_t i = 0; i < model.writes.size(); ++i) {
+    if (model.writes[i].first == 0x680000 && core_update < 0) core_update = static_cast<int>(i);
+    if (model.writes[i].first == 0x690000 + 2 * 0x1000) window_update = static_cast<int>(i);
+  }
+  CHECK(core_update >= 0 && window_update > core_update);                     // the window after the core
+  // the SOR's clock in supervisor 2.2: gf119_sor_clock before GA102, ga102_sor_clock (0x00ec00) on it
+  if (cls == DisplayClass::Ga102) CHECK(model.wrote(0x00ec04 + 0x10, 0) && model.wrote(0x00ec08 + 0x10, 0) && (model.regs[0x612300 + 0x800] & 0x007c0000) == 0);
+  else CHECK((model.regs[0x612300 + 0x800] & 0x007c0707) == 0x0au << 18);
+  // the RAMHT is 8 KiB: the window's context DMAs come after it
+  CHECK(engine.vram_handle() == 0xf0000001u);
+
+  // disable: the window's image off, the SOR let go through the supervisor
+  CHECK(setter.disable(1, 1) == DisplayStatus::Ok);
+  CHECK(model.win[2].arm.at(0x0240) == 0 && model.window_scanout[2] == 0 && model.core.arm[0x0300 + 0x20] == 0 && model.super_acks == 6);
+  CHECK(model.errors == 0);
+  // another head while window 2 is the one claimed: refused (one window channel)
+  req.head = 0;
+  req.output.heads = 0x1;
+  CHECK(setter.set_mode(req) == DisplayStatus::NotImplemented);
+  engine.shutdown();
+  CHECK((model.regs[0x610b00 + 35 * 0x10] & 3) == 0 && (model.regs[0x610b00 + 3 * 0x10] & 3) == 0);   // both window channels stopped
+}
+
+// The per-class SOR DP registers: lane order, TX_PU width, Turing's link enables, GA102's rate index.
+static void test_sor_variants() {
+  Sink sink;
+  Dpcd::Capabilities caps;
+  CHECK(Dpcd::read_capabilities(sink, false, &caps));
+  DcbOutput dp;
+  dp.type = DcbOutputType::Dp;
+  CHECK(sor_variant(DisplayClass::Gf119) == SorVariant::Gf119 && sor_variant(DisplayClass::Gv100) == SorVariant::Gv100);
+  CHECK(sor_variant(DisplayClass::Tu102) == SorVariant::Tu102 && sor_variant(DisplayClass::Ga102) == SorVariant::Ga102);
+  CHECK(ga102_link_rate_index(0x06) && *ga102_link_rate_index(0x06) == 0 && *ga102_link_rate_index(0x14) == 2 && *ga102_link_rate_index(0x1e) == 3);
+  CHECK(*ga102_link_rate_index(0x0c) == 6 && !ga102_link_rate_index(0x0b));
+  for (const SorVariant v : {SorVariant::Gf119, SorVariant::Gv100, SorVariant::Tu102, SorVariant::Ga102}) {
+    FakeMemory mem;
+    Model model(v == SorVariant::Gf119 ? DisplayClass::Gf119 : DisplayClass::Tu102, mem);
+    NvSorDp sor(model, 1, 1, placeholder_dp_drive_table(), kQuick, v);
+    const DpTrainResult r = train_dp_link(sink, sor, caps, dp, 148500ull * 3);
+    CHECK(r.trained && r.bandwidth_code == 0x14 && r.lanes == 4);
+    const uint32_t clk = model.regs[0x612300 + 0x800];
+    CHECK(((clk >> 18) & 0x1f) == (v == SorVariant::Ga102 ? 2u : 0x14u));          // GA102: HBR2 is index 2
+    const bool tu = v == SorVariant::Tu102 || v == SorVariant::Ga102;
+    CHECK(((clk & 0x30000) == 0x10000) == tu && ((model.regs[0x61c10c + 0x800] & 3) == 1) == tu);
+    CHECK((model.regs[0x61c10c + 0x800] & 0x001f0000) == 0x000f0000);
+    // lane 0's drive: byte 2 on GF119 (lanes 2,1,0,3), byte 0 from GM200 on; TX_PU 8 bits / 4 bits
+    const uint32_t current = model.regs[0x61c118 + 0x800], enable = model.regs[0x61c130 + 0x800];
+    CHECK(current != 0);
+    CHECK((enable & 0xf) == 0xf);                                                   // all four lanes powered
+    if (v == SorVariant::Gf119) CHECK((enable & 0xff00) != 0 && (enable & 0xff00) > 0x0f00);
+    else CHECK((enable & 0xf000) == 0);
+  }
+  // GA102 refuses a rate it has no index for (the trainer then goes on to the next)
+  FakeMemory mem;
+  Model model(DisplayClass::Ga102, mem);
+  NvSorDp sor(model, 0, 1, placeholder_dp_drive_table(), kQuick, SorVariant::Ga102);
+  CHECK(!sor.set_link(0x0b, 4, false) && sor.set_link(0x0a, 2, true) && sor.bandwidth_code() == 0x0a);
+  CHECK(((model.regs[0x612300] >> 18) & 0x1f) == 1);
 }
 
 static void test_dp_training_fallback() {
@@ -537,6 +656,10 @@ int main() {
   test_nv50_takeover();
   test_volta_turing(DisplayClass::Gv100, Family::Volta, 0x140);
   test_volta_turing(DisplayClass::Tu102, Family::Turing, 0x164);
+  test_modeset_window_classes(DisplayClass::Gv100, Family::Volta, 0x140);
+  test_modeset_window_classes(DisplayClass::Tu102, Family::Turing, 0x164);
+  test_modeset_window_classes(DisplayClass::Ga102, Family::Ampere, 0x172);
+  test_sor_variants();
   test_timeouts();
   test_refusals();
   test_timings();

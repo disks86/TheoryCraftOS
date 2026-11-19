@@ -19,7 +19,9 @@
 // The display engine model of the NVIDIA display host tests (NvDisplayTest, NvidiaSecondaryGpuTest): registers (ownership handshake, channel
 // control, the user areas' PUT/GET, the readback of assembly and armed state, the supervisor) and memory (the model fetches the push buffers
 // from the fake video memory and decodes methods and data as EVO does, looks context DMA handles up through the RAMHT in the instance memory
-// and writes notifiers where the context DMA points); a pixel clock, a GPIO and a DisplayPort sink that record what they are asked. The
+// and writes notifiers where the context DMA points); on Volta+ (c37d/c57d/c67d) the window channels (chid 1 + w, user 0x690000 + w * 0x1000)
+// and their immediate channels (c37b: chid 33 + w, user 0x690000 + (32 + w) * 0x1000), the 8 KiB RAMHT and the supervisor at 0x611c30 /
+// 0x611860 / 0x6107ac / 0x6107a8; a pixel clock, a GPIO and a DisplayPort sink that record what they are asked. The
 // register and method numbers are typed in here separately from NvDisplayHw.hpp; both come from the same (remembered) nouveau sources, so
 // the model checks that the driver is consistent with itself and with nouveau's sequences, not that the numbers are right on hardware.
 #pragma once
@@ -85,7 +87,8 @@ struct Model final : INvRegisters {
     uint32_t updates = 0, jumps = 0;
   };
   Chan core;
-  Chan win[32];
+  Chan win[40];                           // 0..31 the window channels, 32 + w the window immediate channel of window w
+  static constexpr uint32_t kWimm = 32;
   // behaviour
   bool vbios_never_releases = false, never_start = false, never_fetch = false, never_notify = false, never_latch = false;
   bool supervisor = true;                 // GF119: a mode set UPDATE goes through supervisor stages 1..3
@@ -161,7 +164,7 @@ struct Model final : INvRegisters {
       if (off == 0x680004) return core.get;
       if (off >= 0x680000 && off < 0x688000) return value(core.assy, off - 0x680000);
       if (off >= 0x688000 && off < 0x690000) return value(core.arm, off - 0x688000);
-      if (off >= 0x690000 && off < 0x690000 + 32 * 0x1000) {
+      if (off >= 0x690000 && off < 0x690000 + 40 * 0x1000) {
         Chan& w = win[(off - 0x690000) / 0x1000];
         const uint32_t rel = off & 0xfff;
         if (rel == 0) return w.put;
@@ -200,7 +203,7 @@ struct Model final : INvRegisters {
       regs[off] = (v & 1) && !never_start ? ((v & ~0x30000u) | 0x10000) : v;
       return;
     }
-    if (!pre() && off > 0x610b00 && off < 0x610b00 + 33 * 0x10 && (off & 0xf) == 0) {
+    if (!pre() && off > 0x610b00 && off < 0x610b00 + 41 * 0x10 && (off & 0xf) == 0) {
       regs[off] = v;
       const uint32_t w = (off - 0x610b00) / 0x10 - 1;
       if (v == 0x11 && !never_start) regs[0x610664 + w * 4] = 0x40000;
@@ -215,26 +218,35 @@ struct Model final : INvRegisters {
       process(core, push_address(0), false, 0);
       return;
     }
-    if (!pre() && off == 0x680000) { core.put = v; process(core, push_address(0), false, 0); return; }
-    if (!pre() && off >= 0x690000 && off < 0x690000 + 32 * 0x1000 && (off & 0xfff) == 0) {
+    // (Volta+: PUT written while the channel is not enabled, as *_init does before starting it: the pointers start over, GET with PUT)
+    if (!pre() && off == 0x680000) {
+      if (!(regs[0x610b00] & 1)) { core.put = core.get = v; return; }
+      core.put = v;
+      process(core, push_address(0), false, 0);
+      return;
+    }
+    if (!pre() && off >= 0x690000 && off < 0x690000 + 40 * 0x1000 && (off & 0xfff) == 0) {
       const uint32_t w = (off - 0x690000) / 0x1000;
+      if (!(regs[0x610b00 + (1 + w) * 0x10] & 1)) { win[w].put = win[w].get = v; return; }
       win[w].put = v;
       process(win[w], push_address(1 + w), true, w);
       return;
     }
     // DP lane power: the change takes effect at once
     if (off >= 0x61c034 && off < 0x61c034 + 8 * 0x800 && (off - 0x61c034) % 0x800 == 0) { regs[off] = v & ~0x80000000u; return; }
-    // the supervisor's final handshake
-    if (cls == DisplayClass::Gf119 && off == 0x6101d0 && v == 0x80000000 && super_stage) {
+    // Volta+: the supervisor's pending bits are cleared through 0x611860
+    if (!pre() && off == 0x611860) { regs[0x611c30] &= ~(v & 7); return; }
+    // the supervisor's final handshake (GF119: 0x6101d0, its status 0x6100ac and masks 0x6101d4 + h * 0x800; Volta+: 0x6107a8, 0x611c30, 0x6107ac + h * 4)
+    if (((cls == DisplayClass::Gf119 && off == 0x6101d0) || (!pre() && off == 0x6107a8)) && v == 0x80000000 && super_stage) {
       ++super_acks;
       if (super_stage < 3) {
         ++super_stage;
-        regs[0x6100ac] |= 1u << (super_stage - 1);
-        for (uint32_t h = 0; h < 4; ++h) regs[0x6101d4 + h * 0x800] = pending_masks[h];
+        regs[pre() ? 0x6100ac : 0x611c30] |= 1u << (super_stage - 1);
+        for (uint32_t h = 0; h < 4; ++h) regs[mask_reg(h)] = pending_masks[h];
       } else {
         super_stage = 0;
         commit(core, false, 0);
-        if (super_commit_notify) notify_at(super_notify_at, false);
+        if (super_commit_notify) notify_at(super_notify_at, !pre());
       }
       return;
     }
@@ -242,6 +254,7 @@ struct Model final : INvRegisters {
   }
 
   uint32_t pending_masks[4] = {};
+  uint32_t mask_reg(uint32_t head) const { return pre() ? 0x6101d4 + head * 0x800 : 0x6107ac + head * 4; }
 
   uint64_t push_address(uint32_t chid) {
     uint32_t v = 0;
@@ -269,12 +282,13 @@ struct Model final : INvRegisters {
     uint64_t inst = 0;
     if (pre()) inst = uint64_t{regs[0x610010] & ~0xfu} << 8;
     else inst = uint64_t{regs[0x610014]} << 16;
+    const uint32_t bits = pre() ? 9 : 10, entries = 1u << bits;   // 4 KiB / 8 KiB of 8-byte entries
     uint32_t hash = 0;
-    for (uint32_t h = handle; h; h >>= 9) hash ^= h & 511;
-    hash ^= chid << 5;
-    hash &= 511;
-    for (uint32_t i = 0; i < 512; ++i) {
-      const uint32_t slot = (hash + i) & 511;
+    for (uint32_t h = handle; h; h >>= bits) hash ^= h & (entries - 1);
+    hash ^= chid << (bits - 4);
+    hash &= entries - 1;
+    for (uint32_t i = 0; i < entries; ++i) {
+      const uint32_t slot = (hash + i) & (entries - 1);
       const uint32_t hd = mem.rd(inst + slot * 8), ctx = mem.rd(inst + slot * 8 + 4);
       if (ctx == 0) return false;
       uint32_t c_chid = 0, object = 0;
@@ -317,9 +331,11 @@ struct Model final : INvRegisters {
         uint64_t start = 0, limit = 0;
         if (resolve(0, value(c.arm, iso_m), &start, &limit)) scanout[h] = start + (uint64_t{value(c.arm, off_m)} << 8);
       }
-    } else {
+    } else if (w < kWimm) {
       uint64_t start = 0, limit = 0;
-      if (resolve(1 + w, value(c.arm, 0x240), &start, &limit)) window_scanout[w] = start + (uint64_t{value(c.arm, 0x260)} << 8);
+      const uint32_t iso = value(c.arm, 0x240);
+      if (iso == 0) window_scanout[w] = 0;    // (no image: the window shows nothing)
+      else if (resolve(1 + w, iso, &start, &limit)) window_scanout[w] = start + (uint64_t{value(c.arm, 0x260)} << 8);
     }
   }
 
@@ -332,28 +348,30 @@ struct Model final : INvRegisters {
     uint32_t offset = 0, handle = 0;
     if (pre()) { notify = value(c.assy, 0x84) & 0x80000000; offset = value(c.assy, 0x84) & 0xffc; handle = value(c.assy, 0x88); }
     else if (!window) { notify = value(c.assy, 0x20c) & 0x1000; offset = value(c.assy, 0x20c) & 0xff0; handle = value(c.assy, 0x208); }
-    else { handle = value(c.assy, 0x21c); notify = handle != 0; offset = value(c.assy, 0x220) & 0xff0; }
+    else if (w < kWimm) { handle = value(c.assy, 0x21c); notify = handle != 0; offset = value(c.assy, 0x220) & 0xff0; }
     uint64_t at = 0;
     if (notify) {
       uint64_t start = 0, limit = 0;
       if (!resolve(window ? 1 + w : 0, handle, &start, &limit) || start + offset + 16 > limit + 1) { ++errors; notify = false; }
       else at = start + offset;
     }
-    // GF119: a change of the raster, the clock or an OR goes through the supervisor
-    if (cls == DisplayClass::Gf119 && supervisor && !window) {
+    // GF119 and Volta+: a change of the raster, the clock or an OR goes through the supervisor
+    if ((cls == DisplayClass::Gf119 || !pre()) && supervisor && !window) {
       bool modeset = false;
+      const uint32_t raster_m = pre() ? 0x414 : 0x2064, clock_m = pre() ? 0x450 : 0x200c, stride = pre() ? 0x300 : 0x400;
+      const uint32_t sor_m = pre() ? 0x200 : 0x300;
       for (uint32_t h = 0; h < 4; ++h) {
         pending_masks[h] = 0;
-        const uint32_t b = h * 0x300;
-        const bool raster = value(c.assy, 0x414 + b) != value(c.arm, 0x414 + b);
-        const bool clock = value(c.assy, 0x450 + b) != value(c.arm, 0x450 + b);
+        const uint32_t b = h * stride;
+        const bool raster = value(c.assy, raster_m + b) != value(c.arm, raster_m + b);
+        const bool clock = value(c.assy, clock_m + b) != value(c.arm, clock_m + b);
         if (raster || clock) { pending_masks[h] = 0x1000 | (clock ? 0x10000 : 0); modeset = true; }
       }
-      for (uint32_t s = 0; s < 4; ++s) modeset |= value(c.assy, 0x200 + s * 0x20) != value(c.arm, 0x200 + s * 0x20);
+      for (uint32_t s = 0; s < 4; ++s) modeset |= value(c.assy, sor_m + s * 0x20) != value(c.arm, sor_m + s * 0x20);
       if (modeset) {
         super_stage = 1;
-        regs[0x6100ac] |= 1;
-        for (uint32_t h = 0; h < 4; ++h) regs[0x6101d4 + h * 0x800] = pending_masks[h];
+        regs[pre() ? 0x6100ac : 0x611c30] |= 1;
+        for (uint32_t h = 0; h < 4; ++h) regs[mask_reg(h)] = pending_masks[h];
         super_commit_notify = notify;
         super_notify_at = at;
         return;

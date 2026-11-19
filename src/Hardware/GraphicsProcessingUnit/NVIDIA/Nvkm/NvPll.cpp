@@ -552,6 +552,8 @@ NvPllFamily pll_family(const Chip& chip) {
   }
   if (chip.chipset >= 0xc0 && chip.chipset < 0x140) return NvPllFamily::Gf100;   // gf100, gm107, gm200 (Kepler to Pascal)
   if (chip.chipset == 0x140) return NvPllFamily::Gv100;
+  if (chip.family == Family::Turing) return NvPllFamily::Tu102;
+  if (chip.family == Family::Ampere && chip.chipset >= 0x172) return NvPllFamily::Ga100;   // (GA100 has no display)
   return NvPllFamily::None;
 }
 
@@ -562,6 +564,8 @@ const char* pll_family_name(NvPllFamily family) {
     case NvPllFamily::Gt215: return "gt215";
     case NvPllFamily::Gf100: return "gf100";
     case NvPllFamily::Gv100: return "gv100";
+    case NvPllFamily::Tu102: return "tu102";
+    case NvPllFamily::Ga100: return "ga100";
   }
   return "?";
 }
@@ -685,6 +689,26 @@ NvPllSetReport nv_pll_set(const NvPllSetInputs& in, uint32_t type, uint32_t khz)
       const uint32_t head = info.type - kPllVpll0;
       w.wr(0x00ef10 + head * 0x40, fn << 16);
       w.wr(0x00ef04 + head * 0x40, (p << 16) | (n << 8) | m);
+      rep.status = NvPllSetStatus::Ok;
+      return rep;
+    }
+    case NvPllFamily::Tu102: {
+      if (!is_vpll(info.type)) break;
+      const uint32_t head = info.type - kPllVpll0;
+      w.wr(0x00ef10 + head * 0x40, fn << 16);
+      w.wr(0x00ef04 + head * 0x40, (p << 16) | (n << 8) | m);
+      w.wr(0x00ef0c + head * 0x40, 0x00000900);     // "XXX" in nouveau
+      w.wr(0x00ef00 + head * 0x40, 0x02000014);
+      rep.status = NvPllSetStatus::Ok;
+      return rep;
+    }
+    case NvPllFamily::Ga100: {
+      if (!is_vpll(info.type)) break;
+      const uint32_t head = info.type - kPllVpll0;
+      w.wr(0x00ef00 + head * 0x40, 0x02080004);
+      w.wr(0x00ef18 + head * 0x40, (n << 16) | fn);
+      w.wr(0x00ef04 + head * 0x40, (p << 16) | m);
+      w.wr(0x00e9c0 + head * 0x04, 0x00000001);
       rep.status = NvPllSetStatus::Ok;
       return rep;
     }

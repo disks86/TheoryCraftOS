@@ -34,15 +34,18 @@
 //     object (scanout surface, push buffer, instance memory, notifier) is at BAR1 + its VRAM offset for the CPU. Not the legacy "BAR1 is
 //     linear while 0x001704 is invalid" state the boot display relies on: nothing proves a secondary GPU's BAR1 is in that state (its VBIOS or
 //     a previous driver may have left the virtual BAR on), whereas the page tables say exactly what BAR1 shows.
-//   - The mode set on the GF119..Pascal display (Nvkm/NvDisplayMode's NvModeSetter: head, SOR, raster, the supervisor polled), the head
-//     pointed at the surface, drawing through the CPU's view (FramebufferGpu).
+//   - The mode set (Nvkm/NvDisplayMode's NvModeSetter: head, SOR, raster, the supervisor polled) on the GF119..Pascal display (907d: the head
+//     pointed at the surface) and on Volta (c37d), Turing (c57d) and GA102..GA107 (c67d, which nouveau drives without GSP): the window
+//     channel of the head's first window shows the surface, its immediate channel places it; drawing through the CPU's view (FramebufferGpu).
+//     BAR1 on Volta/Turing/GA10x is the GP100 page-table format (GA10x: the Turing BAR and TLB registers, as nouveau's tu102_bar/ga100_vmm),
+//     and GA10x's VRAM size is ga102_ram_new's (probe_vram_display).
 //
 // Everything that writes to the card is built only with TCOS_NVIDIA_NATIVE (off by default: none of it has run on a real card). Without it
 // initialize() fails before touching the GPU, so the GpuPool gives it the read-only probe instead.
 //
 // The head's VPLL is set in supervisor 2.1 through Nvkm/NvPll (NvVpllClock: the VBIOS's PLL limits table, gf100_devinit_pll_set).
 //
-// Not done: Tesla (NV50 display, no virtual BAR here), Volta/Turing (their mode setting is not written), Ampere+ (GSP); the VBIOS IED scripts
+// Not done: Tesla (NV50 display, no virtual BAR here), Ada and later (nouveau drives them only through GSP); the VBIOS IED scripts
 // and DP drive levels (placeholders); HDMI infoframes/audio; several heads at once (the panel and an external monitor together); hot plug
 // re-routing (a monitor plugged in later is not lit until the driver is built again); the panel's own power sequence delays from the VBIOS
 // and its LVDS link scripts (an LVDS panel is set up by the mode methods alone, which real boards likely need the scripts for); a panel
@@ -156,7 +159,12 @@ class Bar1LinearVram final : public INvMemory {
 };
 
 // The heads' pixel clocks (nouveau: nvkm_devinit_pll_set(devinit, PLL_VPLL0 + head, khz)) through Nvkm/NvPll: the VBIOS's PLL limits, the
-// coefficients, the VPLL registers of the chip's family. Heads 0..3.
+// coefficients, the VPLL registers of the chip's family (gf100, gv100, tu102, ga100). Heads 0..3.
+//
+// Whether this driver sets modes from scratch on a display class (GF119, GV100, TU102, GA102), and why not in words.
+[[nodiscard]] bool sets_modes(DisplayClass display_class);
+const char* refusal(DisplayClass display_class);
+
 class NvVpllClock final : public INvPixelClock {
  public:
   NvVpllClock(ConstByteView bios_image, const Chip& chip, INvRegisters& registers) : bios_(bios_image), chip_(chip), r_(registers) {}
@@ -312,7 +320,8 @@ class NvidiaSecondaryGpu final : public FramebufferGpu, public IMonitorSource, p
 
   const char* name() const override { return name_[0] ? name_ : "NVIDIA GPU"; }
   // Without TCOS_NVIDIA_NATIVE: false at once (nothing touched). With it: the start, the output, BAR1 and the mode set; false (everything
-  // taken down) when the chip's display is not one this driver sets modes on, no monitor is on an output it drives, or the mode set fails.
+  // taken down) when the chip's display is not one this driver sets modes on (Tesla, Ada and later: nv::refusal), no monitor is on an output
+  // it drives, or the mode set fails.
   bool initialize() override;
   void shutdown() override;
   // Why initialize() failed, or "running".
@@ -372,6 +381,7 @@ class NvidiaSecondaryGpu final : public FramebufferGpu, public IMonitorSource, p
   // and asks for modes.
   mutable kernel::RecursiveMutex display_lock_;
   ByteView bar1_;                                  // the CPU's view of BAR1 (mapped once, at initialize)
+  nv::VramInfo vram_;                              // probe_vram_display's (at initialize)
 };
 
 }  // namespace hardware

@@ -126,6 +126,16 @@ class GpuManager {
 
   // What the machine runs on, for select(). Thread-safe.
   void set_power_status(PowerSource source, uint8_t battery_percent, bool battery_saver);
+  struct PowerStatus {
+    PowerSource source = PowerSource::Unknown;
+    uint8_t battery_percent = 100;
+    bool battery_saver = false;
+  };
+  // What set_power_status() said last (for policies that must not wake a GPU on a low battery, such as GpuHotplug's polling). Thread-safe.
+  PowerStatus power_status() const {
+    kernel::ScopedMutex g(lock_);
+    return PowerStatus{power_source_, battery_percent_, battery_saver_};
+  }
 
  private:
   struct Companions {

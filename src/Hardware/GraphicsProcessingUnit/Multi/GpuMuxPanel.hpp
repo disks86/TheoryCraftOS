@@ -23,9 +23,14 @@
 // GopPanelOutput is the integrated GPU's side when its driver is only the firmware's framebuffer (UEFI GOP, and the Intel/AMD boot display
 // drivers, which run on it): the firmware lit the panel at boot, and nothing here can light it again once it is let go. Letting it go writes
 // nothing (the integrated GPU's pipe keeps running; its picture just stops reaching the panel when the mux moves), but from then on
-// can_light_panel() is false, so the switch back to it is refused instead of leaving the panel dark.
+// can_light_panel() is false, so the switch back to it is refused instead of leaving the panel dark. An Intel integrated GPU with native mode
+// setting has a real one instead (IntelPanelOutput, Intel/IntelGpu.hpp), which can light the panel again.
+//
+// IBuiltInScreenSwitch is what a settings page sees of all this: which GPU drives the built-in screen, whether the other one can, and the switch,
+// which moves the desktop's monitor of the panel along (GpuMuxDesktop, Multi/GpuMuxSwitch.hpp).
 #pragma once
 #include <stdint.h>
+#include "Hardware/GraphicsProcessingUnit/Multi/GpuPlatformPower.hpp"
 
 namespace hardware {
 
@@ -76,11 +81,35 @@ class GopPanelOutput final : public IPanelOutput {
   [[nodiscard]] PanelLightStatus light_panel() override { return lit_ ? PanelLightStatus::Ok : PanelLightStatus::NotSupported; }
   void release_panel() override { lit_ = false; }
   const char* panel_status() const override {
-    return lit_ ? "lit by the firmware" : "let go: the firmware's framebuffer cannot light the panel again (until a restart)";
+    return lit_ ? "lit by the firmware" : "the firmware's picture cannot be brought back to the built-in screen until the computer restarts";
   }
 
  private:
   bool lit_;
+};
+
+// The display switch as a settings page uses it (see the file comment). Thread-safety: the implementation's; GpuMuxDesktop's calls may come from any
+// thread, but the monitors it moves are the desktop's, so switch_to() is called where the desktop changes its monitors (its settings page).
+class IBuiltInScreenSwitch {
+ public:
+  struct Result {
+    bool ok = false;
+    bool rolled_back = true;   // after a failure: the screen is back where it was (false: it may be dark, and where it is is not known)
+    const char* reason = "";   // why it failed, a phrase in the user's words ("that GPU would not wake")
+  };
+  // The GPU that drives the built-in screen now; false when that is not known (an earlier switch could not be undone).
+  [[nodiscard]] virtual bool active(GpuMuxTarget* out) const = 0;
+  // The name of one side's GPU (its driver's), for the page.
+  virtual const char* gpu_name(GpuMuxTarget side) const = 0;
+  // Whether switch_to(side) would be tried now; `why` (may be null) gets the reason when not.
+  [[nodiscard]] virtual bool can_switch_to(GpuMuxTarget side, const char** why) const = 0;
+  // Moves the built-in panel to that side's GPU, and the desktop's monitor of it along. The caller then makes the monitors real (applies them and
+  // rebuilds what draws the desktop) while nothing draws, and switches back if that fails.
+  [[nodiscard]] virtual Result switch_to(GpuMuxTarget side) = 0;
+
+ protected:
+  IBuiltInScreenSwitch() = default;
+  ~IBuiltInScreenSwitch() = default;
 };
 
 }  // namespace hardware

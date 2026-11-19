@@ -16,15 +16,22 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-// Full mode setting on one head and one SOR (milestone B), for the GF119..Pascal display (907d): the timings as nouveau's
-// nv50_head_atomic_check_mode turns a DRM mode into raster values, the SOR picked from the DCB output (OR mask, heads, link), the core
-// channel methods of head907d.c/sor907d.c, the supervisor the UPDATE raises (polled: the VPLL through INvPixelClock in 2.1, the RG divider,
-// the SOR clock and the DP transfer unit in 2.2), DisplayPort link training with nouveau's fallback from the fastest link configuration
-// down (nvkm/engine/disp/dp.c) over the shared DpLinkTrainer, and the panel power of LVDS/eDP through a GPIO callback.
+// Full mode setting on one head and one SOR (milestone B): the timings as nouveau's nv50_head_atomic_check_mode turns a DRM mode into raster
+// values, the SOR picked from the DCB output (OR mask, heads, link), the supervisor the UPDATE raises (polled: the VPLL through INvPixelClock
+// in 2.1, the RG divider, the SOR clock and the DP transfer unit in 2.2), DisplayPort link training with nouveau's fallback from the fastest
+// link configuration down (nvkm/engine/disp/dp.c) over the shared DpLinkTrainer, and the panel power of LVDS/eDP through a GPIO callback.
 //
-// Not done (and refused with NotImplemented): NV50 and Volta/Turing mode setting (their method numbers for the raster are in NvDisplayHw.hpp,
-// but their supervisors and Volta's window usage bounds are not written), the VBIOS IED scripts nouveau runs in supervisor 2.x (some boards
-// need them for TMDS/DP: the VBIOS parser does not expose them yet), HDMI infoframes/audio, MST, DSC.
+//   GF119..Pascal (907d): the core channel methods of head907d.c / sor907d.c, the head's surface a core channel method.
+//   Volta (c37d), Turing (c57d), GA102..GA107 (c67d, nouveau's corec57d/headc57d/wndwc67e): the core channel methods of corec37d.c
+//   (window owners and usage bounds), sorc37d.c and headc37d.c/headc57d.c (output resource, raster, pixel clock, viewport, head usage
+//   bounds); the surface on the head's first window (window 2 * head, as corec37d_wndw_owner assigns them) through the window channel
+//   (wndwc37e: present control, composition, image) after the core's UPDATE, and the window's position through its immediate channel
+//   (wimmc37b). The supervisor at 0x611c30 / 0x6107a8 (gv100_disp_super). The SOR's DP side as gv100 / tu102 / ga102 differ
+//   (SorVariant: lane order, the TX_PU field, Turing's "XXX" link enable, GA102's link rate index and its SOR clock at 0x00ec00).
+//
+// Not done (and refused with NotImplemented): NV50 mode setting, the VBIOS IED scripts nouveau runs in supervisor 2.x (some boards need them
+// for TMDS/DP: the VBIOS parser does not expose them yet), HDMI infoframes/audio and HDMI 2.0 (TMDS is sent DVI-style on every class), MST,
+// DSC, a window interlocked with the core (the window follows the core's UPDATE), the cursor channel.
 #pragma once
 #include <stdint.h>
 #include "Hardware/GraphicsProcessingUnit/AMD/DpLinkTrain.hpp"
@@ -78,6 +85,14 @@ struct OutputRoute {
 // and its surface). `depth_bpp` 18, 24 or 30.
 [[nodiscard]] bool gf119_mode_methods(const NvDisplayEngine& engine, uint32_t head, const HeadRaster& raster, const OutputRoute& route, uint32_t depth_bpp,
                                       bool hsync_negative, bool vsync_negative, const ScanoutSurface& surface, MethodList* out);
+// The Volta+ (c37d / c57d / c67d) core channel methods of a full mode set: the windows' owners and usage bounds, SOR control, the head's
+// procamp, output resource, control, pixel clock (and its maximum), usage bounds, viewport and raster. No surface: that is the window's.
+[[nodiscard]] bool gv100_mode_methods(const NvDisplayEngine& engine, uint32_t head, const HeadRaster& raster, const OutputRoute& route, uint32_t depth_bpp,
+                                      bool hsync_negative, bool vsync_negative, MethodList* out);
+// The window channel methods that show `surface` on its head from scratch: present control, composition (opaque), the image.
+[[nodiscard]] bool gv100_window_methods(const NvDisplayEngine& engine, const ScanoutSurface& surface, MethodList* out);
+// The window a head's surface goes through when this code sets the mode (corec37d_wndw_owner: windows 2h and 2h + 1 belong to head h).
+inline uint32_t window_for_head(uint32_t head) { return head * 2; }
 
 // The display PLL of a head (nouveau: nvkm_devinit_pll_set(devinit, PLL_VPLL0 + head, khz)); the clock code implements it.
 class INvPixelClock {
@@ -111,11 +126,23 @@ struct DpDriveTable {
 // Placeholder values in the shape of a VBIOS table, NOT taken from any VBIOS: the VBIOS parser should supply the board's own (BIT 'd' table).
 const DpDriveTable& placeholder_dp_drive_table();
 
-// The DisplayPort side of a GF119..Pascal SOR (gf119_sor_dp_links / _pattern / _drive, g94_sor_dp_power), as DpLinkTrainer's source.
+// Which SOR the display has, for the DP and clock registers that moved:
+//   Gf119  GF119..Pascal: gf119_sor_dp_links, the lanes swizzled 2,1,0,3 (gf119_sor_dp), an 8-bit TX_PU, gf119_sor_clock
+//   Gv100  Volta: gf119_sor_dp_links, lanes 0..3 and a 4-bit TX_PU (gm200_sor_dp_drive), gf119_sor_clock
+//   Tu102  Turing: tu102_sor_dp_links (40 ms, then the link enables), otherwise as Gv100
+//   Ga102  GA102..GA107: ga102_sor_dp_links (the rate as an index), ga102_sor_clock (0x00ec00), otherwise as Tu102
+enum class SorVariant : uint8_t { Gf119, Gv100, Tu102, Ga102 };
+SorVariant sor_variant(DisplayClass display_class);
+// GA102's link rate index for a DP bandwidth code (0x06 RBR .. 0x1e HBR3, and the eDP rates 0x08, 0x09, 0x0c, 0x10); empty for another.
+Optional<uint32_t> ga102_link_rate_index(uint8_t bandwidth_code);
+
+// The DisplayPort side of a SOR (gf119/tu102/ga102_sor_dp_links, gm107_sor_dp_pattern, gf119/gm200_sor_dp_drive, g94_sor_dp_power), as
+// DpLinkTrainer's source.
 class NvSorDp final : public IDpSource {
  public:
-  NvSorDp(INvRegisters& registers, uint32_t sor, uint8_t link, const DpDriveTable& drive, const DisplayTimeouts& timeouts)
-      : r_(registers), sor_(sor), link_(link), drive_(drive), timeouts_(timeouts) {}
+  NvSorDp(INvRegisters& registers, uint32_t sor, uint8_t link, const DpDriveTable& drive, const DisplayTimeouts& timeouts,
+          SorVariant variant = SorVariant::Gf119)
+      : r_(registers), sor_(sor), link_(link), drive_(drive), timeouts_(timeouts), variant_(variant) {}
   // The link rate (bandwidth code), lanes and framing on the SOR, and the lanes powered.
   [[nodiscard]] bool set_link(uint8_t bandwidth_code, uint32_t lanes, bool enhanced_framing);
   bool start_training() override { return true; }
@@ -130,12 +157,14 @@ class NvSorDp final : public IDpSource {
  private:
   uint32_t sor_base() const { return sor_ * 0x800; }
   uint32_t link_base() const { return sor_base() + (link_ == 2 ? 0x80 : 0); }
+  uint32_t lane_byte(uint32_t lane) const;
 
   INvRegisters& r_;
   uint32_t sor_;
   uint8_t link_;
   const DpDriveTable& drive_;
   DisplayTimeouts timeouts_;
+  SorVariant variant_;
   uint32_t lanes_ = 0;
   uint8_t bw_ = 0;
   bool enhanced_ = false;
@@ -185,8 +214,9 @@ class NvModeSetter final : public IDisplayPoller {
       : engine_(engine), clock_(clock), gpio_(gpio), aux_(aux), drive_(drive ? *drive : placeholder_dp_drive_table()) {}
 
   [[nodiscard]] DisplayStatus set_mode(const Request& request);
-  // Blanks `head` and lets go of `sor` (nouveau's atomic disable: sor907d_ctrl with no owner, head907d_core_clr taking the surface away), an
-  // UPDATE through the supervisor (whose stages are acknowledged without touching clocks). GF119..Pascal; the display must be claimed.
+  // Blanks `head` and lets go of `sor` (nouveau's atomic disable: sor907d_ctrl with no owner, head907d_core_clr taking the surface away; on
+  // Volta+ the window's image cleared through the window channel first, then the SOR), an UPDATE through the supervisor (whose stages are
+  // acknowledged without touching clocks). The display must be claimed.
   [[nodiscard]] DisplayStatus disable(uint32_t head, uint32_t sor);
   const DpTrainResult& dp_result() const { return dp_; }
   uint32_t supervisor_stages() const { return stages_; }   // the stages (bit 0 = 1, bit 1 = 2, bit 2 = 3) handled during the last set_mode
@@ -197,6 +227,9 @@ class NvModeSetter final : public IDisplayPoller {
 
  private:
   void supervisor_2(uint32_t head_mask_bits[NvDisplayEngine::kMaxHeads]);
+  DisplayStatus set_mode_gv100(const Request& request, const HeadRaster& raster, const OutputRoute& route);
+  DisplayStatus disable_gv100(uint32_t head, uint32_t sor);
+  bool gv100() const { return engine_.volta_or_later(); }
 
   NvDisplayEngine& engine_;
   INvPixelClock* clock_;

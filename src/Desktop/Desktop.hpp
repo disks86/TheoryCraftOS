@@ -312,6 +312,9 @@ class Desktop {
   // The layout of `monitors` changed (a monitor came or went, or the order was changed): the taskbar, work areas and pointer limits are redone.
   void monitors_changed();
   DisplaySettings& display_settings() { return display_settings_; }
+  // A laptop's display switch for its built-in screen (nullptr: none), shown in Display Settings' Graphics group. It must outlive the desktop (or be
+  // set back to nullptr first).
+  void set_graphics_switch(hardware::IBuiltInScreenSwitch* graphics) { display_settings_.set_graphics_switch(graphics); }
   // Where the pointer is (window coordinates).
   gui::Point pointer() const { return input_.cursor(); }
   // The devices of the machine for the computer manager's Hardware tab (nullptr: none). It must outlive the desktop.
@@ -413,6 +416,7 @@ class Desktop {
   static void on_device_properties(void* self, gui::Control&);
   static void on_bluetooth_properties(void* self, gui::Control&);
   static bool apply_changes_thunk(void* self);
+  static void pause_drawing_thunk(void* self, bool stop);   // (Display Settings, while the built-in screen changes GPU)
   static void confine_pointer(void* self, int32_t* x, int32_t* y);
   static void on_shut_down(void* self, gui::Control&);
   static void on_shutdown_answer(void* self, gui::Control&);
@@ -580,6 +584,7 @@ class Desktop {
   bool scan_running_ = false, scan_again_ = false, scan_ready_ = false;
   bool reap_needed_ = false;
   hardware::SystemMonitors* monitors_ = nullptr;
+  bool drawing_paused_ = false;   // pause_drawing_thunk stopped the render loop (and starts it again)
   DisplayChanger changer_ = nullptr;
   void* changer_context_ = nullptr;
   bool taskbar_in_surface_ = false;

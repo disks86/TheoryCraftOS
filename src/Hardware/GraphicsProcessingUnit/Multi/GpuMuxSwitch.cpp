@@ -20,6 +20,7 @@
 // client's mode set, the handler's switchto, the old client powered off) with the rollback this OS adds for every step.
 #include "Hardware/GraphicsProcessingUnit/Multi/GpuMuxSwitch.hpp"
 #include "Hardware/GraphicsProcessingUnit/Multi/GpuManager.hpp"
+#include "Hardware/Monitor/SystemMonitors.hpp"
 
 namespace hardware {
 
@@ -236,6 +237,64 @@ GpuMuxSwitchReport GpuMuxSwitch::run(GpuMuxTarget target) {
   r.status = GpuMuxSwitchStatus::Switched;
   r.reason = "the panel is on the target GPU";
   return r;
+}
+
+// --- GpuMuxDesktop ---------------------------------------------------------------------------------------------------------------------
+
+IGraphicsProcessingUnit* GpuMuxDesktop::driver(GpuMuxTarget side) const {
+  IGraphicsProcessingUnit* d = driver_[side == GpuMuxTarget::Discrete ? 1 : 0];
+  const int32_t index = switch_.gpu_index(side);
+  if (!d && index >= 0) d = monitors_.gpu_driver(static_cast<uint32_t>(index));
+  return d;
+}
+
+const char* GpuMuxDesktop::gpu_name(GpuMuxTarget side) const {
+  const IGraphicsProcessingUnit* d = driver(side);
+  return d && d->name()[0] ? d->name() : gpu_mux_target_name(side);
+}
+
+bool GpuMuxDesktop::can_switch_to(GpuMuxTarget side, const char** why) const {
+  const int32_t index = switch_.gpu_index(side);
+  if (index < 0 || !driver(side)) {
+    if (why) *why = "the desktop has no display driver for that GPU";
+    return false;
+  }
+  return switch_.can_switch_to(side, why);
+}
+
+IBuiltInScreenSwitch::Result GpuMuxDesktop::switch_to(GpuMuxTarget side) {
+  Result result;
+  GpuMuxTarget from;
+  if (!switch_.active(&from)) {
+    result.rolled_back = false;
+    result.reason = "where the built-in screen is is not known";
+    return result;
+  }
+  const int32_t from_index = switch_.gpu_index(from), to_index = switch_.gpu_index(side);
+  IGraphicsProcessingUnit* to_driver = driver(side);
+  if (to_index < 0 || from_index < 0 || !to_driver) {
+    result.reason = "the desktop has no display driver for that GPU";
+    return result;
+  }
+  const GpuMuxSwitchReport r = switch_.switch_to(side);
+  if (!r.ok()) {
+    result.rolled_back = r.rollback_clean;
+    result.reason = r.reason;
+    return result;
+  }
+  if (r.status == GpuMuxSwitchStatus::AlreadyActive) {
+    result.ok = true;
+    return result;
+  }
+  if (!monitors_.move_panel(static_cast<uint32_t>(from_index), static_cast<uint32_t>(to_index), to_driver)) {
+    const GpuMuxSwitchReport back = switch_.switch_to(from);   // (the desktop could not follow: the panel goes back)
+    result.rolled_back = back.ok();
+    result.reason = "the built-in screen did not appear among that GPU's monitors";
+    return result;
+  }
+  result.ok = true;
+  result.reason = "switched";
+  return result;
 }
 
 }  // namespace hardware

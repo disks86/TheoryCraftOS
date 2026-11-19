@@ -44,6 +44,12 @@ class IGpuProbe {
   virtual int32_t temperature_millicelsius() = 0;
   // Monitors plugged into the GPU's own outputs (a laptop's HDMI or USB-C port is often wired to the discrete GPU), as far as it can tell.
   virtual uint32_t connected_outputs() const { return 0; }
+  // Whether refresh_outputs() can see monitors come and go (the probe reads the GPU's own hot-plug lines and EDIDs). False: it cannot tell.
+  virtual bool reads_outputs() const { return false; }
+  // Looks at the GPU's outputs again (a monitor may have been plugged in while the GPU slept and its hot-plug detection was dark): true if
+  // what connected_outputs() and the EDIDs say changed since the last look. The GPU is awake (and resume() has run after a wake). Multi/GpuHotplug
+  // calls it through GpuPool::refresh_outputs().
+  [[nodiscard]] virtual bool refresh_outputs() { return false; }
 
  protected:
   IGpuProbe() = default;

@@ -125,7 +125,7 @@ struct FakeGpu final : INvRegisters {
   explicit FakeGpu(const Chip& c, uint64_t vram_bytes) : chip(c), vram(vram_bytes) {}
 
   bool volta_plus() const { return chip.family >= Family::Volta; }
-  bool turing() const { return chip.family == Family::Turing; }
+  bool turing() const { return chip.family == Family::Turing || chip.family == Family::Ampere; }   // (GA10x: tu102_bar)
   bool gp100() const { return chip.family >= Family::Pascal; }
 
   uint32_t reg(uint32_t off) { auto it = regs.find(off); return it == regs.end() ? 0 : it->second; }
@@ -461,7 +461,7 @@ struct Rig {
     gpu.sys = &sys;
     set_vram_registers(gpu, c.family);
     set_topology(gpu, c.family);
-    probe = probe_vram(gpu, chip);
+    probe = probe_vram_display(gpu, chip);    // (probe_vram's for every family but GA10x, whose display alone is driven)
     if (!probe.ok() || !fb.init(probe.info)) return;
     pramin = std::make_unique<PraminWindow>(gpu, probe.info.bytes, pramin_lock);
     pmem = std::make_unique<NvVramMemory>(fb, *pramin, &sys);
@@ -551,6 +551,23 @@ static void test_vram_probe() {
     g.set(0x1183a4, 24576);
     const VramProbe p = probe_vram(g, chip);
     CHECK(!p.ok() && p.error == FbError::NeedsGsp && p.info.bytes == 24ull << 30);
+    // for the display alone (ga102_ram_new): the size, the type from the family, the VGA and VBIOS regions
+    g.set(0x625f04, uint32_t(((24576 * kMiB) - 4 * kMiB) >> 8) | 8);
+    const VramProbe d = probe_vram_display(g, chip);
+    CHECK(d.ok() && d.info.bytes == 24ull << 30 && d.info.type == RamType::Gddr6 && d.info.type_guessed);
+    CHECK(d.info.reserved_head == 256 * 1024 && d.info.reserved_tail == 4 * kMiB);
+    g.set(0x1183a4, 0xffffffff);
+    CHECK(probe_vram_display(g, chip).error == FbError::NoMemory);   // (no size)
+    g.set(0x1183a4, 4);
+    CHECK(probe_vram_display(g, chip).error == FbError::Garbage);    // 4 MiB: not a GA10x
+    const Chip ada = make_chip(Family::Ada, 0x192, "AD102");
+    FakeGpu a(ada, 0);
+    a.set(0x1183a4, 24576);
+    CHECK(probe_vram_display(a, ada).error == FbError::NeedsGsp);     // Ada: the GSP's
+    const Chip ga100 = make_chip(Family::Ampere, 0x170, "GA100");
+    FakeGpu c(ga100, 0);
+    c.set(0x1183a4, 40960);
+    CHECK(probe_vram_display(c, ga100).error == FbError::NeedsGsp);   // GA100: no display
   }
   // Unknown family.
   {
@@ -807,7 +824,11 @@ static void test_entry_encodings() {
   GpuMemory sroot{0x100005000ull, 4096, MemoryTarget::SystemCoherent, {}};
   CHECK(encode_pdb(gf, sroot) == 0x100005006ull);
   CHECK(gp.va_bits == 49 && gp.dir_levels == 4 && gf.va_bits == 40 && gf.big_shift == 17 && gm16.big_shift == 16 && gm16.dir[0].bits == 14);
-  CHECK(vmm_layout(make_chip(Family::Ampere, 0x172, "GA102")).format == VmmFormat::None);
+  // GA10x: the GP100 format with subcontexts (nouveau's ga100_vmm); Hopper's v3 tables and Ada are not done
+  const VmmLayout ga = vmm_layout(make_chip(Family::Ampere, 0x172, "GA102"));
+  CHECK(ga.format == VmmFormat::Gp100 && ga.va_bits == 49 && ga.dir_levels == 4 && ga.subcontexts && encode_pdb(ga, root) == 0x5C00);
+  CHECK(vmm_layout(make_chip(Family::Hopper, 0x180, "GH100")).format == VmmFormat::None);
+  CHECK(vmm_layout(make_chip(Family::Ada, 0x192, "AD102")).format == VmmFormat::None);
 }
 
 struct VmmRig {
@@ -1003,6 +1024,7 @@ static void test_bar_setup() {
       {Family::Maxwell, 0x117, 0x001704, 0x001714, true},
       {Family::Pascal, 0x134, 0x001704, 0x001714, true},
       {Family::Turing, 0x164, 0xb80f40, 0xb80f48, true},
+      {Family::Ampere, 0x172, 0xb80f40, 0xb80f48, true},   // GA102: Turing's BAR registers, GP100 tables, Turing's TLB flush
   };
   for (const Case& c : cases) {
     const Chip chip = make_chip(c.f, c.chipset, "x");

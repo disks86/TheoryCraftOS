@@ -225,7 +225,7 @@ class AcpiEvents {
   Deferred deferred_[kMaxDeferred];
   uint32_t deferred_count_ = 0;
   IAcpiNotifyListener* listener_ = nullptr;
-  IAcpiNotifyListener* more_listeners_[4] = {};
+  IAcpiNotifyListener* more_listeners_[8] = {};   // (video keys, hotkeys, USB-C, GPU hot plug, ...)
   IAcpiButtonListener* buttons_listener_ = nullptr;
   acpi::Node* ec_node_ = nullptr;
   uint32_t ec_gpe_ = 0, ec_events_ = 0;

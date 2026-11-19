@@ -19,7 +19,9 @@
 // Host-side tests for a desktop that spans the monitors of several GPUs: SystemMonitors with the display device and other GPUs (ids and order,
 // the default layout, each GPU's own surface, mode changes through the right driver, a GPU without a monitor source, hot plug), and MonitorDisplay
 // copying each monitor's part of the desktop to the screen of the GPU that drives it (pixels, damage only, presents only where drawn), also while
-// another thread draws on that screen under its guard.
+// another thread draws on that screen under its guard. A muxed laptop's built-in panel moving between the GPUs (SystemMonitors::move_panel): its
+// monitor leaves one GPU's monitors and joins the other's in the same place, at the same scale, still primary, and the next frame is copied to the
+// GPU that drives it now; and back.
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -409,12 +411,136 @@ static void test_threads() {
   CHECK(a.live == 0);
 }
 
+// The built-in panel moves from the display device to a second GPU and back (the display mux switch moved it; see Multi/GpuMuxSwitch).
+static void test_panel_moves() {
+  TestAllocator a;
+  {
+    // The display device drives the panel (eDP, Internal) and an external monitor; the second GPU waits with nothing lit (a zero-sized screen),
+    // its eDP connector empty and an HDMI monitor plugged in that it does not drive yet.
+    FakeSource isrc, dsrc;
+    isrc.add("eDP-1", small_edid(), true, ConnectorType::Internal);
+    isrc.add("DP-1", dell_edid());
+    dsrc.multi = false;
+    dsrc.add("eDP-1", small_edid(), false, ConnectorType::Internal);
+    dsrc.add("HDMI-1", dell_edid(), true, ConnectorType::Hdmi);
+    FakeGpu igpu, dgpu;
+    igpu.source = &isrc;
+    igpu.w = 4480;
+    igpu.h = 1440;
+    dgpu.source = &dsrc;
+    dgpu.w = dgpu.h = 0;
+    SystemMonitors sm(&igpu, a);
+    CHECK(sm.add_gpu(&dgpu, 1));
+    sm.initialize();
+    CHECK(sm.layout().count() == 2 && sm.layout().find(0) >= 0 && sm.layout().find(1) >= 0 && sm.layout().find(16) < 0 && sm.layout().find(17) < 0);   // (nothing lit there: none of its monitors)
+    CHECK(sm.set_scale(0, 150) && sm.layout().set_primary(0) && sm.apply() && !sm.spans_gpus());
+    const MonitorRect panel_rect = sm.layout().at(static_cast<uint32_t>(sm.layout().find(0))).rect;
+    const MonitorRect dell_rect = sm.layout().at(static_cast<uint32_t>(sm.layout().find(1))).rect;
+    const uint32_t gen = sm.generation();
+    // Nothing on the new GPU yet (the panel is not lit there): refused, nothing changed.
+    CHECK(!sm.move_panel(0, 1) && sm.layout().count() == 2 && sm.find(0)->connected() && sm.generation() == gen);
+    CHECK(!sm.move_panel(0, 0) && !sm.move_panel(5, 1));
+    // The second GPU lit the panel: its screen has the panel's size, the connector is connected.
+    dgpu.w = 1920;
+    dgpu.h = 1080;
+    dsrc.connectors[0].info.connected = true;
+    CHECK(sm.move_panel(0, 1) && sm.panel_id() == 16 && sm.generation() != gen);
+    CHECK(sm.layout().count() == 2 && sm.layout().find(0) < 0 && sm.layout().find(17) < 0);   // (the HDMI monitor the second GPU does not drive stays out)
+    const int32_t slot = sm.layout().find(16);
+    CHECK(slot >= 0);
+    const MonitorSlot& moved = sm.layout().at(static_cast<uint32_t>(slot));
+    CHECK(moved.scale_percent == 150 && moved.primary && moved.rect.x == panel_rect.x && moved.rect.y == panel_rect.y && moved.rect.width == panel_rect.width &&
+          moved.physical_width == 1920 && moved.physical_height == 1080);
+    CHECK(sm.layout().at(static_cast<uint32_t>(sm.layout().find(1))).rect.x == dell_rect.x);   // (the other monitor keeps its place)
+    CHECK(!sm.find(0)->connected() && sm.find(16)->connected() && sm.find(16)->gpu() == 1 && sm.gpu_of(16) == 1 && sm.device_of(16) == &dgpu);
+    MonitorTarget targets[4];
+    CHECK(sm.targets(targets, 4) == 1 && targets[0].id == 16 && targets[0].gpu == &dgpu);
+    CHECK(sm.apply() && sm.spans_gpus() && sm.needs_compositing() && isrc.last.size() == 1 && isrc.last[0].connector == 1);   // (the display device shows the DP monitor alone)
+    // The next frame: the panel's part of the desktop goes to the second GPU's screen, scaled; the display device gets only the DP monitor's part.
+    ScanoutPlacement places[4];
+    const uint32_t n = sm.physical_placements(places, 4);
+    MonitorDisplay display(igpu, a);
+    const uint32_t k = sm.render_percent();
+    CHECK(display.update(sm.layout(), places, n, k, ArrayView<const MonitorTarget>(targets, 1)) && display.target_count() == 1);
+    const uint32_t dw = display.width(), dh = display.height();
+    std::vector<uint32_t> picture = desktop_picture(dw, dh);
+    display.blit(0, 0, dw, dh, picture.data(), dw);
+    display.present();
+    CHECK(dgpu.blits > 0 && dgpu.presents == 1 && dgpu.screen.size() == size_t{1920} * 1080 && dgpu.screen[0] != 0);
+    // A poll that finds the display device's eDP connector still saying "connected" does not take the panel back.
+    isrc.changed = true;
+    (void)sm.poll();
+    CHECK(sm.layout().find(0) < 0 && sm.layout().find(16) >= 0);
+    // And back: the second GPU let the panel go, the display device lit it.
+    dsrc.connectors[0].info.connected = false;
+    dgpu.w = dgpu.h = 0;
+    CHECK(sm.move_panel(1, 0) && sm.panel_id() == 0);
+    const int32_t back = sm.layout().find(0);
+    CHECK(back >= 0 && sm.layout().find(16) < 0 && sm.layout().at(static_cast<uint32_t>(back)).scale_percent == 150 && sm.layout().at(static_cast<uint32_t>(back)).primary);
+    CHECK(sm.layout().at(static_cast<uint32_t>(back)).rect.x == panel_rect.x && sm.layout().at(static_cast<uint32_t>(back)).physical_width == 1920);
+    CHECK(sm.targets(targets, 4) == 0 && !sm.spans_gpus() && sm.find(0)->connected() && !sm.find(16)->connected());
+    CHECK(sm.apply() && isrc.last.size() == 2);
+    // Off again, and a poll of the second GPU that sees its eDP connected (a stale report) does not bring the panel's monitor there back.
+    dgpu.w = 1920;
+    dgpu.h = 1080;
+    dsrc.connectors[0].info.connected = true;
+    CHECK(sm.move_panel(0, 1));
+    dsrc.connectors[0].info.connected = false;
+    dgpu.w = dgpu.h = 0;
+    CHECK(sm.move_panel(1, 0));
+    dsrc.connectors[0].info.connected = true;
+    dsrc.changed = true;
+    (void)sm.poll();
+    CHECK(sm.layout().find(16) < 0 && sm.layout().find(0) >= 0);
+  }
+  {
+    // The panel alone on the display device, which shows one display, and a second GPU the monitors were not told about until the panel moved.
+    FakeSource isrc, dsrc;
+    isrc.multi = false;
+    isrc.add("Display-0", small_edid(), true, ConnectorType::Unknown);
+    dsrc.multi = false;
+    dsrc.add("eDP-1", small_edid(), true, ConnectorType::Internal);
+    FakeGpu igpu, dgpu;
+    igpu.source = &isrc;
+    igpu.w = 1920;
+    igpu.h = 1080;
+    dgpu.source = &dsrc;
+    dgpu.w = 1920;
+    dgpu.h = 1080;
+    SystemMonitors sm(&igpu, a);
+    sm.initialize();
+    CHECK(sm.apply() && sm.layout().count() == 1);
+    CHECK(!sm.move_panel(0, 2) && sm.move_panel(0, 2, &dgpu) && sm.gpu_count() == 2 && sm.layout().count() == 1 && sm.gpu_of(sm.layout().at(0).id) == 2);
+    CHECK(sm.apply() && sm.desktop_width() == 1920 && sm.surface_width_of(sm.layout().at(0).id) == 1920);   // (the display device keeps its screen; nothing of it is shown)
+    MonitorTarget targets[2];
+    ScanoutPlacement places[2];
+    CHECK(sm.targets(targets, 2) == 1 && sm.physical_placements(places, 2) == 1 && places[0].x == 0);
+    MonitorDisplay display(igpu, a);
+    CHECK(display.update(sm.layout(), places, 1, sm.render_percent(), ArrayView<const MonitorTarget>(targets, 1)));
+    std::vector<uint32_t> picture = desktop_picture(1920, 1080);
+    display.blit(0, 0, 1920, 1080, picture.data(), 1920);
+    CHECK(igpu.blits == 0 && dgpu.blits > 0 && dgpu.screen[size_t{5} * 1920 + 7] == pixel_of(7, 5));
+    // Two monitors in use on the old GPU and neither an Internal connector: which is the panel is not known, nothing moves.
+    FakeSource two;
+    two.add("DP-1", dell_edid());
+    two.add("DP-2", small_edid());
+    FakeGpu many;
+    many.source = &two;
+    SystemMonitors sm2(&many, a);
+    CHECK(sm2.add_gpu(&dgpu, 1));
+    sm2.initialize();
+    CHECK(sm2.layout().count() == 3 && !sm2.move_panel(0, 1) && sm2.layout().count() == 3);
+  }
+  CHECK(a.live == 0);
+}
+
 int main() {
   test_one_gpu();
   test_two_gpus_layout();
   test_secondary_modes();
   test_composition();
   test_threads();
+  test_panel_moves();
   if (g_failed) { printf("%d check(s) failed\n", g_failed.load()); return 1; }
   printf("multi-GPU monitor tests passed\n");
   return 0;

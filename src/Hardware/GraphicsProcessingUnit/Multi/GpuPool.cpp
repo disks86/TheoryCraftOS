@@ -90,9 +90,38 @@ int32_t GpuPool::probe_temperature(uint32_t index) {
   // A lease keeps it from sleeping while the sensor is read (the check above and the read would otherwise race a release on another core).
   if (manager_.asleep(index) || !manager_.acquire(index)) return -1;
   int32_t value = -1;
-  if (manager_.wake_count(index) == probe_wakes_[index] || resume_probe(index)) value = probes_[index]->temperature_millicelsius();
+  {
+    kernel::ScopedMutex g(probe_lock_);
+    if (manager_.wake_count(index) == probe_wakes_[index] || resume_probe(index)) value = probes_[index]->temperature_millicelsius();
+  }
   manager_.release(index);
   return value;
+}
+
+bool GpuPool::outputs_readable(uint32_t index) const {
+  if (index >= manager_.count() || nodes_[index].gpu || !probes_[index]) return false;
+  kernel::ScopedMutex g(probe_lock_);
+  return probes_[index]->reads_outputs();
+}
+
+uint32_t GpuPool::probe_connected_outputs(uint32_t index) const {
+  if (index >= manager_.count() || !probes_[index]) return 0;
+  kernel::ScopedMutex g(probe_lock_);
+  return probes_[index]->connected_outputs();
+}
+
+GpuOutputCheck GpuPool::refresh_outputs(uint32_t index) {
+  if (index >= manager_.count()) return GpuOutputCheck::NoGpu;
+  if (!outputs_readable(index)) return GpuOutputCheck::CannotTell;
+  if (!manager_.acquire(index)) return GpuOutputCheck::NoWake;
+  GpuOutputCheck result = GpuOutputCheck::Unchanged;
+  {
+    kernel::ScopedMutex g(probe_lock_);
+    if (!resume_probe(index)) result = GpuOutputCheck::NoWake;
+    else if (probes_[index]->refresh_outputs()) result = GpuOutputCheck::Changed;
+  }
+  manager_.release(index);
+  return result;
 }
 
 }  // namespace hardware

@@ -50,7 +50,25 @@ bool SystemMonitors::add_gpu(IGraphicsProcessingUnit* gpu, uint32_t gpu_index) {
   added = Source();
   added.gpu = gpu;
   added.gpu_index = gpu_index;
+  if (initialized_) enumerate(source_count_ - 1);   // (added later: its monitors are listed, none is in the layout)
   return true;
+}
+
+IGraphicsProcessingUnit* SystemMonitors::gpu_driver(uint32_t gpu_index) const {
+  const int32_t s = source_of_gpu(gpu_index);
+  return s < 0 ? nullptr : sources_[s].gpu;
+}
+
+int32_t SystemMonitors::source_of_gpu(uint32_t gpu_index) const {
+  for (uint32_t s = 0; s < source_count_; ++s)
+    if (sources_[s].gpu && sources_[s].gpu_index == gpu_index) return static_cast<int32_t>(s);
+  return -1;
+}
+
+bool SystemMonitors::source_has_monitors(uint32_t source) const {
+  for (uint32_t i = 0; i < layout_.count(); ++i)
+    if (layout_.at(i).enabled && source_index(layout_.at(i).id) == source) return true;
+  return false;
 }
 
 const char* SystemMonitors::device_name(uint32_t id) const {
@@ -141,6 +159,9 @@ void SystemMonitors::initialize() {
   layout_.clear();
   applied_ = false;
   multi_ = false;
+  initialized_ = true;
+  panel_id_ = kNoMonitor;
+  for (uint32_t s = 0; s < source_count_; ++s) sources_[s].released = kNoMonitor;
   sources_[0].gpu = gpu_;
   enumerate(0);
   source_ = sources_[0].source;
@@ -166,6 +187,7 @@ void SystemMonitors::initialize() {
   for (uint32_t s = 1; s < source_count_; ++s) {
     const uint64_t first = monitors_.count();
     enumerate(s);
+    if (!sources_[s].gpu->width() || !sources_[s].gpu->height()) continue;   // (nothing lit there yet: a GPU waiting for the built-in panel)
     uint32_t added = 0;
     for (uint64_t i = first; i < monitors_.count(); ++i) {
       const Monitor& m = monitors_[i];
@@ -304,7 +326,14 @@ bool SystemMonitors::apply() {
   desktop_width_ = box.width;
   desktop_height_ = box.height;
   bool ok;
-  if (!source_ || !multi_) {   // one display: the screen, switched to the size the monitor is to show
+  if (multi_ && source_ && !source_has_monitors(0) && source_count_ > 1) {   // (all its monitors are on other GPUs: the built-in panel moved away)
+    surface_width_ = gpu_->width();
+    surface_height_ = gpu_->height();
+    sources_[0].surface_width = surface_width_;
+    sources_[0].surface_height = surface_height_;
+    applied_ = true;
+    ok = true;
+  } else if (!source_ || !multi_) {   // one display: the screen, switched to the size the monitor is to show
     ok = sync_device_mode();
     surface_width_ = gpu_ ? gpu_->width() : 0;
     surface_height_ = gpu_ ? gpu_->height() : 0;
@@ -411,6 +440,7 @@ bool SystemMonitors::poll_source(uint32_t source) {
     ConnectorInfo info;
     if (!from->connector_info(i, &info)) continue;
     const uint32_t id = source * kIdsPerGpu + i;
+    if (id == sources_[source].released) continue;   // (the built-in panel, which is on another GPU now)
     Monitor* known = find_mutable(id);
     if (!known) {   // a connector that was not there before
       add_connector(source, i, info);
@@ -444,6 +474,141 @@ bool SystemMonitors::poll_source(uint32_t source) {
   return changed;
 }
 
+
+// --- The built-in panel moving between GPUs --------------------------------------------------------------
+
+void SystemMonitors::rescan(uint32_t source) {
+  Source& src = sources_[source];
+  if (!src.gpu) return;
+  src.source = src.gpu->monitor_source();
+  if (source == 0) source_ = src.source;
+  const uint32_t first = source * kIdsPerGpu;
+  if (!src.source) {   // the screen is the one monitor: connected while it has a size
+    Monitor* m = find_mutable(first);
+    if (!m) {
+      Monitor monitor;
+      monitor.set_unknown(first, src.gpu->width(), src.gpu->height());
+      monitor.set_gpu(src.gpu_index);
+      monitors_.push_back(monitor);
+      m = find_mutable(first);
+    }
+    if (m) {
+      MonitorMode mode = m->current_mode();
+      mode.width = src.gpu->width();
+      mode.height = src.gpu->height();
+      m->set_current_mode(mode);
+      m->set_connected(mode.width && mode.height);
+    }
+    return;
+  }
+  (void)src.source->refresh_connectors();
+  src.multi = src.source->supports_multiple_displays();
+  if (source == 0) multi_ = src.multi;
+  const uint32_t connectors = src.source->connector_count() < IMonitorSource::kMaxConnectors ? src.source->connector_count() : IMonitorSource::kMaxConnectors;
+  for (uint32_t i = 0; i < connectors; ++i) {
+    ConnectorInfo info;
+    if (!src.source->connector_info(i, &info)) continue;
+    const uint32_t id = first + i;
+    Monitor* known = find_mutable(id);
+    if (!known) {
+      add_connector(source, i, info);
+      continue;
+    }
+    const int32_t slot = layout_.find(id);
+    if (slot >= 0 && layout_.at(static_cast<uint32_t>(slot)).enabled) {   // (a monitor in use keeps its mode)
+      known->set_connected(info.connected);
+      continue;
+    }
+    uint8_t edid[1024];
+    const uint32_t length = info.connected ? src.source->read_edid(i, ByteView(edid)) : 0;
+    known->set(id, info, ConstByteView(edid, length), fallback_number(id));
+    known->set_current_mode(mode_for(*known));
+    known->set_gpu(src.gpu_index);
+  }
+}
+
+bool SystemMonitors::move_panel(uint32_t from_gpu_index, uint32_t to_gpu_index, IGraphicsProcessingUnit* to_driver) {
+  if (from_gpu_index == to_gpu_index) return false;
+  const int32_t from = source_of_gpu(from_gpu_index);
+  if (from < 0) return false;
+  int32_t to = source_of_gpu(to_gpu_index);
+  if (to < 0 && (!to_driver || !add_gpu(to_driver, to_gpu_index) || (to = source_of_gpu(to_gpu_index)) < 0)) return false;
+  // The panel on the old GPU: its Internal connector in use, else the only monitor of that GPU in use.
+  uint32_t old_id = kNoMonitor, only = kNoMonitor, in_use = 0;
+  for (uint32_t i = 0; i < layout_.count(); ++i) {
+    const MonitorSlot& s = layout_.at(i);
+    if (!s.enabled || source_index(s.id) != static_cast<uint32_t>(from)) continue;
+    ++in_use;
+    only = s.id;
+    const Monitor* m = find(s.id);
+    if (m && m->connector_type() == ConnectorType::Internal && old_id == kNoMonitor) old_id = s.id;
+  }
+  if (old_id == kNoMonitor && in_use == 1) old_id = only;
+  if (old_id == kNoMonitor) return false;
+  const MonitorSlot kept = layout_.at(static_cast<uint32_t>(layout_.find(old_id)));
+  // The new GPU's connectors, read again now that it lit the panel: its Internal connector, else the only connected one not in use.
+  rescan(static_cast<uint32_t>(to));
+  // (a GPU that has an Internal connector at all: only that can be the panel, so an external monitor is never taken for it)
+  uint32_t new_id = kNoMonitor, spare = kNoMonitor, spares = 0;
+  bool has_internal = false;
+  for (uint64_t i = 0; i < monitors_.count(); ++i) {
+    const Monitor& m = monitors_[i];
+    if (source_index(m.id()) != static_cast<uint32_t>(to)) continue;
+    if (m.connector_type() == ConnectorType::Internal) has_internal = true;
+    if (!m.connected()) continue;
+    if (m.connector_type() == ConnectorType::Internal && new_id == kNoMonitor) new_id = m.id();
+    const int32_t slot = layout_.find(m.id());
+    if (slot < 0 || !layout_.at(static_cast<uint32_t>(slot)).enabled) {
+      ++spares;
+      spare = m.id();
+    }
+  }
+  if (new_id == kNoMonitor && spares == 1 && !has_internal) new_id = spare;
+  if (new_id == kNoMonitor) return false;
+  Monitor* panel = find_mutable(new_id);
+  if (!panel) return false;
+  // Its mode there: the size of the screen of a GPU that shows one display; else the mode it had if that GPU can show it, else its default.
+  const Source& target = sources_[to];
+  MonitorMode mode = panel->current_mode();
+  const Monitor* was = find(old_id);
+  if (!target.multi && target.gpu->width() && target.gpu->height()) {
+    mode.width = target.gpu->width();
+    mode.height = target.gpu->height();
+  } else if (was && target.source && target.source->mode_available(connector_of(new_id), was->current_mode().width, was->current_mode().height)) {
+    mode = was->current_mode();
+  } else if (!mode.width || !mode.height) {
+    mode = mode_for(*panel);
+  }
+  // The layout: the panel's slot takes the new id, in its place (a place the new id kept from before goes).
+  MonitorSlot slots[MonitorLayout::kMaxMonitors];
+  uint32_t n = 0;
+  for (uint32_t i = 0; i < layout_.count() && n < MonitorLayout::kMaxMonitors; ++i) {
+    MonitorSlot s = layout_.at(i);
+    if (s.id == new_id) continue;
+    if (s.id == old_id) s.id = new_id;
+    slots[n++] = s;
+  }
+  State before;
+  save(&before);
+  if (!layout_.assign(slots, n) || !layout_.set_mode(new_id, mode.width, mode.height, kept.scale_percent)) {
+    (void)restore(before);
+    return false;
+  }
+  if (kept.primary) (void)layout_.set_primary(new_id);
+  layout_.repair();
+  mode.preferred = false;
+  EdidTiming native;
+  if (panel->edid() && panel->edid()->best_timing(&native)) mode.preferred = native.width == mode.width && native.height == mode.height;
+  panel->set_current_mode(mode);
+  panel->set_connected(true);
+  // The old GPU's monitor of it: not connected there while the panel is away, and not taken back by poll().
+  if (Monitor* old = find_mutable(old_id)) old->set_connected(false);
+  sources_[from].released = old_id;
+  if (sources_[to].released == new_id) sources_[to].released = kNoMonitor;
+  panel_id_ = new_id;
+  ++generation_;
+  return true;
+}
 
 // --- What a monitor shows ------------------------------------------------------------------------------
 

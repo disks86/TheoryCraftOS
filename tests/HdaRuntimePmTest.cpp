@@ -411,6 +411,7 @@ static void test_threads() {
       if (i & 1) (void)r.dev.suspend();
       else (void)r.dev.resume();
       (void)r.dev.retarget();
+      if (i % 5 == 0) (void)r.dev.connections_changed();   // (a display came: GpuHotplug)
     }
   });
   std::this_thread::sleep_for(std::chrono::milliseconds(700));
@@ -436,10 +437,71 @@ static void test_threads() {
   r.dev.shutdown();
 }
 
+// A display plugged into the GPU while its HD audio slept (GpuHotplug -> SystemAudioDevices::connections_changed): the controller reads its
+// pins again and moves the output to the pin that now has a display with a valid ELD. Running, it retargets; suspended, it is resumed (which
+// rediscovers the codec) and sleeps again after the idle period; failed, it does nothing.
+static void test_connections_changed() {
+  Rig r;
+  std::atomic<uint32_t> display_pin{0xFF};   // the pin index (0..2) with a monitor behind it, 0xFF: none
+  r.bench.hda.sense = [&](uint32_t i) { return i == display_pin.load() ? 0xC0000000u : 0u; };
+  CHECK(r.dev.initialize());
+  CHECK(r.dev.output_pin() == FakeHda::kPins[0] && !r.dev.output_has_display());   // (no display anywhere: the first digital pin)
+  CHECK(r.dev.connection_changes() == 0);
+
+  // Running: a monitor on the second pin.
+  display_pin = 1;
+  r.bench.hda.log.clear();
+  CHECK(r.dev.connections_changed());
+  CHECK(r.dev.output_pin() == FakeHda::kPins[1] && r.dev.output_has_display());
+  bool sensed = false;
+  for (const FakeHda::Verb& v : r.bench.hda.log)
+    if (v.nid == FakeHda::kPins[1] && (v.command >> 8) == 0xF09) sensed = true;
+  CHECK(sensed);
+  CHECK(r.bench.hda.pins[1].control == 0x40 && r.bench.hda.pins[0].control == 0);   // the old pin silenced, the new one driven
+  CHECK(r.dev.connection_changes() == 1);
+
+  // Suspended: the monitor moves to the third pin while the controller (and the GPU) sleep; the change resumes it, it finds the new pin, and
+  // the idle policy puts it back to sleep.
+  r.dev.set_power_observer(&r.observer, 1000);
+  CHECK(r.dev.suspend());
+  display_pin = 2;
+  CHECK(r.dev.connections_changed());
+  CHECK(r.dev.power_state() == IntelHdaAudioDevice::PowerState::Active && r.dev.resume_count() == 1);
+  CHECK(r.dev.output_pin() == FakeHda::kPins[2] && r.dev.output_has_display());
+  CHECK(r.observer.snapshot() == (std::vector<std::string>{"idle", "busy"}));
+  CHECK(r.dev.connection_changes() == 2);
+  r.dev.service(0);
+  r.dev.service(1000);
+  CHECK(r.dev.power_state() == IntelHdaAudioDevice::PowerState::Suspended);
+  CHECK(r.observer.snapshot() == (std::vector<std::string>{"idle", "busy", "idle"}));
+
+  // The monitor is pulled out: back to the first digital pin, without a display.
+  display_pin = 0xFF;
+  CHECK(r.dev.connections_changed());
+  CHECK(r.dev.output_pin() == FakeHda::kPins[0] && !r.dev.output_has_display());
+  CHECK(r.bench.asleep_accesses.load() == 0 && r.observer.wrong.load() == 0);
+
+  // Failed: nothing is touched.
+  CHECK(r.dev.suspend());
+  r.bench.hda.no_codec = true;
+  CHECK(!r.dev.connections_changed());
+  CHECK(r.dev.power_state() == IntelHdaAudioDevice::PowerState::Failed);
+  const uint32_t before = r.bench.accesses.load();
+  CHECK(!r.dev.connections_changed());
+  CHECK(r.bench.accesses.load() == before);
+  CHECK(r.dev.connection_changes() == 3);
+  r.dev.shutdown();
+
+  // Never started: false.
+  Rig idle;
+  CHECK(!idle.dev.connections_changed());
+}
+
 int main() {
   test_idle_suspend();
   test_resume_on_open();
   test_refusals_and_failure();
+  test_connections_changed();
   test_threads();
   if (g_failed.load()) {
     printf("HdaRuntimePmTest: %d FAILED\n", g_failed.load());

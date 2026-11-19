@@ -122,6 +122,107 @@ void walk_records(const Image& image, uint32_t records, ConnectorRecords* out) {
     at += size;
   }
 }
+// ---- ATOM firmware (data tables 2.1: Vega and later), as bios_parser2.c reads them ----
+constexpr uint32_t kHpdGpioRegisterV21 = 0x34C0 + 0x210B;          // DC_GPIO_HPD_A on DCE 12 (DCE segment 2 + mmDC_GPIO_HPD_A, dce_12_0_offset.h)
+constexpr uint32_t kPathV2Bytes = 16, kPathsAt = 8;                // atom_display_object_path_v2; display_object_info_table_v1_4's paths after header, devices, count
+constexpr uint32_t kGpioPinV21Bytes = 8;                           // atom_gpio_pin_assignment
+constexpr uint8_t kRecordEnd = 0xFF;                               // ATOM_RECORD_END_TYPE
+constexpr uint32_t kGraphObjectTypeConnector = 3;
+
+// bios_parser_get_gpio_pin_info and the HPD pin of its register bit: the hot plug pin of GPIO `id` in gpio_pin_lut v2.1, or kNoPin
+uint8_t hpd_pin_of_gpio_v21(const Image& image, uint32_t data_table_at, uint8_t id) {
+  uint16_t start = 0, size = 0;
+  uint8_t crev = 0;
+  if (!data_table(image, data_table_at, kDataGpioPinLut, &start, &size) || !image.u8(uint32_t{start} + 3, &crev) || crev != 1) return AtomConnectors::kNoPin;
+  const uint32_t pins = size >= kTableHeaderBytes ? (size - kTableHeaderBytes) / kGpioPinV21Bytes : 0;
+  for (uint32_t i = 0; i < pins; ++i) {
+    const uint32_t at = start + kTableHeaderBytes + i * kGpioPinV21Bytes;
+    uint16_t lo = 0, hi = 0;
+    uint8_t shift = 0, gpio_id = 0;
+    if (!image.u16(at, &lo) || !image.u16(at + 2, &hi) || !image.u8(at + 4, &shift) || !image.u8(at + 6, &gpio_id)) return AtomConnectors::kNoPin;
+    if (gpio_id != id) continue;
+    if ((uint32_t{lo} | uint32_t{hi} << 16) != kHpdGpioRegisterV21 || shift >= 32) return AtomConnectors::kNoPin;
+    switch (1u << shift) {     // DC_GPIO_HPD_A__DC_GPIO_HPD1_A .. HPD6_A (dce_12_0_sh_mask.h)
+      case 1u << 0: return 0;
+      case 1u << 8: return 1;
+      case 1u << 16: return 2;
+      case 1u << 24: return 3;
+      case 1u << 26: return 4;
+      case 1u << 28: return 5;
+      default: return AtomConnectors::kNoPin;
+    }
+  }
+  return AtomConnectors::kNoPin;
+}
+
+// The records of a display path (get_hpd_record, get_i2c_record): atom_common_record_header-led records up to ATOM_RECORD_END_TYPE or a zero size
+void walk_records_v21(const Image& image, uint32_t records, ConnectorRecords* out) {
+  uint32_t at = records;
+  for (uint32_t i = 0; i < kMaxRecords; ++i) {
+    uint8_t type = 0, size = 0;
+    if (!image.u8(at, &type) || !image.u8(at + 1, &size)) return;
+    if (type == kRecordEnd || size == 0) return;
+    if (type == kI2cRecord && size >= 4) {          // atom_i2c_record: header, i2c_id, slave address
+      uint8_t id = 0;
+      if (image.u8(at + 2, &id)) {
+        out->ddc_id = id;
+        out->has_ddc = true;
+      }
+    } else if (type == kHpdIntRecord && size >= 4) {   // atom_hpd_int_record: header, pin_id, plugin_pin_state
+      uint8_t gpio = 0, plugged = 0;
+      if (image.u8(at + 2, &gpio) && image.u8(at + 3, &plugged)) {
+        out->gpio_id = gpio;
+        out->plugged_state = plugged;
+        out->has_hpd = true;
+      }
+    }
+    at += size;
+  }
+}
+
+// display_object_info_table_v1_4: one path per connector (display_objid), the GPU's encoder (encoderobjid: the GPU 0x1100 is its source) and a bridge (extencoderobjid)
+uint32_t parse_v14(const Image& image, uint32_t data_table_at, uint32_t header, ArrayView<AtomConnectors::Connector> out) {
+  uint8_t path_count = 0;
+  if (!image.u8(header + 6, &path_count)) return 0;
+  const uint32_t capacity = out.size() < AtomConnectors::kMaxConnectors ? static_cast<uint32_t>(out.size()) : AtomConnectors::kMaxConnectors;
+  uint16_t conn_ids[AtomConnectors::kMaxConnectors] = {};
+  uint32_t count = 0;
+  for (uint32_t p = 0; p < path_count; ++p) {
+    const uint32_t at = header + kPathsAt + p * kPathV2Bytes;
+    uint16_t display = 0, records = 0, encoder = 0, bridge = 0, tag = 0;
+    if (!image.u16(at, &display) || !image.u16(at + 2, &records) || !image.u16(at + 4, &encoder) || !image.u16(at + 6, &bridge) || !image.u16(at + 12, &tag)) break;
+    if (((display & kObjectTypeMask) >> kObjectTypeShift) != kGraphObjectTypeConnector) continue;
+    const uint32_t object_id = (display & kObjectIdMask) >> kObjectIdShift;
+    if (object_id >= kConnectorCount || kConnectorOfObject[object_id] == kUnknown) continue;
+    ConnectorRecords rec;
+    walk_records_v21(image, header + records, &rec);
+    const uint8_t pin = rec.has_hpd ? hpd_pin_of_gpio_v21(image, data_table_at, rec.gpio_id) : AtomConnectors::kNoPin;
+    uint32_t existing = 0;
+    while (existing < count && conn_ids[existing] != display) ++existing;
+    if (existing < count) {
+      out[existing].devices |= tag;
+      continue;
+    }
+    if (count >= capacity) continue;
+    AtomConnectors::Connector c;
+    c.type = static_cast<AtomConnectors::Type>(kConnectorOfObject[object_id]);
+    c.object_id = static_cast<uint8_t>(object_id);
+    c.enum_id = static_cast<uint8_t>((display & kEnumIdMask) >> kEnumIdShift);
+    c.hpd_pin = pin;
+    c.plugged_state = rec.has_hpd ? rec.plugged_state : 0;
+    c.has_ddc = rec.has_ddc;
+    c.ddc_id = rec.ddc_id;
+    c.devices = tag;
+    c.encoder_object = (((encoder & kObjectTypeMask) >> kObjectTypeShift) == kGraphObjectTypeEncoder) ? encoder : 0;
+    c.bridge_object = (((bridge & kObjectTypeMask) >> kObjectTypeShift) == kGraphObjectTypeEncoder) ? bridge : 0;
+    c.number = 1;
+    for (uint32_t i = 0; i < count; ++i)
+      if (out[i].type == c.type) ++c.number;
+    conn_ids[count] = display;
+    out[count++] = c;
+  }
+  return count;
+}
 }  // namespace
 
 const char* AtomConnectors::type_name(Type type) {
@@ -181,8 +282,10 @@ uint32_t AtomConnectors::parse(ConstByteView bios, ArrayView<Connector> out) {
 
   uint16_t header = 0, header_size = 0;
   if (!data_table(image, data_table_at, kDataObjectHeader, &header, &header_size)) return 0;
-  uint8_t crev = 0;
-  if (!image.u8(uint32_t{header} + 3, &crev) || crev < 2) return 0;
+  uint8_t frev = 0, crev = 0;
+  if (!image.u8(uint32_t{header} + 2, &frev) || !image.u8(uint32_t{header} + 3, &crev) || crev < 2) return 0;
+  if (frev == 1 && crev == 4) return parse_v14(image, data_table_at, header, out);     // ATOM firmware's display_object_info_table_v1_4
+  if (crev > 3) return 0;                                                             // (1.5 and later: Navi's path layout, not read)
   uint16_t device_support = 0, connector_table = 0, path_table = 0;
   if (!image.u16(uint32_t{header} + kObjDeviceSupport, &device_support) || !image.u16(uint32_t{header} + kObjConnectorTable, &connector_table) ||
       !image.u16(uint32_t{header} + kObjPathTable, &path_table))

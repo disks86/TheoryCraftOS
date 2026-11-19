@@ -153,6 +153,43 @@ const char* ram_type_name(RamType type) {
   }
 }
 
+namespace {
+// The memory type, and the regions at the bottom (VGA) and the top (VBIOS, display/VGA workspace) the firmware keeps.
+void finish_probe(INvRegisters& regs, const Chip& chip, RamType bios_type, VramProbe& p) {
+  if (p.info.type == RamType::Unknown || bios_type != RamType::Unknown) {
+    p.info.type = bios_type != RamType::Unknown ? bios_type : default_type(chip);
+    p.info.type_guessed = bios_type == RamType::Unknown;
+  }
+
+  p.info.reserved_head = kVgaReserve;
+  p.info.reserved_tail = kVbiosReserve;
+  if (chip.family >= Family::Fermi && chip.chipset >= 0xd9) {
+    // GF119 and later: the display's VGA workspace sits near the top; keep everything above it.
+    const uint32_t vga = regs.read32(kDispVgaWorkspace);
+    if (!all_ones(vga) && (vga & 8)) {
+      const uint64_t base = uint64_t(vga & 0xFFFFFF00u) << 8;
+      if (base >= p.info.bytes / 2 && base < p.info.bytes && p.info.bytes - base > p.info.reserved_tail)
+        p.info.reserved_tail = (p.info.bytes - base + 0xFFFF) & ~uint64_t{0xFFFF};
+    }
+  }
+  p.error = FbError::None;
+}
+}  // namespace
+
+VramProbe probe_vram_display(INvRegisters& regs, const Chip& chip, RamType bios_type) {
+  VramProbe p = probe_vram(regs, chip, bios_type);
+  if (p.error != FbError::NeedsGsp || chip.family != Family::Ampere || chip.chipset < 0x172) return p;
+  // ga102_ram_new: the size is what the firmware left usable (0x1183a4, MiB); the memory type from the VBIOS.
+  if (p.info.bytes < kMinVram || p.info.bytes > kMaxVram) {
+    p.error = p.info.bytes == 0 ? FbError::NoMemory : FbError::Garbage;
+    p.info = VramInfo{};
+    return p;
+  }
+  p.info.type = RamType::Unknown;
+  finish_probe(regs, chip, bios_type, p);
+  return p;
+}
+
 VramProbe probe_vram(INvRegisters& regs, const Chip& chip, RamType bios_type) {
   VramProbe p;
   FbError error = FbError::Unsupported;
@@ -183,24 +220,7 @@ VramProbe probe_vram(INvRegisters& regs, const Chip& chip, RamType bios_type) {
   }
   if (p.info.bytes == 0) { p.info = VramInfo{}; p.error = FbError::NoMemory; return p; }
   if (p.info.bytes < kMinVram || p.info.bytes > kMaxVram || p.info.bytes % kMiB) { p.info = VramInfo{}; p.error = FbError::Garbage; return p; }
-
-  if (p.info.type == RamType::Unknown || bios_type != RamType::Unknown) {
-    p.info.type = bios_type != RamType::Unknown ? bios_type : default_type(chip);
-    p.info.type_guessed = bios_type == RamType::Unknown;
-  }
-
-  p.info.reserved_head = kVgaReserve;
-  p.info.reserved_tail = kVbiosReserve;
-  if (chip.family >= Family::Fermi && chip.chipset >= 0xd9) {
-    // GF119 and later: the display's VGA workspace sits near the top; keep everything above it.
-    const uint32_t vga = regs.read32(kDispVgaWorkspace);
-    if (!all_ones(vga) && (vga & 8)) {
-      const uint64_t base = uint64_t(vga & 0xFFFFFF00u) << 8;
-      if (base >= p.info.bytes / 2 && base < p.info.bytes && p.info.bytes - base > p.info.reserved_tail)
-        p.info.reserved_tail = (p.info.bytes - base + 0xFFFF) & ~uint64_t{0xFFFF};
-    }
-  }
-  p.error = FbError::None;
+  finish_probe(regs, chip, bios_type, p);
   return p;
 }
 

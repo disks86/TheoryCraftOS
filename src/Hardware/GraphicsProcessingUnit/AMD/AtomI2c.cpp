@@ -94,4 +94,37 @@ AtomI2c::Bus AtomI2c::lookup(ConstByteView bios, uint8_t id) {
   return none;
 }
 
+AtomI2c::PinV21 AtomI2c::lookup_v21(ConstByteView bios, uint8_t i2c_id) {
+  constexpr uint32_t kDataGpioPinLut = 12, kPinBytes = 8;      // atom_master_list_of_data_tables_v2_1.gpio_pin_lut, sizeof(atom_gpio_pin_assignment)
+  constexpr uint8_t kLaneMux = 0x0F, kEngineMask = 0x70;       // I2C_HW_LANE_MUX, I2C_HW_ENGINE_ID_MASK (and I2C_HW_CAP, kHwCapable)
+  PinV21 none;
+  const Reader r{bios};
+  uint32_t magic = 0, rom_table = 0, data_table = 0;
+  if (!r.u16(0, &magic) || magic != kBiosMagic || !r.u16(kRomTablePtr, &rom_table)) return none;
+  for (uint32_t i = 0; i < sizeof kRomMagic; ++i) {
+    uint8_t c = 0;
+    if (!r.u8(rom_table + kRomMagicPtr + i, &c) || c != kRomMagic[i]) return none;
+  }
+  uint32_t table = 0, size = 0;
+  uint8_t crev = 0;
+  if (!r.u16(rom_table + kRomDataPtr, &data_table) || !r.u16(data_table + kDataGpioPinLut * 2 + 4, &table) || table == 0 || !r.u16(table, &size) || !r.u8(table + 3, &crev))
+    return none;
+  if (crev != 1 || size < kTableHeaderBytes + kPinBytes) return none;
+  const uint32_t entries = (size - kTableHeaderBytes) / kPinBytes;
+  for (uint32_t i = 0; i < entries; ++i) {
+    const uint32_t at = table + kTableHeaderBytes + i * kPinBytes;
+    uint32_t lo = 0, hi = 0;
+    uint8_t shift = 0, gpio_id = 0;
+    if (!r.u16(at, &lo) || !r.u16(at + 2, &hi) || !r.u8(at + 4, &shift) || !r.u8(at + 6, &gpio_id)) return none;
+    if ((i2c_id & kHwCapable) != (gpio_id & kHwCapable) || (i2c_id & kEngineMask) != (gpio_id & kEngineMask) || (i2c_id & kLaneMux) != (gpio_id & kLaneMux)) continue;
+    PinV21 pin;
+    pin.found = true;
+    pin.a_register = lo | (hi << 16);
+    pin.shift = shift;
+    pin.gpio_id = gpio_id;
+    return pin;
+  }
+  return none;
+}
+
 }  // namespace hardware

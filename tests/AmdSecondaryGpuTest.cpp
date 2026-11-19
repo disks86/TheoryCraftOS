@@ -21,7 +21,11 @@
 // AUX, encoder, transmitter and mode setting tables pass their parameters to registers (FakeAuxCard): the POST (ASIC_Init) of a card that needs
 // it, the memory controller's apertures, the display block's start, the EDIDs, the mode chosen, the command tables of one mode on DCE 11 in the
 // driver's order, the surface the CRTC scans out and the CPU draws in, another mode, a DisplayPort output trained, the refusals (no monitor, a
-// BIOS that is no AtomBIOS image, too little video memory), the shutdown; truncated and damaged video BIOS images and EDIDs.
+// BIOS that is no AtomBIOS image, too little video memory), the shutdown; truncated and damaged video BIOS images and EDIDs. Then the same for the DCE 12 path of the
+// discrete Vegas against a SOC15 register file (VegaCard) and an ATOM firmware video BIOS (make_vega_vbios): a Vega 10 with an HDMI monitor (the POST through ASIC_Init with
+// firmware_info 3.1's clocks, the MMHUB / HDP / BIF / display hub registers, the DCE 12 plane, the command tables in DC's order with their parameters, the shutdown) and a
+// Vega 20 with pipe 0 fused off and a DisplayPort sink (the link trained through the 1.5 / 1.6 tables), the refusals of a video BIOS that is no ATOM firmware image and of a
+// chip with every pipe fused off, and damaged images.
 //
 // Built twice by tests/run_host_tests.sh: with -DTCOS_AMD_NATIVE (everything above) and without it (AmdSecondaryGpuOffTest: the driver must refuse
 // before touching the card, so the pool falls back to the probe).
@@ -535,6 +539,366 @@ void test_vbios_damage() {
 }
 #endif
 
+// --- DCE 12 (Vega 10, Vega 20) ---------------------------------------------------------------------------------------------------------------------
+// SOC15 register numbers typed in from AMD's headers and vega10_ip_offset.h (DCE segment 2 is 0x34C0, MMHUB 0x1A000, NBIO segment 2 0xD20, HDP 0xF20).
+constexpr uint32_t V = 0x34C0;
+constexpr uint32_t kVMemsize = 0xD20 + 0xC3, kVFbBase = 0x1A82C, kVFbTop = 0x1A82D, kVScratch0 = 0x4C, kVMarker = 0x7778;
+constexpr uint32_t kVApLow = 0x1A831, kVApHigh = 0x1A832, kVDefaultLsb = 0x1A818, kVTlb = 0x1A833, kVAgpBot = 0x1A82F, kVBifFbEn = 0xD20 + 0xFF, kVHdpFlush = 0xD20 + 0xF7;
+constexpr uint32_t kVNonsurface = 0xF20 + 0x40, kVDchubAgpBot = V + 0x129, kVPipeDis = V + 0xE0, kVDmif0 = V + 0xEF;
+constexpr uint32_t kVGrphEnable = V + 0x55A, kVGrphControl = V + 0x55B, kVGrphPrimary = V + 0x55E, kVGrphPitch = V + 0x560, kVGrphPrimaryHigh = V + 0x561, kVGrphXEnd = V + 0x567,
+                   kVGrphYEnd = V + 0x568, kVCrtcBlank = V + 0x6F0, kVFmt = V + 0x747, kVPipe = 0x200;
+constexpr uint32_t kVDigFe0 = V + 0x187E, kVDigBe0 = V + 0x18C5, kVDig = 0x100, kVHpd0 = V + 0x1602;
+constexpr uint32_t kVDdc3Mask = V + 0x20EE;      // DC_GPIO_DDC3_MASK; A, EN, Y follow (the HDMI connector's line)
+
+// The card: a SOC15 register file; the HDMI monitor's DDC pads (clock bit 0, data bit 8 of DC_GPIO_DDC3_MASK / _A / _EN / _Y) translated to FakeI2cMonitor's pads; the AUX
+// sink's registers; the DMIF buffers' allocation completes at once. ASIC_Init's marker "trains the memory".
+struct VegaCard final : IVcnRegisters {
+  std::map<uint32_t, uint32_t> regs;
+  std::vector<std::pair<uint32_t, uint32_t>> writes;
+  FakeI2cMonitor* monitor = nullptr;
+  FakeAuxCard* aux = nullptr;
+  uint32_t memsize_mib = 256, posts = 0, mask_rest = 0, en_rest = 0, a_rest = 0;
+  static bool in(uint32_t r, uint32_t lo, uint32_t hi) { return r >= lo && r <= hi; }
+  uint32_t get(uint32_t r) const { auto at = regs.find(r); return at == regs.end() ? 0 : at->second; }
+  void post() {
+    regs[kVMemsize] = memsize_mib;
+    regs[kVFbBase] = 0xF00;
+    regs[kVFbTop] = 0xF00 + (memsize_mib + 15) / 16 - 1;
+    regs[kVScratch0 + 7] |= kAsicInitComplete;
+  }
+  static uint32_t pads(uint32_t clk, uint32_t data) { return (clk ? 1u : 0u) | (data ? 0x100u : 0u); }
+  uint32_t ddc_read(uint32_t r) {
+    FakeI2cMonitor& m = *monitor;
+    switch (r - kVDdc3Mask) {
+      case 0: return (mask_rest & ~0x101u) | pads(m.get(FakeI2cMonitor::kMaskClk) & FakeI2cMonitor::kMaskClkBit, m.get(FakeI2cMonitor::kMaskData) & FakeI2cMonitor::kMaskDataBit);
+      case 1: return (a_rest & ~0x101u) | pads(m.get(FakeI2cMonitor::kAClk) & FakeI2cMonitor::kAClkBit, m.get(FakeI2cMonitor::kAData) & FakeI2cMonitor::kADataBit);
+      case 2: return (en_rest & ~0x101u) | pads(m.get(FakeI2cMonitor::kEnClk) & FakeI2cMonitor::kEnClkBit, m.get(FakeI2cMonitor::kEnData) & FakeI2cMonitor::kEnDataBit);
+      default: {
+        const uint32_t clk = m.read(FakeI2cMonitor::kYClk), data = m.read(FakeI2cMonitor::kYData);
+        return pads(clk, data);
+      }
+    }
+  }
+  void ddc_write(uint32_t r, uint32_t v) {
+    FakeI2cMonitor& m = *monitor;
+    auto put = [&](uint32_t reg, uint32_t bit, bool on) { m.write(reg, on ? (m.get(reg) | bit) : (m.get(reg) & ~bit)); };
+    switch (r - kVDdc3Mask) {
+      case 0: mask_rest = v; put(FakeI2cMonitor::kMaskClk, FakeI2cMonitor::kMaskClkBit, v & 1); put(FakeI2cMonitor::kMaskData, FakeI2cMonitor::kMaskDataBit, v & 0x100); break;
+      case 1: a_rest = v; put(FakeI2cMonitor::kAClk, FakeI2cMonitor::kAClkBit, v & 1); put(FakeI2cMonitor::kAData, FakeI2cMonitor::kADataBit, v & 0x100); break;
+      case 2: en_rest = v; put(FakeI2cMonitor::kEnClk, FakeI2cMonitor::kEnClkBit, v & 1); put(FakeI2cMonitor::kEnData, FakeI2cMonitor::kEnDataBit, v & 0x100); break;
+      default: break;
+    }
+  }
+  uint32_t read(uint32_t r) override {
+    if (monitor && in(r, kVDdc3Mask, kVDdc3Mask + 3)) return ddc_read(r);
+    if (aux && (in(r, 0x7010, 0x7061) || in(r, 0x7100, 0x718F))) return aux->read(r);
+    if (in(r, kVDmif0, kVDmif0 + 5)) return get(r) | 0x10;
+    return get(r);
+  }
+  void write(uint32_t r, uint32_t v) override {
+    writes.push_back({r, v});
+    if (monitor && in(r, kVDdc3Mask, kVDdc3Mask + 3)) return ddc_write(r, v);
+    if (aux && (in(r, 0x7010, 0x7061) || in(r, 0x7100, 0x718F))) return aux->write(r, v);
+    regs[r] = v;
+    if (r == kVMarker) {
+      ++posts;
+      post();
+    }
+  }
+  bool written(uint32_t r) const {
+    for (const auto& w : writes) if (w.first == r) return true;
+    return false;
+  }
+  uint32_t count(uint32_t r) const {
+    uint32_t n = 0;
+    for (const auto& w : writes) n += w.first == r;
+    return n;
+  }
+};
+
+// The ATOM firmware video BIOS: firmware_info 3.1 (boot-up clocks 300 / 400 MHz, BIOS scratch registers from 0x4C), gpio_pin_lut 2.1 (HPD pins 1, 2, 3 on bits 0, 8, 16 of
+// DC_GPIO_HPD_A; I2C 0x92 on DC_GPIO_DDC3), display_object_info_table 1.4 (HDMI-A on UNIPHY1 link A = DIG 2 / HPD 1 / I2C 0x92; DisplayPort on UNIPHY link A = DIG 0 / HPD 0 /
+// AUX 0x91; DisplayPort on UNIPHY link B = DIG 1 / HPD 2 / AUX 0x93), and the command tables with DC's revisions passing their parameters to FakeAuxCard: AUX 78, DIG1
+// TransmitterControl 76 (1.6), DIG1EncoderControl 4 (1.5), SetPixelClock 12 (1.7), EnableCRTC 35 (1), SetCRTC_UsingDTDTiming 49 (3); ASIC_Init writes the engine clock to
+// kVMarker.
+std::vector<uint8_t> make_vega_vbios() {
+  std::vector<uint8_t> b(0xC00, 0);
+  auto u8 = [&](uint32_t at, uint32_t v) { b[at] = static_cast<uint8_t>(v); };
+  auto u16 = [&](uint32_t at, uint32_t v) { u8(at, v); u8(at + 1, v >> 8); };
+  auto u32 = [&](uint32_t at, uint32_t v) { u16(at, v); u16(at + 2, v >> 16); };
+  u8(0, 0x55); u8(1, 0xAA); u16(0x48, 0x100);
+  memcpy(&b[0x104], "ATOM", 4);
+  memcpy(&b[0x30], " 761295520", 10);
+  u16(0x120, 0x200);
+  u16(0x11E, 0x640);
+  u16(0x200 + 4 + 23 * 2, 0x5C0);   // the indirect I/O programs: none
+  u16(0x200 + 4 + 12 * 2, 0x300);   // gpio_pin_lut
+  u16(0x200 + 4 + 22 * 2, 0x400);   // displayobjectinfo
+  u16(0x200 + 4 + 4 * 2, 0x340);    // firmwareinfo
+  u16(0x340, 0x60); u8(0x342, 3); u8(0x343, 1);
+  u32(0x344, 0x01020304); u32(0x348, 30000); u32(0x34C, 40000); u32(0x358, kVScratch0);
+  const struct { uint32_t reg; uint8_t shift, id; } pins[4] = {{V + 0x210B, 0, 1}, {V + 0x210B, 8, 2}, {V + 0x210B, 16, 3}, {V + 0x20EF, 0, 0x92}};
+  u16(0x300, 4 + 4 * 8); u8(0x302, 2); u8(0x303, 1);
+  for (uint32_t i = 0; i < 4; ++i) { u32(0x304 + i * 8, pins[i].reg); u8(0x308 + i * 8, pins[i].shift); u8(0x30A + i * 8, pins[i].id); }
+  u16(0x400, 8 + 3 * 16); u8(0x402, 1); u8(0x403, 4); u16(0x404, 0x0FFF); u8(0x406, 3);
+  const struct { uint16_t display, encoder, tag; uint8_t ddc, gpio; } paths[3] = {{0x310C, 0x2120, 0x80, 0x92, 2}, {0x3113, 0x211E, 0x8, 0x91, 1}, {0x3213, 0x221E, 0x200, 0x93, 3}};
+  for (uint32_t i = 0; i < 3; ++i) {
+    const uint32_t at = 0x408 + i * 16, rec = 0x480 + i * 0x10;
+    u16(at, paths[i].display); u16(at + 2, rec - 0x400); u16(at + 4, paths[i].encoder); u16(at + 12, paths[i].tag);
+    u8(rec, 1); u8(rec + 1, 4); u8(rec + 2, paths[i].ddc);
+    u8(rec + 4, 2); u8(rec + 5, 4); u8(rec + 6, paths[i].gpio); u8(rec + 7, 1);
+    u8(rec + 8, 0xFF); u8(rec + 9, 2);
+  }
+  const auto table = [&](uint32_t index, uint32_t at, uint32_t crev, uint32_t param_bytes, const atomimage::Code& code) {
+    u16(0x640 + 4 + index * 2, at);
+    u16(at, 6 + static_cast<uint32_t>(code.b.size()));
+    u8(at + 2, 1);
+    u8(at + 3, crev);
+    u8(at + 4, param_bytes);
+    u8(at + 5, param_bytes);
+    for (size_t i = 0; i < code.b.size(); ++i) u8(at + 6 + static_cast<uint32_t>(i), code.b[i]);
+  };
+  atomimage::Code aux;
+  aux.move(atomimage::REG, FakeAuxCard::kParams1, atomimage::PS, 1);
+  for (uint32_t w = 1; w <= 5; ++w) aux.move(atomimage::REG, FakeAuxCard::kRequest + w, atomimage::FB, w);
+  aux.move(atomimage::REG, FakeAuxCard::kDoorbell, atomimage::PS, 0);
+  for (uint32_t k = 0; k < 4; ++k) aux.move(atomimage::FB, 5 + k, atomimage::REG, FakeAuxCard::kData + k);
+  aux.move(atomimage::PS, 1, atomimage::REG, FakeAuxCard::kStatus, atomimage::BYTE0, 1);
+  aux.move(atomimage::PS, 1, atomimage::REG, FakeAuxCard::kLength, atomimage::BYTE0, 2);
+  aux.eot();
+  table(78, 0x700, 2, 8, aux);
+  atomimage::Code transmitter;
+  for (uint32_t i = 0; i < 3; ++i) transmitter.move(atomimage::REG, FakeAuxCard::kPanel + i, atomimage::PS, i);
+  transmitter.eot();
+  table(76, 0x780, 6, 16, transmitter);
+  atomimage::Code enc;
+  for (uint32_t i = 0; i < 3; ++i) enc.move(atomimage::REG, 0x7050 + i, atomimage::PS, i);
+  enc.eot();
+  table(4, 0x7A0, 5, 12, enc);
+  const struct { uint32_t index, slot, words, crev; } mode_tables[3] = {{12, 0, 4, 7}, {35, 2, 1, 1}, {49, 3, 6, 3}};
+  for (uint32_t k = 0; k < 3; ++k) {
+    atomimage::Code m;
+    for (uint32_t i = 0; i < mode_tables[k].words; ++i) m.move(atomimage::REG, FakeAuxCard::kModeSet + mode_tables[k].slot * 0x10 + i, atomimage::PS, i);
+    m.eot();
+    table(mode_tables[k].index, 0x800 + k * 0x40, mode_tables[k].crev, mode_tables[k].words * 4, m);
+  }
+  atomimage::Code init;
+  init.move(atomimage::REG, kVMarker, atomimage::PS, 0);
+  init.eot();
+  table(0, 0xA40, 1, 8, init);
+  return b;
+}
+
+struct VegaRig {
+  TestAllocator alloc;
+  VegaCard card;
+  Clock clock;
+  FakeI2cMonitor monitor;
+  FakeAuxCard aux;
+  std::vector<uint8_t> vbios = make_vega_vbios();
+  std::vector<uint8_t> bar0 = std::vector<uint8_t>(kApertureBytes, 0xCD);
+  bool vega20 = false;
+  VegaRig() {
+    card.monitor = &monitor;
+    card.aux = &aux;
+    aux.sink.monitor_present = false;
+    monitor.present = false;
+    std::vector<uint8_t>& dpcd = aux.sink.dpcd;
+    dpcd.assign(0x800, 0);
+    const uint8_t caps[8] = {0x12, 0x14, 0xC4, 0x01, 0x00, 0x00, 0x01, 0x00};
+    for (size_t i = 0; i < 8; ++i) dpcd[i] = caps[i];
+    dpcd[0x202] = dpcd[0x203] = 0x77;
+    dpcd[0x204] = 0x01;
+  }
+  Display::Inputs inputs() {
+    Display::Inputs in;
+    in.registers = &card;
+    in.clock = &clock;
+    in.allocator = &alloc;
+    in.vbios = ConstByteView(vbios.data(), vbios.size());
+    in.aperture = ByteView(bar0.data(), bar0.size());
+    in.engine = Engine::Dce12;
+    in.pipe_harvesting = vega20;
+    return in;
+  }
+  void clear_logs() {
+    card.writes.clear();
+    aux.table_order.clear();
+    aux.mode_calls.clear();
+    aux.dig_calls.clear();
+  }
+};
+
+#ifdef TCOS_AMD_NATIVE
+std::vector<uint32_t> encoder_actions(const FakeAuxCard& aux) {
+  std::vector<uint32_t> out;
+  for (const FakeAuxCard::DigCall& c : aux.dig_calls) if (c.table == 0) out.push_back((c.words[0] >> 8) & 0xFF);
+  return out;
+}
+
+void test_vega10_hdmi() {
+  VegaRig rig;
+  rig.monitor.present = true;
+  rig.monitor.edid = edid_with_timings({t1080, t720});
+  Display display(rig.inputs());
+  CHECK(display.start() == Status::Ok && display.running() && display.engine() == Engine::Dce12);
+  if (!display.running()) printf("  vega10: %s stage %d\n", display.status(), int(display.mode_stage()));
+  // the POST: BIOS scratch 7 (0x4C + 7) lacked ASIC_INIT_COMPLETE; ASIC_Init ran with firmware_info 3.1's boot-up engine clock
+  CHECK(display.posted() && rig.card.posts == 1 && rig.card.get(kVMarker) == 30000);
+  // the memory: 256 MiB at 0xF00 << 24; the system aperture over it, the scratch page 16 MiB in, the AGP aperture empty, the L1 TLB, BIF, HDP, display hub
+  const uint64_t base = 0xF00ull << 24;
+  CHECK(display.memory_map().read && display.memory_map().gpu_base == base && display.memory_map().video_memory_bytes == (256ull << 20));
+  CHECK(rig.card.get(kVApLow) == static_cast<uint32_t>(base >> 18) && rig.card.get(kVApHigh) == static_cast<uint32_t>((base + (256ull << 20) - 1) >> 18));
+  CHECK(rig.card.get(kVDefaultLsb) == static_cast<uint32_t>(kScratchOffset >> 12) && rig.card.get(kVAgpBot) == 0xFFFFFF && rig.card.get(kVBifFbEn) == 3);
+  CHECK(rig.card.get(kVTlb) == (1u | 3u << 3 | 1u << 6 | 3u << 11 | 1u << 13) && rig.card.get(kVNonsurface) == static_cast<uint32_t>(base >> 8) &&
+        rig.card.get(kVDchubAgpBot) == 0x3FFFF);
+  // the connectors: HDMI (DIG 2) with the monitor on DDC 3, two DisplayPorts without sinks
+  CHECK(display.connectors().size() == 3 && display.connector() == 0 && display.edid(0).size() == 128 && display.edid(1).empty() && display.edid(2).empty());
+  CHECK(display.width() == 1920 && display.height() == 1080 && display.bpc() == 8 && display.crtc() == 0 && display.pll() == AmdModeSet::kComboPhyPll0 + 2);
+  // the command tables: the three DIGs' transmitter INIT, then the pixel clock, the timing, EnableCRTC, the stream setup, the transmitter on; no power gating (13)
+  const std::vector<uint32_t> want = {76, 76, 76, 12, 49, 35, 4, 76};
+  CHECK(rig.aux.table_order == want);
+  if (rig.aux.table_order != want) { for (uint32_t t : rig.aux.table_order) printf(" %u", t); printf("\n"); }
+  const std::vector<FakeAuxCard::DigCall>& dc = rig.aux.dig_calls;
+  const std::vector<FakeAuxCard::ModeCall>& mc = rig.aux.mode_calls;
+  CHECK(dc.size() == 5 && mc.size() == 3);
+  if (dc.size() == 5 && mc.size() == 3) {
+    // INIT (action 7): PHY 2, the DVI mode of no signal, four lanes, no clock, HPD 2 (pin 1), no front end, the HDMI connector (0x0C); then the DisplayPorts' PHYs 0 and 1
+    CHECK(dc[0].table == 2 && dc[0].words[0] == (2u | 7u << 8 | 2u << 16 | 4u << 24) && dc[0].words[1] == 0 && dc[0].words[2] == (2u | 0x0Cu << 16));
+    CHECK((dc[1].words[0] & 0xFF) == 0 && (dc[1].words[2] & 0xFF) == 1 && (dc[2].words[0] & 0xFF) == 1 && (dc[2].words[2] & 0xFF) == 3);
+    // SetPixelClock 1.7: 148.5 MHz in 100 Hz, combo PHY PLL 2 (22), UNIPHY1 (0x20), HDMI, CRTC 0 (ATOM_CRTC1), no deep colour
+    CHECK(mc[0].table == 12 && mc[0].words == std::vector<uint32_t>({1485000, 22u | 0x20u << 8 | 3u << 16, 0, 0}));
+    CHECK(mc[1].table == 49 && mc[1].words == std::vector<uint32_t>({1920u | 280u << 16, 1080u | 45u << 16, 88u | 44u << 16, 4u | 5u << 16, 0, 0}));
+    CHECK(mc[2].table == 35 && mc[2].words == std::vector<uint32_t>({1u << 8}));
+    // DIG1EncoderControl 1.5 stream setup: DIG 2, HDMI, four lanes, 148.5 MHz, 8 bpc; the transmitter on: PHY 2, HDMI, four lanes, 148.5 MHz, HPD 2, no front end
+    CHECK(dc[3].table == 0 && dc[3].words[0] == (2u | 0x0Fu << 8 | 3u << 16 | 4u << 24) && dc[3].words[1] == 14850 && dc[3].words[2] == 2u);
+    CHECK(dc[4].table == 2 && dc[4].words[0] == (2u | 1u << 8 | 3u << 16 | 4u << 24) && dc[4].words[1] == 14850 && dc[4].words[2] == (2u | 0x0Cu << 16));
+  }
+  // the DCE 12 plane on CRTC 0: on, linear ARGB8888 (depth 2, colour expansion), at the surface 32 MiB in, 1920 a row
+  CHECK(rig.card.get(kVGrphEnable) == 1 && rig.card.get(kVGrphControl) == (0x80000000u | 2u) && rig.card.get(kVGrphPrimary) == static_cast<uint32_t>(kSurfaceOffset) &&
+        rig.card.get(kVGrphPrimaryHigh) == 0xF);
+  CHECK(rig.card.get(kVGrphPitch) == 1920 && rig.card.get(kVGrphXEnd) == 1920 && rig.card.get(kVGrphYEnd) == 1080 && rig.card.get(kVFmt) == 0x11);
+  // the DIG front end 2 on CRTC 0, the back end on front end 2, the back end's hot plug select (pin 1), unblanked, the pins on
+  CHECK((rig.card.get(kVDigFe0 + 2 * kVDig) & 7) == 0 && ((rig.card.get(kVDigBe0 + 2 * kVDig) >> 8) & 0x7F) == 0x04 && (rig.card.get(kVDigBe0 + 2 * kVDig) >> 28) == 1);
+  CHECK(rig.card.written(kVCrtcBlank) && rig.card.get(kVCrtcBlank) == 0 && rig.card.get(kVHpd0 + 8) == 0x10000000 && rig.card.get(kVHpd0) == 0x10000000);
+  // drawing: the surface cleared; the flush is the NBIO's HDP flush register
+  CHECK(display.pixels().data() == rig.bar0.data() + kSurfaceOffset && rig.bar0[kSurfaceOffset] == 0);
+  const uint32_t flushes = rig.card.count(kVHdpFlush);
+  display.flush();
+  CHECK(rig.card.count(kVHdpFlush) == flushes + 1);
+  // another mode: the stream taken down (transmitter off, CRTC off, PLL down) and set again at 720p
+  rig.clear_logs();
+  CHECK(display.set_mode(1) == Status::Ok && display.width() == 1280 && rig.card.get(kVGrphPitch) == 1280);
+  CHECK(rig.aux.table_order == std::vector<uint32_t>({76, 35, 12, 12, 49, 35, 4, 76}));
+  // the shutdown: the transmitter off, the CRTC off, the plane off, the combo PHY PLL powered down (no CRTC, no clock, the CRT mode, FORCE_PROG_PPLL), the pins off
+  rig.clear_logs();
+  display.shutdown();
+  CHECK(!display.running() && rig.card.get(kVGrphEnable) == 0 && rig.card.get(kVHpd0 + 8) == 0);
+  CHECK(rig.aux.table_order == std::vector<uint32_t>({76, 35, 12}));
+  CHECK(!rig.aux.mode_calls.empty() && rig.aux.mode_calls.back().words == std::vector<uint32_t>({0, 22u | 15u << 16 | 1u << 24, 0xFF, 0}));
+  CHECK(!rig.aux.dig_calls.empty() && (rig.aux.dig_calls[0].words[0] >> 8 & 0xFF) == 0);
+}
+
+void test_vega20_dp() {
+  VegaRig rig;
+  rig.vega20 = true;
+  rig.card.regs[kVPipeDis] = 0x1;            // pipe 0 fused off
+  rig.aux.sink.monitor_present = true;
+  rig.aux.sink.edid = edid_with_timings({t1080});
+  Display display(rig.inputs());
+  CHECK(display.start() == Status::Ok && display.connector() == 1 && display.crtc() == 1 && display.pll() == AmdModeSet::kDpDto);
+  if (!display.running()) printf("  vega20: %s stage %d\n", display.status(), int(display.mode_stage()));
+  CHECK(display.link().outcome.trained() && display.link().config.lanes == 4 && display.link().config.rate_khz == 162000);
+  // the INITs, the timing, the stream, the panel mode, the transmitter on, the training (start, pattern 1, the drive on each of four lanes, pattern 3, complete), the video on
+  const std::vector<uint32_t> want = {76, 76, 76, 12, 49, 35, 4, 4, 76, 4, 4, 76, 76, 76, 76, 4, 4, 4};
+  CHECK(rig.aux.table_order == want);
+  if (rig.aux.table_order != want) { for (uint32_t t : rig.aux.table_order) printf(" %u", t); printf(" stage %d\n", int(display.mode_stage())); }
+  CHECK(encoder_actions(rig.aux) == std::vector<uint32_t>({0x0F, 0x10, 0x08, 0x09, 0x13, 0x0B, 0x0D}));
+  for (const FakeAuxCard::DigCall& c : rig.aux.dig_calls) {
+    if (c.table == 0 && ((c.words[0] >> 8) & 0xFF) == 0x0F) CHECK(c.words[0] == (0u | 0x0Fu << 8 | 0u << 16 | 4u << 24) && c.words[1] == 14850 && c.words[2] == (2u | 6u << 8));
+    if (c.table == 2 && ((c.words[0] >> 8) & 0xFF) == 1) CHECK(c.words[0] == (0u | 1u << 8 | 0u << 16 | 4u << 24) && c.words[1] == 16200 && c.words[2] == (1u | 0x13u << 16));
+    if (c.table == 2 && ((c.words[0] >> 8) & 0xFF) == 11) CHECK((c.words[0] >> 24) == 4 && c.words[1] == 16200);
+  }
+  // the pixel clock on the DP DTO for CRTC 1 (ATOM_CRTC2), the timing and EnableCRTC on CRTC 1
+  for (const FakeAuxCard::ModeCall& c : rig.aux.mode_calls) {
+    if (c.table == 12) CHECK(c.words == std::vector<uint32_t>({1485000, 11u | 0x1Eu << 8, 1, 0}));
+    if (c.table == 49) CHECK(c.words[5] == 1);
+    if (c.table == 35) CHECK(c.words[0] == (1u | 1u << 8));
+  }
+  // pipe 1's plane, DIG 0's front end on CRTC 1
+  CHECK(rig.card.get(kVGrphEnable) == 0 && rig.card.get(kVGrphEnable + kVPipe) == 1 && rig.card.get(kVGrphPrimary + kVPipe) == static_cast<uint32_t>(kSurfaceOffset));
+  CHECK((rig.card.get(kVDigFe0) & 7) == 1 && ((rig.card.get(kVDigBe0) >> 8) & 0x7F) == 0x01);
+  std::vector<uint8_t>& dpcd = rig.aux.sink.dpcd;
+  CHECK(dpcd[0x600] == 0x01 && dpcd[0x100] == 0x06 && (dpcd[0x101] & 0x1F) == 4 && dpcd[0x102] == 0);
+  // the shutdown: DP video off, the sink to D3, the transmitter off, the CRTC off; the DP DTO left alone (no SetPixelClock)
+  rig.clear_logs();
+  display.shutdown();
+  CHECK(dpcd[0x600] == 0x02 && rig.aux.table_order == std::vector<uint32_t>({4, 76, 35}) && rig.card.get(kVGrphEnable + kVPipe) == 0);
+  // a sink that never locks: the training fails, everything is switched off again
+  VegaRig bad;
+  bad.aux.sink.monitor_present = true;
+  bad.aux.sink.edid = edid_with_timings({t1080});
+  bad.aux.sink.dpcd[0x202] = bad.aux.sink.dpcd[0x203] = 0x00;
+  Display failing(bad.inputs());
+  CHECK(failing.start() == Status::ModeSet && failing.mode_stage() == ModeStage::LinkTraining && !failing.running() && bad.card.get(kVGrphEnable) == 0);
+}
+
+void test_vega_refusals() {
+  {
+    // every pipe fused off
+    VegaRig rig;
+    rig.vega20 = true;
+    rig.card.regs[kVPipeDis] = 0x3F;
+    rig.monitor.present = true;
+    rig.monitor.edid = edid_with_timings({t1080});
+    Display display(rig.inputs());
+    CHECK(display.start() == Status::NoPipe && rig.aux.table_order.empty());
+  }
+  {
+    // the Polaris video BIOS (no firmware_info 3.x): refused before anything is written
+    VegaRig rig;
+    rig.vbios = make_vbios();
+    Display display(rig.inputs());
+    CHECK(display.start() == Status::NoBios && rig.card.writes.empty());
+  }
+  {
+    // a card already POSTed is not POSTed again; no monitor
+    VegaRig rig;
+    rig.card.post();
+    Display display(rig.inputs());
+    CHECK(display.start() == Status::NoMonitor && !display.posted() && rig.card.posts == 0);
+  }
+  // truncated and bit-flipped images: start() stays inside them
+  const std::vector<uint8_t> good = make_vega_vbios();
+  for (size_t len = 0; len <= good.size(); len += 11) {
+    VegaRig rig;
+    rig.card.post();
+    rig.monitor.present = true;
+    rig.monitor.edid = edid_with_timings({t1080});
+    rig.vbios.assign(good.begin(), good.begin() + static_cast<long>(len));
+    Display display(rig.inputs());
+    (void)display.start();
+  }
+  uint32_t rng = 4242;
+  for (int round = 0; round < 300; ++round) {
+    VegaRig rig;
+    rig.card.post();
+    rig.monitor.present = true;
+    rig.monitor.edid = edid_with_timings({t1080});
+    for (int flips = 0; flips < 1 + round % 4; ++flips) {
+      rng = rng * 1664525u + 1013904223u;
+      const uint32_t bit = 0x200 * 8 + (rng >> 8) % ((0x4C0 - 0x200) * 8);      // the data list to the end of the object table's records
+      rig.vbios[bit / 8] ^= static_cast<uint8_t>(1u << (bit % 8));
+    }
+    Display display(rig.inputs());
+    const Status st = display.start();
+    CHECK(st == Status::Ok || st == Status::NoConnectors || st == Status::NoMonitor || st == Status::NoMode || st == Status::ModeSet || st == Status::NoBios ||
+          st == Status::PostFailed);
+    display.shutdown();
+  }
+}
+#endif
+
 // --- the IGraphicsProcessingUnit -------------------------------------------------------------------------------------------------------------
 void test_gpu() {
   TestAllocator alloc;
@@ -549,6 +913,15 @@ void test_gpu() {
   other.device_id = 0x6987;       // Polaris 12
   CHECK(AmdSecondaryGpu::supports(other));
   other.device_id = 0x687F;       // Vega 10 (DCE 12): not this driver's
+  CHECK(AmdSecondaryGpu::supports(other));
+  other.device_id = 0x69AF;       // Vega 12
+  CHECK(AmdSecondaryGpu::supports(other));
+  other.device_id = 0x66AF;       // Vega 20
+  CHECK(AmdSecondaryGpu::supports(other));
+  bool harvest = true;
+  CHECK(engine_of(0x687F, &harvest) && *engine_of(0x687F) == Engine::Dce12 && !harvest && engine_of(0x66A1, &harvest) && harvest && *engine_of(0x67DF) == Engine::Dce11);
+  CHECK(!engine_of(0x15DD) && !engine_of(0x731F));     // (a Raven APU, Navi 10)
+  other.device_id = 0x15DD;       // Raven (an APU: its DCN 1.0 is AmdDcn1's)
   CHECK(!AmdSecondaryGpu::supports(other));
   other.device_id = 0x731F;       // Navi 10 (DCN 2)
   CHECK(!AmdSecondaryGpu::supports(other));
@@ -568,6 +941,24 @@ void test_gpu() {
   CHECK(!gpu.initialize_with(rig.inputs()) && rig.card.writes.empty() && rig.card.regs.size() == 6);
   CHECK(gpu.mode_count() == 0 && gpu.connector_count() == 0 && gpu.width() == 0);
   gpu.shutdown();
+  {
+    PciDeviceInfo vega = device;
+    vega.device_id = 0x687F;
+    GpuContext vega_context{nullptr, nullptr, vega, &alloc, nullptr};
+    AmdSecondaryGpu vega_gpu(vega_context);
+    VegaCard card;
+    Clock clock;
+    std::vector<uint8_t> image = make_vega_vbios();
+    std::vector<uint8_t> bar(kApertureBytes);
+    Display::Inputs in;
+    in.registers = &card;
+    in.clock = &clock;
+    in.allocator = &alloc;
+    in.vbios = ConstByteView(image.data(), image.size());
+    in.aperture = ByteView(bar.data(), bar.size());
+    in.engine = Engine::Dce12;
+    CHECK(!vega_gpu.initialize() && !vega_gpu.initialize_with(in) && card.writes.empty() && strstr(vega_gpu.status(), "TCOS_AMD_NATIVE") != nullptr);
+  }
 #else
   CHECK(!gpu.initialize());           // (no register mapper or PCI bus in the context)
   CHECK(rig.card.writes.empty());
@@ -618,6 +1009,9 @@ int main() {
   test_displayport();
   test_refusals();
   test_vbios_damage();
+  test_vega10_hdmi();
+  test_vega20_dp();
+  test_vega_refusals();
 #endif
   test_gpu();
   if (g_failed) {
