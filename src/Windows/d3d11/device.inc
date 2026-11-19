@@ -25,7 +25,8 @@ static HRESULT STDMETHODCALLTYPE dev_QueryInterface(Dev *d, REFIID riid, void **
   if (!out) return E_POINTER;
   *out = NULL;
   if (guid_eq(riid, &IID_IUnknown) || guid_eq(riid, &IID_ID3D11Device)) *out = d;
-  else if (guid_eq(riid, &IID_IDXGIObject) || guid_eq(riid, &IID_IDXGIDevice) || guid_eq(riid, &IID_IDXGIDevice1)) *out = &d->dxgi;
+  else if (guid_eq(riid, &IID_IDXGIObject) || guid_eq(riid, &IID_IDXGIDevice) || guid_eq(riid, &IID_IDXGIDevice1) || guid_eq(riid, &IID_IDXGIDevice2) ||
+           guid_eq(riid, &IID_IDXGIDevice3)) *out = &d->dxgi;      /* (DXGI 1.2: ANGLE needs it to present to another process's window) */
   else if (guid_eq(riid, &IID_ITcosPresenter)) *out = &d->presenter;
   else return E_NOINTERFACE;
   dx_AddRef(OBJ(d));
@@ -106,12 +107,35 @@ static HRESULT STDMETHODCALLTYPE dxgi_SetGPUThreadPriority(IDXGIDevice1 *p, INT 
 static HRESULT STDMETHODCALLTYPE dxgi_GetGPUThreadPriority(IDXGIDevice1 *p, INT *priority) { (void)p; if (priority) *priority = 0; return S_OK; }
 static HRESULT STDMETHODCALLTYPE dxgi_SetMaximumFrameLatency(IDXGIDevice1 *p, UINT latency) { (void)p; (void)latency; return S_OK; }
 static HRESULT STDMETHODCALLTYPE dxgi_GetMaximumFrameLatency(IDXGIDevice1 *p, UINT *latency) { (void)p; if (latency) *latency = 3; return S_OK; }
-static const IDXGIDevice1Vtbl g_dxgi_vtbl = {
-    .QueryInterface = dxgi_QueryInterface, .AddRef = dxgi_AddRef, .Release = dxgi_Release, .SetPrivateData = dxgi_SetPrivateData,
-    .SetPrivateDataInterface = dxgi_SetPrivateDataInterface, .GetPrivateData = dxgi_GetPrivateData, .GetParent = dxgi_GetParent, .GetAdapter = dxgi_GetAdapter,
-    .CreateSurface = dxgi_CreateSurface, .QueryResourceResidency = dxgi_QueryResourceResidency, .SetGPUThreadPriority = dxgi_SetGPUThreadPriority,
-    .GetGPUThreadPriority = dxgi_GetGPUThreadPriority, .SetMaximumFrameLatency = dxgi_SetMaximumFrameLatency, .GetMaximumFrameLatency = dxgi_GetMaximumFrameLatency,
+/* IDXGIDevice2 and 3: memory is never taken back from a resource, so an offered one is always reclaimed intact; the queue runs each list before it returns,
+ * so the work before an EnqueueSetEvent is done when it is called. */
+static HRESULT STDMETHODCALLTYPE dxgi_OfferResources(IDXGIDevice1 *p, UINT count, IDXGIResource *const *resources, DXGI_OFFER_RESOURCE_PRIORITY priority) {
+  (void)p; (void)priority;
+  return count && !resources ? E_INVALIDARG : S_OK;
+}
+static HRESULT STDMETHODCALLTYPE dxgi_ReclaimResources(IDXGIDevice1 *p, UINT count, IDXGIResource *const *resources, BOOL *discarded) {
+  (void)p;
+  if (count && !resources) return E_INVALIDARG;
+  for (UINT i = 0; discarded && i < count; ++i) discarded[i] = FALSE;
+  return S_OK;
+}
+static HRESULT STDMETHODCALLTYPE dxgi_EnqueueSetEvent(IDXGIDevice1 *p, HANDLE event) {
+  Dev *d = dev_of_dxgi(p);
+  if (!event) return E_INVALIDARG;
+  EnterCriticalSection(&d->lock);
+  flush(d);
+  LeaveCriticalSection(&d->lock);
+  return SetEvent(event) ? S_OK : E_INVALIDARG;
+}
+static void STDMETHODCALLTYPE dxgi_Trim(IDXGIDevice1 *p) { (void)p; }
+#define DXGI_SLOT(name) .name = (__typeof__(((IDXGIDevice3Vtbl *)0)->name))dxgi_##name
+static const IDXGIDevice3Vtbl g_dxgi_vtbl = {
+    DXGI_SLOT(QueryInterface), DXGI_SLOT(AddRef), DXGI_SLOT(Release), DXGI_SLOT(SetPrivateData), DXGI_SLOT(SetPrivateDataInterface), DXGI_SLOT(GetPrivateData),
+    DXGI_SLOT(GetParent), DXGI_SLOT(GetAdapter), DXGI_SLOT(CreateSurface), DXGI_SLOT(QueryResourceResidency), DXGI_SLOT(SetGPUThreadPriority),
+    DXGI_SLOT(GetGPUThreadPriority), DXGI_SLOT(SetMaximumFrameLatency), DXGI_SLOT(GetMaximumFrameLatency), DXGI_SLOT(OfferResources), DXGI_SLOT(ReclaimResources),
+    DXGI_SLOT(EnqueueSetEvent), DXGI_SLOT(Trim),
 };
+#undef DXGI_SLOT
 
 /* ---- the swap chain's side (dxgi.dll) -------------------------------------------------------------------------------------------------------------- */
 
@@ -257,7 +281,7 @@ static HRESULT dev_create(IDXGIAdapter *adapter, UINT flags, const D3D_FEATURE_L
   Dev *d = mem_alloc(sizeof *d);
   if (!d) return E_OUTOFMEMORY;
   dx_init(&d->o, &dev_vtbl, g_dev_iids, dev_destroy);
-  d->dxgi.lpVtbl = &g_dxgi_vtbl;
+  d->dxgi.lpVtbl = (const IDXGIDevice1Vtbl *)&g_dxgi_vtbl;      /* (IDXGIDevice3's table begins with IDXGIDevice1's) */
   d->presenter.lpVtbl = &g_presenter_vtbl;
   InitializeCriticalSection(&d->lock);
   d->level = level;

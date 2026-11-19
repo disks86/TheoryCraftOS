@@ -19,7 +19,8 @@ recorded draw uses, the last reference of a resource a recorded command uses.
 | input layouts | the kernel takes 32-bit floats only: a layout with R8G8B8A8 or B8G8R8A8 colours gets its vertex buffers converted (a second buffer, made again when the first changes). |
 | state objects | one Direct3D 12 pipeline state for each combination of shaders, layout, blend, depth-stencil and rasterizer state that is drawn with, in a cache of 96. |
 | textures and samplers of the pixel shader | a table of 8 of each (t0 .. t7, s0 .. s7). A slot with nothing bound samples a white pixel. |
-| swap chains | `dxgi.dll` asks the device for its back buffers and their pixels (`ITcosPresenter`, src/Windows/tcosdx.h); the device hands out the Direct3D 12 queue's back buffers inside its own textures. The device is an `IDXGIDevice` too. |
+| swap chains | `dxgi.dll` asks the device for its back buffers and their pixels (`ITcosPresenter`, src/Windows/tcosdx.h); the device hands out the Direct3D 12 queue's back buffers inside its own textures. The device is an `IDXGIDevice` too (up to `IDXGIDevice3`: resources offered are never discarded, `EnqueueSetEvent` sets the event once the work before it ran). |
+| queries | event, timestamp, timestamp-disjoint and occlusion queries. The queue runs each list before it returns, so `End` sends what was recorded and the query is answered: an event is done, a timestamp is `QueryPerformanceCounter` then. Occlusion is not counted (it says one sample passed). |
 
 **The pixel shader's constants.** A Direct3D 11 pixel shader has constant buffers of its own, b0 .. b13, beside the vertex shader's. The
 kernel compiles a shader's constant buffers end to end into the one block; for a pipeline made by `d3d11.dll` the pixel shader's begin where
@@ -34,7 +35,7 @@ the vertex shader's end. `d3d11.dll` reads the sizes out of the shaders (`dcl_co
 
 - Deferred contexts and command lists; geometry, hull, domain and compute shaders; textures, samplers of the vertex shader.
 - 1D, 3D and cube textures; multisampling; mipmaps of a render target (`GenerateMips` does nothing); buffers as shader resources; unordered
-  access; stream output; queries and predicates (E_NOTIMPL).
+  access; stream output; predicates, counters and pipeline-statistics queries (E_NOTIMPL / E_INVALIDARG); occlusion counts.
 - The sampler of t<n> is s<n>: the kernel pairs them by number. A shader that samples one texture with two samplers gets one.
 - Blend factors (`D3D11_BLEND_BLEND_FACTOR` is 1), wireframe, depth bias, the back face's stencil operations, anisotropy, border colours,
   comparison samplers - what Direct3D 12 here has not.

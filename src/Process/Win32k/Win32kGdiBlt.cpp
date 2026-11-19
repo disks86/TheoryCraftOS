@@ -157,7 +157,7 @@ uint64_t NtGdiBitBlt(Call& c) {
 }  // namespace
 
 bool copy_to_layered_surface(Call& c, uint32_t source_handle, int32_t sx, int32_t sy, int32_t width, int32_t height, uint32_t surface, int32_t dx, int32_t dy, bool per_pixel,
-                             uint8_t constant) {
+                             uint8_t constant, bool keyed, uint32_t key) {
   Source src;
   if (!source_dc(c, source_handle, &src)) return false;
   uint32_t sw = 0, sh = 0;
@@ -188,6 +188,7 @@ bool copy_to_layered_surface(Call& c, uint32_t source_handle, int32_t sx, int32_
         g = (cr >> 8) & 0xFF;
         b = (cr >> 16) & 0xFF;
       }
+      if (keyed && make_rgb(r, g, b) == (key & 0xFFFFFFu)) a = 0;      // (the key is compared with the colour as the source has it)
       a = a * constant / 255;
       const uint64_t o = (uint64_t(uint32_t(y)) * sw + uint32_t(x)) * 4;
       if (o + 4 > out.size()) continue;

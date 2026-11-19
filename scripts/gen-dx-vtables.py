@@ -66,6 +66,7 @@ SPECS = {
         ('ID3D11DepthStencilState', 'depth_vtbl', ['depth', 'child', 'obj']),
         ('ID3D11RasterizerState', 'raster_vtbl', ['raster', 'child', 'obj']),
         ('ID3D11SamplerState', 'sampler_vtbl', ['sampler', 'child', 'obj']),
+        ('ID3D11Query', 'query_vtbl', ['query', 'child', 'obj']),
     ],
     'd3d9': [
         ('IDirect3D9', 'd3d_vtbl', ['d3d', 'obj']),

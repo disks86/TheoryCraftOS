@@ -8,7 +8,6 @@ static HRESULT STDMETHODCALLTYPE dev_vtbl_none_CreateHullShader(ID3D11Device *Th
 static HRESULT STDMETHODCALLTYPE dev_vtbl_none_CreateDomainShader(ID3D11Device *This, const void *pShaderBytecode, SIZE_T BytecodeLength, ID3D11ClassLinkage *pClassLinkage, ID3D11DomainShader **ppDomainShader) { return E_NOTIMPL; }
 static HRESULT STDMETHODCALLTYPE dev_vtbl_none_CreateComputeShader(ID3D11Device *This, const void *pShaderBytecode, SIZE_T BytecodeLength, ID3D11ClassLinkage *pClassLinkage, ID3D11ComputeShader **ppComputeShader) { return E_NOTIMPL; }
 static HRESULT STDMETHODCALLTYPE dev_vtbl_none_CreateClassLinkage(ID3D11Device *This, ID3D11ClassLinkage **ppLinkage) { return E_NOTIMPL; }
-static HRESULT STDMETHODCALLTYPE dev_vtbl_none_CreateQuery(ID3D11Device *This, const D3D11_QUERY_DESC *pQueryDesc, ID3D11Query **ppQuery) { return E_NOTIMPL; }
 static HRESULT STDMETHODCALLTYPE dev_vtbl_none_CreatePredicate(ID3D11Device *This, const D3D11_QUERY_DESC *pPredicateDesc, ID3D11Predicate **ppPredicate) { return E_NOTIMPL; }
 static HRESULT STDMETHODCALLTYPE dev_vtbl_none_CreateCounter(ID3D11Device *This, const D3D11_COUNTER_DESC *pCounterDesc, ID3D11Counter **ppCounter) { return E_NOTIMPL; }
 static HRESULT STDMETHODCALLTYPE dev_vtbl_none_CreateDeferredContext(ID3D11Device *This, UINT ContextFlags, ID3D11DeviceContext **ppDeferredContext) { return E_NOTIMPL; }
@@ -40,7 +39,7 @@ const ID3D11DeviceVtbl dev_vtbl = {
     .CreateDepthStencilState = (__typeof__(((ID3D11DeviceVtbl *)0)->CreateDepthStencilState))dev_CreateDepthStencilState,
     .CreateRasterizerState = (__typeof__(((ID3D11DeviceVtbl *)0)->CreateRasterizerState))dev_CreateRasterizerState,
     .CreateSamplerState = (__typeof__(((ID3D11DeviceVtbl *)0)->CreateSamplerState))dev_CreateSamplerState,
-    .CreateQuery = (__typeof__(((ID3D11DeviceVtbl *)0)->CreateQuery))dev_vtbl_none_CreateQuery,
+    .CreateQuery = (__typeof__(((ID3D11DeviceVtbl *)0)->CreateQuery))dev_CreateQuery,
     .CreatePredicate = (__typeof__(((ID3D11DeviceVtbl *)0)->CreatePredicate))dev_vtbl_none_CreatePredicate,
     .CreateCounter = (__typeof__(((ID3D11DeviceVtbl *)0)->CreateCounter))dev_vtbl_none_CreateCounter,
     .CreateDeferredContext = (__typeof__(((ID3D11DeviceVtbl *)0)->CreateDeferredContext))dev_vtbl_none_CreateDeferredContext,
@@ -64,9 +63,6 @@ static void STDMETHODCALLTYPE ctx_vtbl_none_GSSetConstantBuffers(ID3D11DeviceCon
 static void STDMETHODCALLTYPE ctx_vtbl_none_GSSetShader(ID3D11DeviceContext *This, ID3D11GeometryShader *pShader, ID3D11ClassInstance *const *ppClassInstances, UINT NumClassInstances) {  }
 static void STDMETHODCALLTYPE ctx_vtbl_none_VSSetShaderResources(ID3D11DeviceContext *This, UINT StartSlot, UINT NumViews, ID3D11ShaderResourceView *const *ppShaderResourceViews) {  }
 static void STDMETHODCALLTYPE ctx_vtbl_none_VSSetSamplers(ID3D11DeviceContext *This, UINT StartSlot, UINT NumSamplers, ID3D11SamplerState *const *ppSamplers) {  }
-static void STDMETHODCALLTYPE ctx_vtbl_none_Begin(ID3D11DeviceContext *This, ID3D11Asynchronous *pAsync) {  }
-static void STDMETHODCALLTYPE ctx_vtbl_none_End(ID3D11DeviceContext *This, ID3D11Asynchronous *pAsync) {  }
-static HRESULT STDMETHODCALLTYPE ctx_vtbl_none_GetData(ID3D11DeviceContext *This, ID3D11Asynchronous *pAsync, void *pData, UINT DataSize, UINT GetDataFlags) { return E_NOTIMPL; }
 static void STDMETHODCALLTYPE ctx_vtbl_none_SetPredication(ID3D11DeviceContext *This, ID3D11Predicate *pPredicate, WINBOOL PredicateValue) {  }
 static void STDMETHODCALLTYPE ctx_vtbl_none_GSSetShaderResources(ID3D11DeviceContext *This, UINT StartSlot, UINT NumViews, ID3D11ShaderResourceView *const *ppShaderResourceViews) {  }
 static void STDMETHODCALLTYPE ctx_vtbl_none_GSSetSamplers(ID3D11DeviceContext *This, UINT StartSlot, UINT NumSamplers, ID3D11SamplerState *const *ppSamplers) {  }
@@ -144,9 +140,9 @@ const ID3D11DeviceContextVtbl ctx_vtbl = {
     .IASetPrimitiveTopology = (__typeof__(((ID3D11DeviceContextVtbl *)0)->IASetPrimitiveTopology))ctx_IASetPrimitiveTopology,
     .VSSetShaderResources = (__typeof__(((ID3D11DeviceContextVtbl *)0)->VSSetShaderResources))ctx_vtbl_none_VSSetShaderResources,
     .VSSetSamplers = (__typeof__(((ID3D11DeviceContextVtbl *)0)->VSSetSamplers))ctx_vtbl_none_VSSetSamplers,
-    .Begin = (__typeof__(((ID3D11DeviceContextVtbl *)0)->Begin))ctx_vtbl_none_Begin,
-    .End = (__typeof__(((ID3D11DeviceContextVtbl *)0)->End))ctx_vtbl_none_End,
-    .GetData = (__typeof__(((ID3D11DeviceContextVtbl *)0)->GetData))ctx_vtbl_none_GetData,
+    .Begin = (__typeof__(((ID3D11DeviceContextVtbl *)0)->Begin))ctx_Begin,
+    .End = (__typeof__(((ID3D11DeviceContextVtbl *)0)->End))ctx_End,
+    .GetData = (__typeof__(((ID3D11DeviceContextVtbl *)0)->GetData))ctx_GetData,
     .SetPredication = (__typeof__(((ID3D11DeviceContextVtbl *)0)->SetPredication))ctx_vtbl_none_SetPredication,
     .GSSetShaderResources = (__typeof__(((ID3D11DeviceContextVtbl *)0)->GSSetShaderResources))ctx_vtbl_none_GSSetShaderResources,
     .GSSetSamplers = (__typeof__(((ID3D11DeviceContextVtbl *)0)->GSSetSamplers))ctx_vtbl_none_GSSetSamplers,
@@ -358,4 +354,15 @@ const ID3D11SamplerStateVtbl sampler_vtbl = {
     .SetPrivateData = (__typeof__(((ID3D11SamplerStateVtbl *)0)->SetPrivateData))obj_SetPrivateData,
     .SetPrivateDataInterface = (__typeof__(((ID3D11SamplerStateVtbl *)0)->SetPrivateDataInterface))obj_SetPrivateDataInterface,
     .GetDesc = (__typeof__(((ID3D11SamplerStateVtbl *)0)->GetDesc))sampler_GetDesc,
+};
+const ID3D11QueryVtbl query_vtbl = {
+    .QueryInterface = (__typeof__(((ID3D11QueryVtbl *)0)->QueryInterface))obj_QueryInterface,
+    .AddRef = (__typeof__(((ID3D11QueryVtbl *)0)->AddRef))obj_AddRef,
+    .Release = (__typeof__(((ID3D11QueryVtbl *)0)->Release))obj_Release,
+    .GetDevice = (__typeof__(((ID3D11QueryVtbl *)0)->GetDevice))child_GetDevice,
+    .GetPrivateData = (__typeof__(((ID3D11QueryVtbl *)0)->GetPrivateData))obj_GetPrivateData,
+    .SetPrivateData = (__typeof__(((ID3D11QueryVtbl *)0)->SetPrivateData))obj_SetPrivateData,
+    .SetPrivateDataInterface = (__typeof__(((ID3D11QueryVtbl *)0)->SetPrivateDataInterface))obj_SetPrivateDataInterface,
+    .GetDataSize = (__typeof__(((ID3D11QueryVtbl *)0)->GetDataSize))query_GetDataSize,
+    .GetDesc = (__typeof__(((ID3D11QueryVtbl *)0)->GetDesc))query_GetDesc,
 };

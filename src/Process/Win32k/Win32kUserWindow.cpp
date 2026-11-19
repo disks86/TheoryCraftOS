@@ -900,12 +900,17 @@ uint64_t nt_set_layered_window_attributes(Call& call) {
   if (!(w->ex_style & wn::WS_EX_LAYERED)) return call.fail(kErrorInvalidParameter);
   w->layered_key = call.arg32(1);
   w->layered_alpha = uint8_t(call.arg(2));
-  w->layered_flags = call.arg32(3);
+  w->layered_flags = call.arg32(3) ? call.arg32(3) : 0x100u;      // (0x100: set, with neither LWA_COLORKEY nor LWA_ALPHA)
+  w->layered_updated = false;      // (the window is painted as usual again, its attributes applied by the desktop)
+  notify_top_level(w);
+  uint32_t sw = 0, sh = 0;
+  if (w->surface != 0 && gdi::window_surface_size(w->surface, &sw, &sh)) gdi::window_surface_damaged(w->surface, Rect{0, 0, int32_t(sw), int32_t(sh)});
   return 1;
 }
 // NtUserUpdateLayeredWindow(HWND, HDC hdcDst, POINT* pptDst, SIZE* psize, HDC hdcSrc, POINT* pptSrc, COLORREF crKey, BLENDFUNCTION* pblend, DWORD dwFlags, RECT* prcDirty).
 // user32 has moved and sized the window already (pptDst, psize); here the picture of hdcSrc goes on the window's surface, with its alpha when ULW_ALPHA asks for the
-// source's (AC_SRC_ALPHA), and the desktop blends it over what is below. The colour key (ULW_COLORKEY) is not applied.
+// source's (AC_SRC_ALPHA), and the desktop blends it over what is below. Pixels of the colour key (ULW_COLORKEY) are left out; ULW_OPAQUE takes the picture as
+// it is.
 uint64_t nt_update_layered_window(Call& call) {
   Window* w = window_arg(call, 0);
   if (!w) return 0;
@@ -914,8 +919,10 @@ uint64_t nt_update_layered_window(Call& call) {
   if (flags & ~uint32_t{0x7}) return call.fail(kErrorInvalidParameter);      // ULW_COLORKEY 1, ULW_ALPHA 2, ULW_OPAQUE 4
   uint8_t blend[4] = {0, 0, 255, 0};      // BlendOp, BlendFlags, SourceConstantAlpha, AlphaFormat
   if ((flags & 2) && (call.arg(7) == 0 || !call.read(call.arg(7), ByteView(blend, sizeof(blend))))) return call.fail(kErrorInvalidParameter);
-  const bool per_pixel = (flags & 2) && (blend[3] & 1);
-  const uint8_t constant = (flags & 2) ? blend[2] : 255;
+  const bool per_pixel = (flags & 2) && (blend[3] & 1) && !(flags & 4);
+  const uint8_t constant = ((flags & 2) && !(flags & 4)) ? blend[2] : 255;
+  const bool keyed = (flags & 1) && !(flags & 4);
+  const uint32_t key = call.arg32(6);
   const Rect wr = window_rect_screen(w);
   int32_t width = wr.right - wr.left, height = wr.bottom - wr.top, sx = 0, sy = 0;
   auto read_pair = [&](uint64_t address, int32_t* a, int32_t* b) {      // a SIZE or POINT: two LONGs
@@ -937,8 +944,8 @@ uint64_t nt_update_layered_window(Call& call) {
     if (!redirected(w)) return 1;      // (not shown on the desktop: nothing to put the picture on)
     if (w->surface == 0) sync_surface(w);
     if (w->surface == 0) return 1;
-    if (!gdi::copy_to_layered_surface(call, call.arg32(4), sx, sy, width, height, w->surface, 0, 0, per_pixel, constant)) return call.fail(kErrorInvalidParameter);
-    const bool blended = per_pixel || constant < 255;
+    if (!gdi::copy_to_layered_surface(call, call.arg32(4), sx, sy, width, height, w->surface, 0, 0, per_pixel, constant, keyed, key)) return call.fail(kErrorInvalidParameter);
+    const bool blended = per_pixel || constant < 255 || keyed;
     const bool changed = !w->layered_updated || w->layered_per_pixel != blended;
     w->layered_updated = true;
     w->layered_per_pixel = blended;

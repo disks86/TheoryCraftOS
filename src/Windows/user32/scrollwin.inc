@@ -170,8 +170,8 @@ EXPORT BOOL WINAPI GetScrollBarInfo(HANDLE hwnd, LONG object, SCROLLBARINFO_ *in
 
 /* ---- layered windows ------------------------------------------------------------------------------------------------------------------------------------------------ */
 /* The attributes are kept with the window (properties) and given to the window manager. A layered window is invisible until it has attributes or a picture;
- * with attributes it is painted as usual (the constant alpha and the colour key are not applied). UpdateLayeredWindow puts the picture of a DC on the window,
- * which the desktop blends by its alpha (ULW_ALPHA with AC_SRC_ALPHA, or a SourceConstantAlpha below 255). */
+ * with attributes it is painted as usual and the desktop leaves out the pixels of the colour key and blends the rest at the constant alpha. UpdateLayeredWindow
+ * puts the picture of a DC on the window, which the desktop blends by its alpha (ULW_ALPHA with AC_SRC_ALPHA, a SourceConstantAlpha below 255, ULW_COLORKEY). */
 #define WS_EX_LAYERED_ 0x80000
 SVC NtUserSetLayeredWindowAttributes(ULONG_PTR hwnd, ULONG_PTR key, ULONG_PTR alpha, ULONG_PTR flags);
 SVC NtUserUpdateLayeredWindow(ULONG_PTR hwnd, ULONG_PTR hdc_dst, ULONG_PTR dst, ULONG_PTR size, ULONG_PTR hdc_src, ULONG_PTR src, ULONG_PTR key, ULONG_PTR blend, ULONG_PTR flags,

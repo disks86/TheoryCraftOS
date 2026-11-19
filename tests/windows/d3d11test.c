@@ -27,7 +27,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <d3d11.h>
-#include <dxgi.h>
+#include <dxgi1_3.h>
 #include "dxfixtures.h"
 
 static int g_passed, g_failed;
@@ -140,9 +140,44 @@ static void test_device(void) {
   UINT support = 0, levels = 0;
   check(SUCCEEDED(ID3D11Device_CheckFormatSupport(g_device, DXGI_FORMAT_B8G8R8A8_UNORM, &support)) && (support & D3D11_FORMAT_SUPPORT_RENDER_TARGET) &&
         SUCCEEDED(ID3D11Device_CheckMultisampleQualityLevels(g_device, DXGI_FORMAT_B8G8R8A8_UNORM, 1, &levels)) && levels == 1, "CheckFormatSupport and CheckMultisampleQualityLevels");
+  ID3D11Counter *counter = NULL;
+  const D3D11_COUNTER_DESC counter_desc = {D3D11_COUNTER_DEVICE_DEPENDENT_0, 0};
+  check(ID3D11Device_CreateCounter(g_device, &counter_desc, &counter) == E_NOTIMPL && counter == NULL, "what is not there answers E_NOTIMPL (and leaves the stack whole)");
+
+  /* what ANGLE (Chrome's GL) asks of a device: DXGI 1.2 and 1.3, event queries for its fences, timestamps */
+  IDXGIDevice2 *dxgi2 = NULL;
+  check(SUCCEEDED(ID3D11Device_QueryInterface(g_device, &IID_IDXGIDevice2, (void **)&dxgi2)) && dxgi2, "the device as an IDXGIDevice2");
+  if (dxgi2) {
+    HANDLE done = CreateEventW(NULL, TRUE, FALSE, NULL);
+    check(SUCCEEDED(IDXGIDevice2_EnqueueSetEvent(dxgi2, done)) && WaitForSingleObject(done, 0) == WAIT_OBJECT_0, "EnqueueSetEvent sets the event once the work is done");
+    CloseHandle(done);
+    IDXGIDevice2_Release(dxgi2);
+  }
   ID3D11Query *query = NULL;
-  const D3D11_QUERY_DESC query_desc = {D3D11_QUERY_EVENT, 0};
-  check(ID3D11Device_CreateQuery(g_device, &query_desc, &query) == E_NOTIMPL && query == NULL, "what is not there answers E_NOTIMPL (and leaves the stack whole)");
+  const D3D11_QUERY_DESC event_desc = {D3D11_QUERY_EVENT, 0};
+  BOOL finished = FALSE;
+  check(SUCCEEDED(ID3D11Device_CreateQuery(g_device, &event_desc, &query)) && query && ID3D11Query_GetDataSize(query) == sizeof(BOOL), "an event query");
+  if (query) {
+    check(ID3D11DeviceContext_GetData(g_context, (ID3D11Asynchronous *)query, &finished, sizeof finished, 0) == DXGI_ERROR_INVALID_CALL, "... has no answer before End");
+    ID3D11DeviceContext_End(g_context, (ID3D11Asynchronous *)query);
+    check(ID3D11DeviceContext_GetData(g_context, (ID3D11Asynchronous *)query, &finished, sizeof finished, 0) == S_OK && finished, "... and is done after it");
+    ID3D11Query_Release(query);
+  }
+  ID3D11Query *disjoint = NULL, *stamp = NULL;
+  const D3D11_QUERY_DESC disjoint_desc = {D3D11_QUERY_TIMESTAMP_DISJOINT, 0}, stamp_desc = {D3D11_QUERY_TIMESTAMP, 0};
+  D3D11_QUERY_DATA_TIMESTAMP_DISJOINT frequency = {0, TRUE};
+  UINT64 when = 0;
+  check(SUCCEEDED(ID3D11Device_CreateQuery(g_device, &disjoint_desc, &disjoint)) && SUCCEEDED(ID3D11Device_CreateQuery(g_device, &stamp_desc, &stamp)), "timestamp queries");
+  if (disjoint && stamp) {
+    ID3D11DeviceContext_Begin(g_context, (ID3D11Asynchronous *)disjoint);
+    ID3D11DeviceContext_End(g_context, (ID3D11Asynchronous *)stamp);
+    ID3D11DeviceContext_End(g_context, (ID3D11Asynchronous *)disjoint);
+    check(ID3D11DeviceContext_GetData(g_context, (ID3D11Asynchronous *)stamp, &when, sizeof when, 0) == S_OK && when != 0 &&
+          ID3D11DeviceContext_GetData(g_context, (ID3D11Asynchronous *)disjoint, &frequency, sizeof frequency, 0) == S_OK && frequency.Frequency != 0 && !frequency.Disjoint,
+          "... a time and the counter's frequency");
+  }
+  if (disjoint) ID3D11Query_Release(disjoint);
+  if (stamp) ID3D11Query_Release(stamp);
 }
 
 static void test_buffers(void) {

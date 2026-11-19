@@ -793,8 +793,7 @@ get:/Windows/chrome.log=chrome.log` copies Chromium's own log out. `CHROMIUM_GDB
 ### Google Chrome with its sandbox
 
 Google Chrome as the App Manager installs it (`/Windows/Program Files/Google/Chrome/Application`, started from the Start menu, no flags) runs with Chromium's
-sandbox: the browser window, its toolbar and omnibox show and the sandboxed GPU process starts. ANGLE's Direct3D 11 renderer does not start
-(`eglInitialize: No available renderers`), so pages need `--disable-gpu` (see "Pages and YouTube" below). What the sandbox needed, in the order it
+sandbox: the browser window, its toolbar and omnibox show and the sandboxed GPU process starts, with ANGLE on `d3d11.dll` (see "Pages and YouTube" below). What the sandbox needed, in the order it
 asked:
 
 - **Private assemblies.** chrome.exe's manifest (its RT_MANIFEST resource) depends on an assembly named after the version, a folder next to it whose own manifest
@@ -821,17 +820,24 @@ What its log complained about at startup, and what answers it now (checked by `t
 - **`DNS registry watch failed to start`**: the registry has `HKLM\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters` (and `Tcpip6`, `Dnscache`) from the start.
 - **`SIO_ADDRESS_LIST_SORT failed 10045`**: every DNS answer goes through that ioctl; ws2_32 orders the list by RFC 6724's precedence table.
 - **`Error (0x13D) while retrieving error`**: FormatMessage had ~20 system texts; `kernel32/errtext.inc` has ~250 Win32, Winsock and COM ones (binary search).
-- Expected and left alone: `GPUPersistentCache ... being used by another process` (the GPU process dies at start, ANGLE has no D3D11 renderer, and its successor
-  asks for the cache while the old one still holds it; the retry gets it), `app_bound_encryption` and geolocation `Class not registered` (Chrome's elevation
+- Expected and left alone: `GPUPersistentCache ... being used by another process` (seen while the GPU process died at start and its successor asked for the
+  cache while the old one still held it; the retry got it), `app_bound_encryption` and geolocation `Class not registered` (Chrome's elevation
   service and WinRT capability classes are not there), the Hyper-V PDH counter. Open: `token_service_table ... invalid SQL statement` - `Web Data` stays one empty
   2 KiB page across runs although SQLite itself works on the kernel's files (journal TRUNCATE/DELETE/WAL, exclusive locking, 2 KiB pages: checked in QEMU), and the
   crashpad `TransactNamedPipe: Error (0x6D)` seen once when Chrome was started from the Terminal did not come back under autorun.
 
 #### Pages and YouTube
 
-With `--disable-gpu --disable-software-rasterizer` (ANGLE's Direct3D 11 renderer still does not start, so the default GPU mode has no compositor) Chrome draws
-pages through its software output device (a DIB section blitted to the window), and plays YouTube videos (AV1 + Opus through MSE). What it took, besides the
-sandbox work above:
+Chrome draws pages and plays YouTube videos (AV1 + Opus through MSE), started with no flags or with `--disable-gpu --disable-software-rasterizer`. With no flags
+its GPU process runs ANGLE on our Direct3D 11 (`displayType ANGLE_D3D11_WARP`): the adapter is a software one (vendor 0x1414, device 0x8C, as Microsoft's basic
+render driver), so Chrome composites and rasterizes in software and keeps WebGL off, as it does on a Windows machine with only WARP. Either way the pages go
+through its software output device (a DIB section blitted to the window). What it took, besides the sandbox work above:
+
+- **ANGLE's Direct3D 11 renderer.** It asks the device for `IDXGIDevice2` (DXGI 1.2, to present to a window of another process) and fails without it
+  (`eglInitialize: No available renderers`, then the GPU process exits and is started again about 30 times before Chrome falls back to software: a minute of an
+  empty window). `d3d11.dll` now answers `IDXGIDevice2`/`IDXGIDevice3` and event/timestamp queries (ANGLE's fences). Chrome links ANGLE into chrome.dll, so
+  there are no libEGL/libGLESv2 DLLs to test alone; `tests/windows/angletest.c` drives an ANGLE build that has them (and says why one fails, through
+  EGL_KHR_debug).
 
 - **Handles between processes.** mojo hands a file the browser opened for a sandboxed service (`storage.mojom.Directory::OpenFile`, the LevelDB files of
   localStorage) with `DuplicateHandle(self, file, service, ..., DUPLICATE_SAME_ACCESS | DUPLICATE_CLOSE_SOURCE)`. `NtDuplicateObject` into or out of another program
@@ -844,8 +850,8 @@ sandbox work above:
 - **Waits.** `RegisterWaitForSingleObject` goes through the thread pool's `RtlRegisterWait` (not a thread per wait); a wait callback may end its own wait.
 - **Windows.** A child with `WS_EX_TRANSPARENT` does not clip its parent's painting; a top-level whose client area reaches over its title bar (a custom frame) gets
   no desktop frame; a layered window (`WS_EX_LAYERED`) is invisible until it has attributes or a picture, and `UpdateLayeredWindow` puts the picture on the window's
-  surface with its alpha, which the desktop blends (Chrome's bubbles and menus are such windows). The colour key and the constant alpha of
-  `SetLayeredWindowAttributes` are not applied.
+  surface with its alpha, which the desktop blends (Chrome's bubbles and menus are such windows). `SetLayeredWindowAttributes` windows are painted as usual
+  and drawn by the desktop without the pixels of their colour key and at their constant alpha; `ULW_COLORKEY` leaves the key's pixels out of the picture.
 - **Limits.** 256 threads a process, 8192 handles, `ProcessHandleTable` for the sandbox's handle closer, NT names of files for `NtQueryObject`, image sections of
   files opened for execute only.
 

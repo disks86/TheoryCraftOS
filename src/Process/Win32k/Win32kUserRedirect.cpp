@@ -265,12 +265,24 @@ uint32_t top_level_surface_locked(uint32_t hwnd) {
   return on_desktop(w) ? w->surface : 0;
 }
 
-SurfaceBlend top_level_surface_blend_locked(uint32_t hwnd) {
-  if (!state_or_null()) return SurfaceBlend::Opaque;
+SurfaceBlendInfo top_level_surface_blend_locked(uint32_t hwnd) {
+  SurfaceBlendInfo out;
+  if (!state_or_null()) return out;
   const Window* w = find_window(hwnd);
-  if (!w || !(w->ex_style & wn::WS_EX_LAYERED)) return SurfaceBlend::Opaque;
-  if (w->layered_updated) return w->layered_per_pixel ? SurfaceBlend::PerPixelAlpha : SurfaceBlend::Opaque;
-  return w->layered_flags != 0 ? SurfaceBlend::Opaque : SurfaceBlend::Hidden;      // (SetLayeredWindowAttributes: painted as usual; its constant alpha is not applied)
+  if (!w || !(w->ex_style & wn::WS_EX_LAYERED)) return out;
+  if (w->layered_updated) {
+    out.mode = w->layered_per_pixel ? SurfaceBlend::PerPixelAlpha : SurfaceBlend::Opaque;
+    return out;
+  }
+  if (w->layered_flags == 0) {
+    out.mode = SurfaceBlend::Hidden;
+    return out;
+  }
+  out.keyed = (w->layered_flags & 1) != 0;      // LWA_COLORKEY
+  out.key = ((w->layered_key & 0xFF) << 16) | (w->layered_key & 0xFF00) | ((w->layered_key >> 16) & 0xFF);      // (COLORREF 0x00BBGGRR)
+  out.alpha = (w->layered_flags & 2) ? w->layered_alpha : 255;      // LWA_ALPHA
+  out.mode = (out.keyed || out.alpha < 255) ? SurfaceBlend::Attributes : SurfaceBlend::Opaque;
+  return out;
 }
 
 bool window_redirected_locked(uint32_t hwnd) {
