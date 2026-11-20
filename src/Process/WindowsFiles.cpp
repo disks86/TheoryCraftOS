@@ -568,14 +568,20 @@ uint32_t file_io_core(Process& p, const SyscallRequest& r, bool write, const IoC
   uint8_t chunk[kChunk];
   Status io = Status::Ok;
   const uint64_t size_before = write ? files.size_of(object) : 0;
+  // A file with a data section (a mapping) is kept coherent with the section's copy of it (ObjectManager::file_written).
+  ObjectManager* sections = system_objects();
+  String host(files.allocator());
+  const bool mapped = sections && sections->any_file_sections() && files.host_path_of(object.path.view(), &host);
   while (done < length && io == Status::Ok) {
     const uint64_t n = length - done < sizeof(chunk) ? length - done : sizeof(chunk);
     uint64_t moved = 0;
     if (write) {
       if (!p.read_user(buffer + done, ByteView(chunk, n))) { if (done == 0) return kAccessViolation; break; }
       io = files.write(object, at + done, ConstByteView(chunk, n), &moved);
+      if (mapped && moved) sections->file_written(host.view(), at + done, ConstByteView(chunk, moved));
     } else {
       io = files.read(object, at + done, ByteView(chunk, n), &moved);
+      if (mapped && moved) sections->file_read(host.view(), at + done, ByteView(chunk, moved));
       if (io == Status::Ok && moved && !p.write_user(buffer + done, ConstByteView(chunk, moved))) { if (done == 0) return kAccessViolation; break; }
     }
     done += moved;

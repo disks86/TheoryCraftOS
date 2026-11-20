@@ -23,10 +23,12 @@
 #include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
+#include "FileSystem/Ram/RamFileSystem.hpp"
 #include "Process/Objects.hpp"
 #include "Process/Process.hpp"
 #include "Process/Syscall.hpp"
@@ -521,7 +523,78 @@ static void test_directories() {
   set_system_objects(nullptr);
 }
 
+// A data section of a file is a copy of it: writes and reads through file handles keep the copy and the file the same (SQLite writes pages with WriteFile and reads
+// them back through a view).
+static void test_file_section_coherence() {
+  SystemSync sync;
+  TestAllocator allocator;
+  ObjectManager objects(sync);
+  objects.set_allocator(&allocator);
+  filesystem::RamFileSystem fs(allocator);
+  {
+    UniquePointer<filesystem::IFile> f;
+    CHECK(fs.open_file("/db", filesystem::OpenMode::CreateTruncate, &f) == filesystem::Status::Ok);
+    std::string pages(8192, 'a');
+    uint64_t n = 0;
+    CHECK(f->write(0, ConstByteView(reinterpret_cast<const uint8_t*>(pages.data()), pages.size()), &n) == filesystem::Status::Ok && n == pages.size());
+  }
+  auto bytes = [](const char* text) { return ConstByteView(reinterpret_cast<const uint8_t*>(text), strlen(text)); };
+  // What NtWriteFile does: write the file, then tell the sections.
+  auto write_file = [&](const char* path, uint64_t offset, ConstByteView data) {
+    UniquePointer<filesystem::IFile> f;
+    uint64_t n = 0;
+    if (fs.open_file(path, filesystem::OpenMode::CreateOrOpen, &f) == filesystem::Status::Ok) f->write(offset, data, &n);
+    objects.file_written(path, offset, data);
+  };
+  CHECK(!objects.any_file_sections());
+  const ObjectManager::Created reader = objects.create_section("", 0, 0x02 /* PAGE_READONLY */, 0x800000, &fs, "/db");
+  CHECK(reader.id != 0 && objects.any_file_sections());
+  uint8_t* view = nullptr;
+  uint64_t view_size = 0;
+  SharedMemory* owner = nullptr;
+  CHECK(objects.section_memory(reader.id, &view, &view_size, &owner) && view_size == 8192 && view[0] == 'a');
+  write_file("/db", 4096, bytes("page two"));
+  CHECK(memcmp(view + 4096, "page two", 8) == 0 && view[4104] == 'a');
+  objects.file_written("/DB", 0, bytes("case"));      // (names compare as the file system does)
+  write_file("/db", 0, bytes("case"));
+  CHECK(memcmp(view, "case", 4) == 0);
+  std::string tail(400, 'b');
+  write_file("/db", 8000, ConstByteView(reinterpret_cast<const uint8_t*>(tail.data()), tail.size()));      // runs past the end: only the part inside
+  CHECK(view[8000] == 'b' && view[8191] == 'b');
+  objects.file_written("/db", 9000, bytes("outside"));      // all past the end: nothing
+  objects.file_written("/other", 0, bytes("zzzz"));
+  CHECK(view[0] == 'c');
+  uint8_t got[16] = {};
+  memset(got, 'r', sizeof(got));
+  objects.file_read("/db", 96, ByteView(got, sizeof(got)));      // a read-only section has nothing the file lacks
+  CHECK(got[4] == 'r');
+
+  const ObjectManager::Created writer = objects.create_section("", 0, 0x04 /* PAGE_READWRITE */, 0x800000, &fs, "/db");
+  uint8_t* written = nullptr;
+  CHECK(writer.id != 0 && objects.section_memory(writer.id, &written, &view_size, &owner));
+  memcpy(written + 100, "from view", 9);
+  objects.file_read("/db", 96, ByteView(got, sizeof(got)));
+  CHECK(memcmp(got + 4, "from view", 9) == 0 && got[3] == 'a');      // a read sees what the writable view holds
+  memset(got, 'r', sizeof(got));
+  objects.file_read("/db", 8398, ByteView(got, sizeof(got)));      // a read over the end of the section (8400 bytes, the file grew): the part inside
+  CHECK(got[0] == 'b' && got[1] == 'b' && got[2] == 'r');
+  write_file("/db", 200, bytes("by WriteFile"));
+  CHECK(memcmp(written + 200, "by WriteFile", 12) == 0);
+  objects.release(writer.id);      // the writable section goes: written back, and the other copy has what it wrote
+  CHECK(memcmp(view + 100, "from view", 9) == 0 && memcmp(view + 200, "by WriteFile", 12) == 0);
+  {
+    UniquePointer<filesystem::IFile> f;
+    char back[12] = {};
+    uint64_t n = 0;
+    CHECK(fs.open_file("/db", filesystem::OpenMode::Read, &f) == filesystem::Status::Ok && f->read(200, ByteView(reinterpret_cast<uint8_t*>(back), 12), &n) == filesystem::Status::Ok);
+    CHECK(n == 12 && memcmp(back, "by WriteFile", 12) == 0);
+  }
+  objects.release(reader.id);
+  CHECK(!objects.any_file_sections());
+}
+
 int main() {
+  test_file_section_coherence();
   test_directories();
   test_jobs();
   test_events();

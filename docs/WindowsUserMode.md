@@ -442,7 +442,10 @@ need real windows.
 - **Libraries**: `LoadLibrary`/`FreeLibrary` map and unmap DLLs after start-up, with their imports, reference counted; `DllMain` and TLS callbacks run. A DLL's own
   `__declspec(thread)` data works (up to 16 modules with thread-local data at once).
 - **Files**: a read-only attribute and the times can be set (RAM and FAT file systems); other attributes are accepted and not stored. Byte-range locks are advisory and
-  shared by all programs. File mappings of files are read into memory when made and written back when flushed, when the last view is closed and when the mapping is.
+  shared by all programs. File mappings of files are read into memory when made and written back when flushed, when the last view is closed and when the mapping is. They are
+  kept coherent with the file the way Windows keeps views and `ReadFile`/`WriteFile` coherent: `NtWriteFile` copies what it writes into every data mapping of the
+  file, `NtReadFile` reads what a writable mapping holds, and writing a mapping back updates the file's other mappings (`ObjectManager::file_written`/`file_read`).
+  Two mappings of one file are still separate copies between those points: a write through one view reaches the other only when it is written back.
 - **Hard and symbolic links** (`CreateHardLink`, `CreateSymbolicLink`; service `NtCreateSymbolicLink`, and `NtSetInformationFile`'s `FileLinkInformation` class for hard
   links, the same way `MoveFileEx` goes through `FileRenameInformation`) work on file systems that have a notion of a file apart from its one name — today the RAM file
   system (which is what the demo and the primary image's `C:\` both use), not FAT. A hard link shares its data, size, read-only flag and times with the name it was made
@@ -820,11 +823,19 @@ What its log complained about at startup, and what answers it now (checked by `t
 - **`DNS registry watch failed to start`**: the registry has `HKLM\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters` (and `Tcpip6`, `Dnscache`) from the start.
 - **`SIO_ADDRESS_LIST_SORT failed 10045`**: every DNS answer goes through that ioctl; ws2_32 orders the list by RFC 6724's precedence table.
 - **`Error (0x13D) while retrieving error`**: FormatMessage had ~20 system texts; `kernel32/errtext.inc` has ~250 Win32, Winsock and COM ones (binary search).
+- **`token_service_table ... invalid SQL statement`** and **`Requested load of chrome://newtab/ for incorrect profile type`**: one cause. SQLite writes pages
+  with `WriteFile` and reads them back through its `MapViewOfFile` view; a file mapping was a copy made when it was created, so the view showed old pages, SQLite
+  reported `SQLITE_CORRUPT`, and Chrome razed and poisoned `Web Data` (it stayed one empty 2 KiB page; its small 32-page cache made it reread pages most). With no
+  `keywords` table there was no default search engine, so the new tab page fell back to `chrome://newtab/`. Mappings are now coherent with file reads and writes
+  (see "Sections" above); `Web Data` has its 39 tables and `integrity_check` is ok.
+- **`PdhAddEnglishCounter failed for '\Hyper-V Hypervisor Logical Processor(_Total)\% Total Run Time'`**: pdh.dll has the processor time counters
+  (`\Processor(_Total)\% Processor Time`, from `GetSystemTimes`). In a virtual machine Chrome asks for the Hyper-V one first; it is added but has no data, so
+  collecting fails and Chrome falls back to the processor counter, as on Windows under another hypervisor. (The `Error (0x13D)` part is what Windows prints too: PDH
+  codes are not in the system message table.)
 - Expected and left alone: `GPUPersistentCache ... being used by another process` (seen while the GPU process died at start and its successor asked for the
-  cache while the old one still held it; the retry got it), `app_bound_encryption` and geolocation `Class not registered` (Chrome's elevation
-  service and WinRT capability classes are not there), the Hyper-V PDH counter. Open: `token_service_table ... invalid SQL statement` - `Web Data` stays one empty
-  2 KiB page across runs although SQLite itself works on the kernel's files (journal TRUNCATE/DELETE/WAL, exclusive locking, 2 KiB pages: checked in QEMU), and the
-  crashpad `TransactNamedPipe: Error (0x6D)` seen once when Chrome was started from the Terminal did not come back under autorun.
+  cache while the old one still held it; the retry got it), geolocation `Class not registered` (the WinRT capability classes are not there). `app_bound_encryption
+  ... Class not registered`: Chrome's installer registers its elevation service, but the registry does not outlast a restart here, so after one the class is gone.
+  The crashpad `TransactNamedPipe: Error (0x6D)` seen once when Chrome was started from the Terminal did not come back under autorun.
 
 #### Pages and YouTube
 

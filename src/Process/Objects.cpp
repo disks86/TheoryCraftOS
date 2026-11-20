@@ -1734,6 +1734,8 @@ void ObjectManager::unlock_all(const void* owner) {
 
 // ---- sections
 
+static constexpr uint32_t kSecImageAttribute = 0x1000000u;      // SEC_IMAGE: a program's image, not the file's bytes as they are
+
 void ObjectManager::write_section_locked(Section& s) {
   if (!s.file_backed || !s.writable || !s.fs || !s.storage) return;
   UniquePointer<filesystem::IFile> file;
@@ -1746,6 +1748,7 @@ void ObjectManager::write_section_locked(Section& s) {
     done += wrote;
   }
   file->flush();
+  mirror_locked(StringView(s.path, s.path_size), 0, ConstByteView(s.storage, s.size), &s);      // (other mappings of the file see what this one wrote)
 }
 
 void ObjectManager::free_section_locked(Object& o) {
@@ -1753,6 +1756,7 @@ void ObjectManager::free_section_locked(Object& o) {
   Section& s = sections_[o.section];
   write_section_locked(s);
   if (s.storage && allocator_) allocator_->deallocate(s.storage);
+  if (s.file_backed && !(s.attributes & kSecImageAttribute)) __atomic_sub_fetch(&file_sections_, 1u, __ATOMIC_ACQ_REL);
   s.storage = nullptr;
   s.used = false;
   s.file_backed = false;
@@ -1841,6 +1845,7 @@ ObjectManager::Created ObjectManager::create_section(StringView name, uint64_t s
     for (uint32_t k = 0; k < host_path.size(); ++k) s.path[k] = host_path[k];
     s.path_size = static_cast<uint32_t>(host_path.size());
     s.ref.attach(this, static_cast<uint32_t>(index));
+    if (s.file_backed && !(attributes & kSecImageAttribute)) __atomic_add_fetch(&file_sections_, 1u, __ATOMIC_ACQ_REL);
     result.id = i + 1;
     return result;
   }
@@ -1914,6 +1919,45 @@ bool ObjectManager::section_file_name(uint32_t id, char (&out)[40]) {
   for (uint32_t i = start; i < s.path_size && n < 39; ++i) out[n++] = lower(s.path[i]);
   out[n] = 0;
   return n != 0;
+}
+
+// The part of [offset, offset + length) that lies in a section of `size` bytes: false if none.
+static bool section_overlap(uint64_t size, uint64_t offset, uint64_t length, uint64_t* count) {
+  if (offset >= size || length == 0) return false;
+  *count = size - offset < length ? size - offset : length;
+  return true;
+}
+
+void ObjectManager::mirror_locked(StringView host_path, uint64_t offset, ConstByteView data, const Section* except) {
+  if (!sections_) return;
+  for (uint32_t i = 0; i < kMaxSections; ++i) {
+    Section& s = sections_[i];
+    uint64_t count = 0;
+    if (&s == except || !s.used || !s.file_backed || !s.storage || (s.attributes & kSecImageAttribute) || s.path_size != host_path.size() || !same_name(s.path, s.path_size, host_path)) continue;
+    if (!section_overlap(s.size, offset, data.size(), &count)) continue;
+    ByteView(s.storage + offset, count).copy_from(data.first(count));
+  }
+}
+
+void ObjectManager::file_written(StringView host_path, uint64_t offset, ConstByteView data) {
+  if (!any_file_sections()) return;
+  Locked hold(sync_);
+  mirror_locked(host_path, offset, data, nullptr);
+}
+
+void ObjectManager::file_read(StringView host_path, uint64_t offset, ByteView data) {
+  if (!any_file_sections()) return;
+  Locked hold(sync_);
+  if (!sections_) return;
+  for (uint32_t i = 0; i < kMaxSections; ++i) {
+    const Section& s = sections_[i];
+    uint64_t count = 0;
+    // (only a writable section can hold bytes the file does not have yet; the others hold what file_written() put there)
+    if (!s.used || !s.file_backed || !s.writable || !s.storage || (s.attributes & kSecImageAttribute) || s.path_size != host_path.size() || !same_name(s.path, s.path_size, host_path)) continue;
+    if (!section_overlap(s.size, offset, data.size(), &count)) continue;
+    data.first(count).copy_from(ConstByteView(s.storage + offset, count));
+    return;
+  }
 }
 
 uint32_t ObjectManager::file_has_section(StringView host_path) {

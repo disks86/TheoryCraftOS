@@ -234,6 +234,12 @@ class ObjectManager {
   // Is there a section (a mapping handle or a view) of the file at this path in the OS file system? A file in that state cannot be truncated, deleted or renamed.
   // 0: none, 1: a data section, 2: an image section.
   uint32_t file_has_section(StringView host_path);
+  // A program wrote to (or reads from) the file at `host_path` through a handle. A data section of a file is a copy of it, so the copy is kept coherent the way Windows
+  // keeps views and ReadFile/WriteFile coherent: a write goes into the copies too, and a read sees what was written through a writable view and not yet written back.
+  // (SQLite writes pages with WriteFile and reads them back through its MapViewOfFile view: a stale copy is a "corrupt" database.) `offset` is in the file.
+  bool any_file_sections() const { return __atomic_load_n(&file_sections_, __ATOMIC_ACQUIRE) != 0; }
+  void file_written(StringView host_path, uint64_t offset, ConstByteView data);
+  void file_read(StringView host_path, uint64_t offset, ByteView data);
   // An image section gets a view: was there one before?
   bool section_note_image_view(uint32_t id);
   void flush_section(uint32_t id);
@@ -595,6 +601,9 @@ class ObjectManager {
   ImageEntry* images_ = nullptr;     // kMaxImages of them, made with the first
   uint32_t image_next_ = 0;
   Section* sections_ = nullptr;      // kMaxSections, made with the first section
+  // Copies `data` (bytes of the file at `offset`) into every data section of the file but `except`. (The lock must be held.)
+  void mirror_locked(StringView host_path, uint64_t offset, ConstByteView data, const Section* except);
+  uint32_t file_sections_ = 0;       // data sections of files in use (atomic: file I/O looks at it without the lock)
   Job* jobs_ = nullptr;              // kJobMaxJobs, made with the first job (never moved: job_kill_for() reads it without the lock)
   uint32_t pending_kills_ = 0;       // members flagged to end that have not ended yet (atomic)
   uint64_t job_joins_ = 0;           // counts assignments to jobs (JobMember::joined)
