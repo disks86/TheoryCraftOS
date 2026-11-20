@@ -140,6 +140,15 @@ int8_t signature_slot(const SigElement& s, bool output_of_vertex) {
   return kSlotNone;
 }
 
+// A register can hold several signature elements: the compiler packs varyings that fit together, such as TEXCOORD1 in o4.xy and TEXCOORD2 in o4.zw (ANGLE's shaders
+// for Chrome's video quads do). The register goes between the stages as one varying, so both stages must pick the same one whatever order they list the elements in: the
+// lowest slot of its elements (each semantic is in one register, so no other register has it). Only when none of them is a varying (the position, a system value) does the
+// first element say where the register goes.
+void merge_slot(int8_t* at, int8_t slot) {
+  if (*at == kSlotNone) *at = slot;
+  else if (slot >= 0 && (*at < 0 || slot < *at)) *at = slot;
+}
+
 }  // namespace
 
 NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteView bytes, UniquePointer<D3d9Program>* out, uint32_t constant_base) {
@@ -239,18 +248,21 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
   if (!isgn.empty()) {
     if (!read_signature(isgn, isgn_size, elements, &count)) return status::kInvalidParameter;
     for (uint32_t i = 0; i < count; ++i)
-      if (elements[i].reg < kRegisters) in_slot[elements[i].reg] = signature_slot(elements[i], geometry || patch_stage);   // (a geometry, hull or domain shader's inputs include the position)
+      if (elements[i].reg < kRegisters) merge_slot(&in_slot[elements[i].reg], signature_slot(elements[i], geometry || patch_stage));   // (a geometry, hull or domain shader's inputs include the position)
   }
   if (vertex || geometry || patch_stage) {
     if (vertex)
       for (uint32_t i = 0; i < graphics::kMaxVertexAttributes; ++i) in_slot[i] = static_cast<int8_t>(i);   // (vN is attribute location N)
     if (osgn.empty() || !read_signature(osgn, osgn_size, elements, &count, osgn_streams)) return status::kInvalidParameter;
+    int8_t first_stream[kRegisters];
+    for (int8_t& s : first_stream) s = -1;
     for (uint32_t i = 0; i < count; ++i) {
       if (elements[i].reg >= kRegisters || elements[i].stream >= graphics::kMaxGeometryStreams) continue;
-      const int8_t slot = signature_slot(elements[i], true);
-      stream_slot[elements[i].stream][elements[i].reg] = slot;
-      if (out_slot[elements[i].reg] == kSlotNone) out_slot[elements[i].reg] = slot;   // (a register of several streams: the first until the instructions say which)
+      merge_slot(&stream_slot[elements[i].stream][elements[i].reg], signature_slot(elements[i], true));
+      if (first_stream[elements[i].reg] < 0) first_stream[elements[i].reg] = static_cast<int8_t>(elements[i].stream);
     }
+    for (uint32_t r = 0; r < kRegisters; ++r)   // (a register of several streams: the first stream's until the instructions say which)
+      if (first_stream[r] >= 0) out_slot[r] = stream_slot[first_stream[r]][r];
   } else {
     out_slot[0] = 0;
   }

@@ -650,6 +650,163 @@ static void test_small_formats(void) {
   check(same, "an RG8 texture gives back the two bytes a pixel it was made with");
 }
 
+/* R8 and RG8 planes sampled the way Chrome's video shaders read them: ps_tex with a white vertex colour samples (2, 2), which the clamp turns into the
+ * last texel, and gives it back unchanged. Every other texel holds something else, and the widths are odd, so a row laid out wrongly (pitch, bytes a
+ * pixel) shows. Each plane is filled four ways: at creation, by UpdateSubresource, through Map of a dynamic texture, and (as ANGLE uploads) through Map of
+ * a staging texture copied by CopySubresourceRegion into one that is also a render target. */
+static UINT32 sample_plane(ID3D11ShaderResourceView *view, ID3D11SamplerState *sampler, ID3D11Buffer *vertices) {
+  begin(NULL);
+  clear(0, 0, 1);
+  bind_floats(vertices);
+  ID3D11DeviceContext_PSSetShader(g_context, g_ps_tex, NULL, 0);
+  ID3D11DeviceContext_PSSetShaderResources(g_context, 0, 1, &view);
+  ID3D11DeviceContext_PSSetSamplers(g_context, 0, 1, &sampler);
+  ID3D11DeviceContext_Draw(g_context, 3, 0);
+  ID3D11ShaderResourceView *none = NULL;
+  ID3D11DeviceContext_PSSetShaderResources(g_context, 0, 1, &none);
+  return read_target() ? pixel(32, 40) : 0;
+}
+static void test_sampled_planes(void) {
+  D3D11_SAMPLER_DESC sampler_desc;
+  memset(&sampler_desc, 0, sizeof sampler_desc);
+  sampler_desc.Filter = D3D11_FILTER_MIN_MAG_MIP_POINT;
+  sampler_desc.AddressU = sampler_desc.AddressV = sampler_desc.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
+  sampler_desc.MaxLOD = D3D11_FLOAT32_MAX;
+  ID3D11SamplerState *sampler = NULL;
+  ID3D11Buffer *vertices = triangle(0.5f, 1, 1, 1);
+  if (FAILED(ID3D11Device_CreateSamplerState(g_device, &sampler_desc, &sampler)) || !vertices) { check(0, "a sampler and a triangle for the planes"); return; }
+  static const struct { DXGI_FORMAT format; UINT w, h, bpp; BYTE last[2]; const char *name; } planes[2] = {
+      {DXGI_FORMAT_R8_UNORM, 5, 3, 1, {100, 0}, "R8"}, {DXGI_FORMAT_R8G8_UNORM, 3, 3, 2, {50, 200}, "RG8"}};
+  for (int p = 0; p < 2; ++p) {
+    const UINT w = planes[p].w, h = planes[p].h, bpp = planes[p].bpp, pitch = 16;      /* (rows further apart than their bytes, as a decoder's are) */
+    BYTE bytes[16 * 3];
+    memset(bytes, 7, sizeof bytes);
+    memcpy(bytes + (h - 1) * pitch + (w - 1) * bpp, planes[p].last, bpp);
+    const int want_r = planes[p].last[0], want_g = bpp == 2 ? planes[p].last[1] : 0;
+    char what[160];
+    for (int way = 0; way < 4; ++way) {
+      D3D11_TEXTURE2D_DESC desc = {w, h, 1, 1, planes[p].format, {1, 0}, way == 2 ? D3D11_USAGE_DYNAMIC : D3D11_USAGE_DEFAULT, D3D11_BIND_SHADER_RESOURCE,
+                                   way == 2 ? D3D11_CPU_ACCESS_WRITE : 0, 0};
+      if (way == 3) desc.BindFlags |= D3D11_BIND_RENDER_TARGET;
+      D3D11_SUBRESOURCE_DATA initial = {bytes, pitch, 0};
+      ID3D11Texture2D *texture = NULL, *staging = NULL;
+      ID3D11ShaderResourceView *view = NULL;
+      int made = SUCCEEDED(ID3D11Device_CreateTexture2D(g_device, &desc, way == 0 ? &initial : NULL, &texture)) &&
+                 SUCCEEDED(ID3D11Device_CreateShaderResourceView(g_device, (ID3D11Resource *)texture, NULL, &view));
+      if (made && way == 3) {
+        D3D11_TEXTURE2D_DESC staging_desc = {w, h, 1, 1, planes[p].format, {1, 0}, D3D11_USAGE_STAGING, 0, D3D11_CPU_ACCESS_WRITE, 0};
+        D3D11_MAPPED_SUBRESOURCE m;
+        made = SUCCEEDED(ID3D11Device_CreateTexture2D(g_device, &staging_desc, NULL, &staging)) &&
+               SUCCEEDED(ID3D11DeviceContext_Map(g_context, (ID3D11Resource *)staging, 0, D3D11_MAP_WRITE, 0, &m)) && m.pData && m.RowPitch >= w * bpp;
+        if (made) {
+          for (UINT y = 0; y < h; ++y) memcpy((BYTE *)m.pData + (size_t)y * m.RowPitch, bytes + y * pitch, w * bpp);
+          ID3D11DeviceContext_Unmap(g_context, (ID3D11Resource *)staging, 0);
+          const D3D11_BOX all = {0, 0, 0, w, h, 1};
+          ID3D11DeviceContext_CopySubresourceRegion(g_context, (ID3D11Resource *)texture, 0, 0, 0, 0, (ID3D11Resource *)staging, 0, &all);
+        }
+      }
+      if (made && way == 1) ID3D11DeviceContext_UpdateSubresource(g_context, (ID3D11Resource *)texture, 0, NULL, bytes, pitch, 0);
+      if (made && way == 2) {
+        D3D11_MAPPED_SUBRESOURCE m;
+        made = SUCCEEDED(ID3D11DeviceContext_Map(g_context, (ID3D11Resource *)texture, 0, D3D11_MAP_WRITE_DISCARD, 0, &m)) && m.pData && m.RowPitch >= w * bpp;
+        if (made) {
+          for (UINT y = 0; y < h; ++y) memcpy((BYTE *)m.pData + (size_t)y * m.RowPitch, bytes + y * pitch, w * bpp);
+          ID3D11DeviceContext_Unmap(g_context, (ID3D11Resource *)texture, 0);
+        }
+      }
+      const UINT32 got = made ? sample_plane(view, sampler, vertices) : 0;
+      snprintf(what, sizeof what, "%s plane %s samples as (%d, %d, 0): got (%d, %d, %d)", planes[p].name,
+               way == 0 ? "made with its data" : way == 1 ? "filled by UpdateSubresource" : way == 2 ? "filled through Map" : "copied from a staging texture", want_r, want_g, red(got), green(got), blue(got));
+      check(made && red(got) == want_r && green(got) == want_g && blue(got) == 0, what);
+      if (view) ID3D11ShaderResourceView_Release(view);
+      if (texture) ID3D11Texture2D_Release(texture);
+      if (staging) ID3D11Texture2D_Release(staging);
+    }
+  }
+  ID3D11Buffer_Release(vertices);
+  ID3D11SamplerState_Release(sampler);
+  begin(NULL);
+}
+
+/* An I420 frame as Chrome draws one on the GPU: three R8 planes (also render targets, as ANGLE makes them), each filled by UpdateSubresource and each
+ * sampled with its own sampler in one draw (ps_planes: Y, U and V into red, green and blue). The clamp at (2, 2) reads each plane's last texel.
+ * `packed`: through vs_packed / ps_packed instead, whose plane coordinates the compiler packs two to a register as fxc does ANGLE's (Chrome's video showed
+ * only its V plane on virgl while the two stages linked such a register through different varyings). */
+static void test_three_planes(int packed) {
+  ID3D11PixelShader *ps = NULL;
+  ID3D11VertexShader *vs = NULL;
+  ID3D11InputLayout *layout = NULL;
+  const D3D11_INPUT_ELEMENT_DESC floats[2] = {{"POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0, D3D11_INPUT_PER_VERTEX_DATA, 0},
+                                              {"COLOR", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 12, D3D11_INPUT_PER_VERTEX_DATA, 0}};
+  if (packed ? FAILED(ID3D11Device_CreatePixelShader(g_device, dx_ps_packed_dxbc, sizeof dx_ps_packed_dxbc, NULL, &ps)) ||
+                   FAILED(ID3D11Device_CreateVertexShader(g_device, dx_vs_packed_dxbc, sizeof dx_vs_packed_dxbc, NULL, &vs)) ||
+                   FAILED(ID3D11Device_CreateInputLayout(g_device, floats, 2, dx_vs_packed_dxbc, sizeof dx_vs_packed_dxbc, &layout))
+             : FAILED(ID3D11Device_CreatePixelShader(g_device, dx_ps_planes_dxbc, sizeof dx_ps_planes_dxbc, NULL, &ps))) {
+    check(0, packed ? "the shaders with packed plane coordinates" : "the three-plane pixel shader");
+    if (ps) ID3D11PixelShader_Release(ps);
+    if (vs) ID3D11VertexShader_Release(vs);
+    return;
+  }
+  static const struct { UINT w, h; BYTE last; } planes[3] = {{9, 5, 200}, {5, 3, 60}, {5, 3, 150}};
+  ID3D11Texture2D *textures[3] = {0};
+  ID3D11ShaderResourceView *views[3] = {0};
+  ID3D11SamplerState *samplers[3] = {0};
+  int made = 1;
+  for (int i = 0; i < 3; ++i) {
+    D3D11_TEXTURE2D_DESC desc = {planes[i].w, planes[i].h, 1, 1, DXGI_FORMAT_R8_UNORM, {1, 0}, D3D11_USAGE_DEFAULT, D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET, 0, 0};
+    D3D11_SAMPLER_DESC sampler_desc;
+    memset(&sampler_desc, 0, sizeof sampler_desc);
+    sampler_desc.Filter = i == 0 ? D3D11_FILTER_MIN_MAG_MIP_POINT : D3D11_FILTER_MIN_MAG_MIP_LINEAR;
+    sampler_desc.AddressU = sampler_desc.AddressV = sampler_desc.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
+    sampler_desc.MaxLOD = D3D11_FLOAT32_MAX;
+    made &= SUCCEEDED(ID3D11Device_CreateTexture2D(g_device, &desc, NULL, &textures[i])) &&
+            SUCCEEDED(ID3D11Device_CreateShaderResourceView(g_device, (ID3D11Resource *)textures[i], NULL, &views[i])) &&
+            SUCCEEDED(ID3D11Device_CreateSamplerState(g_device, &sampler_desc, &samplers[i]));
+  }
+  UINT32 got = 0;
+  ID3D11Buffer *vertices = triangle(0.5f, 1, 1, 1);
+  if (made && vertices) {
+    for (int frame = 0; frame < 2; ++frame) {      /* (the second frame writes the planes again, as each new video frame does) */
+      for (int i = 0; i < 3; ++i) {
+        BYTE bytes[16 * 5];
+        const UINT pitch = 16;
+        memset(bytes, frame ? 30 : 7, sizeof bytes);
+        bytes[(planes[i].h - 1) * pitch + planes[i].w - 1] = (BYTE)(planes[i].last - frame);
+        ID3D11DeviceContext_UpdateSubresource(g_context, (ID3D11Resource *)textures[i], 0, NULL, bytes, pitch, 0);
+      }
+      begin(NULL);
+      clear(0, 0, 0);
+      bind_floats(vertices);
+      if (packed) {
+        ID3D11DeviceContext_IASetInputLayout(g_context, layout);
+        ID3D11DeviceContext_VSSetShader(g_context, vs, NULL, 0);
+      }
+      ID3D11DeviceContext_PSSetShader(g_context, ps, NULL, 0);
+      ID3D11DeviceContext_PSSetShaderResources(g_context, 0, 3, views);
+      ID3D11DeviceContext_PSSetSamplers(g_context, 0, 3, samplers);
+      ID3D11DeviceContext_Draw(g_context, 3, 0);
+      ID3D11ShaderResourceView *none[3] = {0};
+      ID3D11DeviceContext_PSSetShaderResources(g_context, 0, 3, none);
+      got = read_target() ? pixel(32, 40) : 0;
+      char what[160];
+      snprintf(what, sizeof what, "frame %d of three R8 planes in one draw%s reads Y, U, V = (%d, %d, %d): got (%d, %d, %d)", frame + 1,
+               packed ? " (packed coordinates)" : "", planes[0].last - frame,
+               planes[1].last - frame, planes[2].last - frame, red(got), green(got), blue(got));
+      check(red(got) == planes[0].last - frame && green(got) == planes[1].last - frame && blue(got) == planes[2].last - frame, what);
+    }
+  } else check(0, "three R8 planes, their views and samplers");
+  if (vertices) ID3D11Buffer_Release(vertices);
+  for (int i = 0; i < 3; ++i) {
+    if (samplers[i]) ID3D11SamplerState_Release(samplers[i]);
+    if (views[i]) ID3D11ShaderResourceView_Release(views[i]);
+    if (textures[i]) ID3D11Texture2D_Release(textures[i]);
+  }
+  ID3D11PixelShader_Release(ps);
+  if (vs) ID3D11VertexShader_Release(vs);
+  if (layout) ID3D11InputLayout_Release(layout);
+  begin(NULL);
+}
+
 int main(void) {
   test_device();
   if (g_device && g_context) {
@@ -663,6 +820,9 @@ int main(void) {
       test_indexed();
       test_multisample();
       test_small_formats();
+      test_sampled_planes();
+      test_three_planes(0);
+      test_three_planes(1);
     }
     ID3D11DeviceContext_ClearState(g_context);
     ID3D11DeviceContext_Flush(g_context);

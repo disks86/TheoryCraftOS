@@ -2492,6 +2492,62 @@ void test_dxbc_real() {
   CHECK(allocator.live == 0);
 }
 
+// Varyings the compiler packs two to a register (vs_packed / ps_packed: TEXCOORD1 in o1.xy, TEXCOORD2 in o1.zw, TEXCOORD3 in o2.xy), as ANGLE's shaders for Chrome's
+// video quads have them. Both stages must send such a register through the same varying: before, the vertex shader took its first element's slot and the pixel shader
+// its last one's, so the Y and U planes were sampled at coordinates nobody wrote and Chrome's video on virgl showed only the V plane (green and red). Checked on the CPU
+// (run_vertex into run_fragment) and as TGSI (the vertex shader's OUT[n + 1] into the pixel shader's IN[n], as virgl links GENERIC[n]).
+void test_packed_varyings() {
+  HostAllocator allocator;
+  {
+    TexSet textures;
+    NtStatus st = 0;
+    const std::vector<uint8_t> vs_blob = read_blob("vs_packed.dxbc"), ps_blob = read_blob("ps_packed.dxbc");
+    CHECK(!vs_blob.empty() && !ps_blob.empty());
+    UniquePointer<D3d9Program> vs = compile_dxbc(allocator, vs_blob, &st);
+    CHECK(st == status::kSuccess && vs);
+    UniquePointer<D3d9Program> ps = compile_dxbc(allocator, ps_blob, &st);
+    CHECK(st == status::kSuccess && ps && ps->uses_textures());
+    if (!vs || !ps) return;
+    String vs_text(allocator), ps_text(allocator);
+    CHECK(vs->emit_tgsi(&vs_text, graphics::kMaxVaryings) == status::kSuccess && ps->emit_tgsi(&ps_text, graphics::kMaxVaryings) == status::kSuccess);
+    const std::string vs_source(vs_text.data(), vs_text.size()), ps_source(ps_text.data(), ps_text.size());
+    for (unsigned set = 0; set < 4; ++set) {
+      uint8_t constants[128] = {};
+      const float identity[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+      memcpy(constants, identity, sizeof identity);
+      graphics::Vec4 attributes[16] = {};
+      const float(*in)[4] = kInputs[set];
+      attributes[0] = {in[0][0], in[0][1], in[0][2], 1};
+      attributes[1] = {in[1][0], in[1][1], in[1][2], in[1][3]};
+      const float* c = in[1];
+      const graphics::Vec4 y = textures.sample(0, c[0] * 2, c[1] * 2), u = textures.sample(1, c[2] * 2, c[3] * 2), v = textures.sample(2, c[1] * 2, c[0] * 2);
+
+      graphics::ShaderIo io = {};
+      vs->run_vertex(attributes, constants, &io);
+      graphics::Vec4 colour = {};
+      const bool alive = ps->run_fragment(io.varying, constants, &textures, &colour);
+      const bool cpu = alive && near_value(colour.x, y.x) && near_value(colour.y, u.x) && near_value(colour.z, v.x) && near_value(colour.w, 1);
+      if (!cpu) printf("  packed varyings on the CPU (set %u): got (%f, %f, %f), want (%f, %f, %f)\n", set, colour.x, colour.y, colour.z, y.x, u.x, v.x);
+      CHECK(cpu);
+
+      TgsiMachine vm;
+      memcpy(vm.cst[0], identity, sizeof identity);
+      for (unsigned i = 0; i < 2; ++i) {
+        const float a[4] = {attributes[i].x, attributes[i].y, attributes[i].z, attributes[i].w};
+        memcpy(vm.in[i], a, sizeof a);
+      }
+      bool ok = vm.run(vs_source);
+      TgsiMachine pm;
+      pm.textures = &textures;
+      for (int i = 0; i + 1 < TgsiMachine::kRegs; ++i) memcpy(pm.in[i], vm.out[i + 1], sizeof pm.in[i]);
+      ok = ok && pm.run(ps_source) && !pm.killed && near_value(pm.out[0][0], y.x) && near_value(pm.out[0][1], u.x) && near_value(pm.out[0][2], v.x);
+      if (!ok) printf("  packed varyings as TGSI (set %u): got (%f, %f, %f), want (%f, %f, %f)\n%s%s", set, pm.out[0][0], pm.out[0][1], pm.out[0][2], y.x, u.x, v.x, vs_source.c_str(), ps_source.c_str());
+      CHECK(ok);
+    }
+  }
+  CHECK(allocator.live == 0);
+}
+
 // --- Bytecode for the devices without a shader compiler -------------------------------------------------------------------------------------------------------------------
 
 void test_device_forms() {
@@ -7947,6 +8003,7 @@ int main() {
   test_d3d9_tgsi_reaches_device();
   test_dxbc();
   test_dxbc_real();
+  test_packed_varyings();
   test_dxbc_constant_buffers();
   test_dxbc_integers();
   test_dxbc_loops();
