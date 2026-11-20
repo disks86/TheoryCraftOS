@@ -18,6 +18,7 @@
 #include "Process/Win32k/Win32k.hpp"
 #include "Kernel/UserMode.hpp"
 #include "Process/ImageCache.hpp"
+#include "Process/ImageFileCache.hpp"
 #include "Process/LinuxProcess.hpp"
 #include "Hardware/CentralProcessingUnit/ICentralProcessingUnit.hpp"
 #include "Kernel/Delay.hpp"
@@ -734,6 +735,10 @@ bool init(allocators::IAllocator& allocator) {
   }
   if (!process::image_cache()) {      // the pages of DLLs at their preferred base, shared by every program that maps them
     if (void* cache_memory = allocator.allocate(sizeof(process::ImageCache))) process::set_image_cache(new (cache_memory) process::ImageCache(allocator));
+  }
+  if (!process::image_file_cache()) {      // the DLL files NtLoadModule reads, for the next process that loads one (512 MiB of them kept while unused)
+    if (void* cache_memory = allocator.allocate(sizeof(process::ImageFileCache)))
+      process::set_image_file_cache(new (cache_memory) process::ImageFileCache(allocator, uint64_t{512} << 20));
   }
   g.nx = (rdmsr(kMsrEfer) & kEferNxe) != 0;
 
@@ -1574,7 +1579,9 @@ void report() {
     console::puts(locked ? "" : " (its lock is held: what follows may be changing)");
     console::puts(", memory ");
     console::put_dec(int64_t(task->program.address_space().resident_bytes() >> 20));
-    console::puts(" MiB resident");
+    console::puts(" MiB resident, ");
+    console::put_dec(int64_t(task->program.address_space().private_bytes() >> 20));
+    console::puts(" MiB of it its own");
     if (task->program.process()->exited()) { console::puts(", ended with "); console::put_hex(task->program.process()->exit_code()); }
     console::puts("\n");
     const process::ModuleSet* modules = task->program.modules();
@@ -1619,6 +1626,20 @@ void report() {
       }
     }
     if (locked) task->mutex.unlock();
+  }
+  if (process::ImageCache* cache = process::image_cache()) {      // the images the programs share (each program's "resident" counts the ones it maps)
+    console::puts("report: image cache ");
+    console::put_dec(int64_t(cache->count()));
+    console::puts(" images, ");
+    console::put_dec(int64_t(cache->bytes() >> 20));
+    console::puts(" MiB\n");
+  }
+  if (process::ImageFileCache* files = process::image_file_cache()) {
+    console::puts("report: library files kept ");
+    console::put_dec(int64_t(files->count()));
+    console::puts(", ");
+    console::put_dec(int64_t(files->bytes() >> 20));
+    console::puts(" MiB\n");
   }
 }
 

@@ -23,6 +23,9 @@
 #include "Process/AddressSpace.hpp"
 #include "Process/ModuleLoader.hpp"
 #include "Process/ImageCache.hpp"
+#include "Process/ImageFileCache.hpp"
+#include <thread>
+#include <atomic>
 #include "FileSystem/Ram/RamFileSystem.hpp"
 
 using namespace process;
@@ -497,12 +500,67 @@ static void test_private_assemblies() {
   }
 }
 
+// The DLL files NtLoadModule keeps (ImageFileCache): one copy of a file for every load of it, a file that changed is read again, unused files go when they do not
+// fit in the budget (oldest first) and ones in use stay; several cores at once.
+static SharedPointer<ByteBuffer> file_bytes(uint64_t size, uint8_t fill) {
+  SharedPointer<ByteBuffer> b = SharedPointer<ByteBuffer>::make(A, A);
+  if (b && b->put_zeros(size)) b->writable_view().fill(fill);
+  return b;
+}
+static void test_image_file_cache() {
+  {
+    ImageFileCache cache(A, 3000);
+    const ImageFileCache::Key big{1000, 5, 50, 7}, changed{1000, 6, 60, 7};
+    CHECK(!cache.find("/Windows/a.dll", big));
+    SharedPointer<ByteBuffer> a = file_bytes(1000, 0xAA);
+    SharedPointer<ByteBuffer> kept = cache.put("/Windows/a.dll", big, a);
+    CHECK(kept.get() == a.get() && cache.count() == 1 && cache.bytes() == 1000);
+    SharedPointer<ByteBuffer> again = cache.find("/Windows/a.dll", big);
+    CHECK(again.get() == a.get());      // (the same block: nothing read or taken again)
+    SharedPointer<ByteBuffer> second = file_bytes(1000, 0xAA);      // another process read it at the same time: the first copy wins
+    CHECK(cache.put("/Windows/a.dll", big, second).get() == a.get() && cache.count() == 1);
+    CHECK(!cache.find("/Windows/a.dll", changed) && cache.count() == 0);      // written again since: forgotten (the holders keep their copy)
+    CHECK(a && a->size() == 1000 && a->view()[999] == 0xAA);
+  }
+  {
+    ImageFileCache cache(A, 2500);      // room for two unused files of 1000 bytes
+    const ImageFileCache::Key k{1000, 1, 1, 1};
+    SharedPointer<ByteBuffer> held = cache.put("/held.dll", k, file_bytes(1000, 1));      // in use by a load the whole time
+    cache.put("/old.dll", k, file_bytes(1000, 2));
+    cache.put("/mid.dll", k, file_bytes(1000, 3));
+    CHECK(cache.count() == 3);
+    cache.put("/new.dll", k, file_bytes(1000, 4));      // three unused now: the least recently used one goes
+    CHECK(cache.count() == 3 && !cache.find("/old.dll", k) && cache.find("/held.dll", k) && cache.find("/mid.dll", k) && cache.find("/new.dll", k));
+    held = SharedPointer<ByteBuffer>();
+  }
+  {
+    ImageFileCache cache(A, 1u << 20);
+    const ImageFileCache::Key k{4096, 9, 9, 9};
+    std::vector<std::thread> threads;
+    std::atomic<int> different{0};
+    for (int t = 0; t < 8; ++t) {
+      threads.emplace_back([&cache, &k, &different, t]() {
+        for (int i = 0; i < 200; ++i) {
+          char path[32];
+          snprintf(path, sizeof path, "/lib%d.dll", (i + t) % 5);
+          SharedPointer<ByteBuffer> b = cache.find(path, k);
+          if (!b) b = cache.put(path, k, file_bytes(4096, uint8_t((i + t) % 5)));
+          if (!b || b->size() != 4096 || b->view()[0] != uint8_t((i + t) % 5)) different.fetch_add(1);
+        }
+      });
+    }
+    for (std::thread& t : threads) t.join();
+    CHECK(different.load() == 0 && cache.count() == 5);
+  }
+}
+
 int main() {
   test_names();
   test_private_assemblies();
   test_load();
   test_failures();
   test_shared_images();
+  test_image_file_cache();
   CHECK(A.live == 0);
   if (g_failed) { printf("%d check(s) failed\n", g_failed); return 1; }
   printf("ModuleLoaderTest: all passed\n");

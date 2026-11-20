@@ -199,6 +199,7 @@ class AddressSpace final : public IUserMemory {
   // What the regions span (reserved, committed or touched alike), and the memory the space really uses: private pages that have memory, and the shared regions.
   uint64_t mapped_bytes() const { return mapped_bytes_; }
   uint64_t resident_bytes() const { return pages_.count() * kPageSize + shared_bytes_; }
+  uint64_t private_bytes() const { return pages_.count() * kPageSize; }      // (its own pages: what only this space uses; shared regions are counted by everyone who maps them)
   uint64_t region_count() const { return regions_.count(); }
 
  private:

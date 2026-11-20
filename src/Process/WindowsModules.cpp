@@ -21,6 +21,7 @@
 #include "Process/WindowsFiles.hpp"
 #include "Process/WindowsProcess.hpp"
 #include "Process/WindowsDebug.hpp"
+#include "Process/ImageFileCache.hpp"
 #include "ObjectContainer/List.hpp"
 #include "Utility/ByteBuffer.hpp"
 
@@ -29,6 +30,36 @@ namespace process::windowsabi {
 namespace {
 constexpr uint32_t kSuccess = 0, kAccessViolation = 0xC0000005u, kInvalidParameter = 0xC000000Du, kNotImplemented = 0xC0000002u, kDllNotFound = 0xC0000135u;
 constexpr uint32_t kRecordBytes = 64, kMaxRecords = 256;      // (the records are on the heap: kernel stacks are small)
+}  // namespace
+
+namespace {
+// The bytes of the DLL file at `path` (a Win32 path): the ones kept for that file (ImageFileCache: a big DLL that every process of a program loads is read once
+// and its block taken once), or read now. False with an NTSTATUS in *status as read_program_file gives one.
+bool library_file(Process& p, StringView path, SharedPointer<ByteBuffer>* out, uint32_t* status) {
+  allocators::IAllocator& allocator = p.files().allocator();
+  ImageFileCache* cache = image_file_cache();
+  ImageFileCache::Key key;
+  String virtual_path(allocator);
+  if (cache) {
+    filesystem::DirectoryEntry entry;
+    if (p.files().resolve(path, &virtual_path) == PathResult::Ok && p.files().stat(virtual_path.view(), &entry) == filesystem::Status::Ok && entry.type == filesystem::NodeType::File) {
+      key.size = entry.size;
+      key.modified = entry.modified;
+      key.exact_modified = entry.exact_modified;
+      key.file_id = entry.file_id;
+      SharedPointer<ByteBuffer> kept = cache->find(virtual_path.view(), key);
+      if (kept) { *out = kept; return true; }
+    } else {
+      cache = nullptr;      // (read_program_file says why it is not there)
+    }
+  }
+  SharedPointer<ByteBuffer> bytes = SharedPointer<ByteBuffer>::make(allocator, allocator);
+  if (!bytes) { *status = 0xC0000017u; return false; }
+  if (!read_program_file(p, path, bytes.get(), status)) return false;
+  if (cache && bytes->size() == key.size) *out = cache->put(virtual_path.view(), key, bytes);      // (a file that changed while it was read is not kept)
+  else *out = bytes;
+  return true;
+}
 }  // namespace
 
 uint32_t nt_load_module(Process& p, const SyscallRequest& r) {
@@ -82,8 +113,8 @@ uint32_t nt_load_module(Process& p, const SyscallRequest& r) {
       from = redirected.view();
     }
   }
-  ByteBuffer file(p.files().allocator());
-  if (!read_program_file(p, from, &file, &status)) {
+  SharedPointer<ByteBuffer> file;
+  if (!library_file(p, from, &file, &status)) {
 #ifdef TCOS_TRACE_SERVICE_FAILURES
     // (with the trace of failing services: which library it was - the service's arguments are pointers, and a program that gives up after this says nothing)
     process_log("library not found: ");
@@ -93,7 +124,7 @@ uint32_t nt_load_module(Process& p, const SyscallRequest& r) {
   }
   {
     exe::PeFile checked(p.files().allocator());
-    if (const uint32_t header = image_section_status(file.view(), checked)) return header;
+    if (const uint32_t header = image_section_status(file->view(), checked)) return header;
   }
   List<LoadedModule> loaded_list(p.files().allocator());
   ByteBuffer record_buffer(p.files().allocator());
@@ -101,7 +132,7 @@ uint32_t nt_load_module(Process& p, const SyscallRequest& r) {
   for (uint32_t i = 0; i < capacity; ++i) loaded_list.push_back(LoadedModule());
   LoadedModule* loaded = &loaded_list[0];
   uint32_t count = 0;
-  status = host->load_module(file.view(), canonical.view(), loaded, capacity, &count, (flags & 1) == 0);
+  status = host->load_module(file->view(), canonical.view(), loaded, capacity, &count, (flags & 1) == 0);
   if (status == 0xC000007Bu) status = 0xC00000BBu;      // a good image that this process cannot run (a 32-bit library): the caller may try the next file of its path
   if (status != kSuccess) return status;
   uint8_t* records = record_buffer.writable_view().data();

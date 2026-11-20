@@ -897,6 +897,7 @@ add_executable(BOOTX64
   src/Process/AddressSpace.cpp
   src/Process/PageMap.cpp
   src/Process/ImageCache.cpp
+  src/Process/ImageFileCache.cpp
   src/Process/ImageLoader.cpp
   src/Process/UserProgram.cpp
   src/Process/UserPageTables.cpp
