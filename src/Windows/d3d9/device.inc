@@ -396,9 +396,13 @@ static HRESULT make_heap(Dev *d, D3D12_DESCRIPTOR_HEAP_TYPE type, UINT count, BO
   D3D12_DESCRIPTOR_HEAP_DESC desc = {type, count, visible ? D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE : D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
   return ID3D12Device_CreateDescriptorHeap(d->d12, &desc, &IID_ID3D12DescriptorHeap, (void **)out);
 }
+/* A ring of upload memory. It is not kept mapped: d3d12.dll compares every mapped upload buffer with what it sent, byte by byte, at each submission, and
+ * sends one unmapped since without comparing. The memory stays where Map put it (d3d12.dll's CPU copy), and flush() marks the rings a list wrote. */
 static BOOL make_ring(Dev *d, UINT bytes, ID3D12Resource **ring, BYTE **data) {
   *ring = make_buffer(d, D3D12_HEAP_TYPE_UPLOAD, bytes);
-  return *ring && SUCCEEDED(ID3D12Resource_Map(*ring, 0, NULL, (void **)data)) && *data;
+  if (!*ring || FAILED(ID3D12Resource_Map(*ring, 0, NULL, (void **)data)) || !*data) return FALSE;
+  ID3D12Resource_Unmap(*ring, 0, NULL);
+  return TRUE;
 }
 
 /* The Direct3D 12 half of a device. */

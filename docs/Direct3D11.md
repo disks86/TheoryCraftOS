@@ -21,7 +21,7 @@ has run, then a spare for the next buffer of its size (`buf_rename`, `retire`, `
 by this list" mark (`converted_used`), apart from the buffer's, and a converted copy a recorded draw reads still sends the list when it is made
 again. (Retiring it too made frames faster still, but on the 3D hardware Chrome's window then stopped updating now and then while typing into a
 page: the GPU process went on drawing and presenting and the picture stayed. Not explained yet: the kernel took every submission, and the
-virgl device's object handles, made atomic, were not it.) Texture uploads
+virgl device is used one thread at a time (RenderNode's LockedDevice), so it is not a race on its object handles.) Texture uploads
 (`UpdateSubresource`, `Unmap` of a dynamic texture) are recorded in order with the draws too. What waits for a list is capped
 (`RETIRED_MAX`, 32 MiB); beyond that the list is sent first. In Chrome a page that repaints everything every frame went from 8 to about 30
 frames a second.

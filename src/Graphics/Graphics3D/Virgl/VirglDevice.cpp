@@ -777,6 +777,7 @@ VirglDevice::~VirglDevice() {
   for (uint32_t i = 0; i < sampler_state_count_; ++i) destroy_object(sampler_states_[i].handle);
 }
 
+// (Called from submit, which RenderNode's LockedDevice runs one at a time: the table needs no lock of its own.)
 uint32_t VirglDevice::sampler_state(const SamplerDesc& sampler) {
   // (PIPE_TEX_WRAP_*: repeat 0, clamp to edge 2, clamp to border 3, mirror repeat 4, mirror clamp to edge 6; PIPE_TEX_MIPFILTER_*: nearest 0, linear 1, none 2)
   static const uint32_t kWrap[] = {virgl::kWrapRepeat, virgl::kWrapClampToEdge, 4, 3, 6};

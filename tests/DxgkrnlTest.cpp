@@ -488,7 +488,7 @@ void test_texture_copy_mips() {
   w.draw(3);
   w.end_pass();
   CHECK(e.render(w, {rt, tex, vb}) == status::kSuccess && e.pixel(rt, 4, 4) == 0xFFC08040);
-  // Drawing with the texture unbound is refused; so is drawing into a bound texture.
+  // Drawing with the texture unbound is refused.
   CommandWriter w_unbound(e.allocator);
   w_unbound.begin_pass(0, kNoAllocation, 0, {0, 0, 0, 0}, 1, 0);
   w_unbound.bind_pipeline(pipe);
@@ -497,11 +497,48 @@ void test_texture_copy_mips() {
   w_unbound.end_pass();
   CHECK(e.render(w_unbound, {rt, tex, vb}) == status::kInvalidParameter);
   Handle tex_rt = e.alloc(kTexture | kTarget, Format::A8R8G8B8, 8, 8);
+  // A pass into an image a texture unit still holds from an earlier draw lets the unit go: the pass is taken, and a draw in it that samples through the unit
+  // is refused (it would read the image it draws into).
   CommandWriter w_self(e.allocator);
   w_self.bind_texture(0, 0, graphics::SamplerDesc());
   w_self.begin_pass(0, kNoAllocation, 0, {0, 0, 0, 0}, 1, 0);
   w_self.end_pass();
-  CHECK(e.render(w_self, {tex_rt}) == status::kInvalidParameter);
+  CHECK(e.render(w_self, {tex_rt}) == status::kSuccess);
+  CommandWriter w_self_draw(e.allocator);
+  w_self_draw.bind_texture(0, 1, graphics::SamplerDesc());
+  w_self_draw.begin_pass(1, kNoAllocation, 0, {0, 0, 0, 0}, 1, 0);
+  w_self_draw.bind_pipeline(pipe);
+  w_self_draw.bind_vertex_buffer(2);
+  w_self_draw.push_constants(floats(identity, 16));
+  w_self_draw.draw(3);
+  w_self_draw.end_pass();
+  CHECK(e.render(w_self_draw, {rt, tex_rt, vb}) == status::kInvalidParameter);
+  CommandWriter w_self_bind(e.allocator);
+  w_self_bind.begin_pass(1, kNoAllocation, 0, {0, 0, 0, 0}, 1, 0);
+  w_self_bind.bind_texture(0, 1, graphics::SamplerDesc());
+  w_self_bind.end_pass();
+  CHECK(e.render(w_self_bind, {rt, tex_rt, vb}) == status::kInvalidParameter);
+  // Render to texture in one stream: sample it, draw into it, sample it again - the second draw sees what the pass between drew.
+  CommandWriter w_ping(e.allocator);
+  w_ping.begin_pass(1, kNoAllocation, kPassClearColor, {1, 0, 0, 1}, 1, 0);      // tex_rt red
+  w_ping.end_pass();
+  w_ping.begin_pass(0, kNoAllocation, kPassClearColor, {0, 0, 0, 1}, 1, 0);      // rt from tex_rt
+  w_ping.bind_pipeline(pipe);
+  w_ping.bind_vertex_buffer(2);
+  w_ping.push_constants(floats(identity, 16));
+  w_ping.bind_texture(0, 1, graphics::SamplerDesc());
+  w_ping.draw(3);
+  w_ping.end_pass();
+  w_ping.begin_pass(1, kNoAllocation, kPassClearColor, {0, 1, 0, 1}, 1, 0);      // tex_rt green, while unit 0 still holds it
+  w_ping.end_pass();
+  w_ping.begin_pass(0, kNoAllocation, 0, {0, 0, 0, 1}, 1, 0);
+  w_ping.bind_pipeline(pipe);
+  w_ping.bind_vertex_buffer(2);
+  w_ping.push_constants(floats(identity, 16));
+  w_ping.bind_texture(0, 1, graphics::SamplerDesc());
+  w_ping.draw(3);
+  w_ping.end_pass();
+  CHECK(e.render(w_ping, {rt, tex_rt, vb}) == status::kSuccess && e.pixel(rt, 4, 4) == 0xFF00FF00);
   // A render target is used as a texture afterwards.
   CommandWriter w2(e.allocator);
   w2.begin_pass(0, kNoAllocation, kPassClearColor, {0, 0, 1, 1}, 1, 0);

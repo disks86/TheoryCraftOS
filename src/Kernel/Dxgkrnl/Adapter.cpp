@@ -317,9 +317,13 @@ class Adapter::StreamRunner {
     // (the clear colour of an integer target is four integers as float bits: any bit pattern)
     if (!is_integer(color->desc().format) && (!finite_within(clear.x, 1e6f) || !finite_within(clear.y, 1e6f) || !finite_within(clear.z, 1e6f) || !finite_within(clear.w, 1e6f))) return kBad;
     if (!(clear_depth >= 0.0f && clear_depth <= 1.0f) || clear_stencil > 255) return kBad;
-    // A render pass may not draw into an image that is bound as a texture.
-    for (uint32_t u = 0; u < graphics::kMaxTextureUnits; ++u)
-      if (texture_bound_[u] && (texture_alloc_[u] == color || texture_alloc_[u] == depth || is_extra_target(extras, extra_count, texture_alloc_[u]))) return kBad;
+    // A render pass may not draw into an image it samples. A texture unit that still holds one of the targets from an earlier draw is let go of here (as a copy
+    // into an image does): no draw of the pass can sample through it, since a draw needs its units bound (draw) and a target cannot be bound during the pass
+    // (bind_texture). Refusing the stream instead refused ordinary render-to-texture in one command list - sample A, draw into B, then sample B, draw into A -
+    // and made the layers above send a list before every such pass.
+    unbind_textures_of(color);
+    if (depth) unbind_textures_of(depth);
+    for (uint32_t n = 0; n < extra_count; ++n) unbind_textures_of(extras[n]);
     in_pass_ = true;
     pass_color_ = color;
     pass_depth_ = depth;

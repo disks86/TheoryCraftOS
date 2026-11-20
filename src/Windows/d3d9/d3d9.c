@@ -313,8 +313,16 @@ static const GUID *const g_ps_iids[] = {&IID_IDirect3DPixelShader9, NULL};
 static void record_pending_clears(Dev *d);
 
 /* Sends what was recorded (the queue runs it before it returns) and begins a new list. */
+/* Marks a ring the list wrote, so that d3d12.dll sends it with the list (see make_ring). */
+static void ring_touch(ID3D12Resource *ring, UINT used) {
+  void *p = NULL;
+  if (used && SUCCEEDED(ID3D12Resource_Map(ring, 0, NULL, &p))) ID3D12Resource_Unmap(ring, 0, NULL);
+}
 static void flush(Dev *d) {
   if (!d->recorded) return;
+  ring_touch(d->vertex_ring, d->vertex_used);
+  ring_touch(d->index_ring, d->index_used);
+  ring_touch(d->constant_ring, d->constant_used);
   ID3D12GraphicsCommandList_Close(d->list);
   ID3D12CommandList *lists[1] = {(ID3D12CommandList *)d->list};
   ID3D12CommandQueue_ExecuteCommandLists(d->queue, 1, lists);
