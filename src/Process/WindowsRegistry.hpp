@@ -22,6 +22,7 @@
 #include "Utility/String.hpp"
 #include "Utility/UniquePointer.hpp"
 #include "Process/Process.hpp"
+#include "Process/RegistryStore.hpp"
 #include "Process/Syscall.hpp"
 
 // The NT registry services (WindowsSyscalls.cpp maps service numbers to these) over the tree of RegistryTree.hpp. A key handle is a descriptor of kind Key whose token is the
@@ -84,5 +85,17 @@ enum class RegistryHive : uint8_t { ClassesRoot, CurrentUser, LocalMachine, User
 void registry_delete_value(RegistryHive hive, StringView key, StringView name);
 // Deletes the key with everything under it; with `only_if_empty`, only a key that has no values and no keys under it.
 void registry_delete_key(RegistryHive hive, StringView key, bool only_if_empty);
+
+// The registry on disk (RegistryStore.hpp, filesystem::layout::kWindowsRegistryFile). registry_attach_storage() is called once at boot, before any
+// Windows program runs: it makes the registry (with `allocator`, the kernel's own) and merges the saved image into it; from then on registry_save()
+// writes it, and RegFlushKey on any key does too. `unix_seconds` is the time now (the write time of the keys the registry starts with). After NotMerged
+// nothing is attached: the registry is in memory only until the next boot, and the file stays as it is.
+[[nodiscard]] RegistryLoad registry_attach_storage(allocators::IAllocator& allocator, filesystem::IFileSystem& fs, uint64_t unix_seconds);
+// Writes the registry's keys that are not volatile to disk; with `only_if_changed`, only if something changed since the last save. True if there was
+// nothing to do or it was written; false if the file system refused (the previous file is then still there). Called every few seconds from a kernel
+// thread (main.cpp) and by NtFlushKey; may be called from any thread.
+[[nodiscard]] bool registry_save(bool only_if_changed);
+// The last save, before the file system goes away (shutdown). From then on the registry is in memory only.
+[[nodiscard]] bool registry_detach_storage();
 
 }  // namespace process::windowsabi

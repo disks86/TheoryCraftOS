@@ -23,7 +23,7 @@
 #include "Utility/String.hpp"
 #include "Utility/UniquePointer.hpp"
 
-// The registry of Windows programs: a tree of keys, each with named values. It is kept in memory (nothing is written to disk) and shared by every program. The names are UTF-8
+// The registry of Windows programs: a tree of keys, each with named values. It is kept in memory and shared by every program; RegistryStore.hpp writes it to disk. The names are UTF-8
 // here and compared without regard to case; the NT services (WindowsRegistry.cpp) convert from and to UTF-16. A key that is deleted while handles to it are open stays
 // until the last one is closed, and then answers STATUS_KEY_DELETED.
 namespace process::windowsabi {
@@ -61,6 +61,9 @@ class RegistryTree {
   static constexpr uint32_t kRoot = 0;
   // Makes the root "REGISTRY" with the usual hives (MACHINE with HARDWARE, SAM, SECURITY, SOFTWARE and SYSTEM; USER with .DEFAULT and the user of the session).
   RegistryTree(allocators::IAllocator& allocator, uint64_t now);
+  // The keys and values the system defines (what the constructor makes): made again after a saved image was merged in (RegistryStore.hpp), so that
+  // they are this system's and not those of the one that saved the image (its version, its folders). Nothing else is touched.
+  void make_defaults(uint64_t now);
   allocators::IAllocator& allocator() { return allocator_; }
 
   // Finds or makes the key named by `path` (components separated by '\'), starting at `base`. A path that starts with '\' is absolute: its first component must be the root's name,
@@ -99,11 +102,18 @@ class RegistryTree {
   // `replace`: the key's own values and subkeys are deleted first, else the two are merged (what the image holds wins). kRegInvalidParameter for an image that does not parse;
   // nothing is changed in that case when `replace` is false or the image is checked first (it always is).
   bool save(uint32_t id, ByteBuffer* out) const;
+  // The image of the whole tree as it should outlast a restart: volatile keys and hives loaded from their own files (NtLoadKey) are left out, with everything under them.
+  bool save_persistent(ByteBuffer* out) const;
   static bool valid_image(ConstByteView image);
   uint32_t restore(uint32_t id, ConstByteView image, bool replace, uint64_t now);
 
   // NtQueryOpenSubKeys: how many keys at or under `id` have a handle open.
   uint32_t count_open_keys(uint32_t id) const;
+
+  // Counts every change to keys and values (made, deleted, renamed, set): a writer compares it with the count it saved at.
+  uint64_t changes() const { return changes_; }
+  // Marks a key volatile (REG_OPTION_VOLATILE): it is not saved by save_persistent().
+  void set_volatile(uint32_t id, bool value) { if (RegKey* k = key(id)) k->volatile_key = value; }
 
   static bool names_equal(StringView a, StringView b);
   static bool valid_key_name(StringView name);
@@ -113,12 +123,14 @@ class RegistryTree {
   uint32_t find_child(uint32_t parent, StringView name) const;
   bool link_child(uint32_t parent, uint32_t child);
   void drop_if_unused(uint32_t id);
-  bool save_node(uint32_t id, ByteBuffer* out, uint32_t depth) const;
+  bool save_node(uint32_t id, ByteBuffer* out, uint32_t depth, bool persistent_only) const;
+  bool kept(uint32_t id, bool persistent_only) const;
   static bool check_node(ByteReader& in, uint32_t depth);
   uint32_t restore_node(uint32_t id, ByteReader& in, uint64_t now, uint32_t depth);
 
   allocators::IAllocator& allocator_;
   List<UniquePointer<RegKey>> keys_;
+  uint64_t changes_ = 0;
 };
 
 // The number of UTF-16 code units of UTF-8 text.

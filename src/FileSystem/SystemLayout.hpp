@@ -109,6 +109,12 @@ inline constexpr const char* kWindowsUsers = "/Windows/Users";
 inline constexpr const char* kWindowsDirectory = "/Windows/Windows";
 inline constexpr const char* kWindowsSystem32 = "/Windows/Windows/System32";
 inline constexpr const char* kWindowsSysWow64 = "/Windows/Windows/SysWOW64";
+// The registry of Windows programs (C:\Windows\System32\config, where Windows keeps its hives): the kernel keeps it in memory and writes the keys that
+// are not volatile to kWindowsRegistryFile (src/Process/RegistryStore.hpp), first to kWindowsRegistryNewFile, which then takes the old file's place.
+inline constexpr const char* kWindowsRegistryFolder = "/Windows/Windows/System32/config";
+inline constexpr const char* kWindowsRegistryFile = "/Windows/Windows/System32/config/Registry.tcos";
+inline constexpr const char* kWindowsRegistryNewFile = "/Windows/Windows/System32/config/Registry.tcos.new";
+inline constexpr const char* kWindowsRegistryBadFile = "/Windows/Windows/System32/config/Registry.tcos.bad";      // a file found damaged at boot, kept aside
 // Where installed Windows programs put their Start menu shortcuts (.lnk): for every user (C:\ProgramData\...) and, under each folder of
 // kWindowsUsers, for one user (kWindowsUserStartMenuPrograms is relative to the user's folder). The desktop's Start menu lists them.
 inline constexpr const char* kWindowsStartMenuPrograms = "/Windows/ProgramData/Microsoft/Windows/Start Menu/Programs";

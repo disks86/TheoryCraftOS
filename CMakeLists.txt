@@ -963,6 +963,7 @@ add_executable(BOOTX64
   ${WIN32K_SOURCES}
   src/Process/WindowsRegistry.cpp
   src/Process/RegistryTree.cpp
+  src/Process/RegistryStore.cpp
   src/Process/DosWildcard.cpp
   src/Process/Objects.cpp
   src/Process/ModuleLoader.cpp

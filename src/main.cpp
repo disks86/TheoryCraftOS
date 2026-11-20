@@ -17,6 +17,7 @@
  */
 
 #include "Process/WindowsSystem.hpp"
+#include "Process/WindowsRegistry.hpp"
 #include "Process/Win32k/Win32k.hpp"
 #include "Process/Win32k/Win32kUserMisc.hpp"
 #include "Process/Win32k/Win32kDesktopBridge.hpp"
@@ -2391,6 +2392,30 @@ static efi::Status kernel_main(efi::Handle image, efi::SystemTable* st) {
     desktop.set_settings(&settings, "system://localhost/system");
     if (system_database.persistent()) Entry(Level::Ok, "Database").text("system database ").text(system_database.path()).text(", boot ").dec(static_cast<uint64_t>(boots));
     else Entry(Level::Warning, "Database").text("system database is in memory only: ").text(system_database.problem().view());
+    // The registry of Windows programs outlasts a restart (C:\Windows\System32\config\Registry.tcos): read back before any Windows program runs, written
+    // again by the "registry" thread a couple of seconds after something changed, and a last time at shutdown.
+    switch (process::windowsabi::registry_attach_storage(shared_allocator, explorer_files.file_system(), unix_seconds(st))) {
+      case process::windowsabi::RegistryLoad::Loaded: Entry(Level::Ok, "Registry").text("read back from ").text(filesystem::layout::kWindowsRegistryFile); break;
+      case process::windowsabi::RegistryLoad::NoFile: Entry(Level::Info, "Registry").text("nothing saved yet: starts with the built-in keys"); break;
+      case process::windowsabi::RegistryLoad::Damaged: Entry(Level::Warning, "Registry").text("the saved registry was damaged (kept as ").text(filesystem::layout::kWindowsRegistryBadFile).text("): starts with the built-in keys"); break;
+      case process::windowsabi::RegistryLoad::NotMerged: Entry(Level::Warning, "Registry").text("out of memory reading ").text(filesystem::layout::kWindowsRegistryFile).text(": changes are not saved this session"); break;
+    }
+    struct RegistryWriter {
+      bool stop = false;
+      kernel::Thread* thread = nullptr;
+      static void main(void* self) {
+        RegistryWriter* w = static_cast<RegistryWriter*>(self);
+        bool failing = false;
+        for (uint32_t tick = 1; !__atomic_load_n(&w->stop, __ATOMIC_ACQUIRE); ++tick) {
+          kernel::sleep_us(250000);
+          if (tick % 8 != 0) continue;      // (every 2 s: a setup program's burst of writes is saved once, not key by key)
+          const bool saved = process::windowsabi::registry_save(true);
+          if (!saved && !failing) Entry(Level::Warning, "Registry").text("could not write ").text(filesystem::layout::kWindowsRegistryFile).text(": changes are in memory only for now");
+          failing = !saved;
+        }
+      }
+    } registry_writer;
+    if (kernel::running()) registry_writer.thread = kernel::spawn(&RegistryWriter::main, &registry_writer, "registry");
     if (stacks.count() > 0) {
       SharedPointer<network::NfsVolume> nfs_volume = SharedPointer<network::NfsVolume>::make(shared_allocator, nfs);
       if (nfs_volume && explorer_files.mounts().mount(desktop::FileExplorer::kNfsFolder, SharedPointer<filesystem::IVolume>(nfs_volume), 0xFFFFFFFFu))
@@ -3562,6 +3587,13 @@ static efi::Status kernel_main(efi::Handle image, efi::SystemTable* st) {
     }
 #endif
     desktop.save_browser_data();
+    if (registry_writer.thread) {
+      __atomic_store_n(&registry_writer.stop, true, __ATOMIC_RELEASE);
+      kernel::join(registry_writer.thread);
+      registry_writer.thread = nullptr;
+    }
+    if (process::windowsabi::registry_detach_storage()) Entry(Level::Info, "Shutdown").text("registry saved");
+    else Entry(Level::Warning, "Shutdown").text("could not save the registry: the changes since the last save are lost");
     const uint32_t kept = desktop.save_session();   // what is open now, for the next start
     Entry(Level::Info, "Desktop").text("saved ").dec(kept).text(" window(s) for the next session");
     guest.stop_service();  // (VirtualBox's resize requests touch the desktop)

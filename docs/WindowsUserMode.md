@@ -165,6 +165,11 @@ The registry is the kernel's (`src/Process/RegistryTree.cpp`, `WindowsRegistry.c
 `NtReplaceKey`, `NtLoadKey*`, `NtUnloadKey*`, `NtQueryOpenSubKeys`, `NtSetInformationKey`. A hive file (`RegSaveKey`) is this OS's own format ("TCRH", see `RegistryTree::save`),
 not Windows' regf; saving needs SeBackupPrivilege, restoring/loading SeRestorePrivilege. A loaded hive is written back by `RegFlushKey` and `RegUnLoadKey`. A change to a key signals
 the watches of `NtNotifyChangeKey` (an event given with an asynchronous call is signalled by the kernel once). Transacted calls only check for a transaction handle.
+The tree outlasts a restart: at boot the kernel reads `C:\Windows\System32\config\Registry.tcos` (`filesystem::layout::kWindowsRegistryFile`, a "TCRH" image of
+`\REGISTRY`) and merges it with the keys it makes itself (the values the system defines, such as its version, are set again after the merge); from then on a thread writes it again about two seconds after a change, `RegFlushKey` on any key writes it at once,
+and shutdown writes it last (`src/Process/RegistryStore.cpp`). Volatile keys (`REG_OPTION_VOLATILE`, and `HKLM\HARDWARE` and `HKCU\Volatile Environment`) and hives loaded
+from their own files are left out. The file is written as `Registry.tcos.new` first and then renamed over the old one; at boot a damaged file is passed over for the `.new` one,
+and if neither reads the registry starts from the built-in keys (the bad file is kept as `Registry.tcos.bad`).
 `NtShutdownSystem` (SeShutdownPrivilege) asks the desktop loop to shut down or restart; `NtImpersonateAnonymousToken`, the `Nt*AuditAlarm` services and a system random source
 (`NtQuerySystemInformation` class 0x1000) are in ntdll.dll / the kernel too.
 

@@ -50,6 +50,11 @@ RegistryTree::RegistryTree(allocators::IAllocator& allocator, uint64_t now) : al
   root->name.assign("REGISTRY");
   root->write_time = now;
   keys_.push_back(static_cast<UniquePointer<RegKey>&&>(root));
+  make_defaults(now);
+}
+
+void RegistryTree::make_defaults(uint64_t now) {
+  if (!key(kRoot)) return;
   static const char* const kHives[] = {"MACHINE\\HARDWARE", "MACHINE\\SAM", "MACHINE\\SECURITY", "MACHINE\\SOFTWARE\\Classes", "MACHINE\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion", "MACHINE\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Shell Folders",
                                        "MACHINE\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion", "MACHINE\\SYSTEM\\CurrentControlSet\\Control", "MACHINE\\SYSTEM\\CurrentControlSet\\Services",
                                        "MACHINE\\SYSTEM\\CurrentControlSet\\Hardware Profiles\\Current",
@@ -141,6 +146,12 @@ RegistryTree::RegistryTree(allocators::IAllocator& allocator, uint64_t now) : al
     expandable("Public", "%SystemDrive%\\Users\\Public");
     expandable("ProgramData", "%SystemDrive%\\ProgramData");
   }
+  // What Windows makes again at every boot is volatile there too: it is not saved (RegistryStore.hpp).
+  static const char* const kVolatile[] = {"MACHINE\\HARDWARE", "USER\\S-1-5-21-0-0-0-1000\\Volatile Environment"};
+  for (const char* path : kVolatile) {
+    uint32_t id = 0;
+    if (resolve(kRoot, StringView(path), false, now, &id, &created) == kRegSuccess) set_volatile(id, true);
+  }
 }
 
 uint32_t RegistryTree::find_child(uint32_t parent, StringView name) const {
@@ -179,6 +190,7 @@ uint32_t RegistryTree::new_key(uint32_t parent, StringView name, uint64_t now) {
     return ~0u;
   }
   if (RegKey* p = key(parent)) p->write_time = now;
+  ++changes_;
   return id;
 }
 
@@ -248,6 +260,7 @@ uint32_t RegistryTree::delete_key(uint32_t id) {
   if (id == kRoot) return kRegCannotDelete;
   for (uint64_t i = 0; i < k->subkeys.count(); ++i) if (alive(k->subkeys[i])) return kRegCannotDelete;
   k->deleted = true;
+  ++changes_;
   RegKey* parent = key(k->parent);
   if (parent) {
     for (uint64_t i = 0; i < parent->subkeys.count(); ++i) if (parent->subkeys[i] == id) { parent->subkeys.remove_at(i); break; }
@@ -278,6 +291,7 @@ uint32_t RegistryTree::set_value(uint32_t id, StringView name, uint32_t type, Co
       replacement->type = type;
       v = static_cast<UniquePointer<RegValue>&&>(replacement);
       k->write_time = now;
+      ++changes_;
       return kRegSuccess;
     }
   }
@@ -286,6 +300,7 @@ uint32_t RegistryTree::set_value(uint32_t id, StringView name, uint32_t type, Co
   fresh->type = type;
   if (!k->values.push_back(static_cast<UniquePointer<RegValue>&&>(fresh))) return kRegNoMemory;
   k->write_time = now;
+  ++changes_;
   return kRegSuccess;
 }
 
@@ -297,6 +312,7 @@ uint32_t RegistryTree::delete_value(uint32_t id, StringView name, uint64_t now) 
     if (v && names_equal(v->name.view(), name)) {
       k->values.remove_at(i);
       k->write_time = now;
+      ++changes_;
       return kRegSuccess;
     }
   }
@@ -316,6 +332,7 @@ uint32_t RegistryTree::rename_key(uint32_t id, StringView new_name, uint64_t now
   if (!k->name.assign(new_name) || !link_child(k->parent, id)) return kRegNoMemory;
   k->write_time = now;
   parent->write_time = now;
+  ++changes_;
   return kRegSuccess;
 }
 
@@ -354,7 +371,14 @@ constexpr uint32_t kImageVersion = 1;
 bool put_text(ByteBuffer* out, StringView text) { return text.size() <= 0xFFFFFFFFu && out->put32(static_cast<uint32_t>(text.size())) && out->append(ConstByteView(reinterpret_cast<const uint8_t*>(text.data()), text.size())); }
 }  // namespace
 
-bool RegistryTree::save_node(uint32_t id, ByteBuffer* out, uint32_t depth) const {
+// A key that goes into the image: alive, and for a persistent image neither volatile nor a hive with a file of its own.
+bool RegistryTree::kept(uint32_t id, bool persistent_only) const {
+  const RegKey* k = key(id);
+  if (!k || k->deleted) return false;
+  return !persistent_only || (!k->volatile_key && !k->loaded_hive);
+}
+
+bool RegistryTree::save_node(uint32_t id, ByteBuffer* out, uint32_t depth, bool persistent_only) const {
   const RegKey* k = key(id);
   if (!k || k->deleted || depth > kRegMaxDepth) return false;
   if (!put_text(out, k->name.view()) || !out->put32(k->volatile_key ? 1u : 0u) || !out->put32(static_cast<uint32_t>(k->write_time)) || !out->put32(static_cast<uint32_t>(k->write_time >> 32))) return false;
@@ -364,14 +388,18 @@ bool RegistryTree::save_node(uint32_t id, ByteBuffer* out, uint32_t depth) const
     if (!v || !put_text(out, v->name.view()) || !out->put32(v->type) || !out->put32(static_cast<uint32_t>(v->data.size())) || !out->append(v->data.view())) return false;
   }
   uint32_t live = 0;
-  for (uint64_t i = 0; i < k->subkeys.count(); ++i) if (alive(k->subkeys[i])) ++live;
+  for (uint64_t i = 0; i < k->subkeys.count(); ++i) if (kept(k->subkeys[i], persistent_only)) ++live;
   if (!out->put32(live)) return false;
-  for (uint64_t i = 0; i < k->subkeys.count(); ++i) if (alive(k->subkeys[i]) && !save_node(k->subkeys[i], out, depth + 1)) return false;
+  for (uint64_t i = 0; i < k->subkeys.count(); ++i) if (kept(k->subkeys[i], persistent_only) && !save_node(k->subkeys[i], out, depth + 1, persistent_only)) return false;
   return true;
 }
 
 bool RegistryTree::save(uint32_t id, ByteBuffer* out) const {
-  return out->put32(kImageMagic) && out->put32(kImageVersion) && save_node(id, out, 0);
+  return out->put32(kImageMagic) && out->put32(kImageVersion) && save_node(id, out, 0, false);
+}
+
+bool RegistryTree::save_persistent(ByteBuffer* out) const {
+  return out->put32(kImageMagic) && out->put32(kImageVersion) && save_node(kRoot, out, 0, true);
 }
 
 // Walks one node without making anything: every length is checked against what is left, so that restore() can run on an image that is known to parse.
@@ -411,7 +439,7 @@ uint32_t RegistryTree::restore_node(uint32_t id, ByteReader& in, uint64_t now, u
   const uint32_t name_size = in.le32();
   in.skip(name_size);      // (the top key keeps its own name; a subkey's name was read by the caller)
   const uint32_t flags = in.le32();
-  in.le64();
+  const uint64_t written = in.le64();
   if (RegKey* k = key(id)) k->volatile_key = (flags & 1) != 0;
   const uint32_t values = in.le32();
   for (uint32_t i = 0; i < values; ++i) {
@@ -437,7 +465,9 @@ uint32_t RegistryTree::restore_node(uint32_t id, ByteReader& in, uint64_t now, u
     const uint32_t status = restore_node(child, in, now, depth + 1);
     if (status != kRegSuccess) return status;
   }
-  return in.ok() ? kRegSuccess : kRegInvalidParameter;
+  if (!in.ok()) return kRegInvalidParameter;
+  if (RegKey* k = key(id)) if (written != 0) k->write_time = written;      // (the key was last written when the image says, not when it was read back)
+  return kRegSuccess;
 }
 
 uint32_t RegistryTree::restore(uint32_t id, ConstByteView image, bool replace, uint64_t now) {
