@@ -62,7 +62,8 @@ int main(void) {
   check(UnmapViewOfFile(part), "UnmapViewOfFile");
   check(!mapped(part), "the pages are gone");
   SetLastError(0);
-  check(!UnmapViewOfFile(a + 8) && GetLastError() == ERROR_INVALID_ADDRESS, "unmapping something that is no view: ERROR_INVALID_ADDRESS");
+  int not_a_view = 0;      /* (an address inside a view names the whole view, as on NT: the stack is no view at all) */
+  check(!UnmapViewOfFile(&not_a_view) && GetLastError() == ERROR_INVALID_ADDRESS, "unmapping something that is no view: ERROR_INVALID_ADDRESS");
   check(UnmapViewOfFile(b), "unmap the second view");
   check(a[0] == 's', "the first view is still there");
   /* a thread on another core sees the writes, and the other way round */
@@ -157,6 +158,47 @@ int main(void) {
   check(GetFileSize(f, NULL) == 12000, "makes the file 12000 bytes");
   CloseHandle(f);
   DeleteFileA("C:\\Temp\\map.bin");
+
+  /* views and WriteFile/ReadFile see the same bytes (SQLite writes pages with WriteFile and reads them through a read-only view; Chrome's "Web Data" was razed as
+     corrupt when the view kept the old bytes) */
+  f = CreateFileA("C:\\Temp\\coherent.bin", GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+  check(f != INVALID_HANDLE_VALUE, "make C:\\Temp\\coherent.bin");
+  static char pages[8192];
+  memset(pages, 'a', sizeof(pages));
+  WriteFile(f, pages, sizeof(pages), &n, NULL);
+  fm = CreateFileMappingA(f, NULL, PAGE_READONLY, 0, 0, NULL);
+  const unsigned char *rv = fm ? MapViewOfFile(fm, FILE_MAP_READ, 0, 0, 0) : NULL;
+  check(rv != NULL && rv[0] == 'a' && rv[8191] == 'a', "a read-only view of it");
+  SetFilePointer(f, 4096, NULL, FILE_BEGIN);
+  WriteFile(f, "page two", 8, &n, NULL);
+  check(rv != NULL && !memcmp(rv + 4096, "page two", 8) && rv[4104] == 'a', "what WriteFile writes, the view has at once");
+  SetFilePointer(f, 8000, NULL, FILE_BEGIN);
+  memset(back, 'b', 400);
+  WriteFile(f, back, 400, &n, NULL);      /* runs past the end of the view: the part inside it shows, the file grows */
+  check(rv != NULL && rv[8000] == 'b' && rv[8191] == 'b', "a write over the end of the view: the part inside it");
+  check(GetFileSize(f, NULL) == 8400, "and the file grows");
+  HANDLE wm = CreateFileMappingA(f, NULL, PAGE_READWRITE, 0, 0, NULL);
+  unsigned char *wv = wm ? MapViewOfFile(wm, FILE_MAP_ALL_ACCESS, 0, 0, 0) : NULL;
+  check(wv != NULL && wv[8399] == 'b', "a writable view of the grown file");
+  if (wv) memcpy(wv + 100, "from view", 9);
+  SetFilePointer(f, 96, NULL, FILE_BEGIN);
+  memset(back, 0, 16);
+  ReadFile(f, back, 16, &n, NULL);
+  check(n == 16 && !memcmp(back + 4, "from view", 9) && back[0] == 'a', "what a view writes, ReadFile reads at once");
+  SetFilePointer(f, 200, NULL, FILE_BEGIN);
+  WriteFile(f, "by WriteFile", 12, &n, NULL);
+  check(wv != NULL && !memcmp(wv + 200, "by WriteFile", 12), "a writable view sees WriteFile too");
+  if (wv) UnmapViewOfFile(wv);
+  CloseHandle(wm);      /* the last view of the writable mapping: written back, without undoing the WriteFile */
+  SetFilePointer(f, 200, NULL, FILE_BEGIN);
+  memset(back, 0, 16);
+  ReadFile(f, back, 12, &n, NULL);
+  check(!memcmp(back, "by WriteFile", 12), "writing a view back keeps what WriteFile wrote");
+  check(rv != NULL && !memcmp(rv + 100, "from view", 9) && !memcmp(rv + 200, "by WriteFile", 12), "and the other mapping has the bytes the view wrote");
+  if (rv) UnmapViewOfFile(rv);
+  CloseHandle(fm);
+  CloseHandle(f);
+  DeleteFileA("C:\\Temp\\coherent.bin");
 
   /* the Ex functions for this process */
   LPVOID block = VirtualAllocEx(GetCurrentProcess(), NULL, 8192, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
