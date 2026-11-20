@@ -658,9 +658,19 @@ void update_key_state(Queue& q, const Msg& m) {
     in.key_state[vk] = uint8_t((in.key_state[vk] & 1) | (down ? 0x80 : 0));
     if (down && !was && (vk == wn::VK_CAPITAL || vk == wn::VK_NUMLOCK || vk == wn::VK_SCROLL)) in.key_state[vk] ^= 1;
   };
+  // A modifier's message names the generic key (VK_SHIFT, VK_CONTROL, VK_MENU), as on Windows; the key state keeps the left or right one, which the lParam tells
+  // (the extended bit for the right Ctrl and Alt, the scan code 0x36 for the right Shift), and the generic key follows from those below. Setting only the generic one
+  // let the recount below clear it again: no program saw Ctrl, Shift or Alt held (Ctrl+L typed an l, Shift made no capitals).
+  auto sided = [&](uint32_t vk) -> uint32_t {
+    const bool extended = (m.lparam & (1u << 24)) != 0;
+    if (vk == wn::VK_CONTROL) return extended ? wn::VK_RCONTROL : wn::VK_LCONTROL;
+    if (vk == wn::VK_MENU) return extended ? wn::VK_RMENU : wn::VK_LMENU;
+    if (vk == wn::VK_SHIFT) return ((m.lparam >> 16) & 0xFF) == 0x36 ? wn::VK_RSHIFT : wn::VK_LSHIFT;
+    return vk;
+  };
   switch (m.message) {
-    case wn::WM_KEYDOWN: case wn::WM_SYSKEYDOWN: set(uint32_t(m.wparam), true); break;
-    case wn::WM_KEYUP: case wn::WM_SYSKEYUP: set(uint32_t(m.wparam), false); break;
+    case wn::WM_KEYDOWN: case wn::WM_SYSKEYDOWN: set(sided(uint32_t(m.wparam)), true); break;
+    case wn::WM_KEYUP: case wn::WM_SYSKEYUP: set(sided(uint32_t(m.wparam)), false); break;
     case wn::WM_LBUTTONDOWN: set(wn::VK_LBUTTON, true); break;
     case wn::WM_LBUTTONUP: set(wn::VK_LBUTTON, false); break;
     case wn::WM_RBUTTONDOWN: set(wn::VK_RBUTTON, true); break;

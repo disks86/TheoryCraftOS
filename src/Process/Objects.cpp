@@ -2335,9 +2335,17 @@ ObjectManager::Job* ObjectManager::job_of(uint32_t id) {
   return o && o->kind == ObjectKind::Job && o->job >= 0 && jobs_ ? &jobs_[o->job] : nullptr;
 }
 
+// pending_kills_ counts the members flagged to end that are still running: while it is not 0, every system call and timer tick of every thread looks through the
+// jobs (job_kill_for). A member that has ended already is never flagged (it would never end again, and the count would stay up for good), and every place a flag
+// is cleared goes through job_unflag_locked().
+void ObjectManager::job_unflag_locked(JobMember& m) {
+  if (m.kill) __atomic_sub_fetch(&pending_kills_, 1u, __ATOMIC_ACQ_REL);
+  __atomic_store_n(&m.kill, 0u, __ATOMIC_RELEASE);
+}
+
 void ObjectManager::job_flag_all_locked(Job& j, uint32_t code) {
   for (JobMember& m : j.members) {
-    if (m.pid == 0 || m.kill) continue;
+    if (m.pid == 0 || m.kill || m.gone) continue;
     m.code = code;
     __atomic_store_n(&m.kill, 1u, __ATOMIC_RELEASE);
     __atomic_add_fetch(&pending_kills_, 1u, __ATOMIC_ACQ_REL);
@@ -2353,6 +2361,7 @@ void ObjectManager::free_job_locked(Object& o) {
   for (JobMember& m : j.members) {      // the members stay members of nothing; those flagged keep their flag (it is found by their process id)
     if (m.pid == 0) continue;
     if (m.kill && !m.gone) { /* leave the entry so that the flagged process still finds it, until it ends */ continue; }
+    job_unflag_locked(m);
     m.pid = 0;
     m.gone = 0;
   }
@@ -2379,7 +2388,8 @@ bool ObjectManager::job_add_locked(Job& j, uint64_t pid) {
   for (int pass = 0; pass < 2; ++pass) {      // a free place, else one of a process that has ended
     for (JobMember& m : j.members) {
       if (pass == 0 ? m.pid != 0 : !m.gone) continue;
-      m.kill = 0; m.code = 0; m.gone = 0;
+      job_unflag_locked(m);
+      m.code = 0; m.gone = 0;
       m.joined = ++job_joins_;
       __atomic_store_n(&m.pid, pid, __ATOMIC_RELEASE);
       ++j.info.active_processes;
@@ -2495,7 +2505,8 @@ uint32_t ObjectManager::job_inherit(uint64_t parent, uint64_t child, bool breaka
     JobMember* place = nullptr;
     for (JobMember& m : j.members) if (!place && (m.pid == 0 || m.gone)) place = &m;
     if (!place) return kQuotaExceeded;
-    place->kill = 0; place->code = 0; place->gone = 0;
+    job_unflag_locked(*place);
+    place->code = 0; place->gone = 0;
     if (parent_member->kill) { place->code = parent_member->code; place->kill = 1; __atomic_add_fetch(&pending_kills_, 1u, __ATOMIC_ACQ_REL); }      // (a child of a process being ended is ended too)
     place->joined = parent_member->joined;      // (the same depth as the parent's: the order of its jobs stays)
     __atomic_store_n(&place->pid, child, __ATOMIC_RELEASE);
@@ -2513,8 +2524,7 @@ void ObjectManager::job_forget_locked(uint64_t pid) {
     if (!j.used) continue;
     for (JobMember& m : j.members) {
       if (m.pid != pid || m.gone) continue;
-      if (m.kill) __atomic_sub_fetch(&pending_kills_, 1u, __ATOMIC_ACQ_REL);
-      __atomic_store_n(&m.kill, 0u, __ATOMIC_RELEASE);
+      job_unflag_locked(m);
       m.gone = 1;      // (it stays in the job, as far as IsProcessInJob goes, until its place is wanted)
       if (j.info.active_processes > 0) --j.info.active_processes;
       job_event_locked(j, 7, pid);      // JOB_OBJECT_MSG_EXIT_PROCESS

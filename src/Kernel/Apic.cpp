@@ -64,10 +64,13 @@ uint32_t this_apic_id() {
   return id;
 }
 
+// x2APIC where the processor has it (CPUID.1:ECX bit 21), even if the firmware left the APIC in xAPIC mode. The registers are then MSRs instead of a page of
+// memory: under a hypervisor every access to that page is a trap whose instruction the hypervisor has to decode (end of interrupt, the timer, the wake-up IPIs:
+// thousands a second, about a tenth of all the time of a busy guest), while MSR accesses are cheap traps or none (posted interrupts). Each core switches its own
+// APIC over in enable_this_core(), before its first register access. The APIC ids stay the same below 255, so MSI and I/O APIC routes keep working.
 bool init_boot_core() {
   const uint64_t base = rdmsr(kMsrApicBase);
-  g_x2apic = base & kApicBaseX2;
-  if (!(base & kApicBaseEnable)) wrmsr(kMsrApicBase, base | kApicBaseEnable);
+  g_x2apic = (base & kApicBaseX2) || (hardware::cpuid(1).ecx & (1u << 21)) != 0;
   g_base = base & 0xFFFFF000ull;
   enable_this_core();
 
@@ -84,7 +87,8 @@ bool init_boot_core() {
 
 void enable_this_core() {
   const uint64_t base = rdmsr(kMsrApicBase);
-  if (!(base & kApicBaseEnable)) wrmsr(kMsrApicBase, base | kApicBaseEnable);
+  const uint64_t wanted = base | kApicBaseEnable | (g_x2apic ? kApicBaseX2 : 0);      // (xAPIC -> x2APIC directly is allowed; the other way is not, and not done)
+  if (wanted != base) wrmsr(kMsrApicBase, wanted);
   write(kRegSpurious, 0x100 | kVectorSpurious);  // software enable + spurious vector
 }
 
