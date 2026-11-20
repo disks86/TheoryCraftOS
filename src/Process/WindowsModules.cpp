@@ -48,6 +48,10 @@ bool library_file(Process& p, StringView path, SharedPointer<ByteBuffer>* out, u
       key.exact_modified = entry.exact_modified;
       key.file_id = entry.file_id;
       SharedPointer<ByteBuffer> kept = cache->find(virtual_path.view(), key);
+#ifdef TCOS_TRACE_SERVICE_FAILURES
+      process_log(kept ? "library file kept: " : "library file read: ");
+      process_log(virtual_path.view());
+#endif
       if (kept) { *out = kept; return true; }
     } else {
       cache = nullptr;      // (read_program_file says why it is not there)
