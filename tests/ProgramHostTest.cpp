@@ -23,6 +23,9 @@
 #include "FileSystem/Ram/RamFileSystem.hpp"
 #include "Process/ProgramEnvironment.hpp"
 
+// The kernel clock ProgramHost::monotonic_ns() reads (KernelStubs.cpp has the timestamp counter but not this one): the tests do not depend on the time.
+namespace hardware { uint64_t uptime_us() { return 0; } }
+
 using namespace desktop;
 
 struct TestAllocator final : allocators::IAllocator {

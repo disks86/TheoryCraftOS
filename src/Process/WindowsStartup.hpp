@@ -76,6 +76,16 @@ struct WindowsStartupInput {
 constexpr uint64_t kSharedUserDataAddress = 0x7FFE0000ull;
 // Brings the clocks of KUSER_SHARED_DATA (InterruptTime, SystemTime, TickCount) up to date; a Windows program's system services do it on entry.
 void refresh_shared_user_data(IProcessHost& host);
+// The performance counter (QueryPerformanceCounter) and the interrupt time run at 10 MHz on the CPU's timestamp counter: (TSC - TSC at the kernel's start) /
+// ticks_per_us * 10, the same on every core and in every process, and the same clock as the hosts' monotonic_ns() (hardware::uptime_us()). The kernel states
+// the rate here once it knows it; with none (0, the default, as in the host tests) the counter is the host's monotonic clock, through the system service. The
+// rate and the start go into KUSER_SHARED_DATA (kSharedUserDataTscRate/Start), so ntdll and kernel32 read the clocks in user mode, without a system service, the
+// way Windows does: a program's threads ask for the time far more often than for anything else, and each service call takes the process's lock.
+void set_performance_counter_rate(uint64_t tsc_ticks_per_us, uint64_t tsc_at_start);
+// The counter now, in 100 ns units; false if no rate was set.
+bool performance_counter_from_tsc(uint64_t* counter);
+// Where in KUSER_SHARED_DATA the rate and the starting TSC go: past the end of Windows' own structure, on the same page (tcos_win.h reads them).
+constexpr uint32_t kSharedUserDataTscRate = 0xF00, kSharedUserDataTscStart = 0xF08;
 // Standard handles as the NT services hand them out (see WindowsSyscalls.cpp): input, output, error.
 constexpr uint64_t kStdInputHandle = 4, kStdOutputHandle = 8, kStdErrorHandle = 12;
 

@@ -693,4 +693,18 @@ IMPORT NTSTATUS NTAPI NtQueryVolumeInformationFile(HANDLE, PIO_STATUS_BLOCK, PVO
 IMPORT NTSTATUS NTAPI NtQueryPerformanceCounter(PLARGE_INTEGER, PLARGE_INTEGER);
 IMPORT NTSTATUS NTAPI NtQueryVirtualMemory(HANDLE, PVOID, ULONG, PVOID, SIZE_T, PSIZE_T);
 
+/* The interrupt time (100 ns since the kernel started), which is also the performance counter (10 MHz), read in user mode from the timestamp counter: the kernel puts
+ * the TSC's rate (ticks per microsecond) at KUSER_SHARED_DATA + 0xF00 and the TSC at its start at + 0xF08 (past Windows' own fields; process::kSharedUserDataTscRate),
+ * and computes its own clocks the same way, (TSC - start) / rate * 10, so the two agree to the tick. Returns 0 when the kernel published no rate: the caller asks the
+ * kernel (a system service, which takes the process's lock: a program as busy as Chrome asks for the time thousands of times a second). */
+static inline int tcos_user_interrupt_time(ULONGLONG *time) {
+  const ULONGLONG rate = *(volatile ULONGLONG *)(0x7ffe0000ull + 0xF00);
+  if (!rate) return 0;
+  ULONG lo, hi;
+  __asm__ __volatile__("lfence; rdtsc" : "=a"(lo), "=d"(hi) :: "memory");      /* (lfence: not read ahead of the instructions before it) */
+  const ULONGLONG tsc = ((ULONGLONG)hi << 32) | lo, start = *(volatile ULONGLONG *)(0x7ffe0000ull + 0xF08);
+  *time = (tsc > start ? tsc - start : 0) / rate * 10;
+  return 1;
+}
+
 #endif

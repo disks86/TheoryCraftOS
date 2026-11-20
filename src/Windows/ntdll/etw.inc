@@ -104,7 +104,7 @@ EXPORT ULONG NTAPI EtwEventActivityIdControl(ULONG control, ETW_GUID_ *id) {
   if (control == 4) { ETW_GUID_ old = *current; *current = *id; *id = old; return 0; }
   static volatile ULONG counter;      /* (an activity id only has to be different from the others) */
   LARGE_INTEGER time;
-  NtQueryPerformanceCounter(&time, NULL);
+  RtlQueryPerformanceCounter(&time);
   const ULONG n = __sync_add_and_fetch(&counter, 1);
   ULONG seed = (ULONG)time.QuadPart ^ n * 0x9E3779B1u ^ (ULONG)(ULONG_PTR)current;
   ETW_GUID_ made;

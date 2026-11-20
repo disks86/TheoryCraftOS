@@ -180,7 +180,9 @@ uint32_t nt_set_timer_resolution(Process& process, const SyscallRequest& r) {
 
 // NtQueryPerformanceCounter(PLARGE_INTEGER Counter, PLARGE_INTEGER Frequency): 100 ns ticks, so the frequency is 10 MHz.
 uint32_t nt_query_performance_counter(Process& process, const SyscallRequest& r) {
-  if (r.args[0] == 0 || !process.write_user_u64(r.args[0], process.host().monotonic_ns() / 100)) return kStatusAccessViolation;
+  uint64_t counter = 0;
+  if (!performance_counter_from_tsc(&counter)) counter = process.host().monotonic_ns() / 100;      // (the counter ntdll reads in user mode, where the kernel set its rate)
+  if (r.args[0] == 0 || !process.write_user_u64(r.args[0], counter)) return kStatusAccessViolation;
   if (r.args[1] != 0 && !process.write_user_u64(r.args[1], 10000000ull)) return kStatusAccessViolation;
   return kStatusSuccess;
 }

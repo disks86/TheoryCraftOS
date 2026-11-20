@@ -135,6 +135,21 @@ disposition and options are converted from their Win32 constants.
 | `NtQueryTimerResolution` | 66 |
 | `NtSetTimerResolution` | 67 |
 
+The clocks a program reads most are read in user mode, without a system service, as on Windows: `QueryPerformanceCounter`
+(`RtlQueryPerformanceCounter`, 10 MHz), the interrupt time, `GetTickCount`/`GetTickCount64`, `NtGetTickCount` and `timeGetTime`. The kernel puts the
+timestamp counter's rate (ticks per microsecond) at `KUSER_SHARED_DATA + 0xF00` and the counter at the kernel's start at `+ 0xF08`, past Windows' own
+fields (`process::kSharedUserDataTscRate`, `tcos_user_interrupt_time` in `src/Windows/tcos_win.h`). Every clock is `(TSC - start) / rate * 10` in
+100 ns units: `NtQueryPerformanceCounter`, the `InterruptTime` and `TickCount` of the page and the hosts' `monotonic_ns()` (`hardware::uptime_us()`) all
+count from the same point, so the times the kernel hands out (message times, waits) and those a program reads itself agree. Without a rate (the host tests)
+ntdll asks the service. The wall clock (`NtQuerySystemTime`) still goes through the service.
+
+This matters for speed: every system service takes the process's lock, and Chrome asks for the time several times per task on every thread. Measured in a
+YouTube page with a service per read, `performance.now()` took about 19 µs and a `MessageChannel` round trip about 1 ms; read in user mode they take about
+0.1 µs and 26 µs (a busy `performance.now()` loop runs 180 times as many calls, `MessageChannel` 37 times as many round trips).
+
+QEMU shows the guest no invariant TSC unless asked (`-cpu host,+invtsc`), so Chrome's `base::TimeTicks` then falls back to `timeGetTime` (millisecond
+steps) instead of `QueryPerformanceCounter`; both are user mode now.
+
 ## Libraries (LoadLibrary)
 
 | Service | Number |

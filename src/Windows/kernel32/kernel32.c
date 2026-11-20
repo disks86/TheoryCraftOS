@@ -2727,13 +2727,18 @@ EXPORT BOOL WINAPI SetHandleInformation(HANDLE h, DWORD mask, DWORD flags) {
   return NT_SUCCESS(status) ? TRUE : fail_nt(status);
 }
 
-EXPORT BOOL WINAPI QueryPerformanceCounter(LARGE_INTEGER *counter) { LARGE_INTEGER f; return NT_SUCCESS(NtQueryPerformanceCounter(counter, &f)); }
-EXPORT BOOL WINAPI QueryPerformanceFrequency(LARGE_INTEGER *frequency) { LARGE_INTEGER c; return NT_SUCCESS(NtQueryPerformanceCounter(&c, frequency)); }
+/* (ntdll reads the counter in user mode: see RtlQueryPerformanceCounter) */
+IMPORT BOOLEAN NTAPI RtlQueryPerformanceCounter(LARGE_INTEGER *counter);
+IMPORT BOOLEAN NTAPI RtlQueryPerformanceFrequency(LARGE_INTEGER *frequency);
+EXPORT BOOL WINAPI QueryPerformanceCounter(LARGE_INTEGER *counter) { return RtlQueryPerformanceCounter(counter); }
+EXPORT BOOL WINAPI QueryPerformanceFrequency(LARGE_INTEGER *frequency) { return RtlQueryPerformanceFrequency(frequency); }
 EXPORT ULONGLONG WINAPI GetTickCount64(void) {      /* (from KUSER_SHARED_DATA, as Windows does; the system service brings it up to date: TickCount, in milliseconds when the multiplier is 1 << 24) */
   LARGE_INTEGER c, f;
   volatile LONG *t = (volatile LONG *)(0x7ffe0000ull + 0x320);
   LONG high;
   ULONG low;
+  ULONGLONG now;
+  if (tcos_user_interrupt_time(&now)) return now / 10000;      /* (in user mode: TickCount is the interrupt time in milliseconds) */
   NtQueryPerformanceCounter(&c, &f);
   do { high = t[1]; low = (ULONG)t[0]; } while (high != t[2]);
   return ((((ULONGLONG)(ULONG)high << 32) | low) * *(volatile ULONG *)(0x7ffe0000ull + 4)) >> 24;

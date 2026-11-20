@@ -97,6 +97,8 @@ EXPORT WORD WINAPI GetMaximumProcessorGroupCount(void) { return 1; }
  * the "precise" forms and the plain ones are the same here. The unbiased time leaves out the time asleep (InterruptTimeBias). */
 static ULONGLONG interrupt_time(void) {
   LARGE_INTEGER c, f;
+  ULONGLONG now;
+  if (tcos_user_interrupt_time(&now)) return now;      /* (in user mode, from the timestamp counter) */
   NtQueryPerformanceCounter(&c, &f);
   volatile LONG *t = (volatile LONG *)(0x7ffe0000ull + 0x08);      /* KSYSTEM_TIME: LowPart, High1Time, High2Time */
   LONG high;

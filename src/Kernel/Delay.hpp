@@ -41,5 +41,7 @@ void set_sleep_function(void (*sleep_us)(uint64_t));
 // Counter ticks per microsecond (0 before delay_init()).
 uint64_t tsc_ticks_per_us();
 uint64_t read_tsc();
+// The counter when delay_init() calibrated it: uptime_us() counts from there.
+uint64_t tsc_origin();
 
 }  // namespace hardware

@@ -84,8 +84,22 @@ EXPORT BOOLEAN NTAPI RtlTimeToSecondsSince1980(const LONGLONG *time, PULONG seco
 EXPORT void NTAPI RtlSecondsSince1970ToTime(ULONG seconds, LONGLONG *time) { *time = ((LONGLONG)seconds + 11644473600ll) * 10000000ll; }
 EXPORT void NTAPI RtlSecondsSince1980ToTime(ULONG seconds, LONGLONG *time) { *time = ((LONGLONG)seconds + 11960006400ll) * 10000000ll; }
 
-EXPORT BOOLEAN NTAPI RtlQueryPerformanceCounter(PLARGE_INTEGER counter) { LARGE_INTEGER f; NtQueryPerformanceCounter(counter, &f); return TRUE; }
-EXPORT BOOLEAN NTAPI RtlQueryPerformanceFrequency(PLARGE_INTEGER frequency) { LARGE_INTEGER c; NtQueryPerformanceCounter(&c, frequency); return TRUE; }
+/* The performance counter is read in user mode, as Windows does: 10 MHz from the timestamp counter (tcos_user_interrupt_time), the clock the kernel's own counter
+ * service computes too. Without a rate from the kernel the service is asked. */
+EXPORT BOOLEAN NTAPI RtlQueryPerformanceCounter(PLARGE_INTEGER counter) {
+  ULONGLONG t;
+  if (tcos_user_interrupt_time(&t)) { counter->QuadPart = (LONGLONG)t; return TRUE; }
+  LARGE_INTEGER f;
+  NtQueryPerformanceCounter(counter, &f);
+  return TRUE;
+}
+EXPORT BOOLEAN NTAPI RtlQueryPerformanceFrequency(PLARGE_INTEGER frequency) {
+  ULONGLONG t;
+  if (tcos_user_interrupt_time(&t)) { frequency->QuadPart = 10000000; return TRUE; }
+  LARGE_INTEGER c;
+  NtQueryPerformanceCounter(&c, frequency);
+  return TRUE;
+}
 /* KUSER_SHARED_DATA (0x7ffe0000): the kernel refreshes the clocks in it whenever a program enters it (a system service). Asking for the performance counter is the
  * cheapest way to have it brought up to date. The KSYSTEM_TIME fields are read the way Windows does: High1Time, LowPart, High2Time until the two halves agree. */
 static ULONGLONG read_user_shared_time(ULONG offset) {
@@ -106,13 +120,19 @@ EXPORT NTSTATUS NTAPI NtQuerySystemTime(PLARGE_INTEGER time) {
 }
 EXPORT BOOLEAN NTAPI RtlQueryUnbiasedInterruptTime(ULONGLONG *time) {
   if (!time) { TEB_LAST_ERROR(NtCurrentTeb()) = 87; return FALSE; }      /* ERROR_INVALID_PARAMETER */
-  LARGE_INTEGER c, f;
-  NtQueryPerformanceCounter(&c, &f);
-  *time = read_user_shared_time(0x08) - *(volatile ULONGLONG *)(0x7ffe0000ull + 0x3b0);      /* InterruptTime - InterruptTimeBias */
+  ULONGLONG now;
+  if (!tcos_user_interrupt_time(&now)) {
+    LARGE_INTEGER c, f;
+    NtQueryPerformanceCounter(&c, &f);
+    now = read_user_shared_time(0x08);
+  }
+  *time = now - *(volatile ULONGLONG *)(0x7ffe0000ull + 0x3b0);      /* InterruptTime - InterruptTimeBias */
   return TRUE;
 }
 /* The tick count: milliseconds (the kernel's TickCountMultiplier is 1 << 24, so a tick is a millisecond). */
 EXPORT ULONG NTAPI NtGetTickCount(void) {
+  ULONGLONG now;
+  if (tcos_user_interrupt_time(&now)) return (ULONG)(now / 10000);      /* (the kernel's TickCount is the interrupt time in milliseconds) */
   LARGE_INTEGER c, f;
   NtQueryPerformanceCounter(&c, &f);
   return (ULONG)((read_user_shared_time(0x320) * *(volatile ULONG *)(0x7ffe0000ull + 4)) >> 24);

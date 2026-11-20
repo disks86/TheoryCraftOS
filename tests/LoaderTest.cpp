@@ -921,6 +921,27 @@ static void test_windows_startup() {
   CHECK(s.read(kSharedUserDataAddress + 0x26C, ByteView(b4, 4)) && b4[0] == 10);
   uint8_t prot = 0;
   CHECK(s.protection_at(kSharedUserDataAddress, &prot) && prot == kProtRead);
+  // The performance counter: 10 MHz (QpcFrequency); no TSC rate unless the kernel set one, so ntdll asks the service.
+  CHECK(p.read_user_u64(kSharedUserDataAddress + 0x300, &v) && v == 10000000);
+  CHECK(p.read_user_u64(kSharedUserDataAddress + kSharedUserDataTscRate, &v) && v == 0);
+  uint64_t counter = 0;
+  CHECK(!performance_counter_from_tsc(&counter));
+#if defined(__x86_64__)
+  {      // with a rate: the counter is (TSC - start) / rate * 10, it never goes back, and the next program's page carries the rate and the start for ntdll
+    const uint64_t start = __builtin_ia32_rdtsc();
+    set_performance_counter_rate(3000, start);
+    uint64_t first = 0, second = 0;
+    CHECK(performance_counter_from_tsc(&first) && performance_counter_from_tsc(&second) && second >= first);
+    const uint64_t expect = (__builtin_ia32_rdtsc() - start) / 3000 * 10;
+    CHECK(first <= expect && first % 10 == 0);
+    UserProgram later(A, 35, host);
+    Bytes pe3 = make_pe();
+    CHECK(later.load(view(pe3), ArrayView<const StringView>(), ArrayView<const StringView>(), ConstByteView(nullptr, 0)) == LoadStatus::Ok);
+    CHECK(later.process()->read_user_u64(kSharedUserDataAddress + kSharedUserDataTscRate, &v) && v == 3000);
+    CHECK(later.process()->read_user_u64(kSharedUserDataAddress + kSharedUserDataTscStart, &v) && v == start);
+    set_performance_counter_rate(0, 0);
+  }
+#endif
   // Static TLS: the TEB points at an array whose first entry is this thread's copy of the template, with the zero fill after it.
   uint64_t array = 0, block = 0;
   CHECK(p.read_user_u64(teb + 0x58, &array) && array != 0 && p.read_user_u64(array, &block) && block != 0);

@@ -77,7 +77,7 @@ class ProgramHost final : public process::IProcessHost {
   mutable kernel::Mutex mutex_;
   String buffer_;
   uint64_t dropped_ = 0;
-  uint64_t start_real_ns_ = 0, start_tsc_ = 0;
+  uint64_t start_real_ns_ = 0, start_monotonic_ns_ = 0;
   // The CPU's generator (RDSEED / RDRAND), else the system's source (set_system_entropy: the hypervisor's virtio-rng, a TPM), so that a program gets random bytes on a
   // processor without the instructions too.
   class Entropy final : public crypto::IEntropySource {

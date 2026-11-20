@@ -44,7 +44,7 @@ bool ProgramHost::Entropy::read(ByteView out) {
 ProgramHost::ProgramHost(allocators::IAllocator& allocator)
     : allocator_(allocator), buffer_(allocator), random_(entropy_), unhandled_(allocator), input_(allocator) {
   start_real_ns_ = filesystem::unix_time_now() * 1000000000ull;
-  start_tsc_ = hardware::read_tsc();
+  start_monotonic_ns_ = monotonic_ns();
   random_.initialize();      // (stays not ready when there is no source at all)
 }
 
@@ -127,12 +127,11 @@ void ProgramHost::interrupt() {
   input_ready_.notify_all();
 }
 
-uint64_t ProgramHost::monotonic_ns() {
-  const uint64_t per_us = hardware::tsc_ticks_per_us();
-  return per_us ? (hardware::read_tsc() - start_tsc_) / per_us * 1000 : 0;
-}
+// Since the kernel started, for every program alike: the clock of the Windows performance counter and interrupt time (WindowsStartup.hpp), which ntdll reads in user
+// mode, so the times the kernel hands out (message times, waits) and the ones a program reads itself agree.
+uint64_t ProgramHost::monotonic_ns() { return hardware::uptime_us() * 1000; }
 
-uint64_t ProgramHost::realtime_ns() { return start_real_ns_ + monotonic_ns(); }
+uint64_t ProgramHost::realtime_ns() { return start_real_ns_ + (monotonic_ns() - start_monotonic_ns_); }
 
 void ProgramHost::sleep_ns(uint64_t ns) {
   // In slices, so that Ctrl+C is noticed.
