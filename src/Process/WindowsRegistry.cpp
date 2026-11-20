@@ -18,7 +18,9 @@
 #include "Process/WindowsRegistry.hpp"
 #include "Utility/Move.hpp"
 #include "Process/Objects.hpp"
+#include "Process/RegistryStore.hpp"
 #include "Process/RegistryTree.hpp"
+#include "Kernel/Sync.hpp"
 #include "Process/WindowsFiles.hpp"
 #include "Process/WindowsIo.hpp"
 #include "Process/WindowsSyscalls.hpp"
@@ -38,6 +40,11 @@ constexpr uint64_t kUnixToNt = 11644473600ull * 10000000ull;
 // The tree lives in static storage and is never destroyed (a global with a destructor would need atexit, which the kernel does not have).
 alignas(RegistryTree) uint8_t g_storage[sizeof(RegistryTree)];
 RegistryTree* g_tree = nullptr;
+
+// Where the tree is saved (RegistryStore.hpp): null until registry_attach_storage(), and again after registry_detach_storage().
+filesystem::IFileSystem* g_store = nullptr;
+uint64_t g_saved_changes = 0;      // RegistryTree::changes() as of the image last saved or read back
+kernel::Mutex g_store_writer;      // one save at a time: the image is taken under the registry lock, the file is written outside it (and g_store read under this)
 
 // The registry is shared by all the programs: one lock (the object manager's) covers it.
 struct Guard {
@@ -174,13 +181,22 @@ void key_token_release(uint64_t token) {
 uint32_t nt_create_key(Process& p, const SyscallRequest& r) {
   if ((r.args[1] & 0x01000000u) && !caller_privilege_enabled(p, 8 /* SeSecurityPrivilege */)) return 0xC0000061u;
   // NtCreateKey(PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES, ULONG TitleIndex, PUNICODE_STRING Class, ULONG CreateOptions, PULONG Disposition)
-  uint64_t disposition_at = 0;
-  if (!argument(p, r, 6, &disposition_at)) return kAccessViolation;
+  uint64_t disposition_at = 0, options = 0;
+  if (!argument(p, r, 6, &disposition_at) || !argument(p, r, 5, &options)) return kAccessViolation;
   uint32_t disposition = 0;
   const uint32_t status = open_or_create(p, r, true, &disposition);
   if (status == kSuccess && disposition_at != 0 && !p.write_user_u32(disposition_at, disposition)) return kAccessViolation;
   uint64_t handle = 0;
-  if (status == kSuccess && disposition == 1 && p.read_user_u64(r.args[0], &handle) && handle != 0) { uint32_t made = 0; if (key_of(p, handle, &made)) notify_key_changed(p, made, false, kNotifyName); }
+  if (status == kSuccess && disposition == 1 && p.read_user_u64(r.args[0], &handle) && handle != 0) {
+    uint32_t made = 0;
+    if (key_of(p, handle, &made)) {
+      if (options & 1) {      // REG_OPTION_VOLATILE: the key (and what is made under it) is not saved to disk
+        Guard guard;
+        if (RegistryTree* t = tree(p)) t->set_volatile(made, true);
+      }
+      notify_key_changed(p, made, false, kNotifyName);
+    }
+  }
   if (status == kSuccess && p.read_user_u64(r.args[0], &handle) && handle != 0) {      // the handle holds the rights asked for
     static const security::GenericMapping kKeyMapping = {0x20019, 0x20006, 0x20019, 0xF003F};
     uint32_t want = uint32_t(r.args[1]);
@@ -909,10 +925,12 @@ uint32_t nt_flush_key(Process& p, const SyscallRequest& r) {
     Guard guard;
     RegistryTree* t = tree(p);
     const RegKey* k = t ? t->key(id) : nullptr;
-    if (!k || !k->loaded_hive || k->hive_file.empty()) return kSuccess;      // (the built-in hives are in memory only)
-    file.assign(k->hive_file.view());
-    if (!t->save(id, &image)) return kNoMemory;
+    if (k && k->loaded_hive && !k->hive_file.empty()) {
+      file.assign(k->hive_file.view());
+      if (!t->save(id, &image)) return kNoMemory;
+    }
   }
+  if (file.empty()) return registry_save(true) ? kSuccess : 0xC000014Cu;      // the registry's own file (RegFlushKey: written when it returns); STATUS_REGISTRY_IO_FAILED
   return write_file_at(p, file.view(), image.view());
 }
 
@@ -1034,6 +1052,46 @@ void registry_delete_key(RegistryHive hive, StringView key, bool only_if_empty) 
   if (!found) return;
   if (!only_if_empty) (void)g_tree->delete_tree(id);
   else if (found->values.count() == 0) (void)g_tree->delete_key(id);      // (which refuses a key that has keys under it)
+}
+
+RegistryLoad registry_attach_storage(allocators::IAllocator& allocator, filesystem::IFileSystem& fs, uint64_t unix_seconds) {
+  kernel::ScopedMutex writer(g_store_writer);
+  const uint64_t now = unix_seconds * 10000000ull + kUnixToNt;
+  ByteBuffer image(allocator);
+  const RegistryLoad read = read_saved_registry(fs, &image);      // (read outside the registry lock: it is file I/O)
+  Guard guard;
+  if (!g_tree) g_tree = new (static_cast<void*>(g_storage)) RegistryTree(allocator, now);
+  if (read == RegistryLoad::Loaded) {
+    const bool merged = g_tree->restore(RegistryTree::kRoot, image.view(), false, now) == kRegSuccess;
+    g_tree->make_defaults(now);      // (the system's own values are this system's: RegistryStore.hpp)
+    if (!merged) return RegistryLoad::NotMerged;      // (not attached: a save now would put part of the registry in place of the whole one on disk)
+  }
+  g_saved_changes = read == RegistryLoad::Loaded ? g_tree->changes() : ~0ull;      // (nothing saved yet, or a bad file: the next save writes a good one)
+  g_store = &fs;
+  return read;
+}
+
+bool registry_save(bool only_if_changed) {
+  kernel::ScopedMutex writer(g_store_writer);
+  if (!g_store || !g_tree) return true;      // (no storage: the registry lives in memory only. g_tree, once made, stays)
+  ByteBuffer image(g_tree->allocator());
+  uint64_t changes = 0;
+  {
+    Guard guard;
+    changes = g_tree->changes();
+    if (only_if_changed && changes == g_saved_changes) return true;
+    if (!g_tree->save_persistent(&image)) return false;
+  }
+  if (!write_saved_registry(*g_store, image.view())) return false;
+  g_saved_changes = changes;
+  return true;
+}
+
+bool registry_detach_storage() {
+  const bool saved = registry_save(true);
+  kernel::ScopedMutex writer(g_store_writer);
+  g_store = nullptr;
+  return saved;
 }
 
 }  // namespace process::windowsabi
