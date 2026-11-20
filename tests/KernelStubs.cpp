@@ -53,7 +53,7 @@ uint32_t wake_all(WaitList*) { return 0; }
 }
 }
 namespace kernel { [[noreturn]] void panic(const char* what, const Frame*) { fprintf(stderr, "PANIC: %s\n", what); abort(); } }
-namespace hardware { uint64_t read_tsc() { return 0; } uint64_t tsc_ticks_per_us() { return 1; } }
+namespace hardware { uint64_t read_tsc() { return 0; } uint64_t tsc_ticks_per_us() { return 1; } uint64_t tsc_origin() { return 0; } }
 
 #include <stdio.h>
 #include <stdlib.h>

@@ -225,6 +225,15 @@ class IProcessRuntime {
   ~IProcessRuntime() = default;
 };
 
+// How a program can read a host's clocks by itself, without a system call (published in the Linux vDSO's data page): at all times
+//   monotonic_ns() == (TSC - tsc_at_start) / tsc_ticks_per_us * 1000   and   realtime_ns() == monotonic_ns() + realtime_offset_ns (modulo 2^64)
+// for the processor's timestamp counter TSC (see LinuxVdso/vdso_data.h, which holds the formula both sides use).
+struct UserClock {
+  uint64_t tsc_ticks_per_us = 0;
+  uint64_t tsc_at_start = 0;
+  uint64_t realtime_offset_ns = 0;
+};
+
 // What a process needs from the rest of the system.
 class IProcessHost {
  public:
@@ -246,6 +255,9 @@ class IProcessHost {
   virtual void wake_blocked() {}
   // Optional: the screen the program's common dialogs (Windows comdlg32) are shown on; nullptr when it has none.
   virtual ICommonDialogs* common_dialogs() { return nullptr; }
+  // Optional: the clocks above as a program can compute them itself (see UserClock). False (the default) when they cannot be: every clock read is then a
+  // system call. A host that answers must keep its promise for as long as any of its programs runs.
+  virtual bool user_clock(UserClock* out) { (void)out; return false; }
 
  protected:
   IProcessHost() = default;

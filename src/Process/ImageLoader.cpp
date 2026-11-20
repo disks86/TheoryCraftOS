@@ -322,7 +322,8 @@ LoadStatus build_linux_stack(AddressSpace& space, uint64_t stack_top, const Load
   struct Aux { uint64_t key, value; };
   const Aux aux[] = {{3, image.phdr}, {4, image.phent}, {5, image.phnum}, {6, AddressSpace::kPageSize}, {7, image.interpreter_base}, {8, 0},
                      {9, image.program_entry ? image.program_entry : image.entry}, {11, 0}, {12, 0},
-                     {13, 0}, {14, 0}, {15, platform_at}, {16, hwcap}, {17, 100}, {23, 0}, {25, random_address}, {26, hwcap2}, {31, executable_at}, {0, 0}};
+                     {13, 0}, {14, 0}, {15, platform_at}, {16, hwcap}, {17, 100}, {23, 0}, {25, random_address}, {26, hwcap2}, {31, executable_at},
+                     {image.vdso_base ? 33u : 1u, image.vdso_base}, {0, 0}};      // AT_SYSINFO_EHDR, or AT_IGNORE without a vDSO
   const uint64_t words = 1 + arguments.size() + 1 + environment.size() + 1 + 2 * (sizeof(aux) / sizeof(aux[0]));
   if (words * 8 > random_address) return LoadStatus::Malformed;
   const uint64_t sp = (random_address - words * 8) & ~uint64_t{15};

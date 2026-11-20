@@ -94,7 +94,8 @@ fonts, others depend on fontconfig's built-in defaults.
   AArch64 and RISC-V programs run only on the emulator, where `clone3` is shared code.
 - **File mappings are copies.** Pages are not shared between processes or with the file: a library mapped by ten programs takes ten copies, and a
   file written after it was mapped is not seen through the mapping. Shared writable file mappings are not supported.
-- **No vDSO** (`AT_SYSINFO_EHDR`): glibc makes real system calls for `clock_gettime` and `gettimeofday`.
+- **The vDSO is x86-64 only** (`AT_SYSINFO_EHDR`, see [LinuxVdso.md](LinuxVdso.md)): `clock_gettime`, `gettimeofday` and `time` run in user mode;
+  programs of other CPUs make the system calls.
 - **No `/etc/ld.so.cache`, no `ldconfig`.** Only the interpreter's built-in directories, `LD_LIBRARY_PATH` and `RUNPATH` are searched.
 - **`execve` starts a new process.** `execve`/`execveat` (src/Process/LinuxExec.cpp) start the new image as a child process with exactly the
   arguments and environment given, the current folder and every descriptor that is not close-on-exec; the old program closes what it had,

@@ -16,7 +16,7 @@ number means a call newer than this list.
 | Processes | `LinuxProcess.cpp`, `LinuxExec.cpp` | fork, vfork, clone and clone3 (processes), execve, execveat, wait4, waitid, exit_group, the uid/gid/group calls, getpgid, setpgid, getsid, setsid, capget, capset, getrlimit, setrlimit, prlimit64, getrusage, times, sysinfo, getpriority, setpriority, the sched_* calls, getcpu, personality, prctl, membarrier, robust lists, kcmp, pidfd_open, pidfd_send_signal, pidfd_getfd, process_mrelease |
 | Signals | `LinuxSignals.cpp` | rt_sigaction, rt_sigprocmask, rt_sigpending, rt_sigtimedwait, rt_sigsuspend, pause, sigaltstack, kill, tkill, tgkill, rt_sigqueueinfo, alarm, getitimer, setitimer, timer_create, timer_settime, timer_gettime, timer_getoverrun, timer_delete |
 | Sockets and events | `LinuxSockets.cpp`, `LinuxInetSockets.cpp` | AF_UNIX, AF_INET and AF_INET6 (TCP, UDP, raw, ICMP echo), AF_NETLINK and AF_PACKET sockets (socket, bind, connect, listen, accept, accept4, sendto, recvfrom, sendmsg, recvmsg, sendmmsg, recvmmsg, shutdown, getsockname, getpeername, setsockopt, getsockopt), pipes, eventfd, timerfd, signalfd, epoll, poll, select |
-| Time | `LinuxSyscalls.cpp` | clock_gettime, clock_getres, clock_nanosleep, nanosleep, gettimeofday, time |
+| Time | `LinuxSyscalls.cpp` | clock_gettime, clock_getres, clock_nanosleep, nanosleep, gettimeofday, time (x86-64 programs read the clocks through the vDSO without these calls: [LinuxVdso.md](LinuxVdso.md)) |
 | System V IPC | `LinuxIpc.cpp` | shmget, shmat, shmdt, shmctl, semget, semop, semtimedop, semctl, msgget, msgsnd, msgrcv, msgctl |
 | POSIX message queues | `LinuxIpc.cpp` | mq_open, mq_unlink, mq_timedsend, mq_timedreceive, mq_notify, mq_getsetattr |
 | Asynchronous I/O | `LinuxAio.cpp` | io_setup, io_destroy, io_submit, io_cancel, io_getevents, io_pgetevents |
@@ -48,8 +48,8 @@ waits, and one with a handler has its handler entered.
   frame Linux gives it on its CPU (`siginfo_t`, `ucontext_t` with every register and the floating-point state) and returns through
   `rt_sigreturn`; it may change the registers it returns to. `SA_SIGINFO`, `SA_ONSTACK`, `SA_NODEFER`, `SA_RESETHAND` and `SA_RESTART`
   are honoured. On x86-64 the action must have a restorer (`SA_RESTORER`), which every C library supplies. AArch64, RISC-V and LoongArch
-  C libraries give none (Linux lends them a few instructions in the vDSO): the process gets a page of its own with those
-  instructions the first time a handler is entered.
+  C libraries give none (Linux lends them a few instructions in the vDSO, which only x86-64 programs have here: see LinuxVdso.md): the
+  process gets a page of its own with those instructions the first time a handler is entered.
 - *Faults.* A page fault, a division error, an invalid instruction and the like become `SIGSEGV`, `SIGFPE`, `SIGILL`, `SIGBUS` or
   `SIGTRAP` with `si_code` and `si_addr`. Without a handler, or with the signal blocked, the process ends.
 - *Where signals come from.* The process itself (`kill`, `tgkill`, `raise`, `abort`), its timers (`alarm`, `setitimer`), the

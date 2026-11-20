@@ -133,6 +133,21 @@ uint64_t ProgramHost::monotonic_ns() { return hardware::uptime_us() * 1000; }
 
 uint64_t ProgramHost::realtime_ns() { return start_real_ns_ + (monotonic_ns() - start_monotonic_ns_); }
 
+// The two clocks above are the timestamp counter (uptime_us) and a fixed offset from it, so a program can read them itself (the Linux vDSO).
+bool ProgramHost::user_clock(process::UserClock* out) {
+#if defined(__x86_64__)
+  const uint64_t rate = hardware::tsc_ticks_per_us();
+  if (rate == 0) return false;      // (not calibrated: uptime_us() is 0, which no formula reproduces)
+  out->tsc_ticks_per_us = rate;
+  out->tsc_at_start = hardware::tsc_origin();
+  out->realtime_offset_ns = start_real_ns_ - start_monotonic_ns_;      // (modulo 2^64, as realtime_ns() adds it)
+  return true;
+#else
+  (void)out;
+  return false;
+#endif
+}
+
 void ProgramHost::sleep_ns(uint64_t ns) {
   // In slices, so that Ctrl+C is noticed.
   for (uint64_t left = ns / 1000; left > 0 && !interrupted();) {

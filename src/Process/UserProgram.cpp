@@ -17,6 +17,7 @@
  */
 #include "Process/UserProgram.hpp"
 #include "Process/LinuxProcess.hpp"
+#include "Process/LinuxVdso.hpp"
 #include "Executable/ElfFile.hpp"
 #include "Executable/ExecutableKind.hpp"
 #include "Executable/PeFile.hpp"
@@ -334,6 +335,8 @@ LoadStatus UserProgram::load(ConstByteView file, ArrayView<const StringView> arg
       status = load_dynamic_elf(elf, file, interpreter, interpreter_file.view(), space_, &image);
     }
     if (status == LoadStatus::Ok) status = map_stack(space_, kDefaultStackBytes, &stack_top);
+    // The vDSO (x86-64): clock reads without a system call. A program runs without it too (its C library then makes the calls), so no room is no failure.
+    if (status == LoadStatus::Ok && map_linux_vdso(space_, binding.arch, host_, &image.vdso_base) != LoadStatus::Ok) image.vdso_base = 0;
     if (status == LoadStatus::Ok) status = build_linux_stack(space_, stack_top, image, arguments, environment, path, random, &stack_pointer,
                                                                        binding.arch == UserArch::AArch64 ? StringView("aarch64") : binding.arch == UserArch::RiscV64 ? StringView("riscv64") : binding.arch == UserArch::LoongArch64 ? StringView("loongarch64") : StringView("x86_64"));
     if (status != LoadStatus::Ok) return status;
@@ -467,6 +470,7 @@ bool UserProgram::fork_from(UserProgram& parent, const LinuxProcessState::ForkRe
   processor_count_ = parent.processor_count_;
   if (!working_directory_.assign(parent.working_directory_.view()) || !executable_path_.assign(parent.executable_path_.view())) return false;
   if (!space_.copy_from(parent.space_)) return false;
+  if (parent.image_.vdso_base && !refresh_linux_vdso_data(space_, parent.image_.vdso_base, host_)) return false;      // (this program's host's clock, not the parent's)
   UniquePointer<Process> process = UniquePointer<Process>::make(allocator_, id_, binding, space_, host_);
   if (!process) return false;
   process->set_image_information(from->image_information());
