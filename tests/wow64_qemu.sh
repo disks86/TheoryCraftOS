@@ -44,7 +44,7 @@ i686-w64-mingw32-gcc -O1 -mcrtdll=msvcrt-os -o "$work/old32.exe" tests/windows/o
 python3 - "$work/dxfixtures.h" <<'PY'
 import sys
 out = open(sys.argv[1], "w")
-for n in ("vs", "ps_color", "ps_tex", "cs_fill", "vs_attrs6", "ps_tex4", "ps_mrt8", "ps_cbuf"):
+for n in ("vs", "ps_color", "ps_tex", "cs_fill", "vs_attrs6", "ps_tex4", "ps_mrt8", "ps_cbuf", "vs_packed", "ps_packed", "ps_planes"):
     data = open("tests/data/dxbc/%s.dxbc" % n, "rb").read()
     out.write("static const unsigned char dx_%s_dxbc[] = {%s};\n" % (n, ",".join(str(b) for b in data)))
 PY
