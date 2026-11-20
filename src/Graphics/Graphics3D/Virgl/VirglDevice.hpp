@@ -72,7 +72,7 @@ class VirglDevice final : public IGraphicsDevice {
   hardware::VirtioGpu& gpu() { return gpu_; }
   // SUBMIT_3D. Without a fence (the default) the host takes the commands and the GPU runs them while we go on; `fence`: the answer waits for the GPU (and has the host poll).
   bool send_commands(const uint32_t* dwords, uint32_t count, bool fence = false);
-  uint32_t new_handle() { return next_handle_++; }
+  uint32_t new_handle() { return __atomic_fetch_add(&next_handle_, 1u, __ATOMIC_RELAXED); }      // (several threads submit at once: the GPU process of a program, the desktop)
   // Whether the host's GPU may still be running work numbered `work` (VirtioGpu::work_sent; 0 is no work), or work of a submit that used more buffers than it
   // kept track of (all buffers count as used by it).
   bool in_flight(uint64_t work) const {

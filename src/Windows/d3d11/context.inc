@@ -154,11 +154,9 @@ static ID3D12Resource *vertex_source(Dev *d, Ctx *c, UINT slot, UINT *stride, UI
   const Layout *l = c->layout;
   const UINT vertices = *bytes / *stride;
   if (!b->converted || b->converted_layout != l->c.id || b->converted_version != b->version || b->converted_stride != *stride || b->converted_offset != *offset) {
-    /* a recorded draw reads the copy: it is kept until the list ran (or, with too much waiting already, the list is sent) */
-    if (b->converted && b->converted_used == d->epoch) {
-      if (retire_room(d, b->converted_bytes)) { retire(d, b->converted, NULL, b->converted_bytes); b->converted = NULL; }
-      else flush(d);
-    }
+    /* A recorded draw reads the copy: the list is sent first. (Retiring the copy instead, as a renamed buffer's memory is, made Chrome's window stop updating
+     * now and then on the 3D hardware - the GPU process kept drawing and presenting, the picture stayed - for a reason not found yet; see docs/Direct3D11.md.) */
+    if (b->converted && b->converted_used == d->epoch) flush(d);
     if (b->converted && (b->converted_vertices < vertices || b->converted_out_stride != out_stride)) {
       const Spare s = {b->converted, NULL, b->converted_bytes};
       spare_keep(d, s);
@@ -204,6 +202,12 @@ static void record_pending_clears(Dev *d) {
   }
 }
 
+/* The kernel keeps a texture bound the way a list first uses it. So a list does not write a texture (draw into it, clear it, copy into it) after it sampled it,
+ * nor read one (sample it, copy from it) after it wrote it: the list is sent first. (When a write to whatever a recorded draw reads sent the list, as it did
+ * for every buffer write, these cases hardly came up; with long lists they show stale pixels.) */
+static void tex_before_write(Dev *d, const Tex *t) { settle(d, t->sampled); }
+static void tex_before_read(Dev *d, const Tex *t) { settle(d, t->written); }
+
 /* Everything of a draw but the draw: FALSE when it cannot be drawn (no vertex shader, no render target, a pipeline the kernel does not take). */
 static BOOL draw_prepare(Ctx *c, BOOL indexed) {
   Dev *d = c->dev;
@@ -218,9 +222,10 @@ static BOOL draw_prepare(Ctx *c, BOOL indexed) {
     if (!sources[slot]) return FALSE;
   }
   /* (a texture the list's draws sampled cannot become its target: the kernel keeps it bound as a texture for the whole list) */
-  for (UINT i = 0; i < c->rtv_count; ++i) settle(d, c->rtv[i]->tex->sampled);
+  for (UINT i = 0; i < c->rtv_count; ++i) tex_before_write(d, c->rtv[i]->tex);
+  if (c->dsv) tex_before_write(d, c->dsv->tex);
   /* (... nor be sampled after the list has drawn into it, cleared it or copied into it: the draw would see the texture as it was before the list) */
-  for (UINT i = 0; i < TEXTURE_SLOTS; ++i) if (c->srv[i]) settle(d, c->srv[i]->tex->written);
+  for (UINT i = 0; i < TEXTURE_SLOTS; ++i) if (c->srv[i]) tex_before_read(d, c->srv[i]->tex);
   if (d->ring_used + CONSTANT_BLOCK > RING_BYTES || d->view_used + TEXTURE_SLOTS > VIEW_HEAP || d->sampler_used + TEXTURE_SLOTS > VIEW_HEAP) flush(d);
   ID3D12PipelineState *pipeline = pipeline_get(d, c);
   if (!pipeline) return FALSE;
@@ -529,6 +534,7 @@ static void STDMETHODCALLTYPE ctx_ClearRenderTargetView(Ctx *c, ID3D11RenderTarg
   if (v->tex->expand == 1) kept[1] = kept[2] = 0, kept[3] = 1;
   else if (v->tex->expand == 3) kept[2] = 0, kept[3] = 1;
   else if (v->tex->expand == 2) kept[0] = kept[1] = kept[2] = 0;
+  tex_before_write(c->dev, v->tex);
   ID3D12GraphicsCommandList_ClearRenderTargetView(c->dev->list, v->handle, kept, 0, NULL);
   v->tex->used = v->tex->written = c->dev->epoch;
   c->dev->recorded = 1;
@@ -551,6 +557,7 @@ static void STDMETHODCALLTYPE ctx_ClearDepthStencilView(Ctx *c, ID3D11DepthStenc
     if (flags & D3D11_CLEAR_DEPTH) p->depth = depth;
     if (flags & D3D11_CLEAR_STENCIL) p->stencil = stencil;
   }
+  tex_before_write(d, v->tex);
   ID3D12GraphicsCommandList_ClearDepthStencilView(d->list, v->handle, (D3D12_CLEAR_FLAGS)(flags & 3), depth, stencil, 0, NULL);
   v->tex->used = v->tex->written = d->epoch;
   d->recorded = 1;
@@ -699,6 +706,8 @@ static void STDMETHODCALLTYPE ctx_CopySubresourceRegion(Ctx *c, ID3D11Resource *
     }
   } else if (tt && tf && to_sub < tex_subresources(tt) && from_sub < tex_subresources(tf)) {
     if (tex_simple(tt) && tex_simple(tf) && tt->stored == tf->stored && tt != tf) {
+      tex_before_write(d, tt);
+      tex_before_read(d, tf);
       D3D12_TEXTURE_COPY_LOCATION dst, src;
       memset(&dst, 0, sizeof dst);
       memset(&src, 0, sizeof src);
@@ -727,6 +736,8 @@ static void STDMETHODCALLTYPE ctx_CopyResource(Ctx *c, ID3D11Resource *to, ID3D1
     ++bt->version;
   } else if (tt && tf && tt != tf && tex_subresources(tt) == tex_subresources(tf) && tt->desc.Width == tf->desc.Width && tt->desc.Height == tf->desc.Height) {
     if (tex_simple(tt) && tex_simple(tf) && tt->stored == tf->stored) {
+      tex_before_write(d, tt);
+      tex_before_read(d, tf);
       ID3D12GraphicsCommandList_CopyResource(d->list, tt->res, tf->res);
       tt->used = tf->used = tt->written = d->epoch;
       d->recorded = 1;
@@ -743,6 +754,8 @@ static void STDMETHODCALLTYPE ctx_ResolveSubresource(Ctx *c, ID3D11Resource *to,
   if (!tt || !tf || to_sub != 0 || from_sub != 0 || tf->desc.SampleDesc.Count < 2 || tt->desc.SampleDesc.Count > 1 || tt->desc.Width != tf->desc.Width ||
       tt->desc.Height != tf->desc.Height || tt->stored != tf->stored) return;
   LOCK(c);
+  tex_before_write(d, tt);
+  tex_before_read(d, tf);
   ID3D12GraphicsCommandList_ResolveSubresource(d->list, tt->res, 0, tf->res, 0, tt->stored);      /* (the stored format: a typed view of it asked for is the same bytes) */
   tt->used = tf->used = tt->written = d->epoch;
   d->recorded = 1;

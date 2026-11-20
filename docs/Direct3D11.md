@@ -10,14 +10,18 @@ A device is a Direct3D 12 device, one command queue and one command list. The im
 out the Direct3D 12 pipeline of that state, sets on the list what changed since the last draw, and records the draw. The list is sent (the
 queue runs it before it returns) when something has to be seen: `Flush`, a `Map` that reads, a `Present`, a query's `End`, a texture the list
 drew into (or cleared, or copied into) that a draw samples, a texture the list sampled that becomes a target or is copied into. The kernel
-keeps a texture bound the way a list first uses it, which is why those two cases split the list.
+keeps a texture bound the way a list first uses it, which is why those cases split the list (also a copy into or a clear of a texture the list
+sampled, and a copy out of one it wrote).
 
 **Writes to what a recorded draw reads** do not send the list. Sending it is a whole trip to the GPU and back, and Chrome (ANGLE, for Skia)
 writes the buffer a recorded draw reads all the time: `Map` with `WRITE_DISCARD`, `UpdateSubresource`, buffer copies, and a different offset
 into its streaming vertex buffer for every batch, which makes a new converted copy (see the input layouts below). Sending the list for each of
 those took about 300 ms per composited frame. Instead the buffer gets other memory and the old is retired: kept, untouched, until the list
-has run, then a spare for the next buffer of its size (`buf_rename`, `retire`, `take_upload` in d3d11.c). A converted copy is retired the same
-way when it is made again; it has its own "used by this list" mark (`converted_used`), apart from the buffer's. Texture uploads
+has run, then a spare for the next buffer of its size (`buf_rename`, `retire`, `take_upload` in d3d11.c). A converted copy has its own "used
+by this list" mark (`converted_used`), apart from the buffer's, and a converted copy a recorded draw reads still sends the list when it is made
+again. (Retiring it too made frames faster still, but on the 3D hardware Chrome's window then stopped updating now and then while typing into a
+page: the GPU process went on drawing and presenting and the picture stayed. Not explained yet: the kernel took every submission, and the
+virgl device's object handles, made atomic, were not it.) Texture uploads
 (`UpdateSubresource`, `Unmap` of a dynamic texture) are recorded in order with the draws too. What waits for a list is capped
 (`RETIRED_MAX`, 32 MiB); beyond that the list is sent first. In Chrome a page that repaints everything every frame went from 8 to about 30
 frames a second.
