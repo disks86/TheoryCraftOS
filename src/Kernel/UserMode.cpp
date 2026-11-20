@@ -19,6 +19,7 @@
 #include "Kernel/UserMode.hpp"
 #include "Process/ImageCache.hpp"
 #include "Process/ImageFileCache.hpp"
+#include "Process/WindowsStartup.hpp"
 #include "Process/LinuxProcess.hpp"
 #include "Hardware/CentralProcessingUnit/ICentralProcessingUnit.hpp"
 #include "Kernel/Delay.hpp"
@@ -740,6 +741,8 @@ bool init(allocators::IAllocator& allocator) {
     if (void* cache_memory = allocator.allocate(sizeof(process::ImageFileCache)))
       process::set_image_file_cache(new (cache_memory) process::ImageFileCache(allocator, uint64_t{512} << 20));
   }
+  // Windows programs read the performance counter and the interrupt time from the timestamp counter themselves (the kernel's clock is that counter, on every core).
+  if (hardware::tsc_ticks_per_us()) process::set_performance_counter_rate(hardware::tsc_ticks_per_us(), hardware::tsc_origin());
   g.nx = (rdmsr(kMsrEfer) & kEferNxe) != 0;
 
   const uint64_t used = address_of(tcos_tramp_end) - address_of(tcos_tramp_begin);

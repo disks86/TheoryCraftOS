@@ -102,8 +102,8 @@ EXPORT NTSTATUS NTAPI RtlSystemTimeToLocalTime(const LARGE_INTEGER *system, PLAR
 EXPORT NTSTATUS NTAPI RtlLocalTimeToSystemTime(const LARGE_INTEGER *local, PLARGE_INTEGER system) { system->QuadPart = local->QuadPart + time_bias_100ns(); return STATUS_SUCCESS; }
 EXPORT LONGLONG NTAPI RtlGetSystemTimePrecise(void) { LARGE_INTEGER t; NtQuerySystemTime(&t); return t.QuadPart; }
 EXPORT ULONGLONG NTAPI RtlGetInterruptTimePrecise(PLARGE_INTEGER performance) {
-  LARGE_INTEGER counter, frequency;
-  NtQueryPerformanceCounter(&counter, &frequency);
+  LARGE_INTEGER counter;
+  RtlQueryPerformanceCounter(&counter);
   if (performance) *performance = counter;
   ULONGLONG time;
   RtlQueryUnbiasedInterruptTime(&time);

@@ -77,6 +77,7 @@ void delay_init(efi::SystemTable* st) {
 
 uint64_t tsc_ticks_per_us() { return g_ticks_per_us; }
 
+uint64_t tsc_origin() { return g_origin; }
 uint64_t uptime_us() { return g_ticks_per_us ? (rdtsc() - g_origin) / g_ticks_per_us : 0; }
 
 void set_sleep_function(void (*sleep_us)(uint64_t)) { g_sleep = sleep_us; }

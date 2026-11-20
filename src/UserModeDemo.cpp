@@ -5389,7 +5389,7 @@ class ConsoleHost final : public process::IProcessHost {
   }
   bool read_console(ByteView, uint64_t* got) override { *got = 0; return true; }
   uint64_t realtime_ns() override { return filesystem::unix_time_now() * 1000000000ull; }
-  uint64_t monotonic_ns() override { return hardware::read_tsc() / (hardware::tsc_ticks_per_us() ? hardware::tsc_ticks_per_us() : 1) * 1000; }
+  uint64_t monotonic_ns() override { return hardware::uptime_us() * 1000; }      // (since the kernel started: the clock of the Windows performance counter)
   void sleep_ns(uint64_t ns) override { kernel::sleep_us(ns / 1000); }
   void yield() override { kernel::yield(); }
   bool random_bytes(ByteView out) override {

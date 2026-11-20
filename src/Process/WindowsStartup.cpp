@@ -143,6 +143,9 @@ void store_system_time(uint8_t* page, uint32_t offset, uint64_t value) {
 }
 
 void store_u32(uint8_t* page, uint32_t offset, uint32_t value) { __atomic_store_n(reinterpret_cast<uint32_t*>(page + offset), value, __ATOMIC_RELAXED); }
+void store_u64(uint8_t* page, uint32_t offset, uint64_t value) { __atomic_store_n(reinterpret_cast<uint64_t*>(page + offset), value, __ATOMIC_RELAXED); }      // (offsets are multiples of 8)
+
+uint64_t g_tsc_ticks_per_us = 0, g_tsc_at_start = 0;
 
 bool map_shared_user_data(AddressSpace& space, uint32_t processor_count) {
   uint8_t* page = g_shared_user_data.data();
@@ -153,6 +156,9 @@ bool map_shared_user_data(AddressSpace& space, uint32_t processor_count) {
   store_u32(page, 0x26C, 10);                               // NtMajorVersion
   store_u32(page, 0x270, 0);                                // NtMinorVersion
   store_u32(page, 0x3C0, processor_count);                  // ActiveProcessorCount
+  store_u64(page, 0x300, 10000000);                         // QpcFrequency: 10 MHz
+  store_u64(page, kSharedUserDataTscStart, __atomic_load_n(&g_tsc_at_start, __ATOMIC_RELAXED));
+  store_u64(page, kSharedUserDataTscRate, __atomic_load_n(&g_tsc_ticks_per_us, __ATOMIC_RELAXED));      // (0: ntdll asks the kernel for the counter)
   return space.map_shared(kSharedUserDataAddress, 4096, kProtRead, g_shared_user_data.data(), &g_shared_user_data);
 }
 
@@ -420,6 +426,24 @@ LoadStatus build_windows_thread(AddressSpace& space, const WindowsThreadInput& i
 }  // namespace process
 
 namespace process {
+
+void set_performance_counter_rate(uint64_t tsc_ticks_per_us, uint64_t tsc_at_start) {
+  __atomic_store_n(&g_tsc_at_start, tsc_at_start, __ATOMIC_RELAXED);
+  __atomic_store_n(&g_tsc_ticks_per_us, tsc_ticks_per_us, __ATOMIC_RELAXED);
+}
+
+bool performance_counter_from_tsc(uint64_t* counter) {
+#if defined(__x86_64__)
+  const uint64_t rate = __atomic_load_n(&g_tsc_ticks_per_us, __ATOMIC_RELAXED);
+  if (!rate) return false;
+  const uint64_t tsc = __builtin_ia32_rdtsc(), start = __atomic_load_n(&g_tsc_at_start, __ATOMIC_RELAXED);
+  *counter = (tsc > start ? tsc - start : 0) / rate * 10;      // (the formula of tcos_win.h: the two never disagree)
+  return true;
+#else
+  (void)counter;
+  return false;
+#endif
+}
 
 // 100 ns units since 1601 for the wall clock; the interrupt time and the tick count run from the boot.
 void refresh_shared_user_data(IProcessHost& host) {
