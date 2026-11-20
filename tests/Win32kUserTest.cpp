@@ -793,10 +793,27 @@ void test_input() {
   user::inject_key(0xA4, 0x38, true, false);      // left Alt
   user::inject_key(0x43, 0x2E, true, false);
   CHECK(t.pk(&m) && m.message == 0x104 && m.wparam == 0x12);      // (the message names VK_MENU, as on Windows; the key state keeps VK_LMENU)
+  CHECK((t.svc32(N::NtUserGetKeyState, {0x12}) & 0x8000) != 0 && (t.svc32(N::NtUserGetKeyState, {0xA4}) & 0x8000) != 0 && (t.svc32(N::NtUserGetKeyState, {0xA5}) & 0x8000) == 0);
   CHECK(t.pk(&m) && m.message == WM_SYSKEYDOWN && m.wparam == 0x43 && (m.lparam & (1u << 29)) != 0);
   user::inject_key(0xA4, 0x38, false, false);
   user::inject_key(0x43, 0x2E, false, false);
   while (t.pk(&m)) {}
+  CHECK((t.svc32(N::NtUserGetKeyState, {0x12}) & 0x8000) == 0 && (t.svc32(N::NtUserGetKeyState, {0xA4}) & 0x8000) == 0);
+  // Ctrl and Shift as the thread sees them while it reads its messages: held from their key down to their key up (the right ones by the extended bit and the scan code)
+  user::inject_key(0xA3, 0x1D, true, true);      // right Ctrl
+  user::inject_key(0x4C, 0x26, true, false);
+  CHECK(t.pk(&m) && m.message == WM_KEYDOWN && m.wparam == 0x11 && (m.lparam & (1u << 24)) != 0);
+  CHECK((t.svc32(N::NtUserGetKeyState, {0x11}) & 0x8000) != 0 && (t.svc32(N::NtUserGetKeyState, {0xA3}) & 0x8000) != 0 && (t.svc32(N::NtUserGetKeyState, {0xA2}) & 0x8000) == 0);
+  CHECK(t.pk(&m) && m.message == WM_KEYDOWN && m.wparam == 0x4C && (t.svc32(N::NtUserGetKeyState, {0x11}) & 0x8000) != 0);      // Ctrl+L
+  user::inject_key(0x4C, 0x26, false, false);
+  user::inject_key(0xA3, 0x1D, false, true);
+  user::inject_key(0xA1, 0x36, true, false);      // right Shift
+  while (t.pk(&m) && !(m.message == WM_KEYDOWN && m.wparam == 0x10)) {}
+  CHECK(m.message == WM_KEYDOWN && m.wparam == 0x10 && (t.svc32(N::NtUserGetKeyState, {0x11}) & 0x8000) == 0);
+  CHECK((t.svc32(N::NtUserGetKeyState, {0x10}) & 0x8000) != 0 && (t.svc32(N::NtUserGetKeyState, {0xA1}) & 0x8000) != 0 && (t.svc32(N::NtUserGetKeyState, {0xA0}) & 0x8000) == 0);
+  user::inject_key(0xA1, 0x36, false, false);
+  while (t.pk(&m)) {}
+  CHECK((t.svc32(N::NtUserGetKeyState, {0x10}) & 0x8000) == 0 && (t.svc32(N::NtUserGetKeyState, {0xA1}) & 0x8000) == 0);
   // GetKeyboardState / SetKeyboardState
   const uint64_t ks = t.tmp(0x1400);
   CHECK(t.svc32(N::NtUserGetKeyboardState, {ks}) == 1 && prog.memory.get8(ks + 0x41) == 0);

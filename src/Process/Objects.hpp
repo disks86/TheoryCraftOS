@@ -333,6 +333,7 @@ class ObjectManager {
   bool job_info(uint32_t job, JobInfo* out, uint64_t* pids, uint32_t capacity, uint32_t* pid_count);
   uint32_t job_set(uint32_t job, const JobInfo& in, bool extended);       // NTSTATUS
   bool job_kill_for(uint64_t pid, uint32_t* code);                  // lock-free: has this process been flagged to end?
+  uint32_t pending_job_kills() const { return __atomic_load_n(&pending_kills_, __ATOMIC_ACQUIRE); }      // members flagged to end that still run (0: job_kill_for() costs nothing)
   // A completion port (JobObjectAssociateCompletionPortInformation): the job keeps the JOB_OBJECT_MSG_* events (new process, exit, no process left) for whoever reads them
   // from the port. NTSTATUS: invalid parameter if a port is associated already (and `present`). Associating queues a new-process event for each process in the job.
   uint32_t job_set_port(uint32_t job, uint64_t key, uint32_t port_object);      // port_object 0: no port. The events are packets of the port (key, process id as the context, the message as the information).
@@ -530,6 +531,7 @@ class ObjectManager {
   void job_forget_locked(uint64_t pid);
   Job* job_of(uint32_t id);      // (locked)
   void job_flag_all_locked(Job& j, uint32_t code);
+  void job_unflag_locked(JobMember& m);      // clears the member's flag, and its part of pending_kills_
   Pipe* pipe_of(uint32_t id);      // (locked)
   void free_pipe_locked(Object& o);
   struct PipeOp;

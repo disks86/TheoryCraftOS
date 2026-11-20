@@ -466,6 +466,28 @@ static void test_jobs() {
     objects.process_exited(9, 1);
     objects.process_exited(10, 1);
     CHECK(!objects.job_kill_for(9, &code) && objects.job_of_process(9) == 0);
+    CHECK(objects.pending_job_kills() == 0);
+    // Kill on close after a member has ended: it is not flagged (it would never end again, and every system call would keep looking through the jobs).
+    CHECK(p.call(WindowsSyscallNumber::NtCreateJobObject, kBase + 0x100, 0x1F001F, 0) == 0);
+    const uint64_t later = p.out();
+    CHECK(p.call(WindowsSyscallNumber::NtSetInformationJobObject, later, 9, buffer, 144) == 0);
+    const uint32_t later_id = uint32_t(p.process.files().token(later / 4 - 1));
+    CHECK(objects.job_assign(later_id, 11) == 0 && objects.job_assign(later_id, 12) == 0);
+    objects.process_exited(11, 0);
+    CHECK(p.call(WindowsSyscallNumber::NtClose, later) == 0);
+    CHECK(objects.pending_job_kills() == 1 && objects.job_kill_for(12, &code) && !objects.job_kill_for(11, &code));      // (only the one still running)
+    objects.process_exited(12, 1);
+    CHECK(objects.pending_job_kills() == 0 && !objects.job_kill_for(12, &code));
+    // The same with TerminateJobObject on a job that stays open.
+    CHECK(p.call(WindowsSyscallNumber::NtCreateJobObject, kBase + 0x100, 0x1F001F, 0) == 0);
+    const uint64_t open_job = p.out();
+    const uint32_t open_id = uint32_t(p.process.files().token(open_job / 4 - 1));
+    CHECK(objects.job_assign(open_id, 13) == 0 && objects.job_assign(open_id, 14) == 0);
+    objects.process_exited(13, 0);
+    CHECK(objects.job_terminate(open_id, 5) == 0 && objects.pending_job_kills() == 1);
+    objects.process_exited(14, 5);
+    CHECK(objects.pending_job_kills() == 0);
+    CHECK(p.call(WindowsSyscallNumber::NtClose, open_job) == 0 && objects.pending_job_kills() == 0);
     // a job, then a new one in its place
     CHECK(p.call(WindowsSyscallNumber::NtCreateJobObject, kBase + 0x100, 0x1F001F, 0) == 0 && p.call(WindowsSyscallNumber::NtAssignProcessToJobObject, p.out(), self) == 0);
   }
