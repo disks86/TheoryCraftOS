@@ -46,6 +46,7 @@ class ImageCache {
   // a damaged file or relocations) or memory ran out.
   Image* acquire(const exe::PeFile& pe, ConstByteView file, uint64_t base);
   uint32_t count();
+  uint64_t bytes();      // what the cached images take together
 
   // Maps the image at the base it was made for into `space`: the headers read-only, each section with the permissions of its characteristics
   // (the Windows layer marks them copy-on-write). False if a piece does not fit; nothing stays mapped then.

@@ -57,6 +57,13 @@ ImageCache::~ImageCache() {
   }
 }
 
+uint64_t ImageCache::bytes() {
+  kernel::ScopedMutex hold(lock_);
+  uint64_t n = 0;
+  for (Image* i = images_; i; i = i->next_) n += i->size_;
+  return n;
+}
+
 uint32_t ImageCache::count() {
   kernel::ScopedMutex hold(lock_);
   uint32_t n = 0;
