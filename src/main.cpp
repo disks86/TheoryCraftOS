@@ -2667,7 +2667,19 @@ static efi::Status kernel_main(efi::Handle image, efi::SystemTable* st) {
         String message(*a.allocator);
         // Every 20 seconds while it runs, what each of its threads is doing goes to the debug console (kernel::usermode::report).
         static volatile bool running = true;
-        kernel::detach(kernel::spawn([](void*) { for (uint32_t s = 0; running; ++s) { kernel::sleep_ms(1000); if (running && s % 20 == 19) kernel::usermode::report(); } }, nullptr, "autorun-report"));
+        kernel::detach(kernel::spawn([](void* context) {
+          const allocators::Allocator& heap = *static_cast<const allocators::Allocator*>(context);
+          for (uint32_t s = 0; running; ++s) {
+            kernel::sleep_ms(1000);
+            if (!running || s % 20 != 19) continue;
+            kernel::usermode::report();
+            console::puts("report: memory free ");      // (the pool below 4 GiB is what DMA allocations can use)
+            console::put_dec(int64_t(heap.free_bytes_low() >> 20));
+            console::puts(" MiB below 4 GiB, ");
+            console::put_dec(int64_t((heap.free_bytes() - heap.free_bytes_low()) >> 20));
+            console::puts(" MiB above\n");
+          }
+        }, static_cast<allocators::Allocator*>(a.allocator), "autorun-report"));      // (the kernel's allocator: see kernel_main)
         const desktop::RunResult result = desktop::run_program(run, &code, &message);
         running = false;
         console::puts("autorun: ended, result ");
