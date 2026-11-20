@@ -8,12 +8,29 @@ one private call. The same source is built for 64-bit and for 32-bit programs ([
 
 A device is a Direct3D 12 device, one command queue and one command list. The immediate context only remembers what is bound; a draw works
 out the Direct3D 12 pipeline of that state, sets on the list what changed since the last draw, and records the draw. The list is sent (the
-queue runs it before it returns) when something has to be seen: `Flush`, a `Map` that reads, a `Present`, a CPU write into a buffer a
-recorded draw uses, the last reference of a resource a recorded command uses.
+queue runs it before it returns) when something has to be seen: `Flush`, a `Map` that reads, a `Present`, a query's `End`, a texture the list
+drew into (or cleared, or copied into) that a draw samples, a texture the list sampled that becomes a target or is copied into. The kernel
+keeps a texture bound the way a list first uses it, which is why those two cases split the list.
+
+**Writes to what a recorded draw reads** do not send the list. Sending it is a whole trip to the GPU and back, and Chrome (ANGLE, for Skia)
+writes the buffer a recorded draw reads all the time: `Map` with `WRITE_DISCARD`, `UpdateSubresource`, buffer copies, and a different offset
+into its streaming vertex buffer for every batch, which makes a new converted copy (see the input layouts below). Sending the list for each of
+those took about 300 ms per composited frame. Instead the buffer gets other memory and the old is retired: kept, untouched, until the list
+has run, then a spare for the next buffer of its size (`buf_rename`, `retire`, `take_upload` in d3d11.c). A converted copy is retired the same
+way when it is made again; it has its own "used by this list" mark (`converted_used`), apart from the buffer's. Texture uploads
+(`UpdateSubresource`, `Unmap` of a dynamic texture) are recorded in order with the draws too. What waits for a list is capped
+(`RETIRED_MAX`, 32 MiB); beyond that the list is sent first. In Chrome a page that repaints everything every frame went from 8 to about 30
+frames a second.
+
+**Buffers stay unmapped.** `d3d12.dll` keeps the CPU's copy of an upload buffer and sends it at `ExecuteCommandLists`. It compares every
+*mapped* buffer with what it sent by a hash, byte by byte, at every submission, and sends one unmapped since then without comparing. So a
+buffer here is mapped in Direct3D 12 only between the program's `Map` and `Unmap`; `Buf.data` stays valid all the time (d3d12.dll's `Map`
+hands out the same memory every time), and a write the runtime does itself is marked with a `Map`/`Unmap` pair (`buf_touched`). The
+constant ring is marked the same way when a list used it.
 
 | Direct3D 11 | here |
 |---|---|
-| buffers | a Direct3D 12 buffer in an upload heap, mapped for good: `Map` hands that memory out, a draw uses its GPU address. |
+| buffers | a Direct3D 12 buffer in an upload heap: `Map` hands its memory out, a draw uses its GPU address. A write while a recorded draw reads it gives the buffer other memory (see above). |
 | constant buffers | Direct3D 12 here has one block of constants for all stages. The block of a draw is put together from the buffers bound to the vertex shader's slots, in slot order, then the pixel shader's, and goes into a ring of upload memory - so a constant buffer may change between draws without the list being sent. |
 | textures | a Direct3D 12 texture in a default heap. The CPU reaches it through copies: `UpdateSubresource`, and `Map` of a dynamic or staging texture (a copy in memory, sent at `Unmap` or fetched at `Map`). R8 and A8 textures are kept as R8G8B8A8. |
 | input layouts | the kernel takes 32-bit floats only: a layout with R8G8B8A8 or B8G8R8A8 colours gets its vertex buffers converted (a second buffer, made again when the first changes). |

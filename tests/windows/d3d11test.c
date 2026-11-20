@@ -284,6 +284,92 @@ static void test_byte_colours(void) {
   if (vertices) ID3D11Buffer_Release(vertices);
 }
 
+/* A buffer written again between two draws of one list (no readback between them, so both are in the list together): each draw has the vertices it was
+ * drawn with. Map with WRITE_DISCARD on a buffer whose colours are four bytes (the runtime draws from a converted copy), then UpdateSubresource and a
+ * buffer-to-buffer copy on one of floats. */
+static void test_rewrite_in_one_list(void) {
+  const VertexB left[3] = {{-0.9f, -0.5f, 0.5f, 255, 0, 0, 255}, {-0.1f, -0.5f, 0.5f, 255, 0, 0, 255}, {-0.5f, 0.5f, 0.5f, 255, 0, 0, 255}};
+  ID3D11Buffer *bytes = make_buffer(D3D11_BIND_VERTEX_BUFFER, D3D11_USAGE_DYNAMIC, D3D11_CPU_ACCESS_WRITE, left, sizeof left);
+  const UINT stride_b = sizeof(VertexB), offset = 0;
+  begin(NULL);
+  clear(0, 0, 0);
+  ID3D11DeviceContext_PSSetShader(g_context, g_ps_color, NULL, 0);
+  ID3D11DeviceContext_IASetInputLayout(g_context, g_layout_bytes);
+  ID3D11DeviceContext_IASetVertexBuffers(g_context, 0, 1, &bytes, &stride_b, &offset);
+  ID3D11DeviceContext_Draw(g_context, 3, 0);
+  D3D11_MAPPED_SUBRESOURCE mapped;
+  int wrote = bytes && SUCCEEDED(ID3D11DeviceContext_Map(g_context, (ID3D11Resource *)bytes, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped));
+  if (wrote) {
+    VertexB *w = mapped.pData;
+    for (int i = 0; i < 3; ++i) { w[i] = left[i]; w[i].x += 1.0f; w[i].r = 0; w[i].b = 255; }      /* the right half, blue */
+    ID3D11DeviceContext_Unmap(g_context, (ID3D11Resource *)bytes, 0);
+  }
+  ID3D11DeviceContext_Draw(g_context, 3, 0);
+  read_target();
+  check(wrote && pixel(16, 32) == 0xFFFF0000u && pixel(48, 32) == 0xFF0000FFu, "Map(WRITE_DISCARD) between two draws of one list: the first keeps its vertices (red left, blue right)");
+  if (bytes) ID3D11Buffer_Release(bytes);
+
+  const VertexF top[3] = {{-0.5f, 0.1f, 0.5f, 0, 1, 0, 1}, {0.5f, 0.1f, 0.5f, 0, 1, 0, 1}, {0.0f, 0.9f, 0.5f, 0, 1, 0, 1}};
+  VertexF bottom[3];
+  for (int i = 0; i < 3; ++i) { bottom[i] = top[i]; bottom[i].y -= 1.0f; bottom[i].g = 0; bottom[i].r = 1; }
+  ID3D11Buffer *floats = make_buffer(D3D11_BIND_VERTEX_BUFFER, D3D11_USAGE_DEFAULT, 0, top, sizeof top);
+  ID3D11Buffer *source = make_buffer(D3D11_BIND_VERTEX_BUFFER, D3D11_USAGE_DEFAULT, 0, top, sizeof top);
+  begin(NULL);
+  clear(0, 0, 0);
+  bind_floats(floats);
+  ID3D11DeviceContext_Draw(g_context, 3, 0);                                                     /* green, top */
+  ID3D11DeviceContext_UpdateSubresource(g_context, (ID3D11Resource *)floats, 0, NULL, bottom, 0, 0);
+  ID3D11DeviceContext_Draw(g_context, 3, 0);                                                     /* red, bottom */
+  ID3D11DeviceContext_UpdateSubresource(g_context, (ID3D11Resource *)source, 0, NULL, top, 0, 0);
+  VertexF moved[3];
+  for (int i = 0; i < 3; ++i) { moved[i] = top[i]; moved[i].y -= 1.0f; moved[i].x -= 0.5f; moved[i].g = 0; moved[i].b = 1; }      /* lower left, blue */
+  ID3D11DeviceContext_UpdateSubresource(g_context, (ID3D11Resource *)source, 0, NULL, moved, 0, 0);
+  ID3D11DeviceContext_CopyResource(g_context, (ID3D11Resource *)floats, (ID3D11Resource *)source);
+  ID3D11DeviceContext_Draw(g_context, 3, 0);
+  read_target();
+  check(green(pixel(32, 16)) == 255 && red(pixel(32, 16)) == 0 && red(pixel(34, 52)) == 255 && blue(pixel(14, 50)) == 255,
+        "UpdateSubresource and CopyResource between draws of one list: each draw has the vertices it was drawn with");
+  if (floats) ID3D11Buffer_Release(floats);
+  if (source) ID3D11Buffer_Release(source);
+}
+
+/* Many draws of one list from one buffer at different offsets, as ANGLE streams vertices: with colours as bytes each offset is a converted copy of its own. */
+static void test_streamed_offsets(void) {
+  enum { N = 16 };
+  VertexB v[N * 3];
+  for (int i = 0; i < N; ++i) {
+    const float cx = -0.75f + (float)(i % 4) * 0.5f, cy = 0.75f - (float)(i / 4) * 0.5f;
+    for (int k = 0; k < 3; ++k) {
+      VertexB *p = &v[i * 3 + k];
+      p->x = cx + (k == 0 ? -0.2f : k == 1 ? 0.2f : 0.0f);
+      p->y = cy + (k == 2 ? 0.2f : -0.2f);
+      p->z = 0.5f;
+      p->r = (BYTE)(i * 16 + 15); p->g = (BYTE)(255 - i * 16); p->b = (BYTE)(i & 1 ? 255 : 0); p->a = 255;
+    }
+  }
+  ID3D11Buffer *buffer = make_buffer(D3D11_BIND_VERTEX_BUFFER, D3D11_USAGE_DYNAMIC, D3D11_CPU_ACCESS_WRITE, v, sizeof v);
+  begin(NULL);
+  clear(0, 0, 0);
+  ID3D11DeviceContext_PSSetShader(g_context, g_ps_color, NULL, 0);
+  ID3D11DeviceContext_IASetInputLayout(g_context, g_layout_bytes);
+  const UINT stride = sizeof(VertexB);
+  for (int i = 0; i < N; ++i) {
+    const UINT offset = (UINT)(i * 3) * stride;
+    ID3D11DeviceContext_IASetVertexBuffers(g_context, 0, 1, &buffer, &stride, &offset);
+    ID3D11DeviceContext_Draw(g_context, 3, 0);
+  }
+  read_target();
+  int good = 0;
+  for (int i = 0; i < N; ++i) {
+    const int x = 8 + (i % 4) * 16, y = 8 + (i / 4) * 16 + 2;
+    const UINT32 p = pixel(x, y);
+    if (red(p) == i * 16 + 15 && green(p) == 255 - i * 16 && blue(p) == (i & 1 ? 255 : 0)) ++good;
+  }
+  check(good == N, "sixteen draws of one list from one buffer at sixteen offsets (colours as bytes): each triangle in its place and colour");
+  if (good != N) printf("d3d11test: (%d of %d right)\n", good, (int)N);
+  if (buffer) ID3D11Buffer_Release(buffer);
+}
+
 static void test_pixel_constants(void) {
   /* ps_cbuf: the average of two of the 64 colours of its own constant buffer, plus a tenth of the vertex colour. All 64 are green here; the
    * vertex shader's matrix is in the vertex shader's b0, and is not what the pixel shader's b0 reads. */
@@ -657,6 +743,8 @@ int main(void) {
     if (make_scene()) {
       test_triangle();
       test_byte_colours();
+      test_rewrite_in_one_list();
+      test_streamed_offsets();
       test_pixel_constants();
       test_texture();
       test_depth_and_blend();
