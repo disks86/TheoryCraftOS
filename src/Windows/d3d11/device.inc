@@ -199,6 +199,7 @@ static void dev_destroy(DxObj *o) {
   if (d->blank) dx_Release(OBJ(d->blank));
   for (UINT i = 0; i < d->pipeline_count; ++i) if (d->pipelines[i].state) ID3D12PipelineState_Release(d->pipelines[i].state);
   if (d->ring) ID3D12Resource_Release(d->ring);
+  spares_release(d);
   if (d->view_heap) ID3D12DescriptorHeap_Release(d->view_heap);
   if (d->sampler_heap) ID3D12DescriptorHeap_Release(d->sampler_heap);
   if (d->rtv_heap) ID3D12DescriptorHeap_Release(d->rtv_heap);
@@ -262,6 +263,7 @@ static HRESULT dev_start(Dev *d) {
   d->dsv_free_count = DSV_SLOTS;
   d->ring = make_buffer(d, D3D12_HEAP_TYPE_UPLOAD, RING_BYTES);
   if (!d->ring || FAILED(ID3D12Resource_Map(d->ring, 0, NULL, (void **)&d->ring_data)) || !d->ring_data) return E_OUTOFMEMORY;
+  ID3D12Resource_Unmap(d->ring, 0, NULL);      /* (the memory stays: see Buf.data; flush() marks it changed when the list wrote constants into it) */
   d->epoch = 1;
   d->dirty = DIRTY_ALL;
 

@@ -68,17 +68,20 @@ static UINT64 fnv(const BYTE *p, UINT64 n) {
   return h;
 }
 
-/* Sends the CPU's copy to the kernel when it changed. */
+/* Sends the CPU's copy to the kernel when it changed. A buffer mapped now may have been written at any time, so its copy is compared by a hash with what was
+ * sent; one unmapped since (`dirty`) is known to have changed and goes without the hash (hashing every buffer at every ExecuteCommandLists, byte by byte,
+ * was the biggest cost of d3d12.dll in Chrome). */
 static void res_push(Resource *r) {
   if (!r->shadow || !r->alloc) return;
   const UINT64 n = r->desc.Width;
-  const UINT64 sum = fnv(r->shadow, n);
-  if (r->pushed && sum == r->sum) return;
+  const int watched = r->map_count > 0;
+  const UINT64 sum = watched ? fnv(r->shadow, n) : 0;
+  if (watched && r->pushed && sum == r->sum) { r->dirty = 0; return; }
   void *data = NULL;
   if (!KMT_OK(kmt_lock(r->d.dev->kdev, r->alloc, 0, 0, &data))) return;
   memcpy(data, r->shadow, (SIZE_T)(n < r->bytes ? n : r->bytes));
   kmt_unlock(r->d.dev->kdev, r->alloc);
-  r->sum = sum;
+  r->sum = watched ? sum : ~sum;      /* (unwatched: no hash taken; the next comparison, once mapped again, sends it) */
   r->pushed = 1;
   r->dirty = 0;
 }

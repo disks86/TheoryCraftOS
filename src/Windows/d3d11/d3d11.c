@@ -62,6 +62,10 @@ __asm__(".text\n.globl ___chkstk_ms\n___chkstk_ms:\n ret\n");
 #define CONSTANT_BLOCK 4096u          /* the bytes of constants a draw has in all (the kernel's limit) */
 #define RING_BYTES (1u << 20)         /* the upload memory the constant blocks of one command list go into */
 #define VIEW_HEAP 4096u               /* descriptors of the heap the textures of the draws go into */
+#define RETIRED_MAX 256u              /* upload buffers a list being recorded may still read after the program has moved on from them */
+#define RETIRED_MAX_BYTES (32u << 20) /* ... and their bytes: beyond that the list is sent first, as without renaming (memory for textures must stay) */
+#define SPARES_MAX 64u                /* upload buffers kept for the next buffer of their size */
+#define SPARES_MAX_BYTES (16u << 20)  /* ... in all */
 #define RTV_SLOTS 1024u
 #define DSV_SLOTS 256u
 #define PIPELINES 96u
@@ -70,6 +74,12 @@ __asm__(".text\n.globl ___chkstk_ms\n___chkstk_ms:\n ret\n");
 typedef struct Dev Dev;
 typedef struct Tex Tex;
 typedef struct Buf Buf;
+/* A D3D12 upload buffer and where it is mapped (NULL: not mapped). */
+typedef struct Spare {
+  ID3D12Resource *res;
+  BYTE *data;
+  UINT64 bytes;
+} Spare;
 
 /* ---- the objects ----------------------------------------------------------------------------------------------------------------------------------- */
 
@@ -86,8 +96,14 @@ struct Buf {
   Child c;
   D3D11_BUFFER_DESC desc;
   ID3D12Resource *res;
-  BYTE *data;                  /* the buffer's memory, mapped for good */
-  UINT used;                   /* the command list (Dev.epoch) that has a draw reading it */
+  BYTE *data;                  /* the buffer's memory: d3d12.dll's CPU copy of `res` (its Map hands out the same memory every time, and it stays there while
+                                * not mapped). `res` is mapped only while the program has the buffer mapped: d3d12.dll hashes every mapped buffer at each
+                                * submission; one this runtime writes itself is marked changed with buf_touched() */
+  int mapped;                  /* the program has it mapped (Map without Unmap yet) */
+  UINT64 bytes;                /* the size of `res` (a spare may be bigger than the buffer) */
+  UINT used;                   /* the command list (Dev.epoch) that has a draw reading `res` */
+  UINT converted_used;         /* ... reading `converted` (the two are apart: `res` may be renamed while a draw reads the copy made from the old) */
+  UINT64 converted_bytes;      /* the size of `converted` */
   UINT version;                /* counts the writes: what a converted copy is compared with */
   /* the copy with float colours, for a layout that needs one */
   ID3D12Resource *converted;
@@ -104,6 +120,7 @@ struct Tex {
   ID3D12Resource *res;
   UINT used;
   UINT sampled;                /* the command list that has a draw sampling it */
+  UINT written;                /* the command list that draws into it, clears it or copies into it */
   BYTE **shadow;               /* by subresource: the copy a Map hands out (NULL until one is mapped) */
   D3D11_MAP *mapped;           /* by subresource: how it is mapped now (0: not) */
   IDXGIResource1 dxgi_res;     /* the same object, for DXGI (dxgi_resource.inc) */
@@ -203,6 +220,12 @@ struct Dev {
   ID3D12DescriptorHeap *rtv_heap, *dsv_heap, *view_heap, *sampler_heap;
   UINT rtv_free[RTV_SLOTS], rtv_free_count, dsv_free[DSV_SLOTS], dsv_free_count;
   ID3D12Resource *ring;                    /* the constant blocks of the list's draws */
+  Spare retired[RETIRED_MAX];              /* upload buffers the list being recorded still reads (a renamed buffer's old memory): kept until it has run */
+  UINT retired_count;
+  UINT64 retired_bytes;
+  Spare spares[SPARES_MAX];                /* upload buffers of lists that have run, not mapped (d3d12.dll looks at every mapped one at each submission) */
+  UINT spare_count;
+  UINT64 spare_bytes;
   BYTE *ring_data;
   UINT ring_used, ring_last, ring_last_bytes;
   UINT view_used, sampler_used;            /* descriptors of the two heaps the list's draws have taken */
@@ -303,14 +326,71 @@ static const GUID *const g_query_iids[] = {&IID_ID3D11DeviceChild, &IID_ID3D11As
 
 static void record_pending_clears(Dev *d);
 
+/* ---- upload buffers that outlive the program's use of them ------------------------------------------------------------------------------------- */
+
+/* Sending the list is a whole trip to the GPU and back, and d3d12.dll sends an upload buffer as it is at that moment (its CPU copy, at ExecuteCommandLists).
+ * A program that writes a buffer a recorded draw still reads (Map with WRITE_DISCARD, as ANGLE does for each batch of Skia's rectangles) had to have the list
+ * sent first, once for every write: about 300 ms a frame in Chrome. Instead such a buffer gets other memory, and the old is retired: kept, as it is, until
+ * the list has run; then it is a spare for the next buffer of its size. */
+static void spare_keep(Dev *d, Spare s) {
+  if (s.data) { ID3D12Resource_Unmap(s.res, 0, NULL); s.data = NULL; }      /* (d3d12.dll hashes every mapped upload buffer at each submission) */
+  if (d->spare_count < SPARES_MAX && d->spare_bytes + s.bytes <= SPARES_MAX_BYTES && s.bytes) { d->spares[d->spare_count++] = s; d->spare_bytes += s.bytes; return; }
+  ID3D12Resource_Release(s.res);
+}
+static void spares_take_retired(Dev *d) {
+  for (UINT i = 0; i < d->retired_count; ++i) spare_keep(d, d->retired[i]);
+  d->retired_count = 0;
+  d->retired_bytes = 0;
+}
+/* Whether `bytes` more may wait for the list (else the caller sends the list: memory kept back for every draw of a long list left Chrome none for its textures). */
+static BOOL retire_room(const Dev *d, UINT64 bytes) { return d->retired_count < RETIRED_MAX && d->retired_bytes + bytes <= RETIRED_MAX_BYTES; }
+static void spares_release(Dev *d) {
+  spares_take_retired(d);
+  for (UINT i = 0; i < d->spare_count; ++i) ID3D12Resource_Release(d->spares[i].res);
+  d->spare_count = 0;
+  d->spare_bytes = 0;
+}
+static ID3D12Resource *make_buffer(Dev *d, D3D12_HEAP_TYPE heap, UINT64 bytes);
+static void flush(Dev *d);
+/* An upload buffer of at least `bytes`, mapped: a spare (at most twice the size) or a new one. NULL if there is none. */
+static ID3D12Resource *take_upload(Dev *d, UINT64 bytes, BYTE **data, UINT64 *size) {
+  UINT best = d->spare_count;
+  for (UINT i = 0; i < d->spare_count; ++i)
+    if (d->spares[i].bytes >= bytes && d->spares[i].bytes <= bytes * 2 && (best == d->spare_count || d->spares[i].bytes < d->spares[best].bytes)) best = i;
+  ID3D12Resource *res;
+  if (best < d->spare_count) {
+    res = d->spares[best].res;
+    *size = d->spares[best].bytes;
+    d->spare_bytes -= *size;
+    d->spares[best] = d->spares[--d->spare_count];
+  } else {
+    res = make_buffer(d, D3D12_HEAP_TYPE_UPLOAD, bytes);
+    *size = bytes;
+    if (!res) return NULL;
+  }
+  *data = NULL;
+  if (FAILED(ID3D12Resource_Map(res, 0, NULL, (void **)data)) || !*data) { ID3D12Resource_Release(res); return NULL; }
+  return res;
+}
+/* `res` is read by the list being recorded: kept until the list has run (sent first when too much waits). The reference passes. */
+static void retire(Dev *d, ID3D12Resource *res, BYTE *data, UINT64 bytes) {
+  const Spare s = {res, data, bytes};
+  if (d->retired_count == RETIRED_MAX) flush(d);      /* (after which nothing reads it any more) */
+  if (d->retired_count == RETIRED_MAX) { spare_keep(d, s); return; }
+  d->retired[d->retired_count++] = s;
+  d->retired_bytes += bytes;
+}
+
 /* Sends what was recorded (the queue runs it before it returns) and begins a new list. */
 static void flush(Dev *d) {
   if (!d->recorded) return;
+  if (d->ring_used) { void *p = NULL; if (SUCCEEDED(ID3D12Resource_Map(d->ring, 0, NULL, &p))) ID3D12Resource_Unmap(d->ring, 0, NULL); }      /* (the constants go with the list) */
   ID3D12GraphicsCommandList_Close(d->list);
   ID3D12CommandList *lists[1] = {(ID3D12CommandList *)d->list};
   ID3D12CommandQueue_ExecuteCommandLists(d->queue, 1, lists);
   ID3D12CommandAllocator_Reset(d->allocator);
   ID3D12GraphicsCommandList_Reset(d->list, d->allocator, NULL);
+  spares_take_retired(d);      /* (the list has run: what it read may be used again) */
   d->recorded = 0;
   d->dirty = DIRTY_ALL;
   d->ring_used = d->ring_last_bytes = 0;
@@ -382,9 +462,9 @@ static BOOL format_of(DXGI_FORMAT format, UINT bind, DXGI_FORMAT *stored, UINT *
 
 static void buf_destroy(DxObj *o) {
   Buf *b = (Buf *)o;
-  settle(b->c.dev, b->used);
-  if (b->converted) ID3D12Resource_Release(b->converted);
-  if (b->res) ID3D12Resource_Release(b->res);
+  Dev *d = b->c.dev;
+  if (b->converted) { const Spare s = {b->converted, NULL, b->converted_bytes}; if (b->converted_used == d->epoch) retire(d, s.res, NULL, s.bytes); else spare_keep(d, s); }
+  if (b->res) { const Spare s = {b->res, b->mapped ? b->data : NULL, b->bytes}; if (b->used == d->epoch) retire(d, s.res, s.data, s.bytes); else spare_keep(d, s); }
   child_destroy(o);
 }
 static void STDMETHODCALLTYPE buf_GetType(Buf *b, D3D11_RESOURCE_DIMENSION *type) { (void)b; if (type) *type = D3D11_RESOURCE_DIMENSION_BUFFER; }
@@ -400,10 +480,11 @@ static HRESULT STDMETHODCALLTYPE dev_CreateBuffer(Dev *d, const D3D11_BUFFER_DES
   Buf *b = child_new(sizeof *b, d, &buf_vtbl, g_buf_iids, buf_destroy);
   if (!b) return E_OUTOFMEMORY;
   b->desc = *desc;
-  b->res = make_buffer(d, D3D12_HEAP_TYPE_UPLOAD, desc->ByteWidth);
-  if (!b->res || FAILED(ID3D12Resource_Map(b->res, 0, NULL, (void **)&b->data)) || !b->data) { dx_Release(OBJ(b)); return E_OUTOFMEMORY; }
+  b->res = take_upload(d, desc->ByteWidth, &b->data, &b->bytes);
+  if (!b->res) { dx_Release(OBJ(b)); return E_OUTOFMEMORY; }
   if (initial && initial->pSysMem) memcpy(b->data, initial->pSysMem, desc->ByteWidth);
   else memset(b->data, 0, desc->ByteWidth);
+  ID3D12Resource_Unmap(b->res, 0, NULL);      /* (marks it changed; see Buf.data) */
   b->version = 1;
   return give(b, (void **)out);
 }
@@ -417,9 +498,15 @@ static UINT mip_size(UINT size, UINT level) { size >>= level; return size ? size
 static HRESULT tex_write(Dev *d, Tex *t, UINT sub, UINT x, UINT y, UINT w, UINT h, const BYTE *rows, UINT pitch) {
   if (t->depth || w == 0 || h == 0) return E_INVALIDARG;
   const UINT row_bytes = w * t->stored_bpp, row_pitch = (row_bytes + 255u) & ~255u;
-  ID3D12Resource *upload = make_buffer(d, D3D12_HEAP_TYPE_UPLOAD, (UINT64)row_pitch * h);
+  /* The copy goes into the list in order with the draws: those recorded before it still see the old pixels, and a draw that samples the texture later sends
+   * the list first (`written`, in draw_prepare). As with a render target, a texture the list has sampled already is not copied into in the same list. */
+  settle(d, t->sampled);
+  const UINT64 upload_bytes = (UINT64)row_pitch * h;
+  if (!retire_room(d, upload_bytes)) flush(d);
   BYTE *memory = NULL;
-  if (!upload || FAILED(ID3D12Resource_Map(upload, 0, NULL, (void **)&memory)) || !memory) { if (upload) ID3D12Resource_Release(upload); return E_OUTOFMEMORY; }
+  UINT64 upload_size = 0;
+  ID3D12Resource *upload = take_upload(d, upload_bytes, &memory, &upload_size);
+  if (!upload) return E_OUTOFMEMORY;
   for (UINT row = 0; row < h; ++row) {
     const BYTE *in = rows + (SIZE_T)row * pitch;
     BYTE *to = memory + (SIZE_T)row * row_pitch;
@@ -448,8 +535,8 @@ static HRESULT tex_write(Dev *d, Tex *t, UINT sub, UINT x, UINT y, UINT w, UINT 
   from.PlacedFootprint.Footprint.RowPitch = row_pitch;
   ID3D12GraphicsCommandList_CopyTextureRegion(d->list, &to, x, y, 0, &from, NULL);
   d->recorded = 1;
-  flush(d);
-  ID3D12Resource_Release(upload);
+  t->used = t->written = d->epoch;
+  retire(d, upload, NULL, upload_size);      /* (unmapped above: kept until the list has run, then a spare) */
   return S_OK;
 }
 

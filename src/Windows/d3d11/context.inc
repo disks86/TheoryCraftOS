@@ -154,11 +154,20 @@ static ID3D12Resource *vertex_source(Dev *d, Ctx *c, UINT slot, UINT *stride, UI
   const Layout *l = c->layout;
   const UINT vertices = *bytes / *stride;
   if (!b->converted || b->converted_layout != l->c.id || b->converted_version != b->version || b->converted_stride != *stride || b->converted_offset != *offset) {
-    if (b->converted && b->used == d->epoch) flush(d);      /* (a recorded draw reads the copy that goes) */
-    if (b->converted && (b->converted_vertices < vertices || b->converted_out_stride != out_stride)) { ID3D12Resource_Release(b->converted); b->converted = NULL; }
-    if (!b->converted) b->converted = make_buffer(d, D3D12_HEAP_TYPE_UPLOAD, (UINT64)(vertices ? vertices : 1) * out_stride);
+    /* a recorded draw reads the copy: it is kept until the list ran (or, with too much waiting already, the list is sent) */
+    if (b->converted && b->converted_used == d->epoch) {
+      if (retire_room(d, b->converted_bytes)) { retire(d, b->converted, NULL, b->converted_bytes); b->converted = NULL; }
+      else flush(d);
+    }
+    if (b->converted && (b->converted_vertices < vertices || b->converted_out_stride != out_stride)) {
+      const Spare s = {b->converted, NULL, b->converted_bytes};
+      spare_keep(d, s);
+      b->converted = NULL;
+    }
     BYTE *out = NULL;
-    if (!b->converted || FAILED(ID3D12Resource_Map(b->converted, 0, NULL, (void **)&out)) || !out) return NULL;
+    if (!b->converted) b->converted = take_upload(d, (UINT64)(vertices ? vertices : 1) * out_stride, &out, &b->converted_bytes);
+    else if (FAILED(ID3D12Resource_Map(b->converted, 0, NULL, (void **)&out))) out = NULL;
+    if (!b->converted || !out) return NULL;
     for (UINT v = 0; v < vertices; ++v) {
       const BYTE *in = b->data + *offset + (SIZE_T)v * *stride;
       for (UINT i = 0; i < l->count; ++i) {
@@ -210,6 +219,8 @@ static BOOL draw_prepare(Ctx *c, BOOL indexed) {
   }
   /* (a texture the list's draws sampled cannot become its target: the kernel keeps it bound as a texture for the whole list) */
   for (UINT i = 0; i < c->rtv_count; ++i) settle(d, c->rtv[i]->tex->sampled);
+  /* (... nor be sampled after the list has drawn into it, cleared it or copied into it: the draw would see the texture as it was before the list) */
+  for (UINT i = 0; i < TEXTURE_SLOTS; ++i) if (c->srv[i]) settle(d, c->srv[i]->tex->written);
   if (d->ring_used + CONSTANT_BLOCK > RING_BYTES || d->view_used + TEXTURE_SLOTS > VIEW_HEAP || d->sampler_used + TEXTURE_SLOTS > VIEW_HEAP) flush(d);
   ID3D12PipelineState *pipeline = pipeline_get(d, c);
   if (!pipeline) return FALSE;
@@ -241,7 +252,8 @@ static BOOL draw_prepare(Ctx *c, BOOL indexed) {
     if (!sources[slot]) continue;
     D3D12_VERTEX_BUFFER_VIEW view = {ID3D12Resource_GetGPUVirtualAddress(sources[slot]) + offsets[slot], sizes[slot], strides[slot]};
     ID3D12GraphicsCommandList_IASetVertexBuffers(list, slot, 1, &view);
-    c->vb[slot]->used = d->epoch;
+    if (sources[slot] == c->vb[slot]->converted) c->vb[slot]->converted_used = d->epoch;
+    else c->vb[slot]->used = d->epoch;
   }
   if (indexed) {
     const UINT offset = c->ib_offset < c->ib->desc.ByteWidth ? c->ib_offset : 0;
@@ -316,9 +328,9 @@ static BOOL draw_prepare(Ctx *c, BOOL indexed) {
   ID3D12GraphicsCommandList_SetGraphicsRootDescriptorTable(list, 2, samplers);
 
   for (UINT i = 0; i < TEXTURE_SLOTS; ++i) if (c->srv[i]) c->srv[i]->tex->used = c->srv[i]->tex->sampled = d->epoch;
-  for (UINT i = 0; i < c->rtv_count; ++i) c->rtv[i]->tex->used = d->epoch;
+  for (UINT i = 0; i < c->rtv_count; ++i) c->rtv[i]->tex->used = c->rtv[i]->tex->written = d->epoch;
   if (c->dsv) {
-    c->dsv->tex->used = d->epoch;
+    c->dsv->tex->used = c->dsv->tex->written = d->epoch;
     for (UINT i = 0; i < d->clear_count;) {      /* (its clear is done by the pass this draw begins) */
       if (d->clears[i].dsv == c->dsv) d->clears[i] = d->clears[--d->clear_count]; else ++i;
     }
@@ -518,7 +530,7 @@ static void STDMETHODCALLTYPE ctx_ClearRenderTargetView(Ctx *c, ID3D11RenderTarg
   else if (v->tex->expand == 3) kept[2] = 0, kept[3] = 1;
   else if (v->tex->expand == 2) kept[0] = kept[1] = kept[2] = 0;
   ID3D12GraphicsCommandList_ClearRenderTargetView(c->dev->list, v->handle, kept, 0, NULL);
-  v->tex->used = c->dev->epoch;
+  v->tex->used = v->tex->written = c->dev->epoch;
   c->dev->recorded = 1;
   UNLOCK(c);
 }
@@ -540,7 +552,7 @@ static void STDMETHODCALLTYPE ctx_ClearDepthStencilView(Ctx *c, ID3D11DepthStenc
     if (flags & D3D11_CLEAR_STENCIL) p->stencil = stencil;
   }
   ID3D12GraphicsCommandList_ClearDepthStencilView(d->list, v->handle, (D3D12_CLEAR_FLAGS)(flags & 3), depth, stencil, 0, NULL);
-  v->tex->used = d->epoch;
+  v->tex->used = v->tex->written = d->epoch;
   d->recorded = 1;
   UNLOCK(c);
 }
@@ -550,6 +562,33 @@ static void STDMETHODCALLTYPE ctx_ClearDepthStencilView(Ctx *c, ID3D11DepthStenc
 static Buf *buf_of_resource(ID3D11Resource *resource) {
   if (!resource || ((DxObj *)resource)->lpVtbl != (const void *)&buf_vtbl) return NULL;
   return (Buf *)resource;
+}
+
+/* Gives a buffer that a recorded draw reads (`res`) other memory, so the program can write it at once (Map, UpdateSubresource, a copy into it): the old memory
+ * is retired until the list has run. `keep`: the new memory starts as a copy of the old (not for WRITE_DISCARD). FALSE without memory: the caller sends the
+ * list instead. (A converted copy a draw reads is `converted_used`'s business: it is replaced when it is made again.) */
+static BOOL buf_rename(Dev *d, Buf *b, BOOL keep) {
+  BYTE *data = NULL;
+  UINT64 bytes = 0;
+  if (!retire_room(d, b->bytes)) return FALSE;
+  ID3D12Resource *fresh = take_upload(d, b->desc.ByteWidth, &data, &bytes);
+  if (!fresh) return FALSE;
+  if (keep) memcpy(data, b->data, b->desc.ByteWidth);
+  ID3D12Resource_Unmap(fresh, 0, NULL);      /* (see Buf.data: the memory stays, and the caller writes it next) */
+  retire(d, b->res, b->mapped ? b->data : NULL, b->bytes);      /* (a mapping of the old memory goes with it) */
+  b->mapped = 0;
+  b->res = fresh;
+  b->data = data;
+  b->bytes = bytes;
+  b->used = d->epoch - 1u;      /* (nothing recorded reads the new memory) */
+  return TRUE;
+}
+
+/* The runtime wrote the buffer's memory itself (UpdateSubresource, a copy): d3d12.dll sends it with the next list (a Map and Unmap mark it changed). */
+static void buf_touched(Buf *b) {
+  void *p = NULL;
+  if (b->mapped) return;      /* (mapped: d3d12.dll compares it at each submission anyway) */
+  if (SUCCEEDED(ID3D12Resource_Map(b->res, 0, NULL, &p))) ID3D12Resource_Unmap(b->res, 0, NULL);
 }
 
 static HRESULT STDMETHODCALLTYPE ctx_Map(Ctx *c, ID3D11Resource *resource, UINT sub, D3D11_MAP type, UINT flags, D3D11_MAPPED_SUBRESOURCE *out) {
@@ -564,7 +603,10 @@ static HRESULT STDMETHODCALLTYPE ctx_Map(Ctx *c, ID3D11Resource *resource, UINT 
   if (b) {
     if (sub != 0) hr = E_INVALIDARG;
     else {
-      if (type != D3D11_MAP_WRITE_NO_OVERWRITE && type != D3D11_MAP_READ) settle(d, b->used);      /* (a recorded draw reads what is there now) */
+      /* (a recorded draw reads what is there now: the buffer gets other memory, or failing that the list is sent first) */
+      if (type != D3D11_MAP_WRITE_NO_OVERWRITE && type != D3D11_MAP_READ && b->used == d->epoch && !buf_rename(d, b, type != D3D11_MAP_WRITE_DISCARD)) settle(d, b->used);
+      void *p = NULL;
+      if (type != D3D11_MAP_READ && !b->mapped && SUCCEEDED(ID3D12Resource_Map(b->res, 0, NULL, &p))) b->mapped = 1;      /* (see Buf.data) */
       out->pData = b->data;
       out->RowPitch = out->DepthPitch = b->desc.ByteWidth;
     }
@@ -590,8 +632,10 @@ static void STDMETHODCALLTYPE ctx_Unmap(Ctx *c, ID3D11Resource *resource, UINT s
   Buf *b = buf_of_resource(resource);
   Tex *t = tex_of_resource(resource);
   LOCK(c);
-  if (b) ++b->version;
-  else if (t && sub < tex_subresources(t) && t->mapped[sub]) {
+  if (b) {
+    ++b->version;
+    if (b->mapped) { ID3D12Resource_Unmap(b->res, 0, NULL); b->mapped = 0; }      /* (d3d12.dll sends it with the next list) */
+  } else if (t && sub < tex_subresources(t) && t->mapped[sub]) {
     const D3D11_MAP type = t->mapped[sub];
     t->mapped[sub] = 0;
     if (type != D3D11_MAP_READ) {
@@ -611,8 +655,9 @@ static void STDMETHODCALLTYPE ctx_UpdateSubresource(Ctx *c, ID3D11Resource *reso
   if (b && sub == 0) {
     const UINT left = box ? box->left : 0, right = box ? box->right : b->desc.ByteWidth;
     if (left < right && right <= b->desc.ByteWidth) {
-      settle(c->dev, b->used);
+      if (b->used == c->dev->epoch && !buf_rename(c->dev, b, left != 0 || right != b->desc.ByteWidth)) settle(c->dev, b->used);
       memcpy(b->data + left, data, right - left);
+      buf_touched(b);
       ++b->version;
     }
   } else if (t && sub < tex_subresources(t) && !t->depth) {
@@ -646,8 +691,10 @@ static void STDMETHODCALLTYPE ctx_CopySubresourceRegion(Ctx *c, ID3D11Resource *
   if (bt && bf) {
     const UINT left = box ? box->left : 0, right = box ? box->right : bf->desc.ByteWidth;
     if (left < right && right <= bf->desc.ByteWidth && x <= bt->desc.ByteWidth && right - left <= bt->desc.ByteWidth - x) {
-      settle(d, bt->used);
+      /* (buffers are written by the CPU only, so the copy is done here, in its place among the commands; a recorded draw keeps the old bytes in the old memory) */
+      if (bt->used == d->epoch && (bt == bf || !buf_rename(d, bt, x != 0 || right - left != bt->desc.ByteWidth))) settle(d, bt->used);
       memmove(bt->data + x, bf->data + left, right - left);
+      buf_touched(bt);
       ++bt->version;
     }
   } else if (tt && tf && to_sub < tex_subresources(tt) && from_sub < tex_subresources(tf)) {
@@ -662,7 +709,7 @@ static void STDMETHODCALLTYPE ctx_CopySubresourceRegion(Ctx *c, ID3D11Resource *
       D3D12_BOX region;
       if (box) { region.left = box->left; region.top = box->top; region.front = 0; region.right = box->right; region.bottom = box->bottom; region.back = 1; }
       ID3D12GraphicsCommandList_CopyTextureRegion(d->list, &dst, x, y, 0, &src, box ? &region : NULL);
-      tt->used = tf->used = d->epoch;
+      tt->used = tf->used = tt->written = d->epoch;
       d->recorded = 1;
     } else tex_copy_slow(d, tt, to_sub, x, y, tf, from_sub, box);
   }
@@ -674,13 +721,14 @@ static void STDMETHODCALLTYPE ctx_CopyResource(Ctx *c, ID3D11Resource *to, ID3D1
   Tex *tt = tex_of_resource(to), *tf = tex_of_resource(from);
   LOCK(c);
   if (bt && bf && bt != bf) {
-    settle(d, bt->used);
+    if (bt->used == d->epoch && !buf_rename(d, bt, bf->desc.ByteWidth < bt->desc.ByteWidth)) settle(d, bt->used);
     memcpy(bt->data, bf->data, bt->desc.ByteWidth < bf->desc.ByteWidth ? bt->desc.ByteWidth : bf->desc.ByteWidth);
+    buf_touched(bt);
     ++bt->version;
   } else if (tt && tf && tt != tf && tex_subresources(tt) == tex_subresources(tf) && tt->desc.Width == tf->desc.Width && tt->desc.Height == tf->desc.Height) {
     if (tex_simple(tt) && tex_simple(tf) && tt->stored == tf->stored) {
       ID3D12GraphicsCommandList_CopyResource(d->list, tt->res, tf->res);
-      tt->used = tf->used = d->epoch;
+      tt->used = tf->used = tt->written = d->epoch;
       d->recorded = 1;
     } else for (UINT sub = 0; sub < tex_subresources(tt); ++sub) tex_copy_slow(d, tt, sub, 0, 0, tf, sub, NULL);
   }
@@ -696,7 +744,7 @@ static void STDMETHODCALLTYPE ctx_ResolveSubresource(Ctx *c, ID3D11Resource *to,
       tt->desc.Height != tf->desc.Height || tt->stored != tf->stored) return;
   LOCK(c);
   ID3D12GraphicsCommandList_ResolveSubresource(d->list, tt->res, 0, tf->res, 0, tt->stored);      /* (the stored format: a typed view of it asked for is the same bytes) */
-  tt->used = tf->used = d->epoch;
+  tt->used = tf->used = tt->written = d->epoch;
   d->recorded = 1;
   UNLOCK(c);
 }
