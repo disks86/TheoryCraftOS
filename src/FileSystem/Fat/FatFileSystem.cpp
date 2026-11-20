@@ -718,22 +718,59 @@ constexpr uint8_t kDotDot11[11] = {'.', '.', ' ', ' ', ' ', ' ', ' ', ' ', ' ', 
 
 Status FatFileSystem::flush() {
   kernel::ScopedRecursiveMutex lock(mutex_);
-  if (!device_.flush()) return Status::IoError;
+  const Status s = barrier();
+  if (s != Status::Ok) return s;
   discard_.issue();   // (the FAT entries that freed them are on the medium now)
   return Status::Ok;
+}
+
+Status FatFileSystem::barrier() {
+  if (read_only_) return Status::Ok;
+  if (!device_.flush()) return Status::IoError;
+  freed_count_ = 0;   // (the frees are durable: those clusters may be used again)
+  return Status::Ok;
+}
+
+void FatFileSystem::freed_run(uint32_t first, uint32_t count) {
+  if (count == 0) return;
+  if (freed_count_ > 0) {   // (a chain is mostly freed in order: grow the last run)
+    FreedRun& last = freed_[freed_count_ - 1];
+    if (last.first + last.count == first) {
+      last.count += count;
+      return;
+    }
+  }
+  if (freed_count_ == kMaxFreedRuns && barrier() != Status::Ok) {
+    // The device cannot flush: the frees are kept apart as before, and the oldest run is given up (reusing it early is the old behaviour).
+    for (uint32_t i = 1; i < kMaxFreedRuns; ++i) freed_[i - 1] = freed_[i];
+    --freed_count_;
+  }
+  freed_[freed_count_++] = FreedRun{first, count};
+}
+
+bool FatFileSystem::freed_recently(uint32_t cluster, uint32_t* run_end) const {
+  for (uint32_t i = 0; i < freed_count_; ++i) {
+    const FreedRun& run = freed_[i];
+    if (cluster >= run.first && cluster - run.first < run.count) {
+      *run_end = run.first + run.count;
+      return true;
+    }
+  }
+  return false;
 }
 
 
 Status FatFileSystem::send_discards() {
   kernel::ScopedRecursiveMutex lock(mutex_);
   if (!discard_.has_committed()) return Status::Ok;
-  if (!device_.flush()) return Status::IoError;   // (what freed them must be on the medium first)
+  const Status s = barrier();   // (what freed them must be on the medium first)
+  if (s != Status::Ok) return s;
   discard_.issue();
   return Status::Ok;
 }
 
 void FatFileSystem::send_discards_if_due() {
-  if (discard_.wants_issue() && device_.flush()) discard_.issue();
+  if (discard_.wants_issue() && barrier() == Status::Ok) discard_.issue();
 }
 
 // fstrim: the runs of free clusters (FAT entry 0), after the device flush that makes every free so far durable.
@@ -742,7 +779,8 @@ Status FatFileSystem::trim(StringView, uint64_t* discarded_bytes) {
   *discarded_bytes = 0;
   if (read_only_) return Status::ReadOnly;
   if (!discard_.enabled()) return Status::Unsupported;
-  if (!device_.flush()) return Status::IoError;
+  const Status flushed = barrier();
+  if (flushed != Status::Ok) return flushed;
   discard_.issue();
   uint32_t run_first = 0, run_length = 0;
   bool ok = true;
@@ -842,11 +880,21 @@ Status FatFileSystem::allocate_cluster(uint32_t* result, uint32_t link_from) {
   if (s != Status::Ok) return s;
   if (free_known_ && free_clusters_ == 0) return Status::NoSpace;
   uint32_t c = alloc_hint_ < 2 || alloc_hint_ >= cluster_count_ + 2 ? 2 : alloc_hint_;
+  bool skipped = false;   // (free clusters passed over because their free is not durable yet)
   for (uint32_t tried = 0; tried < cluster_count_; ++tried) {
     uint32_t value = 0;
     s = get_fat(c, &value);
     if (s != Status::Ok) return s;
-    if (value == 0) {
+    uint32_t run_end = 0;
+    if (value == 0 && freed_recently(c, &run_end)) {
+      skipped = true;
+      const uint32_t skip = run_end - c;   // (the rest of the run: it is all recently freed)
+      if (skip > 1 && tried + skip <= cluster_count_) {
+        tried += skip - 1;
+        c = run_end >= cluster_count_ + 2 ? 2 : run_end;
+        continue;
+      }
+    } else if (value == 0) {
       discard_.reused_bytes(first_block_ * block_size_ + cluster_offset(c), cluster_bytes_, block_size_);
       s = set_fat(c, end_mark());
       if (s != Status::Ok) return s;
@@ -863,7 +911,11 @@ Status FatFileSystem::allocate_cluster(uint32_t* result, uint32_t link_from) {
     }
     c = c + 1 >= cluster_count_ + 2 ? 2 : c + 1;
   }
-  return Status::NoSpace;
+  if (!skipped) return Status::NoSpace;
+  // Only recently freed clusters are left: make the frees durable, then they can be used.
+  s = barrier();
+  if (s != Status::Ok) return s;
+  return allocate_cluster(result, link_from);
 }
 
 Status FatFileSystem::free_chain(uint32_t first) {
@@ -872,7 +924,10 @@ Status FatFileSystem::free_chain(uint32_t first) {
   // that are freed entirely are discarded.
   uint32_t run_first = 0, run_length = 0;
   auto end_run = [&] {
-    if (run_length) discard_.freed_bytes(first_block_ * block_size_ + cluster_offset(run_first), uint64_t{run_length} * cluster_bytes_, block_size_);
+    if (run_length) {
+      discard_.freed_bytes(first_block_ * block_size_ + cluster_offset(run_first), uint64_t{run_length} * cluster_bytes_, block_size_);
+      freed_run(run_first, run_length);
+    }
     run_length = 0;
   };
   uint32_t c = first;
@@ -1097,9 +1152,17 @@ Status FatFileSystem::find_slots(const Node& directory, uint32_t needed, uint64_
     bool end = false;
     Status s = next_cluster(cluster, &next, &end);
     if (s != Status::Ok) return s;
-    if (end) {  // the directory is full: add a cluster (empty, so all of it is free)
-      s = allocate_cluster(&next, cluster);
+    if (end) {  // the directory is full: add a cluster (empty, so all of it is free), on the medium before the chain leads to it
+      uint32_t added = 0;
+      s = allocate_cluster(&added, 0);
       if (s != Status::Ok) return s;
+      s = barrier();
+      if (s == Status::Ok) s = set_fat(cluster, added);
+      if (s != Status::Ok) {
+        set_fat(added, 0);
+        return s;
+      }
+      next = added;
     }
     cluster = next;
   }
@@ -1309,6 +1372,7 @@ Status FatFileSystem::create_directory(StringView path) {
     }
     s = write_bytes(cluster_offset(cluster) + static_cast<uint64_t>(which) * 32, ConstByteView(raw, 32));
   }
+  if (s == Status::Ok) s = barrier();   // ("." and ".." are on the medium before a name leads to them)
   if (s == Status::Ok) s = make_entry(parent, leaf, kAttrDirectory, cluster, 0, 0, nullptr);
   if (s != Status::Ok) free_chain(cluster);
   return s;
@@ -1376,6 +1440,7 @@ Status FatFileSystem::rename(StringView from, StringView to) {
   __builtin_memcpy(new_raw + 13, old_raw + 13, 7);
   __builtin_memcpy(new_raw + 22, old_raw + 22, 4);
   s = write_bytes(created.short_offset, ConstByteView(new_raw, 32));
+  if (s == Status::Ok) s = barrier();   // (the new name is on the medium before the old one goes: a cut leaves one of them, or both)
   if (s != Status::Ok) return s;
   for (File* open = open_files_; open; open = open->next_open())
     if (open->entry_offset() == source.short_offset) open->entry_moved(created.short_offset);

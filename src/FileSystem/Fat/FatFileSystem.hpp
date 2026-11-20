@@ -23,6 +23,7 @@
 #include "FileSystem/DiscardBatch.hpp"
 #include "Hardware/StorageDevice/IStorageDevice.hpp"
 #include "Kernel/Sync.hpp"
+#include "ObjectContainer/Array.hpp"
 #include "Utility/ArrayView.hpp"
 #include "Utility/UniquePointer.hpp"
 
@@ -33,6 +34,16 @@ namespace filesystem {
 // not by its 8.3 alias. Names are case insensitive (ASCII). Writing goes straight to the device (the block cache in front of it, docs/BlockCache.md,
 // keeps it; flush() asks it and the device to commit). A volume on a read-only device, a read-only file and anything else that cannot be written return
 // ReadOnly. Files are at most 4 GiB - 1. Time stamps are not kept up to date (no clock here): new entries get 1980-01-01.
+//
+// Power cuts. FAT keeps no journal, and the block cache below writes back in its own order, so between two flushes any subset of the
+// writes may have reached the medium. flush() (FlushFileBuffers, fsync) makes everything before it durable: data, sizes, chains and names.
+// Between flushes the driver keeps the damage to what fsck repairs without losing data (lost clusters, a chain that ends early, a file
+// under both its old and new name), by three rules:
+// - A freed cluster is not handed out again until the free is durable (the next device flush; one is forced when the list of such runs
+//   is full or the volume has no other free cluster). So an entry that a cut brings back never points at another file's data.
+// - A new directory's "." and ".." are on the medium before its name is (a device flush between), and so is a cluster that a directory
+//   grows by before it is linked: no directory reads as garbage entries.
+// - A rename writes the new name and flushes before it removes the old one: a cut leaves one name or both, never neither.
 //
 // The volume starts at block `first_block` of the device (0 for a bare
 // filesystem, the partition's first block otherwise) and mounting reads and
@@ -115,6 +126,10 @@ class FatFileSystem final : public IFileSystem {
   Status resize_chain(uint32_t* first, uint32_t old_size, uint32_t new_size);
   Status write_chain(uint32_t first, uint64_t offset, const uint8_t* data, uint64_t length, ChainCursor* cursor);  // null data: zeros
   Status update_entry(uint64_t short_offset, uint32_t first, uint32_t size);
+  // Ordering (see the class comment). barrier(): a device flush; what was written before it is durable, and so are the frees.
+  Status barrier();
+  void freed_run(uint32_t first, uint32_t count);   // clusters freed: not reused before the next barrier
+  bool freed_recently(uint32_t cluster, uint32_t* run_end) const;   // and if so, the cluster after its run
   Status touch_directory(const Node& directory);  // its written time becomes now (a name was added or removed); the root has none
   uint32_t free_cluster_count();
   Status find_slots(const Node& directory, uint32_t needed, uint64_t* offsets);
@@ -138,6 +153,12 @@ class FatFileSystem final : public IFileSystem {
   uint32_t alloc_hint_ = 2;      // where the search for a free cluster starts
   uint32_t free_clusters_ = 0;
   bool free_known_ = false;
+  struct FreedRun {
+    uint32_t first = 0, count = 0;
+  };
+  static constexpr uint32_t kMaxFreedRuns = 64;
+  Array<FreedRun, kMaxFreedRuns> freed_;   // the first freed_count_ are clusters freed since the last device flush
+  uint32_t freed_count_ = 0;
 
   ByteView block_;           // one device block, cached
   uint64_t block_number_ = ~uint64_t{0};
