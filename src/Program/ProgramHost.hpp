@@ -46,6 +46,7 @@ class ProgramHost final : public process::IProcessHost {
   bool read_console(ByteView out, uint64_t* got) override;
   uint64_t realtime_ns() override;
   uint64_t monotonic_ns() override;
+  bool user_clock(process::UserClock* out) override;
   void sleep_ns(uint64_t ns) override;
   void yield() override;
   bool random_bytes(ByteView out) override;

@@ -984,6 +984,7 @@ add_executable(BOOTX64
   src/Process/LinuxAio.cpp
   src/Process/LinuxIpc.cpp
   src/Process/LinuxSignals.cpp
+  src/Process/LinuxVdso.cpp
   src/Process/LinuxInput.cpp
   src/Process/ProcessFiles.cpp
   src/Process/WindowsFiles.cpp

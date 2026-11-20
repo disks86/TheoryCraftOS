@@ -71,6 +71,14 @@ static void test_host() {
   host.sleep_ns(0);
   host.yield();
   CHECK(host.monotonic_ns() >= t0);
+  // the clocks as a program can read them itself (the Linux vDSO): realtime is monotonic plus a fixed offset, at any time
+  process::UserClock clock;
+#if defined(__x86_64__)
+  CHECK(host.user_clock(&clock) && clock.tsc_ticks_per_us == 1 && clock.tsc_at_start == 0);
+  CHECK(host.realtime_ns() == host.monotonic_ns() + clock.realtime_offset_ns);
+#else
+  CHECK(!host.user_clock(&clock));
+#endif
   uint8_t r[32] = {};
   const bool got_random = host.random_bytes(ByteView(r, 32));
   if (got_random) {

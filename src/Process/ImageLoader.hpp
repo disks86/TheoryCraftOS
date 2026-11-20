@@ -43,6 +43,7 @@ struct LoadedImage {
   uint64_t phent = 0, phnum = 0;
   uint64_t program_entry = 0;       // a dynamic program: its own entry (AT_ENTRY), while `entry` is the interpreter's; 0 otherwise
   uint64_t interpreter_base = 0;    // a dynamic program: where its interpreter (ld.so) is (AT_BASE); 0 otherwise
+  uint64_t vdso_base = 0;           // a Linux program: where its vDSO is (AT_SYSINFO_EHDR); 0 if it has none
 };
 
 // Where a position-independent ELF is put (a fixed address is its own, so the first program is always loaded alike).
@@ -92,7 +93,7 @@ LoadStatus map_stack(AddressSpace& space, uint64_t size, uint64_t* top);
 
 constexpr uint64_t kMaxStartupStrings = 128 * 1024;      // bytes of arguments and environment together
 // Builds the System V startup block on the stack: argc, the argv and envp pointers, and the auxiliary vector (program headers, entry, page size,
-// clock ticks, the program's path and platform name ("x86_64", "aarch64"), random bytes). `random` supplies the 16 bytes of AT_RANDOM. `*stack_pointer` is the value for the program's stack pointer: 16-byte aligned, pointing at argc.
+// clock ticks, the program's path and platform name ("x86_64", "aarch64"), random bytes, the vDSO when image.vdso_base is set). `random` supplies the 16 bytes of AT_RANDOM. `*stack_pointer` is the value for the program's stack pointer: 16-byte aligned, pointing at argc.
 LoadStatus build_linux_stack(AddressSpace& space, uint64_t stack_top, const LoadedImage& image, ArrayView<const StringView> arguments,
                              ArrayView<const StringView> environment, StringView executable, ConstByteView random, uint64_t* stack_pointer,
                              StringView platform = "x86_64");

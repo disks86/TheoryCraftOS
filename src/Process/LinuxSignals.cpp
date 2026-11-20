@@ -255,7 +255,7 @@ bool push_frame(Process& p, LinuxProcessState::Thread& thread, uint32_t signal, 
 // --- entering a handler (AArch64, RISC-V and LoongArch) -------------------------------------------------------------------------------------------------------------
 // None of these CPUs' C libraries gives the kernel a way back from a handler (RISC-V and LoongArch have no SA_RESTORER at all; AArch64 has one, which glibc
 // does not use): Linux
-// points the handler's return address at a few instructions in the vDSO that call rt_sigreturn. There is no vDSO here, so the process gets a page of its own
+// points the handler's return address at a few instructions in the vDSO that call rt_sigreturn. Only x86-64 programs have a vDSO here (LinuxVdso.hpp), so the process gets a page of its own
 // with those instructions the first time a handler is entered.
 constexpr uint64_t kRtSigreturnGeneric = 139;      // rt_sigreturn in the generic system-call table
 
