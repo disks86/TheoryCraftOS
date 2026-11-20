@@ -170,9 +170,9 @@ static void *mem_alloc(SIZE_T n) { return HeapAlloc(GetProcessHeap(), HEAP_ZERO_
 static void mem_free(void *p) { if (p) HeapFree(GetProcessHeap(), 0, p); }
 static void *mem_alloc_n(SIZE_T count, SIZE_T size) { if (size && count > (SIZE_T)0x7fffffff / size) return NULL; return mem_alloc(count * size); }
 
-static int lock_state;      /* a tiny spin lock for the DIB section table */
-static void table_lock(void) { while (__sync_lock_test_and_set(&lock_state, 1)) { } }
-static void table_unlock(void) { __sync_lock_release(&lock_state); }
+static SRWLOCK lock_state = SRWLOCK_INIT;      /* the DIB section table's lock (a waiter sleeps: a spin lock let a high-priority waiter starve a suspended or lower-priority holder) */
+static void table_lock(void) { AcquireSRWLockExclusive(&lock_state); }
+static void table_unlock(void) { ReleaseSRWLockExclusive(&lock_state); }
 
 static WCHAR *dup_AtoW(const char *s, UINT cp) {
   if (!s) return NULL;

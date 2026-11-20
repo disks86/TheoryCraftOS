@@ -291,9 +291,11 @@ EXPORT DWORD WINAPI DiscardVirtualMemory(PVOID address, SIZE_T size) {
  * (a superset, which is what a collector that rescans the reported pages needs) until the watch is reset. */
 typedef struct { ULONG_PTR base; SIZE_T size; } WatchRegion;
 static WatchRegion g_watched[32];
-static volatile LONG g_watched_lock;
-static void watched_lock(void) { while (__sync_lock_test_and_set(&g_watched_lock, 1)) { while (g_watched_lock) __asm__ volatile("pause"); } }
-static void watched_unlock(void) { __sync_lock_release(&g_watched_lock); }
+/* The locks of this file are SRW locks: a thread that waits for one sleeps. (They were spin locks: when the holder was suspended - Chrome's sampling profiler
+ * suspends threads - or could not run because the spinners had a higher priority, the waiters spun on every processor and the machine stood still.) */
+static SRWLOCK g_watched_lock = {0};      /* (SRWLOCK_INIT) */
+static void watched_lock(void) { RtlAcquireSRWLockExclusive(&g_watched_lock); }
+static void watched_unlock(void) { RtlReleaseSRWLockExclusive(&g_watched_lock); }
 static void watch_note(LPVOID base, SIZE_T size) {
   MEMORY_BASIC_INFORMATION info;
   if (!base || !VirtualQuery(base, &info, sizeof(info))) return;
@@ -397,7 +399,7 @@ EXPORT BOOL WINAPI GetProcessGroupAffinity(HANDLE process, PUSHORT_ count, PUSHO
 /* ---- what a program keeps about itself: working set, shutdown order, mitigations, CPU sets, memory priority, power throttling ------------------------------------------ */
 
 typedef struct {
-  volatile LONG lock;
+  SRWLOCK lock;      /* (see watched_lock) */
   SIZE_T ws_min, ws_max;
   DWORD ws_flags;
   DWORD shutdown_level, shutdown_flags;
@@ -411,9 +413,9 @@ typedef struct {
   DWORD default_cpu_set_count;
   DWORD execution_state;
 } SelfState;
-static SelfState g_self = {0, 204800, 1413120, 0x2, 0x280, 0, 0, {{0}}, 5, 0, 0, 0, 0, {0}, 0, 0x80000000u};
-static void self_lock(void) { while (__sync_lock_test_and_set(&g_self.lock, 1)) { while (g_self.lock) __asm__ volatile("pause"); } }
-static void self_unlock(void) { __sync_lock_release(&g_self.lock); }
+static SelfState g_self = {{0}, 204800, 1413120, 0x2, 0x280, 0, 0, {{0}}, 5, 0, 0, 0, 0, {0}, 0, 0x80000000u};
+static void self_lock(void) { RtlAcquireSRWLockExclusive(&g_self.lock); }
+static void self_unlock(void) { RtlReleaseSRWLockExclusive(&g_self.lock); }
 /* TRUE if `process` is a handle to a process; *self says whether it is this one. */
 static BOOL process_handle_is(HANDLE process, BOOL *self) {
   if (process == NtCurrentProcess() || process == (HANDLE)(LONG_PTR)0) { *self = TRUE; return TRUE; }
@@ -592,7 +594,7 @@ EXPORT BOOL WINAPI SetProcessInformation(HANDLE process, int klass, LPVOID infor
 /* Threads: ideal processor, memory priority, power throttling, selected CPU sets. */
 typedef struct { DWORD id; BYTE ideal; BYTE cpu_set_count; BYTE has_ideal; BYTE pad; DWORD memory_priority, absolute_cpu_priority, dynamic_code, throttle_control, throttle_state; DWORD cpu_sets[16]; } ThreadSettings;
 static ThreadSettings g_thread_settings[64];
-static volatile LONG g_thread_settings_lock;
+static SRWLOCK g_thread_settings_lock = {0};      /* (SRWLOCK_INIT) */
 static ThreadSettings *thread_settings(HANDLE thread) {      /* (with the lock held) */
   const DWORD id = GetThreadId(thread);
   if (!id) return NULL;
@@ -607,8 +609,8 @@ static ThreadSettings *thread_settings(HANDLE thread) {      /* (with the lock h
   free_slot->memory_priority = 5;
   return free_slot;
 }
-static void thread_settings_lock(void) { while (__sync_lock_test_and_set(&g_thread_settings_lock, 1)) { while (g_thread_settings_lock) __asm__ volatile("pause"); } }
-static void thread_settings_unlock(void) { __sync_lock_release(&g_thread_settings_lock); }
+static void thread_settings_lock(void) { RtlAcquireSRWLockExclusive(&g_thread_settings_lock); }
+static void thread_settings_unlock(void) { RtlReleaseSRWLockExclusive(&g_thread_settings_lock); }
 static BOOL thread_information(HANDLE thread, int klass, LPVOID information, DWORD size, BOOL set) {
   DWORD expected;
   if (!information) { set_error(ERROR_NOACCESS); return FALSE; }
@@ -1177,9 +1179,9 @@ EXPORT BOOL WINAPI DnsHostnameToComputerNameA(LPCSTR host, LPSTR name, LPDWORD s
 typedef struct { WCHAR exe[64]; WCHAR source[64]; WCHAR target[256]; } ConsoleAlias;
 static ConsoleAlias g_aliases[64];
 static DWORD g_history_commands = 50, g_history_mode;
-static volatile LONG g_alias_lock;
-static void alias_lock(void) { while (__sync_lock_test_and_set(&g_alias_lock, 1)) { while (g_alias_lock) __asm__ volatile("pause"); } }
-static void alias_unlock(void) { __sync_lock_release(&g_alias_lock); }
+static SRWLOCK g_alias_lock = {0};      /* (SRWLOCK_INIT) */
+static void alias_lock(void) { RtlAcquireSRWLockExclusive(&g_alias_lock); }
+static void alias_unlock(void) { RtlReleaseSRWLockExclusive(&g_alias_lock); }
 static BOOL alias_match(const WCHAR *a, const WCHAR *b) { return equals_ignore_case(a, b); }
 EXPORT BOOL WINAPI AddConsoleAliasW(LPWSTR source, LPWSTR target, LPWSTR exe) {
   if (!source || !*source || !exe || !*exe || wcslen(source) >= 64 || wcslen(exe) >= 64 || (target && wcslen(target) >= 256)) { set_error(ERROR_INVALID_PARAMETER); return FALSE; }
@@ -2351,3 +2353,72 @@ EXPORT BOOL WINAPI CreateProcessInternalA(HANDLE token, LPCSTR application, LPST
   if (token) { set_error(ERROR_NOT_SUPPORTED); return FALSE; }
   return CreateProcessA(application, command_line, process_attributes, thread_attributes, inherit, flags, environment, directory, startup, information);
 }
+
+/* ---- AppContainer profiles (kernelbase.dll is this library): the name (moniker) of an AppContainer is kept by its SID in the user's registry, under
+ * Software\Classes\Local Settings\...\AppContainer\Mappings\<SID>, as on Windows. Chrome's sandbox registers its AppContainer profile there the first time a
+ * user-data folder is used (and stops with a CHECK when these functions are missing). ---- */
+IMPORT NTSTATUS NTAPI RtlConvertSidToUnicodeString(UNICODE_STRING *out, void *sid, BOOLEAN allocate);
+typedef LONG (WINAPI *AcRegDeleteKey)(HANDLE, LPCWSTR);
+#define AC_KEY_READ 0x20019u
+#define AC_KEY_ALL_ACCESS 0xF003Fu
+#define AC_REG_SZ 1u
+#define AC_RRF_RT_REG_SZ 0x2u
+#define AC_S_OK 0L
+#define AC_E_FAIL ((LONG)0x80004005)
+#define AC_E_INVALIDARG ((LONG)0x80070057)
+#define AC_E_OUTOFMEMORY ((LONG)0x8007000E)
+#define AC_HRESULT_FROM_WIN32(e) ((LONG)((e) <= 0 ? (DWORD)(e) : (((DWORD)(e) & 0x0000FFFFu) | 0x80070000u)))
+static BOOL appcontainer_key(void *sid, WCHAR *out, DWORD capacity) {
+  static const char prefix[] = "Software\\Classes\\Local Settings\\Software\\Microsoft\\Windows\\CurrentVersion\\AppContainer\\Mappings\\";
+  WCHAR text[192];
+  UNICODE_STRING s = {0, sizeof(text), text};
+  if (!sid || !NT_SUCCESS(RtlConvertSidToUnicodeString(&s, sid, FALSE))) return FALSE;
+  DWORD n = 0;
+  for (const char *p = prefix; *p; ++p) { if (n + 1 >= capacity) return FALSE; out[n++] = (WCHAR)*p; }
+  for (USHORT i = 0; i < s.Length / sizeof(WCHAR); ++i) { if (n + 1 >= capacity) return FALSE; out[n++] = s.Buffer[i]; }
+  out[n] = 0;
+  return TRUE;
+}
+static DWORD appcontainer_string_bytes(LPCWSTR s) { DWORD n = 0; while (s[n]) ++n; return (n + 1) * sizeof(WCHAR); }
+EXPORT LONG WINAPI AppContainerRegisterSid(void *sid, LPCWSTR moniker, LPCWSTR display_name) {
+  WCHAR path[320];
+  if (!moniker || !appcontainer_key(sid, path, 320)) return AC_E_INVALIDARG;
+  if (!prof_reg_load()) return AC_E_FAIL;
+  HANDLE key = NULL;
+  if (g_prof_reg.open(PROF_HKCU, path, 0, AC_KEY_READ, &key) == ERROR_SUCCESS) {      /* (registered before: the caller uses what is there) */
+    g_prof_reg.close(key);
+    return AC_HRESULT_FROM_WIN32(ERROR_ALREADY_EXISTS);
+  }
+  const LONG made = g_prof_reg.create(PROF_HKCU, path, 0, NULL, 0, AC_KEY_ALL_ACCESS, NULL, &key, NULL);
+  if (made != ERROR_SUCCESS) return AC_HRESULT_FROM_WIN32(made);
+  LONG r = g_prof_reg.set_value(key, L"Moniker", 0, AC_REG_SZ, (const BYTE *)moniker, appcontainer_string_bytes(moniker));
+  if (r == ERROR_SUCCESS && display_name) r = g_prof_reg.set_value(key, L"DisplayName", 0, AC_REG_SZ, (const BYTE *)display_name, appcontainer_string_bytes(display_name));
+  g_prof_reg.close(key);
+  return AC_HRESULT_FROM_WIN32(r);
+}
+EXPORT LONG WINAPI AppContainerUnregisterSid(void *sid) {
+  WCHAR path[320];
+  if (!appcontainer_key(sid, path, 320)) return AC_E_INVALIDARG;
+  static const WCHAR advapi[] = {'a', 'd', 'v', 'a', 'p', 'i', '3', '2', '.', 'd', 'l', 'l', 0};
+  HMODULE m = LoadLibraryW(advapi);
+  AcRegDeleteKey delete_key = m ? (AcRegDeleteKey)GetProcAddress(m, "RegDeleteKeyW") : NULL;
+  if (!delete_key) return AC_E_FAIL;
+  return AC_HRESULT_FROM_WIN32(delete_key(PROF_HKCU, path));
+}
+EXPORT LONG WINAPI AppContainerLookupMoniker(void *sid, LPWSTR *moniker) {
+  WCHAR path[320], value[256];
+  if (!moniker) return AC_E_INVALIDARG;
+  *moniker = NULL;
+  if (!appcontainer_key(sid, path, 320)) return AC_E_INVALIDARG;
+  if (!prof_reg_load()) return AC_E_FAIL;
+  DWORD bytes = sizeof(value), type = 0;
+  const LONG r = g_prof_reg.get_value(PROF_HKCU, path, L"Moniker", AC_RRF_RT_REG_SZ, &type, value, &bytes);
+  if (r != ERROR_SUCCESS) return AC_HRESULT_FROM_WIN32(r);
+  WCHAR *copy = LocalAlloc(0, bytes + sizeof(WCHAR));
+  if (!copy) return AC_E_OUTOFMEMORY;
+  memcpy(copy, value, bytes);
+  copy[bytes / sizeof(WCHAR)] = 0;
+  *moniker = copy;
+  return AC_S_OK;
+}
+EXPORT void WINAPI AppContainerFreeMemory(void *memory) { if (memory) LocalFree(memory); }

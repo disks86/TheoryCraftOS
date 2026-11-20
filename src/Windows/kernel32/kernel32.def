@@ -27,3 +27,7 @@ RtlMoveMemory = ntdll.RtlMoveMemory
 RtlFillMemory = ntdll.RtlFillMemory
 RtlZeroMemory = ntdll.RtlZeroMemory
 RtlCompareMemory = ntdll.RtlCompareMemory
+AppContainerRegisterSid
+AppContainerUnregisterSid
+AppContainerLookupMoniker
+AppContainerFreeMemory
