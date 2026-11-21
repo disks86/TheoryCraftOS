@@ -58,6 +58,7 @@ class SingleFileProvider final : public ILibraryProvider {
     return fallback_ && fallback_->find_32bit(canonical_name, image);
   }
   bool directory_of(StringView canonical_name, String* windows_directory) override { return !canonical_name.equals(name_) && fallback_ && fallback_->directory_of(canonical_name, windows_directory); }
+  bool has_own_copy(StringView file_name, bool wow) override { return fallback_ && fallback_->has_own_copy(file_name, wow); }
 
  private:
   StringView name_;

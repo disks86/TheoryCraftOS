@@ -41,6 +41,9 @@ class ILibraryProvider {
   virtual bool find_32bit(StringView canonical_name, ConstByteView* image) { (void)canonical_name; (void)image; return false; }
   // The Windows folder the library found by find() came from ("C:\\Program Files\\App\\", with the backslash at the end), if not System32. False: System32.
   virtual bool directory_of(StringView canonical_name, String* windows_directory) { (void)canonical_name; (void)windows_directory; return false; }
+  // Did the program bring this library itself: a file of that name (lower case, "msvcr100.dll") in its own folders, not System32 or SysWOW64? A C runtime
+  // it brought is loaded instead of being folded into msvcrt.dll (see ModuleSet::library_name()).
+  virtual bool has_own_copy(StringView file_name, bool wow) { (void)file_name; (void)wow; return false; }
 
  protected:
   ILibraryProvider() = default;
@@ -50,6 +53,11 @@ class ILibraryProvider {
 // The name a library is known by here: lower case, ".dll" added if there is no extension, and the aliases folded: the API-set names ("api-ms-win-core-file-l1-1-0.dll"
 // and the like) and "kernelbase.dll" are kernel32.dll, which implements all of those. False if the name is empty or too long.
 bool canonical_library_name(StringView name, String* out);
+// The name as it is, made canonical only in its form: lower case, the file name of a path, ".dll" added. False if it is empty or too long.
+bool plain_library_name(StringView name, String* out);
+// A C runtime of one Visual C++ version (msvcr100.dll, msvcp120.dll, vcruntime140.dll ...): one canonical_library_name() folds into msvcrt.dll unless the
+// program brings its own copy.
+bool is_versioned_runtime(StringView plain_name);
 
 // Tries one provider, then the next.
 class ChainedLibraryProvider final : public ILibraryProvider {
@@ -63,6 +71,9 @@ class ChainedLibraryProvider final : public ILibraryProvider {
   bool directory_of(StringView canonical_name, String* windows_directory) override {
     ILibraryProvider* from = from_first_ ? first_ : second_;
     return from && from->directory_of(canonical_name, windows_directory);
+  }
+  bool has_own_copy(StringView file_name, bool wow) override {
+    return (first_ && first_->has_own_copy(file_name, wow)) || (second_ && second_->has_own_copy(file_name, wow));
   }
 
  private:
@@ -89,6 +100,7 @@ class FileLibraryProvider final : public ILibraryProvider {
   bool find(StringView canonical_name, ConstByteView* image) override;
   bool find_32bit(StringView canonical_name, ConstByteView* image) override;
   bool directory_of(StringView canonical_name, String* windows_directory) override;
+  bool has_own_copy(StringView file_name, bool wow) override;
   // A folder of the OS file system ("/Windows/Program Files/App") to look in before System32.
   bool add_directory(StringView directory);
   // The program at `path` (OS file system) with the file `image`: its folder (add_directory), and the DLLs of the private assemblies its manifest
@@ -136,7 +148,7 @@ struct Module {
 // Everything loaded into one process, with the stubs that stand in for imports that nothing provides.
 class ModuleSet {
  public:
-  explicit ModuleSet(allocators::IAllocator& allocator) : allocator_(allocator), modules_(allocator), order_(allocator), missing_(allocator) {}
+  explicit ModuleSet(allocators::IAllocator& allocator) : allocator_(allocator), modules_(allocator), order_(allocator), missing_(allocator), own_runtimes_(allocator), folded_runtimes_(allocator) {}
   ModuleSet(const ModuleSet&) = delete;
   ModuleSet& operator=(const ModuleSet&) = delete;
 
@@ -156,12 +168,19 @@ class ModuleSet {
   // A call into an import that nothing provides lands on a stub; this says which import it was ("KERNEL32.dll!Foo"). False if `address` is in no stub.
   bool describe_missing(uint64_t address, String* out) const;
   uint64_t missing_count() const { return missing_.count(); }
+  // The name a library is known by in this process: canonical_library_name(), except that a C runtime the program brought itself ("msvcr100.dll" in its
+  // folder, as Unigine Heaven has) keeps its own name and is that file, as on Windows, where the program's folder is searched first and these are not
+  // known DLLs. Which runtimes those are is decided when the program's imports are first seen (own_runtimes_). False if the name is empty or too long.
+  bool library_name(StringView name, String* out) const;
+  bool owns_runtime(StringView plain_name) const;
 
  // (Filled in by load_windows_modules(); not for anyone else to change.)
   allocators::IAllocator& allocator_;
   List<UniquePointer<Module>> modules_;
   List<Module*> order_;
   List<String> missing_;
+  List<String> own_runtimes_;      // plain names of the C runtimes the program brought ("msvcr100.dll")
+  List<String> folded_runtimes_;   // and of those it did not bring: msvcrt.dll stands for them
   uint64_t stub_base_ = 0;
 };
 

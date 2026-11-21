@@ -205,10 +205,11 @@ Windows side:
   - `Unigine.HeavenBenchmark` (a 32-bit Inno Setup program, 260 MB) with `KEEP=ON RUN=ON`: installed into `C:\Program Files\Unigine\Heaven
     Benchmark 4.0` (see What is not done for why not `Program Files (x86)`). Its Start menu entry is a shortcut to `heaven.bat`, listed as "Heaven
     Benchmark 4.0 (Windows)" and started as `cmd.exe /c "C:\...\heaven.bat"` (docs/WindowsUserMode.md, *The command interpreter*): the batch file
-    changes to `bin` and starts `browser_x86.exe` (32-bit), and cmd ends with 0. The launcher then stops: it imports `MSVCR100.dll`, which the loader
-    folds into the system's msvcrt.dll (src/Process/ModuleLoader.cpp) instead of the `msvcr100.dll` Heaven ships in `bin`, and that lacks
-    `_malloc_crt` and `__CppXcptFilter`; the first missing call raises an exception whose filter is the second, again and again, until the stack runs
-    out.
+    changes to `bin` and starts `browser_x86.exe` (32-bit), and cmd ends with 0. The launcher's window, "Unigine Heaven Benchmark 4.0 (Basic
+    Edition)", opens with its banner and stays up. Its web view is black and its two buttons have no labels, so no settings can be picked and the
+    benchmark has not been started yet. The first run stopped at once: the launcher imports `MSVCR100.dll`, which was folded into the system's
+    msvcrt.dll (missing `_malloc_crt` and `__CppXcptFilter`). Now the `msvcr100.dll` and `msvcp100.dll` that Heaven ships in `bin` are loaded
+    instead (docs/WindowsUserMode.md, *The C runtimes*).
 
   - `KeePassXCTeam.KeePassXC` (a Windows Installer package, 69 MB, an LZX cabinet): installed by this system's own engine, "KeePassXC (Windows)"
     in the Start menu, removed again with the kept package. Its first run found that the kernel's registry makes only the last key of a path;

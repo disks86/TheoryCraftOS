@@ -42,14 +42,22 @@ bool starts_with(StringView text, const char* prefix) {
 
 }  // namespace
 
-bool canonical_library_name(StringView name, String* out) {
+bool plain_library_name(StringView name, String* out) {
   out->clear();
   const uint64_t slash = name.rfind('\\'), slash2 = name.rfind('/');      // a library named with a path is known by its file name
   if (slash != StringView::npos) name = name.without_prefix(slash + 1);
   if (slash2 != StringView::npos && name.rfind('/') != StringView::npos) name = name.without_prefix(name.rfind('/') + 1);
   if (name.empty() || name.size() > 100) return false;
   for (char c : name) if (!out->push_back(lower(c))) return false;
-  if (out->view().rfind('.') == StringView::npos && !out->append(".dll")) return false;
+  return out->view().rfind('.') != StringView::npos || out->append(".dll");
+}
+
+bool is_versioned_runtime(StringView plain_name) {
+  return (starts_with(plain_name, "msvcr") || starts_with(plain_name, "msvcp") || starts_with(plain_name, "vcruntime")) && !plain_name.equals("msvcrt.dll");
+}
+
+bool canonical_library_name(StringView name, String* out) {
+  if (!plain_library_name(name, out)) return false;
   const StringView text = out->view();
   // The API sets of other libraries than kernel32 (checked first: the WinRT ones start with api-ms-win-core- too).
   if (starts_with(text, "api-ms-win-core-winrt-")) return out->assign("combase.dll");
@@ -288,6 +296,20 @@ bool FileLibraryProvider::find_32bit(StringView canonical_name, ConstByteView* i
   return path.assign("/Windows/Windows/SysWOW64/") && path.append(canonical_name) && load(path.view(), key.view(), image);
 }
 
+bool FileLibraryProvider::has_own_copy(StringView file_name, bool wow) {
+  (void)wow;      // (a program's folder holds the libraries of its own kind)
+  kernel::ScopedMutex hold(lock_);
+  if (!files_ || file_name.empty() || file_name.contains('/') || file_name.contains('\\')) return false;
+  String path(allocator_);
+  for (const String& directory : directories_.view()) {
+    const StringView d = directory.view();
+    if (d.equals("/Windows/Windows/System32/") || d.equals("/Windows/Windows/SysWOW64/")) continue;      // (the system's are not the program's)
+    filesystem::DirectoryEntry entry;
+    if (path.assign(d) && path.append(file_name) && files_->stat(path.view(), &entry) == filesystem::Status::Ok && entry.type == filesystem::NodeType::File) return true;
+  }
+  return false;
+}
+
 bool FileLibraryProvider::directory_of(StringView canonical_name, String* windows_directory) {
   kernel::ScopedMutex hold(lock_);
   for (Entry* e = entries_; e; e = e->next) {
@@ -339,6 +361,19 @@ void ModuleSet::drop_from(AddressSpace& space, uint64_t first) {
   }
 }
 
+bool ModuleSet::owns_runtime(StringView plain_name) const {
+  for (const String& own : own_runtimes_.view()) if (own.view().equals(plain_name)) return true;
+  return false;
+}
+
+bool ModuleSet::library_name(StringView name, String* out) const {
+  if (!canonical_library_name(name, out)) return false;
+  if (own_runtimes_.count() == 0 || !out->view().equals("msvcrt.dll")) return true;
+  String plain(allocator_);
+  if (!plain_library_name(name, &plain)) return false;
+  return !owns_runtime(plain.view()) || out->assign(plain.view());
+}
+
 Module* ModuleSet::find(StringView canonical_name) const {
   for (const UniquePointer<Module>& m : modules_.view()) if (!m->doomed && m->name.view().equals(canonical_name)) return m.get();
   return nullptr;
@@ -361,6 +396,18 @@ struct Context {
   bool allow_program = false;      // the library asked for by name may be a program image (it is then only mapped)
   bool bind = true;      // false: only the library itself is mapped (no imports, no dependencies)
 };
+
+// An import of a versioned C runtime that the program brought (a file of that name in its own folders) makes that runtime the process's own: from then
+// on the name is that file, not msvcrt.dll. Decided once per name, the first time it is seen and before anything is bound to it; a name that was
+// folded once stays folded (what was bound to msvcrt.dll for it stays right). False if memory ran out.
+bool note_own_runtime(Context& c, StringView imported) {
+  String plain(c.allocator);
+  if (!plain_library_name(imported, &plain) || !is_versioned_runtime(plain.view())) return true;
+  if (c.set.owns_runtime(plain.view())) return true;
+  for (const String& folded : c.set.folded_runtimes_.view()) if (folded.view().equals(plain.view())) return true;
+  if (c.provider.has_own_copy(plain.view(), c.space.is_32bit())) return c.set.own_runtimes_.push_back(static_cast<String&&>(plain));
+  return c.set.folded_runtimes_.push_back(static_cast<String&&>(plain));
+}
 
 }  // namespace
 
@@ -556,7 +603,8 @@ LoadStatus ensure_loaded(Context& c, StringView canonical, uint32_t depth, Modul
   // Its own dependencies: imported libraries, and the libraries its forwarded exports name.
   String name(c.allocator);
   for (const exe::PeImport& imp : raw->pe->imports().view()) {
-    if (!canonical_library_name(imp.dll.view(), &name)) continue;
+    if (!note_own_runtime(c, imp.dll.view())) return LoadStatus::OutOfMemory;
+    if (!c.set.library_name(imp.dll.view(), &name)) continue;
     Module* dependency = nullptr;
     status = ensure_loaded(c, name.view(), depth + 1, &dependency);
     if (status != LoadStatus::Ok) return status;
@@ -564,7 +612,7 @@ LoadStatus ensure_loaded(Context& c, StringView canonical, uint32_t depth, Modul
   for (const exe::PeExport& e : raw->pe->exports().view()) {
     if (e.forwarder.empty()) continue;
     const uint64_t dot = e.forwarder.view().find('.');
-    if (dot == StringView::npos || !canonical_library_name(e.forwarder.view().first(dot), &name)) continue;
+    if (dot == StringView::npos || !note_own_runtime(c, e.forwarder.view().first(dot)) || !c.set.library_name(e.forwarder.view().first(dot), &name)) continue;
     Module* dependency = nullptr;
     status = ensure_loaded(c, name.view(), depth + 1, &dependency);
     if (status != LoadStatus::Ok) return status;
@@ -584,7 +632,7 @@ uint64_t resolve_export(const ModuleSet& set, const Module& module, StringView n
   const uint64_t dot = forward.find('.');
   if (dot == StringView::npos) return 0;
   String library(allocator);
-  if (!canonical_library_name(forward.first(dot), &library)) return 0;
+  if (!set.library_name(forward.first(dot), &library)) return 0;
   const Module* target = set.find(library.view());
   if (!target || target == &module) return 0;
   const StringView function = forward.without_prefix(dot + 1);
@@ -621,7 +669,7 @@ LoadStatus bind_imports(Context& c, Module& module) {
   String library(c.allocator);
   for (const exe::PeImport& imp : module.pe->imports().view()) {
     uint64_t address = 0;
-    if (canonical_library_name(imp.dll.view(), &library)) {
+    if (c.set.library_name(imp.dll.view(), &library)) {
       if (const Module* target = c.set.find(library.view())) address = resolve_export(c.set, *target, imp.name.view(), imp.by_ordinal, imp.ordinal, 0, c.allocator);
     }
     if (address == 0) {
@@ -661,7 +709,7 @@ void order(Context& c, Module& module, uint32_t depth) {
   module.visit = 1;      // (also what ends a cycle)
   String name(c.allocator);
   for (const exe::PeImport& imp : module.pe->imports().view()) {
-    if (!canonical_library_name(imp.dll.view(), &name)) continue;
+    if (!c.set.library_name(imp.dll.view(), &name)) continue;
     if (Module* dependency = c.set.find(name.view())) order(c, *dependency, depth + 1);
   }
   if (!module.main) c.set.order_.push_back(&module);
@@ -674,7 +722,7 @@ namespace {
 void dependencies_of(const ModuleSet& set, const Module& module, allocators::IAllocator& allocator, List<Module*>* out) {
   String name(allocator);
   for (const exe::PeImport& imp : module.pe->imports().view()) {
-    if (!canonical_library_name(imp.dll.view(), &name)) continue;
+    if (!set.library_name(imp.dll.view(), &name)) continue;
     if (Module* d = set.find(name.view())) out->push_back(d);
   }
   for (Module* d : module.forward_deps.view()) out->push_back(d);      // (a forwarded export is no dependency until it is resolved: see link_libraries)
@@ -726,7 +774,7 @@ LoadStatus load_additional_library(AddressSpace& space, allocators::IAllocator& 
       if (m.no_bind) continue;
       // Resolving an import through a forwarder makes the libraries on the way dependencies of the one that forwards; a forwarder to a library that was loaded for it does too.
       for (const exe::PeImport& imp : m.pe->imports().view()) {
-        if (!canonical_library_name(imp.dll.view(), &name)) continue;
+        if (!set->library_name(imp.dll.view(), &name)) continue;
         const Module* target = set->find(name.view());
         if (!target) continue;
         List<Module*> hops(allocator);
@@ -736,7 +784,7 @@ LoadStatus load_additional_library(AddressSpace& space, allocators::IAllocator& 
       for (const exe::PeExport& e : m.pe->exports().view()) {
         if (e.forwarder.empty()) continue;
         const uint64_t dot = e.forwarder.view().find('.');
-        if (dot == StringView::npos || !canonical_library_name(e.forwarder.view().first(dot), &name)) continue;
+        if (dot == StringView::npos || !set->library_name(e.forwarder.view().first(dot), &name)) continue;
         Module* d = set->find(name.view());
         bool added_now = false;
         for (uint64_t k = first; d && k < set->count(); ++k) if (set->modules_[k].get() == d) added_now = true;
@@ -787,7 +835,7 @@ bool unload_library(AddressSpace& space, ModuleSet* set, uint64_t base) {
 
 uint64_t ModuleSet::export_address(StringView module, StringView function) const {
   String name(allocator_);
-  if (!canonical_library_name(module, &name)) return 0;
+  if (!library_name(module, &name)) return 0;
   const Module* m = find(name.view());
   return m ? resolve_export(*this, *m, function, false, 0, 0, allocator_) : 0;
 }
@@ -809,7 +857,8 @@ LoadStatus load_windows_modules(AddressSpace& space, allocators::IAllocator& all
   // Phase 1: everything that is imported, directly or not.
   String name(allocator);
   for (const exe::PeImport& imp : program.imports().view()) {
-    if (!canonical_library_name(imp.dll.view(), &name)) continue;
+    if (!note_own_runtime(c, imp.dll.view())) return LoadStatus::OutOfMemory;
+    if (!out->library_name(imp.dll.view(), &name)) continue;
     Module* dependency = nullptr;
     const LoadStatus status = ensure_loaded(c, name.view(), 1, &dependency);
     if (status != LoadStatus::Ok) return status;

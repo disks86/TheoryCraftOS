@@ -79,6 +79,11 @@ uint32_t nt_load_module(Process& p, const SyscallRequest& r) {
   const uint64_t slash = path.view().rfind('\\');
   String canonical(p.files().allocator());
   if (!canonical_library_name(slash == StringView::npos ? path.view() : path.view().without_prefix(slash + 1), &canonical)) return kInvalidParameter;
+  if (canonical.view().equals("msvcrt.dll")) {      // (a C runtime the program brought is that file, not msvcrt.dll: see ModuleSet::library_name())
+    String plain(p.files().allocator());
+    if (!plain_library_name(slash == StringView::npos ? path.view() : path.view().without_prefix(slash + 1), &plain)) return kInvalidParameter;
+    if (host->owns_runtime(plain.view()) && !canonical.assign(plain.view())) return kInvalidParameter;
+  }
   if ((flags & 4) != 0) {      // a library of an activation context (an assembly's own copy): known by its file as well as its name, so two files of one name are two libraries
     uint32_t hash = 2166136261u;
     for (char c : path.view()) hash = (hash ^ uint8_t(c >= 'A' && c <= 'Z' ? c + 32 : c)) * 16777619u;

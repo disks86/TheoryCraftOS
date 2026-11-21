@@ -158,6 +158,16 @@ steps) instead of `QueryPerformanceCounter`; both are user mode now.
 | `NtReleaseModule` | 52 |
 | `NtUnloadModule` | 51 |
 
+**The C runtimes.** Every C runtime name (`msvcr*`, `msvcp*`, `vcruntime*`, `ucrtbase`, the `api-ms-win-crt-*` sets) is this system's `msvcrt.dll`
+(`canonical_library_name`, src/Process/ModuleLoader.cpp), which exports the classic and the Universal CRT's names, so that a program finds a runtime
+without a Visual C++ redistributable. A program that **brings its own versioned runtime** (a file such as `msvcr100.dll` or `msvcp100.dll` in its own
+folder, as Unigine Heaven does) gets that file instead, under its own name, as on Windows, where the program's folder is searched first and these are not
+known DLLs. Their imports are only kernel32 functions, which are implemented. The choice is made per process and per name the first time an import of
+it is seen (`ModuleSet::library_name`, `own_runtimes_`). A name folded once stays folded, so nothing bound to `msvcrt.dll` changes later.
+`NtLoadModule` asks the same (`IModuleHost::owns_runtime`). Not covered: an app-local Universal CRT (`ucrtbase.dll` with its `api-ms-win-crt-*`
+forwarders), and a runtime the program first loads by `LoadLibrary` without having imported it (that one is folded). Test: `ModuleLoaderTest`
+(`test_own_runtimes`).
+
 ## The registry and advapi32.dll
 
 The registry is the kernel's (`src/Process/RegistryTree.cpp`, `WindowsRegistry.cpp`): one tree in memory shared by every program, reached by the NT services `NtCreateKey`,

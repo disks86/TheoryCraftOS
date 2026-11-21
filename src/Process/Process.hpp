@@ -88,6 +88,8 @@ class IModuleHost {
   virtual bool reference_module(StringView canonical_name, uint64_t* base) = 0;
   // The canonical name of the library whose image holds `address`; false if there is none.
   virtual bool module_name_at(uint64_t address, char (&name)[40]) const { (void)address; (void)name; return false; }
+  // Did the program bring this C runtime itself ("msvcr100.dll", lower case), so that the name is that file here and not msvcrt.dll (ModuleSet::library_name())?
+  virtual bool owns_runtime(StringView plain_name) const { (void)plain_name; return false; }
   // FreeLibrary: one use less. The libraries that nobody uses any more are listed in `out` (at most `capacity`) in the order their entry points have to be called with
   // DLL_PROCESS_DETACH; they stay mapped until unload_module(). Returns an NTSTATUS.
   virtual uint32_t release_module(uint64_t base, LoadedModule* out, uint32_t capacity, uint32_t* count) = 0;

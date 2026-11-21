@@ -177,7 +177,12 @@ static Built build(const Spec& spec) {
 
 struct Provider final : ILibraryProvider {
   std::map<std::string, Bytes> libraries;
+  std::vector<std::string> own;      // the files the program brought (its own folder), by plain name
   std::vector<std::string> asked;
+  bool has_own_copy(StringView name, bool) override {
+    for (auto& o : own) if (o == std::string(name.data(), name.size())) return true;
+    return false;
+  }
   bool find(StringView name, ConstByteView* image) override {
     const std::string n(name.data(), name.size());
     asked.push_back(n);
@@ -420,6 +425,63 @@ static void write_file(filesystem::IFileSystem& fs, const char* path, const Byte
 static void write_file(filesystem::IFileSystem& fs, const char* path, const std::string& text) { write_file(fs, path, Bytes(text.begin(), text.end())); }
 
 // Side-by-side manifests: a program's private assemblies (Chrome: chrome.exe -> "<version>\\<version>.manifest" -> chrome_elf.dll in that folder).
+// A C runtime the program brought (Unigine Heaven has msvcr100.dll and msvcp100.dll in its folder) is that file, under its own name; one it did not bring is
+// msvcrt.dll, as before. The program's imports, a library's imports (msvcp100 -> MSVCR100) and names looked up later all agree.
+static void test_own_runtimes() {
+  auto run = [](bool brought) {
+    Provider provider;
+    Spec msvcrt; msvcrt.dll_name = "msvcrt.dll"; msvcrt.exports = {{"malloc", ""}, {"free", ""}};
+    Spec r100; r100.dll_name = "msvcr100.dll"; r100.base = 0x10000000ull; r100.exports = {{"malloc", ""}, {"_malloc_crt", ""}};
+    Spec p100; p100.dll_name = "msvcp100.dll"; p100.base = 0x10100000ull; p100.exports = {{"?_Xlength_error@std@@YAXPBD@Z", ""}};
+    p100.imports = {{"MSVCR100.dll", "_malloc_crt"}};
+    provider.libraries["msvcrt.dll"] = build(msvcrt).bytes;
+    provider.libraries["msvcr100.dll"] = build(r100).bytes;
+    provider.libraries["msvcp100.dll"] = build(p100).bytes;
+    if (brought) provider.own = {"msvcr100.dll", "msvcp100.dll"};
+    Spec program;
+    program.dll = false;
+    program.base = 0x140000000ull;
+    program.imports = {{"MSVCR100.dll", "malloc"}, {"MSVCP100.dll", "?_Xlength_error@std@@YAXPBD@Z"}, {"msvcr120.dll", "free"}};
+    const Built exe = build(program);
+    exe::PeFile pe(A);
+    CHECK(pe.parse(ConstByteView(exe.bytes.data(), exe.bytes.size())));
+    AddressSpace space(A);
+    LoadedImage image;
+    CHECK(load_pe(pe, ConstByteView(exe.bytes.data(), exe.bytes.size()), space, &image) == LoadStatus::Ok);
+    ModuleSet set(A);
+    String detail(A);
+    CHECK(load_windows_modules(space, A, pe, ConstByteView(exe.bytes.data(), exe.bytes.size()), "browser_x86.exe", provider, &set, &detail) == LoadStatus::Ok);
+    const Module* crt = set.find("msvcrt.dll");
+    const Module* own_r = set.find("msvcr100.dll");
+    const Module* own_p = set.find("msvcp100.dll");
+    CHECK(crt != nullptr);      // (msvcr120.dll was not brought: it is msvcrt.dll either way)
+    String name(A);
+    if (brought) {
+      CHECK(set.count() == 4 && own_r && own_p && set.owns_runtime("msvcr100.dll") && !set.owns_runtime("msvcr120.dll"));
+      CHECK(own_r && u64_at(space, 0x140000000ull + exe.slots[0]) == own_r->base + 0x1010);           // malloc from the program's msvcr100.dll
+      CHECK(own_p && u64_at(space, 0x140000000ull + exe.slots[1]) == own_p->base + 0x1010);
+      CHECK(crt && u64_at(space, 0x140000000ull + exe.slots[2]) == crt->base + 0x1020);               // free from msvcrt.dll (msvcr120)
+      CHECK(set.export_address("MSVCR100", "_malloc_crt") == own_r->base + 0x1020);                   // a later lookup by the name
+      CHECK(set.library_name("C:\\App\\MsVcR100.DLL", &name) && str(name.view()) == "msvcr100.dll");
+      CHECK(set.library_name("msvcr120.dll", &name) && str(name.view()) == "msvcrt.dll");
+      // msvcp100.dll's own import of MSVCR100 is the program's msvcr100.dll too, and msvcr100 starts first
+      bool ordered = false;
+      for (uint64_t i = 0; i < set.init_count(); ++i) if (set.init_at(i).name.view().equals("msvcr100.dll")) { ordered = true; break; } else if (set.init_at(i).name.view().equals("msvcp100.dll")) break;
+      CHECK(ordered);
+    } else {
+      CHECK(set.count() == 2 && !own_r && !own_p && !set.owns_runtime("msvcr100.dll"));
+      CHECK(crt && u64_at(space, 0x140000000ull + exe.slots[0]) == crt->base + 0x1010);
+      CHECK(set.missing_count() == 1);      // (msvcrt.dll has no ?_Xlength_error: a stub, as before)
+      CHECK(set.library_name("MSVCR100.dll", &name) && str(name.view()) == "msvcrt.dll");
+    }
+  };
+  run(true);
+  run(false);
+  String plain(A);
+  CHECK(plain_library_name("C:\\x\\MSVCP100", &plain) && str(plain.view()) == "msvcp100.dll");
+  CHECK(is_versioned_runtime("msvcr100.dll") && is_versioned_runtime("vcruntime140.dll") && !is_versioned_runtime("msvcrt.dll") && !is_versioned_runtime("ucrtbase.dll"));
+}
+
 static void test_private_assemblies() {
   const std::string program_manifest =
       "<?xml version='1.0' encoding='UTF-8' standalone='yes'?>\n<assembly xmlns='urn:schemas-microsoft-com:asm.v1' manifestVersion='1.0'>\n"
@@ -558,6 +620,7 @@ int main() {
   test_names();
   test_private_assemblies();
   test_load();
+  test_own_runtimes();
   test_failures();
   test_shared_images();
   test_image_file_cache();
