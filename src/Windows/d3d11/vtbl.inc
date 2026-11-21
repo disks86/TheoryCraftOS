@@ -2,18 +2,18 @@
 static HRESULT STDMETHODCALLTYPE dev_vtbl_checked_CreateBuffer(ID3D11Device *This, const D3D11_BUFFER_DESC *pDesc, const D3D11_SUBRESOURCE_DATA *pInitialData, ID3D11Buffer **ppBuffer) { const HRESULT hr = dev_CreateBuffer((void *)This, pDesc, pInitialData, ppBuffer); if (FAILED(hr)) { static volatile LONG said; dx_failed(&said, "ID3D11Device::CreateBuffer", hr); } return hr; }
 static HRESULT STDMETHODCALLTYPE dev_vtbl_none_CreateTexture1D(ID3D11Device *This, const D3D11_TEXTURE1D_DESC *pDesc, const D3D11_SUBRESOURCE_DATA *pInitialData, ID3D11Texture1D **ppTexture1D) { static volatile LONG said; dx_unimplemented(&said, "ID3D11Device::CreateTexture1D"); return E_NOTIMPL; }
 static HRESULT STDMETHODCALLTYPE dev_vtbl_checked_CreateTexture2D(ID3D11Device *This, const D3D11_TEXTURE2D_DESC *pDesc, const D3D11_SUBRESOURCE_DATA *pInitialData, ID3D11Texture2D **ppTexture2D) { const HRESULT hr = dev_CreateTexture2D((void *)This, pDesc, pInitialData, ppTexture2D); if (FAILED(hr)) { static volatile LONG said; dx_failed(&said, "ID3D11Device::CreateTexture2D", hr); } return hr; }
-static HRESULT STDMETHODCALLTYPE dev_vtbl_none_CreateTexture3D(ID3D11Device *This, const D3D11_TEXTURE3D_DESC *pDesc, const D3D11_SUBRESOURCE_DATA *pInitialData, ID3D11Texture3D **ppTexture3D) { static volatile LONG said; dx_unimplemented(&said, "ID3D11Device::CreateTexture3D"); return E_NOTIMPL; }
+static HRESULT STDMETHODCALLTYPE dev_vtbl_checked_CreateTexture3D(ID3D11Device *This, const D3D11_TEXTURE3D_DESC *pDesc, const D3D11_SUBRESOURCE_DATA *pInitialData, ID3D11Texture3D **ppTexture3D) { const HRESULT hr = dev_CreateTexture3D((void *)This, pDesc, pInitialData, ppTexture3D); if (FAILED(hr)) { static volatile LONG said; dx_failed(&said, "ID3D11Device::CreateTexture3D", hr); } return hr; }
 static HRESULT STDMETHODCALLTYPE dev_vtbl_checked_CreateShaderResourceView(ID3D11Device *This, ID3D11Resource *pResource, const D3D11_SHADER_RESOURCE_VIEW_DESC *pDesc, ID3D11ShaderResourceView **ppSRView) { const HRESULT hr = dev_CreateShaderResourceView((void *)This, pResource, pDesc, ppSRView); if (FAILED(hr)) { static volatile LONG said; dx_failed(&said, "ID3D11Device::CreateShaderResourceView", hr); } return hr; }
 static HRESULT STDMETHODCALLTYPE dev_vtbl_none_CreateUnorderedAccessView(ID3D11Device *This, ID3D11Resource *pResource, const D3D11_UNORDERED_ACCESS_VIEW_DESC *pDesc, ID3D11UnorderedAccessView **ppUAView) { static volatile LONG said; dx_unimplemented(&said, "ID3D11Device::CreateUnorderedAccessView"); return E_NOTIMPL; }
 static HRESULT STDMETHODCALLTYPE dev_vtbl_checked_CreateRenderTargetView(ID3D11Device *This, ID3D11Resource *pResource, const D3D11_RENDER_TARGET_VIEW_DESC *pDesc, ID3D11RenderTargetView **ppRTView) { const HRESULT hr = dev_CreateRenderTargetView((void *)This, pResource, pDesc, ppRTView); if (FAILED(hr)) { static volatile LONG said; dx_failed(&said, "ID3D11Device::CreateRenderTargetView", hr); } return hr; }
 static HRESULT STDMETHODCALLTYPE dev_vtbl_checked_CreateDepthStencilView(ID3D11Device *This, ID3D11Resource *pResource, const D3D11_DEPTH_STENCIL_VIEW_DESC *pDesc, ID3D11DepthStencilView **ppDepthStencilView) { const HRESULT hr = dev_CreateDepthStencilView((void *)This, pResource, pDesc, ppDepthStencilView); if (FAILED(hr)) { static volatile LONG said; dx_failed(&said, "ID3D11Device::CreateDepthStencilView", hr); } return hr; }
 static HRESULT STDMETHODCALLTYPE dev_vtbl_checked_CreateInputLayout(ID3D11Device *This, const D3D11_INPUT_ELEMENT_DESC *pInputElementDescs, UINT NumElements, const void *pShaderBytecodeWithInputSignature, SIZE_T BytecodeLength, ID3D11InputLayout **ppInputLayout) { const HRESULT hr = dev_CreateInputLayout((void *)This, pInputElementDescs, NumElements, pShaderBytecodeWithInputSignature, BytecodeLength, ppInputLayout); if (FAILED(hr)) { static volatile LONG said; dx_failed(&said, "ID3D11Device::CreateInputLayout", hr); } return hr; }
 static HRESULT STDMETHODCALLTYPE dev_vtbl_checked_CreateVertexShader(ID3D11Device *This, const void *pShaderBytecode, SIZE_T BytecodeLength, ID3D11ClassLinkage *pClassLinkage, ID3D11VertexShader **ppVertexShader) { const HRESULT hr = dev_CreateVertexShader((void *)This, pShaderBytecode, BytecodeLength, pClassLinkage, ppVertexShader); if (FAILED(hr)) { static volatile LONG said; dx_failed(&said, "ID3D11Device::CreateVertexShader", hr); } return hr; }
-static HRESULT STDMETHODCALLTYPE dev_vtbl_none_CreateGeometryShader(ID3D11Device *This, const void *pShaderBytecode, SIZE_T BytecodeLength, ID3D11ClassLinkage *pClassLinkage, ID3D11GeometryShader **ppGeometryShader) { static volatile LONG said; dx_unimplemented(&said, "ID3D11Device::CreateGeometryShader"); return E_NOTIMPL; }
+static HRESULT STDMETHODCALLTYPE dev_vtbl_checked_CreateGeometryShader(ID3D11Device *This, const void *pShaderBytecode, SIZE_T BytecodeLength, ID3D11ClassLinkage *pClassLinkage, ID3D11GeometryShader **ppGeometryShader) { const HRESULT hr = dev_CreateGeometryShader((void *)This, pShaderBytecode, BytecodeLength, pClassLinkage, ppGeometryShader); if (FAILED(hr)) { static volatile LONG said; dx_failed(&said, "ID3D11Device::CreateGeometryShader", hr); } return hr; }
 static HRESULT STDMETHODCALLTYPE dev_vtbl_none_CreateGeometryShaderWithStreamOutput(ID3D11Device *This, const void *pShaderBytecode, SIZE_T BytecodeLength, const D3D11_SO_DECLARATION_ENTRY *pSODeclaration, UINT NumEntries, const UINT *pBufferStrides, UINT NumStrides, UINT RasterizedStream, ID3D11ClassLinkage *pClassLinkage, ID3D11GeometryShader **ppGeometryShader) { static volatile LONG said; dx_unimplemented(&said, "ID3D11Device::CreateGeometryShaderWithStreamOutput"); return E_NOTIMPL; }
 static HRESULT STDMETHODCALLTYPE dev_vtbl_checked_CreatePixelShader(ID3D11Device *This, const void *pShaderBytecode, SIZE_T BytecodeLength, ID3D11ClassLinkage *pClassLinkage, ID3D11PixelShader **ppPixelShader) { const HRESULT hr = dev_CreatePixelShader((void *)This, pShaderBytecode, BytecodeLength, pClassLinkage, ppPixelShader); if (FAILED(hr)) { static volatile LONG said; dx_failed(&said, "ID3D11Device::CreatePixelShader", hr); } return hr; }
-static HRESULT STDMETHODCALLTYPE dev_vtbl_none_CreateHullShader(ID3D11Device *This, const void *pShaderBytecode, SIZE_T BytecodeLength, ID3D11ClassLinkage *pClassLinkage, ID3D11HullShader **ppHullShader) { static volatile LONG said; dx_unimplemented(&said, "ID3D11Device::CreateHullShader"); return E_NOTIMPL; }
-static HRESULT STDMETHODCALLTYPE dev_vtbl_none_CreateDomainShader(ID3D11Device *This, const void *pShaderBytecode, SIZE_T BytecodeLength, ID3D11ClassLinkage *pClassLinkage, ID3D11DomainShader **ppDomainShader) { static volatile LONG said; dx_unimplemented(&said, "ID3D11Device::CreateDomainShader"); return E_NOTIMPL; }
+static HRESULT STDMETHODCALLTYPE dev_vtbl_checked_CreateHullShader(ID3D11Device *This, const void *pShaderBytecode, SIZE_T BytecodeLength, ID3D11ClassLinkage *pClassLinkage, ID3D11HullShader **ppHullShader) { const HRESULT hr = dev_CreateHullShader((void *)This, pShaderBytecode, BytecodeLength, pClassLinkage, ppHullShader); if (FAILED(hr)) { static volatile LONG said; dx_failed(&said, "ID3D11Device::CreateHullShader", hr); } return hr; }
+static HRESULT STDMETHODCALLTYPE dev_vtbl_checked_CreateDomainShader(ID3D11Device *This, const void *pShaderBytecode, SIZE_T BytecodeLength, ID3D11ClassLinkage *pClassLinkage, ID3D11DomainShader **ppDomainShader) { const HRESULT hr = dev_CreateDomainShader((void *)This, pShaderBytecode, BytecodeLength, pClassLinkage, ppDomainShader); if (FAILED(hr)) { static volatile LONG said; dx_failed(&said, "ID3D11Device::CreateDomainShader", hr); } return hr; }
 static HRESULT STDMETHODCALLTYPE dev_vtbl_none_CreateComputeShader(ID3D11Device *This, const void *pShaderBytecode, SIZE_T BytecodeLength, ID3D11ClassLinkage *pClassLinkage, ID3D11ComputeShader **ppComputeShader) { static volatile LONG said; dx_unimplemented(&said, "ID3D11Device::CreateComputeShader"); return E_NOTIMPL; }
 static HRESULT STDMETHODCALLTYPE dev_vtbl_none_CreateClassLinkage(ID3D11Device *This, ID3D11ClassLinkage **ppLinkage) { static volatile LONG said; dx_unimplemented(&said, "ID3D11Device::CreateClassLinkage"); return E_NOTIMPL; }
 static HRESULT STDMETHODCALLTYPE dev_vtbl_checked_CreateBlendState(ID3D11Device *This, const D3D11_BLEND_DESC *pBlendStateDesc, ID3D11BlendState **ppBlendState) { const HRESULT hr = dev_CreateBlendState((void *)This, pBlendStateDesc, ppBlendState); if (FAILED(hr)) { static volatile LONG said; dx_failed(&said, "ID3D11Device::CreateBlendState", hr); } return hr; }
@@ -42,18 +42,18 @@ const ID3D11DeviceVtbl dev_vtbl = {
     .CreateBuffer = (__typeof__(((ID3D11DeviceVtbl *)0)->CreateBuffer))dev_vtbl_checked_CreateBuffer,
     .CreateTexture1D = (__typeof__(((ID3D11DeviceVtbl *)0)->CreateTexture1D))dev_vtbl_none_CreateTexture1D,
     .CreateTexture2D = (__typeof__(((ID3D11DeviceVtbl *)0)->CreateTexture2D))dev_vtbl_checked_CreateTexture2D,
-    .CreateTexture3D = (__typeof__(((ID3D11DeviceVtbl *)0)->CreateTexture3D))dev_vtbl_none_CreateTexture3D,
+    .CreateTexture3D = (__typeof__(((ID3D11DeviceVtbl *)0)->CreateTexture3D))dev_vtbl_checked_CreateTexture3D,
     .CreateShaderResourceView = (__typeof__(((ID3D11DeviceVtbl *)0)->CreateShaderResourceView))dev_vtbl_checked_CreateShaderResourceView,
     .CreateUnorderedAccessView = (__typeof__(((ID3D11DeviceVtbl *)0)->CreateUnorderedAccessView))dev_vtbl_none_CreateUnorderedAccessView,
     .CreateRenderTargetView = (__typeof__(((ID3D11DeviceVtbl *)0)->CreateRenderTargetView))dev_vtbl_checked_CreateRenderTargetView,
     .CreateDepthStencilView = (__typeof__(((ID3D11DeviceVtbl *)0)->CreateDepthStencilView))dev_vtbl_checked_CreateDepthStencilView,
     .CreateInputLayout = (__typeof__(((ID3D11DeviceVtbl *)0)->CreateInputLayout))dev_vtbl_checked_CreateInputLayout,
     .CreateVertexShader = (__typeof__(((ID3D11DeviceVtbl *)0)->CreateVertexShader))dev_vtbl_checked_CreateVertexShader,
-    .CreateGeometryShader = (__typeof__(((ID3D11DeviceVtbl *)0)->CreateGeometryShader))dev_vtbl_none_CreateGeometryShader,
+    .CreateGeometryShader = (__typeof__(((ID3D11DeviceVtbl *)0)->CreateGeometryShader))dev_vtbl_checked_CreateGeometryShader,
     .CreateGeometryShaderWithStreamOutput = (__typeof__(((ID3D11DeviceVtbl *)0)->CreateGeometryShaderWithStreamOutput))dev_vtbl_none_CreateGeometryShaderWithStreamOutput,
     .CreatePixelShader = (__typeof__(((ID3D11DeviceVtbl *)0)->CreatePixelShader))dev_vtbl_checked_CreatePixelShader,
-    .CreateHullShader = (__typeof__(((ID3D11DeviceVtbl *)0)->CreateHullShader))dev_vtbl_none_CreateHullShader,
-    .CreateDomainShader = (__typeof__(((ID3D11DeviceVtbl *)0)->CreateDomainShader))dev_vtbl_none_CreateDomainShader,
+    .CreateHullShader = (__typeof__(((ID3D11DeviceVtbl *)0)->CreateHullShader))dev_vtbl_checked_CreateHullShader,
+    .CreateDomainShader = (__typeof__(((ID3D11DeviceVtbl *)0)->CreateDomainShader))dev_vtbl_checked_CreateDomainShader,
     .CreateComputeShader = (__typeof__(((ID3D11DeviceVtbl *)0)->CreateComputeShader))dev_vtbl_none_CreateComputeShader,
     .CreateClassLinkage = (__typeof__(((ID3D11DeviceVtbl *)0)->CreateClassLinkage))dev_vtbl_none_CreateClassLinkage,
     .CreateBlendState = (__typeof__(((ID3D11DeviceVtbl *)0)->CreateBlendState))dev_vtbl_checked_CreateBlendState,
@@ -84,14 +84,8 @@ static HRESULT STDMETHODCALLTYPE ctx_vtbl_checked_GetPrivateData(ID3D11DeviceCon
 static HRESULT STDMETHODCALLTYPE ctx_vtbl_checked_SetPrivateData(ID3D11DeviceContext *This, REFGUID guid, UINT DataSize, const void *pData) { const HRESULT hr = obj_SetPrivateData((void *)This, guid, DataSize, pData); if (FAILED(hr)) { static volatile LONG said; dx_failed(&said, "ID3D11DeviceContext::SetPrivateData", hr); } return hr; }
 static HRESULT STDMETHODCALLTYPE ctx_vtbl_checked_SetPrivateDataInterface(ID3D11DeviceContext *This, REFGUID guid, const IUnknown *pData) { const HRESULT hr = obj_SetPrivateDataInterface((void *)This, guid, pData); if (FAILED(hr)) { static volatile LONG said; dx_failed(&said, "ID3D11DeviceContext::SetPrivateDataInterface", hr); } return hr; }
 static HRESULT STDMETHODCALLTYPE ctx_vtbl_checked_Map(ID3D11DeviceContext *This, ID3D11Resource *pResource, UINT Subresource, D3D11_MAP MapType, UINT MapFlags, D3D11_MAPPED_SUBRESOURCE *pMappedResource) { const HRESULT hr = ctx_Map((void *)This, pResource, Subresource, MapType, MapFlags, pMappedResource); if (FAILED(hr)) { static volatile LONG said; dx_failed(&said, "ID3D11DeviceContext::Map", hr); } return hr; }
-static void STDMETHODCALLTYPE ctx_vtbl_none_GSSetConstantBuffers(ID3D11DeviceContext *This, UINT StartSlot, UINT NumBuffers, ID3D11Buffer *const *ppConstantBuffers) { static volatile LONG said; dx_unimplemented(&said, "ID3D11DeviceContext::GSSetConstantBuffers"); }
-static void STDMETHODCALLTYPE ctx_vtbl_none_GSSetShader(ID3D11DeviceContext *This, ID3D11GeometryShader *pShader, ID3D11ClassInstance *const *ppClassInstances, UINT NumClassInstances) { static volatile LONG said; dx_unimplemented(&said, "ID3D11DeviceContext::GSSetShader"); }
-static void STDMETHODCALLTYPE ctx_vtbl_none_VSSetShaderResources(ID3D11DeviceContext *This, UINT StartSlot, UINT NumViews, ID3D11ShaderResourceView *const *ppShaderResourceViews) { static volatile LONG said; dx_unimplemented(&said, "ID3D11DeviceContext::VSSetShaderResources"); }
-static void STDMETHODCALLTYPE ctx_vtbl_none_VSSetSamplers(ID3D11DeviceContext *This, UINT StartSlot, UINT NumSamplers, ID3D11SamplerState *const *ppSamplers) { static volatile LONG said; dx_unimplemented(&said, "ID3D11DeviceContext::VSSetSamplers"); }
 static HRESULT STDMETHODCALLTYPE ctx_vtbl_checked_GetData(ID3D11DeviceContext *This, ID3D11Asynchronous *pAsync, void *pData, UINT DataSize, UINT GetDataFlags) { const HRESULT hr = ctx_GetData((void *)This, pAsync, pData, DataSize, GetDataFlags); if (FAILED(hr)) { static volatile LONG said; dx_failed(&said, "ID3D11DeviceContext::GetData", hr); } return hr; }
 static void STDMETHODCALLTYPE ctx_vtbl_none_SetPredication(ID3D11DeviceContext *This, ID3D11Predicate *pPredicate, WINBOOL PredicateValue) { static volatile LONG said; dx_unimplemented(&said, "ID3D11DeviceContext::SetPredication"); }
-static void STDMETHODCALLTYPE ctx_vtbl_none_GSSetShaderResources(ID3D11DeviceContext *This, UINT StartSlot, UINT NumViews, ID3D11ShaderResourceView *const *ppShaderResourceViews) { static volatile LONG said; dx_unimplemented(&said, "ID3D11DeviceContext::GSSetShaderResources"); }
-static void STDMETHODCALLTYPE ctx_vtbl_none_GSSetSamplers(ID3D11DeviceContext *This, UINT StartSlot, UINT NumSamplers, ID3D11SamplerState *const *ppSamplers) { static volatile LONG said; dx_unimplemented(&said, "ID3D11DeviceContext::GSSetSamplers"); }
 static void STDMETHODCALLTYPE ctx_vtbl_none_OMSetRenderTargetsAndUnorderedAccessViews(ID3D11DeviceContext *This, UINT NumRTVs, ID3D11RenderTargetView *const *ppRenderTargetViews, ID3D11DepthStencilView *pDepthStencilView, UINT UAVStartSlot, UINT NumUAVs, ID3D11UnorderedAccessView *const *ppUnorderedAccessViews, const UINT *pUAVInitialCounts) { static volatile LONG said; dx_unimplemented(&said, "ID3D11DeviceContext::OMSetRenderTargetsAndUnorderedAccessViews"); }
 static void STDMETHODCALLTYPE ctx_vtbl_none_SOSetTargets(ID3D11DeviceContext *This, UINT NumBuffers, ID3D11Buffer *const *ppSOTargets, const UINT *pOffsets) { static volatile LONG said; dx_unimplemented(&said, "ID3D11DeviceContext::SOSetTargets"); }
 static void STDMETHODCALLTYPE ctx_vtbl_none_DrawAuto(ID3D11DeviceContext *This) { static volatile LONG said; dx_unimplemented(&said, "ID3D11DeviceContext::DrawAuto"); }
@@ -105,33 +99,14 @@ static void STDMETHODCALLTYPE ctx_vtbl_none_ClearUnorderedAccessViewFloat(ID3D11
 static void STDMETHODCALLTYPE ctx_vtbl_none_SetResourceMinLOD(ID3D11DeviceContext *This, ID3D11Resource *pResource, FLOAT MinLOD) { static volatile LONG said; dx_unimplemented(&said, "ID3D11DeviceContext::SetResourceMinLOD"); }
 static FLOAT STDMETHODCALLTYPE ctx_vtbl_none_GetResourceMinLOD(ID3D11DeviceContext *This, ID3D11Resource *pResource) { static volatile LONG said; dx_unimplemented(&said, "ID3D11DeviceContext::GetResourceMinLOD"); return (FLOAT)0; }
 static void STDMETHODCALLTYPE ctx_vtbl_none_ExecuteCommandList(ID3D11DeviceContext *This, ID3D11CommandList *pCommandList, WINBOOL RestoreContextState) { static volatile LONG said; dx_unimplemented(&said, "ID3D11DeviceContext::ExecuteCommandList"); }
-static void STDMETHODCALLTYPE ctx_vtbl_none_HSSetShaderResources(ID3D11DeviceContext *This, UINT StartSlot, UINT NumViews, ID3D11ShaderResourceView *const *ppShaderResourceViews) { static volatile LONG said; dx_unimplemented(&said, "ID3D11DeviceContext::HSSetShaderResources"); }
-static void STDMETHODCALLTYPE ctx_vtbl_none_HSSetShader(ID3D11DeviceContext *This, ID3D11HullShader *pHullShader, ID3D11ClassInstance *const *ppClassInstances, UINT NumClassInstances) { static volatile LONG said; dx_unimplemented(&said, "ID3D11DeviceContext::HSSetShader"); }
-static void STDMETHODCALLTYPE ctx_vtbl_none_HSSetSamplers(ID3D11DeviceContext *This, UINT StartSlot, UINT NumSamplers, ID3D11SamplerState *const *ppSamplers) { static volatile LONG said; dx_unimplemented(&said, "ID3D11DeviceContext::HSSetSamplers"); }
-static void STDMETHODCALLTYPE ctx_vtbl_none_HSSetConstantBuffers(ID3D11DeviceContext *This, UINT StartSlot, UINT NumBuffers, ID3D11Buffer *const *ppConstantBuffers) { static volatile LONG said; dx_unimplemented(&said, "ID3D11DeviceContext::HSSetConstantBuffers"); }
-static void STDMETHODCALLTYPE ctx_vtbl_none_DSSetShaderResources(ID3D11DeviceContext *This, UINT StartSlot, UINT NumViews, ID3D11ShaderResourceView *const *ppShaderResourceViews) { static volatile LONG said; dx_unimplemented(&said, "ID3D11DeviceContext::DSSetShaderResources"); }
-static void STDMETHODCALLTYPE ctx_vtbl_none_DSSetShader(ID3D11DeviceContext *This, ID3D11DomainShader *pDomainShader, ID3D11ClassInstance *const *ppClassInstances, UINT NumClassInstances) { static volatile LONG said; dx_unimplemented(&said, "ID3D11DeviceContext::DSSetShader"); }
-static void STDMETHODCALLTYPE ctx_vtbl_none_DSSetSamplers(ID3D11DeviceContext *This, UINT StartSlot, UINT NumSamplers, ID3D11SamplerState *const *ppSamplers) { static volatile LONG said; dx_unimplemented(&said, "ID3D11DeviceContext::DSSetSamplers"); }
-static void STDMETHODCALLTYPE ctx_vtbl_none_DSSetConstantBuffers(ID3D11DeviceContext *This, UINT StartSlot, UINT NumBuffers, ID3D11Buffer *const *ppConstantBuffers) { static volatile LONG said; dx_unimplemented(&said, "ID3D11DeviceContext::DSSetConstantBuffers"); }
 static void STDMETHODCALLTYPE ctx_vtbl_none_CSSetShaderResources(ID3D11DeviceContext *This, UINT StartSlot, UINT NumViews, ID3D11ShaderResourceView *const *ppShaderResourceViews) { static volatile LONG said; dx_unimplemented(&said, "ID3D11DeviceContext::CSSetShaderResources"); }
 static void STDMETHODCALLTYPE ctx_vtbl_none_CSSetUnorderedAccessViews(ID3D11DeviceContext *This, UINT StartSlot, UINT NumUAVs, ID3D11UnorderedAccessView *const *ppUnorderedAccessViews, const UINT *pUAVInitialCounts) { static volatile LONG said; dx_unimplemented(&said, "ID3D11DeviceContext::CSSetUnorderedAccessViews"); }
 static void STDMETHODCALLTYPE ctx_vtbl_none_CSSetShader(ID3D11DeviceContext *This, ID3D11ComputeShader *pComputeShader, ID3D11ClassInstance *const *ppClassInstances, UINT NumClassInstances) { static volatile LONG said; dx_unimplemented(&said, "ID3D11DeviceContext::CSSetShader"); }
 static void STDMETHODCALLTYPE ctx_vtbl_none_CSSetSamplers(ID3D11DeviceContext *This, UINT StartSlot, UINT NumSamplers, ID3D11SamplerState *const *ppSamplers) { static volatile LONG said; dx_unimplemented(&said, "ID3D11DeviceContext::CSSetSamplers"); }
 static void STDMETHODCALLTYPE ctx_vtbl_none_CSSetConstantBuffers(ID3D11DeviceContext *This, UINT StartSlot, UINT NumBuffers, ID3D11Buffer *const *ppConstantBuffers) { static volatile LONG said; dx_unimplemented(&said, "ID3D11DeviceContext::CSSetConstantBuffers"); }
-static void STDMETHODCALLTYPE ctx_vtbl_none_GSGetConstantBuffers(ID3D11DeviceContext *This, UINT StartSlot, UINT NumBuffers, ID3D11Buffer **ppConstantBuffers) { static volatile LONG said; dx_unimplemented(&said, "ID3D11DeviceContext::GSGetConstantBuffers"); }
-static void STDMETHODCALLTYPE ctx_vtbl_none_VSGetShaderResources(ID3D11DeviceContext *This, UINT StartSlot, UINT NumViews, ID3D11ShaderResourceView **ppShaderResourceViews) { static volatile LONG said; dx_unimplemented(&said, "ID3D11DeviceContext::VSGetShaderResources"); }
-static void STDMETHODCALLTYPE ctx_vtbl_none_VSGetSamplers(ID3D11DeviceContext *This, UINT StartSlot, UINT NumSamplers, ID3D11SamplerState **ppSamplers) { static volatile LONG said; dx_unimplemented(&said, "ID3D11DeviceContext::VSGetSamplers"); }
 static void STDMETHODCALLTYPE ctx_vtbl_none_GetPredication(ID3D11DeviceContext *This, ID3D11Predicate **ppPredicate, WINBOOL *pPredicateValue) { static volatile LONG said; dx_unimplemented(&said, "ID3D11DeviceContext::GetPredication"); }
-static void STDMETHODCALLTYPE ctx_vtbl_none_GSGetShaderResources(ID3D11DeviceContext *This, UINT StartSlot, UINT NumViews, ID3D11ShaderResourceView **ppShaderResourceViews) { static volatile LONG said; dx_unimplemented(&said, "ID3D11DeviceContext::GSGetShaderResources"); }
-static void STDMETHODCALLTYPE ctx_vtbl_none_GSGetSamplers(ID3D11DeviceContext *This, UINT StartSlot, UINT NumSamplers, ID3D11SamplerState **ppSamplers) { static volatile LONG said; dx_unimplemented(&said, "ID3D11DeviceContext::GSGetSamplers"); }
 static void STDMETHODCALLTYPE ctx_vtbl_none_OMGetRenderTargetsAndUnorderedAccessViews(ID3D11DeviceContext *This, UINT NumRTVs, ID3D11RenderTargetView **ppRenderTargetViews, ID3D11DepthStencilView **ppDepthStencilView, UINT UAVStartSlot, UINT NumUAVs, ID3D11UnorderedAccessView **ppUnorderedAccessViews) { static volatile LONG said; dx_unimplemented(&said, "ID3D11DeviceContext::OMGetRenderTargetsAndUnorderedAccessViews"); }
 static void STDMETHODCALLTYPE ctx_vtbl_none_SOGetTargets(ID3D11DeviceContext *This, UINT NumBuffers, ID3D11Buffer **ppSOTargets) { static volatile LONG said; dx_unimplemented(&said, "ID3D11DeviceContext::SOGetTargets"); }
-static void STDMETHODCALLTYPE ctx_vtbl_none_HSGetShaderResources(ID3D11DeviceContext *This, UINT StartSlot, UINT NumViews, ID3D11ShaderResourceView **ppShaderResourceViews) { static volatile LONG said; dx_unimplemented(&said, "ID3D11DeviceContext::HSGetShaderResources"); }
-static void STDMETHODCALLTYPE ctx_vtbl_none_HSGetSamplers(ID3D11DeviceContext *This, UINT StartSlot, UINT NumSamplers, ID3D11SamplerState **ppSamplers) { static volatile LONG said; dx_unimplemented(&said, "ID3D11DeviceContext::HSGetSamplers"); }
-static void STDMETHODCALLTYPE ctx_vtbl_none_HSGetConstantBuffers(ID3D11DeviceContext *This, UINT StartSlot, UINT NumBuffers, ID3D11Buffer **ppConstantBuffers) { static volatile LONG said; dx_unimplemented(&said, "ID3D11DeviceContext::HSGetConstantBuffers"); }
-static void STDMETHODCALLTYPE ctx_vtbl_none_DSGetShaderResources(ID3D11DeviceContext *This, UINT StartSlot, UINT NumViews, ID3D11ShaderResourceView **ppShaderResourceViews) { static volatile LONG said; dx_unimplemented(&said, "ID3D11DeviceContext::DSGetShaderResources"); }
-static void STDMETHODCALLTYPE ctx_vtbl_none_DSGetSamplers(ID3D11DeviceContext *This, UINT StartSlot, UINT NumSamplers, ID3D11SamplerState **ppSamplers) { static volatile LONG said; dx_unimplemented(&said, "ID3D11DeviceContext::DSGetSamplers"); }
-static void STDMETHODCALLTYPE ctx_vtbl_none_DSGetConstantBuffers(ID3D11DeviceContext *This, UINT StartSlot, UINT NumBuffers, ID3D11Buffer **ppConstantBuffers) { static volatile LONG said; dx_unimplemented(&said, "ID3D11DeviceContext::DSGetConstantBuffers"); }
 static void STDMETHODCALLTYPE ctx_vtbl_none_CSGetShaderResources(ID3D11DeviceContext *This, UINT StartSlot, UINT NumViews, ID3D11ShaderResourceView **ppShaderResourceViews) { static volatile LONG said; dx_unimplemented(&said, "ID3D11DeviceContext::CSGetShaderResources"); }
 static void STDMETHODCALLTYPE ctx_vtbl_none_CSGetUnorderedAccessViews(ID3D11DeviceContext *This, UINT StartSlot, UINT NumUAVs, ID3D11UnorderedAccessView **ppUnorderedAccessViews) { static volatile LONG said; dx_unimplemented(&said, "ID3D11DeviceContext::CSGetUnorderedAccessViews"); }
 static void STDMETHODCALLTYPE ctx_vtbl_none_CSGetSamplers(ID3D11DeviceContext *This, UINT StartSlot, UINT NumSamplers, ID3D11SamplerState **ppSamplers) { static volatile LONG said; dx_unimplemented(&said, "ID3D11DeviceContext::CSGetSamplers"); }
@@ -160,17 +135,17 @@ const ID3D11DeviceContextVtbl ctx_vtbl = {
     .IASetIndexBuffer = (__typeof__(((ID3D11DeviceContextVtbl *)0)->IASetIndexBuffer))ctx_IASetIndexBuffer,
     .DrawIndexedInstanced = (__typeof__(((ID3D11DeviceContextVtbl *)0)->DrawIndexedInstanced))ctx_DrawIndexedInstanced,
     .DrawInstanced = (__typeof__(((ID3D11DeviceContextVtbl *)0)->DrawInstanced))ctx_DrawInstanced,
-    .GSSetConstantBuffers = (__typeof__(((ID3D11DeviceContextVtbl *)0)->GSSetConstantBuffers))ctx_vtbl_none_GSSetConstantBuffers,
-    .GSSetShader = (__typeof__(((ID3D11DeviceContextVtbl *)0)->GSSetShader))ctx_vtbl_none_GSSetShader,
+    .GSSetConstantBuffers = (__typeof__(((ID3D11DeviceContextVtbl *)0)->GSSetConstantBuffers))ctx_GSSetConstantBuffers,
+    .GSSetShader = (__typeof__(((ID3D11DeviceContextVtbl *)0)->GSSetShader))ctx_GSSetShader,
     .IASetPrimitiveTopology = (__typeof__(((ID3D11DeviceContextVtbl *)0)->IASetPrimitiveTopology))ctx_IASetPrimitiveTopology,
-    .VSSetShaderResources = (__typeof__(((ID3D11DeviceContextVtbl *)0)->VSSetShaderResources))ctx_vtbl_none_VSSetShaderResources,
-    .VSSetSamplers = (__typeof__(((ID3D11DeviceContextVtbl *)0)->VSSetSamplers))ctx_vtbl_none_VSSetSamplers,
+    .VSSetShaderResources = (__typeof__(((ID3D11DeviceContextVtbl *)0)->VSSetShaderResources))ctx_VSSetShaderResources,
+    .VSSetSamplers = (__typeof__(((ID3D11DeviceContextVtbl *)0)->VSSetSamplers))ctx_VSSetSamplers,
     .Begin = (__typeof__(((ID3D11DeviceContextVtbl *)0)->Begin))ctx_Begin,
     .End = (__typeof__(((ID3D11DeviceContextVtbl *)0)->End))ctx_End,
     .GetData = (__typeof__(((ID3D11DeviceContextVtbl *)0)->GetData))ctx_vtbl_checked_GetData,
     .SetPredication = (__typeof__(((ID3D11DeviceContextVtbl *)0)->SetPredication))ctx_vtbl_none_SetPredication,
-    .GSSetShaderResources = (__typeof__(((ID3D11DeviceContextVtbl *)0)->GSSetShaderResources))ctx_vtbl_none_GSSetShaderResources,
-    .GSSetSamplers = (__typeof__(((ID3D11DeviceContextVtbl *)0)->GSSetSamplers))ctx_vtbl_none_GSSetSamplers,
+    .GSSetShaderResources = (__typeof__(((ID3D11DeviceContextVtbl *)0)->GSSetShaderResources))ctx_GSSetShaderResources,
+    .GSSetSamplers = (__typeof__(((ID3D11DeviceContextVtbl *)0)->GSSetSamplers))ctx_GSSetSamplers,
     .OMSetRenderTargets = (__typeof__(((ID3D11DeviceContextVtbl *)0)->OMSetRenderTargets))ctx_OMSetRenderTargets,
     .OMSetRenderTargetsAndUnorderedAccessViews = (__typeof__(((ID3D11DeviceContextVtbl *)0)->OMSetRenderTargetsAndUnorderedAccessViews))ctx_vtbl_none_OMSetRenderTargetsAndUnorderedAccessViews,
     .OMSetBlendState = (__typeof__(((ID3D11DeviceContextVtbl *)0)->OMSetBlendState))ctx_OMSetBlendState,
@@ -197,14 +172,14 @@ const ID3D11DeviceContextVtbl ctx_vtbl = {
     .GetResourceMinLOD = (__typeof__(((ID3D11DeviceContextVtbl *)0)->GetResourceMinLOD))ctx_vtbl_none_GetResourceMinLOD,
     .ResolveSubresource = (__typeof__(((ID3D11DeviceContextVtbl *)0)->ResolveSubresource))ctx_ResolveSubresource,
     .ExecuteCommandList = (__typeof__(((ID3D11DeviceContextVtbl *)0)->ExecuteCommandList))ctx_vtbl_none_ExecuteCommandList,
-    .HSSetShaderResources = (__typeof__(((ID3D11DeviceContextVtbl *)0)->HSSetShaderResources))ctx_vtbl_none_HSSetShaderResources,
-    .HSSetShader = (__typeof__(((ID3D11DeviceContextVtbl *)0)->HSSetShader))ctx_vtbl_none_HSSetShader,
-    .HSSetSamplers = (__typeof__(((ID3D11DeviceContextVtbl *)0)->HSSetSamplers))ctx_vtbl_none_HSSetSamplers,
-    .HSSetConstantBuffers = (__typeof__(((ID3D11DeviceContextVtbl *)0)->HSSetConstantBuffers))ctx_vtbl_none_HSSetConstantBuffers,
-    .DSSetShaderResources = (__typeof__(((ID3D11DeviceContextVtbl *)0)->DSSetShaderResources))ctx_vtbl_none_DSSetShaderResources,
-    .DSSetShader = (__typeof__(((ID3D11DeviceContextVtbl *)0)->DSSetShader))ctx_vtbl_none_DSSetShader,
-    .DSSetSamplers = (__typeof__(((ID3D11DeviceContextVtbl *)0)->DSSetSamplers))ctx_vtbl_none_DSSetSamplers,
-    .DSSetConstantBuffers = (__typeof__(((ID3D11DeviceContextVtbl *)0)->DSSetConstantBuffers))ctx_vtbl_none_DSSetConstantBuffers,
+    .HSSetShaderResources = (__typeof__(((ID3D11DeviceContextVtbl *)0)->HSSetShaderResources))ctx_HSSetShaderResources,
+    .HSSetShader = (__typeof__(((ID3D11DeviceContextVtbl *)0)->HSSetShader))ctx_HSSetShader,
+    .HSSetSamplers = (__typeof__(((ID3D11DeviceContextVtbl *)0)->HSSetSamplers))ctx_HSSetSamplers,
+    .HSSetConstantBuffers = (__typeof__(((ID3D11DeviceContextVtbl *)0)->HSSetConstantBuffers))ctx_HSSetConstantBuffers,
+    .DSSetShaderResources = (__typeof__(((ID3D11DeviceContextVtbl *)0)->DSSetShaderResources))ctx_DSSetShaderResources,
+    .DSSetShader = (__typeof__(((ID3D11DeviceContextVtbl *)0)->DSSetShader))ctx_DSSetShader,
+    .DSSetSamplers = (__typeof__(((ID3D11DeviceContextVtbl *)0)->DSSetSamplers))ctx_DSSetSamplers,
+    .DSSetConstantBuffers = (__typeof__(((ID3D11DeviceContextVtbl *)0)->DSSetConstantBuffers))ctx_DSSetConstantBuffers,
     .CSSetShaderResources = (__typeof__(((ID3D11DeviceContextVtbl *)0)->CSSetShaderResources))ctx_vtbl_none_CSSetShaderResources,
     .CSSetUnorderedAccessViews = (__typeof__(((ID3D11DeviceContextVtbl *)0)->CSSetUnorderedAccessViews))ctx_vtbl_none_CSSetUnorderedAccessViews,
     .CSSetShader = (__typeof__(((ID3D11DeviceContextVtbl *)0)->CSSetShader))ctx_vtbl_none_CSSetShader,
@@ -219,14 +194,14 @@ const ID3D11DeviceContextVtbl ctx_vtbl = {
     .IAGetInputLayout = (__typeof__(((ID3D11DeviceContextVtbl *)0)->IAGetInputLayout))ctx_IAGetInputLayout,
     .IAGetVertexBuffers = (__typeof__(((ID3D11DeviceContextVtbl *)0)->IAGetVertexBuffers))ctx_IAGetVertexBuffers,
     .IAGetIndexBuffer = (__typeof__(((ID3D11DeviceContextVtbl *)0)->IAGetIndexBuffer))ctx_IAGetIndexBuffer,
-    .GSGetConstantBuffers = (__typeof__(((ID3D11DeviceContextVtbl *)0)->GSGetConstantBuffers))ctx_vtbl_none_GSGetConstantBuffers,
+    .GSGetConstantBuffers = (__typeof__(((ID3D11DeviceContextVtbl *)0)->GSGetConstantBuffers))ctx_GSGetConstantBuffers,
     .GSGetShader = (__typeof__(((ID3D11DeviceContextVtbl *)0)->GSGetShader))ctx_GSGetShader,
     .IAGetPrimitiveTopology = (__typeof__(((ID3D11DeviceContextVtbl *)0)->IAGetPrimitiveTopology))ctx_IAGetPrimitiveTopology,
-    .VSGetShaderResources = (__typeof__(((ID3D11DeviceContextVtbl *)0)->VSGetShaderResources))ctx_vtbl_none_VSGetShaderResources,
-    .VSGetSamplers = (__typeof__(((ID3D11DeviceContextVtbl *)0)->VSGetSamplers))ctx_vtbl_none_VSGetSamplers,
+    .VSGetShaderResources = (__typeof__(((ID3D11DeviceContextVtbl *)0)->VSGetShaderResources))ctx_VSGetShaderResources,
+    .VSGetSamplers = (__typeof__(((ID3D11DeviceContextVtbl *)0)->VSGetSamplers))ctx_VSGetSamplers,
     .GetPredication = (__typeof__(((ID3D11DeviceContextVtbl *)0)->GetPredication))ctx_vtbl_none_GetPredication,
-    .GSGetShaderResources = (__typeof__(((ID3D11DeviceContextVtbl *)0)->GSGetShaderResources))ctx_vtbl_none_GSGetShaderResources,
-    .GSGetSamplers = (__typeof__(((ID3D11DeviceContextVtbl *)0)->GSGetSamplers))ctx_vtbl_none_GSGetSamplers,
+    .GSGetShaderResources = (__typeof__(((ID3D11DeviceContextVtbl *)0)->GSGetShaderResources))ctx_GSGetShaderResources,
+    .GSGetSamplers = (__typeof__(((ID3D11DeviceContextVtbl *)0)->GSGetSamplers))ctx_GSGetSamplers,
     .OMGetRenderTargets = (__typeof__(((ID3D11DeviceContextVtbl *)0)->OMGetRenderTargets))ctx_OMGetRenderTargets,
     .OMGetRenderTargetsAndUnorderedAccessViews = (__typeof__(((ID3D11DeviceContextVtbl *)0)->OMGetRenderTargetsAndUnorderedAccessViews))ctx_vtbl_none_OMGetRenderTargetsAndUnorderedAccessViews,
     .OMGetBlendState = (__typeof__(((ID3D11DeviceContextVtbl *)0)->OMGetBlendState))ctx_OMGetBlendState,
@@ -235,14 +210,14 @@ const ID3D11DeviceContextVtbl ctx_vtbl = {
     .RSGetState = (__typeof__(((ID3D11DeviceContextVtbl *)0)->RSGetState))ctx_RSGetState,
     .RSGetViewports = (__typeof__(((ID3D11DeviceContextVtbl *)0)->RSGetViewports))ctx_RSGetViewports,
     .RSGetScissorRects = (__typeof__(((ID3D11DeviceContextVtbl *)0)->RSGetScissorRects))ctx_RSGetScissorRects,
-    .HSGetShaderResources = (__typeof__(((ID3D11DeviceContextVtbl *)0)->HSGetShaderResources))ctx_vtbl_none_HSGetShaderResources,
+    .HSGetShaderResources = (__typeof__(((ID3D11DeviceContextVtbl *)0)->HSGetShaderResources))ctx_HSGetShaderResources,
     .HSGetShader = (__typeof__(((ID3D11DeviceContextVtbl *)0)->HSGetShader))ctx_HSGetShader,
-    .HSGetSamplers = (__typeof__(((ID3D11DeviceContextVtbl *)0)->HSGetSamplers))ctx_vtbl_none_HSGetSamplers,
-    .HSGetConstantBuffers = (__typeof__(((ID3D11DeviceContextVtbl *)0)->HSGetConstantBuffers))ctx_vtbl_none_HSGetConstantBuffers,
-    .DSGetShaderResources = (__typeof__(((ID3D11DeviceContextVtbl *)0)->DSGetShaderResources))ctx_vtbl_none_DSGetShaderResources,
+    .HSGetSamplers = (__typeof__(((ID3D11DeviceContextVtbl *)0)->HSGetSamplers))ctx_HSGetSamplers,
+    .HSGetConstantBuffers = (__typeof__(((ID3D11DeviceContextVtbl *)0)->HSGetConstantBuffers))ctx_HSGetConstantBuffers,
+    .DSGetShaderResources = (__typeof__(((ID3D11DeviceContextVtbl *)0)->DSGetShaderResources))ctx_DSGetShaderResources,
     .DSGetShader = (__typeof__(((ID3D11DeviceContextVtbl *)0)->DSGetShader))ctx_DSGetShader,
-    .DSGetSamplers = (__typeof__(((ID3D11DeviceContextVtbl *)0)->DSGetSamplers))ctx_vtbl_none_DSGetSamplers,
-    .DSGetConstantBuffers = (__typeof__(((ID3D11DeviceContextVtbl *)0)->DSGetConstantBuffers))ctx_vtbl_none_DSGetConstantBuffers,
+    .DSGetSamplers = (__typeof__(((ID3D11DeviceContextVtbl *)0)->DSGetSamplers))ctx_DSGetSamplers,
+    .DSGetConstantBuffers = (__typeof__(((ID3D11DeviceContextVtbl *)0)->DSGetConstantBuffers))ctx_DSGetConstantBuffers,
     .CSGetShaderResources = (__typeof__(((ID3D11DeviceContextVtbl *)0)->CSGetShaderResources))ctx_vtbl_none_CSGetShaderResources,
     .CSGetUnorderedAccessViews = (__typeof__(((ID3D11DeviceContextVtbl *)0)->CSGetUnorderedAccessViews))ctx_vtbl_none_CSGetUnorderedAccessViews,
     .CSGetShader = (__typeof__(((ID3D11DeviceContextVtbl *)0)->CSGetShader))ctx_CSGetShader,
@@ -285,6 +260,22 @@ const ID3D11Texture2DVtbl tex_vtbl = {
     .SetEvictionPriority = (__typeof__(((ID3D11Texture2DVtbl *)0)->SetEvictionPriority))tex_SetEvictionPriority,
     .GetEvictionPriority = (__typeof__(((ID3D11Texture2DVtbl *)0)->GetEvictionPriority))tex_GetEvictionPriority,
     .GetDesc = (__typeof__(((ID3D11Texture2DVtbl *)0)->GetDesc))tex_GetDesc,
+};
+static HRESULT STDMETHODCALLTYPE tex3_vtbl_checked_GetPrivateData(ID3D11Texture3D *This, REFGUID guid, UINT *pDataSize, void *pData) { const HRESULT hr = obj_GetPrivateData((void *)This, guid, pDataSize, pData); if (FAILED(hr)) { static volatile LONG said; dx_failed(&said, "ID3D11Texture3D::GetPrivateData", hr); } return hr; }
+static HRESULT STDMETHODCALLTYPE tex3_vtbl_checked_SetPrivateData(ID3D11Texture3D *This, REFGUID guid, UINT DataSize, const void *pData) { const HRESULT hr = obj_SetPrivateData((void *)This, guid, DataSize, pData); if (FAILED(hr)) { static volatile LONG said; dx_failed(&said, "ID3D11Texture3D::SetPrivateData", hr); } return hr; }
+static HRESULT STDMETHODCALLTYPE tex3_vtbl_checked_SetPrivateDataInterface(ID3D11Texture3D *This, REFGUID guid, const IUnknown *pData) { const HRESULT hr = obj_SetPrivateDataInterface((void *)This, guid, pData); if (FAILED(hr)) { static volatile LONG said; dx_failed(&said, "ID3D11Texture3D::SetPrivateDataInterface", hr); } return hr; }
+const ID3D11Texture3DVtbl tex3_vtbl = {
+    .QueryInterface = (__typeof__(((ID3D11Texture3DVtbl *)0)->QueryInterface))tex_QueryInterface,
+    .AddRef = (__typeof__(((ID3D11Texture3DVtbl *)0)->AddRef))obj_AddRef,
+    .Release = (__typeof__(((ID3D11Texture3DVtbl *)0)->Release))obj_Release,
+    .GetDevice = (__typeof__(((ID3D11Texture3DVtbl *)0)->GetDevice))child_GetDevice,
+    .GetPrivateData = (__typeof__(((ID3D11Texture3DVtbl *)0)->GetPrivateData))tex3_vtbl_checked_GetPrivateData,
+    .SetPrivateData = (__typeof__(((ID3D11Texture3DVtbl *)0)->SetPrivateData))tex3_vtbl_checked_SetPrivateData,
+    .SetPrivateDataInterface = (__typeof__(((ID3D11Texture3DVtbl *)0)->SetPrivateDataInterface))tex3_vtbl_checked_SetPrivateDataInterface,
+    .GetType = (__typeof__(((ID3D11Texture3DVtbl *)0)->GetType))tex3_GetType,
+    .SetEvictionPriority = (__typeof__(((ID3D11Texture3DVtbl *)0)->SetEvictionPriority))tex_SetEvictionPriority,
+    .GetEvictionPriority = (__typeof__(((ID3D11Texture3DVtbl *)0)->GetEvictionPriority))tex_GetEvictionPriority,
+    .GetDesc = (__typeof__(((ID3D11Texture3DVtbl *)0)->GetDesc))tex3_GetDesc,
 };
 static HRESULT STDMETHODCALLTYPE rtv_vtbl_checked_GetPrivateData(ID3D11RenderTargetView *This, REFGUID guid, UINT *pDataSize, void *pData) { const HRESULT hr = obj_GetPrivateData((void *)This, guid, pDataSize, pData); if (FAILED(hr)) { static volatile LONG said; dx_failed(&said, "ID3D11RenderTargetView::GetPrivateData", hr); } return hr; }
 static HRESULT STDMETHODCALLTYPE rtv_vtbl_checked_SetPrivateData(ID3D11RenderTargetView *This, REFGUID guid, UINT DataSize, const void *pData) { const HRESULT hr = obj_SetPrivateData((void *)This, guid, DataSize, pData); if (FAILED(hr)) { static volatile LONG said; dx_failed(&said, "ID3D11RenderTargetView::SetPrivateData", hr); } return hr; }
@@ -351,6 +342,42 @@ const ID3D11PixelShaderVtbl ps_vtbl = {
     .GetPrivateData = (__typeof__(((ID3D11PixelShaderVtbl *)0)->GetPrivateData))ps_vtbl_checked_GetPrivateData,
     .SetPrivateData = (__typeof__(((ID3D11PixelShaderVtbl *)0)->SetPrivateData))ps_vtbl_checked_SetPrivateData,
     .SetPrivateDataInterface = (__typeof__(((ID3D11PixelShaderVtbl *)0)->SetPrivateDataInterface))ps_vtbl_checked_SetPrivateDataInterface,
+};
+static HRESULT STDMETHODCALLTYPE gs_vtbl_checked_GetPrivateData(ID3D11GeometryShader *This, REFGUID guid, UINT *pDataSize, void *pData) { const HRESULT hr = obj_GetPrivateData((void *)This, guid, pDataSize, pData); if (FAILED(hr)) { static volatile LONG said; dx_failed(&said, "ID3D11GeometryShader::GetPrivateData", hr); } return hr; }
+static HRESULT STDMETHODCALLTYPE gs_vtbl_checked_SetPrivateData(ID3D11GeometryShader *This, REFGUID guid, UINT DataSize, const void *pData) { const HRESULT hr = obj_SetPrivateData((void *)This, guid, DataSize, pData); if (FAILED(hr)) { static volatile LONG said; dx_failed(&said, "ID3D11GeometryShader::SetPrivateData", hr); } return hr; }
+static HRESULT STDMETHODCALLTYPE gs_vtbl_checked_SetPrivateDataInterface(ID3D11GeometryShader *This, REFGUID guid, const IUnknown *pData) { const HRESULT hr = obj_SetPrivateDataInterface((void *)This, guid, pData); if (FAILED(hr)) { static volatile LONG said; dx_failed(&said, "ID3D11GeometryShader::SetPrivateDataInterface", hr); } return hr; }
+const ID3D11GeometryShaderVtbl gs_vtbl = {
+    .QueryInterface = (__typeof__(((ID3D11GeometryShaderVtbl *)0)->QueryInterface))obj_QueryInterface,
+    .AddRef = (__typeof__(((ID3D11GeometryShaderVtbl *)0)->AddRef))obj_AddRef,
+    .Release = (__typeof__(((ID3D11GeometryShaderVtbl *)0)->Release))obj_Release,
+    .GetDevice = (__typeof__(((ID3D11GeometryShaderVtbl *)0)->GetDevice))child_GetDevice,
+    .GetPrivateData = (__typeof__(((ID3D11GeometryShaderVtbl *)0)->GetPrivateData))gs_vtbl_checked_GetPrivateData,
+    .SetPrivateData = (__typeof__(((ID3D11GeometryShaderVtbl *)0)->SetPrivateData))gs_vtbl_checked_SetPrivateData,
+    .SetPrivateDataInterface = (__typeof__(((ID3D11GeometryShaderVtbl *)0)->SetPrivateDataInterface))gs_vtbl_checked_SetPrivateDataInterface,
+};
+static HRESULT STDMETHODCALLTYPE hs_vtbl_checked_GetPrivateData(ID3D11HullShader *This, REFGUID guid, UINT *pDataSize, void *pData) { const HRESULT hr = obj_GetPrivateData((void *)This, guid, pDataSize, pData); if (FAILED(hr)) { static volatile LONG said; dx_failed(&said, "ID3D11HullShader::GetPrivateData", hr); } return hr; }
+static HRESULT STDMETHODCALLTYPE hs_vtbl_checked_SetPrivateData(ID3D11HullShader *This, REFGUID guid, UINT DataSize, const void *pData) { const HRESULT hr = obj_SetPrivateData((void *)This, guid, DataSize, pData); if (FAILED(hr)) { static volatile LONG said; dx_failed(&said, "ID3D11HullShader::SetPrivateData", hr); } return hr; }
+static HRESULT STDMETHODCALLTYPE hs_vtbl_checked_SetPrivateDataInterface(ID3D11HullShader *This, REFGUID guid, const IUnknown *pData) { const HRESULT hr = obj_SetPrivateDataInterface((void *)This, guid, pData); if (FAILED(hr)) { static volatile LONG said; dx_failed(&said, "ID3D11HullShader::SetPrivateDataInterface", hr); } return hr; }
+const ID3D11HullShaderVtbl hs_vtbl = {
+    .QueryInterface = (__typeof__(((ID3D11HullShaderVtbl *)0)->QueryInterface))obj_QueryInterface,
+    .AddRef = (__typeof__(((ID3D11HullShaderVtbl *)0)->AddRef))obj_AddRef,
+    .Release = (__typeof__(((ID3D11HullShaderVtbl *)0)->Release))obj_Release,
+    .GetDevice = (__typeof__(((ID3D11HullShaderVtbl *)0)->GetDevice))child_GetDevice,
+    .GetPrivateData = (__typeof__(((ID3D11HullShaderVtbl *)0)->GetPrivateData))hs_vtbl_checked_GetPrivateData,
+    .SetPrivateData = (__typeof__(((ID3D11HullShaderVtbl *)0)->SetPrivateData))hs_vtbl_checked_SetPrivateData,
+    .SetPrivateDataInterface = (__typeof__(((ID3D11HullShaderVtbl *)0)->SetPrivateDataInterface))hs_vtbl_checked_SetPrivateDataInterface,
+};
+static HRESULT STDMETHODCALLTYPE ds_vtbl_checked_GetPrivateData(ID3D11DomainShader *This, REFGUID guid, UINT *pDataSize, void *pData) { const HRESULT hr = obj_GetPrivateData((void *)This, guid, pDataSize, pData); if (FAILED(hr)) { static volatile LONG said; dx_failed(&said, "ID3D11DomainShader::GetPrivateData", hr); } return hr; }
+static HRESULT STDMETHODCALLTYPE ds_vtbl_checked_SetPrivateData(ID3D11DomainShader *This, REFGUID guid, UINT DataSize, const void *pData) { const HRESULT hr = obj_SetPrivateData((void *)This, guid, DataSize, pData); if (FAILED(hr)) { static volatile LONG said; dx_failed(&said, "ID3D11DomainShader::SetPrivateData", hr); } return hr; }
+static HRESULT STDMETHODCALLTYPE ds_vtbl_checked_SetPrivateDataInterface(ID3D11DomainShader *This, REFGUID guid, const IUnknown *pData) { const HRESULT hr = obj_SetPrivateDataInterface((void *)This, guid, pData); if (FAILED(hr)) { static volatile LONG said; dx_failed(&said, "ID3D11DomainShader::SetPrivateDataInterface", hr); } return hr; }
+const ID3D11DomainShaderVtbl ds_vtbl = {
+    .QueryInterface = (__typeof__(((ID3D11DomainShaderVtbl *)0)->QueryInterface))obj_QueryInterface,
+    .AddRef = (__typeof__(((ID3D11DomainShaderVtbl *)0)->AddRef))obj_AddRef,
+    .Release = (__typeof__(((ID3D11DomainShaderVtbl *)0)->Release))obj_Release,
+    .GetDevice = (__typeof__(((ID3D11DomainShaderVtbl *)0)->GetDevice))child_GetDevice,
+    .GetPrivateData = (__typeof__(((ID3D11DomainShaderVtbl *)0)->GetPrivateData))ds_vtbl_checked_GetPrivateData,
+    .SetPrivateData = (__typeof__(((ID3D11DomainShaderVtbl *)0)->SetPrivateData))ds_vtbl_checked_SetPrivateData,
+    .SetPrivateDataInterface = (__typeof__(((ID3D11DomainShaderVtbl *)0)->SetPrivateDataInterface))ds_vtbl_checked_SetPrivateDataInterface,
 };
 static HRESULT STDMETHODCALLTYPE layout_vtbl_checked_GetPrivateData(ID3D11InputLayout *This, REFGUID guid, UINT *pDataSize, void *pData) { const HRESULT hr = obj_GetPrivateData((void *)This, guid, pDataSize, pData); if (FAILED(hr)) { static volatile LONG said; dx_failed(&said, "ID3D11InputLayout::GetPrivateData", hr); } return hr; }
 static HRESULT STDMETHODCALLTYPE layout_vtbl_checked_SetPrivateData(ID3D11InputLayout *This, REFGUID guid, UINT DataSize, const void *pData) { const HRESULT hr = obj_SetPrivateData((void *)This, guid, DataSize, pData); if (FAILED(hr)) { static volatile LONG said; dx_failed(&said, "ID3D11InputLayout::SetPrivateData", hr); } return hr; }

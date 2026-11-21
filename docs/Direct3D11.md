@@ -35,11 +35,14 @@ constant ring is marked the same way when a list used it.
 | Direct3D 11 | here |
 |---|---|
 | buffers | a Direct3D 12 buffer in an upload heap: `Map` hands its memory out, a draw uses its GPU address. A write while a recorded draw reads it gives the buffer other memory (see above). |
-| constant buffers | Direct3D 12 here has one block of constants for all stages. The block of a draw is put together from the buffers bound to the vertex shader's slots, in slot order, then the pixel shader's, and goes into a ring of upload memory - so a constant buffer may change between draws without the list being sent. |
+| constant buffers | Direct3D 12 here has one block of constants for all stages. The block of a draw is put together from the buffers bound to the vertex shader's slots, in slot order, then the pixel shader's, the geometry shader's, the hull shader's and the domain shader's, and goes into a ring of upload memory - so a constant buffer may change between draws without the list being sent. |
 | textures | a Direct3D 12 texture in a default heap. The CPU reaches it through copies: `UpdateSubresource`, and `Map` of a dynamic or staging texture (a copy in memory, sent at `Unmap` or fetched at `Map`). R8 and A8 textures are kept as R8G8B8A8. |
+| arrays, cubes and volumes | `CreateTexture2D` with `ArraySize` > 1 (up to 256) is the kernel's `Texture2DArray`; with `D3D11_RESOURCE_MISC_TEXTURECUBE` and six layers its `TextureCube` (sampled by direction; `d3d12.dll` is told with `TcosD3D12ResourceOptions` that the next resource is a cube, as Direct3D 12 knows a cube only by its views); `CreateTexture3D` (`ID3D11Texture3D`, depth up to 256) its `Texture3D`. Their subresources are the program's (`MipLevels` as asked for, each slice of a volume's level through `UpdateSubresource`'s box or `Map`'s depth pitch), but **the kernel keeps one level of them**: what is written to the others is dropped, and sampling at any level reads the first. They are sampled only. A shader resource view made without a description is a `TEXTURE2DARRAY`, `TEXTURECUBE` or `TEXTURE3D` view. |
+| block-compressed textures | BC1, BC2 and BC3 (with their sRGB and typeless forms) are kept as they are: the rows of `UpdateSubresource`, `Map` and the initial data are rows of 4 x 4 blocks, and a box is on whole blocks. The kernel samples them as they are on the 3D hardware and decodes them for the CPU renderer ([Direct3DKernelMode.md](Direct3DKernelMode.md), *Block-compressed textures*). Sampled only; they are not copied with `CopyResource` / `CopySubresourceRegion`. |
+| geometry, hull and domain shaders | go into the pipeline as they are (`gs_4_0` / `gs_5_0`, `hs_5_0`, `ds_5_0`: the kernel's, [Direct3DKernelMode.md](Direct3DKernelMode.md)); a draw with a hull shader needs a domain shader and a patch-list topology (`D3D11_PRIMITIVE_TOPOLOGY_n_CONTROL_POINT_PATCHLIST`). Their constant buffers come after the pixel shader's in the block (`TcosD3D12StageConstantBases`). |
 | input layouts | the kernel takes 32-bit floats only: a layout with R8G8B8A8 or B8G8R8A8 colours gets its vertex buffers converted (a second buffer, made again when the first changes). |
 | state objects | one Direct3D 12 pipeline state for each combination of shaders, layout, blend, depth-stencil and rasterizer state that is drawn with, in a cache of 96. |
-| textures and samplers of the pixel shader | a table of 8 of each (t0 .. t7, s0 .. s7). A slot with nothing bound samples a white pixel. |
+| textures and samplers | a table of 8 of each (t0 .. t7, s0 .. s7) for all the stages: a slot the pixel shader has nothing bound to takes what the vertex, domain, geometry or hull shader has there (the kernel's texture units are the pipeline's, not a stage's). A slot with nothing bound samples a white texture of the kind the shaders declare there (2D, array, cube or volume: the kernel refuses a draw whose texture is of another kind). |
 | swap chains | `dxgi.dll` asks the device for its back buffers and their pixels (`ITcosPresenter`, src/Windows/tcosdx.h); the device hands out the Direct3D 12 queue's back buffers inside its own textures. The device is an `IDXGIDevice` too (up to `IDXGIDevice3`: resources offered are never discarded, `EnqueueSetEvent` sets the event once the work before it ran). |
 | queries | event, timestamp, timestamp-disjoint and occlusion queries. The queue runs each list before it returns, so `End` sends what was recorded and the query is answered: an event is done, a timestamp is `QueryPerformanceCounter` then. Occlusion is not counted (it says one sample passed). |
 
@@ -54,15 +57,19 @@ the vertex shader's end. `d3d11.dll` reads the sizes out of the shaders (`dcl_co
 
 ## What is not there
 
-- Deferred contexts and command lists; geometry, hull, domain and compute shaders; textures, samplers of the vertex shader.
-- 1D, 3D and cube textures; multisampling; mipmaps of a render target (`GenerateMips` does nothing); buffers as shader resources; unordered
-  access; stream output; predicates, counters and pipeline-statistics queries (E_NOTIMPL / E_INVALIDARG); occlusion counts.
+- Deferred contexts and command lists; compute shaders (`CreateComputeShader`, `Dispatch`, unordered access views: the kernel and `d3d12.dll`
+  have them, but buffers here are upload memory the GPU cannot write); `CreateGeometryShaderWithStreamOutput`; one stage's t<n> and another's
+  of a different texture in one draw (they share the table).
+- 1D textures and arrays of cubes; more than one level of an array, a cube or a volume (the others are dropped: the kernel keeps one); arrays,
+  cubes and volumes as render targets (a dynamic cube map is refused); BC4 .. BC7; multisampling; mipmaps of a render target (`GenerateMips`
+  does nothing); buffers as shader resources; unordered access; stream output; predicates, counters and pipeline-statistics queries
+  (E_NOTIMPL / E_INVALIDARG); occlusion counts (an occlusion query says one sample passed).
 - The sampler of t<n> is s<n>: the kernel pairs them by number. A shader that samples one texture with two samplers gets one.
 - Blend factors (`D3D11_BLEND_BLEND_FACTOR` is 1), wireframe, depth bias, the back face's stencil operations, anisotropy, border colours,
   comparison samplers - what Direct3D 12 here has not.
 - A draw needs a render target: there are no depth-only passes. All render targets of a draw have one size and format.
 - Vertex formats other than 32-bit floats and the two 8-bit colour formats; an instance step rate other than 1.
-- Textures above 4096 pixels a side; R8 and A8 as render targets; block-compressed formats.
+- Textures above 4096 pixels a side; R8 and A8 as render targets.
 
 A method that is not written answers E_NOTIMPL (or does nothing, for the ones that answer nothing), with the method's own signature - a
 32-bit program's stack stays whole (scripts/gen-dx-vtables.py writes those).
@@ -88,7 +95,11 @@ binding (`dxgk::set_stream_trace`).
 
 ## Tests
 
-`tests/windows/d3d11test.c` (40 checks): a device and its other faces, buffers, a triangle read back through a staging texture, a constant
+`tests/windows/d3d11test.c` (100 checks): a device and its other faces, buffers, a triangle read back through a staging texture, a constant
 buffer changed between two draws, the pixel shader's own constant buffer, colours as bytes in the vertices, a sampled texture and its
-update, a dynamic texture, depth, blending, indexed draws, a scissor rectangle, the state read back, a swap chain on a window. Run in the
-real kernel on its CPU renderer: `tests/wow64_qemu.sh d3d11test` (32-bit); the same source built for x86-64 passes too.
+update, a dynamic texture, depth, blending, indexed draws, a scissor rectangle, the state read back, a cube sampled by direction on each
+face (made with all its levels, a face updated, nothing bound), an array sampled by layer, a volume by slice (and one slice updated
+through a box), a geometry shader that adds a copy of the triangle, tessellation with hull and domain shaders that read constant buffers
+of their own, BC1 and BC3 textures (sampled, a block updated), a swap chain on a window. Run in the real kernel on its CPU renderer:
+`tests/wow64_qemu.sh d3d11test` (32-bit) and `GPU=std tests/d3d12_qemu.sh d3d11test` (64-bit), and on the 3D hardware (virgl, the BC
+textures as they are): `tests/d3d12_qemu.sh d3d11test`; all pass.

@@ -19,6 +19,8 @@ program hands over is kept in plain memory, and a draw brings it into the one fo
 | texture stages | eight. The states of the stages - operations, arguments, where a result goes - become a small key (`ff_stages.h`), and a key is written out as a pixel shader 2.0 that the translator below takes like a program's own, so it ends with the same alpha test and fog; the device keeps 48 of them by their keys. Every operation of Direct3D 9 for the colour and for the alpha but the bump environment ones (which pass on what they are given) and `D3DTOP_PREMODULATE` (the first argument); the arguments are the diffuse and specular colours, what the stage before gave, the stage's texture, the texture factor (`D3DRS_TEXTUREFACTOR`), the temporary register (`D3DTSS_RESULTARG`) and the stage's constant (`D3DTSS_CONSTANT`), each also as its complement or its alpha in every component; the third argument of `D3DTOP_MULTIPLYADD` and `D3DTOP_LERP`. A stage's result is clamped to 0 .. 1. The stages end at the first whose colour operation is `D3DTOP_DISABLE`; a stage with no texture that would read one passes on what it is given, the colour and the alpha each by itself. What an operation does not read is not in the key, so set-ups that draw the same share a shader. |
 | render states | a Direct3D 12 pipeline for each combination of the shaders and the states a pipeline holds (culling, depth test and write, blending with separate alpha, the colour write mask, stencil), in a cache of 64. Pipelines of the same shader share the kernel's shader (`d3d12.dll` keeps each bytecode once): the kernel has 128 of a stage at a time where it runs them itself, and if a pipeline cannot be made the cache is emptied and it is tried again. The alpha test is a constant of the pixel shader; the scissor rectangle and the viewport are set with the target. |
 | textures and surfaces | a Direct3D 12 texture of B8G8R8A8 whatever the program's format (A8R8G8B8, X8R8G8B8, R8G8B8, R5G6B5, X1R5G5B5, A1R5G5B5, A4R4G4B4, A8, L8, A8L8); the program's copy of a level is converted and sent when it is unlocked. A surface in system memory is memory only. Locking something that is drawn into fetches its pixels. |
+| cube and volume textures | `CreateCubeTexture` (`IDirect3DCubeTexture9`: faces by `LockRect` / `GetCubeMapSurface`, a face's surface locks the same pixels) and `CreateVolumeTexture` (`IDirect3DVolumeTexture9`: `LockBox`, slices one after the other; no `IDirect3DVolume9` objects) are the kernel's `TextureCube` and `Texture3D`, sampled by a program's pixel shader that declares `dcl_cube` / `dcl_volume`. They keep all the program's levels, but the kernel has one: the others are dropped. Not render targets. A sampler declared as a cube or a volume with nothing of that kind set samples a white one (and a 2D sampler with a cube set a white 2D texture): the kernel refuses a draw whose texture is of another kind. |
+| compressed textures | DXT1 .. DXT5 are kept as their blocks (Direct3D 12's BC1, BC2 for DXT2 / DXT3, BC3 for DXT4 / DXT5; a locked level's pitch is a row of blocks): 2D textures and cubes, not volumes or targets. The kernel samples them as they are on the 3D hardware and decodes them for the CPU renderer. DXT2 and DXT4's premultiplied alpha is taken as it is. |
 | render targets | the back buffer, textures and surfaces made as targets; depth buffers of D24S8 (the 24-bit and stencil formats) or 32-bit float. `GetRenderTargetData` fetches a target into a surface in memory. |
 | state blocks | a block holds all of the device's state, whatever kind was asked for. |
 | `Present` | the back buffer's pixels are read and put into the window with `SetDIBitsToDevice`, as `dxgi.dll` does for its swap chains. |
@@ -47,7 +49,7 @@ and two sets of texture coordinates. A shader the translator refuses cannot be m
 | bool constants `b<n>` | 16 registers after the floats, if the shader reads any; `defb` is decided when the shader is translated. |
 | inputs of a vertex shader | one register of four floats for each `dcl`, named `ATTR<register>`. A draw finds the element of the vertex declaration (or of the FVF code) with the same usage and index and decodes it on the CPU, whatever its type; an input the vertices have not is 0, 0, 0, 1. |
 | what goes from the vertex to the pixel shader | by what it is, which is how the kernel joins the stages: the two colours, texture coordinates 0 to 7, fog, and normal, tangent, binormal and blend weight of Shader Model 3 as further texture coordinates. So either stage can be the fixed-function one, which writes and reads colour 0 and texture coordinates 0 and 1. |
-| samplers | two-dimensional textures `t<n>` with samplers `s<n>`. The tables of a draw hold 2, 4, 8 or 16, by the highest sampler the pixel shader reads (a root signature for each size, made when first needed). |
+| samplers | textures `t<n>` with samplers `s<n>`: 2D, cube or volume as declared. The tables of a draw hold 2, 4, 8 or 16, by the highest sampler the pixel shader reads (a root signature for each size, made when first needed). |
 | instructions | the arithmetic ones, the matrix products, `lit`, `dst`, `nrm`, `crs`, `sincos`, `pow`, `lrp`, `sgn`, `cmp`, `cnd`, `dp2add`, `if` on a bool and on a comparison, `texkill`, `texld` with its projected and biased forms, `dsx` and `dsy`. |
 
 The block of constants of a draw is the vertex shader's registers and then the pixel shader's, 256 registers together at most (a draw whose
@@ -75,8 +77,9 @@ fixed-function pixel shader has the same five registers and the same ending. The
 projection matrix is a perspective one (its fourth column is not 0 0 0 1), as Direct3D 9 decides it - the w the pixel had before the
 projection divided, which is the depth in view space: fog by w. A draw says which by two weights among the registers.
 
-Refused by the translator: loops, `rep`, subroutines and the `break` instructions, the predicate register, integer constants, cube and
-volume samplers, `texldl` and `texldd`, textures in a vertex shader, more than one render target, a depth the pixel shader writes, `vPos`
+Samplers are declared as what the shader says (`dcl_2d`, `dcl_cube`, `dcl_volume`: `dcl_resource_texture2d / texturecube / texture3d`, `SmShader::sampler_kind`).
+Refused by the translator: loops, `rep`, subroutines and the `break` instructions, the predicate register, integer constants, 1D
+samplers, `texldl` and `texldd`, textures in a vertex shader, more than one render target, a depth the pixel shader writes, `vPos`
 and `vFace`.
 
 **Memory.** The rings are small (1 MiB of vertices: 21845 a draw at most, fewer with a vertex shader of more than three inputs - 16 bytes an
@@ -96,7 +99,8 @@ in the program, in the kernel, on the device - and the kernel could not make rin
 - Of the texture stages: bump environment mapping (`D3DTOP_BUMPENVMAP`, `D3DTOP_BUMPENVMAPLUMINANCE` and the signed formats they
   read), `D3DTOP_PREMODULATE`. The dot product writes the colour only, with the alpha by its own operation - not checked against
   Direct3D 9 itself.
-- Cube and volume textures, compressed formats (DXT), 16-bit and floating-point targets, multisampling.
+- More than one level of a cube or volume texture (the kernel keeps the first), cube maps of the fixed-function stages (their pixel shader samples 2D),
+  `texm3x3tex` and the other cube look-ups of pixel shaders 1.x, compressed volumes, 16-bit and floating-point targets, multisampling.
 - Clears of a part of a target; `StretchRect` and `UpdateSurface` of a part or between sizes; `GetDC` of a surface.
 - Clip planes, point size and sprites, wireframe, flat shading, depth bias, the blend factor, two-sided stencil, mirror and border
   addressing, anisotropic filtering - what Direct3D 12 here has not.
@@ -111,7 +115,7 @@ method that is written takes as many parameters as the interface gives it).
 
 `tests/SmToDxbcTest.cpp` (host, ASan and UBSan): shaders a compiler made (`tests/data/d3d9`, `scripts/gen-d3d9-test-shaders.sh`) are
 translated, the kernel's compiler takes the result, and the program it makes gives the same numbers as the kernel's own compiler for
-Direct3D 9 bytecode makes of the same shader; shaders written token by token give the numbers worked out for each kind of instruction
+Direct3D 9 bytecode makes of the same shader (and a cube and a volume sampler are declared as the kernel's `TextureCube` and `Texture3D`); shaders written token by token give the numbers worked out for each kind of instruction
 (constants through `a0`, bools, branches, `texkill`, the outputs of Shader Model 3, pixel shaders 1.x with their modifiers, factors
 and texture registers, and the alpha test and fog at a pixel shader's end); what is refused; every shortened shader and 30000
 with a bit turned.
@@ -127,12 +131,15 @@ every kind of argument, eight stages, the temporary register, and 3000 set-ups p
 is off, no texture passes on, what is not read is not in the key); keys of any bytes, buffers that are too small, and shaders shortened
 or with a bit turned.
 
-`tests/windows/d3d9test.c` (141 checks): the Direct3D object and the adapter, a device on a window, clears, vertices that are pixels (to
+`tests/windows/d3d9test.c` (157 checks): the Direct3D object and the adapter, a device on a window, clears, vertices that are pixels (to
 the pixel) and vertices through the matrices, vertex and index buffers, culling, fans, textures of 32 and 16 bits, the stage operations,
 the alpha test, blending, depth, the scissor rectangle, state blocks, the program's shaders (a vertex shader with the fixed-function pixel
 stage, vertex and pixel shaders of 1.1, 2.0 and 3.0 from FVF vertices and from a vertex buffer through a declaration, constants of both
 stages, a pixel shader that samples and discards, a pixel shader after the fixed-function vertex stage, pixel shaders 1.1 and 1.4, the alpha test and fog - by depth and by a vertex shader's factor - after a pixel shader), the fixed-function pipeline's alpha test
 with each kind of function and its fog by the pixel's depth (by z, and by w under a perspective projection) and by the vertex (also by the distance: range fog; and by what vertices that are pixels bring - their w, and the factor in the second colour's alpha), drawing into a texture and sampling it, `GetRenderTargetData`,
-`Present`, `Reset`, lighting (the lights kept and read back, ambient, a directional light by its angle, the colour sources, normals through the world matrix, a point light's distance and range, a spotlight's cone, the specular colour lit and unlit), texture coordinates (a texture matrix that moves and scales, projection, the set a stage reads, coordinates generated from the position), the texture stages (three and eight stages in a row, a stage with no texture and one switched off, every kind of argument, the operations that multiply, add, subtract, blend and take three arguments, the dot product, the temporary register, the alpha through the stages, the specular colour after them, and eighty set-ups one after the other - more than the device keeps shaders and pipelines for), and that everything is gone with its last reference. Run in the real kernel on its CPU renderer:
-`tests/wow64_qemu.sh d3d9test` (32-bit); the same source built for x86-64 passes too. `DxgkrnlTest` checks that the kernel compiles the
+`Present`, `Reset`, lighting (the lights kept and read back, ambient, a directional light by its angle, the colour sources, normals through the world matrix, a point light's distance and range, a spotlight's cone, the specular colour lit and unlit), texture coordinates (a texture matrix that moves and scales, projection, the set a stage reads, coordinates generated from the position), the texture stages (three and eight stages in a row, a stage with no texture and one switched off, every kind of argument, the operations that multiply, add, subtract, blend and take three arguments, the dot product, the temporary register, the alpha through the stages, the specular colour after them, and eighty set-ups one after the other - more than the device keeps shaders and pipelines for), and that everything is gone with its last reference. Also cube and volume textures (each face and slice
+sampled by a program's pixel shader, a face filled through its surface, a cube sampler with nothing set) and DXT1, DXT3 and DXT5 textures.
+Run in the real kernel on its CPU renderer: `tests/wow64_qemu.sh d3d9test` (32-bit) and `GPU=std tests/d3d12_qemu.sh d3d9test` (64-bit), and on
+the 3D hardware: `tests/d3d12_qemu.sh d3d9test`. All pass on the CPU renderer; on virgl all but one of the fog checks (vertices that are
+pixels with a 1 / w of 0, which should count as 1) - not looked into yet. `DxgkrnlTest` checks that the kernel compiles the
 vertex shader.

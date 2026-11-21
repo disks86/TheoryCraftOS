@@ -208,8 +208,10 @@ Windows side:
     changes to `bin` and starts `browser_x86.exe` (32-bit), and cmd ends with 0. The launcher's window, "Unigine Heaven Benchmark 4.0 (Basic
     Edition)", opens with its licence agreement; after "Agree" its settings page (API, quality, resolution, RUN). RUN starts `heaven.exe`, whose
     engine (`Unigine_x86.dll`) loads its configuration, writes `C:\Users\Default\Heaven\log.html`, sets up OpenAL sound and a Direct3D 11 device, and
-    then stops at its first cube texture: this system's d3d11.dll has no cube textures (nor 3D textures, geometry/hull/domain/compute shaders,
-    queries; docs/Direct3D11.md), and DirectX 9 stops because d3d9.dll has no cube maps. On OpenGL (`-video_app opengl`, the launcher's API
+    then stopped at its first cube texture: d3d11.dll had no cube textures (nor 3D textures, geometry/hull/domain shaders), and DirectX 9 stopped
+    because d3d9.dll had no cube maps. Both now have cube, array and volume textures (one level kept), BC1 - BC3 / DXT1 - DXT5 textures, and d3d11.dll
+    geometry, hull and domain shaders (docs/Direct3D11.md, docs/Direct3D9.md); Heaven has not been run again since (compute shaders and real occlusion
+    counts are still missing in d3d11.dll). On OpenGL (`-video_app opengl`, the launcher's API
     "OpenGL") the engine opens its window, "Unigine Heaven Benchmark 4.0 Basic (OpenGL)", and draws its loading screen with the software GL;
     the scene itself has not been seen yet (the run ended while it was still loading). Faults
     fixed on the way: the launcher's text (no `GetGlyphOutline`, docs/win32k/Gdi.md), `msvcr100.dll` folded into msvcrt.dll (docs/WindowsUserMode.md,
