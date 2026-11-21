@@ -502,6 +502,79 @@ void GlApi::glTexParameteriv(GLenum target, GLenum pname, UserPtr params) {
   tex_parameter_values(target, pname, v, n);
 }
 
+// The integer forms (GL 3.0): a border colour is taken and given as the integers themselves (for an integer texture), the other parameters as with ...iv.
+void GlApi::glTexParameterIiv(GLenum target, GLenum pname, UserPtr params) {
+  if (pname != GL_TEXTURE_BORDER_COLOR) { glTexParameteriv(target, pname, params); return; }
+  int32_t f[4];
+  if (!read_values(params, f, 4)) { error(GL_INVALID_VALUE); return; }
+  const double v[4] = {double(f[0]), double(f[1]), double(f[2]), double(f[3])};
+  tex_parameter_values(target, pname, v, 4);
+}
+void GlApi::glTexParameterIuiv(GLenum target, GLenum pname, UserPtr params) {
+  if (pname != GL_TEXTURE_BORDER_COLOR) { glTexParameteriv(target, pname, params); return; }
+  uint32_t f[4];
+  if (!read_values(params, f, 4)) { error(GL_INVALID_VALUE); return; }
+  const double v[4] = {double(f[0]), double(f[1]), double(f[2]), double(f[3])};
+  tex_parameter_values(target, pname, v, 4);
+}
+void GlApi::glGetTexParameterIiv(GLenum target, GLenum pname, UserPtr params) {
+  double v[4];
+  uint32_t n = 1;
+  if (!tex_parameter_get(target, pname, v, &n)) return;
+  int32_t f[4];
+  for (uint32_t i = 0; i < n; ++i) f[i] = static_cast<int32_t>(v[i]);
+  write_values(params, f, n);
+}
+void GlApi::glGetTexParameterIuiv(GLenum target, GLenum pname, UserPtr params) {
+  double v[4];
+  uint32_t n = 1;
+  if (!tex_parameter_get(target, pname, v, &n)) return;
+  uint32_t f[4];
+  for (uint32_t i = 0; i < n; ++i) f[i] = v[i] < 0 ? 0u : static_cast<uint32_t>(v[i]);
+  write_values(params, f, n);
+}
+
+// Multisample textures (GL 3.2): the storage of one sample per texel - this GL draws without multisampling (GL_MAX_SAMPLES is what renderbuffers keep) - so a
+// framebuffer can have one attached and a program that only writes to it works. Sampling one (sampler2DMS) is not in GLSL here yet. Unlike glTexStorage the
+// texture may be specified again.
+void GlApi::tex_image_multisample(uint32_t target, int32_t samples, uint32_t internal, int32_t w, int32_t h, int32_t d) {
+  if (target != GL_TEXTURE_2D_MULTISAMPLE && target != GL_TEXTURE_2D_MULTISAMPLE_ARRAY) { error(GL_INVALID_ENUM); return; }
+  if (samples < 0 || w < 0 || h < 0 || d < 0) { error(GL_INVALID_VALUE); return; }
+  if (w == 0 || h == 0 || d == 0) return;
+  uint32_t face;
+  webgl::Texture* t = texture_for_target(target, &face);
+  if (!t) { error(GL_INVALID_OPERATION); return; }
+  if (t->immutable && t->immutable_levels == 0) t->immutable = false;      // (one this made before: it may be made again)
+  gl_.tex_storage(target, 1, internal, static_cast<uint32_t>(w), static_cast<uint32_t>(h), static_cast<uint32_t>(d));
+  t->immutable_levels = 0;
+}
+void GlApi::glTexImage2DMultisample(GLenum target, GLsizei samples, GLenum internalformat, GLsizei width, GLsizei height, GLboolean fixedsamplelocations) {
+  (void)fixedsamplelocations;
+  if (target != GL_TEXTURE_2D_MULTISAMPLE) { error(GL_INVALID_ENUM); return; }
+  tex_image_multisample(target, samples, internalformat, width, height, 1);
+}
+void GlApi::glTexImage3DMultisample(GLenum target, GLsizei samples, GLenum internalformat, GLsizei width, GLsizei height, GLsizei depth, GLboolean fixedsamplelocations) {
+  (void)fixedsamplelocations;
+  if (target != GL_TEXTURE_2D_MULTISAMPLE_ARRAY) { error(GL_INVALID_ENUM); return; }
+  tex_image_multisample(target, samples, internalformat, width, height, depth);
+}
+
+// Buffer textures (GL 3.1): the texture bound to GL_TEXTURE_BUFFER takes its texels from a buffer object (0: none). Kept and reported (GL_TEXTURE_BUFFER_*);
+// sampling one (samplerBuffer) is not in GLSL here yet.
+void GlApi::glTexBuffer(GLenum target, GLenum internalformat, GLuint buffer) {
+  if (target != GL_TEXTURE_BUFFER) { error(GL_INVALID_ENUM); return; }
+  uint32_t face;
+  webgl::Texture* t = texture_for_target(target, &face);
+  if (!t) { error(GL_INVALID_OPERATION); return; }
+  if (buffer != 0 && !group_->buffers.known(buffer)) { error(GL_INVALID_OPERATION); return; }
+  const uint32_t object = buffer ? engine_buffer(buffer) : 0;      // (the engine's id of the buffer the program names)
+  if (buffer != 0 && !gl_.buffer_at(object)) { error(GL_INVALID_OPERATION); return; }
+  t->buffer = object;
+  t->buffer_format = buffer ? internalformat : 0;
+  t->buffer_offset = 0;
+  t->buffer_size = object ? gl_.buffer_size(object) : 0;
+}
+
 bool GlApi::tex_parameter_get(uint32_t target, uint32_t pname, double* out, uint32_t* count) {
   uint32_t face;
   webgl::Texture* t = texture_for_target(target, &face);
@@ -581,6 +654,15 @@ bool GlApi::tex_level_get(uint32_t target, int32_t level, uint32_t pname, double
     webgl::Texture* t = texture_for_target(target, &face);
     if (!t) return false;
     if (level < 0 || level >= static_cast<int32_t>(webgl::kMaxLevels)) { error(GL_INVALID_VALUE); return false; }
+    if (target == GL_TEXTURE_BUFFER) {      // (glTexBuffer's buffer, not an image)
+      switch (pname) {
+        case GL_TEXTURE_BUFFER_OFFSET: *out = static_cast<double>(t->buffer_offset); return true;
+        case GL_TEXTURE_BUFFER_SIZE: *out = static_cast<double>(t->buffer ? gl_.buffer_size(t->buffer) : 0); return true;      // (the whole buffer, as it is now)
+        case GL_TEXTURE_BUFFER_DATA_STORE_BINDING: *out = t->buffer ? group_->buffers.name_of(t->buffer) : 0; return true;
+        case GL_TEXTURE_INTERNAL_FORMAT: *out = t->buffer_format ? t->buffer_format : GL_RGBA8; return true;
+        default: break;
+      }
+    }
     const webgl::Image* im = gl_.texture_image(t, target, level);
     if (im && im->defined()) {
       w = im->w; h = im->h; d = im->d;

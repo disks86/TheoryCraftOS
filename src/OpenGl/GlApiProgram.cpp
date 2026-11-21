@@ -189,6 +189,14 @@ void GlApi::glBindAttribLocation(GLuint program, GLuint index, UserPtr name) {
   if (index >= webgl::kMaxAttribs) { error(GL_INVALID_VALUE); return; }
   gl_.bind_attrib_location(p, index, s.view());
 }
+// GL 3.0: the colour number a fragment output without layout(location) gets at the program's next link.
+void GlApi::glBindFragDataLocation(GLuint program, GLuint color, UserPtr name) {
+  const uint32_t p = program_object(program);
+  if (!p) { error(GL_INVALID_VALUE); return; }
+  String s(a_);
+  if (!read_string(name, -1, &s)) { error(GL_INVALID_VALUE); return; }
+  gl_.bind_frag_data_location(p, color, s.view());
+}
 uint64_t GlApi::glGetAttribLocation(GLuint program, UserPtr name) {
   const uint32_t p = program_object(program);
   if (!p) { error(GL_INVALID_VALUE); return static_cast<uint64_t>(-1); }
@@ -349,6 +357,16 @@ void GlApi::glGetVertexAttribiv(GLuint index, GLenum pname, UserPtr params) {
   int32_t f[4];
   for (uint32_t i = 0; i < n; ++i) f[i] = static_cast<int32_t>(v[i]);
   write_values(params, f, n);
+}
+// The integer forms (GL 3.0): GL_CURRENT_VERTEX_ATTRIB as the integers glVertexAttribI* set, the other values as glGetVertexAttribiv has them.
+void GlApi::glGetVertexAttribIiv(GLuint index, GLenum pname, UserPtr params) { glGetVertexAttribiv(index, pname, params); }
+void GlApi::glGetVertexAttribIuiv(GLuint index, GLenum pname, UserPtr params) {
+  double v[4];
+  uint32_t n = 0;
+  if (!vertex_attrib_get(index, pname, v, &n)) return;
+  uint32_t u[4];
+  for (uint32_t i = 0; i < n; ++i) u[i] = v[i] < 0 ? static_cast<uint32_t>(static_cast<int64_t>(v[i])) : static_cast<uint32_t>(v[i]);
+  write_values(params, u, n);
 }
 void GlApi::glGetVertexAttribdv(GLuint index, GLenum pname, UserPtr params) {
   double v[4];

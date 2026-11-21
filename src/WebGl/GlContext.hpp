@@ -242,7 +242,7 @@ constexpr uint32_t kMaxTfSeparateComponents = 64;
 
 struct ProgramObj {
   explicit ProgramObj(allocators::IAllocator& a)
-      : log(a), shaders(a), uniforms(a), attribs(a), links(a), vs_shared(a), fs_shared(a), bound_attribs(a), block_bindings(a), tf_varyings(a), tf_plan(a), tf_resources(a), outputs(a), locs(a), vs_record(a) {}
+      : log(a), shaders(a), uniforms(a), attribs(a), links(a), vs_shared(a), fs_shared(a), bound_attribs(a), bound_outputs(a), block_bindings(a), tf_varyings(a), tf_plan(a), tf_resources(a), outputs(a), locs(a), vs_record(a) {}
   String log;
   // The attached shaders, in the order attached. WebGL allows one per stage; desktop GL any number, linked together (shader::parse_glsl_units).
   struct Attached { uint32_t id; uint32_t type; };
@@ -258,6 +258,7 @@ struct ProgramObj {
   List<uint32_t> vs_shared, fs_shared;
   struct Bound { String name; int32_t loc; explicit Bound(allocators::IAllocator& a) : name(a), loc(0) {} };
   List<UniquePointer<Bound>> bound_attribs;
+  List<UniquePointer<Bound>> bound_outputs;      // glBindFragDataLocation: fragment outputs by name, used at the next link
   List<int32_t> block_bindings;        // per block of vs/fs (by index in the merged list)
   List<UniquePointer<String>> tf_varyings;
   uint32_t tf_mode = 0x8C8C;
@@ -665,6 +666,8 @@ class GlContext final : public shader::ITextureHost {
   bool program_status(uint32_t id, uint32_t pname, double* out);
   StringView program_log(uint32_t id);
   void bind_attrib_location(uint32_t program, uint32_t index, StringView name);
+  // glBindFragDataLocation (desktop GL 3.0): the colour number a fragment output without layout(location) gets at the next link.
+  void bind_frag_data_location(uint32_t program, uint32_t color, StringView name);
   int32_t get_attrib_location(uint32_t program, StringView name);
   uint32_t attached_shaders(uint32_t program, uint32_t* out, uint32_t max);
   void release_if_unattached(uint32_t shader);

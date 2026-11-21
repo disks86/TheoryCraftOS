@@ -623,19 +623,39 @@ void GlContext::link_program(uint32_t id) {
   }
   if (!link_transform_feedback(p, lm)) return;
 
-  // fragment outputs
+  // fragment outputs: the location the shader gives (layout(location)), else the one glBindFragDataLocation gave the name, else the lowest free one(s)
   p->frag_writes_all = false;
+  uint32_t taken = 0;      // (a bit per colour location below 32)
+  auto add_output = [&](const shader::Global& g, int32_t location) {
+    const uint32_t cnt = g.type.array ? g.type.array : 1;
+    for (uint32_t k = 0; k < cnt; ++k) {
+      p->outputs.push_back(ProgramObj::Output{location + static_cast<int32_t>(k), g.slot + k * fm.slots_of(g.type.element()), g.type.element()});
+      if (location + k < 32) taken |= 1u << (location + k);
+    }
+  };
+  List<const shader::Global*> unplaced(a_);
   for (uint64_t i = 0; i < fm.globals.count(); ++i) {
     const shader::Global& g = *fm.globals[i];
     if (g.kind == GlobalKind::Builtin && g.builtin == shader::kBvFragColor && g.referenced) {
       p->outputs.push_back(ProgramObj::Output{0, g.slot, g.type});
       p->frag_writes_all = true;
+      taken |= 1;
     } else if (g.kind == GlobalKind::Builtin && g.builtin == shader::kBvFragData && g.referenced) {
       for (uint32_t k = 0; k < g.type.array; ++k) p->outputs.push_back(ProgramObj::Output{static_cast<int32_t>(k), g.slot + 4 * k, shader::make_type(Base::Float, 4)});
+      for (uint32_t k = 0; k < g.type.array && k < 32; ++k) taken |= 1u << k;
     } else if (g.kind == GlobalKind::Out && g.builtin == shader::kBvNone) {
-      const uint32_t cnt = g.type.array ? g.type.array : 1;
-      for (uint32_t k = 0; k < cnt; ++k) p->outputs.push_back(ProgramObj::Output{(g.location < 0 ? 0 : g.location) + static_cast<int32_t>(k), g.slot + k * fm.slots_of(g.type.element()), g.type.element()});
+      int32_t location = g.location;
+      for (uint64_t b = 0; location < 0 && b < p->bound_outputs.count(); ++b)
+        if (p->bound_outputs[b]->name.view().equals(g.name.view())) location = p->bound_outputs[b]->loc;
+      if (location >= 0) add_output(g, location);
+      else unplaced.push_back(&g);
     }
+  }
+  for (const shader::Global* g : unplaced.view()) {
+    const uint32_t cnt = g->type.array ? g->type.array : 1;
+    uint32_t location = 0;
+    while (location + cnt <= 32 && ((taken >> location) & ((cnt >= 32 ? ~0u : (1u << cnt) - 1)))) ++location;
+    add_output(*g, location + cnt <= 32 ? static_cast<int32_t>(location) : 0);
   }
 
   link_collect_uniforms(p);
@@ -721,6 +741,19 @@ void GlContext::bind_attrib_location(uint32_t program, uint32_t index, StringVie
   p->bound_attribs.push_back(static_cast<UniquePointer<ProgramObj::Bound>&&>(b));
 }
 
+void GlContext::bind_frag_data_location(uint32_t program, uint32_t color, StringView name) {
+  ProgramObj* p = program_at(program);
+  if (!p) { set_error(INVALID_VALUE); return; }
+  if (color >= kMaxDrawBuffers) { set_error(INVALID_VALUE); return; }
+  if (name.starts_with("gl_")) { set_error(INVALID_OPERATION); return; }
+  for (uint64_t i = 0; i < p->bound_outputs.count(); ++i)
+    if (p->bound_outputs[i]->name.view().equals(name)) { p->bound_outputs[i]->loc = static_cast<int32_t>(color); return; }
+  UniquePointer<ProgramObj::Bound> b = UniquePointer<ProgramObj::Bound>::make(a_, a_);
+  if (!b || !b->name.assign(name)) return;
+  b->loc = static_cast<int32_t>(color);
+  p->bound_outputs.push_back(static_cast<UniquePointer<ProgramObj::Bound>&&>(b));
+}
+
 int32_t GlContext::get_attrib_location(uint32_t program, StringView name) {
   ProgramObj* p = program_at(program);
   if (!p) { set_error(INVALID_VALUE); return -1; }
@@ -748,7 +781,10 @@ int32_t GlContext::get_frag_data_location(uint32_t program, StringView name) {
   const shader::Module& fm = *p->fsm;
   for (uint64_t i = 0; i < fm.globals.count(); ++i) {
     const shader::Global& g = *fm.globals[i];
-    if (g.kind == GlobalKind::Out && g.name.view().equals(name)) return g.location < 0 ? 0 : g.location;
+    if (g.kind == GlobalKind::Out && g.name.view().equals(name)) {
+      for (const ProgramObj::Output& o : p->outputs.view()) if (o.slot == g.slot) return o.location;      // (where the link put it)
+      return g.location < 0 ? 0 : g.location;
+    }
   }
   return -1;
 }

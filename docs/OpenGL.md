@@ -40,6 +40,13 @@ opengl32.dll reads it back and draws it with `SetDIBitsToDevice` (also how memor
 What it reports: `GL_VERSION` "3.3.0 Compatibility Profile", `GL_SHADING_LANGUAGE_VERSION` 3.30, core profiles up to 3.3 with `wglCreateContextAttribsARB`. Every extension in
 `GL_EXTENSIONS` has all its commands (the generator checks; extensions it can only half cover lose their vendor-suffixed names so programs never find half an extension).
 
+Texture units: 16 for every stage (`GL_MAX_TEXTURE_IMAGE_UNITS`, vertex and combined alike), all a program's. `glDrawPixels` borrows the last two for its
+own quad and puts back what they held. The GL 3.0-3.2 commands a 3.3 renderer looks up by name are all there: `glBindFragDataLocation` (a shader's
+`layout(location)` first, then the bound colour, then the lowest free colours for the rest), the integer texture-parameter and vertex-attribute queries,
+conditional rendering (the draws are made: the same picture, more work), `glSampleMaski` / `glGetMultisamplefv` (one sample, at the centre),
+`glTexImage2D/3DMultisample` (the storage of one sample a texel: a framebuffer can render into one) and `glTexBuffer` (kept and reported). Sampling a
+multisample or buffer texture (`sampler2DMS`, `samplerBuffer`) is not in GLSL yet. Unigine Heaven's GL renderer looks up all of these.
+
 ## Tests
 
 - `tests/run_host_tests.sh OpenGlTest`: the generated client entries drive the real stream into `GlApi` (ASan+UBSan): immediate mode, quads/polygons, polygon modes, culling,
@@ -275,7 +282,7 @@ The desktop's 3D Test can draw its cube through the kernel GL path (the command 
 
 - GLSL: doubles (so none in transform feedback either), compute shaders, subroutines, SSBOs/images, implicit conversions beyond prototypes; `gl_Layer` and
   `gl_ViewportIndex` read by a fragment shader (`GL_ARB_fragment_layer_viewport`), viewport arrays, layered 1D array textures; unnamed blocks' members captured by xfb
-  layouts are reported as `Block.member`; `glBindFragDataLocation`.
+  layouts are reported as `Block.member`; `sampler2DMS` and `samplerBuffer` (the textures can be made, not sampled).
 - Clip distances (`gl_ClipDistance` with `GL_CLIP_DISTANCEi`, a compatibility shader's `gl_ClipVertex` against the user planes, or `gl_Position` when it writes neither) are
   tested per fragment, as interpolated varyings, like the fixed-function clip planes; a primitive is not cut geometrically.
 - The 3D hardware takes only part of GL (see "The 3D hardware"): the translator has no vertex streams, structure varyings between the extra stages, samplers in

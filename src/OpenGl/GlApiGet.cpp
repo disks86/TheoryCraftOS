@@ -155,8 +155,14 @@ bool GlApi::get_values(uint32_t pname, double* out, uint32_t* count, uint32_t* k
     case GL_MAX_PIXEL_MAP_TABLE: return one(PixelMap::kMaxSize);
     case GL_MAX_TEXTURE_UNITS: return one(kMaxTexUnits);
     case GL_MAX_TEXTURE_COORDS: return one(kMaxTexUnits);
-    case GL_MAX_TEXTURE_IMAGE_UNITS: case GL_MAX_VERTEX_TEXTURE_IMAGE_UNITS: return one(webgl::kMaxTextureUnits - 2);
-    case GL_MAX_COMBINED_TEXTURE_IMAGE_UNITS: return one(webgl::kMaxTextureUnits - 2);
+    // All the units (16, what GL 3.3 asks for; Unigine's engine refuses fewer). glDrawPixels borrows the last two for its own quad and gives them
+    // back as they were (GlApiPixels.cpp), so a program may use them: they used to be kept back, which left 14.
+    case GL_MAX_TEXTURE_IMAGE_UNITS: case GL_MAX_VERTEX_TEXTURE_IMAGE_UNITS: return one(webgl::kMaxTextureUnits);
+    case GL_MAX_COMBINED_TEXTURE_IMAGE_UNITS: return one(webgl::kMaxTextureUnits);
+    case GL_MAX_SAMPLE_MASK_WORDS: return one(1);
+    case GL_SAMPLE_MASK_VALUE: return one(static_cast<int32_t>(sample_mask_));
+    case GL_MAX_COLOR_TEXTURE_SAMPLES: case GL_MAX_DEPTH_TEXTURE_SAMPLES: case GL_MAX_INTEGER_SAMPLES: return one(1);      // (a multisample texture keeps one sample)
+    case GL_MAX_TEXTURE_BUFFER_SIZE: return one(65536);      // (GL 3.1's least)
     case GL_MAX_TEXTURE_SIZE: return one(16384);
     case GL_MAX_RECTANGLE_TEXTURE_SIZE: return one(16384);
     case GL_MAX_CUBE_MAP_TEXTURE_SIZE: return one(16384);

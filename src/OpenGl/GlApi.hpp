@@ -269,6 +269,8 @@ class GlApi {
   void client_state(uint32_t array, bool on);
   bool list_expand_draw(uint32_t op, ConstByteView command);
   uint32_t user_program_ = 0;      // the engine's id of the program glUseProgram chose
+  bool conditional_render_ = false;      // between glBeginConditionalRender and glEndConditionalRender (drawing is not skipped: see GlApiMisc.cpp)
+  uint32_t sample_mask_ = ~0u;           // glSampleMaski word 0 (kept and reported; there is no multisampled drawing)
   bool coherent_maps_ = false;
   void sync_coherent_maps();
 
@@ -314,6 +316,7 @@ class GlApi {
   void release_internal_objects();      // what this context made in its share group for itself
   static uint32_t default_texture_index(uint32_t target);
   webgl::Texture* texture_for_target(uint32_t target, uint32_t* face);
+  void tex_image_multisample(uint32_t target, int32_t samples, uint32_t internal, int32_t w, int32_t h, int32_t d);
   void store_floats(webgl::Image& image, uint32_t xo, uint32_t yo, uint32_t zo, uint32_t w, uint32_t h, uint32_t d, ConstByteView rgba, bool srgb_source);
   void texture_image(uint32_t target, int32_t level, int32_t internal, uint32_t w, uint32_t h, uint32_t d, int32_t border, uint32_t format, uint32_t type, UserPtr pixels, uint32_t dims);
   void texture_sub_image(uint32_t target, int32_t level, int32_t xo, int32_t yo, int32_t zo, uint32_t w, uint32_t h, uint32_t d, uint32_t format, uint32_t type, UserPtr pixels);

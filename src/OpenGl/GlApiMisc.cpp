@@ -749,6 +749,32 @@ void GlApi::glDeleteQueries(GLsizei n, UserPtr ids) {
   }
 }
 uint64_t GlApi::glIsQuery(GLuint id) { return id && query_names_.object(id) != 0; }
+// Conditional rendering (GL 3.0): the draws between Begin and End are made whatever the query found. That is what the NO_WAIT modes allow when the result
+// is not there yet; for the WAIT modes it draws what would have been skipped - more work, the same picture, since a query's draws are the ones that would
+// not be seen (an occlusion test). The errors are GL's.
+void GlApi::glBeginConditionalRender(GLuint id, GLenum mode) {
+  if (conditional_render_) { error(GL_INVALID_OPERATION); return; }
+  if (mode != GL_QUERY_WAIT && mode != GL_QUERY_NO_WAIT && mode != GL_QUERY_BY_REGION_WAIT && mode != GL_QUERY_BY_REGION_NO_WAIT) { error(GL_INVALID_ENUM); return; }
+  if (id == 0 || !glIsQuery(id)) { error(GL_INVALID_VALUE); return; }
+  conditional_render_ = true;
+}
+void GlApi::glEndConditionalRender() {
+  if (!conditional_render_) { error(GL_INVALID_OPERATION); return; }
+  conditional_render_ = false;
+}
+
+// Multisampling state (GL 3.2): one sample per pixel here, at the pixel's centre; the mask word is kept (GL_MAX_SAMPLE_MASK_WORDS is 1).
+void GlApi::glSampleMaski(GLuint maskNumber, GLbitfield mask) {
+  if (maskNumber != 0) { error(GL_INVALID_VALUE); return; }
+  sample_mask_ = mask;
+}
+void GlApi::glGetMultisamplefv(GLenum pname, GLuint index, UserPtr val) {
+  if (pname != GL_SAMPLE_POSITION) { error(GL_INVALID_ENUM); return; }
+  if (index != 0) { error(GL_INVALID_VALUE); return; }
+  const float centre[2] = {0.5f, 0.5f};
+  write_values(val, centre, 2);
+}
+
 void GlApi::glBeginQuery(GLenum target, GLuint id) { glBeginQueryIndexed(target, 0, id); }
 void GlApi::glEndQuery(GLenum target) { gl_.end_query(target); }
 void GlApi::glGetQueryiv(GLenum target, GLenum pname, UserPtr params) { glGetQueryIndexediv(target, 0, pname, params); }

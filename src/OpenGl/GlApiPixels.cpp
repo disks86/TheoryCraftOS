@@ -511,7 +511,8 @@ void GlApi::fragment_rect(int32_t x, int32_t y, uint32_t w, uint32_t h, ConstByt
     pixel_depth_texture_ = gl_.create_texture();
     pixel_buffer_ = gl_.create_buffer();
   }
-  // The picture goes in two hidden textures on the two last units.
+  // The picture goes in two hidden textures on the two last units, which a program may use too: what they hold (texture, sampler) and the active
+  // unit are put back below, so the program finds them as it left them.
   constexpr uint32_t kUnit = webgl::kMaxTextureUnits - 1, kDepthUnit = webgl::kMaxTextureUnits - 2;
   webgl::TextureUnit& unit = gl_.units_[kUnit];
   webgl::TextureUnit& depth_unit = gl_.units_[kDepthUnit];

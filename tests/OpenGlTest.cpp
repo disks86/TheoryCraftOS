@@ -648,6 +648,215 @@ static GLuint build(const char* vs, const char* fs) {
   return ok ? p : 0;
 }
 
+// All 16 texture units for a program (Unigine's engine refuses fewer): a fragment shader that samples every unit, and units 14 and 15, which
+// glDrawPixels borrows for its own quad, as the program left them after it.
+static void test_sixteen_texture_units() {
+  Fixture f;
+  GLint units = 0, combined = 0, vertex = 0;
+  glGetIntegerv(GL_MAX_TEXTURE_IMAGE_UNITS, &units);
+  glGetIntegerv(GL_MAX_COMBINED_TEXTURE_IMAGE_UNITS, &combined);
+  glGetIntegerv(GL_MAX_VERTEX_TEXTURE_IMAGE_UNITS, &vertex);
+  CHECK(units == 16 && combined == 16 && vertex == 16);
+  // texture i is one texel: red = 16 * i, green = 255 only on unit 15
+  GLuint tex[16];
+  glGenTextures(16, tex);
+  for (int i = 0; i < 16; ++i) {
+    const uint8_t texel[4] = {uint8_t(16 * i), uint8_t(i == 15 ? 255 : 0), 0, 255};
+    glActiveTexture(GL_TEXTURE0 + i);
+    glBindTexture(GL_TEXTURE_2D, tex[i]);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, 1, 1, 0, GL_RGBA, GL_UNSIGNED_BYTE, texel);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+  }
+  CHECK(glGetError() == GL_NO_ERROR);
+  const char* vs = "#version 330\nlayout(location=0) in vec2 pos;\nvoid main(){ gl_Position = vec4(pos, 0.0, 1.0); }\n";
+  // the average of the reds is (0 + 16 + ... + 240) / 16 / 255 = 120 / 255; the green comes from unit 15 alone; blue says unit 14 is unit 14 (red 224)
+  const char* fs =
+      "#version 330\nuniform sampler2D s[16];\nout vec4 o;\n"
+      "void main(){ vec4 sum = vec4(0.0); for (int i = 0; i < 16; ++i) sum += texture(s[i], vec2(0.5));\n"
+      "  o = vec4(sum.r / 16.0, texture(s[15], vec2(0.5)).g, texture(s[14], vec2(0.5)).r, 1.0); }\n";
+  const GLuint p = build(vs, fs);
+  CHECK(p != 0);
+  if (!p) return;
+  glUseProgram(p);
+  GLint samplers[16];
+  for (int i = 0; i < 16; ++i) samplers[i] = i;
+  glUniform1iv(glGetUniformLocation(p, "s"), 16, samplers);
+  const float quad[] = {-1, -1, 1, -1, -1, 1, 1, -1, 1, 1, -1, 1};
+  auto draw = [&] {
+    glClearColor(0, 0, 0, 1);
+    glClear(GL_COLOR_BUFFER_BIT);
+    glEnableVertexAttribArray(0);
+    glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 0, quad);
+    glDrawArrays(GL_TRIANGLES, 0, 6);
+    glDisableVertexAttribArray(0);
+  };
+  draw();
+  CHECK(glGetError() == GL_NO_ERROR);
+  const Pixel first = pixel(30, 30);
+  if (!near(first, 120, 255, 224, 2)) printf("  16 units: got %d %d %d\n", first.r, first.g, first.b);
+  CHECK(near(first, 120, 255, 224, 2));
+  // glDrawPixels on its own quad, then the program again: units 14 and 15 still hold the program's textures, and the active unit is unchanged
+  glActiveTexture(GL_TEXTURE0 + 3);
+  glUseProgram(0);
+  const uint8_t block[4] = {1, 2, 3, 255};
+  glRasterPos2i(0, 0);
+  glDrawPixels(1, 1, GL_RGBA, GL_UNSIGNED_BYTE, block);
+  GLint active = 0, bound15 = 0, bound14 = 0;
+  glGetIntegerv(GL_ACTIVE_TEXTURE, &active);
+  glActiveTexture(GL_TEXTURE0 + 15);
+  glGetIntegerv(GL_TEXTURE_BINDING_2D, &bound15);
+  glActiveTexture(GL_TEXTURE0 + 14);
+  glGetIntegerv(GL_TEXTURE_BINDING_2D, &bound14);
+  CHECK(active == GL_TEXTURE0 + 3 && bound15 == GLint(tex[15]) && bound14 == GLint(tex[14]));
+  glUseProgram(p);
+  draw();
+  CHECK(near(pixel(30, 30), 120, 255, 224, 2));
+  glUseProgram(0);
+  glDeleteProgram(p);
+  glDeleteTextures(16, tex);
+  CHECK(glGetError() == GL_NO_ERROR);
+}
+
+// The GL 3.0-3.2 commands a GL 3.3 renderer (Unigine's) looks up by name: fragment output locations, integer texture parameters and attribute queries,
+// conditional rendering, sample mask and positions, multisample and buffer textures.
+static void test_gl3_commands() {
+  Fixture f;
+  const char* vs = "#version 330\nlayout(location=0) in vec2 pos;\nvoid main(){ gl_Position = vec4(pos, 0.0, 1.0); }\n";
+  const char* fs = "#version 330\nout vec4 a;\nout vec4 b;\nvoid main(){ a = vec4(1.0, 0.0, 0.0, 1.0); b = vec4(0.0, 0.0, 1.0, 1.0); }\n";
+  // two outputs without layout(location): distinct locations, the lowest free ones
+  GLuint p = build(vs, fs);
+  CHECK(p != 0);
+  const GLint la = glGetFragDataLocation(p, "a"), lb = glGetFragDataLocation(p, "b");
+  CHECK(la >= 0 && lb >= 0 && la != lb && la + lb == 1);
+  // glBindFragDataLocation before linking: "b" is colour 0, "a" colour 1, and colour 0 is what the window shows
+  glBindFragDataLocation(p, 0, "b");
+  glBindFragDataLocation(p, 1, "a");
+  glLinkProgram(p);
+  GLint ok = 0;
+  glGetProgramiv(p, GL_LINK_STATUS, &ok);
+  CHECK(ok == GL_TRUE && glGetFragDataLocation(p, "b") == 0 && glGetFragDataLocation(p, "a") == 1);
+  glBindFragDataLocation(p, 99, "a");
+  CHECK(glGetError() == GL_INVALID_VALUE);
+  glBindFragDataLocation(p, 0, "gl_FragColor");
+  CHECK(glGetError() == GL_INVALID_OPERATION);
+  glUseProgram(p);
+  const float quad[] = {-1, -1, 1, -1, -1, 1, 1, -1, 1, 1, -1, 1};
+  glClearColor(0, 0, 0, 1);
+  glClear(GL_COLOR_BUFFER_BIT);
+  glEnableVertexAttribArray(0);
+  glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 0, quad);
+  // conditional rendering: drawn (the same picture as skipping an occluded draw would give); nested and unmatched calls are errors
+  GLuint query = 0;
+  glGenQueries(1, &query);
+  glBeginQuery(0x8914 /* GL_SAMPLES_PASSED */, query);
+  glEndQuery(0x8914);
+  glBeginConditionalRender(query, GL_QUERY_WAIT);
+  glBeginConditionalRender(query, GL_QUERY_WAIT);
+  CHECK(glGetError() == GL_INVALID_OPERATION);
+  glDrawArrays(GL_TRIANGLES, 0, 6);
+  glEndConditionalRender();
+  glEndConditionalRender();
+  CHECK(glGetError() == GL_INVALID_OPERATION);
+  glBeginConditionalRender(12345, GL_QUERY_WAIT);
+  CHECK(glGetError() == GL_INVALID_VALUE);
+  glDisableVertexAttribArray(0);
+  CHECK(near(pixel(30, 30), 0, 0, 255));
+  glUseProgram(0);
+  glDeleteProgram(p);
+  glDeleteQueries(1, &query);
+  // a layout(location) wins over a binding
+  const char* fs2 = "#version 330\nlayout(location=0) out vec4 c;\nvoid main(){ c = vec4(1.0); }\n";
+  p = build(vs, fs2);
+  glBindFragDataLocation(p, 3, "c");
+  glLinkProgram(p);
+  CHECK(glGetFragDataLocation(p, "c") == 0);
+  glDeleteProgram(p);
+
+  // integer texture parameters: the border colour as the integers themselves
+  GLuint tex = 0;
+  glGenTextures(1, &tex);
+  glBindTexture(GL_TEXTURE_2D, tex);
+  const GLint border[4] = {5, -7, 300, 1};
+  glTexParameterIiv(GL_TEXTURE_2D, GL_TEXTURE_BORDER_COLOR, border);
+  GLint back[4] = {};
+  glGetTexParameterIiv(GL_TEXTURE_2D, GL_TEXTURE_BORDER_COLOR, back);
+  CHECK(back[0] == 5 && back[1] == -7 && back[2] == 300 && back[3] == 1);
+  const GLuint wrap = GL_CLAMP_TO_EDGE;
+  glTexParameterIuiv(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, &wrap);
+  GLuint wrap_back = 0;
+  glGetTexParameterIuiv(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, &wrap_back);
+  CHECK(wrap_back == GL_CLAMP_TO_EDGE);
+  glDeleteTextures(1, &tex);
+  // integer attribute queries
+  glVertexAttribI4i(2, -3, 4, 5, 6);
+  GLint current[4] = {};
+  glGetVertexAttribIiv(2, GL_CURRENT_VERTEX_ATTRIB, current);
+  CHECK(current[0] == -3 && current[1] == 4 && current[3] == 6);
+  glVertexAttribI4ui(2, 7, 8, 9, 4000000000u);
+  GLuint ucurrent[4] = {};
+  glGetVertexAttribIuiv(2, GL_CURRENT_VERTEX_ATTRIB, ucurrent);
+  CHECK(ucurrent[0] == 7 && ucurrent[3] == 4000000000u);
+  // the sample mask and the sample positions
+  GLint words = 0, mask = 0;
+  glSampleMaski(0, 0x5);
+  glGetIntegerv(GL_MAX_SAMPLE_MASK_WORDS, &words);
+  glGetIntegerv(GL_SAMPLE_MASK_VALUE, &mask);
+  CHECK(words == 1 && mask == 5);
+  glSampleMaski(1, 0);
+  CHECK(glGetError() == GL_INVALID_VALUE);
+  float position[2] = {};
+  glGetMultisamplefv(GL_SAMPLE_POSITION, 0, position);
+  CHECK(position[0] == 0.5f && position[1] == 0.5f);
+  glGetMultisamplefv(GL_SAMPLE_POSITION, 1, position);
+  CHECK(glGetError() == GL_INVALID_VALUE);
+  // a multisample texture: its storage (one sample a texel), again with another size; a framebuffer takes it
+  GLuint ms = 0;
+  glGenTextures(1, &ms);
+  glBindTexture(GL_TEXTURE_2D_MULTISAMPLE, ms);
+  glTexImage2DMultisample(GL_TEXTURE_2D_MULTISAMPLE, 4, GL_RGBA8, 8, 4, GL_TRUE);
+  GLint w = 0, h = 0;
+  glGetTexLevelParameteriv(GL_TEXTURE_2D_MULTISAMPLE, 0, GL_TEXTURE_WIDTH, &w);
+  glGetTexLevelParameteriv(GL_TEXTURE_2D_MULTISAMPLE, 0, GL_TEXTURE_HEIGHT, &h);
+  CHECK(w == 8 && h == 4);
+  glTexImage2DMultisample(GL_TEXTURE_2D_MULTISAMPLE, 4, GL_RGBA8, 16, 16, GL_TRUE);
+  glGetTexLevelParameteriv(GL_TEXTURE_2D_MULTISAMPLE, 0, GL_TEXTURE_WIDTH, &w);
+  CHECK(w == 16 && glGetError() == GL_NO_ERROR);
+  glTexImage2DMultisample(GL_TEXTURE_2D, 4, GL_RGBA8, 16, 16, GL_TRUE);
+  CHECK(glGetError() == GL_INVALID_ENUM);
+  GLuint fb = 0;
+  glGenFramebuffers(1, &fb);
+  glBindFramebuffer(GL_FRAMEBUFFER, fb);
+  glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D_MULTISAMPLE, ms, 0);
+  const GLenum status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+  if (status != GL_FRAMEBUFFER_COMPLETE) printf("  multisample texture framebuffer: status 0x%x\n", status);
+  CHECK(status == GL_FRAMEBUFFER_COMPLETE);
+  glBindFramebuffer(GL_FRAMEBUFFER, 0);
+  glDeleteFramebuffers(1, &fb);
+  glDeleteTextures(1, &ms);
+  // a buffer texture: the buffer, its size and the format are what the texture reports
+  GLuint buffer = 0, tb = 0;
+  glGenBuffers(1, &buffer);
+  glBindBuffer(GL_TEXTURE_BUFFER, buffer);
+  glBufferData(GL_TEXTURE_BUFFER, 64, nullptr, GL_STATIC_DRAW);
+  glGenTextures(1, &tb);
+  glBindTexture(GL_TEXTURE_BUFFER, tb);
+  glTexBuffer(GL_TEXTURE_BUFFER, GL_RGBA32F, buffer);
+  GLint bound = 0, size = 0, format = 0;
+  glGetTexLevelParameteriv(GL_TEXTURE_BUFFER, 0, GL_TEXTURE_BUFFER_DATA_STORE_BINDING, &bound);
+  glGetTexLevelParameteriv(GL_TEXTURE_BUFFER, 0, GL_TEXTURE_BUFFER_SIZE, &size);
+  glGetTexLevelParameteriv(GL_TEXTURE_BUFFER, 0, GL_TEXTURE_INTERNAL_FORMAT, &format);
+  if (!(bound == GLint(buffer) && size == 64 && format == GL_RGBA32F)) printf("  buffer texture: bound %d (want %u) size %d format 0x%x error 0x%x\n", bound, buffer, size, format, glGetError());
+  CHECK(bound == GLint(buffer) && size == 64 && format == GL_RGBA32F);
+  glTexBuffer(GL_TEXTURE_BUFFER, GL_RGBA32F, 9999);
+  CHECK(glGetError() == GL_INVALID_OPERATION);
+  glTexBuffer(GL_TEXTURE_2D, GL_RGBA32F, buffer);
+  CHECK(glGetError() == GL_INVALID_ENUM);
+  glDeleteTextures(1, &tb);
+  glDeleteBuffers(1, &buffer);
+  CHECK(glGetError() == GL_NO_ERROR);
+}
+
 // Desktop GLSL with the compatibility built-ins, fed by the fixed-function state.
 static void test_desktop_glsl() {
   Fixture f;
@@ -2002,6 +2211,8 @@ int main() {
   test_state_stacks_and_get();
   test_selection_and_feedback();
   test_glsl_program();
+  test_sixteen_texture_units();
+  test_gl3_commands();
   test_desktop_glsl();
   test_several_shaders_per_stage();
   test_geometry_and_tessellation();
