@@ -117,14 +117,18 @@ typedef struct Buffer {      /* a vertex or an index buffer: plain memory, read 
 struct Tex {
   Child c;
   UINT width, height, levels;
+  UINT kind;                     /* the kernel's TextureKind: 0 2D, 1 a volume, 3 a cube (IDirect3DCubeTexture9, IDirect3DVolumeTexture9) */
+  UINT slices;                   /* a volume's depth (1 for the others) */
+  UINT kmips;                    /* the levels the Direct3D 12 texture has: the kernel keeps one of a volume or a cube, whose other levels are dropped */
   D3DFORMAT format;
   DWORD usage;
   D3DPOOL pool;
   int depth;                     /* a depth buffer */
   int target;                    /* something that is drawn into */
   ID3D12Resource *res;           /* NULL: memory only (a system-memory surface) */
-  BYTE *shadow[MAX_LEVELS];      /* the pixels of a level as the program has them, once it was locked */
-  DWORD locked[MAX_LEVELS];      /* the flags of the lock, | 0x80000000 while it is locked */
+  /* By subresource, face * levels + level (a cube's six faces; one for the others): */
+  BYTE *shadow[MAX_LEVELS * 6];  /* the pixels of a level as the program has them, once it was locked (a volume's: its slices one after the other) */
+  DWORD locked[MAX_LEVELS * 6];  /* the flags of the lock, | 0x80000000 while it is locked */
   UINT rtv_slot, dsv_slot;
   D3D12_CPU_DESCRIPTOR_HANDLE view;      /* of a target or a depth buffer */
   UINT used;                     /* the command list that has a command using it */
@@ -169,6 +173,7 @@ typedef struct Shader {
   UINT major;                    /* its shader model */
   UINT state;                    /* a pixel shader: the first of its state registers (the alpha test and fog: sm_to_dxbc.h) */
   UINT sampler_count;            /* a pixel shader: the highest sampler it reads, and one */
+  BYTE sampler_kind[16];         /* ... and what each is declared as (SM_SAMPLER_*: Tex.kind) */
   UINT coordinates;              /* ... and the highest set of texture coordinates */
   SmInput inputs[SHADER_INPUTS]; /* a vertex shader: what each input register is */
   UINT input_count;
@@ -238,6 +243,7 @@ struct Dev {
   UINT table_count;
   int tables_valid;
   Tex *blank;                    /* a white pixel: what a stage with no texture samples */
+  Tex *blank_kind[4];            /* ... a white volume and cube (by Tex.kind): what a sampler the pixel shader declares as one samples when nothing of that kind is set */
   UINT epoch;
   int recorded;
   int targets_dirty;             /* the next draw sets the render target, the viewport and the scissor rectangle again */
@@ -291,6 +297,8 @@ extern const IDirect3DDevice9Vtbl dev_vtbl;
 extern const IDirect3DVertexBuffer9Vtbl vb_vtbl;
 extern const IDirect3DIndexBuffer9Vtbl ib_vtbl;
 extern const IDirect3DTexture9Vtbl tex_vtbl;
+extern const IDirect3DCubeTexture9Vtbl cube_vtbl;
+extern const IDirect3DVolumeTexture9Vtbl vol_vtbl;
 extern const IDirect3DSurface9Vtbl surf_vtbl;
 extern const IDirect3DVertexDeclaration9Vtbl decl_vtbl;
 extern const IDirect3DStateBlock9Vtbl sb_vtbl;
@@ -302,6 +310,8 @@ static const GUID *const g_dev_iids[] = {&IID_IDirect3DDevice9, NULL};
 static const GUID *const g_vb_iids[] = {&IID_IDirect3DResource9, &IID_IDirect3DVertexBuffer9, NULL};
 static const GUID *const g_ib_iids[] = {&IID_IDirect3DResource9, &IID_IDirect3DIndexBuffer9, NULL};
 static const GUID *const g_tex_iids[] = {&IID_IDirect3DResource9, &IID_IDirect3DBaseTexture9, &IID_IDirect3DTexture9, NULL};
+static const GUID *const g_cube_iids[] = {&IID_IDirect3DResource9, &IID_IDirect3DBaseTexture9, &IID_IDirect3DCubeTexture9, NULL};
+static const GUID *const g_vol_iids[] = {&IID_IDirect3DResource9, &IID_IDirect3DBaseTexture9, &IID_IDirect3DVolumeTexture9, NULL};
 static const GUID *const g_surf_iids[] = {&IID_IDirect3DResource9, &IID_IDirect3DSurface9, NULL};
 static const GUID *const g_decl_iids[] = {&IID_IDirect3DVertexDeclaration9, NULL};
 static const GUID *const g_sb_iids[] = {&IID_IDirect3DStateBlock9, NULL};

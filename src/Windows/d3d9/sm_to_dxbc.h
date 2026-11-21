@@ -32,7 +32,8 @@
  *               SM_STATE_REGISTERS registers of cb0 after the floats and bools, from `state_register` on (SM_STATE_*): whoever draws fills them
  *               in from the render states - sm_state_none() for a draw with neither. The fog factor is the vertex shader's (TEXCOORD8) or made of
  *               the pixel's depth - z, or the w the projection gave it - which the shader reads as its position (input register 16).
- *   samplers    s<n> is texture t<n> with sampler s<n>, two-dimensional. A pixel shader 1.x names no samplers: its stage n is that pair.
+ *   samplers    s<n> is texture t<n> with sampler s<n>: two-dimensional, a cube (dcl_cube: TextureCube, sampled by direction) or a volume (dcl_volume:
+ *               Texture3D), as the shader declares it (`sampler_kind`). A pixel shader 1.x names no samplers: its stage n is that pair, two-dimensional.
  *
  * Pixel shaders 1.x are another instruction set over the same tokens: the texture registers t<n> are filled by instructions that sample stage n at
  * the texture coordinates n (or at something worked out of them), sources have modifiers that are arithmetic (_bias, _bx2, 1 - x, _x2, _dz, _dw),
@@ -41,7 +42,7 @@
  *
  * Refused (SM_UNSUPPORTED): of pixel shaders 1.x the bump environment instructions (texbem, texbeml, bem), the ones that look up a cube map
  * (texm3x3tex, texm3x3spec, texm3x3vspec) and the ones that write the depth (texdepth, texm3x2depth); loops, subroutines and predicates (loop, rep, call, label, setp, break*); integer constants;
- * cube and volume samplers; texldl and texldd; several render targets and the depth output; vPos and vFace; textures in a vertex shader. A malformed shader - a token stream that ends early, a register that is not there - is SM_INVALID. */
+ * samplers of a kind other than 2D, cube and volume; texldl and texldd; several render targets and the depth output; vPos and vFace; textures in a vertex shader. A malformed shader - a token stream that ends early, a register that is not there - is SM_INVALID. */
 #ifndef TCOS_SM_TO_DXBC_H
 #define TCOS_SM_TO_DXBC_H
 
@@ -66,6 +67,7 @@ typedef struct SmShader {
   unsigned constant_registers;          /* all of cb0: the floats, the bools if used, and a pixel shader's state registers */
   unsigned state_register;              /* a pixel shader: the first of its SM_STATE_REGISTERS state registers */
   unsigned sampler_mask;
+  uint8_t sampler_kind[16];             /* what each sampler of sampler_mask is: SM_SAMPLER_2D, SM_SAMPLER_VOLUME or SM_SAMPLER_CUBE (the kernel's TextureKind) */
   SmInput inputs[16];                   /* a vertex shader's declared inputs */
   unsigned input_count;
   unsigned varying_mask;                /* the slots (SM_SLOT_*) a vertex shader writes or a pixel shader reads */
@@ -73,6 +75,11 @@ typedef struct SmShader {
   uint8_t dxbc[SM_DXBC_BYTES];
   size_t dxbc_size;
 } SmShader;
+
+/* The kinds of texture a sampler is (SmShader.sampler_kind): the numbers of the kernel's TextureKind. */
+#define SM_SAMPLER_2D 0u
+#define SM_SAMPLER_VOLUME 1u
+#define SM_SAMPLER_CUBE 3u
 
 /* The slots of what goes from the vertex to the pixel shader: 0 the position, 1 and 2 the colours, 3 + n TEXCOORD<n>. */
 #define SM_SLOT_POSITION 0
@@ -624,10 +631,11 @@ static int sm_instruction(SmContext *c, unsigned op, unsigned flags, const SmPar
       const int project = (flags & 1) != 0, bias = (flags & 2) != 0;
       DxOperand resource, sampler;
       if (count != 3 || s->vertex || p[2].type != SMR_SAMPLER || p[2].number >= 16) return s->vertex && count == 3 ? SM_UNSUPPORTED : SM_INVALID;
-      if (c->sampler_declared[p[2].number] != 2) return c->sampler_declared[p[2].number] ? SM_UNSUPPORTED : SM_INVALID;
+      if (c->sampler_declared[p[2].number] < 2) return c->sampler_declared[p[2].number] ? SM_UNSUPPORTED : SM_INVALID;
       SM_TRY(sm_destination(c, &p[0], &d));
       SM_TRY(sm_source(c, &p[1], 0, &a));
       s->sampler_mask |= 1u << p[2].number;
+      s->sampler_kind[p[2].number] = (uint8_t)(c->sampler_declared[p[2].number] == 3 ? SM_SAMPLER_CUBE : c->sampler_declared[p[2].number] == 4 ? SM_SAMPLER_VOLUME : SM_SAMPLER_2D);
       resource = dx_src(DXT_RESOURCE, p[2].number, p[2].swizzle, 0);
       sampler.w[0] = ((unsigned)DXT_SAMPLER << 12) | (1u << 20);
       sampler.w[1] = p[2].number;
@@ -968,7 +976,9 @@ static int sm_translate(const uint32_t *tokens, size_t available, SmShader *out,
       number = r & 0x7FF;
       if (type == SMR_SAMPLER) {
         if (number >= 16) return SM_INVALID;
-        c->sampler_declared[number] = (uint8_t)(((usage_token >> 27) & 0xF) == 2 ? 2 : 1);      /* (two-dimensional, or a kind that is not taken) */
+        /* (2 two-dimensional, 3 a cube, 4 a volume - D3DSTT_* - or 1, a kind that is not taken) */
+        const unsigned texture_type = (usage_token >> 27) & 0xF;
+        c->sampler_declared[number] = (uint8_t)(texture_type >= 2 && texture_type <= 4 ? texture_type : 1);
       } else if (type == SMR_INPUT && out->vertex) {
         if (number >= 16 || out->input_count >= 16) return SM_INVALID;
         out->inputs[out->input_count].usage = (uint8_t)(usage_token & 0x1F);
@@ -1106,7 +1116,9 @@ static int sm_translate(const uint32_t *tokens, size_t available, SmShader *out,
     }
     for (unsigned unit = 0; unit < 16; ++unit) {
       if (!(out->sampler_mask >> unit & 1)) continue;
-      declarations[declaration_words++] = DXO_DCL_RESOURCE | (3u << 11) | (4u << 24);      /* dcl_resource_texture2d t<unit>, of floats */
+      /* dcl_resource_texture2d / texturecube / texture3d t<unit>, of floats */
+      const unsigned dimension = out->sampler_kind[unit] == SM_SAMPLER_CUBE ? 6u : out->sampler_kind[unit] == SM_SAMPLER_VOLUME ? 5u : 3u;
+      declarations[declaration_words++] = DXO_DCL_RESOURCE | (dimension << 11) | (4u << 24);
       declarations[declaration_words++] = ((unsigned)DXT_RESOURCE << 12) | (1u << 20);
       declarations[declaration_words++] = unit;
       declarations[declaration_words++] = 0x5555;

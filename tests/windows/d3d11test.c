@@ -893,6 +893,328 @@ static void test_three_planes(int packed) {
   begin(NULL);
 }
 
+/* ---- volumes, arrays and cubes ------------------------------------------------------------------------------------------------------------------------------------------- */
+
+static ID3D11SamplerState *point_sampler(void) {
+  D3D11_SAMPLER_DESC desc;
+  memset(&desc, 0, sizeof desc);
+  desc.Filter = D3D11_FILTER_MIN_MAG_MIP_POINT;
+  desc.AddressU = desc.AddressV = desc.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
+  desc.MaxLOD = D3D11_FLOAT32_MAX;
+  ID3D11SamplerState *sampler = NULL;
+  ID3D11Device_CreateSamplerState(g_device, &desc, &sampler);
+  return sampler;
+}
+/* Draws the middle triangle with vs_vol (the texture coordinate is the vertex colour: a direction, a layer or a depth) and `ps` sampling `view`; the pixel in the middle. */
+static UINT32 draw_lookup(ID3D11VertexShader *vs, ID3D11PixelShader *ps, ID3D11ShaderResourceView *view, ID3D11SamplerState *sampler, float x, float y, float z) {
+  ID3D11Buffer *vertices = triangle(0.5f, x, y, z);
+  begin(NULL);
+  clear(0, 0, 0);
+  bind_floats(vertices);
+  ID3D11DeviceContext_VSSetShader(g_context, vs, NULL, 0);
+  ID3D11DeviceContext_PSSetShader(g_context, ps, NULL, 0);
+  ID3D11DeviceContext_PSSetShaderResources(g_context, 0, 1, &view);
+  ID3D11DeviceContext_PSSetSamplers(g_context, 0, 1, &sampler);
+  ID3D11DeviceContext_Draw(g_context, 3, 0);
+  ID3D11ShaderResourceView *none = NULL;
+  ID3D11DeviceContext_PSSetShaderResources(g_context, 0, 1, &none);
+  const UINT32 got = read_target() ? pixel(32, 40) : 0;
+  if (vertices) ID3D11Buffer_Release(vertices);
+  return got;
+}
+
+static void test_texture_kinds(void) {
+  ID3D11VertexShader *vs = NULL;
+  ID3D11PixelShader *ps_cube = NULL, *ps_array = NULL, *ps_volume = NULL;
+  ID3D11SamplerState *sampler = point_sampler();
+  HRESULT hr = ID3D11Device_CreateVertexShader(g_device, dx_vs_vol_dxbc, sizeof dx_vs_vol_dxbc, NULL, &vs);
+  if (SUCCEEDED(hr)) hr = ID3D11Device_CreatePixelShader(g_device, dx_ps_texcube_dxbc, sizeof dx_ps_texcube_dxbc, NULL, &ps_cube);
+  if (SUCCEEDED(hr)) hr = ID3D11Device_CreatePixelShader(g_device, dx_ps_texarray_dxbc, sizeof dx_ps_texarray_dxbc, NULL, &ps_array);
+  if (SUCCEEDED(hr)) hr = ID3D11Device_CreatePixelShader(g_device, dx_ps_tex3d_dxbc, sizeof dx_ps_tex3d_dxbc, NULL, &ps_volume);
+  check(SUCCEEDED(hr) && sampler, "shaders that sample a cube, an array and a volume");
+  if (FAILED(hr) || !sampler) goto done;
+
+  /* A cube of 4 x 4 faces with all its levels (the program's subresources face by face, level by level), each face its own colour. */
+  {
+    static const UINT32 faces[6] = {0xFFFF0000u, 0xFF00FFFFu, 0xFF00FF00u, 0xFFFF00FFu, 0xFF0000FFu, 0xFFFFFF00u};      /* +X red, -X cyan, +Y green, -Y magenta, +Z blue, -Z yellow (as BGRA words) */
+    static UINT32 pixels[6][3][16];
+    D3D11_SUBRESOURCE_DATA initial[6 * 3];
+    for (int f = 0; f < 6; ++f)
+      for (int level = 0; level < 3; ++level) {
+        for (int i = 0; i < 16; ++i) pixels[f][level][i] = faces[f];
+        initial[f * 3 + level].pSysMem = pixels[f][level];
+        initial[f * 3 + level].SysMemPitch = (4 >> level) * 4;
+        initial[f * 3 + level].SysMemSlicePitch = 0;
+      }
+    D3D11_TEXTURE2D_DESC desc = {4, 4, 0, 6, DXGI_FORMAT_B8G8R8A8_UNORM, {1, 0}, D3D11_USAGE_DEFAULT, D3D11_BIND_SHADER_RESOURCE, 0, D3D11_RESOURCE_MISC_TEXTURECUBE};
+    ID3D11Texture2D *cube = NULL;
+    ID3D11ShaderResourceView *view = NULL;
+    hr = ID3D11Device_CreateTexture2D(g_device, &desc, initial, &cube);
+    D3D11_TEXTURE2D_DESC got_desc;
+    memset(&got_desc, 0, sizeof got_desc);
+    if (cube) ID3D11Texture2D_GetDesc(cube, &got_desc);
+    check(SUCCEEDED(hr) && cube && got_desc.MipLevels == 3 && got_desc.ArraySize == 6 && (got_desc.MiscFlags & D3D11_RESOURCE_MISC_TEXTURECUBE), "a cube texture with all its levels, and its description");
+    if (cube) hr = ID3D11Device_CreateShaderResourceView(g_device, (ID3D11Resource *)cube, NULL, &view);
+    D3D11_SHADER_RESOURCE_VIEW_DESC view_desc;
+    memset(&view_desc, 0, sizeof view_desc);
+    if (view) ID3D11ShaderResourceView_GetDesc(view, &view_desc);
+    check(view && view_desc.ViewDimension == D3D11_SRV_DIMENSION_TEXTURECUBE && view_desc.TextureCube.MipLevels == 3, "a view of the cube is a TEXTURECUBE view");
+    if (view) {
+      static const float directions[6][3] = {{1, 0.2f, 0.1f}, {-1, 0.1f, 0.2f}, {0.2f, 1, 0.1f}, {0.1f, -1, 0.2f}, {0.2f, 0.1f, 1}, {0.1f, 0.2f, -1}};
+      int good = 0;
+      char what[160];
+      for (int f = 0; f < 6; ++f) {
+        const UINT32 got = draw_lookup(vs, ps_cube, view, sampler, directions[f][0], directions[f][1], directions[f][2]);
+        if ((got & 0xFFFFFFu) == (faces[f] & 0xFFFFFFu)) ++good;
+        else { snprintf(what, sizeof what, "cube face %d: got %08X, wanted %08X", f, (unsigned)got, (unsigned)faces[f]); check(0, what); }
+      }
+      check(good == 6, "a cube sampled by direction: each of the six faces");
+      /* UpdateSubresource of face -Z (subresource 5 * 3 levels + level 0) */
+      UINT32 white[16];
+      for (int i = 0; i < 16; ++i) white[i] = 0xFFFFFFFFu;
+      ID3D11DeviceContext_UpdateSubresource(g_context, (ID3D11Resource *)cube, (5 * 3 + 0), NULL, white, 16, 0);
+      const UINT32 got = draw_lookup(vs, ps_cube, view, sampler, directions[5][0], directions[5][1], directions[5][2]);
+      check((got & 0xFFFFFFu) == 0xFFFFFFu, "UpdateSubresource of a face of the cube");
+      ID3D11ShaderResourceView_Release(view);
+    }
+    if (cube) ID3D11Texture2D_Release(cube);
+    /* nothing bound to a slot the shader declares as a cube: a white cube is sampled (the draw is not left out) */
+    const UINT32 blank = draw_lookup(vs, ps_cube, NULL, sampler, 1, 0, 0);
+    check((blank & 0xFFFFFFu) == 0xFFFFFFu, "a cube slot with nothing bound samples white");
+    desc.ArraySize = 12;
+    ID3D11Texture2D *array_of_cubes = NULL;
+    check(ID3D11Device_CreateTexture2D(g_device, &desc, NULL, &array_of_cubes) == DXGI_ERROR_UNSUPPORTED && !array_of_cubes, "an array of cubes is refused (not there)");
+    if (array_of_cubes) ID3D11Texture2D_Release(array_of_cubes);
+  }
+
+  /* An array of four layers of 2 x 2, sampled at layer 2; and layer 1 changed with UpdateSubresource. */
+  {
+    static UINT32 layers[4][4];
+    static const UINT32 colours[4] = {0xFFFF0000u, 0xFF00FF00u, 0xFF0000FFu, 0xFFFFFFFFu};
+    D3D11_SUBRESOURCE_DATA initial[4];
+    for (int l = 0; l < 4; ++l) {
+      for (int i = 0; i < 4; ++i) layers[l][i] = colours[l];
+      initial[l].pSysMem = layers[l];
+      initial[l].SysMemPitch = 8;
+      initial[l].SysMemSlicePitch = 0;
+    }
+    D3D11_TEXTURE2D_DESC desc = {2, 2, 1, 4, DXGI_FORMAT_B8G8R8A8_UNORM, {1, 0}, D3D11_USAGE_DEFAULT, D3D11_BIND_SHADER_RESOURCE, 0, 0};
+    ID3D11Texture2D *array = NULL;
+    ID3D11ShaderResourceView *view = NULL;
+    hr = ID3D11Device_CreateTexture2D(g_device, &desc, initial, &array);
+    if (SUCCEEDED(hr)) hr = ID3D11Device_CreateShaderResourceView(g_device, (ID3D11Resource *)array, NULL, &view);
+    D3D11_SHADER_RESOURCE_VIEW_DESC view_desc;
+    memset(&view_desc, 0, sizeof view_desc);
+    if (view) ID3D11ShaderResourceView_GetDesc(view, &view_desc);
+    check(SUCCEEDED(hr) && view && view_desc.ViewDimension == D3D11_SRV_DIMENSION_TEXTURE2DARRAY && view_desc.Texture2DArray.ArraySize == 4, "a 2D array of four layers and its view");
+    if (view) {
+      const UINT32 got = draw_lookup(vs, ps_array, view, sampler, 0.5f, 0.5f, 2.0f);
+      check((got & 0xFFFFFFu) == 0x0000FFu, "an array sampled at layer 2");
+      UINT32 grey[4] = {0xFF808080u, 0xFF808080u, 0xFF808080u, 0xFF808080u};
+      ID3D11DeviceContext_UpdateSubresource(g_context, (ID3D11Resource *)array, 1, NULL, grey, 8, 0);
+      const UINT32 again = draw_lookup(vs, ps_array, view, sampler, 0.5f, 0.5f, 1.0f);
+      check(red(again) == 0x80 && green(again) == 0x80, "UpdateSubresource of layer 1, sampled");
+      ID3D11ShaderResourceView_Release(view);
+    }
+    if (array) ID3D11Texture2D_Release(array);
+  }
+
+  /* A volume of 2 x 2 x 4: its slices from the initial data, then slice 2 through UpdateSubresource with a box. */
+  {
+    static UINT32 slices[4][4];
+    static const UINT32 colours[4] = {0xFFFF0000u, 0xFF00FF00u, 0xFF0000FFu, 0xFFFFFF00u};
+    for (int z = 0; z < 4; ++z) for (int i = 0; i < 4; ++i) slices[z][i] = colours[z];
+    D3D11_SUBRESOURCE_DATA initial = {slices, 8, 16};
+    D3D11_TEXTURE3D_DESC desc = {2, 2, 4, 1, DXGI_FORMAT_B8G8R8A8_UNORM, D3D11_USAGE_DEFAULT, D3D11_BIND_SHADER_RESOURCE, 0, 0};
+    ID3D11Texture3D *volume = NULL;
+    ID3D11ShaderResourceView *view = NULL;
+    hr = ID3D11Device_CreateTexture3D(g_device, &desc, &initial, &volume);
+    D3D11_TEXTURE3D_DESC got_desc;
+    D3D11_RESOURCE_DIMENSION type = D3D11_RESOURCE_DIMENSION_UNKNOWN;
+    memset(&got_desc, 0, sizeof got_desc);
+    if (volume) { ID3D11Texture3D_GetDesc(volume, &got_desc); ID3D11Texture3D_GetType(volume, &type); }
+    check(SUCCEEDED(hr) && volume && got_desc.Depth == 4 && got_desc.Width == 2 && type == D3D11_RESOURCE_DIMENSION_TEXTURE3D, "CreateTexture3D: a volume, its description and type");
+    if (volume) hr = ID3D11Device_CreateShaderResourceView(g_device, (ID3D11Resource *)volume, NULL, &view);
+    if (view) {
+      int good = 1;
+      for (int z = 0; z < 4; ++z) {
+        const UINT32 got = draw_lookup(vs, ps_volume, view, sampler, 0.5f, 0.5f, (z + 0.5f) / 4);
+        if ((got & 0xFFFFFFu) != (colours[z] & 0xFFFFFFu)) {
+          char what[120];
+          snprintf(what, sizeof what, "volume slice %d: got %08X", z, (unsigned)got);
+          check(0, what);
+          good = 0;
+        }
+      }
+      check(good, "a volume sampled at the middle of each of its four slices");
+      UINT32 white[4] = {0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu};
+      const D3D11_BOX box = {0, 0, 2, 2, 2, 3};
+      ID3D11DeviceContext_UpdateSubresource(g_context, (ID3D11Resource *)volume, 0, &box, white, 8, 16);
+      const UINT32 got = draw_lookup(vs, ps_volume, view, sampler, 0.5f, 0.5f, 2.5f / 4);
+      const UINT32 other = draw_lookup(vs, ps_volume, view, sampler, 0.5f, 0.5f, 1.5f / 4);
+      check((got & 0xFFFFFFu) == 0xFFFFFFu && (other & 0xFFFFFFu) == 0x00FF00u, "UpdateSubresource of one slice of the volume");
+      ID3D11ShaderResourceView_Release(view);
+    }
+    if (volume) ID3D11Texture3D_Release(volume);
+  }
+done:
+  if (sampler) ID3D11SamplerState_Release(sampler);
+  if (ps_cube) ID3D11PixelShader_Release(ps_cube);
+  if (ps_array) ID3D11PixelShader_Release(ps_array);
+  if (ps_volume) ID3D11PixelShader_Release(ps_volume);
+  if (vs) ID3D11VertexShader_Release(vs);
+  begin(NULL);
+}
+
+/* ---- geometry, hull and domain shaders ----------------------------------------------------------------------------------------------------------------------------------- */
+
+static void test_shader_stages(void) {
+  ID3D11GeometryShader *gs = NULL;
+  ID3D11HullShader *hs = NULL;
+  ID3D11DomainShader *ds = NULL;
+  HRESULT hr = ID3D11Device_CreateGeometryShader(g_device, dx_gs_copy_dxbc, sizeof dx_gs_copy_dxbc, NULL, &gs);
+  check(SUCCEEDED(hr) && gs, "CreateGeometryShader");
+  if (gs) {
+    /* gs_copy: the triangle as it is, and a copy half the size moved to the lower right with its colour's red and blue exchanged */
+    ID3D11Buffer *vertices = triangle(0.5f, 1, 0, 0);
+    begin(NULL);
+    clear(0, 0, 0);
+    bind_floats(vertices);
+    ID3D11DeviceContext_PSSetShader(g_context, g_ps_color, NULL, 0);
+    ID3D11DeviceContext_GSSetShader(g_context, gs, NULL, 0);
+    ID3D11DeviceContext_Draw(g_context, 3, 0);
+    ID3D11GeometryShader *bound = NULL;
+    ID3D11DeviceContext_GSGetShader(g_context, &bound, NULL, NULL);
+    check(bound == gs, "GSGetShader gives back what is bound");
+    if (bound) ID3D11GeometryShader_Release(bound);
+    ID3D11DeviceContext_GSSetShader(g_context, NULL, NULL, 0);
+    read_target();
+    /* (the copy: x / 2 + 0.5, y / 2 - 0.5; its middle is at about (48, 44) of 64, below the original's apex region) */
+    check(red(pixel(32, 30)) == 255 && blue(pixel(32, 30)) == 0, "a geometry shader: the triangle it passes on");
+    check(blue(pixel(48, 54)) == 255 && red(pixel(48, 54)) == 0, "... and the copy it adds, in the lower right with red and blue exchanged");
+    if (vertices) ID3D11Buffer_Release(vertices);
+    ID3D11GeometryShader_Release(gs);
+  }
+
+  hr = ID3D11Device_CreateHullShader(g_device, dx_hs_tri_cb_dxbc, sizeof dx_hs_tri_cb_dxbc, NULL, &hs);
+  if (SUCCEEDED(hr)) hr = ID3D11Device_CreateDomainShader(g_device, dx_ds_shift_dxbc, sizeof dx_ds_shift_dxbc, NULL, &ds);
+  check(SUCCEEDED(hr) && hs && ds, "CreateHullShader and CreateDomainShader");
+  if (hs && ds) {
+    /* hs_tri_cb: the factors from its constant buffer (after a matrix); ds_shift: the points moved by its own constant buffer */
+    const float hull_constants[24] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 4, 4, 4, 4, 0, 0, 0, 0};
+    const float domain_constants[4] = {0.5f, 0, 0, 0};
+    ID3D11Buffer *hull_buffer = make_buffer(D3D11_BIND_CONSTANT_BUFFER, D3D11_USAGE_DEFAULT, 0, hull_constants, sizeof hull_constants);
+    ID3D11Buffer *domain_buffer = make_buffer(D3D11_BIND_CONSTANT_BUFFER, D3D11_USAGE_DEFAULT, 0, domain_constants, sizeof domain_constants);
+    ID3D11Buffer *vertices = triangle(0.5f, 0, 1, 0);
+    begin(NULL);
+    clear(0, 0, 0);
+    bind_floats(vertices);
+    ID3D11DeviceContext_PSSetShader(g_context, g_ps_color, NULL, 0);
+    ID3D11DeviceContext_HSSetShader(g_context, hs, NULL, 0);
+    ID3D11DeviceContext_DSSetShader(g_context, ds, NULL, 0);
+    ID3D11DeviceContext_HSSetConstantBuffers(g_context, 0, 1, &hull_buffer);
+    ID3D11DeviceContext_DSSetConstantBuffers(g_context, 0, 1, &domain_buffer);
+    ID3D11DeviceContext_IASetPrimitiveTopology(g_context, D3D11_PRIMITIVE_TOPOLOGY_3_CONTROL_POINT_PATCHLIST);
+    ID3D11DeviceContext_Draw(g_context, 3, 0);
+    read_target();
+    /* (moved right by a quarter of the target: x 0.5 in clip space; the triangle's left foot at 6 of 64 is now at about 22) */
+    int lit = 0;
+    for (int i = 0; i < SIZE * SIZE; ++i) if (g_pixels[i] & 0xFFFFFF) ++lit;
+    check(green(pixel(48, 40)) == 255 && (pixel(10, 56) & 0xFFFFFF) == 0 && lit > 600, "tessellation: hull and domain shaders with constant buffers of their own (the triangle moved right)");
+    ID3D11HullShader *bound_hs = NULL;
+    ID3D11DomainShader *bound_ds = NULL;
+    ID3D11DeviceContext_HSGetShader(g_context, &bound_hs, NULL, NULL);
+    ID3D11DeviceContext_DSGetShader(g_context, &bound_ds, NULL, NULL);
+    check(bound_hs == hs && bound_ds == ds, "HSGetShader and DSGetShader");
+    if (bound_hs) ID3D11HullShader_Release(bound_hs);
+    if (bound_ds) ID3D11DomainShader_Release(bound_ds);
+    ID3D11DeviceContext_HSSetShader(g_context, NULL, NULL, 0);
+    ID3D11DeviceContext_DSSetShader(g_context, NULL, NULL, 0);
+    ID3D11Buffer *none = NULL;
+    ID3D11DeviceContext_HSSetConstantBuffers(g_context, 0, 1, &none);
+    ID3D11DeviceContext_DSSetConstantBuffers(g_context, 0, 1, &none);
+    if (vertices) ID3D11Buffer_Release(vertices);
+    if (hull_buffer) ID3D11Buffer_Release(hull_buffer);
+    if (domain_buffer) ID3D11Buffer_Release(domain_buffer);
+  }
+  if (hs) ID3D11HullShader_Release(hs);
+  if (ds) ID3D11DomainShader_Release(ds);
+  begin(NULL);
+}
+
+/* ---- block-compressed textures ----------------------------------------------------------------------------------------------------------------------------------------- */
+
+static void test_compressed(void) {
+  /* An 8 x 8 texture of four blocks, BC1 (DXT1) and BC3 (DXT5): blue, blue / blue, white. */
+  const DXGI_FORMAT formats[2] = {DXGI_FORMAT_BC1_UNORM, DXGI_FORMAT_BC3_UNORM};
+  ID3D11SamplerState *sampler = point_sampler();
+  for (int i = 0; i < 2; ++i) {
+    const UINT size = i == 0 ? 8 : 16;
+    BYTE blocks[4 * 16];
+    memset(blocks, 0, sizeof blocks);
+    static const WORD colours[4] = {0x001F, 0x001F, 0x001F, 0xFFFF};
+    for (int b = 0; b < 4; ++b) {
+      BYTE *block = blocks + b * size;
+      if (i == 1) { block[0] = 255; block[1] = 255; }
+      BYTE *colour = block + size - 8;
+      colour[0] = (BYTE)colours[b]; colour[1] = (BYTE)(colours[b] >> 8); colour[2] = (BYTE)colours[b]; colour[3] = (BYTE)(colours[b] >> 8);
+    }
+    D3D11_TEXTURE2D_DESC desc = {8, 8, 1, 1, formats[i], {1, 0}, D3D11_USAGE_DEFAULT, D3D11_BIND_SHADER_RESOURCE, 0, 0};
+    D3D11_SUBRESOURCE_DATA initial = {blocks, 2 * size, 0};
+    ID3D11Texture2D *texture = NULL;
+    ID3D11ShaderResourceView *view = NULL;
+    UINT support = 0;
+    ID3D11Device_CheckFormatSupport(g_device, formats[i], &support);
+    HRESULT hr = ID3D11Device_CreateTexture2D(g_device, &desc, &initial, &texture);
+    if (SUCCEEDED(hr)) hr = ID3D11Device_CreateShaderResourceView(g_device, (ID3D11Resource *)texture, NULL, &view);
+    char what[160];
+    snprintf(what, sizeof what, "a %s texture of 8 x 8 with its blocks, and a view of it", i == 0 ? "BC1" : "BC3");
+    check(SUCCEEDED(hr) && view && (support & D3D11_FORMAT_SUPPORT_TEXTURE2D), what);
+    if (view) {
+      /* ps_tex samples at twice the colour's red and green: (0.1, 0.1) -> texel (1, 1) of block (0, 0), blue; (0.4, 0.4) -> texel (6, 6), white */
+      UINT32 got = 0, white = 0;
+      ID3D11Buffer *vertices = triangle(0.5f, 0.1f, 0.1f, 1.0f);
+      begin(NULL);
+      clear(0, 0, 0);
+      bind_floats(vertices);
+      ID3D11DeviceContext_PSSetShader(g_context, g_ps_tex, NULL, 0);
+      ID3D11DeviceContext_PSSetShaderResources(g_context, 0, 1, &view);
+      ID3D11DeviceContext_PSSetSamplers(g_context, 0, 1, &sampler);
+      ID3D11DeviceContext_Draw(g_context, 3, 0);
+      if (read_target()) got = pixel(32, 40);
+      if (vertices) ID3D11Buffer_Release(vertices);
+      vertices = triangle(0.5f, 0.4f, 0.4f, 1.0f);
+      bind_floats(vertices);
+      clear(0, 0, 0);
+      ID3D11DeviceContext_Draw(g_context, 3, 0);
+      if (read_target()) white = pixel(32, 40);
+      if (vertices) ID3D11Buffer_Release(vertices);
+      snprintf(what, sizeof what, "the %s texture sampled: a blue block and the white one (got %08X and %08X)", i == 0 ? "BC1" : "BC3", (unsigned)got, (unsigned)white);
+      check(blue(got) == 255 && red(got) == 0 && green(got) == 0 && blue(white) == 255 && red(white) > 90 && red(white) < 112, what);
+      /* UpdateSubresource of the last block: green now */
+      BYTE green_block[16];
+      memset(green_block, 0, sizeof green_block);
+      if (i == 1) { green_block[0] = 255; green_block[1] = 255; }
+      green_block[size - 8] = 0xE0; green_block[size - 7] = 0x07; green_block[size - 6] = 0xE0; green_block[size - 5] = 0x07;
+      const D3D11_BOX box = {4, 4, 0, 8, 8, 1};
+      ID3D11DeviceContext_UpdateSubresource(g_context, (ID3D11Resource *)texture, 0, &box, green_block, size, 0);
+      clear(0, 0, 0);
+      ID3D11DeviceContext_Draw(g_context, 3, 0);
+      const UINT32 updated = read_target() ? pixel(32, 40) : 0;
+      check(green(updated) > 90 && red(updated) == 0 && blue(updated) == 0, "UpdateSubresource of one block of it");
+      ID3D11ShaderResourceView *none = NULL;
+      ID3D11DeviceContext_PSSetShaderResources(g_context, 0, 1, &none);
+      ID3D11ShaderResourceView_Release(view);
+    }
+    if (texture) ID3D11Texture2D_Release(texture);
+  }
+  D3D11_TEXTURE2D_DESC target_desc = {8, 8, 1, 1, DXGI_FORMAT_BC1_UNORM, {1, 0}, D3D11_USAGE_DEFAULT, D3D11_BIND_RENDER_TARGET, 0, 0};
+  ID3D11Texture2D *target = NULL;
+  check(FAILED(ID3D11Device_CreateTexture2D(g_device, &target_desc, NULL, &target)) && !target, "a BC1 render target is refused");
+  if (sampler) ID3D11SamplerState_Release(sampler);
+  begin(NULL);
+}
+
 int main(void) {
   test_device();
   if (g_device && g_context) {
@@ -911,6 +1233,9 @@ int main(void) {
       test_sampled_planes();
       test_three_planes(0);
       test_three_planes(1);
+      test_texture_kinds();
+      test_shader_stages();
+      test_compressed();
     }
     ID3D11DeviceContext_ClearState(g_context);
     ID3D11DeviceContext_Flush(g_context);

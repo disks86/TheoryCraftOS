@@ -174,6 +174,12 @@ class IImage {
     (void)pixels;
     return false;
   }
+  // The blocks of level `level` of layer `layer` (0 for a plain texture and a volume, whose slices come one after the other) of a block-compressed image
+  // (kFeatureCompressedFormats): Graphics/BlockCompression.hpp's compressed_image_bytes of the level's extent, rows of blocks top to bottom.
+  virtual bool write_compressed(uint32_t level, uint32_t layer, ConstByteView blocks) {
+    (void)level, (void)layer, (void)blocks;
+    return false;
+  }
   // Makes every level above 0 from level 0 by the 2 x 2 box filter of mip_box_downsample, each from the one before it. False when the image has one level or cannot.
   virtual bool generate_mipmaps() { return false; }
 
@@ -723,6 +729,7 @@ enum DeviceFeature : uint32_t {
   kFeatureMultipleTargets = 1u << 5,   // RenderPassBegin::extra_colors and GraphicsPipelineDesc::color_target_count
   kFeatureClipDistances = 1u << 28,    // GraphicsPipelineDesc::clip_distances (TGSI shaders' CLIPDIST outputs)
   kFeatureVertexFormats = 1u << 29,    // VertexFormat values other than Float1 .. Float4
+  kFeatureCompressedFormats = 1u << 30,   // Format::Bc1Unorm .. Bc3Srgb sampled images (any kind, mip levels): IImage::write_compressed; without it the memory manager decodes them
   kFeatureAddressModes = 1u << 31,     // AddressMode::MirrorRepeat, ClampToBorder and MirrorOnce, SamplerDesc::border
 };
 

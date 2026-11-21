@@ -5,7 +5,7 @@
 # Usage: scripts/gen-d3d9-test-shaders.sh
 set -euo pipefail
 cd "$(dirname "$0")/.."
-for spec in "vs_basic vs_1_1" "vs_basic vs_2_0" "vs_basic vs_3_0" "vs_math vs_2_0" "vs_math vs_3_0" "ps_tex ps_2_0" "ps_tex ps_3_0" "ps_math ps_2_0" "ps_math ps_3_0"; do
+for spec in "vs_basic vs_1_1" "vs_basic vs_2_0" "vs_basic vs_3_0" "vs_math vs_2_0" "vs_math vs_3_0" "ps_tex ps_2_0" "ps_tex ps_3_0" "ps_math ps_2_0" "ps_math ps_3_0" "ps_cube ps_2_0" "ps_volume ps_2_0"; do
   set -- $spec
   scripts/hlsl-compile.sh "tests/data/d3d9/$1.hlsl" main "$2" "tests/data/d3d9/$1.$2.bin"
   echo "wrote tests/data/d3d9/$1.$2.bin"

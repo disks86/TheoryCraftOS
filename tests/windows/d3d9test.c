@@ -95,9 +95,12 @@ static void test_object(void) {
   check(SUCCEEDED(IDirect3D9_GetDeviceCaps(g_d3d, 0, D3DDEVTYPE_HAL, &caps)) && caps.MaxSimultaneousTextures == 8 && caps.MaxTextureBlendStages == 8 && caps.MaxTextureWidth >= 2048 &&
         caps.VertexShaderVersion == D3DVS_VERSION(3, 0) && caps.PixelShaderVersion == D3DPS_VERSION(3, 0), "the caps: eight texture stages, shaders up to 3.0");
   check(IDirect3D9_CheckDeviceFormat(g_d3d, 0, D3DDEVTYPE_HAL, D3DFMT_X8R8G8B8, 0, D3DRTYPE_TEXTURE, D3DFMT_A8R8G8B8) == D3D_OK &&
-        IDirect3D9_CheckDeviceFormat(g_d3d, 0, D3DDEVTYPE_HAL, D3DFMT_X8R8G8B8, 0, D3DRTYPE_TEXTURE, D3DFMT_DXT1) == D3DERR_NOTAVAILABLE &&
+        IDirect3D9_CheckDeviceFormat(g_d3d, 0, D3DDEVTYPE_HAL, D3DFMT_X8R8G8B8, 0, D3DRTYPE_TEXTURE, D3DFMT_DXT1) == D3D_OK &&
+        IDirect3D9_CheckDeviceFormat(g_d3d, 0, D3DDEVTYPE_HAL, D3DFMT_X8R8G8B8, D3DUSAGE_RENDERTARGET, D3DRTYPE_TEXTURE, D3DFMT_DXT1) == D3DERR_NOTAVAILABLE &&
+        IDirect3D9_CheckDeviceFormat(g_d3d, 0, D3DDEVTYPE_HAL, D3DFMT_X8R8G8B8, 0, D3DRTYPE_CUBETEXTURE, D3DFMT_A8R8G8B8) == D3D_OK &&
+        IDirect3D9_CheckDeviceFormat(g_d3d, 0, D3DDEVTYPE_HAL, D3DFMT_X8R8G8B8, 0, D3DRTYPE_VOLUMETEXTURE, D3DFMT_DXT5) == D3DERR_NOTAVAILABLE &&
         IDirect3D9_CheckDeviceFormat(g_d3d, 0, D3DDEVTYPE_HAL, D3DFMT_X8R8G8B8, D3DUSAGE_DEPTHSTENCIL, D3DRTYPE_SURFACE, D3DFMT_D24S8) == D3D_OK,
-        "CheckDeviceFormat: a plain format and a depth format are there, a compressed one is not");
+        "CheckDeviceFormat: a plain format, a depth format, DXT1 textures (not targets), cube textures; no compressed volumes");
 }
 
 static HWND g_window;
@@ -1439,6 +1442,168 @@ static void test_present_and_reset(void) {
   check(IDirect3DDevice9_GetDepthStencilSurface(g_device, &back) == D3DERR_NOTFOUND, "... and no depth buffer to get");
 }
 
+/* ---- cube and volume textures ------------------------------------------------------------------------------------------------------------------------------------------ */
+
+typedef struct { float x, y, z, rhw; DWORD colour; float u, v, w; } ScreenTex3Vertex;      /* D3DFVF_XYZRHW | D3DFVF_DIFFUSE | D3DFVF_TEX1 | D3DFVF_TEXCOORDSIZE3(0) */
+/* A quad over the middle of the target whose texture coordinates are (u, v, w) at every corner; the pixel in its middle. */
+static DWORD lookup_quad(float u, float v, float w) {
+  const ScreenTex3Vertex q[4] = {{16, 16, 0.5f, 1, 0xFFFFFFFF, u, v, w}, {48, 16, 0.5f, 1, 0xFFFFFFFF, u, v, w}, {16, 48, 0.5f, 1, 0xFFFFFFFF, u, v, w}, {48, 48, 0.5f, 1, 0xFFFFFFFF, u, v, w}};
+  clear(0xFF000000);
+  IDirect3DDevice9_BeginScene(g_device);
+  IDirect3DDevice9_SetFVF(g_device, D3DFVF_XYZRHW | D3DFVF_DIFFUSE | D3DFVF_TEX1 | D3DFVF_TEXCOORDSIZE3(0));
+  IDirect3DDevice9_DrawPrimitiveUP(g_device, D3DPT_TRIANGLESTRIP, 2, q, sizeof q[0]);
+  IDirect3DDevice9_EndScene(g_device);
+  return read_back() ? pixel(32, 32) : 0xDEADBEEF;
+}
+
+static void test_cube_and_volume(void) {
+  IDirect3DPixelShader9 *ps_cube = NULL, *ps_volume = NULL;
+  DWORD z_enable = TRUE;
+  IDirect3DDevice9_GetRenderState(g_device, D3DRS_ZENABLE, &z_enable);
+  check(IDirect3DDevice9_CreatePixelShader(g_device, g_ps_cube_ps_2_0, &ps_cube) == D3D_OK && ps_cube &&
+        IDirect3DDevice9_CreatePixelShader(g_device, g_ps_volume_ps_2_0, &ps_volume) == D3D_OK && ps_volume, "CreatePixelShader of shaders with dcl_cube and dcl_volume");
+  if (!ps_cube || !ps_volume) goto done;
+  IDirect3DDevice9_SetSamplerState(g_device, 0, D3DSAMP_MINFILTER, D3DTEXF_POINT);
+  IDirect3DDevice9_SetSamplerState(g_device, 0, D3DSAMP_MAGFILTER, D3DTEXF_POINT);
+  IDirect3DDevice9_SetSamplerState(g_device, 0, D3DSAMP_MIPFILTER, D3DTEXF_NONE);
+  IDirect3DDevice9_SetSamplerState(g_device, 0, D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP);
+  IDirect3DDevice9_SetSamplerState(g_device, 0, D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP);
+  IDirect3DDevice9_SetSamplerState(g_device, 0, D3DSAMP_ADDRESSW, D3DTADDRESS_CLAMP);
+  IDirect3DDevice9_SetRenderState(g_device, D3DRS_ZENABLE, FALSE);
+
+  /* A cube of 4 x 4 faces with all its levels, each face its own colour (face by face, through LockRect of each face's top level and through its surfaces' LockRect). */
+  {
+    static const DWORD faces[6] = {0xFFFF0000u, 0xFF00FFFFu, 0xFF00FF00u, 0xFFFF00FFu, 0xFF0000FFu, 0xFFFFFF00u};      /* +X red, -X cyan, +Y green, -Y magenta, +Z blue, -Z yellow */
+    IDirect3DCubeTexture9 *cube = NULL;
+    HRESULT hr = IDirect3DDevice9_CreateCubeTexture(g_device, 4, 0, 0, D3DFMT_A8R8G8B8, D3DPOOL_MANAGED, &cube, NULL);
+    check(hr == D3D_OK && cube && IDirect3DCubeTexture9_GetLevelCount(cube) == 3 && IDirect3DCubeTexture9_GetType(cube) == D3DRTYPE_CUBETEXTURE, "CreateCubeTexture: a cube of three levels");
+    if (cube) {
+      int locked_all = 1;
+      for (UINT f = 0; f < 6; ++f) {
+        D3DLOCKED_RECT locked;
+        if (f % 2 == 0) {
+          if (FAILED(IDirect3DCubeTexture9_LockRect(cube, (D3DCUBEMAP_FACES)f, 0, &locked, NULL, 0)) || !locked.pBits) { locked_all = 0; continue; }
+          for (int y = 0; y < 4; ++y) for (int x = 0; x < 4; ++x) ((DWORD *)((BYTE *)locked.pBits + y * locked.Pitch))[x] = faces[f];
+          IDirect3DCubeTexture9_UnlockRect(cube, (D3DCUBEMAP_FACES)f, 0);
+        } else {
+          IDirect3DSurface9 *surface = NULL;
+          D3DSURFACE_DESC desc;
+          if (FAILED(IDirect3DCubeTexture9_GetCubeMapSurface(cube, (D3DCUBEMAP_FACES)f, 0, &surface)) || !surface || FAILED(IDirect3DSurface9_GetDesc(surface, &desc)) || desc.Width != 4 ||
+              FAILED(IDirect3DSurface9_LockRect(surface, &locked, NULL, 0)) || !locked.pBits) { locked_all = 0; if (surface) IDirect3DSurface9_Release(surface); continue; }
+          for (int y = 0; y < 4; ++y) for (int x = 0; x < 4; ++x) ((DWORD *)((BYTE *)locked.pBits + y * locked.Pitch))[x] = faces[f];
+          IDirect3DSurface9_UnlockRect(surface);
+          IDirect3DSurface9_Release(surface);
+        }
+        /* (a smaller level too: kept by the program, the kernel samples the first) */
+        if (SUCCEEDED(IDirect3DCubeTexture9_LockRect(cube, (D3DCUBEMAP_FACES)f, 1, &locked, NULL, 0)) && locked.pBits) {
+          for (int y = 0; y < 2; ++y) for (int x = 0; x < 2; ++x) ((DWORD *)((BYTE *)locked.pBits + y * locked.Pitch))[x] = 0xFF000000u;
+          IDirect3DCubeTexture9_UnlockRect(cube, (D3DCUBEMAP_FACES)f, 1);
+        } else locked_all = 0;
+      }
+      check(locked_all, "LockRect and UnlockRect of each face and level, and a face's surface");
+      IDirect3DDevice9_SetTexture(g_device, 0, (IDirect3DBaseTexture9 *)cube);
+      IDirect3DDevice9_SetPixelShader(g_device, ps_cube);
+      static const float directions[6][3] = {{1, 0.2f, 0.1f}, {-1, 0.1f, 0.2f}, {0.2f, 1, 0.1f}, {0.1f, -1, 0.2f}, {0.2f, 0.1f, 1}, {0.1f, 0.2f, -1}};
+      int good = 0;
+      for (int f = 0; f < 6; ++f) {
+        const DWORD got = lookup_quad(directions[f][0], directions[f][1], directions[f][2]);
+        if (got == (faces[f] & 0xFFFFFF)) ++good;
+        else printf("d3d9test: (cube face %d: got %06lx, wanted %06lx)\n", f, (unsigned long)got, (unsigned long)(faces[f] & 0xFFFFFF));
+      }
+      check(good == 6, "a cube map sampled by direction from a program's pixel shader: each of the six faces");
+      IDirect3DBaseTexture9 *bound = NULL;
+      IDirect3DDevice9_GetTexture(g_device, 0, &bound);
+      check(bound == (IDirect3DBaseTexture9 *)cube, "GetTexture gives back the cube");
+      if (bound) IDirect3DBaseTexture9_Release(bound);
+      IDirect3DDevice9_SetTexture(g_device, 0, NULL);
+      const DWORD blank = lookup_quad(1, 0, 0);
+      check(blank == 0xFFFFFF, "a cube sampler with no texture set samples white");
+      IDirect3DCubeTexture9_Release(cube);
+    }
+  }
+
+  /* A volume of 2 x 2 x 4, filled through LockBox, sampled at the middle of each slice. */
+  {
+    static const DWORD colours[4] = {0xFFFF0000u, 0xFF00FF00u, 0xFF0000FFu, 0xFFFFFF00u};
+    IDirect3DVolumeTexture9 *volume = NULL;
+    HRESULT hr = IDirect3DDevice9_CreateVolumeTexture(g_device, 2, 2, 4, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_MANAGED, &volume, NULL);
+    D3DVOLUME_DESC desc;
+    memset(&desc, 0, sizeof desc);
+    if (volume) IDirect3DVolumeTexture9_GetLevelDesc(volume, 0, &desc);
+    check(hr == D3D_OK && volume && desc.Depth == 4 && desc.Width == 2 && IDirect3DVolumeTexture9_GetType(volume) == D3DRTYPE_VOLUMETEXTURE, "CreateVolumeTexture and its level's description");
+    if (volume) {
+      D3DLOCKED_BOX box;
+      int filled = SUCCEEDED(IDirect3DVolumeTexture9_LockBox(volume, 0, &box, NULL, 0)) && box.pBits;
+      if (filled) {
+        for (int z = 0; z < 4; ++z) for (int y = 0; y < 2; ++y) for (int x = 0; x < 2; ++x) ((DWORD *)((BYTE *)box.pBits + z * box.SlicePitch + y * box.RowPitch))[x] = colours[z];
+        IDirect3DVolumeTexture9_UnlockBox(volume, 0);
+      }
+      check(filled, "LockBox and UnlockBox");
+      IDirect3DDevice9_SetTexture(g_device, 0, (IDirect3DBaseTexture9 *)volume);
+      IDirect3DDevice9_SetPixelShader(g_device, ps_volume);
+      int good = 0;
+      for (int z = 0; z < 4; ++z) {
+        const DWORD got = lookup_quad(0.5f, 0.5f, (z + 0.5f) / 4);
+        if (got == (colours[z] & 0xFFFFFF)) ++good;
+        else printf("d3d9test: (volume slice %d: got %06lx)\n", z, (unsigned long)got);
+      }
+      check(good == 4, "a volume texture sampled at the middle of each slice");
+      IDirect3DDevice9_SetTexture(g_device, 0, NULL);
+      IDirect3DVolumeTexture9_Release(volume);
+    }
+  }
+done:
+  IDirect3DDevice9_SetPixelShader(g_device, NULL);
+  IDirect3DDevice9_SetRenderState(g_device, D3DRS_ZENABLE, z_enable);
+  if (ps_cube) IDirect3DPixelShader9_Release(ps_cube);
+  if (ps_volume) IDirect3DPixelShader9_Release(ps_volume);
+}
+
+/* ---- compressed textures ----------------------------------------------------------------------------------------------------------------------------------------------- */
+
+/* An 8 x 8 texture of four blocks (red, green / blue, white): DXT1 is the colour block alone, DXT3 and DXT5 an alpha block of opaque before it. */
+static void fill_blocks(BYTE *rows, INT pitch, D3DFORMAT format) {
+  static const WORD colours[4] = {0xF800, 0x07E0, 0x001F, 0xFFFF};
+  const UINT size = format == D3DFMT_DXT1 ? 8 : 16;
+  for (int b = 0; b < 4; ++b) {
+    BYTE *block = rows + (b / 2) * pitch + (b % 2) * size;
+    memset(block, 0, size);
+    BYTE *colour = block + size - 8;
+    if (format == D3DFMT_DXT3) memset(block, 0xFF, 8);
+    if (format == D3DFMT_DXT5) { block[0] = 255; block[1] = 255; }      /* (both alphas 255: every index is opaque) */
+    colour[0] = (BYTE)colours[b]; colour[1] = (BYTE)(colours[b] >> 8); colour[2] = (BYTE)colours[b]; colour[3] = (BYTE)(colours[b] >> 8);
+  }
+}
+static void test_compressed(void) {
+  const D3DFORMAT formats[3] = {D3DFMT_DXT1, D3DFMT_DXT3, D3DFMT_DXT5};
+  const char *names[3] = {"DXT1", "DXT3", "DXT5"};
+  for (int i = 0; i < 3; ++i) {
+    char what[160];
+    IDirect3DTexture9 *texture = NULL;
+    const HRESULT ok = IDirect3D9_CheckDeviceFormat(g_d3d, 0, D3DDEVTYPE_HAL, D3DFMT_X8R8G8B8, 0, D3DRTYPE_TEXTURE, formats[i]);
+    HRESULT hr = IDirect3DDevice9_CreateTexture(g_device, 8, 8, 1, 0, formats[i], D3DPOOL_MANAGED, &texture, NULL);
+    D3DLOCKED_RECT locked;
+    int filled = SUCCEEDED(hr) && texture && SUCCEEDED(IDirect3DTexture9_LockRect(texture, 0, &locked, NULL, 0)) && locked.pBits && locked.Pitch == (formats[i] == D3DFMT_DXT1 ? 16 : 32);
+    if (filled) { fill_blocks(locked.pBits, locked.Pitch, formats[i]); IDirect3DTexture9_UnlockRect(texture, 0); }
+    snprintf(what, sizeof what, "a %s texture of 8 x 8 (CheckDeviceFormat, CreateTexture, LockRect with a pitch of a row of blocks)", names[i]);
+    check(ok == D3D_OK && filled, what);
+    if (filled) {
+      IDirect3DDevice9_SetTexture(g_device, 0, (IDirect3DBaseTexture9 *)texture);
+      clear(0xFF000000);
+      textured_quad(0, 0, 64, 64, 0xFFFFFFFF);
+      read_back();
+      snprintf(what, sizeof what, "the %s texture's four blocks on a rectangle", names[i]);
+      if (!(pixel(8, 8) == 0xFF0000 && pixel(56, 8) == 0x00FF00 && pixel(8, 56) == 0x0000FF && pixel(56, 56) == 0xFFFFFF))
+        printf("d3d9test: (the four corners are %06lx %06lx %06lx %06lx)\n", (unsigned long)pixel(8, 8), (unsigned long)pixel(56, 8), (unsigned long)pixel(8, 56), (unsigned long)pixel(56, 56));
+      check(pixel(8, 8) == 0xFF0000 && pixel(56, 8) == 0x00FF00 && pixel(8, 56) == 0x0000FF && pixel(56, 56) == 0xFFFFFF, what);
+      IDirect3DDevice9_SetTexture(g_device, 0, NULL);
+    }
+    if (texture) IDirect3DTexture9_Release(texture);
+  }
+  IDirect3DSurface9 *target = NULL;
+  check(FAILED(IDirect3DDevice9_CreateRenderTarget(g_device, 8, 8, D3DFMT_DXT1, D3DMULTISAMPLE_NONE, 0, FALSE, &target, NULL)) && !target, "a DXT1 render target is refused");
+}
+
 int main(void) {
   test_object();
   if (g_d3d && make_device()) {
@@ -1454,6 +1619,8 @@ int main(void) {
     test_texture_coordinates();
     test_stages();
     test_render_to_texture();
+    test_cube_and_volume();
+    test_compressed();
     test_present_and_reset();
     check(IDirect3DDevice9_Release(g_device) == 0, "the device is gone with its last reference");
   }
