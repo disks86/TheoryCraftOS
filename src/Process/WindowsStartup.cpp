@@ -18,6 +18,9 @@
 #include "Process/WindowsStartup.hpp"
 #include "Utility/ByteBuffer.hpp"
 #include "Utility/Utf16.hpp"
+#if defined(__x86_64__)
+#include <cpuid.h>
+#endif
 
 namespace process {
 
@@ -147,8 +150,75 @@ void store_u64(uint8_t* page, uint32_t offset, uint64_t value) { __atomic_store_
 
 uint64_t g_tsc_ticks_per_us = 0, g_tsc_at_start = 0;
 
+}  // namespace
+
+// KUSER_SHARED_DATA.ProcessorFeatures (64 bytes at 0x274, indexed by the PF_ numbers of winnt.h): what IsProcessorFeaturePresent answers. From CPUID, as
+// Windows fills it: an extension the operating system has to switch on (AVX, AVX-512) counts only when XCR0 says it is on. Elsewhere (an x86 program in
+// the emulator on another CPU) the baseline every x86-64 processor has. Not claimed: PF_FASTFAIL (int 29h), PF_RDWRFSGSBASE, virtualization.
+void windows_processor_features(uint8_t (&features)[64]) {
+  for (uint8_t& f : features) f = 0;
+  enum : uint32_t { kCx8 = 2, kMmx = 3, k3dNow = 7, kRdtsc = 8, kPae = 9, kSse = 6, kSse2 = 10, kDaz = 11, kNx = 12, kSse3 = 13, kCx16 = 14, kXsave = 17,
+                    kRdrand = 28, kRdtscp = 32, kRdpid = 33, kMonitorx = 35, kSsse3 = 36, kSse41 = 37, kSse42 = 38, kAvx = 39, kAvx2 = 40, kAvx512f = 41, kErms = 42 };
+#if defined(__x86_64__)
+  uint32_t a = 0, b = 0, c = 0, d = 0;
+  __cpuid(0, a, b, c, d);
+  const uint32_t max_leaf = a;
+  __cpuid(0x80000000u, a, b, c, d);
+  const uint32_t max_extended = a;
+  uint32_t c1 = 0, d1 = 0;
+  __cpuid(1, a, b, c1, d1);
+  features[kCx8] = (d1 >> 8) & 1;
+  features[kMmx] = (d1 >> 23) & 1;
+  features[kRdtsc] = (d1 >> 4) & 1;
+  features[kPae] = (d1 >> 6) & 1;
+  features[kSse] = (d1 >> 25) & 1;
+  features[kSse2] = (d1 >> 26) & 1;
+  features[kDaz] = features[kSse2];      // (every processor with SSE2 in long mode has denormals-are-zero)
+  features[kSse3] = c1 & 1;
+  features[kSsse3] = (c1 >> 9) & 1;
+  features[kCx16] = (c1 >> 13) & 1;
+  features[kSse41] = (c1 >> 19) & 1;
+  features[kSse42] = (c1 >> 20) & 1;
+  features[kRdrand] = (c1 >> 30) & 1;
+  const bool osxsave = (c1 >> 27) & 1;
+  features[kXsave] = osxsave;
+  uint64_t xcr0 = 0;
+  if (osxsave) {
+    uint32_t lo = 0, hi = 0;
+    __asm__ volatile("xgetbv" : "=a"(lo), "=d"(hi) : "c"(0));
+    xcr0 = uint64_t{hi} << 32 | lo;
+  }
+  const bool avx_state = (xcr0 & 6) == 6, avx512_state = avx_state && (xcr0 & 0xE0) == 0xE0;
+  features[kAvx] = ((c1 >> 28) & 1) && avx_state;
+  if (max_leaf >= 7) {
+    uint32_t b7 = 0, c7 = 0, d7 = 0;
+    __cpuid_count(7, 0, a, b7, c7, d7);
+    features[kAvx2] = ((b7 >> 5) & 1) && features[kAvx];
+    features[kAvx512f] = ((b7 >> 16) & 1) && avx512_state;
+    features[kErms] = (b7 >> 9) & 1;
+    features[kRdpid] = (c7 >> 22) & 1;
+  }
+  if (max_extended >= 0x80000001u) {
+    uint32_t ce = 0, de = 0;
+    __cpuid(0x80000001u, a, b, ce, de);
+    features[kNx] = (de >> 20) & 1;
+    features[kRdtscp] = (de >> 27) & 1;
+    features[k3dNow] = (de >> 31) & 1;
+    features[kMonitorx] = (ce >> 29) & 1;
+  }
+#else
+  const uint32_t baseline[] = {kCx8, kMmx, kRdtsc, kSse, kSse2, kNx};
+  for (uint32_t f : baseline) features[f] = 1;
+#endif
+}
+
+namespace {
+
 bool map_shared_user_data(AddressSpace& space, uint32_t processor_count) {
   uint8_t* page = g_shared_user_data.data();
+  uint8_t features[64];
+  windows_processor_features(features);
+  for (uint32_t i = 0; i < 64; ++i) __atomic_store_n(page + 0x274 + i, features[i], __ATOMIC_RELAXED);      // ProcessorFeatures
   store_u32(page, 0x04, 1u << 24);                          // TickCountMultiplier: TickCount counts milliseconds
   store_u32(page, 0x260, 19045);                            // NtBuildNumber
   store_u32(page, 0x264, 1);                                // NtProductType: workstation

@@ -86,6 +86,9 @@ void set_performance_counter_rate(uint64_t tsc_ticks_per_us, uint64_t tsc_at_sta
 bool performance_counter_from_tsc(uint64_t* counter);
 // Where in KUSER_SHARED_DATA the rate and the starting TSC go: past the end of Windows' own structure, on the same page (tcos_win.h reads them).
 constexpr uint32_t kSharedUserDataTscRate = 0xF00, kSharedUserDataTscStart = 0xF08;
+// KUSER_SHARED_DATA.ProcessorFeatures: which PF_ features (winnt.h numbers) this processor has, as IsProcessorFeaturePresent answers them (at 0x274 of the page).
+constexpr uint32_t kSharedUserDataProcessorFeatures = 0x274;
+void windows_processor_features(uint8_t (&features)[64]);
 // Standard handles as the NT services hand them out (see WindowsSyscalls.cpp): input, output, error.
 constexpr uint64_t kStdInputHandle = 4, kStdOutputHandle = 8, kStdErrorHandle = 12;
 

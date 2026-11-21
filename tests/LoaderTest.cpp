@@ -919,6 +919,18 @@ static void test_windows_startup() {
   CHECK(environment_size == 17 * 2 && wide_to_narrow(s, environment, 11 * 2) == "PATH=C:\\bin");      // "PATH=C:\bin\0" "A=b\0" "\0"
   // KUSER_SHARED_DATA
   CHECK(s.read(kSharedUserDataAddress + 0x26C, ByteView(b4, 4)) && b4[0] == 10);
+  {      // ProcessorFeatures: what this processor has, by the PF_ numbers (SSE 6, SSE2 10, SSE3 13, CMPXCHG8B 2, RDTSC 8), and nothing past them
+    uint8_t features[64] = {}, expected[64];
+    CHECK(s.read(kSharedUserDataAddress + kSharedUserDataProcessorFeatures, ByteView(features, 64)));
+    windows_processor_features(expected);
+    bool same = true;
+    for (int i = 0; i < 64; ++i) same = same && features[i] == expected[i];
+    CHECK(same && features[6] == 1 && features[10] == 1 && features[2] == 1 && features[8] == 1 && features[18] == 0 && features[23] == 0);
+#if defined(__x86_64__)
+    __builtin_cpu_init();
+    CHECK(features[13] == (__builtin_cpu_supports("sse3") ? 1 : 0) && features[37] == (__builtin_cpu_supports("sse4.1") ? 1 : 0));
+#endif
+  }
   uint8_t prot = 0;
   CHECK(s.protection_at(kSharedUserDataAddress, &prot) && prot == kProtRead);
   // The performance counter: 10 MHz (QpcFrequency); no TSC rate unless the kernel set one, so ntdll asks the service.

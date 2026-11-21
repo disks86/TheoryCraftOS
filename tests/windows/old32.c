@@ -87,6 +87,11 @@ int main(void) {
   check(number >= 3 && __pioinfo[number >> 5][number & 31].osfhnd == -1 && __pioinfo[number >> 5][number & 31].osfile == 0, "a closed file number is gone from __pioinfo");
   DeleteFileA(path);
 
+  {      /* "=C:" (the current folder of drive C, which the C runtime's _chdir sets) is a name; "A=B" is not */
+    char value[64] = "";
+    check(SetEnvironmentVariableA("=C:", "C:\\Temp") && GetEnvironmentVariableA("=C:", value, sizeof(value)) == 7 && strcmp(value, "C:\\Temp") == 0 &&
+          !SetEnvironmentVariableA("A=B", "x") && GetLastError() == ERROR_INVALID_PARAMETER, "a variable name may begin with '='");
+  }
   {      /* exp and pow of msvcrt.dll (2^t taken apart with the x87: the fraction had the wrong sign, and pow's operands were swapped) */
     volatile double one = 1.0, half = 0.5, nine = 9.0, ten = 10.0, two = 2.0, minus = -2.3;
     const double e1 = exp(one), eh = exp(minus), p1 = pow(nine, half), p2 = pow(two, ten), p3 = pow(ten, -2.0 * one);

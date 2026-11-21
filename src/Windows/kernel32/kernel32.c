@@ -481,7 +481,9 @@ EXPORT BOOL WINAPI SetEnvironmentStringsW(LPWSTR block) {
 IMPORT NTSTATUS NTAPI RtlSetEnvironmentVar(PWSTR *penv, PCWSTR name, SIZE_T name_len, PCWSTR value, SIZE_T value_len);
 EXPORT BOOL WINAPI SetEnvironmentVariableW(LPCWSTR name, LPCWSTR value) {
   if (!name || !*name || wcslen(name) > 32767) { set_error(ERROR_INVALID_PARAMETER); return FALSE; }
-  for (const WCHAR *c = name; *c; ++c) if (*c == '=') { set_error(ERROR_INVALID_PARAMETER); return FALSE; }
+  /* a name has no '=' after its first character: "=C:", the current folder of drive C, is a name (the C runtime's _chdir sets it and fails when it cannot,
+     which stopped Unigine's engine before it started) */
+  for (const WCHAR *c = name + 1; *c; ++c) if (*c == '=') { set_error(ERROR_INVALID_PARAMETER); return FALSE; }
   const NTSTATUS status = RtlSetEnvironmentVar(NULL, name, wcslen(name), value, value ? wcslen(value) : 0);
   return NT_SUCCESS(status) ? TRUE : fail_nt(status);
 }
@@ -764,7 +766,7 @@ EXPORT BOOL WINAPI GetPhysicallyInstalledSystemMemory(ULONGLONG *kilobytes) {
   *kilobytes = x.ullTotalPhys / 1024;
   return TRUE;
 }
-EXPORT BOOL WINAPI IsProcessorFeaturePresent(DWORD feature) { return feature == 6 || feature == 10; }
+EXPORT BOOL WINAPI IsProcessorFeaturePresent(DWORD feature) { return feature < 64 && ((const volatile BYTE *)(ULONG_PTR)0x7FFE0274)[feature] != 0; }      /* (KUSER_SHARED_DATA.ProcessorFeatures, as RtlIsProcessorFeaturePresent) */
 EXPORT BOOL WINAPI GetComputerNameW(LPWSTR name, LPDWORD size) {
   static const WCHAR kName[] = {'T', 'C', 'O', 'S', 0};
   if (*size < 5) { *size = 5; set_error(111 /* ERROR_BUFFER_OVERFLOW */); return FALSE; }

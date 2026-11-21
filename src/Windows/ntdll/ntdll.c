@@ -1114,8 +1114,8 @@ EXPORT NTSTATUS NTAPI RtlDeleteCriticalSection(PRTL_CRITICAL_SECTION cs) {
 #include "except.inc"
 #endif
 #include "actctx.inc"
-/* SSE and SSE2 are there (PF_XMMI_INSTRUCTIONS_AVAILABLE = 6, PF_XMMI64_INSTRUCTIONS_AVAILABLE = 10); nothing newer is reported. */
-EXPORT BOOLEAN NTAPI RtlIsProcessorFeaturePresent(ULONG feature) { return feature == 6 || feature == 10; }
+/* KUSER_SHARED_DATA.ProcessorFeatures, which the kernel fills from CPUID (windows_processor_features in src/Process/WindowsStartup.cpp). */
+EXPORT BOOLEAN NTAPI RtlIsProcessorFeaturePresent(ULONG feature) { return feature < 64 && ((const volatile BYTE *)(ULONG_PTR)0x7FFE0274)[feature] != 0; }
 
 /* ---- process start-up ------------------------------------------------------------------------------------------------------------------------------- */
 
