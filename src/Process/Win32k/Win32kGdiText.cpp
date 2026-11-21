@@ -118,8 +118,16 @@ void resolve_font(const Dc& dc, FontSpec* out) {
   }
 }
 
+// Characters that a font shows as nothing: the controls, and the format characters (line and paragraph separators, which Qt ends its lines with, the
+// zero-width ones, the byte order mark). They have no ink and, apart from the controls the built-in font always gave a cell, no width.
+bool invisible_character(char32_t ch) {
+  return ch < 0x20 || (ch >= 0x7F && ch <= 0x9F) || ch == 0xAD || (ch >= 0x200B && ch <= 0x200F) || (ch >= 0x2028 && ch <= 0x202E) ||
+         (ch >= 0x2060 && ch <= 0x2064) || ch == 0xFEFF;
+}
+bool zero_width_character(char32_t ch) { return ch >= 0x80 && invisible_character(ch); }
+
 bool builtin_pixel(char32_t ch, const FontSpec& fs, int32_t px, int32_t py) {
-  if (ch < 0x20 || ch == 0x7F) return false;
+  if (invisible_character(ch)) return false;
   if (ch == 0x20 || ch == 0xA0) return false;
   const char c = ch < 0x7F ? char(ch) : '?';
   int32_t shear = 0;
@@ -127,10 +135,16 @@ bool builtin_pixel(char32_t ch, const FontSpec& fs, int32_t px, int32_t py) {
   const int32_t x = px - shear;
   if (x < 0) return false;
   const ConstByteView g = hardware::Font8x16::glyph(c);
+  // A pixel of the cell covers a span of the 8 x 16 glyph's pixels; it is set if any of them is. (Taking one pixel of the span dropped strokes when
+  // the cell is smaller than the glyph: a 6-pixel 'w' lost its middle.)
+  const int32_t y0 = int32_t(int64_t{py} * 16 / fs.cell_h), y1 = int32_t((int64_t{py} + 1) * 16 / fs.cell_h);
   auto bit = [&](int32_t xx) {
     if (xx < 0 || xx >= fs.cell_w) return false;
-    const int32_t sx = int32_t(int64_t{xx} * 8 / fs.cell_w), sy = int32_t(int64_t{py} * 16 / fs.cell_h);
-    return sy < 16 && sx < 8 && ((g[uint64_t(sy)] >> (7 - sx)) & 1) != 0;
+    const int32_t x0 = int32_t(int64_t{xx} * 8 / fs.cell_w), x1 = int32_t((int64_t{xx} + 1) * 8 / fs.cell_w);
+    for (int32_t sy = y0; sy < 16 && (sy < y1 || sy == y0); ++sy)
+      for (int32_t sx = x0; sx < 8 && (sx < x1 || sx == x0); ++sx)
+        if ((g[uint64_t(sy)] >> (7 - sx)) & 1) return true;
+    return false;
   };
   return bit(x) || (fs.bold && bit(x - 1));
 }
@@ -140,7 +154,7 @@ int32_t advance_of(const FontSpec& fs, char32_t ch) {
     GdiGlyph gl;
     if (g_provider->glyph(fs.face_id, fs.cell_h, ch, &gl)) return gl.advance;
   }
-  return fs.cell_w;
+  return zero_width_character(ch) ? 0 : fs.cell_w;
 }
 
 }  // namespace
@@ -503,6 +517,100 @@ uint64_t NtGdiGetFontData(Call& c) {
 
 uint64_t NtGdiGetOutlineTextMetricsInternalW(Call& c) { return dc_arg(c, c.arg32(0)) ? 0 : 0; }      // only TrueType fonts have outline metrics
 
+// --- GetGlyphOutline -----------------------------------------------------------------------------------------------------------------------------
+// The metrics of one glyph and its picture as a bitmap (GGO_BITMAP, 1 bit a pixel) or in shades (GGO_GRAY2/4/8_BITMAP: 0..4, 0..16, 0..64 a byte), rows
+// from the top, each a multiple of four bytes, as Windows gives them. The glyph is a character, or with GGO_GLYPH_INDEX one of this module's glyph indices
+// (the character itself: NtGdiGetGlyphIndicesW). Not done: the outlines (GGO_NATIVE, GGO_BEZIER) and a transformation other than the identity; those
+// answer GDI_ERROR, after which a program measures its text with the extent functions instead. Qt 4 sizes every glyph it draws with this function:
+// an answer of 0 with no metrics made it draw no text at all.
+constexpr uint64_t kGdiError = 0xFFFFFFFFu;
+enum : uint32_t { kGgoMetrics = 0, kGgoBitmap = 1, kGgoNative = 2, kGgoBezier = 3, kGgoGray2 = 4, kGgoGray4 = 5, kGgoGray8 = 6, kGgoGlyphIndex = 0x80, kGgoUnhinted = 0x100 };
+
+// A glyph as coverage (0..255 a pixel, `width` * `height`) and where it sits: `left` from the pen, `top` above the baseline. Empty: no ink.
+struct GlyphPicture {
+  explicit GlyphPicture(allocators::IAllocator& allocator) : coverage(allocator) {}
+  int32_t left = 0, top = 0, width = 0, height = 0, advance = 0;
+  List<uint8_t> coverage;
+};
+
+bool glyph_picture(const FontSpec& fs, char32_t ch, GlyphPicture* out) {
+  out->coverage.clear();
+  out->left = out->top = out->width = out->height = 0;
+  out->advance = advance_of(fs, ch);
+  if (fs.provider) {
+    GdiGlyph gl;
+    if (!g_provider->glyph(fs.face_id, fs.cell_h, ch, &gl)) return false;
+    out->advance = gl.advance;
+    if (gl.width <= 0 || gl.height <= 0 || gl.width > 4096 || gl.height > 4096) return true;      // (no ink: a blank)
+    const uint64_t n = uint64_t(gl.width) * uint32_t(gl.height);
+    if (gl.coverage.size() < n) return false;
+    for (uint64_t i = 0; i < n; ++i) if (!out->coverage.push_back(gl.coverage[i])) return false;
+    out->left = gl.left; out->top = gl.top; out->width = gl.width; out->height = gl.height;
+    return true;
+  }
+  // The built-in font: the cell (wider by the slant of italics), cut down to the pixels that are set.
+  const int32_t cell_w = fs.cell_w + fs.cell_h / 4;
+  int32_t x0 = cell_w, y0 = fs.cell_h, x1 = -1, y1 = -1;
+  for (int32_t py = 0; py < fs.cell_h; ++py)
+    for (int32_t px = 0; px < cell_w; ++px)
+      if (builtin_pixel(ch, fs, px, py)) { x0 = px < x0 ? px : x0; x1 = px > x1 ? px : x1; y0 = py < y0 ? py : y0; y1 = py > y1 ? py : y1; }
+  if (x1 < 0) return true;
+  out->left = x0; out->top = fs.ascent - y0; out->width = x1 - x0 + 1; out->height = y1 - y0 + 1;
+  for (int32_t py = y0; py <= y1; ++py)
+    for (int32_t px = x0; px <= x1; ++px)
+      if (!out->coverage.push_back(builtin_pixel(ch, fs, px, py) ? 255 : 0)) return false;
+  return true;
+}
+
+uint64_t NtGdiGetGlyphOutline(Call& c) {
+  Dc* dc = dc_arg(c, c.arg32(0));
+  const uint32_t format = c.arg32(2);
+  const uint64_t gm_at = c.arg(3), buffer_at = c.arg(5), mat_at = c.arg(6);
+  const uint32_t size = c.arg32(4);
+  if (!dc || gm_at == 0 || mat_at == 0) return kGdiError;
+  uint8_t mat[16];      // MAT2: four FIXED (16-bit fraction, then 16-bit value): only the identity
+  if (!c.read(mat_at, ByteView(mat, 16))) return kGdiError;
+  static const uint8_t kIdentity[16] = {0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0};
+  for (int i = 0; i < 16; ++i) if (mat[i] != kIdentity[i]) return kGdiError;
+  const uint32_t kind = format & ~uint32_t(kGgoGlyphIndex | kGgoUnhinted);
+  if (kind != kGgoMetrics && kind != kGgoBitmap && kind != kGgoGray2 && kind != kGgoGray4 && kind != kGgoGray8) return kGdiError;      // (no outlines)
+  char32_t ch = c.arg32(1);
+  if ((format & kGgoGlyphIndex) && ch == 0x1F) ch = u'?';      // (the index of a character this font does not have)
+  if (ch > 0x10FFFF) return kGdiError;
+  FontSpec fs;
+  resolve_font(*dc, &fs);
+  GlyphPicture glyph(*alloc());
+  if (!glyph_picture(fs, ch, &glyph)) return kGdiError;
+  // GLYPHMETRICS: black box width and height, the origin of the black box (x right, y up from the baseline), the advance. A blank is 1 x 1, as on Windows.
+  const bool blank = glyph.width == 0;
+  uint8_t gm[20] = {};
+  put32(gm, blank ? 1 : uint32_t(glyph.width)); put32(gm + 4, blank ? 1 : uint32_t(glyph.height));
+  put32(gm + 8, uint32_t(blank ? 0 : glyph.left)); put32(gm + 12, uint32_t(blank ? 0 : glyph.top));
+  put16(gm + 16, uint32_t(int32_t(glyph.advance + dc->s.char_extra) & 0xFFFF)); put16(gm + 18, 0);
+  if (!c.write(gm_at, ConstByteView(gm, 20))) return kGdiError;
+  if (kind == kGgoMetrics) return 1;
+  if (blank) return 0;      // (no bits to give)
+  const uint32_t w = uint32_t(glyph.width), h = uint32_t(glyph.height);
+  const uint32_t pitch = kind == kGgoBitmap ? (w + 31) / 32 * 4 : (w + 3) / 4 * 4;
+  const uint64_t needed = uint64_t{pitch} * h;
+  if (buffer_at == 0 || size == 0) return needed;
+  if (size < needed) return kGdiError;
+  List<uint8_t> bits(*alloc());
+  for (uint64_t i = 0; i < needed; ++i) if (!bits.push_back(0)) return kGdiError;
+  const uint32_t levels = kind == kGgoGray2 ? 4 : kind == kGgoGray4 ? 16 : 64;
+  for (uint32_t y = 0; y < h; ++y) {
+    for (uint32_t x = 0; x < w; ++x) {
+      const uint32_t a = glyph.coverage[uint64_t{y} * w + x];
+      if (kind == kGgoBitmap) {
+        if (a >= 128) bits[uint64_t{y} * pitch + x / 8] |= uint8_t(0x80u >> (x % 8));
+      } else {
+        bits[uint64_t{y} * pitch + x] = uint8_t((a * levels + 127) / 255);
+      }
+    }
+  }
+  return c.write(buffer_at, ConstByteView(bits.view())) ? needed : kGdiError;
+}
+
 uint64_t NtGdiGetRasterizerCaps(Call& c) {
   if (c.arg32(1) < 6) return 0;
   const uint8_t st[6] = {6, 0, 3, 0, 0x09, 0x04};      // RASTERIZER_STATUS: nSize 6, TT_AVAILABLE | TT_ENABLED, English
@@ -567,6 +675,7 @@ void register_text_services() {
   GDI_REGISTER(FontIsLinked, NtGdiFontIsLinked);
   GDI_REGISTER(GetFontData, NtGdiGetFontData);
   GDI_REGISTER(GetOutlineTextMetricsInternalW, NtGdiGetOutlineTextMetricsInternalW);
+  GDI_REGISTER(GetGlyphOutline, NtGdiGetGlyphOutline);
   GDI_REGISTER(GetRasterizerCaps, NtGdiGetRasterizerCaps);
   GDI_REGISTER(EnumFonts, NtGdiEnumFonts);
 }

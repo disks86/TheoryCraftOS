@@ -76,10 +76,17 @@ GDI shares DC attributes with user mode through a shared memory table on Windows
 
 ## Text
 
-Text is drawn with `hardware::Font8x16` (printable ASCII; other characters show `?`), scaled by nearest neighbour to the requested cell height (`|lfHeight|`, default 16) and
-width (`lfWidth`, default half the height); bold smears one pixel, italic shears, underline and strike-out are lines. Rotation (`lfEscapement`) is ignored. A table of built-in face names
+Text is drawn with `hardware::Font8x16` (printable ASCII; other characters show `?`, and the controls and invisible format characters such as U+2028, which Qt ends
+its lines with, are blanks, the format characters without width), scaled to the requested cell height (`|lfHeight|`, default 16) and width (`lfWidth`, default half the
+height): a cell pixel is set if any glyph pixel it covers is, so a cell smaller than 8 x 16 keeps every stroke; bold smears one pixel, italic shears, underline and strike-out are lines. Rotation (`lfEscapement`) is ignored. A table of built-in face names
 (System, Terminal, Courier New, Arial, Segoe UI, ...) all map to this font; unknown names show as `System`. `GetTextMetricsW`, `GetTextExtentExW`, `GetCharWidthW`,
 `GetCharABCWidthsW`, `GetGlyphIndicesW`, `GetTextFaceW`, `EnumFonts` work from it.
+
+`GetGlyphOutline` gives a glyph's metrics (`GGO_METRICS`: its ink box, the box's origin, the advance; a blank is 1 x 1) and its bitmap (`GGO_BITMAP`, and
+`GGO_GRAY2/4/8_BITMAP` with 0..4, 0..16 and 0..64 a byte; rows padded to four bytes, top row first), by character or by glyph index (`GGO_GLYPH_INDEX`: the
+indices are the characters, as `GetGlyphIndicesW` gives them). It works for the built-in font and for a provider's glyphs. The outlines (`GGO_NATIVE`,
+`GGO_BEZIER`) and any transformation other than the identity answer `GDI_ERROR`, which tells a program to measure with the extent functions. Qt 4 needs this: it
+sizes each glyph image from `GGO_METRICS`, and when the service was missing (an answer of 0, no metrics) it drew no text at all (Unigine Heaven's launcher).
 
 `IGdiFontProvider` (in `Win32kGdi.hpp`, `set_font_provider`) lets the kernel supply real fonts: `match` a request to a face, give `metrics` for a pixel height and 8-bit
 coverage `glyph`s (and optionally `font_data` for GetFontData). When a provider is set, GDI asks it first for every selected font and anti-aliases its glyphs; the built-in
@@ -105,7 +112,7 @@ font is the fallback. A provider backed by `src/Font` (TrueType) is not written 
   the print service (`src/SystemPrintService.cpp`); a state machine that only answered "ok" would make programs believe they printed. `ExtEscape` answers "not supported" like a display driver.
 * **Font management**: `AddFontResourceW`, `RemoveFontResourceW`, `AddFontMemResourceEx`, `RemoveFontMemResourceEx`, `AddRemoteFontToDC`, `AddEmbFontToDC`, `GetEmbedFonts`, `MakeFontDir`,
   `GetFontFileData`, `GetFontFileInfo`, `GetFontResourceInfoInternalW`, `GetUFI*`, `SetLinkedUFIs`, `GetLinkedUFIs`, `UnmapMemFont`, `QueryFonts`, `QueryFontAssocInfo`, `GetETM`, `GetWidthTable`,
-  `GetGlyphOutline`, `GetCharacterPlacementW`, `GetStringBitmapW`, `SetFontXform`, `ForceUFIMapping`, `ChangeGhostFont`, `WaitForTextReady`, ...: they need a font file loader and a real
+  `GetGlyphOutline`'s outlines, `GetCharacterPlacementW`, `GetStringBitmapW`, `SetFontXform`, `ForceUFIMapping`, `ChangeGhostFont`, `WaitForTextReady`, ...: they need a font file loader and a real
   font provider behind `IGdiFontProvider`.
 * **Monitor protection and DDC/CI** (`*OPM*`, `DDCCI*`, `GetCertificate*`, `*PhysicalMonitor*`, `GetMonitorID`, `GetCOPPCompatibleOPMInformation`): belong with the display/monitor
   stack, not with the pixel engine.

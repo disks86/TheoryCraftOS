@@ -206,8 +206,11 @@ Windows side:
     Benchmark 4.0` (see What is not done for why not `Program Files (x86)`). Its Start menu entry is a shortcut to `heaven.bat`, listed as "Heaven
     Benchmark 4.0 (Windows)" and started as `cmd.exe /c "C:\...\heaven.bat"` (docs/WindowsUserMode.md, *The command interpreter*): the batch file
     changes to `bin` and starts `browser_x86.exe` (32-bit), and cmd ends with 0. The launcher's window, "Unigine Heaven Benchmark 4.0 (Basic
-    Edition)", opens with its banner and stays up. Its web view is black and its two buttons have no labels, so no settings can be picked and the
-    benchmark has not been started yet. The first run stopped at once: the launcher imports `MSVCR100.dll`, which was folded into the system's
+    Edition)", opens with its banner and shows its licence agreement with "Agree" and "Disagree" (in the kernel's built-in 8 x 16 font: there is no
+    TrueType font provider yet, so non-ASCII characters such as typographic quotes show as `?`). Nobody has clicked through it, so the settings page
+    and the benchmark itself have not been reached; the Direct3D helpers it ships (`d3dx9_42`, `d3dx11_42`, `d3dcompiler_42`, `XAudio2_7`) import
+    msvcrt functions this system does not have yet (the i386 `_CI*` math functions, `exception`, `__pioinfo`). Two faults were fixed on the way: the
+    text was missing because `GetGlyphOutline` had no kernel service (docs/win32k/Gdi.md), and the first run stopped at once: the launcher imports `MSVCR100.dll`, which was folded into the system's
     msvcrt.dll (missing `_malloc_crt` and `__CppXcptFilter`). Now the `msvcr100.dll` and `msvcp100.dll` that Heaven ships in `bin` are loaded
     instead (docs/WindowsUserMode.md, *The C runtimes*).
 

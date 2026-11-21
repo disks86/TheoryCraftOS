@@ -888,6 +888,124 @@ static void test_font_provider() {
   CHECK(f.u(N(GetTextMetricsW), dc, kOut, 0) == 1 && int32_t(f.prog.memory.get32(kOut + 20)) == 6);
 }
 
+// GetGlyphOutline: metrics and bitmaps of the built-in font and of a provider's glyph; outlines and transformations are refused with GDI_ERROR (Qt 4 then
+// measures with the extent functions; before, an answer of 0 left it with empty glyphs and no text).
+static void test_glyph_outline() {
+  constexpr uint32_t kGdiError = 0xFFFFFFFFu;
+  constexpr uint64_t kMat = kIn + 0x800, kGm = kOut + 0x400;
+  {
+    Fixture f(34);
+    const uint32_t dc = make_dc(f, 64, 32);
+    const uint8_t m[16] = {0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0};
+    for (int i = 0; i < 16; ++i) f.prog.memory.put8(kMat + i, m[i]);
+    // the built-in 8x16 font: 'A' has ink inside its cell, an advance of 8, and its box sits on the baseline
+    CHECK(f.u(N(GetGlyphOutline), dc, 'A', 0, kGm, 0, 0, kMat, 0) == 1);
+    const uint32_t bw = f.prog.memory.get32(kGm), bh = f.prog.memory.get32(kGm + 4);
+    const int32_t ox = int32_t(f.prog.memory.get32(kGm + 8)), oy = int32_t(f.prog.memory.get32(kGm + 12));
+    CHECK(bw >= 4 && bw <= 8 && bh >= 6 && bh <= 16 && ox >= 0 && ox < 8 && oy > 0 && oy <= 13 && f.prog.memory.get16(kGm + 16) == 8 && f.prog.memory.get16(kGm + 18) == 0);
+    // the same through its glyph index (this module's indices are the characters)
+    CHECK(f.u(N(GetGlyphOutline), dc, 'A', 0x80, kGm + 0x40, 0, 0, kMat, 0) == 1 && f.prog.memory.get32(kGm + 0x40) == bw && f.prog.memory.get32(kGm + 0x44) == bh);
+    // GGO_BITMAP: rows of four bytes for a box up to 32 wide; the size first, then the bits; a buffer too small is refused
+    const uint32_t need = uint32_t(f.u(N(GetGlyphOutline), dc, 'A', 1, kGm, 0, 0, kMat, 0));
+    CHECK(need == 4 * bh);
+    CHECK(f.u(N(GetGlyphOutline), dc, 'A', 1, kGm, need - 1, kBig, kMat, 0) == kGdiError);
+    for (uint32_t i = 0; i < need + 8; ++i) f.prog.memory.put8(kBig + i, 0xEE);
+    CHECK(f.u(N(GetGlyphOutline), dc, 'A', 1, kGm, need, kBig, kMat, 0) == need);
+    int set = 0, padding = 0;
+    for (uint32_t y = 0; y < bh; ++y)
+      for (uint32_t x = 0; x < 32; ++x) {
+        const bool on = (f.prog.memory.get8(kBig + y * 4 + x / 8) >> (7 - x % 8)) & 1;
+        if (x < bw) set += on; else padding += on;
+      }
+    CHECK(set > 10 && padding == 0 && f.prog.memory.get8(kBig + need) == 0xEE);      // (nothing written past the size)
+    // every row and column of the box has ink at its edges (the box is the ink's own)
+    bool top = false, bottom = false;
+    for (uint32_t x = 0; x < bw; ++x) {
+      top |= (f.prog.memory.get8(kBig + x / 8) >> (7 - x % 8)) & 1;
+      bottom |= (f.prog.memory.get8(kBig + (bh - 1) * 4 + x / 8) >> (7 - x % 8)) & 1;
+    }
+    CHECK(top && bottom);
+    // GGO_GRAY8_BITMAP: a byte a pixel, rows padded to four, 0 or 64
+    const uint32_t pitch = (bw + 3) / 4 * 4;
+    CHECK(f.u(N(GetGlyphOutline), dc, 'A', 6, kGm, 0, 0, kMat, 0) == pitch * bh);
+    CHECK(f.u(N(GetGlyphOutline), dc, 'A', 6, kGm, 4096, kBig, kMat, 0) == pitch * bh);
+    int full = 0, other = 0;
+    for (uint32_t i = 0; i < pitch * bh; ++i) { const uint8_t v = f.prog.memory.get8(kBig + i); full += v == 64; other += v != 0 && v != 64; }
+    CHECK(full == set && other == 0);
+    CHECK(f.u(N(GetGlyphOutline), dc, 'A', 4, kGm, 4096, kBig, kMat, 0) == pitch * bh && f.prog.memory.get8(kBig + pitch * bh - 1) <= 4);      // GRAY2: 0..4
+    // a space: a 1 x 1 box, its advance, and no bits
+    CHECK(f.u(N(GetGlyphOutline), dc, ' ', 0, kGm, 0, 0, kMat, 0) == 1 && f.prog.memory.get32(kGm) == 1 && f.prog.memory.get32(kGm + 4) == 1 && f.prog.memory.get16(kGm + 16) == 8);
+    CHECK(f.u(N(GetGlyphOutline), dc, ' ', 6, kGm, 4096, kBig, kMat, 0) == 0);
+    // refused: outlines, a transformation, no metrics or matrix, a bad DC, bad pointers, a character past Unicode
+    CHECK(f.u(N(GetGlyphOutline), dc, 'A', 2, kGm, 4096, kBig, kMat, 0) == kGdiError);
+    CHECK(f.u(N(GetGlyphOutline), dc, 'A', 3, kGm, 4096, kBig, kMat, 0) == kGdiError);
+    CHECK(f.u(N(GetGlyphOutline), dc, 'A', 0, 0, 0, 0, kMat, 0) == kGdiError);
+    CHECK(f.u(N(GetGlyphOutline), dc, 'A', 0, kGm, 0, 0, 0, 0) == kGdiError);
+    CHECK(f.u(N(GetGlyphOutline), 0x1234, 'A', 0, kGm, 0, 0, kMat, 0) == kGdiError);
+    CHECK(f.u(N(GetGlyphOutline), dc, 'A', 0, 0x10, 0, 0, kMat, 0) == kGdiError);
+    CHECK(f.u(N(GetGlyphOutline), dc, 'A', 6, kGm, 4096, 0x10, kMat, 0) == kGdiError);
+    CHECK(f.u(N(GetGlyphOutline), dc, 0x110000, 0, kGm, 0, 0, kMat, 0) == kGdiError);
+    // every single bit of the matrix and of the format flipped: refused or answered, never a fault (the sanitizers watch)
+    for (int i = 0; i < 16; ++i)
+      for (int bit = 0; bit < 8; ++bit) {
+        f.prog.memory.put8(kMat + i, uint8_t(m[i] ^ (1u << bit)));
+        CHECK(f.u(N(GetGlyphOutline), dc, 'A', 6, kGm, 4096, kBig, kMat, 0) == kGdiError);
+        f.prog.memory.put8(kMat + i, m[i]);
+      }
+    for (int bit = 0; bit < 32; ++bit) (void)f.u(N(GetGlyphOutline), dc, 'A', 1u << bit, kGm, 4096, kBig, kMat, 0);
+  }
+  {
+    // a smaller cell than the 8 x 16 glyphs (12 high, 6 wide): a pixel is set if any of the pixels it covers is, so no stroke is lost; and the
+    // format characters (Qt ends its lines with U+2028) are blanks without width, not a '?'
+    Fixture f(36);
+    const uint32_t dc = make_dc(f, 64, 32);
+    const uint8_t m[16] = {0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0};
+    for (int i = 0; i < 16; ++i) f.prog.memory.put8(kMat + i, m[i]);
+    uint8_t lf[92] = {};
+    lf[0] = 0xF4; lf[1] = 0xFF; lf[2] = 0xFF; lf[3] = 0xFF;      // -12
+    for (int i = 0; i < 92; ++i) f.prog.memory.put8(kBig + 0x800 + i, lf[i]);
+    f.u(N(SelectFont), dc, f.u(N(HfontCreate), kBig + 0x800, 92, 0, 0, 0));
+    CHECK(f.u(N(GetGlyphOutline), dc, 'w', 1, kGm, 4096, kBig, kMat, 0) > 0);
+    const uint32_t bw = f.prog.memory.get32(kGm), bh = f.prog.memory.get32(kGm + 4);
+    if (getenv("SHOW_GLYPH"))
+      for (uint32_t y = 0; y < bh; ++y) { for (uint32_t x = 0; x < bw; ++x) putchar((f.prog.memory.get8(kBig + y * 4 + x / 8) >> (7 - x % 8)) & 1 ? '#' : '.'); putchar('\n'); }
+    // 'w': on its lowest rows the middle stroke is there, between the two outer ones: some row reads ink, gap, ink, gap, ink
+    bool three = false;
+    for (uint32_t y = 0; y < bh && !three; ++y) {
+      int runs = 0;
+      bool prev = false;
+      for (uint32_t x = 0; x < bw; ++x) { const bool on = (f.prog.memory.get8(kBig + y * 4 + x / 8) >> (7 - x % 8)) & 1; runs += on && !prev; prev = on; }
+      three = runs >= 3;
+    }
+    CHECK(bw <= 6 && three);
+    CHECK(f.u(N(GetGlyphOutline), dc, 0x2028, 0, kGm, 0, 0, kMat, 0) == 1 && f.prog.memory.get32(kGm) == 1 && f.prog.memory.get16(kGm + 16) == 0);
+    CHECK(f.u(N(GetGlyphOutline), dc, 0x2028, 1, kGm, 4096, kBig, kMat, 0) == 0);
+    f.prog.memory.put16(kIn, 'a'); f.prog.memory.put16(kIn + 2, 0x2028); f.prog.memory.put16(kIn + 4, 0xFEFF);
+    CHECK(f.u(N(GetTextExtentExW), dc, kIn, 3, -1, 0, 0, kOut, 0) == 1 && int32_t(f.prog.memory.get32(kOut)) == 6);      // (only the 'a' is wide)
+    f.u(N(PatBlt), dc, 0, 0, 64, 32, kWhiteness);
+    f.u(N(GetAndSetDCDword), dc, 101, 1, kOut);
+    f.prog.memory.put16(kIn, 0x2028); f.prog.memory.put16(kIn + 2, 0x0D); f.prog.memory.put16(kIn + 4, 0x2029);
+    CHECK(f.u(N(ExtTextOutW), dc, 0, 0, 0, 0, kIn, 3, 0, 0) == 1);
+    int ink = 0;
+    for (int y = 0; y < 32; ++y) for (int x = 0; x < 64; ++x) ink += px(f, dc, x, y) != kWhite;
+    CHECK(ink == 0);
+  }
+  {
+    // a provider's glyph: its own box, origin and advance; its coverage in shades
+    Fixture f(35);
+    FakeProvider provider;
+    gdi::set_font_provider(&provider);
+    const uint32_t dc = make_dc(f, 64, 32);
+    const uint8_t m[16] = {0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0};
+    for (int i = 0; i < 16; ++i) f.prog.memory.put8(kMat + i, m[i]);
+    CHECK(f.u(N(GetGlyphOutline), dc, 'B', 0, kGm, 0, 0, kMat, 0) == 1);
+    CHECK(f.prog.memory.get32(kGm) == 4 && f.prog.memory.get32(kGm + 4) == 4 && f.prog.memory.get32(kGm + 8) == 0 && f.prog.memory.get32(kGm + 12) == 4 &&
+          f.prog.memory.get16(kGm + 16) == 6);
+    CHECK(f.u(N(GetGlyphOutline), dc, 'B', 5, kGm, 4096, kBig, kMat, 0) == 16 && f.prog.memory.get8(kBig) == 16 && f.prog.memory.get8(kBig + 15) == 16);      // GRAY4: 0..16
+    CHECK(f.u(N(GetGlyphOutline), dc, 'B', 1, kGm, 4096, kBig, kMat, 0) == 16 && f.prog.memory.get8(kBig) == 0xF0 && f.prog.memory.get8(kBig + 1) == 0);
+  }
+}
+
 static void test_screen_dc() {
   Fixture f(33);
   Screen sink;
@@ -1112,6 +1230,7 @@ int main() {
   test_bitmap_bits();
   test_text();
   test_font_provider();
+  test_glyph_outline();
   test_screen_dc();
   test_desktop_bridge();
   test_window_surfaces();
