@@ -44,7 +44,7 @@ struct TgsiAccel : IAccelerator {
   };
   struct Prog { std::string vs, fs, gs, tcs, tes; uint32_t attributes = 0, varyings = 0, textures = 0; bool flat[16] = {}; int position = -1, face = -1; bool depth_out = false, derivatives = false; int depth_reg = 1; AccelStages st; };
   // A texture or a device image (create_image: renderable unless mipmapped; a Depth image keeps its depth in `f`, one float per texel). Mipmapped images keep level 0 only.
-  struct Tex { uint32_t w = 0, h = 0; std::vector<uint8_t> rgba; std::vector<float> f; bool floats = false; bool image = false, depth = false; uint32_t levels = 1; uint32_t layers = 0; AccelKind kind = AccelKind::Volume; };
+  struct Tex { uint32_t w = 0, h = 0; std::vector<uint8_t> rgba; std::vector<float> f; bool floats = false; bool image = false, depth = false; uint32_t levels = 1; uint32_t layers = 0; AccelKind kind = AccelKind::Volume; std::vector<uint8_t> stencil; };
   struct Tgt { uint32_t w = 0, h = 0; std::vector<uint8_t> rgba; std::vector<float> depth; };
   struct Surfaces;
   std::vector<Prog> progs;
@@ -63,6 +63,7 @@ struct TgsiAccel : IAccelerator {
     l.independent_blend = true;
     l.depth_bias = true;
     l.layered_textures = true;
+    l.stencil = true;
     return l;
   }
   uint32_t images = 4;   // (0: a device without device images)
@@ -116,7 +117,8 @@ struct TgsiAccel : IAccelerator {
     t.h = h;
     t.image = true;
     t.levels = levels;
-    t.depth = f == AccelFormat::Depth;
+    t.depth = f == AccelFormat::Depth || f == AccelFormat::DepthStencil;
+    if (f == AccelFormat::DepthStencil) t.stencil.assign(uint64_t{w} * h, 0);
     t.floats = f == AccelFormat::Rgba16F || f == AccelFormat::Rgba32F;
     if (t.depth) t.f.assign(uint64_t{w} * h, 1.0f);
     else if (t.floats) t.f.assign(uint64_t{w} * h * 4, 0.0f);
@@ -179,6 +181,7 @@ struct TgsiAccel : IAccelerator {
       if (a.color_count == 0) { out->w = d.w; out->h = d.h; }
       if (d.w != out->w || d.h != out->h) return false;
       out->depth = d.f.data();
+      out->stencil = d.stencil.empty() ? nullptr : d.stencil.data();
     }
     return out->w != 0;
   }
@@ -194,6 +197,7 @@ struct TgsiAccel : IAccelerator {
             else s.colors[c]->rgba[i * 4 + k] = to8(rgba[k]);
           }
       if (depth && s.depth) s.depth[i] = d;
+      if (s.stencil && a.stencil_clear >= 0) s.stencil[i] = static_cast<uint8_t>(a.stencil_clear);
     }
     return true;
   }
@@ -311,6 +315,7 @@ struct TgsiAccel : IAccelerator {
     Tex* colors[8] = {};
     uint8_t* rgba8 = nullptr;   // (the default target's single colour image)
     float* depth = nullptr;
+    uint8_t* stencil = nullptr;
   };
   struct Pixels final : gpu::IFragmentSink {
     TgsiAccel* acc;
@@ -355,12 +360,45 @@ struct TgsiAccel : IAccelerator {
       float z = p->depth_out ? (m.out[p->depth_reg][2] < 0 ? 0 : (m.out[p->depth_reg][2] > 1 ? 1 : m.out[p->depth_reg][2])) : f.z;
       if (st->depth_bias_modes & 1) z += st->depth_bias_units / 16777216.0f;      // (filled triangles: the units only - the scenes' triangles face the window)
       const uint64_t at = uint64_t(f.y) * t->w + uint64_t(f.x);
+      const auto compare = [](uint8_t op, float a, float b) {
+        return op == 0 ? false : op == 1 ? a < b : op == 2 ? a == b : op == 3 ? a <= b : op == 4 ? a > b : op == 5 ? a != b : op == 6 ? a >= b : true;
+      };
+      // the stencil test (one state for both faces), then the depth test; the stencil is updated by which of them failed
+      const bool stencil_on = st->stencil_test && t->stencil;
+      bool stencil_pass = true;
+      if (stencil_on) {
+        const uint8_t ref = st->stencil_reference & st->stencil_read_mask, cur = t->stencil[at] & st->stencil_read_mask;
+        stencil_pass = compare(st->stencil_compare, ref, cur);
+      }
+      const auto update_stencil = [&](uint8_t op) {
+        if (!stencil_on) return;
+        const uint8_t cur = t->stencil[at];
+        uint8_t v = cur;
+        switch (op) {
+          case 1: v = 0; break;
+          case 2: v = st->stencil_reference; break;
+          case 3: v = cur == 255 ? 255 : static_cast<uint8_t>(cur + 1); break;
+          case 4: v = cur == 0 ? 0 : static_cast<uint8_t>(cur - 1); break;
+          case 5: v = static_cast<uint8_t>(~cur); break;
+          case 6: v = static_cast<uint8_t>(cur + 1); break;
+          case 7: v = static_cast<uint8_t>(cur - 1); break;
+          default: break;
+        }
+        t->stencil[at] = static_cast<uint8_t>((cur & ~st->stencil_write_mask) | (v & st->stencil_write_mask));
+      };
+      if (!stencil_pass) {
+        update_stencil(st->stencil_fail);
+        return;
+      }
       if (st->depth_test && t->depth) {
         const float d = t->depth[at];
         const uint8_t op = st->custom_blend ? st->depth_compare : 3;
-        const bool pass = op == 0 ? false : op == 1 ? z < d : op == 2 ? z == d : op == 3 ? z <= d : op == 4 ? z > d : op == 5 ? z != d : op == 6 ? z >= d : true;
-        if (!pass) return;
+        if (!compare(op, z, d)) {
+          update_stencil(st->stencil_depth_fail);
+          return;
+        }
       }
+      update_stencil(st->stencil_pass);
       if (st->depth_write && t->depth) t->depth[at] = z;
       for (uint32_t c = 0; c < (t->rgba8 ? 1u : t->n); ++c) color(c, at);
     }

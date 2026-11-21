@@ -886,7 +886,7 @@ IImage* VirglDevice::create_image(const ImageDesc& desc) {
   // A sampled image is stored upright, an image only drawn into (and shown) the other way up (see VirglImage): a shown image is not sampled. A depth image that is
   // sampled (DeviceLimits::sampled_depth) is upright like the colour images it is drawn with, which are sampled too (a framebuffer object's).
   if ((desc.usage & kImageSampled) && (desc.usage & kImagePresent)) return nullptr;
-  if ((desc.usage & kImageSampled) && (desc.usage & kImageDepthAttachment) && (desc.format != Format::D32Float || desc.stencil || desc.mip_levels != 1 || desc.kind != TextureKind::Texture2D)) return nullptr;
+  if ((desc.usage & kImageSampled) && (desc.usage & kImageDepthAttachment) && (desc.format != Format::D32Float || desc.mip_levels != 1 || desc.kind != TextureKind::Texture2D)) return nullptr;
   if ((desc.usage & kImageSampled) && desc.format != Format::B8G8R8A8Unorm && desc.format != Format::B8G8R8A8Srgb && desc.format != Format::R8G8B8A8Unorm && desc.format != Format::R8G8B8A8Srgb && !is_wide_format(desc.format) && desc.format != Format::D32Float) return nullptr;
   if (!desc.extent.width || !desc.extent.height || desc.format == Format::Undefined) return nullptr;
   if (desc.stencil && desc.format != Format::D32Float) return nullptr;

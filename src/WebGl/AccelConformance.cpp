@@ -198,6 +198,47 @@ void layered_texture(GlContext& gl, uint32_t p, uint32_t target) {
   if (gl.get_uniform_location(p, "u_t") >= 0) gl.uniform(gl.get_uniform_location(p, "u_t"), 'i', 1, 1, 1, &zero);
 }
 #define kFinishHead "#version 300 es\nprecision highp float;\nin vec2 uv; uniform sampler2D t0; uniform sampler2D t1; uniform sampler2D d; out vec4 o;\n"
+// The stencil scene: a framebuffer object with a depth-stencil renderbuffer; the scene's triangles write 1 into the stencil where they are (the test ALWAYS, REPLACE),
+// then a second draw of the whole picture in one colour where the stencil is 1, then the window from the image.
+void stencil_setup(GlContext& gl) {
+  const uint32_t fb = gl.create_framebuffer();
+  gl.bind_framebuffer(0x8D40, fb);
+  gl.framebuffer_texture(0x8D40, 0x8CE0, 0x0DE1, fbo_texture(gl, 0, 0x8058, 0x1908, 0x1401), 0, 0);
+  const uint32_t rb = gl.create_renderbuffer();
+  gl.bind_renderbuffer(rb);
+  gl.renderbuffer_storage(0x88F0, kFboSize, kFboSize, 0);      // DEPTH24_STENCIL8
+  gl.framebuffer_renderbuffer(0x8D40, 0x8D00, rb);
+  gl.framebuffer_renderbuffer(0x8D40, 0x8D20, rb);
+  gl.clear_stencil(0);
+  gl.enable(0x0B90, true);      // STENCIL_TEST
+  gl.stencil_func_separate(0x0408, 0x0207, 1, 0xFF);      // ALWAYS
+  gl.stencil_op_separate(0x0408, 0x1E00, 0x1E00, 0x1E01);      // KEEP KEEP REPLACE
+}
+void stencil_finish(GlContext& gl) {
+  const uint32_t p = gl.create_program();
+  const char* vs = "#version 300 es\nin vec2 pos; void main(){ gl_Position = vec4(pos, 0.0, 1.0); }\n";
+  const char* fs = "#version 300 es\nprecision highp float; out vec4 o; void main(){ o = vec4(0.2, 0.9, 0.4, 1.0); }\n";
+  const uint32_t types[2] = {0x8B31, 0x8B30};
+  const char* const sources[2] = {vs, fs};
+  for (uint32_t i = 0; i < 2; ++i) {
+    const uint32_t sh = gl.create_shader(types[i]);
+    gl.shader_source(sh, StringView(sources[i]));
+    gl.compile_shader(sh);
+    gl.attach_shader(p, sh);
+  }
+  gl.link_program(p);
+  gl.use_program(p);
+  const int32_t l = gl.get_attrib_location(p, StringView("pos"));
+  if (l >= 0) {
+    gl.enable_vertex_attrib(static_cast<uint32_t>(l), true);
+    gl.vertex_attrib_pointer(static_cast<uint32_t>(l), 2, 0x1406, false, 28, 0, false);
+  }
+  gl.stencil_func_separate(0x0408, 0x0202, 1, 0xFF);      // EQUAL
+  gl.stencil_op_separate(0x0408, 0x1E00, 0x1E00, 0x1E00);
+  gl.draw_arrays(4, 0, 6, 1);      // (the strip's triangles' vertices: 0..5 of the triangles buffer cover the picture)
+  gl.enable(0x0B90, false);
+  fbo_finish(gl, kFinishHead "void main(){ o = texture(t0, uv); }\n");
+}
 
 constexpr Scene kScenes[] = {
       {"for loop with break and continue", kVs, kFsHead "void main(){ float s = 0.0; for (int i = 0; i < 8; ++i) { if (i == 2) continue; if (i == 6) break; s += v.r * float(i) * 0.05; } o = vec4(s, v.g, v.b, 1.0); }\n", 5, nullptr},
@@ -348,6 +389,8 @@ constexpr Scene kScenes[] = {
        [](GlContext& gl, uint32_t p) { layered_texture(gl, p, 0x806F); }},
       {"a 2D array texture and textureLod", kVs, kFsHead "uniform highp sampler2DArray u_t;\nvoid main(){ o = texture(u_t, vec3(v.rg, vk)) * 0.5 + textureLod(u_t, vec3(v.gr, 2.0 - vk), 0.0) * 0.5; }\n", 5,
        [](GlContext& gl, uint32_t p) { layered_texture(gl, p, 0x8C1A); }},
+      {"the stencil test on a framebuffer object", kVs, kFsHead "void main(){ o = v; }\n", 4, [](GlContext& gl, uint32_t) { stencil_setup(gl); }, false, nullptr, nullptr,
+       nullptr, 0, 3, stencil_finish, 3},      // (the scene: the first triangle only, the lower left half; the second draw covers all of the picture)
 };
 #undef kFsHead
 #undef kHead

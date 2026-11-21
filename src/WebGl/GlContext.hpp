@@ -78,8 +78,10 @@ struct AccelImage {
   uint64_t synced = 0;           // the Image::version() the copy holds (0: none - the copy is out of date unless ahead)
   bool ahead = false;            // (set_ahead: the share group counts the images that are ahead, GlObjects::hw_ahead)
   int32_t* ahead_count = nullptr;
-  bool cleared = false;          // a depth copy: a device clear to cleared_value is all that happened to it since it was last in step with the CPU's
+  bool cleared = false;          // a depth copy: device clears (of the depth to cleared_value, of the stencil to stencil_cleared) are all that happened to it since it was last in step with the CPU's
   float cleared_value = 1;
+  bool depth_cleared = false;
+  int32_t stencil_cleared = -1;   // (-1: the stencil was not cleared)
   // A depth copy the CPU wanted while it was ahead with more than a clear in it: the CPU went on with its older depth (at this version), the device keeps its own
   // unless the CPU writes the image after that (0: no such time).
   uint64_t cpu_seen = 0;

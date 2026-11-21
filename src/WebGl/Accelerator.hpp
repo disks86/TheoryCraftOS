@@ -67,11 +67,12 @@ struct AccelLimits {
   bool independent_blend = false; // AccelState::per_target
   bool layered_textures = false;  // create_layered: 3D, cube and 2D array textures
   bool depth_bias = false;        // AccelState::depth_bias_*
+  bool stencil = false;           // AccelFormat::DepthStencil images and AccelState::stencil_*
 };
 
 // The kinds of device image (create_image). Rgba8 (Srgb: sRGB encoded) has 8-bit channels; Rgba16F and Rgba32F floats; Depth a float depth image. Pixels go in and out
 // as w * h * 4 bytes R, G, B, A (Rgba8, Rgba8Srgb), w * h * 16 bytes of little-endian floats (Rgba16F, Rgba32F) - the row of t = 0 (window y 0) first.
-enum class AccelFormat : uint8_t { Rgba8, Rgba8Srgb, Rgba16F, Rgba32F, Depth };
+enum class AccelFormat : uint8_t { Rgba8, Rgba8Srgb, Rgba16F, Rgba32F, Depth, DepthStencil };   // (DepthStencil: AccelLimits::stencil, a depth image with an 8-bit stencil plane)
 enum class AccelKind : uint8_t { Volume, Cube, Array };   // (create_layered)
 constexpr uint32_t kAccelMaxColors = 8;
 // The images a draw renders into (draw_images, clear_images): colours[0 .. color_count - 1], fragment output n going to colors[n], and a Depth image (0: none). All
@@ -80,6 +81,8 @@ struct AccelAttachments {
   uint32_t colors[kAccelMaxColors] = {};
   uint32_t color_count = 0;
   uint32_t depth = 0;
+  // clear_images of a DepthStencil image: its stencil plane to this value (0 .. 255; -1: left as it is)
+  int32_t stencil_clear = -1;
 };
 
 // The stages of a program between the vertex and the fragment shader (create_program_stages), as TGSI text, and what the device must know of them. The numbers are the
@@ -142,6 +145,10 @@ struct AccelState {
   // AccelLimits::depth_bias: glPolygonOffset's factor and units, applied to the primitives `depth_bias_modes` says (bit 0 filled, 1 lines, 2 points).
   float depth_bias_factor = 0, depth_bias_units = 0;
   uint8_t depth_bias_modes = 0;
+  // AccelLimits::stencil, drawing into a DepthStencil image: the stencil test, one state for both faces (graphics::CompareOp and StencilOp numbers)
+  bool stencil_test = false;
+  uint8_t stencil_compare = 7, stencil_fail = 0, stencil_depth_fail = 0, stencil_pass = 0;
+  uint8_t stencil_reference = 0, stencil_read_mask = 0xFF, stencil_write_mask = 0xFF;
 };
 
 class IAccelerator {

@@ -94,6 +94,7 @@ class GlService {
     uint32_t frames_since_report = 0;   // (swaps of its surface since its draw statistics were last reported)
   };
   static constexpr uint32_t kReportFrames = 30;
+  static constexpr uint64_t kReportDraws = 5000;
   struct Surface {
     uint64_t window = 0;
     UniquePointer<GlSurface> surface;

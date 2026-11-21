@@ -53,7 +53,8 @@ class VirglDevice final : public IGraphicsDevice {
     l.sampled_depth = true;
     // (constants for the GL path's large programs: 960 vec4s, under what every GL 4 host's uniform limit takes - radeonsi 4096, NVIDIA 1024 - with room for the
     // host's own uniforms; a shader past the host's limit would lose the whole context)
-    l.shader_constant_bytes = 960 * 16;                 // (a depth image that is a sampler view too: VirglImage)                    // (the rasterizer's offset_tri / line / point, units and scale: glPolygonOffset on the host)
+    l.shader_constant_bytes = 960 * 16;
+    l.stencil = true;                       // (Z32_FLOAT_S8X24_UINT depth images; the DSA object's stencil state)                 // (a depth image that is a sampler view too: VirglImage)                    // (the rasterizer's offset_tri / line / point, units and scale: glPolygonOffset on the host)
     return l;
   }
 

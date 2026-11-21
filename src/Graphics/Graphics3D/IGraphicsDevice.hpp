@@ -69,7 +69,8 @@ struct DeviceLimits {
   uint32_t control_varyings = 0;                        // tessellation: the vectors of each control point from the hull to the domain stage (0: `varyings`)
   bool depth_bias = false;                              // GraphicsPipelineDesc::depth_bias_*
   bool sampled_depth = false;
-  uint32_t shader_constant_bytes = 0;                   // push_constants up to this many bytes (above kMaxPushConstantBytes; 0: kMaxPushConstantBytes)                           // a D32Float image with kImageDepthAttachment | kImageSampled: drawn into, then bound as a texture whose red channel is the depth
+  uint32_t shader_constant_bytes = 0;
+  bool stencil = false;                                 // D32Float images with a stencil plane (ImageDesc::stencil) and GraphicsPipelineDesc::stencil                   // push_constants up to this many bytes (above kMaxPushConstantBytes; 0: kMaxPushConstantBytes)                           // a D32Float image with kImageDepthAttachment | kImageSampled: drawn into, then bound as a texture whose red channel is the depth
 };
 
 // --- Resources ---------------------------------------------------------------

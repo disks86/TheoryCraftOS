@@ -174,6 +174,12 @@ GlStatus GlService::execute(uint64_t pid, uint64_t thread, ConstByteView stream,
   Context* c = p->current(thread);
   if (!c) return GlStatus::NoContext;
   *result = c->api->execute(stream, memory);
+  // (a program whose frames are slow: its statistics every kReportDraws draws too, not only every kReportFrames frames)
+  const webgl::GlContext::HardwareStats& stats = c->api->hardware_stats();
+  if (stats.gpu_draws + stats.cpu_draws >= kReportDraws) {
+    report(pid, *c);
+    c->api->reset_hardware_stats();
+  }
   return GlStatus::Ok;
 }
 

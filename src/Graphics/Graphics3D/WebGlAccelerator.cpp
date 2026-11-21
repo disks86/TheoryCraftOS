@@ -84,6 +84,7 @@ webgl::AccelLimits WebGlAccelerator::limits() const {
   l.independent_blend = (info.features & kFeatureIndependentBlend) && l.blend_state;
   l.depth_bias = info.limits.depth_bias;
   l.layered_textures = (info.features & kFeatureTextureKinds) != 0;
+  l.stencil = info.limits.stencil;
   return l;
 }
 
@@ -218,8 +219,10 @@ uint32_t WebGlAccelerator::make_texture(uint32_t w, uint32_t h, webgl::AccelForm
     case webgl::AccelFormat::Rgba16F: d.format = Format::R16G16B16A16Float; break;
     case webgl::AccelFormat::Rgba32F: d.format = Format::R32G32B32A32Float; break;
     case webgl::AccelFormat::Depth: d.format = Format::D32Float; break;
+    case webgl::AccelFormat::DepthStencil: d.format = Format::D32Float; d.stencil = true; break;
   }
-  if (format == webgl::AccelFormat::Depth) {
+  if (format == webgl::AccelFormat::Depth || format == webgl::AccelFormat::DepthStencil) {
+    if (format == webgl::AccelFormat::DepthStencil && !device_.info().limits.stencil) return 0;
     if (!renderable) return 0;
     // (sampled as well when the device can: a depth texture a later draw reads)
     d.usage = kImageDepthAttachment | (device_.info().limits.sampled_depth ? kImageSampled : 0u);
@@ -320,13 +323,17 @@ IPipeline* WebGlAccelerator::pipeline_for(Program& p, const webgl::AccelState& s
   if (color_count == 0 || color_count > kMaxColorTargets) return nullptr;
   uint64_t key = cull | (s.front_ccw ? 4u : 0u) | (s.depth_test ? 8u : 0u) | (s.depth_write ? 16u : 0u) | (s.blend ? 32u : 0u) | uint64_t{s.clip_mask} << 40;
   key |= uint64_t{color_count - 1} << 48;
+  // (the stencil state: in the second key, bits 20 on)
+  const uint64_t stencil_key = !s.stencil_test ? 0
+                               : 1ull | uint64_t{s.stencil_compare & 7} << 1 | uint64_t{s.stencil_fail & 7} << 4 | uint64_t{s.stencil_depth_fail & 7} << 7 |
+                                     uint64_t{s.stencil_pass & 7} << 10 | uint64_t{s.stencil_reference} << 13 | uint64_t{s.stencil_read_mask} << 21 | uint64_t{s.stencil_write_mask} << 29;
   if (s.custom_blend) {
     key |= uint64_t{1} << 6;
     key |= uint64_t{s.src_rgb & 15} << 8 | uint64_t{s.dst_rgb & 15} << 12 | uint64_t{s.src_alpha & 15} << 16 | uint64_t{s.dst_alpha & 15} << 20;
     key |= uint64_t{s.op_rgb & 7} << 24 | uint64_t{s.op_alpha & 7} << 27 | uint64_t{s.color_mask & 15} << 30 | uint64_t{s.depth_compare & 7} << 34;
   }
   // (the rest: the per-instance attributes - below 16, as the device's - the depth bias's primitives, and the blending of each target)
-  const uint64_t key2 = uint64_t{s.instanced & 0xFFFF} | uint64_t{s.depth_bias_modes & 7u} << 16 | (s.per_target ? 1ull << 19 : 0);
+  const uint64_t key2 = uint64_t{s.instanced & 0xFFFF} | uint64_t{s.depth_bias_modes & 7u} << 16 | (s.per_target ? 1ull << 19 : 0) | stencil_key << 20;
   const float bias_slope = s.depth_bias_modes ? s.depth_bias_factor : 0.0f, bias_units = s.depth_bias_modes ? s.depth_bias_units : 0.0f;
   const auto same_targets = [&](const Variant& v) {
     if (!s.per_target) return true;
@@ -402,6 +409,17 @@ IPipeline* WebGlAccelerator::pipeline_for(Program& p, const webgl::AccelState& s
     if (!blend_of(s.targets[0], &d.blend)) return nullptr;
     for (uint32_t i = 1; i < color_count && i < kMaxColorTargets; ++i)
       if (!blend_of(s.targets[i], &d.target_blend[i - 1])) return nullptr;
+  }
+  if (s.stencil_test) {
+    if (!device_.info().limits.stencil || s.stencil_compare > 7 || s.stencil_fail > 7 || s.stencil_depth_fail > 7 || s.stencil_pass > 7) return nullptr;
+    d.stencil.enable = true;
+    d.stencil.compare = static_cast<CompareOp>(s.stencil_compare);
+    d.stencil.fail_op = static_cast<StencilOp>(s.stencil_fail);
+    d.stencil.depth_fail_op = static_cast<StencilOp>(s.stencil_depth_fail);
+    d.stencil.pass_op = static_cast<StencilOp>(s.stencil_pass);
+    d.stencil.reference = s.stencil_reference;
+    d.stencil.compare_mask = s.stencil_read_mask;
+    d.stencil.write_mask = s.stencil_write_mask;
   }
   if (s.depth_bias_modes) {
     if (!device_.info().limits.depth_bias) return nullptr;
@@ -599,13 +617,13 @@ bool WebGlAccelerator::images_pass(const webgl::AccelAttachments& a, RenderPassB
   };
   for (uint32_t i = 0; i < a.color_count; ++i) {
     const Texture* t = texture_at(a.colors[i]);
-    if (!t || !t->renderable || t->format == webgl::AccelFormat::Depth || !same_size(*t)) return false;
+    if (!t || !t->renderable || t->format == webgl::AccelFormat::Depth || t->format == webgl::AccelFormat::DepthStencil || !same_size(*t)) return false;
     if (i == 0) pass->color = t->image;
     else pass->extra_colors[i - 1] = t->image;
   }
   if (a.depth) {
     const Texture* t = texture_at(a.depth);
-    if (!t || t->format != webgl::AccelFormat::Depth || !same_size(*t)) return false;
+    if (!t || (t->format != webgl::AccelFormat::Depth && t->format != webgl::AccelFormat::DepthStencil) || !same_size(*t)) return false;
     pass->depth = t->image;
   }
   if (w == 0) return false;
@@ -621,12 +639,13 @@ bool WebGlAccelerator::clear_images(const webgl::AccelAttachments& a, bool color
   RenderPassBegin pass;
   uint32_t w = 0, h = 0;
   if (!images_pass(a, &pass, &w, &h)) return false;
-  if (!color && !depth) return true;
   pass.clear_color = color && a.color_count > 0;
   pass.clear_color_value = Vec4{rgba[0], rgba[1], rgba[2], rgba[3]};
   pass.clear_depth = depth && a.depth;
   pass.clear_depth_value = depth_value;
-  pass.clear_stencil = false;
+  pass.clear_stencil = a.depth && a.stencil_clear >= 0 && a.stencil_clear <= 255;
+  pass.clear_stencil_value = static_cast<uint8_t>(pass.clear_stencil ? a.stencil_clear : 0);
+  if (!color && !depth && !pass.clear_stencil) return true;
   return run_pass_on(pass, w, h, a.color_count ? a.color_count : 1, nullptr, nullptr, ConstByteView(), 0, ConstByteView());
 }
 
@@ -694,7 +713,7 @@ bool WebGlAccelerator::write_layer(uint32_t handle, uint32_t layer, ConstByteVie
 bool WebGlAccelerator::write_image(uint32_t handle, uint32_t level, ConstByteView pixels) {
   kernel::ScopedMutex guard(lock_);
   Texture* t = texture_at(handle);
-  if (!t || t->format == webgl::AccelFormat::Depth || level >= t->levels) return false;
+  if (!t || t->format == webgl::AccelFormat::Depth || t->format == webgl::AccelFormat::DepthStencil || level >= t->levels) return false;
   const uint32_t w = t->width >> level ? t->width >> level : 1, h = t->height >> level ? t->height >> level : 1;
   const uint64_t texels = uint64_t{w} * h;
   const bool floats = t->format == webgl::AccelFormat::Rgba16F || t->format == webgl::AccelFormat::Rgba32F;
@@ -726,7 +745,7 @@ bool WebGlAccelerator::write_image(uint32_t handle, uint32_t level, ConstByteVie
 bool WebGlAccelerator::read_image(uint32_t handle, ByteView pixels) {
   kernel::ScopedMutex guard(lock_);
   Texture* t = texture_at(handle);
-  if (!t || t->format == webgl::AccelFormat::Depth) return false;
+  if (!t || t->format == webgl::AccelFormat::Depth || t->format == webgl::AccelFormat::DepthStencil) return false;
   const uint64_t texels = uint64_t{t->width} * t->height;
   const bool floats = t->format == webgl::AccelFormat::Rgba16F || t->format == webgl::AccelFormat::Rgba32F;
   if (pixels.size() != texels * (floats ? 16 : 4)) return false;

@@ -94,8 +94,10 @@ bool GlContext::hw_format(const Image& im, AccelFormat* format, const char** why
       *format = AccelFormat::Rgba32F;
       return true;
     case Store::Depth:
-    case Store::DepthStencil:
       *format = AccelFormat::Depth;
+      return true;
+    case Store::DepthStencil:      // (with its stencil plane on the device when the device has one: the stencil test is then the device's too)
+      *format = l.stencil ? AccelFormat::DepthStencil : AccelFormat::Depth;
       return true;
     default: break;
   }
@@ -152,7 +154,7 @@ bool GlContext::hw_current(Image& im, AccelImage& copy) {
   }
   const uint64_t version = im.version();
   if (copy.synced == version) return true;
-  if (copy.format == AccelFormat::Depth) return false;
+  if (copy.format == AccelFormat::Depth || copy.format == AccelFormat::DepthStencil) return false;
   const uint64_t bytes = uint64_t{im.w} * im.h * texel_bytes(im.info->store);
   if (im.px.size() != bytes || !copy.owner->write_image(copy.handle, 0, im.px.view())) return false;
   copy.synced = version;
@@ -165,26 +167,29 @@ bool GlContext::hw_current(Image& im, AccelImage& copy) {
 void GlContext::hw_sync_image(Image& im) {
   if (!im.hw || !im.hw->ahead) return;
   AccelImage& copy = *im.hw;
-  if (copy.format == AccelFormat::Depth && !copy.cleared) {
+  const bool depth_copy = copy.format == AccelFormat::Depth || copy.format == AccelFormat::DepthStencil;
+  if (depth_copy && !copy.cleared) {
     // (the device drew depth the CPU cannot have: the CPU goes on with what it has, the device keeps its own until the CPU writes the image - hw_current)
     if (!copy.cpu_seen) hw_stats_.note("depth the device drew that the CPU then needed");
     copy.cpu_seen = im.version();
     return;
   }
   copy.set_ahead(false);
-  if (copy.format == AccelFormat::Depth) {
-    if (copy.cleared) {
-      const uint32_t depth = f2u(copy.cleared_value);
+  if (depth_copy) {      // (only clears since: the CPU does them - the depth, the stencil plane)
+    const uint32_t depth = f2u(copy.cleared_value);
+    const bool stencil = copy.stencil_cleared >= 0 && im.info->store == Store::DepthStencil;
+    if (copy.depth_cleared || stencil)
       for (uint32_t y = 0; y < im.h; ++y)
         for (uint32_t x = 0; x < im.w; ++x) {
           uint32_t raw[4];
           read_texel(im, x, y, 0, raw);
-          raw[0] = depth;
+          if (copy.depth_cleared) raw[0] = depth;
+          if (stencil) raw[1] = static_cast<uint32_t>(copy.stencil_cleared);
           write_texel(im, x, y, 0, raw);
         }
-      copy.synced = im.version();
-      copy.cleared = false;
-    }
+    copy.synced = im.version();
+    copy.cleared = copy.depth_cleared = false;
+    copy.stencil_cleared = -1;
     return;
   }
   ByteView dst = im.px.writable_view();
@@ -267,53 +272,72 @@ bool GlContext::hw_fbo_clear(uint32_t mask, const Target& t) {
   const char* why = nullptr;
   const bool color = (mask & 0x4000) != 0;
   const bool depth = (mask & 0x100) != 0 && t.depth && dmask_;
-  if (color && !(cmask_[0] && cmask_[1] && cmask_[2] && cmask_[3])) return false;
+  const auto no = [&](const char* reason) {
+    hw_stats_.note(reason);
+    return false;
+  };
+  if (color && !(cmask_[0] && cmask_[1] && cmask_[2] && cmask_[3])) return no("a framebuffer object clear with a colour mask (on the CPU)");
   uint32_t n = 0;
-  if (color && !hw_fbo_colors(t, &n, &why)) return false;
-  if (n > acc->limits().image_colors) return false;
+  if (color && !hw_fbo_colors(t, &n, &why)) return no(why);
+  if (n > acc->limits().image_colors) return no("a framebuffer object clear of more draw buffers than the device has");
   AccelAttachments att;
   AccelImage* copies[kMaxDrawBuffers] = {};
   float rgba[4] = {clear_color_[0], clear_color_[1], clear_color_[2], clear_color_[3]};
   for (uint32_t i = 0; i < n; ++i) {
     Image& im = *t.color[i];
     AccelFormat f;
-    if (!hw_format(im, &f, &why) || f == AccelFormat::Depth) return false;
-    if (f == AccelFormat::Rgba8Srgb) return false;      // (the CPU encodes the clear colour itself: see clear())
+    if (!hw_format(im, &f, &why) || f == AccelFormat::Depth || f == AccelFormat::DepthStencil) return no(why ? why : "a framebuffer object clear of an image format the device has not");
+    if (f == AccelFormat::Rgba8Srgb) return no("a framebuffer object clear of an sRGB image (on the CPU)");      // (the CPU encodes the clear colour itself: see clear())
     if (channels_kept(im) != 15 && rgba[3] != 1.0f) {      // (an image without alpha keeps it at 1: only a clear colour with alpha 1 is the same for all)
       bool all_without = true;
       for (uint32_t k = 0; k < n; ++k) all_without = all_without && channels_kept(*t.color[k]) != 15;
-      if (!all_without) return false;
+      if (!all_without) return no("a framebuffer object clear of images with and without alpha");
       rgba[3] = 1.0f;
     }
     copies[i] = hw_image(im, f, &why);
-    if (!copies[i]) return false;
+    if (!copies[i]) return no(why);
     att.colors[i] = copies[i]->handle;
   }
   att.color_count = n;
   AccelImage* dcopy = nullptr;
-  if (depth) {
-    if (t.depth->w != t.w || t.depth->h != t.h || t.depth->d != 1 || t.depth_layer != 0) return false;
-    dcopy = hw_image(*t.depth, AccelFormat::Depth, &why);
-    if (!dcopy) return false;
-    att.depth = dcopy->handle;
-  }
-  if (!n && !dcopy) return false;
+  // the stencil plane: cleared on the device with the depth when the device has it (every bit written), else on the CPU
   const bool stencil = (mask & 0x400) && t.stencil && t.stencil->info->store == Store::DepthStencil;
-  if (stencil && !dcopy) return false;      // (a stencil clear alone: the CPU's)
+  AccelFormat dformat = AccelFormat::Depth;
+  if (t.depth && !hw_format(*t.depth, &dformat, &why)) return no(why);
+  const bool device_stencil = stencil && t.stencil == t.depth && dformat == AccelFormat::DepthStencil && (swmask_[0] & 255) == 255;
+  if (depth || device_stencil) {
+    if (t.depth->w != t.w || t.depth->h != t.h || t.depth->d != 1 || t.depth_layer != 0) return no("framebuffer images of different sizes, or a layer of a texture");
+    dcopy = hw_image(*t.depth, dformat, &why);
+    if (!dcopy) return no(why);
+    att.depth = dcopy->handle;
+    if (device_stencil) att.stencil_clear = clear_stencil_ & 255;
+    // (a stencil clear alone leaves the depth as it is: a depth the device does not have stays out of date)
+    if (!depth && !hw_current(*t.depth, *dcopy)) return no("a stencil clear of a depth the device does not have");
+  }
+  if (!n && !dcopy) return no("a framebuffer object clear the device cannot do");
+  if (stencil && !device_stencil && dcopy) return no("a stencil clear with a write mask (on the CPU)");
   const float d = clear_depth_ < 0 ? 0 : (clear_depth_ > 1 ? 1 : clear_depth_);
-  if (!acc->clear_images(att, n > 0, rgba, dcopy != nullptr, d)) return false;
+  if (!acc->clear_images(att, n > 0, rgba, depth, d)) return no("the device failed a clear");
   for (uint32_t i = 0; i < n; ++i) {
     copies[i]->set_ahead(true);
     copies[i]->cleared = false;
   }
   if (dcopy) {
-    // (a depth image the device has the only copy of: what the CPU would have, a clear, is remembered for hw_sync_image)
+    // (a depth image the device has the only copy of: what the CPU would have, its clears, is remembered for hw_sync_image - after a device draw it is not
+    // whole any more)
+    const bool was_clears_only = !dcopy->ahead || dcopy->cleared;
     dcopy->set_ahead(true);
-    dcopy->cleared = true;
-    dcopy->cleared_value = d;
     dcopy->cpu_seen = 0;
+    if (depth) {
+      dcopy->depth_cleared = true;
+      dcopy->cleared_value = d;
+    }
+    if (device_stencil) dcopy->stencil_cleared = clear_stencil_ & 255;
+    // (clears only: a clear of all of it, or one on top of clears only - the part it leaves is still what the CPU has or what an earlier clear left)
+    const bool whole = depth && (dformat == AccelFormat::Depth || device_stencil);
+    dcopy->cleared = whole || was_clears_only;
   }
-  if (stencil) {      // (the stencil is the CPU's: cleared there, but its image's version must not make the device depth look out of date)
+  if (stencil && !device_stencil) {      // (a device without the stencil plane: the stencil is the CPU's, but its image's version must not make the device depth look out of date)
     Image& s = *t.stencil;
     const uint32_t wm = swmask_[0] & 255;
     for (uint32_t y = 0; y < s.h; ++y)
@@ -580,7 +604,7 @@ bool GlContext::hw_texture(const TgsiSampler& ts, uint32_t unit, uint32_t* handl
   // A depth texture: its copy the device drew into, if it can sample that; else the CPU's depth as floats in R.
   sampler->linear = false;
   sampler->mip = 0;
-  if (im.hw && im.hw->format == AccelFormat::Depth && im.hw->owner == acc && acc->limits().sampled_depth && (im.hw->ahead || im.hw->synced == im.version())) {
+  if (im.hw && (im.hw->format == AccelFormat::Depth || im.hw->format == AccelFormat::DepthStencil) && im.hw->owner == acc && acc->limits().sampled_depth && (im.hw->ahead || im.hw->synced == im.version())) {
     *handle = im.hw->handle;
     return true;
   }
@@ -896,7 +920,7 @@ bool GlContext::hw_draw_inner(ProgramObj& p, const Target& target, uint32_t mode
     if (desktop.depth_clamp) return no("depth clamp");
     if ((desktop.per_buffer_masks || desktop.per_buffer_blend) && !(limits.independent_blend && limits.blend_state)) return no("per-buffer blending or masks");
   }
-  if (stencil_test_) return no("the stencil test");
+  if (stencil_test_ && (!fbo || !limits.stencil)) return no("the stencil test");
   const uint8_t bias_modes = static_cast<uint8_t>((offset_fill_ ? 1 : 0) | (desktop.active && desktop.offset_line ? 2 : 0) | (desktop.active && desktop.offset_point ? 4 : 0));
   if (bias_modes && !limits.depth_bias) return no("polygon offset");
   if (alpha_to_coverage_ || sample_coverage_en_) return no("sample coverage");
@@ -948,7 +972,7 @@ bool GlContext::hw_draw_inner(ProgramObj& p, const Target& target, uint32_t mode
       Image& im = *target.color[i];
       AccelFormat f;
       if (!hw_format(im, &f, why)) return false;
-      if (f == AccelFormat::Depth) return no("an image format the device does not have");
+      if (f == AccelFormat::Depth || f == AccelFormat::DepthStencil) return no("an image format the device does not have");
       if (channels_kept(im) != 15) return no("a colour image without alpha");      // (its alpha must stay 1: a mask per image the state here does not have yet)
       copies[i] = hw_image(im, f, why);
       if (!copies[i]) return false;
@@ -956,13 +980,16 @@ bool GlContext::hw_draw_inner(ProgramObj& p, const Target& target, uint32_t mode
       att.colors[i] = copies[i]->handle;
     }
     att.color_count = n;
-    if (depth && (depth_test || dmask_)) {
+    if (depth && (depth_test || dmask_ || stencil_test_)) {
       Image& dim = *target.depth;
       if (dim.w != target.w || dim.h != target.h || dim.d != 1 || target.depth_layer != 0) return no("framebuffer images of different sizes, or a layer of a texture");
-      dcopy = hw_image(dim, AccelFormat::Depth, why);
+      AccelFormat dformat;
+      if (!hw_format(dim, &dformat, why)) return false;
+      if (stencil_test_ && (dformat != AccelFormat::DepthStencil || target.stencil != target.depth)) return no("the stencil test");
+      dcopy = hw_image(dim, dformat, why);
       if (!dcopy) return false;
       if (!hw_current(dim, *dcopy)) {
-        if (depth_test) return no("the device depth is out of date");
+        if (depth_test || stencil_test_) return no("the device depth is out of date");
         dcopy = nullptr;      // (no test: drawn without the depth, which stays out of date on the device until it is cleared there)
       } else {
         att.depth = dcopy->handle;
@@ -1215,6 +1242,29 @@ bool GlContext::hw_draw_inner(ProgramObj& p, const Target& target, uint32_t mode
   st.depth_test = depth_test;
   st.depth_write = dmask_ && depth;
   if (fbo && !dcopy) st.depth_test = st.depth_write = false;
+  // the stencil test (a framebuffer object's depth-stencil image on the device: one state for both faces)
+  bool stencil_writes = false;
+  if (stencil_test_) {
+    static constexpr uint32_t kOps[8] = {0x1E00, 0, 0x1E01, 0x1E02, 0x1E03, 0x150A, 0x8507, 0x8508};      // (KEEP ZERO REPLACE INCR DECR INVERT INCR_WRAP DECR_WRAP)
+    const auto op = [](uint32_t gl, uint8_t* out) {
+      for (uint8_t k = 0; k < 8; ++k)
+        if (kOps[k] == gl) {
+          *out = k;
+          return true;
+        }
+      return false;
+    };
+    if (sfunc_[0] != sfunc_[1] || sref_[0] != sref_[1] || (smask_[0] & 255) != (smask_[1] & 255) || sfail_[0] != sfail_[1] || sdpfail_[0] != sdpfail_[1] ||
+        sdppass_[0] != sdppass_[1] || (swmask_[0] & 255) != (swmask_[1] & 255))
+      return no("a stencil test of two faces");
+    st.stencil_test = true;
+    st.stencil_compare = static_cast<uint8_t>(sfunc_[0] >= 0x0200 && sfunc_[0] <= 0x0207 ? sfunc_[0] - 0x0200 : 7);
+    if (!op(sfail_[0], &st.stencil_fail) || !op(sdpfail_[0], &st.stencil_depth_fail) || !op(sdppass_[0], &st.stencil_pass)) return no("a stencil operation");
+    st.stencil_reference = static_cast<uint8_t>(sref_[0] < 0 ? 0 : (sref_[0] > 255 ? 255 : sref_[0]));
+    st.stencil_read_mask = static_cast<uint8_t>(smask_[0] & 255);
+    st.stencil_write_mask = static_cast<uint8_t>(swmask_[0] & 255);
+    stencil_writes = st.stencil_write_mask && (st.stencil_fail || st.stencil_depth_fail || st.stencil_pass);
+  }
   st.blend = blend_;
   st.topology = topology;
   st.instances = static_cast<uint32_t>(instances);
@@ -1274,7 +1324,7 @@ bool GlContext::hw_draw_inner(ProgramObj& p, const Target& target, uint32_t mode
     }
     if (!acc->draw_images(att, p.accel_program, st, vertices.view(), static_cast<uint32_t>(tris.count()), constants.view())) return no("the device failed the draw");
     for (uint32_t i = 0; i < att.color_count; ++i) copies[i]->set_ahead(true);
-    if (dcopy && st.depth_write) {
+    if (dcopy && (st.depth_write || stencil_writes)) {
       dcopy->set_ahead(true);
       dcopy->cleared = false;
     }
