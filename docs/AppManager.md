@@ -206,13 +206,17 @@ Windows side:
     Benchmark 4.0` (see What is not done for why not `Program Files (x86)`). Its Start menu entry is a shortcut to `heaven.bat`, listed as "Heaven
     Benchmark 4.0 (Windows)" and started as `cmd.exe /c "C:\...\heaven.bat"` (docs/WindowsUserMode.md, *The command interpreter*): the batch file
     changes to `bin` and starts `browser_x86.exe` (32-bit), and cmd ends with 0. The launcher's window, "Unigine Heaven Benchmark 4.0 (Basic
-    Edition)", opens with its banner and shows its licence agreement with "Agree" and "Disagree" (in the kernel's built-in 8 x 16 font: there is no
-    TrueType font provider yet, so non-ASCII characters such as typographic quotes show as `?`). Nobody has clicked through it, so the settings page
-    and the benchmark itself have not been reached; the Direct3D helpers it ships (`d3dx9_42`, `d3dx11_42`, `d3dcompiler_42`, `XAudio2_7`) import
-    msvcrt functions this system does not have yet (the i386 `_CI*` math functions, `exception`, `__pioinfo`). Two faults were fixed on the way: the
-    text was missing because `GetGlyphOutline` had no kernel service (docs/win32k/Gdi.md), and the first run stopped at once: the launcher imports `MSVCR100.dll`, which was folded into the system's
-    msvcrt.dll (missing `_malloc_crt` and `__CppXcptFilter`). Now the `msvcr100.dll` and `msvcp100.dll` that Heaven ships in `bin` are loaded
-    instead (docs/WindowsUserMode.md, *The C runtimes*).
+    Edition)", opens with its licence agreement; after "Agree" its settings page (API, quality, resolution, RUN). RUN starts `heaven.exe`, whose
+    engine (`Unigine_x86.dll`) loads its configuration, writes `C:\Users\Default\Heaven\log.html`, sets up OpenAL sound and a Direct3D 11 device, and
+    then stops at its first cube texture: this system's d3d11.dll has no cube textures (nor 3D textures, geometry/hull/domain/compute shaders,
+    queries; docs/Direct3D11.md). With `-video_app opengl` the engine finds every GL extension it requires and stops because only 14 texture units
+    are offered (it wants 16: the graphics device has 16 and the GL layer keeps two for itself). The benchmark itself has not run yet. Faults
+    fixed on the way: the launcher's text (no `GetGlyphOutline`, docs/win32k/Gdi.md), `msvcr100.dll` folded into msvcrt.dll (docs/WindowsUserMode.md,
+    *The C runtimes*), missing old-runtime exports and wrong `exp`/`pow` in msvcrt, `IsProcessorFeaturePresent` saying only SSE/SSE2, and
+    `SetEnvironmentVariable("=C:")` refused (the C runtime's `_chdir` failed, and the engine quit with code 1). Open: when the launcher was started
+    by `cmd /c heaven.bat` and that cmd has ended, its RUN never reaches process creation (CreateProcessW does not return); started with
+    `cmd /c start /wait`, RUN works. Settings are driven in QEMU through QMP `input-send-event` (absolute coordinates); the launcher remembers
+    "Agree" in its local storage.
 
   - `KeePassXCTeam.KeePassXC` (a Windows Installer package, 69 MB, an LZX cabinet): installed by this system's own engine, "KeePassXC (Windows)"
     in the Start menu, removed again with the kept package. Its first run found that the kernel's registry makes only the last key of a path;
