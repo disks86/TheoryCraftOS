@@ -48,14 +48,18 @@ void GlContext::hw_forget_texture(uint32_t name) {
 // The texture bound to `unit` as the device can read sampler `ts`: a 2D (or 1D, rectangle) texture with no mipmapping in use and a filter and wrap mode the device has, of
 // 8-bit RGBA texels - or, for a shadow sampler, of depth, sent as a float texture with the depth in R and read with nearest filtering (the shader filters and
 // compares, by `params`: the sampler's four CONST rows, see TgsiSampler). Its texels are on the device when this returns true. False: the CPU samples it.
-bool GlContext::hw_texture(const TgsiSampler& ts, uint32_t unit, uint32_t* handle, AccelSampler* sampler, float params[16]) {
-  constexpr uint32_t kMaxSide = 1024;
-  if (unit >= kMaxTextureUnits) return false;
+bool GlContext::hw_texture(const TgsiSampler& ts, uint32_t unit, uint32_t* handle, AccelSampler* sampler, float params[16], const char** why) {
+  const auto no = [why](const char* reason) { *why = reason; return false; };
+  // (a larger texture than the device can make is refused by create_texture, and the draw is then the CPU's; the cost of a large one is its upload and a hash of
+  // its texels at each use, far less than drawing with it on the CPU: Unigine Heaven's 2048-wide loading picture took 4 s a frame there)
+  constexpr uint32_t kMaxSide = 8192;
+  if (unit >= kMaxTextureUnits) return no("a texture unit past the last");
   const TextureUnit& u = units_[unit];
   const uint32_t name = ts.dim == shader::kDim1D ? u.tex1d : (ts.dim == shader::kDimRect ? u.rect : u.tex2d);
   const uint32_t target = ts.dim == shader::kDim1D ? 0x0DE0 : (ts.dim == shader::kDimRect ? 0x84F5 : 0x0DE1);
   const Texture* t = texture_at(name);
-  if (!t || t->target != target || t->base_level != 0) return false;
+  if (!t || t->target != target) return no("a texture of a kind the device cannot sample");
+  if (t->base_level != 0) return no("a texture with a base level");
   SamplerObj so;
   if (u.sampler && u.sampler <= objects_->samplers.count() && objects_->samplers[u.sampler - 1]) so = *objects_->samplers[u.sampler - 1];
   else {
@@ -67,21 +71,22 @@ bool GlContext::hw_texture(const TgsiSampler& ts, uint32_t unit, uint32_t* handl
     so.compare_func = t->compare_func;
   }
   const bool nearest = so.min_filter == 0x2600 && so.mag_filter == 0x2600, linear = so.min_filter == 0x2601 && so.mag_filter == 0x2601;
-  if (!nearest && !linear) return false;   // (a mipmapped minification filter, or different filters for the two)
+  if (!nearest && !linear) return no("a mipmapped texture filter");   // (a mipmapped minification filter, or different filters for the two)
   auto wrap = [](uint32_t mode, bool* repeat) {
     *repeat = mode == 0x2901;
     return mode == 0x2901 || mode == 0x812F;
   };
-  if (!wrap(so.wrap_s, &sampler->repeat_s) || !wrap(so.wrap_t, &sampler->repeat_t)) return false;
-  if (!ts.shadow && so.compare_mode != 0) return false;      // (a comparison through a sampler that is not a shadow one: the CPU's)
+  if (!wrap(so.wrap_s, &sampler->repeat_s) || !wrap(so.wrap_t, &sampler->repeat_t)) return no("a texture wrap mode");
+  if (!ts.shadow && so.compare_mode != 0) return no("a texture comparison");      // (a comparison through a sampler that is not a shadow one: the CPU's)
   if (ts.dim == shader::kDim1D) sampler->repeat_t = true;
   sampler->linear = linear && !ts.shadow;
   bool cube;
-  if (!texture_complete(*t, so, &cube) || t->images.count() == 0 || !t->images[0] || !t->images[0]->defined()) return false;
+  if (!texture_complete(*t, so, &cube) || t->images.count() == 0 || !t->images[0] || !t->images[0]->defined()) return no("an incomplete texture");
   const Image& im = *t->images[0];
-  if (im.w > kMaxSide || im.h > kMaxSide || im.d != 1 || im.ss != 1) return false;
+  if (im.w > kMaxSide || im.h > kMaxSide) return no("a texture larger than the device takes");
+  if (im.d != 1 || im.ss != 1) return no("a layered or multisampled texture");
   IAccelerator* acc = hw_owner_;
-  if (!acc) return false;
+  if (!acc) return no("no accelerator");
   if (ts.params >= 0) {
     for (uint32_t i = 0; i < 16; ++i) params[i] = 0;
     // row 0: the weights of reference < depth, ==, > (GL_TEXTURE_COMPARE_FUNC less the value of GL_NEVER is those three bits: LESS 1, EQUAL 2, LEQUAL 3 ... ALWAYS 7),
@@ -102,21 +107,21 @@ bool GlContext::hw_texture(const TgsiSampler& ts, uint32_t unit, uint32_t* handl
     for (uint32_t i = 0; i < 8; ++i) params[8 + i] = m[mode][i];
   }
   if (!ts.shadow) {
-    if (im.info->store != Store::U8x4 || im.info->srgb || im.info->is_signed) return false;
+    if (im.info->store != Store::U8x4 || im.info->srgb || im.info->is_signed) return no("a texture format the device cannot sample");
     *handle = hw_textures_.get(*acc, name, im.w, im.h, im.px.view());
-    return *handle != 0;
+    return *handle != 0 || no("the device refused the texture");
   }
   // a shadow sampler: the depth texels as floats
-  if ((im.info->store != Store::Depth && im.info->store != Store::DepthStencil) || !acc->limits().float_textures) return false;
+  if ((im.info->store != Store::Depth && im.info->store != Store::DepthStencil) || !acc->limits().float_textures) return no("a shadow texture the device cannot sample");
   ByteBuffer floats(a_);
   for (uint32_t y = 0; y < im.h; ++y)
     for (uint32_t x = 0; x < im.w; ++x) {
       uint32_t raw[4];
       read_texel(im, x, y, 0, raw);
-      if (!floats.put32(raw[0]) || !floats.put32(0) || !floats.put32(0) || !floats.put32(f2u(1.0f))) return false;
+      if (!floats.put32(raw[0]) || !floats.put32(0) || !floats.put32(0) || !floats.put32(f2u(1.0f))) return no("out of memory");
     }
   *handle = hw_textures_.get(*acc, name, im.w, im.h, floats.view(), true);
-  return *handle != 0;
+  return *handle != 0 || no("the device refused the texture");
 }
 
 void GlContext::hw_drop() {
@@ -639,8 +644,9 @@ bool GlContext::hw_draw_inner(ProgramObj& p, const Target& target, uint32_t mode
   if (st.texture_count > kAccelMaxTextures) return no("too many textures");
   for (uint32_t k = 0; k < st.texture_count; ++k) {
     float params[16];
-    if (t.samplers[k].slot >= p.fs_shared.count() || !hw_texture(t.samplers[k], p.fs_shared[t.samplers[k].slot], &st.textures[k], &st.samplers[k], params))
-      return no("a texture the device cannot sample");
+    const char* texture_why = "a texture the device cannot sample";
+    if (t.samplers[k].slot >= p.fs_shared.count() || !hw_texture(t.samplers[k], p.fs_shared[t.samplers[k].slot], &st.textures[k], &st.samplers[k], params, &texture_why))
+      return no(texture_why);
     if (t.samplers[k].params < 0) continue;
     const uint64_t at = uint64_t{static_cast<uint32_t>(t.samplers[k].params)} * 16;      // (its rows: after the uniforms were packed)
     if (at + sizeof params > constants.size()) return no("a texture the device cannot sample");
