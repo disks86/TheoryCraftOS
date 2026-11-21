@@ -209,11 +209,13 @@ Windows side:
     Edition)", opens with its licence agreement; after "Agree" its settings page (API, quality, resolution, RUN). RUN starts `heaven.exe`, whose
     engine (`Unigine_x86.dll`) loads its configuration, writes `C:\Users\Default\Heaven\log.html`, sets up OpenAL sound and a Direct3D 11 device, and
     then stops at its first cube texture: this system's d3d11.dll has no cube textures (nor 3D textures, geometry/hull/domain/compute shaders,
-    queries; docs/Direct3D11.md). With `-video_app opengl` the engine finds every GL extension it requires and stops because only 14 texture units
-    are offered (it wants 16: the graphics device has 16 and the GL layer keeps two for itself). The benchmark itself has not run yet. Faults
+    queries; docs/Direct3D11.md), and DirectX 9 stops because d3d9.dll has no cube maps. On OpenGL (`-video_app opengl`, the launcher's API
+    "OpenGL") the engine opens its window, "Unigine Heaven Benchmark 4.0 Basic (OpenGL)", and draws its loading screen with the software GL;
+    the scene itself has not been seen yet (the run ended while it was still loading). Faults
     fixed on the way: the launcher's text (no `GetGlyphOutline`, docs/win32k/Gdi.md), `msvcr100.dll` folded into msvcrt.dll (docs/WindowsUserMode.md,
     *The C runtimes*), missing old-runtime exports and wrong `exp`/`pow` in msvcrt, `IsProcessorFeaturePresent` saying only SSE/SSE2, and
-    `SetEnvironmentVariable("=C:")` refused (the C runtime's `_chdir` failed, and the engine quit with code 1). Open: when the launcher was started
+    `SetEnvironmentVariable("=C:")` refused (the C runtime's `_chdir` failed, and the engine quit with code 1), 14 GL texture units and the
+    missing GL 3.0-3.2 commands (docs/OpenGL.md). Open: when the launcher was started
     by `cmd /c heaven.bat` and that cmd has ended, its RUN never reaches process creation (CreateProcessW does not return); started with
     `cmd /c start /wait`, RUN works. Settings are driven in QEMU through QMP `input-send-event` (absolute coordinates); the launcher remembers
     "Agree" in its local storage.
