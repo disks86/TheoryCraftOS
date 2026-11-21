@@ -974,6 +974,8 @@ class GlContext final : public shader::ITextureHost {
   bool hw_upload(IAccelerator* acc);
   uint32_t hw_w_ = 0, hw_h_ = 0;    // the size of hw_target_
   HardwareStats hw_stats_;
+  static constexpr uint32_t kMaxLoggedPrograms = 4;
+  uint32_t hw_logged_ = 0;   // (programs whose refusal went to accelerator_log())
   AccelTextureCache hw_textures_;   // the device copies of the textures the accelerated draws sampled, by GL name
   // (`why`: on false, what about the texture the device cannot take, for the draw statistics)
   bool hw_texture(const TgsiSampler& sampler_info, uint32_t unit, uint32_t* handle, AccelSampler* sampler, float params[16], const char** why);

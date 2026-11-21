@@ -76,7 +76,7 @@ webgl::AccelLimits WebGlAccelerator::limits() const {
   if (l.image_colors > kMaxColorTargets) l.image_colors = kMaxColorTargets;
   l.float_images = l.float_textures;
   l.srgb_images = (info.features & kFeatureSrgbFormats) != 0;
-  l.sampled_depth = (info.features & kFeatureSampledDepth) != 0;
+  l.sampled_depth = info.limits.sampled_depth;
   l.mip_images = true;      // (a device without mipmaps refuses such an image, and the texture is then the CPU's)
   l.instancing = (info.features & kFeatureInstancing) && info.limits.vertex_buffers >= 2;
   l.independent_blend = (info.features & kFeatureIndependentBlend) && l.blend_state;
@@ -219,7 +219,7 @@ uint32_t WebGlAccelerator::make_texture(uint32_t w, uint32_t h, webgl::AccelForm
   if (format == webgl::AccelFormat::Depth) {
     if (!renderable) return 0;
     // (sampled as well when the device can: a depth texture a later draw reads)
-    d.usage = kImageDepthAttachment | ((device_.info().features & kFeatureSampledDepth) ? kImageSampled : 0u);
+    d.usage = kImageDepthAttachment | (device_.info().limits.sampled_depth ? kImageSampled : 0u);
   } else {
     d.usage = kImageSampled | (renderable ? kImageColorAttachment : 0u);
   }

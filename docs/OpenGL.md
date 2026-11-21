@@ -197,13 +197,15 @@ draw is offered to the device and runs on the CPU rasterizer when the device can
   `.length()` is the array's size. A fragment shader without a colour output draws with every channel masked (the CPU writes none). A varying that no
   stage before writes reads zero, as the CPU's vertices start (and an output that is declared but never written is written as zero, the flat link the
   CPU makes of it).
-- `src/WebGl/AccelConformance.cpp` has 65 scenes that draw a picture with the accelerator and without, 22 of them desktop GL with geometry and tessellation
+- `src/WebGl/AccelConformance.cpp` has 72 scenes that draw a picture with the accelerator and without, 22 of them desktop GL with geometry and tessellation
   stages (two invocations and `gl_PrimitiveIDIn`, adjacency, points made quads, triangles and quads at equal and odd spacing, patch varyings, an evaluation stage
   alone, tessellation and geometry together, outputs read across `barrier()`, clip distances and planes, no attributes, legacy shadow lookups, a rectangle texture,
   arrays per vertex and per control point, packed control-point arrays, `gl_ClipVertex` through `gl_in[]`, structures per vertex and per control point), plus a
   uniform block, shadow samplers, structures, derivatives, `gl_FragDepth`, `gl_VertexID`, bitwise operators, whole uniform arrays, structure varyings, packed
   varyings, samplers as parameters and members, TGSI arrays, a vertex-stage lookup with `textureSize`, `continue` in a switch and an unwritten varying in GLSL
-  ES. The kernel runs them at boot on the machine's GPU ("OpenGL: ...: as the CPU renderer"; all 65 match on virgl), and
+  ES, a framebuffer object drawn and then sampled, two draw buffers of which one floats, a depth texture drawn and then sampled, instances with
+  `gl_InstanceID`, and polygon offset (a scene may have a second draw: `Scene::finish`). The kernel runs them at boot on the machine's GPU ("OpenGL: ...: as
+  the CPU renderer"; the first 70 match on virgl), and
   `tests/GlAccelTest.cpp` runs them on a TGSI interpreter (`tests/TgsiMachine.hpp`, shared with DxgkrnlTest, with per-vertex registers and EMIT; the test's
   device runs the tessellator of `Software/Tessellator.hpp`). `PiglitShaderTest --accel-survey` counts which piglit draws the hardware would take and why the others not (`SURVEY_REASON=text` lists
   the tests): 1044 of 1223 tests draw only on the device (222 before the translator work, 709 before the geometry and tessellation stages, 755 before
@@ -226,16 +228,36 @@ draw is offered to the device and runs on the CPU rasterizer when the device can
   rows, `kTgsiClipPlanes`) against its `gl_ClipVertex`, or in the compatibility profile its `gl_Position`. A program is translated again
   with them the first time it is drawn with clip planes on.
 - State the device has goes with the draw: blend factors and equations, the colour mask and the depth function (`AccelState::custom_blend`), culling, scissor and
-  viewport, lines and points one pixel wide. What it has not (the stencil test, polygon offset, polygon modes and stipples, flat shading, alpha test, logic ops,
-  wide lines, point sizes, two-sided colour, gl_PrimitiveID in a fragment shader, vertex streams, queries, transform feedback, framebuffer objects,
-  instancing, mipmapped or non-RGBA8 textures, constant blend colours ...) keeps the draw on the CPU.
+  viewport, lines and points one pixel wide, each draw buffer's own blending and mask (`glBlendFunci`, `glColorMaski`, `glEnablei`: `AccelState::per_target`, the
+  device's independent blend), `glPolygonOffset` (`AccelState::depth_bias_*`, virgl's rasterizer offset), instanced draws (`gl_InstanceID` is the INSTANCEID
+  system value; attributes with a divisor go after the vertices, one value per instance: `AccelState::instanced`). What it has not (the stencil test, polygon
+  modes and stipples, flat shading, alpha test, logic ops, wide lines, point sizes, two-sided colour, gl_PrimitiveID in a fragment shader, vertex streams,
+  queries, transform feedback, integer or signed textures, constant blend colours ...) keeps the draw on the CPU.
+- Framebuffer objects draw on the device too (`GlAccel.cpp`). Every texture and renderbuffer image can have a copy on the device (`Image::hw`, an
+  `AccelImage`: `IAccelerator::create_image` of RGBA8, sRGB RGBA8, RGBA32F or depth), which draws render into (`draw_images`, up to 8 colour images, fragment
+  output n to draw buffer n: the translator puts out `COLOR[n]` by the program's output locations, `TgsiStages::outputs`) and later draws sample - a texture a
+  framebuffer object drew is read straight from the device. A copy is either the image's pixels at `Image::version()` (every write of the pixels changes the
+  version; a copy that is behind is written up before a draw uses it) or *ahead*: the device drew into it since, and whatever on the CPU reads or writes the
+  pixels brings them back first (`hw_sync_image`; `resolve_target` for reads, blits and CPU draws into the framebuffer, `bound_texture_for` /
+  `texture_for_target` for glTexSubImage, glGenerateMipmap, glGetTexImage and the like, every draw the device refuses for all the share group's images:
+  `hw_sync_images`). A whole clear of a framebuffer object is the device's (`hw_fbo_clear`; its stencil plane, which the device never uses, is cleared on the
+  CPU). Depth cannot be read back from the device: after a device clear only, the CPU repeats the clear; after device draws, the CPU goes on with its older depth
+  and the device keeps its own until the CPU writes the image ("depth the device drew that the CPU then needed" in the statistics). virgl samples depth images
+  (`DeviceLimits::sampled_depth`: a depth texture a draw rendered is the shadow or depth map the next draw reads). Not taken: multisampled, layered and 3D / array
+  framebuffer images, images of different sizes, gaps between draw buffers, `gl_FragColor` into several draw buffers, 8-bit images without alpha (their alpha
+  must stay 1), integer and signed formats.
+- Mipmapped textures are one device image with all their levels (`Texture::hw_mips`, `hw_mip_texture`; 8-bit RGBA), each level written up when its version
+  changes; the filter within and between levels, LOD range and bias go with the sampler. Mirrored repeat is the device's too. A device without images
+  (`AccelLimits::image_colors` 0) keeps the old per-context texture cache, which compares the texels at each use.
 - The picture stays on the device between draws. A clear of the whole window is done there only, and the CPU's depth and stencil clears wait until the CPU needs
   them (`hw_fast_clear`, `hw_apply_pending_clears`). After the CPU drew (a draw the device could not take, or the first frame without a clear), the next draw
   the device can take writes the CPU's picture up to it first (`IAccelerator::write_color`, `AccelLimits::color_upload`, `hw_upload`) and goes on there; the depth
   stays behind, so draws with the depth test are the CPU's until a clear of the depth on the device (`hw_depth_stale_`, "the device depth is out of date"). The picture comes back to the window's image when something reads it: a swap or a front-buffer read
   (`GlService::sync_hardware`), `glReadPixels`, a draw the device cannot take. A swap keeps the device target for the next frame, which starts again at its clear.
-- `GL_RENDERER` names the device. Each context counts its draws on the GPU and on the CPU, with why each refused one was refused (`GlContext::HardwareStats`); when
-  a context goes, the kernel logs it ("OpenGL: process N: 1 draws on the GPU, 9 on the CPU; 5 because of ...").
+- `GL_RENDERER` names the device. Each context counts its draws on the GPU and on the CPU, with why each refused one was refused (`GlContext::HardwareStats`;
+  a refused built-in or assignment says which: "a built-in variable: gl_PointCoord", "assignment of a vec3 to 4 channels"); the kernel logs it every 30 frames
+  (`GlService::kReportFrames`) and when a context goes ("OpenGL: process N: 1 draws on the GPU, 9 on the CPU, 2 framebuffer object clears on the GPU" and a
+  line per reason).
 
 Measured on virgl (QEMU, egl-headless): the 3D Test's GL cube went from 4.7 ms a frame on the CPU to 2.8 ms, of which 0.2 ms submitting and 2.6 ms bringing the
 picture back. `tests/windows/opengltest.c` passes on virgl as on the CPU (`WINETEST_GPU=virgl scripts/winetest.sh opengl32 own`).
@@ -287,8 +309,9 @@ The desktop's 3D Test can draw its cube through the kernel GL path (the command 
   tested per fragment, as interpolated varyings, like the fixed-function clip planes; a primitive is not cut geometrically.
 - The 3D hardware takes only part of GL (see "The 3D hardware"): the translator has no vertex streams, structure varyings between the extra stages, samplers in
   structures, `~` of unsigned integers, shifts past 23 bits, fragment `gl_PrimitiveID`, point sizes, texture kinds other than 1D / 2D / rectangle,
-  vertex-shader textures, recursion, `continue` inside a `switch` or 4 x 4 `inverse`; no framebuffer objects, stencil, mipmaps or instancing on the device; the picture is read back at each swap (no zero-copy present into the
-  window). Only virgl takes TGSI today (the AMD GCN compiler takes a subset).
+  vertex-shader textures, recursion, `continue` inside a `switch` or 4 x 4 `inverse`; no stencil on the device, no cube, 3D or array textures there, no
+  multisampled framebuffer objects; vertices are still assembled on the CPU for every draw (no device-resident vertex and index buffers); the picture is read
+  back at each swap (no zero-copy present into the window). Only virgl takes TGSI today (the AMD GCN compiler takes a subset).
 - No `KHR_debug` callbacks (a kernel cannot call into the program), no multisampling, `wglUseFontOutlines`, overlay planes, `wglCopyContext`, GL 4.x beyond the few 4.3/4.5
   queries programs call unconditionally, compressed images are not kept as blocks (`glGetCompressedTexImage` fails).
 - Wine's test still fails on rendering into DIBs (bitmap formats' read-back of GDI contents), some pixel-format choice details, and object-name expectations after sharing.

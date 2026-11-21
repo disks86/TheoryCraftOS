@@ -226,7 +226,7 @@ class VirglImage final : public IImage {
     // A sampled image is stored top row first, the way write_pixels() gives it and the sampler reads it, so it does not take the Y_0_TOP flip of the images that are only
     // drawn into (and shown).
     const bool sampled = (desc.usage & kImageSampled) != 0;
-    // (a sampled depth image - kFeatureSampledDepth - is a sampler view too)
+    // (a sampled depth image - DeviceLimits::sampled_depth - is a sampler view too)
     uint32_t bind = depth ? (virgl::kBindDepthStencil | (sampled ? virgl::kBindSamplerView : 0u)) : (virgl::kBindRenderTarget | virgl::kBindSamplerView);
     if (desc.usage & kImagePresent) bind |= virgl::kBindScanout;
     // A volume has its slices as the depth; an array or a cube its layers as the array size (a cube: six).
@@ -853,7 +853,7 @@ IImage* VirglDevice::create_image(const ImageDesc& desc) {
     return nullptr;
   }
   // A sampled image is stored upright, an image only drawn into (and shown) the other way up (see VirglImage): a shown image is not sampled. A depth image that is
-  // sampled (kFeatureSampledDepth) is upright like the colour images it is drawn with, which are sampled too (a framebuffer object's).
+  // sampled (DeviceLimits::sampled_depth) is upright like the colour images it is drawn with, which are sampled too (a framebuffer object's).
   if ((desc.usage & kImageSampled) && (desc.usage & kImagePresent)) return nullptr;
   if ((desc.usage & kImageSampled) && (desc.usage & kImageDepthAttachment) && (desc.format != Format::D32Float || desc.stencil || desc.mip_levels != 1 || desc.kind != TextureKind::Texture2D)) return nullptr;
   if ((desc.usage & kImageSampled) && desc.format != Format::B8G8R8A8Unorm && desc.format != Format::B8G8R8A8Srgb && desc.format != Format::R8G8B8A8Unorm && desc.format != Format::R8G8B8A8Srgb && !is_wide_format(desc.format) && desc.format != Format::D32Float) return nullptr;

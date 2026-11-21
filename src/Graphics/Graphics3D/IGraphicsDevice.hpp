@@ -66,6 +66,7 @@ struct DeviceLimits {
   uint32_t vertex_buffers = kBaseVertexBuffers;         // bind_vertex_buffer_slot slots
   uint32_t control_varyings = 0;                        // tessellation: the vectors of each control point from the hull to the domain stage (0: `varyings`)
   bool depth_bias = false;                              // GraphicsPipelineDesc::depth_bias_*
+  bool sampled_depth = false;                           // a D32Float image with kImageDepthAttachment | kImageSampled: drawn into, then bound as a texture whose red channel is the depth
 };
 
 // --- Resources ---------------------------------------------------------------
@@ -729,7 +730,6 @@ enum DeviceFeature : uint32_t {
   kFeatureClipDistances = 1u << 28,    // GraphicsPipelineDesc::clip_distances (TGSI shaders' CLIPDIST outputs)
   kFeatureVertexFormats = 1u << 29,    // VertexFormat values other than Float1 .. Float4
   kFeatureAddressModes = 1u << 31,     // AddressMode::MirrorRepeat, ClampToBorder and MirrorOnce, SamplerDesc::border
-  kFeatureSampledDepth = 1u << 30,     // a D32Float image with kImageDepthAttachment | kImageSampled: drawn into, then bound as a texture whose red channel is the depth
 };
 
 

@@ -317,9 +317,14 @@ class Gen {
 #ifdef TGSI_FAIL_TRACE      // (host probes only: which global or line a refusal came from)
     if (!sh_.why) TGSI_FAIL_TRACE(why, stage_);
 #endif
-    if (!sh_.why) sh_.why = why;
+    if (!sh_.why) {
+      sh_.why = why;
+      sh_.out->fail_line = line_;
+      sh_.out->fail_stage = stage_;
+    }
     return false;
   }
+  uint32_t line_ = 0;   // the source line of the statement or expression being translated (TgsiProgram::fail_line)
 
   // --- text
   void put_oper(const Oper& o) {
@@ -2330,6 +2335,7 @@ bool Gen::atan2_of(const Val& y_in, const Val& x_in, Val* out) {
 bool Gen::eval(int32_t id, Val* out) {
   if (id < 0) return fail("missing expression");
   const Node& n = m_.nodes[static_cast<uint64_t>(id)];
+  if (n.line) line_ = n.line;
   switch (n.kind) {
     case NodeKind::Const: return const_val(n, out);
     case NodeKind::Local: {
@@ -3820,6 +3826,7 @@ bool Gen::call(const Node& n, Val* out) {
 bool Gen::stmt(int32_t id, bool tail) {
   if (id < 0) return true;
   const Node& n = m_.nodes[static_cast<uint64_t>(id)];
+  if (n.line) line_ = n.line;
   FnCtx& f = fns_[nfns_ - 1];
   switch (n.kind) {
     case NodeKind::Empty: return true;

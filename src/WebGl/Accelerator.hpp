@@ -31,6 +31,7 @@
 #include "Allocators/IAllocator.hpp"
 #include "ObjectContainer/List.hpp"
 #include "Utility/ArrayView.hpp"
+#include "Utility/StringView.hpp"
 
 namespace webgl {
 
@@ -253,5 +254,11 @@ class AccelTextureCache {
 // The accelerator all canvas contexts use (nullptr: software only). It must outlive every context.
 void set_accelerator(IAccelerator* accelerator);
 IAccelerator* accelerator();
+
+// Where a context says why the device refused a program's shaders (the first few of each context): the reason, the stage (0 vertex, 1 fragment, 2 geometry, 3
+// control, 4 evaluation), the source line and its text. nullptr: not said.
+using AcceleratorLog = void (*)(const char* why, uint32_t stage, uint32_t line, StringView text);
+void set_accelerator_log(AcceleratorLog log);
+AcceleratorLog accelerator_log();
 
 }  // namespace webgl

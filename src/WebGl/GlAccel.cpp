@@ -685,7 +685,30 @@ bool GlContext::hw_program(ProgramObj& p, IAccelerator& acc) {
     p.accel_why = "geometry or tessellation shaders on a device without them";
     return false;
   }
-  if (!translate_program_to_tgsi(a_, *p.vsm, *p.fsm, stages, links.view(), t.get(), &p.accel_why, limits)) return false;
+  if (!translate_program_to_tgsi(a_, *p.vsm, *p.fsm, stages, links.view(), t.get(), &p.accel_why, limits)) {
+    // (the first few programs the device refuses: why, and the source line it was at, for the log - see set_accelerator_log)
+    if (accelerator_log() && hw_logged_ < kMaxLoggedPrograms && t->fail_line) {
+      ++hw_logged_;
+      static constexpr uint32_t kTypes[5] = {0x8B31, 0x8B30, 0x8DD9, 0x8E88, 0x8E87};      // (vertex, fragment, geometry, control, evaluation)
+      const ShaderObj* so = t->fail_stage < 5 ? shader_at(p.first_of(kTypes[t->fail_stage])) : nullptr;
+      StringView line;
+      if (so) {
+        const StringView src = so->source.view();
+        uint32_t at = 1;
+        uint64_t start = 0;
+        for (uint64_t i = 0; i < src.size() && at < t->fail_line; ++i)
+          if (src[i] == '\n') {
+            ++at;
+            start = i + 1;
+          }
+        uint64_t end = start;
+        while (end < src.size() && src[end] != '\n') ++end;
+        if (at == t->fail_line) line = src.substr(start, end - start < 200 ? end - start : 200);
+      }
+      accelerator_log()(p.accel_why ? p.accel_why : "refused", t->fail_stage, t->fail_line, line);
+    }
+    return false;
+  }
   p.accel_why = "the device refused the shaders";
   AccelStages as;
   as.gs = t->gs.size() ? t->gs.c_str() : nullptr;

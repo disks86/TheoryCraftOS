@@ -140,6 +140,9 @@ struct TgsiProgram {
   uint32_t varyings = 0;
   bool uses_frag_coord = false;   // the fragment shader reads gl_FragCoord (in the device's pixels: the target must not be supersampled)
   bool no_color = false;          // the fragment shader writes no color (the CPU then writes none: the draw masks every channel, and only the depth changes)
+  // When the translation failed: the source line of the shader it was in and that shader's stage (0 vertex, 1 fragment, then the module's stage numbers; 0xFF none).
+  uint32_t fail_line = 0;
+  uint8_t fail_stage = 0xFF;
   uint32_t color_outputs = 1;     // the fragment shader's colour outputs: OUT[0 .. color_outputs - 1] are COLOR[0 ..] (draw buffers 0 ..); gl_FragDepth comes after them
   // What the device must know of the other stages, as graphics::GeometryPrimitive, GeometryTopology, TessDomain, TessPartitioning and TessOutput numbers.
   uint8_t gs_input = 2, gs_output = 2;
