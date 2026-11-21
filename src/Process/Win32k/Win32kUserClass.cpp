@@ -62,7 +62,9 @@ bool read_class_name(Call& call, uint64_t address, WideString* out, uint32_t* at
 Class* find_class_for_process(uint64_t pid, uint32_t atom, uint64_t instance, bool check_instance) {
   for (Class& c : state().classes) {
     if (c.dead || c.atom != atom) continue;
-    if (!(c.pid == pid || c.is_system || (c.style & wn::CS_GLOBALCLASS))) continue;
+    // (CS_GLOBALCLASS makes a class global to the modules of its own process, not to other processes: another process's class has its window
+    // procedure in that process - of another bitness, a 64-bit address a 32-bit program cannot even call)
+    if (!(c.pid == pid || c.is_system)) continue;
     if (check_instance && !c.is_system && !(c.style & wn::CS_GLOBALCLASS) && (c.instance & ~uint64_t{0xFFFF}) != (instance & ~uint64_t{0xFFFF})) continue;      // (a local class is found by its module; the low 16 bits of the handle do not count)
     return &c;
   }

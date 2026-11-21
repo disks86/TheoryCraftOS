@@ -71,7 +71,8 @@ package, so the next start does not unpack a database.
 2. **Fetch the manifest** of the latest version. It must have the SHA-256 the version list names. It is YAML
    (src/Desktop/AppMan/Yaml.hpp, the part of YAML that winget's files use) and says what to download for which CPU, the SHA-256 of that, and
    what kind of installer it is.
-3. **Choose the installer**: x64, else neutral (the Windows layer runs 64-bit programs only, so x86 installers are not taken). One of the kinds
+3. **Choose the installer**: x64, else neutral, else x86 - and an x86 one only if it is a 32-bit Inno Setup or Nullsoft setup program, the kinds
+   the 32-bit layer is known to run (docs/Wow64.md); a 32-bit package, portable program or setup program of no known kind is not taken. One of the kinds
    the App Manager puts in place itself is taken first:
    - `portable`: one `.exe`;
    - `zip` with `NestedInstallerType: portable`: an archive of portable programs.

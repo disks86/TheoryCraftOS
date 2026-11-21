@@ -217,12 +217,20 @@ StringView key_leaf(StringView key) {
   return slash == StringView::npos ? key : key.substr(slash + 1);
 }
 
-// 0 for the architecture this computer runs best, higher for worse, -1 for one it cannot run. 32-bit x86 programs are among those: the Windows layer
-// runs them only in part so far (docs/Wow64.md), which is enough for a setup program of a 64-bit package but not to offer 32-bit applications.
+// 0 for the architecture this computer runs best, higher for worse, -1 for one it cannot run. 32-bit x86 programs come last: the Windows layer runs
+// them only in part so far (docs/Wow64.md), so an x86 installer is taken only when there is nothing else, and only of a kind known to run
+// (x86_setup_runs).
 int architecture_rank(StringView architecture) {
   if (equals_folded(architecture, "x64")) return 0;
   if (equals_folded(architecture, "neutral")) return 1;
+  if (equals_folded(architecture, "x86")) return 2;
   return -1;
+}
+
+// A 32-bit setup program of a kind the 32-bit layer is known to run (docs/Wow64.md): the only x86 installers taken, and only when no x64 or
+// neutral one can be. What it installs is often 32-bit too, which runs as far as that layer goes.
+bool x86_setup_runs(const WingetInstallerEntry& entry) {
+  return equals_folded(entry.type.view(), "inno") || equals_folded(entry.type.view(), "nullsoft");
 }
 
 }  // namespace
@@ -425,18 +433,23 @@ const WingetInstallerEntry* WingetInstaller::choose_installer(const WingetManife
   for (const UniquePointer<WingetInstallerEntry>& entry : manifest.installers.view()) {
     const int architecture = architecture_rank(entry->architecture.view());
     if (architecture < 0) continue;
-    const bool native = (kinds & kNative) && is_native(*entry), setup = (kinds & kSetup) && is_setup(*entry), package = (kinds & kSetup) && is_msi(*entry);
+    const bool x86 = architecture == 2;
+    const bool native = !x86 && (kinds & kNative) && is_native(*entry), setup = (kinds & kSetup) && is_setup(*entry) && (!x86 || x86_setup_runs(*entry)),
+               package = !x86 && (kinds & kSetup) && is_msi(*entry);
     if (!native && !setup && !package) {
       if (!other) other = entry.get();
       continue;
     }
     // (a setup program of a kind that is known to run here before a package this system installs by its description, which may ask for more than it does)
-    const int rank = (native ? 0 : setup ? 10 : 20) + architecture;
+    // (and any program for this computer's own architecture before a 32-bit one)
+    const int rank = (x86 ? 100 : 0) + (native ? 0 : setup ? 10 : 20) + architecture;
     if (!best || rank < best_rank) best = entry.get(), best_rank = rank;
   }
   if (best) return best;
   if (!other) {
     (void)why->assign("there is no version of it for this kind of computer (64-bit x64)");
+  } else if (architecture_rank(other->architecture.view()) == 2) {
+    (void)(why->assign("there is only a 32-bit version of it, installed by ") && why->append(kind_name(other->type.view())) && why->append(", which cannot be run here yet"));
   } else if (is_native(*other)) {      // (asked for a setup program only: an update of a package that was installed by one)
     (void)why->assign("this version does not come as a setup program, as the installed one did; remove it and install it again");
   } else if ((kinds & kSetup) && equals_folded(other->type.view(), "exe")) {

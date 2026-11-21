@@ -750,6 +750,30 @@ static void test_winget_manifests() {
     CHECK(chosen && chosen->type.view().equals("portable"));
     chosen = appman::WingetInstaller::choose_installer(manifest, appman::WingetInstaller::kSetup, &why);
     CHECK(chosen && chosen->type.view().equals("nullsoft"));
+    // Only a 32-bit version (Unigine.HeavenBenchmark 4.0): a 32-bit Inno Setup program is taken, though after anything for x64; a 32-bit setup
+    // program of no known kind, a 32-bit package or portable program is not.
+    const char* x86_only =
+        "PackageIdentifier: Unigine.HeavenBenchmark\nPackageName: Heaven Benchmark\nPackageVersion: \"4.0\"\nInstallerType: inno\nScope: machine\n"
+        "InstallerSwitches:\n  Custom: /NORESTART\nInstallers:\n"
+        "- Architecture: x86\n  InstallerUrl: https://assets.unigine.com/d/Unigine_Heaven-4.0.exe\n  InstallerSha256: 497865A09AF205A7D2E8812BFC2DD54870216CC1E95541B63CEF89A4433B0E5F\n";
+    CHECK(appman::WingetInstaller::parse_manifest(a, x86_only, &manifest) && manifest.installers.count() == 1);
+    chosen = appman::WingetInstaller::choose_installer(manifest, appman::WingetInstaller::kNative | appman::WingetInstaller::kSetup, &why);
+    CHECK(chosen && chosen->architecture.view().equals("x86") && chosen->type.view().equals("inno") && why.empty());
+    CHECK(!appman::WingetInstaller::choose_installer(manifest, appman::WingetInstaller::kNative, &why) && why.view().contains("32-bit"));
+    const char* x86_after_x64 =
+        "PackageIdentifier: A.X\nPackageName: X\nPackageVersion: 1\nInstallers:\n"
+        "- Architecture: x86\n  InstallerType: nullsoft\n  InstallerUrl: https://example.org/x86.exe\n  InstallerSha256: 0000000000000000000000000000000000000000000000000000000000000000\n"
+        "- Architecture: x64\n  InstallerType: msi\n  InstallerUrl: https://example.org/x64.msi\n  InstallerSha256: 0000000000000000000000000000000000000000000000000000000000000000\n";
+    CHECK(appman::WingetInstaller::parse_manifest(a, x86_after_x64, &manifest));
+    chosen = appman::WingetInstaller::choose_installer(manifest, appman::WingetInstaller::kSetup, &why);
+    CHECK(chosen && chosen->architecture.view().equals("x64"));
+    const char* x86_refused =
+        "PackageIdentifier: A.Y\nPackageName: Y\nPackageVersion: 1\nInstallers:\n"
+        "- Architecture: x86\n  InstallerType: exe\n  InstallerSwitches:\n    Silent: /q\n  InstallerUrl: https://example.org/y.exe\n  InstallerSha256: 0000000000000000000000000000000000000000000000000000000000000000\n"
+        "- Architecture: x86\n  InstallerType: msi\n  InstallerUrl: https://example.org/y.msi\n  InstallerSha256: 0000000000000000000000000000000000000000000000000000000000000000\n"
+        "- Architecture: x86\n  InstallerType: portable\n  InstallerUrl: https://example.org/y.exe\n  InstallerSha256: 0000000000000000000000000000000000000000000000000000000000000000\n";
+    CHECK(appman::WingetInstaller::parse_manifest(a, x86_refused, &manifest));
+    CHECK(!appman::WingetInstaller::choose_installer(manifest, appman::WingetInstaller::kNative | appman::WingetInstaller::kSetup, &why) && why.view().starts_with("there is only a 32-bit version"));
     // Command lines.
     String program(a);
     List<String> words(a);
