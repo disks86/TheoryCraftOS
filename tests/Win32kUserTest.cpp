@@ -231,6 +231,25 @@ void test_classes() {
   Program other(22);
   Th o(other, 22, kScratch);
   CHECK(o.atom_class("MyClass") >= 0xC000);
+  // An application global class (CS_GLOBALCLASS, as user32 registers its controls) is global to its own process only: asked for by the program's
+  // instance, a process finds its own one, never another process's - whose window procedure lives in that process (a 64-bit one for a 32-bit
+  // Inno Setup program, which jumped to it).
+  Program early(23);
+  Th e(early, 23, kScratch);
+  CHECK(e.atom_class("Static", 0x4000 | 0x88, 0x180a23580ull, 0, 8, 0x180a00000ull) >= 0xC000);
+  CHECK(t.atom_class("Static", 0x4000 | 0x88, 0x77a23580ull, 0, 8, 0x77a00000ull) >= 0xC000);
+  {
+    const uint64_t sus = t.tmp(0x200), schars = t.tmp(0x240), swc = t.tmp(0x300);
+    prog.memory.put_unicode_string(sus, schars, "Static");
+    prog.memory.put32(swc, 80);
+    CHECK(t.svc32(N::NtUserGetClassInfoEx, {0x400000, sus, swc, 0, 0}) >= 0xC000 && prog.memory.get64(swc + 8) == 0x77a23580ull);
+    // and a process with no class of that name does not find the other's
+    Program bare(24);
+    Th b(bare, 24, kScratch);
+    bare.memory.put_unicode_string(sus, schars, "Static");
+    bare.memory.put32(swc, 80);
+    CHECK(b.svc32(N::NtUserGetClassInfoEx, {0x400000, sus, swc, 0, 0}) == 0);
+  }
   // class info
   const uint64_t us = t.tmp(0x200), chars = t.tmp(0x240), wc = t.tmp(0x300);
   prog.memory.put_unicode_string(us, chars, "MyClass");
