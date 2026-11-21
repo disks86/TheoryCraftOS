@@ -2859,6 +2859,15 @@ static efi::Status kernel_main(efi::Handle image, efi::SystemTable* st) {
               if (!word.empty()) words[count++] = word;
               rest = after;
             }
+            List<String> own(*t.allocator);      // (no arguments asked for: the entry's own, as the Start menu starts it - cmd.exe /c <file> for a batch file)
+            if (count == 0 && desktop::installed_app_arguments(app, &own))
+              for (const String& word : own.view()) if (count < 16) words[count++] = word.view();
+            console::puts("winget-selftest: starting ");
+            console::puts(app.label.view());
+            console::puts(": ");
+            console::puts(app.program.view());
+            for (uint64_t w = 0; w < count; ++w) { console::puts(" ["); console::puts(words[w]); console::puts("]"); }
+            console::puts("\n");
             const bool ran = t.setup->run(app.program.view(), ArrayView<const StringView>(words, count), &stop_program, &exit_code, &message);
             console::puts("winget-selftest: run ");
             console::puts(app.program.view());

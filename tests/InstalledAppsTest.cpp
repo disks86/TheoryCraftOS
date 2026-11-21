@@ -333,6 +333,63 @@ static void test_finding() {
   CHECK(find_installed_apps(empty, g_alloc, &none) && none.count() == 0);
 }
 
+// Shortcuts to batch files (Unigine Heaven's is one: heaven.bat starts bin\browser_x86.exe) start cmd.exe /c with the file; without cmd.exe they are left out.
+static void test_batch_shortcuts() {
+  filesystem::RamFileSystem fs(g_alloc);
+  for (const char* f : layout::kFolders) fs.create_directory(f);
+  for (const char* f : layout::kWindowsFolders) fs.create_directory(f);
+  make_folders(fs, layout::kWindowsStartMenuPrograms);
+  make_folders(fs, "/Windows/ProgramData/Microsoft/Windows/Start Menu/Programs/Unigine/Heaven Benchmark 4.0");
+  make_folders(fs, "/Windows/Program Files/Unigine/Heaven Benchmark 4.0/bin");
+  make_folders(fs, "/Windows/Program Files/Tools");
+  write_text(fs, "/Windows/Program Files/Unigine/Heaven Benchmark 4.0/heaven.bat", "@echo off\r\ncd %~dp0/bin\r\nstart browser_x86.exe -config ../data/launcher/launcher.xml\r\n");
+  write_pe(fs, "/Windows/Program Files/Unigine/Heaven Benchmark 4.0/bin/browser_x86.exe");
+  write_text(fs, "/Windows/Program Files/Tools/build.CMD", "echo hi\r\n");
+  auto link_to = [&](const char* lnk, const char* const* parts, int count, const char* args) {
+    ByteBuffer b(g_alloc);
+    put_header(b, 0x01 | 0x80 | (args ? 0x20 : 0));
+    put_tcos_list(b, parts, count);
+    if (args) put_string(b, args);
+    put32(b, 0);
+    write_file(fs, lnk, b.view());
+  };
+  const char* heaven[] = {"Program Files", "Unigine", "Heaven Benchmark 4.0", "heaven.bat"};
+  const char* build[] = {"Program Files", "Tools", "build.CMD"};
+  const char* gone[] = {"Program Files", "Tools", "gone.bat"};
+  link_to("/Windows/ProgramData/Microsoft/Windows/Start Menu/Programs/Unigine/Heaven Benchmark 4.0/Heaven Benchmark 4.0.lnk", heaven, 4, nullptr);
+  link_to("/Windows/ProgramData/Microsoft/Windows/Start Menu/Programs/Build.lnk", build, 3, "release x64");
+  link_to("/Windows/ProgramData/Microsoft/Windows/Start Menu/Programs/Gone.lnk", gone, 3, nullptr);
+
+  List<InstalledApp> apps(g_alloc);
+  CHECK(find_installed_apps(fs, g_alloc, &apps) && apps.count() == 0);      // no cmd.exe yet: nothing could start them
+
+  make_folders(fs, layout::kWindowsSystem32);
+  write_pe(fs, "/Windows/Windows/System32/cmd.exe");
+  apps.clear();
+  CHECK(find_installed_apps(fs, g_alloc, &apps));
+  CHECK(apps.count() == 2);
+  String line(g_alloc);
+  for (const InstalledApp& app : apps.view()) {
+    CHECK(app.program.equals("/Windows/Windows/System32/cmd.exe"));
+    if (app.label.equals("Heaven Benchmark 4.0 (Windows)")) {
+      CHECK(app.arguments.equals("/c \"C:\\Program Files\\Unigine\\Heaven Benchmark 4.0\\heaven.bat\""));
+      CHECK(app.working_directory.equals("/Windows/Program Files/Unigine/Heaven Benchmark 4.0"));
+      CHECK(installed_app_command_line(app, &line) && line.equals("/Windows/Windows/System32/cmd.exe /c \"C:\\Program Files\\Unigine\\Heaven Benchmark 4.0\\heaven.bat\""));
+      List<String> words(g_alloc);
+      CHECK(installed_app_arguments(app, &words) && words.count() == 2 && words[0].equals("/c") && words[1].equals("C:\\Program Files\\Unigine\\Heaven Benchmark 4.0\\heaven.bat"));
+    } else {
+      CHECK(app.label.equals("Build (Windows)"));
+      CHECK(app.arguments.equals("/c \"C:\\Program Files\\Tools\\build.CMD\" release x64"));
+      List<String> words(g_alloc);
+      CHECK(installed_app_arguments(app, &words) && words.count() == 4 && words[1].equals("C:\\Program Files\\Tools\\build.CMD") && words[3].equals("x64"));
+      InstalledApp quoted(g_alloc);
+      CHECK(quoted.arguments.assign("'it\"s' \"a 'b'\" x\"y z\"") && installed_app_arguments(quoted, &words) && words.count() == 3);
+      if (words.count() == 3) CHECK(words[0].equals("it\"s") && words[1].equals("a 'b'") && words[2].equals("xy z"));
+      CHECK(quoted.arguments.assign("\"open") && !installed_app_arguments(quoted, &words));
+    }
+  }
+}
+
 // Every truncation and every single-bit flip of a shortcut and of a desktop entry: no crash, no read outside (ASan), and nothing left over.
 static void test_damage() {
   ByteBuffer link(g_alloc);
@@ -376,6 +433,7 @@ int main() {
   test_shell_links();
   test_desktop_entries();
   test_finding();
+  test_batch_shortcuts();
   test_damage();
   if (g_failed) {
     printf("InstalledAppsTest: %d check(s) FAILED\n", g_failed);

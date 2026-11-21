@@ -338,6 +338,24 @@ bool is_program_file(IFileSystem& fs, StringView path) {
   return fs.stat(path, &entry) == Status::Ok && entry.type == NodeType::File && exe::identify_executable_file(fs, path) != exe::ExecutableKind::None;
 }
 
+bool is_batch_name(StringView name) { return ends_with_ignore_case(name, ".bat") || ends_with_ignore_case(name, ".cmd"); }
+
+bool is_batch_file(IFileSystem& fs, StringView path) {
+  DirectoryEntry entry;
+  return is_batch_name(file_name_of(path)) && fs.stat(path, &entry) == Status::Ok && entry.type == NodeType::File;
+}
+
+// A shortcut to a batch file starts it as Windows does: cmd.exe /c "<the file>" <the shortcut's arguments>. Turns `app` (whose program is the batch
+// file) into that; false if cmd.exe is not there, the file is not one a Windows process can name, or memory ran out.
+bool run_batch_with_cmd(IFileSystem& fs, InstalledApp* app, StringView link_arguments) {
+  String cmd(app->program.allocator()), batch(app->program.allocator());
+  if (!cmd.assign(filesystem::layout::kWindowsSystem32) || !cmd.append("/cmd.exe") || !is_program_file(fs, cmd.view())) return false;
+  if (!filesystem::layout::windows_view_of(app->program.view(), &batch)) return false;
+  if (!app->arguments.assign("/c") || !append_shell_word(&app->arguments, batch.view())) return false;
+  if (!trim(link_arguments).empty() && (!app->arguments.push_back(' ') || !app->arguments.append(link_arguments))) return false;
+  return app->program.assign(cmd.view());
+}
+
 struct Finder {
   IFileSystem& fs;
   allocators::IAllocator& allocator;
@@ -392,11 +410,19 @@ struct Finder {
     if (!found && !link.relative_path.empty()) {   // relative to the folder the shortcut is in
       found = app.program.assign(parent_of(path)) && append_components(&app.program, link.relative_path.view(), StringView(filesystem::layout::kWindows).size());
     }
-    if (!found || starts_with_ignore_case(file_name_of(app.program.view()), "unins") || !is_program_file(fs, app.program.view())) return;
+    if (!found || starts_with_ignore_case(file_name_of(app.program.view()), "unins")) return;
+    const bool batch = is_batch_file(fs, app.program.view());
+    if (!batch && !is_program_file(fs, app.program.view())) return;
     if (link.working_directory.empty() || !windows_path_to_system(link.working_directory.view(), &app.working_directory)) {
       if (!app.working_directory.assign(parent_of(app.program.view()))) { memory_ok = false; return; }
     }
-    if (!app.name.assign(name) || !app.arguments.assign(link.arguments.view())) { memory_ok = false; return; }
+    if (!app.name.assign(name)) { memory_ok = false; return; }
+    if (batch) {
+      if (!run_batch_with_cmd(fs, &app, link.arguments.view())) return;
+    } else if (!app.arguments.assign(link.arguments.view())) {
+      memory_ok = false;
+      return;
+    }
     add(static_cast<InstalledApp&&>(app));
   }
 
@@ -440,6 +466,32 @@ bool installed_app_command_line(const InstalledApp& app, String* out) {
   out->clear();
   if (!append_shell_word(out, app.program.view())) return false;
   return app.arguments.empty() || (out->push_back(' ') && out->append(app.arguments.view()));
+}
+
+bool installed_app_arguments(const InstalledApp& app, List<String>* out) {
+  out->clear();
+  const StringView text = app.arguments.view();
+  uint64_t i = 0;
+  while (i < text.size()) {
+    while (i < text.size() && (text[i] == ' ' || text[i] == '\t')) ++i;
+    if (i >= text.size()) break;
+    String word(app.arguments.allocator());
+    char quote = 0;
+    for (; i < text.size(); ++i) {      // (a run in '...' or "..." is taken as it is; quotes of the other kind inside it are characters)
+      const char c = text[i];
+      if (quote) {
+        if (c == quote) quote = 0;
+        else if (!word.push_back(c)) return false;
+        continue;
+      }
+      if (c == ' ' || c == '\t') break;
+      if (c == '"' || c == '\'') { quote = c; continue; }
+      if (!word.push_back(c)) return false;
+    }
+    if (quote) return false;
+    if (!out->push_back(static_cast<String&&>(word))) return false;
+  }
+  return true;
 }
 
 bool same_installed_app(const InstalledApp& a, const InstalledApp& b) {

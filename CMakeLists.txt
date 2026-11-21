@@ -1567,6 +1567,15 @@ if(TCOS_ARCH STREQUAL "x86_64")
   foreach(_library ${WINDOWS_LIBRARIES})
     list(APPEND WINDOWS_DLL_FILES ${WINDOWS_DIR}/${_library}.dll)
   endforeach()
+  # cmd.exe (src/Windows/cmd): batch files and command lines, what %ComSpec% names. A program, not a library: it is linked against kernel32.dll alone.
+  set(WINDOWS_DLL_FLAGS_PROGRAM ${WINDOWS_DLL_FLAGS})
+  list(REMOVE_ITEM WINDOWS_DLL_FLAGS_PROGRAM -shared -Wl,--entry=DllMain)
+  add_custom_command(OUTPUT ${WINDOWS_DIR}/cmd.exe
+    COMMAND ${CMAKE_C_COMPILER} ${WINDOWS_DLL_FLAGS_PROGRAM} -Wl,--entry=cmd_main -Wl,--subsystem,console -o ${WINDOWS_DIR}/cmd.exe
+            ${CMAKE_SOURCE_DIR}/src/Windows/cmd/cmd.c ${WINDOWS_DIR}/kernel32.dll
+    DEPENDS ${CMAKE_SOURCE_DIR}/src/Windows/cmd/cmd.c ${CMAKE_SOURCE_DIR}/src/Windows/cmd/batch.inc ${WINDOWS_DIR}/kernel32.dll
+    COMMENT "Building cmd.exe")
+  list(APPEND WINDOWS_DLL_FILES ${WINDOWS_DIR}/cmd.exe)
   add_custom_target(windows_dlls DEPENDS ${WINDOWS_DLL_FILES})
   if(TCOS_USERMODE_DEMO OR TCOS_WINE_TEST_PROGRAM)
     # The demo (and TCOS_WINE_TEST_PROGRAM, below) run on a RAM file system, not on the primary disk: they get copies of the libraries inside the build and write them to /Windows/Windows/System32 themselves.
@@ -1807,6 +1816,7 @@ if(TCOS_ARCH STREQUAL "x86_64" AND MKFS_FAT AND TCOS_HOST_CXX)
   foreach(_library ${WINDOWS_LIBRARIES})
     list(APPEND _system32_files file:${_system32}/${_library}.dll=${WINDOWS_DIR}/${_library}.dll)
   endforeach()
+  list(APPEND _system32_files file:${_system32}/cmd.exe=${WINDOWS_DIR}/cmd.exe)
   # The libraries of 32-bit programs (C:\\Windows\\SysWOW64, see docs/Wow64.md): the same sources built for i386, where there is a compiler for that.
   find_program(TCOS_WOW64_CC i686-w64-mingw32-gcc)
   # (the same list, in the order of building, is LIBRARIES in scripts/build-wow64-dlls.sh)

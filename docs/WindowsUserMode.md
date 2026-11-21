@@ -581,6 +581,31 @@ user32 the `Char*`/`IsChar*` functions. No new NT system services were needed: e
 Tests: `tests/windows/shell32test.c` (168 checks; run it as `shell32_own.exe` through `scripts/winetest.sh shell32 own`, with `WINETEST_EXTRA=<procchild.exe>` for the ShellExecute checks) and Wine's
 `tests/windows/wine/shell32` (status in the table of `tests/windows/wine/README.md`).
 
+## The command interpreter (cmd.exe)
+
+`C:\Windows\System32\cmd.exe` (`src/Windows/cmd`) is what `%ComSpec%` names: a real 64-bit program, freestanding C over kernel32 (`cmd.c`), around an
+interpreter that has no Windows in it (`batch.inc`, which `tests/CmdBatchTest.cpp` runs on the development machine over a pretend file system). The desktop's
+Start menu starts a shortcut to a batch file with it, as Windows does (`cmd.exe /c "C:\...\file.bat" <the shortcut's arguments>`, see
+`run_batch_with_cmd` in src/Desktop/InstalledApps.cpp). Unigine Heaven's launcher is one: `heaven.bat` changes to `%~dp0/bin` and `start`s `browser_x86.exe`.
+
+- **Command line.** `cmd /c <command>` (runs it, ends with its exit code), `cmd /k <command>` (runs it, then reads commands), `cmd` alone (reads commands from
+  the standard input until `EXIT` or its end), `/q` (ECHO OFF), the quote rule of `/c` and `/s` as in cmd; `/d /a /u /t: /e: /f: /v:` are accepted and ignored.
+- **Batch files.** `@`, labels and `::`, ECHO ON/OFF with the prompt echo, `%%`, `%0`-`%9`, `%*`, the modifiers `%~fdpnx0`, `%NAME%`, `%NAME:~a,b%`,
+  `%NAME:old=new%` (and `*old=`), `%CD%`, `%ERRORLEVEL%`, `^`, `&`, `&&`, `||`, redirection (`>`, `>>`, `<`, `2>`, `2>&1`, `nul`). Built in: REM ECHO
+  CD/CHDIR `X:` SET START (title, `/D`, `/WAIT`; a batch file goes to a new cmd) CALL (a file or a `:label`) GOTO EXIT [/B] IF ([NOT], `/I`, EXIST, ERRORLEVEL,
+  DEFINED, `==`) SHIFT PUSHD POPD PAUSE TYPE VER, and TITLE CLS COLOR SETLOCAL ENDLOCAL VERIFY that do nothing. A program is looked for in the current
+  folder, then PATH's folders, with PATHEXT's extensions, and waited for; a batch file named without CALL takes over, as in cmd. A file is read as UTF-8
+  when it is that, else in the OEM code page.
+- **Not done.** Blocks in parentheses (so `IF ... ( ... ) ELSE ( ... )` and FOR), pipes, `SET /A` and `SET /P`, delayed expansion (`!VAR!`), SETLOCAL's
+  scope, listing the whole environment (`SET` alone), DIR/COPY/DEL/MKDIR and the other file commands, `START` of a document or a URL (only programs and
+  batch files), and a 32-bit cmd.exe in SysWOW64 (a 32-bit program that starts `cmd.exe` gets the 64-bit one, which is what `%ComSpec%` says anyway). A
+  line that needs what is missing says "... is not supported" and the batch file goes on. A shortcut to a batch file whose own arguments are quoted
+  gets more than two quotes after `/c`, so cmd's rule takes the first and the last away, as it would on Windows for that command line.
+
+Tests: `tests/run_host_tests.sh CmdBatchTest` (Heaven's launcher, expansion, the commands, flow, programs, redirection, truncations and single-character
+changes of a batch file) and `InstalledAppsTest` (`test_batch_shortcuts`: the Start menu entry and its arguments). In QEMU: `KEEP=ON RUN=ON
+tests/winget_qemu.sh Unigine.HeavenBenchmark` (see docs/AppManager.md).
+
 ## Stubs: every service and every export is in place
 
 Nothing a program links against is missing, even where nothing is implemented yet (`scripts/gen-windows-stubs.py` produced the lists from the mingw-w64 import libraries, which name the exports of the real DLLs).

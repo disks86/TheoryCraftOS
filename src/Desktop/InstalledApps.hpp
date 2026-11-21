@@ -27,7 +27,8 @@
 //    /usr/local/share/applications and root's ~/.local/share/applications. Type=Application entries with an Exec line that are not
 //    NoDisplay or Hidden; the Name is the unlocalised one, the field codes (%f, %U, ...) are dropped from Exec.
 //
-// Only entries whose program is an ELF or PE file on the disk are listed. Paths are translated into the system tree (C:\ is /Windows, a
+// Only entries whose program is an ELF or PE file on the disk are listed, and Windows shortcuts to a batch file (.bat, .cmd), which start as on Windows:
+// the program is C:\Windows\System32\cmd.exe (src/Windows/cmd) with "/c <the batch file>" and the shortcut's arguments (left out when there is no cmd.exe). Paths are translated into the system tree (C:\ is /Windows, a
 // Linux / is /Linux); a path that would leave its root (".." or another drive) is not used. The parsers take untrusted bytes and never read
 // outside them.
 #pragma once
@@ -63,6 +64,8 @@ struct InstalledApp {
 // The command line that starts `app` in the terminal's shell: the program (quoted when it needs to be), then the arguments. False if memory
 // ran out.
 [[nodiscard]] bool installed_app_command_line(const InstalledApp& app, String* out);
+// The arguments one by one, as the terminal's shell reads `app.arguments` (quotes taken away). False on an unterminated quote or out-of-memory.
+[[nodiscard]] bool installed_app_arguments(const InstalledApp& app, List<String>* out);
 // Do the two describe the same application, started the same way?
 bool same_installed_app(const InstalledApp& a, const InstalledApp& b);
 
