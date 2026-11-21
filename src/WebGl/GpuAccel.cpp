@@ -97,7 +97,7 @@ void Device::hw_end() {
 // The texture a bound view and sampler make, as the device can read it: one mip level of a single-layer 2D RGBA8 (not sRGB) texture, sampled with a plain
 // nearest or linear filter and wrap or clamp addressing.
 bool Device::hw_texture(const Bound& b, uint32_t* handle, webgl::AccelSampler* sampler) {
-  constexpr uint32_t kMaxSide = 1024;
+  constexpr uint32_t kMaxSide = 8192;      // (as GlContext::hw_texture: a device that cannot make one that large refuses it)
   const TextureView* v = b.view;
   const Texture* t = b.tex;
   const Sampler* s = b.sampler;
