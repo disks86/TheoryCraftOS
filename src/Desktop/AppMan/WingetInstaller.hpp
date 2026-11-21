@@ -35,7 +35,7 @@
 //                        for it; find the latest version's manifest in it;
 //                     2. fetch that manifest and check it against the SHA-256 the version list has for it. It says what to download for which kind
 //                        of computer, the SHA-256 of that, and how it is installed;
-//                     3. choose the installer for this computer (x64, else neutral: 32-bit applications are not offered yet) among the kinds that need no
+//                     3. choose the installer for this computer (x64, else neutral, else a 32-bit Inno Setup or Nullsoft setup program) among the kinds that need no
 //                        setup program to be run:
 //                        a "portable" program (one .exe) or a "zip" archive of portable programs;
 //                     4. download it into the package's folder (through a .part file) and check its SHA-256 - so every byte that is installed is the
