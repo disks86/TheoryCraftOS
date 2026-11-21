@@ -56,6 +56,8 @@ class WebGlAccelerator final : public webgl::IAccelerator {
   bool write_color(uint32_t target, ConstByteView rgba) override;
   uint32_t create_image(uint32_t w, uint32_t h, webgl::AccelFormat format, uint32_t levels) override;
   bool write_image(uint32_t image, uint32_t level, ConstByteView pixels) override;
+  uint32_t create_layered(uint32_t w, uint32_t h, uint32_t layers, webgl::AccelKind kind) override;
+  bool write_layer(uint32_t image, uint32_t layer, ConstByteView rgba) override;
   bool read_image(uint32_t image, ByteView pixels) override;
   bool clear_images(const webgl::AccelAttachments& a, bool color, const float rgba[4], bool depth, float depth_value) override;
   bool draw_images(const webgl::AccelAttachments& a, uint32_t program, const webgl::AccelState& state, ConstByteView vertices, uint32_t vertex_count, ConstByteView constants) override;
@@ -89,8 +91,10 @@ class WebGlAccelerator final : public webgl::IAccelerator {
     webgl::AccelFormat format = webgl::AccelFormat::Rgba8;
     uint32_t levels = 1;
     bool renderable = false;   // a colour or depth attachment as well
+    uint32_t layers = 0;       // create_layered: its layers (0: a 2D texture)
   };
   uint32_t make_texture(uint32_t w, uint32_t h, webgl::AccelFormat format, uint32_t levels, bool renderable);
+  uint32_t add_texture(UniquePointer<Texture>&& t);
   struct Target {
     IImage* color = nullptr;
     IImage* depth = nullptr;

@@ -178,6 +178,25 @@ void offset_finish(GlContext& gl) {
   gl.polygon_offset(0, -4);
   gl.draw_arrays(5, 0, 4, 1);
 }
+// A texture of layers on unit 0 (nearest): a cube of 2 x 2 faces, a 2 x 2 x 2 volume or a 2 x 2 x 3 array, each texel its own colour.
+void layered_texture(GlContext& gl, uint32_t p, uint32_t target) {
+  const uint32_t tex = gl.create_texture();
+  gl.active_texture(0x84C0);
+  gl.bind_texture(target, tex);
+  uint8_t texels[2 * 2 * 6 * 4];
+  for (uint32_t i = 0; i < sizeof texels; ++i) texels[i] = static_cast<uint8_t>((i * 37 + (i / 4) * 53) & 255);
+  for (uint32_t i = 3; i < sizeof texels; i += 4) texels[i] = 255;
+  if (target == 0x8513) {
+    for (uint32_t f = 0; f < 6; ++f) gl.tex_image(0x8515 + f, 0, 0x1908, 2, 2, 1, 0, 0x1908, 0x1401, ConstByteView(texels + f * 16, 16), true, false);
+  } else {
+    const uint32_t depth = target == 0x806F ? 2 : 3;
+    gl.tex_image(target, 0, 0x1908, 2, 2, depth, 0, 0x1908, 0x1401, ConstByteView(texels, 16 * depth), true, true);
+  }
+  gl.tex_parameter(target, 0x2801, 0x2600);
+  gl.tex_parameter(target, 0x2800, 0x2600);
+  const uint32_t zero = 0;
+  if (gl.get_uniform_location(p, "u_t") >= 0) gl.uniform(gl.get_uniform_location(p, "u_t"), 'i', 1, 1, 1, &zero);
+}
 #define kFinishHead "#version 300 es\nprecision highp float;\nin vec2 uv; uniform sampler2D t0; uniform sampler2D t1; uniform sampler2D d; out vec4 o;\n"
 
 constexpr Scene kScenes[] = {
@@ -323,6 +342,12 @@ constexpr Scene kScenes[] = {
        kFsHead "void main(){ o = v; }\n", 5, nullptr, false, nullptr, nullptr, nullptr, 0, 0, nullptr, 1, 2},
       {"polygon offset", kHead "in vec2 pos; in vec4 col; in float k; out vec4 v; out float vk;\nvoid main(){ v = col; vk = k; gl_Position = vec4(pos, 0.25, 1.0); }\n",
        kFsHead "void main(){ o = v; }\n", 5, [](GlContext& gl, uint32_t) { gl.enable(0x0B71, true); }, false, nullptr, nullptr, nullptr, 0, 0, offset_finish, 2},
+      {"a cube map", kVs, kFsHead "uniform samplerCube u_t;\nvoid main(){ vec3 d = vec3(v.r * 2.0 - 1.0, v.g * 2.0 - 1.0, vk - 1.5); o = texture(u_t, d); }\n", 5,
+       [](GlContext& gl, uint32_t p) { layered_texture(gl, p, 0x8513); }},
+      {"a 3D texture", kVs, kFsHead "uniform highp sampler3D u_t;\nvoid main(){ o = texture(u_t, vec3(v.rg, vk * 0.3)); }\n", 5,
+       [](GlContext& gl, uint32_t p) { layered_texture(gl, p, 0x806F); }},
+      {"a 2D array texture and textureLod", kVs, kFsHead "uniform highp sampler2DArray u_t;\nvoid main(){ o = texture(u_t, vec3(v.rg, vk)) * 0.5 + textureLod(u_t, vec3(v.gr, 2.0 - vk), 0.0) * 0.5; }\n", 5,
+       [](GlContext& gl, uint32_t p) { layered_texture(gl, p, 0x8C1A); }},
 };
 #undef kFsHead
 #undef kHead

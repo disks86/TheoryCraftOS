@@ -65,12 +65,14 @@ struct AccelLimits {
   bool mip_images = false;        // create_image with more than one level (sampled only)
   bool instancing = false;        // AccelState::instances and per-instance attributes (AccelState::instanced)
   bool independent_blend = false; // AccelState::per_target
+  bool layered_textures = false;  // create_layered: 3D, cube and 2D array textures
   bool depth_bias = false;        // AccelState::depth_bias_*
 };
 
 // The kinds of device image (create_image). Rgba8 (Srgb: sRGB encoded) has 8-bit channels; Rgba16F and Rgba32F floats; Depth a float depth image. Pixels go in and out
 // as w * h * 4 bytes R, G, B, A (Rgba8, Rgba8Srgb), w * h * 16 bytes of little-endian floats (Rgba16F, Rgba32F) - the row of t = 0 (window y 0) first.
 enum class AccelFormat : uint8_t { Rgba8, Rgba8Srgb, Rgba16F, Rgba32F, Depth };
+enum class AccelKind : uint8_t { Volume, Cube, Array };   // (create_layered)
 constexpr uint32_t kAccelMaxColors = 8;
 // The images a draw renders into (draw_images, clear_images): colours[0 .. color_count - 1], fragment output n going to colors[n], and a Depth image (0: none). All
 // have one size. color_count may be 0 (a depth-only draw).
@@ -214,6 +216,16 @@ class IAccelerator {
   // Copies level 0 of a colour image to `pixels` (as AccelFormat says). False for a Depth image: its depth stays on the device.
   virtual bool read_image(uint32_t image, ByteView pixels) {
     (void)image, (void)pixels;
+    return false;
+  }
+  // A sampled texture of layers (AccelLimits::layered_textures): a volume of `layers` slices, a cube (six faces +X, -X, +Y, -Y, +Z, -Z; `layers` is 6), or an
+  // array of `layers` layers, w x h each, 8-bit RGBA, one level. Its layers are filled by write_layer (w * h * 4 bytes, the row of t = 0 first). 0: the device cannot.
+  virtual uint32_t create_layered(uint32_t w, uint32_t h, uint32_t layers, AccelKind kind) {
+    (void)w, (void)h, (void)layers, (void)kind;
+    return 0;
+  }
+  virtual bool write_layer(uint32_t image, uint32_t layer, ConstByteView rgba) {
+    (void)image, (void)layer, (void)rgba;
     return false;
   }
   // Clears the colour images of `a` (to rgba) and/or its depth image (to depth_value).

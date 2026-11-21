@@ -380,6 +380,97 @@ bool GlContext::hw_mip_texture(Texture& t, const SamplerObj& so, uint32_t* handl
   return true;
 }
 
+// A 3D, cube or 2D array texture as the device samples it (AccelLimits::layered_textures): one device texture of layers (Texture::hw_layers) holding the base level,
+// each layer written up when its pixels changed. The device's layered textures have one level: a mipmapped filter reads the base level with the filter it has within
+// a level. 8-bit colour only.
+bool GlContext::hw_layered_texture(const TgsiSampler& ts, uint32_t unit, uint32_t* handle, AccelSampler* sampler, const char** why) {
+  const auto no = [why](const char* reason) { *why = reason; return false; };
+  IAccelerator* acc = accelerator();
+  if (!acc || !acc->limits().layered_textures) return no("a 3D, cube or array texture on a device without them");
+  const TextureUnit& u = units_[unit];
+  const bool cube = ts.dim == shader::kDimCube, volume = ts.dim == shader::kDim3D;
+  const uint32_t name = cube ? u.cube : (volume ? u.tex3d : u.array);
+  const uint32_t target = cube ? 0x8513 : (volume ? 0x806F : 0x8C1A);
+  Texture* t = name && name <= objects_->textures.count() ? objects_->textures[name - 1].get() : nullptr;
+  if (!t || t->target != target) return no("a texture of a kind the device cannot sample");
+  SamplerObj so;
+  if (u.sampler && u.sampler <= objects_->samplers.count() && objects_->samplers[u.sampler - 1]) so = *objects_->samplers[u.sampler - 1];
+  else {
+    so.min_filter = t->min_filter;
+    so.mag_filter = t->mag_filter;
+    so.wrap_s = t->wrap_s;
+    so.wrap_t = t->wrap_t;
+    so.compare_mode = t->compare_mode;
+  }
+  if (t->swizzle[0] != 0x1903 || t->swizzle[1] != 0x1904 || t->swizzle[2] != 0x1905 || t->swizzle[3] != 0x1906) return no("a texture swizzle");
+  if (so.compare_mode != 0) return no("a texture comparison");
+  // (the filter within a level: a mipmapped one's NEAREST_MIPMAP_* / LINEAR_MIPMAP_* part)
+  const uint32_t within = so.min_filter == 0x2700 || so.min_filter == 0x2702 ? 0x2600 : (so.min_filter == 0x2701 || so.min_filter == 0x2703 ? 0x2601 : so.min_filter);
+  if (within != so.mag_filter || (within != 0x2600 && within != 0x2601)) return no("different filters for minification and magnification");
+  auto wrap = [](uint32_t mode, bool* repeat, bool* mirror) {
+    *repeat = mode == 0x2901 || mode == 0x8370;
+    *mirror = mode == 0x8370;
+    return mode == 0x2901 || mode == 0x812F || mode == 0x8370;
+  };
+  if (!wrap(so.wrap_s, &sampler->repeat_s, &sampler->mirror_s) || !wrap(so.wrap_t, &sampler->repeat_t, &sampler->mirror_t)) return no("a texture wrap mode");
+  sampler->linear = within == 0x2601;
+  sampler->mip = 0;
+  SamplerObj base_only = so;
+  base_only.min_filter = within;
+  bool is_cube;
+  if (!texture_complete(*t, base_only, &is_cube)) return no("an incomplete texture");
+  const int32_t base = t->base_level < 0 ? 0 : t->base_level;
+  if (base >= static_cast<int32_t>(kMaxLevels)) return no("an incomplete texture");
+  const uint32_t faces = cube ? 6 : 1;
+  Image* images[6] = {};
+  for (uint32_t f = 0; f < faces; ++f) {
+    const uint64_t at = uint64_t{f} * kMaxLevels + static_cast<uint32_t>(base);
+    if (at >= t->images.count() || !t->images[at] || !t->images[at]->defined()) return no("an incomplete texture");
+    images[f] = t->images[at].get();
+    const Image& im = *images[f];
+    if (im.info->store != Store::U8x4 || im.info->srgb || im.info->is_signed || im.ss != 1) return no("a 3D, cube or array texture of a format the device has not");
+    if (im.w > 8192 || im.h > 8192) return no("a texture larger than the device takes");
+  }
+  const Image& b = *images[0];
+  const uint32_t layers = cube ? 6 : b.d;
+  if (layers == 0 || layers > 256 || (!cube && b.d < 1)) return no("a texture of more layers than the device takes");
+  AccelImage* copy = t->hw_layers.get();
+  if (!copy || copy->owner != acc || copy->w != b.w || copy->h != b.h || copy->levels != layers || t->hw_layer_kind != ts.dim) {
+    t->hw_layers.reset();
+    const uint32_t made = acc->create_layered(b.w, b.h, layers, cube ? AccelKind::Cube : (volume ? AccelKind::Volume : AccelKind::Array));
+    if (!made) return no("the device refused a 3D, cube or array texture");
+    t->hw_layers = UniquePointer<AccelImage>::make(a_);
+    if (!t->hw_layers) {
+      acc->destroy_texture(made);
+      return no("out of memory");
+    }
+    copy = t->hw_layers.get();
+    copy->owner = acc;
+    copy->handle = made;
+    copy->w = b.w;
+    copy->h = b.h;
+    copy->levels = layers;      // (here: the layers)
+    t->hw_layer_kind = ts.dim;
+    for (uint64_t& v : t->hw_layer_versions) v = 0;
+  }
+  const uint64_t layer_bytes = uint64_t{b.w} * b.h * 4;
+  for (uint32_t f = 0; f < faces; ++f) {
+    Image& im = *images[f];
+    hw_sync_image(im);      // (a face a framebuffer object drew into comes back first)
+    const uint64_t v = im.version();
+    if (t->hw_layer_versions[f] == v) continue;
+    if (im.w != b.w || im.h != b.h) return no("an incomplete texture");
+    const ConstByteView px = im.px.view();
+    const uint32_t slices = cube ? 1 : layers;
+    if (px.size() != layer_bytes * slices) return no("an incomplete texture");
+    for (uint32_t k = 0; k < slices; ++k)
+      if (!acc->write_layer(copy->handle, cube ? f : k, px.subview(k * layer_bytes, layer_bytes))) return no("the device refused a 3D, cube or array texture");
+    t->hw_layer_versions[f] = v;
+  }
+  *handle = copy->handle;
+  return true;
+}
+
 // The texture bound to `unit` as the device can read sampler `ts`: a 2D (or 1D, rectangle) texture with a filter and wrap mode the device has. Its image goes to the
 // device as its copy there (Image::hw), which is what a framebuffer object drew into when it did (no CPU copy then); a mipmapped filter takes the texture's levels
 // (hw_mip_texture). A shadow sampler reads depth (a depth image the device drew into, or the CPU's depth sent as floats in R) with nearest filtering; the shader
@@ -390,6 +481,7 @@ bool GlContext::hw_texture(const TgsiSampler& ts, uint32_t unit, uint32_t* handl
   // on the CPU: Unigine Heaven's 2048-wide loading picture took 4 s a frame there)
   constexpr uint32_t kMaxSide = 8192;
   if (unit >= kMaxTextureUnits) return no("a texture unit past the last");
+  if (ts.dim == shader::kDim3D || ts.dim == shader::kDimCube || ts.dim == shader::kDim2DArray) return hw_layered_texture(ts, unit, handle, sampler, why);
   const TextureUnit& u = units_[unit];
   const uint32_t name = ts.dim == shader::kDim1D ? u.tex1d : (ts.dim == shader::kDimRect ? u.rect : u.tex2d);
   const uint32_t target = ts.dim == shader::kDim1D ? 0x0DE0 : (ts.dim == shader::kDimRect ? 0x84F5 : 0x0DE1);

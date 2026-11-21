@@ -2793,12 +2793,17 @@ bool Gen::tex_call(const Node& n, Val* out) {
     if (g->kind != GlobalKind::Handle || g->type.base != Base::Texture || g->type.array || g->type.dim != kDim2D || g->type.shadow || g->type.texel != Base::Float ||
         s->kind != GlobalKind::Handle || s->type.base != Base::SamplerState || s->type.array)
       return fail("a texture the device cannot take");
-  } else if (!eval(sampler_id, &sv) || sv.kind != 5 || sv.ival < 0 || !sv.sfloat || (sv.sdim != kDim2D && sv.sdim != kDim1D && sv.sdim != kDimRect)) {
+  } else if (!eval(sampler_id, &sv) || sv.kind != 5 || sv.ival < 0 || !sv.sfloat ||
+             (sv.sdim != kDim2D && sv.sdim != kDim1D && sv.sdim != kDimRect && sv.sdim != kDim3D && sv.sdim != kDimCube && sv.sdim != kDim2DArray)) {
     return fail("a sampler the device cannot take");
   }
   const uint32_t slot = wgsl ? g->slot : static_cast<uint32_t>(sv.ival);
   const uint8_t dim = wgsl ? kDim2D : sv.sdim;
   const bool shadow = !wgsl && sv.sshadow;
+  // (a 3D, cube or array texture: three coordinates, no comparison, no size row)
+  const bool volume = dim == kDim3D || dim == kDimCube || dim == kDim2DArray;
+  if (volume && (shadow || size_query || legacy)) return fail("a lookup of a 3D, cube or array texture the device cannot take");
+  if (volume && proj && dim != kDim3D) return fail("a projective lookup of a cube or array texture");
   if (size_query) {      // (level 0 only: the size of another level is that of the image the texture has there, which the device does not know)
     const int32_t lod = static_cast<uint64_t>(n.first) + 4 < m_.kids.count() ? m_.kids[static_cast<uint64_t>(n.first) + 4] : -1;
     if (lod >= 0) {
@@ -2842,8 +2847,9 @@ bool Gen::tex_call(const Node& n, Val* out) {
   if (coord.kind || coord.cols != 1) return fail("a texture coordinate the device cannot take");
   // what the coordinate holds: s (and t but in 1D), the reference of a comparison in its third component, a projective lookup's q last
   const uint32_t nc = coord.rows;
-  const uint32_t needed = (shadow ? 3u : (dim == kDim1D ? 1u : 2u)) + (proj ? 1u : 0u);
-  if (nc < needed || (!proj && !shadow && nc != (dim == kDim1D ? 1u : 2u))) return fail("a texture coordinate the device cannot take");
+  const uint32_t plain_count = volume ? 3u : (dim == kDim1D ? 1u : 2u);
+  const uint32_t needed = (shadow ? 3u : plain_count) + (proj ? 1u : 0u);
+  if (nc < needed || (!proj && !shadow && nc != plain_count)) return fail("a texture coordinate the device cannot take");
   Oper half;
   uint16_t uv, ref = 0;
   if (!scalar_imm(0.5f, &half) || !new_temp(&uv) || (shadow && !new_temp(&ref))) return false;
@@ -2859,13 +2865,17 @@ bool Gen::tex_call(const Node& n, Val* out) {
     const Oper cr = component(coord.c[0], 2);
     inst("MOV", ref, "x", &cr);
   }
+  if (volume) {
+    const Oper cz = component(coord.c[0], 2);
+    inst("MOV", uv, "z", &cz);
+  }
   if (proj) {
     const Oper q = component(coord.c[0], nc - 1);
     uint16_t rq;
     if (!new_temp(&rq)) return false;
     inst("RCP", rq, "x", &q);
-    const Oper rqx = component(filled('T', rq, 1), 0), uvo = filled('T', uv, 2);
-    inst("MUL", uv, dim == kDim1D ? "x" : "xy", &uvo, &rqx);
+    const Oper rqx = component(filled('T', rq, 1), 0), uvo = filled('T', uv, 2), filled_uv3 = filled('T', uv, 3);
+    inst("MUL", uv, dim == kDim1D ? "x" : (volume ? "xyz" : "xy"), volume ? &filled_uv3 : &uvo, &rqx);
     if (shadow) {
       const Oper refo = component(filled('T', ref, 1), 0);
       inst("MUL", ref, "x", &refo, &rqx);
@@ -2879,19 +2889,35 @@ bool Gen::tex_call(const Node& n, Val* out) {
     const Oper uvo = filled('T', uv, 2);
     inst("MUL", uv, "xy", &uvo, &inv);
   }
-  // (a stage but the fragment one has no derivatives for an implicit level: TXL of level 0, the only one the device's textures have)
-  Oper zero_level;
-  if (!fs_ && !scalar_imm(0.0f, &zero_level)) return false;
+  // The level: a stage but the fragment one has no derivatives for an implicit level (TXL of level 0, or of the level the lookup names); textureLod is TXL and a
+  // bias TXB in the fragment stage too, the value in the coordinate's w (the device's textures may have mipmaps).
+  const int32_t lod_id = static_cast<uint64_t>(n.first) + 4 < m_.kids.count() ? m_.kids[static_cast<uint64_t>(n.first) + 4] : -1;
+  const bool explicit_lod = !wgsl && (top == TexOp::Lod || top == TexOp::ProjLod) && lod_id >= 0;
+  const bool bias = !wgsl && fs_ && (top == TexOp::Bias || top == TexOp::ProjBias) && lod_id >= 0;
+  Oper level;
+  if (explicit_lod || bias) {
+    Val lv;
+    if (!eval(lod_id, &lv) || !to_float(lv) || lv.kind || lv.cols != 1) return fail("a texture level the device cannot take");
+    level = component(lv.c[0], 0);
+  } else if (!fs_ && !scalar_imm(0.0f, &level)) {
+    return false;
+  }
+  const bool with_level = !fs_ || explicit_lod || bias;
+  const char* target = dim == kDim3D ? "3D" : dim == kDimCube ? "CUBE" : dim == kDim2DArray ? "2D_ARRAY" : "2D";
   const auto tex = [&](uint16_t dst, uint16_t at) {
-    if (!fs_) inst("MOV", at, "zw", &zero_level);
-    begin_inst(fs_ ? "TEX" : "TXL");
+    if (with_level) {
+      if (!volume) inst("MOV", at, "z", &level);
+      inst("MOV", at, "w", &level);
+    }
+    begin_inst(!with_level ? "TEX" : (bias ? "TXB" : "TXL"));
     body.append(" TEMP[");
     body.append_uint(dst);
     body.append("].xyzw, ");
-    put_oper(filled('T', at, fs_ ? 2 : 4));
+    put_oper(filled('T', at, with_level ? 4 : (volume ? 3 : 2)));
     body.append(", SAMP[");
     body.append_uint(index);
-    body.append("], 2D");
+    body.append("], ");
+    body.append(target);
     end_inst();
   };
   if (!shadow) {
@@ -4153,7 +4179,8 @@ bool Gen::run() {
   for (uint64_t gi = 0; gi < m_.globals.count(); ++gi) {
     const Global& g = *m_.globals[gi];
     const bool legacy = (g.builtin == kBvFragColor || g.builtin == kBvFragData) && g.referenced;
-    const bool modern = g.kind == GlobalKind::Out && g.builtin == kBvNone && (!outputs.empty() || (!g.type.array && g.location <= 0));
+    // (an output the shader never uses is not written: it may not even have a slot of its own)
+    const bool modern = g.kind == GlobalKind::Out && g.builtin == kBvNone && g.referenced && (!outputs.empty() || (!g.type.array && g.location <= 0));
     if (!legacy && !modern) continue;
     if (g.type.base != Base::Float || g.type.rows != 4 || g.type.cols != 1) return fail("a color output that is not a vec4");
     Var v;
@@ -4921,7 +4948,8 @@ bool assemble(String& out, const Gen& g, const Shared& sh, uint32_t attributes, 
     out.append_uint(i);
     out.append("]\nDCL SVIEW[");
     out.append_uint(i);
-    out.append("], 2D, FLOAT\n");
+    const uint8_t dim = i < sh.out->samplers.count() ? sh.out->samplers[i].dim : kDim2D;
+    out.append(dim == kDim3D ? "], 3D, FLOAT\n" : dim == kDimCube ? "], CUBE, FLOAT\n" : dim == kDim2DArray ? "], 2D_ARRAY, FLOAT\n" : "], 2D, FLOAT\n");
   }
   write_header_decl(out, "CONST", const_rows);
   if (g.uses_addr) out.append("DCL ADDR[0]\n");

@@ -44,7 +44,7 @@ struct TgsiAccel : IAccelerator {
   };
   struct Prog { std::string vs, fs, gs, tcs, tes; uint32_t attributes = 0, varyings = 0, textures = 0; bool flat[16] = {}; int position = -1, face = -1; bool depth_out = false, derivatives = false; int depth_reg = 1; AccelStages st; };
   // A texture or a device image (create_image: renderable unless mipmapped; a Depth image keeps its depth in `f`, one float per texel). Mipmapped images keep level 0 only.
-  struct Tex { uint32_t w = 0, h = 0; std::vector<uint8_t> rgba; std::vector<float> f; bool floats = false; bool image = false, depth = false; uint32_t levels = 1; };
+  struct Tex { uint32_t w = 0, h = 0; std::vector<uint8_t> rgba; std::vector<float> f; bool floats = false; bool image = false, depth = false; uint32_t levels = 1; uint32_t layers = 0; AccelKind kind = AccelKind::Volume; };
   struct Tgt { uint32_t w = 0, h = 0; std::vector<uint8_t> rgba; std::vector<float> depth; };
   struct Surfaces;
   std::vector<Prog> progs;
@@ -62,6 +62,7 @@ struct TgsiAccel : IAccelerator {
     l.instancing = true;
     l.independent_blend = true;
     l.depth_bias = true;
+    l.layered_textures = true;
     return l;
   }
   uint32_t images = 4;   // (0: a device without device images)
@@ -122,6 +123,24 @@ struct TgsiAccel : IAccelerator {
     else t.rgba.assign(uint64_t{w} * h * 4, 0);
     texs.push_back(t);
     return static_cast<uint32_t>(texs.size());
+  }
+  uint32_t create_layered(uint32_t w, uint32_t h, uint32_t layers, AccelKind kind) override {
+    if (w == 0 || h == 0 || layers == 0 || (kind == AccelKind::Cube && (layers != 6 || w != h))) return 0;
+    Tex t;
+    t.w = w;
+    t.h = h;
+    t.layers = layers;
+    t.kind = kind;
+    t.rgba.assign(uint64_t{w} * h * 4 * layers, 0);
+    texs.push_back(t);
+    return static_cast<uint32_t>(texs.size());
+  }
+  bool write_layer(uint32_t image, uint32_t layer, ConstByteView px) override {
+    Tex& t = texs.at(image - 1);
+    const uint64_t bytes = uint64_t{t.w} * t.h * 4;
+    if (!t.layers || layer >= t.layers || px.size() != bytes) return false;
+    memcpy(t.rgba.data() + bytes * layer, px.data(), bytes);
+    return true;
   }
   bool write_image(uint32_t image, uint32_t level, ConstByteView px) override {
     Tex& t = texs.at(image - 1);
@@ -226,6 +245,41 @@ struct TgsiAccel : IAccelerator {
   struct Sampling final : graphics::ITextureSet {
     const TgsiAccel* acc = nullptr;
     const AccelState* st = nullptr;
+    // 3D: the slice nearest w (linear: blended with the next), a cube: the face of the major axis (GL's table), an array: the layer nearest w.
+    graphics::Vec4 sample_volume(uint32_t unit, float u, float v, float w) const override {
+      const Tex& t = acc->texs.at(st->textures[unit] - 1);
+      if (!t.layers) return sample(unit, u, v);
+      if (t.kind == AccelKind::Cube) {
+        const float ax = fabsf(u), ay = fabsf(v), az = fabsf(w);
+        uint32_t face;
+        float sc, tc, ma;
+        if (ax >= ay && ax >= az) { face = u >= 0 ? 0 : 1; sc = u >= 0 ? -w : w; tc = -v; ma = ax; }
+        else if (ay >= az) { face = v >= 0 ? 2 : 3; sc = u; tc = v >= 0 ? w : -w; ma = ay; }
+        else { face = w >= 0 ? 4 : 5; sc = w >= 0 ? u : -u; tc = -v; ma = az; }
+        return sample_layer(unit, face, (sc / ma + 1) * 0.5f, (tc / ma + 1) * 0.5f);
+      }
+      if (t.kind == AccelKind::Array) {
+        const float l = floorf(w + 0.5f);
+        return sample_layer(unit, static_cast<uint32_t>(l < 0 ? 0 : (l > static_cast<float>(t.layers - 1) ? static_cast<float>(t.layers - 1) : l)), u, v);
+      }
+      const float z = (w < 0 ? 0 : (w > 1 ? 1 : w)) * static_cast<float>(t.layers);
+      if (!st->samplers[unit].linear) {
+        const float sl = floorf(z);
+        return sample_layer(unit, static_cast<uint32_t>(sl >= static_cast<float>(t.layers) ? static_cast<float>(t.layers - 1) : sl), u, v);
+      }
+      const float zc = z - 0.5f, z0 = floorf(zc), a = zc - z0;
+      const auto clampl = [&](float l) { return static_cast<uint32_t>(l < 0 ? 0 : (l > static_cast<float>(t.layers - 1) ? static_cast<float>(t.layers - 1) : l)); };
+      const graphics::Vec4 p = sample_layer(unit, clampl(z0), u, v), q = sample_layer(unit, clampl(z0 + 1), u, v);
+      return {p.x * (1 - a) + q.x * a, p.y * (1 - a) + q.y * a, p.z * (1 - a) + q.z * a, p.w * (1 - a) + q.w * a};
+    }
+    graphics::Vec4 sample_lod_volume(uint32_t unit, float u, float v, float w, float) const override { return sample_volume(unit, u, v, w); }
+    mutable uint32_t layer_ = 0;
+    graphics::Vec4 sample_layer(uint32_t unit, uint32_t layer, float u, float v) const {
+      layer_ = layer;
+      const graphics::Vec4 r = sample(unit, u, v);
+      layer_ = 0;
+      return r;
+    }
     graphics::Vec4 sample(uint32_t unit, float u, float v) const override {
       const Tex& t = acc->texs.at(st->textures[unit] - 1);
       const AccelSampler& sm = st->samplers[unit];
@@ -234,7 +288,7 @@ struct TgsiAccel : IAccelerator {
         x = wrap(x, static_cast<int>(t.w), sm.repeat_s);
         y = wrap(y, static_cast<int>(t.h), sm.repeat_t);
         if (t.depth) return k == 0 ? t.f[uint64_t(y) * t.w + uint64_t(x)] : (k == 3 ? 1.0f : 0.0f);
-        const uint64_t at = (uint64_t(y) * t.w + uint64_t(x)) * 4 + k;
+        const uint64_t at = ((uint64_t{layer_} * t.h + uint64_t(y)) * t.w + uint64_t(x)) * 4 + k;
         return t.floats ? t.f[at] : t.rgba[at] / 255.0f;
       };
       float r[4];

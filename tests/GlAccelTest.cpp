@@ -174,11 +174,11 @@ static void test_translate_refusals() {
     uint32_t prog = make_program(gl, "attribute vec2 p; void main() { float s = 0.0; for (int i = 0; i < 4; i++) { s += 1.0; } gl_Position = vec4(p, s, 1.0); }", kFs);
     // (kFs reads a varying that this vertex shader does not write: zero, as the CPU's vertices start)
     CHECK(translate(gl, a, prog, &t, &why));
-    // a texture lookup with an explicit level is a plain one (the device's textures have one level); one with an offset, or of a cube map, is refused
+    // a texture lookup with an explicit level is TXL; one of a cube map is a CUBE lookup (one with an offset is refused)
     prog = make_program(gl, kVs, "precision mediump float; varying vec3 vcol; uniform sampler2D tex; void main() { gl_FragColor = texture2DLod(tex, vcol.xy, 1.0); }");
     CHECK(translate(gl, a, prog, &t, &why));
     prog = make_program(gl, kVs, "precision mediump float; varying vec3 vcol; uniform samplerCube tex; void main() { gl_FragColor = textureCube(tex, vcol); }");
-    CHECK(!translate(gl, a, prog, &t, &why));
+    CHECK(translate(gl, a, prog, &t, &why) && contains(t.fs, ", CUBE\n") && contains(t.fs, "DCL SVIEW[0], CUBE, FLOAT"));
     // a third sampler
     prog = make_program(gl, kVs, "precision mediump float; varying vec3 vcol; uniform sampler2D a; uniform sampler2D b; uniform sampler2D c; void main() { gl_FragColor = texture2D(a, vcol.xy) + texture2D(b, vcol.xy) + texture2D(c, vcol.xy); }");
     CHECK(!translate(gl, a, prog, &t, &why));
@@ -1235,6 +1235,88 @@ static uint32_t rgba_texture(GlContext& gl, uint32_t w, uint32_t h, uint32_t int
   return t;
 }
 
+// Overloaded functions of one name with different parameter and return types (Unigine's mul4 / mul3): each call inlines its own overload, on the device.
+static void test_translate_overloads() {
+  TestAllocator a;
+  TgsiAccel ref;
+  set_accelerator(&ref);
+  {
+    static const char* const kVariants[] = {
+        "#version 150\nin vec4 pos; uniform mat4 s_projection; out vec4 c;\n"
+        "vec4 mul4(mat4 m, vec4 v) { return m * v; }\nvec4 mul4(mat4 m, vec3 v) { return m * vec4(v, 1.0); }\nvec3 mul3(mat4 m, vec3 v) { return (m * vec4(v, 1.0)).xyz; }\n"
+        "vec4 getPosition(vec4 vertex) { return mul4(s_projection, vertex); }\nvec3 getNormal(vec3 n) { return mul3(s_projection, n); }\n"
+        "void main() { c = vec4(getNormal(pos.xyz), 1.0); gl_Position = getPosition(pos); }\n",
+        "#version 150\nin vec4 pos; uniform mat4 s_projection; out vec4 c;\n"
+        "vec3 mul4(mat4 m, vec3 v) { return (m * vec4(v, 1.0)).xyz; }\nvec4 mul4(mat4 m, vec4 v) { return m * v; }\n"
+        "vec4 getPosition(vec4 vertex) { return mul4(s_projection, vertex); }\nvec3 getPosition(vec3 vertex) { return mul4(s_projection, vertex); }\n"
+        "void main() { c = vec4(getPosition(pos.xyz), 1.0); gl_Position = getPosition(pos); }\n",
+    };
+    static const char* kOutFs = "#version 150\nin vec4 c; out vec4 o; void main() { o = c; }\n";
+    for (const char* vs : kVariants) {
+      GlContext gl(a, true, 16, 16, noaa());
+      gl.desktop.active = true;
+      const uint32_t prog = make_program(gl, vs, kOutFs);
+      gl.use_program(prog);
+      const float ident[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+      uint32_t bits[16];
+      memcpy(bits, ident, sizeof bits);
+      gl.uniform(gl.get_uniform_location(prog, "s_projection"), 'f', 4, 4, 1, bits);
+      quad_buffer(gl, prog, 0.0f);
+      gl.draw_arrays(4, 0, 6, 1);
+      if (gl.hardware_stats().gpu_draws != 1) printf("overloads: %s\n", gl.hardware_stats().last_refusal ? gl.hardware_stats().last_refusal : "-");
+      CHECK(gl.hardware_stats().gpu_draws == 1);
+    }
+  }
+  set_accelerator(nullptr);
+  CHECK(a.live == 0);
+}
+
+// Unigine's deferred pass: GLSL 1.50 outputs placed by glBindFragDataLocation, one of them never written, a helper function returning the value - on the device.
+static void test_bound_fragment_outputs() {
+  TestAllocator a;
+  TgsiAccel ref;
+  set_accelerator(&ref);
+  {
+    GlContext gl(a, true, 16, 16, noaa());
+    gl.desktop.active = true;
+    static const char* kVs = "#version 150\nin vec3 pos; void main() { gl_Position = vec4(pos, 1.0); }\n";
+    static const char* kFs = "#version 150\nout vec4 s_frag_data_0; out vec4 s_frag_data_1; out vec4 s_frag_data_2; out vec4 s_frag_data_3;\n"
+                             "vec4 setDeferredNormal(vec3 n, float p) { return vec4(n * 0.5 + 0.5, p); }\n"
+                             "void main() { s_frag_data_0 = vec4(0.25); s_frag_data_2 = setDeferredNormal(normalize(vec3(0.0, 0.0, 1.0)), 0.5); }\n";
+    const uint32_t v = gl.create_shader(0x8B31), f = gl.create_shader(0x8B30), prog = gl.create_program();
+    gl.shader_source(v, kVs);
+    gl.compile_shader(v);
+    gl.shader_source(f, kFs);
+    gl.compile_shader(f);
+    gl.attach_shader(prog, v);
+    gl.attach_shader(prog, f);
+    for (uint32_t i = 0; i < 4; ++i) {
+      char name[] = "s_frag_data_0";
+      name[12] = static_cast<char>('0' + i);
+      gl.bind_frag_data_location(prog, i, StringView(name));
+    }
+    gl.link_program(prog);
+    gl.use_program(prog);
+    const uint32_t t0 = rgba_texture(gl, 16, 16), t1 = rgba_texture(gl, 16, 16), t2 = rgba_texture(gl, 16, 16);
+    const uint32_t fb = gl.create_framebuffer();
+    gl.bind_framebuffer(0x8D40, fb);
+    gl.framebuffer_texture(0x8D40, 0x8CE0, 0x0DE1, t0, 0, 0);
+    gl.framebuffer_texture(0x8D40, 0x8CE1, 0x0DE1, t1, 0, 0);
+    gl.framebuffer_texture(0x8D40, 0x8CE2, 0x0DE1, t2, 0, 0);
+    const uint32_t bufs[3] = {0x8CE0, 0x8CE1, 0x8CE2};
+    gl.draw_buffers(ArrayView<const uint32_t>(bufs, 3));
+    gl.clear(0x4000);
+    quad_buffer(gl, prog, 0.0f);
+    gl.draw_arrays(4, 0, 6, 1);
+    if (gl.hardware_stats().gpu_draws != 1) printf("bound outputs: %s\n", gl.hardware_stats().last_refusal ? gl.hardware_stats().last_refusal : "-");
+    CHECK(gl.hardware_stats().gpu_draws == 1);
+    gl.read_buffer(0x8CE2);
+    CHECK(pixel(gl, 4, 4) == 0x808080FFu);      // (0.5, 0.5, 1, 0.5)
+  }
+  set_accelerator(nullptr);
+  CHECK(a.live == 0);
+}
+
 // A framebuffer object's pictures stay on the device: draws and clears into its images there, a later draw samples them there (nothing read back), and the CPU
 // gets them back only when it reads or writes them - glReadPixels, glTexSubImage, a draw the device refuses.
 static void test_framebuffer_objects() {
@@ -1591,6 +1673,8 @@ static void test_stage_programs() {
 }
 
 int main() {
+  test_translate_overloads();
+  test_bound_fragment_outputs();
   test_translate_basic();
   test_translate_matrix_and_functions();
   test_translate_texture();

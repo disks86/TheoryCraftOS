@@ -2075,6 +2075,36 @@ class Parser {
     switch (n.kind) {
       case NodeKind::Const: case NodeKind::Construct: case NodeKind::Zero: *t = n.type; return true;
       case NodeKind::Global: *t = m_.globals[static_cast<uint64_t>(n.ival)]->type; return true;
+      // (a local variable or parameter: the type it was declared with, kept on the node for this - Unigine overloads functions by vec3 / vec4 arguments)
+      case NodeKind::Local:
+        if (n.type.base == Base::Void) return false;
+        *t = n.type;
+        return true;
+      case NodeKind::Call:
+        if (n.ival < 0 || static_cast<uint64_t>(n.ival) >= m_.functions.count()) return false;
+        *t = m_.functions[static_cast<uint64_t>(n.ival)]->ret;
+        return t->base != Base::Void;
+      case NodeKind::Field: {      // a swizzle of a vector (v.xyz): a vector of its length, of the vector's base (a structure's member: not told here)
+        Type inner;
+        if (!static_type(n.a, &inner) || inner.cols != 1 || inner.array || inner.base == Base::Struct || n.c < 1 || n.c > 4 || n.b < 0) return false;
+        static const char* const kSets[3] = {"xyzw", "rgba", "stpq"};
+        bool any_set = false;
+        for (const char* set : kSets) {
+          bool all = true;
+          for (int32_t i = 0; i < n.c && all; ++i) {
+            const uint64_t at = static_cast<uint64_t>(n.b) + static_cast<uint64_t>(i);
+            if (at >= m_.consts.count()) return false;
+            const char ch = static_cast<char>(m_.consts[at]);
+            bool in = false;
+            for (uint32_t k = 0; k < inner.rows && k < 4; ++k) in = in || set[k] == ch;
+            all = in;
+          }
+          any_set = any_set || all;
+        }
+        if (!any_set) return false;
+        *t = make_type(inner.base, static_cast<uint8_t>(n.c));
+        return true;
+      }
       default: return false;
     }
   }
@@ -2182,6 +2212,7 @@ class Parser {
     }
     n.kind = s->kind == 0 ? NodeKind::Local : NodeKind::Global;
     n.ival = s->index;
+    if (s->kind == 0) n.type = s->type;      // (for static_type: choosing between overloads)
     if (s->kind == 1) {
       m_.globals[static_cast<uint64_t>(s->index)]->referenced = true;
       if (m_.globals[static_cast<uint64_t>(s->index)]->builtin == kBvFragCoord) unit_uses_frag_coord_ = true;
@@ -2196,17 +2227,32 @@ class Parser {
     n.first = add_kids(args.view().data(), static_cast<uint32_t>(args.count()));
     n.count = static_cast<int32_t>(args.count());
     // user functions first (they can shadow built-ins only by overloading)
+    // (the overload whose parameters fit the arguments whose types are known: an exact match before one through an implicit conversion between int, uint and
+    // float - also the other way for out parameters, whose value is converted back; among equals the first with a body)
     int32_t best = -1;
+    int32_t best_score = -1;
+    bool best_body = false;
+    const auto numeric = [](Base b) { return b == Base::Int || b == Base::Uint || b == Base::Float; };
     for (uint64_t i = 0; i < m_.functions.count(); ++i) {
       const Function& f = *m_.functions[i];
       if (!f.name.view().equals(name) || f.params.count() != args.count() || !visible_here(i)) continue;
       bool ok = true;
-      for (uint64_t k = 0; k < args.count(); ++k) {
+      int32_t score = 0;
+      for (uint64_t k = 0; k < args.count() && ok; ++k) {
         Type st;
-        if (static_type(args[k], &st) && st.base != f.params[k].type.base && !(st.base == Base::Int && f.params[k].type.base == Base::Float)) ok = false;
-        else if (static_type(args[k], &st) && st.base == f.params[k].type.base && (st.rows != f.params[k].type.rows || st.cols != f.params[k].type.cols)) ok = false;
+        if (!static_type(args[k], &st)) continue;
+        const Type& pt = f.params[k].type;
+        if (st.rows != pt.rows || st.cols != pt.cols) ok = false;
+        else if (st.base == pt.base) ++score;
+        else if (!numeric(st.base) || !numeric(pt.base)) ok = false;
       }
-      if (ok) { best = static_cast<int32_t>(i); if (f.body >= 0) break; }
+      if (!ok) continue;
+      const bool body = f.body >= 0;
+      if (best < 0 || score > best_score || (score == best_score && body && !best_body)) {
+        best = static_cast<int32_t>(i);
+        best_score = score;
+        best_body = body;
+      }
     }
     if (best >= 0) {
       n.kind = NodeKind::Call;

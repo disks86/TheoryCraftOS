@@ -81,6 +81,7 @@ webgl::AccelLimits WebGlAccelerator::limits() const {
   l.instancing = (info.features & kFeatureInstancing) && info.limits.vertex_buffers >= 2;
   l.independent_blend = (info.features & kFeatureIndependentBlend) && l.blend_state;
   l.depth_bias = info.limits.depth_bias;
+  l.layered_textures = (info.features & kFeatureTextureKinds) != 0;
   return l;
 }
 
@@ -640,6 +641,52 @@ bool WebGlAccelerator::draw_images(const webgl::AccelAttachments& a, uint32_t pr
   // (a depth-only draw has the blank colour image, which must never be written: the colour mask is the device's blend state, so such a draw needs it)
   if (a.color_count == 0 && (!state.custom_blend || state.color_mask != 0)) return false;
   return run_pass_on(pass, w, h, a.color_count ? a.color_count : 1, p, &state, vertices, vertex_count, constants);
+}
+
+uint32_t WebGlAccelerator::add_texture(UniquePointer<Texture>&& t) {
+  for (uint64_t i = 0; i < textures_.count(); ++i)
+    if (!textures_[i]) {
+      textures_[i] = static_cast<UniquePointer<Texture>&&>(t);
+      return static_cast<uint32_t>(i + 1);
+    }
+  if (!textures_.push_back(static_cast<UniquePointer<Texture>&&>(t))) return 0;
+  return static_cast<uint32_t>(textures_.count());
+}
+
+uint32_t WebGlAccelerator::create_layered(uint32_t w, uint32_t h, uint32_t layers, webgl::AccelKind kind) {
+  if (!(device_.info().features & kFeatureTextureKinds) || w == 0 || h == 0 || layers == 0 || layers > kMaxTextureLayers) return 0;
+  if (kind == webgl::AccelKind::Cube && (layers != 6 || w != h)) return 0;
+  kernel::ScopedMutex guard(lock_);
+  UniquePointer<Texture> t = UniquePointer<Texture>::make(allocator_);
+  if (!t) return 0;
+  t->width = w;
+  t->height = h;
+  t->layers = layers;
+  ImageDesc d;
+  d.extent = {w, h};
+  d.format = Format::B8G8R8A8Unorm;
+  d.usage = kImageSampled;
+  d.kind = kind == webgl::AccelKind::Volume ? TextureKind::Texture3D : (kind == webgl::AccelKind::Cube ? TextureKind::TextureCube : TextureKind::Texture2DArray);
+  d.layers = layers;
+  t->image = device_.create_image(d);
+  if (!t->image) return 0;
+  const uint32_t handle = add_texture(static_cast<UniquePointer<Texture>&&>(t));
+  return handle;
+}
+
+bool WebGlAccelerator::write_layer(uint32_t handle, uint32_t layer, ConstByteView rgba) {
+  kernel::ScopedMutex guard(lock_);
+  Texture* t = texture_at(handle);
+  if (!t || !t->layers || layer >= t->layers) return false;
+  const uint64_t texels = uint64_t{t->width} * t->height;
+  if (rgba.size() != texels * 4) return false;
+  ArrayView<uint32_t> scratch = allocate_view<uint32_t>(allocator_, texels);
+  if (scratch.empty()) return false;
+  for (uint64_t i = 0; i < texels; ++i)   // 0xAARRGGBB
+    scratch[i] = (uint32_t{rgba[i * 4 + 3]} << 24) | (uint32_t{rgba[i * 4]} << 16) | (uint32_t{rgba[i * 4 + 1]} << 8) | rgba[i * 4 + 2];
+  const bool ok = t->image->write_layer_pixels(layer, scratch);
+  release_view(allocator_, scratch);
+  return ok;
 }
 
 bool WebGlAccelerator::write_image(uint32_t handle, uint32_t level, ConstByteView pixels) {

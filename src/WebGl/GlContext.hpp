@@ -174,6 +174,10 @@ struct Texture {
   UniquePointer<AccelImage> hw_mips;
   int32_t hw_mip_base = 0;
   uint64_t hw_mip_versions[kMaxLevels] = {};
+  // ... and of a 3D, cube or array texture's base level (hw_layered_texture): the versions of its image (of each face of a cube)
+  UniquePointer<AccelImage> hw_layers;
+  uint8_t hw_layer_kind = 0;
+  uint64_t hw_layer_versions[6] = {};
 };
 
 struct SamplerObj {
@@ -1006,6 +1010,7 @@ class GlContext final : public shader::ITextureHost {
   bool hw_fbo_clear(uint32_t mask, const Target& t);
   static bool hw_fbo_colors(const Target& t, uint32_t* count, const char** why);
   bool hw_mip_texture(Texture& t, const SamplerObj& so, uint32_t* handle, AccelSampler* sampler, const char** why);
+  bool hw_layered_texture(const TgsiSampler& ts, uint32_t unit, uint32_t* handle, AccelSampler* sampler, const char** why);
 };
 
 // Vertex fetch shared by the software and accelerated draws (GlDraw.cpp): the four float lanes (as bit patterns, missing ones 0, 0, 0, 1) of the attribute element at
