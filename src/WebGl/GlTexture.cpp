@@ -109,9 +109,23 @@ uint32_t texel_bytes(Store s) {
   }
 }
 
+namespace {
+uint64_t g_image_versions = 0;   // (the last version handed out, by every image of every context: atomically)
+}
+
+uint64_t Image::version() {
+  if (changed_) {
+    version_ = __atomic_add_fetch(&g_image_versions, 1, __ATOMIC_RELAXED);
+    changed_ = false;
+  }
+  return version_;
+}
+
 bool Image::allocate(const FormatInfo* fi, uint32_t width, uint32_t height, uint32_t depth) {
   const uint64_t n = uint64_t{width} * height * depth * texel_bytes(fi->store);
   if (n > (2048ull << 20)) return false;
+  hw.reset();      // (new storage: the 3D hardware's copy, of the old, goes)
+  changed_ = true;
   px.clear();
   if (!px.put_zeros(n)) return false;
   info = fi;

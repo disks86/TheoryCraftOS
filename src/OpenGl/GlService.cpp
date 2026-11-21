@@ -180,7 +180,7 @@ GlStatus GlService::execute(uint64_t pid, uint64_t thread, ConstByteView stream,
 void GlService::report(uint64_t pid, const Context& c) const {
   if (!report_ || !c.api) return;
   const webgl::GlContext::HardwareStats& stats = c.api->hardware_stats();
-  if (stats.gpu_draws || stats.cpu_draws) report_(pid, stats);
+  if (stats.gpu_draws || stats.cpu_draws) report_(pid, stats, "");
 }
 
 // The pictures the 3D hardware drew for the contexts drawing to `surface` are brought into its images (before they are shown or swapped).
@@ -199,6 +199,13 @@ GlStatus GlService::swap(uint64_t pid, uint64_t window, uint32_t width, uint32_t
     Surface* s = p->surface(window);
     if (!s) return GlStatus::InvalidHandle;
     sync_hardware(*p, s->surface.get());
+    // A long-running program's draw statistics are reported every kReportFrames frames (and the rest when its context goes), so a run that is stopped still says them.
+    for (const UniquePointer<Context>& c : p->contexts) {
+      if (!c || !c->api || c->api->surface() != s->surface.get() || ++c->frames_since_report < kReportFrames) continue;
+      c->frames_since_report = 0;
+      report(pid, *c);
+      c->api->reset_hardware_stats();
+    }
     if (do_swap) s->surface->swap();
     const webgl::Image& front = s->surface->front();
     if (present && front.defined()) {

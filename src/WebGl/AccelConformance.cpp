@@ -42,6 +42,10 @@ struct Scene {
   const char* tes = nullptr;
   uint32_t patch_vertices = 0;
   uint32_t count = 0;
+  // A second draw after the scene's (nullptr: none), and how many draws the device must take (the scene's and that one).
+  void (*finish)(GlContext& gl) = nullptr;
+  uint32_t draws = 1;
+  uint32_t instances = 1;   // (the scene's draw: instanced)
 };
 
 #define kHead "#version 300 es\nprecision highp float;\nprecision highp int;\n"
@@ -85,6 +89,96 @@ void two_units(GlContext& gl, uint32_t p) {
   if (gl.get_uniform_location(p, "u_st.k") >= 0) set_floats(gl, p, "u_st.k", 1, 1, 1, &half);
   if (gl.get_uniform_location(p, "u_t") >= 0) gl.uniform(gl.get_uniform_location(p, "u_t"), 'i', 1, 1, 1, &one);
 }
+
+// --- framebuffer objects: a scene draws into the images of one (setup binds it), and `finish` draws the window from them with a second program on the device
+constexpr uint32_t kFboSize = 32;
+
+uint32_t fbo_texture(GlContext& gl, uint32_t unit, uint32_t internal, uint32_t format, uint32_t type) {
+  const uint32_t t = gl.create_texture();
+  gl.active_texture(0x84C0 + unit);
+  gl.bind_texture(0x0DE1, t);
+  gl.tex_image(0x0DE1, 0, internal, kFboSize, kFboSize, 1, 0, format, type, ConstByteView(), false, false);
+  gl.tex_parameter(0x0DE1, 0x2801, 0x2600);
+  gl.tex_parameter(0x0DE1, 0x2800, 0x2600);
+  gl.active_texture(0x84C0);
+  return t;
+}
+
+// The framebuffer object of a scene: RGBA8 on unit 0; `floats`: an RGBA32F second draw buffer on unit 1; `depth_texture`: a 32-bit float depth texture on unit 2
+// (else a depth renderbuffer).
+void fbo_setup(GlContext& gl, bool floats, bool depth_texture) {
+  const uint32_t fb = gl.create_framebuffer();
+  gl.bind_framebuffer(0x8D40, fb);
+  gl.framebuffer_texture(0x8D40, 0x8CE0, 0x0DE1, fbo_texture(gl, 0, 0x8058, 0x1908, 0x1401), 0, 0);
+  if (floats) {
+    gl.framebuffer_texture(0x8D40, 0x8CE1, 0x0DE1, fbo_texture(gl, 1, 0x8814, 0x1908, 0x1406), 0, 0);
+    const uint32_t bufs[2] = {0x8CE0, 0x8CE1};
+    gl.draw_buffers(ArrayView<const uint32_t>(bufs, 2));
+  }
+  if (depth_texture) {
+    gl.framebuffer_texture(0x8D40, 0x8D00, 0x0DE1, fbo_texture(gl, 2, 0x8CAC, 0x1902, 0x1406), 0, 0);
+  } else {
+    const uint32_t rb = gl.create_renderbuffer();
+    gl.bind_renderbuffer(rb);
+    gl.renderbuffer_storage(0x81A5, kFboSize, kFboSize, 0);
+    gl.framebuffer_renderbuffer(0x8D40, 0x8D00, rb);
+  }
+}
+
+// The second draw: the window, from the framebuffer object's textures (t0, t1, d on units 0, 1, 2), by `fs` (which writes o from them at uv).
+void fbo_finish(GlContext& gl, const char* fs) {
+  gl.bind_framebuffer(0x8D40, 0);
+  gl.enable(0x0B71, false);
+  const uint32_t p = gl.create_program();
+  const char* vs = "#version 300 es\nin vec2 pos; out vec2 uv; void main(){ uv = pos * 0.5 + 0.5; gl_Position = vec4(pos, 0.0, 1.0); }\n";
+  const uint32_t stages[2][2] = {{0x8B31, 0}, {0x8B30, 1}};
+  for (const auto& st : stages) {
+    const uint32_t s = gl.create_shader(st[0]);
+    gl.shader_source(s, StringView(st[1] ? fs : vs));
+    gl.compile_shader(s);
+    gl.attach_shader(p, s);
+  }
+  gl.link_program(p);
+  gl.use_program(p);
+  const int32_t l = gl.get_attrib_location(p, StringView("pos"));      // (the scene's strip, still bound: pos first, 28 bytes a vertex)
+  if (l >= 0) {
+    gl.enable_vertex_attrib(static_cast<uint32_t>(l), true);
+    gl.vertex_attrib_pointer(static_cast<uint32_t>(l), 2, 0x1406, false, 28, 0, false);
+  }
+  const uint32_t units[3] = {0, 1, 2};
+  const char* const names[3] = {"t0", "t1", "d"};
+  for (uint32_t i = 0; i < 3; ++i)
+    if (gl.get_uniform_location(p, StringView(names[i])) >= 0) gl.uniform(gl.get_uniform_location(p, StringView(names[i])), 'i', 1, 1, 1, &units[i]);
+  gl.clear_color(0.1f, 0.2f, 0.3f, 1);
+  gl.clear(0x4000);
+  gl.draw_arrays(5, 0, 4, 1);
+}
+// The second draw of the polygon offset scene: the scene's strip again, at the same depth, pulled nearer by glPolygonOffset (the depth test is LESS, so only
+// the offset lets it through), in another colour.
+void offset_finish(GlContext& gl) {
+  const uint32_t p = gl.create_program();
+  const char* vs = "#version 300 es\nin vec2 pos; void main(){ gl_Position = vec4(pos, 0.25, 1.0); }\n";
+  const char* fs = "#version 300 es\nprecision highp float; out vec4 o; void main(){ o = vec4(0.9, 0.6, 0.1, 1.0); }\n";
+  const uint32_t types[2] = {0x8B31, 0x8B30};
+  const char* const sources[2] = {vs, fs};
+  for (uint32_t i = 0; i < 2; ++i) {
+    const uint32_t sh = gl.create_shader(types[i]);
+    gl.shader_source(sh, StringView(sources[i]));
+    gl.compile_shader(sh);
+    gl.attach_shader(p, sh);
+  }
+  gl.link_program(p);
+  gl.use_program(p);
+  const int32_t l = gl.get_attrib_location(p, StringView("pos"));
+  if (l >= 0) {
+    gl.enable_vertex_attrib(static_cast<uint32_t>(l), true);
+    gl.vertex_attrib_pointer(static_cast<uint32_t>(l), 2, 0x1406, false, 28, 0, false);
+  }
+  gl.enable(0x8037, true);      // POLYGON_OFFSET_FILL
+  gl.polygon_offset(0, -4);
+  gl.draw_arrays(5, 0, 4, 1);
+}
+#define kFinishHead "#version 300 es\nprecision highp float;\nin vec2 uv; uniform sampler2D t0; uniform sampler2D t1; uniform sampler2D d; out vec4 o;\n"
 
 constexpr Scene kScenes[] = {
       {"for loop with break and continue", kVs, kFsHead "void main(){ float s = 0.0; for (int i = 0; i < 8; ++i) { if (i == 2) continue; if (i == 6) break; s += v.r * float(i) * 0.05; } o = vec4(s, v.g, v.b, 1.0); }\n", 5, nullptr},
@@ -215,6 +309,20 @@ constexpr Scene kScenes[] = {
        kHead "in vec4 v; in vec4 w; out vec4 o;\nvoid main(){ o = v * 0.5 + w + vec4(0.1); }\n", 5, nullptr},
       {"&& and || that skip a right side with effects", kVs,
        kFsHead "void main(){ float x = v.r; float y = v.g; if (x > 0.5 && ++y > 1.5) y += 0.1; bool b = x < 0.3 || (x += 0.2) > 0.9; o = vec4(x * 0.5, y * 0.4, b ? 0.7 : 0.2, 1.0); }\n", 5, nullptr},
+      {"a framebuffer object, drawn and then sampled by the next draw", kVs, kFsHead "void main(){ o = vec4(v.rgb * 0.8 + 0.1, 1.0); }\n", 5,
+       [](GlContext& gl, uint32_t) { fbo_setup(gl, false, false); }, false, nullptr, nullptr, nullptr, 0, 0,
+       [](GlContext& gl) { fbo_finish(gl, kFinishHead "void main(){ o = texture(t0, uv).bgra; }\n"); }, 2},
+      {"two draw buffers, one of floats, sampled by the next draw", kVs,
+       kHead "in vec4 v; in float vk; layout(location = 0) out vec4 o; layout(location = 1) out vec4 f;\nvoid main(){ o = v; f = vec4(v.rgb * 3.0 - 1.0, vk * 0.5); }\n", 5,
+       [](GlContext& gl, uint32_t) { fbo_setup(gl, true, false); }, false, nullptr, nullptr, nullptr, 0, 0,
+       [](GlContext& gl) { fbo_finish(gl, kFinishHead "void main(){ vec4 c = texture(t1, uv); o = vec4(texture(t0, uv).b, c.r * 0.25 + 0.25, c.a * 0.5, 1.0); }\n"); }, 2},
+      {"a depth texture, drawn and then sampled", kHead "in vec2 pos; in vec4 col; in float k; out vec4 v; out float vk;\nvoid main(){ v = col; vk = k; gl_Position = vec4(pos, col.r * 1.6 - 0.8, 1.0); }\n",
+       kFsHead "void main(){ o = v; }\n", 5, [](GlContext& gl, uint32_t) { fbo_setup(gl, false, true); gl.enable(0x0B71, true); }, false, nullptr, nullptr, nullptr, 0, 0,
+       [](GlContext& gl) { fbo_finish(gl, kFinishHead "void main(){ o = vec4(texture(d, uv).r, texture(t0, uv).g, 0.5, 1.0); }\n"); }, 2},
+      {"instances and gl_InstanceID", kHead "in vec2 pos; in vec4 col; in float k; out vec4 v; out float vk;\nvoid main(){ v = col * (0.4 + 0.5 * float(gl_InstanceID)); vk = k; gl_Position = vec4(pos.x * 0.5 - 0.5 + float(gl_InstanceID), pos.y, 0.0, 1.0); }\n",
+       kFsHead "void main(){ o = v; }\n", 5, nullptr, false, nullptr, nullptr, nullptr, 0, 0, nullptr, 1, 2},
+      {"polygon offset", kHead "in vec2 pos; in vec4 col; in float k; out vec4 v; out float vk;\nvoid main(){ v = col; vk = k; gl_Position = vec4(pos, 0.25, 1.0); }\n",
+       kFsHead "void main(){ o = v; }\n", 5, [](GlContext& gl, uint32_t) { gl.enable(0x0B71, true); }, false, nullptr, nullptr, nullptr, 0, 0, offset_finish, 2},
 };
 #undef kFsHead
 #undef kHead
@@ -421,7 +529,8 @@ bool draw_scene(allocators::IAllocator& a, const Scene& sc, ByteView out, uint64
   if (sc.setup) sc.setup(gl, p);
   gl.clear_color(0.1f, 0.2f, 0.3f, 1);
   gl.clear(0x4000 | 0x100);
-  gl.draw_arrays(sc.mode, 0, static_cast<int32_t>(count), 1);
+  gl.draw_arrays(sc.mode, 0, static_cast<int32_t>(count), static_cast<int32_t>(sc.instances));
+  if (sc.finish) sc.finish(gl);
   gl.read_pixels(0, 0, kSize, kSize, 0x1908, 0x1401, out);
   *gpu_draws = gl.hardware_stats().gpu_draws;
   *why = gl.hardware_stats().last_refusal;
@@ -452,7 +561,7 @@ uint32_t run_accel_conformance(allocators::IAllocator& allocator, IAccelerator& 
     if (!cpu_ok || !gpu_ok) {
       r.verdict = AccelVerdict::Broken;
       ++wrong;
-    } else if (gpu_draws != 1) {
+    } else if (gpu_draws != sc.draws) {
       r.verdict = AccelVerdict::NotTaken;
       r.why = why;
     } else {

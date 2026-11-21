@@ -1205,6 +1205,285 @@ static void test_translated_shaders_match_the_cpu() {
   CHECK(a.live == 0);
 }
 
+// --- Framebuffer objects on the device ------------------------------------------------------------------------------------------------------------------------
+
+// A full-window quad (two triangles of `pos`) in the program now in use, at depth z.
+static uint32_t quad_buffer(GlContext& gl, uint32_t prog, float z) {
+  const float v[] = {-1, -1, z, 1, -1, z, 1, 1, z, -1, -1, z, 1, 1, z, -1, 1, z};
+  const uint32_t buf = gl.create_buffer();
+  gl.bind_buffer(0x8892, buf);
+  gl.buffer_data(0x8892, ConstByteView(reinterpret_cast<const uint8_t*>(v), sizeof v), 0, 0x88E4);
+  const int32_t pl = gl.get_attrib_location(prog, "pos");
+  gl.enable_vertex_attrib(static_cast<uint32_t>(pl), true);
+  gl.vertex_attrib_pointer(static_cast<uint32_t>(pl), 3, 0x1406, false, 12, 0, false);
+  return buf;
+}
+
+static void set_vec4(GlContext& gl, uint32_t prog, const char* name, float r, float g, float b, float al) {
+  const float f[4] = {r, g, b, al};
+  uint32_t bits[4];
+  memcpy(bits, f, sizeof bits);
+  gl.uniform(gl.get_uniform_location(prog, name), 'f', 1, 4, 1, bits);
+}
+
+static uint32_t rgba_texture(GlContext& gl, uint32_t w, uint32_t h, uint32_t internal = 0x8058, uint32_t format = 0x1908, uint32_t type = 0x1401) {
+  const uint32_t t = gl.create_texture();
+  gl.bind_texture(0x0DE1, t);
+  gl.tex_image(0x0DE1, 0, internal, w, h, 1, 0, format, type, ConstByteView(), false, false);
+  gl.tex_parameter(0x0DE1, 0x2801, 0x2600);   // MIN_FILTER NEAREST
+  gl.tex_parameter(0x0DE1, 0x2800, 0x2600);   // MAG_FILTER NEAREST
+  return t;
+}
+
+// A framebuffer object's pictures stay on the device: draws and clears into its images there, a later draw samples them there (nothing read back), and the CPU
+// gets them back only when it reads or writes them - glReadPixels, glTexSubImage, a draw the device refuses.
+static void test_framebuffer_objects() {
+  TestAllocator a;
+  TgsiAccel ref;
+  set_accelerator(&ref);
+  {
+    GlContext gl(a, true, 64, 64, noaa());
+    static const char* kSolidVs = "attribute vec3 pos; void main() { gl_Position = vec4(pos, 1.0); }";
+    static const char* kSolidFs = "precision mediump float; uniform vec4 color; void main() { gl_FragColor = color; }";
+    static const char* kCopyVs = "attribute vec3 pos; varying vec2 uv; void main() { uv = pos.xy * 0.5 + 0.5; gl_Position = vec4(pos, 1.0); }";
+    static const char* kCopyFs = "precision mediump float; varying vec2 uv; uniform sampler2D tex; void main() { gl_FragColor = texture2D(tex, uv); }";
+    const uint32_t solid = make_program(gl, kSolidVs, kSolidFs);
+    const uint32_t copy = make_program(gl, kCopyVs, kCopyFs);
+    const uint32_t tex = rgba_texture(gl, 32, 32);
+    const uint32_t rb = gl.create_renderbuffer();
+    gl.bind_renderbuffer(rb);
+    gl.renderbuffer_storage(0x81A5, 32, 32, 0);   // DEPTH_COMPONENT16
+    const uint32_t fb = gl.create_framebuffer();
+    gl.bind_framebuffer(0x8D40, fb);
+    gl.framebuffer_texture(0x8D40, 0x8CE0, 0x0DE1, tex, 0, 0);
+    gl.framebuffer_renderbuffer(0x8D40, 0x8D00, rb);
+    CHECK(gl.check_framebuffer_status(0x8D40) == 0x8CD5);
+    gl.viewport(0, 0, 32, 32);
+    gl.clear_color(0, 0, 1, 1);
+    gl.clear(0x4000 | 0x100);
+    CHECK(ref.image_clears == 1);
+    gl.use_program(solid);
+    quad_buffer(gl, solid, 0.0f);
+    set_vec4(gl, solid, "color", 0, 1, 0, 1);
+    gl.enable(0x0B71, true);   // DEPTH_TEST
+    gl.draw_arrays(4, 0, 6, 1);
+    CHECK(ref.image_draws == 1 && ref.image_reads == 0);
+    // (a quad behind the first: the depth test on the device keeps the green)
+    quad_buffer(gl, solid, 0.5f);
+    set_vec4(gl, solid, "color", 1, 0, 0, 1);
+    gl.draw_arrays(4, 0, 6, 1);
+    CHECK(ref.image_draws == 2);
+    gl.enable(0x0B71, false);
+
+    // the default framebuffer samples the texture on the device: nothing comes back to the CPU for it
+    gl.bind_framebuffer(0x8D40, 0);
+    gl.viewport(0, 0, 64, 64);
+    gl.use_program(copy);
+    quad_buffer(gl, copy, 0.0f);
+    const uint32_t unit0 = 0;
+    gl.uniform(gl.get_uniform_location(copy, "tex"), 'i', 1, 1, 1, &unit0);
+    gl.bind_texture(0x0DE1, tex);
+    const uint64_t gpu_before = gl.hardware_stats().gpu_draws;
+    gl.draw_arrays(4, 0, 6, 1);
+    CHECK(gl.hardware_stats().gpu_draws == gpu_before + 1 && ref.image_reads == 0);
+    CHECK(pixel(gl, 10, 10) == 0xFF00FF00u && pixel(gl, 60, 60) == 0xFF00FF00u);
+
+    // glReadPixels of the framebuffer object: its image comes back
+    gl.bind_framebuffer(0x8D40, fb);
+    CHECK(pixel(gl, 5, 5) == 0xFF00FF00u && ref.image_reads == 1);
+    CHECK(pixel(gl, 6, 6) == 0xFF00FF00u && ref.image_reads == 1);   // (once: then the CPU's pixels are current)
+
+    // a sub-image after another device draw: the device's picture first, then the CPU's change, then up again for the next draw
+    gl.use_program(solid);
+    quad_buffer(gl, solid, 0.0f);
+    set_vec4(gl, solid, "color", 1, 1, 0, 1);
+    gl.viewport(0, 0, 16, 32);      // (the left half yellow)
+    gl.draw_arrays(4, 0, 6, 1);
+    const uint8_t white[4 * 4] = {255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255};
+    gl.bind_texture(0x0DE1, tex);
+    gl.tex_sub_image(0x0DE1, 0, 30, 30, 0, 2, 2, 1, 0x1908, 0x1401, ConstByteView(white, sizeof white), false);
+    CHECK(ref.image_reads == 2);
+    CHECK(pixel(gl, 2, 2) == 0xFFFFFF00u && pixel(gl, 20, 2) == 0xFF00FF00u && pixel(gl, 31, 31) == 0xFFFFFFFFu);
+    const int writes = ref.image_writes;
+    gl.draw_arrays(4, 0, 6, 1);      // (the CPU's pixels go up before the device draws on them)
+    CHECK(ref.image_writes == writes + 1);
+    CHECK(pixel(gl, 31, 31) == 0xFFFFFFFFu && pixel(gl, 2, 2) == 0xFFFFFF00u);
+
+    // a draw the device cannot do (the stencil test) gets the device's pictures first
+    gl.viewport(0, 0, 32, 32);
+    set_vec4(gl, solid, "color", 1, 0, 1, 1);
+    const int reads = ref.image_reads;
+    gl.enable(0x0B90, true);
+    const uint64_t cpu_before = gl.hardware_stats().cpu_draws;
+    gl.draw_arrays(4, 0, 6, 1);      // (stencil test with nothing attached passes: magenta everywhere)
+    gl.enable(0x0B90, false);
+    CHECK(gl.hardware_stats().cpu_draws == cpu_before + 1);
+    CHECK(pixel(gl, 31, 31) == 0xFFFF00FFu && ref.image_reads >= reads);
+  }
+  set_accelerator(nullptr);
+  CHECK(a.live == 0);
+}
+
+// Several draw buffers (layout locations), a float image and a depth texture that a later draw samples - all on the device - against the same scene on the CPU.
+static void test_framebuffer_objects_mrt() {
+  TestAllocator a;
+  uint32_t got[2][4] = {};
+  for (int device = 1; device >= 0; --device) {
+    TgsiAccel ref;
+    set_accelerator(device ? &ref : nullptr);
+    {
+      GlContext gl(a, true, 32, 32, noaa());
+      static const char* kVs = "#version 300 es\nin vec3 pos; void main() { gl_Position = vec4(pos, 1.0); }";
+      static const char* kFs = "#version 300 es\nprecision highp float; layout(location = 1) out vec4 second; layout(location = 0) out vec4 first;\n"
+                               "void main() { first = vec4(0.25, 0.5, 0.75, 1.0); second = vec4(2.5, -1.0, 0.125, gl_FragCoord.z); }";
+      static const char* kReadVs = "#version 300 es\nin vec3 pos; out vec2 uv; void main() { uv = pos.xy * 0.5 + 0.5; gl_Position = vec4(pos, 1.0); }";
+      static const char* kReadFs = "#version 300 es\nprecision highp float; in vec2 uv; uniform sampler2D a; uniform sampler2D b; uniform sampler2D d; out vec4 o;\n"
+                                   "void main() { o = vec4(texture(a, uv).g, texture(b, uv).r * 0.1, texture(d, uv).r, 1.0); }";
+      const uint32_t prog = make_program(gl, kVs, kFs);
+      const uint32_t read = make_program(gl, kReadVs, kReadFs);
+      const uint32_t t0 = rgba_texture(gl, 32, 32);
+      const uint32_t t1 = rgba_texture(gl, 32, 32, 0x8814, 0x1908, 0x1406);   // RGBA32F
+      const uint32_t td = rgba_texture(gl, 32, 32, 0x81A6, 0x1902, 0x1405);   // DEPTH_COMPONENT24
+      const uint32_t fb = gl.create_framebuffer();
+      gl.bind_framebuffer(0x8D40, fb);
+      gl.framebuffer_texture(0x8D40, 0x8CE0, 0x0DE1, t0, 0, 0);
+      gl.framebuffer_texture(0x8D40, 0x8CE1, 0x0DE1, t1, 0, 0);
+      gl.framebuffer_texture(0x8D40, 0x8D00, 0x0DE1, td, 0, 0);
+      const uint32_t bufs[2] = {0x8CE0, 0x8CE1};
+      gl.draw_buffers(ArrayView<const uint32_t>(bufs, 2));
+      CHECK(gl.check_framebuffer_status(0x8D40) == 0x8CD5);
+      gl.clear_color(0, 0, 0, 0);
+      gl.clear(0x4000 | 0x100);
+      gl.use_program(prog);
+      quad_buffer(gl, prog, 0.5f);      // (window depth 0.75)
+      gl.enable(0x0B71, true);
+      gl.draw_arrays(4, 0, 6, 1);
+      gl.enable(0x0B71, false);
+      if (device) CHECK(ref.image_draws == 1 && ref.image_clears == 1 && ref.image_reads == 0);
+      // a later draw samples all three, on the device too
+      gl.bind_framebuffer(0x8D40, 0);
+      gl.use_program(read);
+      quad_buffer(gl, read, 0.0f);
+      const uint32_t units[3] = {0, 1, 2};
+      gl.uniform(gl.get_uniform_location(read, "a"), 'i', 1, 1, 1, &units[0]);
+      gl.uniform(gl.get_uniform_location(read, "b"), 'i', 1, 1, 1, &units[1]);
+      gl.uniform(gl.get_uniform_location(read, "d"), 'i', 1, 1, 1, &units[2]);
+      gl.active_texture(0x84C0);
+      gl.bind_texture(0x0DE1, t0);
+      gl.active_texture(0x84C1);
+      gl.bind_texture(0x0DE1, t1);
+      gl.active_texture(0x84C2);
+      gl.bind_texture(0x0DE1, td);
+      gl.draw_arrays(4, 0, 6, 1);
+      if (device) CHECK(ref.image_draws == 1 && ref.image_reads == 0 && gl.hardware_stats().gpu_draws == 2);
+      const uint32_t p = pixel(gl, 16, 16);
+      got[device][0] = (p >> 16) & 255;
+      got[device][1] = (p >> 8) & 255;
+      got[device][2] = p & 255;
+      // and the second draw buffer read back as floats
+      gl.bind_framebuffer(0x8D40, fb);
+      gl.read_buffer(0x8CE1);
+      float f[4] = {};
+      gl.read_pixels(3, 3, 1, 1, 0x1908, 0x1406, ByteView(reinterpret_cast<uint8_t*>(f), sizeof f));
+      CHECK(f[0] == 2.5f && f[1] == -1.0f && f[2] == 0.125f && fabsf(f[3] - 0.75f) < 1e-5f);
+      got[device][3] = static_cast<uint32_t>(f[3] * 1000.0f + 0.5f);
+    }
+    set_accelerator(nullptr);
+  }
+  CHECK(got[1][0] == 128 && got[1][1] == 64 && got[1][2] >= 190 && got[1][2] <= 192);   // (0.5; 2.5 * 0.1; the depth 0.75)
+  for (int k = 0; k < 4; ++k) CHECK(got[0][k] == got[1][k]);
+  CHECK(a.live == 0);
+}
+
+// A mipmapped texture is sampled on the device from its levels (each written up once, and again when it changes); on a device without images it is the CPU's.
+static void test_mipmapped_texture() {
+  TestAllocator a;
+  TgsiAccel ref;
+  set_accelerator(&ref);
+  {
+    GlContext gl(a, false, 32, 32, noaa());
+    static const char* kVs = "attribute vec3 pos; varying vec2 uv; void main() { uv = pos.xy * 0.5 + 0.5; gl_Position = vec4(pos, 1.0); }";
+    static const char* kFs = "precision mediump float; varying vec2 uv; uniform sampler2D tex; void main() { gl_FragColor = texture2D(tex, uv); }";
+    const uint32_t prog = make_program(gl, kVs, kFs);
+    gl.use_program(prog);
+    quad_buffer(gl, prog, 0.0f);
+    const uint32_t t = gl.create_texture();
+    gl.bind_texture(0x0DE1, t);
+    uint8_t px[16 * 16 * 4];
+    for (uint8_t& b : px) b = 200;
+    gl.tex_image(0x0DE1, 0, 0x1908, 16, 16, 1, 0, 0x1908, 0x1401, ConstByteView(px, sizeof px), true, false);
+    gl.generate_mipmap(0x0DE1);
+    gl.tex_parameter(0x0DE1, 0x2801, 0x2703);   // LINEAR_MIPMAP_LINEAR
+    const int writes = ref.image_writes;
+    gl.clear(0x4000);
+    gl.draw_arrays(4, 0, 6, 1);
+    CHECK(gl.hardware_stats().gpu_draws == 1 && ref.image_writes == writes + 5);   // (16, 8, 4, 2, 1)
+    gl.draw_arrays(4, 0, 6, 1);
+    CHECK(gl.hardware_stats().gpu_draws == 2 && ref.image_writes == writes + 5);
+    gl.tex_sub_image(0x0DE1, 2, 0, 0, 0, 1, 1, 1, 0x1908, 0x1401, ConstByteView(px, 4), false);
+    gl.draw_arrays(4, 0, 6, 1);
+    CHECK(gl.hardware_stats().gpu_draws == 3 && ref.image_writes == writes + 6);   // (level 2 alone)
+    CHECK(pixel(gl, 16, 16) == 0xC8C8C8C8u);
+  }
+  set_accelerator(nullptr);
+  CHECK(a.live == 0);
+}
+
+// Instanced draws (gl_InstanceID and an attribute with a divisor), per-buffer colour masks and polygon offset on the device, against the same scene on the CPU.
+static void test_instancing_and_buffer_state() {
+  TestAllocator a;
+  std::vector<uint32_t> got[2];
+  for (int device = 1; device >= 0; --device) {
+    TgsiAccel ref;
+    set_accelerator(device ? &ref : nullptr);
+    {
+      GlContext gl(a, true, 32, 32, noaa());
+      static const char* kVs = "#version 300 es\nin vec3 pos; in vec4 tint; out vec4 c;\n"
+                               "void main() { c = tint; gl_Position = vec4(pos.x * 0.25 - 0.75 + float(gl_InstanceID) * 0.5, pos.y, pos.z, 1.0); }";
+      static const char* kFs = "#version 300 es\nprecision highp float; in vec4 c; layout(location = 0) out vec4 a; layout(location = 1) out vec4 b;\n"
+                               "void main() { a = c; b = c.bgra; }";
+      const uint32_t prog = make_program(gl, kVs, kFs);
+      const uint32_t t0 = rgba_texture(gl, 32, 32), t1 = rgba_texture(gl, 32, 32);
+      const uint32_t fb = gl.create_framebuffer();
+      gl.bind_framebuffer(0x8D40, fb);
+      gl.framebuffer_texture(0x8D40, 0x8CE0, 0x0DE1, t0, 0, 0);
+      gl.framebuffer_texture(0x8D40, 0x8CE1, 0x0DE1, t1, 0, 0);
+      const uint32_t bufs[2] = {0x8CE0, 0x8CE1};
+      gl.draw_buffers(ArrayView<const uint32_t>(bufs, 2));
+      gl.clear_color(0.5f, 0.5f, 0.5f, 0.5f);
+      gl.clear(0x4000);
+      gl.use_program(prog);
+      quad_buffer(gl, prog, 0.0f);
+      // per instance: a colour for every second instance (divisor 2)
+      const float tints[] = {1, 0, 0, 1, 0, 0, 1, 1};
+      const uint32_t tb = gl.create_buffer();
+      gl.bind_buffer(0x8892, tb);
+      gl.buffer_data(0x8892, ConstByteView(reinterpret_cast<const uint8_t*>(tints), sizeof tints), 0, 0x88E4);
+      const int32_t tl = gl.get_attrib_location(prog, "tint");
+      gl.enable_vertex_attrib(static_cast<uint32_t>(tl), true);
+      gl.vertex_attrib_pointer(static_cast<uint32_t>(tl), 4, 0x1406, false, 16, 0, false);
+      gl.vertex_attrib_divisor(static_cast<uint32_t>(tl), 2);
+      // draw buffer 1 keeps its green and alpha (glColorMaski)
+      gl.desktop.active = true;
+      gl.desktop.per_buffer_masks = true;
+      gl.desktop.color_mask[1] = 1 | 4;
+      gl.draw_arrays(4, 0, 6, 4);
+      if (device) CHECK(ref.image_draws == 1 && gl.hardware_stats().cpu_draws == 0);
+      gl.desktop.per_buffer_masks = false;
+      gl.desktop.active = false;
+      for (uint32_t buffer = 0; buffer < 2; ++buffer) {
+        gl.read_buffer(0x8CE0 + buffer);
+        for (int x = 2; x < 32; x += 4) got[device].push_back(pixel(gl, x, 16));
+      }
+    }
+    set_accelerator(nullptr);
+  }
+  CHECK(got[0].size() == 16 && got[0] == got[1]);
+  CHECK(got[1].size() == 16 && got[1][0] == 0xFFFF0000u && got[1][6] == 0xFF0000FFu);      // (instances 0, 1 red; 2, 3 blue)
+  CHECK(got[1].size() == 16 && got[1][8] == 0x800080FFu);      // (buffer 1, instance 0: c.bgra is blue; red and blue written, green and alpha kept at 0.5)
+  CHECK(a.live == 0);
+}
+
 // A desktop GL program of the stages given (nullptr: not there).
 static uint32_t make_stage_program(GlContext& gl, const char* vs, const char* tcs, const char* tes, const char* gs, const char* fs) {
   const uint32_t p = gl.create_program();
@@ -1324,6 +1603,10 @@ int main() {
   test_device_only_clear();
   test_translated_shaders_match_the_cpu();
   test_color_upload();
+  test_framebuffer_objects();
+  test_framebuffer_objects_mrt();
+  test_mipmapped_texture();
+  test_instancing_and_buffer_state();
   test_stage_programs();
   test_refused_program_and_failed_draw();
   test_uniforms_and_depth();

@@ -38,6 +38,10 @@ namespace webgl {
 struct AccelSampler {
   bool linear = false;
   bool repeat_s = true, repeat_t = true;
+  // A mipmapped image (create_image with levels): the filter between levels (0 none: level 0 only, 1 the nearest level, 2 linear between two) and the levels' range.
+  uint8_t mip = 0;
+  float min_lod = 0, max_lod = 1000, lod_bias = 0;
+  bool mirror_s = false, mirror_t = false;   // (with repeat: GL_MIRRORED_REPEAT)
 };
 constexpr uint32_t kAccelMaxTextures = 16;
 
@@ -52,6 +56,27 @@ struct AccelLimits {
   bool float_textures = false;  // create_texture_float (what a depth texture is sent as)
   uint32_t control_varyings = 0;  // tessellation: the registers per control point from the control to the evaluation stage (0: `varyings`)
   bool color_upload = false;      // write_color
+  // Device images (create_image): what draws render into (draw_images) and sample later, so a framebuffer object's pictures stay on the device. 0 colours: none.
+  uint32_t image_colors = 0;      // colour images one draw_images may render into at once
+  bool float_images = false;      // AccelFormat::Rgba16F / Rgba32F images
+  bool srgb_images = false;       // AccelFormat::Rgba8Srgb images
+  bool sampled_depth = false;     // a Depth image can be sampled too (its depth in R)
+  bool mip_images = false;        // create_image with more than one level (sampled only)
+  bool instancing = false;        // AccelState::instances and per-instance attributes (AccelState::instanced)
+  bool independent_blend = false; // AccelState::per_target
+  bool depth_bias = false;        // AccelState::depth_bias_*
+};
+
+// The kinds of device image (create_image). Rgba8 (Srgb: sRGB encoded) has 8-bit channels; Rgba16F and Rgba32F floats; Depth a float depth image. Pixels go in and out
+// as w * h * 4 bytes R, G, B, A (Rgba8, Rgba8Srgb), w * h * 16 bytes of little-endian floats (Rgba16F, Rgba32F) - the row of t = 0 (window y 0) first.
+enum class AccelFormat : uint8_t { Rgba8, Rgba8Srgb, Rgba16F, Rgba32F, Depth };
+constexpr uint32_t kAccelMaxColors = 8;
+// The images a draw renders into (draw_images, clear_images): colours[0 .. color_count - 1], fragment output n going to colors[n], and a Depth image (0: none). All
+// have one size. color_count may be 0 (a depth-only draw).
+struct AccelAttachments {
+  uint32_t colors[kAccelMaxColors] = {};
+  uint32_t color_count = 0;
+  uint32_t depth = 0;
 };
 
 // The stages of a program between the vertex and the fragment shader (create_program_stages), as TGSI text, and what the device must know of them. The numbers are the
@@ -99,6 +124,21 @@ struct AccelState {
   uint32_t texture_count = 0;
   uint32_t textures[kAccelMaxTextures] = {};
   AccelSampler samplers[kAccelMaxTextures] = {};
+  // AccelLimits::instancing: the instances of the draw (each runs the vertices again), and the attributes (bit i: IN[i]) that step per instance instead - those take
+  // their values from the vertex data after the per-vertex ones: instances x the per-instance attributes, float4 each, in IN[] order.
+  uint32_t instances = 1;
+  uint32_t instanced = 0;
+  // AccelLimits::independent_blend, with custom_blend: each colour image of draw_images blends and masks as targets[n] says (target 0's also in the fields above).
+  struct TargetBlend {
+    bool blend = false;
+    uint8_t src_rgb = 1, dst_rgb = 0, src_alpha = 1, dst_alpha = 0, op_rgb = 0, op_alpha = 0;
+    uint8_t color_mask = 0xF;
+  };
+  bool per_target = false;
+  TargetBlend targets[kAccelMaxColors] = {};
+  // AccelLimits::depth_bias: glPolygonOffset's factor and units, applied to the primitives `depth_bias_modes` says (bit 0 filled, 1 lines, 2 points).
+  float depth_bias_factor = 0, depth_bias_units = 0;
+  uint8_t depth_bias_modes = 0;
 };
 
 class IAccelerator {
@@ -156,6 +196,33 @@ class IAccelerator {
   virtual bool write_color(uint32_t target, ConstByteView rgba) {
     (void)target;
     (void)rgba;
+    return false;
+  }
+
+  // --- Device images (AccelLimits::image_colors). An image is a texture handle (AccelState::textures may name it) that draws can also render into.
+  // A w x h image of `format` with `levels` mipmap levels (more than 1: AccelLimits::mip_images, Rgba8 / Rgba8Srgb, sampled only - not rendered into). 0: the device cannot.
+  virtual uint32_t create_image(uint32_t w, uint32_t h, AccelFormat format, uint32_t levels = 1) {
+    (void)w, (void)h, (void)format, (void)levels;
+    return 0;
+  }
+  // Replaces level `level` (its size: w >> level, h >> level, at least 1) with `pixels` (as AccelFormat says). False for a Depth image.
+  virtual bool write_image(uint32_t image, uint32_t level, ConstByteView pixels) {
+    (void)image, (void)level, (void)pixels;
+    return false;
+  }
+  // Copies level 0 of a colour image to `pixels` (as AccelFormat says). False for a Depth image: its depth stays on the device.
+  virtual bool read_image(uint32_t image, ByteView pixels) {
+    (void)image, (void)pixels;
+    return false;
+  }
+  // Clears the colour images of `a` (to rgba) and/or its depth image (to depth_value).
+  virtual bool clear_images(const AccelAttachments& a, bool color, const float rgba[4], bool depth, float depth_value) {
+    (void)a, (void)color, (void)rgba, (void)depth, (void)depth_value;
+    return false;
+  }
+  // draw() into images: the same, with `a` as the target. An image of `a` may not be one of the textures of `state`.
+  virtual bool draw_images(const AccelAttachments& a, uint32_t program, const AccelState& state, ConstByteView vertices, uint32_t vertex_count, ConstByteView constants) {
+    (void)a, (void)program, (void)state, (void)vertices, (void)vertex_count, (void)constants;
     return false;
   }
 

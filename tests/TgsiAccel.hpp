@@ -42,16 +42,30 @@ struct TgsiAccel : IAccelerator {
     void* allocate_aligned(uint64_t size, uint64_t) override { return malloc(size); }
     void deallocate(void* p) override { free(p); }
   };
-  struct Prog { std::string vs, fs, gs, tcs, tes; uint32_t attributes = 0, varyings = 0, textures = 0; bool flat[16] = {}; int position = -1, face = -1; bool depth_out = false, derivatives = false; AccelStages st; };
-  struct Tex { uint32_t w = 0, h = 0; std::vector<uint8_t> rgba; std::vector<float> f; bool floats = false; };
+  struct Prog { std::string vs, fs, gs, tcs, tes; uint32_t attributes = 0, varyings = 0, textures = 0; bool flat[16] = {}; int position = -1, face = -1; bool depth_out = false, derivatives = false; int depth_reg = 1; AccelStages st; };
+  // A texture or a device image (create_image: renderable unless mipmapped; a Depth image keeps its depth in `f`, one float per texel). Mipmapped images keep level 0 only.
+  struct Tex { uint32_t w = 0, h = 0; std::vector<uint8_t> rgba; std::vector<float> f; bool floats = false; bool image = false, depth = false; uint32_t levels = 1; };
   struct Tgt { uint32_t w = 0, h = 0; std::vector<uint8_t> rgba; std::vector<float> depth; };
+  struct Surfaces;
   std::vector<Prog> progs;
   std::vector<Tex> texs;
   std::vector<Tgt> tgts;
   int draws = 0, refused = 0;
   const char* name() const override { return "tgsi reference"; }
   bool stages = true;   // (false: a device without geometry and tessellation stages)
-  AccelLimits limits() const override { return AccelLimits{256, 16, 14, 16, true, true, stages, stages, true, true, 30, upload}; }
+  AccelLimits limits() const override {
+    AccelLimits l{256, 16, 14, 16, true, true, stages, stages, true, true, 30, upload};
+    l.image_colors = images;
+    l.float_images = true;
+    l.sampled_depth = true;
+    l.mip_images = true;
+    l.instancing = true;
+    l.independent_blend = true;
+    l.depth_bias = true;
+    return l;
+  }
+  uint32_t images = 4;   // (0: a device without device images)
+  int image_reads = 0, image_writes = 0, image_draws = 0, image_clears = 0;
   bool upload = true;   // (false: a device without write_color)
   bool write_color(uint32_t target, ConstByteView rgba) override {
     if (!upload) return false;
@@ -86,12 +100,93 @@ struct TgsiAccel : IAccelerator {
       if (line.find("FACE") != std::string::npos) p.face = i;
       at = eol;
     }
-    p.depth_out = p.fs.find("DCL OUT[1], POSITION") != std::string::npos;
+    p.depth_reg = declared(p.fs, "OUT", "POSITION");
+    p.depth_out = p.depth_reg >= 0;
     p.derivatives = p.fs.find("DDX") != std::string::npos || p.fs.find("DDY") != std::string::npos;
     progs.push_back(p);
     return static_cast<uint32_t>(progs.size());
   }
   void destroy_program(uint32_t) override {}
+  uint32_t create_image(uint32_t w, uint32_t h, AccelFormat f, uint32_t levels) override {
+    if (!images || w == 0 || h == 0 || levels == 0) return 0;
+    if (levels > 1 && f != AccelFormat::Rgba8 && f != AccelFormat::Rgba8Srgb) return 0;
+    Tex t;
+    t.w = w;
+    t.h = h;
+    t.image = true;
+    t.levels = levels;
+    t.depth = f == AccelFormat::Depth;
+    t.floats = f == AccelFormat::Rgba16F || f == AccelFormat::Rgba32F;
+    if (t.depth) t.f.assign(uint64_t{w} * h, 1.0f);
+    else if (t.floats) t.f.assign(uint64_t{w} * h * 4, 0.0f);
+    else t.rgba.assign(uint64_t{w} * h * 4, 0);
+    texs.push_back(t);
+    return static_cast<uint32_t>(texs.size());
+  }
+  bool write_image(uint32_t image, uint32_t level, ConstByteView px) override {
+    Tex& t = texs.at(image - 1);
+    if (!t.image || t.depth || level >= t.levels) return false;
+    ++image_writes;
+    const uint32_t w = t.w >> level ? t.w >> level : 1, h = t.h >> level ? t.h >> level : 1;
+    if (px.size() != uint64_t{w} * h * (t.floats ? 16 : 4)) return false;
+    if (level) return true;      // (only level 0 is kept: the tests sample at the texture's own size)
+    if (t.floats) memcpy(t.f.data(), px.data(), px.size());
+    else memcpy(t.rgba.data(), px.data(), px.size());
+    return true;
+  }
+  bool read_image(uint32_t image, ByteView px) override {
+    Tex& t = texs.at(image - 1);
+    if (!t.image || t.depth) return false;
+    ++image_reads;
+    if (px.size() != uint64_t{t.w} * t.h * (t.floats ? 16 : 4)) return false;
+    if (t.floats) memcpy(px.data(), t.f.data(), px.size());
+    else memcpy(px.data(), t.rgba.data(), px.size());
+    return true;
+  }
+  // The images of `a` as a render target: false if they are not all images of one size.
+  bool surfaces(const AccelAttachments& a, Surfaces* out) {
+    out->n = a.color_count;
+    for (uint32_t i = 0; i < a.color_count; ++i) {
+      if (!a.colors[i] || a.colors[i] > texs.size()) return false;
+      Tex& t = texs[a.colors[i] - 1];
+      if (!t.image || t.depth || t.levels != 1) return false;
+      if (i == 0) { out->w = t.w; out->h = t.h; }
+      if (t.w != out->w || t.h != out->h) return false;
+      out->colors[i] = &t;
+    }
+    if (a.depth) {
+      if (a.depth > texs.size() || !texs[a.depth - 1].depth) return false;
+      Tex& d = texs[a.depth - 1];
+      if (a.color_count == 0) { out->w = d.w; out->h = d.h; }
+      if (d.w != out->w || d.h != out->h) return false;
+      out->depth = d.f.data();
+    }
+    return out->w != 0;
+  }
+  bool clear_images(const AccelAttachments& a, bool color, const float rgba[4], bool depth, float d) override {
+    Surfaces s;
+    if (!surfaces(a, &s)) return false;
+    ++image_clears;
+    for (uint64_t i = 0; i < uint64_t{s.w} * s.h; ++i) {
+      if (color)
+        for (uint32_t c = 0; c < s.n; ++c)
+          for (int k = 0; k < 4; ++k) {
+            if (s.colors[c]->floats) s.colors[c]->f[i * 4 + k] = rgba[k];
+            else s.colors[c]->rgba[i * 4 + k] = to8(rgba[k]);
+          }
+      if (depth && s.depth) s.depth[i] = d;
+    }
+    return true;
+  }
+  bool draw_images(const AccelAttachments& a, uint32_t program, const AccelState& st, ConstByteView vertices, uint32_t count, ConstByteView constants) override {
+    Surfaces s;
+    if (!surfaces(a, &s)) return false;
+    for (uint32_t k = 0; k < st.texture_count; ++k)
+      for (uint32_t i = 0; i < a.color_count; ++i)
+        if (st.textures[k] == a.colors[i] || (a.depth && st.textures[k] == a.depth)) return false;
+    ++image_draws;
+    return render(s, program, st, vertices, count, constants);
+  }
   uint32_t create_texture(uint32_t w, uint32_t h) override {
     texs.push_back(Tex{w, h, std::vector<uint8_t>(uint64_t{w} * h * 4)});
     return static_cast<uint32_t>(texs.size());
@@ -138,6 +233,7 @@ struct TgsiAccel : IAccelerator {
         const auto wrap = [](int i, int n, bool repeat) { return repeat ? ((i % n) + n) % n : (i < 0 ? 0 : (i >= n ? n - 1 : i)); };
         x = wrap(x, static_cast<int>(t.w), sm.repeat_s);
         y = wrap(y, static_cast<int>(t.h), sm.repeat_t);
+        if (t.depth) return k == 0 ? t.f[uint64_t(y) * t.w + uint64_t(x)] : (k == 3 ? 1.0f : 0.0f);
         const uint64_t at = (uint64_t(y) * t.w + uint64_t(x)) * 4 + k;
         return t.floats ? t.f[at] : t.rgba[at] / 255.0f;
       };
@@ -155,9 +251,16 @@ struct TgsiAccel : IAccelerator {
       return {r[0], r[1], r[2], r[3]};
     }
   };
+  // What a draw writes: colour images (8-bit or floats) and a depth.
+  struct Surfaces {
+    uint32_t w = 0, h = 0, n = 0;
+    Tex* colors[8] = {};
+    uint8_t* rgba8 = nullptr;   // (the default target's single colour image)
+    float* depth = nullptr;
+  };
   struct Pixels final : gpu::IFragmentSink {
     TgsiAccel* acc;
-    Tgt* t;
+    Surfaces* t;
     const Prog* p;
     const AccelState* st;
     const float* constants;
@@ -168,7 +271,7 @@ struct TgsiAccel : IAccelerator {
       if (f.x < 0 || f.y < 0 || static_cast<uint32_t>(f.x) >= t->w || static_cast<uint32_t>(f.y) >= t->h) return;
       for (uint32_t i = 0; i < 8; ++i)      // (clip distances: interpolated after the varyings, a fragment where an enabled one is below zero is cut)
         if ((st->clip_mask >> i) & 1 && f.varyings[p->varyings * 4 + i] < 0) return;
-      static tgsi_test::TgsiMachine m;
+      tgsi_test::TgsiMachine& m = machine();
       std::vector<float> vary(p->varyings * 4 + 8), log_x, log_y;
       // (the shader at pixel (px, py) with the fragment's varyings there; derivatives run it to the right and above first, as the CPU does)
       const auto run_at = [&](int32_t px, int32_t py, bool same, std::vector<float>* record) {
@@ -195,22 +298,40 @@ struct TgsiAccel : IAccelerator {
       if (p->derivatives && (!run_at(f.x + 1, f.y, false, &log_x) || !run_at(f.x, f.y + 1, false, &log_y))) { ok = false; return; }
       if (!run_at(f.x, f.y, true, nullptr)) { ok = false; return; }
       if (m.killed) return;
-      const float z = p->depth_out ? (m.out[1][2] < 0 ? 0 : (m.out[1][2] > 1 ? 1 : m.out[1][2])) : f.z;
+      float z = p->depth_out ? (m.out[p->depth_reg][2] < 0 ? 0 : (m.out[p->depth_reg][2] > 1 ? 1 : m.out[p->depth_reg][2])) : f.z;
+      if (st->depth_bias_modes & 1) z += st->depth_bias_units / 16777216.0f;      // (filled triangles: the units only - the scenes' triangles face the window)
       const uint64_t at = uint64_t(f.y) * t->w + uint64_t(f.x);
-      if (st->depth_test) {
+      if (st->depth_test && t->depth) {
         const float d = t->depth[at];
         const uint8_t op = st->custom_blend ? st->depth_compare : 3;
         const bool pass = op == 0 ? false : op == 1 ? z < d : op == 2 ? z == d : op == 3 ? z <= d : op == 4 ? z > d : op == 5 ? z != d : op == 6 ? z >= d : true;
         if (!pass) return;
       }
-      if (st->depth_write) t->depth[at] = z;
+      if (st->depth_write && t->depth) t->depth[at] = z;
+      for (uint32_t c = 0; c < (t->rgba8 ? 1u : t->n); ++c) color(c, at);
+    }
+    void color(uint32_t c, uint64_t at) {
+      static tgsi_test::TgsiMachine& m = machine();
+      const bool floats = !t->rgba8 && t->colors[c]->floats;
+      uint8_t* bytes = t->rgba8 ? t->rgba8 : (floats ? nullptr : t->colors[c]->rgba.data());
       float src[4], dst[4];
       for (int k = 0; k < 4; ++k) {
-        src[k] = m.out[0][k] < 0 ? 0 : (m.out[0][k] > 1 ? 1 : m.out[0][k]);
-        dst[k] = t->rgba[at * 4 + k] / 255.0f;
+        src[k] = floats ? m.out[c][k] : (m.out[c][k] < 0 ? 0 : (m.out[c][k] > 1 ? 1 : m.out[c][k]));
+        dst[k] = floats ? t->colors[c]->f[at * 4 + k] : bytes[at * 4 + k] / 255.0f;
       }
       float res[4] = {src[0], src[1], src[2], src[3]};
-      if (st->blend) {
+      // (per target: its own blending and mask, as AccelState::per_target says)
+      AccelState::TargetBlend own;
+      own.blend = st->blend;
+      own.src_rgb = st->custom_blend ? st->src_rgb : 4;
+      own.dst_rgb = st->custom_blend ? st->dst_rgb : 5;
+      own.src_alpha = st->custom_blend ? st->src_alpha : 4;
+      own.dst_alpha = st->custom_blend ? st->dst_alpha : 5;
+      own.op_rgb = st->custom_blend ? st->op_rgb : 0;
+      own.op_alpha = st->custom_blend ? st->op_alpha : 0;
+      own.color_mask = st->custom_blend ? st->color_mask : 15;
+      const AccelState::TargetBlend& tb = st->per_target && c < kAccelMaxColors ? st->targets[c] : own;
+      if (tb.blend) {
         const auto factor = [&](uint8_t fct, int k) {
           switch (fct) {
             case 0: return 0.0f;
@@ -228,15 +349,22 @@ struct TgsiAccel : IAccelerator {
         };
         for (int k = 0; k < 4; ++k) {
           const bool alpha = k == 3;
-          const uint8_t sf = st->custom_blend ? (alpha ? st->src_alpha : st->src_rgb) : 4, df = st->custom_blend ? (alpha ? st->dst_alpha : st->dst_rgb) : 5;
-          const uint8_t op = st->custom_blend ? (alpha ? st->op_alpha : st->op_rgb) : 0;
+          const uint8_t sf = alpha ? tb.src_alpha : tb.src_rgb, df = alpha ? tb.dst_alpha : tb.dst_rgb;
+          const uint8_t op = alpha ? tb.op_alpha : tb.op_rgb;
           const float s = src[k] * factor(sf, k), d = dst[k] * factor(df, k);
           res[k] = op == 0 ? s + d : op == 1 ? s - d : op == 2 ? d - s : op == 3 ? (src[k] < dst[k] ? src[k] : dst[k]) : (src[k] > dst[k] ? src[k] : dst[k]);
         }
       }
-      const uint8_t mask = st->custom_blend ? st->color_mask : 15;
-      for (int k = 0; k < 4; ++k)
-        if (mask & (1 << k)) t->rgba[at * 4 + k] = to8(res[k]);
+      const uint8_t mask = tb.color_mask;
+      for (int k = 0; k < 4; ++k) {
+        if (!(mask & (1 << k))) continue;
+        if (floats) t->colors[c]->f[at * 4 + k] = res[k];
+        else bytes[at * 4 + k] = to8(res[k]);
+      }
+    }
+    static tgsi_test::TgsiMachine& machine() {
+      static tgsi_test::TgsiMachine m;
+      return m;
     }
   };
   Sampling stage_textures;   // (the draw's textures for the stages before the fragment one: draw() sets it)
@@ -389,12 +517,27 @@ struct TgsiAccel : IAccelerator {
     return true;
   }
   bool draw(uint32_t target, uint32_t program, const AccelState& st, ConstByteView vertices, uint32_t count, ConstByteView constants) override {
+    Tgt& tg = tgts.at(target - 1);
+    Surfaces s;
+    s.w = tg.w;
+    s.h = tg.h;
+    s.n = 1;
+    s.rgba8 = tg.rgba.data();
+    s.depth = tg.depth.data();
+    return render(s, program, st, vertices, count, constants);
+  }
+  bool render(Surfaces& t, uint32_t program, const AccelState& st, ConstByteView vertices, uint32_t count, ConstByteView constants) {
     ++draws;
-    Tgt& t = tgts.at(target - 1);
     const Prog& p = progs.at(program - 1);
     const float* vf = reinterpret_cast<const float*>(vertices.data());
     const float* cf = reinterpret_cast<const float*>(constants.data());
     const uint32_t rows = static_cast<uint32_t>(constants.size() / 16);
+    // (instancing: the vertices again for each instance, the per-instance attributes from after the vertices, INSTANCEID the instance)
+    const uint32_t instances = st.instances ? st.instances : 1;
+    uint32_t per_vertex = 0, per_instance = 0;
+    for (uint32_t a = 0; a < p.attributes; ++a) ((st.instanced >> a) & 1 ? per_instance : per_vertex)++;
+    const uint32_t vertices_once = count;
+    count *= instances;
     std::vector<gpu::RVertex> vs(count);
     std::vector<Vtx> vouts(count);
     stage_textures.acc = this;
@@ -403,8 +546,14 @@ struct TgsiAccel : IAccelerator {
       static Machine m;
       m = Machine();
       stage_machine(m, cf, rows);
-      for (uint32_t a = 0; a < p.attributes; ++a)
-        for (int k = 0; k < 4; ++k) m.in[a][k] = vf[(v * p.attributes + a) * 4 + k];
+      const uint32_t vertex = v % vertices_once, instance = v / vertices_once;
+      uint32_t pv = 0, pi = 0;
+      for (uint32_t a = 0; a < p.attributes; ++a) {
+        const bool inst = (st.instanced >> a) & 1;
+        const uint64_t at = inst ? (uint64_t{vertices_once} * per_vertex + uint64_t{instance} * per_instance + pi++) * 4 : (uint64_t{vertex} * per_vertex + pv++) * 4;
+        for (int k = 0; k < 4; ++k) m.in[a][k] = vf[at + k];
+      }
+      set_sv(m, p.vs, "INSTANCEID", instance);
       if (!m.run(p.vs)) { if (getenv("TGSI_TRACE")) printf("%s\n", p.vs.c_str()); ++refused; return false; }
       memcpy(vouts[v].r, m.out, sizeof vouts[v].r);
       for (int k = 0; k < 4; ++k) vs[v].pos[k] = m.out[0][k];

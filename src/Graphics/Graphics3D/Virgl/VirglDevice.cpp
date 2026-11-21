@@ -226,7 +226,8 @@ class VirglImage final : public IImage {
     // A sampled image is stored top row first, the way write_pixels() gives it and the sampler reads it, so it does not take the Y_0_TOP flip of the images that are only
     // drawn into (and shown).
     const bool sampled = (desc.usage & kImageSampled) != 0;
-    uint32_t bind = depth ? virgl::kBindDepthStencil : (virgl::kBindRenderTarget | virgl::kBindSamplerView);
+    // (a sampled depth image - kFeatureSampledDepth - is a sampler view too)
+    uint32_t bind = depth ? (virgl::kBindDepthStencil | (sampled ? virgl::kBindSamplerView : 0u)) : (virgl::kBindRenderTarget | virgl::kBindSamplerView);
     if (desc.usage & kImagePresent) bind |= virgl::kBindScanout;
     // A volume has its slices as the depth; an array or a cube its layers as the array size (a cube: six).
     const uint32_t layers = layer_count();
@@ -252,7 +253,7 @@ class VirglImage final : public IImage {
       view_ = device.new_handle();
       // (the layers the view shows: all of an array's or a cube's; a volume's slices are not layers)
       const uint32_t last_layer = desc.kind == TextureKind::Texture2DArray || desc.kind == TextureKind::TextureCube ? layers - 1 : 0;
-      const uint32_t cmd[] = {virgl::header(virgl::kCreateObject, virgl::kObjectSamplerView, 6), view_, id_, color_format_, last_layer << 16, (desc.mip_levels - 1) << 8 /* first level | last level << 8 */, virgl::kSwizzleRgba};
+      const uint32_t cmd[] = {virgl::header(virgl::kCreateObject, virgl::kObjectSamplerView, 6), view_, id_, depth ? depth_format : color_format_, last_layer << 16, (desc.mip_levels - 1) << 8 /* first level | last level << 8 */, virgl::kSwizzleRgba};
       ok_ = device.send_commands(cmd, 7);
     }
   }
@@ -676,14 +677,15 @@ class VirglPipeline final : public VirglPipelineBase {
     cmd[n++] = virgl::header(virgl::kCreateObject, virgl::kObjectRasterizer, 9);
     cmd[n++] = rasterizer_;
     cmd[n++] = (1u << 1) /*depth clip*/ | (1u << 2) /*clip half z*/ | (desc.stream_output_count && desc.rasterized_stream < 0 ? 1u << 3 : 0u) /*rasterizer discard*/ | (cull << 8) | (1u << 14) /*scissor*/ |
-               ((front_ccw ? 1u : 0u) << 15) | (desc.multisample ? 1u << 25 : 0u) /*multisample*/ | (1u << 29) /*half pixel center*/ | (1u << 30) /*bottom edge rule*/;
+               ((front_ccw ? 1u : 0u) << 15) | (desc.multisample ? 1u << 25 : 0u) /*multisample*/ | (1u << 29) /*half pixel center*/ | (1u << 30) /*bottom edge rule*/ |
+               ((desc.depth_bias_modes & 2u) ? 1u << 18 : 0u) /*offset line*/ | ((desc.depth_bias_modes & 4u) ? 1u << 19 : 0u) /*offset point*/ | ((desc.depth_bias_modes & 1u) ? 1u << 20 : 0u) /*offset tri*/;
     cmd[n++] = float_bits(1.0f);  // point size
     cmd[n++] = 0;                 // sprite coord enable
     cmd[n++] = uint32_t{desc.clip_distances} << 24;   // line stipple, clip planes (the clip distances enabled)
     cmd[n++] = float_bits(1.0f);  // line width
-    cmd[n++] = 0;
-    cmd[n++] = 0;
-    cmd[n++] = 0;
+    cmd[n++] = float_bits(desc.depth_bias_modes ? desc.depth_bias_units : 0.0f);   // offset units
+    cmd[n++] = float_bits(desc.depth_bias_modes ? desc.depth_bias_slope : 0.0f);   // offset scale
+    cmd[n++] = 0;                 // offset clamp (none)
 
     // Vertex elements. Element n is the vertex shader's input n on the host, so they are laid out by location (a location nothing feeds repeats the first attribute: the
     // shader does not read it). The host keeps the instance divisor with a buffer binding, so every vertex buffer slot in use gets a binding for its per-vertex attributes and
@@ -850,9 +852,11 @@ IImage* VirglDevice::create_image(const ImageDesc& desc) {
   } else if (desc.layers != 1) {
     return nullptr;
   }
-  // A texture is not drawn into: the two kinds of image are stored in opposite row order (see VirglImage).
-  if ((desc.usage & kImageSampled) && (desc.usage & (kImageDepthAttachment | kImagePresent))) return nullptr;
-  if ((desc.usage & kImageSampled) && desc.format != Format::B8G8R8A8Unorm && desc.format != Format::B8G8R8A8Srgb && desc.format != Format::R8G8B8A8Unorm && desc.format != Format::R8G8B8A8Srgb && !is_wide_format(desc.format)) return nullptr;
+  // A sampled image is stored upright, an image only drawn into (and shown) the other way up (see VirglImage): a shown image is not sampled. A depth image that is
+  // sampled (kFeatureSampledDepth) is upright like the colour images it is drawn with, which are sampled too (a framebuffer object's).
+  if ((desc.usage & kImageSampled) && (desc.usage & kImagePresent)) return nullptr;
+  if ((desc.usage & kImageSampled) && (desc.usage & kImageDepthAttachment) && (desc.format != Format::D32Float || desc.stencil || desc.mip_levels != 1 || desc.kind != TextureKind::Texture2D)) return nullptr;
+  if ((desc.usage & kImageSampled) && desc.format != Format::B8G8R8A8Unorm && desc.format != Format::B8G8R8A8Srgb && desc.format != Format::R8G8B8A8Unorm && desc.format != Format::R8G8B8A8Srgb && !is_wide_format(desc.format) && desc.format != Format::D32Float) return nullptr;
   if (!desc.extent.width || !desc.extent.height || desc.format == Format::Undefined) return nullptr;
   if (desc.stencil && desc.format != Format::D32Float) return nullptr;
   VirglImage* image = make<VirglImage>(gpu_.allocator(), *this, desc);

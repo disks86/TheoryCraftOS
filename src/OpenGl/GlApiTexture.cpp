@@ -199,13 +199,14 @@ uint64_t GlApi::glAreTexturesResident(GLsizei n, UserPtr textures, UserPtr resid
 
 // --- Images ---------------------------------------------------------------------------------------------------------------------------------------------------
 
-webgl::Texture* GlApi::texture_for_target(uint32_t target, uint32_t* face) {
+webgl::Texture* GlApi::texture_for_target(uint32_t target, uint32_t* face, bool pixels) {
   *face = 0;
   if (is_cube_face(target)) *face = target - GL_TEXTURE_CUBE_MAP_POSITIVE_X;
   uint32_t* slot = gl_.bound_texture_slot(target);
   if (!slot) { error(GL_INVALID_ENUM); return nullptr; }
   webgl::Texture* t = gl_.texture_at(*slot);
   if (!t) { error(GL_INVALID_OPERATION); return nullptr; }
+  if (pixels) gl_.hw_sync_texture(*t);
   return t;
 }
 
@@ -465,7 +466,7 @@ void GlApi::glGetTexImage(GLenum target, GLint level, GLenum format, GLenum type
 
 void GlApi::tex_parameter_values(uint32_t target, uint32_t pname, const double* v, uint32_t) {
   uint32_t face;
-  webgl::Texture* t = texture_for_target(target, &face);
+  webgl::Texture* t = texture_for_target(target, &face, false);
   if (!t) return;
   switch (pname) {
     case GL_TEXTURE_BORDER_COLOR: for (int i = 0; i < 4; ++i) t->border_color[i] = static_cast<float>(v[i]); ++gl_.version_; return;
@@ -577,7 +578,7 @@ void GlApi::glTexBuffer(GLenum target, GLenum internalformat, GLuint buffer) {
 
 bool GlApi::tex_parameter_get(uint32_t target, uint32_t pname, double* out, uint32_t* count) {
   uint32_t face;
-  webgl::Texture* t = texture_for_target(target, &face);
+  webgl::Texture* t = texture_for_target(target, &face, false);
   if (!t) return false;
   *count = 1;
   switch (pname) {
@@ -651,7 +652,7 @@ bool GlApi::tex_level_get(uint32_t target, int32_t level, uint32_t pname, double
     fi = internal ? format_for(internal) : nullptr;
   } else {
     uint32_t face;
-    webgl::Texture* t = texture_for_target(target, &face);
+    webgl::Texture* t = texture_for_target(target, &face, false);
     if (!t) return false;
     if (level < 0 || level >= static_cast<int32_t>(webgl::kMaxLevels)) { error(GL_INVALID_VALUE); return false; }
     if (target == GL_TEXTURE_BUFFER) {      // (glTexBuffer's buffer, not an image)

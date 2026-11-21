@@ -70,6 +70,18 @@ struct Val {
   bool sshadow = false, sfloat = false;
 };
 
+// The reason for an assignment of `v` to `want` channels of another shape (as builtin_why: static strings).
+const char* shape_why(const Val& v, uint32_t want) {
+  static const char* const kWhy[4][6] = {
+      {"assignment of a float to 1 channel", "assignment of a vec2 to 1 channel", "assignment of a vec3 to 1 channel", "assignment of a vec4 to 1 channel", "assignment of a matrix to 1 channel", "assignment of a structure, array or sampler to 1 channel"},
+      {"assignment of a float to 2 channels", "assignment of a vec2 to 2 channels", "assignment of a vec3 to 2 channels", "assignment of a vec4 to 2 channels", "assignment of a matrix to 2 channels", "assignment of a structure, array or sampler to 2 channels"},
+      {"assignment of a float to 3 channels", "assignment of a vec2 to 3 channels", "assignment of a vec3 to 3 channels", "assignment of a vec4 to 3 channels", "assignment of a matrix to 3 channels", "assignment of a structure, array or sampler to 3 channels"},
+      {"assignment of a float to 4 channels", "assignment of a vec2 to 4 channels", "assignment of a vec3 to 4 channels", "assignment of a vec4 to 4 channels", "assignment of a matrix to 4 channels", "assignment of a structure, array or sampler to 4 channels"}};
+  if (want < 1 || want > 4) return "assignment of another shape";
+  const uint32_t have = v.kind ? 5 : (v.cols != 1 ? 4 : (v.rows >= 1 && v.rows <= 4 ? v.rows - 1u : 4u));
+  return kWhy[want - 1][have];
+}
+
 // A variable: one temporary per column.
 struct Var {
   bool valid = false;
@@ -158,6 +170,24 @@ struct Boundary {
 };
 
 // What both stages share while they are translated.
+// The reasons a draw's statistics give for a built-in variable or an assignment the translation does not take (static strings: the statistics keep the pointers).
+const char* builtin_why(int32_t builtin) {
+  switch (builtin) {
+    case kBvPointCoord: return "a built-in variable: gl_PointCoord";
+    case kBvFragCoord: return "a built-in variable: gl_FragCoord outside a fragment shader";
+    case kBvFrontFacing: return "a built-in variable: gl_FrontFacing outside a fragment shader";
+    case kBvInstanceIndex: return "a built-in variable: gl_InstanceID outside a vertex shader";
+    case kBvVertexIndex: return "a built-in variable: gl_VertexID outside a vertex shader";
+    case kBvSampleIndex: return "a built-in variable: gl_SampleID";
+    case kBvSampleMask: return "a built-in variable: gl_SampleMask";
+    case kBvBaseVertex: return "a built-in variable: gl_BaseVertex";
+    case kBvBaseInstance: return "a built-in variable: gl_BaseInstance";
+    case kBvClipDistance: return "a built-in variable: gl_ClipDistance in a fragment shader";
+    case kBvFragData: case kBvFragDepth: return "a built-in variable: a fragment output outside a fragment shader";
+    default: return "a built-in variable";
+  }
+}
+
 struct Shared {
   Shared(TgsiProgram* p, ArrayView<const TgsiLink> l, const TgsiLimits& lim) : out(p), links(l), limits(lim), bounds{Boundary(p->vs.allocator()), Boundary(p->vs.allocator()),
                                                                                                                         Boundary(p->vs.allocator()), Boundary(p->vs.allocator())} {
@@ -619,12 +649,14 @@ class Gen {
   int32_t position_in = -1, face_in = -1;   // a fragment shader's gl_FragCoord / gl_FrontFacing inputs
   int32_t primitive_in = -1;                 // a geometry shader's gl_PrimitiveIDIn input
   bool clip_out = false;                     // the stage writes CLIPDIST[0], CLIPDIST[1] after its varyings
-  bool depth_out = false;                    // a fragment shader writes gl_FragDepth (OUT[1], POSITION: its z)
+  bool depth_out = false;                    // a fragment shader writes gl_FragDepth (OUT[color_outs], POSITION: its z)
+  uint32_t color_outs = 1;                   // a fragment shader's colour outputs OUT[0 .. color_outs - 1] (TgsiProgram::color_outputs)
   uint32_t samplers_used = 0;                // the program's samplers this stage reads: SAMP[0 .. samplers_used - 1] (TgsiProgram::samplers is the program's)
   bool uses_addr = false;                    // ARL (a uniform array indexed by a variable)
   static constexpr uint32_t kMaxSystemValues = 4;
   const char* sv_names[kMaxSystemValues] = {};   // SV[i]'s semantic
   uint32_t nsv = 0;
+  int32_t instance_temp_ = -1;               // a vertex shader's gl_InstanceID: its temporary (the INSTANCEID system value as a float), or -1
   uint8_t stage() const { return stage_; }
   const Module& module() const { return m_; }
   const Boundary* in_boundary() const { return in_; }
@@ -1215,9 +1247,15 @@ bool Gen::global_val(uint64_t gi, Val* out) {
         out->num = kNumInt;
         return true;
       }
+      if (g.kind == GlobalKind::Builtin && vs_ && g.builtin == kBvInstanceIndex && instance_temp_ >= 0) {      // gl_InstanceID: the INSTANCEID system value (run())
+        *out = Val();
+        out->c[0] = filled('T', static_cast<uint16_t>(instance_temp_), 1);
+        out->num = kNumInt;
+        return true;
+      }
       if (g.kind == GlobalKind::Builtin && g.builtin != kBvPosition && g.builtin != kBvPointSize && g.builtin != kBvFragColor && !(fs_ && (g.builtin == kBvFragData || g.builtin == kBvFragDepth)) &&
           !(!fs_ && g.builtin == kBvClipDistance))
-        return fail("a built-in variable");
+        return fail(builtin_why(g.builtin));
       if ((g.builtin == kBvFragColor) != (fs_ && g.builtin == kBvFragColor) || (!fs_ && g.builtin == kBvFragColor)) return fail("gl_FragColor in a vertex shader");
       if (fs_ && (g.builtin == kBvPosition || g.builtin == kBvPointSize)) return fail("a vertex output in a fragment shader");
       if (stage_ == kStControl && g.kind == GlobalKind::Out && g.per_vertex) return fail("a control stage output of another invocation, or all of them");
@@ -1356,7 +1394,7 @@ bool Gen::store(const LV& l, const Val& v_in) {
     for (uint32_t c = 0; c < l.cols; ++c) inst_rows("MOV", l.temp[c], l.rows, &v.c[c]);
     return true;
   }
-  if (v.cols != 1 || v.rows != l.n) return fail("assignment of another shape");
+  if (v.cols != 1 || v.rows != l.n) return fail(shape_why(v, l.n));
   Oper s = v.c[0];
   bool used[4] = {false, false, false, false};
   for (uint32_t j = 0; j < l.n; ++j) {
@@ -3095,7 +3133,7 @@ bool Gen::cond_store(const LV& l, const Val& v_in, const Oper& t) {
     }
     return true;
   }
-  if (v.cols != 1 || v.rows != l.n) return fail("assignment of another shape");
+  if (v.cols != 1 || v.rows != l.n) return fail(shape_why(v, l.n));
   Oper src = v.c[0];
   bool used[4] = {false, false, false, false};
   for (uint32_t j = 0; j < l.n; ++j) {
@@ -3290,7 +3328,7 @@ bool Gen::indexed_swizzle_store(const Node& n, const Val& v_in, bool* done) {
   if (!swizzle_indices(n, idx, &count)) return false;
   Val v = v_in;
   if (!to_float(v)) return false;
-  if (v.kind || v.cols != 1 || v.rows != count) return fail("assignment of another shape");
+  if (v.kind || v.cols != 1 || v.rows != count) return fail(shape_why(v, count));
   Oper src = v.c[0];
   bool used[4] = {false, false, false, false};
   for (uint32_t j = 0; j < count; ++j) {
@@ -4020,6 +4058,24 @@ bool Gen::run() {
     inst("MOV", fns_[0].flag, "x", &zero);
   }
   if (!vs_ && !fs_ && !stage_start()) return false;
+  if (vs_) {      // gl_InstanceID: the INSTANCEID system value, as a float in a temporary from the start (a read may be anywhere)
+    const int32_t ii = m_.find_builtin_global(kBvInstanceIndex);
+    if (ii >= 0 && m_.globals[static_cast<uint64_t>(ii)]->referenced) {
+      uint16_t t;
+      if (nsv >= kMaxSystemValues) return fail("a system value the device cannot take");
+      if (!new_temp(&t)) return false;
+      const uint32_t k = nsv++;
+      sv_names[k] = "INSTANCEID";
+      begin_inst("I2F");
+      body.append(" TEMP[");
+      body.append_uint(t);
+      body.append("].x, SV[");
+      body.append_uint(k);
+      body.append("].xxxx");
+      end_inst();
+      instance_temp_ = t;
+    }
+  }
   if (!uniform_arrays()) return false;
   // globals with an initializer (`float g = 1.0;` at file scope): the initializers run first, in their order
   for (uint64_t gi = 0; gi < m_.globals.count(); ++gi) {
@@ -4070,33 +4126,73 @@ bool Gen::run() {
   if (vs_ || stage_ == kStEval) return write_vertex_outputs();
   if (stage_ == kStGeometry) return true;      // (its vertices went out at each EmitVertex())
   if (stage_ == kStControl) return control_end();
-  // fragment: gl_FragDepth (the z of a POSITION output), then the first color output
+  // fragment: the colour outputs, each to its draw buffer's COLOR register, then gl_FragDepth (the z of the POSITION output after them)
+  struct ColorOut {
+    uint32_t location;
+    uint16_t temp;
+  };
+  ColorOut colors[kTgsiMaxColors];
+  uint32_t ncolors = 0, highest = 0;
+  const auto add_color = [&](int32_t location, uint16_t temp) {
+    // (a draw buffer the device does not have is not written)
+    if (location < 0 || static_cast<uint32_t>(location) >= sh_.limits.colors || static_cast<uint32_t>(location) >= kTgsiMaxColors) return true;
+    for (uint32_t k = 0; k < ncolors; ++k)
+      if (colors[k].location == static_cast<uint32_t>(location)) return fail("two colour outputs for one draw buffer");
+    colors[ncolors++] = ColorOut{static_cast<uint32_t>(location), temp};
+    if (static_cast<uint32_t>(location) + 1 > highest) highest = static_cast<uint32_t>(location) + 1;
+    return true;
+  };
+  const ArrayView<const TgsiOutput> outputs = sh_.stages.outputs;
+  for (uint64_t gi = 0; gi < m_.globals.count(); ++gi) {
+    const Global& g = *m_.globals[gi];
+    const bool legacy = (g.builtin == kBvFragColor || g.builtin == kBvFragData) && g.referenced;
+    const bool modern = g.kind == GlobalKind::Out && g.builtin == kBvNone && (!outputs.empty() || (!g.type.array && g.location <= 0));
+    if (!legacy && !modern) continue;
+    if (g.type.base != Base::Float || g.type.rows != 4 || g.type.cols != 1) return fail("a color output that is not a vec4");
+    Var v;
+    if (!global_var(gi, &v) || v.is_struct) return false;
+    // (gl_FragData and an array output: one draw buffer per element; without link information only the first output, to draw buffer 0, as before)
+    const uint32_t elements = v.count && (g.builtin == kBvFragData || !outputs.empty()) ? v.count : 1;
+    for (uint32_t e = 0; e < elements; ++e) {
+      const Var& c = v.count ? elems_[v.first + e] : v;
+      int32_t location = 0;
+      if (g.builtin == kBvFragData) {
+        location = static_cast<int32_t>(e);
+      } else if (g.builtin == kBvNone && !outputs.empty()) {
+        location = -1;
+        const uint32_t slot = g.slot + e * 4;
+        for (const TgsiOutput& o : outputs)
+          if (o.slot == slot) location = o.location;
+      }
+      if (!add_color(location, c.temp[0])) return false;
+    }
+    if (outputs.empty() && g.builtin != kBvFragData) break;
+  }
+  for (uint32_t k = 0; k < ncolors; ++k) out_mov(colors[k].location, "xyzw", filled('T', colors[k].temp, 4));
+  Oper zero;
+  if (!scalar_imm(0.0f, &zero)) return false;
+  // (a draw buffer below the highest written one that no output writes: zero)
+  for (uint32_t loc = 0; loc < highest; ++loc) {
+    bool written = false;
+    for (uint32_t k = 0; k < ncolors; ++k) written = written || colors[k].location == loc;
+    if (!written) out_mov(loc, "xyzw", zero);
+  }
+  if (ncolors == 0) {
+    // no color output: OUT[0] is zero, and the draw writes none of it (TgsiProgram::no_color)
+    out_mov(0, "xyzw", zero);
+    sh_.out->no_color = true;
+    highest = 1;
+  }
+  sh_.out->color_outputs = highest;
+  color_outs = highest;
   for (uint64_t gi = 0; gi < m_.globals.count(); ++gi) {
     const Global& g = *m_.globals[gi];
     if (g.builtin != kBvFragDepth || !g.referenced) continue;
     Var v;
     if (!global_var(gi, &v) || v.count || v.is_struct) return fail("a depth output the device cannot take");
-    out_mov(1, "z", component(filled('T', v.temp[0], 1), 0));
+    out_mov(highest, "z", component(filled('T', v.temp[0], 1), 0));
     depth_out = true;
   }
-  for (uint64_t gi = 0; gi < m_.globals.count(); ++gi) {
-    const Global& g = *m_.globals[gi];
-    const bool legacy = (g.builtin == kBvFragColor || g.builtin == kBvFragData) && g.referenced;
-    const bool modern = g.kind == GlobalKind::Out && g.builtin == kBvNone && !g.type.array && (g.location <= 0);
-    if (!legacy && !modern) continue;
-    if (g.type.base != Base::Float || g.type.rows != 4 || g.type.cols != 1) return fail("a color output that is not a vec4");
-    Var v;
-    if (!global_var(gi, &v)) return false;
-    // (gl_FragData: the first draw buffer's, the only one the device's target has)
-    const Var& c = v.count ? elems_[v.first] : v;
-    out_mov(0, "xyzw", filled('T', c.temp[0], 4));
-    return true;
-  }
-  // no color output: OUT[0] is zero, and the draw writes none of it (TgsiProgram::no_color)
-  Oper zero;
-  if (!scalar_imm(0.0f, &zero)) return false;
-  out_mov(0, "xyzw", zero);
-  sh_.out->no_color = true;
   return true;
 }
 
@@ -4770,8 +4866,21 @@ bool assemble(String& out, const Gen& g, const Shared& sh, uint32_t attributes, 
       out.append_uint(static_cast<uint32_t>(g.face_in));
       out.append("], FACE, CONSTANT\n");
     }
-    out.append("DCL OUT[0], COLOR\n");
-    if (g.depth_out) out.append("DCL OUT[1], POSITION\n");
+    for (uint32_t k = 0; k < g.color_outs; ++k) {
+      out.append("DCL OUT[");
+      out.append_uint(k);
+      out.append(k ? "], COLOR[" : "], COLOR");
+      if (k) {
+        out.append_uint(k);
+        out.push_back(']');
+      }
+      out.push_back('\n');
+    }
+    if (g.depth_out) {
+      out.append("DCL OUT[");
+      out.append_uint(g.color_outs);
+      out.append("], POSITION\n");
+    }
   } else {
     out.append("VERT\n");
     if (g.clip_out) out.append("PROPERTY NUM_CLIPDIST_ENABLED 8\n");

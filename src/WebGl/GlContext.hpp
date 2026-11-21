@@ -54,6 +54,37 @@ struct FormatInfo {
 const FormatInfo* find_format(uint32_t internal);
 uint32_t texel_bytes(Store s);
 
+// The 3D hardware's copy of an image (GlAccel.cpp): a device image (IAccelerator::create_image) that accelerated draws render into or sample. Either the copy is
+// the image's pixels as they were at Image::version() `synced`, or it is `ahead`: the device drew into it since, and the CPU's pixels are older (GlContext::
+// hw_sync_image brings them back before anything on the CPU uses them). A depth image's copy cannot be read back: what a device clear left in it is remembered
+// (`cleared`) so the CPU can do the same clear.
+struct AccelImage {
+  AccelImage() = default;
+  AccelImage(const AccelImage&) = delete;
+  AccelImage& operator=(const AccelImage&) = delete;
+  ~AccelImage() {
+    set_ahead(false);
+    if (owner && handle) owner->destroy_texture(handle);
+  }
+  void set_ahead(bool now) {
+    if (now == ahead) return;
+    ahead = now;
+    if (ahead_count) *ahead_count += now ? 1 : -1;
+  }
+  IAccelerator* owner = nullptr;
+  uint32_t handle = 0;
+  AccelFormat format = AccelFormat::Rgba8;
+  uint32_t w = 0, h = 0, levels = 1;
+  uint64_t synced = 0;           // the Image::version() the copy holds (0: none - the copy is out of date unless ahead)
+  bool ahead = false;            // (set_ahead: the share group counts the images that are ahead, GlObjects::hw_ahead)
+  int32_t* ahead_count = nullptr;
+  bool cleared = false;          // a depth copy: a device clear to cleared_value is all that happened to it since it was last in step with the CPU's
+  float cleared_value = 1;
+  // A depth copy the CPU wanted while it was ahead with more than a clear in it: the CPU went on with its older depth (at this version), the device keeps its own
+  // unless the CPU writes the image after that (0: no such time).
+  uint64_t cpu_seen = 0;
+};
+
 struct Image {
   explicit Image(allocators::IAllocator& a) : px(a) {}
   uint32_t w = 0, h = 0, d = 1;   // (for a multisampled image these are the stored samples: ss x ss of them per pixel)
@@ -63,9 +94,21 @@ struct Image {
   const FormatInfo* info = nullptr;
   ByteBuffer px;
   bool defined() const { return info != nullptr && w > 0 && h > 0; }
-  uint8_t* texel(uint32_t x, uint32_t y, uint32_t z) { return px.writable_view().data() + ((uint64_t{z} * h + y) * w + x) * texel_bytes(info->store); }
+  // (every write of the pixels goes through texel(), write_texel() or allocate(), or calls touched(): the version then changes)
+  uint8_t* texel(uint32_t x, uint32_t y, uint32_t z) {
+    changed_ = true;
+    return px.writable_view().data() + ((uint64_t{z} * h + y) * w + x) * texel_bytes(info->store);
+  }
+  void touched() { changed_ = true; }
+  // A number that is new whenever the pixels changed since it was last asked for (never 0, never one another image had).
+  uint64_t version();
+  UniquePointer<AccelImage> hw;   // the 3D hardware's copy (GlAccel.cpp), or none
   const uint8_t* texel(uint32_t x, uint32_t y, uint32_t z) const { return px.view().data() + ((uint64_t{z} * h + y) * w + x) * texel_bytes(info->store); }
   bool allocate(const FormatInfo* fi, uint32_t width, uint32_t height, uint32_t depth);
+
+ private:
+  uint64_t version_ = 0;
+  bool changed_ = true;
 };
 
 struct Color4 {
@@ -127,6 +170,10 @@ struct Texture {
   uint32_t depth_mode = 0x1909;           // GL_DEPTH_TEXTURE_MODE: GL_LUMINANCE
   uint32_t swizzle[4] = {0x1903, 0x1904, 0x1905, 0x1906};
   bool stencil_mode = false;              // GL_DEPTH_STENCIL_TEXTURE_MODE is GL_STENCIL_INDEX
+  // The 3D hardware's copy of its mipmap levels (sampled with a mipmapped filter; GlAccel.cpp): which level each of its levels is, at which Image::version().
+  UniquePointer<AccelImage> hw_mips;
+  int32_t hw_mip_base = 0;
+  uint64_t hw_mip_versions[kMaxLevels] = {};
 };
 
 struct SamplerObj {
@@ -423,6 +470,8 @@ struct BufferBinding {
 // feedback objects stay per context, as GL says.
 struct GlObjects {
   explicit GlObjects(allocators::IAllocator& a) : buffers(a), textures(a), rbos(a), shaders(a), programs(a), samplers(a) {}
+  // the images of these textures and renderbuffers whose 3D hardware copy is newer than their pixels (AccelImage::ahead; first: it outlives them)
+  int32_t hw_ahead = 0;
   List<UniquePointer<Buffer>> buffers;
   List<UniquePointer<Texture>> textures;
   List<UniquePointer<Renderbuffer>> rbos;
@@ -502,13 +551,17 @@ class GlContext final : public shader::ITextureHost {
   // How the draws of the default framebuffer went: on the 3D hardware or on the CPU, and why the last one the hardware did not take was refused (a static string).
   struct HardwareStats {
     uint64_t gpu_draws = 0, cpu_draws = 0;
+    uint64_t gpu_clears = 0;   // clears of framebuffer objects done on the device (the default framebuffer's are not counted)
     const char* last_refusal = nullptr;
     // the reasons draws went to the CPU, and how many each (the first kReasons distinct ones)
-    static constexpr uint32_t kReasons = 8;
+    static constexpr uint32_t kReasons = 16;
     struct Reason { const char* why = nullptr; uint64_t count = 0; } reasons[kReasons];
     void refused(const char* why) {
       ++cpu_draws;
       last_refusal = why;
+      note(why);
+    }
+    void note(const char* why) {      // (a reason counted without a draw: something the CPU had to do for the hardware's draws)
       for (Reason& r : reasons) {
         if (r.why == why || !r.why) {
           r.why = why;
@@ -519,6 +572,11 @@ class GlContext final : public shader::ITextureHost {
     }
   };
   const HardwareStats& hardware_stats() const { return hw_stats_; }
+  void reset_hardware_stats() { hw_stats_ = HardwareStats(); }
+  // The 3D hardware's copies of images that are newer than the CPU's pixels come back (GlAccel.cpp): one texture's, or all of the share group's. Whatever reads or
+  // writes a texture's pixels on the CPU calls one of these first.
+  void hw_sync_texture(Texture& t);
+  void hw_sync_images();
   GlContext& operator=(const GlContext&) = delete;
 
   bool valid() const { return valid_; }
@@ -781,7 +839,7 @@ class GlContext final : public shader::ITextureHost {
 
   Image* texture_image(Texture* t, uint32_t target, int32_t level);   // the image for a (face) target and level, or null
   Image* make_texture_image(Texture* t, uint32_t target, int32_t level);
-  Texture* bound_texture_for(uint32_t target, uint32_t* face);
+  Texture* bound_texture_for(uint32_t target, uint32_t* face, bool pixels = true);   // (pixels: what the caller does reads or writes them - see hw_sync_texture)
   uint32_t* bound_texture_slot(uint32_t target);
   static uint32_t face_index(uint32_t target);
   bool texture_complete(const Texture& t, const SamplerObj& s, bool* is_cube) const;
@@ -806,7 +864,8 @@ class GlContext final : public shader::ITextureHost {
   };
   bool resolve_image(const Attachment& at, Image** img, uint32_t* layer, uint32_t select = 0);
   static uint32_t attachment_layers(const Attachment& at, const Image& im);
-  void resolve_target(uint32_t fb, bool draw, Target* t, uint32_t select_layer = 0);
+  // (`sync`: the 3D hardware's copies of the images that are newer come back first - see hw_sync_image; false for a target that may be drawn on the device)
+  void resolve_target(uint32_t fb, bool draw, Target* t, uint32_t select_layer = 0, bool sync = true);
   bool framebuffer_complete(uint32_t fb, uint32_t* status);
 
   void link_failed(ProgramObj* p, StringView why);
@@ -936,6 +995,15 @@ class GlContext final : public shader::ITextureHost {
   bool hw_draw(ProgramObj& p, const Target& target, uint32_t mode, int32_t first, int32_t count, uint32_t index_type, const uint8_t* idx, bool indexed, int32_t instances);
   bool hw_draw_inner(ProgramObj& p, const Target& target, uint32_t mode, int32_t first, int32_t count, uint32_t index_type, const uint8_t* idx, bool indexed, int32_t instances,
                      const char** why);
+  // Framebuffer objects and textures on the 3D hardware: each image's device copy (Image::hw).
+  bool hw_format(const Image& im, AccelFormat* format, const char** why) const;
+  AccelImage* hw_image(Image& im, AccelFormat format, const char** why);
+  bool hw_current(Image& im, AccelImage& copy);
+  void hw_sync_image(Image& im);
+  void hw_sync_target(const Target& t);
+  bool hw_fbo_clear(uint32_t mask, const Target& t);
+  static bool hw_fbo_colors(const Target& t, uint32_t* count, const char** why);
+  bool hw_mip_texture(Texture& t, const SamplerObj& so, uint32_t* handle, AccelSampler* sampler, const char** why);
 };
 
 // Vertex fetch shared by the software and accelerated draws (GlDraw.cpp): the four float lanes (as bit patterns, missing ones 0, 0, 0, 1) of the attribute element at

@@ -50,7 +50,15 @@ constexpr uint32_t kTgsiMaxSamplers = 16;
 struct TgsiLimits {
   uint32_t const_rows = 8, attributes = 4, varyings = 4, samplers = 2;
   uint32_t control_varyings = 0;   // the registers per control point from a tessellation control stage to the evaluation stage (0: `varyings`)
+  uint32_t colors = 1;             // the colour outputs a fragment shader may have (OUT[0 .. colors - 1], COLOR[n]: draw buffer n)
 };
+
+// A colour output of a fragment shader: its slot in the shader's private region and the draw buffer (location) the program's link gave it.
+struct TgsiOutput {
+  uint32_t slot = 0;
+  int32_t location = 0;
+};
+constexpr uint32_t kTgsiMaxColors = 8;
 
 // A varying the vertex shader writes and the fragment shader reads: their private slots and the number of floats.
 struct TgsiLink {
@@ -117,6 +125,8 @@ struct TgsiStages {
   // The last stage before the rasterizer puts out eight clip distances (CLIPDIST[0], CLIPDIST[1]), as the CPU path has them: its gl_ClipDistance, or the user planes
   // against its gl_ClipVertex, or (compatibility) its gl_Position; +1 (inside) when it has none of them.
   bool clip = false;
+  // The fragment shader's colour outputs by draw buffer (ProgramObj::outputs). Empty: its first colour output is draw buffer 0 and the others are not written.
+  ArrayView<const TgsiOutput> outputs;
 };
 
 struct TgsiProgram {
@@ -130,6 +140,7 @@ struct TgsiProgram {
   uint32_t varyings = 0;
   bool uses_frag_coord = false;   // the fragment shader reads gl_FragCoord (in the device's pixels: the target must not be supersampled)
   bool no_color = false;          // the fragment shader writes no color (the CPU then writes none: the draw masks every channel, and only the depth changes)
+  uint32_t color_outputs = 1;     // the fragment shader's colour outputs: OUT[0 .. color_outputs - 1] are COLOR[0 ..] (draw buffers 0 ..); gl_FragDepth comes after them
   // What the device must know of the other stages, as graphics::GeometryPrimitive, GeometryTopology, TessDomain, TessPartitioning and TessOutput numbers.
   uint8_t gs_input = 2, gs_output = 2;
   uint32_t gs_max_vertices = 0, gs_invocations = 1;

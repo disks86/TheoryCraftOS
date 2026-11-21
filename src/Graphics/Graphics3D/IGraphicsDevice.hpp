@@ -65,6 +65,7 @@ struct DeviceLimits {
   uint32_t color_targets = kBaseColorTargets;           // kFeatureMultipleTargets: colour images of a pass
   uint32_t vertex_buffers = kBaseVertexBuffers;         // bind_vertex_buffer_slot slots
   uint32_t control_varyings = 0;                        // tessellation: the vectors of each control point from the hull to the domain stage (0: `varyings`)
+  bool depth_bias = false;                              // GraphicsPipelineDesc::depth_bias_*
 };
 
 // --- Resources ---------------------------------------------------------------
@@ -566,6 +567,10 @@ struct GraphicsPipelineDesc {
   StencilState stencil;
   BlendState blend;                                   // kFeatureBlendState
   CompareOp depth_compare = CompareOp::LessEqual;     // kFeatureBlendState: what depth_test compares with (a device without it always uses LessEqual)
+  // DeviceLimits::depth_bias: the depth of the primitives `depth_bias_modes` names (bit 0 triangles, 1 lines, 2 points) moved by depth_bias_slope times their depth slope plus
+  // depth_bias_units times the smallest step of the depth image, before the depth test (glPolygonOffset's factor and units).
+  float depth_bias_slope = 0, depth_bias_units = 0;
+  uint8_t depth_bias_modes = 0;
   // kFeatureIndependentBlend: with independent_blend, colour target 0 uses `blend` (or alpha_blend) and target n (1..3) uses target_blend[n - 1], which is taken as it is (custom or
   // not: a state that is not custom means no blending and every channel written). Without it every target uses `blend`.
   bool independent_blend = false;
@@ -724,6 +729,7 @@ enum DeviceFeature : uint32_t {
   kFeatureClipDistances = 1u << 28,    // GraphicsPipelineDesc::clip_distances (TGSI shaders' CLIPDIST outputs)
   kFeatureVertexFormats = 1u << 29,    // VertexFormat values other than Float1 .. Float4
   kFeatureAddressModes = 1u << 31,     // AddressMode::MirrorRepeat, ClampToBorder and MirrorOnce, SamplerDesc::border
+  kFeatureSampledDepth = 1u << 30,     // a D32Float image with kImageDepthAttachment | kImageSampled: drawn into, then bound as a texture whose red channel is the depth
 };
 
 
