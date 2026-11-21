@@ -40,7 +40,7 @@
 namespace webgl {
 
 // The most any device takes (array sizes); what one device takes is a TgsiLimits.
-constexpr uint32_t kTgsiMaxConstRows = 256;
+constexpr uint32_t kTgsiMaxConstRows = 1024;
 constexpr uint32_t kTgsiMaxAttributes = 16;
 constexpr uint32_t kTgsiMaxVaryings = 16;
 constexpr uint32_t kTgsiMaxControlVaryings = 32;   // (from a tessellation control stage)

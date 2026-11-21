@@ -197,13 +197,13 @@ draw is offered to the device and runs on the CPU rasterizer when the device can
   `.length()` is the array's size. A fragment shader without a colour output draws with every channel masked (the CPU writes none). A varying that no
   stage before writes reads zero, as the CPU's vertices start (and an output that is declared but never written is written as zero, the flat link the
   CPU makes of it).
-- `src/WebGl/AccelConformance.cpp` has 72 scenes that draw a picture with the accelerator and without, 22 of them desktop GL with geometry and tessellation
+- `src/WebGl/AccelConformance.cpp` has 75 scenes that draw a picture with the accelerator and without, 22 of them desktop GL with geometry and tessellation
   stages (two invocations and `gl_PrimitiveIDIn`, adjacency, points made quads, triangles and quads at equal and odd spacing, patch varyings, an evaluation stage
   alone, tessellation and geometry together, outputs read across `barrier()`, clip distances and planes, no attributes, legacy shadow lookups, a rectangle texture,
   arrays per vertex and per control point, packed control-point arrays, `gl_ClipVertex` through `gl_in[]`, structures per vertex and per control point), plus a
   uniform block, shadow samplers, structures, derivatives, `gl_FragDepth`, `gl_VertexID`, bitwise operators, whole uniform arrays, structure varyings, packed
   varyings, samplers as parameters and members, TGSI arrays, a vertex-stage lookup with `textureSize`, `continue` in a switch and an unwritten varying in GLSL
-  ES, a framebuffer object drawn and then sampled, two draw buffers of which one floats, a depth texture drawn and then sampled, instances with
+  ES, a cube map, a 3D texture, a 2D array texture with `textureLod`, a framebuffer object drawn and then sampled, two draw buffers of which one floats, a depth texture drawn and then sampled, instances with
   `gl_InstanceID`, and polygon offset (a scene may have a second draw: `Scene::finish`). The kernel runs them at boot on the machine's GPU ("OpenGL: ...: as
   the CPU renderer"; the first 70 match on virgl), and
   `tests/GlAccelTest.cpp` runs them on a TGSI interpreter (`tests/TgsiMachine.hpp`, shared with DxgkrnlTest, with per-vertex registers and EMIT; the test's
@@ -247,7 +247,9 @@ draw is offered to the device and runs on the CPU rasterizer when the device can
   framebuffer images, images of different sizes, gaps between draw buffers, `gl_FragColor` into several draw buffers, 8-bit images without alpha (their alpha
   must stay 1), integer and signed formats.
 - Mipmapped textures are one device image with all their levels (`Texture::hw_mips`, `hw_mip_texture`; 8-bit RGBA), each level written up when its version
-  changes; the filter within and between levels, LOD range and bias go with the sampler. Mirrored repeat is the device's too. A device without images
+  changes; the filter within and between levels, LOD range and bias go with the sampler (`textureLod` is TXL, a bias TXB). Mirrored repeat is the device's too.
+  3D, cube and 2D array textures are layered device textures (`IAccelerator::create_layered`, `Texture::hw_layers`, `hw_layered_texture`; 8-bit RGBA, their
+  base level only - a mipmapped filter reads it with the filter it has within a level), looked up with 3D, CUBE and 2D_ARRAY targets. A device without images
   (`AccelLimits::image_colors` 0) keeps the old per-context texture cache, which compares the texels at each use.
 - The picture stays on the device between draws. A clear of the whole window is done there only, and the CPU's depth and stencil clears wait until the CPU needs
   them (`hw_fast_clear`, `hw_apply_pending_clears`). After the CPU drew (a draw the device could not take, or the first frame without a clear), the next draw
@@ -309,8 +311,8 @@ The desktop's 3D Test can draw its cube through the kernel GL path (the command 
   tested per fragment, as interpolated varyings, like the fixed-function clip planes; a primitive is not cut geometrically.
 - The 3D hardware takes only part of GL (see "The 3D hardware"): the translator has no vertex streams, structure varyings between the extra stages, samplers in
   structures, `~` of unsigned integers, shifts past 23 bits, fragment `gl_PrimitiveID`, point sizes, texture kinds other than 1D / 2D / rectangle,
-  vertex-shader textures, recursion, `continue` inside a `switch` or 4 x 4 `inverse`; no stencil on the device, no cube, 3D or array textures there, no
-  multisampled framebuffer objects; vertices are still assembled on the CPU for every draw (no device-resident vertex and index buffers); the picture is read
+  vertex-shader textures, recursion, `continue` inside a `switch` or 4 x 4 `inverse`; no stencil on the device, no mipmaps of 3D, cube or array textures there,
+  no shadow lookups of them, no multisampled framebuffer objects; vertices are still assembled on the CPU for every draw (no device-resident vertex and index buffers); the picture is read
   back at each swap (no zero-copy present into the window). Only virgl takes TGSI today (the AMD GCN compiler takes a subset).
 - No `KHR_debug` callbacks (a kernel cannot call into the program), no multisampling, `wglUseFontOutlines`, overlay planes, `wglCopyContext`, GL 4.x beyond the few 4.3/4.5
   queries programs call unconditionally, compressed images are not kept as blocks (`glGetCompressedTexImage` fails).

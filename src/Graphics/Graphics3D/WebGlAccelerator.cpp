@@ -57,7 +57,9 @@ void WebGlAccelerator::destroy_program_locked(Program& p) {
 webgl::AccelLimits WebGlAccelerator::limits() const {
   const DeviceInfo info = device_.info();
   webgl::AccelLimits l;
-  const uint32_t rows = (info.max_push_constant_bytes < kMaxPushConstantBytes ? info.max_push_constant_bytes : kMaxPushConstantBytes) / 16;
+  // (a device with larger constant blocks: those - the GL path's programs have many uniforms)
+  const uint32_t most = info.limits.shader_constant_bytes > info.max_push_constant_bytes ? info.limits.shader_constant_bytes : info.max_push_constant_bytes;
+  const uint32_t rows = (most < kMaxShaderConstantBytes ? most : kMaxShaderConstantBytes) / 16;
   l.const_rows = rows < 8 ? 8 : rows;
   l.attributes = info.limits.vertex_attributes < kMaxVertexAttributes ? info.limits.vertex_attributes : kMaxVertexAttributes;
   l.varyings = info.limits.varyings < kMaxVaryings ? info.limits.varyings : kMaxVaryings;
@@ -534,7 +536,7 @@ bool WebGlAccelerator::clear(uint32_t handle, bool color, const float rgba[4], b
 }
 
 bool WebGlAccelerator::draw_checks(Program& p, const webgl::AccelState& state, ConstByteView vertices, uint32_t vertex_count, ConstByteView constants) {
-  if (vertex_count == 0 || constants.size() > kMaxPushConstantBytes || constants.size() % 16) return false;
+  if (vertex_count == 0 || constants.size() > kMaxShaderConstantBytes || constants.size() % 16) return false;
   const DeviceInfo info = device_.info();
   // the vertex data: per vertex the attributes that are not per instance, then (AccelState::instanced) per instance the others
   if (p.attributes > 16 || (state.instanced >> p.attributes)) return false;
@@ -543,7 +545,7 @@ bool WebGlAccelerator::draw_checks(Program& p, const webgl::AccelState& state, C
   if (instanced && instanced == p.attributes) return false;      // (a vertex has at least one attribute of its own)
   const uint64_t expected = uint64_t{vertex_count} * (p.attributes - instanced) * 16 + uint64_t{state.instances} * instanced * 16;
   if (vertices.size() != expected) return false;
-  if (constants.size() > info.max_push_constant_bytes) return false;
+  if (constants.size() > (info.limits.shader_constant_bytes > info.max_push_constant_bytes ? info.limits.shader_constant_bytes : info.max_push_constant_bytes)) return false;
   if (state.topology > 5 || (state.topology && !(info.features & kFeatureLines))) return false;
   // (patches go to the tessellation stages and only there, with as many vertices as the program was made for; adjacency only to a geometry stage that takes it)
   if ((state.topology == 3) != (p.hs != nullptr) || (state.topology == 3 && (state.patch_vertices != p.patch_vertices || vertex_count % p.patch_vertices))) return false;

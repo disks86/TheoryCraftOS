@@ -1007,6 +1007,8 @@ class GlContext final : public shader::ITextureHost {
   bool hw_current(Image& im, AccelImage& copy);
   void hw_sync_image(Image& im);
   void hw_sync_target(const Target& t);
+  // Before a draw on the CPU: the images it may read or write - its framebuffer's and those of every texture bound to a unit.
+  void hw_sync_for_cpu_draw(const Target& target);
   bool hw_fbo_clear(uint32_t mask, const Target& t);
   static bool hw_fbo_colors(const Target& t, uint32_t* count, const char** why);
   bool hw_mip_texture(Texture& t, const SamplerObj& so, uint32_t* handle, AccelSampler* sampler, const char** why);

@@ -654,7 +654,7 @@ bool GlContext::run_draw(uint32_t mode, int32_t first, int32_t count, uint32_t i
     if (target.is_default) hw_cpu_write();      // (the CPU draws over the device's picture: it comes back first)
     hw_stats_.refused(desktop.primitive_sink ? "selection or feedback" : "adjacency or patches without a geometry or tessellation stage");
   }
-  hw_sync_images();
+  hw_sync_for_cpu_draw(target);
 
   // varying flags for the rasterizer
   gpu::RasterState rs;

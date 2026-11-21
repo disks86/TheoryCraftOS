@@ -940,7 +940,7 @@ IPipeline* VirglDevice::create_compute_pipeline(const IShaderModule* shader) {
   return make<VirglComputePipeline>(gpu_.allocator(), *static_cast<const VirglShaderModule*>(shader));
 }
 
-ICommandBuffer* VirglDevice::create_command_buffer() { return make<CommandRecorder>(gpu_.allocator(), gpu_.allocator()); }
+ICommandBuffer* VirglDevice::create_command_buffer() { return make<CommandRecorder>(gpu_.allocator(), gpu_.allocator(), limits().shader_constant_bytes); }
 void VirglDevice::destroy_command_buffer(ICommandBuffer* commands) {
   destroy(gpu_.allocator(), static_cast<CommandRecorder*>(commands));
 }
@@ -986,7 +986,7 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
   IndexType index_type = IndexType::Uint16;
   Viewport viewport;
   Rect2D scissor;
-  uint32_t constants[kMaxPushConstantBytes / 4] = {};
+  ConstByteView constants;      // (the last push_constants block: in the recorder's pool, which outlives the submit)
   uint32_t constants_dwords = 0;
   bool constants_dirty = false;
   bool in_pass = false;
@@ -1313,7 +1313,7 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
           stream.command(virgl::kSetConstantBuffer, 0, 2 + constants_dwords);
           stream.put(virgl::kShaderCompute);
           stream.put(0);
-          for (uint32_t k = 0; k < constants_dwords; ++k) stream.put(constants[k]);
+          for (ByteReader r(constants); r.remaining() >= 4;) stream.put(r.le32());
           compute_constants_dirty = false;
         }
         stream.command(virgl::kLaunchGrid, 0, 8);
@@ -1430,7 +1430,7 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
       case RecordedCommand::Type::PushConstants: {
         ConstByteView block;
         if (!pool.try_subview(cmd.constants_offset, cmd.constants_size, &block)) return false;
-        for (uint32_t k = 0; k < block.size(); ++k) reinterpret_cast<uint8_t*>(constants)[k] = block[k];
+        constants = block;
         constants_dwords = cmd.constants_size / 4;
         constants_dirty = true;
         compute_constants_dirty = true;
@@ -1523,7 +1523,7 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
             stream.command(virgl::kSetConstantBuffer, 0, 2 + constants_dwords);
             stream.put(shader);
             stream.put(0);
-            for (uint32_t k = 0; k < constants_dwords; ++k) stream.put(constants[k]);
+            for (ByteReader r(constants); r.remaining() >= 4;) stream.put(r.le32());
           }
           constants_dirty = false;
         }

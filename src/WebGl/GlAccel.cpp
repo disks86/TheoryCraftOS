@@ -212,6 +212,16 @@ void GlContext::hw_sync_images() {
     if (rb) hw_sync_image(rb->image);
 }
 
+void GlContext::hw_sync_for_cpu_draw(const Target& target) {
+  if (objects_->hw_ahead <= 0) return;
+  hw_sync_target(target);
+  for (const TextureUnit& u : units_) {
+    const uint32_t names[] = {u.tex2d, u.cube, u.tex3d, u.array, u.tex1d, u.rect, u.array1d, u.cube_array, u.ms2d, u.ms2d_array};
+    for (uint32_t name : names)
+      if (Texture* t = name && name <= objects_->textures.count() ? objects_->textures[name - 1].get() : nullptr) hw_sync_texture(*t);
+  }
+}
+
 void GlContext::hw_sync_target(const Target& t) {
   if (objects_->hw_ahead <= 0 || t.is_default) return;
   for (Image* im : t.color)

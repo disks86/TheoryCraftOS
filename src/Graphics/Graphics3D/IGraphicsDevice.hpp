@@ -46,6 +46,8 @@ constexpr uint32_t kMaxVaryings = 16;           // values passed from the vertex
 constexpr uint32_t kMaxVertexBuffers = 8;       // vertex buffers (input slots) bound at once
 // The most a command buffer may carry as shader constants; what a device really takes is DeviceInfo::max_push_constant_bytes (most take 128: eight vec4s).
 constexpr uint32_t kMaxPushConstantBytes = 4096;
+// A device that takes larger constant blocks says so in DeviceLimits::shader_constant_bytes (at most this); its command buffers take push_constants of that size.
+constexpr uint32_t kMaxShaderConstantBytes = 16384;
 constexpr uint32_t kMaxTextureUnits = 16;
 // The colour images one render pass can draw into at once (kFeatureMultipleTargets): RenderPassBegin::color and up to seven more.
 constexpr uint32_t kMaxColorTargets = 8;
@@ -66,7 +68,8 @@ struct DeviceLimits {
   uint32_t vertex_buffers = kBaseVertexBuffers;         // bind_vertex_buffer_slot slots
   uint32_t control_varyings = 0;                        // tessellation: the vectors of each control point from the hull to the domain stage (0: `varyings`)
   bool depth_bias = false;                              // GraphicsPipelineDesc::depth_bias_*
-  bool sampled_depth = false;                           // a D32Float image with kImageDepthAttachment | kImageSampled: drawn into, then bound as a texture whose red channel is the depth
+  bool sampled_depth = false;
+  uint32_t shader_constant_bytes = 0;                   // push_constants up to this many bytes (above kMaxPushConstantBytes; 0: kMaxPushConstantBytes)                           // a D32Float image with kImageDepthAttachment | kImageSampled: drawn into, then bound as a texture whose red channel is the depth
 };
 
 // --- Resources ---------------------------------------------------------------
