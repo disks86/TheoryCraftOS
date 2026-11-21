@@ -202,6 +202,13 @@ Windows side:
   - `jqlang.jq` (a portable program): 16,396 packages in the index, 1 MB installed, "jq (Windows)" in the Start menu, removed;
   - `7zip.7zip` (a 64-bit setup program): downloaded, run with `/S`, "7-Zip File Manager (Windows)" in the Start menu, then removed by its own
     uninstaller.
+  - `Unigine.HeavenBenchmark` (a 32-bit Inno Setup program, 260 MB) with `KEEP=ON RUN=ON`: installed into `C:\Program Files\Unigine\Heaven
+    Benchmark 4.0` (see What is not done for why not `Program Files (x86)`). Its Start menu entry is a shortcut to `heaven.bat`, listed as "Heaven
+    Benchmark 4.0 (Windows)" and started as `cmd.exe /c "C:\...\heaven.bat"` (docs/WindowsUserMode.md, *The command interpreter*): the batch file
+    changes to `bin` and starts `browser_x86.exe` (32-bit), and cmd ends with 0. The launcher then stops: it imports `MSVCR100.dll`, which the loader
+    folds into the system's msvcrt.dll (src/Process/ModuleLoader.cpp) instead of the `msvcr100.dll` Heaven ships in `bin`, and that lacks
+    `_malloc_crt` and `__CppXcptFilter`; the first missing call raises an exception whose filter is the second, again and again, until the stack runs
+    out.
 
   - `KeePassXCTeam.KeePassXC` (a Windows Installer package, 69 MB, an LZX cabinet): installed by this system's own engine, "KeePassXC (Windows)"
     in the Start menu, removed again with the kept package. Its first run found that the kernel's registry makes only the last key of a path;
@@ -260,8 +267,12 @@ Windows:
   and until winget's manifest follows, the SHA-256 does not match and the package cannot be installed - by the real winget either.
 - **A few packages have been through QEMU** (see Tests): a Windows Installer package (KeePassXC), a portable program (jq), a 64-bit setup program (7-Zip), 32-bit Nullsoft ones
   (qBittorrent) and 32-bit Inno Setup ones (WinMerge, TreeSize Free). That is
-  four setup programs out of thousands; the App Manager's window has not been clicked through there, and no installed program has been
-  started from the Start menu there.
+  four setup programs out of thousands; the App Manager's window has not been clicked through there. With `RUN=ON` the self-test starts each
+  Start menu entry as the menu does (its own arguments; a batch file through `cmd.exe /c`), not by clicking the menu.
+- **A 32-bit setup program installs into `C:\Program Files`, not `C:\Program Files (x86)`.** Every process is given `ProgramFiles=C:\Program Files`
+  (src/Process/ProgramEnvironment.cpp, userenv.dll) and shell32's `FOLDERID_ProgramFiles` / `CSIDL_PROGRAM_FILES` is `ProgramW6432` whatever the
+  process (src/Windows/shell32/folders.inc); on Windows a 32-bit process sees `Program Files (x86)` for both. Unigine Heaven (32-bit Inno Setup)
+  lands in `C:\Program Files\Unigine`. The programs still run from there.
 - **An archive member is unpacked in memory**, so one file of an archive can be at most 1 GiB and needs that much memory.
 - **No dependencies** (a package's `Dependencies`, such as the Visual C++ runtime, are not installed), no command aliases in a `Links` folder,
   no descriptions in the list (winget's index has none), and only the latest version of a package can be installed.
