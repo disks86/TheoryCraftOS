@@ -151,6 +151,63 @@ int msvcrt_adjust_fdiv = 0;      /* (no processor this runs on has that bug) */
 /* type_info::~type_info(): `this` in ecx, nothing on the stack; a type_info here owns nothing. */
 __attribute__((naked)) void msvcrt_type_info_destroy(void) { __asm__ volatile("ret"); }
 
+/* The math functions that the 32-bit Microsoft compiler calls with their arguments on the x87 stack (an intrinsic it could not inline): _CIsin(x) has x in
+ * ST(0); the two-argument ones have the first argument in ST(1) and the second in ST(0) (_CIpow is pow(ST(1), ST(0)), as Wine has them). Both are popped
+ * and the result is left in ST(0). Each is the C function of the same name with the arguments moved to the stack. (d3dx9_42, d3dcompiler_42, XAudio2_7
+ * and X3DAudio1_7, which Unigine Heaven brings, import them.) */
+#define MSVCRT_CI1(name)                                                                                                   \
+  __asm__(".globl __CI" #name "\n__CI" #name ":\n subl $8, %esp\n fstpl (%esp)\n call _" #name "\n addl $8, %esp\n ret\n" \
+          ".section .drectve\n.ascii \" -export:_CI" #name "\"\n.text\n")
+#define MSVCRT_CI2(name)                                                                                                                     \
+  __asm__(".globl __CI" #name "\n__CI" #name ":\n subl $16, %esp\n fstpl 8(%esp)\n fstpl (%esp)\n call _" #name "\n addl $16, %esp\n ret\n" \
+          ".section .drectve\n.ascii \" -export:_CI" #name "\"\n.text\n")
+MSVCRT_CI1(sin); MSVCRT_CI1(cos); MSVCRT_CI1(tan); MSVCRT_CI1(asin); MSVCRT_CI1(acos); MSVCRT_CI1(atan); MSVCRT_CI1(sinh); MSVCRT_CI1(cosh);
+MSVCRT_CI1(tanh); MSVCRT_CI1(exp); MSVCRT_CI1(log); MSVCRT_CI1(log10); MSVCRT_CI1(sqrt);
+MSVCRT_CI2(pow); MSVCRT_CI2(atan2); MSVCRT_CI2(fmod);
+
+/* class exception of the old Microsoft C++ library (msvcrt.dll has it; std::exception of the later ones is another class): a virtual table, the message,
+ * and whether the object owns the message. The members are thiscall (`this` in ecx, the callee takes its arguments off the stack); their compiler-made
+ * names are in msvcrt32.def. The virtual table holds the deleting destructor and what(); the slot before it, where the compiler puts the type
+ * information, is empty (nothing here asks it). A class derived from it in a program has its own table. */
+typedef struct MsvcrtException { const void *const *vtable; char *name; int do_free; } MsvcrtException;
+static void *__thiscall msvcrt_exception_deleting_dtor(MsvcrtException *self, unsigned flags);
+const char *__thiscall msvcrt_exception_what(const MsvcrtException *self) { return self->name ? self->name : "Unknown exception"; }
+static const void *const g_exception_vtable[3] = {NULL, (const void *)msvcrt_exception_deleting_dtor, (const void *)msvcrt_exception_what};
+static void msvcrt_exception_set(MsvcrtException *self, const char *name, int copy) {
+  self->vtable = &g_exception_vtable[1];
+  self->name = NULL;
+  self->do_free = 0;
+  if (!name) return;
+  if (!copy) { self->name = (char *)name; return; }
+  const size_t_ n = strlen(name) + 1;
+  self->name = (char *)malloc(n);
+  if (self->name) { memcpy(self->name, name, n); self->do_free = 1; }
+}
+/* exception::exception(), exception::exception(const char *const &), exception::exception(const exception &), the destructor, operator= */
+MsvcrtException *__thiscall msvcrt_exception_ctor(MsvcrtException *self) { msvcrt_exception_set(self, NULL, 0); return self; }
+MsvcrtException *__thiscall msvcrt_exception_ctor_name(MsvcrtException *self, const char *const *name) { msvcrt_exception_set(self, name ? *name : NULL, 1); return self; }
+MsvcrtException *__thiscall msvcrt_exception_copy(MsvcrtException *self, const MsvcrtException *other) {
+  msvcrt_exception_set(self, other->name, other->do_free);      /* (a message the other owns is copied; one it borrows is borrowed again) */
+  return self;
+}
+void __thiscall msvcrt_exception_dtor(MsvcrtException *self) {
+  if (self->do_free) free(self->name);
+  self->name = NULL;
+  self->do_free = 0;
+}
+MsvcrtException *__thiscall msvcrt_exception_assign(MsvcrtException *self, const MsvcrtException *other) {
+  if (self != other) { msvcrt_exception_dtor(self); msvcrt_exception_set(self, other->name, other->do_free); }
+  return self;
+}
+static void *__thiscall msvcrt_exception_deleting_dtor(MsvcrtException *self, unsigned flags) {
+  msvcrt_exception_dtor(self);
+  if (flags & 1) free(self);
+  return self;
+}
+/* terminate(): what an exception that nobody catches comes to. */
+API void abort(void);
+void __cdecl msvcrt_terminate(void) { abort(); }
+
 /* ---- C++ exceptions of the 32-bit Microsoft compiler ----------------------------------------------------------------------------------------------------------------
  * `throw` is _CxxThrowException(object, throw information): the exception 0xE06D7363 with three parameters - a magic number, the thrown object and the
  * description of its type (the types it can be caught as, how to copy and destroy it). A function with try blocks or objects to destroy links a frame

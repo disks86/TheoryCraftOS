@@ -5,5 +5,12 @@
 "??_U@YAPAXI@Z" = msvcrt_operator_new
 "??_V@YAXPAX@Z" = msvcrt_operator_delete
 "??1type_info@@UAE@XZ" = msvcrt_type_info_destroy
+"??0exception@@QAE@XZ" = msvcrt_exception_ctor
+"??0exception@@QAE@ABQBD@Z" = msvcrt_exception_ctor_name
+"??0exception@@QAE@ABV0@@Z" = msvcrt_exception_copy
+"??1exception@@UAE@XZ" = msvcrt_exception_dtor
+"??4exception@@QAEAAV0@ABV0@@Z" = msvcrt_exception_assign
+"?what@exception@@UBEPBDXZ" = msvcrt_exception_what
+"?terminate@@YAXXZ" = msvcrt_terminate
 _adjust_fdiv = msvcrt_adjust_fdiv DATA
 _iob = msvcrt_iob DATA

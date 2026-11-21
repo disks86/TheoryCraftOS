@@ -662,9 +662,11 @@ API double frexp(double x, int *e) {
   return x < 0 ? -(double)m : (double)m;
 }
 API double modf(double x, double *ip) { double t = trunc(x); *ip = t; return x - t; }
+/* exp and pow take 2^t apart as 2^n * 2^f, n = round(t), f = t - n: "fsubr %st(0), %st(1)" is that subtraction (the GNU assembler swaps fsub and fsubr in this
+ * form: written as fsub, it gave n - t, and exp(1) was 1.47). */
 API double exp(double x) {
   long double r = x;
-  __asm__("fldl2e\n fmulp\n fld %%st(0)\n frndint\n fsub %%st(0), %%st(1)\n fxch\n f2xm1\n fld1\n faddp\n fscale\n fstp %%st(1)" : "+t"(r));
+  __asm__("fldl2e\n fmulp\n fld %%st(0)\n frndint\n fsubr %%st(0), %%st(1)\n fxch\n f2xm1\n fld1\n faddp\n fscale\n fstp %%st(1)" : "+t"(r));
   return (double)r;
 }
 API double log(double x) { if (x < 0) return 0.0 / 0.0; if (x == 0) return -1.0 / 0.0; long double r = x; __asm__("fldln2\n fxch\n fyl2x" : "+t"(r)); return (double)r; }
@@ -676,8 +678,9 @@ API double pow(double x, double y) {
   if (x == 0) return y > 0 ? 0.0 : 1.0 / 0.0;
   const int y_is_integer = y == floor(y) && fabs(y) < 9e15;
   if (x < 0 && !y_is_integer) return 0.0 / 0.0;
-  long double base = x < 0 ? -(long double)x : x, r = y;
-  __asm__("fyl2x\n fld %%st(0)\n frndint\n fsub %%st(0), %%st(1)\n fxch\n f2xm1\n fld1\n faddp\n fscale\n fstp %%st(1)" : "+t"(r) : "u"(base) : "st(1)");
+  /* fyl2x is ST(1) * log2(ST(0)): the base goes in ST(0) and the exponent in ST(1) (the other way round, pow(2, 10) was 2 * log2(10) a power of two) */
+  long double r = x < 0 ? -(long double)x : x, exponent = y;
+  __asm__("fyl2x\n fld %%st(0)\n frndint\n fsubr %%st(0), %%st(1)\n fxch\n f2xm1\n fld1\n faddp\n fscale\n fstp %%st(1)" : "+t"(r) : "u"(exponent) : "st(1)");
   if (x < 0 && y_is_integer && ((long long)y & 1)) r = -r;
   return (double)r;
 }
@@ -967,6 +970,28 @@ typedef struct { HANDLE handle; unsigned char flags; } FdEntry;
 static FdEntry g_fds[MAX_FDS];
 static int g_io_ready;
 
+/* __pioinfo and __badioinfo: the descriptor table as the Microsoft C runtimes before Visual C++ 2005 lay it out, which code compiled against them reads
+ * itself (__pioinfo[fd >> 5][fd & 31].osfhnd and .osfile: d3dx9_42.dll does). Blocks of 32 entries; an entry is the handle, the flags (FOPEN 0x01,
+ * FAPPEND 0x20, FDEV 0x40, FTEXT 0x80), the look-ahead bytes, more flags and a lock that is never set up (exflag has no EF_CRIT_INIT, so nobody takes it).
+ * A copy of g_fds, written each time a descriptor changes (ioinfo_sync); a closed one has INVALID_HANDLE_VALUE. __badioinfo is the entry of a number
+ * that is no descriptor. */
+#define IOINFO_BLOCK 32
+typedef struct { HANDLE osfhnd; unsigned char osfile; char pipech[3]; int exflag; CRITICAL_SECTION lock; } IoInfo;
+static IoInfo g_ioinfo[MAX_FDS] = {[0 ... MAX_FDS - 1] = {INVALID_HANDLE_VALUE, 0, {10, 10, 10}, 0, {0}}};
+#define IOINFO_AT(n) &g_ioinfo[(n) * IOINFO_BLOCK]
+API IoInfo *__pioinfo[64] = {IOINFO_AT(0), IOINFO_AT(1), IOINFO_AT(2), IOINFO_AT(3), IOINFO_AT(4), IOINFO_AT(5), IOINFO_AT(6), IOINFO_AT(7),
+                             IOINFO_AT(8), IOINFO_AT(9), IOINFO_AT(10), IOINFO_AT(11), IOINFO_AT(12), IOINFO_AT(13), IOINFO_AT(14), IOINFO_AT(15)};
+API IoInfo __badioinfo = {INVALID_HANDLE_VALUE, 0, {10, 10, 10}, 0, {0}};
+_Static_assert(MAX_FDS == 16 * IOINFO_BLOCK, "the blocks of __pioinfo cover g_fds");
+static void ioinfo_sync(int fd) {
+  if (fd < 0 || fd >= MAX_FDS) return;
+  const FdEntry *e = &g_fds[fd];
+  IoInfo *info = &g_ioinfo[fd];
+  const int open = (e->flags & FD_OPEN) != 0;
+  info->osfhnd = open ? e->handle : INVALID_HANDLE_VALUE;
+  info->osfile = (unsigned char)(open ? 0x01 | ((e->flags & FD_APPEND) ? 0x20 : 0) | ((e->flags & FD_DEVICE) ? 0x40 : 0) | ((e->flags & FD_TEXT) ? 0x80 : 0) : 0);
+}
+
 static void init_io(void) {
   if (g_io_ready) return;
   g_io_ready = 1;
@@ -974,6 +999,7 @@ static void init_io(void) {
   for (int i = 0; i < 3; ++i) {
     HANDLE h = GetStdHandle(which[i]);
     if (h && h != INVALID_HANDLE_VALUE) g_fds[i].handle = h, g_fds[i].flags = FD_OPEN | FD_TEXT | (GetFileType(h) == FILE_TYPE_CHAR ? FD_DEVICE : 0);
+    ioinfo_sync(i);
   }
 }
 static FdEntry *fd_entry(int fd) {
@@ -983,7 +1009,8 @@ static FdEntry *fd_entry(int fd) {
 }
 static int fd_new(HANDLE h, unsigned char flags) {
   init_io();
-  for (int i = 3; i < MAX_FDS; ++i) if (!(g_fds[i].flags & FD_OPEN)) { g_fds[i].handle = h; g_fds[i].flags = (unsigned char)(flags | FD_OPEN); return i; }
+  for (int i = 3; i < MAX_FDS; ++i)
+    if (!(g_fds[i].flags & FD_OPEN)) { g_fds[i].handle = h; g_fds[i].flags = (unsigned char)(flags | FD_OPEN); ioinfo_sync(i); return i; }
   g_errno = EMFILE;
   return -1;
 }
@@ -1058,6 +1085,7 @@ API int _close(int fd) {
   const int ok = fd < 3 ? 1 : CloseHandle(e->handle);
   e->flags = 0;
   e->handle = NULL;
+  ioinfo_sync(fd);
   if (!ok) { map_last_error(); return -1; }
   return 0;
 }
@@ -1075,6 +1103,7 @@ API int _setmode(int fd, int mode) {
   if (!e) return -1;
   const int old = (e->flags & FD_TEXT) ? O_TEXT_ : O_BINARY_;
   if (mode == O_TEXT_) e->flags |= FD_TEXT; else if (mode == O_BINARY_) e->flags &= (unsigned char)~FD_TEXT;
+  ioinfo_sync(fd);
   return old;
 }
 API intptr_t _get_osfhandle(int fd) { FdEntry *e = fd_entry(fd); return e ? (intptr_t)e->handle : -1; }
@@ -1094,6 +1123,7 @@ API int _dup2(int fd, int to) {
   if (g_fds[to].flags & FD_OPEN) _close(to);
   g_fds[to].handle = e->handle;
   g_fds[to].flags = e->flags;
+  ioinfo_sync(to);
   return 0;
 }
 
@@ -1525,7 +1555,7 @@ static void * fopen_nolock(const char *path, const char *mode) {
   if (fd < 0) return NULL;
   Stream *f = stream_open(fd, sflags);
   if (!f) { _close(fd); return NULL; }
-  if (oflags & O_APPEND_) g_fds[fd].flags |= FD_APPEND;
+  if (oflags & O_APPEND_) g_fds[fd].flags |= FD_APPEND, ioinfo_sync(fd);
   return f;
 }
 API int fopen_s(void **out, const char *path, const char *mode) { *out = fopen(path, mode); return *out ? 0 : g_errno; }
