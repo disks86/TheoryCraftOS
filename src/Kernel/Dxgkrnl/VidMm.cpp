@@ -20,6 +20,7 @@
 #include "Kernel/Dxgkrnl/D3d12.hpp"
 #include "Graphics/Graphics3D/Mipmaps.hpp"
 #include "Graphics/WidePixels.hpp"
+#include "Graphics/BlockCompression.hpp"
 #include "Utility/AllocatedView.hpp"
 #include "Utility/ByteStream.hpp"
 
@@ -47,12 +48,25 @@ graphics::Format wide_format_of(Format f) {
 constexpr uint64_t kMaxQueryResultBytes = 1 << 20;
 constexpr uint32_t kKnownFlags = kAllocVertexBuffer | kAllocIndexBuffer | kAllocTexture | kAllocRenderTarget | kAllocDepthStencil | kAllocPresent | kAllocStaging | kAllocShared | kAllocQueryResult | kAllocUnorderedAccess | kAllocStreamOutput | kAllocConstantBuffer | kAllocTrackState | kAllocHeap | kAllocReserved;
 
-// The bytes of all levels of a w x h image of `pixel`-byte pixels; false if the description's levels are not possible. (w and h are at most kMaxTextureDimension, so nothing overflows.)
-bool image_bytes(uint32_t w, uint32_t h, uint32_t levels, uint32_t pixel, uint64_t* total) {
+// The bytes of all levels of a w x h image of format `f` (pixels, or blocks of a compressed format); false if the description's levels are not possible. (w and h are at most
+// kMaxTextureDimension, so nothing overflows.)
+bool image_bytes(uint32_t w, uint32_t h, uint32_t levels, Format f, uint64_t* total) {
   uint64_t sum = 0;
-  for (uint32_t l = 0; l < levels; ++l) sum += uint64_t{graphics::mip_extent(w, l)} * graphics::mip_extent(h, l) * pixel;
+  for (uint32_t l = 0; l < levels; ++l) sum += image_level_bytes(f, graphics::mip_extent(w, l), graphics::mip_extent(h, l));
   *total = sum;
   return true;
+}
+// The device's format of a compressed one.
+graphics::Format compressed_format_of(Format f) {
+  switch (f) {
+    case Format::Bc1: return graphics::Format::Bc1Unorm;
+    case Format::Bc2: return graphics::Format::Bc2Unorm;
+    case Format::Bc3: return graphics::Format::Bc3Unorm;
+    case Format::Bc1Srgb: return graphics::Format::Bc1Srgb;
+    case Format::Bc2Srgb: return graphics::Format::Bc2Srgb;
+    case Format::Bc3Srgb: return graphics::Format::Bc3Srgb;
+    default: return graphics::Format::Undefined;
+  }
 }
 
 // The backing as 32-bit words (it is allocated 16-byte aligned, so this holds; false would mean a bug elsewhere).
@@ -70,14 +84,13 @@ bool Allocation::level_range(uint32_t level, uint64_t* offset, uint64_t* bytes) 
   if (level >= desc_.mip_levels) return false;
   if (desc_.kind != graphics::TextureKind::Texture2D) {   // (one level: all the layers)
     *offset = 0;
-    *bytes = uint64_t{desc_.width} * desc_.height * pixel_bytes(desc_.format) * layers();
+    *bytes = image_level_bytes(desc_.format, desc_.width, desc_.height) * layers();
     return true;
   }
   uint64_t start = 0;
-  const uint32_t pixel = pixel_bytes(desc_.format);
-  for (uint32_t l = 0; l < level; ++l) start += uint64_t{graphics::mip_extent(desc_.width, l)} * graphics::mip_extent(desc_.height, l) * pixel;
+  for (uint32_t l = 0; l < level; ++l) start += image_level_bytes(desc_.format, graphics::mip_extent(desc_.width, l), graphics::mip_extent(desc_.height, l));
   *offset = start;
-  *bytes = uint64_t{graphics::mip_extent(desc_.width, level)} * graphics::mip_extent(desc_.height, level) * pixel;
+  *bytes = image_level_bytes(desc_.format, graphics::mip_extent(desc_.width, level), graphics::mip_extent(desc_.height, level));
   return true;
 }
 
@@ -206,7 +219,11 @@ NtStatus VidMm::create(const AllocationDesc& requested, SharedPointer<Allocation
     if (desc.mip_levels == 0 || desc.mip_levels > graphics::mip_level_limit({desc.width, desc.height})) return status::kInvalidParameter;
     const bool depth_flag = (desc.flags & kAllocDepthStencil) != 0;
     if (depth_flag != dxgk::is_depth(desc.format)) return status::kInvalidParameter;
-    if (!depth_flag && !dxgk::is_color(desc.format)) return status::kInvalidParameter;
+    const bool compressed = dxgk::is_compressed(desc.format);
+    if (!depth_flag && !dxgk::is_color(desc.format) && !compressed) return status::kInvalidParameter;
+    // (block-compressed: sampled only - or staging memory - and of one sample)
+    if (compressed && ((desc.flags & ~(kAllocTexture | kAllocShared | kAllocStaging)) || ((desc.flags & kAllocStaging) != 0) == ((desc.flags & kAllocTexture) != 0) || desc.samples != 1))
+      return status::kInvalidParameter;
     if (desc.flags & kAllocStaging) {
       if (desc.flags & ~(kAllocStaging | kAllocShared)) return status::kInvalidParameter;
     } else if (!(desc.flags & (kAllocTexture | kAllocRenderTarget | kAllocDepthStencil | kAllocPresent))) {
@@ -224,7 +241,7 @@ NtStatus VidMm::create(const AllocationDesc& requested, SharedPointer<Allocation
     }
     if (desc.mip_levels > 1 && (desc.flags & ~(kAllocTexture | kAllocShared))) return status::kInvalidParameter;
     uint64_t total = 0;
-    image_bytes(desc.width, desc.height, desc.mip_levels, pixel_bytes(desc.format), &total);
+    image_bytes(desc.width, desc.height, desc.mip_levels, desc.format, &total);
     if (desc.samples != 1) {
       // (a multisampled target: the device keeps the samples, the system keeps nothing)
       const graphics::DeviceInfo info = device_.info();
@@ -340,7 +357,10 @@ bool VidMm::create_device_object(Allocation& a) {
     a.image_ = device_.create_image(id);
     return a.image_ != nullptr;
   }
-  id.format = dxgk::is_wide(d.format) ? wide_format_of(d.format)
+  // (a compressed texture: as it is on a device that samples it so, else decoded to 8-bit pixels when it is uploaded)
+  const bool native_blocks = (device_.info().features & graphics::kFeatureCompressedFormats) != 0;
+  id.format = dxgk::is_compressed(d.format) ? (native_blocks ? compressed_format_of(d.format) : graphics::decoded_format(compressed_format_of(d.format)))
+              : dxgk::is_wide(d.format) ? wide_format_of(d.format)
               : dxgk::is_srgb(d.format) ? (is_rgba_order(d.format) ? graphics::Format::R8G8B8A8Srgb : graphics::Format::B8G8R8A8Srgb)
               : is_rgba_order(d.format) ? graphics::Format::R8G8B8A8Unorm : graphics::Format::B8G8R8A8Unorm;
   id.usage = 0;
@@ -439,6 +459,11 @@ bool VidMm::upload(Allocation& a) {
     a.device_stale_ = false;
     return true;
   }
+  if (dxgk::is_compressed(f)) {
+    if (!upload_compressed(a)) return false;
+    a.device_stale_ = false;
+    return true;
+  }
   const bool convert = !is_plain_bgra(f);
   if (a.desc_.kind != graphics::TextureKind::Texture2D) {
     const uint64_t layer_bytes = uint64_t{a.desc_.width} * a.desc_.height * 4;
@@ -483,7 +508,43 @@ bool VidMm::upload(Allocation& a) {
   return true;
 }
 
+// The blocks of a compressed texture to its device image: each level (or each layer of a volume, an array or a cube, which have one), as blocks where the device samples them
+// (kFeatureCompressedFormats), else decoded into 32-bit pixels (the image was made of graphics::decoded_format).
+bool VidMm::upload_compressed(Allocation& a) {
+  const graphics::Format blocks_format = compressed_format_of(a.desc_.format);
+  const bool native = (device_.info().features & graphics::kFeatureCompressedFormats) != 0;
+  const bool layered = a.desc_.kind != graphics::TextureKind::Texture2D;
+  const uint32_t parts = layered ? a.layers() : a.desc_.mip_levels;
+  const uint64_t layer_bytes = image_level_bytes(a.desc_.format, a.desc_.width, a.desc_.height);
+  for (uint32_t part = 0; part < parts; ++part) {
+    const uint32_t level = layered ? 0 : part, layer = layered ? part : 0;
+    uint64_t offset = 0, bytes = 0;
+    if (!a.level_range(level, &offset, &bytes)) return false;
+    if (layered) offset += layer_bytes * layer, bytes = layer_bytes;
+    ConstByteView blocks;
+    if (!ConstByteView(a.cpu_).try_subview(offset, bytes, &blocks)) return false;
+    const uint32_t w = graphics::mip_extent(a.desc_.width, level), h = graphics::mip_extent(a.desc_.height, level);
+    bool ok;
+    if (native) {
+      // (a volume's slices are the layers of the backing here; the device takes each slice as a layer of the transfer)
+      ok = a.image_->write_compressed(level, layer, blocks);
+    } else {
+      scratch_.clear();
+      ArrayView<uint32_t> pixels;
+      if (!scratch_.put_zeros(uint64_t{w} * h * 4) || !as_words(scratch_.writable_view(), &pixels) || !graphics::decode_blocks(blocks_format, blocks, w, h, pixels)) return false;
+      const ArrayView<const uint32_t> decoded(pixels.data(), pixels.size());
+      ok = layered ? a.image_->write_layer_pixels(layer, decoded) : level == 0 ? a.image_->write_pixels(decoded) : a.image_->write_mip_pixels(level, decoded);
+    }
+    if (!ok && a.cpu_written_) return false;
+  }
+  return true;
+}
+
 bool VidMm::read_back(Allocation& a) {
+  if (dxgk::is_compressed(a.desc_.format)) {   // (sampled only: the GPU never writes it)
+    a.gpu_newer_ = false;
+    return true;
+  }
   if (!a.gpu_newer_) {
     if (a.reserved_) gather_tiles(a);   // (the heap's memory may have changed under it)
     return true;

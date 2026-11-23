@@ -19,6 +19,7 @@
 #include <initializer_list>
 #include "Graphics/Graphics3D/Virgl/VirglDevice.hpp"
 #include "Graphics/WidePixels.hpp"
+#include "Graphics/BlockCompression.hpp"
 #include <new>
 #include "Graphics/Graphics3D/Virgl/VirglProtocol.hpp"
 #include "Utility/AllocatedView.hpp"
@@ -219,6 +220,12 @@ class VirglImage final : public IImage {
       case Format::R16G16B16A16Snorm: color_format_ = virgl::kFormatR16G16B16A16Snorm; break;
       case Format::R10G10B10A2Unorm: color_format_ = virgl::kFormatR10G10B10A2Unorm; break;
       case Format::B8G8R8A8Srgb: case Format::R8G8B8A8Srgb: color_format_ = virgl::kFormatB8G8R8A8Srgb; break;
+      case Format::Bc1Unorm: color_format_ = virgl::kFormatDxt1Rgba; break;
+      case Format::Bc2Unorm: color_format_ = virgl::kFormatDxt3Rgba; break;
+      case Format::Bc3Unorm: color_format_ = virgl::kFormatDxt5Rgba; break;
+      case Format::Bc1Srgb: color_format_ = virgl::kFormatDxt1Srgba; break;
+      case Format::Bc2Srgb: color_format_ = virgl::kFormatDxt3Srgba; break;
+      case Format::Bc3Srgb: color_format_ = virgl::kFormatDxt5Srgba; break;
       // (R8G8B8A8Unorm too is a BGRA image on the host: pixels go in and come out as 0xAARRGGBB words whatever the format's memory order, and a shader sees colours, not bytes)
       default: color_format_ = virgl::kFormatB8G8R8A8Unorm; break;
     }
@@ -226,7 +233,7 @@ class VirglImage final : public IImage {
     // A sampled image is stored top row first, the way write_pixels() gives it and the sampler reads it, so it does not take the Y_0_TOP flip of the images that are only
     // drawn into (and shown).
     const bool sampled = (desc.usage & kImageSampled) != 0;
-    uint32_t bind = depth ? virgl::kBindDepthStencil : (virgl::kBindRenderTarget | virgl::kBindSamplerView);
+    uint32_t bind = depth ? virgl::kBindDepthStencil : is_compressed_format(desc.format) ? virgl::kBindSamplerView : (virgl::kBindRenderTarget | virgl::kBindSamplerView);
     if (desc.usage & kImagePresent) bind |= virgl::kBindScanout;
     // A volume has its slices as the depth; an array or a cube its layers as the array size (a cube: six).
     const uint32_t layers = layer_count();
@@ -292,6 +299,17 @@ class VirglImage final : public IImage {
     const ArrayView<uint32_t> staged = backing_.cast<uint32_t>();
     for (uint64_t i = 0; i < count; ++i) staged[i] = pixels[i];
     TransferHost3d transfer{header(kCmdTransferToHost3d), {0, 0, 0, width, height, 1}, 0, id_, level, width * 4, 0};
+    return device_.gpu().command(as_bytes(transfer), /*fence=*/false);
+  }
+  // The blocks of a level of a layer (a slice, a face; 0 for a plain texture) of a block-compressed image: staged at the start of the backing (room for level 0 of a layer, as
+  // 32-bit pixels, which is more than its blocks), the transfer's stride a row of blocks, its box in pixels.
+  bool write_compressed(uint32_t level, uint32_t layer, ConstByteView blocks) override {
+    if (!is_compressed_format(desc_.format) || level >= desc_.mip_levels || layer >= layer_count()) return false;
+    const uint32_t width = mip_extent(desc_.extent.width, level), height = mip_extent(desc_.extent.height, level);
+    if (blocks.size() != compressed_image_bytes(desc_.format, width, height) || !ensure_backing(uint64_t{desc_.extent.width} * desc_.extent.height)) return false;
+    ByteView staged;
+    if (!backing_.try_subview(0, blocks.size(), &staged) || !staged.copy_from(blocks)) return false;
+    TransferHost3d transfer{header(kCmdTransferToHost3d), {0, 0, layer, width, height, 1}, 0, id_, level, static_cast<uint32_t>(compressed_row_bytes(desc_.format, width)), 0};
     return device_.gpu().command(as_bytes(transfer), /*fence=*/false);
   }
   // A layer (a slice, a face) goes through the one-layer backing: the host copies from or into it at the layer's place in the resource.
@@ -835,6 +853,19 @@ void VirglDevice::destroy_buffer(IBuffer* buffer) { destroy(gpu_.allocator(), st
 IImage* VirglDevice::create_image(const ImageDesc& desc) {
   // (mipmaps: a plain texture of 8-bit colour that is only sampled, as the kernel's own; its levels are written one by one)
   if (desc.mip_levels == 0 || desc.mip_levels > mip_level_limit(desc.extent)) return nullptr;
+  if (is_compressed_format(desc.format)) {
+    // (block-compressed: sampled only, of any kind, plain textures with levels; filled with write_compressed)
+    const uint32_t layers = desc.kind == TextureKind::TextureCube ? 6 : desc.layers;
+    if (desc.usage != kImageSampled || desc.samples != 1 || layers == 0 || layers > kMaxTextureLayers || (desc.kind != TextureKind::Texture2D && desc.mip_levels != 1) ||
+        (desc.kind == TextureKind::Texture2D && desc.layers != 1) || (desc.kind == TextureKind::TextureCube && desc.extent.width != desc.extent.height))
+      return nullptr;
+    VirglImage* image = make<VirglImage>(gpu_.allocator(), *this, desc);
+    if (image && !image->valid()) {
+      destroy(gpu_.allocator(), image);
+      return nullptr;
+    }
+    return image;
+  }
   if (desc.mip_levels != 1 && (desc.usage != kImageSampled || desc.kind != TextureKind::Texture2D || desc.samples != 1 || desc.layers != 1 ||
                                (desc.format != Format::B8G8R8A8Unorm && desc.format != Format::B8G8R8A8Srgb && desc.format != Format::R8G8B8A8Unorm && desc.format != Format::R8G8B8A8Srgb)))
     return nullptr;

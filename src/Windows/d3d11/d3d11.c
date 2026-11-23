@@ -112,11 +112,16 @@ struct Buf {
 
 struct Tex {
   Child c;
-  D3D11_TEXTURE2D_DESC desc;
+  D3D11_TEXTURE2D_DESC desc;   /* (a volume: its width, height and levels, with one layer; its depth is `slices`) */
+  UINT kind;                   /* the kernel's TextureKind: 0 2D, 1 3D (a volume), 2 2D array, 3 cube */
+  UINT slices;                 /* a volume's depth (1 for the others) */
+  UINT kmips;                  /* the levels the Direct3D 12 texture has: the kernel keeps one of a volume, an array or a cube, whose other levels are dropped */
+  D3D11_TEXTURE3D_DESC desc3;  /* a volume: as the program made it */
   DXGI_FORMAT stored;          /* the format of the Direct3D 12 texture */
   UINT bpp, stored_bpp;        /* bytes a pixel: as the program has it, as it is kept */
   int expand;                  /* 0: kept as it is; 1: R8 kept as RGBA (r, 0, 0, 1); 2: A8 kept as RGBA (0, 0, 0, a); 3: RG8 kept as RGBA (r, g, 0, 1) */
   int depth;                   /* a depth buffer: the CPU does not reach it */
+  UINT block;                  /* a block-compressed format (BC1 .. BC3): the bytes of a 4 x 4 block (bpp is the same); its rows are rows of blocks */
   ID3D12Resource *res;
   UINT used;
   UINT sampled;                /* the command list that has a draw sampling it */
@@ -141,6 +146,7 @@ typedef struct Shader {
   SIZE_T bytes;
   UINT cb_registers[CONSTANT_SLOTS];      /* the size each constant buffer is declared with, in 16-byte registers (0: not used) */
   UINT registers;                         /* ... and all of them together */
+  BYTE tex_kind[TEXTURE_SLOTS];           /* what each t<n> is declared as (Tex.kind; 0xFF: not declared) */
 } Shader;
 
 typedef struct Layout {
@@ -161,6 +167,7 @@ typedef struct Query { Child c; D3D11_QUERY_DESC desc; BOOL begun, ended; UINT64
 
 typedef struct Pipeline {
   UINT vs, ps, layout;
+  UINT gs, hs, ds;
   D3D11_BLEND_DESC blend;
   D3D11_DEPTH_STENCIL_DESC depth;
   D3D11_RASTERIZER_DESC raster;
@@ -186,6 +193,12 @@ typedef struct Ctx {
   Buf *vs_cb[CONSTANT_SLOTS], *ps_cb[CONSTANT_SLOTS];
   View *srv[TEXTURE_SLOTS];
   Sampler *sampler[TEXTURE_SLOTS];
+  /* The geometry, hull and domain stages (STAGE_GS ...), and the textures and samplers of the stages but the pixel shader's (STAGE_VS ..., which share the table:
+   * a slot the pixel shader has nothing bound to takes the first of the others that has). */
+  Shader *gs, *hs, *ds;
+  Buf *stage_cb[3][CONSTANT_SLOTS];
+  View *stage_srv[4][TEXTURE_SLOTS];
+  Sampler *stage_sampler[4][TEXTURE_SLOTS];
   View *rtv[8];
   UINT rtv_count;
   View *dsv;
@@ -200,6 +213,15 @@ typedef struct Ctx {
   D3D11_RECT scissor;
   int scissor_set;
 } Ctx;
+
+/* (the stages in Ctx.stage_cb: geometry, hull, domain; in Ctx.stage_srv and stage_sampler the vertex shader's first) */
+#define STAGE_GS 0u
+#define STAGE_HS 1u
+#define STAGE_DS 2u
+#define SRV_VS 0u
+#define SRV_GS 1u
+#define SRV_HS 2u
+#define SRV_DS 3u
 
 typedef struct PendingClear { View *dsv; UINT flags; FLOAT depth; UINT8 stencil; } PendingClear;
 
@@ -233,6 +255,7 @@ struct Dev {
   UINT table_view_ids[TEXTURE_SLOTS], table_sampler_ids[TEXTURE_SLOTS];      /* ... and what was in them */
   int tables_valid;
   Tex *blank;                              /* a white pixel: what a texture slot with nothing bound samples */
+  Tex *blank_kind[4];                      /* ... a white volume, array and cube (by Tex.kind, made when a shader that declares one has nothing bound to it) */
   UINT epoch;                              /* counts the command lists */
   int recorded;                            /* the list has something in it */
   UINT dirty;                              /* what the next draw has to set again (DIRTY_*) */
@@ -299,6 +322,9 @@ extern const ID3D11DepthStencilViewVtbl dsv_vtbl;
 extern const ID3D11ShaderResourceViewVtbl srv_vtbl;
 extern const ID3D11VertexShaderVtbl vs_vtbl;
 extern const ID3D11PixelShaderVtbl ps_vtbl;
+extern const ID3D11GeometryShaderVtbl gs_vtbl;
+extern const ID3D11HullShaderVtbl hs_vtbl;
+extern const ID3D11DomainShaderVtbl ds_vtbl;
 extern const ID3D11InputLayoutVtbl layout_vtbl;
 extern const ID3D11BlendStateVtbl blend_vtbl;
 extern const ID3D11DepthStencilStateVtbl depth_vtbl;
@@ -310,11 +336,15 @@ static const GUID *const g_dev_iids[] = {&IID_ID3D11Device, NULL};
 static const GUID *const g_ctx_iids[] = {&IID_ID3D11DeviceChild, &IID_ID3D11DeviceContext, NULL};
 static const GUID *const g_buf_iids[] = {&IID_ID3D11DeviceChild, &IID_ID3D11Resource, &IID_ID3D11Buffer, NULL};
 static const GUID *const g_tex_iids[] = {&IID_ID3D11DeviceChild, &IID_ID3D11Resource, &IID_ID3D11Texture2D, NULL};
+static const GUID *const g_tex3_iids[] = {&IID_ID3D11DeviceChild, &IID_ID3D11Resource, &IID_ID3D11Texture3D, NULL};
 static const GUID *const g_rtv_iids[] = {&IID_ID3D11DeviceChild, &IID_ID3D11View, &IID_ID3D11RenderTargetView, NULL};
 static const GUID *const g_dsv_iids[] = {&IID_ID3D11DeviceChild, &IID_ID3D11View, &IID_ID3D11DepthStencilView, NULL};
 static const GUID *const g_srv_iids[] = {&IID_ID3D11DeviceChild, &IID_ID3D11View, &IID_ID3D11ShaderResourceView, NULL};
 static const GUID *const g_vs_iids[] = {&IID_ID3D11DeviceChild, &IID_ID3D11VertexShader, NULL};
 static const GUID *const g_ps_iids[] = {&IID_ID3D11DeviceChild, &IID_ID3D11PixelShader, NULL};
+static const GUID *const g_gs_iids[] = {&IID_ID3D11DeviceChild, &IID_ID3D11GeometryShader, NULL};
+static const GUID *const g_hs_iids[] = {&IID_ID3D11DeviceChild, &IID_ID3D11HullShader, NULL};
+static const GUID *const g_ds_iids[] = {&IID_ID3D11DeviceChild, &IID_ID3D11DomainShader, NULL};
 static const GUID *const g_layout_iids[] = {&IID_ID3D11DeviceChild, &IID_ID3D11InputLayout, NULL};
 static const GUID *const g_blend_iids[] = {&IID_ID3D11DeviceChild, &IID_ID3D11BlendState, NULL};
 static const GUID *const g_depth_iids[] = {&IID_ID3D11DeviceChild, &IID_ID3D11DepthStencilState, NULL};
@@ -448,6 +478,13 @@ static BOOL format_of(DXGI_FORMAT format, UINT bind, DXGI_FORMAT *stored, UINT *
     case DXGI_FORMAT_D32_FLOAT: case DXGI_FORMAT_D24_UNORM_S8_UINT: case DXGI_FORMAT_R32_TYPELESS: case DXGI_FORMAT_R24G8_TYPELESS:
       *bpp = *stored_bpp = 4;
       return *depth;
+    /* Block-compressed: kept as they are (the kernel decodes them where the device does not sample them so); sampled only. */
+    case DXGI_FORMAT_BC1_TYPELESS: case DXGI_FORMAT_BC1_UNORM: case DXGI_FORMAT_BC1_UNORM_SRGB:
+      *bpp = *stored_bpp = 8;
+      return !*depth && !(bind & (D3D11_BIND_RENDER_TARGET | D3D11_BIND_UNORDERED_ACCESS));
+    case DXGI_FORMAT_BC2_TYPELESS: case DXGI_FORMAT_BC2_UNORM: case DXGI_FORMAT_BC2_UNORM_SRGB: case DXGI_FORMAT_BC3_TYPELESS: case DXGI_FORMAT_BC3_UNORM: case DXGI_FORMAT_BC3_UNORM_SRGB:
+      *bpp = *stored_bpp = 16;
+      return !*depth && !(bind & (D3D11_BIND_RENDER_TARGET | D3D11_BIND_UNORDERED_ACCESS));
     case DXGI_FORMAT_D16_UNORM: case DXGI_FORMAT_R16_TYPELESS:
       *stored = DXGI_FORMAT_D32_FLOAT;
       *bpp = 2;
@@ -493,21 +530,35 @@ static HRESULT STDMETHODCALLTYPE dev_CreateBuffer(Dev *d, const D3D11_BUFFER_DES
 
 static UINT tex_subresources(const Tex *t) { return t->desc.MipLevels * t->desc.ArraySize; }
 static UINT mip_size(UINT size, UINT level) { size >>= level; return size ? size : 1; }
+/* The subresource of the Direct3D 12 texture that subresource `sub` of the program's is; FALSE for a level the kernel does not keep (see Tex.kmips). */
+static BOOL tex_d12_sub(const Tex *t, UINT sub, UINT *out) {
+  const UINT level = sub % t->desc.MipLevels, layer = sub / t->desc.MipLevels;
+  if (level >= t->kmips) return FALSE;
+  *out = level + layer * t->kmips;
+  return TRUE;
+}
+/* The bytes of a row of a level `w` pixels wide as the program has it (a row of blocks of a compressed format), and the rows of a level `h` high. */
+static UINT tex_pitch(const Tex *t, UINT w) { return t->block ? (w + 3) / 4 * t->block : w * t->bpp; }
+static UINT tex_rows(const Tex *t, UINT h) { return t->block ? (h + 3) / 4 : h; }
+/* The slices of a level of a volume (1 for the other kinds). */
+static UINT tex_slices(const Tex *t, UINT sub) { return t->kind == 1 ? mip_size(t->slices, sub % t->desc.MipLevels) : 1; }
 
 /* Sends rows of pixels (as the program has them, `pitch` bytes apart) into the rectangle (x, y, w, h) of a subresource. The list is sent with it. */
-static HRESULT tex_write(Dev *d, Tex *t, UINT sub, UINT x, UINT y, UINT w, UINT h, const BYTE *rows, UINT pitch) {
+static HRESULT tex_write(Dev *d, Tex *t, UINT sub, UINT x, UINT y, UINT z, UINT w, UINT h, const BYTE *rows, UINT pitch) {
   if (t->depth || w == 0 || h == 0) return E_INVALIDARG;
-  const UINT row_bytes = w * t->stored_bpp, row_pitch = (row_bytes + 255u) & ~255u;
+  UINT d12_sub;
+  if (!tex_d12_sub(t, sub, &d12_sub)) return S_OK;      /* (a level the kernel does not keep) */
+  const UINT row_bytes = t->block ? tex_pitch(t, w) : w * t->stored_bpp, row_pitch = (row_bytes + 255u) & ~255u, rows_of = tex_rows(t, h);
   /* The copy goes into the list in order with the draws: those recorded before it still see the old pixels, and a draw that samples the texture later sends
    * the list first (`written`, in draw_prepare). As with a render target, a texture the list has sampled already is not copied into in the same list. */
   settle(d, t->sampled);
-  const UINT64 upload_bytes = (UINT64)row_pitch * h;
+  const UINT64 upload_bytes = (UINT64)row_pitch * rows_of;
   if (!retire_room(d, upload_bytes)) flush(d);
   BYTE *memory = NULL;
   UINT64 upload_size = 0;
   ID3D12Resource *upload = take_upload(d, upload_bytes, &memory, &upload_size);
   if (!upload) return E_OUTOFMEMORY;
-  for (UINT row = 0; row < h; ++row) {
+  for (UINT row = 0; row < rows_of; ++row) {
     const BYTE *in = rows + (SIZE_T)row * pitch;
     BYTE *to = memory + (SIZE_T)row * row_pitch;
     if (!t->expand) memcpy(to, in, row_bytes);
@@ -525,7 +576,7 @@ static HRESULT tex_write(Dev *d, Tex *t, UINT sub, UINT x, UINT y, UINT w, UINT 
   memset(&from, 0, sizeof from);
   to.pResource = t->res;
   to.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-  to.SubresourceIndex = sub;
+  to.SubresourceIndex = d12_sub;
   from.pResource = upload;
   from.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
   from.PlacedFootprint.Footprint.Format = t->stored;
@@ -533,19 +584,21 @@ static HRESULT tex_write(Dev *d, Tex *t, UINT sub, UINT x, UINT y, UINT w, UINT 
   from.PlacedFootprint.Footprint.Height = h;
   from.PlacedFootprint.Footprint.Depth = 1;
   from.PlacedFootprint.Footprint.RowPitch = row_pitch;
-  ID3D12GraphicsCommandList_CopyTextureRegion(d->list, &to, x, y, 0, &from, NULL);
+  ID3D12GraphicsCommandList_CopyTextureRegion(d->list, &to, x, y, t->kind == 1 ? z : 0, &from, NULL);
   d->recorded = 1;
   t->used = t->written = d->epoch;
   retire(d, upload, NULL, upload_size);      /* (unmapped above: kept until the list has run, then a spare) */
   return S_OK;
 }
 
-/* Fetches a whole subresource as rows of `w * bpp` bytes, as the program has them. */
-static HRESULT tex_read(Dev *d, Tex *t, UINT sub, BYTE *rows) {
+/* Fetches a whole subresource (slice `z` of a volume's) as rows of `w * bpp` bytes, as the program has them. */
+static HRESULT tex_read(Dev *d, Tex *t, UINT sub, UINT z, BYTE *rows) {
   if (t->depth) return E_INVALIDARG;
   const UINT level = sub % t->desc.MipLevels, w = mip_size(t->desc.Width, level), h = mip_size(t->desc.Height, level);
-  const UINT row_pitch = (w * t->stored_bpp + 255u) & ~255u;
-  ID3D12Resource *readback = make_buffer(d, D3D12_HEAP_TYPE_READBACK, (UINT64)row_pitch * h);
+  UINT d12_sub;
+  if (!tex_d12_sub(t, sub, &d12_sub)) { memset(rows, 0, (SIZE_T)tex_pitch(t, w) * tex_rows(t, h)); return S_OK; }      /* (a level the kernel does not keep) */
+  const UINT row_pitch = ((t->block ? tex_pitch(t, w) : w * t->stored_bpp) + 255u) & ~255u, rows_of = tex_rows(t, h);
+  ID3D12Resource *readback = make_buffer(d, D3D12_HEAP_TYPE_READBACK, (UINT64)row_pitch * rows_of);
   if (!readback) return E_OUTOFMEMORY;
   D3D12_TEXTURE_COPY_LOCATION to, from;
   memset(&to, 0, sizeof to);
@@ -559,17 +612,18 @@ static HRESULT tex_read(Dev *d, Tex *t, UINT sub, BYTE *rows) {
   to.PlacedFootprint.Footprint.RowPitch = row_pitch;
   from.pResource = t->res;
   from.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-  from.SubresourceIndex = sub;
-  ID3D12GraphicsCommandList_CopyTextureRegion(d->list, &to, 0, 0, 0, &from, NULL);
+  from.SubresourceIndex = d12_sub;
+  const D3D12_BOX slice = {0, 0, z, w, h, z + 1};
+  ID3D12GraphicsCommandList_CopyTextureRegion(d->list, &to, 0, 0, 0, &from, t->kind == 1 ? &slice : NULL);
   d->recorded = 1;
   flush(d);
   const BYTE *memory = NULL;
   HRESULT hr = ID3D12Resource_Map(readback, 0, NULL, (void **)&memory);
   if (SUCCEEDED(hr) && memory) {
-    for (UINT row = 0; row < h; ++row) {
+    for (UINT row = 0; row < rows_of; ++row) {
       const BYTE *in = memory + (SIZE_T)row * row_pitch;
-      BYTE *to_row = rows + (SIZE_T)row * w * t->bpp;
-      if (!t->expand) memcpy(to_row, in, (SIZE_T)w * t->bpp);
+      BYTE *to_row = rows + (SIZE_T)row * tex_pitch(t, w);
+      if (!t->expand) memcpy(to_row, in, tex_pitch(t, w));
       else for (UINT i = 0; i < w; ++i) {
         if (t->expand == 3) { to_row[2 * i] = in[4 * i]; to_row[2 * i + 1] = in[4 * i + 1]; }
         else to_row[i] = in[4 * i + (t->expand == 1 ? 0 : 3)];
@@ -594,6 +648,8 @@ static void STDMETHODCALLTYPE tex_GetType(Tex *t, D3D11_RESOURCE_DIMENSION *type
 static void STDMETHODCALLTYPE tex_SetEvictionPriority(Tex *t, UINT priority) { (void)t; (void)priority; }
 static UINT STDMETHODCALLTYPE tex_GetEvictionPriority(Tex *t) { (void)t; return 0; }
 static void STDMETHODCALLTYPE tex_GetDesc(Tex *t, D3D11_TEXTURE2D_DESC *desc) { if (desc) *desc = t->desc; }
+static void STDMETHODCALLTYPE tex3_GetType(Tex *t, D3D11_RESOURCE_DIMENSION *type) { (void)t; if (type) *type = D3D11_RESOURCE_DIMENSION_TEXTURE3D; }
+static void STDMETHODCALLTYPE tex3_GetDesc(Tex *t, D3D11_TEXTURE3D_DESC *desc) { if (desc) *desc = t->desc3; }
 
 static void tex_dxgi_init(Tex *t);      /* (dxgi_resource.inc) */
 
@@ -619,26 +675,42 @@ static void tex_refused(const D3D11_TEXTURE2D_DESC *desc, const char *why) {
   dx_say(text);
 }
 
-/* A texture object around `res` (a reference is taken), or around a new Direct3D 12 texture when it is NULL. */
-static HRESULT tex_make(Dev *d, const D3D11_TEXTURE2D_DESC *in, ID3D12Resource *res, Tex **out) {
+/* A texture object around `res` (a reference is taken), or around a new Direct3D 12 texture when it is NULL. `slices`: 0 for a 2D texture, array or cube, else the
+ * depth of a volume (`in` then has one layer). */
+static HRESULT tex_make(Dev *d, const D3D11_TEXTURE2D_DESC *in, UINT slices, ID3D12Resource *res, Tex **out) {
   D3D11_TEXTURE2D_DESC desc = *in;
   *out = NULL;
   if (desc.Width == 0 || desc.Height == 0 || desc.ArraySize == 0) return E_INVALIDARG;
-  if (desc.Width > 4096 || desc.Height > 4096) { tex_refused(&desc, "larger than 4096"); return E_INVALIDARG; }
-  if (desc.MiscFlags & D3D11_RESOURCE_MISC_TEXTURECUBE) { tex_refused(&desc, "a cube"); return DXGI_ERROR_UNSUPPORTED; }
+  if (desc.Width > 4096 || desc.Height > 4096 || slices > 256) { tex_refused(&desc, "larger than 4096 (or a volume deeper than 256)"); return E_INVALIDARG; }
+  const BOOL cube = (desc.MiscFlags & D3D11_RESOURCE_MISC_TEXTURECUBE) != 0;
+  if (cube && (desc.ArraySize % 6 || desc.Width != desc.Height)) return E_INVALIDARG;
+  if (cube && desc.ArraySize != 6) { tex_refused(&desc, "an array of cubes"); return DXGI_ERROR_UNSUPPORTED; }
+  if (desc.ArraySize > 256) { tex_refused(&desc, "an array of more than 256"); return E_INVALIDARG; }
+  const BOOL layered = cube || slices || desc.ArraySize > 1;
+  /* (the kernel samples volumes, arrays and cubes; it does not draw into them) */
+  if (layered && (desc.BindFlags & (D3D11_BIND_RENDER_TARGET | D3D11_BIND_DEPTH_STENCIL | D3D11_BIND_UNORDERED_ACCESS))) {
+    tex_refused(&desc, slices ? "a volume to draw into" : cube ? "a cube to draw into" : "an array to draw into");
+    return DXGI_ERROR_UNSUPPORTED;
+  }
   const BOOL target = (desc.BindFlags & (D3D11_BIND_RENDER_TARGET | D3D11_BIND_DEPTH_STENCIL)) != 0;
   /* (a multisampled texture: a render target or depth buffer of one level and one layer, drawn into and resolved; the adapter says which counts it has) */
   if (desc.SampleDesc.Count == 0) return E_INVALIDARG;
   if (desc.SampleDesc.Count > 1 && (!target || desc.ArraySize != 1 || desc.CPUAccessFlags || desc.Usage != D3D11_USAGE_DEFAULT)) { tex_refused(&desc, "multisampled"); return E_INVALIDARG; }
   UINT full = 1;
-  for (UINT size = desc.Width > desc.Height ? desc.Width : desc.Height; size > 1; size >>= 1) ++full;
+  UINT largest = desc.Width > desc.Height ? desc.Width : desc.Height;
+  if (slices > largest) largest = slices;
+  for (UINT size = largest; size > 1; size >>= 1) ++full;
   /* (a render target has one level here: the kernel draws into those only) */
-  if (target || desc.ArraySize > 1 || desc.SampleDesc.Count > 1) desc.MipLevels = 1;
+  if (target || desc.SampleDesc.Count > 1) desc.MipLevels = 1;
   else if (desc.MipLevels == 0 || desc.MipLevels > full) desc.MipLevels = full;
   Tex *t = child_new(sizeof *t, d, &tex_vtbl, g_tex_iids, tex_destroy);
   if (!t) return E_OUTOFMEMORY;
   tex_dxgi_init(t);
   t->desc = desc;
+  t->kind = slices ? 1 : cube ? 3 : desc.ArraySize > 1 ? 2 : 0;
+  t->block = (desc.Format >= DXGI_FORMAT_BC1_TYPELESS && desc.Format <= DXGI_FORMAT_BC3_UNORM_SRGB) ? t->bpp : 0;
+  t->slices = slices ? slices : 1;
+  t->kmips = layered ? 1 : desc.MipLevels;      /* (the kernel's volumes, arrays and cubes have one level: the program's others are dropped) */
   if (!format_of(desc.Format, desc.BindFlags, &t->stored, &t->bpp, &t->stored_bpp, &t->expand, &t->depth)) { tex_refused(&desc, "the format, for that use"); dx_Release(OBJ(t)); return E_INVALIDARG; }
   t->shadow = mem_alloc(sizeof(BYTE *) * tex_subresources(t));
   t->mapped = mem_alloc(sizeof(D3D11_MAP) * tex_subresources(t));
@@ -648,10 +720,11 @@ static HRESULT tex_make(Dev *d, const D3D11_TEXTURE2D_DESC *in, ID3D12Resource *
     t->res = res;
   } else {
     D3D12_HEAP_PROPERTIES props = {D3D12_HEAP_TYPE_DEFAULT, D3D12_CPU_PAGE_PROPERTY_UNKNOWN, D3D12_MEMORY_POOL_UNKNOWN, 1, 1};
-    D3D12_RESOURCE_DESC rd = {D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, desc.Width, desc.Height, (UINT16)desc.ArraySize, (UINT16)desc.MipLevels, t->stored, {desc.SampleDesc.Count, 0},
-                              D3D12_TEXTURE_LAYOUT_UNKNOWN, D3D12_RESOURCE_FLAG_NONE};
+    D3D12_RESOURCE_DESC rd = {slices ? D3D12_RESOURCE_DIMENSION_TEXTURE3D : D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, desc.Width, desc.Height,
+                              (UINT16)(slices ? slices : desc.ArraySize), (UINT16)t->kmips, t->stored, {desc.SampleDesc.Count, 0}, D3D12_TEXTURE_LAYOUT_UNKNOWN, D3D12_RESOURCE_FLAG_NONE};
     if (desc.BindFlags & D3D11_BIND_RENDER_TARGET) rd.Flags |= D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
     if (t->depth) rd.Flags |= D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
+    if (cube) TcosD3D12ResourceOptions(d->d12, TCOS_RESOURCE_CUBE);      /* (Direct3D 12 knows a cube only by its views; the kernel has to know it now) */
     const HRESULT hr = ID3D12Device_CreateCommittedResource(d->d12, &props, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_COMMON, NULL, &IID_ID3D12Resource, (void **)&t->res);
     if (FAILED(hr) || !t->res) { tex_refused(&desc, "Direct3D 12 below refused it"); dx_Release(OBJ(t)); return FAILED(hr) ? hr : E_FAIL; }
   }
@@ -659,18 +732,47 @@ static HRESULT tex_make(Dev *d, const D3D11_TEXTURE2D_DESC *in, ID3D12Resource *
   return S_OK;
 }
 
+/* The contents a texture is made with: every subresource (each slice of a volume's levels), in the program's order. */
+static HRESULT tex_initial(Dev *d, Tex *t, const D3D11_SUBRESOURCE_DATA *initial) {
+  HRESULT hr = S_OK;
+  for (UINT sub = 0; SUCCEEDED(hr) && sub < tex_subresources(t); ++sub) {
+    if (!initial[sub].pSysMem) continue;
+    const UINT level = sub % t->desc.MipLevels, w = mip_size(t->desc.Width, level), h = mip_size(t->desc.Height, level);
+    const UINT pitch = initial[sub].SysMemPitch ? initial[sub].SysMemPitch : tex_pitch(t, w);
+    const UINT slice_pitch = initial[sub].SysMemSlicePitch ? initial[sub].SysMemSlicePitch : pitch * tex_rows(t, h);
+    for (UINT z = 0; SUCCEEDED(hr) && z < tex_slices(t, sub); ++z)
+      hr = tex_write(d, t, sub, 0, 0, z, w, h, (const BYTE *)initial[sub].pSysMem + (SIZE_T)z * slice_pitch, pitch);
+  }
+  return hr;
+}
+
 static HRESULT STDMETHODCALLTYPE dev_CreateTexture2D(Dev *d, const D3D11_TEXTURE2D_DESC *desc, const D3D11_SUBRESOURCE_DATA *initial, ID3D11Texture2D **out) {
   if (out) *out = NULL;
   if (!desc) return E_INVALIDARG;
   Tex *t = NULL;
   EnterCriticalSection(&d->lock);
-  HRESULT hr = tex_make(d, desc, NULL, &t);
-  if (SUCCEEDED(hr) && initial && !t->depth) {
-    for (UINT sub = 0; SUCCEEDED(hr) && sub < tex_subresources(t); ++sub) {
-      if (!initial[sub].pSysMem) continue;
-      const UINT level = sub % t->desc.MipLevels, w = mip_size(t->desc.Width, level), h = mip_size(t->desc.Height, level);
-      hr = tex_write(d, t, sub, 0, 0, w, h, initial[sub].pSysMem, initial[sub].SysMemPitch ? initial[sub].SysMemPitch : w * t->bpp);
-    }
+  HRESULT hr = tex_make(d, desc, 0, NULL, &t);
+  if (SUCCEEDED(hr) && initial && !t->depth) hr = tex_initial(d, t, initial);
+  LeaveCriticalSection(&d->lock);
+  if (FAILED(hr)) { if (t) dx_Release(OBJ(t)); return hr; }
+  return give(t, (void **)out);
+}
+
+static HRESULT STDMETHODCALLTYPE dev_CreateTexture3D(Dev *d, const D3D11_TEXTURE3D_DESC *desc, const D3D11_SUBRESOURCE_DATA *initial, ID3D11Texture3D **out) {
+  extern const ID3D11Texture3DVtbl tex3_vtbl;
+  if (out) *out = NULL;
+  if (!desc || desc->Depth == 0) return E_INVALIDARG;
+  const D3D11_TEXTURE2D_DESC as2d = {desc->Width, desc->Height, desc->MipLevels, 1, desc->Format, {1, 0}, desc->Usage, desc->BindFlags, desc->CPUAccessFlags,
+                                     desc->MiscFlags & ~(UINT)D3D11_RESOURCE_MISC_TEXTURECUBE};
+  Tex *t = NULL;
+  EnterCriticalSection(&d->lock);
+  HRESULT hr = tex_make(d, &as2d, desc->Depth, NULL, &t);
+  if (SUCCEEDED(hr)) {
+    t->c.o.lpVtbl = (const void *)&tex3_vtbl;
+    t->c.o.iids = g_tex3_iids;
+    t->desc3 = *desc;
+    t->desc3.MipLevels = t->desc.MipLevels;
+    if (initial && !t->depth) hr = tex_initial(d, t, initial);
   }
   LeaveCriticalSection(&d->lock);
   if (FAILED(hr)) { if (t) dx_Release(OBJ(t)); return hr; }
@@ -680,7 +782,8 @@ static HRESULT STDMETHODCALLTYPE dev_CreateTexture2D(Dev *d, const D3D11_TEXTURE
 /* ---- views --------------------------------------------------------------------------------------------------------------------------------------------- */
 
 static Tex *tex_of_resource(ID3D11Resource *resource) {
-  if (!resource || ((DxObj *)resource)->lpVtbl != (const void *)&tex_vtbl) return NULL;
+  extern const ID3D11Texture3DVtbl tex3_vtbl;
+  if (!resource || (((DxObj *)resource)->lpVtbl != (const void *)&tex_vtbl && ((DxObj *)resource)->lpVtbl != (const void *)&tex3_vtbl)) return NULL;
   return (Tex *)resource;
 }
 static void STDMETHODCALLTYPE view_GetResource(View *v, ID3D11Resource **out) {
@@ -772,9 +875,14 @@ static HRESULT STDMETHODCALLTYPE dev_CreateShaderResourceView(Dev *d, ID3D11Reso
   v->tex = t;
   if (desc) v->desc.srv = *desc;
   else {
+    /* (the whole texture, as what it is) */
     v->desc.srv.Format = t->desc.Format;
-    v->desc.srv.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
-    v->desc.srv.Texture2D.MipLevels = t->desc.MipLevels;
+    switch (t->kind) {
+      case 1: v->desc.srv.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE3D; v->desc.srv.Texture3D.MipLevels = t->desc.MipLevels; break;
+      case 2: v->desc.srv.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2DARRAY; v->desc.srv.Texture2DArray.MipLevels = t->desc.MipLevels; v->desc.srv.Texture2DArray.ArraySize = t->desc.ArraySize; break;
+      case 3: v->desc.srv.ViewDimension = D3D11_SRV_DIMENSION_TEXTURECUBE; v->desc.srv.TextureCube.MipLevels = t->desc.MipLevels; break;
+      default: v->desc.srv.ViewDimension = t->desc.SampleDesc.Count > 1 ? D3D11_SRV_DIMENSION_TEXTURE2DMS : D3D11_SRV_DIMENSION_TEXTURE2D; v->desc.srv.Texture2D.MipLevels = t->desc.MipLevels; break;
+    }
   }
   return give(v, (void **)out);
 }
@@ -808,6 +916,16 @@ static void shader_constants(Shader *s) {
       length = (token >> 24) & 0x7F;
       if (op == 53 /* customdata */) { if (w + 1 >= words) return; memcpy(&length, code + 4 * (w + 1), 4); }
       if (length == 0 || length > words - w) return;
+      if (op == 88 /* dcl_resource: the dimension in the token, then the operand and its register */ && length >= 3) {
+        UINT operand, slot;
+        const UINT dimension = (token >> 11) & 0x1F;
+        memcpy(&operand, code + 4 * (w + 1), 4);
+        const UINT k = w + ((operand >> 31) ? 3 : 2);
+        if (k < w + length && ((operand >> 20) & 3) == 1) {      /* (one immediate index: SM 4 / 5.0) */
+          memcpy(&slot, code + 4 * k, 4);
+          if (slot < TEXTURE_SLOTS) s->tex_kind[slot] = dimension == 5 ? 1 : dimension == 8 ? 2 : dimension == 6 ? 3 : 0;
+        }
+      }
       if (op == 89 /* dcl_constantbuffer: the operand, then the slot and the size in registers */ && length >= 4) {
         UINT operand, slot, registers, k = w + 1;
         memcpy(&operand, code + 4 * k, 4);
@@ -834,6 +952,7 @@ static HRESULT shader_make(Dev *d, const void *code, SIZE_T bytes, const void *v
   if (!s->code) { dx_Release(OBJ(s)); return E_OUTOFMEMORY; }
   memcpy(s->code, code, bytes);
   s->bytes = bytes;
+  memset(s->tex_kind, 0xFF, sizeof s->tex_kind);
   shader_constants(s);
   if (s->registers * 16 > CONSTANT_BLOCK) { dx_Release(OBJ(s)); return E_INVALIDARG; }
   return give(s, out);
@@ -845,6 +964,19 @@ static HRESULT STDMETHODCALLTYPE dev_CreateVertexShader(Dev *d, const void *code
 static HRESULT STDMETHODCALLTYPE dev_CreatePixelShader(Dev *d, const void *code, SIZE_T bytes, ID3D11ClassLinkage *linkage, ID3D11PixelShader **out) {
   (void)linkage;
   return shader_make(d, code, bytes, &ps_vtbl, g_ps_iids, (void **)out);
+}
+/* (geometry, hull and domain shaders go into the pipeline as they are: the kernel takes gs_4_0 / gs_5_0, hs_5_0 and ds_5_0; see docs/Direct3DKernelMode.md) */
+static HRESULT STDMETHODCALLTYPE dev_CreateGeometryShader(Dev *d, const void *code, SIZE_T bytes, ID3D11ClassLinkage *linkage, ID3D11GeometryShader **out) {
+  (void)linkage;
+  return shader_make(d, code, bytes, &gs_vtbl, g_gs_iids, (void **)out);
+}
+static HRESULT STDMETHODCALLTYPE dev_CreateHullShader(Dev *d, const void *code, SIZE_T bytes, ID3D11ClassLinkage *linkage, ID3D11HullShader **out) {
+  (void)linkage;
+  return shader_make(d, code, bytes, &hs_vtbl, g_hs_iids, (void **)out);
+}
+static HRESULT STDMETHODCALLTYPE dev_CreateDomainShader(Dev *d, const void *code, SIZE_T bytes, ID3D11ClassLinkage *linkage, ID3D11DomainShader **out) {
+  (void)linkage;
+  return shader_make(d, code, bytes, &ds_vtbl, g_ds_iids, (void **)out);
 }
 
 /* The floats a vertex element is for the pipeline (1 .. 4), and whether it has to be converted to them; 0 for a format that cannot be had. */

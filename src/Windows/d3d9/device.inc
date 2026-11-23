@@ -374,6 +374,7 @@ static void dev_destroy(DxObj *o) {
   state_release(&d->state);
   targets_release(d);
   if (d->blank) { take_device_reference(d); dx_Release(OBJ(d->blank)); }
+  for (UINT k = 0; k < 4; ++k) if (d->blank_kind[k]) { take_device_reference(d); dx_Release(OBJ(d->blank_kind[k])); }
   for (UINT i = 0; i < d->fixed_count; ++i) { take_device_reference(d); dx_Release(OBJ(d->fixed[i].shader)); }
   for (UINT i = 0; i < d->pipeline_count; ++i) if (d->pipelines[i].state) ID3D12PipelineState_Release(d->pipelines[i].state);
   if (d->vertex_ring) ID3D12Resource_Release(d->vertex_ring);
@@ -440,6 +441,20 @@ static HRESULT dev_start(Dev *d) {
   memset(d->blank->shadow[0], 255, 4);
   hr = tex_upload(d, d->blank, 0);
   if (FAILED(hr)) return hr;
+  /* (and a white volume and cube, for samplers declared as those with nothing of their kind set; an adapter without them has none, and gets the 2D one) */
+  for (UINT kind = 1; kind <= 3; kind += 2) {
+    Tex *t = NULL;
+    if (FAILED(tex_make_kind(d, kind, 1, 1, 1, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT, FALSE, NULL, &t))) continue;
+    forget_device_reference(d);
+    d->blank_kind[kind] = t;
+    for (UINT sub = 0; sub < tex_subresources(t); ++sub) {
+      t->shadow[sub] = mem_alloc(4);
+      if (!t->shadow[sub]) return E_OUTOFMEMORY;
+      memset(t->shadow[sub], 255, 4);
+      hr = tex_upload(d, t, sub);
+      if (FAILED(hr)) return hr;
+    }
+  }
   hr = targets_make(d);
   if (FAILED(hr)) return hr;
   state_defaults(&d->state, d->auto_depth != NULL, d->back->width, d->back->height);
@@ -486,9 +501,11 @@ static HRESULT STDMETHODCALLTYPE d3d_CheckDeviceType(Direct3D *o, UINT adapter, 
 static HRESULT STDMETHODCALLTYPE d3d_CheckDeviceFormat(Direct3D *o, UINT adapter, D3DDEVTYPE type, D3DFORMAT display, DWORD usage, D3DRESOURCETYPE resource, D3DFORMAT format) {
   (void)o; (void)type; (void)display;
   if (adapter != 0) return D3DERR_INVALIDCALL;
-  if (resource != D3DRTYPE_SURFACE && resource != D3DRTYPE_TEXTURE) return D3DERR_NOTAVAILABLE;      /* (no cube or volume textures) */
-  if (usage & D3DUSAGE_DEPTHSTENCIL) return format_is_depth(format) ? D3D_OK : D3DERR_NOTAVAILABLE;
-  if (usage & D3DUSAGE_RENDERTARGET) return display_format(format) ? D3D_OK : D3DERR_NOTAVAILABLE;
+  if (resource != D3DRTYPE_SURFACE && resource != D3DRTYPE_TEXTURE && resource != D3DRTYPE_CUBETEXTURE && resource != D3DRTYPE_VOLUMETEXTURE) return D3DERR_NOTAVAILABLE;
+  const BOOL layered = resource == D3DRTYPE_CUBETEXTURE || resource == D3DRTYPE_VOLUMETEXTURE;      /* (sampled only: nothing draws into a cube or a volume here) */
+  if (usage & D3DUSAGE_DEPTHSTENCIL) return format_is_depth(format) && !layered ? D3D_OK : D3DERR_NOTAVAILABLE;
+  if (usage & D3DUSAGE_RENDERTARGET) return display_format(format) && !layered ? D3D_OK : D3DERR_NOTAVAILABLE;
+  if (dxt_block(format)) return resource != D3DRTYPE_VOLUMETEXTURE ? D3D_OK : D3DERR_NOTAVAILABLE;      /* (DXT1 .. DXT5: 2D textures and cubes) */
   return format_bytes(format) ? D3D_OK : D3DERR_NOTAVAILABLE;
 }
 static HRESULT STDMETHODCALLTYPE d3d_CheckDeviceMultiSampleType(Direct3D *o, UINT adapter, D3DDEVTYPE type, D3DFORMAT format, BOOL windowed, D3DMULTISAMPLE_TYPE samples,

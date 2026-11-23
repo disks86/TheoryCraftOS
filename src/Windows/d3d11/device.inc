@@ -168,7 +168,7 @@ static HRESULT STDMETHODCALLTYPE pres_CreateBackBuffers(ITcosPresenter *p, UINT 
   D3D11_TEXTURE2D_DESC desc = {width, height, 1, 1, format, {1, 0}, D3D11_USAGE_DEFAULT, D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE, 0, 0};
   for (UINT i = 0; i < count; ++i) {
     Tex *t = NULL;
-    if (SUCCEEDED(hr)) hr = tex_make(d, &desc, (ID3D12Resource *)made[i], &t);
+    if (SUCCEEDED(hr)) hr = tex_make(d, &desc, 0, (ID3D12Resource *)made[i], &t);
     made[i]->lpVtbl->Release(made[i]);
     out[i] = (IUnknown *)t;
   }
@@ -197,6 +197,7 @@ static void dev_destroy(DxObj *o) {
   if (d->list) flush(d);
   if (d->ctx) { ctx_unbind_all(d->ctx); mem_free(d->ctx); }
   if (d->blank) dx_Release(OBJ(d->blank));
+  for (UINT k = 0; k < 4; ++k) if (d->blank_kind[k]) dx_Release(OBJ(d->blank_kind[k]));
   for (UINT i = 0; i < d->pipeline_count; ++i) if (d->pipelines[i].state) ID3D12PipelineState_Release(d->pipelines[i].state);
   if (d->ring) ID3D12Resource_Release(d->ring);
   spares_release(d);
@@ -269,11 +270,22 @@ static HRESULT dev_start(Dev *d) {
 
   static const BYTE white[4] = {255, 255, 255, 255};
   D3D11_TEXTURE2D_DESC blank = {1, 1, 1, 1, DXGI_FORMAT_R8G8B8A8_UNORM, {1, 0}, D3D11_USAGE_DEFAULT, D3D11_BIND_SHADER_RESOURCE, 0, 0};
-  hr = tex_make(d, &blank, NULL, &d->blank);
+  hr = tex_make(d, &blank, 0, NULL, &d->blank);
   if (FAILED(hr)) return hr;
   InterlockedDecrement(&d->o.ref);      /* (the device's own texture does not hold the device) */
-  hr = tex_write(d, d->blank, 0, 0, 0, 1, 1, white, 4);
+  hr = tex_write(d, d->blank, 0, 0, 0, 0, 1, 1, white, 4);
   if (FAILED(hr)) return hr;
+  /* (and a white volume, array and cube: what a slot a shader declares as one samples when nothing is bound; an adapter without them gets none, and the 2D one) */
+  for (UINT kind = 1; kind <= 3; ++kind) {
+    D3D11_TEXTURE2D_DESC layered = blank;
+    layered.ArraySize = kind == 3 ? 6 : kind == 2 ? 2 : 1;
+    if (kind == 3) layered.MiscFlags = D3D11_RESOURCE_MISC_TEXTURECUBE;
+    Tex *t = NULL;
+    if (FAILED(tex_make(d, &layered, kind == 1 ? 1 : 0, NULL, &t))) continue;
+    InterlockedDecrement(&d->o.ref);
+    for (UINT layer = 0; layer < layered.ArraySize; ++layer) tex_write(d, t, layer, 0, 0, 0, 1, 1, white, 4);
+    d->blank_kind[kind] = t;
+  }
 
   Ctx *c = mem_alloc(sizeof *c);
   if (!c) return E_OUTOFMEMORY;

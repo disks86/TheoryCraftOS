@@ -168,6 +168,7 @@ class VidMm {
   friend class Allocation;
   void forget(Allocation& a);   // called by ~Allocation
   bool upload(Allocation& a);
+  bool upload_compressed(Allocation& a);   // (the part of upload for a block-compressed texture)
   void gather_tiles(Allocation& a);
   void scatter_tiles(Allocation& a);
   void release_device_object(Allocation& a);

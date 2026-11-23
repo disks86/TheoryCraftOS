@@ -87,6 +87,13 @@ constexpr uint32_t kFormatR16G16B16A16Sint = 192;
 constexpr uint32_t kFormatR8G8B8A8Uint = 180;
 constexpr uint32_t kFormatR16G16B16A16Snorm = 59;
 constexpr uint32_t kFormatR10G10B10A2Unorm = 8;
+// The S3TC formats (virglrenderer's virgl_hw.h): BC1 is DXT1 with its one-bit alpha, BC2 DXT3, BC3 DXT5.
+constexpr uint32_t kFormatDxt1Rgba = 106;
+constexpr uint32_t kFormatDxt3Rgba = 107;
+constexpr uint32_t kFormatDxt5Rgba = 108;
+constexpr uint32_t kFormatDxt1Srgba = 110;
+constexpr uint32_t kFormatDxt3Srgba = 111;
+constexpr uint32_t kFormatDxt5Srgba = 112;
 
 // Resource bind flags (VIRGL_BIND_*).
 constexpr uint32_t kBindDepthStencil = 1u << 0;

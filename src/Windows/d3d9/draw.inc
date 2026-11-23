@@ -563,15 +563,26 @@ static UINT64 constants_of(Dev *d, const Layout *l, const Shader *vs, const Shad
   return ID3D12Resource_GetGPUVirtualAddress(d->constant_ring) + d->constant_last;
 }
 
+/* What stage `i` of a draw with pixel shader `ps` samples: the texture set there when it is of the kind the shader declares (the kernel refuses a draw with a
+ * texture of another kind), else a white one of that kind. */
+static Tex *stage_texture(const Dev *d, const Shader *ps, UINT i) {
+  Tex *t = d->state.tex[i];
+  const UINT kind = ps && i < 16 ? ps->sampler_kind[i] : 0;
+  if (t && t->res && !t->depth && t->kind == kind) return t;
+  return kind && kind < 4 && d->blank_kind[kind] ? d->blank_kind[kind] : d->blank;
+}
+
 /* The textures and samplers of the first `slots` stages: a table of each, made again when what is set changed. */
-static void tables_of(Dev *d, UINT slots) {
+static void tables_of(Dev *d, UINT slots, const Shader *ps) {
   const State *s = &d->state;
   UINT ids[TEXTURE_SLOTS];
+  Tex *textures[TEXTURE_SLOTS];
   DWORD samplers[TEXTURE_SLOTS][4];
   if (d->table_count != slots) d->tables_valid = 0;
   d->table_count = slots;
   for (UINT i = 0; i < slots; ++i) {
-    ids[i] = s->tex[i] && s->tex[i]->res && !s->tex[i]->depth ? s->tex[i]->c.id : 0;
+    textures[i] = stage_texture(d, ps, i);
+    ids[i] = textures[i]->c.id;
     samplers[i][0] = s->sampler[i][D3DSAMP_ADDRESSU] | s->sampler[i][D3DSAMP_ADDRESSV] << 8;
     samplers[i][1] = s->sampler[i][D3DSAMP_MAGFILTER];
     samplers[i][2] = s->sampler[i][D3DSAMP_MINFILTER];
@@ -585,7 +596,7 @@ static void tables_of(Dev *d, UINT slots) {
     at.ptr += (SIZE_T)d->view_used * step_views;
     d->table_views = gpu.ptr + (UINT64)d->view_used * step_views;
     for (UINT i = 0; i < slots; ++i) {
-      ID3D12Device_CreateShaderResourceView(d->d12, ids[i] ? s->tex[i]->res : d->blank->res, NULL, at);
+      ID3D12Device_CreateShaderResourceView(d->d12, textures[i]->res, NULL, at);
       at.ptr += step_views;
     }
     d->view_used += slots;
@@ -744,7 +755,7 @@ static HRESULT draw(Dev *d, D3DPRIMITIVETYPE type, UINT primitives, const Source
   D3D12_VERTEX_BUFFER_VIEW vertex_view = {ID3D12Resource_GetGPUVirtualAddress(d->vertex_ring) + vertex_at, vertices * stride, stride};
   ID3D12GraphicsCommandList_IASetVertexBuffers(list, 0, 1, &vertex_view);
   ID3D12GraphicsCommandList_SetGraphicsRootConstantBufferView(list, 0, constants_of(d, &layout, vs, ps, d->state.ps == NULL));
-  tables_of(d, slots);
+  tables_of(d, slots, ps);
   D3D12_GPU_DESCRIPTOR_HANDLE views = {d->table_views}, samplers = {d->table_samplers};
   ID3D12GraphicsCommandList_SetGraphicsRootDescriptorTable(list, 1, views);
   ID3D12GraphicsCommandList_SetGraphicsRootDescriptorTable(list, 2, samplers);
