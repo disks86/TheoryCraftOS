@@ -1295,6 +1295,7 @@ Adapter::Adapter(allocators::IAllocator& allocator, graphics::IGraphicsDevice& d
   const char* name = config.name ? config.name : info.name;
   for (uint32_t i = 0; name && name[i] && i + 1 < sizeof(caps_.name); ++i) caps_.name[i] = name[i];
   caps_.sample_counts = info.sample_counts;
+  caps_.blend_constant = info.blend_constant;
   caps_.device_kind = static_cast<uint32_t>(info.kind);
   // The vendor the name says (the names are those of the devices in src/Graphics/Graphics3D); the virtual GPUs have their hypervisor's.
   auto name_has = [&](const char* part) {
@@ -1535,13 +1536,20 @@ NtStatus Adapter::create_pipeline(const PipelineDesc& d, const SharedPointer<Sha
   if (st.enable && !caps_.stencil) return status::kNotSupported;
   // The state beyond the base interface, for the devices that have it.
   const graphics::BlendState& bs = d.blend;
-  if (static_cast<uint32_t>(d.depth_compare) > 7 || static_cast<uint32_t>(bs.src_color) > 10 || static_cast<uint32_t>(bs.dst_color) > 10 || static_cast<uint32_t>(bs.src_alpha) > 10 ||
-      static_cast<uint32_t>(bs.dst_alpha) > 10 || static_cast<uint32_t>(bs.color_op) > 4 || static_cast<uint32_t>(bs.alpha_op) > 4 || bs.write_mask > 0xF)
+  constexpr uint32_t kLastFactor = graphics::kBlendFactorCount - 1;
+  if (static_cast<uint32_t>(d.depth_compare) > 7 || static_cast<uint32_t>(bs.src_color) > kLastFactor || static_cast<uint32_t>(bs.dst_color) > kLastFactor ||
+      static_cast<uint32_t>(bs.src_alpha) > kLastFactor || static_cast<uint32_t>(bs.dst_alpha) > kLastFactor || static_cast<uint32_t>(bs.color_op) > 4 ||
+      static_cast<uint32_t>(bs.alpha_op) > 4 || bs.write_mask > 0xF)
     return status::kInvalidParameter;
   for (const graphics::BlendState& t : d.target_blend)
-    if (static_cast<uint32_t>(t.src_color) > 10 || static_cast<uint32_t>(t.dst_color) > 10 || static_cast<uint32_t>(t.src_alpha) > 10 || static_cast<uint32_t>(t.dst_alpha) > 10 ||
-        static_cast<uint32_t>(t.color_op) > 4 || static_cast<uint32_t>(t.alpha_op) > 4 || t.write_mask > 0xF)
+    if (static_cast<uint32_t>(t.src_color) > kLastFactor || static_cast<uint32_t>(t.dst_color) > kLastFactor || static_cast<uint32_t>(t.src_alpha) > kLastFactor ||
+        static_cast<uint32_t>(t.dst_alpha) > kLastFactor || static_cast<uint32_t>(t.color_op) > 4 || static_cast<uint32_t>(t.alpha_op) > 4 || t.write_mask > 0xF)
       return status::kInvalidParameter;
+  // (the constant factors: a device that has them, DeviceInfo::blend_constant)
+  bool constant_factors = bs.custom && bs.uses_constant();
+  if (d.independent_blend)
+    for (const graphics::BlendState& t : d.target_blend) constant_factors = constant_factors || (t.custom && t.uses_constant());
+  if (constant_factors && !caps_.blend_constant) return status::kNotSupported;
   if (d.independent_blend && !(caps_.features & graphics::kFeatureIndependentBlend)) return status::kNotSupported;
   if ((d.multisample || d.alpha_to_coverage) && !(caps_.features & graphics::kFeatureMultisample)) return status::kNotSupported;
   if (d.alpha_to_coverage && !d.multisample) return status::kInvalidParameter;

@@ -197,11 +197,18 @@ struct Dev {
   UINT next_shader_kind;   /* ... and the kernel's kind of its shaders (0: DXBC / DXIL) */
   UINT next_stage_base[3]; /* TcosD3D12StageConstantBases: ... where the geometry, hull and domain shaders' constant buffers begin */
   UINT next_resource_flags;/* TcosD3D12ResourceOptions: for the next resource made (TCOS_RESOURCE_CUBE) */
+  struct Fence *fences;    /* the device's fences (RemoveDevice signals them all) */
+  SRWLOCK fence_lock;
+  struct ShaderCache *caches;      /* the shader cache sessions open (library.inc), for ShaderCacheControl */
+  SRWLOCK cache_lock;
 };
 #define DEV_FEATURE_STREAM_OUTPUT (1u << 21)      /* graphics::kFeatureStreamOutput in KmtCaps.features */
+#define DEV_FEATURE_DEPTH_RESOLVE (1u << 19)      /* graphics::kFeatureDepthResolve */
+#define DEV_FEATURE_RESOLVE_MODES (1u << 20)      /* graphics::kFeatureResolveModes: resolves of the least, greatest (and a depth image's mean) samples */
 #define DEV_FEATURE_VERTEX_FORMATS (1u << 29)     /* graphics::kFeatureVertexFormats: vertex elements other than 32-bit floats */
 
-static const GUID *const g_device_iids[] = {&IID_ID3D12Object, &IID_ID3D12Device, NULL};
+static const GUID *const g_device_iids[] = {&IID_ID3D12Object, &IID_ID3D12Device, &IID_ID3D12Device1, &IID_ID3D12Device2, &IID_ID3D12Device3, &IID_ID3D12Device4,
+                                            &IID_ID3D12Device5, &IID_ID3D12Device6, &IID_ID3D12Device7, &IID_ID3D12Device8, &IID_ID3D12Device9, &IID_ID3D12Device10, NULL};
 
 static void dev_addref(Dev *d) { dx_AddRef(OBJ(d)); }
 static void dev_release(Dev *d) { dx_Release(OBJ(d)); }

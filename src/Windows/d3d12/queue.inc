@@ -32,26 +32,41 @@ typedef struct Queue {
 typedef struct Fence {
   DObj d;
   UINT sync;
+  D3D12_FENCE_FLAGS flags;
+  struct Fence *next, *prev;      /* Dev.fences */
 } Fence;
 
 static const GUID *const g_queue_iids[] = {&IID_ID3D12Object, &IID_ID3D12DeviceChild, &IID_ID3D12Pageable, &IID_ID3D12CommandQueue, NULL};
-static const GUID *const g_fence_iids[] = {&IID_ID3D12Object, &IID_ID3D12DeviceChild, &IID_ID3D12Pageable, &IID_ID3D12Fence, NULL};
+static const GUID *const g_fence_iids[] = {&IID_ID3D12Object, &IID_ID3D12DeviceChild, &IID_ID3D12Pageable, &IID_ID3D12Fence, &IID_ID3D12Fence1, NULL};
 
 /* ---- fences ---------------------------------------------------------------------------------------------------------------------------------------------------------------------- */
 
 static void fence_destroy(DxObj *o) {
   Fence *f = (Fence *)o;
+  Dev *d = f->d.dev;
+  AcquireSRWLockExclusive(&d->fence_lock);
+  if (f->prev) f->prev->next = f->next;
+  else if (d->fences == f) d->fences = f->next;
+  if (f->next) f->next->prev = f->prev;
+  ReleaseSRWLockExclusive(&d->fence_lock);
   if (f->sync) kmt_destroy_sync(f->sync);
   dobj_child_destroy(o);
 }
 
 static HRESULT STDMETHODCALLTYPE dev_CreateFence(Dev *This, UINT64 initial, D3D12_FENCE_FLAGS flags, REFIID riid, void **out) {
-  extern const ID3D12FenceVtbl fence_vtbl;
+  extern const ID3D12Fence1Vtbl fence_vtbl;
   if (flags & ~D3D12_FENCE_FLAG_NONE) return DXGI_ERROR_UNSUPPORTED;      /* (shared fences need sharing of synchronization objects, which the kernel does not do) */
   Fence *f = dobj_new(sizeof *f, This, &fence_vtbl, g_fence_iids, fence_destroy);
   if (!f) return E_OUTOFMEMORY;
   const NTSTATUS st = kmt_create_fence(This->kdev, initial, &f->sync);
   if (!KMT_OK(st)) { dx_Release(OBJ(f)); return hr_from(st); }
+  f->flags = flags;
+  AcquireSRWLockExclusive(&This->fence_lock);
+  f->next = This->fences;
+  if (f->next) f->next->prev = f;
+  This->fences = f;
+  ReleaseSRWLockExclusive(&This->fence_lock);
+  if (InterlockedCompareExchange(&This->removed, 0, 0)) kmt_signal_cpu(This->kdev, f->sync, (~(UINT64)0));
   return query_out((IUnknown *)f, riid, out);
 }
 

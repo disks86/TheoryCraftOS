@@ -50,6 +50,7 @@ struct Resource {
   int dirty;
   UINT64 sum;                  /* of the shadow as the kernel has it */
   int pushed;
+  int cpu_texture;             /* a texture of a custom heap the CPU sees: WriteToSubresource / ReadFromSubresource lock the kernel's image */
   int reserved;                /* a tiled resource: the tiles are mapped to heaps with UpdateTileMappings */
   TileBind *tile_map;          /* ... and where each tile is, as UpdateTileMappings left it (CopyTileMappings copies from here) */
   UINT tile_count;
@@ -59,8 +60,8 @@ struct Resource {
 
 static Resource *g_cpu_resources;
 
-static const GUID *const g_resource_iids[] = {&IID_ID3D12Object, &IID_ID3D12DeviceChild, &IID_ID3D12Pageable, &IID_ID3D12Resource, NULL};
-static const GUID *const g_heap_iids[] = {&IID_ID3D12Object, &IID_ID3D12DeviceChild, &IID_ID3D12Pageable, &IID_ID3D12Heap, NULL};
+static const GUID *const g_resource_iids[] = {&IID_ID3D12Object, &IID_ID3D12DeviceChild, &IID_ID3D12Pageable, &IID_ID3D12Resource, &IID_ID3D12Resource1, &IID_ID3D12Resource2, NULL};
+static const GUID *const g_heap_iids[] = {&IID_ID3D12Object, &IID_ID3D12DeviceChild, &IID_ID3D12Pageable, &IID_ID3D12Heap, &IID_ID3D12Heap1, NULL};
 
 static UINT64 fnv(const BYTE *p, UINT64 n) {
   UINT64 h = 1469598103934665603ull;
@@ -254,7 +255,7 @@ static int heap_cpu_access(const D3D12_HEAP_PROPERTIES *p, int *upload, int *rea
 
 static HRESULT resource_make(Dev *dev, const D3D12_HEAP_PROPERTIES *props, D3D12_HEAP_FLAGS hflags, const D3D12_RESOURCE_DESC *desc, HeapObj *heap, UINT64 heap_offset, int mode,
                              Resource **out) {
-  extern const ID3D12ResourceVtbl res_vtbl;
+  extern const ID3D12Resource2Vtbl res_vtbl;
   KmtAllocDesc ad;
   memset(&ad, 0, sizeof ad);
   ad.mips = 1;
@@ -291,7 +292,15 @@ static HRESULT resource_make(Dev *dev, const D3D12_HEAP_PROPERTIES *props, D3D12
     UINT depth_or_array = desc->DepthOrArraySize ? desc->DepthOrArraySize : 1;
     const int want_depth = (desc->Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL) != 0;
     /* (a one-dimensional texture is a two-dimensional one a texel high - the kernel's shaders take 1D textures as that - and an array of them an array of those) */
-    if (cpu || (desc->Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D && desc->Height != 1)) { hr = E_INVALIDARG; goto fail; }
+    if (desc->Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D && desc->Height != 1) { hr = E_INVALIDARG; goto fail; }
+    /* (a texture the CPU sees: only in a custom heap - an upload or readback heap holds buffers - with the driver's layout, not a depth buffer or multisampled, and
+     * reached with WriteToSubresource / ReadFromSubresource) */
+    if (cpu) {
+      if (props->Type != D3D12_HEAP_TYPE_CUSTOM || desc->Layout != D3D12_TEXTURE_LAYOUT_UNKNOWN || samples > 1 || reserved ||
+          (desc->Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL)) { hr = E_INVALIDARG; goto fail; }
+      r->cpu_texture = 1;
+      r->cpu_upload = r->cpu_readback = 0;      /* (no shadow: the image itself is written and read) */
+    }
     if (desc->Format == DXGI_FORMAT_R32_TYPELESS && want_depth) fi = format_info(DXGI_FORMAT_D32_FLOAT);
     if (desc->Format == DXGI_FORMAT_R24G8_TYPELESS && want_depth) fi = format_info(DXGI_FORMAT_D24_UNORM_S8_UINT);
     if (!fi || !fi->kernel || !!fi->depth != want_depth) { hr = fi && fi->kernel ? E_INVALIDARG : DXGI_ERROR_UNSUPPORTED; goto fail; }
@@ -386,7 +395,7 @@ static void heap_destroy(DxObj *o) {
 }
 
 static HRESULT STDMETHODCALLTYPE dev_CreateHeap(Dev *This, const D3D12_HEAP_DESC *desc, REFIID riid, void **out) {
-  extern const ID3D12HeapVtbl heap_vtbl;
+  extern const ID3D12Heap1Vtbl heap_vtbl;
   if (!desc || desc->SizeInBytes == 0 || desc->SizeInBytes > 256ull * 1024 * 1024) return E_INVALIDARG;
   HeapObj *h = dobj_new(sizeof *h, This, &heap_vtbl, g_heap_iids, heap_destroy);
   if (!h) return E_OUTOFMEMORY;
@@ -428,7 +437,15 @@ static void STDMETHODCALLTYPE dev_GetCopyableFootprints(Dev *This, const D3D12_R
 
 /* ---- ID3D12Resource ----------------------------------------------------------------------------------------------------------------------------------------------------------- */
 
+static UINT res_subresources(const Resource *r) { return r->desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER ? 1 : r->mips * (r->kind == 1 ? 1 : r->layers); }
 static HRESULT STDMETHODCALLTYPE res_Map(Resource *This, UINT sub, const D3D12_RANGE *read, void **data) {
+  if (This->cpu_texture) {
+    /* (a texture of the driver's layout has no address the program could use: Map with no pointer only says it will be written and read with Write/ReadFromSubresource) */
+    if (data) *data = NULL;
+    if (data || sub >= res_subresources(This)) return E_INVALIDARG;
+    InterlockedIncrement(&This->map_count);
+    return S_OK;
+  }
   if (sub != 0 || !This->shadow) return E_INVALIDARG;
   if (This->cpu_readback) res_pull(This);
   InterlockedIncrement(&This->map_count);
@@ -438,7 +455,7 @@ static HRESULT STDMETHODCALLTYPE res_Map(Resource *This, UINT sub, const D3D12_R
 }
 static void STDMETHODCALLTYPE res_Unmap(Resource *This, UINT sub, const D3D12_RANGE *written) {
   if (This->map_count > 0) InterlockedDecrement(&This->map_count);
-  This->dirty = 1;
+  if (!This->cpu_texture) This->dirty = 1;
 }
 static D3D12_RESOURCE_DESC *STDMETHODCALLTYPE res_GetDesc(Resource *This, D3D12_RESOURCE_DESC *ret) { *ret = This->desc; return ret; }
 static D3D12_GPU_VIRTUAL_ADDRESS STDMETHODCALLTYPE res_GetGPUVirtualAddress(Resource *This) { return This->va; }
@@ -447,5 +464,49 @@ static HRESULT STDMETHODCALLTYPE res_GetHeapProperties(Resource *This, D3D12_HEA
   if (flags) *flags = This->heap_flags;
   return S_OK;
 }
-static HRESULT STDMETHODCALLTYPE res_WriteToSubresource(Resource *This, UINT sub, const D3D12_BOX *box, const void *src, UINT row_pitch, UINT slice_pitch) { return E_NOTIMPL; }
-static HRESULT STDMETHODCALLTYPE res_ReadFromSubresource(Resource *This, void *dst, UINT row_pitch, UINT slice_pitch, UINT sub, const D3D12_BOX *box) { return E_NOTIMPL; }
+/* WriteToSubresource / ReadFromSubresource: a box of a subresource of a CPU-visible texture, copied between the program's memory (rows `row_pitch` apart, slices
+ * `slice_pitch`) and the kernel's image, which is locked for it (the copy is done when the call returns, as the CPU's copy is on Windows; the program keeps the GPU off
+ * the texture meanwhile). The kernel's image is the texels in rows of exactly the level's width (blocks of 4 x 4 for a compressed format); a level of an array, cube or
+ * volume has all its layers one after the other. A box that is empty copies nothing. */
+static HRESULT res_texture_copy(Resource *r, UINT sub, const D3D12_BOX *box, BYTE *mem, UINT row_pitch, UINT slice_pitch, int write) {
+  if (!r->cpu_texture || !mem || !r->fmt || sub >= res_subresources(r)) return E_INVALIDARG;
+  const FormatInfo *fi = r->fmt;
+  const UINT level = sub % r->mips, layer = sub / r->mips;
+  const UINT w = mip_extent((UINT)r->desc.Width, level), h = mip_extent(r->desc.Height, level), d = r->kind == 1 ? r->layers : 1;
+  D3D12_BOX b = {0, 0, 0, w, h, d};
+  if (box) b = *box;
+  if (b.left >= b.right || b.top >= b.bottom || b.front >= b.back) return S_OK;
+  if (b.right > w || b.bottom > h || b.back > d) return E_INVALIDARG;
+  if (fi->compressed && (b.left % 4 || b.top % 4 || (b.right % 4 && b.right != w) || (b.bottom % 4 && b.bottom != h))) return E_INVALIDARG;
+  const UINT64 pitch = format_row_bytes(fi, w), plane = pitch * format_rows(fi, h);
+  const UINT64 x_bytes = format_row_bytes(fi, b.left), row_bytes = format_row_bytes(fi, b.right) - x_bytes;
+  const UINT first_row = fi->compressed ? b.top / 4 : b.top, rows = format_rows(fi, b.bottom) - first_row;
+  /* (the kernel's subresource: the level of a 2D texture; a layered one has one level, the layers in it) */
+  const UINT ksub = r->kind == 0 ? level : 0;
+  const UINT64 base = r->kind == 1 ? 0 : (UINT64)layer * plane;
+  void *data = NULL;
+  NTSTATUS st = 0;
+  for (UINT tries = 0; tries < 2000; ++tries) {      /* (the GPU's work that still uses it, a queue waiting for a fence: up to two seconds) */
+    st = kmt_lock(r->d.dev->kdev, r->alloc, ksub, write ? 0 : KMT_LOCK_READ_ONLY, &data);
+    if (st != (NTSTATUS)0xC01E0102L) break;      /* (STATUS_GRAPHICS_ALLOCATION_BUSY) */
+    Sleep(1);
+  }
+  if (!KMT_OK(st)) return hr_from(st);
+  if (!data) { kmt_unlock(r->d.dev->kdev, r->alloc); return E_FAIL; }
+  BYTE *image = data;
+  for (UINT z = b.front; z < b.back; ++z)
+    for (UINT y = 0; y < rows; ++y) {
+      BYTE *texels = image + base + (UINT64)z * plane + (UINT64)(first_row + y) * pitch + x_bytes;
+      BYTE *program = mem + (UINT64)(z - b.front) * slice_pitch + (UINT64)y * row_pitch;
+      if (write) memcpy(texels, program, (SIZE_T)row_bytes);
+      else memcpy(program, texels, (SIZE_T)row_bytes);
+    }
+  kmt_unlock(r->d.dev->kdev, r->alloc);
+  return S_OK;
+}
+static HRESULT STDMETHODCALLTYPE res_WriteToSubresource(Resource *This, UINT sub, const D3D12_BOX *box, const void *src, UINT row_pitch, UINT slice_pitch) {
+  return res_texture_copy(This, sub, box, (BYTE *)(UINT_PTR)src, row_pitch, slice_pitch, 1);      /* (only read from: the one helper takes both directions) */
+}
+static HRESULT STDMETHODCALLTYPE res_ReadFromSubresource(Resource *This, void *dst, UINT row_pitch, UINT slice_pitch, UINT sub, const D3D12_BOX *box) {
+  return res_texture_copy(This, sub, box, dst, row_pitch, slice_pitch, 0);
+}

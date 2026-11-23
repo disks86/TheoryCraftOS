@@ -320,7 +320,8 @@ EXPORT HRESULT WINAPI D3D12SerializeVersionedRootSignature(const D3D12_VERSIONED
 /* ---- pipeline states ----------------------------------------------------------------------------------------------------------------------------------------------------------- */
 
 #define MAX_PSO_PIPELINES 8
-typedef struct PsoPipe { UINT strides[8], stencil_ref, handle; } PsoPipe;
+/* One kernel pipeline of a PSO: what it was made for, and how many unreset command lists bound it (it is destroyed only when none does). */
+typedef struct PsoPipe { UINT strides[8], stencil_ref, handle; float blend_factor[4]; UINT users; } PsoPipe;
 
 typedef struct Attr { UINT location, format, offset, per_instance, slot; } Attr;      /* (format: the kernel's graphics::VertexFormat) */
 
@@ -333,6 +334,7 @@ struct Pso {
   Attr attrs[16];
   UINT varyings, textures;
   D3D12_BLEND_DESC blend;
+  int blend_constant;          /* a target blends with the blend factor (OMSetBlendFactor): the kernel pipelines are made for each factor too */
   D3D12_RASTERIZER_DESC raster;
   D3D12_DEPTH_STENCIL_DESC depth;
   UINT render_targets;
@@ -343,10 +345,93 @@ struct Pso {
   UINT so_entries, so_rasterized, so_strides[4];
   UINT samples;                /* of the targets it draws into (1: not multisampled) */
   UINT so_entry[16][2];        /* the words of the kernel's description of each captured output */
-  PsoPipe pipes[MAX_PSO_PIPELINES];
+  PsoPipe pipes[MAX_PSO_PIPELINES];      /* the pipelines a draw may find (the latest ones) */
   UINT pipe_count;
+  PsoPipe *retired;            /* pushed out of `pipes` while lists still bind them: destroyed when the last of those lists is reset */
+  UINT nretired, cap_retired;
+  SRWLOCK pipe_lock;           /* pipes and retired: lists recorded on several threads share the PSO */
   UINT compute_pipe;
+  UINT64 hash;                 /* what its description was (desc_hash_*): what a pipeline library stores it by, and compares a description loaded under its name with */
 };
+
+/* ---- the fingerprint of a pipeline description ----------------------------------------------------------------------------------------------------------------------- */
+/* FNV-1a over everything a description says - the shaders' bytes, the input layout's elements and names, the stream output's entries, the fixed state - except what
+ * names objects of a run (the root signature is compared by the bytes it was made from) and the cached blob. */
+static UINT64 pfnv(UINT64 h, const void *data, SIZE_T n) {
+  const BYTE *p = data;
+  for (SIZE_T i = 0; i < n; ++i) { h ^= p[i]; h *= 1099511628211ull; }
+  return h;
+}
+static UINT64 fnv_str(UINT64 h, const char *s) { if (!s) return pfnv(h, "", 1); SIZE_T n = 0; while (s[n]) ++n; return pfnv(h, s, n + 1); }
+static UINT64 fnv_shader(UINT64 h, const D3D12_SHADER_BYTECODE *b) {
+  const UINT64 n = b->pShaderBytecode ? b->BytecodeLength : 0;
+  h = pfnv(h, &n, 8);
+  return n ? pfnv(h, b->pShaderBytecode, (SIZE_T)n) : h;
+}
+static UINT64 fnv_root(UINT64 h, ID3D12RootSignature *rs) {
+  const RootSig *r = (const RootSig *)rs;
+  return r && r->blob ? pfnv(h, r->blob, r->blob_size) : pfnv(h, "-", 1);
+}
+static UINT64 desc_hash_graphics(const D3D12_GRAPHICS_PIPELINE_STATE_DESC *d) {
+  UINT64 h = 14695981039346656037ull;
+  h = pfnv(h, "G", 1);
+  h = fnv_root(h, d->pRootSignature);
+  const D3D12_SHADER_BYTECODE *stages[5] = {&d->VS, &d->PS, &d->DS, &d->HS, &d->GS};
+  for (UINT i = 0; i < 5; ++i) h = fnv_shader(h, stages[i]);
+  h = pfnv(h, &d->StreamOutput.NumEntries, 4);
+  for (UINT i = 0; d->StreamOutput.pSODeclaration && i < d->StreamOutput.NumEntries; ++i) {
+    const D3D12_SO_DECLARATION_ENTRY *e = &d->StreamOutput.pSODeclaration[i];
+    h = fnv_str(h, e->SemanticName);
+    h = pfnv(h, &e->Stream, 4); h = pfnv(h, &e->SemanticIndex, 4); h = pfnv(h, &e->StartComponent, 1); h = pfnv(h, &e->ComponentCount, 1); h = pfnv(h, &e->OutputSlot, 1);
+  }
+  for (UINT i = 0; d->StreamOutput.pBufferStrides && i < d->StreamOutput.NumStrides; ++i) h = pfnv(h, &d->StreamOutput.pBufferStrides[i], 4);
+  h = pfnv(h, &d->StreamOutput.RasterizedStream, 4);
+  /* (field by field: the structures' padding is whatever the program's memory held) */
+  h = pfnv(h, &d->BlendState.AlphaToCoverageEnable, 4);
+  h = pfnv(h, &d->BlendState.IndependentBlendEnable, 4);
+  for (UINT t = 0; t < 8; ++t) {
+    const D3D12_RENDER_TARGET_BLEND_DESC *b = &d->BlendState.RenderTarget[t];
+    const UINT words[9] = {(UINT)b->BlendEnable, (UINT)b->LogicOpEnable, b->SrcBlend, b->DestBlend, b->BlendOp, b->SrcBlendAlpha, b->DestBlendAlpha, b->BlendOpAlpha, b->LogicOp};
+    h = pfnv(h, words, sizeof words);
+    h = pfnv(h, &b->RenderTargetWriteMask, 1);
+  }
+  h = pfnv(h, &d->SampleMask, 4);
+  h = pfnv(h, &d->RasterizerState, sizeof d->RasterizerState);      /* (no padding: eleven 4-byte fields) */
+  {
+    const D3D12_DEPTH_STENCIL_DESC *z = &d->DepthStencilState;
+    const UINT words[4] = {(UINT)z->DepthEnable, z->DepthWriteMask, z->DepthFunc, (UINT)z->StencilEnable};
+    h = pfnv(h, words, sizeof words);
+    h = pfnv(h, &z->StencilReadMask, 1);
+    h = pfnv(h, &z->StencilWriteMask, 1);
+    const D3D12_DEPTH_STENCILOP_DESC *faces[2] = {&z->FrontFace, &z->BackFace};
+    for (UINT f = 0; f < 2; ++f) h = pfnv(h, faces[f], sizeof *faces[f]);      /* (four 4-byte enums) */
+  }
+  h = pfnv(h, &d->InputLayout.NumElements, 4);
+  for (UINT i = 0; d->InputLayout.pInputElementDescs && i < d->InputLayout.NumElements; ++i) {
+    const D3D12_INPUT_ELEMENT_DESC *e = &d->InputLayout.pInputElementDescs[i];
+    h = fnv_str(h, e->SemanticName);
+    h = pfnv(h, &e->SemanticIndex, 4); h = pfnv(h, &e->Format, 4); h = pfnv(h, &e->InputSlot, 4); h = pfnv(h, &e->AlignedByteOffset, 4);
+    h = pfnv(h, &e->InputSlotClass, 4); h = pfnv(h, &e->InstanceDataStepRate, 4);
+  }
+  h = pfnv(h, &d->IBStripCutValue, 4);
+  h = pfnv(h, &d->PrimitiveTopologyType, 4);
+  h = pfnv(h, &d->NumRenderTargets, 4);
+  h = pfnv(h, d->RTVFormats, sizeof d->RTVFormats);
+  h = pfnv(h, &d->DSVFormat, 4);
+  h = pfnv(h, &d->SampleDesc, sizeof d->SampleDesc);
+  h = pfnv(h, &d->NodeMask, 4);
+  h = pfnv(h, &d->Flags, 4);
+  return h;
+}
+static UINT64 desc_hash_compute(const D3D12_COMPUTE_PIPELINE_STATE_DESC *d) {
+  UINT64 h = 14695981039346656037ull;
+  h = pfnv(h, "C", 1);
+  h = fnv_root(h, d->pRootSignature);
+  h = fnv_shader(h, &d->CS);
+  h = pfnv(h, &d->NodeMask, 4);
+  h = pfnv(h, &d->Flags, 4);
+  return h;
+}
 
 static const GUID *const g_pso_iids[] = {&IID_ID3D12Object, &IID_ID3D12DeviceChild, &IID_ID3D12Pageable, &IID_ID3D12PipelineState, NULL};
 
@@ -357,6 +442,11 @@ static void pso_destroy(DxObj *o) {
     UINT request[2] = {ESC_DESTROY_PIPELINE, p->pipes[i].handle};
     dev_escape(p->d.dev, request, 2, NULL, 0);
   }
+  for (UINT i = 0; i < p->nretired; ++i) {      /* (none has users left: a list that bound one holds the PSO) */
+    UINT request[2] = {ESC_DESTROY_PIPELINE, p->retired[i].handle};
+    dev_escape(p->d.dev, request, 2, NULL, 0);
+  }
+  mem_free(p->retired);
   if (p->compute_pipe) {
     UINT request[2] = {ESC_DESTROY_PIPELINE, p->compute_pipe};
     dev_escape(p->d.dev, request, 2, NULL, 0);
@@ -513,6 +603,7 @@ static int vertex_format(DXGI_FORMAT f, UINT *bytes) {
 #undef VF
 }
 
+static HRESULT blend_state_check(const Dev *dev, const D3D12_BLEND_DESC *b, UINT targets, int *constant);
 static HRESULT STDMETHODCALLTYPE dev_CreateGraphicsPipelineState(Dev *This, const D3D12_GRAPHICS_PIPELINE_STATE_DESC *desc, REFIID riid, void **out) {
   extern const ID3D12PipelineStateVtbl pso_vtbl;
   if (!desc || !desc->pRootSignature || !desc->VS.pShaderBytecode) return E_INVALIDARG;
@@ -520,9 +611,14 @@ static HRESULT STDMETHODCALLTYPE dev_CreateGraphicsPipelineState(Dev *This, cons
   if (desc->StreamOutput.NumEntries > 16 || desc->StreamOutput.NumStrides > 4) return DXGI_ERROR_UNSUPPORTED;
   Pso *p = dobj_new(sizeof *p, This, &pso_vtbl, g_pso_iids, pso_destroy);
   if (!p) return E_OUTOFMEMORY;
+  p->hash = desc_hash_graphics(desc);
   p->rs = (RootSig *)desc->pRootSignature;
   dx_AddRef(OBJ(p->rs));
   p->blend = desc->BlendState;
+  {
+    const HRESULT bh = blend_state_check(This, &desc->BlendState, desc->NumRenderTargets, &p->blend_constant);
+    if (FAILED(bh)) { dx_Release(OBJ(p)); return bh; }
+  }
   p->raster = desc->RasterizerState;
   p->depth = desc->DepthStencilState;
   p->render_targets = desc->NumRenderTargets;
@@ -612,6 +708,7 @@ static HRESULT STDMETHODCALLTYPE dev_CreateComputePipelineState(Dev *This, const
   Pso *p = dobj_new(sizeof *p, This, &pso_vtbl, g_pso_iids, pso_destroy);
   if (!p) return E_OUTOFMEMORY;
   p->compute = 1;
+  p->hash = desc_hash_compute(desc);
   p->rs = (RootSig *)desc->pRootSignature;
   dx_AddRef(OBJ(p->rs));
   HRESULT hr = make_shader(This, &desc->CS, 2, &p->shaders[5]);
@@ -650,19 +747,82 @@ static UINT blend_factor(UINT f) {
     case D3D12_BLEND_DEST_COLOR: return 6;
     case D3D12_BLEND_INV_DEST_COLOR: return 7;
     case D3D12_BLEND_SRC_ALPHA_SAT: return 10;
-    case D3D12_BLEND_INV_BLEND_FACTOR: return 0;
+    case D3D12_BLEND_BLEND_FACTOR: return 11;            /* (graphics::BlendFactor::ConstantColor: each channel its own; an alpha factor takes the alpha) */
+    case D3D12_BLEND_INV_BLEND_FACTOR: return 12;
+    case D3D12_BLEND_ALPHA_FACTOR: return 13;            /* (ConstantAlpha: the factor's alpha in every channel) */
+    case D3D12_BLEND_INV_ALPHA_FACTOR: return 14;
     default: return 1;
   }
+}
+/* What a blend factor needs: 0 nothing more, 1 the blend factor (OMSetBlendFactor), -1 something the kernel does not have (the second colour of dual-source blending)
+ * or a value that is not a factor. */
+static int blend_factor_need(UINT f) {
+  if (f == D3D12_BLEND_BLEND_FACTOR || f == D3D12_BLEND_INV_BLEND_FACTOR || f == D3D12_BLEND_ALPHA_FACTOR || f == D3D12_BLEND_INV_ALPHA_FACTOR) return 1;
+  return (f >= D3D12_BLEND_ZERO && f <= D3D12_BLEND_SRC_ALPHA_SAT) ? 0 : -1;
+}
+/* The blend state's needs, over the targets that blend: E_INVALIDARG for a value that is no factor, DXGI_ERROR_UNSUPPORTED for dual-source blending and for the blend factor
+ * on a device without it; *constant: some target uses the blend factor. */
+static HRESULT blend_state_check(const Dev *dev, const D3D12_BLEND_DESC *b, UINT targets, int *constant) {
+  *constant = 0;
+  const UINT n = b->IndependentBlendEnable ? (targets ? targets : 1) : 1;
+  for (UINT t = 0; t < n && t < 8; ++t) {
+    const D3D12_RENDER_TARGET_BLEND_DESC *rt = &b->RenderTarget[t];
+    if (!rt->BlendEnable) continue;
+    const UINT factors[4] = {rt->SrcBlend, rt->DestBlend, rt->SrcBlendAlpha, rt->DestBlendAlpha};
+    for (UINT k = 0; k < 4; ++k) {
+      const int need = blend_factor_need(factors[k]);
+      if (need < 0) return factors[k] >= D3D12_BLEND_SRC1_COLOR && factors[k] <= D3D12_BLEND_INV_SRC1_ALPHA ? DXGI_ERROR_UNSUPPORTED : E_INVALIDARG;
+      if (need) *constant = 1;
+    }
+  }
+  if (*constant && !(dev->caps.flags & KMT_CAPS_BLEND_CONSTANT)) return DXGI_ERROR_UNSUPPORTED;
+  return S_OK;
 }
 static UINT blend_op(UINT o) { return o >= 1 && o <= 5 ? o - 1 : 0; }
 static UINT cmp_func(UINT f) { return f >= 1 && f <= 8 ? f - 1 : 7; }
 static UINT stencil_op(UINT o) { return o >= 1 && o <= 8 ? o - 1 : 0; }
 
 /* The kernel pipeline of the state for these draws, made when first needed. Returns 0 when the kernel refuses. */
-static UINT pso_pipeline(Pso *p, const UINT strides[8], UINT stencil_ref) {
-  if (p->compute) return p->compute_pipe;
+/* A command list no longer binds the kernel pipeline `handle` of p (it is reset or destroyed, or it had it already): one user less. (The use is taken by
+ * pso_pipeline, under the lock, so no other thread can retire it in between.) */
+static void pso_unuse(Pso *p, UINT handle) {
+  UINT destroy = 0;
+  AcquireSRWLockExclusive(&p->pipe_lock);
   for (UINT i = 0; i < p->pipe_count; ++i)
-    if (p->pipes[i].stencil_ref == stencil_ref && memcmp(p->pipes[i].strides, strides, 8 * sizeof(UINT)) == 0) return p->pipes[i].handle;
+    if (p->pipes[i].handle == handle && p->pipes[i].users) --p->pipes[i].users;
+  for (UINT i = 0; i < p->nretired; ++i)
+    if (p->retired[i].handle == handle) {
+      if (p->retired[i].users && --p->retired[i].users == 0) {
+        destroy = handle;
+        p->retired[i] = p->retired[--p->nretired];
+      }
+      break;
+    }
+  ReleaseSRWLockExclusive(&p->pipe_lock);
+  if (destroy) {
+    UINT request[2] = {ESC_DESTROY_PIPELINE, destroy};
+    dev_escape(p->d.dev, request, 2, NULL, 0);
+  }
+}
+static UINT pso_pipeline_locked(Pso *p, const UINT strides[8], UINT stencil_ref, const float blend_factor_in[4]);
+static UINT pso_pipeline(Pso *p, const UINT strides[8], UINT stencil_ref, const float blend_factor_in[4]) {
+  if (p->compute) return p->compute_pipe;
+  AcquireSRWLockExclusive(&p->pipe_lock);
+  const UINT handle = pso_pipeline_locked(p, strides, stencil_ref, blend_factor_in);
+  /* (the caller's use of it: a command list, which lets it go with pso_unuse) */
+  for (UINT i = 0; handle && i < p->pipe_count; ++i)
+    if (p->pipes[i].handle == handle) ++p->pipes[i].users;
+  ReleaseSRWLockExclusive(&p->pipe_lock);
+  return handle;
+}
+static UINT pso_pipeline_locked(Pso *p, const UINT strides[8], UINT stencil_ref, const float blend_factor_in[4]) {
+  /* (the blend factor counts only where a target blends with it; out of range it is clamped, as the targets' fixed-point formats clamp it) */
+  float factor[4] = {0, 0, 0, 0};
+  if (p->blend_constant)
+    for (UINT c = 0; c < 4; ++c) factor[c] = blend_factor_in[c] != blend_factor_in[c] ? 0.0f : blend_factor_in[c];
+  for (UINT i = 0; i < p->pipe_count; ++i)
+    if (p->pipes[i].stencil_ref == stencil_ref && memcmp(p->pipes[i].strides, strides, 8 * sizeof(UINT)) == 0 && memcmp(p->pipes[i].blend_factor, factor, sizeof factor) == 0)
+      return p->pipes[i].handle;
   const UINT stride = strides[0];
   UINT r[320];
   UINT w = 0;
@@ -733,7 +893,7 @@ static UINT pso_pipeline(Pso *p, const UINT strides[8], UINT stencil_ref) {
   for (UINT i = 0; i < p->attr_count; ++i)
     if (p->attrs[i].slot > max_slot) max_slot = p->attrs[i].slot;
   const UINT more_blends = p->blend.IndependentBlendEnable && p->render_targets > 4 ? p->render_targets - 4 : 0;
-  if (p->attr_count > 4 || max_slot > 0 || more_blends) {
+  if (p->attr_count > 4 || max_slot > 0 || more_blends || p->blend_constant) {
     if (!p->so_entries) r[w++] = 0;
     const UINT extra = p->attr_count > 4 ? p->attr_count - 4 : 0;
     r[w++] = extra;
@@ -764,18 +924,38 @@ static UINT pso_pipeline(Pso *p, const UINT strides[8], UINT stencil_ref) {
       r[w++] = blend_op(b->BlendOpAlpha);
       r[w++] = b->RenderTargetWriteMask & 0xF;
     }
+    if (p->blend_constant)
+      for (UINT c = 0; c < 4; ++c) r[w++] = bits_of(factor[c]);      /* (the colour of the constant blend factors) */
   }
   UINT reply[1] = {0};
   if (!KMT_OK(dev_escape(p->d.dev, r, w, reply, 1))) return 0;
   if (p->pipe_count == MAX_PSO_PIPELINES) {
-    UINT drop[2] = {ESC_DESTROY_PIPELINE, p->pipes[0].handle};
-    dev_escape(p->d.dev, drop, 2, NULL, 0);
+    /* (the oldest goes: destroyed now if no list binds it, else retired until the last list that does is reset) */
+    if (p->pipes[0].users) {
+      if (p->nretired == p->cap_retired) {
+        const UINT cap = p->cap_retired ? p->cap_retired * 2 : 8;
+        PsoPipe *n = cap < (1u << 20) ? mem_grow(p->retired, (SIZE_T)cap * sizeof *n) : NULL;
+        if (!n) {      /* (no memory to remember the old one: the new pipeline is let go, and the draw is not made) */
+          UINT drop[2] = {ESC_DESTROY_PIPELINE, reply[0]};
+          dev_escape(p->d.dev, drop, 2, NULL, 0);
+          return 0;
+        }
+        p->retired = n;
+        p->cap_retired = cap;
+      }
+      p->retired[p->nretired++] = p->pipes[0];
+    } else {
+      UINT drop[2] = {ESC_DESTROY_PIPELINE, p->pipes[0].handle};
+      dev_escape(p->d.dev, drop, 2, NULL, 0);
+    }
     memmove(&p->pipes[0], &p->pipes[1], (MAX_PSO_PIPELINES - 1) * sizeof p->pipes[0]);
     p->pipe_count--;
   }
   memcpy(p->pipes[p->pipe_count].strides, strides, 8 * sizeof(UINT));
   p->pipes[p->pipe_count].stencil_ref = stencil_ref;
+  memcpy(p->pipes[p->pipe_count].blend_factor, factor, sizeof factor);
   p->pipes[p->pipe_count].handle = reply[0];
+  p->pipes[p->pipe_count].users = 0;
   p->pipe_count++;
   return reply[0];
 }

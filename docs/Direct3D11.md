@@ -81,7 +81,7 @@ float, D32_FLOAT_S8X24_UINT in D24S8 (with its stencil, 24 bits of depth). R24G8
   several layers or levels, and sampling a depth buffer; unordered access to textures, typed buffer loads and stores (`Buffer<>`, `RWBuffer<>`),
   append and consume buffers (`imm_atomic_alloc` / `consume`), unordered access slots above u3 and buffer shader resources above t3; dynamic shader
   linkage; textures above 4096 a side; BC4 - BC7; `SV_RenderTargetArrayIndex` and `SV_ViewportArrayIndex` (several viewports: the first is drawn
-  with); blend factors (`D3D11_BLEND_BLEND_FACTOR` is 1), wireframe, depth bias, the back face's stencil operations, anisotropy, border colours.
+  with); dual-source blend factors (`D3D11_BLEND_SRC1_*`: the pipeline is refused), the blend factor on GPUs other than virgl, wireframe, depth bias, the back face's stencil operations, anisotropy, border colours.
 - The sampler of t<n> is s<n>: the kernel pairs them by number. A shader that samples one texture with two samplers gets one.
 - One query of the kernel's is open at a time: a draw is measured for one kind (above).
 - Shared resources (`D3D11_RESOURCE_MISC_SHARED`, `IDXGIResource::GetSharedHandle`, `OpenSharedResource*`): none is shared (`DXGI_ERROR_UNSUPPORTED`,

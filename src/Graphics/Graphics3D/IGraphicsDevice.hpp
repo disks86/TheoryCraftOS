@@ -522,7 +522,11 @@ struct StencilState {
 
 // Blending (kFeatureBlendState): result = source * source_factor (op) destination * destination_factor, for the colour and the alpha on their own, then only the channels
 // of write_mask (bit 0 red .. bit 3 alpha) are stored. Min / Max ignore the factors. With `custom` false the pipeline's alpha_blend decides (source over destination).
-enum class BlendFactor : uint8_t { Zero, One, SrcColor, InvSrcColor, SrcAlpha, InvSrcAlpha, DstColor, InvDstColor, DstAlpha, InvDstAlpha, SrcAlphaSaturate };
+// The Constant factors (DeviceInfo::blend_constant) are the state's `constant` colour (each channel its own) or its alpha (every channel), and one minus those.
+enum class BlendFactor : uint8_t { Zero, One, SrcColor, InvSrcColor, SrcAlpha, InvSrcAlpha, DstColor, InvDstColor, DstAlpha, InvDstAlpha, SrcAlphaSaturate,
+                                   ConstantColor, InvConstantColor, ConstantAlpha, InvConstantAlpha };
+constexpr uint32_t kBlendFactorCount = 15;
+constexpr bool is_constant_blend_factor(BlendFactor f) { return f >= BlendFactor::ConstantColor; }
 enum class BlendOp : uint8_t { Add, Subtract, ReverseSubtract, Min, Max };
 struct BlendState {
   bool custom = false;
@@ -530,6 +534,8 @@ struct BlendState {
   BlendFactor src_color = BlendFactor::One, dst_color = BlendFactor::Zero, src_alpha = BlendFactor::One, dst_alpha = BlendFactor::Zero;
   BlendOp color_op = BlendOp::Add, alpha_op = BlendOp::Add;
   uint8_t write_mask = 0xF;
+  float constant[4] = {0, 0, 0, 0};   // red, green, blue, alpha: the colour of the Constant factors
+  bool uses_constant() const { return enable && (is_constant_blend_factor(src_color) || is_constant_blend_factor(dst_color) || is_constant_blend_factor(src_alpha) || is_constant_blend_factor(dst_alpha)); }
 };
 
 enum class CullMode : uint8_t { None, Back, Front };
@@ -648,7 +654,7 @@ class ICommandBuffer {
   virtual void end_render_pass() = 0;
   // Averages the samples of a multisampled colour image into a single-sample image of the same format and size (kFeatureMultisample), outside a render pass.
   // The image may be a depth image (kFeatureDepthResolve): then the destination gets the depth of sample 0 (a stencil plane that comes along: sample 0's too). `mode` says how the samples are
-  // combined: Average (the default, colour only, or depth with kFeatureResolveModes), Sample0, Min, Max (depth only; Sample0 of a colour image too): all but the average of a colour image and
+  // combined: Average (the default, colour only, or depth with kFeatureResolveModes), Sample0, Min, Max (per channel of a colour image, of the depth of a depth image): all but the average of a colour image and
   // the sample 0 of a depth image are kFeatureResolveModes.
   virtual void resolve_image(IImage* destination, IImage* source, ResolveMode mode = ResolveMode::Average) {
     (void)destination, (void)source, (void)mode;
@@ -742,6 +748,7 @@ struct DeviceInfo {
   uint32_t features = 0;                    // DeviceFeature bits
   uint32_t sample_counts = 0;               // kFeatureMultisample: bit n set: ImageDesc::samples = n is supported
   DeviceLimits limits;                      // vertex attributes, varyings, texture units, colour targets and vertex buffers the device takes
+  bool blend_constant = false;              // with kFeatureBlendState: the BlendFactor Constant* factors and BlendState::constant
 };
 
 class IGraphicsDevice {

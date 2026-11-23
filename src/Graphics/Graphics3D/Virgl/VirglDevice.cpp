@@ -55,6 +55,8 @@ void destroy(allocators::IAllocator& allocator, T* object) {
   allocator.deallocate(object);
 }
 
+static_assert(sizeof virgl::kBlendFactors / sizeof virgl::kBlendFactors[0] == kBlendFactorCount, "a Gallium factor for every BlendFactor");
+
 uint32_t float_bits(float f) {
   uint32_t u;
   __builtin_memcpy(&u, &f, 4);
@@ -746,6 +748,14 @@ class VirglPipeline final : public VirglPipelineBase {
   uint32_t binding_count() const { return binding_count_; }
   uint32_t binding_slot(uint32_t binding) const { return bindings_[binding] / 2; }
   uint8_t stencil_reference() const { return stencil_reference_; }
+  bool uses_blend_constant() const {
+    if (!desc_.blend.custom) return false;
+    if (desc_.blend.uses_constant()) return true;
+    if (desc_.independent_blend)
+      for (const BlendState& t : desc_.target_blend)
+        if (t.custom && t.uses_constant()) return true;
+    return false;
+  }
   bool stencil_enabled() const { return desc_.stencil.enable; }
   uint32_t vertex_shader() const { return vs_; }
   uint32_t fragment_shader() const { return fs_; }
@@ -1377,6 +1387,11 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
         stream.put(pipeline->dsa());
         stream.command(virgl::kBindObject, virgl::kObjectRasterizer, 1);
         stream.put(pipeline->rasterizer());
+        if (pipeline->uses_blend_constant()) {
+          // (the colour of the constant blend factors: one for all the targets, as in Direct3D and OpenGL)
+          stream.command(virgl::kSetBlendColor, 0, 4);
+          for (const float channel : pipeline->desc().blend.constant) stream.putf(channel);
+        }
         if (pipeline->stencil_enabled()) {
           stream.command(virgl::kSetStencilRef, 0, 1);
           stream.put(pipeline->stencil_reference() | (uint32_t{pipeline->stencil_reference()} << 8));

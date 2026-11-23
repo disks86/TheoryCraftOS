@@ -1619,8 +1619,10 @@ void scene_dxil_compute_shared(Rig& rig, ArrayView<uint32_t> out) { compute_shar
 
 // Multisampling (4 samples): a far red rectangle and a near green one that overlaps it, both with edges between the pixels' sample positions, drawn into 4x colour and depth images (depth
 // tested per sample) and resolved. Vertical and horizontal edges are covered the same by every device that uses the standard 4x pattern, whatever the order of the samples.
-void scene_multisample(Rig& rig, ArrayView<uint32_t> out) {
-  if (!rig.has(graphics::kFeatureMultisample | graphics::kFeatureBlendState)) return void(rig.step("multisampling", status::kNotSupported));
+// `mode`: how the colour samples are combined (a graphics::ResolveMode: 0 the average, 2 the least and 3 the greatest of each channel, kFeatureResolveModes).
+void multisample_scene(Rig& rig, ArrayView<uint32_t> out, uint32_t mode) {
+  if (!rig.has(graphics::kFeatureMultisample | graphics::kFeatureBlendState | (mode == 0 ? 0u : graphics::kFeatureResolveModes)))
+    return void(rig.step(mode == 0 ? "multisampling" : "colour resolve modes", status::kNotSupported));
   auto rect = [](Vertex* v, float x0, float y0, float x1, float y1, float z, float r, float g, float b) {
     auto at = [&](float px, float py) { return Vertex{px / 16.0f - 1.0f, py / 16.0f - 1.0f, z, r, g, b, 1}; };
     v[0] = at(x0, y0), v[1] = at(x1, y0), v[2] = at(x0, y1);
@@ -1649,8 +1651,8 @@ void scene_multisample(Rig& rig, ArrayView<uint32_t> out) {
   w.push_constants(bytes_of(kIdentity, sizeof kIdentity));
   w.draw(12);
   w.end_pass();
-  w.resolve_region(2, 0);
-  w.resolve_region(3, 0);
+  w.resolve_region(2, 0, mode);
+  w.resolve_region(3, 0, mode);
   rig.render(w, {multisampled, depth, target, textured, vb});
   ArrayView<uint32_t> other = allocate_view<uint32_t>(rig.allocator(), uint64_t{kSize} * kSize);
   if (other.empty()) return void(rig.step("memory", status::kNoMemory));
@@ -1659,6 +1661,9 @@ void scene_multisample(Rig& rig, ArrayView<uint32_t> out) {
   for (uint32_t i = 1; i < kSize * kSize; i += 2) out[i] = other[i];
   release_view(rig.allocator(), other);
 }
+void scene_multisample(Rig& rig, ArrayView<uint32_t> out) { multisample_scene(rig, out, 0); }
+void scene_multisample_resolve_min(Rig& rig, ArrayView<uint32_t> out) { multisample_scene(rig, out, 2); }
+void scene_multisample_resolve_max(Rig& rig, ArrayView<uint32_t> out) { multisample_scene(rig, out, 3); }
 
 // A geometry shader (gs_copy.hlsl): every triangle comes out as itself and, as a second strip, a half-size copy moved to the lower right with the red and blue swapped.
 void geometry_scene(Rig& rig, ArrayView<uint32_t> out, const uint8_t* gs_code, uint32_t gs_size) {
@@ -2855,6 +2860,8 @@ const Entry kScenes[] = {
     {"Direct3D 10 integer formats of every width and sign (DXBC)", scene_integer_formats},
     {"Direct3D 10 signed and 10-bit normalised formats (DXBC)", scene_normalised_formats},
     {"Direct3D 10 4x multisampling", scene_multisample},
+    {"Direct3D 12 colour resolve, least samples", scene_multisample_resolve_min},
+    {"Direct3D 12 colour resolve, greatest samples", scene_multisample_resolve_max},
     {"Direct3D 10 alpha to coverage", scene_alpha_to_coverage},
     {"Direct3D 12 depth resolve, first sample", scene_depth_resolve_sample0},
     {"Direct3D 12 depth resolve, least sample", scene_depth_resolve_min},

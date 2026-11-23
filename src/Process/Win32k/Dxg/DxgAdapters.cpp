@@ -279,7 +279,7 @@ uint32_t query_adapter_info(Session& s, Call& call, uint64_t arg) {
       const uint32_t st = s.kernel().query_adapter_caps(s.pid(), handle, &caps);
       if (st != status::kSuccess) return st;
       const uint32_t flags = (caps.accelerated ? 1u : 0u) | (caps.stencil ? 2u : 0u) | (caps.mipmaps ? 4u : 0u) | (caps.textures ? 8u : 0u) | (caps.programmable_vertex ? 16u : 0u) |
-                             (caps.programmable_pixel ? 32u : 0u);
+                             (caps.programmable_pixel ? 32u : 0u) | (caps.blend_constant ? 64u : 0u);
       for (uint32_t w : {caps.max_texture_dimension, caps.max_vertex_attributes, caps.max_varyings, caps.max_texture_units, caps.max_push_constant_bytes, caps.max_vertex_stride, flags, caps.features})
         out.put32(w);
       uint8_t name[64] = {};

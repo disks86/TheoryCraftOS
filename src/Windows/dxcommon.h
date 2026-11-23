@@ -271,6 +271,7 @@ typedef struct KmtCaps {
 #define KMT_CAPS_STENCIL 2u
 #define KMT_CAPS_MIPMAPS 4u
 #define KMT_CAPS_TEXTURES 8u
+#define KMT_CAPS_BLEND_CONSTANT 64u      /* (pipelines with the constant blend factors: graphics::DeviceInfo::blend_constant) */
 static NTSTATUS kmt_adapter_caps(UINT adapter, KmtCaps *caps) { return kmt_query_adapter(adapter, 0, caps, sizeof(KmtCaps)); }
 
 /* The memory of the adapter (KMTQAITYPE_GETSEGMENTSIZE): dedicated video memory, dedicated system memory, shared system memory. */

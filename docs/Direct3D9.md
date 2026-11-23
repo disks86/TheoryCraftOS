@@ -102,7 +102,7 @@ in the program, in the kernel, on the device - and the kernel could not make rin
 - More than one level of a cube or volume texture (the kernel keeps the first), cube maps of the fixed-function stages (their pixel shader samples 2D),
   `texm3x3tex` and the other cube look-ups of pixel shaders 1.x, compressed volumes, 16-bit and floating-point targets, multisampling.
 - Clears of a part of a target; `StretchRect` and `UpdateSurface` of a part or between sizes; `GetDC` of a surface.
-- Clip planes, point size and sprites, wireframe, flat shading, depth bias, the blend factor, two-sided stencil, mirror and border
+- Clip planes, point size and sprites, wireframe, flat shading, depth bias, two-sided stencil, mirror and border
   addressing, anisotropic filtering - what Direct3D 12 here has not.
 - Queries, additional swap chains, `IDirect3D9Ex`, exclusive full-screen modes (a device is its window's size or what it is asked for; one
   display mode is reported).

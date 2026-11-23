@@ -78,7 +78,8 @@ typedef struct CmdAlloc {
 
 typedef struct CmdList CmdList;
 enum { B_PSO = 1, B_TOPOLOGY, B_STENCIL_REF, B_INDEX_BUFFER, B_VERTEX_BUFFERS, B_HEAPS, B_GRAPHICS_SIGNATURE, B_COMPUTE_SIGNATURE, B_GRAPHICS_CONSTANTS, B_COMPUTE_CONSTANTS,
-       B_GRAPHICS_CBV, B_GRAPHICS_SRV, B_GRAPHICS_UAV, B_COMPUTE_CBV, B_COMPUTE_SRV, B_COMPUTE_UAV, B_GRAPHICS_TABLE, B_COMPUTE_TABLE, B_DRAW, B_DRAW_INDEXED, B_DISPATCH, B_INDIRECT };
+       B_GRAPHICS_CBV, B_GRAPHICS_SRV, B_GRAPHICS_UAV, B_COMPUTE_CBV, B_COMPUTE_SRV, B_COMPUTE_UAV, B_GRAPHICS_TABLE, B_COMPUTE_TABLE, B_DRAW, B_DRAW_INDEXED, B_DISPATCH, B_INDIRECT,
+       B_BLEND_FACTOR };
 static void bundle_log(CmdList *l, UINT id, const UINT64 a[6], const UINT *data, UINT ndata);
 #define BUNDLE_LOG(l, id, ...) do { if ((l)->bundle) { UINT64 a_[6] = {__VA_ARGS__}; bundle_log((l), (id), a_, NULL, 0); return; } } while (0)
 #define BUNDLE_LOG_DATA(l, id, data, n, ...) do { if ((l)->bundle) { UINT64 a_[6] = {__VA_ARGS__}; bundle_log((l), (id), a_, (data), (n)); return; } } while (0)
@@ -102,6 +103,12 @@ struct CmdList {
   UINT nchunks, cap_chunks;
   IUnknown **refs;
   UINT nrefs, cap_refs;
+  /* the render pass's resolve parameters, copied from the program's at BeginRenderPass (kept across resets: only the room) */
+  D3D12_RENDER_PASS_ENDING_ACCESS_RESOLVE_SUBRESOURCE_PARAMETERS *rp_params;
+  UINT rp_params_cap;
+  /* the kernel pipelines the recording binds, each once (its PSO keeps it until the list is reset: pso_use / pso_unuse) */
+  struct BoundPipe { Pso *pso; UINT handle; } *bound;
+  UINT nbound, cap_bound;
   /* the state of the recording */
   Pso *pso;
   int query_open;
@@ -127,6 +134,7 @@ struct CmdList {
   D3D12_RECT scissor;
   int have_viewport, have_scissor;
   UINT stencil_ref;
+  float blend_factor[4];       /* OMSetBlendFactor (0, 0, 0, 0 when the list is reset) */
   UINT rtv[8];                 /* the kernel's allocations of the colour targets */
   UINT rtv_count;
   UINT dsv;
@@ -147,10 +155,20 @@ struct CmdList {
   int sent_viewport, sent_scissor;
   int sent_binding;            /* 0 none, 1 graphics, 2 compute */
   int dirty_gfx, dirty_cs, dirty_heaps;
+  /* (cmdlist1.inc) the upload buffer WriteBufferImmediate's values go through, and the render pass begun (its ending accesses, for EndRenderPass) */
+  struct Resource *immediate;
+  UINT immediate_used;
+  int in_render_pass, rp_suspending;
+  UINT rp_count;
+  D3D12_RENDER_PASS_RENDER_TARGET_DESC rp_rts[8];
+  D3D12_RENDER_PASS_DEPTH_STENCIL_DESC rp_ds;
+  int rp_has_ds;
 };
 
 static const GUID *const g_alloc_iids[] = {&IID_ID3D12Object, &IID_ID3D12DeviceChild, &IID_ID3D12Pageable, &IID_ID3D12CommandAllocator, NULL};
-static const GUID *const g_list_iids[] = {&IID_ID3D12Object, &IID_ID3D12DeviceChild, &IID_ID3D12CommandList, &IID_ID3D12GraphicsCommandList, NULL};
+static const GUID *const g_list_iids[] = {&IID_ID3D12Object, &IID_ID3D12DeviceChild, &IID_ID3D12CommandList, &IID_ID3D12GraphicsCommandList, &IID_ID3D12GraphicsCommandList1,
+                                          &IID_ID3D12GraphicsCommandList2, &IID_ID3D12GraphicsCommandList3, &IID_ID3D12GraphicsCommandList4, &IID_ID3D12GraphicsCommandList5,
+                                          &IID_ID3D12GraphicsCommandList6, &IID_ID3D12GraphicsCommandList7, NULL};
 
 /* ---- allocators --------------------------------------------------------------------------------------------------------------------------------------------------------------- */
 
@@ -234,19 +252,22 @@ static void end_pass(CmdList *l) {
   l->pass_open = 0;
 }
 
-static void keep(CmdList *l, IUnknown *o) {
-  if (!o) return;
+/* The list holds a reference to `o` until it is reset. Returns 0 when it could not (no memory): a caller that made `o` for the list must then let it go itself. */
+static int keep(CmdList *l, IUnknown *o) {
+  if (!o) return 1;
   for (UINT i = 0; i < l->nrefs; ++i)
-    if (l->refs[i] == o) return;
+    if (l->refs[i] == o) return 1;
   if (l->nrefs == l->cap_refs) {
+    if (l->cap_refs > 0x7FFFFFFFu / sizeof(IUnknown *) / 2) return 0;
     const UINT cap = l->cap_refs ? l->cap_refs * 2 : 16;
     IUnknown **n = mem_grow(l->refs, cap * sizeof *n);
-    if (!n) return;
+    if (!n) return 0;
     l->refs = n;
     l->cap_refs = cap;
   }
   o->lpVtbl->AddRef(o);
   l->refs[l->nrefs++] = o;
+  return 1;
 }
 
 static void indirect_free(struct Indirect *i);
@@ -259,6 +280,8 @@ static void list_free_recording(CmdList *l) {
   l->nchunks = 0;
   for (UINT i = 0; i < l->nlog; ++i) mem_free(l->log[i].data);
   l->nlog = 0;
+  for (UINT i = 0; i < l->nbound; ++i) pso_unuse(l->bound[i].pso, l->bound[i].handle);      /* (before the references: the list holds the PSOs) */
+  l->nbound = 0;
   for (UINT i = 0; i < l->nrefs; ++i) l->refs[i]->lpVtbl->Release(l->refs[i]);
   l->nrefs = 0;
 }
@@ -274,12 +297,14 @@ static void list_destroy(DxObj *o) {
   list_free_recording(l);
   mem_free(l->chunks);
   mem_free(l->refs);
+  mem_free(l->rp_params);
+  mem_free(l->bound);
   mem_free(l->log);
   dobj_child_destroy(o);
 }
 
 static HRESULT STDMETHODCALLTYPE dev_CreateCommandList(Dev *This, UINT mask, D3D12_COMMAND_LIST_TYPE type, ID3D12CommandAllocator *allocator, ID3D12PipelineState *initial, REFIID riid, void **out) {
-  extern const ID3D12GraphicsCommandListVtbl list_vtbl;
+  extern const ID3D12GraphicsCommandList7Vtbl list_vtbl;
   if (!allocator || (type != D3D12_COMMAND_LIST_TYPE_DIRECT && type != D3D12_COMMAND_LIST_TYPE_COMPUTE && type != D3D12_COMMAND_LIST_TYPE_COPY && type != D3D12_COMMAND_LIST_TYPE_BUNDLE)) return E_INVALIDARG;
   CmdList *l = dobj_new(sizeof *l, This, &list_vtbl, g_list_iids, list_destroy);
   if (!l) return E_OUTOFMEMORY;
@@ -540,6 +565,24 @@ static UINT topology_code(D3D12_PRIMITIVE_TOPOLOGY t) {
   }
 }
 
+/* The list binds the kernel pipeline `handle` of p, which pso_pipeline gave it with a use: the list keeps that use until it is reset (once for each pipeline: a
+ * second use is given back). Returns 0 without memory to remember it (the use given back too). */
+static int list_bind_pipeline(CmdList *l, Pso *p, UINT handle) {
+  for (UINT i = 0; i < l->nbound; ++i)
+    if (l->bound[i].pso == p && l->bound[i].handle == handle) { pso_unuse(p, handle); return 1; }
+  if (l->nbound == l->cap_bound) {
+    const UINT cap = l->cap_bound ? l->cap_bound * 2 : 8;
+    struct BoundPipe *n = l->cap_bound < (1u << 20) ? mem_grow(l->bound, (SIZE_T)cap * sizeof *n) : NULL;
+    if (!n) { pso_unuse(p, handle); return 0; }
+    l->bound = n;
+    l->cap_bound = cap;
+  }
+  l->bound[l->nbound].pso = p;
+  l->bound[l->nbound].handle = handle;
+  l->nbound++;
+  return 1;
+}
+
 /* Everything a draw needs sent: the pass, the pipeline, the root arguments, the buffers, the viewport. Returns 0 when the draw cannot be made. */
 static int prepare_draw(CmdList *l, int indexed) {
   if (!l->pso || l->pso->compute || !l->gfx.rs) return 0;
@@ -552,8 +595,9 @@ static int prepare_draw(CmdList *l, int indexed) {
   UINT strides[8] = {0};
   for (UINT slot = 0; slot < 8; ++slot)
     if (l->pso->slots_used >> slot & 1) strides[slot] = l->vb[slot].stride;
-  const UINT pipeline = pso_pipeline(l->pso, strides, l->stencil_ref);
+  const UINT pipeline = pso_pipeline(l->pso, strides, l->stencil_ref, l->blend_factor);
   if (!pipeline) return 0;
+  if (!list_bind_pipeline(l, l->pso, pipeline)) return 0;
   if (pipeline != l->sent_pipeline) {
     packet(l, OP_BIND_PIPELINE, &pipeline, 1);
     l->sent_pipeline = pipeline;
@@ -659,7 +703,15 @@ static void STDMETHODCALLTYPE list_RSSetScissorRects(CmdList *l, UINT n, const D
   l->have_scissor = 1;
   l->sent_scissor = 0;
 }
-static void STDMETHODCALLTYPE list_OMSetBlendFactor(CmdList *l, const FLOAT factor[4]) {}
+/* (NULL is 1, 1, 1, 1; the factor takes effect in the kernel pipeline the next draw makes or finds for it) */
+static void STDMETHODCALLTYPE list_OMSetBlendFactor(CmdList *l, const FLOAT factor[4]) {
+  const float ones[4] = {1, 1, 1, 1};
+  const float *f = factor ? factor : ones;
+  UINT bits[4];
+  for (UINT c = 0; c < 4; ++c) bits[c] = bits_of(f[c]);
+  BUNDLE_LOG(l, B_BLEND_FACTOR, bits[0], bits[1], bits[2], bits[3]);
+  memcpy(l->blend_factor, f, sizeof l->blend_factor);
+}
 static void STDMETHODCALLTYPE list_OMSetStencilRef(CmdList *l, UINT ref) { BUNDLE_LOG(l, B_STENCIL_REF, ref); l->stencil_ref = ref; }
 static void STDMETHODCALLTYPE list_IASetIndexBuffer(CmdList *l, const D3D12_INDEX_BUFFER_VIEW *view) { BUNDLE_LOG(l, B_INDEX_BUFFER, view ? view->BufferLocation : 0, view ? view->SizeInBytes : 0, view ? view->Format : 0);
   if (!view || !view->BufferLocation) { l->ib_alloc = 0; return; }
@@ -809,8 +861,15 @@ static void STDMETHODCALLTYPE list_ClearDepthStencilView(CmdList *l, D3D12_CPU_D
   l->pending_depth = depth < 0.0f ? 0.0f : depth > 1.0f ? 1.0f : depth;
   l->pending_stencil = stencil;
 }
-static void STDMETHODCALLTYPE list_ClearUnorderedAccessViewUint(CmdList *l, D3D12_GPU_DESCRIPTOR_HANDLE g, D3D12_CPU_DESCRIPTOR_HANDLE c, ID3D12Resource *r, const UINT v[4], UINT n, const D3D12_RECT *rects) {}
-static void STDMETHODCALLTYPE list_ClearUnorderedAccessViewFloat(CmdList *l, D3D12_GPU_DESCRIPTOR_HANDLE g, D3D12_CPU_DESCRIPTOR_HANDLE c, ID3D12Resource *r, const float v[4], UINT n, const D3D12_RECT *rects) {}
+static void uav_clear_list(CmdList *l, D3D12_CPU_DESCRIPTOR_HANDLE cpu, ID3D12Resource *resource, const UINT u[4], const float f[4], int floats, UINT rect_count, const D3D12_RECT *rects);
+static void STDMETHODCALLTYPE list_ClearUnorderedAccessViewUint(CmdList *l, D3D12_GPU_DESCRIPTOR_HANDLE g, D3D12_CPU_DESCRIPTOR_HANDLE c, ID3D12Resource *r, const UINT v[4], UINT n, const D3D12_RECT *rects) {
+  const float none[4] = {0, 0, 0, 0};
+  if (v) uav_clear_list(l, c, r, v, none, 0, n, rects);
+}
+static void STDMETHODCALLTYPE list_ClearUnorderedAccessViewFloat(CmdList *l, D3D12_GPU_DESCRIPTOR_HANDLE g, D3D12_CPU_DESCRIPTOR_HANDLE c, ID3D12Resource *r, const float v[4], UINT n, const D3D12_RECT *rects) {
+  const UINT none[4] = {0, 0, 0, 0};
+  if (v) uav_clear_list(l, c, r, none, v, 1, n, rects);
+}
 static void STDMETHODCALLTYPE list_DiscardResource(CmdList *l, ID3D12Resource *r, const D3D12_DISCARD_REGION *region) {}
 
 /* ---- copies ------------------------------------------------------------------------------------------------------------------------------------------------------------------- */

@@ -335,6 +335,12 @@ static void STDMETHODCALLTYPE list_ExecuteBundle(CmdList *l, ID3D12GraphicsComma
       case B_PSO: list_SetPipelineState(l, (ID3D12PipelineState *)(UINT_PTR)a[0]); break;
       case B_TOPOLOGY: list_IASetPrimitiveTopology(l, (D3D12_PRIMITIVE_TOPOLOGY)a[0]); break;
       case B_STENCIL_REF: list_OMSetStencilRef(l, (UINT)a[0]); break;
+      case B_BLEND_FACTOR: {
+        float f[4];
+        for (UINT c = 0; c < 4; ++c) { const UINT bits = (UINT)a[c]; memcpy(&f[c], &bits, 4); }
+        list_OMSetBlendFactor(l, f);
+        break;
+      }
       case B_INDEX_BUFFER: {
         const D3D12_INDEX_BUFFER_VIEW v = {a[0], (UINT)a[1], (DXGI_FORMAT)a[2]};
         list_IASetIndexBuffer(l, a[0] ? &v : NULL);

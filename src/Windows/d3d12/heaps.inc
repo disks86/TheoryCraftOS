@@ -36,7 +36,8 @@ typedef struct SoftDesc {
   UINT sampler[4];         /* filter | address_u << 8 | address_v << 16 | mip_filter << 24, lod bias, min lod, max lod (floats as bits) */
   UINT dimension;
   UINT slice;
-  UINT pad[2];
+  UINT stride;             /* buffer unordered access views: the bytes of an element (ClearUnorderedAccessView* rectangles count elements) */
+  UINT pad;
 } SoftDesc;
 typedef char soft_desc_size_check[sizeof(SoftDesc) == DESCRIPTOR_STRIDE ? 1 : -1];
 
@@ -162,8 +163,10 @@ static void STDMETHODCALLTYPE dev_CreateUnorderedAccessView(Dev *This, ID3D12Res
       stride = desc->Buffer.StructureByteStride ? desc->Buffer.StructureByteStride : (desc->Format != DXGI_FORMAT_UNKNOWN && desc->Format != DXGI_FORMAT_R32_TYPELESS ? format_bytes(desc->Format) : 4);
       first = desc->Buffer.FirstElement;
       count = desc->Buffer.NumElements;
+      if (!desc->Buffer.StructureByteStride && !(desc->Buffer.Flags & D3D12_BUFFER_UAV_FLAG_RAW)) d.format = desc->Format;      /* (typed: ClearUnorderedAccessView* converts to it) */
     }
     d.kind = DK_UAV;
+    d.stride = stride;
     d.alloc = r->alloc;
     d.offset = first * stride;
     d.size = count * stride;

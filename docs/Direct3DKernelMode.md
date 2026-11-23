@@ -411,10 +411,40 @@ In the DLL alone: passes with a depth buffer and no render target (the kernel's 
 nothing reads; a device whose passes need none would save that memory), a depth clear that no pass takes (a pass of its own when the list is closed), multisampled render
 targets and depth buffers with `ResolveSubresource`.
 
+**The later interfaces** (`ID3D12Device1` .. `ID3D12Device10`, `ID3D12GraphicsCommandList1` .. `7`, `ID3D12Fence1`, `ID3D12Resource2`, `ID3D12Heap1`; every vtable slot
+has its method, `scripts/gen-dx-vtables.py` names the latest interface of each object). What each part does:
+
+- `device1.inc`: the `*1`/`*2`/`*3` resource and heap creation (`D3D12_RESOURCE_DESC1`, initial layouts as states; protected sessions and castable formats refused with
+  `E_INVALIDARG`), `GetResourceAllocationInfo1/2`, `GetCopyableFootprints1`, `CreateCommandList1` (a closed list), `CreateCommandQueue1`, residency
+  (`SetResidencyPriority`, `EnqueueMakeResident` signals its fence), `SetEventOnMultipleFenceCompletion` (any or all, on a thread of its own), `RemoveDevice` (every fence
+  of the device signalled with `UINT64_MAX`), lifetime trackers, pipeline state streams (`CreatePipelineState`, `stream_parse`: the CD3DX12 defaults, duplicates refused),
+  `CheckDriverMatchingIdentifier`, and the later fence/resource/heap methods. What the device does not have answers what Direct3D 12 answers for it: no meta commands are
+  enumerated, state objects and protected sessions are `DXGI_ERROR_UNSUPPORTED`, the raytracing prebuild info is zeros.
+- `library.inc`: pipeline libraries (`ID3D12PipelineLibrary1`, a `TCOSPLB1` blob of names, kinds and FNV fingerprints of the descriptions: a load with another description or
+  a name not stored is `E_INVALIDARG`, a foreign blob `D3D12_ERROR_DRIVER_VERSION_MISMATCH`) and shader cache sessions (`ID3D12ShaderCacheSession`, in memory or in a
+  `TCOSSCC1` file under `%LOCALAPPDATA%\D3DSCache`, `ShaderCacheControl` clearing the application's).
+- `rootsig.inc`: `D3D12CreateRootSignatureDeserializer` and `D3D12CreateVersionedRootSignatureDeserializer` (raw blobs and DXBC `RTS0` parts, bounds-checked; 1.0 to 1.1 makes
+  ranges and root descriptors volatile as Windows does, 1.1 to 1.0 drops the flags).
+- `cmdlist1.inc`: atomic buffer copies, `WriteBufferImmediate` (through an upload buffer of the list's), `ResolveSubresourceRegion` (average, least, greatest; a partial region
+  through a texture of the source's size), render passes (tier 0: targets bound, beginning-access clears, ending-access resolves), the enhanced barriers (nothing to
+  transition), and `ClearUnorderedAccessViewUint/Float` of buffer views (raw, structured and typed, each format's conversion). The calls of the features the device reports at
+  the "not supported" tier (depth bounds, sample positions, view instancing, meta commands, raytracing, shading rate, mesh shaders) are calls a program may not make here.
+- `resource.inc`: textures in custom heaps the CPU sees (`D3D12_CPU_PAGE_PROPERTY_WRITE_BACK` / `WRITE_COMBINE`, the driver's layout), `Map` with no pointer and
+  `WriteToSubresource` / `ReadFromSubresource`, which lock the kernel's image of the subresource.
+- `OMSetBlendFactor` and the factors `BLEND_FACTOR`, `INV_BLEND_FACTOR`, `ALPHA_FACTOR`, `INV_ALPHA_FACTOR`: the kernel's `BlendFactor::Constant*` (the CPU renderer and
+  virgl, `DeviceInfo::blend_constant`); a pipeline is made for each factor a draw uses, as for each stencil reference. d3d11 and d3d9 (`D3DRS_BLENDFACTOR`,
+  `D3DBLEND_BOTHSRCALPHA`) pass theirs on.
+
 Not done, in the order a program is likely to meet them: texture formats of fewer than four channels, packed floats and block compression beyond BC1 - BC3 (above); a depth buffer read as a texture (shadow maps: virgl keeps textures and attachments in opposite row order, and the
-kernel refuses the combination); rendering into a mip level or an array layer; unordered access to textures; the blend factor, depth bias and back-face stencil state;
-several viewports; more than four unordered access buffers; pipeline statistics queries from the DLL; shared handles; the later device and command list interfaces
-(`ID3D12Device1` ..., ray tracing, mesh shaders, variable rate shading); and all of it on the GPU backends other than virgl.
+kernel refuses the combination); rendering into a mip level or an array layer; unordered access to textures (and so `ClearUnorderedAccessView*` of a texture); depth bias
+and back-face stencil state; dual-source blending (`SRC1_*` factors: the pipeline is refused with `DXGI_ERROR_UNSUPPORTED`); several viewports; more than four unordered
+access buffers; pipeline statistics queries from the DLL; shared handles (`CreateSharedHandle` / `OpenSharedHandle*` answer `DXGI_ERROR_UNSUPPORTED`: win32k has the
+global share handles of allocations but no NT-handle sharing of resources or synchronization objects); the blend factor on Vega and the other fixed backends; ray tracing,
+mesh shaders, variable rate shading, view instancing, sampler feedback, protected sessions and meta commands (reported unsupported); `ResolveSubresourceRegion` into a
+subresource other than 0 and the least / greatest colour resolves on virgl (its resolves are averages: the call is left out there); typed UAV clears of formats outside
+`g_uav_formats` (R11G11B10, B5G6R5 ...); root signature version 1.2 and the pipeline-stream subobjects of the later Agility SDKs (`DEPTH_STENCIL2`, `RASTERIZER1/2`,
+serialized root signatures: `E_INVALIDARG`); two shader cache sessions of one identifier are two stores (the later file write wins); and all of it on the GPU backends
+other than virgl.
 
 ### The other GPU backends and feature level 11_0
 

@@ -1406,13 +1406,14 @@ NtStatus Kernel::escape(ProcessId pid, Handle device, ConstByteView request, Byt
       }
       const uint32_t enable = in.le32(), compare = in.le32(), fail = in.le32(), depth_fail = in.le32(), pass = in.le32();
       const uint32_t compare_mask = in.le32(), write_mask = in.le32(), reference = in.le32();
+      constexpr uint32_t kLastFactor = graphics::kBlendFactorCount - 1;
       // Optional trailing words (the state of Direct3D 10): depth_compare, then blend custom, enable, the four factors, the two ops, the write mask, and a bit per attribute for
       // per_instance (then the number of colour outputs, then independent blending). Their absence is the base state.
       if (!in.ok()) return status::kInvalidParameter;
       if (!in.at_end()) {
         const uint32_t depth_compare = in.le32(), custom = in.le32(), blend_enable = in.le32(), sc = in.le32(), dc = in.le32(), sa = in.le32(), da = in.le32(), cop = in.le32(), aop = in.le32(),
                        mask = in.le32(), instance_bits = in.le32();
-        if (!in.ok() || depth_compare > 7 || custom > 1 || blend_enable > 1 || sc > 10 || dc > 10 || sa > 10 || da > 10 || cop > 4 || aop > 4 || mask > 15 || instance_bits > 15) return status::kInvalidParameter;
+        if (!in.ok() || depth_compare > 7 || custom > 1 || blend_enable > 1 || sc > kLastFactor || dc > kLastFactor || sa > kLastFactor || da > kLastFactor || cop > 4 || aop > 4 || mask > 15 || instance_bits > 15) return status::kInvalidParameter;
         desc.depth_compare = static_cast<graphics::CompareOp>(depth_compare);
         desc.blend.custom = custom != 0, desc.blend.enable = blend_enable != 0;
         desc.blend.src_color = static_cast<graphics::BlendFactor>(sc), desc.blend.dst_color = static_cast<graphics::BlendFactor>(dc);
@@ -1430,7 +1431,7 @@ NtStatus Kernel::escape(ProcessId pid, Handle device, ConstByteView request, Byt
             for (uint32_t ti = 0; ti < 3; ++ti) {
               graphics::BlendState& t = desc.target_blend[ti];
               const uint32_t tc = in.le32(), te = in.le32(), tsc = in.le32(), tdc = in.le32(), tsa = in.le32(), tda = in.le32(), tcop = in.le32(), taop = in.le32(), tmask = in.le32();
-              if (!in.ok() || tc > 1 || te > 1 || tsc > 10 || tdc > 10 || tsa > 10 || tda > 10 || tcop > 4 || taop > 4 || tmask > 15) return status::kInvalidParameter;
+              if (!in.ok() || tc > 1 || te > 1 || tsc > kLastFactor || tdc > kLastFactor || tsa > kLastFactor || tda > kLastFactor || tcop > 4 || taop > 4 || tmask > 15) return status::kInvalidParameter;
               t.custom = tc != 0, t.enable = te != 0;
               t.src_color = static_cast<graphics::BlendFactor>(tsc), t.dst_color = static_cast<graphics::BlendFactor>(tdc);
               t.src_alpha = static_cast<graphics::BlendFactor>(tsa), t.dst_alpha = static_cast<graphics::BlendFactor>(tda);
@@ -1490,12 +1491,25 @@ NtStatus Kernel::escape(ProcessId pid, Handle device, ConstByteView request, Byt
                       for (uint32_t k = 0; k < more_blends; ++k) {
                         graphics::BlendState& t = desc.target_blend[3 + k];
                         const uint32_t tc = in.le32(), te = in.le32(), tsc = in.le32(), tdc = in.le32(), tsa = in.le32(), tda = in.le32(), tcop = in.le32(), taop = in.le32(), tmask = in.le32();
-                        if (!in.ok() || tc > 1 || te > 1 || tsc > 10 || tdc > 10 || tsa > 10 || tda > 10 || tcop > 4 || taop > 4 || tmask > 15) return status::kInvalidParameter;
+                        if (!in.ok() || tc > 1 || te > 1 || tsc > kLastFactor || tdc > kLastFactor || tsa > kLastFactor || tda > kLastFactor || tcop > 4 || taop > 4 || tmask > 15) return status::kInvalidParameter;
                         t.custom = tc != 0, t.enable = te != 0;
                         t.src_color = static_cast<graphics::BlendFactor>(tsc), t.dst_color = static_cast<graphics::BlendFactor>(tdc);
                         t.src_alpha = static_cast<graphics::BlendFactor>(tsa), t.dst_alpha = static_cast<graphics::BlendFactor>(tda);
                         t.color_op = static_cast<graphics::BlendOp>(tcop), t.alpha_op = static_cast<graphics::BlendOp>(taop);
                         t.write_mask = static_cast<uint8_t>(tmask);
+                      }
+                      if (!in.at_end()) {   // (and, after that, the colour of the constant blend factors: red, green, blue, alpha as floats; every target's)
+                        float constant[4];
+                        for (float& c : constant) {
+                          const uint32_t bits = in.le32();
+                          __builtin_memcpy(&c, &bits, 4);
+                          if (c != c) return status::kInvalidParameter;      // (NaN)
+                        }
+                        if (!in.ok()) return status::kInvalidParameter;
+                        for (uint32_t c = 0; c < 4; ++c) {
+                          desc.blend.constant[c] = constant[c];
+                          for (graphics::BlendState& t : desc.target_blend) t.constant[c] = constant[c];
+                        }
                       }
                     }
                   }

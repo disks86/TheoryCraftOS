@@ -592,6 +592,7 @@ static BOOL draw_prepare(Ctx *c, BOOL indexed) {
   if ((d->dirty & DIRTY_SO) && streams) so_record(d, c);
   ID3D12GraphicsCommandList_IASetPrimitiveTopology(list, (D3D12_PRIMITIVE_TOPOLOGY)c->topology);
   ID3D12GraphicsCommandList_OMSetStencilRef(list, c->stencil_ref);
+  ID3D12GraphicsCommandList_OMSetBlendFactor(list, c->blend_factor);
   for (UINT slot = 0; slot < VERTEX_SLOTS; ++slot) {
     if (!sources[slot]) continue;
     D3D12_VERTEX_BUFFER_VIEW view = {ID3D12Resource_GetGPUVirtualAddress(sources[slot]) + offsets[slot], sizes[slot], strides[slot]};

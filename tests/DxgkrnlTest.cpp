@@ -1730,9 +1730,11 @@ class SpyDevice final : public graphics::IGraphicsDevice {
   bool qpu_rows = false;
   uint32_t limit = 0;   // 0: the inner device's push constant limit
   uint32_t feature_mask = 0xFFFFFFFFu;   // the features the device lets through
+  bool no_blend_constant = false;        // the device says it has no constant blend factors
   graphics::DeviceInfo info() const override {
     graphics::DeviceInfo i = inner_.info();
     i.features &= feature_mask;
+    if (no_blend_constant) i.blend_constant = false;
     if (limit) i.max_push_constant_bytes = limit;
     return i;
   }
@@ -3506,7 +3508,7 @@ void test_independent_blend() {
     return env.kernel.create_pipeline(kPid, env.dev, pd, out);
   };
   CHECK(make(e, true, 1, &pipe) == status::kSuccess && make(e, false, 1, &pipe) == status::kSuccess);
-  CHECK(make(e, true, 11, &pipe) == status::kInvalidParameter);   // (a factor that does not exist, in a state of a target)
+  CHECK(make(e, true, graphics::kBlendFactorCount, &pipe) == status::kInvalidParameter);   // (a factor that does not exist, in a state of a target)
   // A device without the feature refuses it (but takes the same pipeline without independent blending).
   FakeScreen screen(8, 6);
   graphics::SoftwareDevice software(e.allocator, &screen);
@@ -3529,6 +3531,48 @@ void test_independent_blend() {
   CHECK(kernel.create_pipeline(kPid, dev, pd, &out) == status::kSuccess);
   pd.independent_blend = true;
   CHECK(kernel.create_pipeline(kPid, dev, pd, &out) == status::kNotSupported);
+}
+
+// The constant blend factors: taken by a device that has them (the CPU renderer), refused with kNotSupported by one that does not, in the pipeline's own state and in a
+// target's; a pipeline that names them only in a state that does not blend is not refused.
+void test_blend_constant() {
+  Env e;
+  auto make = [](Kernel& kernel, Handle dev, graphics::BlendFactor factor, bool in_target, bool enable, Handle* out) {
+    Handle vs = 0, fs = 0;
+    CHECK(kernel.create_shader(kPid, dev, {ShaderKind::ColoredVertex, graphics::ShaderStage::Vertex, {}}, &vs) == status::kSuccess);
+    CHECK(kernel.create_shader(kPid, dev, {ShaderKind::ColoredFragment, graphics::ShaderStage::Fragment, {}}, &fs) == status::kSuccess);
+    graphics::GraphicsPipelineDesc gd;
+    graphics::describe_colored_pipeline(&gd);
+    PipelineDesc pd;
+    pd.vertex_shader = vs, pd.fragment_shader = fs, pd.vertex_stride = gd.vertex_stride, pd.attribute_count = 2, pd.varying_count = 1;
+    pd.attributes[0] = gd.attributes[0], pd.attributes[1] = gd.attributes[1];
+    graphics::BlendState& b = in_target ? pd.target_blend[0] : pd.blend;
+    pd.independent_blend = in_target;
+    b.custom = true, b.enable = enable, b.src_color = factor, b.dst_alpha = graphics::BlendFactor::InvConstantAlpha;
+    b.constant[0] = 0.25f, b.constant[3] = 0.5f;
+    return kernel.create_pipeline(kPid, dev, pd, out);
+  };
+  Handle pipe = 0;
+  CHECK(make(e.kernel, e.dev, graphics::BlendFactor::ConstantColor, false, true, &pipe) == status::kSuccess);
+  CHECK(make(e.kernel, e.dev, graphics::BlendFactor::InvConstantColor, true, true, &pipe) == status::kSuccess);
+  FakeScreen screen(8, 6);
+  graphics::SoftwareDevice software(e.allocator, &screen);
+  SpyDevice limited(software);
+  limited.no_blend_constant = true;
+  Kernel kernel(e.allocator);
+  AdapterConfig c;
+  c.display = &screen;
+  kernel.add_adapter(limited, c);
+  Handle adapter = 0, dev = 0;
+  CHECK(kernel.open_process(kPid) == status::kSuccess && kernel.open_adapter_from_index(kPid, 0, &adapter) == status::kSuccess && kernel.create_device(kPid, adapter, &dev) == status::kSuccess);
+  AdapterCaps caps;
+  CHECK(kernel.query_adapter_caps(kPid, adapter, &caps) == status::kSuccess && !caps.blend_constant);
+  CHECK(make(kernel, dev, graphics::BlendFactor::ConstantColor, false, true, &pipe) == status::kNotSupported);
+  CHECK(make(kernel, dev, graphics::BlendFactor::ConstantAlpha, true, true, &pipe) == status::kNotSupported);
+  CHECK(make(kernel, dev, graphics::BlendFactor::ConstantColor, false, false, &pipe) == status::kSuccess);   // (blending off: the factors are not used)
+  AdapterCaps full;
+  Handle first = 0;
+  CHECK(e.kernel.open_adapter_from_index(kPid, 0, &first) == status::kSuccess && e.kernel.query_adapter_caps(kPid, first, &full) == status::kSuccess && full.blend_constant);
 }
 
 // A compute shader written token by token (the HLSL compiler at hand has no ByteAddressBuffer methods): ld_raw, store_raw and an immediate atomic on a raw buffer.
@@ -8079,6 +8123,7 @@ int main() {
   test_occlusion_queries();
   test_texture_kinds();
   test_independent_blend();
+  test_blend_constant();
   test_compute();
   test_compute_kernel();
   test_multisample();

@@ -31,14 +31,16 @@
  * Whatever the device:
  *   - four unordered access buffers and four buffer SRVs, no 1D textures, mip chains and arrays only on sampled textures (a render target or depth buffer has one level and
  *     one layer, and a depth buffer cannot be sampled), no texture UAVs, buffer SRVs only on buffers made with unordered access, texture formats of four channels only
- *     (base.inc g_formats: no one- or two-channel, packed-float or block-compressed formats), a blend factor, depth bias and a back-face stencil state are not applied,
+ *     (base.inc g_formats: no one- or two-channel, packed-float or block-compressed formats), depth bias and a back-face stencil state are not applied (the blend factor is: the CPU renderer and virgl),
  *     one viewport and scissor
  *   - a pass with a depth buffer and no render target draws into a colour image of the buffer's size that nothing reads (cmdlist.inc depth_companion): it costs that memory
  *   - sampler border colours are the three of a static sampler (another colour is the nearest of them); a device with wrap and clamp alone uses the nearer of those
  *   - multisampled images are render targets and depth buffers of the adapter's sample counts, drawn into and resolved (not read by shaders through this DLL)
- *   - pipeline statistics and stream output queries, tiled depth/multisampled/array resources, shared handles, resource state validation (barriers are accepted and not looked at,
- *     except aliasing), the debug layer, the root signature deserializers, WriteToSubresource / ReadFromSubresource, the interfaces after ID3D12Device and
- *     ID3D12GraphicsCommandList
+ *   - pipeline statistics and stream output queries, tiled depth/multisampled/array resources, shared handles (DXGI_ERROR_UNSUPPORTED: no NT-handle sharing in win32k),
+ *     resource state validation (barriers are accepted and not looked at, except aliasing), the debug layer, dual-source blending, unordered access to textures
+ *   - of the later interfaces (ID3D12Device1 .. 10, ID3D12GraphicsCommandList1 .. 7: device1.inc, cmdlist1.inc, library.inc, rootsig.inc), the features reported at their
+ *     "not supported" tier: ray tracing, mesh shaders, variable-rate shading, view instancing, depth bounds, sample positions, sampler feedback, protected sessions, meta
+ *     commands
  *   - vertex elements: 32-bit floats on every device; bytes, 16-bit numbers, half floats and 32-bit integers (pso.inc vertex_format) where the device reads them (the CPU
  *     renderer and virgl)
  *     (queries are occlusion, binary occlusion and timestamps; ExecuteIndirect is made when the list is executed; bundles replay their calls: extras.inc)
@@ -68,10 +70,14 @@ __asm__(".text\n.globl ___chkstk_ms\n___chkstk_ms:\n ret\n");
 #include "resource.inc"
 #include "heaps.inc"
 #include "pso.inc"
+#include "rootsig.inc"
 #include "cmdlist.inc"
+#include "cmdlist1.inc"
 #include "extras.inc"
 #include "queue.inc"
 #include "device.inc"
+#include "device1.inc"
+#include "library.inc"
 
 #include "vtbl.inc"
 
@@ -136,8 +142,6 @@ EXPORT HRESULT WINAPI D3D12GetDebugInterface(REFIID riid, void **out) {
   return DXGI_ERROR_SDK_COMPONENT_MISSING;
 }
 EXPORT HRESULT WINAPI D3D12EnableExperimentalFeatures(UINT count, const IID *iids, void *configuration, UINT *sizes) { return count == 0 ? S_OK : E_NOINTERFACE; }
-EXPORT HRESULT WINAPI D3D12CreateRootSignatureDeserializer(const void *data, SIZE_T size, REFIID riid, void **out) { if (out) *out = NULL; return E_NOTIMPL; }
-EXPORT HRESULT WINAPI D3D12CreateVersionedRootSignatureDeserializer(const void *data, SIZE_T size, REFIID riid, void **out) { if (out) *out = NULL; return E_NOTIMPL; }
 EXPORT HRESULT WINAPI D3D12GetInterface(REFCLSID clsid, REFIID riid, void **out) { if (out) *out = NULL; return E_NOINTERFACE; }
 
 BOOL WINAPI DllMain(HINSTANCE module, DWORD reason, LPVOID reserved) {

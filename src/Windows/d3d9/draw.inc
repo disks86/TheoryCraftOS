@@ -147,7 +147,18 @@ static void decode_shader_vertices(const Attribute *a, UINT inputs, const Source
 
 /* ---- pipelines -------------------------------------------------------------------------------------------------------------------------------------- */
 
-static D3D12_BLEND blend_of(DWORD value) { return value >= D3DBLEND_ZERO && value <= D3DBLEND_SRCALPHASAT ? (D3D12_BLEND)value : D3D12_BLEND_ONE; }      /* (the same numbers) */
+/* (the same numbers, D3DBLEND_BLENDFACTOR and D3DBLEND_INVBLENDFACTOR too; D3DBLEND_BOTHSRCALPHA and BOTHINVSRCALPHA set both factors: blend_pair) */
+static D3D12_BLEND blend_of(DWORD value) {
+  return (value >= D3DBLEND_ZERO && value <= D3DBLEND_SRCALPHASAT) || value == D3DBLEND_BLENDFACTOR || value == D3DBLEND_INVBLENDFACTOR ? (D3D12_BLEND)value : D3D12_BLEND_ONE;
+}
+/* The source and destination factors of a source blend and a destination blend: a source of D3DBLEND_BOTHSRCALPHA is the source's alpha and the destination one minus it
+ * (BOTHINVSRCALPHA the other way round), whatever the destination blend says. */
+static void blend_pair(DWORD src, DWORD dst, UINT *src_out, UINT *dst_out) {
+  if (src == D3DBLEND_BOTHSRCALPHA) { *src_out = D3D12_BLEND_SRC_ALPHA; *dst_out = D3D12_BLEND_INV_SRC_ALPHA; return; }
+  if (src == D3DBLEND_BOTHINVSRCALPHA) { *src_out = D3D12_BLEND_INV_SRC_ALPHA; *dst_out = D3D12_BLEND_SRC_ALPHA; return; }
+  *src_out = blend_of(src);
+  *dst_out = blend_of(dst);
+}
 static UINT op_of(DWORD value, UINT lowest, UINT highest, UINT otherwise) { return value >= lowest && value <= highest ? value : otherwise; }
 
 /* The textures a draw's tables hold: the samplers its pixel shader reads, as 2, 4, 8 or 16. */
@@ -199,12 +210,22 @@ static ID3D12PipelineState *pipeline_get(Dev *d, const Shader *vs, const Shader 
   key.zwrite = rs[D3DRS_ZWRITEENABLE] != 0;
   key.zfunc = op_of(rs[D3DRS_ZFUNC], 1, 8, D3DCMP_LESSEQUAL);
   key.blend = rs[D3DRS_ALPHABLENDENABLE] != 0;
-  key.src = blend_of(rs[D3DRS_SRCBLEND]);
-  key.dst = blend_of(rs[D3DRS_DESTBLEND]);
+  {
+    UINT s_, d_;
+    blend_pair(rs[D3DRS_SRCBLEND], rs[D3DRS_DESTBLEND], &s_, &d_);
+    key.src = s_;
+    key.dst = d_;
+  }
   key.op = op_of(rs[D3DRS_BLENDOP], 1, 5, D3DBLENDOP_ADD);
   key.separate = rs[D3DRS_SEPARATEALPHABLENDENABLE] != 0;
-  key.src_alpha = key.separate ? blend_of(rs[D3DRS_SRCBLENDALPHA]) : key.src;
-  key.dst_alpha = key.separate ? blend_of(rs[D3DRS_DESTBLENDALPHA]) : key.dst;
+  key.src_alpha = key.src;
+  key.dst_alpha = key.dst;
+  if (key.separate) {
+    UINT s_, d_;
+    blend_pair(rs[D3DRS_SRCBLENDALPHA], rs[D3DRS_DESTBLENDALPHA], &s_, &d_);
+    key.src_alpha = s_;
+    key.dst_alpha = d_;
+  }
   key.op_alpha = key.separate ? op_of(rs[D3DRS_BLENDOPALPHA], 1, 5, D3DBLENDOP_ADD) : key.op;
   key.write = rs[D3DRS_COLORWRITEENABLE] & 0xF;
   key.stencil = rs[D3DRS_STENCILENABLE] != 0 && d->depth != NULL;
@@ -752,6 +773,12 @@ static HRESULT draw(Dev *d, D3DPRIMITIVETYPE type, UINT primitives, const Source
                                                          : type == D3DPT_LINESTRIP ? D3D_PRIMITIVE_TOPOLOGY_LINESTRIP
                                                          : type == D3DPT_TRIANGLESTRIP ? D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP : D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
   ID3D12GraphicsCommandList_OMSetStencilRef(list, d->state.rs[D3DRS_STENCILREF] & 0xFF);
+  {
+    /* (D3DRS_BLENDFACTOR: a D3DCOLOR, alpha in the top byte) */
+    const DWORD c = d->state.rs[D3DRS_BLENDFACTOR];
+    const float factor[4] = {((c >> 16) & 0xFF) / 255.0f, ((c >> 8) & 0xFF) / 255.0f, (c & 0xFF) / 255.0f, (c >> 24) / 255.0f};
+    ID3D12GraphicsCommandList_OMSetBlendFactor(list, factor);
+  }
   D3D12_VERTEX_BUFFER_VIEW vertex_view = {ID3D12Resource_GetGPUVirtualAddress(d->vertex_ring) + vertex_at, vertices * stride, stride};
   ID3D12GraphicsCommandList_IASetVertexBuffers(list, 0, 1, &vertex_view);
   ID3D12GraphicsCommandList_SetGraphicsRootConstantBufferView(list, 0, constants_of(d, &layout, vs, ps, d->state.ps == NULL));

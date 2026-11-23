@@ -158,8 +158,10 @@ class VegaModule final : public IShaderModule {
 
 uint8_t blend_factor(BlendFactor f) {
   // (graphics order: zero, one, src colour, 1 - src colour, src alpha, 1 - src alpha, dst colour, 1 - dst colour, dst alpha, 1 - dst alpha, saturate; the hardware's: dst alpha is 6, dst colour 8)
+  // (the constant factors are not among them: the device does not report DeviceInfo::blend_constant, so the kernel refuses pipelines that use them)
   static const uint8_t kMap[11] = {0, 1, 2, 3, 4, 5, 8, 9, 6, 7, 10};
-  return kMap[static_cast<uint32_t>(f)];
+  const uint32_t i = static_cast<uint32_t>(f);
+  return i < 11 ? kMap[i] : 1;
 }
 
 uint8_t blend_op(BlendOp op) {

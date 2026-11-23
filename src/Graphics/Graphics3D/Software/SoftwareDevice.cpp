@@ -648,8 +648,8 @@ bool depth_passes(CompareOp op, float z, float stored) {
   return false;
 }
 
-// One factor of the blend equation for one channel (0 red .. 3 alpha) of the colour `s` and the destination `d`.
-float blend_factor(BlendFactor f, const float s[4], const float d[4], uint32_t channel) {
+// One factor of the blend equation for one channel (0 red .. 3 alpha) of the colour `s` and the destination `d`; `k` is the state's constant colour.
+float blend_factor(BlendFactor f, const float s[4], const float d[4], const float k[4], uint32_t channel) {
   switch (f) {
     case BlendFactor::Zero: return 0.0f;
     case BlendFactor::One: return 1.0f;
@@ -662,6 +662,10 @@ float blend_factor(BlendFactor f, const float s[4], const float d[4], uint32_t c
     case BlendFactor::DstAlpha: return d[3];
     case BlendFactor::InvDstAlpha: return 1.0f - d[3];
     case BlendFactor::SrcAlphaSaturate: return channel == 3 ? 1.0f : (s[3] < 1.0f - d[3] ? s[3] : 1.0f - d[3]);
+    case BlendFactor::ConstantColor: return k[channel];
+    case BlendFactor::InvConstantColor: return 1.0f - k[channel];
+    case BlendFactor::ConstantAlpha: return k[3];
+    case BlendFactor::InvConstantAlpha: return 1.0f - k[3];
   }
   return 0.0f;
 }
@@ -674,7 +678,7 @@ uint32_t blend_pixel(const BlendState& b, uint32_t source, uint32_t destination)
   for (uint32_t c = 0; c < 4; ++c) {
     const bool alpha = c == 3;
     const BlendOp op = alpha ? b.alpha_op : b.color_op;
-    const float sf = blend_factor(alpha ? b.src_alpha : b.src_color, s, d, c), df = blend_factor(alpha ? b.dst_alpha : b.dst_color, s, d, c);
+    const float sf = blend_factor(alpha ? b.src_alpha : b.src_color, s, d, b.constant, c), df = blend_factor(alpha ? b.dst_alpha : b.dst_color, s, d, b.constant, c);
     if (!b.enable) out[c] = s[c];
     else if (op == BlendOp::Add) out[c] = s[c] * sf + d[c] * df;
     else if (op == BlendOp::Subtract) out[c] = s[c] * sf - d[c] * df;
@@ -702,7 +706,7 @@ Vec4 blend_float(const BlendState& b, bool over, Vec4 source, Vec4 destination) 
     }
     const bool alpha = c == 3;
     const BlendOp op = alpha ? b.alpha_op : b.color_op;
-    const float sf = blend_factor(alpha ? b.src_alpha : b.src_color, s, d, c), df = blend_factor(alpha ? b.dst_alpha : b.dst_color, s, d, c);
+    const float sf = blend_factor(alpha ? b.src_alpha : b.src_color, s, d, b.constant, c), df = blend_factor(alpha ? b.dst_alpha : b.dst_color, s, d, b.constant, c);
     if (!b.enable) out[c] = s[c];
     else if (op == BlendOp::Add) out[c] = s[c] * sf + d[c] * df;
     else if (op == BlendOp::Subtract) out[c] = s[c] * sf - d[c] * df;
@@ -1575,7 +1579,24 @@ bool SoftwareDevice::submit(ICommandBuffer* commands) {
             for (uint32_t x = 0; x < out.width; ++x) out.row(y)[x] = in.row(y)[uint64_t{x} * n];
           break;
         }
-        if (mode != ResolveMode::Average) return false;   // (a colour image is averaged or takes sample 0)
+        if (mode == ResolveMode::Min || mode == ResolveMode::Max) {
+          // (the least or greatest of each channel's codes: the order of the codes is the order of the values, sRGB ones too)
+          for (uint32_t y = 0; y < out.height; ++y)
+            for (uint32_t x = 0; x < out.width; ++x) {
+              uint32_t best = in.decode(in.row(y)[uint64_t{x} * n]);
+              for (uint32_t k = 1; k < n; ++k) {
+                const uint32_t argb = in.decode(in.row(y)[uint64_t{x} * n + k]);
+                uint32_t merged = 0;
+                for (uint32_t c = 0; c < 4; ++c) {
+                  const uint32_t a = (best >> (8 * c)) & 0xFF, b = (argb >> (8 * c)) & 0xFF;
+                  merged |= (mode == ResolveMode::Min ? (a < b ? a : b) : (a > b ? a : b)) << (8 * c);
+                }
+                best = merged;
+              }
+              out.row(y)[x] = out.encode(best);
+            }
+          break;
+        }
         for (uint32_t y = 0; y < out.height; ++y)
           for (uint32_t x = 0; x < out.width; ++x) {
             if (is_srgb_format(in.format)) {
