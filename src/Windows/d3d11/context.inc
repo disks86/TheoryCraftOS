@@ -25,6 +25,7 @@ static void set_range(void **slots, UINT capacity, UINT start, UINT count, void 
 static void get_range(void **slots, UINT capacity, UINT start, UINT count, void **objects);
 static void unbind_reads_of(Ctx *c, const void *resource, BOOL compute);
 static BOOL compute_prepare(Ctx *c);
+static void rtv_load(Dev *d, struct View *v, BOOL whole);
 static void set_instances(Ctx *c, UINT stage, ID3D11ClassInstance *const *instances, UINT count);
 
 /* ---- pipelines ------------------------------------------------------------------------------------------------------------------------------------- */
@@ -547,8 +548,14 @@ static BOOL draw_prepare(Ctx *c, BOOL indexed) {
     sources[slot] = vertex_source(d, c, slot, &strides[slot], &offsets[slot], &sizes[slot]);
     if (!sources[slot]) return FALSE;
   }
-  /* (a texture the list's draws sampled cannot become its target: the kernel keeps it bound as a texture for the whole list) */
-  for (UINT i = 0; i < c->rtv_count; ++i) tex_before_write(d, c->rtv[i]->tex);
+  /* (what views drew into the textures sampled goes into them first: rtshadow.inc) */
+  for (UINT i = 0; i < TEXTURE_SLOTS; ++i) if (slot_view(c, i) && slot_view(c, i)->tex) tex_sync(d, slot_view(c, i)->tex);
+  /* (a texture the list's draws sampled cannot become its target: the kernel keeps it bound as a texture for the whole list; a view with a target of its own is
+   * drawn into there, loaded from the texture when that changed) */
+  for (UINT i = 0; i < c->rtv_count; ++i) {
+    if (c->rtv[i]->scratch) rtv_load(d, c->rtv[i], FALSE);
+    else tex_before_write(d, c->rtv[i]->tex);
+  }
   if (c->dsv) tex_before_write(d, c->dsv->tex);
   /* (... nor be sampled after the list has drawn into it, cleared it or copied into it: the draw would see the texture as it was before the list) */
   for (UINT i = 0; i < TEXTURE_SLOTS; ++i) if (slot_view(c, i) && slot_view(c, i)->tex) tex_before_read(d, slot_view(c, i)->tex);
@@ -570,8 +577,9 @@ static BOOL draw_prepare(Ctx *c, BOOL indexed) {
   if (d->dirty & (DIRTY_VIEWPORT | DIRTY_TARGETS)) {
     static const Tex none = {.desc = {1, 1}};
     const Tex *target = c->rtv_count ? c->rtv[0]->tex : c->dsv ? c->dsv->tex : &none;
-    D3D12_VIEWPORT vp = {0, 0, (FLOAT)target->desc.Width, (FLOAT)target->desc.Height, 0, 1};
-    D3D12_RECT sc = {0, 0, (LONG)target->desc.Width, (LONG)target->desc.Height};
+    const UINT tw = c->rtv_count ? c->rtv[0]->width : target->desc.Width, th = c->rtv_count ? c->rtv[0]->height : target->desc.Height;      /* (the level a view names) */
+    D3D12_VIEWPORT vp = {0, 0, (FLOAT)tw, (FLOAT)th, 0, 1};
+    D3D12_RECT sc = {0, 0, (LONG)tw, (LONG)th};
     if (c->viewport_count) memcpy(&vp, &c->viewports[0], sizeof vp);      /* (the two structures are the same; the kernel has one viewport) */
     if (c->raster && c->raster->desc.ScissorEnable) {
       if (c->scissor_count) memcpy(&sc, &c->scissors[0], sizeof sc);
@@ -1092,6 +1100,7 @@ static BOOL compute_prepare(Ctx *c) {
   Dev *d = c->dev;
   Shader *cs = c->cs;
   if (!cs) return FALSE;
+  for (UINT i = 0; i < TEXTURE_SLOTS; ++i) if (c->cs_srv[i] && c->cs_srv[i]->tex) tex_sync(d, c->cs_srv[i]->tex);
   for (UINT i = 0; i < TEXTURE_SLOTS; ++i) if (c->cs_srv[i] && c->cs_srv[i]->tex) tex_before_read(d, c->cs_srv[i]->tex);
   if (d->ring_used + CONSTANT_BLOCK > RING_BYTES || d->view_used + TEXTURE_SLOTS + UAV_SLOTS > VIEW_HEAP || d->sampler_used + TEXTURE_SLOTS > VIEW_HEAP) flush(d);
   if (!cs->compute) {
@@ -1147,7 +1156,8 @@ static void STDMETHODCALLTYPE ctx_ClearRenderTargetView(Ctx *c, ID3D11RenderTarg
   FLOAT kept[4] = {colour[0], colour[1], colour[2], colour[3]};      /* (a target kept wider than its format: the channels it does not have stay 0 and 1) */
   const UINT8 mask = tex_format_mask(v->tex->fmt);
   for (UINT k = 0; k < 4; ++k) if (!(mask >> k & 1)) kept[k] = k == 3 ? 1.0f : 0.0f;
-  tex_before_write(c->dev, v->tex);
+  if (v->scratch) rtv_load(c->dev, v, TRUE);      /* (all of it: nothing to load) */
+  else tex_before_write(c->dev, v->tex);
   ID3D12GraphicsCommandList_ClearRenderTargetView(c->dev->list, v->handle, kept, 0, NULL);
   v->tex->used = v->tex->written = c->dev->epoch;
   c->dev->recorded = 1;
@@ -1362,6 +1372,9 @@ static void STDMETHODCALLTYPE ctx_CopySubresourceRegion(Ctx *c, ID3D11Resource *
     const UINT left = box ? box->left : 0, right = box ? box->right : bf->desc.ByteWidth;
     if (left < right && right <= bf->desc.ByteWidth && x <= bt->desc.ByteWidth && right - left <= bt->desc.ByteWidth - x) buf_copy(d, bt, x, bf, left, right - left);
   } else if (tt && tf && to_sub < tex_subresources(tt) && from_sub < tex_subresources(tf)) {
+    tex_sync(d, tf);
+    tex_sync(d, tt);
+    ++tt->version;
     if (tex_simple(tt) && tex_simple(tf) && tt->stored == tf->stored && tt != tf) {
       tex_before_write(d, tt);
       tex_before_read(d, tf);
@@ -1391,6 +1404,9 @@ static void STDMETHODCALLTYPE ctx_CopyResource(Ctx *c, ID3D11Resource *to, ID3D1
   if (bt && bf && bt != bf) {
     if (bt->desc.ByteWidth == bf->desc.ByteWidth) buf_copy(d, bt, 0, bf, 0, bt->desc.ByteWidth);      /* (CopyResource copies resources of one size) */
   } else if (tt && tf && tt != tf && tex_subresources(tt) == tex_subresources(tf) && tt->desc.Width == tf->desc.Width && tt->desc.Height == tf->desc.Height) {
+    tex_sync(d, tf);
+    tex_sync(d, tt);
+    ++tt->version;
     if (tex_simple(tt) && tex_simple(tf) && tt->stored == tf->stored) {
       tex_before_write(d, tt);
       tex_before_read(d, tf);
@@ -1574,8 +1590,6 @@ static void STDMETHODCALLTYPE ctx_CopyStructureCount(Ctx *c, ID3D11Buffer *buffe
   UNLOCK(c);
 }
 
-static void STDMETHODCALLTYPE ctx_GenerateMips(Ctx *c, ID3D11ShaderResourceView *view) {
-  if (c->deferred) { deferred_record(c, &(RecArgs){.op = REC_GENERATE_MIPS, .obj = {view}}); return; } (void)c; (void)view; }
 /* A multisampled texture into an ordinary one of its size and format: the samples of each pixel averaged (Direct3D 12's ResolveSubresource below). */
 static void STDMETHODCALLTYPE ctx_ResolveSubresource(Ctx *c, ID3D11Resource *to, UINT to_sub, ID3D11Resource *from, UINT from_sub, DXGI_FORMAT format) {
   if (c->deferred) { deferred_record(c, &(RecArgs){.op = REC_RESOLVE, .obj = {to, from}, .u = {to_sub, from_sub, (UINT)format}}); return; }
@@ -1587,6 +1601,8 @@ static void STDMETHODCALLTYPE ctx_ResolveSubresource(Ctx *c, ID3D11Resource *to,
   LOCK(c);
   tex_before_write(d, tt);
   tex_before_read(d, tf);
+  tex_sync(d, tt);
+  ++tt->version;
   ID3D12GraphicsCommandList_ResolveSubresource(d->list, tt->res, 0, tf->res, 0, tt->stored);      /* (the stored format: a typed view of it asked for is the same bytes) */
   tt->used = tf->used = tt->written = d->epoch;
   d->recorded = 1;

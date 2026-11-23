@@ -88,8 +88,11 @@ static HRESULT STDMETHODCALLTYPE dev_CheckFormatSupport(Dev *d, DXGI_FORMAT form
       *support |= D3D11_FORMAT_SUPPORT_SHADER_LOAD;
       if (!format_is_integer(format)) *support |= D3D11_FORMAT_SUPPORT_SHADER_SAMPLE | D3D11_FORMAT_SUPPORT_SHADER_GATHER;
     } else *support |= D3D11_FORMAT_SUPPORT_CAST_WITHIN_BIT_LAYOUT;
+    FLOAT probe[4];
+    const BYTE zero[16] = {0};
     if (colour->flags & FMT_TARGET) {
       *support |= D3D11_FORMAT_SUPPORT_RENDER_TARGET;
+      if (texel_decode(colour->stored, zero, probe) && !format_is_integer(format)) *support |= D3D11_FORMAT_SUPPORT_MIP_AUTOGEN;      /* (GenerateMips: rtshadow.inc) */
       if (!format_is_integer(format) && !format_is_typeless(format)) *support |= D3D11_FORMAT_SUPPORT_BLENDABLE;
     }
     if (format == DXGI_FORMAT_B8G8R8A8_UNORM || format == DXGI_FORMAT_R8G8B8A8_UNORM || format == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB || format == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB ||

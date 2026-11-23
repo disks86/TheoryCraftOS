@@ -2130,6 +2130,112 @@ static void test_creation_and_interop(void) {
   if (d12) ID3D12Device_Release(d12);
 }
 
+/* ---- render targets of levels and layers, GenerateMips -------------------------------------------------------------------------------------------------- */
+
+/* The first texel of subresource `sub` of a texture of R8G8B8A8 (`w` x `h` at that level), by way of a staging texture of that size. */
+static UINT32 subresource_texel(ID3D11Texture2D *texture, UINT sub, UINT w, UINT h) {
+  D3D11_TEXTURE2D_DESC sd = {w, h, 1, 1, DXGI_FORMAT_R8G8B8A8_UNORM, {1, 0}, D3D11_USAGE_STAGING, 0, D3D11_CPU_ACCESS_READ, 0};
+  ID3D11Texture2D *staging = NULL;
+  UINT32 texel = 0xDEADBEEFu;
+  if (FAILED(ID3D11Device_CreateTexture2D(g_device, &sd, NULL, &staging))) return texel;
+  ID3D11DeviceContext_CopySubresourceRegion(g_context, (ID3D11Resource *)staging, 0, 0, 0, 0, (ID3D11Resource *)texture, sub, NULL);
+  D3D11_MAPPED_SUBRESOURCE mapped;
+  if (SUCCEEDED(ID3D11DeviceContext_Map(g_context, (ID3D11Resource *)staging, 0, D3D11_MAP_READ, 0, &mapped))) { memcpy(&texel, mapped.pData, 4); ID3D11DeviceContext_Unmap(g_context, (ID3D11Resource *)staging, 0); }
+  ID3D11Texture2D_Release(staging);
+  return texel;
+}
+static void test_render_to_levels(void) {
+  D3D11_TEXTURE2D_DESC desc = {8, 8, 0, 1, DXGI_FORMAT_R8G8B8A8_UNORM, {1, 0}, D3D11_USAGE_DEFAULT, D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE, 0,
+                               D3D11_RESOURCE_MISC_GENERATE_MIPS};
+  ID3D11Texture2D *texture = NULL;
+  HRESULT hr = ID3D11Device_CreateTexture2D(g_device, &desc, NULL, &texture);
+  D3D11_TEXTURE2D_DESC back;
+  memset(&back, 0, sizeof back);
+  if (texture) ID3D11Texture2D_GetDesc(texture, &back);
+  IDXGISurface *surface = NULL;
+  if (texture) ID3D11Texture2D_QueryInterface(texture, &IID_IDXGISurface, (void **)&surface);
+  check(SUCCEEDED(hr) && back.MipLevels == 4 && !surface, "a render target of all its levels (MipLevels 0: 4 of them), no IDXGISurface");
+  if (surface) IDXGISurface_Release(surface);
+  if (!texture) return;
+  D3D11_RENDER_TARGET_VIEW_DESC rd;
+  memset(&rd, 0, sizeof rd);
+  rd.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+  rd.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D;
+  ID3D11RenderTargetView *level0 = NULL, *level1 = NULL;
+  ID3D11Device_CreateRenderTargetView(g_device, (ID3D11Resource *)texture, &rd, &level0);
+  rd.Texture2D.MipSlice = 1;
+  ID3D11Device_CreateRenderTargetView(g_device, (ID3D11Resource *)texture, &rd, &level1);
+  rd.Texture2D.MipSlice = 4;
+  ID3D11RenderTargetView *none = NULL;
+  check(level0 && level1 && ID3D11Device_CreateRenderTargetView(g_device, (ID3D11Resource *)texture, &rd, &none) == E_INVALIDARG && !none,
+        "render target views of level 0 and level 1 (and none of a level it does not have)");
+  if (!level0 || !level1) return;
+  const float red[4] = {1, 0, 0, 1}, green[4] = {0, 1, 0, 1}, blue[4] = {0, 0, 1, 1};
+  ID3D11DeviceContext_ClearRenderTargetView(g_context, level0, red);
+  ID3D11DeviceContext_ClearRenderTargetView(g_context, level1, green);
+  check(subresource_texel(texture, 0, 8, 8) == 0xFF0000FFu && subresource_texel(texture, 1, 4, 4) == 0xFF00FF00u, "a clear of level 0 and one of level 1, each in its level");
+
+  /* drawn into level 1 (a triangle covering it), then sampled through a view of the texture */
+  const VertexF big[3] = {{-1, -1, 0.5f, 0.1f, 0.1f, 1, 1}, {3, -1, 0.5f, 0.1f, 0.1f, 1, 1}, {-1, 3, 0.5f, 0.1f, 0.1f, 1, 1}};
+  ID3D11Buffer *vertices = make_buffer(D3D11_BIND_VERTEX_BUFFER, D3D11_USAGE_DEFAULT, 0, big, sizeof big);
+  D3D11_VIEWPORT vp = {0, 0, 4, 4, 0, 1};
+  begin(NULL);
+  ID3D11DeviceContext_OMSetRenderTargets(g_context, 1, &level1, NULL);
+  ID3D11DeviceContext_RSSetViewports(g_context, 1, &vp);
+  bind_floats(vertices);
+  ID3D11DeviceContext_PSSetShader(g_context, g_ps_color, NULL, 0);
+  ID3D11DeviceContext_Draw(g_context, 3, 0);
+  const UINT32 drawn = subresource_texel(texture, 1, 4, 4);
+  check(drawn == 0xFFFF1A1Au || drawn == 0xFFFF1919u, "a draw into level 1 (its colour (0.1, 0.1, 1))");
+  if (!(drawn == 0xFFFF1A1Au || drawn == 0xFFFF1919u)) printf("d3d11test: (level 1 after the draw: %08x)\n", (unsigned)drawn);
+
+  /* GenerateMips: level 0 half red, half blue; the 1 x 1 level is their average (in linear colour: R8G8B8A8_UNORM is linear) */
+  const D3D11_RECT right = {4, 0, 8, 8};
+  ID3D11DeviceContext_ClearRenderTargetView(g_context, level0, red);
+  ID3D11DeviceContext1 *context1 = NULL;
+  ID3D11DeviceContext_QueryInterface(g_context, &IID_ID3D11DeviceContext1, (void **)&context1);
+  if (context1) { ID3D11DeviceContext1_ClearView(context1, (ID3D11View *)level0, blue, &right, 1); ID3D11DeviceContext1_Release(context1); }
+  ID3D11ShaderResourceView *view = NULL;
+  ID3D11Device_CreateShaderResourceView(g_device, (ID3D11Resource *)texture, NULL, &view);
+  if (view) ID3D11DeviceContext_GenerateMips(g_context, view);
+  const UINT32 top = subresource_texel(texture, 3, 1, 1), half = subresource_texel(texture, 1, 4, 4);
+  if (!(top == 0xFF800080u || top == 0xFF7F007Fu)) printf("d3d11test: (the top level after GenerateMips: %08x; level 1 %08x)\n", (unsigned)top, (unsigned)half);
+  check(view && (top == 0xFF800080u || top == 0xFF7F007Fu) && half == 0xFF0000FFu, "GenerateMips: each level the average of the one before");
+  UINT support = 0;
+  ID3D11Device_CheckFormatSupport(g_device, DXGI_FORMAT_R8G8B8A8_UNORM, &support);
+  check((support & D3D11_FORMAT_SUPPORT_MIP_AUTOGEN) != 0, "CheckFormatSupport: MIP_AUTOGEN");
+
+  /* an array of two to draw into: a clear of layer 1; a cube: a clear of face 3 */
+  D3D11_TEXTURE2D_DESC array_desc = {4, 4, 1, 2, DXGI_FORMAT_R8G8B8A8_UNORM, {1, 0}, D3D11_USAGE_DEFAULT, D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE, 0, 0};
+  ID3D11Texture2D *array = NULL, *cube = NULL;
+  ID3D11Device_CreateTexture2D(g_device, &array_desc, NULL, &array);
+  array_desc.ArraySize = 6;
+  array_desc.MiscFlags = D3D11_RESOURCE_MISC_TEXTURECUBE;
+  ID3D11Device_CreateTexture2D(g_device, &array_desc, NULL, &cube);
+  memset(&rd, 0, sizeof rd);
+  rd.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+  rd.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2DARRAY;
+  rd.Texture2DArray.FirstArraySlice = 1;
+  rd.Texture2DArray.ArraySize = 1;
+  ID3D11RenderTargetView *layer1 = NULL, *face3 = NULL;
+  if (array) ID3D11Device_CreateRenderTargetView(g_device, (ID3D11Resource *)array, &rd, &layer1);
+  rd.Texture2DArray.FirstArraySlice = 3;
+  if (cube) ID3D11Device_CreateRenderTargetView(g_device, (ID3D11Resource *)cube, &rd, &face3);
+  if (layer1) ID3D11DeviceContext_ClearRenderTargetView(g_context, layer1, blue);
+  if (face3) ID3D11DeviceContext_ClearRenderTargetView(g_context, face3, green);
+  check(layer1 && subresource_texel(array, 1, 4, 4) == 0xFFFF0000u && subresource_texel(array, 0, 4, 4) == 0, "an array to draw into: layer 1 cleared, layer 0 as it was");
+  check(face3 && subresource_texel(cube, 3, 4, 4) == 0xFF00FF00u && subresource_texel(cube, 2, 4, 4) == 0, "a cube to draw into: face 3 cleared");
+  if (face3) ID3D11RenderTargetView_Release(face3);
+  if (layer1) ID3D11RenderTargetView_Release(layer1);
+  if (cube) ID3D11Texture2D_Release(cube);
+  if (array) ID3D11Texture2D_Release(array);
+  if (view) ID3D11ShaderResourceView_Release(view);
+  ID3D11Buffer_Release(vertices);
+  ID3D11RenderTargetView_Release(level1);
+  ID3D11RenderTargetView_Release(level0);
+  ID3D11Texture2D_Release(texture);
+}
+
 int main(void) {
   test_device();
   if (g_device && g_context) {
@@ -2161,6 +2267,7 @@ int main(void) {
       test_texture1d();
       test_formats();
       test_creation_and_interop();
+      test_render_to_levels();
     }
     ID3D11DeviceContext_ClearState(g_context);
     ID3D11DeviceContext_Flush(g_context);
