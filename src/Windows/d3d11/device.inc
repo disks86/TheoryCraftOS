@@ -46,29 +46,62 @@ static void STDMETHODCALLTYPE dev_GetImmediateContext(Dev *d, ID3D11DeviceContex
  * standard pattern, for the counts the adapter draws with; 0 for the others). */
 static UINT dev_ms_levels(Dev *d, DXGI_FORMAT format, UINT samples) {
   if (samples == 1) return 1;
-  DXGI_FORMAT stored;
-  UINT bpp, stored_bpp;
-  int expand, depth;
-  if (!format_of(format, D3D11_BIND_RENDER_TARGET, &stored, &bpp, &stored_bpp, &expand, &depth) &&
-      !format_of(format, D3D11_BIND_DEPTH_STENCIL, &stored, &bpp, &stored_bpp, &expand, &depth)) return 0;
-  D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS q = {stored, samples, D3D12_MULTISAMPLE_QUALITY_LEVELS_FLAG_NONE, 0};
+  const TexFormat *f = tex_format_for(format, D3D11_BIND_RENDER_TARGET);
+  if (!f) f = tex_format_for(format, D3D11_BIND_DEPTH_STENCIL);
+  if (!f) return 0;
+  D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS q = {f->stored, samples, D3D12_MULTISAMPLE_QUALITY_LEVELS_FLAG_NONE, 0};
   if (FAILED(ID3D12Device_CheckFeatureSupport(d->d12, D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS, &q, sizeof q))) return 0;
   return q.NumQualityLevels;
 }
+/* Whether a format's channels are integers (sampled with Load only, not blended). */
+static BOOL format_is_integer(DXGI_FORMAT f) {
+  switch (f) {
+    case DXGI_FORMAT_R32G32B32A32_UINT: case DXGI_FORMAT_R32G32B32A32_SINT: case DXGI_FORMAT_R32G32B32_UINT: case DXGI_FORMAT_R32G32B32_SINT: case DXGI_FORMAT_R16G16B16A16_UINT:
+    case DXGI_FORMAT_R16G16B16A16_SINT: case DXGI_FORMAT_R32G32_UINT: case DXGI_FORMAT_R32G32_SINT: case DXGI_FORMAT_R10G10B10A2_UINT: case DXGI_FORMAT_R8G8B8A8_UINT:
+    case DXGI_FORMAT_R8G8B8A8_SINT: case DXGI_FORMAT_R16G16_UINT: case DXGI_FORMAT_R16G16_SINT: case DXGI_FORMAT_R32_UINT: case DXGI_FORMAT_R32_SINT: case DXGI_FORMAT_R8G8_UINT:
+    case DXGI_FORMAT_R8G8_SINT: case DXGI_FORMAT_R16_UINT: case DXGI_FORMAT_R16_SINT: case DXGI_FORMAT_R8_UINT: case DXGI_FORMAT_R8_SINT: return TRUE;
+    default: return FALSE;
+  }
+}
+static BOOL format_is_typeless(DXGI_FORMAT f) {
+  switch (f) {
+    case DXGI_FORMAT_R32G32B32A32_TYPELESS: case DXGI_FORMAT_R32G32B32_TYPELESS: case DXGI_FORMAT_R16G16B16A16_TYPELESS: case DXGI_FORMAT_R32G32_TYPELESS: case DXGI_FORMAT_R32G8X24_TYPELESS:
+    case DXGI_FORMAT_R10G10B10A2_TYPELESS: case DXGI_FORMAT_R8G8B8A8_TYPELESS: case DXGI_FORMAT_R16G16_TYPELESS: case DXGI_FORMAT_R32_TYPELESS: case DXGI_FORMAT_R24G8_TYPELESS:
+    case DXGI_FORMAT_R8G8_TYPELESS: case DXGI_FORMAT_R16_TYPELESS: case DXGI_FORMAT_R8_TYPELESS: case DXGI_FORMAT_BC1_TYPELESS: case DXGI_FORMAT_BC2_TYPELESS: case DXGI_FORMAT_BC3_TYPELESS:
+    case DXGI_FORMAT_B8G8R8A8_TYPELESS: case DXGI_FORMAT_B8G8R8X8_TYPELESS: return TRUE;
+    default: return FALSE;
+  }
+}
+/* What a format may be used for here: textures (volumes, arrays and cubes of the formats the kernel keeps in 32 bits a texel or in blocks), render targets and depth
+ * buffers, buffers, vertex and index data. No typed unordered access views (the kernel has none) and no mipmaps made by GenerateMips of a render target's format. */
 static HRESULT STDMETHODCALLTYPE dev_CheckFormatSupport(Dev *d, DXGI_FORMAT format, UINT *support) {
-  DXGI_FORMAT stored;
-  UINT bpp, stored_bpp;
-  int expand, depth, convert;
+  int convert;
   if (!support) return E_INVALIDARG;
   *support = 0;
-  if (format_of(format, 0, &stored, &bpp, &stored_bpp, &expand, &depth)) {
-    *support |= D3D11_FORMAT_SUPPORT_TEXTURE2D | D3D11_FORMAT_SUPPORT_SHADER_SAMPLE | D3D11_FORMAT_SUPPORT_SHADER_LOAD | D3D11_FORMAT_SUPPORT_CPU_LOCKABLE;
-    if (!expand) *support |= D3D11_FORMAT_SUPPORT_RENDER_TARGET | D3D11_FORMAT_SUPPORT_BLENDABLE | D3D11_FORMAT_SUPPORT_DISPLAY;
-    else if (expand != 2) *support |= D3D11_FORMAT_SUPPORT_RENDER_TARGET | D3D11_FORMAT_SUPPORT_BLENDABLE;      /* (R8 and RG8: masked RGBA8) */
-  } else if (format_of(format, D3D11_BIND_DEPTH_STENCIL, &stored, &bpp, &stored_bpp, &expand, &depth)) {
-    *support |= D3D11_FORMAT_SUPPORT_TEXTURE2D | D3D11_FORMAT_SUPPORT_DEPTH_STENCIL;
+  const TexFormat *colour = tex_format_for(format, 0), *depth = tex_format_for(format, D3D11_BIND_DEPTH_STENCIL);
+  if (colour) {
+    const BOOL layered = colour->stored_bpp == 4 || (colour->flags & FMT_BLOCK);      /* (the kernel's volumes, arrays and cubes: 32-bit texels or blocks) */
+    *support |= D3D11_FORMAT_SUPPORT_TEXTURE1D | D3D11_FORMAT_SUPPORT_TEXTURE2D | D3D11_FORMAT_SUPPORT_MIP | D3D11_FORMAT_SUPPORT_CPU_LOCKABLE;
+    if (layered) *support |= D3D11_FORMAT_SUPPORT_TEXTURE3D | D3D11_FORMAT_SUPPORT_TEXTURECUBE;
+    if (!format_is_typeless(format)) {
+      *support |= D3D11_FORMAT_SUPPORT_SHADER_LOAD;
+      if (!format_is_integer(format)) *support |= D3D11_FORMAT_SUPPORT_SHADER_SAMPLE | D3D11_FORMAT_SUPPORT_SHADER_GATHER;
+    } else *support |= D3D11_FORMAT_SUPPORT_CAST_WITHIN_BIT_LAYOUT;
+    if (colour->flags & FMT_TARGET) {
+      *support |= D3D11_FORMAT_SUPPORT_RENDER_TARGET;
+      if (!format_is_integer(format) && !format_is_typeless(format)) *support |= D3D11_FORMAT_SUPPORT_BLENDABLE;
+    }
+    if (format == DXGI_FORMAT_B8G8R8A8_UNORM || format == DXGI_FORMAT_R8G8B8A8_UNORM || format == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB || format == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB ||
+        format == DXGI_FORMAT_R16G16B16A16_FLOAT || format == DXGI_FORMAT_R10G10B10A2_UNORM)
+      *support |= D3D11_FORMAT_SUPPORT_DISPLAY;      /* (what dxgi.dll's swap chains have) */
+  } else if (depth) {
+    *support |= D3D11_FORMAT_SUPPORT_TEXTURE1D | D3D11_FORMAT_SUPPORT_TEXTURE2D | D3D11_FORMAT_SUPPORT_DEPTH_STENCIL | D3D11_FORMAT_SUPPORT_MIP;
+    if (format_is_typeless(format)) *support |= D3D11_FORMAT_SUPPORT_CAST_WITHIN_BIT_LAYOUT;
   }
+  if (buffer_format_bytes(format)) *support |= D3D11_FORMAT_SUPPORT_BUFFER;
   if (element_floats(format, &convert)) *support |= D3D11_FORMAT_SUPPORT_IA_VERTEX_BUFFER;
+  if (format == DXGI_FORMAT_R32_FLOAT || format == DXGI_FORMAT_R32G32_FLOAT || format == DXGI_FORMAT_R32G32B32_FLOAT || format == DXGI_FORMAT_R32G32B32A32_FLOAT)
+    *support |= D3D11_FORMAT_SUPPORT_SO_BUFFER;
   if (format == DXGI_FORMAT_R16_UINT || format == DXGI_FORMAT_R32_UINT) *support |= D3D11_FORMAT_SUPPORT_IA_INDEX_BUFFER;
   if ((*support & (D3D11_FORMAT_SUPPORT_RENDER_TARGET | D3D11_FORMAT_SUPPORT_DEPTH_STENCIL)) && dev_ms_levels(d, format, 4))
     *support |= D3D11_FORMAT_SUPPORT_MULTISAMPLE_RENDERTARGET | D3D11_FORMAT_SUPPORT_MULTISAMPLE_RESOLVE;      /* (drawn into and resolved, not read by shaders) */

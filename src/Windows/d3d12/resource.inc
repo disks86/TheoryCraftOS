@@ -290,7 +290,8 @@ static HRESULT resource_make(Dev *dev, const D3D12_HEAP_PROPERTIES *props, D3D12
     const FormatInfo *fi = format_info(desc->Format);
     UINT depth_or_array = desc->DepthOrArraySize ? desc->DepthOrArraySize : 1;
     const int want_depth = (desc->Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL) != 0;
-    if (cpu || desc->Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D) { hr = cpu ? E_INVALIDARG : E_NOTIMPL; goto fail; }
+    /* (a one-dimensional texture is a two-dimensional one a texel high - the kernel's shaders take 1D textures as that - and an array of them an array of those) */
+    if (cpu || (desc->Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D && desc->Height != 1)) { hr = E_INVALIDARG; goto fail; }
     if (desc->Format == DXGI_FORMAT_R32_TYPELESS && want_depth) fi = format_info(DXGI_FORMAT_D32_FLOAT);
     if (desc->Format == DXGI_FORMAT_R24G8_TYPELESS && want_depth) fi = format_info(DXGI_FORMAT_D24_UNORM_S8_UINT);
     if (!fi || !fi->kernel || !!fi->depth != want_depth) { hr = fi && fi->kernel ? E_INVALIDARG : DXGI_ERROR_UNSUPPORTED; goto fail; }

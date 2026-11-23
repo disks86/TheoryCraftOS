@@ -134,9 +134,11 @@ struct Tex {
   UINT slices;                 /* a volume's depth (1 for the others) */
   UINT kmips;                  /* the levels the Direct3D 12 texture has: the kernel keeps one of a volume, an array or a cube, whose other levels are dropped */
   D3D11_TEXTURE3D_DESC desc3;  /* a volume: as the program made it */
+  D3D11_TEXTURE1D_DESC desc1;  /* a one-dimensional texture (`one_d`): as the program made it; kept as a 2D texture (or array) a texel high */
+  BOOL one_d;
   DXGI_FORMAT stored;          /* the format of the Direct3D 12 texture */
   UINT bpp, stored_bpp;        /* bytes a pixel: as the program has it, as it is kept */
-  int expand;                  /* 0: kept as it is; 1: R8 kept as RGBA (r, 0, 0, 1); 2: A8 kept as RGBA (0, 0, 0, a); 3: RG8 kept as RGBA (r, g, 0, 1) */
+  const struct TexFormat *fmt; /* how the program's format is kept (formats.inc) */
   int depth;                   /* a depth buffer: the CPU does not reach it */
   UINT block;                  /* a block-compressed format (BC1 .. BC3): the bytes of a 4 x 4 block (bpp is the same); its rows are rows of blocks */
   ID3D12Resource *res;
@@ -267,6 +269,7 @@ typedef struct Ctx {
   Blend *blend;
   Depth *depth;
   Raster *raster;
+  struct ClassInst *instances[6][8];  /* the class instances bound with each stage's shader (vs, ps, gs, hs, ds, cs) */
   struct Query *predicate;            /* SetPredication: the predicate, and the value that leaves the commands out */
   /* ---- the plain values */
   UINT vb_stride[VERTEX_SLOTS], vb_offset[VERTEX_SLOTS];
@@ -282,6 +285,7 @@ typedef struct Ctx {
   D3D11_RECT scissors[D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE];
   UINT scissor_count;
   BOOL predicate_value;
+  UINT instance_count[6];
   UINT cb_first[6][CONSTANT_SLOTS], cb_number[6][CONSTANT_SLOTS];      /* the windows of the constant buffers (by stage: vs, ps, gs, hs, ds, cs; in constants) */
   /* ---- not part of the copies */
   Buf *so_buf[4];                     /* SOSetTargets: the stream output buffers (their records go on from Buf.so_end; a deferred context records the call) */
@@ -554,56 +558,7 @@ static ID3D12Resource *make_buffer(Dev *d, D3D12_HEAP_TYPE heap, UINT64 bytes) {
 
 /* ---- formats ----------------------------------------------------------------------------------------------------------------------------------------- */
 
-/* What a texture of `format` is kept as; FALSE for one this runtime has not. */
-static BOOL format_of(DXGI_FORMAT format, UINT bind, DXGI_FORMAT *stored, UINT *bpp, UINT *stored_bpp, int *expand, int *depth) {
-  *expand = 0;
-  *depth = (bind & D3D11_BIND_DEPTH_STENCIL) != 0;
-  *stored = format;
-  switch (format) {
-    case DXGI_FORMAT_R8G8B8A8_UNORM: case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB: case DXGI_FORMAT_R8G8B8A8_TYPELESS: case DXGI_FORMAT_B8G8R8A8_UNORM:
-    case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB: case DXGI_FORMAT_B8G8R8A8_TYPELESS: case DXGI_FORMAT_B8G8R8X8_UNORM: case DXGI_FORMAT_B8G8R8X8_TYPELESS:
-    case DXGI_FORMAT_R10G10B10A2_UNORM:
-      *bpp = *stored_bpp = 4;
-      return !*depth;
-    case DXGI_FORMAT_R16G16B16A16_FLOAT: case DXGI_FORMAT_R16G16B16A16_UNORM:
-      *bpp = *stored_bpp = 8;
-      return !*depth;
-    case DXGI_FORMAT_R32G32B32A32_FLOAT:
-      *bpp = *stored_bpp = 16;
-      return !*depth;
-    /* One- and two-channel formats are kept as RGBA8 (the kernel's images have four channels): sampled they read as Direct3D reads them, and a draw into
-     * one writes only its channels (pipeline_get masks the others), so the rest stay 0 and 1. Chrome keeps the planes of video frames in R8 and RG8. */
-    case DXGI_FORMAT_R8_UNORM: case DXGI_FORMAT_R8_TYPELESS: case DXGI_FORMAT_A8_UNORM:
-      *expand = format == DXGI_FORMAT_A8_UNORM ? 2 : 1;
-      *stored = DXGI_FORMAT_R8G8B8A8_UNORM;
-      *bpp = 1;
-      *stored_bpp = 4;
-      return !*depth && !(format == DXGI_FORMAT_A8_UNORM && (bind & D3D11_BIND_RENDER_TARGET));
-    case DXGI_FORMAT_R8G8_UNORM: case DXGI_FORMAT_R8G8_TYPELESS:
-      *expand = 3;
-      *stored = DXGI_FORMAT_R8G8B8A8_UNORM;
-      *bpp = 2;
-      *stored_bpp = 4;
-      return !*depth;
-    case DXGI_FORMAT_D32_FLOAT: case DXGI_FORMAT_D24_UNORM_S8_UINT: case DXGI_FORMAT_R32_TYPELESS: case DXGI_FORMAT_R24G8_TYPELESS:
-      *bpp = *stored_bpp = 4;
-      return *depth;
-    /* Block-compressed: kept as they are (the kernel decodes them where the device does not sample them so); sampled only. */
-    case DXGI_FORMAT_BC1_TYPELESS: case DXGI_FORMAT_BC1_UNORM: case DXGI_FORMAT_BC1_UNORM_SRGB:
-      *bpp = *stored_bpp = 8;
-      return !*depth && !(bind & (D3D11_BIND_RENDER_TARGET | D3D11_BIND_UNORDERED_ACCESS));
-    case DXGI_FORMAT_BC2_TYPELESS: case DXGI_FORMAT_BC2_UNORM: case DXGI_FORMAT_BC2_UNORM_SRGB: case DXGI_FORMAT_BC3_TYPELESS: case DXGI_FORMAT_BC3_UNORM: case DXGI_FORMAT_BC3_UNORM_SRGB:
-      *bpp = *stored_bpp = 16;
-      return !*depth && !(bind & (D3D11_BIND_RENDER_TARGET | D3D11_BIND_UNORDERED_ACCESS));
-    case DXGI_FORMAT_D16_UNORM: case DXGI_FORMAT_R16_TYPELESS:
-      *stored = DXGI_FORMAT_D32_FLOAT;
-      *bpp = 2;
-      *stored_bpp = 4;
-      return *depth;
-    default:
-      return FALSE;
-  }
-}
+#include "formats.inc"
 
 /* ---- buffers ----------------------------------------------------------------------------------------------------------------------------------------- */
 
@@ -754,14 +709,7 @@ static HRESULT tex_write(Dev *d, Tex *t, UINT sub, UINT x, UINT y, UINT z, UINT 
   for (UINT row = 0; row < rows_of; ++row) {
     const BYTE *in = rows + (SIZE_T)row * pitch;
     BYTE *to = memory + (SIZE_T)row * row_pitch;
-    if (!t->expand) memcpy(to, in, row_bytes);
-    else for (UINT i = 0; i < w; ++i) {
-      const BYTE *p = in + (SIZE_T)i * t->bpp;
-      to[4 * i] = t->expand == 2 ? 0 : p[0];
-      to[4 * i + 1] = t->expand == 3 ? p[1] : 0;
-      to[4 * i + 2] = 0;
-      to[4 * i + 3] = t->expand == 2 ? p[0] : 255;
-    }
+    row_to_stored(t->fmt, in, to, w, row_bytes);
   }
   ID3D12Resource_Unmap(upload, 0, NULL);
   D3D12_TEXTURE_COPY_LOCATION to, from;
@@ -816,11 +764,7 @@ static HRESULT tex_read(Dev *d, Tex *t, UINT sub, UINT z, BYTE *rows) {
     for (UINT row = 0; row < rows_of; ++row) {
       const BYTE *in = memory + (SIZE_T)row * row_pitch;
       BYTE *to_row = rows + (SIZE_T)row * tex_pitch(t, w);
-      if (!t->expand) memcpy(to_row, in, tex_pitch(t, w));
-      else for (UINT i = 0; i < w; ++i) {
-        if (t->expand == 3) { to_row[2 * i] = in[4 * i]; to_row[2 * i + 1] = in[4 * i + 1]; }
-        else to_row[i] = in[4 * i + (t->expand == 1 ? 0 : 3)];
-      }
+      row_from_stored(t->fmt, in, to_row, w, tex_pitch(t, w));
     }
     ID3D12Resource_Unmap(readback, 0, NULL);
   } else if (SUCCEEDED(hr)) hr = E_FAIL;
@@ -842,6 +786,8 @@ static void STDMETHODCALLTYPE tex_SetEvictionPriority(Tex *t, UINT priority) { (
 static UINT STDMETHODCALLTYPE tex_GetEvictionPriority(Tex *t) { (void)t; return 0; }
 static void STDMETHODCALLTYPE tex_GetDesc(Tex *t, D3D11_TEXTURE2D_DESC *desc) { if (desc) *desc = t->desc; }
 static void STDMETHODCALLTYPE tex3_GetType(Tex *t, D3D11_RESOURCE_DIMENSION *type) { (void)t; if (type) *type = D3D11_RESOURCE_DIMENSION_TEXTURE3D; }
+static void STDMETHODCALLTYPE tex1d_GetType(Tex *t, D3D11_RESOURCE_DIMENSION *type) { (void)t; if (type) *type = D3D11_RESOURCE_DIMENSION_TEXTURE1D; }
+static void STDMETHODCALLTYPE tex1d_GetDesc(Tex *t, D3D11_TEXTURE1D_DESC *desc) { if (desc) *desc = t->desc1; }
 static void STDMETHODCALLTYPE tex3_GetDesc(Tex *t, D3D11_TEXTURE3D_DESC *desc) { if (desc) *desc = t->desc3; }
 
 static void tex_dxgi_init(Tex *t);      /* (dxgi_resource.inc) */
@@ -901,10 +847,15 @@ static HRESULT tex_make(Dev *d, const D3D11_TEXTURE2D_DESC *in, UINT slices, ID3
   tex_dxgi_init(t);
   t->desc = desc;
   t->kind = slices ? 1 : cube ? 3 : desc.ArraySize > 1 ? 2 : 0;
-  t->block = (desc.Format >= DXGI_FORMAT_BC1_TYPELESS && desc.Format <= DXGI_FORMAT_BC3_UNORM_SRGB) ? t->bpp : 0;
   t->slices = slices ? slices : 1;
   t->kmips = layered ? 1 : desc.MipLevels;      /* (the kernel's volumes, arrays and cubes have one level: the program's others are dropped) */
-  if (!format_of(desc.Format, desc.BindFlags, &t->stored, &t->bpp, &t->stored_bpp, &t->expand, &t->depth)) { tex_refused(&desc, "the format, for that use"); dx_Release(OBJ(t)); return E_INVALIDARG; }
+  t->fmt = tex_format_for(desc.Format, desc.BindFlags);
+  if (!t->fmt) { tex_refused(&desc, "the format, for that use"); dx_Release(OBJ(t)); return E_INVALIDARG; }
+  t->stored = t->fmt->stored;
+  t->bpp = t->fmt->bpp;
+  t->stored_bpp = t->fmt->stored_bpp;
+  t->depth = (t->fmt->flags & FMT_DEPTH) != 0;
+  t->block = (t->fmt->flags & FMT_BLOCK) ? t->bpp : 0;
   t->shadow = mem_alloc(sizeof(BYTE *) * tex_subresources(t));
   t->mapped = mem_alloc(sizeof(D3D11_MAP) * tex_subresources(t));
   if (!t->shadow || !t->mapped) { dx_Release(OBJ(t)); return E_OUTOFMEMORY; }
@@ -972,11 +923,41 @@ static HRESULT STDMETHODCALLTYPE dev_CreateTexture3D(Dev *d, const D3D11_TEXTURE
   return give(t, (void **)out);
 }
 
+/* A one-dimensional texture (or an array of them): a two-dimensional one a texel high, which is what the kernel's shaders take a texture1d as. */
+static HRESULT STDMETHODCALLTYPE dev_CreateTexture1D(Dev *d, const D3D11_TEXTURE1D_DESC *desc, const D3D11_SUBRESOURCE_DATA *initial, ID3D11Texture1D **out) {
+  extern const ID3D11Texture1DVtbl tex1d_vtbl;
+  static const GUID *const iids[] = {&IID_ID3D11DeviceChild, &IID_ID3D11Resource, &IID_ID3D11Texture1D, NULL};
+  if (out) *out = NULL;
+  if (!desc || desc->Width == 0 || desc->Width > D3D11_REQ_TEXTURE1D_U_DIMENSION || desc->ArraySize == 0 || desc->ArraySize > D3D11_REQ_TEXTURE1D_ARRAY_AXIS_DIMENSION) return E_INVALIDARG;
+  if (desc->MiscFlags & D3D11_RESOURCE_MISC_TEXTURECUBE) return E_INVALIDARG;
+  if (initial && !initial->pSysMem) return E_INVALIDARG;
+  const D3D11_TEXTURE2D_DESC as2d = {desc->Width, 1, desc->MipLevels, desc->ArraySize, desc->Format, {1, 0}, desc->Usage, desc->BindFlags, desc->CPUAccessFlags, desc->MiscFlags};
+  if (!out) return S_FALSE;
+  Tex *t = NULL;
+  EnterCriticalSection(&d->lock);
+  HRESULT hr = tex_make(d, &as2d, 0, NULL, &t);
+  if (SUCCEEDED(hr)) {
+    t->c.o.lpVtbl = (const void *)&tex1d_vtbl;
+    t->c.o.iids = iids;
+    t->one_d = TRUE;
+    t->desc1 = *desc;
+    t->desc1.MipLevels = t->desc.MipLevels;
+    if (initial && !t->depth) hr = tex_initial(d, t, initial);
+  }
+  LeaveCriticalSection(&d->lock);
+  if (FAILED(hr)) { if (t) dx_Release(OBJ(t)); return hr; }
+  *out = (ID3D11Texture1D *)t;
+  return S_OK;
+}
+
 /* ---- views --------------------------------------------------------------------------------------------------------------------------------------------- */
 
 static Tex *tex_of_resource(ID3D11Resource *resource) {
   extern const ID3D11Texture3DVtbl tex3_vtbl;
-  if (!resource || (((DxObj *)resource)->lpVtbl != (const void *)&tex_vtbl && ((DxObj *)resource)->lpVtbl != (const void *)&tex3_vtbl)) return NULL;
+  extern const ID3D11Texture1DVtbl tex1d_vtbl;
+  if (!resource) return NULL;
+  const void *v = ((DxObj *)resource)->lpVtbl;
+  if (v != (const void *)&tex_vtbl && v != (const void *)&tex3_vtbl && v != (const void *)&tex1d_vtbl) return NULL;
   return (Tex *)resource;
 }
 static void STDMETHODCALLTYPE view_GetResource(View *v, ID3D11Resource **out) {
@@ -1079,7 +1060,7 @@ static HRESULT STDMETHODCALLTYPE dev_CreateRenderTargetView(Dev *d, ID3D11Resour
   dx_AddRef(OBJ(t));
   v->tex = t;
   if (desc) v->desc.rtv = *desc;
-  else { v->desc.rtv.Format = t->desc.Format; v->desc.rtv.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D; }
+  else { v->desc.rtv.Format = t->desc.Format; v->desc.rtv.ViewDimension = t->one_d ? D3D11_RTV_DIMENSION_TEXTURE1D : D3D11_RTV_DIMENSION_TEXTURE2D; }
   v->handle = ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(d->rtv_heap);
   v->handle.ptr += (SIZE_T)v->slot * ID3D12Device_GetDescriptorHandleIncrementSize(d->d12, D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
   if (t->desc.SampleDesc.Count > 1) {
@@ -1102,7 +1083,7 @@ static HRESULT STDMETHODCALLTYPE dev_CreateDepthStencilView(Dev *d, ID3D11Resour
   dx_AddRef(OBJ(t));
   v->tex = t;
   if (desc) v->desc.dsv = *desc;
-  else { v->desc.dsv.Format = t->desc.Format; v->desc.dsv.ViewDimension = D3D11_DSV_DIMENSION_TEXTURE2D; }
+  else { v->desc.dsv.Format = t->desc.Format; v->desc.dsv.ViewDimension = t->one_d ? D3D11_DSV_DIMENSION_TEXTURE1D : D3D11_DSV_DIMENSION_TEXTURE2D; }
   v->handle = ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(d->dsv_heap);
   v->handle.ptr += (SIZE_T)v->slot * ID3D12Device_GetDescriptorHandleIncrementSize(d->d12, D3D12_DESCRIPTOR_HEAP_TYPE_DSV);
   if (t->desc.SampleDesc.Count > 1) v->desc.dsv.ViewDimension = D3D11_DSV_DIMENSION_TEXTURE2DMS;
@@ -1160,7 +1141,10 @@ static HRESULT STDMETHODCALLTYPE dev_CreateShaderResourceView(Dev *d, ID3D11Reso
   else {
     /* (the whole texture, as what it is) */
     v->desc.srv.Format = t->desc.Format;
-    switch (t->kind) {
+    if (t->one_d) {
+      if (t->desc.ArraySize > 1) { v->desc.srv.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE1DARRAY; v->desc.srv.Texture1DArray.MipLevels = t->desc.MipLevels; v->desc.srv.Texture1DArray.ArraySize = t->desc.ArraySize; }
+      else { v->desc.srv.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE1D; v->desc.srv.Texture1D.MipLevels = t->desc.MipLevels; }
+    } else switch (t->kind) {
       case 1: v->desc.srv.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE3D; v->desc.srv.Texture3D.MipLevels = t->desc.MipLevels; break;
       case 2: v->desc.srv.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2DARRAY; v->desc.srv.Texture2DArray.MipLevels = t->desc.MipLevels; v->desc.srv.Texture2DArray.ArraySize = t->desc.ArraySize; break;
       case 3: v->desc.srv.ViewDimension = D3D11_SRV_DIMENSION_TEXTURECUBE; v->desc.srv.TextureCube.MipLevels = t->desc.MipLevels; break;
@@ -1201,7 +1185,9 @@ static HRESULT STDMETHODCALLTYPE dev_CreateUnorderedAccessView(Dev *d, ID3D11Res
     if (!(t->desc.BindFlags & D3D11_BIND_UNORDERED_ACCESS)) return E_INVALIDARG;
     if (!desc) {
       whole.Format = t->desc.Format;
-      whole.ViewDimension = t->kind == 1 ? D3D11_UAV_DIMENSION_TEXTURE3D : t->desc.ArraySize > 1 ? D3D11_UAV_DIMENSION_TEXTURE2DARRAY : D3D11_UAV_DIMENSION_TEXTURE2D;
+      whole.ViewDimension = t->one_d ? (t->desc.ArraySize > 1 ? D3D11_UAV_DIMENSION_TEXTURE1DARRAY : D3D11_UAV_DIMENSION_TEXTURE1D)
+                          : t->kind == 1 ? D3D11_UAV_DIMENSION_TEXTURE3D : t->desc.ArraySize > 1 ? D3D11_UAV_DIMENSION_TEXTURE2DARRAY : D3D11_UAV_DIMENSION_TEXTURE2D;
+      if (whole.ViewDimension == D3D11_UAV_DIMENSION_TEXTURE1DARRAY) whole.Texture1DArray.ArraySize = t->desc.ArraySize;
       if (whole.ViewDimension == D3D11_UAV_DIMENSION_TEXTURE2DARRAY) whole.Texture2DArray.ArraySize = t->desc.ArraySize;
       if (whole.ViewDimension == D3D11_UAV_DIMENSION_TEXTURE3D) whole.Texture3D.WSize = t->slices;
       desc = &whole;
@@ -1267,7 +1253,7 @@ static void shader_constants(Shader *s) {
         if (k < w + length && ((operand >> 20) & 3) == 1) {      /* (one immediate index: SM 4 / 5.0) */
           memcpy(&slot, code + 4 * k, 4);
           if (op >= 156 && op <= 158) { if (slot < UAV_SLOTS) s->uav_mask |= 1u << slot; }
-          else if (slot < TEXTURE_SLOTS) s->tex_kind[slot] = op != 88 || dimension == 1 ? KIND_BUFFER : dimension == 5 ? 1 : dimension == 8 ? 2 : dimension == 6 ? 3 : 0;
+          else if (slot < TEXTURE_SLOTS) s->tex_kind[slot] = op != 88 || dimension == 1 ? KIND_BUFFER : dimension == 5 ? 1 : (dimension == 8 || dimension == 7) ? 2 : dimension == 6 ? 3 : 0;
         }
       }
       if (op == 155 /* dcl_thread_group x, y, z */ && length >= 4) for (UINT k = 0; k < 3; ++k) memcpy(&s->group[k], code + 4 * (w + 1 + k), 4);
@@ -1375,6 +1361,82 @@ static HRESULT STDMETHODCALLTYPE dev_CreateGeometryShaderWithStreamOutput(Dev *d
   if (stride_count < 4) for (UINT slot = stride_count; slot < 4; ++slot) if (s->so_strides[slot]) s->so_stride_count = slot + 1;
   s->so_rasterized = rasterized;
   return give(s, (void **)out);
+}
+
+/* ---- class linkage ----------------------------------------------------------------------------------------------------------------------------------- */
+/* Dynamic shader linkage: a linkage object, and the class instances made from it. The kernel has no dynamic linkage (interfaces and fcall), so a shader that
+ * declares class instances is not run, and no instance of one is known to GetClassInstance (docs/Direct3D11.md). */
+typedef struct Linkage { Child c; } Linkage;
+typedef struct ClassInst {
+  Child c;
+  Linkage *linkage;            /* a reference */
+  D3D11_CLASS_INSTANCE_DESC desc;
+  char type_name[256];
+  char instance_name[256];
+} ClassInst;
+static HRESULT STDMETHODCALLTYPE dev_CreateClassLinkage(Dev *d, ID3D11ClassLinkage **out) {
+  extern const ID3D11ClassLinkageVtbl link_vtbl;
+  static const GUID *const iids[] = {&IID_ID3D11DeviceChild, &IID_ID3D11ClassLinkage, NULL};
+  if (!out) return E_INVALIDARG;
+  *out = NULL;
+  Linkage *l = child_new(sizeof *l, d, &link_vtbl, iids, child_destroy);
+  if (!l) return E_OUTOFMEMORY;
+  *out = (ID3D11ClassLinkage *)l;
+  return S_OK;
+}
+static void inst_destroy(DxObj *o) {
+  ClassInst *i = (ClassInst *)o;
+  if (i->linkage) dx_Release(OBJ(i->linkage));
+  child_destroy(o);
+}
+/* A string into a buffer of `size` (`*length` in: its room, out: the length with the NUL; no buffer: only the length). */
+static void name_out(const char *name, LPSTR buffer, SIZE_T *length) {
+  if (!length) return;
+  SIZE_T n = 0;
+  while (name[n]) ++n;
+  if (buffer && *length) {
+    const SIZE_T copied = n + 1 <= *length ? n : *length - 1;
+    memcpy(buffer, name, copied);
+    buffer[copied] = 0;
+  }
+  *length = n + 1;
+}
+static void STDMETHODCALLTYPE inst_GetClassLinkage(ClassInst *i, ID3D11ClassLinkage **out) { if (!out) return; dx_AddRef(OBJ(i->linkage)); *out = (ID3D11ClassLinkage *)i->linkage; }
+static void STDMETHODCALLTYPE inst_GetDesc(ClassInst *i, D3D11_CLASS_INSTANCE_DESC *desc) { if (desc) *desc = i->desc; }
+static void STDMETHODCALLTYPE inst_GetInstanceName(ClassInst *i, LPSTR name, SIZE_T *length) { name_out(i->instance_name, name, length); }
+static void STDMETHODCALLTYPE inst_GetTypeName(ClassInst *i, LPSTR name, SIZE_T *length) { name_out(i->type_name, name, length); }
+/* An instance that is not a shader's variable: the type, and where its data is (the constant buffer, the offset in it in vectors, the first texture and sampler).
+ * Its instance name is empty, and it counts as made (Created). */
+static HRESULT STDMETHODCALLTYPE link_CreateClassInstance(Linkage *l, LPCSTR type_name, UINT cb, UINT cb_offset, UINT texture, UINT sampler, ID3D11ClassInstance **out) {
+  extern const ID3D11ClassInstanceVtbl inst_vtbl;
+  static const GUID *const iids[] = {&IID_ID3D11DeviceChild, &IID_ID3D11ClassInstance, NULL};
+  if (out) *out = NULL;
+  if (!type_name || !out) return E_INVALIDARG;
+  SIZE_T n = 0;
+  while (type_name[n]) ++n;
+  if (n == 0 || n >= sizeof ((ClassInst *)0)->type_name) return E_INVALIDARG;
+  ClassInst *i = child_new(sizeof *i, l->c.dev, &inst_vtbl, iids, inst_destroy);
+  if (!i) return E_OUTOFMEMORY;
+  dx_AddRef(OBJ(l));
+  i->linkage = l;
+  memcpy(i->type_name, type_name, n + 1);
+  i->instance_name[0] = 0;
+  i->desc.InstanceId = 0;
+  i->desc.InstanceIndex = 0;
+  i->desc.TypeId = 0;
+  i->desc.ConstantBuffer = cb;
+  i->desc.BaseConstantBufferOffset = cb_offset;
+  i->desc.BaseTexture = texture;
+  i->desc.BaseSampler = sampler;
+  i->desc.Created = TRUE;
+  *out = (ID3D11ClassInstance *)i;
+  return S_OK;
+}
+static HRESULT STDMETHODCALLTYPE link_GetClassInstance(Linkage *l, LPCSTR name, UINT index, ID3D11ClassInstance **out) {
+  (void)l; (void)index;
+  if (out) *out = NULL;
+  if (!name || !out) return E_INVALIDARG;
+  return E_INVALIDARG;      /* (no shader made with the linkage has class instances this device runs: see above) */
 }
 
 /* (a compute shader's Direct3D 12 pipeline is made at its first Dispatch: ctx_compute_prepare) */

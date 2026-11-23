@@ -76,6 +76,7 @@ SPECS = {
         ('ID3D11Query', 'query_vtbl', ['query', 'child', 'obj']),
         ('ID3D11Predicate', 'pred_vtbl', ['query', 'child', 'obj']),
         ('ID3D11ClassLinkage', 'link_vtbl', ['link', 'child', 'obj']),
+        ('ID3D11ClassInstance', 'inst_vtbl', ['inst', 'child', 'obj']),
         ('ID3D11CommandList', 'cmdlist_vtbl', ['cmdlist', 'child', 'obj']),
         ('ID3DDeviceContextState', 'cstate_vtbl', ['cstate', 'child', 'obj']),
     ],

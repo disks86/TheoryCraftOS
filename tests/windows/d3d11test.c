@@ -1845,6 +1845,167 @@ static void test_d3d11_1(void) {
   ID3D11Device1_Release(device1);
 }
 
+/* ---- one-dimensional textures ---------------------------------------------------------------------------------------------------------------------------- */
+
+static void test_texture1d(void) {
+  const UINT32 texels[4] = {0xFF0000FFu, 0xFF00FF00u, 0xFFFF0000u, 0xFFFFFFFFu};      /* (R8G8B8A8: red, green, blue, white) */
+  D3D11_TEXTURE1D_DESC desc = {4, 1, 1, DXGI_FORMAT_R8G8B8A8_UNORM, D3D11_USAGE_DEFAULT, D3D11_BIND_SHADER_RESOURCE, 0, 0};
+  D3D11_SUBRESOURCE_DATA initial = {texels, 16, 0};
+  ID3D11Texture1D *texture = NULL;
+  ID3D11ShaderResourceView *view = NULL;
+  ID3D11PixelShader *ps = NULL, *ps_array = NULL;
+  HRESULT hr = ID3D11Device_CreateTexture1D(g_device, &desc, &initial, &texture);
+  D3D11_RESOURCE_DIMENSION type = D3D11_RESOURCE_DIMENSION_UNKNOWN;
+  D3D11_TEXTURE1D_DESC back;
+  memset(&back, 0, sizeof back);
+  if (texture) { ID3D11Texture1D_GetType(texture, &type); ID3D11Texture1D_GetDesc(texture, &back); }
+  check(SUCCEEDED(hr) && type == D3D11_RESOURCE_DIMENSION_TEXTURE1D && back.Width == 4 && back.ArraySize == 1, "CreateTexture1D: its type and description");
+  if (SUCCEEDED(hr)) hr = ID3D11Device_CreateShaderResourceView(g_device, (ID3D11Resource *)texture, NULL, &view);
+  D3D11_SHADER_RESOURCE_VIEW_DESC vd;
+  memset(&vd, 0, sizeof vd);
+  if (view) ID3D11ShaderResourceView_GetDesc(view, &vd);
+  if (SUCCEEDED(hr)) hr = ID3D11Device_CreatePixelShader(g_device, dx_ps_tex1d_dxbc, sizeof dx_ps_tex1d_dxbc, NULL, &ps);
+  if (SUCCEEDED(hr)) hr = ID3D11Device_CreatePixelShader(g_device, dx_ps_tex1darray_dxbc, sizeof dx_ps_tex1darray_dxbc, NULL, &ps_array);
+  check(SUCCEEDED(hr) && vd.ViewDimension == D3D11_SRV_DIMENSION_TEXTURE1D, "a view of it (TEXTURE1D), and pixel shaders of a Texture1D and a Texture1DArray");
+  if (FAILED(hr)) return;
+  ID3D11SamplerState *sampler = point_sampler();
+  /* (the colour (0.3125, 0.25, 1) makes the coordinate 0.625: texel 2, blue) */
+  ID3D11Buffer *vertices = triangle(0.5f, 0.3125f, 0.25f, 1.0f);
+  begin(NULL);
+  clear(0, 0, 0);
+  bind_floats(vertices);
+  ID3D11DeviceContext_PSSetShader(g_context, ps, NULL, 0);
+  ID3D11DeviceContext_PSSetShaderResources(g_context, 0, 1, &view);
+  ID3D11DeviceContext_PSSetSamplers(g_context, 0, 1, &sampler);
+  ID3D11DeviceContext_Draw(g_context, 3, 0);
+  read_target();
+  const UINT32 p = pixel(32, 32);
+  if (!(blue(p) > 250 && red(p) > 120 && red(p) < 136 && green(p) > 120 && green(p) < 136 && (p >> 24) > 120 && (p >> 24) < 136)) printf("d3d11test: (1D: %08x)\n", (unsigned)p);
+  check(blue(p) > 250 && red(p) > 120 && red(p) < 136 && green(p) > 120 && green(p) < 136, "a Texture1D sampled (blue) and loaded at texel 3 (white), half each");
+  check((p >> 24) > 120 && (p >> 24) < 136, "... and its GetDimensions: 4 texels wide");
+
+  /* an array of two: the second layer green */
+  UINT32 layers[8];
+  for (int i = 0; i < 8; ++i) layers[i] = i < 4 ? 0xFF0000FFu : 0xFF00FF00u;
+  D3D11_TEXTURE1D_DESC array_desc = {4, 1, 2, DXGI_FORMAT_R8G8B8A8_UNORM, D3D11_USAGE_DEFAULT, D3D11_BIND_SHADER_RESOURCE, 0, 0};
+  D3D11_SUBRESOURCE_DATA array_initial[2] = {{layers, 16, 0}, {layers + 4, 16, 0}};
+  ID3D11Texture1D *array = NULL;
+  ID3D11ShaderResourceView *array_view = NULL;
+  ID3D11Device_CreateTexture1D(g_device, &array_desc, array_initial, &array);
+  if (array) ID3D11Device_CreateShaderResourceView(g_device, (ID3D11Resource *)array, NULL, &array_view);
+  memset(&vd, 0, sizeof vd);
+  if (array_view) ID3D11ShaderResourceView_GetDesc(array_view, &vd);
+  clear(0, 0, 0);
+  ID3D11DeviceContext_PSSetShader(g_context, ps_array, NULL, 0);
+  ID3D11DeviceContext_PSSetShaderResources(g_context, 0, 1, &array_view);
+  ID3D11DeviceContext_Draw(g_context, 3, 0);
+  read_target();
+  const UINT32 q = pixel(32, 32);
+  if (!(green(q) > 250 && red(q) < 5 && (q >> 24) > 120 && (q >> 24) < 136)) printf("d3d11test: (1D array: %08x)\n", (unsigned)q);
+  check(array_view && vd.ViewDimension == D3D11_SRV_DIMENSION_TEXTURE1DARRAY && vd.Texture1DArray.ArraySize == 2 && green(q) > 250 && red(q) < 5 && (q >> 24) > 120 && (q >> 24) < 136,
+        "a Texture1DArray of two sampled at layer 1, and its GetDimensions (two layers)");
+  ID3D11ShaderResourceView *no_view = NULL;
+  ID3D11DeviceContext_PSSetShaderResources(g_context, 0, 1, &no_view);
+  if (array_view) ID3D11ShaderResourceView_Release(array_view);
+  if (array) ID3D11Texture1D_Release(array);
+  ID3D11Buffer_Release(vertices);
+  if (sampler) ID3D11SamplerState_Release(sampler);
+  ID3D11PixelShader_Release(ps_array);
+  ID3D11PixelShader_Release(ps);
+  ID3D11ShaderResourceView_Release(view);
+  ID3D11Texture1D_Release(texture);
+}
+
+/* ---- formats the kernel keeps in a wider one ---------------------------------------------------------------------------------------------------------------- */
+
+/* A 4 x 4 render target of `format` cleared to (0.5, 0.25, 1, 1): the bytes of its first texel, read back through a staging texture of the same format. */
+static int cleared_texel(DXGI_FORMAT format, BYTE out[16], UINT *bytes) {
+  D3D11_TEXTURE2D_DESC desc = {4, 4, 1, 1, format, {1, 0}, D3D11_USAGE_DEFAULT, D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE, 0, 0};
+  D3D11_TEXTURE2D_DESC staging_desc = {4, 4, 1, 1, format, {1, 0}, D3D11_USAGE_STAGING, 0, D3D11_CPU_ACCESS_READ, 0};
+  ID3D11Texture2D *texture = NULL, *staging = NULL;
+  ID3D11RenderTargetView *view = NULL;
+  int ok = 0;
+  if (SUCCEEDED(ID3D11Device_CreateTexture2D(g_device, &desc, NULL, &texture)) && SUCCEEDED(ID3D11Device_CreateTexture2D(g_device, &staging_desc, NULL, &staging)) &&
+      SUCCEEDED(ID3D11Device_CreateRenderTargetView(g_device, (ID3D11Resource *)texture, NULL, &view))) {
+    const float colour[4] = {0.5f, 0.25f, 1.0f, 1.0f};
+    ID3D11DeviceContext_ClearRenderTargetView(g_context, view, colour);
+    ID3D11DeviceContext_CopyResource(g_context, (ID3D11Resource *)staging, (ID3D11Resource *)texture);
+    D3D11_MAPPED_SUBRESOURCE mapped;
+    if (SUCCEEDED(ID3D11DeviceContext_Map(g_context, (ID3D11Resource *)staging, 0, D3D11_MAP_READ, 0, &mapped))) {
+      *bytes = mapped.RowPitch / 4;
+      memcpy(out, mapped.pData, *bytes <= 16 ? *bytes : 16);
+      ID3D11DeviceContext_Unmap(g_context, (ID3D11Resource *)staging, 0);
+      ok = 1;
+    }
+  }
+  if (view) ID3D11RenderTargetView_Release(view);
+  if (staging) ID3D11Texture2D_Release(staging);
+  if (texture) ID3D11Texture2D_Release(texture);
+  return ok;
+}
+static void test_formats(void) {
+  BYTE t[16];
+  UINT bytes = 0;
+  UINT32 w = 0;
+  UINT16 h[2] = {0, 0};
+  memset(t, 0, sizeof t);
+  check(cleared_texel(DXGI_FORMAT_R32_FLOAT, t, &bytes) && bytes == 4 && (memcpy(&w, t, 4), w == 0x3F000000u), "an R32_FLOAT target: cleared, read back (0.5)");
+  check(cleared_texel(DXGI_FORMAT_R16G16_FLOAT, t, &bytes) && bytes == 4 && (memcpy(h, t, 4), h[0] == 0x3800 && h[1] == 0x3400), "an R16G16_FLOAT target (0.5, 0.25 as halves)");
+  check(cleared_texel(DXGI_FORMAT_R11G11B10_FLOAT, t, &bytes) && bytes == 4 && (memcpy(&w, t, 4), w == 0x781A0380u), "an R11G11B10_FLOAT target (packed 0.5, 0.25, 1)");
+  check(cleared_texel(DXGI_FORMAT_R16_UNORM, t, &bytes) && bytes == 2 && (memcpy(h, t, 2), h[0] >= 32767 && h[0] <= 32768), "an R16_UNORM target");
+  check(cleared_texel(DXGI_FORMAT_R8G8B8A8_SNORM, t, &bytes) && bytes == 4 && t[0] == 64 && t[1] == 32 && t[2] == 127 && t[3] == 127, "an R8G8B8A8_SNORM target (kept in 16 bits)");
+  check(cleared_texel(DXGI_FORMAT_B5G6R5_UNORM, t, &bytes) && bytes == 2 && (memcpy(h, t, 2), h[0] == 0x821F), "a B5G6R5_UNORM target (kept as BGRA8)");
+  if (h[0] != 0x821F) printf("d3d11test: (B5G6R5: %04x)\n", h[0]);
+
+  /* an R32_FLOAT texture written, sampled and read back */
+  const float values[4] = {0.75f, 0.25f, 0.5f, 1.0f};
+  D3D11_TEXTURE2D_DESC desc = {2, 2, 1, 1, DXGI_FORMAT_R32_FLOAT, {1, 0}, D3D11_USAGE_DEFAULT, D3D11_BIND_SHADER_RESOURCE, 0, 0};
+  D3D11_SUBRESOURCE_DATA initial = {values, 8, 0};
+  ID3D11Texture2D *texture = NULL;
+  ID3D11ShaderResourceView *view = NULL;
+  ID3D11Device_CreateTexture2D(g_device, &desc, &initial, &texture);
+  if (texture) ID3D11Device_CreateShaderResourceView(g_device, (ID3D11Resource *)texture, NULL, &view);
+  ID3D11SamplerState *sampler = point_sampler();
+  ID3D11Buffer *vertices = triangle(0.5f, 0.1f, 0.1f, 1.0f);      /* (ps_tex: the texel at twice the colour's red and green, (0.2, 0.2): the first; times the colour) */
+  begin(NULL);
+  clear(0, 0, 0);
+  bind_floats(vertices);
+  ID3D11DeviceContext_PSSetShader(g_context, g_ps_tex, NULL, 0);
+  ID3D11DeviceContext_PSSetShaderResources(g_context, 0, 1, &view);
+  ID3D11DeviceContext_PSSetSamplers(g_context, 0, 1, &sampler);
+  ID3D11DeviceContext_Draw(g_context, 3, 0);
+  read_target();
+  const UINT32 p = pixel(32, 32);
+  /* (0.75 times 0.1 in red; green and blue 0 (the format has no green or blue); alpha 1) */
+  check(view && red(p) >= 17 && red(p) <= 21 && green(p) == 0 && blue(p) == 0, "an R32_FLOAT texture sampled: red as written, green and blue 0");
+  if (!(red(p) >= 17 && red(p) <= 21 && green(p) == 0 && blue(p) == 0)) printf("d3d11test: (R32_FLOAT sampled: %08x)\n", (unsigned)p);
+  D3D11_TEXTURE2D_DESC staging_desc = {2, 2, 1, 1, DXGI_FORMAT_R32_FLOAT, {1, 0}, D3D11_USAGE_STAGING, 0, D3D11_CPU_ACCESS_READ, 0};
+  ID3D11Texture2D *staging = NULL;
+  ID3D11Device_CreateTexture2D(g_device, &staging_desc, NULL, &staging);
+  float back[4] = {0, 0, 0, 0};
+  if (staging && texture) {
+    ID3D11DeviceContext_CopyResource(g_context, (ID3D11Resource *)staging, (ID3D11Resource *)texture);
+    D3D11_MAPPED_SUBRESOURCE mapped;
+    if (SUCCEEDED(ID3D11DeviceContext_Map(g_context, (ID3D11Resource *)staging, 0, D3D11_MAP_READ, 0, &mapped))) {
+      memcpy(back, mapped.pData, 8);
+      memcpy(back + 2, (const BYTE *)mapped.pData + mapped.RowPitch, 8);
+      ID3D11DeviceContext_Unmap(g_context, (ID3D11Resource *)staging, 0);
+    }
+  }
+  check(memcmp(back, values, sizeof values) == 0, "... and read back as it was written");
+  ID3D11ShaderResourceView *no_view = NULL;
+  ID3D11DeviceContext_PSSetShaderResources(g_context, 0, 1, &no_view);
+  if (staging) ID3D11Texture2D_Release(staging);
+  ID3D11Buffer_Release(vertices);
+  if (sampler) ID3D11SamplerState_Release(sampler);
+  if (view) ID3D11ShaderResourceView_Release(view);
+  if (texture) ID3D11Texture2D_Release(texture);
+  UINT support = 0;
+  ID3D11Device_CheckFormatSupport(g_device, DXGI_FORMAT_R16G16_FLOAT, &support);
+  check((support & D3D11_FORMAT_SUPPORT_RENDER_TARGET) && (support & D3D11_FORMAT_SUPPORT_SHADER_SAMPLE) && (support & D3D11_FORMAT_SUPPORT_BLENDABLE),
+        "CheckFormatSupport of R16G16_FLOAT: a render target, sampled, blended");
+}
+
 int main(void) {
   test_device();
   if (g_device && g_context) {
@@ -1873,6 +2034,8 @@ int main(void) {
       test_min_lod();
       test_deferred();
       test_d3d11_1();
+      test_texture1d();
+      test_formats();
     }
     ID3D11DeviceContext_ClearState(g_context);
     ID3D11DeviceContext_Flush(g_context);

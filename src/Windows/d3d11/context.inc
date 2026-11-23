@@ -25,6 +25,7 @@ static void set_range(void **slots, UINT capacity, UINT start, UINT count, void 
 static void get_range(void **slots, UINT capacity, UINT start, UINT count, void **objects);
 static void unbind_reads_of(Ctx *c, const void *resource, BOOL compute);
 static BOOL compute_prepare(Ctx *c);
+static void set_instances(Ctx *c, UINT stage, ID3D11ClassInstance *const *instances, UINT count);
 
 /* ---- pipelines ------------------------------------------------------------------------------------------------------------------------------------- */
 
@@ -116,14 +117,13 @@ static ID3D12PipelineState *pipeline_get(Dev *d, Ctx *c) {
     out->RenderTargetWriteMask = in->RenderTargetWriteMask;
   }
   for (UINT i = 0; i < c->rtv_count && i < 8; ++i) {      /* a target kept wider than its format: only its own channels are written */
-    const int e = c->rtv[i]->tex->expand;
-    if (!e) continue;
+    const UINT8 mask = tex_format_mask(c->rtv[i]->tex->fmt);
+    if (mask == 0xF) continue;
     if (!pd.BlendState.IndependentBlendEnable) {
       for (UINT j = 1; j < 8; ++j) pd.BlendState.RenderTarget[j] = pd.BlendState.RenderTarget[0];
       pd.BlendState.IndependentBlendEnable = TRUE;
     }
-    pd.BlendState.RenderTarget[i].RenderTargetWriteMask &= (UINT8)(e == 1 ? D3D12_COLOR_WRITE_ENABLE_RED : e == 3 ? (D3D12_COLOR_WRITE_ENABLE_RED | D3D12_COLOR_WRITE_ENABLE_GREEN)
-                                                                                             : D3D12_COLOR_WRITE_ENABLE_ALPHA);
+    pd.BlendState.RenderTarget[i].RenderTargetWriteMask &= mask;
   }
   pd.RasterizerState.FillMode = (D3D12_FILL_MODE)key.raster.FillMode;
   pd.RasterizerState.CullMode = (D3D12_CULL_MODE)key.raster.CullMode;
@@ -672,24 +672,24 @@ static D3D11_DEVICE_CONTEXT_TYPE STDMETHODCALLTYPE ctx_GetType(Ctx *c) { return 
 static UINT STDMETHODCALLTYPE ctx_GetContextFlags(Ctx *c) { return c->flags; }
 
 static void STDMETHODCALLTYPE ctx_VSSetShader(Ctx *c, ID3D11VertexShader *shader, ID3D11ClassInstance *const *instances, UINT count) {
-  (void)instances; (void)count;
   bind(&c->vs, shader);
+  set_instances(c, 0, instances, count);
 }
 static void STDMETHODCALLTYPE ctx_PSSetShader(Ctx *c, ID3D11PixelShader *shader, ID3D11ClassInstance *const *instances, UINT count) {
-  (void)instances; (void)count;
   bind(&c->ps, shader);
+  set_instances(c, 1, instances, count);
 }
 static void STDMETHODCALLTYPE ctx_GSSetShader(Ctx *c, ID3D11GeometryShader *shader, ID3D11ClassInstance *const *instances, UINT count) {
-  (void)instances; (void)count;
   bind(&c->gs, shader);
+  set_instances(c, 2, instances, count);
 }
 static void STDMETHODCALLTYPE ctx_HSSetShader(Ctx *c, ID3D11HullShader *shader, ID3D11ClassInstance *const *instances, UINT count) {
-  (void)instances; (void)count;
   bind(&c->hs, shader);
+  set_instances(c, 3, instances, count);
 }
 static void STDMETHODCALLTYPE ctx_DSSetShader(Ctx *c, ID3D11DomainShader *shader, ID3D11ClassInstance *const *instances, UINT count) {
-  (void)instances; (void)count;
   bind(&c->ds, shader);
+  set_instances(c, 4, instances, count);
 }
 static void set_range(void **slots, UINT capacity, UINT start, UINT count, void *const *objects) {
   for (UINT i = 0; i < count && start + i < capacity; ++i) bind(&slots[start + i], objects ? objects[i] : NULL);
@@ -768,6 +768,21 @@ static void STDMETHODCALLTYPE ctx_DSSetConstantBuffers(Ctx *c, UINT start, UINT 
 static void STDMETHODCALLTYPE ctx_DSSetConstantBuffers1(Ctx *c, UINT start, UINT count, ID3D11Buffer *const *buffers, const UINT *first, const UINT *number) { cb_set(c, 4, start, count, buffers, first, number); }
 static void STDMETHODCALLTYPE ctx_DSGetConstantBuffers(Ctx *c, UINT start, UINT count, ID3D11Buffer **buffers) { cb_get(c, 4, start, count, buffers, NULL, NULL); }
 static void STDMETHODCALLTYPE ctx_DSGetConstantBuffers1(Ctx *c, UINT start, UINT count, ID3D11Buffer **buffers, UINT *first, UINT *number) { cb_get(c, 4, start, count, buffers, first, number); }
+/* The class instances bound with a stage's shader (at most 8 are kept: the kernel runs no shader that uses them, see docs/Direct3D11.md). */
+static void set_instances(Ctx *c, UINT stage, ID3D11ClassInstance *const *instances, UINT count) {
+  for (UINT i = 0; i < 8; ++i) bind(&c->instances[stage][i], i < count && instances ? instances[i] : NULL);
+  c->instance_count[stage] = instances ? (count < 8 ? count : 8) : 0;
+}
+/* (*count in: the room in `instances`; out: how many are bound) */
+static void get_instances(Ctx *c, UINT stage, ID3D11ClassInstance **instances, UINT *count) {
+  if (!count) return;
+  const UINT have = c->instance_count[stage];
+  for (UINT i = 0; instances && i < *count; ++i) {
+    instances[i] = i < have ? (ID3D11ClassInstance *)c->instances[stage][i] : NULL;
+    if (instances[i]) dx_AddRef(OBJ(instances[i]));
+  }
+  *count = have;
+}
 static void get_shader(void *shader, void **out, ID3D11ClassInstance **instances, UINT *count) {
   (void)instances;
   if (count) *count = 0;
@@ -775,12 +790,12 @@ static void get_shader(void *shader, void **out, ID3D11ClassInstance **instances
   *out = shader;
   if (shader) dx_AddRef(OBJ(shader));
 }
-static void STDMETHODCALLTYPE ctx_VSGetShader(Ctx *c, ID3D11VertexShader **out, ID3D11ClassInstance **instances, UINT *count) { get_shader(c->vs, (void **)out, instances, count); }
-static void STDMETHODCALLTYPE ctx_PSGetShader(Ctx *c, ID3D11PixelShader **out, ID3D11ClassInstance **instances, UINT *count) { get_shader(c->ps, (void **)out, instances, count); }
-static void STDMETHODCALLTYPE ctx_GSGetShader(Ctx *c, ID3D11GeometryShader **out, ID3D11ClassInstance **instances, UINT *count) { get_shader(c->gs, (void **)out, instances, count); }
-static void STDMETHODCALLTYPE ctx_HSGetShader(Ctx *c, ID3D11HullShader **out, ID3D11ClassInstance **instances, UINT *count) { get_shader(c->hs, (void **)out, instances, count); }
-static void STDMETHODCALLTYPE ctx_DSGetShader(Ctx *c, ID3D11DomainShader **out, ID3D11ClassInstance **instances, UINT *count) { get_shader(c->ds, (void **)out, instances, count); }
-static void STDMETHODCALLTYPE ctx_CSGetShader(Ctx *c, ID3D11ComputeShader **out, ID3D11ClassInstance **instances, UINT *count) { get_shader(c->cs, (void **)out, instances, count); }
+static void STDMETHODCALLTYPE ctx_VSGetShader(Ctx *c, ID3D11VertexShader **out, ID3D11ClassInstance **instances, UINT *count) { get_shader(c->vs, (void **)out, NULL, NULL); get_instances(c, 0, instances, count); }
+static void STDMETHODCALLTYPE ctx_PSGetShader(Ctx *c, ID3D11PixelShader **out, ID3D11ClassInstance **instances, UINT *count) { get_shader(c->ps, (void **)out, NULL, NULL); get_instances(c, 1, instances, count); }
+static void STDMETHODCALLTYPE ctx_GSGetShader(Ctx *c, ID3D11GeometryShader **out, ID3D11ClassInstance **instances, UINT *count) { get_shader(c->gs, (void **)out, NULL, NULL); get_instances(c, 2, instances, count); }
+static void STDMETHODCALLTYPE ctx_HSGetShader(Ctx *c, ID3D11HullShader **out, ID3D11ClassInstance **instances, UINT *count) { get_shader(c->hs, (void **)out, NULL, NULL); get_instances(c, 3, instances, count); }
+static void STDMETHODCALLTYPE ctx_DSGetShader(Ctx *c, ID3D11DomainShader **out, ID3D11ClassInstance **instances, UINT *count) { get_shader(c->ds, (void **)out, NULL, NULL); get_instances(c, 4, instances, count); }
+static void STDMETHODCALLTYPE ctx_CSGetShader(Ctx *c, ID3D11ComputeShader **out, ID3D11ClassInstance **instances, UINT *count) { get_shader(c->cs, (void **)out, NULL, NULL); get_instances(c, 5, instances, count); }
 
 static void STDMETHODCALLTYPE ctx_IASetInputLayout(Ctx *c, ID3D11InputLayout *layout) { bind(&c->layout, layout); }
 static void STDMETHODCALLTYPE ctx_IAGetInputLayout(Ctx *c, ID3D11InputLayout **out) { get_shader(c->layout, (void **)out, NULL, NULL); }
@@ -1037,8 +1052,8 @@ static void set_resources(Ctx *c, View **slots, UINT start, UINT count, ID3D11Sh
 }
 
 static void STDMETHODCALLTYPE ctx_CSSetShader(Ctx *c, ID3D11ComputeShader *shader, ID3D11ClassInstance *const *instances, UINT count) {
-  (void)instances; (void)count;
   bind(&c->cs, shader);
+  set_instances(c, 5, instances, count);
 }
 static void STDMETHODCALLTYPE ctx_CSSetConstantBuffers(Ctx *c, UINT start, UINT count, ID3D11Buffer *const *buffers) { cb_set(c, 5, start, count, buffers, NULL, NULL); }
 static void STDMETHODCALLTYPE ctx_CSSetConstantBuffers1(Ctx *c, UINT start, UINT count, ID3D11Buffer *const *buffers, const UINT *first, const UINT *number) { cb_set(c, 5, start, count, buffers, first, number); }
@@ -1126,9 +1141,8 @@ static void STDMETHODCALLTYPE ctx_ClearRenderTargetView(Ctx *c, ID3D11RenderTarg
   if (predicated_out(c->dev)) return;
   LOCK(c);
   FLOAT kept[4] = {colour[0], colour[1], colour[2], colour[3]};      /* (a target kept wider than its format: the channels it does not have stay 0 and 1) */
-  if (v->tex->expand == 1) kept[1] = kept[2] = 0, kept[3] = 1;
-  else if (v->tex->expand == 3) kept[2] = 0, kept[3] = 1;
-  else if (v->tex->expand == 2) kept[0] = kept[1] = kept[2] = 0;
+  const UINT8 mask = tex_format_mask(v->tex->fmt);
+  for (UINT k = 0; k < 4; ++k) if (!(mask >> k & 1)) kept[k] = k == 3 ? 1.0f : 0.0f;
   tex_before_write(c->dev, v->tex);
   ID3D12GraphicsCommandList_ClearRenderTargetView(c->dev->list, v->handle, kept, 0, NULL);
   v->tex->used = v->tex->written = c->dev->epoch;
