@@ -31,12 +31,19 @@ struct OwnerRecord {
   SourceOwner kind = SourceOwner::None;
 };
 
+// A keyed mutex made with a global share handle (D3DKMTCreateKeyedMutex, or ...2 without NtSecuritySharing): the handle names it until its creator's handle goes.
+struct GlobalKeyedMutex {
+  uint32_t id = 0;
+  uint64_t pid = 0;
+  SharedPointer<KeyedMutexState> state;
+};
 struct Registry {
-  explicit Registry(allocators::IAllocator& a) : allocator(a), states(a), shares(a), owners(a) {}
+  explicit Registry(allocators::IAllocator& a) : allocator(a), states(a), shares(a), owners(a), keyed(a) {}
   allocators::IAllocator& allocator;
   List<SharedPointer<ProcessState>> states;
   List<UniquePointer<ShareRecord>> shares;
   List<OwnerRecord> owners;
+  List<GlobalKeyedMutex> keyed;
   uint32_t next_share = 0x40000001u;
 };
 
@@ -218,8 +225,14 @@ void process_exited(uint64_t pid) {
       if (r->shares[i]->owner == pid) r->shares.remove_at(i);
     for (uint64_t i = r->owners.count(); i-- > 0;)
       if (r->owners[i].pid == pid) r->owners.remove_at(i);
+    for (uint64_t i = r->keyed.count(); i-- > 0;)
+      if (r->keyed[i].pid == pid) r->keyed.remove_at(i);
   }
   // (the kernel destroys the process's devices, allocations and the share tokens it made; the layer's records go with `state`)
+  if (state) {
+    kernel::ScopedMutex g(state->lock);
+    keyed_mutexes_process_exited(*state, pid);
+  }
   if (state) kernel = state->kernel();
   if (kernel && kernel == dxgk::system_kernel()) {
     // (with the process lock: a thread of the process that is still inside a call is using views of memory the kernel frees here)
@@ -289,6 +302,38 @@ uint32_t add_share(UniquePointer<ShareRecord> record) {
   record->id = r->next_share++;
   const uint32_t id = record->id;
   return r->shares.push_back(util::move(record)) ? id : 0;
+}
+
+uint32_t add_global_keyed_mutex(uint64_t pid, SharedPointer<KeyedMutexState> state) {
+  kernel::ScopedMutex g(g_lock);
+  Registry* r = registry_locked();
+  if (!r || !state || r->next_share >= 0x7FFFFFFFu) return 0;
+  GlobalKeyedMutex k;
+  k.id = r->next_share++;
+  k.pid = pid;
+  k.state = util::move(state);
+  const uint32_t id = k.id;
+  return r->keyed.push_back(util::move(k)) ? id : 0;
+}
+SharedPointer<KeyedMutexState> find_global_keyed_mutex(uint32_t id) {
+  kernel::ScopedMutex g(g_lock);
+  Registry* r = registry_locked();
+  if (r)
+    for (GlobalKeyedMutex& k : r->keyed.view())
+      if (k.id == id) return k.state;
+  return SharedPointer<KeyedMutexState>();
+}
+void remove_global_keyed_mutex(uint32_t id) {
+  SharedPointer<KeyedMutexState> gone;      // (let go after the lock)
+  kernel::ScopedMutex g(g_lock);
+  Registry* r = registry_locked();
+  if (!r) return;
+  for (uint64_t i = 0; i < r->keyed.count(); ++i)
+    if (r->keyed[i].id == id) {
+      gone = util::move(r->keyed[i].state);
+      r->keyed.remove_at(i);
+      return;
+    }
 }
 
 bool with_share(uint32_t id, void (*use)(void* context, ShareRecord& share), void* context) {

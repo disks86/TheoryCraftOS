@@ -448,7 +448,7 @@ Not done, in the order a program is likely to meet them: texture formats of fewe
 kernel refuses the combination); rendering into a mip level or an array layer; unordered access to textures (and so `ClearUnorderedAccessView*` of a texture); depth bias
 and back-face stencil state; dual-source blending (`SRC1_*` factors: the pipeline is refused with `DXGI_ERROR_UNSUPPORTED`); several viewports; more than four unordered
 access buffers; pipeline statistics queries from the DLL; shared resources across adapters (`D3D12_HEAP_FLAG_SHARED_CROSS_ADAPTER`,
-`D3D12_FENCE_FLAG_SHARED_CROSS_ADAPTER`: `DXGI_ERROR_UNSUPPORTED`) and D3D11 keyed mutexes and legacy (non-NT) shared handles; the blend factor on Vega and the other fixed backends; ray tracing,
+`D3D12_FENCE_FLAG_SHARED_CROSS_ADAPTER`: `DXGI_ERROR_UNSUPPORTED`) and legacy (non-NT) shared handles in the DLLs; the blend factor on Vega and the other fixed backends; ray tracing,
 mesh shaders, variable rate shading, view instancing, sampler feedback, protected sessions and meta commands (reported unsupported); `ResolveSubresourceRegion` into a
 subresource other than 0 and the least / greatest colour resolves on virgl (its resolves are averages: the call is left out there); typed UAV clears of formats outside
 `g_uav_formats` (R11G11B10, B5G6R5 ...); root signature version 1.2 and the pipeline-stream subobjects of the later Agility SDKs (`DEPTH_STENCIL2`, `RASTERIZER1/2`,

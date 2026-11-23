@@ -18,7 +18,8 @@
 
 /* Part of d3d11.c. A texture as DXGI sees it: every Direct3D 11 texture is also an IDXGIResource1 and an IDXGISurface2 (programs ask for them to share it, to learn its usage,
  * or to wrap it - Chrome's video frames and shared images do). They are parts of the texture object (Tex.dxgi_res, Tex.dxgi_surf) and share its count.
- * Nothing is shared with another device or process here: a shared handle is refused. */
+ * A texture made D3D11_RESOURCE_MISC_SHARED_NTHANDLE is shared through NT handles (CreateSharedHandle; interop.inc opens them), with its keyed mutex (Tex.dxgi_mutex,
+ * IDXGIKeyedMutex) when it was made SHARED_KEYEDMUTEX. */
 
 static Tex *tex_of_dxgi_res(IDXGIResource1 *p) { return (Tex *)((BYTE *)p - offsetof(Tex, dxgi_res)); }
 static Tex *tex_of_dxgi_surf(IDXGISurface2 *p) { return (Tex *)((BYTE *)p - offsetof(Tex, dxgi_surf)); }
@@ -28,6 +29,9 @@ static HRESULT STDMETHODCALLTYPE tex_QueryInterface(Tex *t, REFIID riid, void **
   *out = NULL;
   if (guid_eq(riid, &IID_IDXGIObject) || guid_eq(riid, &IID_IDXGIDeviceSubObject) || guid_eq(riid, &IID_IDXGIResource) || guid_eq(riid, &IID_IDXGIResource1)) {
     *out = &t->dxgi_res;
+  } else if (guid_eq(riid, &IID_IDXGIKeyedMutex)) {
+    if (!t->keyed_mutex) return E_NOINTERFACE;      /* (made without SHARED_KEYEDMUTEX) */
+    *out = &t->dxgi_mutex;
   } else if (guid_eq(riid, &IID_IDXGISurface) || guid_eq(riid, &IID_IDXGISurface1) || guid_eq(riid, &IID_IDXGISurface2)) {
     if (t->desc.ArraySize != 1 || t->desc.MipLevels != 1 || t->kind != 0) { dx_no_interface("ID3D11Texture2D (a surface of several subresources)", riid); return E_NOINTERFACE; }
     *out = &t->dxgi_surf;
@@ -90,7 +94,18 @@ static HRESULT STDMETHODCALLTYPE dres_CreateSharedHandle(IDXGIResource1 *p, cons
   if (!handle) return E_INVALIDARG;
   *handle = NULL;
   if (!(t->desc.MiscFlags & D3D11_RESOURCE_MISC_SHARED_NTHANDLE) || !access || (access & ~SHARED_ACCESS_ALL)) return E_INVALIDARG;
-  return ID3D12Device_CreateSharedHandle(t->c.dev->d12, (ID3D12DeviceChild *)t->res, attributes, GENERIC_ALL, name, handle);
+  /* (the resource, and its keyed mutex: one NT handle for both, as D3DKMTShareObjects takes them) */
+  const UINT list[2] = {TcosD3D12SharedResource(t->res), t->keyed_mutex};
+  if (!list[0]) return E_INVALIDARG;
+  KmtAttributes a;
+  void *oa = kmt_attributes(&a, name, attributes && attributes->bInheritHandle, attributes ? attributes->lpSecurityDescriptor : NULL);
+  if (!oa) return E_INVALIDARG;
+  UINT64 nt = 0;
+  const NTSTATUS st = kmt_share_list(list, t->keyed_mutex ? 2 : 1, oa, GENERIC_ALL, &nt);
+  if ((UINT)st == 0xC0000035u) return DXGI_ERROR_NAME_ALREADY_EXISTS;      /* STATUS_OBJECT_NAME_COLLISION */
+  if (!KMT_OK(st)) return (UINT)st == 0xC000000Du || (UINT)st == 0xC0000008u ? E_INVALIDARG : E_FAIL;
+  *handle = (HANDLE)(UINT_PTR)nt;
+  return S_OK;
 }
 #define DRES_SLOT(name) .name = (__typeof__(((IDXGIResource1Vtbl *)0)->name))dres_##name
 static const IDXGIResource1Vtbl g_dxgi_res_vtbl = {
@@ -150,7 +165,48 @@ static const IDXGISurface2Vtbl g_dxgi_surf_vtbl = {
 #undef DSURF_SLOT
 
 /* (every texture made gets the two) */
+/* ---- IDXGIKeyedMutex (a texture made SHARED_KEYEDMUTEX) ---- */
+/* AcquireSync waits up to `ms` for the mutex with `key` (WAIT_TIMEOUT when the time runs out, WAIT_ABANDONED when its holder went without releasing it); ReleaseSync
+ * sends what the device recorded first - the texture's contents are there for the next holder - and frees it with `key`. Either without holding it as it should:
+ * DXGI_ERROR_INVALID_CALL. */
+static Tex *tex_of_dxgi_mutex(IDXGIKeyedMutex *p) { return (Tex *)((BYTE *)p - offsetof(Tex, dxgi_mutex)); }
+static HRESULT STDMETHODCALLTYPE dkm_QueryInterface(IDXGIKeyedMutex *p, REFIID riid, void **out) { return tex_QueryInterface(tex_of_dxgi_mutex(p), riid, out); }
+static ULONG STDMETHODCALLTYPE dkm_AddRef(IDXGIKeyedMutex *p) { return dx_AddRef(OBJ(tex_of_dxgi_mutex(p))); }
+static ULONG STDMETHODCALLTYPE dkm_Release(IDXGIKeyedMutex *p) { return dx_Release(OBJ(tex_of_dxgi_mutex(p))); }
+static HRESULT STDMETHODCALLTYPE dkm_SetPrivateData(IDXGIKeyedMutex *p, REFGUID g, UINT size, const void *data) { return dx_SetPrivateData(OBJ(tex_of_dxgi_mutex(p)), g, size, data); }
+static HRESULT STDMETHODCALLTYPE dkm_SetPrivateDataInterface(IDXGIKeyedMutex *p, REFGUID g, const IUnknown *o) { return dx_SetPrivateDataInterface(OBJ(tex_of_dxgi_mutex(p)), g, o); }
+static HRESULT STDMETHODCALLTYPE dkm_GetPrivateData(IDXGIKeyedMutex *p, REFGUID g, UINT *size, void *data) { return dx_GetPrivateData(OBJ(tex_of_dxgi_mutex(p)), g, size, data); }
+static HRESULT STDMETHODCALLTYPE dkm_GetParent(IDXGIKeyedMutex *p, REFIID riid, void **out) { return dev_QueryInterface(tex_of_dxgi_mutex(p)->c.dev, riid, out); }
+static HRESULT STDMETHODCALLTYPE dkm_GetDevice(IDXGIKeyedMutex *p, REFIID riid, void **out) { return dev_QueryInterface(tex_of_dxgi_mutex(p)->c.dev, riid, out); }
+static HRESULT keyed_mutex_result(NTSTATUS st) {
+  switch ((UINT)st) {
+    case 0: return S_OK;
+    case 0x102u: return WAIT_TIMEOUT;           /* STATUS_TIMEOUT */
+    case 0x80u: return WAIT_ABANDONED;          /* STATUS_ABANDONED */
+    case 0xC0000184u: return DXGI_ERROR_INVALID_CALL;      /* STATUS_INVALID_DEVICE_STATE: held by it already, or not held by it */
+    default: return E_FAIL;
+  }
+}
+static HRESULT STDMETHODCALLTYPE dkm_AcquireSync(IDXGIKeyedMutex *p, UINT64 key, DWORD ms) {
+  return keyed_mutex_result(kmt_acquire_keyed_mutex(tex_of_dxgi_mutex(p)->keyed_mutex, key, ms));
+}
+static HRESULT STDMETHODCALLTYPE dkm_ReleaseSync(IDXGIKeyedMutex *p, UINT64 key) {
+  Tex *t = tex_of_dxgi_mutex(p);
+  Dev *d = t->c.dev;
+  EnterCriticalSection(&d->lock);
+  flush(d);      /* (what the device recorded runs before the next holder looks: the queue runs it as it is sent) */
+  LeaveCriticalSection(&d->lock);
+  return keyed_mutex_result(kmt_release_keyed_mutex(t->keyed_mutex, key));
+}
+#define DKM_SLOT(name) .name = (__typeof__(((IDXGIKeyedMutexVtbl *)0)->name))dkm_##name
+static const IDXGIKeyedMutexVtbl g_dxgi_mutex_vtbl = {
+    DKM_SLOT(QueryInterface), DKM_SLOT(AddRef), DKM_SLOT(Release), DKM_SLOT(SetPrivateData), DKM_SLOT(SetPrivateDataInterface), DKM_SLOT(GetPrivateData),
+    DKM_SLOT(GetParent), DKM_SLOT(GetDevice), DKM_SLOT(AcquireSync), DKM_SLOT(ReleaseSync),
+};
+#undef DKM_SLOT
+
 static void tex_dxgi_init(Tex *t) {
   t->dxgi_res.lpVtbl = &g_dxgi_res_vtbl;
   t->dxgi_surf.lpVtbl = &g_dxgi_surf_vtbl;
+  t->dxgi_mutex.lpVtbl = &g_dxgi_mutex_vtbl;
 }

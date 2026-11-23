@@ -196,6 +196,7 @@ void install_dxg() {
   dxg::register_work();
   dxg::register_unsupported();
   dxg::register_shares();
+  dxg::register_keyed_mutexes();
   register_process_exit_hook(dxg::process_exited);
   linuxabi::set_dxg_service_handler(&dxg::linux_service);
   linuxabi::set_dxg_buffer_handlers(&dxg::linux_export, &dxg::linux_import);

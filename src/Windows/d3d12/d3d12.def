@@ -24,4 +24,5 @@ TcosD3D12StageConstantBases
 TcosD3D12ResourceOptions
 TcosD3D12ShareExtra
 TcosD3D12SharedExtra
+TcosD3D12SharedResource
 TcosD3D12BeginQueryKind

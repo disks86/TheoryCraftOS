@@ -256,3 +256,22 @@ static NTSTATUS __cdecl gdi_wow_kmt_OpenResourceFromNtHandle(void *params) {
   return status;
 }
 #define NtGdiDdDDIOpenResourceFromNtHandle gdi_wow_kmt_OpenResourceFromNtHandle
+/* ---- keyed mutexes: the structures with pointers (CreateKeyedMutex, DestroyKeyedMutex, OpenKeyedMutex and ReleaseKeyedMutex are laid out the same in both widths) */
+/* D3DKMT_CREATEKEYEDMUTEX2 { InitialValue; hSharedHandle; hKeyedMutex; pPrivateRuntimeData; PrivateRuntimeDataSize; Flags }: 32 in both, the last three in other places */
+KMT_CONVERTED(CreateKeyedMutex2, {0, 0, 8}, {8, 8, 4}, {12, 12, 4}, {16, 16, KMT_POINTER}, {20, 24, 4}, {24, 28, 4})
+#define NtGdiDdDDICreateKeyedMutex2 gdi_wow_kmt_CreateKeyedMutex2
+/* D3DKMT_OPENKEYEDMUTEX2 { hSharedHandle; hKeyedMutex; pPrivateRuntimeData; PrivateRuntimeDataSize }: 16 and 24 */
+KMT_CONVERTED(OpenKeyedMutex2, {0, 0, 4}, {4, 4, 4}, {8, 8, KMT_POINTER}, {12, 16, 4})
+#define NtGdiDdDDIOpenKeyedMutex2 gdi_wow_kmt_OpenKeyedMutex2
+/* D3DKMT_OPENKEYEDMUTEXFROMNTHANDLE { hNtHandle; hKeyedMutex; pPrivateRuntimeData; PrivateRuntimeDataSize }: 16 and 32 */
+KMT_CONVERTED(OpenKeyedMutexFromNtHandle, {0, 0, KMT_POINTER}, {4, 8, 4}, {8, 16, KMT_POINTER}, {12, 24, 4})
+#define NtGdiDdDDIOpenKeyedMutexFromNtHandle gdi_wow_kmt_OpenKeyedMutexFromNtHandle
+/* D3DKMT_ACQUIREKEYEDMUTEX { hKeyedMutex; Key; pTimeout; FenceValue }: 32 in both, the timeout's pointer 4 bytes here */
+KMT_CONVERTED(AcquireKeyedMutex, {0, 0, 4}, {8, 8, 8}, {16, 16, KMT_POINTER}, {24, 24, 8})
+#define NtGdiDdDDIAcquireKeyedMutex gdi_wow_kmt_AcquireKeyedMutex
+/* D3DKMT_ACQUIREKEYEDMUTEX2 { ... pPrivateRuntimeData; PrivateRuntimeDataSize }: 40 and 48 */
+KMT_CONVERTED(AcquireKeyedMutex2, {0, 0, 4}, {8, 8, 8}, {16, 16, KMT_POINTER}, {24, 24, 8}, {32, 32, KMT_POINTER}, {36, 40, 4})
+#define NtGdiDdDDIAcquireKeyedMutex2 gdi_wow_kmt_AcquireKeyedMutex2
+/* D3DKMT_RELEASEKEYEDMUTEX2 { hKeyedMutex; Key; FenceValue; pPrivateRuntimeData; PrivateRuntimeDataSize }: 32 and 40 */
+KMT_CONVERTED(ReleaseKeyedMutex2, {0, 0, 4}, {8, 8, 8}, {16, 16, 8}, {24, 24, KMT_POINTER}, {28, 32, 4})
+#define NtGdiDdDDIReleaseKeyedMutex2 gdi_wow_kmt_ReleaseKeyedMutex2

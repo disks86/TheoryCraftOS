@@ -63,6 +63,8 @@ class SharedResource final : public ObjectPayload {
   ByteBuffer runtime_data, driver_data;
   List<UniquePointer<ByteBuffer>> allocation_data;
   allocators::IAllocator& allocator;
+  SharedPointer<KeyedMutexState> keyed_mutex;          // shared with it (ShareObjects of the resource and the mutex: DxgKeyedMutex.cpp), or empty
+  SharedPointer<dxgk::ExportedSync> sync;              // ... and the synchronization object shared with them, or empty
   uint64_t total_driver_bytes() const {
     uint64_t total = 0;
     for (const UniquePointer<ByteBuffer>& d : allocation_data.view()) total += d->size();
@@ -92,17 +94,18 @@ uint32_t payload_of(Call& call, uint64_t handle, ObjectKind kind, SharedPointer<
 
 // --- Sharing --------------------------------------------------------------------------------------------------------------------------------------------------
 
-// NtGdiDdDDIShareObjects(UINT cObjects, const D3DKMT_HANDLE* hObjects, OBJECT_ATTRIBUTES* pObjectAttributes, DWORD dwDesiredAccess, HANDLE* phSharedNtHandle): one object,
-// a resource made with NtSecuritySharing or a fence made shared. (Windows takes a resource with its keyed mutex and synchronization object as well: keyed mutexes are not
-// made here, so a list of more than one object is not one this layer can have made.)
+// NtGdiDdDDIShareObjects(UINT cObjects, const D3DKMT_HANDLE* hObjects, OBJECT_ATTRIBUTES* pObjectAttributes, DWORD dwDesiredAccess, HANDLE* phSharedNtHandle): a resource
+// made with NtSecuritySharing - alone, with its keyed mutex (made with NtSecuritySharing), or with the mutex and a fence made shared - or a fence made shared, alone.
 uint32_t share_objects(Session& s, Call& call, uint64_t) {
   const uint32_t count = call.arg32(0);
   const uint64_t handles = call.arg(1), attributes = call.arg(2), out = call.arg(4);
   const uint32_t access = call.arg32(3);
   if (call.bad_stack()) return kStatusAccessViolation;
-  if (count != 1 || handles == 0 || out == 0) return kStatusInvalidParameter;
-  uint32_t handle = 0;
-  if (!call.read_u32(handles, &handle)) return kStatusAccessViolation;
+  if (count == 0 || count > 3 || handles == 0 || out == 0) return kStatusInvalidParameter;
+  uint32_t list[3] = {0, 0, 0};
+  for (uint32_t i = 0; i < count; ++i)
+    if (!call.read_u32(handles + 4 * uint64_t{i}, &list[i])) return kStatusAccessViolation;
+  const uint32_t handle = list[0];
   allocators::IAllocator& allocator = object_allocator(s, call);
   SharedPointer<ObjectPayload> payload;
   ObjectKind kind = ObjectKind::None;
@@ -114,6 +117,18 @@ uint32_t share_objects(Session& s, Call& call, uint64_t) {
     ResourceRecord* r = s.state().find_resource(id);
     if (!r) return status::kInvalidHandle;
     if (!r->nt_shareable || r->allocations.count() == 0) return kStatusInvalidParameter;
+    if (count >= 2) {      // (the keyed mutex that orders its use)
+      shared->keyed_mutex = keyed_mutex_of(s.state(), list[1]);
+      if (!shared->keyed_mutex) return status::kInvalidHandle;
+      if (!shared->keyed_mutex->nt_shareable) return kStatusInvalidParameter;
+    }
+    if (count == 3) {      // (and a fence)
+      SyncRecord* sync = s.state().find_sync(list[2]);
+      if (!sync) return status::kInvalidHandle;
+      if (!sync->nt_shareable) return kStatusInvalidParameter;
+      const uint32_t st = s.kernel().export_sync(s.pid(), list[2], &shared->sync);
+      if (st != status::kSuccess) return st;
+    }
     if (!shared->runtime_data.append(r->runtime_data.view()) || !shared->driver_data.append(r->driver_data.view())) return status::kNoMemory;
     for (uint64_t i = 0; i < r->allocations.count(); ++i) {
       SharedPointer<dxgk::ExportedAllocation> exported;
@@ -126,6 +141,7 @@ uint32_t share_objects(Session& s, Call& call, uint64_t) {
     payload = util::move(shared);
     kind = ObjectKind::DxgSharedResource;
   } else {
+    if (count != 1) return kStatusInvalidParameter;      // (a fence is shared alone)
     SharedPointer<SharedSync> shared = SharedPointer<SharedSync>::make(allocator);
     if (!shared) return status::kNoMemory;
     Locked g(s);
@@ -171,7 +187,8 @@ uint32_t query_resource_info_from_nt_handle(Session& s, Call& call, uint64_t arg
 // PrivateDriverDataSize @16, GpuVirtualAddress @24); PrivateRuntimeDataSize @32; pPrivateRuntimeData @40; ResourcePrivateDriverDataSize @48;
 // pResourcePrivateDriverData @56; TotalPrivateDriverDataBufferSize @64; pTotalPrivateDriverDataBuffer @72; hResource @80 (out); hKeyedMutex @84 (out);
 // pKeyedMutexPrivateRuntimeData @88; KeyedMutexPrivateRuntimeDataSize @96; hSyncObject @100 (out) }. The allocations' private data goes into the total buffer one after
-// the other, each entry pointing at its own; the resource's into its buffer. No keyed mutex is shared with a resource here (hKeyedMutex and hSyncObject are 0).
+// the other, each entry pointing at its own; the resource's into its buffer. A keyed mutex shared with it gets a handle of the caller's (its private runtime data into
+// pKeyedMutexPrivateRuntimeData), and so does a fence shared with them (on the device); 0 for what was not shared.
 uint32_t open_resource_from_nt_handle(Session& s, Call& call, uint64_t arg) {
   UserBlock b;
   if (!b.load(call, arg, 104)) return load_failure(arg);
@@ -185,6 +202,8 @@ uint32_t open_resource_from_nt_handle(Session& s, Call& call, uint64_t arg) {
   const uint64_t resource_ptr = b.u64(56);
   const uint32_t total_size = b.u32(64);
   const uint64_t total_ptr = b.u64(72);
+  const uint64_t mutex_data = b.u64(88);
+  const uint32_t mutex_size = b.u32(96);
   if (device == 0 || nt == 0 || count == 0 || count > kMaxAllocationsPerCall || infos == 0) return kStatusInvalidParameter;
   SharedPointer<ObjectPayload> holder;
   SharedResource* shared = nullptr;
@@ -193,6 +212,8 @@ uint32_t open_resource_from_nt_handle(Session& s, Call& call, uint64_t arg) {
   if (runtime_size < shared->runtime_data.size() || resource_size < shared->driver_data.size() || total_size < shared->total_driver_bytes()) return kStatusBufferTooSmall;
   if ((shared->runtime_data.size() && runtime_ptr == 0) || (shared->driver_data.size() && resource_ptr == 0) || (shared->total_driver_bytes() && total_ptr == 0))
     return kStatusInvalidParameter;
+  if (shared->keyed_mutex && shared->keyed_mutex->runtime_data.size() && (mutex_size < shared->keyed_mutex->runtime_data.size() || mutex_data == 0))
+    return mutex_size < shared->keyed_mutex->runtime_data.size() ? kStatusBufferTooSmall : kStatusInvalidParameter;
 
   Locked g(s);
   ProcessState& ps = s.state();
@@ -238,12 +259,35 @@ uint32_t open_resource_from_nt_handle(Session& s, Call& call, uint64_t arg) {
               put32(call, entry, 16, static_cast<uint32_t>(data.size())) && put64(call, entry, 24, 0);
       at += data.size();
     }
+    // (the keyed mutex and the fence shared with it: handles of the caller's)
+    dxgk::Handle mutex = 0, sync = 0;
+    if (wrote && shared->keyed_mutex) {
+      mutex = add_keyed_mutex(ps, shared->keyed_mutex);
+      wrote = mutex != 0 && (shared->keyed_mutex->runtime_data.size() == 0 || call.write(mutex_data, shared->keyed_mutex->runtime_data.view())) &&
+              put32(call, arg, 96, static_cast<uint32_t>(shared->keyed_mutex->runtime_data.size()));
+    }
+    if (wrote && shared->sync) {
+      wrote = s.kernel().import_sync(s.pid(), device, *shared->sync, &sync) == status::kSuccess;
+      SyncRecord rec;
+      rec.handle = sync;
+      rec.device = device;
+      rec.type = dxgk::SyncType::Fence;
+      rec.nt_shareable = true;
+      if (wrote && !ps.syncs.push_back(rec)) { s.kernel().destroy_sync(s.pid(), sync); sync = 0; wrote = false; }
+    }
     wrote = wrote && put32(call, arg, 32, static_cast<uint32_t>(shared->runtime_data.size())) && put32(call, arg, 48, static_cast<uint32_t>(shared->driver_data.size())) &&
-            put32(call, arg, 64, static_cast<uint32_t>(shared->total_driver_bytes())) && put32(call, arg, 80, kResourceHandleBase | id) && put32(call, arg, 84, 0) &&
-            put32(call, arg, 100, 0);
+            put32(call, arg, 64, static_cast<uint32_t>(shared->total_driver_bytes())) && put32(call, arg, 80, kResourceHandleBase | id) && put32(call, arg, 84, mutex) &&
+            put32(call, arg, 100, sync);
     if (!wrote) {
       for (uint64_t i = 0; i < ps.resources.count(); ++i)
         if (ps.resources[i]->id == id) { ps.resources.remove_at(i); break; }
+      for (uint64_t i = 0; mutex && i < ps.keyed_mutexes.count(); ++i)
+        if (ps.keyed_mutexes[i].handle == mutex) { ps.keyed_mutexes.remove_at(i); break; }
+      if (sync) {
+        s.kernel().destroy_sync(s.pid(), sync);
+        for (uint64_t i = 0; i < ps.syncs.count(); ++i)
+          if (ps.syncs[i].handle == sync) { ps.syncs.remove_at(i); break; }
+      }
       st = kStatusAccessViolation;
     }
   }
@@ -254,6 +298,30 @@ uint32_t open_resource_from_nt_handle(Session& s, Call& call, uint64_t arg) {
     }
   }
   return st;
+}
+
+// D3DKMT_OPENKEYEDMUTEXFROMNTHANDLE { hNtHandle @0; hKeyedMutex @8 (out); pPrivateRuntimeData @16; PrivateRuntimeDataSize @24 }: the keyed mutex shared with a resource
+// (STATUS_INVALID_PARAMETER for a resource shared without one).
+uint32_t open_keyed_mutex_from_nt_handle(Session& s, Call& call, uint64_t arg) {
+  UserBlock b;
+  if (!b.load(call, arg, 32)) return load_failure(arg);
+  const uint64_t nt = b.u64(0), data = b.u64(16);
+  const uint32_t size = b.u32(24);
+  if (nt == 0) return kStatusInvalidParameter;
+  SharedPointer<ObjectPayload> holder;
+  SharedResource* shared = nullptr;
+  if (const uint32_t st = payload_of(call, nt, ObjectKind::DxgSharedResource, &holder, &shared)) return st;
+  if (!shared->keyed_mutex) return kStatusInvalidParameter;
+  const ByteBuffer& runtime = shared->keyed_mutex->runtime_data;
+  if (runtime.size() && size < runtime.size()) return kStatusBufferTooSmall;
+  if (runtime.size() && (!data || !call.write(data, runtime.view()))) return data ? kStatusAccessViolation : kStatusInvalidParameter;
+  Locked g(s);
+  const dxgk::Handle mutex = add_keyed_mutex(s.state(), shared->keyed_mutex);
+  if (!mutex) return status::kInsufficientResources;
+  if (put32(call, arg, 8, mutex) && put32(call, arg, 24, static_cast<uint32_t>(runtime.size()))) return status::kSuccess;
+  for (uint64_t i = 0; i < s.state().keyed_mutexes.count(); ++i)
+    if (s.state().keyed_mutexes[i].handle == mutex) { s.state().keyed_mutexes.remove_at(i); break; }
+  return kStatusAccessViolation;
 }
 
 // --- Fences ------------------------------------------------------------------------------------------------------------------------------------------------
@@ -333,6 +401,7 @@ void register_shares() {
   add<open_sync_object_from_nt_handle2>(N::NtGdiDdDDIOpenSyncObjectFromNtHandle2);
   add<open_nt_handle_from_name>(N::NtGdiDdDDIOpenNtHandleFromName);
   add<open_sync_object_nt_handle_from_name>(N::NtGdiDdDDIOpenSyncObjectNtHandleFromName);
+  add<open_keyed_mutex_from_nt_handle>(N::NtGdiDdDDIOpenKeyedMutexFromNtHandle);
 }
 
 }  // namespace process::win32k::dxg

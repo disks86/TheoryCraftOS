@@ -140,6 +140,28 @@ struct ResourceRecord {
   List<UniquePointer<ByteBuffer>> allocation_data;   // per allocation, in the order of `allocations`
 };
 
+// A keyed mutex (D3DKMTCreateKeyedMutex*, DxgKeyedMutex.cpp): the object every handle of it - in any process, opened by its global share handle or with a resource's NT
+// handle - refers to. Acquire succeeds when it is free and its key is the one asked for; Release frees it with the key the next Acquire may have. Guarded by `lock`.
+struct KeyedMutexState {
+  explicit KeyedMutexState(allocators::IAllocator& a) : runtime_data(a), release_data(a) {}
+  kernel::Mutex lock;
+  uint64_t key = 0;                 // what the next Acquire may have
+  bool held = false;
+  uint64_t owner_pid = 0;           // who holds it: a process and its handle
+  uint32_t owner_handle = 0;
+  bool abandoned = false;           // its holder went (exited, or destroyed its handle) while holding it
+  uint64_t fence_value = 0;         // the last Release's, which the next Acquire returns
+  ByteBuffer runtime_data;          // the creator's private runtime data (what an opener gets back)
+  ByteBuffer release_data;          // the last ReleaseKeyedMutex2's, which the next AcquireKeyedMutex2 returns
+  bool nt_shareable = false;        // made with NtSecuritySharing: D3DKMTShareObjects takes it with its resource
+};
+struct KeyedMutexRecord {
+  dxgk::Handle handle = 0;
+  SharedPointer<KeyedMutexState> state;
+  uint32_t global = 0;              // the global share handle it was made with (0: none, or opened)
+};
+constexpr uint32_t kKeyedMutexHandleBase = 0xD0000000u;      // the layer's keyed mutex handles: this in the top four bits, a number below
+
 // An adapter handle of the process and the adapter's number (the handle may be closed while devices made from it live on).
 struct AdapterRecord {
   dxgk::Handle handle = 0;
@@ -155,7 +177,8 @@ struct DeviceRecord {
 class ProcessState {
  public:
   ProcessState(allocators::IAllocator& allocator, uint64_t pid, dxgk::Kernel* kernel)
-      : adapters(allocator), allocations(allocator), locks(allocator), contexts(allocator), resources(allocator), devices(allocator), syncs(allocator), pid_(pid), kernel_(kernel), allocator_(allocator) {}
+      : adapters(allocator), allocations(allocator), locks(allocator), contexts(allocator), resources(allocator), devices(allocator), syncs(allocator), keyed_mutexes(allocator), pid_(pid),
+        kernel_(kernel), allocator_(allocator) {}
   uint64_t pid() const { return pid_; }
   dxgk::Kernel* kernel() const { return kernel_; }
   allocators::IAllocator& allocator() { return allocator_; }
@@ -168,7 +191,9 @@ class ProcessState {
   List<UniquePointer<ResourceRecord>> resources;
   List<DeviceRecord> devices;
   List<SyncRecord> syncs;
+  List<KeyedMutexRecord> keyed_mutexes;
   uint32_t next_resource = 1;
+  uint32_t next_keyed_mutex = 1;
 
   AdapterRecord* find_adapter(dxgk::Handle handle);
   AllocationRecord* find_allocation(dxgk::Handle handle);
@@ -254,6 +279,17 @@ void register_sync();
 void register_work();
 void register_unsupported();
 void register_shares();
+void register_keyed_mutexes();
+// Keyed mutexes (DxgKeyedMutex.cpp). A new handle of the caller's for the mutex (its record noted): 0 when there is no room. With the process lock held.
+dxgk::Handle add_keyed_mutex(ProcessState& ps, SharedPointer<KeyedMutexState> state);
+// The mutex of a handle of the process's (empty if it is none). With the process lock held.
+SharedPointer<KeyedMutexState> keyed_mutex_of(ProcessState& ps, dxgk::Handle handle);
+// The global share handles of keyed mutexes (in the registry, with the global shares' numbers): made for the creator, found by an opener, gone with the creator's handle.
+uint32_t add_global_keyed_mutex(uint64_t pid, SharedPointer<KeyedMutexState> state);
+SharedPointer<KeyedMutexState> find_global_keyed_mutex(uint32_t id);
+void remove_global_keyed_mutex(uint32_t id);
+// A process goes: what it holds is abandoned, its global share handles go.
+void keyed_mutexes_process_exited(ProcessState& ps, uint64_t pid);
 
 // The D3DKMT thunks all take one pointer: this wraps a function of (Session, Call, address) in a handler that answers STATUS_NO_SUCH_DEVICE without a kernel.
 using ThunkFn = uint32_t (*)(Session&, Call&, uint64_t arg0);

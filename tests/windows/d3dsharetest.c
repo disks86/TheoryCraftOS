@@ -484,10 +484,152 @@ static void test_kmt_direct(D12 *a) {
   ID3D12Fence_Release(fence);
 }
 
+/* ---- keyed mutexes -------------------------------------------------------------------------------------------------------------------------------------------------- */
+
+/* A texture of `color` made SHARED_KEYEDMUTEX | SHARED_NTHANDLE on `dev` (a render target, cleared), its mutex held by nobody with key 0. */
+static ID3D11Texture2D *km_texture(ID3D11Device *dev, ID3D11DeviceContext *ctx, const float color[4]) {
+  D3D11_TEXTURE2D_DESC td = {4, 4, 1, 1, DXGI_FORMAT_R8G8B8A8_UNORM, {1, 0}, D3D11_USAGE_DEFAULT, D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET, 0,
+                             D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX | D3D11_RESOURCE_MISC_SHARED_NTHANDLE};
+  ID3D11Texture2D *tex = NULL;
+  CHECK_HR(ID3D11Device_CreateTexture2D(dev, &td, NULL, &tex));
+  if (!tex) return NULL;
+  ID3D11RenderTargetView *rtv = NULL;
+  CHECK_HR(ID3D11Device_CreateRenderTargetView(dev, (ID3D11Resource *)tex, NULL, &rtv));
+  if (rtv) {
+    ID3D11DeviceContext_ClearRenderTargetView(ctx, rtv, color);
+    ID3D11RenderTargetView_Release(rtv);
+  }
+  ID3D11DeviceContext_Flush(ctx);
+  return tex;
+}
+/* The first texel of `tex`, read on `dev` through a staging texture. */
+static UINT texel_of(ID3D11Device *dev, ID3D11DeviceContext *ctx, ID3D11Texture2D *tex) {
+  D3D11_TEXTURE2D_DESC sd = {4, 4, 1, 1, DXGI_FORMAT_R8G8B8A8_UNORM, {1, 0}, D3D11_USAGE_STAGING, 0, D3D11_CPU_ACCESS_READ, 0};
+  ID3D11Texture2D *staging = NULL;
+  UINT texel = 0xDEADDEAD;
+  if (FAILED(ID3D11Device_CreateTexture2D(dev, &sd, NULL, &staging)) || !staging) return texel;
+  ID3D11DeviceContext_CopyResource(ctx, (ID3D11Resource *)staging, (ID3D11Resource *)tex);
+  D3D11_MAPPED_SUBRESOURCE m;
+  if (SUCCEEDED(ID3D11DeviceContext_Map(ctx, (ID3D11Resource *)staging, 0, D3D11_MAP_READ, 0, &m))) {
+    texel = *(const UINT *)m.pData;
+    ID3D11DeviceContext_Unmap(ctx, (ID3D11Resource *)staging, 0);
+  }
+  ID3D11Texture2D_Release(staging);
+  return texel;
+}
+static IDXGIKeyedMutex *mutex_of(void *texture) {
+  IDXGIKeyedMutex *m = NULL;
+  CHECK_HR(IUnknown_QueryInterface((IUnknown *)texture, &IID_IDXGIKeyedMutex, (void **)&m));
+  return m;
+}
+
+typedef struct { IDXGIKeyedMutex *mutex; UINT64 key; HRESULT result; } Waiter;
+static DWORD WINAPI wait_for_key(void *p) {
+  Waiter *w = p;
+  w->result = IDXGIKeyedMutex_AcquireSync(w->mutex, w->key, INFINITE);
+  return 0;
+}
+
+static void test_keyed_mutex(void) {
+  ID3D11Device *x = NULL, *y = NULL;
+  ID3D11DeviceContext *cx = NULL, *cy = NULL;
+  CHECK_HR(D3D11CreateDevice(NULL, D3D_DRIVER_TYPE_HARDWARE, NULL, 0, NULL, 0, D3D11_SDK_VERSION, &x, NULL, &cx));
+  CHECK_HR(D3D11CreateDevice(NULL, D3D_DRIVER_TYPE_HARDWARE, NULL, 0, NULL, 0, D3D11_SDK_VERSION, &y, NULL, &cy));
+  if (!x || !y) return;
+  const float red[4] = {1, 0, 0, 1}, blue[4] = {0, 0, 1, 1};
+  ID3D11Texture2D *tex = km_texture(x, cx, red);
+  if (!tex) return;
+  /* (a texture made without SHARED_KEYEDMUTEX has no mutex) */
+  D3D11_TEXTURE2D_DESC pd = {4, 4, 1, 1, DXGI_FORMAT_R8G8B8A8_UNORM, {1, 0}, D3D11_USAGE_DEFAULT, D3D11_BIND_SHADER_RESOURCE, 0, D3D11_RESOURCE_MISC_SHARED | D3D11_RESOURCE_MISC_SHARED_NTHANDLE};
+  ID3D11Texture2D *plain = NULL;
+  IDXGIKeyedMutex *none = NULL;
+  CHECK_HR(ID3D11Device_CreateTexture2D(x, &pd, NULL, &plain));
+  if (plain) { CHECK(ID3D11Texture2D_QueryInterface(plain, &IID_IDXGIKeyedMutex, (void **)&none) == E_NOINTERFACE && !none); ID3D11Texture2D_Release(plain); }
+
+  IDXGIKeyedMutex *mx = mutex_of(tex), *my = NULL;
+  IDXGIResource1 *dres = NULL;
+  HANDLE handle = NULL;
+  CHECK_HR(ID3D11Texture2D_QueryInterface(tex, &IID_IDXGIResource1, (void **)&dres));
+  if (dres) { CHECK_HR(IDXGIResource1_CreateSharedHandle(dres, NULL, DXGI_SHARED_RESOURCE_READ | DXGI_SHARED_RESOURCE_WRITE, NULL, &handle)); IDXGIResource1_Release(dres); }
+  ID3D11Device1 *y1 = NULL;
+  ID3D11Texture2D *opened = NULL;
+  CHECK_HR(ID3D11Device_QueryInterface(y, &IID_ID3D11Device1, (void **)&y1));
+  if (y1 && handle) CHECK_HR(ID3D11Device1_OpenSharedResource1(y1, handle, &IID_ID3D11Texture2D, (void **)&opened));
+  if (opened) my = mutex_of(opened);
+  if (!mx || !my) return;
+
+  /* The key says who has it: 0 first, then whatever each release names. */
+  CHECK(IDXGIKeyedMutex_AcquireSync(mx, 0, 0) == S_OK);
+  CHECK(IDXGIKeyedMutex_AcquireSync(my, 0, 0) == WAIT_TIMEOUT);
+  CHECK(IDXGIKeyedMutex_AcquireSync(mx, 0, 0) == DXGI_ERROR_INVALID_CALL);      /* (held by it already) */
+  CHECK(IDXGIKeyedMutex_ReleaseSync(my, 1) == DXGI_ERROR_INVALID_CALL);         /* (not its holder) */
+  CHECK(IDXGIKeyedMutex_ReleaseSync(mx, 1) == S_OK);
+  CHECK(IDXGIKeyedMutex_AcquireSync(mx, 0, 20) == WAIT_TIMEOUT);                /* (free, but for key 1) */
+  CHECK(IDXGIKeyedMutex_AcquireSync(my, 1, 1000) == S_OK);
+  CHECK(texel_of(y, cy, opened) == 0xFF0000FFu);      /* (what the first device drew before its release: red) */
+  /* the second device draws, and gives it back with key 2 */
+  ID3D11RenderTargetView *rtv = NULL;
+  CHECK_HR(ID3D11Device_CreateRenderTargetView(y, (ID3D11Resource *)opened, NULL, &rtv));
+  if (rtv) { ID3D11DeviceContext_ClearRenderTargetView(cy, rtv, blue); ID3D11RenderTargetView_Release(rtv); }
+  CHECK(IDXGIKeyedMutex_ReleaseSync(my, 2) == S_OK);
+  CHECK(IDXGIKeyedMutex_AcquireSync(mx, 2, INFINITE) == S_OK);
+  CHECK(texel_of(x, cx, tex) == 0xFFFF0000u);         /* (blue, which the release sent before it let go) */
+
+  /* A waiter on another thread goes on when the holder releases with its key. */
+  Waiter w = {my, 5, E_FAIL};
+  HANDLE thread = CreateThread(NULL, 0, wait_for_key, &w, 0, NULL);
+  CHECK(thread != NULL);
+  if (thread) {
+    CHECK(WaitForSingleObject(thread, 100) == WAIT_TIMEOUT);      /* (still waiting) */
+    CHECK(IDXGIKeyedMutex_ReleaseSync(mx, 5) == S_OK);
+    CHECK(WaitForSingleObject(thread, 10000) == WAIT_OBJECT_0);
+    CHECK(w.result == S_OK);
+    CloseHandle(thread);
+  }
+  /* The holder lets its texture go without releasing: the mutex is abandoned. */
+  IDXGIKeyedMutex_Release(my);
+  ID3D11Texture2D_Release(opened);
+  CHECK(IDXGIKeyedMutex_AcquireSync(mx, 5, 0) == WAIT_ABANDONED);
+  IDXGIKeyedMutex_Release(mx);
+  if (handle) CloseHandle(handle);
+  if (y1) ID3D11Device1_Release(y1);
+  ID3D11Texture2D_Release(tex);
+  ID3D11DeviceContext_Release(cx);
+  ID3D11DeviceContext_Release(cy);
+  ID3D11Device_Release(x);
+  ID3D11Device_Release(y);
+}
+
 /* ---- two processes ------------------------------------------------------------------------------------------------------------------------------------------------ */
 /* The parent shares a buffer and a fence, starts this program again with the two handles inherited, and waits for the fence: the child checks the buffer holds the
- * parent's words, writes its own after them and signals the fence with 2; the parent then reads the child's words. */
-static int child(HANDLE buffer_handle, HANDLE fence_handle) {
+ * parent's words, writes its own after them and signals the fence with 2; the parent then reads the child's words. A texture with a keyed mutex goes along: the
+ * parent draws it red and releases it with key 1, the child acquires it with 1, sees red, draws it green and releases it with 2, which the parent then acquires. */
+static void child_keyed(HANDLE texture_handle) {
+  ID3D11Device *dev = NULL;
+  ID3D11DeviceContext *ctx = NULL;
+  ID3D11Device1 *dev1 = NULL;
+  ID3D11Texture2D *tex = NULL;
+  CHECK_HR(D3D11CreateDevice(NULL, D3D_DRIVER_TYPE_HARDWARE, NULL, 0, NULL, 0, D3D11_SDK_VERSION, &dev, NULL, &ctx));
+  if (!dev) return;
+  CHECK_HR(ID3D11Device_QueryInterface(dev, &IID_ID3D11Device1, (void **)&dev1));
+  if (dev1) CHECK_HR(ID3D11Device1_OpenSharedResource1(dev1, texture_handle, &IID_ID3D11Texture2D, (void **)&tex));
+  IDXGIKeyedMutex *m = tex ? mutex_of(tex) : NULL;
+  if (m) {
+    CHECK(IDXGIKeyedMutex_AcquireSync(m, 1, 60000) == S_OK);
+    CHECK(texel_of(dev, ctx, tex) == 0xFF0000FFu);
+    const float green[4] = {0, 1, 0, 1};
+    ID3D11RenderTargetView *rtv = NULL;
+    CHECK_HR(ID3D11Device_CreateRenderTargetView(dev, (ID3D11Resource *)tex, NULL, &rtv));
+    if (rtv) { ID3D11DeviceContext_ClearRenderTargetView(ctx, rtv, green); ID3D11RenderTargetView_Release(rtv); }
+    CHECK(IDXGIKeyedMutex_ReleaseSync(m, 2) == S_OK);
+    IDXGIKeyedMutex_Release(m);
+  }
+  if (tex) ID3D11Texture2D_Release(tex);
+  if (dev1) ID3D11Device1_Release(dev1);
+  ID3D11DeviceContext_Release(ctx);
+  ID3D11Device_Release(dev);
+}
+static int child(HANDLE buffer_handle, HANDLE fence_handle, HANDLE texture_handle) {
   D12 c;
   if (!d12_make(&c)) { printf("child: no device\n"); return 1; }
   ID3D12Resource *shared = NULL;
@@ -506,6 +648,7 @@ static int child(HANDLE buffer_handle, HANDLE fence_handle) {
   if (shared) ID3D12Resource_Release(shared);
   if (fence) ID3D12Fence_Release(fence);
   d12_free(&c);
+  if (texture_handle) child_keyed(texture_handle);
   printf("d3dsharetest child: %d checks, %d failed\n", checks, failed);
   return failed ? 1 : 0;
 }
@@ -523,9 +666,26 @@ static void test_processes(D12 *a) {
   HANDLE hb = NULL, hf = NULL;
   CHECK_HR(ID3D12Device_CreateSharedHandle(a->dev, (ID3D12DeviceChild *)shared, &inherit, GENERIC_ALL, NULL, &hb));
   CHECK_HR(ID3D12Device_CreateSharedHandle(a->dev, (ID3D12DeviceChild *)fence, &inherit, GENERIC_ALL, NULL, &hf));
-  WCHAR self[MAX_PATH], line[MAX_PATH + 64];
+  /* (the texture with a keyed mutex: drawn red, released with key 1 for the child) */
+  ID3D11Device *x = NULL;
+  ID3D11DeviceContext *cx = NULL;
+  ID3D11Texture2D *tex = NULL;
+  IDXGIKeyedMutex *km = NULL;
+  HANDLE ht = NULL;
+  CHECK_HR(D3D11CreateDevice(NULL, D3D_DRIVER_TYPE_HARDWARE, NULL, 0, NULL, 0, D3D11_SDK_VERSION, &x, NULL, &cx));
+  if (x) {
+    const float red[4] = {1, 0, 0, 1};
+    tex = km_texture(x, cx, red);
+    if (tex) km = mutex_of(tex);
+    IDXGIResource1 *dres = NULL;
+    if (tex) CHECK_HR(ID3D11Texture2D_QueryInterface(tex, &IID_IDXGIResource1, (void **)&dres));
+    if (dres) { CHECK_HR(IDXGIResource1_CreateSharedHandle(dres, &inherit, DXGI_SHARED_RESOURCE_READ | DXGI_SHARED_RESOURCE_WRITE, NULL, &ht)); IDXGIResource1_Release(dres); }
+    if (km) { CHECK(IDXGIKeyedMutex_AcquireSync(km, 0, 0) == S_OK); CHECK(IDXGIKeyedMutex_ReleaseSync(km, 1) == S_OK); }
+  }
+  WCHAR self[MAX_PATH], line[MAX_PATH + 96];
   GetModuleFileNameW(NULL, self, MAX_PATH);
-  swprintf(line, sizeof line / sizeof line[0], L"\"%ls\" child %llu %llu", self, (unsigned long long)(UINT_PTR)hb, (unsigned long long)(UINT_PTR)hf);
+  swprintf(line, sizeof line / sizeof line[0], L"\"%ls\" child %llu %llu %llu", self, (unsigned long long)(UINT_PTR)hb, (unsigned long long)(UINT_PTR)hf,
+           (unsigned long long)(UINT_PTR)ht);
   STARTUPINFOW si;
   PROCESS_INFORMATION pi;
   memset(&si, 0, sizeof si);
@@ -544,17 +704,28 @@ static void test_processes(D12 *a) {
     printf("child exit code %lu\n", (unsigned long)code);
     CHECK(code == 0);
     CHECK(d12_holds(a, shared, sizeof mine, theirs, sizeof theirs));      /* (what the child wrote) */
+    if (km) {
+      CHECK(IDXGIKeyedMutex_AcquireSync(km, 2, 60000) == S_OK);      /* (the child's release) */
+      CHECK(texel_of(x, cx, tex) == 0xFF00FF00u);                    /* (green: what it drew) */
+      CHECK(IDXGIKeyedMutex_ReleaseSync(km, 0) == S_OK);
+    }
     CloseHandle(pi.hProcess);
     CloseHandle(pi.hThread);
   }
   CloseHandle(hb);
   CloseHandle(hf);
+  if (ht) CloseHandle(ht);
+  if (km) IDXGIKeyedMutex_Release(km);
+  if (tex) ID3D11Texture2D_Release(tex);
+  if (cx) ID3D11DeviceContext_Release(cx);
+  if (x) ID3D11Device_Release(x);
   ID3D12Resource_Release(shared);
   ID3D12Fence_Release(fence);
 }
 
 int main(int argc, char **argv) {
-  if (argc == 4 && strcmp(argv[1], "child") == 0) return child((HANDLE)(UINT_PTR)_strtoui64(argv[2], NULL, 10), (HANDLE)(UINT_PTR)_strtoui64(argv[3], NULL, 10));
+  if (argc == 5 && strcmp(argv[1], "child") == 0)
+    return child((HANDLE)(UINT_PTR)_strtoui64(argv[2], NULL, 10), (HANDLE)(UINT_PTR)_strtoui64(argv[3], NULL, 10), (HANDLE)(UINT_PTR)_strtoui64(argv[4], NULL, 10));
   const int processes = argc > 1 && strcmp(argv[1], "processes") == 0;
   D12 a, b;
   if (!d12_make(&a) || !d12_make(&b)) {
@@ -567,6 +738,7 @@ int main(int argc, char **argv) {
   test_fences(&a, &b);
   test_d3d11(&a);
   test_kmt_direct(&a);
+  test_keyed_mutex();
   if (processes) test_processes(&a);
   d12_free(&a);
   d12_free(&b);

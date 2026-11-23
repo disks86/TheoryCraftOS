@@ -161,6 +161,8 @@ struct Tex {
   D3D11_MAP *mapped;           /* by subresource: how it is mapped now (0: not) */
   IDXGIResource1 dxgi_res;     /* the same object, for DXGI (dxgi_resource.inc) */
   IDXGISurface2 dxgi_surf;
+  IDXGIKeyedMutex dxgi_mutex;  /* ... and its keyed mutex (a texture made D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX, or opened with one: `keyed_mutex`) */
+  UINT keyed_mutex;            /* the D3DKMT keyed mutex (0: none) */
 };
 
 /* A render target, depth-stencil, shader resource or unordered access view: the texture (or buffer), and the descriptor of the first two. A view of a buffer names
@@ -822,6 +824,7 @@ static void tex_destroy(DxObj *o) {
   mem_free(t->shadow);
   mem_free(t->mapped);
   if (t->res) ID3D12Resource_Release(t->res);
+  if (t->keyed_mutex) kmt_destroy_keyed_mutex(t->keyed_mutex);      /* (held: abandoned, as Windows has it) */
   child_destroy(o);
 }
 static void STDMETHODCALLTYPE tex_GetType(Tex *t, D3D11_RESOURCE_DIMENSION *type) { (void)t; if (type) *type = D3D11_RESOURCE_DIMENSION_TEXTURE2D; }
@@ -976,6 +979,11 @@ static HRESULT tex_make(Dev *d, const D3D11_TEXTURE2D_DESC *in, UINT slices, ID3
     const HRESULT hr = ID3D12Device_CreateCommittedResource(d->d12, &props, nt_shared ? D3D12_HEAP_FLAG_SHARED : D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_COMMON, NULL,
                                                             &IID_ID3D12Resource, (void **)&t->res);
     if (FAILED(hr) || !t->res) { tex_refused(&desc, "Direct3D 12 below refused it"); dx_Release(OBJ(t)); return FAILED(hr) ? hr : E_FAIL; }
+    /* (a keyed mutex that orders its use between devices: free, with key 0, as DXGI makes one; shared with the texture's NT handle) */
+    if (desc.MiscFlags & D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX) {
+      const NTSTATUS st = kmt_create_keyed_mutex(0, &t->keyed_mutex);
+      if (!KMT_OK(st)) { dx_Release(OBJ(t)); return E_OUTOFMEMORY; }
+    }
   }
   *out = t;
   return S_OK;

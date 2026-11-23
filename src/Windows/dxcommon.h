@@ -186,6 +186,16 @@ __declspec(dllimport) NTSTATUS __cdecl NtGdiDdDDIOpenNtHandleFromName(void *);
 #define D3DKMTOpenNtHandleFromName NtGdiDdDDIOpenNtHandleFromName
 __declspec(dllimport) NTSTATUS __cdecl NtGdiDdDDIOpenSyncObjectNtHandleFromName(void *);
 #define D3DKMTOpenSyncObjectNtHandleFromName NtGdiDdDDIOpenSyncObjectNtHandleFromName
+__declspec(dllimport) NTSTATUS __cdecl NtGdiDdDDICreateKeyedMutex2(void *);
+#define D3DKMTCreateKeyedMutex2 NtGdiDdDDICreateKeyedMutex2
+__declspec(dllimport) NTSTATUS __cdecl NtGdiDdDDIDestroyKeyedMutex(void *);
+#define D3DKMTDestroyKeyedMutex NtGdiDdDDIDestroyKeyedMutex
+__declspec(dllimport) NTSTATUS __cdecl NtGdiDdDDIAcquireKeyedMutex(void *);
+#define D3DKMTAcquireKeyedMutex NtGdiDdDDIAcquireKeyedMutex
+__declspec(dllimport) NTSTATUS __cdecl NtGdiDdDDIReleaseKeyedMutex(void *);
+#define D3DKMTReleaseKeyedMutex NtGdiDdDDIReleaseKeyedMutex
+__declspec(dllimport) NTSTATUS __cdecl NtGdiDdDDIOpenKeyedMutexFromNtHandle(void *);
+#define D3DKMTOpenKeyedMutexFromNtHandle NtGdiDdDDIOpenKeyedMutexFromNtHandle
 #else
 NTSTATUS WINAPI D3DKMTEnumAdapters2(void *);
 NTSTATUS WINAPI D3DKMTOpenAdapterFromLuid(void *);
@@ -215,6 +225,11 @@ NTSTATUS WINAPI D3DKMTOpenResourceFromNtHandle(void *);
 NTSTATUS WINAPI D3DKMTOpenSyncObjectFromNtHandle2(void *);
 NTSTATUS WINAPI D3DKMTOpenNtHandleFromName(void *);
 NTSTATUS WINAPI D3DKMTOpenSyncObjectNtHandleFromName(void *);
+NTSTATUS WINAPI D3DKMTCreateKeyedMutex2(void *);
+NTSTATUS WINAPI D3DKMTDestroyKeyedMutex(void *);
+NTSTATUS WINAPI D3DKMTAcquireKeyedMutex(void *);
+NTSTATUS WINAPI D3DKMTReleaseKeyedMutex(void *);
+NTSTATUS WINAPI D3DKMTOpenKeyedMutexFromNtHandle(void *);
 #endif
 
 #pragma GCC diagnostic ignored "-Wunused-function"
@@ -499,11 +514,57 @@ static void *kmt_attributes(KmtAttributes *a, const WCHAR *name, BOOL inherit, c
   KPUT64(a->attributes, 16, (UINT_PTR)a->string);
   return a->attributes;
 }
-/* An NT handle (*nt, a HANDLE's value) for a resource handle (the win32k resource of an allocation made with NtSecuritySharing) or a shared fence. */
+/* An NT handle (*nt, a HANDLE's value) for a resource handle (the win32k resource of an allocation made with NtSecuritySharing) or a shared fence - or, as a list, a
+ * resource with its keyed mutex (and a fence). */
+static NTSTATUS kmt_share_list(const UINT *objects, UINT count, void *attributes, DWORD access, UINT64 *nt) {
+  *nt = 0;
+  return D3DKMTShareObjects(count, objects, attributes, access, nt);
+}
 static NTSTATUS kmt_share_objects(UINT object, void *attributes, DWORD access, UINT64 *nt) {
   UINT list[1] = {object};
-  *nt = 0;
-  return D3DKMTShareObjects(1, list, attributes, access, nt);
+  return kmt_share_list(list, 1, attributes, access, nt);
+}
+
+/* ---- keyed mutexes (src/Process/Win32k/Dxg/DxgKeyedMutex.cpp) ---- */
+/* A keyed mutex whose first key is `initial`, shared through its resource's NT handle (NtSecuritySharing). */
+static NTSTATUS kmt_create_keyed_mutex(UINT64 initial, UINT *mutex) {
+  BYTE block[32] __attribute__((aligned(16))) = {0};
+  KPUT64(block, 0, initial);
+  KPUT32(block, 28, 1);      /* NtSecuritySharing */
+  const NTSTATUS st = D3DKMTCreateKeyedMutex2(block);
+  *mutex = KMT_OK(st) ? KGET32(block, 12) : 0;
+  return st;
+}
+static void kmt_destroy_keyed_mutex(UINT mutex) {
+  BYTE block[8] __attribute__((aligned(8))) = {0};
+  KPUT32(block, 0, mutex);
+  D3DKMTDestroyKeyedMutex(block);
+}
+/* Waits up to `ms` milliseconds (INFINITE: forever) for the mutex with `key`: STATUS_SUCCESS, STATUS_TIMEOUT (0x102), STATUS_ABANDONED (0x80) or a failure. */
+static NTSTATUS kmt_acquire_keyed_mutex(UINT mutex, UINT64 key, DWORD ms) {
+  BYTE block[32] __attribute__((aligned(16))) = {0};
+  INT64 timeout = -(INT64)ms * 10000;
+  KPUT32(block, 0, mutex);
+  KPUT64(block, 8, key);
+  KPUT64(block, 16, ms == INFINITE ? 0 : (UINT_PTR)&timeout);
+  return D3DKMTAcquireKeyedMutex(block);
+}
+static NTSTATUS kmt_release_keyed_mutex(UINT mutex, UINT64 key) {
+  BYTE block[24] __attribute__((aligned(16))) = {0};
+  KPUT32(block, 0, mutex);
+  KPUT64(block, 8, key);
+  return D3DKMTReleaseKeyedMutex(block);
+}
+/* The keyed mutex shared with a resource's NT handle (STATUS_INVALID_PARAMETER: it was shared without one). */
+static NTSTATUS kmt_open_keyed_mutex_nt(UINT64 nt, UINT *mutex) {
+  BYTE block[32] __attribute__((aligned(16))) = {0};
+  BYTE data[256];
+  KPUT64(block, 0, nt);
+  KPUT64(block, 16, (UINT_PTR)data);
+  KPUT32(block, 24, sizeof data);
+  const NTSTATUS st = D3DKMTOpenKeyedMutexFromNtHandle(block);
+  *mutex = KMT_OK(st) ? KGET32(block, 8) : 0;
+  return st;
 }
 /* What a shared resource's NT handle holds: its runtime data (up to `capacity` bytes into `runtime`), the bytes of its driver data, the number of allocations. */
 static NTSTATUS kmt_query_resource_nt(UINT device, UINT64 nt, void *runtime, UINT capacity, UINT *runtime_size, UINT *total_driver, UINT *resource_driver, UINT *allocations) {
@@ -520,6 +581,7 @@ static NTSTATUS kmt_query_resource_nt(UINT device, UINT64 nt, void *runtime, UIN
   return st;
 }
 /* Opens a shared resource of one allocation: its allocation and resource handles on `device`; its private data goes to `driver` (the allocation's) and `resource_driver`. */
+static void kmt_destroy_sync(UINT sync);
 static NTSTATUS kmt_open_resource_nt(UINT device, UINT64 nt, void *runtime, UINT runtime_size, void *resource_driver, UINT resource_driver_size, void *driver, UINT driver_size,
                                      UINT *allocation, UINT *resource) {
   BYTE block[104] __attribute__((aligned(16))) = {0};
@@ -534,10 +596,16 @@ static NTSTATUS kmt_open_resource_nt(UINT device, UINT64 nt, void *runtime, UINT
   KPUT64(block, 56, (UINT_PTR)resource_driver);
   KPUT32(block, 64, driver_size);
   KPUT64(block, 72, (UINT_PTR)driver);
+  BYTE mutex_data[256];      /* (a keyed mutex's data, when one was shared with it) */
+  KPUT64(block, 88, (UINT_PTR)mutex_data);
+  KPUT32(block, 96, sizeof mutex_data);
   const NTSTATUS st = D3DKMTOpenResourceFromNtHandle(block);
   if (KMT_OK(st)) {
     *allocation = KGET32(info, 0);
     *resource = KGET32(block, 80);
+    /* (the keyed mutex and fence shared with it come with it: the runtime above opens the mutex itself - kmt_open_keyed_mutex_nt - so these go) */
+    if (KGET32(block, 84)) kmt_destroy_keyed_mutex(KGET32(block, 84));
+    if (KGET32(block, 100)) kmt_destroy_sync(KGET32(block, 100));
   }
   return st;
 }

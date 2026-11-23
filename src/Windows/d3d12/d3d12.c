@@ -117,6 +117,13 @@ EXPORT UINT WINAPI TcosD3D12SharedExtra(ID3D12Resource *resource, void *out, UIN
   if (out) memcpy(out, r->share_extra, r->share_extra_size < capacity ? r->share_extra_size : capacity);
   return r->share_extra_size;
 }
+/* (src/Windows/tcosdx.h) The win32k resource of a resource made shared or opened from a shared handle (0: neither): what D3DKMTShareObjects shares, which d3d11.dll
+ * shares itself together with the texture's keyed mutex. */
+EXPORT UINT WINAPI TcosD3D12SharedResource(ID3D12Resource *resource) {
+  extern const ID3D12Resource2Vtbl res_vtbl;
+  Resource *r = (Resource *)resource;
+  return r && r->d.o.lpVtbl == (const void *)&res_vtbl ? r->kresource : 0;
+}
 EXPORT void WINAPI TcosD3D12BeginQueryKind(ID3D12GraphicsCommandList *list, ID3D12QueryHeap *heap, UINT index, UINT kind) {
   if (list) list_begin_query_kind((CmdList *)list, (QHeap *)heap, index, kind);
 }

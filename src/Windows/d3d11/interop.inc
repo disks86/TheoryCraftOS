@@ -127,7 +127,7 @@ static void tex_take_kind(Tex *t, UINT kind, UINT depth) {
     t->desc1 = d1;
   }
 }
-static HRESULT open_shared_texture(Dev *d, ID3D12Resource *res, REFIID riid, void **out) {
+static HRESULT open_shared_texture(Dev *d, ID3D12Resource *res, HANDLE handle, REFIID riid, void **out) {
   const D3D12_RESOURCE_DESC rd = ID3D12Resource_GetDesc(res);
   if (rd.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) return E_INVALIDARG;      /* (Direct3D 11 shares textures) */
   BYTE blob[TEX_SHARE_BYTES];
@@ -152,6 +152,11 @@ static HRESULT open_shared_texture(Dev *d, ID3D12Resource *res, REFIID riid, voi
   if (SUCCEEDED(hr)) tex_take_kind(t, kind, slices);
   LeaveCriticalSection(&d->lock);
   if (FAILED(hr)) return hr;
+  /* (the keyed mutex shared with it, when its description says it has one: the creator's mutex, through this handle) */
+  if (desc.MiscFlags & D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX) {
+    const NTSTATUS st = kmt_open_keyed_mutex_nt((UINT64)(UINT_PTR)handle, &t->keyed_mutex);
+    if (!KMT_OK(st)) { dx_Release(OBJ(t)); return (UINT)st == 0xC000000Du ? E_INVALIDARG : E_FAIL; }
+  }
   hr = IUnknown_QueryInterface((IUnknown *)t, riid, out);
   dx_Release(OBJ(t));
   return hr;
@@ -162,7 +167,7 @@ static HRESULT STDMETHODCALLTYPE dev_OpenSharedResource1(Dev *d, HANDLE handle, 
   ID3D12Resource *res = NULL;
   HRESULT hr = ID3D12Device_OpenSharedHandle(d->d12, handle, &IID_ID3D12Resource, (void **)&res);
   if (FAILED(hr) || !res) return hr == E_NOINTERFACE || SUCCEEDED(hr) ? E_INVALIDARG : hr;      /* (a fence's or a heap's handle: no resource) */
-  hr = open_shared_texture(d, res, riid, out);
+  hr = open_shared_texture(d, res, handle, riid, out);
   ID3D12Resource_Release(res);
   return hr;
 }

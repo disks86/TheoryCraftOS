@@ -112,6 +112,13 @@ what virgl takes and how `tests/d3d12_qemu.sh` checks it.
   the same memory; each allocation's data packed into the total buffer, the resource's into its own; hKeyedMutex / hSyncObject 0) and `OpenSyncObjectFromNtHandle` (the
   caller's first device) / `...2` (its device; the monitored-fence addresses 0) open them. A payload is let go after the object manager's lock (it takes dxgk's). Not waitable
   (STATUS_OBJECT_TYPE_MISMATCH). gdi32's i386 exports widen the structures, OBJECT_ATTRIBUTES and OPENALLOCATIONINFO2 arrays (`wow64.inc`).
+  `ShareObjects` also takes a resource with its keyed mutex (made with NtSecuritySharing), and with a fence after that; `OpenResourceFromNtHandle` then returns handles of
+  the caller's for both (hKeyedMutex with its private runtime data, hSyncObject on the device), and `OpenKeyedMutexFromNtHandle` opens the mutex alone.
+- Keyed mutexes (`DxgKeyedMutex.cpp`): CreateKeyedMutex(2), DestroyKeyedMutex, OpenKeyedMutex(2) (by the global share handle a mutex made without NtSecuritySharing
+  has, while its creator's handle lives), Acquire/ReleaseKeyedMutex(2). One `KeyedMutexState` (system memory) behind every handle of a mutex, in any process. Acquire
+  waits (polling, the process lock let go) until it is free with the key asked for, or the timeout (STATUS_TIMEOUT); held by the same handle: STATUS_INVALID_DEVICE_STATE;
+  Release by any other handle: STATUS_INVALID_DEVICE_STATE. Release's key, fence value and (Release2) private data go to the next Acquire. A holder that exits or destroys
+  its handle abandons the mutex: every later Acquire answers STATUS_ABANDONED.
 
 ## Answer STATUS_NOT_SUPPORTED (72)
 
@@ -120,8 +127,7 @@ paging queues, GPU virtual addresses, SubmitCommand, doorbells, tracked workload
 
 ## Left unregistered (STATUS_NOT_IMPLEMENTED)
 
-OpenAdapterFromHdc (needs HDC -> display from the GDI module), keyed mutexes (Create/OpenKeyedMutex*, Acquire/ReleaseKeyedMutex*), OpenSynchronizationObject (the
-global share handles of synchronization objects), MakeResident and CreatePagingQueue (the paging queue needs a fence address), QueryStatistics,
+OpenAdapterFromHdc (needs HDC -> display from the GDI module), OpenSynchronizationObject (the global share handles of synchronization objects), MakeResident and CreatePagingQueue (the paging queue needs a fence address), QueryStatistics,
 SignalSynchronizationObjectFromGpu2, services whose layout is not in the headers at hand (Get/SetProperties, IsFeatureEnabled, PinResources, ...), swap chain and DispMgr
 services, GetPresentHistory, allocation priorities, and the DirectDraw fullscreen-sprite / QueryVisRgnUniqueness services (this service list has no other legacy DDraw
 calls). Missing in `dxgk::Kernel`: a context priority setter, sync-object sharing, a way to map allocation memory into a process.

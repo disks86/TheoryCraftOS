@@ -1642,7 +1642,9 @@ void test_nt_handle_sharing() {
   const uint64_t nt_a = a.get64(kOut);
   CHECK(nt_a != 0);
   CHECK(a.call_args(WN::NtGdiDdDDIShareObjects, {1, kList, a.object_attributes(kAttr, "\\BaseNamedObjects\\TcosShared"), 0x10000000u, kOut}) == kNameCollision);
-  CHECK(a.call_args(WN::NtGdiDdDDIShareObjects, {2, kList, 0, 0x10000000u, kOut}) == kInvalidParameter);
+  CHECK(a.call_args(WN::NtGdiDdDDIShareObjects, {4, kList, 0, 0x10000000u, kOut}) == kInvalidParameter);      // (a resource, its keyed mutex and a fence at most)
+  a.put32(kList + 4, 0x4242);
+  CHECK(a.call_args(WN::NtGdiDdDDIShareObjects, {2, kList, 0, 0x10000000u, kOut}) == kInvalidHandle);      // (the second is no keyed mutex)
   CHECK(alloc_ok(a, dev_a, buffer_spec(dxgk::kAllocVertexBuffer, 16), 1) != 0);
   {
     // (a plain resource: CreateResource alone)
@@ -1792,6 +1794,200 @@ void test_nt_handle_sharing() {
   win32k::process_exited(400);
 }
 
+// --- Keyed mutexes -----------------------------------------------------------------------------------------------------------------------------------------------
+
+uint32_t km_acquire(Win& w, uint32_t mutex, uint64_t key, int64_t timeout_100ns, uint64_t* fence = nullptr, bool infinite = false, uint64_t at = kF + 0xA00) {
+  w.zero(at, 48 + 8);
+  w.put32(at, mutex);
+  w.put64(at + 8, key);
+  w.put64(at + 48, uint64_t(timeout_100ns));
+  w.put64(at + 16, infinite ? 0 : at + 48);
+  const uint32_t st = w.call(WN::NtGdiDdDDIAcquireKeyedMutex, at);
+  if (fence) *fence = w.get64(at + 24);
+  return st;
+}
+uint32_t km_release(Win& w, uint32_t mutex, uint64_t key, uint64_t fence = 0, uint64_t at = kF + 0xB00) {
+  w.zero(at, 24);
+  w.put32(at, mutex);
+  w.put64(at + 8, key);
+  w.put64(at + 16, fence);
+  return w.call(WN::NtGdiDdDDIReleaseKeyedMutex, at);
+}
+uint32_t km_destroy(Win& w, uint32_t mutex) {
+  w.zero(kF + 0xC00, 4);
+  w.put32(kF + 0xC00, mutex);
+  return w.call(WN::NtGdiDdDDIDestroyKeyedMutex, kF + 0xC00);
+}
+
+void test_keyed_mutexes() {
+  System sys;
+  Machine m;
+  Win a(m.allocator, 500), b(m.allocator, 600);
+  const uint32_t dev_a = create_device(a, enum_first_adapter(a)), dev_b = create_device(b, enum_first_adapter(b));
+  constexpr uint32_t kTimeout = 0x102u, kAbandoned = 0x80u, kInvalidDeviceState = 0xC0000184u;
+
+  // A keyed mutex with a global share handle; the other process opens it by that handle.
+  a.zero(kC, 16);
+  a.put64(kC, 5);
+  CHECK(a.call(WN::NtGdiDdDDICreateKeyedMutex, kC) == kOk);
+  const uint32_t global = a.get32(kC + 8), km_a = a.get32(kC + 12);
+  CHECK(global != 0 && km_a != 0);
+  b.zero(kC, 8);
+  b.put32(kC, global);
+  CHECK(b.call(WN::NtGdiDdDDIOpenKeyedMutex, kC) == kOk);
+  const uint32_t km_b = b.get32(kC + 4);
+  CHECK(km_b != 0);
+  b.put32(kC, global + 1000);
+  CHECK(b.call(WN::NtGdiDdDDIOpenKeyedMutex, kC) == kInvalidHandle);
+
+  // Who has it is told by the key: 5 first (its initial value), then what each release says.
+  CHECK(km_acquire(a, km_a, 4, 0) == kTimeout);             // (not its key)
+  CHECK(km_acquire(b, km_b, 5, 0) == kOk);
+  CHECK(km_acquire(a, km_a, 5, 0) == kTimeout);             // (held)
+  CHECK(km_acquire(b, km_b, 5, 0) == kInvalidDeviceState);  // (held by this handle already)
+  CHECK(km_release(a, km_a, 7) == kInvalidDeviceState);     // (not its holder)
+  CHECK(km_release(b, km_b, 7, 33) == kOk);
+  uint64_t fence = 0;
+  CHECK(km_acquire(a, km_a, 7, -10000, &fence) == kOk && fence == 33);      // (the releaser's fence value)
+  CHECK(km_release(a, km_a, 1) == kOk);
+  CHECK(km_release(a, km_a, 1) == kInvalidDeviceState);     // (released already)
+  CHECK(km_acquire(a, 0xD0000777u, 1, 0) == kInvalidHandle);
+
+  // Acquire2 / Release2 hand the releaser's private data to the next holder.
+  {
+    const uint64_t at = kF + 0xD00;
+    b.zero(at, 64 + 16);
+    b.put32(at, km_b);
+    b.put64(at + 8, 1);
+    b.put64(at + 48, 0);
+    b.put64(at + 16, at + 48);
+    b.put64(at + 32, at + 56);
+    b.put32(at + 40, 8);
+    CHECK(b.call(WN::NtGdiDdDDIAcquireKeyedMutex2, at) == kOk);
+    b.zero(at + 0x80, 40 + 8);
+    b.put32(at + 0x80, km_b);
+    b.put64(at + 0x88, 2);
+    b.put64(at + 0x90, 44);
+    b.put64(at + 0xA8, 0x0123456789ABCDEFull);
+    b.put64(at + 0x98, at + 0xA8);
+    b.put32(at + 0xA0, 8);
+    CHECK(b.call(WN::NtGdiDdDDIReleaseKeyedMutex2, at + 0x80) == kOk);
+    a.zero(at, 64 + 16);
+    a.put32(at, km_a);
+    a.put64(at + 8, 2);
+    a.put64(at + 16, 0);      // (no timeout: forever - it is free, with this key)
+    a.put64(at + 32, at + 56);
+    a.put32(at + 40, 8);
+    CHECK(a.call(WN::NtGdiDdDDIAcquireKeyedMutex2, at) == kOk && a.get64(at + 24) == 44 && a.get64(at + 56) == 0x0123456789ABCDEFull);
+  }
+
+  // A blocked Acquire goes on when the holder releases with its key (another thread of the other process waits).
+  {
+    std::atomic<uint32_t> got{0xFFFFFFFFu};
+    std::thread waiter([&] { got = km_acquire(b, km_b, 9, 0, nullptr, true, kF + 0xE00); });
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    CHECK(got.load() == 0xFFFFFFFFu);      // (still waiting)
+    CHECK(km_release(a, km_a, 9) == kOk);
+    waiter.join();
+    CHECK(got.load() == kOk);
+  }
+  // A holder that destroys its handle abandons the mutex.
+  CHECK(km_destroy(b, km_b) == kOk && km_destroy(b, km_b) == kInvalidHandle);
+  CHECK(km_acquire(a, km_a, 9, 0) == kAbandoned);
+  CHECK(km_destroy(a, km_a) == kOk);
+  b.put32(kC, global);
+  CHECK(b.call(WN::NtGdiDdDDIOpenKeyedMutex, kC) == kInvalidHandle);      // (the global handle went with its creator's handle)
+
+  // A keyed mutex shared with a resource through an NT handle, its runtime data with it; a holder whose process exits abandons it.
+  a.zero(kC, 32);
+  const char kmdata[] = "keyed-mutex-data";
+  a.put(kE + 0x600, ConstByteView(reinterpret_cast<const uint8_t*>(kmdata), sizeof kmdata));
+  a.put64(kC, 0);
+  a.put64(kC + 16, kE + 0x600);
+  a.put32(kC + 24, sizeof kmdata);
+  a.put32(kC + 28, 1);      // NtSecuritySharing
+  CHECK(a.call(WN::NtGdiDdDDICreateKeyedMutex2, kC) == kOk);
+  const uint32_t km = a.get32(kC + 12);
+  CHECK(km != 0 && a.get32(kC + 8) == 0);
+  a.zero(kC, 32);
+  a.put32(kC + 28, 0);
+  CHECK(a.call(WN::NtGdiDdDDICreateKeyedMutex2, kC) == kOk);
+  const uint32_t plain_km = a.get32(kC + 12);
+  CHECK(a.get32(kC + 8) != 0);      // (made with a global share handle)
+  a.put32(kC + 28, 2);
+  CHECK(a.call(WN::NtGdiDdDDICreateKeyedMutex2, kC) == kInvalidParameter);
+  uint32_t fence_h = 0;
+  CHECK(make_sync2(a, dev_a, 3, 3, 0, 0, &fence_h) == kOk);
+  a.zero(kC, lay::sizeof_create_allocation);
+  a.zero(kD, 64);
+  write_private(a, kE, buffer_spec(dxgk::kAllocVertexBuffer, 64));
+  a.put32(kC, dev_a);
+  a.put32(kC + 44, 1);
+  a.put64(kC + 48, kD);
+  a.put32(kC + 56, 1 | lay::kCaNtSecuritySharing);
+  a.put64(kD + 16, kE);
+  a.put32(kD + 24, lay::kAllocPrivateBytes);
+  CHECK(a.call(WN::NtGdiDdDDICreateAllocation, kC) == kOk);
+  const uint32_t resource = a.get32(kC + 4);
+  const uint64_t kList = kF + 0x810, kOut = kF + 0x800, kAttr = kF + 0x400;
+  a.put32(kList, resource);
+  a.put32(kList + 4, plain_km);
+  {
+    const uint32_t st = a.call_args(WN::NtGdiDdDDIShareObjects, {2, kList, 0, 0x10000000u, kOut});
+    if (st != kInvalidParameter) printf("share with a plain mutex: %08x (mutex %08x, resource %08x)\n", st, plain_km, resource);
+    CHECK(st == kInvalidParameter);      // (a mutex made without NtSecuritySharing)
+  }
+  a.put32(kList + 4, km);
+  a.put32(kList + 8, fence_h);
+  CHECK(a.call_args(WN::NtGdiDdDDIShareObjects, {3, kList, a.object_attributes(kAttr, "\\BaseNamedObjects\\TcosKeyed"), 0x10000000u, kOut}) == kOk);
+  const uint64_t nt_a = a.get64(kOut);
+  b.zero(kC, 24);
+  b.put32(kC, 0x10000000u);
+  b.put64(kC + 8, b.object_attributes(kAttr, "\\BaseNamedObjects\\TcosKeyed"));
+  CHECK(b.call(WN::NtGdiDdDDIOpenNtHandleFromName, kC) == kOk);
+  const uint64_t nt_b = b.get64(kC + 16);
+  b.zero(kC, 104);
+  b.zero(kD, 80);
+  b.put32(kC, dev_b);
+  b.put64(kC + 8, nt_b);
+  b.put32(kC + 16, 1);
+  b.put64(kC + 24, kD);
+  b.put32(kC + 64, 1024);
+  b.put64(kC + 72, kE + 0x200);
+  CHECK(b.call(WN::NtGdiDdDDIOpenResourceFromNtHandle, kC) == kBufferTooSmall);      // (no room for the mutex's data)
+  b.put64(kC + 88, kE + 0x700);
+  b.put32(kC + 96, 64);
+  CHECK(b.call(WN::NtGdiDdDDIOpenResourceFromNtHandle, kC) == kOk);
+  const uint32_t km_opened = b.get32(kC + 84), sync_opened = b.get32(kC + 100);
+  CHECK(km_opened != 0 && sync_opened != 0 && b.get32(kC + 96) == sizeof kmdata);
+  {
+    uint8_t got[sizeof kmdata] = {};
+    CHECK(b.space.read_privileged(kE + 0x700, ByteView(got, sizeof got)) && std::string(reinterpret_cast<char*>(got)) == kmdata);
+  }
+  b.zero(kC + 0x100, 32);
+  b.put64(kC + 0x100, nt_b);
+  b.put64(kC + 0x110, kE + 0x780);
+  b.put32(kC + 0x118, 64);
+  CHECK(b.call(WN::NtGdiDdDDIOpenKeyedMutexFromNtHandle, kC + 0x100) == kOk && b.get32(kC + 0x108) != 0 && b.get32(kC + 0x118) == sizeof kmdata);
+  // (both of the second process's handles are the creator's mutex)
+  CHECK(km_acquire(b, km_opened, 0, 0) == kOk);
+  CHECK(km_acquire(a, km, 0, 0) == kTimeout);
+  CHECK(km_acquire(b, b.get32(kC + 0x108), 0, 0) == kTimeout);
+  // (the fence shared with them is the creator's too)
+  CHECK(sync_cpu(a, WN::NtGdiDdDDISignalSynchronizationObjectFromCpu, dev_a, {fence_h}, {6}) == kOk);
+  CHECK(sync_cpu(b, WN::NtGdiDdDDIWaitForSynchronizationObjectFromCpu, dev_b, {sync_opened}, {6}) == kOk);
+  win32k::process_exited(600);
+  CHECK(km_acquire(a, km, 0, 0) == kAbandoned);
+  // (a resource shared without a mutex has none to open)
+  a.put32(kList, resource);
+  CHECK(a.call_args(WN::NtGdiDdDDIShareObjects, {1, kList, 0, 0x10000000u, kOut}) == kOk);
+  a.zero(kC + 0x100, 32);
+  a.put64(kC + 0x100, a.get64(kOut));
+  CHECK(a.call(WN::NtGdiDdDDIOpenKeyedMutexFromNtHandle, kC + 0x100) == kInvalidParameter);
+  CHECK(a.call(WN::NtClose, a.get64(kOut)) == kOk && a.call(WN::NtClose, nt_a) == kOk);
+  win32k::process_exited(500);
+}
+
 int main() {
   test_no_driver();
   test_adapters();
@@ -1799,6 +1995,7 @@ int main() {
   test_allocations();
   test_resources_and_sharing();
   test_nt_handle_sharing();
+  test_keyed_mutexes();
   test_render_and_present();
   test_synchronization();
   test_escape();
