@@ -12,6 +12,46 @@ The goal of this project is to produce a Computer Operating system with the foll
 - Support a wide range of x86, ARM, and RISC-V hardware.
 - Support Hardware accerlators and special instructions whenever possible.
 
+## Navigating the code with graphify
+
+The repository is large, so find code through the graphify knowledge graph (`graphify-out/graph.json`, kept current by the git hooks;
+it is not committed) before reading or grepping raw files:
+
+- Start every question about where something lives, how a subsystem works, or what touches what with `graphify query "<question>"`
+  (or the graphify MCP tools). Use `graphify explain "<symbol or concept>"` for one node and its neighbours, `graphify path "<A>" "<B>"`
+  for how two pieces connect, and `graphify section "<heading>"` to read a section of a doc in `docs/` without opening it.
+- Before changing a shared class, interface or syscall, use the graph to find its callers, implementers and tests, so a change to one
+  layer is carried through every layer that depends on it (kernel service, user-mode DLL or library, tests).
+- Read raw files only for the lines the graph pointed to. Use grep for literal text the graph does not model: string constants,
+  error messages, syscall numbers, `.def` ordinals, CMake options, generated files.
+- Use `graphify-out/GRAPH_REPORT.md` only for broad architecture questions that query/explain/path do not answer.
+- If `graphify-out/` is missing or a result is clearly stale, run `graphify update .` (AST only, no API cost) and query again. Run it
+  after a large change too, so the next query sees the new code.
+- Put these rules in the prompt of every subagent that explores code.
+- Skip the graph when the target is already known: a file and line from a compiler error, a test failure or an earlier read.
+
+## Compatibility layers are implemented to completion
+
+The Windows and Linux userlands (ntdll, kernel32, user32, gdi32, the other system DLLs, Linux syscalls, the vDSO, glibc-facing
+behaviour), and the other compatibility surfaces (Direct3D, Vulkan, OpenGL, X11, Wayland, PipeWire, D-Bus, file formats and
+protocols), exist so that real programs run unchanged. A half-implemented API is worse than a missing one: the program takes a path its
+authors never tested and fails far from the cause.
+
+- Implement each function, syscall, flag, message, interface method or structure field the work touches to its full documented
+  behaviour, matching the reference implementation (Windows, Linux, the specification), including its error codes, edge cases,
+  out-parameters, `GetLastError`/`errno` values, alignment and structure sizes, and the 32-bit and 64-bit variants.
+- Do not leave stubs, `TODO`s, `return STATUS_NOT_IMPLEMENTED`/`-ENOSYS`, or "succeed and do nothing" bodies on purpose to finish
+  sooner. A stub that reports success is the worst case: never fake success for something that did not happen.
+- If a feature needs a layer below it that does not exist yet (a kernel service, a driver, a syscall), build that layer as part of the
+  same task rather than stopping at the boundary.
+- When the whole of an API family is too large for one change, finish a coherent part of it completely (every function in it, every
+  flag of those functions) instead of touching many functions shallowly.
+- Only when something truly cannot be done in this environment (it needs hardware, firmware or a licence that is not available)
+  return the real error code that Windows or Linux returns for an unsupported request, add a comment saying why, and list it in the
+  final report and in the relevant memory/notes as an open gap. Never hide it.
+- Verify against the reference: Wine's conformance tests, the Linux behaviour (LTP, real binaries), or a host test comparing with the
+  real implementation, and real programs run under QEMU. "It compiles" or "the program got further" is not done.
+
 ## Memory safety
 
 Write new code so that memory errors cannot happen, not so that they are unlikely:
@@ -108,6 +148,7 @@ ComfyUI output defaults to `/mnt/shared`. Look there for generated files, and co
 - If a test fails, investigate the underlying cause rather than merely reporting the failure.
 - Keep a short progress checklist and update it as milestones are completed.
 - Make reasonable, reversible decisions without asking me to choose between minor implementation details.
+- Do not stop at a partial implementation of a compatibility API (see "Compatibility layers are implemented to completion").
 - Ask questions only for genuinely blocking ambiguity, destructive operations, or decisions with significant architectural consequences.
 - Never claim success without verifying the result.
 - Before stopping, review the diff, run relevant tests, and list any incomplete work and its cause.
