@@ -79,7 +79,8 @@ struct Luid {
 // A32B32G32R32Sint, A16B16G16R16Uint / Sint and A8B8G8R8Uint (DXGI R32G32B32A32_SINT, R16G16B16A16_UINT / SINT, R8G8B8A8_UINT) are the other integer formats (a narrow one saturates what a shader
 // writes); A16B16G16R16Snorm (R16G16B16A16_SNORM) and A2B10G10R10 (R10G10B10A2_UNORM, 2 bits of alpha) need kFeatureSnormFormats.
 // Like the floats, these have one mip level and cannot be presented or multisampled.
-enum class Format : uint32_t { Unknown, A8R8G8B8, X8R8G8B8, A8B8G8R8, X8B8G8R8, D32Float, D24S8, A16B16G16R16F, A32B32G32R32F, A8R8G8B8Srgb, A8B8G8R8Srgb, A16B16G16R16, A32B32G32R32Uint, A32B32G32R32Sint, A16B16G16R16Uint, A16B16G16R16Sint, A8B8G8R8Uint, A16B16G16R16Snorm, A2B10G10R10 };
+enum class Format : uint32_t { Unknown, A8R8G8B8, X8R8G8B8, A8B8G8R8, X8B8G8R8, D32Float, D24S8, A16B16G16R16F, A32B32G32R32F, A8R8G8B8Srgb, A8B8G8R8Srgb, A16B16G16R16, A32B32G32R32Uint, A32B32G32R32Sint, A16B16G16R16Uint, A16B16G16R16Sint, A8B8G8R8Uint, A16B16G16R16Snorm, A2B10G10R10,
+                               Bc1, Bc2, Bc3, Bc1Srgb, Bc2Srgb, Bc3Srgb };   // (BC1 .. BC3: block-compressed, 4 x 4 pixels a block of 8 or 16 bytes - see is_compressed)
 
 constexpr bool is_depth(Format f) { return f == Format::D32Float || f == Format::D24S8; }
 constexpr bool is_float(Format f) { return f == Format::A16B16G16R16F || f == Format::A32B32G32R32F; }
@@ -106,6 +107,16 @@ constexpr graphics::AddressMode base_address_mode(graphics::AddressMode mode) {
   return mode == graphics::AddressMode::Repeat || mode == graphics::AddressMode::MirrorRepeat ? graphics::AddressMode::Repeat : graphics::AddressMode::ClampToEdge;
 }
 
+// Block-compressed (BC1 = DXT1, BC2 = DXT3, BC3 = DXT5, and their sRGB forms): sampled textures only (kAllocTexture, kAllocShared), any kind, with mip levels; the backing is rows of
+// 4 x 4 blocks (image_row_bytes / image_rows), and the device samples them as they are (graphics::kFeatureCompressedFormats) or gets them decoded to 8-bit pixels.
+constexpr bool is_compressed(Format f) { return f == Format::Bc1 || f == Format::Bc2 || f == Format::Bc3 || f == Format::Bc1Srgb || f == Format::Bc2Srgb || f == Format::Bc3Srgb; }
+constexpr uint32_t pixel_bytes(Format f);
+// The bytes of one row of the backing of a level `w` pixels wide (of pixels, or of blocks), and the number of such rows of a level `h` high.
+constexpr uint64_t image_row_bytes(Format f, uint32_t w) {
+  return is_compressed(f) ? uint64_t{(w + 3) / 4} * (f == Format::Bc1 || f == Format::Bc1Srgb ? 8u : 16u) : uint64_t{w} * pixel_bytes(f);
+}
+constexpr uint32_t image_rows(Format f, uint32_t h) { return is_compressed(f) ? (h + 3) / 4 : h; }
+constexpr uint64_t image_level_bytes(Format f, uint32_t w, uint32_t h) { return image_row_bytes(f, w) * image_rows(f, h); }
 constexpr uint32_t pixel_bytes(Format f) {
   switch (f) {
     case Format::A16B16G16R16F: case Format::A16B16G16R16: case Format::A16B16G16R16Snorm: case Format::A16B16G16R16Uint: case Format::A16B16G16R16Sint: return 8;

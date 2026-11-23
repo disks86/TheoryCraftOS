@@ -43,6 +43,9 @@ static ID3D12PipelineState *pipeline_get(Dev *d, Ctx *c) {
   memset(&key, 0, sizeof key);
   key.vs = c->vs->c.id;
   key.ps = c->ps ? c->ps->c.id : 0;
+  key.gs = c->gs ? c->gs->c.id : 0;
+  key.hs = c->hs ? c->hs->c.id : 0;
+  key.ds = c->ds ? c->ds->c.id : 0;
   key.layout = c->layout ? c->layout->c.id : 0;
   key.blend = c->blend ? c->blend->desc : default_blend();
   key.depth = c->depth ? c->depth->desc : g_default_depth;
@@ -63,7 +66,7 @@ static ID3D12PipelineState *pipeline_get(Dev *d, Ctx *c) {
   Pipeline *oldest = &d->pipelines[0];
   for (UINT i = 0; i < d->pipeline_count; ++i) {
     Pipeline *p = &d->pipelines[i];
-    if (p->vs == key.vs && p->ps == key.ps && p->layout == key.layout && p->targets == key.targets && p->has_depth == key.has_depth && p->samples == key.samples &&
+    if (p->vs == key.vs && p->ps == key.ps && p->gs == key.gs && p->hs == key.hs && p->ds == key.ds && p->layout == key.layout && p->targets == key.targets && p->has_depth == key.has_depth && p->samples == key.samples &&
         memcmp(p->formats, key.formats, sizeof key.formats) == 0 && p->depth_format == key.depth_format &&
         memcmp(&p->blend, &key.blend, sizeof key.blend) == 0 && memcmp(&p->depth, &key.depth, sizeof key.depth) == 0 && memcmp(&p->raster, &key.raster, sizeof key.raster) == 0) {
       p->last_used = ++d->pipeline_clock;
@@ -78,6 +81,9 @@ static ID3D12PipelineState *pipeline_get(Dev *d, Ctx *c) {
   pd.VS.pShaderBytecode = c->vs->code;
   pd.VS.BytecodeLength = c->vs->bytes;
   if (c->ps) { pd.PS.pShaderBytecode = c->ps->code; pd.PS.BytecodeLength = c->ps->bytes; }
+  if (c->gs) { pd.GS.pShaderBytecode = c->gs->code; pd.GS.BytecodeLength = c->gs->bytes; }
+  if (c->hs) { pd.HS.pShaderBytecode = c->hs->code; pd.HS.BytecodeLength = c->hs->bytes; }
+  if (c->ds) { pd.DS.pShaderBytecode = c->ds->code; pd.DS.BytecodeLength = c->ds->bytes; }
   pd.SampleMask = 0xFFFFFFFFu;
   pd.BlendState.AlphaToCoverageEnable = key.blend.AlphaToCoverageEnable;
   pd.BlendState.IndependentBlendEnable = key.blend.IndependentBlendEnable;
@@ -120,14 +126,18 @@ static ID3D12PipelineState *pipeline_get(Dev *d, Ctx *c) {
   memcpy(&pd.DepthStencilState.FrontFace, &key.depth.FrontFace, sizeof pd.DepthStencilState.FrontFace);      /* (the two structures are the same) */
   memcpy(&pd.DepthStencilState.BackFace, &key.depth.BackFace, sizeof pd.DepthStencilState.BackFace);
   if (c->layout) { pd.InputLayout.pInputElementDescs = c->layout->elements; pd.InputLayout.NumElements = c->layout->count; }
-  pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+  pd.PrimitiveTopologyType = c->hs ? D3D12_PRIMITIVE_TOPOLOGY_TYPE_PATCH : D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
   pd.NumRenderTargets = c->rtv_count;
   for (UINT i = 0; i < c->rtv_count; ++i) pd.RTVFormats[i] = c->rtv[i]->tex->stored;
   if (c->dsv) pd.DSVFormat = c->dsv->tex->stored == DXGI_FORMAT_R24G8_TYPELESS ? DXGI_FORMAT_D24_UNORM_S8_UINT
                            : c->dsv->tex->stored == DXGI_FORMAT_R32_TYPELESS ? DXGI_FORMAT_D32_FLOAT : c->dsv->tex->stored;
   pd.SampleDesc.Count = key.samples;
   ID3D12PipelineState *state = NULL;
-  TcosD3D12PipelineOptions(d->d12, c->vs->registers, 0);      /* (the pixel shader's constant buffers come after the vertex shader's) */
+  /* (the pixel shader's constant buffers come after the vertex shader's, then the geometry, hull and domain shaders' in that order: as draw_prepare lays them out) */
+  const UINT ps_base = c->vs->registers, gs_base = ps_base + (c->ps ? c->ps->registers : 0), hs_base = gs_base + (c->gs ? c->gs->registers : 0),
+             ds_base = hs_base + (c->hs ? c->hs->registers : 0);
+  TcosD3D12PipelineOptions(d->d12, ps_base, 0);
+  TcosD3D12StageConstantBases(d->d12, gs_base, hs_base, ds_base);
   if (FAILED(ID3D12Device_CreateGraphicsPipelineState(d->d12, &pd, &IID_ID3D12PipelineState, (void **)&state)) || !state) return NULL;
 
   Pipeline *slot = d->pipeline_count < PIPELINES ? &d->pipelines[d->pipeline_count++] : oldest;
@@ -208,10 +218,32 @@ static void record_pending_clears(Dev *d) {
 static void tex_before_write(Dev *d, const Tex *t) { settle(d, t->sampled); }
 static void tex_before_read(Dev *d, const Tex *t) { settle(d, t->written); }
 
+/* What texture slot `i` of the table holds: the pixel shader's, else the first of the other stages' that has one bound (they share the kernel's units). */
+static View *slot_view(const Ctx *c, UINT i) {
+  if (c->srv[i]) return c->srv[i];
+  for (UINT k = 0; k < 4; ++k) if (c->stage_srv[k][i]) return c->stage_srv[k][i];
+  return NULL;
+}
+static Sampler *slot_sampler(const Ctx *c, UINT i) {
+  if (c->sampler[i]) return c->sampler[i];
+  for (UINT k = 0; k < 4; ++k) if (c->stage_sampler[k][i]) return c->stage_sampler[k][i];
+  return NULL;
+}
+/* What fills a slot with nothing bound: a white texture of the kind the shaders declare there (the kernel refuses a draw whose texture is of another kind). */
+static Tex *slot_blank(const Dev *d, const Ctx *c, UINT i) {
+  const Shader *stages[5] = {c->ps, c->vs, c->gs, c->hs, c->ds};
+  for (UINT k = 0; k < 5; ++k) {
+    const UINT kind = stages[k] ? stages[k]->tex_kind[i] : 0xFF;
+    if (kind >= 1 && kind <= 3 && d->blank_kind[kind]) return d->blank_kind[kind];
+  }
+  return d->blank;
+}
+
 /* Everything of a draw but the draw: FALSE when it cannot be drawn (no vertex shader, no render target, a pipeline the kernel does not take). */
 static BOOL draw_prepare(Ctx *c, BOOL indexed) {
   Dev *d = c->dev;
   if (!c->vs || c->rtv_count == 0 || (indexed && !c->ib)) return FALSE;
+  if (!c->hs != !c->ds) return FALSE;      /* (tessellation needs both) */
 
   /* what may have to send the list first */
   ID3D12Resource *sources[VERTEX_SLOTS] = {0};
@@ -225,7 +257,7 @@ static BOOL draw_prepare(Ctx *c, BOOL indexed) {
   for (UINT i = 0; i < c->rtv_count; ++i) tex_before_write(d, c->rtv[i]->tex);
   if (c->dsv) tex_before_write(d, c->dsv->tex);
   /* (... nor be sampled after the list has drawn into it, cleared it or copied into it: the draw would see the texture as it was before the list) */
-  for (UINT i = 0; i < TEXTURE_SLOTS; ++i) if (c->srv[i]) tex_before_read(d, c->srv[i]->tex);
+  for (UINT i = 0; i < TEXTURE_SLOTS; ++i) if (slot_view(c, i)) tex_before_read(d, slot_view(c, i)->tex);
   if (d->ring_used + CONSTANT_BLOCK > RING_BYTES || d->view_used + TEXTURE_SLOTS > VIEW_HEAP || d->sampler_used + TEXTURE_SLOTS > VIEW_HEAP) flush(d);
   ID3D12PipelineState *pipeline = pipeline_get(d, c);
   if (!pipeline) return FALSE;
@@ -268,12 +300,12 @@ static BOOL draw_prepare(Ctx *c, BOOL indexed) {
     c->ib->used = d->epoch;
   }
 
-  /* the constants: the vertex shader's buffers in slot order, then the pixel shader's */
+  /* the constants: the vertex shader's buffers in slot order, then the pixel shader's, the geometry shader's, the hull shader's and the domain shader's */
   BYTE block[CONSTANT_BLOCK];
   UINT bytes = 0;
-  for (UINT stage = 0; stage < 2; ++stage) {
-    const Shader *s = stage == 0 ? c->vs : c->ps;
-    Buf *const *bound = stage == 0 ? c->vs_cb : c->ps_cb;
+  for (UINT stage = 0; stage < 5; ++stage) {
+    const Shader *s = stage == 0 ? c->vs : stage == 1 ? c->ps : stage == 2 ? c->gs : stage == 3 ? c->hs : c->ds;
+    Buf *const *bound = stage == 0 ? c->vs_cb : stage == 1 ? c->ps_cb : c->stage_cb[stage - 2];
     for (UINT slot = 0; s && slot < CONSTANT_SLOTS; ++slot) {
       const UINT size = s->cb_registers[slot] * 16;
       if (!size || bytes + size > CONSTANT_BLOCK) continue;
@@ -295,8 +327,8 @@ static BOOL draw_prepare(Ctx *c, BOOL indexed) {
   /* the textures and the samplers of the pixel shader: a table of each, made again when what is bound changed */
   UINT view_ids[TEXTURE_SLOTS], sampler_ids[TEXTURE_SLOTS];
   for (UINT i = 0; i < TEXTURE_SLOTS; ++i) {
-    view_ids[i] = c->srv[i] ? c->srv[i]->tex->c.id : 0;
-    sampler_ids[i] = c->sampler[i] ? c->sampler[i]->c.id : 0;
+    view_ids[i] = slot_view(c, i) ? slot_view(c, i)->tex->c.id : slot_blank(d, c, i)->c.id;
+    sampler_ids[i] = slot_sampler(c, i) ? slot_sampler(c, i)->c.id : 0;
   }
   const UINT step_views = ID3D12Device_GetDescriptorHandleIncrementSize(d->d12, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
   const UINT step_samplers = ID3D12Device_GetDescriptorHandleIncrementSize(d->d12, D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER);
@@ -306,7 +338,7 @@ static BOOL draw_prepare(Ctx *c, BOOL indexed) {
     at.ptr += (SIZE_T)d->view_used * step_views;
     d->table_views = gpu.ptr + (UINT64)d->view_used * step_views;
     for (UINT i = 0; i < TEXTURE_SLOTS; ++i) {
-      Tex *t = c->srv[i] ? c->srv[i]->tex : d->blank;
+      Tex *t = slot_view(c, i) ? slot_view(c, i)->tex : slot_blank(d, c, i);
       ID3D12Device_CreateShaderResourceView(d->d12, t->res, NULL, at);
       at.ptr += step_views;
     }
@@ -321,7 +353,7 @@ static BOOL draw_prepare(Ctx *c, BOOL indexed) {
     at.ptr += (SIZE_T)d->sampler_used * step_samplers;
     d->table_samplers = gpu.ptr + (UINT64)d->sampler_used * step_samplers;
     for (UINT i = 0; i < TEXTURE_SLOTS; ++i) {
-      ID3D12Device_CreateSampler(d->d12, (const D3D12_SAMPLER_DESC *)(c->sampler[i] ? &c->sampler[i]->desc : &fallback), at);      /* (the two structures are the same) */
+      ID3D12Device_CreateSampler(d->d12, (const D3D12_SAMPLER_DESC *)(slot_sampler(c, i) ? &slot_sampler(c, i)->desc : &fallback), at);      /* (the two structures are the same) */
       at.ptr += step_samplers;
     }
     d->sampler_used += TEXTURE_SLOTS;
@@ -332,7 +364,7 @@ static BOOL draw_prepare(Ctx *c, BOOL indexed) {
   ID3D12GraphicsCommandList_SetGraphicsRootDescriptorTable(list, 1, views);
   ID3D12GraphicsCommandList_SetGraphicsRootDescriptorTable(list, 2, samplers);
 
-  for (UINT i = 0; i < TEXTURE_SLOTS; ++i) if (c->srv[i]) c->srv[i]->tex->used = c->srv[i]->tex->sampled = d->epoch;
+  for (UINT i = 0; i < TEXTURE_SLOTS; ++i) if (slot_view(c, i)) slot_view(c, i)->tex->used = slot_view(c, i)->tex->sampled = d->epoch;
   for (UINT i = 0; i < c->rtv_count; ++i) c->rtv[i]->tex->used = c->rtv[i]->tex->written = d->epoch;
   if (c->dsv) {
     c->dsv->tex->used = c->dsv->tex->written = d->epoch;
@@ -388,6 +420,18 @@ static void STDMETHODCALLTYPE ctx_PSSetShader(Ctx *c, ID3D11PixelShader *shader,
   (void)instances; (void)count;
   bind(&c->ps, shader);
 }
+static void STDMETHODCALLTYPE ctx_GSSetShader(Ctx *c, ID3D11GeometryShader *shader, ID3D11ClassInstance *const *instances, UINT count) {
+  (void)instances; (void)count;
+  bind(&c->gs, shader);
+}
+static void STDMETHODCALLTYPE ctx_HSSetShader(Ctx *c, ID3D11HullShader *shader, ID3D11ClassInstance *const *instances, UINT count) {
+  (void)instances; (void)count;
+  bind(&c->hs, shader);
+}
+static void STDMETHODCALLTYPE ctx_DSSetShader(Ctx *c, ID3D11DomainShader *shader, ID3D11ClassInstance *const *instances, UINT count) {
+  (void)instances; (void)count;
+  bind(&c->ds, shader);
+}
 static void set_range(void **slots, UINT capacity, UINT start, UINT count, void *const *objects) {
   for (UINT i = 0; i < count && start + i < capacity; ++i) bind(&slots[start + i], objects ? objects[i] : NULL);
 }
@@ -405,6 +449,29 @@ static void STDMETHODCALLTYPE ctx_VSGetConstantBuffers(Ctx *c, UINT start, UINT 
 static void STDMETHODCALLTYPE ctx_PSGetConstantBuffers(Ctx *c, UINT start, UINT count, ID3D11Buffer **buffers) { get_range((void **)c->ps_cb, CONSTANT_SLOTS, start, count, (void **)buffers); }
 static void STDMETHODCALLTYPE ctx_PSGetShaderResources(Ctx *c, UINT start, UINT count, ID3D11ShaderResourceView **views) { get_range((void **)c->srv, TEXTURE_SLOTS, start, count, (void **)views); }
 static void STDMETHODCALLTYPE ctx_PSGetSamplers(Ctx *c, UINT start, UINT count, ID3D11SamplerState **samplers) { get_range((void **)c->sampler, TEXTURE_SLOTS, start, count, (void **)samplers); }
+/* the other stages' constant buffers, textures and samplers (written out: scripts/gen-dx-vtables.py finds the methods by their names) */
+static void STDMETHODCALLTYPE ctx_VSSetShaderResources(Ctx *c, UINT start, UINT count, ID3D11ShaderResourceView *const *views) { set_range((void **)c->stage_srv[SRV_VS], TEXTURE_SLOTS, start, count, (void *const *)views); }
+static void STDMETHODCALLTYPE ctx_VSGetShaderResources(Ctx *c, UINT start, UINT count, ID3D11ShaderResourceView **views) { get_range((void **)c->stage_srv[SRV_VS], TEXTURE_SLOTS, start, count, (void **)views); }
+static void STDMETHODCALLTYPE ctx_VSSetSamplers(Ctx *c, UINT start, UINT count, ID3D11SamplerState *const *samplers) { set_range((void **)c->stage_sampler[SRV_VS], TEXTURE_SLOTS, start, count, (void *const *)samplers); }
+static void STDMETHODCALLTYPE ctx_VSGetSamplers(Ctx *c, UINT start, UINT count, ID3D11SamplerState **samplers) { get_range((void **)c->stage_sampler[SRV_VS], TEXTURE_SLOTS, start, count, (void **)samplers); }
+static void STDMETHODCALLTYPE ctx_GSSetShaderResources(Ctx *c, UINT start, UINT count, ID3D11ShaderResourceView *const *views) { set_range((void **)c->stage_srv[SRV_GS], TEXTURE_SLOTS, start, count, (void *const *)views); }
+static void STDMETHODCALLTYPE ctx_GSGetShaderResources(Ctx *c, UINT start, UINT count, ID3D11ShaderResourceView **views) { get_range((void **)c->stage_srv[SRV_GS], TEXTURE_SLOTS, start, count, (void **)views); }
+static void STDMETHODCALLTYPE ctx_GSSetSamplers(Ctx *c, UINT start, UINT count, ID3D11SamplerState *const *samplers) { set_range((void **)c->stage_sampler[SRV_GS], TEXTURE_SLOTS, start, count, (void *const *)samplers); }
+static void STDMETHODCALLTYPE ctx_GSGetSamplers(Ctx *c, UINT start, UINT count, ID3D11SamplerState **samplers) { get_range((void **)c->stage_sampler[SRV_GS], TEXTURE_SLOTS, start, count, (void **)samplers); }
+static void STDMETHODCALLTYPE ctx_HSSetShaderResources(Ctx *c, UINT start, UINT count, ID3D11ShaderResourceView *const *views) { set_range((void **)c->stage_srv[SRV_HS], TEXTURE_SLOTS, start, count, (void *const *)views); }
+static void STDMETHODCALLTYPE ctx_HSGetShaderResources(Ctx *c, UINT start, UINT count, ID3D11ShaderResourceView **views) { get_range((void **)c->stage_srv[SRV_HS], TEXTURE_SLOTS, start, count, (void **)views); }
+static void STDMETHODCALLTYPE ctx_HSSetSamplers(Ctx *c, UINT start, UINT count, ID3D11SamplerState *const *samplers) { set_range((void **)c->stage_sampler[SRV_HS], TEXTURE_SLOTS, start, count, (void *const *)samplers); }
+static void STDMETHODCALLTYPE ctx_HSGetSamplers(Ctx *c, UINT start, UINT count, ID3D11SamplerState **samplers) { get_range((void **)c->stage_sampler[SRV_HS], TEXTURE_SLOTS, start, count, (void **)samplers); }
+static void STDMETHODCALLTYPE ctx_DSSetShaderResources(Ctx *c, UINT start, UINT count, ID3D11ShaderResourceView *const *views) { set_range((void **)c->stage_srv[SRV_DS], TEXTURE_SLOTS, start, count, (void *const *)views); }
+static void STDMETHODCALLTYPE ctx_DSGetShaderResources(Ctx *c, UINT start, UINT count, ID3D11ShaderResourceView **views) { get_range((void **)c->stage_srv[SRV_DS], TEXTURE_SLOTS, start, count, (void **)views); }
+static void STDMETHODCALLTYPE ctx_DSSetSamplers(Ctx *c, UINT start, UINT count, ID3D11SamplerState *const *samplers) { set_range((void **)c->stage_sampler[SRV_DS], TEXTURE_SLOTS, start, count, (void *const *)samplers); }
+static void STDMETHODCALLTYPE ctx_DSGetSamplers(Ctx *c, UINT start, UINT count, ID3D11SamplerState **samplers) { get_range((void **)c->stage_sampler[SRV_DS], TEXTURE_SLOTS, start, count, (void **)samplers); }
+static void STDMETHODCALLTYPE ctx_GSSetConstantBuffers(Ctx *c, UINT start, UINT count, ID3D11Buffer *const *buffers) { set_range((void **)c->stage_cb[STAGE_GS], CONSTANT_SLOTS, start, count, (void *const *)buffers); }
+static void STDMETHODCALLTYPE ctx_GSGetConstantBuffers(Ctx *c, UINT start, UINT count, ID3D11Buffer **buffers) { get_range((void **)c->stage_cb[STAGE_GS], CONSTANT_SLOTS, start, count, (void **)buffers); }
+static void STDMETHODCALLTYPE ctx_HSSetConstantBuffers(Ctx *c, UINT start, UINT count, ID3D11Buffer *const *buffers) { set_range((void **)c->stage_cb[STAGE_HS], CONSTANT_SLOTS, start, count, (void *const *)buffers); }
+static void STDMETHODCALLTYPE ctx_HSGetConstantBuffers(Ctx *c, UINT start, UINT count, ID3D11Buffer **buffers) { get_range((void **)c->stage_cb[STAGE_HS], CONSTANT_SLOTS, start, count, (void **)buffers); }
+static void STDMETHODCALLTYPE ctx_DSSetConstantBuffers(Ctx *c, UINT start, UINT count, ID3D11Buffer *const *buffers) { set_range((void **)c->stage_cb[STAGE_DS], CONSTANT_SLOTS, start, count, (void *const *)buffers); }
+static void STDMETHODCALLTYPE ctx_DSGetConstantBuffers(Ctx *c, UINT start, UINT count, ID3D11Buffer **buffers) { get_range((void **)c->stage_cb[STAGE_DS], CONSTANT_SLOTS, start, count, (void **)buffers); }
 static void get_shader(void *shader, void **out, ID3D11ClassInstance **instances, UINT *count) {
   (void)instances;
   if (count) *count = 0;
@@ -414,10 +481,10 @@ static void get_shader(void *shader, void **out, ID3D11ClassInstance **instances
 }
 static void STDMETHODCALLTYPE ctx_VSGetShader(Ctx *c, ID3D11VertexShader **out, ID3D11ClassInstance **instances, UINT *count) { get_shader(c->vs, (void **)out, instances, count); }
 static void STDMETHODCALLTYPE ctx_PSGetShader(Ctx *c, ID3D11PixelShader **out, ID3D11ClassInstance **instances, UINT *count) { get_shader(c->ps, (void **)out, instances, count); }
-/* (the stages this runtime has not: nothing is bound to them) */
-static void STDMETHODCALLTYPE ctx_GSGetShader(Ctx *c, ID3D11GeometryShader **out, ID3D11ClassInstance **instances, UINT *count) { (void)c; get_shader(NULL, (void **)out, instances, count); }
-static void STDMETHODCALLTYPE ctx_HSGetShader(Ctx *c, ID3D11HullShader **out, ID3D11ClassInstance **instances, UINT *count) { (void)c; get_shader(NULL, (void **)out, instances, count); }
-static void STDMETHODCALLTYPE ctx_DSGetShader(Ctx *c, ID3D11DomainShader **out, ID3D11ClassInstance **instances, UINT *count) { (void)c; get_shader(NULL, (void **)out, instances, count); }
+static void STDMETHODCALLTYPE ctx_GSGetShader(Ctx *c, ID3D11GeometryShader **out, ID3D11ClassInstance **instances, UINT *count) { get_shader(c->gs, (void **)out, instances, count); }
+static void STDMETHODCALLTYPE ctx_HSGetShader(Ctx *c, ID3D11HullShader **out, ID3D11ClassInstance **instances, UINT *count) { get_shader(c->hs, (void **)out, instances, count); }
+static void STDMETHODCALLTYPE ctx_DSGetShader(Ctx *c, ID3D11DomainShader **out, ID3D11ClassInstance **instances, UINT *count) { get_shader(c->ds, (void **)out, instances, count); }
+/* (the stage this runtime has not: nothing is bound to it) */
 static void STDMETHODCALLTYPE ctx_CSGetShader(Ctx *c, ID3D11ComputeShader **out, ID3D11ClassInstance **instances, UINT *count) { (void)c; get_shader(NULL, (void **)out, instances, count); }
 
 static void STDMETHODCALLTYPE ctx_IASetInputLayout(Ctx *c, ID3D11InputLayout *layout) { bind(&c->layout, layout); }
@@ -620,15 +687,17 @@ static HRESULT STDMETHODCALLTYPE ctx_Map(Ctx *c, ID3D11Resource *resource, UINT 
   } else if (t) {
     if (sub >= tex_subresources(t) || t->depth || t->mapped[sub]) hr = E_INVALIDARG;
     else {
-      const UINT level = sub % t->desc.MipLevels, w = mip_size(t->desc.Width, level), h = mip_size(t->desc.Height, level);
-      if (!t->shadow[sub]) t->shadow[sub] = mem_alloc((SIZE_T)w * h * t->bpp);
+      const UINT level = sub % t->desc.MipLevels, w = mip_size(t->desc.Width, level), h = mip_size(t->desc.Height, level), slices = tex_slices(t, sub);
+      const SIZE_T slice_bytes = (SIZE_T)tex_pitch(t, w) * tex_rows(t, h);
+      if (!t->shadow[sub]) t->shadow[sub] = mem_alloc(slice_bytes * slices);
       if (!t->shadow[sub]) hr = E_OUTOFMEMORY;
-      else if (type == D3D11_MAP_READ || type == D3D11_MAP_READ_WRITE) hr = tex_read(d, t, sub, t->shadow[sub]);
+      else if (type == D3D11_MAP_READ || type == D3D11_MAP_READ_WRITE)
+        for (UINT z = 0; SUCCEEDED(hr) && z < slices; ++z) hr = tex_read(d, t, sub, z, t->shadow[sub] + z * slice_bytes);
       if (SUCCEEDED(hr)) {
         t->mapped[sub] = type;
         out->pData = t->shadow[sub];
-        out->RowPitch = w * t->bpp;
-        out->DepthPitch = w * h * t->bpp;
+        out->RowPitch = tex_pitch(t, w);
+        out->DepthPitch = (UINT)slice_bytes;
       }
     }
   } else hr = E_INVALIDARG;
@@ -647,14 +716,13 @@ static void STDMETHODCALLTYPE ctx_Unmap(Ctx *c, ID3D11Resource *resource, UINT s
     t->mapped[sub] = 0;
     if (type != D3D11_MAP_READ) {
       const UINT level = sub % t->desc.MipLevels, w = mip_size(t->desc.Width, level), h = mip_size(t->desc.Height, level);
-      tex_write(c->dev, t, sub, 0, 0, w, h, t->shadow[sub], w * t->bpp);
+      for (UINT z = 0; z < tex_slices(t, sub); ++z) tex_write(c->dev, t, sub, 0, 0, z, w, h, t->shadow[sub] + (SIZE_T)z * tex_pitch(t, w) * tex_rows(t, h), tex_pitch(t, w));
     }
   }
   UNLOCK(c);
 }
 
 static void STDMETHODCALLTYPE ctx_UpdateSubresource(Ctx *c, ID3D11Resource *resource, UINT sub, const D3D11_BOX *box, const void *data, UINT row_pitch, UINT depth_pitch) {
-  (void)depth_pitch;
   Buf *b = buf_of_resource(resource);
   Tex *t = tex_of_resource(resource);
   if (!data) return;
@@ -668,26 +736,30 @@ static void STDMETHODCALLTYPE ctx_UpdateSubresource(Ctx *c, ID3D11Resource *reso
       ++b->version;
     }
   } else if (t && sub < tex_subresources(t) && !t->depth) {
-    const UINT level = sub % t->desc.MipLevels, w = mip_size(t->desc.Width, level), h = mip_size(t->desc.Height, level);
+    const UINT level = sub % t->desc.MipLevels, w = mip_size(t->desc.Width, level), h = mip_size(t->desc.Height, level), slices = tex_slices(t, sub);
     const UINT x = box ? box->left : 0, y = box ? box->top : 0, x1 = box ? box->right : w, y1 = box ? box->bottom : h;
-    if (x < x1 && y < y1 && x1 <= w && y1 <= h) tex_write(c->dev, t, sub, x, y, x1 - x, y1 - y, data, row_pitch ? row_pitch : (x1 - x) * t->bpp);
+    const UINT z0 = box && t->kind == 1 ? box->front : 0, z1 = box && t->kind == 1 ? box->back : slices;
+    const UINT pitch = row_pitch ? row_pitch : tex_pitch(t, x1 - x);
+    const UINT slice_pitch = depth_pitch ? depth_pitch : pitch * tex_rows(t, y1 - y);
+    if (x < x1 && y < y1 && x1 <= w && y1 <= h && z0 < z1 && z1 <= slices)
+      for (UINT z = z0; z < z1; ++z) tex_write(c->dev, t, sub, x, y, z, x1 - x, y1 - y, (const BYTE *)data + (SIZE_T)(z - z0) * slice_pitch, pitch);
   }
   UNLOCK(c);
 }
 
 /* A rectangle of one subresource into another, by way of memory (what Direct3D 12 here does not copy itself). */
 static void tex_copy_slow(Dev *d, Tex *to, UINT to_sub, UINT x, UINT y, Tex *from, UINT from_sub, const D3D11_BOX *box) {
-  if (to->bpp != from->bpp || to->depth || from->depth) return;
+  if (to->bpp != from->bpp || to->depth || from->depth || to->kind == 1 || from->kind == 1 || to->block || from->block) return;      /* (volumes and compressed textures are not copied) */
   const UINT level = from_sub % from->desc.MipLevels, w = mip_size(from->desc.Width, level), h = mip_size(from->desc.Height, level);
   const UINT to_level = to_sub % to->desc.MipLevels, to_w = mip_size(to->desc.Width, to_level), to_h = mip_size(to->desc.Height, to_level);
   const UINT x0 = box ? box->left : 0, y0 = box ? box->top : 0, x1 = box ? box->right : w, y1 = box ? box->bottom : h;
   if (x0 >= x1 || y0 >= y1 || x1 > w || y1 > h || x > to_w || y > to_h || x1 - x0 > to_w - x || y1 - y0 > to_h - y) return;
   BYTE *pixels = mem_alloc((SIZE_T)w * h * from->bpp);
-  if (pixels && SUCCEEDED(tex_read(d, from, from_sub, pixels)))
-    tex_write(d, to, to_sub, x, y, x1 - x0, y1 - y0, pixels + ((SIZE_T)y0 * w + x0) * from->bpp, w * from->bpp);
+  if (pixels && SUCCEEDED(tex_read(d, from, from_sub, 0, pixels)))
+    tex_write(d, to, to_sub, x, y, 0, x1 - x0, y1 - y0, pixels + ((SIZE_T)y0 * w + x0) * from->bpp, w * from->bpp);
   mem_free(pixels);
 }
-static BOOL tex_simple(const Tex *t) { return t->desc.MipLevels == 1 && t->desc.ArraySize == 1 && !t->depth; }
+static BOOL tex_simple(const Tex *t) { return t->desc.MipLevels == 1 && t->desc.ArraySize == 1 && t->kind == 0 && !t->depth; }
 
 static void STDMETHODCALLTYPE ctx_CopySubresourceRegion(Ctx *c, ID3D11Resource *to, UINT to_sub, UINT x, UINT y, UINT z, ID3D11Resource *from, UINT from_sub, const D3D11_BOX *box) {
   (void)z;
@@ -770,6 +842,11 @@ static void STDMETHODCALLTYPE ctx_Flush(Ctx *c) {
 static void ctx_unbind_all(Ctx *c) {
   bind(&c->vs, NULL);
   bind(&c->ps, NULL);
+  bind(&c->gs, NULL);
+  bind(&c->hs, NULL);
+  bind(&c->ds, NULL);
+  for (UINT k = 0; k < 3; ++k) for (UINT i = 0; i < CONSTANT_SLOTS; ++i) bind(&c->stage_cb[k][i], NULL);
+  for (UINT k = 0; k < 4; ++k) for (UINT i = 0; i < TEXTURE_SLOTS; ++i) { bind(&c->stage_srv[k][i], NULL); bind(&c->stage_sampler[k][i], NULL); }
   bind(&c->layout, NULL);
   bind(&c->ib, NULL);
   bind(&c->dsv, NULL);

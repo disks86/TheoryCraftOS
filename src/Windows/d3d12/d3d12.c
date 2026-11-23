@@ -85,6 +85,18 @@ EXPORT void WINAPI TcosD3D12PipelineOptions(ID3D12Device *device, UINT pixel_con
   dev->next_shader_kind = shader_kind;
 }
 
+EXPORT void WINAPI TcosD3D12StageConstantBases(ID3D12Device *device, UINT geometry, UINT hull, UINT domain) {
+  Dev *dev = (Dev *)device;
+  if (!dev) return;
+  dev->next_stage_base[0] = geometry;
+  dev->next_stage_base[1] = hull;
+  dev->next_stage_base[2] = domain;
+}
+EXPORT void WINAPI TcosD3D12ResourceOptions(ID3D12Device *device, UINT flags) {
+  Dev *dev = (Dev *)device;
+  if (dev) dev->next_resource_flags = flags;
+}
+
 EXPORT HRESULT WINAPI D3D12CreateDevice(IUnknown *adapter, D3D_FEATURE_LEVEL minimum, REFIID riid, void **out) {
   LUID luid = {0, 0};
   NTSTATUS st = 0;

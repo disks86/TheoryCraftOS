@@ -52,6 +52,8 @@ enum class Format : uint8_t {
   R8G8B8A8Uint,        // 32-bit, four unsigned bytes in the order R, G, B, A: stored clamped to 255 (still a wide format: the pixels travel as Vec4s of integer bits)
   R16G16B16A16Snorm,   // 64-bit, four 16-bit signed normalised channels (-1 .. 1; kFeatureSnormFormats)
   R10G10B10A2Unorm,    // 32-bit packed: R in bits 0-9, G 10-19, B 20-29, A 30-31, all normalised (kFeatureSnormFormats)
+  // Block-compressed (Graphics/BlockCompression.hpp): 4 x 4 pixels a block of 8 (BC1) or 16 bytes; sampled only, filled with IImage::write_compressed (kFeatureCompressedFormats).
+  Bc1Unorm, Bc2Unorm, Bc3Unorm, Bc1Srgb, Bc2Srgb, Bc3Srgb,
 };
 
 constexpr bool is_float_format(Format f) { return f == Format::R16G16B16A16Float || f == Format::R32G32B32A32Float; }

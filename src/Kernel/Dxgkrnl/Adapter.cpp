@@ -802,7 +802,7 @@ class Adapter::StreamRunner {
     Allocation* dst = alloc(di);
     Allocation* src = alloc(si);
     if (!dst || !src || !dst->is_image() || !src->is_image() || dst->is_depth() || src->is_depth() || !use(dst, state::kCopyDest) || !use(src, state::kCopySource)) return kBad;
-    if (dst->desc().format != src->desc().format || dst->mip_levels() != 1 || src->mip_levels() != 1 || dst->desc().samples != 1 || src->desc().samples != 1) return kBad;
+    if (dst->desc().format != src->desc().format || dst->mip_levels() != 1 || src->mip_levels() != 1 || dst->desc().samples != 1 || src->desc().samples != 1 || is_compressed(dst->desc().format)) return kBad;
     if (uint64_t{dx} + w > dst->desc().width || uint64_t{dy} + h > dst->desc().height || uint64_t{sx} + w > src->desc().width || uint64_t{sy} + h > src->desc().height) return kBad;
     if (!exec_) return status::kSuccess;
     NtStatus s = flush();
@@ -848,19 +848,23 @@ class Adapter::StreamRunner {
     if (level >= image->mip_levels() || layer >= image->layers() || (!plain && level != 0)) return kBad;
     const uint32_t level_w = plain ? graphics::mip_extent(image->desc().width, level) : image->desc().width;
     const uint32_t level_h = plain ? graphics::mip_extent(image->desc().height, level) : image->desc().height;
-    const uint32_t pixel = pixel_bytes(image->desc().format);
-    const uint64_t row_bytes = uint64_t{w} * pixel;
-    if (uint64_t{x} + w > level_w || uint64_t{y} + h > level_h || pitch < row_bytes) return kBad;
-    if (uint64_t{boff} + uint64_t{pitch} * (h - 1) + row_bytes > buffer->desc().size) return kBad;
+    // (a block-compressed image is copied in whole blocks: the rectangle starts on a block and ends on one or at the level's edge; its rows are rows of blocks)
+    const Format format = image->desc().format;
+    const uint32_t unit = is_compressed(format) ? 4 : 1;
+    if (uint64_t{x} + w > level_w || uint64_t{y} + h > level_h || x % unit || y % unit || ((x + w) % unit && x + w != level_w) || ((y + h) % unit && y + h != level_h)) return kBad;
+    const uint64_t row_bytes = image_row_bytes(format, w), level_row_bytes = image_row_bytes(format, level_w), x_bytes = image_row_bytes(format, x);
+    const uint32_t rows = image_rows(format, h), first_row = y / unit;
+    if (pitch < row_bytes) return kBad;
+    if (uint64_t{boff} + uint64_t{pitch} * (rows - 1) + row_bytes > buffer->desc().size) return kBad;
     uint64_t level_offset = 0, level_bytes = 0;
     if (!image->level_range(level, &level_offset, &level_bytes)) return kBad;
     if (!exec_) return status::kSuccess;
     NtStatus s = flush();
     if (s != status::kSuccess) return s;
     if (!mm_.read_back(*image) || !mm_.read_back(*buffer)) return status::kInvalidDeviceState;
-    const uint64_t layer_bytes = uint64_t{level_w} * level_h * pixel;
-    for (uint32_t row = 0; row < h; ++row) {
-      const uint64_t image_at = level_offset + layer_bytes * layer + (uint64_t{y + row} * level_w + x) * pixel;
+    const uint64_t layer_bytes = image_level_bytes(format, level_w, level_h);
+    for (uint32_t row = 0; row < rows; ++row) {
+      const uint64_t image_at = level_offset + layer_bytes * layer + uint64_t{first_row + row} * level_row_bytes + x_bytes;
       const uint64_t buffer_at = uint64_t{boff} + uint64_t{pitch} * row;
       ByteView to;
       ConstByteView from;
@@ -884,7 +888,7 @@ class Adapter::StreamRunner {
     const uint32_t index = p.le32();
     if (!exact(p) || in_pass_) return kBad;
     Allocation* a = alloc(index);
-    if (!a || !a->is_image() || !(a->desc().flags & kAllocTexture) || a->mip_levels() < 2) return kBad;
+    if (!a || !a->is_image() || !(a->desc().flags & kAllocTexture) || a->mip_levels() < 2 || is_compressed(a->desc().format)) return kBad;
     if (!exec_) return status::kSuccess;
     NtStatus s = flush();
     if (s != status::kSuccess) return s;
