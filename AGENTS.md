@@ -81,6 +81,16 @@ files each application keeps. See [docs/FileSystemLayout.md](docs/FileSystemLayo
   settings, state) under `/AppStore/<Application>/` and nowhere else.
 - Do not add top-level folders to `/`. If something does not fit, extend the layout doc and `SystemLayout.hpp` in the same change.
 
+## User interfaces
+
+Every user interface (the desktop shell, the built-in applications, dialogs, new toolkit controls) follows
+[docs/UserInterfaceGuidelines.md](docs/UserInterfaceGuidelines.md). Read the sections that apply before writing or changing interface code.
+
+- Everything works from the keyboard alone, and every basic task with single clicks. Standard shortcuts keep their standard meanings.
+- Reuse the controls and dialogs in `src/Gui` and `src/Desktop` before adding one. Colours come from `gui::Theme`, sizes follow the font and the display scale.
+- Disable what does not apply, make actions undoable or confirm them, and never make a destructive action the default button.
+- Run the review checklist at the end of that document before calling an interface change finished.
+
 ## Delegating routine work to a local model
 
 When possible, use Ollama with the `qwen3-coder-next` model (the `mcp__ollama__*` tools, e.g. `generate` or `chat`) for routine work:
