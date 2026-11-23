@@ -21,22 +21,25 @@
  * the list and sends it when something has to be seen: Flush, a Map that reads, a Present, a CPU write into a buffer a recorded draw uses.
  *
  * What maps to what:
- *   buffers            a Direct3D 12 buffer in an upload heap, mapped for good: Map hands that memory out, a draw uses its GPU address.
+ *   buffers            a Direct3D 12 buffer in an upload heap, mapped for good: Map hands that memory out, a draw uses its GPU address (one the
+ *                      GPU writes - unordered access, stream output - in its memory).
  *   constant buffers   Direct3D 12 here has one block of constants for all stages (b0). The block of a draw is put together from the buffers bound to
  *                      the vertex shader's slots, in slot order, and then the pixel shader's (d3d12.dll is told where those begin:
  *                      TcosD3D12PipelineOptions), and goes into a ring of upload memory - so a constant buffer may change between draws freely.
  *   textures           a Direct3D 12 texture in a default heap. The CPU reaches it through copies (UpdateSubresource, Map of a dynamic or staging
- *                      texture: a copy in memory, sent or fetched). R8 and A8 textures are kept as R8G8B8A8.
+ *                      texture: a copy in memory, sent or fetched). Formats the kernel has no image of are kept wider (formats.inc).
  *   vertex layouts     the kernel takes 32-bit floats only: a layout with R8G8B8A8 / B8G8R8A8 colours gets its vertex buffers converted (a second
  *                      buffer, made again when the first changes).
  *   states             a Direct3D 12 pipeline state for each combination of shaders, layout, blend, depth and rasterizer state that is drawn with,
  *                      kept in a cache.
- *   textures, samplers a table of 8 of each for the pixel shader (t0 .. t7, s0 .. s7; the sampler of t<n> is s<n>, as the kernel pairs them).
+ *   textures, samplers a table of 8 of each for all the stages (t0 .. t7, s0 .. s7; the sampler of t<n> is s<n>, as the kernel pairs them), and one of the
+ *                      unordered access views (u0 .. u7).
  *   swap chains        dxgi.dll asks the device for its back buffers and their pixels (ITcosPresenter, src/Windows/tcosdx.h).
  *
- * Not there: deferred contexts, geometry / hull / domain / compute shaders, textures and constant buffers of the vertex shader beyond what is said
- * above, 1D / 3D / cube textures, multisampling, queries, mipmaps of render targets (GenerateMips does nothing), buffers as shader resources, blend
- * factors, depth-only passes (a draw needs a render target), stream output. The methods for them answer E_NOTIMPL or do nothing. */
+ * The rest is in the other parts: compute, unordered access and buffer views, stream output and the draws whose counts are in buffers (context.inc); queries,
+ * predication and counters (query.inc); deferred contexts and command lists (deferred.inc); Direct3D 11.1 (context1.inc); render targets of levels and layers
+ * and GenerateMips (rtshadow.inc); the texture formats (formats.inc); 11 on 12 and the Windows Runtime's face (interop.inc). What is not there, and why, is
+ * in docs/Direct3D11.md. */
 #define INITGUID
 #define COBJMACROS
 #define CONST_VTABLE
@@ -98,6 +101,7 @@ typedef struct Child {
   DxObj o;
   Dev *dev;
   UINT id;
+  LONG internal;      /* the references of the runtime itself (bindings, views, recorded commands): not counted in what AddRef and Release answer, as in Windows */
 } Child;
 static LONG g_next_id;
 
@@ -413,6 +417,15 @@ static void *child_new(SIZE_T size, Dev *dev, const void *vtbl, const GUID *cons
   return c;
 }
 static void child_destroy(DxObj *o) { dx_Release(OBJ(((Child *)o)->dev)); }
+/* A reference of the runtime's own to a child (hold) and its end (unhold): the object lives while either kind is there; AddRef and Release answer the program's. */
+static void hold(void *object) { if (object) { InterlockedIncrement(&((Child *)object)->internal); dx_AddRef(OBJ(object)); } }
+static void unhold(void *object) { if (object) { InterlockedDecrement(&((Child *)object)->internal); dx_Release(OBJ(object)); } }
+static ULONG STDMETHODCALLTYPE child_AddRef(Child *c) { return (ULONG)(InterlockedIncrement(&c->o.ref) - c->internal); }
+static ULONG STDMETHODCALLTYPE child_Release(Child *c) {
+  const LONG internal = c->internal;
+  const LONG n = (LONG)dx_Release(OBJ(c));
+  return n > internal ? (ULONG)(n - internal) : 0;
+}
 static void STDMETHODCALLTYPE child_GetDevice(Child *c, ID3D11Device **out) {
   if (!out) return;
   dx_AddRef(OBJ(c->dev));
@@ -428,10 +441,10 @@ static HRESULT give(void *object, void **out) {
 static void bind(void *slot_address, void *object) {
   DxObj **slot = slot_address;
   if (*slot == object) return;
-  if (object) dx_AddRef(OBJ(object));
+  hold(object);      /* (a binding is the runtime's reference) */
   DxObj *old = *slot;
   *slot = object;
-  if (old) dx_Release(old);
+  unhold(old);
 }
 
 extern const ID3D11Device1Vtbl dev_vtbl;
@@ -845,10 +858,25 @@ static void tex_refused(const D3D11_TEXTURE2D_DESC *desc, const char *why) {
 
 /* A texture object around `res` (a reference is taken), or around a new Direct3D 12 texture when it is NULL. `slices`: 0 for a 2D texture, array or cube, else the
  * depth of a volume (`in` then has one layer). */
+static UINT dev_ms_levels(Dev *d, DXGI_FORMAT format, UINT samples);
 static HRESULT tex_make(Dev *d, const D3D11_TEXTURE2D_DESC *in, UINT slices, ID3D12Resource *res, Tex **out) {
   D3D11_TEXTURE2D_DESC desc = *in;
   *out = NULL;
   if (desc.Width == 0 || desc.Height == 0 || desc.ArraySize == 0) return E_INVALIDARG;
+  /* (what a texture may be bound as, and the combinations Direct3D 11 refuses) */
+  const UINT bind = desc.BindFlags;
+  if ((bind & ~(UINT)(D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET | D3D11_BIND_DEPTH_STENCIL | D3D11_BIND_UNORDERED_ACCESS | D3D11_BIND_DECODER | D3D11_BIND_VIDEO_ENCODER)) ||
+      ((bind & D3D11_BIND_DEPTH_STENCIL) && (bind & (D3D11_BIND_RENDER_TARGET | D3D11_BIND_UNORDERED_ACCESS))))
+    return E_INVALIDARG;
+  if ((desc.MiscFlags & D3D11_RESOURCE_MISC_SHARED) && (desc.MiscFlags & D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX)) return E_INVALIDARG;
+  if ((desc.MiscFlags & D3D11_RESOURCE_MISC_GENERATE_MIPS) && (bind & (D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE)) != (D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE)) return E_INVALIDARG;
+  if (desc.Usage > D3D11_USAGE_STAGING || (desc.Usage == D3D11_USAGE_STAGING && bind) || (desc.Usage == D3D11_USAGE_DYNAMIC && (desc.CPUAccessFlags != D3D11_CPU_ACCESS_WRITE || (bind & ~(UINT)D3D11_BIND_SHADER_RESOURCE))) ||
+      ((desc.Usage == D3D11_USAGE_DEFAULT || desc.Usage == D3D11_USAGE_IMMUTABLE) && desc.CPUAccessFlags))
+    return E_INVALIDARG;
+  /* (a typed depth format is not read by shaders: a typeless one is made for that) */
+  if ((bind & D3D11_BIND_SHADER_RESOURCE) && (desc.Format == DXGI_FORMAT_D16_UNORM || desc.Format == DXGI_FORMAT_D24_UNORM_S8_UINT || desc.Format == DXGI_FORMAT_D32_FLOAT ||
+                                               desc.Format == DXGI_FORMAT_D32_FLOAT_S8X24_UINT))
+    return E_INVALIDARG;
   if (desc.Width > 4096 || desc.Height > 4096 || slices > 256) { tex_refused(&desc, "larger than 4096 (or a volume deeper than 256)"); return E_INVALIDARG; }
   const BOOL cube = (desc.MiscFlags & D3D11_RESOURCE_MISC_TEXTURECUBE) != 0;
   if (cube && (desc.ArraySize % 6 || desc.Width != desc.Height)) return E_INVALIDARG;
@@ -857,6 +885,8 @@ static HRESULT tex_make(Dev *d, const D3D11_TEXTURE2D_DESC *in, UINT slices, ID3
   const BOOL layered = cube || slices || desc.ArraySize > 1;
   /* (a render target of levels or layers: the kernel draws into images of one level and one layer, so the texture is drawn into through targets of its own) */
   const BOOL shadowed = !res && (desc.BindFlags & D3D11_BIND_RENDER_TARGET) && desc.SampleDesc.Count == 1 && (desc.MipLevels != 1 || layered);
+  /* (a format that cannot be had for that use: refused as such, before what the kernel cannot do) */
+  if (!tex_format_for(desc.Format, desc.BindFlags) && !(res && tex_format(desc.Format))) { tex_refused(&desc, "the format, for that use"); return E_INVALIDARG; }
   /* (the kernel samples volumes, arrays and cubes; it does not draw into them, nor give unordered access to textures; a depth buffer is drawn into whole) */
   if (layered && (desc.BindFlags & (D3D11_BIND_DEPTH_STENCIL | D3D11_BIND_UNORDERED_ACCESS))) {
     tex_refused(&desc, slices ? "a volume to draw into" : cube ? "a cube to draw into" : "an array to draw into");
@@ -866,6 +896,11 @@ static HRESULT tex_make(Dev *d, const D3D11_TEXTURE2D_DESC *in, UINT slices, ID3
   /* (a multisampled texture: a render target or depth buffer of one level and one layer, drawn into and resolved; the adapter says which counts it has) */
   if (desc.SampleDesc.Count == 0) return E_INVALIDARG;
   if (desc.SampleDesc.Count > 1 && (!target || desc.ArraySize != 1 || desc.CPUAccessFlags || desc.Usage != D3D11_USAGE_DEFAULT)) { tex_refused(&desc, "multisampled"); return E_INVALIDARG; }
+  /* (a sample count the adapter has, and a quality below the levels it has for it) */
+  if (!res && (desc.SampleDesc.Count > 1 || desc.SampleDesc.Quality)) {
+    const UINT levels = dev_ms_levels(d, desc.Format, desc.SampleDesc.Count);
+    if (!levels || desc.SampleDesc.Quality >= levels) return E_INVALIDARG;
+  }
   UINT full = 1;
   UINT largest = desc.Width > desc.Height ? desc.Width : desc.Height;
   if (slices > largest) largest = slices;
@@ -1003,7 +1038,7 @@ static void STDMETHODCALLTYPE view_GetResource(View *v, ID3D11Resource **out) {
 }
 /* The list that last used what a view is of. */
 static UINT view_used(const View *v) { return v->tex ? v->tex->used : v->buf->used; }
-static void view_release_resource(View *v) { if (v->tex) dx_Release(OBJ(v->tex)); if (v->buf) dx_Release(OBJ(v->buf)); }
+static void view_release_resource(View *v) { unhold(v->tex); unhold(v->buf); }
 static void rtv_shadow_destroy(Dev *d, View *v);      /* (rtshadow.inc) */
 static void rtv_destroy(DxObj *o) {
   View *v = (View *)o;
@@ -1011,7 +1046,7 @@ static void rtv_destroy(DxObj *o) {
   if (v->scratch) { EnterCriticalSection(&d->lock); rtv_shadow_destroy(d, v); LeaveCriticalSection(&d->lock); }
   settle(d, v->tex->used);
   if (d->rtv_free_count < RTV_SLOTS) d->rtv_free[d->rtv_free_count++] = v->slot;
-  dx_Release(OBJ(v->tex));
+  unhold(v->tex);
   child_destroy(o);
 }
 static void dsv_destroy(DxObj *o) {
@@ -1022,7 +1057,7 @@ static void dsv_destroy(DxObj *o) {
     if (d->clears[i].dsv == v) d->clears[i] = d->clears[--d->clear_count]; else ++i;
   }
   if (d->dsv_free_count < DSV_SLOTS) d->dsv_free[d->dsv_free_count++] = v->slot;
-  dx_Release(OBJ(v->tex));
+  unhold(v->tex);
   child_destroy(o);
 }
 static void srv_destroy(DxObj *o) {
@@ -1098,9 +1133,9 @@ static HRESULT STDMETHODCALLTYPE dev_CreateRenderTargetView(Dev *d, ID3D11Resour
   if (!v) { LeaveCriticalSection(&d->lock); return E_OUTOFMEMORY; }
   v->slot = d->rtv_free[--d->rtv_free_count];
   LeaveCriticalSection(&d->lock);
-  dx_AddRef(OBJ(t));
+  hold(t);      /* (a view's reference to its resource is the runtime's) */
   v->tex = t;
-  if (desc) v->desc.rtv = *desc;
+  if (desc) { v->desc.rtv = *desc; if (v->desc.rtv.Format == DXGI_FORMAT_UNKNOWN) v->desc.rtv.Format = t->desc.Format; }
   else { v->desc.rtv.Format = t->desc.Format; v->desc.rtv.ViewDimension = t->one_d ? D3D11_RTV_DIMENSION_TEXTURE1D : D3D11_RTV_DIMENSION_TEXTURE2D; }
   v->handle = ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(d->rtv_heap);
   v->handle.ptr += (SIZE_T)v->slot * ID3D12Device_GetDescriptorHandleIncrementSize(d->d12, D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
@@ -1129,9 +1164,9 @@ static HRESULT STDMETHODCALLTYPE dev_CreateDepthStencilView(Dev *d, ID3D11Resour
   if (!v) { LeaveCriticalSection(&d->lock); return E_OUTOFMEMORY; }
   v->slot = d->dsv_free[--d->dsv_free_count];
   LeaveCriticalSection(&d->lock);
-  dx_AddRef(OBJ(t));
+  hold(t);      /* (a view's reference to its resource is the runtime's) */
   v->tex = t;
-  if (desc) v->desc.dsv = *desc;
+  if (desc) { v->desc.dsv = *desc; if (v->desc.dsv.Format == DXGI_FORMAT_UNKNOWN) v->desc.dsv.Format = t->desc.Format; }
   else { v->desc.dsv.Format = t->desc.Format; v->desc.dsv.ViewDimension = t->one_d ? D3D11_DSV_DIMENSION_TEXTURE1D : D3D11_DSV_DIMENSION_TEXTURE2D; }
   v->handle = ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(d->dsv_heap);
   v->handle.ptr += (SIZE_T)v->slot * ID3D12Device_GetDescriptorHandleIncrementSize(d->d12, D3D12_DESCRIPTOR_HEAP_TYPE_DSV);
@@ -1165,7 +1200,7 @@ static HRESULT srv_of_buffer(Dev *d, Buf *b, const D3D11_SHADER_RESOURCE_VIEW_DE
   if (!out) return S_FALSE;
   View *v = child_new(sizeof *v, d, &srv_vtbl, g_srv_iids, srv_destroy);
   if (!v) return E_OUTOFMEMORY;
-  dx_AddRef(OBJ(b));
+  hold(b);
   v->buf = b;
   v->offset = probe.offset;
   v->size = probe.size;
@@ -1184,7 +1219,7 @@ static HRESULT STDMETHODCALLTYPE dev_CreateShaderResourceView(Dev *d, ID3D11Reso
   if (!(t->desc.BindFlags & D3D11_BIND_SHADER_RESOURCE)) return E_INVALIDARG;      /* (a depth buffer made to be read too has one: ANGLE makes them for its depth renderbuffers) */
   View *v = child_new(sizeof *v, d, &srv_vtbl, g_srv_iids, srv_destroy);
   if (!v) return E_OUTOFMEMORY;
-  dx_AddRef(OBJ(t));
+  hold(t);      /* (a view's reference to its resource is the runtime's) */
   v->tex = t;
   if (desc) v->desc.srv = *desc;
   else {
@@ -1247,8 +1282,8 @@ static HRESULT STDMETHODCALLTYPE dev_CreateUnorderedAccessView(Dev *d, ID3D11Res
   if (!out) return S_FALSE;
   View *v = child_new(sizeof *v, d, &uav_vtbl, iids, uav_destroy);
   if (!v) return E_OUTOFMEMORY;
-  if (b) { dx_AddRef(OBJ(b)); v->buf = b; }
-  else { dx_AddRef(OBJ(t)); v->tex = t; }
+  if (b) { hold(b); v->buf = b; }
+  else { hold(t); v->tex = t; }
   v->offset = probe.offset;
   v->size = probe.size;
   v->stride = probe.stride;
@@ -1435,7 +1470,7 @@ static HRESULT STDMETHODCALLTYPE dev_CreateClassLinkage(Dev *d, ID3D11ClassLinka
 }
 static void inst_destroy(DxObj *o) {
   ClassInst *i = (ClassInst *)o;
-  if (i->linkage) dx_Release(OBJ(i->linkage));
+  unhold(i->linkage);
   child_destroy(o);
 }
 /* A string into a buffer of `size` (`*length` in: its room, out: the length with the NUL; no buffer: only the length). */
@@ -1466,7 +1501,7 @@ static HRESULT STDMETHODCALLTYPE link_CreateClassInstance(Linkage *l, LPCSTR typ
   if (n == 0 || n >= sizeof ((ClassInst *)0)->type_name) return E_INVALIDARG;
   ClassInst *i = child_new(sizeof *i, l->c.dev, &inst_vtbl, iids, inst_destroy);
   if (!i) return E_OUTOFMEMORY;
-  dx_AddRef(OBJ(l));
+  hold(l);
   i->linkage = l;
   memcpy(i->type_name, type_name, n + 1);
   i->instance_name[0] = 0;

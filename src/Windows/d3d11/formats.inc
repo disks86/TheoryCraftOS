@@ -117,6 +117,8 @@ static const TexFormat g_tex_formats[] = {
 #undef FW
 #undef FP
 
+static const TexFormat g_raw32 = {DXGI_FORMAT_R24G8_TYPELESS, DXGI_FORMAT_R8G8B8A8_TYPELESS, 4, 4, 0, 0, 0, 0, PACK_NONE, 0, FMT_SAMPLE};
+static const TexFormat g_raw64 = {DXGI_FORMAT_R32G8X24_TYPELESS, DXGI_FORMAT_R16G16B16A16_TYPELESS, 8, 8, 0, 0, 0, 0, PACK_NONE, 0, FMT_SAMPLE};
 static const TexFormat *tex_format(DXGI_FORMAT format) {
   for (UINT i = 0; i < sizeof g_tex_formats / sizeof g_tex_formats[0]; ++i)
     if (g_tex_formats[i].format == format) return &g_tex_formats[i];
@@ -130,6 +132,9 @@ static const TexFormat *tex_format_for(DXGI_FORMAT format, UINT bind) {
   /* (R32_TYPELESS, R24G8_TYPELESS, R16_TYPELESS, R32G8X24_TYPELESS are depth formats only when bound as one: R32_TYPELESS and R16_TYPELESS are colour ones otherwise) */
   if (!depth && format == DXGI_FORMAT_R32_TYPELESS) return tex_format(DXGI_FORMAT_R32_FLOAT);
   if (!depth && format == DXGI_FORMAT_R16_TYPELESS) return tex_format(DXGI_FORMAT_R16_UNORM);
+  /* (R24G8 and R32G8X24 not made for depth: their bytes, kept as they are in a format of their size - what views of them read is not converted) */
+  if (!depth && format == DXGI_FORMAT_R24G8_TYPELESS && !(bind & (D3D11_BIND_RENDER_TARGET | D3D11_BIND_UNORDERED_ACCESS))) return &g_raw32;
+  if (!depth && format == DXGI_FORMAT_R32G8X24_TYPELESS && !(bind & (D3D11_BIND_RENDER_TARGET | D3D11_BIND_UNORDERED_ACCESS))) return &g_raw64;
   if (!!(f->flags & FMT_DEPTH) != depth) return NULL;
   if ((f->flags & (FMT_BLOCK | FMT_SAMPLE)) && (bind & (D3D11_BIND_RENDER_TARGET | D3D11_BIND_UNORDERED_ACCESS))) return NULL;
   if ((bind & D3D11_BIND_RENDER_TARGET) && !(f->flags & FMT_TARGET)) return NULL;

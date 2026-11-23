@@ -63,7 +63,7 @@ programs=("$@")
 fail=0
 for src in "${programs[@]}"; do
   name=$(basename "${src%.*}")
-  x86_64-w64-mingw32-gcc -O1 -Wall -Wextra -Wno-unused-parameter -I "$work" -o "$work/$name.exe" "$src" -ld3d11 -ldxgi -ld3d12 -luuid -ldxguid -luser32 -lgdi32
+  x86_64-w64-mingw32-gcc -O1 -Wall -Wextra -Wno-unused-parameter -I "$work" -o "$work/$name.exe" "$src" -ld3d11 -ld3d9 -ldxgi -ld3d12 -luuid -ldxguid -luser32 -lgdi32
   echo "== $name"
   "$work/emurun" "$work/$name.exe" "$work/sys32" | tee "$work/$name.out"
   grep -q -e ", 0 failed" -e "all [0-9]* checks passed" "$work/$name.out" || fail=1

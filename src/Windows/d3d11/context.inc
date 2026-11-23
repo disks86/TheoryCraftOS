@@ -445,7 +445,7 @@ static void so_record(Dev *d, Ctx *c) {
     ++b->version;
     UINT k = 0;
     while (k < d->so_written_count && d->so_written[k] != b) ++k;
-    if (k == d->so_written_count && k < 16) { dx_AddRef(OBJ(b)); d->so_written[d->so_written_count++] = b; }
+    if (k == d->so_written_count && k < 16) { hold(b); d->so_written[d->so_written_count++] = b; }
   }
   ID3D12GraphicsCommandList_SOSetTargets(d->list, 0, 4, views);
   d->recorded = 1;
@@ -458,7 +458,7 @@ static void so_collect(Dev *d) {
     memcpy(&filled, b->so_fill_data, 8);
     memcpy(&began, b->so_fill_data + 8, 8);
     b->so_end = began + filled;
-    dx_Release(OBJ(b));
+    unhold(b);
   }
   d->so_written_count = 0;
 }

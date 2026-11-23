@@ -56,12 +56,12 @@ typedef struct CmdList {
 
 static void state_release(StateCopy *s) {
   if (!s || InterlockedDecrement(&s->ref) != 0) return;
-  for (UINT i = 0; i < STATE_OBJECTS; ++i) if (s->objects[i]) dx_Release(s->objects[i]);
+  for (UINT i = 0; i < STATE_OBJECTS; ++i) unhold(s->objects[i]);
   mem_free(s);
 }
 static void command_release(Command *m) {
   state_release(m->state);
-  for (UINT i = 0; i < 8; ++i) if (m->obj[i]) dx_Release(m->obj[i]);
+  for (UINT i = 0; i < 8; ++i) unhold(m->obj[i]);
   mem_free(m->data);
   mem_free(m->rects);
 }
@@ -83,7 +83,7 @@ static StateCopy *state_of(Ctx *c) {
   s->ref = 1;
   memcpy(s->objects, objects, sizeof s->objects);
   memcpy(s->values, values, STATE_VALUE_BYTES);
-  for (UINT i = 0; i < STATE_OBJECTS; ++i) if (s->objects[i]) dx_AddRef(s->objects[i]);
+  for (UINT i = 0; i < STATE_OBJECTS; ++i) hold(s->objects[i]);
   if (r) {
     state_release(r->last);
     InterlockedIncrement(&s->ref);
@@ -122,7 +122,7 @@ static void deferred_record(Ctx *c, const RecArgs *a) {
   if (!m) return;
   m->op = a->op;
   if (op_needs_state(a->op)) m->state = state_of(c);
-  for (UINT i = 0; i < 8; ++i) if ((m->obj[i] = a->obj[i]) != NULL) dx_AddRef(m->obj[i]);
+  for (UINT i = 0; i < 8; ++i) if ((m->obj[i] = a->obj[i]) != NULL) hold(m->obj[i]);
   memcpy(m->u, a->u, sizeof m->u);
   memcpy(m->f, a->f, sizeof m->f);
   if (a->box) { m->box = *a->box; m->has_box = TRUE; }
@@ -173,10 +173,10 @@ static HRESULT deferred_map(Ctx *c, ID3D11Resource *resource, UINT sub, D3D11_MA
     m = &r->maps[r->map_count++];
     memset(m, 0, sizeof *m);
     m->resource = (DxObj *)resource;
-    dx_AddRef(m->resource);
+    hold(m->resource);
     m->sub = sub;
     m->data = mem_alloc(bytes);
-    if (!m->data) { dx_Release(m->resource); --r->map_count; return E_OUTOFMEMORY; }
+    if (!m->data) { unhold(m->resource); --r->map_count; return E_OUTOFMEMORY; }
     memset(m->data, 0, bytes);
     m->bytes = bytes;
   }
@@ -202,7 +202,7 @@ static void deferred_unmap(Ctx *c, ID3D11Resource *resource, UINT sub) {
   }
 }
 static void deferred_maps_free(Deferred *r) {
-  for (UINT i = 0; i < r->map_count; ++i) { dx_Release(r->maps[i].resource); mem_free(r->maps[i].data); }
+  for (UINT i = 0; i < r->map_count; ++i) { unhold(r->maps[i].resource); mem_free(r->maps[i].data); }
   mem_free(r->maps);
   r->maps = NULL;
   r->map_count = r->map_cap = 0;
@@ -337,7 +337,7 @@ static void STDMETHODCALLTYPE ctx_ExecuteCommandList(Ctx *c, ID3D11CommandList *
       if (!m) break;
       *m = l->commands[i];
       if (m->state) InterlockedIncrement(&m->state->ref);
-      for (UINT k = 0; k < 8; ++k) if (m->obj[k]) dx_AddRef(m->obj[k]);
+      for (UINT k = 0; k < 8; ++k) hold(m->obj[k]);
       if (l->commands[i].data) { m->data = mem_alloc(m->bytes); if (m->data) memcpy(m->data, l->commands[i].data, m->bytes); else m->bytes = 0; }
       if (l->commands[i].rects) { m->rects = mem_alloc(sizeof *m->rects * m->rect_count); if (m->rects) memcpy(m->rects, l->commands[i].rects, sizeof *m->rects * m->rect_count); else m->rect_count = 0; }
     }

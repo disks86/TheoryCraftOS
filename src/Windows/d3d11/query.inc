@@ -139,7 +139,7 @@ static void measures_collect(Dev *d) {
       if (m->what == MEASURE_SAMPLES) q->samples += v;
       else if (m->what == MEASURE_PIXELS) q->stats.PSInvocations += v;
       else q->so_needed[m->what - MEASURE_STREAM] += v;
-      dx_Release(OBJ(q));
+      unhold(q);
     }
     m->count = 0;
   }
@@ -166,7 +166,7 @@ static BOOL measure_begin(Dev *d) {
   m->what = what;
   m->count = 0;
   for (UINT i = 0; i < d->active_count && m->count < 8; ++i)
-    if (query_measures(d->active[i]->desc.Query) == what) { dx_AddRef(OBJ(d->active[i])); m->queries[m->count++] = d->active[i]; }
+    if (query_measures(d->active[i]->desc.Query) == what) { hold(d->active[i]); m->queries[m->count++] = d->active[i]; }
   /* the kernel's kinds: 0 the samples, 5 the pixel shader's invocations, 8 | stream << 8 the stream output's primitives needed */
   const UINT kind = what == MEASURE_SAMPLES ? 0u : what == MEASURE_PIXELS ? 5u : 8u | ((what - MEASURE_STREAM) << 8);
   TcosD3D12BeginQueryKind(d->list, d->measure_heap, d->measure_count, kind);
@@ -238,7 +238,7 @@ static void query_deactivate(Dev *d, Query *q) {
     if (d->active[i] == q) {
       d->active[i] = d->active[--d->active_count];
       q->active = FALSE;
-      dx_Release(OBJ(q));
+      unhold(q);
       return;
     }
 }
@@ -252,7 +252,7 @@ static void STDMETHODCALLTYPE ctx_Begin(Ctx *c, ID3D11Asynchronous *async) {
   EnterCriticalSection(&d->lock);
   /* (begun again: counting starts over) */
   if (!q->active && d->active_count == ACTIVE_QUERIES) { LeaveCriticalSection(&d->lock); return; }
-  if (!q->active) { dx_AddRef(OBJ(q)); d->active[d->active_count++] = q; q->active = TRUE; }
+  if (!q->active) { hold(q); d->active[d->active_count++] = q; q->active = TRUE; }
   q->begun = TRUE;
   q->ended = FALSE;
   q->samples = 0;
@@ -271,7 +271,7 @@ static void STDMETHODCALLTYPE ctx_End(Ctx *c, ID3D11Asynchronous *async) {
   if (!q) return;
   if (q->desc.Query != D3D11_QUERY_EVENT && q->desc.Query != D3D11_QUERY_TIMESTAMP && !q->active) return;      /* (an End without a Begin) */
   EnterCriticalSection(&d->lock);
-  dx_AddRef(OBJ(q));
+  hold(q);
   query_deactivate(d, q);
   flush(d);      /* (what came before is done, and what the kernel measured for it is in) */
   if (query_stream(q->desc.Query) <= 4)
@@ -286,7 +286,7 @@ static void STDMETHODCALLTYPE ctx_End(Ctx *c, ID3D11Asynchronous *async) {
   q->begun = FALSE;
   q->ended = TRUE;
   LeaveCriticalSection(&d->lock);
-  dx_Release(OBJ(q));
+  unhold(q);
 }
 /* The result of a predicate: an occlusion predicate is true when some sample passed, a stream-output one when a stream needed more room than it had. */
 static BOOL query_predicate_value(const Query *q) {
