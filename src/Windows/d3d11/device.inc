@@ -28,6 +28,7 @@ static HRESULT STDMETHODCALLTYPE dev_QueryInterface(Dev *d, REFIID riid, void **
   else if (guid_eq(riid, &IID_IDXGIObject) || guid_eq(riid, &IID_IDXGIDevice) || guid_eq(riid, &IID_IDXGIDevice1) || guid_eq(riid, &IID_IDXGIDevice2) ||
            guid_eq(riid, &IID_IDXGIDevice3)) *out = &d->dxgi;      /* (DXGI 1.2: ANGLE needs it to present to another process's window) */
   else if (guid_eq(riid, &IID_ITcosPresenter)) *out = &d->presenter;
+  else if ((guid_eq(riid, &IID_ID3D11On12Device) || guid_eq(riid, &IID_ID3D11On12Device1)) && d->on12.lpVtbl) *out = &d->on12;      /* (a device of D3D11On12CreateDevice) */
   else { dx_no_interface("ID3D11Device", riid); return E_NOINTERFACE; }
   dx_AddRef(OBJ(d));
   return S_OK;
@@ -265,10 +266,14 @@ static HRESULT make_heap(Dev *d, D3D12_DESCRIPTOR_HEAP_TYPE type, UINT count, BO
 
 /* The Direct3D 12 half of a device: FALSE when some part of it could not be made. */
 static HRESULT dev_start(Dev *d) {
-  HRESULT hr = D3D12CreateDevice((IUnknown *)d->adapter, D3D_FEATURE_LEVEL_11_0, &IID_ID3D12Device, (void **)&d->d12);
-  if (FAILED(hr) || !d->d12) return DXGI_ERROR_UNSUPPORTED;
+  HRESULT hr = S_OK;
+  /* (a device of its own, or the program's: D3D11On12CreateDevice) */
+  if (!d->d12) {
+    hr = D3D12CreateDevice((IUnknown *)d->adapter, D3D_FEATURE_LEVEL_11_0, &IID_ID3D12Device, (void **)&d->d12);
+    if (FAILED(hr) || !d->d12) return DXGI_ERROR_UNSUPPORTED;
+  }
   D3D12_COMMAND_QUEUE_DESC qd = {D3D12_COMMAND_LIST_TYPE_DIRECT, D3D12_COMMAND_QUEUE_PRIORITY_NORMAL, D3D12_COMMAND_QUEUE_FLAG_NONE, 0};
-  hr = ID3D12Device_CreateCommandQueue(d->d12, &qd, &IID_ID3D12CommandQueue, (void **)&d->queue);
+  if (!d->queue) hr = ID3D12Device_CreateCommandQueue(d->d12, &qd, &IID_ID3D12CommandQueue, (void **)&d->queue);
   if (SUCCEEDED(hr)) hr = ID3D12Device_CreateCommandAllocator(d->d12, D3D12_COMMAND_LIST_TYPE_DIRECT, &IID_ID3D12CommandAllocator, (void **)&d->allocator);
   if (SUCCEEDED(hr)) hr = ID3D12Device_CreateCommandList(d->d12, 0, D3D12_COMMAND_LIST_TYPE_DIRECT, d->allocator, NULL, &IID_ID3D12GraphicsCommandList, (void **)&d->list);
   if (FAILED(hr)) return hr;
@@ -364,13 +369,14 @@ static HRESULT dev_start(Dev *d) {
   if (!c) return E_OUTOFMEMORY;
   dx_init(&c->o, &ctx_vtbl, g_ctx_iids, NULL);
   c->dev = d;
+  ctx_init_faces(c);
   c->sample_mask = 0xFFFFFFFFu;
   for (UINT i = 0; i < 4; ++i) c->blend_factor[i] = 1.0f;
   d->ctx = c;
   return S_OK;
 }
 
-static HRESULT dev_create(IDXGIAdapter *adapter, UINT flags, const D3D_FEATURE_LEVEL *levels, UINT level_count, Dev **out) {
+static HRESULT dev_create_on(IDXGIAdapter *adapter, UINT flags, const D3D_FEATURE_LEVEL *levels, UINT level_count, ID3D12Device *d12, ID3D12CommandQueue *queue, Dev **out) {
   *out = NULL;
   D3D_FEATURE_LEVEL level = D3D_FEATURE_LEVEL_11_0;
   if (levels && level_count) {      /* the first the program asks for that is not above what there is */
@@ -387,6 +393,13 @@ static HRESULT dev_create(IDXGIAdapter *adapter, UINT flags, const D3D_FEATURE_L
   InitializeCriticalSection(&d->lock);
   d->level = level;
   d->flags = flags;
+  if (d12) {
+    ID3D12Device_AddRef(d12);
+    ID3D12CommandQueue_AddRef(queue);
+    d->d12 = d12;
+    d->queue = queue;
+    d->on12.lpVtbl = &g_on12_vtbl;
+  }
   HRESULT hr = S_OK;
   if (adapter) {
     IDXGIAdapter_AddRef(adapter);
@@ -401,6 +414,9 @@ static HRESULT dev_create(IDXGIAdapter *adapter, UINT flags, const D3D_FEATURE_L
   if (FAILED(hr)) { dx_Release(OBJ(d)); return hr; }
   *out = d;
   return S_OK;
+}
+static HRESULT dev_create(IDXGIAdapter *adapter, UINT flags, const D3D_FEATURE_LEVEL *levels, UINT level_count, Dev **out) {
+  return dev_create_on(adapter, flags, levels, level_count, NULL, NULL, out);
 }
 
 /* ---- the entry points ------------------------------------------------------------------------------------------------------------------------------- */
@@ -417,8 +433,13 @@ EXPORT HRESULT WINAPI D3D11CreateDevice(IDXGIAdapter *adapter, D3D_DRIVER_TYPE d
   if (device) *device = NULL;
   if (feature_level) *feature_level = 0;
   if (context) *context = NULL;
-  if (adapter && driver_type != D3D_DRIVER_TYPE_UNKNOWN) return E_INVALIDARG;
+  /* (an adapter goes with D3D_DRIVER_TYPE_UNKNOWN, no adapter with a driver type) */
+  if (adapter ? driver_type != D3D_DRIVER_TYPE_UNKNOWN : driver_type == D3D_DRIVER_TYPE_UNKNOWN) return E_INVALIDARG;
   if (driver_type == D3D_DRIVER_TYPE_SOFTWARE && !software) return E_INVALIDARG;
+  if (driver_type > D3D_DRIVER_TYPE_WARP) return E_INVALIDARG;
+  if (driver_type == D3D_DRIVER_TYPE_REFERENCE || driver_type == D3D_DRIVER_TYPE_SOFTWARE) return DXGI_ERROR_UNSUPPORTED;      /* (no reference rasterizer, no program's own) */
+  /* (the debug layer is part of the SDK's optional Graphics Tools, which this system does not have: Windows answers so without them) */
+  if (flags & D3D11_CREATE_DEVICE_DEBUG) return DXGI_ERROR_SDK_COMPONENT_MISSING;
   Dev *d = NULL;
   const HRESULT hr = dev_create(adapter, flags, levels, level_count, &d);
   if (FAILED(hr)) return hr;
@@ -433,7 +454,16 @@ EXPORT HRESULT WINAPI D3D11CreateDeviceAndSwapChain(IDXGIAdapter *adapter, D3D_D
                                                     UINT level_count, UINT sdk, const DXGI_SWAP_CHAIN_DESC *description, IDXGISwapChain **swap_chain, ID3D11Device **device,
                                                     D3D_FEATURE_LEVEL *feature_level, ID3D11DeviceContext **context) {
   if (swap_chain) *swap_chain = NULL;
+  if (device) *device = NULL;
+  if (feature_level) *feature_level = 0;
+  if (context) *context = NULL;
   if (!swap_chain || !description) return D3D11CreateDevice(adapter, driver_type, software, flags, levels, level_count, sdk, device, feature_level, context);
+  /* (what a swap chain is checked for before anything is made: a window, and a format a swap chain can have) */
+  if (!description->OutputWindow) return DXGI_ERROR_INVALID_CALL;
+  const DXGI_FORMAT f = description->BufferDesc.Format;
+  if (f != DXGI_FORMAT_B8G8R8A8_UNORM && f != DXGI_FORMAT_R8G8B8A8_UNORM && f != DXGI_FORMAT_B8G8R8A8_UNORM_SRGB && f != DXGI_FORMAT_R8G8B8A8_UNORM_SRGB &&
+      f != DXGI_FORMAT_R16G16B16A16_FLOAT && f != DXGI_FORMAT_R10G10B10A2_UNORM)
+    return E_INVALIDARG;
   ID3D11Device *made = NULL;
   ID3D11DeviceContext *made_context = NULL;
   HRESULT hr = D3D11CreateDevice(adapter, driver_type, software, flags, levels, level_count, sdk, &made, feature_level, &made_context);
@@ -456,12 +486,3 @@ EXPORT HRESULT WINAPI D3D11CreateDeviceAndSwapChain(IDXGIAdapter *adapter, D3D_D
   return S_OK;
 }
 
-/* (a Direct3D 12 device that is not this runtime's own: not there) */
-EXPORT HRESULT WINAPI D3D11On12CreateDevice(IUnknown *device12, UINT flags, const D3D_FEATURE_LEVEL *levels, UINT level_count, IUnknown *const *queues, UINT queue_count, UINT node_mask,
-                                            ID3D11Device **device, ID3D11DeviceContext **context, D3D_FEATURE_LEVEL *feature_level) {
-  (void)device12; (void)flags; (void)levels; (void)level_count; (void)queues; (void)queue_count; (void)node_mask;
-  if (device) *device = NULL;
-  if (context) *context = NULL;
-  if (feature_level) *feature_level = 0;
-  return DXGI_ERROR_UNSUPPORTED;
-}

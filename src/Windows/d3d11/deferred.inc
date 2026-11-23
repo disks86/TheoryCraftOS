@@ -240,6 +240,7 @@ static void cmdlist_destroy(DxObj *o) {
 static UINT STDMETHODCALLTYPE cmdlist_GetContextFlags(CmdList *l) { return l->flags; }
 
 static void ctx_ClearState(Ctx *c);
+static void ctx_init_faces(Ctx *c);
 static HRESULT STDMETHODCALLTYPE ctx_FinishCommandList(Ctx *c, BOOL restore, ID3D11CommandList **out) {
   extern const ID3D11CommandListVtbl cmdlist_vtbl;
   static const GUID *const iids[] = {&IID_ID3D11DeviceChild, &IID_ID3D11CommandList, NULL};
@@ -385,6 +386,7 @@ static HRESULT STDMETHODCALLTYPE dev_CreateDeferredContext(Dev *d, UINT flags, I
   dx_AddRef(OBJ(d));
   c->deferred = TRUE;
   c->flags = flags;
+  ctx_init_faces(c);
   c->sample_mask = 0xFFFFFFFFu;
   for (UINT i = 0; i < 4; ++i) c->blend_factor[i] = 1.0f;
   c->rec = mem_alloc(sizeof *c->rec);

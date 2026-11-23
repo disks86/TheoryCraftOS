@@ -187,3 +187,38 @@ static HRESULT STDMETHODCALLTYPE dev_OpenSharedResourceByName(Dev *d, LPCWSTR na
   if (out) *out = NULL;
   return E_INVALIDARG;
 }
+
+/* ---- ID3D11Multithread and ID3DUserDefinedAnnotation -------------------------------------------------------------------------------------------------------------- */
+
+static Ctx *ctx_of_multithread(ID3D11Multithread *p) { return (Ctx *)((BYTE *)p - offsetof(Ctx, multithread)); }
+static Ctx *ctx_of_annotation(ID3DUserDefinedAnnotation *p) { return (Ctx *)((BYTE *)p - offsetof(Ctx, annotation)); }
+static HRESULT STDMETHODCALLTYPE ctx_QueryInterface(Ctx *c, REFIID riid, void **out);
+static HRESULT STDMETHODCALLTYPE mt_QueryInterface(ID3D11Multithread *p, REFIID riid, void **out) { return ctx_QueryInterface(ctx_of_multithread(p), riid, out); }
+static ULONG STDMETHODCALLTYPE mt_AddRef(ID3D11Multithread *p) { return ctx_AddRef(ctx_of_multithread(p)); }
+static ULONG STDMETHODCALLTYPE mt_Release(ID3D11Multithread *p) { return ctx_Release(ctx_of_multithread(p)); }
+/* Enter and Leave: the device's lock, which the context's calls take too. */
+static void STDMETHODCALLTYPE mt_Enter(ID3D11Multithread *p) { EnterCriticalSection(&ctx_of_multithread(p)->dev->lock); }
+static void STDMETHODCALLTYPE mt_Leave(ID3D11Multithread *p) { LeaveCriticalSection(&ctx_of_multithread(p)->dev->lock); }
+static BOOL STDMETHODCALLTYPE mt_SetMultithreadProtected(ID3D11Multithread *p, BOOL on) {
+  Ctx *c = ctx_of_multithread(p);
+  const BOOL was = c->protected_;
+  c->protected_ = !!on;
+  return was;
+}
+static BOOL STDMETHODCALLTYPE mt_GetMultithreadProtected(ID3D11Multithread *p) { return ctx_of_multithread(p)->protected_; }
+static const ID3D11MultithreadVtbl g_mt_vtbl = {mt_QueryInterface, mt_AddRef, mt_Release, mt_Enter, mt_Leave, mt_SetMultithreadProtected, mt_GetMultithreadProtected};
+
+/* The events and markers of a profiler: with no profiler attached they are not kept, and BeginEvent and EndEvent answer -1 (as Windows does then). */
+static HRESULT STDMETHODCALLTYPE an_QueryInterface(ID3DUserDefinedAnnotation *p, REFIID riid, void **out) { return ctx_QueryInterface(ctx_of_annotation(p), riid, out); }
+static ULONG STDMETHODCALLTYPE an_AddRef(ID3DUserDefinedAnnotation *p) { return ctx_AddRef(ctx_of_annotation(p)); }
+static ULONG STDMETHODCALLTYPE an_Release(ID3DUserDefinedAnnotation *p) { return ctx_Release(ctx_of_annotation(p)); }
+static INT STDMETHODCALLTYPE an_BeginEvent(ID3DUserDefinedAnnotation *p, LPCWSTR name) { (void)p; (void)name; return -1; }
+static INT STDMETHODCALLTYPE an_EndEvent(ID3DUserDefinedAnnotation *p) { (void)p; return -1; }
+static void STDMETHODCALLTYPE an_SetMarker(ID3DUserDefinedAnnotation *p, LPCWSTR name) { (void)p; (void)name; }
+static BOOL STDMETHODCALLTYPE an_GetStatus(ID3DUserDefinedAnnotation *p) { (void)p; return FALSE; }
+static const ID3DUserDefinedAnnotationVtbl g_annotation_vtbl = {an_QueryInterface, an_AddRef, an_Release, an_BeginEvent, an_EndEvent, an_SetMarker, an_GetStatus};
+
+static void ctx_init_faces(Ctx *c) {
+  c->multithread.lpVtbl = &g_mt_vtbl;
+  c->annotation.lpVtbl = &g_annotation_vtbl;
+}

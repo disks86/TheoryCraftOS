@@ -46,6 +46,8 @@
 #include <stddef.h>
 #include <d3d11.h>
 #include <d3d11_1.h>
+#include <d3d11_4.h>
+#include <d3d11on12.h>
 #include <d3d10_1.h>
 #include <d3d12.h>
 #include <dxgi1_3.h>
@@ -243,6 +245,9 @@ typedef struct Pipeline {
 typedef struct Ctx {
   DxObj o;
   Dev *dev;
+  ID3D11Multithread multithread;              /* the same object as ID3D11Multithread (the immediate context's) and ID3DUserDefinedAnnotation (context1.inc) */
+  ID3DUserDefinedAnnotation annotation;
+  BOOL protected_;                            /* SetMultithreadProtected (the device's lock is taken by every call that needs it, whatever this says) */
   /* ---- the bound objects (references) */
   Shader *vs, *ps;
   Layout *layout;
@@ -314,6 +319,7 @@ struct Dev {
   DxObj o;
   IDXGIDevice1 dxgi;                       /* the same object, for dxgi's interfaces */
   ITcosPresenter presenter;                /* ... and for dxgi.dll's swap chains */
+  ID3D11On12Device1 on12;                  /* ... and, made by D3D11On12CreateDevice on the program's Direct3D 12 device, ID3D11On12Device1 (interop.inc; NULL table: not one) */
   CRITICAL_SECTION lock;
   IDXGIAdapter *adapter;
   IDXGIFactory1 *factory;                  /* the factory the adapter was taken from, when the program gave none */
@@ -647,7 +653,7 @@ static BOOL buffer_desc_valid(const D3D11_BUFFER_DESC *desc, const D3D11_SUBRESO
 
 static HRESULT STDMETHODCALLTYPE dev_CreateBuffer(Dev *d, const D3D11_BUFFER_DESC *desc, const D3D11_SUBRESOURCE_DATA *initial, ID3D11Buffer **out) {
   if (out) *out = NULL;
-  if (!desc || !buffer_desc_valid(desc, initial)) return E_INVALIDARG;
+  if (!desc || !buffer_desc_valid(desc, initial) || (initial && !initial->pSysMem)) return E_INVALIDARG;
   if (!out) return S_FALSE;
   Buf *b = child_new(sizeof *b, d, &buf_vtbl, g_buf_iids, buf_destroy);
   if (!b) return E_OUTOFMEMORY;
@@ -879,6 +885,7 @@ static HRESULT tex_make(Dev *d, const D3D11_TEXTURE2D_DESC *in, UINT slices, ID3
 /* The contents a texture is made with: every subresource (each slice of a volume's levels), in the program's order. */
 static HRESULT tex_initial(Dev *d, Tex *t, const D3D11_SUBRESOURCE_DATA *initial) {
   HRESULT hr = S_OK;
+  for (UINT sub = 0; sub < tex_subresources(t); ++sub) if (!initial[sub].pSysMem) return E_INVALIDARG;      /* (initial data has every subresource) */
   for (UINT sub = 0; SUCCEEDED(hr) && sub < tex_subresources(t); ++sub) {
     if (!initial[sub].pSysMem) continue;
     const UINT level = sub % t->desc.MipLevels, w = mip_size(t->desc.Width, level), h = mip_size(t->desc.Height, level);
@@ -1750,6 +1757,8 @@ static void STDMETHODCALLTYPE ctx_ClearView(Ctx *c, ID3D11View *view, const FLOA
 #include "context.inc"
 #include "deferred.inc"
 #include "context1.inc"
+static const ID3D11On12Device1Vtbl g_on12_vtbl;
 #include "device.inc"
+#include "interop.inc"
 #include "dxgi_resource.inc"
 #include "vtbl.inc"

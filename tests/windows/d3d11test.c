@@ -28,6 +28,9 @@
 #include <string.h>
 #include <d3d11.h>
 #include <d3d11_1.h>
+#include <d3d11_4.h>
+#include <d3d11on12.h>
+#include <d3d12.h>
 #include <dxgi1_3.h>
 #include "dxfixtures.h"
 
@@ -2006,6 +2009,127 @@ static void test_formats(void) {
         "CheckFormatSupport of R16G16_FLOAT: a render target, sampled, blended");
 }
 
+/* ---- making devices, 11 on 12, the Windows Runtime's face ------------------------------------------------------------------------------------------------ */
+
+static void test_creation_and_interop(void) {
+  ID3D11Device *device = (ID3D11Device *)1;
+  D3D_FEATURE_LEVEL level = (D3D_FEATURE_LEVEL)1;
+  check(D3D11CreateDevice(NULL, D3D_DRIVER_TYPE_UNKNOWN, NULL, 0, NULL, 0, D3D11_SDK_VERSION, &device, &level, NULL) == E_INVALIDARG && !device && !level,
+        "D3D11CreateDevice: no adapter needs a driver type");
+  device = (ID3D11Device *)1;
+  check(D3D11CreateDevice(NULL, D3D_DRIVER_TYPE_HARDWARE, NULL, D3D11_CREATE_DEVICE_DEBUG, NULL, 0, D3D11_SDK_VERSION, &device, NULL, NULL) == DXGI_ERROR_SDK_COMPONENT_MISSING && !device,
+        "a debug device needs the SDK's layers, which are not there");
+  ID3D11Multithread *mt = NULL;
+  ID3DUserDefinedAnnotation *annotation = NULL;
+  ID3D11DeviceContext_QueryInterface(g_context, &IID_ID3D11Multithread, (void **)&mt);
+  ID3D11DeviceContext_QueryInterface(g_context, &IID_ID3DUserDefinedAnnotation, (void **)&annotation);
+  check(mt && !ID3D11Multithread_GetMultithreadProtected(mt) && ID3D11Multithread_SetMultithreadProtected(mt, TRUE) == FALSE && ID3D11Multithread_GetMultithreadProtected(mt),
+        "ID3D11Multithread of the immediate context");
+  if (mt) { ID3D11Multithread_Enter(mt); ID3D11Multithread_Leave(mt); ID3D11Multithread_SetMultithreadProtected(mt, FALSE); ID3D11Multithread_Release(mt); }
+  check(annotation && ID3DUserDefinedAnnotation_BeginEvent(annotation, L"event") == -1 && ID3DUserDefinedAnnotation_EndEvent(annotation) == -1 &&
+        ID3DUserDefinedAnnotation_GetStatus(annotation) == FALSE, "ID3DUserDefinedAnnotation: no profiler (BeginEvent and EndEvent answer -1)");
+  if (annotation) ID3DUserDefinedAnnotation_Release(annotation);
+
+  /* D3D11CoreCreateDevice */
+  typedef HRESULT (WINAPI *CoreCreate)(IDXGIFactory *, IDXGIAdapter *, UINT, const D3D_FEATURE_LEVEL *, UINT, ID3D11Device **);
+  CoreCreate core = (CoreCreate)(void (*)(void))GetProcAddress(GetModuleHandleW(L"d3d11.dll"), "D3D11CoreCreateDevice");
+  IDXGIFactory *factory = NULL;
+  CreateDXGIFactory(&IID_IDXGIFactory, (void **)&factory);
+  device = NULL;
+  check(core && factory && SUCCEEDED(core(factory, NULL, 0, NULL, 0, &device)) && device && ID3D11Device_GetFeatureLevel(device) == D3D_FEATURE_LEVEL_11_0, "D3D11CoreCreateDevice");
+  if (device) ID3D11Device_Release(device);
+  if (factory) IDXGIFactory_Release(factory);
+
+  /* the Windows Runtime's device and surface */
+  typedef HRESULT (WINAPI *FromDevice)(IDXGIDevice *, IUnknown **);
+  typedef HRESULT (WINAPI *FromSurface)(IDXGISurface *, IUnknown **);
+  FromDevice from_device = (FromDevice)(void (*)(void))GetProcAddress(GetModuleHandleW(L"d3d11.dll"), "CreateDirect3D11DeviceFromDXGIDevice");
+  FromSurface from_surface = (FromSurface)(void (*)(void))GetProcAddress(GetModuleHandleW(L"d3d11.dll"), "CreateDirect3D11SurfaceFromDXGISurface");
+  static const GUID iid_access = {0xa9b3d012, 0x3df2, 0x4ee3, {0xb8, 0xd1, 0x86, 0x95, 0xf4, 0x57, 0xd3, 0xc1}};
+  static const GUID iid_closable = {0x30d5a829, 0x7fa4, 0x4026, {0x83, 0xbb, 0xd7, 0x5b, 0xae, 0x4e, 0xa9, 0x9e}};
+  typedef struct { const struct { HRESULT (WINAPI *qi)(void *, REFIID, void **); ULONG (WINAPI *add)(void *); ULONG (WINAPI *rel)(void *); HRESULT (WINAPI *get)(void *, REFIID, void **); } *v; } Access;
+  typedef struct { const struct { void *qi, *add; ULONG (WINAPI *rel)(void *); void *iids, *name, *trust; HRESULT (WINAPI *close)(void *); } *v; } Closable;
+  IDXGIDevice *dxgi = NULL;
+  ID3D11Device_QueryInterface(g_device, &IID_IDXGIDevice, (void **)&dxgi);
+  IUnknown *winrt = NULL;
+  Access *access = NULL;
+  ID3D11Device *back = NULL;
+  check(from_device && dxgi && SUCCEEDED(from_device(dxgi, &winrt)) && winrt && SUCCEEDED(IUnknown_QueryInterface(winrt, &iid_access, (void **)&access)) && access &&
+        SUCCEEDED(access->v->get(access, &IID_ID3D11Device, (void **)&back)) && back == g_device,
+        "CreateDirect3D11DeviceFromDXGIDevice: an IDirect3DDevice whose IDirect3DDxgiInterfaceAccess gives the device back");
+  if (back) ID3D11Device_Release(back);
+  Closable *closable = NULL;
+  if (winrt) IUnknown_QueryInterface(winrt, &iid_closable, (void **)&closable);
+  back = NULL;
+  check(closable && SUCCEEDED(closable->v->close(closable)) && access && access->v->get(access, &IID_ID3D11Device, (void **)&back) == (HRESULT)0x80000013 && !back,
+        "... and once closed (IClosable) it answers RO_E_CLOSED");
+  if (closable) closable->v->rel(closable);
+  if (access) access->v->rel(access);
+  if (winrt) IUnknown_Release(winrt);
+  if (dxgi) IDXGIDevice_Release(dxgi);
+  IDXGISurface *surface = NULL;
+  ID3D11Texture2D_QueryInterface(g_target, &IID_IDXGISurface, (void **)&surface);
+  winrt = NULL;
+  typedef struct { const struct { void *qi, *add; ULONG (WINAPI *rel)(void *); void *iids, *name, *trust; HRESULT (WINAPI *desc)(void *, INT32 *); } *v; } WinRtSurface;
+  INT32 description[5] = {0, 0, 0, 0, 0};
+  check(from_surface && surface && SUCCEEDED(from_surface(surface, &winrt)) && winrt && SUCCEEDED(((WinRtSurface *)winrt)->v->desc(winrt, description)) &&
+        description[0] == SIZE && description[1] == SIZE && description[2] == DXGI_FORMAT_B8G8R8A8_UNORM && description[3] == 1,
+        "CreateDirect3D11SurfaceFromDXGISurface: an IDirect3DSurface and its description");
+  if (winrt) IUnknown_Release(winrt);
+  if (surface) IDXGISurface_Release(surface);
+
+  /* 11 on 12: a Direct3D 11 device on the program's Direct3D 12 device, a texture of Direct3D 12 wrapped and cleared through Direct3D 11 */
+  ID3D12Device *d12 = NULL;
+  ID3D12CommandQueue *queue = NULL;
+  D3D12_COMMAND_QUEUE_DESC qd = {D3D12_COMMAND_LIST_TYPE_DIRECT, 0, D3D12_COMMAND_QUEUE_FLAG_NONE, 0};
+  if (SUCCEEDED(D3D12CreateDevice(NULL, D3D_FEATURE_LEVEL_11_0, &IID_ID3D12Device, (void **)&d12)) && d12)
+    ID3D12Device_CreateCommandQueue(d12, &qd, &IID_ID3D12CommandQueue, (void **)&queue);
+  ID3D11Device *on12 = NULL;
+  ID3D11DeviceContext *on12_context = NULL;
+  ID3D11On12Device *interop = NULL;
+  HRESULT hr = d12 && queue ? D3D11On12CreateDevice((IUnknown *)d12, 0, NULL, 0, (IUnknown **)&queue, 1, 0, &on12, &on12_context, NULL) : E_FAIL;
+  if (on12) ID3D11Device_QueryInterface(on12, &IID_ID3D11On12Device, (void **)&interop);
+  check(SUCCEEDED(hr) && on12 && on12_context && interop, "D3D11On12CreateDevice: a device on a Direct3D 12 device and queue, an ID3D11On12Device");
+  if (interop) {
+    D3D12_HEAP_PROPERTIES heap = {D3D12_HEAP_TYPE_DEFAULT, D3D12_CPU_PAGE_PROPERTY_UNKNOWN, D3D12_MEMORY_POOL_UNKNOWN, 1, 1};
+    D3D12_RESOURCE_DESC rd = {D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, 8, 8, 1, 1, DXGI_FORMAT_R8G8B8A8_UNORM, {1, 0}, D3D12_TEXTURE_LAYOUT_UNKNOWN, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET};
+    ID3D12Resource *res = NULL;
+    ID3D12Device_CreateCommittedResource(d12, &heap, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_RENDER_TARGET, NULL, &IID_ID3D12Resource, (void **)&res);
+    const D3D11_RESOURCE_FLAGS flags = {D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE, 0, 0, 0};
+    ID3D11Texture2D *wrapped = NULL;
+    if (res) ID3D11On12Device_CreateWrappedResource(interop, (IUnknown *)res, &flags, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE, &IID_ID3D11Texture2D, (void **)&wrapped);
+    D3D11_TEXTURE2D_DESC wd;
+    memset(&wd, 0, sizeof wd);
+    if (wrapped) ID3D11Texture2D_GetDesc(wrapped, &wd);
+    ID3D11RenderTargetView *view = NULL;
+    if (wrapped) ID3D11Device_CreateRenderTargetView(on12, (ID3D11Resource *)wrapped, NULL, &view);
+    UINT32 texel = 0;
+    if (view) {
+      const float green[4] = {0, 1, 0, 1};
+      ID3D11DeviceContext_ClearRenderTargetView(on12_context, view, green);
+      ID3D11On12Device_ReleaseWrappedResources(interop, (ID3D11Resource **)&wrapped, 1);
+      D3D11_TEXTURE2D_DESC sd = {8, 8, 1, 1, DXGI_FORMAT_R8G8B8A8_UNORM, {1, 0}, D3D11_USAGE_STAGING, 0, D3D11_CPU_ACCESS_READ, 0};
+      ID3D11Texture2D *staging = NULL;
+      ID3D11Device_CreateTexture2D(on12, &sd, NULL, &staging);
+      if (staging) {
+        ID3D11DeviceContext_CopyResource(on12_context, (ID3D11Resource *)staging, (ID3D11Resource *)wrapped);
+        D3D11_MAPPED_SUBRESOURCE mapped;
+        if (SUCCEEDED(ID3D11DeviceContext_Map(on12_context, (ID3D11Resource *)staging, 0, D3D11_MAP_READ, 0, &mapped))) { memcpy(&texel, mapped.pData, 4); ID3D11DeviceContext_Unmap(on12_context, (ID3D11Resource *)staging, 0); }
+        ID3D11Texture2D_Release(staging);
+      }
+    }
+    check(wrapped && wd.Width == 8 && wd.Height == 8 && wd.Format == DXGI_FORMAT_R8G8B8A8_UNORM && texel == 0xFF00FF00u, "CreateWrappedResource: the Direct3D 12 texture cleared through Direct3D 11");
+    if (view) ID3D11RenderTargetView_Release(view);
+    if (wrapped) ID3D11Texture2D_Release(wrapped);
+    if (res) ID3D12Resource_Release(res);
+    ID3D11On12Device_Release(interop);
+  }
+  if (on12_context) ID3D11DeviceContext_Release(on12_context);
+  if (on12) ID3D11Device_Release(on12);
+  if (queue) ID3D12CommandQueue_Release(queue);
+  if (d12) ID3D12Device_Release(d12);
+}
+
 int main(void) {
   test_device();
   if (g_device && g_context) {
@@ -2036,6 +2160,7 @@ int main(void) {
       test_d3d11_1();
       test_texture1d();
       test_formats();
+      test_creation_and_interop();
     }
     ID3D11DeviceContext_ClearState(g_context);
     ID3D11DeviceContext_Flush(g_context);
