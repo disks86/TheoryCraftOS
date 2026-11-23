@@ -49,9 +49,12 @@ enum DxbcOp : uint32_t {
   kEmit4 = 19, kCut4 = 9, kDclOutputTopology4 = 92, kDclInputPrimitive4 = 93, kDclMaxOutputVertices4 = 94, kDclGsInstanceCount4 = 206, kDclThreadGroup4 = 155, kDclResourceRaw4 = 161, kDclResourceStructured4 = 162, kDclUavRaw4 = 157, kDclUavStructured4 = 158, kLdRaw4 = 165, kStoreRaw4 = 166, kLdStructured4 = 167, kStoreStructured4 = 168, kSync4 = 190, kDclTgsmRaw4 = 159, kDclTgsmStructured4 = 160,
   kDclOutput4 = 101, kDclOutputSgv4 = 102, kDclOutputSiv4 = 103, kDclTemps4 = 104, kDclIndexableTemp4 = 105, kDclGlobalFlags4 = 106,
 };
-// The texture a dcl_resource declares (D3D10_SB_RESOURCE_DIMENSION: 3 texture2d, 5 texture3d, 6 texturecube, 8 texture2darray); the others are not taken.
+// The texture a dcl_resource declares (D3D10_SB_RESOURCE_DIMENSION: 2 texture1d, 3 texture2d, 5 texture3d, 6 texturecube, 7 texture1darray, 8 texture2darray); the others
+// are not taken. A one-dimensional texture is a two-dimensional one a texel high (and an array of them an array of those): the accesses to it are rewritten (one_d_fix).
 bool resource_kind(uint32_t dimension, graphics::TextureKind* kind) {
   switch (dimension) {
+    case 2: *kind = graphics::TextureKind::Texture2D; return true;
+    case 7: *kind = graphics::TextureKind::Texture2DArray; return true;
     case 3: *kind = graphics::TextureKind::Texture2D; return true;
     case 4: *kind = graphics::TextureKind::Texture2DMS; return true;   // (dcl_resource_texture2dms: the sample count is in the token)
     case 5: *kind = graphics::TextureKind::Texture3D; return true;
@@ -546,6 +549,79 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
     return program->code_.push_back(ins) ? status::kSuccess : status::kNoMemory;
   };
 
+  // One-dimensional textures (texture1d, texture1darray) are two-dimensional ones a texel high, and arrays of those. An access to one goes through the last three
+  // temporaries, which such a program may not declare: its coordinate (and the gradients of sample_d) gets a second component - the middle of the row to sample, row 0
+  // to load - and an array's layer moves from the second component to the third; resinfo's result gets its second component back (0, or the array's size).
+  uint32_t one_d_units = 0, declared_temps = 0;
+  auto one_d_fix = [&](Instr& ins) -> NtStatus {
+    constexpr uint16_t kScratch = static_cast<uint16_t>(kMaxTemps - 1), kGradX = static_cast<uint16_t>(kMaxTemps - 2), kGradY = static_cast<uint16_t>(kMaxTemps - 3);
+    if (declared_temps > kMaxTemps - 3) return status::kNotSupported;
+    const bool array = program->texture_kind_[ins.src[1].number] == graphics::TextureKind::Texture2DArray;
+    auto set_literal = [&](uint16_t temp, uint8_t mask, float value) -> NtStatus {
+      Instr m;
+      m.op = kMov;
+      m.dst.type = kTemp, m.dst.number = temp, m.dst.mask = mask;
+      Operand o;
+      o.type = kOpImmediate, o.components = 2;
+      for (float& f : o.imm) f = value;
+      NtStatus r = to_src(o, &m.src[0]);
+      if (r != status::kSuccess) return r;
+      m.src_count = 1;
+      return emit(m);
+    };
+    auto copy = [&](uint16_t temp, uint8_t mask, const Instr::Src& from, int component) -> NtStatus {
+      Instr m;
+      m.op = kMov;
+      m.dst.type = kTemp, m.dst.number = temp, m.dst.mask = mask;
+      m.src[0] = from;
+      if (component >= 0) for (uint8_t& c : m.src[0].swizzle) c = from.swizzle[component];
+      m.src_count = 1;
+      return emit(m);
+    };
+    auto plain = [&](Instr::Src* src, uint16_t temp) {
+      Instr::Src t;
+      t.type = kTemp, t.number = temp;
+      *src = t;
+    };
+    NtStatus r = status::kSuccess;
+    if (ins.op == kTexSize) {
+      // resinfo: into the scratch register, its second component made right, then where it was asked for
+      Instr::Dst wanted = ins.dst;
+      uint8_t swizzle[4];
+      for (uint32_t k = 0; k < 4; ++k) swizzle[k] = ins.tex_swizzle[k], ins.tex_swizzle[k] = static_cast<uint8_t>(k);      // (the components in their places first)
+      ins.dst.type = kTemp, ins.dst.number = kScratch, ins.dst.mask = 0xF, ins.dst.saturate = false;
+      if ((r = emit(ins)) != status::kSuccess) return r;
+      if (array) {
+        Instr::Src layers;
+        layers.type = kTemp, layers.number = kScratch;
+        if ((r = copy(kScratch, 2, layers, 2)) != status::kSuccess) return r;      // (the size of the array, from the third component)
+        if ((r = set_literal(kScratch, 4, 0.0f)) != status::kSuccess) return r;
+      } else if ((r = set_literal(kScratch, 2, 0.0f)) != status::kSuccess) {
+        return r;
+      }
+      Instr m;
+      m.op = kMov;
+      m.dst = wanted;
+      m.src[0].type = kTemp, m.src[0].number = kScratch;
+      for (uint32_t k = 0; k < 4; ++k) m.src[0].swizzle[k] = swizzle[k];
+      m.src_count = 1;
+      return emit(m);
+    }
+    const float row = ins.op == kTexFetch ? 0.0f : 0.5f;      // (a load names texel 0; a lookup the middle of the one row)
+    if ((r = copy(kScratch, 0xF, ins.src[0], -1)) != status::kSuccess) return r;
+    if (array && (r = copy(kScratch, 4, ins.src[0], 1)) != status::kSuccess) return r;
+    if ((r = set_literal(kScratch, 2, row)) != status::kSuccess) return r;
+    plain(&ins.src[0], kScratch);
+    if (ins.op == kTexGrad) {
+      // (sample_d: the gradients have no second component either)
+      if ((r = copy(kGradX, 0xF, ins.src[2], -1)) != status::kSuccess || (r = set_literal(kGradX, 2, 0.0f)) != status::kSuccess) return r;
+      if ((r = copy(kGradY, 0xF, ins.src[3], -1)) != status::kSuccess || (r = set_literal(kGradY, 2, 0.0f)) != status::kSuccess) return r;
+      plain(&ins.src[2], kGradX);
+      plain(&ins.src[3], kGradY);
+    }
+    return emit(ins);
+  };
+
   // --- the instructions
   while (!in.at_end()) {
     if (returned) return status::kNotSupported;   // (code after a ret)
@@ -596,6 +672,7 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
       case kDclTemps4: {
         const uint32_t n = p.le32();
         if (!p.ok() || n > kMaxTemps) return status::kNotSupported;
+        declared_temps = n;
         continue;
       }
       case kDclConstantBuffer4: {
@@ -629,12 +706,14 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
           if (!p.ok() || o.type != kOpResource || o.dims != 3) return status::kInvalidParameter;
           if (!resource_kind((token >> 11) & 0x1F, &kind) || o.index[0] >= 8 || o.index[1] != o.index[2] || o.index[1] >= graphics::kMaxTextureUnits || space != 0) return status::kNotSupported;
           texture_register[o.index[0]] = static_cast<int32_t>(o.index[1]);
+          if (((token >> 11) & 0x1F) == 2 || ((token >> 11) & 0x1F) == 7) one_d_units |= 1u << o.index[1];
           program->texture_unit_mask_ |= 1u << o.index[1];
           program->texture_kind_[o.index[1]] = kind;
           program->texture_samples_[o.index[1]] = static_cast<uint8_t>((token >> 16) & 0x7F);
           continue;
         }
         if (o.type != kOpResource || o.dims != 1 || !resource_kind((token >> 11) & 0x1F, &kind) || o.index[0] >= graphics::kMaxTextureUnits) return status::kNotSupported;   // two units
+        if (((token >> 11) & 0x1F) == 2 || ((token >> 11) & 0x1F) == 7) one_d_units |= 1u << o.index[0];
         program->texture_unit_mask_ |= 1u << o.index[0];
         program->texture_kind_[o.index[0]] = kind;
         program->texture_samples_[o.index[0]] = static_cast<uint8_t>((token >> 16) & 0x7F);
@@ -1171,6 +1250,12 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
       ins.src_count = alu->sources;
     }
     if (!p.at_end()) return status::kInvalidParameter;
+    if (ins.op >= kTexFetch && ins.op <= kTexCompare && ins.op != kTexSamples && ins.op != kTexFetchMs && ins.src[1].type == kSampler && ins.src[1].number < 32 &&
+        (one_d_units >> ins.src[1].number & 1)) {
+      s = one_d_fix(ins);
+      if (s != status::kSuccess) return s;
+      continue;
+    }
     s = emit(ins);
     if (s != status::kSuccess) return s;
   }

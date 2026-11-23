@@ -407,7 +407,8 @@ static HRESULT make_shader(Dev *dev, const D3D12_SHADER_BYTECODE *code, UINT sta
   if (code->BytecodeLength > 60000) return DXGI_ERROR_UNSUPPORTED;
   /* ShaderKind::Dxbc (DXBC and the DXIL of Shader Model 6), or what the runtime above asked for (TcosD3D12PipelineOptions); above the kind, where a
    * pixel shader's constant buffers begin */
-  const UINT kind = (dev->next_shader_kind ? dev->next_shader_kind : 7) | (stage == 1 && !dev->next_shader_kind ? dev->next_pixel_base << 8 : 0);
+  UINT base = stage == 1 ? dev->next_pixel_base : stage >= 3 && stage <= 5 ? dev->next_stage_base[stage - 3] : 0;
+  const UINT kind = (dev->next_shader_kind ? dev->next_shader_kind : 7) | (!dev->next_shader_kind ? base << 8 : 0);
   const UINT64 hash = shader_hash(code->pShaderBytecode, code->BytecodeLength);
   AcquireSRWLockExclusive(&g_shared_lock);
   for (UINT i = 0; i < dev->shared_count; ++i) {
@@ -539,6 +540,7 @@ static HRESULT STDMETHODCALLTYPE dev_CreateGraphicsPipelineState(Dev *This, cons
   if (SUCCEEDED(hr)) hr = make_shader(This, &desc->HS, 4, &p->shaders[3]);
   if (SUCCEEDED(hr)) hr = make_shader(This, &desc->DS, 5, &p->shaders[4]);
   This->next_pixel_base = This->next_shader_kind = 0;      /* (the options were for this pipeline) */
+  This->next_stage_base[0] = This->next_stage_base[1] = This->next_stage_base[2] = 0;
   if (FAILED(hr)) { dx_Release(OBJ(p)); return hr; }
   /* the vertex inputs: register numbers from the vertex shader's signature */
   SigElement inputs[16], outputs[16];
@@ -581,9 +583,10 @@ static HRESULT STDMETHODCALLTYPE dev_CreateGraphicsPipelineState(Dev *This, cons
   if (p->varyings > dev->caps.max_varyings) { dx_Release(OBJ(p)); return DXGI_ERROR_UNSUPPORTED; }
   p->textures = p->rs->textures_unbounded ? dev->caps.max_texture_units : p->rs->textures;
   if (p->textures > dev->caps.max_texture_units) { dx_Release(OBJ(p)); return DXGI_ERROR_UNSUPPORTED; }
-  /* stream output: the captured outputs by their register in the output signature of the last stage before the rasterizer (the geometry shader, else the vertex shader) */
+  /* stream output: the captured outputs by their register in the output signature of the last stage before the rasterizer (the geometry shader, else the domain
+   * shader, else the vertex shader) */
   if (desc->StreamOutput.NumEntries) {
-    const D3D12_SHADER_BYTECODE *last = desc->GS.pShaderBytecode ? &desc->GS : &desc->VS;
+    const D3D12_SHADER_BYTECODE *last = desc->GS.pShaderBytecode ? &desc->GS : desc->DS.pShaderBytecode ? &desc->DS : &desc->VS;
     SigElement so_outputs[16];
     int so_found = 0;
     const UINT so_n = dxbc_signature(last->pShaderBytecode, last->BytecodeLength, 1, so_outputs, 16, &so_found);

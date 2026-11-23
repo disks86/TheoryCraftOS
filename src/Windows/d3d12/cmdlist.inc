@@ -840,11 +840,11 @@ static void STDMETHODCALLTYPE list_CopyTextureRegion(CmdList *l, const D3D12_TEX
     const D3D12_SUBRESOURCE_FOOTPRINT *fp = &src->PlacedFootprint.Footprint;
     UINT level, layer;
     sub_split(d, dst->SubresourceIndex, &level, &layer);
-    const UINT bytes = d->fmt ? d->fmt->bytes : 4;
     const UINT left = box ? box->left : 0, top = box ? box->top : 0, front = box ? box->front : 0;
     const UINT w = box ? box->right - box->left : fp->Width, h = box ? box->bottom - box->top : fp->Height, depth = box ? box->back - box->front : fp->Depth;
     for (UINT k = 0; k < depth; ++k) {
-      UINT64 offset = src->PlacedFootprint.Offset + (UINT64)(front + k) * fp->RowPitch * fp->Height + (UINT64)top * fp->RowPitch + (UINT64)left * bytes;
+      /* (a compressed format's rows are rows of blocks: the box is on whole blocks) */
+      UINT64 offset = src->PlacedFootprint.Offset + (UINT64)(front + k) * fp->RowPitch * format_rows(d->fmt, fp->Height) + (UINT64)format_rows(d->fmt, top) * fp->RowPitch + format_row_bytes(d->fmt, left);
       UINT image_layer = d->kind == 1 ? z + k : layer;
       UINT payload[11] = {0, alloc_index(l, d->alloc), level, image_layer, x, y, w, h, alloc_index(l, s->alloc), (UINT)offset, fp->RowPitch};
       packet(l, OP_COPY_BUFFER_IMAGE, payload, 11);
@@ -854,11 +854,10 @@ static void STDMETHODCALLTYPE list_CopyTextureRegion(CmdList *l, const D3D12_TEX
     const D3D12_SUBRESOURCE_FOOTPRINT *fp = &dst->PlacedFootprint.Footprint;
     UINT level, layer;
     sub_split(s, src->SubresourceIndex, &level, &layer);
-    const UINT bytes = s->fmt ? s->fmt->bytes : 4;
     const UINT left = box ? box->left : 0, top = box ? box->top : 0, front = box ? box->front : 0;
     const UINT w = box ? box->right - box->left : fp->Width, h = box ? box->bottom - box->top : fp->Height, depth = box ? box->back - box->front : fp->Depth;
     for (UINT k = 0; k < depth; ++k) {
-      UINT64 offset = dst->PlacedFootprint.Offset + (UINT64)(z + k) * fp->RowPitch * fp->Height + (UINT64)y * fp->RowPitch + (UINT64)x * bytes;
+      UINT64 offset = dst->PlacedFootprint.Offset + (UINT64)(z + k) * fp->RowPitch * format_rows(s->fmt, fp->Height) + (UINT64)format_rows(s->fmt, y) * fp->RowPitch + format_row_bytes(s->fmt, x);
       UINT image_layer = s->kind == 1 ? front + k : layer;
       UINT payload[11] = {1, alloc_index(l, s->alloc), level, image_layer, left, top, w, h, alloc_index(l, d->alloc), (UINT)offset, fp->RowPitch};
       packet(l, OP_COPY_BUFFER_IMAGE, payload, 11);

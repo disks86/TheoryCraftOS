@@ -37,6 +37,15 @@ static UINT format_bytes(D3DFORMAT format) {
     default: return 0;
   }
 }
+/* The bytes of a 4 x 4 block of a block-compressed format (DXT1 .. DXT5, which Direct3D 12 calls BC1 .. BC3); 0 for the others. Such a texture keeps its blocks: the
+ * kernel samples them as they are on a device that has them and decodes them for the others. */
+static UINT dxt_block(D3DFORMAT format) { return format == D3DFMT_DXT1 ? 8 : format == D3DFMT_DXT2 || format == D3DFMT_DXT3 || format == D3DFMT_DXT4 || format == D3DFMT_DXT5 ? 16 : 0; }
+static DXGI_FORMAT dxt_dxgi(D3DFORMAT format) {
+  return format == D3DFMT_DXT1 ? DXGI_FORMAT_BC1_UNORM : format == D3DFMT_DXT2 || format == D3DFMT_DXT3 ? DXGI_FORMAT_BC2_UNORM : DXGI_FORMAT_BC3_UNORM;
+}
+/* The bytes of a row of a level `w` pixels wide as the program has it (a row of blocks of a compressed format), and the rows of a level `h` high. */
+static UINT format_pitch(D3DFORMAT format, UINT w) { return dxt_block(format) ? (w + 3) / 4 * dxt_block(format) : w * format_bytes(format); }
+static UINT format_rows(D3DFORMAT format, UINT h) { return dxt_block(format) ? (h + 3) / 4 : h; }
 static BOOL format_is_depth(D3DFORMAT format) {
   return format == D3DFMT_D16 || format == D3DFMT_D24S8 || format == D3DFMT_D24X8 || format == D3DFMT_D32 || format == D3DFMT_D16_LOCKABLE || format == D3DFMT_D24X4S4 ||
          format == D3DFMT_D15S1;
@@ -135,28 +144,42 @@ static HRESULT STDMETHODCALLTYPE dev_CreateIndexBuffer(Dev *d, UINT length, DWOR
 
 static UINT level_size(UINT size, UINT level) { size >>= level; return size ? size : 1; }
 
-/* Sends a level's pixels (the program's copy) to the Direct3D 12 texture. The list is sent with it. */
-static HRESULT tex_upload(Dev *d, Tex *t, UINT level) {
-  if (!t->res || t->depth || !t->shadow[level]) return D3D_OK;
-  const UINT w = level_size(t->width, level), h = level_size(t->height, level), bytes = format_bytes(t->format);
-  const UINT row_pitch = (w * 4 + 255u) & ~255u;
-  ID3D12Resource *upload = make_buffer(d, D3D12_HEAP_TYPE_UPLOAD, (UINT64)row_pitch * h);
+/* The slices of a subresource (face * levels + level) of a volume; 1 for the other kinds. */
+static UINT tex_slices(const Tex *t, UINT sub) { return t->kind == 1 ? level_size(t->slices, sub % t->levels) : 1; }
+/* The bytes of the program's copy of a subresource. */
+static SIZE_T tex_sub_bytes(const Tex *t, UINT sub) {
+  const UINT level = sub % t->levels;
+  return (SIZE_T)format_pitch(t->format, level_size(t->width, level)) * format_rows(t->format, level_size(t->height, level)) * tex_slices(t, sub);
+}
+
+/* Sends a subresource's pixels (the program's copy; face * levels + level) to the Direct3D 12 texture, slice by slice for a volume. The list is sent with it. */
+static HRESULT tex_upload(Dev *d, Tex *t, UINT sub) {
+  if (!t->res || t->depth || !t->shadow[sub]) return D3D_OK;
+  const UINT level = sub % t->levels, face = sub / t->levels;
+  if (level >= t->kmips) return D3D_OK;      /* (a level the kernel does not keep) */
+  const UINT w = level_size(t->width, level), h = level_size(t->height, level), bytes = format_bytes(t->format), slices = tex_slices(t, sub);
+  const UINT block = dxt_block(t->format), rows = format_rows(t->format, h), pitch = format_pitch(t->format, w);
+  const UINT row_pitch = ((block ? pitch : w * 4) + 255u) & ~255u;
+  ID3D12Resource *upload = make_buffer(d, D3D12_HEAP_TYPE_UPLOAD, (UINT64)row_pitch * rows * slices);
   BYTE *memory = NULL;
   if (!upload || FAILED(ID3D12Resource_Map(upload, 0, NULL, (void **)&memory)) || !memory) { if (upload) ID3D12Resource_Release(upload); return E_OUTOFMEMORY; }
-  for (UINT row = 0; row < h; ++row) row_to_bgra(t->format, t->shadow[level] + (SIZE_T)row * w * bytes, w, memory + (SIZE_T)row * row_pitch);
+  for (UINT row = 0; row < rows * slices; ++row) {
+    if (block) memcpy(memory + (SIZE_T)row * row_pitch, t->shadow[sub] + (SIZE_T)row * pitch, pitch);      /* (blocks go as they are) */
+    else row_to_bgra(t->format, t->shadow[sub] + (SIZE_T)row * w * bytes, w, memory + (SIZE_T)row * row_pitch);
+  }
   ID3D12Resource_Unmap(upload, 0, NULL);
   D3D12_TEXTURE_COPY_LOCATION to, from;
   memset(&to, 0, sizeof to);
   memset(&from, 0, sizeof from);
   to.pResource = t->res;
   to.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-  to.SubresourceIndex = level;
+  to.SubresourceIndex = level + face * t->kmips;
   from.pResource = upload;
   from.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
-  from.PlacedFootprint.Footprint.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+  from.PlacedFootprint.Footprint.Format = block ? dxt_dxgi(t->format) : DXGI_FORMAT_B8G8R8A8_UNORM;
   from.PlacedFootprint.Footprint.Width = w;
   from.PlacedFootprint.Footprint.Height = h;
-  from.PlacedFootprint.Footprint.Depth = 1;
+  from.PlacedFootprint.Footprint.Depth = slices;
   from.PlacedFootprint.Footprint.RowPitch = row_pitch;
   ID3D12GraphicsCommandList_CopyTextureRegion(d->list, &to, 0, 0, 0, &from, NULL);
   d->recorded = 1;
@@ -206,29 +229,40 @@ static void tex_destroy(DxObj *o) {
   }
   if (t->target && d->rtv_free_count < RTV_SLOTS) d->rtv_free[d->rtv_free_count++] = t->rtv_slot;
   if (t->depth && d->dsv_free_count < DSV_SLOTS) d->dsv_free[d->dsv_free_count++] = t->dsv_slot;
-  for (UINT i = 0; i < MAX_LEVELS; ++i) mem_free(t->shadow[i]);
+  for (UINT i = 0; i < MAX_LEVELS * 6; ++i) mem_free(t->shadow[i]);
   if (t->res) ID3D12Resource_Release(t->res);
   child_destroy(o);
 }
 
 /* A texture, or what stands behind a surface. `memory_only`: no Direct3D 12 texture (a system-memory surface). `existing`: the Direct3D 12 texture
- * to use (the back buffer), a reference is taken. */
-static HRESULT tex_make(Dev *d, UINT width, UINT height, UINT levels, DWORD usage, D3DFORMAT format, D3DPOOL pool, BOOL memory_only, ID3D12Resource *existing, Tex **out) {
+ * to use (the back buffer), a reference is taken. `kind`: 0 a 2D texture, 1 a volume of `slices`, 3 a cube (Tex.kind). */
+static HRESULT tex_make_kind(Dev *d, UINT kind, UINT width, UINT height, UINT slices, UINT levels, DWORD usage, D3DFORMAT format, D3DPOOL pool, BOOL memory_only, ID3D12Resource *existing,
+                             Tex **out) {
   *out = NULL;
   const BOOL depth = format_is_depth(format);
-  if (width == 0 || height == 0 || width > 4096 || height > 4096 || (!depth && !format_bytes(format))) return D3DERR_INVALIDCALL;
+  if (width == 0 || height == 0 || width > 4096 || height > 4096 || (!depth && !format_bytes(format) && !dxt_block(format))) return D3DERR_INVALIDCALL;
+  if (dxt_block(format) && (kind == 1 || (usage & (D3DUSAGE_RENDERTARGET | D3DUSAGE_DEPTHSTENCIL)) || existing)) return D3DERR_NOTAVAILABLE;      /* (compressed: sampled 2D textures and cubes) */
+  if (kind == 1 && (slices == 0 || slices > 256)) return D3DERR_INVALIDCALL;
   const BOOL target = !depth && (usage & D3DUSAGE_RENDERTARGET) != 0;
+  /* (the kernel samples volumes and cubes; it does not draw into them) */
+  if (kind && (depth || target || memory_only || existing)) return D3DERR_NOTAVAILABLE;
   if (depth && d->dsv_free_count == 0) return E_OUTOFMEMORY;
   if (target && d->rtv_free_count == 0) return E_OUTOFMEMORY;
   UINT full = 1;
-  for (UINT size = width > height ? width : height; size > 1; size >>= 1) ++full;
+  UINT largest = width > height ? width : height;
+  if (kind == 1 && slices > largest) largest = slices;
+  for (UINT size = largest; size > 1; size >>= 1) ++full;
   if (target || depth || (usage & D3DUSAGE_AUTOGENMIPMAP) || memory_only) levels = 1;      /* (a target has one level here: the kernel draws into those only) */
   else if (levels == 0 || levels > full) levels = full;
-  Tex *t = child_new(sizeof *t, d, &tex_vtbl, g_tex_iids, tex_destroy);
+  Tex *t = child_new(sizeof *t, d, kind == 3 ? (const void *)&cube_vtbl : kind == 1 ? (const void *)&vol_vtbl : (const void *)&tex_vtbl,
+                     kind == 3 ? g_cube_iids : kind == 1 ? g_vol_iids : g_tex_iids, tex_destroy);
   if (!t) return E_OUTOFMEMORY;
   t->width = width;
   t->height = height;
   t->levels = levels;
+  t->kind = kind;
+  t->slices = kind == 1 ? slices : 1;
+  t->kmips = kind ? 1 : levels;      /* (the kernel's volumes and cubes have one level: the program's others are dropped) */
   t->format = format;
   t->usage = usage;
   t->pool = pool;
@@ -237,12 +271,14 @@ static HRESULT tex_make(Dev *d, UINT width, UINT height, UINT levels, DWORD usag
     t->res = existing;
   } else if (!memory_only) {
     D3D12_HEAP_PROPERTIES props = {D3D12_HEAP_TYPE_DEFAULT, D3D12_CPU_PAGE_PROPERTY_UNKNOWN, D3D12_MEMORY_POOL_UNKNOWN, 1, 1};
-    D3D12_RESOURCE_DESC rd = {D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, width, height, 1, (UINT16)levels,
+    D3D12_RESOURCE_DESC rd = {kind == 1 ? D3D12_RESOURCE_DIMENSION_TEXTURE3D : D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, width, height,
+                              (UINT16)(kind == 1 ? slices : kind == 3 ? 6 : 1), (UINT16)t->kmips,
                               depth ? (format == D3DFMT_D24S8 || format == D3DFMT_D24X4S4 || format == D3DFMT_D15S1 ? DXGI_FORMAT_D24_UNORM_S8_UINT : DXGI_FORMAT_D32_FLOAT)
-                                    : DXGI_FORMAT_B8G8R8A8_UNORM,
+                                    : dxt_block(format) ? dxt_dxgi(format) : DXGI_FORMAT_B8G8R8A8_UNORM,
                               {1, 0}, D3D12_TEXTURE_LAYOUT_UNKNOWN, depth ? D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL : target ? D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET : D3D12_RESOURCE_FLAG_NONE};
+    if (kind == 3) TcosD3D12ResourceOptions(d->d12, TCOS_RESOURCE_CUBE);      /* (Direct3D 12 knows a cube only by its views; the kernel has to know it now) */
     const HRESULT hr = ID3D12Device_CreateCommittedResource(d->d12, &props, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_COMMON, NULL, &IID_ID3D12Resource, (void **)&t->res);
-    if (FAILED(hr) || !t->res) { dx_Release(OBJ(t)); return D3DERR_INVALIDCALL; }
+    if (FAILED(hr) || !t->res) { dx_Release(OBJ(t)); return kind ? D3DERR_NOTAVAILABLE : D3DERR_INVALIDCALL; }
   }
   /* (the slots are taken only now: tex_destroy gives back what the flags say was taken) */
   if (depth && t->res) {
@@ -261,37 +297,45 @@ static HRESULT tex_make(Dev *d, UINT width, UINT height, UINT levels, DWORD usag
   *out = t;
   return D3D_OK;
 }
+static HRESULT tex_make(Dev *d, UINT width, UINT height, UINT levels, DWORD usage, D3DFORMAT format, D3DPOOL pool, BOOL memory_only, ID3D12Resource *existing, Tex **out) {
+  return tex_make_kind(d, 0, width, height, 1, levels, usage, format, pool, memory_only, existing, out);
+}
 
-/* Locks a level: the program gets its copy of the pixels (fetched first for something that is drawn into). */
-static HRESULT tex_lock(Tex *t, UINT level, D3DLOCKED_RECT *out, const RECT *rect, DWORD flags) {
+/* The number of subresources (face * levels + level). */
+static UINT tex_subresources(const Tex *t) { return t->levels * (t->kind == 3 ? 6 : 1); }
+
+/* Locks a subresource (face * levels + level): the program gets its copy of the pixels (fetched first for something that is drawn into). */
+static HRESULT tex_lock(Tex *t, UINT sub, D3DLOCKED_RECT *out, const RECT *rect, DWORD flags) {
   Dev *d = t->c.dev;
   if (!out) return D3DERR_INVALIDCALL;
   out->pBits = NULL;
   out->Pitch = 0;
-  const UINT bytes = format_bytes(t->format);
-  if (level >= t->levels || t->depth || !bytes || (t->locked[level] & 0x80000000u)) return D3DERR_INVALIDCALL;
-  const UINT w = level_size(t->width, level), h = level_size(t->height, level);
+  const UINT bytes = format_bytes(t->format), block = dxt_block(t->format);
+  if (sub >= tex_subresources(t) || t->depth || (!bytes && !block) || (t->locked[sub] & 0x80000000u)) return D3DERR_INVALIDCALL;
+  const UINT level = sub % t->levels, w = level_size(t->width, level), h = level_size(t->height, level);
   if (rect && (rect->left < 0 || rect->top < 0 || rect->right > (LONG)w || rect->bottom > (LONG)h || rect->left >= rect->right || rect->top >= rect->bottom)) return D3DERR_INVALIDCALL;
   HRESULT hr = D3D_OK;
   EnterCriticalSection(&d->lock);
-  if (!t->shadow[level]) t->shadow[level] = mem_alloc((SIZE_T)w * h * bytes);
-  if (!t->shadow[level]) hr = E_OUTOFMEMORY;
-  else if (t->target && t->res && !(flags & D3DLOCK_DISCARD)) hr = bytes == 4 ? tex_download(d, t, level, t->shadow[level], w * 4) : D3DERR_INVALIDCALL;
+  if (!t->shadow[sub]) t->shadow[sub] = mem_alloc(tex_sub_bytes(t, sub));
+  if (!t->shadow[sub]) hr = E_OUTOFMEMORY;
+  else if (t->target && t->res && !(flags & D3DLOCK_DISCARD)) hr = bytes == 4 ? tex_download(d, t, level, t->shadow[sub], w * 4) : D3DERR_INVALIDCALL;
   LeaveCriticalSection(&d->lock);
   if (FAILED(hr)) return hr;
-  t->locked[level] = flags | 0x80000000u;
-  out->Pitch = (INT)(w * bytes);
-  out->pBits = t->shadow[level] + (rect ? (SIZE_T)rect->top * w * bytes + (SIZE_T)rect->left * bytes : 0);
+  t->locked[sub] = flags | 0x80000000u;
+  out->Pitch = (INT)format_pitch(t->format, w);
+  /* (a rectangle of a compressed level starts at its block) */
+  const SIZE_T row = rect ? (SIZE_T)(block ? (UINT)rect->top / 4 : (UINT)rect->top) : 0, column = rect ? (block ? (SIZE_T)rect->left / 4 * block : (SIZE_T)rect->left * bytes) : 0;
+  out->pBits = t->shadow[sub] + row * (SIZE_T)out->Pitch + column;
   return D3D_OK;
 }
-static HRESULT tex_unlock(Tex *t, UINT level) {
+static HRESULT tex_unlock(Tex *t, UINT sub) {
   Dev *d = t->c.dev;
-  if (level >= t->levels || !(t->locked[level] & 0x80000000u)) return D3DERR_INVALIDCALL;
-  const DWORD flags = t->locked[level];
-  t->locked[level] = 0;
+  if (sub >= tex_subresources(t) || !(t->locked[sub] & 0x80000000u)) return D3DERR_INVALIDCALL;
+  const DWORD flags = t->locked[sub];
+  t->locked[sub] = 0;
   if (flags & D3DLOCK_READONLY) return D3D_OK;
   EnterCriticalSection(&d->lock);
-  const HRESULT hr = tex_upload(d, t, level);
+  const HRESULT hr = tex_upload(d, t, sub);
   LeaveCriticalSection(&d->lock);
   return hr;
 }
@@ -322,6 +366,83 @@ static HRESULT STDMETHODCALLTYPE tex_LockRect(Tex *t, UINT level, D3DLOCKED_RECT
 static HRESULT STDMETHODCALLTYPE tex_UnlockRect(Tex *t, UINT level) { return tex_unlock(t, level); }
 static HRESULT STDMETHODCALLTYPE tex_AddDirtyRect(Tex *t, const RECT *rect) { (void)t; (void)rect; return D3D_OK; }
 
+/* ---- cube and volume textures ------------------------------------------------------------------------------------------------------------------------ */
+
+/* A cube's faces are its subresources face * levels + level (D3DCUBEMAP_FACE_POSITIVE_X .. NEGATIVE_Z: the kernel's order, +X -X +Y -Y +Z -Z). */
+static D3DRESOURCETYPE STDMETHODCALLTYPE cube_GetType(Tex *t) { (void)t; return D3DRTYPE_CUBETEXTURE; }
+static HRESULT STDMETHODCALLTYPE cube_GetLevelDesc(Tex *t, UINT level, D3DSURFACE_DESC *desc) { return tex_GetLevelDesc(t, level, desc); }
+static HRESULT STDMETHODCALLTYPE cube_GetCubeMapSurface(Tex *t, D3DCUBEMAP_FACES face, UINT level, IDirect3DSurface9 **out);
+static HRESULT STDMETHODCALLTYPE cube_LockRect(Tex *t, D3DCUBEMAP_FACES face, UINT level, D3DLOCKED_RECT *out, const RECT *rect, DWORD flags) {
+  if ((UINT)face >= 6 || level >= t->levels) { if (out) out->pBits = NULL; return D3DERR_INVALIDCALL; }
+  return tex_lock(t, (UINT)face * t->levels + level, out, rect, flags);
+}
+static HRESULT STDMETHODCALLTYPE cube_UnlockRect(Tex *t, D3DCUBEMAP_FACES face, UINT level) {
+  if ((UINT)face >= 6 || level >= t->levels) return D3DERR_INVALIDCALL;
+  return tex_unlock(t, (UINT)face * t->levels + level);
+}
+static HRESULT STDMETHODCALLTYPE cube_AddDirtyRect(Tex *t, D3DCUBEMAP_FACES face, const RECT *rect) { (void)t; (void)face; (void)rect; return D3D_OK; }
+
+static D3DRESOURCETYPE STDMETHODCALLTYPE vol_GetType(Tex *t) { (void)t; return D3DRTYPE_VOLUMETEXTURE; }
+static HRESULT STDMETHODCALLTYPE vol_GetLevelDesc(Tex *t, UINT level, D3DVOLUME_DESC *desc) {
+  if (!desc || level >= t->levels) return D3DERR_INVALIDCALL;
+  desc->Format = t->format;
+  desc->Type = D3DRTYPE_VOLUME;
+  desc->Usage = t->usage;
+  desc->Pool = t->pool;
+  desc->Width = level_size(t->width, level);
+  desc->Height = level_size(t->height, level);
+  desc->Depth = level_size(t->slices, level);
+  return D3D_OK;
+}
+/* (a level as an IDirect3DVolume9 object of its own is not made here: LockBox reaches the same pixels) */
+static HRESULT STDMETHODCALLTYPE vol_GetVolumeLevel(Tex *t, UINT level, IDirect3DVolume9 **out) { (void)t; (void)level; if (out) *out = NULL; return D3DERR_NOTAVAILABLE; }
+/* Locks a level of a volume: its slices one after the other, rows of the program's format. */
+static HRESULT STDMETHODCALLTYPE vol_LockBox(Tex *t, UINT level, D3DLOCKED_BOX *out, const D3DBOX *box, DWORD flags) {
+  Dev *d = t->c.dev;
+  if (!out) return D3DERR_INVALIDCALL;
+  out->pBits = NULL;
+  out->RowPitch = out->SlicePitch = 0;
+  const UINT bytes = format_bytes(t->format);
+  if (level >= t->levels || !bytes || (t->locked[level] & 0x80000000u)) return D3DERR_INVALIDCALL;
+  const UINT w = level_size(t->width, level), h = level_size(t->height, level), slices = tex_slices(t, level);
+  if (box && (box->Left >= box->Right || box->Top >= box->Bottom || box->Front >= box->Back || box->Right > w || box->Bottom > h || box->Back > slices)) return D3DERR_INVALIDCALL;
+  EnterCriticalSection(&d->lock);
+  if (!t->shadow[level]) t->shadow[level] = mem_alloc(tex_sub_bytes(t, level));
+  LeaveCriticalSection(&d->lock);
+  if (!t->shadow[level]) return E_OUTOFMEMORY;
+  t->locked[level] = flags | 0x80000000u;
+  out->RowPitch = (INT)(w * bytes);
+  out->SlicePitch = (INT)(w * h * bytes);
+  out->pBits = t->shadow[level] + (box ? (SIZE_T)box->Front * w * h * bytes + (SIZE_T)box->Top * w * bytes + (SIZE_T)box->Left * bytes : 0);
+  return D3D_OK;
+}
+static HRESULT STDMETHODCALLTYPE vol_UnlockBox(Tex *t, UINT level) { return tex_unlock(t, level); }
+static HRESULT STDMETHODCALLTYPE vol_AddDirtyBox(Tex *t, const D3DBOX *box) { (void)t; (void)box; return D3D_OK; }
+
+static HRESULT STDMETHODCALLTYPE dev_CreateCubeTexture(Dev *d, UINT edge, UINT levels, DWORD usage, D3DFORMAT format, D3DPOOL pool, IDirect3DCubeTexture9 **out, HANDLE *shared) {
+  if (!out) return D3DERR_INVALIDCALL;
+  *out = NULL;
+  if (shared) return D3DERR_INVALIDCALL;
+  Tex *t = NULL;
+  EnterCriticalSection(&d->lock);
+  const HRESULT hr = tex_make_kind(d, 3, edge, edge, 1, levels, usage, format, pool, FALSE, NULL, &t);
+  LeaveCriticalSection(&d->lock);
+  *out = (IDirect3DCubeTexture9 *)t;
+  return hr;
+}
+static HRESULT STDMETHODCALLTYPE dev_CreateVolumeTexture(Dev *d, UINT width, UINT height, UINT depth, UINT levels, DWORD usage, D3DFORMAT format, D3DPOOL pool,
+                                                         IDirect3DVolumeTexture9 **out, HANDLE *shared) {
+  if (!out) return D3DERR_INVALIDCALL;
+  *out = NULL;
+  if (shared) return D3DERR_INVALIDCALL;
+  Tex *t = NULL;
+  EnterCriticalSection(&d->lock);
+  const HRESULT hr = tex_make_kind(d, 1, width, height, depth, levels, usage, format, pool, FALSE, NULL, &t);
+  LeaveCriticalSection(&d->lock);
+  *out = (IDirect3DVolumeTexture9 *)t;
+  return hr;
+}
+
 /* ---- surfaces --------------------------------------------------------------------------------------------------------------------------------------- */
 
 static void surface_destroy(DxObj *o) {
@@ -345,6 +466,14 @@ static HRESULT STDMETHODCALLTYPE tex_GetSurfaceLevel(Tex *t, UINT level, IDirect
   *out = (IDirect3DSurface9 *)surface_make(t->c.dev, t, level, 0);
   return *out ? D3D_OK : E_OUTOFMEMORY;
 }
+/* (a face's surface: its `level` is the subresource, face * levels + level) */
+static HRESULT STDMETHODCALLTYPE cube_GetCubeMapSurface(Tex *t, D3DCUBEMAP_FACES face, UINT level, IDirect3DSurface9 **out) {
+  if (!out) return D3DERR_INVALIDCALL;
+  *out = NULL;
+  if ((UINT)face >= 6 || level >= t->levels) return D3DERR_INVALIDCALL;
+  *out = (IDirect3DSurface9 *)surface_make(t->c.dev, t, (UINT)face * t->levels + level, 0);
+  return *out ? D3D_OK : E_OUTOFMEMORY;
+}
 static D3DRESOURCETYPE STDMETHODCALLTYPE surf_GetType(Surface *s) { (void)s; return D3DRTYPE_SURFACE; }
 static HRESULT STDMETHODCALLTYPE surf_GetContainer(Surface *s, REFIID riid, void **out) {
   if (!out) return D3DERR_INVALIDCALL;
@@ -354,7 +483,7 @@ static HRESULT STDMETHODCALLTYPE surf_GetContainer(Surface *s, REFIID riid, void
 }
 static HRESULT STDMETHODCALLTYPE surf_GetDesc(Surface *s, D3DSURFACE_DESC *desc) {
   if (!desc) return D3DERR_INVALIDCALL;
-  tex_describe(s->tex, s->level, desc);
+  tex_describe(s->tex, s->level % s->tex->levels, desc);
   return D3D_OK;
 }
 static HRESULT STDMETHODCALLTYPE surf_LockRect(Surface *s, D3DLOCKED_RECT *out, const RECT *rect, DWORD flags) { return tex_lock(s->tex, s->level, out, rect, flags); }

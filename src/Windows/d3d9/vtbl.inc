@@ -44,8 +44,8 @@ static HRESULT STDMETHODCALLTYPE dev_vtbl_checked_GetBackBuffer(IDirect3DDevice9
 static HRESULT STDMETHODCALLTYPE dev_vtbl_none_GetRasterStatus(IDirect3DDevice9 *This, UINT iSwapChain, D3DRASTER_STATUS* pRasterStatus) { static volatile LONG said; dx_unimplemented(&said, "IDirect3DDevice9::GetRasterStatus"); return E_NOTIMPL; }
 static HRESULT STDMETHODCALLTYPE dev_vtbl_checked_SetDialogBoxMode(IDirect3DDevice9 *This, WINBOOL bEnableDialogs) { const HRESULT hr = dev_SetDialogBoxMode((void *)This, bEnableDialogs); if (FAILED(hr)) { static volatile LONG said; dx_failed(&said, "IDirect3DDevice9::SetDialogBoxMode", hr); } return hr; }
 static HRESULT STDMETHODCALLTYPE dev_vtbl_checked_CreateTexture(IDirect3DDevice9 *This, UINT Width, UINT Height, UINT Levels, DWORD Usage, D3DFORMAT Format, D3DPOOL Pool, IDirect3DTexture9** ppTexture, HANDLE* pSharedHandle) { const HRESULT hr = dev_CreateTexture((void *)This, Width, Height, Levels, Usage, Format, Pool, ppTexture, pSharedHandle); if (FAILED(hr)) { static volatile LONG said; dx_failed(&said, "IDirect3DDevice9::CreateTexture", hr); } return hr; }
-static HRESULT STDMETHODCALLTYPE dev_vtbl_none_CreateVolumeTexture(IDirect3DDevice9 *This, UINT Width, UINT Height, UINT Depth, UINT Levels, DWORD Usage, D3DFORMAT Format, D3DPOOL Pool, IDirect3DVolumeTexture9** ppVolumeTexture, HANDLE* pSharedHandle) { static volatile LONG said; dx_unimplemented(&said, "IDirect3DDevice9::CreateVolumeTexture"); return E_NOTIMPL; }
-static HRESULT STDMETHODCALLTYPE dev_vtbl_none_CreateCubeTexture(IDirect3DDevice9 *This, UINT EdgeLength, UINT Levels, DWORD Usage, D3DFORMAT Format, D3DPOOL Pool, IDirect3DCubeTexture9** ppCubeTexture, HANDLE* pSharedHandle) { static volatile LONG said; dx_unimplemented(&said, "IDirect3DDevice9::CreateCubeTexture"); return E_NOTIMPL; }
+static HRESULT STDMETHODCALLTYPE dev_vtbl_checked_CreateVolumeTexture(IDirect3DDevice9 *This, UINT Width, UINT Height, UINT Depth, UINT Levels, DWORD Usage, D3DFORMAT Format, D3DPOOL Pool, IDirect3DVolumeTexture9** ppVolumeTexture, HANDLE* pSharedHandle) { const HRESULT hr = dev_CreateVolumeTexture((void *)This, Width, Height, Depth, Levels, Usage, Format, Pool, ppVolumeTexture, pSharedHandle); if (FAILED(hr)) { static volatile LONG said; dx_failed(&said, "IDirect3DDevice9::CreateVolumeTexture", hr); } return hr; }
+static HRESULT STDMETHODCALLTYPE dev_vtbl_checked_CreateCubeTexture(IDirect3DDevice9 *This, UINT EdgeLength, UINT Levels, DWORD Usage, D3DFORMAT Format, D3DPOOL Pool, IDirect3DCubeTexture9** ppCubeTexture, HANDLE* pSharedHandle) { const HRESULT hr = dev_CreateCubeTexture((void *)This, EdgeLength, Levels, Usage, Format, Pool, ppCubeTexture, pSharedHandle); if (FAILED(hr)) { static volatile LONG said; dx_failed(&said, "IDirect3DDevice9::CreateCubeTexture", hr); } return hr; }
 static HRESULT STDMETHODCALLTYPE dev_vtbl_checked_CreateVertexBuffer(IDirect3DDevice9 *This, UINT Length, DWORD Usage, DWORD FVF, D3DPOOL Pool, IDirect3DVertexBuffer9** ppVertexBuffer, HANDLE* pSharedHandle) { const HRESULT hr = dev_CreateVertexBuffer((void *)This, Length, Usage, FVF, Pool, ppVertexBuffer, pSharedHandle); if (FAILED(hr)) { static volatile LONG said; dx_failed(&said, "IDirect3DDevice9::CreateVertexBuffer", hr); } return hr; }
 static HRESULT STDMETHODCALLTYPE dev_vtbl_checked_CreateIndexBuffer(IDirect3DDevice9 *This, UINT Length, DWORD Usage, D3DFORMAT Format, D3DPOOL Pool, IDirect3DIndexBuffer9** ppIndexBuffer, HANDLE* pSharedHandle) { const HRESULT hr = dev_CreateIndexBuffer((void *)This, Length, Usage, Format, Pool, ppIndexBuffer, pSharedHandle); if (FAILED(hr)) { static volatile LONG said; dx_failed(&said, "IDirect3DDevice9::CreateIndexBuffer", hr); } return hr; }
 static HRESULT STDMETHODCALLTYPE dev_vtbl_checked_CreateRenderTarget(IDirect3DDevice9 *This, UINT Width, UINT Height, D3DFORMAT Format, D3DMULTISAMPLE_TYPE MultiSample, DWORD MultisampleQuality, WINBOOL Lockable, IDirect3DSurface9** ppSurface, HANDLE* pSharedHandle) { const HRESULT hr = dev_CreateRenderTarget((void *)This, Width, Height, Format, MultiSample, MultisampleQuality, Lockable, ppSurface, pSharedHandle); if (FAILED(hr)) { static volatile LONG said; dx_failed(&said, "IDirect3DDevice9::CreateRenderTarget", hr); } return hr; }
@@ -160,8 +160,8 @@ const IDirect3DDevice9Vtbl dev_vtbl = {
     .SetGammaRamp = (__typeof__(((IDirect3DDevice9Vtbl *)0)->SetGammaRamp))dev_SetGammaRamp,
     .GetGammaRamp = (__typeof__(((IDirect3DDevice9Vtbl *)0)->GetGammaRamp))dev_GetGammaRamp,
     .CreateTexture = (__typeof__(((IDirect3DDevice9Vtbl *)0)->CreateTexture))dev_vtbl_checked_CreateTexture,
-    .CreateVolumeTexture = (__typeof__(((IDirect3DDevice9Vtbl *)0)->CreateVolumeTexture))dev_vtbl_none_CreateVolumeTexture,
-    .CreateCubeTexture = (__typeof__(((IDirect3DDevice9Vtbl *)0)->CreateCubeTexture))dev_vtbl_none_CreateCubeTexture,
+    .CreateVolumeTexture = (__typeof__(((IDirect3DDevice9Vtbl *)0)->CreateVolumeTexture))dev_vtbl_checked_CreateVolumeTexture,
+    .CreateCubeTexture = (__typeof__(((IDirect3DDevice9Vtbl *)0)->CreateCubeTexture))dev_vtbl_checked_CreateCubeTexture,
     .CreateVertexBuffer = (__typeof__(((IDirect3DDevice9Vtbl *)0)->CreateVertexBuffer))dev_vtbl_checked_CreateVertexBuffer,
     .CreateIndexBuffer = (__typeof__(((IDirect3DDevice9Vtbl *)0)->CreateIndexBuffer))dev_vtbl_checked_CreateIndexBuffer,
     .CreateRenderTarget = (__typeof__(((IDirect3DDevice9Vtbl *)0)->CreateRenderTarget))dev_vtbl_checked_CreateRenderTarget,
@@ -335,6 +335,74 @@ const IDirect3DTexture9Vtbl tex_vtbl = {
     .LockRect = (__typeof__(((IDirect3DTexture9Vtbl *)0)->LockRect))tex_vtbl_checked_LockRect,
     .UnlockRect = (__typeof__(((IDirect3DTexture9Vtbl *)0)->UnlockRect))tex_vtbl_checked_UnlockRect,
     .AddDirtyRect = (__typeof__(((IDirect3DTexture9Vtbl *)0)->AddDirtyRect))tex_vtbl_checked_AddDirtyRect,
+};
+static HRESULT STDMETHODCALLTYPE cube_vtbl_checked_GetDevice(IDirect3DCubeTexture9 *This, struct IDirect3DDevice9** ppDevice) { const HRESULT hr = child_GetDevice((void *)This, ppDevice); if (FAILED(hr)) { static volatile LONG said; dx_failed(&said, "IDirect3DCubeTexture9::GetDevice", hr); } return hr; }
+static HRESULT STDMETHODCALLTYPE cube_vtbl_none_SetPrivateData(IDirect3DCubeTexture9 *This, REFGUID guid, const void *data, DWORD data_size, DWORD flags) { static volatile LONG said; dx_unimplemented(&said, "IDirect3DCubeTexture9::SetPrivateData"); return E_NOTIMPL; }
+static HRESULT STDMETHODCALLTYPE cube_vtbl_none_GetPrivateData(IDirect3DCubeTexture9 *This, REFGUID refguid, void* pData, DWORD* pSizeOfData) { static volatile LONG said; dx_unimplemented(&said, "IDirect3DCubeTexture9::GetPrivateData"); return E_NOTIMPL; }
+static HRESULT STDMETHODCALLTYPE cube_vtbl_none_FreePrivateData(IDirect3DCubeTexture9 *This, REFGUID refguid) { static volatile LONG said; dx_unimplemented(&said, "IDirect3DCubeTexture9::FreePrivateData"); return E_NOTIMPL; }
+static HRESULT STDMETHODCALLTYPE cube_vtbl_checked_SetAutoGenFilterType(IDirect3DCubeTexture9 *This, D3DTEXTUREFILTERTYPE FilterType) { const HRESULT hr = tex_SetAutoGenFilterType((void *)This, FilterType); if (FAILED(hr)) { static volatile LONG said; dx_failed(&said, "IDirect3DCubeTexture9::SetAutoGenFilterType", hr); } return hr; }
+static HRESULT STDMETHODCALLTYPE cube_vtbl_checked_GetLevelDesc(IDirect3DCubeTexture9 *This, UINT Level,D3DSURFACE_DESC* pDesc) { const HRESULT hr = cube_GetLevelDesc((void *)This, Level, pDesc); if (FAILED(hr)) { static volatile LONG said; dx_failed(&said, "IDirect3DCubeTexture9::GetLevelDesc", hr); } return hr; }
+static HRESULT STDMETHODCALLTYPE cube_vtbl_checked_GetCubeMapSurface(IDirect3DCubeTexture9 *This, D3DCUBEMAP_FACES FaceType, UINT Level, IDirect3DSurface9** ppCubeMapSurface) { const HRESULT hr = cube_GetCubeMapSurface((void *)This, FaceType, Level, ppCubeMapSurface); if (FAILED(hr)) { static volatile LONG said; dx_failed(&said, "IDirect3DCubeTexture9::GetCubeMapSurface", hr); } return hr; }
+static HRESULT STDMETHODCALLTYPE cube_vtbl_checked_LockRect(IDirect3DCubeTexture9 *This, D3DCUBEMAP_FACES face, UINT level, D3DLOCKED_RECT *locked_rect, const RECT *rect, DWORD flags) { const HRESULT hr = cube_LockRect((void *)This, face, level, locked_rect, rect, flags); if (FAILED(hr)) { static volatile LONG said; dx_failed(&said, "IDirect3DCubeTexture9::LockRect", hr); } return hr; }
+static HRESULT STDMETHODCALLTYPE cube_vtbl_checked_UnlockRect(IDirect3DCubeTexture9 *This, D3DCUBEMAP_FACES FaceType, UINT Level) { const HRESULT hr = cube_UnlockRect((void *)This, FaceType, Level); if (FAILED(hr)) { static volatile LONG said; dx_failed(&said, "IDirect3DCubeTexture9::UnlockRect", hr); } return hr; }
+static HRESULT STDMETHODCALLTYPE cube_vtbl_checked_AddDirtyRect(IDirect3DCubeTexture9 *This, D3DCUBEMAP_FACES face, const RECT *dirty_rect) { const HRESULT hr = cube_AddDirtyRect((void *)This, face, dirty_rect); if (FAILED(hr)) { static volatile LONG said; dx_failed(&said, "IDirect3DCubeTexture9::AddDirtyRect", hr); } return hr; }
+const IDirect3DCubeTexture9Vtbl cube_vtbl = {
+    .QueryInterface = (__typeof__(((IDirect3DCubeTexture9Vtbl *)0)->QueryInterface))obj_QueryInterface,
+    .AddRef = (__typeof__(((IDirect3DCubeTexture9Vtbl *)0)->AddRef))obj_AddRef,
+    .Release = (__typeof__(((IDirect3DCubeTexture9Vtbl *)0)->Release))obj_Release,
+    .GetDevice = (__typeof__(((IDirect3DCubeTexture9Vtbl *)0)->GetDevice))cube_vtbl_checked_GetDevice,
+    .SetPrivateData = (__typeof__(((IDirect3DCubeTexture9Vtbl *)0)->SetPrivateData))cube_vtbl_none_SetPrivateData,
+    .GetPrivateData = (__typeof__(((IDirect3DCubeTexture9Vtbl *)0)->GetPrivateData))cube_vtbl_none_GetPrivateData,
+    .FreePrivateData = (__typeof__(((IDirect3DCubeTexture9Vtbl *)0)->FreePrivateData))cube_vtbl_none_FreePrivateData,
+    .SetPriority = (__typeof__(((IDirect3DCubeTexture9Vtbl *)0)->SetPriority))res9_SetPriority,
+    .GetPriority = (__typeof__(((IDirect3DCubeTexture9Vtbl *)0)->GetPriority))res9_GetPriority,
+    .PreLoad = (__typeof__(((IDirect3DCubeTexture9Vtbl *)0)->PreLoad))res9_PreLoad,
+    .GetType = (__typeof__(((IDirect3DCubeTexture9Vtbl *)0)->GetType))cube_GetType,
+    .SetLOD = (__typeof__(((IDirect3DCubeTexture9Vtbl *)0)->SetLOD))tex_SetLOD,
+    .GetLOD = (__typeof__(((IDirect3DCubeTexture9Vtbl *)0)->GetLOD))tex_GetLOD,
+    .GetLevelCount = (__typeof__(((IDirect3DCubeTexture9Vtbl *)0)->GetLevelCount))tex_GetLevelCount,
+    .SetAutoGenFilterType = (__typeof__(((IDirect3DCubeTexture9Vtbl *)0)->SetAutoGenFilterType))cube_vtbl_checked_SetAutoGenFilterType,
+    .GetAutoGenFilterType = (__typeof__(((IDirect3DCubeTexture9Vtbl *)0)->GetAutoGenFilterType))tex_GetAutoGenFilterType,
+    .GenerateMipSubLevels = (__typeof__(((IDirect3DCubeTexture9Vtbl *)0)->GenerateMipSubLevels))tex_GenerateMipSubLevels,
+    .GetLevelDesc = (__typeof__(((IDirect3DCubeTexture9Vtbl *)0)->GetLevelDesc))cube_vtbl_checked_GetLevelDesc,
+    .GetCubeMapSurface = (__typeof__(((IDirect3DCubeTexture9Vtbl *)0)->GetCubeMapSurface))cube_vtbl_checked_GetCubeMapSurface,
+    .LockRect = (__typeof__(((IDirect3DCubeTexture9Vtbl *)0)->LockRect))cube_vtbl_checked_LockRect,
+    .UnlockRect = (__typeof__(((IDirect3DCubeTexture9Vtbl *)0)->UnlockRect))cube_vtbl_checked_UnlockRect,
+    .AddDirtyRect = (__typeof__(((IDirect3DCubeTexture9Vtbl *)0)->AddDirtyRect))cube_vtbl_checked_AddDirtyRect,
+};
+static HRESULT STDMETHODCALLTYPE vol_vtbl_checked_GetDevice(IDirect3DVolumeTexture9 *This, struct IDirect3DDevice9** ppDevice) { const HRESULT hr = child_GetDevice((void *)This, ppDevice); if (FAILED(hr)) { static volatile LONG said; dx_failed(&said, "IDirect3DVolumeTexture9::GetDevice", hr); } return hr; }
+static HRESULT STDMETHODCALLTYPE vol_vtbl_none_SetPrivateData(IDirect3DVolumeTexture9 *This, REFGUID guid, const void *data, DWORD data_size, DWORD flags) { static volatile LONG said; dx_unimplemented(&said, "IDirect3DVolumeTexture9::SetPrivateData"); return E_NOTIMPL; }
+static HRESULT STDMETHODCALLTYPE vol_vtbl_none_GetPrivateData(IDirect3DVolumeTexture9 *This, REFGUID refguid, void* pData, DWORD* pSizeOfData) { static volatile LONG said; dx_unimplemented(&said, "IDirect3DVolumeTexture9::GetPrivateData"); return E_NOTIMPL; }
+static HRESULT STDMETHODCALLTYPE vol_vtbl_none_FreePrivateData(IDirect3DVolumeTexture9 *This, REFGUID refguid) { static volatile LONG said; dx_unimplemented(&said, "IDirect3DVolumeTexture9::FreePrivateData"); return E_NOTIMPL; }
+static HRESULT STDMETHODCALLTYPE vol_vtbl_checked_SetAutoGenFilterType(IDirect3DVolumeTexture9 *This, D3DTEXTUREFILTERTYPE FilterType) { const HRESULT hr = tex_SetAutoGenFilterType((void *)This, FilterType); if (FAILED(hr)) { static volatile LONG said; dx_failed(&said, "IDirect3DVolumeTexture9::SetAutoGenFilterType", hr); } return hr; }
+static HRESULT STDMETHODCALLTYPE vol_vtbl_checked_GetLevelDesc(IDirect3DVolumeTexture9 *This, UINT Level, D3DVOLUME_DESC *pDesc) { const HRESULT hr = vol_GetLevelDesc((void *)This, Level, pDesc); if (FAILED(hr)) { static volatile LONG said; dx_failed(&said, "IDirect3DVolumeTexture9::GetLevelDesc", hr); } return hr; }
+static HRESULT STDMETHODCALLTYPE vol_vtbl_checked_GetVolumeLevel(IDirect3DVolumeTexture9 *This, UINT Level, IDirect3DVolume9** ppVolumeLevel) { const HRESULT hr = vol_GetVolumeLevel((void *)This, Level, ppVolumeLevel); if (FAILED(hr)) { static volatile LONG said; dx_failed(&said, "IDirect3DVolumeTexture9::GetVolumeLevel", hr); } return hr; }
+static HRESULT STDMETHODCALLTYPE vol_vtbl_checked_LockBox(IDirect3DVolumeTexture9 *This, UINT level, D3DLOCKED_BOX *locked_box, const D3DBOX *box, DWORD flags) { const HRESULT hr = vol_LockBox((void *)This, level, locked_box, box, flags); if (FAILED(hr)) { static volatile LONG said; dx_failed(&said, "IDirect3DVolumeTexture9::LockBox", hr); } return hr; }
+static HRESULT STDMETHODCALLTYPE vol_vtbl_checked_UnlockBox(IDirect3DVolumeTexture9 *This, UINT Level) { const HRESULT hr = vol_UnlockBox((void *)This, Level); if (FAILED(hr)) { static volatile LONG said; dx_failed(&said, "IDirect3DVolumeTexture9::UnlockBox", hr); } return hr; }
+static HRESULT STDMETHODCALLTYPE vol_vtbl_checked_AddDirtyBox(IDirect3DVolumeTexture9 *This, const D3DBOX *dirty_box) { const HRESULT hr = vol_AddDirtyBox((void *)This, dirty_box); if (FAILED(hr)) { static volatile LONG said; dx_failed(&said, "IDirect3DVolumeTexture9::AddDirtyBox", hr); } return hr; }
+const IDirect3DVolumeTexture9Vtbl vol_vtbl = {
+    .QueryInterface = (__typeof__(((IDirect3DVolumeTexture9Vtbl *)0)->QueryInterface))obj_QueryInterface,
+    .AddRef = (__typeof__(((IDirect3DVolumeTexture9Vtbl *)0)->AddRef))obj_AddRef,
+    .Release = (__typeof__(((IDirect3DVolumeTexture9Vtbl *)0)->Release))obj_Release,
+    .GetDevice = (__typeof__(((IDirect3DVolumeTexture9Vtbl *)0)->GetDevice))vol_vtbl_checked_GetDevice,
+    .SetPrivateData = (__typeof__(((IDirect3DVolumeTexture9Vtbl *)0)->SetPrivateData))vol_vtbl_none_SetPrivateData,
+    .GetPrivateData = (__typeof__(((IDirect3DVolumeTexture9Vtbl *)0)->GetPrivateData))vol_vtbl_none_GetPrivateData,
+    .FreePrivateData = (__typeof__(((IDirect3DVolumeTexture9Vtbl *)0)->FreePrivateData))vol_vtbl_none_FreePrivateData,
+    .SetPriority = (__typeof__(((IDirect3DVolumeTexture9Vtbl *)0)->SetPriority))res9_SetPriority,
+    .GetPriority = (__typeof__(((IDirect3DVolumeTexture9Vtbl *)0)->GetPriority))res9_GetPriority,
+    .PreLoad = (__typeof__(((IDirect3DVolumeTexture9Vtbl *)0)->PreLoad))res9_PreLoad,
+    .GetType = (__typeof__(((IDirect3DVolumeTexture9Vtbl *)0)->GetType))vol_GetType,
+    .SetLOD = (__typeof__(((IDirect3DVolumeTexture9Vtbl *)0)->SetLOD))tex_SetLOD,
+    .GetLOD = (__typeof__(((IDirect3DVolumeTexture9Vtbl *)0)->GetLOD))tex_GetLOD,
+    .GetLevelCount = (__typeof__(((IDirect3DVolumeTexture9Vtbl *)0)->GetLevelCount))tex_GetLevelCount,
+    .SetAutoGenFilterType = (__typeof__(((IDirect3DVolumeTexture9Vtbl *)0)->SetAutoGenFilterType))vol_vtbl_checked_SetAutoGenFilterType,
+    .GetAutoGenFilterType = (__typeof__(((IDirect3DVolumeTexture9Vtbl *)0)->GetAutoGenFilterType))tex_GetAutoGenFilterType,
+    .GenerateMipSubLevels = (__typeof__(((IDirect3DVolumeTexture9Vtbl *)0)->GenerateMipSubLevels))tex_GenerateMipSubLevels,
+    .GetLevelDesc = (__typeof__(((IDirect3DVolumeTexture9Vtbl *)0)->GetLevelDesc))vol_vtbl_checked_GetLevelDesc,
+    .GetVolumeLevel = (__typeof__(((IDirect3DVolumeTexture9Vtbl *)0)->GetVolumeLevel))vol_vtbl_checked_GetVolumeLevel,
+    .LockBox = (__typeof__(((IDirect3DVolumeTexture9Vtbl *)0)->LockBox))vol_vtbl_checked_LockBox,
+    .UnlockBox = (__typeof__(((IDirect3DVolumeTexture9Vtbl *)0)->UnlockBox))vol_vtbl_checked_UnlockBox,
+    .AddDirtyBox = (__typeof__(((IDirect3DVolumeTexture9Vtbl *)0)->AddDirtyBox))vol_vtbl_checked_AddDirtyBox,
 };
 static HRESULT STDMETHODCALLTYPE surf_vtbl_checked_GetDevice(IDirect3DSurface9 *This, struct IDirect3DDevice9** ppDevice) { const HRESULT hr = child_GetDevice((void *)This, ppDevice); if (FAILED(hr)) { static volatile LONG said; dx_failed(&said, "IDirect3DSurface9::GetDevice", hr); } return hr; }
 static HRESULT STDMETHODCALLTYPE surf_vtbl_none_SetPrivateData(IDirect3DSurface9 *This, REFGUID guid, const void *data, DWORD data_size, DWORD flags) { static volatile LONG said; dx_unimplemented(&said, "IDirect3DSurface9::SetPrivateData"); return E_NOTIMPL; }

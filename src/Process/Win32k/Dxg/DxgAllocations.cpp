@@ -66,7 +66,7 @@ uint32_t parse_private_data(const ByteBuffer& data, Session& s, dxgk::Handle dev
   if (word(data, kAwVersion) != kAllocPrivateVersion) return kStatusInvalidParameter;
   desc->flags = word(data, kAwFlags);
   const uint32_t format = word(data, kAwFormat);
-  if (format > static_cast<uint32_t>(dxgk::Format::A2B10G10R10)) return kStatusInvalidParameter;
+  if (format > static_cast<uint32_t>(dxgk::Format::Bc3Srgb)) return kStatusInvalidParameter;
   desc->format = static_cast<dxgk::Format>(format);
   desc->width = word(data, kAwWidth);
   desc->height = word(data, kAwHeight);

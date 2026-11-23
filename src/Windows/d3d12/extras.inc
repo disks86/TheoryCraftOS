@@ -105,6 +105,19 @@ static void STDMETHODCALLTYPE list_BeginQuery(CmdList *l, ID3D12QueryHeap *heap,
   l->query_open = 1;
 }
 
+/* A query of one of the kernel's kinds (graphics::QueryKind: 0 occlusion, 1 occlusion predicate, 5 pixel shader invocations, 8 | stream << 8 stream output primitives
+ * needed ...) into slot `index` of an occlusion heap, for the runtimes layered on this one (TcosD3D12BeginQueryKind). EndQuery with D3D12_QUERY_TYPE_OCCLUSION ends it. */
+static void list_begin_query_kind(CmdList *l, QHeap *h, UINT index, UINT kind) {
+  if (l->bundle || !h || h->desc.Type != D3D12_QUERY_HEAP_TYPE_OCCLUSION || index >= h->desc.Count || l->query_open) return;
+  ensure_room(l, 512, 4);
+  if (chunk_cur(l)->queries >= 60) { end_pass(l); chunk_new(l); }
+  if (!ensure_pass(l)) return;
+  UINT w[3] = {alloc_index(l, h->alloc), index * 8, kind};
+  packet(l, OP_BEGIN_QUERY, w, 3);
+  chunk_cur(l)->queries++;
+  l->query_open = 1;
+}
+
 static void STDMETHODCALLTYPE list_EndQuery(CmdList *l, ID3D12QueryHeap *heap, D3D12_QUERY_TYPE type, UINT index) {
   QHeap *h = (QHeap *)heap;
   if (l->bundle || !h || index >= h->desc.Count) return;

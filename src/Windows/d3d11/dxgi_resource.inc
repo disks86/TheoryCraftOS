@@ -29,7 +29,7 @@ static HRESULT STDMETHODCALLTYPE tex_QueryInterface(Tex *t, REFIID riid, void **
   if (guid_eq(riid, &IID_IDXGIObject) || guid_eq(riid, &IID_IDXGIDeviceSubObject) || guid_eq(riid, &IID_IDXGIResource) || guid_eq(riid, &IID_IDXGIResource1)) {
     *out = &t->dxgi_res;
   } else if (guid_eq(riid, &IID_IDXGISurface) || guid_eq(riid, &IID_IDXGISurface1) || guid_eq(riid, &IID_IDXGISurface2)) {
-    if (t->desc.ArraySize != 1 || t->desc.MipLevels != 1) { dx_no_interface("ID3D11Texture2D (a surface of several subresources)", riid); return E_NOINTERFACE; }
+    if (t->desc.ArraySize != 1 || t->desc.MipLevels != 1 || t->kind != 0) { dx_no_interface("ID3D11Texture2D (a surface of several subresources)", riid); return E_NOINTERFACE; }
     *out = &t->dxgi_surf;
   } else {
     return dx_QueryInterface(OBJ(t), riid, out);

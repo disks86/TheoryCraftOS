@@ -34,7 +34,7 @@ enum {
 };
 enum {
   KF_UNKNOWN, KF_A8R8G8B8, KF_X8R8G8B8, KF_A8B8G8R8, KF_X8B8G8R8, KF_D32F, KF_D24S8, KF_RGBA16F, KF_RGBA32F, KF_BGRA8_SRGB, KF_RGBA8_SRGB, KF_RGBA16, KF_RGBA32UINT, KF_RGBA32SINT,
-  KF_RGBA16UINT, KF_RGBA16SINT, KF_RGBA8UINT, KF_RGBA16SNORM, KF_RGB10A2,
+  KF_RGBA16UINT, KF_RGBA16SINT, KF_RGBA8UINT, KF_RGBA16SNORM, KF_RGB10A2, KF_BC1, KF_BC2, KF_BC3, KF_BC1_SRGB, KF_BC2_SRGB, KF_BC3_SRGB,
 };
 #define KMAX_TEXTURE_DIMENSION 4096
 #define KTILE_BYTES 65536
@@ -42,8 +42,9 @@ enum {
 typedef struct FormatInfo {
   DXGI_FORMAT dxgi;
   UINT kernel;         /* the kernel's format (0: not one a texture can have) */
-  UINT bytes;          /* of a pixel */
+  UINT bytes;          /* of a pixel; of a 4 x 4 block of a compressed format */
   UINT depth;          /* depth/stencil format */
+  UINT compressed;     /* block-compressed (BC1 .. BC3): the rows of a footprint are rows of blocks */
 } FormatInfo;
 
 static const FormatInfo g_formats[] = {
@@ -55,7 +56,13 @@ static const FormatInfo g_formats[] = {
     {DXGI_FORMAT_R8G8B8A8_UINT, KF_RGBA8UINT, 4, 0}, {DXGI_FORMAT_B8G8R8A8_UNORM, KF_A8R8G8B8, 4, 0}, {DXGI_FORMAT_B8G8R8X8_UNORM, KF_X8R8G8B8, 4, 0},
     {DXGI_FORMAT_B8G8R8A8_TYPELESS, KF_A8R8G8B8, 4, 0}, {DXGI_FORMAT_B8G8R8A8_UNORM_SRGB, KF_BGRA8_SRGB, 4, 0}, {DXGI_FORMAT_B8G8R8X8_TYPELESS, KF_X8R8G8B8, 4, 0},
     {DXGI_FORMAT_D32_FLOAT, KF_D32F, 4, 1}, {DXGI_FORMAT_D24_UNORM_S8_UINT, KF_D24S8, 4, 1},
+    {DXGI_FORMAT_BC1_TYPELESS, KF_BC1, 8, 0, 1}, {DXGI_FORMAT_BC1_UNORM, KF_BC1, 8, 0, 1}, {DXGI_FORMAT_BC1_UNORM_SRGB, KF_BC1_SRGB, 8, 0, 1},
+    {DXGI_FORMAT_BC2_TYPELESS, KF_BC2, 16, 0, 1}, {DXGI_FORMAT_BC2_UNORM, KF_BC2, 16, 0, 1}, {DXGI_FORMAT_BC2_UNORM_SRGB, KF_BC2_SRGB, 16, 0, 1},
+    {DXGI_FORMAT_BC3_TYPELESS, KF_BC3, 16, 0, 1}, {DXGI_FORMAT_BC3_UNORM, KF_BC3, 16, 0, 1}, {DXGI_FORMAT_BC3_UNORM_SRGB, KF_BC3_SRGB, 16, 0, 1},
 };
+/* The bytes of a row of a level `w` pixels wide (of blocks for a compressed format), and the rows of a level `h` high. */
+static UINT64 format_row_bytes(const FormatInfo *fi, UINT w) { return fi && fi->compressed ? (UINT64)((w + 3) / 4) * fi->bytes : (UINT64)w * (fi ? fi->bytes : 4); }
+static UINT format_rows(const FormatInfo *fi, UINT h) { return fi && fi->compressed ? (h + 3) / 4 : h; }
 
 static const FormatInfo *format_info(DXGI_FORMAT f) {
   for (UINT i = 0; i < sizeof g_formats / sizeof g_formats[0]; ++i)
@@ -188,6 +195,8 @@ struct Dev {
   UINT shared_count, shared_capacity;
   UINT next_pixel_base;    /* TcosD3D12PipelineOptions: for the next graphics pipeline, where the pixel shader's constant buffers begin (16-byte registers) */
   UINT next_shader_kind;   /* ... and the kernel's kind of its shaders (0: DXBC / DXIL) */
+  UINT next_stage_base[3]; /* TcosD3D12StageConstantBases: ... where the geometry, hull and domain shaders' constant buffers begin */
+  UINT next_resource_flags;/* TcosD3D12ResourceOptions: for the next resource made (TCOS_RESOURCE_CUBE) */
 };
 #define DEV_FEATURE_STREAM_OUTPUT (1u << 21)      /* graphics::kFeatureStreamOutput in KmtCaps.features */
 #define DEV_FEATURE_VERTEX_FORMATS (1u << 29)     /* graphics::kFeatureVertexFormats: vertex elements other than 32-bit floats */

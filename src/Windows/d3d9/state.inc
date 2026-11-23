@@ -302,7 +302,9 @@ static HRESULT STDMETHODCALLTYPE dev_GetIndices(Dev *d, IDirect3DIndexBuffer9 **
 }
 static HRESULT STDMETHODCALLTYPE dev_SetTexture(Dev *d, DWORD stage, IDirect3DBaseTexture9 *texture) {
   if (stage >= TEXTURE_SLOTS) return D3D_OK;      /* (the vertex shader's samplers and the like) */
-  if (texture && ((DxObj *)texture)->lpVtbl != (const void *)&tex_vtbl) return D3DERR_INVALIDCALL;
+  if (texture && ((DxObj *)texture)->lpVtbl != (const void *)&tex_vtbl && ((DxObj *)texture)->lpVtbl != (const void *)&cube_vtbl &&
+      ((DxObj *)texture)->lpVtbl != (const void *)&vol_vtbl)
+    return D3DERR_INVALIDCALL;
   bind(&d->state.tex[stage], texture);
   return D3D_OK;
 }
@@ -365,6 +367,7 @@ static HRESULT shader_make(Dev *d, const DWORD *code, BOOL vertex, Shader **out)
       s->major = translated->major;
       s->state = translated->state_register;
       for (UINT i = 0; i < 16; ++i) if (translated->sampler_mask >> i & 1) s->sampler_count = i + 1;
+      memcpy(s->sampler_kind, translated->sampler_kind, sizeof s->sampler_kind);
       for (UINT i = 0; i < TEXTURE_SETS; ++i) if (translated->varying_mask >> (SM_SLOT_TEXCOORD + i) & 1) s->coordinates = i + 1;
       s->input_count = translated->input_count;
       memcpy(s->inputs, translated->inputs, sizeof s->inputs);

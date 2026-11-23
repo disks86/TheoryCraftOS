@@ -44,12 +44,12 @@ i686-w64-mingw32-gcc -O1 -mcrtdll=msvcrt-os -o "$work/old32.exe" tests/windows/o
 python3 - "$work/dxfixtures.h" <<'PY'
 import sys
 out = open(sys.argv[1], "w")
-for n in ("vs", "ps_color", "ps_tex", "cs_fill", "vs_attrs6", "ps_tex4", "ps_mrt8", "ps_cbuf", "vs_packed", "ps_packed", "ps_planes"):
+for n in ("vs", "ps_color", "ps_tex", "cs_fill", "vs_attrs6", "ps_tex4", "ps_mrt8", "ps_cbuf", "vs_packed", "ps_packed", "ps_planes", "vs_vol", "ps_texcube", "ps_texarray", "ps_tex3d", "gs_copy", "hs_tri_cb", "ds_shift", "cs_d3d11", "ps_sbuf", "ps_tex1d", "ps_tex1darray"):
     data = open("tests/data/dxbc/%s.dxbc" % n, "rb").read()
     out.write("static const unsigned char dx_%s_dxbc[] = {%s};\n" % (n, ",".join(str(b) for b in data)))
 PY
 i686-w64-mingw32-gcc -O1 -I "$work" -o "$work/dx32.exe" tests/windows/dx32.c -ldxgi -ld3d12 -luuid -lgdi32
-i686-w64-mingw32-gcc -O1 -I "$work" -o "$work/d3d11test.exe" tests/windows/d3d11test.c -ld3d11 -ldxgi -luuid -ldxguid -luser32
+i686-w64-mingw32-gcc -O1 -I "$work" -o "$work/d3d11test.exe" tests/windows/d3d11test.c -ld3d11 -ld3d12 -ldxgi -luuid -ldxguid -luser32
 i686-w64-mingw32-gcc -O1 -o "$work/d3d9test.exe" tests/windows/d3d9test.c -ld3d9 -luser32
 # (com32's interfaces: the type library is a resource of the program, the header and the identifiers are generated)
 widl -m32 -I /usr/include/wine/windows -t -T "$work/com32.tlb" -h -H "$work/com32_h.h" -u -U "$work/com32_i.c" tests/windows/com32.idl

@@ -196,6 +196,22 @@ by a linear filter, clamped), an array's is the layer (rounded, clamped), a cube
 layers staged one at a time through a one-layer backing (transfer box `z` = the layer), the sampler's wrap R is clamped, the view's last layer is `layers - 1` for arrays and cubes and 0 for a volume. The 33 scenes
 pass on virglrenderer; pixel centres on exact texel boundaries are avoided in the array scene (devices round ties either way).
 
+`d3d12.dll` makes a `TEXTURE3D` resource a volume and a 2D one of `DepthOrArraySize` > 1 an array; a cube only when the runtime above says the next resource is one
+(`TcosD3D12ResourceOptions(device, TCOS_RESOURCE_CUBE)`, src/Windows/tcosdx.h: six square layers), since Direct3D 12 tells a cube from an array of six only by its views and
+the kernel's allocation has to know when it is made. `d3d11.dll` (`D3D11_RESOURCE_MISC_TEXTURECUBE`) and `d3d9.dll` (`CreateCubeTexture`) say it; a plain Direct3D 12
+program's cube is an array. The same header's `TcosD3D12StageConstantBases` places the geometry, hull and domain shaders' constant buffers in the block of constants.
+
+## Block-compressed textures
+
+`Format::Bc1`, `Bc2`, `Bc3` and their sRGB forms (BC1 = DXT1 with its one-bit alpha, BC2 = DXT3, BC3 = DXT5) are allocation formats of sampled textures only (`kAllocTexture`,
+optionally `kAllocShared`, or staging memory; one sample): plain textures with mip levels, or volumes, arrays and cubes of one level. The backing is rows of 4 x 4 blocks of 8 or 16
+bytes (`image_row_bytes` / `image_rows` / `image_level_bytes` in DxgTypes.hpp; a lock's pitch is a row of blocks), and `CopyBufferImage` copies whole blocks: the rectangle starts on a
+block and ends on one or at the level's edge, the buffer's rows are rows of blocks. `CopyRegion` and `GenerateMipmaps` refuse them. A device with `kFeatureCompressedFormats` samples
+them as they are: VidMm gives it the blocks with `IImage::write_compressed` (virgl: the host's `DXT1_RGBA` 106, `DXT3_RGBA` 107, `DXT5_RGBA` 108 and the `SRGBA` forms 110 - 112 of
+virglrenderer's `virgl_hw.h`, bound as sampler views only, each level and layer transferred with a stride of a row of blocks); for the others (the CPU renderer) the device image is
+B8G8R8A8 and VidMm decodes the blocks when it uploads them (`Graphics/BlockCompression.hpp`, the decoding the Direct3D 10 specification gives; `BlockCompressionTest` checks it
+with values worked out by hand, shortened views and every bit turned). BC4 - BC7 are not there.
+
 ## Compute shaders and unordered access views
 
 `cs_5_0` DXBC compute shaders run through `ShaderKind::Dxbc` with `ShaderStage::Compute` (the escape ABI's `CreateShader` stage 2). A compute pipeline has no state: `PipelineDesc::compute_shader`
@@ -291,7 +307,7 @@ the kernel side of each can be tried and timed on the machine at hand:
 - **Shaders**: SM2 / SM3 / SM4 / SM5.0 / SM5.1 vertex and pixel shaders (no geometry / tessellation / compute shaders, no 5.1 register spaces or arrays of resources). The pixel stage of Intel Gen9 is two fixed kernels, so a general pixel
   shader runs there only on the software, virgl (as unvalidated TGSI) and SVGA3D (unvalidated) paths. No loops, calls, predication, ps_1_x, constants above c7 (push constants are
   128 bytes), depth output, fog / point size, cube and volume samplers. Pipeline state is limited to what `IGraphicsDevice` offers (one colour target, 2 textures, alpha blend on/off, depth and stencil).
-- No UAV textures, no group-shared memory or barriers (a compute shader that needs `sync` or `dcl_tgsm` is refused), no multisampled shader resources (`Texture2DMS`, `ld2dms`), no depth resolve, no alpha-to-coverage or sample mask, no per-sample shading, no centroid interpolation, no mipmapped / render-target / float cube, volume or array textures, no integer formats but R32G32B32A32_UINT, no signed or 10-bit formats.
+- No UAV textures, no group-shared memory or barriers (a compute shader that needs `sync` or `dcl_tgsm` is refused), no multisampled shader resources (`Texture2DMS`, `ld2dms`), no depth resolve, no alpha-to-coverage or sample mask, no per-sample shading, no centroid interpolation, no mipmapped / render-target / float cube, volume or array textures (`d3d11.dll` and `d3d9.dll` keep the first level of the ones a program makes with more), no integer formats but R32G32B32A32_UINT, no signed or 10-bit formats.
 - Sync objects cannot be shared between processes. No timeout detection and recovery (a hung device cannot be reset), no vblank / scan line, gamma, overlays or VidPN topology
   (multi-monitor); display mode listing and switching go straight to the GPU driver.
 - Video memory is accounted per adapter but there is no per-process budget or priority-based paging between processes.
@@ -395,8 +411,7 @@ In the DLL alone: passes with a depth buffer and no render target (the kernel's 
 nothing reads; a device whose passes need none would save that memory), a depth clear that no pass takes (a pass of its own when the list is closed), multisampled render
 targets and depth buffers with `ResolveSubresource`.
 
-Not done, in the order a program is likely to meet them: texture formats of fewer than four channels, packed floats and block compression (`graphics::Format` has
-four-channel colour formats and one depth format); a depth buffer read as a texture (shadow maps: virgl keeps textures and attachments in opposite row order, and the
+Not done, in the order a program is likely to meet them: texture formats of fewer than four channels, packed floats and block compression beyond BC1 - BC3 (above); a depth buffer read as a texture (shadow maps: virgl keeps textures and attachments in opposite row order, and the
 kernel refuses the combination); rendering into a mip level or an array layer; unordered access to textures; the blend factor, depth bias and back-face stencil state;
 several viewports; more than four unordered access buffers; pipeline statistics queries from the DLL; shared handles; the later device and command list interfaces
 (`ID3D12Device1` ..., ray tracing, mesh shaders, variable rate shading); and all of it on the GPU backends other than virgl.

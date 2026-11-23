@@ -49,5 +49,20 @@ struct ITcosPresenter { const ITcosPresenterVtbl *lpVtbl; };
  * Exported by d3d12.dll; the caller makes the pipeline right after, on the same thread. */
 struct ID3D12Device;
 void WINAPI TcosD3D12PipelineOptions(struct ID3D12Device *device, UINT pixel_constant_base, UINT shader_kind);
+/* The same for the geometry, hull and domain shaders of the next graphics pipeline (16-byte registers; 0 where the stage reads no constants or the pipeline
+ * has no such shader). Direct3D 11 puts them after the vertex and pixel shaders' buffers. */
+void WINAPI TcosD3D12StageConstantBases(struct ID3D12Device *device, UINT geometry, UINT hull, UINT domain);
+/* Options of the next resource made on the device (CreateCommittedResource), on the same thread right after:
+ *   TCOS_RESOURCE_CUBE   a 2D texture of six layers (square) is a cube, which the kernel samples by direction. Direct3D 12 tells a cube from an array of six
+ *                        only by its views; the kernel's allocation has to know when it is made (Direct3D 11's D3D11_RESOURCE_MISC_TEXTURECUBE, Direct3D 9's
+ *                        cube textures). */
+#define TCOS_RESOURCE_CUBE 1u
+void WINAPI TcosD3D12ResourceOptions(struct ID3D12Device *device, UINT flags);
+/* Begins a query of one of the kernel's kinds (graphics::QueryKind, docs/Direct3DKernelMode.md "More queries": 0 occlusion count, 1 occlusion predicate, 5 pixel
+ * shader invocations, 8 | stream << 8 stream output primitives needed, ...) in slot `index` of an occlusion query heap; ID3D12GraphicsCommandList::EndQuery with
+ * D3D12_QUERY_TYPE_OCCLUSION ends it, and ResolveQueryData gives its 64-bit result. One query is open at a time. */
+struct ID3D12GraphicsCommandList;
+struct ID3D12QueryHeap;
+void WINAPI TcosD3D12BeginQueryKind(struct ID3D12GraphicsCommandList *list, struct ID3D12QueryHeap *heap, UINT index, UINT kind);
 
 #endif

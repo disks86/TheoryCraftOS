@@ -207,14 +207,16 @@ static void get_footprints(const D3D12_RESOURCE_DESC *d, UINT first, UINT count,
   }
   const UINT mips = d->MipLevels ? d->MipLevels : mip_count_for((UINT)d->Width, d->Height);
   const UINT depth_or_array = d->DepthOrArraySize ? d->DepthOrArraySize : 1;
+  const FormatInfo *fi = format_info(d->Format);
   const UINT bytes = format_bytes(d->Format);
   for (UINT i = 0; i < count; ++i) {
     const UINT sub = first + i;
     const UINT level = sub % mips;
     const UINT w = mip_extent((UINT)d->Width, level), h = mip_extent(d->Height, level);
     const UINT depth = d->Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D ? mip_extent(depth_or_array, level) : 1;
-    const UINT64 row_size = (UINT64)w * bytes;
+    const UINT64 row_size = fi ? format_row_bytes(fi, w) : (UINT64)w * bytes;
     const UINT pitch = (UINT)KALIGN(row_size, 256);
+    const UINT rows_of = fi ? format_rows(fi, h) : h;
     offset = KALIGN(offset, 512);
     if (layouts) {
       memset(&layouts[i], 0, sizeof layouts[i]);
@@ -225,11 +227,11 @@ static void get_footprints(const D3D12_RESOURCE_DESC *d, UINT first, UINT count,
       layouts[i].Footprint.Depth = depth;
       layouts[i].Footprint.RowPitch = pitch;
     }
-    if (rows) rows[i] = h;
+    if (rows) rows[i] = rows_of;
     if (row_sizes) row_sizes[i] = row_size;
     /* (the last row of the last slice is not padded) */
-    end = offset + (UINT64)pitch * h * (depth - 1) + (UINT64)pitch * (h - 1) + row_size;
-    offset += (UINT64)pitch * h * depth;
+    end = offset + (UINT64)pitch * rows_of * (depth - 1) + (UINT64)pitch * (rows_of - 1) + row_size;
+    offset += (UINT64)pitch * rows_of * depth;
   }
   if (total) *total = end - base;
 }
@@ -267,6 +269,8 @@ static HRESULT resource_make(Dev *dev, const D3D12_HEAP_PROPERTIES *props, D3D12
   /* (mode: 0 an ordinary resource, 2 a reserved one, which has the 64 KiB layouts) */
   const int reserved = mode == 2;
   if (!reserved && desc->Layout != D3D12_TEXTURE_LAYOUT_UNKNOWN && desc->Layout != D3D12_TEXTURE_LAYOUT_ROW_MAJOR) return E_INVALIDARG;
+  const int cube = (dev->next_resource_flags & TCOS_RESOURCE_CUBE) != 0;
+  dev->next_resource_flags = 0;      /* (the options were for this resource) */
   Resource *r = dobj_new(sizeof *r, dev, &res_vtbl, g_resource_iids, resource_destroy);
   if (!r) return E_OUTOFMEMORY;
   r->desc = *desc;
@@ -286,17 +290,24 @@ static HRESULT resource_make(Dev *dev, const D3D12_HEAP_PROPERTIES *props, D3D12
     const FormatInfo *fi = format_info(desc->Format);
     UINT depth_or_array = desc->DepthOrArraySize ? desc->DepthOrArraySize : 1;
     const int want_depth = (desc->Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL) != 0;
-    if (cpu || desc->Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D) { hr = cpu ? E_INVALIDARG : E_NOTIMPL; goto fail; }
+    /* (a one-dimensional texture is a two-dimensional one a texel high - the kernel's shaders take 1D textures as that - and an array of them an array of those) */
+    if (cpu || (desc->Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D && desc->Height != 1)) { hr = E_INVALIDARG; goto fail; }
     if (desc->Format == DXGI_FORMAT_R32_TYPELESS && want_depth) fi = format_info(DXGI_FORMAT_D32_FLOAT);
     if (desc->Format == DXGI_FORMAT_R24G8_TYPELESS && want_depth) fi = format_info(DXGI_FORMAT_D24_UNORM_S8_UINT);
     if (!fi || !fi->kernel || !!fi->depth != want_depth) { hr = fi && fi->kernel ? E_INVALIDARG : DXGI_ERROR_UNSUPPORTED; goto fail; }
+    if (fi->compressed && (desc->Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS))) { hr = E_INVALIDARG; goto fail; }      /* (sampled only) */
     if (desc->Width == 0 || desc->Height == 0 || desc->Width > KMAX_TEXTURE_DIMENSION || desc->Height > KMAX_TEXTURE_DIMENSION) { hr = E_INVALIDARG; goto fail; }
     r->fmt = fi;
     r->mips = samples > 1 ? 1 : desc->MipLevels ? desc->MipLevels : mip_count_for((UINT)desc->Width, desc->Height);
     r->layers = 1;
     r->kind = 0;
     if (desc->Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D) { r->kind = 1; r->layers = depth_or_array; }
-    else if (depth_or_array > 1) { r->kind = 2; r->layers = depth_or_array; }
+    else if (cube) {
+      /* (a cube: what the runtime above said of it - Direct3D 12 tells a cube from an array of six only by its views; the kernel's cube is six square faces) */
+      if (depth_or_array != 6 || desc->Width != desc->Height) { hr = DXGI_ERROR_UNSUPPORTED; goto fail; }
+      r->kind = 3;
+      r->layers = 6;
+    } else if (depth_or_array > 1) { r->kind = 2; r->layers = depth_or_array; }
     const int target = (desc->Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET) != 0;
     if ((r->kind != 0 || r->mips > 1) && (target || want_depth || (r->kind != 0 && r->mips > 1))) { hr = DXGI_ERROR_UNSUPPORTED; goto fail; }
     ad.flags = want_depth ? KA_DEPTH : (target ? (KA_RENDER_TARGET | KA_TEXTURE) : KA_TEXTURE);

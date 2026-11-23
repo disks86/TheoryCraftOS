@@ -25,7 +25,7 @@ A method defined with `#define <prefix>_<Method> <function>` counts too (the IUn
 import re, os, sys
 
 INC = '/usr/x86_64-w64-mingw32/include/'
-HEADERS = ['d3d12.h', 'd3d12sdklayers.h', 'dxgi1_6.h', 'dxgi1_5.h', 'dxgi1_4.h', 'dxgi1_3.h', 'dxgi1_2.h', 'dxgi.h', 'd3dcommon.h', 'd3d11.h', 'd3d9.h']
+HEADERS = ['d3d12.h', 'd3d12sdklayers.h', 'dxgi1_6.h', 'dxgi1_5.h', 'dxgi1_4.h', 'dxgi1_3.h', 'dxgi1_2.h', 'dxgi.h', 'd3dcommon.h', 'd3d11.h', 'd3d11_1.h', 'd3d9.h']
 ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'src', 'Windows')
 
 # (interface, vtable variable, [prefixes in the order they are tried])
@@ -52,21 +52,33 @@ SPECS = {
         ('ID3D10Blob', 'blob_vtbl', ['blob', 'obj']),
     ],
     'd3d11': [
-        ('ID3D11Device', 'dev_vtbl', ['dev', 'obj']),
-        ('ID3D11DeviceContext', 'ctx_vtbl', ['ctx', 'child', 'obj']),
+        ('ID3D11Device1', 'dev_vtbl', ['dev', 'obj']),
+        ('ID3D11DeviceContext1', 'ctx_vtbl', ['ctx', 'child', 'obj']),
         ('ID3D11Buffer', 'buf_vtbl', ['buf', 'child', 'obj']),
+        ('ID3D11Texture1D', 'tex1d_vtbl', ['tex1d', 'tex', 'child', 'obj']),
         ('ID3D11Texture2D', 'tex_vtbl', ['tex', 'child', 'obj']),
+        ('ID3D11Texture3D', 'tex3_vtbl', ['tex3', 'tex', 'child', 'obj']),
         ('ID3D11RenderTargetView', 'rtv_vtbl', ['rtv', 'view', 'child', 'obj']),
         ('ID3D11DepthStencilView', 'dsv_vtbl', ['dsv', 'view', 'child', 'obj']),
         ('ID3D11ShaderResourceView', 'srv_vtbl', ['srv', 'view', 'child', 'obj']),
+        ('ID3D11UnorderedAccessView', 'uav_vtbl', ['uav', 'view', 'child', 'obj']),
         ('ID3D11VertexShader', 'vs_vtbl', ['child', 'obj']),
         ('ID3D11PixelShader', 'ps_vtbl', ['child', 'obj']),
+        ('ID3D11GeometryShader', 'gs_vtbl', ['child', 'obj']),
+        ('ID3D11HullShader', 'hs_vtbl', ['child', 'obj']),
+        ('ID3D11DomainShader', 'ds_vtbl', ['child', 'obj']),
+        ('ID3D11ComputeShader', 'cs_vtbl', ['child', 'obj']),
         ('ID3D11InputLayout', 'layout_vtbl', ['child', 'obj']),
-        ('ID3D11BlendState', 'blend_vtbl', ['blend', 'child', 'obj']),
+        ('ID3D11BlendState1', 'blend_vtbl', ['blend', 'child', 'obj']),
         ('ID3D11DepthStencilState', 'depth_vtbl', ['depth', 'child', 'obj']),
-        ('ID3D11RasterizerState', 'raster_vtbl', ['raster', 'child', 'obj']),
+        ('ID3D11RasterizerState1', 'raster_vtbl', ['raster', 'child', 'obj']),
         ('ID3D11SamplerState', 'sampler_vtbl', ['sampler', 'child', 'obj']),
         ('ID3D11Query', 'query_vtbl', ['query', 'child', 'obj']),
+        ('ID3D11Predicate', 'pred_vtbl', ['query', 'child', 'obj']),
+        ('ID3D11ClassLinkage', 'link_vtbl', ['link', 'child', 'obj']),
+        ('ID3D11ClassInstance', 'inst_vtbl', ['inst', 'child', 'obj']),
+        ('ID3D11CommandList', 'cmdlist_vtbl', ['cmdlist', 'child', 'obj']),
+        ('ID3DDeviceContextState', 'cstate_vtbl', ['cstate', 'child', 'obj']),
     ],
     'd3d9': [
         ('IDirect3D9', 'd3d_vtbl', ['d3d', 'obj']),
@@ -74,6 +86,8 @@ SPECS = {
         ('IDirect3DVertexBuffer9', 'vb_vtbl', ['vb', 'buf', 'res9', 'child', 'obj']),
         ('IDirect3DIndexBuffer9', 'ib_vtbl', ['ib', 'buf', 'res9', 'child', 'obj']),
         ('IDirect3DTexture9', 'tex_vtbl', ['tex', 'res9', 'child', 'obj']),
+        ('IDirect3DCubeTexture9', 'cube_vtbl', ['cube', 'tex', 'res9', 'child', 'obj']),
+        ('IDirect3DVolumeTexture9', 'vol_vtbl', ['vol', 'tex', 'res9', 'child', 'obj']),
         ('IDirect3DSurface9', 'surf_vtbl', ['surf', 'res9', 'child', 'obj']),
         ('IDirect3DVertexDeclaration9', 'decl_vtbl', ['decl', 'child', 'obj']),
         ('IDirect3DStateBlock9', 'sb_vtbl', ['sb', 'child', 'obj']),

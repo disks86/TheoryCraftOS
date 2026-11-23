@@ -554,9 +554,16 @@ void test_refusals() {
   }
   {
     Asm a(false, 2, 0);
-    a.dcl(3u << 27, 0, reg(kSampler, 0));      // a cube sampler
+    a.dcl(1u << 27, 0, reg(kSampler, 0));      // a one-dimensional sampler (D3DSTT_1D): not taken
     a.ins(66, {dst(kTemp, 0), src(kAddr, 0), src(kSampler, 0)});
     CHECK(status_of(a.end()) == SM_UNSUPPORTED);
+  }
+  for (unsigned type = 2; type <= 4; ++type) {
+    Asm a(false, 2, 0);
+    a.dcl(type << 27, 0, reg(kSampler, 0));      // two-dimensional, cube and volume samplers
+    a.ins(66, {dst(kTemp, 0), src(kAddr, 0), src(kSampler, 0)});
+    CHECK(status_of(a.end()) == SM_OK);
+    CHECK(g_shader.sampler_kind[0] == (type == 3 ? SM_SAMPLER_CUBE : type == 4 ? SM_SAMPLER_VOLUME : SM_SAMPLER_2D));
   }
   {
     Asm a(false, 2, 0);
@@ -580,7 +587,8 @@ void test_refusals() {
 
 void test_fixtures(HostAllocator& allocator, std::vector<Tokens>* all) {
   static const char* const names[] = {"vs_basic.vs_1_1.bin", "vs_basic.vs_2_0.bin", "vs_basic.vs_3_0.bin", "vs_math.vs_2_0.bin", "vs_math.vs_3_0.bin",
-                                      "ps_tex.ps_2_0.bin",   "ps_tex.ps_3_0.bin",   "ps_math.ps_2_0.bin",  "ps_math.ps_3_0.bin"};
+                                      "ps_tex.ps_2_0.bin",   "ps_tex.ps_3_0.bin",   "ps_math.ps_2_0.bin",  "ps_math.ps_3_0.bin",
+                                      "ps_cube.ps_2_0.bin",  "ps_volume.ps_2_0.bin"};
   for (const char* name : names) {
     const Tokens tokens = read_tokens(name);
     CHECK(tokens.size() > 8);
@@ -598,7 +606,11 @@ void test_fixtures(HostAllocator& allocator, std::vector<Tokens>* all) {
     CHECK((translated->stage() == graphics::ShaderStage::Vertex) == (g_shader.vertex != 0));
     CHECK(translated->constant_bytes() == g_shader.constant_registers * 16);
     const bool textured = g_shader.sampler_mask != 0;
-    CHECK(textured == (strncmp(name, "ps_tex", 6) == 0) && (!textured || translated->texture_unit_mask() == 1));
+    const bool cube = strncmp(name, "ps_cube", 7) == 0, volume = strncmp(name, "ps_volume", 9) == 0;
+    CHECK(textured == (strncmp(name, "ps_tex", 6) == 0 || cube || volume) && (!textured || translated->texture_unit_mask() == 1));
+    // (dcl_cube and dcl_volume: the translation declares a cube or a volume, which the kernel's program records for the draw's check of the bound texture)
+    CHECK(!textured || g_shader.sampler_kind[0] == (cube ? SM_SAMPLER_CUBE : volume ? SM_SAMPLER_VOLUME : SM_SAMPLER_2D));
+    CHECK(!textured || translated->texture_kind(0) == (cube ? graphics::TextureKind::TextureCube : volume ? graphics::TextureKind::Texture3D : graphics::TextureKind::Texture2D));
     // The kernel's own compiler for this bytecode takes the simpler ones: the two programs then agree on every input set.
     UniquePointer<D3d9Program> native;
     const NtStatus native_status = D3d9Program::compile(allocator, ConstByteView(reinterpret_cast<const uint8_t*>(tokens.data()), tokens.size() * 4), &native);
