@@ -24,7 +24,7 @@
 static HRESULT STDMETHODCALLTYPE dev_QueryInterface(Dev *d, REFIID riid, void **out) {
   if (!out) return E_POINTER;
   *out = NULL;
-  if (guid_eq(riid, &IID_IUnknown) || guid_eq(riid, &IID_ID3D11Device)) *out = d;
+  if (guid_eq(riid, &IID_IUnknown) || guid_eq(riid, &IID_ID3D11Device) || guid_eq(riid, &IID_ID3D11Device1)) *out = d;
   else if (guid_eq(riid, &IID_IDXGIObject) || guid_eq(riid, &IID_IDXGIDevice) || guid_eq(riid, &IID_IDXGIDevice1) || guid_eq(riid, &IID_IDXGIDevice2) ||
            guid_eq(riid, &IID_IDXGIDevice3)) *out = &d->dxgi;      /* (DXGI 1.2: ANGLE needs it to present to another process's window) */
   else if (guid_eq(riid, &IID_ITcosPresenter)) *out = &d->presenter;
@@ -195,7 +195,7 @@ static void dev_destroy(DxObj *o) {
   Dev *d = (Dev *)o;
   InterlockedExchange(&d->o.ref, 16);      /* (the references given back below - the blank texture's, the bound state's - are not the last again) */
   if (d->list) flush(d);
-  if (d->ctx) { ctx_unbind_all(d->ctx); mem_free(d->ctx); }
+  if (d->ctx) { ctx_release_all(d->ctx); mem_free(d->ctx); }
   if (d->blank) dx_Release(OBJ(d->blank));
   for (UINT k = 0; k < 4; ++k) if (d->blank_kind[k]) dx_Release(OBJ(d->blank_kind[k]));
   if (d->blank_buffer) dx_Release(OBJ(d->blank_buffer));
@@ -209,7 +209,6 @@ static void dev_destroy(DxObj *o) {
   if (d->dsv_heap) ID3D12DescriptorHeap_Release(d->dsv_heap);
   for (UINT i = 0; i < d->active_count; ++i) dx_Release(OBJ(d->active[i]));
   d->active_count = 0;
-  if (d->predicate) { dx_Release(OBJ(d->predicate)); d->predicate = NULL; }
   if (d->sig_draw) ID3D12CommandSignature_Release(d->sig_draw);
   if (d->sig_draw_indexed) ID3D12CommandSignature_Release(d->sig_draw_indexed);
   if (d->sig_dispatch) ID3D12CommandSignature_Release(d->sig_dispatch);

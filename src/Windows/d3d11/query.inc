@@ -245,6 +245,7 @@ static void query_deactivate(Dev *d, Query *q) {
 static UINT64 so_filled(Ctx *c, UINT stream);
 static UINT64 so_primitive_bytes(Ctx *c, UINT stream);
 static void STDMETHODCALLTYPE ctx_Begin(Ctx *c, ID3D11Asynchronous *async) {
+  if (c->deferred) { deferred_record(c, &(RecArgs){.op = REC_BEGIN, .obj = {async}}); return; }
   Query *q = query_of(async);
   Dev *d = c->dev;
   if (!q || q->desc.Query == D3D11_QUERY_EVENT || q->desc.Query == D3D11_QUERY_TIMESTAMP) return;      /* (those only End) */
@@ -264,6 +265,7 @@ static void STDMETHODCALLTYPE ctx_Begin(Ctx *c, ID3D11Asynchronous *async) {
   LeaveCriticalSection(&d->lock);
 }
 static void STDMETHODCALLTYPE ctx_End(Ctx *c, ID3D11Asynchronous *async) {
+  if (c->deferred) { deferred_record(c, &(RecArgs){.op = REC_END, .obj = {async}}); return; }
   Query *q = query_of(async);
   Dev *d = c->dev;
   if (!q) return;
@@ -295,7 +297,7 @@ static BOOL query_predicate_value(const Query *q) {
   return FALSE;
 }
 static HRESULT STDMETHODCALLTYPE ctx_GetData(Ctx *c, ID3D11Asynchronous *async, void *data, UINT size, UINT flags) {
-  (void)c;
+  if (c->deferred) return DXGI_ERROR_INVALID_CALL;      /* (a deferred context answers no queries) */
   Query *q = query_of(async);
   if (!q || (flags & ~(UINT)D3D11_ASYNC_GETDATA_DONOTFLUSH)) return E_INVALIDARG;
   const UINT need = query_data_size(q->desc.Query);
@@ -336,17 +338,17 @@ static HRESULT STDMETHODCALLTYPE ctx_GetData(Ctx *c, ID3D11Asynchronous *async, 
  * (End sends the list); one still being built does not hold anything back. */
 
 static void STDMETHODCALLTYPE ctx_SetPredication(Ctx *c, ID3D11Predicate *predicate, BOOL value) {
-  Dev *d = c->dev;
   Query *q = query_of((ID3D11Asynchronous *)predicate);
-  EnterCriticalSection(&d->lock);
-  bind(&d->predicate, q);
-  d->predicate_value = value;
-  LeaveCriticalSection(&d->lock);
+  if (predicate && (!q || !query_is_predicate(q->desc.Query))) q = NULL;
+  bind(&c->predicate, q);
+  c->predicate_value = value;
 }
 static void STDMETHODCALLTYPE ctx_GetPredication(Ctx *c, ID3D11Predicate **predicate, BOOL *value) {
-  Dev *d = c->dev;
-  if (predicate) { *predicate = (ID3D11Predicate *)d->predicate; if (d->predicate) dx_AddRef(OBJ(d->predicate)); }
-  if (value) *value = d->predicate_value;
+  if (predicate) { *predicate = (ID3D11Predicate *)c->predicate; if (c->predicate) dx_AddRef(OBJ(c->predicate)); }
+  if (value) *value = c->predicate_value;
 }
-/* Whether the next predicated command is left out. */
-static BOOL predicated_out(const Dev *d) { return d->predicate && d->predicate->ended && query_predicate_value(d->predicate) == d->predicate_value; }
+/* Whether the next predicated command of the immediate context is left out. */
+static BOOL predicated_out(const Dev *d) {
+  const Query *p = d->ctx->predicate;
+  return p && p->ended && query_predicate_value(p) == d->ctx->predicate_value;
+}

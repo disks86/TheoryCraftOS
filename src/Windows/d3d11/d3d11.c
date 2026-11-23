@@ -45,6 +45,8 @@
 #include "../dxcommon.h"
 #include <stddef.h>
 #include <d3d11.h>
+#include <d3d11_1.h>
+#include <d3d10_1.h>
 #include <d3d12.h>
 #include <dxgi1_3.h>
 #include <dxgi1_2.h>
@@ -195,10 +197,17 @@ typedef struct Layout {
   UINT slot_converted[VERTEX_SLOTS];      /* the stride of the converted buffer of a slot, 0: used as it is */
 } Layout;
 
-typedef struct Blend { Child c; D3D11_BLEND_DESC desc; } Blend;
-typedef struct Depth { Child c; D3D11_DEPTH_STENCIL_DESC desc; } Depth;
-typedef struct Raster { Child c; D3D11_RASTERIZER_DESC desc; } Raster;
-typedef struct Sampler { Child c; D3D11_SAMPLER_DESC desc; } Sampler;
+/* The state objects. Direct3D 11 hands out the same object for the same description: a device keeps those it made in a list a kind (Dev.states, `next`), and the
+ * description each is found by (`key`, after it is put in its usual form) is what GetDesc gives back. */
+typedef struct StateObj { Child c; struct StateObj *next; UINT kind; } StateObj;
+typedef struct Blend { StateObj s; D3D11_BLEND_DESC1 desc1; D3D11_BLEND_DESC desc; } Blend;
+typedef struct Depth { StateObj s; D3D11_DEPTH_STENCIL_DESC desc; } Depth;
+typedef struct Raster { StateObj s; D3D11_RASTERIZER_DESC1 desc1; D3D11_RASTERIZER_DESC desc; } Raster;
+typedef struct Sampler { StateObj s; D3D11_SAMPLER_DESC desc; } Sampler;
+#define STATE_BLEND 0u
+#define STATE_DEPTH 1u
+#define STATE_RASTER 2u
+#define STATE_SAMPLER 3u
 /* A query or predicate (query.inc). What the kernel measures for it (the samples that passed, the pixel shader's invocations, the stream output's primitives) is
  * added up as each list runs; the pipeline statistics this library counts itself are added at each draw. */
 typedef struct Query {
@@ -226,17 +235,17 @@ typedef struct Pipeline {
 } Pipeline;
 
 /* The immediate context: what is bound. Every pointer is a reference. */
+/* A device context: what is bound. The immediate context draws; a deferred one (CreateDeferredContext) records what it is asked to do into a command list
+ * (deferred.inc). The bound objects come first, each a reference, from `vs` to `predicate`; then the plain values, from `vb_stride` to `predicate_value`: a
+ * deferred context's commands keep a copy of both (StateCopy). */
 typedef struct Ctx {
   DxObj o;
   Dev *dev;
+  /* ---- the bound objects (references) */
   Shader *vs, *ps;
   Layout *layout;
   Buf *vb[VERTEX_SLOTS];
-  UINT vb_stride[VERTEX_SLOTS], vb_offset[VERTEX_SLOTS];
   Buf *ib;
-  DXGI_FORMAT ib_format;
-  UINT ib_offset;
-  D3D11_PRIMITIVE_TOPOLOGY topology;
   Buf *vs_cb[CONSTANT_SLOTS], *ps_cb[CONSTANT_SLOTS];
   View *srv[TEXTURE_SLOTS];
   Sampler *sampler[TEXTURE_SLOTS];
@@ -253,21 +262,38 @@ typedef struct Ctx {
   Sampler *cs_sampler[TEXTURE_SLOTS];
   View *cs_uav[UAV_SLOTS];
   View *ps_uav[UAV_SLOTS];
-  Buf *so_buf[4];                     /* SOSetTargets: the stream output buffers (their records go on from Buf.so_end) */
   View *rtv[8];
-  UINT rtv_count;
   View *dsv;
   Blend *blend;
+  Depth *depth;
+  Raster *raster;
+  struct Query *predicate;            /* SetPredication: the predicate, and the value that leaves the commands out */
+  /* ---- the plain values */
+  UINT vb_stride[VERTEX_SLOTS], vb_offset[VERTEX_SLOTS];
+  DXGI_FORMAT ib_format;
+  UINT ib_offset;
+  D3D11_PRIMITIVE_TOPOLOGY topology;
+  UINT rtv_count;
   FLOAT blend_factor[4];
   UINT sample_mask;
-  Depth *depth;
   UINT stencil_ref;
-  Raster *raster;
-  D3D11_VIEWPORT viewport;
-  int viewport_set;
-  D3D11_RECT scissor;
-  int scissor_set;
+  D3D11_VIEWPORT viewports[D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE];      /* (the kernel draws with the first) */
+  UINT viewport_count;
+  D3D11_RECT scissors[D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE];
+  UINT scissor_count;
+  BOOL predicate_value;
+  UINT cb_first[6][CONSTANT_SLOTS], cb_number[6][CONSTANT_SLOTS];      /* the windows of the constant buffers (by stage: vs, ps, gs, hs, ds, cs; in constants) */
+  /* ---- not part of the copies */
+  Buf *so_buf[4];                     /* SOSetTargets: the stream output buffers (their records go on from Buf.so_end; a deferred context records the call) */
+  BOOL deferred;
+  UINT flags;                         /* CreateDeferredContext's ContextFlags */
+  struct Deferred *rec;               /* a deferred context: what it has recorded since the last FinishCommandList */
+  struct CtxState *active;            /* SwapDeviceContextState: the context state object that is active (a reference; NULL: the device's own, not made yet) */
 } Ctx;
+#define CTX_OBJECTS_FIRST offsetof(Ctx, vs)
+#define CTX_OBJECTS_END (offsetof(Ctx, predicate) + sizeof(void *))
+#define CTX_VALUES_FIRST offsetof(Ctx, vb_stride)
+#define CTX_VALUES_END (offsetof(Ctx, cb_number) + sizeof(((Ctx *)0)->cb_number))
 
 /* (the stages in Ctx.stage_cb: geometry, hull, domain; in Ctx.stage_srv and stage_sampler the vertex shader's first) */
 #define STAGE_GS 0u
@@ -332,11 +358,10 @@ struct Dev {
   UINT measure_count;
   Buf *so_written[16];                     /* the stream output buffers the list has bound (references): where their records end is read when it has run */
   UINT so_written_count;
-  struct Query *predicate;                 /* SetPredication: the predicate (a reference) and the value that skips the commands */
-  BOOL predicate_value;
   PendingClear clears[8];                  /* depth clears a draw has not followed yet (Direct3D 12 here does them when the next pass begins) */
   UINT clear_count;
   Ctx *ctx;
+  StateObj *states[4];                     /* the state objects made, by kind (STATE_*): what CreateBlendState ... give again for the same description */
 };
 #define DIRTY_TARGETS 1u
 #define DIRTY_VIEWPORT 2u
@@ -387,8 +412,8 @@ static void bind(void *slot_address, void *object) {
   if (old) dx_Release(old);
 }
 
-extern const ID3D11DeviceVtbl dev_vtbl;
-extern const ID3D11DeviceContextVtbl ctx_vtbl;
+extern const ID3D11Device1Vtbl dev_vtbl;
+extern const ID3D11DeviceContext1Vtbl ctx_vtbl;
 extern const ID3D11BufferVtbl buf_vtbl;
 extern const ID3D11Texture2DVtbl tex_vtbl;
 extern const ID3D11RenderTargetViewVtbl rtv_vtbl;
@@ -400,9 +425,9 @@ extern const ID3D11GeometryShaderVtbl gs_vtbl;
 extern const ID3D11HullShaderVtbl hs_vtbl;
 extern const ID3D11DomainShaderVtbl ds_vtbl;
 extern const ID3D11InputLayoutVtbl layout_vtbl;
-extern const ID3D11BlendStateVtbl blend_vtbl;
+extern const ID3D11BlendState1Vtbl blend_vtbl;
 extern const ID3D11DepthStencilStateVtbl depth_vtbl;
-extern const ID3D11RasterizerStateVtbl raster_vtbl;
+extern const ID3D11RasterizerState1Vtbl raster_vtbl;
 extern const ID3D11SamplerStateVtbl sampler_vtbl;
 extern const ID3D11QueryVtbl query_vtbl;
 
@@ -420,9 +445,7 @@ static const GUID *const g_gs_iids[] = {&IID_ID3D11DeviceChild, &IID_ID3D11Geome
 static const GUID *const g_hs_iids[] = {&IID_ID3D11DeviceChild, &IID_ID3D11HullShader, NULL};
 static const GUID *const g_ds_iids[] = {&IID_ID3D11DeviceChild, &IID_ID3D11DomainShader, NULL};
 static const GUID *const g_layout_iids[] = {&IID_ID3D11DeviceChild, &IID_ID3D11InputLayout, NULL};
-static const GUID *const g_blend_iids[] = {&IID_ID3D11DeviceChild, &IID_ID3D11BlendState, NULL};
 static const GUID *const g_depth_iids[] = {&IID_ID3D11DeviceChild, &IID_ID3D11DepthStencilState, NULL};
-static const GUID *const g_raster_iids[] = {&IID_ID3D11DeviceChild, &IID_ID3D11RasterizerState, NULL};
 static const GUID *const g_sampler_iids[] = {&IID_ID3D11DeviceChild, &IID_ID3D11SamplerState, NULL};
 static const GUID *const g_query_iids[] = {&IID_ID3D11DeviceChild, &IID_ID3D11Asynchronous, &IID_ID3D11Query, NULL};
 
@@ -670,7 +693,6 @@ static BOOL buffer_desc_valid(const D3D11_BUFFER_DESC *desc, const D3D11_SUBRESO
 static HRESULT STDMETHODCALLTYPE dev_CreateBuffer(Dev *d, const D3D11_BUFFER_DESC *desc, const D3D11_SUBRESOURCE_DATA *initial, ID3D11Buffer **out) {
   if (out) *out = NULL;
   if (!desc || !buffer_desc_valid(desc, initial)) return E_INVALIDARG;
-  if ((desc->BindFlags & D3D11_BIND_CONSTANT_BUFFER) && desc->ByteWidth > CONSTANT_BLOCK) return E_INVALIDARG;      /* (the kernel's constants of a draw: see CONSTANT_BLOCK) */
   if (!out) return S_FALSE;
   Buf *b = child_new(sizeof *b, d, &buf_vtbl, g_buf_iids, buf_destroy);
   if (!b) return E_OUTOFMEMORY;
@@ -1421,45 +1443,251 @@ static HRESULT STDMETHODCALLTYPE dev_CreateInputLayout(Dev *d, const D3D11_INPUT
 }
 
 static void STDMETHODCALLTYPE blend_GetDesc(Blend *s, D3D11_BLEND_DESC *desc) { if (desc) *desc = s->desc; }
+static void STDMETHODCALLTYPE blend_GetDesc1(Blend *s, D3D11_BLEND_DESC1 *desc) { if (desc) *desc = s->desc1; }
 static void STDMETHODCALLTYPE depth_GetDesc(Depth *s, D3D11_DEPTH_STENCIL_DESC *desc) { if (desc) *desc = s->desc; }
 static void STDMETHODCALLTYPE raster_GetDesc(Raster *s, D3D11_RASTERIZER_DESC *desc) { if (desc) *desc = s->desc; }
+static void STDMETHODCALLTYPE raster_GetDesc1(Raster *s, D3D11_RASTERIZER_DESC1 *desc) { if (desc) *desc = s->desc1; }
 static void STDMETHODCALLTYPE sampler_GetDesc(Sampler *s, D3D11_SAMPLER_DESC *desc) { if (desc) *desc = s->desc; }
 
+/* A state object leaves its device's list as it goes. */
+static void state_obj_destroy(DxObj *o) {
+  StateObj *s = (StateObj *)o;
+  Dev *d = s->c.dev;
+  EnterCriticalSection(&d->lock);
+  for (StateObj **at = &d->states[s->kind]; *at; at = &(*at)->next)
+    if (*at == s) { *at = s->next; break; }
+  LeaveCriticalSection(&d->lock);
+  child_destroy(o);
+}
+/* The object of `kind` whose description (`bytes` at `offset` of it) is `key`, with a new reference; NULL when there is none (or it is just going away). */
+static StateObj *state_obj_find(Dev *d, UINT kind, SIZE_T offset, const void *key, SIZE_T bytes) {
+  for (StateObj *s = d->states[kind]; s; s = s->next) {
+    if (memcmp((const BYTE *)s + offset, key, bytes) != 0) continue;
+    LONG n = s->c.o.ref;
+    while (n > 0) {      /* (a reference only while it still has one: its last may be going on another thread) */
+      const LONG seen = InterlockedCompareExchange(&s->c.o.ref, n + 1, n);
+      if (seen == n) return s;
+      n = seen;
+    }
+  }
+  return NULL;
+}
+static void *state_obj_new(Dev *d, SIZE_T size, UINT kind, const void *vtbl, const GUID *const *iids) {
+  StateObj *s = child_new(size, d, vtbl, iids, state_obj_destroy);
+  if (!s) return NULL;
+  s->kind = kind;
+  s->next = d->states[kind];
+  d->states[kind] = s;
+  return s;
+}
+
+static BOOL blend_valid(D3D11_BLEND b, BOOL alpha) {
+  if (b < D3D11_BLEND_ZERO || b > D3D11_BLEND_INV_SRC1_ALPHA || b == 12 || b == 13) return FALSE;
+  return !alpha || (b != D3D11_BLEND_SRC_COLOR && b != D3D11_BLEND_INV_SRC_COLOR && b != D3D11_BLEND_DEST_COLOR && b != D3D11_BLEND_INV_DEST_COLOR &&
+                    b != D3D11_BLEND_SRC1_COLOR && b != D3D11_BLEND_INV_SRC1_COLOR);
+}
+/* CreateBlendState1: every target as the description says (all as the first without IndependentBlendEnable); a target that does not blend has the default
+ * factors. Logic operations need D3D11_FEATURE_DATA_D3D11_OPTIONS.OutputMergerLogicOp, which this device does not have. */
+static HRESULT STDMETHODCALLTYPE dev_CreateBlendState1(Dev *d, const D3D11_BLEND_DESC1 *desc, ID3D11BlendState1 **out) {
+  extern const ID3D11BlendState1Vtbl blend_vtbl;
+  static const GUID *const iids[] = {&IID_ID3D11DeviceChild, &IID_ID3D11BlendState, &IID_ID3D11BlendState1, NULL};
+  if (out) *out = NULL;
+  if (!desc) return E_INVALIDARG;
+  D3D11_BLEND_DESC1 key;
+  memset(&key, 0, sizeof key);
+  key.AlphaToCoverageEnable = !!desc->AlphaToCoverageEnable;
+  key.IndependentBlendEnable = !!desc->IndependentBlendEnable;
+  for (UINT i = 0; i < 8; ++i) {
+    const D3D11_RENDER_TARGET_BLEND_DESC1 *in = &desc->RenderTarget[desc->IndependentBlendEnable ? i : 0];
+    D3D11_RENDER_TARGET_BLEND_DESC1 *t = &key.RenderTarget[i];
+    if (in->BlendEnable && in->LogicOpEnable) return E_INVALIDARG;
+    if (in->LogicOpEnable) return E_INVALIDARG;      /* (no logic operations: OutputMergerLogicOp is FALSE) */
+    if (in->BlendEnable) {
+      if (!blend_valid(in->SrcBlend, FALSE) || !blend_valid(in->DestBlend, FALSE) || !blend_valid(in->SrcBlendAlpha, TRUE) || !blend_valid(in->DestBlendAlpha, TRUE) ||
+          in->BlendOp < D3D11_BLEND_OP_ADD || in->BlendOp > D3D11_BLEND_OP_MAX || in->BlendOpAlpha < D3D11_BLEND_OP_ADD || in->BlendOpAlpha > D3D11_BLEND_OP_MAX)
+        return E_INVALIDARG;
+      *t = *in;
+      t->BlendEnable = TRUE;
+    } else {
+      t->SrcBlend = t->SrcBlendAlpha = D3D11_BLEND_ONE;
+      t->DestBlend = t->DestBlendAlpha = D3D11_BLEND_ZERO;
+      t->BlendOp = t->BlendOpAlpha = D3D11_BLEND_OP_ADD;
+    }
+    t->LogicOpEnable = FALSE;
+    t->LogicOp = D3D11_LOGIC_OP_NOOP;
+    if (in->RenderTargetWriteMask > D3D11_COLOR_WRITE_ENABLE_ALL) return E_INVALIDARG;
+    t->RenderTargetWriteMask = in->RenderTargetWriteMask;
+  }
+  if (!out) return S_FALSE;
+  EnterCriticalSection(&d->lock);
+  Blend *s = (Blend *)state_obj_find(d, STATE_BLEND, offsetof(Blend, desc1), &key, sizeof key);
+  if (!s && (s = state_obj_new(d, sizeof *s, STATE_BLEND, &blend_vtbl, iids)) != NULL) {
+    s->desc1 = key;
+    s->desc.AlphaToCoverageEnable = key.AlphaToCoverageEnable;
+    s->desc.IndependentBlendEnable = key.IndependentBlendEnable;
+    for (UINT i = 0; i < 8; ++i) {
+      const D3D11_RENDER_TARGET_BLEND_DESC1 *t = &key.RenderTarget[i];
+      const D3D11_RENDER_TARGET_BLEND_DESC plain = {t->BlendEnable, t->SrcBlend, t->DestBlend, t->BlendOp, t->SrcBlendAlpha, t->DestBlendAlpha, t->BlendOpAlpha, t->RenderTargetWriteMask};
+      s->desc.RenderTarget[i] = plain;
+    }
+  }
+  LeaveCriticalSection(&d->lock);
+  if (!s) return E_OUTOFMEMORY;
+  *out = (ID3D11BlendState1 *)s;
+  return S_OK;
+}
 static HRESULT STDMETHODCALLTYPE dev_CreateBlendState(Dev *d, const D3D11_BLEND_DESC *desc, ID3D11BlendState **out) {
   if (out) *out = NULL;
   if (!desc) return E_INVALIDARG;
-  Blend *s = child_new(sizeof *s, d, &blend_vtbl, g_blend_iids, child_destroy);
-  if (!s) return E_OUTOFMEMORY;
-  s->desc = *desc;
-  return give(s, (void **)out);
+  D3D11_BLEND_DESC1 d1;
+  memset(&d1, 0, sizeof d1);
+  d1.AlphaToCoverageEnable = desc->AlphaToCoverageEnable;
+  d1.IndependentBlendEnable = desc->IndependentBlendEnable;
+  for (UINT i = 0; i < 8; ++i) {
+    const D3D11_RENDER_TARGET_BLEND_DESC *t = &desc->RenderTarget[i];
+    const D3D11_RENDER_TARGET_BLEND_DESC1 wide = {t->BlendEnable, FALSE, t->SrcBlend, t->DestBlend, t->BlendOp, t->SrcBlendAlpha, t->DestBlendAlpha, t->BlendOpAlpha, D3D11_LOGIC_OP_NOOP,
+                                                  t->RenderTargetWriteMask};
+    d1.RenderTarget[i] = wide;
+  }
+  return dev_CreateBlendState1(d, &d1, (ID3D11BlendState1 **)out);
 }
+static BOOL comparison_valid(D3D11_COMPARISON_FUNC f) { return f >= D3D11_COMPARISON_NEVER && f <= D3D11_COMPARISON_ALWAYS; }
+static BOOL stencil_op_valid(D3D11_STENCIL_OP o) { return o >= D3D11_STENCIL_OP_KEEP && o <= D3D11_STENCIL_OP_DECR; }
 static HRESULT STDMETHODCALLTYPE dev_CreateDepthStencilState(Dev *d, const D3D11_DEPTH_STENCIL_DESC *desc, ID3D11DepthStencilState **out) {
   if (out) *out = NULL;
   if (!desc) return E_INVALIDARG;
-  Depth *s = child_new(sizeof *s, d, &depth_vtbl, g_depth_iids, child_destroy);
+  D3D11_DEPTH_STENCIL_DESC key = *desc;
+  key.DepthEnable = !!key.DepthEnable;
+  key.StencilEnable = !!key.StencilEnable;
+  /* (only what applies is checked: the depth fields with the depth test, the stencil fields with the stencil test) */
+  if (key.DepthEnable && (key.DepthWriteMask > D3D11_DEPTH_WRITE_MASK_ALL || !comparison_valid(key.DepthFunc))) return E_INVALIDARG;
+  const D3D11_DEPTH_STENCILOP_DESC *faces[2] = {&key.FrontFace, &key.BackFace};
+  for (UINT i = 0; key.StencilEnable && i < 2; ++i)
+    if (!stencil_op_valid(faces[i]->StencilFailOp) || !stencil_op_valid(faces[i]->StencilDepthFailOp) || !stencil_op_valid(faces[i]->StencilPassOp) || !comparison_valid(faces[i]->StencilFunc))
+      return E_INVALIDARG;
+  /* (what does not apply is in its usual form: without the depth test, writing all and LESS; without stencil, the masks 0xFF and every operation KEEP, ALWAYS) */
+  if (!key.DepthEnable) { key.DepthWriteMask = D3D11_DEPTH_WRITE_MASK_ALL; key.DepthFunc = D3D11_COMPARISON_LESS; }
+  if (!key.StencilEnable) {
+    static const D3D11_DEPTH_STENCILOP_DESC keep = {D3D11_STENCIL_OP_KEEP, D3D11_STENCIL_OP_KEEP, D3D11_STENCIL_OP_KEEP, D3D11_COMPARISON_ALWAYS};
+    key.StencilReadMask = key.StencilWriteMask = 0xFF;
+    key.FrontFace = key.BackFace = keep;
+  }
+  if (!out) return S_FALSE;
+  extern const ID3D11DepthStencilStateVtbl depth_vtbl;
+  EnterCriticalSection(&d->lock);
+  Depth *s = (Depth *)state_obj_find(d, STATE_DEPTH, offsetof(Depth, desc), &key, sizeof key);
+  if (!s && (s = state_obj_new(d, sizeof *s, STATE_DEPTH, &depth_vtbl, g_depth_iids)) != NULL) s->desc = key;
+  LeaveCriticalSection(&d->lock);
   if (!s) return E_OUTOFMEMORY;
-  s->desc = *desc;
-  return give(s, (void **)out);
+  *out = (ID3D11DepthStencilState *)s;
+  return S_OK;
+}
+/* CreateRasterizerState1: ForcedSampleCount is a feature of level 11_1; at 11_0 it must be 0. */
+static HRESULT STDMETHODCALLTYPE dev_CreateRasterizerState1(Dev *d, const D3D11_RASTERIZER_DESC1 *desc, ID3D11RasterizerState1 **out) {
+  extern const ID3D11RasterizerState1Vtbl raster_vtbl;
+  static const GUID *const iids[] = {&IID_ID3D11DeviceChild, &IID_ID3D11RasterizerState, &IID_ID3D11RasterizerState1, NULL};
+  if (out) *out = NULL;
+  if (!desc) return E_INVALIDARG;
+  if (desc->FillMode < D3D11_FILL_WIREFRAME || desc->FillMode > D3D11_FILL_SOLID || desc->CullMode < D3D11_CULL_NONE || desc->CullMode > D3D11_CULL_BACK || desc->ForcedSampleCount)
+    return E_INVALIDARG;
+  D3D11_RASTERIZER_DESC1 key = *desc;
+  key.FrontCounterClockwise = !!key.FrontCounterClockwise;
+  key.DepthClipEnable = !!key.DepthClipEnable;
+  key.ScissorEnable = !!key.ScissorEnable;
+  key.MultisampleEnable = !!key.MultisampleEnable;
+  key.AntialiasedLineEnable = !!key.AntialiasedLineEnable;
+  if (!out) return S_FALSE;
+  EnterCriticalSection(&d->lock);
+  Raster *s = (Raster *)state_obj_find(d, STATE_RASTER, offsetof(Raster, desc1), &key, sizeof key);
+  if (!s && (s = state_obj_new(d, sizeof *s, STATE_RASTER, &raster_vtbl, iids)) != NULL) {
+    s->desc1 = key;
+    const D3D11_RASTERIZER_DESC plain = {key.FillMode, key.CullMode, key.FrontCounterClockwise, key.DepthBias, key.DepthBiasClamp, key.SlopeScaledDepthBias, key.DepthClipEnable,
+                                         key.ScissorEnable, key.MultisampleEnable, key.AntialiasedLineEnable};
+    s->desc = plain;
+  }
+  LeaveCriticalSection(&d->lock);
+  if (!s) return E_OUTOFMEMORY;
+  *out = (ID3D11RasterizerState1 *)s;
+  return S_OK;
 }
 static HRESULT STDMETHODCALLTYPE dev_CreateRasterizerState(Dev *d, const D3D11_RASTERIZER_DESC *desc, ID3D11RasterizerState **out) {
   if (out) *out = NULL;
   if (!desc) return E_INVALIDARG;
-  Raster *s = child_new(sizeof *s, d, &raster_vtbl, g_raster_iids, child_destroy);
-  if (!s) return E_OUTOFMEMORY;
-  s->desc = *desc;
-  return give(s, (void **)out);
+  const D3D11_RASTERIZER_DESC1 d1 = {desc->FillMode, desc->CullMode, desc->FrontCounterClockwise, desc->DepthBias, desc->DepthBiasClamp, desc->SlopeScaledDepthBias,
+                                     desc->DepthClipEnable, desc->ScissorEnable, desc->MultisampleEnable, desc->AntialiasedLineEnable, 0};
+  return dev_CreateRasterizerState1(d, &d1, (ID3D11RasterizerState1 **)out);
+}
+static BOOL address_valid(D3D11_TEXTURE_ADDRESS_MODE m) { return m >= D3D11_TEXTURE_ADDRESS_WRAP && m <= D3D11_TEXTURE_ADDRESS_MIRROR_ONCE; }
+static BOOL filter_valid(D3D11_FILTER f) {
+  const UINT plain = (UINT)f & 0x7Fu, reduction = ((UINT)f >> 7) & 3u;
+  if ((UINT)f & ~(0x7Fu | (3u << 7))) return FALSE;
+  return plain == 0x55 || (plain & ~0x15u) == 0;      /* (anisotropic, or the three point/linear choices) */
+  (void)reduction;
 }
 static HRESULT STDMETHODCALLTYPE dev_CreateSamplerState(Dev *d, const D3D11_SAMPLER_DESC *desc, ID3D11SamplerState **out) {
   if (out) *out = NULL;
   if (!desc) return E_INVALIDARG;
-  Sampler *s = child_new(sizeof *s, d, &sampler_vtbl, g_sampler_iids, child_destroy);
+  if (!filter_valid(desc->Filter) || !address_valid(desc->AddressU) || !address_valid(desc->AddressV) || !address_valid(desc->AddressW) ||
+      desc->MaxAnisotropy > D3D11_MAX_MAXANISOTROPY || desc->MinLOD > desc->MaxLOD || desc->MinLOD != desc->MinLOD || desc->MaxLOD != desc->MaxLOD)
+    return E_INVALIDARG;
+  if (((UINT)desc->Filter >> 7 & 3u) == 1 && !comparison_valid(desc->ComparisonFunc)) return E_INVALIDARG;      /* (a comparison filter needs a comparison) */
+  D3D11_SAMPLER_DESC key = *desc;
+  if (((UINT)desc->Filter & 0x7Fu) != 0x55) key.MaxAnisotropy = 0;
+  if (((UINT)desc->Filter >> 7 & 3u) != 1) key.ComparisonFunc = D3D11_COMPARISON_NEVER;
+  if (!out) return S_FALSE;
+  extern const ID3D11SamplerStateVtbl sampler_vtbl;
+  EnterCriticalSection(&d->lock);
+  Sampler *s = (Sampler *)state_obj_find(d, STATE_SAMPLER, offsetof(Sampler, desc), &key, sizeof key);
+  if (!s && (s = state_obj_new(d, sizeof *s, STATE_SAMPLER, &sampler_vtbl, g_sampler_iids)) != NULL) s->desc = key;
+  LeaveCriticalSection(&d->lock);
   if (!s) return E_OUTOFMEMORY;
-  s->desc = *desc;
-  return give(s, (void **)out);
+  *out = (ID3D11SamplerState *)s;
+  return S_OK;
 }
+
+/* (deferred.inc: what a deferred context records) */
+enum {
+  REC_DRAW, REC_DRAW_INDEXED, REC_DRAW_INSTANCED, REC_DRAW_INDEXED_INSTANCED, REC_DRAW_AUTO, REC_DRAW_INDIRECT, REC_DRAW_INDEXED_INDIRECT, REC_DISPATCH,
+  REC_DISPATCH_INDIRECT, REC_CLEAR_RTV, REC_CLEAR_DSV, REC_CLEAR_UAV_UINT, REC_CLEAR_UAV_FLOAT, REC_COPY_REGION, REC_COPY_RESOURCE, REC_UPDATE,
+  REC_COPY_STRUCTURE_COUNT, REC_RESOLVE, REC_GENERATE_MIPS, REC_BEGIN, REC_END, REC_SO_TARGETS, REC_UAV_COUNTS, REC_MIN_LOD, REC_MAPPED, REC_CLEAR_VIEW,
+  REC_DISCARD
+};
+typedef struct Command {
+  UINT op;
+  struct StateCopy *state;       /* the bindings it was recorded under (NULL: it does not need them) */
+  DxObj *obj[8];                 /* references */
+  UINT u[10];
+  FLOAT f[4];
+  D3D11_BOX box;
+  BOOL has_box;
+  BYTE *data;                    /* bytes it carries (an update, the writes of a Map) */
+  SIZE_T bytes;
+  D3D11_RECT *rects;             /* ClearView's rectangles */
+  UINT rect_count;
+} Command;
+/* What a call of a context's method records (deferred_record). */
+typedef struct RecArgs {
+  UINT op;
+  void *obj[8];
+  UINT u[10];
+  FLOAT f[4];
+  const D3D11_BOX *box;
+  const void *data;
+  SIZE_T bytes;
+  const D3D11_RECT *rects;
+  UINT rect_count;
+} RecArgs;
+struct StateCopy;
+static void deferred_record(Ctx *c, const RecArgs *a);
+static void deferred_update(Ctx *c, ID3D11Resource *resource, UINT sub, const D3D11_BOX *box, const void *data, UINT row_pitch, UINT depth_pitch);
+static HRESULT deferred_map(Ctx *c, ID3D11Resource *resource, UINT sub, D3D11_MAP type, D3D11_MAPPED_SUBRESOURCE *out);
+static void deferred_unmap(Ctx *c, ID3D11Resource *resource, UINT sub);
+static void STDMETHODCALLTYPE ctx_ClearView(Ctx *c, ID3D11View *view, const FLOAT colour[4], const D3D11_RECT *rects, UINT count);
 
 #include "query.inc"
 #include "context.inc"
+#include "deferred.inc"
+#include "context1.inc"
 #include "device.inc"
 #include "dxgi_resource.inc"
 #include "vtbl.inc"

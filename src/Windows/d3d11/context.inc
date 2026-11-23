@@ -265,17 +265,25 @@ static Tex *slot_blank(const Dev *d, const Ctx *c, UINT i) {
 
 /* The block of constants of a draw or a dispatch: the buffers bound to each stage's slots, stage after stage, each as large as the shader declares it, into the ring
  * (Dev.ring_last is where; a block the same as the last one is used again). */
-static void constants_record(Dev *d, const Shader *const *stages, Buf *const *const *bound, UINT count) {
+static Buf **cb_slots(Ctx *c, UINT stage);
+static void constants_record(Dev *d, Ctx *c, const Shader *const *stages, const UINT *stage_of, UINT count) {
   BYTE block[CONSTANT_BLOCK];
   UINT bytes = 0;
   for (UINT stage = 0; stage < count; ++stage) {
     const Shader *s = stages[stage];
+    const UINT k = stage_of[stage];
+    Buf *const *bound = cb_slots(c, k);
     for (UINT slot = 0; s && slot < CONSTANT_SLOTS; ++slot) {
       const UINT size = s->cb_registers[slot] * 16;
       if (!size || bytes + size > CONSTANT_BLOCK) continue;
-      const Buf *b = bound[stage][slot];
-      const UINT have = b ? (b->desc.ByteWidth < size ? b->desc.ByteWidth : size) : 0;
-      if (have) memcpy(block + bytes, b->data, have);
+      const Buf *b = bound[slot];
+      /* (the window the stage reads: from its first constant, as many as were given and the buffer has) */
+      const UINT64 from = b ? (UINT64)c->cb_first[k][slot] * 16 : 0;
+      UINT64 window = b ? (UINT64)c->cb_number[k][slot] * 16 : 0;
+      if (b && from >= b->desc.ByteWidth) window = 0;
+      else if (b && window > b->desc.ByteWidth - from) window = b->desc.ByteWidth - from;
+      const UINT have = (UINT)(window < size ? window : size);
+      if (have) memcpy(block + bytes, b->data + from, have);
       memset(block + bytes + have, 0, size - have);
       bytes += size;
     }
@@ -329,7 +337,7 @@ static BOOL tables_record(Dev *d, View *const *srvs, Sampler *const *samplers, c
   FLOAT min_lods[TEXTURE_SLOTS];
   for (UINT i = 0; i < TEXTURE_SLOTS; ++i) {
     view_ids[i] = srvs[i] ? srvs[i]->c.id : kinds[i] == KIND_BUFFER ? d->blank_buffer->c.id : (kinds[i] >= 1 && kinds[i] <= 3 && d->blank_kind[kinds[i]] ? d->blank_kind[kinds[i]] : d->blank)->c.id;
-    sampler_ids[i] = samplers[i] ? samplers[i]->c.id : 0;
+    sampler_ids[i] = samplers[i] ? samplers[i]->s.c.id : 0;
     min_lods[i] = srvs[i] && srvs[i]->tex ? srvs[i]->tex->min_lod : 0.0f;      /* (the clamp goes into the sampler) */
   }
   for (UINT i = 0; i < UAV_SLOTS; ++i) uav_ids[i] = !(uav_mask >> i & 1) ? 0 : uavs[i] ? uavs[i]->c.id : d->blank_uav->c.id;
@@ -484,6 +492,24 @@ static UINT64 so_primitive_bytes(Ctx *c, UINT stream) {
 static void so_settle(Dev *d, const Buf *b) { if (b->so_fill && b->written == d->epoch) flush(d); }
 
 static void STDMETHODCALLTYPE ctx_SOSetTargets(Ctx *c, UINT count, ID3D11Buffer *const *buffers, const UINT *offsets) {
+  if (c->deferred) {
+    if (count > 4) return;
+    RecArgs a = {.op = REC_SO_TARGETS, .u = {count}};
+    for (UINT slot = 0; slot < 4; ++slot) {
+      Buf *b = slot < count && buffers ? (Buf *)buffers[slot] : NULL;
+      if (b && !(b->desc.BindFlags & D3D11_BIND_STREAM_OUTPUT)) b = NULL;
+      if (b) {
+        for (UINT i = 0; i < VERTEX_SLOTS; ++i) if (c->vb[i] == b) bind(&c->vb[i], NULL);
+        if (c->ib == b) bind(&c->ib, NULL);
+        unbind_reads_of(c, b, FALSE);
+      }
+      bind(&c->so_buf[slot], b);
+      a.obj[slot] = b;
+      a.u[1 + slot] = offsets && slot < count ? offsets[slot] : 0;
+    }
+    deferred_record(c, &a);
+    return;
+  }
   Dev *d = c->dev;
   if (count > 4) return;
   LOCK(c);
@@ -546,8 +572,11 @@ static BOOL draw_prepare(Ctx *c, BOOL indexed) {
     const Tex *target = c->rtv_count ? c->rtv[0]->tex : c->dsv ? c->dsv->tex : &none;
     D3D12_VIEWPORT vp = {0, 0, (FLOAT)target->desc.Width, (FLOAT)target->desc.Height, 0, 1};
     D3D12_RECT sc = {0, 0, (LONG)target->desc.Width, (LONG)target->desc.Height};
-    if (c->viewport_set) memcpy(&vp, &c->viewport, sizeof vp);      /* (the two structures are the same) */
-    if (c->raster && c->raster->desc.ScissorEnable && c->scissor_set) memcpy(&sc, &c->scissor, sizeof sc);
+    if (c->viewport_count) memcpy(&vp, &c->viewports[0], sizeof vp);      /* (the two structures are the same; the kernel has one viewport) */
+    if (c->raster && c->raster->desc.ScissorEnable) {
+      if (c->scissor_count) memcpy(&sc, &c->scissors[0], sizeof sc);
+      else sc.right = sc.bottom = 0;      /* (the scissor test with no rectangle set: nothing passes) */
+    }
     ID3D12GraphicsCommandList_RSSetViewports(list, 1, &vp);
     ID3D12GraphicsCommandList_RSSetScissorRects(list, 1, &sc);
   }
@@ -572,8 +601,8 @@ static BOOL draw_prepare(Ctx *c, BOOL indexed) {
 
   /* the constants: the vertex shader's buffers in slot order, then the pixel shader's, the geometry shader's, the hull shader's and the domain shader's */
   const Shader *const stages[5] = {c->vs, c->ps, c->gs && !c->gs->so_only ? c->gs : NULL, c->hs, c->ds};
-  Buf *const *const bound[5] = {c->vs_cb, c->ps_cb, c->stage_cb[STAGE_GS], c->stage_cb[STAGE_HS], c->stage_cb[STAGE_DS]};
-  constants_record(d, stages, bound, 5);
+  static const UINT stage_of[5] = {0, 1, 2, 3, 4};
+  constants_record(d, c, stages, stage_of, 5);
   ID3D12GraphicsCommandList_SetGraphicsRootConstantBufferView(list, 0, ID3D12Resource_GetGPUVirtualAddress(d->ring) + d->ring_last);
 
   /* the textures (and buffer views) and the samplers of the stages, and the pixel shader's unordered access views: a table of each, made again when what is bound
@@ -612,11 +641,13 @@ static BOOL draw_prepare(Ctx *c, BOOL indexed) {
 
 /* The device holds the context (one reference); the first reference a program takes holds the device, the last one it gives back lets it go. */
 static ULONG STDMETHODCALLTYPE ctx_AddRef(Ctx *c) {
+  if (c->deferred) return dx_AddRef(OBJ(c));      /* (a deferred context is an object of its own, which holds the device) */
   const LONG n = InterlockedIncrement(&c->o.ref);
   if (n == 2) dx_AddRef(OBJ(c->dev));
   return (ULONG)(n - 1);
 }
 static ULONG STDMETHODCALLTYPE ctx_Release(Ctx *c) {
+  if (c->deferred) return dx_Release(OBJ(c));
   const LONG n = InterlockedDecrement(&c->o.ref);
   if (n == 1) dx_Release(OBJ(c->dev));      /* (may be the device's last reference: the context goes with it) */
   return (ULONG)(n - 1);
@@ -624,7 +655,7 @@ static ULONG STDMETHODCALLTYPE ctx_Release(Ctx *c) {
 static HRESULT STDMETHODCALLTYPE ctx_QueryInterface(Ctx *c, REFIID riid, void **out) {
   if (!out) return E_POINTER;
   *out = NULL;
-  if (!guid_eq(riid, &IID_IUnknown) && !guid_eq(riid, &IID_ID3D11DeviceChild) && !guid_eq(riid, &IID_ID3D11DeviceContext)) {
+  if (!guid_eq(riid, &IID_IUnknown) && !guid_eq(riid, &IID_ID3D11DeviceChild) && !guid_eq(riid, &IID_ID3D11DeviceContext) && !guid_eq(riid, &IID_ID3D11DeviceContext1)) {
     dx_no_interface("ID3D11DeviceContext", riid);
     return E_NOINTERFACE;
   }
@@ -637,8 +668,8 @@ static void STDMETHODCALLTYPE ctx_GetDevice(Ctx *c, ID3D11Device **out) {
   dx_AddRef(OBJ(c->dev));
   *out = (ID3D11Device *)c->dev;
 }
-static D3D11_DEVICE_CONTEXT_TYPE STDMETHODCALLTYPE ctx_GetType(Ctx *c) { (void)c; return D3D11_DEVICE_CONTEXT_IMMEDIATE; }
-static UINT STDMETHODCALLTYPE ctx_GetContextFlags(Ctx *c) { (void)c; return 0; }
+static D3D11_DEVICE_CONTEXT_TYPE STDMETHODCALLTYPE ctx_GetType(Ctx *c) { return c->deferred ? D3D11_DEVICE_CONTEXT_DEFERRED : D3D11_DEVICE_CONTEXT_IMMEDIATE; }
+static UINT STDMETHODCALLTYPE ctx_GetContextFlags(Ctx *c) { return c->flags; }
 
 static void STDMETHODCALLTYPE ctx_VSSetShader(Ctx *c, ID3D11VertexShader *shader, ID3D11ClassInstance *const *instances, UINT count) {
   (void)instances; (void)count;
@@ -669,13 +700,43 @@ static void get_range(void **slots, UINT capacity, UINT start, UINT count, void 
     if (objects[i]) dx_AddRef(OBJ(objects[i]));
   }
 }
-static void STDMETHODCALLTYPE ctx_VSSetConstantBuffers(Ctx *c, UINT start, UINT count, ID3D11Buffer *const *buffers) { set_range((void **)c->vs_cb, CONSTANT_SLOTS, start, count, (void *const *)buffers); }
-static void STDMETHODCALLTYPE ctx_PSSetConstantBuffers(Ctx *c, UINT start, UINT count, ID3D11Buffer *const *buffers) { set_range((void **)c->ps_cb, CONSTANT_SLOTS, start, count, (void *const *)buffers); }
+/* The constant buffers of a stage (0 vertex, 1 pixel, 2 geometry, 3 hull, 4 domain, 5 compute shader), and the window of each a stage reads
+ * (*SetConstantBuffers1: from constant `first`, `number` constants, each of 16 bytes; without it all of the buffer). */
+static Buf **cb_slots(Ctx *c, UINT stage) {
+  return stage == 0 ? c->vs_cb : stage == 1 ? c->ps_cb : stage == 5 ? c->cs_cb : c->stage_cb[stage - 2];
+}
+static void cb_set(Ctx *c, UINT stage, UINT start, UINT count, ID3D11Buffer *const *buffers, const UINT *first, const UINT *number) {
+  if (start >= CONSTANT_SLOTS || count > CONSTANT_SLOTS - start) return;
+  if ((first != NULL) != (number != NULL)) return;
+  for (UINT i = 0; first && i < count; ++i)
+    if (buffers && buffers[i] && (first[i] % 16 || number[i] % 16 || number[i] == 0 || number[i] > 4096)) return;      /* (windows of whole 256 bytes, at most 4096 constants) */
+  Buf **slots = cb_slots(c, stage);
+  for (UINT i = 0; i < count; ++i) {
+    bind(&slots[start + i], buffers ? buffers[i] : NULL);
+    c->cb_first[stage][start + i] = first ? first[i] : 0;
+    c->cb_number[stage][start + i] = first ? number[i] : 4096;
+  }
+}
+static void cb_get(Ctx *c, UINT stage, UINT start, UINT count, ID3D11Buffer **buffers, UINT *first, UINT *number) {
+  Buf **slots = cb_slots(c, stage);
+  for (UINT i = 0; i < count; ++i) {
+    const BOOL in = start + i < CONSTANT_SLOTS;
+    if (buffers) { buffers[i] = in ? (ID3D11Buffer *)slots[start + i] : NULL; if (buffers[i]) dx_AddRef(OBJ(buffers[i])); }
+    if (first) first[i] = in && slots[start + i] ? c->cb_first[stage][start + i] : 0;
+    if (number) number[i] = in && slots[start + i] ? c->cb_number[stage][start + i] : 0;
+  }
+}
+static void STDMETHODCALLTYPE ctx_VSSetConstantBuffers(Ctx *c, UINT start, UINT count, ID3D11Buffer *const *buffers) { cb_set(c, 0, start, count, buffers, NULL, NULL); }
+static void STDMETHODCALLTYPE ctx_VSSetConstantBuffers1(Ctx *c, UINT start, UINT count, ID3D11Buffer *const *buffers, const UINT *first, const UINT *number) { cb_set(c, 0, start, count, buffers, first, number); }
+static void STDMETHODCALLTYPE ctx_PSSetConstantBuffers(Ctx *c, UINT start, UINT count, ID3D11Buffer *const *buffers) { cb_set(c, 1, start, count, buffers, NULL, NULL); }
+static void STDMETHODCALLTYPE ctx_PSSetConstantBuffers1(Ctx *c, UINT start, UINT count, ID3D11Buffer *const *buffers, const UINT *first, const UINT *number) { cb_set(c, 1, start, count, buffers, first, number); }
 static void set_resources(Ctx *c, View **slots, UINT start, UINT count, ID3D11ShaderResourceView *const *views, BOOL compute);
 static void STDMETHODCALLTYPE ctx_PSSetShaderResources(Ctx *c, UINT start, UINT count, ID3D11ShaderResourceView *const *views) { set_resources(c, c->srv, start, count, views, FALSE); }
 static void STDMETHODCALLTYPE ctx_PSSetSamplers(Ctx *c, UINT start, UINT count, ID3D11SamplerState *const *samplers) { set_range((void **)c->sampler, TEXTURE_SLOTS, start, count, (void *const *)samplers); }
-static void STDMETHODCALLTYPE ctx_VSGetConstantBuffers(Ctx *c, UINT start, UINT count, ID3D11Buffer **buffers) { get_range((void **)c->vs_cb, CONSTANT_SLOTS, start, count, (void **)buffers); }
-static void STDMETHODCALLTYPE ctx_PSGetConstantBuffers(Ctx *c, UINT start, UINT count, ID3D11Buffer **buffers) { get_range((void **)c->ps_cb, CONSTANT_SLOTS, start, count, (void **)buffers); }
+static void STDMETHODCALLTYPE ctx_VSGetConstantBuffers(Ctx *c, UINT start, UINT count, ID3D11Buffer **buffers) { cb_get(c, 0, start, count, buffers, NULL, NULL); }
+static void STDMETHODCALLTYPE ctx_VSGetConstantBuffers1(Ctx *c, UINT start, UINT count, ID3D11Buffer **buffers, UINT *first, UINT *number) { cb_get(c, 0, start, count, buffers, first, number); }
+static void STDMETHODCALLTYPE ctx_PSGetConstantBuffers(Ctx *c, UINT start, UINT count, ID3D11Buffer **buffers) { cb_get(c, 1, start, count, buffers, NULL, NULL); }
+static void STDMETHODCALLTYPE ctx_PSGetConstantBuffers1(Ctx *c, UINT start, UINT count, ID3D11Buffer **buffers, UINT *first, UINT *number) { cb_get(c, 1, start, count, buffers, first, number); }
 static void STDMETHODCALLTYPE ctx_PSGetShaderResources(Ctx *c, UINT start, UINT count, ID3D11ShaderResourceView **views) { get_range((void **)c->srv, TEXTURE_SLOTS, start, count, (void **)views); }
 static void STDMETHODCALLTYPE ctx_PSGetSamplers(Ctx *c, UINT start, UINT count, ID3D11SamplerState **samplers) { get_range((void **)c->sampler, TEXTURE_SLOTS, start, count, (void **)samplers); }
 /* the other stages' constant buffers, textures and samplers (written out: scripts/gen-dx-vtables.py finds the methods by their names) */
@@ -695,12 +756,18 @@ static void STDMETHODCALLTYPE ctx_DSSetShaderResources(Ctx *c, UINT start, UINT 
 static void STDMETHODCALLTYPE ctx_DSGetShaderResources(Ctx *c, UINT start, UINT count, ID3D11ShaderResourceView **views) { get_range((void **)c->stage_srv[SRV_DS], TEXTURE_SLOTS, start, count, (void **)views); }
 static void STDMETHODCALLTYPE ctx_DSSetSamplers(Ctx *c, UINT start, UINT count, ID3D11SamplerState *const *samplers) { set_range((void **)c->stage_sampler[SRV_DS], TEXTURE_SLOTS, start, count, (void *const *)samplers); }
 static void STDMETHODCALLTYPE ctx_DSGetSamplers(Ctx *c, UINT start, UINT count, ID3D11SamplerState **samplers) { get_range((void **)c->stage_sampler[SRV_DS], TEXTURE_SLOTS, start, count, (void **)samplers); }
-static void STDMETHODCALLTYPE ctx_GSSetConstantBuffers(Ctx *c, UINT start, UINT count, ID3D11Buffer *const *buffers) { set_range((void **)c->stage_cb[STAGE_GS], CONSTANT_SLOTS, start, count, (void *const *)buffers); }
-static void STDMETHODCALLTYPE ctx_GSGetConstantBuffers(Ctx *c, UINT start, UINT count, ID3D11Buffer **buffers) { get_range((void **)c->stage_cb[STAGE_GS], CONSTANT_SLOTS, start, count, (void **)buffers); }
-static void STDMETHODCALLTYPE ctx_HSSetConstantBuffers(Ctx *c, UINT start, UINT count, ID3D11Buffer *const *buffers) { set_range((void **)c->stage_cb[STAGE_HS], CONSTANT_SLOTS, start, count, (void *const *)buffers); }
-static void STDMETHODCALLTYPE ctx_HSGetConstantBuffers(Ctx *c, UINT start, UINT count, ID3D11Buffer **buffers) { get_range((void **)c->stage_cb[STAGE_HS], CONSTANT_SLOTS, start, count, (void **)buffers); }
-static void STDMETHODCALLTYPE ctx_DSSetConstantBuffers(Ctx *c, UINT start, UINT count, ID3D11Buffer *const *buffers) { set_range((void **)c->stage_cb[STAGE_DS], CONSTANT_SLOTS, start, count, (void *const *)buffers); }
-static void STDMETHODCALLTYPE ctx_DSGetConstantBuffers(Ctx *c, UINT start, UINT count, ID3D11Buffer **buffers) { get_range((void **)c->stage_cb[STAGE_DS], CONSTANT_SLOTS, start, count, (void **)buffers); }
+static void STDMETHODCALLTYPE ctx_GSSetConstantBuffers(Ctx *c, UINT start, UINT count, ID3D11Buffer *const *buffers) { cb_set(c, 2, start, count, buffers, NULL, NULL); }
+static void STDMETHODCALLTYPE ctx_GSSetConstantBuffers1(Ctx *c, UINT start, UINT count, ID3D11Buffer *const *buffers, const UINT *first, const UINT *number) { cb_set(c, 2, start, count, buffers, first, number); }
+static void STDMETHODCALLTYPE ctx_GSGetConstantBuffers(Ctx *c, UINT start, UINT count, ID3D11Buffer **buffers) { cb_get(c, 2, start, count, buffers, NULL, NULL); }
+static void STDMETHODCALLTYPE ctx_GSGetConstantBuffers1(Ctx *c, UINT start, UINT count, ID3D11Buffer **buffers, UINT *first, UINT *number) { cb_get(c, 2, start, count, buffers, first, number); }
+static void STDMETHODCALLTYPE ctx_HSSetConstantBuffers(Ctx *c, UINT start, UINT count, ID3D11Buffer *const *buffers) { cb_set(c, 3, start, count, buffers, NULL, NULL); }
+static void STDMETHODCALLTYPE ctx_HSSetConstantBuffers1(Ctx *c, UINT start, UINT count, ID3D11Buffer *const *buffers, const UINT *first, const UINT *number) { cb_set(c, 3, start, count, buffers, first, number); }
+static void STDMETHODCALLTYPE ctx_HSGetConstantBuffers(Ctx *c, UINT start, UINT count, ID3D11Buffer **buffers) { cb_get(c, 3, start, count, buffers, NULL, NULL); }
+static void STDMETHODCALLTYPE ctx_HSGetConstantBuffers1(Ctx *c, UINT start, UINT count, ID3D11Buffer **buffers, UINT *first, UINT *number) { cb_get(c, 3, start, count, buffers, first, number); }
+static void STDMETHODCALLTYPE ctx_DSSetConstantBuffers(Ctx *c, UINT start, UINT count, ID3D11Buffer *const *buffers) { cb_set(c, 4, start, count, buffers, NULL, NULL); }
+static void STDMETHODCALLTYPE ctx_DSSetConstantBuffers1(Ctx *c, UINT start, UINT count, ID3D11Buffer *const *buffers, const UINT *first, const UINT *number) { cb_set(c, 4, start, count, buffers, first, number); }
+static void STDMETHODCALLTYPE ctx_DSGetConstantBuffers(Ctx *c, UINT start, UINT count, ID3D11Buffer **buffers) { cb_get(c, 4, start, count, buffers, NULL, NULL); }
+static void STDMETHODCALLTYPE ctx_DSGetConstantBuffers1(Ctx *c, UINT start, UINT count, ID3D11Buffer **buffers, UINT *first, UINT *number) { cb_get(c, 4, start, count, buffers, first, number); }
 static void get_shader(void *shader, void **out, ID3D11ClassInstance **instances, UINT *count) {
   (void)instances;
   if (count) *count = 0;
@@ -774,6 +841,12 @@ static void STDMETHODCALLTYPE ctx_OMSetRenderTargetsAndUnorderedAccessViews(Ctx 
   }
   if (uav_count == D3D11_KEEP_UNORDERED_ACCESS_VIEWS) return;
   if (uav_start > UAV_SLOTS || uav_count > UAV_SLOTS - uav_start || (rtv_count != D3D11_KEEP_RENDER_TARGETS_AND_DEPTH_STENCIL && uav_count && uav_start < rtv_count)) return;
+  if (c->deferred && counts && uavs) {
+    RecArgs a = {.op = REC_UAV_COUNTS, .u = {uav_count}, .data = counts, .bytes = 4 * uav_count};
+    for (UINT i = 0; i < uav_count; ++i) a.obj[i] = uavs[i];
+    deferred_record(c, &a);
+    counts = NULL;
+  }
   for (UINT slot = 0; slot < UAV_SLOTS; ++slot) {
     View *v = slot >= uav_start && slot < uav_start + uav_count && uavs ? (View *)uavs[slot - uav_start] : NULL;
     if (v) {
@@ -813,24 +886,33 @@ static void STDMETHODCALLTYPE ctx_RSSetState(Ctx *c, ID3D11RasterizerState *stat
 }
 static void STDMETHODCALLTYPE ctx_RSGetState(Ctx *c, ID3D11RasterizerState **state) { get_shader(c->raster, (void **)state, NULL, NULL); }
 static void STDMETHODCALLTYPE ctx_RSSetViewports(Ctx *c, UINT count, const D3D11_VIEWPORT *viewports) {
-  c->viewport_set = count && viewports;
-  if (c->viewport_set) c->viewport = viewports[0];
+  if (count > D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE || (count && !viewports)) return;
+  for (UINT i = 0; i < count; ++i) c->viewports[i] = viewports[i];
+  c->viewport_count = count;
   c->dev->dirty |= DIRTY_VIEWPORT;
 }
+/* (no array: the number bound; else up to *count of them, and zeros after what is bound) */
 static void STDMETHODCALLTYPE ctx_RSGetViewports(Ctx *c, UINT *count, D3D11_VIEWPORT *viewports) {
   if (!count) return;
-  if (viewports && *count && c->viewport_set) viewports[0] = c->viewport;
-  *count = c->viewport_set ? 1 : 0;
+  if (!viewports) { *count = c->viewport_count; return; }
+  for (UINT i = 0; i < *count; ++i) {
+    if (i < c->viewport_count) viewports[i] = c->viewports[i];
+    else memset(&viewports[i], 0, sizeof viewports[i]);
+  }
 }
 static void STDMETHODCALLTYPE ctx_RSSetScissorRects(Ctx *c, UINT count, const D3D11_RECT *rects) {
-  c->scissor_set = count && rects;
-  if (c->scissor_set) c->scissor = rects[0];
+  if (count > D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE || (count && !rects)) return;
+  for (UINT i = 0; i < count; ++i) c->scissors[i] = rects[i];
+  c->scissor_count = count;
   c->dev->dirty |= DIRTY_VIEWPORT;
 }
 static void STDMETHODCALLTYPE ctx_RSGetScissorRects(Ctx *c, UINT *count, D3D11_RECT *rects) {
   if (!count) return;
-  if (rects && *count && c->scissor_set) rects[0] = c->scissor;
-  *count = c->scissor_set ? 1 : 0;
+  if (!rects) { *count = c->scissor_count; return; }
+  for (UINT i = 0; i < *count; ++i) {
+    if (i < c->scissor_count) rects[i] = c->scissors[i];
+    else memset(&rects[i], 0, sizeof rects[i]);
+  }
 }
 
 /* A draw: left out while predicated, measured for the active queries, counted for the pipeline statistics. */
@@ -845,10 +927,14 @@ static void draw_any(Ctx *c, BOOL indexed, UINT count, UINT instances, UINT star
   query_count_draw(c, count, instances);
   UNLOCK(c);
 }
-static void STDMETHODCALLTYPE ctx_Draw(Ctx *c, UINT count, UINT start) { draw_any(c, FALSE, count, 1, start, 0, 0); }
-static void STDMETHODCALLTYPE ctx_DrawIndexed(Ctx *c, UINT count, UINT start, INT base_vertex) { draw_any(c, TRUE, count, 1, start, base_vertex, 0); }
-static void STDMETHODCALLTYPE ctx_DrawInstanced(Ctx *c, UINT count, UINT instances, UINT start, UINT start_instance) { draw_any(c, FALSE, count, instances, start, 0, start_instance); }
+static void STDMETHODCALLTYPE ctx_Draw(Ctx *c, UINT count, UINT start) {
+  if (c->deferred) { deferred_record(c, &(RecArgs){.op = REC_DRAW, .u = {count, start}}); return; } draw_any(c, FALSE, count, 1, start, 0, 0); }
+static void STDMETHODCALLTYPE ctx_DrawIndexed(Ctx *c, UINT count, UINT start, INT base_vertex) {
+  if (c->deferred) { deferred_record(c, &(RecArgs){.op = REC_DRAW_INDEXED, .u = {count, start, (UINT)base_vertex}}); return; } draw_any(c, TRUE, count, 1, start, base_vertex, 0); }
+static void STDMETHODCALLTYPE ctx_DrawInstanced(Ctx *c, UINT count, UINT instances, UINT start, UINT start_instance) {
+  if (c->deferred) { deferred_record(c, &(RecArgs){.op = REC_DRAW_INSTANCED, .u = {count, instances, start, start_instance}}); return; } draw_any(c, FALSE, count, instances, start, 0, start_instance); }
 static void STDMETHODCALLTYPE ctx_DrawIndexedInstanced(Ctx *c, UINT count, UINT instances, UINT start, INT base_vertex, UINT start_instance) {
+  if (c->deferred) { deferred_record(c, &(RecArgs){.op = REC_DRAW_INDEXED_INSTANCED, .u = {count, instances, start, (UINT)base_vertex, start_instance}}); return; }
   draw_any(c, TRUE, count, instances, start, base_vertex, start_instance);
 }
 /* The arguments of an indirect draw or dispatch, read on the CPU (for the pipeline statistics, when a query counts them): FALSE when they cannot be had. */
@@ -879,9 +965,12 @@ static void draw_indirect(Ctx *c, BOOL indexed, ID3D11Buffer *buffer, UINT offse
   if (counted) query_count_draw(c, args[0], args[1]);
   UNLOCK(c);
 }
-static void STDMETHODCALLTYPE ctx_DrawInstancedIndirect(Ctx *c, ID3D11Buffer *buffer, UINT offset) { draw_indirect(c, FALSE, buffer, offset); }
-static void STDMETHODCALLTYPE ctx_DrawIndexedInstancedIndirect(Ctx *c, ID3D11Buffer *buffer, UINT offset) { draw_indirect(c, TRUE, buffer, offset); }
+static void STDMETHODCALLTYPE ctx_DrawInstancedIndirect(Ctx *c, ID3D11Buffer *buffer, UINT offset) {
+  if (c->deferred) { deferred_record(c, &(RecArgs){.op = REC_DRAW_INDIRECT, .obj = {buffer}, .u = {offset}}); return; } draw_indirect(c, FALSE, buffer, offset); }
+static void STDMETHODCALLTYPE ctx_DrawIndexedInstancedIndirect(Ctx *c, ID3D11Buffer *buffer, UINT offset) {
+  if (c->deferred) { deferred_record(c, &(RecArgs){.op = REC_DRAW_INDEXED_INDIRECT, .obj = {buffer}, .u = {offset}}); return; } draw_indirect(c, TRUE, buffer, offset); }
 static void STDMETHODCALLTYPE ctx_DispatchIndirect(Ctx *c, ID3D11Buffer *buffer, UINT offset) {
+  if (c->deferred) { deferred_record(c, &(RecArgs){.op = REC_DISPATCH_INDIRECT, .obj = {buffer}, .u = {offset}}); return; }
   Dev *d = c->dev;
   Buf *b = (Buf *)buffer;
   if (!b || !(b->desc.MiscFlags & D3D11_RESOURCE_MISC_DRAWINDIRECT_ARGS) || offset % 4 || offset > b->desc.ByteWidth || b->desc.ByteWidth - offset < 12) return;
@@ -898,6 +987,7 @@ static void STDMETHODCALLTYPE ctx_DispatchIndirect(Ctx *c, ID3D11Buffer *buffer,
 
 /* The vertices stream output wrote into the buffer of vertex slot 0, drawn: as many as its records hold after the slot's offset. */
 static void STDMETHODCALLTYPE ctx_DrawAuto(Ctx *c) {
+  if (c->deferred) { deferred_record(c, &(RecArgs){.op = REC_DRAW_AUTO}); return; }
   Dev *d = c->dev;
   LOCK(c);
   Buf *b = c->vb[0];
@@ -950,14 +1040,23 @@ static void STDMETHODCALLTYPE ctx_CSSetShader(Ctx *c, ID3D11ComputeShader *shade
   (void)instances; (void)count;
   bind(&c->cs, shader);
 }
-static void STDMETHODCALLTYPE ctx_CSSetConstantBuffers(Ctx *c, UINT start, UINT count, ID3D11Buffer *const *buffers) { set_range((void **)c->cs_cb, CONSTANT_SLOTS, start, count, (void *const *)buffers); }
-static void STDMETHODCALLTYPE ctx_CSGetConstantBuffers(Ctx *c, UINT start, UINT count, ID3D11Buffer **buffers) { get_range((void **)c->cs_cb, CONSTANT_SLOTS, start, count, (void **)buffers); }
+static void STDMETHODCALLTYPE ctx_CSSetConstantBuffers(Ctx *c, UINT start, UINT count, ID3D11Buffer *const *buffers) { cb_set(c, 5, start, count, buffers, NULL, NULL); }
+static void STDMETHODCALLTYPE ctx_CSSetConstantBuffers1(Ctx *c, UINT start, UINT count, ID3D11Buffer *const *buffers, const UINT *first, const UINT *number) { cb_set(c, 5, start, count, buffers, first, number); }
+static void STDMETHODCALLTYPE ctx_CSGetConstantBuffers(Ctx *c, UINT start, UINT count, ID3D11Buffer **buffers) { cb_get(c, 5, start, count, buffers, NULL, NULL); }
+static void STDMETHODCALLTYPE ctx_CSGetConstantBuffers1(Ctx *c, UINT start, UINT count, ID3D11Buffer **buffers, UINT *first, UINT *number) { cb_get(c, 5, start, count, buffers, first, number); }
 static void STDMETHODCALLTYPE ctx_CSSetShaderResources(Ctx *c, UINT start, UINT count, ID3D11ShaderResourceView *const *views) { set_resources(c, c->cs_srv, start, count, views, TRUE); }
 static void STDMETHODCALLTYPE ctx_CSGetShaderResources(Ctx *c, UINT start, UINT count, ID3D11ShaderResourceView **views) { get_range((void **)c->cs_srv, TEXTURE_SLOTS, start, count, (void **)views); }
 static void STDMETHODCALLTYPE ctx_CSSetSamplers(Ctx *c, UINT start, UINT count, ID3D11SamplerState *const *samplers) { set_range((void **)c->cs_sampler, TEXTURE_SLOTS, start, count, (void *const *)samplers); }
 static void STDMETHODCALLTYPE ctx_CSGetSamplers(Ctx *c, UINT start, UINT count, ID3D11SamplerState **samplers) { get_range((void **)c->cs_sampler, TEXTURE_SLOTS, start, count, (void **)samplers); }
 /* Unordered access views of the compute shader; `counts`: the hidden count of each append or counter view (-1: kept as it is). */
 static void STDMETHODCALLTYPE ctx_CSSetUnorderedAccessViews(Ctx *c, UINT start, UINT count, ID3D11UnorderedAccessView *const *views, const UINT *counts) {
+  if (c->deferred && counts && views) {
+    /* (the counts are set when the list runs) */
+    RecArgs a = {.op = REC_UAV_COUNTS, .u = {count < 8 ? count : 8}, .data = counts, .bytes = 4 * (count < 8 ? count : 8)};
+    for (UINT i = 0; i < count && i < 8; ++i) a.obj[i] = views[i];
+    deferred_record(c, &a);
+    counts = NULL;
+  }
   for (UINT i = 0; i < count && start + i < UAV_SLOTS; ++i) {
     View *v = views ? (View *)views[i] : NULL;
     if (v) {
@@ -995,8 +1094,8 @@ static BOOL compute_prepare(Ctx *c) {
   ID3D12GraphicsCommandList_SetDescriptorHeaps(list, 2, heaps);
   ID3D12GraphicsCommandList_SetPipelineState(list, cs->compute);
   const Shader *const stages[1] = {cs};
-  Buf *const *const bound[1] = {c->cs_cb};
-  constants_record(d, stages, bound, 1);
+  static const UINT stage_of[1] = {5};
+  constants_record(d, c, stages, stage_of, 1);
   ID3D12GraphicsCommandList_SetComputeRootConstantBufferView(list, 0, ID3D12Resource_GetGPUVirtualAddress(d->ring) + d->ring_last);
   if (!tables_record(d, c->cs_srv, c->cs_sampler, cs->tex_kind, c->cs_uav, cs->uav_mask, FALSE)) return FALSE;
   D3D12_GPU_DESCRIPTOR_HANDLE views = {d->table_views}, samplers = {d->table_samplers}, uavs = {d->table_uavs};
@@ -1010,6 +1109,7 @@ static BOOL compute_prepare(Ctx *c) {
   return TRUE;
 }
 static void STDMETHODCALLTYPE ctx_Dispatch(Ctx *c, UINT x, UINT y, UINT z) {
+  if (c->deferred) { deferred_record(c, &(RecArgs){.op = REC_DISPATCH, .u = {x, y, z}}); return; }
   LOCK(c);
   if (!predicated_out(c->dev) && x && y && z && x <= D3D11_CS_DISPATCH_MAX_THREAD_GROUPS_PER_DIMENSION && y <= D3D11_CS_DISPATCH_MAX_THREAD_GROUPS_PER_DIMENSION &&
       z <= D3D11_CS_DISPATCH_MAX_THREAD_GROUPS_PER_DIMENSION && compute_prepare(c)) {
@@ -1020,6 +1120,7 @@ static void STDMETHODCALLTYPE ctx_Dispatch(Ctx *c, UINT x, UINT y, UINT z) {
 }
 
 static void STDMETHODCALLTYPE ctx_ClearRenderTargetView(Ctx *c, ID3D11RenderTargetView *view, const FLOAT colour[4]) {
+  if (c->deferred) { deferred_record(c, &(RecArgs){.op = REC_CLEAR_RTV, .obj = {view}, .f = {colour ? colour[0] : 0, colour ? colour[1] : 0, colour ? colour[2] : 0, colour ? colour[3] : 0}}); return; }
   View *v = (View *)view;
   if (!v || !colour) return;
   if (predicated_out(c->dev)) return;
@@ -1035,6 +1136,7 @@ static void STDMETHODCALLTYPE ctx_ClearRenderTargetView(Ctx *c, ID3D11RenderTarg
   UNLOCK(c);
 }
 static void STDMETHODCALLTYPE ctx_ClearDepthStencilView(Ctx *c, ID3D11DepthStencilView *view, UINT flags, FLOAT depth, UINT8 stencil) {
+  if (c->deferred) { deferred_record(c, &(RecArgs){.op = REC_CLEAR_DSV, .obj = {view}, .u = {flags, stencil}, .f = {depth}}); return; }
   View *v = (View *)view;
   Dev *d = c->dev;
   if (!v || !(flags & 3)) return;
@@ -1128,6 +1230,7 @@ static void buf_write_any(Dev *d, Buf *b, UINT64 offset, const void *data, UINT6
 }
 
 static HRESULT STDMETHODCALLTYPE ctx_Map(Ctx *c, ID3D11Resource *resource, UINT sub, D3D11_MAP type, UINT flags, D3D11_MAPPED_SUBRESOURCE *out) {
+  if (c->deferred) { if (out) memset(out, 0, sizeof *out); return out && !flags ? deferred_map(c, resource, sub, type, out) : E_INVALIDARG; }
   (void)flags;
   Dev *d = c->dev;
   if (out) memset(out, 0, sizeof *out);
@@ -1167,6 +1270,7 @@ static HRESULT STDMETHODCALLTYPE ctx_Map(Ctx *c, ID3D11Resource *resource, UINT 
   return hr;
 }
 static void STDMETHODCALLTYPE ctx_Unmap(Ctx *c, ID3D11Resource *resource, UINT sub) {
+  if (c->deferred) { deferred_unmap(c, resource, sub); return; }
   Buf *b = buf_of_resource(resource);
   Tex *t = tex_of_resource(resource);
   LOCK(c);
@@ -1185,6 +1289,7 @@ static void STDMETHODCALLTYPE ctx_Unmap(Ctx *c, ID3D11Resource *resource, UINT s
 }
 
 static void STDMETHODCALLTYPE ctx_UpdateSubresource(Ctx *c, ID3D11Resource *resource, UINT sub, const D3D11_BOX *box, const void *data, UINT row_pitch, UINT depth_pitch) {
+  if (c->deferred) { deferred_update(c, resource, sub, box, data, row_pitch, depth_pitch); return; }
   Buf *b = buf_of_resource(resource);
   Tex *t = tex_of_resource(resource);
   if (!data) return;
@@ -1228,6 +1333,7 @@ static void tex_copy_slow(Dev *d, Tex *to, UINT to_sub, UINT x, UINT y, Tex *fro
 static BOOL tex_simple(const Tex *t) { return t->desc.MipLevels == 1 && t->desc.ArraySize == 1 && t->kind == 0 && !t->depth; }
 
 static void STDMETHODCALLTYPE ctx_CopySubresourceRegion(Ctx *c, ID3D11Resource *to, UINT to_sub, UINT x, UINT y, UINT z, ID3D11Resource *from, UINT from_sub, const D3D11_BOX *box) {
+  if (c->deferred) { deferred_record(c, &(RecArgs){.op = REC_COPY_REGION, .obj = {to, from}, .u = {to_sub, x, y, z, from_sub}, .box = box}); return; }
   (void)z;
   Dev *d = c->dev;
   Buf *bt = buf_of_resource(to), *bf = buf_of_resource(from);
@@ -1258,6 +1364,7 @@ static void STDMETHODCALLTYPE ctx_CopySubresourceRegion(Ctx *c, ID3D11Resource *
   UNLOCK(c);
 }
 static void STDMETHODCALLTYPE ctx_CopyResource(Ctx *c, ID3D11Resource *to, ID3D11Resource *from) {
+  if (c->deferred) { deferred_record(c, &(RecArgs){.op = REC_COPY_RESOURCE, .obj = {to, from}}); return; }
   Dev *d = c->dev;
   Buf *bt = buf_of_resource(to), *bf = buf_of_resource(from);
   Tex *tt = tex_of_resource(to), *tf = tex_of_resource(from);
@@ -1418,6 +1525,7 @@ static void uav_clear(Ctx *c, View *v, const UINT values[4], const FLOAT fvalues
   mem_free(fill);
 }
 static void STDMETHODCALLTYPE ctx_ClearUnorderedAccessViewUint(Ctx *c, ID3D11UnorderedAccessView *view, const UINT values[4]) {
+  if (c->deferred && values) { deferred_record(c, &(RecArgs){.op = REC_CLEAR_UAV_UINT, .obj = {view}, .u = {values[0], values[1], values[2], values[3]}}); return; }
   if (!view || !values) return;
   static const FLOAT none[4] = {0, 0, 0, 0};
   if (predicated_out(c->dev)) return;
@@ -1426,6 +1534,7 @@ static void STDMETHODCALLTYPE ctx_ClearUnorderedAccessViewUint(Ctx *c, ID3D11Uno
   UNLOCK(c);
 }
 static void STDMETHODCALLTYPE ctx_ClearUnorderedAccessViewFloat(Ctx *c, ID3D11UnorderedAccessView *view, const FLOAT values[4]) {
+  if (c->deferred && values) { deferred_record(c, &(RecArgs){.op = REC_CLEAR_UAV_FLOAT, .obj = {view}, .f = {values[0], values[1], values[2], values[3]}}); return; }
   if (!view || !values) return;
   static const UINT none[4] = {0, 0, 0, 0};
   if (predicated_out(c->dev)) return;
@@ -1436,6 +1545,7 @@ static void STDMETHODCALLTYPE ctx_ClearUnorderedAccessViewFloat(Ctx *c, ID3D11Un
 /* The hidden count of an append or counter view into a buffer (4 bytes at a multiple of 4). The kernel's shaders do not change it (it has no append and consume
  * instructions), so it is the count the program last set. */
 static void STDMETHODCALLTYPE ctx_CopyStructureCount(Ctx *c, ID3D11Buffer *buffer, UINT offset, ID3D11UnorderedAccessView *view) {
+  if (c->deferred) { deferred_record(c, &(RecArgs){.op = REC_COPY_STRUCTURE_COUNT, .obj = {buffer, view}, .u = {offset}}); return; }
   Buf *b = (Buf *)buffer;
   View *v = (View *)view;
   if (!b || !v || !v->buf || offset % 4 || offset > b->desc.ByteWidth || b->desc.ByteWidth - offset < 4 ||
@@ -1446,9 +1556,11 @@ static void STDMETHODCALLTYPE ctx_CopyStructureCount(Ctx *c, ID3D11Buffer *buffe
   UNLOCK(c);
 }
 
-static void STDMETHODCALLTYPE ctx_GenerateMips(Ctx *c, ID3D11ShaderResourceView *view) { (void)c; (void)view; }
+static void STDMETHODCALLTYPE ctx_GenerateMips(Ctx *c, ID3D11ShaderResourceView *view) {
+  if (c->deferred) { deferred_record(c, &(RecArgs){.op = REC_GENERATE_MIPS, .obj = {view}}); return; } (void)c; (void)view; }
 /* A multisampled texture into an ordinary one of its size and format: the samples of each pixel averaged (Direct3D 12's ResolveSubresource below). */
 static void STDMETHODCALLTYPE ctx_ResolveSubresource(Ctx *c, ID3D11Resource *to, UINT to_sub, ID3D11Resource *from, UINT from_sub, DXGI_FORMAT format) {
+  if (c->deferred) { deferred_record(c, &(RecArgs){.op = REC_RESOLVE, .obj = {to, from}, .u = {to_sub, from_sub, (UINT)format}}); return; }
   (void)format;
   Dev *d = c->dev;
   Tex *tt = tex_of_resource(to), *tf = tex_of_resource(from);
@@ -1464,51 +1576,40 @@ static void STDMETHODCALLTYPE ctx_ResolveSubresource(Ctx *c, ID3D11Resource *to,
 }
 
 static void STDMETHODCALLTYPE ctx_Flush(Ctx *c) {
+  if (c->deferred) return;
   LOCK(c);
   flush(c->dev);
   UNLOCK(c);
 }
+/* The bound objects of a context as an array (the references of Ctx from `vs` to `predicate`). */
+static DxObj **ctx_objects(Ctx *c, UINT *count) {
+  *count = (UINT)((CTX_OBJECTS_END - CTX_OBJECTS_FIRST) / sizeof(DxObj *));
+  return (DxObj **)((BYTE *)c + CTX_OBJECTS_FIRST);
+}
 static void ctx_unbind_all(Ctx *c) {
-  bind(&c->vs, NULL);
-  bind(&c->ps, NULL);
-  bind(&c->gs, NULL);
-  bind(&c->hs, NULL);
-  bind(&c->ds, NULL);
-  for (UINT k = 0; k < 3; ++k) for (UINT i = 0; i < CONSTANT_SLOTS; ++i) bind(&c->stage_cb[k][i], NULL);
-  for (UINT k = 0; k < 4; ++k) for (UINT i = 0; i < TEXTURE_SLOTS; ++i) { bind(&c->stage_srv[k][i], NULL); bind(&c->stage_sampler[k][i], NULL); }
-  bind(&c->cs, NULL);
-  for (UINT i = 0; i < CONSTANT_SLOTS; ++i) bind(&c->cs_cb[i], NULL);
-  for (UINT i = 0; i < TEXTURE_SLOTS; ++i) { bind(&c->cs_srv[i], NULL); bind(&c->cs_sampler[i], NULL); }
-  for (UINT i = 0; i < UAV_SLOTS; ++i) { bind(&c->cs_uav[i], NULL); bind(&c->ps_uav[i], NULL); }
+  UINT n;
+  DxObj **objects = ctx_objects(c, &n);
+  for (UINT i = 0; i < n; ++i) bind(&objects[i], NULL);
   for (UINT i = 0; i < 4; ++i) bind(&c->so_buf[i], NULL);
-  bind(&c->layout, NULL);
-  bind(&c->ib, NULL);
-  bind(&c->dsv, NULL);
-  bind(&c->blend, NULL);
-  bind(&c->depth, NULL);
-  bind(&c->raster, NULL);
-  for (UINT i = 0; i < VERTEX_SLOTS; ++i) bind(&c->vb[i], NULL);
-  for (UINT i = 0; i < CONSTANT_SLOTS; ++i) { bind(&c->vs_cb[i], NULL); bind(&c->ps_cb[i], NULL); }
-  for (UINT i = 0; i < TEXTURE_SLOTS; ++i) { bind(&c->srv[i], NULL); bind(&c->sampler[i], NULL); }
-  for (UINT i = 0; i < 8; ++i) bind(&c->rtv[i], NULL);
   c->rtv_count = 0;
+}
+static void ctx_release_all(Ctx *c) {
+  ctx_unbind_all(c);
+  bind(&c->active, NULL);
 }
 static void STDMETHODCALLTYPE ctx_ClearState(Ctx *c) {
   LOCK(c);
   ctx_unbind_all(c);
-  c->viewport_set = c->scissor_set = 0;
-  c->topology = D3D11_PRIMITIVE_TOPOLOGY_UNDEFINED;
-  c->stencil_ref = 0;
+  memset((BYTE *)c + CTX_VALUES_FIRST, 0, CTX_VALUES_END - CTX_VALUES_FIRST);      /* (no viewports or scissor rectangles, the topology UNDEFINED, no predication) */
   c->sample_mask = 0xFFFFFFFFu;
   for (UINT i = 0; i < 4; ++i) c->blend_factor[i] = 1.0f;
-  bind(&c->dev->predicate, NULL);
-  c->dev->predicate_value = FALSE;
   c->dev->dirty = DIRTY_ALL;
   UNLOCK(c);
 }
 
 /* SetResourceMinLOD: the most detailed level a texture is sampled at (its samplers' MinLOD is raised to it). Buffers have no levels. */
 static void STDMETHODCALLTYPE ctx_SetResourceMinLOD(Ctx *c, ID3D11Resource *resource, FLOAT lod) {
+  if (c->deferred) { deferred_record(c, &(RecArgs){.op = REC_MIN_LOD, .obj = {resource}, .f = {lod}}); return; }
   Tex *t = tex_of_resource(resource);
   if (!t || !(lod >= 0.0f)) return;
   LOCK(c);

@@ -27,6 +27,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <d3d11.h>
+#include <d3d11_1.h>
 #include <dxgi1_3.h>
 #include "dxfixtures.h"
 
@@ -1669,6 +1670,181 @@ static void test_min_lod(void) {
   ID3D11Texture2D_Release(texture);
 }
 
+/* ---- deferred contexts and command lists ----------------------------------------------------------------------------------------------------------------- */
+
+static void test_deferred(void) {
+  ID3D11DeviceContext *deferred = NULL;
+  HRESULT hr = ID3D11Device_CreateDeferredContext(g_device, 0, &deferred);
+  check(SUCCEEDED(hr) && deferred && ID3D11DeviceContext_GetType(deferred) == D3D11_DEVICE_CONTEXT_DEFERRED && ID3D11DeviceContext_GetType(g_context) == D3D11_DEVICE_CONTEXT_IMMEDIATE,
+        "CreateDeferredContext: a deferred context");
+  if (!deferred) return;
+  ID3D11CommandList *list = NULL;
+  check(ID3D11DeviceContext_FinishCommandList(g_context, FALSE, &list) == DXGI_ERROR_INVALID_CALL && !list, "the immediate context has no command list to finish");
+  ID3D11Buffer *matrix = make_buffer(D3D11_BIND_CONSTANT_BUFFER, D3D11_USAGE_DYNAMIC, D3D11_CPU_ACCESS_WRITE, NULL, 64);
+  ID3D11Buffer *vertices = triangle(0.5f, 0, 0, 1);
+  ID3D11Query *occlusion = NULL;
+  const D3D11_QUERY_DESC occlusion_desc = {D3D11_QUERY_OCCLUSION, 0};
+  ID3D11Device_CreateQuery(g_device, &occlusion_desc, &occlusion);
+  /* recorded: the bindings, a Map of the matrix (half the size), a clear and a draw counted by a query */
+  D3D11_VIEWPORT viewport = {0, 0, SIZE, SIZE, 0, 1};
+  const UINT stride = sizeof(VertexF), offset = 0;
+  ID3D11DeviceContext_OMSetRenderTargets(deferred, 1, &g_target_view, NULL);
+  ID3D11DeviceContext_RSSetViewports(deferred, 1, &viewport);
+  ID3D11DeviceContext_RSSetState(deferred, g_no_cull);
+  ID3D11DeviceContext_VSSetShader(deferred, g_vs, NULL, 0);
+  ID3D11DeviceContext_VSSetConstantBuffers(deferred, 0, 1, &matrix);
+  ID3D11DeviceContext_PSSetShader(deferred, g_ps_color, NULL, 0);
+  ID3D11DeviceContext_IASetPrimitiveTopology(deferred, D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+  ID3D11DeviceContext_IASetInputLayout(deferred, g_layout_floats);
+  ID3D11DeviceContext_IASetVertexBuffers(deferred, 0, 1, &vertices, &stride, &offset);
+  D3D11_MAPPED_SUBRESOURCE mapped;
+  const float half[16] = {0.5f, 0, 0, 0, 0, 0.5f, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+  check(ID3D11DeviceContext_Map(deferred, (ID3D11Resource *)matrix, 0, D3D11_MAP_WRITE, 0, &mapped) == E_INVALIDARG, "a deferred context maps for WRITE_DISCARD and WRITE_NO_OVERWRITE only");
+  hr = ID3D11DeviceContext_Map(deferred, (ID3D11Resource *)matrix, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
+  if (SUCCEEDED(hr)) { memcpy(mapped.pData, half, sizeof half); ID3D11DeviceContext_Unmap(deferred, (ID3D11Resource *)matrix, 0); }
+  const float red[4] = {1, 0, 0, 1};
+  ID3D11DeviceContext_ClearRenderTargetView(deferred, g_target_view, red);
+  if (occlusion) ID3D11DeviceContext_Begin(deferred, (ID3D11Asynchronous *)occlusion);
+  ID3D11DeviceContext_Draw(deferred, 3, 0);
+  if (occlusion) ID3D11DeviceContext_End(deferred, (ID3D11Asynchronous *)occlusion);
+  UINT64 samples = 0;
+  check(SUCCEEDED(hr) && ID3D11DeviceContext_GetData(deferred, (ID3D11Asynchronous *)occlusion, &samples, sizeof samples, 0) == DXGI_ERROR_INVALID_CALL,
+        "Map with WRITE_DISCARD on the deferred context; it answers no queries");
+  hr = ID3D11DeviceContext_FinishCommandList(deferred, FALSE, &list);
+  check(SUCCEEDED(hr) && list && ID3D11CommandList_GetContextFlags(list) == 0, "FinishCommandList");
+  ID3D11RenderTargetView *bound = (ID3D11RenderTargetView *)1;
+  ID3D11DeviceContext_OMGetRenderTargets(deferred, 1, &bound, NULL);
+  check(bound == NULL, "... after which the deferred context's bindings are the default ones (RestoreDeferredContextState FALSE)");
+  if (!list) { ID3D11DeviceContext_Release(deferred); return; }
+
+  /* nothing happened yet: the immediate context runs the list */
+  begin(NULL);
+  clear(0, 0, 0);
+  read_target();
+  check(pixel(1, 1) == 0xFF000000u, "nothing recorded has run before ExecuteCommandList");
+  ID3D11DeviceContext_ExecuteCommandList(g_context, list, FALSE);
+  read_target();
+  if (!(pixel(1, 1) == 0xFFFF0000u && pixel(32, 32) == 0xFF0000FFu && pixel(32, 12) == 0xFFFF0000u))
+    printf("d3d11test: (after the list: corner %08x, middle %08x, above %08x)\n", (unsigned)pixel(1, 1), (unsigned)pixel(32, 32), (unsigned)pixel(32, 12));
+  check(pixel(1, 1) == 0xFFFF0000u && pixel(32, 32) == 0xFF0000FFu && pixel(32, 12) == 0xFFFF0000u, "ExecuteCommandList: the clear, and the draw with the matrix the deferred Map wrote");
+  samples = 0;
+  check(occlusion && ID3D11DeviceContext_GetData(g_context, (ID3D11Asynchronous *)occlusion, &samples, sizeof samples, 0) == S_OK && samples > 100 && samples < 1000,
+        "a query begun and ended in the list is answered on the immediate context");
+  bound = (ID3D11RenderTargetView *)1;
+  ID3D11DeviceContext_OMGetRenderTargets(g_context, 1, &bound, NULL);
+  check(bound == NULL, "after ExecuteCommandList(FALSE) the immediate context's bindings are cleared");
+
+  /* again, keeping the immediate context's bindings */
+  begin(NULL);
+  clear(0, 0, 0);
+  ID3D11DeviceContext_ExecuteCommandList(g_context, list, TRUE);
+  read_target();
+  bound = NULL;
+  ID3D11DeviceContext_OMGetRenderTargets(g_context, 1, &bound, NULL);
+  check(pixel(32, 32) == 0xFF0000FFu && bound == g_target_view, "a list runs again; ExecuteCommandList(TRUE) keeps the immediate context's bindings");
+  if (bound) ID3D11RenderTargetView_Release(bound);
+
+  /* a list recorded into another deferred context's list */
+  ID3D11DeviceContext_ExecuteCommandList(deferred, list, FALSE);
+  ID3D11CommandList *outer = NULL;
+  ID3D11DeviceContext_FinishCommandList(deferred, TRUE, &outer);
+  clear(0, 1, 0);
+  if (outer) ID3D11DeviceContext_ExecuteCommandList(g_context, outer, FALSE);
+  read_target();
+  check(outer && pixel(1, 1) == 0xFFFF0000u && pixel(32, 32) == 0xFF0000FFu, "ExecuteCommandList on a deferred context: a list inside a list");
+  if (outer) ID3D11CommandList_Release(outer);
+
+  ID3D11CommandList_Release(list);
+  if (occlusion) ID3D11Query_Release(occlusion);
+  ID3D11Buffer_Release(vertices);
+  ID3D11Buffer_Release(matrix);
+  ULONG left = ID3D11DeviceContext_Release(deferred);
+  check(left == 0, "the deferred context goes with its last reference");
+}
+
+/* ---- Direct3D 11.1 ------------------------------------------------------------------------------------------------------------------------------------------- */
+
+static void test_d3d11_1(void) {
+  ID3D11Device1 *device1 = NULL;
+  ID3D11DeviceContext1 *context1 = NULL;
+  ID3D11Device_QueryInterface(g_device, &IID_ID3D11Device1, (void **)&device1);
+  ID3D11DeviceContext_QueryInterface(g_context, &IID_ID3D11DeviceContext1, (void **)&context1);
+  check(device1 && context1, "the device is an ID3D11Device1, its context an ID3D11DeviceContext1");
+  if (!device1 || !context1) return;
+  /* a constant buffer of two matrices, the second 256 bytes in: VSSetConstantBuffers1 binds the window of the second */
+  float two[128];
+  memset(two, 0, sizeof two);
+  const float full[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1}, small[16] = {0.25f, 0, 0, 0, 0, 0.25f, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+  memcpy(two, full, sizeof full);
+  memcpy(two + 64, small, sizeof small);
+  ID3D11Buffer *matrices = make_buffer(D3D11_BIND_CONSTANT_BUFFER, D3D11_USAGE_DEFAULT, 0, two, sizeof two);
+  ID3D11Buffer *vertices = triangle(0.5f, 0, 1, 0);
+  begin(NULL);
+  clear(0, 0, 0);
+  bind_floats(vertices);
+  ID3D11DeviceContext_PSSetShader(g_context, g_ps_color, NULL, 0);
+  const UINT first = 16, number = 16;
+  ID3D11DeviceContext1_VSSetConstantBuffers1(context1, 0, 1, &matrices, &first, &number);
+  ID3D11DeviceContext_Draw(g_context, 3, 0);
+  read_target();
+  int greens = 0;
+  for (int i = 0; i < SIZE * SIZE; ++i) greens += g_pixels[i] == 0xFF00FF00u;
+  UINT got_first = 0, got_number = 0;
+  ID3D11Buffer *got = NULL;
+  ID3D11DeviceContext1_VSGetConstantBuffers1(context1, 0, 1, &got, &got_first, &got_number);
+  check(matrices && greens > 20 && greens < 200 && got == matrices && got_first == 16 && got_number == 16, "VSSetConstantBuffers1: the window of the buffer the shader reads (and the getter)");
+  if (got) ID3D11Buffer_Release(got);
+
+  /* ClearView of a rectangle */
+  const float blue[4] = {0, 0, 1, 1};
+  const D3D11_RECT rect = {4, 4, 12, 12};
+  ID3D11DeviceContext1_ClearView(context1, (ID3D11View *)g_target_view, blue, &rect, 1);
+  read_target();
+  check(pixel(6, 6) == 0xFF0000FFu && pixel(13, 13) == 0xFF000000u && pixel(3, 3) == 0xFF000000u, "ClearView of a rectangle of the target");
+
+  /* the same description, the same object */
+  D3D11_BLEND_DESC bd;
+  memset(&bd, 0, sizeof bd);
+  bd.RenderTarget[0].BlendEnable = TRUE;
+  bd.RenderTarget[0].SrcBlend = bd.RenderTarget[0].SrcBlendAlpha = D3D11_BLEND_SRC_ALPHA;
+  bd.RenderTarget[0].DestBlend = bd.RenderTarget[0].DestBlendAlpha = D3D11_BLEND_INV_SRC_ALPHA;
+  bd.RenderTarget[0].BlendOp = bd.RenderTarget[0].BlendOpAlpha = D3D11_BLEND_OP_ADD;
+  bd.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
+  ID3D11BlendState *b1 = NULL, *b2 = NULL;
+  ID3D11Device_CreateBlendState(g_device, &bd, &b1);
+  ID3D11Device_CreateBlendState(g_device, &bd, &b2);
+  D3D11_BLEND_DESC back;
+  if (b1) ID3D11BlendState_GetDesc(b1, &back);
+  check(b1 && b1 == b2 && back.RenderTarget[3].BlendEnable == TRUE && back.RenderTarget[3].SrcBlend == D3D11_BLEND_SRC_ALPHA,
+        "CreateBlendState: the same object for the same description (each target as the first without IndependentBlendEnable)");
+  if (b1) ID3D11BlendState_Release(b1);
+  if (b2) ID3D11BlendState_Release(b2);
+
+  /* a context state object: swapped in, the bindings are the default ones; swapped back, they return */
+  ID3DDeviceContextState *state = NULL, *previous = NULL;
+  const D3D_FEATURE_LEVEL level = D3D_FEATURE_LEVEL_11_0;
+  D3D_FEATURE_LEVEL chosen = 0;
+  HRESULT hr = ID3D11Device1_CreateDeviceContextState(device1, 0, &level, 1, D3D11_SDK_VERSION, &IID_ID3D11Device1, &chosen, &state);
+  check(SUCCEEDED(hr) && state && chosen == D3D_FEATURE_LEVEL_11_0, "CreateDeviceContextState");
+  if (state) {
+    ID3D11DeviceContext1_SwapDeviceContextState(context1, state, &previous);
+    ID3D11RenderTargetView *bound = (ID3D11RenderTargetView *)1;
+    ID3D11DeviceContext_OMGetRenderTargets(g_context, 1, &bound, NULL);
+    check(previous && bound == NULL, "SwapDeviceContextState: the new state's bindings (none)");
+    ID3D11DeviceContext1_SwapDeviceContextState(context1, previous, NULL);
+    bound = NULL;
+    ID3D11DeviceContext_OMGetRenderTargets(g_context, 1, &bound, NULL);
+    check(bound == g_target_view, "... and the old ones back");
+    if (bound) ID3D11RenderTargetView_Release(bound);
+    if (previous) ID3DDeviceContextState_Release(previous);
+    ID3DDeviceContextState_Release(state);
+  }
+  if (matrices) ID3D11Buffer_Release(matrices);
+  ID3D11Buffer_Release(vertices);
+  ID3D11DeviceContext1_Release(context1);
+  ID3D11Device1_Release(device1);
+}
+
 int main(void) {
   test_device();
   if (g_device && g_context) {
@@ -1695,6 +1871,8 @@ int main(void) {
       test_stream_output();
       test_indirect_draws();
       test_min_lod();
+      test_deferred();
+      test_d3d11_1();
     }
     ID3D11DeviceContext_ClearState(g_context);
     ID3D11DeviceContext_Flush(g_context);
