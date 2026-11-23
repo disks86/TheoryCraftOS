@@ -163,6 +163,7 @@ struct Tex {
   IDXGISurface2 dxgi_surf;
   IDXGIKeyedMutex dxgi_mutex;  /* ... and its keyed mutex (a texture made D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX, or opened with one: `keyed_mutex`) */
   UINT keyed_mutex;            /* the D3DKMT keyed mutex (0: none) */
+  UINT global_share;           /* shared with a legacy handle (made SHARED / SHARED_KEYEDMUTEX without NTHANDLE, or opened by one): what GetSharedHandle answers */
 };
 
 /* A render target, depth-stencil, shader resource or unordered access view: the texture (or buffer), and the descriptor of the first two. A view of a buffer names
@@ -860,17 +861,18 @@ static void tex_refused(const D3D11_TEXTURE2D_DESC *desc, const char *why) {
   dx_say(text);
 }
 
-/* What a texture shared through an NT handle carries for the device that opens it (TcosD3D12ShareExtra): "D11T", the kind (0 2D, 1 3D, 2 1D), then the
- * D3D11_TEXTURE2D_DESC as tex_make keeps it and the depth of a volume, each a 32-bit word. */
-#define TEX_SHARE_BYTES 56
-static void tex_share_blob(const D3D11_TEXTURE2D_DESC *t, UINT kind, UINT slices, BYTE out[TEX_SHARE_BYTES]) {
-  const UINT words[13] = {kind, t->Width, t->Height, t->MipLevels, t->ArraySize, t->Format, t->SampleDesc.Count, t->SampleDesc.Quality, t->Usage, t->BindFlags,
-                          t->CPUAccessFlags, t->MiscFlags, slices};
+/* What a shared texture carries for the device that opens it (TcosD3D12ShareExtra): "D11T", the kind (0 2D, 1 3D, 2 1D), then the D3D11_TEXTURE2D_DESC as tex_make
+ * keeps it, the depth of a volume and the global share handle of its keyed mutex (a texture shared with a legacy handle: its mutex has one too; 0 otherwise), each a
+ * 32-bit word. */
+#define TEX_SHARE_BYTES 60
+static void tex_share_blob(const D3D11_TEXTURE2D_DESC *t, UINT kind, UINT slices, UINT mutex_global, BYTE out[TEX_SHARE_BYTES]) {
+  const UINT words[14] = {kind, t->Width, t->Height, t->MipLevels, t->ArraySize, t->Format, t->SampleDesc.Count, t->SampleDesc.Quality, t->Usage, t->BindFlags,
+                          t->CPUAccessFlags, t->MiscFlags, slices, mutex_global};
   out[0] = 'D', out[1] = '1', out[2] = '1', out[3] = 'T';
   memcpy(out + 4, words, sizeof words);
 }
-static int tex_share_read(const BYTE *in, UINT size, D3D11_TEXTURE2D_DESC *t, UINT *kind, UINT *slices) {
-  UINT words[13];
+static int tex_share_read(const BYTE *in, UINT size, D3D11_TEXTURE2D_DESC *t, UINT *kind, UINT *slices, UINT *mutex_global) {
+  UINT words[14];
   if (size != TEX_SHARE_BYTES || in[0] != 'D' || in[1] != '1' || in[2] != '1' || in[3] != 'T') return 0;
   memcpy(words, in + 4, sizeof words);
   if (words[0] > 2) return 0;
@@ -879,6 +881,7 @@ static int tex_share_read(const BYTE *in, UINT size, D3D11_TEXTURE2D_DESC *t, UI
   t->SampleDesc.Count = words[6], t->SampleDesc.Quality = words[7], t->Usage = (D3D11_USAGE)words[8], t->BindFlags = words[9], t->CPUAccessFlags = words[10];
   t->MiscFlags = words[11];
   *slices = words[12];
+  *mutex_global = words[13];
   return 1;
 }
 
@@ -899,6 +902,9 @@ static HRESULT tex_make(Dev *d, const D3D11_TEXTURE2D_DESC *in, UINT slices, ID3
   const BOOL nt_shared = !res && (desc.MiscFlags & D3D11_RESOURCE_MISC_SHARED_NTHANDLE) != 0;
   if (nt_shared && (!(desc.MiscFlags & (D3D11_RESOURCE_MISC_SHARED | D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX)) || desc.Usage != D3D11_USAGE_DEFAULT || desc.CPUAccessFlags))
     return E_INVALIDARG;
+  /* (shared with a legacy handle - IDXGIResource::GetSharedHandle's -: SHARED or SHARED_KEYEDMUTEX without NTHANDLE, in GPU memory too) */
+  const BOOL global_shared = !res && !nt_shared && (desc.MiscFlags & (D3D11_RESOURCE_MISC_SHARED | D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX)) != 0;
+  if (global_shared && (desc.Usage != D3D11_USAGE_DEFAULT || desc.CPUAccessFlags)) return E_INVALIDARG;
   const UINT made_kind = d->next_tex_kind;
   d->next_tex_kind = 0;
   if ((desc.MiscFlags & D3D11_RESOURCE_MISC_GENERATE_MIPS) && (bind & (D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE)) != (D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE)) return E_INVALIDARG;
@@ -969,21 +975,25 @@ static HRESULT tex_make(Dev *d, const D3D11_TEXTURE2D_DESC *in, UINT slices, ID3
                               (UINT16)(slices ? slices : desc.ArraySize), (UINT16)t->kmips, t->stored, {desc.SampleDesc.Count, 0}, D3D12_TEXTURE_LAYOUT_UNKNOWN, D3D12_RESOURCE_FLAG_NONE};
     if ((desc.BindFlags & D3D11_BIND_RENDER_TARGET) && !shadowed) rd.Flags |= D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
     if (t->depth) rd.Flags |= D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
-    if (cube) TcosD3D12ResourceOptions(d->d12, TCOS_RESOURCE_CUBE);      /* (Direct3D 12 knows a cube only by its views; the kernel has to know it now) */
-    if (nt_shared) {
+    /* (a keyed mutex that orders its use between devices: free, with key 0, as DXGI makes one; shared with the texture's NT handle, or - a legacy share - with a
+     * global share handle of its own, which the texture's description carries) */
+    UINT mutex_global = 0;
+    if (desc.MiscFlags & D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX) {
+      const NTSTATUS st = kmt_create_keyed_mutex_shared(0, &t->keyed_mutex, global_shared ? &mutex_global : NULL);
+      if (!KMT_OK(st)) { dx_Release(OBJ(t)); return E_OUTOFMEMORY; }
+    }
+    /* (Direct3D 12 knows a cube only by its views, so the kernel has to be told now; a legacy share is one Direct3D 12 itself does not make) */
+    if (cube || global_shared) TcosD3D12ResourceOptions(d->d12, (cube ? TCOS_RESOURCE_CUBE : 0u) | (global_shared ? TCOS_RESOURCE_GLOBAL_SHARE : 0u));
+    if (nt_shared || global_shared) {
       /* (what a device that opens it makes of it: the program's description, which the Direct3D 12 one - formats kept wider, one level of a target - does not say) */
       BYTE blob[TEX_SHARE_BYTES];
-      tex_share_blob(&t->desc, slices ? 1 : made_kind == 2 ? 2 : 0, slices, blob);
+      tex_share_blob(&t->desc, slices ? 1 : made_kind == 2 ? 2 : 0, slices, mutex_global, blob);
       TcosD3D12ShareExtra(d->d12, blob, sizeof blob);
     }
     const HRESULT hr = ID3D12Device_CreateCommittedResource(d->d12, &props, nt_shared ? D3D12_HEAP_FLAG_SHARED : D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_COMMON, NULL,
                                                             &IID_ID3D12Resource, (void **)&t->res);
     if (FAILED(hr) || !t->res) { tex_refused(&desc, "Direct3D 12 below refused it"); dx_Release(OBJ(t)); return FAILED(hr) ? hr : E_FAIL; }
-    /* (a keyed mutex that orders its use between devices: free, with key 0, as DXGI makes one; shared with the texture's NT handle) */
-    if (desc.MiscFlags & D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX) {
-      const NTSTATUS st = kmt_create_keyed_mutex(0, &t->keyed_mutex);
-      if (!KMT_OK(st)) { dx_Release(OBJ(t)); return E_OUTOFMEMORY; }
-    }
+    if (global_shared) t->global_share = TcosD3D12GlobalShare(t->res);
   }
   *out = t;
   return S_OK;

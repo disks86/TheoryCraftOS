@@ -196,6 +196,12 @@ __declspec(dllimport) NTSTATUS __cdecl NtGdiDdDDIReleaseKeyedMutex(void *);
 #define D3DKMTReleaseKeyedMutex NtGdiDdDDIReleaseKeyedMutex
 __declspec(dllimport) NTSTATUS __cdecl NtGdiDdDDIOpenKeyedMutexFromNtHandle(void *);
 #define D3DKMTOpenKeyedMutexFromNtHandle NtGdiDdDDIOpenKeyedMutexFromNtHandle
+__declspec(dllimport) NTSTATUS __cdecl NtGdiDdDDIOpenKeyedMutex(void *);
+#define D3DKMTOpenKeyedMutex NtGdiDdDDIOpenKeyedMutex
+__declspec(dllimport) NTSTATUS __cdecl NtGdiDdDDIQueryResourceInfo(void *);
+#define D3DKMTQueryResourceInfo NtGdiDdDDIQueryResourceInfo
+__declspec(dllimport) NTSTATUS __cdecl NtGdiDdDDIOpenResource(void *);
+#define D3DKMTOpenResource NtGdiDdDDIOpenResource
 #else
 NTSTATUS WINAPI D3DKMTEnumAdapters2(void *);
 NTSTATUS WINAPI D3DKMTOpenAdapterFromLuid(void *);
@@ -230,6 +236,9 @@ NTSTATUS WINAPI D3DKMTDestroyKeyedMutex(void *);
 NTSTATUS WINAPI D3DKMTAcquireKeyedMutex(void *);
 NTSTATUS WINAPI D3DKMTReleaseKeyedMutex(void *);
 NTSTATUS WINAPI D3DKMTOpenKeyedMutexFromNtHandle(void *);
+NTSTATUS WINAPI D3DKMTOpenKeyedMutex(void *);
+NTSTATUS WINAPI D3DKMTQueryResourceInfo(void *);
+NTSTATUS WINAPI D3DKMTOpenResource(void *);
 #endif
 
 #pragma GCC diagnostic ignored "-Wunused-function"
@@ -377,13 +386,20 @@ typedef struct KmtAllocDesc {
   UINT64 size, heap_offset;
 } KmtAllocDesc;
 
-static NTSTATUS kmt_create_allocation_ex(UINT device, const KmtAllocDesc *d, const void *runtime, UINT runtime_size, UINT *resource, UINT *allocation, UINT *pitch, UINT64 *bytes);
+static NTSTATUS kmt_create_allocation_shared(UINT device, const KmtAllocDesc *d, const void *runtime, UINT runtime_size, UINT *resource, UINT *global, UINT *allocation, UINT *pitch,
+                                             UINT64 *bytes);
 static NTSTATUS kmt_create_allocation(UINT device, const KmtAllocDesc *d, UINT *allocation, UINT *pitch, UINT64 *bytes) {
-  return kmt_create_allocation_ex(device, d, NULL, 0, NULL, allocation, pitch, bytes);
+  return kmt_create_allocation_shared(device, d, NULL, 0, NULL, NULL, allocation, pitch, bytes);
 }
 /* `resource` non-NULL: the allocation is made as a resource of its own that is shared through NT handles (CreateResource | NtSecuritySharing), with `runtime` as
  * the data an opener gets; *resource is its handle (what kmt_share_objects shares). */
 static NTSTATUS kmt_create_allocation_ex(UINT device, const KmtAllocDesc *d, const void *runtime, UINT runtime_size, UINT *resource, UINT *allocation, UINT *pitch, UINT64 *bytes) {
+  return kmt_create_allocation_shared(device, d, runtime, runtime_size, resource, NULL, allocation, pitch, bytes);
+}
+/* ... and `global` non-NULL as well: shared through a global share handle instead (CreateResource | CreateShared: the legacy handles of
+ * IDXGIResource::GetSharedHandle), *global being it. */
+static NTSTATUS kmt_create_allocation_shared(UINT device, const KmtAllocDesc *d, const void *runtime, UINT runtime_size, UINT *resource, UINT *global, UINT *allocation, UINT *pitch,
+                                             UINT64 *bytes) {
   UINT priv[KAW_WORDS] __attribute__((aligned(16))) = {0};
   BYTE block[72] __attribute__((aligned(16))) = {0};
   BYTE info[96] __attribute__((aligned(16))) = {0};
@@ -410,12 +426,13 @@ static NTSTATUS kmt_create_allocation_ex(UINT device, const KmtAllocDesc *d, con
   if (resource) {
     KPUT64(block, 16, (UINT_PTR)runtime);
     KPUT32(block, 24, runtime_size);
-    KPUT32(block, 56, 1u | 0x40u);      /* CreateResource | NtSecuritySharing */
+    KPUT32(block, 56, global ? (1u | 2u) : (1u | 0x40u));      /* CreateResource | CreateShared, or CreateResource | NtSecuritySharing */
   }
   NTSTATUS st = D3DKMTCreateAllocation(block);
   if (!KMT_OK(st)) return st;
   *allocation = KGET32(info, 0);
   if (resource) *resource = KGET32(block, 4);
+  if (resource && global) *global = KGET32(block, 8);
   if (pitch) *pitch = priv[KAW_PITCH];
   if (bytes) *bytes = priv[KAW_BYTES_LO] | ((UINT64)priv[KAW_BYTES_HI] << 32);
   return st;
@@ -526,13 +543,59 @@ static NTSTATUS kmt_share_objects(UINT object, void *attributes, DWORD access, U
 }
 
 /* ---- keyed mutexes (src/Process/Win32k/Dxg/DxgKeyedMutex.cpp) ---- */
-/* A keyed mutex whose first key is `initial`, shared through its resource's NT handle (NtSecuritySharing). */
-static NTSTATUS kmt_create_keyed_mutex(UINT64 initial, UINT *mutex) {
+/* A keyed mutex whose first key is `initial`, shared through its resource's NT handle (NtSecuritySharing) - or, `global` non-NULL, through the global share handle
+ * that comes back there (the legacy handles). */
+static NTSTATUS kmt_create_keyed_mutex_shared(UINT64 initial, UINT *mutex, UINT *global) {
   BYTE block[32] __attribute__((aligned(16))) = {0};
   KPUT64(block, 0, initial);
-  KPUT32(block, 28, 1);      /* NtSecuritySharing */
+  KPUT32(block, 28, global ? 0u : 1u);      /* NtSecuritySharing */
   const NTSTATUS st = D3DKMTCreateKeyedMutex2(block);
   *mutex = KMT_OK(st) ? KGET32(block, 12) : 0;
+  if (global) *global = KMT_OK(st) ? KGET32(block, 8) : 0;
+  return st;
+}
+static NTSTATUS kmt_create_keyed_mutex(UINT64 initial, UINT *mutex) { return kmt_create_keyed_mutex_shared(initial, mutex, NULL); }
+/* The keyed mutex of a global share handle. */
+static NTSTATUS kmt_open_keyed_mutex_global(UINT global, UINT *mutex) {
+  BYTE block[8] __attribute__((aligned(8))) = {0};
+  KPUT32(block, 0, global);
+  const NTSTATUS st = D3DKMTOpenKeyedMutex(block);
+  *mutex = KMT_OK(st) ? KGET32(block, 4) : 0;
+  return st;
+}
+/* What a resource's global share handle holds (D3DKMT_QUERYRESOURCEINFO), and opening it (D3DKMT_OPENRESOURCE) as kmt_query_resource_nt / kmt_open_resource_nt do
+ * an NT handle's: one allocation, its private data into `driver` (the resource's comes first in that buffer: `resource_driver` bytes). */
+static NTSTATUS kmt_query_resource_global(UINT device, UINT global, void *runtime, UINT capacity, UINT *runtime_size, UINT *total_driver, UINT *resource_driver, UINT *allocations) {
+  BYTE block[32] __attribute__((aligned(16))) = {0};
+  KPUT32(block, 0, device);
+  KPUT32(block, 4, global);
+  KPUT64(block, 8, (UINT_PTR)runtime);
+  KPUT32(block, 16, capacity);
+  const NTSTATUS st = D3DKMTQueryResourceInfo(block);
+  *runtime_size = KGET32(block, 16);
+  *total_driver = KGET32(block, 20);
+  *resource_driver = KGET32(block, 24);
+  *allocations = KGET32(block, 28);
+  return st;
+}
+static NTSTATUS kmt_open_resource_global(UINT device, UINT global, void *runtime, UINT runtime_size, void *driver, UINT driver_size, UINT *allocation, UINT *resource,
+                                         void **allocation_driver) {
+  BYTE block[72] __attribute__((aligned(16))) = {0};
+  BYTE info[24] __attribute__((aligned(16))) = {0};
+  KPUT32(block, 0, device);
+  KPUT32(block, 4, global);
+  KPUT32(block, 8, 1);
+  KPUT64(block, 16, (UINT_PTR)info);
+  KPUT64(block, 24, (UINT_PTR)runtime);
+  KPUT32(block, 32, runtime_size);
+  KPUT64(block, 56, (UINT_PTR)driver);
+  KPUT32(block, 64, driver_size);
+  const NTSTATUS st = D3DKMTOpenResource(block);
+  if (KMT_OK(st)) {
+    *allocation = KGET32(info, 0);
+    *resource = KGET32(block, 68);
+    *allocation_driver = (void *)(UINT_PTR)KGET64(info, 8);
+  }
   return st;
 }
 static void kmt_destroy_keyed_mutex(UINT mutex) {

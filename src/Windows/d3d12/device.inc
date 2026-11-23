@@ -67,22 +67,35 @@ static HRESULT STDMETHODCALLTYPE dev_CreateSharedHandle(Dev *This, ID3D12DeviceC
   return S_OK;
 }
 
-/* The object a shared handle names, made on this device: a resource or a heap (what its share says it is) or a fence. */
-static HRESULT open_shared(Dev *This, UINT64 nt, IUnknown **out) {
+/* The object a shared handle names, made on this device: a resource or a heap (what its share says it is) or a fence. `mode`: SHARED_NT an NT handle only (of a resource,
+ * heap or fence), SHARED_GLOBAL a global share handle only (the legacy handles of IDXGIResource::GetSharedHandle, a resource's), SHARED_ANY either - an NT handle
+ * first. */
+enum { SHARED_ANY, SHARED_NT, SHARED_GLOBAL };
+static HRESULT open_shared(Dev *This, UINT64 handle, int mode, IUnknown **out) {
   extern const ID3D12Heap1Vtbl heap_vtbl;
   *out = NULL;
   BYTE runtime[SHARE_DESC_BYTES];
   UINT runtime_size = 0, total = 0, resource_driver = 0, allocations = 0;
-  NTSTATUS st = kmt_query_resource_nt(This->kdev, nt, runtime, sizeof runtime, &runtime_size, &total, &resource_driver, &allocations);
-  if ((UINT)st == 0xC0000024u) {      /* STATUS_OBJECT_TYPE_MISMATCH: not a resource's handle - a fence's? */
-    UINT sync = 0;
-    st = kmt_open_sync_nt(This->kdev, nt, &sync);
-    if (!KMT_OK(st)) return (UINT)st == 0xC0000024u || (UINT)st == 0xC0000008u ? E_INVALIDARG : hr_from(st);
-    Fence *f = NULL;
-    const HRESULT hr = fence_make(This, 0, D3D12_FENCE_FLAG_SHARED, sync, &f);
-    if (FAILED(hr)) { kmt_destroy_sync(sync); return hr; }
-    *out = (IUnknown *)f;
-    return S_OK;
+  int global = mode == SHARED_GLOBAL;
+  NTSTATUS st = 0xC0000008u;
+  if (!global) {
+    st = kmt_query_resource_nt(This->kdev, handle, runtime, sizeof runtime, &runtime_size, &total, &resource_driver, &allocations);
+    if ((UINT)st == 0xC0000024u) {      /* STATUS_OBJECT_TYPE_MISMATCH: not a resource's handle - a fence's? */
+      UINT sync = 0;
+      st = kmt_open_sync_nt(This->kdev, handle, &sync);
+      if (!KMT_OK(st)) return (UINT)st == 0xC0000024u || (UINT)st == 0xC0000008u ? E_INVALIDARG : hr_from(st);
+      Fence *f = NULL;
+      const HRESULT hr = fence_make(This, 0, D3D12_FENCE_FLAG_SHARED, sync, &f);
+      if (FAILED(hr)) { kmt_destroy_sync(sync); return hr; }
+      *out = (IUnknown *)f;
+      return S_OK;
+    }
+    /* (no NT handle of the process's: a global share handle, if that may be one - they are 32-bit numbers) */
+    if ((UINT)st == 0xC0000008u && mode == SHARED_ANY && handle <= 0xFFFFFFFFu) global = 1;
+  }
+  if (global) {
+    if (handle == 0 || handle > 0xFFFFFFFFu) return E_INVALIDARG;
+    st = kmt_query_resource_global(This->kdev, (UINT)handle, runtime, sizeof runtime, &runtime_size, &total, &resource_driver, &allocations);
   }
   if ((UINT)st == 0xC0000023u) return E_INVALIDARG;      /* (runtime data of another runtime's: bigger than ours) */
   if (!KMT_OK(st)) return (UINT)st == 0xC0000008u ? E_INVALIDARG : hr_from(st);
@@ -92,9 +105,21 @@ static HRESULT open_shared(Dev *This, UINT64 nt, IUnknown **out) {
   BYTE *driver = mem_alloc(total ? total : 1), *resource_data = mem_alloc(resource_driver ? resource_driver : 1);
   if (!driver || !resource_data) { mem_free(driver); mem_free(resource_data); return E_OUTOFMEMORY; }
   UINT allocation = 0, kresource = 0;
-  st = kmt_open_resource_nt(This->kdev, nt, runtime, runtime_size, resource_data, resource_driver, driver, total, &allocation, &kresource);
+  const BYTE *allocation_data = driver;
+  if (global) {
+    void *at = NULL;
+    st = kmt_open_resource_global(This->kdev, (UINT)handle, runtime, runtime_size, driver, total, &allocation, &kresource, &at);
+    /* (the allocation's data follows the resource's in the buffer: where the kernel says it put it) */
+    if (KMT_OK(st)) allocation_data = (const BYTE *)at && (const BYTE *)at >= driver && (const BYTE *)at <= driver + total ? (const BYTE *)at : driver;
+  } else {
+    st = kmt_open_resource_nt(This->kdev, handle, runtime, runtime_size, resource_data, resource_driver, driver, total, &allocation, &kresource);
+  }
   UINT64 bytes = 0;
-  if (KMT_OK(st) && total >= KAW_WORDS * 4) bytes = ((UINT *)driver)[KAW_BYTES_LO] | ((UINT64)((UINT *)driver)[KAW_BYTES_HI] << 32);
+  if (KMT_OK(st) && (SIZE_T)(driver + total - allocation_data) >= KAW_WORDS * 4) {
+    UINT words[KAW_WORDS];
+    memcpy(words, allocation_data, sizeof words);
+    bytes = words[KAW_BYTES_LO] | ((UINT64)words[KAW_BYTES_HI] << 32);
+  }
   mem_free(driver);
   mem_free(resource_data);
   if (!KMT_OK(st)) return (UINT)st == 0xC0000008u ? E_INVALIDARG : hr_from(st);
@@ -118,6 +143,7 @@ static HRESULT open_shared(Dev *This, UINT64 nt, IUnknown **out) {
   if (FAILED(hr)) { kmt_destroy_allocation(This->kdev, allocation); return hr; }      /* (a description this device cannot make: the opened allocation goes) */
   memcpy(r->share_extra, sd.extra, sd.extra_size);
   r->share_extra_size = sd.extra_size;
+  if (global) r->global_share = (UINT)handle;      /* (what GetSharedHandle of the runtime above answers for it) */
   *out = (IUnknown *)r;
   return S_OK;
 }
@@ -125,7 +151,7 @@ static HRESULT STDMETHODCALLTYPE dev_OpenSharedHandle(Dev *This, HANDLE handle, 
   if (object) *object = NULL;
   if (!handle || !riid || !object) return E_INVALIDARG;
   IUnknown *made = NULL;
-  const HRESULT hr = open_shared(This, (UINT64)(UINT_PTR)handle, &made);
+  const HRESULT hr = open_shared(This, (UINT64)(UINT_PTR)handle, SHARED_ANY, &made);
   if (FAILED(hr)) return hr;
   return query_out(made, riid, object);      /* (an interface the object does not have: E_NOINTERFACE, and the object goes) */
 }

@@ -600,6 +600,118 @@ static void test_keyed_mutex(void) {
   ID3D11Device_Release(y);
 }
 
+/* ---- legacy shared handles (IDXGIResource::GetSharedHandle, ID3D11Device::OpenSharedResource) ------------------------------------------------------------------------ */
+
+/* A texture of `color` made with `misc` (SHARED or SHARED_KEYEDMUTEX, without NTHANDLE), cleared on `dev`. */
+static ID3D11Texture2D *legacy_texture(ID3D11Device *dev, ID3D11DeviceContext *ctx, UINT misc, const float color[4]) {
+  D3D11_TEXTURE2D_DESC td = {4, 4, 1, 1, DXGI_FORMAT_R8G8B8A8_UNORM, {1, 0}, D3D11_USAGE_DEFAULT, D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET, 0, misc};
+  ID3D11Texture2D *tex = NULL;
+  CHECK_HR(ID3D11Device_CreateTexture2D(dev, &td, NULL, &tex));
+  if (!tex) return NULL;
+  ID3D11RenderTargetView *rtv = NULL;
+  CHECK_HR(ID3D11Device_CreateRenderTargetView(dev, (ID3D11Resource *)tex, NULL, &rtv));
+  if (rtv) { ID3D11DeviceContext_ClearRenderTargetView(ctx, rtv, color); ID3D11RenderTargetView_Release(rtv); }
+  ID3D11DeviceContext_Flush(ctx);
+  return tex;
+}
+static HANDLE legacy_handle(void *texture) {
+  IDXGIResource *r = NULL;
+  HANDLE h = NULL;
+  CHECK_HR(IUnknown_QueryInterface((IUnknown *)texture, &IID_IDXGIResource, (void **)&r));
+  if (r) { CHECK_HR(IDXGIResource_GetSharedHandle(r, &h)); IDXGIResource_Release(r); }
+  return h;
+}
+
+static void test_legacy(D12 *a) {
+  ID3D11Device *x = NULL, *y = NULL;
+  ID3D11DeviceContext *cx = NULL, *cy = NULL;
+  CHECK_HR(D3D11CreateDevice(NULL, D3D_DRIVER_TYPE_HARDWARE, NULL, 0, NULL, 0, D3D11_SDK_VERSION, &x, NULL, &cx));
+  CHECK_HR(D3D11CreateDevice(NULL, D3D_DRIVER_TYPE_HARDWARE, NULL, 0, NULL, 0, D3D11_SDK_VERSION, &y, NULL, &cy));
+  if (!x || !y) return;
+  const float red[4] = {1, 0, 0, 1}, blue[4] = {0, 0, 1, 1};
+  ID3D11Texture2D *tex = legacy_texture(x, cx, D3D11_RESOURCE_MISC_SHARED, red);
+  if (!tex) return;
+  const HANDLE handle = legacy_handle(tex);
+  CHECK(handle != NULL);
+  /* (a shared texture must be in GPU memory; one made for NT handles has no legacy handle, and the other way round) */
+  D3D11_TEXTURE2D_DESC staging = {4, 4, 1, 1, DXGI_FORMAT_R8G8B8A8_UNORM, {1, 0}, D3D11_USAGE_STAGING, 0, D3D11_CPU_ACCESS_READ, D3D11_RESOURCE_MISC_SHARED};
+  ID3D11Texture2D *bad = NULL;
+  CHECK(ID3D11Device_CreateTexture2D(x, &staging, NULL, &bad) == E_INVALIDARG && !bad);
+  IDXGIResource1 *r1 = NULL;
+  HANDLE none = NULL;
+  CHECK_HR(ID3D11Texture2D_QueryInterface(tex, &IID_IDXGIResource1, (void **)&r1));
+  if (r1) { CHECK(IDXGIResource1_CreateSharedHandle(r1, NULL, DXGI_SHARED_RESOURCE_READ, NULL, &none) == E_INVALIDARG && !none); IDXGIResource1_Release(r1); }
+  D3D11_TEXTURE2D_DESC nt = {4, 4, 1, 1, DXGI_FORMAT_R8G8B8A8_UNORM, {1, 0}, D3D11_USAGE_DEFAULT, D3D11_BIND_SHADER_RESOURCE, 0, D3D11_RESOURCE_MISC_SHARED | D3D11_RESOURCE_MISC_SHARED_NTHANDLE};
+  ID3D11Texture2D *nt_tex = NULL;
+  HANDLE nt_handle = NULL;
+  CHECK_HR(ID3D11Device_CreateTexture2D(x, &nt, NULL, &nt_tex));
+  if (nt_tex) {
+    IDXGIResource1 *nr = NULL;
+    CHECK_HR(ID3D11Texture2D_QueryInterface(nt_tex, &IID_IDXGIResource1, (void **)&nr));
+    if (nr) {
+      CHECK(IDXGIResource1_GetSharedHandle(nr, &none) == DXGI_ERROR_INVALID_CALL && !none);
+      CHECK_HR(IDXGIResource1_CreateSharedHandle(nr, NULL, DXGI_SHARED_RESOURCE_READ, NULL, &nt_handle));
+      IDXGIResource1_Release(nr);
+    }
+  }
+
+  /* The other device opens it by that handle: the same texture, which knows the same handle. */
+  ID3D11Texture2D *opened = NULL, *wrong = NULL;
+  CHECK_HR(ID3D11Device_OpenSharedResource(y, handle, &IID_ID3D11Texture2D, (void **)&opened));
+  if (opened) {
+    D3D11_TEXTURE2D_DESC got;
+    ID3D11Texture2D_GetDesc(opened, &got);
+    CHECK(got.Width == 4 && got.MiscFlags == D3D11_RESOURCE_MISC_SHARED && got.BindFlags == (D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET));
+    CHECK(texel_of(y, cy, opened) == 0xFF0000FFu);
+    CHECK(legacy_handle(opened) == handle);
+    /* (what the second device draws, the first sees) */
+    ID3D11RenderTargetView *rtv = NULL;
+    CHECK_HR(ID3D11Device_CreateRenderTargetView(y, (ID3D11Resource *)opened, NULL, &rtv));
+    if (rtv) { ID3D11DeviceContext_ClearRenderTargetView(cy, rtv, blue); ID3D11RenderTargetView_Release(rtv); }
+    ID3D11DeviceContext_Flush(cy);
+    CHECK(texel_of(x, cx, tex) == 0xFFFF0000u);
+  }
+  ID3D11Device1 *y1 = NULL;
+  CHECK_HR(ID3D11Device_QueryInterface(y, &IID_ID3D11Device1, (void **)&y1));
+  if (y1) { CHECK(ID3D11Device1_OpenSharedResource1(y1, handle, &IID_ID3D11Texture2D, (void **)&wrong) == E_INVALIDARG && !wrong); ID3D11Device1_Release(y1); }      /* (NT handles only) */
+  if (nt_handle) CHECK(ID3D11Device_OpenSharedResource(y, nt_handle, &IID_ID3D11Texture2D, (void **)&wrong) == E_INVALIDARG && !wrong);      /* (legacy handles only) */
+  CHECK(ID3D11Device_OpenSharedResource(y, (HANDLE)(UINT_PTR)0x7FFFFFF0u, &IID_ID3D11Texture2D, (void **)&wrong) == E_INVALIDARG && !wrong);
+  /* Direct3D 12 opens the legacy handle too */
+  ID3D12Resource *as12 = NULL;
+  CHECK_HR(ID3D12Device_OpenSharedHandle(a->dev, handle, &IID_ID3D12Resource, (void **)&as12));
+  if (as12) {
+    const D3D12_RESOURCE_DESC rd = ID3D12Resource_GetDesc(as12);
+    CHECK(rd.Width == 4 && rd.Height == 4);
+    ID3D12Resource_Release(as12);
+  }
+
+  /* A legacy share with a keyed mutex: the mutex comes with the texture. */
+  ID3D11Texture2D *ktex = legacy_texture(x, cx, D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX, red), *kopened = NULL;
+  HANDLE kh = ktex ? legacy_handle(ktex) : NULL;
+  if (kh) CHECK_HR(ID3D11Device_OpenSharedResource(y, kh, &IID_ID3D11Texture2D, (void **)&kopened));
+  IDXGIKeyedMutex *kx = ktex ? mutex_of(ktex) : NULL, *ky = kopened ? mutex_of(kopened) : NULL;
+  if (kx && ky) {
+    CHECK(IDXGIKeyedMutex_AcquireSync(kx, 0, 0) == S_OK);
+    CHECK(IDXGIKeyedMutex_AcquireSync(ky, 0, 0) == WAIT_TIMEOUT);
+    CHECK(IDXGIKeyedMutex_ReleaseSync(kx, 3) == S_OK);
+    CHECK(IDXGIKeyedMutex_AcquireSync(ky, 3, 1000) == S_OK);
+    CHECK(texel_of(y, cy, kopened) == 0xFF0000FFu);
+    CHECK(IDXGIKeyedMutex_ReleaseSync(ky, 0) == S_OK);
+  }
+  if (kx) IDXGIKeyedMutex_Release(kx);
+  if (ky) IDXGIKeyedMutex_Release(ky);
+  if (kopened) ID3D11Texture2D_Release(kopened);
+  if (ktex) ID3D11Texture2D_Release(ktex);
+  if (nt_handle) CloseHandle(nt_handle);
+  if (nt_tex) ID3D11Texture2D_Release(nt_tex);
+  if (opened) ID3D11Texture2D_Release(opened);
+  ID3D11Texture2D_Release(tex);
+  ID3D11DeviceContext_Release(cx);
+  ID3D11DeviceContext_Release(cy);
+  ID3D11Device_Release(x);
+  ID3D11Device_Release(y);
+}
+
 /* ---- two processes ------------------------------------------------------------------------------------------------------------------------------------------------ */
 /* The parent shares a buffer and a fence, starts this program again with the two handles inherited, and waits for the fence: the child checks the buffer holds the
  * parent's words, writes its own after them and signals the fence with 2; the parent then reads the child's words. A texture with a keyed mutex goes along: the
@@ -629,7 +741,19 @@ static void child_keyed(HANDLE texture_handle) {
   ID3D11DeviceContext_Release(ctx);
   ID3D11Device_Release(dev);
 }
-static int child(HANDLE buffer_handle, HANDLE fence_handle, HANDLE texture_handle) {
+/* The parent's legacy shared texture (a global share handle: the same number in every process), drawn yellow. */
+static void child_legacy(HANDLE legacy) {
+  ID3D11Device *dev = NULL;
+  ID3D11DeviceContext *ctx = NULL;
+  ID3D11Texture2D *tex = NULL;
+  CHECK_HR(D3D11CreateDevice(NULL, D3D_DRIVER_TYPE_HARDWARE, NULL, 0, NULL, 0, D3D11_SDK_VERSION, &dev, NULL, &ctx));
+  if (!dev) return;
+  CHECK_HR(ID3D11Device_OpenSharedResource(dev, legacy, &IID_ID3D11Texture2D, (void **)&tex));
+  if (tex) { CHECK(texel_of(dev, ctx, tex) == 0xFF00FFFFu); ID3D11Texture2D_Release(tex); }
+  ID3D11DeviceContext_Release(ctx);
+  ID3D11Device_Release(dev);
+}
+static int child(HANDLE buffer_handle, HANDLE fence_handle, HANDLE texture_handle, HANDLE legacy) {
   D12 c;
   if (!d12_make(&c)) { printf("child: no device\n"); return 1; }
   ID3D12Resource *shared = NULL;
@@ -649,6 +773,7 @@ static int child(HANDLE buffer_handle, HANDLE fence_handle, HANDLE texture_handl
   if (fence) ID3D12Fence_Release(fence);
   d12_free(&c);
   if (texture_handle) child_keyed(texture_handle);
+  if (legacy) child_legacy(legacy);
   printf("d3dsharetest child: %d checks, %d failed\n", checks, failed);
   return failed ? 1 : 0;
 }
@@ -682,10 +807,18 @@ static void test_processes(D12 *a) {
     if (dres) { CHECK_HR(IDXGIResource1_CreateSharedHandle(dres, &inherit, DXGI_SHARED_RESOURCE_READ | DXGI_SHARED_RESOURCE_WRITE, NULL, &ht)); IDXGIResource1_Release(dres); }
     if (km) { CHECK(IDXGIKeyedMutex_AcquireSync(km, 0, 0) == S_OK); CHECK(IDXGIKeyedMutex_ReleaseSync(km, 1) == S_OK); }
   }
-  WCHAR self[MAX_PATH], line[MAX_PATH + 96];
+  /* (and a legacy shared texture, yellow: its handle is a number every process opens) */
+  ID3D11Texture2D *legacy_tex = NULL;
+  HANDLE hl = NULL;
+  if (x) {
+    const float yellow[4] = {1, 1, 0, 1};
+    legacy_tex = legacy_texture(x, cx, D3D11_RESOURCE_MISC_SHARED, yellow);
+    if (legacy_tex) hl = legacy_handle(legacy_tex);
+  }
+  WCHAR self[MAX_PATH], line[MAX_PATH + 128];
   GetModuleFileNameW(NULL, self, MAX_PATH);
-  swprintf(line, sizeof line / sizeof line[0], L"\"%ls\" child %llu %llu %llu", self, (unsigned long long)(UINT_PTR)hb, (unsigned long long)(UINT_PTR)hf,
-           (unsigned long long)(UINT_PTR)ht);
+  swprintf(line, sizeof line / sizeof line[0], L"\"%ls\" child %llu %llu %llu %llu", self, (unsigned long long)(UINT_PTR)hb, (unsigned long long)(UINT_PTR)hf,
+           (unsigned long long)(UINT_PTR)ht, (unsigned long long)(UINT_PTR)hl);
   STARTUPINFOW si;
   PROCESS_INFORMATION pi;
   memset(&si, 0, sizeof si);
@@ -716,6 +849,7 @@ static void test_processes(D12 *a) {
   CloseHandle(hf);
   if (ht) CloseHandle(ht);
   if (km) IDXGIKeyedMutex_Release(km);
+  if (legacy_tex) ID3D11Texture2D_Release(legacy_tex);
   if (tex) ID3D11Texture2D_Release(tex);
   if (cx) ID3D11DeviceContext_Release(cx);
   if (x) ID3D11Device_Release(x);
@@ -724,8 +858,9 @@ static void test_processes(D12 *a) {
 }
 
 int main(int argc, char **argv) {
-  if (argc == 5 && strcmp(argv[1], "child") == 0)
-    return child((HANDLE)(UINT_PTR)_strtoui64(argv[2], NULL, 10), (HANDLE)(UINT_PTR)_strtoui64(argv[3], NULL, 10), (HANDLE)(UINT_PTR)_strtoui64(argv[4], NULL, 10));
+  if (argc == 6 && strcmp(argv[1], "child") == 0)
+    return child((HANDLE)(UINT_PTR)_strtoui64(argv[2], NULL, 10), (HANDLE)(UINT_PTR)_strtoui64(argv[3], NULL, 10), (HANDLE)(UINT_PTR)_strtoui64(argv[4], NULL, 10),
+                 (HANDLE)(UINT_PTR)_strtoui64(argv[5], NULL, 10));
   const int processes = argc > 1 && strcmp(argv[1], "processes") == 0;
   D12 a, b;
   if (!d12_make(&a) || !d12_make(&b)) {
@@ -739,6 +874,7 @@ int main(int argc, char **argv) {
   test_d3d11(&a);
   test_kmt_direct(&a);
   test_keyed_mutex();
+  test_legacy(&a);
   if (processes) test_processes(&a);
   d12_free(&a);
   d12_free(&b);

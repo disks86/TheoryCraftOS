@@ -60,11 +60,15 @@ static HRESULT STDMETHODCALLTYPE dres_SetPrivateDataInterface(IDXGIResource1 *p,
 static HRESULT STDMETHODCALLTYPE dres_GetPrivateData(IDXGIResource1 *p, REFGUID g, UINT *size, void *data) { return dx_GetPrivateData(OBJ(tex_of_dxgi_res(p)), g, size, data); }
 static HRESULT STDMETHODCALLTYPE dres_GetParent(IDXGIResource1 *p, REFIID riid, void **out) { return dev_QueryInterface(tex_of_dxgi_res(p)->c.dev, riid, out); }
 static HRESULT STDMETHODCALLTYPE dres_GetDevice(IDXGIResource1 *p, REFIID riid, void **out) { return dev_QueryInterface(tex_of_dxgi_res(p)->c.dev, riid, out); }
+/* The legacy shared handle of a texture made SHARED or SHARED_KEYEDMUTEX without NTHANDLE (or opened by one): its global share handle, which OpenSharedResource of any
+ * device - in any process - opens. Any other texture has none. */
 static HRESULT STDMETHODCALLTYPE dres_GetSharedHandle(IDXGIResource1 *p, HANDLE *handle) {
-  (void)p;
+  Tex *t = tex_of_dxgi_res(p);
   if (!handle) return E_INVALIDARG;
   *handle = NULL;
-  return DXGI_ERROR_UNSUPPORTED;      /* (no texture is shared with another device here) */
+  if (!t->global_share) return DXGI_ERROR_INVALID_CALL;
+  *handle = (HANDLE)(UINT_PTR)t->global_share;
+  return S_OK;
 }
 static HRESULT STDMETHODCALLTYPE dres_GetUsage(IDXGIResource1 *p, DXGI_USAGE *usage) {
   if (!usage) return E_INVALIDARG;

@@ -124,6 +124,19 @@ EXPORT UINT WINAPI TcosD3D12SharedResource(ID3D12Resource *resource) {
   Resource *r = (Resource *)resource;
   return r && r->d.o.lpVtbl == (const void *)&res_vtbl ? r->kresource : 0;
 }
+EXPORT UINT WINAPI TcosD3D12GlobalShare(ID3D12Resource *resource) {
+  extern const ID3D12Resource2Vtbl res_vtbl;
+  Resource *r = (Resource *)resource;
+  return r && r->d.o.lpVtbl == (const void *)&res_vtbl ? r->global_share : 0;
+}
+EXPORT HRESULT WINAPI TcosD3D12OpenShared(ID3D12Device *device, HANDLE handle, int global, REFIID riid, void **out) {
+  if (out) *out = NULL;
+  if (!device || !handle || !riid || !out) return E_INVALIDARG;
+  IUnknown *made = NULL;
+  const HRESULT hr = open_shared((Dev *)device, (UINT64)(UINT_PTR)handle, global ? SHARED_GLOBAL : SHARED_NT, &made);
+  if (FAILED(hr)) return hr;
+  return query_out(made, riid, out);
+}
 EXPORT void WINAPI TcosD3D12BeginQueryKind(ID3D12GraphicsCommandList *list, ID3D12QueryHeap *heap, UINT index, UINT kind) {
   if (list) list_begin_query_kind((CmdList *)list, (QHeap *)heap, index, kind);
 }

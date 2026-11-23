@@ -417,7 +417,8 @@ made `D3D12_FENCE_FLAG_SHARED` gets NT handles from `CreateSharedHandle` (`GENER
 with up to 64 bytes for the runtime above: d3d11.dll's texture description through `TcosD3D12ShareExtra` / `TcosD3D12SharedExtra`), a heap (placed resources in it on
 both sides alias the same memory) or a fence on any device of the adapter, in this process or another; `OpenSharedHandleByName` finds the handle. d3d11.dll shares
 `D3D11_RESOURCE_MISC_SHARED_NTHANDLE` textures with `IDXGIResource1::CreateSharedHandle` and opens them, and Direct3D 12's, with `OpenSharedResource1` /
-`OpenSharedResourceByName`. Tested by tests/windows/d3dsharetest.c (two devices on the emulator; `ARGS=processes tests/d3d12_qemu.sh d3dsharetest` also a second process
+`OpenSharedResourceByName`. `OpenSharedHandle` also opens the legacy (global share) handles d3d11.dll's `GetSharedHandle` gives (resources made with the private
+option `TCOS_RESOURCE_GLOBAL_SHARE`; `TcosD3D12OpenShared` takes one kind only). Tested by tests/windows/d3dsharetest.c (two devices on the emulator; `ARGS=processes tests/d3d12_qemu.sh d3dsharetest` also a second process
 that inherits the handles).
 
 **The later interfaces** (`ID3D12Device1` .. `ID3D12Device10`, `ID3D12GraphicsCommandList1` .. `7`, `ID3D12Fence1`, `ID3D12Resource2`, `ID3D12Heap1`; every vtable slot
@@ -448,7 +449,7 @@ Not done, in the order a program is likely to meet them: texture formats of fewe
 kernel refuses the combination); rendering into a mip level or an array layer; unordered access to textures (and so `ClearUnorderedAccessView*` of a texture); depth bias
 and back-face stencil state; dual-source blending (`SRC1_*` factors: the pipeline is refused with `DXGI_ERROR_UNSUPPORTED`); several viewports; more than four unordered
 access buffers; pipeline statistics queries from the DLL; shared resources across adapters (`D3D12_HEAP_FLAG_SHARED_CROSS_ADAPTER`,
-`D3D12_FENCE_FLAG_SHARED_CROSS_ADAPTER`: `DXGI_ERROR_UNSUPPORTED`) and legacy (non-NT) shared handles in the DLLs; the blend factor on Vega and the other fixed backends; ray tracing,
+`D3D12_FENCE_FLAG_SHARED_CROSS_ADAPTER`: `DXGI_ERROR_UNSUPPORTED`); the blend factor on Vega and the other fixed backends; ray tracing,
 mesh shaders, variable rate shading, view instancing, sampler feedback, protected sessions and meta commands (reported unsupported); `ResolveSubresourceRegion` into a
 subresource other than 0 and the least / greatest colour resolves on virgl (its resolves are averages: the call is left out there); typed UAV clears of formats outside
 `g_uav_formats` (R11G11B10, B5G6R5 ...); root signature version 1.2 and the pipeline-stream subobjects of the later Agility SDKs (`DEPTH_STENCIL2`, `RASTERIZER1/2`,

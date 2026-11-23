@@ -57,12 +57,20 @@ void WINAPI TcosD3D12StageConstantBases(struct ID3D12Device *device, UINT geomet
  *                        only by its views; the kernel's allocation has to know when it is made (Direct3D 11's D3D11_RESOURCE_MISC_TEXTURECUBE, Direct3D 9's
  *                        cube textures). */
 #define TCOS_RESOURCE_CUBE 1u
+/*   TCOS_RESOURCE_GLOBAL_SHARE  the resource is shared with a global share handle (D3DKMT's CreateShared; TcosD3D12GlobalShare returns it): the legacy shared handles
+ *                        of IDXGIResource::GetSharedHandle, which Direct3D 12 itself does not make (its OpenSharedHandle opens them). */
+#define TCOS_RESOURCE_GLOBAL_SHARE 2u
 void WINAPI TcosD3D12ResourceOptions(struct ID3D12Device *device, UINT flags);
 /* What the next resource made D3D12_HEAP_FLAG_SHARED carries for the runtime above (at most 64 bytes), and what a shared or opened resource carries (its size). */
 void WINAPI TcosD3D12ShareExtra(struct ID3D12Device *device, const void *data, UINT size);
 UINT WINAPI TcosD3D12SharedExtra(struct ID3D12Resource *resource, void *out, UINT capacity);
 /* The win32k resource (a D3DKMT handle) of a shared resource, which D3DKMTShareObjects takes (0: not shared). */
 UINT WINAPI TcosD3D12SharedResource(struct ID3D12Resource *resource);
+/* The global share handle of a resource made TCOS_RESOURCE_GLOBAL_SHARE or opened by one (0: none). */
+UINT WINAPI TcosD3D12GlobalShare(struct ID3D12Resource *resource);
+/* Opens a shared handle as OpenSharedHandle does, but only an NT handle (`global` 0) or only a global share handle (`global` 1): what d3d11.dll's
+ * OpenSharedResource1 and OpenSharedResource each take. */
+HRESULT WINAPI TcosD3D12OpenShared(struct ID3D12Device *device, HANDLE handle, int global, REFIID riid, void **out);
 /* Begins a query of one of the kernel's kinds (graphics::QueryKind, docs/Direct3DKernelMode.md "More queries": 0 occlusion count, 1 occlusion predicate, 5 pixel
  * shader invocations, 8 | stream << 8 stream output primitives needed, ...) in slot `index` of an occlusion query heap; ID3D12GraphicsCommandList::EndQuery with
  * D3D12_QUERY_TYPE_OCCLUSION ends it, and ResolveQueryData gives its 64-bit result. One query is open at a time. */

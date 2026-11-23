@@ -87,7 +87,10 @@ float, D32_FLOAT_S8X24_UINT in D24S8 (with its stencil, 24 bits of depth). R24G8
 - Shared resources: textures made `D3D11_RESOURCE_MISC_SHARED_NTHANDLE` (with `SHARED` or `SHARED_KEYEDMUTEX`) are shared through NT handles
   (`IDXGIResource1::CreateSharedHandle`, `ID3D11Device1::OpenSharedResource1` / `OpenSharedResourceByName`, over d3d12.dll's shared resources). A texture made
   `SHARED_KEYEDMUTEX` has an `IDXGIKeyedMutex` (win32k's keyed mutex, shared with the texture's NT handle): `AcquireSync` (WAIT_TIMEOUT, WAIT_ABANDONED,
-  DXGI_ERROR_INVALID_CALL when held already), `ReleaseSync` (sends what the device recorded first). Not there: the legacy handles of `IDXGIResource::GetSharedHandle` / `OpenSharedResource` (`DXGI_ERROR_UNSUPPORTED`, `E_INVALIDARG`), shared fences
+  DXGI_ERROR_INVALID_CALL when held already), `ReleaseSync` (sends what the device recorded first). Textures made `SHARED` or `SHARED_KEYEDMUTEX` without `NTHANDLE`
+  have legacy handles: `IDXGIResource::GetSharedHandle` answers the global share handle (one number for every process; DXGI_ERROR_INVALID_CALL for a texture that has
+  none), `ID3D11Device::OpenSharedResource` opens it (legacy handles only: `OpenSharedResource1` takes NT handles), with the keyed mutex's own global handle carried
+  in the share's description. The legacy share ends with its creator's texture (Windows keeps it while an opener has it). Not there: shared fences
   (`ID3D11Device5` is not made).
 - A draw with no render target, no depth buffer and no stream output (unordered access only) is not made: the kernel's passes need a target.
 - Vertex formats other than 32-bit floats and the two 8-bit colour formats; an instance step rate other than 1.

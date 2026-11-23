@@ -54,6 +54,7 @@ struct Resource {
   int cpu_texture;             /* a texture of a custom heap the CPU sees: WriteToSubresource / ReadFromSubresource lock the kernel's image */
   UINT kresource;              /* made D3D12_HEAP_FLAG_SHARED (or opened from an NT handle): win32k's resource, what CreateSharedHandle shares */
   BYTE share_extra[64];        /* ... and what it carries for the runtime above (TcosD3D12ShareExtra / TcosD3D12SharedExtra) */
+  UINT global_share;           /* made TCOS_RESOURCE_GLOBAL_SHARE (or opened by one): its global share handle, the runtime above's legacy shared handle */
   UINT share_extra_size;
   int reserved;                /* a tiled resource: the tiles are mapped to heaps with UpdateTileMappings */
   TileBind *tile_map;          /* ... and where each tile is, as UpdateTileMappings left it (CopyTileMappings copies from here) */
@@ -360,6 +361,7 @@ static HRESULT resource_make_from(Dev *dev, const D3D12_HEAP_PROPERTIES *props, 
   const int reserved = mode == 2;
   if (!reserved && desc->Layout != D3D12_TEXTURE_LAYOUT_UNKNOWN && desc->Layout != D3D12_TEXTURE_LAYOUT_ROW_MAJOR) return E_INVALIDARG;
   const int cube = (dev->next_resource_flags & TCOS_RESOURCE_CUBE) != 0;
+  const int global_share = (dev->next_resource_flags & TCOS_RESOURCE_GLOBAL_SHARE) != 0;
   dev->next_resource_flags = 0;      /* (the options were for this resource) */
   Resource *r = dobj_new(sizeof *r, dev, &res_vtbl, g_resource_iids, resource_destroy);
   if (!r) return E_OUTOFMEMORY;
@@ -446,7 +448,7 @@ static HRESULT resource_make_from(Dev *dev, const D3D12_HEAP_PROPERTIES *props, 
     r->kresource = source->kresource;
     r->bytes = source->bytes;
     st = 0;
-  } else if (!heap && (hflags & (D3D12_HEAP_FLAG_SHARED | D3D12_HEAP_FLAG_SHARED_CROSS_ADAPTER))) {
+  } else if (!heap && (global_share || (hflags & (D3D12_HEAP_FLAG_SHARED | D3D12_HEAP_FLAG_SHARED_CROSS_ADAPTER)))) {
     /* (a committed resource: a placed one is shared with its heap, whose flags it has) */
     if (hflags & D3D12_HEAP_FLAG_SHARED_CROSS_ADAPTER) { hr = DXGI_ERROR_UNSUPPORTED; goto fail; }      /* (the kernel has no allocations of two adapters) */
     if (cpu || r->cpu_texture || reserved || !props) { hr = E_INVALIDARG; goto fail; }
@@ -463,7 +465,9 @@ static HRESULT resource_make_from(Dev *dev, const D3D12_HEAP_PROPERTIES *props, 
     r->share_extra_size = sd.extra_size;
     BYTE blob[SHARE_DESC_BYTES];
     share_desc_write(blob, &sd);
-    st = kmt_create_allocation_ex(dev->kdev, &ad, blob, sizeof blob, &r->kresource, &r->alloc, &pitch, &r->bytes);
+    /* (an NT-handle share - D3D12_HEAP_FLAG_SHARED - or, asked for alone, one with a global share handle) */
+    st = kmt_create_allocation_shared(dev->kdev, &ad, blob, sizeof blob, &r->kresource, global_share && !(hflags & D3D12_HEAP_FLAG_SHARED) ? &r->global_share : NULL, &r->alloc,
+                                      &pitch, &r->bytes);
   } else {
     st = kmt_create_allocation(dev->kdev, &ad, &r->alloc, &pitch, &r->bytes);
   }

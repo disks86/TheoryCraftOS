@@ -25,4 +25,6 @@ TcosD3D12ResourceOptions
 TcosD3D12ShareExtra
 TcosD3D12SharedExtra
 TcosD3D12SharedResource
+TcosD3D12GlobalShare
+TcosD3D12OpenShared
 TcosD3D12BeginQueryKind
