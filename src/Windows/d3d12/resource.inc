@@ -31,6 +31,7 @@ typedef struct HeapObj {
   DObj d;
   D3D12_HEAP_DESC desc;
   UINT alloc;
+  UINT kresource;              /* made D3D12_HEAP_FLAG_SHARED (or opened from an NT handle): win32k's resource, what CreateSharedHandle shares */
 } HeapObj;
 
 struct Resource {
@@ -51,6 +52,9 @@ struct Resource {
   UINT64 sum;                  /* of the shadow as the kernel has it */
   int pushed;
   int cpu_texture;             /* a texture of a custom heap the CPU sees: WriteToSubresource / ReadFromSubresource lock the kernel's image */
+  UINT kresource;              /* made D3D12_HEAP_FLAG_SHARED (or opened from an NT handle): win32k's resource, what CreateSharedHandle shares */
+  BYTE share_extra[64];        /* ... and what it carries for the runtime above (TcosD3D12ShareExtra / TcosD3D12SharedExtra) */
+  UINT share_extra_size;
   int reserved;                /* a tiled resource: the tiles are mapped to heaps with UpdateTileMappings */
   TileBind *tile_map;          /* ... and where each tile is, as UpdateTileMappings left it (CopyTileMappings copies from here) */
   UINT tile_count;
@@ -253,8 +257,93 @@ static int heap_cpu_access(const D3D12_HEAP_PROPERTIES *p, int *upload, int *rea
   }
 }
 
+/* ---- what a shared resource or heap tells the process that opens it ------------------------------------------------------------------------------------------- */
+/* The runtime data of win32k's resource (D3DKMT's PrivateRuntimeData): magic "TCOSD12S", version, kind (0 a resource, 1 a heap), then the description, the heap
+ * properties and flags, the heap's size and alignment, and whether the texture is a cube - every field at a fixed offset, the same in both widths (a 32-bit and a
+ * 64-bit program share them). */
+#define SHARE_DESC_BYTES 192      /* (the fixed part, then at 128 up to 64 bytes of the runtime above: its size at 116) */
+static const char g_share_magic[8] = {'T', 'C', 'O', 'S', 'D', '1', '2', 'S'};
+typedef struct ShareDesc {
+  UINT kind;
+  D3D12_RESOURCE_DESC desc;
+  D3D12_HEAP_PROPERTIES props;
+  D3D12_HEAP_FLAGS flags;
+  UINT64 heap_size, heap_alignment;
+  UINT cube;
+  UINT extra_size;
+  BYTE extra[64];
+} ShareDesc;
+static void share_desc_write(BYTE out[SHARE_DESC_BYTES], const ShareDesc *s) {
+  memset(out, 0, SHARE_DESC_BYTES);
+  memcpy(out, g_share_magic, 8);
+  KPUT32(out, 8, 1);
+  KPUT32(out, 12, s->kind);
+  KPUT32(out, 16, s->desc.Dimension);
+  KPUT64(out, 24, s->desc.Alignment);
+  KPUT64(out, 32, s->desc.Width);
+  KPUT32(out, 40, s->desc.Height);
+  KPUT32(out, 44, (UINT)s->desc.DepthOrArraySize | ((UINT)s->desc.MipLevels << 16));
+  KPUT32(out, 48, s->desc.Format);
+  KPUT32(out, 52, s->desc.SampleDesc.Count);
+  KPUT32(out, 56, s->desc.SampleDesc.Quality);
+  KPUT32(out, 60, s->desc.Layout);
+  KPUT32(out, 64, s->desc.Flags);
+  KPUT32(out, 68, s->props.Type);
+  KPUT32(out, 72, s->props.CPUPageProperty);
+  KPUT32(out, 76, s->props.MemoryPoolPreference);
+  KPUT32(out, 80, s->props.CreationNodeMask);
+  KPUT32(out, 84, s->props.VisibleNodeMask);
+  KPUT32(out, 88, s->flags);
+  KPUT64(out, 96, s->heap_size);
+  KPUT64(out, 104, s->heap_alignment);
+  KPUT32(out, 112, s->cube);
+  KPUT32(out, 116, s->extra_size);
+  memcpy(out + 128, s->extra, s->extra_size <= 64 ? s->extra_size : 64);
+}
+static int share_desc_read(const BYTE *in, UINT size, ShareDesc *s) {
+  if (size != SHARE_DESC_BYTES || memcmp(in, g_share_magic, 8) != 0 || KGET32(in, 8) != 1 || KGET32(in, 12) > 1) return 0;
+  memset(s, 0, sizeof *s);
+  s->kind = KGET32(in, 12);
+  s->desc.Dimension = (D3D12_RESOURCE_DIMENSION)KGET32(in, 16);
+  s->desc.Alignment = KGET64(in, 24);
+  s->desc.Width = KGET64(in, 32);
+  s->desc.Height = KGET32(in, 40);
+  s->desc.DepthOrArraySize = (UINT16)KGET32(in, 44);
+  s->desc.MipLevels = (UINT16)(KGET32(in, 44) >> 16);
+  s->desc.Format = (DXGI_FORMAT)KGET32(in, 48);
+  s->desc.SampleDesc.Count = KGET32(in, 52);
+  s->desc.SampleDesc.Quality = KGET32(in, 56);
+  s->desc.Layout = (D3D12_TEXTURE_LAYOUT)KGET32(in, 60);
+  s->desc.Flags = (D3D12_RESOURCE_FLAGS)KGET32(in, 64);
+  s->props.Type = (D3D12_HEAP_TYPE)KGET32(in, 68);
+  s->props.CPUPageProperty = (D3D12_CPU_PAGE_PROPERTY)KGET32(in, 72);
+  s->props.MemoryPoolPreference = (D3D12_MEMORY_POOL)KGET32(in, 76);
+  s->props.CreationNodeMask = KGET32(in, 80);
+  s->props.VisibleNodeMask = KGET32(in, 84);
+  s->flags = (D3D12_HEAP_FLAGS)KGET32(in, 88);
+  s->heap_size = KGET64(in, 96);
+  s->heap_alignment = KGET64(in, 104);
+  s->cube = KGET32(in, 112);
+  s->extra_size = KGET32(in, 116);
+  if (s->extra_size > 64) return 0;
+  memcpy(s->extra, in + 128, s->extra_size);
+  return 1;
+}
+/* Whether heap properties are of memory the CPU sees (a shared heap may not be: Direct3D 12 shares GPU memory). */
+static int heap_cpu_visible(const D3D12_HEAP_PROPERTIES *p) {
+  return p->Type == D3D12_HEAP_TYPE_UPLOAD || p->Type == D3D12_HEAP_TYPE_READBACK || (p->Type == D3D12_HEAP_TYPE_CUSTOM && p->CPUPageProperty != D3D12_CPU_PAGE_PROPERTY_NOT_AVAILABLE);
+}
+
+/* A resource made around an allocation another process made (OpenSharedHandle): its handles and backing size. */
+typedef struct ResourceSource { UINT alloc, kresource; UINT64 bytes; } ResourceSource;
+static HRESULT resource_make_from(Dev *dev, const D3D12_HEAP_PROPERTIES *props, D3D12_HEAP_FLAGS hflags, const D3D12_RESOURCE_DESC *desc, HeapObj *heap, UINT64 heap_offset,
+                                  int mode, const ResourceSource *source, Resource **out);
 static HRESULT resource_make(Dev *dev, const D3D12_HEAP_PROPERTIES *props, D3D12_HEAP_FLAGS hflags, const D3D12_RESOURCE_DESC *desc, HeapObj *heap, UINT64 heap_offset, int mode,
                              Resource **out) {
+  return resource_make_from(dev, props, hflags, desc, heap, heap_offset, mode, NULL, out);
+}
+static HRESULT resource_make_from(Dev *dev, const D3D12_HEAP_PROPERTIES *props, D3D12_HEAP_FLAGS hflags, const D3D12_RESOURCE_DESC *desc, HeapObj *heap, UINT64 heap_offset,
+                                  int mode, const ResourceSource *source, Resource **out) {
   extern const ID3D12Resource2Vtbl res_vtbl;
   KmtAllocDesc ad;
   memset(&ad, 0, sizeof ad);
@@ -348,7 +437,36 @@ static HRESULT resource_make(Dev *dev, const D3D12_HEAP_PROPERTIES *props, D3D12
     r->tile_map = mem_alloc((SIZE_T)layout.total * sizeof(TileBind));
     if (!r->tile_map) { hr = E_OUTOFMEMORY; goto fail; }
   }
-  NTSTATUS st = kmt_create_allocation(dev->kdev, &ad, &r->alloc, &pitch, &r->bytes);
+  /* (shared: a resource of win32k's that NT handles share, with what an opener needs to make the same resource; GPU memory only, committed, not tiled) */
+  NTSTATUS st;
+  const UINT extra_size = dev->next_share_extra_size;
+  dev->next_share_extra_size = 0;      /* (it was for this resource) */
+  if (source) {
+    r->alloc = source->alloc;
+    r->kresource = source->kresource;
+    r->bytes = source->bytes;
+    st = 0;
+  } else if (!heap && (hflags & (D3D12_HEAP_FLAG_SHARED | D3D12_HEAP_FLAG_SHARED_CROSS_ADAPTER))) {
+    /* (a committed resource: a placed one is shared with its heap, whose flags it has) */
+    if (hflags & D3D12_HEAP_FLAG_SHARED_CROSS_ADAPTER) { hr = DXGI_ERROR_UNSUPPORTED; goto fail; }      /* (the kernel has no allocations of two adapters) */
+    if (cpu || r->cpu_texture || reserved || !props) { hr = E_INVALIDARG; goto fail; }
+    ShareDesc sd;
+    memset(&sd, 0, sizeof sd);
+    sd.kind = 0;
+    sd.desc = r->desc;
+    sd.props = *props;
+    sd.flags = hflags;
+    sd.cube = r->kind == 3;
+    sd.extra_size = extra_size <= 64 ? extra_size : 0;
+    memcpy(sd.extra, dev->next_share_extra, sd.extra_size);
+    memcpy(r->share_extra, sd.extra, sd.extra_size);
+    r->share_extra_size = sd.extra_size;
+    BYTE blob[SHARE_DESC_BYTES];
+    share_desc_write(blob, &sd);
+    st = kmt_create_allocation_ex(dev->kdev, &ad, blob, sizeof blob, &r->kresource, &r->alloc, &pitch, &r->bytes);
+  } else {
+    st = kmt_create_allocation(dev->kdev, &ad, &r->alloc, &pitch, &r->bytes);
+  }
   if (!KMT_OK(st)) { hr = hr_from(st); goto fail; }
   if (desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
     r->va = va_register(r, desc->Width);
@@ -404,7 +522,24 @@ static HRESULT STDMETHODCALLTYPE dev_CreateHeap(Dev *This, const D3D12_HEAP_DESC
   memset(&ad, 0, sizeof ad);
   ad.flags = KA_HEAP;
   ad.size = KALIGN(desc->SizeInBytes, 256);
-  const NTSTATUS st = kmt_create_allocation(This->kdev, &ad, &h->alloc, NULL, NULL);
+  NTSTATUS st;
+  if (desc->Flags & D3D12_HEAP_FLAG_SHARED_CROSS_ADAPTER) { dx_Release(OBJ(h)); return DXGI_ERROR_UNSUPPORTED; }
+  if (desc->Flags & D3D12_HEAP_FLAG_SHARED) {
+    /* (a heap other processes open: GPU memory, its description for them) */
+    if (heap_cpu_visible(&desc->Properties)) { dx_Release(OBJ(h)); return E_INVALIDARG; }
+    ShareDesc sd;
+    memset(&sd, 0, sizeof sd);
+    sd.kind = 1;
+    sd.props = desc->Properties;
+    sd.flags = desc->Flags;
+    sd.heap_size = desc->SizeInBytes;
+    sd.heap_alignment = desc->Alignment;
+    BYTE blob[SHARE_DESC_BYTES];
+    share_desc_write(blob, &sd);
+    st = kmt_create_allocation_ex(This->kdev, &ad, blob, sizeof blob, &h->kresource, &h->alloc, NULL, NULL);
+  } else {
+    st = kmt_create_allocation(This->kdev, &ad, &h->alloc, NULL, NULL);
+  }
   if (!KMT_OK(st)) { dx_Release(OBJ(h)); return hr_from(st); }
   return query_out((IUnknown *)h, riid, out);
 }

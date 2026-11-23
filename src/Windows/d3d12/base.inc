@@ -197,6 +197,8 @@ struct Dev {
   UINT next_shader_kind;   /* ... and the kernel's kind of its shaders (0: DXBC / DXIL) */
   UINT next_stage_base[3]; /* TcosD3D12StageConstantBases: ... where the geometry, hull and domain shaders' constant buffers begin */
   UINT next_resource_flags;/* TcosD3D12ResourceOptions: for the next resource made (TCOS_RESOURCE_CUBE) */
+  BYTE next_share_extra[64];      /* TcosD3D12ShareExtra: what the next shared resource carries for the runtime above (d3d11.dll's description) */
+  UINT next_share_extra_size;
   struct Fence *fences;    /* the device's fences (RemoveDevice signals them all) */
   SRWLOCK fence_lock;
   struct ShaderCache *caches;      /* the shader cache sessions open (library.inc), for ShaderCacheControl */

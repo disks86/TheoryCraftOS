@@ -43,7 +43,7 @@ constexpr uint64_t kUnixToNt = 11644473600ull * 10000000ull;
 constexpr uint64_t kCurrentProcess = ~uint64_t{0};
 constexpr uint32_t kMaxWait = 64;
 
-bool is_object_kind(DescriptorKind k) { return k == DescriptorKind::Event || k == DescriptorKind::Mutex || k == DescriptorKind::Semaphore || k == DescriptorKind::Process || k == DescriptorKind::Timer || k == DescriptorKind::Section || k == DescriptorKind::Job || k == DescriptorKind::ChangeNotification || k == DescriptorKind::DebugObject || k == DescriptorKind::Token || k == DescriptorKind::KeyedEvent || k == DescriptorKind::IoCompletion || k == DescriptorKind::Reserve || k == DescriptorKind::ObjectDirectory || k == DescriptorKind::SymbolicLink || k == DescriptorKind::Port; }
+bool is_object_kind(DescriptorKind k) { return k == DescriptorKind::Event || k == DescriptorKind::Mutex || k == DescriptorKind::Semaphore || k == DescriptorKind::Process || k == DescriptorKind::Timer || k == DescriptorKind::Section || k == DescriptorKind::Job || k == DescriptorKind::ChangeNotification || k == DescriptorKind::DebugObject || k == DescriptorKind::Token || k == DescriptorKind::KeyedEvent || k == DescriptorKind::IoCompletion || k == DescriptorKind::Reserve || k == DescriptorKind::ObjectDirectory || k == DescriptorKind::SymbolicLink || k == DescriptorKind::Port || k == DescriptorKind::DxgSharedResource || k == DescriptorKind::DxgSharedSync; }
 DescriptorKind descriptor_kind_of(ObjectKind k) {
   switch (k) {
     case ObjectKind::Event: return DescriptorKind::Event;
@@ -61,6 +61,8 @@ DescriptorKind descriptor_kind_of(ObjectKind k) {
     case ObjectKind::Directory: return DescriptorKind::ObjectDirectory;
     case ObjectKind::SymbolicLink: return DescriptorKind::SymbolicLink;
     case ObjectKind::Port: return DescriptorKind::Port;
+    case ObjectKind::DxgSharedResource: return DescriptorKind::DxgSharedResource;
+    case ObjectKind::DxgSharedSync: return DescriptorKind::DxgSharedSync;
     default: return DescriptorKind::Semaphore;
   }
 }
@@ -236,6 +238,8 @@ bool kind_access(DescriptorKind kind, KindAccess* out) {
     case DescriptorKind::KeyedEvent: *out = {0x1F0003u, {0x20001u, 0x20002u, 0x120000u, 0x1F0003u}}; return true;
     case DescriptorKind::Reserve: *out = {0x1F0001u, {0x20001u, 0x20000u, 0x120000u, 0x1F0001u}}; return true;
     case DescriptorKind::Port: *out = {0x1F0001u, {0x20001u, 0x20001u, 0x120000u, 0x1F0001u}}; return true;
+    // (a shared Direct3D resource or fence: DXGI_SHARED_RESOURCE_READ is GENERIC_READ, DXGI_SHARED_RESOURCE_WRITE the one specific right, 1)
+    case DescriptorKind::DxgSharedResource: case DescriptorKind::DxgSharedSync: *out = {0x1F0001u, {0x120000u, 0x120001u, 0x120000u, 0x1F0001u}}; return true;
     case DescriptorKind::IoCompletion: *out = {0x1F0003u, {0x120001u, 0x120002u, 0x120000u, 0x1F0003u}}; return true;
     case DescriptorKind::DebugObject: *out = {0x1F000Fu, {0x20001u, 0x20002u, 0x120000u, 0x1F000Fu}}; return true;
     case DescriptorKind::File: case DescriptorKind::Directory: case DescriptorKind::Pipe: *out = {0x1F01FFu, {0x120089u, 0x120116u, 0x1200A0u, 0x1F01FFu}}; return true;
@@ -429,6 +433,7 @@ bool resolve(Process& p, uint64_t handle, Waitable* w) {
     w->type = Waitable::Always;
     return true;
   }
+  if (k == DescriptorKind::DxgSharedResource || k == DescriptorKind::DxgSharedSync) return false;      // (not dispatcher objects: nothing to wait for)
   if (is_object_kind(k)) {
     if (p.files().denied_access(slot) & 0x100000u) return false;      // (no SYNCHRONIZE right)
     w->type = Waitable::Object;
@@ -1365,6 +1370,8 @@ const char* object_type_name(ObjectKind kind) {
     case ObjectKind::Directory: return "Directory";
     case ObjectKind::SymbolicLink: return "SymbolicLink";
     case ObjectKind::Port: return "ALPC Port";
+    case ObjectKind::DxgSharedResource: return "DxgkSharedResource";
+    case ObjectKind::DxgSharedSync: return "DxgkSharedSyncObject";
     default: return "Object";
   }
 }
@@ -1813,6 +1820,8 @@ uint32_t nt_query_object(Process& p, const SyscallRequest& r) {
         case DescriptorKind::ObjectDirectory: type = "Directory"; break;
         case DescriptorKind::SymbolicLink: type = "SymbolicLink"; break;
         case DescriptorKind::Port: type = "ALPC Port"; break;
+        case DescriptorKind::DxgSharedResource: type = "DxgkSharedResource"; break;
+        case DescriptorKind::DxgSharedSync: type = "DxgkSharedSyncObject"; break;
         default: break;
       }
       uint32_t n = 0;
@@ -1867,6 +1876,60 @@ uint32_t nt_set_information_object(Process& p, const SyscallRequest& r) {
   if (!p.read_user(r.args[2], ByteView(flags, 2))) return kAccessViolation;
   p.files().set_handle_flags(slot, flags[0] != 0, flags[1] != 0);
   return kSuccess;
+}
+
+// --- Objects with a payload (win32k's Direct3D shares) ---------------------------------------------------------------------------------------------------------
+
+uint32_t create_payload_object(Process& p, ObjectKind kind, uint64_t attributes, uint32_t desired, SharedPointer<ObjectPayload> payload, uint64_t handle_at) {
+  ObjectManager* objects = system_objects();
+  if (!objects) return kNotImplemented;
+  if (kind != ObjectKind::DxgSharedResource && kind != ObjectKind::DxgSharedSync) return kInvalidParameter;
+  if (!p.write_user_u64(handle_at, 0)) return kAccessViolation;
+  Named n;
+  if (const uint32_t status = resolve_name(p, *objects, attributes, true, false, &n)) return status;
+  if (n.exists() != objpath::EntryKind::None) return n.exists() == objpath::EntryKind::Object ? objpath::kStatusNameCollision : kTypeMismatch;
+  const DescriptorKind dk = descriptor_kind_of(kind);
+  const uint32_t granted = desired == 0 ? 0x1F0001u : mapped_access(dk, desired);
+  if (granted & ~0x1F0001u & ~uint32_t{0x01000000u}) return kAccessDeniedStatus;      // (no rights of other kinds)
+  if (granted & 0x01000000u) return kPrivilegeNotHeld;      // ACCESS_SYSTEM_SECURITY
+  const ObjectManager::Created c = objects->create_with_payload(kind, n.flat(), util::move(payload));
+  if (c.id == 0) return c.status;
+  if (c.status == kNameExistsStatus) { objects->release(c.id); return objpath::kStatusNameCollision; }      // (made by another thread meanwhile)
+  const uint32_t given = give_handle(p, *objects, kind, c.id, handle_at, kSuccess, wants_inherit(p, attributes));
+  if (given == kSuccess) restrict_handle(p, handle_at, granted, kind);
+  return given;
+}
+
+uint32_t open_payload_object(Process& p, ObjectKind kind, uint64_t attributes, uint32_t desired, uint64_t handle_at) {
+  ObjectManager* objects = system_objects();
+  if (!objects) return kNotImplemented;
+  if (!p.write_user_u64(handle_at, 0)) return kAccessViolation;
+  Named n;
+  if (const uint32_t status = resolve_name(p, *objects, attributes, false, false, &n)) return status;
+  if (n.same_object != 0) return kTypeMismatch;
+  if (n.res.entry.kind == objpath::EntryKind::None) return objpath::kStatusNameNotFound;
+  if (n.res.entry.kind != objpath::EntryKind::Object || n.res.entry.object_kind != uint8_t(kind)) return kTypeMismatch;
+  const DescriptorKind dk = descriptor_kind_of(kind);
+  uint32_t granted = mapped_access(dk, desired);
+  if (desired & kMaximumAllowed) granted = 0x1F0001u;
+  if (granted == 0) return kAccessDeniedStatus;
+  if (granted & ~0x1F0001u) return kAccessDeniedStatus;
+  const ObjectManager::Created c = objects->open(kind, n.flat());
+  if (c.id == 0) return c.status;
+  const uint32_t given = give_handle(p, *objects, kind, c.id, handle_at, kSuccess, wants_inherit(p, attributes));
+  if (given == kSuccess) restrict_handle(p, handle_at, granted, kind);
+  return given;
+}
+
+uint32_t payload_of_handle(Process& p, uint64_t handle, ObjectKind kind, uint32_t rights, SharedPointer<ObjectPayload>* out) {
+  ObjectManager* objects = system_objects();
+  if (!objects) return kNotImplemented;
+  uint64_t slot = 0;
+  if (!slot_of(handle, &slot) || p.files().kind(slot) == DescriptorKind::Closed) return kInvalidHandle;
+  if (p.files().kind(slot) != descriptor_kind_of(kind)) return kTypeMismatch;
+  if (p.files().denied_access(slot) & rights) return kAccessDeniedStatus;
+  *out = objects->payload(uint32_t(p.files().token(slot)));
+  return *out ? kSuccess : kInvalidHandle;
 }
 
 }  // namespace process::windowsabi

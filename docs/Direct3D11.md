@@ -84,8 +84,10 @@ float, D32_FLOAT_S8X24_UINT in D24S8 (with its stencil, 24 bits of depth). R24G8
   with); dual-source blend factors (`D3D11_BLEND_SRC1_*`: the pipeline is refused), the blend factor on GPUs other than virgl, wireframe, depth bias, the back face's stencil operations, anisotropy, border colours.
 - The sampler of t<n> is s<n>: the kernel pairs them by number. A shader that samples one texture with two samplers gets one.
 - One query of the kernel's is open at a time: a draw is measured for one kind (above).
-- Shared resources (`D3D11_RESOURCE_MISC_SHARED`, `IDXGIResource::GetSharedHandle`, `OpenSharedResource*`): none is shared (`DXGI_ERROR_UNSUPPORTED`,
-  `E_INVALIDARG`).
+- Shared resources: textures made `D3D11_RESOURCE_MISC_SHARED_NTHANDLE` (with `SHARED` or `SHARED_KEYEDMUTEX`) are shared through NT handles
+  (`IDXGIResource1::CreateSharedHandle`, `ID3D11Device1::OpenSharedResource1` / `OpenSharedResourceByName`, over d3d12.dll's shared resources). Not there: keyed mutexes
+  (`IDXGIKeyedMutex`), the legacy handles of `IDXGIResource::GetSharedHandle` / `OpenSharedResource` (`DXGI_ERROR_UNSUPPORTED`, `E_INVALIDARG`), shared fences
+  (`ID3D11Device5` is not made).
 - A draw with no render target, no depth buffer and no stream output (unordered access only) is not made: the kernel's passes need a target.
 - Vertex formats other than 32-bit floats and the two 8-bit colour formats; an instance step rate other than 1.
 - The interfaces after 11.1 (`ID3D11Device2` .. `5`, `ID3D11DeviceContext2` .. `4`: tiled resources, fences, `Texture2D1` ...), the video interfaces

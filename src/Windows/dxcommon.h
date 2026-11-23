@@ -173,6 +173,19 @@ __declspec(dllimport) NTSTATUS __cdecl NtGdiDdDDIWaitForSynchronizationObjectFro
 #define D3DKMTWaitForSynchronizationObjectFromGpu NtGdiDdDDIWaitForSynchronizationObjectFromGpu
 __declspec(dllimport) NTSTATUS __cdecl NtGdiDdDDIWaitForIdle(void *);
 #define D3DKMTWaitForIdle NtGdiDdDDIWaitForIdle
+/* (the NT-handle sharing: the handle comes back in 8 bytes and the OBJECT_ATTRIBUTES is the kernel's 48-byte layout, as kmt_attributes() writes it) */
+__declspec(dllimport) NTSTATUS __cdecl NtGdiDdDDIShareObjects(UINT, const UINT *, void *, DWORD, UINT64 *);
+#define D3DKMTShareObjects NtGdiDdDDIShareObjects
+__declspec(dllimport) NTSTATUS __cdecl NtGdiDdDDIQueryResourceInfoFromNtHandle(void *);
+#define D3DKMTQueryResourceInfoFromNtHandle NtGdiDdDDIQueryResourceInfoFromNtHandle
+__declspec(dllimport) NTSTATUS __cdecl NtGdiDdDDIOpenResourceFromNtHandle(void *);
+#define D3DKMTOpenResourceFromNtHandle NtGdiDdDDIOpenResourceFromNtHandle
+__declspec(dllimport) NTSTATUS __cdecl NtGdiDdDDIOpenSyncObjectFromNtHandle2(void *);
+#define D3DKMTOpenSyncObjectFromNtHandle2 NtGdiDdDDIOpenSyncObjectFromNtHandle2
+__declspec(dllimport) NTSTATUS __cdecl NtGdiDdDDIOpenNtHandleFromName(void *);
+#define D3DKMTOpenNtHandleFromName NtGdiDdDDIOpenNtHandleFromName
+__declspec(dllimport) NTSTATUS __cdecl NtGdiDdDDIOpenSyncObjectNtHandleFromName(void *);
+#define D3DKMTOpenSyncObjectNtHandleFromName NtGdiDdDDIOpenSyncObjectNtHandleFromName
 #else
 NTSTATUS WINAPI D3DKMTEnumAdapters2(void *);
 NTSTATUS WINAPI D3DKMTOpenAdapterFromLuid(void *);
@@ -196,6 +209,12 @@ NTSTATUS WINAPI D3DKMTWaitForSynchronizationObjectFromCpu(void *);
 NTSTATUS WINAPI D3DKMTSignalSynchronizationObjectFromGpu(void *);
 NTSTATUS WINAPI D3DKMTWaitForSynchronizationObjectFromGpu(void *);
 NTSTATUS WINAPI D3DKMTWaitForIdle(void *);
+NTSTATUS WINAPI D3DKMTShareObjects(UINT, const UINT *, void *, DWORD, UINT64 *);
+NTSTATUS WINAPI D3DKMTQueryResourceInfoFromNtHandle(void *);
+NTSTATUS WINAPI D3DKMTOpenResourceFromNtHandle(void *);
+NTSTATUS WINAPI D3DKMTOpenSyncObjectFromNtHandle2(void *);
+NTSTATUS WINAPI D3DKMTOpenNtHandleFromName(void *);
+NTSTATUS WINAPI D3DKMTOpenSyncObjectNtHandleFromName(void *);
 #endif
 
 #pragma GCC diagnostic ignored "-Wunused-function"
@@ -343,7 +362,13 @@ typedef struct KmtAllocDesc {
   UINT64 size, heap_offset;
 } KmtAllocDesc;
 
+static NTSTATUS kmt_create_allocation_ex(UINT device, const KmtAllocDesc *d, const void *runtime, UINT runtime_size, UINT *resource, UINT *allocation, UINT *pitch, UINT64 *bytes);
 static NTSTATUS kmt_create_allocation(UINT device, const KmtAllocDesc *d, UINT *allocation, UINT *pitch, UINT64 *bytes) {
+  return kmt_create_allocation_ex(device, d, NULL, 0, NULL, allocation, pitch, bytes);
+}
+/* `resource` non-NULL: the allocation is made as a resource of its own that is shared through NT handles (CreateResource | NtSecuritySharing), with `runtime` as
+ * the data an opener gets; *resource is its handle (what kmt_share_objects shares). */
+static NTSTATUS kmt_create_allocation_ex(UINT device, const KmtAllocDesc *d, const void *runtime, UINT runtime_size, UINT *resource, UINT *allocation, UINT *pitch, UINT64 *bytes) {
   UINT priv[KAW_WORDS] __attribute__((aligned(16))) = {0};
   BYTE block[72] __attribute__((aligned(16))) = {0};
   BYTE info[96] __attribute__((aligned(16))) = {0};
@@ -367,9 +392,15 @@ static NTSTATUS kmt_create_allocation(UINT device, const KmtAllocDesc *d, UINT *
   KPUT32(block, 0, device);
   KPUT32(block, 44, 1);
   KPUT64(block, 48, info);
+  if (resource) {
+    KPUT64(block, 16, (UINT_PTR)runtime);
+    KPUT32(block, 24, runtime_size);
+    KPUT32(block, 56, 1u | 0x40u);      /* CreateResource | NtSecuritySharing */
+  }
   NTSTATUS st = D3DKMTCreateAllocation(block);
   if (!KMT_OK(st)) return st;
   *allocation = KGET32(info, 0);
+  if (resource) *resource = KGET32(block, 4);
   if (pitch) *pitch = priv[KAW_PITCH];
   if (bytes) *bytes = priv[KAW_BYTES_LO] | ((UINT64)priv[KAW_BYTES_HI] << 32);
   return st;
@@ -427,6 +458,105 @@ static NTSTATUS kmt_create_fence(UINT device, UINT64 initial, UINT *sync) {
   KPUT64(block, 16, initial);
   NTSTATUS st = D3DKMTCreateSynchronizationObject2(block);
   if (KMT_OK(st)) *sync = KGET32(block, 88);
+  return st;
+}
+
+/* A fence another process can open: made Shared | NtSecuritySharing, shared with kmt_share_objects. */
+static NTSTATUS kmt_create_shared_fence(UINT device, UINT64 initial, UINT *sync) {
+  BYTE block[96] __attribute__((aligned(16))) = {0};
+  KPUT32(block, 0, device);
+  KPUT32(block, 8, 3);              /* D3DDDI_FENCE */
+  KPUT32(block, 12, 3);             /* D3DDDI_SYNCHRONIZATIONOBJECT_FLAGS: Shared | NtSecuritySharing */
+  KPUT64(block, 16, initial);
+  NTSTATUS st = D3DKMTCreateSynchronizationObject2(block);
+  if (KMT_OK(st)) *sync = KGET32(block, 88);
+  return st;
+}
+
+/* ---- NT-handle sharing (src/Process/Win32k/Dxg/DxgShares.cpp) ---------------------------------------------------------------------------------------------- */
+
+/* An OBJECT_ATTRIBUTES of the kernel's layout { Length @0; RootDirectory @8; ObjectName @16; Attributes @24; SecurityDescriptor @32; SecurityQualityOfService @40 }
+ * and its UNICODE_STRING { Length @0; MaximumLength @2; Buffer @8 } for the name a Direct3D runtime gives a shared object: the session's \BaseNamedObjects
+ * directory (Global\ puts it in the system's, Local\ is the session's), as kernel32 names its objects. NULL name: an object without one. */
+typedef struct KmtAttributes { BYTE attributes[48]; BYTE string[16]; WCHAR text[300]; } KmtAttributes;
+static void *kmt_attributes(KmtAttributes *a, const WCHAR *name, BOOL inherit, const void *security) {
+  static const WCHAR local_prefix[] = L"\\Sessions\\1\\BaseNamedObjects\\", global_prefix[] = L"\\BaseNamedObjects\\";
+  memset(a, 0, sizeof(*a));
+  KPUT32(a->attributes, 0, 48);
+  KPUT32(a->attributes, 24, inherit ? 2u : 0u);      /* OBJ_INHERIT (names are case sensitive) */
+  KPUT64(a->attributes, 32, (UINT_PTR)security);
+  if (!name || !*name) return a->attributes;
+  const WCHAR *prefix = local_prefix, *rest = name;
+  if ((name[0] | 32) == 'l' && (name[1] | 32) == 'o' && (name[2] | 32) == 'c' && (name[3] | 32) == 'a' && (name[4] | 32) == 'l' && name[5] == '\\') rest = name + 6;
+  else if ((name[0] | 32) == 'g' && (name[1] | 32) == 'l' && (name[2] | 32) == 'o' && (name[3] | 32) == 'b' && (name[4] | 32) == 'a' && (name[5] | 32) == 'l' && name[6] == '\\') { rest = name + 7; prefix = global_prefix; }
+  UINT n = 0;
+  for (; prefix[n]; ++n) a->text[n] = prefix[n];
+  for (; *rest && n < 299; ++rest) a->text[n++] = *rest;
+  if (*rest) return NULL;      /* (too long: refused by the caller) */
+  a->text[n] = 0;
+  KPUT32(a->string, 0, (n * 2) | ((n * 2 + 2) << 16));
+  KPUT64(a->string, 8, (UINT_PTR)a->text);
+  KPUT64(a->attributes, 16, (UINT_PTR)a->string);
+  return a->attributes;
+}
+/* An NT handle (*nt, a HANDLE's value) for a resource handle (the win32k resource of an allocation made with NtSecuritySharing) or a shared fence. */
+static NTSTATUS kmt_share_objects(UINT object, void *attributes, DWORD access, UINT64 *nt) {
+  UINT list[1] = {object};
+  *nt = 0;
+  return D3DKMTShareObjects(1, list, attributes, access, nt);
+}
+/* What a shared resource's NT handle holds: its runtime data (up to `capacity` bytes into `runtime`), the bytes of its driver data, the number of allocations. */
+static NTSTATUS kmt_query_resource_nt(UINT device, UINT64 nt, void *runtime, UINT capacity, UINT *runtime_size, UINT *total_driver, UINT *resource_driver, UINT *allocations) {
+  BYTE block[40] __attribute__((aligned(16))) = {0};
+  KPUT32(block, 0, device);
+  KPUT64(block, 8, nt);
+  KPUT64(block, 16, (UINT_PTR)runtime);
+  KPUT32(block, 24, capacity);
+  const NTSTATUS st = D3DKMTQueryResourceInfoFromNtHandle(block);
+  *runtime_size = KGET32(block, 24);
+  *total_driver = KGET32(block, 28);
+  *resource_driver = KGET32(block, 32);
+  *allocations = KGET32(block, 36);
+  return st;
+}
+/* Opens a shared resource of one allocation: its allocation and resource handles on `device`; its private data goes to `driver` (the allocation's) and `resource_driver`. */
+static NTSTATUS kmt_open_resource_nt(UINT device, UINT64 nt, void *runtime, UINT runtime_size, void *resource_driver, UINT resource_driver_size, void *driver, UINT driver_size,
+                                     UINT *allocation, UINT *resource) {
+  BYTE block[104] __attribute__((aligned(16))) = {0};
+  BYTE info[80] __attribute__((aligned(16))) = {0};
+  KPUT32(block, 0, device);
+  KPUT64(block, 8, nt);
+  KPUT32(block, 16, 1);
+  KPUT64(block, 24, (UINT_PTR)info);
+  KPUT32(block, 32, runtime_size);
+  KPUT64(block, 40, (UINT_PTR)runtime);
+  KPUT32(block, 48, resource_driver_size);
+  KPUT64(block, 56, (UINT_PTR)resource_driver);
+  KPUT32(block, 64, driver_size);
+  KPUT64(block, 72, (UINT_PTR)driver);
+  const NTSTATUS st = D3DKMTOpenResourceFromNtHandle(block);
+  if (KMT_OK(st)) {
+    *allocation = KGET32(info, 0);
+    *resource = KGET32(block, 80);
+  }
+  return st;
+}
+/* A synchronization object on `device` for a shared fence's NT handle. */
+static NTSTATUS kmt_open_sync_nt(UINT device, UINT64 nt, UINT *sync) {
+  BYTE block[88] __attribute__((aligned(16))) = {0};
+  KPUT64(block, 0, nt);
+  KPUT32(block, 8, device);
+  const NTSTATUS st = D3DKMTOpenSyncObjectFromNtHandle2(block);
+  if (KMT_OK(st)) *sync = KGET32(block, 16);
+  return st;
+}
+/* An NT handle for the shared object of the name: a resource's (fence 0) or a fence's (fence 1). */
+static NTSTATUS kmt_open_nt_by_name(void *attributes, DWORD access, int fence, UINT64 *nt) {
+  BYTE block[24] __attribute__((aligned(16))) = {0};
+  KPUT32(block, 0, access);
+  KPUT64(block, 8, (UINT_PTR)attributes);
+  const NTSTATUS st = fence ? D3DKMTOpenSyncObjectNtHandleFromName(block) : D3DKMTOpenNtHandleFromName(block);
+  *nt = KMT_OK(st) ? KGET64(block, 16) : 0;
   return st;
 }
 

@@ -411,6 +411,15 @@ In the DLL alone: passes with a depth buffer and no render target (the kernel's 
 nothing reads; a device whose passes need none would save that memory), a depth clear that no pass takes (a pass of its own when the list is closed), multisampled render
 targets and depth buffers with `ResolveSubresource`.
 
+**Shared handles** (`device.inc`, `resource.inc` ShareDesc, win32k `DxgShares.cpp`): a committed resource or heap made `D3D12_HEAP_FLAG_SHARED` (GPU memory) or a fence
+made `D3D12_FENCE_FLAG_SHARED` gets NT handles from `CreateSharedHandle` (`GENERIC_ALL`, a name in the session's `\BaseNamedObjects` as kernel32 names objects,
+`DXGI_ERROR_NAME_ALREADY_EXISTS` for a taken one); `OpenSharedHandle` makes a resource (its description, heap properties and flags travel in the share's runtime data,
+with up to 64 bytes for the runtime above: d3d11.dll's texture description through `TcosD3D12ShareExtra` / `TcosD3D12SharedExtra`), a heap (placed resources in it on
+both sides alias the same memory) or a fence on any device of the adapter, in this process or another; `OpenSharedHandleByName` finds the handle. d3d11.dll shares
+`D3D11_RESOURCE_MISC_SHARED_NTHANDLE` textures with `IDXGIResource1::CreateSharedHandle` and opens them, and Direct3D 12's, with `OpenSharedResource1` /
+`OpenSharedResourceByName`. Tested by tests/windows/d3dsharetest.c (two devices on the emulator; `ARGS=processes tests/d3d12_qemu.sh d3dsharetest` also a second process
+that inherits the handles).
+
 **The later interfaces** (`ID3D12Device1` .. `ID3D12Device10`, `ID3D12GraphicsCommandList1` .. `7`, `ID3D12Fence1`, `ID3D12Resource2`, `ID3D12Heap1`; every vtable slot
 has its method, `scripts/gen-dx-vtables.py` names the latest interface of each object). What each part does:
 
@@ -438,8 +447,8 @@ has its method, `scripts/gen-dx-vtables.py` names the latest interface of each o
 Not done, in the order a program is likely to meet them: texture formats of fewer than four channels, packed floats and block compression beyond BC1 - BC3 (above); a depth buffer read as a texture (shadow maps: virgl keeps textures and attachments in opposite row order, and the
 kernel refuses the combination); rendering into a mip level or an array layer; unordered access to textures (and so `ClearUnorderedAccessView*` of a texture); depth bias
 and back-face stencil state; dual-source blending (`SRC1_*` factors: the pipeline is refused with `DXGI_ERROR_UNSUPPORTED`); several viewports; more than four unordered
-access buffers; pipeline statistics queries from the DLL; shared handles (`CreateSharedHandle` / `OpenSharedHandle*` answer `DXGI_ERROR_UNSUPPORTED`: win32k has the
-global share handles of allocations but no NT-handle sharing of resources or synchronization objects); the blend factor on Vega and the other fixed backends; ray tracing,
+access buffers; pipeline statistics queries from the DLL; shared resources across adapters (`D3D12_HEAP_FLAG_SHARED_CROSS_ADAPTER`,
+`D3D12_FENCE_FLAG_SHARED_CROSS_ADAPTER`: `DXGI_ERROR_UNSUPPORTED`) and D3D11 keyed mutexes and legacy (non-NT) shared handles; the blend factor on Vega and the other fixed backends; ray tracing,
 mesh shaders, variable rate shading, view instancing, sampler feedback, protected sessions and meta commands (reported unsupported); `ResolveSubresourceRegion` into a
 subresource other than 0 and the least / greatest colour resolves on virgl (its resolves are averages: the call is left out there); typed UAV clears of formats outside
 `g_uav_formats` (R11G11B10, B5G6R5 ...); root signature version 1.2 and the pipeline-stream subobjects of the later Agility SDKs (`DEPTH_STENCIL2`, `RASTERIZER1/2`,

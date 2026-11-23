@@ -37,25 +37,114 @@ static HRESULT STDMETHODCALLTYPE dev_GetDeviceRemovedReason(Dev *This) { return 
 static HRESULT STDMETHODCALLTYPE dev_SetStablePowerState(Dev *This, BOOL enable) { return S_OK; }
 static HRESULT STDMETHODCALLTYPE dev_MakeResident(Dev *This, UINT count, ID3D12Pageable *const *objects) { return S_OK; }
 static HRESULT STDMETHODCALLTYPE dev_Evict(Dev *This, UINT count, ID3D12Pageable *const *objects) { return S_OK; }
-/* Shared handles: an NT handle of a resource, heap or fence for another device or process needs the kernel's sharing of allocations and synchronization objects through
- * NT handles (D3DKMTShareObjects, D3DKMTOpenResourceFromNtHandle, D3DKMTOpenSyncObjectFromNtHandle2), which win32k does not have yet: the device answers what Direct3D 12
- * answers for sharing it cannot do (DXGI_ERROR_UNSUPPORTED, as d3d11.dll's IDXGIResource1::CreateSharedHandle does), after the checks of the arguments. An object made with
- * D3D12_HEAP_FLAG_SHARED is an ordinary one in this process. */
+/* ---- shared handles ----------------------------------------------------------------------------------------------------------------------------------------- */
+/* A resource or heap made D3D12_HEAP_FLAG_SHARED, or a fence made D3D12_FENCE_FLAG_SHARED, gets an NT handle (D3DKMTShareObjects: win32k makes a kernel object
+ * "DxgkSharedResource" / "DxgkSharedSyncObject" holding the kernel's allocation or fence, src/Process/Win32k/Dxg/DxgShares.cpp). Another device - of this process or of
+ * any process the handle reaches by DuplicateHandle, inheritance or the name - opens it as a resource, heap or fence of its own over the same memory or fence, on the
+ * same adapter. A resource's description travels in the share (resource.inc ShareDesc). */
 static HRESULT STDMETHODCALLTYPE dev_CreateSharedHandle(Dev *This, ID3D12DeviceChild *object, const SECURITY_ATTRIBUTES *attributes, DWORD access, const WCHAR *name, HANDLE *handle) {
+  extern const ID3D12Resource2Vtbl res_vtbl;
+  extern const ID3D12Heap1Vtbl heap_vtbl;
+  extern const ID3D12Fence1Vtbl fence_vtbl;
   if (handle) *handle = NULL;
   if (!object || !handle) return E_INVALIDARG;
-  if (access & ~(DWORD)(GENERIC_ALL | 0x1u /* DXGI_SHARED_RESOURCE_READ */ | 0x2u /* DXGI_SHARED_RESOURCE_WRITE */)) return E_INVALIDARG;
-  return DXGI_ERROR_UNSUPPORTED;
+  if (access != GENERIC_ALL) return E_INVALIDARG;      /* (the one value Direct3D 12 takes) */
+  const void *vtbl = ((IUnknown *)object)->lpVtbl;
+  UINT shared = 0;
+  if (vtbl == &res_vtbl) shared = ((Resource *)object)->kresource;
+  else if (vtbl == &heap_vtbl) shared = ((HeapObj *)object)->kresource;
+  else if (vtbl == &fence_vtbl && (((Fence *)object)->flags & D3D12_FENCE_FLAG_SHARED)) shared = ((Fence *)object)->sync;
+  else if (vtbl != &fence_vtbl) return E_INVALIDARG;      /* (no other object is shared) */
+  if (!shared || DOBJ(object)->dev != This) return E_INVALIDARG;      /* (not made shared, or of another device) */
+  KmtAttributes a;
+  void *oa = kmt_attributes(&a, name, attributes && attributes->bInheritHandle, attributes ? attributes->lpSecurityDescriptor : NULL);
+  if (!oa) return E_INVALIDARG;
+  UINT64 nt = 0;
+  const NTSTATUS st = kmt_share_objects(shared, oa, access, &nt);
+  if ((UINT)st == 0xC0000035u) return DXGI_ERROR_NAME_ALREADY_EXISTS;      /* STATUS_OBJECT_NAME_COLLISION */
+  if (!KMT_OK(st)) return hr_from(st);
+  *handle = (HANDLE)(UINT_PTR)nt;
+  return S_OK;
+}
+
+/* The object a shared handle names, made on this device: a resource or a heap (what its share says it is) or a fence. */
+static HRESULT open_shared(Dev *This, UINT64 nt, IUnknown **out) {
+  extern const ID3D12Heap1Vtbl heap_vtbl;
+  *out = NULL;
+  BYTE runtime[SHARE_DESC_BYTES];
+  UINT runtime_size = 0, total = 0, resource_driver = 0, allocations = 0;
+  NTSTATUS st = kmt_query_resource_nt(This->kdev, nt, runtime, sizeof runtime, &runtime_size, &total, &resource_driver, &allocations);
+  if ((UINT)st == 0xC0000024u) {      /* STATUS_OBJECT_TYPE_MISMATCH: not a resource's handle - a fence's? */
+    UINT sync = 0;
+    st = kmt_open_sync_nt(This->kdev, nt, &sync);
+    if (!KMT_OK(st)) return (UINT)st == 0xC0000024u || (UINT)st == 0xC0000008u ? E_INVALIDARG : hr_from(st);
+    Fence *f = NULL;
+    const HRESULT hr = fence_make(This, 0, D3D12_FENCE_FLAG_SHARED, sync, &f);
+    if (FAILED(hr)) { kmt_destroy_sync(sync); return hr; }
+    *out = (IUnknown *)f;
+    return S_OK;
+  }
+  if ((UINT)st == 0xC0000023u) return E_INVALIDARG;      /* (runtime data of another runtime's: bigger than ours) */
+  if (!KMT_OK(st)) return (UINT)st == 0xC0000008u ? E_INVALIDARG : hr_from(st);
+  ShareDesc sd;
+  /* (one allocation and our description: a resource another Direct3D runtime made would be laid out otherwise) */
+  if (allocations != 1 || !share_desc_read(runtime, runtime_size, &sd) || total > 4096 || resource_driver > 4096) return E_INVALIDARG;
+  BYTE *driver = mem_alloc(total ? total : 1), *resource_data = mem_alloc(resource_driver ? resource_driver : 1);
+  if (!driver || !resource_data) { mem_free(driver); mem_free(resource_data); return E_OUTOFMEMORY; }
+  UINT allocation = 0, kresource = 0;
+  st = kmt_open_resource_nt(This->kdev, nt, runtime, runtime_size, resource_data, resource_driver, driver, total, &allocation, &kresource);
+  UINT64 bytes = 0;
+  if (KMT_OK(st) && total >= KAW_WORDS * 4) bytes = ((UINT *)driver)[KAW_BYTES_LO] | ((UINT64)((UINT *)driver)[KAW_BYTES_HI] << 32);
+  mem_free(driver);
+  mem_free(resource_data);
+  if (!KMT_OK(st)) return (UINT)st == 0xC0000008u ? E_INVALIDARG : hr_from(st);
+  if (sd.kind == 1) {
+    HeapObj *h = dobj_new(sizeof *h, This, &heap_vtbl, g_heap_iids, heap_destroy);
+    if (!h) { kmt_destroy_allocation(This->kdev, allocation); return E_OUTOFMEMORY; }
+    memset(&h->desc, 0, sizeof h->desc);
+    h->desc.SizeInBytes = sd.heap_size;
+    h->desc.Properties = sd.props;
+    h->desc.Alignment = sd.heap_alignment;
+    h->desc.Flags = sd.flags;
+    h->alloc = allocation;
+    h->kresource = kresource;
+    *out = (IUnknown *)h;
+    return S_OK;
+  }
+  ResourceSource source = {allocation, kresource, bytes};
+  if (sd.cube) This->next_resource_flags = TCOS_RESOURCE_CUBE;
+  Resource *r = NULL;
+  const HRESULT hr = resource_make_from(This, &sd.props, sd.flags, &sd.desc, NULL, 0, 0, &source, &r);
+  if (FAILED(hr)) { kmt_destroy_allocation(This->kdev, allocation); return hr; }      /* (a description this device cannot make: the opened allocation goes) */
+  memcpy(r->share_extra, sd.extra, sd.extra_size);
+  r->share_extra_size = sd.extra_size;
+  *out = (IUnknown *)r;
+  return S_OK;
 }
 static HRESULT STDMETHODCALLTYPE dev_OpenSharedHandle(Dev *This, HANDLE handle, REFIID riid, void **object) {
   if (object) *object = NULL;
-  if (!handle || !riid) return E_INVALIDARG;
-  return DXGI_ERROR_UNSUPPORTED;      /* (no handle this process holds was made by CreateSharedHandle) */
+  if (!handle || !riid || !object) return E_INVALIDARG;
+  IUnknown *made = NULL;
+  const HRESULT hr = open_shared(This, (UINT64)(UINT_PTR)handle, &made);
+  if (FAILED(hr)) return hr;
+  return query_out(made, riid, object);      /* (an interface the object does not have: E_NOINTERFACE, and the object goes) */
 }
+/* The NT handle of a shared object by the name it was shared with (in the session's \BaseNamedObjects, as CreateSharedHandle put it). */
 static HRESULT STDMETHODCALLTYPE dev_OpenSharedHandleByName(Dev *This, const WCHAR *name, DWORD access, HANDLE *handle) {
   if (handle) *handle = NULL;
-  if (!name || !handle) return E_INVALIDARG;
-  return DXGI_ERROR_UNSUPPORTED;
+  if (!name || !*name || !handle) return E_INVALIDARG;
+  if (access != GENERIC_ALL) return E_INVALIDARG;
+  KmtAttributes a;
+  void *oa = kmt_attributes(&a, name, FALSE, NULL);
+  if (!oa) return E_INVALIDARG;
+  UINT64 nt = 0;
+  NTSTATUS st = kmt_open_nt_by_name(oa, access, 0, &nt);
+  if ((UINT)st == 0xC0000024u) st = kmt_open_nt_by_name(oa, access, 1, &nt);      /* (a fence's name) */
+  if ((UINT)st == 0xC0000034u || (UINT)st == 0xC000003Au) return HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND);      /* STATUS_OBJECT_NAME_NOT_FOUND / PATH_NOT_FOUND */
+  if ((UINT)st == 0xC0000024u) return E_INVALIDARG;      /* (an object of another kind has the name) */
+  if (!KMT_OK(st)) return hr_from(st);
+  *handle = (HANDLE)(UINT_PTR)nt;
+  return S_OK;
 }
 
 static UINT STDMETHODCALLTYPE dev_GetDescriptorHandleIncrementSize(Dev *This, D3D12_DESCRIPTOR_HEAP_TYPE type) { return type < D3D12_DESCRIPTOR_HEAP_TYPE_NUM_TYPES ? DESCRIPTOR_STRIDE : 0; }

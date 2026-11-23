@@ -23,6 +23,7 @@
 #include "Process/ObjectPath.hpp"
 #include "Process/IoRequest.hpp"
 #include "Utility/ArrayView.hpp"
+#include "Utility/SharedPointer.hpp"
 #include "Utility/StringView.hpp"
 
 namespace process {
@@ -47,7 +48,24 @@ class ISystemSync {
   ~ISystemSync() = default;
 };
 
-enum class ObjectKind : uint8_t { None, Event, Mutex, Semaphore, Process, Pipe, Timer, Section, Job, ChangeNotification, Mailslot, DebugObject, Token, KeyedEvent, IoCompletion, Reserve, Directory, SymbolicLink, Port };
+enum class ObjectKind : uint8_t { None, Event, Mutex, Semaphore, Process, Pipe, Timer, Section, Job, ChangeNotification, Mailslot, DebugObject, Token, KeyedEvent, IoCompletion, Reserve, Directory, SymbolicLink, Port,
+                                  DxgSharedResource /* "DxgkSharedResource": a Direct3D resource shared through an NT handle (win32k D3DKMTShareObjects) */,
+                                  DxgSharedSync /* "DxgkSharedSyncObject": a Direct3D fence shared the same way */ };
+
+// What an object of a kind the manager knows nothing about holds (the Direct3D shares: the kernel-mode driver's exports and the runtime's data). The manager keeps it with the
+// object and lets it go when the object goes - after its own lock is let go, since a payload may take other locks (dxgk::Kernel's) when it is destroyed.
+// (No virtual destructor - the kernel has no operator delete: a payload is made with SharedPointer::make_as, whose control block destroys it as the class it was made.)
+class ObjectPayload {
+ protected:
+  ObjectPayload() = default;
+  ~ObjectPayload() = default;
+  ObjectPayload(const ObjectPayload&) = delete;
+  ObjectPayload& operator=(const ObjectPayload&) = delete;
+
+ private:
+  friend class ObjectManager;
+  SharedPointer<ObjectPayload> dropped_next_;      // (the manager's list of payloads to let go once its lock is free)
+};
 
 class ObjectManager {
  public:
@@ -80,6 +98,11 @@ class ObjectManager {
   bool directory_child(StringView directory, uint32_t index, char* name, uint32_t capacity, uint32_t* name_size, ObjectKind* kind);
   // A process (waited for by its parent): signalled when it has ended. `pid` finds it again when the process ends.
   Created create_process(uint64_t pid);
+  // An object with a payload (ObjectKind::DxgSharedResource / DxgSharedSync): as create(), and the payload goes with the new object (an existing one of the name keeps its own;
+  // the status says it existed).
+  Created create_with_payload(ObjectKind kind, StringView name, SharedPointer<ObjectPayload> payload);
+  // The payload of the object (a reference of the caller's), empty if it has none or there is no such object.
+  SharedPointer<ObjectPayload> payload(uint32_t id);
 
   // --- pipes. A pipe is one object with two ends: end 0 is the server's (CreateNamedPipe, or the write side of CreatePipe), end 1 the client's (CreateFile on the name, or the
   // read side of CreatePipe). Each end is counted separately: the other side sees the end of the data / a broken pipe when no handle to it is left. The buffers come from the
@@ -464,6 +487,7 @@ class ObjectManager {
     uint64_t apc_thread = 0, apc_routine = 0, apc_context = 0;      // timer: the APC it queues
     bool armed = false, apc_pending = false;
     uint64_t fired_at = 0;
+    SharedPointer<ObjectPayload> payload;  // (create_with_payload)
   };
   // The object slots: kCapacity in place, then chunks of kCapacity more, made from the allocator when the ones there are all taken (a program like Chromium keeps
   // thousands of events and sections). A chunk is never moved or freed before the manager, so a pointer to a slot stays good. An object's id is its index + 1.
@@ -502,6 +526,9 @@ class ObjectManager {
   Object* find_locked(StringView name, bool case_insensitive = false);
   void fire_timer_locked(Object& o, uint64_t now);
   void free_object_locked(Object& o);
+  SharedPointer<ObjectPayload> dropped_;      // payloads of objects freed under the lock, let go by release() once it is free (ObjectPayload::dropped_next_)
+  SharedPointer<ObjectPayload> take_dropped_locked() { SharedPointer<ObjectPayload> d = util::move(dropped_); dropped_ = SharedPointer<ObjectPayload>(); return d; }
+  static void let_go(SharedPointer<ObjectPayload> chain);      // (without the lock: one by one, not recursively)
   void finish_dying_locked(Object& o);
 
   struct Pipe;

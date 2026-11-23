@@ -83,11 +83,14 @@ static HRESULT STDMETHODCALLTYPE dres_CreateSubresourceSurface(IDXGIResource1 *p
   *out = &t->dxgi_surf;
   return S_OK;
 }
+/* An NT handle of a texture made D3D11_RESOURCE_MISC_SHARED_NTHANDLE (its Direct3D 12 resource's, which d3d12.dll shares: interop.inc). `access` is what
+ * DXGI_SHARED_RESOURCE_READ / _WRITE ask for; the handle carries both. */
 static HRESULT STDMETHODCALLTYPE dres_CreateSharedHandle(IDXGIResource1 *p, const SECURITY_ATTRIBUTES *attributes, DWORD access, LPCWSTR name, HANDLE *handle) {
-  (void)p; (void)attributes; (void)access; (void)name;
+  Tex *t = tex_of_dxgi_res(p);
   if (!handle) return E_INVALIDARG;
   *handle = NULL;
-  return DXGI_ERROR_UNSUPPORTED;
+  if (!(t->desc.MiscFlags & D3D11_RESOURCE_MISC_SHARED_NTHANDLE) || !access || (access & ~SHARED_ACCESS_ALL)) return E_INVALIDARG;
+  return ID3D12Device_CreateSharedHandle(t->c.dev->d12, (ID3D12DeviceChild *)t->res, attributes, GENERIC_ALL, name, handle);
 }
 #define DRES_SLOT(name) .name = (__typeof__(((IDXGIResource1Vtbl *)0)->name))dres_##name
 static const IDXGIResource1Vtbl g_dxgi_res_vtbl = {

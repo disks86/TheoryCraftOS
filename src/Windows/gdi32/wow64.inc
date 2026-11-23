@@ -93,7 +93,7 @@ static HDC gdi_wow_open_dc(UNICODE_STRING *device, const DEVMODEW *devmode, UNIC
  * that are that half here - dxgi.dll, d3d12.dll - call win32u.dll with the kernel's layout themselves (src/Windows/dxcommon.h). */
 #define KMT_POINTER 0
 typedef struct { unsigned char here, there, kind; } KmtField;
-#define KMT_WIDE_BYTES 64
+#define KMT_WIDE_BYTES 128
 static NTSTATUS gdi_wow_kmt(NTSTATUS (__cdecl *service)(void *), void *params, const KmtField *fields, unsigned count) {
   BYTE wide[KMT_WIDE_BYTES] __attribute__((aligned(8)));
   BYTE *narrow = params;
@@ -154,3 +154,105 @@ KMT_CONVERTED(SetVidPnSourceOwner, {0, 0, 4}, {4, 8, KMT_POINTER}, {8, 16, KMT_P
 /* D3DKMT_ESCAPE { hAdapter; hDevice; Type; Flags; pPrivateDriverData; PrivateDriverDataSize; hContext }: 28 and 32 */
 KMT_CONVERTED(Escape, {0, 0, 4}, {4, 4, 4}, {8, 8, 4}, {12, 12, 4}, {16, 16, KMT_POINTER}, {20, 24, 4}, {24, 28, 4})
 #define NtGdiDdDDIEscape gdi_wow_kmt_Escape
+
+/* ---- NT-handle sharing: the structures, and the OBJECT_ATTRIBUTES and handles they point at --------------------------------------------------------- */
+/* An OBJECT_ATTRIBUTES of the kernel's layout { Length; RootDirectory; ObjectName; Attributes; SecurityDescriptor; SecurityQualityOfService }: 48 bytes (24 here),
+ * its UNICODE_STRING widened too. */
+typedef struct { ULONG length, pad0; ULONGLONG root, name; ULONG attributes, pad1; ULONGLONG descriptor, quality; } GdiWowAttributes;
+static void *gdi_wow_attributes(GdiWowAttributes *out, GdiWowString *name, const OBJECT_ATTRIBUTES *in) {
+  if (!in) return NULL;
+  memset(out, 0, sizeof(*out));
+  out->length = in->Length == sizeof(OBJECT_ATTRIBUTES) ? sizeof(GdiWowAttributes) : in->Length;      /* (a wrong length stays wrong) */
+  out->root = (ULONGLONG)(LONG64)(LONG)(ULONG_PTR)in->RootDirectory;
+  out->name = (ULONG_PTR)gdi_wow_string(name, in->ObjectName);
+  out->attributes = in->Attributes;
+  out->descriptor = (ULONG_PTR)in->SecurityDescriptor;
+  out->quality = (ULONG_PTR)in->SecurityQualityOfService;
+  return out;
+}
+typedef NTSTATUS(__cdecl *gdi_wow_share_fn)(UINT, const UINT *, void *, DWORD, ULONGLONG *);
+static NTSTATUS gdi_wow_share_objects(UINT count, const UINT *objects, void *attributes, DWORD access, HANDLE *handle) {
+  GdiWowAttributes wide;
+  GdiWowString name;
+  ULONGLONG made = 0;
+  const NTSTATUS status = ((gdi_wow_share_fn)(void *)NtGdiDdDDIShareObjects)(count, objects, gdi_wow_attributes(&wide, &name, attributes), access, handle ? &made : NULL);
+  if (handle) *handle = (HANDLE)(ULONG_PTR)made;
+  return status;
+}
+/* D3DKMT_QUERYRESOURCEINFOFROMNTHANDLE { hDevice; hNtHandle; pPrivateRuntimeData; PrivateRuntimeDataSize; TotalPrivateDriverDataSize;
+ * ResourcePrivateDriverDataSize; NumAllocations }: 28 and 40 */
+KMT_CONVERTED(QueryResourceInfoFromNtHandle, {0, 0, 4}, {4, 8, KMT_POINTER}, {8, 16, KMT_POINTER}, {12, 24, 4}, {16, 28, 4}, {20, 32, 4}, {24, 36, 4})
+#define NtGdiDdDDIQueryResourceInfoFromNtHandle gdi_wow_kmt_QueryResourceInfoFromNtHandle
+/* D3DKMT_OPENSYNCOBJECTFROMNTHANDLE { hNtHandle; hSyncObject }: 8 and 16 */
+KMT_CONVERTED(OpenSyncObjectFromNtHandle, {0, 0, KMT_POINTER}, {4, 8, 4})
+#define NtGdiDdDDIOpenSyncObjectFromNtHandle gdi_wow_kmt_OpenSyncObjectFromNtHandle
+/* D3DKMT_OPENSYNCOBJECTFROMNTHANDLE2 { hNtHandle; hDevice; Flags; hSyncObject; MonitoredFence { FenceValueCPUVirtualAddress; FenceValueGPUVirtualAddress;
+ * EngineAffinity } }: 80 and 88 */
+KMT_CONVERTED(OpenSyncObjectFromNtHandle2, {0, 0, KMT_POINTER}, {4, 8, 4}, {8, 12, 4}, {12, 16, 4}, {16, 24, KMT_POINTER}, {24, 32, 8}, {32, 40, 4})
+#define NtGdiDdDDIOpenSyncObjectFromNtHandle2 gdi_wow_kmt_OpenSyncObjectFromNtHandle2
+/* D3DKMT_OPENNTHANDLEFROMNAME / D3DKMT_OPENSYNCOBJECTNTHANDLEFROMNAME { dwDesiredAccess; pObjAttrib; hNtHandle }: 12 and 24, the OBJECT_ATTRIBUTES widened */
+static NTSTATUS gdi_wow_open_by_name(NTSTATUS (__cdecl *service)(void *), void *params) {
+  BYTE wide[24] __attribute__((aligned(8)));
+  BYTE *narrow = params;
+  GdiWowAttributes attributes;
+  GdiWowString name;
+  if (!params) return service(NULL);
+  memset(wide, 0, sizeof(wide));
+  memcpy(wide, narrow, 4);
+  const ULONGLONG at = (ULONG_PTR)gdi_wow_attributes(&attributes, &name, *(OBJECT_ATTRIBUTES **)(narrow + 4));
+  memcpy(wide + 8, &at, 8);
+  const NTSTATUS status = service(wide);
+  memcpy(narrow + 8, wide + 16, 4);      /* (a handle: its low half) */
+  return status;
+}
+static NTSTATUS __cdecl gdi_wow_kmt_OpenNtHandleFromName(void *params) { return gdi_wow_open_by_name(NtGdiDdDDIOpenNtHandleFromName, params); }
+#define NtGdiDdDDIOpenNtHandleFromName gdi_wow_kmt_OpenNtHandleFromName
+static NTSTATUS __cdecl gdi_wow_kmt_OpenSyncObjectNtHandleFromName(void *params) { return gdi_wow_open_by_name(NtGdiDdDDIOpenSyncObjectNtHandleFromName, params); }
+#define NtGdiDdDDIOpenSyncObjectNtHandleFromName gdi_wow_kmt_OpenSyncObjectNtHandleFromName
+/* D3DKMT_OPENRESOURCEFROMNTHANDLE: 60 and 104, and its D3DDDI_OPENALLOCATIONINFO2 array { hAllocation; pPrivateDriverData; PrivateDriverDataSize;
+ * GpuVirtualAddress; Reserved[6] }: 48 and 80 each, filled in by the kernel and narrowed back */
+static NTSTATUS __cdecl gdi_wow_kmt_OpenResourceFromNtHandle(void *params) {
+  static const KmtField fields[] = {{0, 0, 4},   {4, 8, KMT_POINTER},  {8, 16, 4},  {16, 32, 4},  {20, 40, KMT_POINTER}, {24, 48, 4}, {28, 56, KMT_POINTER}, {32, 64, 4},
+                                    {36, 72, KMT_POINTER}, {40, 80, 4}, {44, 84, 4}, {48, 88, KMT_POINTER}, {52, 96, 4}, {56, 100, 4}};
+  BYTE wide[104] __attribute__((aligned(8)));
+  BYTE *narrow = params;
+  if (!params) return NtGdiDdDDIOpenResourceFromNtHandle(NULL);
+  memset(wide, 0, sizeof(wide));
+  for (unsigned i = 0; i < sizeof(fields) / sizeof(fields[0]); ++i) {
+    const KmtField f = fields[i];
+    if (f.kind == KMT_POINTER) { const LONG64 value = *(const LONG *)(narrow + f.here); memcpy(wide + f.there, &value, 8); }
+    else memcpy(wide + f.there, narrow + f.here, f.kind);
+  }
+  UINT count = 0;
+  BYTE *infos = *(BYTE **)(narrow + 12);
+  memcpy(&count, narrow + 8, 4);
+  BYTE *wide_infos = NULL;
+  if (infos && count && count <= 256) {
+    wide_infos = HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, (SIZE_T)count * 80);
+    if (!wide_infos) return 0xC0000017; /* STATUS_NO_MEMORY */
+    const ULONGLONG at = (ULONG_PTR)wide_infos;
+    memcpy(wide + 24, &at, 8);
+  } else {
+    const LONG64 value = (LONG)(ULONG_PTR)infos;
+    memcpy(wide + 24, &value, 8);      /* (as it is: the kernel refuses it) */
+  }
+  const NTSTATUS status = NtGdiDdDDIOpenResourceFromNtHandle(wide);
+  for (unsigned i = 0; i < sizeof(fields) / sizeof(fields[0]); ++i) {
+    const KmtField f = fields[i];
+    memcpy(narrow + f.here, wide + f.there, f.kind == KMT_POINTER ? 4 : f.kind);
+  }
+  memcpy(narrow + 12, &infos, 4);
+  if (wide_infos) {
+    if (status == 0)
+      for (UINT i = 0; i < count; ++i) {
+        BYTE *n = infos + (SIZE_T)i * 48, *w = wide_infos + (SIZE_T)i * 80;
+        memcpy(n, w, 4);            /* hAllocation */
+        memcpy(n + 4, w + 8, 4);    /* pPrivateDriverData (in the program's own buffer) */
+        memcpy(n + 8, w + 16, 4);   /* PrivateDriverDataSize */
+        memcpy(n + 16, w + 24, 8);  /* GpuVirtualAddress */
+      }
+    HeapFree(GetProcessHeap(), 0, wide_infos);
+  }
+  return status;
+}
+#define NtGdiDdDDIOpenResourceFromNtHandle gdi_wow_kmt_OpenResourceFromNtHandle

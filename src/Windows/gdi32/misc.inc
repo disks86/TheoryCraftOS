@@ -252,7 +252,16 @@ EXPORT NTSTATUS WINAPI D3DKMTSetStereoEnabled(void *params) { return NtGdiDdDDIS
 EXPORT NTSTATUS WINAPI D3DKMTSetSyncRefreshCountWaitTarget(void *params) { return NtGdiDdDDISetSyncRefreshCountWaitTarget(params); }
 EXPORT NTSTATUS WINAPI D3DKMTSetVidPnSourceHwProtection(void *params) { return NtGdiDdDDISetVidPnSourceHwProtection(params); }
 EXPORT NTSTATUS WINAPI D3DKMTSetYieldPercentage(void *params) { return NtGdiDdDDISetYieldPercentage(params); }
-EXPORT NTSTATUS WINAPI D3DKMTShareObjects(void *params) { return NtGdiDdDDIShareObjects(params); }
+/* D3DKMTShareObjects(cObjects, hObjects, pObjectAttributes, dwDesiredAccess, phSharedNtHandle): five arguments, not a structure (gdi_share_objects: on i386 the
+ * OBJECT_ATTRIBUTES and the handle are widened, wow64.inc) */
+typedef NTSTATUS(WINAPI *gdi_share_objects_fn)(UINT, const UINT *, void *, DWORD, HANDLE *);
+EXPORT NTSTATUS WINAPI D3DKMTShareObjects(UINT count, const UINT *objects, void *attributes, DWORD access, HANDLE *handle) {
+#ifdef __i386__
+  return gdi_wow_share_objects(count, objects, attributes, access, handle);
+#else
+  return ((gdi_share_objects_fn)(void *)NtGdiDdDDIShareObjects)(count, objects, attributes, access, handle);
+#endif
+}
 EXPORT NTSTATUS WINAPI D3DKMTSharedPrimaryLockNotification(void *params) { return NtGdiDdDDISharedPrimaryLockNotification(params); }
 EXPORT NTSTATUS WINAPI D3DKMTSharedPrimaryUnLockNotification(void *params) { return NtGdiDdDDISharedPrimaryUnLockNotification(params); }
 EXPORT NTSTATUS WINAPI D3DKMTSignalSynchronizationObject(void *params) { return NtGdiDdDDISignalSynchronizationObject(params); }

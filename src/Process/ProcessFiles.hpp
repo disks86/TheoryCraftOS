@@ -46,7 +46,9 @@ PathResult resolve_path(PathStyle style, StringView cwd, StringView path, String
 enum class DescriptorKind : uint8_t { Closed, ConsoleInput, ConsoleOutput, ConsoleError, File, Directory, Null, Zero, Random, Thread, Event, Mutex, Semaphore, Process, Pipe, Timer, Section, Job, Socket, ChangeNotification, Mailslot, Key, MountManager, DebugObject, Token, KeyedEvent, IoCompletion, Reserve, ObjectDirectory, SymbolicLink, Port,
                                     Dxg /* /dev/dxg: the kernel-mode Direct3D layer for a Linux process (DxgDevice.h) */,
                                     UnixSocket /* an AF_UNIX socket (UnixSockets.hpp), shared with Windows programs */,
-                                    InputDevice /* /dev/input/eventN or jsN: a game controller for a Linux process (LinuxInput.hpp) */ };
+                                    InputDevice /* /dev/input/eventN or jsN: a game controller for a Linux process (LinuxInput.hpp) */,
+                                    DxgSharedResource /* an NT handle of a shared Direct3D resource (ObjectKind::DxgSharedResource) */,
+                                    DxgSharedSync /* an NT handle of a shared Direct3D fence (ObjectKind::DxgSharedSync) */ };
 
 // How open() treats the path. (The Linux O_* and Windows dispositions both reduce to these.)
 struct OpenFlags {

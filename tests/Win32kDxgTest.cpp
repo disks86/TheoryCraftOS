@@ -95,6 +95,34 @@ struct Win {
     put64(kStack + 0x28, 0);
     return uint32_t(iface->dispatch(process, r));
   }
+  // A call of up to five arguments (the fifth on the stack, as the x64 convention has it).
+  uint32_t call_args(WN n, std::initializer_list<uint64_t> args) {
+    SyscallRequest r;
+    r.number = uint64_t(n);
+    uint32_t i = 0;
+    for (uint64_t a : args) {
+      if (i < 4) r.args[i] = a;
+      else put64(kStack + 0x28 + 8 * (i - 4), a);
+      ++i;
+    }
+    r.user_stack = kStack;
+    return uint32_t(iface->dispatch(process, r));
+  }
+  // An OBJECT_ATTRIBUTES at `at` naming `name` (its UNICODE_STRING and characters after it); 0 for none.
+  uint64_t object_attributes(uint64_t at, const char* name) {
+    zero(at, 48 + 16 + 256);
+    put32(at, 48);
+    if (name) {
+      uint32_t n = 0;
+      for (; name[n]; ++n) { put32(at + 64 + 2 * n, uint32_t(uint8_t(name[n]))); }
+      put32(at + 64 + 2 * n, 0);
+      put32(at + 48, (2 * n) | (2 * n + 2) << 16);      // Length, MaximumLength
+      put64(at + 56, at + 64);
+      put64(at + 16, at + 48);
+    }
+    put32(at + 24, 0x40);      // OBJ_CASE_INSENSITIVE
+    return at;
+  }
   uint64_t call64(WN n, uint64_t a0 = 0) {
     SyscallRequest r;
     r.number = uint64_t(n);
@@ -1389,7 +1417,7 @@ void test_not_supported_and_registration() {
                WN::NtDxgkVailConnect, WN::NtGdiDdDDICreateProtectedSession, WN::NtGdiDdDDINetDispStartMiracastDisplayDevice, WN::NtDxgkSubmitPresentToHwQueue})
     CHECK(w.call(n, kA) == kNotSupported && w.call(n, 0) == kNotSupported);
   // not implementable here: still NOT_IMPLEMENTED
-  for (WN n : {WN::NtGdiDdDDIOpenAdapterFromHdc, WN::NtGdiDdDDIShareObjects, WN::NtGdiDdDDIOpenSynchronizationObject, WN::NtGdiDdDDIQueryStatistics, WN::NtDxgkGetProperties,
+  for (WN n : {WN::NtGdiDdDDIOpenAdapterFromHdc, WN::NtGdiDdDDIOpenSynchronizationObject, WN::NtGdiDdDDIQueryStatistics, WN::NtDxgkGetProperties,
                WN::NtDxgkIsFeatureEnabled, WN::NtGdiDdDDIMakeResident})
     CHECK(w.call(n, kA) == kNotImplemented);
   int count = 0;
@@ -1567,12 +1595,210 @@ void test_concurrent_processes() {
 
 }  // namespace
 
+// --- NT-handle sharing ---------------------------------------------------------------------------------------------------------------------------------------
+
+// A resource made with NtSecuritySharing is shared by name through D3DKMTShareObjects; the other process finds the NT handle by the name, queries and opens it, and
+// sees what the first wrote. The handles' lifetimes, the refusals, and a fence shared the same way.
+void test_nt_handle_sharing() {
+  System sys;
+  Machine m;
+  Win a(m.allocator, 300), b(m.allocator, 400);
+  const uint32_t dev_a = create_device(a, enum_first_adapter(a)), dev_b = create_device(b, enum_first_adapter(b));
+  constexpr uint32_t kNameCollision = 0xC0000035u, kNameNotFound = 0xC0000034u, kTypeMismatch = 0xC0000024u;
+  const uint64_t kAttr = kF + 0x400, kOut = kF + 0x800, kList = kF + 0x810;
+
+  // Two allocations with runtime and driver data, NtSecuritySharing: no global share handle comes back.
+  a.zero(kC, lay::sizeof_create_allocation);
+  a.zero(kD, 128);
+  const AllocSpec s1 = buffer_spec(dxgk::kAllocVertexBuffer, 64), s2 = image_spec(dxgk::kAllocTexture, 4, 4);
+  write_private(a, kE, s1);
+  write_private(a, kE + 0x100, s2);
+  const char runtime[] = "d3d12-resource-desc";
+  const char driver[] = "driver";
+  a.put(kE + 0x400, ConstByteView(reinterpret_cast<const uint8_t*>(runtime), sizeof runtime));
+  a.put(kE + 0x500, ConstByteView(reinterpret_cast<const uint8_t*>(driver), sizeof driver));
+  a.put32(kC, dev_a);
+  a.put64(kC + 16, kE + 0x400);
+  a.put32(kC + 24, sizeof runtime);
+  a.put64(kC + 32, kE + 0x500);
+  a.put32(kC + 40, sizeof driver);
+  a.put32(kC + 44, 2);
+  a.put64(kC + 48, kD);
+  a.put32(kC + 56, 1 | 2 | lay::kCaNtSecuritySharing);      // CreateResource | CreateShared | NtSecuritySharing
+  a.put64(kD + 16, kE);
+  a.put32(kD + 24, lay::kAllocPrivateBytes);
+  a.put64(kD + 40 + 16, kE + 0x100);
+  a.put32(kD + 40 + 24, lay::kAllocPrivateBytes);
+  CHECK(a.call(WN::NtGdiDdDDICreateAllocation, kC) == kOk);
+  const uint32_t resource = a.get32(kC + 4), a1 = a.get32(kD);
+  CHECK(resource != 0 && a.get32(kC + 8) == 0);
+  CHECK(lock_alloc(a, dev_a, a1) == kOk);
+  a.put32(a.get64(kF + 24) + 8, 0x5EED1234);
+  CHECK(unlock_alloc(a, dev_a, a1) == kOk);
+
+  // Shared under a name. A second share of the name collides; more than one object, or a resource made without NtSecuritySharing, is refused.
+  a.put32(kList, resource);
+  CHECK(a.call_args(WN::NtGdiDdDDIShareObjects, {1, kList, a.object_attributes(kAttr, "\\BaseNamedObjects\\TcosShared"), 0x10000000u, kOut}) == kOk);
+  const uint64_t nt_a = a.get64(kOut);
+  CHECK(nt_a != 0);
+  CHECK(a.call_args(WN::NtGdiDdDDIShareObjects, {1, kList, a.object_attributes(kAttr, "\\BaseNamedObjects\\TcosShared"), 0x10000000u, kOut}) == kNameCollision);
+  CHECK(a.call_args(WN::NtGdiDdDDIShareObjects, {2, kList, 0, 0x10000000u, kOut}) == kInvalidParameter);
+  CHECK(alloc_ok(a, dev_a, buffer_spec(dxgk::kAllocVertexBuffer, 16), 1) != 0);
+  {
+    // (a plain resource: CreateResource alone)
+    a.zero(kC, lay::sizeof_create_allocation);
+    a.zero(kD, 64);
+    write_private(a, kE, s1);
+    a.put32(kC, dev_a);
+    a.put32(kC + 44, 1);
+    a.put64(kC + 48, kD);
+    a.put32(kC + 56, 1);
+    a.put64(kD + 16, kE);
+    a.put32(kD + 24, lay::kAllocPrivateBytes);
+    CHECK(a.call(WN::NtGdiDdDDICreateAllocation, kC) == kOk);
+    a.put32(kList + 4, a.get32(kC + 4));
+    CHECK(a.call_args(WN::NtGdiDdDDIShareObjects, {1, kList + 4, 0, 0x10000000u, kOut}) == kInvalidParameter);
+  }
+  // An NT handle is no dispatcher object.
+  {
+    SyscallRequest r;
+    r.number = uint64_t(WN::NtWaitForSingleObject);
+    r.args[0] = nt_a;
+    CHECK(uint32_t(a.iface->dispatch(a.process, r)) == kTypeMismatch);
+  }
+
+  // The other process: the name, the sizes, then the allocations with the creator's data and contents.
+  b.zero(kC, 24);
+  b.put32(kC, 0x10000000u);
+  b.put64(kC + 8, b.object_attributes(kAttr, "\\BaseNamedObjects\\tcosshared"));
+  CHECK(b.call(WN::NtGdiDdDDIOpenNtHandleFromName, kC) == kOk);
+  const uint64_t nt_b = b.get64(kC + 16);
+  CHECK(nt_b != 0);
+  CHECK(b.call(WN::NtGdiDdDDIOpenSyncObjectNtHandleFromName, kC) == kTypeMismatch);      // (a resource's name, not a fence's)
+  b.put64(kC + 8, b.object_attributes(kAttr, "\\BaseNamedObjects\\NoSuchShare"));
+  CHECK(b.call(WN::NtGdiDdDDIOpenNtHandleFromName, kC) == kNameNotFound);
+  b.zero(kC, 40);
+  b.put32(kC, dev_b);
+  b.put64(kC + 8, nt_b);
+  CHECK(b.call(WN::NtGdiDdDDIQueryResourceInfoFromNtHandle, kC) == kOk);
+  CHECK(b.get32(kC + 24) == sizeof runtime && b.get32(kC + 32) == sizeof driver && b.get32(kC + 36) == 2 && b.get32(kC + 28) == 2 * lay::kAllocPrivateBytes);
+  b.put64(kC + 16, kE);
+  b.put32(kC + 24, 4);
+  CHECK(b.call(WN::NtGdiDdDDIQueryResourceInfoFromNtHandle, kC) == kBufferTooSmall);
+  b.put32(kC + 24, 64);
+  CHECK(b.call(WN::NtGdiDdDDIQueryResourceInfoFromNtHandle, kC) == kOk);
+  {
+    uint8_t got[sizeof runtime] = {};
+    CHECK(b.space.read_privileged(kE, ByteView(got, sizeof got)) && std::string(reinterpret_cast<char*>(got)) == runtime);
+  }
+  b.zero(kC, 104);
+  b.zero(kD, 2 * 80);
+  b.put32(kC, dev_b);
+  b.put64(kC + 8, nt_b);
+  b.put32(kC + 16, 2);
+  b.put64(kC + 24, kD);
+  b.put32(kC + 32, 64);
+  b.put64(kC + 40, kE);
+  b.put32(kC + 48, 64);
+  b.put64(kC + 56, kE + 0x100);
+  b.put32(kC + 64, 8);
+  b.put64(kC + 72, kE + 0x200);
+  CHECK(b.call(WN::NtGdiDdDDIOpenResourceFromNtHandle, kC) == kBufferTooSmall);
+  b.put32(kC + 64, 1024);
+  b.put32(kC + 16, 1);
+  CHECK(b.call(WN::NtGdiDdDDIOpenResourceFromNtHandle, kC) == kInvalidParameter);      // (two allocations)
+  b.put32(kC + 16, 2);
+  CHECK(b.call(WN::NtGdiDdDDIOpenResourceFromNtHandle, kC) == kOk);
+  const uint32_t b_resource = b.get32(kC + 80), b1 = b.get32(kD), b2 = b.get32(kD + 80);
+  CHECK(b_resource != 0 && b1 != 0 && b2 != 0 && b.get32(kD + 16) == lay::kAllocPrivateBytes && b.get64(kD + 88) == b.get64(kD + 8) + lay::kAllocPrivateBytes);
+  CHECK(b.get32(b.get64(kD + 88) + 4 * lay::kAwFlags) == dxgk::kAllocTexture);
+  {
+    uint8_t got[sizeof driver] = {};
+    CHECK(b.space.read_privileged(kE + 0x100, ByteView(got, sizeof got)) && std::string(reinterpret_cast<char*>(got)) == driver);
+  }
+  CHECK(lock_alloc(b, dev_b, b1, lay::kLockReadOnly) == kOk && b.get32(b.get64(kF + 24) + 8) == 0x5EED1234);
+  CHECK(unlock_alloc(b, dev_b, b1) == kOk);
+  // What the second process writes, the first sees.
+  CHECK(lock_alloc(b, dev_b, b1) == kOk);
+  b.put32(b.get64(kF + 24) + 12, 0xB0B0B0B0);
+  CHECK(unlock_alloc(b, dev_b, b1) == kOk);
+  CHECK(lock_alloc(a, dev_a, a1, lay::kLockReadOnly) == kOk && a.get32(a.get64(kF + 24) + 12) == 0xB0B0B0B0);
+  CHECK(unlock_alloc(a, dev_a, a1) == kOk);
+
+  // The creator destroys its resource and closes its handle: the second process's handle keeps the object and its name, its opened resource the allocations.
+  a.zero(kF + 0x100, 24);
+  a.put32(kF + 0x100, dev_a);
+  a.put32(kF + 0x104, resource);
+  CHECK(a.call(WN::NtGdiDdDDIDestroyAllocation, kF + 0x100) == kOk);
+  CHECK(a.call(WN::NtClose, nt_a) == kOk);
+  CHECK(lock_alloc(b, dev_b, b1, lay::kLockReadOnly) == kOk && b.get32(b.get64(kF + 24) + 8) == 0x5EED1234);
+  CHECK(unlock_alloc(b, dev_b, b1) == kOk);
+  b.zero(kF + 0x900, 24);
+  b.put32(kF + 0x900, 0x10000000u);
+  b.put64(kF + 0x908, b.object_attributes(kAttr, "\\BaseNamedObjects\\TcosShared"));
+  CHECK(b.call(WN::NtGdiDdDDIOpenNtHandleFromName, kF + 0x900) == kOk);
+  CHECK(b.call(WN::NtClose, b.get64(kF + 0x910)) == kOk);
+  CHECK(b.call(WN::NtClose, nt_b) == kOk);
+  CHECK(b.call(WN::NtGdiDdDDIOpenNtHandleFromName, kF + 0x900) == kNameNotFound);      // (the last handle went: so did the name)
+  CHECK(lock_alloc(b, dev_b, b1, lay::kLockReadOnly) == kOk && unlock_alloc(b, dev_b, b1) == kOk);      // (the opened resource still has them)
+  b.zero(kC, 40);
+  b.put32(kC, dev_b);
+  b.put64(kC + 8, nt_b);
+  CHECK(b.call(WN::NtGdiDdDDIQueryResourceInfoFromNtHandle, kC) == kInvalidHandle);
+
+  // A fence: made shared, shared without a name, the handle passed on (here: duplicated within the process, then opened on the other device of the same process).
+  uint32_t fence = 0, plain = 0;
+  CHECK(make_sync2(a, dev_a, 3, 1, 5, 0, &fence) == kNotSupported);      // (Shared alone: a global handle, which fences do not have here)
+  CHECK(make_sync2(a, dev_a, 3, 3, 5, 0, &fence) == kOk && fence != 0);
+  CHECK(make_sync2(a, dev_a, 3, 0, 0, 0, &plain) == kOk);
+  a.put32(kList, plain);
+  CHECK(a.call_args(WN::NtGdiDdDDIShareObjects, {1, kList, 0, 0x10000000u, kOut}) == kInvalidParameter);
+  a.put32(kList, fence);
+  CHECK(a.call_args(WN::NtGdiDdDDIShareObjects, {1, kList, a.object_attributes(kAttr, "\\BaseNamedObjects\\TcosFence"), 0, kOut}) == kOk);
+  const uint64_t nt_fence = a.get64(kOut);
+  b.zero(kC, 24);
+  b.put32(kC, 0x10000000u);
+  b.put64(kC + 8, b.object_attributes(kAttr, "\\BaseNamedObjects\\TcosFence"));
+  CHECK(b.call(WN::NtGdiDdDDIOpenNtHandleFromName, kC) == kTypeMismatch);
+  CHECK(b.call(WN::NtGdiDdDDIOpenSyncObjectNtHandleFromName, kC) == kOk);
+  const uint64_t nt_fence_b = b.get64(kC + 16);
+  b.zero(kC, 88);
+  b.put64(kC, nt_fence_b);
+  b.put32(kC + 8, dev_b);
+  CHECK(b.call(WN::NtGdiDdDDIOpenSyncObjectFromNtHandle2, kC) == kOk);
+  const uint32_t fence_b = b.get32(kC + 16);
+  CHECK(fence_b != 0 && b.get64(kC + 24) == 0);
+  b.zero(kC + 0x200, 16);
+  b.put64(kC + 0x200, nt_fence_b);
+  CHECK(b.call(WN::NtGdiDdDDIOpenSyncObjectFromNtHandle, kC + 0x200) == kOk && b.get32(kC + 0x208) != 0);
+  b.zero(kC + 0x300, 104);
+  b.put32(kC + 0x300, dev_b);
+  b.put64(kC + 0x308, nt_fence_b);
+  b.put32(kC + 0x310, 1);
+  b.put64(kC + 0x318, kD);
+  CHECK(b.call(WN::NtGdiDdDDIOpenResourceFromNtHandle, kC + 0x300) == kTypeMismatch);
+  // One fence: a value signalled by either process is the other's.
+  CHECK(sync_cpu(b, WN::NtGdiDdDDIWaitForSynchronizationObjectFromCpu, dev_b, {fence_b}, {5}) == kOk);      // (its initial value)
+  CHECK(sync_cpu(a, WN::NtGdiDdDDISignalSynchronizationObjectFromCpu, dev_a, {fence}, {9}) == kOk);
+  CHECK(sync_cpu(b, WN::NtGdiDdDDIWaitForSynchronizationObjectFromCpu, dev_b, {fence_b}, {9}) == kOk);
+  CHECK(sync_cpu(b, WN::NtGdiDdDDISignalSynchronizationObjectFromCpu, dev_b, {fence_b}, {12}) == kOk);
+  CHECK(sync_cpu(a, WN::NtGdiDdDDIWaitForSynchronizationObjectFromCpu, dev_a, {fence}, {12}) == kOk);
+  CHECK(a.call(WN::NtClose, nt_fence) == kOk && b.call(WN::NtClose, nt_fence_b) == kOk);
+  // A handle that is not a share's.
+  b.zero(kC, 16);
+  b.put64(kC, 0x7FF0);
+  CHECK(b.call(WN::NtGdiDdDDIOpenSyncObjectFromNtHandle, kC) == kInvalidHandle);
+  win32k::process_exited(300);
+  win32k::process_exited(400);
+}
+
 int main() {
   test_no_driver();
   test_adapters();
   test_devices_and_display();
   test_allocations();
   test_resources_and_sharing();
+  test_nt_handle_sharing();
   test_render_and_present();
   test_synchronization();
   test_escape();

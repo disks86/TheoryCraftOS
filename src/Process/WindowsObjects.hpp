@@ -19,6 +19,7 @@
 #include <stdint.h>
 #include "Executable/PeFile.hpp"
 #include "Process/Process.hpp"
+#include "Process/Objects.hpp"
 #include "Process/Syscall.hpp"
 
 // The NT services for synchronization objects, waiting and handle duplication (WindowsSyscalls.cpp maps service numbers to these). Each returns an NTSTATUS.
@@ -109,5 +110,15 @@ uint32_t nt_alert_thread_by_thread_id(Process& p, const SyscallRequest& r);
 uint32_t nt_wait_for_alert_by_thread_id(Process& p, const SyscallRequest& r);
 // NtDuplicateObject(SourceProcess, SourceHandle, TargetProcess, PHANDLE Target, Access, Attributes, Options): within the calling process.
 uint32_t nt_duplicate_object(Process& p, const SyscallRequest& r);
+
+// --- Objects with a payload, for win32k's Direct3D shares (ObjectKind::DxgSharedResource / DxgSharedSync: D3DKMTShareObjects and the *FromNtHandle / *FromName calls).
+// `attributes` is an OBJECT_ATTRIBUTES of the x64 layout (0 or no name: an object nobody can open by name), its name walked as NtCreateEvent walks one; `desired` the rights
+// the new handle holds (generic ones mapped; 0 for a creator: all of them), written to *handle_at (8 bytes). An existing object of the name is STATUS_OBJECT_NAME_COLLISION.
+uint32_t create_payload_object(Process& p, ObjectKind kind, uint64_t attributes, uint32_t desired, SharedPointer<ObjectPayload> payload, uint64_t handle_at);
+// A new handle to the object of `kind` named by `attributes`: STATUS_OBJECT_NAME_NOT_FOUND, STATUS_OBJECT_TYPE_MISMATCH (another kind of object has the name) ...
+uint32_t open_payload_object(Process& p, ObjectKind kind, uint64_t attributes, uint32_t desired, uint64_t handle_at);
+// The payload of the object `handle` names: STATUS_INVALID_HANDLE, STATUS_OBJECT_TYPE_MISMATCH (a handle of another kind), STATUS_ACCESS_DENIED (the handle does not hold
+// `rights`, specific rights of the kind's mapping), or 0 and *out.
+uint32_t payload_of_handle(Process& p, uint64_t handle, ObjectKind kind, uint32_t rights, SharedPointer<ObjectPayload>* out);
 
 }  // namespace process::windowsabi

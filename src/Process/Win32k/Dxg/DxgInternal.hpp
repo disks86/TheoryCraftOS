@@ -126,6 +126,7 @@ struct SyncRecord {
   dxgk::Handle handle = 0;
   dxgk::Handle device = 0;
   dxgk::SyncType type = dxgk::SyncType::Fence;
+  bool nt_shareable = false;  // made with D3DDDI_SYNCHRONIZATIONOBJECT_FLAGS Shared and NtSecuritySharing: D3DKMTShareObjects takes it
 };
 
 struct ResourceRecord {
@@ -133,6 +134,7 @@ struct ResourceRecord {
   uint32_t id = 0;
   dxgk::Handle device = 0;
   uint32_t share = 0;                         // the global share handle (0: not shared)
+  bool nt_shareable = false;                  // made with NtSecuritySharing: D3DKMTShareObjects makes NT handles of it (DxgShares.cpp)
   List<dxgk::Handle> allocations;
   ByteBuffer runtime_data, driver_data;       // PrivateRuntimeData / PrivateDriverData of the creation
   List<UniquePointer<ByteBuffer>> allocation_data;   // per allocation, in the order of `allocations`
@@ -251,6 +253,7 @@ void register_allocations();
 void register_sync();
 void register_work();
 void register_unsupported();
+void register_shares();
 
 // The D3DKMT thunks all take one pointer: this wraps a function of (Session, Call, address) in a handler that answers STATUS_NO_SUCH_DEVICE without a kernel.
 using ThunkFn = uint32_t (*)(Session&, Call&, uint64_t arg0);

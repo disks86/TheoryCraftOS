@@ -192,7 +192,7 @@ NtStatus VidMm::create(const AllocationDesc& requested, SharedPointer<Allocation
   if (track_state && (requested.initial_state & ~kStateMask)) return status::kInvalidParameter;
   if (desc.flags == 0 || (desc.flags & ~kKnownFlags)) return status::kInvalidParameter;
   const bool buffer = (desc.flags & (kAllocVertexBuffer | kAllocIndexBuffer | kAllocQueryResult | kAllocUnorderedAccess | kAllocStreamOutput | kAllocConstantBuffer | kAllocHeap)) != 0;
-  if ((desc.flags & kAllocHeap) && (desc.flags != kAllocHeap || heap || requested.heap)) return status::kInvalidParameter;
+  if ((desc.flags & kAllocHeap) && ((desc.flags & ~kAllocShared) != kAllocHeap || heap || requested.heap)) return status::kInvalidParameter;      // (a heap may be shared: D3D12_HEAP_FLAG_SHARED)
   if ((desc.flags & kAllocUnorderedAccess) && !(device_.info().features & graphics::kFeatureCompute)) return status::kNotSupported;
   if ((desc.flags & kAllocStreamOutput) && !(device_.info().features & graphics::kFeatureStreamOutput)) return status::kNotSupported;
   uint64_t cpu_bytes = 0, device_bytes = 0;
@@ -246,7 +246,7 @@ NtStatus VidMm::create(const AllocationDesc& requested, SharedPointer<Allocation
       // (a multisampled target: the device keeps the samples, the system keeps nothing)
       const graphics::DeviceInfo info = device_.info();
       if (!(info.features & graphics::kFeatureMultisample) || desc.samples >= 32 || !(info.sample_counts >> desc.samples & 1)) return status::kNotSupported;
-      if ((depth_flag ? desc.flags != kAllocDepthStencil : (desc.flags & ~kAllocTexture) != kAllocRenderTarget) || desc.mip_levels != 1 || desc.kind != graphics::TextureKind::Texture2D || desc.layers != 1 || dxgk::is_wide(desc.format))
+      if ((depth_flag ? (desc.flags & ~kAllocShared) != kAllocDepthStencil : (desc.flags & ~(kAllocTexture | kAllocShared)) != kAllocRenderTarget) || desc.mip_levels != 1 || desc.kind != graphics::TextureKind::Texture2D || desc.layers != 1 || dxgk::is_wide(desc.format))
         return status::kInvalidParameter;
       device_bytes = uint64_t{desc.width} * desc.height * desc.samples * (depth_flag ? (desc.format == Format::D24S8 ? 5 : 4) : 4);
       goto sized;

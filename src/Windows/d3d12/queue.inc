@@ -53,13 +53,21 @@ static void fence_destroy(DxObj *o) {
   dobj_child_destroy(o);
 }
 
-static HRESULT STDMETHODCALLTYPE dev_CreateFence(Dev *This, UINT64 initial, D3D12_FENCE_FLAGS flags, REFIID riid, void **out) {
+/* A fence of the device: a new synchronization object (opened 0), or one opened from a shared fence's NT handle (device1.inc's OpenSharedHandle), which is then the
+ * fence's. D3D12_FENCE_FLAG_SHARED makes it one CreateSharedHandle shares; D3D12_FENCE_FLAG_NON_MONITORED changes nothing (no fence here keeps its value in
+ * memory a process could map); one shared across adapters needs the kernel's cross-adapter objects, which it does not have. */
+static HRESULT fence_make(Dev *This, UINT64 initial, D3D12_FENCE_FLAGS flags, UINT opened, Fence **out) {
   extern const ID3D12Fence1Vtbl fence_vtbl;
-  if (flags & ~D3D12_FENCE_FLAG_NONE) return DXGI_ERROR_UNSUPPORTED;      /* (shared fences need sharing of synchronization objects, which the kernel does not do) */
+  *out = NULL;
+  if (flags & ~(D3D12_FENCE_FLAG_SHARED | D3D12_FENCE_FLAG_SHARED_CROSS_ADAPTER | D3D12_FENCE_FLAG_NON_MONITORED)) return E_INVALIDARG;
+  if (flags & D3D12_FENCE_FLAG_SHARED_CROSS_ADAPTER) return DXGI_ERROR_UNSUPPORTED;
   Fence *f = dobj_new(sizeof *f, This, &fence_vtbl, g_fence_iids, fence_destroy);
   if (!f) return E_OUTOFMEMORY;
-  const NTSTATUS st = kmt_create_fence(This->kdev, initial, &f->sync);
-  if (!KMT_OK(st)) { dx_Release(OBJ(f)); return hr_from(st); }
+  if (opened) f->sync = opened;
+  else {
+    const NTSTATUS st = (flags & D3D12_FENCE_FLAG_SHARED) ? kmt_create_shared_fence(This->kdev, initial, &f->sync) : kmt_create_fence(This->kdev, initial, &f->sync);
+    if (!KMT_OK(st)) { dx_Release(OBJ(f)); return hr_from(st); }
+  }
   f->flags = flags;
   AcquireSRWLockExclusive(&This->fence_lock);
   f->next = This->fences;
@@ -67,6 +75,13 @@ static HRESULT STDMETHODCALLTYPE dev_CreateFence(Dev *This, UINT64 initial, D3D1
   This->fences = f;
   ReleaseSRWLockExclusive(&This->fence_lock);
   if (InterlockedCompareExchange(&This->removed, 0, 0)) kmt_signal_cpu(This->kdev, f->sync, (~(UINT64)0));
+  *out = f;
+  return S_OK;
+}
+static HRESULT STDMETHODCALLTYPE dev_CreateFence(Dev *This, UINT64 initial, D3D12_FENCE_FLAGS flags, REFIID riid, void **out) {
+  Fence *f = NULL;
+  const HRESULT hr = fence_make(This, initial, flags, 0, &f);
+  if (FAILED(hr)) return hr;
   return query_out((IUnknown *)f, riid, out);
 }
 

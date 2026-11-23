@@ -175,19 +175,6 @@ static void STDMETHODCALLTYPE dev_GetImmediateContext1(Dev *d, ID3D11DeviceConte
   *out = (ID3D11DeviceContext1 *)d->ctx;
 }
 static HRESULT STDMETHODCALLTYPE dev_CreateDeferredContext1(Dev *d, UINT flags, ID3D11DeviceContext1 **out) { return dev_CreateDeferredContext(d, flags, (ID3D11DeviceContext **)out); }
-/* Shared resources: no resource of this device is shared (IDXGIResource::GetSharedHandle answers DXGI_ERROR_UNSUPPORTED), so no handle names one. */
-static HRESULT STDMETHODCALLTYPE dev_OpenSharedResource(Dev *d, HANDLE handle, REFIID riid, void **out) {
-  (void)d; (void)handle; (void)riid;
-  if (out) *out = NULL;
-  return E_INVALIDARG;
-}
-static HRESULT STDMETHODCALLTYPE dev_OpenSharedResource1(Dev *d, HANDLE handle, REFIID riid, void **out) { return dev_OpenSharedResource(d, handle, riid, out); }
-static HRESULT STDMETHODCALLTYPE dev_OpenSharedResourceByName(Dev *d, LPCWSTR name, DWORD access, REFIID riid, void **out) {
-  (void)d; (void)access; (void)riid;
-  if (out) *out = NULL;
-  return E_INVALIDARG;
-}
-
 /* ---- ID3D11Multithread and ID3DUserDefinedAnnotation -------------------------------------------------------------------------------------------------------------- */
 
 static Ctx *ctx_of_multithread(ID3D11Multithread *p) { return (Ctx *)((BYTE *)p - offsetof(Ctx, multithread)); }

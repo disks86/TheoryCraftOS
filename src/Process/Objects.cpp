@@ -350,6 +350,8 @@ void ObjectManager::ObjectTable::release(allocators::IAllocator* allocator) {
 }
 
 ObjectManager::~ObjectManager() {
+  for (Object& o : objects_) o.payload = SharedPointer<ObjectPayload>();
+  let_go(util::move(dropped_));
   objects_.release(allocator_);
   if (pipes_) {
     for (uint32_t i = 0; i < kMaxPipes; ++i) {
@@ -2166,7 +2168,32 @@ void ObjectManager::free_object_locked(Object& o) {
   free_watch_locked(o);
   free_mailslot_locked(o);
   free_port_locked(o);
+  if (o.payload) {      // (destroyed once the lock is let go: release())
+    o.payload->dropped_next_ = util::move(dropped_);
+    dropped_ = util::move(o.payload);
+  }
   o = Object();
+}
+
+void ObjectManager::let_go(SharedPointer<ObjectPayload> chain) {
+  while (chain) {
+    SharedPointer<ObjectPayload> next = util::move(chain->dropped_next_);
+    chain = util::move(next);      // (the one before goes here, if this was its last reference)
+  }
+}
+
+ObjectManager::Created ObjectManager::create_with_payload(ObjectKind kind, StringView name, SharedPointer<ObjectPayload> payload) {
+  Created c = create(kind, name, false, false, 0, 0, 0);
+  if (c.id == 0 || c.status == kNameExists) return c;
+  Locked hold(sync_);
+  if (Object* o = at(c.id)) o->payload = util::move(payload);
+  return c;
+}
+
+SharedPointer<ObjectPayload> ObjectManager::payload(uint32_t id) {
+  Locked hold(sync_);
+  Object* o = at(id);
+  return o ? o->payload : SharedPointer<ObjectPayload>();
 }
 
 // An object nobody has a handle to goes at once - unless a thread is waiting for it, or a thread owns it (the mutex of a thread that ends is abandoned and its waiters told).
@@ -2175,8 +2202,13 @@ void ObjectManager::finish_dying_locked(Object& o) {
 }
 
 void ObjectManager::release(uint32_t id) {
-  Locked hold(sync_);
-  release_locked(id);
+  SharedPointer<ObjectPayload> dropped;
+  {
+    Locked hold(sync_);
+    release_locked(id);
+    dropped = take_dropped_locked();
+  }
+  let_go(util::move(dropped));
 }
 
 void ObjectManager::release_locked(uint32_t id) {

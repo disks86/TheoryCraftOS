@@ -342,6 +342,7 @@ struct Dev {
   D3D_FEATURE_LEVEL level;
   UINT flags;
   ID3D12Device *d12;
+  UINT next_tex_kind;                      /* what tex_make makes next, for the description a share carries: 0 as its arguments say, 2 one-dimensional (dev_CreateTexture1D) */
   ID3D12CommandQueue *queue;
   ID3D12CommandAllocator *allocator;
   ID3D12GraphicsCommandList *list;
@@ -856,6 +857,28 @@ static void tex_refused(const D3D11_TEXTURE2D_DESC *desc, const char *why) {
   dx_say(text);
 }
 
+/* What a texture shared through an NT handle carries for the device that opens it (TcosD3D12ShareExtra): "D11T", the kind (0 2D, 1 3D, 2 1D), then the
+ * D3D11_TEXTURE2D_DESC as tex_make keeps it and the depth of a volume, each a 32-bit word. */
+#define TEX_SHARE_BYTES 56
+static void tex_share_blob(const D3D11_TEXTURE2D_DESC *t, UINT kind, UINT slices, BYTE out[TEX_SHARE_BYTES]) {
+  const UINT words[13] = {kind, t->Width, t->Height, t->MipLevels, t->ArraySize, t->Format, t->SampleDesc.Count, t->SampleDesc.Quality, t->Usage, t->BindFlags,
+                          t->CPUAccessFlags, t->MiscFlags, slices};
+  out[0] = 'D', out[1] = '1', out[2] = '1', out[3] = 'T';
+  memcpy(out + 4, words, sizeof words);
+}
+static int tex_share_read(const BYTE *in, UINT size, D3D11_TEXTURE2D_DESC *t, UINT *kind, UINT *slices) {
+  UINT words[13];
+  if (size != TEX_SHARE_BYTES || in[0] != 'D' || in[1] != '1' || in[2] != '1' || in[3] != 'T') return 0;
+  memcpy(words, in + 4, sizeof words);
+  if (words[0] > 2) return 0;
+  *kind = words[0];
+  t->Width = words[1], t->Height = words[2], t->MipLevels = words[3], t->ArraySize = words[4], t->Format = (DXGI_FORMAT)words[5];
+  t->SampleDesc.Count = words[6], t->SampleDesc.Quality = words[7], t->Usage = (D3D11_USAGE)words[8], t->BindFlags = words[9], t->CPUAccessFlags = words[10];
+  t->MiscFlags = words[11];
+  *slices = words[12];
+  return 1;
+}
+
 /* A texture object around `res` (a reference is taken), or around a new Direct3D 12 texture when it is NULL. `slices`: 0 for a 2D texture, array or cube, else the
  * depth of a volume (`in` then has one layer). */
 static UINT dev_ms_levels(Dev *d, DXGI_FORMAT format, UINT samples);
@@ -869,6 +892,12 @@ static HRESULT tex_make(Dev *d, const D3D11_TEXTURE2D_DESC *in, UINT slices, ID3
       ((bind & D3D11_BIND_DEPTH_STENCIL) && (bind & (D3D11_BIND_RENDER_TARGET | D3D11_BIND_UNORDERED_ACCESS))))
     return E_INVALIDARG;
   if ((desc.MiscFlags & D3D11_RESOURCE_MISC_SHARED) && (desc.MiscFlags & D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX)) return E_INVALIDARG;
+  /* (shared through NT handles: with SHARED or SHARED_KEYEDMUTEX, in GPU memory) */
+  const BOOL nt_shared = !res && (desc.MiscFlags & D3D11_RESOURCE_MISC_SHARED_NTHANDLE) != 0;
+  if (nt_shared && (!(desc.MiscFlags & (D3D11_RESOURCE_MISC_SHARED | D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX)) || desc.Usage != D3D11_USAGE_DEFAULT || desc.CPUAccessFlags))
+    return E_INVALIDARG;
+  const UINT made_kind = d->next_tex_kind;
+  d->next_tex_kind = 0;
   if ((desc.MiscFlags & D3D11_RESOURCE_MISC_GENERATE_MIPS) && (bind & (D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE)) != (D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE)) return E_INVALIDARG;
   if (desc.Usage > D3D11_USAGE_STAGING || (desc.Usage == D3D11_USAGE_STAGING && bind) || (desc.Usage == D3D11_USAGE_DYNAMIC && (desc.CPUAccessFlags != D3D11_CPU_ACCESS_WRITE || (bind & ~(UINT)D3D11_BIND_SHADER_RESOURCE))) ||
       ((desc.Usage == D3D11_USAGE_DEFAULT || desc.Usage == D3D11_USAGE_IMMUTABLE) && desc.CPUAccessFlags))
@@ -938,7 +967,14 @@ static HRESULT tex_make(Dev *d, const D3D11_TEXTURE2D_DESC *in, UINT slices, ID3
     if ((desc.BindFlags & D3D11_BIND_RENDER_TARGET) && !shadowed) rd.Flags |= D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
     if (t->depth) rd.Flags |= D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
     if (cube) TcosD3D12ResourceOptions(d->d12, TCOS_RESOURCE_CUBE);      /* (Direct3D 12 knows a cube only by its views; the kernel has to know it now) */
-    const HRESULT hr = ID3D12Device_CreateCommittedResource(d->d12, &props, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_COMMON, NULL, &IID_ID3D12Resource, (void **)&t->res);
+    if (nt_shared) {
+      /* (what a device that opens it makes of it: the program's description, which the Direct3D 12 one - formats kept wider, one level of a target - does not say) */
+      BYTE blob[TEX_SHARE_BYTES];
+      tex_share_blob(&t->desc, slices ? 1 : made_kind == 2 ? 2 : 0, slices, blob);
+      TcosD3D12ShareExtra(d->d12, blob, sizeof blob);
+    }
+    const HRESULT hr = ID3D12Device_CreateCommittedResource(d->d12, &props, nt_shared ? D3D12_HEAP_FLAG_SHARED : D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_COMMON, NULL,
+                                                            &IID_ID3D12Resource, (void **)&t->res);
     if (FAILED(hr) || !t->res) { tex_refused(&desc, "Direct3D 12 below refused it"); dx_Release(OBJ(t)); return FAILED(hr) ? hr : E_FAIL; }
   }
   *out = t;
@@ -1005,6 +1041,7 @@ static HRESULT STDMETHODCALLTYPE dev_CreateTexture1D(Dev *d, const D3D11_TEXTURE
   if (!out) return S_FALSE;
   Tex *t = NULL;
   EnterCriticalSection(&d->lock);
+  d->next_tex_kind = 2;      /* (for the description a share of it carries) */
   HRESULT hr = tex_make(d, &as2d, 0, NULL, &t);
   if (SUCCEEDED(hr)) {
     t->c.o.lpVtbl = (const void *)&tex1d_vtbl;

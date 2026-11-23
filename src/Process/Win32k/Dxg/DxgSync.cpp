@@ -46,7 +46,7 @@ constexpr uint32_t kTypeMutex = 1, kTypeSemaphore = 2, kTypeFence = 3, kTypeCpuN
 constexpr uint32_t kFlagShared = 1u << 0, kFlagNtSecuritySharing = 1u << 1, kFlagCrossAdapter = 1u << 2;
 
 // Makes the object and notes it; writes the handle at `handle_offset`.
-uint32_t create_sync(Session& s, Call& call, uint64_t arg, dxgk::Handle device, dxgk::SyncType type, uint64_t initial, uint64_t limit, uint64_t handle_offset) {
+uint32_t create_sync(Session& s, Call& call, uint64_t arg, dxgk::Handle device, dxgk::SyncType type, uint64_t initial, uint64_t limit, uint64_t handle_offset, bool nt_shareable = false) {
   Locked g(s);
   ProcessState& ps = s.state();
   if (!ps.find_device(device)) return status::kInvalidHandle;
@@ -57,6 +57,7 @@ uint32_t create_sync(Session& s, Call& call, uint64_t arg, dxgk::Handle device, 
   rec.handle = sync;
   rec.device = device;
   rec.type = type;
+  rec.nt_shareable = nt_shareable;
   if (!ps.syncs.push_back(rec)) {
     s.kernel().destroy_sync(s.pid(), sync);
     return status::kNoMemory;
@@ -100,7 +101,10 @@ uint32_t create_synchronization_object2(Session& s, Call& call, uint64_t arg) {
   const uint32_t flags = b.u32(12);
   if (device == 0) return kStatusInvalidParameter;
   if (type == kTypeCpuNotification || type == kTypeMonitoredFence || type == kTypePeriodicMonitoredFence) return kStatusNotSupported;
-  if (flags & (kFlagShared | kFlagNtSecuritySharing | kFlagCrossAdapter)) return kStatusNotSupported;      // (no sharing of synchronization objects between processes)
+  // Sharing: a fence through NT handles (Shared and NtSecuritySharing, D3DKMTShareObjects: DxgShares.cpp). Not the global share handles of the other kinds
+  // (D3DKMTOpenSynchronizationObject) or fences across adapters: the kernel exports fences alone.
+  const bool nt_shared = (flags & (kFlagShared | kFlagNtSecuritySharing)) == (kFlagShared | kFlagNtSecuritySharing);
+  if ((flags & kFlagCrossAdapter) || ((flags & (kFlagShared | kFlagNtSecuritySharing)) && (!nt_shared || type != kTypeFence))) return kStatusNotSupported;
   switch (type) {
     case kTypeMutex:
       return create_sync(s, call, arg, device, dxgk::SyncType::Semaphore, b.u32(16) ? 1 : 0, 1, 88);
@@ -110,7 +114,7 @@ uint32_t create_synchronization_object2(Session& s, Call& call, uint64_t arg) {
       return create_sync(s, call, arg, device, dxgk::SyncType::Semaphore, initial, max, 88);
     }
     case kTypeFence:
-      return create_sync(s, call, arg, device, dxgk::SyncType::Fence, b.u64(16), 0, 88);
+      return create_sync(s, call, arg, device, dxgk::SyncType::Fence, b.u64(16), 0, 88, nt_shared);
     default:
       return kStatusInvalidParameter;
   }

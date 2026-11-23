@@ -101,6 +101,7 @@ struct ExportInfo {
   uint32_t pitch = 0;      // bytes per row
   uint64_t bytes = 0;      // its system-memory backing
   uint32_t adapter = 0;    // the adapter's number
+  bool image = false;      // made by export_allocation (a plain image the dmabuf readers take), not export_shared_allocation
 };
 const ExportInfo& export_info(const ExportedAllocation& exported);
 // Copies the image of an export to `bytes`, or `bytes` to it (`to_image`): the first bytes of its memory (rows `pitch` apart), as many as both have. The work
@@ -171,6 +172,10 @@ class Kernel {
   NtStatus share_allocation(ProcessId pid, Handle allocation, uint32_t* token);
   NtStatus open_shared_allocation(ProcessId pid, Handle device, uint32_t token, Handle* allocation, AllocationDesc* desc);
   NtStatus close_share(ProcessId pid, uint32_t token);
+  // An export of any allocation made kAllocShared (buffers, heaps, textures of every kind, depth and multisampled images): what an NT handle of a shared resource holds
+  // (win32k's D3DKMTShareObjects). Another process imports it with import_allocation and gets the same allocation (contents, placed allocations of a heap). The
+  // dmabuf readers (copy_export, read_export, acquire_export_image) take only what export_allocation would have made.
+  NtStatus export_shared_allocation(ProcessId pid, Handle allocation, SharedPointer<ExportedAllocation>* out);
   // An export of an allocation made kAllocShared: a 2D image of one level and one sample in an 8-bit colour format of four channels (what a compositor shows).
   // kAccessDenied when it was not made shareable, kNotSupported for anything else.
   NtStatus export_allocation(ProcessId pid, Handle allocation, SharedPointer<ExportedAllocation>* out);
@@ -240,6 +245,7 @@ class Kernel {
 
  private:
   friend class ExportedAllocation;
+  NtStatus export_locked_common(ProcessId pid, Handle allocation, bool image_only, SharedPointer<ExportedAllocation>* out);
   friend bool copy_export(ExportedAllocation& exported, ByteView bytes, bool to_image);
   friend bool export_idle(ExportedAllocation& exported);
   friend class ExportedSync;

@@ -36,7 +36,8 @@
  *   - a pass with a depth buffer and no render target draws into a colour image of the buffer's size that nothing reads (cmdlist.inc depth_companion): it costs that memory
  *   - sampler border colours are the three of a static sampler (another colour is the nearest of them); a device with wrap and clamp alone uses the nearer of those
  *   - multisampled images are render targets and depth buffers of the adapter's sample counts, drawn into and resolved (not read by shaders through this DLL)
- *   - pipeline statistics and stream output queries, tiled depth/multisampled/array resources, shared handles (DXGI_ERROR_UNSUPPORTED: no NT-handle sharing in win32k),
+ *   - pipeline statistics and stream output queries, tiled depth/multisampled/array resources, sharing across adapters (DXGI_ERROR_UNSUPPORTED; shared handles of one
+ *     adapter's resources, heaps and fences are made: device.inc),
  *     resource state validation (barriers are accepted and not looked at, except aliasing), the debug layer, dual-source blending, unordered access to textures
  *   - of the later interfaces (ID3D12Device1 .. 10, ID3D12GraphicsCommandList1 .. 7: device1.inc, cmdlist1.inc, library.inc, rootsig.inc), the features reported at their
  *     "not supported" tier: ray tracing, mesh shaders, variable-rate shading, view instancing, depth bounds, sample positions, sampler feedback, protected sessions, meta
@@ -101,6 +102,20 @@ EXPORT void WINAPI TcosD3D12StageConstantBases(ID3D12Device *device, UINT geomet
 EXPORT void WINAPI TcosD3D12ResourceOptions(ID3D12Device *device, UINT flags) {
   Dev *dev = (Dev *)device;
   if (dev) dev->next_resource_flags = flags;
+}
+/* (src/Windows/tcosdx.h) What the next resource made D3D12_HEAP_FLAG_SHARED carries for the runtime above it (up to 64 bytes: d3d11.dll's description of its
+ * texture), and what a resource - made shared, or opened from a shared handle - carries: its size (0: none), up to `capacity` bytes copied. */
+EXPORT void WINAPI TcosD3D12ShareExtra(ID3D12Device *device, const void *data, UINT size) {
+  Dev *dev = (Dev *)device;
+  if (!dev) return;
+  dev->next_share_extra_size = data && size <= sizeof dev->next_share_extra ? size : 0;
+  if (dev->next_share_extra_size) memcpy(dev->next_share_extra, data, size);
+}
+EXPORT UINT WINAPI TcosD3D12SharedExtra(ID3D12Resource *resource, void *out, UINT capacity) {
+  Resource *r = (Resource *)resource;
+  if (!r) return 0;
+  if (out) memcpy(out, r->share_extra, r->share_extra_size < capacity ? r->share_extra_size : capacity);
+  return r->share_extra_size;
 }
 EXPORT void WINAPI TcosD3D12BeginQueryKind(ID3D12GraphicsCommandList *list, ID3D12QueryHeap *heap, UINT index, UINT kind) {
   if (list) list_begin_query_kind((CmdList *)list, (QHeap *)heap, index, kind);

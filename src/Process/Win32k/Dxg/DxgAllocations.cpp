@@ -138,10 +138,12 @@ uint32_t create_allocation_common(Session& s, Call& call, uint64_t arg, uint64_t
   const uint32_t count = b.u32(44);
   const uint64_t infos = b.u64(48);
   const uint32_t flags = b.u32(56);
-  const bool create_resource = (flags & kCaCreateResource) != 0, shared = (flags & kCaCreateShared) != 0;
+  // NtSecuritySharing: the resource is shared through NT handles (D3DKMTShareObjects), not a global share handle - which is then not made, even with CreateShared.
+  const bool nt_sharing = (flags & kCaNtSecuritySharing) != 0;
+  const bool create_resource = (flags & kCaCreateResource) != 0, shared = (flags & kCaCreateShared) != 0 && !nt_sharing;
   if (device == 0 || count == 0 || count > kMaxAllocationsPerCall || infos == 0) return kStatusInvalidParameter;
-  if (shared && !create_resource) return kStatusInvalidParameter;
-  if (flags & (kCaStandardAllocation | kCaExistingSysMem | kCaExistingSection | kCaCrossAdapter | kCaOpenCrossAdapter | kCaCreateProtected | kCaNtSecuritySharing)) return kStatusNotSupported;
+  if ((shared || nt_sharing) && !create_resource) return kStatusInvalidParameter;
+  if (flags & (kCaStandardAllocation | kCaExistingSysMem | kCaExistingSection | kCaCrossAdapter | kCaOpenCrossAdapter | kCaCreateProtected)) return kStatusNotSupported;
 
   Locked g(s);
   ProcessState& ps = s.state();
@@ -184,7 +186,7 @@ uint32_t create_allocation_common(Session& s, Call& call, uint64_t arg, uint64_t
       break;
     }
     dxgk::AllocationDesc desc;
-    st = parse_private_data(*data, s, device, (e.u32(32) & 1) != 0, shared, &desc);
+    st = parse_private_data(*data, s, device, (e.u32(32) & 1) != 0, shared || nt_sharing, &desc);
     if (st != status::kSuccess) break;
     dxgk::Handle handle = 0;
     st = s.kernel().create_allocation(s.pid(), device, desc, &handle);
@@ -249,6 +251,7 @@ uint32_t create_allocation_common(Session& s, Call& call, uint64_t arg, uint64_t
     id = ps.next_resource++;
     resource->id = id;
     resource->share = share_id;
+    resource->nt_shareable = nt_sharing;
     for (uint32_t i = 0; i < created.count(); ++i) {
       ps.find_allocation(created[i])->resource = id;
       resource->allocations.push_back(created[i]);

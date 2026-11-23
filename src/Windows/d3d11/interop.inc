@@ -104,6 +104,87 @@ static HRESULT STDMETHODCALLTYPE on12_CreateWrappedResource(ID3D11On12Device1 *p
   dx_Release(made);
   return hr;
 }
+/* ---- shared resources -------------------------------------------------------------------------------------------------------------------------------------- */
+/* A texture made D3D11_RESOURCE_MISC_SHARED_NTHANDLE is a Direct3D 12 resource made D3D12_HEAP_FLAG_SHARED (tex_make), its description carried along
+ * (tex_share_blob); IDXGIResource1::CreateSharedHandle makes the NT handle (dxgi_resource.inc) and OpenSharedResource1 opens it as a texture of this device over the
+ * same memory. A resource Direct3D 12 shared (no description of ours) is opened as the texture its Direct3D 12 description says, bound as its flags allow. The legacy
+ * shared handles of IDXGIResource::GetSharedHandle are not made (DXGI_ERROR_UNSUPPORTED there), so OpenSharedResource takes none. */
+static void tex_take_kind(Tex *t, UINT kind, UINT depth) {
+  extern const ID3D11Texture3DVtbl tex3_vtbl;
+  extern const ID3D11Texture1DVtbl tex1d_vtbl;
+  static const GUID *const iids3[] = {&IID_ID3D11DeviceChild, &IID_ID3D11Resource, &IID_ID3D11Texture3D, NULL};
+  static const GUID *const iids1[] = {&IID_ID3D11DeviceChild, &IID_ID3D11Resource, &IID_ID3D11Texture1D, NULL};
+  if (kind == 1) {
+    t->c.o.lpVtbl = (const void *)&tex3_vtbl;
+    t->c.o.iids = iids3;
+    const D3D11_TEXTURE3D_DESC d3 = {t->desc.Width, t->desc.Height, depth, t->desc.MipLevels, t->desc.Format, t->desc.Usage, t->desc.BindFlags, t->desc.CPUAccessFlags, t->desc.MiscFlags};
+    t->desc3 = d3;
+  } else if (kind == 2) {
+    t->c.o.lpVtbl = (const void *)&tex1d_vtbl;
+    t->c.o.iids = iids1;
+    t->one_d = TRUE;
+    const D3D11_TEXTURE1D_DESC d1 = {t->desc.Width, t->desc.MipLevels, t->desc.ArraySize, t->desc.Format, t->desc.Usage, t->desc.BindFlags, t->desc.CPUAccessFlags, t->desc.MiscFlags};
+    t->desc1 = d1;
+  }
+}
+static HRESULT open_shared_texture(Dev *d, ID3D12Resource *res, REFIID riid, void **out) {
+  const D3D12_RESOURCE_DESC rd = ID3D12Resource_GetDesc(res);
+  if (rd.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) return E_INVALIDARG;      /* (Direct3D 11 shares textures) */
+  BYTE blob[TEX_SHARE_BYTES];
+  D3D11_TEXTURE2D_DESC desc;
+  UINT kind = 0, slices = 0;
+  const UINT size = TcosD3D12SharedExtra(res, blob, sizeof blob);
+  if (!tex_share_read(blob, size, &desc, &kind, &slices)) {
+    /* (Direct3D 12's: the texture its description says, bound as its flags allow) */
+    kind = rd.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D ? 1 : rd.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D ? 2 : 0;
+    slices = kind == 1 ? rd.DepthOrArraySize : 0;
+    UINT bind = (rd.Flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE) ? 0u : (UINT)D3D11_BIND_SHADER_RESOURCE;
+    if (rd.Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET) bind |= D3D11_BIND_RENDER_TARGET;
+    if (rd.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL) bind = (bind & ~(UINT)D3D11_BIND_SHADER_RESOURCE) | D3D11_BIND_DEPTH_STENCIL;
+    if (rd.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) bind |= D3D11_BIND_UNORDERED_ACCESS;
+    const D3D11_TEXTURE2D_DESC from12 = {(UINT)rd.Width, rd.Height, rd.MipLevels, kind == 1 ? 1u : rd.DepthOrArraySize, rd.Format, rd.SampleDesc, D3D11_USAGE_DEFAULT,
+                                         bind, 0, D3D11_RESOURCE_MISC_SHARED | D3D11_RESOURCE_MISC_SHARED_NTHANDLE};
+    desc = from12;
+  }
+  Tex *t = NULL;
+  EnterCriticalSection(&d->lock);
+  HRESULT hr = tex_make(d, &desc, slices, res, &t);
+  if (SUCCEEDED(hr)) tex_take_kind(t, kind, slices);
+  LeaveCriticalSection(&d->lock);
+  if (FAILED(hr)) return hr;
+  hr = IUnknown_QueryInterface((IUnknown *)t, riid, out);
+  dx_Release(OBJ(t));
+  return hr;
+}
+static HRESULT STDMETHODCALLTYPE dev_OpenSharedResource1(Dev *d, HANDLE handle, REFIID riid, void **out) {
+  if (out) *out = NULL;
+  if (!handle || !riid || !out) return E_INVALIDARG;
+  ID3D12Resource *res = NULL;
+  HRESULT hr = ID3D12Device_OpenSharedHandle(d->d12, handle, &IID_ID3D12Resource, (void **)&res);
+  if (FAILED(hr) || !res) return hr == E_NOINTERFACE || SUCCEEDED(hr) ? E_INVALIDARG : hr;      /* (a fence's or a heap's handle: no resource) */
+  hr = open_shared_texture(d, res, riid, out);
+  ID3D12Resource_Release(res);
+  return hr;
+}
+/* (the legacy handles of GetSharedHandle: none is made here) */
+static HRESULT STDMETHODCALLTYPE dev_OpenSharedResource(Dev *d, HANDLE handle, REFIID riid, void **out) {
+  (void)d; (void)handle; (void)riid;
+  if (out) *out = NULL;
+  return E_INVALIDARG;
+}
+/* DXGI_SHARED_RESOURCE_READ and _WRITE: what a handle may be asked for. */
+#define SHARED_ACCESS_ALL (0x80000000u | 0x1u)
+static HRESULT STDMETHODCALLTYPE dev_OpenSharedResourceByName(Dev *d, LPCWSTR name, DWORD access, REFIID riid, void **out) {
+  if (out) *out = NULL;
+  if (!name || !riid || !out || !access || (access & ~SHARED_ACCESS_ALL)) return E_INVALIDARG;
+  HANDLE handle = NULL;
+  HRESULT hr = ID3D12Device_OpenSharedHandleByName(d->d12, name, GENERIC_ALL, &handle);
+  if (FAILED(hr)) return hr;
+  hr = dev_OpenSharedResource1(d, handle, riid, out);
+  CloseHandle(handle);
+  return hr;
+}
+
 /* Before Direct3D 12 uses what the device wrote into wrapped resources: what was recorded is sent (the queue runs it before it returns). */
 static void STDMETHODCALLTYPE on12_ReleaseWrappedResources(ID3D11On12Device1 *p, ID3D11Resource *const *resources, UINT count) {
   Dev *d = dev_of_on12(p);

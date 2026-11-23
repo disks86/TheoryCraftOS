@@ -581,6 +581,7 @@ bool export_idle(ExportedAllocation& exported) {
 }
 
 bool copy_export(ExportedAllocation& exported, ByteView bytes, bool to_image) {
+  if (!exported.info_.image) return false;      // (an NT handle's export: not a dmabuf's image)
   kernel::ScopedMutex g(exported.kernel_.lock_);
   Allocation& a = *exported.allocation_;
   exported.adapter_.pump();
@@ -677,7 +678,10 @@ NtStatus Kernel::import_sync(ProcessId pid, Handle device, const ExportedSync& e
   return *sync ? status::kSuccess : status::kInsufficientResources;
 }
 
-NtStatus Kernel::export_allocation(ProcessId pid, Handle allocation, SharedPointer<ExportedAllocation>* out) {
+NtStatus Kernel::export_allocation(ProcessId pid, Handle allocation, SharedPointer<ExportedAllocation>* out) { return export_locked_common(pid, allocation, true, out); }
+NtStatus Kernel::export_shared_allocation(ProcessId pid, Handle allocation, SharedPointer<ExportedAllocation>* out) { return export_locked_common(pid, allocation, false, out); }
+
+NtStatus Kernel::export_locked_common(ProcessId pid, Handle allocation, bool image_only, SharedPointer<ExportedAllocation>* out) {
   SharedPointer<ExportedAllocation> made;
   {
     kernel::ScopedMutex g(lock_);
@@ -687,8 +691,8 @@ NtStatus Kernel::export_allocation(ProcessId pid, Handle allocation, SharedPoint
     const Allocation& a = *rec->allocation;
     const AllocationDesc& d = a.desc();
     if (!(d.flags & kAllocShared)) return status::kAccessDenied;
-    if (!a.is_image() || a.is_depth() || a.is_staging() || d.samples != 1 || d.mip_levels != 1 || d.kind != graphics::TextureKind::Texture2D || d.layers > 1 || d.heap != 0 ||
-        !exportable_format(d.format))
+    if (image_only && (!a.is_image() || a.is_depth() || a.is_staging() || d.samples != 1 || d.mip_levels != 1 || d.kind != graphics::TextureKind::Texture2D || d.layers > 1 ||
+                       d.heap != 0 || !exportable_format(d.format)))
       return status::kNotSupported;
     Adapter* adapter = adapter_of_locked(a);
     if (!adapter) return status::kInvalidDeviceState;
@@ -697,6 +701,7 @@ NtStatus Kernel::export_allocation(ProcessId pid, Handle allocation, SharedPoint
     info.pitch = a.pitch();
     info.bytes = a.backing().size();
     info.adapter = adapter->index();
+    info.image = image_only;
     made = SharedPointer<ExportedAllocation>::make(allocator_, *this, rec->allocation, *adapter, info);
     if (!made) return status::kNoMemory;
   }
@@ -722,6 +727,7 @@ NtStatus Kernel::import_allocation(ProcessId pid, Handle device, const ExportedA
 
 NtStatus Kernel::read_export(ExportedAllocation& exported, LockResult* out) {
   if (&exported.kernel_ != this) return status::kInvalidParameter;
+  if (!exported.info_.image) return status::kNotSupported;
   kernel::ScopedMutex g(lock_);
   Allocation& a = *exported.allocation_;
   exported.adapter_.pump();
@@ -748,6 +754,7 @@ NtStatus Kernel::end_read_export(ExportedAllocation& exported) {
 
 NtStatus Kernel::acquire_export_image(ExportedAllocation& exported, AcquiredImage* out) {
   if (&exported.kernel_ != this || !out) return status::kInvalidParameter;
+  if (!exported.info_.image) return status::kNotSupported;
   kernel::ScopedMutex g(lock_);
   Allocation& a = *exported.allocation_;
   if (!(a.desc().flags & kAllocTexture) || !(a.desc().flags & kAllocRenderTarget)) return status::kNotSupported;
