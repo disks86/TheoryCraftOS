@@ -198,6 +198,8 @@ static void dev_destroy(DxObj *o) {
   if (d->ctx) { ctx_unbind_all(d->ctx); mem_free(d->ctx); }
   if (d->blank) dx_Release(OBJ(d->blank));
   for (UINT k = 0; k < 4; ++k) if (d->blank_kind[k]) dx_Release(OBJ(d->blank_kind[k]));
+  if (d->blank_buffer) dx_Release(OBJ(d->blank_buffer));
+  if (d->blank_uav) dx_Release(OBJ(d->blank_uav));
   for (UINT i = 0; i < d->pipeline_count; ++i) if (d->pipelines[i].state) ID3D12PipelineState_Release(d->pipelines[i].state);
   if (d->ring) ID3D12Resource_Release(d->ring);
   spares_release(d);
@@ -205,6 +207,15 @@ static void dev_destroy(DxObj *o) {
   if (d->sampler_heap) ID3D12DescriptorHeap_Release(d->sampler_heap);
   if (d->rtv_heap) ID3D12DescriptorHeap_Release(d->rtv_heap);
   if (d->dsv_heap) ID3D12DescriptorHeap_Release(d->dsv_heap);
+  for (UINT i = 0; i < d->active_count; ++i) dx_Release(OBJ(d->active[i]));
+  d->active_count = 0;
+  if (d->predicate) { dx_Release(OBJ(d->predicate)); d->predicate = NULL; }
+  if (d->sig_draw) ID3D12CommandSignature_Release(d->sig_draw);
+  if (d->sig_draw_indexed) ID3D12CommandSignature_Release(d->sig_draw_indexed);
+  if (d->sig_dispatch) ID3D12CommandSignature_Release(d->sig_dispatch);
+  if (d->measure_heap) ID3D12QueryHeap_Release(d->measure_heap);
+  if (d->measure_readback) ID3D12Resource_Release(d->measure_readback);
+  mem_free(d->measures);
   if (d->root) ID3D12RootSignature_Release(d->root);
   if (d->list) ID3D12GraphicsCommandList_Release(d->list);
   if (d->allocator) ID3D12CommandAllocator_Release(d->allocator);
@@ -232,19 +243,24 @@ static HRESULT dev_start(Dev *d) {
 
   /* the one root signature: the block of constants (b0), the pixel shader's textures (t0 .. t7) and its samplers (s0 .. s7) */
   D3D12_DESCRIPTOR_RANGE views = {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, TEXTURE_SLOTS, 0, 0, 0}, samplers = {D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER, TEXTURE_SLOTS, 0, 0, 0};
-  D3D12_ROOT_PARAMETER params[3];
+  D3D12_DESCRIPTOR_RANGE uavs = {D3D12_DESCRIPTOR_RANGE_TYPE_UAV, UAV_SLOTS, 0, 0, 0};
+  D3D12_ROOT_PARAMETER params[4];
   memset(params, 0, sizeof params);
   params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
   params[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
   params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
   params[1].DescriptorTable.NumDescriptorRanges = 1;
   params[1].DescriptorTable.pDescriptorRanges = &views;
-  params[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+  params[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;      /* (every stage's textures, in the one table: see slot_view) */
   params[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
   params[2].DescriptorTable.NumDescriptorRanges = 1;
   params[2].DescriptorTable.pDescriptorRanges = &samplers;
-  params[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
-  D3D12_ROOT_SIGNATURE_DESC rsd = {3, params, 0, NULL, D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT};
+  params[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+  params[3].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;      /* (the unordered access views: the compute shader's, or the pixel shader's beside its targets) */
+  params[3].DescriptorTable.NumDescriptorRanges = 1;
+  params[3].DescriptorTable.pDescriptorRanges = &uavs;
+  params[3].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+  D3D12_ROOT_SIGNATURE_DESC rsd = {4, params, 0, NULL, D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT};
   ID3DBlob *blob = NULL, *error = NULL;
   hr = D3D12SerializeRootSignature(&rsd, D3D_ROOT_SIGNATURE_VERSION_1_0, &blob, &error);
   if (error) ID3D10Blob_Release(error);
@@ -253,6 +269,26 @@ static HRESULT dev_start(Dev *d) {
   if (blob) ID3D10Blob_Release(blob);
   if (FAILED(hr) || !d->root) return FAILED(hr) ? hr : E_FAIL;
 
+  /* (the indirect draws and dispatches: one command each, whose arguments are Direct3D 11's) */
+  static const D3D12_INDIRECT_ARGUMENT_TYPE kinds[3] = {D3D12_INDIRECT_ARGUMENT_TYPE_DRAW, D3D12_INDIRECT_ARGUMENT_TYPE_DRAW_INDEXED, D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH};
+  static const UINT arg_bytes[3] = {16, 20, 12};
+  ID3D12CommandSignature **sigs[3] = {&d->sig_draw, &d->sig_draw_indexed, &d->sig_dispatch};
+  for (UINT k = 0; k < 3; ++k) {
+    D3D12_INDIRECT_ARGUMENT_DESC arg;
+    memset(&arg, 0, sizeof arg);
+    arg.Type = kinds[k];
+    const D3D12_COMMAND_SIGNATURE_DESC sd = {arg_bytes[k], 1, &arg, 0};
+    hr = ID3D12Device_CreateCommandSignature(d->d12, &sd, NULL, &IID_ID3D12CommandSignature, (void **)sigs[k]);
+    if (FAILED(hr)) return hr;
+  }
+  /* (what the kernel measures for the queries: one slot of the heap a draw) */
+  const D3D12_QUERY_HEAP_DESC measure_desc = {D3D12_QUERY_HEAP_TYPE_OCCLUSION, MEASURES, 0};
+  if (SUCCEEDED(ID3D12Device_CreateQueryHeap(d->d12, &measure_desc, &IID_ID3D12QueryHeap, (void **)&d->measure_heap))) {
+    d->measure_readback = make_buffer(d, D3D12_HEAP_TYPE_READBACK, (UINT64)MEASURES * 8);
+    d->measures = mem_alloc(sizeof(Measure) * MEASURES);
+    if (!d->measure_readback || !d->measures) return E_OUTOFMEMORY;
+    memset(d->measures, 0, sizeof(Measure) * MEASURES);
+  } else d->measure_heap = NULL;      /* (an adapter without occlusion queries: the queries that need the kernel's measurements are not made) */
   hr = make_heap(d, D3D12_DESCRIPTOR_HEAP_TYPE_RTV, RTV_SLOTS, FALSE, &d->rtv_heap);
   if (SUCCEEDED(hr)) hr = make_heap(d, D3D12_DESCRIPTOR_HEAP_TYPE_DSV, DSV_SLOTS, FALSE, &d->dsv_heap);
   if (SUCCEEDED(hr)) hr = make_heap(d, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, VIEW_HEAP, TRUE, &d->view_heap);
@@ -287,6 +323,11 @@ static HRESULT dev_start(Dev *d) {
     d->blank_kind[kind] = t;
   }
 
+  /* (the buffers an empty buffer slot reads (zeros) and an empty unordered access slot writes: an adapter without compute has neither, and no shader that needs one) */
+  static const D3D11_BUFFER_DESC zeros = {256, D3D11_USAGE_DEFAULT, D3D11_BIND_SHADER_RESOURCE, 0, D3D11_RESOURCE_MISC_BUFFER_ALLOW_RAW_VIEWS, 0};
+  static const D3D11_BUFFER_DESC sink = {256, D3D11_USAGE_DEFAULT, D3D11_BIND_UNORDERED_ACCESS, 0, D3D11_RESOURCE_MISC_BUFFER_ALLOW_RAW_VIEWS, 0};
+  if (SUCCEEDED(dev_CreateBuffer(d, &zeros, NULL, (ID3D11Buffer **)&d->blank_buffer))) InterlockedDecrement(&d->o.ref);
+  if (SUCCEEDED(dev_CreateBuffer(d, &sink, NULL, (ID3D11Buffer **)&d->blank_uav))) InterlockedDecrement(&d->o.ref);
   Ctx *c = mem_alloc(sizeof *c);
   if (!c) return E_OUTOFMEMORY;
   dx_init(&c->o, &ctx_vtbl, g_ctx_iids, NULL);

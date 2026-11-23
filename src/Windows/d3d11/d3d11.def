@@ -2,17 +2,17 @@ LIBRARY d3d11.dll
 EXPORTS
 ; The ordinals Windows gives these exports (scripts/sync-ordinals.py)
 D3D11CreateDeviceForD3D12 @1
-D3DKMTCloseAdapter @2
-D3DKMTDestroyAllocation @3
-D3DKMTDestroyContext @4
-D3DKMTDestroyDevice @5
-D3DKMTDestroySynchronizationObject @6
-D3DKMTPresent @7
-D3DKMTQueryAdapterInfo @8
-D3DKMTSetDisplayPrivateDriverFormat @9
-D3DKMTSignalSynchronizationObject @10
-D3DKMTUnlock @11
-D3DKMTWaitForSynchronizationObject @12
+D3DKMTCloseAdapter = gdi32.D3DKMTCloseAdapter @2
+D3DKMTDestroyAllocation = gdi32.D3DKMTDestroyAllocation @3
+D3DKMTDestroyContext = gdi32.D3DKMTDestroyContext @4
+D3DKMTDestroyDevice = gdi32.D3DKMTDestroyDevice @5
+D3DKMTDestroySynchronizationObject = gdi32.D3DKMTDestroySynchronizationObject @6
+D3DKMTPresent = gdi32.D3DKMTPresent @7
+D3DKMTQueryAdapterInfo = gdi32.D3DKMTQueryAdapterInfo @8
+D3DKMTSetDisplayPrivateDriverFormat = gdi32.D3DKMTSetDisplayPrivateDriverFormat @9
+D3DKMTSignalSynchronizationObject = gdi32.D3DKMTSignalSynchronizationObject @10
+D3DKMTUnlock = gdi32.D3DKMTUnlock @11
+D3DKMTWaitForSynchronizationObject = gdi32.D3DKMTWaitForSynchronizationObject @12
 EnableFeatureLevelUpgrade @13
 OpenAdapter10 @14
 OpenAdapter10_2 @15
@@ -25,29 +25,29 @@ D3D11CoreRegisterLayers @21
 D3D11CreateDevice @22
 D3D11CreateDeviceAndSwapChain @23
 D3D11On12CreateDevice @24
-D3DKMTCreateAllocation @25
-D3DKMTCreateContext @26
-D3DKMTCreateDevice @27
-D3DKMTCreateSynchronizationObject @28
-D3DKMTEscape @29
-D3DKMTGetContextSchedulingPriority @30
-D3DKMTGetDeviceState @31
-D3DKMTGetDisplayModeList @32
-D3DKMTGetMultisampleMethodList @33
-D3DKMTGetRuntimeData @34
-D3DKMTGetSharedPrimaryHandle @35
-D3DKMTLock @36
-D3DKMTOpenAdapterFromHdc @37
-D3DKMTOpenResource @38
-D3DKMTQueryAllocationResidency @39
-D3DKMTQueryResourceInfo @40
-D3DKMTRender @41
-D3DKMTSetAllocationPriority @42
-D3DKMTSetContextSchedulingPriority @43
-D3DKMTSetDisplayMode @44
-D3DKMTSetGammaRamp @45
-D3DKMTSetVidPnSourceOwner @46
-D3DKMTWaitForVerticalBlankEvent @47
+D3DKMTCreateAllocation = gdi32.D3DKMTCreateAllocation @25
+D3DKMTCreateContext = gdi32.D3DKMTCreateContext @26
+D3DKMTCreateDevice = gdi32.D3DKMTCreateDevice @27
+D3DKMTCreateSynchronizationObject = gdi32.D3DKMTCreateSynchronizationObject @28
+D3DKMTEscape = gdi32.D3DKMTEscape @29
+D3DKMTGetContextSchedulingPriority = gdi32.D3DKMTGetContextSchedulingPriority @30
+D3DKMTGetDeviceState = gdi32.D3DKMTGetDeviceState @31
+D3DKMTGetDisplayModeList = gdi32.D3DKMTGetDisplayModeList @32
+D3DKMTGetMultisampleMethodList = gdi32.D3DKMTGetMultisampleMethodList @33
+D3DKMTGetRuntimeData = gdi32.D3DKMTGetRuntimeData @34
+D3DKMTGetSharedPrimaryHandle = gdi32.D3DKMTGetSharedPrimaryHandle @35
+D3DKMTLock = gdi32.D3DKMTLock @36
+D3DKMTOpenAdapterFromHdc = gdi32.D3DKMTOpenAdapterFromHdc @37
+D3DKMTOpenResource = gdi32.D3DKMTOpenResource @38
+D3DKMTQueryAllocationResidency = gdi32.D3DKMTQueryAllocationResidency @39
+D3DKMTQueryResourceInfo = gdi32.D3DKMTQueryResourceInfo @40
+D3DKMTRender = gdi32.D3DKMTRender @41
+D3DKMTSetAllocationPriority = gdi32.D3DKMTSetAllocationPriority @42
+D3DKMTSetContextSchedulingPriority = gdi32.D3DKMTSetContextSchedulingPriority @43
+D3DKMTSetDisplayMode = gdi32.D3DKMTSetDisplayMode @44
+D3DKMTSetGammaRamp = gdi32.D3DKMTSetGammaRamp @45
+D3DKMTSetVidPnSourceOwner = gdi32.D3DKMTSetVidPnSourceOwner @46
+D3DKMTWaitForVerticalBlankEvent = gdi32.D3DKMTWaitForVerticalBlankEvent @47
 D3DPerformance_BeginEvent @48
 D3DPerformance_EndEvent @49
 D3DPerformance_GetStatus @50

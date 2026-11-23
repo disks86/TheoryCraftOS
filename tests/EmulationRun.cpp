@@ -258,7 +258,7 @@ class FakeScreen final : public hardware::IGraphicsProcessingUnit {
 
 // Runs a Linux ELF or a Windows PE on the CPU emulator with real host threads, printing what the program writes to standard output and, last,
 // "[exit=... faulted=... killed=... vector=... addr=... pc=...]".   Usage: EmulationRun <program> [<folder with the DLLs>]
-// Used by aarch64_diff.sh and emulated_windows.sh. Gives up after 60 seconds.
+// Used by aarch64_diff.sh and emulated_windows.sh. Gives up after 60 seconds (TCOS_EMU_SECONDS).
 struct A final : allocators::IAllocator { void* allocate(uint64_t s) override { return malloc(s); } void* allocate_aligned(uint64_t s, uint64_t al) override { if (al < 16) al = 16; return aligned_alloc(al, (s + al - 1) / al * al); } void deallocate(void* p) override { free(p); } };
 static uint64_t now() { return uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count()); }
 struct H final : process::IProcessHost {
@@ -744,7 +744,9 @@ int main(int argc, char** argv) {
     }
   });
 #endif
-  std::thread watchdog([&] { for (int i = 0; i < 600 && !ctl.stop; ++i) std::this_thread::sleep_for(std::chrono::milliseconds(100)); ctl.stop = true; });
+  // (TCOS_EMU_SECONDS: how long the program may run before it is stopped, 60 by default)
+  const int limit_tenths = getenv("TCOS_EMU_SECONDS") ? atoi(getenv("TCOS_EMU_SECONDS")) * 10 : 600;
+  std::thread watchdog([&] { for (int i = 0; i < limit_tenths && !ctl.stop; ++i) std::this_thread::sleep_for(std::chrono::milliseconds(100)); ctl.stop = true; });
   auto o = run_emulated_threads(p, *cpu.get(), ctl, sync, th, a, 20000);
   bool wasstop = ctl.stop; ctl.stop = true; watchdog.join();
 #ifdef TCOS_EMU_DBUS

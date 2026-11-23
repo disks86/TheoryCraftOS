@@ -22,3 +22,4 @@ GetBehaviorValue @117
 TcosD3D12PipelineOptions
 TcosD3D12StageConstantBases
 TcosD3D12ResourceOptions
+TcosD3D12BeginQueryKind

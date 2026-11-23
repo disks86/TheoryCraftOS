@@ -96,6 +96,9 @@ EXPORT void WINAPI TcosD3D12ResourceOptions(ID3D12Device *device, UINT flags) {
   Dev *dev = (Dev *)device;
   if (dev) dev->next_resource_flags = flags;
 }
+EXPORT void WINAPI TcosD3D12BeginQueryKind(ID3D12GraphicsCommandList *list, ID3D12QueryHeap *heap, UINT index, UINT kind) {
+  if (list) list_begin_query_kind((CmdList *)list, (QHeap *)heap, index, kind);
+}
 
 EXPORT HRESULT WINAPI D3D12CreateDevice(IUnknown *adapter, D3D_FEATURE_LEVEL minimum, REFIID riid, void **out) {
   LUID luid = {0, 0};

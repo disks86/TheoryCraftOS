@@ -70,6 +70,10 @@ __asm__(".text\n.globl ___chkstk_ms\n___chkstk_ms:\n ret\n");
 #define DSV_SLOTS 256u
 #define PIPELINES 96u
 #define VERTEX_SLOTS 8u
+#define ACTIVE_QUERIES 32u            /* queries begun and not ended at once */
+#define MEASURES 2048u                /* the kernel's measurements one list holds (one a draw) */
+#define UAV_SLOTS 8u                  /* u0 .. u7: of the compute shader, and of the pixel shader beside its render targets (D3D11_PS_CS_UAV_REGISTER_COUNT) */
+#define KIND_BUFFER 0xFEu             /* Shader.tex_kind: t<n> is a raw or structured buffer */
 
 typedef struct Dev Dev;
 typedef struct Tex Tex;
@@ -79,6 +83,7 @@ typedef struct Spare {
   ID3D12Resource *res;
   BYTE *data;
   UINT64 bytes;
+  int uav;                     /* made with D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS: a buffer shaders may read as a shader resource (kept apart from the others) */
 } Spare;
 
 /* ---- the objects ----------------------------------------------------------------------------------------------------------------------------------- */
@@ -108,6 +113,16 @@ struct Buf {
   /* the copy with float colours, for a layout that needs one */
   ID3D12Resource *converted;
   UINT converted_layout, converted_version, converted_stride, converted_offset, converted_vertices, converted_out_stride;
+  /* A buffer the GPU writes (unordered access, stream output) is in the GPU's memory: `data` is NULL, `res` a default-heap buffer the CPU reaches through copies
+   * (buf_upload, buf_download); `written` is the list that wrote it last. A buffer shaders read as a shader resource is an upload buffer made for that (`uav`). */
+  int gpu;
+  int uav;
+  UINT written;
+  /* a stream output target: where the records written into it end (bytes from its start), and a buffer d3d12.dll puts that into after a list ran (the
+   * BufferFilledSizeLocation of the view: the bytes after the view's offset) */
+  UINT64 so_end;
+  ID3D12Resource *so_fill;
+  BYTE *so_fill_data;
 };
 
 struct Tex {
@@ -126,18 +141,26 @@ struct Tex {
   UINT used;
   UINT sampled;                /* the command list that has a draw sampling it */
   UINT written;                /* the command list that draws into it, clears it or copies into it */
+  FLOAT min_lod;               /* SetResourceMinLOD: the most detailed level that is sampled */
   BYTE **shadow;               /* by subresource: the copy a Map hands out (NULL until one is mapped) */
   D3D11_MAP *mapped;           /* by subresource: how it is mapped now (0: not) */
   IDXGIResource1 dxgi_res;     /* the same object, for DXGI (dxgi_resource.inc) */
   IDXGISurface2 dxgi_surf;
 };
 
-typedef struct View {          /* a render target, depth-stencil or shader resource view: the texture, and its descriptor for the first two */
+/* A render target, depth-stencil, shader resource or unordered access view: the texture (or buffer), and the descriptor of the first two. A view of a buffer names
+ * bytes of it: `offset` and `size`, with `stride` the bytes of an element (4 for a raw view, the structure's for a structured one, the format's for a typed one). */
+typedef struct View {
   Child c;
   Tex *tex;
+  Buf *buf;
   UINT slot;
   D3D12_CPU_DESCRIPTOR_HANDLE handle;
-  union { D3D11_RENDER_TARGET_VIEW_DESC rtv; D3D11_DEPTH_STENCIL_VIEW_DESC dsv; D3D11_SHADER_RESOURCE_VIEW_DESC srv; } desc;
+  UINT64 offset, size;
+  UINT stride;
+  DXGI_FORMAT format;          /* a typed buffer view's format (DXGI_FORMAT_UNKNOWN for raw and structured ones) */
+  UINT counter;                /* an append or counter view's hidden count (D3D11_BUFFER_UAV_FLAG_APPEND / COUNTER) */
+  union { D3D11_RENDER_TARGET_VIEW_DESC rtv; D3D11_DEPTH_STENCIL_VIEW_DESC dsv; D3D11_SHADER_RESOURCE_VIEW_DESC srv; D3D11_UNORDERED_ACCESS_VIEW_DESC uav; } desc;
 } View;
 
 typedef struct Shader {
@@ -146,7 +169,20 @@ typedef struct Shader {
   SIZE_T bytes;
   UINT cb_registers[CONSTANT_SLOTS];      /* the size each constant buffer is declared with, in 16-byte registers (0: not used) */
   UINT registers;                         /* ... and all of them together */
-  BYTE tex_kind[TEXTURE_SLOTS];           /* what each t<n> is declared as (Tex.kind; 0xFF: not declared) */
+  BYTE tex_kind[TEXTURE_SLOTS];           /* what each t<n> is declared as (Tex.kind, KIND_BUFFER; 0xFF: not declared) */
+  UINT uav_mask;                          /* the u<n> it declares */
+  UINT group[3];                          /* a compute shader's threads in a group (dcl_thread_group) */
+  UINT gs_instances;                      /* a geometry shader's instances (dcl_gs_instance_count; 0: one) */
+  UINT program_type;                      /* the shader's stage by its version token (D3D10_SB_TOKENIZED_PROGRAM_TYPE: 0 pixel, 1 vertex, 2 geometry, 3 hull, 4 domain, 5 compute) */
+  UINT out_vertices;                      /* the vertices of a primitive a geometry shader puts out (dcl_output_topology: 1, 2 or 3; 0 not declared) */
+  /* CreateGeometryShaderWithStreamOutput: what is captured, the strides of the buffers and the stream that is drawn (D3D11_SO_NO_RASTERIZED_STREAM: none). The
+   * shader may be a vertex or domain shader's code, which captures what that stage puts out (there is then no geometry stage: `so_only`). */
+  D3D11_SO_DECLARATION_ENTRY *so;
+  char (*so_names)[64];
+  UINT so_count, so_strides[4], so_stride_count, so_rasterized;
+  BOOL so_only;
+  ID3D12PipelineState *compute;           /* a compute shader: its Direct3D 12 pipeline, made at its first Dispatch */
+  UINT used;                              /* ... and the list that last dispatched it */
 } Shader;
 
 typedef struct Layout {
@@ -163,7 +199,18 @@ typedef struct Blend { Child c; D3D11_BLEND_DESC desc; } Blend;
 typedef struct Depth { Child c; D3D11_DEPTH_STENCIL_DESC desc; } Depth;
 typedef struct Raster { Child c; D3D11_RASTERIZER_DESC desc; } Raster;
 typedef struct Sampler { Child c; D3D11_SAMPLER_DESC desc; } Sampler;
-typedef struct Query { Child c; D3D11_QUERY_DESC desc; BOOL begun, ended; UINT64 start, stop; } Query;      /* stop/start: QueryPerformanceCounter */
+/* A query or predicate (query.inc). What the kernel measures for it (the samples that passed, the pixel shader's invocations, the stream output's primitives) is
+ * added up as each list runs; the pipeline statistics this library counts itself are added at each draw. */
+typedef struct Query {
+  Child c;
+  D3D11_QUERY_DESC desc;
+  BOOL begun, ended, active;
+  UINT64 start, stop;                         /* QueryPerformanceCounter at Begin and End */
+  UINT64 samples;
+  D3D11_QUERY_DATA_PIPELINE_STATISTICS stats;
+  UINT64 so_written[4], so_needed[4];
+  UINT64 so_filled_at_begin[4];               /* the bytes the stream output targets of each stream held at Begin (what was written is the growth) */
+} Query;
 
 typedef struct Pipeline {
   UINT vs, ps, layout;
@@ -199,6 +246,14 @@ typedef struct Ctx {
   Buf *stage_cb[3][CONSTANT_SLOTS];
   View *stage_srv[4][TEXTURE_SLOTS];
   Sampler *stage_sampler[4][TEXTURE_SLOTS];
+  /* the compute stage, and the unordered access views of the pixel shader (OMSetRenderTargetsAndUnorderedAccessViews: u<n> for n from the first after the targets) */
+  Shader *cs;
+  Buf *cs_cb[CONSTANT_SLOTS];
+  View *cs_srv[TEXTURE_SLOTS];
+  Sampler *cs_sampler[TEXTURE_SLOTS];
+  View *cs_uav[UAV_SLOTS];
+  View *ps_uav[UAV_SLOTS];
+  Buf *so_buf[4];                     /* SOSetTargets: the stream output buffers (their records go on from Buf.so_end) */
   View *rtv[8];
   UINT rtv_count;
   View *dsv;
@@ -239,6 +294,7 @@ struct Dev {
   ID3D12CommandAllocator *allocator;
   ID3D12GraphicsCommandList *list;
   ID3D12RootSignature *root;
+  ID3D12CommandSignature *sig_draw, *sig_draw_indexed, *sig_dispatch;      /* the indirect draws and dispatches (ExecuteIndirect of one command) */
   ID3D12DescriptorHeap *rtv_heap, *dsv_heap, *view_heap, *sampler_heap;
   UINT rtv_free[RTV_SLOTS], rtv_free_count, dsv_free[DSV_SLOTS], dsv_free_count;
   ID3D12Resource *ring;                    /* the constant blocks of the list's draws */
@@ -256,11 +312,28 @@ struct Dev {
   int tables_valid;
   Tex *blank;                              /* a white pixel: what a texture slot with nothing bound samples */
   Tex *blank_kind[4];                      /* ... a white volume, array and cube (by Tex.kind, made when a shader that declares one has nothing bound to it) */
+  Buf *blank_buffer;                       /* ... and a buffer of zeros, for a buffer slot (t<n> or u<n>) a shader reads with nothing bound (what it reads beyond it is zero too) */
+  Buf *blank_uav;                          /* ... and a buffer for an unordered access slot a shader declares with nothing bound (what it writes there is lost to the program) */
+  UINT64 table_uavs;                       /* the GPU handle of the unordered access table the last draw used, and what was in it */
+  UINT table_uav_ids[UAV_SLOTS];
+  FLOAT table_min_lods[TEXTURE_SLOTS];     /* ... and the textures' SetResourceMinLOD clamps the sampler table was made with */
   UINT epoch;                              /* counts the command lists */
   int recorded;                            /* the list has something in it */
   UINT dirty;                              /* what the next draw has to set again (DIRTY_*) */
   Pipeline pipelines[PIPELINES];
   UINT pipeline_count, pipeline_clock;
+  /* the queries (query.inc): those begun and not ended; the kernel's measurements of the list's draws (one query of the kernel's at a time), into slots of
+   * `measure_heap`, read back through `measure_readback` once the list ran, and the queries each is for (references) */
+  struct Query *active[ACTIVE_QUERIES];
+  UINT active_count;
+  ID3D12QueryHeap *measure_heap;
+  ID3D12Resource *measure_readback;
+  struct Measure *measures;                /* MEASURES of them */
+  UINT measure_count;
+  Buf *so_written[16];                     /* the stream output buffers the list has bound (references): where their records end is read when it has run */
+  UINT so_written_count;
+  struct Query *predicate;                 /* SetPredication: the predicate (a reference) and the value that skips the commands */
+  BOOL predicate_value;
   PendingClear clears[8];                  /* depth clears a draw has not followed yet (Direct3D 12 here does them when the next pass begins) */
   UINT clear_count;
   Ctx *ctx;
@@ -270,6 +343,7 @@ struct Dev {
 #define DIRTY_INPUT 4u
 #define DIRTY_PIPELINE 8u
 #define DIRTY_ROOT 16u
+#define DIRTY_SO 32u
 #define DIRTY_ALL 0xFFu
 
 static Dev *dev_of_dxgi(IDXGIDevice1 *p) { return (Dev *)((BYTE *)p - offsetof(Dev, dxgi)); }
@@ -363,6 +437,7 @@ static void record_pending_clears(Dev *d);
  * sent first, once for every write: about 300 ms a frame in Chrome. Instead such a buffer gets other memory, and the old is retired: kept, as it is, until
  * the list has run; then it is a spare for the next buffer of its size. */
 static void spare_keep(Dev *d, Spare s) {
+  if (s.uav < 0) { ID3D12Resource_Release(s.res); return; }      /* (a buffer of the GPU's memory: not an upload buffer to use again) */
   if (s.data) { ID3D12Resource_Unmap(s.res, 0, NULL); s.data = NULL; }      /* (d3d12.dll hashes every mapped upload buffer at each submission) */
   if (d->spare_count < SPARES_MAX && d->spare_bytes + s.bytes <= SPARES_MAX_BYTES && s.bytes) { d->spares[d->spare_count++] = s; d->spare_bytes += s.bytes; return; }
   ID3D12Resource_Release(s.res);
@@ -381,12 +456,14 @@ static void spares_release(Dev *d) {
   d->spare_bytes = 0;
 }
 static ID3D12Resource *make_buffer(Dev *d, D3D12_HEAP_TYPE heap, UINT64 bytes);
+static ID3D12Resource *make_buffer_flags(Dev *d, D3D12_HEAP_TYPE heap, UINT64 bytes, D3D12_RESOURCE_FLAGS flags);
 static void flush(Dev *d);
-/* An upload buffer of at least `bytes`, mapped: a spare (at most twice the size) or a new one. NULL if there is none. */
-static ID3D12Resource *take_upload(Dev *d, UINT64 bytes, BYTE **data, UINT64 *size) {
+/* An upload buffer of at least `bytes`, mapped: a spare (at most twice the size) or a new one. NULL if there is none. `uav`: one shaders may read as a shader resource
+ * view (the kernel takes buffer views of unordered-access allocations only). */
+static ID3D12Resource *take_upload_of(Dev *d, UINT64 bytes, int uav, BYTE **data, UINT64 *size) {
   UINT best = d->spare_count;
   for (UINT i = 0; i < d->spare_count; ++i)
-    if (d->spares[i].bytes >= bytes && d->spares[i].bytes <= bytes * 2 && (best == d->spare_count || d->spares[i].bytes < d->spares[best].bytes)) best = i;
+    if (d->spares[i].uav == uav && d->spares[i].bytes >= bytes && d->spares[i].bytes <= bytes * 2 && (best == d->spare_count || d->spares[i].bytes < d->spares[best].bytes)) best = i;
   ID3D12Resource *res;
   if (best < d->spare_count) {
     res = d->spares[best].res;
@@ -394,7 +471,7 @@ static ID3D12Resource *take_upload(Dev *d, UINT64 bytes, BYTE **data, UINT64 *si
     d->spare_bytes -= *size;
     d->spares[best] = d->spares[--d->spare_count];
   } else {
-    res = make_buffer(d, D3D12_HEAP_TYPE_UPLOAD, bytes);
+    res = make_buffer_flags(d, D3D12_HEAP_TYPE_UPLOAD, bytes, uav ? D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS : D3D12_RESOURCE_FLAG_NONE);
     *size = bytes;
     if (!res) return NULL;
   }
@@ -402,22 +479,30 @@ static ID3D12Resource *take_upload(Dev *d, UINT64 bytes, BYTE **data, UINT64 *si
   if (FAILED(ID3D12Resource_Map(res, 0, NULL, (void **)data)) || !*data) { ID3D12Resource_Release(res); return NULL; }
   return res;
 }
+static ID3D12Resource *take_upload(Dev *d, UINT64 bytes, BYTE **data, UINT64 *size) { return take_upload_of(d, bytes, 0, data, size); }
 /* `res` is read by the list being recorded: kept until the list has run (sent first when too much waits). The reference passes. */
-static void retire(Dev *d, ID3D12Resource *res, BYTE *data, UINT64 bytes) {
-  const Spare s = {res, data, bytes};
+static void retire_of(Dev *d, ID3D12Resource *res, BYTE *data, UINT64 bytes, int uav) {
+  const Spare s = {res, data, bytes, uav};
   if (d->retired_count == RETIRED_MAX) flush(d);      /* (after which nothing reads it any more) */
   if (d->retired_count == RETIRED_MAX) { spare_keep(d, s); return; }
   d->retired[d->retired_count++] = s;
   d->retired_bytes += bytes;
 }
+static void retire(Dev *d, ID3D12Resource *res, BYTE *data, UINT64 bytes) { retire_of(d, res, data, bytes, 0); }
 
 /* Sends what was recorded (the queue runs it before it returns) and begins a new list. */
+static void measures_resolve(Dev *d);
+static void measures_collect(Dev *d);
+static void so_collect(Dev *d);
 static void flush(Dev *d) {
   if (!d->recorded) return;
+  measures_resolve(d);      /* (what the kernel measured for the queries goes into memory the CPU reads after the list ran) */
   if (d->ring_used) { void *p = NULL; if (SUCCEEDED(ID3D12Resource_Map(d->ring, 0, NULL, &p))) ID3D12Resource_Unmap(d->ring, 0, NULL); }      /* (the constants go with the list) */
   ID3D12GraphicsCommandList_Close(d->list);
   ID3D12CommandList *lists[1] = {(ID3D12CommandList *)d->list};
   ID3D12CommandQueue_ExecuteCommandLists(d->queue, 1, lists);
+  measures_collect(d);
+  so_collect(d);
   ID3D12CommandAllocator_Reset(d->allocator);
   ID3D12GraphicsCommandList_Reset(d->list, d->allocator, NULL);
   spares_take_retired(d);      /* (the list has run: what it read may be used again) */
@@ -432,15 +517,17 @@ static void flush(Dev *d) {
 /* Before the CPU writes into (or the last reference leaves) something a recorded command uses. */
 static void settle(Dev *d, UINT used) { if (used == d->epoch) flush(d); }
 
-static ID3D12Resource *make_buffer(Dev *d, D3D12_HEAP_TYPE heap, UINT64 bytes) {
+static ID3D12Resource *make_buffer_flags(Dev *d, D3D12_HEAP_TYPE heap, UINT64 bytes, D3D12_RESOURCE_FLAGS flags) {
   D3D12_HEAP_PROPERTIES props = {heap, D3D12_CPU_PAGE_PROPERTY_UNKNOWN, D3D12_MEMORY_POOL_UNKNOWN, 1, 1};
-  D3D12_RESOURCE_DESC desc = {D3D12_RESOURCE_DIMENSION_BUFFER, 0, bytes < 16 ? 16 : bytes, 1, 1, 1, DXGI_FORMAT_UNKNOWN, {1, 0}, D3D12_TEXTURE_LAYOUT_ROW_MAJOR, D3D12_RESOURCE_FLAG_NONE};
+  D3D12_RESOURCE_DESC desc = {D3D12_RESOURCE_DIMENSION_BUFFER, 0, bytes < 16 ? 16 : bytes, 1, 1, 1, DXGI_FORMAT_UNKNOWN, {1, 0}, D3D12_TEXTURE_LAYOUT_ROW_MAJOR, flags};
   ID3D12Resource *res = NULL;
   ID3D12Device_CreateCommittedResource(d->d12, &props, D3D12_HEAP_FLAG_NONE, &desc,
-                                       heap == D3D12_HEAP_TYPE_READBACK ? D3D12_RESOURCE_STATE_COPY_DEST : D3D12_RESOURCE_STATE_GENERIC_READ, NULL, &IID_ID3D12Resource,
+                                       heap == D3D12_HEAP_TYPE_READBACK ? D3D12_RESOURCE_STATE_COPY_DEST
+                                       : heap == D3D12_HEAP_TYPE_DEFAULT ? D3D12_RESOURCE_STATE_COMMON : D3D12_RESOURCE_STATE_GENERIC_READ, NULL, &IID_ID3D12Resource,
                                        (void **)&res);
   return res;
 }
+static ID3D12Resource *make_buffer(Dev *d, D3D12_HEAP_TYPE heap, UINT64 bytes) { return make_buffer_flags(d, heap, bytes, D3D12_RESOURCE_FLAG_NONE); }
 
 /* ---- formats ----------------------------------------------------------------------------------------------------------------------------------------- */
 
@@ -500,8 +587,12 @@ static BOOL format_of(DXGI_FORMAT format, UINT bind, DXGI_FORMAT *stored, UINT *
 static void buf_destroy(DxObj *o) {
   Buf *b = (Buf *)o;
   Dev *d = b->c.dev;
-  if (b->converted) { const Spare s = {b->converted, NULL, b->converted_bytes}; if (b->converted_used == d->epoch) retire(d, s.res, NULL, s.bytes); else spare_keep(d, s); }
-  if (b->res) { const Spare s = {b->res, b->mapped ? b->data : NULL, b->bytes}; if (b->used == d->epoch) retire(d, s.res, s.data, s.bytes); else spare_keep(d, s); }
+  if (b->converted) { const Spare s = {b->converted, NULL, b->converted_bytes, 0}; if (b->converted_used == d->epoch) retire(d, s.res, NULL, s.bytes); else spare_keep(d, s); }
+  if (b->so_fill) { settle(d, b->used); ID3D12Resource_Release(b->so_fill); }
+  if (b->res) {
+    const Spare s = {b->res, b->mapped ? b->data : NULL, b->bytes, b->gpu ? -1 : b->uav};
+    if (b->used == d->epoch) retire_of(d, s.res, s.data, s.bytes, s.uav); else spare_keep(d, s);
+  }
   child_destroy(o);
 }
 static void STDMETHODCALLTYPE buf_GetType(Buf *b, D3D11_RESOURCE_DIMENSION *type) { (void)b; if (type) *type = D3D11_RESOURCE_DIMENSION_BUFFER; }
@@ -509,20 +600,100 @@ static void STDMETHODCALLTYPE buf_SetEvictionPriority(Buf *b, UINT priority) { (
 static UINT STDMETHODCALLTYPE buf_GetEvictionPriority(Buf *b) { (void)b; return 0; }
 static void STDMETHODCALLTYPE buf_GetDesc(Buf *b, D3D11_BUFFER_DESC *desc) { if (desc) *desc = b->desc; }
 
+/* ---- buffers in the GPU's memory -------------------------------------------------------------------------------------------------------------------- */
+
+/* Writes `bytes` at `offset` of a buffer of the GPU's memory: a copy from upload memory, recorded in order with the draws and dispatches. */
+static HRESULT buf_gpu_write(Dev *d, Buf *b, UINT64 offset, const void *data, UINT64 bytes) {
+  if (!bytes) return S_OK;
+  if (!retire_room(d, bytes)) flush(d);
+  BYTE *memory = NULL;
+  UINT64 size = 0;
+  ID3D12Resource *upload = take_upload(d, bytes, &memory, &size);
+  if (!upload) return E_OUTOFMEMORY;
+  memcpy(memory, data, bytes);
+  ID3D12Resource_Unmap(upload, 0, NULL);
+  ID3D12GraphicsCommandList_CopyBufferRegion(d->list, b->res, offset, upload, 0, bytes);
+  d->recorded = 1;
+  b->used = b->written = d->epoch;
+  ++b->version;
+  retire(d, upload, NULL, size);
+  return S_OK;
+}
+/* A buffer of the GPU's memory as it is made: `data` (ByteWidth bytes) or zeros. */
+static HRESULT buf_gpu_fill(Dev *d, Buf *b, const void *data) {
+  BYTE *zeros = NULL;
+  if (!data) { zeros = mem_alloc(b->desc.ByteWidth); if (!zeros) return E_OUTOFMEMORY; memset(zeros, 0, b->desc.ByteWidth); }
+  const HRESULT hr = buf_gpu_write(d, b, 0, data ? data : zeros, b->desc.ByteWidth);
+  mem_free(zeros);
+  return hr;
+}
+/* Reads `bytes` at `offset` of a buffer of the GPU's memory, after everything recorded before (the list is sent). */
+static HRESULT buf_gpu_read(Dev *d, Buf *b, UINT64 offset, UINT64 bytes, void *out) {
+  if (!bytes) return S_OK;
+  ID3D12Resource *readback = make_buffer(d, D3D12_HEAP_TYPE_READBACK, bytes);
+  if (!readback) return E_OUTOFMEMORY;
+  ID3D12GraphicsCommandList_CopyBufferRegion(d->list, readback, 0, b->res, offset, bytes);
+  d->recorded = 1;
+  flush(d);
+  const BYTE *memory = NULL;
+  HRESULT hr = ID3D12Resource_Map(readback, 0, NULL, (void **)&memory);
+  if (SUCCEEDED(hr) && memory) { memcpy(out, memory, bytes); ID3D12Resource_Unmap(readback, 0, NULL); }
+  else if (SUCCEEDED(hr)) hr = E_FAIL;
+  ID3D12Resource_Release(readback);
+  return hr;
+}
+
+/* Whether a buffer description is one Direct3D 11 takes (the rules of ID3D11Device::CreateBuffer at feature level 11_0). */
+static BOOL buffer_desc_valid(const D3D11_BUFFER_DESC *desc, const D3D11_SUBRESOURCE_DATA *initial) {
+  const UINT bind = desc->BindFlags, misc = desc->MiscFlags;
+  const UINT known_bind = D3D11_BIND_VERTEX_BUFFER | D3D11_BIND_INDEX_BUFFER | D3D11_BIND_CONSTANT_BUFFER | D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_STREAM_OUTPUT |
+                          D3D11_BIND_UNORDERED_ACCESS;
+  if (desc->ByteWidth == 0 || desc->ByteWidth > (256u << 20) || (bind & ~known_bind)) return FALSE;
+  if (desc->Usage > D3D11_USAGE_STAGING || (desc->CPUAccessFlags & ~(UINT)(D3D11_CPU_ACCESS_READ | D3D11_CPU_ACCESS_WRITE))) return FALSE;
+  switch (desc->Usage) {
+    case D3D11_USAGE_DEFAULT: if (desc->CPUAccessFlags) return FALSE; break;
+    case D3D11_USAGE_IMMUTABLE: if (desc->CPUAccessFlags || !initial || !initial->pSysMem || (bind & (D3D11_BIND_UNORDERED_ACCESS | D3D11_BIND_STREAM_OUTPUT))) return FALSE; break;
+    case D3D11_USAGE_DYNAMIC: if (desc->CPUAccessFlags != D3D11_CPU_ACCESS_WRITE || (bind & (D3D11_BIND_UNORDERED_ACCESS | D3D11_BIND_STREAM_OUTPUT))) return FALSE; break;
+    case D3D11_USAGE_STAGING: if (bind || !desc->CPUAccessFlags) return FALSE; break;
+  }
+  /* (a constant buffer: whole registers, at most 4096 of them, and nothing else at feature level 11_0) */
+  if ((bind & D3D11_BIND_CONSTANT_BUFFER) && (bind != D3D11_BIND_CONSTANT_BUFFER || desc->ByteWidth % 16 || desc->ByteWidth > 65536)) return FALSE;
+  const BOOL structured = (misc & D3D11_RESOURCE_MISC_BUFFER_STRUCTURED) != 0, raw = (misc & D3D11_RESOURCE_MISC_BUFFER_ALLOW_RAW_VIEWS) != 0;
+  if (structured && raw) return FALSE;
+  if (structured && (desc->StructureByteStride == 0 || desc->StructureByteStride % 4 || desc->StructureByteStride > 2048 || desc->ByteWidth % desc->StructureByteStride)) return FALSE;
+  if ((structured || raw) && (bind & (D3D11_BIND_VERTEX_BUFFER | D3D11_BIND_INDEX_BUFFER | D3D11_BIND_STREAM_OUTPUT | D3D11_BIND_CONSTANT_BUFFER))) return FALSE;
+  if (raw && desc->ByteWidth % 4) return FALSE;
+  if ((misc & D3D11_RESOURCE_MISC_DRAWINDIRECT_ARGS) && structured) return FALSE;
+  return TRUE;
+}
+
 static HRESULT STDMETHODCALLTYPE dev_CreateBuffer(Dev *d, const D3D11_BUFFER_DESC *desc, const D3D11_SUBRESOURCE_DATA *initial, ID3D11Buffer **out) {
   if (out) *out = NULL;
-  if (!desc || desc->ByteWidth == 0 || desc->ByteWidth > (256u << 20)) return E_INVALIDARG;
-  if (desc->Usage == D3D11_USAGE_IMMUTABLE && (!initial || !initial->pSysMem)) return E_INVALIDARG;
-  if ((desc->BindFlags & D3D11_BIND_CONSTANT_BUFFER) && desc->ByteWidth > CONSTANT_BLOCK) return E_INVALIDARG;
+  if (!desc || !buffer_desc_valid(desc, initial)) return E_INVALIDARG;
+  if ((desc->BindFlags & D3D11_BIND_CONSTANT_BUFFER) && desc->ByteWidth > CONSTANT_BLOCK) return E_INVALIDARG;      /* (the kernel's constants of a draw: see CONSTANT_BLOCK) */
+  if (!out) return S_FALSE;
   Buf *b = child_new(sizeof *b, d, &buf_vtbl, g_buf_iids, buf_destroy);
   if (!b) return E_OUTOFMEMORY;
   b->desc = *desc;
-  b->res = take_upload(d, desc->ByteWidth, &b->data, &b->bytes);
+  b->version = 1;
+  if (desc->Usage == D3D11_USAGE_DEFAULT && (desc->BindFlags & (D3D11_BIND_UNORDERED_ACCESS | D3D11_BIND_STREAM_OUTPUT))) {
+    /* (the GPU writes it: a buffer of its memory, which unordered access views and stream output may name) */
+    b->gpu = 1;
+    b->bytes = (desc->ByteWidth + 15u) & ~15u;
+    b->res = make_buffer_flags(d, D3D12_HEAP_TYPE_DEFAULT, b->bytes, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+    if (!b->res) { dx_Release(OBJ(b)); return E_OUTOFMEMORY; }
+    EnterCriticalSection(&d->lock);
+    const HRESULT hr = buf_gpu_fill(d, b, initial && initial->pSysMem ? initial->pSysMem : NULL);
+    LeaveCriticalSection(&d->lock);
+    if (FAILED(hr)) { dx_Release(OBJ(b)); return hr; }
+    return give(b, (void **)out);
+  }
+  b->uav = (desc->BindFlags & D3D11_BIND_SHADER_RESOURCE) != 0;
+  b->res = take_upload_of(d, desc->ByteWidth, b->uav, &b->data, &b->bytes);
   if (!b->res) { dx_Release(OBJ(b)); return E_OUTOFMEMORY; }
   if (initial && initial->pSysMem) memcpy(b->data, initial->pSysMem, desc->ByteWidth);
   else memset(b->data, 0, desc->ByteWidth);
   ID3D12Resource_Unmap(b->res, 0, NULL);      /* (marks it changed; see Buf.data) */
-  b->version = 1;
   return give(b, (void **)out);
 }
 
@@ -788,9 +959,13 @@ static Tex *tex_of_resource(ID3D11Resource *resource) {
 }
 static void STDMETHODCALLTYPE view_GetResource(View *v, ID3D11Resource **out) {
   if (!out) return;
-  dx_AddRef(OBJ(v->tex));
-  *out = (ID3D11Resource *)v->tex;
+  DxObj *r = v->tex ? OBJ(v->tex) : OBJ(v->buf);
+  dx_AddRef(r);
+  *out = (ID3D11Resource *)r;
 }
+/* The list that last used what a view is of. */
+static UINT view_used(const View *v) { return v->tex ? v->tex->used : v->buf->used; }
+static void view_release_resource(View *v) { if (v->tex) dx_Release(OBJ(v->tex)); if (v->buf) dx_Release(OBJ(v->buf)); }
 static void rtv_destroy(DxObj *o) {
   View *v = (View *)o;
   Dev *d = v->c.dev;
@@ -812,13 +987,61 @@ static void dsv_destroy(DxObj *o) {
 }
 static void srv_destroy(DxObj *o) {
   View *v = (View *)o;
-  settle(v->c.dev, v->tex->used);
-  dx_Release(OBJ(v->tex));
+  settle(v->c.dev, view_used(v));
+  view_release_resource(v);
   child_destroy(o);
 }
+static void uav_destroy(DxObj *o) { srv_destroy(o); }
 static void STDMETHODCALLTYPE rtv_GetDesc(View *v, D3D11_RENDER_TARGET_VIEW_DESC *desc) { if (desc) *desc = v->desc.rtv; }
 static void STDMETHODCALLTYPE dsv_GetDesc(View *v, D3D11_DEPTH_STENCIL_VIEW_DESC *desc) { if (desc) *desc = v->desc.dsv; }
 static void STDMETHODCALLTYPE srv_GetDesc(View *v, D3D11_SHADER_RESOURCE_VIEW_DESC *desc) { if (desc) *desc = v->desc.srv; }
+static void STDMETHODCALLTYPE uav_GetDesc(View *v, D3D11_UNORDERED_ACCESS_VIEW_DESC *desc) { if (desc) *desc = v->desc.uav; }
+
+/* The bytes of an element of a typed buffer view of `format`; 0 for a format a buffer view cannot have (a block-compressed, depth or video format). */
+static UINT buffer_format_bytes(DXGI_FORMAT format) {
+  switch (format) {
+    case DXGI_FORMAT_R32G32B32A32_TYPELESS: case DXGI_FORMAT_R32G32B32A32_FLOAT: case DXGI_FORMAT_R32G32B32A32_UINT: case DXGI_FORMAT_R32G32B32A32_SINT: return 16;
+    case DXGI_FORMAT_R32G32B32_TYPELESS: case DXGI_FORMAT_R32G32B32_FLOAT: case DXGI_FORMAT_R32G32B32_UINT: case DXGI_FORMAT_R32G32B32_SINT: return 12;
+    case DXGI_FORMAT_R16G16B16A16_TYPELESS: case DXGI_FORMAT_R16G16B16A16_FLOAT: case DXGI_FORMAT_R16G16B16A16_UNORM: case DXGI_FORMAT_R16G16B16A16_UINT:
+    case DXGI_FORMAT_R16G16B16A16_SNORM: case DXGI_FORMAT_R16G16B16A16_SINT: case DXGI_FORMAT_R32G32_TYPELESS: case DXGI_FORMAT_R32G32_FLOAT: case DXGI_FORMAT_R32G32_UINT:
+    case DXGI_FORMAT_R32G32_SINT: return 8;
+    case DXGI_FORMAT_R10G10B10A2_TYPELESS: case DXGI_FORMAT_R10G10B10A2_UNORM: case DXGI_FORMAT_R10G10B10A2_UINT: case DXGI_FORMAT_R11G11B10_FLOAT:
+    case DXGI_FORMAT_R8G8B8A8_TYPELESS: case DXGI_FORMAT_R8G8B8A8_UNORM: case DXGI_FORMAT_R8G8B8A8_UINT: case DXGI_FORMAT_R8G8B8A8_SNORM: case DXGI_FORMAT_R8G8B8A8_SINT:
+    case DXGI_FORMAT_R16G16_TYPELESS: case DXGI_FORMAT_R16G16_FLOAT: case DXGI_FORMAT_R16G16_UNORM: case DXGI_FORMAT_R16G16_UINT: case DXGI_FORMAT_R16G16_SNORM:
+    case DXGI_FORMAT_R16G16_SINT: case DXGI_FORMAT_R32_TYPELESS: case DXGI_FORMAT_R32_FLOAT: case DXGI_FORMAT_R32_UINT: case DXGI_FORMAT_R32_SINT:
+    case DXGI_FORMAT_B8G8R8A8_UNORM: case DXGI_FORMAT_B8G8R8X8_UNORM: case DXGI_FORMAT_B8G8R8A8_TYPELESS: return 4;
+    case DXGI_FORMAT_R8G8_TYPELESS: case DXGI_FORMAT_R8G8_UNORM: case DXGI_FORMAT_R8G8_UINT: case DXGI_FORMAT_R8G8_SNORM: case DXGI_FORMAT_R8G8_SINT:
+    case DXGI_FORMAT_R16_TYPELESS: case DXGI_FORMAT_R16_FLOAT: case DXGI_FORMAT_R16_UNORM: case DXGI_FORMAT_R16_UINT: case DXGI_FORMAT_R16_SNORM: case DXGI_FORMAT_R16_SINT:
+    case DXGI_FORMAT_B5G6R5_UNORM: case DXGI_FORMAT_B5G5R5A1_UNORM: case DXGI_FORMAT_B4G4R4A4_UNORM: return 2;
+    case DXGI_FORMAT_R8_TYPELESS: case DXGI_FORMAT_R8_UNORM: case DXGI_FORMAT_R8_UINT: case DXGI_FORMAT_R8_SNORM: case DXGI_FORMAT_R8_SINT: case DXGI_FORMAT_A8_UNORM: return 1;
+    default: return 0;
+  }
+}
+/* The bytes a buffer view names: `first` and `count` elements; the stride by the view's kind (raw: 4, structured: the buffer's structure, typed: the format's).
+ * FALSE for a view Direct3D 11 does not make of that buffer. */
+static BOOL buffer_view_range(const Buf *b, DXGI_FORMAT format, BOOL raw, UINT first, UINT count, View *v) {
+  const BOOL structured = (b->desc.MiscFlags & D3D11_RESOURCE_MISC_BUFFER_STRUCTURED) != 0;
+  UINT stride;
+  if (raw) {
+    if (!(b->desc.MiscFlags & D3D11_RESOURCE_MISC_BUFFER_ALLOW_RAW_VIEWS) || format != DXGI_FORMAT_R32_TYPELESS) return FALSE;
+    stride = 4;
+  } else if (structured) {
+    if (format != DXGI_FORMAT_UNKNOWN) return FALSE;
+    stride = b->desc.StructureByteStride;
+  } else {
+    stride = buffer_format_bytes(format);
+    if (!stride || format == DXGI_FORMAT_R32G32B32A32_TYPELESS || format == DXGI_FORMAT_R32G32B32_TYPELESS || format == DXGI_FORMAT_R16G16B16A16_TYPELESS ||
+        format == DXGI_FORMAT_R32G32_TYPELESS || format == DXGI_FORMAT_R10G10B10A2_TYPELESS || format == DXGI_FORMAT_R8G8B8A8_TYPELESS || format == DXGI_FORMAT_R16G16_TYPELESS ||
+        format == DXGI_FORMAT_R32_TYPELESS || format == DXGI_FORMAT_R8G8_TYPELESS || format == DXGI_FORMAT_R16_TYPELESS || format == DXGI_FORMAT_R8_TYPELESS ||
+        format == DXGI_FORMAT_B8G8R8A8_TYPELESS) return FALSE;      /* (a typed view has a type) */
+  }
+  if (count == 0 || first > b->desc.ByteWidth / stride || count > b->desc.ByteWidth / stride - first) return FALSE;
+  v->offset = (UINT64)first * stride;
+  v->size = (UINT64)count * stride;
+  v->stride = stride;
+  v->format = raw || structured ? DXGI_FORMAT_UNKNOWN : format;
+  return TRUE;
+}
 
 static HRESULT STDMETHODCALLTYPE dev_CreateRenderTargetView(Dev *d, ID3D11Resource *resource, const D3D11_RENDER_TARGET_VIEW_DESC *desc, ID3D11RenderTargetView **out) {
   if (out) *out = NULL;
@@ -864,10 +1087,48 @@ static HRESULT STDMETHODCALLTYPE dev_CreateDepthStencilView(Dev *d, ID3D11Resour
   ID3D12Device_CreateDepthStencilView(d->d12, t->res, NULL, v->handle);      /* (the view follows the resource: a multisampled one is seen as such) */
   return give(v, (void **)out);
 }
+static Buf *buf_of_resource(ID3D11Resource *resource);
+static HRESULT srv_of_buffer(Dev *d, Buf *b, const D3D11_SHADER_RESOURCE_VIEW_DESC *desc, ID3D11ShaderResourceView **out) {
+  if (!(b->desc.BindFlags & D3D11_BIND_SHADER_RESOURCE)) return E_INVALIDARG;
+  D3D11_SHADER_RESOURCE_VIEW_DESC whole;
+  if (!desc) {
+    /* (without a description: a structured buffer, all of it) */
+    if (!(b->desc.MiscFlags & D3D11_RESOURCE_MISC_BUFFER_STRUCTURED)) return E_INVALIDARG;
+    memset(&whole, 0, sizeof whole);
+    whole.Format = DXGI_FORMAT_UNKNOWN;
+    whole.ViewDimension = D3D11_SRV_DIMENSION_BUFFER;
+    whole.Buffer.FirstElement = 0;
+    whole.Buffer.NumElements = b->desc.ByteWidth / b->desc.StructureByteStride;
+    desc = &whole;
+  }
+  View probe;
+  memset(&probe, 0, sizeof probe);
+  if (desc->ViewDimension == D3D11_SRV_DIMENSION_BUFFER) {
+    if (!buffer_view_range(b, desc->Format, FALSE, desc->Buffer.FirstElement, desc->Buffer.NumElements, &probe)) return E_INVALIDARG;
+  } else if (desc->ViewDimension == D3D11_SRV_DIMENSION_BUFFEREX) {
+    if ((desc->BufferEx.Flags & ~(UINT)D3D11_BUFFEREX_SRV_FLAG_RAW) ||
+        !buffer_view_range(b, desc->Format, (desc->BufferEx.Flags & D3D11_BUFFEREX_SRV_FLAG_RAW) != 0, desc->BufferEx.FirstElement, desc->BufferEx.NumElements, &probe))
+      return E_INVALIDARG;
+  } else return E_INVALIDARG;
+  if (!out) return S_FALSE;
+  View *v = child_new(sizeof *v, d, &srv_vtbl, g_srv_iids, srv_destroy);
+  if (!v) return E_OUTOFMEMORY;
+  dx_AddRef(OBJ(b));
+  v->buf = b;
+  v->offset = probe.offset;
+  v->size = probe.size;
+  v->stride = probe.stride;
+  v->format = probe.format;
+  v->desc.srv = *desc;
+  return give(v, (void **)out);
+}
+
 static HRESULT STDMETHODCALLTYPE dev_CreateShaderResourceView(Dev *d, ID3D11Resource *resource, const D3D11_SHADER_RESOURCE_VIEW_DESC *desc, ID3D11ShaderResourceView **out) {
   if (out) *out = NULL;
+  Buf *b = buf_of_resource(resource);
+  if (b) return srv_of_buffer(d, b, desc, out);
   Tex *t = tex_of_resource(resource);
-  if (!t) return resource ? E_NOTIMPL : E_INVALIDARG;      /* (a buffer as a shader resource) */
+  if (!t) return E_INVALIDARG;
   if (!(t->desc.BindFlags & D3D11_BIND_SHADER_RESOURCE)) return E_INVALIDARG;      /* (a depth buffer made to be read too has one: ANGLE makes them for its depth renderbuffers) */
   View *v = child_new(sizeof *v, d, &srv_vtbl, g_srv_iids, srv_destroy);
   if (!v) return E_OUTOFMEMORY;
@@ -887,10 +1148,66 @@ static HRESULT STDMETHODCALLTYPE dev_CreateShaderResourceView(Dev *d, ID3D11Reso
   return give(v, (void **)out);
 }
 
+/* An unordered access view. Of a buffer: raw (R32_TYPELESS, a buffer that allows raw views), structured (UNKNOWN; an append or counter view has a hidden count), or
+ * typed. Of a texture: the view is made, but the kernel has no unordered access to textures, and a shader that declares one is refused (docs/Direct3D11.md). */
+static HRESULT STDMETHODCALLTYPE dev_CreateUnorderedAccessView(Dev *d, ID3D11Resource *resource, const D3D11_UNORDERED_ACCESS_VIEW_DESC *desc, ID3D11UnorderedAccessView **out) {
+  extern const ID3D11UnorderedAccessViewVtbl uav_vtbl;
+  static const GUID *const iids[] = {&IID_ID3D11DeviceChild, &IID_ID3D11View, &IID_ID3D11UnorderedAccessView, NULL};
+  if (out) *out = NULL;
+  Buf *b = buf_of_resource(resource);
+  Tex *t = tex_of_resource(resource);
+  if (!b && !t) return E_INVALIDARG;
+  View probe;
+  memset(&probe, 0, sizeof probe);
+  D3D11_UNORDERED_ACCESS_VIEW_DESC whole;
+  memset(&whole, 0, sizeof whole);
+  if (b) {
+    if (!(b->desc.BindFlags & D3D11_BIND_UNORDERED_ACCESS)) return E_INVALIDARG;
+    if (!desc) {
+      if (!(b->desc.MiscFlags & D3D11_RESOURCE_MISC_BUFFER_STRUCTURED)) return E_INVALIDARG;
+      whole.Format = DXGI_FORMAT_UNKNOWN;
+      whole.ViewDimension = D3D11_UAV_DIMENSION_BUFFER;
+      whole.Buffer.NumElements = b->desc.ByteWidth / b->desc.StructureByteStride;
+      desc = &whole;
+    }
+    const UINT flags = desc->Buffer.Flags;
+    if (desc->ViewDimension != D3D11_UAV_DIMENSION_BUFFER || (flags & ~(UINT)(D3D11_BUFFER_UAV_FLAG_RAW | D3D11_BUFFER_UAV_FLAG_APPEND | D3D11_BUFFER_UAV_FLAG_COUNTER))) return E_INVALIDARG;
+    if ((flags & D3D11_BUFFER_UAV_FLAG_APPEND) && (flags & D3D11_BUFFER_UAV_FLAG_COUNTER)) return E_INVALIDARG;
+    if ((flags & (D3D11_BUFFER_UAV_FLAG_APPEND | D3D11_BUFFER_UAV_FLAG_COUNTER)) && !(b->desc.MiscFlags & D3D11_RESOURCE_MISC_BUFFER_STRUCTURED)) return E_INVALIDARG;
+    if (!buffer_view_range(b, desc->Format, (flags & D3D11_BUFFER_UAV_FLAG_RAW) != 0, desc->Buffer.FirstElement, desc->Buffer.NumElements, &probe)) return E_INVALIDARG;
+  } else {
+    if (!(t->desc.BindFlags & D3D11_BIND_UNORDERED_ACCESS)) return E_INVALIDARG;
+    if (!desc) {
+      whole.Format = t->desc.Format;
+      whole.ViewDimension = t->kind == 1 ? D3D11_UAV_DIMENSION_TEXTURE3D : t->desc.ArraySize > 1 ? D3D11_UAV_DIMENSION_TEXTURE2DARRAY : D3D11_UAV_DIMENSION_TEXTURE2D;
+      if (whole.ViewDimension == D3D11_UAV_DIMENSION_TEXTURE2DARRAY) whole.Texture2DArray.ArraySize = t->desc.ArraySize;
+      if (whole.ViewDimension == D3D11_UAV_DIMENSION_TEXTURE3D) whole.Texture3D.WSize = t->slices;
+      desc = &whole;
+    }
+    if (desc->ViewDimension == D3D11_UAV_DIMENSION_BUFFER || desc->ViewDimension == D3D11_UAV_DIMENSION_UNKNOWN) return E_INVALIDARG;
+    if (desc->ViewDimension == D3D11_UAV_DIMENSION_TEXTURE2D && desc->Texture2D.MipSlice >= t->desc.MipLevels) return E_INVALIDARG;
+  }
+  if (!out) return S_FALSE;
+  View *v = child_new(sizeof *v, d, &uav_vtbl, iids, uav_destroy);
+  if (!v) return E_OUTOFMEMORY;
+  if (b) { dx_AddRef(OBJ(b)); v->buf = b; }
+  else { dx_AddRef(OBJ(t)); v->tex = t; }
+  v->offset = probe.offset;
+  v->size = probe.size;
+  v->stride = probe.stride;
+  v->format = probe.format;
+  v->desc.uav = *desc;
+  return give(v, (void **)out);
+}
+
 /* ---- shaders, layouts and states ------------------------------------------------------------------------------------------------------------------- */
 
 static void shader_destroy(DxObj *o) {
-  mem_free(((Shader *)o)->code);
+  Shader *s = (Shader *)o;
+  if (s->compute) { settle(s->c.dev, s->used); ID3D12PipelineState_Release(s->compute); }
+  mem_free(s->so);
+  mem_free(s->so_names);
+  mem_free(s->code);
   child_destroy(o);
 }
 
@@ -909,6 +1226,9 @@ static void shader_constants(Shader *s) {
     if (size > s->bytes - at - 8 || size < 8) return;
     const UINT words = size / 4;
     const BYTE *code = b + at + 8;
+    UINT version;
+    memcpy(&version, code, 4);
+    s->program_type = version >> 16;
     for (UINT w = 2; w < words;) {
       UINT token, length;
       memcpy(&token, code + 4 * w, 4);
@@ -916,15 +1236,23 @@ static void shader_constants(Shader *s) {
       length = (token >> 24) & 0x7F;
       if (op == 53 /* customdata */) { if (w + 1 >= words) return; memcpy(&length, code + 4 * (w + 1), 4); }
       if (length == 0 || length > words - w) return;
-      if (op == 88 /* dcl_resource: the dimension in the token, then the operand and its register */ && length >= 3) {
+      /* dcl_resource (the dimension in the token), dcl_resource_raw / _structured, dcl_uav_typed / _raw / _structured: the operand, then its register */
+      if ((op == 88 || op == 161 || op == 162 || op == 156 || op == 157 || op == 158) && length >= 3) {
         UINT operand, slot;
         const UINT dimension = (token >> 11) & 0x1F;
         memcpy(&operand, code + 4 * (w + 1), 4);
         const UINT k = w + ((operand >> 31) ? 3 : 2);
         if (k < w + length && ((operand >> 20) & 3) == 1) {      /* (one immediate index: SM 4 / 5.0) */
           memcpy(&slot, code + 4 * k, 4);
-          if (slot < TEXTURE_SLOTS) s->tex_kind[slot] = dimension == 5 ? 1 : dimension == 8 ? 2 : dimension == 6 ? 3 : 0;
+          if (op >= 156 && op <= 158) { if (slot < UAV_SLOTS) s->uav_mask |= 1u << slot; }
+          else if (slot < TEXTURE_SLOTS) s->tex_kind[slot] = op != 88 || dimension == 1 ? KIND_BUFFER : dimension == 5 ? 1 : dimension == 8 ? 2 : dimension == 6 ? 3 : 0;
         }
+      }
+      if (op == 155 /* dcl_thread_group x, y, z */ && length >= 4) for (UINT k = 0; k < 3; ++k) memcpy(&s->group[k], code + 4 * (w + 1 + k), 4);
+      if (op == 206 /* dcl_gs_instance_count n */ && length >= 2) memcpy(&s->gs_instances, code + 4 * (w + 1), 4);
+      if (op == 92 /* dcl_output_topology: the topology in the token (1 points, 2 lines, 3 line strip, 4 triangles, 5 triangle strip) */) {
+        const UINT t = (token >> 11) & 0x7F;
+        s->out_vertices = t == 1 ? 1 : (t == 2 || t == 3) ? 2 : 3;
       }
       if (op == 89 /* dcl_constantbuffer: the operand, then the slot and the size in registers */ && length >= 4) {
         UINT operand, slot, registers, k = w + 1;
@@ -977,6 +1305,62 @@ static HRESULT STDMETHODCALLTYPE dev_CreateHullShader(Dev *d, const void *code, 
 static HRESULT STDMETHODCALLTYPE dev_CreateDomainShader(Dev *d, const void *code, SIZE_T bytes, ID3D11ClassLinkage *linkage, ID3D11DomainShader **out) {
   (void)linkage;
   return shader_make(d, code, bytes, &ds_vtbl, g_ds_iids, (void **)out);
+}
+/* A geometry shader whose outputs go into stream output buffers, or the code of a vertex or domain shader whose outputs do (there is then no geometry stage). */
+static HRESULT STDMETHODCALLTYPE dev_CreateGeometryShaderWithStreamOutput(Dev *d, const void *code, SIZE_T bytes, const D3D11_SO_DECLARATION_ENTRY *entries, UINT count,
+                                                                         const UINT *strides, UINT stride_count, UINT rasterized, ID3D11ClassLinkage *linkage,
+                                                                         ID3D11GeometryShader **out) {
+  (void)linkage;
+  if (out) *out = NULL;
+  if (!entries || count == 0 || count > D3D11_SO_STREAM_COUNT * D3D11_SO_OUTPUT_COMPONENT_COUNT || stride_count > D3D11_SO_BUFFER_SLOT_COUNT || (stride_count && !strides)) return E_INVALIDARG;
+  if (rasterized != D3D11_SO_NO_RASTERIZED_STREAM && rasterized >= D3D11_SO_STREAM_COUNT) return E_INVALIDARG;
+  for (UINT i = 0; i < stride_count; ++i) if (strides[i] > 2048 || strides[i] % 4) return E_INVALIDARG;
+  UINT components[4] = {0, 0, 0, 0}, stream_of_slot[4] = {~0u, ~0u, ~0u, ~0u};
+  for (UINT i = 0; i < count; ++i) {
+    const D3D11_SO_DECLARATION_ENTRY *e = &entries[i];
+    if (e->Stream >= D3D11_SO_STREAM_COUNT || e->OutputSlot >= D3D11_SO_BUFFER_SLOT_COUNT || e->ComponentCount == 0 || e->ComponentCount > 4 || e->StartComponent > 3 ||
+        e->StartComponent + e->ComponentCount > 4)
+      return E_INVALIDARG;
+    if (stream_of_slot[e->OutputSlot] != ~0u && stream_of_slot[e->OutputSlot] != e->Stream) return E_INVALIDARG;      /* (a buffer has one stream's records) */
+    stream_of_slot[e->OutputSlot] = e->Stream;
+    components[e->OutputSlot] += e->ComponentCount;
+  }
+  for (UINT slot = 0; slot < 4; ++slot)
+    if (components[slot] && slot < stride_count && strides[slot] && strides[slot] < components[slot] * 4) return E_INVALIDARG;      /* (a record wider than its stride) */
+  Shader *s = NULL;
+  HRESULT hr = shader_make(d, code, bytes, &gs_vtbl, g_gs_iids, (void **)&s);
+  if (FAILED(hr)) return hr;
+  if (s->program_type != 1 && s->program_type != 2 && s->program_type != 4) { dx_Release(OBJ(s)); return E_INVALIDARG; }
+  s->so_only = s->program_type != 2;
+  if (s->so_only && rasterized != D3D11_SO_NO_RASTERIZED_STREAM && rasterized != 0) { dx_Release(OBJ(s)); return E_INVALIDARG; }      /* (those stages have stream 0 only) */
+  s->so = mem_alloc(sizeof *s->so * count);
+  s->so_names = mem_alloc(sizeof *s->so_names * count);
+  if (!s->so || !s->so_names) { dx_Release(OBJ(s)); return E_OUTOFMEMORY; }
+  for (UINT i = 0; i < count; ++i) {
+    s->so[i] = entries[i];
+    s->so_names[i][0] = 0;
+    if (entries[i].SemanticName) {
+      SIZE_T n = 0;
+      while (entries[i].SemanticName[n] && n + 1 < sizeof s->so_names[i]) { s->so_names[i][n] = entries[i].SemanticName[n]; ++n; }
+      s->so_names[i][n] = 0;
+      s->so[i].SemanticName = s->so_names[i];
+    }
+  }
+  s->so_count = count;
+  s->so_stride_count = stride_count;
+  for (UINT i = 0; i < stride_count; ++i) s->so_strides[i] = strides[i];
+  for (UINT slot = 0; slot < 4; ++slot) if (components[slot] && (slot >= stride_count || !s->so_strides[slot])) s->so_strides[slot] = components[slot] * 4;      /* (a stride not given: the record) */
+  if (stride_count < 4) for (UINT slot = stride_count; slot < 4; ++slot) if (s->so_strides[slot]) s->so_stride_count = slot + 1;
+  s->so_rasterized = rasterized;
+  return give(s, (void **)out);
+}
+
+/* (a compute shader's Direct3D 12 pipeline is made at its first Dispatch: ctx_compute_prepare) */
+static HRESULT STDMETHODCALLTYPE dev_CreateComputeShader(Dev *d, const void *code, SIZE_T bytes, ID3D11ClassLinkage *linkage, ID3D11ComputeShader **out) {
+  extern const ID3D11ComputeShaderVtbl cs_vtbl;
+  static const GUID *const iids[] = {&IID_ID3D11DeviceChild, &IID_ID3D11ComputeShader, NULL};
+  (void)linkage;
+  return shader_make(d, code, bytes, &cs_vtbl, iids, (void **)out);
 }
 
 /* The floats a vertex element is for the pipeline (1 .. 4), and whether it has to be converted to them; 0 for a format that cannot be had. */
@@ -1074,39 +1458,7 @@ static HRESULT STDMETHODCALLTYPE dev_CreateSamplerState(Dev *d, const D3D11_SAMP
   return give(s, (void **)out);
 }
 
-/* ---- queries ---------------------------------------------------------------------------------------------------------------------------------------- */
-/* The queue runs each command list before it returns, so a query is answered once the work recorded before its End is sent: an event is then done, a
- * timestamp is the time of the End. Occlusion is not counted: a query says some samples passed (what a renderer may assume when it cannot know). */
-
-static UINT query_data_size(D3D11_QUERY q) {
-  switch (q) {
-    case D3D11_QUERY_EVENT: return sizeof(BOOL);
-    case D3D11_QUERY_OCCLUSION: case D3D11_QUERY_TIMESTAMP: return sizeof(UINT64);
-    case D3D11_QUERY_TIMESTAMP_DISJOINT: return sizeof(D3D11_QUERY_DATA_TIMESTAMP_DISJOINT);
-    case D3D11_QUERY_OCCLUSION_PREDICATE: return sizeof(BOOL);
-    default: return 0;
-  }
-}
-static HRESULT STDMETHODCALLTYPE dev_CreateQuery(Dev *d, const D3D11_QUERY_DESC *desc, ID3D11Query **out) {
-  if (out) *out = NULL;
-  if (!desc || desc->MiscFlags & ~(UINT)D3D11_QUERY_MISC_PREDICATEHINT) return E_INVALIDARG;
-  if (query_data_size(desc->Query) == 0 || desc->Query == D3D11_QUERY_OCCLUSION_PREDICATE) return E_INVALIDARG;      /* (a predicate is made with CreatePredicate) */
-  if (!out) return S_FALSE;
-  Query *q = child_new(sizeof *q, d, &query_vtbl, g_query_iids, child_destroy);
-  if (!q) return E_OUTOFMEMORY;
-  q->desc = *desc;
-  q->begun = q->ended = FALSE;
-  q->start = q->stop = 0;
-  return give(q, (void **)out);
-}
-static void STDMETHODCALLTYPE query_GetDesc(Query *q, D3D11_QUERY_DESC *desc) { if (desc) *desc = q->desc; }
-static UINT STDMETHODCALLTYPE query_GetDataSize(Query *q) { return query_data_size(q->desc.Query); }
-static UINT64 query_now(void) {
-  LARGE_INTEGER t;
-  QueryPerformanceCounter(&t);
-  return (UINT64)t.QuadPart;
-}
-
+#include "query.inc"
 #include "context.inc"
 #include "device.inc"
 #include "dxgi_resource.inc"

@@ -583,9 +583,10 @@ static HRESULT STDMETHODCALLTYPE dev_CreateGraphicsPipelineState(Dev *This, cons
   if (p->varyings > dev->caps.max_varyings) { dx_Release(OBJ(p)); return DXGI_ERROR_UNSUPPORTED; }
   p->textures = p->rs->textures_unbounded ? dev->caps.max_texture_units : p->rs->textures;
   if (p->textures > dev->caps.max_texture_units) { dx_Release(OBJ(p)); return DXGI_ERROR_UNSUPPORTED; }
-  /* stream output: the captured outputs by their register in the output signature of the last stage before the rasterizer (the geometry shader, else the vertex shader) */
+  /* stream output: the captured outputs by their register in the output signature of the last stage before the rasterizer (the geometry shader, else the domain
+   * shader, else the vertex shader) */
   if (desc->StreamOutput.NumEntries) {
-    const D3D12_SHADER_BYTECODE *last = desc->GS.pShaderBytecode ? &desc->GS : &desc->VS;
+    const D3D12_SHADER_BYTECODE *last = desc->GS.pShaderBytecode ? &desc->GS : desc->DS.pShaderBytecode ? &desc->DS : &desc->VS;
     SigElement so_outputs[16];
     int so_found = 0;
     const UINT so_n = dxbc_signature(last->pShaderBytecode, last->BytecodeLength, 1, so_outputs, 16, &so_found);

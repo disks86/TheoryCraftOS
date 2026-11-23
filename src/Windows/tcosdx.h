@@ -58,5 +58,11 @@ void WINAPI TcosD3D12StageConstantBases(struct ID3D12Device *device, UINT geomet
  *                        cube textures). */
 #define TCOS_RESOURCE_CUBE 1u
 void WINAPI TcosD3D12ResourceOptions(struct ID3D12Device *device, UINT flags);
+/* Begins a query of one of the kernel's kinds (graphics::QueryKind, docs/Direct3DKernelMode.md "More queries": 0 occlusion count, 1 occlusion predicate, 5 pixel
+ * shader invocations, 8 | stream << 8 stream output primitives needed, ...) in slot `index` of an occlusion query heap; ID3D12GraphicsCommandList::EndQuery with
+ * D3D12_QUERY_TYPE_OCCLUSION ends it, and ResolveQueryData gives its 64-bit result. One query is open at a time. */
+struct ID3D12GraphicsCommandList;
+struct ID3D12QueryHeap;
+void WINAPI TcosD3D12BeginQueryKind(struct ID3D12GraphicsCommandList *list, struct ID3D12QueryHeap *heap, UINT index, UINT kind);
 
 #endif

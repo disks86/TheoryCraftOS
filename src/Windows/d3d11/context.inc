@@ -19,6 +19,13 @@
 /* Part of d3d11.c: the immediate context. Setting state only remembers it; a draw works out the Direct3D 12 pipeline of what is bound, sets on the
  * command list what changed since the last draw, and records the draw. See d3d11.c for what maps to what. */
 
+#define LOCK(c) EnterCriticalSection(&(c)->dev->lock)
+#define UNLOCK(c) LeaveCriticalSection(&(c)->dev->lock)
+static void set_range(void **slots, UINT capacity, UINT start, UINT count, void *const *objects);
+static void get_range(void **slots, UINT capacity, UINT start, UINT count, void **objects);
+static void unbind_reads_of(Ctx *c, const void *resource, BOOL compute);
+static BOOL compute_prepare(Ctx *c);
+
 /* ---- pipelines ------------------------------------------------------------------------------------------------------------------------------------- */
 
 static const D3D11_RASTERIZER_DESC g_default_raster = {D3D11_FILL_SOLID, D3D11_CULL_BACK, FALSE, 0, 0.0f, 0.0f, TRUE, FALSE, FALSE, FALSE};
@@ -81,7 +88,15 @@ static ID3D12PipelineState *pipeline_get(Dev *d, Ctx *c) {
   pd.VS.pShaderBytecode = c->vs->code;
   pd.VS.BytecodeLength = c->vs->bytes;
   if (c->ps) { pd.PS.pShaderBytecode = c->ps->code; pd.PS.BytecodeLength = c->ps->bytes; }
-  if (c->gs) { pd.GS.pShaderBytecode = c->gs->code; pd.GS.BytecodeLength = c->gs->bytes; }
+  if (c->gs && !c->gs->so_only) { pd.GS.pShaderBytecode = c->gs->code; pd.GS.BytecodeLength = c->gs->bytes; }
+  if (c->gs && c->gs->so) {
+    /* (stream output: of the geometry shader, or of the stage whose code the "geometry shader" is - which is then the vertex or domain shader bound) */
+    pd.StreamOutput.pSODeclaration = (const D3D12_SO_DECLARATION_ENTRY *)c->gs->so;      /* (the two structures are the same) */
+    pd.StreamOutput.NumEntries = c->gs->so_count;
+    pd.StreamOutput.pBufferStrides = c->gs->so_strides;
+    pd.StreamOutput.NumStrides = c->gs->so_stride_count;
+    pd.StreamOutput.RasterizedStream = c->gs->so_rasterized;
+  }
   if (c->hs) { pd.HS.pShaderBytecode = c->hs->code; pd.HS.BytecodeLength = c->hs->bytes; }
   if (c->ds) { pd.DS.pShaderBytecode = c->ds->code; pd.DS.BytecodeLength = c->ds->bytes; }
   pd.SampleMask = 0xFFFFFFFFu;
@@ -134,7 +149,8 @@ static ID3D12PipelineState *pipeline_get(Dev *d, Ctx *c) {
   pd.SampleDesc.Count = key.samples;
   ID3D12PipelineState *state = NULL;
   /* (the pixel shader's constant buffers come after the vertex shader's, then the geometry, hull and domain shaders' in that order: as draw_prepare lays them out) */
-  const UINT ps_base = c->vs->registers, gs_base = ps_base + (c->ps ? c->ps->registers : 0), hs_base = gs_base + (c->gs ? c->gs->registers : 0),
+  const Shader *gs = c->gs && !c->gs->so_only ? c->gs : NULL;
+  const UINT ps_base = c->vs->registers, gs_base = ps_base + (c->ps ? c->ps->registers : 0), hs_base = gs_base + (gs ? gs->registers : 0),
              ds_base = hs_base + (c->hs ? c->hs->registers : 0);
   TcosD3D12PipelineOptions(d->d12, ps_base, 0);
   TcosD3D12StageConstantBases(d->d12, gs_base, hs_base, ds_base);
@@ -168,16 +184,23 @@ static ID3D12Resource *vertex_source(Dev *d, Ctx *c, UINT slot, UINT *stride, UI
      * now and then on the 3D hardware - the GPU process kept drawing and presenting, the picture stayed - for a reason not found yet; see docs/Direct3D11.md.) */
     if (b->converted && b->converted_used == d->epoch) flush(d);
     if (b->converted && (b->converted_vertices < vertices || b->converted_out_stride != out_stride)) {
-      const Spare s = {b->converted, NULL, b->converted_bytes};
+      const Spare s = {b->converted, NULL, b->converted_bytes, 0};
       spare_keep(d, s);
       b->converted = NULL;
+    }
+    /* (a buffer of the GPU's memory - stream output, unordered access - is read back first) */
+    BYTE *source = b->data, *fetched = NULL;
+    if (b->gpu) {
+      fetched = mem_alloc(b->desc.ByteWidth);
+      if (!fetched || FAILED(buf_gpu_read(d, b, 0, b->desc.ByteWidth, fetched))) { mem_free(fetched); return NULL; }
+      source = fetched;
     }
     BYTE *out = NULL;
     if (!b->converted) b->converted = take_upload(d, (UINT64)(vertices ? vertices : 1) * out_stride, &out, &b->converted_bytes);
     else if (FAILED(ID3D12Resource_Map(b->converted, 0, NULL, (void **)&out))) out = NULL;
-    if (!b->converted || !out) return NULL;
+    if (!b->converted || !out) { mem_free(fetched); return NULL; }
     for (UINT v = 0; v < vertices; ++v) {
-      const BYTE *in = b->data + *offset + (SIZE_T)v * *stride;
+      const BYTE *in = source + *offset + (SIZE_T)v * *stride;
       for (UINT i = 0; i < l->count; ++i) {
         if (l->elements[i].InputSlot != slot) continue;
         FLOAT *to = (FLOAT *)(out + (SIZE_T)v * out_stride + l->elements[i].AlignedByteOffset);
@@ -191,6 +214,7 @@ static ID3D12Resource *vertex_source(Dev *d, Ctx *c, UINT slot, UINT *stride, UI
       }
     }
     ID3D12Resource_Unmap(b->converted, 0, NULL);
+    mem_free(fetched);
     b->converted_layout = l->c.id;
     b->converted_version = b->version;
     b->converted_stride = *stride;
@@ -239,10 +263,254 @@ static Tex *slot_blank(const Dev *d, const Ctx *c, UINT i) {
   return d->blank;
 }
 
+/* The block of constants of a draw or a dispatch: the buffers bound to each stage's slots, stage after stage, each as large as the shader declares it, into the ring
+ * (Dev.ring_last is where; a block the same as the last one is used again). */
+static void constants_record(Dev *d, const Shader *const *stages, Buf *const *const *bound, UINT count) {
+  BYTE block[CONSTANT_BLOCK];
+  UINT bytes = 0;
+  for (UINT stage = 0; stage < count; ++stage) {
+    const Shader *s = stages[stage];
+    for (UINT slot = 0; s && slot < CONSTANT_SLOTS; ++slot) {
+      const UINT size = s->cb_registers[slot] * 16;
+      if (!size || bytes + size > CONSTANT_BLOCK) continue;
+      const Buf *b = bound[stage][slot];
+      const UINT have = b ? (b->desc.ByteWidth < size ? b->desc.ByteWidth : size) : 0;
+      if (have) memcpy(block + bytes, b->data, have);
+      memset(block + bytes + have, 0, size - have);
+      bytes += size;
+    }
+  }
+  if (bytes == 0) { memset(block, 0, 16); bytes = 16; }
+  if (d->ring_last_bytes != bytes || memcmp(d->ring_data + d->ring_last, block, bytes) != 0) {
+    d->ring_last = d->ring_used;
+    d->ring_last_bytes = bytes;
+    memcpy(d->ring_data + d->ring_used, block, bytes);
+    d->ring_used += (bytes + 255u) & ~255u;
+  }
+}
+
+/* What the shaders of a draw declare t<n> as (Tex.kind, KIND_BUFFER; 0xFF: none declares it). */
+static BYTE slot_declared_kind(const Ctx *c, UINT i) {
+  const Shader *stages[5] = {c->ps, c->vs, c->gs, c->hs, c->ds};
+  for (UINT k = 0; k < 5; ++k) if (stages[k] && stages[k]->tex_kind[i] != 0xFF) return stages[k]->tex_kind[i];
+  return 0xFF;
+}
+
+/* The descriptor of a buffer view (raw words: the kernel takes the stride from the shader's declaration). FALSE for one the kernel cannot bind (not whole words). */
+static BOOL buffer_descriptor(Dev *d, const View *v, BOOL unordered, D3D12_CPU_DESCRIPTOR_HANDLE at) {
+  if (v->offset % 4 || v->size % 4) return FALSE;
+  if (unordered) {
+    D3D12_UNORDERED_ACCESS_VIEW_DESC u;
+    memset(&u, 0, sizeof u);
+    u.Format = DXGI_FORMAT_R32_TYPELESS;
+    u.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+    u.Buffer.FirstElement = v->offset / 4;
+    u.Buffer.NumElements = (UINT)(v->size / 4);
+    u.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
+    ID3D12Device_CreateUnorderedAccessView(d->d12, v->buf->res, NULL, &u, at);
+  } else {
+    D3D12_SHADER_RESOURCE_VIEW_DESC r;
+    memset(&r, 0, sizeof r);
+    r.Format = DXGI_FORMAT_R32_TYPELESS;
+    r.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+    r.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    r.Buffer.FirstElement = v->offset / 4;
+    r.Buffer.NumElements = (UINT)(v->size / 4);
+    r.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_RAW;
+    ID3D12Device_CreateShaderResourceView(d->d12, v->buf->res, &r, at);
+  }
+  return TRUE;
+}
+
+/* The tables of a draw or a dispatch: shader resources t0 .. t7 (`kinds`: what the shaders declare there, for what fills an empty slot), samplers s0 .. s7, and the
+ * unordered access views u0 .. u7 the shaders declare (`uav_mask`). The handles go into Dev.table_*. `cache`: a table the same as the last one is used again. */
+static BOOL tables_record(Dev *d, View *const *srvs, Sampler *const *samplers, const BYTE *kinds, View *const *uavs, UINT uav_mask, BOOL cache) {
+  UINT view_ids[TEXTURE_SLOTS], sampler_ids[TEXTURE_SLOTS], uav_ids[UAV_SLOTS];
+  FLOAT min_lods[TEXTURE_SLOTS];
+  for (UINT i = 0; i < TEXTURE_SLOTS; ++i) {
+    view_ids[i] = srvs[i] ? srvs[i]->c.id : kinds[i] == KIND_BUFFER ? d->blank_buffer->c.id : (kinds[i] >= 1 && kinds[i] <= 3 && d->blank_kind[kinds[i]] ? d->blank_kind[kinds[i]] : d->blank)->c.id;
+    sampler_ids[i] = samplers[i] ? samplers[i]->c.id : 0;
+    min_lods[i] = srvs[i] && srvs[i]->tex ? srvs[i]->tex->min_lod : 0.0f;      /* (the clamp goes into the sampler) */
+  }
+  for (UINT i = 0; i < UAV_SLOTS; ++i) uav_ids[i] = !(uav_mask >> i & 1) ? 0 : uavs[i] ? uavs[i]->c.id : d->blank_uav->c.id;
+  const UINT step_views = ID3D12Device_GetDescriptorHandleIncrementSize(d->d12, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+  const UINT step_samplers = ID3D12Device_GetDescriptorHandleIncrementSize(d->d12, D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER);
+  const D3D12_CPU_DESCRIPTOR_HANDLE view_start = ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(d->view_heap);
+  const D3D12_GPU_DESCRIPTOR_HANDLE view_gpu = ID3D12DescriptorHeap_GetGPUDescriptorHandleForHeapStart(d->view_heap);
+  if (!cache || !d->tables_valid || memcmp(view_ids, d->table_view_ids, sizeof view_ids) != 0) {
+    D3D12_CPU_DESCRIPTOR_HANDLE at = view_start;
+    at.ptr += (SIZE_T)d->view_used * step_views;
+    d->table_views = view_gpu.ptr + (UINT64)d->view_used * step_views;
+    for (UINT i = 0; i < TEXTURE_SLOTS; ++i) {
+      const View *v = srvs[i];
+      if (v && v->buf) { if (!buffer_descriptor(d, v, FALSE, at)) return FALSE; }
+      else if (!v && kinds[i] == KIND_BUFFER) {
+        const View blank = {.buf = d->blank_buffer, .offset = 0, .size = d->blank_buffer->desc.ByteWidth};
+        buffer_descriptor(d, &blank, FALSE, at);
+      } else {
+        Tex *t = v ? v->tex : kinds[i] >= 1 && kinds[i] <= 3 && d->blank_kind[kinds[i]] ? d->blank_kind[kinds[i]] : d->blank;
+        ID3D12Device_CreateShaderResourceView(d->d12, t->res, NULL, at);
+      }
+      at.ptr += step_views;
+    }
+    d->view_used += TEXTURE_SLOTS;
+    memcpy(d->table_view_ids, view_ids, sizeof view_ids);
+  }
+  if (!cache || !d->tables_valid || memcmp(uav_ids, d->table_uav_ids, sizeof uav_ids) != 0) {
+    D3D12_CPU_DESCRIPTOR_HANDLE at = view_start;
+    at.ptr += (SIZE_T)d->view_used * step_views;
+    d->table_uavs = view_gpu.ptr + (UINT64)d->view_used * step_views;
+    for (UINT i = 0; i < UAV_SLOTS; ++i) {
+      const View *v = !(uav_mask >> i & 1) ? NULL : uavs[i] ? uavs[i] : NULL;
+      const View blank = {.buf = d->blank_uav, .offset = 0, .size = d->blank_uav->desc.ByteWidth};
+      if (v && v->buf) { if (!buffer_descriptor(d, v, TRUE, at)) return FALSE; }
+      else if ((uav_mask >> i & 1) && !v) buffer_descriptor(d, &blank, TRUE, at);      /* (D3D11: what is written to nothing is lost; here it goes into a buffer of its own) */
+      else ID3D12Device_CreateUnorderedAccessView(d->d12, NULL, NULL, NULL, at);      /* (not declared, or a texture's view: the kernel has no unordered access to textures) */
+      at.ptr += step_views;
+    }
+    d->view_used += UAV_SLOTS;
+    memcpy(d->table_uav_ids, uav_ids, sizeof uav_ids);
+  }
+  if (!cache || !d->tables_valid || memcmp(sampler_ids, d->table_sampler_ids, sizeof sampler_ids) != 0 || memcmp(min_lods, d->table_min_lods, sizeof min_lods) != 0) {
+    static const D3D11_SAMPLER_DESC fallback = {D3D11_FILTER_MIN_MAG_MIP_LINEAR, D3D11_TEXTURE_ADDRESS_CLAMP, D3D11_TEXTURE_ADDRESS_CLAMP, D3D11_TEXTURE_ADDRESS_CLAMP, 0.0f, 1,
+                                                D3D11_COMPARISON_NEVER, {0, 0, 0, 0}, 0.0f, 3.402823466e+38f};
+    D3D12_CPU_DESCRIPTOR_HANDLE at = ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(d->sampler_heap);
+    D3D12_GPU_DESCRIPTOR_HANDLE gpu = ID3D12DescriptorHeap_GetGPUDescriptorHandleForHeapStart(d->sampler_heap);
+    at.ptr += (SIZE_T)d->sampler_used * step_samplers;
+    d->table_samplers = gpu.ptr + (UINT64)d->sampler_used * step_samplers;
+    for (UINT i = 0; i < TEXTURE_SLOTS; ++i) {
+      D3D11_SAMPLER_DESC desc = samplers[i] ? samplers[i]->desc : fallback;
+      /* (SetResourceMinLOD: the texture is not sampled at a level below its clamp) */
+      if (srvs[i] && srvs[i]->tex && srvs[i]->tex->min_lod > desc.MinLOD) desc.MinLOD = srvs[i]->tex->min_lod;
+      if (desc.MaxLOD < desc.MinLOD) desc.MaxLOD = desc.MinLOD;
+      ID3D12Device_CreateSampler(d->d12, (const D3D12_SAMPLER_DESC *)&desc, at);      /* (the two structures are the same) */
+      at.ptr += step_samplers;
+    }
+    d->sampler_used += TEXTURE_SLOTS;
+    memcpy(d->table_sampler_ids, sampler_ids, sizeof sampler_ids);
+    memcpy(d->table_min_lods, min_lods, sizeof min_lods);
+  }
+  d->tables_valid = cache;
+  return TRUE;
+}
+/* What the tables name is used by the list: read (shader resources), and written (unordered access views). */
+static void tables_mark_used(Dev *d, View *const *srvs, View *const *uavs, UINT uav_mask) {
+  for (UINT i = 0; i < TEXTURE_SLOTS; ++i) {
+    if (!srvs[i]) continue;
+    if (srvs[i]->tex) srvs[i]->tex->used = srvs[i]->tex->sampled = d->epoch;
+    else srvs[i]->buf->used = d->epoch;
+  }
+  for (UINT i = 0; i < UAV_SLOTS; ++i) {
+    if (!(uav_mask >> i & 1) || !uavs[i] || !uavs[i]->buf) continue;
+    Buf *b = uavs[i]->buf;
+    b->used = b->written = d->epoch;
+    ++b->version;      /* (what the GPU writes: a converted copy of it is made again) */
+  }
+}
+
+/* ---- stream output -------------------------------------------------------------------------------------------------------------------------------------- */
+
+/* The buffer d3d12.dll puts the bytes a stream output target holds into, after a list ran (an upload buffer: its memory is d3d12.dll's copy, which it writes). */
+static BOOL so_fill_buffer(Dev *d, Buf *b) {
+  if (b->so_fill) return TRUE;
+  b->so_fill = make_buffer(d, D3D12_HEAP_TYPE_UPLOAD, 16);
+  if (!b->so_fill) return FALSE;
+  if (FAILED(ID3D12Resource_Map(b->so_fill, 0, NULL, (void **)&b->so_fill_data)) || !b->so_fill_data) { ID3D12Resource_Release(b->so_fill); b->so_fill = NULL; return FALSE; }
+  memset(b->so_fill_data, 0, 16);
+  ID3D12Resource_Unmap(b->so_fill, 0, NULL);
+  return TRUE;
+}
+/* The stream output targets into the list: each goes on from where its records end (Buf.so_end; SOSetTargets set that to the offset it was given). */
+static void so_record(Dev *d, Ctx *c) {
+  D3D12_STREAM_OUTPUT_BUFFER_VIEW views[4];
+  memset(views, 0, sizeof views);
+  for (UINT slot = 0; slot < 4; ++slot) {
+    Buf *b = c->so_buf[slot];
+    if (!b || !so_fill_buffer(d, b)) continue;
+    const UINT64 at = b->so_end < b->desc.ByteWidth ? b->so_end : b->desc.ByteWidth;
+    views[slot].BufferLocation = ID3D12Resource_GetGPUVirtualAddress(b->res) + at;
+    views[slot].SizeInBytes = b->desc.ByteWidth - at;
+    views[slot].BufferFilledSizeLocation = ID3D12Resource_GetGPUVirtualAddress(b->so_fill);
+    memcpy(b->so_fill_data + 8, &at, 8);      /* (bytes 8 ..: where the view began, for so_collect) */
+    b->used = b->written = d->epoch;
+    ++b->version;
+    UINT k = 0;
+    while (k < d->so_written_count && d->so_written[k] != b) ++k;
+    if (k == d->so_written_count && k < 16) { dx_AddRef(OBJ(b)); d->so_written[d->so_written_count++] = b; }
+  }
+  ID3D12GraphicsCommandList_SOSetTargets(d->list, 0, 4, views);
+  d->recorded = 1;
+}
+/* After a list ran: where the records of each target it wrote end now. */
+static void so_collect(Dev *d) {
+  for (UINT i = 0; i < d->so_written_count; ++i) {
+    Buf *b = d->so_written[i];
+    UINT64 filled = 0, began = 0;
+    memcpy(&filled, b->so_fill_data, 8);
+    memcpy(&began, b->so_fill_data + 8, 8);
+    b->so_end = began + filled;
+    dx_Release(OBJ(b));
+  }
+  d->so_written_count = 0;
+}
+/* The bytes the targets of a stream hold (what the bound geometry shader's declaration sends to it). */
+static UINT64 so_filled(Ctx *c, UINT stream) {
+  UINT64 total = 0;
+  if (!c->gs || !c->gs->so) return 0;
+  for (UINT slot = 0; slot < 4; ++slot) {
+    if (!c->so_buf[slot]) continue;
+    for (UINT i = 0; i < c->gs->so_count; ++i)
+      if (c->gs->so[i].OutputSlot == slot && c->gs->so[i].Stream == stream) { total += c->so_buf[slot]->so_end; break; }
+  }
+  return total;
+}
+/* The bytes a primitive of a stream takes in its targets: the strides of its buffers times the vertices of a primitive (the geometry shader's, else the draw's). */
+static UINT64 so_primitive_bytes(Ctx *c, UINT stream) {
+  if (!c->gs || !c->gs->so) return 0;
+  UINT64 stride = 0;
+  for (UINT slot = 0; slot < 4; ++slot) {
+    if (!c->so_buf[slot]) continue;
+    for (UINT i = 0; i < c->gs->so_count; ++i)
+      if (c->gs->so[i].OutputSlot == slot && c->gs->so[i].Stream == stream) { stride += c->gs->so_strides[slot]; break; }
+  }
+  UINT vertices = c->gs->so_only ? 0 : c->gs->out_vertices;
+  if (!vertices) {
+    const D3D11_PRIMITIVE_TOPOLOGY t = c->topology;
+    vertices = t == D3D11_PRIMITIVE_TOPOLOGY_POINTLIST ? 1 : (t == D3D11_PRIMITIVE_TOPOLOGY_LINELIST || t == D3D11_PRIMITIVE_TOPOLOGY_LINESTRIP) ? 2 : 3;
+  }
+  return stride * vertices;
+}
+/* Before what reads where a target's records end: the list that writes them is sent. */
+static void so_settle(Dev *d, const Buf *b) { if (b->so_fill && b->written == d->epoch) flush(d); }
+
+static void STDMETHODCALLTYPE ctx_SOSetTargets(Ctx *c, UINT count, ID3D11Buffer *const *buffers, const UINT *offsets) {
+  Dev *d = c->dev;
+  if (count > 4) return;
+  LOCK(c);
+  for (UINT slot = 0; slot < 4; ++slot) {
+    Buf *b = slot < count && buffers ? (Buf *)buffers[slot] : NULL;
+    if (b && !(b->desc.BindFlags & D3D11_BIND_STREAM_OUTPUT)) b = NULL;
+    if (b) {
+      const UINT offset = offsets ? offsets[slot] : 0;
+      if (offset == (UINT)-1) so_settle(d, b);      /* (-1: on from where its records end) */
+      else b->so_end = offset;
+      /* (a buffer written to is no input: its vertex, index and shader resource bindings are taken away) */
+      for (UINT i = 0; i < VERTEX_SLOTS; ++i) if (c->vb[i] == b) bind(&c->vb[i], NULL);
+      if (c->ib == b) bind(&c->ib, NULL);
+      unbind_reads_of(c, b, FALSE);
+    }
+    bind(&c->so_buf[slot], b);
+  }
+  d->dirty |= DIRTY_SO;
+  UNLOCK(c);
+}
+static void STDMETHODCALLTYPE ctx_SOGetTargets(Ctx *c, UINT count, ID3D11Buffer **buffers) { get_range((void **)c->so_buf, 4, 0, count, (void **)buffers); }
+
 /* Everything of a draw but the draw: FALSE when it cannot be drawn (no vertex shader, no render target, a pipeline the kernel does not take). */
 static BOOL draw_prepare(Ctx *c, BOOL indexed) {
   Dev *d = c->dev;
-  if (!c->vs || c->rtv_count == 0 || (indexed && !c->ib)) return FALSE;
+  const BOOL streams = c->gs && c->gs->so;
+  if (!c->vs || (c->rtv_count == 0 && !c->dsv && !streams) || (indexed && !c->ib)) return FALSE;      /* (d3d12.dll gives a pass without a colour target one) */
   if (!c->hs != !c->ds) return FALSE;      /* (tessellation needs both) */
 
   /* what may have to send the list first */
@@ -257,8 +525,8 @@ static BOOL draw_prepare(Ctx *c, BOOL indexed) {
   for (UINT i = 0; i < c->rtv_count; ++i) tex_before_write(d, c->rtv[i]->tex);
   if (c->dsv) tex_before_write(d, c->dsv->tex);
   /* (... nor be sampled after the list has drawn into it, cleared it or copied into it: the draw would see the texture as it was before the list) */
-  for (UINT i = 0; i < TEXTURE_SLOTS; ++i) if (slot_view(c, i)) tex_before_read(d, slot_view(c, i)->tex);
-  if (d->ring_used + CONSTANT_BLOCK > RING_BYTES || d->view_used + TEXTURE_SLOTS > VIEW_HEAP || d->sampler_used + TEXTURE_SLOTS > VIEW_HEAP) flush(d);
+  for (UINT i = 0; i < TEXTURE_SLOTS; ++i) if (slot_view(c, i) && slot_view(c, i)->tex) tex_before_read(d, slot_view(c, i)->tex);
+  if (d->ring_used + CONSTANT_BLOCK > RING_BYTES || d->view_used + TEXTURE_SLOTS + UAV_SLOTS > VIEW_HEAP || d->sampler_used + TEXTURE_SLOTS > VIEW_HEAP) flush(d);
   ID3D12PipelineState *pipeline = pipeline_get(d, c);
   if (!pipeline) return FALSE;
 
@@ -274,7 +542,8 @@ static BOOL draw_prepare(Ctx *c, BOOL indexed) {
     ID3D12GraphicsCommandList_OMSetRenderTargets(list, c->rtv_count, targets, FALSE, c->dsv ? &c->dsv->handle : NULL);
   }
   if (d->dirty & (DIRTY_VIEWPORT | DIRTY_TARGETS)) {
-    const Tex *target = c->rtv[0]->tex;
+    static const Tex none = {.desc = {1, 1}};
+    const Tex *target = c->rtv_count ? c->rtv[0]->tex : c->dsv ? c->dsv->tex : &none;
     D3D12_VIEWPORT vp = {0, 0, (FLOAT)target->desc.Width, (FLOAT)target->desc.Height, 0, 1};
     D3D12_RECT sc = {0, 0, (LONG)target->desc.Width, (LONG)target->desc.Height};
     if (c->viewport_set) memcpy(&vp, &c->viewport, sizeof vp);      /* (the two structures are the same) */
@@ -283,6 +552,7 @@ static BOOL draw_prepare(Ctx *c, BOOL indexed) {
     ID3D12GraphicsCommandList_RSSetScissorRects(list, 1, &sc);
   }
   ID3D12GraphicsCommandList_SetPipelineState(list, pipeline);
+  if ((d->dirty & DIRTY_SO) && streams) so_record(d, c);
   ID3D12GraphicsCommandList_IASetPrimitiveTopology(list, (D3D12_PRIMITIVE_TOPOLOGY)c->topology);
   ID3D12GraphicsCommandList_OMSetStencilRef(list, c->stencil_ref);
   for (UINT slot = 0; slot < VERTEX_SLOTS; ++slot) {
@@ -301,70 +571,31 @@ static BOOL draw_prepare(Ctx *c, BOOL indexed) {
   }
 
   /* the constants: the vertex shader's buffers in slot order, then the pixel shader's, the geometry shader's, the hull shader's and the domain shader's */
-  BYTE block[CONSTANT_BLOCK];
-  UINT bytes = 0;
-  for (UINT stage = 0; stage < 5; ++stage) {
-    const Shader *s = stage == 0 ? c->vs : stage == 1 ? c->ps : stage == 2 ? c->gs : stage == 3 ? c->hs : c->ds;
-    Buf *const *bound = stage == 0 ? c->vs_cb : stage == 1 ? c->ps_cb : c->stage_cb[stage - 2];
-    for (UINT slot = 0; s && slot < CONSTANT_SLOTS; ++slot) {
-      const UINT size = s->cb_registers[slot] * 16;
-      if (!size || bytes + size > CONSTANT_BLOCK) continue;
-      const UINT have = bound[slot] ? (bound[slot]->desc.ByteWidth < size ? bound[slot]->desc.ByteWidth : size) : 0;
-      if (have) memcpy(block + bytes, bound[slot]->data, have);
-      memset(block + bytes + have, 0, size - have);
-      bytes += size;
-    }
-  }
-  if (bytes == 0) { memset(block, 0, 16); bytes = 16; }
-  if (d->ring_last_bytes != bytes || memcmp(d->ring_data + d->ring_last, block, bytes) != 0) {
-    d->ring_last = d->ring_used;
-    d->ring_last_bytes = bytes;
-    memcpy(d->ring_data + d->ring_used, block, bytes);
-    d->ring_used += (bytes + 255u) & ~255u;
-  }
+  const Shader *const stages[5] = {c->vs, c->ps, c->gs && !c->gs->so_only ? c->gs : NULL, c->hs, c->ds};
+  Buf *const *const bound[5] = {c->vs_cb, c->ps_cb, c->stage_cb[STAGE_GS], c->stage_cb[STAGE_HS], c->stage_cb[STAGE_DS]};
+  constants_record(d, stages, bound, 5);
   ID3D12GraphicsCommandList_SetGraphicsRootConstantBufferView(list, 0, ID3D12Resource_GetGPUVirtualAddress(d->ring) + d->ring_last);
 
-  /* the textures and the samplers of the pixel shader: a table of each, made again when what is bound changed */
-  UINT view_ids[TEXTURE_SLOTS], sampler_ids[TEXTURE_SLOTS];
+  /* the textures (and buffer views) and the samplers of the stages, and the pixel shader's unordered access views: a table of each, made again when what is bound
+   * changed */
+  View *srvs[TEXTURE_SLOTS];
+  Sampler *samplers_of[TEXTURE_SLOTS];
+  BYTE kinds[TEXTURE_SLOTS];
   for (UINT i = 0; i < TEXTURE_SLOTS; ++i) {
-    view_ids[i] = slot_view(c, i) ? slot_view(c, i)->tex->c.id : slot_blank(d, c, i)->c.id;
-    sampler_ids[i] = slot_sampler(c, i) ? slot_sampler(c, i)->c.id : 0;
+    srvs[i] = slot_view(c, i);
+    samplers_of[i] = slot_sampler(c, i);
+    kinds[i] = slot_declared_kind(c, i);
   }
-  const UINT step_views = ID3D12Device_GetDescriptorHandleIncrementSize(d->d12, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
-  const UINT step_samplers = ID3D12Device_GetDescriptorHandleIncrementSize(d->d12, D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER);
-  if (!d->tables_valid || memcmp(view_ids, d->table_view_ids, sizeof view_ids) != 0) {
-    D3D12_CPU_DESCRIPTOR_HANDLE at = ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(d->view_heap);
-    D3D12_GPU_DESCRIPTOR_HANDLE gpu = ID3D12DescriptorHeap_GetGPUDescriptorHandleForHeapStart(d->view_heap);
-    at.ptr += (SIZE_T)d->view_used * step_views;
-    d->table_views = gpu.ptr + (UINT64)d->view_used * step_views;
-    for (UINT i = 0; i < TEXTURE_SLOTS; ++i) {
-      Tex *t = slot_view(c, i) ? slot_view(c, i)->tex : slot_blank(d, c, i);
-      ID3D12Device_CreateShaderResourceView(d->d12, t->res, NULL, at);
-      at.ptr += step_views;
-    }
-    d->view_used += TEXTURE_SLOTS;
-    memcpy(d->table_view_ids, view_ids, sizeof view_ids);
-  }
-  if (!d->tables_valid || memcmp(sampler_ids, d->table_sampler_ids, sizeof sampler_ids) != 0) {
-    static const D3D11_SAMPLER_DESC fallback = {D3D11_FILTER_MIN_MAG_MIP_LINEAR, D3D11_TEXTURE_ADDRESS_CLAMP, D3D11_TEXTURE_ADDRESS_CLAMP, D3D11_TEXTURE_ADDRESS_CLAMP, 0.0f, 1,
-                                                D3D11_COMPARISON_NEVER, {0, 0, 0, 0}, 0.0f, 3.402823466e+38f};
-    D3D12_CPU_DESCRIPTOR_HANDLE at = ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(d->sampler_heap);
-    D3D12_GPU_DESCRIPTOR_HANDLE gpu = ID3D12DescriptorHeap_GetGPUDescriptorHandleForHeapStart(d->sampler_heap);
-    at.ptr += (SIZE_T)d->sampler_used * step_samplers;
-    d->table_samplers = gpu.ptr + (UINT64)d->sampler_used * step_samplers;
-    for (UINT i = 0; i < TEXTURE_SLOTS; ++i) {
-      ID3D12Device_CreateSampler(d->d12, (const D3D12_SAMPLER_DESC *)(slot_sampler(c, i) ? &slot_sampler(c, i)->desc : &fallback), at);      /* (the two structures are the same) */
-      at.ptr += step_samplers;
-    }
-    d->sampler_used += TEXTURE_SLOTS;
-    memcpy(d->table_sampler_ids, sampler_ids, sizeof sampler_ids);
-  }
-  d->tables_valid = 1;
-  D3D12_GPU_DESCRIPTOR_HANDLE views = {d->table_views}, samplers = {d->table_samplers};
+  UINT uav_mask = 0;
+  const Shader *graphics_stages[5] = {c->vs, c->ps, c->gs, c->hs, c->ds};
+  for (UINT k = 0; k < 5; ++k) if (graphics_stages[k]) uav_mask |= graphics_stages[k]->uav_mask;
+  if (!tables_record(d, srvs, samplers_of, kinds, c->ps_uav, uav_mask, TRUE)) return FALSE;
+  D3D12_GPU_DESCRIPTOR_HANDLE views = {d->table_views}, samplers = {d->table_samplers}, uavs = {d->table_uavs};
   ID3D12GraphicsCommandList_SetGraphicsRootDescriptorTable(list, 1, views);
   ID3D12GraphicsCommandList_SetGraphicsRootDescriptorTable(list, 2, samplers);
+  ID3D12GraphicsCommandList_SetGraphicsRootDescriptorTable(list, 3, uavs);
+  tables_mark_used(d, srvs, c->ps_uav, uav_mask);
 
-  for (UINT i = 0; i < TEXTURE_SLOTS; ++i) if (slot_view(c, i)) slot_view(c, i)->tex->used = slot_view(c, i)->tex->sampled = d->epoch;
   for (UINT i = 0; i < c->rtv_count; ++i) c->rtv[i]->tex->used = c->rtv[i]->tex->written = d->epoch;
   if (c->dsv) {
     c->dsv->tex->used = c->dsv->tex->written = d->epoch;
@@ -372,15 +603,12 @@ static BOOL draw_prepare(Ctx *c, BOOL indexed) {
       if (d->clears[i].dsv == c->dsv) d->clears[i] = d->clears[--d->clear_count]; else ++i;
     }
   }
-  d->dirty = 0;
+  d->dirty = streams ? 0 : d->dirty & DIRTY_SO;      /* (the targets go into the list with the first draw that writes them) */
   d->recorded = 1;
   return TRUE;
 }
 
 /* ---- the context's own methods --------------------------------------------------------------------------------------------------------------------- */
-
-#define LOCK(c) EnterCriticalSection(&(c)->dev->lock)
-#define UNLOCK(c) LeaveCriticalSection(&(c)->dev->lock)
 
 /* The device holds the context (one reference); the first reference a program takes holds the device, the last one it gives back lets it go. */
 static ULONG STDMETHODCALLTYPE ctx_AddRef(Ctx *c) {
@@ -443,26 +671,27 @@ static void get_range(void **slots, UINT capacity, UINT start, UINT count, void 
 }
 static void STDMETHODCALLTYPE ctx_VSSetConstantBuffers(Ctx *c, UINT start, UINT count, ID3D11Buffer *const *buffers) { set_range((void **)c->vs_cb, CONSTANT_SLOTS, start, count, (void *const *)buffers); }
 static void STDMETHODCALLTYPE ctx_PSSetConstantBuffers(Ctx *c, UINT start, UINT count, ID3D11Buffer *const *buffers) { set_range((void **)c->ps_cb, CONSTANT_SLOTS, start, count, (void *const *)buffers); }
-static void STDMETHODCALLTYPE ctx_PSSetShaderResources(Ctx *c, UINT start, UINT count, ID3D11ShaderResourceView *const *views) { set_range((void **)c->srv, TEXTURE_SLOTS, start, count, (void *const *)views); }
+static void set_resources(Ctx *c, View **slots, UINT start, UINT count, ID3D11ShaderResourceView *const *views, BOOL compute);
+static void STDMETHODCALLTYPE ctx_PSSetShaderResources(Ctx *c, UINT start, UINT count, ID3D11ShaderResourceView *const *views) { set_resources(c, c->srv, start, count, views, FALSE); }
 static void STDMETHODCALLTYPE ctx_PSSetSamplers(Ctx *c, UINT start, UINT count, ID3D11SamplerState *const *samplers) { set_range((void **)c->sampler, TEXTURE_SLOTS, start, count, (void *const *)samplers); }
 static void STDMETHODCALLTYPE ctx_VSGetConstantBuffers(Ctx *c, UINT start, UINT count, ID3D11Buffer **buffers) { get_range((void **)c->vs_cb, CONSTANT_SLOTS, start, count, (void **)buffers); }
 static void STDMETHODCALLTYPE ctx_PSGetConstantBuffers(Ctx *c, UINT start, UINT count, ID3D11Buffer **buffers) { get_range((void **)c->ps_cb, CONSTANT_SLOTS, start, count, (void **)buffers); }
 static void STDMETHODCALLTYPE ctx_PSGetShaderResources(Ctx *c, UINT start, UINT count, ID3D11ShaderResourceView **views) { get_range((void **)c->srv, TEXTURE_SLOTS, start, count, (void **)views); }
 static void STDMETHODCALLTYPE ctx_PSGetSamplers(Ctx *c, UINT start, UINT count, ID3D11SamplerState **samplers) { get_range((void **)c->sampler, TEXTURE_SLOTS, start, count, (void **)samplers); }
 /* the other stages' constant buffers, textures and samplers (written out: scripts/gen-dx-vtables.py finds the methods by their names) */
-static void STDMETHODCALLTYPE ctx_VSSetShaderResources(Ctx *c, UINT start, UINT count, ID3D11ShaderResourceView *const *views) { set_range((void **)c->stage_srv[SRV_VS], TEXTURE_SLOTS, start, count, (void *const *)views); }
+static void STDMETHODCALLTYPE ctx_VSSetShaderResources(Ctx *c, UINT start, UINT count, ID3D11ShaderResourceView *const *views) { set_resources(c, c->stage_srv[SRV_VS], start, count, views, FALSE); }
 static void STDMETHODCALLTYPE ctx_VSGetShaderResources(Ctx *c, UINT start, UINT count, ID3D11ShaderResourceView **views) { get_range((void **)c->stage_srv[SRV_VS], TEXTURE_SLOTS, start, count, (void **)views); }
 static void STDMETHODCALLTYPE ctx_VSSetSamplers(Ctx *c, UINT start, UINT count, ID3D11SamplerState *const *samplers) { set_range((void **)c->stage_sampler[SRV_VS], TEXTURE_SLOTS, start, count, (void *const *)samplers); }
 static void STDMETHODCALLTYPE ctx_VSGetSamplers(Ctx *c, UINT start, UINT count, ID3D11SamplerState **samplers) { get_range((void **)c->stage_sampler[SRV_VS], TEXTURE_SLOTS, start, count, (void **)samplers); }
-static void STDMETHODCALLTYPE ctx_GSSetShaderResources(Ctx *c, UINT start, UINT count, ID3D11ShaderResourceView *const *views) { set_range((void **)c->stage_srv[SRV_GS], TEXTURE_SLOTS, start, count, (void *const *)views); }
+static void STDMETHODCALLTYPE ctx_GSSetShaderResources(Ctx *c, UINT start, UINT count, ID3D11ShaderResourceView *const *views) { set_resources(c, c->stage_srv[SRV_GS], start, count, views, FALSE); }
 static void STDMETHODCALLTYPE ctx_GSGetShaderResources(Ctx *c, UINT start, UINT count, ID3D11ShaderResourceView **views) { get_range((void **)c->stage_srv[SRV_GS], TEXTURE_SLOTS, start, count, (void **)views); }
 static void STDMETHODCALLTYPE ctx_GSSetSamplers(Ctx *c, UINT start, UINT count, ID3D11SamplerState *const *samplers) { set_range((void **)c->stage_sampler[SRV_GS], TEXTURE_SLOTS, start, count, (void *const *)samplers); }
 static void STDMETHODCALLTYPE ctx_GSGetSamplers(Ctx *c, UINT start, UINT count, ID3D11SamplerState **samplers) { get_range((void **)c->stage_sampler[SRV_GS], TEXTURE_SLOTS, start, count, (void **)samplers); }
-static void STDMETHODCALLTYPE ctx_HSSetShaderResources(Ctx *c, UINT start, UINT count, ID3D11ShaderResourceView *const *views) { set_range((void **)c->stage_srv[SRV_HS], TEXTURE_SLOTS, start, count, (void *const *)views); }
+static void STDMETHODCALLTYPE ctx_HSSetShaderResources(Ctx *c, UINT start, UINT count, ID3D11ShaderResourceView *const *views) { set_resources(c, c->stage_srv[SRV_HS], start, count, views, FALSE); }
 static void STDMETHODCALLTYPE ctx_HSGetShaderResources(Ctx *c, UINT start, UINT count, ID3D11ShaderResourceView **views) { get_range((void **)c->stage_srv[SRV_HS], TEXTURE_SLOTS, start, count, (void **)views); }
 static void STDMETHODCALLTYPE ctx_HSSetSamplers(Ctx *c, UINT start, UINT count, ID3D11SamplerState *const *samplers) { set_range((void **)c->stage_sampler[SRV_HS], TEXTURE_SLOTS, start, count, (void *const *)samplers); }
 static void STDMETHODCALLTYPE ctx_HSGetSamplers(Ctx *c, UINT start, UINT count, ID3D11SamplerState **samplers) { get_range((void **)c->stage_sampler[SRV_HS], TEXTURE_SLOTS, start, count, (void **)samplers); }
-static void STDMETHODCALLTYPE ctx_DSSetShaderResources(Ctx *c, UINT start, UINT count, ID3D11ShaderResourceView *const *views) { set_range((void **)c->stage_srv[SRV_DS], TEXTURE_SLOTS, start, count, (void *const *)views); }
+static void STDMETHODCALLTYPE ctx_DSSetShaderResources(Ctx *c, UINT start, UINT count, ID3D11ShaderResourceView *const *views) { set_resources(c, c->stage_srv[SRV_DS], start, count, views, FALSE); }
 static void STDMETHODCALLTYPE ctx_DSGetShaderResources(Ctx *c, UINT start, UINT count, ID3D11ShaderResourceView **views) { get_range((void **)c->stage_srv[SRV_DS], TEXTURE_SLOTS, start, count, (void **)views); }
 static void STDMETHODCALLTYPE ctx_DSSetSamplers(Ctx *c, UINT start, UINT count, ID3D11SamplerState *const *samplers) { set_range((void **)c->stage_sampler[SRV_DS], TEXTURE_SLOTS, start, count, (void *const *)samplers); }
 static void STDMETHODCALLTYPE ctx_DSGetSamplers(Ctx *c, UINT start, UINT count, ID3D11SamplerState **samplers) { get_range((void **)c->stage_sampler[SRV_DS], TEXTURE_SLOTS, start, count, (void **)samplers); }
@@ -484,14 +713,15 @@ static void STDMETHODCALLTYPE ctx_PSGetShader(Ctx *c, ID3D11PixelShader **out, I
 static void STDMETHODCALLTYPE ctx_GSGetShader(Ctx *c, ID3D11GeometryShader **out, ID3D11ClassInstance **instances, UINT *count) { get_shader(c->gs, (void **)out, instances, count); }
 static void STDMETHODCALLTYPE ctx_HSGetShader(Ctx *c, ID3D11HullShader **out, ID3D11ClassInstance **instances, UINT *count) { get_shader(c->hs, (void **)out, instances, count); }
 static void STDMETHODCALLTYPE ctx_DSGetShader(Ctx *c, ID3D11DomainShader **out, ID3D11ClassInstance **instances, UINT *count) { get_shader(c->ds, (void **)out, instances, count); }
-/* (the stage this runtime has not: nothing is bound to it) */
-static void STDMETHODCALLTYPE ctx_CSGetShader(Ctx *c, ID3D11ComputeShader **out, ID3D11ClassInstance **instances, UINT *count) { (void)c; get_shader(NULL, (void **)out, instances, count); }
+static void STDMETHODCALLTYPE ctx_CSGetShader(Ctx *c, ID3D11ComputeShader **out, ID3D11ClassInstance **instances, UINT *count) { get_shader(c->cs, (void **)out, instances, count); }
 
 static void STDMETHODCALLTYPE ctx_IASetInputLayout(Ctx *c, ID3D11InputLayout *layout) { bind(&c->layout, layout); }
 static void STDMETHODCALLTYPE ctx_IAGetInputLayout(Ctx *c, ID3D11InputLayout **out) { get_shader(c->layout, (void **)out, NULL, NULL); }
 static void STDMETHODCALLTYPE ctx_IASetVertexBuffers(Ctx *c, UINT start, UINT count, ID3D11Buffer *const *buffers, const UINT *strides, const UINT *offsets) {
   for (UINT i = 0; i < count && start + i < VERTEX_SLOTS; ++i) {
-    bind(&c->vb[start + i], buffers ? buffers[i] : NULL);
+    Buf *b = buffers ? (Buf *)buffers[i] : NULL;
+    for (UINT k = 0; b && k < 4; ++k) if (c->so_buf[k] == b) b = NULL;      /* (a stream output target is no input) */
+    bind(&c->vb[start + i], b);
     c->vb_stride[start + i] = strides ? strides[i] : 0;
     c->vb_offset[start + i] = offsets ? offsets[i] : 0;
   }
@@ -504,6 +734,7 @@ static void STDMETHODCALLTYPE ctx_IAGetVertexBuffers(Ctx *c, UINT start, UINT co
   }
 }
 static void STDMETHODCALLTYPE ctx_IASetIndexBuffer(Ctx *c, ID3D11Buffer *buffer, DXGI_FORMAT format, UINT offset) {
+  for (UINT k = 0; buffer && k < 4; ++k) if (c->so_buf[k] == (Buf *)buffer) buffer = NULL;
   bind(&c->ib, buffer);
   c->ib_format = format;
   c->ib_offset = offset;
@@ -516,17 +747,47 @@ static void STDMETHODCALLTYPE ctx_IAGetIndexBuffer(Ctx *c, ID3D11Buffer **buffer
 static void STDMETHODCALLTYPE ctx_IASetPrimitiveTopology(Ctx *c, D3D11_PRIMITIVE_TOPOLOGY topology) { c->topology = topology; }
 static void STDMETHODCALLTYPE ctx_IAGetPrimitiveTopology(Ctx *c, D3D11_PRIMITIVE_TOPOLOGY *topology) { if (topology) *topology = c->topology; }
 
+static void unbind_reads_of(Ctx *c, const void *resource, BOOL compute);
+static const void *view_resource(const View *v);
 static void STDMETHODCALLTYPE ctx_OMSetRenderTargets(Ctx *c, UINT count, ID3D11RenderTargetView *const *views, ID3D11DepthStencilView *depth) {
   UINT n = 0;
   while (views && n < count && n < 8 && views[n]) ++n;      /* (up to the first that is not there: the kernel's targets have no gaps) */
   for (UINT i = 0; i < 8; ++i) bind(&c->rtv[i], i < n ? views[i] : NULL);
   c->rtv_count = n;
   bind(&c->dsv, depth);
+  /* (what is drawn into is no shader resource any more) */
+  for (UINT i = 0; i < n; ++i) unbind_reads_of(c, view_resource(c->rtv[i]), FALSE);
+  if (c->dsv) unbind_reads_of(c, view_resource(c->dsv), FALSE);
   c->dev->dirty |= DIRTY_TARGETS | DIRTY_VIEWPORT;
 }
 static void STDMETHODCALLTYPE ctx_OMGetRenderTargets(Ctx *c, UINT count, ID3D11RenderTargetView **views, ID3D11DepthStencilView **depth) {
   get_range((void **)c->rtv, 8, 0, count, (void **)views);
   get_shader(c->dsv, (void **)depth, NULL, NULL);
+}
+/* Render targets and the pixel shader's unordered access views, which share the slots: u<n> for n from `uav_start` (at or after the last target) on, the other
+ * unordered access slots left empty. D3D11_KEEP_RENDER_TARGETS_AND_DEPTH_STENCIL and D3D11_KEEP_UNORDERED_ACCESS_VIEWS keep what is bound. */
+static void STDMETHODCALLTYPE ctx_OMSetRenderTargetsAndUnorderedAccessViews(Ctx *c, UINT rtv_count, ID3D11RenderTargetView *const *rtvs, ID3D11DepthStencilView *depth,
+                                                                            UINT uav_start, UINT uav_count, ID3D11UnorderedAccessView *const *uavs, const UINT *counts) {
+  if (rtv_count != D3D11_KEEP_RENDER_TARGETS_AND_DEPTH_STENCIL) {
+    if (rtv_count > 8) return;
+    ctx_OMSetRenderTargets(c, rtv_count, rtvs, depth);
+  }
+  if (uav_count == D3D11_KEEP_UNORDERED_ACCESS_VIEWS) return;
+  if (uav_start > UAV_SLOTS || uav_count > UAV_SLOTS - uav_start || (rtv_count != D3D11_KEEP_RENDER_TARGETS_AND_DEPTH_STENCIL && uav_count && uav_start < rtv_count)) return;
+  for (UINT slot = 0; slot < UAV_SLOTS; ++slot) {
+    View *v = slot >= uav_start && slot < uav_start + uav_count && uavs ? (View *)uavs[slot - uav_start] : NULL;
+    if (v) {
+      unbind_reads_of(c, view_resource(v), FALSE);
+      const UINT k = slot - uav_start;
+      if (counts && counts[k] != (UINT)-1 && (v->desc.uav.Buffer.Flags & (D3D11_BUFFER_UAV_FLAG_APPEND | D3D11_BUFFER_UAV_FLAG_COUNTER))) v->counter = counts[k];
+    }
+    bind(&c->ps_uav[slot], v);
+  }
+}
+static void STDMETHODCALLTYPE ctx_OMGetRenderTargetsAndUnorderedAccessViews(Ctx *c, UINT rtv_count, ID3D11RenderTargetView **rtvs, ID3D11DepthStencilView **depth,
+                                                                            UINT uav_start, UINT uav_count, ID3D11UnorderedAccessView **uavs) {
+  if (rtvs || depth) ctx_OMGetRenderTargets(c, rtvs ? rtv_count : 0, rtvs, depth);
+  if (uavs) get_range((void **)c->ps_uav, UAV_SLOTS, uav_start, uav_count, (void **)uavs);
 }
 static void STDMETHODCALLTYPE ctx_OMSetBlendState(Ctx *c, ID3D11BlendState *state, const FLOAT factor[4], UINT sample_mask) {
   bind(&c->blend, state);
@@ -572,30 +833,196 @@ static void STDMETHODCALLTYPE ctx_RSGetScissorRects(Ctx *c, UINT *count, D3D11_R
   *count = c->scissor_set ? 1 : 0;
 }
 
-static void STDMETHODCALLTYPE ctx_Draw(Ctx *c, UINT count, UINT start) {
+/* A draw: left out while predicated, measured for the active queries, counted for the pipeline statistics. */
+static void draw_any(Ctx *c, BOOL indexed, UINT count, UINT instances, UINT start, INT base_vertex, UINT start_instance) {
+  Dev *d = c->dev;
   LOCK(c);
-  if (draw_prepare(c, FALSE)) ID3D12GraphicsCommandList_DrawInstanced(c->dev->list, count, 1, start, 0);
+  if (!count || !instances || predicated_out(d) || !draw_prepare(c, indexed)) { UNLOCK(c); return; }
+  const BOOL measured = measure_begin(d);
+  if (indexed) ID3D12GraphicsCommandList_DrawIndexedInstanced(d->list, count, instances, start, base_vertex, start_instance);
+  else ID3D12GraphicsCommandList_DrawInstanced(d->list, count, instances, start, start_instance);
+  measure_end(d, measured);
+  query_count_draw(c, count, instances);
   UNLOCK(c);
 }
-static void STDMETHODCALLTYPE ctx_DrawIndexed(Ctx *c, UINT count, UINT start, INT base_vertex) {
-  LOCK(c);
-  if (draw_prepare(c, TRUE)) ID3D12GraphicsCommandList_DrawIndexedInstanced(c->dev->list, count, 1, start, base_vertex, 0);
-  UNLOCK(c);
-}
-static void STDMETHODCALLTYPE ctx_DrawInstanced(Ctx *c, UINT count, UINT instances, UINT start, UINT start_instance) {
-  LOCK(c);
-  if (draw_prepare(c, FALSE)) ID3D12GraphicsCommandList_DrawInstanced(c->dev->list, count, instances, start, start_instance);
-  UNLOCK(c);
-}
+static void STDMETHODCALLTYPE ctx_Draw(Ctx *c, UINT count, UINT start) { draw_any(c, FALSE, count, 1, start, 0, 0); }
+static void STDMETHODCALLTYPE ctx_DrawIndexed(Ctx *c, UINT count, UINT start, INT base_vertex) { draw_any(c, TRUE, count, 1, start, base_vertex, 0); }
+static void STDMETHODCALLTYPE ctx_DrawInstanced(Ctx *c, UINT count, UINT instances, UINT start, UINT start_instance) { draw_any(c, FALSE, count, instances, start, 0, start_instance); }
 static void STDMETHODCALLTYPE ctx_DrawIndexedInstanced(Ctx *c, UINT count, UINT instances, UINT start, INT base_vertex, UINT start_instance) {
+  draw_any(c, TRUE, count, instances, start, base_vertex, start_instance);
+}
+/* The arguments of an indirect draw or dispatch, read on the CPU (for the pipeline statistics, when a query counts them): FALSE when they cannot be had. */
+static BOOL indirect_args(Dev *d, Buf *b, UINT offset, UINT bytes, UINT *out) {
+  if (b->gpu) return SUCCEEDED(buf_gpu_read(d, b, offset, bytes, out));
+  memcpy(out, b->data + offset, bytes);
+  return TRUE;
+}
+static BOOL stats_active(const Dev *d) {
+  for (UINT i = 0; i < d->active_count; ++i) if (d->active[i]->desc.Query == D3D11_QUERY_PIPELINE_STATISTICS) return TRUE;
+  return FALSE;
+}
+/* A draw whose arguments are in a buffer (made with D3D11_RESOURCE_MISC_DRAWINDIRECT_ARGS): the vertex count, instances, first vertex and first instance (and for an
+ * indexed one the index count, instances, first index, base vertex and first instance), as the GPU finds them when the list runs. */
+static void draw_indirect(Ctx *c, BOOL indexed, ID3D11Buffer *buffer, UINT offset) {
+  Dev *d = c->dev;
+  Buf *b = (Buf *)buffer;
+  const UINT bytes = indexed ? 20 : 16;
+  if (!b || !(b->desc.MiscFlags & D3D11_RESOURCE_MISC_DRAWINDIRECT_ARGS) || offset % 4 || offset > b->desc.ByteWidth || b->desc.ByteWidth - offset < bytes) return;
   LOCK(c);
-  if (draw_prepare(c, TRUE)) ID3D12GraphicsCommandList_DrawIndexedInstanced(c->dev->list, count, instances, start, base_vertex, start_instance);
+  UINT args[5] = {0};
+  const BOOL counted = stats_active(d) && indirect_args(d, b, offset, bytes, args);
+  if (predicated_out(d) || !draw_prepare(c, indexed)) { UNLOCK(c); return; }
+  const BOOL measured = measure_begin(d);
+  ID3D12GraphicsCommandList_ExecuteIndirect(d->list, indexed ? d->sig_draw_indexed : d->sig_draw, 1, b->res, offset, NULL, 0);
+  measure_end(d, measured);
+  b->used = d->epoch;
+  if (counted) query_count_draw(c, args[0], args[1]);
+  UNLOCK(c);
+}
+static void STDMETHODCALLTYPE ctx_DrawInstancedIndirect(Ctx *c, ID3D11Buffer *buffer, UINT offset) { draw_indirect(c, FALSE, buffer, offset); }
+static void STDMETHODCALLTYPE ctx_DrawIndexedInstancedIndirect(Ctx *c, ID3D11Buffer *buffer, UINT offset) { draw_indirect(c, TRUE, buffer, offset); }
+static void STDMETHODCALLTYPE ctx_DispatchIndirect(Ctx *c, ID3D11Buffer *buffer, UINT offset) {
+  Dev *d = c->dev;
+  Buf *b = (Buf *)buffer;
+  if (!b || !(b->desc.MiscFlags & D3D11_RESOURCE_MISC_DRAWINDIRECT_ARGS) || offset % 4 || offset > b->desc.ByteWidth || b->desc.ByteWidth - offset < 12) return;
+  LOCK(c);
+  UINT args[3] = {0};
+  const BOOL counted = stats_active(d) && indirect_args(d, b, offset, 12, args);
+  if (!predicated_out(d) && compute_prepare(c)) {
+    ID3D12GraphicsCommandList_ExecuteIndirect(d->list, d->sig_dispatch, 1, b->res, offset, NULL, 0);
+    b->used = d->epoch;
+    if (counted) query_count_dispatch(c, args[0], args[1], args[2]);
+  }
+  UNLOCK(c);
+}
+
+/* The vertices stream output wrote into the buffer of vertex slot 0, drawn: as many as its records hold after the slot's offset. */
+static void STDMETHODCALLTYPE ctx_DrawAuto(Ctx *c) {
+  Dev *d = c->dev;
+  LOCK(c);
+  Buf *b = c->vb[0];
+  UINT vertices = 0;
+  if (b && c->vb_stride[0]) {
+    so_settle(d, b);
+    const UINT64 end = b->so_end < b->desc.ByteWidth ? b->so_end : b->desc.ByteWidth;
+    vertices = end > c->vb_offset[0] ? (UINT)((end - c->vb_offset[0]) / c->vb_stride[0]) : 0;
+  }
+  UNLOCK(c);
+  if (vertices) draw_any(c, FALSE, vertices, 1, 0, 0, 0);
+}
+
+/* ---- compute ------------------------------------------------------------------------------------------------------------------------------------------ */
+
+/* The resource a view is of. */
+static const void *view_resource(const View *v) { return v->tex ? (const void *)v->tex : (const void *)v->buf; }
+/* Direct3D 11 keeps a resource from being read and written at once: binding it for writing takes it out of every shader-resource slot, and a shader-resource binding
+ * of what is bound for writing is left empty. These are the views that write: the compute shader's unordered access views (`compute`), or the render targets,
+ * the depth buffer and the pixel shader's unordered access views. */
+static BOOL bound_for_writing(const Ctx *c, const void *resource, BOOL compute) {
+  if (compute) {
+    for (UINT i = 0; i < UAV_SLOTS; ++i) if (c->cs_uav[i] && view_resource(c->cs_uav[i]) == resource) return TRUE;
+    return FALSE;
+  }
+  for (UINT i = 0; i < UAV_SLOTS; ++i) if (c->ps_uav[i] && view_resource(c->ps_uav[i]) == resource) return TRUE;
+  for (UINT i = 0; i < c->rtv_count; ++i) if (c->rtv[i] && view_resource(c->rtv[i]) == resource) return TRUE;
+  return c->dsv && view_resource(c->dsv) == resource;
+}
+static void unbind_reads_of(Ctx *c, const void *resource, BOOL compute) {
+  if (compute) {
+    for (UINT i = 0; i < TEXTURE_SLOTS; ++i) if (c->cs_srv[i] && view_resource(c->cs_srv[i]) == resource) bind(&c->cs_srv[i], NULL);
+    return;
+  }
+  for (UINT i = 0; i < TEXTURE_SLOTS; ++i) {
+    if (c->srv[i] && view_resource(c->srv[i]) == resource) bind(&c->srv[i], NULL);
+    for (UINT k = 0; k < 4; ++k) if (c->stage_srv[k][i] && view_resource(c->stage_srv[k][i]) == resource) bind(&c->stage_srv[k][i], NULL);
+  }
+}
+/* Shader resources into slots, each left empty when what it is of is bound for writing. */
+static void set_resources(Ctx *c, View **slots, UINT start, UINT count, ID3D11ShaderResourceView *const *views, BOOL compute) {
+  for (UINT i = 0; i < count && start + i < TEXTURE_SLOTS; ++i) {
+    View *v = views ? (View *)views[i] : NULL;
+    if (v && bound_for_writing(c, view_resource(v), compute)) v = NULL;
+    bind(&slots[start + i], v);
+  }
+}
+
+static void STDMETHODCALLTYPE ctx_CSSetShader(Ctx *c, ID3D11ComputeShader *shader, ID3D11ClassInstance *const *instances, UINT count) {
+  (void)instances; (void)count;
+  bind(&c->cs, shader);
+}
+static void STDMETHODCALLTYPE ctx_CSSetConstantBuffers(Ctx *c, UINT start, UINT count, ID3D11Buffer *const *buffers) { set_range((void **)c->cs_cb, CONSTANT_SLOTS, start, count, (void *const *)buffers); }
+static void STDMETHODCALLTYPE ctx_CSGetConstantBuffers(Ctx *c, UINT start, UINT count, ID3D11Buffer **buffers) { get_range((void **)c->cs_cb, CONSTANT_SLOTS, start, count, (void **)buffers); }
+static void STDMETHODCALLTYPE ctx_CSSetShaderResources(Ctx *c, UINT start, UINT count, ID3D11ShaderResourceView *const *views) { set_resources(c, c->cs_srv, start, count, views, TRUE); }
+static void STDMETHODCALLTYPE ctx_CSGetShaderResources(Ctx *c, UINT start, UINT count, ID3D11ShaderResourceView **views) { get_range((void **)c->cs_srv, TEXTURE_SLOTS, start, count, (void **)views); }
+static void STDMETHODCALLTYPE ctx_CSSetSamplers(Ctx *c, UINT start, UINT count, ID3D11SamplerState *const *samplers) { set_range((void **)c->cs_sampler, TEXTURE_SLOTS, start, count, (void *const *)samplers); }
+static void STDMETHODCALLTYPE ctx_CSGetSamplers(Ctx *c, UINT start, UINT count, ID3D11SamplerState **samplers) { get_range((void **)c->cs_sampler, TEXTURE_SLOTS, start, count, (void **)samplers); }
+/* Unordered access views of the compute shader; `counts`: the hidden count of each append or counter view (-1: kept as it is). */
+static void STDMETHODCALLTYPE ctx_CSSetUnorderedAccessViews(Ctx *c, UINT start, UINT count, ID3D11UnorderedAccessView *const *views, const UINT *counts) {
+  for (UINT i = 0; i < count && start + i < UAV_SLOTS; ++i) {
+    View *v = views ? (View *)views[i] : NULL;
+    if (v) {
+      unbind_reads_of(c, view_resource(v), TRUE);
+      if (counts && counts[i] != (UINT)-1 && (v->desc.uav.Buffer.Flags & (D3D11_BUFFER_UAV_FLAG_APPEND | D3D11_BUFFER_UAV_FLAG_COUNTER))) v->counter = counts[i];
+    }
+    bind(&c->cs_uav[start + i], v);
+  }
+}
+static void STDMETHODCALLTYPE ctx_CSGetUnorderedAccessViews(Ctx *c, UINT start, UINT count, ID3D11UnorderedAccessView **views) { get_range((void **)c->cs_uav, UAV_SLOTS, start, count, (void **)views); }
+
+/* Everything of a dispatch but the dispatch: FALSE when there is no compute shader or the kernel does not take it. */
+static BOOL compute_prepare(Ctx *c) {
+  Dev *d = c->dev;
+  Shader *cs = c->cs;
+  if (!cs) return FALSE;
+  for (UINT i = 0; i < TEXTURE_SLOTS; ++i) if (c->cs_srv[i] && c->cs_srv[i]->tex) tex_before_read(d, c->cs_srv[i]->tex);
+  if (d->ring_used + CONSTANT_BLOCK > RING_BYTES || d->view_used + TEXTURE_SLOTS + UAV_SLOTS > VIEW_HEAP || d->sampler_used + TEXTURE_SLOTS > VIEW_HEAP) flush(d);
+  if (!cs->compute) {
+    D3D12_COMPUTE_PIPELINE_STATE_DESC pd;
+    memset(&pd, 0, sizeof pd);
+    pd.pRootSignature = d->root;
+    pd.CS.pShaderBytecode = cs->code;
+    pd.CS.BytecodeLength = cs->bytes;
+    if (FAILED(ID3D12Device_CreateComputePipelineState(d->d12, &pd, &IID_ID3D12PipelineState, (void **)&cs->compute)) || !cs->compute) {
+      cs->compute = NULL;
+      static volatile LONG said;
+      if (!InterlockedExchange(&said, 1)) dx_say("dx: refused: a compute shader the kernel does not take (see docs/Direct3D11.md)");
+      return FALSE;
+    }
+  }
+  ID3D12GraphicsCommandList *list = d->list;
+  ID3D12DescriptorHeap *heaps[2] = {d->view_heap, d->sampler_heap};
+  ID3D12GraphicsCommandList_SetComputeRootSignature(list, d->root);
+  ID3D12GraphicsCommandList_SetDescriptorHeaps(list, 2, heaps);
+  ID3D12GraphicsCommandList_SetPipelineState(list, cs->compute);
+  const Shader *const stages[1] = {cs};
+  Buf *const *const bound[1] = {c->cs_cb};
+  constants_record(d, stages, bound, 1);
+  ID3D12GraphicsCommandList_SetComputeRootConstantBufferView(list, 0, ID3D12Resource_GetGPUVirtualAddress(d->ring) + d->ring_last);
+  if (!tables_record(d, c->cs_srv, c->cs_sampler, cs->tex_kind, c->cs_uav, cs->uav_mask, FALSE)) return FALSE;
+  D3D12_GPU_DESCRIPTOR_HANDLE views = {d->table_views}, samplers = {d->table_samplers}, uavs = {d->table_uavs};
+  ID3D12GraphicsCommandList_SetComputeRootDescriptorTable(list, 1, views);
+  ID3D12GraphicsCommandList_SetComputeRootDescriptorTable(list, 2, samplers);
+  ID3D12GraphicsCommandList_SetComputeRootDescriptorTable(list, 3, uavs);
+  tables_mark_used(d, c->cs_srv, c->cs_uav, cs->uav_mask);
+  cs->used = d->epoch;
+  d->dirty |= DIRTY_ROOT;      /* (the next draw sets the graphics root signature and the heaps again) */
+  d->recorded = 1;
+  return TRUE;
+}
+static void STDMETHODCALLTYPE ctx_Dispatch(Ctx *c, UINT x, UINT y, UINT z) {
+  LOCK(c);
+  if (!predicated_out(c->dev) && x && y && z && x <= D3D11_CS_DISPATCH_MAX_THREAD_GROUPS_PER_DIMENSION && y <= D3D11_CS_DISPATCH_MAX_THREAD_GROUPS_PER_DIMENSION &&
+      z <= D3D11_CS_DISPATCH_MAX_THREAD_GROUPS_PER_DIMENSION && compute_prepare(c)) {
+    ID3D12GraphicsCommandList_Dispatch(c->dev->list, x, y, z);
+    query_count_dispatch(c, x, y, z);
+  }
   UNLOCK(c);
 }
 
 static void STDMETHODCALLTYPE ctx_ClearRenderTargetView(Ctx *c, ID3D11RenderTargetView *view, const FLOAT colour[4]) {
   View *v = (View *)view;
   if (!v || !colour) return;
+  if (predicated_out(c->dev)) return;
   LOCK(c);
   FLOAT kept[4] = {colour[0], colour[1], colour[2], colour[3]};      /* (a target kept wider than its format: the channels it does not have stay 0 and 1) */
   if (v->tex->expand == 1) kept[1] = kept[2] = 0, kept[3] = 1;
@@ -611,6 +1038,7 @@ static void STDMETHODCALLTYPE ctx_ClearDepthStencilView(Ctx *c, ID3D11DepthStenc
   View *v = (View *)view;
   Dev *d = c->dev;
   if (!v || !(flags & 3)) return;
+  if (predicated_out(c->dev)) return;
   LOCK(c);
   /* Direct3D 12 here clears a depth buffer when the next pass with it begins, and forgets the clear with the list: it is kept until a draw has
    * followed it, and recorded again in every list until then. */
@@ -665,6 +1093,40 @@ static void buf_touched(Buf *b) {
   if (SUCCEEDED(ID3D12Resource_Map(b->res, 0, NULL, &p))) ID3D12Resource_Unmap(b->res, 0, NULL);
 }
 
+/* Bytes of one buffer into another, in their place among the commands. Between buffers of the CPU's memory the copy is done here (a recorded draw keeps the old
+ * bytes in the old memory); into one of the GPU's memory it is a copy the list makes; out of one into the CPU's memory the list is sent and the bytes read back. */
+static void buf_copy(Dev *d, Buf *to, UINT64 to_offset, Buf *from, UINT64 from_offset, UINT64 bytes) {
+  if (!bytes) return;
+  if (to->gpu) {
+    if (from->gpu && to == from && to_offset < from_offset + bytes && from_offset < to_offset + bytes) {
+      /* (an overlapping copy within one buffer: by way of memory) */
+      BYTE *t = mem_alloc(bytes);
+      if (t && SUCCEEDED(buf_gpu_read(d, from, from_offset, bytes, t))) buf_gpu_write(d, to, to_offset, t, bytes);
+      mem_free(t);
+      return;
+    }
+    ID3D12GraphicsCommandList_CopyBufferRegion(d->list, to->res, to_offset, from->res, from_offset, bytes);
+    d->recorded = 1;
+    to->used = to->written = from->used = d->epoch;
+    ++to->version;
+    return;
+  }
+  if (to->used == d->epoch && (to == from || !buf_rename(d, to, to_offset != 0 || bytes != to->desc.ByteWidth))) settle(d, to->used);
+  if (from->gpu) {
+    if (FAILED(buf_gpu_read(d, from, from_offset, bytes, to->data + to_offset))) return;
+  } else memmove(to->data + to_offset, from->data + from_offset, bytes);
+  buf_touched(to);
+  ++to->version;
+}
+/* Writes bytes into a buffer wherever its memory is (CopyStructureCount, the clears of unordered access views). */
+static void buf_write_any(Dev *d, Buf *b, UINT64 offset, const void *data, UINT64 bytes) {
+  if (b->gpu) { buf_gpu_write(d, b, offset, data, bytes); return; }
+  if (b->used == d->epoch && !buf_rename(d, b, TRUE)) settle(d, b->used);
+  memcpy(b->data + offset, data, bytes);
+  buf_touched(b);
+  ++b->version;
+}
+
 static HRESULT STDMETHODCALLTYPE ctx_Map(Ctx *c, ID3D11Resource *resource, UINT sub, D3D11_MAP type, UINT flags, D3D11_MAPPED_SUBRESOURCE *out) {
   (void)flags;
   Dev *d = c->dev;
@@ -675,7 +1137,7 @@ static HRESULT STDMETHODCALLTYPE ctx_Map(Ctx *c, ID3D11Resource *resource, UINT 
   HRESULT hr = S_OK;
   LOCK(c);
   if (b) {
-    if (sub != 0) hr = E_INVALIDARG;
+    if (sub != 0 || b->gpu || b->desc.Usage == D3D11_USAGE_DEFAULT || b->desc.Usage == D3D11_USAGE_IMMUTABLE) hr = E_INVALIDARG;      /* (the CPU maps dynamic and staging buffers only) */
     else {
       /* (a recorded draw reads what is there now: the buffer gets other memory, or failing that the list is sent first) */
       if (type != D3D11_MAP_WRITE_NO_OVERWRITE && type != D3D11_MAP_READ && b->used == d->epoch && !buf_rename(d, b, type != D3D11_MAP_WRITE_DISCARD)) settle(d, b->used);
@@ -726,14 +1188,18 @@ static void STDMETHODCALLTYPE ctx_UpdateSubresource(Ctx *c, ID3D11Resource *reso
   Buf *b = buf_of_resource(resource);
   Tex *t = tex_of_resource(resource);
   if (!data) return;
+  if (predicated_out(c->dev)) return;
   LOCK(c);
   if (b && sub == 0) {
     const UINT left = box ? box->left : 0, right = box ? box->right : b->desc.ByteWidth;
-    if (left < right && right <= b->desc.ByteWidth) {
-      if (b->used == c->dev->epoch && !buf_rename(c->dev, b, left != 0 || right != b->desc.ByteWidth)) settle(c->dev, b->used);
-      memcpy(b->data + left, data, right - left);
-      buf_touched(b);
-      ++b->version;
+    if (left < right && right <= b->desc.ByteWidth && !(b->desc.BindFlags & D3D11_BIND_CONSTANT_BUFFER && box)) {      /* (a constant buffer is written whole) */
+      if (b->gpu) buf_gpu_write(c->dev, b, left, data, right - left);
+      else {
+        if (b->used == c->dev->epoch && !buf_rename(c->dev, b, left != 0 || right != b->desc.ByteWidth)) settle(c->dev, b->used);
+        memcpy(b->data + left, data, right - left);
+        buf_touched(b);
+        ++b->version;
+      }
     }
   } else if (t && sub < tex_subresources(t) && !t->depth) {
     const UINT level = sub % t->desc.MipLevels, w = mip_size(t->desc.Width, level), h = mip_size(t->desc.Height, level), slices = tex_slices(t, sub);
@@ -766,16 +1232,11 @@ static void STDMETHODCALLTYPE ctx_CopySubresourceRegion(Ctx *c, ID3D11Resource *
   Dev *d = c->dev;
   Buf *bt = buf_of_resource(to), *bf = buf_of_resource(from);
   Tex *tt = tex_of_resource(to), *tf = tex_of_resource(from);
+  if (predicated_out(c->dev)) return;
   LOCK(c);
   if (bt && bf) {
     const UINT left = box ? box->left : 0, right = box ? box->right : bf->desc.ByteWidth;
-    if (left < right && right <= bf->desc.ByteWidth && x <= bt->desc.ByteWidth && right - left <= bt->desc.ByteWidth - x) {
-      /* (buffers are written by the CPU only, so the copy is done here, in its place among the commands; a recorded draw keeps the old bytes in the old memory) */
-      if (bt->used == d->epoch && (bt == bf || !buf_rename(d, bt, x != 0 || right - left != bt->desc.ByteWidth))) settle(d, bt->used);
-      memmove(bt->data + x, bf->data + left, right - left);
-      buf_touched(bt);
-      ++bt->version;
-    }
+    if (left < right && right <= bf->desc.ByteWidth && x <= bt->desc.ByteWidth && right - left <= bt->desc.ByteWidth - x) buf_copy(d, bt, x, bf, left, right - left);
   } else if (tt && tf && to_sub < tex_subresources(tt) && from_sub < tex_subresources(tf)) {
     if (tex_simple(tt) && tex_simple(tf) && tt->stored == tf->stored && tt != tf) {
       tex_before_write(d, tt);
@@ -800,12 +1261,10 @@ static void STDMETHODCALLTYPE ctx_CopyResource(Ctx *c, ID3D11Resource *to, ID3D1
   Dev *d = c->dev;
   Buf *bt = buf_of_resource(to), *bf = buf_of_resource(from);
   Tex *tt = tex_of_resource(to), *tf = tex_of_resource(from);
+  if (predicated_out(c->dev)) return;
   LOCK(c);
   if (bt && bf && bt != bf) {
-    if (bt->used == d->epoch && !buf_rename(d, bt, bf->desc.ByteWidth < bt->desc.ByteWidth)) settle(d, bt->used);
-    memcpy(bt->data, bf->data, bt->desc.ByteWidth < bf->desc.ByteWidth ? bt->desc.ByteWidth : bf->desc.ByteWidth);
-    buf_touched(bt);
-    ++bt->version;
+    if (bt->desc.ByteWidth == bf->desc.ByteWidth) buf_copy(d, bt, 0, bf, 0, bt->desc.ByteWidth);      /* (CopyResource copies resources of one size) */
   } else if (tt && tf && tt != tf && tex_subresources(tt) == tex_subresources(tf) && tt->desc.Width == tf->desc.Width && tt->desc.Height == tf->desc.Height) {
     if (tex_simple(tt) && tex_simple(tf) && tt->stored == tf->stored) {
       tex_before_write(d, tt);
@@ -817,6 +1276,176 @@ static void STDMETHODCALLTYPE ctx_CopyResource(Ctx *c, ID3D11Resource *to, ID3D1
   }
   UNLOCK(c);
 }
+/* ---- clearing unordered access views ------------------------------------------------------------------------------------------------------------------ */
+
+static UINT16 half_of(FLOAT f) {
+  UINT32 x;
+  memcpy(&x, &f, 4);
+  const UINT32 sign = (x >> 16) & 0x8000u, exponent = (x >> 23) & 0xFFu, mantissa = x & 0x7FFFFFu;
+  if (exponent == 0xFF) return (UINT16)(sign | 0x7C00u | (mantissa ? 0x200u : 0));      /* (infinity, NaN) */
+  const INT e = (INT)exponent - 127 + 15;
+  if (e >= 31) return (UINT16)(sign | 0x7C00u);
+  if (e <= 0) {
+    if (e < -10) return (UINT16)sign;
+    const UINT32 m = (mantissa | 0x800000u) >> (1 - e);
+    return (UINT16)(sign | ((m + 0x1000u) >> 13));
+  }
+  UINT32 h = sign | ((UINT32)e << 10) | (mantissa >> 13);
+  if (mantissa & 0x1000u) ++h;      /* (rounded to nearest) */
+  return (UINT16)h;
+}
+static UINT32 unorm_of(FLOAT f, UINT bits) {
+  const FLOAT top = (FLOAT)((1u << bits) - 1);
+  if (!(f > 0.0f)) return 0;
+  if (f >= 1.0f) return (UINT32)top;
+  return (UINT32)(f * top + 0.5f);
+}
+static UINT32 snorm_of(FLOAT f, UINT bits) {
+  const FLOAT top = (FLOAT)((1u << (bits - 1)) - 1);
+  if (!(f > -1.0f)) f = -1.0f;
+  if (f > 1.0f) f = 1.0f;
+  const INT v = (INT)(f * top + (f >= 0 ? 0.5f : -0.5f));
+  return (UINT32)v & ((1u << bits) - 1);
+}
+/* One element of `format` with the four values of a clear (`floats`: ClearUnorderedAccessViewFloat, converted to the format; else ClearUnorderedAccessViewUint, the
+ * low bits of each value). Returns its bytes; 0 for a format that cannot be had. */
+static UINT clear_element(DXGI_FORMAT format, const UINT values[4], const FLOAT fvalues[4], BOOL floats, BYTE *out) {
+  UINT channels = 0, bits = 0;
+  int kind = 0;      /* 0 uint/sint/typeless, 1 float, 2 unorm, 3 snorm */
+  BOOL bgra = FALSE;
+  switch (format) {
+    case DXGI_FORMAT_R32G32B32A32_FLOAT: kind = 1; /* fallthrough */ case DXGI_FORMAT_R32G32B32A32_UINT: case DXGI_FORMAT_R32G32B32A32_SINT: case DXGI_FORMAT_R32G32B32A32_TYPELESS: channels = 4; bits = 32; break;
+    case DXGI_FORMAT_R32G32B32_FLOAT: kind = 1; /* fallthrough */ case DXGI_FORMAT_R32G32B32_UINT: case DXGI_FORMAT_R32G32B32_SINT: case DXGI_FORMAT_R32G32B32_TYPELESS: channels = 3; bits = 32; break;
+    case DXGI_FORMAT_R32G32_FLOAT: kind = 1; /* fallthrough */ case DXGI_FORMAT_R32G32_UINT: case DXGI_FORMAT_R32G32_SINT: case DXGI_FORMAT_R32G32_TYPELESS: channels = 2; bits = 32; break;
+    case DXGI_FORMAT_R32_FLOAT: kind = 1; /* fallthrough */ case DXGI_FORMAT_R32_UINT: case DXGI_FORMAT_R32_SINT: case DXGI_FORMAT_R32_TYPELESS: case DXGI_FORMAT_UNKNOWN: channels = 1; bits = 32; break;
+    case DXGI_FORMAT_R16G16B16A16_FLOAT: kind = 1; channels = 4; bits = 16; break;
+    case DXGI_FORMAT_R16G16B16A16_UNORM: kind = 2; channels = 4; bits = 16; break;
+    case DXGI_FORMAT_R16G16B16A16_SNORM: kind = 3; channels = 4; bits = 16; break;
+    case DXGI_FORMAT_R16G16B16A16_UINT: case DXGI_FORMAT_R16G16B16A16_SINT: case DXGI_FORMAT_R16G16B16A16_TYPELESS: channels = 4; bits = 16; break;
+    case DXGI_FORMAT_R16G16_FLOAT: kind = 1; channels = 2; bits = 16; break;
+    case DXGI_FORMAT_R16G16_UNORM: kind = 2; channels = 2; bits = 16; break;
+    case DXGI_FORMAT_R16G16_SNORM: kind = 3; channels = 2; bits = 16; break;
+    case DXGI_FORMAT_R16G16_UINT: case DXGI_FORMAT_R16G16_SINT: case DXGI_FORMAT_R16G16_TYPELESS: channels = 2; bits = 16; break;
+    case DXGI_FORMAT_R16_FLOAT: kind = 1; channels = 1; bits = 16; break;
+    case DXGI_FORMAT_R16_UNORM: kind = 2; channels = 1; bits = 16; break;
+    case DXGI_FORMAT_R16_SNORM: kind = 3; channels = 1; bits = 16; break;
+    case DXGI_FORMAT_R16_UINT: case DXGI_FORMAT_R16_SINT: case DXGI_FORMAT_R16_TYPELESS: channels = 1; bits = 16; break;
+    case DXGI_FORMAT_B8G8R8A8_UNORM: case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB: case DXGI_FORMAT_B8G8R8X8_UNORM: bgra = TRUE; /* fallthrough */
+    case DXGI_FORMAT_R8G8B8A8_UNORM: case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB: kind = 2; channels = 4; bits = 8; break;
+    case DXGI_FORMAT_R8G8B8A8_SNORM: kind = 3; channels = 4; bits = 8; break;
+    case DXGI_FORMAT_R8G8B8A8_UINT: case DXGI_FORMAT_R8G8B8A8_SINT: case DXGI_FORMAT_R8G8B8A8_TYPELESS: case DXGI_FORMAT_B8G8R8A8_TYPELESS: channels = 4; bits = 8; break;
+    case DXGI_FORMAT_R8G8_UNORM: kind = 2; channels = 2; bits = 8; break;
+    case DXGI_FORMAT_R8G8_SNORM: kind = 3; channels = 2; bits = 8; break;
+    case DXGI_FORMAT_R8G8_UINT: case DXGI_FORMAT_R8G8_SINT: case DXGI_FORMAT_R8G8_TYPELESS: channels = 2; bits = 8; break;
+    case DXGI_FORMAT_R8_UNORM: case DXGI_FORMAT_A8_UNORM: kind = 2; channels = 1; bits = 8; break;
+    case DXGI_FORMAT_R8_SNORM: kind = 3; channels = 1; bits = 8; break;
+    case DXGI_FORMAT_R8_UINT: case DXGI_FORMAT_R8_SINT: case DXGI_FORMAT_R8_TYPELESS: channels = 1; bits = 8; break;
+    case DXGI_FORMAT_R10G10B10A2_UNORM: case DXGI_FORMAT_R10G10B10A2_UINT: case DXGI_FORMAT_R10G10B10A2_TYPELESS: {
+      static const UINT widths[4] = {10, 10, 10, 2};
+      UINT32 word = 0, shift = 0;
+      for (UINT i = 0; i < 4; ++i) {
+        const UINT32 v = floats ? (format == DXGI_FORMAT_R10G10B10A2_UNORM ? unorm_of(fvalues[i], widths[i]) : (UINT32)fvalues[i]) : values[i];
+        word |= (v & ((1u << widths[i]) - 1)) << shift;
+        shift += widths[i];
+      }
+      memcpy(out, &word, 4);
+      return 4;
+    }
+    default: return 0;
+  }
+  if (format == DXGI_FORMAT_A8_UNORM) {      /* (the one channel is alpha) */
+    out[0] = (BYTE)(floats ? unorm_of(fvalues[3], 8) : values[3]);
+    return 1;
+  }
+  for (UINT i = 0; i < channels; ++i) {
+    const UINT from = bgra && i < 3 ? 2 - i : i;
+    UINT32 v;
+    if (!floats) v = values[from];
+    else if (kind == 1) { if (bits == 32) memcpy(&v, &fvalues[from], 4); else v = half_of(fvalues[from]); }
+    else if (kind == 2) v = unorm_of(fvalues[from], bits);
+    else if (kind == 3) v = snorm_of(fvalues[from], bits);
+    else if (bits == 32 && format != DXGI_FORMAT_R32G32B32A32_UINT && format != DXGI_FORMAT_R32G32B32A32_SINT && format != DXGI_FORMAT_R32G32_UINT &&
+             format != DXGI_FORMAT_R32G32_SINT && format != DXGI_FORMAT_R32_UINT && format != DXGI_FORMAT_R32_SINT && format != DXGI_FORMAT_R32G32B32_UINT &&
+             format != DXGI_FORMAT_R32G32B32_SINT) memcpy(&v, &fvalues[from], 4);      /* (raw, structured and typeless: the float's bits) */
+    else v = (UINT32)(INT)fvalues[from];
+    if (bits == 32) memcpy(out + 4 * i, &v, 4);
+    else if (bits == 16) { const UINT16 h = (UINT16)v; memcpy(out + 2 * i, &h, 2); }
+    else out[i] = (BYTE)v;
+  }
+  return channels * bits / 8;
+}
+
+/* Fills what an unordered access view names with one element made from the clear's values: a buffer's range, or the level and layers of a texture's view. */
+static void uav_clear(Ctx *c, View *v, const UINT values[4], const FLOAT fvalues[4], BOOL floats) {
+  Dev *d = c->dev;
+  BYTE element[16];
+  if (v->buf) {
+    /* (a raw or structured view is cleared word by word with the first value) */
+    const BOOL words = v->format == DXGI_FORMAT_UNKNOWN;
+    const UINT bytes = clear_element(words ? DXGI_FORMAT_R32_TYPELESS : v->format, values, fvalues, floats, element);
+    if (!bytes || v->size % bytes) return;
+    BYTE *fill = mem_alloc((SIZE_T)v->size);
+    if (!fill) return;
+    for (UINT64 at = 0; at < v->size; at += bytes) memcpy(fill + at, element, bytes);
+    buf_write_any(d, v->buf, v->offset, fill, v->size);
+    mem_free(fill);
+    return;
+  }
+  Tex *t = v->tex;
+  const D3D11_UNORDERED_ACCESS_VIEW_DESC *u = &v->desc.uav;
+  UINT level = 0, first = 0, layers = 1;
+  switch (u->ViewDimension) {
+    case D3D11_UAV_DIMENSION_TEXTURE1D: level = u->Texture1D.MipSlice; break;
+    case D3D11_UAV_DIMENSION_TEXTURE1DARRAY: level = u->Texture1DArray.MipSlice; first = u->Texture1DArray.FirstArraySlice; layers = u->Texture1DArray.ArraySize; break;
+    case D3D11_UAV_DIMENSION_TEXTURE2D: level = u->Texture2D.MipSlice; break;
+    case D3D11_UAV_DIMENSION_TEXTURE2DARRAY: level = u->Texture2DArray.MipSlice; first = u->Texture2DArray.FirstArraySlice; layers = u->Texture2DArray.ArraySize; break;
+    case D3D11_UAV_DIMENSION_TEXTURE3D: level = u->Texture3D.MipSlice; first = u->Texture3D.FirstWSlice; layers = u->Texture3D.WSize; break;
+    default: return;
+  }
+  const UINT bytes = clear_element(u->Format != DXGI_FORMAT_UNKNOWN ? u->Format : t->desc.Format, values, fvalues, floats, element);
+  if (!bytes || bytes != t->bpp || level >= t->desc.MipLevels) return;
+  const UINT w = mip_size(t->desc.Width, level), h = mip_size(t->desc.Height, level);
+  const UINT have = t->kind == 1 ? mip_size(t->slices, level) : t->desc.ArraySize;
+  if (layers == (UINT)-1 || first + layers > have) layers = first < have ? have - first : 0;
+  BYTE *fill = mem_alloc((SIZE_T)w * h * bytes);
+  if (!fill) return;
+  for (SIZE_T at = 0; at < (SIZE_T)w * h * bytes; at += bytes) memcpy(fill + at, element, bytes);
+  tex_before_write(d, t);
+  for (UINT k = first; k < first + layers; ++k) {
+    if (t->kind == 1) tex_write(d, t, level, 0, 0, k, w, h, fill, w * bytes);
+    else tex_write(d, t, level + k * t->desc.MipLevels, 0, 0, 0, w, h, fill, w * bytes);
+  }
+  mem_free(fill);
+}
+static void STDMETHODCALLTYPE ctx_ClearUnorderedAccessViewUint(Ctx *c, ID3D11UnorderedAccessView *view, const UINT values[4]) {
+  if (!view || !values) return;
+  static const FLOAT none[4] = {0, 0, 0, 0};
+  if (predicated_out(c->dev)) return;
+  LOCK(c);
+  uav_clear(c, (View *)view, values, none, FALSE);
+  UNLOCK(c);
+}
+static void STDMETHODCALLTYPE ctx_ClearUnorderedAccessViewFloat(Ctx *c, ID3D11UnorderedAccessView *view, const FLOAT values[4]) {
+  if (!view || !values) return;
+  static const UINT none[4] = {0, 0, 0, 0};
+  if (predicated_out(c->dev)) return;
+  LOCK(c);
+  uav_clear(c, (View *)view, none, values, TRUE);
+  UNLOCK(c);
+}
+/* The hidden count of an append or counter view into a buffer (4 bytes at a multiple of 4). The kernel's shaders do not change it (it has no append and consume
+ * instructions), so it is the count the program last set. */
+static void STDMETHODCALLTYPE ctx_CopyStructureCount(Ctx *c, ID3D11Buffer *buffer, UINT offset, ID3D11UnorderedAccessView *view) {
+  Buf *b = (Buf *)buffer;
+  View *v = (View *)view;
+  if (!b || !v || !v->buf || offset % 4 || offset > b->desc.ByteWidth || b->desc.ByteWidth - offset < 4 ||
+      !(v->desc.uav.Buffer.Flags & (D3D11_BUFFER_UAV_FLAG_APPEND | D3D11_BUFFER_UAV_FLAG_COUNTER))) return;
+  if (predicated_out(c->dev)) return;
+  LOCK(c);
+  buf_write_any(c->dev, b, offset, &v->counter, 4);
+  UNLOCK(c);
+}
+
 static void STDMETHODCALLTYPE ctx_GenerateMips(Ctx *c, ID3D11ShaderResourceView *view) { (void)c; (void)view; }
 /* A multisampled texture into an ordinary one of its size and format: the samples of each pixel averaged (Direct3D 12's ResolveSubresource below). */
 static void STDMETHODCALLTYPE ctx_ResolveSubresource(Ctx *c, ID3D11Resource *to, UINT to_sub, ID3D11Resource *from, UINT from_sub, DXGI_FORMAT format) {
@@ -824,7 +1453,7 @@ static void STDMETHODCALLTYPE ctx_ResolveSubresource(Ctx *c, ID3D11Resource *to,
   Dev *d = c->dev;
   Tex *tt = tex_of_resource(to), *tf = tex_of_resource(from);
   if (!tt || !tf || to_sub != 0 || from_sub != 0 || tf->desc.SampleDesc.Count < 2 || tt->desc.SampleDesc.Count > 1 || tt->desc.Width != tf->desc.Width ||
-      tt->desc.Height != tf->desc.Height || tt->stored != tf->stored) return;
+      tt->desc.Height != tf->desc.Height || tt->stored != tf->stored || predicated_out(d)) return;
   LOCK(c);
   tex_before_write(d, tt);
   tex_before_read(d, tf);
@@ -847,6 +1476,11 @@ static void ctx_unbind_all(Ctx *c) {
   bind(&c->ds, NULL);
   for (UINT k = 0; k < 3; ++k) for (UINT i = 0; i < CONSTANT_SLOTS; ++i) bind(&c->stage_cb[k][i], NULL);
   for (UINT k = 0; k < 4; ++k) for (UINT i = 0; i < TEXTURE_SLOTS; ++i) { bind(&c->stage_srv[k][i], NULL); bind(&c->stage_sampler[k][i], NULL); }
+  bind(&c->cs, NULL);
+  for (UINT i = 0; i < CONSTANT_SLOTS; ++i) bind(&c->cs_cb[i], NULL);
+  for (UINT i = 0; i < TEXTURE_SLOTS; ++i) { bind(&c->cs_srv[i], NULL); bind(&c->cs_sampler[i], NULL); }
+  for (UINT i = 0; i < UAV_SLOTS; ++i) { bind(&c->cs_uav[i], NULL); bind(&c->ps_uav[i], NULL); }
+  for (UINT i = 0; i < 4; ++i) bind(&c->so_buf[i], NULL);
   bind(&c->layout, NULL);
   bind(&c->ib, NULL);
   bind(&c->dsv, NULL);
@@ -866,53 +1500,23 @@ static void STDMETHODCALLTYPE ctx_ClearState(Ctx *c) {
   c->topology = D3D11_PRIMITIVE_TOPOLOGY_UNDEFINED;
   c->stencil_ref = 0;
   c->sample_mask = 0xFFFFFFFFu;
+  for (UINT i = 0; i < 4; ++i) c->blend_factor[i] = 1.0f;
+  bind(&c->dev->predicate, NULL);
+  c->dev->predicate_value = FALSE;
   c->dev->dirty = DIRTY_ALL;
   UNLOCK(c);
 }
 
-/* ---- queries (see d3d11.c) ------------------------------------------------------------------------------------------------------------------------------ */
-
-static Query *query_of(ID3D11Asynchronous *a) {
-  if (!a || ((DxObj *)a)->lpVtbl != (const void *)&query_vtbl) return NULL;      /* (only this library's queries: predicates and counters are not made) */
-  return (Query *)a;
+/* SetResourceMinLOD: the most detailed level a texture is sampled at (its samplers' MinLOD is raised to it). Buffers have no levels. */
+static void STDMETHODCALLTYPE ctx_SetResourceMinLOD(Ctx *c, ID3D11Resource *resource, FLOAT lod) {
+  Tex *t = tex_of_resource(resource);
+  if (!t || !(lod >= 0.0f)) return;
+  LOCK(c);
+  t->min_lod = lod;
+  UNLOCK(c);
 }
-static void STDMETHODCALLTYPE ctx_Begin(Ctx *c, ID3D11Asynchronous *async) {
+static FLOAT STDMETHODCALLTYPE ctx_GetResourceMinLOD(Ctx *c, ID3D11Resource *resource) {
   (void)c;
-  Query *q = query_of(async);
-  if (!q || q->desc.Query == D3D11_QUERY_EVENT || q->desc.Query == D3D11_QUERY_TIMESTAMP) return;      /* (those only End) */
-  q->begun = TRUE;
-  q->ended = FALSE;
-  q->start = query_now();
+  const Tex *t = tex_of_resource(resource);
+  return t ? t->min_lod : 0.0f;
 }
-static void STDMETHODCALLTYPE ctx_End(Ctx *c, ID3D11Asynchronous *async) {
-  Query *q = query_of(async);
-  if (!q) return;
-  flush(c->dev);      /* (what came before is done) */
-  q->stop = query_now();
-  q->ended = TRUE;
-}
-static HRESULT STDMETHODCALLTYPE ctx_GetData(Ctx *c, ID3D11Asynchronous *async, void *data, UINT size, UINT flags) {
-  (void)c; (void)flags;
-  Query *q = query_of(async);
-  if (!q) return E_INVALIDARG;
-  const UINT need = query_data_size(q->desc.Query);
-  if (data && size != need && size != 0) return E_INVALIDARG;
-  if (!q->ended) return DXGI_ERROR_INVALID_CALL;
-  if (!data || size == 0) return S_OK;
-  switch (q->desc.Query) {
-    case D3D11_QUERY_EVENT: *(BOOL *)data = TRUE; break;
-    case D3D11_QUERY_OCCLUSION: *(UINT64 *)data = 1; break;
-    case D3D11_QUERY_TIMESTAMP: *(UINT64 *)data = q->stop; break;
-    case D3D11_QUERY_TIMESTAMP_DISJOINT: {
-      D3D11_QUERY_DATA_TIMESTAMP_DISJOINT *t = data;
-      LARGE_INTEGER f;
-      QueryPerformanceFrequency(&f);
-      t->Frequency = (UINT64)f.QuadPart;
-      t->Disjoint = FALSE;
-      break;
-    }
-    default: return E_INVALIDARG;
-  }
-  return S_OK;
-}
-

@@ -23,6 +23,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 work=${TMPDIR:-/tmp}/tcos-emudx
+export TCOS_EMU_SECONDS=${TCOS_EMU_SECONDS:-300}      # (the Direct3D suites run longer than the runner's 60 seconds)
 mkdir -p "$work/sys32" "$work/obj"
 if [ ! -f "$work/build/build.ninja" ]; then
   cmake -S . -B "$work/build" -G Ninja -DCMAKE_TOOLCHAIN_FILE="$PWD/cmake/toolchain-x86_64-uefi.cmake" -DCMAKE_BUILD_TYPE=Debug > /dev/null
@@ -50,8 +51,10 @@ g++ -pthread "${objs[@]}" -o "$work/emurun"
 python3 - "$work/dxfixtures.h" <<'PY'
 import sys
 out = open(sys.argv[1], "w")
-for n in ("vs", "ps_color", "ps_tex", "cs_fill", "vs_attrs6", "ps_tex4", "ps_mrt8", "ps_cbuf"):
-    data = open("tests/data/dxbc/%s.dxbc" % n, "rb").read()
+import glob, os
+for path in sorted(glob.glob("tests/data/dxbc/*.dxbc")):
+    n = os.path.basename(path)[:-5]
+    data = open(path, "rb").read()
     out.write("static const unsigned char dx_%s_dxbc[] = {%s};\n" % (n, ",".join(str(b) for b in data)))
 PY
 
@@ -60,10 +63,10 @@ programs=("$@")
 fail=0
 for src in "${programs[@]}"; do
   name=$(basename "${src%.*}")
-  x86_64-w64-mingw32-gcc -O1 -Wall -Wextra -Wno-unused-parameter -I "$work" -o "$work/$name.exe" "$src" -ldxgi -ld3d12 -luuid
+  x86_64-w64-mingw32-gcc -O1 -Wall -Wextra -Wno-unused-parameter -I "$work" -o "$work/$name.exe" "$src" -ld3d11 -ldxgi -ld3d12 -luuid -ldxguid -luser32 -lgdi32
   echo "== $name"
   "$work/emurun" "$work/$name.exe" "$work/sys32" | tee "$work/$name.out"
-  grep -q ", 0 failed" "$work/$name.out" || fail=1
+  grep -q -e ", 0 failed" -e "all [0-9]* checks passed" "$work/$name.out" || fail=1
   grep -q "faulted=0" "$work/$name.out" || fail=1
 done
 exit $fail

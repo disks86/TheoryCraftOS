@@ -142,7 +142,11 @@ static void test_device(void) {
         SUCCEEDED(ID3D11Device_CheckMultisampleQualityLevels(g_device, DXGI_FORMAT_B8G8R8A8_UNORM, 1, &levels)) && levels == 1, "CheckFormatSupport and CheckMultisampleQualityLevels");
   ID3D11Counter *counter = NULL;
   const D3D11_COUNTER_DESC counter_desc = {D3D11_COUNTER_DEVICE_DEPENDENT_0, 0};
-  check(ID3D11Device_CreateCounter(g_device, &counter_desc, &counter) == E_NOTIMPL && counter == NULL, "what is not there answers E_NOTIMPL (and leaves the stack whole)");
+  D3D11_COUNTER_INFO counter_info = {1, 1, 0};
+  ID3D11Device_CheckCounterInfo(g_device, &counter_info);
+  check(counter_info.LastDeviceDependentCounter == 0 && counter_info.NumSimultaneousCounters == 0 && counter_info.NumDetectableParallelUnits == 1 &&
+        ID3D11Device_CreateCounter(g_device, &counter_desc, &counter) == DXGI_ERROR_UNSUPPORTED && counter == NULL,
+        "the device has no counters of the driver's: CheckCounterInfo says none, CreateCounter answers DXGI_ERROR_UNSUPPORTED (and leaves the stack whole)");
 
   /* what ANGLE (Chrome's GL) asks of a device: DXGI 1.2 and 1.3, event queries for its fences, timestamps */
   IDXGIDevice2 *dxgi2 = NULL;
@@ -1215,6 +1219,456 @@ static void test_compressed(void) {
   begin(NULL);
 }
 
+/* ---- compute shaders, buffer views and unordered access ------------------------------------------------------------------------------------------------- */
+
+/* A buffer's bytes, by way of a staging buffer. */
+static int read_buffer(ID3D11Buffer *buffer, void *out, UINT bytes) {
+  ID3D11Buffer *staging = make_buffer(0, D3D11_USAGE_STAGING, D3D11_CPU_ACCESS_READ, NULL, bytes);
+  D3D11_MAPPED_SUBRESOURCE mapped;
+  int ok = 0;
+  if (!staging) return 0;
+  D3D11_BOX box = {0, 0, 0, bytes, 1, 1};
+  ID3D11DeviceContext_CopySubresourceRegion(g_context, (ID3D11Resource *)staging, 0, 0, 0, 0, (ID3D11Resource *)buffer, 0, &box);
+  if (SUCCEEDED(ID3D11DeviceContext_Map(g_context, (ID3D11Resource *)staging, 0, D3D11_MAP_READ, 0, &mapped)) && mapped.pData) {
+    memcpy(out, mapped.pData, bytes);
+    ID3D11DeviceContext_Unmap(g_context, (ID3D11Resource *)staging, 0);
+    ok = 1;
+  }
+  ID3D11Buffer_Release(staging);
+  return ok;
+}
+static ID3D11Buffer *structured(UINT bind, UINT stride, UINT count, const void *data, UINT misc) {
+  D3D11_BUFFER_DESC desc = {stride * count, D3D11_USAGE_DEFAULT, bind, 0, misc | D3D11_RESOURCE_MISC_BUFFER_STRUCTURED, stride};
+  D3D11_SUBRESOURCE_DATA initial = {data, 0, 0};
+  ID3D11Buffer *buffer = NULL;
+  ID3D11Device_CreateBuffer(g_device, &desc, data ? &initial : NULL, &buffer);
+  return buffer;
+}
+static UINT64 query_result(ID3D11Query *query) {
+  UINT64 value = 0;
+  while (ID3D11DeviceContext_GetData(g_context, (ID3D11Asynchronous *)query, &value, sizeof value, 0) == S_FALSE) {}
+  return value;
+}
+
+static void test_compute(void) {
+  UINT source[32], result[32], sum[4];
+  for (UINT i = 0; i < 32; ++i) source[i] = i + 1;
+  ID3D11Buffer *src = structured(D3D11_BIND_SHADER_RESOURCE, 4, 32, source, 0);
+  ID3D11Buffer *dst = structured(D3D11_BIND_UNORDERED_ACCESS | D3D11_BIND_SHADER_RESOURCE, 4, 32, NULL, 0);
+  ID3D11Buffer *total = structured(D3D11_BIND_UNORDERED_ACCESS, 4, 4, NULL, 0);
+  const UINT k[4] = {3, 5, 0, 0};
+  ID3D11Buffer *constants = make_buffer(D3D11_BIND_CONSTANT_BUFFER, D3D11_USAGE_DEFAULT, 0, k, sizeof k);
+  ID3D11ComputeShader *cs = NULL;
+  ID3D11ShaderResourceView *src_view = NULL, *dst_view = NULL;
+  ID3D11UnorderedAccessView *uavs[2] = {NULL, NULL};
+  HRESULT hr = ID3D11Device_CreateComputeShader(g_device, dx_cs_d3d11_dxbc, sizeof dx_cs_d3d11_dxbc, NULL, &cs);
+  if (SUCCEEDED(hr)) hr = ID3D11Device_CreateShaderResourceView(g_device, (ID3D11Resource *)src, NULL, &src_view);
+  if (SUCCEEDED(hr)) hr = ID3D11Device_CreateShaderResourceView(g_device, (ID3D11Resource *)dst, NULL, &dst_view);
+  if (SUCCEEDED(hr)) hr = ID3D11Device_CreateUnorderedAccessView(g_device, (ID3D11Resource *)dst, NULL, &uavs[0]);
+  if (SUCCEEDED(hr)) hr = ID3D11Device_CreateUnorderedAccessView(g_device, (ID3D11Resource *)total, NULL, &uavs[1]);
+  check(SUCCEEDED(hr) && src && dst && total && constants && cs && src_view && uavs[0] && uavs[1],
+        "CreateComputeShader, structured buffers, their shader resource and unordered access views");
+  if (FAILED(hr)) return;
+  D3D11_UNORDERED_ACCESS_VIEW_DESC uav_desc;
+  ID3D11UnorderedAccessView_GetDesc(uavs[0], &uav_desc);
+  check(uav_desc.ViewDimension == D3D11_UAV_DIMENSION_BUFFER && uav_desc.Format == DXGI_FORMAT_UNKNOWN && uav_desc.Buffer.NumElements == 32, "the view's description");
+  ID3D11ShaderResourceView *refused = NULL;
+  ID3D11Buffer *plain = make_buffer(D3D11_BIND_SHADER_RESOURCE, D3D11_USAGE_DEFAULT, 0, NULL, 64);
+  check(ID3D11Device_CreateShaderResourceView(g_device, (ID3D11Resource *)plain, NULL, &refused) == E_INVALIDARG && !refused,
+        "a view of a buffer that is not structured needs a description");
+  if (plain) ID3D11Buffer_Release(plain);
+
+  const UINT zero[4] = {0, 0, 0, 0};
+  ID3D11DeviceContext_CSSetShader(g_context, cs, NULL, 0);
+  ID3D11DeviceContext_CSSetConstantBuffers(g_context, 0, 1, &constants);
+  ID3D11DeviceContext_CSSetShaderResources(g_context, 0, 1, &src_view);
+  ID3D11DeviceContext_CSSetUnorderedAccessViews(g_context, 0, 2, uavs, NULL);
+  ID3D11DeviceContext_ClearUnorderedAccessViewUint(g_context, uavs[1], zero);
+  ID3D11Query *stats = NULL;
+  const D3D11_QUERY_DESC stats_desc = {D3D11_QUERY_PIPELINE_STATISTICS, 0};
+  ID3D11Device_CreateQuery(g_device, &stats_desc, &stats);
+  if (stats) ID3D11DeviceContext_Begin(g_context, (ID3D11Asynchronous *)stats);
+  ID3D11DeviceContext_Dispatch(g_context, 2, 1, 1);
+  if (stats) ID3D11DeviceContext_End(g_context, (ID3D11Asynchronous *)stats);
+  int good = read_buffer(dst, result, sizeof result);
+  for (UINT i = 0; good && i < 32; ++i) good = result[i] == source[i] * 3 + 5;
+  if (!good) printf("d3d11test: (dispatched: %u %u %u ... %u)\n", result[0], result[1], result[2], result[31]);
+  check(good, "Dispatch: a compute shader reads a structured buffer and its constants, and writes another");
+  check(read_buffer(total, sum, sizeof sum) && sum[0] == 528, "... and adds with atomics into a buffer cleared with ClearUnorderedAccessViewUint");
+  D3D11_QUERY_DATA_PIPELINE_STATISTICS counted;
+  memset(&counted, 0xFF, sizeof counted);
+  check(stats && ID3D11DeviceContext_GetData(g_context, (ID3D11Asynchronous *)stats, &counted, sizeof counted, 0) == S_OK && counted.CSInvocations == 32 && counted.IAVertices == 0,
+        "a pipeline statistics query counts the compute shader's invocations");
+
+  ID3D11ComputeShader *bound = NULL;
+  ID3D11UnorderedAccessView *bound_uav = NULL;
+  ID3D11DeviceContext_CSGetShader(g_context, &bound, NULL, NULL);
+  ID3D11DeviceContext_CSGetUnorderedAccessViews(g_context, 1, 1, &bound_uav);
+  check(bound == cs && bound_uav == uavs[1], "CSGetShader and CSGetUnorderedAccessViews give back what is bound");
+  if (bound) ID3D11ComputeShader_Release(bound);
+  if (bound_uav) ID3D11UnorderedAccessView_Release(bound_uav);
+  ID3D11ShaderResourceView *read_back = (ID3D11ShaderResourceView *)1;
+  ID3D11DeviceContext_CSSetShaderResources(g_context, 1, 1, &dst_view);
+  ID3D11DeviceContext_CSGetShaderResources(g_context, 1, 1, &read_back);
+  check(read_back == NULL, "a buffer bound for unordered access is not bound as a shader resource too");
+
+  /* a clear with a value, and a dispatch whose group count is in a buffer */
+  const UINT sevens[4] = {7, 0, 0, 0};
+  ID3D11DeviceContext_ClearUnorderedAccessViewUint(g_context, uavs[0], sevens);
+  good = read_buffer(dst, result, sizeof result);
+  for (UINT i = 0; good && i < 32; ++i) good = result[i] == 7;
+  check(good, "ClearUnorderedAccessViewUint fills a structured buffer with the first value");
+  const UINT groups[3] = {1, 1, 1};
+  D3D11_BUFFER_DESC args_desc = {12, D3D11_USAGE_DEFAULT, 0, 0, D3D11_RESOURCE_MISC_DRAWINDIRECT_ARGS, 0};
+  D3D11_SUBRESOURCE_DATA args_data = {groups, 0, 0};
+  ID3D11Buffer *args = NULL;
+  ID3D11Device_CreateBuffer(g_device, &args_desc, &args_data, &args);
+  ID3D11DeviceContext_ClearUnorderedAccessViewUint(g_context, uavs[1], zero);
+  if (args) ID3D11DeviceContext_DispatchIndirect(g_context, args, 0);
+  good = read_buffer(dst, result, sizeof result);
+  for (UINT i = 0; good && i < 32; ++i) good = result[i] == (i < 16 ? source[i] * 3 + 5 : 7);
+  check(args && good && read_buffer(total, sum, sizeof sum) && sum[0] == 136, "DispatchIndirect: one group, from the arguments in a buffer");
+  if (args) ID3D11Buffer_Release(args);
+
+  /* the hidden count of an append view: set when it is bound, copied out with CopyStructureCount */
+  ID3D11Buffer *appended = structured(D3D11_BIND_UNORDERED_ACCESS, 8, 16, NULL, 0);
+  ID3D11Buffer *count = make_buffer(D3D11_BIND_SHADER_RESOURCE, D3D11_USAGE_DEFAULT, 0, NULL, 16);
+  ID3D11UnorderedAccessView *append_view = NULL;
+  D3D11_UNORDERED_ACCESS_VIEW_DESC append_desc;
+  memset(&append_desc, 0, sizeof append_desc);
+  append_desc.Format = DXGI_FORMAT_UNKNOWN;
+  append_desc.ViewDimension = D3D11_UAV_DIMENSION_BUFFER;
+  append_desc.Buffer.NumElements = 16;
+  append_desc.Buffer.Flags = D3D11_BUFFER_UAV_FLAG_APPEND;
+  if (appended) ID3D11Device_CreateUnorderedAccessView(g_device, (ID3D11Resource *)appended, &append_desc, &append_view);
+  const UINT initial_count = 7;
+  UINT counted_words[4] = {0, 0, 0, 0};
+  if (append_view && count) {
+    ID3D11DeviceContext_CSSetUnorderedAccessViews(g_context, 2, 1, &append_view, &initial_count);
+    ID3D11DeviceContext_CopyStructureCount(g_context, count, 4, append_view);
+  }
+  check(append_view && count && read_buffer(count, counted_words, sizeof counted_words) && counted_words[1] == 7 && counted_words[0] == 0,
+        "an append view's count, set by CSSetUnorderedAccessViews, copied with CopyStructureCount");
+  if (append_view) ID3D11UnorderedAccessView_Release(append_view);
+  if (appended) ID3D11Buffer_Release(appended);
+  if (count) ID3D11Buffer_Release(count);
+
+  ID3D11DeviceContext_CSSetShader(g_context, NULL, NULL, 0);
+  ID3D11UnorderedAccessView *none[2] = {NULL, NULL};
+  ID3D11DeviceContext_CSSetUnorderedAccessViews(g_context, 0, 2, none, NULL);
+  if (stats) ID3D11Query_Release(stats);
+  ID3D11ComputeShader_Release(cs);
+  ID3D11ShaderResourceView_Release(src_view);
+  if (dst_view) ID3D11ShaderResourceView_Release(dst_view);
+  ID3D11UnorderedAccessView_Release(uavs[0]);
+  ID3D11UnorderedAccessView_Release(uavs[1]);
+  ID3D11Buffer_Release(src);
+  ID3D11Buffer_Release(dst);
+  ID3D11Buffer_Release(total);
+  ID3D11Buffer_Release(constants);
+}
+
+/* ---- the pixel shader's unordered access views, queries, predication ----------------------------------------------------------------------------------- */
+
+static void test_pixel_uav_and_queries(void) {
+  const float colours[8] = {1, 0, 0, 1, 0, 1, 0, 1};
+  ID3D11Buffer *palette = structured(D3D11_BIND_SHADER_RESOURCE, 16, 2, colours, 0);
+  ID3D11Buffer *hits = structured(D3D11_BIND_UNORDERED_ACCESS, 4, 4, NULL, 0);
+  ID3D11PixelShader *ps = NULL;
+  ID3D11ShaderResourceView *palette_view = NULL;
+  ID3D11UnorderedAccessView *hits_view = NULL;
+  HRESULT hr = ID3D11Device_CreatePixelShader(g_device, dx_ps_sbuf_dxbc, sizeof dx_ps_sbuf_dxbc, NULL, &ps);
+  if (SUCCEEDED(hr)) hr = ID3D11Device_CreateShaderResourceView(g_device, (ID3D11Resource *)palette, NULL, &palette_view);
+  if (SUCCEEDED(hr)) hr = ID3D11Device_CreateUnorderedAccessView(g_device, (ID3D11Resource *)hits, NULL, &hits_view);
+  ID3D11Query *occlusion = NULL, *stats = NULL;
+  ID3D11Predicate *predicate = NULL;
+  const D3D11_QUERY_DESC occlusion_desc = {D3D11_QUERY_OCCLUSION, 0}, stats_desc = {D3D11_QUERY_PIPELINE_STATISTICS, 0}, predicate_desc = {D3D11_QUERY_OCCLUSION_PREDICATE, 0};
+  if (SUCCEEDED(hr)) hr = ID3D11Device_CreateQuery(g_device, &occlusion_desc, &occlusion);
+  if (SUCCEEDED(hr)) hr = ID3D11Device_CreateQuery(g_device, &stats_desc, &stats);
+  if (SUCCEEDED(hr)) hr = ID3D11Device_CreatePredicate(g_device, &predicate_desc, &predicate);
+  ID3D11Predicate *wrong = NULL;
+  check(SUCCEEDED(hr) && ID3D11Device_CreatePredicate(g_device, &occlusion_desc, &wrong) == E_INVALIDARG && !wrong,
+        "a pixel shader with a buffer view and an unordered access view; occlusion and statistics queries; a predicate (and none of a query that is not one)");
+  if (FAILED(hr)) return;
+  ID3D11Buffer *vertices = triangle(0.5f, 1, 1, 1);
+  begin(NULL);
+  clear(0, 0, 0);
+  bind_floats(vertices);
+  const UINT zero[4] = {0, 0, 0, 0};
+  ID3D11DeviceContext_ClearUnorderedAccessViewUint(g_context, hits_view, zero);
+  ID3D11DeviceContext_OMSetRenderTargetsAndUnorderedAccessViews(g_context, 1, &g_target_view, NULL, 1, 1, &hits_view, NULL);
+  ID3D11DeviceContext_PSSetShader(g_context, ps, NULL, 0);
+  ID3D11DeviceContext_PSSetShaderResources(g_context, 0, 1, &palette_view);
+  ID3D11DeviceContext_Begin(g_context, (ID3D11Asynchronous *)occlusion);
+  ID3D11DeviceContext_Draw(g_context, 3, 0);
+  ID3D11DeviceContext_End(g_context, (ID3D11Asynchronous *)occlusion);
+  read_target();
+  int greens = 0;
+  for (int i = 0; i < SIZE * SIZE; ++i) greens += g_pixels[i] == 0xFF00FF00u;
+  UINT counted[4] = {0};
+  const UINT64 samples = query_result(occlusion);
+  read_buffer(hits, counted, sizeof counted);
+  if (!(greens > 600 && (int)counted[0] == greens && samples == (UINT64)greens))
+    printf("d3d11test: (%d green pixels, the shader counted %u, the occlusion query %u)\n", greens, counted[0], (unsigned)samples);
+  check(greens > 600 && pixel(32, 32) == 0xFF00FF00u, "the pixel shader reads its colour out of a structured buffer");
+  check((int)counted[0] == greens, "... and counts its pixels with an atomic in an unordered access view");
+  check(samples == (UINT64)greens, "an occlusion query counts the samples drawn");
+  ID3D11UnorderedAccessView *got = NULL;
+  ID3D11RenderTargetView *got_target = NULL;
+  ID3D11DeviceContext_OMGetRenderTargetsAndUnorderedAccessViews(g_context, 1, &got_target, NULL, 1, 1, &got);
+  check(got == hits_view && got_target == g_target_view, "OMGetRenderTargetsAndUnorderedAccessViews");
+  if (got) ID3D11UnorderedAccessView_Release(got);
+  if (got_target) ID3D11RenderTargetView_Release(got_target);
+
+  /* the statistics of a draw */
+  ID3D11DeviceContext_Begin(g_context, (ID3D11Asynchronous *)stats);
+  ID3D11DeviceContext_Draw(g_context, 3, 0);
+  ID3D11DeviceContext_End(g_context, (ID3D11Asynchronous *)stats);
+  D3D11_QUERY_DATA_PIPELINE_STATISTICS s;
+  memset(&s, 0, sizeof s);
+  while (ID3D11DeviceContext_GetData(g_context, (ID3D11Asynchronous *)stats, &s, sizeof s, 0) == S_FALSE) {}
+  if (!(s.IAVertices == 3 && s.IAPrimitives == 1 && s.VSInvocations == 3 && s.CInvocations == 1 && s.PSInvocations == (UINT64)greens))
+    printf("d3d11test: (statistics: %u vertices, %u primitives, %u vs, %u c, %u ps)\n", (unsigned)s.IAVertices, (unsigned)s.IAPrimitives, (unsigned)s.VSInvocations,
+           (unsigned)s.CInvocations, (unsigned)s.PSInvocations);
+  check(s.IAVertices == 3 && s.IAPrimitives == 1 && s.VSInvocations == 3 && s.CInvocations == 1 && s.PSInvocations == (UINT64)greens && s.CSInvocations == 0,
+        "a pipeline statistics query: the vertices, the primitive, the vertex and pixel shaders' invocations");
+
+  /* an occlusion predicate of a draw outside the target, and the commands it holds back */
+  set_matrix(0.2f, 0.2f, 5.0f, 0);
+  ID3D11DeviceContext_Begin(g_context, (ID3D11Asynchronous *)predicate);
+  ID3D11DeviceContext_Draw(g_context, 3, 0);
+  ID3D11DeviceContext_End(g_context, (ID3D11Asynchronous *)predicate);
+  BOOL visible = TRUE;
+  while (ID3D11DeviceContext_GetData(g_context, (ID3D11Asynchronous *)predicate, &visible, sizeof visible, 0) == S_FALSE) {}
+  check(visible == FALSE, "an occlusion predicate of a draw that covers no pixel is false");
+  ID3D11DeviceContext_SetPredication(g_context, predicate, FALSE);
+  clear(1, 0, 0);
+  set_matrix(1, 1, 0, 0);
+  ID3D11DeviceContext_Draw(g_context, 3, 0);
+  ID3D11Predicate *got_predicate = NULL;
+  BOOL got_value = TRUE;
+  ID3D11DeviceContext_GetPredication(g_context, &got_predicate, &got_value);
+  check(got_predicate == predicate && got_value == FALSE, "GetPredication");
+  if (got_predicate) ID3D11Predicate_Release(got_predicate);
+  ID3D11DeviceContext_SetPredication(g_context, NULL, FALSE);
+  read_target();
+  check(pixel(32, 32) == 0xFF00FF00u && pixel(1, 1) == 0xFF000000u, "SetPredication: a clear and a draw are left out while the predicate is false");
+  ID3D11DeviceContext_SetPredication(g_context, predicate, TRUE);
+  clear(0, 0, 1);
+  ID3D11DeviceContext_SetPredication(g_context, NULL, FALSE);
+  read_target();
+  check(pixel(1, 1) == 0xFF0000FFu, "... and done while it is not the value given");
+
+  ID3D11UnorderedAccessView *no_uav = NULL;
+  ID3D11DeviceContext_OMSetRenderTargetsAndUnorderedAccessViews(g_context, 1, &g_target_view, NULL, 1, 1, &no_uav, NULL);
+  ID3D11ShaderResourceView *no_view = NULL;
+  ID3D11DeviceContext_PSSetShaderResources(g_context, 0, 1, &no_view);
+  ID3D11Predicate_Release(predicate);
+  ID3D11Query_Release(stats);
+  ID3D11Query_Release(occlusion);
+  ID3D11Buffer_Release(vertices);
+  ID3D11UnorderedAccessView_Release(hits_view);
+  ID3D11ShaderResourceView_Release(palette_view);
+  ID3D11PixelShader_Release(ps);
+  ID3D11Buffer_Release(hits);
+  ID3D11Buffer_Release(palette);
+}
+
+/* ---- stream output and the draws whose counts are in buffers ---------------------------------------------------------------------------------------------- */
+
+static void test_stream_output(void) {
+  /* the vertex shader's position and colour captured (a "geometry shader" made of a vertex shader's code: there is no geometry stage), 32 bytes a vertex */
+  const D3D11_SO_DECLARATION_ENTRY entries[2] = {{0, "SV_POSITION", 0, 0, 4, 0}, {0, "COLOR", 0, 0, 4, 0}};
+  const UINT stride = 32;
+  ID3D11GeometryShader *so = NULL;
+  HRESULT hr = ID3D11Device_CreateGeometryShaderWithStreamOutput(g_device, dx_vs_dxbc, sizeof dx_vs_dxbc, entries, 2, &stride, 1, 0, NULL, &so);
+  ID3D11GeometryShader *refused = NULL;
+  const D3D11_SO_DECLARATION_ENTRY bad = {0, "COLOR", 0, 0, 5, 0};
+  check(SUCCEEDED(hr) && so && ID3D11Device_CreateGeometryShaderWithStreamOutput(g_device, dx_vs_dxbc, sizeof dx_vs_dxbc, &bad, 1, &stride, 1, 0, NULL, &refused) == E_INVALIDARG,
+        "CreateGeometryShaderWithStreamOutput of a vertex shader's code (and a declaration of five components is refused)");
+  if (!so) return;
+  D3D11_BUFFER_DESC desc = {6 * 32, D3D11_USAGE_DEFAULT, D3D11_BIND_STREAM_OUTPUT | D3D11_BIND_VERTEX_BUFFER, 0, 0, 0};
+  ID3D11Buffer *captured = NULL, *small = NULL;
+  ID3D11Device_CreateBuffer(g_device, &desc, NULL, &captured);
+  desc.ByteWidth = 32;
+  ID3D11Device_CreateBuffer(g_device, &desc, NULL, &small);
+  ID3D11Query *so_stats = NULL;
+  ID3D11Predicate *overflow = NULL;
+  const D3D11_QUERY_DESC stats_desc = {D3D11_QUERY_SO_STATISTICS_STREAM0, 0}, overflow_desc = {D3D11_QUERY_SO_OVERFLOW_PREDICATE_STREAM0, 0};
+  ID3D11Device_CreateQuery(g_device, &stats_desc, &so_stats);
+  ID3D11Device_CreatePredicate(g_device, &overflow_desc, &overflow);
+  check(captured && small && so_stats && overflow, "stream output buffers, a statistics query of stream 0 and its overflow predicate");
+  if (!captured || !small || !so_stats || !overflow) return;
+
+  const VertexF v[3] = {{-0.8f, -0.8f, 0.5f, 1, 0, 0, 1}, {0.8f, -0.8f, 0.5f, 0, 1, 0, 1}, {0.0f, 0.8f, 0.5f, 0, 0, 1, 1}};
+  ID3D11Buffer *vertices = make_buffer(D3D11_BIND_VERTEX_BUFFER, D3D11_USAGE_DEFAULT, 0, v, sizeof v);
+  begin(NULL);
+  clear(0, 0, 0);
+  bind_floats(vertices);
+  ID3D11DeviceContext_PSSetShader(g_context, g_ps_color, NULL, 0);
+  ID3D11DeviceContext_GSSetShader(g_context, so, NULL, 0);
+  UINT offset = 0;
+  ID3D11DeviceContext_SOSetTargets(g_context, 1, &captured, &offset);
+  ID3D11DeviceContext_Begin(g_context, (ID3D11Asynchronous *)so_stats);
+  ID3D11DeviceContext_Draw(g_context, 3, 0);
+  ID3D11DeviceContext_End(g_context, (ID3D11Asynchronous *)so_stats);
+  D3D11_QUERY_DATA_SO_STATISTICS st = {99, 99};
+  while (ID3D11DeviceContext_GetData(g_context, (ID3D11Asynchronous *)so_stats, &st, sizeof st, 0) == S_FALSE) {}
+  if (st.NumPrimitivesWritten != 1 || st.PrimitivesStorageNeeded != 1) printf("d3d11test: (stream output statistics: %u written, %u needed)\n", (unsigned)st.NumPrimitivesWritten, (unsigned)st.PrimitivesStorageNeeded);
+  check(st.NumPrimitivesWritten == 1 && st.PrimitivesStorageNeeded == 1, "a stream output statistics query: one triangle written");
+  read_target();
+  check((pixel(32, 32) & 0xFFFFFF) != 0, "... and drawn (stream 0 is rasterized)");
+  float records[6 * 8];
+  memset(records, 0, sizeof records);
+  check(read_buffer(captured, records, sizeof records) && records[0] == -0.8f && records[1] == -0.8f && records[2] == 0.5f && records[3] == 1.0f && records[4] == 1.0f &&
+        records[8 + 5] == 1.0f && records[16 + 6] == 1.0f, "the captured records: each vertex's position and colour");
+  ID3D11Buffer *got[2] = {NULL, NULL};
+  ID3D11DeviceContext_SOGetTargets(g_context, 2, got);
+  check(got[0] == captured && got[1] == NULL, "SOGetTargets");
+  for (int i = 0; i < 2; ++i) if (got[i]) ID3D11Buffer_Release(got[i]);
+  /* appended: a second draw with the offset -1 goes on after the first triangle */
+  offset = (UINT)-1;
+  set_matrix(1, 1, 0.1f, 0);
+  ID3D11DeviceContext_SOSetTargets(g_context, 1, &captured, &offset);
+  ID3D11DeviceContext_Draw(g_context, 3, 0);
+  read_buffer(captured, records, sizeof records);
+  check(records[24] > -0.75f && records[24] < -0.65f && records[0] == -0.8f, "SOSetTargets with the offset -1 appends to what the buffer holds");
+
+  /* DrawAuto: what was captured, drawn as vertices (the position's x, y and z, and the colour) */
+  const D3D11_INPUT_ELEMENT_DESC elements[2] = {{"POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0, D3D11_INPUT_PER_VERTEX_DATA, 0},
+                                                {"COLOR", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 16, D3D11_INPUT_PER_VERTEX_DATA, 0}};
+  ID3D11InputLayout *layout = NULL;
+  ID3D11Device_CreateInputLayout(g_device, elements, 2, dx_vs_dxbc, sizeof dx_vs_dxbc, &layout);
+  ID3D11DeviceContext_SOSetTargets(g_context, 0, NULL, NULL);
+  ID3D11DeviceContext_GSSetShader(g_context, NULL, NULL, 0);
+  set_matrix(0.5f, 0.5f, 0, 0);
+  clear(0, 0, 0);
+  const UINT so_stride = 32, so_offset = 0;
+  ID3D11DeviceContext_IASetInputLayout(g_context, layout);
+  ID3D11DeviceContext_IASetVertexBuffers(g_context, 0, 1, &captured, &so_stride, &so_offset);
+  ID3D11Query *stats = NULL;
+  const D3D11_QUERY_DESC pipeline_desc = {D3D11_QUERY_PIPELINE_STATISTICS, 0};
+  ID3D11Device_CreateQuery(g_device, &pipeline_desc, &stats);
+  if (stats) ID3D11DeviceContext_Begin(g_context, (ID3D11Asynchronous *)stats);
+  ID3D11DeviceContext_DrawAuto(g_context);
+  if (stats) ID3D11DeviceContext_End(g_context, (ID3D11Asynchronous *)stats);
+  D3D11_QUERY_DATA_PIPELINE_STATISTICS ps;
+  memset(&ps, 0, sizeof ps);
+  if (stats) while (ID3D11DeviceContext_GetData(g_context, (ID3D11Asynchronous *)stats, &ps, sizeof ps, 0) == S_FALSE) {}
+  read_target();
+  check(layout && (pixel(32, 32) & 0xFFFFFF) != 0 && pixel(32, 8) == 0xFF000000u && ps.IAVertices == 6, "DrawAuto draws the six vertices captured, at half the size");
+  if (stats) ID3D11Query_Release(stats);
+
+  /* a buffer too small for the triangle: the overflow predicate is true, nothing is written */
+  set_matrix(1, 1, 0, 0);
+  bind_floats(vertices);
+  ID3D11DeviceContext_GSSetShader(g_context, so, NULL, 0);
+  offset = 0;
+  ID3D11DeviceContext_SOSetTargets(g_context, 1, &small, &offset);
+  ID3D11DeviceContext_Begin(g_context, (ID3D11Asynchronous *)overflow);
+  ID3D11DeviceContext_Begin(g_context, (ID3D11Asynchronous *)so_stats);
+  ID3D11DeviceContext_Draw(g_context, 3, 0);
+  ID3D11DeviceContext_End(g_context, (ID3D11Asynchronous *)so_stats);
+  ID3D11DeviceContext_End(g_context, (ID3D11Asynchronous *)overflow);
+  BOOL overflowed = FALSE;
+  while (ID3D11DeviceContext_GetData(g_context, (ID3D11Asynchronous *)overflow, &overflowed, sizeof overflowed, 0) == S_FALSE) {}
+  while (ID3D11DeviceContext_GetData(g_context, (ID3D11Asynchronous *)so_stats, &st, sizeof st, 0) == S_FALSE) {}
+  if (!(overflowed == TRUE && st.NumPrimitivesWritten == 0 && st.PrimitivesStorageNeeded == 1))
+    printf("d3d11test: (overflow %d, %u written, %u needed)\n", overflowed, (unsigned)st.NumPrimitivesWritten, (unsigned)st.PrimitivesStorageNeeded);
+  check(overflowed == TRUE && st.NumPrimitivesWritten == 0 && st.PrimitivesStorageNeeded == 1, "a stream output buffer too small: the overflow predicate, written 0 of 1");
+
+  ID3D11DeviceContext_SOSetTargets(g_context, 0, NULL, NULL);
+  ID3D11DeviceContext_GSSetShader(g_context, NULL, NULL, 0);
+  if (layout) ID3D11InputLayout_Release(layout);
+  ID3D11Buffer_Release(vertices);
+  ID3D11Predicate_Release(overflow);
+  ID3D11Query_Release(so_stats);
+  ID3D11Buffer_Release(small);
+  ID3D11Buffer_Release(captured);
+  ID3D11GeometryShader_Release(so);
+}
+
+static void test_indirect_draws(void) {
+  const UINT draw[4] = {3, 1, 0, 0}, indexed[5] = {3, 1, 0, 0, 0};
+  const UINT16 indices[3] = {0, 1, 2};
+  D3D11_BUFFER_DESC desc = {20, D3D11_USAGE_DEFAULT, 0, 0, D3D11_RESOURCE_MISC_DRAWINDIRECT_ARGS, 0};
+  D3D11_SUBRESOURCE_DATA d1 = {draw, 0, 0}, d2 = {indexed, 0, 0};
+  ID3D11Buffer *args = NULL, *args_indexed = NULL;
+  desc.ByteWidth = 16;
+  ID3D11Device_CreateBuffer(g_device, &desc, &d1, &args);
+  desc.ByteWidth = 20;
+  ID3D11Device_CreateBuffer(g_device, &desc, &d2, &args_indexed);
+  ID3D11Buffer *index = make_buffer(D3D11_BIND_INDEX_BUFFER, D3D11_USAGE_DEFAULT, 0, indices, sizeof indices);
+  ID3D11Buffer *vertices = triangle(0.5f, 0, 1, 0);
+  check(args && args_indexed && index && vertices, "buffers of draw arguments (D3D11_RESOURCE_MISC_DRAWINDIRECT_ARGS)");
+  if (!args || !args_indexed || !index || !vertices) return;
+  begin(NULL);
+  clear(0, 0, 0);
+  bind_floats(vertices);
+  ID3D11DeviceContext_PSSetShader(g_context, g_ps_color, NULL, 0);
+  ID3D11DeviceContext_DrawInstancedIndirect(g_context, args, 0);
+  read_target();
+  check(pixel(32, 32) == 0xFF00FF00u && pixel(1, 1) == 0xFF000000u, "DrawInstancedIndirect");
+  clear(0, 0, 0);
+  ID3D11DeviceContext_IASetIndexBuffer(g_context, index, DXGI_FORMAT_R16_UINT, 0);
+  ID3D11DeviceContext_DrawIndexedInstancedIndirect(g_context, args_indexed, 0);
+  read_target();
+  check(pixel(32, 32) == 0xFF00FF00u && pixel(1, 1) == 0xFF000000u, "DrawIndexedInstancedIndirect");
+  ID3D11Buffer_Release(vertices);
+  ID3D11Buffer_Release(index);
+  ID3D11Buffer_Release(args);
+  ID3D11Buffer_Release(args_indexed);
+}
+
+/* SetResourceMinLOD: a texture of three levels (red, green, blue) sampled at its most detailed level, then no more detailed than level 1. */
+static void test_min_lod(void) {
+  static UINT32 level0[16], level1[4], level2[1];
+  for (int i = 0; i < 16; ++i) level0[i] = 0xFF0000FFu;
+  for (int i = 0; i < 4; ++i) level1[i] = 0xFF00FF00u;
+  level2[0] = 0xFFFF0000u;
+  D3D11_TEXTURE2D_DESC desc = {4, 4, 3, 1, DXGI_FORMAT_R8G8B8A8_UNORM, {1, 0}, D3D11_USAGE_DEFAULT, D3D11_BIND_SHADER_RESOURCE, 0, 0};
+  D3D11_SUBRESOURCE_DATA initial[3] = {{level0, 16, 0}, {level1, 8, 0}, {level2, 4, 0}};
+  ID3D11Texture2D *texture = NULL;
+  ID3D11ShaderResourceView *view = NULL;
+  ID3D11SamplerState *sampler = NULL;
+  D3D11_SAMPLER_DESC sd;
+  memset(&sd, 0, sizeof sd);
+  sd.Filter = D3D11_FILTER_MIN_MAG_MIP_POINT;
+  sd.AddressU = sd.AddressV = sd.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
+  sd.MaxLOD = D3D11_FLOAT32_MAX;
+  HRESULT hr = ID3D11Device_CreateTexture2D(g_device, &desc, initial, &texture);
+  if (SUCCEEDED(hr)) hr = ID3D11Device_CreateShaderResourceView(g_device, (ID3D11Resource *)texture, NULL, &view);
+  if (SUCCEEDED(hr)) hr = ID3D11Device_CreateSamplerState(g_device, &sd, &sampler);
+  check(SUCCEEDED(hr), "a texture of three levels");
+  if (FAILED(hr)) return;
+  /* (ps_tex samples at twice the colour's red and green, times the colour: (0.25, 0.25, 1) is the middle, at the same place for every pixel) */
+  ID3D11Buffer *vertices = triangle(0.5f, 0.25f, 0.25f, 1.0f);
+  begin(NULL);
+  clear(0, 0, 0);
+  bind_floats(vertices);
+  ID3D11DeviceContext_PSSetShader(g_context, g_ps_tex, NULL, 0);
+  ID3D11DeviceContext_PSSetShaderResources(g_context, 0, 1, &view);
+  ID3D11DeviceContext_PSSetSamplers(g_context, 0, 1, &sampler);
+  ID3D11DeviceContext_Draw(g_context, 3, 0);
+  read_target();
+  const UINT32 first = pixel(32, 32);
+  ID3D11DeviceContext_SetResourceMinLOD(g_context, (ID3D11Resource *)texture, 1.0f);
+  ID3D11DeviceContext_Draw(g_context, 3, 0);
+  read_target();
+  const UINT32 clamped = pixel(32, 32);
+  ID3D11DeviceContext_SetResourceMinLOD(g_context, (ID3D11Resource *)texture, 0.0f);
+  if (!(red(first) > 40 && green(first) == 0 && green(clamped) > 40 && red(clamped) == 0)) printf("d3d11test: (sampled %08x, with the clamp %08x)\n", (unsigned)first, (unsigned)clamped);
+  check(red(first) > 40 && green(first) == 0, "the texture sampled at level 0");
+  check(green(clamped) > 40 && red(clamped) == 0 && ID3D11DeviceContext_GetResourceMinLOD(g_context, (ID3D11Resource *)texture) == 0.0f,
+        "SetResourceMinLOD 1: sampled no more detailed than level 1 (and GetResourceMinLOD)");
+  ID3D11ShaderResourceView *no_view = NULL;
+  ID3D11DeviceContext_PSSetShaderResources(g_context, 0, 1, &no_view);
+  ID3D11Buffer_Release(vertices);
+  ID3D11SamplerState_Release(sampler);
+  ID3D11ShaderResourceView_Release(view);
+  ID3D11Texture2D_Release(texture);
+}
+
 int main(void) {
   test_device();
   if (g_device && g_context) {
@@ -1236,6 +1690,11 @@ int main(void) {
       test_texture_kinds();
       test_shader_stages();
       test_compressed();
+      test_compute();
+      test_pixel_uav_and_queries();
+      test_stream_output();
+      test_indirect_draws();
+      test_min_lod();
     }
     ID3D11DeviceContext_ClearState(g_context);
     ID3D11DeviceContext_Flush(g_context);
