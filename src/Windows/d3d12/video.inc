@@ -22,9 +22,13 @@
  * into the planes of the output). A decoder heap is the kernel's decoder (what it keeps of earlier pictures is the heap's state, as Direct3D 12 says); the decoder object
  * names the profile. Every picture is known by its texture (the kernel's allocation of its luma plane), so the reference list may change from picture to picture.
  * Video processing is the stream's VideoProcess (Hardware/VideoCodec/VideoProcess.hpp, on the CPU): colour space and format conversion, scaling, the eight orientations,
- * alpha blending and fill; no deinterlacing, filters, luma keying, stereo or auto processing (the feature queries say so).
+ * alpha blending and fill, deinterlacing (bob, and motion adaptive with a past and a future frame: CUSTOM), the ProcAmp, noise reduction, edge enhancement and
+ * anamorphic scaling filters, luma keying, stereo (packed and separate pictures, two outputs), PQ and HLG with tone mapping; no auto processing and no stereo adjustment
+ * filter (the feature queries say so).
  * Not here: video encoding and motion estimation (D3D12_FEATURE_VIDEO_FEATURE_AREA_SUPPORT says VideoEncodeSupport FALSE; their creators answer DXGI_ERROR_UNSUPPORTED),
  * extension commands (none are enumerated), protected sessions, decode histograms and decode-time conversion (reported as not supported), timestamps on video lists. */
+
+#include "video_extra.h"
 
 /* ---- the profiles ------------------------------------------------------------------------------------------------------------------------------------------------ */
 
@@ -74,7 +78,7 @@ static int vp_format(DXGI_FORMAT f) {
     default: return -1;
   }
 }
-/* (the standard dynamic range spaces, gamma 2.2 and 2.4: YCbCr for the YUV formats, RGB for the others - what vp_color_space_supported takes; no PQ or HLG) */
+/* (gamma 2.2 and 2.4, PQ and HLG: YCbCr for the YUV formats, RGB for the others - what vp_color_space_supported takes) */
 static int vp_space_ok(DXGI_FORMAT f, DXGI_COLOR_SPACE_TYPE s) {
   const int v = vp_format(f);
   if (v < 0) return 0;
@@ -82,21 +86,35 @@ static int vp_space_ok(DXGI_FORMAT f, DXGI_COLOR_SPACE_TYPE s) {
     return s == DXGI_COLOR_SPACE_YCBCR_FULL_G22_NONE_P709_X601 || s == DXGI_COLOR_SPACE_YCBCR_STUDIO_G22_LEFT_P601 || s == DXGI_COLOR_SPACE_YCBCR_FULL_G22_LEFT_P601 ||
            s == DXGI_COLOR_SPACE_YCBCR_STUDIO_G22_LEFT_P709 || s == DXGI_COLOR_SPACE_YCBCR_FULL_G22_LEFT_P709 || s == DXGI_COLOR_SPACE_YCBCR_STUDIO_G22_LEFT_P2020 ||
            s == DXGI_COLOR_SPACE_YCBCR_FULL_G22_LEFT_P2020 || s == DXGI_COLOR_SPACE_YCBCR_STUDIO_G22_TOPLEFT_P2020 || s == DXGI_COLOR_SPACE_YCBCR_STUDIO_G24_LEFT_P709 ||
-           s == DXGI_COLOR_SPACE_YCBCR_STUDIO_G24_LEFT_P2020 || s == DXGI_COLOR_SPACE_YCBCR_STUDIO_G24_TOPLEFT_P2020;
+           s == DXGI_COLOR_SPACE_YCBCR_STUDIO_G24_LEFT_P2020 || s == DXGI_COLOR_SPACE_YCBCR_STUDIO_G24_TOPLEFT_P2020 || s == DXGI_COLOR_SPACE_YCBCR_STUDIO_G2084_LEFT_P2020 ||
+           s == DXGI_COLOR_SPACE_YCBCR_STUDIO_G2084_TOPLEFT_P2020 || s == DXGI_COLOR_SPACE_YCBCR_STUDIO_GHLG_TOPLEFT_P2020 || s == DXGI_COLOR_SPACE_YCBCR_FULL_GHLG_TOPLEFT_P2020;
   return s == DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709 || s == DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709 || s == DXGI_COLOR_SPACE_RGB_STUDIO_G22_NONE_P709 ||
          s == DXGI_COLOR_SPACE_RGB_STUDIO_G22_NONE_P2020 || s == DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P2020 || s == DXGI_COLOR_SPACE_RGB_STUDIO_G24_NONE_P709 ||
-         s == DXGI_COLOR_SPACE_RGB_STUDIO_G24_NONE_P2020;
+         s == DXGI_COLOR_SPACE_RGB_STUDIO_G24_NONE_P2020 || s == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020 || s == DXGI_COLOR_SPACE_RGB_STUDIO_G2084_NONE_P2020;
 }
 #define VP_MAX_STREAMS 16      /* (the kernel's kMaxVideoProcessStreams) */
-#define VP_FEATURES (D3D12_VIDEO_PROCESS_FEATURE_FLAG_ALPHA_FILL | D3D12_VIDEO_PROCESS_FEATURE_FLAG_ROTATION | D3D12_VIDEO_PROCESS_FEATURE_FLAG_FLIP | D3D12_VIDEO_PROCESS_FEATURE_FLAG_ALPHA_BLENDING)
+#define VP_FEATURES (D3D12_VIDEO_PROCESS_FEATURE_FLAG_ALPHA_FILL | D3D12_VIDEO_PROCESS_FEATURE_FLAG_ROTATION | D3D12_VIDEO_PROCESS_FEATURE_FLAG_FLIP | D3D12_VIDEO_PROCESS_FEATURE_FLAG_ALPHA_BLENDING | \
+                     D3D12_VIDEO_PROCESS_FEATURE_FLAG_LUMA_KEY | D3D12_VIDEO_PROCESS_FEATURE_FLAG_STEREO)
+#define VP_DEINTERLACE (D3D12_VIDEO_PROCESS_DEINTERLACE_FLAG_BOB | D3D12_VIDEO_PROCESS_DEINTERLACE_FLAG_CUSTOM)
+/* The filters (all but stereo adjustment) and their ranges, in DXVA-HD's units once multiplied: brightness -100..100, contrast 0..10 (1), hue -180..180 degrees,
+ * saturation 0..10 (1), noise reduction, edge enhancement and anamorphic scaling 0..1 (strength); the multipliers are binary fractions, as Direct3D asks. */
+#define VP_FILTERS 0x7Fu
+static const D3D12_VIDEO_PROCESS_FILTER_RANGE g_vp_filter_ranges[7] = {
+    {-400, 400, 0, 0.25f}, {0, 640, 64, 1.0f / 64}, {-720, 720, 0, 0.25f}, {0, 640, 64, 1.0f / 64}, {0, 64, 0, 1.0f / 64}, {0, 64, 0, 1.0f / 64}, {0, 64, 0, 1.0f / 64}};
+/* (the past and future frames the motion adaptive deinterlacer takes) */
+#define VP_PAST_FRAMES 1
+#define VP_FUTURE_FRAMES 1
 
 static int vp_input_ok(const D3D12_VIDEO_PROCESS_INPUT_STREAM_DESC *in) {
-  return vp_space_ok(in->Format, in->ColorSpace) && in->FieldType == D3D12_VIDEO_FIELD_TYPE_NONE && in->StereoFormat == D3D12_VIDEO_FRAME_STEREO_FORMAT_NONE &&
-         in->DeinterlaceMode == D3D12_VIDEO_PROCESS_DEINTERLACE_FLAG_NONE && in->FilterFlags == D3D12_VIDEO_PROCESS_FILTER_FLAG_NONE && !in->LumaKey.Enable &&
-         in->NumPastFrames == 0 && in->NumFutureFrames == 0 && !in->EnableAutoProcessing;
+  return vp_space_ok(in->Format, in->ColorSpace) && (UINT)in->FieldType <= D3D12_VIDEO_FIELD_TYPE_INTERLACED_BOTTOM_FIELD_FIRST &&
+         (UINT)in->StereoFormat <= D3D12_VIDEO_FRAME_STEREO_FORMAT_SEPARATE &&
+         (in->DeinterlaceMode == D3D12_VIDEO_PROCESS_DEINTERLACE_FLAG_NONE || in->DeinterlaceMode == D3D12_VIDEO_PROCESS_DEINTERLACE_FLAG_BOB ||
+          in->DeinterlaceMode == D3D12_VIDEO_PROCESS_DEINTERLACE_FLAG_CUSTOM) &&
+         !(in->FilterFlags & ~VP_FILTERS) && (!in->LumaKey.Enable || (in->LumaKey.Lower >= 0.0f && in->LumaKey.Lower <= in->LumaKey.Upper && in->LumaKey.Upper <= 1.0f)) &&
+         in->NumPastFrames <= 16 && in->NumFutureFrames <= 16 && !in->EnableAutoProcessing;
 }
 static int vp_output_ok(const D3D12_VIDEO_PROCESS_OUTPUT_STREAM_DESC *out) {
-  return vp_space_ok(out->Format, out->ColorSpace) && !out->EnableStereo && (UINT)out->AlphaFillMode <= D3D12_VIDEO_PROCESS_ALPHA_FILL_MODE_SOURCE_STREAM;
+  return vp_space_ok(out->Format, out->ColorSpace) && (UINT)out->AlphaFillMode <= D3D12_VIDEO_PROCESS_ALPHA_FILL_MODE_SOURCE_STREAM;
 }
 
 /* ---- decoders, decoder heaps, processors ------------------------------------------------------------------------------------------------------------------------- */
@@ -241,8 +259,9 @@ static HRESULT STDMETHODCALLTYPE vdev_CheckFeatureSupport(ID3D12VideoDevice3 *v,
       if (f->NodeIndex) return E_INVALIDARG;
       const int ok = vp_space_ok(f->InputSample.Format.Format, f->InputSample.Format.ColorSpace) && vp_space_ok(f->OutputFormat.Format, f->OutputFormat.ColorSpace) &&
                      f->InputSample.Width && f->InputSample.Height && f->InputSample.Width <= KMAX_TEXTURE_DIMENSION && f->InputSample.Height <= KMAX_TEXTURE_DIMENSION &&
-                     f->InputFieldType == D3D12_VIDEO_FIELD_TYPE_NONE && f->InputStereoFormat == D3D12_VIDEO_FRAME_STEREO_FORMAT_NONE &&
-                     f->OutputStereoFormat == D3D12_VIDEO_FRAME_STEREO_FORMAT_NONE;
+                     (UINT)f->InputFieldType <= D3D12_VIDEO_FIELD_TYPE_INTERLACED_BOTTOM_FIELD_FIRST && (UINT)f->InputStereoFormat <= D3D12_VIDEO_FRAME_STEREO_FORMAT_SEPARATE &&
+                     (f->OutputStereoFormat == D3D12_VIDEO_FRAME_STEREO_FORMAT_NONE || f->OutputStereoFormat == D3D12_VIDEO_FRAME_STEREO_FORMAT_MONO ||
+                      f->OutputStereoFormat == D3D12_VIDEO_FRAME_STEREO_FORMAT_SEPARATE);
       f->SupportFlags = ok ? D3D12_VIDEO_PROCESS_SUPPORT_FLAG_SUPPORTED : D3D12_VIDEO_PROCESS_SUPPORT_FLAG_NONE;
       memset(&f->ScaleSupport, 0, sizeof f->ScaleSupport);
       if (ok) {
@@ -250,10 +269,11 @@ static HRESULT STDMETHODCALLTYPE vdev_CheckFeatureSupport(ID3D12VideoDevice3 *v,
         f->ScaleSupport.OutputSizeRange.MinWidth = f->ScaleSupport.OutputSizeRange.MinHeight = 1;
       }
       f->FeatureSupport = ok ? VP_FEATURES : D3D12_VIDEO_PROCESS_FEATURE_FLAG_NONE;
-      f->DeinterlaceSupport = D3D12_VIDEO_PROCESS_DEINTERLACE_FLAG_NONE;
+      f->DeinterlaceSupport = ok && f->InputFieldType != D3D12_VIDEO_FIELD_TYPE_NONE ? (D3D12_VIDEO_PROCESS_DEINTERLACE_FLAGS)VP_DEINTERLACE : D3D12_VIDEO_PROCESS_DEINTERLACE_FLAG_NONE;
       f->AutoProcessingSupport = D3D12_VIDEO_PROCESS_AUTO_PROCESSING_FLAG_NONE;
-      f->FilterSupport = D3D12_VIDEO_PROCESS_FILTER_FLAG_NONE;
+      f->FilterSupport = ok ? (D3D12_VIDEO_PROCESS_FILTER_FLAGS)VP_FILTERS : D3D12_VIDEO_PROCESS_FILTER_FLAG_NONE;
       memset(f->FilterRangeSupport, 0, sizeof f->FilterRangeSupport);
+      for (UINT i = 0; ok && i < 7; ++i) f->FilterRangeSupport[i] = g_vp_filter_ranges[i];
       return S_OK;
     }
     case D3D12_FEATURE_VIDEO_PROCESS_MAX_INPUT_STREAMS: {
@@ -264,11 +284,13 @@ static HRESULT STDMETHODCALLTYPE vdev_CheckFeatureSupport(ID3D12VideoDevice3 *v,
       return S_OK;
     }
     case D3D12_FEATURE_VIDEO_PROCESS_REFERENCE_INFO: {
-      /* (no deinterlacing or temporal filters: no past or future frames) */
+      /* (the motion adaptive deinterlacer takes a frame before and one after; bob and the filters none: they are spatial) */
       VIDEO_FEATURE(D3D12_FEATURE_DATA_VIDEO_PROCESS_REFERENCE_INFO);
       D3D12_FEATURE_DATA_VIDEO_PROCESS_REFERENCE_INFO *f = data;
-      if (f->NodeIndex) return E_INVALIDARG;
-      f->PastFrames = f->FutureFrames = 0;
+      if (f->NodeIndex || (f->DeinterlaceMode & ~VP_DEINTERLACE) || (f->Filters & ~VP_FILTERS) || (f->FeatureSupport & ~VP_FEATURES) || f->EnableAutoProcessing) return E_INVALIDARG;
+      const int adaptive = (f->DeinterlaceMode & D3D12_VIDEO_PROCESS_DEINTERLACE_FLAG_CUSTOM) != 0;
+      f->PastFrames = adaptive ? VP_PAST_FRAMES : 0;
+      f->FutureFrames = adaptive ? VP_FUTURE_FRAMES : 0;
       return S_OK;
     }
     case D3D12_FEATURE_VIDEO_PROCESSOR_SIZE: {
@@ -589,40 +611,109 @@ static int video_planes(CmdList *l, Resource *r, UINT sub, UINT *p0, UINT *p1) {
   return 1;
 }
 static UINT float_word(float f) { UINT w; memcpy(&w, &f, 4); return w; }
-static void video_process(CmdList *l, VProc *p, const D3D12_VIDEO_PROCESS_OUTPUT_STREAM_ARGUMENTS *out, UINT count, const D3D12_VIDEO_PROCESS_INPUT_STREAM_ARGUMENTS *ins, UINT stride,
-                          const D3D12_VIDEO_FIELD_TYPE *field) {
-  if (!p || !out || !ins || count == 0 || count != p->nin || l->closed) return;
-  if (field && *field != D3D12_VIDEO_FIELD_TYPE_NONE) return;
-  ensure_room(l, 256 + 64 * count, 4 + 2 * count);
-  UINT w[16 + 15 * VP_MAX_STREAMS];
-  UINT n = 0;
-  w[n++] = (UINT)vp_format(p->out.Format);
-  w[n++] = p->out.ColorSpace;
-  w[n++] = (UINT)out->TargetRectangle.left; w[n++] = (UINT)out->TargetRectangle.top; w[n++] = (UINT)out->TargetRectangle.right; w[n++] = (UINT)out->TargetRectangle.bottom;
-  for (UINT c = 0; c < 4; ++c) w[n++] = float_word(p->out.BackgroundColor[c]);
-  w[n++] = vp_format(p->out.Format) <= VP_P016 ? 1u : 0u;      /* (the background is in the output's colour space) */
-  w[n++] = (UINT)p->out.AlphaFillMode;
-  w[n++] = p->out.AlphaFillModeSourceStreamIndex;
-  if (!video_planes(l, (Resource *)out->OutputStream[0].pTexture2D, out->OutputStream[0].Subresource, &w[n], &w[n + 1])) return;
-  n += 2;
-  w[n++] = count;
-  for (UINT s = 0; s < count; ++s) {
-    const D3D12_VIDEO_PROCESS_INPUT_STREAM_ARGUMENTS *a = (const D3D12_VIDEO_PROCESS_INPUT_STREAM_ARGUMENTS *)((const BYTE *)ins + (SIZE_T)s * stride);
-    const D3D12_VIDEO_PROCESS_INPUT_STREAM_DESC *d = &p->in[s];
-    w[n++] = (UINT)vp_format(d->Format);
-    w[n++] = d->ColorSpace;
-    const D3D12_RECT *src = &a->Transform.SourceRectangle, *dst = &a->Transform.DestinationRectangle;
-    w[n++] = (UINT)src->left; w[n++] = (UINT)src->top; w[n++] = (UINT)src->right; w[n++] = (UINT)src->bottom;
-    w[n++] = (UINT)dst->left; w[n++] = (UINT)dst->top; w[n++] = (UINT)dst->right; w[n++] = (UINT)dst->bottom;
-    if (a->Transform.Orientation != D3D12_VIDEO_PROCESS_ORIENTATION_DEFAULT && !d->EnableOrientation) return;
-    w[n++] = (UINT)a->Transform.Orientation;
-    const int blend = d->EnableAlphaBlending && a->AlphaBlending.Enable;
-    w[n++] = blend ? 1u : 0u;
-    w[n++] = float_word(blend ? a->AlphaBlending.Alpha : 1.0f);
-    if (!video_planes(l, (Resource *)a->InputStream[0].pTexture2D, a->InputStream[0].Subresource, &w[n], &w[n + 1])) return;
-    n += 2;
+/* The reference frames a stream gives (`n` of `frames`, nearest in time at `nearest`): that one's planes, or none (0xFFFFFFFF). (Past frames are in time order, the
+ * last the nearest; future ones the first.) */
+static void video_reference(CmdList *l, UINT n, ID3D12Resource *const *frames, const UINT *subs, UINT nearest, UINT *p0, UINT *p1) {
+  *p0 = *p1 = 0xFFFFFFFFu;
+  if (!n || !frames || !frames[nearest] || !video_planes(l, (Resource *)frames[nearest], subs ? subs[nearest] : 0, p0, p1)) *p0 = *p1 = 0xFFFFFFFFu;
+}
+/* What Direct3D 12's stereo format of a stream is in the kernel's terms (TCOS_STEREO_*). */
+static UINT video_stereo_of(D3D12_VIDEO_FRAME_STEREO_FORMAT f) {
+  switch (f) {
+    case D3D12_VIDEO_FRAME_STEREO_FORMAT_HORIZONTAL: return TCOS_STEREO_HORIZONTAL;
+    case D3D12_VIDEO_FRAME_STEREO_FORMAT_VERTICAL: return TCOS_STEREO_VERTICAL;
+    case D3D12_VIDEO_FRAME_STEREO_FORMAT_SEPARATE: return TCOS_STEREO_SEPARATE;
+    default: return TCOS_STEREO_NONE;      /* (NONE, MONO: one view, shown as both) */
   }
-  packet(l, OP_VIDEO_PROCESS, w, n);
+}
+/* The streams into the output: one VideoProcess of the kernel's, or two with stereo output (the left view into OutputStream[0], the right into [1]). Each stream's
+ * deinterlacing (its field type, the mode of its desc, the field RateInfo.OutputIndex names), reference frames, view of a stereo picture, filters (the levels of the
+ * filters its desc enables, times their multipliers), luma key and light levels go to the kernel's optional words. A call the processor cannot take records nothing. */
+static void video_process(CmdList *l, VProc *p, const D3D12_VIDEO_PROCESS_OUTPUT_STREAM_ARGUMENTS *out, UINT count, const D3D12_VIDEO_PROCESS_INPUT_STREAM_ARGUMENTS *ins, UINT stride,
+                          const D3D12_VIDEO_FIELD_TYPE *field_types) {
+  if (!p || !out || !ins || count == 0 || count != p->nin || l->closed) return;
+  TcosVideoProcessExtra extra;
+  UINT extra_size = sizeof extra;
+  if (FAILED(dx_GetPrivateData(OBJ(l), &TCOS_VIDEO_PROCESS_EXTRA_GUID, &extra_size, &extra)) || extra_size != sizeof extra || extra.version != 1) memset(&extra, 0, sizeof extra);
+  const UINT views = p->out.EnableStereo ? 2 : 1;
+  if (views == 2 && !out->OutputStream[1].pTexture2D) return;
+  if (extra.count > VP_MAX_STREAMS) extra.count = VP_MAX_STREAMS;
+  for (UINT view = 0; view < views; ++view) {
+    ensure_room(l, 4 * (24 + (15 + 25) * VP_MAX_STREAMS) + 64, 4 + 6 * count);
+    UINT w[24 + (15 + 25) * VP_MAX_STREAMS];
+    UINT x[(25) * VP_MAX_STREAMS];
+    UINT n = 0, nx = 0;
+    w[n++] = (UINT)vp_format(p->out.Format);
+    w[n++] = p->out.ColorSpace;
+    w[n++] = (UINT)out->TargetRectangle.left; w[n++] = (UINT)out->TargetRectangle.top; w[n++] = (UINT)out->TargetRectangle.right; w[n++] = (UINT)out->TargetRectangle.bottom;
+    for (UINT c = 0; c < 4; ++c) w[n++] = float_word(p->out.BackgroundColor[c]);
+    w[n++] = vp_format(p->out.Format) <= VP_P016 ? 1u : 0u;      /* (the background is in the output's colour space) */
+    w[n++] = (UINT)p->out.AlphaFillMode;
+    w[n++] = p->out.AlphaFillModeSourceStreamIndex;
+    if (!video_planes(l, (Resource *)out->OutputStream[view].pTexture2D, out->OutputStream[view].Subresource, &w[n], &w[n + 1])) return;
+    n += 2;
+    w[n++] = count;
+    for (UINT s = 0; s < count; ++s) {
+      const D3D12_VIDEO_PROCESS_INPUT_STREAM_ARGUMENTS *a = (const D3D12_VIDEO_PROCESS_INPUT_STREAM_ARGUMENTS *)((const BYTE *)ins + (SIZE_T)s * stride);
+      const D3D12_VIDEO_PROCESS_INPUT_STREAM_DESC *d = &p->in[s];
+      const TcosVideoStreamExtra *e = s < extra.count ? &extra.stream[s] : NULL;
+      /* the view: which picture (a separate pair's) and which frame of a packed one; mono output shows the left (base) view */
+      const UINT stereo = e ? e->stereo : video_stereo_of(d->StereoFormat);
+      const UINT frame = e ? e->view_frame[view] & 1u : view;
+      const UINT input = stereo == TCOS_STEREO_SEPARATE ? frame : 0;
+      if (stereo == TCOS_STEREO_SEPARATE && !a->InputStream[input].pTexture2D) return;
+      const D3D12_VIDEO_PROCESS_INPUT_STREAM *is = &a->InputStream[input];
+      w[n++] = (UINT)vp_format(d->Format);
+      w[n++] = d->ColorSpace;
+      const D3D12_RECT *src = &a->Transform.SourceRectangle, *dst = &a->Transform.DestinationRectangle;
+      w[n++] = (UINT)src->left; w[n++] = (UINT)src->top; w[n++] = (UINT)src->right; w[n++] = (UINT)src->bottom;
+      w[n++] = (UINT)dst->left; w[n++] = (UINT)dst->top; w[n++] = (UINT)dst->right; w[n++] = (UINT)dst->bottom;
+      if (a->Transform.Orientation != D3D12_VIDEO_PROCESS_ORIENTATION_DEFAULT && !d->EnableOrientation) return;
+      w[n++] = (UINT)a->Transform.Orientation;
+      const int blend = d->EnableAlphaBlending && a->AlphaBlending.Enable;
+      w[n++] = blend ? 1u : 0u;
+      w[n++] = float_word(blend ? a->AlphaBlending.Alpha : 1.0f);
+      if (!video_planes(l, (Resource *)is->pTexture2D, is->Subresource, &w[n], &w[n + 1])) return;
+      n += 2;
+      /* interlacing: the frame's field type (ProcessFrames1's, else the desc's), the desc's mode (CUSTOM: motion adaptive), the field */
+      const D3D12_VIDEO_FIELD_TYPE ft = field_types ? *(const D3D12_VIDEO_FIELD_TYPE *)((const BYTE *)&field_types[0] + (SIZE_T)s * stride) : d->FieldType;
+      if ((UINT)ft > D3D12_VIDEO_FIELD_TYPE_INTERLACED_BOTTOM_FIELD_FIRST) return;
+      x[nx++] = (UINT)ft;
+      x[nx++] = e && e->field != TCOS_FIELD_FROM_INDEX ? e->field & 1u : a->RateInfo.OutputIndex & 1u;
+      x[nx++] = d->DeinterlaceMode == D3D12_VIDEO_PROCESS_DEINTERLACE_FLAG_CUSTOM ? 2u : d->DeinterlaceMode == D3D12_VIDEO_PROCESS_DEINTERLACE_FLAG_BOB ? 1u : 0u;
+      const D3D12_VIDEO_PROCESS_REFERENCE_SET *rs = &is->ReferenceSet;
+      if (ft != D3D12_VIDEO_FIELD_TYPE_NONE && d->DeinterlaceMode == D3D12_VIDEO_PROCESS_DEINTERLACE_FLAG_CUSTOM) {
+        video_reference(l, rs->NumPastFrames, rs->ppPastFrames, rs->pPastSubresources, rs->NumPastFrames ? rs->NumPastFrames - 1 : 0, &x[nx], &x[nx + 1]);
+        video_reference(l, rs->NumFutureFrames, rs->ppFutureFrames, rs->pFutureSubresources, 0, &x[nx + 2], &x[nx + 3]);
+      } else {
+        x[nx] = x[nx + 1] = x[nx + 2] = x[nx + 3] = 0xFFFFFFFFu;
+      }
+      nx += 4;
+      /* stereo: a packed picture's frame (separate pictures were chosen above), whether it is upside down, the mono offset (right view to the right) */
+      x[nx++] = stereo == TCOS_STEREO_SEPARATE ? TCOS_STEREO_NONE : stereo;
+      x[nx++] = frame;
+      x[nx++] = e && e->flip_frame == frame + 1 ? 1u : 0u;
+      x[nx++] = (UINT)(stereo == TCOS_STEREO_MONO_OFFSET && e && views == 2 ? (view == 1 ? e->mono_offset : -e->mono_offset) : 0);   /* (mono output: the picture as it is) */
+      /* the filters the desc enables, at their levels times the multipliers; a level outside its range is not taken */
+      float values[7] = {0.0f, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f, 0.0f};
+      for (UINT f = 0; f < 7; ++f) {
+        if (!(d->FilterFlags & (1u << f))) continue;
+        const D3D12_VIDEO_PROCESS_FILTER_RANGE *r = &g_vp_filter_ranges[f];
+        if (a->FilterLevels[f] < r->Minimum || a->FilterLevels[f] > r->Maximum) return;
+        values[f] = (float)a->FilterLevels[f] * r->Multiplier;
+      }
+      for (UINT f = 0; f < 7; ++f) x[nx++] = float_word(values[f]);
+      x[nx++] = d->LumaKey.Enable ? 1u : 0u;
+      x[nx++] = float_word(d->LumaKey.Enable ? d->LumaKey.Lower : 0.0f);
+      x[nx++] = float_word(d->LumaKey.Enable ? d->LumaKey.Upper : 0.0f);
+      for (UINT k = 0; k < 4; ++k) x[nx++] = float_word(e ? e->hdr[k] : 0.0f);
+    }
+    w[n++] = 0x31585056u;      /* (the kernel's kVideoProcessExtension: the optional words follow) */
+    for (UINT k = 0; k < 4; ++k) w[n++] = float_word(extra.display[k]);
+    memcpy(&w[n], x, nx * sizeof *x);
+    n += nx;
+    packet(l, OP_VIDEO_PROCESS, w, n);
+  }
   keep(l, (IUnknown *)p);
 }
 static void STDMETHODCALLTYPE vplist_ProcessFrames(CmdList *l, ID3D12VideoProcessor *proc, const D3D12_VIDEO_PROCESS_OUTPUT_STREAM_ARGUMENTS *out, UINT count,
@@ -631,8 +722,6 @@ static void STDMETHODCALLTYPE vplist_ProcessFrames(CmdList *l, ID3D12VideoProces
 }
 static void STDMETHODCALLTYPE vplist_ProcessFrames1(CmdList *l, ID3D12VideoProcessor *proc, const D3D12_VIDEO_PROCESS_OUTPUT_STREAM_ARGUMENTS *out, UINT count,
                                                     const D3D12_VIDEO_PROCESS_INPUT_STREAM_ARGUMENTS1 *ins) {
-  /* (the field type of each stream: progressive frames only) */
-  for (UINT s = 0; ins && s < count; ++s)
-    if (ins[s].FieldType != D3D12_VIDEO_FIELD_TYPE_NONE) return;
-  video_process(l, (VProc *)proc, out, count, (const D3D12_VIDEO_PROCESS_INPUT_STREAM_ARGUMENTS *)ins, sizeof *ins, NULL);
+  /* (each frame's own field type: ARGUMENTS1 is ARGUMENTS and FieldType) */
+  video_process(l, (VProc *)proc, out, count, (const D3D12_VIDEO_PROCESS_INPUT_STREAM_ARGUMENTS *)ins, sizeof *ins, ins ? &ins[0].FieldType : NULL);
 }

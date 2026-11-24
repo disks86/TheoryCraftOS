@@ -1091,16 +1091,29 @@ class Adapter::StreamRunner {
     struct StreamWords { uint32_t w[kVideoProcessStreamWords]; } words[kMaxVideoProcessStreams];
     for (uint32_t s = 0; s < count; ++s)
       for (uint32_t& w : words[s].w) w = p.le32();
+    // the optional part: the streams' interlacing, stereo, filters, luma keys and light levels, the display's light levels
+    struct ExtWords { uint32_t w[kVideoProcessStreamExtWords]; } ext[kMaxVideoProcessStreams] = {};
+    const bool extended = p.ok() && !p.at_end();
+    if (extended) {
+      if (p.le32() != kVideoProcessExtension) return refuse(__LINE__);
+      output.hdr.max_mastering = bits_float(p.le32());
+      output.hdr.min_mastering = bits_float(p.le32());
+      output.hdr.max_content = bits_float(p.le32());
+      output.hdr.max_frame_average = bits_float(p.le32());
+      for (uint32_t s = 0; s < count; ++s)
+        for (uint32_t& w : ext[s].w) w = p.le32();
+    }
     if (!exact(p)) return refuse(__LINE__);
+    output.allocator = &adapter_.allocator_;
     const hardware::VpFormat ofmt = static_cast<hardware::VpFormat>(out_format);
     Allocation* out0 = alloc(o0);
     Allocation* out1 = hardware::vp_is_yuv(ofmt) ? alloc(o1) : nullptr;
     hardware::VpImage out_image;
     if (!video_image_of(ofmt, out_space, out0, out1, &out_image)) return refuse(__LINE__);
     if (!use(out0, state::kVideoProcessWrite) || (out1 && !use(out1, state::kVideoProcessWrite))) return refuse(__LINE__);
-    hardware::VpImage images[kMaxVideoProcessStreams];
+    hardware::VpImage images[kMaxVideoProcessStreams], references[2 * kMaxVideoProcessStreams];
     hardware::VpStream streams[kMaxVideoProcessStreams];
-    Allocation* inputs[2 * kMaxVideoProcessStreams] = {};
+    Allocation* inputs[6 * kMaxVideoProcessStreams] = {};
     for (uint32_t s = 0; s < count; ++s) {
       const uint32_t* w = words[s].w;
       if (w[0] > static_cast<uint32_t>(hardware::VpFormat::Rgba16f) || w[10] > static_cast<uint32_t>(hardware::VpOrientation::Clockwise270FlipHorizontal)) return refuse(__LINE__);
@@ -1110,14 +1123,54 @@ class Adapter::StreamRunner {
       if (!video_image_of(f, w[1], a0, a1, &images[s])) return refuse(__LINE__);
       if (a0 == out0 || a0 == out1 || (a1 && (a1 == out0 || a1 == out1))) return refuse(__LINE__);      // (a stream is not its own output)
       if (!use(a0, state::kVideoProcessRead) || (a1 && !use(a1, state::kVideoProcessRead))) return refuse(__LINE__);
-      inputs[2 * s] = a0;
-      inputs[2 * s + 1] = a1;
+      inputs[6 * s] = a0;
+      inputs[6 * s + 1] = a1;
       streams[s].image = &images[s];
       streams[s].source = {static_cast<int32_t>(w[2]), static_cast<int32_t>(w[3]), static_cast<int32_t>(w[4]), static_cast<int32_t>(w[5])};
       streams[s].destination = {static_cast<int32_t>(w[6]), static_cast<int32_t>(w[7]), static_cast<int32_t>(w[8]), static_cast<int32_t>(w[9])};
       streams[s].orientation = static_cast<hardware::VpOrientation>(w[10]);
       streams[s].alpha_blend = w[11] != 0;
       streams[s].alpha = bits_float(w[12]);
+      if (!extended) continue;
+      const uint32_t* e = ext[s].w;
+      hardware::VpStream& st = streams[s];
+      if (e[0] > static_cast<uint32_t>(hardware::VpFieldOrder::BottomFieldFirst) || e[1] > 1 || e[2] > static_cast<uint32_t>(hardware::VpDeinterlace::Adaptive) ||
+          e[7] > static_cast<uint32_t>(hardware::VpStereoFormat::MonoOffset) || e[8] > 1 || e[9] > 1 || e[18] > 1)
+        return refuse(__LINE__);
+      st.field_order = static_cast<hardware::VpFieldOrder>(e[0]);
+      st.field = static_cast<uint8_t>(e[1]);
+      st.deinterlace = static_cast<hardware::VpDeinterlace>(e[2]);
+      for (uint32_t k = 0; k < 2; ++k) {   // the frames before and after: two planes each (the second kNoAllocation for RGB), pictures like the stream's
+        const uint32_t i0 = e[3 + 2 * k], i1 = e[4 + 2 * k];
+        if (i0 == kNoAllocation) continue;
+        Allocation* r0 = alloc(i0);
+        Allocation* r1 = hardware::vp_is_yuv(f) ? alloc(i1) : nullptr;
+        hardware::VpImage& ri = references[2 * s + k];
+        if (!video_image_of(f, w[1], r0, r1, &ri) || ri.width != images[s].width || ri.height != images[s].height) return refuse(__LINE__);
+        if (r0 == out0 || r0 == out1 || (r1 && (r1 == out0 || r1 == out1))) return refuse(__LINE__);
+        if (!use(r0, state::kVideoProcessRead) || (r1 && !use(r1, state::kVideoProcessRead))) return refuse(__LINE__);
+        inputs[6 * s + 2 + 2 * k] = r0;
+        inputs[6 * s + 3 + 2 * k] = r1;
+        (k ? st.future : st.past) = &ri;
+      }
+      st.stereo = static_cast<hardware::VpStereoFormat>(e[7]);
+      st.stereo_frame = static_cast<uint8_t>(e[8]);
+      st.stereo_flip = e[9] != 0;
+      st.stereo_offset = static_cast<int32_t>(e[10]);
+      st.brightness = bits_float(e[11]);
+      st.contrast = bits_float(e[12]);
+      st.hue = bits_float(e[13]);
+      st.saturation = bits_float(e[14]);
+      st.noise_reduction = bits_float(e[15]);
+      st.edge_enhancement = bits_float(e[16]);
+      st.anamorphic = bits_float(e[17]);
+      st.luma_key = e[18] != 0;
+      st.luma_lower = bits_float(e[19]);
+      st.luma_upper = bits_float(e[20]);
+      st.hdr.max_mastering = bits_float(e[21]);
+      st.hdr.min_mastering = bits_float(e[22]);
+      st.hdr.max_content = bits_float(e[23]);
+      st.hdr.max_frame_average = bits_float(e[24]);
     }
     if (!exec_) return status::kSuccess;
     NtStatus st = flush();

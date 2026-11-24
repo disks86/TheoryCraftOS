@@ -27,6 +27,7 @@
 #include <vector>
 #include "Graphics/GraphicsTypes.hpp"
 #include "Hardware/VideoCodec/VideoProcess.hpp"
+#include "Allocators/IAllocator.hpp"
 
 using namespace hardware;
 
@@ -879,7 +880,7 @@ static void test_refusals() {
   CHECK(with([](VpImage& i) { i.format = static_cast<VpFormat>(9); }) == VpResult::Invalid);
   CHECK(with([](VpImage& i) { i.plane[0].half_float = true; }) == VpResult::Invalid);
   // colour spaces
-  for (VpColorSpace bad : {4u, 12u, 13u, 14u, 16u, 18u, 19u, 25u, 0xFFFFFFFFu}) {
+  for (VpColorSpace bad : {4u, 25u, 0xFFFFFFFFu}) {   // (12..19 without 15 and 17: PQ and HLG, see test_hdr)
     CHECK(with([bad](VpImage& i) { i.color_space = bad; }) == VpResult::Unsupported);
     CHECK(!vp_color_space_supported(VpFormat::Nv12, bad) && !vp_color_space_supported(VpFormat::Rgba16f, bad));
   }
@@ -942,6 +943,522 @@ static void test_garbage() {
   CHECK(ok > 100);
 }
 
+// ==== the stages and effects: deinterlacing, stereo views, filters, luma key, ProcAmp, HDR
+
+struct TestAllocator final : allocators::IAllocator {
+  int live = 0;
+  void* allocate(uint64_t size) override { ++live; return malloc(size ? size : 1); }
+  void* allocate_aligned(uint64_t size, uint64_t alignment) override {
+    ++live;
+    const uint64_t al = alignment < 16 ? 16 : alignment;
+    return aligned_alloc(al, (size + al - 1) / al * al + al);
+  }
+  void deallocate(void* p) override { if (p) { --live; free(p); } }
+};
+static TestAllocator g_alloc;
+
+static VpResult process_fx(Pic& out, const std::vector<VpStream>& streams, const VpHdrMetadata* display = nullptr, const float background[4] = nullptr) {
+  VpOutput o;
+  o.image = &out.img;
+  o.target = whole(out);
+  if (background) for (int i = 0; i < 4; ++i) o.background[i] = background[i];
+  if (display) o.hdr = *display;
+  o.allocator = &g_alloc;
+  const VpResult r = video_process(o, ArrayView<const VpStream>(streams.data(), streams.size()));
+  CHECK(g_alloc.live == 0);   // (scratch given back)
+  return r;
+}
+static Pic nv12_frame(const std::vector<uint8_t>& raw, size_t at, uint32_t w, uint32_t h, bool widened = false) {
+  Pic p = make_pic(VpFormat::Nv12, kVpYcbcrStudioG22LeftP709, w, h, widened);
+  for (uint32_t y = 0; y < h; ++y) for (uint32_t x = 0; x < w; ++x) set_code(p, 0, x, y, 0, raw[at + y * w + x]);
+  for (uint32_t y = 0; y < h / 2; ++y) for (uint32_t x = 0; x < w / 2; ++x) for (int c = 0; c < 2; ++c) set_code(p, 1, x, y, c, raw[at + w * h + y * w + 2 * x + c]);
+  return p;
+}
+static bool same_pictures(const Pic& a, const Pic& b, int planes, int* worst = nullptr) {
+  int w = 0;
+  for (int pl = 0; pl < planes; ++pl) {
+    const uint32_t pw = pl ? (a.w + 1) / 2 : a.w, ph = pl ? (a.h + 1) / 2 : a.h, nc = pl ? 2 : (is_yuv(a.format) ? 1 : 3);
+    for (uint32_t y = 0; y < ph; ++y) for (uint32_t x = 0; x < pw; ++x) for (uint32_t c = 0; c < nc; ++c)
+      w = fmax(w, fabs(get_code(a, pl, x, y, c) - get_code(b, pl, x, y, c)));
+  }
+  if (worst) *worst = w;
+  return w == 0;
+}
+
+// yadif: every field of six interlaced frames, as top field first and bottom field first, against ffmpeg's yadif output processed as progressive frames. The stage's
+// planes must be ffmpeg's exactly (so the rest of the processor makes the same output of both).
+static void test_deinterlace_ffmpeg() {
+  const std::vector<uint8_t> in = read_file("tests/data/videoprocess/interlaced.nv12");
+  const std::vector<uint8_t> refs[2] = {read_file("tests/data/videoprocess/yadif_tff.nv12"), read_file("tests/data/videoprocess/yadif_bff.nv12")};
+  const uint32_t w = 64, h = 32, frame = w * h * 3 / 2;
+  CHECK(in.size() == 6 * frame && refs[0].size() == 12 * frame && refs[1].size() == 12 * frame);
+  if (g_failed) return;
+  int matched = 0;
+  for (int order = 0; order < 2; ++order)
+    for (int widened = 0; widened < 2; ++widened)
+      for (uint32_t k = 0; k < 6; ++k)
+        for (uint8_t field = 0; field < 2; ++field) {
+          Pic cur = nv12_frame(in, k * frame, w, h, widened), prev = nv12_frame(in, (k ? k - 1 : 0) * frame, w, h, widened), next = nv12_frame(in, (k < 5 ? k + 1 : 5) * frame, w, h, widened);
+          Pic out = make_pic(VpFormat::Nv12, kVpYcbcrStudioG22LeftP709, w, h, true), expect = make_pic(VpFormat::Nv12, kVpYcbcrStudioG22LeftP709, w, h, true);
+          VpStream s = stream_of(cur, whole(cur), whole(out));
+          s.field_order = order ? VpFieldOrder::BottomFieldFirst : VpFieldOrder::TopFieldFirst;
+          s.deinterlace = VpDeinterlace::Adaptive;
+          s.field = field;
+          if (k > 0) s.past = &prev.img;   // (none: the current frame, as yadif does at the ends)
+          if (k < 5) s.future = &next.img;
+          CHECK(process_fx(out, {s}) == VpResult::Ok);
+          Pic ref = nv12_frame(refs[order], (2 * k + field) * frame, w, h);
+          CHECK(process_fx(expect, {stream_of(ref, whole(ref), whole(expect))}) == VpResult::Ok);
+          int worst = 0;
+          if (same_pictures(out, expect, 2, &worst)) ++matched;
+          else if (g_reported < 40) printf("  yadif %s frame %u field %u: worst difference %d\n", order ? "BFF" : "TFF", k, field, worst);
+        }
+  printf("  ffmpeg yadif: %d of 48 fields the same\n", matched);
+  CHECK(matched == 48);
+}
+
+// Bob, and the adaptive deinterlacer's two extremes: a still picture is the weave (the frame as it is), a moving bar the bob.
+static void test_deinterlace_properties() {
+  const uint32_t w = 32, h = 16;
+  auto luma_pic = [&](auto f) {
+    Pic p = make_pic(VpFormat::Nv12, kVpYcbcrFullG22LeftP709, w, h);
+    for (uint32_t y = 0; y < h; ++y) for (uint32_t x = 0; x < w; ++x) set_code(p, 0, x, y, 0, f(x, y));
+    for (uint32_t y = 0; y < h / 2; ++y) for (uint32_t x = 0; x < w / 2; ++x) for (int c = 0; c < 2; ++c) set_code(p, 1, x, y, c, 128);
+    return p;
+  };
+  // bob: the shown field's rows as they are, the others the mean of the rows above and below (mirrored at the edges)
+  Pic in = luma_pic([](uint32_t x, uint32_t y) { return (x * 7 + y * y * 3) % 200 + 20; });
+  for (int order = 0; order < 2; ++order)
+    for (uint8_t field = 0; field < 2; ++field) {
+      Pic out = make_pic(VpFormat::Nv12, kVpYcbcrFullG22LeftP709, w, h);
+      VpStream s = stream_of(in, whole(in), whole(out));
+      s.field_order = order ? VpFieldOrder::BottomFieldFirst : VpFieldOrder::TopFieldFirst;
+      s.deinterlace = VpDeinterlace::Bob;
+      s.field = field;
+      CHECK(process_fx(out, {s}) == VpResult::Ok);
+      const uint32_t shown = (order == 0) == (field == 0) ? 0 : 1;
+      int bad = 0;
+      for (uint32_t y = 0; y < h; ++y)
+        for (uint32_t x = 0; x < w; ++x) {
+          double expect = get_code(in, 0, x, y, 0);
+          if ((y & 1) != shown) {
+            const uint32_t a = y > 0 ? y - 1 : y + 1, b = y + 1 < h ? y + 1 : y - 1;
+            expect = floor((get_code(in, 0, x, a, 0) + get_code(in, 0, x, b, 0)) * 0.5 + 0.5);
+          }
+          bad += get_code(out, 0, x, y, 0) != expect;
+        }
+      CHECK(bad == 0);
+    }
+  // a still picture (each row's value between those of the rows above and below, any texture across): the adaptive deinterlacer gives the frame back
+  Pic still = luma_pic([](uint32_t x, uint32_t y) { return 16 + y * 12 + (x * 37 % 11); });
+  for (uint8_t field = 0; field < 2; ++field) {
+    Pic out = make_pic(VpFormat::Nv12, kVpYcbcrFullG22LeftP709, w, h), weave = make_pic(VpFormat::Nv12, kVpYcbcrFullG22LeftP709, w, h);
+    VpStream s = stream_of(still, whole(still), whole(out));
+    s.field_order = VpFieldOrder::TopFieldFirst;
+    s.deinterlace = VpDeinterlace::Adaptive;
+    s.field = field;
+    s.past = s.future = &still.img;
+    CHECK(process_fx(out, {s}) == VpResult::Ok);
+    CHECK(process_fx(weave, {stream_of(still, whole(still), whole(weave))}) == VpResult::Ok);
+    CHECK(same_pictures(out, weave, 2));
+  }
+  // a bar moving to the right by 16 pixels a field: in the missing rows the shown field's bar is interpolated (bob) and the other field's bar is not there (as in a weave)
+  auto bar_at = [&](uint32_t top_x, uint32_t bottom_x) {
+    return luma_pic([=](uint32_t x, uint32_t y) { const uint32_t at = (y & 1) ? bottom_x : top_x; return x >= at && x < at + 6 ? 220u : 40u; });
+  };
+  Pic prev = bar_at(0, 0), cur = bar_at(4, 20), next = bar_at(26, 26);
+  Pic out = make_pic(VpFormat::Nv12, kVpYcbcrFullG22LeftP709, w, h);
+  VpStream s = stream_of(cur, whole(cur), whole(out));
+  s.field_order = VpFieldOrder::TopFieldFirst;
+  s.deinterlace = VpDeinterlace::Adaptive;
+  s.field = 0;   // the top field (bar at 4..9) is shown
+  s.past = &prev.img;
+  s.future = &next.img;
+  CHECK(process_fx(out, {s}) == VpResult::Ok);
+  int bad = 0;
+  for (uint32_t y = 1; y < h; y += 2) {
+    for (uint32_t x = 5; x < 9; ++x) bad += get_code(out, 0, x, y, 0) != 220;
+    for (uint32_t x = 21; x < 25; ++x) bad += get_code(out, 0, x, y, 0) != 40;
+  }
+  CHECK(bad == 0);
+  // what is refused: an interlaced row-interleaved or checkerboard stereo picture, references of another size
+  Pic small = luma_pic([](uint32_t, uint32_t) { return 100u; });
+  Pic other = make_pic(VpFormat::Nv12, kVpYcbcrFullG22LeftP709, w, h / 2);
+  VpStream r = stream_of(small, {0, 0, 32, 8}, whole(out));
+  r.field_order = VpFieldOrder::TopFieldFirst;
+  r.stereo = VpStereoFormat::RowInterleaved;
+  CHECK(process_fx(out, {r}) == VpResult::Invalid);
+  r.stereo = VpStereoFormat::None;
+  r.source = whole(small);
+  r.past = &other.img;
+  r.deinterlace = VpDeinterlace::Adaptive;
+  CHECK(process_fx(out, {r}) == VpResult::Invalid);
+  // a reference with fewer channels than the picture (BGRA described with and without its alpha): refused, not read past its samples
+  Pic with_alpha = make_pic(VpFormat::Bgra8, kVpRgbFullG22P709, 8, 8), without = make_pic(VpFormat::Bgra8, kVpRgbFullG22P709, 8, 8);
+  without.img.plane[0].channels = 3;
+  Pic rgb_out = make_pic(VpFormat::Bgra8, kVpRgbFullG22P709, 8, 8);
+  VpStream ra = stream_of(with_alpha, whole(with_alpha), whole(rgb_out));
+  ra.field_order = VpFieldOrder::TopFieldFirst;
+  ra.deinterlace = VpDeinterlace::Adaptive;
+  ra.future = &without.img;
+  CHECK(process_fx(rgb_out, {ra}) == VpResult::Invalid);
+  ra.future = nullptr;
+  ra.past = &with_alpha.img;
+  CHECK(process_fx(rgb_out, {ra}) == VpResult::Ok);
+  r.past = nullptr;
+  VpOutput no_alloc;
+  no_alloc.image = &out.img;
+  no_alloc.target = whole(out);
+  CHECK(video_process(no_alloc, ArrayView<const VpStream>(&r, 1)) == VpResult::Unsupported);   // (no scratch memory to deinterlace into)
+  printf("  deinterlacing: bob, still and moving pictures checked\n");
+}
+
+// Stereo: each packing's frames, flipped views, the mono offset.
+static void test_stereo() {
+  const uint32_t w = 16, h = 8;
+  auto pic = [&](auto f) {
+    Pic p = make_pic(VpFormat::Bgra8, kVpRgbFullG22P709, w, h);
+    for (uint32_t y = 0; y < h; ++y) for (uint32_t x = 0; x < w; ++x) for (int c = 0; c < 4; ++c) set_code(p, 0, x, y, c, c == 3 ? 255 : f(x, y, c));
+    return p;
+  };
+  struct Case { VpStereoFormat format; uint32_t vw, vh; int (*frame_of)(uint32_t, uint32_t); };
+  const Case cases[] = {
+      {VpStereoFormat::Horizontal, w / 2, h, [](uint32_t x, uint32_t) { return x >= 8 ? 1 : 0; }},
+      {VpStereoFormat::Vertical, w, h / 2, [](uint32_t, uint32_t y) { return y >= 4 ? 1 : 0; }},
+      {VpStereoFormat::RowInterleaved, w, h / 2, [](uint32_t, uint32_t y) { return static_cast<int>(y & 1); }},
+      {VpStereoFormat::ColumnInterleaved, w / 2, h, [](uint32_t x, uint32_t) { return static_cast<int>(x & 1); }},
+      {VpStereoFormat::Checkerboard, w, h, [](uint32_t x, uint32_t y) { return static_cast<int>((x + y) & 1); }},
+  };
+  for (const Case& k : cases) {
+    // frame 0 is red, frame 1 blue (each with a ramp in green)
+    Pic in = pic([&](uint32_t x, uint32_t y, int c) { const int f = k.frame_of(x, y); return c == 0 ? (f ? 0 : 200) : c == 2 ? (f ? 200 : 0) : 10 + y * 5; });
+    for (uint8_t frame = 0; frame < 2; ++frame)
+      for (int flip = 0; flip < 2; ++flip) {
+        Pic out = make_pic(VpFormat::Bgra8, kVpRgbFullG22P709, k.vw, k.vh);
+        VpStream s = stream_of(in, {0, 0, static_cast<int32_t>(k.vw), static_cast<int32_t>(k.vh)}, whole(out));
+        s.stereo = k.format;
+        s.stereo_frame = frame;
+        s.stereo_flip = flip;
+        CHECK(process_fx(out, {s}) == VpResult::Ok);
+        int bad = 0;
+        for (uint32_t y = 0; y < k.vh; ++y)
+          for (uint32_t x = 0; x < k.vw; ++x) {
+            bad += get_code(out, 0, x, y, 0) != (frame ? 0 : 200) || get_code(out, 0, x, y, 2) != (frame ? 200 : 0);
+            // the green ramp: the view's row (flipped: from the bottom) of the frame's rows
+            const uint32_t vy = flip ? k.vh - 1 - y : y;
+            uint32_t sy = vy;
+            if (k.format == VpStereoFormat::Vertical) sy = vy + frame * 4;
+            if (k.format == VpStereoFormat::RowInterleaved) sy = 2 * vy + frame;
+            bad += get_code(out, 0, x, y, 1) != 10 + sy * 5;
+          }
+        CHECK(bad == 0);
+      }
+    // a source rectangle is in the view's pixels: one outside the view is refused
+    Pic out = make_pic(VpFormat::Bgra8, kVpRgbFullG22P709, w, h);
+    VpStream s = stream_of(in, whole(in), whole(out));
+    s.stereo = k.format;
+    CHECK(process_fx(out, {s}) == (k.format == VpStereoFormat::Checkerboard ? VpResult::Ok : VpResult::Invalid));
+  }
+  // mono offset: the view is the picture moved right by the offset (its edge column repeated)
+  Pic ramp = pic([](uint32_t x, uint32_t, int c) { return c == 0 ? 10 + x * 10 : 0; });
+  for (int32_t offset : {-3, 0, 2, 5}) {
+    Pic out = make_pic(VpFormat::Bgra8, kVpRgbFullG22P709, w, h);
+    VpStream s = stream_of(ramp, whole(ramp), whole(out));
+    s.stereo = VpStereoFormat::MonoOffset;
+    s.stereo_offset = offset;
+    CHECK(process_fx(out, {s}) == VpResult::Ok);
+    int bad = 0;
+    for (uint32_t x = 0; x < w; ++x) {
+      int32_t sx = static_cast<int32_t>(x) - offset;
+      sx = sx < 0 ? 0 : sx >= static_cast<int32_t>(w) ? static_cast<int32_t>(w) - 1 : sx;
+      bad += get_code(out, 0, x, 3, 0) != 10 + sx * 10;
+    }
+    CHECK(bad == 0);
+  }
+  // NV12 side by side: the views' luma and chroma come from their halves
+  Pic yuv = make_pic(VpFormat::Nv12, kVpYcbcrStudioG22LeftP709, 32, 8);
+  for (uint32_t y = 0; y < 8; ++y) for (uint32_t x = 0; x < 32; ++x) set_code(yuv, 0, x, y, 0, x < 16 ? 50 : 200);
+  for (uint32_t y = 0; y < 4; ++y) for (uint32_t x = 0; x < 16; ++x) { set_code(yuv, 1, x, y, 0, x < 8 ? 100 : 160); set_code(yuv, 1, x, y, 1, 128); }
+  for (uint8_t frame = 0; frame < 2; ++frame) {
+    Pic out = make_pic(VpFormat::Nv12, kVpYcbcrStudioG22LeftP709, 16, 8, true);
+    VpStream s = stream_of(yuv, {0, 0, 16, 8}, whole(out));
+    s.stereo = VpStereoFormat::Horizontal;
+    s.stereo_frame = frame;
+    CHECK(process_fx(out, {s}) == VpResult::Ok);
+    int bad = 0;
+    for (uint32_t y = 0; y < 8; ++y) for (uint32_t x = 0; x < 16; ++x) bad += get_code(out, 0, x, y, 0) != (frame ? 200 : 50);
+    for (uint32_t y = 0; y < 4; ++y) for (uint32_t x = 0; x < 8; ++x) bad += fabs(get_code(out, 1, x, y, 0) - (frame ? 160 : 100)) > 0.5;
+    CHECK(bad == 0);
+  }
+  printf("  stereo: five packings x two frames x flips, mono offset, NV12 views checked\n");
+}
+
+// ProcAmp against DXVA's formulas computed by ffmpeg's geq on the codes (both outputs through the same chroma filters: ProcAmp is affine, so it commutes with them).
+static void test_procamp() {
+  const std::vector<uint8_t> nv12 = read_file("tests/data/videoprocess/gradient_709.nv12"), ref = read_file("tests/data/videoprocess/procamp.nv12");
+  CHECK(nv12.size() == 64 * 32 * 3 / 2 && ref.size() == nv12.size());
+  if (g_failed) return;
+  Pic in = nv12_frame(nv12, 0, 64, 32), expected_in = nv12_frame(ref, 0, 64, 32);
+  for (VpFormat fo : {VpFormat::Nv12, VpFormat::Bgra8}) {
+    Pic out = make_pic(fo, fo == VpFormat::Nv12 ? kVpYcbcrStudioG22LeftP709 : kVpRgbFullG22P709, 64, 32), expect = out;
+    expect.img.plane[0].memory = ByteView(expect.mem[0].data(), expect.mem[0].size());
+    expect.img.plane[1].memory = ByteView(expect.mem[1].data(), expect.mem[1].size());
+    VpStream s = stream_of(in, whole(in), whole(out));
+    s.brightness = 10.0f;
+    s.contrast = 1.2f;
+    s.hue = 20.0f;
+    s.saturation = 0.8f;
+    CHECK(process_fx(out, {s}) == VpResult::Ok);
+    CHECK(process_fx(expect, {stream_of(expected_in, whole(expected_in), whole(expect))}) == VpResult::Ok);
+    int worst = 0;
+    same_pictures(out, expect, is_yuv(fo) ? 2 : 1, &worst);
+    printf("  ffmpeg geq ProcAmp -> %s: worst difference %d\n", format_name(fo), worst);
+    CHECK(worst <= 2);   // (geq rounds the codes; the processor keeps them exact until the output)
+  }
+  // RGB: saturation 0 is grey, brightness lifts all three, contrast 0 leaves the brightness alone
+  Pic rgb = make_pic(VpFormat::Bgra8, kVpRgbFullG22P709, 8, 1);
+  for (uint32_t x = 0; x < 8; ++x) { set_code(rgb, 0, x, 0, 0, 30 * x); set_code(rgb, 0, x, 0, 1, 200 - 20 * x); set_code(rgb, 0, x, 0, 2, 90); set_code(rgb, 0, x, 0, 3, 255); }
+  Pic out = make_pic(VpFormat::Bgra8, kVpRgbFullG22P709, 8, 1);
+  VpStream s = stream_of(rgb, whole(rgb), whole(out));
+  s.saturation = 0.0f;
+  CHECK(process_fx(out, {s}) == VpResult::Ok);
+  int bad = 0;
+  for (uint32_t x = 0; x < 8; ++x) {
+    const double y = 0.2126 * 30 * x + 0.7152 * (200 - 20 * x) + 0.0722 * 90;
+    for (int c = 0; c < 3; ++c) bad += fabs(get_code(out, 0, x, 0, c) - y) > 1.0;
+  }
+  CHECK(bad == 0);
+  s.saturation = 1.0f;
+  s.contrast = 0.0f;
+  s.brightness = 51.0f;   // (in full range: 51 / 255 = 0.2)
+  CHECK(process_fx(out, {s}) == VpResult::Ok);
+  bad = 0;
+  for (uint32_t x = 0; x < 8; ++x) for (int c = 0; c < 3; ++c) bad += get_code(out, 0, x, 0, c) != 51;
+  CHECK(bad == 0);
+  // out of range: refused
+  s.contrast = 11.0f;
+  CHECK(process_fx(out, {s}) == VpResult::Invalid);
+  s.contrast = 1.0f;
+  s.hue = 181.0f;
+  CHECK(process_fx(out, {s}) == VpResult::Invalid);
+  s.hue = 0.0f;
+  s.brightness = NAN;
+  CHECK(process_fx(out, {s}) == VpResult::Invalid);
+}
+
+// Luma key: a luma ramp over a background; the codes from lower to upper (both truncated to codes, inclusive) show the background.
+static void test_luma_key() {
+  Pic in = make_pic(VpFormat::Nv12, kVpYcbcrFullG22LeftP709, 256, 2);
+  for (uint32_t y = 0; y < 2; ++y) for (uint32_t x = 0; x < 256; ++x) set_code(in, 0, x, y, 0, x);
+  for (uint32_t x = 0; x < 128; ++x) { set_code(in, 1, x, 0, 0, 128); set_code(in, 1, x, 0, 1, 128); }
+  Pic out = make_pic(VpFormat::Bgra8, kVpRgbFullG22P709, 256, 2);
+  const float bg[4] = {0.0f, 1.0f, 0.0f, 1.0f};   // green
+  VpStream s = stream_of(in, whole(in), whole(out));
+  s.luma_key = true;
+  s.luma_lower = 0.25f;   // 63.75: code 63
+  s.luma_upper = 0.5f;    // 127.5: code 127
+  CHECK(process_fx(out, {s}, nullptr, bg) == VpResult::Ok);
+  int bad = 0;
+  for (uint32_t x = 0; x < 256; ++x) {
+    const bool keyed = x >= 63 && x <= 127;
+    bad += keyed ? (get_code(out, 0, x, 0, 1) != 255 || get_code(out, 0, x, 0, 0) != 0) : (get_code(out, 0, x, 0, 0) != x || get_code(out, 0, x, 0, 1) != x);
+  }
+  CHECK(bad == 0);
+  // RGB: the luma of R'G'B' (BT.709)
+  Pic rgb = make_pic(VpFormat::Bgra8, kVpRgbFullG22P709, 4, 1);
+  const int grey[4] = {10, 100, 150, 240};
+  for (uint32_t x = 0; x < 4; ++x) for (int c = 0; c < 4; ++c) set_code(rgb, 0, x, 0, c, c == 3 ? 255 : grey[x]);
+  Pic out2 = make_pic(VpFormat::Bgra8, kVpRgbFullG22P709, 4, 1);
+  VpStream r = stream_of(rgb, whole(rgb), whole(out2));
+  r.luma_key = true;
+  r.luma_lower = 0.3f;
+  r.luma_upper = 0.7f;
+  CHECK(process_fx(out2, {r}, nullptr, bg) == VpResult::Ok);
+  CHECK(get_code(out2, 0, 0, 0, 0) == 10 && get_code(out2, 0, 1, 0, 1) == 255 && get_code(out2, 0, 2, 0, 1) == 255 && get_code(out2, 0, 3, 0, 0) == 240);
+  r.luma_lower = 0.8f;   // (lower above upper)
+  CHECK(process_fx(out2, {r}, nullptr, bg) == VpResult::Invalid);
+}
+
+// Noise reduction keeps edges and smooths noise; edge enhancement steepens edges and leaves flat areas; anamorphic scaling stretches the sides more than the middle.
+static void test_spatial_filters() {
+  const uint32_t w = 32, h = 16;
+  Pic in = make_pic(VpFormat::Nv12, kVpYcbcrFullG22LeftP709, w, h);
+  g_seed = 99;
+  for (uint32_t y = 0; y < h; ++y) for (uint32_t x = 0; x < w; ++x) set_code(in, 0, x, y, 0, (x < 16 ? 80 : 180) + static_cast<int>(rnd() % 9) - 4);
+  for (uint32_t y = 0; y < h / 2; ++y) for (uint32_t x = 0; x < w / 2; ++x) for (int c = 0; c < 2; ++c) set_code(in, 1, x, y, c, 128);
+  auto variance = [&](const Pic& p, uint32_t x0, uint32_t x1) {
+    double sum = 0, sq = 0, n = 0;
+    for (uint32_t y = 1; y + 1 < h; ++y) for (uint32_t x = x0; x < x1; ++x) { const double v = get_code(p, 0, x, y, 0); sum += v; sq += v * v; ++n; }
+    return sq / n - (sum / n) * (sum / n);
+  };
+  Pic plain = make_pic(VpFormat::Nv12, kVpYcbcrFullG22LeftP709, w, h), nr = plain, ee = plain;
+  for (Pic* p : {&nr, &ee}) { p->img.plane[0].memory = ByteView(p->mem[0].data(), p->mem[0].size()); p->img.plane[1].memory = ByteView(p->mem[1].data(), p->mem[1].size()); }
+  CHECK(process_fx(plain, {stream_of(in, whole(in), whole(plain))}) == VpResult::Ok);
+  VpStream s = stream_of(in, whole(in), whole(nr));
+  s.noise_reduction = 1.0f;
+  CHECK(process_fx(nr, {s}) == VpResult::Ok);
+  const double v0 = variance(plain, 1, 15), v1 = variance(nr, 1, 15);
+  int crossed = 0;   // (no pixel took the other side's level: the edge stays)
+  for (uint32_t y = 0; y < h; ++y) { crossed += get_code(nr, 0, 15, y, 0) > 90; crossed += get_code(nr, 0, 16, y, 0) < 170; }
+  printf("  noise reduction: variance %.2f -> %.2f, %d pixels across the edge changed side\n", v0, v1, crossed);
+  CHECK(v1 < v0 * 0.5 && crossed == 0);
+  s.noise_reduction = 0.0f;
+  s.edge_enhancement = 1.0f;
+  // on a clean step: an overshoot either side of the edge, flat areas as they were
+  Pic step = make_pic(VpFormat::Nv12, kVpYcbcrFullG22LeftP709, w, h);
+  for (uint32_t y = 0; y < h; ++y) for (uint32_t x = 0; x < w; ++x) set_code(step, 0, x, y, 0, x < 16 ? 80 : 180);
+  for (uint32_t y = 0; y < h / 2; ++y) for (uint32_t x = 0; x < w / 2; ++x) for (int c = 0; c < 2; ++c) set_code(step, 1, x, y, c, 128);
+  s.image = &step.img;
+  CHECK(process_fx(ee, {s}) == VpResult::Ok);
+  // (3x3 mean beside the edge: 80 + 100 / 3; amount 2: 80 - 2 * 33.3 = 13.3, 180 + 66.7 = 246.7)
+  CHECK(get_code(ee, 0, 15, 5, 0) == 13 && get_code(ee, 0, 16, 5, 0) == 247 && get_code(ee, 0, 5, 5, 0) == 80 && get_code(ee, 0, 25, 5, 0) == 180);
+  // anamorphic: a ramp 0..63 across 64 pixels into 64: the middle advances 1 + k per pixel, the sides 1 - k (k = half the level), the ends stay
+  Pic ramp = make_pic(VpFormat::Bgra8, kVpRgbFullG22P709, 64, 1), out = make_pic(VpFormat::Bgra8, kVpRgbFullG22P709, 64, 1);
+  for (uint32_t x = 0; x < 64; ++x) for (int c = 0; c < 4; ++c) set_code(ramp, 0, x, 0, c, c == 3 ? 255 : x * 4);
+  VpStream a = stream_of(ramp, whole(ramp), whole(out));
+  a.anamorphic = 1.0f;
+  CHECK(process_fx(out, {a}) == VpResult::Ok);
+  const double mid = get_code(out, 0, 33, 0, 0) - get_code(out, 0, 31, 0, 0), side = get_code(out, 0, 2, 0, 0) - get_code(out, 0, 0, 0, 0);
+  printf("  anamorphic: middle step %.1f, side step %.1f (codes per two pixels)\n", mid, side);
+  CHECK(mid > 11.0 && mid < 13.0 && side >= 2.0 && side < 5.5 && get_code(out, 0, 0, 0, 0) <= 2 && get_code(out, 0, 63, 0, 0) >= 250);
+  for (uint32_t x = 1; x < 64; ++x) CHECK(get_code(out, 0, x, 0, 0) >= get_code(out, 0, x - 1, 0, 0));
+}
+
+// HDR: PQ and HLG against BT.2100's formulas and BT.2408's reference levels, round trips, tone mapping (monotonic, the content's peak to the display's).
+static double ref_pq_nits(double e) {
+  const double m1 = 2610.0 / 16384, m2 = 2523.0 / 4096 * 128, c1 = 3424.0 / 4096, c2 = 2413.0 / 4096 * 32, c3 = 2392.0 / 4096 * 32;
+  const double p = pow(e, 1 / m2);
+  return 10000 * pow(fmax(p - c1, 0) / (c2 - c3 * p), 1 / m1);
+}
+static double ref_nits_pq(double l) {
+  const double m1 = 2610.0 / 16384, m2 = 2523.0 / 4096 * 128, c1 = 3424.0 / 4096, c2 = 2413.0 / 4096 * 32, c3 = 2392.0 / 4096 * 32;
+  const double y = pow(l / 10000, m1);
+  return pow((c1 + c2 * y) / (1 + c3 * y), m2);
+}
+static void test_hdr() {
+  CHECK(vp_color_space_supported(VpFormat::P010, kVpYcbcrStudioG2084LeftP2020) && vp_color_space_supported(VpFormat::Rgb10a2, kVpRgbFullG2084P2020) &&
+        vp_color_space_supported(VpFormat::P010, kVpYcbcrStudioGhlgTopLeftP2020) && !vp_color_space_supported(VpFormat::Rgb10a2, kVpYcbcrStudioG2084LeftP2020));
+  // PQ grey ramp (RGB10A2) -> linear float (relative to 203 cd/m2): BT.2100's EOTF
+  Pic pq = make_pic(VpFormat::Rgb10a2, kVpRgbFullG2084P2020, 64, 1);
+  for (uint32_t x = 0; x < 64; ++x) for (int c = 0; c < 4; ++c) set_code(pq, 0, x, 0, c, c == 3 ? 3 : x * 1023 / 63);
+  Pic lin = make_pic(VpFormat::Rgba16f, kVpRgbFullG10P709, 64, 1);
+  CHECK(process_fx(lin, {stream_of(pq, whole(pq), whole(lin))}) == VpResult::Ok);
+  double worst = 0;
+  for (uint32_t x = 0; x < 64; ++x) {
+    const double expect = ref_pq_nits((x * 1023 / 63) / 1023.0) / 203.0;
+    for (int c = 0; c < 3; ++c) worst = fmax(worst, fabs(get_code(lin, 0, x, 0, c) - expect) / fmax(expect, 0.01));
+  }
+  printf("  PQ -> linear: worst relative error %.5f (10000 cd/m2 = %.2f)\n", worst, get_code(lin, 0, 63, 0, 0));
+  CHECK(worst < 2e-3);
+  // and back to PQ: the codes return (to a code)
+  Pic back = make_pic(VpFormat::Rgb10a2, kVpRgbFullG2084P2020, 64, 1);
+  Pic lin_p709 = lin;
+  lin_p709.img.plane[0].memory = ByteView(lin_p709.mem[0].data(), lin_p709.mem[0].size());
+  CHECK(process_fx(back, {stream_of(lin_p709, whole(lin_p709), whole(back))}) == VpResult::Ok);
+  worst = 0;
+  for (uint32_t x = 1; x < 64; ++x) worst = fmax(worst, fabs(get_code(back, 0, x, 0, 1) - get_code(pq, 0, x, 0, 1)));
+  printf("  PQ round trip through half floats: worst %g codes\n", worst);
+  CHECK(worst <= 1.0);
+  // SDR white in PQ is the reference white (BT.2408: 203 cd/m2, PQ 58%)
+  Pic white = make_pic(VpFormat::Bgra8, kVpRgbFullG22P709, 1, 1);
+  for (int c = 0; c < 4; ++c) set_code(white, 0, 0, 0, c, 255);
+  Pic wpq = make_pic(VpFormat::Rgb10a2, kVpRgbFullG2084P2020, 1, 1);
+  CHECK(process_fx(wpq, {stream_of(white, whole(white), whole(wpq))}) == VpResult::Ok);
+  CHECK(fabs(get_code(wpq, 0, 0, 0, 0) - floor(ref_nits_pq(203) * 1023 + 0.5)) <= 1);
+  // HLG: 75% is the reference white (BT.2408) on the 1000 cd/m2 display: linear 1.0; HLG -> linear -> HLG returns
+  Pic hlg = make_pic(VpFormat::P010, kVpYcbcrFullGhlgTopLeftP2020, 2, 2);
+  for (uint32_t y = 0; y < 2; ++y) for (uint32_t x = 0; x < 2; ++x) set_code(hlg, 0, x, y, 0, floor(0.75 * 1023 + 0.5));
+  set_code(hlg, 1, 0, 0, 0, 512); set_code(hlg, 1, 0, 0, 1, 512);
+  Pic hl = make_pic(VpFormat::Rgba16f, kVpRgbFullG10P709, 2, 2);
+  CHECK(process_fx(hl, {stream_of(hlg, whole(hlg), whole(hl))}) == VpResult::Ok);
+  printf("  HLG 75%%: linear %.4f (reference white 1)\n", get_code(hl, 0, 0, 0, 1));
+  CHECK(fabs(get_code(hl, 0, 0, 0, 1) - 1.0) < 0.01);
+  Pic hlg_back = make_pic(VpFormat::P010, kVpYcbcrFullGhlgTopLeftP2020, 2, 2, true);
+  Pic hl2 = hl;
+  hl2.img.plane[0].memory = ByteView(hl2.mem[0].data(), hl2.mem[0].size());
+  CHECK(process_fx(hlg_back, {stream_of(hl2, whole(hl2), whole(hlg_back))}) == VpResult::Ok);
+  CHECK(fabs(get_code(hlg_back, 0, 0, 0, 0) - floor(0.75 * 1023 + 0.5)) <= 1);
+  // tone mapping PQ (content 1000 cd/m2, MaxCLL) -> SDR: monotonic, the content's peak to white, dark levels untouched
+  Pic ramp = make_pic(VpFormat::Rgb10a2, kVpRgbFullG2084P2020, 1024, 1);
+  for (uint32_t x = 0; x < 1024; ++x) for (int c = 0; c < 4; ++c) set_code(ramp, 0, x, 0, c, c == 3 ? 3 : x);
+  Pic sdr = make_pic(VpFormat::Bgra8, kVpRgbFullG22P709, 1024, 1);
+  VpStream s = stream_of(ramp, whole(ramp), whole(sdr));
+  s.hdr.max_content = 1000.0f;
+  s.hdr.max_mastering = 4000.0f;
+  CHECK(process_fx(sdr, {s}) == VpResult::Ok);
+  int non_monotonic = 0;
+  for (uint32_t x = 1; x < 1024; ++x) non_monotonic += get_code(sdr, 0, x, 0, 1) < get_code(sdr, 0, x - 1, 0, 1);
+  const uint32_t peak = static_cast<uint32_t>(floor(ref_nits_pq(1000) * 1023 + 0.5)), dark = static_cast<uint32_t>(floor(ref_nits_pq(20) * 1023 + 0.5));
+  const double dark_expect = 255 * (1.055 * pow(ref_pq_nits(dark / 1023.0) / 203, 1 / 2.4) - 0.055);
+  printf("  tone mapping 1000 cd/m2 -> SDR: peak (PQ code %u) -> %g, 20 cd/m2 -> %g (untouched: %.1f), %d steps down\n", peak, get_code(sdr, 0, peak, 0, 1),
+         get_code(sdr, 0, dark, 0, 1), dark_expect, non_monotonic);
+  CHECK(non_monotonic == 0 && get_code(sdr, 0, peak, 0, 1) == 255 && get_code(sdr, 0, static_cast<uint32_t>(floor(ref_nits_pq(300) * 1023 + 0.5)), 0, 1) < 250 && fabs(get_code(sdr, 0, dark, 0, 1) - dark_expect) <= 1.0);
+  // PQ -> PQ onto a 600 cd/m2 display (SetOutputHDRMetaData): the content's peak to 600, monotonic
+  Pic pq_out = make_pic(VpFormat::Rgb10a2, kVpRgbFullG2084P2020, 1024, 1);
+  VpHdrMetadata display;
+  display.max_mastering = 600.0f;
+  s.destination = whole(pq_out);
+  CHECK(process_fx(pq_out, {s}, &display) == VpResult::Ok);
+  non_monotonic = 0;
+  for (uint32_t x = 1; x < 1024; ++x) non_monotonic += get_code(pq_out, 0, x, 0, 0) < get_code(pq_out, 0, x - 1, 0, 0);
+  printf("  tone mapping 1000 -> 600 cd/m2 (PQ): peak -> %.0f cd/m2\n", ref_pq_nits(get_code(pq_out, 0, peak, 0, 0) / 1023.0));
+  CHECK(non_monotonic == 0 && fabs(get_code(pq_out, 0, peak, 0, 0) - floor(ref_nits_pq(600) * 1023 + 0.5)) <= 1 && get_code(pq_out, 0, dark, 0, 0) == dark);
+  // without metadata a PQ output holds all of PQ: the codes pass (no tone mapping)
+  CHECK(process_fx(pq_out, {s}) == VpResult::Ok);
+  int moved = 0;
+  for (uint32_t x = 0; x < 1024; ++x) moved += get_code(pq_out, 0, x, 0, 2) != x;
+  CHECK(moved == 0);
+  // HLG -> SDR: tone mapped from HLG's 1000 cd/m2 peak; HLG 1.0 is white
+  Pic hlg1 = make_pic(VpFormat::P010, kVpYcbcrStudioGhlgTopLeftP2020, 2, 2);
+  for (uint32_t y = 0; y < 2; ++y) for (uint32_t x = 0; x < 2; ++x) set_code(hlg1, 0, x, y, 0, 940);
+  set_code(hlg1, 1, 0, 0, 0, 512); set_code(hlg1, 1, 0, 0, 1, 512);
+  Pic sdr1 = make_pic(VpFormat::Bgra8, kVpRgbFullG22P709, 2, 2);
+  CHECK(process_fx(sdr1, {stream_of(hlg1, whole(hlg1), whole(sdr1))}) == VpResult::Ok);
+  CHECK(get_code(sdr1, 0, 0, 0, 0) == 255 && get_code(sdr1, 0, 0, 0, 1) == 255);
+  // BT.2020 PQ red -> BT.709 SDR: out of gamut, clipped to the gamut's red
+  Pic red = make_pic(VpFormat::Rgb10a2, kVpRgbFullG2084P2020, 1, 1);
+  set_code(red, 0, 0, 0, 0, floor(ref_nits_pq(100) * 1023 + 0.5)); set_code(red, 0, 0, 0, 1, 0); set_code(red, 0, 0, 0, 2, 0); set_code(red, 0, 0, 0, 3, 3);
+  Pic red_out = make_pic(VpFormat::Bgra8, kVpRgbFullG22P709, 1, 1);
+  CHECK(process_fx(red_out, {stream_of(red, whole(red), whole(red_out))}) == VpResult::Ok);
+  CHECK(get_code(red_out, 0, 0, 0, 0) > 200 && get_code(red_out, 0, 0, 0, 1) == 0 && get_code(red_out, 0, 0, 0, 2) == 0);
+  VpHdrMetadata bad;
+  bad.max_content = -1.0f;
+  CHECK(process_fx(red_out, {stream_of(red, whole(red), whole(red_out))}, &bad) == VpResult::Invalid);
+}
+
+// Random stages on random small pictures: nothing outside a plane is touched (the sanitizers watch), scratch always given back.
+static void test_stage_garbage() {
+  int ok = 0;
+  g_seed = 4242;
+  for (int iter = 0; iter < 3000; ++iter) {
+    const VpFormat fi = kFormats[rnd() % 8], fo = kFormats[rnd() % 8];
+    const uint32_t w = 1 + rnd() % 13, h = 1 + rnd() % 13;
+    const VpColorSpace si = is_yuv(fi) ? kYuvSpaces[rnd() % 11] : kRgbSpaces[rnd() % 7];
+    Pic in = make_pic(fi, si, w, h, rnd() & 1), past = make_pic(fi, si, w, h, rnd() & 1), future = make_pic(fi, si, w, h, rnd() & 1);
+    Pic out = make_pic(fo, is_yuv(fo) ? kYuvSpaces[rnd() % 11] : kRgbSpaces[rnd() % 7], 1 + rnd() % 9, 1 + rnd() % 9, rnd() & 1);
+    for (Pic* p : {&in, &past, &future}) for (auto& m : p->mem) for (auto& b : m) b = static_cast<uint8_t>(rnd());
+    VpStream s = stream_of(in, {0, 0, static_cast<int32_t>(rnd() % (w + 2)), static_cast<int32_t>(rnd() % (h + 2))}, whole(out), static_cast<VpOrientation>(rnd() % 8));
+    s.field_order = static_cast<VpFieldOrder>(rnd() % 3);
+    s.deinterlace = static_cast<VpDeinterlace>(rnd() % 3);
+    s.field = rnd() & 1;
+    if (rnd() & 1) s.past = &past.img;
+    if (rnd() & 1) s.future = &future.img;
+    s.stereo = static_cast<VpStereoFormat>(rnd() % 7);
+    s.stereo_frame = rnd() & 1;
+    s.stereo_flip = rnd() & 1;
+    s.stereo_offset = static_cast<int32_t>(rnd() % 40) - 20;
+    if (rnd() & 1) { s.noise_reduction = (rnd() % 5) / 4.0f; s.edge_enhancement = (rnd() % 5) / 4.0f; }
+    if (rnd() & 1) { s.brightness = static_cast<float>(rnd() % 201) - 100; s.contrast = (rnd() % 30) / 3.0f; s.hue = static_cast<float>(rnd() % 361) - 180; s.saturation = (rnd() % 30) / 3.0f; }
+    s.anamorphic = (rnd() % 3) / 2.0f;
+    s.luma_key = rnd() & 1;
+    s.luma_lower = 0.2f;
+    s.luma_upper = 0.6f;
+    if (process_fx(out, {s, s}) == VpResult::Ok) ++ok;
+  }
+  printf("  random stages: %d of 3000 accepted, none faulted\n", ok);
+  CHECK(ok > 500);
+}
+
 // ---- speed
 
 static double now() { timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + t.tv_nsec * 1e-9; }
@@ -960,6 +1477,17 @@ static void test_speed() {
   const double t2 = now();
   printf("  1920x1080 NV12 -> 1280x720 BGRA8: %.1f ms; -> 1280x720 NV12 (widened): %.1f ms\n", (t1 - t0) * 1e3, (t2 - t1) * 1e3);
   CHECK(t1 - t0 < 1.0);
+  // motion adaptive deinterlacing of 1080i into 1080p NV12, with ProcAmp
+  Pic full = make_pic(VpFormat::Nv12, kVpYcbcrStudioG22LeftP709, 1920, 1080, true);
+  VpStream d = stream_of(in, whole(in), whole(full));
+  d.field_order = VpFieldOrder::TopFieldFirst;
+  d.deinterlace = VpDeinterlace::Adaptive;
+  d.past = d.future = &in.img;
+  d.contrast = 1.1f;
+  const double t3 = now();
+  CHECK(process_fx(full, {d}) == VpResult::Ok);
+  const double t4 = now();
+  printf("  1920x1080 interlaced NV12 -> 1920x1080 NV12, motion adaptive: %.1f ms\n", (t4 - t3) * 1e3);
 }
 
 int main() {
@@ -976,6 +1504,14 @@ int main() {
   test_yuv_targets();
   test_refusals();
   test_garbage();
+  test_deinterlace_ffmpeg();
+  test_deinterlace_properties();
+  test_stereo();
+  test_procamp();
+  test_luma_key();
+  test_spatial_filters();
+  test_hdr();
+  test_stage_garbage();
   test_speed();
   if (g_failed) {
     printf("%d check(s) failed\n", g_failed);

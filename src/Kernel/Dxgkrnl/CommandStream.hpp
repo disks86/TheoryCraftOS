@@ -72,6 +72,11 @@
 //                    on the CPU. Formats are hardware::VpFormat; a YUV image is two 2D images of one level as the runtime keeps NV12 / P010 / P016 (DxgTypes.hpp VideoDecoderDesc), an RGB one a
 //                    single image of the matching kernel format (Bgra8 A8R8G8B8, Bgrx8 X8R8G8B8, Rgba8 A8B8G8R8, Rgb10a2 A2B10G10R10, Rgba16f A16B16G16R16F); plane1_index is
 //                    kNoAllocation for RGB. At most kMaxVideoProcessStreams streams. A frame the processor refuses (rectangles, colour spaces) leaves the output as it was)
+//                    [, kVideoProcessExtension, the display's light levels (VpHdrMetadata: max_mastering, min_mastering, max_content, max_frame_average, float bits), then per
+//                    stream kVideoProcessStreamExtWords words: field_order, field, deinterlace, past plane0_index, plane1_index, future plane0_index, plane1_index
+//                    (kNoAllocation: none), stereo format, stereo frame, stereo flip, stereo offset (signed), brightness, contrast, hue, saturation, noise reduction,
+//                    edge enhancement, anamorphic (float bits), luma_key, lower, upper (float bits), the content's light levels (4 float bits)]   (the optional part: the
+//                    VpStream values; without it every stream is progressive, unfiltered and not stereo. The references are pictures like the stream's)
 //   EndQuery         (the count of fragments that passed the depth and stencil tests since BeginQuery is written there - a little-endian 64-bit number - once the stream has run)
 #pragma once
 #include "Kernel/Dxgkrnl/DxgTypes.hpp"
@@ -115,6 +120,8 @@ enum class Op : uint16_t {
   VideoProcess,
 };
 constexpr uint32_t kVideoProcessStreamWords = 15;
+constexpr uint32_t kVideoProcessExtension = 0x31585056;   // 'VPX1': VideoProcess's optional part follows
+constexpr uint32_t kVideoProcessStreamExtWords = 25;
 constexpr uint32_t kMaxVideoProcessStreams = 16;
 
 // How the vertices (or indices) of a draw make triangles (D3D10 IASetPrimitiveTopology / D3D9 primitive types); the default is a list. A strip or fan is expanded to a list of

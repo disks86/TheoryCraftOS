@@ -313,7 +313,13 @@ Direct3D 11's and 12's video interfaces run on the kernel's codecs, on the CPU, 
   `VideoDecodeStatus` (Direct3D 12's decode statistics). A picture that cannot be decoded leaves the planes alone and says so in the status: the stream goes on.
 - **Processing.** The stream's `VideoProcess` (Hardware/VideoCodec/VideoProcess.hpp): up to 16 streams converted between NV12 / P010 / P016 / BGRA8 / BGRX8 / RGBA8 /
   RGB10A2 / RGBA16F and the SDR colour spaces (BT.601 / 709 / 2020, studio and full range, gamma 2.2, 2.4 and linear, chroma siting), scaled bilinearly, oriented, blended,
-  composed over a background in a target rectangle. No HDR tone mapping, deinterlacing, filters or luma keying.
+  composed over a background in a target rectangle; PQ and HLG (BT.2100) in and out, converted in absolute light (SDR white = BT.2408's 203 cd/m2) and tone mapped by
+  BT.2390's EETF on the brightest channel with the content's and the display's HDR10 light levels. Before sampling, a stream may be made a scratch picture of its own
+  (VideoProcessStages.inc, plane by plane in the source's layout, so it is format-independent): the view of a stereo picture (side by side, top and bottom, rows,
+  columns, checkerboard, mono offset, flipped frames), deinterlaced (bob, or motion adaptive: yadif's algorithm with a past and a future frame, the same as ffmpeg's yadif
+  sample for sample), noise reduced (3x3 sigma filter) and edge enhanced (3x3 unsharp mask). ProcAmp (DXVA's formulas on Y'CbCr: an affine map folded into the
+  conversion) and the luma key (D3D11's truncated code range) are applied per sample, anamorphic scaling in the destination mapping. `VideoProcess` takes these as an
+  optional part after the streams (`kVideoProcessExtension`, CommandStream.hpp: the display's light levels, then 25 words per stream, with the reference frames' planes).
 - **Planes.** The kernel has no one- or two-channel formats: NV12 / P010 planes, and R8 / R8G8 / R16 / R16G16 textures, are kept widened (`(r, g or 0, 0, maximum)` in an
   A8B8G8R8 or A16B16G16R16 image), so a view of the narrow format reads the right values; `CopyBufferImage` takes a `NarrowLayout` to copy the narrow rows, and render
   targets of those formats write their channels only. d3d12.dll makes every plane of every array slice of a planar texture an allocation of its own
@@ -326,7 +332,10 @@ Direct3D 11's and 12's video interfaces run on the kernel's codecs, on the CPU, 
   content (crypto sessions and authenticated channels are refused), shared planar textures, placed planar resources, views of several slices of a planar texture.
 - Tests: `tests/run_host_tests.sh DxvaDecoderTest VideoProcessTest DxgkrnlTest` (every codec bit for bit with ffmpeg; the DXVA buffers filled as ffmpeg's dxva2_*.c
   fill them), `tests/emulated_dx.sh tests/windows/d3d12videotest.c` and `d3d11videotest.c` (H.264 decoded through both APIs, bit for bit with ffmpeg; the processor
-  against BT.709), `tests/d3d12_qemu.sh d3d12videotest`, `tests/wow64_qemu.sh d3d12videotest d3d11videotest` (32-bit).
+  against BT.709; motion adaptive deinterlacing against ffmpeg's yadif output, bob, ProcAmp, luma key, stereo, HDR10 into SDR), `tests/d3d12_qemu.sh d3d12videotest`,
+  `tests/wow64_qemu.sh d3d12videotest d3d11videotest` (32-bit). VideoProcessTest's references: tests/data/videoprocess/make_refs.sh (zscale, yadif, geq).
+- Not in the processor: inverse telecine and frame rate conversion, motion-compensated deinterlacing, the stereo adjustment filter and auto processing (not reported),
+  HDR10+ dynamic metadata (only HDR10's static light levels are read), scRGB (G10) input brighter than white is clipped, not tone mapped.
 
 ## Not done
 
