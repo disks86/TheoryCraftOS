@@ -76,6 +76,9 @@ enum class ObuEventKind : uint8_t {
   ContentLightLevel,  // content_light_level() changed
   MasteringDisplay,   // mastering_display() changed
   ItuT35,             // a registered user data message: itut_t35_* fields of the event
+  // Large-scale tile decoding only (set_large_scale_tile):
+  CameraFrameHeader,  // frame_header() was parsed as the camera frame header the tile lists that follow are decoded with (the rest of the OBU is not read)
+  TileList,           // a tile list OBU (5.12): decode tile_list() with frame_header()
 };
 
 struct ObuEvent {
@@ -101,6 +104,24 @@ struct TileData {
   uint16_t tile_col = 0;
 };
 
+// Large-scale tile decoding (7.3): one tile_list_entry() - the tile (anchor_tile_row, anchor_tile_col) of the camera frame, predicted from anchor frame
+// anchor_frame_idx, and its coded data.
+struct TileListEntry {
+  ConstByteView data;
+  uint8_t anchor_frame_idx = 0;   // 0..127 (kMaxAnchorFrames)
+  uint8_t tile_row = 0;
+  uint8_t tile_col = 0;
+};
+constexpr unsigned kMaxAnchorFrames = 128;     // anchor_frame_idx <= 127
+constexpr unsigned kMaxTileListEntries = 512;  // tile_count_minus_1 <= 511
+
+// A tile list OBU: the output frame is width_in_tiles x height_in_tiles tiles; entry i goes to tile (i % width_in_tiles, i / width_in_tiles) of it.
+struct TileList {
+  unsigned width_in_tiles = 0;    // output_frame_width_in_tiles_minus_1 + 1
+  unsigned height_in_tiles = 0;   // output_frame_height_in_tiles_minus_1 + 1
+  ArrayView<const TileListEntry> entries;
+};
+
 enum class ObuError : uint8_t {
   None,
   Truncated,     // an OBU or header ran past its data, or a trailing bit is missing
@@ -124,6 +145,11 @@ class ObuParser {
   void set_frame_size_limit(uint32_t limit) { frame_size_limit_ = limit; }
   // Operating point to decode (default 0). Takes effect with the next sequence header; an index that is out of range selects 0.
   void set_operating_point(unsigned index) { operating_point_ = index; }
+  // Large-scale tile decoding (7.3; the decoder is told by external means, the bitstream does not say): from now on every frame header OBU (OBU_FRAME_HEADER, or the
+  // header of an OBU_FRAME, whose tile data is then not read) is a camera frame header (event CameraFrameHeader), and tile list OBUs are decoded against the last one
+  // (event TileList). Off: tile list OBUs are skipped, as a decoder that does not offer large-scale tile decoding does.
+  void set_large_scale_tile(bool on) { large_scale_tile_ = on; }
+  bool large_scale_tile() const { return large_scale_tile_; }
 
   // Parses the first OBU of `data` (header, optional extension, size field and payload; without a size field the OBU extends to the end of
   // `data`). `consumed` is the number of bytes the OBU took (also set for dropped OBUs). False on a corrupt OBU (see error()): the state of
@@ -142,6 +168,10 @@ class ObuParser {
   const FrameHeader* frame_header() const { return have_frame_ ? &frame_ : nullptr; }
   // The tiles of the frame: valid after FrameReady, indexed by tile number (row * cols + col).
   ArrayView<const TileData> tiles() const { return tiles_.empty() ? ArrayView<const TileData>() : ArrayView<const TileData>(tiles_.first(n_tiles_)); }
+  // The tile list of the last TileList event (its data views point into the packet). The camera frame header is frame_header().
+  TileList tile_list() const {
+    return TileList{tile_list_width_, tile_list_height_, ArrayView<const TileListEntry>(tile_list_).first(tile_list_count_)};
+  }
   // The header stored in reference slot `index`, null if the slot is empty.
   const FrameHeader* ref_header(unsigned index) const { return index < NUM_REF_FRAMES && refs_[index].valid ? &refs_[index].hdr : nullptr; }
   bool ref_showable(unsigned index) const { return index < NUM_REF_FRAMES && refs_[index].valid && refs_[index].showable; }
@@ -171,6 +201,7 @@ class ObuParser {
   bool check_references();
   bool handle_show_existing(ObuEvent& event);
   bool parse_metadata(BitReader& gb, ObuEvent& event);
+  bool parse_tile_list(ConstByteView payload, ObuEvent& event);
   void invalidate_refs();
   bool reserve_tiles(uint64_t count);
 
@@ -196,6 +227,11 @@ class ObuParser {
   uint64_t n_tiles_ = 0;       // tiles stored so far for the current frame
 
   RefSlot refs_[NUM_REF_FRAMES];
+
+  bool large_scale_tile_ = false;
+  bool have_camera_ = false;   // frame_ is a camera frame header (large-scale tile decoding)
+  TileListEntry tile_list_[kMaxTileListEntries];
+  unsigned tile_list_count_ = 0, tile_list_width_ = 0, tile_list_height_ = 0;
 };
 
 }  // namespace av1

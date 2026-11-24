@@ -22,7 +22,7 @@
  * surface index the picture goes into and the surface indices of the references it may read. The program maps the indices to its surfaces: in Direct3D 11 an index is
  * an array slice of the output texture; Direct3D 12 takes a list of reference textures, in which an index is a position.
  *
- *   H.264: Annex B byte streams (no slice groups, no gaps in frame_num) of frames, MBAFF frames and field pictures: SPS, PPS, POC types 0, 1 and 2, reference
+ *   H.264: Annex B byte streams (no slice groups) of frames, MBAFF frames and field pictures: SPS, PPS, POC types 0, 1 and 2, gaps in frame_num, reference
  *          marking of frames and of fields by the sliding window and by memory management control operations 1 .. 6, a second field paired with its first (same
  *          surface; the frame is a reference of the second field when its first field is), scaling lists with the fall-back rules; DXVA_PicParams_H264 (field_pic_flag,
  *          MbaffFrameFlag, CurrPic's AssociatedFlag for a bottom field, UsedForReferenceFlags and FieldOrderCntList per field), DXVA_Qmatrix_H264 and the short slice
@@ -97,6 +97,7 @@ typedef struct DxvaStream {
   unsigned char *pp, *qm, *sc, *bs;
   size_t pp_size, qm_size, sc_size, sc_cap, bs_size, bs_cap;
   unsigned slices;
+  unsigned inferred;                 /* H.264: the gaps in frame_num filled with "non-existing" frames so far */
   DxvaH264State *h264;
   DxvaMpeg2State *mpeg2;
   DxvaVc1State *vc1;
@@ -662,6 +663,64 @@ static void dxva_h264_end_picture(DxvaH264State *h) {
   if (mmco5) ++h->period;
 }
 
+/* 8.2.5.2, the decoding process for gaps in frame_num, as ffmpeg's h264_field_start does it for its hwaccels: a "non-existing" frame for each frame_num between
+ * PrevRefFrameNum and the picture's, each a short-term reference after the sliding window, named in RefFrameList with its own FrameNumList entry and the surface of
+ * the short-term reference before it (NonExistingFrameFlags stays 0, as ffmpeg leaves it). Its order counts: 8.2.1 for pic_order_cnt_type 1 and 2 (a reference, not
+ * IDR, delta_pic_order_cnt 0), the previous picture's for type 0 (the standard derives none). h->frame_num and h->nal_ref_idc are the current picture's again after. */
+static int dxva_h264_fill_gap(DxvaStream *s) {
+  DxvaH264State *h = s->h264;
+  const DxvaH264Sps *sps = h->sps_cur;
+  const unsigned max_frame_num = 1u << sps->log2_max_frame_num;
+  const unsigned frame_num = h->frame_num, nal_ref_idc = h->nal_ref_idc;
+  const int poc_keep[2] = {h->poc[0], h->poc[1]};
+  h->first_active = 0;   /* (a first field left alone does not pair across the gap) */
+  for (unsigned unused = (h->prev_ref_frame_num + 1) % max_frame_num; unused != frame_num; unused = (unused + 1) % max_frame_num) {
+    h->frame_num = unused;
+    h->nal_ref_idc = 1;
+    if (sps->poc_type != 0) {
+      const int delta[2] = {0, 0};
+      dxva_h264_poc(h, 0, delta);
+    }
+    /* 8.2.4.1 relative to the inferred frame (dxva_h264_pic_num uses h->frame_num), then 8.2.5.3 */
+    unsigned longs = 0;
+    for (unsigned i = 0; i < 16; ++i) longs += h->long_used[i] != 0;
+    const unsigned max_refs = sps->max_num_ref_frames ? sps->max_num_ref_frames : 1;
+    unsigned surface;
+    if (h->short_count) surface = h->shortr[0].surface;
+    else {
+      unsigned busy[32], nbusy = 0;
+      for (unsigned i = 0; i < 16; ++i) if (h->long_used[i]) busy[nbusy++] = h->longr[i].surface;
+      surface = dxva_pick_surface(s, busy, nbusy);
+      if (surface == ~0u) { s->error = "no free surface (give more)"; return 0; }
+    }
+    if (h->short_count + longs >= max_refs && h->short_count) {
+      unsigned oldest = 0;
+      for (unsigned i = 1; i < h->short_count; ++i) if (dxva_h264_pic_num(h, &h->shortr[i]) < dxva_h264_pic_num(h, &h->shortr[oldest])) oldest = i;
+      dxva_h264_remove_short(h, oldest);
+    }
+    if (h->short_count < 16) {
+      DxvaH264Ref r;
+      memset(&r, 0, sizeof r);
+      r.surface = surface;
+      r.frame_num = unused;
+      r.poc[0] = h->poc[0];
+      r.poc[1] = h->poc[1];
+      r.fields = 3;
+      memmove(&h->shortr[1], &h->shortr[0], sizeof h->shortr[0] * h->short_count);
+      h->shortr[0] = r;
+      ++h->short_count;
+    }
+    h->prev_ref_frame_num = unused;
+    h->prev_frame_num = unused;
+    if (sps->poc_type != 0) h->prev_frame_num_offset = h->frame_num_offset;
+  }
+  h->frame_num = frame_num;
+  h->nal_ref_idc = nal_ref_idc;
+  h->poc[0] = poc_keep[0];
+  h->poc[1] = poc_keep[1];
+  return 1;
+}
+
 /* A slice NAL unit: its header (the first slice of a picture begins one), its bytes with a start code into the bitstream, its short slice control. 0: the stream is not
  * one this takes; 2: it begins a new picture while one is pending (nothing done: the caller hands the pending one out first). */
 static int dxva_h264_slice(DxvaStream *s, const unsigned char *nal, size_t size, unsigned char *rbsp) {
@@ -742,9 +801,12 @@ static int dxva_h264_slice(DxvaStream *s, const unsigned char *nal, size_t size,
       }
     }
     if (b.bad) { s->error = "a slice header that does not parse"; return 0; }
-    /* (no gaps in frame_num: the decoder is not given frames that do not exist) */
+    /* a gap in frame_num (8.2.5.2) */
     const unsigned max_frame_num = 1u << sps->log2_max_frame_num;
-    if (!h->idr && h->frame_num != h->prev_ref_frame_num && h->frame_num != (h->prev_ref_frame_num + 1) % max_frame_num) { s->error = "a gap in frame_num"; return 0; }
+    if (!h->idr && h->frame_num != h->prev_ref_frame_num && h->frame_num != (h->prev_ref_frame_num + 1) % max_frame_num) {
+      if (!dxva_h264_fill_gap(s)) return 0;
+      ++s->inferred;
+    }
     /* 7.4.1.2.4: the second field of a complementary (reference or non-reference) field pair - the next field of the other parity with the same frame_num */
     int mmco5 = 0;
     for (unsigned m = 0; m < h->mmco_count; ++m) mmco5 |= h->mmco[m].op == 5;

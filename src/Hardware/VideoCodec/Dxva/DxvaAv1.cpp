@@ -28,8 +28,8 @@
 // The frame comes back at once, in decoding order, whether it is shown or not (show_frame 0: the program shows the surface itself later), at its size (the
 // upscaled width), in the decoder's surface format (DxvaSurfaceFormat: NV12 / P010 / P016 for 4:2:0 and monochrome - neutral chroma -, AYUV / Y410 / Y416 for 4:4:4,
 // YUY2 / Y210 / Y216 for 4:2:2; deeper samples in the top bits of their words, alpha opaque). With apply_grain the film grain is applied to the output, as DXVA has the
-// accelerator do; the surface's reference picture stays without grain. Large-scale tile decoding (anchor frames and tile list OBUs) is not offered: Unsupported -
-// the core decodes whole frames only, and the Windows decoder profiles carry ordinary frames (every program's DXVA_Tile_AV1.anchor_frame is 0xFF).
+// accelerator do; the surface's reference picture stays without grain. Large-scale tile decoding (7.3): a call whose tile controls name anchor frames
+// (DXVA_Tile_AV1.anchor_frame) is a tile list - see decode_tile_list.
 #include "Hardware/VideoCodec/Dxva/DxvaCodecs.hpp"
 #include "Hardware/VideoCodec/Dxva/DxvaSurfaces.hpp"
 #include "Hardware/VideoCodec/Dxva/DxvaTypesAv1.hpp"
@@ -62,7 +62,7 @@ struct Av1Surface {
 class Av1DxvaDecoder final : public IDxvaDecoder {
  public:
   Av1DxvaDecoder(allocators::IAllocator& allocator, const DxvaDecoderConfig& config)
-      : allocator_(allocator), config_(config), surfaces_(config.surfaces + 1), tiles_(allocator), out_(allocator) {}
+      : allocator_(allocator), config_(config), surfaces_(config.surfaces + 1), tiles_(allocator), list_(allocator), out_(allocator) {}
   ~Av1DxvaDecoder() = default;
 
   [[nodiscard]] bool init() {
@@ -86,8 +86,11 @@ class Av1DxvaDecoder final : public IDxvaDecoder {
   }
   // The headers of the frame from the parameters; Ok or what to refuse it with (*why says why).
   DxvaResult make_headers(const dxva::PicParamsAv1& pp, SequenceHeader* seq, FrameHeader* hdr, const char** why);
-  // The tiles of the frame by tile number; Ok or what to refuse.
-  DxvaResult collect_tiles(const DxvaPicture& picture, const FrameHeader& hdr, const char** why);
+  // The tiles of the frame by tile number, or (*large_scale set: the controls name anchor frames) the entries of a tile list in list_; Ok or what to refuse.
+  DxvaResult collect_tiles(const DxvaPicture& picture, const FrameHeader& hdr, bool* large_scale, const char** why);
+  // Large-scale tile decoding: the tile list in list_ with the camera frame header `hdr` and its reference slots, into the output frame.
+  DxvaResult decode_tile_list(const DxvaPicture& picture, const dxva::PicParamsAv1& pp, const SequenceHeader& seq, const FrameHeader& hdr, uint32_t cur_key,
+                              DxvaDecodedPicture* out);
   // A mid-grey picture standing in for a missing reference of `width` x `height` with the order hint `order_hint`, and the default CDFs.
   [[nodiscard]] bool grey_reference(const SequenceHeader& seq, const FrameHeader& hdr, int width, int height, RefSlot* slot);
   [[nodiscard]] bool output(const Picture& p, DxvaDecodedPicture* out);
@@ -97,6 +100,7 @@ class Av1DxvaDecoder final : public IDxvaDecoder {
   UniquePointer<av1::Core> core_;
   dxva::SurfaceTable<Av1Surface> surfaces_;
   av1::OwnedArray<TileData> tiles_;
+  av1::OwnedArray<av1::TileListEntry> list_;   // a tile list: anchor_frame_idx is the anchor's surface index
   ByteBuffer out_;
 };
 
@@ -505,8 +509,40 @@ DxvaResult Av1DxvaDecoder::make_headers(const dxva::PicParamsAv1& pp, SequenceHe
   return DxvaResult::Ok;
 }
 
-DxvaResult Av1DxvaDecoder::collect_tiles(const DxvaPicture& picture, const FrameHeader& hdr, const char** why) {
+DxvaResult Av1DxvaDecoder::collect_tiles(const DxvaPicture& picture, const FrameHeader& hdr, bool* large_scale, const char** why) {
   constexpr uint64_t kControl = sizeof(dxva::TileAv1);
+  *large_scale = false;
+  // A first control that names an anchor frame makes the call a tile list (large-scale tile decoding): one control per tile_list_entry(), in the list's order.
+  uint8_t first_anchor = 0xFF;
+  if (picture.slice_control.size() >= kControl && !picture.slice_control.try_get(14, &first_anchor)) return DxvaResult::Invalid;
+  if (first_anchor != 0xFF) {
+    *why = "AV1: the tile controls of a tile list are not 1 to 512 whole DXVA_Tile_AV1, each naming an anchor frame and a tile inside the bitstream";
+    const uint64_t n = picture.slice_control.size() / kControl;
+    if (picture.slice_control.size() % kControl != 0 || n == 0 || n > av1::kMaxTileListEntries || picture.bitstream.empty()) return DxvaResult::Invalid;
+    if (!list_.reset(n)) {
+      *why = "AV1: out of memory";
+      return DxvaResult::Invalid;
+    }
+    for (uint64_t i = 0; i < n; ++i) {
+      ByteReader in(picture.slice_control.subview(i * kControl, kControl));
+      const uint32_t offset = in.le32(), size = in.le32();
+      const uint16_t row = in.le16(), column = in.le16();
+      in.skip(2);
+      const uint8_t anchor = in.u8();
+      ConstByteView data;
+      if (!in.ok() || anchor == 0xFF || anchor >= av1::kMaxAnchorFrames || row >= hdr.tiling.rows || column >= hdr.tiling.cols || size == 0 ||
+          !picture.bitstream.try_subview(offset, size, &data))
+        return DxvaResult::Invalid;
+      av1::TileListEntry& e = list_[i];
+      e.data = data;
+      e.anchor_frame_idx = anchor;
+      e.tile_row = static_cast<uint8_t>(row);
+      e.tile_col = static_cast<uint8_t>(column);
+    }
+    *large_scale = true;
+    *why = nullptr;
+    return DxvaResult::Ok;
+  }
   const uint64_t count = static_cast<uint64_t>(hdr.tiling.cols) * hdr.tiling.rows;
   *why = "AV1: the tile controls do not describe every tile of the frame once, inside the bitstream";
   if (picture.slice_control.size() != count * kControl || picture.bitstream.empty()) return DxvaResult::Invalid;
@@ -522,8 +558,8 @@ DxvaResult Av1DxvaDecoder::collect_tiles(const DxvaPicture& picture, const Frame
     const uint8_t anchor = in.u8();
     if (!in.ok()) return DxvaResult::Invalid;
     if (anchor != 0xFF) {
-      *why = "AV1: large-scale tile decoding (anchor frames) is not supported";
-      return DxvaResult::Unsupported;
+      *why = "AV1: a tile of an ordinary frame names an anchor frame (only a tile list's do, from its first control on)";
+      return DxvaResult::Invalid;
     }
     ConstByteView data;
     if (row >= hdr.tiling.rows || column >= hdr.tiling.cols || size == 0 || !picture.bitstream.try_subview(offset, size, &data)) return DxvaResult::Invalid;
@@ -535,6 +571,84 @@ DxvaResult Av1DxvaDecoder::collect_tiles(const DxvaPicture& picture, const Frame
   }
   *why = nullptr;
   return DxvaResult::Ok;
+}
+
+// Large-scale tile decoding (AV1 7.3) through DXVA. What DXVA expresses: DXVA_Tile_AV1.anchor_frame (0xFF for an ordinary tile) and the tile controls themselves.
+// So a call whose tile controls name anchor frames is one tile list: the picture parameters are the camera frame header, control i is tile_list_entry() i (row and
+// column: anchor_tile_row / anchor_tile_col; DataOffset / DataSize: coded_tile_data; anchor_frame: the surface index of the anchor frame, a frame decoded into it
+// before - AnchorFrames[] are the program's surfaces), and the output frame goes into CurrPicTextureIndex. DXVA_PicParams_AV1 has no large_scale_tile flag and no
+// output_frame_width_in_tiles_minus_1 / output_frame_height_in_tiles_minus_1 (D3D12 has none either: D3D12_VIDEO_DECODE_ARGUMENT_TYPE carries the same DXVA
+// structures), so the output frame is the decoder's surface size in whole tiles - (SampleWidth / TileWidth) x (SampleHeight / TileHeight) tiles, control i at
+// (i % columns, i / columns) - and samples no tile is written to are 0, as libaom leaves them. A list that does not fit is refused. The output is no reference.
+DxvaResult Av1DxvaDecoder::decode_tile_list(const DxvaPicture& picture, const dxva::PicParamsAv1& pp, const SequenceHeader& seq, const FrameHeader& hdr,
+                                            uint32_t cur_key, DxvaDecodedPicture* out) {
+  if (!av1::is_inter_or_switch(hdr)) return refuse(out, DxvaResult::Invalid, "AV1: the camera frame of a tile list is not an inter frame (7.3.1)");
+  const int sb_px = 64 << seq.sb128;
+  const int tile_w = (hdr.tiling.col_start_sb[1] - hdr.tiling.col_start_sb[0]) * sb_px, tile_h = sb_px;
+  const uint32_t columns = tile_w > 0 ? config_.width / static_cast<uint32_t>(tile_w) : 0, rows = config_.height / static_cast<uint32_t>(tile_h);
+  if (columns == 0 || rows == 0 || list_.size() > uint64_t{columns} * rows)
+    return refuse(out, DxvaResult::Invalid, "AV1: the tile list does not fit the output frame (the decoder's surface size in whole tiles)");
+  uint32_t keep[1 + av1::NUM_REF_FRAMES + av1::kMaxAnchorFrames];
+  uint32_t keep_count = 0;
+  keep[keep_count++] = cur_key;
+  bool missing = false;
+  const int bpc = 8 + 2 * seq.hbd;
+  // The anchor frames the list names.
+  SharedPointer<Picture> anchors[av1::kMaxAnchorFrames];
+  for (const av1::TileListEntry& e : list_.view()) {
+    SharedPointer<Picture>& a = anchors[e.anchor_frame_idx];
+    if (a) continue;
+    uint32_t key = 0;
+    if (!dxva::surface_key(picture, config_.surfaces, e.anchor_frame_idx, &key)) return refuse(out, DxvaResult::Invalid, "AV1: anchor_frame names no surface");
+    keep[keep_count++] = key;
+    const Av1Surface* s = surfaces_.find(key);
+    if (s && s->state.pic) {
+      a = s->state.pic;
+      surfaces_.touch(key);
+      if (a->layout() != seq.layout || a->bpc() != bpc || a->width() != hdr.width[1] || a->height() != hdr.height)
+        return refuse(out, DxvaResult::Invalid, "AV1: an anchor frame has another format or size than the camera frame (7.3.1)");
+    } else {
+      RefSlot grey;
+      if (!grey_reference(seq, hdr, hdr.width[1], hdr.height, &grey)) return refuse(out, DxvaResult::Invalid, "AV1: out of memory");
+      a = grey.pic;
+      missing = true;
+    }
+  }
+  // The camera frame header's references: only the primary one's CDFs are used (LAST_FRAME's picture is each tile's anchor, and nothing else is predicted from).
+  RefSlot slots[av1::NUM_REF_FRAMES];
+  for (int i = 0; i < av1::NUM_REF_FRAMES; ++i) {
+    const uint8_t index = pp.RefFrameMapTextureIndex[i];
+    if (index == kNoSlot) continue;
+    uint32_t key = 0;
+    if (!dxva::surface_key(picture, config_.surfaces, index, &key)) return refuse(out, DxvaResult::Invalid, "AV1: RefFrameMapTextureIndex names no surface");
+    keep[keep_count++] = key;
+    if (const Av1Surface* s = surfaces_.find(key)) {
+      slots[i] = s->state;
+      surfaces_.touch(key);
+    }
+  }
+  for (int i = 0; i < av1::REFS_PER_FRAME; ++i) {
+    RefSlot& slot = slots[hdr.refidx[i]];
+    const bool primary = hdr.primary_ref_frame != av1::PRIMARY_REF_NONE && i == hdr.primary_ref_frame;
+    if (slot.pic && slot.cdf) continue;
+    if (primary) {
+      if (!grey_reference(seq, hdr, hdr.width[1], hdr.height, &slot)) return refuse(out, DxvaResult::Invalid, "AV1: out of memory");
+      missing = true;
+    } else if (!slot.pic) {
+      slot.pic = anchors[list_[0].anchor_frame_idx];
+    }
+  }
+  const av1::TileList list{columns, rows, ArrayView<const av1::TileListEntry>(list_.view())};
+  SharedPointer<Picture> pic;
+  if (!core_->decode_tile_list_external(seq, hdr, ArrayView<const RefSlot>(slots), ArrayView<const SharedPointer<Picture>>(anchors), list, &pic) || !pic)
+    return refuse(out, DxvaResult::Invalid, "AV1: the tile list cannot be decoded (damaged tile data, or a camera frame outside the constraints of 7.3.1)");
+  bool fresh = false;
+  Av1Surface* target = surfaces_.claim(cur_key, ArrayView<const uint32_t>(keep, keep_count), &fresh);
+  if (!target) return refuse(out, DxvaResult::Invalid, "AV1: no room for the surface");
+  target->state = RefSlot();   // (the output frame is no reference and no anchor frame)
+  out->surface = pp.CurrPicTextureIndex;
+  if (!output(*pic, out)) return refuse(out, DxvaResult::Invalid, "AV1: out of memory");
+  return missing ? DxvaResult::MissingReference : DxvaResult::Ok;
 }
 
 bool Av1DxvaDecoder::grey_reference(const SequenceHeader& seq, const FrameHeader& hdr, int width, int height, RefSlot* slot) {
@@ -661,13 +775,15 @@ DxvaResult Av1DxvaDecoder::decode(const DxvaPicture& picture, DxvaDecodedPicture
   FrameHeader hdr;
   const DxvaResult made = make_headers(pp, &seq, &hdr, &why);
   if (made != DxvaResult::Ok) return refuse(out, made, why);
-  const DxvaResult tiled = collect_tiles(picture, hdr, &why);
+  bool large_scale = false;
+  const DxvaResult tiled = collect_tiles(picture, hdr, &large_scale, &why);
   if (tiled != DxvaResult::Ok) return refuse(out, tiled, why);
 
   // The surfaces: the current one and the eight reference slots.
   uint32_t cur_key = 0;
   if (!dxva::output_surface_key(picture, config_.surfaces, pp.CurrPicTextureIndex, &cur_key))
     return refuse(out, DxvaResult::Invalid, "AV1: CurrPicTextureIndex names no surface");
+  if (large_scale) return decode_tile_list(picture, pp, seq, hdr, cur_key, out);
   uint32_t keep[1 + av1::NUM_REF_FRAMES];
   uint32_t keep_count = 0;
   keep[keep_count++] = cur_key;

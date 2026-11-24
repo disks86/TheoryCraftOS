@@ -76,6 +76,7 @@ void Dpb::clear_pictures() {
   returned_ = nullptr;
   cur_ = nullptr;
   pending_ = nullptr;
+  have_prev_ref_ = false;
 }
 
 void Dpb::reset() {
@@ -91,6 +92,8 @@ void Dpb::reset() {
   pending_ = nullptr;
   prev_poc_msb_ = prev_poc_lsb_ = 0;
   prev_frame_num_ = prev_frame_num_offset_ = 0;
+  prev_ref_frame_num_ = 0;
+  have_prev_ref_ = false;
   returned_ = nullptr;
 }
 
@@ -150,23 +153,8 @@ PictureInfo* Dpb::begin_picture(const SliceHeader& sh, int64_t pts, PictureInfo*
     max_long_term_idx_ = -1;
   }
   compute_poc(sh);
-  PictureInfo* pic = find_free_slot();
-  while (!pic) {
-    // The buffer is full: push the earliest picture out, and if that frees nothing drop the oldest reference.
-    if (out_count_ > 0) {
-      bump_output(false);
-      pic = find_free_slot();
-      if (pic) break;
-    }
-    PictureInfo* oldest = nullptr;
-    for (int i = 0; i < slot_count_; ++i) {
-      PictureInfo* q = slots_[i];
-      if (q->is_ref && q != returned_ && (!oldest || q->frame_num_wrap < oldest->frame_num_wrap)) oldest = q;
-    }
-    if (!oldest) return nullptr;
-    unmark(*oldest);
-    pic = find_free_slot();
-  }
+  PictureInfo* pic = claim_slot();
+  if (!pic) return nullptr;
   cur_ = pic;
   cur_->in_use = true;
   cur_->id = next_pic_id_++;
@@ -190,6 +178,101 @@ PictureInfo* Dpb::begin_picture(const SliceHeader& sh, int64_t pts, PictureInfo*
   cur_->keyframe = sh.idr() || sh.type == kSliceI;
   cur_->pts = pts;
   return cur_;
+}
+
+// A slot for a new picture. The buffer is full: push the earliest picture out, and if that frees nothing drop the oldest reference.
+PictureInfo* Dpb::claim_slot() {
+  PictureInfo* pic = find_free_slot();
+  while (!pic) {
+    if (out_count_ > 0) {
+      bump_output(false);
+      pic = find_free_slot();
+      if (pic) break;
+    }
+    PictureInfo* oldest = nullptr;
+    for (int i = 0; i < slot_count_; ++i) {
+      PictureInfo* q = slots_[i];
+      if (q->is_ref && q != returned_ && (!oldest || q->frame_num_wrap < oldest->frame_num_wrap)) oldest = q;
+    }
+    if (!oldest) return nullptr;
+    unmark(*oldest);
+    pic = find_free_slot();
+  }
+  return pic;
+}
+
+bool Dpb::has_frame_num_gap(const SliceHeader& sh) const {
+  if (!sps_ || sh.idr() || !have_prev_ref_) return false;
+  const int max_frame_num = 1 << sps_->log2_max_frame_num;
+  return sh.frame_num != prev_ref_frame_num_ && sh.frame_num != (prev_ref_frame_num_ + 1) % max_frame_num;
+}
+
+bool Dpb::fill_frame_num_gap(const SliceHeader& sh, NonExistingHook prepare, void* context) {
+  if (!has_frame_num_gap(sh)) return true;
+  const Sps& s = *sps_;
+  const int max_frame_num = 1 << s.log2_max_frame_num;
+  // The values UnusedShortTermFrameNum takes (7-23), without the current picture's own.
+  const int first = (prev_ref_frame_num_ + 1) % max_frame_num;
+  const int count = (sh.frame_num - first + max_frame_num) % max_frame_num;
+  const int window = s.max_num_ref_frames > 0 ? s.max_num_ref_frames : 1;
+  // pic_order_cnt_type 0: no counts are derived for the frames (8.2.5.2); they carry the previous picture's.
+  int top = top_poc_, bottom = bottom_poc_;
+  // A first field left without its second one does not pair with anything after the gap.
+  if (pending_) release_pending();
+  cur_ = nullptr;
+  structure_ = 3;   // the inferred frames are frames (field_pic_flag inferred 0)
+  second_field_ = false;
+  for (int k = 0; k < count; ++k) {
+    const int fn = (first + k) % max_frame_num;
+    if (s.poc_type != 0) {
+      // 8.2.1 for the frame: frame_num inferred, a reference, not IDR, a frame, delta_pic_order_cnt[0..1] 0.
+      SliceHeader g;
+      g.nal_unit_type = 1;
+      g.nal_ref_idc = 1;
+      g.type = kSliceP;
+      g.frame_num = fn;
+      compute_poc(g);
+      top = top_poc_;
+      bottom = bottom_poc_;
+      prev_frame_num_ = fn;
+      prev_frame_num_offset_ = frame_num_offset_;
+    }
+    prev_ref_frame_num_ = fn;
+    if (count - k > window) continue;   // the sliding window of a later frame of the gap drops this one again
+    // 8.2.4.1 relative to the inferred frame, then 8.2.5.3.
+    PictureInfo* previous = nullptr;
+    for (int i = 0; i < slot_count_; ++i) {
+      PictureInfo& p = *slots_[i];
+      if (p.field_ref[0] != 1 && p.field_ref[1] != 1) continue;   // short-term frames, field pairs and fields
+      p.frame_num_wrap = p.frame_num > fn ? p.frame_num - max_frame_num : p.frame_num;
+      if (!previous || p.frame_num_wrap > previous->frame_num_wrap) previous = &p;
+    }
+    sliding_window();
+    PictureInfo* p = claim_slot();
+    if (!p) return false;
+    p->in_use = true;
+    p->id = next_pic_id_++;
+    p->top_poc = top;
+    p->bottom_poc = bottom;
+    p->poc = top < bottom ? top : bottom;
+    p->frame_num = fn;
+    p->frame_num_wrap = fn;
+    p->field_ref[0] = p->field_ref[1] = 1;
+    sync_ref(*p);
+    p->decoded = 3;
+    p->field_coded = false;
+    p->mbaff = false;
+    p->needed_for_output = false;
+    p->non_existing = true;
+    p->keyframe = false;
+    p->pts = 0;
+    if (prepare && !prepare(context, p, previous)) {
+      unmark(*p);
+      p->in_use = false;
+      return false;
+    }
+  }
+  return true;
 }
 
 void Dpb::set_current_poc(int top, int bottom) {
@@ -310,7 +393,10 @@ void Dpb::finish_picture(const SliceHeader& sh) {
   } else {
     prev_frame_num_ = sh.frame_num;
   }
-  prev_ref_frame_num_ = sh.nal_ref_idc != 0 ? (mmco5 ? 0 : sh.frame_num) : prev_ref_frame_num_;
+  if (sh.nal_ref_idc != 0) {
+    prev_ref_frame_num_ = mmco5 ? 0 : sh.frame_num;
+    have_prev_ref_ = true;
+  }
   PictureInfo* done = cur_;
   cur_ = nullptr;
   if (structure_ != 3 && !second_field_) {
@@ -574,9 +660,11 @@ void Dpb::build_ref_lists(const SliceHeader& sh) {
   PictureInfo* shorts[kMaxPictures];
   PictureInfo* longs[kMaxPictures];
   int ns = 0, nl = 0;
+  // 8.2.4.2.3: with pic_order_cnt_type 0 the "non-existing" frames (which have no order count) are in neither list of a B slice.
+  const bool skip_non_existing = sh.type == kSliceB && sps_->poc_type == 0;
   for (int k = 0; k < slot_count_; ++k) {
     PictureInfo& p = *slots_[k];
-    if (!p.is_ref) continue;
+    if (!p.is_ref || (skip_non_existing && p.non_existing)) continue;
     if (!field) {
       if (&p == cur_) continue;
       if (frame_short(p)) {

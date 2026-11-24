@@ -1338,7 +1338,9 @@ static void decode_av1(const char *name, const char *b64, const GUID *profile, D
   }
   checkf(SUCCEEDED(hr) && dec && out && surfaces <= 16, "%s: a decoder of %u x %u and an array of %u slices with their output views", name, w, h, surfaces);
   const UINT row = (format == DXGI_FORMAT_YUY2 || format == DXGI_FORMAT_Y210 || format == DXGI_FORMAT_Y216 ? (w + 1) / 2 * 2 : w) * bpp;
-  BYTE *picture = malloc((size_t)row * h);
+  /* (NV12, a large-scale tile list's output frame: hashed as I420, as the reference) */
+  const int nv12 = format == DXGI_FORMAT_NV12;
+  BYTE *picture = malloc(nv12 ? (size_t)w * h * 3 : (size_t)row * h);
   unsigned shown = 0, same = 0, failures = 0;
   size_t at = 32;
   for (UINT e = 0; SUCCEEDED(hr) && dec && out && picture && e < events; ++e) {
@@ -1362,6 +1364,19 @@ static void decode_av1(const char *name, const char *b64, const GUID *profile, D
       at += pp + sc + bs;
     }
     if (!show) continue;
+    if (nv12) {
+      if (!read_planar(out, surface, picture)) { ++failures; continue; }
+      BYTE *i420 = picture + (size_t)w * h * 3 / 2;
+      memcpy(i420, picture, (size_t)w * h);
+      for (UINT y = 0; y < h / 2; ++y)
+        for (UINT x = 0; x < w / 2; ++x) {
+          i420[(size_t)w * h + (size_t)y * (w / 2) + x] = picture[(size_t)w * h + (size_t)y * w + 2 * x];
+          i420[(size_t)w * h * 5 / 4 + (size_t)y * (w / 2) + x] = picture[(size_t)w * h + (size_t)y * w + 2 * x + 1];
+        }
+      if (shown < frames) same += fnv(i420, (size_t)w * h * 3 / 2, 0x811c9dc5u) == hashes[shown];
+      ++shown;
+      continue;
+    }
     if (!read_packed(out, surface, row, picture)) { ++failures; continue; }
     if (shown < frames) same += fnv(picture, (size_t)row * h, 0x811c9dc5u) == hashes[shown];
     ++shown;
@@ -2199,6 +2214,9 @@ int main(void) {
       /* interlaced: MBAFF frames and field pictures (a field writes its lines of the slice; the frame is compared after its second field) */
       decode_stream("h264_paff_mbaff_cabac", DXVA_CODEC_H264, &D3D11_DECODER_PROFILE_H264_VLD_NOFGT, g_h264_paff_mbaff_cabac_b64, 17, g_h264_paff_mbaff_cabac_fnv, 8, NULL,
                     0, 0);
+      /* gaps in frame_num: "non-existing" frames named with the surface of the reference before them, as ffmpeg does */
+      decode_stream("h264_dxva_gaps", DXVA_CODEC_H264, &D3D11_DECODER_PROFILE_H264_VLD_NOFGT, g_h264_dxva_gaps_b64, 17, g_h264_dxva_gaps_fnv, 18, NULL, 0, 0);
+      decode_stream("h264_dxva_gaps_p", DXVA_CODEC_H264, &D3D11_DECODER_PROFILE_H264_VLD_NOFGT, g_h264_dxva_gaps_p_b64, 17, g_h264_dxva_gaps_p_fnv, 19, NULL, 0, 1);
       for (unsigned i = 0; i < sizeof g_hevc10_streams / sizeof g_hevc10_streams[0]; ++i) decode_hevc10(&g_hevc10_streams[i]);
       decode_stream("mpeg2_ibp", DXVA_CODEC_MPEG2, &D3D11_DECODER_PROFILE_MPEG2_VLD, g_mpeg2_ibp_b64, 8, NULL, 8, g_mpeg2_ibp_means, 1, 0);
       decode_stream("mpeg2_ibp (separate textures)", DXVA_CODEC_MPEG2, &D3D11_DECODER_PROFILE_MPEG2_VLD, g_mpeg2_ibp_b64, 8, NULL, 8, g_mpeg2_ibp_means, 0, 1);
@@ -2207,6 +2225,8 @@ int main(void) {
       decode_av1("av1_444 (profile 1, AYUV)", g_av1_444_dxva_b64, &DXVA_ModeAV1_VLD_Profile1, DXGI_FORMAT_AYUV, 4, g_av1_444_dxva_fnv, 6);
       decode_av1("av1_422_10bit (profile 2, Y210, film grain)", g_av1_422_10bit_dxva_b64, &DXVA_ModeAV1_VLD_Profile2, DXGI_FORMAT_Y210, 4, g_av1_422_10bit_dxva_fnv, 6);
       decode_av1("av1_444_12bit (12-bit profile 2, Y416)", g_av1_444_12bit_dxva_b64, &DXVA_ModeAV1_VLD_12bit_Profile2, DXGI_FORMAT_Y416, 8, g_av1_444_12bit_dxva_fnv, 6);
+      /* large-scale tile decoding: the anchors, then tile lists (DXVA_Tile_AV1.anchor_frame) into 512 x 512 NV12 output frames, libaom's */
+      decode_av1("av1_lst (large-scale tile, NV12)", g_av1_lst_dxva_b64, &DXVA_ModeAV1_VLD_Profile0, DXGI_FORMAT_NV12, 1, g_av1_lst_dxva_fnv, 3);
       test_decode_then_draw();
       test_processor();
       test_processor_effects();

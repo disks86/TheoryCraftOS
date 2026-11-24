@@ -304,6 +304,15 @@ struct Av1DxvaApp final : av1::IOffload {
   struct Event { int call; int shown; uint32_t surface; };
   std::vector<Event>* events = nullptr;
   static constexpr uint32_t kSurfaces = 10;   // 8 slots, the current frame and one more
+  // Large-scale tile decoding (av1_lst.ivf): the decoder at least this large (the output frame is the surface size in tiles), the anchor frames (the surfaces of the
+  // frames the test made anchors), the tile lists decoded through DXVA (output frames, ffmpeg layout) and their calls.
+  uint32_t min_width = 0, min_height = 0;
+  uint32_t last_shown_key = 0;
+  std::vector<uint32_t> anchor_keys;
+  bool lst = false;
+  std::vector<std::vector<uint8_t>> tile_lists;
+  std::vector<DxvaRecordedCall> lst_calls;
+  DxvaResult lst_result = DxvaResult::Ok;
 
   bool accepts(const av1::SequenceHeader&, const av1::FrameHeader&) override { return true; }
 
@@ -315,8 +324,8 @@ struct Av1DxvaApp final : av1::IOffload {
       av1_decoder_for(seq, force_profile0, &cfg.profile, &cfg.surface);
       used_profile = cfg.profile;
       used_surface = cfg.surface;
-      cfg.width = static_cast<uint32_t>(seq.max_width);
-      cfg.height = static_cast<uint32_t>(seq.max_height);
+      cfg.width = std::max(static_cast<uint32_t>(seq.max_width), min_width);
+      cfg.height = std::max(static_cast<uint32_t>(seq.max_height), min_height);
       cfg.surfaces = naming == DxvaNaming::D3d11 ? kSurfaces : 16;
       decoder = create_dxva_decoder(*alloc, cfg);
       CHECK(decoder);
@@ -331,6 +340,7 @@ struct Av1DxvaApp final : av1::IOffload {
       for (cur_key = 0; cur_key < kSurfaces; ++cur_key) {
         bool held = false;
         for (int i = 0; i < 8; ++i) held = held || (slot_valid[i] && slot_key[i] == cur_key);
+        held = held || std::find(anchor_keys.begin(), anchor_keys.end(), cur_key) != anchor_keys.end();
         if (!held) break;
       }
       for (int i = 0; i < 8; ++i) slot_index[i] = static_cast<uint8_t>(slot_key[i]);
@@ -382,7 +392,10 @@ struct Av1DxvaApp final : av1::IOffload {
     CHECK(out.surface_format == used_surface);
     mono_chroma_bad += av1_surface_extras_bad(out, seq);
     picture_of_key[cur_key] = av1_ffmpeg_layout(out, seq);
-    if (hdr.show_frame) shown.push_back(picture_of_key[cur_key]);
+    if (hdr.show_frame) {
+      shown.push_back(picture_of_key[cur_key]);
+      last_shown_key = cur_key;
+    }
     for (int i = 0; i < 8; ++i)
       if (hdr.refresh_frame_flags & (1 << i)) {
         slot_valid[i] = true;
@@ -395,6 +408,7 @@ struct Av1DxvaApp final : av1::IOffload {
     if (idx >= 8 || !slot_valid[idx]) return;
     if (events) events->push_back({-1, 1, slot_key[idx]});
     shown.push_back(picture_of_key[slot_key[idx]]);
+    last_shown_key = slot_key[idx];
     if (refresh_all)
       for (int i = 0; i < 8; ++i) {
         slot_valid[i] = true;
@@ -404,6 +418,87 @@ struct Av1DxvaApp final : av1::IOffload {
   }
   void new_sequence() override {
     for (bool& v : slot_valid) v = false;
+  }
+  bool takes_tile_lists() const override { return lst; }
+  // A tile list as a program hands it to DXVA: the camera frame header's parameters, one DXVA_Tile_AV1 per entry with anchor_frame the anchor's surface index, the
+  // output into a surface no slot or anchor holds. The output frame comes back into the core's planes.
+  bool decode_tile_list(const av1::OffloadTileList& o) override {
+    const av1::SequenceHeader& seq = *o.seq;
+    const av1::FrameHeader& hdr = *o.camera;
+    if (!decoder) return false;
+    DxvaRecordedCall call;
+    uint32_t cur_key = 0;
+    uint8_t slot_index[8] = {};
+    uint8_t cur_index = 0;
+    std::vector<uint8_t> anchor_index(anchor_keys.size());
+    if (naming == DxvaNaming::D3d11) {
+      for (cur_key = 0; cur_key < kSurfaces; ++cur_key) {
+        bool held = std::find(anchor_keys.begin(), anchor_keys.end(), cur_key) != anchor_keys.end();
+        for (int i = 0; i < 8; ++i) held = held || (slot_valid[i] && slot_key[i] == cur_key);
+        if (!held) break;
+      }
+      for (int i = 0; i < 8; ++i) slot_index[i] = static_cast<uint8_t>(slot_key[i]);
+      for (size_t a = 0; a < anchor_keys.size(); ++a) anchor_index[a] = static_cast<uint8_t>(anchor_keys[a]);
+      cur_index = static_cast<uint8_t>(cur_key);
+    } else {
+      cur_key = next_key++;
+      std::vector<uint32_t> keys;
+      auto add = [&](uint32_t key) {
+        if (std::find(keys.begin(), keys.end(), key) == keys.end()) keys.push_back(key);
+      };
+      for (int i = 0; i < 8; ++i)
+        if (slot_valid[i]) add(slot_key[i]);
+      for (uint32_t key : anchor_keys) add(key);
+      if (naming == DxvaNaming::D3d12Shuffled) keys.push_back(cur_key);
+      std::shuffle(keys.begin(), keys.end(), rng);
+      auto position = [&](uint32_t key) { return static_cast<uint8_t>(std::find(keys.begin(), keys.end(), key) - keys.begin()); };
+      for (int i = 0; i < 8; ++i) slot_index[i] = slot_valid[i] ? position(slot_key[i]) : 0xFF;
+      for (size_t a = 0; a < anchor_keys.size(); ++a) anchor_index[a] = position(anchor_keys[a]);
+      if (naming == DxvaNaming::D3d12Shuffled) {
+        cur_index = position(cur_key);
+      } else {
+        cur_index = static_cast<uint8_t>(keys.size() + 7);
+        call.output_key = cur_key;
+      }
+      call.keys = keys;
+    }
+    call.params = av1_bytes(av1_fill_params(seq, hdr, slot_hdr, slot_valid, slot_index, cur_index));
+    for (const av1::TileListEntry& e : o.list.entries) {
+      if (e.anchor_frame_idx >= anchor_index.size()) return false;
+      dxva::TileAv1 c;
+      memset(&c, 0, sizeof c);
+      c.DataOffset = static_cast<uint32_t>(call.bitstream.size());
+      c.DataSize = static_cast<uint32_t>(e.data.size());
+      c.row = e.tile_row;
+      c.column = e.tile_col;
+      c.anchor_frame = anchor_index[e.anchor_frame_idx];
+      call.bitstream.insert(call.bitstream.end(), e.data.data(), e.data.data() + e.data.size());
+      const std::vector<uint8_t> b = av1_bytes(c);
+      call.slices.insert(call.slices.end(), b.begin(), b.end());
+    }
+    call.bitstream.resize(call.bitstream.size() + (128 - (call.bitstream.size() & 127)), 0);
+    DxvaDecodedPicture out;
+    const DxvaResult r = decoder->decode(call.picture(), &out);
+    lst_calls.push_back(call);
+    if (r != DxvaResult::Ok) {
+      lst_result = r;
+      printf("  AV1 tile list %zu: result %d (%s)\n", tile_lists.size(), static_cast<int>(r), out.detail ? out.detail : "");
+      return false;
+    }
+    CHECK(out.surface == cur_index);
+    CHECK(out.frame.format.width == static_cast<uint32_t>(o.width) && out.frame.format.height == static_cast<uint32_t>(o.height));
+    CHECK(out.frame.format.pixel_format == PixelFormat::Nv12);
+    if (out.frame.format.pixel_format != PixelFormat::Nv12 || out.frame.format.width != static_cast<uint32_t>(o.width)) return false;
+    tile_lists.push_back(av1_ffmpeg_layout(out, seq));
+    // Into the core's output frame (8-bit NV12 -> planes).
+    for (int y = 0; y < o.height; ++y)
+      for (int x = 0; x < o.width; ++x) o.plane[0].at(x, y) = out.frame.plane[0][size_t(y) * out.frame.stride[0] + size_t(x)];
+    for (int y = 0; y < o.height / 2; ++y)
+      for (int x = 0; x < o.width / 2; ++x) {
+        o.plane[1].at(x, y) = out.frame.plane[1][size_t(y) * out.frame.stride[1] + size_t(2 * x)];
+        o.plane[2].at(x, y) = out.frame.plane[1][size_t(y) * out.frame.stride[1] + size_t(2 * x + 1)];
+      }
+    return true;
   }
 };
 
@@ -628,13 +723,15 @@ void dxva_av1_errors() {
     c = calls[1];
     c.bitstream.resize(4);
     CHECK(d->decode(c.picture(), &o) == DxvaResult::Invalid);
-    // Large-scale tile decoding (anchor frames) is not offered.
+    // A first tile control naming an anchor frame makes the call a tile list (large-scale tile decoding, dxva_av1_large_scale_tile): an ordinary frame's tile with
+    // the anchor of surface 0 decodes as a one-tile list or is refused, never "unsupported".
     c = calls[1];
     dxva::TileAv1 t;
     memcpy(&t, c.slices.data(), sizeof t);
     t.anchor_frame = 0;
     memcpy(c.slices.data(), &t, sizeof t);
-    CHECK(d->decode(c.picture(), &o) == DxvaResult::Unsupported && o.detail != nullptr);
+    const DxvaResult lr = d->decode(c.picture(), &o);
+    CHECK(lr != DxvaResult::Unsupported && (lr != DxvaResult::Invalid || o.detail != nullptr));
   }
   CHECK(alloc.live == 0);
   int runs = 0;
@@ -650,6 +747,339 @@ void dxva_av1_errors() {
   }
   CHECK(alloc.live == 0);
   printf("  AV1 damaged buffers: %d decodes\n", runs);
+}
+
+// ---- large-scale tile decoding (AV1 7.3): tests/data/av1_lst.ivf, made by make_av1_large_scale_tile.sh with libaom's light field examples. Its temporal units: four
+// anchor frames (ordinary frames), the camera frame header, three tile lists (8, 12 and 5 tiles of 64 x 64 out of a 256 x 128 camera frame with 4 x 2 tiles,
+// into a 512 x 512 output frame). av1_lst_md5.txt: what libaom's tile list decoder makes of them.
+struct Av1LstRefs {
+  std::vector<std::string> anchors, lists;
+  std::vector<std::vector<std::string>> tiles;
+};
+
+Av1LstRefs av1_lst_refs() {
+  Av1LstRefs r;
+  const std::vector<uint8_t> text = read_file("tests/data/av1_lst_md5.txt");
+  const std::string all(text.begin(), text.end());
+  size_t pos = 0;
+  while (pos < all.size()) {
+    size_t e = all.find('\n', pos);
+    if (e == std::string::npos) e = all.size();
+    char kind[16] = {}, md5[40] = {};
+    unsigned a = 0, b = 0;
+    const std::string line = all.substr(pos, e - pos);
+    if (sscanf(line.c_str(), "tile %u %u %39s", &a, &b, md5) == 3) {
+      if (r.tiles.size() <= a) r.tiles.resize(a + 1);
+      r.tiles[a].push_back(md5);
+    } else if (sscanf(line.c_str(), "%15s %u %39s", kind, &a, md5) == 3) {
+      (std::string(kind) == "anchor" ? r.anchors : r.lists).push_back(md5);
+    }
+    pos = e + 1;
+  }
+  return r;
+}
+
+// I420 bytes (8-bit) of a decoded VideoFrame.
+std::vector<uint8_t> av1_i420(const VideoFrame& f) {
+  std::vector<uint8_t> out;
+  for (uint32_t p = 0; p < 3; ++p) {
+    const uint32_t w = p ? (f.format.width + 1) / 2 : f.format.width, h = p ? (f.format.height + 1) / 2 : f.format.height;
+    for (uint32_t y = 0; y < h; ++y) out.insert(out.end(), f.plane[p] + size_t(y) * f.stride[p], f.plane[p] + size_t(y) * f.stride[p] + w);
+  }
+  return out;
+}
+
+// Tile t (64 x 64, raster order) of a W x H I420 output frame, as the reference hashes it: luma, then the two 32 x 32 chroma blocks.
+std::string av1_lst_tile_md5(const std::vector<uint8_t>& i420, uint32_t w, uint32_t h, size_t t) {
+  std::vector<uint8_t> b;
+  const uint32_t x = static_cast<uint32_t>(t % (w / 64)) * 64, y = static_cast<uint32_t>(t / (w / 64)) * 64;
+  for (uint32_t r = 0; r < 64; ++r) b.insert(b.end(), i420.begin() + (y + r) * w + x, i420.begin() + (y + r) * w + x + 64);
+  for (uint32_t p = 0; p < 2; ++p) {
+    const size_t base = size_t(w) * h + p * size_t(w / 2) * (h / 2);
+    for (uint32_t r = 0; r < 32; ++r) {
+      const size_t o = base + (y / 2 + r) * size_t(w / 2) + x / 2;
+      b.insert(b.end(), i420.begin() + static_cast<long>(o), i420.begin() + static_cast<long>(o + 32));
+    }
+  }
+  return dxva_md5_hex(b);
+}
+
+// Compares output frame `n` (W x H I420) with libaom's: the whole frame, and every tile written to it.
+int av1_lst_compare(const Av1LstRefs& refs, size_t n, const std::vector<uint8_t>& i420, uint32_t w, uint32_t h, const char* who) {
+  int exact = 0;
+  CHECK(n < refs.lists.size() && n < refs.tiles.size());
+  if (n >= refs.lists.size() || n >= refs.tiles.size() || i420.size() != size_t(w) * h * 3 / 2) return 0;
+  const bool whole = dxva_md5_hex(i420) == refs.lists[n];
+  CHECK(whole);
+  for (size_t t = 0; t < refs.tiles[n].size(); ++t) {
+    const bool same = av1_lst_tile_md5(i420, w, h, t) == refs.tiles[n][t];
+    if (!same) printf("  AV1 tile list %zu (%s): tile %zu differs from libaom's\n", n, who, t);
+    exact += same ? 1 : 0;
+  }
+  CHECK(exact == static_cast<int>(refs.tiles[n].size()));
+  return exact + (whole ? 1 : 0);
+}
+
+// `dump` (DXVA_AV1_DUMP): also writes av1_lst.ivf.dxva - the anchors and the three tile list calls as the Windows tests replay them (see av1_dump_stream; the size
+// words are the decoder's, 512 x 512) - and av1_lst.ivf.fnv, the FNV-1a hashes of the three output frames as I420 (each checked against libaom's MD5s here first).
+void dxva_av1_large_scale_tile(const char* dump = nullptr) {
+  const std::vector<uint8_t> data = read_file("tests/data/av1_lst.ivf");
+  const auto tus = av1_ivf_frames(data);
+  const Av1LstRefs refs = av1_lst_refs();
+  CHECK(tus.size() == 8 && refs.anchors.size() == 4 && refs.lists.size() == 3 && refs.tiles.size() == 3);
+  if (tus.size() != 8 || refs.lists.size() != 3) return;
+  auto tu = [&](size_t i) { return ConstByteView(data.data() + tus[i].first, tus[i].second); };
+  int sw_exact = 0, sw_total = 0;
+  TestAllocator alloc;
+  {
+    // The CPU decoder: the anchors as ordinary frames, then in large-scale tile mode the camera frame header (no picture) and the three lists.
+    Av1Decoder dec(alloc);
+    VideoFrame f;
+    for (size_t i = 0; i < 4; ++i) {
+      CHECK(dec.decode(tu(i), 0) && dec.receive(&f));
+      CHECK(f.format.width == 256 && f.format.height == 128 && dxva_md5_hex(av1_i420(f)) == refs.anchors[i]);
+      CHECK(dec.keep_anchor_frame(static_cast<unsigned>(i)));
+    }
+    CHECK(!dec.keep_anchor_frame(av1::kMaxAnchorFrames));
+    // (without large-scale tile decoding a tile list OBU is skipped: nothing comes out)
+    CHECK(dec.decode(tu(5), 0) && !dec.receive(&f));
+    dec.set_large_scale_tile(true);
+    CHECK(dec.decode(tu(4), 0) && !dec.receive(&f));
+    for (size_t n = 0; n < 3; ++n) {
+      CHECK(dec.decode(tu(5 + n), 0) && dec.receive(&f));
+      CHECK(f.format.width == 512 && f.format.height == 512);
+      if (f.format.width != 512 || f.format.height != 512) continue;
+      sw_exact += av1_lst_compare(refs, n, av1_i420(f), 512, 512, "CPU");
+      sw_total += 1 + static_cast<int>(refs.tiles[n].size());
+    }
+    // The same list again gives the same frame (a tile decoded twice is decoded the same way).
+    CHECK(dec.decode(tu(7), 0) && dec.receive(&f) && dxva_md5_hex(av1_i420(f)) == refs.lists[2]);
+    // Damaged tile lists (cut short at every length, bits flipped): no fault; a cut list fails; whatever comes out is a whole 512 x 512 frame.
+    std::mt19937 rng(41);
+    int cut_failed = 0, cuts = 0, flips = 0;
+    for (size_t n = 5; n < 8; ++n) {
+      const std::vector<uint8_t> whole(data.begin() + static_cast<long>(tus[n].first), data.begin() + static_cast<long>(tus[n].first + tus[n].second));
+      for (size_t len = 1; len < whole.size(); len += 1 + len / 16) {
+        ++cuts;
+        if (!dec.decode(ConstByteView(whole.data(), len), 0)) ++cut_failed;
+        while (dec.receive(&f)) CHECK(f.format.width == 512 && f.format.height == 512);
+      }
+      for (int k = 0; k < 60; ++k) {
+        std::vector<uint8_t> d = whole;
+        const int bits = 1 + static_cast<int>(rng() % 6);
+        for (int b = 0; b < bits; ++b) d[rng() % d.size()] ^= static_cast<uint8_t>(1u << (rng() % 8));
+        (void)dec.decode(ConstByteView(d.data(), d.size()), 0);
+        ++flips;
+        while (dec.receive(&f)) CHECK(f.format.width > 0 && f.format.width <= 16384 && f.format.height > 0 && f.format.height <= 16384);
+      }
+    }
+    CHECK(cut_failed == cuts);
+    // The list still decodes after all that (a flipped OBU type can make a damaged camera frame header of it: the program sends the camera frame header again).
+    CHECK(dec.decode(tu(4), 0));
+    CHECK(dec.decode(tu(6), 0) && dec.receive(&f) && dxva_md5_hex(av1_i420(f)) == refs.lists[1]);
+    printf("  AV1 large-scale tile, CPU decoder: %d of %d tile list frames and tiles bit-exact with libaom; %d cut and %d bit-flipped lists survived\n", sw_exact,
+           sw_total, cuts, flips);
+    // A tile list before any anchor frame or camera frame header: refused.
+    Av1Decoder fresh(alloc);
+    fresh.set_large_scale_tile(true);
+    CHECK(!fresh.decode(tu(5), 0) && !fresh.receive(&f));
+  }
+  CHECK(alloc.live == 0);
+
+  // DXVA: the program decodes the anchors through the decoder (keeping their surfaces), then hands each tile list over as one call.
+  int exact = 0, total = 0;
+  std::vector<std::vector<uint8_t>> lst_frames;
+  std::vector<DxvaRecordedCall> calls, lst_calls;
+  for (DxvaNaming naming : {DxvaNaming::D3d11, DxvaNaming::D3d12Shuffled, DxvaNaming::D3d12OutputKey}) {
+    TestAllocator a2;
+    {
+      Av1DxvaApp app;
+      app.alloc = &a2;
+      app.naming = naming;
+      app.min_width = app.min_height = 512;
+      if (naming == DxvaNaming::D3d11) app.record = &calls;
+      Av1Decoder dec(a2);
+      dec.set_offload(&app);
+      VideoFrame f;
+      for (size_t i = 0; i < 4; ++i) {
+        CHECK(dec.decode(tu(i), 0) && dec.receive(&f));
+        app.anchor_keys.push_back(app.last_shown_key);
+        CHECK(dec.keep_anchor_frame(static_cast<unsigned>(i)));
+      }
+      for (size_t i = 0; i < 4 && i < app.shown.size(); ++i) CHECK(dxva_md5_hex(app.shown[i]) == refs.anchors[i]);
+      app.lst = true;
+      dec.set_large_scale_tile(true);
+      CHECK(dec.decode(tu(4), 0) && !dec.receive(&f));
+      for (size_t n = 0; n < 3; ++n) {
+        CHECK(dec.decode(tu(5 + n), 0) && dec.receive(&f));
+        CHECK(app.tile_lists.size() == n + 1);
+        if (app.tile_lists.size() != n + 1) continue;
+        exact += av1_lst_compare(refs, n, app.tile_lists[n], 512, 512, dxva_naming_name(naming));
+        total += 1 + static_cast<int>(refs.tiles[n].size());
+        CHECK(av1_i420(f) == app.tile_lists[n]);   // the frame the decoder gives is the DXVA output
+      }
+      CHECK(app.lst_result == DxvaResult::Ok);
+      if (naming == DxvaNaming::D3d11) {
+        lst_calls = app.lst_calls;
+        lst_frames = app.tile_lists;
+      }
+    }
+    CHECK(a2.live == 0);
+  }
+  printf("  AV1 large-scale tile, DXVA: %d of %d tile list frames and tiles bit-exact with libaom (3 ways of naming surfaces)\n", exact, total);
+  if (dump && calls.size() == 4 && lst_calls.size() == 3 && lst_frames.size() == 3 && exact == total) {
+    std::vector<uint8_t> out;
+    auto word = [&](uint32_t v) { for (int i = 0; i < 4; ++i) out.push_back(static_cast<uint8_t>(v >> (8 * i))); };
+    auto bytes = [&](const std::vector<uint8_t>& b) { out.insert(out.end(), b.begin(), b.end()); };
+    out.insert(out.end(), {'A', 'V', '1', 'D'});
+    for (uint32_t v : {Av1DxvaApp::kSurfaces, 512u, 512u, 0u, 8u, 0u, 7u}) word(v);
+    for (int k = 0; k < 7; ++k) {
+      const DxvaRecordedCall& c = k < 4 ? calls[static_cast<size_t>(k)] : lst_calls[static_cast<size_t>(k - 4)];
+      dxva::PicParamsAv1 pp;
+      memcpy(&pp, c.params.data(), sizeof pp);
+      word(0);
+      word(k < 4 ? 0 : 1);   // (the anchors are not compared: the lists are)
+      word(pp.CurrPicTextureIndex);
+      word(static_cast<uint32_t>(c.params.size()));
+      word(static_cast<uint32_t>(c.slices.size()));
+      word(static_cast<uint32_t>(c.bitstream.size()));
+      bytes(c.params);
+      bytes(c.slices);
+      bytes(c.bitstream);
+    }
+    const std::string base = std::string(dump) + "/av1_lst.ivf";
+    FILE* file = fopen((base + ".dxva").c_str(), "wb");
+    CHECK(file != nullptr);
+    if (file) {
+      CHECK(fwrite(out.data(), 1, out.size(), file) == out.size());
+      fclose(file);
+    }
+    file = fopen((base + ".fnv").c_str(), "w");
+    CHECK(file != nullptr);
+    if (file) {
+      for (const std::vector<uint8_t>& frame : lst_frames) {
+        uint32_t h = 0x811c9dc5u;
+        for (uint8_t v : frame) h = (h ^ v) * 0x01000193u;
+        fprintf(file, "%08x\n", h);
+      }
+      fclose(file);
+    }
+    printf("  wrote %s.dxva and .fnv\n", base.c_str());
+  }
+
+  // What a tile list call may not be. calls: the four anchors and nothing else (D3D11 naming, surfaces 0..); lst_calls: the three lists.
+  CHECK(calls.size() == 4 && lst_calls.size() == 3);
+  if (calls.size() != 4 || lst_calls.size() != 3) return;
+  TestAllocator a3;
+  {
+    DxvaDecoderConfig cfg;
+    cfg.profile = DxvaProfile::Av1VldProfile0;
+    cfg.width = cfg.height = 512;
+    cfg.surfaces = Av1DxvaApp::kSurfaces;
+    UniquePointer<IDxvaDecoder> d = create_dxva_decoder(a3, cfg);
+    CHECK(d);
+    if (!d) return;
+    DxvaDecodedPicture o;
+    // Before anything was decoded: the camera frame's primary reference (its CDFs) is missing too, so the tiles decode with the default CDFs into nonsense or fail.
+    {
+      const DxvaResult r0 = d->decode(lst_calls[0].picture(), &o);
+      CHECK(r0 == DxvaResult::MissingReference || (r0 == DxvaResult::Invalid && o.detail != nullptr));
+    }
+    for (const DxvaRecordedCall& c : calls) CHECK(d->decode(c.picture(), &o) == DxvaResult::Ok);
+    CHECK(d->decode(lst_calls[0].picture(), &o) == DxvaResult::Ok);
+    CHECK(o.frame.format.width == 512 && o.frame.format.height == 512);
+    {
+      // An anchor_frame naming a surface that holds no frame (9: never decoded into): a mid-grey anchor, MissingReference, a frame all the same; the other tiles
+      // are libaom's.
+      DxvaRecordedCall c = lst_calls[0];
+      dxva::TileAv1 t;
+      memcpy(&t, c.slices.data(), sizeof t);
+      t.anchor_frame = 9;
+      memcpy(c.slices.data(), &t, sizeof t);
+      CHECK(d->decode(c.picture(), &o) == DxvaResult::MissingReference && o.frame.plane[0] != nullptr && o.frame.format.width == 512);
+      if (o.frame.plane[0] && o.frame.format.width == 512) {
+        std::vector<uint8_t> i420(512 * 512 * 3 / 2);
+        for (uint32_t y = 0; y < 512; ++y) memcpy(&i420[y * 512], o.frame.plane[0] + size_t(y) * o.frame.stride[0], 512);
+        for (uint32_t y = 0; y < 256; ++y)
+          for (uint32_t x = 0; x < 256; ++x) {
+            i420[512 * 512 + y * 256 + x] = o.frame.plane[1][size_t(y) * o.frame.stride[1] + 2 * x];
+            i420[512 * 512 + 65536 + y * 256 + x] = o.frame.plane[1][size_t(y) * o.frame.stride[1] + 2 * x + 1];
+          }
+        int same = 0;
+        for (size_t k = 0; k < refs.tiles[0].size(); ++k) same += av1_lst_tile_md5(i420, 512, 512, k) == refs.tiles[0][k] ? 1 : 0;
+        CHECK(same == static_cast<int>(refs.tiles[0].size()) - 1);
+      }
+    }
+    auto expect = [&](const DxvaRecordedCall& c, DxvaResult want) {
+      const DxvaResult r = d->decode(c.picture(), &o);
+      CHECK(r == want);
+      if (r != want) printf("  AV1 tile list refusal: got %d (%s)\n", static_cast<int>(r), o.detail ? o.detail : "");
+      if (r == DxvaResult::Invalid) CHECK(o.detail != nullptr);
+    };
+    auto with_tile = [&](size_t index, auto&& change) {
+      DxvaRecordedCall c = lst_calls[1];
+      dxva::TileAv1 t;
+      memcpy(&t, c.slices.data() + index * sizeof t, sizeof t);
+      change(t);
+      memcpy(c.slices.data() + index * sizeof t, &t, sizeof t);
+      return c;
+    };
+    expect(with_tile(3, [](dxva::TileAv1& t) { t.anchor_frame = 0xFF; }), DxvaResult::Invalid);           // a list control without an anchor
+    expect(with_tile(2, [](dxva::TileAv1& t) { t.anchor_frame = 200; }), DxvaResult::Invalid);            // past the surfaces / anchor limit
+    expect(with_tile(2, [](dxva::TileAv1& t) { t.anchor_frame = 60; }), DxvaResult::Invalid);             // no such surface (10 of them)
+    expect(with_tile(1, [](dxva::TileAv1& t) { t.row = 2; }), DxvaResult::Invalid);                       // the camera frame has 2 tile rows
+    expect(with_tile(1, [](dxva::TileAv1& t) { t.column = 4; }), DxvaResult::Invalid);
+    expect(with_tile(0, [](dxva::TileAv1& t) { t.DataSize = 0; }), DxvaResult::Invalid);
+    expect(with_tile(0, [](dxva::TileAv1& t) { t.DataOffset = 0xFFFFFF00u; }), DxvaResult::Invalid);
+    {
+      // An ordinary frame's tile that names an anchor after its first one.
+      DxvaRecordedCall c = calls[1];
+      if (c.slices.size() >= 2 * sizeof(dxva::TileAv1)) {
+        dxva::TileAv1 t;
+        memcpy(&t, c.slices.data() + sizeof t, sizeof t);
+        t.anchor_frame = 0;
+        memcpy(c.slices.data() + sizeof t, &t, sizeof t);
+        expect(c, DxvaResult::Invalid);
+      }
+      // 513 tiles; and more tiles than the output frame (64 of 64 x 64 in 512 x 512) holds.
+      DxvaRecordedCall big = lst_calls[2];
+      const std::vector<uint8_t> one(big.slices.begin(), big.slices.begin() + sizeof(dxva::TileAv1));
+      big.slices.clear();
+      for (int i = 0; i < 65; ++i) big.slices.insert(big.slices.end(), one.begin(), one.end());
+      expect(big, DxvaResult::Invalid);
+      for (int i = 65; i < 513; ++i) big.slices.insert(big.slices.end(), one.begin(), one.end());
+      expect(big, DxvaResult::Invalid);
+      big.slices.resize(64 * sizeof(dxva::TileAv1));
+      expect(big, DxvaResult::Ok);
+      // A camera frame header that is an intra frame.
+      DxvaRecordedCall intra = lst_calls[0];
+      dxva::PicParamsAv1 pp;
+      memcpy(&pp, intra.params.data(), sizeof pp);
+      pp.FormatAndPictureInfoFlags = static_cast<uint8_t>(pp.FormatAndPictureInfoFlags & ~3u);   // KEY_FRAME
+      intra.params = av1_bytes(pp);
+      expect(intra, DxvaResult::Invalid);
+    }
+    // A decoder smaller than the output frame: the list does not fit.
+    cfg.width = 256;
+    cfg.height = 128;
+    UniquePointer<IDxvaDecoder> small = create_dxva_decoder(a3, cfg);
+    CHECK(small);
+    if (small) {
+      for (const DxvaRecordedCall& c : calls) CHECK(small->decode(c.picture(), &o) == DxvaResult::Ok);
+      CHECK(small->decode(lst_calls[0].picture(), &o) == DxvaResult::Ok);       // 8 tiles: 4 x 2 fit
+      CHECK(small->decode(lst_calls[1].picture(), &o) == DxvaResult::Invalid);  // 12 do not
+    }
+    // Damaged lists through DXVA.
+    int runs = 0;
+    auto make = [&]() {
+      DxvaDecoderConfig c2 = cfg;
+      c2.width = c2.height = 512;
+      return create_dxva_decoder(a3, c2);
+    };
+    runs += dxva_damage(make, calls, lst_calls[1], 31);
+    printf("  AV1 large-scale tile, DXVA refusals and %d damaged list decodes\n", runs);
+  }
+  CHECK(a3.live == 0);
 }
 
 }  // namespace
@@ -703,6 +1133,7 @@ static void av1_dump_stream(const char* folder, const char* name) {
 static void dxva_test_av1() {
   if (const char* dump = getenv("DXVA_AV1_DUMP")) {
     for (const char* s : {"av1_422_10bit.ivf", "av1_444.ivf", "av1_444_12bit.ivf"}) av1_dump_stream(dump, s);
+    dxva_av1_large_scale_tile(dump);
     return;
   }
   static const char* kStreams[] = {"av1_intra.ivf",   "av1_inter.ivf",    "av1_tiles.ivf",  "av1_sb128.ivf", "av1_lossless.ivf", "av1_qm.ivf",
@@ -729,4 +1160,5 @@ static void dxva_test_av1() {
   printf("DXVA AV1 profiles 1 and 2: %d of %d shown pictures bit-exact with ffmpeg/libdav1d (%d frames decoded, 8 streams, 3 ways of naming surfaces)\n", matched, total,
          frames);
   dxva_av1_errors();
+  dxva_av1_large_scale_tile();
 }

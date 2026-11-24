@@ -30,7 +30,8 @@ class Core;
 // An H.264 / AVC decoder on the CPU: Baseline, Main and High profile video (8-bit 4:2:0 or monochrome, CAVLC or CABAC, I/P/B
 // slices, multiple reference frames, weighted prediction, 8x8 transform and scaling matrices, multiple slices, deblocking),
 // progressive or interlaced: field pictures (alone or as complementary field pairs in one frame) and MBAFF frames (frame and
-// field macroblock pairs), with field reference lists, field order counts, direct modes and the loop filter of each. Not
+// field macroblock pairs), with field reference lists, field order counts, direct modes and the loop filter of each, and gaps in
+// frame_num (8.2.5.2: "non-existing" frames, the samples of the reference before them, which a lost picture is concealed with). Not
 // covered: flexible macroblock ordering, data partitioning, SP/SI slices, high bit depths and 4:2:2 / 4:4:4. Pictures come
 // out in display order, as frames (a field pair in one frame; a field without its pair with the other field's lines grey).
 //

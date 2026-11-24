@@ -32,6 +32,7 @@ struct Stream {
   uint32_t mb_w = 0, mb_h = 0;
   int crop_l = 0, crop_r = 0, crop_t = 0, crop_b = 0;
   std::vector<std::pair<size_t, size_t>> access_units;   // byte ranges for H264Decoder
+  uint64_t inferred = 0;   // "non-existing" frames inferred for gaps in frame_num
 };
 
 constexpr uint32_t kPool = 20;   // surfaces in the program's pool
@@ -42,8 +43,23 @@ std::vector<uint8_t> bytes_of(const T& v) {
   return std::vector<uint8_t>(p, p + sizeof(T));
 }
 
+// A gap in frame_num: ffmpeg (h264_field_start) gives each inferred "non-existing" frame the surface of the short-term reference before it, and names it in
+// RefFrameList with its own FrameNumList entry and NonExistingFrameFlags 0. With `flag` the entries are marked in NonExistingFrameFlags instead (DXVA's own way;
+// the decoder then does not read their surface).
+struct GapSurfaces {
+  uint32_t* slot_surface;
+  uint64_t inferred = 0;
+  static bool hook(void* context, h264::PictureInfo* frame, const h264::PictureInfo* previous) {
+    GapSurfaces& g = *static_cast<GapSurfaces*>(context);
+    frame->has_memory = true;
+    g.slot_surface[frame->slot] = previous ? g.slot_surface[previous->slot] : 0;
+    ++g.inferred;
+    return true;
+  }
+};
+
 // Parses `data` and records the decode calls ffmpeg's DXVA H.264 code would make.
-bool record(TestAllocator& alloc, const std::vector<uint8_t>& data, Stream* st) {
+bool record(TestAllocator& alloc, const std::vector<uint8_t>& data, Stream* st, bool flag_non_existing = false) {
   H264StreamParser parser(alloc);
   List<H264Slice> slices(alloc);
   if (!parser.parse(ConstByteView(data.data(), data.size()), &slices) || slices.count() == 0) return false;
@@ -56,6 +72,7 @@ bool record(TestAllocator& alloc, const std::vector<uint8_t>& data, Stream* st) 
   uint32_t slot_surface[h264::kMaxPictures] = {};
   uint32_t next_surface = 0;
   uint32_t feedback = 0;
+  GapSurfaces gaps{slot_surface};
   for (uint64_t first = 0; first < slices.count();) {
     uint64_t end = first + 1;
     while (end < slices.count() && !slices[end].starts_picture) ++end;
@@ -71,6 +88,7 @@ bool record(TestAllocator& alloc, const std::vector<uint8_t>& data, Stream* st) 
     st->crop_l = sps.crop_l, st->crop_r = sps.crop_r, st->crop_t = sps.crop_t, st->crop_b = sps.crop_b;
     dpb.set_sps(&sps);
     dpb.release_returned();
+    if (!dpb.fill_frame_num_gap(s0.header, &GapSurfaces::hook, &gaps)) return false;
     h264::PictureInfo* cur = dpb.begin_picture(s0.header, 0);
     if (!cur) return false;
     cur->has_memory = true;
@@ -125,6 +143,7 @@ bool record(TestAllocator& alloc, const std::vector<uint8_t>& data, Stream* st) 
         pp.FrameNumList[n] = static_cast<uint16_t>(r.is_long ? r.long_term_idx : r.frame_num);
         if (r.field_ref[0]) pp.UsedForReferenceFlags |= 1u << (2 * n);
         if (r.field_ref[1]) pp.UsedForReferenceFlags |= 2u << (2 * n);
+        if (flag_non_existing && r.non_existing) pp.NonExistingFrameFlags = static_cast<uint16_t>(pp.NonExistingFrameFlags | (1u << n));
         ++n;
       }
     pp.CurrFieldOrderCnt[0] = (structure & 1) ? cur->top_poc : 0;
@@ -179,6 +198,7 @@ bool record(TestAllocator& alloc, const std::vector<uint8_t>& data, Stream* st) 
     dpb.finish_picture(slices[end - 1].header);
     first = end;
   }
+  st->inferred = gaps.inferred;
   return true;
 }
 
@@ -509,7 +529,7 @@ void sw_fuzz(TestAllocator& alloc, const std::vector<uint8_t>& data, const Strea
   printf("  CPU decoder on damaged access units: %d frames out\n", frames);
 }
 
-void test_stream(const char* name, bool damage) {
+void test_stream(const char* name, bool damage, bool gaps) {
   TestAllocator alloc;
   {
     const std::string file = std::string(name) + ".h264";
@@ -562,6 +582,23 @@ void test_stream(const char* name, bool damage) {
       } else {
         CHECK(r.pictures == plain.pictures);   // the same pictures whatever the index -> key mapping
       }
+    }
+    if (gaps) {
+      // The inferred frames named by NonExistingFrameFlags instead of by a second entry for the surface before them: the same pictures.
+      CHECK(st.inferred > 0);
+      Stream flagged;
+      CHECK(record(alloc, data, &flagged, true));
+      RunResult r = run(alloc, flagged, KeyMode::Plain, 3);
+      CHECK(r.pictures == plain.pictures);
+      int flags = 0;
+      for (const Call& c : flagged.calls) {
+        PicParamsH264 pp;
+        memcpy(&pp, c.params.data(), sizeof pp);
+        flags += pp.NonExistingFrameFlags != 0 ? 1 : 0;
+      }
+      CHECK(flags > 0);
+      printf("  %s: %llu frames inferred for gaps in frame_num; %d pictures name them in NonExistingFrameFlags, decoded the same\n", name,
+             static_cast<unsigned long long>(st.inferred), flags);
     }
     if (damage) {
       // Refusals before every picture leave the decoding unchanged.
@@ -634,6 +671,128 @@ void test_stream(const char* name, bool damage) {
   CHECK(alloc.live == 0);
 }
 
+// The decoding process for gaps in frame_num (8.2.5.2) on h264::Dpb alone, with values worked out from the standard: the inferred frames, their order counts with
+// pic_order_cnt_type 2 (8.2.1.3, FrameNumOffset carried through a gap that wraps MaxFrameNum - which the fixtures leave out because ffmpeg gets it wrong), the
+// sliding window over them, PrevRefFrameNum after a non-reference picture that follows a gap (7.4.3), and with pic_order_cnt_type 0 the lists of a B slice without
+// them and a P slice's with them (8.2.4.2.1, 8.2.4.2.3).
+struct GapRun {
+  h264::PictureInfo infos[h264::kMaxPictures];
+  h264::Dpb dpb;
+  h264::Sps sps;
+  int inferred = 0;
+  int last_previous_fn = -1;
+  GapRun(int poc_type, int refs) {
+    h264::PictureInfo* slots[h264::kMaxPictures];
+    for (int i = 0; i < h264::kMaxPictures; ++i) slots[i] = &infos[i];
+    dpb.attach(slots, h264::kMaxPictures);
+    dpb.set_decode_order(true);
+    sps.log2_max_frame_num = 4;
+    sps.poc_type = poc_type;
+    sps.log2_max_poc_lsb = 6;
+    sps.max_num_ref_frames = refs;
+    sps.dpb_frames = 16;
+    dpb.set_sps(&sps);
+  }
+  static bool hook(void* context, h264::PictureInfo* frame, const h264::PictureInfo* previous) {
+    GapRun& g = *static_cast<GapRun*>(context);
+    frame->has_memory = true;
+    ++g.inferred;
+    g.last_previous_fn = previous ? previous->frame_num : -1;
+    return true;
+  }
+  // One picture (its slice header); the order count it got.
+  int picture(int frame_num, bool ref, int type = h264::kSliceP, bool idr = false, int poc_lsb = 0) {
+    h264::SliceHeader sh;
+    sh.nal_unit_type = idr ? 5 : 1;
+    sh.nal_ref_idc = ref ? 1 : 0;
+    sh.type = type;
+    sh.frame_num = frame_num;
+    sh.poc_lsb = poc_lsb;
+    sh.num_ref_idx[0] = sh.num_ref_idx[1] = 4;
+    dpb.release_returned();
+    CHECK(dpb.fill_frame_num_gap(sh, &GapRun::hook, this));
+    h264::PictureInfo* p = dpb.begin_picture(sh, 0);
+    CHECK(p != nullptr);
+    if (!p) return -1;
+    p->has_memory = true;
+    if (type != h264::kSliceI) dpb.build_ref_lists(sh);
+    const int poc = dpb.pic_poc();
+    dpb.finish_picture(sh);
+    return poc;
+  }
+  // The references: frame_num of each, non-existing ones as -(frame_num + 100).
+  std::vector<int> refs() const {
+    std::vector<int> v;
+    for (const h264::PictureInfo& p : infos)
+      if (p.is_ref) v.push_back(p.non_existing ? -(p.frame_num + 100) : p.frame_num);
+    std::sort(v.begin(), v.end());
+    return v;
+  }
+  int poc_of(int frame_num) const {
+    for (const h264::PictureInfo& p : infos)
+      if (p.is_ref && p.frame_num == frame_num) return p.poc;
+    return -1;
+  }
+};
+
+void gap_process_unit() {
+  {
+    GapRun g(2, 3);
+    CHECK(g.picture(0, true, h264::kSliceI, true) == 0);
+    CHECK(g.picture(1, true) == 2);
+    // A gap of three (frame_num 2, 3, 4): all three inferred, the sliding window drops frames 0 and 1 for the last two.
+    CHECK(g.picture(5, true) == 10);
+    CHECK(g.inferred == 3 && g.last_previous_fn == 3);
+    CHECK((g.refs() == std::vector<int>{-104, -103, 5}));   // (frame 5's own marking dropped the inferred frame 2)
+    // A gap of eight (6..13): only the last three can be references afterwards; FrameNumOffset is unchanged (no wrap).
+    CHECK(g.picture(14, true) == 28);
+    CHECK(g.inferred == 6);
+    CHECK((g.refs() == std::vector<int>{-113, -112, 14}));
+    CHECK(g.poc_of(13) == 26 && g.poc_of(12) == 24);
+    // A gap that wraps MaxFrameNum (15, 0, 1): FrameNumOffset steps to 16 at the inferred frame 0 (8.2.1.3), so frame 2 has order count 2 * (16 + 2).
+    CHECK(g.picture(2, true) == 36);
+    CHECK(g.poc_of(0) == 32 && g.poc_of(1) == 34);   // (the inferred frame 15, order count 30, is gone again)
+    // A non-reference picture after a gap (3, 4, 5 inferred): PrevRefFrameNum is the last inferred frame's (5), so a reference picture with frame_num 6 has no gap.
+    CHECK(g.picture(6, false) == 2 * (16 + 6) - 1);
+    const int before = g.inferred;
+    CHECK(g.picture(6, true) == 2 * (16 + 6) && g.inferred == before);
+    // No gap without a reference picture before (a stream that starts at a non-IDR picture) and none at an IDR picture.
+    GapRun h(2, 2);
+    CHECK(h.picture(7, true, h264::kSliceI) >= 0 && h.inferred == 0);
+    CHECK(h.picture(0, true, h264::kSliceI, true) == 0 && h.inferred == 0);
+  }
+  {
+    // pic_order_cnt_type 0: no counts for the inferred frames, so a B slice's lists leave them out; a P slice's lists hold them (by FrameNumWrap).
+    GapRun g(0, 4);
+    CHECK(g.picture(0, true, h264::kSliceI, true, 0) == 0);
+    CHECK(g.picture(1, true, h264::kSliceP, false, 8) == 8);
+    CHECK(g.picture(3, true, h264::kSliceP, false, 16) == 16);   // frame 2 inferred
+    CHECK(g.inferred == 1 && (g.refs() == std::vector<int>{-102, 0, 1, 3}));
+    h264::SliceHeader sh;
+    sh.nal_unit_type = 1;
+    sh.nal_ref_idc = 0;
+    sh.frame_num = 4;
+    sh.num_ref_idx[0] = sh.num_ref_idx[1] = 3;
+    sh.type = h264::kSliceP;
+    sh.poc_lsb = 24;
+    g.dpb.release_returned();
+    CHECK(g.dpb.begin_picture(sh, 0) != nullptr);
+    g.dpb.build_ref_lists(sh);
+    CHECK(g.dpb.ref(0, 0)->frame_num == 3 && g.dpb.ref(0, 1)->non_existing && g.dpb.ref(0, 2)->frame_num == 1);
+    sh.type = h264::kSliceB;
+    sh.poc_lsb = 12;
+    g.dpb.set_current_poc(12, 12);
+    g.dpb.build_ref_lists(sh);
+    bool any = false;
+    for (int l = 0; l < 2; ++l)
+      for (int i = 0; i < g.dpb.ref_count(l); ++i) any = any || g.dpb.ref(l, i)->non_existing;
+    CHECK(!any);
+    CHECK(g.dpb.ref(0, 0)->frame_num == 1 && g.dpb.ref(1, 0)->frame_num == 3);   // before: POC 8, then 0; after: POC 16
+    g.dpb.abort_picture();
+  }
+  printf("  gaps in frame_num on the decoded picture buffer: order counts, sliding window, PrevRefFrameNum, list initialisation checked\n");
+}
+
 }  // namespace dxva_h264_test
 
 static void dxva_test_h264() {
@@ -641,13 +800,17 @@ static void dxva_test_h264() {
   struct Case {
     const char* name;
     bool damage;
+    bool gaps = false;   // has gaps in frame_num
   };
   const Case cases[] = {{"h264_bframes", true}, {"h264_cavlc", true}, {"h264_cqm", true}, {"h264_intra", false}, {"h264_ltr", true}, {"h264_noise", false},
                         {"h264_pcm_cabac", false}, {"h264_pcm_cavlc", false}, {"h264_dxva_poc2", true}, {"h264_dxva_poc1", true}, {"h264_dxva_pyramid", true},
                         // interlaced: MBAFF frames (x264), field pictures and mixed field/frame streams, MBAFF with constrained intra (JVT conformance cuts); monochrome
                         {"h264_mbaff_cabac", true}, {"h264_mbaff_cavlc", true}, {"h264_paff_mbaff_cabac", true}, {"h264_fields_cavlc", false},
-                        {"h264_picaff_cabac", false}, {"h264_fields_mmco", true}, {"h264_mbaff_ci", false}, {"h264_mono_cavlc", true}, {"h264_mono_cabac", false}};
-  for (const Case& c : cases) test_stream(c.name, c.damage);
+                        {"h264_picaff_cabac", false}, {"h264_fields_mmco", true}, {"h264_mbaff_ci", false}, {"h264_mono_cavlc", true}, {"h264_mono_cabac", false},
+                        // gaps in frame_num (8.2.5.2)
+                        {"h264_dxva_gaps", true, true}, {"h264_dxva_gaps_p", true, true}};
+  for (const Case& c : cases) test_stream(c.name, c.damage, c.gaps);
+  gap_process_unit();
   // The profile takes NV12 only.
   TestAllocator alloc;
   DxvaDecoderConfig config;

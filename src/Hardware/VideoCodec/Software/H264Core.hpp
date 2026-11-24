@@ -67,6 +67,7 @@ class Mem {
   T* data() const { return p_; }
   uint64_t size() const { return count_; }
   T& operator[](uint64_t i) const { return p_[i]; }
+  ArrayView<T> view() const { return ArrayView<T>(p_, count_); }
 
  private:
   void memset_zero() {
@@ -261,6 +262,10 @@ struct Picture : PictureInfo {
   Mem<uint8_t> y, u, v;
   Mem<MotionMb> motion;
   int stride = 0, cstride = 0;
+  // Decoding for a DXVA driver: a copy of the picture of surface `key` (the one with id `alias_of`), for a program that names that surface a second time with another
+  // frame number or long-term status (ffmpeg gives an inferred "non-existing" frame the surface of the reference before it). has_key stays false for a copy.
+  bool alias = false;
+  int alias_of = 0;
 };
 
 // The decoded picture buffer (8.2): picture order counts, reference marking and the reference lists of each slice, and the order pictures are output in. It
@@ -283,6 +288,20 @@ class Dpb {
   // `into` (decoding for a DXVA driver): the field goes into that slot, which holds the other field of its frame.
   PictureInfo* begin_picture(const SliceHeader& sh, int64_t pts, PictureInfo* into = nullptr);
   void abort_picture();
+  // 8.2.5.2: does the picture `sh` starts (its first slice) leave a gap in frame_num, a frame_num that is neither PrevRefFrameNum nor the one after it? (Never for an
+  // IDR picture, nor before the first reference picture of the sequence.)
+  bool has_frame_num_gap(const SliceHeader& sh) const;
+  // Called with each inferred "non-existing" frame once it has a slot: the owner gives the slot memory and sample values (any values: the standard leaves them open)
+  // and returns false if it cannot. `previous` is the short-term reference decoded (or inferred) last before the frame, null if there is none; it is the frame's own
+  // slot when the sliding window freed that one for it.
+  using NonExistingHook = bool (*)(void* context, PictureInfo* frame, const PictureInfo* previous);
+  // The decoding process for gaps in frame_num (8.2.5.2), before begin_picture() of the picture that has the gap: one "non-existing" frame for each missing value of
+  // frame_num, in order, each a short-term reference after the sliding window (8.2.5.3) made room for it, never output. Their order counts come from 8.2.1 when
+  // pic_order_cnt_type is 1 or 2 (which also carries FrameNumOffset on to the picture); with type 0 the standard derives none (the frames keep the previous
+  // picture's counts and stay out of B slices' lists, 8.2.4.2.3). PrevRefFrameNum becomes the last inferred frame_num (7.4.3). Only the frames that can still be
+  // references when the gap is over get slots (the sliding window of the later ones would drop the others again; the counters still step through them). False if
+  // no slot could be freed or the hook failed.
+  [[nodiscard]] bool fill_frame_num_gap(const SliceHeader& sh, NonExistingHook prepare, void* context);
   // Decoding for a DXVA driver: the order counts of the current picture are the program's (after begin_picture(); for a field only its own count is used).
   void set_current_poc(int top, int bottom);
   // Decoding for a DXVA driver: the next field pairs only with the frame begin_picture() is told to put it into, not with the field decoded before it.
@@ -316,6 +335,7 @@ class Dpb {
 
  private:
   PictureInfo* find_free_slot() const;
+  PictureInfo* claim_slot();
   PictureInfo* shorts_any_or_cur() const;
   void compute_poc(const SliceHeader& sh);
   void mark_references(const SliceHeader& sh);
@@ -350,6 +370,7 @@ class Dpb {
   int top_poc_ = 0, bottom_poc_ = 0, pic_poc_ = 0;
   int max_long_term_idx_ = -1;
   bool decode_order_ = false;
+  bool have_prev_ref_ = false;   // a reference picture was decoded since the sequence started (PrevRefFrameNum is defined)
 };
 
 // The macroblock-level state kept for the picture being decoded (neighbour contexts and the loop filter).
@@ -469,6 +490,9 @@ class Core {
   void finish_picture();
   bool allocate_pictures();
   bool alloc_picture(Picture* p);
+  static bool prepare_non_existing(void* context, PictureInfo* frame, const PictureInfo* previous);
+  [[nodiscard]] bool copy_picture(Picture* to, const Picture& from);
+  void make_grey(Picture* p);
   bool apply_external_references(const SliceHeader& sh);
   void compute_scaling();
   void build_vlc();

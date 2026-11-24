@@ -747,6 +747,48 @@ bool Core::alloc_picture(Picture* p) {
   return p->has_memory;
 }
 
+// A "non-existing" frame of a gap in frame_num gets memory and, as ffmpeg gives it, the samples of the short-term reference before it (mid-grey if there is none).
+// A stream that keeps to the standard never predicts from it; one that lost pictures is concealed with the last reference.
+bool Core::prepare_non_existing(void* context, PictureInfo* frame, const PictureInfo* previous) {
+  Core& core = *static_cast<Core*>(context);
+  Picture* p = static_cast<Picture*>(frame);   // every slot of the buffer is one of our pictures
+  p->alias = false;
+  p->has_key = false;
+  if (!core.alloc_picture(p)) return false;
+  const Picture* prev = static_cast<const Picture*>(previous);
+  if (prev && prev != p && prev->has_memory) return core.copy_picture(p, *prev);
+  if (prev != p) core.make_grey(p);
+  return true;
+}
+
+// The samples and motion of `from` (the same size: every picture has the sequence's size) into `to`. (Direct prediction reads a "non-existing" frame as intra
+// whatever its motion says.)
+bool Core::copy_picture(Picture* to, const Picture& from) {
+  if (!to->y.view().copy_from(from.y.view()) || !to->u.view().copy_from(from.u.view()) || !to->v.view().copy_from(from.v.view())) return false;
+  if (!to->motion.view().copy_from(from.motion.view())) return false;
+  to->keyframe = from.keyframe;
+  return true;
+}
+
+// Mid-grey samples and intra motion (no motion vectors for direct prediction), for a reference that holds no decoded picture.
+void Core::make_grey(Picture* p) {
+  p->y.view().fill(128);
+  p->u.view().fill(128);
+  p->v.view().fill(128);
+  for (uint64_t k = 0; k < p->motion.size(); ++k) {
+    MotionMb& m = p->motion[k];
+    for (int l = 0; l < 2; ++l)
+      for (int b = 0; b < 4; ++b) {
+        m.ref[l][b] = -1;
+        m.refid[l][b] = -1;
+      }
+    for (int l = 0; l < 2; ++l)
+      for (int b = 0; b < 16; ++b) m.mv[l][b][0] = m.mv[l][b][1] = 0;
+    m.intra = 1;
+    m.field = 0;
+  }
+}
+
 bool Core::start_picture(const SliceHeader& sh, int64_t pts) {
   const Pps& p = ps_.pps[sh.pps_id];
   const Sps& s = ps_.sps[p.sps_id];
@@ -769,6 +811,8 @@ bool Core::start_picture(const SliceHeader& sh, int64_t pts) {
     ext_no_memory_ = true;
     return false;
   }
+  // A gap in frame_num (8.2.5.2; the program does this itself when decoding for a DXVA driver).
+  if (!ext_ && !dpb_.fill_frame_num_gap(sh, &Core::prepare_non_existing, this)) return false;
   // Decoding for a DXVA driver, a field: the surface's frame (the picture the key held) is where the field goes. When it holds the other field only, the
   // field is decoded into it (the second field of a pair); otherwise into a new picture that takes the frame's other lines.
   Picture* surface = nullptr;
@@ -782,6 +826,7 @@ bool Core::start_picture(const SliceHeader& sh, int64_t pts) {
   PictureInfo* info = dpb_.begin_picture(sh, pts, into);
   if (!info) return false;
   Picture* pic = static_cast<Picture*>(info);  // every slot of the buffer is one of our pictures
+  pic->alias = false;
   const bool second = dpb_.second_field();
   if (!second && !alloc_picture(pic)) {
     dpb_.abort_picture();
@@ -859,8 +904,10 @@ void Core::finish_picture() {
 
 // Decoding for a DXVA driver: the slots hold the pictures of the program's surfaces, by key. Before a picture starts, exactly the pictures the program names are
 // references, with its frame numbers, order counts and the fields it says are used; a reference whose surface holds nothing gets a mid-grey stand-in (intra, so
-// direct prediction from it has no motion). Every other slot is free and forgets its key: a picture no longer referenced is never referenced again - except, for a
-// field picture, the frame of the output surface, which the field goes into.
+// direct prediction from it has no motion), and so does an entry NonExistingFrameFlags marks (a frame inferred for a gap in frame_num: its surface is not read). A
+// surface named a second time with another frame number or long-term status - ffmpeg names the surface of the reference before an inferred frame for it - is a
+// second reference: a copy of the picture, kept while both stay named. Every other slot is free and forgets its key: a picture no longer referenced is never
+// referenced again - except, for a field picture, the frame of the output surface, which the field goes into.
 bool Core::apply_external_references(const SliceHeader& sh) {
   const H264Decoder::ExternalPicture& ext = *ext_;
   bool named[kMaxPictures] = {};
@@ -875,36 +922,66 @@ bool Core::apply_external_references(const SliceHeader& sh) {
     kept[i] = named[i] || (sh.field_pic && p.key == ext.key);
     if (!kept[i]) p.has_key = false;
   }
+  // A copy stays while the picture it copies is kept under the same key.
+  for (int i = 0; i < kMaxPictures; ++i) {
+    Picture& p = pics_[i];
+    if (!p.alias) continue;
+    bool held = false;
+    for (int j = 0; j < kMaxPictures; ++j)
+      if (named[j] && pics_[j].has_key && pics_[j].key == p.key && pics_[j].id == p.alias_of) held = true;
+    if (held) named[i] = kept[i] = true;
+    else p.alias = false;
+  }
+  auto free_slot = [&]() -> Picture* {
+    for (int i = 0; i < kMaxPictures; ++i)
+      if (!kept[i] && !pics_[i].is_ref && pics_[i].has_memory) return &pics_[i];
+    for (int i = 0; i < kMaxPictures; ++i)
+      if (!kept[i] && !pics_[i].is_ref) return &pics_[i];
+    return nullptr;
+  };
   for (const H264Decoder::ExternalReference& r : ext.references) {
     const uint8_t fields = r.fields & 3;
     if (!fields) continue;
     Picture* found = nullptr;
-    for (int i = 0; i < kMaxPictures && !found; ++i)
-      if (named[i] && pics_[i].key == r.key && !r.non_existing) found = &pics_[i];
-    if (found && found->is_ref) continue;   // named twice: the first entry stands
-    if (!found) {
-      if (!r.non_existing) ext_missing_ = true;
-      for (int i = 0; i < kMaxPictures && !found; ++i)
-        if (!kept[i] && !pics_[i].is_ref && pics_[i].has_memory) found = &pics_[i];
-      for (int i = 0; i < kMaxPictures && !found; ++i)
-        if (!kept[i] && !pics_[i].is_ref) found = &pics_[i];
-      if (!found || !alloc_picture(found)) return false;
-      for (uint64_t k = 0; k < found->y.size(); ++k) found->y[k] = 128;
-      for (uint64_t k = 0; k < found->u.size(); ++k) found->u[k] = found->v[k] = 128;
-      for (uint64_t k = 0; k < found->motion.size(); ++k) {
-        MotionMb& m = found->motion[k];
-        for (int l = 0; l < 2; ++l)
-          for (int b = 0; b < 4; ++b) {
-            m.ref[l][b] = -1;
-            m.refid[l][b] = -1;
-          }
-        for (int l = 0; l < 2; ++l)
-          for (int b = 0; b < 16; ++b) m.mv[l][b][0] = m.mv[l][b][1] = 0;
-        m.intra = 1;
-        m.field = 0;
+    Picture* held = nullptr;
+    for (int i = 0; i < kMaxPictures && !held; ++i)
+      if (named[i] && pics_[i].has_key && pics_[i].key == r.key && !r.non_existing) held = &pics_[i];
+    if (held && !held->is_ref) {
+      found = held;
+    } else if (held) {
+      // The surface is named again. With the same frame number and status as an earlier entry it is the same reference (the first entry stands).
+      bool same = false;
+      for (const Picture& q : pics_)
+        if (q.is_ref && (&q == held || (q.alias && q.key == r.key && q.alias_of == held->id)) && q.is_long == r.long_term &&
+            (r.long_term ? q.long_term_idx : q.frame_num) == r.frame_num)
+          same = true;
+      if (same) continue;
+      for (int i = 0; i < kMaxPictures && !found; ++i) {
+        Picture& q = pics_[i];
+        if (named[i] && q.alias && !q.is_ref && q.key == r.key && q.alias_of == held->id) found = &q;
       }
+      if (!found) {
+        found = free_slot();
+        if (!found || !alloc_picture(found) || !copy_picture(found, *held)) return false;
+        found->id = dpb_.new_id();
+        found->has_key = false;
+        found->alias = true;
+        found->alias_of = held->id;
+        found->key = r.key;
+        found->non_existing = false;
+        found->decoded = held->decoded;
+        found->field_coded = held->field_coded;
+        found->mbaff = held->mbaff;
+        named[found->slot] = kept[found->slot] = true;
+      }
+    } else {
+      if (!r.non_existing) ext_missing_ = true;
+      found = free_slot();
+      if (!found || !alloc_picture(found)) return false;
+      make_grey(found);
       found->id = dpb_.new_id();
       found->has_key = false;
+      found->alias = false;
       found->non_existing = r.non_existing;
       found->keyframe = false;
       found->decoded = 3;
