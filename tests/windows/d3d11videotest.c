@@ -251,7 +251,9 @@ static void test_planar_rules(void) {
   check(hr == S_OK && (fs.OutFormatSupport & D3D11_FORMAT_SUPPORT_DECODER_OUTPUT), "CheckFeatureSupport(FORMAT_SUPPORT, P010)");
   D3D11_FEATURE_DATA_FORMAT_SUPPORT2 fs2 = {DXGI_FORMAT_NV12, 0xFFFFFFFFu};
   hr = ID3D11Device_CheckFeatureSupport(g_device, D3D11_FEATURE_FORMAT_SUPPORT2, &fs2, sizeof fs2);
-  check(hr == S_OK && fs2.OutFormatSupport2 == 0, "CheckFeatureSupport(FORMAT_SUPPORT2, NV12): none of the second set");
+  /* (the planes take typed unordered access views - written back through mirrors - and nothing else of the second set: no atomics, not tiled - video formats never are) */
+  check(hr == S_OK && fs2.OutFormatSupport2 == (D3D11_FORMAT_SUPPORT2_UAV_TYPED_LOAD | D3D11_FORMAT_SUPPORT2_UAV_TYPED_STORE),
+        "CheckFeatureSupport(FORMAT_SUPPORT2, NV12): typed loads and stores of its planes, nothing else of the second set");
   D3D11_FEATURE_DATA_D3D11_OPTIONS4 o4 = {TRUE};
   hr = ID3D11Device_CheckFeatureSupport(g_device, D3D11_FEATURE_D3D11_OPTIONS4, &o4, sizeof o4);
   check(hr == S_OK && o4.ExtendedNV12SharedTextureSupported, "D3D11_OPTIONS4: NV12 textures are shared");
