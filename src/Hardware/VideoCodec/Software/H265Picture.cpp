@@ -69,17 +69,7 @@ Picture* Core::generate_missing(int poc, bool long_term) {
   Picture* p = find_free_picture();
   if (!p) return nullptr;
   if (!alloc_picture(p)) return nullptr;
-  for (int c = 0; c < 3; ++c) {
-    if (!p->deep) {
-      for (uint64_t i = 0; i < p->plane[c].size(); ++i) p->plane[c][i] = 128;
-      continue;
-    }
-    const uint32_t grey = 1u << ((c ? p->depth_chroma : p->depth_luma) - 1);
-    for (uint64_t i = 0; i + 1 < p->plane[c].size(); i += 2) {
-      p->plane[c][i] = static_cast<uint8_t>(grey);
-      p->plane[c][i + 1] = static_cast<uint8_t>(grey >> 8);
-    }
-  }
+  fill_grey(p);
   for (uint64_t i = 0; i < p->col.size(); ++i) p->col[i].pred_flags = 0;
   p->poc = poc;
   p->in_use = true;
@@ -220,8 +210,6 @@ bool Core::start_picture(const SliceHeader& sh, int64_t pts) {
   if (first_picture_ && !irap) return H265_FALSE;      // decoding starts at a random access point
   if (is_rasl(sh.nal_type) && skip_rasl_) return H265_FALSE;   // its references are not there: it is not decoded or shown
   if (!irap && no_rasl_output_ && after_eos_) return H265_FALSE;
-  // The pixel paths here are eight-bit ones: a picture with deeper samples that nothing offloads cannot be decoded, and is dropped before it takes a place in the buffer.
-  if ((sps.bit_depth_luma > 8 || sps.bit_depth_chroma > 8) && !(offload_ && offload_->accepts(sps, pps))) return H265_FALSE;
 
   const bool new_cvs = irap && no_rasl_output_;
   const bool size_change = sp_ && (sp_->width != sps.width || sp_->height != sps.height || sp_->log2_ctb != sps.log2_ctb);
@@ -367,8 +355,13 @@ bool Core::setup_picture_state() {
       !ts_to_rs_.alloc(allocator_, nctb) || !tile_id_ts_.alloc(allocator_, nctb) || !col_bd_.alloc(allocator_, 25) || !row_bd_.alloc(allocator_, 25) ||
       !ctb_slice_.alloc(allocator_, nctb) || !sao_.alloc(allocator_, nctb))
     return false;
+  bd_y_ = s.bit_depth_luma;
+  bd_c_ = s.bit_depth_chroma;
+  qp_bd_y_ = 6 * (bd_y_ - 8);
+  qp_bd_c_ = 6 * (bd_c_ - 8);
+  const uint64_t sample_bytes = s.bit_depth_luma > 8 || s.bit_depth_chroma > 8 ? 2 : 1;   // (as alloc_picture lays the planes out)
   for (int c = 0; c < 3; ++c)
-    if (!sao_plane_[c].alloc(allocator_, static_cast<uint64_t>(c == 0 ? s.width : s.width / 2) * (c == 0 ? s.height : s.height / 2))) return false;
+    if (!sao_plane_[c].alloc(allocator_, static_cast<uint64_t>(c == 0 ? s.width : s.width / 2) * (c == 0 ? s.height : s.height / 2) * sample_bytes)) return false;
   for (uint64_t i = 0; i < nctb; ++i) ctb_slice_[i] = -1;
   slices_.clear();
   slice_idx_ = -1;
@@ -432,9 +425,7 @@ void Core::run_offload(Picture* p) {
     o.plane[c] = ByteView(p->plane[c].data(), p->plane[c].size());
     o.stride[c] = p->stride[c];
   }
-  if (!offload_->decode_picture(o))
-    for (int c = 0; c < 3; ++c)
-      for (uint64_t i = 0; i < p->plane[c].size(); ++i) p->plane[c][i] = 128;
+  if (!offload_->decode_picture(o)) fill_grey(p);
 }
 
 // Called when the last slice of the picture has been decoded.
@@ -546,12 +537,12 @@ bool Core::receive(VideoFrame* frame) {
   const int w = best->width - best->crop_l - best->crop_r, h = best->height - best->crop_t - best->crop_b;
   const int cw = w / 2, ch = h / 2;
   if (best->deep) {
-    // Cropped P010: every sample scaled to ten bits and held in the top of its word.
+    // Cropped P010: every sample held in the top bits of its word (a 10-bit one shifted up by 6; one of fewer bits scaled up to them).
     const uint64_t luma_bytes = static_cast<uint64_t>(w) * h * 2, total = luma_bytes + static_cast<uint64_t>(cw) * ch * 4;
     if (!out_frame_.alloc(allocator_, total)) return false;
     uint8_t* dst = out_frame_.data();
     auto put = [&dst](uint32_t value, int depth) {
-      const uint32_t word = (depth >= 10 ? value : value << (10 - depth)) << 6;
+      const uint32_t word = (value << (16 - depth)) & 0xFFFFu;
       *dst++ = static_cast<uint8_t>(word);
       *dst++ = static_cast<uint8_t>(word >> 8);
     };
@@ -618,8 +609,7 @@ void Core::external_prepare(const Sps& sps, const Pps& pps) {
 
 bool Core::external_grey(Picture* p, int poc) {
   if (!external_ || !p || !alloc_picture(p)) return false;
-  for (int c = 0; c < 3; ++c)
-    for (uint64_t i = 0; i < p->plane[c].size(); ++i) p->plane[c][i] = 128;
+  fill_grey(p);
   for (uint64_t i = 0; i < p->col.size(); ++i) p->col[i].pred_flags = 0;
   p->poc = poc;
   p->generated = true;

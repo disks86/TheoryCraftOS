@@ -18,7 +18,7 @@
 
 /* Direct3D 11's video (d3d11.dll's video.inc over d3d12.dll's video): NV12 / P010 textures (the rules they are made by, Map, UpdateSubresource and the copies byte for
  * byte, views of their planes sampled and drawn into), the decoder's profiles, formats and configurations, H.264 and MPEG-2 streams decoded through ID3D11VideoContext
- * (the DXVA buffers filled as ffmpeg does: dxva_streams.h) and compared with ffmpeg's decode (d3d11video_data.h), the video processor (formats, scaling, rotation,
+ * (the DXVA buffers filled as ffmpeg does: dxva_streams.h; also VC-1 and MPEG-4 Part 2) and compared with ffmpeg's decode (d3d11video_data.h), the video processor (formats, scaling, rotation,
  * mirroring, the background, alpha, the target rectangle, what it refuses), and the content protection there is not. Ends with exit code 42 when every check passed.
  *   tests/emulated_dx.sh tests/windows/d3d11videotest.c */
 #define COBJMACROS
@@ -34,7 +34,9 @@
 #include <dxgi1_3.h>
 #include "dxfixtures.h"
 #include "dxva_streams.h"
+#include "hevc10_dxva.h"
 #include "d3d11video_data.h"
+#include "av1_dxva_data.h"
 
 /* (what mingw's d3d11_4.h does not have: the Windows SDK's) */
 DEFINE_GUID(IID_ID3D11VideoDevice2_, 0x59c0cb01, 0x35f0, 0x4a70, 0x8f, 0x67, 0x87, 0x90, 0x5c, 0x90, 0x6a, 0x53);
@@ -198,7 +200,9 @@ static void test_planar_rules(void) {
       {64, 32, 1, 1, 1, DXGI_FORMAT_NV12, D3D11_USAGE_DEFAULT, D3D11_BIND_VIDEO_ENCODER, 0, 0, E_INVALIDARG, "a video encoder's input (there is no encoder)"},
       {64, 32, 1, 2, 1, DXGI_FORMAT_NV12, D3D11_USAGE_STAGING, 0, D3D11_CPU_ACCESS_READ, 0, E_INVALIDARG, "a staging NV12 array"},
       {64, 32, 1, 1, 1, DXGI_FORMAT_NV12, D3D11_USAGE_DEFAULT, D3D11_BIND_SHADER_RESOURCE, 0, D3D11_RESOURCE_MISC_SHARED, E_INVALIDARG, "a shared NV12 texture"},
-      {64, 32, 1, 1, 1, DXGI_FORMAT_P016, D3D11_USAGE_DEFAULT, D3D11_BIND_DECODER, 0, 0, E_INVALIDARG, "a P016 texture for a decoder (none puts it out)"},
+      {64, 32, 1, 1, 1, DXGI_FORMAT_P016, D3D11_USAGE_DEFAULT, D3D11_BIND_DECODER, 0, 0, S_OK, "a P016 texture for a decoder (AV1's 12-bit 4:2:0)"},
+      {64, 32, 1, 4, 1, DXGI_FORMAT_Y216, D3D11_USAGE_DEFAULT, D3D11_BIND_DECODER, 0, 0, S_OK, "a Y216 array for a decoder (AV1's 12-bit 4:2:2)"},
+      {63, 32, 1, 1, 1, DXGI_FORMAT_Y210, D3D11_USAGE_DEFAULT, D3D11_BIND_DECODER, 0, 0, E_INVALIDARG, "a Y210 texture of odd width"},
       {64, 32, 1, 1, 1, DXGI_FORMAT_B8G8R8A8_UNORM, D3D11_USAGE_DEFAULT, D3D11_BIND_DECODER, 0, 0, E_INVALIDARG, "a BGRA texture for a decoder"},
   };
   for (size_t i = 0; i < sizeof cases / sizeof cases[0]; ++i) {
@@ -221,7 +225,7 @@ static void test_planar_rules(void) {
   checkf(hr == S_OK && (support & want) == want && !(support & (D3D11_FORMAT_SUPPORT_MIP | D3D11_FORMAT_SUPPORT_MULTISAMPLE_RENDERTARGET | D3D11_FORMAT_SUPPORT_VIDEO_ENCODER)),
          "CheckFormatSupport(NV12): %#x", support);
   hr = ID3D11Device_CheckFormatSupport(g_device, DXGI_FORMAT_P016, &support);
-  check(hr == S_OK && (support & D3D11_FORMAT_SUPPORT_TEXTURE2D) && !(support & D3D11_FORMAT_SUPPORT_DECODER_OUTPUT), "CheckFormatSupport(P016): a texture, not a decoder's output");
+  check(hr == S_OK && (support & D3D11_FORMAT_SUPPORT_TEXTURE2D) && (support & D3D11_FORMAT_SUPPORT_DECODER_OUTPUT), "CheckFormatSupport(P016): a texture, a decoder's output (AV1's 12-bit 4:2:0)");
   hr = ID3D11Device_CheckFormatSupport(g_device, DXGI_FORMAT_B8G8R8A8_UNORM, &support);
   check(hr == S_OK && (support & D3D11_FORMAT_SUPPORT_VIDEO_PROCESSOR_OUTPUT) && (support & D3D11_FORMAT_SUPPORT_VIDEO_PROCESSOR_INPUT), "CheckFormatSupport(BGRA8): the video processor's");
   D3D11_FEATURE_DATA_FORMAT_SUPPORT fs = {DXGI_FORMAT_P010, 0};
@@ -492,7 +496,7 @@ static void test_planar_views(void) {
 
 static void test_decoder_caps(void) {
   const UINT count = ID3D11VideoDevice_GetVideoDecoderProfileCount(g_vdevice);
-  int h264 = 0, mpeg2 = 0, hevc = 0, vp9 = 0, av1 = 0;
+  int h264 = 0, mpeg2 = 0, hevc = 0, vp9 = 0, av1 = 0, vc1 = 0, mpeg4 = 0, av1_more = 0, hevc10 = 0;
   for (UINT i = 0; i < count; ++i) {
     GUID g;
     if (FAILED(ID3D11VideoDevice_GetVideoDecoderProfile(g_vdevice, i, &g))) continue;
@@ -501,8 +505,31 @@ static void test_decoder_caps(void) {
     hevc |= IsEqualGUID(&g, &D3D11_DECODER_PROFILE_HEVC_VLD_MAIN);
     vp9 |= IsEqualGUID(&g, &D3D11_DECODER_PROFILE_VP9_VLD_PROFILE0);
     av1 |= IsEqualGUID(&g, &DXVA_ModeAV1_VLD_Profile0);
+    hevc10 |= IsEqualGUID(&g, &D3D11_DECODER_PROFILE_HEVC_VLD_MAIN10);
+    vc1 += IsEqualGUID(&g, &D3D11_DECODER_PROFILE_VC1_VLD) + IsEqualGUID(&g, &D3D11_DECODER_PROFILE_VC1_D2010);
+    mpeg4 += IsEqualGUID(&g, &D3D11_DECODER_PROFILE_MPEG4PT2_VLD_SIMPLE) + IsEqualGUID(&g, &D3D11_DECODER_PROFILE_MPEG4PT2_VLD_ADVSIMPLE_NOGMC) +
+             IsEqualGUID(&g, &D3D11_DECODER_PROFILE_MPEG4PT2_VLD_ADVSIMPLE_GMC);
+    av1_more += IsEqualGUID(&g, &DXVA_ModeAV1_VLD_Profile1) + IsEqualGUID(&g, &DXVA_ModeAV1_VLD_Profile2) + IsEqualGUID(&g, &DXVA_ModeAV1_VLD_12bit_Profile2) +
+                IsEqualGUID(&g, &DXVA_ModeAV1_VLD_12bit_Profile2_420);
   }
-  checkf(count == 7 && h264 && mpeg2 && hevc && vp9 && av1, "GetVideoDecoderProfileCount %u: H.264, MPEG-2, MPEG-1/2, VP9 (two), HEVC, AV1", count);
+  checkf(count == 17 && h264 && mpeg2 && hevc && hevc10 && vp9 && av1 && vc1 == 2 && mpeg4 == 3 && av1_more == 4,
+         "GetVideoDecoderProfileCount %u: H.264, MPEG-2, MPEG-1/2, VP9 (two), HEVC Main and Main 10, AV1 (five), VC-1 (two), MPEG-4 Part 2 (three)", count);
+  {
+    BOOL f1 = FALSE, f2 = TRUE, f3 = FALSE, f4 = FALSE;
+    check(SUCCEEDED(ID3D11VideoDevice_CheckVideoDecoderFormat(g_vdevice, &DXVA_ModeAV1_VLD_Profile1, DXGI_FORMAT_Y410, &f1)) && f1 &&
+              SUCCEEDED(ID3D11VideoDevice_CheckVideoDecoderFormat(g_vdevice, &DXVA_ModeAV1_VLD_Profile1, DXGI_FORMAT_NV12, &f2)) && !f2 &&
+              SUCCEEDED(ID3D11VideoDevice_CheckVideoDecoderFormat(g_vdevice, &DXVA_ModeAV1_VLD_12bit_Profile2, DXGI_FORMAT_Y216, &f3)) && f3 &&
+              SUCCEEDED(ID3D11VideoDevice_CheckVideoDecoderFormat(g_vdevice, &DXVA_ModeAV1_VLD_12bit_Profile2_420, DXGI_FORMAT_P016, &f4)) && f4,
+          "AV1 profile 1 decodes into Y410 (not NV12), 12-bit profile 2 into Y216, 12-bit profile 2 4:2:0 into P016");
+    ID3D11VideoDevice1 *vd1 = NULL;
+    if (SUCCEEDED(ID3D11VideoDevice_QueryInterface(g_vdevice, &IID_ID3D11VideoDevice1, (void **)&vd1))) {
+      UINT caps = 1;
+      const DXGI_RATIONAL rate = {30, 1};
+      check(SUCCEEDED(ID3D11VideoDevice1_GetVideoDecoderCaps(vd1, &DXVA_ModeAV1_VLD_Profile2, 1920, 1080, &rate, 0, NULL, &caps)) && caps == 0,
+            "GetVideoDecoderCaps of AV1 profile 2: decoded (into YUY2 / Y210 / NV12 / P010)");
+      ID3D11VideoDevice1_Release(vd1);
+    }
+  }
   GUID g;
   check(ID3D11VideoDevice_GetVideoDecoderProfile(g_vdevice, count, &g) == E_INVALIDARG, "GetVideoDecoderProfile past the last: E_INVALIDARG");
   BOOL ok = FALSE;
@@ -523,6 +550,15 @@ static void test_decoder_caps(void) {
   check(ID3D11VideoDevice_GetVideoDecoderConfig(g_vdevice, &desc, 1, &c) == E_INVALIDARG, "GetVideoDecoderConfig past the last: E_INVALIDARG");
   D3D11_VIDEO_DECODER_DESC hevc_desc = {D3D11_DECODER_PROFILE_HEVC_VLD_MAIN, 64, 64, DXGI_FORMAT_NV12};
   check(SUCCEEDED(ID3D11VideoDevice_GetVideoDecoderConfig(g_vdevice, &hevc_desc, 0, &c)) && c.ConfigBitstreamRaw == 1, "the HEVC configuration: ConfigBitstreamRaw 1 (what ffmpeg takes)");
+  D3D11_VIDEO_DECODER_DESC vc1_desc = {D3D11_DECODER_PROFILE_VC1_D2010, 720, 576, DXGI_FORMAT_NV12};
+  check(SUCCEEDED(ID3D11VideoDevice_GetVideoDecoderConfigCount(g_vdevice, &vc1_desc, &configs)) && configs == 1 &&
+            SUCCEEDED(ID3D11VideoDevice_GetVideoDecoderConfig(g_vdevice, &vc1_desc, 0, &c)) && c.ConfigBitstreamRaw == 1,
+        "the VC-1 configuration: one, ConfigBitstreamRaw 1 (what ffmpeg's dxva2_vc1.c takes)");
+  D3D11_VIDEO_DECODER_DESC mpeg4_desc = {D3D11_DECODER_PROFILE_MPEG4PT2_VLD_ADVSIMPLE_GMC, 352, 288, DXGI_FORMAT_NV12};
+  check(SUCCEEDED(ID3D11VideoDevice_GetVideoDecoderConfigCount(g_vdevice, &mpeg4_desc, &configs)) && configs == 1 &&
+            SUCCEEDED(ID3D11VideoDevice_GetVideoDecoderConfig(g_vdevice, &mpeg4_desc, 0, &c)) && c.ConfigBitstreamRaw == 1,
+        "the MPEG-4 Part 2 (GMC) configuration: one, ConfigBitstreamRaw 1");
+  check(SUCCEEDED(ID3D11VideoDevice_CheckVideoDecoderFormat(g_vdevice, &D3D11_DECODER_PROFILE_VC1_VLD, DXGI_FORMAT_P010, &ok)) && !ok, "VC-1 does not decode into P010");
   D3D11_VIDEO_DECODER_DESC p010 = {D3D11_DECODER_PROFILE_H264_VLD_NOFGT, 64, 64, DXGI_FORMAT_P010};
   check(SUCCEEDED(ID3D11VideoDevice_GetVideoDecoderConfigCount(g_vdevice, &p010, &configs)) && configs == 0, "... no configuration of H.264 into P010");
   /* decoders */
@@ -790,10 +826,16 @@ static void decode_stream(const char *name, int codec, const GUID *profile, cons
   const UINT frame_bytes = vw * vh + 2 * cw * ch;
   Decoded *decoded = calloc(256, sizeof *decoded);
   BYTE *nv12 = malloc((size_t)s.width * s.height * 3 / 2);
-  UINT n = 0, failed = 0, last_feedback = 0;
+  UINT n = 0, failed = 0, last_feedback = 0, last_surface = 0;
   int r = 1;
   while (SUCCEEDED(hr) && dec && out && r == 1 && n < 256) {
     if (codec == DXVA_CODEC_H264) last_feedback = ((const DXVA_PicParams_H264 *)p.picture_parameters)->StatusReportFeedbackNumber;
+    if (codec == DXVA_CODEC_VC1) {
+      const DXVA_PictureParameters *pp = p.picture_parameters;
+      last_feedback = (UINT)pp->bPicScanFixed << 8 | pp->bPicScanMethod;      /* (VC-1's feedback number) */
+    }
+    if (codec == DXVA_CODEC_MPEG4) last_feedback = ((const DxvaPicParamsMpeg4 *)p.picture_parameters)->StatusReportFeedbackNumber;
+    last_surface = p.surface;
     const UINT slice_bytes = codec == DXVA_CODEC_H264 ? sizeof(DXVA_Slice_H264_Short) : sizeof(DXVA_SliceInfo);
     const UINT location = codec == DXVA_CODEC_H264 ? offsetof(DXVA_Slice_H264_Short, BSNALunitDataLocation) : offsetof(DXVA_SliceInfo, dwSliceDataLocation);
     if (!decode_picture(dec, views[p.surface], &p, slice_bytes, location, split) || !read_planar(out, p.surface, nv12)) { ++failed; break; }
@@ -857,6 +899,24 @@ static void decode_stream(const char *name, int codec, const GUID *profile, cons
                st[0].bDXVA_Func == DXVA_PICTURE_DECODING_FUNCTION && st[0].bBufType == 0xFF,
            "%s: the status reports, the newest first: feedback %u and %u, status %u", name, st[0].StatusReportFeedbackNumber, st[1].StatusReportFeedbackNumber, st[0].bStatus);
   }
+  if (dec && (codec == DXVA_CODEC_VC1 || codec == DXVA_CODEC_MPEG4)) {
+    /* (DXVA_Status_VC1 of the Windows SDK; MPEG-4 Part 2 reports in the same form) */
+#pragma pack(push, 1)
+    typedef struct { USHORT StatusReportFeedbackNumber; WORD wDecodedPictureIndex, wDeblockedPictureIndex; UCHAR bPicStructure, bBufType, bStatus, bReserved8Bits; USHORT wNumMbsAffected; } StatusVc1;
+#pragma pack(pop)
+    StatusVc1 st[2];
+    memset(st, 0xCC, sizeof st);
+    D3D11_VIDEO_DECODER_EXTENSION ext;
+    memset(&ext, 0, sizeof ext);
+    ext.Function = DXVA_STATUS_REPORTING_FUNCTION;
+    ext.pPrivateOutputData = st;
+    ext.PrivateOutputDataSize = sizeof st;
+    hr = ID3D11VideoContext_DecoderExtension(g_vcontext, dec, &ext);
+    checkf(hr == S_OK && st[0].StatusReportFeedbackNumber == last_feedback && st[1].StatusReportFeedbackNumber == last_feedback - 1 && st[0].bStatus == 0 &&
+               st[0].wDecodedPictureIndex == last_surface && st[0].bPicStructure == 3 && st[0].bBufType == 0xFF && st[0].wNumMbsAffected == 0,
+           "%s: the status reports (DXVA_Status_VC1), the newest first: feedback %u and %u, picture %u, status %u", name, st[0].StatusReportFeedbackNumber,
+           st[1].StatusReportFeedbackNumber, st[0].wDecodedPictureIndex, st[0].bStatus);
+  }
   for (UINT i = 0; i < n; ++i) free(decoded[i].frame);
   free(decoded);
   free(nv12);
@@ -865,6 +925,266 @@ static void decode_stream(const char *name, int codec, const GUID *profile, cons
   if (dec) ID3D11VideoDecoder_Release(dec);
   dxva_stream_close(&s);
   free(data);
+}
+
+/* ---- packed YUV textures (AYUV, Y410, Y416, YUY2, Y210, Y216) -------------------------------------------------------------------------------------------------------- */
+
+/* A slice of a packed YUV texture as the CPU sees it (`row` bytes a row), by way of a staging texture of one slice. */
+static int read_packed(ID3D11Texture2D *t, UINT slice, UINT row, BYTE *out) {
+  D3D11_TEXTURE2D_DESC desc;
+  ID3D11Texture2D_GetDesc(t, &desc);
+  ID3D11Texture2D *staging = texture(desc.Width, desc.Height, 1, desc.Format, D3D11_USAGE_STAGING, 0, D3D11_CPU_ACCESS_READ, NULL, NULL);
+  if (!staging) return 0;
+  ID3D11DeviceContext_CopySubresourceRegion(g_context, (ID3D11Resource *)staging, 0, 0, 0, 0, (ID3D11Resource *)t, slice, NULL);
+  D3D11_MAPPED_SUBRESOURCE m;
+  int ok = SUCCEEDED(ID3D11DeviceContext_Map(g_context, (ID3D11Resource *)staging, 0, D3D11_MAP_READ, 0, &m)) && m.pData && m.RowPitch >= row;
+  if (ok) {
+    for (UINT y = 0; y < desc.Height; ++y) memcpy(out + (size_t)y * row, (BYTE *)m.pData + (size_t)y * m.RowPitch, row);
+    ID3D11DeviceContext_Unmap(g_context, (ID3D11Resource *)staging, 0);
+  }
+  ID3D11Texture2D_Release(staging);
+  return ok;
+}
+
+static void test_packed_yuv(void) {
+  static const struct { DXGI_FORMAT f; const char *name; UINT bpp; DXGI_FORMAT view; int target; } formats[] = {
+      {DXGI_FORMAT_AYUV, "AYUV", 4, DXGI_FORMAT_R8G8B8A8_UNORM, 1}, {DXGI_FORMAT_Y410, "Y410", 4, DXGI_FORMAT_R10G10B10A2_UNORM, 0},
+      {DXGI_FORMAT_Y416, "Y416", 8, DXGI_FORMAT_R16G16B16A16_UNORM, 0}, {DXGI_FORMAT_YUY2, "YUY2", 2, DXGI_FORMAT_R8G8B8A8_UNORM, 0},
+      {DXGI_FORMAT_Y210, "Y210", 4, DXGI_FORMAT_R16G16B16A16_UNORM, 0}, {DXGI_FORMAT_Y216, "Y216", 4, DXGI_FORMAT_R16G16B16A16_UNORM, 0}};
+  const UINT w = 16, h = 8;
+  for (UINT i = 0; i < sizeof formats / sizeof formats[0]; ++i) {
+    const DXGI_FORMAT f = formats[i].f;
+    const char *name = formats[i].name;
+    UINT support = 0;
+    HRESULT hr = ID3D11Device_CheckFormatSupport(g_device, f, &support);
+    checkf(hr == S_OK && (support & D3D11_FORMAT_SUPPORT_TEXTURE2D) && (support & D3D11_FORMAT_SUPPORT_SHADER_SAMPLE) && (support & D3D11_FORMAT_SUPPORT_DECODER_OUTPUT) &&
+               (support & D3D11_FORMAT_SUPPORT_VIDEO_PROCESSOR_INPUT) && !!(support & D3D11_FORMAT_SUPPORT_RENDER_TARGET) == formats[i].target &&
+               !!(support & D3D11_FORMAT_SUPPORT_VIDEO_PROCESSOR_OUTPUT) == formats[i].target && !(support & D3D11_FORMAT_SUPPORT_MIP),
+           "CheckFormatSupport(%s): a 2D texture, sampled, a decoder's output, the processor's input%s", name, formats[i].target ? " and output, a render target" : "");
+    /* made with its contents, read back byte for byte */
+    BYTE rows[16 * 8 * 8], back[16 * 8 * 8];
+    const UINT row = w * formats[i].bpp;
+    for (UINT k = 0; k < row * h; ++k) rows[k] = (BYTE)(k * 37 + i * 5 + 1);
+    const D3D11_SUBRESOURCE_DATA initial = {rows, row, 0};
+    ID3D11Texture2D *t = texture(w, h, 1, f, D3D11_USAGE_DEFAULT, D3D11_BIND_SHADER_RESOURCE | (formats[i].target ? D3D11_BIND_RENDER_TARGET : 0), 0, &initial, &hr);
+    checkf(t && SUCCEEDED(hr) && read_packed(t, 0, row, back) && !memcmp(rows, back, row * h), "%s: a texture made with its pixels, read back byte for byte", name);
+    if (!t) continue;
+    /* UpdateSubresource of a box (on whole pairs for the 4:2:2 ones) */
+    const D3D11_BOX box = {4, 2, 0, 8, 4, 1};
+    BYTE patch[4 * 8 * 2];
+    memset(patch, 0x5A, sizeof patch);
+    ID3D11DeviceContext_UpdateSubresource(g_context, (ID3D11Resource *)t, 0, &box, patch, 4 * formats[i].bpp, 0);
+    int ok = read_packed(t, 0, row, back);
+    ok = ok && back[2 * row + 4 * formats[i].bpp] == 0x5A && back[3 * row + 8 * formats[i].bpp - 1] == 0x5A && back[2 * row + 4 * formats[i].bpp - 1] == rows[2 * row + 4 * formats[i].bpp - 1] &&
+         back[4 * row + 4 * formats[i].bpp] == rows[4 * row + 4 * formats[i].bpp];
+    checkf(ok, "%s: UpdateSubresource of a box writes that box alone", name);
+    /* the views: of the pixels' format alone */
+    ID3D11ShaderResourceView *srv = NULL, *bad = NULL;
+    D3D11_SHADER_RESOURCE_VIEW_DESC sd;
+    memset(&sd, 0, sizeof sd);
+    sd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+    sd.Texture2D.MipLevels = 1;
+    check(ID3D11Device_CreateShaderResourceView(g_device, (ID3D11Resource *)t, NULL, &bad) == E_INVALIDARG, "a shader resource view of a packed YUV texture without a description: E_INVALIDARG");
+    sd.Format = f;
+    check(ID3D11Device_CreateShaderResourceView(g_device, (ID3D11Resource *)t, &sd, &bad) == E_INVALIDARG, "... of the YUV format itself: E_INVALIDARG");
+    sd.Format = DXGI_FORMAT_R32_FLOAT;
+    check(ID3D11Device_CreateShaderResourceView(g_device, (ID3D11Resource *)t, &sd, &bad) == E_INVALIDARG, "... of another format: E_INVALIDARG");
+    sd.Format = formats[i].view;
+    hr = ID3D11Device_CreateShaderResourceView(g_device, (ID3D11Resource *)t, &sd, &srv);
+    /* sampled: the last texel of the view (a pair of pixels for YUY2 / Y210 / Y216) as its channels */
+    const BYTE *last = back + (size_t)(h - 1) * row + row - (f == DXGI_FORMAT_YUY2 || f == DXGI_FORMAT_Y210 || f == DXGI_FORMAT_Y216 ? 2 : 1) * formats[i].bpp;
+    int want[3];
+    for (int c = 0; c < 3; ++c) {
+      if (formats[i].view == DXGI_FORMAT_R8G8B8A8_UNORM) want[c] = last[c];
+      else if (formats[i].view == DXGI_FORMAT_R16G16B16A16_UNORM) want[c] = (int)lround((last[2 * c] | last[2 * c + 1] << 8) * 255.0 / 65535.0);
+      else { const UINT v = (UINT)last[0] | (UINT)last[1] << 8 | (UINT)last[2] << 16 | (UINT)last[3] << 24; want[c] = (int)lround(((v >> (10 * c)) & 1023) * 255.0 / 1023.0); }
+    }
+    const UINT32 got = srv ? sample_view(srv) : 0;
+    checkf(SUCCEEDED(hr) && srv && close_to(red(got), want[0], 1) && close_to(green(got), want[1], 1) && close_to(blue(got), want[2], 1),
+           "%s sampled through a view of its pixels' format: (%d, %d, %d), want (%d, %d, %d)", name, red(got), green(got), blue(got), want[0], want[1], want[2]);
+    if (srv) ID3D11ShaderResourceView_Release(srv);
+    if (formats[i].target) {
+      /* AYUV: a render target, cleared: V, U, Y, A */
+      ID3D11RenderTargetView *rtv = NULL;
+      D3D11_RENDER_TARGET_VIEW_DESC rd;
+      memset(&rd, 0, sizeof rd);
+      rd.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D;
+      check(ID3D11Device_CreateRenderTargetView(g_device, (ID3D11Resource *)t, NULL, &rtv) == E_INVALIDARG && !rtv, "a render target view of AYUV without a description: E_INVALIDARG");
+      rd.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+      hr = ID3D11Device_CreateRenderTargetView(g_device, (ID3D11Resource *)t, &rd, &rtv);
+      if (rtv) {
+        const float vuya[4] = {0.25f, 0.5f, 0.75f, 1.0f};
+        ID3D11DeviceContext_ClearRenderTargetView(g_context, rtv, vuya);
+        ok = read_packed(t, 0, row, back);
+        checkf(ok && close_to(back[0], 64, 1) && close_to(back[1], 128, 1) && close_to(back[2], 191, 1) && back[3] == 255 && close_to(back[row * h - 2], 191, 1),
+               "AYUV cleared through an R8G8B8A8_UNORM render target: (%d, %d, %d, %d)", back[0], back[1], back[2], back[3]);
+        ID3D11RenderTargetView_Release(rtv);
+      } else check(0, "a render target view of AYUV (R8G8B8A8_UNORM)");
+    } else {
+      HRESULT rh = S_OK;
+      ID3D11Texture2D *rt = texture(w, h, 1, f, D3D11_USAGE_DEFAULT, D3D11_BIND_RENDER_TARGET, 0, NULL, &rh);
+      checkf(!rt && rh == E_INVALIDARG, "%s is no render target: E_INVALIDARG", name);
+      if (rt) ID3D11Texture2D_Release(rt);
+    }
+    UINT vp = 0;
+    D3D11_VIDEO_PROCESSOR_CONTENT_DESC cd = {D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE, {30, 1}, 16, 8, {30, 1}, 16, 8, D3D11_VIDEO_USAGE_PLAYBACK_NORMAL};
+    ID3D11VideoProcessorEnumerator *e = NULL;
+    if (SUCCEEDED(ID3D11VideoDevice_CreateVideoProcessorEnumerator(g_vdevice, &cd, &e))) {
+      checkf(SUCCEEDED(ID3D11VideoProcessorEnumerator_CheckVideoProcessorFormat(e, f, &vp)) && (vp & D3D11_VIDEO_PROCESSOR_FORMAT_SUPPORT_INPUT) &&
+                 !!(vp & D3D11_VIDEO_PROCESSOR_FORMAT_SUPPORT_OUTPUT) == formats[i].target,
+             "CheckVideoProcessorFormat(%s): input%s", name, formats[i].target ? " and output" : " (no output: it is no render target)");
+      ID3D11VideoProcessorEnumerator_Release(e);
+    }
+    ID3D11Texture2D_Release(t);
+  }
+  HRESULT hr = S_OK;
+  ID3D11Texture2D *odd = texture(15, 8, 1, DXGI_FORMAT_YUY2, D3D11_USAGE_DEFAULT, D3D11_BIND_SHADER_RESOURCE, 0, NULL, &hr);
+  check(!odd && hr == E_INVALIDARG, "a YUY2 texture of odd width: E_INVALIDARG");
+  const D3D11_TEXTURE2D_DESC mips = {16, 16, 2, 1, DXGI_FORMAT_AYUV, {1, 0}, D3D11_USAGE_DEFAULT, D3D11_BIND_SHADER_RESOURCE, 0, 0};
+  ID3D11Texture2D *m = NULL;
+  check(ID3D11Device_CreateTexture2D(g_device, &mips, NULL, &m) == E_INVALIDARG && !m, "an AYUV texture of two levels: E_INVALIDARG");
+  UINT support = 0;
+  check(ID3D11Device_CheckFormatSupport(g_device, DXGI_FORMAT_P208, &support) == E_FAIL && !support, "CheckFormatSupport(P208): not a Direct3D 11 format, E_FAIL");
+  /* an array: each slice its own */
+  BYTE rows[16 * 8 * 4 * 3];
+  for (UINT k = 0; k < sizeof rows; ++k) rows[k] = (BYTE)(k * 13 + 7);
+  D3D11_SUBRESOURCE_DATA init[3] = {{rows, 64, 0}, {rows + 512, 64, 0}, {rows + 1024, 64, 0}};
+  ID3D11Texture2D *arr = texture(16, 8, 3, DXGI_FORMAT_Y410, D3D11_USAGE_DEFAULT, D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_DECODER, 0, init, &hr);
+  BYTE back[512];
+  check(arr && read_packed(arr, 2, 64, back) && !memcmp(back, rows + 1024, 512) && read_packed(arr, 0, 64, back) && !memcmp(back, rows, 512),
+        "a Y410 array of three slices for a decoder, made with its pixels: each slice its own");
+  if (arr) ID3D11Texture2D_Release(arr);
+}
+
+/* An AV1 stream of profile 1 or 2 (av1_dxva_data.h: the DXVA buffers a program fills, picture by picture) decoded through ID3D11VideoContext into an array of
+ * `format` (the indices are its slices); every picture the stream shows read back and compared with ffmpeg's (FNV hashes of the packed rows). */
+static UINT le32_at(const BYTE *p) { return (UINT)p[0] | (UINT)p[1] << 8 | (UINT)p[2] << 16 | (UINT)p[3] << 24; }
+static void decode_av1(const char *name, const char *b64, const GUID *profile, DXGI_FORMAT format, UINT bpp, const unsigned *hashes, unsigned frames) {
+  size_t size = 0;
+  BYTE *data = base64_decode(b64, &size);
+  if (!data || size < 32 || memcmp(data, "AV1D", 4) != 0) { checkf(0, "%s: the DXVA buffers", name); free(data); return; }
+  const UINT surfaces = le32_at(data + 4), w = le32_at(data + 8), h = le32_at(data + 12), events = le32_at(data + 28);
+  BOOL fits = FALSE;
+  check(SUCCEEDED(ID3D11VideoDevice_CheckVideoDecoderFormat(g_vdevice, profile, format, &fits)) && fits, "CheckVideoDecoderFormat of the AV1 profile and its format");
+  const D3D11_VIDEO_DECODER_DESC desc = {*profile, w, h, format};
+  D3D11_VIDEO_DECODER_CONFIG config;
+  UINT count = 0;
+  HRESULT hr = ID3D11VideoDevice_GetVideoDecoderConfigCount(g_vdevice, &desc, &count);
+  if (SUCCEEDED(hr) && count) hr = ID3D11VideoDevice_GetVideoDecoderConfig(g_vdevice, &desc, 0, &config);
+  else hr = E_FAIL;
+  ID3D11VideoDecoder *dec = NULL;
+  if (SUCCEEDED(hr)) hr = ID3D11VideoDevice_CreateVideoDecoder(g_vdevice, &desc, &config, &dec);
+  ID3D11Texture2D *out = texture(w, h, surfaces, format, D3D11_USAGE_DEFAULT, D3D11_BIND_DECODER | D3D11_BIND_SHADER_RESOURCE, 0, NULL, NULL);
+  ID3D11VideoDecoderOutputView *views[16] = {0};
+  for (UINT i = 0; SUCCEEDED(hr) && out && i < surfaces && i < 16; ++i) {
+    D3D11_VIDEO_DECODER_OUTPUT_VIEW_DESC vd = {*profile, D3D11_VDOV_DIMENSION_TEXTURE2D, {{i}}};
+    hr = ID3D11VideoDevice_CreateVideoDecoderOutputView(g_vdevice, (ID3D11Resource *)out, &vd, &views[i]);
+  }
+  checkf(SUCCEEDED(hr) && dec && out && surfaces <= 16, "%s: a decoder of %u x %u and an array of %u slices with their output views", name, w, h, surfaces);
+  const UINT row = (format == DXGI_FORMAT_YUY2 || format == DXGI_FORMAT_Y210 || format == DXGI_FORMAT_Y216 ? (w + 1) / 2 * 2 : w) * bpp;
+  BYTE *picture = malloc((size_t)row * h);
+  unsigned shown = 0, same = 0, failures = 0;
+  size_t at = 32;
+  for (UINT e = 0; SUCCEEDED(hr) && dec && out && picture && e < events; ++e) {
+    if (at + 12 > size) { ++failures; break; }
+    const UINT kind = le32_at(data + at), show = le32_at(data + at + 4), surface = le32_at(data + at + 8);
+    at += 12;
+    if (surface >= surfaces) { ++failures; break; }
+    if (kind == 0) {
+      if (at + 12 > size) { ++failures; break; }
+      const UINT pp = le32_at(data + at), sc = le32_at(data + at + 4), bs = le32_at(data + at + 8);
+      at += 12;
+      if (at + pp + sc + bs > size) { ++failures; break; }
+      int ok = SUCCEEDED(ID3D11VideoContext_DecoderBeginFrame(g_vcontext, dec, views[surface], 0, NULL)) &&
+               fill_buffer(dec, D3D11_VIDEO_DECODER_BUFFER_PICTURE_PARAMETERS, 0, data + at, pp) && fill_buffer(dec, D3D11_VIDEO_DECODER_BUFFER_SLICE_CONTROL, 0, data + at + pp, sc) &&
+               fill_buffer(dec, D3D11_VIDEO_DECODER_BUFFER_BITSTREAM, 0, data + at + pp + sc, bs);
+      D3D11_VIDEO_DECODER_BUFFER_DESC b[3] = {buffer_desc(D3D11_VIDEO_DECODER_BUFFER_PICTURE_PARAMETERS, 0, pp), buffer_desc(D3D11_VIDEO_DECODER_BUFFER_SLICE_CONTROL, 0, sc),
+                                              buffer_desc(D3D11_VIDEO_DECODER_BUFFER_BITSTREAM, 0, bs)};
+      ok = ok && SUCCEEDED(ID3D11VideoContext_SubmitDecoderBuffers(g_vcontext, dec, 3, b));
+      ok = SUCCEEDED(ID3D11VideoContext_DecoderEndFrame(g_vcontext, dec)) && ok;
+      if (!ok) ++failures;
+      at += pp + sc + bs;
+    }
+    if (!show) continue;
+    if (!read_packed(out, surface, row, picture)) { ++failures; continue; }
+    if (shown < frames) same += fnv(picture, (size_t)row * h, 0x811c9dc5u) == hashes[shown];
+    ++shown;
+  }
+  checkf(!failures && shown == frames && same == frames, "%s: decoded through ID3D11VideoContext, every picture shown is ffmpeg's, bit for bit (%u of %u)", name, same, frames);
+  free(picture);
+  for (UINT i = 0; i < 16; ++i) if (views[i]) ID3D11VideoDecoderOutputView_Release(views[i]);
+  if (out) ID3D11Texture2D_Release(out);
+  if (dec) ID3D11VideoDecoder_Release(dec);
+  free(data);
+}
+
+/* A Main 10 stream (hevc10_dxva.h: the DXVA buffers of every picture as ffmpeg fills them) decoded into a P010 array through ID3D11VideoContext; each picture read
+ * back as it is decoded and compared in display order with the reference (FNV hashes of the pictures as yuv420p10le). */
+static void decode_hevc10(const Hevc10Stream *st) {
+  const UINT w = st->width, h = st->height, surfaces = st->surfaces;
+  const D3D11_VIDEO_DECODER_DESC desc = {D3D11_DECODER_PROFILE_HEVC_VLD_MAIN10, w, h, DXGI_FORMAT_P010};
+  D3D11_VIDEO_DECODER_CONFIG config;
+  UINT count = 0;
+  HRESULT hr = ID3D11VideoDevice_GetVideoDecoderConfigCount(g_vdevice, &desc, &count);
+  if (SUCCEEDED(hr) && count) hr = ID3D11VideoDevice_GetVideoDecoderConfig(g_vdevice, &desc, 0, &config);
+  checkf(SUCCEEDED(hr) && count == 1 && config.ConfigBitstreamRaw == 1, "%s: one HEVC Main 10 configuration into P010 (ConfigBitstreamRaw 1)", st->name);
+  ID3D11VideoDecoder *dec = NULL;
+  if (SUCCEEDED(hr)) hr = ID3D11VideoDevice_CreateVideoDecoder(g_vdevice, &desc, &config, &dec);
+  ID3D11Texture2D *out = texture(w, h, surfaces, DXGI_FORMAT_P010, D3D11_USAGE_DEFAULT, D3D11_BIND_DECODER, 0, NULL, NULL);
+  ID3D11VideoDecoderOutputView *views[DXVA_STREAM_MAX_SURFACES] = {0};
+  for (unsigned i = 0; SUCCEEDED(hr) && out && i < surfaces; ++i) {
+    D3D11_VIDEO_DECODER_OUTPUT_VIEW_DESC vd = {D3D11_DECODER_PROFILE_HEVC_VLD_MAIN10, D3D11_VDOV_DIMENSION_TEXTURE2D, {{i}}};
+    hr = ID3D11VideoDevice_CreateVideoDecoderOutputView(g_vdevice, (ID3D11Resource *)out, &vd, &views[i]);
+  }
+  checkf(SUCCEEDED(hr) && dec && out, "%s: a Main 10 decoder of %u x %u, a P010 array of %u slices and their output views", st->name, w, h, surfaces);
+  BYTE *p010 = malloc((size_t)w * h * 3), *f = malloc((size_t)w * h * 3);
+  unsigned hashes[64] = {0}, n = 0, low_bits = 0;
+  for (; SUCCEEDED(hr) && dec && out && n < st->count && n < 64; ++n) {
+    const Hevc10Picture *p = &st->pictures[n];
+    if (FAILED(ID3D11VideoContext_DecoderBeginFrame(g_vcontext, dec, views[p->surface], 0, NULL))) break;
+    int ok = fill_buffer(dec, D3D11_VIDEO_DECODER_BUFFER_PICTURE_PARAMETERS, 0, st->bytes + p->pp, p->pp_size) &&
+             (!p->qm_size || fill_buffer(dec, D3D11_VIDEO_DECODER_BUFFER_INVERSE_QUANTIZATION_MATRIX, 0, st->bytes + p->qm, p->qm_size)) &&
+             fill_buffer(dec, D3D11_VIDEO_DECODER_BUFFER_SLICE_CONTROL, 0, st->bytes + p->slices, p->slices_size) &&
+             fill_buffer(dec, D3D11_VIDEO_DECODER_BUFFER_BITSTREAM, 0, st->bytes + p->bits, p->bits_size);
+    D3D11_VIDEO_DECODER_BUFFER_DESC b[4];
+    UINT nb = 0;
+    b[nb++] = buffer_desc(D3D11_VIDEO_DECODER_BUFFER_PICTURE_PARAMETERS, 0, p->pp_size);
+    if (p->qm_size) b[nb++] = buffer_desc(D3D11_VIDEO_DECODER_BUFFER_INVERSE_QUANTIZATION_MATRIX, 0, p->qm_size);
+    b[nb++] = buffer_desc(D3D11_VIDEO_DECODER_BUFFER_SLICE_CONTROL, 0, p->slices_size);
+    b[nb++] = buffer_desc(D3D11_VIDEO_DECODER_BUFFER_BITSTREAM, 0, p->bits_size);
+    ok = ok && SUCCEEDED(ID3D11VideoContext_SubmitDecoderBuffers(g_vcontext, dec, nb, b));
+    ok = SUCCEEDED(ID3D11VideoContext_DecoderEndFrame(g_vcontext, dec)) && ok;
+    if (!ok || !read_planar(out, p->surface, p010)) break;
+    /* (luma rows of w words, then h / 2 rows of w / 2 Cb, Cr pairs: as yuv420p10le, planar) */
+    BYTE *at = f;
+    for (UINT i = 0; i < w * h; ++i) {
+      const unsigned v = (unsigned)p010[2 * i] | ((unsigned)p010[2 * i + 1] << 8);
+      low_bits |= v & 0x3F;
+      *at++ = (BYTE)(v >> 6);
+      *at++ = (BYTE)(v >> 14);
+    }
+    const BYTE *chroma = p010 + (size_t)w * h * 2;
+    for (int c = 0; c < 2; ++c)
+      for (UINT i = 0; i < w * h / 4; ++i) {
+        const unsigned v = (unsigned)chroma[4 * i + 2 * c] | ((unsigned)chroma[4 * i + 2 * c + 1] << 8);
+        low_bits |= v & 0x3F;
+        *at++ = (BYTE)(v >> 6);
+        *at++ = (BYTE)(v >> 14);
+      }
+    if (p->display < 64) hashes[p->display] = fnv(f, (size_t)w * h * 3, 0x811c9dc5u);
+  }
+  checkf(n == st->count && low_bits == 0, "%s: %u pictures decoded through ID3D11VideoContext into P010 (the samples in the top ten bits)", st->name, n);
+  UINT same = 0, first_bad = ~0u;
+  for (UINT i = 0; i < st->count && i < 64; ++i) {
+    if (hashes[i] == st->fnv[i]) ++same;
+    else if (first_bad == ~0u) first_bad = i;
+  }
+  checkf(same == st->count, "%s: in display order every frame is the reference's, bit for bit (%u of %u; the first that differs: %d)", st->name, same, st->count, (int)first_bad);
+  free(p010);
+  free(f);
+  for (unsigned i = 0; i < surfaces; ++i) if (views[i]) ID3D11VideoDecoderOutputView_Release(views[i]);
+  if (out) ID3D11Texture2D_Release(out);
+  if (dec) ID3D11VideoDecoder_Release(dec);
 }
 
 /* A decoded picture sampled in a draw: the draw after the decode sees it (the device orders its video work with its draws). */
@@ -1610,12 +1930,19 @@ int main(void) {
     test_planar_cpu(DXGI_FORMAT_P010, "P010");
     if (make_scene()) {
       test_planar_views();
+      test_packed_yuv();
       test_decoder_caps();
       decode_stream("h264_bframes", DXVA_CODEC_H264, &D3D11_DECODER_PROFILE_H264_VLD_NOFGT, g_h264_bframes_b64, 17, g_h264_bframes_fnv, 14, NULL, 0);
       decode_stream("h264_cavlc", DXVA_CODEC_H264, &D3D11_DECODER_PROFILE_H264_VLD_NOFGT, g_h264_cavlc_b64, 17, g_h264_cavlc_fnv, 10, NULL, 1);
       decode_stream("h264_ltr", DXVA_CODEC_H264, &D3D11_DECODER_PROFILE_H264_VLD_NOFGT, g_h264_ltr_b64, 20, g_h264_ltr_fnv, 24, NULL, 0);
       decode_stream("h264_cqm", DXVA_CODEC_H264, &D3D11_DECODER_PROFILE_H264_VLD_NOFGT, g_h264_cqm_b64, 17, g_h264_cqm_fnv, 9, NULL, 2);
+      for (unsigned i = 0; i < sizeof g_hevc10_streams / sizeof g_hevc10_streams[0]; ++i) decode_hevc10(&g_hevc10_streams[i]);
       decode_stream("mpeg2_ibp", DXVA_CODEC_MPEG2, &D3D11_DECODER_PROFILE_MPEG2_VLD, g_mpeg2_ibp_b64, 8, NULL, 8, g_mpeg2_ibp_means, 1);
+      decode_stream("vc1_adv_ipb", DXVA_CODEC_VC1, &D3D11_DECODER_PROFILE_VC1_VLD, g_vc1_adv_ipb_b64, 8, g_vc1_adv_ipb_fnv, 10, NULL, 0);
+      decode_stream("m4vdec_bframes", DXVA_CODEC_MPEG4, &D3D11_DECODER_PROFILE_MPEG4PT2_VLD_ADVSIMPLE_NOGMC, g_m4vdec_bframes_b64, 8, g_m4vdec_bframes_fnv, 8, NULL, 2);
+      decode_av1("av1_444 (profile 1, AYUV)", g_av1_444_dxva_b64, &DXVA_ModeAV1_VLD_Profile1, DXGI_FORMAT_AYUV, 4, g_av1_444_dxva_fnv, 6);
+      decode_av1("av1_422_10bit (profile 2, Y210, film grain)", g_av1_422_10bit_dxva_b64, &DXVA_ModeAV1_VLD_Profile2, DXGI_FORMAT_Y210, 4, g_av1_422_10bit_dxva_fnv, 6);
+      decode_av1("av1_444_12bit (12-bit profile 2, Y416)", g_av1_444_12bit_dxva_b64, &DXVA_ModeAV1_VLD_12bit_Profile2, DXGI_FORMAT_Y416, 8, g_av1_444_12bit_dxva_fnv, 6);
       test_decode_then_draw();
       test_processor();
       test_processor_effects();

@@ -89,7 +89,15 @@ static HRESULT STDMETHODCALLTYPE dev_CheckFormatSupport(Dev *d, DXGI_FORMAT form
      * and the video processor reads and writes; no unordered access to them is drawn, no mipmaps, no multisampling) */
     *support = D3D11_FORMAT_SUPPORT_TEXTURE2D | D3D11_FORMAT_SUPPORT_SHADER_LOAD | D3D11_FORMAT_SUPPORT_SHADER_SAMPLE | D3D11_FORMAT_SUPPORT_RENDER_TARGET |
                D3D11_FORMAT_SUPPORT_CPU_LOCKABLE | D3D11_FORMAT_SUPPORT_VIDEO_PROCESSOR_INPUT | D3D11_FORMAT_SUPPORT_VIDEO_PROCESSOR_OUTPUT;
-    if (format != DXGI_FORMAT_P016) *support |= D3D11_FORMAT_SUPPORT_DECODER_OUTPUT;
+    *support |= D3D11_FORMAT_SUPPORT_DECODER_OUTPUT;      /* (P016: AV1's 12-bit 4:2:0) */
+    return S_OK;
+  }
+  if (planar && (planar->flags & FMT_YUV)) {
+    /* (AYUV, Y410, Y416, YUY2, Y210, Y216: 2D textures and arrays of one level the CPU reaches, sampled through views of their pixels' format (AYUV drawn into too),
+     * what AV1's profiles 1 and 2 decode into, what the video processor reads - and writes where it may be a render target: AYUV; no unordered access is drawn) */
+    *support = D3D11_FORMAT_SUPPORT_TEXTURE2D | D3D11_FORMAT_SUPPORT_SHADER_LOAD | D3D11_FORMAT_SUPPORT_SHADER_SAMPLE | D3D11_FORMAT_SUPPORT_CPU_LOCKABLE |
+               D3D11_FORMAT_SUPPORT_DECODER_OUTPUT | D3D11_FORMAT_SUPPORT_VIDEO_PROCESSOR_INPUT;
+    if (format == DXGI_FORMAT_AYUV) *support |= D3D11_FORMAT_SUPPORT_RENDER_TARGET | D3D11_FORMAT_SUPPORT_VIDEO_PROCESSOR_OUTPUT;
     return S_OK;
   }
   const TexFormat *colour = tex_format_for(format, 0), *depth = tex_format_for(format, D3D11_BIND_DEPTH_STENCIL);

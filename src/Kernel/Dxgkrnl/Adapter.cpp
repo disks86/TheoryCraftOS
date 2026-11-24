@@ -950,6 +950,25 @@ class Adapter::StreamRunner {
     return true;
   }
 
+  // A packed surface's rows (DxvaDecodedPicture::frame.plane[0]: dxva_packed_row_bytes each) copied into the image it is kept in, whose pixels are the same bytes (DxgTypes.hpp
+  // VideoDecoderDesc); what is outside either is left alone.
+  static bool write_packed_surface(VidMm& mm, Allocation& image, const uint8_t* plane, uint32_t stride, uint64_t row_bytes, uint32_t height) {
+    if (!plane || row_bytes > stride) return false;
+    const uint64_t pitch = image_row_bytes(image.desc().format, image.desc().width);
+    const uint64_t bytes = row_bytes < pitch ? row_bytes : pitch;
+    const uint32_t h = height < image.desc().height ? height : image.desc().height;
+    if (h == 0) return true;
+    if (!mm.read_back(image)) return false;
+    const ConstByteView source(plane, uint64_t{stride} * (h - 1) + row_bytes);
+    for (uint32_t y = 0; y < h; ++y) {
+      ByteView row;
+      if (!image.writable_backing().try_subview(pitch * y, bytes, &row)) return false;
+      row.copy_from(source.subview(uint64_t{stride} * y, bytes));
+    }
+    mm.note_cpu_write(image);
+    return true;
+  }
+
   NtStatus decode_frame(ByteReader& p) {
     const Handle handle = p.le32();
     const uint32_t bi = p.le32(), pp_off = p.le32(), pp_bytes = p.le32(), qm_off = p.le32(), qm_bytes = p.le32(), sc_off = p.le32(), sc_bytes = p.le32();
@@ -970,20 +989,32 @@ class Adapter::StreamRunner {
     const VideoDecoderDesc& desc = decoder->desc();
     Allocation* buffer = alloc(bi);
     Allocation* bitstream = alloc(si);
+    const hardware::DxvaSurfaceFormat surface = static_cast<hardware::DxvaSurfaceFormat>(desc.surface_format);
+    const bool packed = hardware::dxva_surface_packed(surface);
     Allocation* luma = alloc(li);
-    Allocation* chroma = alloc(ci);
+    Allocation* chroma = packed ? nullptr : alloc(ci);
+    if (packed && ci != kNoAllocation) return refuse(__LINE__);
     Allocation* status_buffer = qi == kNoAllocation ? nullptr : alloc(qi);
     if (!copyable_buffer(buffer) || !copyable_buffer(bitstream) || (qi != kNoAllocation && !copyable_buffer(status_buffer, true))) return refuse(__LINE__);
     if (uint64_t{pp_off} + pp_bytes > buffer->desc().size || uint64_t{qm_off} + qm_bytes > buffer->desc().size || uint64_t{sc_off} + sc_bytes > buffer->desc().size ||
         uint64_t{bs_off} + bs_bytes > bitstream->desc().size || (status_buffer && uint64_t{q_off} + sizeof(VideoDecodeStatus) > status_buffer->desc().size))
       return refuse(__LINE__);
-    const Format plane_format = desc.ten_bit ? Format::A16B16G16R16 : Format::A8B8G8R8;
+    // (the images the surface format is kept in: 8-bit samples in A8B8G8R8 / X8B8G8R8 pixels, 16-bit in A16B16G16R16, Y410 in A2B10G10R10)
+    using S = hardware::DxvaSurfaceFormat;
+    const bool eight = surface == S::Nv12 || surface == S::Ayuv || surface == S::Yuy2;
+    const Format plane_format = eight ? Format::A8B8G8R8 : surface == S::Y410 ? Format::A2B10G10R10 : Format::A16B16G16R16;
     auto plane_ok = [&](const Allocation* a, uint32_t w, uint32_t h) {
       return a && a->is_image() && a->desc().kind == graphics::TextureKind::Texture2D && a->mip_levels() == 1 && a->desc().samples == 1 && a->desc().width >= w && a->desc().height >= h &&
-             (a->desc().format == plane_format || (!desc.ten_bit && a->desc().format == Format::X8B8G8R8));
+             (a->desc().format == plane_format || (eight && a->desc().format == Format::X8B8G8R8));
     };
-    if (!plane_ok(luma, desc.width, desc.height) || !plane_ok(chroma, (desc.width + 1) / 2, (desc.height + 1) / 2) || luma == chroma) return refuse(__LINE__);
-    if (!use(luma, state::kVideoDecodeWrite) || !use(chroma, state::kVideoDecodeWrite) || !use(buffer, state::kVideoDecodeRead) || !use(bitstream, state::kVideoDecodeRead)) return refuse(__LINE__);
+    const bool pairs = surface == S::Yuy2 || surface == S::Y210 || surface == S::Y216;
+    if (packed) {
+      if (!plane_ok(luma, pairs ? (desc.width + 1) / 2 : desc.width, desc.height)) return refuse(__LINE__);
+    } else if (!plane_ok(luma, desc.width, desc.height) || !plane_ok(chroma, (desc.width + 1) / 2, (desc.height + 1) / 2) || luma == chroma) {
+      return refuse(__LINE__);
+    }
+    if (!use(luma, state::kVideoDecodeWrite) || (chroma && !use(chroma, state::kVideoDecodeWrite)) || !use(buffer, state::kVideoDecodeRead) || !use(bitstream, state::kVideoDecodeRead))
+      return refuse(__LINE__);
     for (uint32_t i = 0; i < key_count; ++i)
       if (key_index[i] != kNoAllocation && !alloc(key_index[i])) return refuse(__LINE__);
     if (!exec_) return status::kSuccess;
@@ -1005,12 +1036,17 @@ class Adapter::StreamRunner {
     VideoDecodeStatus record;
     if (result == hardware::DxvaResult::Ok || result == hardware::DxvaResult::MissingReference) {
       const hardware::VideoFrame& f = decoded.frame;
-      const bool sixteen = f.format.pixel_format == hardware::PixelFormat::P010;
-      const bool written = sixteen == (desc.ten_bit != 0) && write_video_plane(mm_, *luma, f.plane[0], f.stride[0], f.format.width, f.format.height, 1, sixteen) &&
-                           write_video_plane(mm_, *chroma, f.plane[1], f.stride[1], f.format.chroma_width(), f.format.chroma_height(), 2, sixteen);
+      bool written = decoded.surface_format == surface;
+      if (written && packed) {
+        written = write_packed_surface(mm_, *luma, f.plane[0], f.stride[0], hardware::dxva_packed_row_bytes(surface, f.format.width), f.format.height);
+      } else if (written) {
+        const bool sixteen = f.format.pixel_format == hardware::PixelFormat::P010;
+        written = sixteen == (surface != S::Nv12) && write_video_plane(mm_, *luma, f.plane[0], f.stride[0], f.format.width, f.format.height, 1, sixteen) &&
+                  write_video_plane(mm_, *chroma, f.plane[1], f.stride[1], f.format.chroma_width(), f.format.chroma_height(), 2, sixteen);
+      }
       if (!written) return status::kInvalidDeviceState;
       unbind_textures_of(luma);
-      unbind_textures_of(chroma);
+      if (chroma) unbind_textures_of(chroma);
       ++decoder->pictures;
       if (result == hardware::DxvaResult::MissingReference) { record.status = 1; record.macroblocks_affected = ~uint64_t{0}; }
     } else {
@@ -1069,6 +1105,28 @@ class Adapter::StreamRunner {
       case hardware::VpFormat::Rgba8: if (f0 != Format::A8B8G8R8 && f0 != Format::X8B8G8R8) return false; plane_of(plane0, &out->plane[0], f0 == Format::X8B8G8R8 ? 3 : 4, 4, {0, 1, 2, 3}, 8, false); return true;
       case hardware::VpFormat::Rgb10a2: if (f0 != Format::A2B10G10R10) return false; plane_of(plane0, &out->plane[0], 4, 4, {0, 1, 2, 3}, 10, false); return true;
       case hardware::VpFormat::Rgba16f: if (f0 != Format::A16B16G16R16F) return false; plane_of(plane0, &out->plane[0], 4, 8, {0, 2, 4, 6}, 16, true); return true;
+      case hardware::VpFormat::P208: {
+        // (NV12's widened planes, the chroma as high as the luma)
+        if (!plane1 || plane1 == plane0 || !plane1->is_image() || plane1->desc().kind != graphics::TextureKind::Texture2D || plane1->mip_levels() != 1 || plane1->desc().samples != 1) return false;
+        if ((f0 != Format::A8B8G8R8 && f0 != Format::X8B8G8R8) || (plane1->desc().format != Format::A8B8G8R8 && plane1->desc().format != Format::X8B8G8R8)) return false;
+        if (plane1->desc().width < (out->width + 1) / 2 || plane1->desc().height < out->height) return false;
+        plane_of(plane0, &out->plane[0], 1, 4, {0}, 8, false);
+        plane_of(plane1, &out->plane[1], 2, 4, {0, 1}, 8, false);
+        return true;
+      }
+      // The packed YUV formats: one image of their own pixels (VideoProcess.hpp VpPlane: channels Y, U, V, A - for 4:2:2 Y0, U, Y1, V of a pair of pixels).
+      case hardware::VpFormat::Ayuv: if (f0 != Format::A8B8G8R8) return false; plane_of(plane0, &out->plane[0], 4, 4, {2, 1, 0, 3}, 8, false); return true;
+      case hardware::VpFormat::Y410: if (f0 != Format::A2B10G10R10) return false; plane_of(plane0, &out->plane[0], 4, 4, {1, 0, 2, 3}, 10, false); return true;
+      case hardware::VpFormat::Y416: if (f0 != Format::A16B16G16R16) return false; plane_of(plane0, &out->plane[0], 4, 8, {2, 0, 4, 6}, 16, false); return true;
+      case hardware::VpFormat::Yuy2:
+      case hardware::VpFormat::Y210:
+      case hardware::VpFormat::Y216: {
+        const bool deep = format != hardware::VpFormat::Yuy2;
+        if (f0 != (deep ? Format::A16B16G16R16 : Format::A8B8G8R8)) return false;
+        plane_of(plane0, &out->plane[0], 4, deep ? 8 : 4, deep ? std::initializer_list<uint8_t>{0, 2, 4, 6} : std::initializer_list<uint8_t>{0, 1, 2, 3}, deep ? 16 : 8, false);
+        out->width = 2 * plane0->desc().width;      // (the picture is two pixels a pair: an odd width is the runtime's to clip by its rectangles)
+        return true;
+      }
     }
     return false;
   }
@@ -1085,7 +1143,7 @@ class Adapter::StreamRunner {
     const uint32_t fill = p.le32();
     output.alpha_fill_stream = p.le32();
     const uint32_t o0 = p.le32(), o1 = p.le32(), count = p.le32();
-    if (!p.ok() || in_pass_ || out_format > static_cast<uint32_t>(hardware::VpFormat::Rgba16f) || fill > static_cast<uint32_t>(hardware::VpAlphaFill::SourceStream) || count > kMaxVideoProcessStreams)
+    if (!p.ok() || in_pass_ || out_format > static_cast<uint32_t>(hardware::kVpLastFormat) || fill > static_cast<uint32_t>(hardware::VpAlphaFill::SourceStream) || count > kMaxVideoProcessStreams)
       return refuse(__LINE__);
     output.alpha_fill = static_cast<hardware::VpAlphaFill>(fill);
     struct StreamWords { uint32_t w[kVideoProcessStreamWords]; } words[kMaxVideoProcessStreams];
@@ -1107,7 +1165,7 @@ class Adapter::StreamRunner {
     output.allocator = &adapter_.allocator_;
     const hardware::VpFormat ofmt = static_cast<hardware::VpFormat>(out_format);
     Allocation* out0 = alloc(o0);
-    Allocation* out1 = hardware::vp_is_yuv(ofmt) ? alloc(o1) : nullptr;
+    Allocation* out1 = hardware::vp_plane_count(ofmt) == 2 ? alloc(o1) : nullptr;
     hardware::VpImage out_image;
     if (!video_image_of(ofmt, out_space, out0, out1, &out_image)) return refuse(__LINE__);
     if (!use(out0, state::kVideoProcessWrite) || (out1 && !use(out1, state::kVideoProcessWrite))) return refuse(__LINE__);
@@ -1116,10 +1174,10 @@ class Adapter::StreamRunner {
     Allocation* inputs[6 * kMaxVideoProcessStreams] = {};
     for (uint32_t s = 0; s < count; ++s) {
       const uint32_t* w = words[s].w;
-      if (w[0] > static_cast<uint32_t>(hardware::VpFormat::Rgba16f) || w[10] > static_cast<uint32_t>(hardware::VpOrientation::Clockwise270FlipHorizontal)) return refuse(__LINE__);
+      if (w[0] > static_cast<uint32_t>(hardware::kVpLastFormat) || w[10] > static_cast<uint32_t>(hardware::VpOrientation::Clockwise270FlipHorizontal)) return refuse(__LINE__);
       const hardware::VpFormat f = static_cast<hardware::VpFormat>(w[0]);
       Allocation* a0 = alloc(w[13]);
-      Allocation* a1 = hardware::vp_is_yuv(f) ? alloc(w[14]) : nullptr;
+      Allocation* a1 = hardware::vp_plane_count(f) == 2 ? alloc(w[14]) : nullptr;
       if (!video_image_of(f, w[1], a0, a1, &images[s])) return refuse(__LINE__);
       if (a0 == out0 || a0 == out1 || (a1 && (a1 == out0 || a1 == out1))) return refuse(__LINE__);      // (a stream is not its own output)
       if (!use(a0, state::kVideoProcessRead) || (a1 && !use(a1, state::kVideoProcessRead))) return refuse(__LINE__);
@@ -1144,7 +1202,7 @@ class Adapter::StreamRunner {
         const uint32_t i0 = e[3 + 2 * k], i1 = e[4 + 2 * k];
         if (i0 == kNoAllocation) continue;
         Allocation* r0 = alloc(i0);
-        Allocation* r1 = hardware::vp_is_yuv(f) ? alloc(i1) : nullptr;
+        Allocation* r1 = hardware::vp_plane_count(f) == 2 ? alloc(i1) : nullptr;
         hardware::VpImage& ri = references[2 * s + k];
         if (!video_image_of(f, w[1], r0, r1, &ri) || ri.width != images[s].width || ri.height != images[s].height) return refuse(__LINE__);
         if (r0 == out0 || r0 == out1 || (r1 && (r1 == out0 || r1 == out1))) return refuse(__LINE__);

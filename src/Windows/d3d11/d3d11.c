@@ -894,6 +894,7 @@ static HRESULT tex_write(Dev *d, Tex *t, UINT sub, UINT x, UINT y, UINT z, UINT 
 static HRESULT tex_write_rows(Dev *d, Tex *t, UINT sub, UINT x, UINT y, UINT z, UINT w, UINT h, const BYTE *rows, UINT pitch, BOOL raw) {
   if (t->depth || w == 0 || h == 0) return E_INVALIDARG;
   if (t->planar) return tex_planar_write(d, t, sub, x, y, w, h, rows, pitch);      /* (both planes of the slice: `rows` has the chroma after the luma) */
+  if (format_pairs(t->desc.Format) && ((x & 1) || ((w & 1) && x + w != t->desc.Width))) return E_INVALIDARG;      /* (YUY2, Y210, Y216: whole pairs of pixels) */
   tex_sync(d, t);      /* (what views drew into it goes in first: this write comes after) */
   ++t->version;
   UINT d12_sub;
@@ -1064,7 +1065,15 @@ static HRESULT tex_make(Dev *d, const D3D11_TEXTURE2D_DESC *in, UINT slices, ID3
   const TexFormat *made_format = tex_format(desc.Format);
   const BOOL planar = made_format && (made_format->flags & FMT_PLANAR);
   if (bind & D3D11_BIND_VIDEO_ENCODER) return E_INVALIDARG;
-  if ((bind & D3D11_BIND_DECODER) && desc.Format != DXGI_FORMAT_NV12 && desc.Format != DXGI_FORMAT_P010) return E_INVALIDARG;
+  const BOOL yuv = made_format && (made_format->flags & FMT_YUV);
+  /* (the decoders' formats: NV12 and P010, P016 for AV1's 12-bit 4:2:0, the packed ones of AV1's profiles 1 and 2) */
+  if ((bind & D3D11_BIND_DECODER) && desc.Format != DXGI_FORMAT_NV12 && desc.Format != DXGI_FORMAT_P010 && desc.Format != DXGI_FORMAT_P016 && !yuv) return E_INVALIDARG;
+  if (yuv) {
+    /* AYUV, Y410, Y416, YUY2, Y210, Y216: a 2D texture or array of one level, not multisampled, a depth buffer or a cube; YUY2, Y210, Y216 of even width */
+    if (slices || desc.MipLevels != 1 || desc.SampleDesc.Count != 1 || desc.SampleDesc.Quality || (desc.MiscFlags & D3D11_RESOURCE_MISC_TEXTURECUBE) ||
+        (bind & D3D11_BIND_DEPTH_STENCIL) || (format_pairs(desc.Format) && (desc.Width & 1)))
+      return E_INVALIDARG;
+  }
   if (planar) {
     /* NV12, P010, P016: a 2D texture or array of one level, of even width and height (the chroma is half of both), not multisampled, not a depth buffer, a cube or
      * shared (D3D11_FEATURE_D3D11_OPTIONS4: no shared NV12); the CPU reaches one of a single slice (as on Windows, which has no CPU access to arrays of them) */
@@ -1097,7 +1106,7 @@ static HRESULT tex_make(Dev *d, const D3D11_TEXTURE2D_DESC *in, UINT slices, ID3
   if (desc.ArraySize > 256) { tex_refused(&desc, "an array of more than 256"); return E_INVALIDARG; }
   const BOOL layered = cube || slices || desc.ArraySize > 1;
   /* (a render target of levels or layers: the kernel draws into images of one level and one layer, so the texture is drawn into through targets of its own) */
-  const BOOL shadowed = !res && !planar && (desc.BindFlags & D3D11_BIND_RENDER_TARGET) && desc.SampleDesc.Count == 1 && (desc.MipLevels != 1 || layered);
+  const BOOL shadowed = !res && !planar && !yuv && (desc.BindFlags & D3D11_BIND_RENDER_TARGET) && desc.SampleDesc.Count == 1 && (desc.MipLevels != 1 || layered);
   /* (a format that cannot be had for that use: refused as such, before what the kernel cannot do) */
   if (!tex_format_for(desc.Format, desc.BindFlags) && !(res && tex_format(desc.Format))) { tex_refused(&desc, "the format, for that use"); return E_INVALIDARG; }
   /* (the kernel samples volumes, arrays and cubes; it does not draw into them, nor give unordered access to textures; a depth buffer is drawn into whole) */
@@ -1376,6 +1385,7 @@ static HRESULT rtv_create(Dev *d, ID3D11Resource *resource, const D3D11_RENDER_T
       return E_INVALIDARG;
   } else {
     if (plane_slice > 0) return E_INVALIDARG;      /* (a format of one plane) */
+    if ((t->fmt->flags & FMT_YUV) && (!desc || !yuv_view_ok(t->desc.Format, desc->Format, TRUE))) return E_INVALIDARG;      /* (AYUV: as R8G8B8A8) */
     if (desc && !rtv_subresource(t, desc, &level, &layer)) return E_INVALIDARG;
     if (!t->shadowed && (level || layer)) return E_INVALIDARG;
   }
@@ -1423,6 +1433,13 @@ static HRESULT rtv_create(Dev *d, ID3D11Resource *resource, const D3D11_RENDER_T
     v->desc.rtv.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2DMS;
     D3D12_RENDER_TARGET_VIEW_DESC ms = {t->stored, D3D12_RTV_DIMENSION_TEXTURE2DMS, {{0}}};
     ID3D12Device_CreateRenderTargetView(d->d12, t->res, &ms, v->handle);
+  } else if (t->fmt->flags & FMT_YUV) {
+    /* (AYUV: a view of its pixels' format - Direct3D 12 below makes no view of the YUV format itself; slice 0, as for the other formats here) */
+    D3D12_RENDER_TARGET_VIEW_DESC r;
+    memset(&r, 0, sizeof r);
+    r.Format = desc->Format;
+    r.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
+    ID3D12Device_CreateRenderTargetView(d->d12, t->res, &r, v->handle);
   } else ID3D12Device_CreateRenderTargetView(d->d12, t->res, NULL, v->handle);
   return give(v, (void **)out);
 }
@@ -1501,6 +1518,7 @@ static HRESULT srv_create(Dev *d, ID3D11Resource *resource, const D3D11_SHADER_R
                      &plane, &slice))
       return E_INVALIDARG;
   } else if (plane_slice > 0) return E_INVALIDARG;      /* (a format of one plane) */
+  if ((t->fmt->flags & FMT_YUV) && (!desc || !yuv_view_ok(t->desc.Format, desc->Format, FALSE))) return E_INVALIDARG;      /* (packed YUV: a view of its pixels' format) */
   if (!out) return S_FALSE;
   View *v = child_new(sizeof *v, d, &srv_vtbl, g_srv_iids, srv_destroy);
   if (!v) return E_OUTOFMEMORY;
@@ -1569,6 +1587,7 @@ static HRESULT uav_create(Dev *d, ID3D11Resource *resource, const D3D11_UNORDERE
   } else {
     if (plane_slice > 0) return E_INVALIDARG;      /* (a format of one plane) */
     if (!(t->desc.BindFlags & D3D11_BIND_UNORDERED_ACCESS)) return E_INVALIDARG;
+    if ((t->fmt->flags & FMT_YUV) && (!desc || !yuv_view_ok(t->desc.Format, desc->Format, FALSE))) return E_INVALIDARG;      /* (packed YUV: a view of its pixels' format) */
     if (!desc) {
       whole.Format = t->desc.Format;
       whole.ViewDimension = t->one_d ? (t->desc.ArraySize > 1 ? D3D11_UAV_DIMENSION_TEXTURE1DARRAY : D3D11_UAV_DIMENSION_TEXTURE1D)

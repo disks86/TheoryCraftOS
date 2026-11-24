@@ -52,9 +52,10 @@ struct ScratchPlanes {
     p.width = w;
     p.height = h;
     p.channels = channels;
+    for (uint8_t c = 0; c < 4; ++c) p.offset[c] = c;   // (F32 reads floats[address], the address taking the channel's offset)
     return true;
   }
-  void put(uint32_t k, uint32_t x, uint32_t y, uint32_t c, float v) const { data[k][y * plane[k].pitch + x * plane[k].step + c] = v; }
+  void put(uint32_t k, uint32_t x, uint32_t y, uint32_t c, float v) const { data[k][plane[k].address(x, y, c)] = v; }
 };
 
 // The size of the view a stream shows of a picture of w x h.
@@ -157,6 +158,27 @@ struct Yadif {
   static float min3(float a, float b, float c) { return min2(min2(a, b), c); }
 };
 
+// The channels of plane k that sampling reads (and so the stages make): plane 1 the chroma pair; plane 0 luma (and alpha, channel 3) of YUV, R, G, B (and alpha) of RGB.
+// (A packed YUV picture's plane 0 describes all of its sample: only these are its luma plane's.) A scratch plane needs the highest one + 1 slots.
+uint32_t stage_channels(const ImageAccess& img, uint32_t k, uint8_t (&list)[4]) {
+  uint32_t n = 0;
+  if (k == 1) {
+    list[n++] = 0;
+    list[n++] = 1;
+    return n;
+  }
+  if (!img.yuv) {
+    list[n++] = 0;
+    list[n++] = 1;
+    list[n++] = 2;
+  } else {
+    list[n++] = 0;
+  }
+  if (img.has_alpha) list[n++] = 3;
+  return n;
+}
+uint8_t stage_slots(const uint8_t (&list)[4], uint32_t n) { return static_cast<uint8_t>(list[n - 1] + 1); }
+
 // Whether a stream needs the stages.
 bool needs_stages(const VpStream& in) {
   return in.stereo != VpStereoFormat::None || (in.field_order != VpFieldOrder::Progressive && in.deinterlace != VpDeinterlace::Weave) || in.noise_reduction > 0.0f ||
@@ -175,13 +197,16 @@ float channel_range(const ImageAccess& img, uint32_t k, uint32_t c) {
 // the threshold growing with `strength`; 0 keeps the picture) or edge enhancement (an unsharp mask: the sample plus `amount` times its difference from the 3x3 mean).
 void filter_plane(const ImageAccess& img, const ScratchPlanes& from, ScratchPlanes& to, uint32_t k, bool noise, float strength) {
   const PlaneAccess& p = from.plane[k];
+  uint8_t list[4];
+  const uint32_t count = stage_channels(img, k, list);
   ViewPlane v;
   v.plane = &p;
   v.src_w = v.view_w = static_cast<int32_t>(p.width);
   v.src_h = v.view_h = static_cast<int32_t>(p.height);
   for (uint32_t y = 0; y < p.height; ++y)
     for (uint32_t x = 0; x < p.width; ++x)
-      for (uint32_t c = 0; c < p.channels; ++c) {
+      for (uint32_t ci = 0; ci < count; ++ci) {
+        const uint32_t c = list[ci];
         const int32_t i = static_cast<int32_t>(x), j = static_cast<int32_t>(y);
         const float centre = v.at(i, j, c);
         const bool luma = !is_chroma_channel(img, k, c);
@@ -234,7 +259,11 @@ void filter_plane(const ImageAccess& img, const ScratchPlanes& from, ScratchPlan
     const PlaneAccess& p = img->plane[k];
     pw[k] = static_cast<uint32_t>((uint64_t{vw} * p.width + img->width - 1) / img->width);   // (what sampling a picture of the view's size reads of the plane)
     ph[k] = static_cast<uint32_t>((uint64_t{vh} * p.height + img->height - 1) / img->height);
-    if (!scratch[0].make(*allocator, k, pw[k], ph[k], p.channels)) return VpResult::NoMemory;
+    uint8_t list[4];
+    const uint32_t count = stage_channels(*img, k, list);
+    for (uint32_t i = 0; i < count; ++i)
+      if (list[i] >= p.channels) return VpResult::Invalid;   // (a channel sampling reads that the plane has not got)
+    if (!scratch[0].make(*allocator, k, pw[k], ph[k], stage_slots(list, count))) return VpResult::NoMemory;
   }
   for (uint32_t k = 0; k < planes; ++k) {
     ViewPlane views[3];
@@ -253,11 +282,13 @@ void filter_plane(const ImageAccess& img, const ScratchPlanes& from, ScratchPlan
     }
     const ViewPlane& cur = views[0];
     Yadif yadif{&views[1], &cur, &views[2], first ? &views[1] : &cur, first ? &cur : &views[2], cur.view_w, cur.view_h, integer};
-    const uint8_t channels = img->plane[k].channels;
+    uint8_t list[4];
+    const uint32_t channels = stage_channels(*img, k, list);
     for (int32_t j = 0; j < cur.view_h; ++j) {
       const bool missing = interlaced && cur.row_parity(j) != shown;
       for (int32_t i = 0; i < cur.view_w; ++i)
-        for (uint32_t c = 0; c < channels; ++c) {
+        for (uint32_t ci = 0; ci < channels; ++ci) {
+          const uint32_t c = list[ci];
           float v;
           if (!missing) v = cur.at(i, j, c);
           else if (in.deinterlace == VpDeinterlace::Bob) v = (cur.at(i, j > 0 ? j - 1 : j + 1, c) + cur.at(i, j + 1 < cur.view_h ? j + 1 : j - 1, c)) * 0.5f;
@@ -273,7 +304,7 @@ void filter_plane(const ImageAccess& img, const ScratchPlanes& from, ScratchPlan
     if (!(strength > 0.0f)) continue;
     ScratchPlanes& to = scratch[at ^ 1];
     for (uint32_t k = 0; k < planes; ++k)
-      if (to.data[k].empty() && !to.make(*allocator, k, pw[k], ph[k], img->plane[k].channels)) return VpResult::NoMemory;
+      if (to.data[k].empty() && !to.make(*allocator, k, pw[k], ph[k], scratch[at].plane[k].channels)) return VpResult::NoMemory;
     for (uint32_t k = 0; k < planes; ++k) filter_plane(*img, scratch[at], to, k, noise, strength);
     at ^= 1;
   }

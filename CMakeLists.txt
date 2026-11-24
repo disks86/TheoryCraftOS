@@ -1085,6 +1085,8 @@ add_executable(BOOTX64
   src/Hardware/VideoCodec/Dxva/DxvaVp9.cpp
   src/Hardware/VideoCodec/Dxva/DxvaHevc.cpp
   src/Hardware/VideoCodec/Dxva/DxvaAv1.cpp
+  src/Hardware/VideoCodec/Dxva/DxvaVc1.cpp
+  src/Hardware/VideoCodec/Dxva/DxvaMpeg4.cpp
   src/Hardware/VideoCodec/SystemVideoCodecs.cpp
   src/Hardware/VideoCodec/AMD/AmdIpDiscovery.cpp
   src/Hardware/VideoCodec/AMD/AmdVcnFirmware.cpp
