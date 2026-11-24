@@ -448,7 +448,7 @@ static void test_processor(void) {
   ID3D12VideoProcessor *vp = NULL;
   CHECK_HR(ID3D12VideoDevice_CreateVideoProcessor(g_vdev, 0, &osd, 1, &isd, &IID_ID3D12VideoProcessor, (void **)&vp));
   D3D12_VIDEO_PROCESS_INPUT_STREAM_DESC deint = isd;
-  deint.EnableAutoProcessing = TRUE;      /* (there is no automatic processing) */
+  deint.FilterFlags = (D3D12_VIDEO_PROCESS_FILTER_FLAGS)0x100;      /* (a filter there is not) */
   ID3D12VideoProcessor *bad = NULL;
   CHECK(ID3D12VideoDevice_CreateVideoProcessor(g_vdev, 0, &osd, 1, &deint, &IID_ID3D12VideoProcessor, (void **)&bad) == E_INVALIDARG && !bad);
   if (!vp) return;
@@ -743,6 +743,8 @@ static void test_processor_yuv(void) {
 #include "av1_dxva_data.h"
 static void test_decode(void);
 static void test_processor_effects(void);
+static void test_processor_temporal(void);
+static void test_decode_conversion(void);
 
 int main(void) {
   if (FAILED(D3D12CreateDevice(NULL, D3D_FEATURE_LEVEL_11_0, &IID_ID3D12Device, (void **)&g_dev)) || !g_dev) {
@@ -767,7 +769,9 @@ int main(void) {
   test_processor();
   test_processor_yuv();
   test_processor_effects();
+  test_processor_temporal();
   test_decode();
+  test_decode_conversion();
   if (g_vdev) ID3D12VideoDevice_Release(g_vdev);
   ID3D12Fence_Release(g_fence);
   ID3D12CommandQueue_Release(g_queue);
@@ -1306,9 +1310,10 @@ static void test_processor_effects(void) {
   ps.OutputFormat.ColorSpace = DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709;
   CHECK_HR(ID3D12VideoDevice_CheckFeatureSupport(g_vdev, D3D12_FEATURE_VIDEO_PROCESS_SUPPORT, &ps, sizeof ps));
   CHECK(ps.SupportFlags == D3D12_VIDEO_PROCESS_SUPPORT_FLAG_SUPPORTED && ps.DeinterlaceSupport == (D3D12_VIDEO_PROCESS_DEINTERLACE_FLAG_BOB | D3D12_VIDEO_PROCESS_DEINTERLACE_FLAG_CUSTOM));
-  CHECK((ps.FeatureSupport & D3D12_VIDEO_PROCESS_FEATURE_FLAG_LUMA_KEY) && (ps.FeatureSupport & D3D12_VIDEO_PROCESS_FEATURE_FLAG_STEREO) && ps.FilterSupport == 0x7F && !ps.AutoProcessingSupport);
+  CHECK((ps.FeatureSupport & D3D12_VIDEO_PROCESS_FEATURE_FLAG_LUMA_KEY) && (ps.FeatureSupport & D3D12_VIDEO_PROCESS_FEATURE_FLAG_STEREO) && ps.FilterSupport == 0xFF && ps.AutoProcessingSupport == 0xF);
   CHECK(ps.FilterRangeSupport[0].Minimum == -400 && ps.FilterRangeSupport[0].Maximum == 400 && ps.FilterRangeSupport[0].Default == 0 && ps.FilterRangeSupport[0].Multiplier == 0.25f);
-  CHECK(ps.FilterRangeSupport[1].Maximum == 640 && ps.FilterRangeSupport[1].Default == 64 && ps.FilterRangeSupport[1].Multiplier == 1.0f / 64 && ps.FilterRangeSupport[7].Maximum == 0);
+  CHECK(ps.FilterRangeSupport[1].Maximum == 640 && ps.FilterRangeSupport[1].Default == 64 && ps.FilterRangeSupport[1].Multiplier == 1.0f / 64 && ps.FilterRangeSupport[7].Maximum == 127 &&
+        ps.FilterRangeSupport[8].Maximum == 0);
   ps.InputSample.Format.Format = DXGI_FORMAT_P010;
   ps.InputSample.Format.ColorSpace = DXGI_COLOR_SPACE_YCBCR_STUDIO_G2084_LEFT_P2020;
   CHECK_HR(ID3D12VideoDevice_CheckFeatureSupport(g_vdev, D3D12_FEATURE_VIDEO_PROCESS_SUPPORT, &ps, sizeof ps));
@@ -1540,4 +1545,483 @@ static void test_processor_effects(void) {
     if (out) ID3D12Resource_Release(out);
   }
   rig_close(&rig);
+}
+
+/* ---- frame rate conversion, inverse telecine, the stereo adjustment filter, automatic processing ------------------------------------------------------------------- */
+
+/* The test's own sine and cosine (a reduced argument's Taylor series): the CPU emulator's x87 fsin gives NaN, and the scene must not depend on it. */
+static double tsin(double x) {
+  const double pi = 3.14159265358979323846;
+  x = fmod(x, 2 * pi);
+  if (x > pi) x -= 2 * pi;
+  if (x < -pi) x += 2 * pi;
+  double term = x, sum = 0;
+  for (int k = 1; k < 40; k += 2) { sum += term; term *= -x * x / ((k + 1) * (k + 2)); }
+  return sum;
+}
+static double tcos(double x) { return tsin(x + 1.57079632679489661923); }
+/* A moving test picture (full-range NV12 luma; chroma a little colour that moves too), at film frame k. */
+static BYTE scene_luma(UINT x, UINT y, int k) {
+  const double fx = (double)x - 3.0 * k, fy = (double)y - 1.0 * k;
+  double v = 120 + 50 * tsin(0.27 * fx + 0.11 * fy) + 30 * tsin(0.61 * fy - 0.2 * fx) + 20 * tsin(0.9 * fx + 0.75 * fy);
+  if ((fx - 20) * (fx - 20) + (fy - 12) * (fy - 12) < 49) v += 60;
+  return (BYTE)(v < 0 ? 0 : v > 255 ? 255 : v);
+}
+static void scene_frame(BYTE *f, UINT w, UINT h, int k) {
+  for (UINT y = 0; y < h; ++y) for (UINT x = 0; x < w; ++x) f[y * w + x] = scene_luma(x, y, k);
+  for (UINT y = 0; y < h / 2; ++y)
+    for (UINT x = 0; x < w / 2; ++x) {
+      f[w * h + y * w + 2 * x] = (BYTE)(128 + 30 * tsin(0.2 * (2.0 * x - 3 * k)));
+      f[w * h + y * w + 2 * x + 1] = (BYTE)(128 + 20 * tcos(0.15 * (2.0 * y - k)));
+    }
+}
+/* The rows of one parity (luma rows, and the chroma rows of that parity) of `from` into `to`. */
+static void field_rows(BYTE *to, const BYTE *from, UINT w, UINT h, int parity) {
+  for (UINT y = (UINT)parity; y < h; y += 2) memcpy(to + y * w, from + y * w, w);
+  for (UINT y = (UINT)parity; y < h / 2; y += 2) memcpy(to + w * h + y * w, from + w * h + y * w, w);
+}
+
+static void test_processor_temporal(void) {
+  if (!g_vdev) return;
+  enum { W = 64, H = 48 };
+  const DXGI_COLOR_SPACE_TYPE full = DXGI_COLOR_SPACE_YCBCR_FULL_G22_LEFT_P709;
+  D3D12_VIDEO_PROCESS_INPUT_STREAM_DESC isd;
+  D3D12_VIDEO_PROCESS_OUTPUT_STREAM_DESC osd;
+  VpRig rig;
+  if (!rig_open(&rig)) { CHECK(0); return; }
+  static BYTE frame[W * H * 3 / 2], got[W * H * 3 / 2], want[W * H * 3 / 2];
+
+  /* the conversions VIDEO_PROCESS_SUPPORT and REFERENCE_INFO report: progressive 24 -> 60 (blending, a future frame), interlaced 30 -> 24 (inverse telecine, five
+   * frames either way); interlaced 30 -> 25 is not had */
+  D3D12_FEATURE_DATA_VIDEO_PROCESS_SUPPORT ps;
+  memset(&ps, 0, sizeof ps);
+  ps.InputSample.Width = W; ps.InputSample.Height = H;
+  ps.InputSample.Format.Format = ps.OutputFormat.Format = DXGI_FORMAT_NV12;
+  ps.InputSample.Format.ColorSpace = ps.OutputFormat.ColorSpace = full;
+  ps.InputFrameRate = (DXGI_RATIONAL){24, 1};
+  ps.OutputFrameRate = (DXGI_RATIONAL){60, 1};
+  CHECK_HR(ID3D12VideoDevice_CheckFeatureSupport(g_vdev, D3D12_FEATURE_VIDEO_PROCESS_SUPPORT, &ps, sizeof ps));
+  CHECK(ps.SupportFlags & D3D12_VIDEO_PROCESS_SUPPORT_FLAG_SUPPORTED);
+  CHECK(ps.AutoProcessingSupport == (D3D12_VIDEO_PROCESS_AUTO_PROCESSING_FLAG_DENOISE | D3D12_VIDEO_PROCESS_AUTO_PROCESSING_FLAG_DERINGING |
+                                     D3D12_VIDEO_PROCESS_AUTO_PROCESSING_FLAG_EDGE_ENHANCEMENT | D3D12_VIDEO_PROCESS_AUTO_PROCESSING_FLAG_COLOR_CORRECTION));
+  CHECK(ps.FilterSupport == 0xFF && ps.FilterRangeSupport[7].Minimum == -128 && ps.FilterRangeSupport[7].Maximum == 127 && ps.FilterRangeSupport[7].Multiplier == 1.0f);
+  ps.InputFieldType = D3D12_VIDEO_FIELD_TYPE_INTERLACED_TOP_FIELD_FIRST;
+  ps.InputFrameRate = (DXGI_RATIONAL){30000, 1001};
+  ps.OutputFrameRate = (DXGI_RATIONAL){24000, 1001};
+  CHECK_HR(ID3D12VideoDevice_CheckFeatureSupport(g_vdev, D3D12_FEATURE_VIDEO_PROCESS_SUPPORT, &ps, sizeof ps));
+  CHECK(ps.SupportFlags & D3D12_VIDEO_PROCESS_SUPPORT_FLAG_SUPPORTED);
+  ps.OutputFrameRate = (DXGI_RATIONAL){25, 1};
+  CHECK_HR(ID3D12VideoDevice_CheckFeatureSupport(g_vdev, D3D12_FEATURE_VIDEO_PROCESS_SUPPORT, &ps, sizeof ps));
+  CHECK(!(ps.SupportFlags & D3D12_VIDEO_PROCESS_SUPPORT_FLAG_SUPPORTED));
+  D3D12_FEATURE_DATA_VIDEO_PROCESS_REFERENCE_INFO ri;
+  memset(&ri, 0, sizeof ri);
+  ri.InputFrameRate = (DXGI_RATIONAL){24, 1};
+  ri.OutputFrameRate = (DXGI_RATIONAL){60, 1};
+  ri.EnableAutoProcessing = TRUE;
+  CHECK_HR(ID3D12VideoDevice_CheckFeatureSupport(g_vdev, D3D12_FEATURE_VIDEO_PROCESS_REFERENCE_INFO, &ri, sizeof ri));
+  CHECK(ri.PastFrames == 0 && ri.FutureFrames == 1);
+  ri.DeinterlaceMode = D3D12_VIDEO_PROCESS_DEINTERLACE_FLAG_CUSTOM;
+  ri.InputFrameRate = (DXGI_RATIONAL){30, 1};
+  ri.OutputFrameRate = (DXGI_RATIONAL){24, 1};
+  CHECK_HR(ID3D12VideoDevice_CheckFeatureSupport(g_vdev, D3D12_FEATURE_VIDEO_PROCESS_REFERENCE_INFO, &ri, sizeof ri));
+  CHECK(ri.PastFrames == 5 && ri.FutureFrames == 5);
+
+  /* frame rate conversion, 24 to 60 frames a second: the outputs between two frames blend them (constant frames of luma 40 and 200: 40, 104, 168, then 72, 136) */
+  {
+    vp_descs(DXGI_FORMAT_NV12, full, DXGI_FORMAT_NV12, full, &isd, &osd);
+    isd.FrameRate = (DXGI_RATIONAL){24, 1};
+    osd.FrameRate = (DXGI_RATIONAL){60, 1};
+    isd.NumFutureFrames = 1;
+    ID3D12VideoProcessor *vp = make_vp(&isd, &osd);
+    memset(frame, 40, W * H);
+    memset(frame + W * H, 128, W * H / 2);
+    ID3D12Resource *a = nv12_of(frame, W, H, 0);
+    memset(frame, 200, W * H);
+    ID3D12Resource *b = nv12_of(frame, W, H, 0);
+    ID3D12Resource *out = texture(DXGI_FORMAT_NV12, W, H, 1, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
+    const struct { UINT input, index, luma; } expect[] = {{0, 0, 40}, {0, 1, 104}, {0, 2, 168}, {1, 0, 72}, {1, 1, 136}};
+    int right = 0;
+    for (UINT k = 0; vp && a && b && out && k < 5; ++k) {
+      D3D12_VIDEO_PROCESS_INPUT_STREAM_ARGUMENTS ia;
+      D3D12_VIDEO_PROCESS_OUTPUT_STREAM_ARGUMENTS oa;
+      stream_args(&ia, a, W, H, W, H);
+      out_args(&oa, out, W, H);
+      ID3D12Resource *future[1] = {b};
+      ia.InputStream[0].ReferenceSet.NumFutureFrames = 1;
+      ia.InputStream[0].ReferenceSet.ppFutureFrames = future;
+      ia.RateInfo.InputFrameOrField = expect[k].input;
+      ia.RateInfo.OutputIndex = expect[k].index;
+      rig_run(&rig, vp, &oa, 1, &ia, NULL);
+      copy_subresources(out, 0, 2, got, sizeof got, 0);
+      right += abs(got[W * 10 + 10] - (int)expect[k].luma) <= 1 && abs(got[W * H + 2 * W + 8] - 128) <= 1;
+    }
+    printf("d3d12videotest: frame rate conversion 24 -> 60: %d of 5 outputs the blend of the frames around them\n", right);
+    CHECK(right == 5);
+    /* a rate the processor does not convert: no processor */
+    vp_descs(DXGI_FORMAT_NV12, full, DXGI_FORMAT_NV12, full, &isd, &osd);
+    isd.FieldType = D3D12_VIDEO_FIELD_TYPE_INTERLACED_TOP_FIELD_FIRST;
+    isd.FrameRate = (DXGI_RATIONAL){30, 1};
+    osd.FrameRate = (DXGI_RATIONAL){25, 1};
+    ID3D12VideoProcessor *bad = NULL;
+    CHECK(ID3D12VideoDevice_CreateVideoProcessor(g_vdev, 0, &osd, 1, &isd, &IID_ID3D12VideoProcessor, (void **)&bad) == E_INVALIDARG && !bad);
+    if (out) ID3D12Resource_Release(out);
+    if (b) ID3D12Resource_Release(b);
+    if (a) ID3D12Resource_Release(a);
+    if (vp) ID3D12VideoProcessor_Release(vp);
+  }
+
+  /* inverse telecine, 30 interlaced frames a second (3:2 pulldown of 24) to 24: each frame of a cycle of five with its five frames either way; the outputs are the film
+   * frames bit for bit (as ffmpeg's fieldmatch,decimate gives them back: tests/data/videoprocess/ivtc_ffmpeg.sh) */
+  {
+    enum { FILM = 12, FRAMES = 15 };
+    static BYTE film[FILM][W * H * 3 / 2], tele[FRAMES][W * H * 3 / 2];
+    for (int k = 0; k < FILM; ++k) scene_frame(film[k], W, H, k);
+    int field = 0, parity = 0;
+    for (int k = 0; k < FILM && field / 2 < FRAMES; ++k)
+      for (int n = 0; n < (k % 2 ? 3 : 2) && field / 2 < FRAMES; ++n, ++field, parity ^= 1) field_rows(tele[field / 2], film[k], W, H, parity);
+    ID3D12Resource *t[FRAMES], *f[FILM];
+    for (int k = 0; k < FRAMES; ++k) t[k] = nv12_of(tele[k], W, H, 0);
+    for (int k = 0; k < FILM; ++k) f[k] = nv12_of(film[k], W, H, 0);
+    vp_descs(DXGI_FORMAT_NV12, full, DXGI_FORMAT_NV12, full, &isd, &osd);
+    isd.FieldType = D3D12_VIDEO_FIELD_TYPE_INTERLACED_TOP_FIELD_FIRST;
+    isd.DeinterlaceMode = D3D12_VIDEO_PROCESS_DEINTERLACE_FLAG_CUSTOM;
+    isd.FrameRate = (DXGI_RATIONAL){30000, 1001};
+    osd.FrameRate = (DXGI_RATIONAL){24000, 1001};
+    isd.NumPastFrames = isd.NumFutureFrames = 5;
+    ID3D12VideoProcessor *vp = make_vp(&isd, &osd);
+    D3D12_VIDEO_PROCESS_INPUT_STREAM_DESC pd;
+    D3D12_VIDEO_PROCESS_OUTPUT_STREAM_DESC pod;
+    vp_descs(DXGI_FORMAT_NV12, full, DXGI_FORMAT_NV12, full, &pd, &pod);
+    ID3D12VideoProcessor *plain = make_vp(&pd, &pod);
+    ID3D12Resource *out = texture(DXGI_FORMAT_NV12, W, H, 1, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET), *ref = texture(DXGI_FORMAT_NV12, W, H, 1, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
+    int same = 0, outputs = 0;
+    for (int n = 5; vp && plain && out && ref && n < 10; ++n) {      /* (the second cycle: frames 5 .. 9 make film frames 4 .. 7) */
+      const int c = n % 5;
+      if (c == 4) continue;      /* (the cycle's last frame makes no output: its time is past the fourth output's) */
+      D3D12_VIDEO_PROCESS_INPUT_STREAM_ARGUMENTS ia;
+      D3D12_VIDEO_PROCESS_OUTPUT_STREAM_ARGUMENTS oa;
+      stream_args(&ia, t[n], W, H, W, H);
+      out_args(&oa, out, W, H);
+      ID3D12Resource *past[5], *future[5];
+      for (int k = 0; k < 5; ++k) { past[k] = t[n - 5 + k]; future[k] = t[n + 1 + k]; }
+      ia.InputStream[0].ReferenceSet = (D3D12_VIDEO_PROCESS_REFERENCE_SET){5, past, NULL, 5, future, NULL};
+      ia.RateInfo.InputFrameOrField = (UINT)n;
+      ia.RateInfo.OutputIndex = 0;
+      rig_run(&rig, vp, &oa, 1, &ia, NULL);
+      copy_subresources(out, 0, 2, got, sizeof got, 0);
+      const int j = (c * 4 + 4) / 5;      /* (ceil(4 c / 5): the film frame of the cycle at this frame's time) */
+      stream_args(&ia, f[4 + j], W, H, W, H);
+      out_args(&oa, ref, W, H);
+      rig_run(&rig, plain, &oa, 1, &ia, NULL);
+      copy_subresources(ref, 0, 2, want, sizeof want, 0);
+      same += memcmp(got, want, sizeof got) == 0;
+      ++outputs;
+    }
+    printf("d3d12videotest: inverse telecine (30i of 3:2 pulldown -> 24p): %d of %d outputs the film frames, bit for bit\n", same, outputs);
+    CHECK(outputs == 4 && same == 4);
+    if (out) ID3D12Resource_Release(out);
+    if (ref) ID3D12Resource_Release(ref);
+    for (int k = 0; k < FRAMES; ++k) if (t[k]) ID3D12Resource_Release(t[k]);
+    for (int k = 0; k < FILM; ++k) if (f[k]) ID3D12Resource_Release(f[k]);
+    if (vp) ID3D12VideoProcessor_Release(vp);
+    if (plain) ID3D12VideoProcessor_Release(plain);
+  }
+
+  /* the stereo adjustment filter: a side by side picture into stereo output, the left view moved left by the level, the right view right */
+  {
+    for (UINT y = 0; y < H; ++y) for (UINT x = 0; x < W; ++x) frame[y * W + x] = (BYTE)(x < W / 2 ? 4 * x : 4 * (x - W / 2) + 100);
+    memset(frame + W * H, 128, W * H / 2);
+    ID3D12Resource *in = nv12_of(frame, W, H, 0), *out = texture(DXGI_FORMAT_NV12, W / 2, H, 2, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
+    vp_descs(DXGI_FORMAT_NV12, full, DXGI_FORMAT_NV12, full, &isd, &osd);
+    isd.StereoFormat = D3D12_VIDEO_FRAME_STEREO_FORMAT_HORIZONTAL;
+    isd.FilterFlags = D3D12_VIDEO_PROCESS_FILTER_FLAG_STEREO_ADJUSTMENT;
+    osd.EnableStereo = TRUE;
+    ID3D12VideoProcessor *vp = make_vp(&isd, &osd);
+    int right = 0;
+    if (vp && in && out) {
+      D3D12_VIDEO_PROCESS_INPUT_STREAM_ARGUMENTS ia;
+      D3D12_VIDEO_PROCESS_OUTPUT_STREAM_ARGUMENTS oa;
+      stream_args(&ia, in, W / 2, H, W / 2, H);
+      ia.FilterLevels[D3D12_VIDEO_PROCESS_FILTER_STEREO_ADJUSTMENT] = 3;
+      out_args(&oa, out, W / 2, H);
+      oa.OutputStream[1].pTexture2D = out;
+      oa.OutputStream[1].Subresource = 1;
+      rig_run(&rig, vp, &oa, 1, &ia, NULL);
+      static BYTE views[2][W / 2 * H * 3 / 2];
+      for (UINT k = 0; k < 2; ++k) {
+        copy_subresources(out, k, 1, views[k], W / 2 * H, 0);      /* (the luma of slice k) */
+        for (int x = 0; x < W / 2; ++x) {
+          int from = k == 0 ? x + 3 : x - 3;      /* (left view moved left: column x shows x + 3) */
+          from = from < 0 ? 0 : from > W / 2 - 1 ? W / 2 - 1 : from;
+          right += views[k][5 * (W / 2) + x] == (k == 0 ? 4 * from : 4 * from + 100);
+        }
+      }
+    }
+    printf("d3d12videotest: stereo adjustment 3: %d of %d columns of both views moved apart\n", right, W);
+    CHECK(right == W);
+    if (vp) ID3D12VideoProcessor_Release(vp);
+    if (in) ID3D12Resource_Release(in);
+    if (out) ID3D12Resource_Release(out);
+  }
+
+  /* automatic processing: a clean picture as it is, a noisy one denoised */
+  {
+    vp_descs(DXGI_FORMAT_NV12, DXGI_COLOR_SPACE_YCBCR_STUDIO_G22_LEFT_P709, DXGI_FORMAT_NV12, DXGI_COLOR_SPACE_YCBCR_STUDIO_G22_LEFT_P709, &isd, &osd);
+    ID3D12VideoProcessor *plain = make_vp(&isd, &osd);
+    isd.EnableAutoProcessing = TRUE;
+    ID3D12VideoProcessor *autop = make_vp(&isd, &osd);
+    ID3D12Resource *out = texture(DXGI_FORMAT_NV12, W, H, 1, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
+    int clean_same = 0;
+    double noise[2] = {0, 0};
+    for (int pass = 0; plain && autop && out && pass < 2; ++pass) {
+      unsigned seed = 99;
+      for (UINT y = 0; y < H; ++y)
+        for (UINT x = 0; x < W; ++x) {
+          seed = seed * 1103515245u + 12345u;
+          frame[y * W + x] = pass == 0 ? (BYTE)(x < W / 2 ? (y < H / 2 ? 16 : 128) : (y < H / 2 ? 235 : 60)) : (BYTE)(120 + (int)((seed >> 16) % 13) - 6);
+        }
+      memset(frame + W * H, 128, W * H / 2);
+      ID3D12Resource *in = nv12_of(frame, W, H, 0);
+      for (int k = 0; in && k < 2; ++k) {
+        D3D12_VIDEO_PROCESS_INPUT_STREAM_ARGUMENTS ia;
+        D3D12_VIDEO_PROCESS_OUTPUT_STREAM_ARGUMENTS oa;
+        stream_args(&ia, in, W, H, W, H);
+        out_args(&oa, out, W, H);
+        rig_run(&rig, k ? autop : plain, &oa, 1, &ia, NULL);
+        copy_subresources(out, 0, 2, k ? got : want, sizeof got, 0);
+      }
+      if (pass == 0) clean_same = memcmp(got, want, sizeof got) == 0;
+      else
+        for (int k = 0; k < 2; ++k) {
+          const BYTE *p = k ? got : want;
+          double s = 0, s2 = 0;
+          for (UINT i = 0; i < W * H; ++i) { s += p[i]; s2 += (double)p[i] * p[i]; }
+          noise[k] = sqrt(s2 / (W * H) - (s / (W * H)) * (s / (W * H)));
+        }
+      if (in) ID3D12Resource_Release(in);
+    }
+    printf("d3d12videotest: automatic processing: a clean picture %s, noise %.2f -> %.2f\n", clean_same ? "as it was" : "CHANGED", noise[0], noise[1]);
+    CHECK(clean_same && noise[1] < 0.7 * noise[0]);
+    if (out) ID3D12Resource_Release(out);
+    if (plain) ID3D12VideoProcessor_Release(plain);
+    if (autop) ID3D12VideoProcessor_Release(autop);
+  }
+  rig_close(&rig);
+}
+
+/* ---- decode conversion and histograms ------------------------------------------------------------------------------------------------------------------------------ */
+
+/* An H.264 stream decoded with conversion: DecodeFrame into a half-size NV12 texture (the picture's reference texture of the decoder's own size), DecodeFrame1 into a BGRA
+ * texture of full-range RGB with the Y, U and V histograms. Each output is what ProcessFrames makes of the reference the picture was decoded into, bit for bit; the
+ * histograms are the reference's counted here. */
+static void test_decode_conversion(void) {
+  if (!g_vdev) return;
+  size_t size = 0;
+  unsigned char *data = base64_decode(g_h264_bframes_b64, &size);
+  DxvaStream s;
+  DxvaPicture p;
+  const unsigned surfaces = 17;
+  if (!data || dxva_stream_open(&s, DXVA_CODEC_H264, data, size, surfaces) != 0 || dxva_stream_next(&s, &p) != 1) { CHECK(0); free(data); return; }
+  const UINT w = s.width, h = s.height, hw = w / 2, hh = h / 2;
+  const DXGI_COLOR_SPACE_TYPE studio = DXGI_COLOR_SPACE_YCBCR_STUDIO_G22_LEFT_P709, rgb = DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709;
+  /* what the device says of it */
+  D3D12_FEATURE_DATA_VIDEO_DECODE_CONVERSION_SUPPORT cs;
+  memset(&cs, 0, sizeof cs);
+  cs.Configuration.DecodeProfile = D3D12_VIDEO_DECODE_PROFILE_H264;
+  cs.DecodeSample.Width = w;
+  cs.DecodeSample.Height = h;
+  cs.DecodeSample.Format.Format = DXGI_FORMAT_NV12;
+  cs.DecodeSample.Format.ColorSpace = studio;
+  cs.OutputFormat.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+  cs.OutputFormat.ColorSpace = rgb;
+  CHECK_HR(ID3D12VideoDevice_CheckFeatureSupport(g_vdev, D3D12_FEATURE_VIDEO_DECODE_CONVERSION_SUPPORT, &cs, sizeof cs));
+  CHECK((cs.SupportFlags & D3D12_VIDEO_DECODE_CONVERSION_SUPPORT_FLAG_SUPPORTED) && cs.ScaleSupport.OutputSizeRange.MinWidth == 1 && cs.ScaleSupport.OutputSizeRange.MaxWidth >= 4096);
+  cs.OutputFormat.ColorSpace = DXGI_COLOR_SPACE_YCBCR_STUDIO_G22_LEFT_P709;      /* (a YCbCr space for an RGB format: no) */
+  CHECK_HR(ID3D12VideoDevice_CheckFeatureSupport(g_vdev, D3D12_FEATURE_VIDEO_DECODE_CONVERSION_SUPPORT, &cs, sizeof cs));
+  CHECK(cs.SupportFlags == D3D12_VIDEO_DECODE_CONVERSION_SUPPORT_FLAG_NONE);
+  D3D12_FEATURE_DATA_VIDEO_DECODE_HISTOGRAM hf;
+  memset(&hf, 0, sizeof hf);
+  hf.DecodeProfile = D3D12_VIDEO_DECODE_PROFILE_H264;
+  hf.Width = w;
+  hf.Height = h;
+  hf.DecodeFormat = DXGI_FORMAT_NV12;
+  CHECK_HR(ID3D12VideoDevice_CheckFeatureSupport(g_vdev, D3D12_FEATURE_VIDEO_DECODE_HISTOGRAM, &hf, sizeof hf));
+  CHECK(hf.Components == (D3D12_VIDEO_DECODE_HISTOGRAM_COMPONENT_FLAG_Y | D3D12_VIDEO_DECODE_HISTOGRAM_COMPONENT_FLAG_U | D3D12_VIDEO_DECODE_HISTOGRAM_COMPONENT_FLAG_V) &&
+        hf.BinCount == 64 && hf.CounterBitDepth == 32);
+  hf.DecodeFormat = DXGI_FORMAT_AYUV;      /* (H.264 does not decode into AYUV: no histograms of it) */
+  CHECK_HR(ID3D12VideoDevice_CheckFeatureSupport(g_vdev, D3D12_FEATURE_VIDEO_DECODE_HISTOGRAM, &hf, sizeof hf));
+  CHECK(hf.Components == D3D12_VIDEO_DECODE_HISTOGRAM_COMPONENT_FLAG_NONE);
+
+  D3D12_VIDEO_DECODER_DESC dd = {0, {D3D12_VIDEO_DECODE_PROFILE_H264, D3D12_BITSTREAM_ENCRYPTION_TYPE_NONE, D3D12_VIDEO_FRAME_CODED_INTERLACE_TYPE_NONE}};
+  D3D12_VIDEO_DECODER_HEAP_DESC hd;
+  memset(&hd, 0, sizeof hd);
+  hd.Configuration = dd.Configuration;
+  hd.DecodeWidth = w;
+  hd.DecodeHeight = h;
+  hd.Format = DXGI_FORMAT_NV12;
+  hd.MaxDecodePictureBufferCount = surfaces;
+  ID3D12VideoDecoder *dec = NULL;
+  ID3D12VideoDecoderHeap *heap = NULL;
+  CHECK_HR(ID3D12VideoDevice_CreateVideoDecoder(g_vdev, &dd, &IID_ID3D12VideoDecoder, (void **)&dec));
+  CHECK_HR(ID3D12VideoDevice_CreateVideoDecoderHeap(g_vdev, &hd, &IID_ID3D12VideoDecoderHeap, (void **)&heap));
+  ID3D12Resource *refs[DXVA_STREAM_MAX_SURFACES] = {0};
+  UINT subs[DXVA_STREAM_MAX_SURFACES] = {0};
+  for (unsigned i = 0; i < surfaces; ++i) refs[i] = texture(DXGI_FORMAT_NV12, w, h, 1, D3D12_RESOURCE_FLAG_NONE);
+  ID3D12Resource *small = texture(DXGI_FORMAT_NV12, hw, hh, 1, D3D12_RESOURCE_FLAG_NONE), *small_ref = texture(DXGI_FORMAT_NV12, hw, hh, 1, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
+  ID3D12Resource *bgra = texture(DXGI_FORMAT_B8G8R8A8_UNORM, w, h, 1, D3D12_RESOURCE_FLAG_NONE), *bgra_ref = texture(DXGI_FORMAT_B8G8R8A8_UNORM, w, h, 1, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
+  ID3D12Resource *hist = buffer(D3D12_HEAP_TYPE_DEFAULT, 4 * 256), *hist_rb = buffer(D3D12_HEAP_TYPE_READBACK, 4 * 256);
+  D3D12_COMMAND_QUEUE_DESC qd = {D3D12_COMMAND_LIST_TYPE_VIDEO_DECODE, 0, D3D12_COMMAND_QUEUE_FLAG_NONE, 0};
+  ID3D12CommandQueue *vq = NULL;
+  ID3D12CommandAllocator *va = NULL;
+  ID3D12VideoDecodeCommandList1 *vl = NULL;
+  ID3D12Device_CreateCommandQueue(g_dev, &qd, &IID_ID3D12CommandQueue, (void **)&vq);
+  ID3D12Device_CreateCommandAllocator(g_dev, D3D12_COMMAND_LIST_TYPE_VIDEO_DECODE, &IID_ID3D12CommandAllocator, (void **)&va);
+  if (va) ID3D12Device_CreateCommandList(g_dev, 0, D3D12_COMMAND_LIST_TYPE_VIDEO_DECODE, va, NULL, &IID_ID3D12VideoDecodeCommandList1, (void **)&vl);
+  ID3D12Resource *bits = buffer(D3D12_HEAP_TYPE_UPLOAD, 1 << 20);
+  /* the processor's view of the same conversions */
+  D3D12_VIDEO_PROCESS_INPUT_STREAM_DESC isd;
+  D3D12_VIDEO_PROCESS_OUTPUT_STREAM_DESC osd;
+  vp_descs(DXGI_FORMAT_NV12, studio, DXGI_FORMAT_NV12, studio, &isd, &osd);
+  ID3D12VideoProcessor *to_small = make_vp(&isd, &osd);
+  vp_descs(DXGI_FORMAT_NV12, studio, DXGI_FORMAT_B8G8R8A8_UNORM, rgb, &isd, &osd);
+  ID3D12VideoProcessor *to_bgra = make_vp(&isd, &osd);
+  VpRig rig;
+  const int have_rig = rig_open(&rig);
+  CHECK(dec && heap && refs[0] && small && small_ref && bgra && bgra_ref && hist && hist_rb && vq && vl && bits && to_small && to_bgra && have_rig);
+  BYTE *a = malloc((size_t)w * h * 4), *b = malloc((size_t)w * h * 4), *ref = malloc((size_t)w * h * 3 / 2);
+  int pictures = 0, small_same = 0, bgra_same = 0, hist_same = 0, r = 1;
+  while (dec && heap && vl && bits && have_rig && a && b && ref && r == 1 && pictures < 64) {
+    BYTE *map = NULL;
+    ID3D12Resource_Map(bits, 0, NULL, (void **)&map);
+    memcpy(map, p.bitstream, p.bitstream_size);
+    ID3D12Resource_Unmap(bits, 0, NULL);
+    D3D12_VIDEO_DECODE_INPUT_STREAM_ARGUMENTS in;
+    memset(&in, 0, sizeof in);
+    in.FrameArguments[in.NumFrameArguments++] = (D3D12_VIDEO_DECODE_FRAME_ARGUMENT){D3D12_VIDEO_DECODE_ARGUMENT_TYPE_PICTURE_PARAMETERS, p.picture_parameters_size, (void *)p.picture_parameters};
+    if (p.qmatrix_size)
+      in.FrameArguments[in.NumFrameArguments++] = (D3D12_VIDEO_DECODE_FRAME_ARGUMENT){D3D12_VIDEO_DECODE_ARGUMENT_TYPE_INVERSE_QUANTIZATION_MATRIX, p.qmatrix_size, (void *)p.qmatrix};
+    in.FrameArguments[in.NumFrameArguments++] = (D3D12_VIDEO_DECODE_FRAME_ARGUMENT){D3D12_VIDEO_DECODE_ARGUMENT_TYPE_SLICE_CONTROL, p.slice_control_size, (void *)p.slice_control};
+    in.ReferenceFrames.NumTexture2Ds = surfaces;
+    in.ReferenceFrames.ppTexture2Ds = refs;
+    in.ReferenceFrames.pSubresources = subs;
+    in.CompressedBitstream.pBuffer = bits;
+    in.CompressedBitstream.Size = p.bitstream_size;
+    in.pHeap = heap;
+    const int with_histograms = pictures % 2 == 1;
+    if (!with_histograms) {
+      D3D12_VIDEO_DECODE_OUTPUT_STREAM_ARGUMENTS out;
+      memset(&out, 0, sizeof out);
+      out.pOutputTexture2D = small;
+      out.ConversionArguments = (D3D12_VIDEO_DECODE_CONVERSION_ARGUMENTS){TRUE, refs[p.surface], 0, studio, studio};
+      ID3D12VideoDecodeCommandList1_DecodeFrame(vl, dec, &out, &in);
+    } else {
+      D3D12_VIDEO_DECODE_OUTPUT_STREAM_ARGUMENTS1 out;
+      memset(&out, 0, sizeof out);
+      out.pOutputTexture2D = bgra;
+      out.ConversionArguments = (D3D12_VIDEO_DECODE_CONVERSION_ARGUMENTS1){TRUE, refs[p.surface], 0, rgb, studio, w, h};
+      for (UINT c = 0; c < 3; ++c) out.Histograms[c] = (D3D12_VIDEO_DECODE_OUTPUT_HISTOGRAM){256 * c, hist};
+      ID3D12VideoDecodeCommandList1_DecodeFrame1(vl, dec, &out, &in);
+    }
+    ID3D12VideoDecodeCommandList1_Close(vl);
+    ID3D12CommandList *lists[1] = {(ID3D12CommandList *)vl};
+    ID3D12CommandQueue_ExecuteCommandLists(vq, 1, lists);
+    wait_queue(vq);
+    ID3D12CommandAllocator_Reset(va);
+    ID3D12VideoDecodeCommandList1_Reset(vl, va);
+    ++pictures;
+    /* what the processor makes of the reference */
+    D3D12_VIDEO_PROCESS_INPUT_STREAM_ARGUMENTS ia;
+    D3D12_VIDEO_PROCESS_OUTPUT_STREAM_ARGUMENTS oa;
+    if (!with_histograms) {
+      stream_args(&ia, refs[p.surface], w, h, hw, hh);
+      out_args(&oa, small_ref, hw, hh);
+      rig_run(&rig, to_small, &oa, 1, &ia, NULL);
+      copy_subresources(small, 0, 2, a, (size_t)hw * hh * 3 / 2, 0);
+      copy_subresources(small_ref, 0, 2, b, (size_t)hw * hh * 3 / 2, 0);
+      small_same += memcmp(a, b, (size_t)hw * hh * 3 / 2) == 0;
+    } else {
+      stream_args(&ia, refs[p.surface], w, h, w, h);
+      out_args(&oa, bgra_ref, w, h);
+      rig_run(&rig, to_bgra, &oa, 1, &ia, NULL);
+      copy_subresources(bgra, 0, 1, a, (size_t)w * h * 4, 0);
+      copy_subresources(bgra_ref, 0, 1, b, (size_t)w * h * 4, 0);
+      bgra_same += memcmp(a, b, (size_t)w * h * 4) == 0;
+      /* the histograms: 64 bins of the codes (bin = code >> 2) of the reference's luma, and of its chroma samples' U and V */
+      copy_subresources(refs[p.surface], 0, 2, ref, (size_t)w * h * 3 / 2, 0);
+      UINT want[3][64];
+      memset(want, 0, sizeof want);
+      for (UINT i = 0; i < w * h; ++i) ++want[0][ref[i] >> 2];
+      for (UINT i = 0; i < w * h / 4; ++i) { ++want[1][ref[w * h + 2 * i] >> 2]; ++want[2][ref[w * h + 2 * i + 1] >> 2]; }
+      Copier cp;
+      copier_begin(&cp);
+      ID3D12GraphicsCommandList_CopyBufferRegion(cp.l, hist_rb, 0, hist, 0, 4 * 256);
+      copier_run(&cp);
+      const UINT *counts = NULL;
+      ID3D12Resource_Map(hist_rb, 0, NULL, (void **)&counts);
+      int ok = counts != NULL;
+      for (UINT c = 0; ok && c < 3; ++c) ok = memcmp(counts + 64 * c, want[c], sizeof want[c]) == 0;
+      ID3D12Resource_Unmap(hist_rb, 0, NULL);
+      hist_same += ok;
+    }
+    /* (field pictures are not in this stream) */
+    r = dxva_stream_next(&s, &p);
+  }
+  printf("d3d12videotest: decode conversion: %d of %d half-size NV12 and %d of %d BGRA pictures the processor's of the reference, %d histograms counted right\n", small_same,
+         (pictures + 1) / 2, bgra_same, pictures / 2, hist_same);
+  CHECK(r == 0 && pictures == 14 && small_same == 7 && bgra_same == 7 && hist_same == 7);
+  /* refused (nothing recorded, the output left as it was): an output the size of which the arguments overrun, a misaligned histogram */
+  {
+    BYTE *before = malloc((size_t)w * h * 4);
+    if (before && bgra) {
+      copy_subresources(bgra, 0, 1, before, (size_t)w * h * 4, 0);
+      dxva_stream_close(&s);
+      int again = dxva_stream_open(&s, DXVA_CODEC_H264, data, size, surfaces) == 0 && dxva_stream_next(&s, &p) == 1;
+      for (int k = 0; again && k < 2; ++k) {
+        BYTE *map = NULL;
+        ID3D12Resource_Map(bits, 0, NULL, (void **)&map);
+        memcpy(map, p.bitstream, p.bitstream_size);
+        ID3D12Resource_Unmap(bits, 0, NULL);
+        D3D12_VIDEO_DECODE_INPUT_STREAM_ARGUMENTS in;
+        memset(&in, 0, sizeof in);
+        in.FrameArguments[in.NumFrameArguments++] = (D3D12_VIDEO_DECODE_FRAME_ARGUMENT){D3D12_VIDEO_DECODE_ARGUMENT_TYPE_PICTURE_PARAMETERS, p.picture_parameters_size, (void *)p.picture_parameters};
+        in.FrameArguments[in.NumFrameArguments++] = (D3D12_VIDEO_DECODE_FRAME_ARGUMENT){D3D12_VIDEO_DECODE_ARGUMENT_TYPE_SLICE_CONTROL, p.slice_control_size, (void *)p.slice_control};
+        in.ReferenceFrames.NumTexture2Ds = surfaces;
+        in.ReferenceFrames.ppTexture2Ds = refs;
+        in.ReferenceFrames.pSubresources = subs;
+        in.CompressedBitstream.pBuffer = bits;
+        in.CompressedBitstream.Size = p.bitstream_size;
+        in.pHeap = heap;
+        D3D12_VIDEO_DECODE_OUTPUT_STREAM_ARGUMENTS1 out;
+        memset(&out, 0, sizeof out);
+        out.pOutputTexture2D = bgra;
+        out.ConversionArguments = (D3D12_VIDEO_DECODE_CONVERSION_ARGUMENTS1){TRUE, refs[p.surface], 0, rgb, studio, k == 0 ? w + 1 : w, h};
+        if (k == 1) out.Histograms[0] = (D3D12_VIDEO_DECODE_OUTPUT_HISTOGRAM){100, hist};
+        ID3D12VideoDecodeCommandList1_DecodeFrame1(vl, dec, &out, &in);
+        ID3D12VideoDecodeCommandList1_Close(vl);
+        ID3D12CommandList *lists[1] = {(ID3D12CommandList *)vl};
+        ID3D12CommandQueue_ExecuteCommandLists(vq, 1, lists);
+        wait_queue(vq);
+        ID3D12CommandAllocator_Reset(va);
+        ID3D12VideoDecodeCommandList1_Reset(vl, va);
+      }
+      copy_subresources(bgra, 0, 1, a, (size_t)w * h * 4, 0);
+      CHECK(again && memcmp(a, before, (size_t)w * h * 4) == 0);
+    }
+    free(before);
+  }
+  free(a); free(b); free(ref);
+  if (have_rig) rig_close(&rig);
+  if (to_small) ID3D12VideoProcessor_Release(to_small);
+  if (to_bgra) ID3D12VideoProcessor_Release(to_bgra);
+  if (bits) ID3D12Resource_Release(bits);
+  if (vl) ID3D12VideoDecodeCommandList1_Release(vl);
+  if (va) ID3D12CommandAllocator_Release(va);
+  if (vq) ID3D12CommandQueue_Release(vq);
+  ID3D12Resource *all[] = {small, small_ref, bgra, bgra_ref, hist, hist_rb};
+  for (UINT i = 0; i < sizeof all / sizeof all[0]; ++i) if (all[i]) ID3D12Resource_Release(all[i]);
+  for (unsigned i = 0; i < surfaces; ++i) if (refs[i]) ID3D12Resource_Release(refs[i]);
+  if (heap) ID3D12VideoDecoderHeap_Release(heap);
+  if (dec) ID3D12VideoDecoder_Release(dec);
+  dxva_stream_close(&s);
+  free(data);
 }

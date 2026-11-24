@@ -80,6 +80,10 @@ struct ViewPlane {
   float at(int32_t i, int32_t j, uint32_t c) const {
     i = i < 0 ? 0 : i >= view_w ? view_w - 1 : i;
     j = j < 0 ? 0 : j >= view_h ? view_h - 1 : j;
+    if (shift) {   // (the view moved right by `shift`: the mono offset, the stereo adjustment; what is uncovered repeats the edge)
+      i -= shift;
+      i = i < 0 ? 0 : i >= view_w ? view_w - 1 : i;
+    }
     if (flip) j = view_h - 1 - j;
     switch (format) {
       case VpStereoFormat::Horizontal: return raw(i + frame * (src_w / 2), j, c);
@@ -95,7 +99,7 @@ struct ViewPlane {
         if (right) return raw(i + 1, j, c);
         return raw(i, j, c);
       }
-      case VpStereoFormat::MonoOffset: return raw(i - shift, j, c);
+      case VpStereoFormat::MonoOffset: return raw(i, j, c);
       case VpStereoFormat::None: break;
     }
     return raw(i, j, c);
@@ -182,7 +186,7 @@ uint8_t stage_slots(const uint8_t (&list)[4], uint32_t n) { return static_cast<u
 // Whether a stream needs the stages.
 bool needs_stages(const VpStream& in) {
   return in.stereo != VpStereoFormat::None || (in.field_order != VpFieldOrder::Progressive && in.deinterlace != VpDeinterlace::Weave) || in.noise_reduction > 0.0f ||
-         in.edge_enhancement > 0.0f;
+         in.edge_enhancement > 0.0f || in.temporal != VpTemporal::None || (in.auto_processing & kVpAutoAll) != 0 || in.stereo_adjust != 0;
 }
 
 // Whether channel c of plane k is alpha, and the codes' range of it (for the filters' thresholds).
@@ -234,26 +238,57 @@ void filter_plane(const ImageAccess& img, const ScratchPlanes& from, ScratchPlan
       }
 }
 
-// The stages for stream `in`, whose current picture `img` is prepared (and its references, when given, as well): `img` becomes the stream's picture in `scratch[0]`
-// or `scratch[1]`, of the view's size.
-[[nodiscard]] VpResult run_stages(const VpStream& in, ImageAccess* img, const ImageAccess* past, const ImageAccess* future, allocators::IAllocator* allocator,
-                                  ScratchPlanes (&scratch)[2]) {
+#include "Hardware/VideoCodec/VideoProcessTemporal.inc"
+#include "Hardware/VideoCodec/VideoProcessAuto.inc"
+
+// The frames a stream's stages read besides its picture, prepared: the frames before and after it (deinterlacing; Blend blends in `future`) and an inverse telecine
+// window (every entry set: the nearest known frame stands in for one not given).
+struct StageFrames {
+  const ImageAccess* past = nullptr;
+  const ImageAccess* future = nullptr;
+  const ImageAccess* window[kVpMaxTelecineFrames] = {};
+  bool given[kVpMaxTelecineFrames] = {};   // (false: the entry stands in for a frame not given)
+  uint32_t window_count = 0;
+};
+
+// Whether a frame can stand beside the stream's picture: planes of its size, with every channel the stages read (a sample's channels are read as the picture's).
+bool frame_fits(const ImageAccess& img, const ImageAccess& ref, uint32_t planes) {
+  for (uint32_t k = 0; k < planes; ++k) {
+    if (ref.plane[k].width != img.plane[k].width || ref.plane[k].height != img.plane[k].height) return false;
+    uint8_t list[4];
+    const uint32_t count = stage_channels(img, k, list);
+    for (uint32_t i = 0; i < count; ++i)
+      if (list[i] >= ref.plane[k].channels) return false;
+  }
+  return true;
+}
+
+// The stages for stream `in`, whose current picture `img` is prepared (and the frames it needs as well): `img` becomes the stream's picture in one of the scratch
+// pictures, of the view's size. `enlargement`: how much larger the destination rectangle is than the source's (automatic edge enhancement).
+[[nodiscard]] VpResult run_stages(const VpStream& in, ImageAccess* img, const StageFrames& frames, double enlargement, allocators::IAllocator* allocator,
+                                  ScratchPlanes (&scratch)[3]) {
   if (!allocator) return VpResult::Unsupported;
   uint32_t vw = 0, vh = 0;
   view_size(in.stereo, img->width, img->height, &vw, &vh);
   if (vw == 0 || vh == 0) return VpResult::Invalid;
-  const bool interlaced = in.field_order != VpFieldOrder::Progressive && in.deinterlace != VpDeinterlace::Weave;
+  const bool ivtc = in.temporal == VpTemporal::InverseTelecine, blend = in.temporal == VpTemporal::Blend && in.blend > 0.0f;
+  bool interlaced = in.field_order != VpFieldOrder::Progressive && in.deinterlace != VpDeinterlace::Weave;
+  VpDeinterlace mode = in.deinterlace;
   if (interlaced && (in.stereo == VpStereoFormat::RowInterleaved || in.stereo == VpStereoFormat::Checkerboard)) return VpResult::Invalid;   // (each view is one field)
+  if (ivtc && (in.stereo != VpStereoFormat::None || in.field_order == VpFieldOrder::Progressive || frames.window_count != uint32_t{in.ivtc_cycle} + 2))
+    return VpResult::Invalid;
+  if (in.temporal == VpTemporal::Blend && in.field_order != VpFieldOrder::Progressive) return VpResult::Invalid;   // (frame rate conversion of progressive frames)
+  if (blend && !frames.future) return VpResult::Invalid;
   const uint32_t planes = img->plane[1].width ? 2 : 1;
-  // (the references are of the picture's format and size; their planes must also have its channels: a sample's channels are read as the current picture's)
-  const ImageAccess* const references[2] = {past, future};
+  const ImageAccess* const references[2] = {frames.past, frames.future};
   for (const ImageAccess* ref : references)
-    for (uint32_t k = 0; ref && k < 2; ++k)
-      if (ref->plane[k].width != img->plane[k].width || ref->plane[k].height != img->plane[k].height || ref->plane[k].channels != img->plane[k].channels) return VpResult::Invalid;
+    if (ref && !frame_fits(*img, *ref, planes)) return VpResult::Invalid;
+  for (uint32_t i = 0; ivtc && i < frames.window_count; ++i)
+    if (!frames.window[i] || !frame_fits(*img, *frames.window[i], planes)) return VpResult::Invalid;
   const bool integer = img->plane[0].kind != SampleKind::Half && img->plane[0].kind != SampleKind::F32;
   // the field shown (the parity of its rows) and which frames are the missing field's before and after it
-  const int32_t shown = in.field_order == VpFieldOrder::TopFieldFirst ? (in.field == 0 ? 0 : 1) : (in.field == 0 ? 1 : 0);
-  const bool first = in.field == 0;
+  int32_t shown = in.field_order == VpFieldOrder::TopFieldFirst ? (in.field == 0 ? 0 : 1) : (in.field == 0 ? 1 : 0);
+  bool first = in.field == 0;
   uint32_t pw[2] = {}, ph[2] = {};
   for (uint32_t k = 0; k < planes; ++k) {
     const PlaneAccess& p = img->plane[k];
@@ -265,12 +300,48 @@ void filter_plane(const ImageAccess& img, const ScratchPlanes& from, ScratchPlan
       if (list[i] >= p.channels) return VpResult::Invalid;   // (a channel sampling reads that the plane has not got)
     if (!scratch[0].make(*allocator, k, pw[k], ph[k], stage_slots(list, count))) return VpResult::NoMemory;
   }
+  // Inverse telecine: the picture is the frame woven of the matched fields, or the kept frame deinterlaced when nothing matches it
+  const ImageAccess* source = img;
+  const ImageAccess* before = frames.past;
+  const ImageAccess* after = frames.future;
+  ImageAccess woven_image;
+  if (ivtc) {
+    const int32_t kp = in.field_order == VpFieldOrder::TopFieldFirst ? 0 : 1;
+    bool no_memory = false;
+    const IvtcChoice choice = inverse_telecine(frames.window, frames.given, in.ivtc_cycle, in.ivtc_drop, in.ivtc_output, kp, *allocator, &no_memory);
+    if (no_memory) return VpResult::NoMemory;
+    if (choice.combed) {
+      source = frames.window[choice.kept];
+      before = frames.window[choice.kept - 1];
+      after = frames.window[choice.kept + 1];
+      interlaced = true;
+      mode = VpDeinterlace::Adaptive;
+      shown = kp;
+      first = true;
+    } else {
+      woven_image = *img;
+      const ImageAccess& kept = *frames.window[choice.kept];
+      const ImageAccess& other = *frames.window[choice.other];
+      for (uint32_t k = 0; k < planes; ++k) {
+        uint8_t list[4];
+        const uint32_t count = stage_channels(*img, k, list);
+        if (!scratch[2].make(*allocator, k, pw[k], ph[k], stage_slots(list, count))) return VpResult::NoMemory;
+        for (uint32_t y = 0; y < ph[k]; ++y)
+          for (uint32_t x = 0; x < pw[k]; ++x)
+            for (uint32_t ci = 0; ci < count; ++ci) scratch[2].put(k, x, y, list[ci], woven(kept, other, kp, k, x, y, list[ci]));
+        woven_image.plane[k] = scratch[2].plane[k];
+      }
+      source = &woven_image;
+      interlaced = false;
+    }
+  }
+  McVectors motion;
   for (uint32_t k = 0; k < planes; ++k) {
-    ViewPlane views[3];
-    const ImageAccess* frames[3] = {img, past ? past : img, future ? future : img};
-    for (uint32_t f = 0; f < 3; ++f) {
+    ViewPlane views[4];
+    const ImageAccess* pictures[4] = {source, before ? before : source, after ? after : source, blend ? frames.future : source};
+    for (uint32_t f = 0; f < 4; ++f) {
       ViewPlane& v = views[f];
-      v.plane = &frames[f]->plane[k];
+      v.plane = &pictures[f]->plane[k];
       v.src_w = static_cast<int32_t>(v.plane->width);
       v.src_h = static_cast<int32_t>(v.plane->height);
       v.view_w = static_cast<int32_t>(pw[k]);
@@ -278,38 +349,106 @@ void filter_plane(const ImageAccess& img, const ScratchPlanes& from, ScratchPlan
       v.format = in.stereo;
       v.frame = in.stereo_frame ? 1 : 0;
       v.flip = in.stereo_flip;
-      v.shift = static_cast<int32_t>((int64_t{in.stereo_offset} * v.src_w) / static_cast<int64_t>(img->width));   // (in the plane's samples)
+      const int64_t moved = int64_t{in.stereo_offset} + in.stereo_adjust;   // (the mono offset and the stereo adjustment, in pixels)
+      v.shift = static_cast<int32_t>((moved * v.src_w) / static_cast<int64_t>(img->width));   // (in the plane's samples)
     }
     const ViewPlane& cur = views[0];
     Yadif yadif{&views[1], &cur, &views[2], first ? &views[1] : &cur, first ? &cur : &views[2], cur.view_w, cur.view_h, integer};
+    const bool compensated = interlaced && mode == VpDeinterlace::MotionCompensated;
+    if (compensated && k == 0) {
+      const int32_t missing_parity = cur.row_parity(0) != shown ? 0 : 1;
+      const VpResult r = estimate_field_motion(*img, *yadif.prev2, *yadif.next2, missing_parity, *allocator, &motion);
+      if (r != VpResult::Ok) return r;
+    }
+    const McBwdif mc{&yadif};
+    const float ratio_x = static_cast<float>(pw[0]) / static_cast<float>(pw[k]), ratio_y = static_cast<float>(ph[0]) / static_cast<float>(ph[k]);
+    const float weight = blend ? in.blend : 0.0f;
     uint8_t list[4];
     const uint32_t channels = stage_channels(*img, k, list);
     for (int32_t j = 0; j < cur.view_h; ++j) {
       const bool missing = interlaced && cur.row_parity(j) != shown;
-      for (int32_t i = 0; i < cur.view_w; ++i)
+      for (int32_t i = 0; i < cur.view_w; ++i) {
+        float ox = 0.0f, oy = 0.0f;
+        if (missing && compensated && motion.any) motion.at(i, j, ratio_x, ratio_y, &ox, &oy);
         for (uint32_t ci = 0; ci < channels; ++ci) {
           const uint32_t c = list[ci];
           float v;
           if (!missing) v = cur.at(i, j, c);
-          else if (in.deinterlace == VpDeinterlace::Bob) v = (cur.at(i, j > 0 ? j - 1 : j + 1, c) + cur.at(i, j + 1 < cur.view_h ? j + 1 : j - 1, c)) * 0.5f;
+          else if (mode == VpDeinterlace::Bob) v = (cur.at(i, j > 0 ? j - 1 : j + 1, c) + cur.at(i, j + 1 < cur.view_h ? j + 1 : j - 1, c)) * 0.5f;
+          else if (compensated) v = mc.sample(i, j, c, ox, oy);
           else v = yadif.sample(i, j, c);
+          if (blend) v = v * (1.0f - weight) + views[3].at(i, j, c) * weight;
           scratch[0].put(k, static_cast<uint32_t>(i), static_cast<uint32_t>(j), c, v);
         }
+      }
     }
   }
   uint32_t at = 0;
+  auto next_buffer = [&]() -> bool {
+    ScratchPlanes& to = scratch[at ^ 1];
+    for (uint32_t k = 0; k < planes; ++k)
+      if (to.data[k].empty() && !to.make(*allocator, k, pw[k], ph[k], scratch[at].plane[k].channels)) return false;
+    return true;
+  };
   for (int pass = 0; pass < 2; ++pass) {
     const bool noise = pass == 0;
     const float strength = noise ? in.noise_reduction : in.edge_enhancement;
     if (!(strength > 0.0f)) continue;
-    ScratchPlanes& to = scratch[at ^ 1];
-    for (uint32_t k = 0; k < planes; ++k)
-      if (to.data[k].empty() && !to.make(*allocator, k, pw[k], ph[k], scratch[at].plane[k].channels)) return VpResult::NoMemory;
-    for (uint32_t k = 0; k < planes; ++k) filter_plane(*img, scratch[at], to, k, noise, strength);
+    if (!next_buffer()) return VpResult::NoMemory;
+    for (uint32_t k = 0; k < planes; ++k) filter_plane(*img, scratch[at], scratch[at ^ 1], k, noise, strength);
     at ^= 1;
+  }
+  // automatic processing, each kind when the picture asks for it
+  const uint32_t luma = luma_channel(*img);
+  const float range = luma_range(*img);
+  if (in.auto_processing & kVpAutoDenoise) {
+    const float sigma = estimate_noise(scratch[at].plane[0], luma, range);
+    if (sigma > 0.5f * range / 255.0f) {
+      float strength = 2.5f * sigma / (0.1f * range);
+      if (strength > 1.0f) strength = 1.0f;
+      if (!next_buffer()) return VpResult::NoMemory;
+      for (uint32_t k = 0; k < planes; ++k) filter_plane(*img, scratch[at], scratch[at ^ 1], k, true, strength);
+      at ^= 1;
+    }
+  }
+  if (in.auto_processing & kVpAutoDeringing) {
+    ScratchArray<uint8_t> near;
+    if (!near.make(*allocator, uint64_t{pw[0]} * ph[0]) || !next_buffer()) return VpResult::NoMemory;
+    dering_plane(*img, scratch[at], scratch[at ^ 1], 0, luma, range, near);
+    for (uint32_t k = 1; k < planes; ++k)
+      if (!scratch[at ^ 1].data[k].copy_from(scratch[at].data[k])) return VpResult::Invalid;   // (planes of one size: cannot fail)
+    at ^= 1;
+  }
+  if ((in.auto_processing & kVpAutoEdgeEnhancement) && enlargement >= 1.5) {
+    float strength = static_cast<float>(0.25 * (enlargement - 1.0));
+    if (strength > 0.5f) strength = 0.5f;
+    if (!next_buffer()) return VpResult::NoMemory;
+    for (uint32_t k = 0; k < planes; ++k) filter_plane(*img, scratch[at], scratch[at ^ 1], k, false, strength);
+    at ^= 1;
+  }
+  if (in.auto_processing & kVpAutoColorCorrection) {
+    float mid = 0.0f, gain = 1.0f, target = 0.0f;
+    bool no_memory = false;
+    if (colour_correction(*img, scratch[at].plane[0], *allocator, &mid, &gain, &target, &no_memory)) {
+      const PlaneAccess& p = scratch[at].plane[0];
+      uint8_t list[4];
+      const uint32_t count = stage_channels(*img, 0, list);
+      const float top = img->is_float ? channel_range(*img, 0, 0) : img->max[0];
+      for (uint32_t y = 0; y < p.height; ++y)
+        for (uint32_t x = 0; x < p.width; ++x)
+          for (uint32_t ci = 0; ci < count; ++ci) {
+            if (list[ci] == 3) continue;   // (not alpha)
+            float v = (p.read(x, y, list[ci]) - mid) * gain + target;
+            v = v > 0.0f ? (v < top ? v : top) : 0.0f;
+            scratch[at].put(0, x, y, list[ci], v);
+          }
+    } else if (no_memory) {
+      return VpResult::NoMemory;
+    }
   }
   for (uint32_t k = 0; k < planes; ++k) img->plane[k] = scratch[at].plane[k];
   img->width = vw;
   img->height = vh;
   return VpResult::Ok;
 }
+

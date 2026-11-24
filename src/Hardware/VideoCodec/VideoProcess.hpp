@@ -89,14 +89,50 @@ constexpr uint32_t kVpMaxStreams = 16;   // more streams in one call: Unsupporte
 
 // Interlaced pictures (D3D12_VIDEO_FIELD_TYPE, D3D11_VIDEO_FRAME_FORMAT) and how a field is made a frame: Weave shows the frame as it is; Bob interpolates the field's
 // missing rows from the rows above and below; Adaptive is motion adaptive with the previous and next frames (the yadif algorithm: temporal interpolation where the picture
-// is still, edge-directed spatial interpolation where it moves).
+// is still, edge-directed spatial interpolation where it moves); MotionCompensated is bwdif (yadif's decision with w3fdif's filters) with its samples of the other
+// fields taken along the motion of each 8x8 block of the missing field, estimated between the missing field's neighbours in time (Software/MotionEstimator) and
+// checked bilaterally: moving pictures keep the detail the others interpolate away (VideoProcessTemporal.inc says how).
 enum class VpFieldOrder : uint8_t { Progressive, TopFieldFirst, BottomFieldFirst };
-enum class VpDeinterlace : uint8_t { Weave, Bob, Adaptive };
+enum class VpDeinterlace : uint8_t { Weave, Bob, Adaptive, MotionCompensated };
+// Temporal processing besides deinterlacing (VpStream::temporal): frame rate conversion by blending two frames (Blend), and inverse telecine - field matching and
+// decimation of a cycle of telecined frames back into the progressive frames they were made of (InverseTelecine; VideoProcessTemporal.inc says how).
+enum class VpTemporal : uint8_t { None, Blend, InverseTelecine };
+constexpr uint32_t kVpMaxTelecineFrames = 8;   // an inverse telecine window: a cycle of up to 6 frames and one frame on either side of it
+// Automatic processing (VpStream::auto_processing; the bits of D3D12_VIDEO_PROCESS_AUTO_PROCESSING_FLAGS and D3D11_VIDEO_PROCESSOR_AUTO_STREAM_CAPS): what the processor
+// decides to do from the picture itself (VideoProcessAuto.inc): denoising by the noise it measures, deringing around strong edges, edge enhancement of pictures it
+// enlarges, and colour correction (a luma range stretch) of washed-out pictures. A picture that needs none comes out as it went in.
+constexpr uint32_t kVpAutoDenoise = 0x1, kVpAutoDeringing = 0x2, kVpAutoEdgeEnhancement = 0x4, kVpAutoColorCorrection = 0x8;
+constexpr uint32_t kVpAutoAll = kVpAutoDenoise | kVpAutoDeringing | kVpAutoEdgeEnhancement | kVpAutoColorCorrection;
 // How two views are packed in one picture (D3D11_VIDEO_PROCESSOR_STEREO_FORMAT; separate pictures are two streams' worth of images: the caller picks the view's image):
 // frame 0 on the left / top / even rows / even columns / where x + y is even, frame 1 in the rest. MonoOffset: one view, shifted horizontally.
 enum class VpStereoFormat : uint8_t { None, Horizontal, Vertical, RowInterleaved, ColumnInterleaved, Checkerboard, MonoOffset };
 // DXGI_HDR_METADATA_HDR10's light levels in cd/m2 (0: not known).
 struct VpHdrMetadata { float max_mastering = 0.0f, min_mastering = 0.0f, max_content = 0.0f, max_frame_average = 0.0f; };
+
+// HDR10+ dynamic metadata (SMPTE ST 2094-40 application 4, DXGI_HDR_METADATA_TYPE_HDR10PLUS) of one picture, as vp_parse_hdr10plus reads it: light levels in cd/m2,
+// the rest in 0..1. The processor uses window 0 (the whole picture): HDR10+ profiles A and B have one window, and further windows (ellipses with their own curves)
+// are read but not applied.
+constexpr uint32_t kVpHdr10PlusMaxBytes = 72;   // DXGI_HDR_METADATA_HDR10PLUS
+struct VpHdr10Plus {
+  bool present = false;
+  uint8_t application_version = 0, windows = 1;
+  float target_peak = 0.0f;                     // targeted_system_display_maximum_luminance
+  float maxscl[3] = {};                         // the brightest R, G, B of the scene
+  float average_maxrgb = 0.0f;
+  uint8_t percentile_count = 0;
+  uint8_t percentages[15] = {};
+  float percentiles[15] = {};
+  float fraction_bright_pixels = 0.0f;
+  bool tone_mapping = false;                    // the basis tone mapping curve: a line to the knee point, then a Bezier curve of anchors[0 .. anchor_count) between (0, 0) and (1, 1)
+  float knee_x = 0.0f, knee_y = 0.0f;
+  uint8_t anchor_count = 0;
+  float anchors[15] = {};
+  bool saturation_mapping = false;
+  float saturation_weight = 1.0f;               // 0 .. 63 / 8
+};
+// The metadata in its T.35 form: either the whole payload (country code 0xB5, provider 0x003C, oriented code 0x0001, application identifier 4, then the application's
+// bits) or the application's bits only (from application_version on). False for anything else, truncated data or values the standard does not allow.
+[[nodiscard]] bool vp_parse_hdr10plus(ConstByteView data, VpHdr10Plus* out);
 
 struct VpStream {
   const VpImage* image = nullptr;
@@ -113,12 +149,22 @@ struct VpStream {
   uint8_t field = 0;
   const VpImage* past = nullptr;
   const VpImage* future = nullptr;
+  // Temporal processing. Blend: the stream shows (1 - blend) x the image + blend x `future` (frame rate conversion: an output between two progressive frames; 0 repeats
+  // the image). InverseTelecine: `telecine` is a window of interlaced frames of the image's format - [0] the frame before a cycle, [1 .. ivtc_cycle] the cycle's,
+  // [ivtc_cycle + 1] the frame after it (nullptr: not known, the nearest known one stands in) - whose cycle makes ivtc_cycle - ivtc_drop progressive frames; the
+  // stream shows number `ivtc_output` of them. (`image` is one of the window's frames; the field order says which field is first.)
+  VpTemporal temporal = VpTemporal::None;
+  float blend = 0.0f;
+  const VpImage* telecine[kVpMaxTelecineFrames] = {};
+  uint8_t ivtc_cycle = 5, ivtc_drop = 1, ivtc_output = 0;
   // Stereo: which frame of the packed picture is this stream's view (0, 1), whether it is stored upside down, and MonoOffset's shift (pixels, positive to the right).
   // The source rectangle is in the view's pixels (half the picture's width for Horizontal, ...).
   VpStereoFormat stereo = VpStereoFormat::None;
   uint8_t stereo_frame = 0;
   bool stereo_flip = false;
   int32_t stereo_offset = 0;
+  // The stereo adjustment filter: the view moved right by this many of its pixels (negative: left; what is uncovered repeats the edge).
+  int32_t stereo_adjust = 0;
   // Filters, in the DXVA-HD units: ProcAmp (brightness -100..100 in 8-bit luma steps, contrast 0..10, hue -180..180 degrees, saturation 0..10: on the YCbCr values,
   // Y' = C Y + B, (Cb', Cr') = C S R(H) (Cb, Cr)); noise reduction and edge enhancement 0..1 (strength); anamorphic scaling 0..1 (a non-linear horizontal stretch
   // that keeps the middle of the picture least stretched).
@@ -128,6 +174,8 @@ struct VpStream {
   bool luma_key = false;
   float luma_lower = 0.0f, luma_upper = 0.0f;
   VpHdrMetadata hdr;          // the content's light levels (tone mapping)
+  VpHdr10Plus hdr10plus;      // the picture's dynamic metadata (present: tone mapped by it rather than by `hdr`, for PQ content)
+  uint32_t auto_processing = 0;   // kVpAuto* bits
 };
 
 struct VpOutput {
@@ -149,10 +197,22 @@ enum class VpResult : uint8_t { Ok, Invalid, Unsupported, NoMemory };
 // planes do not match, a stream alpha or background outside 0..1; Unsupported: a colour space vp_color_space_supported refuses, more than kVpMaxStreams streams.
 // An empty source or destination rectangle leaves its stream out. Results are clamped to 0..1 (also for Rgba16f, except linear G10 out of PQ or HLG, which keeps their light: up to 10000 / kVpReferenceWhiteNits). Alpha fill SourceStream: the target's alpha is the
 // background's, inside that stream's destination the stream's own (opaque if its format has none; left as it was if its source rectangle is empty).
-// Before that, per stream: the view of a stereo picture is taken, an interlaced one deinterlaced (each plane on its own, its rows' parity giving their field), then
-// noise reduction (3x3 sigma filter) and edge enhancement (3x3 unsharp mask) on the picture's samples; the luma key, ProcAmp and the colour conversion with tone mapping
-// are applied to each sample read. Invalid also: filter values outside their ranges, reference frames that do not match, an interlaced row-interleaved or checkerboard
-// picture; NoMemory: no scratch memory.
+// Before that, per stream: an inverse telecine window is field matched and decimated into the frame shown, the view of a stereo picture is taken (moved by the stereo
+// adjustment), an interlaced one deinterlaced (each plane on its own, its rows' parity giving their field), a frame rate conversion's frames blended, then noise
+// reduction (3x3 sigma filter), edge enhancement (3x3 unsharp mask) and the automatic processing on the picture's samples; the luma key, ProcAmp and the colour
+// conversion with tone mapping (HDR10+ metadata's curve, when given) are applied to each sample read. Invalid also: filter values outside their ranges, reference frames
+// that do not match, an interlaced row-interleaved or checkerboard picture, a blend of interlaced frames or without the frame after, an inverse telecine of progressive
+// frames, of a stereo view or of a cycle that does not fit its window, unknown automatic processing bits; NoMemory: no scratch memory.
 [[nodiscard]] VpResult video_process(const VpOutput& output, ArrayView<const VpStream> streams);
+
+// A histogram of each component of the `width` x `height` pixels at the top left of `image` (D3D12_VIDEO_DECODE_HISTOGRAM_COMPONENT's numbering: Y, U, V, A for a YUV
+// image, R, G, B, A for RGB; chroma components count the chroma samples covering that area). `out[c]` receives component c's counts - out[c].size() bins evenly
+// dividing the component's codes (bin = code * bins >> its depth - 2 for the alpha of Rgb10a2 and Y410; a float format's 0..1, clamped) - for each bit c of
+// `components`; the others are not touched. Invalid: a component the format has not got, a bin count that is not 1 .. kVpMaxHistogramBins, an area outside the
+// image, planes that do not hold it.
+constexpr uint32_t kVpMaxHistogramBins = 65536;
+[[nodiscard]] VpResult vp_histogram(const VpImage& image, uint32_t width, uint32_t height, uint32_t components, ArrayView<uint32_t> out[4]);
+// The components vp_histogram counts of a format (bits).
+uint32_t vp_histogram_components(VpFormat format);
 
 }  // namespace hardware

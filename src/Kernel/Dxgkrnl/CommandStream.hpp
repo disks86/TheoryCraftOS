@@ -58,7 +58,13 @@
 //                    A16B16G16R16 one: copied into the image they become (r, g or 0, 0, maximum), out of it the first channels are taken. What a runtime keeps R8 / R8G8 / R16 / R16G16 textures and
 //                    the planes of NV12 / P010 in, as the kernel has no narrower formats)
 //   DecodeFrame      decoder handle, buffer_index, picture_offset, picture_bytes, matrix_offset, matrix_bytes, slices_offset, slices_bytes, bitstream_index, bitstream_offset, bitstream_bytes,
-//                    luma_index, chroma_index, status_index, status_offset, output_keyed, key_count, then key_count allocation indices   (outside a pass: decodes one picture with a video decoder of the
+//                    luma_index, chroma_index, status_index, status_offset, output_keyed, key_count, then key_count allocation indices
+//                    [, kDecodeConversion, output format (hardware::VpFormat), output colour space, decode colour space, output plane0_index, plane1_index (kNoAllocation for
+//                    one image), output width, height]   (decode conversion: the picture is decoded into the surface above - the reference - and then converted into the
+//                    output, scaled to width x height, by the video processor; the output is kVideoDecodeWrite. A picture that is not decoded leaves it as it was)
+//                    [, kDecodeHistogram, components (bits: Y, U, V, A), bin count, counter bits (32), then 4 pairs of buffer_index (kNoAllocation: none), offset]
+//                    (histograms of the decoded picture, as hardware::vp_histogram counts them, into each component's buffer: bin count little-endian 32-bit counters at the
+//                    offset; the buffers kVideoDecodeWrite, written only when the picture was decoded)   (outside a pass: decodes one picture with a video decoder of the
 //                    device (Kernel::create_video_decoder) - its DXVA picture parameters, inverse quantization matrices and slice controls are the three ranges of the buffer `buffer_index`
 //                    (a range of 0 bytes: none), the compressed data the range of `bitstream_index` - into the two planes of the output surface (2D images of one level, the formats of
 //                    DxgTypes.hpp VideoDecoderDesc, the luma at least the decoder's size, the chroma at least half of it; a packed surface format is the one image `luma_index`,
@@ -77,7 +83,12 @@
 //                    stream kVideoProcessStreamExtWords words: field_order, field, deinterlace, past plane0_index, plane1_index, future plane0_index, plane1_index
 //                    (kNoAllocation: none), stereo format, stereo frame, stereo flip, stereo offset (signed), brightness, contrast, hue, saturation, noise reduction,
 //                    edge enhancement, anamorphic (float bits), luma_key, lower, upper (float bits), the content's light levels (4 float bits)]   (the optional part: the
-//                    VpStream values; without it every stream is progressive, unfiltered and not stereo. The references are pictures like the stream's)
+//                    VpStream values; without it every stream is progressive, unfiltered and not stereo. The references are pictures like the stream's. Deinterlace 3 is
+//                    motion compensated.) With kVideoProcessExtension2 instead each stream's kVideoProcessStreamExtWords are followed by kVideoProcessStreamExt2Words more:
+//                    temporal (hardware::VpTemporal), blend (float bits), inverse telecine cycle, drop, output, window count (at most kVpMaxTelecineFrames), then
+//                    kVpMaxTelecineFrames pairs of plane0_index, plane1_index (the window's frames, kNoAllocation: not known), stereo adjustment (signed), automatic
+//                    processing (kVpAuto* bits), HDR10+ metadata bytes (at most kVpHdr10PlusMaxBytes), then 18 words of them (byte k in bits 8 (k % 4) of word k / 4;
+//                    metadata vp_parse_hdr10plus refuses is not used)
 //   EstimateMotion   block (8 or 16), width, height, current_luma_index, reference_luma_index, hint_index (kNoAllocation: none), hint_offset, heap_index, heap_offset   (outside a
 //                    pass: the motion vectors of the current picture's blocks into the reference (VideoEncode.hpp run_motion_estimation; the lumas are widened planes of at least
 //                    width x height, the heaps buffers: hint is an earlier heap, heap receives motion_vector_heap_bytes); the planes kVideoEncodeRead)
@@ -138,7 +149,12 @@ enum class Op : uint16_t {
 constexpr uint32_t kVideoProcessStreamWords = 15;
 constexpr uint32_t kVideoProcessExtension = 0x31585056;   // 'VPX1': VideoProcess's optional part follows
 constexpr uint32_t kVideoProcessStreamExtWords = 25;
+constexpr uint32_t kVideoProcessExtension2 = 0x32585056;   // 'VPX2': the optional part with kVideoProcessStreamExt2Words more a stream
+constexpr uint32_t kVideoProcessStreamExt2Words = 43;
 constexpr uint32_t kMaxVideoProcessStreams = 16;
+constexpr uint32_t kVideoProcessMaxWords = 16 + kVideoProcessStreamWords * kMaxVideoProcessStreams + 5 + (kVideoProcessStreamExtWords + kVideoProcessStreamExt2Words) * kMaxVideoProcessStreams;
+constexpr uint32_t kDecodeConversion = 0x31564344;   // 'DCV1': DecodeFrame's conversion follows
+constexpr uint32_t kDecodeHistogram = 0x31474844;    // 'DHG1': DecodeFrame's histograms follow
 
 // How the vertices (or indices) of a draw make triangles (D3D10 IASetPrimitiveTopology / D3D9 primitive types); the default is a list. A strip or fan is expanded to a list of
 // triangles by the kernel, so any device draws it; with an index buffer the index 0xFFFF (0xFFFFFFFF for 32-bit indices) ends a strip and starts the next.
@@ -156,7 +172,8 @@ constexpr uint32_t kNoAllocation = 0xFFFFFFFFu;
 enum class NarrowLayout : uint32_t { None = 0, R8 = 1, R8G8 = 2, R16 = 3, R16G16 = 4 };
 constexpr uint32_t narrow_pixel_bytes(NarrowLayout n) { return n == NarrowLayout::R8 ? 1 : n == NarrowLayout::R8G8 || n == NarrowLayout::R16 ? 2 : n == NarrowLayout::R16G16 ? 4 : 0; }
 constexpr uint32_t kStreamOutputAppendOffset = 0xFFFFFFFFu;   // SetStreamOutput's offset for "after what the last stream output into the buffer wrote"
-constexpr uint32_t kMaxPacketWords = 2 + graphics::kMaxPushConstantBytes / 4;   // (PushConstants is the longest: the byte count, then up to kMaxPushConstantBytes of constants)
+// (the longest packets: PushConstants - the byte count, then up to kMaxPushConstantBytes of constants - and a VideoProcess of every stream with both optional parts)
+constexpr uint32_t kMaxPacketWords = 1 + (1 + graphics::kMaxPushConstantBytes / 4 > kVideoProcessMaxWords ? 1 + graphics::kMaxPushConstantBytes / 4 : kVideoProcessMaxWords);
 constexpr uint64_t kMaxCommandBytes = 16 * 1024 * 1024;
 
 enum BeginPassFlags : uint32_t { kPassClearColor = 1u << 0, kPassClearDepth = 1u << 1, kPassClearStencil = 1u << 2 };
