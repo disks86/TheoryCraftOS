@@ -27,9 +27,11 @@
  *
  * A bundle records the calls it gets (BUNDLE_LOG) and ExecuteBundle makes them on the list that executes it, so it takes the targets, viewport and the rest from that list.
  *
- * Tiled resources are the kernel's reserved allocations: buffers, and textures of 4-byte colour pixels with a size in whole tiles of 128 x 128 (the levels below a tile in either direction
- * are the mip tail, one tile). UpdateTileMappings maps their 64 KiB tiles to places in heaps at once (the queue is synchronous, so that is in order with the lists executed before) and
- * keeps the mapping for CopyTileMappings; CopyTiles moves the bytes of tiles to and from a buffer with CopyBuffer / CopyBufferImage.
+ * Tiled resources are the kernel's reserved allocations: buffers, and textures of the formats with D3D12_FORMAT_SUPPORT2_TILED (format_tiled) on Direct3D's standard tile shapes
+ * (tile_layout: 256 x 256 texels of 8 bits down to 64 x 64 of 128), the levels below a tile in either direction packed after the others over as many tiles as they fill.
+ * UpdateTileMappings maps their 64 KiB tiles to places in heaps at once (the queue is synchronous, so that is in order with the lists executed before) and keeps the mapping for
+ * CopyTileMappings; CopyTiles moves the bytes of tiles to and from a buffer with CopyBuffer / CopyBufferImage (narrow for R8 / R8G8 / R16 / R16G16, which the kernel widens).
+ * The video formats are not tiled (Direct3D has no tiles for them: CreateReservedResource refuses them as a format without the support).
  *
  * Predication (SetPredication) cuts the list into chunks that carry the predicate: when a chunk is run its 64-bit value is read and the chunk is skipped or not.
  *
@@ -418,13 +420,13 @@ static void STDMETHODCALLTYPE dev_GetResourceTiling(Dev *This, ID3D12Resource *r
     if (!buffer) {
       packed->NumStandardMips = (UINT8)t.standard;
       packed->NumPackedMips = (UINT8)(t.mips - t.standard);
-      packed->NumTilesForPackedMips = t.standard < t.mips ? 1 : 0;
+      packed->NumTilesForPackedMips = t.tail_tiles;
       packed->StartTileIndexInOverallResource = t.tail_first;
     }
   }
   if (shape) {
     memset(shape, 0, sizeof *shape);
-    if (!buffer) { shape->WidthInTexels = TILE_TEXELS; shape->HeightInTexels = TILE_TEXELS; shape->DepthInTexels = 1; }
+    if (!buffer) { shape->WidthInTexels = t.tile_w; shape->HeightInTexels = t.tile_h; shape->DepthInTexels = 1; }
   }
   if (count) {
     const UINT room = *count;
@@ -522,9 +524,11 @@ static void STDMETHODCALLTYPE queue_CopyTileMappings(void *This, ID3D12Resource 
   mem_free(a);
 }
 
+/* A rectangle of a level of a reserved texture to or from a buffer (rows `pitch` apart), the buffer's texels the format's - narrower than the kernel's pixels for R8 / R8G8 / R16 /
+ * R16G16 (CopyBufferImage's NarrowLayout, which NARROW_* is). */
 static void emit_buffer_image(CmdList *l, UINT direction, const Resource *image, UINT level, UINT x, UINT y, UINT w, UINT h, const Resource *buffer, UINT64 offset, UINT pitch) {
-  UINT payload[11] = {direction, alloc_index(l, image->alloc), level, 0, x, y, w, h, alloc_index(l, buffer->alloc), (UINT)offset, pitch};
-  packet(l, OP_COPY_BUFFER_IMAGE, payload, 11);
+  UINT payload[12] = {direction, alloc_index(l, image->alloc), level, 0, x, y, w, h, alloc_index(l, buffer->alloc), (UINT)offset, pitch, image->fmt ? image->fmt->narrow : 0};
+  packet(l, OP_COPY_BUFFER_IMAGE, payload, payload[11] ? 12 : 11);
 }
 
 static void STDMETHODCALLTYPE list_CopyTiles(CmdList *l, ID3D12Resource *resource, const D3D12_TILED_RESOURCE_COORDINATE *start, const D3D12_TILE_REGION_SIZE *size, ID3D12Resource *buffer,
@@ -557,15 +561,30 @@ static void STDMETHODCALLTYPE list_CopyTiles(CmdList *l, ID3D12Resource *resourc
     if (level < layout.standard) {
       const UINT local = tile - layout.first[level], tx = local % layout.across[level], ty = local / layout.across[level];
       const UINT lw = mip_extent((UINT)r->desc.Width, level), lh = mip_extent(r->desc.Height, level);
-      const UINT x = tx * TILE_TEXELS, y = ty * TILE_TEXELS;
-      emit_buffer_image(l, to_resource ? 0 : 1, r, level, x, y, lw - x < TILE_TEXELS ? lw - x : TILE_TEXELS, lh - y < TILE_TEXELS ? lh - y : TILE_TEXELS, b, at, TILE_TEXELS * 4);
+      const UINT x = tx * layout.tile_w, y = ty * layout.tile_h;
+      emit_buffer_image(l, to_resource ? 0 : 1, r, level, x, y, lw - x < layout.tile_w ? lw - x : layout.tile_w, lh - y < layout.tile_h ? lh - y : layout.tile_h, b, at,
+                        layout.tile_w * layout.texel);
     } else {
-      /* the mip tail: the packed levels one after the other, as in the backing */
-      UINT64 offset = at;
-      for (UINT lv = layout.standard; lv < layout.mips; ++lv) {
+      /* a tile of the packed levels: its 64 KiB of their texels, which run one level after the other, row by row (a row may go on in the next tile; a texel never does) */
+      const UINT64 low = (UINT64)(tile - layout.tail_first) * KTILE_BYTES, high = low + KTILE_BYTES;
+      UINT64 pos = 0;
+      for (UINT lv = layout.standard; lv < layout.mips && pos < high; ++lv) {
         const UINT lw = mip_extent((UINT)r->desc.Width, lv), lh = mip_extent(r->desc.Height, lv);
-        emit_buffer_image(l, to_resource ? 0 : 1, r, lv, 0, 0, lw, lh, b, offset, lw * 4);
-        offset += (UINT64)lw * lh * 4;
+        const UINT64 row = (UINT64)lw * layout.texel;
+        if (pos + row * lh <= low) { pos += row * lh; continue; }
+        if (pos >= low && pos + row * lh <= high) {      /* (the whole level in this tile: one copy) */
+          ensure_room(l, 2048, 4);
+          emit_buffer_image(l, to_resource ? 0 : 1, r, lv, 0, 0, lw, lh, b, at + (pos - low), (UINT)row);
+          pos += row * lh;
+          continue;
+        }
+        for (UINT y = 0; y < lh && pos < high; ++y, pos += row) {
+          const UINT64 from = pos > low ? pos : low, to = pos + row < high ? pos + row : high;
+          if (from >= to) continue;
+          const UINT x = (UINT)((from - pos) / layout.texel), w = (UINT)((to - from) / layout.texel);
+          ensure_room(l, 2048, 4);
+          emit_buffer_image(l, to_resource ? 0 : 1, r, lv, x, y, w, 1, b, at + (from - low), (UINT)(to - from));
+        }
       }
     }
   }

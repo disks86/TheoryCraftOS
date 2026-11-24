@@ -128,44 +128,72 @@ static UINT mip_extent(UINT size, UINT level) { UINT v = size >> level; return v
 
 /* ---- the tiles of a reserved resource ---------------------------------------------------------------------------------------------------------------------------------- */
 
-#define TILE_TEXELS 128
 /* The tile numbering the kernel has (VidMm.cpp): a buffer is a row of 64 KiB tiles; a texture has the tiles of its standard mip levels (at least a tile in both directions), level after level,
- * row by row, and then one tile for all the smaller levels together (the mip tail). */
+ * row by row, and then the packed levels (the mip tail): their texels one level after the other, over as many tiles as they fill. A tile has Direct3D's standard shape for the
+ * bytes of a texel of the format (tile_texels): 8 bits 256 x 256, 16 bits 256 x 128, 32 bits 128 x 128, 64 bits 128 x 64, 128 bits 64 x 64; a tile in a heap is its rows one
+ * after the other, `tile_w` texels each (the kernel widens the texels of R8 / R8G8 / R16 / R16G16 into its images and narrows them back: AllocationDesc::tile_narrow). */
 typedef struct TileLayout {
   UINT standard;               /* the standard mip levels */
   UINT mips;
   UINT total;
   UINT first[16], across[16], down[16];
-  UINT tail_first;             /* the tail tile (when standard < mips) */
+  UINT tail_first;             /* the first tile of the packed levels (when standard < mips) */
+  UINT tail_tiles;             /* ... and how many they fill */
+  UINT tile_w, tile_h;         /* a texture's tile shape, in texels */
+  UINT texel;                  /* ... and the bytes of a texel in the heap */
+  int buffer;                  /* a buffer: its tiles are numbered by X alone */
 } TileLayout;
+
+/* The standard tile shape for texels of `bytes` (0 x 0 for a size that has none). */
+static void tile_texels(UINT bytes, UINT *w, UINT *h) {
+  switch (bytes) {
+    case 1: *w = 256; *h = 256; return;
+    case 2: *w = 256; *h = 128; return;
+    case 4: *w = 128; *h = 128; return;
+    case 8: *w = 128; *h = 64; return;
+    case 16: *w = 64; *h = 64; return;
+    default: *w = *h = 0; return;
+  }
+}
 
 static void tile_layout(const D3D12_RESOURCE_DESC *d, TileLayout *t) {
   memset(t, 0, sizeof *t);
   if (d->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
+    t->buffer = 1;
     t->mips = 1;
     t->total = t->across[0] = (UINT)((d->Width + KTILE_BYTES - 1) / KTILE_BYTES);
     t->down[0] = 1;
     return;
   }
+  const FormatInfo *fi = format_info(d->Format);
+  t->texel = fi ? fi->bytes : 4;
+  tile_texels(t->texel, &t->tile_w, &t->tile_h);
+  if (!t->tile_w) return;
   t->mips = d->MipLevels ? d->MipLevels : 1;
   if (t->mips > 16) t->mips = 16;
-  while (t->standard < t->mips && mip_extent((UINT)d->Width, t->standard) >= TILE_TEXELS && mip_extent(d->Height, t->standard) >= TILE_TEXELS) {
+  while (t->standard < t->mips && mip_extent((UINT)d->Width, t->standard) >= t->tile_w && mip_extent(d->Height, t->standard) >= t->tile_h) {
     const UINT l = t->standard++;
     t->first[l] = t->total;
-    t->across[l] = (mip_extent((UINT)d->Width, l) + TILE_TEXELS - 1) / TILE_TEXELS;
-    t->down[l] = (mip_extent(d->Height, l) + TILE_TEXELS - 1) / TILE_TEXELS;
+    t->across[l] = (mip_extent((UINT)d->Width, l) + t->tile_w - 1) / t->tile_w;
+    t->down[l] = (mip_extent(d->Height, l) + t->tile_h - 1) / t->tile_h;
     t->total += t->across[l] * t->down[l];
   }
   t->tail_first = t->total;
-  if (t->standard < t->mips) t->total++;
+  UINT64 packed = 0;
+  for (UINT l = t->standard; l < t->mips; ++l) packed += (UINT64)mip_extent((UINT)d->Width, l) * mip_extent(d->Height, l) * t->texel;
+  t->tail_tiles = (UINT)((packed + KTILE_BYTES - 1) / KTILE_BYTES);
+  t->total += t->tail_tiles;
 }
 
 /* The linear number of the tile at a coordinate (Z is not used: textures are 2D); (UINT)-1 for one that is not there. */
 static UINT tile_number(const TileLayout *t, D3D12_TILED_RESOURCE_COORDINATE c) {
   UINT n;
-  if (c.Subresource < t->standard) n = t->first[c.Subresource] + c.Y * t->across[c.Subresource] + c.X;
-  else if (c.Subresource < t->mips) n = t->tail_first + c.X;
-  else if (t->mips == 1 && t->standard == 0) n = c.X;
+  if (t->buffer) n = c.Subresource == 0 ? c.X : (UINT)-1;
+  else if (c.Subresource < t->standard) {
+    if (c.X >= t->across[c.Subresource] || c.Y >= t->down[c.Subresource]) return (UINT)-1;
+    n = t->first[c.Subresource] + c.Y * t->across[c.Subresource] + c.X;
+  }
+  else if (c.Subresource < t->mips) n = c.X < t->tail_tiles ? t->tail_first + c.X : (UINT)-1;      /* (a packed level: X counts the packed tiles) */
   else return (UINT)-1;
   return n < t->total ? n : (UINT)-1;
 }
@@ -436,6 +464,10 @@ static UINT kernel_pixel_bytes(UINT kf) {
     default: return 4;
   }
 }
+/* Whether the kernel's images of the format may have mip levels: its 8-bit and block-compressed ones do, its wider ones (16 and 32-bit channels, 10-bit, integer) have one. */
+static int kernel_format_levels(UINT kf) {
+  return (kf >= KF_A8R8G8B8 && kf <= KF_X8B8G8R8) || kf == KF_BGRA8_SRGB || kf == KF_RGBA8_SRGB || (kf >= KF_BC1 && kf <= KF_BC3_SRGB);
+}
 /* The size of plane allocation `i` of a planar texture (plane_alloc's order: plane * layers + slice) of `fi`: the kernel's image of the plane (plane_extent; a packed YUV
  * array's one plane in the kernel's pixels, format_kw). */
 static void planar_extent(const D3D12_RESOURCE_DESC *d, const FormatInfo *fi, UINT layers, UINT i, UINT *w, UINT *h) {
@@ -464,6 +496,7 @@ static UINT64 texture_kernel_bytes(const D3D12_RESOURCE_DESC *d) {
   if (!fi || !fi->kernel) return 0;
   const UINT layers = d->DepthOrArraySize ? d->DepthOrArraySize : 1;
   if (fi->planar) return planar_layout(d, fi, layers, format_planes(fi) * layers, NULL);
+  if (format_packed_yuv(d->Format) && layers > 1) return planar_layout(d, fi, layers, layers, NULL);      /* (a packed YUV array: a slice an allocation) */
   const UINT mips = d->MipLevels ? d->MipLevels : mip_count_for((UINT)d->Width, d->Height);
   UINT64 total = 0;
   for (UINT level = 0; level < mips; ++level) {
@@ -559,26 +592,30 @@ static HRESULT resource_make_from(Dev *dev, const D3D12_HEAP_PROPERTIES *props, 
     const int target = (desc->Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET) != 0;
     if (fi->planar) {
       /* (NV12, P010, P016, P208, V208, V408: a 2D texture or array of one level, not multisampled or depth; each plane of each slice is a 2D image of the kernel's, so the
-       * slices may be render targets. Committed, placed (the planes one after the other in the heap: planar_layout) or shared (every plane allocation in one resource of
-       * win32k's). Not reserved: tiling is not one of these formats' supports (D3D12_FORMAT_SUPPORT2_TILED; Windows' drivers do not tile video formats either), so a
-       * reserved one is a description the device refuses. Not CPU visible: the kernel's planes are widened, so the driver's layout a custom heap's texture is read in would
-       * not be what Direct3D says it is) */
+       * slices may be render targets. Committed, placed (the planes one after the other in the heap: planar_layout), shared (every plane allocation in one resource of
+       * win32k's) or in a custom heap the CPU sees (each plane a subresource of Write/ReadFromSubresource: res_texture_copy). Not reserved: tiling is not one of these
+       * formats' supports (D3D12_FORMAT_SUPPORT2_TILED - DXGI's format tables have "Tiled Resource" disallowed for every video format -), so a reserved one is a
+       * description the device refuses) */
       /* (P208's chroma is half as wide - its width even -, V208's half as high - its height even -, V408's full size; the 4:2:0 formats' half of both) */
       const int even_w = fi->planar != PLANAR_V208 && fi->planar != PLANAR_V408, even_h = fi->planar != PLANAR_P208 && fi->planar != PLANAR_V408;
       if (desc->Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || cube || r->mips != 1 || samples > 1 || want_depth || (even_w && (desc->Width & 1)) || (even_h && (desc->Height & 1)) || reserved) { hr = E_INVALIDARG; goto fail; }
-      if (cpu) { hr = DXGI_ERROR_UNSUPPORTED; goto fail; }
       if (format_planes(fi) * r->layers > KMT_MAX_RESOURCE_ALLOCATIONS) { hr = E_INVALIDARG; goto fail; }      /* (every plane of every slice in one resource) */
       r->kind = 0;
       r->planes = format_planes(fi);
     }
     if (format_packed_yuv(desc->Format)) {
-      /* (the packed YUV formats: 2D textures and arrays of one level, not multisampled; YUY2, Y210, Y216 of even width (a pixel of the kernel's image is a pair); render
-       * targets of AYUV alone - DXGI gives the others shader resource and unordered access views only) */
-      if (desc->Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || cube || r->mips != 1 || samples > 1 || (fi->pair && (desc->Width & 1)) ||
-          (target && desc->Format != DXGI_FORMAT_AYUV)) { hr = E_INVALIDARG; goto fail; }
+      /* (the packed YUV formats: 2D textures and arrays, not multisampled, not reserved (no video format is tiled: format_tiled); mip levels for AYUV and Y416 alone, as DXGI's
+       * format tables have them; YUY2, Y210, Y216 of even width (a pixel of the kernel's image is a pair); render targets of AYUV alone - DXGI gives the others shader resource
+       * and unordered access views only) */
+      if (desc->Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || cube || (r->mips != 1 && !format_packed_yuv_mips(desc->Format)) || samples > 1 || (fi->pair && (desc->Width & 1)) ||
+          (target && desc->Format != DXGI_FORMAT_AYUV) || reserved) { hr = E_INVALIDARG; goto fail; }
+      /* (Y416's levels: Windows has them, the kernel's 16-bit images have one level - as for every 64-bit format here) */
+      if (r->mips > 1 && !kernel_format_levels(fi->kernel)) { hr = DXGI_ERROR_UNSUPPORTED; goto fail; }
       if (r->layers > 1) {
-        /* (an array: each slice an allocation of its own, as a planar texture's planes - `planes` 1 - so that a slice is a 2D image the decoder and the processor write) */
-        if (reserved || cpu || heap || (hflags & (D3D12_HEAP_FLAG_SHARED | D3D12_HEAP_FLAG_SHARED_CROSS_ADAPTER)) || global_share) { hr = DXGI_ERROR_UNSUPPORTED; goto fail; }
+        /* (an array: each slice an allocation of its own, as a planar texture's planes - `planes` 1 - so that a slice is a 2D image the decoder and the processor write;
+         * committed, placed, shared or CPU visible as a planar texture is. Of one level: the kernel's images of several layers have one, as for every format) */
+        if (r->mips > 1) { hr = DXGI_ERROR_UNSUPPORTED; goto fail; }
+        if (r->layers > KMT_MAX_RESOURCE_ALLOCATIONS) { hr = E_INVALIDARG; goto fail; }      /* (every slice in one resource) */
         r->kind = 0;
         r->planes = 1;
       }
@@ -586,9 +623,12 @@ static HRESULT resource_make_from(Dev *dev, const D3D12_HEAP_PROPERTIES *props, 
     if ((r->kind != 0 || r->mips > 1) && (target || want_depth || (r->kind != 0 && r->mips > 1))) { hr = DXGI_ERROR_UNSUPPORTED; goto fail; }
     ad.flags = want_depth ? KA_DEPTH : (target ? (KA_RENDER_TARGET | KA_TEXTURE) : KA_TEXTURE);
     if (reserved) {
-      /* (the kernel's reserved textures: 4-byte colour pixels, whole tiles, one mip level, only sampled) */
-      if (fi->bytes != 4 || fi->depth || !(fi->kernel <= KF_X8B8G8R8 || fi->kernel == KF_BGRA8_SRGB || fi->kernel == KF_RGBA8_SRGB) || desc->Width % 128 || desc->Height % 128 || r->kind != 0 || target || want_depth) { hr = DXGI_ERROR_UNSUPPORTED; goto fail; }
+      /* (the kernel's reserved textures: of the formats tiling is a support of (format_tiled: not the video formats, whose tiles Direct3D does not define, nor
+       * block-compressed or depth ones), any size, with mip levels - the 64-bit and 128-bit formats one: the kernel's wide images have one -, only sampled) */
+      if (!format_tiled(fi) || r->planes) { hr = E_INVALIDARG; goto fail; }
+      if (r->kind != 0 || target || want_depth || (r->mips > 1 && !kernel_format_levels(fi->kernel))) { hr = DXGI_ERROR_UNSUPPORTED; goto fail; }
       ad.flags = KA_TEXTURE | KA_RESERVED;
+      ad.tile_narrow = fi->narrow;      /* (NARROW_* is the kernel's NarrowLayout) */
       r->reserved = 1;
     }
     ad.format = fi->kernel;
@@ -608,7 +648,7 @@ static HRESULT resource_make_from(Dev *dev, const D3D12_HEAP_PROPERTIES *props, 
   UINT pitch = 0;
   if (reserved) {
     TileLayout layout;
-    tile_layout(desc, &layout);
+    tile_layout(&r->desc, &layout);      /* (the description with its mip count made whole) */
     r->tile_count = layout.total;
     r->tile_map = mem_alloc((SIZE_T)layout.total * sizeof(TileBind));
     if (!r->tile_map) { hr = E_OUTOFMEMORY; goto fail; }
@@ -840,42 +880,77 @@ static HRESULT STDMETHODCALLTYPE res_GetHeapProperties(Resource *This, D3D12_HEA
 /* WriteToSubresource / ReadFromSubresource: a box of a subresource of a CPU-visible texture, copied between the program's memory (rows `row_pitch` apart, slices
  * `slice_pitch`) and the kernel's image, which is locked for it (the copy is done when the call returns, as the CPU's copy is on Windows; the program keeps the GPU off
  * the texture meanwhile). The kernel's image is the texels in rows of exactly the level's width (blocks of 4 x 4 for a compressed format); a level of an array, cube or
- * volume has all its layers one after the other. A box that is empty copies nothing. */
+ * volume has all its layers one after the other. A planar texture's subresource is a plane of a slice (plane * slices + slice), a packed YUV array's a slice: each an image of
+ * its own. The program's texels are the subresource's format (a plane's: R8 / R8G8 / R16 / R16G16); where the kernel keeps them widened (narrow formats and planes) a written
+ * texel becomes (r, g or 0, 0, the maximum - 1 for an integer image), as a copy into the image makes it, and a read one is the pixel's first channels. A box that is empty
+ * copies nothing. */
 static HRESULT res_texture_copy(Resource *r, UINT sub, const D3D12_BOX *box, BYTE *mem, UINT row_pitch, UINT slice_pitch, int write) {
   if (!r->cpu_texture || !mem || !r->fmt || sub >= res_subresources(r)) return E_INVALIDARG;
   const FormatInfo *fi = r->fmt;
-  const UINT level = sub % r->mips, layer = sub / r->mips;
-  const UINT w = mip_extent((UINT)r->desc.Width, level), h = mip_extent(r->desc.Height, level), d = r->kind == 1 ? r->layers : 1;
+  UINT alloc = r->alloc, level = sub % r->mips, layer = sub / r->mips, w, h;
+  const FormatInfo *texel = fi;      /* (the format of the program's texels) */
+  if (r->planes) {
+    /* (a plane of a slice, or a slice of a packed YUV array: an allocation of one level and layer) */
+    alloc = r->plane_alloc[sub];
+    texel = plane_format(fi, sub / r->layers);
+    w = (UINT)r->desc.Width;
+    h = r->desc.Height;
+    plane_extent(fi, sub / r->layers, &w, &h);
+    level = layer = 0;
+  } else {
+    w = mip_extent((UINT)r->desc.Width, level);
+    h = mip_extent(r->desc.Height, level);
+  }
+  if (!texel) return E_INVALIDARG;
+  const UINT d = r->kind == 1 ? mip_extent(r->layers, level) : 1;
   D3D12_BOX b = {0, 0, 0, w, h, d};
   if (box) b = *box;
   if (b.left >= b.right || b.top >= b.bottom || b.front >= b.back) return S_OK;
   if (b.right > w || b.bottom > h || b.back > d) return E_INVALIDARG;
   if (fi->compressed && (b.left % 4 || b.top % 4 || (b.right % 4 && b.right != w) || (b.bottom % 4 && b.bottom != h))) return E_INVALIDARG;
   if (fi->pair && (b.left % 2 || (b.right % 2 && b.right != w))) return E_INVALIDARG;      /* (whole pairs of pixels) */
-  const UINT64 pitch = format_row_bytes(fi, w), plane = pitch * format_rows(fi, h);
-  const UINT64 x_bytes = format_row_bytes(fi, b.left), row_bytes = format_row_bytes(fi, b.right) - x_bytes;
+  /* (the kernel's image: a pixel kernel_pixel_bytes wide - a pair's, a block's -, or the texel itself) */
+  const UINT kpixel = kernel_pixel_bytes(fi->kernel);
+  const int narrow = texel->narrow != NARROW_NONE;
+  const UINT64 pitch = narrow ? (UINT64)w * kpixel : format_row_bytes(fi, w), plane = pitch * format_rows(fi, h);
+  const UINT64 x_bytes = narrow ? (UINT64)b.left * kpixel : format_row_bytes(fi, b.left);
+  const UINT64 row_bytes = format_row_bytes(texel, b.right) - format_row_bytes(texel, b.left);      /* (the program's) */
   const UINT first_row = fi->compressed ? b.top / 4 : b.top, rows = format_rows(fi, b.bottom) - first_row;
   /* (the kernel's subresource: the level of a 2D texture; a layered one has one level, the layers in it) */
   const UINT ksub = r->kind == 0 ? level : 0;
-  const UINT64 base = r->kind == 1 ? 0 : (UINT64)layer * plane;
+  const UINT64 base = r->kind == 1 || r->planes ? 0 : (UINT64)layer * plane;
   void *data = NULL;
   NTSTATUS st = 0;
   for (UINT tries = 0; tries < 2000; ++tries) {      /* (the GPU's work that still uses it, a queue waiting for a fence: up to two seconds) */
-    st = kmt_lock(r->d.dev->kdev, r->alloc, ksub, write ? 0 : KMT_LOCK_READ_ONLY, &data);
+    st = kmt_lock(r->d.dev->kdev, alloc, ksub, write ? 0 : KMT_LOCK_READ_ONLY, &data);
     if (st != (NTSTATUS)0xC01E0102L) break;      /* (STATUS_GRAPHICS_ALLOCATION_BUSY) */
     Sleep(1);
   }
   if (!KMT_OK(st)) return hr_from(st);
-  if (!data) { kmt_unlock(r->d.dev->kdev, r->alloc); return E_FAIL; }
+  if (!data) { kmt_unlock(r->d.dev->kdev, alloc); return E_FAIL; }
   BYTE *image = data;
+  /* (a narrow texel: one or two channels of 8 or 16 bits in a pixel of four; the missing alpha is the maximum, or 1 in an integer image) */
+  const UINT sample = narrow ? (texel->narrow == NARROW_R16 || texel->narrow == NARROW_R16G16 ? 2 : 1) : 0, texel_bytes = texel->bytes;
+  const int integer = fi->kernel == KF_RGBA16SINT || fi->kernel == KF_RGBA16UINT || fi->kernel == KF_RGBA8UINT;
   for (UINT z = b.front; z < b.back; ++z)
     for (UINT y = 0; y < rows; ++y) {
-      BYTE *texels = image + base + (UINT64)z * plane + (UINT64)(first_row + y) * pitch + x_bytes;
+      BYTE *pixels = image + base + (UINT64)z * plane + (UINT64)(first_row + y) * pitch + x_bytes;
       BYTE *program = mem + (UINT64)(z - b.front) * slice_pitch + (UINT64)y * row_pitch;
-      if (write) memcpy(texels, program, (SIZE_T)row_bytes);
-      else memcpy(program, texels, (SIZE_T)row_bytes);
+      if (!narrow) {
+        if (write) memcpy(pixels, program, (SIZE_T)row_bytes);
+        else memcpy(program, pixels, (SIZE_T)row_bytes);
+        continue;
+      }
+      for (UINT x = 0; x < b.right - b.left; ++x) {
+        BYTE *px = pixels + (UINT64)x * kpixel, *tx = program + (UINT64)x * texel_bytes;
+        if (!write) { memcpy(tx, px, texel_bytes); continue; }
+        memset(px, 0, kpixel);
+        memcpy(px, tx, texel_bytes);
+        if (integer) px[3 * sample] = 1;
+        else memset(px + 3 * sample, 0xFF, sample);
+      }
     }
-  kmt_unlock(r->d.dev->kdev, r->alloc);
+  kmt_unlock(r->d.dev->kdev, alloc);
   return S_OK;
 }
 static HRESULT STDMETHODCALLTYPE res_WriteToSubresource(Resource *This, UINT sub, const D3D12_BOX *box, const void *src, UINT row_pitch, UINT slice_pitch) {

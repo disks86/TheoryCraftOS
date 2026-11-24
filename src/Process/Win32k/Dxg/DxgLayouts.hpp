@@ -77,6 +77,8 @@ enum AllocWord : uint32_t {
   kAwPitch, kAwBytesLo, kAwBytesHi, kAwWords
 };
 constexpr uint32_t kAllocPrivateBytes = kAwWords * 4;
+// An optional input word after those (private data that long has it): AllocationDesc::tile_narrow, the NarrowLayout of a reserved texture's texels in the heaps' tiles.
+constexpr uint32_t kAwTileNarrow = kAwWords;
 
 // --- Synchronization
 constexpr uint64_t sizeof_create_sync = 76;                 // { hDevice @0; Info @4 { Type @4; union @8 }; hSyncObject @72 }

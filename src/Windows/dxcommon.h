@@ -380,10 +380,13 @@ static NTSTATUS kmt_render(const KmtContext *context, UINT bytes, UINT allocatio
 /* The private driver data of an allocation (src/Process/Win32k/Dxg/DxgLayouts.hpp AllocWord) */
 enum { KAW_VERSION, KAW_FLAGS, KAW_FORMAT, KAW_WIDTH, KAW_HEIGHT, KAW_MIPS, KAW_SIZE_LO, KAW_SIZE_HI, KAW_KIND, KAW_SAMPLES, KAW_LAYERS, KAW_INITIAL_STATE, KAW_HEAP, KAW_HEAP_OFFSET_LO,
        KAW_HEAP_OFFSET_HI, KAW_PITCH, KAW_BYTES_LO, KAW_BYTES_HI, KAW_WORDS };
+/* ... and the optional word after them (kAwTileNarrow): a reserved texture's NarrowLayout in the heaps' tiles. What this runtime sends is KAW_ALL_WORDS long. */
+enum { KAW_TILE_NARROW = KAW_WORDS, KAW_ALL_WORDS };
 
 typedef struct KmtAllocDesc {
   UINT flags, format, width, height, mips, kind, samples, layers, initial_state, heap;
   UINT64 size, heap_offset;
+  UINT tile_narrow;      /* a reserved texture (KA_RESERVED): the NarrowLayout of its texels in the heaps' tiles (1 R8, 2 R8G8, 3 R16, 4 R16G16; 0 the image's pixels) */
 } KmtAllocDesc;
 
 static NTSTATUS kmt_create_allocation_shared(UINT device, const KmtAllocDesc *d, const void *runtime, UINT runtime_size, UINT *resource, UINT *global, UINT *allocation, UINT *pitch,
@@ -411,13 +414,13 @@ static NTSTATUS kmt_create_allocation_shared(UINT device, const KmtAllocDesc *d,
 static NTSTATUS kmt_create_allocations_shared(UINT device, const KmtAllocDesc *descs, UINT count, const void *runtime, UINT runtime_size, UINT *resource, UINT *global,
                                               UINT *allocations, UINT *pitches, UINT64 *bytes) {
   if (count == 0 || count > KMT_MAX_RESOURCE_ALLOCATIONS) return (NTSTATUS)0xC000000Du;      /* STATUS_INVALID_PARAMETER */
-  UINT *priv = mem_alloc((SIZE_T)count * KAW_WORDS * 4);
+  UINT *priv = mem_alloc((SIZE_T)count * KAW_ALL_WORDS * 4);
   BYTE *info = mem_alloc((SIZE_T)count * 40);      /* (D3DDDI_ALLOCATIONINFO: 40 bytes each) */
   if (!priv || !info) { mem_free(priv); mem_free(info); return (NTSTATUS)0xC0000017u; }      /* STATUS_NO_MEMORY */
   BYTE block[72] __attribute__((aligned(16))) = {0};
   for (UINT i = 0; i < count; ++i) {
     const KmtAllocDesc *d = &descs[i];
-    UINT *w = priv + (SIZE_T)i * KAW_WORDS;
+    UINT *w = priv + (SIZE_T)i * KAW_ALL_WORDS;
     w[KAW_VERSION] = 1;
     w[KAW_FLAGS] = d->flags;
     w[KAW_FORMAT] = d->format;
@@ -433,8 +436,9 @@ static NTSTATUS kmt_create_allocations_shared(UINT device, const KmtAllocDesc *d
     w[KAW_HEAP] = d->heap;
     w[KAW_HEAP_OFFSET_LO] = (UINT)d->heap_offset;
     w[KAW_HEAP_OFFSET_HI] = (UINT)(d->heap_offset >> 32);
+    w[KAW_TILE_NARROW] = d->tile_narrow;
     KPUT64(info + (SIZE_T)i * 40, 16, (UINT_PTR)w);
-    KPUT32(info + (SIZE_T)i * 40, 24, KAW_WORDS * 4);
+    KPUT32(info + (SIZE_T)i * 40, 24, KAW_ALL_WORDS * 4);
   }
   KPUT32(block, 0, device);
   KPUT32(block, 44, count);
@@ -447,7 +451,7 @@ static NTSTATUS kmt_create_allocations_shared(UINT device, const KmtAllocDesc *d
   NTSTATUS st = D3DKMTCreateAllocation(block);
   if (KMT_OK(st)) {
     for (UINT i = 0; i < count; ++i) {
-      const UINT *w = priv + (SIZE_T)i * KAW_WORDS;
+      const UINT *w = priv + (SIZE_T)i * KAW_ALL_WORDS;
       allocations[i] = KGET32(info + (SIZE_T)i * 40, 0);
       if (pitches) pitches[i] = w[KAW_PITCH];
       if (bytes) bytes[i] = w[KAW_BYTES_LO] | ((UINT64)w[KAW_BYTES_HI] << 32);

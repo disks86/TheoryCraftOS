@@ -144,13 +144,28 @@ enum AllocationFlags : uint32_t {
   kAllocStreamOutput = 1u << 10,   // a buffer a geometry shader's stream output is written to (SetStreamOutput; the adapter's kFeatureStreamOutput): read by locking it
   kAllocConstantBuffer = 1u << 11,   // a buffer of constants (Direct3D 12 root constant buffer views and descriptors); system memory only, never resident: read by the CPU when a draw needs it
   kAllocHeap = 1u << 13,             // Direct3D 12 resource heap: memory other allocations are placed in (AllocationDesc::heap / heap_offset); system memory only, never resident, no other flags but kAllocShared-free
-  kAllocReserved = 1u << 14,         // Direct3D 12 reserved (tiled) buffer: with the flags of a vertex, index, storage or stream output buffer; its size a multiple of kTileBytes; no memory of its own - Kernel::update_tile_mappings maps its 64 KiB tiles to places in heaps (an unmapped tile reads as zero and drops writes)
+  kAllocReserved = 1u << 14,         // Direct3D 12 reserved (tiled) buffer or texture (VidMm::create, tile_shape, AllocationDesc::tile_narrow). A buffer: with the flags of a vertex, index, storage or stream output buffer; its size a multiple of kTileBytes; no memory of its own - Kernel::update_tile_mappings maps its 64 KiB tiles to places in heaps (an unmapped tile reads as zero and drops writes)
   kAllocTrackState = 1u << 12,       // Direct3D 12 resource states: AllocationDesc::initial_state is the state; ResourceBarrier moves it and uses of the allocation check it (CommandStream.hpp). Any other flags as usual.
   kAllocQueryResult = 1u << 8,   // a buffer the results of occlusion queries are written to (CommandStream.hpp BeginQuery); system memory only, never resident, read by locking it
 };
 
-constexpr uint32_t kTileTexels = 128;   // ... a reserved texture of 4-byte pixels has tiles of kTileTexels x kTileTexels (so 64 KiB; the rows of a tile follow one another in the heap)
+constexpr uint32_t kTileTexels = 128;   // ... a reserved texture of 4-byte texels has tiles of kTileTexels x kTileTexels (so 64 KiB; the rows of a tile follow one another in the heap)
 constexpr uint32_t kTileBytes = 65536;   // the size of a tile of a reserved resource
+// The shape of a 64 KiB tile of a reserved 2D texture whose texels are `texel_bytes` in the heaps (Direct3D's standard tile shapes: 8 bits 256 x 256, 16 bits 256 x 128,
+// 32 bits 128 x 128, 64 bits 128 x 64, 128 bits 64 x 64); 0 x 0 for another size.
+struct TileShape {
+  uint32_t width = 0, height = 0;
+};
+constexpr TileShape tile_shape(uint32_t texel_bytes) {
+  switch (texel_bytes) {
+    case 1: return {256, 256};
+    case 2: return {256, 128};
+    case 4: return {kTileTexels, kTileTexels};
+    case 8: return {128, 64};
+    case 16: return {64, 64};
+    default: return {};
+  }
+}
 constexpr uint32_t kMaxTextureDimension = 4096;
 constexpr uint64_t kMaxBufferBytes = 256ull * 1024 * 1024;
 
@@ -167,6 +182,8 @@ struct AllocationDesc {
   uint64_t heap_offset = 0;          //   (a multiple of 16; a buffer or a colour image of one sample - no depth image; its backing is the heap's memory, not a copy)
   uint32_t initial_state = 0;        // kAllocTrackState: the resource state it starts in (D3d12.hpp ResourceState)
   uint32_t layers = 1;               // Texture3D: the depth; Texture2DArray: the array size (1 .. graphics::kMaxTextureLayers); TextureCube: 6 (width equals height)
+  uint32_t tile_narrow = 0;          // a reserved texture: the NarrowLayout (CommandStream.hpp) of its texels in the heaps' tiles - Direct3D's R8 / R8G8 (of an A8B8G8R8 / X8B8G8R8
+                                     //   image) or R16 / R16G16 (of A16B16G16R16 / A16B16G16R16Sint), which the image keeps widened; 0: the tiles hold the image's own pixels
 };
 
 struct AllocationInfo {

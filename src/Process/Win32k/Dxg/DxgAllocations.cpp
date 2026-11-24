@@ -80,6 +80,7 @@ uint32_t parse_private_data(const ByteBuffer& data, Session& s, dxgk::Handle dev
   desc->initial_state = word(data, kAwInitialState);
   desc->heap = word(data, kAwHeap);
   desc->heap_offset = uint64_t{word(data, kAwHeapOffsetLo)} | uint64_t{word(data, kAwHeapOffsetHi)} << 32;
+  desc->tile_narrow = data.size() >= (uint64_t{kAwTileNarrow} + 1) * 4 ? word(data, kAwTileNarrow) : 0;   // (the optional word)
   if (desc->heap != 0) {
     AllocationRecord* heap = s.state().find_allocation(desc->heap);
     if (!heap || heap->device != device) return status::kInvalidHandle;

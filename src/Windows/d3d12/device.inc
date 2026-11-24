@@ -104,7 +104,9 @@ static HRESULT open_shared(Dev *This, UINT64 handle, int mode, IUnknown **out) {
    * would be laid out otherwise) */
   if (!share_desc_read(runtime, runtime_size, &sd) || total > 4096 * KMT_MAX_RESOURCE_ALLOCATIONS || resource_driver > 4096) return E_INVALIDARG;
   const FormatInfo *sfi = sd.kind == 0 && sd.desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER ? format_info(sd.desc.Format) : NULL;
-  const UINT expected = sfi && sfi->planar ? format_planes(sfi) * (sd.desc.DepthOrArraySize ? sd.desc.DepthOrArraySize : 1u) : 1u;
+  const UINT shared_layers = sd.desc.DepthOrArraySize ? sd.desc.DepthOrArraySize : 1u;
+  /* (a planar texture: an allocation for every plane of every slice; a packed YUV array: one for every slice) */
+  const UINT expected = sfi && sfi->planar ? format_planes(sfi) * shared_layers : sfi && format_packed_yuv(sfi->dxgi) && shared_layers > 1 ? shared_layers : 1u;
   if (allocations != expected || expected > KMT_MAX_RESOURCE_ALLOCATIONS) return E_INVALIDARG;
   BYTE *driver = mem_alloc(total ? total : 1), *resource_data = mem_alloc(resource_driver ? resource_driver : 1);
   UINT *opened = mem_alloc(sizeof(UINT) * expected);
@@ -260,8 +262,13 @@ static HRESULT STDMETHODCALLTYPE dev_CheckFeatureSupport(Dev *This, D3D12_FEATUR
         f->Support1 = D3D12_FORMAT_SUPPORT1_TEXTURE2D | D3D12_FORMAT_SUPPORT1_SHADER_LOAD | D3D12_FORMAT_SUPPORT1_SHADER_SAMPLE | D3D12_FORMAT_SUPPORT1_DECODER_OUTPUT |
                       D3D12_FORMAT_SUPPORT1_VIDEO_PROCESSOR_OUTPUT | D3D12_FORMAT_SUPPORT1_VIDEO_PROCESSOR_INPUT;
         if (f->Format == DXGI_FORMAT_AYUV) f->Support1 |= D3D12_FORMAT_SUPPORT1_RENDER_TARGET;
+        /* (AYUV has mip levels; Y416 would - DXGI's tables give it them -, but the kernel's 16-bit images have one level; the others have none in DXGI's tables) */
+        if (format_packed_yuv_mips(f->Format) && kernel_format_levels(i->kernel)) f->Support1 |= D3D12_FORMAT_SUPPORT1_MIP;
       } else if (i) {
         f->Support1 = D3D12_FORMAT_SUPPORT1_TEXTURE2D;
+        /* (levels: the kernel's 8-bit and block-compressed images have them, its wider ones - 16 and 32-bit channels, 10-bit, integer - and depth buffers one) */
+        if (!i->depth && kernel_format_levels(i->kernel)) f->Support1 |= D3D12_FORMAT_SUPPORT1_MIP;
+        if (format_tiled(i)) f->Support2 |= D3D12_FORMAT_SUPPORT2_TILED;      /* (the kernel's reserved textures: tile_layout) */
         if (i->depth) f->Support1 |= D3D12_FORMAT_SUPPORT1_DEPTH_STENCIL;
         else f->Support1 |= D3D12_FORMAT_SUPPORT1_SHADER_SAMPLE | D3D12_FORMAT_SUPPORT1_RENDER_TARGET | D3D12_FORMAT_SUPPORT1_BLENDABLE;
         if (i->narrow || i->kernel == KF_A8R8G8B8 || i->kernel == KF_A8B8G8R8 || i->kernel == KF_X8R8G8B8 || i->kernel == KF_RGBA16 || i->kernel == KF_RGB10A2)

@@ -93,10 +93,12 @@ static HRESULT STDMETHODCALLTYPE dev_CheckFormatSupport(Dev *d, DXGI_FORMAT form
     return S_OK;
   }
   if (planar && (planar->flags & FMT_YUV)) {
-    /* (AYUV, Y410, Y416, YUY2, Y210, Y216: 2D textures and arrays of one level the CPU reaches, sampled through views of their pixels' format (AYUV drawn into too),
-     * what AV1's profiles 1 and 2 decode into, what the video processor reads - and writes where it may be a render target: AYUV; no unordered access is drawn) */
+    /* (AYUV, Y410, Y416, YUY2, Y210, Y216: 2D textures and arrays the CPU reaches, sampled through views of their pixels' format (AYUV drawn into too), AYUV with mip
+     * levels (DXGI's tables give them to AYUV and Y416 alone), what AV1's profiles 1 and 2 decode into, what the video processor reads - and writes where it may be a render
+     * target: AYUV; no unordered access is drawn) */
     *support = D3D11_FORMAT_SUPPORT_TEXTURE2D | D3D11_FORMAT_SUPPORT_SHADER_LOAD | D3D11_FORMAT_SUPPORT_SHADER_SAMPLE | D3D11_FORMAT_SUPPORT_CPU_LOCKABLE |
                D3D11_FORMAT_SUPPORT_DECODER_OUTPUT | D3D11_FORMAT_SUPPORT_VIDEO_PROCESSOR_INPUT;
+    if (format == DXGI_FORMAT_AYUV) *support |= D3D11_FORMAT_SUPPORT_MIP;      /* (Y416's levels: Direct3D 12 below has none - the kernel's 16-bit images have one) */
     if (format == DXGI_FORMAT_AYUV) *support |= D3D11_FORMAT_SUPPORT_RENDER_TARGET | D3D11_FORMAT_SUPPORT_VIDEO_PROCESSOR_OUTPUT;
     return S_OK;
   }

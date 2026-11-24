@@ -2562,6 +2562,473 @@ static void test_planar(Scene *c) {
   ID3D12DescriptorHeap_Release(views);
 }
 
+/* ---- reserved textures of other texel sizes, CPU-visible planar and packed YUV textures, packed YUV mips and arrays ------------------------------------------------- */
+
+/* Subresource `sub` of `tex` from `data` (rows of `row_bytes`, tight) through an upload buffer laid out as GetCopyableFootprints says, or (`down`) back into it. */
+static int sub_copy(Scene *c, ID3D12Resource *tex, UINT sub, BYTE *data, int down) {
+  const D3D12_RESOURCE_DESC rd = ID3D12Resource_GetDesc(tex);
+  D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp;
+  UINT rows = 0;
+  UINT64 row_bytes = 0, total = 0;
+  ID3D12Device_GetCopyableFootprints(c->dev, &rd, sub, 1, 0, &fp, &rows, &row_bytes, &total);
+  ID3D12Resource *buf = make_buffer(c->dev, down ? D3D12_HEAP_TYPE_READBACK : D3D12_HEAP_TYPE_UPLOAD, total, D3D12_RESOURCE_FLAG_NONE,
+                                    down ? D3D12_RESOURCE_STATE_COPY_DEST : D3D12_RESOURCE_STATE_GENERIC_READ);
+  BYTE *p = NULL;
+  if (!buf) return 0;
+  if (!down) {
+    if (FAILED(ID3D12Resource_Map(buf, 0, NULL, (void **)&p)) || !p) { ID3D12Resource_Release(buf); return 0; }
+    for (UINT y = 0; y < rows * fp.Footprint.Depth; ++y) memcpy(p + fp.Offset + (UINT64)y * fp.Footprint.RowPitch, data + (UINT64)y * row_bytes, (SIZE_T)row_bytes);
+    ID3D12Resource_Unmap(buf, 0, NULL);
+  }
+  ID3D12GraphicsCommandList *list = NULL;
+  CHECK_HR(ID3D12CommandAllocator_Reset(c->allocator));
+  CHECK_HR(ID3D12Device_CreateCommandList(c->dev, 0, D3D12_COMMAND_LIST_TYPE_DIRECT, c->allocator, NULL, &IID_ID3D12GraphicsCommandList, (void **)&list));
+  if (!list) { ID3D12Resource_Release(buf); return 0; }
+  D3D12_TEXTURE_COPY_LOCATION t, b;
+  memset(&t, 0, sizeof t);
+  memset(&b, 0, sizeof b);
+  t.pResource = tex;
+  t.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+  t.SubresourceIndex = sub;
+  b.pResource = buf;
+  b.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+  b.PlacedFootprint = fp;
+  if (down) ID3D12GraphicsCommandList_CopyTextureRegion(list, &b, 0, 0, 0, &t, NULL);
+  else ID3D12GraphicsCommandList_CopyTextureRegion(list, &t, 0, 0, 0, &b, NULL);
+  scene_run(c, list);
+  ID3D12GraphicsCommandList_Release(list);
+  int ok = 1;
+  if (down) {
+    ok = SUCCEEDED(ID3D12Resource_Map(buf, 0, NULL, (void **)&p)) && p;
+    for (UINT y = 0; ok && y < rows * fp.Footprint.Depth; ++y) memcpy(data + (UINT64)y * row_bytes, p + fp.Offset + (UINT64)y * fp.Footprint.RowPitch, (SIZE_T)row_bytes);
+    if (p) ID3D12Resource_Unmap(buf, 0, NULL);
+  }
+  ID3D12Resource_Release(buf);
+  return ok;
+}
+static UINT64 sub_bytes(ID3D12Device *dev, ID3D12Resource *tex, UINT sub) {
+  const D3D12_RESOURCE_DESC rd = ID3D12Resource_GetDesc(tex);
+  UINT rows = 0;
+  UINT64 row_bytes = 0;
+  D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp;
+  ID3D12Device_GetCopyableFootprints(dev, &rd, sub, 1, 0, &fp, &rows, &row_bytes, NULL);
+  return row_bytes * rows;
+}
+static UINT32 format_support2(ID3D12Device *dev, DXGI_FORMAT f) {
+  D3D12_FEATURE_DATA_FORMAT_SUPPORT fs = {f, 0, 0};
+  return SUCCEEDED(ID3D12Device_CheckFeatureSupport(dev, D3D12_FEATURE_FORMAT_SUPPORT, &fs, sizeof fs)) ? (UINT32)fs.Support2 : 0xFFFFFFFFu;
+}
+static UINT32 format_support1(ID3D12Device *dev, DXGI_FORMAT f) {
+  D3D12_FEATURE_DATA_FORMAT_SUPPORT fs = {f, 0, 0};
+  return SUCCEEDED(ID3D12Device_CheckFeatureSupport(dev, D3D12_FEATURE_FORMAT_SUPPORT, &fs, sizeof fs)) ? (UINT32)fs.Support1 : 0;
+}
+
+/* Reserved textures of 1, 2, 8 and 16-byte texels: Direct3D's tile shapes, the packed levels over several tiles, the tiles' bytes the texels of the format (CopyTiles in, a
+ * copy of the level out); the video formats are not tiled. */
+static void test_tiled_formats(Scene *c) {
+  ID3D12Device *dev = c->dev;
+  static const struct { DXGI_FORMAT f; UINT w, h; } shapes[] = {
+      {DXGI_FORMAT_R8_UNORM, 256, 256}, {DXGI_FORMAT_R8G8_UNORM, 256, 128}, {DXGI_FORMAT_R16_UNORM, 256, 128}, {DXGI_FORMAT_R16G16_UNORM, 128, 128},
+      {DXGI_FORMAT_R8G8B8A8_UNORM, 128, 128}, {DXGI_FORMAT_R16G16B16A16_UNORM, 128, 64}, {DXGI_FORMAT_R32G32B32A32_FLOAT, 64, 64}};
+  for (UINT i = 0; i < sizeof shapes / sizeof shapes[0]; ++i) {
+    CHECK(format_support2(dev, shapes[i].f) & D3D12_FORMAT_SUPPORT2_TILED);
+    D3D12_RESOURCE_DESC td = {D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, 300, 200, 1, 1, shapes[i].f, {1, 0}, D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE, D3D12_RESOURCE_FLAG_NONE};
+    ID3D12Resource *r = NULL;
+    CHECK_HR(ID3D12Device_CreateReservedResource(dev, &td, D3D12_RESOURCE_STATE_COMMON, NULL, &IID_ID3D12Resource, (void **)&r));
+    if (!r) continue;
+    UINT total = 0, nsub = 1;
+    D3D12_TILE_SHAPE shape;
+    D3D12_SUBRESOURCE_TILING tiling;
+    D3D12_PACKED_MIP_INFO packed;
+    ID3D12Device_GetResourceTiling(dev, r, &total, &packed, &shape, &nsub, 0, &tiling);
+    const UINT across = (300 + shapes[i].w - 1) / shapes[i].w, down = (200 + shapes[i].h - 1) / shapes[i].h;
+    const int standard = 300 >= shapes[i].w && 200 >= shapes[i].h;
+    printf("tiled format %d: %ux%u tiles of %ux%u, %u in all\n", (int)shapes[i].f, tiling.WidthInTiles, tiling.HeightInTiles, shape.WidthInTexels, shape.HeightInTexels, total);
+    CHECK(shape.WidthInTexels == shapes[i].w && shape.HeightInTexels == shapes[i].h && shape.DepthInTexels == 1);
+    if (standard) CHECK(tiling.WidthInTiles == across && tiling.HeightInTiles == down && total == across * down && packed.NumPackedMips == 0);
+    else CHECK(packed.NumPackedMips == 1 && packed.NumStandardMips == 0 && total == packed.NumTilesForPackedMips && total >= 1);
+    ID3D12Resource_Release(r);
+  }
+  /* not tiled: the video formats (DXGI's tables), block-compressed and depth formats */
+  static const DXGI_FORMAT untiled[] = {DXGI_FORMAT_NV12, DXGI_FORMAT_P010, DXGI_FORMAT_P016, DXGI_FORMAT_AYUV, DXGI_FORMAT_Y410, DXGI_FORMAT_Y416, DXGI_FORMAT_YUY2,
+                                        DXGI_FORMAT_Y210, DXGI_FORMAT_Y216, DXGI_FORMAT_BC1_UNORM, DXGI_FORMAT_D32_FLOAT};
+  for (UINT i = 0; i < sizeof untiled / sizeof untiled[0]; ++i) {
+    CHECK(!(format_support2(dev, untiled[i]) & D3D12_FORMAT_SUPPORT2_TILED));
+    D3D12_RESOURCE_DESC td = {D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, 256, 256, 1, 1, untiled[i], {1, 0}, D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE,
+                              untiled[i] == DXGI_FORMAT_D32_FLOAT ? D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL : D3D12_RESOURCE_FLAG_NONE};
+    ID3D12Resource *r = NULL;
+    const HRESULT hr = ID3D12Device_CreateReservedResource(dev, &td, D3D12_RESOURCE_STATE_COMMON, NULL, &IID_ID3D12Resource, (void **)&r);
+    if (untiled[i] != DXGI_FORMAT_D32_FLOAT) CHECK(hr == E_INVALIDARG && !r);
+    else CHECK(FAILED(hr) && !r);
+    if (r) ID3D12Resource_Release(r);
+  }
+
+  {
+    /* (levels of a 64-bit format: the kernel's 16-bit images have one - not supported here, though Direct3D has them) */
+    D3D12_RESOURCE_DESC wd = {D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, 256, 256, 1, 2, DXGI_FORMAT_R16G16B16A16_FLOAT, {1, 0}, D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE,
+                              D3D12_RESOURCE_FLAG_NONE};
+    ID3D12Resource *r = NULL;
+    CHECK(ID3D12Device_CreateReservedResource(dev, &wd, D3D12_RESOURCE_STATE_COMMON, NULL, &IID_ID3D12Resource, (void **)&r) == DXGI_ERROR_UNSUPPORTED && !r);
+    if (r) ID3D12Resource_Release(r);
+  }
+  /* R8 4096 x 64, 7 levels: none is a whole 256 x 256 tile, so all are packed - 349504 bytes over six tiles */
+  D3D12_RESOURCE_DESC td = {D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, 4096, 64, 1, 7, DXGI_FORMAT_R8_UNORM, {1, 0}, D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE, D3D12_RESOURCE_FLAG_NONE};
+  ID3D12Resource *tall = NULL;
+  CHECK_HR(ID3D12Device_CreateReservedResource(dev, &td, D3D12_RESOURCE_STATE_COMMON, NULL, &IID_ID3D12Resource, (void **)&tall));
+  /* R8 512 x 256: two standard tiles side by side */
+  td.Width = 512;
+  td.Height = 256;
+  td.MipLevels = 1;
+  ID3D12Resource *wide = NULL;
+  CHECK_HR(ID3D12Device_CreateReservedResource(dev, &td, D3D12_RESOURCE_STATE_COMMON, NULL, &IID_ID3D12Resource, (void **)&wide));
+  D3D12_HEAP_DESC hd;
+  memset(&hd, 0, sizeof hd);
+  hd.SizeInBytes = 8 * 65536;
+  hd.Properties.Type = D3D12_HEAP_TYPE_DEFAULT;
+  hd.Properties.CreationNodeMask = hd.Properties.VisibleNodeMask = 1;
+  hd.Alignment = 65536;
+  ID3D12Heap *heap = NULL;
+  CHECK_HR(ID3D12Device_CreateHeap(dev, &hd, &IID_ID3D12Heap, (void **)&heap));
+  ID3D12Resource *upload = make_buffer(dev, D3D12_HEAP_TYPE_UPLOAD, 6 * 65536, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ);
+  ID3D12Resource *readback = make_buffer(dev, D3D12_HEAP_TYPE_READBACK, 6 * 65536, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);
+  if (!tall || !wide || !heap || !upload || !readback) { CHECK(0); goto done; }
+  UINT total = 0, nsub = 7;
+  D3D12_PACKED_MIP_INFO packed;
+  D3D12_TILE_SHAPE shape;
+  D3D12_SUBRESOURCE_TILING tilings[7];
+  ID3D12Device_GetResourceTiling(dev, tall, &total, &packed, &shape, &nsub, 0, tilings);
+  printf("R8 4096x64x7: %u tiles, %u standard + %u packed levels in %u tiles from %u\n", total, packed.NumStandardMips, packed.NumPackedMips, packed.NumTilesForPackedMips,
+         packed.StartTileIndexInOverallResource);
+  CHECK(total == 6 && packed.NumStandardMips == 0 && packed.NumPackedMips == 7 && packed.NumTilesForPackedMips == 6 && packed.StartTileIndexInOverallResource == 0);
+  CHECK(nsub == 7 && tilings[0].StartTileIndexInOverallResource == 0xFFFFFFFFu && shape.WidthInTexels == 256 && shape.HeightInTexels == 256);
+  {
+    /* the six tiles to heap tiles 1 .. 6; CopyTiles of a pattern in; level 1 (2048 x 32, from byte 262144 of the packed run: tile 4) copied out as R8 */
+    D3D12_TILED_RESOURCE_COORDINATE start = {0, 0, 0, 0};
+    D3D12_TILE_REGION_SIZE size = {6, FALSE, 0, 0, 0};
+    D3D12_TILE_RANGE_FLAGS flags = D3D12_TILE_RANGE_FLAG_NONE;
+    UINT heap_start = 1, count = 6;
+    ID3D12CommandQueue_UpdateTileMappings(c->queue, tall, 1, &start, &size, heap, 1, &flags, &heap_start, &count, D3D12_TILE_MAPPING_FLAG_NONE);
+    BYTE *p = NULL;
+    CHECK_HR(ID3D12Resource_Map(upload, 0, NULL, (void **)&p));
+    if (p) {
+      for (UINT i = 0; i < 6 * 65536; ++i) p[i] = (BYTE)(i * 13 + (i >> 16) * 7 + 1);
+      ID3D12Resource_Unmap(upload, 0, NULL);
+    }
+    ID3D12GraphicsCommandList *list = NULL;
+    CHECK_HR(ID3D12CommandAllocator_Reset(c->allocator));
+    CHECK_HR(ID3D12Device_CreateCommandList(dev, 0, D3D12_COMMAND_LIST_TYPE_DIRECT, c->allocator, NULL, &IID_ID3D12GraphicsCommandList, (void **)&list));
+    if (list) {
+      ID3D12GraphicsCommandList_CopyTiles(list, tall, &start, &size, upload, 0, D3D12_TILE_COPY_FLAG_LINEAR_BUFFER_TO_SWIZZLED_TILED_RESOURCE);
+      scene_run(c, list);
+      ID3D12GraphicsCommandList_Release(list);
+    }
+    static BYTE level1[2048 * 32];
+    CHECK(sub_copy(c, tall, 1, level1, 1));
+    int same = 1;
+    for (UINT i = 0; i < sizeof level1; ++i) {
+      const UINT at = 262144 + i;
+      same &= level1[i] == (BYTE)(at * 13 + (at >> 16) * 7 + 1);
+    }
+    printf("R8 packed level 1 through CopyTiles: %s\n", same ? "same" : "differs");
+    CHECK(same);
+    /* and back out of the tiles: the packed run as it went in (the last tile's 21824 bytes of it) */
+    CHECK_HR(ID3D12CommandAllocator_Reset(c->allocator));
+    CHECK_HR(ID3D12Device_CreateCommandList(dev, 0, D3D12_COMMAND_LIST_TYPE_DIRECT, c->allocator, NULL, &IID_ID3D12GraphicsCommandList, (void **)&list));
+    if (list) {
+      ID3D12GraphicsCommandList_CopyTiles(list, tall, &start, &size, readback, 0, D3D12_TILE_COPY_FLAG_SWIZZLED_TILED_RESOURCE_TO_LINEAR_BUFFER);
+      scene_run(c, list);
+      ID3D12GraphicsCommandList_Release(list);
+    }
+    const BYTE *q = NULL;
+    CHECK_HR(ID3D12Resource_Map(readback, 0, NULL, (void **)&q));
+    same = q != NULL;
+    for (UINT i = 0; q && i < 349504; ++i) same &= q[i] == (BYTE)(i * 13 + (i >> 16) * 7 + 1);
+    if (q) ID3D12Resource_Unmap(readback, 0, NULL);
+    CHECK(same);
+  }
+  {
+    /* R8 512 x 256: tile 1 (the right half) to heap tile 7, written through a placed... through CopyTiles of a ramp; level 0 copied out: the right half is the ramp, row by row
+     * 256 texels, the left half (tile 0, nowhere) zero */
+    D3D12_TILED_RESOURCE_COORDINATE start = {1, 0, 0, 0};
+    D3D12_TILE_REGION_SIZE size = {1, FALSE, 0, 0, 0};
+    D3D12_TILE_RANGE_FLAGS flags = D3D12_TILE_RANGE_FLAG_NONE;
+    UINT heap_start = 7, count = 1;
+    ID3D12CommandQueue_UpdateTileMappings(c->queue, wide, 1, &start, &size, heap, 1, &flags, &heap_start, &count, D3D12_TILE_MAPPING_FLAG_NONE);
+    ID3D12GraphicsCommandList *list = NULL;
+    CHECK_HR(ID3D12CommandAllocator_Reset(c->allocator));
+    CHECK_HR(ID3D12Device_CreateCommandList(dev, 0, D3D12_COMMAND_LIST_TYPE_DIRECT, c->allocator, NULL, &IID_ID3D12GraphicsCommandList, (void **)&list));
+    if (list) {
+      ID3D12GraphicsCommandList_CopyTiles(list, wide, &start, &size, upload, 3 * 65536, D3D12_TILE_COPY_FLAG_LINEAR_BUFFER_TO_SWIZZLED_TILED_RESOURCE);
+      scene_run(c, list);
+      ID3D12GraphicsCommandList_Release(list);
+    }
+    static BYTE level0[512 * 256];
+    CHECK(sub_copy(c, wide, 0, level0, 1));
+    int same = 1;
+    for (UINT y = 0; y < 256; ++y)
+      for (UINT x = 0; x < 512; ++x) {
+        const UINT at = 3 * 65536 + y * 256 + (x - 256);
+        same &= level0[y * 512 + x] == (x < 256 ? 0 : (BYTE)(at * 13 + (at >> 16) * 7 + 1));
+      }
+    printf("R8 512x256, tile 1 mapped: %s\n", same ? "right" : "wrong");
+    CHECK(same);
+  }
+done:
+  if (readback) ID3D12Resource_Release(readback);
+  if (upload) ID3D12Resource_Release(upload);
+  if (heap) ID3D12Heap_Release(heap);
+  if (wide) ID3D12Resource_Release(wide);
+  if (tall) ID3D12Resource_Release(tall);
+}
+
+/* Planar, packed YUV and narrow textures in a custom heap the CPU sees: each plane of each slice (each slice of a packed YUV array) a subresource of WriteToSubresource /
+ * ReadFromSubresource, in the plane's format; what the CPU wrote is what the GPU copies out. */
+static void test_cpu_planar(Scene *c) {
+  ID3D12Device *dev = c->dev;
+  D3D12_HEAP_PROPERTIES hp = ID3D12Device_GetCustomHeapProperties(dev, 0, D3D12_HEAP_TYPE_READBACK);
+  static const DXGI_FORMAT formats[] = {DXGI_FORMAT_NV12, DXGI_FORMAT_P010, DXGI_FORMAT_P208, DXGI_FORMAT_V408};
+  for (UINT f = 0; f < sizeof formats / sizeof formats[0]; ++f) {
+    D3D12_RESOURCE_DESC td = {D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, PL_W, PL_H, 2, 1, formats[f], {1, 0}, D3D12_TEXTURE_LAYOUT_UNKNOWN, D3D12_RESOURCE_FLAG_NONE};
+    ID3D12Resource *tex = NULL;
+    CHECK_HR(ID3D12Device_CreateCommittedResource(dev, &hp, D3D12_HEAP_FLAG_NONE, &td, D3D12_RESOURCE_STATE_COMMON, NULL, &IID_ID3D12Resource, (void **)&tex));
+    if (!tex) continue;
+    D3D12_FEATURE_DATA_FORMAT_INFO info = {formats[f], 0};
+    CHECK_HR(ID3D12Device_CheckFeatureSupport(dev, D3D12_FEATURE_FORMAT_INFO, &info, sizeof info));
+    const UINT subs = info.PlaneCount * 2;
+    void *pointer = (void *)1;
+    CHECK(ID3D12Resource_Map(tex, 0, NULL, &pointer) == E_INVALIDARG && pointer == NULL);      /* (the driver's layout: no address) */
+    CHECK_HR(ID3D12Resource_Map(tex, subs - 1, NULL, NULL));
+    CHECK(ID3D12Resource_Map(tex, subs, NULL, NULL) == E_INVALIDARG);
+    static BYTE data[6][PL_W * PL_H * 4], back[PL_W * PL_H * 4];
+    int same = 1;
+    for (UINT s = 0; s < subs; ++s) {
+      D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp;
+      UINT rows = 0;
+      UINT64 row = 0;
+      ID3D12Device_GetCopyableFootprints(dev, &td, s, 1, 0, &fp, &rows, &row, NULL);
+      for (UINT i = 0; i < row * rows; ++i) data[s][i] = (BYTE)(s * 37 + i * 3 + f);
+      CHECK_HR(ID3D12Resource_WriteToSubresource(tex, s, NULL, data[s], (UINT)row, (UINT)(row * rows)));
+    }
+    /* a box of the second plane of slice 1: the row after the first 2 texels of the next one, written from rows 40 bytes apart */
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp1;
+    UINT rows1 = 0;
+    UINT64 row1 = 0;
+    ID3D12Device_GetCopyableFootprints(dev, &td, 3, 1, 0, &fp1, &rows1, &row1, NULL);
+    const UINT texel = (UINT)(row1 / fp1.Footprint.Width);
+    BYTE patch[2 * 40];
+    for (UINT i = 0; i < sizeof patch; ++i) patch[i] = (BYTE)(0xC0 + i);
+    const D3D12_BOX box = {2, 1, 0, 4, 3, 1};
+    CHECK_HR(ID3D12Resource_WriteToSubresource(tex, 3, &box, patch, 40, 80));
+    for (UINT y = 1; y < 3; ++y) memcpy(data[3] + y * row1 + 2 * texel, patch + (y - 1) * 40, 2 * texel);
+    const D3D12_BOX outside = {0, 0, 0, fp1.Footprint.Width + 1, 1, 1};
+    CHECK(ID3D12Resource_WriteToSubresource(tex, 3, &outside, patch, 40, 80) == E_INVALIDARG);
+    for (UINT s = 0; s < subs; ++s) {
+      const UINT64 n = sub_bytes(dev, tex, s);
+      D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp;
+      UINT rows = 0;
+      UINT64 row = 0;
+      ID3D12Device_GetCopyableFootprints(dev, &td, s, 1, 0, &fp, &rows, &row, NULL);
+      memset(back, 0, sizeof back);
+      CHECK_HR(ID3D12Resource_ReadFromSubresource(tex, back, (UINT)row, (UINT)n, s, NULL));
+      same &= memcmp(back, data[s], (SIZE_T)n) == 0;
+      memset(back, 0, sizeof back);
+      CHECK(sub_copy(c, tex, s, back, 1));      /* (the GPU's copy of the plane: the same texels) */
+      same &= memcmp(back, data[s], (SIZE_T)n) == 0;
+    }
+    printf("CPU-visible %d texture of %u planes x 2 slices: %s\n", (int)formats[f], info.PlaneCount, same ? "same" : "differs");
+    CHECK(same);
+    ID3D12Resource_Unmap(tex, subs - 1, NULL);
+    ID3D12Resource_Release(tex);
+  }
+  /* a narrow format (R8, R16G16): the texels written are what is read and copied, not the kernel's widened pixels (two levels of the 8-bit ones; the kernel's 16-bit
+   * images have one) */
+  static const DXGI_FORMAT narrow[] = {DXGI_FORMAT_R8_UNORM, DXGI_FORMAT_R16G16_UNORM, DXGI_FORMAT_R8G8_UNORM};
+  for (UINT f = 0; f < sizeof narrow / sizeof narrow[0]; ++f) {
+    const UINT levels = narrow[f] == DXGI_FORMAT_R16G16_UNORM ? 1 : 2;
+    D3D12_RESOURCE_DESC td = {D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, 12, 6, 1, (UINT16)levels, narrow[f], {1, 0}, D3D12_TEXTURE_LAYOUT_UNKNOWN, D3D12_RESOURCE_FLAG_NONE};
+    ID3D12Resource *tex = NULL;
+    CHECK_HR(ID3D12Device_CreateCommittedResource(dev, &hp, D3D12_HEAP_FLAG_NONE, &td, D3D12_RESOURCE_STATE_COMMON, NULL, &IID_ID3D12Resource, (void **)&tex));
+    if (!tex) continue;
+    int same = 1;
+    for (UINT s = 0; s < levels; ++s) {
+      BYTE data[12 * 6 * 4], back[12 * 6 * 4];
+      const UINT64 n = sub_bytes(dev, tex, s), row = n / (s ? 3 : 6);
+      for (UINT i = 0; i < n; ++i) data[i] = (BYTE)(i * 5 + s + 11 * f);
+      CHECK_HR(ID3D12Resource_WriteToSubresource(tex, s, NULL, data, (UINT)row, (UINT)n));
+      memset(back, 0, sizeof back);
+      CHECK_HR(ID3D12Resource_ReadFromSubresource(tex, back, (UINT)row, (UINT)n, s, NULL));
+      same &= memcmp(back, data, (SIZE_T)n) == 0;
+      memset(back, 0, sizeof back);
+      CHECK(sub_copy(c, tex, s, back, 1));
+      same &= memcmp(back, data, (SIZE_T)n) == 0;
+    }
+    printf("CPU-visible narrow %d texture: %s\n", (int)narrow[f], same ? "same" : "differs");
+    CHECK(same);
+    ID3D12Resource_Release(tex);
+  }
+  /* packed YUV: an AYUV array of three slices and a YUY2 texture (its boxes on whole pairs) in the CPU's heap */
+  D3D12_RESOURCE_DESC ad = {D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, 8, 4, 3, 1, DXGI_FORMAT_AYUV, {1, 0}, D3D12_TEXTURE_LAYOUT_UNKNOWN, D3D12_RESOURCE_FLAG_NONE};
+  ID3D12Resource *ayuv = NULL, *yuy2 = NULL;
+  CHECK_HR(ID3D12Device_CreateCommittedResource(dev, &hp, D3D12_HEAP_FLAG_NONE, &ad, D3D12_RESOURCE_STATE_COMMON, NULL, &IID_ID3D12Resource, (void **)&ayuv));
+  if (ayuv) {
+    int same = 1;
+    for (UINT s = 0; s < 3; ++s) {
+      UINT32 px[4][8], back[4][8];
+      for (UINT i = 0; i < 32; ++i) px[i / 8][i % 8] = 0x01020304u * (s + 1) + i;
+      CHECK_HR(ID3D12Resource_WriteToSubresource(ayuv, s, NULL, px, sizeof px[0], sizeof px));
+      CHECK_HR(ID3D12Resource_ReadFromSubresource(ayuv, back, sizeof back[0], sizeof back, s, NULL));
+      same &= memcmp(px, back, sizeof px) == 0;
+      memset(back, 0, sizeof back);
+      CHECK(sub_copy(c, ayuv, s, (BYTE *)back, 1));
+      same &= memcmp(px, back, sizeof px) == 0;
+    }
+    CHECK(ID3D12Resource_WriteToSubresource(ayuv, 3, NULL, &same, 32, 128) == E_INVALIDARG);
+    printf("CPU-visible AYUV array: %s\n", same ? "same" : "differs");
+    CHECK(same);
+    ID3D12Resource_Release(ayuv);
+  }
+  ad.DepthOrArraySize = 1;
+  ad.Format = DXGI_FORMAT_YUY2;
+  CHECK_HR(ID3D12Device_CreateCommittedResource(dev, &hp, D3D12_HEAP_FLAG_NONE, &ad, D3D12_RESOURCE_STATE_COMMON, NULL, &IID_ID3D12Resource, (void **)&yuy2));
+  if (yuy2) {
+    BYTE row[16 * 4];
+    for (UINT i = 0; i < sizeof row; ++i) row[i] = (BYTE)(i + 100);
+    const D3D12_BOX odd = {1, 0, 0, 3, 1, 1}, pair = {2, 1, 0, 6, 2, 1};
+    CHECK(ID3D12Resource_WriteToSubresource(yuy2, 0, &odd, row, 16, 16) == E_INVALIDARG);
+    CHECK_HR(ID3D12Resource_WriteToSubresource(yuy2, 0, &pair, row, 16, 16));
+    BYTE back[4][16];
+    CHECK_HR(ID3D12Resource_ReadFromSubresource(yuy2, back, 16, 64, 0, NULL));
+    CHECK(memcmp(&back[1][4], row, 8) == 0 && back[0][4] == 0);
+    ID3D12Resource_Release(yuy2);
+  }
+}
+
+/* Packed YUV textures: mip levels for AYUV and Y416 (the others none, as DXGI's tables have it); arrays placed in a heap; render target views of a slice of an AYUV array;
+ * a Texture2DArray view of several slices of one. */
+static void test_packed_yuv(Scene *c) {
+  ID3D12Device *dev = c->dev;
+  D3D12_HEAP_PROPERTIES defaults = {D3D12_HEAP_TYPE_DEFAULT, D3D12_CPU_PAGE_PROPERTY_UNKNOWN, D3D12_MEMORY_POOL_UNKNOWN, 1, 1};
+  CHECK(format_support1(dev, DXGI_FORMAT_AYUV) & D3D12_FORMAT_SUPPORT1_MIP);
+  CHECK(!(format_support1(dev, DXGI_FORMAT_Y416) & D3D12_FORMAT_SUPPORT1_MIP));      /* (Windows allows them; the kernel's 16-bit images have one level) */
+  CHECK(!(format_support1(dev, DXGI_FORMAT_YUY2) & D3D12_FORMAT_SUPPORT1_MIP) && !(format_support1(dev, DXGI_FORMAT_Y410) & D3D12_FORMAT_SUPPORT1_MIP));
+  /* (mips: 1 made, 0 refused as Windows refuses it - E_INVALIDARG -, 2 not supported here - DXGI_ERROR_UNSUPPORTED) */
+  static const struct { DXGI_FORMAT f; int mips; UINT bytes; } kinds[] = {{DXGI_FORMAT_AYUV, 1, 4}, {DXGI_FORMAT_Y416, 2, 8}, {DXGI_FORMAT_Y410, 0, 4},
+                                                                         {DXGI_FORMAT_YUY2, 0, 4}, {DXGI_FORMAT_Y210, 0, 8}, {DXGI_FORMAT_Y216, 0, 8}};
+  for (UINT k = 0; k < sizeof kinds / sizeof kinds[0]; ++k) {
+    D3D12_RESOURCE_DESC td = {D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, 16, 8, 1, 3, kinds[k].f, {1, 0}, D3D12_TEXTURE_LAYOUT_UNKNOWN, D3D12_RESOURCE_FLAG_NONE};
+    ID3D12Resource *t = NULL;
+    const HRESULT hr = ID3D12Device_CreateCommittedResource(dev, &defaults, D3D12_HEAP_FLAG_NONE, &td, D3D12_RESOURCE_STATE_COMMON, NULL, &IID_ID3D12Resource, (void **)&t);
+    if (kinds[k].mips != 1) { CHECK(hr == (kinds[k].mips ? DXGI_ERROR_UNSUPPORTED : E_INVALIDARG) && !t); continue; }
+    CHECK_HR(hr);
+    if (!t) continue;
+    /* level 1 (8 x 4) and level 2 (4 x 2) written and read back: each its own */
+    int same = 1;
+    for (UINT level = 1; level < 3; ++level) {
+      BYTE data[8 * 4 * 8], back[8 * 4 * 8];
+      const UINT64 n = sub_bytes(dev, t, level);
+      for (UINT i = 0; i < n; ++i) data[i] = (BYTE)(i * 7 + level * 50 + k);
+      same &= sub_copy(c, t, level, data, 0);
+      memset(back, 0, sizeof back);
+      same &= sub_copy(c, t, level, back, 1) && memcmp(back, data, (SIZE_T)n) == 0;
+    }
+    printf("packed YUV %d with 3 levels: %s\n", (int)kinds[k].f, same ? "kept" : "lost");
+    CHECK(same);
+    ID3D12Resource_Release(t);
+  }
+  /* (an array of levels: the kernel's images of several layers have one - not supported, said so) */
+  D3D12_RESOURCE_DESC ad = {D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, 16, 8, 2, 2, DXGI_FORMAT_AYUV, {1, 0}, D3D12_TEXTURE_LAYOUT_UNKNOWN, D3D12_RESOURCE_FLAG_NONE};
+  ID3D12Resource *none = NULL;
+  CHECK(ID3D12Device_CreateCommittedResource(dev, &defaults, D3D12_HEAP_FLAG_NONE, &ad, D3D12_RESOURCE_STATE_COMMON, NULL, &IID_ID3D12Resource, (void **)&none) == DXGI_ERROR_UNSUPPORTED && !none);
+
+  /* two Y416 arrays of three slices placed side by side in one heap keep their own slices */
+  ad.Format = DXGI_FORMAT_Y416;
+  ad.DepthOrArraySize = 3;
+  ad.MipLevels = 1;
+  const D3D12_RESOURCE_ALLOCATION_INFO info = ID3D12Device_GetResourceAllocationInfo(dev, 0, 1, &ad);
+  CHECK(info.SizeInBytes >= 3 * 16 * 8 * 8 && info.SizeInBytes % 65536 == 0);
+  D3D12_HEAP_DESC hd = {2 * info.SizeInBytes, {D3D12_HEAP_TYPE_DEFAULT, D3D12_CPU_PAGE_PROPERTY_UNKNOWN, D3D12_MEMORY_POOL_UNKNOWN, 1, 1}, 0, D3D12_HEAP_FLAG_NONE};
+  ID3D12Heap *heap = NULL;
+  ID3D12Resource *placed[2] = {NULL, NULL};
+  CHECK_HR(ID3D12Device_CreateHeap(dev, &hd, &IID_ID3D12Heap, (void **)&heap));
+  for (int i = 0; heap && i < 2; ++i)
+    CHECK_HR(ID3D12Device_CreatePlacedResource(dev, heap, (UINT64)i * info.SizeInBytes, &ad, D3D12_RESOURCE_STATE_COMMON, NULL, &IID_ID3D12Resource, (void **)&placed[i]));
+  if (placed[0] && placed[1]) {
+    static BYTE data[2][3][16 * 8 * 8], back[16 * 8 * 8];
+    for (int i = 0; i < 2; ++i)
+      for (UINT s = 0; s < 3; ++s) {
+        for (UINT b = 0; b < sizeof data[i][s]; ++b) data[i][s][b] = (BYTE)(b * 3 + s * 40 + i * 101);
+        CHECK(sub_copy(c, placed[i], s, data[i][s], 0));
+      }
+    int same = 1;
+    for (int i = 0; i < 2; ++i)
+      for (UINT s = 0; s < 3; ++s) same &= sub_copy(c, placed[i], s, back, 1) && memcmp(back, data[i][s], sizeof back) == 0;
+    printf("placed Y416 arrays side by side: %s\n", same ? "apart" : "mixed");
+    CHECK(same);
+  }
+  for (int i = 0; i < 2; ++i) if (placed[i]) ID3D12Resource_Release(placed[i]);
+  if (heap) ID3D12Heap_Release(heap);
+
+  /* an AYUV array of three slices: a render target view of slice 1 cleared, the others kept; a Texture2DArray view of slices 1 and 2 reads each */
+  ad.Format = DXGI_FORMAT_AYUV;
+  ad.Width = PL_W;
+  ad.Height = PL_H;
+  ad.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+  ID3D12Resource *arr = NULL;
+  CHECK_HR(ID3D12Device_CreateCommittedResource(dev, &defaults, D3D12_HEAP_FLAG_NONE, &ad, D3D12_RESOURCE_STATE_COMMON, NULL, &IID_ID3D12Resource, (void **)&arr));
+  D3D12_DESCRIPTOR_HEAP_DESC rh = {D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
+  D3D12_DESCRIPTOR_HEAP_DESC sh = {D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
+  ID3D12DescriptorHeap *rtvs = NULL, *srvs = NULL;
+  CHECK_HR(ID3D12Device_CreateDescriptorHeap(dev, &rh, &IID_ID3D12DescriptorHeap, (void **)&rtvs));
+  CHECK_HR(ID3D12Device_CreateDescriptorHeap(dev, &sh, &IID_ID3D12DescriptorHeap, (void **)&srvs));
+  if (arr && rtvs && srvs) {
+    static UINT32 slices[3][PL_W * PL_H], back[PL_W * PL_H];
+    for (UINT s = 0; s < 3; ++s) {
+      for (UINT i = 0; i < PL_W * PL_H; ++i) slices[s][i] = 0xFF000000u | (0x30 + 0x40 * s) << 16 | (0x20 + 0x10 * s) << 8 | (0x10 + 0x20 * s);
+      CHECK(sub_copy(c, arr, s, (BYTE *)slices[s], 0));
+    }
+    D3D12_RENDER_TARGET_VIEW_DESC rv;
+    memset(&rv, 0, sizeof rv);
+    rv.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    rv.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2DARRAY;
+    rv.Texture2DArray.FirstArraySlice = 1;
+    rv.Texture2DArray.ArraySize = 1;
+    const D3D12_CPU_DESCRIPTOR_HANDLE rtv = ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(rtvs);
+    ID3D12Device_CreateRenderTargetView(dev, arr, &rv, rtv);
+    ID3D12GraphicsCommandList *list = NULL;
+    CHECK_HR(ID3D12CommandAllocator_Reset(c->allocator));
+    CHECK_HR(ID3D12Device_CreateCommandList(dev, 0, D3D12_COMMAND_LIST_TYPE_DIRECT, c->allocator, NULL, &IID_ID3D12GraphicsCommandList, (void **)&list));
+    if (list) {
+      const float colour[4] = {1.0f, 0.0f, 0.5f, 1.0f};      /* (V 255, U 0, Y 128, A 255) */
+      ID3D12GraphicsCommandList_ClearRenderTargetView(list, rtv, colour, 0, NULL);
+      scene_run(c, list);
+      ID3D12GraphicsCommandList_Release(list);
+    }
+    int ok = sub_copy(c, arr, 1, (BYTE *)back, 1);
+    printf("AYUV array slice 1 cleared through its render target view: %08x\n", (unsigned)back[0]);
+    for (UINT i = 0; ok && i < PL_W * PL_H; ++i) ok &= (back[i] & 0xFF00FFFFu) == 0xFF0000FFu && ((back[i] >> 16) & 0xFF) >= 127 && ((back[i] >> 16) & 0xFF) <= 128;
+    CHECK(ok);
+    ok = sub_copy(c, arr, 0, (BYTE *)back, 1) && memcmp(back, slices[0], sizeof back) == 0 && sub_copy(c, arr, 2, (BYTE *)back, 1) && memcmp(back, slices[2], sizeof back) == 0;
+    CHECK(ok);
+    /* the array view: slices 1 and 2 through a Texture2DArray shader (the colour's z picks the slice of the view) */
+    PlanarDraw draw;
+    if (planar_draw_make(c, &draw, dx_vs_vol_dxbc, sizeof dx_vs_vol_dxbc, dx_ps_texarray_dxbc, sizeof dx_ps_texarray_dxbc, DXGI_FORMAT_B8G8R8A8_UNORM, 1)) {
+      D3D12_SHADER_RESOURCE_VIEW_DESC sv = plane_srv_desc(DXGI_FORMAT_R8G8B8A8_UNORM, 0, 1, 1, 2);
+      ID3D12Device_CreateShaderResourceView(dev, arr, &sv, ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(srvs));
+      const D3D12_GPU_DESCRIPTOR_HANDLE gpu = ID3D12DescriptorHeap_GetGPUDescriptorHandleForHeapStart(srvs);
+      const float at0[4] = {0.5f, 0.5f, 0.0f, 1}, at1[4] = {0.5f, 0.5f, 1.0f, 1};
+      const UINT32 p0 = planar_draw(c, &draw, srvs, gpu, at0, NULL, 64, 64, 32, 32), p1 = planar_draw(c, &draw, srvs, gpu, at1, NULL, 64, 64, 32, 32);
+      printf("AYUV array view of slices 1, 2: %d %d %d / %d %d %d\n", px_red(p0), px_green(p0), px_blue(p0), px_red(p1), px_green(p1), px_blue(p1));
+      /* (the B8G8R8A8 target shows the R8G8B8A8 view's red as red: slice 1 is the clear - V 255, U 0, Y 128 -, slice 2 its pattern) */
+      CHECK(px_red(p0) == 255 && px_green(p0) == 0 && abs(px_blue(p0) - 128) <= 1);
+      CHECK(px_red(p1) == (int)(slices[2][0] & 0xFF) && px_green(p1) == (int)((slices[2][0] >> 8) & 0xFF) && px_blue(p1) == (int)((slices[2][0] >> 16) & 0xFF));
+      planar_draw_free(&draw);
+    } else CHECK(0);
+  }
+  if (rtvs) ID3D12DescriptorHeap_Release(rtvs);
+  if (srvs) ID3D12DescriptorHeap_Release(srvs);
+  if (arr) ID3D12Resource_Release(arr);
+}
+
 static void test_extras(ID3D12Device *dev, ID3D12CommandQueue *queue, ID3D12Fence *fence, UINT64 *fence_value) {
   Scene c;
   memset(&c, 0, sizeof c);
@@ -2583,6 +3050,9 @@ static void test_extras(ID3D12Device *dev, ID3D12CommandQueue *queue, ID3D12Fenc
   test_limits(&c);
   test_blend_factor(&c);
   test_planar(&c);
+  test_tiled_formats(&c);
+  test_cpu_planar(&c);
+  test_packed_yuv(&c);
 }
 
 /* ---- the interfaces after ID3D12Device and ID3D12GraphicsCommandList ---------------------------------------------------------------------------------------------------- */

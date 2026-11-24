@@ -957,6 +957,83 @@ static ID3D11Texture2D *nv12_texture(ID3D11Device *dev, UINT layers, UINT misc) 
   return tex;
 }
 
+/* ---- packed YUV arrays: every slice goes with the share --------------------------------------------------------------------------------------------------------- */
+
+/* Subresource `sub` of a texture of Direct3D 12 from `bytes` (`write`, tight rows) or compared with them, through an upload or readback buffer. */
+static int d12_subresource(D12 *d, ID3D12Resource *tex, UINT sub, const BYTE *bytes, int write) {
+  const D3D12_RESOURCE_DESC rd = ID3D12Resource_GetDesc(tex);
+  D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp;
+  UINT rows = 0;
+  UINT64 row_bytes = 0, total = 0;
+  ID3D12Device_GetCopyableFootprints(d->dev, &rd, sub, 1, 0, &fp, &rows, &row_bytes, &total);
+  ID3D12Resource *buf = buffer(d->dev, write ? D3D12_HEAP_TYPE_UPLOAD : D3D12_HEAP_TYPE_READBACK, D3D12_HEAP_FLAG_NONE, total,
+                               write ? D3D12_RESOURCE_STATE_GENERIC_READ : D3D12_RESOURCE_STATE_COPY_DEST);
+  BYTE *p = NULL;
+  if (!buf) return 0;
+  if (write) {
+    if (FAILED(ID3D12Resource_Map(buf, 0, NULL, (void **)&p)) || !p) { ID3D12Resource_Release(buf); return 0; }
+    for (UINT y = 0; y < rows; ++y) memcpy(p + fp.Offset + (UINT64)y * fp.Footprint.RowPitch, bytes + (UINT64)y * row_bytes, (SIZE_T)row_bytes);
+    ID3D12Resource_Unmap(buf, 0, NULL);
+  }
+  D3D12_TEXTURE_COPY_LOCATION t, b;
+  memset(&t, 0, sizeof t);
+  memset(&b, 0, sizeof b);
+  t.pResource = tex;
+  t.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+  t.SubresourceIndex = sub;
+  b.pResource = buf;
+  b.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+  b.PlacedFootprint = fp;
+  if (write) ID3D12GraphicsCommandList_CopyTextureRegion(d->list, &t, 0, 0, 0, &b, NULL);
+  else ID3D12GraphicsCommandList_CopyTextureRegion(d->list, &b, 0, 0, 0, &t, NULL);
+  d12_run(d);
+  int same = 1;
+  if (!write) {
+    same = SUCCEEDED(ID3D12Resource_Map(buf, 0, NULL, (void **)&p)) && p;
+    for (UINT y = 0; same && y < rows; ++y) same = memcmp(p + fp.Offset + (UINT64)y * fp.Footprint.RowPitch, bytes + (UINT64)y * row_bytes, (SIZE_T)row_bytes) == 0;
+    if (p) ID3D12Resource_Unmap(buf, 0, NULL);
+  }
+  ID3D12Resource_Release(buf);
+  return same;
+}
+
+/* Direct3D 12's AYUV and Y210 arrays (HEAP_FLAG_SHARED: an allocation a slice) opened by a second device: each slice as it was written, and what the opener writes the
+ * maker reads. */
+static void test_packed_yuv_share(D12 *a, D12 *b) {
+  static const DXGI_FORMAT formats[] = {DXGI_FORMAT_AYUV, DXGI_FORMAT_Y210};
+  for (UINT f = 0; f < 2; ++f) {
+    D3D12_HEAP_PROPERTIES hp = {D3D12_HEAP_TYPE_DEFAULT, D3D12_CPU_PAGE_PROPERTY_UNKNOWN, D3D12_MEMORY_POOL_UNKNOWN, 1, 1};
+    D3D12_RESOURCE_DESC td = {D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, 16, 8, 3, 1, formats[f], {1, 0}, D3D12_TEXTURE_LAYOUT_UNKNOWN, D3D12_RESOURCE_FLAG_NONE};
+    ID3D12Resource *made = NULL, *opened = NULL;
+    CHECK_HR(ID3D12Device_CreateCommittedResource(a->dev, &hp, D3D12_HEAP_FLAG_SHARED, &td, D3D12_RESOURCE_STATE_COMMON, NULL, &IID_ID3D12Resource, (void **)&made));
+    if (!made) continue;
+    static BYTE slices[3][16 * 8 * 8];
+    for (UINT s = 0; s < 3; ++s) {
+      for (UINT i = 0; i < sizeof slices[s]; ++i) slices[s][i] = (BYTE)(i * 7 + s * 61 + f * 3);
+      CHECK(d12_subresource(a, made, s, slices[s], 1));
+    }
+    HANDLE h = NULL;
+    CHECK_HR(ID3D12Device_CreateSharedHandle(a->dev, (ID3D12DeviceChild *)made, NULL, GENERIC_ALL, NULL, &h));
+    if (h) {
+      CHECK_HR(ID3D12Device_OpenSharedHandle(b->dev, h, &IID_ID3D12Resource, (void **)&opened));
+      CloseHandle(h);
+    }
+    if (opened) {
+      const D3D12_RESOURCE_DESC got = ID3D12Resource_GetDesc(opened);
+      CHECK(got.Format == formats[f] && got.DepthOrArraySize == 3 && got.Width == 16 && got.Height == 8);
+      int same = 1;
+      for (UINT s = 0; s < 3; ++s) same &= d12_subresource(b, opened, s, slices[s], 0);
+      printf("shared %s array: the opener sees %s\n", f ? "Y210" : "AYUV", same ? "every slice" : "something else");
+      CHECK(same);
+      for (UINT i = 0; i < sizeof slices[1]; ++i) slices[1][i] ^= 0xA5;
+      CHECK(d12_subresource(b, opened, 1, slices[1], 1));
+      CHECK(d12_subresource(a, made, 1, slices[1], 0) && d12_subresource(a, made, 2, slices[2], 0));
+      ID3D12Resource_Release(opened);
+    }
+    ID3D12Resource_Release(made);
+  }
+}
+
 static void test_nv12(D12 *a, D12 *b) {
   ID3D11Device *x = NULL, *y = NULL;
   ID3D11DeviceContext *cx = NULL, *cy = NULL;
@@ -1311,6 +1388,7 @@ int main(int argc, char **argv) {
   test_legacy(&a);
   test_d3d11_fences(&a);
   test_nv12(&a, &b);
+  test_packed_yuv_share(&a, &b);
   if (processes) test_processes(&a);
   d12_free(&a);
   d12_free(&b);

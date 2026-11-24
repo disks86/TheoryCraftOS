@@ -105,6 +105,14 @@ static int packed_yuv_view_ok(DXGI_FORMAT res, DXGI_FORMAT view, int render_targ
   }
 }
 static UINT format_rows(const FormatInfo *fi, UINT h) { return fi && fi->compressed ? (h + 3) / 4 : h; }
+/* The packed YUV formats that may have mip levels (DXGI's format tables: AYUV and Y416; Y410, YUY2, Y210 and Y216 have "Mipmap" disallowed). */
+static int format_packed_yuv_mips(DXGI_FORMAT f) { return f == DXGI_FORMAT_AYUV || f == DXGI_FORMAT_Y416; }
+/* Whether a texture of the format may be reserved (D3D12_FORMAT_SUPPORT2_TILED): a colour format the kernel keeps, of 1 to 16 bytes a texel, not block-compressed, not a video
+ * format (planar or packed YUV: Direct3D defines no tiles for those, and its format tables have "Tiled Resource" disallowed for every one of them). */
+static int format_tiled(const FormatInfo *fi) {
+  if (!fi || !fi->kernel || fi->depth || fi->compressed || fi->planar || fi->pair || format_packed_yuv(fi->dxgi)) return 0;
+  return fi->bytes == 1 || fi->bytes == 2 || fi->bytes == 4 || fi->bytes == 8 || fi->bytes == 16;
+}
 
 static const FormatInfo *format_info(DXGI_FORMAT f) {
   for (UINT i = 0; i < sizeof g_formats / sizeof g_formats[0]; ++i)

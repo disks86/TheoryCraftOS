@@ -199,6 +199,8 @@ static void test_planar_rules(void) {
       {64, 32, 1, 1, 1, DXGI_FORMAT_NV12, D3D11_USAGE_DEFAULT, D3D11_BIND_DEPTH_STENCIL, 0, 0, E_INVALIDARG, "a depth buffer"},
       {64, 32, 1, 1, 1, DXGI_FORMAT_NV12, D3D11_USAGE_DEFAULT, D3D11_BIND_VIDEO_ENCODER, 0, 0, E_INVALIDARG, "a video encoder's input (there is no encoder)"},
       {64, 32, 1, 2, 1, DXGI_FORMAT_NV12, D3D11_USAGE_STAGING, 0, D3D11_CPU_ACCESS_READ, 0, E_INVALIDARG, "a staging NV12 array"},
+      {64, 32, 1, 2, 1, DXGI_FORMAT_NV12, D3D11_USAGE_DYNAMIC, D3D11_BIND_SHADER_RESOURCE, D3D11_CPU_ACCESS_WRITE, 0, E_INVALIDARG, "a dynamic NV12 array"},
+      {64, 32, 1, 2, 1, DXGI_FORMAT_P010, D3D11_USAGE_STAGING, 0, D3D11_CPU_ACCESS_WRITE, 0, E_INVALIDARG, "a staging P010 array"},
       {64, 32, 1, 1, 1, DXGI_FORMAT_NV12, D3D11_USAGE_DEFAULT, D3D11_BIND_SHADER_RESOURCE, 0, D3D11_RESOURCE_MISC_SHARED, S_OK, "a shared NV12 texture"},
       {64, 32, 1, 4, 1, DXGI_FORMAT_NV12, D3D11_USAGE_DEFAULT, D3D11_BIND_DECODER | D3D11_BIND_SHADER_RESOURCE, 0, D3D11_RESOURCE_MISC_SHARED | D3D11_RESOURCE_MISC_SHARED_NTHANDLE, S_OK,
        "a shared (NT handle) NV12 array for a decoder"},
@@ -1124,7 +1126,7 @@ static void test_packed_yuv(void) {
     HRESULT hr = ID3D11Device_CheckFormatSupport(g_device, f, &support);
     checkf(hr == S_OK && (support & D3D11_FORMAT_SUPPORT_TEXTURE2D) && (support & D3D11_FORMAT_SUPPORT_SHADER_SAMPLE) && (support & D3D11_FORMAT_SUPPORT_DECODER_OUTPUT) &&
                (support & D3D11_FORMAT_SUPPORT_VIDEO_PROCESSOR_INPUT) && !!(support & D3D11_FORMAT_SUPPORT_RENDER_TARGET) == formats[i].target &&
-               !!(support & D3D11_FORMAT_SUPPORT_VIDEO_PROCESSOR_OUTPUT) == formats[i].target && !(support & D3D11_FORMAT_SUPPORT_MIP),
+               !!(support & D3D11_FORMAT_SUPPORT_VIDEO_PROCESSOR_OUTPUT) == formats[i].target && !!(support & D3D11_FORMAT_SUPPORT_MIP) == (f == DXGI_FORMAT_AYUV),
            "CheckFormatSupport(%s): a 2D texture, sampled, a decoder's output, the processor's input%s", name, formats[i].target ? " and output, a render target" : "");
     /* made with its contents, read back byte for byte */
     BYTE rows[16 * 8 * 8], back[16 * 8 * 8];
@@ -1205,9 +1207,42 @@ static void test_packed_yuv(void) {
   HRESULT hr = S_OK;
   ID3D11Texture2D *odd = texture(15, 8, 1, DXGI_FORMAT_YUY2, D3D11_USAGE_DEFAULT, D3D11_BIND_SHADER_RESOURCE, 0, NULL, &hr);
   check(!odd && hr == E_INVALIDARG, "a YUY2 texture of odd width: E_INVALIDARG");
-  const D3D11_TEXTURE2D_DESC mips = {16, 16, 2, 1, DXGI_FORMAT_AYUV, {1, 0}, D3D11_USAGE_DEFAULT, D3D11_BIND_SHADER_RESOURCE, 0, 0};
+  /* levels: AYUV's (and Y416's, which Direct3D 12 below has not: the kernel's 16-bit images have one level), none of the others' (DXGI's tables) */
+  D3D11_TEXTURE2D_DESC mips = {16, 16, 2, 1, DXGI_FORMAT_AYUV, {1, 0}, D3D11_USAGE_DEFAULT, D3D11_BIND_SHADER_RESOURCE, 0, 0};
   ID3D11Texture2D *m = NULL;
-  check(ID3D11Device_CreateTexture2D(g_device, &mips, NULL, &m) == E_INVALIDARG && !m, "an AYUV texture of two levels: E_INVALIDARG");
+  {
+    BYTE level0[16 * 16 * 4], level1[8 * 8 * 4], back[8 * 8 * 4];
+    for (UINT k = 0; k < sizeof level0; ++k) level0[k] = (BYTE)(k * 3 + 1);
+    for (UINT k = 0; k < sizeof level1; ++k) level1[k] = (BYTE)(k * 11 + 5);
+    const D3D11_SUBRESOURCE_DATA levels[2] = {{level0, 64, 0}, {level1, 32, 0}};
+    check(SUCCEEDED(ID3D11Device_CreateTexture2D(g_device, &mips, levels, &m)) && m, "an AYUV texture of two levels");
+    if (m) {
+      /* (level 1 through a staging texture of 8 x 8) */
+      ID3D11Texture2D *staging = texture(8, 8, 1, DXGI_FORMAT_AYUV, D3D11_USAGE_STAGING, 0, D3D11_CPU_ACCESS_READ, NULL, NULL);
+      int ok = staging != NULL;
+      D3D11_MAPPED_SUBRESOURCE mapped;
+      if (ok) {
+        ID3D11DeviceContext_CopySubresourceRegion(g_context, (ID3D11Resource *)staging, 0, 0, 0, 0, (ID3D11Resource *)m, 1, NULL);
+        ok = SUCCEEDED(ID3D11DeviceContext_Map(g_context, (ID3D11Resource *)staging, 0, D3D11_MAP_READ, 0, &mapped)) && mapped.pData;
+        for (UINT y = 0; ok && y < 8; ++y) memcpy(back + y * 32, (BYTE *)mapped.pData + (size_t)y * mapped.RowPitch, 32);
+        if (ok) ID3D11DeviceContext_Unmap(g_context, (ID3D11Resource *)staging, 0);
+        ID3D11Texture2D_Release(staging);
+      }
+      check(ok && !memcmp(back, level1, sizeof level1), "... its second level is what it was made with");
+      ID3D11Texture2D_Release(m);
+      m = NULL;
+    }
+  }
+  mips.Format = DXGI_FORMAT_Y410;
+  check(ID3D11Device_CreateTexture2D(g_device, &mips, NULL, &m) == E_INVALIDARG && !m, "a Y410 texture of two levels: E_INVALIDARG (none in DXGI's tables)");
+  mips.Format = DXGI_FORMAT_YUY2;
+  check(ID3D11Device_CreateTexture2D(g_device, &mips, NULL, &m) == E_INVALIDARG && !m, "a YUY2 texture of two levels: E_INVALIDARG");
+  mips.Format = DXGI_FORMAT_Y416;
+  check(ID3D11Device_CreateTexture2D(g_device, &mips, NULL, &m) == DXGI_ERROR_UNSUPPORTED && !m, "a Y416 texture of two levels: DXGI_ERROR_UNSUPPORTED (no 16-bit levels below)");
+  mips.Format = DXGI_FORMAT_AYUV;
+  mips.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
+  check(ID3D11Device_CreateTexture2D(g_device, &mips, NULL, &m) == DXGI_ERROR_UNSUPPORTED && !m, "an AYUV render target of two levels: DXGI_ERROR_UNSUPPORTED");
+  if (m) ID3D11Texture2D_Release(m);
   UINT support = 0;
   check(ID3D11Device_CheckFormatSupport(g_device, DXGI_FORMAT_P208, &support) == E_FAIL && !support, "CheckFormatSupport(P208): not a Direct3D 11 format, E_FAIL");
   /* an array: each slice its own */
@@ -1219,6 +1254,62 @@ static void test_packed_yuv(void) {
   check(arr && read_packed(arr, 2, 64, back) && !memcmp(back, rows + 1024, 512) && read_packed(arr, 0, 64, back) && !memcmp(back, rows, 512),
         "a Y410 array of three slices for a decoder, made with its pixels: each slice its own");
   if (arr) ID3D11Texture2D_Release(arr);
+}
+
+/* An AYUV array of three slices: a render target view of slice 1 (cleared, the others kept) and a Texture2DArray view of slices 1 and 2 (a Texture2DArray shader reads each). */
+static void test_packed_yuv_arrays(void) {
+  BYTE rows[3][16 * 8 * 4];
+  for (UINT s = 0; s < 3; ++s)
+    for (UINT k = 0; k < sizeof rows[s]; k += 4) { rows[s][k] = (BYTE)(40 + 60 * s); rows[s][k + 1] = (BYTE)(200 - 50 * s); rows[s][k + 2] = (BYTE)(10 + 20 * s); rows[s][k + 3] = 255; }
+  D3D11_SUBRESOURCE_DATA init[3] = {{rows[0], 64, 0}, {rows[1], 64, 0}, {rows[2], 64, 0}};
+  HRESULT hr = S_OK;
+  ID3D11Texture2D *arr = texture(16, 8, 3, DXGI_FORMAT_AYUV, D3D11_USAGE_DEFAULT, D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET, 0, init, &hr);
+  check(arr && SUCCEEDED(hr), "an AYUV array of three slices to sample and draw into");
+  if (!arr) return;
+  D3D11_RENDER_TARGET_VIEW_DESC rd;
+  memset(&rd, 0, sizeof rd);
+  rd.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+  rd.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2DARRAY;
+  rd.Texture2DArray.FirstArraySlice = 1;
+  rd.Texture2DArray.ArraySize = 1;
+  ID3D11RenderTargetView *rtv = NULL;
+  hr = ID3D11Device_CreateRenderTargetView(g_device, (ID3D11Resource *)arr, &rd, &rtv);
+  check(SUCCEEDED(hr) && rtv, "a render target view of slice 1 of the AYUV array");
+  BYTE back[16 * 8 * 4];
+  if (rtv) {
+    const float vuya[4] = {1.0f, 0.0f, 0.5f, 1.0f};
+    ID3D11DeviceContext_ClearRenderTargetView(g_context, rtv, vuya);
+    int ok = read_packed(arr, 1, 64, back) && back[0] == 255 && back[1] == 0 && close_to(back[2], 128, 1) && back[3] == 255 && back[sizeof back - 4] == 255;
+    checkf(ok, "slice 1 cleared through it: (%d, %d, %d, %d)", back[0], back[1], back[2], back[3]);
+    check(read_packed(arr, 0, 64, back) && !memcmp(back, rows[0], sizeof back) && read_packed(arr, 2, 64, back) && !memcmp(back, rows[2], sizeof back),
+          "... slices 0 and 2 kept");
+    ID3D11RenderTargetView_Release(rtv);
+  }
+  ID3D11VertexShader *vs_vol = NULL;
+  ID3D11PixelShader *ps_array = NULL;
+  hr = ID3D11Device_CreateVertexShader(g_device, dx_vs_vol_dxbc, sizeof dx_vs_vol_dxbc, NULL, &vs_vol);
+  if (SUCCEEDED(hr)) hr = ID3D11Device_CreatePixelShader(g_device, dx_ps_texarray_dxbc, sizeof dx_ps_texarray_dxbc, NULL, &ps_array);
+  D3D11_SHADER_RESOURCE_VIEW_DESC sd;
+  memset(&sd, 0, sizeof sd);
+  sd.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+  sd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2DARRAY;
+  sd.Texture2DArray.MipLevels = 1;
+  sd.Texture2DArray.FirstArraySlice = 1;
+  sd.Texture2DArray.ArraySize = 2;
+  ID3D11ShaderResourceView *view = NULL;
+  if (SUCCEEDED(hr)) hr = ID3D11Device_CreateShaderResourceView(g_device, (ID3D11Resource *)arr, &sd, &view);
+  check(SUCCEEDED(hr) && view, "a Texture2DArray view of slices 1 and 2 of the AYUV array");
+  if (view) {
+    const float at0[4] = {0.5f, 0.5f, 0.0f, 1}, at1[4] = {0.5f, 0.5f, 1.0f, 1};
+    const UINT32 p0 = draw_with(vs_vol, ps_array, view, at0), p1 = draw_with(vs_vol, ps_array, view, at1);
+    checkf(red(p0) == 255 && green(p0) == 0 && close_to(blue(p0), 128, 1), "a Texture2DArray shader reads slice 1 (the clear): (%d, %d, %d)", red(p0), green(p0), blue(p0));
+    checkf(red(p1) == rows[2][0] && green(p1) == rows[2][1] && blue(p1) == rows[2][2], "... and slice 2: (%d, %d, %d), want (%d, %d, %d)", red(p1), green(p1), blue(p1),
+           rows[2][0], rows[2][1], rows[2][2]);
+    ID3D11ShaderResourceView_Release(view);
+  }
+  if (vs_vol) ID3D11VertexShader_Release(vs_vol);
+  if (ps_array) ID3D11PixelShader_Release(ps_array);
+  ID3D11Texture2D_Release(arr);
 }
 
 /* An AV1 stream of profile 1 or 2 (av1_dxva_data.h: the DXVA buffers a program fills, picture by picture) decoded through ID3D11VideoContext into an array of
@@ -2096,6 +2187,7 @@ int main(void) {
     if (make_scene()) {
       test_planar_views();
       test_packed_yuv();
+      test_packed_yuv_arrays();
       test_plane_array_and_integer_views();
       test_decoder_caps();
       decode_stream("h264_bframes", DXVA_CODEC_H264, &D3D11_DECODER_PROFILE_H264_VLD_NOFGT, g_h264_bframes_b64, 17, g_h264_bframes_fnv, 14, NULL, 0, 0);

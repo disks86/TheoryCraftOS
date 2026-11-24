@@ -4919,6 +4919,98 @@ void test_reserved_mip_tail() {
   CHECK(e.kernel.escape(kPid, e.dev, ConstByteView(reinterpret_cast<const uint8_t*>(request), 8), ByteView(reinterpret_cast<uint8_t*>(reply), 16), &reply_bytes) == status::kInvalidParameter);   // (not a stream output buffer)
 }
 
+// Reserved textures of other texel sizes: Direct3D's tile shapes (R8 256 x 256, R8G8 / R16 256 x 128, R16G16 128 x 128, 64-bit 128 x 64, 128-bit 64 x 64), the narrow
+// texels of R8 / R8G8 / R16 / R16G16 in the heap widened in the image and narrowed back, and packed mip levels over several tiles.
+void test_reserved_texel_sizes() {
+  Env e;
+  AllocationDesc hd;
+  hd.flags = kAllocHeap, hd.size = 16 * kTileBytes;
+  Handle heap = 0;
+  CHECK(e.kernel.create_allocation(kPid, e.dev, hd, &heap) == status::kSuccess);
+  // (a buffer placed over the whole heap: what the program's other resources would see there)
+  AllocationDesc bd;
+  bd.flags = kAllocVertexBuffer, bd.size = 16 * kTileBytes, bd.heap = heap;
+  Handle view = 0;
+  CHECK(e.kernel.create_allocation(kPid, e.dev, bd, &view) == status::kSuccess);
+  auto reserved = [&](Format f, NarrowLayout narrow, uint32_t w, uint32_t h, uint32_t mips, Handle* out) {
+    AllocationDesc d;
+    d.flags = kAllocTexture | kAllocReserved, d.format = f, d.width = w, d.height = h, d.mip_levels = mips, d.tile_narrow = static_cast<uint32_t>(narrow);
+    return e.kernel.create_allocation(kPid, e.dev, d, out);
+  };
+  auto tiles_of = [&](Handle r) {      // (how many tiles it has: the last one that maps)
+    uint32_t n = 0;
+    while (n < 64 && e.kernel.update_tile_mappings(kPid, r, n, 0, 0, 1) == status::kSuccess) ++n;
+    return n;
+  };
+  Handle r8 = 0, rg8 = 0, r16 = 0, rg16 = 0, wide = 0, wide32 = 0, plain = 0, none = 0;
+  CHECK(reserved(Format::A8B8G8R8, NarrowLayout::R8, 512, 256, 1, &r8) == status::kSuccess && tiles_of(r8) == 2);          // 256 x 256
+  CHECK(reserved(Format::A8B8G8R8, NarrowLayout::R8G8, 256, 256, 1, &rg8) == status::kSuccess && tiles_of(rg8) == 2);      // 256 x 128
+  CHECK(reserved(Format::A16B16G16R16, NarrowLayout::R16, 256, 128, 1, &r16) == status::kSuccess && tiles_of(r16) == 1);   // 256 x 128
+  CHECK(reserved(Format::A16B16G16R16, NarrowLayout::R16G16, 256, 128, 1, &rg16) == status::kSuccess && tiles_of(rg16) == 2);   // 128 x 128
+  CHECK(reserved(Format::A16B16G16R16, NarrowLayout::None, 128, 128, 1, &wide) == status::kSuccess && tiles_of(wide) == 2);       // 128 x 64
+  CHECK(reserved(Format::A32B32G32R32F, NarrowLayout::None, 128, 64, 1, &wide32) == status::kSuccess && tiles_of(wide32) == 2);   // 64 x 64
+  CHECK(reserved(Format::A8R8G8B8, NarrowLayout::R8, 256, 256, 1, &none) == status::kInvalidParameter);           // (R8 of an image that is not A8B8G8R8)
+  CHECK(reserved(Format::A8B8G8R8, NarrowLayout::R16, 256, 256, 1, &none) == status::kInvalidParameter);          // (R16 of an 8-bit image)
+  CHECK(reserved(Format::A8B8G8R8, static_cast<NarrowLayout>(9), 256, 256, 1, &none) == status::kInvalidParameter);
+  // R8: the heap's bytes are the texels; the image has (r, 0, 0, 255). Tile 0 is the left 256 x 256, mapped to heap tile 3; tile 1 nowhere.
+  std::vector<uint8_t> heap_bytes(16 * kTileBytes);
+  for (uint32_t y = 0; y < 256; ++y)
+    for (uint32_t x = 0; x < 256; ++x) heap_bytes[3 * kTileBytes + y * 256 + x] = static_cast<uint8_t>(x ^ y);
+  CHECK(e.write(view, ConstByteView(heap_bytes.data(), heap_bytes.size())));
+  CHECK(e.kernel.update_tile_mappings(kPid, r8, 0, heap, 3 * kTileBytes, 1) == status::kSuccess);
+  LockResult lock;
+  CHECK(e.kernel.lock(kPid, r8, kLockReadOnly, 0, &lock) == status::kSuccess && lock.data.size() == 512u * 256 * 4);
+  bool good = true;
+  for (uint32_t y = 0; y < 256 && good; y += 17)
+    for (uint32_t x = 0; x < 512 && good; x += 13) {
+      ByteReader px(lock.data.subview((uint64_t{y} * 512 + x) * 4, 4));
+      good = px.le32() == (x < 256 ? 0xFF000000u | ((x ^ y) & 0xFF) : 0xFF000000u);      // (nowhere: zero texels, widened)
+    }
+  CHECK(good);
+  e.kernel.unlock(kPid, r8);
+  // Written through the texture: the red channel goes to the heap's byte, the others are not in it.
+  CHECK(e.kernel.lock(kPid, r8, 0, 0, &lock) == status::kSuccess);
+  ByteWriter(lock.data.subview((uint64_t{5} * 512 + 7) * 4, 4)).le32(0x80402099u);
+  ByteWriter(lock.data.subview((uint64_t{5} * 512 + 300) * 4, 4)).le32(0xFF0000AAu);      // (an unmapped tile: dropped)
+  e.kernel.unlock(kPid, r8);
+  CHECK(e.kernel.lock(kPid, view, kLockReadOnly, 0, &lock) == status::kSuccess);
+  CHECK(lock.data[3 * kTileBytes + 5 * 256 + 7] == 0x99 && lock.data[3 * kTileBytes + 5 * 256 + 8] == ((8 ^ 5) & 0xFF));
+  e.kernel.unlock(kPid, view);
+  CHECK(e.pixel(r8, 300, 5) == 0xFF000000u);
+  // R16G16 on 128 x 128 tiles: tile 1 (the right half) mapped to heap tile 5, its texel (x, y) at 5 * 64 KiB + (y * 128 + x - 128) * 4.
+  CHECK(e.kernel.update_tile_mappings(kPid, rg16, 1, heap, 5 * kTileBytes, 1) == status::kSuccess);
+  CHECK(e.kernel.lock(kPid, view, 0, 0, &lock) == status::kSuccess);
+  ByteWriter(lock.data.subview(5 * kTileBytes + (uint64_t{9} * 128 + 3) * 4, 4)).le32(0xBEEF1234u);
+  e.kernel.unlock(kPid, view);
+  CHECK(e.kernel.lock(kPid, rg16, kLockReadOnly, 0, &lock) == status::kSuccess);
+  {
+    ByteReader px(lock.data.subview((uint64_t{9} * 256 + 131) * 8, 8));
+    const uint16_t r = px.le16(), g = px.le16(), b = px.le16(), a = px.le16();
+    CHECK(r == 0x1234 && g == 0xBEEF && b == 0 && a == 0xFFFF);
+  }
+  e.kernel.unlock(kPid, rg16);
+  // 64-bit pixels on 128 x 64 tiles: tile 1 is the lower half.
+  CHECK(e.kernel.update_tile_mappings(kPid, wide, 1, heap, 6 * kTileBytes, 1) == status::kSuccess);
+  CHECK(e.kernel.lock(kPid, wide, 0, 0, &lock) == status::kSuccess);
+  ByteWriter(lock.data.subview((uint64_t{70} * 128 + 2) * 8, 8)).le64(0x0102030405060708ull);
+  e.kernel.unlock(kPid, wide);
+  CHECK(e.kernel.lock(kPid, view, kLockReadOnly, 0, &lock) == status::kSuccess);
+  CHECK(ByteReader(lock.data.subview(6 * kTileBytes + (uint64_t{6} * 128 + 2) * 8, 8)).le64() == 0x0102030405060708ull);
+  e.kernel.unlock(kPid, view);
+  // Packed levels over several tiles: an R8 texture 4096 x 64 has no standard level (64 < 256); its 7 levels' texels (262144 + 65536 + ... bytes) fill 6 tiles.
+  Handle tall = 0;
+  CHECK(reserved(Format::A8B8G8R8, NarrowLayout::R8, 4096, 64, 7, &tall) == status::kSuccess && tiles_of(tall) == 6);
+  // (map the six to heap tiles 8 .. 13 and mark the first texel of level 1, which is at 262144 in the packed run: tile 4, offset 0)
+  CHECK(e.kernel.update_tile_mappings(kPid, tall, 0, heap, 8 * kTileBytes, 6) == status::kSuccess);
+  CHECK(e.kernel.lock(kPid, view, 0, 0, &lock) == status::kSuccess);
+  lock.data[12 * kTileBytes] = 0x5C;
+  lock.data[12 * kTileBytes + 2048 + 1] = 0x3D;      // (level 1 is 2048 wide: texel (1, 1))
+  e.kernel.unlock(kPid, view);
+  CHECK((e.pixel(tall, 0, 0, 1) & 0xFFu) == 0x5C && (e.pixel(tall, 1, 1, 1) & 0xFFu) == 0x3D);
+  // A plain 4-byte texture keeps the old layout: 128 x 128 tiles and the packed levels after them.
+  CHECK(reserved(Format::A8R8G8B8, NarrowLayout::None, 256, 128, 8, &plain) == status::kSuccess && tiles_of(plain) == 3);
+}
+
 // The software renderer behind a device that reports the limits of the fixed pipelines (DeviceInfo::limits at their defaults): what the device takes is checked against what it says.
 class NarrowDevice final : public graphics::IGraphicsDevice {
  public:
@@ -5131,7 +5223,10 @@ void test_d3d12_reserved_texture() {
   CHECK(e.kernel.create_allocation(kPid, e.dev, hd, &heap) == status::kSuccess);
   CHECK(create(kAllocTexture, 128, 128, heap, 0, &p) == status::kSuccess && create(kAllocTexture, 128, 128, heap, 2 * kTileBytes, &q) == status::kSuccess);
   CHECK(create(kAllocTexture | kAllocReserved, 256, 256, 0, 0, &r) == status::kSuccess);
-  CHECK(create(kAllocTexture | kAllocReserved, 200, 256, 0, 0, &none) == status::kInvalidParameter && create(kAllocTexture | kAllocReserved, 256, 0, 0, 0, &none) == status::kInvalidParameter);
+  CHECK(create(kAllocTexture | kAllocReserved, 256, 0, 0, 0, &none) == status::kInvalidParameter);
+  Handle edge = 0;
+  CHECK(create(kAllocTexture | kAllocReserved, 200, 256, 0, 0, &edge) == status::kSuccess);      // (any size: its edge tiles partly used)
+  CHECK(e.kernel.update_tile_mappings(kPid, edge, 0, heap, 0, 4) == status::kSuccess && e.kernel.update_tile_mappings(kPid, edge, 4, heap, 0, 1) == status::kInvalidParameter);
   CHECK(create(kAllocTexture | kAllocRenderTarget | kAllocReserved, 256, 256, 0, 0, &none) == status::kInvalidParameter && create(kAllocTexture | kAllocReserved, 256, 256, heap, 0, &none) == status::kInvalidParameter);
   CHECK(e.kernel.update_tile_mappings(kPid, r, 0, heap, 0, 1) == status::kSuccess && e.kernel.update_tile_mappings(kPid, r, 3, heap, 2 * kTileBytes, 1) == status::kSuccess);
   CHECK(e.kernel.update_tile_mappings(kPid, r, 4, heap, 0, 1) == status::kInvalidParameter && e.kernel.update_tile_mappings(kPid, r, 0, heap, 3 * kTileBytes, 2) == status::kInvalidParameter);
@@ -6725,7 +6820,14 @@ void test_d3d12_reserved() {
   CHECK(create(kAllocVertexBuffer | kAllocReserved, kTileBytes, heap, 0, &none) == status::kInvalidParameter);   // (reserved and placed)
   AllocationDesc image;
   image.flags = kAllocTexture | kAllocReserved, image.format = Format::A8R8G8B8, image.width = image.height = 8;
-  CHECK(e.kernel.create_allocation(kPid, e.dev, image, &none) == status::kInvalidParameter);
+  image.tile_narrow = static_cast<uint32_t>(NarrowLayout::R8);
+  CHECK(e.kernel.create_allocation(kPid, e.dev, image, &none) == status::kInvalidParameter);      // (a narrow layout of an image that is not A8B8G8R8)
+  image.tile_narrow = 0;
+  image.flags = kAllocTexture | kAllocRenderTarget | kAllocReserved;
+  CHECK(e.kernel.create_allocation(kPid, e.dev, image, &none) == status::kInvalidParameter);      // (a reserved texture is sampled only)
+  AllocationDesc narrow_buffer;
+  narrow_buffer.flags = kAllocVertexBuffer, narrow_buffer.size = kTileBytes, narrow_buffer.tile_narrow = 1;
+  CHECK(e.kernel.create_allocation(kPid, e.dev, narrow_buffer, &none) == status::kInvalidParameter);      // (a narrow layout is of reserved textures)
   // Mapping: tile 0 to the start of the heap, tile 1 to its third tile, tile 2 nowhere.
   CHECK(e.kernel.update_tile_mappings(kPid, r, 0, heap, 0, 1) == status::kSuccess && e.kernel.update_tile_mappings(kPid, r, 1, heap, 2 * kTileBytes, 1) == status::kSuccess);
   CHECK(e.kernel.update_tile_mappings(kPid, r, 2, 0, 0, 1) == status::kSuccess);
@@ -8246,6 +8348,7 @@ int main() {
   test_d3d12_binding();
   test_d3d12_copies_and_escapes();
   test_reserved_mip_tail();
+  test_reserved_texel_sizes();
   test_device_limits();
   test_d3d12_compute();
   test_d3d12_buffer_views();

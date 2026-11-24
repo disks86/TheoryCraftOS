@@ -376,20 +376,25 @@ static BOOL tables_record(Dev *d, View *const *srvs, Sampler *const *samplers, c
         }
         ID3D12Device_CreateShaderResourceView(d->d12, v->tex->res, &r, at);
       } else if (v && (v->tex->fmt->flags & FMT_YUV)) {
-        /* (a packed YUV texture: through a view of its pixels' format, of the view's first slice - each an image of its own below) */
+        /* (a packed YUV texture: through a view of its pixels' format; of an array, its slices - each an image of its own below, a shader that declares an array
+         * reading a mirror of them -, of a texture of levels, the view's levels) */
         D3D12_SHADER_RESOURCE_VIEW_DESC r;
         memset(&r, 0, sizeof r);
         r.Format = v->desc.srv.Format;
         r.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-        const UINT slice = v->desc.srv.ViewDimension == D3D11_SRV_DIMENSION_TEXTURE2DARRAY ? v->desc.srv.Texture2DArray.FirstArraySlice : 0;
+        const BOOL array = v->desc.srv.ViewDimension == D3D11_SRV_DIMENSION_TEXTURE2DARRAY;
+        const UINT slice = array ? v->desc.srv.Texture2DArray.FirstArraySlice : 0;
+        UINT count = array ? v->desc.srv.Texture2DArray.ArraySize : 1;
+        if (count == (UINT)-1 || count > v->tex->desc.ArraySize - slice) count = v->tex->desc.ArraySize - slice;
         if (v->tex->desc.ArraySize > 1) {
           r.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
           r.Texture2DArray.MipLevels = 1;
           r.Texture2DArray.FirstArraySlice = slice;
-          r.Texture2DArray.ArraySize = 1;
+          r.Texture2DArray.ArraySize = count;
         } else {
           r.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
-          r.Texture2D.MipLevels = 1;
+          r.Texture2D.MostDetailedMip = array ? v->desc.srv.Texture2DArray.MostDetailedMip : v->desc.srv.Texture2D.MostDetailedMip;
+          r.Texture2D.MipLevels = array ? v->desc.srv.Texture2DArray.MipLevels : v->desc.srv.Texture2D.MipLevels;
         }
         ID3D12Device_CreateShaderResourceView(d->d12, v->tex->res, &r, at);
       } else {

@@ -1070,10 +1070,19 @@ static HRESULT tex_make(Dev *d, const D3D11_TEXTURE2D_DESC *in, UINT slices, ID3
   /* (the decoders' formats: NV12 and P010, P016 for AV1's 12-bit 4:2:0, the packed ones of AV1's profiles 1 and 2) */
   if ((bind & D3D11_BIND_DECODER) && desc.Format != DXGI_FORMAT_NV12 && desc.Format != DXGI_FORMAT_P010 && desc.Format != DXGI_FORMAT_P016 && !yuv) return E_INVALIDARG;
   if (yuv) {
-    /* AYUV, Y410, Y416, YUY2, Y210, Y216: a 2D texture or array of one level, not multisampled, a depth buffer or a cube; YUY2, Y210, Y216 of even width */
-    if (slices || desc.MipLevels != 1 || desc.SampleDesc.Count != 1 || desc.SampleDesc.Quality || (desc.MiscFlags & D3D11_RESOURCE_MISC_TEXTURECUBE) ||
-        (bind & D3D11_BIND_DEPTH_STENCIL) || (format_pairs(desc.Format) && (desc.Width & 1)))
+    /* AYUV, Y410, Y416, YUY2, Y210, Y216: a 2D texture or array, not multisampled, a depth buffer or a cube; YUY2, Y210, Y216 of even width. Mip levels for AYUV and
+     * Y416 alone (DXGI's format tables: the others have "Mipmap" disallowed; MipLevels 0 is the whole chain, which for them is one level only at 1 x 1) */
+    UINT chain = 1;
+    for (UINT size = desc.Width > desc.Height ? desc.Width : desc.Height; size > 1; size >>= 1) ++chain;
+    const BOOL mips_ok = desc.Format == DXGI_FORMAT_AYUV || desc.Format == DXGI_FORMAT_Y416;
+    if (slices || (!mips_ok && desc.MipLevels != 1 && !(desc.MipLevels == 0 && chain == 1)) || desc.SampleDesc.Count != 1 || desc.SampleDesc.Quality ||
+        (desc.MiscFlags & D3D11_RESOURCE_MISC_TEXTURECUBE) || (bind & D3D11_BIND_DEPTH_STENCIL) || (format_pairs(desc.Format) && (desc.Width & 1)))
       return E_INVALIDARG;
+    /* (levels of a render target, and of an array: the kernel draws into images of one level, and its images of several layers have one - Direct3D 12 below refuses those) */
+    if ((desc.MipLevels != 1 && chain > 1) && ((bind & D3D11_BIND_RENDER_TARGET) || desc.ArraySize > 1)) {
+      tex_refused(&desc, "a packed YUV texture of mip levels drawn into, or an array of them");
+      return DXGI_ERROR_UNSUPPORTED;
+    }
   }
   if (planar) {
     /* NV12, P010, P016: a 2D texture or array of one level, of even width and height (the chroma is half of both), not multisampled, not a depth buffer or a cube; it
@@ -1390,7 +1399,8 @@ static HRESULT rtv_create(Dev *d, ID3D11Resource *resource, const D3D11_RENDER_T
     if (plane_slice > 0) return E_INVALIDARG;      /* (a format of one plane) */
     if ((t->fmt->flags & FMT_YUV) && (!desc || !yuv_view_ok(t->desc.Format, desc->Format, TRUE))) return E_INVALIDARG;      /* (AYUV: as R8G8B8A8) */
     if (desc && !rtv_subresource(t, desc, &level, &layer)) return E_INVALIDARG;
-    if (!t->shadowed && (level || layer)) return E_INVALIDARG;
+    /* (a packed YUV array's slices are images of their own below: a view may be of any of them) */
+    if (!t->shadowed && (level || (layer && !(t->fmt->flags & FMT_YUV)))) return E_INVALIDARG;
   }
   EnterCriticalSection(&d->lock);
   if (d->rtv_free_count == 0) { LeaveCriticalSection(&d->lock); return E_OUTOFMEMORY; }
@@ -1437,11 +1447,18 @@ static HRESULT rtv_create(Dev *d, ID3D11Resource *resource, const D3D11_RENDER_T
     D3D12_RENDER_TARGET_VIEW_DESC ms = {t->stored, D3D12_RTV_DIMENSION_TEXTURE2DMS, {{0}}};
     ID3D12Device_CreateRenderTargetView(d->d12, t->res, &ms, v->handle);
   } else if (t->fmt->flags & FMT_YUV) {
-    /* (AYUV: a view of its pixels' format - Direct3D 12 below makes no view of the YUV format itself; slice 0, as for the other formats here) */
+    /* (AYUV: a view of its pixels' format - Direct3D 12 below makes no view of the YUV format itself -, of the view's first slice: one of several slices draws into the
+     * first, as for planar textures - the kernel takes no SV_RenderTargetArrayIndex) */
     D3D12_RENDER_TARGET_VIEW_DESC r;
     memset(&r, 0, sizeof r);
     r.Format = desc->Format;
     r.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
+    if (t->desc.ArraySize > 1) {
+      r.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2DARRAY;
+      r.Texture2DArray.FirstArraySlice = layer;
+      r.Texture2DArray.ArraySize = 1;
+    }
+    v->array_slice = layer;
     ID3D12Device_CreateRenderTargetView(d->d12, t->res, &r, v->handle);
   } else ID3D12Device_CreateRenderTargetView(d->d12, t->res, NULL, v->handle);
   return give(v, (void **)out);

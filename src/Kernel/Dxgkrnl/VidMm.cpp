@@ -18,6 +18,7 @@
 
 #include "Kernel/Dxgkrnl/VidMm.hpp"
 #include "Kernel/Dxgkrnl/D3d12.hpp"
+#include "Kernel/Dxgkrnl/CommandStream.hpp"
 #include "Graphics/Graphics3D/Mipmaps.hpp"
 #include "Graphics/WidePixels.hpp"
 #include "Graphics/BlockCompression.hpp"
@@ -115,62 +116,136 @@ uint32_t VidMm::from_logical(Format f, uint32_t pixel) {
 }
 
 // --- Reserved textures: the numbering of tiles ----------------------------------------------------------------------------------------------------------------------------
-// The levels that are at least a tile (kTileTexels) in both directions - the standard ones - are cut into tiles, row by row, level after level; the smaller levels (the mip tail) share
-// one last tile. A tile in the heap is kTileTexels rows of kTileTexels pixels one after the other (the part of an edge tile outside the level is not used); the tail tile is the bytes of
-// the packed levels, one after the other as they are in the backing.
+// A reserved texture's texels are `texel_bytes` each in the heaps - its image's pixels, or the narrower ones its tile_narrow names (Direct3D's R8 / R8G8 / R16 / R16G16, which
+// the image keeps widened) -, so its tiles have Direct3D's standard shape for that size (tile_shape). The levels that are at least a tile in both directions - the standard ones -
+// are cut into tiles, row by row, level after level; a tile of one is its rows one after the other in the heap, each tile_shape().width texels (the part of an edge tile outside
+// the level is not used). The smaller levels (the packed mips) come last: their texels one level after the other, row by row, over as many tiles as they fill.
 namespace {
+uint32_t tile_texel_bytes(const AllocationDesc& d) { return d.tile_narrow ? narrow_pixel_bytes(static_cast<NarrowLayout>(d.tile_narrow)) : pixel_bytes(d.format); }
 uint32_t standard_levels(const AllocationDesc& d) {
+  const TileShape t = tile_shape(tile_texel_bytes(d));
   uint32_t n = 0;
-  while (n < d.mip_levels && graphics::mip_extent(d.width, n) >= kTileTexels && graphics::mip_extent(d.height, n) >= kTileTexels) ++n;
+  while (n < d.mip_levels && graphics::mip_extent(d.width, n) >= t.width && graphics::mip_extent(d.height, n) >= t.height) ++n;
   return n;
 }
-uint64_t level_tile_columns(const AllocationDesc& d, uint32_t level) { return (graphics::mip_extent(d.width, level) + kTileTexels - 1) / kTileTexels; }
-uint64_t level_tile_rows(const AllocationDesc& d, uint32_t level) { return (graphics::mip_extent(d.height, level) + kTileTexels - 1) / kTileTexels; }
+uint64_t level_tile_columns(const AllocationDesc& d, uint32_t level) {
+  const uint32_t across = tile_shape(tile_texel_bytes(d)).width;
+  return (graphics::mip_extent(d.width, level) + uint64_t{across} - 1) / across;
+}
+uint64_t level_tile_rows(const AllocationDesc& d, uint32_t level) {
+  const uint32_t down = tile_shape(tile_texel_bytes(d)).height;
+  return (graphics::mip_extent(d.height, level) + uint64_t{down} - 1) / down;
+}
+// The heap bytes of the packed levels, and the tiles they take.
+uint64_t packed_bytes(const AllocationDesc& d) {
+  uint64_t n = 0;
+  for (uint32_t l = standard_levels(d); l < d.mip_levels; ++l) n += uint64_t{graphics::mip_extent(d.width, l)} * graphics::mip_extent(d.height, l) * tile_texel_bytes(d);
+  return n;
+}
+uint64_t packed_tiles(const AllocationDesc& d) { return (packed_bytes(d) + kTileBytes - 1) / kTileBytes; }
 uint64_t texture_tile_count(const AllocationDesc& d) {
   const uint32_t standard = standard_levels(d);
-  uint64_t n = standard < d.mip_levels ? 1 : 0;
+  uint64_t n = packed_tiles(d);
   for (uint32_t l = 0; l < standard; ++l) n += level_tile_columns(d, l) * level_tile_rows(d, l);
   return n;
 }
 struct TileSpot {
-  uint32_t level = 0, x = 0, y = 0;   // the tile's column and row in the level
-  bool tail = false;
+  uint32_t level = 0, x = 0, y = 0;   // a standard level's tile: its column and row in the level
+  bool packed = false;
+  uint64_t packed_index = 0;          // a tile of the packed levels: which of them
 };
 bool tile_spot(const AllocationDesc& d, uint64_t tile, TileSpot* out) {
   const uint32_t standard = standard_levels(d);
   for (uint32_t l = 0; l < standard; ++l) {
     const uint64_t across = level_tile_columns(d, l), count = across * level_tile_rows(d, l);
     if (tile < count) {
-      *out = {l, static_cast<uint32_t>(tile % across), static_cast<uint32_t>(tile / across), false};
+      *out = {l, static_cast<uint32_t>(tile % across), static_cast<uint32_t>(tile / across), false, 0};
       return true;
     }
     tile -= count;
   }
-  if (tile == 0 && standard < d.mip_levels) {
-    *out = {standard, 0, 0, true};
+  if (tile < packed_tiles(d)) {
+    *out = {standard, 0, 0, true, tile};
     return true;
   }
   return false;
 }
-// The rows of tile `tile` of a reserved texture in the backing, and where each is in the heap's tile: calls use(picture_row, tile_row_offset) for each, or use(whole tail, 0).
+// The texels of tile `tile` of a reserved texture: calls use(image_run, heap_at, texels) for each run of them that is contiguous in both - `image_run` the run's pixels in the
+// backing, `heap_at` where its texels start in the heap's tile.
 template <typename Use>
-void for_tile_rows(const Allocation& a, uint64_t tile, ByteView backing, Use use) {
+void for_tile_runs(const Allocation& a, uint64_t tile, ByteView backing, Use use) {
+  const AllocationDesc& d = a.desc();
   TileSpot spot;
-  if (!tile_spot(a.desc(), tile, &spot)) return;
-  uint64_t offset = 0, bytes = 0;
-  if (!a.level_range(spot.level, &offset, &bytes)) return;
-  if (spot.tail) {
-    ByteView whole;
-    const uint64_t length = backing.size() - offset < kTileBytes ? backing.size() - offset : kTileBytes;
-    if (backing.try_subview(offset, length, &whole)) use(whole, uint64_t{0});
+  if (!tile_spot(d, tile, &spot)) return;
+  const uint32_t image_bytes = pixel_bytes(d.format), texel_bytes = tile_texel_bytes(d);
+  if (spot.packed) {
+    // (the packed levels as one run of texels, of which this tile is the kTileBytes from packed_index * kTileBytes on; texel_bytes divides kTileBytes, so no texel straddles two)
+    const uint64_t low = spot.packed_index * kTileBytes, high = low + kTileBytes;
+    uint64_t at = 0;
+    for (uint32_t l = spot.level; l < d.mip_levels && at < high; ++l) {
+      const uint32_t w = graphics::mip_extent(d.width, l), h = graphics::mip_extent(d.height, l);
+      const uint64_t row = uint64_t{w} * texel_bytes;
+      if (at + row * h <= low) {
+        at += row * h;
+        continue;
+      }
+      uint64_t offset = 0, bytes = 0;
+      if (!a.level_range(l, &offset, &bytes)) return;
+      for (uint32_t y = 0; y < h && at < high; ++y, at += row) {
+        const uint64_t from = at > low ? at : low, to = at + row < high ? at + row : high;
+        if (from >= to) continue;
+        const uint64_t first = (from - at) / texel_bytes, count = (to - from) / texel_bytes;
+        ByteView run;
+        if (backing.try_subview(offset + (uint64_t{y} * w + first) * image_bytes, count * image_bytes, &run)) use(run, from - low, static_cast<uint32_t>(count));
+      }
+    }
     return;
   }
-  const uint32_t level_w = graphics::mip_extent(a.desc().width, spot.level), level_h = graphics::mip_extent(a.desc().height, spot.level);
-  const uint32_t x0 = spot.x * kTileTexels, y0 = spot.y * kTileTexels;
-  const uint32_t columns = level_w - x0 < kTileTexels ? level_w - x0 : kTileTexels, rows = level_h - y0 < kTileTexels ? level_h - y0 : kTileTexels;
+  uint64_t offset = 0, bytes = 0;
+  if (!a.level_range(spot.level, &offset, &bytes)) return;
+  const TileShape shape = tile_shape(texel_bytes);
+  const uint32_t level_w = graphics::mip_extent(d.width, spot.level), level_h = graphics::mip_extent(d.height, spot.level);
+  const uint32_t x0 = spot.x * shape.width, y0 = spot.y * shape.height;
+  const uint32_t columns = level_w - x0 < shape.width ? level_w - x0 : shape.width, rows = level_h - y0 < shape.height ? level_h - y0 : shape.height;
   for (uint32_t row = 0; row < rows; ++row) {
-    ByteView picture_row;
-    if (backing.try_subview(offset + (uint64_t{y0 + row} * level_w + x0) * 4, uint64_t{columns} * 4, &picture_row)) use(picture_row, uint64_t{row} * kTileTexels * 4);
+    ByteView run;
+    if (backing.try_subview(offset + (uint64_t{y0 + row} * level_w + x0) * image_bytes, uint64_t{columns} * image_bytes, &run))
+      use(run, uint64_t{row} * shape.width * texel_bytes, columns);
+  }
+}
+// A run of `texels` of a reserved texture between its image's pixels and the heap's texels: the same bytes, or - a narrow layout - the first channels of each pixel, widened back
+// to (r, g or 0, 0, the maximum; 1 for an integer image) as CopyBufferImage widens. An empty `heap` (a tile mapped nowhere) gives zero texels.
+void image_from_heap(const AllocationDesc& d, ByteView image, ConstByteView heap, uint32_t texels) {
+  if (!d.tile_narrow) {
+    if (heap.empty()) image.fill(0);
+    else image.copy_from(heap);
+    return;
+  }
+  const NarrowLayout narrow = static_cast<NarrowLayout>(d.tile_narrow);
+  const bool sixteen = narrow == NarrowLayout::R16 || narrow == NarrowLayout::R16G16, integer = d.format == Format::A16B16G16R16Sint;
+  const uint32_t sample = sixteen ? 2 : 1, pixel = 4 * sample, texel = narrow_pixel_bytes(narrow);
+  for (uint32_t i = 0; i < texels; ++i) {
+    ByteView to;
+    if (!image.try_subview(uint64_t{i} * pixel, pixel, &to)) return;
+    to.fill(0);
+    ConstByteView from;
+    if (!heap.empty() && heap.try_subview(uint64_t{i} * texel, texel, &from)) to.subview(0, texel).copy_from(from);
+    if (integer) to[3 * sample] = 1;
+    else to.subview(3 * sample, sample).fill(0xFF);
+  }
+}
+void heap_from_image(const AllocationDesc& d, ByteView heap, ConstByteView image, uint32_t texels) {
+  if (!d.tile_narrow) {
+    heap.copy_from(image);
+    return;
+  }
+  const NarrowLayout narrow = static_cast<NarrowLayout>(d.tile_narrow);
+  const uint32_t sample = narrow == NarrowLayout::R16 || narrow == NarrowLayout::R16G16 ? 2 : 1, pixel = 4 * sample, texel = narrow_pixel_bytes(narrow);
+  for (uint32_t i = 0; i < texels; ++i) {
+    ConstByteView from;
+    ByteView to;
+    if (!image.try_subview(uint64_t{i} * pixel, texel, &from) || !heap.try_subview(uint64_t{i} * texel, texel, &to)) return;
+    to.copy_from(from);
   }
 }
 }  // namespace
@@ -181,13 +256,22 @@ NtStatus VidMm::create(const AllocationDesc& requested, SharedPointer<Allocation
   desc.flags &= ~kAllocTrackState;
   const bool reserved = (desc.flags & kAllocReserved) != 0;
   desc.flags &= ~kAllocReserved;
-  // A reserved resource is a buffer of whole tiles, or a plain texture of 4-byte pixels whose sides are whole tiles of kTileTexels (one sample, not a target; its mip levels below a tile in
-  // either direction are packed into one tile at the end, see tile_spot()).
+  // A reserved resource is a buffer of whole tiles, or a plain sampled texture of colour pixels (one sample and layer; its tiles of tile_shape(), its mip levels below a tile in
+  // either direction packed at the end, see tile_spot()), whose texels in the heaps may be narrower than its pixels (tile_narrow).
   const bool reserved_texture = reserved && desc.flags == kAllocTexture;
   if (reserved && (heap || requested.heap || (desc.flags & (kAllocQueryResult | kAllocConstantBuffer | kAllocHeap | kAllocShared))) ) return status::kInvalidParameter;
   if (reserved && !reserved_texture && (!(desc.flags & (kAllocVertexBuffer | kAllocIndexBuffer | kAllocUnorderedAccess | kAllocStreamOutput)) || desc.size == 0 || desc.size % kTileBytes)) return status::kInvalidParameter;
-  if (reserved_texture && (!dxgk::is_color(desc.format) || dxgk::is_wide(desc.format) || pixel_bytes(desc.format) != 4 || desc.width == 0 || desc.height == 0 || desc.width % kTileTexels || desc.height % kTileTexels ||
-                           desc.mip_levels == 0 || desc.samples != 1 || desc.kind != graphics::TextureKind::Texture2D || desc.layers != 1))
+  if (desc.tile_narrow != 0) {
+    // (a narrow layout: of an 8-bit four-channel image for R8 / R8G8, of a 16-bit one for R16 / R16G16 - what CopyBufferImage widens into)
+    const uint32_t n = desc.tile_narrow;
+    const bool eight = n == static_cast<uint32_t>(NarrowLayout::R8) || n == static_cast<uint32_t>(NarrowLayout::R8G8);
+    const bool sixteen = n == static_cast<uint32_t>(NarrowLayout::R16) || n == static_cast<uint32_t>(NarrowLayout::R16G16);
+    if (!reserved_texture || (!eight && !sixteen) || (eight && desc.format != Format::A8B8G8R8 && desc.format != Format::X8B8G8R8) ||
+        (sixteen && desc.format != Format::A16B16G16R16 && desc.format != Format::A16B16G16R16Sint))
+      return status::kInvalidParameter;
+  }
+  if (reserved_texture && (!dxgk::is_color(desc.format) || tile_shape(tile_texel_bytes(desc)).width == 0 || desc.width == 0 || desc.height == 0 || desc.mip_levels == 0 ||
+                           desc.samples != 1 || desc.kind != graphics::TextureKind::Texture2D || desc.layers != 1))
     return status::kInvalidParameter;
   if (track_state && (requested.initial_state & ~kStateMask)) return status::kInvalidParameter;
   if (desc.flags == 0 || (desc.flags & ~kKnownFlags)) return status::kInvalidParameter;
@@ -383,10 +467,11 @@ void VidMm::gather_tiles(Allocation& a) {
   if (a.is_image()) {
     for (uint64_t i = 0; i < a.tiles_.count(); ++i) {
       const Allocation::TileBinding& b = a.tiles_[i];
-      for_tile_rows(a, i, a.cpu_, [&](ByteView picture, uint64_t at) {
+      for_tile_runs(a, i, a.cpu_, [&](ByteView image, uint64_t at, uint32_t texels) {
         ConstByteView from;
-        if (b.heap && b.heap->backing().try_subview(b.offset + at, picture.size(), &from)) picture.copy_from(from);
-        else picture.fill(0);
+        const uint64_t heap_bytes = uint64_t{texels} * tile_texel_bytes(a.desc_);
+        if (!b.heap || !b.heap->backing().try_subview(b.offset + at, heap_bytes, &from)) from = ConstByteView();   // (nowhere: zero texels)
+        image_from_heap(a.desc_, image, from, texels);
       });
     }
     return;
@@ -407,8 +492,8 @@ void VidMm::scatter_tiles(Allocation& a) {
     if (!b.heap) continue;
     ByteView from, to;
     if (a.is_image()) {
-      for_tile_rows(a, i, a.cpu_, [&](ByteView picture, uint64_t at) {
-        if (b.heap->cpu_.try_subview(b.offset + at, picture.size(), &to)) to.copy_from(ConstByteView(picture));
+      for_tile_runs(a, i, a.cpu_, [&](ByteView image, uint64_t at, uint32_t texels) {
+        if (b.heap->cpu_.try_subview(b.offset + at, uint64_t{texels} * tile_texel_bytes(a.desc_), &to)) heap_from_image(a.desc_, to, ConstByteView(image), texels);
       });
     } else if (a.cpu_.try_subview(i * kTileBytes, kTileBytes, &from) && b.heap->cpu_.try_subview(b.offset, kTileBytes, &to)) to.copy_from(ConstByteView(from));
     // (what lies in the heap's memory under placed allocations is theirs to see: their device objects are stale now)
