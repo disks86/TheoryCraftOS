@@ -90,9 +90,15 @@ static const VideoProfile *video_profile(const GUID *g) {
     if (guid_eq(g, g_video_profiles[i].guid)) return &g_video_profiles[i];
   return NULL;
 }
-/* The interlace types a profile decodes: progressive, and field-based content (field pictures and MBAFF frames) for H.264, as Windows' H.264 drivers report. */
+/* The profiles (their hardware::DxvaProfile numbers) that decode field-based content, as Windows' drivers of them report: H.264 (field pictures and MBAFF frames)
+ * and VC-1 (field interlace frames, two field pictures, and interlaced frame pictures). */
+enum { VIDEO_KERNEL_H264 = 0, VIDEO_KERNEL_VC1 = 7, VIDEO_KERNEL_VC1_D2010 = 8 };
+static int video_field_based(const VideoProfile *p) {
+  return p && (p->kernel == VIDEO_KERNEL_H264 || p->kernel == VIDEO_KERNEL_VC1 || p->kernel == VIDEO_KERNEL_VC1_D2010);
+}
+/* The interlace types a profile decodes: progressive, and field-based content for the profiles that have it. */
 static int video_interlace_ok(const VideoProfile *p, D3D12_VIDEO_FRAME_CODED_INTERLACE_TYPE t) {
-  return t == D3D12_VIDEO_FRAME_CODED_INTERLACE_TYPE_NONE || (t == D3D12_VIDEO_FRAME_CODED_INTERLACE_TYPE_FIELD_BASED && p && p->kernel == 0);
+  return t == D3D12_VIDEO_FRAME_CODED_INTERLACE_TYPE_NONE || (t == D3D12_VIDEO_FRAME_CODED_INTERLACE_TYPE_FIELD_BASED && video_field_based(p));
 }
 /* Whether the kernel decodes the configuration into `format` at that size (not encrypted). */
 static int video_decode_supported(Dev *d, const D3D12_VIDEO_DECODE_CONFIGURATION *c, DXGI_FORMAT format, UINT width, UINT height) {

@@ -428,10 +428,13 @@ int main() {
                                         "adv_il_ipb", "adv_il_ipp", "adv_il_skip",   // (an interlaced sequence whose frames are progressive)
                                         "adv_fi_ipp", "adv_fi_mv", "adv_fi_b", "adv_fi_slices",    // (field pictures)
                                         "adv_fr_i", "adv_fr_p", "adv_fr_b", "adv_fr_slices", "adv_fr_narrow",   // (interlaced frame pictures)
-                                        "adv_mix_a", "adv_mix_b", "adv_mix_odd"};                  // (progressive, frame and field pictures in one sequence)
+                                        "adv_mix_a", "adv_mix_b", "adv_mix_odd",                   // (progressive, frame and field pictures in one sequence)
+                                        "main_rr_ipb", "main_rr_ipp",       // (range reduction: the pictures of FFmpeg with scripts/ffmpeg-vc1-range-reduction.patch)
+                                        "adv_rmap_p", "adv_rmap_il"};       // (range mapping)
   for (const char* name : streams) test_stream(name);
   for (const char* name : {"sm_ipb_f", "sm_ipp_q", "adv_ipb", "adv_skip", "adv_ipp_odd", "sp_ipp", "adv_il_ipb", "adv_fi_ipp", "adv_fi_mv", "adv_fi_b", "adv_fi_slices",
-                           "adv_fr_i", "adv_fr_p", "adv_fr_b", "adv_fr_slices", "adv_fr_narrow", "adv_mix_a", "adv_mix_b", "adv_mix_odd"})
+                           "adv_fr_i", "adv_fr_p", "adv_fr_b", "adv_fr_slices", "adv_fr_narrow", "adv_mix_a", "adv_mix_b", "adv_mix_odd", "main_rr_ipb", "main_rr_ipp",
+                           "adv_rmap_p", "adv_rmap_il"})
     test_damaged(name);
   for (const char* name : {"adv_fi_ipp", "adv_fi_b", "adv_fi_slices", "adv_mix_a", "adv_mix_odd"}) test_damaged_fields(name);
   test_config();

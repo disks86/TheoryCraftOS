@@ -1,0 +1,324 @@
+FFmpeg's VC-1 decoder does not follow SMPTE 421M on range reduction (Main profile RANGERED / RANGEREDFRM). This patch, against FFmpeg 7.0
+(libavcodec of 2024-04-23, revision 092f84b614; FFmpeg 9.0 decodes the test streams the same way), makes it follow clauses 8.1.1.4,
+8.3.4.11 and 8.4.4.14; with it FFmpeg is the reference for the range reduced test streams (scripts/gen_vc1_test_streams.sh,
+tests/data/vc1_main_rr_*). Streams without range reduction decode exactly as before.
+
+What stock FFmpeg does, and what the standard says:
+ - Intra blocks of a range reduced picture are doubled before they are put (vc1_block.c), so I pictures are stored in full range, while
+   the inter blocks of a range reduced P or B picture are left in reduced range: such a picture is a mix of both ranges. The standard
+   reconstructs the whole picture in reduced range (overlap smoothing and the in-loop filter included), keeps that reconstruction as the
+   reference, and outputs a copy scaled up, Y = CLIP((Y - 128) * 2 + 128) (Cb and Cr the same).
+ - A reference is scaled down, ((Y - 128) >> 1) + 128, whenever the current picture is range reduced (vc1_mc.c), whatever the
+   reference's own RANGEREDFRM, and never scaled up. The standard scales it only when the two differ: down when only the current picture
+   is reduced, up (with clipping) when only the reference is, before intensity compensation. A B picture has the RANGEREDFRM of its
+   backward anchor, so only its forward reference can need it.
+
+The patch: every picture remembers its RANGEREDFRM (Picture.vc1_rangeredfrm), intra blocks are no longer doubled, motion compensation
+scales a reference by the difference of the two (vc1_range_adjust), and a range reduced picture is output as a scaled up copy
+(vc1_output_range, through av_frame_make_writable), the reference staying as it was reconstructed.
+
+Apply in an FFmpeg 7.0 source tree: patch -p1 < ffmpeg-vc1-range-reduction.patch
+
+diff -ru a/libavcodec/mpegpicture.h b/libavcodec/mpegpicture.h
+--- a/libavcodec/mpegpicture.h
++++ b/libavcodec/mpegpicture.h
+@@ -79,6 +79,8 @@
+ 
+     int display_picture_number;
+     int coded_picture_number;
++
++    int vc1_rangeredfrm;        ///< VC-1 Main profile: the picture was reconstructed in reduced range (RANGEREDFRM)
+ } Picture;
+ 
+ /**
+diff -ru a/libavcodec/vc1_block.c b/libavcodec/vc1_block.c
+--- a/libavcodec/vc1_block.c
++++ b/libavcodec/vc1_block.c
+@@ -1283,7 +1283,7 @@
+ {
+     MpegEncContext *s = &v->s;
+     GetBitContext *gb = &s->gb;
+-    int i, j;
++    int i;
+     int mb_pos = s->mb_x + s->mb_y * s->mb_stride;
+     int cbp; /* cbp decoding stuff */
+     int mqdiff, mquant; /* MB quantization */
+@@ -1360,9 +1360,6 @@
+                     if (CONFIG_GRAY && (i > 3) && (s->avctx->flags & AV_CODEC_FLAG_GRAY))
+                         continue;
+                     v->vc1dsp.vc1_inv_trans_8x8(v->block[v->cur_blk_idx][block_map[i]]);
+-                    if (v->rangeredfrm)
+-                        for (j = 0; j < 64; j++)
+-                            v->block[v->cur_blk_idx][block_map[i]][j] *= 2;
+                     block_cbp   |= 0xF << (i << 2);
+                     block_intra |= 1 << i;
+                 } else if (val) {
+@@ -1463,9 +1460,6 @@
+                     if (CONFIG_GRAY && (i > 3) && (s->avctx->flags & AV_CODEC_FLAG_GRAY))
+                         continue;
+                     v->vc1dsp.vc1_inv_trans_8x8(v->block[v->cur_blk_idx][block_map[i]]);
+-                    if (v->rangeredfrm)
+-                        for (j = 0; j < 64; j++)
+-                            v->block[v->cur_blk_idx][block_map[i]][j] *= 2;
+                     block_cbp   |= 0xF << (i << 2);
+                     block_intra |= 1 << i;
+                 } else if (is_coded[i]) {
+@@ -1849,7 +1843,7 @@
+ {
+     MpegEncContext *s = &v->s;
+     GetBitContext *gb = &s->gb;
+-    int i, j;
++    int i;
+     int mb_pos = s->mb_x + s->mb_y * s->mb_stride;
+     int cbp = 0; /* cbp decoding stuff */
+     int mqdiff, mquant; /* MB quantization */
+@@ -1979,9 +1973,6 @@
+             if (CONFIG_GRAY && (i > 3) && (s->avctx->flags & AV_CODEC_FLAG_GRAY))
+                 continue;
+             v->vc1dsp.vc1_inv_trans_8x8(s->block[i]);
+-            if (v->rangeredfrm)
+-                for (j = 0; j < 64; j++)
+-                    s->block[i][j] *= 2;
+             s->idsp.put_signed_pixels_clamped(s->block[i],
+                                               s->dest[dst_idx] + off,
+                                               i & 4 ? s->uvlinesize
+@@ -2007,7 +1998,7 @@
+ {
+     MpegEncContext *s = &v->s;
+     GetBitContext *gb = &s->gb;
+-    int i, j;
++    int i;
+     int mb_pos = s->mb_x + s->mb_y * s->mb_stride;
+     int cbp = 0; /* cbp decoding stuff */
+     int mqdiff, mquant; /* MB quantization */
+@@ -2058,9 +2049,6 @@
+             if (CONFIG_GRAY && (i > 3) && (s->avctx->flags & AV_CODEC_FLAG_GRAY))
+                 continue;
+             v->vc1dsp.vc1_inv_trans_8x8(s->block[i]);
+-            if (v->rangeredfrm)
+-                for (j = 0; j < 64; j++)
+-                    s->block[i][j] <<= 1;
+             off  = (i & 4) ? 0 : ((i & 1) * 8 + (i & 2) * 4 * s->linesize);
+             s->idsp.put_signed_pixels_clamped(s->block[i],
+                                               s->dest[dst_idx] + off,
+@@ -2522,7 +2510,7 @@
+  */
+ static void vc1_decode_i_blocks(VC1Context *v)
+ {
+-    int k, j;
++    int k;
+     MpegEncContext *s = &v->s;
+     int cbp, val;
+     uint8_t *coded_val;
+@@ -2601,16 +2589,8 @@
+ 
+             if (v->overlap && v->pq >= 9) {
+                 ff_vc1_i_overlap_filter(v);
+-                if (v->rangeredfrm)
+-                    for (k = 0; k < 6; k++)
+-                        for (j = 0; j < 64; j++)
+-                            v->block[v->cur_blk_idx][block_map[k]][j] *= 2;
+                 vc1_put_blocks_clamped(v, 1);
+             } else {
+-                if (v->rangeredfrm)
+-                    for (k = 0; k < 6; k++)
+-                        for (j = 0; j < 64; j++)
+-                            v->block[v->cur_blk_idx][block_map[k]][j] = (v->block[v->cur_blk_idx][block_map[k]][j] - 64) * 2;
+                 vc1_put_blocks_clamped(v, 0);
+             }
+ 
+diff -ru a/libavcodec/vc1dec.c b/libavcodec/vc1dec.c
+--- a/libavcodec/vc1dec.c
++++ b/libavcodec/vc1dec.c
+@@ -621,6 +621,25 @@
+  * @todo TODO: Handle VC-1 IDUs (Transport level?)
+  * @todo TODO: Decipher remaining bits in extra_data
+  */
++/* SMPTE 421M 8.1.1.4: a picture reconstructed in reduced range is output scaled up, while the reference keeps the reconstruction. */
++static int vc1_output_range(const Picture *p, AVFrame *pict)
++{
++    int ret, c, x, y;
++    if (!p->vc1_rangeredfrm)
++        return 0;
++    if ((ret = av_frame_make_writable(pict)) < 0)
++        return ret;
++    for (c = 0; c < 3; c++) {
++        const int w = c ? (pict->width + 1) >> 1 : pict->width, h = c ? (pict->height + 1) >> 1 : pict->height;
++        for (y = 0; y < h; y++) {
++            uint8_t *row = pict->data[c] + y * pict->linesize[c];
++            for (x = 0; x < w; x++)
++                row[x] = av_clip_uint8((row[x] - 128) * 2 + 128);
++        }
++    }
++    return 0;
++}
++
+ static av_cold int vc1_decode_init(AVCodecContext *avctx)
+ {
+     VC1Context *v = avctx->priv_data;
+@@ -840,6 +859,8 @@
+         if (s->low_delay == 0 && s->next_picture_ptr) {
+             if ((ret = av_frame_ref(pict, s->next_picture_ptr->f)) < 0)
+                 return ret;
++            if ((ret = vc1_output_range(s->next_picture_ptr, pict)) < 0)
++                return ret;
+             s->next_picture_ptr = NULL;
+ 
+             *got_frame = 1;
+@@ -1062,6 +1083,7 @@
+     }
+ 
+     v->s.current_picture_ptr->field_picture = v->field_mode;
++    v->s.current_picture_ptr->vc1_rangeredfrm = v->rangeredfrm;
+     v->s.current_picture_ptr->f->flags |= AV_FRAME_FLAG_INTERLACED * (v->fcm != PROGRESSIVE);
+     v->s.current_picture_ptr->f->flags |= AV_FRAME_FLAG_TOP_FIELD_FIRST * !!v->tff;
+ 
+@@ -1355,12 +1377,16 @@
+         if (s->pict_type == AV_PICTURE_TYPE_B || s->low_delay) {
+             if ((ret = av_frame_ref(pict, s->current_picture_ptr->f)) < 0)
+                 goto err;
++            if ((ret = vc1_output_range(s->current_picture_ptr, pict)) < 0)
++                goto err;
+             if (!v->field_mode)
+                 ff_print_debug_info(s, s->current_picture_ptr, pict);
+             *got_frame = 1;
+         } else if (s->last_picture_ptr) {
+             if ((ret = av_frame_ref(pict, s->last_picture_ptr->f)) < 0)
+                 goto err;
++            if ((ret = vc1_output_range(s->last_picture_ptr, pict)) < 0)
++                goto err;
+             if (!v->field_mode)
+                 ff_print_debug_info(s, s->last_picture_ptr, pict);
+             *got_frame = 1;
+diff -ru a/libavcodec/vc1_mc.c b/libavcodec/vc1_mc.c
+--- a/libavcodec/vc1_mc.c
++++ b/libavcodec/vc1_mc.c
+@@ -32,25 +32,39 @@
+ #include "mpegvideo.h"
+ #include "vc1.h"
+ 
++/* SMPTE 421M 8.3.4.11 and 8.4.4.14: a reference picture is kept as it was reconstructed (in reduced range when its RANGEREDFRM
++ * was set); when its RANGEREDFRM differs from the current picture's it is scaled before intensity compensation and motion
++ * compensation: down when only the current picture is reduced, up when only the reference is. 1: down, -1: up, 0: as it is. */
++static av_always_inline int vc1_range_adjust(const VC1Context *v, int dir)
++{
++    const Picture *ref = dir ? v->s.next_picture_ptr : v->s.last_picture_ptr;
++    return v->rangeredfrm - (ref ? ref->vc1_rangeredfrm : 0);
++}
++
++static av_always_inline int vc1_range_scale(int x, int adjust)
++{
++    return adjust > 0 ? ((x - 128) >> 1) + 128 : av_clip_uint8((x - 128) * 2 + 128);
++}
++
+ static av_always_inline void vc1_scale_luma(uint8_t *srcY,
+-                                            int k, int linesize)
++                                            int k, int linesize, int adjust)
+ {
+     int i, j;
+     for (j = 0; j < k; j++) {
+         for (i = 0; i < k; i++)
+-            srcY[i] = ((srcY[i] - 128) >> 1) + 128;
++            srcY[i] = vc1_range_scale(srcY[i], adjust);
+         srcY += linesize;
+     }
+ }
+ 
+ static av_always_inline void vc1_scale_chroma(uint8_t *srcU, uint8_t *srcV,
+-                                              int k, int uvlinesize)
++                                              int k, int uvlinesize, int adjust)
+ {
+     int i, j;
+     for (j = 0; j < k; j++) {
+         for (i = 0; i < k; i++) {
+-            srcU[i] = ((srcU[i] - 128) >> 1) + 128;
+-            srcV[i] = ((srcV[i] - 128) >> 1) + 128;
++            srcU[i] = vc1_range_scale(srcU[i], adjust);
++            srcV[i] = vc1_range_scale(srcV[i], adjust);
+         }
+         srcU += uvlinesize;
+         srcV += uvlinesize;
+@@ -288,7 +302,7 @@
+         srcV = s->sc.edge_emu_buffer + 18 * s->linesize;
+     }
+ 
+-    if (v->rangeredfrm || use_ic
++    if (vc1_range_adjust(v, dir) || use_ic
+         || s->h_edge_pos < 22 || v_edge_pos < 22
+         || (unsigned)(src_x - s->mspel) > s->h_edge_pos - (mx&3) - 16 - s->mspel * 3
+         || (unsigned)(src_y - 1)        > v_edge_pos    - (my&3) - 16 - 3) {
+@@ -400,9 +414,9 @@
+         srcU = ubuf;
+         srcV = vbuf;
+         /* if we deal with range reduction we need to scale source blocks */
+-        if (v->rangeredfrm) {
+-            vc1_scale_luma(srcY, k, s->linesize);
+-            vc1_scale_chroma(srcU, srcV, 9, s->uvlinesize);
++        if (vc1_range_adjust(v, dir)) {
++            vc1_scale_luma(srcY, k, s->linesize, vc1_range_adjust(v, dir));
++            vc1_scale_chroma(srcU, srcV, 9, s->uvlinesize, vc1_range_adjust(v, dir));
+         }
+         /* if we deal with intensity compensation we need to scale source blocks */
+         if (use_ic) {
+@@ -557,7 +571,7 @@
+     if (v->field_mode && v->ref_field_type[dir])
+         srcY += linesize;
+ 
+-    if (v->rangeredfrm || use_ic
++    if (vc1_range_adjust(v, dir) || use_ic
+         || s->h_edge_pos < 13 || v_edge_pos < 23
+         || (unsigned)(src_x - s->mspel) > s->h_edge_pos - (mx & 3) - 8 - s->mspel * 2
+         || (unsigned)(src_y - (s->mspel << fieldmv)) > v_edge_pos - (my & 3) - ((8 + s->mspel * 2) << fieldmv)) {
+@@ -601,8 +615,8 @@
+                                      s->v_edge_pos);
+         srcY = s->sc.edge_emu_buffer;
+         /* if we deal with range reduction we need to scale source blocks */
+-        if (v->rangeredfrm) {
+-            vc1_scale_luma(srcY, k, s->linesize << fieldmv);
++        if (vc1_range_adjust(v, dir)) {
++            vc1_scale_luma(srcY, k, s->linesize << fieldmv, vc1_range_adjust(v, dir));
+         }
+         /* if we deal with intensity compensation we need to scale source blocks */
+         if (use_ic) {
+@@ -733,7 +747,7 @@
+         }
+     }
+ 
+-    if (v->rangeredfrm || use_ic
++    if (vc1_range_adjust(v, dir) || use_ic
+         || s->h_edge_pos < 18 || v_edge_pos < 18
+         || (unsigned)uvsrc_x > (s->h_edge_pos >> 1) - 9
+         || (unsigned)uvsrc_y > (v_edge_pos    >> 1) - 9) {
+@@ -806,8 +820,8 @@
+         srcV = s->sc.edge_emu_buffer + 16;
+ 
+         /* if we deal with range reduction we need to scale source blocks */
+-        if (v->rangeredfrm) {
+-            vc1_scale_chroma(srcU, srcV, 9, s->uvlinesize);
++        if (vc1_range_adjust(v, dir)) {
++            vc1_scale_chroma(srcU, srcV, 9, s->uvlinesize, vc1_range_adjust(v, dir));
+         }
+         /* if we deal with intensity compensation we need to scale source blocks */
+         if (use_ic) {
+@@ -1074,7 +1088,7 @@
+         srcV = s->sc.edge_emu_buffer + 18 * s->linesize;
+     }
+ 
+-    if (v->rangeredfrm || s->h_edge_pos < 22 || v_edge_pos < 22 || use_ic
++    if (vc1_range_adjust(v, 1) || s->h_edge_pos < 22 || v_edge_pos < 22 || use_ic
+         || (unsigned)(src_x - 1) > s->h_edge_pos - (mx & 3) - 16 - 3
+         || (unsigned)(src_y - 1) > v_edge_pos    - (my & 3) - 16 - 3) {
+         uint8_t *ubuf = s->sc.edge_emu_buffer + 19 * s->linesize;
+@@ -1185,9 +1199,9 @@
+         srcU = ubuf;
+         srcV = vbuf;
+         /* if we deal with range reduction we need to scale source blocks */
+-        if (v->rangeredfrm) {
+-            vc1_scale_luma(srcY, k, s->linesize);
+-            vc1_scale_chroma(srcU, srcV, 9, s->uvlinesize);
++        if (vc1_range_adjust(v, 1)) {
++            vc1_scale_luma(srcY, k, s->linesize, vc1_range_adjust(v, 1));
++            vc1_scale_chroma(srcU, srcV, 9, s->uvlinesize, vc1_range_adjust(v, 1));
+         }
+ 
+         if (use_ic) {

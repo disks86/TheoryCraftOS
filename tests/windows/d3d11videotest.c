@@ -981,21 +981,22 @@ static void decode_stream(const char *name, int codec, const GUID *profile, cons
   const UINT frame_bytes = vw * vh + 2 * cw * ch;
   Decoded *decoded = calloc(256, sizeof *decoded);
   BYTE *nv12 = malloc((size_t)s.width * s.height * 3 / 2);
-  UINT n = 0, pictures = 0, failed = 0, last_feedback = 0, last_surface = 0;
+  UINT n = 0, pictures = 0, failed = 0, last_feedback = 0, last_surface = 0, last_structure = 3;
   int r = 1;
   while (SUCCEEDED(hr) && dec && out && r == 1 && n < 256) {
     if (codec == DXVA_CODEC_H264) last_feedback = ((const DXVA_PicParams_H264 *)p.picture_parameters)->StatusReportFeedbackNumber;
     if (codec == DXVA_CODEC_VC1) {
       const DXVA_PictureParameters *pp = p.picture_parameters;
       last_feedback = (UINT)pp->bPicScanFixed << 8 | pp->bPicScanMethod;      /* (VC-1's feedback number) */
+      last_structure = pp->bPicStructure;      /* (3 a frame, 1 / 2 a field picture) */
     }
     if (codec == DXVA_CODEC_MPEG4) last_feedback = ((const DxvaPicParamsMpeg4 *)p.picture_parameters)->StatusReportFeedbackNumber;
     last_surface = p.surface;
     const UINT slice_bytes = codec == DXVA_CODEC_H264 ? sizeof(DXVA_Slice_H264_Short) : sizeof(DXVA_SliceInfo);
     const UINT location = codec == DXVA_CODEC_H264 ? offsetof(DXVA_Slice_H264_Short, BSNALunitDataLocation) : offsetof(DXVA_SliceInfo, dwSliceDataLocation);
     if (!decode_picture(dec, views[p.surface], &p, slice_bytes, location, split)) { ++failed; break; }
-    /* (an H.264 first field: the frame is whole after the second field, which goes into the same surface next) */
-    if (codec == DXVA_CODEC_H264 && p.field == 1) {
+    /* (an H.264 or VC-1 first field: the frame is whole after the second field, which goes into the same surface next) */
+    if ((codec == DXVA_CODEC_H264 || codec == DXVA_CODEC_VC1) && p.field == 1) {
       ++pictures;
       r = dxva_stream_next(&s, &p);
       checkf(r != 1 || p.field == 2, "%s: a first field is followed by its second", name);
@@ -1078,7 +1079,7 @@ static void decode_stream(const char *name, int codec, const GUID *profile, cons
     ext.PrivateOutputDataSize = sizeof st;
     hr = ID3D11VideoContext_DecoderExtension(g_vcontext, dec, &ext);
     checkf(hr == S_OK && st[0].StatusReportFeedbackNumber == last_feedback && st[1].StatusReportFeedbackNumber == last_feedback - 1 && st[0].bStatus == 0 &&
-               st[0].wDecodedPictureIndex == last_surface && st[0].bPicStructure == 3 && st[0].bBufType == 0xFF && st[0].wNumMbsAffected == 0,
+               st[0].wDecodedPictureIndex == last_surface && st[0].bPicStructure == last_structure && st[0].bBufType == 0xFF && st[0].wNumMbsAffected == 0,
            "%s: the status reports (DXVA_Status_VC1), the newest first: feedback %u and %u, picture %u, status %u", name, st[0].StatusReportFeedbackNumber,
            st[1].StatusReportFeedbackNumber, st[0].wDecodedPictureIndex, st[0].bStatus);
   }
@@ -2112,6 +2113,10 @@ int main(void) {
       decode_stream("mpeg2_ibp", DXVA_CODEC_MPEG2, &D3D11_DECODER_PROFILE_MPEG2_VLD, g_mpeg2_ibp_b64, 8, NULL, 8, g_mpeg2_ibp_means, 1, 0);
       decode_stream("mpeg2_ibp (separate textures)", DXVA_CODEC_MPEG2, &D3D11_DECODER_PROFILE_MPEG2_VLD, g_mpeg2_ibp_b64, 8, NULL, 8, g_mpeg2_ibp_means, 0, 1);
       decode_stream("vc1_adv_ipb", DXVA_CODEC_VC1, &D3D11_DECODER_PROFILE_VC1_VLD, g_vc1_adv_ipb_b64, 8, g_vc1_adv_ipb_fnv, 10, NULL, 0, 0);
+      /* VC-1 interlaced: progressive, interlaced frame and field interlace frames (a field writes its lines; the frame is compared after its second field), slices;
+       * and field pairs with range mapping (the output mapped, the references not) */
+      decode_stream("vc1_adv_mix_a", DXVA_CODEC_VC1, &D3D11_DECODER_PROFILE_VC1_VLD, g_vc1_adv_mix_a_b64, 8, g_vc1_adv_mix_a_fnv, 12, NULL, 1, 0);
+      decode_stream("vc1_adv_rmap_il (separate textures)", DXVA_CODEC_VC1, &D3D11_DECODER_PROFILE_VC1_D2010, g_vc1_adv_rmap_il_b64, 8, g_vc1_adv_rmap_il_fnv, 8, NULL, 0, 1);
       decode_stream("m4vdec_bframes", DXVA_CODEC_MPEG4, &D3D11_DECODER_PROFILE_MPEG4PT2_VLD_ADVSIMPLE_NOGMC, g_m4vdec_bframes_b64, 8, g_m4vdec_bframes_fnv, 8, NULL, 2, 0);
       decode_av1("av1_444 (profile 1, AYUV)", g_av1_444_dxva_b64, &DXVA_ModeAV1_VLD_Profile1, DXGI_FORMAT_AYUV, 4, g_av1_444_dxva_fnv, 6);
       decode_av1("av1_422_10bit (profile 2, Y210, film grain)", g_av1_422_10bit_dxva_b64, &DXVA_ModeAV1_VLD_Profile2, DXGI_FORMAT_Y210, 4, g_av1_422_10bit_dxva_fnv, 6);

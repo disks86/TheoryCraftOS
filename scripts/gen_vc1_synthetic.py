@@ -359,6 +359,11 @@ class Enc:
             b.put(r.randint(0, 3), 2)
             if f['rangered']:
                 p['rangeredfrm'] = p.get('rangeredfrm', r.randint(0, 1))   # RANGEREDFRM (no stream without range reduction gets here)
+                # SMPTE 421M 7.1.1.3: a B or BI frame has the RANGEREDFRM of the anchor after it in display order (the last one coded); the anchors pick theirs.
+                if t in ('B', 'BI'):
+                    p['rangeredfrm'] = getattr(self, 'anchor_rangeredfrm', 0)
+                else:
+                    self.anchor_rangeredfrm = p['rangeredfrm']
                 b.put(p['rangeredfrm'], 1)
             if t == 'P':
                 b.put(1, 1)

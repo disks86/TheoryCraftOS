@@ -386,6 +386,7 @@ Core::RefSel Core::reference_for(int dir, int ref_field) const {
   if (!field_mode_) {
     s.pic = p ? anchor_[1] : dir == 0 ? anchor_[0] : anchor_[1];
     s.ic = dir == 0 ? &ic_last_ : &ic_next_;
+    if (range_scale_[dir & 1]) s.ic = &range_luts_[dir & 1];   // (range reduction, then the intensity compensation: see prepare_range_scaling)
     return s;
   }
   s.field = ref_field & 1;

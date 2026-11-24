@@ -32,6 +32,9 @@ using SliceInfoVc1 = SliceInfoMpeg2;                   // DXVA_SliceInfo
 // wPicWidthInMBminus1 / wPicHeightInMBminus1: Simple and Main profile, the coded size in macroblocks minus 1; Advanced profile, the coded size in samples minus 1 (the
 // entry point's CODED_WIDTH / CODED_HEIGHT, or the sequence's MAX_CODED_*).
 // bPicStructure 3 (frame), 1 / 2 (a field of a field interlace frame); bSecondField: the second field.
+constexpr uint8_t kVc1StructureTopField = 1, kVc1StructureBottomField = 2, kVc1StructureFrame = 3;
+// The start codes the program puts in front of the pieces of an Advanced profile picture.
+constexpr uint8_t kVc1StartCodeSlice = 0x0B, kVc1StartCodeField = 0x0C, kVc1StartCodeFrame = 0x0D;
 // bPicIntra: an I or BI picture; bPicBackwardPrediction: a B picture.
 // bBidirectionalAveragingMode:
 constexpr uint8_t kVc1AveragingVc1Rounding = 1u << 7;         // always set
@@ -60,7 +63,10 @@ constexpr uint8_t kVc1DeblockedLoopFilter = 1u << 1;           // LOOPFILTER
 constexpr uint8_t kVc1ConfinedPostProc = 1u << 7, kVc1ConfinedPulldown = 1u << 6, kVc1ConfinedInterlace = 1u << 5, kVc1ConfinedTfcntr = 1u << 4,
                   kVc1ConfinedFinterp = 1u << 3, kVc1ConfinedReference = 1u << 2, kVc1ConfinedPsf = 1u << 1, kVc1ConfinedExtendedDmv = 1u << 0;
 // bPic4MVallowed: the picture may have 4MV macroblocks. bPicOBMC (Advanced profile): RANGE_MAPY_FLAG << 7 | RANGE_MAPY << 4 | RANGE_MAPUV_FLAG << 3 | RANGE_MAPUV.
-// bMV_RPS: field pictures (REFDIST + 9 for B fields). bReservedBits: PQUANT.
+constexpr uint8_t kVc1ObmcRangeMapYFlag = 1u << 7, kVc1ObmcRangeMapUvFlag = 1u << 3;
+constexpr int kVc1ObmcRangeMapYShift = 4;
+// bMV_RPS: B field pictures, REFDIST + 9 (0 otherwise). bReservedBits: PQUANT.
+constexpr uint8_t kVc1MvRpsRefdistBias = 9;
 // wBitstreamFcodes / wBitstreamPCEelements: LUMSCALE / LUMSHIFT of intensity compensation (32 / 0 without), for fields top << 8 | bottom.
 // DXVA_SliceInfo: wVerticalPosition the first macroblock row; dwSliceDataLocation / dwSliceBitsInBuffer the slice's bytes (Advanced profile: from its start code - 00 00 01
 // 0D for the frame, 0C a second field, 0B a slice - which the program puts there; Simple and Main profile: the frame as stored); wMBbitOffset where the macroblock layer

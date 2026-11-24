@@ -84,7 +84,9 @@ struct SequenceHeader {
   bool panscanflag = false, refdist_flag = false, extended_dmv = false, hrd_param_flag = false;
   int hrd_num_leaky_buckets = 0;
   int max_coded_width = 0, max_coded_height = 0;
+  // Range mapping (entry point RANGE_MAPY / RANGE_MAPUV, 6.2.15 and 6.2.16): the output pictures are scaled by (value + 9) / 8 around 128; the references are not.
   bool range_mapy_flag = false, range_mapuv_flag = false;
+  int range_mapy = 0, range_mapuv = 0;
   // The size of the pictures (the container's for Simple and Main, the entry point's or the sequence's for Advanced) and what follows from it.
   int width = 0, height = 0, mb_width = 0, mb_height = 0;
 };
@@ -150,7 +152,21 @@ struct Picture {
   Mem<int16_t> direct_mv_bottom; // interlaced frame pictures, per macroblock: the vector of luma block 2 (direct_mv has block 0's), for the field vectors of direct mode
   bool interlaced = false;       // coded as fields or as an interlaced frame: a reference read field by field
   bool field_coded = false;      // two field pictures
+  // What turns the reconstruction (which stays the reference) into the output picture: range reduction (RANGEREDFRM: the planes are in reduced range and the output
+  // is scaled up, 8.1.1.4) and range mapping (the entry point's RANGE_MAPY / RANGE_MAPUV in force when the picture was decoded, -1: none).
+  bool range_reduced = false;
+  int range_map_y = -1, range_map_uv = -1;
+  Mem<uint8_t> out_plane[3];     // the output picture when it differs from the reconstruction (filled by the Core's own output; same layout as `plane`)
+  bool out_mapped = false;       // out_plane holds the output
 };
+
+// The sample mapping from a picture's reconstruction to its output (range reduction, then range mapping): `any` is false when the output is the reconstruction.
+struct OutputMap {
+  bool any = false;
+  uint8_t y[256];
+  uint8_t uv[256];
+};
+[[nodiscard]] OutputMap output_map(const Picture& picture);
 
 // What an offload (a hardware decoder) is given for each picture: the headers, the pictures it refers to (by slot: the index in the Core's pool) and the picture's
 // data: the frame unit and its slice units, as they are in the stream (Advanced profile: each behind its start code; Simple and Main: the frame as stored).
@@ -169,6 +185,7 @@ struct OffloadPicture {
   int anchor_slot[2] = {-1, -1};               // the older and the newer anchor picture when this one starts: the pictures an offload must still hold
   ArrayView<const ConstByteView> units;
   ArrayView<const UnitInfo> unit_info;         // one per unit
+  const PictureHeader* second_field = nullptr; // a field interlace frame: the second field's header (`pic` is the first field's, which describes the frame)
   // The bit planes the picture codes (one byte per macroblock, 0 or 1, in raster order); empty for a plane that is not there or is coded in the macroblock layer ("raw").
   ArrayView<const uint8_t> skip_plane, mv_type_plane, direct_plane, acpred_plane, overflags_plane;
   // Intensity compensation of the forward reference (set by the P picture that follows it, and in force for the B pictures between): the 6 bit scale and shift of the header.
@@ -314,6 +331,16 @@ class Core {
   }
   void set_frame_observer(IFrameObserver* observer) { observer_ = observer; }
 
+  // Intensity compensation tables (the model of the reference decoder, which the reference pictures follow): for each reference field (or line parity of a frame)
+  // a luma and a chroma table, and whether they are in force. Updates chain onto what is there.
+  struct IcLuts {
+    uint8_t y[2][256];
+    uint8_t uv[2][256];
+    bool use = false;
+  };
+  // Tables that leave the samples as they are.
+  static void identity_luts(IcLuts& luts);
+
   // Decoding for a DXVA driver (src/Hardware/VideoCodec/Dxva/DxvaVc1.cpp): the caller gives the sequence (and entry point) layer as a SequenceHeader, keeps the
   // pictures and says which ones a picture is decoded into and predicted from; the picture is decoded at once (decoding order) and nothing goes to the output
   // queue. A Core used this way is used only this way.
@@ -322,14 +349,25 @@ class Core {
     Picture* forward = nullptr;    // P: the anchor it predicts from (a skipped P picture: the one it repeats); B: the older anchor
     Picture* backward = nullptr;   // B: the newer anchor (its direct mode vectors are used too). Every reference the type needs must be given.
     int rnd = -1;                  // Simple and Main profile: the picture's rounding control (DXVA's bRcontrol); -1: the decoder's own history
-    // B pictures: the intensity compensation of the forward reference, which the P picture of the backward anchor set.
-    bool ic_forward = false;
-    int ic_scale = 32, ic_shift = 0;
+    // What part of a frame the picture is (DXVA's bPicStructure and bSecondField): the whole frame (progressive, or an interlaced frame picture), or the first or
+    // the second field of a field interlace frame. A second field comes right after its first field and goes into the same target; what the first field's
+    // header says of the frame (FPTYPE, TFF, RNDCTRL, REFDIST, BFRACTION ...) is kept from that call.
+    enum class Part : uint8_t { Frame, FirstField, SecondField };
+    Part part = Part::Frame;
+    int refdist = -1;              // B field pictures: the REFDIST of the pair (DXVA's bMV_RPS - 9: it is in an earlier frame's header); -1: the last one read here
+    // Intensity compensation is a modification of the reference pictures (DXVA's "reference picture modification"): each picture the caller keeps has tables its
+    // samples are read through, and the Core updates them as the reference decoder does - a P picture (or field) chains its compensation onto its forward
+    // reference's tables, the second field of a P frame onto those of its first field. Null: tables that leave the samples as they are.
+    IcLuts* forward_ic = nullptr;          // in and out: the forward reference's
+    const IcLuts* backward_ic = nullptr;   // in: the backward reference's (B pictures)
+    IcLuts* target_ic = nullptr;           // out: the target's (in as well for a second field: what the first field left)
   };
-  enum class ExternalStatus : uint8_t { Decoded, BadSequence, BadPicture, Interlaced, NoMemory };
-  // `data`: one frame, as decode() takes it (Advanced profile: the frame unit and its slice units with their start codes, or the frame without a start code; a
-  // sequence header or entry point unit in front is skipped: `seq` is what is in force). `header` receives the picture header the frame has (its type, whether it
-  // is skipped, its intensity compensation) also when the picture is refused after the header was read.
+  enum class ExternalStatus : uint8_t { Decoded, BadSequence, BadPicture, Structure, NoMemory };
+  // `data`: one picture, as decode() takes a frame (Advanced profile: the frame unit and its slice units with their start codes, or the frame without a start code;
+  // a sequence header or entry point unit in front is skipped: `seq` is what is in force). The first field of a field interlace frame is its frame unit and the
+  // first field's slices; the second field is the field unit (start code 0C, or no start code) and its slices. `header` receives the picture header (a field's own,
+  // with its type, whether it is skipped, its intensity compensation) also when the picture is refused after the header was read. Structure: the bitstream's
+  // frame coding mode is not the part given (a field picture sent as a frame, or the other way round), or a second field without its first field.
   [[nodiscard]] ExternalStatus decode_external(const SequenceHeader& seq, ConstByteView data, const ExternalPicture& picture, PictureHeader* header);
 
   // A unit of a frame as decode() found it: its start code (0x0D for the frame itself, also when it has none), the bits with the emulation prevention bytes removed,
@@ -343,13 +381,6 @@ class Core {
   // Where a picture header is read from: the frame's, a slice's (SLICE_ADDR then PIC_HEADER_FLAG set: the whole picture header again), the second field's (after
   // the field start code: it starts at PQINDEX).
   enum class HeaderAt : uint8_t { Frame, Slice, SecondField };
-  // Intensity compensation tables (the model of the reference decoder, which the reference pictures follow): for each reference field (or line parity of a frame)
-  // a luma and a chroma table, and whether they are in force. Updates chain onto what is there.
-  struct IcLuts {
-    uint8_t y[2][256];
-    uint8_t uv[2][256];
-    bool use = false;
-  };
   // A reference for motion compensation: the picture, which of its fields (-1: the frame) and the tables its samples go through (null: none).
   struct RefSel {
     const Picture* pic = nullptr;
@@ -368,7 +399,8 @@ class Core {
   bool setup_sequence();
   bool decode_frame(ArrayView<const Part> parts, ArrayView<const ConstByteView> raw_units);
   [[nodiscard]] bool walk_progressive_slices(BitReader& br, ArrayView<const Part> parts);
-  void decode_field_pair(BitReader& br, ArrayView<const Part> parts);
+  [[nodiscard]] bool decode_field_pair(BitReader& br, ArrayView<const Part> parts, bool first_only);
+  [[nodiscard]] bool decode_second_field_external(ArrayView<const Part> parts, const PictureHeader& first);
   void begin_field(bool second);
   void finish_field();
   bool start_picture();
@@ -379,6 +411,8 @@ class Core {
   // intensity compensation
   void rotate_luts(int type);
   static void init_lut(int lumscale, int lumshift, IcLuts& luts, int field, bool chain);
+  void prepare_range_scaling();
+  [[nodiscard]] bool make_output(Picture* p);
   IcLuts& ic_curr() { return ic_curr_is_aux_ ? ic_aux_ : ic_next_; }
   // --- Vc1Block.cpp
   bool decode_slice_blocks(BitReader& br, int start_mb_y, int end_mb_y);
@@ -466,10 +500,19 @@ class Core {
   // current frame's first field as its second field sees it), `aux` for the first field of a B frame as its second field sees it.
   IcLuts ic_last_, ic_next_, ic_aux_;
   bool ic_curr_is_aux_ = false;
+  // Range reduction (Simple and Main profile, 8.3.4.11 and 8.4.4.14): a reference whose RANGEREDFRM is not the current picture's is read scaled (down or up), before
+  // its intensity compensation; per direction, the tables of both together (in force when range_scale_[dir]).
+  IcLuts range_luts_[2];
+  bool range_scale_[2] = {false, false};
 
   IOffload* offload_ = nullptr;
   IFrameObserver* observer_ = nullptr;
   const ExternalPicture* ext_ = nullptr;      // decode_external's picture while it is decoded
+  // decode_external: the first field just decoded, which the next call may complete (its target and its header)
+  bool pair_open_ = false;
+  const Picture* pair_target_ = nullptr;
+  PictureHeader pair_header_;
+  PictureHeader second_header_;               // the second field's header of the last field pair decoded (for the observer)
   bool offloaded_ = false;
   VideoFormat out_format_;
 

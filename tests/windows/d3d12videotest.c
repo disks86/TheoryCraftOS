@@ -224,6 +224,9 @@ static void test_features(void) {
   ds.Configuration.InterlaceType = D3D12_VIDEO_FRAME_CODED_INTERLACE_TYPE_FIELD_BASED;      /* (H.264 field pictures and MBAFF frames: 32 lines aligned) */
   CHECK_HR(ID3D12VideoDevice_CheckFeatureSupport(g_vdev, D3D12_FEATURE_VIDEO_DECODE_SUPPORT, &ds, sizeof ds));
   CHECK(ds.SupportFlags == D3D12_VIDEO_DECODE_SUPPORT_FLAG_SUPPORTED && ds.ConfigurationFlags == D3D12_VIDEO_DECODE_CONFIGURATION_FLAG_HEIGHT_ALIGNMENT_MULTIPLE_32_REQUIRED);
+  ds.Configuration.DecodeProfile = D3D12_VIDEO_DECODE_PROFILE_VC1_D2010;      /* (VC-1: field interlace and interlaced frame pictures) */
+  CHECK_HR(ID3D12VideoDevice_CheckFeatureSupport(g_vdev, D3D12_FEATURE_VIDEO_DECODE_SUPPORT, &ds, sizeof ds));
+  CHECK(ds.SupportFlags == D3D12_VIDEO_DECODE_SUPPORT_FLAG_SUPPORTED && ds.ConfigurationFlags == D3D12_VIDEO_DECODE_CONFIGURATION_FLAG_HEIGHT_ALIGNMENT_MULTIPLE_32_REQUIRED);
   ds.Configuration.DecodeProfile = D3D12_VIDEO_DECODE_PROFILE_VP9;      /* (the other profiles are progressive here) */
   CHECK_HR(ID3D12VideoDevice_CheckFeatureSupport(g_vdev, D3D12_FEATURE_VIDEO_DECODE_SUPPORT, &ds, sizeof ds));
   CHECK(ds.SupportFlags == D3D12_VIDEO_DECODE_SUPPORT_FLAG_NONE);
@@ -820,7 +823,7 @@ static void decode_stream(const char *name, int codec, const GUID *profile, cons
   D3D12_VIDEO_DECODER_DESC dd = {0, {*profile, D3D12_BITSTREAM_ENCRYPTION_TYPE_NONE,
                                      interlaced ? D3D12_VIDEO_FRAME_CODED_INTERLACE_TYPE_FIELD_BASED : D3D12_VIDEO_FRAME_CODED_INTERLACE_TYPE_NONE}};
   if (interlaced) {
-    /* field-based H.264 is supported, with surfaces 32 lines aligned; not for the other profiles */
+    /* field-based H.264 and VC-1 are supported, with surfaces 32 lines aligned; not for the other profiles */
     D3D12_FEATURE_DATA_VIDEO_DECODE_SUPPORT fs;
     memset(&fs, 0, sizeof fs);
     fs.Configuration = dd.Configuration;
@@ -904,7 +907,7 @@ static void decode_stream(const char *name, int codec, const GUID *profile, cons
     ID3D12VideoDecodeCommandList_Reset(vl, va);
     ++pictures;
     /* (a first field: the frame is whole after the second, which the stream gives next in the same surface) */
-    if (codec == DXVA_CODEC_H264 && p.field == 1) {
+    if ((codec == DXVA_CODEC_H264 || codec == DXVA_CODEC_VC1) && p.field == 1) {
       r = dxva_stream_next(&s, &p);
       CHECK(r != 1 || p.field == 2);
       continue;
@@ -1204,6 +1207,9 @@ static void test_decode(void) {
   /* interlaced: MBAFF frames and field pictures (P and B fields, B MBAFF frames), CABAC */
   decode_stream("h264_paff_mbaff_cabac", DXVA_CODEC_H264, &D3D12_VIDEO_DECODE_PROFILE_H264, g_h264_paff_mbaff_cabac_b64, 17, g_h264_paff_mbaff_cabac_fnv, 8, 0, 1);
   decode_stream("vc1_adv_ipb", DXVA_CODEC_VC1, &D3D12_VIDEO_DECODE_PROFILE_VC1_D2010, g_vc1_adv_ipb_b64, 8, g_vc1_adv_ipb_fnv, 10, 0, 0);
+  /* VC-1 interlaced: progressive, interlaced frame and field interlace frames, slices; field pairs with range mapping (the output mapped, the references not) */
+  decode_stream("vc1_adv_mix_a", DXVA_CODEC_VC1, &D3D12_VIDEO_DECODE_PROFILE_VC1, g_vc1_adv_mix_a_b64, 8, g_vc1_adv_mix_a_fnv, 12, 0, 1);
+  decode_stream("vc1_adv_rmap_il", DXVA_CODEC_VC1, &D3D12_VIDEO_DECODE_PROFILE_VC1_D2010, g_vc1_adv_rmap_il_b64, 8, g_vc1_adv_rmap_il_fnv, 8, 1, 1);
   decode_stream("m4vdec_bframes", DXVA_CODEC_MPEG4, &D3D12_VIDEO_DECODE_PROFILE_MPEG4PT2_ADVSIMPLE_NOGMC, g_m4vdec_bframes_b64, 8, g_m4vdec_bframes_fnv, 8, 1, 0);
   decode_av1("av1_422_10bit (profile 2, film grain)", g_av1_422_10bit_dxva_b64, &D3D12_VIDEO_DECODE_PROFILE_AV1_PROFILE2, DXGI_FORMAT_Y210, g_av1_422_10bit_dxva_fnv, 6, 0);
   decode_av1("av1_444 (profile 1)", g_av1_444_dxva_b64, &D3D12_VIDEO_DECODE_PROFILE_AV1_PROFILE1, DXGI_FORMAT_AYUV, g_av1_444_dxva_fnv, 6, 1);
