@@ -1015,9 +1015,15 @@ static void STDMETHODCALLTYPE list_ResourceBarrier(CmdList *l, UINT count, const
     if (barriers[i].Type != D3D12_RESOURCE_BARRIER_TYPE_ALIASING) continue;
     const Resource *before = (const Resource *)barriers[i].Aliasing.pResourceBefore, *after = (const Resource *)barriers[i].Aliasing.pResourceAfter;
     end_pass(l);
-    ensure_room(l, 256, 4);
-    UINT w[7] = {1, 2, before ? alloc_index(l, before->alloc) : 0xFFFFFFFFu, after ? alloc_index(l, after->alloc) : 0xFFFFFFFFu, 0, 0, 0};
-    packet(l, OP_RESOURCE_BARRIER, w, 6);
+    /* (a planar texture is an allocation for each plane of each slice: every one of the outgoing resource's goes out, every one of the incoming's comes in) */
+    const UINT outs = before && before->planes ? before->planes * before->layers : 1, ins = after && after->planes ? after->planes * after->layers : 1;
+    for (UINT o = 0; o < outs; ++o)
+      for (UINT n = 0; n < ins; ++n) {
+        ensure_room(l, 256, 4);
+        const UINT out_alloc = before ? (before->planes ? before->plane_alloc[o] : before->alloc) : 0, in_alloc = after ? (after->planes ? after->plane_alloc[n] : after->alloc) : 0;
+        UINT w[7] = {1, 2, out_alloc ? alloc_index(l, out_alloc) : 0xFFFFFFFFu, in_alloc ? alloc_index(l, in_alloc) : 0xFFFFFFFFu, 0, 0, 0};
+        packet(l, OP_RESOURCE_BARRIER, w, 6);
+      }
   }
 }
 static void STDMETHODCALLTYPE list_SetMarker(CmdList *l, UINT m, const void *d, UINT s) {}

@@ -349,8 +349,53 @@ static int heap_cpu_visible(const D3D12_HEAP_PROPERTIES *p) {
   return p->Type == D3D12_HEAP_TYPE_UPLOAD || p->Type == D3D12_HEAP_TYPE_READBACK || (p->Type == D3D12_HEAP_TYPE_CUSTOM && p->CPUPageProperty != D3D12_CPU_PAGE_PROPERTY_NOT_AVAILABLE);
 }
 
-/* A resource made around an allocation another process made (OpenSharedHandle): its handles and backing size. */
-typedef struct ResourceSource { UINT alloc, kresource; UINT64 bytes; } ResourceSource;
+/* A resource made around the allocations another process made (OpenSharedHandle): its handles and backing size - a planar texture's `count` allocations, in its order of
+ * planes and slices (plane_alloc), `alloc` being the first. */
+typedef struct ResourceSource { UINT alloc, kresource; UINT64 bytes; const UINT *allocs; UINT count; } ResourceSource;
+
+/* The bytes of a pixel of the kernel's format (of a 4 x 4 block of a compressed one): what its images keep in memory, which a narrow format's are wider than. */
+static UINT kernel_pixel_bytes(UINT kf) {
+  switch (kf) {
+    case KF_RGBA16F: case KF_RGBA16: case KF_RGBA16UINT: case KF_RGBA16SINT: case KF_RGBA16SNORM: case KF_BC1: case KF_BC1_SRGB: return 8;
+    case KF_RGBA32F: case KF_RGBA32UINT: case KF_RGBA32SINT: case KF_BC2: case KF_BC3: case KF_BC2_SRGB: case KF_BC3_SRGB: return 16;
+    default: return 4;
+  }
+}
+/* The size of plane allocation `i` of a planar texture (plane_alloc's order: plane * layers + slice): the luma the texture's, the chroma half of it both ways. */
+static void planar_extent(const D3D12_RESOURCE_DESC *d, UINT layers, UINT i, UINT *w, UINT *h) {
+  const int chroma = i >= layers;
+  *w = chroma ? ((UINT)d->Width + 1) / 2 : (UINT)d->Width;
+  *h = chroma ? (d->Height + 1) / 2 : d->Height;
+}
+#define PLANE_PLACEMENT 4096u      /* (where each plane of a placed planar texture begins in the heap: a multiple of this) */
+/* Where in a heap each of the `count` plane allocations of a placed planar texture of `fi` begins (offsets, from the resource's own offset), and the bytes of all of
+ * them: the kernel's images of the planes - widened pixels - one after the other. */
+static UINT64 planar_layout(const D3D12_RESOURCE_DESC *d, const FormatInfo *fi, UINT layers, UINT count, UINT64 *offsets) {
+  UINT64 at = 0;
+  for (UINT i = 0; i < count; ++i) {
+    UINT w, h;
+    planar_extent(d, layers, i, &w, &h);
+    at = KALIGN(at, PLANE_PLACEMENT);
+    if (offsets) offsets[i] = at;
+    at += (UINT64)w * h * kernel_pixel_bytes(fi->kernel);
+  }
+  return at;
+}
+/* The bytes the kernel's image of a texture of this description has in memory (every level and layer, or every plane of a planar one): at least what a placed one
+ * takes of its heap (GetResourceAllocationInfo). */
+static UINT64 texture_kernel_bytes(const D3D12_RESOURCE_DESC *d) {
+  const FormatInfo *fi = format_info(d->Format);
+  if (!fi || !fi->kernel) return 0;
+  const UINT layers = d->DepthOrArraySize ? d->DepthOrArraySize : 1;
+  if (fi->planar) return planar_layout(d, fi, layers, 2 * layers, NULL);
+  const UINT mips = d->MipLevels ? d->MipLevels : mip_count_for((UINT)d->Width, d->Height);
+  UINT64 total = 0;
+  for (UINT level = 0; level < mips; ++level) {
+    const UINT w = mip_extent((UINT)d->Width, level), h = mip_extent(d->Height, level);
+    total += fi->compressed ? (UINT64)((w + 3) / 4) * ((h + 3) / 4) * kernel_pixel_bytes(fi->kernel) : (UINT64)w * h * kernel_pixel_bytes(fi->kernel);
+  }
+  return total * layers;
+}
 static HRESULT resource_make_from(Dev *dev, const D3D12_HEAP_PROPERTIES *props, D3D12_HEAP_FLAGS hflags, const D3D12_RESOURCE_DESC *desc, HeapObj *heap, UINT64 heap_offset,
                                   int mode, const ResourceSource *source, Resource **out);
 static HRESULT resource_make(Dev *dev, const D3D12_HEAP_PROPERTIES *props, D3D12_HEAP_FLAGS hflags, const D3D12_RESOURCE_DESC *desc, HeapObj *heap, UINT64 heap_offset, int mode,
@@ -437,10 +482,14 @@ static HRESULT resource_make_from(Dev *dev, const D3D12_HEAP_PROPERTIES *props, 
     } else if (depth_or_array > 1) { r->kind = 2; r->layers = depth_or_array; }
     const int target = (desc->Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET) != 0;
     if (fi->planar) {
-      /* (NV12, P010, P016: a 2D texture or array of one level, of even width and height (the chroma is half of both), not multisampled, depth, tiled, CPU visible, placed
-       * or shared; each plane of each slice is a 2D image of the kernel's, so the slices may be render targets) */
-      if (desc->Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || cube || r->mips != 1 || samples > 1 || want_depth || (desc->Width & 1) || (desc->Height & 1)) { hr = E_INVALIDARG; goto fail; }
-      if (reserved || cpu || heap || (hflags & (D3D12_HEAP_FLAG_SHARED | D3D12_HEAP_FLAG_SHARED_CROSS_ADAPTER)) || global_share) { hr = DXGI_ERROR_UNSUPPORTED; goto fail; }
+      /* (NV12, P010, P016: a 2D texture or array of one level, of even width and height (the chroma is half of both), not multisampled or depth; each plane of each slice is
+       * a 2D image of the kernel's, so the slices may be render targets. Committed, placed (the planes one after the other in the heap: planar_layout) or shared (every
+       * plane allocation in one resource of win32k's). Not reserved: tiling is not one of these formats' supports (D3D12_FORMAT_SUPPORT2_TILED; Windows' drivers do not
+       * tile video formats either), so a reserved one is a description the device refuses. Not CPU visible: the kernel's planes are widened, so the driver's layout a
+       * custom heap's texture is read in would not be what Direct3D says it is) */
+      if (desc->Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || cube || r->mips != 1 || samples > 1 || want_depth || (desc->Width & 1) || (desc->Height & 1) || reserved) { hr = E_INVALIDARG; goto fail; }
+      if (cpu) { hr = DXGI_ERROR_UNSUPPORTED; goto fail; }
+      if (2u * r->layers > KMT_MAX_RESOURCE_ALLOCATIONS) { hr = E_INVALIDARG; goto fail; }      /* (128 slices at most: two planes of each, one resource) */
       r->kind = 0;
       r->planes = 2;
     }
@@ -478,8 +527,27 @@ static HRESULT resource_make_from(Dev *dev, const D3D12_HEAP_PROPERTIES *props, 
   NTSTATUS st;
   const UINT extra_size = dev->next_share_extra_size;
   dev->next_share_extra_size = 0;      /* (it was for this resource) */
+  /* (a planar texture: plane 0 of every slice, then plane 1 of every slice - each an allocation, sized and placed as planar_extent / planar_layout say) */
+  const UINT plane_count = r->planes * r->layers;
+  KmtAllocDesc *plane_descs = NULL;
+  if (r->planes) {
+    r->plane_alloc = mem_alloc(sizeof(UINT) * plane_count);
+    plane_descs = mem_alloc(sizeof(KmtAllocDesc) * plane_count);
+    UINT64 *offsets = mem_alloc(sizeof(UINT64) * plane_count);
+    if (!r->plane_alloc || !plane_descs || !offsets) { mem_free(plane_descs); mem_free(offsets); hr = E_OUTOFMEMORY; goto fail; }
+    planar_layout(desc, r->fmt, r->layers, plane_count, offsets);
+    for (UINT i = 0; i < plane_count; ++i) {
+      plane_descs[i] = ad;
+      planar_extent(desc, r->layers, i, &plane_descs[i].width, &plane_descs[i].height);
+      if (heap) plane_descs[i].heap_offset = heap_offset + offsets[i];
+    }
+    mem_free(offsets);
+  }
   if (source) {
-    r->alloc = source->alloc;
+    /* (opened: the allocations are the resource's from now on) */
+    if ((r->planes && (source->count != plane_count || !source->allocs)) || (!r->planes && source->count > 1)) { mem_free(plane_descs); hr = E_INVALIDARG; goto fail; }
+    if (r->planes) memcpy(r->plane_alloc, source->allocs, sizeof(UINT) * plane_count);
+    r->alloc = r->planes ? r->plane_alloc[0] : source->alloc;
     r->kresource = source->kresource;
     r->bytes = source->bytes;
     st = 0;
@@ -501,26 +569,32 @@ static HRESULT resource_make_from(Dev *dev, const D3D12_HEAP_PROPERTIES *props, 
     BYTE blob[SHARE_DESC_BYTES];
     share_desc_write(blob, &sd);
     /* (an NT-handle share - D3D12_HEAP_FLAG_SHARED - or, asked for alone, one with a global share handle) */
-    st = kmt_create_allocation_shared(dev->kdev, &ad, blob, sizeof blob, &r->kresource, global_share && !(hflags & D3D12_HEAP_FLAG_SHARED) ? &r->global_share : NULL, &r->alloc,
-                                      &pitch, &r->bytes);
+    UINT *global_out = global_share && !(hflags & D3D12_HEAP_FLAG_SHARED) ? &r->global_share : NULL;
+    if (r->planes) {
+      /* (all the planes of all the slices one resource of win32k's: an opener gets every allocation) */
+      UINT64 *plane_bytes = mem_alloc(sizeof(UINT64) * plane_count);
+      st = plane_bytes ? kmt_create_allocations_shared(dev->kdev, plane_descs, plane_count, blob, sizeof blob, &r->kresource, global_out, r->plane_alloc, NULL, plane_bytes)
+                       : (NTSTATUS)0xC0000017u;
+      r->bytes = 0;
+      for (UINT i = 0; KMT_OK(st) && i < plane_count; ++i) r->bytes += plane_bytes[i];
+      mem_free(plane_bytes);
+      if (KMT_OK(st)) r->alloc = r->plane_alloc[0];
+    } else {
+      st = kmt_create_allocation_shared(dev->kdev, &ad, blob, sizeof blob, &r->kresource, global_out, &r->alloc, &pitch, &r->bytes);
+    }
   } else if (r->planes) {
-    /* (a planar texture: plane 0 of every slice, then plane 1 of every slice) */
-    r->plane_alloc = mem_alloc(sizeof(UINT) * r->planes * r->layers);
-    if (!r->plane_alloc) { hr = E_OUTOFMEMORY; goto fail; }
-    memset(r->plane_alloc, 0, sizeof(UINT) * r->planes * r->layers);
     st = 0;
     r->bytes = 0;
-    for (UINT i = 0; KMT_OK(st) && i < r->planes * r->layers; ++i) {
-      KmtAllocDesc pd = ad;
-      if (i >= r->layers) { pd.width = (ad.width + 1) / 2; pd.height = (ad.height + 1) / 2; }
+    for (UINT i = 0; KMT_OK(st) && i < plane_count; ++i) {
       UINT64 plane_bytes = 0;
-      st = kmt_create_allocation(dev->kdev, &pd, &r->plane_alloc[i], &pitch, &plane_bytes);
+      st = kmt_create_allocation(dev->kdev, &plane_descs[i], &r->plane_alloc[i], &pitch, &plane_bytes);
       r->bytes += plane_bytes;
     }
     r->alloc = r->plane_alloc[0];
   } else {
     st = kmt_create_allocation(dev->kdev, &ad, &r->alloc, &pitch, &r->bytes);
   }
+  mem_free(plane_descs);
   if (!KMT_OK(st)) { hr = hr_from(st); goto fail; }
   /* (a narrow format's image starts as zeros in its channels and the maximum in the alpha the kernel keeps, as a copy into it would leave it) */
   if (r->fmt && r->fmt->narrow && !source && !heap && !reserved) {
@@ -545,6 +619,11 @@ static HRESULT resource_make_from(Dev *dev, const D3D12_HEAP_PROPERTIES *props, 
   *out = r;
   return S_OK;
 fail:
+  if (source) {
+    /* (the opened allocations stay the caller's, which gives them back) */
+    r->alloc = 0;
+    if (r->plane_alloc) memset(r->plane_alloc, 0, sizeof(UINT) * r->planes * r->layers);
+  }
   dx_Release(OBJ(r));
   return hr;
 }
@@ -621,6 +700,9 @@ static D3D12_RESOURCE_ALLOCATION_INFO *STDMETHODCALLTYPE dev_GetResourceAllocati
       const FormatInfo *dfi = format_info(d.Format);
       const UINT subs = mips * (d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D ? 1 : (d.DepthOrArraySize ? d.DepthOrArraySize : 1)) * (dfi && dfi->planar ? 2 : 1);
       get_footprints(&d, 0, subs, 0, NULL, NULL, NULL, &n);
+      /* (what the kernel keeps of it: a narrow format's and a plane's pixels are widened, so a placed one needs more of its heap than its footprints) */
+      const UINT64 kernel = texture_kernel_bytes(&d);
+      if (kernel > n) n = kernel;
     }
     size += KALIGN(n, KTILE_BYTES);
   }

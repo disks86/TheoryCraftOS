@@ -202,7 +202,11 @@ static HRESULT STDMETHODCALLTYPE dev_CheckFeatureSupport(Dev *d, D3D11_FEATURE f
       g->MaxGPUVirtualAddressBitsPerProcess = g12.MaxGPUVirtualAddressBitsPerProcess;
       return S_OK;
     }
-    case D3D11_FEATURE_D3D11_OPTIONS4: FEATURE_SIZE(D3D11_FEATURE_DATA_D3D11_OPTIONS4); break;      /* (NV12 textures are not shared: tex_make refuses the shared flags for them) */
+    case D3D11_FEATURE_D3D11_OPTIONS4:
+      /* (NV12 textures share as other textures do, every plane of every slice: tex_make) */
+      FEATURE_SIZE(D3D11_FEATURE_DATA_D3D11_OPTIONS4);
+      ((D3D11_FEATURE_DATA_D3D11_OPTIONS4 *)data)->ExtendedNV12SharedTextureSupported = TRUE;
+      return S_OK;
     case D3D11_FEATURE_SHADER_CACHE: FEATURE_SIZE(D3D11_FEATURE_DATA_SHADER_CACHE); break;      /* (D3D11_SHADER_CACHE_SUPPORT_NONE) */
     case D3D11_FEATURE_D3D11_OPTIONS5: {
       /* (resources and fences share through NT handles; the formats that share are Direct3D 12's tier) */

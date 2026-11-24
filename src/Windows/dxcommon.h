@@ -398,43 +398,65 @@ static NTSTATUS kmt_create_allocation_ex(UINT device, const KmtAllocDesc *d, con
 }
 /* ... and `global` non-NULL as well: shared through a global share handle instead (CreateResource | CreateShared: the legacy handles of
  * IDXGIResource::GetSharedHandle), *global being it. */
+static NTSTATUS kmt_create_allocations_shared(UINT device, const KmtAllocDesc *descs, UINT count, const void *runtime, UINT runtime_size, UINT *resource, UINT *global,
+                                              UINT *allocations, UINT *pitches, UINT64 *bytes);
 static NTSTATUS kmt_create_allocation_shared(UINT device, const KmtAllocDesc *d, const void *runtime, UINT runtime_size, UINT *resource, UINT *global, UINT *allocation, UINT *pitch,
                                              UINT64 *bytes) {
-  UINT priv[KAW_WORDS] __attribute__((aligned(16))) = {0};
+  return kmt_create_allocations_shared(device, d, 1, runtime, runtime_size, resource, global, allocation, pitch, bytes);
+}
+/* `count` allocations (at most KMT_MAX_RESOURCE_ALLOCATIONS) made in one call - with `resource` non-NULL, one resource of all of them (Windows' resource of several
+ * allocations, a planar texture's planes), shared as kmt_create_allocation_shared shares one: through NT handles, or through `global`. allocations[i], pitches[i] and
+ * bytes[i] are the i-th's (pitches and bytes may be NULL). On a failure none of them is made. */
+#define KMT_MAX_RESOURCE_ALLOCATIONS 256u      /* (win32k's kMaxAllocationsPerCall) */
+static NTSTATUS kmt_create_allocations_shared(UINT device, const KmtAllocDesc *descs, UINT count, const void *runtime, UINT runtime_size, UINT *resource, UINT *global,
+                                              UINT *allocations, UINT *pitches, UINT64 *bytes) {
+  if (count == 0 || count > KMT_MAX_RESOURCE_ALLOCATIONS) return (NTSTATUS)0xC000000Du;      /* STATUS_INVALID_PARAMETER */
+  UINT *priv = mem_alloc((SIZE_T)count * KAW_WORDS * 4);
+  BYTE *info = mem_alloc((SIZE_T)count * 40);      /* (D3DDDI_ALLOCATIONINFO: 40 bytes each) */
+  if (!priv || !info) { mem_free(priv); mem_free(info); return (NTSTATUS)0xC0000017u; }      /* STATUS_NO_MEMORY */
   BYTE block[72] __attribute__((aligned(16))) = {0};
-  BYTE info[96] __attribute__((aligned(16))) = {0};
-  priv[KAW_VERSION] = 1;
-  priv[KAW_FLAGS] = d->flags;
-  priv[KAW_FORMAT] = d->format;
-  priv[KAW_WIDTH] = d->width;
-  priv[KAW_HEIGHT] = d->height;
-  priv[KAW_MIPS] = d->mips ? d->mips : 1;
-  priv[KAW_SIZE_LO] = (UINT)d->size;
-  priv[KAW_SIZE_HI] = (UINT)(d->size >> 32);
-  priv[KAW_KIND] = d->kind;
-  priv[KAW_SAMPLES] = d->samples ? d->samples : 1;
-  priv[KAW_LAYERS] = d->layers ? d->layers : 1;
-  priv[KAW_INITIAL_STATE] = d->initial_state;
-  priv[KAW_HEAP] = d->heap;
-  priv[KAW_HEAP_OFFSET_LO] = (UINT)d->heap_offset;
-  priv[KAW_HEAP_OFFSET_HI] = (UINT)(d->heap_offset >> 32);
-  KPUT64(info, 16, priv);
-  KPUT32(info, 24, sizeof priv);
+  for (UINT i = 0; i < count; ++i) {
+    const KmtAllocDesc *d = &descs[i];
+    UINT *w = priv + (SIZE_T)i * KAW_WORDS;
+    w[KAW_VERSION] = 1;
+    w[KAW_FLAGS] = d->flags;
+    w[KAW_FORMAT] = d->format;
+    w[KAW_WIDTH] = d->width;
+    w[KAW_HEIGHT] = d->height;
+    w[KAW_MIPS] = d->mips ? d->mips : 1;
+    w[KAW_SIZE_LO] = (UINT)d->size;
+    w[KAW_SIZE_HI] = (UINT)(d->size >> 32);
+    w[KAW_KIND] = d->kind;
+    w[KAW_SAMPLES] = d->samples ? d->samples : 1;
+    w[KAW_LAYERS] = d->layers ? d->layers : 1;
+    w[KAW_INITIAL_STATE] = d->initial_state;
+    w[KAW_HEAP] = d->heap;
+    w[KAW_HEAP_OFFSET_LO] = (UINT)d->heap_offset;
+    w[KAW_HEAP_OFFSET_HI] = (UINT)(d->heap_offset >> 32);
+    KPUT64(info + (SIZE_T)i * 40, 16, (UINT_PTR)w);
+    KPUT32(info + (SIZE_T)i * 40, 24, KAW_WORDS * 4);
+  }
   KPUT32(block, 0, device);
-  KPUT32(block, 44, 1);
-  KPUT64(block, 48, info);
+  KPUT32(block, 44, count);
+  KPUT64(block, 48, (UINT_PTR)info);
   if (resource) {
     KPUT64(block, 16, (UINT_PTR)runtime);
     KPUT32(block, 24, runtime_size);
     KPUT32(block, 56, global ? (1u | 2u) : (1u | 0x40u));      /* CreateResource | CreateShared, or CreateResource | NtSecuritySharing */
   }
   NTSTATUS st = D3DKMTCreateAllocation(block);
-  if (!KMT_OK(st)) return st;
-  *allocation = KGET32(info, 0);
-  if (resource) *resource = KGET32(block, 4);
-  if (resource && global) *global = KGET32(block, 8);
-  if (pitch) *pitch = priv[KAW_PITCH];
-  if (bytes) *bytes = priv[KAW_BYTES_LO] | ((UINT64)priv[KAW_BYTES_HI] << 32);
+  if (KMT_OK(st)) {
+    for (UINT i = 0; i < count; ++i) {
+      const UINT *w = priv + (SIZE_T)i * KAW_WORDS;
+      allocations[i] = KGET32(info + (SIZE_T)i * 40, 0);
+      if (pitches) pitches[i] = w[KAW_PITCH];
+      if (bytes) bytes[i] = w[KAW_BYTES_LO] | ((UINT64)w[KAW_BYTES_HI] << 32);
+    }
+    if (resource) *resource = KGET32(block, 4);
+    if (resource && global) *global = KGET32(block, 8);
+  }
+  mem_free(priv);
+  mem_free(info);
   return st;
 }
 
@@ -578,13 +600,16 @@ static NTSTATUS kmt_query_resource_global(UINT device, UINT global, void *runtim
   *allocations = KGET32(block, 28);
   return st;
 }
-static NTSTATUS kmt_open_resource_global(UINT device, UINT global, void *runtime, UINT runtime_size, void *driver, UINT driver_size, UINT *allocation, UINT *resource,
-                                         void **allocation_driver) {
+/* ... of `count` allocations: allocations[i] and, in `driver`, the i-th's private data at datas[i] (NULL: not wanted). */
+static NTSTATUS kmt_open_resource_global_n(UINT device, UINT global, void *runtime, UINT runtime_size, void *driver, UINT driver_size, UINT count, UINT *allocations,
+                                           void **datas, UINT *resource) {
+  if (count == 0 || count > KMT_MAX_RESOURCE_ALLOCATIONS) return (NTSTATUS)0xC000000Du;
   BYTE block[72] __attribute__((aligned(16))) = {0};
-  BYTE info[24] __attribute__((aligned(16))) = {0};
+  BYTE *info = mem_alloc((SIZE_T)count * 24);      /* (D3DDDI_OPENALLOCATIONINFO: 24 bytes each) */
+  if (!info) return (NTSTATUS)0xC0000017u;
   KPUT32(block, 0, device);
   KPUT32(block, 4, global);
-  KPUT32(block, 8, 1);
+  KPUT32(block, 8, count);
   KPUT64(block, 16, (UINT_PTR)info);
   KPUT64(block, 24, (UINT_PTR)runtime);
   KPUT32(block, 32, runtime_size);
@@ -592,11 +617,18 @@ static NTSTATUS kmt_open_resource_global(UINT device, UINT global, void *runtime
   KPUT32(block, 64, driver_size);
   const NTSTATUS st = D3DKMTOpenResource(block);
   if (KMT_OK(st)) {
-    *allocation = KGET32(info, 0);
+    for (UINT i = 0; i < count; ++i) {
+      allocations[i] = KGET32(info + (SIZE_T)i * 24, 0);
+      if (datas) datas[i] = (void *)(UINT_PTR)KGET64(info + (SIZE_T)i * 24, 8);
+    }
     *resource = KGET32(block, 68);
-    *allocation_driver = (void *)(UINT_PTR)KGET64(info, 8);
   }
+  mem_free(info);
   return st;
+}
+static NTSTATUS kmt_open_resource_global(UINT device, UINT global, void *runtime, UINT runtime_size, void *driver, UINT driver_size, UINT *allocation, UINT *resource,
+                                         void **allocation_driver) {
+  return kmt_open_resource_global_n(device, global, runtime, runtime_size, driver, driver_size, 1, allocation, allocation_driver, resource);
 }
 static void kmt_destroy_keyed_mutex(UINT mutex) {
   BYTE block[8] __attribute__((aligned(8))) = {0};
@@ -643,15 +675,18 @@ static NTSTATUS kmt_query_resource_nt(UINT device, UINT64 nt, void *runtime, UIN
   *allocations = KGET32(block, 36);
   return st;
 }
-/* Opens a shared resource of one allocation: its allocation and resource handles on `device`; its private data goes to `driver` (the allocation's) and `resource_driver`. */
+/* Opens a shared resource of `count` allocations (what kmt_query_resource_nt said it has): allocations[i] on `device` and, in `driver`, the i-th's private data at
+ * datas[i] (NULL: not wanted), and the resource's handle; the resource's own private data goes to `resource_driver`. */
 static void kmt_destroy_sync(UINT sync);
-static NTSTATUS kmt_open_resource_nt(UINT device, UINT64 nt, void *runtime, UINT runtime_size, void *resource_driver, UINT resource_driver_size, void *driver, UINT driver_size,
-                                     UINT *allocation, UINT *resource) {
+static NTSTATUS kmt_open_resource_nt_n(UINT device, UINT64 nt, void *runtime, UINT runtime_size, void *resource_driver, UINT resource_driver_size, void *driver, UINT driver_size,
+                                       UINT count, UINT *allocations, void **datas, UINT *resource) {
+  if (count == 0 || count > KMT_MAX_RESOURCE_ALLOCATIONS) return (NTSTATUS)0xC000000Du;
   BYTE block[104] __attribute__((aligned(16))) = {0};
-  BYTE info[80] __attribute__((aligned(16))) = {0};
+  BYTE *info = mem_alloc((SIZE_T)count * 80);      /* (D3DDDI_OPENALLOCATIONINFO2: 80 bytes each) */
+  if (!info) return (NTSTATUS)0xC0000017u;
   KPUT32(block, 0, device);
   KPUT64(block, 8, nt);
-  KPUT32(block, 16, 1);
+  KPUT32(block, 16, count);
   KPUT64(block, 24, (UINT_PTR)info);
   KPUT32(block, 32, runtime_size);
   KPUT64(block, 40, (UINT_PTR)runtime);
@@ -664,13 +699,22 @@ static NTSTATUS kmt_open_resource_nt(UINT device, UINT64 nt, void *runtime, UINT
   KPUT32(block, 96, sizeof mutex_data);
   const NTSTATUS st = D3DKMTOpenResourceFromNtHandle(block);
   if (KMT_OK(st)) {
-    *allocation = KGET32(info, 0);
+    for (UINT i = 0; i < count; ++i) {
+      allocations[i] = KGET32(info + (SIZE_T)i * 80, 0);
+      if (datas) datas[i] = (void *)(UINT_PTR)KGET64(info + (SIZE_T)i * 80, 8);
+    }
     *resource = KGET32(block, 80);
     /* (the keyed mutex and fence shared with it come with it: the runtime above opens the mutex itself - kmt_open_keyed_mutex_nt - so these go) */
     if (KGET32(block, 84)) kmt_destroy_keyed_mutex(KGET32(block, 84));
     if (KGET32(block, 100)) kmt_destroy_sync(KGET32(block, 100));
   }
+  mem_free(info);
   return st;
+}
+/* ... of one allocation: its private data goes to `driver` (the allocation's) and `resource_driver`. */
+static NTSTATUS kmt_open_resource_nt(UINT device, UINT64 nt, void *runtime, UINT runtime_size, void *resource_driver, UINT resource_driver_size, void *driver, UINT driver_size,
+                                     UINT *allocation, UINT *resource) {
+  return kmt_open_resource_nt_n(device, nt, runtime, runtime_size, resource_driver, resource_driver_size, driver, driver_size, 1, allocation, NULL, resource);
 }
 /* A synchronization object on `device` for a shared fence's NT handle. */
 static NTSTATUS kmt_open_sync_nt(UINT device, UINT64 nt, UINT *sync) {

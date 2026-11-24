@@ -1066,9 +1066,11 @@ static HRESULT tex_make(Dev *d, const D3D11_TEXTURE2D_DESC *in, UINT slices, ID3
   if (bind & D3D11_BIND_VIDEO_ENCODER) return E_INVALIDARG;
   if ((bind & D3D11_BIND_DECODER) && desc.Format != DXGI_FORMAT_NV12 && desc.Format != DXGI_FORMAT_P010) return E_INVALIDARG;
   if (planar) {
-    /* NV12, P010, P016: a 2D texture or array of one level, of even width and height (the chroma is half of both), not multisampled, not a depth buffer, a cube or
-     * shared (D3D11_FEATURE_D3D11_OPTIONS4: no shared NV12); the CPU reaches one of a single slice (as on Windows, which has no CPU access to arrays of them) */
-    if (slices || (desc.Width & 1) || (desc.Height & 1) || desc.MipLevels != 1 || desc.SampleDesc.Count != 1 || desc.SampleDesc.Quality || desc.MiscFlags ||
+    /* NV12, P010, P016: a 2D texture or array of one level, of even width and height (the chroma is half of both), not multisampled, not a depth buffer or a cube; it
+     * may be shared - SHARED, SHARED_NTHANDLE, SHARED_KEYEDMUTEX (D3D11_FEATURE_D3D11_OPTIONS4: ExtendedNV12SharedTextureSupported), every plane of every slice going
+     * with it -, nothing else of the misc flags; the CPU reaches one of a single slice (as on Windows, which has no CPU access to arrays of them) */
+    const UINT planar_misc = D3D11_RESOURCE_MISC_SHARED | D3D11_RESOURCE_MISC_SHARED_NTHANDLE | D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX;
+    if (slices || (desc.Width & 1) || (desc.Height & 1) || desc.MipLevels != 1 || desc.SampleDesc.Count != 1 || desc.SampleDesc.Quality || (desc.MiscFlags & ~planar_misc) ||
         (bind & D3D11_BIND_DEPTH_STENCIL) || ((desc.Usage == D3D11_USAGE_DYNAMIC || desc.Usage == D3D11_USAGE_STAGING) && desc.ArraySize != 1))
       return E_INVALIDARG;
   }

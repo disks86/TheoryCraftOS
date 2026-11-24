@@ -196,7 +196,12 @@ static void test_planar_rules(void) {
       {64, 32, 1, 1, 1, DXGI_FORMAT_NV12, D3D11_USAGE_DEFAULT, D3D11_BIND_DEPTH_STENCIL, 0, 0, E_INVALIDARG, "a depth buffer"},
       {64, 32, 1, 1, 1, DXGI_FORMAT_NV12, D3D11_USAGE_DEFAULT, D3D11_BIND_VIDEO_ENCODER, 0, 0, E_INVALIDARG, "a video encoder's input (there is no encoder)"},
       {64, 32, 1, 2, 1, DXGI_FORMAT_NV12, D3D11_USAGE_STAGING, 0, D3D11_CPU_ACCESS_READ, 0, E_INVALIDARG, "a staging NV12 array"},
-      {64, 32, 1, 1, 1, DXGI_FORMAT_NV12, D3D11_USAGE_DEFAULT, D3D11_BIND_SHADER_RESOURCE, 0, D3D11_RESOURCE_MISC_SHARED, E_INVALIDARG, "a shared NV12 texture"},
+      {64, 32, 1, 1, 1, DXGI_FORMAT_NV12, D3D11_USAGE_DEFAULT, D3D11_BIND_SHADER_RESOURCE, 0, D3D11_RESOURCE_MISC_SHARED, S_OK, "a shared NV12 texture"},
+      {64, 32, 1, 4, 1, DXGI_FORMAT_NV12, D3D11_USAGE_DEFAULT, D3D11_BIND_DECODER | D3D11_BIND_SHADER_RESOURCE, 0, D3D11_RESOURCE_MISC_SHARED | D3D11_RESOURCE_MISC_SHARED_NTHANDLE, S_OK,
+       "a shared (NT handle) NV12 array for a decoder"},
+      {64, 32, 1, 1, 1, DXGI_FORMAT_P010, D3D11_USAGE_DEFAULT, D3D11_BIND_SHADER_RESOURCE, 0, D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX, S_OK, "a P010 texture with a keyed mutex"},
+      {64, 32, 1, 1, 1, DXGI_FORMAT_NV12, D3D11_USAGE_DEFAULT, D3D11_BIND_SHADER_RESOURCE, 0, D3D11_RESOURCE_MISC_TEXTURECUBE, E_INVALIDARG, "an NV12 cube"},
+      {64, 32, 1, 1, 1, DXGI_FORMAT_NV12, D3D11_USAGE_DEFAULT, D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET, 0, D3D11_RESOURCE_MISC_GENERATE_MIPS, E_INVALIDARG, "NV12 mipmaps generated"},
       {64, 32, 1, 1, 1, DXGI_FORMAT_P016, D3D11_USAGE_DEFAULT, D3D11_BIND_DECODER, 0, 0, E_INVALIDARG, "a P016 texture for a decoder (none puts it out)"},
       {64, 32, 1, 1, 1, DXGI_FORMAT_B8G8R8A8_UNORM, D3D11_USAGE_DEFAULT, D3D11_BIND_DECODER, 0, 0, E_INVALIDARG, "a BGRA texture for a decoder"},
   };
@@ -231,7 +236,7 @@ static void test_planar_rules(void) {
   check(hr == S_OK && fs2.OutFormatSupport2 == 0, "CheckFeatureSupport(FORMAT_SUPPORT2, NV12): none of the second set");
   D3D11_FEATURE_DATA_D3D11_OPTIONS4 o4 = {TRUE};
   hr = ID3D11Device_CheckFeatureSupport(g_device, D3D11_FEATURE_D3D11_OPTIONS4, &o4, sizeof o4);
-  check(hr == S_OK && !o4.ExtendedNV12SharedTextureSupported, "D3D11_OPTIONS4: no shared NV12 textures");
+  check(hr == S_OK && o4.ExtendedNV12SharedTextureSupported, "D3D11_OPTIONS4: NV12 textures are shared");
 }
 
 /* An NV12 (or P010) frame of a pattern: Y = f(x, y), U, V = g(x, y) (P010: the values in the top 10 bits). */
@@ -762,10 +767,11 @@ static int decode_picture(ID3D11VideoDecoder *dec, ID3D11VideoDecoderOutputView 
   }
   return SUCCEEDED(ID3D11VideoContext_DecoderEndFrame(g_vcontext, dec)) && ok;
 }
-/* A stream decoded into an NV12 array of `surfaces` slices (the DXVA indices); each picture read back as it is decoded; then in display order against ffmpeg's frames:
- * their hashes (H.264), or the means of their 4 x 4 blocks within 2 (MPEG-2). */
+/* A stream decoded into an NV12 array of `surfaces` slices (the DXVA indices) - or, `separate`, into that many NV12 textures of one slice each (index n the n-th
+ * texture, every output view of slice 0) -; each picture read back as it is decoded; then in display order against ffmpeg's frames: their hashes (H.264), or the means
+ * of their 4 x 4 blocks within 2 (MPEG-2). */
 static void decode_stream(const char *name, int codec, const GUID *profile, const char *b64, unsigned surfaces, const unsigned *hashes, UINT frames,
-                          const unsigned char (*means)[576], int split) {
+                          const unsigned char (*means)[576], int split, int separate) {
   size_t size = 0;
   unsigned char *data = base64_decode(b64, &size);
   DxvaStream s;
@@ -778,13 +784,16 @@ static void decode_stream(const char *name, int codec, const GUID *profile, cons
   if (SUCCEEDED(hr) && count) hr = ID3D11VideoDevice_GetVideoDecoderConfig(g_vdevice, &desc, 0, &config);
   ID3D11VideoDecoder *dec = NULL;
   if (SUCCEEDED(hr)) hr = ID3D11VideoDevice_CreateVideoDecoder(g_vdevice, &desc, &config, &dec);
-  ID3D11Texture2D *out = texture(s.width, s.height, surfaces, DXGI_FORMAT_NV12, D3D11_USAGE_DEFAULT, D3D11_BIND_DECODER, 0, NULL, NULL);
+  ID3D11Texture2D *outs[DXVA_STREAM_MAX_SURFACES] = {0};
+  ID3D11Texture2D *out = texture(s.width, s.height, separate ? 1 : surfaces, DXGI_FORMAT_NV12, D3D11_USAGE_DEFAULT, D3D11_BIND_DECODER, 0, NULL, NULL);
+  for (unsigned i = 0; i < surfaces; ++i) outs[i] = !separate ? out : i == 0 ? out : texture(s.width, s.height, 1, DXGI_FORMAT_NV12, D3D11_USAGE_DEFAULT, D3D11_BIND_DECODER, 0, NULL, NULL);
   ID3D11VideoDecoderOutputView *views[DXVA_STREAM_MAX_SURFACES] = {0};
   for (unsigned i = 0; SUCCEEDED(hr) && out && i < surfaces; ++i) {
-    D3D11_VIDEO_DECODER_OUTPUT_VIEW_DESC vd = {*profile, D3D11_VDOV_DIMENSION_TEXTURE2D, {{i}}};
-    hr = ID3D11VideoDevice_CreateVideoDecoderOutputView(g_vdevice, (ID3D11Resource *)out, &vd, &views[i]);
+    D3D11_VIDEO_DECODER_OUTPUT_VIEW_DESC vd = {*profile, D3D11_VDOV_DIMENSION_TEXTURE2D, {{separate ? 0 : i}}};
+    hr = outs[i] ? ID3D11VideoDevice_CreateVideoDecoderOutputView(g_vdevice, (ID3D11Resource *)outs[i], &vd, &views[i]) : E_OUTOFMEMORY;
   }
-  checkf(SUCCEEDED(hr) && dec && out, "%s: a decoder of %u x %u, an NV12 array of %u slices and their output views", name, s.width, s.height, surfaces);
+  checkf(SUCCEEDED(hr) && dec && out, separate ? "%s: a decoder of %u x %u, %u NV12 textures of one slice and their output views" : "%s: a decoder of %u x %u, an NV12 array of %u slices and their output views",
+         name, s.width, s.height, surfaces);
   const UINT vw = s.width - s.crop_left - s.crop_right, vh = s.height - s.crop_top - s.crop_bottom, cw = (vw + 1) / 2, ch = (vh + 1) / 2;
   const UINT frame_bytes = vw * vh + 2 * cw * ch;
   Decoded *decoded = calloc(256, sizeof *decoded);
@@ -795,7 +804,7 @@ static void decode_stream(const char *name, int codec, const GUID *profile, cons
     if (codec == DXVA_CODEC_H264) last_feedback = ((const DXVA_PicParams_H264 *)p.picture_parameters)->StatusReportFeedbackNumber;
     const UINT slice_bytes = codec == DXVA_CODEC_H264 ? sizeof(DXVA_Slice_H264_Short) : sizeof(DXVA_SliceInfo);
     const UINT location = codec == DXVA_CODEC_H264 ? offsetof(DXVA_Slice_H264_Short, BSNALunitDataLocation) : offsetof(DXVA_SliceInfo, dwSliceDataLocation);
-    if (!decode_picture(dec, views[p.surface], &p, slice_bytes, location, split) || !read_planar(out, p.surface, nv12)) { ++failed; break; }
+    if (!decode_picture(dec, views[p.surface], &p, slice_bytes, location, split) || !read_planar(outs[p.surface], separate ? 0 : p.surface, nv12)) { ++failed; break; }
     /* (the visible picture as I420) */
     BYTE *f = malloc(frame_bytes);
     for (UINT y = 0; y < vh; ++y) memcpy(f + (size_t)y * vw, nv12 + (size_t)(s.crop_top + y) * s.width + s.crop_left, vw);
@@ -811,8 +820,9 @@ static void decode_stream(const char *name, int codec, const GUID *profile, cons
     ++n;
     r = dxva_stream_next(&s, &p);
   }
-  checkf(!failed && r == 0, "%s: %u pictures decoded through ID3D11VideoContext%s (%s)", name, n,
+  checkf(!failed && r == 0, "%s: %u pictures decoded through ID3D11VideoContext%s%s (%s)", name, n,
          split == 2 ? "3 (DecoderBeginFrame1, SubmitDecoderBuffers2)" : split ? ", the slices of a picture in two SubmitDecoderBuffers calls" : "",
+         separate ? ", each surface index a texture of its own" : "",
          s.error ? s.error : "to the end of the stream");
   qsort(decoded, n, sizeof *decoded, by_key);
   if (hashes) {
@@ -860,6 +870,7 @@ static void decode_stream(const char *name, int codec, const GUID *profile, cons
   free(decoded);
   free(nv12);
   for (unsigned i = 0; i < surfaces; ++i) if (views[i]) ID3D11VideoDecoderOutputView_Release(views[i]);
+  for (unsigned i = 1; separate && i < surfaces; ++i) if (outs[i]) ID3D11Texture2D_Release(outs[i]);
   if (out) ID3D11Texture2D_Release(out);
   if (dec) ID3D11VideoDecoder_Release(dec);
   dxva_stream_close(&s);
@@ -1310,11 +1321,14 @@ int main(void) {
     if (make_scene()) {
       test_planar_views();
       test_decoder_caps();
-      decode_stream("h264_bframes", DXVA_CODEC_H264, &D3D11_DECODER_PROFILE_H264_VLD_NOFGT, g_h264_bframes_b64, 17, g_h264_bframes_fnv, 14, NULL, 0);
-      decode_stream("h264_cavlc", DXVA_CODEC_H264, &D3D11_DECODER_PROFILE_H264_VLD_NOFGT, g_h264_cavlc_b64, 17, g_h264_cavlc_fnv, 10, NULL, 1);
-      decode_stream("h264_ltr", DXVA_CODEC_H264, &D3D11_DECODER_PROFILE_H264_VLD_NOFGT, g_h264_ltr_b64, 20, g_h264_ltr_fnv, 24, NULL, 0);
-      decode_stream("h264_cqm", DXVA_CODEC_H264, &D3D11_DECODER_PROFILE_H264_VLD_NOFGT, g_h264_cqm_b64, 17, g_h264_cqm_fnv, 9, NULL, 2);
-      decode_stream("mpeg2_ibp", DXVA_CODEC_MPEG2, &D3D11_DECODER_PROFILE_MPEG2_VLD, g_mpeg2_ibp_b64, 8, NULL, 8, g_mpeg2_ibp_means, 1);
+      decode_stream("h264_bframes", DXVA_CODEC_H264, &D3D11_DECODER_PROFILE_H264_VLD_NOFGT, g_h264_bframes_b64, 17, g_h264_bframes_fnv, 14, NULL, 0, 0);
+      decode_stream("h264_cavlc", DXVA_CODEC_H264, &D3D11_DECODER_PROFILE_H264_VLD_NOFGT, g_h264_cavlc_b64, 17, g_h264_cavlc_fnv, 10, NULL, 1, 0);
+      decode_stream("h264_ltr", DXVA_CODEC_H264, &D3D11_DECODER_PROFILE_H264_VLD_NOFGT, g_h264_ltr_b64, 20, g_h264_ltr_fnv, 24, NULL, 0, 0);
+      decode_stream("h264_ltr (separate textures)", DXVA_CODEC_H264, &D3D11_DECODER_PROFILE_H264_VLD_NOFGT, g_h264_ltr_b64, 20, g_h264_ltr_fnv, 24, NULL, 0, 1);
+      decode_stream("h264_bframes (separate textures)", DXVA_CODEC_H264, &D3D11_DECODER_PROFILE_H264_VLD_NOFGT, g_h264_bframes_b64, 17, g_h264_bframes_fnv, 14, NULL, 0, 1);
+      decode_stream("h264_cqm", DXVA_CODEC_H264, &D3D11_DECODER_PROFILE_H264_VLD_NOFGT, g_h264_cqm_b64, 17, g_h264_cqm_fnv, 9, NULL, 2, 0);
+      decode_stream("mpeg2_ibp", DXVA_CODEC_MPEG2, &D3D11_DECODER_PROFILE_MPEG2_VLD, g_mpeg2_ibp_b64, 8, NULL, 8, g_mpeg2_ibp_means, 1, 0);
+      decode_stream("mpeg2_ibp (separate textures)", DXVA_CODEC_MPEG2, &D3D11_DECODER_PROFILE_MPEG2_VLD, g_mpeg2_ibp_b64, 8, NULL, 8, g_mpeg2_ibp_means, 0, 1);
       test_decode_then_draw();
       test_processor();
     }

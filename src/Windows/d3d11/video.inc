@@ -23,9 +23,11 @@
  * Decoding. A decoder is a Direct3D 12 decoder and decoder heap (the heap is the kernel's decoder, which keeps the pictures the stream refers to). GetDecoderBuffer hands
  * out memory of the decoder's for each DXVA buffer type; SubmitDecoderBuffers gathers what the program put there (the slices of several calls one after the other, the
  * slice controls' offsets moved with them); DecoderEndFrame sends the picture as one DecodeFrame on a VIDEO_DECODE queue of the device's, after what the immediate context
- * recorded (the list is sent first, and the queue runs the decode before it returns), so draws and copies before and after see the textures in order. The DXVA surface
- * indices of the parameters are the array slices of the texture the output view is of (as ffmpeg's d3d11va and Media Foundation give them): the reference list is every
- * slice of that texture, so index n is slice n. The status of each picture (DecoderExtension, DXVA_STATUS_REPORTING_FUNCTION) comes from Direct3D 12's decode statistics.
+ * recorded (the list is sent first, and the queue runs the decode before it returns), so draws and copies before and after see the textures in order. A DXVA surface
+ * index of the parameters names the picture decoded into an output view (a texture and its slice): the decoder keeps, for each index, the subresource the picture whose
+ * current-picture index (CurrPic, wDecodedPictureIndex, CurrPicTextureIndex) it was went into, so the pictures of a stream may be in the slices of one array texture
+ * (index n slice n, as ffmpeg's d3d11va gives them; an array's slices start out as those indices) or in textures of their own (one index each, as the program numbers
+ * them). The status of each picture (DecoderExtension, DXVA_STATUS_REPORTING_FUNCTION) comes from Direct3D 12's decode statistics.
  * Profiles: what Direct3D 12 below decodes (H.264, MPEG-2, MPEG-1/2, VP9 profile 0 and 10-bit profile 2, HEVC Main, AV1 profile 0); all are VLD (bitstream) decoders, so
  * the buffers of the older acceleration modes (macroblock control, residual difference, deblocking, motion vectors, film grain) are not taken.
  *
@@ -40,7 +42,7 @@
  * cannot be made (see video_crypto_*): the context's methods that take one have nothing valid to be given. */
 
 #define VIDEO_STREAMS 16u            /* the video processor's input streams (Direct3D 12's and the kernel's limit) */
-#define VIDEO_SURFACES 128u          /* the slices of a decoder's output texture its pictures may name (the kernel's kMaxVideoDecodeSurfaces) */
+#define VIDEO_SURFACES 128u          /* the DXVA surface indices a decoder's pictures may name (the kernel's kMaxVideoDecodeSurfaces) */
 #define VIDEO_STATUS_KEPT 64u        /* the status reports of decoded pictures kept until DecoderExtension takes them */
 #define VIDEO_BUFFER_TYPES 9u        /* D3D11_VIDEO_DECODER_BUFFER_TYPE: PICTURE_PARAMETERS .. FILM_GRAIN */
 #define VIDEO_PROCESSOR_CACHE 4u     /* Direct3D 12 processors a Direct3D 11 one keeps */
@@ -211,6 +213,8 @@ typedef struct VideoDecoder {
   BOOL have_bits;
   VideoStatus status[VIDEO_STATUS_KEPT];  /* the newest last */
   UINT status_count;
+  /* What each DXVA surface index names: the texture (a reference of the runtime's: hold) and slice the picture of that current-picture index was decoded into (NULL: none) */
+  struct { Tex *tex; UINT slice; } surfaces[VIDEO_SURFACES];
 } VideoDecoder;
 
 typedef struct VideoEnum { Child c; D3D11_VIDEO_PROCESSOR_CONTENT_DESC desc; } VideoEnum;
@@ -554,6 +558,7 @@ static void vdec_frame_clear(VideoDecoder *v) {
 static void vdec_destroy(DxObj *o) {
   VideoDecoder *v = (VideoDecoder *)o;
   vdec_frame_clear(v);
+  for (UINT i = 0; i < VIDEO_SURFACES; ++i) unhold(v->surfaces[i].tex);
   for (UINT i = 0; i < VIDEO_BUFFER_TYPES; ++i) mem_free(v->buffers[i]);
   bytes_free(&v->picture);
   bytes_free(&v->matrix);
@@ -601,7 +606,7 @@ static HRESULT STDMETHODCALLTYPE vdev_CreateVideoDecoder(ID3D11VideoDevice2 *p, 
       hd.DecodeHeight = desc->SampleHeight;
       hd.Format = desc->OutputFormat;
       hd.FrameRate.Denominator = 1;
-      hd.MaxDecodePictureBufferCount = VIDEO_SURFACES - 1;      /* (every slice of an output texture may be a reference: see video.inc's head) */
+      hd.MaxDecodePictureBufferCount = VIDEO_SURFACES - 1;      /* (every surface index but the current picture's may be a reference: see video.inc's head) */
       hr = ID3D12VideoDevice_CreateVideoDecoderHeap(vs->v12, &hd, &IID_ID3D12VideoDecoderHeap, (void **)&v->heap12);
     }
   }
@@ -1142,8 +1147,32 @@ static void vdec_status_push(VideoDecoder *v, const D3D12_QUERY_DATA_VIDEO_DECOD
   if (v->status_count == VIDEO_STATUS_KEPT) { memmove(v->status, v->status + 1, sizeof v->status[0] * (VIDEO_STATUS_KEPT - 1)); --v->status_count; }
   v->status[v->status_count++] = s;
 }
-/* Sends the picture: one DecodeFrame of the gathered buffers into the output view's slice, the references every slice of its texture (the DXVA indices are the slices),
- * after what the immediate context recorded. A picture that could not be decoded is in its status report; one that was not described (no picture parameters or no
+/* The surface index the picture parameters give the current picture (the codec's CurrPic: seven bits of a DXVA_PicEntry for H.264, HEVC and VP9, the 16-bit
+ * wDecodedPictureIndex of MPEG-2, the byte CurrPicTextureIndex of AV1); VIDEO_SURFACES when the parameters are too short or the index is out of range. */
+static UINT vdec_current_index(const VideoDecoder *v) {
+  const VideoCodec *k = v->codec;
+  const BYTE *pp = v->picture.data;
+  UINT index = VIDEO_SURFACES;
+  if (k->status == VSTATUS_NONE) {
+    if (v->picture.size >= k->pp_curr + 2) index = (UINT)pp[k->pp_curr] | (UINT)pp[k->pp_curr + 1] << 8;
+  } else if (v->picture.size > k->pp_curr) {
+    index = k->status == VSTATUS_AV1 ? pp[k->pp_curr] : pp[k->pp_curr] & 0x7Fu;
+  }
+  return index < VIDEO_SURFACES ? index : VIDEO_SURFACES;
+}
+/* Points surface index `index` at a subresource (dropping what it named; any other index that named the same subresource forgets it: that picture is gone). */
+static void vdec_surface_set(VideoDecoder *v, UINT index, Tex *t, UINT slice) {
+  for (UINT i = 0; i < VIDEO_SURFACES; ++i)
+    if (i != index && v->surfaces[i].tex == t && v->surfaces[i].slice == slice) { unhold(v->surfaces[i].tex); v->surfaces[i].tex = NULL; }
+  if (v->surfaces[index].tex == t && v->surfaces[index].slice == slice) return;
+  hold(t);
+  unhold(v->surfaces[index].tex);
+  v->surfaces[index].tex = t;
+  v->surfaces[index].slice = slice;
+}
+/* Sends the picture: one DecodeFrame of the gathered buffers into the output view's slice, the references the subresources the surface indices name (the current
+ * picture's index is the output's from now on; an array texture's slices are the indices of their numbers that name nothing yet), after what the immediate context
+ * recorded. A picture that could not be decoded is in its status report; one that was not described (no picture parameters or no
  * bitstream) is E_INVALIDARG. */
 static HRESULT STDMETHODCALLTYPE vctx_DecoderEndFrame(ID3D11VideoContext3 *p, ID3D11VideoDecoder *decoder) {
   Ctx *c = ctx_of_video(p);
@@ -1176,7 +1205,17 @@ static HRESULT STDMETHODCALLTYPE vctx_DecoderEndFrame(ID3D11VideoContext3 *p, ID
     ID3D12VideoDecodeCommandList *list = (ID3D12VideoDecodeCommandList *)vs->decode.list;
     ID3D12Resource *refs[VIDEO_SURFACES];
     UINT subs[VIDEO_SURFACES];
-    for (UINT i = 0; i < t->desc.ArraySize; ++i) { refs[i] = t->res; subs[i] = i; }
+    if (t->desc.ArraySize > 1)
+      for (UINT i = 0; i < t->desc.ArraySize && i < VIDEO_SURFACES; ++i)
+        if (!v->surfaces[i].tex) vdec_surface_set(v, i, t, i);
+    const UINT current = vdec_current_index(v);
+    if (current < VIDEO_SURFACES) vdec_surface_set(v, current, t, v->output->slice);
+    UINT nrefs = 0;
+    for (UINT i = 0; i < VIDEO_SURFACES; ++i) {
+      refs[i] = v->surfaces[i].tex ? v->surfaces[i].tex->res : NULL;
+      subs[i] = v->surfaces[i].tex ? v->surfaces[i].slice : 0;
+      if (refs[i]) nrefs = i + 1;
+    }
     D3D12_VIDEO_DECODE_INPUT_STREAM_ARGUMENTS in;
     memset(&in, 0, sizeof in);
     in.FrameArguments[in.NumFrameArguments++] = (D3D12_VIDEO_DECODE_FRAME_ARGUMENT){D3D12_VIDEO_DECODE_ARGUMENT_TYPE_PICTURE_PARAMETERS, (UINT)v->picture.size, v->picture.data};
@@ -1184,7 +1223,7 @@ static HRESULT STDMETHODCALLTYPE vctx_DecoderEndFrame(ID3D11VideoContext3 *p, ID
       in.FrameArguments[in.NumFrameArguments++] = (D3D12_VIDEO_DECODE_FRAME_ARGUMENT){D3D12_VIDEO_DECODE_ARGUMENT_TYPE_INVERSE_QUANTIZATION_MATRIX, (UINT)v->matrix.size, v->matrix.data};
     if (v->slices.size)
       in.FrameArguments[in.NumFrameArguments++] = (D3D12_VIDEO_DECODE_FRAME_ARGUMENT){D3D12_VIDEO_DECODE_ARGUMENT_TYPE_SLICE_CONTROL, (UINT)v->slices.size, v->slices.data};
-    in.ReferenceFrames.NumTexture2Ds = t->desc.ArraySize;
+    in.ReferenceFrames.NumTexture2Ds = nrefs;
     in.ReferenceFrames.ppTexture2Ds = refs;
     in.ReferenceFrames.pSubresources = subs;
     in.CompressedBitstream.pBuffer = upload;

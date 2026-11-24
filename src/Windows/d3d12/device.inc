@@ -100,30 +100,35 @@ static HRESULT open_shared(Dev *This, UINT64 handle, int mode, IUnknown **out) {
   if ((UINT)st == 0xC0000023u) return E_INVALIDARG;      /* (runtime data of another runtime's: bigger than ours) */
   if (!KMT_OK(st)) return (UINT)st == 0xC0000008u ? E_INVALIDARG : hr_from(st);
   ShareDesc sd;
-  /* (one allocation and our description: a resource another Direct3D runtime made would be laid out otherwise) */
-  if (allocations != 1 || !share_desc_read(runtime, runtime_size, &sd) || total > 4096 || resource_driver > 4096) return E_INVALIDARG;
+  /* (our description, and the allocations it says there are: one, or two for each slice of a planar texture - its planes; a resource another Direct3D runtime made
+   * would be laid out otherwise) */
+  if (!share_desc_read(runtime, runtime_size, &sd) || total > 4096 * KMT_MAX_RESOURCE_ALLOCATIONS || resource_driver > 4096) return E_INVALIDARG;
+  const FormatInfo *sfi = sd.kind == 0 && sd.desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER ? format_info(sd.desc.Format) : NULL;
+  const UINT expected = sfi && sfi->planar ? 2u * (sd.desc.DepthOrArraySize ? sd.desc.DepthOrArraySize : 1u) : 1u;
+  if (allocations != expected || expected > KMT_MAX_RESOURCE_ALLOCATIONS) return E_INVALIDARG;
   BYTE *driver = mem_alloc(total ? total : 1), *resource_data = mem_alloc(resource_driver ? resource_driver : 1);
-  if (!driver || !resource_data) { mem_free(driver); mem_free(resource_data); return E_OUTOFMEMORY; }
-  UINT allocation = 0, kresource = 0;
-  const BYTE *allocation_data = driver;
-  if (global) {
-    void *at = NULL;
-    st = kmt_open_resource_global(This->kdev, (UINT)handle, runtime, runtime_size, driver, total, &allocation, &kresource, &at);
-    /* (the allocation's data follows the resource's in the buffer: where the kernel says it put it) */
-    if (KMT_OK(st)) allocation_data = (const BYTE *)at && (const BYTE *)at >= driver && (const BYTE *)at <= driver + total ? (const BYTE *)at : driver;
-  } else {
-    st = kmt_open_resource_nt(This->kdev, handle, runtime, runtime_size, resource_data, resource_driver, driver, total, &allocation, &kresource);
-  }
+  UINT *opened = mem_alloc(sizeof(UINT) * expected);
+  void **datas = mem_alloc(sizeof(void *) * expected);
+  if (!driver || !resource_data || !opened || !datas) { mem_free(driver); mem_free(resource_data); mem_free(opened); mem_free(datas); return E_OUTOFMEMORY; }
+  UINT kresource = 0;
+  if (global) st = kmt_open_resource_global_n(This->kdev, (UINT)handle, runtime, runtime_size, driver, total, expected, opened, datas, &kresource);
+  else st = kmt_open_resource_nt_n(This->kdev, handle, runtime, runtime_size, resource_data, resource_driver, driver, total, expected, opened, datas, &kresource);
+  /* (the backing of all of them: each allocation's data, where the kernel says it put it in the buffer, has its bytes) */
   UINT64 bytes = 0;
-  if (KMT_OK(st) && (SIZE_T)(driver + total - allocation_data) >= KAW_WORDS * 4) {
+  for (UINT i = 0; KMT_OK(st) && i < expected; ++i) {
+    const BYTE *at = datas[i];
+    if (!at || at < driver || at > driver + total || (SIZE_T)(driver + total - at) < KAW_WORDS * 4) continue;
     UINT words[KAW_WORDS];
-    memcpy(words, allocation_data, sizeof words);
-    bytes = words[KAW_BYTES_LO] | ((UINT64)words[KAW_BYTES_HI] << 32);
+    memcpy(words, at, sizeof words);
+    bytes += words[KAW_BYTES_LO] | ((UINT64)words[KAW_BYTES_HI] << 32);
   }
   mem_free(driver);
   mem_free(resource_data);
-  if (!KMT_OK(st)) return (UINT)st == 0xC0000008u ? E_INVALIDARG : hr_from(st);
+  mem_free(datas);
+  if (!KMT_OK(st)) { mem_free(opened); return (UINT)st == 0xC0000008u ? E_INVALIDARG : hr_from(st); }
+  const UINT allocation = opened[0];
   if (sd.kind == 1) {
+    mem_free(opened);
     HeapObj *h = dobj_new(sizeof *h, This, &heap_vtbl, g_heap_iids, heap_destroy);
     if (!h) { kmt_destroy_allocation(This->kdev, allocation); return E_OUTOFMEMORY; }
     memset(&h->desc, 0, sizeof h->desc);
@@ -136,11 +141,16 @@ static HRESULT open_shared(Dev *This, UINT64 handle, int mode, IUnknown **out) {
     *out = (IUnknown *)h;
     return S_OK;
   }
-  ResourceSource source = {allocation, kresource, bytes};
+  ResourceSource source = {allocation, kresource, bytes, opened, expected};
   if (sd.cube) This->next_resource_flags = TCOS_RESOURCE_CUBE;
   Resource *r = NULL;
   const HRESULT hr = resource_make_from(This, &sd.props, sd.flags, &sd.desc, NULL, 0, 0, &source, &r);
-  if (FAILED(hr)) { kmt_destroy_allocation(This->kdev, allocation); return hr; }      /* (a description this device cannot make: the opened allocation goes) */
+  if (FAILED(hr)) {
+    for (UINT i = 0; i < expected; ++i) kmt_destroy_allocation(This->kdev, opened[i]);      /* (a description this device cannot make: the opened allocations go) */
+    mem_free(opened);
+    return hr;
+  }
+  mem_free(opened);
   memcpy(r->share_extra, sd.extra, sd.extra_size);
   r->share_extra_size = sd.extra_size;
   if (global) r->global_share = (UINT)handle;      /* (what GetSharedHandle of the runtime above answers for it) */

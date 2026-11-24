@@ -850,6 +850,213 @@ static void test_legacy(D12 *a) {
 }
 
 /* ---- two processes ------------------------------------------------------------------------------------------------------------------------------------------------ */
+/* ---- NV12 textures: every plane of every slice goes with the share ------------------------------------------------------------------------------------------- */
+
+#define NV12_W 16
+#define NV12_H 8
+/* The byte of plane `plane` (0 the luma, 1 the interleaved chroma) of a slice at (x, y) - x counts bytes - of pattern `seed`. */
+static BYTE nv12_byte(UINT seed, UINT slice, UINT plane, UINT x, UINT y) { return (BYTE)(seed * 37u + slice * 101u + plane * 53u + x * 7u + y * 13u); }
+/* Pattern `seed` into every plane of every slice of an NV12 texture of Direct3D 12, through an upload buffer laid out as GetCopyableFootprints says. */
+static void d12_write_nv12(D12 *d, ID3D12Resource *tex, UINT layers, UINT seed) {
+  const D3D12_RESOURCE_DESC rd = ID3D12Resource_GetDesc(tex);
+  D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp[8];
+  UINT rows[8];
+  UINT64 row_bytes[8], total = 0;
+  ID3D12Device_GetCopyableFootprints(d->dev, &rd, 0, 2 * layers, 0, fp, rows, row_bytes, &total);
+  ID3D12Resource *up = buffer(d->dev, D3D12_HEAP_TYPE_UPLOAD, D3D12_HEAP_FLAG_NONE, total, D3D12_RESOURCE_STATE_GENERIC_READ);
+  BYTE *p = NULL;
+  if (!up || FAILED(ID3D12Resource_Map(up, 0, NULL, (void **)&p)) || !p) { CHECK(0); if (up) ID3D12Resource_Release(up); return; }
+  for (UINT sub = 0; sub < 2 * layers; ++sub)
+    for (UINT y = 0; y < rows[sub]; ++y)
+      for (UINT x = 0; x < row_bytes[sub]; ++x) p[fp[sub].Offset + (UINT64)y * fp[sub].Footprint.RowPitch + x] = nv12_byte(seed, sub % layers, sub / layers, x, y);
+  ID3D12Resource_Unmap(up, 0, NULL);
+  for (UINT sub = 0; sub < 2 * layers; ++sub) {
+    D3D12_TEXTURE_COPY_LOCATION to = {tex, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, {0}}, from = {up, D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, {0}};
+    to.SubresourceIndex = sub;
+    from.PlacedFootprint = fp[sub];
+    ID3D12GraphicsCommandList_CopyTextureRegion(d->list, &to, 0, 0, 0, &from, NULL);
+  }
+  d12_run(d);
+  ID3D12Resource_Release(up);
+}
+/* Whether every plane of every slice of an NV12 texture of Direct3D 12 holds pattern `seed` (slice `except` - when below `layers` - pattern `except_seed`). */
+static int d12_nv12_is(D12 *d, ID3D12Resource *tex, UINT layers, UINT seed, UINT except, UINT except_seed) {
+  const D3D12_RESOURCE_DESC rd = ID3D12Resource_GetDesc(tex);
+  D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp[8];
+  UINT rows[8];
+  UINT64 row_bytes[8], total = 0;
+  ID3D12Device_GetCopyableFootprints(d->dev, &rd, 0, 2 * layers, 0, fp, rows, row_bytes, &total);
+  ID3D12Resource *down = buffer(d->dev, D3D12_HEAP_TYPE_READBACK, D3D12_HEAP_FLAG_NONE, total, D3D12_RESOURCE_STATE_COPY_DEST);
+  if (!down) return 0;
+  for (UINT sub = 0; sub < 2 * layers; ++sub) {
+    D3D12_TEXTURE_COPY_LOCATION to = {down, D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, {0}}, from = {tex, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, {0}};
+    to.PlacedFootprint = fp[sub];
+    from.SubresourceIndex = sub;
+    ID3D12GraphicsCommandList_CopyTextureRegion(d->list, &to, 0, 0, 0, &from, NULL);
+  }
+  d12_run(d);
+  const BYTE *p = NULL;
+  int same = 1;
+  if (FAILED(ID3D12Resource_Map(down, 0, NULL, (void **)&p)) || !p) same = 0;
+  for (UINT sub = 0; same && sub < 2 * layers; ++sub)
+    for (UINT y = 0; same && y < rows[sub]; ++y)
+      for (UINT x = 0; same && x < row_bytes[sub]; ++x) {
+        const UINT slice = sub % layers, plane = sub / layers;
+        const BYTE want = nv12_byte(slice == except ? except_seed : seed, slice, plane, x, y), got = p[fp[sub].Offset + (UINT64)y * fp[sub].Footprint.RowPitch + x];
+        if (got != want) { printf("  NV12 slice %u plane %u (%u, %u): %u, want %u\n", slice, plane, x, y, got, want); same = 0; }
+      }
+  if (p) ID3D12Resource_Unmap(down, 0, NULL);
+  ID3D12Resource_Release(down);
+  return same;
+}
+/* The same through Direct3D 11: each slice copied into a staging NV12 texture and mapped (the luma rows, then the chroma rows). */
+static int d11_nv12_is(ID3D11Device *dev, ID3D11DeviceContext *ctx, ID3D11Texture2D *tex, UINT layers, UINT seed, UINT except, UINT except_seed) {
+  D3D11_TEXTURE2D_DESC sd = {NV12_W, NV12_H, 1, 1, DXGI_FORMAT_NV12, {1, 0}, D3D11_USAGE_STAGING, 0, D3D11_CPU_ACCESS_READ, 0};
+  ID3D11Texture2D *staging = NULL;
+  if (FAILED(ID3D11Device_CreateTexture2D(dev, &sd, NULL, &staging)) || !staging) return 0;
+  int same = 1;
+  for (UINT slice = 0; same && slice < layers; ++slice) {
+    ID3D11DeviceContext_CopySubresourceRegion(ctx, (ID3D11Resource *)staging, 0, 0, 0, 0, (ID3D11Resource *)tex, slice, NULL);
+    D3D11_MAPPED_SUBRESOURCE m;
+    if (FAILED(ID3D11DeviceContext_Map(ctx, (ID3D11Resource *)staging, 0, D3D11_MAP_READ, 0, &m)) || !m.pData) { same = 0; break; }
+    for (UINT y = 0; same && y < NV12_H * 3 / 2; ++y)
+      for (UINT x = 0; same && x < NV12_W; ++x) {
+        const UINT plane = y >= NV12_H, row = plane ? y - NV12_H : y;
+        const BYTE want = nv12_byte(slice == except ? except_seed : seed, slice, plane, x, row), got = ((const BYTE *)m.pData)[(SIZE_T)y * m.RowPitch + x];
+        if (got != want) { printf("  NV12 (Direct3D 11) slice %u plane %u (%u, %u): %u, want %u\n", slice, plane, x, row, got, want); same = 0; }
+      }
+    ID3D11DeviceContext_Unmap(ctx, (ID3D11Resource *)staging, 0);
+  }
+  ID3D11Texture2D_Release(staging);
+  return same;
+}
+/* Pattern `seed` into slice `slice` of a Direct3D 11 NV12 texture, by UpdateSubresource of the slice (its luma rows, then its chroma rows). */
+static void d11_write_nv12_slice(ID3D11DeviceContext *ctx, ID3D11Texture2D *tex, UINT slice, UINT seed) {
+  BYTE data[NV12_W * NV12_H * 3 / 2];
+  for (UINT y = 0; y < NV12_H * 3 / 2; ++y)
+    for (UINT x = 0; x < NV12_W; ++x) data[y * NV12_W + x] = nv12_byte(seed, slice, y >= NV12_H, x, y >= NV12_H ? y - NV12_H : y);
+  ID3D11DeviceContext_UpdateSubresource(ctx, (ID3D11Resource *)tex, slice, NULL, data, NV12_W, 0);
+  ID3D11DeviceContext_Flush(ctx);
+}
+static ID3D11Texture2D *nv12_texture(ID3D11Device *dev, UINT layers, UINT misc) {
+  D3D11_TEXTURE2D_DESC td = {NV12_W, NV12_H, 1, layers, DXGI_FORMAT_NV12, {1, 0}, D3D11_USAGE_DEFAULT, D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET, 0, misc};
+  ID3D11Texture2D *tex = NULL;
+  CHECK_HR(ID3D11Device_CreateTexture2D(dev, &td, NULL, &tex));
+  return tex;
+}
+
+static void test_nv12(D12 *a, D12 *b) {
+  ID3D11Device *x = NULL, *y = NULL;
+  ID3D11DeviceContext *cx = NULL, *cy = NULL;
+  CHECK_HR(D3D11CreateDevice(NULL, D3D_DRIVER_TYPE_HARDWARE, NULL, 0, NULL, 0, D3D11_SDK_VERSION, &x, NULL, &cx));
+  CHECK_HR(D3D11CreateDevice(NULL, D3D_DRIVER_TYPE_HARDWARE, NULL, 0, NULL, 0, D3D11_SDK_VERSION, &y, NULL, &cy));
+  if (!x || !y) return;
+  ID3D11Device1 *y1 = NULL;
+  CHECK_HR(ID3D11Device_QueryInterface(y, &IID_ID3D11Device1, (void **)&y1));
+  /* Direct3D 11's NV12 array (NT handle) opened by Direct3D 12: the description, then what each writes the other reads, plane by plane and slice by slice */
+  ID3D11Texture2D *tex = nv12_texture(x, 2, D3D11_RESOURCE_MISC_SHARED | D3D11_RESOURCE_MISC_SHARED_NTHANDLE);
+  HANDLE handle = NULL;
+  if (tex) {
+    d11_write_nv12_slice(cx, tex, 0, 3);
+    d11_write_nv12_slice(cx, tex, 1, 3);
+    IDXGIResource1 *dres = NULL;
+    CHECK_HR(ID3D11Texture2D_QueryInterface(tex, &IID_IDXGIResource1, (void **)&dres));
+    if (dres) { CHECK_HR(IDXGIResource1_CreateSharedHandle(dres, NULL, DXGI_SHARED_RESOURCE_READ | DXGI_SHARED_RESOURCE_WRITE, L"TcosShareTestNV12", &handle)); IDXGIResource1_Release(dres); }
+  }
+  ID3D12Resource *as12 = NULL;
+  if (handle) CHECK_HR(ID3D12Device_OpenSharedHandle(a->dev, handle, &IID_ID3D12Resource, (void **)&as12));
+  if (as12) {
+    const D3D12_RESOURCE_DESC rd = ID3D12Resource_GetDesc(as12);
+    CHECK(rd.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && rd.Width == NV12_W && rd.Height == NV12_H && rd.DepthOrArraySize == 2 && rd.Format == DXGI_FORMAT_NV12 &&
+          rd.MipLevels == 1);
+    CHECK(d12_nv12_is(a, as12, 2, 3, 2, 0));                  /* (Direct3D 11's bytes in both planes of both slices) */
+    d12_write_nv12(a, as12, 2, 4);
+    CHECK(d11_nv12_is(x, cx, tex, 2, 4, 2, 0));               /* (and Direct3D 12's in Direct3D 11's texture) */
+  }
+  /* ... by another Direct3D 11 device (by handle and by name), which writes one slice */
+  ID3D11Texture2D *opened = NULL, *by_name = NULL;
+  if (y1 && handle) CHECK_HR(ID3D11Device1_OpenSharedResource1(y1, handle, &IID_ID3D11Texture2D, (void **)&opened));
+  if (y1) CHECK_HR(ID3D11Device1_OpenSharedResourceByName(y1, L"TcosShareTestNV12", DXGI_SHARED_RESOURCE_READ, &IID_ID3D11Texture2D, (void **)&by_name));
+  if (opened) {
+    D3D11_TEXTURE2D_DESC got;
+    ID3D11Texture2D_GetDesc(opened, &got);
+    CHECK(got.Format == DXGI_FORMAT_NV12 && got.ArraySize == 2 && got.Width == NV12_W && got.MiscFlags == (D3D11_RESOURCE_MISC_SHARED | D3D11_RESOURCE_MISC_SHARED_NTHANDLE));
+    CHECK(d11_nv12_is(y, cy, opened, 2, 4, 2, 0));
+    d11_write_nv12_slice(cy, opened, 1, 5);
+    if (as12) CHECK(d12_nv12_is(a, as12, 2, 4, 1, 5));      /* (slice 1 is the second device's, slice 0 still Direct3D 12's) */
+    CHECK(d11_nv12_is(x, cx, tex, 2, 4, 1, 5));
+  }
+  if (by_name) { CHECK(d11_nv12_is(y, cy, by_name, 2, 4, 1, 5)); ID3D11Texture2D_Release(by_name); }
+  /* Direct3D 12's NV12 texture (HEAP_FLAG_SHARED) opened by Direct3D 11 and by a second Direct3D 12 device */
+  D3D12_HEAP_PROPERTIES hp = {D3D12_HEAP_TYPE_DEFAULT, D3D12_CPU_PAGE_PROPERTY_UNKNOWN, D3D12_MEMORY_POOL_UNKNOWN, 1, 1};
+  D3D12_RESOURCE_DESC td = {D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, NV12_W, NV12_H, 1, 1, DXGI_FORMAT_NV12, {1, 0}, D3D12_TEXTURE_LAYOUT_UNKNOWN, D3D12_RESOURCE_FLAG_NONE};
+  ID3D12Resource *made12 = NULL, *made12_b = NULL;
+  CHECK_HR(ID3D12Device_CreateCommittedResource(a->dev, &hp, D3D12_HEAP_FLAG_SHARED, &td, D3D12_RESOURCE_STATE_COMMON, NULL, &IID_ID3D12Resource, (void **)&made12));
+  HANDLE h12 = NULL;
+  if (made12) {
+    d12_write_nv12(a, made12, 1, 6);
+    CHECK_HR(ID3D12Device_CreateSharedHandle(a->dev, (ID3D12DeviceChild *)made12, NULL, GENERIC_ALL, NULL, &h12));
+  }
+  if (h12) {
+    CHECK_HR(ID3D12Device_OpenSharedHandle(b->dev, h12, &IID_ID3D12Resource, (void **)&made12_b));
+    if (made12_b) { CHECK(d12_nv12_is(b, made12_b, 1, 6, 1, 0)); ID3D12Resource_Release(made12_b); }
+    ID3D11Texture2D *as11 = NULL;
+    if (y1) CHECK_HR(ID3D11Device1_OpenSharedResource1(y1, h12, &IID_ID3D11Texture2D, (void **)&as11));
+    if (as11) {
+      D3D11_TEXTURE2D_DESC got;
+      ID3D11Texture2D_GetDesc(as11, &got);
+      CHECK(got.Format == DXGI_FORMAT_NV12 && got.ArraySize == 1 && got.Width == NV12_W && got.Height == NV12_H);
+      CHECK(d11_nv12_is(y, cy, as11, 1, 6, 1, 0));
+      ID3D11Texture2D_Release(as11);
+    }
+    CloseHandle(h12);
+  }
+  /* A legacy (global) share of an NV12 texture, opened by Direct3D 11 and by Direct3D 12 */
+  ID3D11Texture2D *legacy = nv12_texture(x, 1, D3D11_RESOURCE_MISC_SHARED);
+  if (legacy) {
+    d11_write_nv12_slice(cx, legacy, 0, 7);
+    HANDLE hl = legacy_handle(legacy);
+    ID3D11Texture2D *legacy_y = NULL;
+    ID3D12Resource *legacy12 = NULL;
+    if (hl) CHECK_HR(ID3D11Device_OpenSharedResource(y, hl, &IID_ID3D11Texture2D, (void **)&legacy_y));
+    if (legacy_y) { CHECK(d11_nv12_is(y, cy, legacy_y, 1, 7, 1, 0)); ID3D11Texture2D_Release(legacy_y); }
+    if (hl) CHECK_HR(ID3D12Device_OpenSharedHandle(b->dev, hl, &IID_ID3D12Resource, (void **)&legacy12));
+    if (legacy12) { CHECK(d12_nv12_is(b, legacy12, 1, 7, 1, 0)); ID3D12Resource_Release(legacy12); }
+    ID3D11Texture2D_Release(legacy);
+  }
+  /* ... and one with a keyed mutex (SHARED_KEYEDMUTEX, a legacy handle): the opener's mutex is the creator's */
+  ID3D11Texture2D *keyed = nv12_texture(x, 1, D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX);
+  if (keyed) {
+    IDXGIKeyedMutex *km = mutex_of(keyed), *km_y = NULL;
+    HANDLE hk = legacy_handle(keyed);
+    ID3D11Texture2D *keyed_y = NULL;
+    if (km) { CHECK(IDXGIKeyedMutex_AcquireSync(km, 0, 0) == S_OK); }
+    d11_write_nv12_slice(cx, keyed, 0, 8);
+    if (km) CHECK(IDXGIKeyedMutex_ReleaseSync(km, 1) == S_OK);
+    if (hk) CHECK_HR(ID3D11Device_OpenSharedResource(y, hk, &IID_ID3D11Texture2D, (void **)&keyed_y));
+    if (keyed_y) km_y = mutex_of(keyed_y);
+    if (km_y) {
+      CHECK(IDXGIKeyedMutex_AcquireSync(km_y, 1, 10000) == S_OK);
+      CHECK(d11_nv12_is(y, cy, keyed_y, 1, 8, 1, 0));
+      CHECK(IDXGIKeyedMutex_ReleaseSync(km_y, 0) == S_OK);
+      IDXGIKeyedMutex_Release(km_y);
+    }
+    if (keyed_y) ID3D11Texture2D_Release(keyed_y);
+    if (km) IDXGIKeyedMutex_Release(km);
+    ID3D11Texture2D_Release(keyed);
+  }
+  if (made12) ID3D12Resource_Release(made12);
+  if (opened) ID3D11Texture2D_Release(opened);
+  if (as12) ID3D12Resource_Release(as12);
+  if (handle) CloseHandle(handle);
+  if (tex) ID3D11Texture2D_Release(tex);
+  if (y1) ID3D11Device1_Release(y1);
+  ID3D11DeviceContext_Release(cx);
+  ID3D11DeviceContext_Release(cy);
+  ID3D11Device_Release(x);
+  ID3D11Device_Release(y);
+}
+
 /* The parent shares a buffer and a fence, starts this program again with the two handles inherited, and waits for the fence: the child checks the buffer holds the
  * parent's words, writes its own after them and signals the fence with 2; the parent then reads the child's words. A texture with a keyed mutex goes along: the
  * parent draws it red and releases it with key 1, the child acquires it with 1, sees red, draws it green and releases it with 2, which the parent then acquires. */
@@ -890,6 +1097,30 @@ static void child_legacy(HANDLE legacy) {
   ID3D11DeviceContext_Release(ctx);
   ID3D11Device_Release(dev);
 }
+/* The parent's Direct3D 12 NV12 array of two slices (pattern 9): the child sees it through Direct3D 12, then writes slice 1 (pattern 10) through Direct3D 11. */
+static void child_nv12(D12 *c, HANDLE nv12) {
+  ID3D12Resource *tex = NULL;
+  CHECK_HR(ID3D12Device_OpenSharedHandle(c->dev, nv12, &IID_ID3D12Resource, (void **)&tex));
+  if (tex) { CHECK(d12_nv12_is(c, tex, 2, 9, 2, 0)); ID3D12Resource_Release(tex); }
+  ID3D11Device *dev = NULL;
+  ID3D11DeviceContext *ctx = NULL;
+  ID3D11Device1 *dev1 = NULL;
+  ID3D11Texture2D *t11 = NULL;
+  CHECK_HR(D3D11CreateDevice(NULL, D3D_DRIVER_TYPE_HARDWARE, NULL, 0, NULL, 0, D3D11_SDK_VERSION, &dev, NULL, &ctx));
+  if (!dev) return;
+  CHECK_HR(ID3D11Device_QueryInterface(dev, &IID_ID3D11Device1, (void **)&dev1));
+  if (dev1) CHECK_HR(ID3D11Device1_OpenSharedResource1(dev1, nv12, &IID_ID3D11Texture2D, (void **)&t11));
+  if (t11) {
+    CHECK(d11_nv12_is(dev, ctx, t11, 2, 9, 2, 0));
+    d11_write_nv12_slice(ctx, t11, 1, 10);
+    ID3D11DeviceContext_Flush(ctx);
+    CHECK(d11_nv12_is(dev, ctx, t11, 2, 9, 1, 10));
+    ID3D11Texture2D_Release(t11);
+  }
+  if (dev1) ID3D11Device1_Release(dev1);
+  ID3D11DeviceContext_Release(ctx);
+  ID3D11Device_Release(dev);
+}
 /* The parent's Direct3D 11 fence: the child's context waits for 1 (the parent's signal) and then signals 2, which the parent waits for. */
 static void child_fence11(HANDLE fence_handle) {
   ID3D11DeviceContext4 *ctx = NULL;
@@ -910,7 +1141,7 @@ static void child_fence11(HANDLE fence_handle) {
   if (ctx) ID3D11DeviceContext4_Release(ctx);
   if (dev) ID3D11Device5_Release(dev);
 }
-static int child(HANDLE buffer_handle, HANDLE fence_handle, HANDLE texture_handle, HANDLE legacy, HANDLE fence11) {
+static int child(HANDLE buffer_handle, HANDLE fence_handle, HANDLE texture_handle, HANDLE legacy, HANDLE fence11, HANDLE nv12) {
   D12 c;
   if (!d12_make(&c)) { printf("child: no device\n"); return 1; }
   ID3D12Resource *shared = NULL;
@@ -928,6 +1159,7 @@ static int child(HANDLE buffer_handle, HANDLE fence_handle, HANDLE texture_handl
   }
   if (shared) ID3D12Resource_Release(shared);
   if (fence) ID3D12Fence_Release(fence);
+  if (nv12) child_nv12(&c, nv12);
   d12_free(&c);
   if (texture_handle) child_keyed(texture_handle);
   if (legacy) child_legacy(legacy);
@@ -981,10 +1213,20 @@ static void test_processes(D12 *a) {
   if (x) { CHECK_HR(ID3D11Device_QueryInterface(x, &IID_ID3D11Device5, (void **)&x5)); CHECK_HR(ID3D11DeviceContext_QueryInterface(cx, &IID_ID3D11DeviceContext4, (void **)&cx4)); }
   if (x5) CHECK_HR(ID3D11Device5_CreateFence(x5, 0, D3D11_FENCE_FLAG_SHARED, &IID_ID3D11Fence, (void **)&f11));
   if (f11) CHECK_HR(ID3D11Fence_CreateSharedHandle(f11, &inherit, GENERIC_ALL, NULL, &hf11));
-  WCHAR self[MAX_PATH], line[MAX_PATH + 128];
+  /* (and an NV12 array of Direct3D 12's, every plane of both slices: the child reads it through both APIs and writes slice 1 through Direct3D 11) */
+  D3D12_HEAP_PROPERTIES hp = {D3D12_HEAP_TYPE_DEFAULT, D3D12_CPU_PAGE_PROPERTY_UNKNOWN, D3D12_MEMORY_POOL_UNKNOWN, 1, 1};
+  D3D12_RESOURCE_DESC nd = {D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, NV12_W, NV12_H, 2, 1, DXGI_FORMAT_NV12, {1, 0}, D3D12_TEXTURE_LAYOUT_UNKNOWN, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET};
+  ID3D12Resource *nv12 = NULL;
+  HANDLE hn = NULL;
+  CHECK_HR(ID3D12Device_CreateCommittedResource(a->dev, &hp, D3D12_HEAP_FLAG_SHARED, &nd, D3D12_RESOURCE_STATE_COMMON, NULL, &IID_ID3D12Resource, (void **)&nv12));
+  if (nv12) {
+    d12_write_nv12(a, nv12, 2, 9);
+    CHECK_HR(ID3D12Device_CreateSharedHandle(a->dev, (ID3D12DeviceChild *)nv12, &inherit, GENERIC_ALL, NULL, &hn));
+  }
+  WCHAR self[MAX_PATH], line[MAX_PATH + 160];
   GetModuleFileNameW(NULL, self, MAX_PATH);
-  swprintf(line, sizeof line / sizeof line[0], L"\"%ls\" child %llu %llu %llu %llu %llu", self, (unsigned long long)(UINT_PTR)hb, (unsigned long long)(UINT_PTR)hf,
-           (unsigned long long)(UINT_PTR)ht, (unsigned long long)(UINT_PTR)hl, (unsigned long long)(UINT_PTR)hf11);
+  swprintf(line, sizeof line / sizeof line[0], L"\"%ls\" child %llu %llu %llu %llu %llu %llu", self, (unsigned long long)(UINT_PTR)hb, (unsigned long long)(UINT_PTR)hf,
+           (unsigned long long)(UINT_PTR)ht, (unsigned long long)(UINT_PTR)hl, (unsigned long long)(UINT_PTR)hf11, (unsigned long long)(UINT_PTR)hn);
   STARTUPINFOW si;
   PROCESS_INFORMATION pi;
   memset(&si, 0, sizeof si);
@@ -1010,6 +1252,7 @@ static void test_processes(D12 *a) {
     printf("child exit code %lu\n", (unsigned long)code);
     CHECK(code == 0);
     CHECK(d12_holds(a, shared, sizeof mine, theirs, sizeof theirs));      /* (what the child wrote) */
+    if (nv12) CHECK(d12_nv12_is(a, nv12, 2, 9, 1, 10));                  /* (slice 1 the child's, through Direct3D 11) */
     if (km) {
       CHECK(IDXGIKeyedMutex_AcquireSync(km, 2, 60000) == S_OK);      /* (the child's release) */
       CHECK(texel_of(x, cx, tex) == 0xFF00FF00u);                    /* (green: what it drew) */
@@ -1022,6 +1265,8 @@ static void test_processes(D12 *a) {
   CloseHandle(hf);
   if (ht) CloseHandle(ht);
   if (hf11) CloseHandle(hf11);
+  if (hn) CloseHandle(hn);
+  if (nv12) ID3D12Resource_Release(nv12);
   if (f11) ID3D11Fence_Release(f11);
   if (cx4) ID3D11DeviceContext4_Release(cx4);
   if (x5) ID3D11Device5_Release(x5);
@@ -1035,9 +1280,9 @@ static void test_processes(D12 *a) {
 }
 
 int main(int argc, char **argv) {
-  if (argc == 7 && strcmp(argv[1], "child") == 0)
+  if (argc == 8 && strcmp(argv[1], "child") == 0)
     return child((HANDLE)(UINT_PTR)_strtoui64(argv[2], NULL, 10), (HANDLE)(UINT_PTR)_strtoui64(argv[3], NULL, 10), (HANDLE)(UINT_PTR)_strtoui64(argv[4], NULL, 10),
-                 (HANDLE)(UINT_PTR)_strtoui64(argv[5], NULL, 10), (HANDLE)(UINT_PTR)_strtoui64(argv[6], NULL, 10));
+                 (HANDLE)(UINT_PTR)_strtoui64(argv[5], NULL, 10), (HANDLE)(UINT_PTR)_strtoui64(argv[6], NULL, 10), (HANDLE)(UINT_PTR)_strtoui64(argv[7], NULL, 10));
   const int processes = argc > 1 && strcmp(argv[1], "processes") == 0;
   D12 a, b;
   if (!d12_make(&a) || !d12_make(&b)) {
@@ -1053,6 +1298,7 @@ int main(int argc, char **argv) {
   test_keyed_mutex();
   test_legacy(&a);
   test_d3d11_fences(&a);
+  test_nv12(&a, &b);
   if (processes) test_processes(&a);
   d12_free(&a);
   d12_free(&b);
