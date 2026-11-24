@@ -228,6 +228,40 @@ transfers what the shader wrote. The device claims `kFeatureCompute` only when t
 (Wine's) has no `ByteAddressBuffer` methods, so the raw-buffer path is tested with a shader written token by token (`test_compute`); the conformance shader uses structured buffers.
 The conformance run on virglrenderer is the only check of the TGSI path against a real host.
 
+### Storage images (unordered access views of textures)
+
+A `kAllocStorageImage` texture (with `kAllocTexture`, optionally `kAllocRenderTarget`; a colour format that is not sRGB or block-compressed, one sample, not a cube; the adapter's
+`kFeature2StorageImages`, a second word of device features `DeviceInfo::features2` / `AdapterCaps::features2`) is read and written texel by texel by compute shaders, and by pixel
+shaders in passes (`kFeature2StorageImagesInDraws`). A stream binds a level and a run of layers of one to storage slot u<n> with `BindUavImage slot, allocation, level,
+first_layer, layer_count [, view format]` (op 37; slots below `kMaxStorageImages` = 8, a register being a buffer or an image by the shader's declaration); Direct3D 12 binds
+them through descriptors of `DescriptorKind::UavTexture` (5; WriteDescriptors' offset words the level and first layer, size words the count and the view's format), which
+the stream runner lowers at each dispatch and draw where the pipeline's shader declares the slot. The view's format may be another wide format of the same pixel size than the
+allocation's (a typeless resource's views: R32_UINT of R32_FLOAT), or A8B8G8R8Uint of A8B8G8R8 and back. A dispatch or draw is refused when a slot the shader declares is
+unbound, an integer image is given to a float slot or the other way round, a 2D slot gets several layers or a volume, an array slot a volume. What the shaders write is in the
+image after the dispatch or draw (VidMm reads layered and mipmapped storage images back by layer and level); a mirror that writes back gives its channels to its source then.
+- DXBC: `dcl_uav_typed_texture1d / 1darray / 2d / 2darray / 3d` (return types float, unorm, snorm: floats; uint, sint: integers), `ld_uav_typed`, `store_uav_typed`,
+  `resinfo` of a u#, and the atomics `atomic_*` / `imm_atomic_*` on typed views (add, and, or, xor, min / max signed and unsigned, exchange, compare-exchange; the last also on
+  buffers now: `atomic_cmp_store`, `imm_atomic_cmp_exch`) on R32Uint / R32Sint images - `Format::R32Uint`, `R32Sint`, `R32Float` (25 .. 27) are new one-channel 32-bit wide
+  formats (`kFeature2SingleChannelFormats`), render targets, textures and storage images. A one-dimensional image is a two-dimensional one a texel high (its array an array of
+  those). Not taken: typed buffer UAVs (`dcl_uav_typed_buffer`), storage images in vertex, geometry and tessellation shaders, SM 5.1 UAV ranges, DXIL texture UAVs.
+- Software device: `IStorageImages` (load / store / atomic / size) in `ComputeContext::images` and `FragmentContext::images`; values travel as textures' do (floats, or the
+  integers' bits).
+- virgl: `DCL IMAGE[n], <target>, IMGFMT<n>, WR` and `LOAD` / `STORE` / `ATOM*` / `ATOMCAS` / `RESQ` on `IMAGE[n]`; `IMGFMT<n>` is a placeholder the device replaces with
+  the Gallium name of the format of what is bound to slot n (`VirglShaderModule::variant`, up to four host shaders per module), bound with `SET_SHADER_IMAGES` (35: format,
+  access, `first | last << 16` layers, level, resource) before each dispatch and draw, and a memory barrier after. An 8-bit storage image is an RGBA8 resource on the host
+  (the image units have no BGRA format; its 0xAARRGGBB pixels are swapped on the way in and out).
+
+### Layered render targets (SV_RenderTargetArrayIndex)
+
+Arrays, cubes and volumes (one level) may be render targets, and arrays and cubes depth buffers, on an adapter with `kFeature2LayeredTargets`. `BeginPass` with
+`kPassLayers` (flag 8) ends with a first layer and a count for each colour target and then the depth buffer (`RenderPassBegin::first_layer` / `layer_count`): a clear
+clears those layers, and a primitive goes to the layer its geometry shader's `SV_RenderTargetArrayIndex` names (the leading vertex's: `ShaderIo::layer`), the target's first
+when that is past its count. Only a geometry shader writes it (`VPAndRTArrayIndexFromAnyShaderFeedingRasterizerSupportedWithoutGSEmulation` is FALSE); `SV_ViewportArrayIndex`
+is not taken (one viewport). DXBC: the output's `render_target_array_index` (OSGN names up to 31 characters now) and `vPrim` in geometry shaders. virgl: `DCL OUT[n], LAYER`
+(after the stream positions), `vPrim` as the input `DCL IN[n], PRIM_ID` (the host makes a geometry shader's PRIMID system value the output `gl_PrimitiveID`, its input `gl_PrimitiveIDIn`), and surfaces of a layer range (`first | last << 16`); layered resources never take Y_0_TOP (the host refuses it on anything but 2D). d3d12.dll:
+render target and depth views of `TEXTURE2DARRAY` / `TEXTURE1DARRAY` / `TEXTURE3D` slices (`SoftDesc::slice` / `stride`), planar views of several slices through an array
+mirror that writes back. d3d11.dll: arrays, cubes and volumes of one level are drawn into directly (the render target shadows of rtshadow.inc stay for textures with levels).
+
 ## Multisampling
 
 An allocation with `samples` 2, 4 or 8 (the adapter's `kFeatureMultisample`; `DeviceInfo::sample_counts` says which) is a render target of an 8-bit colour format or a depth buffer, nothing
@@ -367,8 +401,10 @@ Direct3D 11's and 12's video interfaces run on the kernel's codecs, on the CPU, 
   channel width; `Allocation::version()` counts each image's changes and a stream copies a source again when its version moved: when a root table that reaches the
   mirror is set outside a pass (where what the GPU drew can be read back first; d3d12.dll sends such a binding before the pass, after the pipeline, so only the image the
   pipeline declares is copied), and from the CPU's copy when a draw binds it. `kMirrorInteger` gives an integer image of the same bits (alpha 1): Direct3D's
-  `R8_UINT` / `R8G8_UINT` / `R16_UINT` / `R16G16_UINT` views of a plane. `kMirrorWriteBack` makes a render target whose channels go back to the plane when the pass
-  that drew into it ends (an integer render target view). A Texture2DArray view of planes has two images: the plane of its first slice (a shader that declares a 2D
+  `R8_UINT` / `R8G8_UINT` / `R16_UINT` / `R16G16_UINT` views of a plane. `kMirrorWriteBack` makes a render target or a storage image whose channels go back to the plane
+  when the pass that drew into it ends, or after the dispatch that wrote it (an integer render target view; an unordered access view of a plane, integer or not, and of a
+  narrow non-planar texture's one image - so a store leaves the widened image's other channels as zeros and the maximum); an array mirror that writes back gives each
+  layer to its own source (a render target view of several slices of a plane, drawn into by layer). A Texture2DArray view of planes has two images: the plane of its first slice (a shader that declares a 2D
   texture) and an array mirror of its slices (`Descriptor::alternate`, chosen by the unit's declared kind: one that declares an array sees every slice).
 - **4:2:2 and 4:4:4.** AV1 profiles 1 and 2 (`D3D12_VIDEO_DECODE_PROFILE_AV1_PROFILE1`, `_PROFILE2`, `_12BIT_PROFILE2`, `_12BIT_PROFILE2_420`; DXVA_ModeAV1_VLD_*) decode
   into the formats Windows' decoders use: AYUV / Y410 (8- and 10-bit 4:4:4), YUY2 / Y210 (4:2:2) and NV12 / P010 (monochrome), Y216 / Y416 (12-bit 4:2:2 / 4:4:4),
@@ -408,8 +444,7 @@ Direct3D 11's and 12's video interfaces run on the kernel's codecs, on the CPU, 
 - Not there: HEVC 16-bit samples through DXVA (DXVA_PicParams_HEVC's bit depths are three bits: the Main16 profile takes 15 at most), HEVC separate colour planes (no
   profile has them), extended precision and CABAC bypass alignment checked against a reference (no decoder at hand has them: implemented from the standard, not
   verified), AV1 tile lists whose output frame is not the decoder's size (DXVA cannot say), interlaced VC-1 (the CPU decoder has progressive pictures only), protected
-  content (crypto sessions and authenticated channels are refused), unordered access to planes (the kernel has none to textures), layered rendering into several slices
-  (no `SV_RenderTargetArrayIndex`: a render target view of several slices draws into the first).
+  content (crypto sessions and authenticated channels are refused).
 - Tests: `tests/run_host_tests.sh DxvaDecoderTest VideoProcessTest DxgkrnlTest` (every codec bit for bit with ffmpeg; the DXVA buffers filled as ffmpeg's dxva2_*.c
   fill them; interlaced H.264 from x264 MBAFF streams and cuts of the JVT conformance streams, tests/data/make_h264_interlaced_fixtures.py; VC-1 and MPEG-4 Part 2, which ffmpeg has no DXVA path for, from the software decoder's view of the stream; HEVC Main 10 over tests/data/hevc10_*.h265, scripts/gen_hevc10_test_streams.sh, with the PCM stream of
   scripts/gen_hevc10_pcm_stream.py; the HEVC range extensions over tests/data/hevcrext_*.h265 - x265's 4:0:0 / 4:2:0 / 4:2:2 / 4:4:4 streams of 8 to 12 bits,
@@ -447,7 +482,7 @@ Direct3D 11's and 12's video interfaces run on the kernel's codecs, on the CPU, 
 - **Shaders**: SM2 / SM3 / SM4 / SM5.0 / SM5.1 vertex and pixel shaders (no geometry / tessellation / compute shaders, no 5.1 register spaces or arrays of resources). The pixel stage of Intel Gen9 is two fixed kernels, so a general pixel
   shader runs there only on the software, virgl (as unvalidated TGSI) and SVGA3D (unvalidated) paths. No loops, calls, predication, ps_1_x, constants above c7 (push constants are
   128 bytes), depth output, fog / point size, cube and volume samplers. Pipeline state is limited to what `IGraphicsDevice` offers (one colour target, 2 textures, alpha blend on/off, depth and stencil).
-- No UAV textures, no group-shared memory or barriers (a compute shader that needs `sync` or `dcl_tgsm` is refused), no multisampled shader resources (`Texture2DMS`, `ld2dms`), no depth resolve, no alpha-to-coverage or sample mask, no per-sample shading, no centroid interpolation, no mipmapped / render-target / float cube, volume or array textures (`d3d11.dll` and `d3d9.dll` keep the first level of the ones a program makes with more), no integer formats but R32G32B32A32_UINT, no signed or 10-bit formats.
+- No group-shared memory or barriers (a compute shader that needs `sync` or `dcl_tgsm` is refused), no multisampled shader resources (`Texture2DMS`, `ld2dms`), no depth resolve, no alpha-to-coverage or sample mask, no per-sample shading, no centroid interpolation, no mipmapped / render-target / float cube, volume or array textures (`d3d11.dll` and `d3d9.dll` keep the first level of the ones a program makes with more), no integer formats but R32G32B32A32_UINT, no signed or 10-bit formats.
 - Sync objects cannot be shared between processes. No timeout detection and recovery (a hung device cannot be reset), no vblank / scan line, gamma, overlays or VidPN topology
   (multi-monitor); display mode listing and switching go straight to the GPU driver.
 - Video memory is accounted per adapter but there is no per-process budget or priority-based paging between processes.
@@ -588,7 +623,8 @@ has its method, `scripts/gen-dx-vtables.py` names the latest interface of each o
   `D3DBLEND_BOTHSRCALPHA`) pass theirs on.
 
 Not done, in the order a program is likely to meet them: texture formats of fewer than four channels, packed floats and block compression beyond BC1 - BC3 (above); a depth buffer read as a texture (shadow maps: virgl keeps textures and attachments in opposite row order, and the
-kernel refuses the combination); rendering into a mip level or an array layer; unordered access to textures (and so `ClearUnorderedAccessView*` of a texture); depth bias
+kernel refuses the combination); rendering into a mip level; unordered access to cubes, to mipmapped arrays and volumes (the kernel keeps one level of them), to narrow
+arrays or narrow textures with levels, to typed buffers; `CopyResource` of arrays, volumes and textures with levels; depth bias
 and back-face stencil state; dual-source blending (`SRC1_*` factors: the pipeline is refused with `DXGI_ERROR_UNSUPPORTED`); several viewports; more than four unordered
 access buffers; pipeline statistics queries from the DLL; shared resources across adapters (`D3D12_HEAP_FLAG_SHARED_CROSS_ADAPTER`,
 `D3D12_FENCE_FLAG_SHARED_CROSS_ADAPTER`: `DXGI_ERROR_UNSUPPORTED`); the blend factor on Vega and the other fixed backends; ray tracing,

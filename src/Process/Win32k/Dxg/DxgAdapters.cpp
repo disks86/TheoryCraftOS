@@ -288,6 +288,7 @@ uint32_t query_adapter_info(Session& s, Call& call, uint64_t arg) {
       for (uint32_t w : {caps.max_color_targets, caps.max_vertex_buffers}) out.put32(w);      // (after the name: what a caller built before them reads is unchanged)
       // After the name (a user-mode driver that reads only the head does not see them): the multisample counts, the kind of device, the vendor and device numbers. The Vulkan driver reports them.
       for (uint32_t w : {caps.sample_counts, caps.device_kind, caps.vendor_id, caps.device_id}) out.put32(w);
+      out.put32(caps.features2);   // (graphics::DeviceFeature2: storage images, layered targets, the single-channel formats)
       break;
     }
     case kQaiWddm12Caps: case kQaiWddm13Caps: case kQaiWddm20Caps: case kQaiDirectFlipSupport: case kQaiMultiPlaneOverlaySupport: case kQaiMultiPlaneOverlayHudSupport:

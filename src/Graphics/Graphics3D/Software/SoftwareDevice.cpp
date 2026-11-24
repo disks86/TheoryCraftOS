@@ -21,6 +21,7 @@
 #include "Graphics/Graphics2D/Software/SoftwareRenderer2D.hpp"
 #include "Graphics/Graphics3D/Software/Tessellator.hpp"
 #include "Graphics/Graphics3D/VertexFetch.hpp"
+#include "Graphics/BlockCompression.hpp"
 #include "Graphics/WidePixels.hpp"
 #include "Utility/AllocatedView.hpp"
 
@@ -136,8 +137,8 @@ class SoftwareImage final : public IImage {
       total += uint64_t{mip_extent(desc.extent.width, level)} * mip_extent(desc.extent.height, level);
     }
     if (desc.format == Format::D32Float) {
-      depth_ = allocate_view<float>(allocator, count);
-      if (desc.stencil) stencil_ = allocate_view<uint8_t>(allocator, count);
+      depth_ = allocate_view<float>(allocator, count * layer_count());   // (a layered depth image: its layers one after the other)
+      if (desc.stencil) stencil_ = allocate_view<uint8_t>(allocator, count * layer_count());
     } else if (is_wide_format(desc.format)) {
       if (desc.mip_levels == 1) hdr_ = allocate_view<Vec4>(allocator, count * layer_count());   // (an array: its layers one after the other)
     } else if (desc.format != Format::Undefined) {
@@ -173,6 +174,20 @@ class SoftwareImage final : public IImage {
     if (pixels.size() != count) return false;
     const ArrayView<Vec4> to = hdr_.subview(layer * count, count);
     for (uint64_t i = 0; i < count; ++i) to[i] = store_float(pixels[i]);
+    return true;
+  }
+  bool read_layer_pixels_float(uint32_t layer, ArrayView<Vec4> out) override {
+    if (hdr_.empty() || layer >= layer_count()) return false;
+    const uint64_t count = uint64_t{desc_.extent.width} * desc_.extent.height;
+    if (out.size() < count) return false;
+    return out.first(count).copy_from(ArrayView<const Vec4>(hdr_.subview(layer * count, count).data(), count));
+  }
+  bool read_mip_pixels(uint32_t level, ArrayView<uint32_t> out) override {
+    if (color_.empty() || level >= desc_.mip_levels || desc_.samples != 1) return false;
+    const Surface s = surface(level);
+    const uint64_t count = uint64_t{s.width} * s.height;
+    if (out.size() < count) return false;
+    for (uint64_t i = 0; i < count; ++i) out[i] = s.decode(s.pixels[i]);
     return true;
   }
   bool read_layer_pixels(uint32_t layer, ArrayView<uint32_t> out) override {
@@ -255,6 +270,15 @@ class SoftwareImage final : public IImage {
   }
   ArrayView<float> depth() const { return depth_; }
   ArrayView<uint8_t> stencil() const { return stencil_; }
+  // The depth and stencil planes of one layer of a layered depth image (all its samples; empty for a layer it does not have).
+  ArrayView<float> depth_layer(uint32_t layer) const {
+    const uint64_t count = uint64_t{desc_.extent.width} * desc_.extent.height * desc_.samples;
+    return layer < layer_count() && !depth_.empty() ? depth_.subview(layer * count, count) : ArrayView<float>();
+  }
+  ArrayView<uint8_t> stencil_layer(uint32_t layer) const {
+    const uint64_t count = uint64_t{desc_.extent.width} * desc_.extent.height * desc_.samples;
+    return layer < layer_count() && !stencil_.empty() ? stencil_.subview(layer * count, count) : ArrayView<uint8_t>();
+  }
 
  private:
   allocators::IAllocator& allocator_;
@@ -555,17 +579,116 @@ class TextureSet final : public ITextureSet {
   mutable float lambda_[kMaxTextureUnits] = {};
 };
 
+// The storage images bound (bind_storage_image), as the shaders read and write them: a texel of the view is texel (x, y) of layer first_layer + z (of level `level`).
+class StorageImageSet final : public IStorageImages {
+ public:
+  void bind(uint32_t slot, SoftwareImage* image, const StorageImageView& view) {
+    if (slot >= kMaxStorageImages) return;
+    images_[slot] = image;
+    views_[slot] = view;
+  }
+  bool size(uint32_t slot, uint32_t* width, uint32_t* height, uint32_t* layers) const override {
+    if (slot >= kMaxStorageImages || !images_[slot]) return false;
+    *width = mip_extent(images_[slot]->extent().width, views_[slot].level);
+    *height = mip_extent(images_[slot]->extent().height, views_[slot].level);
+    *layers = views_[slot].layer_count;
+    return true;
+  }
+  Vec4 load(uint32_t slot, uint32_t x, uint32_t y, uint32_t z) const override {
+    Surface surface;
+    if (!texel_surface(slot, x, y, z, &surface)) return {0, 0, 0, 0};
+    if (!surface.floats.empty()) return as_view(slot, surface.format, surface.float_row(y)[x]);
+    const uint32_t argb = surface.decode(surface.row(y)[x]);
+    if (view_format(slot, surface.format) == Format::R8G8B8A8Uint)   // (the bytes as integers)
+      return {__builtin_bit_cast(float, (argb >> 16) & 0xFF), __builtin_bit_cast(float, (argb >> 8) & 0xFF), __builtin_bit_cast(float, argb & 0xFF), __builtin_bit_cast(float, argb >> 24)};
+    return unpack_color(argb);
+  }
+  void store(uint32_t slot, uint32_t x, uint32_t y, uint32_t z, Vec4 value) const override {
+    Surface surface;
+    if (!texel_surface(slot, x, y, z, &surface)) return;
+    if (!surface.floats.empty()) {
+      const Format view = view_format(slot, surface.format);
+      surface.float_row(y)[x] = view == surface.format ? images_[slot]->store_float(value) : as_view(slot, view, quantize_wide_pixel(view, value), surface.format);
+      return;
+    }
+    if (view_format(slot, surface.format) == Format::R8G8B8A8Uint) {   // (integers into the bytes, saturated)
+      auto byte = [](float v) { const uint32_t b = __builtin_bit_cast(uint32_t, v); return b > 255 ? 255u : b; };
+      surface.row(y)[x] = surface.encode(byte(value.w) << 24 | byte(value.x) << 16 | byte(value.y) << 8 | byte(value.z));
+      return;
+    }
+    surface.row(y)[x] = surface.encode(pack_color(value));
+  }
+  bool atomic(uint32_t slot, uint32_t x, uint32_t y, uint32_t z, ImageAtomic op, uint32_t operand, uint32_t compare, uint32_t* old) const override {
+    *old = 0;
+    Surface surface;
+    // (a 32-bit integer view: of an R32Uint or R32Sint image, or of an R32Float one, whose texel's bits it is)
+    if (!texel_surface(slot, x, y, z, &surface) || !is_single_channel_format(surface.format)) return false;
+    const Format view = view_format(slot, surface.format);
+    if (view != Format::R32Uint && view != Format::R32Sint) return false;
+    Vec4& texel = surface.float_row(y)[x];
+    const uint32_t before = __builtin_bit_cast(uint32_t, texel.x);
+    uint32_t after = before;
+    switch (op) {
+      case ImageAtomic::Add: after = before + operand; break;
+      case ImageAtomic::And: after = before & operand; break;
+      case ImageAtomic::Or: after = before | operand; break;
+      case ImageAtomic::Xor: after = before ^ operand; break;
+      case ImageAtomic::IMax: after = static_cast<int32_t>(operand) > static_cast<int32_t>(before) ? operand : before; break;
+      case ImageAtomic::IMin: after = static_cast<int32_t>(operand) < static_cast<int32_t>(before) ? operand : before; break;
+      case ImageAtomic::UMax: after = operand > before ? operand : before; break;
+      case ImageAtomic::UMin: after = operand < before ? operand : before; break;
+      case ImageAtomic::Exchange: after = operand; break;
+      case ImageAtomic::CompareExchange: after = before == compare ? operand : before; break;
+    }
+    texel.x = __builtin_bit_cast(float, after);
+    *old = before;
+    return true;
+  }
+
+ private:
+  Format view_format(uint32_t slot, Format image) const { return views_[slot].format == Format::Undefined ? image : views_[slot].format; }
+  // A texel of a wide image `from` (the values of that format) as the values of format `to` the same bits are (the image's format to the view's, or back): what a typeless resource's view does.
+  Vec4 as_view(uint32_t slot, Format from, Vec4 value, Format to = Format::Undefined) const {
+    if (to == Format::Undefined) to = view_format(slot, from);
+    if (to == from) return value;
+    if (to == Format::R8G8B8A8Unorm || from == Format::R8G8B8A8Unorm) {   // (an R8G8B8A8Uint image's bytes as normalised values, or back)
+      const Vec4 q = quantize_wide_pixel(Format::R8G8B8A8Uint, value);
+      auto bits = [](float v) { return __builtin_bit_cast(uint32_t, v); };
+      if (to == Format::R8G8B8A8Unorm) return {bits(q.x) / 255.0f, bits(q.y) / 255.0f, bits(q.z) / 255.0f, bits(q.w) / 255.0f};
+      const uint32_t argb = pack_color(value);
+      return {__builtin_bit_cast(float, (argb >> 16) & 0xFF), __builtin_bit_cast(float, (argb >> 8) & 0xFF), __builtin_bit_cast(float, argb & 0xFF), __builtin_bit_cast(float, argb >> 24)};
+    }
+    uint8_t bits[16] = {};
+    ByteWriter out{ByteView(bits, sizeof bits)};
+    encode_wide_pixel(from, value, out);
+    ByteReader in{ConstByteView(bits, bytes_per_pixel(from))};
+    return decode_wide_pixel(to, in);
+  }
+  // The surface the texel is in (false outside the view, or nothing bound).
+  bool texel_surface(uint32_t slot, uint32_t x, uint32_t y, uint32_t z, Surface* out) const {
+    if (slot >= kMaxStorageImages || !images_[slot]) return false;
+    const StorageImageView& view = views_[slot];
+    if (z >= view.layer_count || view.level >= images_[slot]->mip_levels() || view.first_layer + z >= images_[slot]->layer_count()) return false;
+    *out = images_[slot]->surface(view.level, view.first_layer + z);
+    return x < out->width && y < out->height;
+  }
+  SoftwareImage* images_[kMaxStorageImages] = {};
+  StorageImageView views_[kMaxStorageImages];
+};
+
 // --- Rasterization -------------------------------------------------------------
 
 struct ClipVertex {
   Vec4 position;
   Vec4 varying[kMaxVaryings];
+  uint32_t layer = 0;   // (SV_RenderTargetArrayIndex: a primitive goes to its first vertex's)
 };
 
 inline float lerp(float a, float b, float t) { return a + (b - a) * t; }
 
 ClipVertex mix(const ClipVertex& a, const ClipVertex& b, float t, uint32_t varyings) {
   ClipVertex r;
+  r.layer = a.layer;
   r.position = {lerp(a.position.x, b.position.x, t), lerp(a.position.y, b.position.y, t),
                 lerp(a.position.z, b.position.z, t), lerp(a.position.w, b.position.w, t)};
   for (uint32_t i = 0; i < varyings; ++i)
@@ -585,6 +708,20 @@ struct DrawState {
   SoftwareImage* color = nullptr;
   SoftwareImage* extra_colors[kMaxColorTargets - 1] = {};
   SoftwareImage* depth = nullptr;
+  // The layers of the targets the pass draws into (RenderPassBegin::first_layer / layer_count; kMaxColorTargets: the depth image) and the one the primitive being drawn goes to.
+  uint32_t first_layer[kMaxColorTargets + 1] = {};
+  uint32_t layer_count[kMaxColorTargets + 1] = {1, 1, 1, 1, 1, 1, 1, 1, 1};
+  mutable uint32_t layer = 0;
+  void select_layer(uint32_t l) const { layer = l; }
+  // (the layer of target n the primitive goes to: its own first when the primitive's is beyond the target's)
+  uint32_t layer_of(uint32_t n) const { return first_layer[n] + (layer < layer_count[n] ? layer : 0); }
+  Surface target(uint32_t n) const {
+    const SoftwareImage* image = n == 0 ? color : extra_colors[n - 1];
+    return image->surface(0, layer_of(n));
+  }
+  ArrayView<float> depth_plane() const { return depth ? depth->depth_layer(layer_of(kMaxColorTargets)) : ArrayView<float>(); }
+  ArrayView<uint8_t> stencil_plane() const { return depth ? depth->stencil_layer(layer_of(kMaxColorTargets)) : ArrayView<uint8_t>(); }
+  const StorageImageSet* images = nullptr;   // the storage images bound
   Viewport viewport;
   Rect2D scissor;  // already clamped to the target
   TextureSet textures;
@@ -729,8 +866,8 @@ Vec4 blend_float(const BlendState& b, bool over, Vec4 source, Vec4 destination) 
 // Stencil test, depth write, blend and store of a shaded fragment of the pixel (x, y); depth_ok is the depth test's verdict.
 void write_fragment(const DrawState& s, int32_t x, int32_t y, float z, bool depth_ok, const Vec4* colors, uint32_t sample = 0) {
   const GraphicsPipelineDesc& pd = s.pipeline->desc();
-  const ArrayView<float> depth = s.depth ? s.depth->depth() : ArrayView<float>();
-  const ArrayView<uint8_t> stencil = s.depth ? s.depth->stencil() : ArrayView<uint8_t>();
+  const ArrayView<float> depth = s.depth_plane();
+  const ArrayView<uint8_t> stencil = s.stencil_plane();
   const bool stencil_on = pd.stencil.enable && !stencil.empty();
   const uint32_t samples = s.sample_count;
   const uint64_t index = (uint64_t{static_cast<uint32_t>(y)} * s.color->extent().width + static_cast<uint32_t>(x)) * samples + sample;   // (the sample's place in the depth and stencil planes)
@@ -749,7 +886,7 @@ void write_fragment(const DrawState& s, int32_t x, int32_t y, float z, bool dept
   for (uint32_t n = 0; n < pd.color_target_count && n < kMaxColorTargets; ++n) {
     const SoftwareImage* image = n == 0 ? s.color : s.extra_colors[n - 1];
     if (!image) break;
-    const Surface surface = image->surface();
+    const Surface surface = s.target(n);
     // (the state of this target: its own with independent blending, which has no source-over shorthand)
     const bool own = pd.independent_blend && n > 0;
     const BlendState& blend = own ? pd.target_blend[n - 1] : pd.blend;
@@ -782,6 +919,7 @@ bool run_fragment_shader(const DrawState& s, const Vec4* varying, const Fragment
   if (s.ps_invocations) ++*s.ps_invocations;
   FragmentContext context = given;
   context.storage = s.storage;
+  context.images = s.images;
   if (s.pipeline->fragment_ex()) return s.pipeline->fragment_ex()(varying, context, s.constants, s.textures, color);
   if (s.pipeline->textured()) return s.pipeline->textured()(varying, s.constants, s.textures, color);
   return s.pipeline->fragment()(varying, s.constants, color);
@@ -846,8 +984,8 @@ void raster_triangle(const DrawState& s, const ScreenVertex& a, const ScreenVert
   const float e2dx = v1->x - v0->x, e2dy = v1->y - v0->y;  // opposite v2
   const bool own0 = owns_edge(e0dx, e0dy), own1 = owns_edge(e1dx, e1dy), own2 = owns_edge(e2dx, e2dy);
   const float inv_area = 1.0f / area;
-  const ArrayView<float> depth = s.depth ? s.depth->depth() : ArrayView<float>();
-  const ArrayView<uint8_t> stencil = s.depth ? s.depth->stencil() : ArrayView<uint8_t>();
+  const ArrayView<float> depth = s.depth_plane();
+  const ArrayView<uint8_t> stencil = s.stencil_plane();
   const bool stencil_on = pd.stencil.enable && !stencil.empty();
   // The varyings at any point of the plane of the triangle (also outside it, as the hardware extends them to the pixels of a quad it only partly covers).
   auto varyings_at = [&](float qx, float qy, Vec4* out) {
@@ -1004,17 +1142,17 @@ void raster_triangle(const DrawState& s, const ScreenVertex& a, const ScreenVert
 // A screen-space point or line fragment: the same shader, depth, stencil and blend as a triangle's, from varyings interpolated perspective-correct along the line.
 void fragment_at(const DrawState& s, int32_t x, int32_t y, float z, float inv_w, const Vec4* varying) {
   const GraphicsPipelineDesc& pd = s.pipeline->desc();
-  const Surface target = s.color->surface();
+  const Surface target = s.target(0);
   if (x < s.scissor.x || y < s.scissor.y || x >= static_cast<int64_t>(s.scissor.x) + s.scissor.width || y >= static_cast<int64_t>(s.scissor.y) + s.scissor.height) return;
   if (x < 0 || y < 0 || static_cast<uint32_t>(x) >= target.width || static_cast<uint32_t>(y) >= target.height) return;
-  const ArrayView<float> depth = s.depth ? s.depth->depth() : ArrayView<float>();
+  const ArrayView<float> depth = s.depth_plane();
   const uint64_t index = uint64_t{static_cast<uint32_t>(y)} * s.color->extent().width + static_cast<uint32_t>(x);
   const uint32_t sample_count = s.sample_count;   // (a line or point covers every sample of its pixel)
   uint32_t depth_pass = (1u << sample_count) - 1;
   if (pd.depth_test && !depth.empty())
     for (uint32_t k = 0; k < sample_count; ++k)
       if (!depth_passes(pd.depth_compare, z, depth[index * sample_count + k])) depth_pass &= ~(1u << k);
-  if (!depth_pass && !(pd.stencil.enable && s.depth && !s.depth->stencil().empty())) return;
+  if (!depth_pass && !(pd.stencil.enable && !s.stencil_plane().empty())) return;
   FragmentContext context;
   context.position = {static_cast<float>(x) + 0.5f, static_cast<float>(y) + 0.5f, z, inv_w};
   context.front_facing = true;
@@ -1038,6 +1176,7 @@ ScreenVertex to_screen(const DrawState& s, const ClipVertex& v, uint32_t varying
 // One pixel for a point (the pixel its position falls in).
 void draw_point(const DrawState& s, const ClipVertex& a) {
   const uint32_t varyings = s.pipeline->desc().varying_count;
+  s.select_layer(a.layer);
   if (a.position.z < 0 || !(a.position.w > 1e-9f)) return;
   const ScreenVertex v = to_screen(s, a, varyings);
   if (!(v.x > -1e6f && v.x < 1e6f && v.y > -1e6f && v.y < 1e6f)) return;
@@ -1048,6 +1187,7 @@ void draw_point(const DrawState& s, const ClipVertex& a) {
 // A line one pixel wide: a step per pixel along the longer axis, the other coordinate and the varyings interpolated (perspective-correct) along it.
 void draw_line(const DrawState& s, const ClipVertex& a, const ClipVertex& b) {
   const uint32_t varyings = s.pipeline->desc().varying_count;
+  s.select_layer(a.layer);
   ClipVertex p = a, q = b;
   if (p.position.z < 0 && q.position.z < 0) return;
   if (p.position.z < 0) p = mix(p, q, p.position.z / (p.position.z - q.position.z), varyings);   // (the near plane)
@@ -1077,6 +1217,7 @@ void draw_line(const DrawState& s, const ClipVertex& a, const ClipVertex& b) {
 // rasterizes the 1 or 2 triangles that remain.
 void draw_triangle(const DrawState& s, const ClipVertex& a, const ClipVertex& b, const ClipVertex& c) {
   const uint32_t varyings = s.pipeline->desc().varying_count;
+  s.select_layer(a.layer);
   ClipVertex in[3] = {a, b, c};
   ClipVertex poly[4];
   uint32_t n = 0;
@@ -1245,6 +1386,7 @@ void run_geometry_instance(const DrawState& s, const ShaderModuleDesc& md, const
     ClipVertex c;
     c.position = output.vertex[i].position;
     for (uint32_t k = 0; k < kMaxVaryings; ++k) c.varying[k] = output.vertex[i].varying[k];
+    c.layer = output.vertex[i].layer;
     return c;
   };
   uint32_t in_strip = 0;   // vertices of the strip so far
@@ -1258,7 +1400,11 @@ void run_geometry_instance(const DrawState& s, const ShaderModuleDesc& md, const
       if (in_strip >= 2) draw_line(s, clip(i - 1), clip(i));
     } else if (in_strip >= 3) {
       const bool odd = (in_strip - 3) & 1;
-      if (odd) draw_triangle(s, clip(i - 1), clip(i - 2), clip(i));
+      if (odd) {
+        ClipVertex first = clip(i - 1);
+        first.layer = output.vertex[i - 2].layer;   // (the triangle's leading vertex in the strip's order names its layer)
+        draw_triangle(s, first, clip(i - 2), clip(i));
+      }
       else draw_triangle(s, clip(i - 2), clip(i - 1), clip(i));
     }
   }
@@ -1373,11 +1519,16 @@ IImage* SoftwareDevice::create_image(const ImageDesc& desc) {
         (depth ? desc.usage != kImageDepthAttachment : (desc.usage & ~kImageSampled) != kImageColorAttachment))
       return nullptr;
   }
+  // (a storage image: a sampled colour image of one sample that is not sRGB or block-compressed, and not a cube)
+  if ((desc.usage & kImageStorage) && (!(desc.usage & kImageSampled) || desc.samples != 1 || desc.format == Format::D32Float || is_srgb_format(desc.format) || is_compressed_format(desc.format) ||
+                                       desc.kind == TextureKind::TextureCube))
+    return nullptr;
   if (desc.kind != TextureKind::Texture2D) {
-    // (layered images are sampled only: one level, 8-bit colour - or a wide format, for an array: its layers of Vec4s)
+    // (layered images: one level, sampled, and also drawn into (colour or depth) or read and written as storage images)
     const uint32_t layers = desc.kind == TextureKind::TextureCube ? 6 : desc.layers;
-    if (desc.usage != kImageSampled || desc.mip_levels != 1 || layers == 0 || layers > kMaxTextureLayers || desc.format == Format::D32Float ||
-        (is_wide_format(desc.format) && desc.kind != TextureKind::Texture2DArray) ||
+    const bool depth = desc.format == Format::D32Float;
+    if (!(desc.usage & (depth ? kImageDepthAttachment : kImageSampled)) || (desc.usage & ~(depth ? kImageDepthAttachment | kImageSampled : kImageSampled | kImageColorAttachment | kImageStorage)) ||
+        desc.mip_levels != 1 || layers == 0 || layers > kMaxTextureLayers || (depth && desc.kind == TextureKind::Texture3D) || desc.samples != 1 ||
         (desc.kind == TextureKind::TextureCube && desc.extent.width != desc.extent.height))
       return nullptr;
   } else if (desc.layers != 1) {
@@ -1489,6 +1640,8 @@ bool SoftwareDevice::submit(ICommandBuffer* commands) {
   const SoftwareComputePipeline* compute = nullptr;
   ByteView storage[kMaxStorageBuffers];
   s.storage = storage;
+  StorageImageSet images;
+  s.images = &images;
   DrawState::StreamOutputTarget stream_output[kMaxStreamOutputBuffers];
   uint64_t query_samples = 0;
   uint32_t query_slot = 0;
@@ -1531,10 +1684,30 @@ bool SoftwareDevice::submit(ICommandBuffer* commands) {
             if (s.extra_colors[k] == image) return false;
           s.extra_colors[n] = image;
         }
+        // (the layers of each target: within the image; a 2D image has layer 0 alone)
+        s.layer = 0;
+        for (uint32_t n = 0; n <= kMaxColorTargets; ++n) {
+          const SoftwareImage* image = n == kMaxColorTargets ? s.depth : n == 0 ? s.color : s.extra_colors[n - 1];
+          s.first_layer[n] = cmd.pass.first_layer[n];
+          s.layer_count[n] = cmd.pass.layer_count[n];
+          if (image && (s.layer_count[n] == 0 || s.first_layer[n] >= image->layer_count() || s.layer_count[n] > image->layer_count() - s.first_layer[n])) return false;
+        }
         if (cmd.pass.clear_color) {
           for (uint32_t n = 0; n < kMaxColorTargets; ++n) {
             const SoftwareImage* image = n == 0 ? s.color : s.extra_colors[n - 1];
             if (!image) break;
+            if (image->layer_count() > 1) {
+              // (a layered target: the pass's layers of it)
+              for (uint32_t l = 0; l < s.layer_count[n]; ++l) {
+                const Surface surface = image->surface(0, s.first_layer[n] + l);
+                if (!surface.floats.empty()) {
+                  for (Vec4& c : surface.floats) c = image->store_float(cmd.pass.clear_color_value);
+                } else {
+                  surface.pixels.fill(surface.encode(is_srgb_format(surface.format) ? pack_srgb(cmd.pass.clear_color_value) : pack_color(cmd.pass.clear_color_value)));
+                }
+              }
+              continue;
+            }
             const Surface surface = image->surface();
             if (!surface.floats.empty()) {
               for (Vec4& c : surface.floats) c = image->store_float(cmd.pass.clear_color_value);
@@ -1544,8 +1717,10 @@ bool SoftwareDevice::submit(ICommandBuffer* commands) {
             image->all_samples().fill(v);   // (every sample of every pixel; the rows of a plain image are tight)
           }
         }
-        if (s.depth && cmd.pass.clear_depth) s.depth->depth().fill(cmd.pass.clear_depth_value);
-        if (s.depth && cmd.pass.clear_stencil) s.depth->stencil().fill(cmd.pass.clear_stencil_value);
+        for (uint32_t l = 0; s.depth && l < s.layer_count[kMaxColorTargets]; ++l) {
+          if (cmd.pass.clear_depth) s.depth->depth_layer(s.first_layer[kMaxColorTargets] + l).fill(cmd.pass.clear_depth_value);
+          if (cmd.pass.clear_stencil) s.depth->stencil_layer(s.first_layer[kMaxColorTargets] + l).fill(cmd.pass.clear_stencil_value);
+        }
         s.viewport = {0, 0, static_cast<float>(e.width), static_cast<float>(e.height), 0, 1};
         s.scissor = {0, 0, e.width, e.height};
         s.pipeline = nullptr;
@@ -1652,6 +1827,16 @@ bool SoftwareDevice::submit(ICommandBuffer* commands) {
         }
         break;
       }
+      case RecordedCommand::Type::BindStorageImage: {
+        SoftwareImage* image = static_cast<SoftwareImage*>(cmd.image);
+        const StorageImageView& view = cmd.storage_view;
+        if (cmd.unit >= kMaxStorageImages) return false;
+        if (image && (!(image->usage() & kImageStorage) || view.level >= image->mip_levels() || view.layer_count == 0 || view.first_layer >= image->layer_count() ||
+                      view.layer_count > image->layer_count() - view.first_layer || !storage_view_compatible(image->format(), view.format)))
+          return false;
+        images.bind(cmd.unit, image, view);
+        break;
+      }
       case RecordedCommand::Type::BindStorageBuffer: {
         if (cmd.unit >= kMaxStorageBuffers || !cmd.buffer) return false;   // (the bindings may change between draws)
         ByteView whole = cmd.buffer->map(), part;
@@ -1668,6 +1853,7 @@ bool SoftwareDevice::submit(ICommandBuffer* commands) {
         ComputeContext context;
         for (uint32_t k = 0; k < kMaxStorageBuffers; ++k) context.buffers[k] = storage[k];
         context.textures = &s.textures;   // (bound outside the passes as well)
+        context.images = &images;
         for (uint32_t z = 0; z < gz; ++z)
           for (uint32_t y = 0; y < gy; ++y)
             for (uint32_t x = 0; x < gx; ++x) {

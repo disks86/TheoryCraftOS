@@ -2399,6 +2399,289 @@ static void test_device5(void) {
   ID3D11Device5_Release(d5);
 }
 
+
+/* ---- unordered access to textures, and drawing into layers ------------------------------------------------------------------------------------------------------------ */
+
+/* Subresource `sub` of a texture of `desc` (a 2D one, or an array's slice) read back through a staging texture of its description: `texel` bytes a texel, rows tight. */
+static int texture2d_read(ID3D11Texture2D *texture, UINT sub, void *out, UINT texel) {
+  D3D11_TEXTURE2D_DESC desc;
+  ID3D11Texture2D_GetDesc(texture, &desc);
+  desc.Usage = D3D11_USAGE_STAGING;
+  desc.BindFlags = 0;
+  desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+  desc.MiscFlags = 0;
+  ID3D11Texture2D *staging = NULL;
+  if (FAILED(ID3D11Device_CreateTexture2D(g_device, &desc, NULL, &staging)) || !staging) return 0;
+  ID3D11DeviceContext_CopyResource(g_context, (ID3D11Resource *)staging, (ID3D11Resource *)texture);
+  D3D11_MAPPED_SUBRESOURCE m;
+  int ok = SUCCEEDED(ID3D11DeviceContext_Map(g_context, (ID3D11Resource *)staging, sub, D3D11_MAP_READ, 0, &m)) && m.pData;
+  const UINT rows = desc.Format == DXGI_FORMAT_NV12 ? desc.Height + desc.Height / 2 : desc.Height;
+  for (UINT y = 0; ok && y < rows; ++y) memcpy((BYTE *)out + (SIZE_T)y * desc.Width * texel, (const BYTE *)m.pData + (SIZE_T)y * m.RowPitch, desc.Width * texel);
+  if (ok) ID3D11DeviceContext_Unmap(g_context, (ID3D11Resource *)staging, sub);
+  ID3D11Texture2D_Release(staging);
+  return ok;
+}
+static ID3D11Texture2D *texture2d(UINT w, UINT h, UINT layers, DXGI_FORMAT format, UINT bind) {
+  D3D11_TEXTURE2D_DESC desc = {w, h, 1, layers, format, {1, 0}, D3D11_USAGE_DEFAULT, bind, 0, 0};
+  ID3D11Texture2D *t = NULL;
+  ID3D11Device_CreateTexture2D(g_device, &desc, NULL, &t);
+  return t;
+}
+static BYTE unorm8(float v) { return (BYTE)(v <= 0 ? 0 : v >= 1 ? 255 : (UINT)(v * 255.0f + 0.5f)); }
+
+/* A compute shader writing a 2D array storage image; the atomics on R32_UINT / R32_SINT textures of one, two and three dimensions; ClearUnorderedAccessView* of their views;
+ * the format support of typed unordered access. */
+static void test_texture_uavs(void) {
+  UINT support = 0;
+  D3D11_FEATURE_DATA_FORMAT_SUPPORT2 s2 = {DXGI_FORMAT_R32_UINT, 0};
+  check(SUCCEEDED(ID3D11Device_CheckFormatSupport(g_device, DXGI_FORMAT_R32_UINT, &support)) && (support & D3D11_FORMAT_SUPPORT_TYPED_UNORDERED_ACCESS_VIEW) &&
+            SUCCEEDED(ID3D11Device_CheckFeatureSupport(g_device, D3D11_FEATURE_FORMAT_SUPPORT2, &s2, sizeof s2)) && (s2.OutFormatSupport2 & D3D11_FORMAT_SUPPORT2_UAV_ATOMIC_ADD) &&
+            (s2.OutFormatSupport2 & D3D11_FORMAT_SUPPORT2_UAV_TYPED_STORE) && (s2.OutFormatSupport2 & D3D11_FORMAT_SUPPORT2_UAV_TYPED_LOAD),
+        "R32_UINT: typed unordered access views, typed loads and stores, atomics");
+  ID3D11Texture2D *picture = texture2d(8, 8, 3, DXGI_FORMAT_R8G8B8A8_UNORM, D3D11_BIND_UNORDERED_ACCESS | D3D11_BIND_SHADER_RESOURCE);
+  ID3D11Texture2D *counts = texture2d(4, 1, 1, DXGI_FORMAT_R32_UINT, D3D11_BIND_UNORDERED_ACCESS);
+  D3D11_TEXTURE1D_DESC d1 = {4, 1, 1, DXGI_FORMAT_R32_SINT, D3D11_USAGE_DEFAULT, D3D11_BIND_UNORDERED_ACCESS, 0, 0};
+  ID3D11Texture1D *least = NULL, *flags = NULL;
+  ID3D11Device_CreateTexture1D(g_device, &d1, NULL, &least);
+  d1.Format = DXGI_FORMAT_R32_TYPELESS;
+  ID3D11Device_CreateTexture1D(g_device, &d1, NULL, &flags);
+  D3D11_TEXTURE3D_DESC d3 = {2, 2, 2, 1, DXGI_FORMAT_R32_SINT, D3D11_USAGE_DEFAULT, D3D11_BIND_UNORDERED_ACCESS, 0, 0};
+  ID3D11Texture3D *most = NULL;
+  ID3D11Device_CreateTexture3D(g_device, &d3, NULL, &most);
+  ID3D11ComputeShader *fill = NULL, *atomic = NULL;
+  ID3D11Device_CreateComputeShader(g_device, dx_cs_uav_array_dxbc, sizeof dx_cs_uav_array_dxbc, NULL, &fill);
+  ID3D11Device_CreateComputeShader(g_device, dx_cs_uav_atomic_dxbc, sizeof dx_cs_uav_atomic_dxbc, NULL, &atomic);
+  ID3D11UnorderedAccessView *views[5] = {NULL};
+  if (picture) ID3D11Device_CreateUnorderedAccessView(g_device, (ID3D11Resource *)picture, NULL, &views[0]);
+  if (counts) ID3D11Device_CreateUnorderedAccessView(g_device, (ID3D11Resource *)counts, NULL, &views[1]);
+  if (least) ID3D11Device_CreateUnorderedAccessView(g_device, (ID3D11Resource *)least, NULL, &views[2]);
+  D3D11_UNORDERED_ACCESS_VIEW_DESC u;
+  memset(&u, 0, sizeof u);
+  u.Format = DXGI_FORMAT_R32_UINT;
+  u.ViewDimension = D3D11_UAV_DIMENSION_TEXTURE1D;
+  if (flags) ID3D11Device_CreateUnorderedAccessView(g_device, (ID3D11Resource *)flags, &u, &views[3]);
+  if (most) ID3D11Device_CreateUnorderedAccessView(g_device, (ID3D11Resource *)most, NULL, &views[4]);
+  int made = picture && counts && least && flags && most && fill && atomic;
+  for (int i = 0; i < 5; ++i) made = made && views[i];
+  check(made, "textures of 1, 2 (an array) and 3 dimensions with unordered access views, compute shaders that write them");
+  if (!made) return;
+  /* the picture: the shader's (x / 8, y / 8, layer / 3, 1) in each of its three layers; a clear of a rectangle of none (the shader writes it all afterwards) */
+  ID3D11DeviceContext_CSSetShader(g_context, fill, NULL, 0);
+  ID3D11DeviceContext_CSSetUnorderedAccessViews(g_context, 0, 1, &views[0], NULL);
+  ID3D11DeviceContext_Dispatch(g_context, 1, 1, 3);
+  static BYTE texels[8 * 8 * 4];
+  int wrong = 0;
+  for (UINT layer = 0; layer < 3; ++layer) {
+    if (!texture2d_read(picture, layer, texels, 4)) { ++wrong; continue; }
+    for (UINT i = 0; i < 64; ++i) {
+      const BYTE want[4] = {unorm8((i % 8) / 8.0f), unorm8((i / 8) / 8.0f), unorm8(layer / 3.0f), 255};
+      if (memcmp(&texels[i * 4], want, 4) && !wrong++) printf("d3d11test: (layer %u texel %u: %u %u %u %u)\n", layer, i, texels[i * 4], texels[i * 4 + 1], texels[i * 4 + 2], texels[i * 4 + 3]);
+    }
+  }
+  check(!wrong, "a compute shader wrote every texel of a Texture2DArray through its unordered access view (and GetDimensions said three layers)");
+  /* the atomics' textures cleared, then the shader */
+  const UINT zero[4] = {0, 0, 0, 0}, big[4] = {0x7FFFFFFFu, 0, 0, 0}, small[4] = {0x80000000u, 0, 0, 0};
+  ID3D11DeviceContext_ClearUnorderedAccessViewUint(g_context, views[1], zero);
+  ID3D11DeviceContext_ClearUnorderedAccessViewUint(g_context, views[2], big);
+  ID3D11DeviceContext_ClearUnorderedAccessViewUint(g_context, views[3], zero);
+  ID3D11DeviceContext_ClearUnorderedAccessViewUint(g_context, views[4], small);
+  ID3D11DeviceContext_CSSetShader(g_context, atomic, NULL, 0);
+  ID3D11DeviceContext_CSSetUnorderedAccessViews(g_context, 0, 4, &views[1], NULL);
+  ID3D11DeviceContext_Dispatch(g_context, 1, 1, 1);
+  UINT got[4] = {0};
+  INT ints[8] = {0};
+  int ok = texture2d_read(counts, 0, got, 4) && got[0] == 16 && got[1] == 16 && got[2] == 16 && got[3] == 16;
+  check(ok, "InterlockedAdd on an R32_UINT texture: 16 in each of its four texels");
+  /* (the other results through a staging copy of each) */
+  D3D11_TEXTURE1D_DESC s1 = d1;
+  s1.Usage = D3D11_USAGE_STAGING, s1.BindFlags = 0, s1.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+  ID3D11Texture1D *staging1 = NULL;
+  ID3D11Device_CreateTexture1D(g_device, &s1, NULL, &staging1);
+  D3D11_MAPPED_SUBRESOURCE m;
+  ok = 0;
+  if (staging1) {
+    ID3D11DeviceContext_CopyResource(g_context, (ID3D11Resource *)staging1, (ID3D11Resource *)least);
+    if (SUCCEEDED(ID3D11DeviceContext_Map(g_context, (ID3D11Resource *)staging1, 0, D3D11_MAP_READ, 0, &m)) && m.pData) {
+      memcpy(ints, m.pData, 16);
+      ID3D11DeviceContext_Unmap(g_context, (ID3D11Resource *)staging1, 0);
+      ok = ints[0] == -60 && ints[1] == -61 && ints[2] == -62 && ints[3] == -63;
+    }
+    ID3D11DeviceContext_CopyResource(g_context, (ID3D11Resource *)staging1, (ID3D11Resource *)flags);
+    if (SUCCEEDED(ID3D11DeviceContext_Map(g_context, (ID3D11Resource *)staging1, 0, D3D11_MAP_READ, 0, &m)) && m.pData) {
+      memcpy(got, m.pData, 16);
+      ID3D11DeviceContext_Unmap(g_context, (ID3D11Resource *)staging1, 0);
+    }
+    ID3D11Texture1D_Release(staging1);
+  }
+  check(ok, "InterlockedMin on a Texture1D of R32_SINT");
+  printf("d3d11test: (bits %08x, compare-exchange %u, exchange %u, old %u)\n", got[0], got[1], got[2], got[3]);
+  check(got[0] == 0xFFFFFFFFu && got[1] >= 1 && got[1] <= 64 && got[2] >= 100 && got[2] <= 163, "InterlockedOr, InterlockedCompareExchange and InterlockedExchange on an R32_UINT view of an R32_TYPELESS texture");
+  D3D11_TEXTURE3D_DESC s3 = d3;
+  s3.Usage = D3D11_USAGE_STAGING, s3.BindFlags = 0, s3.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+  ID3D11Texture3D *staging3 = NULL;
+  ID3D11Device_CreateTexture3D(g_device, &s3, NULL, &staging3);
+  ok = 0;
+  if (staging3) {
+    ID3D11DeviceContext_CopyResource(g_context, (ID3D11Resource *)staging3, (ID3D11Resource *)most);
+    if (SUCCEEDED(ID3D11DeviceContext_Map(g_context, (ID3D11Resource *)staging3, 0, D3D11_MAP_READ, 0, &m)) && m.pData) {
+      ok = 1;
+      for (UINT z = 0; z < 2; ++z)
+        for (UINT y = 0; y < 2; ++y)
+          for (UINT x = 0; x < 2; ++x) {
+            INT v;
+            memcpy(&v, (const BYTE *)m.pData + (SIZE_T)z * m.DepthPitch + (SIZE_T)y * m.RowPitch + x * 4, 4);
+            if (v != (INT)(56 + x + 2 * y + 4 * z) && ok) printf("d3d11test: (3D maximum at %u %u %u: %d)\n", x, y, z, v);
+            ok = ok && v == (INT)(56 + x + 2 * y + 4 * z);
+          }
+      ID3D11DeviceContext_Unmap(g_context, (ID3D11Resource *)staging3, 0);
+    }
+    ID3D11Texture3D_Release(staging3);
+  }
+  check(ok, "InterlockedMax on a Texture3D of R32_SINT");
+  /* ClearUnorderedAccessViewFloat of a view of layer 1 of the picture */
+  D3D11_UNORDERED_ACCESS_VIEW_DESC layer1;
+  memset(&layer1, 0, sizeof layer1);
+  layer1.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+  layer1.ViewDimension = D3D11_UAV_DIMENSION_TEXTURE2DARRAY;
+  layer1.Texture2DArray.FirstArraySlice = 1;
+  layer1.Texture2DArray.ArraySize = 1;
+  ID3D11UnorderedAccessView *one = NULL;
+  ID3D11Device_CreateUnorderedAccessView(g_device, (ID3D11Resource *)picture, &layer1, &one);
+  const float red[4] = {1, 0, 0, 1};
+  if (one) ID3D11DeviceContext_ClearUnorderedAccessViewFloat(g_context, one, red);
+  BYTE l0[8 * 8 * 4], l1[8 * 8 * 4];
+  check(one && texture2d_read(picture, 0, l0, 4) && texture2d_read(picture, 1, l1, 4) && l1[0] == 255 && l1[1] == 0 && l1[3] == 255 && l1[63 * 4] == 255 && l0[63 * 4] == unorm8(7 / 8.0f),
+        "ClearUnorderedAccessViewFloat of a view of one layer: that layer red, the others as they were");
+  ID3D11UnorderedAccessView *none[4] = {NULL, NULL, NULL, NULL};
+  ID3D11DeviceContext_CSSetUnorderedAccessViews(g_context, 0, 4, none, NULL);
+  if (one) ID3D11UnorderedAccessView_Release(one);
+  for (int i = 0; i < 5; ++i) ID3D11UnorderedAccessView_Release(views[i]);
+  ID3D11ComputeShader_Release(atomic);
+  ID3D11ComputeShader_Release(fill);
+  ID3D11Texture3D_Release(most);
+  ID3D11Texture1D_Release(flags);
+  ID3D11Texture1D_Release(least);
+  ID3D11Texture2D_Release(counts);
+  ID3D11Texture2D_Release(picture);
+}
+
+/* OMSetRenderTargetsAndUnorderedAccessViews: a pixel shader writing two R32_UINT textures (u1, u2) beside its target. */
+static void test_pixel_texture_uavs(void) {
+  ID3D11Texture2D *marks = texture2d(SIZE, SIZE, 1, DXGI_FORMAT_R32_UINT, D3D11_BIND_UNORDERED_ACCESS), *total = texture2d(1, 1, 1, DXGI_FORMAT_R32_UINT, D3D11_BIND_UNORDERED_ACCESS);
+  ID3D11UnorderedAccessView *views[2] = {NULL, NULL};
+  ID3D11PixelShader *ps = NULL;
+  if (marks) ID3D11Device_CreateUnorderedAccessView(g_device, (ID3D11Resource *)marks, NULL, &views[0]);
+  if (total) ID3D11Device_CreateUnorderedAccessView(g_device, (ID3D11Resource *)total, NULL, &views[1]);
+  ID3D11Device_CreatePixelShader(g_device, dx_ps_uav_dxbc, sizeof dx_ps_uav_dxbc, NULL, &ps);
+  ID3D11Buffer *vertices = triangle(0.5f, 1, 1, 1);
+  if (!views[0] || !views[1] || !ps || !vertices) { check(0, "a pixel shader writing textures, and its views"); return; }
+  const UINT zero[4] = {0, 0, 0, 0};
+  ID3D11DeviceContext_ClearUnorderedAccessViewUint(g_context, views[0], zero);
+  ID3D11DeviceContext_ClearUnorderedAccessViewUint(g_context, views[1], zero);
+  begin(NULL);
+  clear(0, 0, 0);
+  bind_floats(vertices);
+  ID3D11DeviceContext_OMSetRenderTargetsAndUnorderedAccessViews(g_context, 1, &g_target_view, NULL, 1, 2, views, NULL);
+  ID3D11DeviceContext_PSSetShader(g_context, ps, NULL, 0);
+  ID3D11DeviceContext_Draw(g_context, 3, 0);
+  read_target();
+  static UINT placed[SIZE * SIZE];
+  UINT count = 0;
+  int lit = 0, wrong = 0;
+  const int read = texture2d_read(marks, 0, placed, 4) && texture2d_read(total, 0, &count, 4);
+  for (UINT i = 0; i < SIZE * SIZE; ++i) {
+    const int on = (g_pixels[i] & 0xFFFFFF) != 0;
+    lit += on;
+    if ((on ? placed[i] != i + 1 : placed[i] != 0) && !wrong++) printf("d3d11test: (pixel %u lit %d, mark %u)\n", i, on, placed[i]);
+  }
+  if ((UINT)lit != count) printf("d3d11test: (%d pixels drawn, %u counted)\n", lit, count);
+  check(read && lit > 600 && !wrong, "a pixel shader's stores into an R32_UINT texture (u1): every pixel it drew marked at its place, no other");
+  check(read && count == (UINT)lit, "... and its InterlockedAdd into another (u2) counted them");
+  ID3D11DeviceContext_OMSetRenderTargets(g_context, 1, &g_target_view, NULL);
+  ID3D11PixelShader_Release(ps);
+  ID3D11Buffer_Release(vertices);
+  ID3D11UnorderedAccessView_Release(views[1]);
+  ID3D11UnorderedAccessView_Release(views[0]);
+  ID3D11Texture2D_Release(total);
+  ID3D11Texture2D_Release(marks);
+}
+
+/* A geometry shader sending triangle n into slice n of a Texture2DArray render target (SV_RenderTargetArrayIndex). */
+static void test_layered_target(void) {
+  ID3D11Texture2D *slices = texture2d(SIZE, SIZE, 3, DXGI_FORMAT_B8G8R8A8_UNORM, D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE);
+  ID3D11RenderTargetView *view = NULL;
+  ID3D11GeometryShader *gs = NULL;
+  if (slices) ID3D11Device_CreateRenderTargetView(g_device, (ID3D11Resource *)slices, NULL, &view);
+  ID3D11Device_CreateGeometryShader(g_device, dx_gs_layer_dxbc, sizeof dx_gs_layer_dxbc, NULL, &gs);
+  VertexF v[9];
+  for (UINT t = 0; t < 3; ++t) {
+    const float x0 = -1.0f + 0.66f * t;
+    const VertexF tri[3] = {{x0, -0.9f, 0.5f, t == 0, t == 1, t == 2, 1}, {x0 + 0.6f, -0.9f, 0.5f, t == 0, t == 1, t == 2, 1}, {x0 + 0.3f, 0.9f, 0.5f, t == 0, t == 1, t == 2, 1}};
+    memcpy(&v[t * 3], tri, sizeof tri);
+  }
+  ID3D11Buffer *vertices = make_buffer(D3D11_BIND_VERTEX_BUFFER, D3D11_USAGE_DEFAULT, 0, v, sizeof v);
+  if (!view || !gs || !vertices) { check(0, "a render target view of the three slices of an array, and a geometry shader that picks the slice"); return; }
+  begin(NULL);
+  const float black[4] = {0, 0, 0, 1};
+  ID3D11DeviceContext_ClearRenderTargetView(g_context, view, black);
+  ID3D11DeviceContext_OMSetRenderTargets(g_context, 1, &view, NULL);
+  bind_floats(vertices);
+  ID3D11DeviceContext_GSSetShader(g_context, gs, NULL, 0);
+  ID3D11DeviceContext_PSSetShader(g_context, g_ps_color, NULL, 0);
+  ID3D11DeviceContext_Draw(g_context, 9, 0);
+  ID3D11DeviceContext_GSSetShader(g_context, NULL, NULL, 0);
+  static UINT32 texels[SIZE * SIZE];
+  int wrong = 0;
+  for (UINT layer = 0; layer < 3; ++layer) {
+    if (!texture2d_read(slices, layer, texels, 4)) { ++wrong; continue; }
+    for (UINT t = 0; t < 3; ++t) {
+      const UINT x = (UINT)(((-1.0f + 0.66f * t + 0.3f) + 1.0f) * 32.0f);
+      const UINT32 p = texels[32 * SIZE + x] & 0xFFFFFF, want = t != layer ? 0 : t == 0 ? 0xFF0000u : t == 1 ? 0x00FF00u : 0x0000FFu;
+      if (p != want && !wrong++) printf("d3d11test: (slice %u, triangle %u: %06x, want %06x)\n", layer, t, p, want);
+    }
+  }
+  check(!wrong, "each triangle drawn into the slice its geometry shader's SV_RenderTargetArrayIndex names");
+  ID3D11DeviceContext_OMSetRenderTargets(g_context, 1, &g_target_view, NULL);
+  ID3D11Buffer_Release(vertices);
+  ID3D11GeometryShader_Release(gs);
+  ID3D11RenderTargetView_Release(view);
+  ID3D11Texture2D_Release(slices);
+}
+
+/* Unordered access views of the planes of an NV12 texture (R8_UINT, R8G8_UINT): a compute shader's values land in the planes. */
+static void test_plane_uavs(void) {
+  ID3D11Texture2D *tex = texture2d(16, 8, 1, DXGI_FORMAT_NV12, D3D11_BIND_UNORDERED_ACCESS | D3D11_BIND_SHADER_RESOURCE);
+  ID3D11ComputeShader *cs = NULL;
+  ID3D11Device_CreateComputeShader(g_device, dx_cs_plane_uav_dxbc, sizeof dx_cs_plane_uav_dxbc, NULL, &cs);
+  ID3D11UnorderedAccessView *views[2] = {NULL, NULL};
+  D3D11_UNORDERED_ACCESS_VIEW_DESC u;
+  memset(&u, 0, sizeof u);
+  u.Format = DXGI_FORMAT_R8_UINT;
+  u.ViewDimension = D3D11_UAV_DIMENSION_TEXTURE2D;
+  if (tex) ID3D11Device_CreateUnorderedAccessView(g_device, (ID3D11Resource *)tex, &u, &views[0]);
+  u.Format = DXGI_FORMAT_R8G8_UINT;
+  if (tex) ID3D11Device_CreateUnorderedAccessView(g_device, (ID3D11Resource *)tex, &u, &views[1]);
+  if (!tex || !cs || !views[0] || !views[1]) { check(0, "an NV12 texture with unordered access views of its planes (R8_UINT, R8G8_UINT)"); return; }
+  ID3D11DeviceContext_CSSetShader(g_context, cs, NULL, 0);
+  ID3D11DeviceContext_CSSetUnorderedAccessViews(g_context, 0, 2, views, NULL);
+  ID3D11DeviceContext_Dispatch(g_context, 2, 1, 1);
+  ID3D11UnorderedAccessView *none[2] = {NULL, NULL};
+  ID3D11DeviceContext_CSSetUnorderedAccessViews(g_context, 0, 2, none, NULL);
+  BYTE bytes[16 * 12];
+  int ok = texture2d_read(tex, 0, bytes, 1), wrong = 0;
+  for (UINT y = 0; ok && y < 8; ++y)
+    for (UINT x = 0; x < 16; ++x)
+      if (bytes[y * 16 + x] != x + 16 * y && !wrong++) printf("d3d11test: (luma %u, %u: %u)\n", x, y, bytes[y * 16 + x]);
+  for (UINT y = 0; ok && y < 4; ++y)
+    for (UINT x = 0; x < 8; ++x)
+      if ((bytes[(8 + y) * 16 + 2 * x] != x * 10 || bytes[(8 + y) * 16 + 2 * x + 1] != y * 20 + 1) && !wrong++) printf("d3d11test: (chroma %u, %u: %u %u)\n", x, y, bytes[(8 + y) * 16 + 2 * x], bytes[(8 + y) * 16 + 2 * x + 1]);
+  check(ok && !wrong, "a compute shader's stores through R8_UINT and R8G8_UINT views of an NV12 texture's planes are in the planes");
+  ID3D11UnorderedAccessView_Release(views[1]);
+  ID3D11UnorderedAccessView_Release(views[0]);
+  ID3D11ComputeShader_Release(cs);
+  ID3D11Texture2D_Release(tex);
+}
+
 static void test_render_to_levels(void) {
   D3D11_TEXTURE2D_DESC desc = {8, 8, 0, 1, DXGI_FORMAT_R8G8B8A8_UNORM, {1, 0}, D3D11_USAGE_DEFAULT, D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE, 0,
                                D3D11_RESOURCE_MISC_GENERATE_MIPS};
@@ -2523,6 +2806,10 @@ int main(void) {
       test_formats();
       test_creation_and_interop();
       test_render_to_levels();
+      test_texture_uavs();
+      test_pixel_texture_uavs();
+      test_layered_target();
+      test_plane_uavs();
       test_device5();
     }
     ID3D11DeviceContext_ClearState(g_context);

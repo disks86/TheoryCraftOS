@@ -31,6 +31,7 @@
 // What differs from the interpreter, at the edges: nrm of a zero vector, lit with y == 0 and w == 0, pow of a zero base and a zero exponent, and the precision of constants (twelve
 // decimals, nothing above 1e9) follow the GPU's arithmetic; a relative read outside CONST[0..7] reads what the host driver gives.
 #include "Kernel/Dxgkrnl/D3d9Decoded.hpp"
+#include <initializer_list>
 #include "ObjectContainer/List.hpp"
 
 namespace dxgk {
@@ -67,7 +68,8 @@ class TgsiEmitter {
   const uint32_t kColorExtra = kSys + kSysValueCount;   // colour outputs 1..3 (output 0 is kColor)
   const uint32_t kGsPosition = kColorExtra + graphics::kMaxColorTargets - 1;   // a geometry shader's input positions, up to six vertices, turned back to Direct3D's +Y up
   const uint32_t kPatchBase = kGsPosition + 6;   // a hull shader's patch constant registers (shadows of the tessellation factors)
-  const uint32_t kTempCount = kPatchBase + graphics::kMaxPatchRegisters;
+  const uint32_t kLayer = kPatchBase + graphics::kMaxPatchRegisters;   // a geometry shader's SV_RenderTargetArrayIndex (the integer in x)
+  const uint32_t kTempCount = kLayer + 1;
   uint32_t color_register(uint32_t target) const { return target == 0 ? kColor : kColorExtra + target - 1; }
   // The first output after the position and the varyings: the position as the shader wrote it (one a stream), or a hull shader's tessellation factors. (With the device's four
   // varyings of old it was OUT[5]; virgl's stream output declaration names the same register: VirglShaderModule.)
@@ -165,6 +167,20 @@ class TgsiEmitter {
   String zero() { return splat(0.0f); }
 
   // --- instructions
+  // The same with any number of parts (a memory instruction's operands, then its texture target and format).
+  void line_parts(const char* op, std::initializer_list<const String*> parts) {
+    add(body_, "  ");
+    add_uint(body_, inst_++);
+    add(body_, ": ");
+    add(body_, op);
+    bool first = true;
+    for (const String* part : parts) {
+      add(body_, first ? " " : ", ");
+      add(body_, part->view());
+      first = false;
+    }
+    add(body_, "\n");
+  }
   void line(const char* op, const String* d = nullptr, const String* s0 = nullptr, const String* s1 = nullptr, const String* s2 = nullptr) {
     add(body_, "  ");
     add_uint(body_, inst_++);
@@ -260,6 +276,15 @@ class TgsiEmitter {
   bool in_used_[16] = {};
   bool sys_used_[kSysValueCount] = {};
   bool buffer_used_[graphics::kMaxStorageBuffers] = {};
+  bool image_used_[graphics::kMaxStorageImages] = {};   // the storage images the instructions name (IMAGE[n])
+  // A storage image's TGSI texture target: one-dimensional images are two-dimensional ones a texel high here (and their arrays arrays of those).
+  const char* image_target(uint32_t slot) const {
+    switch (p_.image_dim(slot)) {
+      case D3d9Program::ImageDim::Texture1DArray: case D3d9Program::ImageDim::Texture2DArray: return "2D_ARRAY";
+      case D3d9Program::ImageDim::Texture3D: return "3D";
+      default: return "2D";
+    }
+  }
   bool shared_used_ = false;   // group-shared memory is used (MEMORY[0]), barriers too
   bool compute_ = false;
   bool geometry_ = false, hull_ = false, domain_ = false;
@@ -350,7 +375,7 @@ String TgsiEmitter::operand(const Instr::Src& s, uint32_t offset, uint32_t slot,
         unsupported_ = true;
         break;
       }
-      if (s.number >= kSysValueCount || (geometry_ ? s.number != kSysGsInstanceId : s.number == kSysGsInstanceId) || (compute_ || hull_ || domain_ ? s.number < kSysDispatchThreadId : vertex_ ? s.number != kSysVertexId && s.number != kSysInstanceId : s.number == kSysVertexId || s.number == kSysInstanceId || s.number >= kSysDispatchThreadId)) {
+      if (s.number >= kSysValueCount || (geometry_ ? s.number != kSysGsInstanceId && s.number != kSysPrimitiveId : s.number == kSysGsInstanceId) || (compute_ || hull_ || domain_ ? s.number < kSysDispatchThreadId : vertex_ ? s.number != kSysVertexId && s.number != kSysInstanceId : s.number == kSysVertexId || s.number == kSysInstanceId || s.number >= kSysDispatchThreadId)) {
         unsupported_ = true;
         break;
       }
@@ -454,7 +479,7 @@ String TgsiEmitter::operand(const Instr::Src& s, uint32_t offset, uint32_t slot,
 String TgsiEmitter::destination(const Instr::Dst& d) {
   switch (d.type) {
     case kTemp: return temp(d.number, "");
-    case kRastOut: return temp(kPosition, "");
+    case kRastOut: return temp(d.slot == kSlotLayer ? kLayer : kPosition, "");
     case kAttrOut:
     case kTexCrdOut:
       if (d.slot == kSlotPosition) return temp(kPosition, "");
@@ -868,8 +893,121 @@ bool TgsiEmitter::instruction(const Instr& ins) {
         const String v = temp(kVarying + i);
         line("MOV", &target, &v);
       }
+      if (p_.writes_layer_) {   // (the layer, an integer)
+        String layer = str();
+        add(layer, "OUT[");
+        add_uint(layer, extra() + p_.geometry_streams());
+        add(layer, "].x");
+        const String value = temp(kLayer, ".xxxx");
+        line("MOV", &layer, &value);
+      }
       line("EMIT", &stream);
       return true;
+    }
+    case kImgLoad: case kImgStore: case kImgAtomic: case kImgImmAtomic: case kImgSize: {
+      // Storage images: TGSI's LOAD / STORE / ATOM* / RESQ on IMAGE[n] (the unit is the slot), at integer coordinates - x, y and the layer or slice, a 1D image's y 0, its array's layer
+      // in z. The format is the bound image's: the text names it IMGFMT<n>, which the device puts the format of what it binds there in place of (ShaderModuleDesc::tgsi).
+      const uint32_t slot = ins.uav;
+      if (slot >= graphics::kMaxStorageImages || p_.image_dim(slot) == D3d9Program::ImageDim::None) {
+        unsupported_ = true;
+        break;
+      }
+      image_used_[slot] = true;
+      String image = str(), target = str(), format = str();
+      add(image, "IMAGE[");
+      add_uint(image, slot);
+      add(image, "]");
+      add(target, image_target(slot));
+      add(format, "IMGFMT");
+      add_uint(format, slot);
+      const D3d9Program::ImageDim dim = p_.image_dim(slot);
+      if (op == kImgSize) {
+        // RESQ: (width, height, layers or depth) of the view; resinfo's components as the dimension has them, the levels 1
+        t = begin_result(ins, true, &direct);
+        const String size = temp(kWork2), z0 = zero(), w = temp(kWork);
+        line("MOV", &size, &z0);
+        // (the host's RESQ is imageSize - of as many components as the target has - and its w the samples: only the sizes are asked for)
+        const String sizes = temp(kWork2, dim == D3d9Program::ImageDim::Texture2DArray || dim == D3d9Program::ImageDim::Texture1DArray || dim == D3d9Program::ImageDim::Texture3D ? ".xyz" : ".xy");
+        line_parts("RESQ", {&sizes, &image});
+        const String sy = temp(kWork2, ".y"), sz = temp(kWork2, ".z"), sw = temp(kWork2, ".w");
+        if (dim == D3d9Program::ImageDim::Texture1D) {
+          line("MOV", &sy, &z0);
+          line("MOV", &sz, &z0);
+        } else if (dim == D3d9Program::ImageDim::Texture1DArray) {
+          const String layers = temp(kWork2, ".zzzz");
+          line("MOV", &sy, &layers);
+          line("MOV", &sz, &z0);
+        } else if (dim == D3d9Program::ImageDim::Texture2D) {
+          line("MOV", &sz, &z0);
+        }
+        const bool saved = force_integer_;
+        force_integer_ = true;
+        String one = str();
+        add(one, "IMM[");
+        add_uint(one, imm4_bits(1, 1, 1, 1));
+        add(one, "].xxxx");
+        force_integer_ = saved;
+        line("MOV", &sw, &one);
+        if (ins.control != 2) {   // floats (0) or reciprocals (1) of the sizes (the levels as a float 1)
+          line("U2F", &size, &size);
+          if (ins.control == 1) {
+            const String xyz = temp(kWork2, ".xyz");
+            line("RCP", &xyz, &xyz);
+          }
+        }
+        String picked = temp(kWork2, ".");
+        for (uint32_t c = 0; c < 4; ++c) add(picked, StringView(&"xyzw"[ins.tex_swizzle[c] & 3], 1));
+        line("MOV", &w, &picked);
+        break;
+      }
+      // (the coordinate in the third work register)
+      const String coordinate = temp(kWork3), z0 = zero();
+      line("MOV", &coordinate, &z0);
+      const String cx = temp(kWork3, ".x"), x = component(ins.src[0], 0, 0);
+      line("MOV", &cx, &x);
+      if (dim == D3d9Program::ImageDim::Texture1DArray) {
+        const String cz = temp(kWork3, ".z"), layer = component(ins.src[0], 1, 0);
+        line("MOV", &cz, &layer);
+      } else if (dim != D3d9Program::ImageDim::Texture1D) {
+        const String cy = temp(kWork3, ".y"), y = component(ins.src[0], 1, 0);
+        line("MOV", &cy, &y);
+        if (dim != D3d9Program::ImageDim::Texture2D) {
+          const String cz = temp(kWork3, ".z"), z = component(ins.src[0], 2, 0);
+          line("MOV", &cz, &z);
+        }
+      }
+      if (op == kImgLoad) {
+        t = begin_result(ins, true, &direct);
+        const String texel = temp(kWork2), w = temp(kWork);
+        line_parts("LOAD", {&texel, &image, &coordinate, &target, &format});
+        String picked = temp(kWork2, ".");
+        for (uint32_t c = 0; c < 4; ++c) add(picked, StringView(&"xyzw"[ins.tex_swizzle[c] & 3], 1));
+        line("MOV", &w, &picked);
+        break;
+      }
+      if (op == kImgStore) {
+        const String value = operand(ins.src[1], 0, 1, nullptr, false), stored = temp(kWork2);
+        line("MOV", &stored, &value);
+        String written = str();
+        add(written, image.view());
+        add(written, ".xyzw");
+        line_parts("STORE", {&written, &coordinate, &stored, &target, &format});
+        return true;
+      }
+      static const char* const kAtomics[] = {"ATOMUADD", "ATOMAND", "ATOMOR", "ATOMXOR", "ATOMIMAX", "ATOMIMIN", "ATOMUMAX", "ATOMUMIN", "ATOMXCHG", "ATOMCAS"};
+      const String value = operand(ins.src[1], 0, 1, nullptr, true), old = temp(kWork2, ".x");
+      const char* name = ins.control < 10 ? kAtomics[ins.control] : "ATOMUADD";
+      if (ins.control == kAtomicCompareExchange) {
+        const String compare = operand(ins.src[2], 0, 2, nullptr, true);
+        line_parts(name, {&old, &image, &coordinate, &compare, &value, &target, &format});
+      } else {
+        line_parts(name, {&old, &image, &coordinate, &value, &target, &format});
+      }
+      if (op == kImgAtomic) return true;
+      t = begin_result(ins, true, &direct);
+      const String w = temp(kWork), old_all = temp(kWork2, ".xxxx");
+      line("MOV", &w, &old_all);
+      break;
     }
     case kBufLoad: case kBufStore: case kBufAtomic: case kBufImmAtomic: {
       // Storage buffers: TGSI's LOAD / STORE / ATOM* on BUFFER[n], addressed in bytes. The address of a structured buffer is index * stride + offset (an atomic gives both in the
@@ -941,7 +1079,12 @@ bool TgsiEmitter::instruction(const Instr& ins) {
       }
       static const char* const kAtomics[] = {"ATOMUADD", "ATOMAND", "ATOMOR", "ATOMXOR", "ATOMIMAX", "ATOMIMIN", "ATOMUMAX", "ATOMUMIN", "ATOMXCHG"};
       const String operand_value = operand(ins.src[1], 0, 2, nullptr, true), old = temp(kWork2, ".x");
-      line(ins.control < 9 ? kAtomics[ins.control] : "ATOMUADD", &old, &buffer, &address_source, &operand_value);
+      if (ins.control == kAtomicCompareExchange) {   // (ATOMCAS: the compare value, then the value)
+        const String compare = operand(ins.src[2], 0, 3, nullptr, true);
+        line_parts("ATOMCAS", {&old, &buffer, &address_source, &compare, &operand_value});
+      } else {
+        line(ins.control < 9 ? kAtomics[ins.control] : "ATOMUADD", &old, &buffer, &address_source, &operand_value);
+      }
       if (op == kBufAtomic) return true;
       t = begin_result(ins, true, &direct);
       const String w = temp(kWork), old_all = temp(kWork2, ".xxxx");
@@ -1419,6 +1562,13 @@ void TgsiEmitter::assemble(String* out) {
     add_uint(*out, p_.geometry_instances_);
     add(*out, "\nDCL IN[][0], POSITION\n");
     if (sys_used_[kSysGsInstanceId]) add(*out, "DCL SV[0], INVOCATIONID\n");
+    // (vPrim: an input of the primitive, not a system value - the host reads a geometry shader's PRIMID input as gl_PrimitiveIDIn, while its system value would be the
+    // output gl_PrimitiveID)
+    if (sys_used_[kSysPrimitiveId]) {
+      add(*out, "DCL IN[");
+      add_uint(*out, varyings_ + 1);
+      add(*out, "], PRIM_ID\n");
+    }
     for (uint32_t i = 0; i < varyings_; ++i) {
       add(*out, "DCL IN[][");
       add_uint(*out, i + 1);
@@ -1441,6 +1591,12 @@ void TgsiEmitter::assemble(String* out) {
       add(*out, "], GENERIC[");
       add_uint(*out, varyings_ + k);
       add(*out, "]\n");
+    }
+    // (SV_RenderTargetArrayIndex: the host's layer output, after those)
+    if (p_.writes_layer_) {
+      add(*out, "DCL OUT[");
+      add_uint(*out, extra() + p_.geometry_streams());
+      add(*out, "], LAYER\n");
     }
   }
   if (hull_ || domain_) {
@@ -1576,6 +1732,17 @@ void TgsiEmitter::assemble(String* out) {
       add_uint(*out, index);
       add(*out, "]\n");
     }
+  }
+  // (the storage images: each with its target, the format of what is bound there - IMGFMT<n>, the device's to fill in -, written)
+  for (uint32_t i = 0; i < graphics::kMaxStorageImages; ++i) {
+    if (!image_used_[i] && !(p_.image_mask() >> i & 1)) continue;
+    add(*out, "DCL IMAGE[");
+    add_uint(*out, i);
+    add(*out, "], ");
+    add(*out, image_target(i));
+    add(*out, ", IMGFMT");
+    add_uint(*out, i);
+    add(*out, ", WR\n");
   }
   add(*out, "DCL CONST[0..");
   add_uint(*out, p_.constant_registers_ - 1);
@@ -1720,9 +1887,15 @@ NtStatus TgsiEmitter::run(String* out) {
       // vGSInstanceID: the invocation
       const String z0 = zero();
       line("MOV", &reg, &z0);
-      if (k == kSysGsInstanceId) {
+      if (k == kSysGsInstanceId || k == kSysPrimitiveId) {   // (vGSInstanceID, vPrim)
         String source = str();
-        add(source, "SV[0].xxxx");
+        if (k == kSysGsInstanceId) {
+          add(source, "SV[0].xxxx");
+        } else {
+          add(source, "IN[");
+          add_uint(source, varyings_ + 1);
+          add(source, "].xxxx");
+        }
         line("MOV", &reg_x, &source);
       }
       continue;

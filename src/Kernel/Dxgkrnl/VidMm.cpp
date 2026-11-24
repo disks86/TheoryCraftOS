@@ -42,12 +42,31 @@ graphics::Format wide_format_of(Format f) {
     case Format::A8B8G8R8Uint: return graphics::Format::R8G8B8A8Uint;
     case Format::A16B16G16R16Snorm: return graphics::Format::R16G16B16A16Snorm;
     case Format::A2B10G10R10: return graphics::Format::R10G10B10A2Unorm;
+    case Format::R32Uint: return graphics::Format::R32Uint;
+    case Format::R32Sint: return graphics::Format::R32Sint;
+    case Format::R32Float: return graphics::Format::R32Float;
     default: return graphics::Format::Undefined;
   }
 }
 
+}  // namespace
+
+graphics::Format device_wide_format(Format f) { return wide_format_of(f); }
+bool storage_view_format(Format allocation, Format view, graphics::Format* out) {
+  *out = graphics::Format::Undefined;
+  if (view == Format::Unknown || view == allocation) return true;
+  // (the 8-bit RGBA image as integers, and the integer one as normalised values: the same bytes)
+  if ((allocation == Format::A8B8G8R8 || allocation == Format::X8B8G8R8) && view == Format::A8B8G8R8Uint) return *out = graphics::Format::R8G8B8A8Uint, true;
+  if (allocation == Format::A8B8G8R8Uint && view == Format::A8B8G8R8) return *out = graphics::Format::R8G8B8A8Unorm, true;
+  if (!dxgk::is_wide(allocation) || !dxgk::is_wide(view) || pixel_bytes(allocation) != pixel_bytes(view)) return false;
+  *out = wide_format_of(view);
+  return true;
+}
+
+namespace {
+
 constexpr uint64_t kMaxQueryResultBytes = 1 << 20;
-constexpr uint32_t kKnownFlags = kAllocVertexBuffer | kAllocIndexBuffer | kAllocTexture | kAllocRenderTarget | kAllocDepthStencil | kAllocPresent | kAllocStaging | kAllocShared | kAllocQueryResult | kAllocUnorderedAccess | kAllocStreamOutput | kAllocConstantBuffer | kAllocTrackState | kAllocHeap | kAllocReserved;
+constexpr uint32_t kKnownFlags = kAllocVertexBuffer | kAllocIndexBuffer | kAllocTexture | kAllocRenderTarget | kAllocDepthStencil | kAllocPresent | kAllocStaging | kAllocShared | kAllocQueryResult | kAllocUnorderedAccess | kAllocStreamOutput | kAllocConstantBuffer | kAllocTrackState | kAllocHeap | kAllocReserved | kAllocStorageImage;
 
 // The bytes of all levels of a w x h image of format `f` (pixels, or blocks of a compressed format); false if the description's levels are not possible. (w and h are at most
 // kMaxTextureDimension, so nothing overflows.)
@@ -276,6 +295,13 @@ NtStatus VidMm::create(const AllocationDesc& requested, SharedPointer<Allocation
   if (track_state && (requested.initial_state & ~kStateMask)) return status::kInvalidParameter;
   if (desc.flags == 0 || (desc.flags & ~kKnownFlags)) return status::kInvalidParameter;
   const bool buffer = (desc.flags & (kAllocVertexBuffer | kAllocIndexBuffer | kAllocQueryResult | kAllocUnorderedAccess | kAllocStreamOutput | kAllocConstantBuffer | kAllocHeap)) != 0;
+  // (a storage image: a sampled colour texture of one sample that is not sRGB, block-compressed or a cube, on a device with them)
+  if ((desc.flags & kAllocStorageImage) &&
+      (buffer || !(desc.flags & kAllocTexture) || (desc.flags & ~(kAllocStorageImage | kAllocTexture | kAllocRenderTarget | kAllocShared)) || !dxgk::is_color(desc.format) || dxgk::is_srgb(desc.format) ||
+       desc.samples != 1 || desc.kind == graphics::TextureKind::TextureCube))
+    return status::kInvalidParameter;
+  if ((desc.flags & kAllocStorageImage) && !(device_.info().features2 & graphics::kFeature2StorageImages)) return status::kNotSupported;
+  if (dxgk::is_single_channel(desc.format) && !(desc.flags & kAllocStaging) && !(device_.info().features2 & graphics::kFeature2SingleChannelFormats)) return status::kNotSupported;
   if ((desc.flags & kAllocHeap) && ((desc.flags & ~kAllocShared) != kAllocHeap || heap || requested.heap)) return status::kInvalidParameter;      // (a heap may be shared: D3D12_HEAP_FLAG_SHARED)
   if ((desc.flags & kAllocUnorderedAccess) && !(device_.info().features & graphics::kFeatureCompute)) return status::kNotSupported;
   if ((desc.flags & kAllocStreamOutput) && !(device_.info().features & graphics::kFeatureStreamOutput)) return status::kNotSupported;
@@ -316,14 +342,14 @@ NtStatus VidMm::create(const AllocationDesc& requested, SharedPointer<Allocation
     if (depth_flag && (desc.flags & ~(kAllocDepthStencil | kAllocShared))) return status::kInvalidParameter;
     if (dxgk::is_wide(desc.format)) {
       if (desc.mip_levels != 1 || (desc.flags & kAllocPresent)) return status::kInvalidParameter;
-      const uint32_t needed = dxgk::is_float(desc.format) ? graphics::kFeatureFloatFormats : dxgk::is_integer(desc.format) ? graphics::kFeatureIntegerFormats : (desc.format == Format::A16B16G16R16Snorm || desc.format == Format::A2B10G10R10) ? graphics::kFeatureSnormFormats : graphics::kFeatureUnorm16Formats;
-      if (!(desc.flags & kAllocStaging) && !(device_.info().features & needed)) return status::kNotSupported;
+      const uint32_t needed = dxgk::is_single_channel(desc.format) ? 0u : dxgk::is_float(desc.format) ? graphics::kFeatureFloatFormats : dxgk::is_integer(desc.format) ? graphics::kFeatureIntegerFormats : (desc.format == Format::A16B16G16R16Snorm || desc.format == Format::A2B10G10R10) ? graphics::kFeatureSnormFormats : graphics::kFeatureUnorm16Formats;
+      if (!(desc.flags & kAllocStaging) && (device_.info().features & needed) != needed) return status::kNotSupported;
     }
     if (dxgk::is_srgb(desc.format)) {
       if (desc.flags & kAllocPresent) return status::kInvalidParameter;
       if (!(desc.flags & kAllocStaging) && !(device_.info().features & graphics::kFeatureSrgbFormats)) return status::kNotSupported;
     }
-    if (desc.mip_levels > 1 && (desc.flags & ~(kAllocTexture | kAllocShared))) return status::kInvalidParameter;
+    if (desc.mip_levels > 1 && (desc.flags & ~(kAllocTexture | kAllocShared | kAllocStorageImage))) return status::kInvalidParameter;
     uint64_t total = 0;
     image_bytes(desc.width, desc.height, desc.mip_levels, desc.format, &total);
     if (desc.samples != 1) {
@@ -336,17 +362,22 @@ NtStatus VidMm::create(const AllocationDesc& requested, SharedPointer<Allocation
       goto sized;
     }
     if (desc.kind != graphics::TextureKind::Texture2D) {
-      // (a volume, array or cube: sampled only, one level, 8-bit colour - an array also of the wide formats, which the devices take as layers of Vec4s)
-      const bool wide_array = dxgk::is_wide(desc.format) && desc.kind == graphics::TextureKind::Texture2DArray;
-      if ((desc.flags & ~(kAllocTexture | kAllocShared)) || !(desc.flags & kAllocTexture) || desc.mip_levels != 1 || depth_flag || (dxgk::is_wide(desc.format) && !wide_array)) return status::kInvalidParameter;
+      // (a volume, array or cube: one level, sampled - and also drawn into or read and written as a storage image - or a depth buffer that is an array or a cube; of any colour format but
+      // the block-compressed ones, which are sampled only; the wide ones the devices take as layers of Vec4s)
+      const uint32_t colour_flags = kAllocTexture | kAllocShared | kAllocRenderTarget | kAllocStorageImage;
+      if (depth_flag ? (desc.flags & ~(kAllocDepthStencil | kAllocShared)) || desc.kind == graphics::TextureKind::Texture3D
+                     : (desc.flags & ~colour_flags) || !(desc.flags & kAllocTexture) || (compressed && (desc.flags & (kAllocRenderTarget | kAllocStorageImage))))
+        return status::kInvalidParameter;
+      if (desc.mip_levels != 1) return status::kInvalidParameter;
       if (desc.layers == 0 || desc.layers > graphics::kMaxTextureLayers || (desc.kind == graphics::TextureKind::TextureCube && (desc.layers != 6 || desc.width != desc.height))) return status::kInvalidParameter;
       if (!(device_.info().features & graphics::kFeatureTextureKinds)) return status::kNotSupported;
+      if ((desc.flags & (kAllocRenderTarget | kAllocDepthStencil)) && !(device_.info().features2 & graphics::kFeature2LayeredTargets)) return status::kNotSupported;
       total *= desc.layers;
     } else if (desc.layers != 1) {
       return status::kInvalidParameter;
     }
     if (depth_flag) {
-      device_bytes = uint64_t{desc.width} * desc.height * (desc.format == Format::D24S8 ? 5 : 4);
+      device_bytes = uint64_t{desc.width} * desc.height * (desc.format == Format::D24S8 ? 5 : 4) * (desc.kind == graphics::TextureKind::Texture2D ? 1 : desc.layers);
     } else {
       cpu_bytes = total;
       device_bytes = desc.flags & kAllocStaging ? 0 : total;
@@ -452,6 +483,7 @@ bool VidMm::create_device_object(Allocation& a) {
   if (d.flags & kAllocRenderTarget) id.usage |= graphics::kImageColorAttachment;
   if (d.flags & kAllocPresent) id.usage |= graphics::kImagePresent;
   if (d.flags & kAllocTexture) id.usage |= graphics::kImageSampled;
+  if (d.flags & kAllocStorageImage) id.usage |= graphics::kImageStorage;
   // (uploading the backing needs kImageSampled on some devices: a render target gets it too, and does without if the device refuses the combination)
   if (d.mip_levels == 1 && id.usage != graphics::kImageSampled) {
     graphics::ImageDesc with_sampled = id;
@@ -657,29 +689,48 @@ bool VidMm::read_back(Allocation& a) {
     return true;
   }
   const Format f = a.desc_.format;
+  const bool layered = a.desc_.kind != graphics::TextureKind::Texture2D;   // (a layered render target or storage image: each layer)
+  const uint64_t pixel_count = uint64_t{a.desc_.width} * a.desc_.height;
   if (dxgk::is_wide(f)) {
     ArrayView<graphics::Vec4> pixels;
     scratch_.clear();
-    if (!scratch_.put_zeros(uint64_t{a.desc_.width} * a.desc_.height * sizeof(graphics::Vec4)) || !scratch_.writable_view().try_cast<graphics::Vec4>(&pixels)) return false;
-    if (!a.image_->read_pixels_float(pixels)) return false;
-    ByteWriter out(a.cpu_.first(uint64_t{a.desc_.width} * a.desc_.height * pixel_bytes(f)));
+    if (!scratch_.put_zeros(pixel_count * sizeof(graphics::Vec4)) || !scratch_.writable_view().try_cast<graphics::Vec4>(&pixels)) return false;
     const graphics::Format device_format = wide_format_of(f);
-    for (const graphics::Vec4& c : pixels) graphics::encode_wide_pixel(device_format, c, out);
-    if (!out.ok()) return false;
+    const uint64_t layer_bytes = pixel_count * pixel_bytes(f);
+    for (uint32_t layer = 0; layer < a.layers(); ++layer) {
+      if (!(layered ? a.image_->read_layer_pixels_float(layer, pixels) : a.image_->read_pixels_float(pixels))) return false;
+      ByteView to;
+      if (!a.cpu_.try_subview(layer * layer_bytes, layer_bytes, &to)) return false;
+      ByteWriter out(to);
+      for (const graphics::Vec4& c : pixels) graphics::encode_wide_pixel(device_format, c, out);
+      if (!out.ok()) return false;
+    }
     a.gpu_newer_ = false;
     return true;
   }
-  ArrayView<uint32_t> backing;
-  if (!as_words(a.cpu_.first(uint64_t{a.desc_.width} * a.desc_.height * 4), &backing)) return false;
-  if (is_plain_bgra(f)) {
-    if (!a.image_->read_pixels(backing)) return false;
-  } else {
-    scratch_.clear();
-    if (!scratch_.put_zeros(backing.size() * 4)) return false;
-    ArrayView<uint32_t> logical;
-    if (!as_words(scratch_.writable_view(), &logical)) return false;
-    if (!a.image_->read_pixels(logical)) return false;
-    for (uint64_t i = 0; i < backing.size(); ++i) backing[i] = from_logical(f, logical[i]);
+  // (the 8-bit images: each layer of a layered one, level 0 of a plain one - and its other levels when shaders may have written them as a storage image)
+  const uint32_t parts = layered ? a.layers() : (a.desc_.flags & kAllocStorageImage) ? a.desc_.mip_levels : 1;
+  for (uint32_t part = 0; part < parts; ++part) {
+    uint64_t offset = 0, bytes = 0;
+    if (layered) {
+      offset = part * pixel_count * 4, bytes = pixel_count * 4;
+    } else if (!a.level_range(part, &offset, &bytes)) {
+      return false;
+    }
+    ArrayView<uint32_t> backing;
+    ByteView range;
+    if (!a.cpu_.try_subview(offset, bytes, &range) || !as_words(range, &backing)) return false;
+    auto read = [&](ArrayView<uint32_t> out) { return layered ? a.image_->read_layer_pixels(part, out) : part == 0 ? a.image_->read_pixels(out) : a.image_->read_mip_pixels(part, out); };
+    if (is_plain_bgra(f)) {
+      if (!read(backing)) return false;
+    } else {
+      scratch_.clear();
+      if (!scratch_.put_zeros(backing.size() * 4)) return false;
+      ArrayView<uint32_t> logical;
+      if (!as_words(scratch_.writable_view(), &logical)) return false;
+      if (!read(logical)) return false;
+      for (uint64_t i = 0; i < backing.size(); ++i) backing[i] = from_logical(f, logical[i]);
+    }
   }
   a.gpu_newer_ = false;
   return true;
@@ -743,8 +794,8 @@ NtStatus VidMm::set_mirror(Allocation& mirror, ArrayView<const SharedPointer<All
   if (!mirror.is_image() || mirror.is_mirror() || mirror.placed() || mirror.reserved_ || !(m.flags & kAllocTexture) || m.mip_levels != 1 || m.samples != 1 || channel == 0 ||
       (!array && m.kind != graphics::TextureKind::Texture2D) || sources.size() != (array ? m.layers : 1u))
     return status::kInvalidParameter;
-  // (a mirror that writes back is a render target of one source; one channel at least goes back)
-  if ((mode & kMirrorWriteBack) && (array || !(m.flags & kAllocRenderTarget) || channels == 0)) return status::kInvalidParameter;
+  // (a mirror that writes back is a render target or a storage image - an array of them gives each layer to its source; one channel at least goes back)
+  if ((mode & kMirrorWriteBack) && (!(m.flags & (kAllocRenderTarget | kAllocStorageImage)) || channels == 0)) return status::kInvalidParameter;
   for (const SharedPointer<Allocation>& source : sources) {
     if (!source || &source->manager() != this || source.get() == &mirror || !source->is_image() || source->is_mirror()) return status::kInvalidParameter;
     const AllocationDesc& d = source->desc_;
@@ -803,19 +854,22 @@ bool VidMm::refresh_mirror(Allocation& mirror, bool may_read_back, bool* stale) 
 }
 
 bool VidMm::write_back_mirror(Allocation& mirror) {
-  if (!mirror.writes_back() || mirror.mirror_sources_.count() != 1) return false;
-  Allocation& source = *mirror.mirror_sources_[0].source;
-  if (!read_back(mirror) || !read_back(source)) return false;
+  if (!mirror.writes_back() || mirror.mirror_sources_.count() == 0 || !read_back(mirror)) return false;
   const uint32_t channel = mirror_channel_bytes(mirror.desc_.format);
   const uint64_t pixel = 4ull * channel, bytes = uint64_t{mirror.desc_.width} * mirror.desc_.height * pixel;
-  ByteView to;
-  ConstByteView from;
-  if (!source.cpu_.try_subview(0, bytes, &to) || !ConstByteView(mirror.cpu_).try_subview(0, bytes, &from)) return false;
-  for (uint64_t at = 0; at < bytes; at += pixel)
-    for (uint32_t c = 0; c < 4; ++c)
-      if ((mirror.mirror_channels_ >> c & 1) && !to.subview(at + c * channel, channel).copy_from(from.subview(at + c * channel, channel))) return false;
-  note_cpu_write(source);
-  mirror.mirror_sources_[0].seen = source.version_;   // (the mirror holds what it gave)
+  // (each layer to its source: a mirror of one source has one)
+  for (uint64_t layer = 0; layer < mirror.mirror_sources_.count(); ++layer) {
+    Allocation& source = *mirror.mirror_sources_[layer].source;
+    if (!read_back(source)) return false;
+    ByteView to;
+    ConstByteView from;
+    if (!source.cpu_.try_subview(0, bytes, &to) || !ConstByteView(mirror.cpu_).try_subview(layer * bytes, bytes, &from)) return false;
+    for (uint64_t at = 0; at < bytes; at += pixel)
+      for (uint32_t c = 0; c < 4; ++c)
+        if ((mirror.mirror_channels_ >> c & 1) && !to.subview(at + c * channel, channel).copy_from(from.subview(at + c * channel, channel))) return false;
+    note_cpu_write(source);
+    mirror.mirror_sources_[layer].seen = source.version_;   // (the mirror holds what it gave)
+  }
   return true;
 }
 

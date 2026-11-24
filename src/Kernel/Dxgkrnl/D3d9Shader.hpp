@@ -107,6 +107,17 @@ class D3d9Program {
   uint32_t storage_stride(uint32_t slot) const { return slot < graphics::kMaxStorageBuffers ? uav_stride_[slot] : 0; }
   // Runs the shader for one thread. `constants` are the push constants; the buffers are the context's.
   void run_compute(const graphics::ComputeContext& context, const uint8_t* constants) const;
+  // Storage images (typed unordered access views of textures, dcl_uav_typed u#: compute and pixel shaders): what the shader declared slot u<slot> to be - its dimension and the type of
+  // the values it reads and writes (a float, unorm or snorm view: floats; uint or sint: the integers' bits). A register is a storage buffer or an image, never both.
+  enum class ImageDim : uint8_t { None, Texture1D, Texture1DArray, Texture2D, Texture2DArray, Texture3D };
+  enum class ImageReturn : uint8_t { Float, Uint, Sint };
+  ImageDim image_dim(uint32_t slot) const { return slot < graphics::kMaxStorageImages ? image_dim_[slot] : ImageDim::None; }
+  ImageReturn image_return(uint32_t slot) const { return slot < graphics::kMaxStorageImages ? image_return_[slot] : ImageReturn::Float; }
+  uint32_t image_mask() const { return image_mask_; }   // (bit n: u<n> is a storage image)
+  // A geometry shader that writes SV_RenderTargetArrayIndex (ShaderIo::layer).
+  bool writes_layer() const { return writes_layer_; }
+  // The graphics::DeviceFeature2 bits the program needs (storage images; the layer output).
+  uint32_t required_features2() const;
   // What the pixel shader declared texture unit `unit` to be (a DXBC dcl_resource; the others: 2D). Binding another kind to the unit makes a draw wrong, so the kernel refuses it.
   graphics::TextureKind texture_kind(uint32_t unit) const { return unit < graphics::kMaxTextureUnits ? texture_kind_[unit] : graphics::TextureKind::Texture2D; }
 
@@ -188,6 +199,10 @@ class D3d9Program {
   uint32_t shared_bytes_[graphics::kMaxSharedMemories] = {};
   bool uses_barrier_ = false;
   uint32_t texture_unit_mask_ = 0, attributes_used_ = 0;
+  ImageDim image_dim_[graphics::kMaxStorageImages] = {};
+  ImageReturn image_return_[graphics::kMaxStorageImages] = {};
+  uint32_t image_mask_ = 0;
+  bool writes_layer_ = false;
   graphics::TextureKind texture_kind_[graphics::kMaxTextureUnits] = {};
   uint8_t texture_samples_[graphics::kMaxTextureUnits] = {};   // the sample count a multisampled texture was declared with
   bool uses_system_values_ = false, uses_texel_access_ = false, uses_graphics_storage_ = false, uses_fragment_stores_ = false, uses_vertex_stores_ = false, uses_geometry_stores_ = false, uses_tessellation_stores_ = false;

@@ -47,6 +47,7 @@ enum Command : uint32_t {
   kGetQueryResult = 21,
   kBindShader = 31,
   kSetShaderBuffers = 34,
+  kSetShaderImages = 35,
   kMemoryBarrier = 36,
   kLaunchGrid = 37,
 };
@@ -87,6 +88,9 @@ constexpr uint32_t kFormatR16G16B16A16Sint = 192;
 constexpr uint32_t kFormatR8G8B8A8Uint = 180;
 constexpr uint32_t kFormatR16G16B16A16Snorm = 59;
 constexpr uint32_t kFormatR10G10B10A2Unorm = 8;
+constexpr uint32_t kFormatR8G8B8A8Unorm = 67;
+constexpr uint32_t kFormatR32Uint = 193, kFormatR32Sint = 197;   // (kFormatR32Float is 28)
+constexpr uint32_t kImageAccessReadWrite = 3;   // (PIPE_IMAGE_ACCESS_READ | WRITE: SET_SHADER_IMAGES)
 // The S3TC formats (virglrenderer's virgl_hw.h): BC1 is DXT1 with its one-bit alpha, BC2 DXT3, BC3 DXT5.
 constexpr uint32_t kFormatDxt1Rgba = 106;
 constexpr uint32_t kFormatDxt3Rgba = 107;

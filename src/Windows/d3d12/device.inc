@@ -210,6 +210,26 @@ static D3D_FEATURE_LEVEL dev_feature_level(const Dev *d) {
   return D3D_FEATURE_LEVEL_9_1;
 }
 
+/* Whether a format holds integers (no filtering, no blending). */
+static int format_integer(DXGI_FORMAT f) {
+  const FormatInfo *i = format_info(f);
+  return i && (i->kernel == KF_RGBA32UINT || i->kernel == KF_RGBA32SINT || i->kernel == KF_RGBA16UINT || i->kernel == KF_RGBA16SINT || i->kernel == KF_RGBA8UINT || i->kernel == KF_R32UINT ||
+               i->kernel == KF_R32SINT || f == DXGI_FORMAT_R16G16_SINT);
+}
+/* Unordered access to textures of the format (the kernel's storage images, DEV_FEATURE2_STORAGE_IMAGES): typed loads and stores of every format a texture's view can be
+ * made of - the colour formats that are not sRGB or block-compressed, the narrow ones and the planes of the planar ones through mirrors (texture_uav) -, and the atomic
+ * operations on R32_UINT and R32_SINT. (A cube has none: the kernel's cube is not an array.) */
+static void format_uav_support(const Dev *dev, DXGI_FORMAT format, D3D12_FORMAT_SUPPORT1 *s1, D3D12_FORMAT_SUPPORT2 *s2) {
+  const FormatInfo *i = format_info(format);
+  if (!(dev->caps.features2 & DEV_FEATURE2_STORAGE_IMAGES) || !i || !i->kernel || i->depth || i->compressed || i->kernel == KF_BGRA8_SRGB || i->kernel == KF_RGBA8_SRGB) return;
+  if (i->narrow && i->kernel != KF_A8B8G8R8 && i->kernel != KF_RGBA16) return;      /* (a mirror is of 8- or 16-bit RGBA: not of R16G16_SINT's image) */
+  *s1 |= D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW;
+  *s2 |= D3D12_FORMAT_SUPPORT2_UAV_TYPED_LOAD | D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE;
+  if (format == DXGI_FORMAT_R32_UINT || format == DXGI_FORMAT_R32_SINT)
+    *s2 |= D3D12_FORMAT_SUPPORT2_UAV_ATOMIC_ADD | D3D12_FORMAT_SUPPORT2_UAV_ATOMIC_BITWISE_OPS | D3D12_FORMAT_SUPPORT2_UAV_ATOMIC_COMPARE_STORE_OR_COMPARE_EXCHANGE |
+           D3D12_FORMAT_SUPPORT2_UAV_ATOMIC_EXCHANGE | D3D12_FORMAT_SUPPORT2_UAV_ATOMIC_SIGNED_MIN_OR_MAX | D3D12_FORMAT_SUPPORT2_UAV_ATOMIC_UNSIGNED_MIN_OR_MAX;
+}
+
 /* What the device can do: Direct3D 12 on feature level 11_0 with the tiers at their lowest. The limits that are lower than the levels' (texture units, vertex attributes, ...) are
  * those of the kernel's pipeline model: docs/win32k/Dxg.md and d3d12.c say which. */
 static HRESULT STDMETHODCALLTYPE dev_CheckFeatureSupport(Dev *This, D3D12_FEATURE feature, void *data, UINT size) {
@@ -270,6 +290,7 @@ static HRESULT STDMETHODCALLTYPE dev_CheckFeatureSupport(Dev *This, D3D12_FEATUR
         if (!i->depth && kernel_format_levels(i->kernel)) f->Support1 |= D3D12_FORMAT_SUPPORT1_MIP;
         if (format_tiled(i)) f->Support2 |= D3D12_FORMAT_SUPPORT2_TILED;      /* (the kernel's reserved textures: tile_layout) */
         if (i->depth) f->Support1 |= D3D12_FORMAT_SUPPORT1_DEPTH_STENCIL;
+        else if (format_integer(f->Format)) f->Support1 |= D3D12_FORMAT_SUPPORT1_SHADER_LOAD | D3D12_FORMAT_SUPPORT1_RENDER_TARGET;      /* (integers: loaded, not filtered or blended) */
         else f->Support1 |= D3D12_FORMAT_SUPPORT1_SHADER_SAMPLE | D3D12_FORMAT_SUPPORT1_RENDER_TARGET | D3D12_FORMAT_SUPPORT1_BLENDABLE;
         if (i->narrow || i->kernel == KF_A8R8G8B8 || i->kernel == KF_A8B8G8R8 || i->kernel == KF_X8R8G8B8 || i->kernel == KF_RGBA16 || i->kernel == KF_RGB10A2)
           f->Support1 |= D3D12_FORMAT_SUPPORT1_VIDEO_PROCESSOR_OUTPUT | D3D12_FORMAT_SUPPORT1_VIDEO_PROCESSOR_INPUT;      /* (the video processor's RGB) */
@@ -277,6 +298,7 @@ static HRESULT STDMETHODCALLTYPE dev_CheckFeatureSupport(Dev *This, D3D12_FEATUR
         f->Support1 = D3D12_FORMAT_SUPPORT1_IA_VERTEX_BUFFER;
       }
       if (f->Format == DXGI_FORMAT_R16_UINT || f->Format == DXGI_FORMAT_R32_UINT) f->Support1 |= D3D12_FORMAT_SUPPORT1_IA_INDEX_BUFFER;
+      format_uav_support(This, f->Format, &f->Support1, &f->Support2);
       return S_OK;
     }
     case D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS: {

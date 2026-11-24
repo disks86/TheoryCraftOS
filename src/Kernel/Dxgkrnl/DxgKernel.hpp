@@ -72,8 +72,10 @@ class IWaitHook {
 //   CreateRootSignature     byte_count, the serialized root signature (padded to a word)                                               reply: handle
 //   DestroyRootSignature / DestroyDescriptorHeap   handle
 //   CreateDescriptorHeap    type (0 views, 1 samplers), count                                                                          reply: handle
-//   WriteDescriptors        heap, count, then per descriptor 14 words: index, kind (a DescriptorKind: 0 clear, 1 SRV, 2 UAV, 3 CBV, 4 sampler), allocation handle, offset (lo, hi), size (lo, hi),
-//                           and the sampler: filter, address_u, address_v, mip_filter, lod_bias (float), min_lod, max_lod
+//   WriteDescriptors        heap, count, then per descriptor 14 words: index, kind (a DescriptorKind: 0 clear, 1 SRV, 2 UAV, 3 CBV, 4 sampler, 5 UAV of a texture), allocation handle, offset (lo, hi),
+//                           size (lo, hi), and the sampler: filter, address_u, address_v, mip_filter, lod_bias (float), min_lod, max_lod. A UAV of a texture has its level in the offset's low word,
+//                           its first layer in the high word, its layer count in the size's low word and the format of the view in the high word (a Format: 0 the allocation's own,
+//                           another wide format of the same pixel size for a wide allocation); its sampler words are zeros
 //   CopyDescriptors         destination heap, destination index, source heap, source index, count
 //   UpdateTileMappings      reserved allocation, first tile, heap (0: unmap), heap offset (lo, hi), tile count
 //   QueryStreamOutput       allocation handle (a stream output buffer)                                                                 reply: how far stream output got in it (an offset, lo, hi)

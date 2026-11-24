@@ -75,6 +75,8 @@ inline Vec4 decode_wide_pixel(Format f, ByteReader& in) {
       const uint32_t word = in.le32();
       return {unorm(word & 0x3FF, 1023), unorm((word >> 10) & 0x3FF, 1023), unorm((word >> 20) & 0x3FF, 1023), unorm(word >> 30, 3)};
     }
+    case Format::R32Uint: case Format::R32Sint: return {bits_float(in.le32()), 0.0f, 0.0f, bits_float(1)};
+    case Format::R32Float: return {bits_float(in.le32()), 0.0f, 0.0f, 1.0f};
     default: {   // (single floats, or 32-bit integers as their bits)
       const float r = bits_float(in.le32()), g = bits_float(in.le32()), b = bits_float(in.le32()), a = bits_float(in.le32());
       return {r, g, b, a};
@@ -101,6 +103,7 @@ inline void encode_wide_pixel(Format f, const Vec4& c, ByteWriter& out) {
       return;
     case Format::R8G8B8A8Uint: out.le32(clamp_unsigned(float_bits(c.x), 255) | clamp_unsigned(float_bits(c.y), 255) << 8 | clamp_unsigned(float_bits(c.z), 255) << 16 | clamp_unsigned(float_bits(c.w), 255) << 24); return;
     case Format::R10G10B10A2Unorm: out.le32(to_unorm(c.x, 1023) | to_unorm(c.y, 1023) << 10 | to_unorm(c.z, 1023) << 20 | to_unorm(c.w, 3) << 30); return;
+    case Format::R32Uint: case Format::R32Sint: case Format::R32Float: out.le32(float_bits(c.x)); return;
     default: out.le32(float_bits(c.x)), out.le32(float_bits(c.y)), out.le32(float_bits(c.z)), out.le32(float_bits(c.w)); return;
   }
 }
@@ -120,6 +123,8 @@ inline Vec4 quantize_wide_pixel(Format f, Vec4 c) {
       auto q = [](float v) { return bits_float(static_cast<uint32_t>(clamp_signed(static_cast<int32_t>(float_bits(v)), -32768, 32767))); };
       return {q(c.x), q(c.y), q(c.z), q(c.w)};
     }
+    case Format::R32Uint: case Format::R32Sint: return {c.x, 0.0f, 0.0f, bits_float(1)};
+    case Format::R32Float: return {c.x, 0.0f, 0.0f, 1.0f};
     default: return c;
   }
 }

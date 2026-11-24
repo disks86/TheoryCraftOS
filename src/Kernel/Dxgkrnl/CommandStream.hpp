@@ -24,6 +24,9 @@
 // State (pass, pipeline, buffers, textures) does not carry over from one stream to the next.
 //
 //   BeginPass        color_index, depth_index (kNoAllocation: none), flags, clear r, g, b, a (floats), clear depth (float), clear stencil, [up to three more colour indices (kFeatureMultipleTargets)]
+//                    [with kPassLayers in the flags, last: for each colour target and then the depth buffer its first layer and its layer count - 2 * (targets + 1) words (the adapter's
+//                    kFeature2LayeredTargets: targets that are arrays, volumes or cubes; a primitive goes to the layer its SV_RenderTargetArrayIndex names, the first when that is past
+//                    the target's count; a 2D image's is layer 0 of 1, and the depth pair of a pass without one is 0, 1)]
 //   EndPass
 //   BindPipeline     pipeline handle
 //   BindVertexBuffer allocation_index, offset
@@ -102,6 +105,10 @@
 //   ResolveEncoderMetadata metadata_index, metadata_offset, out_index, out_offset[, frame_psnr_index, frame_psnr_offset, subregion_psnr_index, subregion_psnr_offset]
 //                    (outside a pass: EncodeFrame's metadata as D3D12_VIDEO_ENCODER_OUTPUT_METADATA and its slice records into the buffer `out`, and the PSNRs into the other two
 //                    when given - kNoAllocation for none; each kVideoEncodeWrite)
+//   BindUavImage     slot, allocation_index, level, first_layer, layer_count [, view format]   (a storage image: u<slot> of a shader that declares it typed, slot below kMaxStorageImages; a kAllocStorageImage
+//                    allocation, a level it has and layers it has (an array's layers, a volume's slices); the view's Format, 0 (or left out) the allocation's
+//                    own, another wide format of the same pixel size for a wide allocation. Outside a pass, and in one with the adapter's kFeature2StorageImagesInDraws;
+//                    kAllocationIndex kNoAllocation: none. What the shaders write is in the image after the dispatch or the draw)
 //   EndQuery         (the count of fragments that passed the depth and stencil tests since BeginQuery is written there - a little-endian 64-bit number - once the stream has run)
 #pragma once
 #include "Kernel/Dxgkrnl/DxgTypes.hpp"
@@ -147,6 +154,7 @@ enum class Op : uint16_t {
   ResolveMotionVectors,
   EncodeFrame,
   ResolveEncoderMetadata,
+  BindUavImage,   // (37)
 };
 constexpr uint32_t kVideoProcessStreamWords = 15;
 constexpr uint32_t kVideoProcessExtension = 0x31585056;   // 'VPX1': VideoProcess's optional part follows
@@ -178,7 +186,7 @@ constexpr uint32_t kStreamOutputAppendOffset = 0xFFFFFFFFu;   // SetStreamOutput
 constexpr uint32_t kMaxPacketWords = 1 + (1 + graphics::kMaxPushConstantBytes / 4 > kVideoProcessMaxWords ? 1 + graphics::kMaxPushConstantBytes / 4 : kVideoProcessMaxWords);
 constexpr uint64_t kMaxCommandBytes = 16 * 1024 * 1024;
 
-enum BeginPassFlags : uint32_t { kPassClearColor = 1u << 0, kPassClearDepth = 1u << 1, kPassClearStencil = 1u << 2 };
+enum BeginPassFlags : uint32_t { kPassClearColor = 1u << 0, kPassClearDepth = 1u << 1, kPassClearStencil = 1u << 2, kPassLayers = 1u << 3 };
 
 inline uint32_t float_bits(float f) { return __builtin_bit_cast(uint32_t, f); }
 inline float bits_float(uint32_t w) { return __builtin_bit_cast(float, w); }
@@ -201,6 +209,15 @@ class CommandWriter {
     for (uint32_t w : {color, depth, flags, float_bits(clear_color.x), float_bits(clear_color.y), float_bits(clear_color.z), float_bits(clear_color.w), float_bits(clear_depth), clear_stencil})
       ok_ &= bytes_.put32(w);
     for (uint32_t w : extra) ok_ &= bytes_.put32(w);
+  }
+  // A pass that draws into layers of its targets (kPassLayers): `layers` has a first layer and a count for each colour target (color, then `extra`) and then for the depth buffer.
+  void begin_pass_layers(uint32_t color, std::initializer_list<uint32_t> extra, uint32_t depth, uint32_t flags, graphics::Vec4 clear_color, float clear_depth, uint32_t clear_stencil,
+                         std::initializer_list<uint32_t> layers) {
+    ok_ &= bytes_.put32(static_cast<uint32_t>(Op::BeginPass) | ((10 + static_cast<uint32_t>(extra.size() + layers.size())) << 16));
+    for (uint32_t w : {color, depth, flags | kPassLayers, float_bits(clear_color.x), float_bits(clear_color.y), float_bits(clear_color.z), float_bits(clear_color.w), float_bits(clear_depth), clear_stencil})
+      ok_ &= bytes_.put32(w);
+    for (uint32_t w : extra) ok_ &= bytes_.put32(w);
+    for (uint32_t w : layers) ok_ &= bytes_.put32(w);
   }
   void end_pass() { packet(Op::EndPass, {}); }
   void bind_pipeline(Handle pipeline) { packet(Op::BindPipeline, {pipeline}); }
@@ -280,6 +297,9 @@ class CommandWriter {
     packet(Op::CopyBufferImage, {direction, image, level, layer, x, y, width, height, buffer, offset, row_pitch, static_cast<uint32_t>(narrow)});
   }
   void bind_uav(uint32_t slot, uint32_t allocation, uint32_t offset, uint32_t size) { packet(Op::BindUav, {slot, allocation, offset, size}); }
+  void bind_uav_image(uint32_t slot, uint32_t allocation, uint32_t level = 0, uint32_t first_layer = 0, uint32_t layer_count = 1, Format view = Format::Unknown) {
+    packet(Op::BindUavImage, {slot, allocation, level, first_layer, layer_count, static_cast<uint32_t>(view)});
+  }
   struct DecodeArgs {
     Handle decoder = 0;
     uint32_t buffer = kNoAllocation, picture_offset = 0, picture_bytes = 0, matrix_offset = 0, matrix_bytes = 0, slices_offset = 0, slices_bytes = 0;

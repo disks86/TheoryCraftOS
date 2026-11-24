@@ -331,6 +331,58 @@ static BOOL buffer_descriptor(Dev *d, const View *v, BOOL unordered, D3D12_CPU_D
   return TRUE;
 }
 
+/* The descriptor of a texture's unordered access view: Direct3D 12's view of the same level and layers (a planar texture's: the plane of the slices, which Direct3D 12 below
+ * writes through a mirror of them). */
+static void texture_uav_descriptor(Dev *d, const View *v, D3D12_CPU_DESCRIPTOR_HANDLE at) {
+  const Tex *t = v->tex;
+  const D3D11_UNORDERED_ACCESS_VIEW_DESC *u = &v->desc.uav;
+  D3D12_UNORDERED_ACCESS_VIEW_DESC x;
+  memset(&x, 0, sizeof x);
+  x.Format = t->planar ? v->plane_format : u->Format != DXGI_FORMAT_UNKNOWN ? u->Format : t->desc.Format;
+  if (!t->planar && x.Format == t->desc.Format) x.Format = t->stored;      /* (the format Direct3D 12 keeps it in) */
+  switch (u->ViewDimension) {
+    case D3D11_UAV_DIMENSION_TEXTURE1D: x.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D; x.Texture2D.MipSlice = u->Texture1D.MipSlice; break;
+    case D3D11_UAV_DIMENSION_TEXTURE1DARRAY:
+      x.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2DARRAY;
+      x.Texture2DArray.MipSlice = u->Texture1DArray.MipSlice;
+      x.Texture2DArray.FirstArraySlice = u->Texture1DArray.FirstArraySlice;
+      x.Texture2DArray.ArraySize = u->Texture1DArray.ArraySize;
+      break;
+    case D3D11_UAV_DIMENSION_TEXTURE2D:
+      if (t->planar && t->desc.ArraySize > 1) {      /* (a plane of a slice of an array) */
+        x.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2DARRAY;
+        x.Texture2DArray.FirstArraySlice = v->array_slice;
+        x.Texture2DArray.ArraySize = 1;
+        x.Texture2DArray.PlaneSlice = v->plane;
+      } else {
+        x.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+        x.Texture2D.MipSlice = u->Texture2D.MipSlice;
+        x.Texture2D.PlaneSlice = t->planar ? v->plane : 0;
+      }
+      break;
+    case D3D11_UAV_DIMENSION_TEXTURE2DARRAY:
+      x.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2DARRAY;
+      x.Texture2DArray.MipSlice = u->Texture2DArray.MipSlice;
+      x.Texture2DArray.FirstArraySlice = u->Texture2DArray.FirstArraySlice;
+      x.Texture2DArray.ArraySize = u->Texture2DArray.ArraySize;
+      x.Texture2DArray.PlaneSlice = t->planar ? v->plane : 0;
+      break;
+    case D3D11_UAV_DIMENSION_TEXTURE3D:
+      x.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE3D;
+      x.Texture3D.MipSlice = u->Texture3D.MipSlice;
+      x.Texture3D.FirstWSlice = u->Texture3D.FirstWSlice;
+      x.Texture3D.WSize = u->Texture3D.WSize;
+      break;
+    default: ID3D12Device_CreateUnorderedAccessView(d->d12, NULL, NULL, NULL, at); return;
+  }
+  /* (a level the kernel does not keep - the other levels of an array or a volume -: nothing to write) */
+  if ((x.ViewDimension == D3D12_UAV_DIMENSION_TEXTURE2D ? x.Texture2D.MipSlice : x.ViewDimension == D3D12_UAV_DIMENSION_TEXTURE3D ? x.Texture3D.MipSlice : x.Texture2DArray.MipSlice) >= t->kmips) {
+    ID3D12Device_CreateUnorderedAccessView(d->d12, NULL, NULL, NULL, at);
+    return;
+  }
+  ID3D12Device_CreateUnorderedAccessView(d->d12, t->res, NULL, &x, at);
+}
+
 /* The tables of a draw or a dispatch: shader resources t0 .. t7 (`kinds`: what the shaders declare there, for what fills an empty slot), samplers s0 .. s7, and the
  * unordered access views u0 .. u7 the shaders declare (`uav_mask`). The handles go into Dev.table_*. `cache`: a table the same as the last one is used again. */
 static BOOL tables_record(Dev *d, View *const *srvs, Sampler *const *samplers, const BYTE *kinds, View *const *uavs, UINT uav_mask, BOOL cache) {
@@ -415,7 +467,8 @@ static BOOL tables_record(Dev *d, View *const *srvs, Sampler *const *samplers, c
       const View blank = {.buf = d->blank_uav, .offset = 0, .size = d->blank_uav->desc.ByteWidth};
       if (v && v->buf) { if (!buffer_descriptor(d, v, TRUE, at)) return FALSE; }
       else if ((uav_mask >> i & 1) && !v) buffer_descriptor(d, &blank, TRUE, at);      /* (D3D11: what is written to nothing is lost; here it goes into a buffer of its own) */
-      else ID3D12Device_CreateUnorderedAccessView(d->d12, NULL, NULL, NULL, at);      /* (not declared, or a texture's view: the kernel has no unordered access to textures) */
+      else if (v && v->tex) texture_uav_descriptor(d, v, at);
+      else ID3D12Device_CreateUnorderedAccessView(d->d12, NULL, NULL, NULL, at);      /* (not declared) */
       at.ptr += step_views;
     }
     d->view_used += UAV_SLOTS;
@@ -451,10 +504,26 @@ static void tables_mark_used(Dev *d, View *const *srvs, View *const *uavs, UINT 
     else srvs[i]->buf->used = d->epoch;
   }
   for (UINT i = 0; i < UAV_SLOTS; ++i) {
-    if (!(uav_mask >> i & 1) || !uavs[i] || !uavs[i]->buf) continue;
+    if (!(uav_mask >> i & 1) || !uavs[i]) continue;
+    if (uavs[i]->tex) {
+      /* (a texture the shaders write: what reads it later sends the list first; a render target's views load it again) */
+      Tex *t = uavs[i]->tex;
+      t->used = t->written = d->epoch;
+      ++t->version;
+      continue;
+    }
     Buf *b = uavs[i]->buf;
     b->used = b->written = d->epoch;
     ++b->version;      /* (what the GPU writes: a converted copy of it is made again) */
+  }
+}
+/* Before a draw or dispatch records anything: the textures its unordered access views write are brought up to date (what their render target views drew) and, if the list
+ * samples them, the list is sent first (the kernel keeps a texture bound the way a list first uses it). */
+static void uav_textures_before(Dev *d, View *const *uavs, UINT uav_mask) {
+  for (UINT i = 0; i < UAV_SLOTS; ++i) {
+    if (!(uav_mask >> i & 1) || !uavs[i] || !uavs[i]->tex) continue;
+    tex_sync(d, uavs[i]->tex);
+    tex_before_write(d, uavs[i]->tex);
   }
 }
 
@@ -600,6 +669,12 @@ static BOOL draw_prepare(Ctx *c, BOOL indexed) {
   if (c->dsv) tex_before_write(d, c->dsv->tex);
   /* (... nor be sampled after the list has drawn into it, cleared it or copied into it: the draw would see the texture as it was before the list) */
   for (UINT i = 0; i < TEXTURE_SLOTS; ++i) if (slot_view(c, i) && slot_view(c, i)->tex) tex_before_read(d, slot_view(c, i)->tex);
+  {
+    UINT uav_mask = 0;
+    const Shader *writers[5] = {c->vs, c->ps, c->gs, c->hs, c->ds};
+    for (UINT k = 0; k < 5; ++k) if (writers[k]) uav_mask |= writers[k]->uav_mask;
+    uav_textures_before(d, c->ps_uav, uav_mask);
+  }
   if (d->ring_used + CONSTANT_BLOCK > RING_BYTES || d->view_used + TEXTURE_SLOTS + UAV_SLOTS > VIEW_HEAP || d->sampler_used + TEXTURE_SLOTS > VIEW_HEAP) flush(d);
   ID3D12PipelineState *pipeline = pipeline_get(d, c);
   if (!pipeline) return FALSE;
@@ -1149,6 +1224,7 @@ static BOOL compute_prepare(Ctx *c) {
   if (!cs) return FALSE;
   for (UINT i = 0; i < TEXTURE_SLOTS; ++i) if (c->cs_srv[i] && c->cs_srv[i]->tex) tex_sync(d, c->cs_srv[i]->tex);
   for (UINT i = 0; i < TEXTURE_SLOTS; ++i) if (c->cs_srv[i] && c->cs_srv[i]->tex) tex_before_read(d, c->cs_srv[i]->tex);
+  uav_textures_before(d, c->cs_uav, cs->uav_mask);
   if (d->ring_used + CONSTANT_BLOCK > RING_BYTES || d->view_used + TEXTURE_SLOTS + UAV_SLOTS > VIEW_HEAP || d->sampler_used + TEXTURE_SLOTS > VIEW_HEAP) flush(d);
   if (!cs->compute) {
     D3D12_COMPUTE_PIPELINE_STATE_DESC pd;
@@ -1396,14 +1472,19 @@ static void STDMETHODCALLTYPE ctx_UpdateSubresource(Ctx *c, ID3D11Resource *reso
 
 /* A rectangle of one subresource into another, by way of memory (what Direct3D 12 here does not copy itself). */
 static void tex_copy_slow(Dev *d, Tex *to, UINT to_sub, UINT x, UINT y, Tex *from, UINT from_sub, const D3D11_BOX *box) {
-  if (to->bpp != from->bpp || to->depth || from->depth || to->kind == 1 || from->kind == 1 || to->block || from->block) return;      /* (volumes and compressed textures are not copied) */
+  /* (a volume: each slice of the box - all of the level's without one - into the slice of the other volume at the same place; a volume and another kind are not copied, nor
+   * compressed textures) */
+  if (to->bpp != from->bpp || to->depth || from->depth || (to->kind == 1) != (from->kind == 1) || to->block || from->block) return;
   const UINT level = from_sub % from->desc.MipLevels, w = mip_size(from->desc.Width, level), h = mip_size(from->desc.Height, level);
   const UINT to_level = to_sub % to->desc.MipLevels, to_w = mip_size(to->desc.Width, to_level), to_h = mip_size(to->desc.Height, to_level);
   const UINT x0 = box ? box->left : 0, y0 = box ? box->top : 0, x1 = box ? box->right : w, y1 = box ? box->bottom : h;
+  const UINT depth = tex_slices(from, from_sub), to_depth = tex_slices(to, to_sub), z0 = box ? box->front : 0, z1 = box ? box->back : depth;
   if (x0 >= x1 || y0 >= y1 || x1 > w || y1 > h || x > to_w || y > to_h || x1 - x0 > to_w - x || y1 - y0 > to_h - y) return;
+  if (z0 >= z1 || z1 > depth || z1 - z0 > to_depth) return;
   BYTE *pixels = mem_alloc((SIZE_T)w * h * from->bpp);
-  if (pixels && SUCCEEDED(tex_read(d, from, from_sub, 0, pixels)))
-    tex_write(d, to, to_sub, x, y, 0, x1 - x0, y1 - y0, pixels + ((SIZE_T)y0 * w + x0) * from->bpp, w * from->bpp);
+  for (UINT z = z0; pixels && z < z1; ++z)
+    if (SUCCEEDED(tex_read(d, from, from_sub, z, pixels)))
+      tex_write(d, to, to_sub, x, y, z - z0, x1 - x0, y1 - y0, pixels + ((SIZE_T)y0 * w + x0) * from->bpp, w * from->bpp);
   mem_free(pixels);
 }
 static BOOL tex_simple(const Tex *t) { return t->desc.MipLevels == 1 && t->desc.ArraySize == 1 && t->kind == 0 && !t->depth; }

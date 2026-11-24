@@ -1730,10 +1730,12 @@ class SpyDevice final : public graphics::IGraphicsDevice {
   bool qpu_rows = false;
   uint32_t limit = 0;   // 0: the inner device's push constant limit
   uint32_t feature_mask = 0xFFFFFFFFu;   // the features the device lets through
+  uint32_t feature2_mask = 0xFFFFFFFFu;  // ... and of the second word
   bool no_blend_constant = false;        // the device says it has no constant blend factors
   graphics::DeviceInfo info() const override {
     graphics::DeviceInfo i = inner_.info();
     i.features &= feature_mask;
+    i.features2 &= feature2_mask;
     if (no_blend_constant) i.blend_constant = false;
     if (limit) i.max_push_constant_bytes = limit;
     return i;
@@ -3415,14 +3417,20 @@ void test_texture_kinds() {
   CHECK(create(TextureKind::Texture2DArray, 256, 2, 2) == status::kSuccess);
   CHECK(create(TextureKind::TextureCube, 6, 4, 4) == status::kSuccess);
   CHECK(create(TextureKind::Texture3D, 4, 4, 4, kAllocTexture | kAllocShared, Format::X8B8G8R8) == status::kSuccess);
-  // What cannot be: no layers, too many, a cube that is not six squares, a render target, mipmaps, a float or depth format, staging, layers on a plain texture.
+  // (with the device's kFeature2LayeredTargets and kFeature2StorageImages: layered render targets and storage images, of any colour format; a wide volume too)
+  CHECK(create(TextureKind::Texture3D, 4, 4, 4, kAllocTexture | kAllocRenderTarget) == status::kSuccess);
+  CHECK(create(TextureKind::Texture2DArray, 3, 4, 4, kAllocTexture | kAllocRenderTarget | kAllocStorageImage, Format::A32B32G32R32F) == status::kSuccess);
+  CHECK(create(TextureKind::Texture3D, 4, 4, 4, kAllocTexture, Format::A16B16G16R16F) == status::kSuccess);
+  CHECK(create(TextureKind::Texture3D, 4, 4, 4, kAllocTexture | kAllocStorageImage, Format::R32Uint) == status::kSuccess);
+  // What cannot be: no layers, too many, a cube that is not six squares, a storage cube, a storage image without kAllocTexture or of sRGB, mipmaps, staging, layers on a plain texture.
   CHECK(create(TextureKind::Texture3D, 0, 4, 4) == status::kInvalidParameter);
   CHECK(create(TextureKind::Texture2DArray, 257, 4, 4) == status::kInvalidParameter);
   CHECK(create(TextureKind::TextureCube, 5, 4, 4) == status::kInvalidParameter);
   CHECK(create(TextureKind::TextureCube, 6, 4, 8) == status::kInvalidParameter);
-  CHECK(create(TextureKind::Texture3D, 4, 4, 4, kAllocTexture | kAllocRenderTarget) == status::kInvalidParameter);
+  CHECK(create(TextureKind::TextureCube, 6, 4, 4, kAllocTexture | kAllocStorageImage) == status::kInvalidParameter);
+  CHECK(create(TextureKind::Texture2DArray, 2, 4, 4, kAllocStorageImage) == status::kInvalidParameter);
+  CHECK(create(TextureKind::Texture2DArray, 2, 4, 4, kAllocTexture | kAllocStorageImage, Format::A8R8G8B8Srgb) == status::kInvalidParameter);
   CHECK(create(TextureKind::Texture3D, 4, 4, 4, kAllocTexture, Format::A8R8G8B8, 2) == status::kInvalidParameter);
-  CHECK(create(TextureKind::Texture3D, 4, 4, 4, kAllocTexture, Format::A16B16G16R16F) == status::kInvalidParameter);
   CHECK(create(TextureKind::Texture3D, 4, 4, 4, kAllocStaging) == status::kInvalidParameter);
   CHECK(create(TextureKind::Texture2D, 2, 4, 4) == status::kInvalidParameter);
   // The lock shows all the layers, one after the other.
@@ -3746,6 +3754,180 @@ void test_compute_kernel() {
   d.flags = kAllocUnorderedAccess, d.size = 64;
   CHECK(kernel.create_allocation(kPid, dev, d, &refused) == status::kNotSupported);
   CHECK(kernel.create_shader(kPid, dev, sd, &refused) == status::kNotSupported);
+}
+
+
+// Storage images (BindUavImage, kAllocStorageImage) on the CPU renderer: a compute shader writing a 2D array, the atomics on R32 images of one, two and three dimensions (one an
+// R32_UINT view of an R32_FLOAT allocation), and what is refused.
+void test_storage_images_kernel() {
+  Env e;
+  auto blob_shader = [&](const char* name, graphics::ShaderStage stage, Handle* out) {
+    const std::vector<uint8_t> code = read_blob(name);
+    ShaderDesc sd;
+    sd.kind = ShaderKind::Dxbc, sd.stage = stage, sd.code = ConstByteView(code.data(), code.size());
+    return !code.empty() && e.kernel.create_shader(kPid, e.dev, sd, out) == status::kSuccess;
+  };
+  Handle fill_cs = 0, atomic_cs = 0, fill = 0, atomic = 0;
+  CHECK(blob_shader("cs_uav_array.dxbc", graphics::ShaderStage::Compute, &fill_cs) && blob_shader("cs_uav_atomic.dxbc", graphics::ShaderStage::Compute, &atomic_cs));
+  PipelineDesc pd;
+  pd.compute_shader = fill_cs;
+  CHECK(e.kernel.create_pipeline(kPid, e.dev, pd, &fill) == status::kSuccess);
+  pd.compute_shader = atomic_cs;
+  CHECK(e.kernel.create_pipeline(kPid, e.dev, pd, &atomic) == status::kSuccess);
+  auto image = [&](graphics::TextureKind kind, uint32_t layers, uint32_t w, uint32_t h, Format f, uint32_t flags = kAllocTexture | kAllocStorageImage) {
+    AllocationDesc d;
+    d.flags = flags, d.format = f, d.width = w, d.height = h, d.kind = kind, d.layers = layers;
+    Handle out = 0;
+    return e.kernel.create_allocation(kPid, e.dev, d, &out) == status::kSuccess ? out : Handle{0};
+  };
+  using graphics::TextureKind;
+  const Handle picture = image(TextureKind::Texture2DArray, 3, 8, 8, Format::A8B8G8R8), plain = image(TextureKind::Texture2D, 1, 8, 8, Format::A8B8G8R8, kAllocTexture);
+  const Handle counts = image(TextureKind::Texture2D, 1, 4, 1, Format::R32Uint), least = image(TextureKind::Texture2D, 1, 4, 1, Format::R32Sint);
+  const Handle flags = image(TextureKind::Texture2D, 1, 4, 1, Format::R32Float), most = image(TextureKind::Texture3D, 2, 2, 2, Format::R32Sint);
+  CHECK(picture && plain && counts && least && flags && most);
+  auto run = [&](auto build) {
+    CommandWriter w(e.allocator);
+    build(w);
+    return w.ok() ? e.render(w, {picture, plain, counts, least, flags, most}) : status::kNoMemory;
+  };
+  CHECK(run([&](CommandWriter& w) { w.bind_pipeline(fill); w.bind_uav_image(0, 0, 0, 0, 3); w.dispatch(1, 1, 3); }) == status::kSuccess);
+  LockResult lock;
+  CHECK(e.kernel.lock(kPid, picture, kLockReadOnly, 0, &lock) == status::kSuccess);
+  int wrong = 0;
+  auto unorm8 = [](float v) { return static_cast<uint8_t>(v * 255.0f + 0.5f); };
+  for (uint32_t z = 0; z < 3; ++z)
+    for (uint32_t i = 0; i < 64; ++i) {
+      const uint8_t* t = lock.data.data() + (z * 64 + i) * 4;
+      if (t[0] != unorm8((i % 8) / 8.0f) || t[1] != unorm8((i / 8) / 8.0f) || t[2] != unorm8(z / 3.0f) || t[3] != 255) ++wrong;
+    }
+  e.kernel.unlock(kPid, picture);
+  CHECK(wrong == 0);
+  // The atomics: starting values written by the CPU (counts and bits 0, the least the largest int, the most the smallest).
+  auto fill_words = [&](Handle a, uint32_t value, uint32_t count) {
+    std::vector<uint8_t> bytes(count * 4);
+    for (uint32_t i = 0; i < count; ++i) for (uint32_t k = 0; k < 4; ++k) bytes[i * 4 + k] = static_cast<uint8_t>(value >> (8 * k));
+    return e.write(a, ConstByteView(bytes.data(), bytes.size()));
+  };
+  CHECK(fill_words(counts, 0, 4) && fill_words(least, 0x7FFFFFFFu, 4) && fill_words(flags, 0, 4) && fill_words(most, 0x80000000u, 8));
+  const Format r32u = Format::R32Uint;
+  CHECK(run([&](CommandWriter& w) {
+          w.bind_pipeline(atomic);
+          w.bind_uav_image(0, 2), w.bind_uav_image(1, 3), w.bind_uav_image(2, 4, 0, 0, 1, r32u), w.bind_uav_image(3, 5, 0, 0, 2);
+          w.dispatch(1);
+        }) == status::kSuccess);
+  auto words = [&](Handle a, uint32_t count) {
+    std::vector<uint32_t> out(count, 0);
+    LockResult l;
+    if (e.kernel.lock(kPid, a, kLockReadOnly, 0, &l) != status::kSuccess) return out;
+    ByteReader in(l.data);
+    for (uint32_t& v : out) v = in.le32();
+    e.kernel.unlock(kPid, a);
+    return out;
+  };
+  const std::vector<uint32_t> c = words(counts, 4), l = words(least, 4), f = words(flags, 4), m = words(most, 8);
+  CHECK(c[0] == 16 && c[1] == 16 && c[2] == 16 && c[3] == 16);
+  CHECK(static_cast<int32_t>(l[0]) == -60 && static_cast<int32_t>(l[3]) == -63);
+  CHECK(f[0] == 0xFFFFFFFFu && f[1] == 1 && f[2] == 163 && f[3] == 162);   // (the CPU runs the threads in order)
+  for (uint32_t i = 0; i < 8; ++i) CHECK(m[i] == 56 + i);
+  // Refused: nothing bound where the shader declares an image; an integer image where it declares floats (and the other way); a texture that is not a storage image; layers or a
+  // level the image has not; a view of another pixel size; a 2D slot given several layers.
+  CHECK(run([&](CommandWriter& w) { w.bind_pipeline(fill); w.dispatch(1); }) == status::kInvalidParameter);
+  CHECK(run([&](CommandWriter& w) { w.bind_pipeline(fill); w.bind_uav_image(0, 2); w.dispatch(1); }) == status::kInvalidParameter);
+  CHECK(run([&](CommandWriter& w) { w.bind_pipeline(atomic); w.bind_uav_image(0, 0), w.bind_uav_image(1, 3), w.bind_uav_image(2, 4, 0, 0, 1, r32u), w.bind_uav_image(3, 5, 0, 0, 2); w.dispatch(1); }) == status::kInvalidParameter);
+  CHECK(run([&](CommandWriter& w) { w.bind_uav_image(0, 1); }) == status::kInvalidParameter);
+  CHECK(run([&](CommandWriter& w) { w.bind_uav_image(0, 0, 0, 2, 2); }) == status::kInvalidParameter);
+  CHECK(run([&](CommandWriter& w) { w.bind_uav_image(0, 0, 1, 0, 1); }) == status::kInvalidParameter);
+  CHECK(run([&](CommandWriter& w) { w.bind_uav_image(0, 0, 0, 0, 1, Format::A32B32G32R32Uint); }) == status::kInvalidParameter);
+  CHECK(run([&](CommandWriter& w) { w.bind_uav_image(graphics::kMaxStorageImages, 0); }) == status::kInvalidParameter);
+  CHECK(run([&](CommandWriter& w) { w.bind_pipeline(atomic); w.bind_uav_image(0, 0, 0, 0, 3), w.bind_uav_image(1, 3), w.bind_uav_image(2, 4, 0, 0, 1, r32u), w.bind_uav_image(3, 5, 0, 0, 2); w.dispatch(1); }) == status::kInvalidParameter);
+  // A device without storage images: no such allocations, no shaders that declare them.
+  FakeScreen screen(8, 6);
+  graphics::SoftwareDevice software(e.allocator, &screen);
+  SpyDevice limited(software);
+  limited.feature2_mask = 0;
+  Kernel kernel(e.allocator);
+  AdapterConfig cfg;
+  cfg.display = &screen;
+  kernel.add_adapter(limited, cfg);
+  Handle adapter = 0, dev = 0, refused = 0;
+  CHECK(kernel.open_process(kPid) == status::kSuccess && kernel.open_adapter_from_index(kPid, 0, &adapter) == status::kSuccess && kernel.create_device(kPid, adapter, &dev) == status::kSuccess);
+  AllocationDesc d;
+  d.flags = kAllocTexture | kAllocStorageImage, d.format = Format::A8B8G8R8, d.width = d.height = 4;
+  CHECK(kernel.create_allocation(kPid, dev, d, &refused) == status::kNotSupported);
+  const std::vector<uint8_t> code = read_blob("cs_uav_array.dxbc");
+  ShaderDesc sd;
+  sd.kind = ShaderKind::Dxbc, sd.stage = graphics::ShaderStage::Compute, sd.code = ConstByteView(code.data(), code.size());
+  CHECK(kernel.create_shader(kPid, dev, sd, &refused) == status::kNotSupported);
+  d.flags = kAllocTexture | kAllocRenderTarget, d.kind = graphics::TextureKind::Texture2DArray, d.layers = 2;
+  CHECK(kernel.create_allocation(kPid, dev, d, &refused) == status::kNotSupported);   // (no layered targets either)
+}
+
+// A pass of the layers of an array (kPassLayers): a geometry shader sends triangle n to layer n (SV_RenderTargetArrayIndex); a pass of layers 1 and 2 of it, and what is refused.
+void test_layered_pass_kernel() {
+  Env e;
+  Handle vs = 0, gs = 0, ps = 0, pipe = 0;
+  auto blob_shader = [&](const char* name, graphics::ShaderStage stage, Handle* out) {
+    const std::vector<uint8_t> code = read_blob(name);
+    ShaderDesc sd;
+    sd.kind = ShaderKind::Dxbc, sd.stage = stage, sd.code = ConstByteView(code.data(), code.size());
+    return !code.empty() && e.kernel.create_shader(kPid, e.dev, sd, out) == status::kSuccess;
+  };
+  CHECK(blob_shader("vs.dxbc", graphics::ShaderStage::Vertex, &vs) && blob_shader("gs_layer.dxbc", graphics::ShaderStage::Geometry, &gs) &&
+        blob_shader("ps_color.dxbc", graphics::ShaderStage::Fragment, &ps));
+  PipelineDesc pd;
+  pd.vertex_shader = vs, pd.fragment_shader = ps, pd.geometry_shader = gs, pd.vertex_stride = 28, pd.attribute_count = 2, pd.varying_count = 3;
+  pd.attributes[0] = {0, graphics::VertexFormat::Float3, 0};
+  pd.attributes[1] = {1, graphics::VertexFormat::Float4, 12};
+  pd.cull_mode = graphics::CullMode::None;
+  CHECK(e.kernel.create_pipeline(kPid, e.dev, pd, &pipe) == status::kSuccess);
+  AllocationDesc d;
+  d.flags = kAllocTexture | kAllocRenderTarget, d.format = Format::A8R8G8B8, d.width = d.height = 16, d.kind = graphics::TextureKind::Texture2DArray, d.layers = 3;
+  Handle slices = 0, depths = 0;
+  CHECK(e.kernel.create_allocation(kPid, e.dev, d, &slices) == status::kSuccess);
+  d.flags = kAllocDepthStencil, d.format = Format::D32Float;
+  CHECK(e.kernel.create_allocation(kPid, e.dev, d, &depths) == status::kSuccess);
+  // three triangles over the whole target, red, green, blue
+  float v[9 * 7];
+  for (uint32_t t = 0; t < 3; ++t) {
+    const float tri[3][2] = {{-1, -1}, {3, -1}, {-1, 3}};
+    for (uint32_t k = 0; k < 3; ++k) {
+      float* p = &v[(t * 3 + k) * 7];
+      p[0] = tri[k][0], p[1] = tri[k][1], p[2] = 0.5f, p[3] = t == 0, p[4] = t == 1, p[5] = t == 2, p[6] = 1;
+    }
+  }
+  const Handle vb = e.buffer(kAllocVertexBuffer, sizeof v);
+  CHECK(e.write(vb, floats(v, 9 * 7)));
+  const float identity[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+  auto draw = [&](std::initializer_list<uint32_t> layers, uint32_t depth, uint32_t count) {
+    CommandWriter w(e.allocator);
+    w.begin_pass_layers(0, {}, depth, kPassClearColor | kPassClearDepth, {0, 0, 0, 1}, 1, 0, layers);
+    w.bind_pipeline(pipe);
+    w.bind_vertex_buffer(2);
+    w.push_constants(floats(identity, 16));
+    w.draw(count);
+    w.end_pass();
+    return e.render(w, {slices, depths, vb});
+  };
+  auto layer_pixel = [&](uint32_t layer) {
+    LockResult l;
+    uint32_t out = 0;
+    if (e.kernel.lock(kPid, slices, kLockReadOnly, 0, &l) == status::kSuccess) {
+      ByteReader in(l.data.subview(uint64_t{layer} * 16 * 16 * 4 + (8 * 16 + 8) * 4, 4));
+      out = in.le32();
+      e.kernel.unlock(kPid, slices);
+    }
+    return out;
+  };
+  CHECK(draw({0, 3, 0, 3}, 1, 9) == status::kSuccess);
+  CHECK(layer_pixel(0) == 0xFFFF0000u && layer_pixel(1) == 0xFF00FF00u && layer_pixel(2) == 0xFF0000FFu);
+  // layers 1 and 2: the first triangle goes to layer 1, the second to 2, the third (past the pass's two) to its first, 1 again - and is drawn over the first there
+  CHECK(draw({1, 2, 1, 2}, 1, 9) == status::kSuccess);
+  CHECK(layer_pixel(0) == 0xFFFF0000u && layer_pixel(1) == 0xFF0000FFu && layer_pixel(2) == 0xFF00FF00u);
+  // Refused: layers the target has not, none, a count of zero, a block that does not add up.
+  CHECK(draw({2, 2, 0, 1}, kNoAllocation, 3) == status::kInvalidParameter);
+  CHECK(draw({0, 0, 0, 1}, kNoAllocation, 3) == status::kInvalidParameter);
+  CHECK(draw({3, 1, 0, 1}, kNoAllocation, 3) == status::kInvalidParameter);
+  CHECK(draw({0, 1, 0}, kNoAllocation, 3) == status::kInvalidParameter);
 }
 
 void test_multisample() {
@@ -8375,6 +8557,8 @@ int main() {
   test_blend_constant();
   test_compute();
   test_compute_kernel();
+  test_storage_images_kernel();
+  test_layered_pass_kernel();
   test_multisample();
   test_geometry_kernel();
   test_formats();
