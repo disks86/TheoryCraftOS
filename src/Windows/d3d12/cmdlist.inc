@@ -943,7 +943,7 @@ static void STDMETHODCALLTYPE list_CopyTextureRegion(CmdList *l, const D3D12_TEX
       /* (a compressed format's rows are rows of blocks: the box is on whole blocks) */
       UINT64 offset = src->PlacedFootprint.Offset + (UINT64)(front + k) * fp->RowPitch * format_rows(fi, fp->Height) + (UINT64)format_rows(fi, top) * fp->RowPitch + format_row_bytes(fi, left);
       UINT image_layer = d->kind == 1 ? z + k : layer;
-      copy_buffer_image_packet(l, 0, alloc_index(l, image), level, image_layer, x, y, w, h, alloc_index(l, s->alloc), (UINT)offset, fp->RowPitch, fi);
+      copy_buffer_image_packet(l, 0, alloc_index(l, image), level, image_layer, format_kx(fi, x), y, format_kw(fi, w), h, alloc_index(l, s->alloc), (UINT)offset, fp->RowPitch, fi);
     }
   } else if (dst->Type == D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT && src->Type == D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX) {
     /* texture to buffer */
@@ -957,7 +957,7 @@ static void STDMETHODCALLTYPE list_CopyTextureRegion(CmdList *l, const D3D12_TEX
     for (UINT k = 0; k < depth; ++k) {
       UINT64 offset = dst->PlacedFootprint.Offset + (UINT64)(z + k) * fp->RowPitch * format_rows(fi, fp->Height) + (UINT64)format_rows(fi, y) * fp->RowPitch + format_row_bytes(fi, x);
       UINT image_layer = s->kind == 1 ? front + k : layer;
-      copy_buffer_image_packet(l, 1, alloc_index(l, image), level, image_layer, left, top, w, h, alloc_index(l, d->alloc), (UINT)offset, fp->RowPitch, fi);
+      copy_buffer_image_packet(l, 1, alloc_index(l, image), level, image_layer, format_kx(fi, left), top, format_kw(fi, w), h, alloc_index(l, d->alloc), (UINT)offset, fp->RowPitch, fi);
     }
   } else if (dst->Type == D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX && src->Type == D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX && d->mips == 1 && s->mips == 1 && d->kind == 0 && s->kind == 0) {
     /* (2D images of one level: a planar texture's plane of a slice is one) */
@@ -965,10 +965,11 @@ static void STDMETHODCALLTYPE list_CopyTextureRegion(CmdList *l, const D3D12_TEX
     const FormatInfo *dfi = NULL, *sfi = NULL;
     const UINT di = sub_target(d, dst->SubresourceIndex, &dl, &dy, &dfi), si = sub_target(s, src->SubresourceIndex, &sl, &sy, &sfi);
     if (!di || !si) return;
-    const int chroma = s->planes && src->SubresourceIndex >= s->layers;
-    const UINT sw = chroma ? ((UINT)s->desc.Width + 1) / 2 : (UINT)s->desc.Width, sh = chroma ? (s->desc.Height + 1) / 2 : s->desc.Height;
+    UINT sw = (UINT)s->desc.Width, sh = s->desc.Height;
+    if (s->planes) plane_extent(s->fmt, src->SubresourceIndex / s->layers, &sw, &sh);
     const UINT w = box ? box->right - box->left : sw, h = box ? box->bottom - box->top : sh;
-    UINT payload[8] = {alloc_index(l, di), x, y, alloc_index(l, si), box ? box->left : 0, box ? box->top : 0, w, h};
+    /* (a packed 4:2:2 format's columns are pairs in the kernel's image) */
+    UINT payload[8] = {alloc_index(l, di), format_kx(dfi, x), y, alloc_index(l, si), format_kx(sfi, box ? box->left : 0), box ? box->top : 0, format_kw(sfi, w), h};
     packet(l, OP_COPY_REGION, payload, 8);
   }
 }
@@ -983,15 +984,15 @@ static void STDMETHODCALLTYPE list_CopyResource(CmdList *l, ID3D12Resource *dst,
     end_pass(l);
     for (UINT i = 0; i < s->planes * s->layers; ++i) {
       ensure_room(l, 256, 4);
-      const int chroma = i >= s->layers;
-      const UINT w = chroma ? ((UINT)s->desc.Width + 1) / 2 : (UINT)s->desc.Width, h = chroma ? (s->desc.Height + 1) / 2 : s->desc.Height;
+      UINT w = (UINT)s->desc.Width, h = s->desc.Height;
+      plane_extent(s->fmt, i / s->layers, &w, &h);
       UINT payload[8] = {alloc_index(l, d->plane_alloc[i]), 0, 0, alloc_index(l, s->plane_alloc[i]), 0, 0, w, h};
       packet(l, OP_COPY_REGION, payload, 8);
     }
   } else if (d->mips == 1 && s->mips == 1 && d->kind == 0 && s->kind == 0 && d->fmt && s->fmt && !d->planes && !s->planes) {
     end_pass(l);
     ensure_room(l, 256, 4);
-    UINT payload[8] = {alloc_index(l, d->alloc), 0, 0, alloc_index(l, s->alloc), 0, 0, (UINT)s->desc.Width, s->desc.Height};
+    UINT payload[8] = {alloc_index(l, d->alloc), 0, 0, alloc_index(l, s->alloc), 0, 0, format_kw(s->fmt, (UINT)s->desc.Width), s->desc.Height};
     packet(l, OP_COPY_REGION, payload, 8);
   }
 }

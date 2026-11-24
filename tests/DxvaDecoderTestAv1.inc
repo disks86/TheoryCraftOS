@@ -175,26 +175,112 @@ std::vector<uint8_t> av1_bytes(const T& v) {
   return std::vector<uint8_t>(p, p + sizeof v);
 }
 
-// The decoded picture as ffmpeg's framemd5 hashes it: planar yuv420p / yuv420p10le, or gray / gray10le for monochrome.
-std::vector<uint8_t> av1_ffmpeg_layout(const VideoFrame& f, bool mono) {
+// The decoded picture as ffmpeg's framemd5 hashes it: planar in the stream's own layout and depth (yuv420p / yuv420p10le / yuv420p12le, yuv422p..., yuv444p..., gray /
+// gray10le / gray12le for monochrome), unpacked from the surface format the decoder wrote (NV12 / P010 / P016, AYUV, Y410, Y416, YUY2, Y210, Y216) by the layouts DXGI
+// gives them - so the packing is checked along with the pixels.
+std::vector<uint8_t> av1_ffmpeg_layout(const DxvaDecodedPicture& d, const av1::SequenceHeader& seq) {
+  const VideoFrame& f = d.frame;
   std::vector<uint8_t> out;
-  const uint32_t w = f.format.width, h = f.format.height, cw = (w + 1) / 2, ch = (h + 1) / 2;
-  const bool deep = f.format.pixel_format == PixelFormat::P010;
-  auto sample = [&](int plane, uint32_t x, uint32_t y) -> uint32_t {
-    const uint8_t* row = f.plane[plane] + size_t(y) * f.stride[plane];
-    return deep ? static_cast<uint32_t>(row[2 * x] | (row[2 * x + 1] << 8)) >> 6 : row[x];
-  };
+  const uint32_t w = f.format.width, h = f.format.height;
+  const int bpc = 8 + 2 * seq.hbd;
+  const bool mono = seq.monochrome, deep = bpc > 8;
+  const uint32_t shift = deep ? 16 - bpc : 0;
+  const uint32_t cw = seq.ss_hor ? (w + 1) / 2 : w, ch = seq.ss_ver ? (h + 1) / 2 : h;
+  auto le16 = [](const uint8_t* p) { return static_cast<uint32_t>(p[0] | (p[1] << 8)); };
   auto put = [&](uint32_t v) {
     out.push_back(static_cast<uint8_t>(v));
     if (deep) out.push_back(static_cast<uint8_t>(v >> 8));
   };
+  // sample(plane, x, y): plane 0 Y, 1 U, 2 V, in their own resolution
+  auto sample = [&](int plane, uint32_t x, uint32_t y) -> uint32_t {
+    switch (d.surface_format) {
+      case DxvaSurfaceFormat::Nv12:
+      case DxvaSurfaceFormat::P010:
+      case DxvaSurfaceFormat::P016: {
+        const uint8_t* row = f.plane[plane ? 1 : 0] + size_t(y) * f.stride[plane ? 1 : 0];
+        const uint32_t i = plane ? 2 * x + (plane - 1) : x;
+        return deep ? le16(row + 2 * i) >> shift : row[i];
+      }
+      case DxvaSurfaceFormat::Ayuv: return f.plane[0][size_t(y) * f.stride[0] + 4 * x + (plane == 0 ? 2 : plane == 1 ? 1 : 0)];
+      case DxvaSurfaceFormat::Y410: {
+        const uint8_t* p = f.plane[0] + size_t(y) * f.stride[0] + 4 * x;
+        const uint32_t word = le16(p) | le16(p + 2) << 16;
+        return (word >> (plane == 0 ? 10 : plane == 1 ? 0 : 20)) & 0x3FF;
+      }
+      case DxvaSurfaceFormat::Y416: return le16(f.plane[0] + size_t(y) * f.stride[0] + 8 * x + 2 * (plane == 0 ? 1 : plane == 1 ? 0 : 2)) >> shift;
+      case DxvaSurfaceFormat::Yuy2: return f.plane[0][size_t(y) * f.stride[0] + (plane == 0 ? 2 * x : 4 * x + (plane == 1 ? 1 : 3))];
+      case DxvaSurfaceFormat::Y210:
+      case DxvaSurfaceFormat::Y216: return le16(f.plane[0] + size_t(y) * f.stride[0] + (plane == 0 ? 4 * x : 8 * x + (plane == 1 ? 2 : 6))) >> shift;
+    }
+    return 0;
+  };
   for (uint32_t y = 0; y < h; ++y)
     for (uint32_t x = 0; x < w; ++x) put(sample(0, x, y));
   if (!mono)
-    for (int c = 0; c < 2; ++c)
+    for (int c = 1; c <= 2; ++c)
       for (uint32_t y = 0; y < ch; ++y)
-        for (uint32_t x = 0; x < cw; ++x) put(sample(1, 2 * x + c, y));
+        for (uint32_t x = 0; x < cw; ++x) put(sample(c, x, y));
   return out;
+}
+
+// What a packed surface holds besides the samples: AYUV / Y410 / Y416 an opaque alpha, the 16-bit words of 10- and 12-bit samples zeros below the value; and an NV12 /
+// P010 / P016 picture of a monochrome stream neutral chroma. The count of samples that are not so.
+int av1_surface_extras_bad(const DxvaDecodedPicture& d, const av1::SequenceHeader& seq) {
+  const VideoFrame& f = d.frame;
+  const uint32_t w = f.format.width, h = f.format.height;
+  const int bpc = 8 + 2 * seq.hbd;
+  const uint32_t low = bpc > 8 ? (1u << (16 - bpc)) - 1 : 0;
+  auto le16 = [](const uint8_t* p) { return static_cast<uint32_t>(p[0] | (p[1] << 8)); };
+  int bad = 0;
+  for (uint32_t y = 0; y < h; ++y) {
+    const uint8_t* row = f.plane[0] + size_t(y) * f.stride[0];
+    switch (d.surface_format) {
+      case DxvaSurfaceFormat::Ayuv: for (uint32_t x = 0; x < w; ++x) bad += row[4 * x + 3] != 0xFF; break;
+      case DxvaSurfaceFormat::Y410: for (uint32_t x = 0; x < w; ++x) bad += (row[4 * x + 3] >> 6) != 3; break;
+      case DxvaSurfaceFormat::Y416:
+        for (uint32_t x = 0; x < w; ++x) {
+          bad += le16(row + 8 * x + 6) != 0xFFFF;
+          for (int c = 0; c < 3; ++c) bad += (le16(row + 8 * x + 2 * c) & low) != 0;
+        }
+        break;
+      case DxvaSurfaceFormat::Y210:
+      case DxvaSurfaceFormat::Y216:
+        for (uint32_t x = 0; x < (w + 1) / 2 * 4; ++x) bad += (le16(row + 2 * x) & low) != 0;
+        break;
+      default: break;
+    }
+  }
+  if (seq.monochrome && !dxva_surface_packed(d.surface_format)) {
+    const uint32_t cw = (w + 1) / 2, ch = (h + 1) / 2;
+    const bool deep = d.surface_format != DxvaSurfaceFormat::Nv12;
+    for (uint32_t y = 0; y < ch; ++y)
+      for (uint32_t x = 0; x < 2 * cw; ++x) {
+        const uint8_t* row = f.plane[1] + size_t(y) * f.stride[1];
+        const uint32_t v = deep ? le16(row + 2 * x) : row[x];
+        if (v != (deep ? (1u << (bpc - 1)) << (16 - bpc) : 128u)) ++bad;
+      }
+  }
+  return bad;
+}
+
+// The decoder profile and surface format Windows uses for a stream (what ffmpeg's dxva2 picks): profile 0 NV12 / P010; profile 1 AYUV / Y410; profile 2 YUY2 / Y210
+// (4:2:2), NV12 / P010 (monochrome), and at 12 bits Y216 / Y416 (12BIT_PROFILE2) or P016 (12BIT_PROFILE2_420).
+void av1_decoder_for(const av1::SequenceHeader& seq, bool force_profile0, DxvaProfile* profile, DxvaSurfaceFormat* surface) {
+  const bool i444 = !seq.ss_hor && !seq.ss_ver, i422 = seq.ss_hor && !seq.ss_ver;
+  using S = DxvaSurfaceFormat;
+  if (force_profile0 || seq.profile == 0) {
+    *profile = DxvaProfile::Av1VldProfile0;
+    *surface = seq.hbd ? S::P010 : S::Nv12;
+  } else if (seq.profile == 1) {
+    *profile = DxvaProfile::Av1VldProfile1;
+    *surface = seq.hbd ? S::Y410 : S::Ayuv;
+  } else if (seq.hbd == 2) {
+    *profile = i444 || i422 ? DxvaProfile::Av1Vld12BitProfile2 : DxvaProfile::Av1Vld12BitProfile2_420;
+    *surface = i444 ? S::Y416 : i422 ? S::Y216 : S::P016;
+  } else {
+    *profile = DxvaProfile::Av1VldProfile2;
+    *surface = i422 ? (seq.hbd ? S::Y210 : S::Yuy2) : (seq.hbd ? S::P010 : S::Nv12);
+  }
 }
 
 struct Av1DxvaApp final : av1::IOffload {
@@ -209,8 +295,14 @@ struct Av1DxvaApp final : av1::IOffload {
   uint32_t next_key = 5000;
   std::mt19937 rng{11};
   int frames = 0, failures = 0, mono_chroma_bad = 0;
+  bool force_profile0 = false;   // a profile 0 decoder whatever the stream (what it refuses)
+  DxvaProfile used_profile = DxvaProfile::Av1VldProfile0;
+  DxvaSurfaceFormat used_surface = DxvaSurfaceFormat::Nv12;
   DxvaResult first_result = DxvaResult::Ok;
   std::vector<DxvaRecordedCall>* record = nullptr;
+  // What the stream does, in order, for a program to replay (av1_dump_stream): a decode (the call's number) shown at once or not, or a surface shown again.
+  struct Event { int call; int shown; uint32_t surface; };
+  std::vector<Event>* events = nullptr;
   static constexpr uint32_t kSurfaces = 10;   // 8 slots, the current frame and one more
 
   bool accepts(const av1::SequenceHeader&, const av1::FrameHeader&) override { return true; }
@@ -220,11 +312,12 @@ struct Av1DxvaApp final : av1::IOffload {
     const av1::FrameHeader& hdr = *f.hdr;
     if (!decoder) {
       DxvaDecoderConfig cfg;
-      cfg.profile = DxvaProfile::Av1VldProfile0;
+      av1_decoder_for(seq, force_profile0, &cfg.profile, &cfg.surface);
+      used_profile = cfg.profile;
+      used_surface = cfg.surface;
       cfg.width = static_cast<uint32_t>(seq.max_width);
       cfg.height = static_cast<uint32_t>(seq.max_height);
       cfg.surfaces = naming == DxvaNaming::D3d11 ? kSurfaces : 16;
-      cfg.output = seq.hbd ? PixelFormat::P010 : PixelFormat::Nv12;
       decoder = create_dxva_decoder(*alloc, cfg);
       CHECK(decoder);
       if (!decoder) return false;
@@ -278,6 +371,7 @@ struct Av1DxvaApp final : av1::IOffload {
     if (frames == 0) first_result = r;
     ++frames;
     if (record) record->push_back(call);
+    if (events) events->push_back({static_cast<int>(record ? record->size() - 1 : 0), hdr.show_frame ? 1 : 0, cur_index});
     if (r != DxvaResult::Ok) {
       if (first_result == DxvaResult::Ok) printf("  AV1 frame %d: result %d (%s)\n", frames, static_cast<int>(r), out.detail ? out.detail : "");
       ++failures;
@@ -285,18 +379,9 @@ struct Av1DxvaApp final : av1::IOffload {
     }
     CHECK(out.surface == cur_index);
     CHECK(out.frame.format.width == static_cast<uint32_t>(hdr.width[1]) && out.frame.format.height == static_cast<uint32_t>(hdr.height));
-    if (seq.monochrome) {
-      // neutral chroma
-      const uint32_t cw = (out.frame.format.width + 1) / 2, ch = (out.frame.format.height + 1) / 2;
-      const bool deep = out.frame.format.pixel_format == PixelFormat::P010;
-      for (uint32_t y = 0; y < ch; ++y)
-        for (uint32_t x = 0; x < 2 * cw; ++x) {
-          const uint8_t* row = out.frame.plane[1] + size_t(y) * out.frame.stride[1];
-          const uint32_t v = deep ? static_cast<uint32_t>(row[2 * x] | (row[2 * x + 1] << 8)) : row[x];
-          if (v != (deep ? 512u << 6 : 128u)) ++mono_chroma_bad;
-        }
-    }
-    picture_of_key[cur_key] = av1_ffmpeg_layout(out.frame, seq.monochrome);
+    CHECK(out.surface_format == used_surface);
+    mono_chroma_bad += av1_surface_extras_bad(out, seq);
+    picture_of_key[cur_key] = av1_ffmpeg_layout(out, seq);
     if (hdr.show_frame) shown.push_back(picture_of_key[cur_key]);
     for (int i = 0; i < 8; ++i)
       if (hdr.refresh_frame_flags & (1 << i)) {
@@ -308,6 +393,7 @@ struct Av1DxvaApp final : av1::IOffload {
   }
   void show_existing(unsigned idx, bool refresh_all) override {
     if (idx >= 8 || !slot_valid[idx]) return;
+    if (events) events->push_back({-1, 1, slot_key[idx]});
     shown.push_back(picture_of_key[slot_key[idx]]);
     if (refresh_all)
       for (int i = 0; i < 8; ++i) {
@@ -342,7 +428,8 @@ struct Av1Run {
   DxvaResult first = DxvaResult::Ok;
 };
 
-Av1Run dxva_av1_stream(const std::string& name, DxvaNaming naming, std::vector<DxvaRecordedCall>* record, bool compare = true) {
+Av1Run dxva_av1_stream(const std::string& name, DxvaNaming naming, std::vector<DxvaRecordedCall>* record, bool compare = true, bool force_profile0 = false,
+                       std::vector<Av1DxvaApp::Event>* events = nullptr) {
   TestAllocator alloc;
   Av1Run run;
   const std::vector<uint8_t> data = read_file("tests/data/" + name);
@@ -353,6 +440,8 @@ Av1Run dxva_av1_stream(const std::string& name, DxvaNaming naming, std::vector<D
     app.alloc = &alloc;
     app.naming = naming;
     app.record = record;
+    app.force_profile0 = force_profile0;
+    app.events = events;
     Av1Decoder dec(alloc);
     dec.set_offload(&app);
     for (const auto& fr : av1_ivf_frames(data)) (void)dec.decode(ConstByteView(data.data() + fr.first, fr.second), 0);
@@ -375,11 +464,13 @@ Av1Run dxva_av1_stream(const std::string& name, DxvaNaming naming, std::vector<D
   return run;
 }
 
-UniquePointer<IDxvaDecoder> av1_make_decoder(TestAllocator& alloc, const DxvaRecordedCall& first, PixelFormat format) {
+UniquePointer<IDxvaDecoder> av1_make_decoder(TestAllocator& alloc, const DxvaRecordedCall& first, PixelFormat format,
+                                             DxvaProfile profile = DxvaProfile::Av1VldProfile0, DxvaSurfaceFormat surface = DxvaSurfaceFormat::Nv12) {
   dxva::PicParamsAv1 pp;
   memcpy(&pp, first.params.data(), sizeof pp);
   DxvaDecoderConfig cfg;
-  cfg.profile = DxvaProfile::Av1VldProfile0;
+  cfg.profile = profile;
+  cfg.surface = surface;
   cfg.width = pp.max_width;
   cfg.height = pp.max_height;
   cfg.surfaces = Av1DxvaApp::kSurfaces;
@@ -387,12 +478,96 @@ UniquePointer<IDxvaDecoder> av1_make_decoder(TestAllocator& alloc, const DxvaRec
   return create_dxva_decoder(alloc, cfg);
 }
 
+const char* const kAv1Profile12Streams[] = {"av1_444.ivf", "av1_444_10bit.ivf", "av1_422.ivf", "av1_422_10bit.ivf", "av1_422_12bit.ivf", "av1_444_12bit.ivf",
+                                             "av1_12bit.ivf", "av1_mono_12bit.ivf"};
+
+// What the profile 1 and 2 decoders refuse: a stream of another profile (Unsupported), a surface format that does not hold the frame's layout or depth, parameters that
+// break 5.5.2's rules (Invalid); which formats each profile takes; damaged buffers.
+void dxva_av1_profile12_errors() {
+  using S = DxvaSurfaceFormat;
+  // The formats of each profile (CheckVideoDecoderFormat answers these).
+  CHECK(dxva_profile_supports(DxvaProfile::Av1VldProfile1, S::Ayuv, 64, 64) && dxva_profile_supports(DxvaProfile::Av1VldProfile1, S::Y410, 64, 64));
+  CHECK(!dxva_profile_supports(DxvaProfile::Av1VldProfile1, S::Nv12, 64, 64) && !dxva_profile_supports(DxvaProfile::Av1VldProfile1, S::Y416, 64, 64));
+  CHECK(dxva_profile_supports(DxvaProfile::Av1VldProfile2, S::Yuy2, 64, 64) && dxva_profile_supports(DxvaProfile::Av1VldProfile2, S::Y210, 64, 64));
+  CHECK(dxva_profile_supports(DxvaProfile::Av1VldProfile2, S::Nv12, 64, 64) && !dxva_profile_supports(DxvaProfile::Av1VldProfile2, S::Y216, 64, 64));
+  CHECK(dxva_profile_supports(DxvaProfile::Av1Vld12BitProfile2, S::Y216, 64, 64) && dxva_profile_supports(DxvaProfile::Av1Vld12BitProfile2, S::Y416, 64, 64));
+  CHECK(!dxva_profile_supports(DxvaProfile::Av1Vld12BitProfile2, S::P016, 64, 64) && dxva_profile_supports(DxvaProfile::Av1Vld12BitProfile2_420, S::P016, 64, 64));
+  CHECK(!dxva_profile_supports(DxvaProfile::Av1Vld12BitProfile2_420, S::P010, 64, 64) && !dxva_profile_supports(DxvaProfile::Av1VldProfile0, S::P016, 64, 64));
+  CHECK(!dxva_profile_supports(DxvaProfile::Av1VldProfile0, S::Ayuv, 64, 64) && !dxva_profile_supports(DxvaProfile::HevcVldMain, S::Yuy2, 64, 64));
+  CHECK(!dxva_profile_supports(DxvaProfile::Av1VldProfile1, S::Ayuv, 0, 64) && !dxva_profile_supports(DxvaProfile::Av1VldProfile1, S::Ayuv, 64, 20000));
+  TestAllocator alloc;
+  {
+    DxvaDecoderConfig cfg;
+    cfg.profile = DxvaProfile::Av1VldProfile1;
+    cfg.width = cfg.height = 64;
+    cfg.surfaces = 8;
+    cfg.surface = S::Nv12;   // (not one of profile 1's)
+    CHECK(!create_dxva_decoder(alloc, cfg));
+    cfg.surface = S::Ayuv;
+    CHECK(create_dxva_decoder(alloc, cfg) && create_dxva_decoder(alloc, cfg)->profile() == DxvaProfile::Av1VldProfile1);
+  }
+  int runs = 0;
+  for (const char* name : {"av1_444_10bit.ivf", "av1_422_12bit.ivf", "av1_mono_12bit.ivf"}) {
+    std::vector<DxvaRecordedCall> calls;
+    const Av1Run r = dxva_av1_stream(name, DxvaNaming::D3d11, &calls);
+    CHECK(r.matched == r.total && calls.size() >= 2);
+    if (calls.size() < 2) continue;
+    dxva::PicParamsAv1 pp;
+    memcpy(&pp, calls[0].params.data(), sizeof pp);
+    av1::SequenceHeader seq{};
+    seq.profile = pp.seq_profile;
+    seq.hbd = (pp.bitdepth - 8) / 2;
+    seq.ss_hor = (pp.FormatAndPictureInfoFlags >> 4) & 1;
+    seq.ss_ver = (pp.FormatAndPictureInfoFlags >> 5) & 1;
+    seq.monochrome = (pp.FormatAndPictureInfoFlags >> 6) & 1;
+    DxvaProfile profile;
+    S surface;
+    av1_decoder_for(seq, false, &profile, &surface);
+    DxvaDecodedPicture o;
+    {
+      UniquePointer<IDxvaDecoder> d = av1_make_decoder(alloc, calls[0], PixelFormat::Nv12, profile, surface);
+      CHECK(d && d->decode(calls[0].picture(), &o) == DxvaResult::Ok && o.surface_format == surface);
+      // A surface of the profile that does not hold this frame (another depth or layout): Invalid.
+      const S other = surface == S::Y410 ? S::Ayuv : surface == S::Y216 ? S::Y416 : S::P016;
+      UniquePointer<IDxvaDecoder> wrong = av1_make_decoder(alloc, calls[0], PixelFormat::Nv12, profile, other);
+      if (other != surface && wrong) CHECK(wrong->decode(calls[0].picture(), &o) == DxvaResult::Invalid && o.detail != nullptr);
+      // Another profile's decoder: Unsupported.
+      UniquePointer<IDxvaDecoder> p0 = av1_make_decoder(alloc, calls[0], PixelFormat::P010);
+      CHECK(p0 && p0->decode(calls[0].picture(), &o) == DxvaResult::Unsupported);
+      // Parameters against 5.5.2: the layout or depth a profile does not have, seq_profile 3, bitdepth 9, 4:4:0, monochrome 4:4:4.
+      auto refused = [&](void (*damage)(dxva::PicParamsAv1&)) {
+        dxva::PicParamsAv1 bad = pp;
+        damage(bad);
+        DxvaRecordedCall c = calls[0];
+        c.params = av1_bytes(bad);
+        d->reset();
+        const DxvaResult res = d->decode(c.picture(), &o);
+        return res == DxvaResult::Invalid || res == DxvaResult::Unsupported;
+      };
+      CHECK(refused([](dxva::PicParamsAv1& b) { b.seq_profile = 3; }));
+      CHECK(refused([](dxva::PicParamsAv1& b) { b.bitdepth = 9; }));
+      CHECK(refused([](dxva::PicParamsAv1& b) { b.FormatAndPictureInfoFlags = static_cast<uint8_t>((b.FormatAndPictureInfoFlags & ~0x70) | 0x20); }));   // 4:4:0
+      CHECK(refused([](dxva::PicParamsAv1& b) { b.FormatAndPictureInfoFlags = static_cast<uint8_t>((b.FormatAndPictureInfoFlags & ~0x70) | 0x40); }));   // mono 4:4:4
+      CHECK(refused([](dxva::PicParamsAv1& b) { b.bitdepth = b.bitdepth == 12 ? 10 : 12; }));
+      // still decodes afterwards
+      d->reset();
+      CHECK(d->decode(calls[0].picture(), &o) == DxvaResult::Ok);
+    }
+    auto make = [&]() { return av1_make_decoder(alloc, calls[0], PixelFormat::Nv12, profile, surface); };
+    runs += dxva_damage(make, {}, calls[0], 31);
+    runs += dxva_damage(make, {calls[0]}, calls[1], 32);
+  }
+  CHECK(alloc.live == 0);
+  printf("  AV1 profiles 1 and 2 damaged buffers: %d decodes\n", runs);
+}
+
 void dxva_av1_errors() {
   // What profile 0 does not take: 4:4:4, 4:2:2 (profiles 1 and 2), 12-bit.
   for (const char* s : {"av1_444.ivf", "av1_422.ivf", "av1_12bit.ivf"}) {
-    const Av1Run r = dxva_av1_stream(s, DxvaNaming::D3d11, nullptr, false);
+    const Av1Run r = dxva_av1_stream(s, DxvaNaming::D3d11, nullptr, false, true);
     CHECK(r.frames > 0 && r.first == DxvaResult::Unsupported);
   }
+  dxva_av1_profile12_errors();
   std::vector<DxvaRecordedCall> calls;
   dxva_av1_stream("av1_inter.ivf", DxvaNaming::D3d11, &calls);
   CHECK(calls.size() >= 4);
@@ -479,7 +654,57 @@ void dxva_av1_errors() {
 
 }  // namespace
 
+// DXVA_AV1_DUMP=<folder>: writes, for the streams the Windows tests replay (tests/data/make_av1_dxva_data.py makes tests/windows/av1_dxva_data.h of them), the DXVA buffers
+// of every picture as this test fills them - ffmpeg's dxva2_av1.c's way - with Direct3D 11's surface naming (index = array slice of 10), and the order the stream
+// decodes and shows them in. A file of little-endian words: "AV1D", surfaces, width, height, seq_profile, bitdepth, layout (0 4:2:0, 1 4:2:2, 2 4:4:4, 3 monochrome),
+// event count; per event: kind (0 decode, 1 show again), shown, surface, and for a decode the sizes of the picture parameters, tile controls and bitstream, then them.
+static void av1_dump_stream(const char* folder, const char* name) {
+  std::vector<DxvaRecordedCall> calls;
+  std::vector<Av1DxvaApp::Event> events;
+  dxva_av1_stream(name, DxvaNaming::D3d11, &calls, true, false, &events);
+  if (calls.empty()) return;
+  dxva::PicParamsAv1 pp;
+  memcpy(&pp, calls[0].params.data(), sizeof pp);
+  const uint32_t f = pp.FormatAndPictureInfoFlags;
+  const uint32_t layout = (f >> 6) & 1 ? 3 : !((f >> 4) & 1) ? 2 : !((f >> 5) & 1) ? 1 : 0;
+  std::vector<uint8_t> out;
+  auto word = [&](uint32_t v) { for (int i = 0; i < 4; ++i) out.push_back(static_cast<uint8_t>(v >> (8 * i))); };
+  auto bytes = [&](const std::vector<uint8_t>& b) { out.insert(out.end(), b.begin(), b.end()); };
+  out.insert(out.end(), {'A', 'V', '1', 'D'});
+  word(Av1DxvaApp::kSurfaces);
+  word(pp.max_width);
+  word(pp.max_height);
+  word(pp.seq_profile);
+  word(pp.bitdepth);
+  word(layout);
+  word(static_cast<uint32_t>(events.size()));
+  for (const Av1DxvaApp::Event& e : events) {
+    word(e.call < 0 ? 1 : 0);
+    word(static_cast<uint32_t>(e.shown));
+    word(e.surface);
+    if (e.call < 0) continue;
+    const DxvaRecordedCall& c = calls[static_cast<size_t>(e.call)];
+    word(static_cast<uint32_t>(c.params.size()));
+    word(static_cast<uint32_t>(c.slices.size()));
+    word(static_cast<uint32_t>(c.bitstream.size()));
+    bytes(c.params);
+    bytes(c.slices);
+    bytes(c.bitstream);
+  }
+  const std::string path = std::string(folder) + "/" + name + ".dxva";
+  FILE* file = fopen(path.c_str(), "wb");
+  CHECK(file != nullptr);
+  if (!file) return;
+  CHECK(fwrite(out.data(), 1, out.size(), file) == out.size());
+  fclose(file);
+  printf("  wrote %s (%zu events, %zu bytes)\n", path.c_str(), events.size(), out.size());
+}
+
 static void dxva_test_av1() {
+  if (const char* dump = getenv("DXVA_AV1_DUMP")) {
+    for (const char* s : {"av1_422_10bit.ivf", "av1_444.ivf", "av1_444_12bit.ivf"}) av1_dump_stream(dump, s);
+    return;
+  }
   static const char* kStreams[] = {"av1_intra.ivf",   "av1_inter.ivf",    "av1_tiles.ivf",  "av1_sb128.ivf", "av1_lossless.ivf", "av1_qm.ivf",
                                    "av1_segments.ivf", "av1_screen.ivf",   "av1_superres.ivf", "av1_resize.ivf", "av1_grain.ivf",  "av1_10bit.ivf",
                                    "av1_mono.ivf",     "av1_svt.ivf",      "av1_rav1e.ivf"};
@@ -492,5 +717,16 @@ static void dxva_test_av1() {
       frames += r.frames;
     }
   printf("DXVA AV1: %d of %d shown pictures bit-exact with ffmpeg/libdav1d (%d frames decoded, 15 streams, 3 ways of naming surfaces)\n", matched, total, frames);
+  // Profiles 1 and 2: 4:4:4 (AYUV, Y410, Y416), 4:2:2 (YUY2, Y210 with film grain, Y216), 12-bit 4:2:0 and monochrome (P016).
+  matched = total = frames = 0;
+  for (DxvaNaming naming : {DxvaNaming::D3d11, DxvaNaming::D3d12Shuffled, DxvaNaming::D3d12OutputKey})
+    for (const char* s : kAv1Profile12Streams) {
+      const Av1Run r = dxva_av1_stream(s, naming, nullptr);
+      matched += r.matched;
+      total += r.total;
+      frames += r.frames;
+    }
+  printf("DXVA AV1 profiles 1 and 2: %d of %d shown pictures bit-exact with ffmpeg/libdav1d (%d frames decoded, 8 streams, 3 ways of naming surfaces)\n", matched, total,
+         frames);
   dxva_av1_errors();
 }

@@ -114,7 +114,8 @@ static void desc_write(D3D12_CPU_DESCRIPTOR_HANDLE handle, const SoftDesc *d) {
  * The kernel's view is of one 2D image: a view of several slices sees the first. Any other texture: its allocation. */
 static UINT view_alloc(const Resource *r, DXGI_FORMAT view_format, UINT plane, UINT slice) {
   if (!r->planes) return r->alloc;
-  if (view_format != DXGI_FORMAT_UNKNOWN) {
+  /* (V208 / V408: three R8 planes, named by the PlaneSlice alone) */
+  if (view_format != DXGI_FORMAT_UNKNOWN && r->planes == 2) {
     const FormatInfo *vf = format_info(view_format);
     if (vf && vf->narrow) plane = vf->narrow == NARROW_R8G8 || vf->narrow == NARROW_R16G16 ? 1 : 0;
   }
@@ -157,6 +158,8 @@ static void STDMETHODCALLTYPE dev_CreateShaderResourceView(Dev *This, ID3D12Reso
       d.size = count * stride;
     } else {
       d.kind = DK_SRV;
+      /* (a packed YUV texture is seen through a view of its pixels' format only) */
+      if (format_packed_yuv(r->desc.Format) && (!desc || !packed_yuv_view_ok(r->desc.Format, desc->Format, 0))) d.kind = 0;
       if (r->planes) {
         UINT plane = 0, slice = 0;
         if (desc && desc->ViewDimension == D3D12_SRV_DIMENSION_TEXTURE2D) plane = desc->Texture2D.PlaneSlice;
@@ -202,6 +205,7 @@ static void STDMETHODCALLTYPE dev_CreateRenderTargetView(Dev *This, ID3D12Resour
     d.alloc = r->alloc;
     d.format = desc ? desc->Format : r->desc.Format;
     if (desc && desc->ViewDimension == D3D12_RTV_DIMENSION_TEXTURE2D) d.mip = desc->Texture2D.MipSlice;
+    if (format_packed_yuv(r->desc.Format) && (!desc || !packed_yuv_view_ok(r->desc.Format, desc->Format, 1))) d.kind = 0;
     if (r->planes) {
       UINT plane = 0, slice = 0;
       if (desc && desc->ViewDimension == D3D12_RTV_DIMENSION_TEXTURE2D) plane = desc->Texture2D.PlaneSlice;

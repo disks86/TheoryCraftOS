@@ -318,15 +318,24 @@ Direct3D 11's and 12's video interfaces run on the kernel's codecs, on the CPU, 
   A8B8G8R8 or A16B16G16R16 image), so a view of the narrow format reads the right values; `CopyBufferImage` takes a `NarrowLayout` to copy the narrow rows, and render
   targets of those formats write their channels only. d3d12.dll makes every plane of every array slice of a planar texture an allocation of its own
   (`Resource.plane_alloc`), which keeps P010 arrays and planar render targets within what the kernel's images can be.
+- **4:2:2 and 4:4:4.** AV1 profiles 1 and 2 (`D3D12_VIDEO_DECODE_PROFILE_AV1_PROFILE1`, `_PROFILE2`, `_12BIT_PROFILE2`, `_12BIT_PROFILE2_420`; DXVA_ModeAV1_VLD_*) decode
+  into the formats Windows' decoders use: AYUV / Y410 (8- and 10-bit 4:4:4), YUY2 / Y210 (4:2:2) and NV12 / P010 (monochrome), Y216 / Y416 (12-bit 4:2:2 / 4:4:4),
+  P016 (12-bit 4:2:0 and monochrome; 12 bits in the top of each word). `VideoDecoderDesc::surface_format` (hardware::DxvaSurfaceFormat; 0 and 1 are NV12 and P010 as
+  the `ten_bit` word was) names it; the packed ones are one image of their views' pixels (AYUV and YUY2 A8B8G8R8, Y410 A2B10G10R10, Y416 / Y210 / Y216 A16B16G16R16;
+  the 4:2:2 ones half as wide, a pixel a pair), into which `DecodeFrame` copies the rows the decoder packed. d3d12.dll has the packed formats (views of their pixels'
+  format only, render targets of AYUV only, arrays one allocation a slice) and Direct3D 12's planar P208 / V208 / V408 (two or three planes); the processor reads and
+  writes AYUV, Y410, Y416, YUY2, Y210, Y216 and P208 (4:2:2 chroma sited as the colour space says, horizontally). Large-scale tiles (anchor frames) stay refused: the
+  core decodes whole frames.
 - d3d12.dll: `ID3D12VideoDevice` .. 3, decoders and heaps (a heap is the kernel's decoder), processors, the VIDEO_DECODE / VIDEO_PROCESS queues and lists, decode
   statistics queries (video.inc; video_types.h has what mingw's d3d12video.h lacks). d3d11.dll: `ID3D11VideoDevice` .. 2, `ID3D11VideoContext` .. 3 on those
   (docs/Direct3D11.md).
 - Not there: video encoding and motion estimation (reported as not supported; their creators answer DXGI_ERROR_UNSUPPORTED), interlaced H.264 (field pictures, MBAFF),
-  HEVC Main10 and 4:2:2 / 4:4:4, AV1 profiles 1 and 2 and large-scale tiles, VC-1 and MPEG-4 part 2 DXVA profiles, decode-time conversion and histograms, protected
+  HEVC Main10 and 4:2:2 / 4:4:4, AV1 large-scale tiles, VC-1 and MPEG-4 part 2 DXVA profiles, decode-time conversion and histograms, protected
   content (crypto sessions and authenticated channels are refused), shared planar textures, placed planar resources, views of several slices of a planar texture.
 - Tests: `tests/run_host_tests.sh DxvaDecoderTest VideoProcessTest DxgkrnlTest` (every codec bit for bit with ffmpeg; the DXVA buffers filled as ffmpeg's dxva2_*.c
-  fill them), `tests/emulated_dx.sh tests/windows/d3d12videotest.c` and `d3d11videotest.c` (H.264 decoded through both APIs, bit for bit with ffmpeg; the processor
-  against BT.709), `tests/d3d12_qemu.sh d3d12videotest`, `tests/wow64_qemu.sh d3d12videotest d3d11videotest` (32-bit).
+  fill them), `tests/emulated_dx.sh tests/windows/d3d12videotest.c` and `d3d11videotest.c` (H.264 and AV1 profiles 1 and 2 decoded through both APIs, bit for bit
+  with ffmpeg - the AV1 streams' DXVA buffers dumped by DxvaDecoderTest with DXVA_AV1_DUMP, tests/data/make_av1_dxva_data.py; the packed and planar YUV textures; the
+  processor against BT.709), `tests/d3d12_qemu.sh d3d12videotest`, `tests/wow64_qemu.sh d3d12videotest d3d11videotest` (32-bit).
 
 ## Not done
 
