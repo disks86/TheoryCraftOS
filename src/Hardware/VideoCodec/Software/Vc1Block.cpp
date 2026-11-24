@@ -124,7 +124,7 @@ bool Core::decode_mquant(BitReader& br, int* mquant) {
   if ((edges & 1) && !mb_x_) *mquant = -pic_.altpq;
   if ((edges & 2) && !mb_y_) *mquant = -pic_.altpq;
   if ((edges & 4) && mb_x_ == mb_w_ - 1) *mquant = -pic_.altpq;
-  if ((edges & 8) && mb_y_ == mb_h_ - 1) *mquant = -pic_.altpq;
+  if ((edges & 8) && mb_y_ == mb_rows_ - 1) *mquant = -pic_.altpq;   // (a field picture: its own last row)
   if (!*mquant || *mquant > 31 || *mquant < -31) *mquant = 1;
   return !br.error();
 }
@@ -347,8 +347,9 @@ bool Core::decode_i_block_adv(BitReader& br, int16_t* block, int n, bool coded, 
   if (coded) {
     int last = 0, skip, value;
     const uint8_t* zz;
-    if (ac_pred_) zz = !dir ? zz_8x8_[2] : zz_8x8_[3];
-    else zz = zz_8x8_[1];
+    const bool frame_interlace = pic_.fcm == kFcmFrameInterlace;   // (field pictures scan like progressive ones here)
+    if (ac_pred_) zz = !use_pred && frame_interlace ? zzi_8x8_ : !dir ? zz_8x8_[2] : zz_8x8_[3];
+    else zz = frame_interlace ? zzi_8x8_ : zz_8x8_[1];
     for (int i = 1; !last; ++i) {
       if (!decode_ac_coeff(br, &last, &skip, &value, codingset)) return false;
       i += skip;
@@ -454,11 +455,13 @@ bool Core::decode_intra_block(BitReader& br, int16_t* block, int n, bool coded, 
   const int left_sh = 0, top_sh = 3;
   if (coded) {
     int last = 0, skip, value;
+    // The scan: progressive, or interlaced (an interlaced frame picture with AC prediction: the progressive scans of the prediction direction).
+    const uint8_t* zz = pic_.fcm == kFcmProgressive ? zz_8x8_[0] : (use_pred && pic_.fcm == kFcmFrameInterlace) ? (!dir ? zz_8x8_[2] : zz_8x8_[3]) : zzi_8x8_;
     for (int i = 1; !last; ++i) {
       if (!decode_ac_coeff(br, &last, &skip, &value, codingset)) return false;
       i += skip;
       if (i > 63) break;
-      block[zz_8x8_[0][i]] = s16(value);
+      block[zz[i]] = s16(value);
     }
     if (use_pred) {
       q1 = iabs(q1) * 2 + (q1 < 0 ? 0 : halfpq) - 1;
@@ -841,6 +844,11 @@ int Core::decode_p_block(BitReader& br, int16_t* block, int n, int mquant, int t
     if (!pic_.pquantizer) block[idx] = s16(block[idx] + (block[idx] < 0 ? -quant : quant));
   };
   int last, skip, value;
+  const bool interlaced = pic_.fcm != kFcmProgressive;   // (interlaced pictures have scans of their own)
+  const uint8_t* zz8 = interlaced ? zzi_8x8_ : zz_8x8_[0];
+  const uint8_t* zz84 = interlaced ? kScan8x4Interlaced : zz_8x4_;
+  const uint8_t* zz48 = interlaced ? kScan4x8Interlaced : zz_4x8_;
+  const uint8_t* zz44 = interlaced ? kScan4x4Interlaced : kScan4x4;
   switch (ttblk) {
     case kTt8x8: {
       pat = 0xF;
@@ -850,7 +858,7 @@ int Core::decode_p_block(BitReader& br, int16_t* block, int n, int mquant, int t
         if (!decode_ac_coeff(br, &last, &skip, &value, codingset2_)) return -1;
         i += skip;
         if (i > 63) break;
-        dequant(zz_8x8_[0][i++], value);
+        dequant(zz8[i++], value);
       }
       inv_trans_8x8(block);
       add_block_clamped(plane, offset, stride, block);
@@ -866,7 +874,7 @@ int Core::decode_p_block(BitReader& br, int16_t* block, int n, int mquant, int t
           if (!decode_ac_coeff(br, &last, &skip, &value, codingset2_)) return -1;
           i += skip;
           if (i > 15) break;
-          dequant(kScan4x4[i++] + off, value);
+          dequant(zz44[i++] + off, value);
         }
         if (!(subblkpat & (1 << (3 - j)))) inv_trans_4x4_add(plane, offset + static_cast<uint64_t>((j & 1) * 4) + static_cast<uint64_t>((j & 2) * 2) * static_cast<uint64_t>(stride), stride, block + off);
       }
@@ -882,7 +890,7 @@ int Core::decode_p_block(BitReader& br, int16_t* block, int n, int mquant, int t
           if (!decode_ac_coeff(br, &last, &skip, &value, codingset2_)) return -1;
           i += skip;
           if (i > 31) break;
-          dequant(zz_8x4_[i++] + off, value);
+          dequant(zz84[i++] + off, value);
         }
         if (!(subblkpat & (1 << (1 - j)))) inv_trans_8x4_add(plane, offset + static_cast<uint64_t>(j * 4) * static_cast<uint64_t>(stride), stride, block + off);
       }
@@ -898,7 +906,7 @@ int Core::decode_p_block(BitReader& br, int16_t* block, int n, int mquant, int t
           if (!decode_ac_coeff(br, &last, &skip, &value, codingset2_)) return -1;
           i += skip;
           if (i > 31) break;
-          dequant(zz_4x8_[i++] + off, value);
+          dequant(zz48[i++] + off, value);
         }
         if (!(subblkpat & (1 << (1 - j)))) inv_trans_4x8_add(plane, offset + static_cast<uint64_t>(j * 4), stride, block + off);
       }
@@ -913,16 +921,17 @@ int Core::decode_p_block(BitReader& br, int16_t* block, int n, int mquant, int t
 
 // ---- macroblocks ---------------------------------------------------------------------------------------------------------------------
 
-// The positions of the six blocks of the current macroblock in the planes of the picture: block n -> plane, byte offset, stride.
+// The positions of the six blocks of the current macroblock in the planes of the picture (a field picture: in its lines of the frame): block n -> plane, byte
+// offset, stride.
 void Core::block_target(int n, int* plane, uint64_t* offset, int* stride) const {
   if (n < 4) {
     *plane = 0;
-    *stride = cur_->stride[0];
-    *offset = static_cast<uint64_t>(mb_y_ * 16 + (n >> 1) * 8) * static_cast<uint64_t>(*stride) + static_cast<uint64_t>(mb_x_ * 16 + (n & 1) * 8);
+    *stride = dst_stride_[0];
+    *offset = dst_off_[0] + static_cast<uint64_t>(mb_y_ * 16 + (n >> 1) * 8) * static_cast<uint64_t>(*stride) + static_cast<uint64_t>(mb_x_ * 16 + (n & 1) * 8);
   } else {
     *plane = n - 3;
-    *stride = cur_->stride[1];
-    *offset = static_cast<uint64_t>(mb_y_ * 8) * static_cast<uint64_t>(*stride) + static_cast<uint64_t>(mb_x_ * 8);
+    *stride = dst_stride_[*plane];
+    *offset = dst_off_[*plane] + static_cast<uint64_t>(mb_y_ * 8) * static_cast<uint64_t>(*stride) + static_cast<uint64_t>(mb_x_ * 8);
   }
 }
 
@@ -959,14 +968,20 @@ bool Core::decode_slice_blocks(BitReader& br, int start_mb_y, int end_mb_y) {
     for (int x = 0; x < bw; ++x) coded_[static_cast<uint64_t>(2 * start_mb_y - 1) * static_cast<uint64_t>(bw) + static_cast<uint64_t>(x)] = 0;
   }
   if (intra_picture && !adv) y_dc_scale_ = kDcScale[pic_.pq];
+  // Like the reference decoder, a unit stops (without a word) at a macroblock that starts with 1 bit or none left: every Advanced profile intra macroblock, every
+  // macroblock of a field picture, and those of progressive P and B pictures with a bit plane coded in the macroblocks.
+  const bool check_left = intra_picture ? adv
+                          : field_mode_ || pic_.skip_raw || (pic_.type == kPictureP ? pic_.mv_type_raw : pic_.direct_raw);
+  if (intra_picture && adv && br.bits_left() <= 1) return false;
   for (mb_y_ = start_mb_y; mb_y_ < end_mb_y; ++mb_y_) {
     first_slice_line_ = mb_y_ == start_mb_y;
     slice_start_row_[static_cast<uint64_t>(mb_y_)] = first_slice_line_ ? 1 : 0;
     for (mb_x_ = 0; mb_x_ < mb_w_; ++mb_x_) {
+      if (check_left && br.bits_left() <= 1) return false;
       bool ok;
       if (intra_picture) ok = adv ? decode_i_mb_adv(br) : decode_i_mb(br);
-      else if (pic_.type == kPictureP) ok = decode_p_mb(br);
-      else ok = decode_b_mb(br);
+      else if (pic_.type == kPictureP) ok = field_mode_ ? decode_p_mb_field(br) : decode_p_mb(br);
+      else ok = field_mode_ ? decode_b_mb_field(br) : decode_b_mb(br);
       if (!ok || br.overrun()) return false;
     }
   }
@@ -996,7 +1011,9 @@ bool Core::decode_i_mb(BitReader& br) {
 bool Core::decode_i_mb_adv(BitReader& br) {
   const uint64_t mb_pos = static_cast<uint64_t>(mb_y_) * static_cast<uint64_t>(mb_w_) + static_cast<uint64_t>(mb_x_);
   intra_mask_[mb_pos] = 0x3F;
-  cur_->direct_mv[mb_pos * 2] = cur_->direct_mv[mb_pos * 2 + 1] = 0;
+  const uint64_t fmb = field_mb_index(mb_pos);
+  cur_->direct_mv[fmb * 2] = cur_->direct_mv[fmb * 2 + 1] = 0;
+  if (field_mode_) cur_->mb_flags[fmb] = 1;
   int mquant = pic_.pq;
   int cbp = vlc_intra_cbpcy_.decode(br);
   if (cbp < 0) return false;
@@ -1119,7 +1136,7 @@ bool Core::decode_p_mb(BitReader& br) {
           bool coeffs = false;
           if (val && !read_mvdata(br, &dmv_x, &dmv_y, &coeffs, &mb_intra_)) return false;
           pred_mv(br, i, dmv_x, dmv_y, false, pic_.range_x, pic_.range_y);
-          if (!mb_intra_) mc_4mv_luma(i);
+          if (!mb_intra_) mc_4mv_luma(i, 0);
           intra_count += mb_intra_ ? 1 : 0;
           is_intra[i] = mb_intra_;
           is_coded[i] = coeffs;
@@ -1127,7 +1144,7 @@ bool Core::decode_p_mb(BitReader& br) {
           is_intra[i] = intra_count >= 3;
           is_coded[i] = val != 0;
         }
-        if (i == 4) mc_4mv_chroma();
+        if (i == 4) mc_4mv_chroma(0);
         if (is_intra[i]) intra_mask_[mb_pos] = static_cast<uint8_t>(intra_mask_[mb_pos] | (1 << i));
         if (!coded_inter) coded_inter = !is_intra[i] && is_coded[i];
       }
@@ -1173,9 +1190,9 @@ bool Core::decode_p_mb(BitReader& br) {
       qscale_[mb_pos] = 0;
       for (int i = 0; i < 4; ++i) {
         pred_mv(br, i, 0, 0, false, pic_.range_x, pic_.range_y);
-        mc_4mv_luma(i);
+        mc_4mv_luma(i, 0);
       }
-      mc_4mv_chroma();
+      mc_4mv_chroma(0);
     }
   }
   cbp_blocks_[mb_pos] = block_cbp;
@@ -1304,6 +1321,515 @@ bool Core::decode_b_mb(BitReader& br) {
     }
   }
   return !br.error();
+}
+
+// ---- field pictures ------------------------------------------------------------------------------------------------------------------
+
+namespace {
+// The offsets of the interlaced MVDATA: without and with the extended range of a direction (DMVRANGE).
+constexpr uint8_t kOffsetTableI[2][9] = {{0, 1, 2, 4, 8, 16, 32, 64, 128}, {0, 1, 3, 7, 15, 31, 63, 127, 255}};
+}  // namespace
+
+// 10.3.5.2 MVDATA of an interlaced picture: the differential vector, and with two reference fields whether the predictor of the other field is used.
+bool Core::read_mvdata_interlaced(BitReader& br, int* dmv_x, int* dmv_y, int* pred_flag) {
+  const int numref = pic_.numref ? 1 : 0;
+  const int esc = numref ? 125 : 71;
+  const int extend_x = pic_.dmvrange & 1, extend_y = (pic_.dmvrange >> 1) & 1;
+  const int index = numref ? vlc_mvdata2_[pic_.imvtab & 7].decode(br) : vlc_mvdata1_[pic_.imvtab & 3].decode(br);
+  if (index < 0) return false;
+  if (index == esc) {
+    *dmv_x = static_cast<int>(br.get(pic_.k_x));
+    *dmv_y = static_cast<int>(br.get(pic_.k_y));
+    if (numref) {
+      if (pred_flag) *pred_flag = *dmv_y & 1;
+      *dmv_y = (*dmv_y + (*dmv_y & 1)) >> 1;
+    }
+  } else {
+    int index1 = (index + 1) % 9;
+    if (index1 != 0) {
+      const int val = static_cast<int>(br.get(index1 + extend_x));
+      const int sign = 0 - (val & 1);
+      *dmv_x = (sign ^ ((val >> 1) + kOffsetTableI[extend_x][index1])) - sign;
+    } else {
+      *dmv_x = 0;
+    }
+    index1 = (index + 1) / 9;
+    if (index1 > numref) {
+      const int i = index1 >> numref;
+      if (i > 8) return false;
+      const int val = static_cast<int>(br.get(i + extend_y));
+      const int sign = 0 - (val & 1);
+      *dmv_y = (sign ^ ((val >> 1) + kOffsetTableI[extend_y][i])) - sign;
+    } else {
+      *dmv_y = 0;
+    }
+    if (numref && pred_flag) *pred_flag = index1 & 1;
+  }
+  return !br.error();
+}
+
+namespace {
+int clip_value(int v, int lo, int hi) { return v < lo ? lo : v > hi ? hi : v; }
+// The zone scaling of a predictor (10.3.5.4.3.4): small values by one factor, the others by another plus an offset; values past `limit` stay.
+int zone_scale(int n, int limit, int zone, int scale1, int scale2, int offset) {
+  if (iabs(n) > limit) return n;
+  if (iabs(n) < zone) return (n * scale1) >> 8;
+  return n < 0 ? ((n * scale2) >> 8) - offset : ((n * scale2) >> 8) + offset;
+}
+}  // namespace
+
+// 10.3.5.4.3.4: a predictor that refers to the opposite field, made to refer to the field of the same parity (`dim`: 0 x, 1 y).
+int Core::scale_for_same(int value, int dim, int dir) const {
+  const int hpel = pic_.quarter_sample ? 0 : 1;
+  int n = value >> hpel;
+  if (pic_.type != kPictureB || second_field_ || !dir) {
+    const int table = (dir ^ (second_field_ ? 1 : 0)) & 1;
+    int refdist = pic_.type != kPictureB ? pic_.refdist : (dir ? pic_.brfd : pic_.frfd);
+    if (refdist > 3) refdist = 3;
+    if (refdist < 0) refdist = 0;
+    auto scale = [&](int row) { return static_cast<int>(kFieldMvPredScales[(table * 7 + row) * 4 + refdist]); };
+    if (dim) {
+      const int scaled = zone_scale(n, 63, scale(4), scale(1), scale(2), scale(6));
+      n = cur_field_ && !ref_field_[dir] ? clip_value(scaled, -pic_.range_y / 2 + 1, pic_.range_y / 2) : clip_value(scaled, -pic_.range_y / 2, pic_.range_y / 2 - 1);
+    } else {
+      n = clip_value(zone_scale(n, 255, scale(3), scale(1), scale(2), scale(5)), -pic_.range_x, pic_.range_x - 1);
+    }
+    return n * (1 << hpel);
+  }
+  const int brfd = pic_.brfd > 3 ? 3 : pic_.brfd;
+  return ((n * static_cast<int>(kBFieldMvPredScales[0 * 4 + brfd])) >> 8) * (1 << hpel);
+}
+
+// ... and one that refers to the field of the same parity, made to refer to the opposite one.
+int Core::scale_for_opp(int value, int dim, int dir) const {
+  const int hpel = pic_.quarter_sample ? 0 : 1;
+  int n = value >> hpel;
+  if (pic_.type == kPictureB && !second_field_ && dir == 1) {
+    const int brfd = pic_.brfd > 3 ? 3 : pic_.brfd < 0 ? 0 : pic_.brfd;
+    auto scale = [&](int row) { return static_cast<int>(kBFieldMvPredScales[row * 4 + brfd]); };
+    if (dim) {
+      const int scaled = zone_scale(n, 63, scale(4), scale(1), scale(2), scale(6));
+      n = cur_field_ && !ref_field_[dir] ? clip_value(scaled, -pic_.range_y / 2 + 1, pic_.range_y / 2) : clip_value(scaled, -pic_.range_y / 2, pic_.range_y / 2 - 1);
+    } else {
+      n = clip_value(zone_scale(n, 255, scale(3), scale(1), scale(2), scale(5)), -pic_.range_x, pic_.range_x - 1);
+    }
+    return n * (1 << hpel);
+  }
+  int refdist = pic_.type != kPictureB ? pic_.refdist : (dir ? pic_.brfd : pic_.frfd);
+  if (refdist > 3) refdist = 3;
+  if (refdist < 0) refdist = 0;
+  const int table = (dir ^ (second_field_ ? 1 : 0)) & 1;
+  return ((n * static_cast<int>(kFieldMvPredScales[(table * 7 + 0) * 4 + refdist])) >> 8) * (1 << hpel);
+}
+
+// 10.3.5.4 motion vector prediction in a field picture, for block n (the whole macroblock: mv1) and direction dir: the predictors of the blocks around that are not
+// intra, each made to refer to the field this vector refers to (which REFFIELD says, or with two reference fields the majority of the predictors and the
+// predictor flag of MVDATA), their median, the hybrid prediction of P fields; the vector is the predictor plus the difference, in the range.
+void Core::pred_mv_field(BitReader& br, int n, int dmv_x, int dmv_y, bool mv1, int pred_flag, int dir) {
+  const int bw = 2 * mb_w_;
+  Buf<int16_t>& mvs = dir ? mv_back_ : mv_;
+  Buf<uint8_t>& mvf = mv_f_[dir & 1];
+  const int bx = 2 * mb_x_ + (n & 1), by = 2 * mb_y_ + (n >> 1);
+  auto at = [&](int x, int y) { return static_cast<uint64_t>(y) * static_cast<uint64_t>(bw) + static_cast<uint64_t>(x); };
+  auto blk_intra = [&](int x, int y) {
+    const uint64_t mb = static_cast<uint64_t>(y >> 1) * static_cast<uint64_t>(mb_w_) + static_cast<uint64_t>(x >> 1);
+    return ((intra_mask_[mb] >> (((y & 1) << 1) | (x & 1))) & 1) != 0;
+  };
+  const bool mixed = pic_.mv_mode == kMvMixed || (pic_.mv_mode == kMvIntensityComp && pic_.mv_mode2 == kMvMixed);
+  if (!pic_.quarter_sample) {
+    dmv_x *= 2;
+    dmv_y *= 2;
+  }
+  // (an intra macroblock of a field picture has no vectors: this is not called for it)
+  bool a_valid = !first_slice_line_ || n == 2 || n == 3;
+  bool b_valid = a_valid;
+  bool c_valid = mb_x_ != 0 || n == 1 || n == 3;
+  int off = 0;
+  if (mv1) {
+    if (mixed) off = mb_x_ == mb_w_ - 1 ? -2 : 2;
+    else off = mb_x_ == mb_w_ - 1 ? -1 : 2;
+    b_valid = b_valid && mb_w_ > 1;
+  } else {
+    switch (n) {
+      case 0: off = mb_x_ ? -1 : 1; break;
+      case 1: off = mb_x_ == mb_w_ - 1 ? -1 : 1; break;
+      case 2: off = 1; break;
+      default: off = -1; break;
+    }
+    if (mb_w_ == 1) b_valid = b_valid && c_valid;
+  }
+  // (intra blocks do not predict a field vector)
+  a_valid = a_valid && !blk_intra(bx, by - 1);
+  b_valid = b_valid && !blk_intra(bx + off, by - 1);
+  c_valid = c_valid && !blk_intra(bx - 1, by);
+  int pa[2] = {0, 0}, pb[2] = {0, 0}, pc[2] = {0, 0};
+  int a_f = 0, b_f = 0, c_f = 0, num_same = 0, num_opp = 0;
+  auto take = [&](bool valid, int x, int y, int* p, int* f) {
+    if (!valid) return;
+    const uint64_t i = at(x, y);
+    p[0] = mvs[i * 2];
+    p[1] = mvs[i * 2 + 1];
+    *f = mvf[i];
+    num_opp += *f;
+    num_same += 1 - *f;
+  };
+  take(a_valid, bx, by - 1, pa, &a_f);
+  take(b_valid, bx + off, by - 1, pb, &b_f);
+  take(c_valid, bx - 1, by, pc, &c_f);
+  int opposite;
+  if (!pic_.numref) opposite = 1 - pic_.reffield;
+  else opposite = num_same <= num_opp ? 1 - pred_flag : pred_flag;
+  const uint64_t xy = at(bx, by);
+  if (opposite) {
+    mvf[xy] = 1;
+    ref_field_[dir] = cur_field_ ^ 1;
+    if (a_valid && !a_f) {
+      pa[0] = s16(scale_for_opp(pa[0], 0, dir));
+      pa[1] = s16(scale_for_opp(pa[1], 1, dir));
+    }
+    if (b_valid && !b_f) {
+      pb[0] = s16(scale_for_opp(pb[0], 0, dir));
+      pb[1] = s16(scale_for_opp(pb[1], 1, dir));
+    }
+    if (c_valid && !c_f) {
+      pc[0] = s16(scale_for_opp(pc[0], 0, dir));
+      pc[1] = s16(scale_for_opp(pc[1], 1, dir));
+    }
+  } else {
+    mvf[xy] = 0;
+    ref_field_[dir] = cur_field_;
+    if (a_valid && a_f) {
+      pa[0] = s16(scale_for_same(pa[0], 0, dir));
+      pa[1] = s16(scale_for_same(pa[1], 1, dir));
+    }
+    if (b_valid && b_f) {
+      pb[0] = s16(scale_for_same(pb[0], 0, dir));
+      pb[1] = s16(scale_for_same(pb[1], 1, dir));
+    }
+    if (c_valid && c_f) {
+      pc[0] = s16(scale_for_same(pc[0], 0, dir));
+      pc[1] = s16(scale_for_same(pc[1], 1, dir));
+    }
+  }
+  int px, py;
+  if (a_valid) {
+    px = pa[0];
+    py = pa[1];
+  } else if (c_valid) {
+    px = pc[0];
+    py = pc[1];
+  } else if (b_valid) {
+    px = pb[0];
+    py = pb[1];
+  } else {
+    px = py = 0;
+  }
+  if (num_same + num_opp > 1) {
+    px = mid_pred(pa[0], pb[0], pc[0]);
+    py = mid_pred(pa[1], pb[1], pc[1]);
+  }
+  if (pic_.type != kPictureB && a_valid && c_valid) {   // hybrid prediction (P fields only), with the predictors as scaled
+    int sum;
+    if (blk_intra(bx, by - 1)) sum = iabs(px) + iabs(py);
+    else sum = iabs(px - pa[0]) + iabs(py - pa[1]);
+    if (sum > 32) {
+      if (br.bit()) {
+        px = pa[0];
+        py = pa[1];
+      } else {
+        px = pc[0];
+        py = pc[1];
+      }
+    } else {
+      if (blk_intra(bx - 1, by)) sum = iabs(px) + iabs(py);
+      else sum = iabs(px - pc[0]) + iabs(py - pc[1]);
+      if (sum > 32) {
+        if (br.bit()) {
+          px = pa[0];
+          py = pa[1];
+        } else {
+          px = pc[0];
+          py = pc[1];
+        }
+      }
+    }
+  }
+  const int r_x = pic_.range_x;
+  const int r_y = pic_.numref ? pic_.range_y >> 1 : pic_.range_y;
+  // A bottom field's vector to the top field is one line longer: the range is shifted by that.
+  const int y_bias = cur_field_ && ref_field_[dir] == 0 ? 1 : 0;
+  const int mx = ((px + dmv_x + r_x) & ((r_x << 1) - 1)) - r_x;
+  const int my = ((py + dmv_y + r_y - y_bias) & ((r_y << 1) - 1)) - r_y + y_bias;
+  mv_cur_[dir & 1][n][0] = s16(mx);
+  mv_cur_[dir & 1][n][1] = s16(my);
+  mvs[xy * 2] = s16(mx);
+  mvs[xy * 2 + 1] = s16(my);
+  if (mv1) {
+    for (int k = 1; k < 4; ++k) {
+      const uint64_t i = at(2 * mb_x_ + (k & 1), 2 * mb_y_ + (k >> 1));
+      mvs[i * 2] = s16(mx);
+      mvs[i * 2 + 1] = s16(my);
+      mvf[i] = mvf[xy];
+    }
+  }
+}
+
+// 10.4.5 the vectors of a B field macroblock of type bmvtype_ (block n, or the whole macroblock: mv1). Direct mode takes the co-located vector of the backward
+// anchor's field (the one decoded in the same place: first or second) scaled by BFRACTION, and the opposite field when most of its luma blocks referred to it.
+// The direction that is not used is predicted as well (with no difference), so that the macroblocks after this one have its predictors.
+bool Core::pred_b_mv_field(int n, int dmv_x[2], int dmv_y[2], bool mv1, int pred_flag[2]) {
+  BitReader none;   // (no hybrid prediction in B fields: nothing is read)
+  if (bmvtype_ == kBmvDirect) {
+    const Picture* next = anchor_[1];
+    if (!next || !next->field_coded) return false;
+    const uint64_t mb_pos = static_cast<uint64_t>(mb_y_) * static_cast<uint64_t>(mb_w_) + static_cast<uint64_t>(mb_x_);
+    const uint64_t co = field_mb_index(mb_pos);
+    int f = 0;
+    if (!(next->mb_flags[co] & 1)) {
+      const int vx = next->direct_mv[co * 2], vy = next->direct_mv[co * 2 + 1];
+      const bool qs = pic_.quarter_sample;
+      mv_cur_[0][0][0] = s16(scale_mv(vx, pic_.bfraction, 0, qs));
+      mv_cur_[0][0][1] = s16(scale_mv(vy, pic_.bfraction, 0, qs));
+      mv_cur_[1][0][0] = s16(scale_mv(vx, pic_.bfraction, 1, qs));
+      mv_cur_[1][0][1] = s16(scale_mv(vy, pic_.bfraction, 1, qs));
+      const int opp = (next->mb_flags[co] >> 1) & 15;
+      const int total_opp = (opp & 1) + ((opp >> 1) & 1) + ((opp >> 2) & 1) + ((opp >> 3) & 1);
+      f = total_opp > 2 ? 1 : 0;
+    } else {
+      mv_cur_[0][0][0] = mv_cur_[0][0][1] = mv_cur_[1][0][0] = mv_cur_[1][0][1] = 0;
+    }
+    ref_field_[0] = ref_field_[1] = cur_field_ ^ f;
+    const int bw = 2 * mb_w_;
+    for (int k = 0; k < 4; ++k) {
+      const uint64_t i = static_cast<uint64_t>(2 * mb_y_ + (k >> 1)) * static_cast<uint64_t>(bw) + static_cast<uint64_t>(2 * mb_x_ + (k & 1));
+      mv_[i * 2] = mv_cur_[0][0][0];
+      mv_[i * 2 + 1] = mv_cur_[0][0][1];
+      mv_back_[i * 2] = mv_cur_[1][0][0];
+      mv_back_[i * 2 + 1] = mv_cur_[1][0][1];
+      mv_f_[0][i] = static_cast<uint8_t>(f);
+      mv_f_[1][i] = static_cast<uint8_t>(f);
+    }
+    return true;
+  }
+  if (bmvtype_ == kBmvInterpolated) {
+    pred_mv_field(none, 0, dmv_x[0], dmv_y[0], true, pred_flag[0], 0);
+    pred_mv_field(none, 0, dmv_x[1], dmv_y[1], true, pred_flag[1], 1);
+    return true;
+  }
+  if (bmvtype_ == kBmvBackward) {
+    pred_mv_field(none, n, dmv_x[1], dmv_y[1], mv1, pred_flag[1], 1);
+    if (n == 3 || mv1) pred_mv_field(none, 0, dmv_x[0], dmv_y[0], true, 0, 0);
+  } else {
+    pred_mv_field(none, n, dmv_x[0], dmv_y[0], mv1, pred_flag[0], 0);
+    if (n == 3 || mv1) pred_mv_field(none, 0, dmv_x[1], dmv_y[1], true, 0, 1);
+  }
+  return true;
+}
+
+// An intra macroblock of a field picture (MBMODE 0 and 1: without and with coded blocks): MQUANT, ACPRED, ICBPCY and the six intra blocks; a B field puts them
+// at once, a P field keeps them for its overlap filter.
+bool Core::decode_field_intra_mb(BitReader& br, int idx_mbmode, bool put_now) {
+  const uint64_t mb_pos = static_cast<uint64_t>(mb_y_) * static_cast<uint64_t>(mb_w_) + static_cast<uint64_t>(mb_x_);
+  const uint64_t fmb = field_mb_index(mb_pos);
+  mb_intra_ = true;
+  intra_mask_[mb_pos] = 0x3F;
+  cur_->direct_mv[fmb * 2] = cur_->direct_mv[fmb * 2 + 1] = 0;
+  cur_->mb_flags[fmb] = 1;
+  int mquant = pic_.pq;
+  if (!decode_mquant(br, &mquant)) return false;
+  qscale_[mb_pos] = static_cast<int8_t>(mquant);
+  y_dc_scale_ = kDcScale[iabs(mquant)];
+  ac_pred_ = br.bit() != 0;
+  plane_acpred_[mb_pos] = ac_pred_ ? 1 : 0;
+  int cbp = 0;
+  if (idx_mbmode & 1) {
+    const int sym = vlc_icbpcy_[pic_.icbptab & 7].decode(br);
+    if (sym < 0) return false;
+    cbp = sym + 1;
+  }
+  auto block_intra = [&](int bx, int by) { return ((intra_mask_[static_cast<uint64_t>(by >> 1) * static_cast<uint64_t>(mb_w_) + static_cast<uint64_t>(bx >> 1)] >> (((by & 1) << 1) | (bx & 1))) & 1) != 0; };
+  for (int i = 0; i < 6; ++i) {
+    const BlockPos p = block_pos(mb_x_, mb_y_, mb_w_, i);
+    dc_[p.plane][static_cast<uint64_t>(p.y) * static_cast<uint64_t>(p.wrap) + static_cast<uint64_t>(p.x)] = 0;
+    a_avail_ = c_avail_ = 0;
+    if (i < 4) {
+      const int bx = 2 * mb_x_ + (i & 1), by = 2 * mb_y_ + (i >> 1);
+      if (i == 2 || i == 3 || !first_slice_line_) a_avail_ = block_intra(bx, by - 1);
+      if (i == 1 || i == 3 || mb_x_) c_avail_ = block_intra(bx - 1, by);
+    } else {
+      if (!first_slice_line_) a_avail_ = (intra_mask_[mb_pos - static_cast<uint64_t>(mb_w_)] >> i) & 1;
+      if (mb_x_) c_avail_ = (intra_mask_[mb_pos - 1] >> i) & 1;
+    }
+    const int val = (cbp >> (5 - i)) & 1;
+    for (int k = 0; k < 64; ++k) cur_blk_[i][k] = 0;
+    if (!decode_intra_block(br, cur_blk_[i], i, val != 0, mquant, i >= 4 ? codingset2_ : codingset_)) return false;
+    inv_trans_8x8(cur_blk_[i]);
+    if (put_now) {
+      int plane, stride;
+      uint64_t offset;
+      block_target(i, &plane, &offset, &stride);
+      put_block_clamped(dst_plane(plane), offset, stride, cur_blk_[i], true);
+    } else {
+      keep_intra_block(i, cur_blk_[i]);
+    }
+  }
+  // (a P field's intra blocks count as coded everywhere for the in-loop filter; a B field's are not looked at)
+  cbp_blocks_[mb_pos] = put_now ? 0 : 0xFFFFFFu;
+  ttblk_[mb_pos] = 0;
+  return !br.error();
+}
+
+// The residual of an inter macroblock of a field picture: MQUANT, TTMB and the coded blocks (`cbp`) added to the prediction.
+bool Core::decode_field_residual(BitReader& br, int cbp, int mquant, uint32_t* block_cbp, uint32_t* block_tt) {
+  const uint64_t mb_pos = static_cast<uint64_t>(mb_y_) * static_cast<uint64_t>(mb_w_) + static_cast<uint64_t>(mb_x_);
+  if (cbp && !decode_mquant(br, &mquant)) return false;
+  qscale_[mb_pos] = static_cast<int8_t>(mquant);
+  int ttmb = pic_.ttfrm;
+  if (!pic_.ttmbf && cbp) {
+    ttmb = vlc_ttmb_[pic_.tt_index].decode(br);
+    if (ttmb < 0) return false;
+  }
+  bool first_block = true;
+  for (int i = 0; i < 6; ++i) {
+    const BlockPos p = block_pos(mb_x_, mb_y_, mb_w_, i);
+    dc_[p.plane][static_cast<uint64_t>(p.y) * static_cast<uint64_t>(p.wrap) + static_cast<uint64_t>(p.x)] = 0;
+    if (!((cbp >> (5 - i)) & 1)) continue;
+    int plane, stride;
+    uint64_t offset;
+    block_target(i, &plane, &offset, &stride);
+    const int pat = decode_p_block(br, cur_blk_[i], i, mquant, ttmb, first_block, dst_plane(plane), offset, stride, block_tt);
+    if (pat < 0) return false;
+    *block_cbp |= static_cast<uint32_t>(pat) << (i << 2);
+    if (!pic_.ttmbf && ttmb < 8) ttmb = -1;
+    first_block = false;
+  }
+  return true;
+}
+
+// 10.7.4.2 a macroblock of a P field: MBMODE (intra, 1MV with or without vector data and coded blocks, 4MV), the vectors with their prediction and motion
+// compensation, then the residual.
+bool Core::decode_p_mb_field(BitReader& br) {
+  const uint64_t mb_pos = static_cast<uint64_t>(mb_y_) * static_cast<uint64_t>(mb_w_) + static_cast<uint64_t>(mb_x_);
+  const uint64_t fmb = field_mb_index(mb_pos);
+  const bool mixed = (pic_.mv_mode == kMvIntensityComp && pic_.mv_mode2 == kMvMixed) || pic_.mv_mode == kMvMixed;
+  const int idx = mixed ? vlc_if_mmv_mbmode_[pic_.mbmodetab & 7].decode(br) : vlc_if_1mv_mbmode_[pic_.mbmodetab & 7].decode(br);
+  if (idx < 0) return false;
+  intra_mask_[mb_pos] = 0;
+  if (idx <= 1) return decode_field_intra_mb(br, idx, false);
+  mb_intra_ = false;
+  cur_->mb_flags[fmb] = 0;
+  bool has_coeffs;
+  if (idx <= 5) {   // 1MV
+    int dmv_x = 0, dmv_y = 0, pred_flag = 0;
+    if ((idx & 1) && !read_mvdata_interlaced(br, &dmv_x, &dmv_y, &pred_flag)) return false;
+    pred_mv_field(br, 0, dmv_x, dmv_y, true, pred_flag, 0);
+    mc_1mv(0);
+    has_coeffs = !(idx & 2);
+  } else {   // 4MV
+    const int fourmvbp = vlc_4mvbp_[pic_.fourmvbptab & 3].decode(br);
+    if (fourmvbp < 0) return false;
+    for (int i = 0; i < 4; ++i) {
+      int dmv_x = 0, dmv_y = 0, pred_flag = 0;
+      if ((fourmvbp & (8 >> i)) && !read_mvdata_interlaced(br, &dmv_x, &dmv_y, &pred_flag)) return false;
+      pred_mv_field(br, i, dmv_x, dmv_y, false, pred_flag, 0);
+      mc_4mv_luma(i, 0);
+    }
+    mc_4mv_chroma(0);
+    has_coeffs = (idx & 1) != 0;
+  }
+  // For B fields that use this one as their backward anchor: which field each luma block's vector refers to.
+  const int bw = 2 * mb_w_;
+  uint8_t flags = 0;
+  for (int k = 0; k < 4; ++k) {
+    const uint64_t i = static_cast<uint64_t>(2 * mb_y_ + (k >> 1)) * static_cast<uint64_t>(bw) + static_cast<uint64_t>(2 * mb_x_ + (k & 1));
+    if (mv_f_[0][i]) flags = static_cast<uint8_t>(flags | (2 << k));
+  }
+  cur_->mb_flags[fmb] = flags;
+  int cbp = 0;
+  if (has_coeffs) {
+    const int sym = vlc_icbpcy_[pic_.icbptab & 7].decode(br);
+    if (sym < 0) return false;
+    cbp = sym + 1;
+  }
+  uint32_t block_cbp = 0, block_tt = 0;
+  const bool ok = decode_field_residual(br, cbp, pic_.pq, &block_cbp, &block_tt);
+  cbp_blocks_[mb_pos] = block_cbp;
+  ttblk_[mb_pos] = block_tt;
+  return ok && !br.error();
+}
+
+// 10.7.4.3 a macroblock of a B field: MBMODE, FORWARDMB (or the bit plane), BMVTYPE (backward, direct, interpolated with the second vector's flag), the vectors,
+// motion compensation, the residual. A 4MV macroblock goes one way, forward or backward.
+bool Core::decode_b_mb_field(BitReader& br) {
+  const uint64_t mb_pos = static_cast<uint64_t>(mb_y_) * static_cast<uint64_t>(mb_w_) + static_cast<uint64_t>(mb_x_);
+  mb_intra_ = false;
+  const bool mixed = pic_.mv_mode == kMvMixed;
+  const int idx = mixed ? vlc_if_mmv_mbmode_[pic_.mbmodetab & 7].decode(br) : vlc_if_1mv_mbmode_[pic_.mbmodetab & 7].decode(br);
+  if (idx < 0) return false;
+  intra_mask_[mb_pos] = 0;
+  if (idx <= 1) return decode_field_intra_mb(br, idx, true);
+  int fwd;
+  if (pic_.forward_raw) {
+    fwd = br.bit();
+    plane_forward_[mb_pos] = static_cast<uint8_t>(fwd);
+  } else {
+    fwd = plane_forward_[mb_pos];
+  }
+  int dmv_x[2] = {0, 0}, dmv_y[2] = {0, 0}, pred_flag[2] = {0, 0};
+  bmvtype_ = kBmvBackward;
+  bool has_coeffs;
+  if (idx <= 5) {   // 1MV
+    bool interpmvp = false;
+    if (fwd) {
+      bmvtype_ = kBmvForward;
+    } else {
+      switch (br.decode012()) {
+        case 0: bmvtype_ = kBmvBackward; break;
+        case 1: bmvtype_ = kBmvDirect; break;
+        default:
+          bmvtype_ = kBmvInterpolated;
+          interpmvp = br.bit() != 0;
+          break;
+      }
+    }
+    const int d = bmvtype_ == kBmvBackward ? 1 : 0;
+    if (bmvtype_ != kBmvDirect && (idx & 1) && !read_mvdata_interlaced(br, &dmv_x[d], &dmv_y[d], &pred_flag[d])) return false;
+    if (interpmvp && !read_mvdata_interlaced(br, &dmv_x[1], &dmv_y[1], &pred_flag[1])) return false;
+    if (bmvtype_ == kBmvDirect) {
+      dmv_x[0] = dmv_y[0] = dmv_x[1] = dmv_y[1] = 0;
+      pred_flag[0] = 0;
+      // (direct mode needs an anchor of two field pictures: the reference decoder refuses the macroblock otherwise)
+      if (!anchor_[1] || !anchor_[1]->field_coded) return false;
+    }
+    if (!pred_b_mv_field(0, dmv_x, dmv_y, true, pred_flag)) return false;
+    b_mc(bmvtype_ == kBmvDirect, bmvtype_);
+    has_coeffs = !(idx & 2);
+  } else {   // 4MV
+    if (fwd) bmvtype_ = kBmvForward;
+    const int d = bmvtype_ == kBmvBackward ? 1 : 0;
+    const int fourmvbp = vlc_4mvbp_[pic_.fourmvbptab & 3].decode(br);
+    if (fourmvbp < 0) return false;
+    for (int i = 0; i < 4; ++i) {
+      dmv_x[0] = dmv_y[0] = pred_flag[0] = 0;
+      dmv_x[1] = dmv_y[1] = pred_flag[1] = 0;
+      if ((fourmvbp & (8 >> i)) && !read_mvdata_interlaced(br, &dmv_x[d], &dmv_y[d], &pred_flag[d])) return false;
+      if (!pred_b_mv_field(i, dmv_x, dmv_y, false, pred_flag)) return false;
+      mc_4mv_luma(i, d);
+    }
+    mc_4mv_chroma(d);
+    has_coeffs = (idx & 1) != 0;
+  }
+  int cbp = 0;
+  if (has_coeffs) {
+    const int sym = vlc_icbpcy_[pic_.icbptab & 7].decode(br);
+    if (sym < 0) return false;
+    cbp = sym + 1;
+  }
+  uint32_t block_cbp = 0, block_tt = 0;
+  const bool ok = decode_field_residual(br, cbp, pic_.pq, &block_cbp, &block_tt);
+  cbp_blocks_[mb_pos] = block_cbp;
+  ttblk_[mb_pos] = block_tt;
+  return ok && !br.error();
 }
 
 }  // namespace vc1
