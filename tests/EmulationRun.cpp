@@ -226,7 +226,12 @@ double tone(const std::vector<int16_t>& s, size_t from, size_t n, double freq) {
 #include "Hardware/GraphicsProcessingUnit/IGraphicsProcessingUnit.hpp"
 #include "Process/Win32k/Win32k.hpp"
 #include "Process/Win32k/Dxg/DxgInternal.hpp"
+#include "Kernel/Dxgkrnl/Adapter.hpp"
 namespace {
+// TCOS_EMU_STREAM_TRACE set: every command stream the kernel refuses is printed (the packet's op, the status, the packets before it, the line of Adapter.cpp that refused it).
+void print_refused_stream(uint32_t op, uint32_t status, uint32_t commands_before, uint32_t line) {
+  printf("[stream refused: op %u status %#x after %u packets, Adapter.cpp line %u]\n", op, status, commands_before, line);
+}
 class FakeScreen final : public hardware::IGraphicsProcessingUnit {
  public:
   FakeScreen(uint32_t w, uint32_t h) : w_(w), h_(h), pixels_(uint64_t{w} * h, 0) {}
@@ -391,6 +396,7 @@ int main(int argc, char** argv) {
   auto cpu = create_guest_cpu(p.start().arch, a);
   Sync sync; Threads th; Ctl ctl;
 #ifdef TCOS_EMU_DXG
+  if (getenv("TCOS_EMU_STREAM_TRACE")) dxgk::set_stream_trace(print_refused_stream);
   FakeScreen screen(640, 480);
   graphics::SoftwareDevice device(a, &screen);
 #ifdef TCOS_EMU_DMABUF

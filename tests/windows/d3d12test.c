@@ -25,6 +25,7 @@
 #include <windows.h>
 #include <stdio.h>
 #include <string.h>
+#include <stdlib.h>
 #include <d3d12.h>
 #include <dxgi1_6.h>
 #include "dxfixtures.h"
@@ -2147,6 +2148,420 @@ static void test_blend_factor(Scene *c) {
   ID3D12Resource_Release(vb);
 }
 
+/* ---- planar textures: placed ones, views of several slices of a plane, integer views of a plane ---------------------------------------------------------------------- */
+
+#define PL_W 16
+#define PL_H 8
+/* The value of plane `plane` of slice `slice` at (x, y) (x counts channels: the chroma's U and V are 2x and 2x + 1) of pattern `seed`: constant over each slice and plane
+ * unless `ramp`. 16-bit planes take it as it is. */
+static UINT planar_value(UINT seed, UINT slice, UINT plane, UINT x, UINT y, int ramp) {
+  if (!ramp) return plane == 0 ? 40 + 60 * slice + seed : (x & 1) ? 200 - 30 * slice + seed : 10 + 30 * slice + seed;
+  return (seed * 31 + slice * 57 + plane * 101 + x * 7 + y * 11) & 0xFF;
+}
+/* Every plane of every slice of a planar texture from pattern `seed` (8 or 16-bit pixels), through an upload buffer laid out as GetCopyableFootprints says. */
+static void planar_fill(ID3D12Device *dev, ID3D12CommandQueue *queue, ID3D12Fence *fence, UINT64 *fence_value, ID3D12CommandAllocator *allocator, ID3D12Resource *tex, UINT seed,
+                        int ramp) {
+  const D3D12_RESOURCE_DESC rd = ID3D12Resource_GetDesc(tex);
+  const UINT layers = rd.DepthOrArraySize, bytes = rd.Format == DXGI_FORMAT_NV12 ? 1 : 2;
+  D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp[16];
+  UINT rows[16];
+  UINT64 row_bytes[16], total = 0;
+  ID3D12Device_GetCopyableFootprints(dev, &rd, 0, 2 * layers, 0, fp, rows, row_bytes, &total);
+  ID3D12Resource *up = make_buffer(dev, D3D12_HEAP_TYPE_UPLOAD, total, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ);
+  BYTE *p = NULL;
+  if (!up || FAILED(ID3D12Resource_Map(up, 0, NULL, (void **)&p)) || !p) { CHECK(0); if (up) ID3D12Resource_Release(up); return; }
+  for (UINT sub = 0; sub < 2 * layers; ++sub)
+    for (UINT y = 0; y < rows[sub]; ++y)
+      for (UINT x = 0; x < row_bytes[sub] / bytes; ++x) {
+        const UINT v = planar_value(seed, sub % layers, sub / layers, x, y, ramp);
+        BYTE *at = p + fp[sub].Offset + (UINT64)y * fp[sub].Footprint.RowPitch + (UINT64)x * bytes;
+        if (bytes == 1) at[0] = (BYTE)v;
+        else { at[0] = (BYTE)(v << 8); at[1] = (BYTE)v; }      /* (16-bit: the value in the high byte, as P010's ten bits are) */
+      }
+  ID3D12Resource_Unmap(up, 0, NULL);
+  ID3D12GraphicsCommandList *list = NULL;
+  CHECK_HR(ID3D12CommandAllocator_Reset(allocator));
+  CHECK_HR(ID3D12Device_CreateCommandList(dev, 0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator, NULL, &IID_ID3D12GraphicsCommandList, (void **)&list));
+  for (UINT sub = 0; list && sub < 2 * layers; ++sub) {
+    D3D12_TEXTURE_COPY_LOCATION to, from;
+    memset(&to, 0, sizeof to);
+    memset(&from, 0, sizeof from);
+    to.pResource = tex;
+    to.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    from.pResource = up;
+    from.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    to.SubresourceIndex = sub;
+    from.PlacedFootprint = fp[sub];
+    ID3D12GraphicsCommandList_CopyTextureRegion(list, &to, 0, 0, 0, &from, NULL);
+  }
+  if (list) {
+    CHECK_HR(ID3D12GraphicsCommandList_Close(list));
+    ID3D12CommandList *lists[1] = {(ID3D12CommandList *)list};
+    ID3D12CommandQueue_ExecuteCommandLists(queue, 1, lists);
+    wait_fence(queue, fence, fence_value);
+    ID3D12GraphicsCommandList_Release(list);
+  }
+  ID3D12Resource_Release(up);
+}
+/* Subresource `sub` of a planar texture read back: its values (the high byte of a 16-bit one) into out[y * row + x], `row` the channels of a row. */
+static int planar_read(ID3D12Device *dev, ID3D12CommandQueue *queue, ID3D12Fence *fence, UINT64 *fence_value, ID3D12CommandAllocator *allocator, ID3D12Resource *tex, UINT sub,
+                       BYTE *out, UINT *row) {
+  const D3D12_RESOURCE_DESC rd = ID3D12Resource_GetDesc(tex);
+  const UINT bytes = rd.Format == DXGI_FORMAT_NV12 ? 1 : 2;
+  D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp;
+  UINT rows = 0;
+  UINT64 row_bytes = 0, total = 0;
+  ID3D12Device_GetCopyableFootprints(dev, &rd, sub, 1, 0, &fp, &rows, &row_bytes, &total);
+  ID3D12Resource *down = make_buffer(dev, D3D12_HEAP_TYPE_READBACK, total, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);
+  ID3D12GraphicsCommandList *list = NULL;
+  CHECK_HR(ID3D12CommandAllocator_Reset(allocator));
+  CHECK_HR(ID3D12Device_CreateCommandList(dev, 0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator, NULL, &IID_ID3D12GraphicsCommandList, (void **)&list));
+  if (!down || !list) { if (down) ID3D12Resource_Release(down); if (list) ID3D12GraphicsCommandList_Release(list); return 0; }
+  D3D12_TEXTURE_COPY_LOCATION to, from;
+  memset(&to, 0, sizeof to);
+  memset(&from, 0, sizeof from);
+  to.pResource = down;
+  to.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+  from.pResource = tex;
+  from.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+  to.PlacedFootprint = fp;
+  from.SubresourceIndex = sub;
+  ID3D12GraphicsCommandList_CopyTextureRegion(list, &to, 0, 0, 0, &from, NULL);
+  CHECK_HR(ID3D12GraphicsCommandList_Close(list));
+  ID3D12CommandList *lists[1] = {(ID3D12CommandList *)list};
+  ID3D12CommandQueue_ExecuteCommandLists(queue, 1, lists);
+  wait_fence(queue, fence, fence_value);
+  ID3D12GraphicsCommandList_Release(list);
+  const BYTE *p = NULL;
+  int ok = SUCCEEDED(ID3D12Resource_Map(down, 0, NULL, (void **)&p)) && p;
+  *row = (UINT)(row_bytes / bytes);
+  for (UINT y = 0; ok && y < rows; ++y)
+    for (UINT x = 0; x < *row; ++x) out[y * *row + x] = p[fp.Offset + (UINT64)y * fp.Footprint.RowPitch + (UINT64)x * bytes + bytes - 1];
+  if (p) ID3D12Resource_Unmap(down, 0, NULL);
+  ID3D12Resource_Release(down);
+  return ok;
+}
+/* Whether a planar texture holds pattern `seed` in every plane of every slice (`ramp` as planar_fill). */
+static int planar_holds(Scene *c, ID3D12Resource *tex, UINT seed, int ramp) {
+  const D3D12_RESOURCE_DESC rd = ID3D12Resource_GetDesc(tex);
+  BYTE values[PL_W * PL_H];
+  for (UINT sub = 0; sub < 2u * rd.DepthOrArraySize; ++sub) {
+    UINT row = 0;
+    if (!planar_read(c->dev, c->queue, c->fence, c->fence_value, c->allocator, tex, sub, values, &row)) return 0;
+    const UINT h = sub >= rd.DepthOrArraySize ? PL_H / 2 : PL_H;
+    for (UINT y = 0; y < h; ++y)
+      for (UINT x = 0; x < row; ++x)
+        if (values[y * row + x] != (BYTE)planar_value(seed, sub % rd.DepthOrArraySize, sub / rd.DepthOrArraySize, x, y, ramp)) {
+          printf("  planar sub %u (%u, %u): %u, want %u\n", sub, x, y, values[y * row + x], planar_value(seed, sub % rd.DepthOrArraySize, sub / rd.DepthOrArraySize, x, y, ramp) & 0xFF);
+          return 0;
+        }
+  }
+  return 1;
+}
+static ID3D12Resource *planar_texture(ID3D12Device *dev, DXGI_FORMAT format, UINT layers, D3D12_RESOURCE_FLAGS flags) {
+  D3D12_HEAP_PROPERTIES defaults = {D3D12_HEAP_TYPE_DEFAULT, D3D12_CPU_PAGE_PROPERTY_UNKNOWN, D3D12_MEMORY_POOL_UNKNOWN, 1, 1};
+  D3D12_RESOURCE_DESC td = {D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, PL_W, PL_H, (UINT16)layers, 1, format, {1, 0}, D3D12_TEXTURE_LAYOUT_UNKNOWN, flags};
+  ID3D12Resource *t = NULL;
+  CHECK_HR(ID3D12Device_CreateCommittedResource(dev, &defaults, D3D12_HEAP_FLAG_NONE, &td, D3D12_RESOURCE_STATE_COMMON, NULL, &IID_ID3D12Resource, (void **)&t));
+  return t;
+}
+
+/* A pipeline of `ps` over a root signature of a table of one shader resource view (t0), a point sampler and the vertex shader's matrix; `target` its render target's format. */
+typedef struct PlanarDraw { ID3D12RootSignature *rs; ID3D12PipelineState *pso; } PlanarDraw;
+static int planar_draw_make(Scene *c, PlanarDraw *p, const void *vs, SIZE_T vs_size, const void *ps, SIZE_T ps_size, DXGI_FORMAT target, int with_table) {
+  memset(p, 0, sizeof *p);
+  D3D12_DESCRIPTOR_RANGE range = {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0, 0, D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND};
+  D3D12_ROOT_PARAMETER params[2];
+  memset(params, 0, sizeof params);
+  params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+  params[0].Constants.Num32BitValues = 16;
+  params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+  params[1].DescriptorTable.NumDescriptorRanges = 1;
+  params[1].DescriptorTable.pDescriptorRanges = &range;
+  D3D12_STATIC_SAMPLER_DESC ss;
+  memset(&ss, 0, sizeof ss);
+  ss.Filter = D3D12_FILTER_MIN_MAG_MIP_POINT;
+  ss.AddressU = ss.AddressV = ss.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+  ss.MaxLOD = 1000.0f;
+  D3D12_ROOT_SIGNATURE_DESC rsd = {with_table ? 2u : 1u, params, 1, &ss, D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT};
+  ID3DBlob *blob = NULL, *error = NULL;
+  CHECK_HR(D3D12SerializeRootSignature(&rsd, D3D_ROOT_SIGNATURE_VERSION_1_0, &blob, &error));
+  if (blob) {
+    CHECK_HR(ID3D12Device_CreateRootSignature(c->dev, 0, ID3D10Blob_GetBufferPointer(blob), ID3D10Blob_GetBufferSize(blob), &IID_ID3D12RootSignature, (void **)&p->rs));
+    ID3D10Blob_Release(blob);
+  }
+  D3D12_INPUT_ELEMENT_DESC layout[2] = {{"POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
+                                        {"COLOR", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 12, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0}};
+  D3D12_GRAPHICS_PIPELINE_STATE_DESC pd;
+  memset(&pd, 0, sizeof pd);
+  pd.pRootSignature = p->rs;
+  pd.VS.pShaderBytecode = vs;
+  pd.VS.BytecodeLength = vs_size;
+  pd.PS.pShaderBytecode = ps;
+  pd.PS.BytecodeLength = ps_size;
+  pd.SampleMask = 0xFFFFFFFFu;
+  pd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+  pd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+  pd.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+  pd.InputLayout.pInputElementDescs = layout;
+  pd.InputLayout.NumElements = 2;
+  pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+  pd.NumRenderTargets = 1;
+  pd.RTVFormats[0] = target;
+  pd.SampleDesc.Count = 1;
+  if (p->rs) CHECK_HR(ID3D12Device_CreateGraphicsPipelineState(c->dev, &pd, &IID_ID3D12PipelineState, (void **)&p->pso));
+  return p->rs && p->pso;
+}
+static void planar_draw_free(PlanarDraw *p) {
+  if (p->pso) ID3D12PipelineState_Release(p->pso);
+  if (p->rs) ID3D12RootSignature_Release(p->rs);
+}
+/* One triangle over all of the target (`rtv`, w x h; c->target when NULL) whose vertices have the colour `colour`, drawn with `p` and the view at `srv` of `heap` (none:
+ * NULL); the target's pixel at (x, y) when it is the scene's. */
+static UINT32 planar_draw(Scene *c, PlanarDraw *p, ID3D12DescriptorHeap *heap, D3D12_GPU_DESCRIPTOR_HANDLE srv, const float colour[4], const D3D12_CPU_DESCRIPTOR_HANDLE *rtv,
+                          UINT w, UINT h, int x, int y) {
+  const float v[3][7] = {{-1, -1, 0.5f, colour[0], colour[1], colour[2], colour[3]}, {3, -1, 0.5f, colour[0], colour[1], colour[2], colour[3]},
+                         {-1, 3, 0.5f, colour[0], colour[1], colour[2], colour[3]}};
+  ID3D12Resource *vb = make_buffer(c->dev, D3D12_HEAP_TYPE_UPLOAD, 256, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ);
+  ID3D12GraphicsCommandList *list = NULL;
+  UINT32 pixel = 0;
+  void *mapped = NULL;
+  if (!vb || FAILED(ID3D12Resource_Map(vb, 0, NULL, &mapped)) || !mapped) { CHECK(0); if (vb) ID3D12Resource_Release(vb); return 0; }
+  memcpy(mapped, v, sizeof v);
+  ID3D12Resource_Unmap(vb, 0, NULL);
+  CHECK_HR(ID3D12CommandAllocator_Reset(c->allocator));
+  CHECK_HR(ID3D12Device_CreateCommandList(c->dev, 0, D3D12_COMMAND_LIST_TYPE_DIRECT, c->allocator, p->pso, &IID_ID3D12GraphicsCommandList, (void **)&list));
+  if (list) {
+    const D3D12_VERTEX_BUFFER_VIEW vbv = {ID3D12Resource_GetGPUVirtualAddress(vb), 256, 28};
+    const D3D12_VIEWPORT vp = {0, 0, (float)w, (float)h, 0, 1};
+    const D3D12_RECT sc = {0, 0, (LONG)w, (LONG)h};
+    if (rtv) ID3D12GraphicsCommandList_OMSetRenderTargets(list, 1, rtv, FALSE, NULL);
+    else scene_begin(c, list, 1);
+    ID3D12GraphicsCommandList_RSSetViewports(list, 1, &vp);
+    ID3D12GraphicsCommandList_RSSetScissorRects(list, 1, &sc);
+    ID3D12GraphicsCommandList_SetGraphicsRootSignature(list, p->rs);
+    ID3D12GraphicsCommandList_SetGraphicsRoot32BitConstants(list, 0, 16, kIdentity, 0);
+    if (heap) {
+      ID3D12DescriptorHeap *heaps[1] = {heap};
+      ID3D12GraphicsCommandList_SetDescriptorHeaps(list, 1, heaps);
+      ID3D12GraphicsCommandList_SetGraphicsRootDescriptorTable(list, 1, srv);
+    }
+    ID3D12GraphicsCommandList_IASetPrimitiveTopology(list, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    ID3D12GraphicsCommandList_IASetVertexBuffers(list, 0, 1, &vbv);
+    ID3D12GraphicsCommandList_DrawInstanced(list, 3, 1, 0, 0);
+    if (!rtv) scene_read_target(c, list);
+    scene_run(c, list);
+    const UINT32 *pixels = NULL;
+    if (!rtv && SUCCEEDED(ID3D12Resource_Map(c->readback, 0, NULL, (void **)&pixels)) && pixels) {
+      pixel = pixels[y * 64 + x];
+      ID3D12Resource_Unmap(c->readback, 0, NULL);
+    }
+    ID3D12GraphicsCommandList_Release(list);
+  }
+  ID3D12Resource_Release(vb);
+  return pixel;
+}
+static D3D12_SHADER_RESOURCE_VIEW_DESC plane_srv_desc(DXGI_FORMAT format, UINT plane, int array, UINT first, UINT size) {
+  D3D12_SHADER_RESOURCE_VIEW_DESC sv;
+  memset(&sv, 0, sizeof sv);
+  sv.Format = format;
+  sv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+  if (array) {
+    sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
+    sv.Texture2DArray.MipLevels = 1;
+    sv.Texture2DArray.FirstArraySlice = first;
+    sv.Texture2DArray.ArraySize = size;
+    sv.Texture2DArray.PlaneSlice = plane;
+  } else {
+    sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    sv.Texture2D.MipLevels = 1;
+    sv.Texture2D.PlaneSlice = plane;
+  }
+  return sv;
+}
+static int px_red(UINT32 p) { return (int)((p >> 16) & 0xFF); }
+static int px_green(UINT32 p) { return (int)((p >> 8) & 0xFF); }
+static int px_blue(UINT32 p) { return (int)(p & 0xFF); }
+
+static void test_planar(Scene *c) {
+  ID3D12Device *dev = c->dev;
+  /* Placed planar textures: the allocation info covers every plane, two textures side by side in one heap keep their own planes, a reserved one is refused */
+  D3D12_RESOURCE_DESC nd = {D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, PL_W, PL_H, 2, 1, DXGI_FORMAT_NV12, {1, 0}, D3D12_TEXTURE_LAYOUT_UNKNOWN, D3D12_RESOURCE_FLAG_NONE};
+  const D3D12_RESOURCE_ALLOCATION_INFO info = ID3D12Device_GetResourceAllocationInfo(dev, 0, 1, &nd);
+  D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp[4];
+  UINT64 footprint_total = 0;
+  ID3D12Device_GetCopyableFootprints(dev, &nd, 0, 4, 0, fp, NULL, NULL, &footprint_total);
+  printf("NV12 %ux%u x2: allocation %llu bytes (alignment %llu), footprints %llu\n", PL_W, PL_H, (unsigned long long)info.SizeInBytes, (unsigned long long)info.Alignment,
+         (unsigned long long)footprint_total);
+  CHECK(info.SizeInBytes >= footprint_total && info.Alignment == 65536 && info.SizeInBytes % info.Alignment == 0);
+  D3D12_HEAP_DESC hd = {2 * info.SizeInBytes, {D3D12_HEAP_TYPE_DEFAULT, D3D12_CPU_PAGE_PROPERTY_UNKNOWN, D3D12_MEMORY_POOL_UNKNOWN, 1, 1}, 0, D3D12_HEAP_FLAG_NONE};
+  ID3D12Heap *heap = NULL;
+  ID3D12Resource *placed[2] = {NULL, NULL};
+  CHECK_HR(ID3D12Device_CreateHeap(dev, &hd, &IID_ID3D12Heap, (void **)&heap));
+  for (int i = 0; heap && i < 2; ++i)
+    CHECK_HR(ID3D12Device_CreatePlacedResource(dev, heap, (UINT64)i * info.SizeInBytes, &nd, D3D12_RESOURCE_STATE_COMMON, NULL, &IID_ID3D12Resource, (void **)&placed[i]));
+  ID3D12Resource *beyond = NULL;
+  if (heap) CHECK(FAILED(ID3D12Device_CreatePlacedResource(dev, heap, info.SizeInBytes + 65536, &nd, D3D12_RESOURCE_STATE_COMMON, NULL, &IID_ID3D12Resource, (void **)&beyond)) && !beyond);
+  if (placed[0] && placed[1]) {
+    planar_fill(dev, c->queue, c->fence, c->fence_value, c->allocator, placed[0], 1, 1);
+    planar_fill(dev, c->queue, c->fence, c->fence_value, c->allocator, placed[1], 2, 1);
+    CHECK(planar_holds(c, placed[0], 1, 1));
+    CHECK(planar_holds(c, placed[1], 2, 1));
+    const D3D12_RESOURCE_DESC got = ID3D12Resource_GetDesc(placed[1]);
+    CHECK(got.Format == DXGI_FORMAT_NV12 && got.DepthOrArraySize == 2);
+  }
+  ID3D12Resource *reserved = NULL;
+  CHECK(ID3D12Device_CreateReservedResource(dev, &nd, D3D12_RESOURCE_STATE_COMMON, NULL, &IID_ID3D12Resource, (void **)&reserved) == E_INVALIDARG && !reserved);
+  for (int i = 0; i < 2; ++i) if (placed[i]) ID3D12Resource_Release(placed[i]);
+  if (heap) ID3D12Heap_Release(heap);
+
+  /* Views of several slices of a plane: a Texture2DArray shader reads each slice (NV12 and P010) */
+  D3D12_DESCRIPTOR_HEAP_DESC dh = {D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 8, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
+  ID3D12DescriptorHeap *views = NULL;
+  CHECK_HR(ID3D12Device_CreateDescriptorHeap(dev, &dh, &IID_ID3D12DescriptorHeap, (void **)&views));
+  if (!views) return;
+  const D3D12_CPU_DESCRIPTOR_HANDLE cpu0 = ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(views);
+  const D3D12_GPU_DESCRIPTOR_HANDLE gpu0 = ID3D12DescriptorHeap_GetGPUDescriptorHandleForHeapStart(views);
+  const UINT inc = ID3D12Device_GetDescriptorHandleIncrementSize(dev, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+  PlanarDraw array_draw, int_draw, int_write;
+  const int have_array = planar_draw_make(c, &array_draw, dx_vs_vol_dxbc, sizeof dx_vs_vol_dxbc, dx_ps_texarray_dxbc, sizeof dx_ps_texarray_dxbc, DXGI_FORMAT_B8G8R8A8_UNORM, 1);
+  const int have_int = planar_draw_make(c, &int_draw, dx_vs_dxbc, sizeof dx_vs_dxbc, dx_ps_int_load_dxbc, sizeof dx_ps_int_load_dxbc, DXGI_FORMAT_B8G8R8A8_UNORM, 1);
+  const int have_write = planar_draw_make(c, &int_write, dx_vs_dxbc, sizeof dx_vs_dxbc, dx_ps_int_write_dxbc, sizeof dx_ps_int_write_dxbc, DXGI_FORMAT_R8_UINT, 0);
+  CHECK(have_array && have_int && have_write);
+  ID3D12Resource *nv12 = planar_texture(dev, DXGI_FORMAT_NV12, 3, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
+  ID3D12Resource *p010 = planar_texture(dev, DXGI_FORMAT_P010, 3, D3D12_RESOURCE_FLAG_NONE);
+  if (nv12) planar_fill(dev, c->queue, c->fence, c->fence_value, c->allocator, nv12, 0, 0);
+  if (p010) planar_fill(dev, c->queue, c->fence, c->fence_value, c->allocator, p010, 0, 0);
+  if (have_array && nv12 && p010) {
+    D3D12_SHADER_RESOURCE_VIEW_DESC sv = plane_srv_desc(DXGI_FORMAT_R8_UNORM, 0, 1, 0, 3);
+    ID3D12Device_CreateShaderResourceView(dev, nv12, &sv, cpu0);
+    sv = plane_srv_desc(DXGI_FORMAT_R8G8_UNORM, 1, 1, 1, 2);      /* (the chroma of slices 1 and 2) */
+    ID3D12Device_CreateShaderResourceView(dev, nv12, &sv, (D3D12_CPU_DESCRIPTOR_HANDLE){cpu0.ptr + inc});
+    sv = plane_srv_desc(DXGI_FORMAT_R16_UNORM, 0, 1, 0, 3);
+    ID3D12Device_CreateShaderResourceView(dev, p010, &sv, (D3D12_CPU_DESCRIPTOR_HANDLE){cpu0.ptr + 2 * inc});
+    int luma_ok = 1, chroma_ok = 1, p010_ok = 1;
+    for (UINT s = 0; s < 3; ++s) {
+      const float at[4] = {0.5f, 0.5f, (float)s, 1};
+      UINT32 px = planar_draw(c, &array_draw, views, gpu0, at, NULL, 64, 64, 32, 32);
+      printf("  NV12 luma slice %u through an array view: %d %d %d\n", s, px_red(px), px_green(px), px_blue(px));
+      luma_ok &= abs(px_red(px) - (int)planar_value(0, s, 0, 0, 0, 0)) <= 1 && px_green(px) == 0 && px_blue(px) == 0;
+      px = planar_draw(c, &array_draw, views, (D3D12_GPU_DESCRIPTOR_HANDLE){gpu0.ptr + 2 * inc}, at, NULL, 64, 64, 32, 32);
+      p010_ok &= abs(px_red(px) - (int)planar_value(0, s, 0, 0, 0, 0)) <= 1 && px_green(px) == 0;
+      if (s < 2) {
+        px = planar_draw(c, &array_draw, views, (D3D12_GPU_DESCRIPTOR_HANDLE){gpu0.ptr + inc}, at, NULL, 64, 64, 32, 32);
+        printf("  NV12 chroma slice %u through an array view of slices 1, 2: %d %d %d\n", s + 1, px_red(px), px_green(px), px_blue(px));
+        chroma_ok &= abs(px_red(px) - (int)planar_value(0, s + 1, 1, 0, 0, 0)) <= 1 && abs(px_green(px) - (int)planar_value(0, s + 1, 1, 1, 0, 0)) <= 1 && px_blue(px) == 0;
+      }
+    }
+    CHECK(luma_ok);
+    CHECK(chroma_ok);
+    CHECK(p010_ok);
+    /* ... and what changes in a slice is seen the next time the view is read (the array the view gives the shader follows its slices) */
+    planar_fill(dev, c->queue, c->fence, c->fence_value, c->allocator, nv12, 5, 0);
+    const float at[4] = {0.5f, 0.5f, 2.0f, 1};
+    const UINT32 px = planar_draw(c, &array_draw, views, gpu0, at, NULL, 64, 64, 32, 32);
+    CHECK(abs(px_red(px) - (int)planar_value(5, 2, 0, 0, 0, 0)) <= 1);
+  }
+
+  /* Integer views of a plane: R8_UINT / R8G8_UINT / R16_UINT read the plane's values as integers; an R8_UINT render target view writes them */
+  if (have_int && nv12 && p010) {
+    D3D12_SHADER_RESOURCE_VIEW_DESC sv = plane_srv_desc(DXGI_FORMAT_R8_UINT, 0, 1, 2, 1);      /* (slice 2's luma, read by a Texture2D<uint4> shader) */
+    ID3D12Device_CreateShaderResourceView(dev, nv12, &sv, (D3D12_CPU_DESCRIPTOR_HANDLE){cpu0.ptr + 3 * inc});
+    sv = plane_srv_desc(DXGI_FORMAT_R8G8_UINT, 1, 1, 1, 1);
+    ID3D12Device_CreateShaderResourceView(dev, nv12, &sv, (D3D12_CPU_DESCRIPTOR_HANDLE){cpu0.ptr + 4 * inc});
+    sv = plane_srv_desc(DXGI_FORMAT_R16_UINT, 0, 1, 1, 1);
+    ID3D12Device_CreateShaderResourceView(dev, p010, &sv, (D3D12_CPU_DESCRIPTOR_HANDLE){cpu0.ptr + 5 * inc});
+    const float any[4] = {0, 0, 0, 1};
+    UINT32 px = planar_draw(c, &int_draw, views, (D3D12_GPU_DESCRIPTOR_HANDLE){gpu0.ptr + 3 * inc}, any, NULL, 64, 64, 3, 3);
+    printf("  R8_UINT of NV12 slice 2's luma: %d %d %d (alpha %u)\n", px_red(px), px_green(px), px_blue(px), (unsigned)(px >> 24));
+    CHECK(px_red(px) == (int)planar_value(5, 2, 0, 0, 0, 0) && px_green(px) == 0 && px_blue(px) == 0 && (px >> 24) == 1);
+    px = planar_draw(c, &int_draw, views, (D3D12_GPU_DESCRIPTOR_HANDLE){gpu0.ptr + 4 * inc}, any, NULL, 64, 64, 3, 3);
+    printf("  R8G8_UINT of NV12 slice 1's chroma: %d %d %d\n", px_red(px), px_green(px), px_blue(px));
+    CHECK(px_red(px) == (int)planar_value(5, 1, 1, 0, 0, 0) && px_green(px) == (int)planar_value(5, 1, 1, 1, 0, 0) && px_blue(px) == 0);
+    px = planar_draw(c, &int_draw, views, (D3D12_GPU_DESCRIPTOR_HANDLE){gpu0.ptr + 5 * inc}, any, NULL, 64, 64, 3, 3);
+    /* (P010's 16-bit value is the pattern in the high byte: the integer is that times 256, which over 255 is above 1 in every channel the shader writes) */
+    printf("  R16_UINT of P010 slice 1's luma: %d %d %d\n", px_red(px), px_green(px), px_blue(px));
+    CHECK(px_red(px) == 255 && px_green(px) == 0 && px_blue(px) == 0);
+  }
+  if (have_write && nv12) {
+    D3D12_DESCRIPTOR_HEAP_DESC rh = {D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 3, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
+    ID3D12DescriptorHeap *rtvs = NULL;
+    CHECK_HR(ID3D12Device_CreateDescriptorHeap(dev, &rh, &IID_ID3D12DescriptorHeap, (void **)&rtvs));
+    if (rtvs) {
+      const D3D12_CPU_DESCRIPTOR_HANDLE luma = ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(rtvs);
+      const D3D12_CPU_DESCRIPTOR_HANDLE chroma = {luma.ptr + ID3D12Device_GetDescriptorHandleIncrementSize(dev, D3D12_DESCRIPTOR_HEAP_TYPE_RTV)};
+      const D3D12_CPU_DESCRIPTOR_HANDLE luma_unorm = {luma.ptr + 2 * ID3D12Device_GetDescriptorHandleIncrementSize(dev, D3D12_DESCRIPTOR_HEAP_TYPE_RTV)};
+      D3D12_RENDER_TARGET_VIEW_DESC rv;
+      memset(&rv, 0, sizeof rv);
+      rv.Format = DXGI_FORMAT_R8_UINT;
+      rv.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2DARRAY;
+      rv.Texture2DArray.FirstArraySlice = 1;
+      rv.Texture2DArray.ArraySize = 1;
+      ID3D12Device_CreateRenderTargetView(dev, nv12, &rv, luma);
+      rv.Format = DXGI_FORMAT_R8_UNORM;
+      ID3D12Device_CreateRenderTargetView(dev, nv12, &rv, luma_unorm);
+      rv.Format = DXGI_FORMAT_R8G8_UINT;
+      rv.Texture2DArray.FirstArraySlice = 0;
+      rv.Texture2DArray.PlaneSlice = 1;
+      ID3D12Device_CreateRenderTargetView(dev, nv12, &rv, chroma);
+      /* (the plane drawn into by the GPU first - a clear of its R8_UNORM view to 128 -, then the left half by the integer view: the right half keeps the GPU's 128) */
+      ID3D12GraphicsCommandList *cl = NULL;
+      CHECK_HR(ID3D12CommandAllocator_Reset(c->allocator));
+      CHECK_HR(ID3D12Device_CreateCommandList(dev, 0, D3D12_COMMAND_LIST_TYPE_DIRECT, c->allocator, NULL, &IID_ID3D12GraphicsCommandList, (void **)&cl));
+      if (cl) {
+        const float half[4] = {0.5f, 0, 0, 1};
+        ID3D12GraphicsCommandList_ClearRenderTargetView(cl, luma_unorm, half, 0, NULL);
+        scene_run(c, cl);
+        ID3D12GraphicsCommandList_Release(cl);
+      }
+      const float colour[4] = {0.2f, 0.9f, 0.9f, 0.9f};      /* (written as uint4(c * 255 + 0.5): red 51) */
+      planar_draw(c, &int_write, NULL, (D3D12_GPU_DESCRIPTOR_HANDLE){0}, colour, &luma, PL_W / 2, PL_H, 0, 0);
+      ID3D12GraphicsCommandList *list = NULL;
+      CHECK_HR(ID3D12CommandAllocator_Reset(c->allocator));
+      CHECK_HR(ID3D12Device_CreateCommandList(dev, 0, D3D12_COMMAND_LIST_TYPE_DIRECT, c->allocator, NULL, &IID_ID3D12GraphicsCommandList, (void **)&list));
+      if (list) {
+        const float uv[4] = {7, 9, 300, 4};      /* (the integers 7 and 9; the channels the view does not have stay the plane's) */
+        ID3D12GraphicsCommandList_ClearRenderTargetView(list, chroma, uv, 0, NULL);
+        scene_run(c, list);
+        ID3D12GraphicsCommandList_Release(list);
+      }
+      BYTE values[PL_W * PL_H];
+      UINT row = 0;
+      int luma_ok = planar_read(dev, c->queue, c->fence, c->fence_value, c->allocator, nv12, 1, values, &row), others_ok = 1, uv_ok = 1;
+      for (UINT i = 0; luma_ok && i < PL_W * PL_H; ++i) luma_ok &= values[i] == ((i % PL_W) < PL_W / 2 ? 51 : 128);
+      printf("  R8_UINT target of the left half of slice 1's luma: %u, the right half %u (want 51, 128)\n", values[0], values[PL_W - 1]);
+      others_ok &= planar_read(dev, c->queue, c->fence, c->fence_value, c->allocator, nv12, 0, values, &row) && values[5] == (BYTE)planar_value(5, 0, 0, 0, 0, 0);
+      uv_ok &= planar_read(dev, c->queue, c->fence, c->fence_value, c->allocator, nv12, 3, values, &row);
+      for (UINT i = 0; uv_ok && i < row * (PL_H / 2); ++i) uv_ok &= values[i] == ((i & 1) ? 9 : 7);
+      printf("  R8G8_UINT clear of slice 0's chroma: %u %u (want 7 9)\n", values[0], values[1]);
+      others_ok &= planar_read(dev, c->queue, c->fence, c->fence_value, c->allocator, nv12, 4, values, &row) && values[0] == (BYTE)planar_value(5, 1, 1, 0, 0, 0);
+      CHECK(luma_ok);
+      CHECK(uv_ok);
+      CHECK(others_ok);
+      /* (and what the integer target wrote is what the integer view of it reads, through the mirror kept up to date) */
+      if (have_int) {
+        const float any[4] = {0, 0, 0, 1};
+        D3D12_SHADER_RESOURCE_VIEW_DESC sv = plane_srv_desc(DXGI_FORMAT_R8_UINT, 0, 1, 1, 1);
+        ID3D12Device_CreateShaderResourceView(dev, nv12, &sv, (D3D12_CPU_DESCRIPTOR_HANDLE){cpu0.ptr + 6 * inc});
+        const UINT32 px = planar_draw(c, &int_draw, views, (D3D12_GPU_DESCRIPTOR_HANDLE){gpu0.ptr + 6 * inc}, any, NULL, 64, 64, 3, 3);
+        CHECK(px_red(px) == 51);
+      }
+      ID3D12DescriptorHeap_Release(rtvs);
+    }
+  }
+  /* (a view of slices or planes the texture does not have reads nothing: its descriptor is a null one) */
+  if (have_array && nv12) {
+    D3D12_SHADER_RESOURCE_VIEW_DESC sv = plane_srv_desc(DXGI_FORMAT_R8_UNORM, 0, 1, 2, 2);
+    ID3D12Device_CreateShaderResourceView(dev, nv12, &sv, (D3D12_CPU_DESCRIPTOR_HANDLE){cpu0.ptr + 7 * inc});
+  }
+  if (have_array) planar_draw_free(&array_draw);
+  if (have_int) planar_draw_free(&int_draw);
+  if (have_write) planar_draw_free(&int_write);
+  if (nv12) ID3D12Resource_Release(nv12);
+  if (p010) ID3D12Resource_Release(p010);
+  ID3D12DescriptorHeap_Release(views);
+}
+
 static void test_extras(ID3D12Device *dev, ID3D12CommandQueue *queue, ID3D12Fence *fence, UINT64 *fence_value) {
   Scene c;
   memset(&c, 0, sizeof c);
@@ -2167,6 +2582,7 @@ static void test_extras(ID3D12Device *dev, ID3D12CommandQueue *queue, ID3D12Fenc
   test_multisample(&c);
   test_limits(&c);
   test_blend_factor(&c);
+  test_planar(&c);
 }
 
 /* ---- the interfaces after ID3D12Device and ID3D12GraphicsCommandList ---------------------------------------------------------------------------------------------------- */

@@ -83,6 +83,8 @@ enum class EscapeOp : uint32_t {
   CreateRootSignature = 6, DestroyRootSignature = 7, CreateDescriptorHeap = 8, DestroyDescriptorHeap = 9, WriteDescriptors = 10, CopyDescriptors = 11, UpdateTileMappings = 12, QuerySync = 13, QueryStreamOutput = 14,
   // Video decoding: CreateVideoDecoder (profile, width, height, surfaces, ten_bit -> handle), DestroyVideoDecoder (handle), QueryVideoDecodeSupport (profile, ten_bit, width, height -> 1 or 0)
   CreateVideoDecoder = 15, DestroyVideoDecoder = 16, QueryVideoDecodeSupport = 17,
+  // SetMirror (mirror, mode, channels, count, count source allocations): VidMm::set_mirror - the mirror shows the sources (count 0: no longer a mirror)
+  SetMirror = 18,
 };
 
 // A render target lent to a compositor that draws on the same device (Kernel::acquire_image).
@@ -238,6 +240,8 @@ class Kernel {
   NtStatus copy_descriptors(ProcessId pid, Handle destination, uint32_t destination_index, Handle source, uint32_t source_index, uint32_t count);
   // Reserved buffers (kAllocReserved): `tile_count` tiles of 64 KiB from `first_tile` go to `heap_offset` (a multiple of 64 KiB) of the heap on; heap 0 unmaps them.
   NtStatus update_tile_mappings(ProcessId pid, Handle reserved, uint32_t first_tile, Handle heap, uint64_t heap_offset, uint32_t tile_count);
+  // Mirrors (VidMm::set_mirror): `mirror` shows the allocations `sources`, all of one device, with the kMirror* `mode` (a write-back one gives `channels` back).
+  NtStatus set_mirror(ProcessId pid, Handle mirror, uint32_t mode, uint32_t channels, ArrayView<const Handle> sources);
   // Video decoders (DxgTypes.hpp VideoDecoderDesc; decoding is the stream's DecodeFrame). kNotSupported for a profile, format or size the decoders do not take - what
   // video_decode_supported says beforehand.
   NtStatus create_video_decoder(ProcessId pid, Handle device, const VideoDecoderDesc& desc, Handle* decoder);

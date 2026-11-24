@@ -35,6 +35,9 @@ namespace dxgk {
 
 class VidMm;
 
+// VidMm::set_mirror's modes.
+constexpr uint32_t kMirrorInteger = 1u << 0, kMirrorWriteBack = 1u << 1;
+
 class Allocation {
  public:
   Allocation(VidMm& manager, allocators::IAllocator& allocator, const AllocationDesc& desc, uint64_t id);
@@ -83,6 +86,12 @@ class Allocation {
   graphics::IBuffer* buffer() const { return buffer_; }
   uint32_t lock_count() const { return lock_count_; }
 
+  // How often the contents changed (a CPU write, a GPU write, an aliasing switch): what a mirror compares with what it copied.
+  uint64_t version() const { return version_; }
+  // A mirror (VidMm::set_mirror): an image whose contents are other images' - each source a layer of it - kept up to date by the command streams that use it.
+  bool is_mirror() const { return mirror_sources_.count() != 0; }
+  bool writes_back() const { return (mirror_mode_ & kMirrorWriteBack) != 0; }
+
  private:
   friend class VidMm;
   VidMm& manager_;
@@ -111,6 +120,14 @@ class Allocation {
   uint32_t lock_count_ = 0;
   uint32_t pin_count_ = 0;
   uint64_t last_use_ = 0;
+  uint64_t version_ = 0;
+  struct MirrorSource {
+    SharedPointer<Allocation> source;
+    uint64_t seen = ~uint64_t{0};   // the source's version the mirror's layer was copied from (none yet)
+  };
+  List<MirrorSource> mirror_sources_;   // a mirror: its layers' sources, in order
+  uint32_t mirror_mode_ = 0;            // kMirror* flags
+  uint32_t mirror_channels_ = 0;        // a mirror that writes back: the channels it gives its source (bit 0 red .. bit 3 alpha)
 };
 
 class VidMm {
@@ -151,6 +168,21 @@ class VidMm {
   NtStatus map_tiles(Allocation& reserved, uint32_t first, const SharedPointer<Allocation>& heap, uint64_t heap_offset, uint32_t count);
   void note_cpu_write(Allocation& a);
   void note_gpu_write(Allocation& a);
+
+  // Mirrors: `mirror` (a texture of one level and sample, 2D or a 2D array, not placed or reserved) shows `sources` - 2D images of one level and sample of its size whose pixels
+  // are as many bytes as its own and of the same channel width (8 or 16 bits): source n is layer n of an array, a 2D mirror has one source. Its contents are the sources'
+  // bytes; kMirrorInteger makes the alpha the integer 1 (the mirror is an integer image showing a normalised one: Direct3D's R8_UINT view of an NV12 plane), kMirrorWriteBack
+  // gives the `channels` the GPU drew into the mirror back to its one source once the pass that drew is over (a render target of that integer view). The kernel's devices
+  // have no views of other formats or of several images, so a mirror is a copy: command streams bring it up to date (refresh_mirror) before it is sampled or drawn into.
+  // An empty `sources` makes it an ordinary image again. kInvalidParameter for images that cannot be mirrored so.
+  NtStatus set_mirror(Allocation& mirror, ArrayView<const SharedPointer<Allocation>> sources, uint32_t mode, uint32_t channels);
+  // Whether bringing the mirror up to date needs a source's contents back from the GPU (the GPU must have run what was recorded first: refresh_mirror then reads them).
+  bool mirror_needs_read_back(const Allocation& mirror) const;
+  // Copies the sources that changed since their last copy into the mirror. A source whose newest contents are still on the GPU is read back when `may_read_back`, else left as
+  // the mirror last saw it (`stale` set). False if a read-back or a copy failed.
+  bool refresh_mirror(Allocation& mirror, bool may_read_back, bool* stale = nullptr);
+  // A mirror that writes back, drawn into: its channels go into its source (whose other channels stay). The GPU must have run the drawing. False if the read-back failed.
+  bool write_back_mirror(Allocation& mirror);
   // The backing has been thrown away by the caller (a discard lock): the GPU's contents are no longer wanted.
   void discard_gpu_contents(Allocation& a) { a.gpu_newer_ = false; }
 

@@ -193,9 +193,10 @@ typedef struct View {
   UINT level, layer, link_pitch, loaded_version;
   BOOL newer;
   struct View *next_rt;
-  /* a view of a planar texture: the plane it is of (its format: R8 / R8G8 or R16 / R16G16) and the slice */
+  /* a view of a planar texture: the plane it is of (its format: R8 / R8G8 or R16 / R16G16, or their UINT forms), the slice, and how many slices a 2D array view of it has
+   * (0: a 2D view) */
   DXGI_FORMAT plane_format;
-  UINT plane, array_slice;
+  UINT plane, array_slice, array_size;
   union { D3D11_RENDER_TARGET_VIEW_DESC rtv; D3D11_DEPTH_STENCIL_VIEW_DESC dsv; D3D11_SHADER_RESOURCE_VIEW_DESC srv; D3D11_UNORDERED_ACCESS_VIEW_DESC uav; } desc;
 } View;
 
@@ -1351,9 +1352,9 @@ static BOOL buffer_view_range(const Buf *b, DXGI_FORMAT format, BOOL raw, UINT f
   return TRUE;
 }
 
-/* The plane and slice a view of a planar texture is of. Its format names the plane (R8 / R16 the luma, R8G8 / R16G16 U and V; `plane_slice`, a *1 description's, must
- * be that one, -1: none given); a 2D view is of the first slice, a 2D array view of one level of its first (the kernel's view of a plane is one image). FALSE for any
- * other view - of the planar format itself, of no format, of a level but the first: Direct3D 11 makes a view of a planar texture of one plane. */
+/* The plane and slice a view of a planar texture is of. Its format names the plane (R8 / R16 the luma, R8G8 / R16G16 U and V, or their UINT forms; `plane_slice`, a *1
+ * description's, must be that one, -1: none given); a 2D view is of the first slice, a 2D array view of one level of its slices from the first. FALSE for any other view - of
+ * the planar format itself, of no format, of a level but the first: Direct3D 11 makes a view of a planar texture of one plane. */
 static BOOL planar_view(const Tex *t, DXGI_FORMAT format, INT plane_slice, BOOL array, UINT mip, UINT levels, UINT first, UINT size, UINT *plane, UINT *slice) {
   if (!plane_of_view_format(t->desc.Format, format, plane) || (plane_slice >= 0 && (UINT)plane_slice != *plane) || mip != 0 || (levels != 1 && levels != (UINT)-1)) return FALSE;
   *slice = 0;
@@ -1508,7 +1509,14 @@ static HRESULT srv_create(Dev *d, ID3D11Resource *resource, const D3D11_SHADER_R
   if (!v) return E_OUTOFMEMORY;
   hold(t);      /* (a view's reference to its resource is the runtime's) */
   v->tex = t;
-  if (t->planar) { v->plane_format = desc->Format; v->plane = plane; v->array_slice = slice; }
+  if (t->planar) {
+    v->plane_format = desc->Format;
+    v->plane = plane;
+    v->array_slice = slice;
+    /* (a 2D array view: its slices, all from the first when the size is -1) */
+    if (desc->ViewDimension == D3D11_SRV_DIMENSION_TEXTURE2DARRAY)
+      v->array_size = desc->Texture2DArray.ArraySize == (UINT)-1 ? t->desc.ArraySize - slice : desc->Texture2DArray.ArraySize;
+  }
   if (desc) v->desc.srv = *desc;
   else {
     /* (the whole texture, as what it is) */
@@ -1565,6 +1573,9 @@ static HRESULT uav_create(Dev *d, ID3D11Resource *resource, const D3D11_UNORDERE
     if (!planar_view(t, desc->Format, plane_slice, array, array ? desc->Texture2DArray.MipSlice : desc->Texture2D.MipSlice, 1, array ? desc->Texture2DArray.FirstArraySlice : 0,
                      array ? desc->Texture2DArray.ArraySize : 1, &plane, &slice))
       return E_INVALIDARG;
+    /* (not the integer forms: they are mirrors of the plane below, which a shader cannot write through - the kernel has no unordered access to textures, and the format
+     * support says no typed stores, so a view that would write is refused as one of a format without them) */
+    if (desc->Format == DXGI_FORMAT_R8_UINT || desc->Format == DXGI_FORMAT_R8G8_UINT || desc->Format == DXGI_FORMAT_R16_UINT || desc->Format == DXGI_FORMAT_R16G16_UINT) return E_INVALIDARG;
     probe.plane_format = desc->Format;
     probe.plane = plane;
     probe.array_slice = slice;

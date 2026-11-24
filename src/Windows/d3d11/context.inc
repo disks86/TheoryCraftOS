@@ -357,16 +357,17 @@ static BOOL tables_record(Dev *d, View *const *srvs, Sampler *const *samplers, c
         const View blank = {.buf = d->blank_buffer, .offset = 0, .size = d->blank_buffer->desc.ByteWidth};
         buffer_descriptor(d, &blank, FALSE, at);
       } else if (v && v->tex->planar) {
-        /* (a view of a plane of a slice: Direct3D 12 keeps each as an image of its own) */
+        /* (a view of a plane of a slice - or of slices: a 2D array view of them, which Direct3D 12 below gives a shader that declares an array as a mirror of the
+         * slices) */
         D3D12_SHADER_RESOURCE_VIEW_DESC r;
         memset(&r, 0, sizeof r);
         r.Format = v->plane_format;
         r.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-        if (v->tex->desc.ArraySize > 1) {
+        if (v->array_size) {
           r.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
           r.Texture2DArray.MipLevels = 1;
           r.Texture2DArray.FirstArraySlice = v->array_slice;
-          r.Texture2DArray.ArraySize = 1;
+          r.Texture2DArray.ArraySize = v->array_size;
           r.Texture2DArray.PlaneSlice = v->plane;
         } else {
           r.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;

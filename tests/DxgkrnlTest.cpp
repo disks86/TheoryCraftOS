@@ -5551,6 +5551,95 @@ void test_d3d12_barriers() {
 
 
 // Resource heaps: allocations placed in one block of memory, overlapping, with the GPU's contents carried across by aliasing barriers.
+// Mirrors (VidMm::set_mirror): an array of two 4 x 2 planes and an integer image of one, kept up to date by refresh_mirror; one that writes back; the checks of set_mirror; the
+// escape that makes one; and an array of a wide format the software device samples (layers of Vec4s).
+void test_mirrors() {
+  Env e;
+  VidMm& mm = e.kernel.adapter(0)->vidmm();
+  auto make = [&](uint32_t flags, Format f, uint32_t w, uint32_t h, graphics::TextureKind kind, uint32_t layers) {
+    AllocationDesc d;
+    d.flags = flags, d.format = f, d.width = w, d.height = h, d.kind = kind, d.layers = layers;
+    SharedPointer<Allocation> a;
+    CHECK(mm.create(d, &a) == status::kSuccess);
+    return a;
+  };
+  using graphics::TextureKind;
+  SharedPointer<Allocation> y0 = make(kAllocTexture | kAllocRenderTarget, Format::A8B8G8R8, 4, 2, TextureKind::Texture2D, 1), y1 = make(kAllocTexture, Format::A8B8G8R8, 4, 2, TextureKind::Texture2D, 1);
+  SharedPointer<Allocation> array = make(kAllocTexture, Format::A8B8G8R8, 4, 2, TextureKind::Texture2DArray, 2), integer = make(kAllocTexture | kAllocRenderTarget, Format::A8B8G8R8Uint, 4, 2, TextureKind::Texture2D, 1);
+  if (!y0 || !y1 || !array || !integer) return;
+  auto fill = [&](Allocation& a, uint8_t base) {
+    ByteView b = a.writable_backing();
+    for (uint64_t i = 0; i < b.size(); ++i) b[i] = static_cast<uint8_t>((i % 4) == 3 ? 255 : (i % 4) == 0 ? base + i / 4 : 0);   // (r, 0, 0, 255): a widened R8 plane
+    mm.note_cpu_write(a);
+  };
+  fill(*y0, 10);
+  fill(*y1, 100);
+  // The checks: sources of the mirror's size and channel width, as many as its layers; a 2D one has one; a mirror is not a source; write-back is for one render target.
+  const SharedPointer<Allocation> both[2] = {y0, y1};
+  CHECK(mm.set_mirror(*array, ArrayView<const SharedPointer<Allocation>>(both, 1), 0, 0) == status::kInvalidParameter);
+  CHECK(mm.set_mirror(*array, ArrayView<const SharedPointer<Allocation>>(both, 2), kMirrorWriteBack, 1) == status::kInvalidParameter);
+  CHECK(mm.set_mirror(*array, ArrayView<const SharedPointer<Allocation>>(both, 2), 4, 0) == status::kInvalidParameter);
+  SharedPointer<Allocation> wrong_size = make(kAllocTexture, Format::A8B8G8R8, 2, 2, TextureKind::Texture2D, 1), wide = make(kAllocTexture, Format::A16B16G16R16, 4, 2, TextureKind::Texture2D, 1);
+  const SharedPointer<Allocation> mixed[2] = {y0, wrong_size}, widths[2] = {y0, wide};
+  CHECK(mm.set_mirror(*array, ArrayView<const SharedPointer<Allocation>>(mixed, 2), 0, 0) == status::kInvalidParameter);
+  CHECK(mm.set_mirror(*array, ArrayView<const SharedPointer<Allocation>>(widths, 2), 0, 0) == status::kInvalidParameter);
+  CHECK(mm.set_mirror(*array, ArrayView<const SharedPointer<Allocation>>(both, 2), 0, 0) == status::kSuccess && array->is_mirror() && !array->writes_back());
+  const SharedPointer<Allocation> self[1] = {array};
+  CHECK(mm.set_mirror(*integer, ArrayView<const SharedPointer<Allocation>>(self, 1), 0, 0) == status::kInvalidParameter);   // (a mirror is no source)
+  // The array: each layer its source's bytes, copied again only when the source changed.
+  CHECK(mm.refresh_mirror(*array, true));
+  ConstByteView got = array->backing();
+  CHECK(got.size() == 2 * 4 * 2 * 4 && got[0] == 10 && got[4] == 11 && got[32] == 100 && got[3] == 255);
+  const uint64_t version = array->version();
+  CHECK(mm.refresh_mirror(*array, true) && array->version() == version && !mm.mirror_needs_read_back(*array));
+  fill(*y1, 50);
+  CHECK(mm.refresh_mirror(*array, true) && array->version() != version && array->backing()[32] == 50 && array->backing()[0] == 10);
+  // A source the GPU drew into: not copied while it cannot be read back (the mirror keeps what it had), then read back and copied.
+  mm.note_gpu_write(*y1);
+  bool stale = false;
+  CHECK(mm.mirror_needs_read_back(*array) && mm.refresh_mirror(*array, false, &stale) && stale && array->backing()[32] == 50);
+  CHECK(mm.refresh_mirror(*array, true, &stale) && !stale && !mm.mirror_needs_read_back(*array));
+  // The integer image: the same bytes, the alpha the integer 1; written back, its red goes into the plane and the rest of the plane stays.
+  const SharedPointer<Allocation> one[1] = {y0};
+  CHECK(mm.set_mirror(*integer, ArrayView<const SharedPointer<Allocation>>(one, 1), kMirrorInteger | kMirrorWriteBack, 0) == status::kInvalidParameter);   // (no channels to give back)
+  CHECK(mm.set_mirror(*integer, ArrayView<const SharedPointer<Allocation>>(one, 1), kMirrorInteger | kMirrorWriteBack, 1) == status::kSuccess && integer->writes_back());
+  CHECK(mm.refresh_mirror(*integer, true));
+  got = integer->backing();
+  CHECK(got[0] == 10 && got[1] == 0 && got[3] == 1 && got[7] == 1);
+  ByteView drawn = integer->writable_backing();
+  for (uint64_t i = 0; i < drawn.size(); i += 4) drawn[i] = 77, drawn[i + 1] = 88;   // (what a pass drew: red 77, green 88 - green is not the view's)
+  mm.note_cpu_write(*integer);
+  CHECK(mm.write_back_mirror(*integer));
+  got = y0->backing();
+  CHECK(got[0] == 77 && got[1] == 0 && got[3] == 255 && got[4] == 77);
+  CHECK(!mm.write_back_mirror(*array));   // (only one that writes back)
+  CHECK(mm.set_mirror(*array, ArrayView<const SharedPointer<Allocation>>(), 0, 0) == status::kSuccess && !array->is_mirror());
+  // The escape (EscapeOp::SetMirror) with the process's handles: a mirror array of two planes, and handles that are not the process's.
+  Handle p0 = e.alloc(kAllocTexture, Format::A8B8G8R8, 4, 2), p1 = e.alloc(kAllocTexture, Format::A8B8G8R8, 4, 2), m = 0;
+  AllocationDesc md;
+  md.flags = kAllocTexture, md.format = Format::A8B8G8R8, md.width = 4, md.height = 2, md.kind = TextureKind::Texture2DArray, md.layers = 2;
+  CHECK(e.kernel.create_allocation(kPid, e.dev, md, &m) == status::kSuccess);
+  auto escape = [&](std::initializer_list<uint32_t> words) {
+    uint8_t request[64] = {}, reply[16] = {};
+    ByteWriter w(ByteView(request, sizeof request));
+    for (uint32_t v : words) w.le32(v);
+    uint32_t reply_bytes = 0;
+    return e.kernel.escape(kPid, e.dev, ConstByteView(request, words.size() * 4), ByteView(reply, sizeof reply), &reply_bytes);
+  };
+  CHECK(escape({static_cast<uint32_t>(EscapeOp::SetMirror), m, 0, 0, 2, p0, p1}) == status::kSuccess);
+  CHECK(escape({static_cast<uint32_t>(EscapeOp::SetMirror), m, 0, 0, 2, p0, 0x7777}) == status::kInvalidHandle);
+  CHECK(escape({static_cast<uint32_t>(EscapeOp::SetMirror), 0x7777, 0, 0, 1, p0}) == status::kInvalidHandle);
+  CHECK(escape({static_cast<uint32_t>(EscapeOp::SetMirror), m, 0, 0, 2, p0}) == status::kInvalidParameter);   // (fewer words than the count says)
+  // An array of a wide format: made, filled layer by layer, sampled by layer.
+  SharedPointer<Allocation> wide_array = make(kAllocTexture, Format::A16B16G16R16, 4, 2, TextureKind::Texture2DArray, 3);
+  if (wide_array) {
+    ByteView b = wide_array->writable_backing();
+    for (uint64_t i = 0; i + 1 < b.size(); i += 2) b[i + 1] = static_cast<uint8_t>(i / 64 * 64 + 32);   // (layer l: every channel's high byte 64 l + 32)
+    mm.note_cpu_write(*wide_array);
+    CHECK(mm.make_resident(*wide_array) == status::kSuccess && wide_array->image() && wide_array->image()->layer_count() == 3);
+  }
+}
+
 void test_d3d12_heaps() {
   Env e;
   auto create = [&](uint32_t flags, uint64_t size, Handle heap, uint64_t offset, Handle* out) {
@@ -8168,6 +8257,7 @@ int main() {
   test_gather_register_offsets();
   test_d3d12_barriers();
   test_d3d12_heaps();
+  test_mirrors();
   test_d3d12_reserved();
   test_d3d12_reserved_texture();
   test_dxil();

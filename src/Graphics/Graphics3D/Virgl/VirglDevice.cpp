@@ -323,6 +323,15 @@ class VirglImage final : public IImage {
     TransferHost3d transfer{header(kCmdTransferToHost3d), {0, 0, layer, desc_.extent.width, desc_.extent.height, 1}, 0, id_, 0, desc_.extent.width * 4, 0};
     return device_.gpu().command(as_bytes(transfer), /*fence=*/false);
   }
+  bool write_layer_pixels_float(uint32_t layer, ArrayView<const Vec4> pixels) override {
+    const uint64_t count = uint64_t{desc_.extent.width} * desc_.extent.height;
+    if (!is_wide_format(desc_.format) || desc_.kind == TextureKind::Texture2D || layer >= layer_count() || pixels.size() != count || !ensure_backing(count)) return false;
+    ByteWriter out{backing_};
+    for (const Vec4& c : pixels) encode_wide_pixel(desc_.format, c, out);
+    if (!out.ok()) return false;
+    TransferHost3d transfer{header(kCmdTransferToHost3d), {0, 0, layer, desc_.extent.width, desc_.extent.height, 1}, 0, id_, 0, desc_.extent.width * bytes_per_pixel(desc_.format), 0};
+    return device_.gpu().command(as_bytes(transfer), /*fence=*/false);
+  }
   bool read_layer_pixels(uint32_t layer, ArrayView<uint32_t> out) override {
     const uint64_t count = uint64_t{desc_.extent.width} * desc_.extent.height;
     if (desc_.kind == TextureKind::Texture2D || layer >= layer_count() || out.size() < count || !ensure_backing(count)) return false;
@@ -885,9 +894,10 @@ IImage* VirglDevice::create_image(const ImageDesc& desc) {
     if ((desc.samples != 2 && desc.samples != 4) || desc.kind != TextureKind::Texture2D || (depth ? desc.usage != kImageDepthAttachment : (desc.usage & ~kImageSampled) != kImageColorAttachment) || (!depth && desc.format != Format::B8G8R8A8Unorm && desc.format != Format::R8G8B8A8Unorm)) return nullptr;
   }
   if (desc.kind != TextureKind::Texture2D) {
-    // (a volume, array or cube is only sampled: 8-bit colour, one level)
+    // (a volume, array or cube is only sampled: 8-bit colour, one level - an array also of a wide format, its layers staged as such: write_layer_pixels_float)
     const uint32_t layers = desc.kind == TextureKind::TextureCube ? 6 : desc.layers;
-    if (desc.usage != kImageSampled || (desc.format != Format::B8G8R8A8Unorm && desc.format != Format::R8G8B8A8Unorm) || layers == 0 || layers > kMaxTextureLayers || (desc.kind == TextureKind::TextureCube && desc.extent.width != desc.extent.height)) return nullptr;
+    const bool wide_array = desc.kind == TextureKind::Texture2DArray && is_wide_format(desc.format);
+    if (desc.usage != kImageSampled || (desc.format != Format::B8G8R8A8Unorm && desc.format != Format::R8G8B8A8Unorm && !wide_array) || layers == 0 || layers > kMaxTextureLayers || (desc.kind == TextureKind::TextureCube && desc.extent.width != desc.extent.height)) return nullptr;
   } else if (desc.layers != 1) {
     return nullptr;
   }

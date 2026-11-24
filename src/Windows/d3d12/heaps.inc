@@ -30,7 +30,8 @@ enum { DK_NONE, DK_SRV, DK_SRV_BUFFER, DK_UAV, DK_CBV, DK_SAMPLER, DK_RTV, DK_DS
 typedef struct SoftDesc {
   UINT kind;
   UINT alloc;              /* the kernel's allocation */
-  UINT64 offset, size;     /* buffer views */
+  UINT64 offset, size;     /* buffer views. A texture's view of planes (DK_SRV): `size` is its array mirror (alternate | SRV_ALTERNATE: the kernel's Descriptor::alternate), and
+                            * `offset` has SRV_MIRRORS when it or the alternate is a mirror the kernel brings up to date (res_mirror) */
   UINT format;
   UINT mip;
   UINT sampler[4];         /* filter | address_u << 8 | address_v << 16 | mip_filter << 24, lod bias, min lod, max lod (floats as bits) */
@@ -110,8 +111,10 @@ static void desc_write(D3D12_CPU_DESCRIPTOR_HANDLE handle, const SoftDesc *d) {
 
 /* ---- the views ------------------------------------------------------------------------------------------------------------------------------------------------------------------ */
 
-/* The allocation a view of a planar texture (NV12, P010, P016) names: its plane (the PlaneSlice; a view format of one channel is plane 0, of two plane 1) of its first slice.
- * The kernel's view is of one 2D image: a view of several slices sees the first. Any other texture: its allocation. */
+#define SRV_ALTERNATE ((UINT64)0xFFFFFFFFu << 32)      /* (the size word's high half that says the low half is an alternate: the kernel's WriteDescriptors) */
+#define SRV_MIRRORS 1u
+/* The allocation a view of a planar texture (NV12, P010, P016) names: its plane (the PlaneSlice; a view format of one channel is plane 0, of two plane 1) of its first slice
+ * (a view of several slices gives the shaders that declare an array a mirror of them as well: plane_srv). Any other texture: its allocation. */
 static UINT view_alloc(const Resource *r, DXGI_FORMAT view_format, UINT plane, UINT slice) {
   if (!r->planes) return r->alloc;
   if (view_format != DXGI_FORMAT_UNKNOWN) {
@@ -120,6 +123,26 @@ static UINT view_alloc(const Resource *r, DXGI_FORMAT view_format, UINT plane, U
   }
   if (plane >= r->planes || slice >= r->layers) return 0;
   return r->plane_alloc[plane * r->layers + slice];
+}
+
+/* A shader resource view of planes of a planar texture: plane `plane` of the slices from `first` (`count` of them; a TEXTURE2D view: slice 0). The view's image is the plane of
+ * slice `first` - what a shader that declares a 2D texture reads -, or, for an integer view (R8_UINT, R8G8_UINT, R16_UINT, R16G16_UINT: plane_integer_view), a mirror of it in
+ * the integer format of its bits; an array view also has a mirror of all its slices (the alternate a shader that declares a 2D array reads). 0 in d.kind when the view cannot be
+ * made (a slice or plane the texture does not have, or a mirror the kernel refused). */
+static void plane_srv(Resource *r, DXGI_FORMAT format, UINT plane, UINT first, UINT count, int array, SoftDesc *d) {
+  UINT channels = 0;
+  const int integer = format != DXGI_FORMAT_UNKNOWN && plane_integer_view(r, format, &plane, &channels);
+  if (!integer) d->alloc = view_alloc(r, format, plane, first);
+  else d->alloc = res_mirror(r, plane, first, 1, 0, MIRROR_INTEGER, 0);
+  if (plane >= r->planes || first >= r->layers || count == 0 || count > r->layers - first) d->alloc = 0;
+  UINT alternate = 0;
+  if (d->alloc && array) {
+    alternate = res_mirror(r, plane, first, count, 1, integer ? MIRROR_INTEGER : 0, 0);
+    if (!alternate) d->alloc = 0;
+  }
+  if (!d->alloc) { d->kind = 0; return; }
+  d->offset = integer || alternate ? SRV_MIRRORS : 0;
+  d->size = alternate ? SRV_ALTERNATE | alternate : 0;
 }
 
 static void STDMETHODCALLTYPE dev_CreateConstantBufferView(Dev *This, const D3D12_CONSTANT_BUFFER_VIEW_DESC *desc, D3D12_CPU_DESCRIPTOR_HANDLE handle) {
@@ -158,11 +181,11 @@ static void STDMETHODCALLTYPE dev_CreateShaderResourceView(Dev *This, ID3D12Reso
     } else {
       d.kind = DK_SRV;
       if (r->planes) {
-        UINT plane = 0, slice = 0;
-        if (desc && desc->ViewDimension == D3D12_SRV_DIMENSION_TEXTURE2D) plane = desc->Texture2D.PlaneSlice;
-        if (desc && desc->ViewDimension == D3D12_SRV_DIMENSION_TEXTURE2DARRAY) { plane = desc->Texture2DArray.PlaneSlice; slice = desc->Texture2DArray.FirstArraySlice; }
-        d.alloc = view_alloc(r, desc ? desc->Format : DXGI_FORMAT_UNKNOWN, plane, slice);
-        if (!d.alloc) d.kind = 0;
+        if (desc && desc->ViewDimension == D3D12_SRV_DIMENSION_TEXTURE2DARRAY)
+          plane_srv(r, desc->Format, desc->Texture2DArray.PlaneSlice, desc->Texture2DArray.FirstArraySlice, desc->Texture2DArray.ArraySize, 1, &d);
+        else if (!desc || desc->ViewDimension == D3D12_SRV_DIMENSION_TEXTURE2D)
+          plane_srv(r, desc ? desc->Format : DXGI_FORMAT_UNKNOWN, desc ? desc->Texture2D.PlaneSlice : 0, 0, 1, 0, &d);
+        else d.kind = 0;      /* (a planar texture is 2D) */
       }
     }
     d.format = desc ? desc->Format : r->desc.Format;
@@ -203,10 +226,14 @@ static void STDMETHODCALLTYPE dev_CreateRenderTargetView(Dev *This, ID3D12Resour
     d.format = desc ? desc->Format : r->desc.Format;
     if (desc && desc->ViewDimension == D3D12_RTV_DIMENSION_TEXTURE2D) d.mip = desc->Texture2D.MipSlice;
     if (r->planes) {
-      UINT plane = 0, slice = 0;
+      UINT plane = 0, slice = 0, channels = 0;
       if (desc && desc->ViewDimension == D3D12_RTV_DIMENSION_TEXTURE2D) plane = desc->Texture2D.PlaneSlice;
       if (desc && desc->ViewDimension == D3D12_RTV_DIMENSION_TEXTURE2DARRAY) { plane = desc->Texture2DArray.PlaneSlice; slice = desc->Texture2DArray.FirstArraySlice; }
-      d.alloc = view_alloc(r, desc ? desc->Format : DXGI_FORMAT_UNKNOWN, plane, slice);
+      /* (an integer view: a mirror of the plane in the integer format of its bits, drawn into, whose channels go back to the plane after each pass; one of several slices
+       * draws into the first, as any view of several slices does - the kernel takes no SV_RenderTargetArrayIndex) */
+      if (desc && plane_integer_view(r, desc->Format, &plane, &channels))
+        d.alloc = (r->desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET) ? res_mirror(r, plane, slice, 1, 0, MIRROR_INTEGER | MIRROR_WRITE_BACK, channels) : 0;
+      else d.alloc = view_alloc(r, desc ? desc->Format : DXGI_FORMAT_UNKNOWN, plane, slice);
       if (!d.alloc) d.kind = 0;
     }
   }

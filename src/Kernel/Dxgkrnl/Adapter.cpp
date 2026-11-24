@@ -213,8 +213,9 @@ class Adapter::StreamRunner {
       case Op::EndPass: {
         if (!exact(p) || !in_pass_ || query_open_) return kBad;
         in_pass_ = false;
-        if (exec_) cb_->end_render_pass();
-        return status::kSuccess;
+        if (!exec_) return status::kSuccess;
+        cb_->end_render_pass();
+        return write_back_targets();
       }
       case Op::BindPipeline: return bind_pipeline(p);
       case Op::BindVertexBuffer: return bind_vertex_buffer(p);
@@ -338,7 +339,12 @@ class Adapter::StreamRunner {
     for (uint32_t n = 0; n < graphics::kMaxColorTargets - 1; ++n) pass_extra_[n] = n < extra_count ? extras[n] : nullptr;
     if (!exec_) return status::kSuccess;
 
-    NtStatus s = resident(*color);
+    // (a target that is a mirror - an integer view of a plane - starts with what its source has: the pass draws over it, and it goes back at the pass's end)
+    NtStatus s = refresh_mirror(color, true);
+    for (uint32_t n = 0; n < extra_count && s == status::kSuccess; ++n) s = refresh_mirror(extras[n], true);
+    write_back_[0] = color->writes_back() ? color : nullptr;
+    for (uint32_t n = 0; n + 1 < graphics::kMaxColorTargets; ++n) write_back_[n + 1] = n < extra_count && extras[n]->writes_back() ? extras[n] : nullptr;
+    if (s == status::kSuccess) s = resident(*color);
     if (s == status::kSuccess && depth) s = resident(*depth);
     for (uint32_t n = 0; n < extra_count && s == status::kSuccess; ++n) s = resident(*extras[n]);
     if (s == status::kSuccess) s = ensure_cb();
@@ -375,6 +381,7 @@ class Adapter::StreamRunner {
       // (a compute pipeline is bound between passes and dispatched; it leaves the graphics pipeline alone)
       if (in_pass_) return kBad;
       compute_ = found.get();
+      bound_compute_ = true;
       if (exec_) {
         const NtStatus s = ensure_cb();
         if (s != status::kSuccess) return s;
@@ -383,6 +390,7 @@ class Adapter::StreamRunner {
       return status::kSuccess;
     }
     pipeline_ = found.get();
+    bound_compute_ = false;
     if (exec_) {
       const NtStatus s = ensure_cb();
       if (s != status::kSuccess) return s;
@@ -471,7 +479,7 @@ class Adapter::StreamRunner {
   }
 
   NtStatus dispatch(ByteReader& p) {
-    if (const NtStatus bound = apply_root_arguments()) return bound;
+    if (const NtStatus bound = apply_root_arguments(true)) return bound;
     const uint32_t x = p.le32(), y = p.le32(), z = p.le32();
     if (!exact(p) || in_pass_ || !compute_) return kBad;
     if (x > graphics::kMaxDispatchGroups || y > graphics::kMaxDispatchGroups || z > graphics::kMaxDispatchGroups) return kBad;
@@ -605,7 +613,7 @@ class Adapter::StreamRunner {
   uint32_t refused_line_ = 0;
 
   NtStatus draw(ByteReader& p, bool indexed, bool instanced) {
-    if (const NtStatus bound = apply_root_arguments()) return bound;
+    if (const NtStatus bound = apply_root_arguments(false)) return bound;
     const uint32_t count = p.le32(), first = p.le32();
     const int32_t vertex_offset = indexed ? static_cast<int32_t>(p.le32()) : 0;
     uint32_t instance_count = 1, first_instance = 0;
@@ -1278,7 +1286,72 @@ class Adapter::StreamRunner {
     if (rp->table_size != kUnboundedDescriptors && rp->table_size > heap->count() - first) return refuse(__LINE__);
     arguments_[index].set = true;
     arguments_[index].first = first;
+    // (the mirrors the table's views show are brought up to date here, outside a pass, where what the GPU drew into their sources can be read back: a draw in a pass
+    // copies only what the CPU has)
+    if (exec_ && !in_pass_ && !rp->sampler_table) return refresh_table_mirrors(*rp, first);
     return status::kSuccess;
+  }
+
+  // Brings a mirror (VidMm::set_mirror) up to date before it is used. `may_flush`: what was recorded may be run first, so that sources the GPU drew into can be read back
+  // (no pass open on the device, and nothing bound yet that the run would lose: a table set outside a pass, a pass about to begin); else those keep what the mirror last
+  // copied of them.
+  NtStatus refresh_mirror(Allocation* a, bool may_flush) {
+    if (!exec_ || !a || !a->is_mirror()) return status::kSuccess;
+    const bool read_back = may_flush && mm_.mirror_needs_read_back(*a);
+    if (read_back) {
+      const NtStatus s = flush();
+      if (s != status::kSuccess) return s;
+    }
+    return mm_.refresh_mirror(*a, read_back) ? status::kSuccess : status::kInvalidDeviceState;
+  }
+  // (the images the pipeline bound last reads - a view's own or its array, as it declares the unit -, or both of a view's when none is bound yet)
+  NtStatus refresh_table_mirrors(const RootParameter& rp, uint32_t first) {
+    if (!view_heap_) return status::kSuccess;
+    const PipelineObject* reads = bound_compute_ ? compute_ : pipeline_;
+    for (uint32_t r = 0; r < rp.range_count; ++r) {
+      const DescriptorRange& range = rp.ranges[r];
+      if (range.type != RangeType::Srv) continue;
+      const uint64_t available = view_heap_->count() > first ? view_heap_->count() - first : 0;
+      const uint64_t count = range.count == kUnboundedDescriptors ? (available > range.offset ? available - range.offset : 0) : range.count;
+      for (uint64_t k = 0; k < count; ++k) {
+        const uint64_t at = uint64_t{first} + range.offset + k;
+        if (at >= view_heap_->count()) break;
+        const Descriptor& d = view_heap_->at(at);
+        if (d.kind != DescriptorKind::Srv) continue;
+        const uint64_t reg = range.base_register + k;
+        NtStatus s = status::kSuccess;
+        if (!reads) {
+          s = refresh_mirror(d.allocation.get(), true);
+          if (s == status::kSuccess) s = refresh_mirror(d.alternate.get(), true);
+        } else if (reg < graphics::kMaxTextureUnits && (bound_compute_ ? (reads->texture_mask() >> reg & 1) != 0 : reg < reads->texture_count())) {
+          s = refresh_mirror(view_image(d, reads->texture_kind(static_cast<uint32_t>(reg))), true);
+        }
+        if (s != status::kSuccess) return s;
+      }
+    }
+    return status::kSuccess;
+  }
+  // After a pass: the targets that are mirrors that write back give their channels to their sources (the drawing is run first).
+  NtStatus write_back_targets() {
+    bool flushed = false;
+    for (uint32_t t = 0; t < graphics::kMaxColorTargets; ++t) {
+      Allocation* target = write_back_[t];
+      write_back_[t] = nullptr;
+      if (!target) continue;
+      if (!flushed) {
+        const NtStatus s = flush();
+        if (s != status::kSuccess) return s;
+        flushed = true;
+      }
+      if (!mm_.write_back_mirror(*target)) return status::kInvalidDeviceState;
+    }
+    return status::kSuccess;
+  }
+  Allocation* write_back_[graphics::kMaxColorTargets] = {};   // the pass's targets that are mirrors that write back (begin_pass)
+  // The image a texture view gives a shader that declares `unit` of `kind`: the view's own, or its alternate array (Descriptor::alternate) for a shader that declares an array.
+  static Allocation* view_image(const Descriptor& d, graphics::TextureKind kind) {
+    if (d.alternate && kind == graphics::TextureKind::Texture2DArray && d.allocation->texture_kind() == graphics::TextureKind::Texture2D) return d.alternate.get();
+    return d.allocation.get();
   }
 
   NtStatus resource_barrier(ByteReader& p) {
@@ -1326,7 +1399,7 @@ class Adapter::StreamRunner {
 
   // What a draw or dispatch binds from the root arguments: b0 (the first constant buffer: root constants, a root constant buffer view or a table's first view) as the push constants, the shader
   // resource views of tables as the texture units t<n> (with the sampler s<n> of a table or a static sampler, else s0, else the defaults), the unordered access views as storage slots u<n>.
-  NtStatus apply_root_arguments() {
+  NtStatus apply_root_arguments(bool compute) {
     if (!signature_) return status::kSuccess;
     const RootSignatureDesc& sig = signature_->desc;
     bool constants_found = false;
@@ -1405,7 +1478,10 @@ class Adapter::StreamRunner {
               if (s != status::kSuccess) return s;
             } else if (range.type == RangeType::Srv && d.kind == DescriptorKind::Srv) {
               if (reg >= adapter_.caps_.max_texture_units) return refuse(__LINE__);
-              const NtStatus s = lower_texture(reg, d.allocation.get(), sampler_for(reg));
+              const PipelineObject* reads = compute ? compute_ : pipeline_;
+              Allocation* image = view_image(d, reads && reg < graphics::kMaxTextureUnits ? reads->texture_kind(reg) : graphics::TextureKind::Texture2D);
+              NtStatus s = refresh_mirror(image, false);
+              if (s == status::kSuccess) s = lower_texture(reg, image, sampler_for(reg));
               if (s != status::kSuccess) return s;
             } else if (range.type == RangeType::Uav && d.kind == DescriptorKind::Uav) {
               if (reg >= graphics::kMaxUavBuffers) return refuse(__LINE__);
@@ -1511,6 +1587,7 @@ class Adapter::StreamRunner {
   const Allocation* pass_depth_ = nullptr;
   PipelineObject* pipeline_ = nullptr;
   PipelineObject* compute_ = nullptr;
+  bool bound_compute_ = false;   // the pipeline bound last is compute_ (whose textures a table set now is for)
   bool so_bound_[graphics::kMaxStreamOutputBuffers] = {};
   Allocation* so_alloc_[graphics::kMaxStreamOutputBuffers] = {};
   bool uav_bound_[graphics::kMaxStorageBuffers] = {};

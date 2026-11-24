@@ -27,6 +27,13 @@ typedef struct TileBind {
   UINT64 tile;
 } TileBind;
 
+/* A mirror of planes of a planar texture (the kernel's VidMm::set_mirror): an image of the kernel's whose contents are those planes', brought up to date by the streams that
+ * use it - what a view the kernel's images cannot be is made of. A 2D array of slices `first` .. `first + count - 1` of a plane (a Texture2DArray view), or a 2D image of the
+ * plane of slice `first` in the integer format of the same bits (an R8_UINT / R8G8_UINT / R16_UINT / R16G16_UINT view; MIRROR_WRITE_BACK: a render target whose `channels` go
+ * back to the plane after each pass). Made when a view first needs it, kept until the resource goes. */
+enum { MIRROR_INTEGER = 1, MIRROR_WRITE_BACK = 2 };      /* (kMirrorInteger, kMirrorWriteBack) */
+typedef struct Mirror { UINT alloc, plane, first, count, array, mode, channels; } Mirror;
+
 typedef struct HeapObj {
   DObj d;
   D3D12_HEAP_DESC desc;
@@ -65,6 +72,8 @@ struct Resource {
    * the size - since the kernel's arrays and render targets are of one plane. `alloc` is plane_alloc[0]. Its subresources are Direct3D's: plane * layers + layer (one level). */
   UINT planes;
   UINT *plane_alloc;
+  Mirror *mirrors;             /* ... and the mirrors its views have needed (g_lock) */
+  UINT mirror_count;
 };
 
 static Resource *g_cpu_resources;
@@ -182,6 +191,8 @@ static void depth_companion_drop(Dev *dev, UINT depth);      /* (cmdlist.inc) */
 static void resource_destroy(DxObj *o) {
   Resource *r = (Resource *)o;
   if (r->alloc && (r->desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL)) depth_companion_drop(r->d.dev, r->alloc);
+  for (UINT i = 0; i < r->mirror_count; ++i) kmt_destroy_allocation(r->d.dev->kdev, r->mirrors[i].alloc);      /* (each holds its planes in the kernel until it goes) */
+  mem_free(r->mirrors);
   if (r->plane_alloc) {
     for (UINT i = 1; i < r->planes * r->layers; ++i)      /* (the first is `alloc`, given back below) */
       if (r->plane_alloc[i]) kmt_destroy_allocation(r->d.dev->kdev, r->plane_alloc[i]);
@@ -197,6 +208,68 @@ static void resource_destroy(DxObj *o) {
   mem_free(r->tile_map);
   if (r->heap) dx_Release(OBJ(r->heap));
   dobj_child_destroy(o);
+}
+
+/* ---- mirrors of planes ------------------------------------------------------------------------------------------------------------------------------------------------------ */
+
+static void planar_extent(const D3D12_RESOURCE_DESC *d, UINT layers, UINT i, UINT *w, UINT *h);
+/* The integer format of a plane's bits: the kernel's R8G8B8A8_UINT of an 8-bit plane, R16G16B16A16_UINT of a 16-bit one. */
+static UINT plane_integer_kernel_format(const FormatInfo *fi) { return fi->planar == PLANAR_16 ? KF_RGBA16UINT : KF_RGBA8UINT; }
+/* Whether `f` is an integer view of a plane of r (R8_UINT the luma of NV12, R8G8_UINT its U and V; R16_UINT / R16G16_UINT those of P010 and P016): the plane and the
+ * channels the view has (1: red, 3: red and green). */
+static int plane_integer_view(const Resource *r, DXGI_FORMAT f, UINT *plane, UINT *channels) {
+  if (!r->planes || !r->fmt) return 0;
+  const int sixteen = r->fmt->planar == PLANAR_16;
+  if (f == (sixteen ? DXGI_FORMAT_R16_UINT : DXGI_FORMAT_R8_UINT)) { *plane = 0; *channels = 1; return 1; }
+  if (f == (sixteen ? DXGI_FORMAT_R16G16_UINT : DXGI_FORMAT_R8G8_UINT)) { *plane = 1; *channels = 3; return 1; }
+  return 0;
+}
+/* The kernel's allocation of a mirror of r (made the first time it is asked for, then the same one): 0 when the description is not one of r's planes and slices or the
+ * kernel cannot make it (a device without arrays of that format, or without integer formats). */
+static UINT res_mirror(Resource *r, UINT plane, UINT first, UINT count, int array, UINT mode, UINT channels) {
+  if (!r->planes || plane >= r->planes || count == 0 || first >= r->layers || count > r->layers - first || (!array && count != 1)) return 0;
+  EnterCriticalSection(&g_lock);
+  for (UINT i = 0; i < r->mirror_count; ++i) {
+    const Mirror *m = &r->mirrors[i];
+    if (m->plane == plane && m->first == first && m->count == count && m->array == (UINT)array && m->mode == mode && m->channels == channels) {
+      const UINT found = m->alloc;
+      LeaveCriticalSection(&g_lock);
+      return found;
+    }
+  }
+  UINT alloc = 0;
+  Mirror *grown = mem_grow(r->mirrors, sizeof(Mirror) * (r->mirror_count + 1));
+  if (grown) {
+    r->mirrors = grown;
+    KmtAllocDesc md;
+    memset(&md, 0, sizeof md);
+    md.flags = KA_TEXTURE | ((mode & MIRROR_WRITE_BACK) ? KA_RENDER_TARGET : 0);
+    md.format = (mode & MIRROR_INTEGER) ? plane_integer_kernel_format(r->fmt) : r->fmt->kernel;
+    planar_extent(&r->desc, r->layers, plane * r->layers, &md.width, &md.height);
+    md.mips = md.samples = 1;
+    md.kind = array ? 2 : 0;
+    md.layers = array ? count : 1;
+    if (KMT_OK(kmt_create_allocation(r->d.dev->kdev, &md, &alloc, NULL, NULL))) {
+      UINT request[5 + 128];
+      request[0] = ESC_SET_MIRROR;
+      request[1] = alloc;
+      request[2] = mode;
+      request[3] = channels;
+      request[4] = count;
+      for (UINT i = 0; i < count; ++i) request[5 + i] = r->plane_alloc[plane * r->layers + first + i];
+      if (KMT_OK(dev_escape(r->d.dev, request, 5 + count, NULL, 0))) {
+        const Mirror m = {alloc, plane, first, count, (UINT)array, mode, channels};
+        r->mirrors[r->mirror_count++] = m;
+      } else {
+        kmt_destroy_allocation(r->d.dev->kdev, alloc);
+        alloc = 0;
+      }
+    } else {
+      alloc = 0;
+    }
+  }
+  LeaveCriticalSection(&g_lock);
+  return alloc;
 }
 
 /* ---- footprints ---------------------------------------------------------------------------------------------------------------------------------------------------------------- */

@@ -1219,6 +1219,15 @@ NtStatus Kernel::write_descriptor(ProcessId pid, Handle heap, uint32_t index, co
       d.size = desc.size ? desc.size : alloc.desc().size - desc.offset;
     }
     d.allocation = a->allocation;
+    if (desc.alternate) {
+      // (an image's view only: the alternate is a 2D array of the same device, sampled)
+      SharedPointer<AllocRec> alt = p->allocations.get(desc.alternate);
+      if (!alt || alt->device != h->device) return status::kInvalidHandle;
+      if (desc.kind != DescriptorKind::Srv || !alloc.is_image() || !alt->allocation->is_image() || !(alt->allocation->desc().flags & kAllocTexture) ||
+          alt->allocation->texture_kind() != graphics::TextureKind::Texture2DArray)
+        return status::kInvalidParameter;
+      d.alternate = alt->allocation;
+    }
   }
   h->heap->at(index) = d;
   return status::kSuccess;
@@ -1253,6 +1262,21 @@ NtStatus Kernel::update_tile_mappings(ProcessId pid, Handle reserved, uint32_t f
     heap_allocation = h->allocation;
   }
   return r->allocation->manager().map_tiles(*r->allocation, first_tile, heap_allocation, heap_offset, tile_count);
+}
+
+NtStatus Kernel::set_mirror(ProcessId pid, Handle mirror, uint32_t mode, uint32_t channels, ArrayView<const Handle> sources) {
+  kernel::ScopedMutex g(lock_);
+  Process* p = find_process(pid);
+  SharedPointer<AllocRec> m = p ? p->allocations.get(mirror) : SharedPointer<AllocRec>();
+  if (!m) return status::kInvalidHandle;
+  if (sources.size() > graphics::kMaxTextureLayers) return status::kInvalidParameter;
+  List<SharedPointer<Allocation>> found(allocator_);
+  for (const Handle h : sources) {
+    SharedPointer<AllocRec> s = p->allocations.get(h);
+    if (!s || s->device != m->device) return status::kInvalidHandle;
+    if (!found.push_back(s->allocation)) return status::kNoMemory;
+  }
+  return m->allocation->manager().set_mirror(*m->allocation, ArrayView<const SharedPointer<Allocation>>(found.view().data(), found.count()), mode, channels);
 }
 
 // --- Video decoders -----------------------------------------------------------------------------------------------------------------------------------------------------
@@ -1379,6 +1403,11 @@ NtStatus Kernel::escape_d3d12(ProcessId pid, Handle device, uint32_t op, ByteRea
         d.sampler.lod_bias = bits_float(bias);
         d.sampler.min_lod = bits_float(min_lod);
         d.sampler.max_lod = bits_float(max_lod);
+        // (a texture's view has no range: its size word names the array image a shader that declares one reads instead - Descriptor::alternate)
+        if (d.kind == DescriptorKind::Srv && size_hi == 0xFFFFFFFFu) {
+          d.alternate = size_lo;
+          d.size = 0;
+        }
         const NtStatus st = write_descriptor(pid, heap, index, d);
         if (st != status::kSuccess) return st;
       }
@@ -1399,6 +1428,16 @@ NtStatus Kernel::escape_d3d12(ProcessId pid, Handle device, uint32_t op, ByteRea
       const uint32_t lo = in.le32(), hi = in.le32(), count = in.le32();
       if (!in.ok() || !in.at_end()) return status::kInvalidParameter;
       return update_tile_mappings(pid, reserved, first, heap, lo | (uint64_t{hi} << 32), count);
+    }
+    case EscapeOp::SetMirror: {
+      const Handle mirror = in.le32();
+      const uint32_t mode = in.le32(), channels = in.le32(), count = in.le32();
+      if (!in.ok() || count > graphics::kMaxTextureLayers) return status::kInvalidParameter;
+      List<Handle> sources(allocator_);
+      for (uint32_t i = 0; i < count; ++i)
+        if (!sources.push_back(in.le32())) return status::kNoMemory;
+      if (!in.ok() || !in.at_end()) return status::kInvalidParameter;
+      return set_mirror(pid, mirror, mode, channels, ArrayView<const Handle>(sources.view().data(), sources.count()));
     }
     case EscapeOp::QueryStreamOutput: {
       const Handle allocation = in.le32();

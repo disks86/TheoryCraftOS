@@ -319,10 +319,14 @@ static DXGI_FORMAT plane_format_of(DXGI_FORMAT planar, UINT plane) {
   const BOOL sixteen = planar == DXGI_FORMAT_P010 || planar == DXGI_FORMAT_P016;
   return plane == 0 ? (sixteen ? DXGI_FORMAT_R16_UNORM : DXGI_FORMAT_R8_UNORM) : (sixteen ? DXGI_FORMAT_R16G16_UNORM : DXGI_FORMAT_R8G8_UNORM);
 }
-/* The plane a view of a planar texture names by its format: R8_UNORM / R16_UNORM the luma, R8G8_UNORM / R16G16_UNORM the chroma. FALSE for another format: the planar
- * format itself (a view is of one plane), and the integer and typeless forms of the planes' formats, which the kernel cannot give (it keeps a plane as unorm pixels). */
+/* The plane a view of a planar texture names by its format: R8_UNORM / R16_UNORM the luma, R8G8_UNORM / R16G16_UNORM the chroma, and their integer forms R8_UINT / R16_UINT
+ * and R8G8_UINT / R16G16_UINT (Direct3D 12 below reads and draws those through mirrors of the plane in the integer format of its bits). FALSE for another format: the planar
+ * format itself (a view is of one plane), and the typeless forms, which a view cannot have. */
 static BOOL plane_of_view_format(DXGI_FORMAT planar, DXGI_FORMAT view, UINT *plane) {
+  const BOOL sixteen = planar == DXGI_FORMAT_P010 || planar == DXGI_FORMAT_P016;
   for (UINT p = 0; p < 2; ++p)
     if (view == plane_format_of(planar, p)) { *plane = p; return TRUE; }
+  if (view == (sixteen ? DXGI_FORMAT_R16_UINT : DXGI_FORMAT_R8_UINT)) { *plane = 0; return TRUE; }
+  if (view == (sixteen ? DXGI_FORMAT_R16G16_UINT : DXGI_FORMAT_R8G8_UINT)) { *plane = 1; return TRUE; }
   return FALSE;
 }

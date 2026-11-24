@@ -551,6 +551,7 @@ static void send_binding(CmdList *l, Binding *b, int which) {
           for (UINT k = 0; k < reach && listed < TABLE_ALLOCS; ++k) {
             const SoftDesc *sd = &h->descs[index + k];
             if (sd->alloc && (sd->kind == DK_SRV || sd->kind == DK_SRV_BUFFER || sd->kind == DK_UAV || sd->kind == DK_CBV)) { alloc_index(l, sd->alloc); ++listed; }
+            if (sd->kind == DK_SRV && (sd->size & SRV_ALTERNATE) == SRV_ALTERNATE) { alloc_index(l, (UINT)sd->size); ++listed; }      /* (a view's array mirror too) */
           }
         }
         w[0] = i; w[1] = index;
@@ -597,10 +598,40 @@ static int list_bind_pipeline(CmdList *l, Pso *p, UINT handle) {
   return 1;
 }
 
+/* Whether the tables of a binding reach views of mirrors (SRV_MIRRORS: planes the kernel copies into an image of its own before they are read). */
+static int binding_has_mirrors(CmdList *l, const Binding *b) {
+  if (!b->rs) return 0;
+  for (UINT i = 0; i < b->rs->parameter_count && i < 16; ++i) {
+    const RootArg *a = &b->args[i];
+    if (a->kind != 5) continue;
+    UINT index = 0;
+    const DescHeap *h = heap_for_gpu(l, a->gpu, &index);
+    if (!h || h->desc.Type != D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) continue;
+    UINT reach = b->rs->pdescriptors[i];
+    if (reach > h->desc.NumDescriptors - index) reach = h->desc.NumDescriptors - index;
+    for (UINT k = 0; k < reach; ++k)
+      if (h->descs[index + k].kind == DK_SRV && (h->descs[index + k].offset & SRV_MIRRORS)) return 1;
+  }
+  return 0;
+}
+
 /* Everything a draw needs sent: the pass, the pipeline, the root arguments, the buffers, the viewport. Returns 0 when the draw cannot be made. */
 static int prepare_draw(CmdList *l, int indexed) {
   if (!l->pso || l->pso->compute || !l->gfx.rs) return 0;
   ensure_room(l, ROOM_BYTES, ROOM_ALLOCS);
+  /* (the kernel brings the mirrors a table's views show up to date when the table is set outside a pass - inside one, what the GPU drew cannot be read back -: such a
+   * binding goes before the pass begins, ending the pass it would have been sent in) */
+  if ((l->sent_binding != 1 || l->dirty_gfx || l->dirty_heaps) && binding_has_mirrors(l, &l->gfx)) {
+    end_pass(l);
+    /* (the pipeline first: the kernel copies only the images it reads - a view's own, or its array for a unit declared one -; the pass sends it again) */
+    UINT strides[8] = {0};
+    for (UINT slot = 0; slot < 8; ++slot)
+      if (l->pso->slots_used >> slot & 1) strides[slot] = l->vb[slot].stride;
+    const UINT pipeline = pso_pipeline(l->pso, strides, l->stencil_ref, l->blend_factor);
+    if (pipeline && list_bind_pipeline(l, l->pso, pipeline)) packet(l, OP_BIND_PIPELINE, &pipeline, 1);
+    send_binding(l, &l->gfx, 1);
+    l->dirty_heaps = 0;
+  }
   if (!ensure_pass(l)) return 0;
   if (l->sent_binding != 1 || l->dirty_gfx || l->dirty_heaps) {
     send_binding(l, &l->gfx, 1);
@@ -687,11 +718,13 @@ static void STDMETHODCALLTYPE list_Dispatch(CmdList *l, UINT x, UINT y, UINT z) 
   if (!l->pso || !l->pso->compute || !l->cs.rs || !x || !y || !z) return;
   end_pass(l);
   ensure_room(l, ROOM_BYTES, ROOM_ALLOCS);
+  UINT pipeline = l->pso->compute_pipe;
   if (l->sent_binding != 2 || l->dirty_cs || l->dirty_heaps) {
+    /* (a binding with mirrors goes after the pipeline, which says which images of the views the kernel copies; the pipeline is bound again after it all the same) */
+    if (binding_has_mirrors(l, &l->cs)) packet(l, OP_BIND_PIPELINE, &pipeline, 1);
     send_binding(l, &l->cs, 2);
     l->dirty_heaps = 0;
   }
-  UINT pipeline = l->pso->compute_pipe;
   packet(l, OP_BIND_PIPELINE, &pipeline, 1);
   l->sent_pipeline = 0;
   UINT w[3] = {x, y, z};
@@ -856,10 +889,21 @@ static void STDMETHODCALLTYPE list_ClearRenderTargetView(CmdList *l, D3D12_CPU_D
   ensure_room(l, ROOM_BYTES, ROOM_ALLOCS);
   const UINT saved = l->rtv_count;
   l->rtv_count = 1;
-  /* (a narrow view clears its channels: the kernel's image keeps the others as zeros and the maximum alpha) */
+  /* (a narrow view clears its channels: the kernel's image keeps the others as zeros and the maximum alpha; an integer view of a plane - a mirror of it, whose red, or red
+   * and green, go back to the plane - clears to the integers the values are, as float bits: the kernel's clear colour of an integer image) */
   const UINT mask = format_write_mask(d->format);
   const float narrow[4] = {color[0], (mask & 2) ? color[1] : 0.0f, 0.0f, 1.0f};
-  begin_pass_packet(l, d->alloc, 0, 1 /* clear colour */, mask == 0xF ? color : narrow, 1.0f, 0);
+  float integers[4] = {0, 0, 0, 0};
+  const int integer = d->format == DXGI_FORMAT_R8_UINT || d->format == DXGI_FORMAT_R8G8_UINT || d->format == DXGI_FORMAT_R16_UINT || d->format == DXGI_FORMAT_R16G16_UINT;
+  if (integer) {
+    const float limit = d->format == DXGI_FORMAT_R8_UINT || d->format == DXGI_FORMAT_R8G8_UINT ? 255.0f : 65535.0f;
+    for (int c = 0; c < 4; ++c) {
+      const float v = color[c] != color[c] || color[c] < 0.0f ? 0.0f : color[c] > limit ? limit : color[c];
+      const UINT u = (UINT)v;
+      memcpy(&integers[c], &u, 4);
+    }
+  }
+  begin_pass_packet(l, d->alloc, 0, 1 /* clear colour */, integer ? integers : mask == 0xF ? color : narrow, 1.0f, 0);
   l->rtv_count = saved;
   packet(l, OP_END_PASS, NULL, 0);
 }

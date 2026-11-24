@@ -139,7 +139,7 @@ class SoftwareImage final : public IImage {
       depth_ = allocate_view<float>(allocator, count);
       if (desc.stencil) stencil_ = allocate_view<uint8_t>(allocator, count);
     } else if (is_wide_format(desc.format)) {
-      if (desc.mip_levels == 1) hdr_ = allocate_view<Vec4>(allocator, count);
+      if (desc.mip_levels == 1) hdr_ = allocate_view<Vec4>(allocator, count * layer_count());   // (an array: its layers one after the other)
     } else if (desc.format != Format::Undefined) {
       color_ = allocate_view<uint32_t>(allocator, total);
     }
@@ -167,6 +167,14 @@ class SoftwareImage final : public IImage {
     for (uint64_t i = 0; i < pixels.size(); ++i) s.pixels[i] = s.encode(pixels[i]);
     return true;
   }
+  bool write_layer_pixels_float(uint32_t layer, ArrayView<const Vec4> pixels) override {
+    if (hdr_.empty() || desc_.kind == TextureKind::Texture2D || layer >= layer_count()) return false;
+    const uint64_t count = uint64_t{desc_.extent.width} * desc_.extent.height;
+    if (pixels.size() != count) return false;
+    const ArrayView<Vec4> to = hdr_.subview(layer * count, count);
+    for (uint64_t i = 0; i < count; ++i) to[i] = store_float(pixels[i]);
+    return true;
+  }
   bool read_layer_pixels(uint32_t layer, ArrayView<uint32_t> out) override {
     if (color_.empty() || layer >= layer_count() || desc_.mip_levels != 1) return false;
     const Surface s = surface(0, layer);
@@ -187,12 +195,12 @@ class SoftwareImage final : public IImage {
   }
   bool write_pixels(ArrayView<const uint32_t> pixels) override { return desc_.samples == 1 && write_mip_pixels(0, pixels); }
   bool read_pixels_float(ArrayView<Vec4> out) override {
-    if (hdr_.empty() || out.size() < hdr_.size()) return false;
+    if (hdr_.empty() || layer_count() != 1 || out.size() < hdr_.size()) return false;
     for (uint64_t i = 0; i < hdr_.size(); ++i) out[i] = hdr_[i];
     return true;
   }
   bool write_pixels_float(ArrayView<const Vec4> pixels) override {
-    if (hdr_.empty() || pixels.size() != hdr_.size()) return false;
+    if (hdr_.empty() || layer_count() != 1 || pixels.size() != hdr_.size()) return false;
     for (uint64_t i = 0; i < hdr_.size(); ++i) hdr_[i] = store_float(pixels[i]);
     return true;
   }
@@ -239,7 +247,7 @@ class SoftwareImage final : public IImage {
     const uint64_t offset = level == 0 ? uint64_t{layer} * desc_.extent.width * desc_.extent.height : level_offset_[level];
     s.width = mip_extent(desc_.extent.width, level);
     s.height = mip_extent(desc_.extent.height, level);
-    if (!hdr_.empty()) s.floats = hdr_;
+    if (!hdr_.empty()) s.floats = layer_count() == 1 ? hdr_ : hdr_.subview(uint64_t{layer} * desc_.extent.width * desc_.extent.height, uint64_t{desc_.extent.width} * desc_.extent.height);
     else s.pixels = color_.subview(offset, uint64_t{s.width} * s.height);
     s.pitch = s.width * desc_.samples;   // (a multisampled image: the samples of a pixel are neighbours, so the pixel x is at x * samples)
     s.format = desc_.format;
@@ -1366,9 +1374,10 @@ IImage* SoftwareDevice::create_image(const ImageDesc& desc) {
       return nullptr;
   }
   if (desc.kind != TextureKind::Texture2D) {
-    // (layered images are sampled only: one level, 8-bit colour)
+    // (layered images are sampled only: one level, 8-bit colour - or a wide format, for an array: its layers of Vec4s)
     const uint32_t layers = desc.kind == TextureKind::TextureCube ? 6 : desc.layers;
-    if (desc.usage != kImageSampled || desc.mip_levels != 1 || layers == 0 || layers > kMaxTextureLayers || desc.format == Format::D32Float || is_wide_format(desc.format) ||
+    if (desc.usage != kImageSampled || desc.mip_levels != 1 || layers == 0 || layers > kMaxTextureLayers || desc.format == Format::D32Float ||
+        (is_wide_format(desc.format) && desc.kind != TextureKind::Texture2DArray) ||
         (desc.kind == TextureKind::TextureCube && desc.extent.width != desc.extent.height))
       return nullptr;
   } else if (desc.layers != 1) {

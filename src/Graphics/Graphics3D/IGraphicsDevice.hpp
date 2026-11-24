@@ -166,6 +166,12 @@ class IImage {
     (void)layer, (void)out;
     return false;
   }
+  // A layer of an array of a wide format (the float, 16-bit and integer formats write_pixels_float takes): extent.width * extent.height colours, rows top to bottom. False as for
+  // write_layer_pixels, or for a format that is not wide.
+  virtual bool write_layer_pixels_float(uint32_t layer, ArrayView<const Vec4> pixels) {
+    (void)layer, (void)pixels;
+    return false;
+  }
   // The number of levels the image was made with.
   virtual uint32_t mip_levels() const { return 1; }
   // The same for level `level` of a mipmapped image (mip_extent() of the extent, rows top to bottom). Level 0 is write_pixels.

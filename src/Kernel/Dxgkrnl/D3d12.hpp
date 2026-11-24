@@ -114,6 +114,7 @@ struct DescriptorDesc {
   Handle allocation = 0;
   uint64_t offset = 0, size = 0;   // buffers: the range (size 0: to the end)
   graphics::SamplerDesc sampler;
+  Handle alternate = 0;            // a texture's view: the image a shader that declares a 2D array reads instead of `allocation`, a 2D image (0: none)
 };
 
 struct Descriptor {
@@ -121,6 +122,9 @@ struct Descriptor {
   SharedPointer<Allocation> allocation;
   uint64_t offset = 0, size = 0;
   graphics::SamplerDesc sampler;
+  // A view that is both a 2D image and an array of them (Direct3D's Texture2DArray view of one plane of a planar texture's slices: the slice's own image, and a mirror of the
+  // slices, VidMm::set_mirror): the array, read by shaders that declare one.
+  SharedPointer<Allocation> alternate;
 };
 
 class DescriptorHeapObject {

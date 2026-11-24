@@ -317,13 +317,24 @@ Direct3D 11's and 12's video interfaces run on the kernel's codecs, on the CPU, 
 - **Planes.** The kernel has no one- or two-channel formats: NV12 / P010 planes, and R8 / R8G8 / R16 / R16G16 textures, are kept widened (`(r, g or 0, 0, maximum)` in an
   A8B8G8R8 or A16B16G16R16 image), so a view of the narrow format reads the right values; `CopyBufferImage` takes a `NarrowLayout` to copy the narrow rows, and render
   targets of those formats write their channels only. d3d12.dll makes every plane of every array slice of a planar texture an allocation of its own
-  (`Resource.plane_alloc`), which keeps P010 arrays and planar render targets within what the kernel's images can be.
+  (`Resource.plane_alloc`), which keeps P010 arrays and planar render targets within what the kernel's images can be. A shared planar texture is one win32k resource of
+  all those allocations (an opener gets every one); a placed one has them one after the other in the heap (`planar_layout`, 4 KiB apart; `GetResourceAllocationInfo`
+  counts the widened images); aliasing barriers name each. Reserved planar textures are refused (`E_INVALIDARG`: tiling is not among those formats' supports).
+- **Mirrors** (`VidMm::set_mirror`, escape `SetMirror`): what a view the kernel's images cannot be is made of. A mirror is a texture (2D, or a 2D array - also of the wide
+  formats now: the software and virgl devices take layers of Vec4s, `IImage::write_layer_pixels_float`) whose layers are copies of other 2D images of the same size and
+  channel width; `Allocation::version()` counts each image's changes and a stream copies a source again when its version moved: when a root table that reaches the
+  mirror is set outside a pass (where what the GPU drew can be read back first; d3d12.dll sends such a binding before the pass, after the pipeline, so only the image the
+  pipeline declares is copied), and from the CPU's copy when a draw binds it. `kMirrorInteger` gives an integer image of the same bits (alpha 1): Direct3D's
+  `R8_UINT` / `R8G8_UINT` / `R16_UINT` / `R16G16_UINT` views of a plane. `kMirrorWriteBack` makes a render target whose channels go back to the plane when the pass
+  that drew into it ends (an integer render target view). A Texture2DArray view of planes has two images: the plane of its first slice (a shader that declares a 2D
+  texture) and an array mirror of its slices (`Descriptor::alternate`, chosen by the unit's declared kind: one that declares an array sees every slice).
 - d3d12.dll: `ID3D12VideoDevice` .. 3, decoders and heaps (a heap is the kernel's decoder), processors, the VIDEO_DECODE / VIDEO_PROCESS queues and lists, decode
   statistics queries (video.inc; video_types.h has what mingw's d3d12video.h lacks). d3d11.dll: `ID3D11VideoDevice` .. 2, `ID3D11VideoContext` .. 3 on those
   (docs/Direct3D11.md).
 - Not there: video encoding and motion estimation (reported as not supported; their creators answer DXGI_ERROR_UNSUPPORTED), interlaced H.264 (field pictures, MBAFF),
   HEVC Main10 and 4:2:2 / 4:4:4, AV1 profiles 1 and 2 and large-scale tiles, VC-1 and MPEG-4 part 2 DXVA profiles, decode-time conversion and histograms, protected
-  content (crypto sessions and authenticated channels are refused), shared planar textures, placed planar resources, views of several slices of a planar texture.
+  content (crypto sessions and authenticated channels are refused), unordered access to planes (the kernel has none to textures), layered rendering into several slices
+  (no `SV_RenderTargetArrayIndex`: a render target view of several slices draws into the first).
 - Tests: `tests/run_host_tests.sh DxvaDecoderTest VideoProcessTest DxgkrnlTest` (every codec bit for bit with ffmpeg; the DXVA buffers filled as ffmpeg's dxva2_*.c
   fill them), `tests/emulated_dx.sh tests/windows/d3d12videotest.c` and `d3d11videotest.c` (H.264 decoded through both APIs, bit for bit with ffmpeg; the processor
   against BT.709), `tests/d3d12_qemu.sh d3d12videotest`, `tests/wow64_qemu.sh d3d12videotest d3d11videotest` (32-bit).

@@ -95,7 +95,7 @@ bool Allocation::level_range(uint32_t level, uint64_t* offset, uint64_t* bytes) 
 }
 
 Allocation::Allocation(VidMm& manager, allocators::IAllocator& allocator, const AllocationDesc& desc, uint64_t id)
-    : manager_(manager), allocator_(allocator), desc_(desc), id_(id), placed_(allocator), tiles_(allocator) {}
+    : manager_(manager), allocator_(allocator), desc_(desc), id_(id), placed_(allocator), tiles_(allocator), mirror_sources_(allocator) {}
 
 Allocation::~Allocation() { manager_.forget(*this); }
 
@@ -252,8 +252,9 @@ NtStatus VidMm::create(const AllocationDesc& requested, SharedPointer<Allocation
       goto sized;
     }
     if (desc.kind != graphics::TextureKind::Texture2D) {
-      // (a volume, array or cube: sampled only, one level, 8-bit colour)
-      if ((desc.flags & ~(kAllocTexture | kAllocShared)) || !(desc.flags & kAllocTexture) || desc.mip_levels != 1 || depth_flag || dxgk::is_wide(desc.format)) return status::kInvalidParameter;
+      // (a volume, array or cube: sampled only, one level, 8-bit colour - an array also of the wide formats, which the devices take as layers of Vec4s)
+      const bool wide_array = dxgk::is_wide(desc.format) && desc.kind == graphics::TextureKind::Texture2DArray;
+      if ((desc.flags & ~(kAllocTexture | kAllocShared)) || !(desc.flags & kAllocTexture) || desc.mip_levels != 1 || depth_flag || (dxgk::is_wide(desc.format) && !wide_array)) return status::kInvalidParameter;
       if (desc.layers == 0 || desc.layers > graphics::kMaxTextureLayers || (desc.kind == graphics::TextureKind::TextureCube && (desc.layers != 6 || desc.width != desc.height))) return status::kInvalidParameter;
       if (!(device_.info().features & graphics::kFeatureTextureKinds)) return status::kNotSupported;
       total *= desc.layers;
@@ -411,7 +412,10 @@ void VidMm::scatter_tiles(Allocation& a) {
       });
     } else if (a.cpu_.try_subview(i * kTileBytes, kTileBytes, &from) && b.heap->cpu_.try_subview(b.offset, kTileBytes, &to)) to.copy_from(ConstByteView(from));
     // (what lies in the heap's memory under placed allocations is theirs to see: their device objects are stale now)
-    for (Allocation* other : b.heap->placed_) other->device_stale_ = other->cpu_written_ = true;
+    for (Allocation* other : b.heap->placed_) {
+      other->device_stale_ = other->cpu_written_ = true;
+      ++other->version_;
+    }
   }
 }
 
@@ -448,14 +452,19 @@ bool VidMm::upload(Allocation& a) {
   }
   const Format f = a.desc_.format;
   if (dxgk::is_wide(f)) {
+    // (each layer of an array as Vec4s of its own; a plain image is one layer)
     ArrayView<graphics::Vec4> pixels;
     scratch_.clear();
     if (!scratch_.put_zeros(uint64_t{a.desc_.width} * a.desc_.height * sizeof(graphics::Vec4)) || !scratch_.writable_view().try_cast<graphics::Vec4>(&pixels)) return false;
     ByteReader in(ConstByteView(a.cpu_));
     const graphics::Format device_format = wide_format_of(f);
-    for (graphics::Vec4& c : pixels) c = graphics::decode_wide_pixel(device_format, in);
-    if (!in.ok()) return false;
-    if (!a.image_->write_pixels_float(ArrayView<const graphics::Vec4>(pixels.data(), pixels.size())) && a.cpu_written_) return false;
+    const bool layered = a.desc_.kind != graphics::TextureKind::Texture2D;
+    for (uint32_t layer = 0; layer < a.layers(); ++layer) {
+      for (graphics::Vec4& c : pixels) c = graphics::decode_wide_pixel(device_format, in);
+      if (!in.ok()) return false;
+      const ArrayView<const graphics::Vec4> layer_pixels(pixels.data(), pixels.size());
+      if (!(layered ? a.image_->write_layer_pixels_float(layer, layer_pixels) : a.image_->write_pixels_float(layer_pixels)) && a.cpu_written_) return false;
+    }
     a.device_stale_ = false;
     return true;
   }
@@ -602,14 +611,127 @@ bool overlaps(const Allocation& a, const Allocation& b) {
 void VidMm::note_cpu_write(Allocation& a) {
   a.device_stale_ = true;
   a.cpu_written_ = true;
+  ++a.version_;
   if (a.reserved_) scatter_tiles(a);
   if (a.heap_)
     for (Allocation* other : a.heap_->placed_)
-      if (other != &a && overlaps(a, *other)) other->device_stale_ = other->cpu_written_ = true;   // (its device object is out of date, and what it holds is now written by someone)
+      if (other != &a && overlaps(a, *other)) {
+        other->device_stale_ = other->cpu_written_ = true;   // (its device object is out of date, and what it holds is now written by someone)
+        ++other->version_;
+      }
 }
 void VidMm::note_gpu_write(Allocation& a) {
   a.gpu_newer_ = true;
   a.last_use_ = ++clock_;
+  ++a.version_;
+}
+
+// --- Mirrors --------------------------------------------------------------------------------------------------------------------------------------------------------
+
+namespace {
+// The bytes of one channel of a format a mirror may have or show (0: none): the 8-bit four-channel formats and the 16-bit ones, normalised or integer.
+uint32_t mirror_channel_bytes(Format f) {
+  switch (f) {
+    case Format::A8B8G8R8: case Format::X8B8G8R8: case Format::A8B8G8R8Uint: return 1;
+    case Format::A16B16G16R16: case Format::A16B16G16R16Uint: return 2;
+    default: return 0;
+  }
+}
+// The channel value of "one" in an integer image (the alpha Direct3D gives a view whose format has none) written into a pixel's alpha.
+void set_integer_alpha(ByteView pixel, uint32_t channel) {
+  ByteWriter w(pixel.subview(3 * channel, channel));
+  if (channel == 1) w.u8(1);
+  else w.le16(1);
+}
+}  // namespace
+
+NtStatus VidMm::set_mirror(Allocation& mirror, ArrayView<const SharedPointer<Allocation>> sources, uint32_t mode, uint32_t channels) {
+  if (mode & ~(kMirrorInteger | kMirrorWriteBack) || channels > 0xF) return status::kInvalidParameter;
+  if (sources.empty()) {
+    mirror.mirror_sources_.clear();
+    mirror.mirror_mode_ = mirror.mirror_channels_ = 0;
+    return status::kSuccess;
+  }
+  const AllocationDesc& m = mirror.desc_;
+  const uint32_t channel = mirror_channel_bytes(m.format);
+  const bool array = m.kind == graphics::TextureKind::Texture2DArray;
+  if (!mirror.is_image() || mirror.is_mirror() || mirror.placed() || mirror.reserved_ || !(m.flags & kAllocTexture) || m.mip_levels != 1 || m.samples != 1 || channel == 0 ||
+      (!array && m.kind != graphics::TextureKind::Texture2D) || sources.size() != (array ? m.layers : 1u))
+    return status::kInvalidParameter;
+  // (a mirror that writes back is a render target of one source; one channel at least goes back)
+  if ((mode & kMirrorWriteBack) && (array || !(m.flags & kAllocRenderTarget) || channels == 0)) return status::kInvalidParameter;
+  for (const SharedPointer<Allocation>& source : sources) {
+    if (!source || &source->manager() != this || source.get() == &mirror || !source->is_image() || source->is_mirror()) return status::kInvalidParameter;
+    const AllocationDesc& d = source->desc_;
+    if (d.kind != graphics::TextureKind::Texture2D || d.mip_levels != 1 || d.samples != 1 || d.width != m.width || d.height != m.height || mirror_channel_bytes(d.format) != channel)
+      return status::kInvalidParameter;
+  }
+  List<Allocation::MirrorSource> made(allocator_);
+  for (const SharedPointer<Allocation>& source : sources) {
+    Allocation::MirrorSource ms;
+    ms.source = source;
+    if (!made.push_back(util::move(ms))) return status::kNoMemory;
+  }
+  mirror.mirror_sources_.clear();
+  for (Allocation::MirrorSource& ms : made.view())
+    if (!mirror.mirror_sources_.push_back(util::move(ms))) {
+      mirror.mirror_sources_.clear();
+      return status::kNoMemory;
+    }
+  mirror.mirror_mode_ = mode;
+  mirror.mirror_channels_ = channels;
+  return status::kSuccess;
+}
+
+bool VidMm::mirror_needs_read_back(const Allocation& mirror) const {
+  for (const Allocation::MirrorSource& ms : mirror.mirror_sources_.view())
+    if (ms.seen != ms.source->version_ && ms.source->gpu_newer_) return true;
+  return false;
+}
+
+bool VidMm::refresh_mirror(Allocation& mirror, bool may_read_back, bool* stale) {
+  if (stale) *stale = false;
+  const uint32_t channel = mirror_channel_bytes(mirror.desc_.format);
+  const uint64_t pixel = 4ull * channel, layer_bytes = uint64_t{mirror.desc_.width} * mirror.desc_.height * pixel;
+  bool copied = false;
+  for (uint64_t layer = 0; layer < mirror.mirror_sources_.count(); ++layer) {
+    Allocation::MirrorSource& ms = mirror.mirror_sources_[layer];
+    Allocation& source = *ms.source;
+    if (ms.seen == source.version_) continue;
+    if (source.gpu_newer_) {
+      if (!may_read_back) {
+        if (stale) *stale = true;
+        continue;
+      }
+      if (!read_back(source)) return false;
+    }
+    ByteView to;
+    ConstByteView from;
+    if (!mirror.cpu_.try_subview(layer * layer_bytes, layer_bytes, &to) || !ConstByteView(source.cpu_).try_subview(0, layer_bytes, &from) || !to.copy_from(from)) return false;
+    if (mirror.mirror_mode_ & kMirrorInteger)
+      for (uint64_t at = 0; at < layer_bytes; at += pixel) set_integer_alpha(to.subview(at, pixel), channel);
+    ms.seen = source.version_;
+    copied = true;
+  }
+  if (copied) note_cpu_write(mirror);
+  return true;
+}
+
+bool VidMm::write_back_mirror(Allocation& mirror) {
+  if (!mirror.writes_back() || mirror.mirror_sources_.count() != 1) return false;
+  Allocation& source = *mirror.mirror_sources_[0].source;
+  if (!read_back(mirror) || !read_back(source)) return false;
+  const uint32_t channel = mirror_channel_bytes(mirror.desc_.format);
+  const uint64_t pixel = 4ull * channel, bytes = uint64_t{mirror.desc_.width} * mirror.desc_.height * pixel;
+  ByteView to;
+  ConstByteView from;
+  if (!source.cpu_.try_subview(0, bytes, &to) || !ConstByteView(mirror.cpu_).try_subview(0, bytes, &from)) return false;
+  for (uint64_t at = 0; at < bytes; at += pixel)
+    for (uint32_t c = 0; c < 4; ++c)
+      if ((mirror.mirror_channels_ >> c & 1) && !to.subview(at + c * channel, channel).copy_from(from.subview(at + c * channel, channel))) return false;
+  note_cpu_write(source);
+  mirror.mirror_sources_[0].seen = source.version_;   // (the mirror holds what it gave)
+  return true;
 }
 
 bool VidMm::switch_alias(Allocation& outgoing, Allocation& incoming) {
@@ -620,8 +742,10 @@ bool VidMm::switch_alias(Allocation& outgoing, Allocation& incoming) {
     if (other != &outgoing && overlaps(outgoing, *other)) {
       if (other->gpu_newer_ && !read_back(*other)) return false;   // (what the GPU wrote there before: kept where it does not overlap)
       other->device_stale_ = other->cpu_written_ = true;
+      ++other->version_;
     }
   incoming.device_stale_ = incoming.cpu_written_ = true;
+  ++incoming.version_;
   return true;
 }
 

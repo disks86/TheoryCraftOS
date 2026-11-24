@@ -492,6 +492,151 @@ static void test_planar_views(void) {
   ID3D11Texture2D_Release(t);
 }
 
+/* Views of several slices of a plane (a Texture2DArray shader reads each slice) and integer views of a plane (R8_UINT / R8G8_UINT read the bytes as integers; an R8_UINT
+ * render target writes them), on an NV12 array of three slices. */
+static UINT32 draw_with(ID3D11VertexShader *vs, ID3D11PixelShader *ps, ID3D11ShaderResourceView *view, const float colour[4]) {
+  const float blue[4] = {0, 0, 1, 1};
+  const D3D11_VIEWPORT vp = {0, 0, 64, 64, 0, 1};
+  const UINT stride = 28, offset = 0;
+  const float v[21] = {-1, -1, 0.5f, colour[0], colour[1], colour[2], colour[3], 3, -1, 0.5f, colour[0], colour[1], colour[2], colour[3],
+                       -1, 3, 0.5f, colour[0], colour[1], colour[2], colour[3]};
+  const D3D11_BUFFER_DESC bd = {sizeof v, D3D11_USAGE_DEFAULT, D3D11_BIND_VERTEX_BUFFER, 0, 0, 0};
+  const D3D11_SUBRESOURCE_DATA init = {v, 0, 0};
+  ID3D11Buffer *vb = NULL;
+  if (FAILED(ID3D11Device_CreateBuffer(g_device, &bd, &init, &vb))) return 0;
+  ID3D11DeviceContext_ClearRenderTargetView(g_context, g_target_view, blue);
+  ID3D11DeviceContext_OMSetRenderTargets(g_context, 1, &g_target_view, NULL);
+  ID3D11DeviceContext_RSSetViewports(g_context, 1, &vp);
+  ID3D11DeviceContext_RSSetState(g_context, g_no_cull);
+  ID3D11DeviceContext_IASetInputLayout(g_context, g_layout);
+  ID3D11DeviceContext_IASetVertexBuffers(g_context, 0, 1, &vb, &stride, &offset);
+  ID3D11DeviceContext_IASetPrimitiveTopology(g_context, D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+  ID3D11DeviceContext_VSSetShader(g_context, vs, NULL, 0);
+  ID3D11DeviceContext_VSSetConstantBuffers(g_context, 0, 1, &g_matrix);
+  ID3D11DeviceContext_PSSetShader(g_context, ps, NULL, 0);
+  ID3D11DeviceContext_PSSetShaderResources(g_context, 0, 1, &view);
+  ID3D11DeviceContext_PSSetSamplers(g_context, 0, 1, &g_point);
+  ID3D11DeviceContext_Draw(g_context, 3, 0);
+  ID3D11ShaderResourceView *none = NULL;
+  ID3D11DeviceContext_PSSetShaderResources(g_context, 0, 1, &none);
+  ID3D11Buffer_Release(vb);
+  static UINT32 pixels[64 * 64];
+  return read_bgra(g_target, pixels) ? pixels[3 * 64 + 3] : 0;
+}
+static void test_plane_array_and_integer_views(void) {
+  const UINT w = 16, h = 8;
+  ID3D11Texture2D *t = texture(w, h, 3, DXGI_FORMAT_NV12, D3D11_USAGE_DEFAULT, D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET, 0, NULL, NULL);
+  ID3D11VertexShader *vs_vol = NULL;
+  ID3D11PixelShader *ps_array = NULL, *ps_load = NULL, *ps_write = NULL;
+  HRESULT hr = ID3D11Device_CreateVertexShader(g_device, dx_vs_vol_dxbc, sizeof dx_vs_vol_dxbc, NULL, &vs_vol);
+  if (SUCCEEDED(hr)) hr = ID3D11Device_CreatePixelShader(g_device, dx_ps_texarray_dxbc, sizeof dx_ps_texarray_dxbc, NULL, &ps_array);
+  if (SUCCEEDED(hr)) hr = ID3D11Device_CreatePixelShader(g_device, dx_ps_int_load_dxbc, sizeof dx_ps_int_load_dxbc, NULL, &ps_load);
+  if (SUCCEEDED(hr)) hr = ID3D11Device_CreatePixelShader(g_device, dx_ps_int_write_dxbc, sizeof dx_ps_int_write_dxbc, NULL, &ps_write);
+  check(SUCCEEDED(hr) && t, "an NV12 array of three slices to sample and draw into, and the shaders that read an array and integers");
+  if (FAILED(hr) || !t) goto done;
+  /* (slice s: Y = 30 + 70 s, U = 20 + s, V = 220 - s) */
+  BYTE frame[16 * 12];
+  for (UINT s = 0; s < 3; ++s) {
+    for (UINT i = 0; i < w * h; ++i) frame[i] = (BYTE)(30 + 70 * s);
+    for (UINT i = 0; i < w * h / 2; i += 2) { frame[w * h + i] = (BYTE)(20 + s); frame[w * h + i + 1] = (BYTE)(220 - s); }
+    ID3D11DeviceContext_UpdateSubresource(g_context, (ID3D11Resource *)t, s, NULL, frame, w, 0);
+  }
+  D3D11_SHADER_RESOURCE_VIEW_DESC sd;
+  memset(&sd, 0, sizeof sd);
+  sd.Format = DXGI_FORMAT_R8_UNORM;
+  sd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2DARRAY;
+  sd.Texture2DArray.MipLevels = 1;
+  sd.Texture2DArray.ArraySize = 3;
+  ID3D11ShaderResourceView *luma = NULL, *chroma = NULL, *luma_int = NULL, *chroma_int = NULL;
+  hr = ID3D11Device_CreateShaderResourceView(g_device, (ID3D11Resource *)t, &sd, &luma);
+  sd.Format = DXGI_FORMAT_R8G8_UNORM;
+  sd.Texture2DArray.FirstArraySlice = 1;
+  sd.Texture2DArray.ArraySize = 2;
+  if (SUCCEEDED(hr)) hr = ID3D11Device_CreateShaderResourceView(g_device, (ID3D11Resource *)t, &sd, &chroma);
+  sd.Format = DXGI_FORMAT_R8_UINT;
+  sd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+  sd.Texture2D.MipLevels = 1;
+  if (SUCCEEDED(hr)) hr = ID3D11Device_CreateShaderResourceView(g_device, (ID3D11Resource *)t, &sd, &luma_int);
+  sd.Format = DXGI_FORMAT_R8G8_UINT;
+  sd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2DARRAY;
+  sd.Texture2DArray.MipLevels = 1;
+  sd.Texture2DArray.FirstArraySlice = 2;
+  sd.Texture2DArray.ArraySize = 1;
+  if (SUCCEEDED(hr)) hr = ID3D11Device_CreateShaderResourceView(g_device, (ID3D11Resource *)t, &sd, &chroma_int);
+  check(SUCCEEDED(hr), "shader resource views of NV12: arrays of R8_UNORM and R8G8_UNORM, R8_UINT and R8G8_UINT");
+  int luma_ok = 1, chroma_ok = 1;
+  for (UINT s = 0; luma && chroma && s < 3; ++s) {
+    const float at[4] = {0.5f, 0.5f, (float)s, 1};
+    UINT32 px = draw_with(vs_vol, ps_array, luma, at);
+    luma_ok &= close_to(red(px), 30 + 70 * (int)s, 1) && green(px) == 0;
+    if (s < 2) {
+      px = draw_with(vs_vol, ps_array, chroma, at);
+      chroma_ok &= close_to(red(px), 21 + (int)s, 1) && close_to(green(px), 219 - (int)s, 1) && blue(px) == 0;
+    }
+  }
+  checkf(luma && luma_ok, "a Texture2DArray shader reads each of the three slices of the luma (an array view of R8_UNORM)");
+  checkf(chroma && chroma_ok, "... and slices 1 and 2 of the chroma (an array view of R8G8_UNORM from slice 1)");
+  const float any[4] = {0, 0, 0, 1};
+  UINT32 px = luma_int ? draw_with(g_vs, ps_load, luma_int, any) : 0;
+  checkf(luma_int && red(px) == 30 && green(px) == 0 && blue(px) == 0, "an R8_UINT view of the luma reads its bytes as integers: (%d, %d, %d), want (30, 0, 0)", red(px), green(px), blue(px));
+  px = chroma_int ? draw_with(g_vs, ps_load, chroma_int, any) : 0;
+  checkf(chroma_int && red(px) == 22 && green(px) == 218 && blue(px) == 0, "an R8G8_UINT view of slice 2's chroma: (%d, %d, %d), want (22, 218, 0)", red(px), green(px), blue(px));
+  /* an R8_UINT render target of slice 1's luma, drawn into by a shader that writes integers */
+  D3D11_RENDER_TARGET_VIEW_DESC rd;
+  memset(&rd, 0, sizeof rd);
+  rd.Format = DXGI_FORMAT_R8_UINT;
+  rd.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2DARRAY;
+  rd.Texture2DArray.FirstArraySlice = 1;
+  rd.Texture2DArray.ArraySize = 1;
+  ID3D11RenderTargetView *target = NULL;
+  hr = ID3D11Device_CreateRenderTargetView(g_device, (ID3D11Resource *)t, &rd, &target);
+  check(SUCCEEDED(hr) && target, "an R8_UINT render target view of slice 1's luma");
+  if (target) {
+    const float c[4] = {0.4f, 0.1f, 0.1f, 1};      /* (uint4(c * 255 + 0.5): 102) */
+    const float v[21] = {-1, -1, 0.5f, c[0], c[1], c[2], c[3], 3, -1, 0.5f, c[0], c[1], c[2], c[3], -1, 3, 0.5f, c[0], c[1], c[2], c[3]};
+    const D3D11_BUFFER_DESC bd = {sizeof v, D3D11_USAGE_DEFAULT, D3D11_BIND_VERTEX_BUFFER, 0, 0, 0};
+    const D3D11_SUBRESOURCE_DATA init = {v, 0, 0};
+    ID3D11Buffer *vb = NULL;
+    if (SUCCEEDED(ID3D11Device_CreateBuffer(g_device, &bd, &init, &vb))) {
+      const D3D11_VIEWPORT vp = {0, 0, (float)w, (float)h, 0, 1};
+      const UINT stride = 28, offset = 0;
+      ID3D11DeviceContext_OMSetRenderTargets(g_context, 1, &target, NULL);
+      ID3D11DeviceContext_RSSetViewports(g_context, 1, &vp);
+      ID3D11DeviceContext_IASetVertexBuffers(g_context, 0, 1, &vb, &stride, &offset);
+      ID3D11DeviceContext_VSSetShader(g_context, g_vs, NULL, 0);
+      ID3D11DeviceContext_PSSetShader(g_context, ps_write, NULL, 0);
+      ID3D11DeviceContext_Draw(g_context, 3, 0);
+      ID3D11DeviceContext_OMSetRenderTargets(g_context, 1, &g_target_view, NULL);
+      ID3D11Buffer_Release(vb);
+    }
+    BYTE back[16 * 12];
+    int ok = read_planar(t, 1, back), y_ok = 1;
+    for (UINT i = 0; ok && i < w * h; ++i) y_ok &= back[i] == 102;
+    const int uv_kept = ok && back[w * h] == 21 && back[w * h + 1] == 219;
+    checkf(ok && y_ok && uv_kept, "the integer target wrote slice 1's luma: %d (want 102), its chroma kept: %d %d", back[0], back[w * h], back[w * h + 1]);
+    ok = read_planar(t, 0, back);
+    checkf(ok && back[0] == 30, "... and slice 0 is as it was: %d", back[0]);
+    ID3D11RenderTargetView_Release(target);
+  }
+  /* (an unordered access view of an integer form is refused: there are no typed stores to textures) */
+  D3D11_UNORDERED_ACCESS_VIEW_DESC ud;
+  memset(&ud, 0, sizeof ud);
+  ud.Format = DXGI_FORMAT_R8_UINT;
+  ud.ViewDimension = D3D11_UAV_DIMENSION_TEXTURE2D;
+  ID3D11UnorderedAccessView *uav = NULL;
+  check(ID3D11Device_CreateUnorderedAccessView(g_device, (ID3D11Resource *)t, &ud, &uav) == E_INVALIDARG && !uav, "an R8_UINT unordered access view of NV12: E_INVALIDARG");
+  if (luma) ID3D11ShaderResourceView_Release(luma);
+  if (chroma) ID3D11ShaderResourceView_Release(chroma);
+  if (luma_int) ID3D11ShaderResourceView_Release(luma_int);
+  if (chroma_int) ID3D11ShaderResourceView_Release(chroma_int);
+done:
+  if (vs_vol) ID3D11VertexShader_Release(vs_vol);
+  if (ps_array) ID3D11PixelShader_Release(ps_array);
+  if (ps_load) ID3D11PixelShader_Release(ps_load);
+  if (ps_write) ID3D11PixelShader_Release(ps_write);
+  if (t) ID3D11Texture2D_Release(t);
+}
+
 /* ---- the decoder: profiles, formats, configurations ------------------------------------------------------------------------------------------------------------- */
 
 static void test_decoder_caps(void) {
@@ -1320,6 +1465,7 @@ int main(void) {
     test_planar_cpu(DXGI_FORMAT_P010, "P010");
     if (make_scene()) {
       test_planar_views();
+      test_plane_array_and_integer_views();
       test_decoder_caps();
       decode_stream("h264_bframes", DXVA_CODEC_H264, &D3D11_DECODER_PROFILE_H264_VLD_NOFGT, g_h264_bframes_b64, 17, g_h264_bframes_fnv, 14, NULL, 0, 0);
       decode_stream("h264_cavlc", DXVA_CODEC_H264, &D3D11_DECODER_PROFILE_H264_VLD_NOFGT, g_h264_cavlc_b64, 17, g_h264_cavlc_fnv, 10, NULL, 1, 0);
