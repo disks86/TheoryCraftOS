@@ -52,6 +52,7 @@ static const VideoProfile g_video_profiles[] = {
     {&D3D12_VIDEO_DECODE_PROFILE_AV1_PROFILE2, 13, {DXGI_FORMAT_YUY2, DXGI_FORMAT_Y210, DXGI_FORMAT_NV12, DXGI_FORMAT_P010}, 4},
     {&D3D12_VIDEO_DECODE_PROFILE_AV1_12BIT_PROFILE2, 14, {DXGI_FORMAT_Y216, DXGI_FORMAT_Y416}, 2},
     {&D3D12_VIDEO_DECODE_PROFILE_AV1_12BIT_PROFILE2_420, 15, {DXGI_FORMAT_P016}, 1},
+    {&D3D12_VIDEO_DECODE_PROFILE_HEVC_MAIN10, 16, {DXGI_FORMAT_P010}, 1},
 };
 /* The kernel's surface format of a decoder's output (hardware::DxvaSurfaceFormat; DxgTypes.hpp VideoDecoderDesc::surface_format). */
 static UINT video_surface_format(DXGI_FORMAT f) {

@@ -54,8 +54,9 @@ enum class DxvaProfile : uint8_t {
   Av1VldProfile2,      // D3D11_DECODER_PROFILE_AV1_VLD_PROFILE2 {0c5f2aa1-e541-4089-bb7b-98110a19d7c8}: 8-bit (YUY2) and 10-bit (Y210) 4:2:2; monochrome (NV12, P010)
   Av1Vld12BitProfile2, // D3D11_DECODER_PROFILE_AV1_VLD_12BIT_PROFILE2 {17127009-a00f-4ce1-994e-bf4081f6f3f0}: 12-bit 4:2:2 (Y216) and 4:4:4 (Y416)
   Av1Vld12BitProfile2_420,   // D3D11_DECODER_PROFILE_AV1_VLD_12BIT_PROFILE2_420 {2d80bed6-9cac-4835-9e91-327bbc4f9ee8}: 12-bit 4:2:0 and monochrome (P016)
+  HevcVldMain10,       // D3D11_DECODER_PROFILE_HEVC_VLD_MAIN10 {107af0e0-ef1a-4d19-aba8-67a163073d13}: 8-bit to 10-bit 4:2:0 (Main 10, Main, the Still Picture profiles) -> P010
 };
-constexpr uint32_t kDxvaProfileCount = 16;
+constexpr uint32_t kDxvaProfileCount = 17;
 
 // The formats of the surfaces a decoder writes (DXGI_FORMAT_NV12, P010, P016, AYUV, Y410, Y416, YUY2, Y210, Y216). The numbers are the kernel's (DxgTypes.hpp
 // VideoDecoderDesc::surface_format): 0 and 1 are NV12 and P010 as before. The 16-bit formats hold the value in the top bits of each word (P016 / Y216 / Y416 with

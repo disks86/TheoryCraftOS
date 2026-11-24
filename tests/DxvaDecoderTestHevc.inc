@@ -1,4 +1,4 @@
-// DxvaDecoderTest: the HEVC cases (DxvaProfile::HevcVldMain, src/Hardware/VideoCodec/Dxva/DxvaHevc.cpp).
+// DxvaDecoderTest: the HEVC cases (DxvaProfile::HevcVldMain and HevcVldMain10, src/Hardware/VideoCodec/Dxva/DxvaHevc.cpp).
 //
 // The program: the kernel's own H.265 decoder (H265Decoder) parses each stream of tests/data/hevc_*.h265 and keeps the decoded picture buffer, as ffmpeg's hevc
 // decoder does for its hwaccel; its IOffload hook hands every picture over - parameter sets, slice headers, the reference picture sets as picture buffer slots, the
@@ -6,6 +6,8 @@
 // reference picture of the buffer, the three sets as indexes into it, the slices with three-byte start codes and the last one padded to 128 bytes), decodes through
 // create_dxva_decoder() and writes the NV12 picture back into the H.265 decoder's picture, which outputs it in display order cropped: that is compared with ffmpeg's
 // decode (MD5 per picture). The streams' own picture hashes (SEI) are checked as well. The surfaces are named three ways (DxvaNaming); the output must not change.
+// Main 10: the streams tests/data/hevc10_*.h265 through the Main 10 decoder into P010, written back as the H.265 decoder's 16-bit samples and compared with the
+// reference decode of tests/data/hevc10_*.md5 (yuv420p10le MD5s); 8-bit Main streams through the Main 10 decoder as well (P010 of 8-bit samples).
 #include "DxvaDecoderTestRefs.inc"
 #include "Hardware/VideoCodec/Dxva/DxvaTypesHevc.hpp"
 #include "Hardware/VideoCodec/Software/H265.hpp"
@@ -145,17 +147,18 @@ struct HevcDxvaApp final : h265::IOffload {
   int pictures = 0, failures = 0;
   std::vector<DxvaRecordedCall>* record = nullptr;
   uint32_t width = 0, height = 0;
+  DxvaProfile profile = DxvaProfile::HevcVldMain;
 
   bool accepts(const h265::Sps&, const h265::Pps&) override { return true; }
 
   bool decode_picture(const h265::OffloadPicture& o) override {
     if (!decoder) {
       DxvaDecoderConfig cfg;
-      cfg.profile = DxvaProfile::HevcVldMain;
+      cfg.profile = profile;
       cfg.width = width = static_cast<uint32_t>(o.sps->width);
       cfg.height = height = static_cast<uint32_t>(o.sps->height);
       cfg.surfaces = h265::kMaxPics;
-      cfg.output = PixelFormat::Nv12;
+      cfg.output = profile == DxvaProfile::HevcVldMain10 ? PixelFormat::P010 : PixelFormat::Nv12;
       decoder = create_dxva_decoder(*alloc, cfg);
       CHECK(decoder);
       if (!decoder) return false;
@@ -217,6 +220,31 @@ struct HevcDxvaApp final : h265::IOffload {
       return false;
     }
     CHECK(out.surface == cur_index);
+    if (profile == DxvaProfile::HevcVldMain10) {
+      // P010 back into the decoder's picture (the coded size): 16-bit words with the value in the low bits for a deep picture, bytes for an 8-bit one.
+      CHECK(out.frame.format.pixel_format == PixelFormat::P010 && out.frame.format.width == width && out.frame.format.height == height);
+      const bool deep = o.sps->bit_depth_luma > 8 || o.sps->bit_depth_chroma > 8;
+      auto word = [](const uint8_t* q) { return uint32_t(q[0] | (q[1] << 8)); };
+      auto store = [&](int c, uint32_t x, uint32_t y, uint32_t w16) {
+        const int depth = c == 0 ? o.sps->bit_depth_luma : o.sps->bit_depth_chroma;
+        CHECK((w16 & ((1u << (16 - depth)) - 1)) == 0);   // (nothing in the low bits)
+        const uint32_t v = w16 >> (16 - depth);
+        if (deep) {
+          o.plane[c][uint64_t(y) * o.stride[c] + x * 2] = uint8_t(v);
+          o.plane[c][uint64_t(y) * o.stride[c] + x * 2 + 1] = uint8_t(v >> 8);
+        } else {
+          o.plane[c][uint64_t(y) * o.stride[c] + x] = uint8_t(v);
+        }
+      };
+      for (uint32_t y = 0; y < height; ++y)
+        for (uint32_t x = 0; x < width; ++x) store(0, x, y, word(out.frame.plane[0] + size_t(y) * out.frame.stride[0] + x * 2));
+      for (uint32_t y = 0; y < height / 2; ++y)
+        for (uint32_t x = 0; x < width / 2; ++x) {
+          store(1, x, y, word(out.frame.plane[1] + size_t(y) * out.frame.stride[1] + x * 4));
+          store(2, x, y, word(out.frame.plane[1] + size_t(y) * out.frame.stride[1] + x * 4 + 2));
+        }
+      return true;
+    }
     CHECK(out.frame.format.pixel_format == PixelFormat::Nv12 && out.frame.format.width == width && out.frame.format.height == height);
     // NV12 back into the decoder's I420 picture (the coded size).
     for (uint32_t y = 0; y < height; ++y)
@@ -258,11 +286,35 @@ std::vector<std::pair<size_t, size_t>> hevc_access_units(const std::vector<uint8
   return units;
 }
 
-// Decodes `name` with the surfaces named as `naming` says; returns how many pictures matched ffmpeg's.
-int dxva_hevc_stream(const std::string& name, DxvaNaming naming, std::vector<DxvaRecordedCall>* record, int* total) {
+// The reference MD5s of a Main 10 stream (tests/data/hevc10_<name>.md5, one per line, yuv420p10le).
+std::vector<std::string> hevc10_reference_md5(const std::string& file) {
+  std::vector<std::string> out;
+  const std::vector<uint8_t> text = read_file("tests/data/" + file.substr(0, file.size() - 5) + ".md5");
+  std::string line;
+  for (uint8_t ch : text) {
+    if (ch == '\n') {
+      if (line.size() >= 32) out.push_back(line.substr(0, 32));
+      line.clear();
+    } else {
+      line.push_back(char(ch));
+    }
+  }
+  return out;
+}
+
+bool hevc_is_main10(const std::string& name) { return name.compare(0, 7, "hevc10_") == 0; }
+
+// Decodes `name` with the surfaces named as `naming` says; returns how many pictures matched ffmpeg's (for a Main 10 stream: the reference of its .md5). The Main 10
+// streams go through the Main 10 decoder; `profile` says which an 8-bit one goes through.
+// `outputs` (when not null) gets every output picture, in display order: the decode-order index of its picture and its bytes as they were hashed.
+int dxva_hevc_stream(const std::string& name, DxvaNaming naming, std::vector<DxvaRecordedCall>* record, int* total, DxvaProfile profile = DxvaProfile::HevcVldMain,
+                     std::vector<std::pair<int64_t, std::vector<uint8_t>>>* outputs = nullptr) {
   TestAllocator alloc;
   const std::vector<uint8_t> data = read_file("tests/data/" + name);
-  const std::vector<std::string> refs = dxva_reference_md5(name);
+  const bool main10 = hevc_is_main10(name);
+  if (main10) profile = DxvaProfile::HevcVldMain10;
+  const std::vector<std::string> refs = main10 ? hevc10_reference_md5(name) : dxva_reference_md5(name);
+  const bool hashed = name != "hevc10_pcm.h265";   // (the x265 streams carry the MD5 of every picture; the PCM stream made by scripts/gen_hevc10_pcm_stream.py none)
   CHECK(!data.empty() && !refs.empty());
   int matched = 0, n = 0;
   // ffmpeg decodes the chroma of hevc_cip wrong (its own picture hash check fails there, see scripts/gen_hevc_test_streams.sh): that stream is checked against the
@@ -273,6 +325,7 @@ int dxva_hevc_stream(const std::string& name, DxvaNaming naming, std::vector<Dxv
     app.alloc = &alloc;
     app.naming = naming;
     app.record = record;
+    app.profile = profile;
     DxvaMd5PlaneHasher hasher;
     H265Decoder dec(alloc);
     dec.set_offload(&app);
@@ -282,17 +335,33 @@ int dxva_hevc_stream(const std::string& name, DxvaNaming naming, std::vector<Dxv
       while (dec.receive(&f)) {
         std::vector<uint8_t> packed;
         const uint32_t w = f.format.width, h = f.format.height;
-        for (uint32_t y = 0; y < h; ++y) packed.insert(packed.end(), f.plane[0] + size_t(y) * f.stride[0], f.plane[0] + size_t(y) * f.stride[0] + w);
-        for (int c = 1; c < 3; ++c)
-          for (uint32_t y = 0; y < h / 2; ++y) packed.insert(packed.end(), f.plane[c] + size_t(y) * f.stride[c], f.plane[c] + size_t(y) * f.stride[c] + w / 2);
+        if (f.format.pixel_format == PixelFormat::P010) {
+          // as yuv420p10le: the ten bits at the bottom of each word, planar
+          auto put = [&](const uint8_t* q) {
+            const uint32_t v = uint32_t(q[0] | (q[1] << 8)) >> 6;
+            packed.push_back(uint8_t(v));
+            packed.push_back(uint8_t(v >> 8));
+          };
+          for (uint32_t y = 0; y < h; ++y)
+            for (uint32_t x = 0; x < w; ++x) put(f.plane[0] + size_t(y) * f.stride[0] + x * 2);
+          for (int c = 0; c < 2; ++c)
+            for (uint32_t y = 0; y < h / 2; ++y)
+              for (uint32_t x = 0; x < w / 2; ++x) put(f.plane[1] + size_t(y) * f.stride[1] + x * 4 + c * 2);
+        } else {
+          for (uint32_t y = 0; y < h; ++y) packed.insert(packed.end(), f.plane[0] + size_t(y) * f.stride[0], f.plane[0] + size_t(y) * f.stride[0] + w);
+          for (int c = 1; c < 3; ++c)
+            for (uint32_t y = 0; y < h / 2; ++y) packed.insert(packed.end(), f.plane[c] + size_t(y) * f.stride[c], f.plane[c] + size_t(y) * f.stride[c] + w / 2);
+        }
         const std::string md5 = dxva_md5_hex(packed);
+        if (outputs) outputs->push_back({f.pts_us, packed});
         if (n < static_cast<int>(refs.size()) && (md5 == refs[n] || ffmpeg_wrong)) ++matched;
         else if (n - matched < 3) printf("  %s %s: picture %d differs from ffmpeg's\n", name.c_str(), dxva_naming_name(naming), n);
         ++n;
       }
     };
+    int64_t au_index = 0;   // (the pictures' pts: one picture an access unit, so it is the decode order)
     for (const auto& au : hevc_access_units(data)) {
-      dec.decode(ConstByteView(data.data() + au.first, au.second), 0);
+      dec.decode(ConstByteView(data.data() + au.first, au.second), au_index++);
       drain();
     }
     dec.flush();
@@ -302,7 +371,7 @@ int dxva_hevc_stream(const std::string& name, DxvaNaming naming, std::vector<Dxv
     CHECK(matched == n);
     const H265Decoder::HashStatistics stats = dec.hash_statistics();
     CHECK(stats.mismatched == 0);
-    CHECK(stats.checked == static_cast<uint64_t>(n));   // (every picture of the x265 streams carries its MD5)
+    CHECK(stats.checked == (hashed ? static_cast<uint64_t>(n) : 0u));   // (every picture of the x265 streams carries its MD5)
   }
   CHECK(alloc.live == 0);
   *total = static_cast<int>(refs.size());
@@ -310,15 +379,17 @@ int dxva_hevc_stream(const std::string& name, DxvaNaming naming, std::vector<Dxv
 }
 
 // The decoder of the recorded stream's size.
+// (Main 10 when the stream's samples are deeper than eight bits)
 UniquePointer<IDxvaDecoder> hevc_make_decoder(TestAllocator& alloc, const DxvaRecordedCall& first, uint32_t surfaces = h265::kMaxPics) {
   dxva::PicParamsHevc pp;
   memcpy(&pp, first.params.data(), sizeof pp);
+  const bool main10 = ((pp.wFormatAndSequenceInfoFlags >> 3) & 0x3F) != 0;
   DxvaDecoderConfig cfg;
-  cfg.profile = DxvaProfile::HevcVldMain;
+  cfg.profile = main10 ? DxvaProfile::HevcVldMain10 : DxvaProfile::HevcVldMain;
   cfg.width = static_cast<uint32_t>(pp.PicWidthInMinCbsY) << (pp.log2_min_luma_coding_block_size_minus3 + 3);
   cfg.height = static_cast<uint32_t>(pp.PicHeightInMinCbsY) << (pp.log2_min_luma_coding_block_size_minus3 + 3);
   cfg.surfaces = surfaces;
-  cfg.output = PixelFormat::Nv12;
+  cfg.output = main10 ? PixelFormat::P010 : PixelFormat::Nv12;
   return create_dxva_decoder(alloc, cfg);
 }
 
@@ -460,7 +531,8 @@ void dxva_hevc_errors() {
   runs += dxva_damage(make, {}, calls[0], 1);
   runs += dxva_damage(make, std::vector<DxvaRecordedCall>(calls.begin(), calls.begin() + 3), calls[3], 2);
   uint32_t seed = 3;
-  for (const char* s : {"hevc_tools.h265", "hevc_wpp.h265", "hevc_slices.h265", "hevc_weighted.h265", "hevc_lossless.h265"}) {
+  for (const char* s : {"hevc_tools.h265", "hevc_wpp.h265", "hevc_slices.h265", "hevc_weighted.h265", "hevc_lossless.h265", "hevc10_tools.h265", "hevc10_pcm.h265",
+                        "hevc10_chromaqp.h265", "hevc10_weighted.h265", "hevc10_culossless.h265"}) {
     std::vector<DxvaRecordedCall> more;
     dxva_hevc_stream(s, DxvaNaming::D3d11, &more, &total);
     if (more.size() < 3) continue;
@@ -469,6 +541,127 @@ void dxva_hevc_errors() {
   }
   CHECK(alloc.live == 0);
   printf("  HEVC damaged buffers: %d decodes\n", runs);
+}
+
+// DXVA_HEVC10_DUMP=<file>: writes the DXVA calls of the Main 10 streams the Windows tests decode (tests/windows/hevc10_dxva.h, for d3d12videotest.c and
+// d3d11videotest.c): every picture's buffers as this program (ffmpeg's dxva2_hevc.c) fills them with Direct3D 11's naming (the surfaces are the picture buffer's slots),
+// and a 32-bit FNV-1a hash of each picture in display order as yuv420p10le of the coded size - written only when every picture is the reference's.
+void hevc10_dump_windows_data(const char* path) {
+  FILE* out = fopen(path, "w");
+  CHECK(out != nullptr);
+  if (!out) return;
+  fprintf(out, "/* Generated by tests/DxvaDecoderTest.cpp (DXVA_HEVC10_DUMP=tests/windows/hevc10_dxva.h tests/run_host_tests.sh DxvaDecoderTest): the DXVA calls of Main 10\n"
+               " * streams of tests/data as ffmpeg's dxva2_hevc.c makes them (Direct3D 11 naming: a surface index is a slot of the picture buffer, 17 of them), and a 32-bit\n"
+               " * FNV-1a hash of every picture in display order (yuv420p10le, the coded size), checked against the reference decode. Do not edit. */\n#pragma once\n");
+  fprintf(out, "typedef struct Hevc10Picture { unsigned pp, pp_size, qm, qm_size, slices, slices_size, bits, bits_size, surface, display; } Hevc10Picture;\n");
+  fprintf(out, "typedef struct Hevc10Stream { const char *name; unsigned width, height, surfaces, count; const unsigned char *bytes; const Hevc10Picture *pictures; const unsigned *fnv; } Hevc10Stream;\n");
+  std::vector<std::string> names;
+  for (const char* stream : {"hevc10_bframes", "hevc10_pcm"}) {
+    std::vector<DxvaRecordedCall> calls;
+    std::vector<std::pair<int64_t, std::vector<uint8_t>>> outputs;
+    int total = 0;
+    const int matched = dxva_hevc_stream(std::string(stream) + ".h265", DxvaNaming::D3d11, &calls, &total, DxvaProfile::HevcVldMain10, &outputs);
+    CHECK(matched == total && outputs.size() == calls.size());
+    if (matched != total || outputs.size() != calls.size()) break;
+    std::vector<uint8_t> bytes;
+    std::vector<unsigned> display(calls.size(), 0);
+    for (size_t i = 0; i < outputs.size(); ++i) display[size_t(outputs[i].first)] = unsigned(i);
+    fprintf(out, "static const Hevc10Picture g_%s_pictures[%zu] = {\n", stream, calls.size());
+    for (size_t i = 0; i < calls.size(); ++i) {
+      const DxvaRecordedCall& c = calls[i];
+      dxva::PicParamsHevc pp;
+      memcpy(&pp, c.params.data(), sizeof pp);
+      unsigned at[4];
+      const std::vector<uint8_t>* parts[4] = {&c.params, &c.qm, &c.slices, &c.bitstream};
+      for (int k = 0; k < 4; ++k) {
+        at[k] = unsigned(bytes.size());
+        bytes.insert(bytes.end(), parts[k]->begin(), parts[k]->end());
+        while (bytes.size() % 4) bytes.push_back(0);   // (each buffer 4-byte aligned: the structures are read in place)
+      }
+      fprintf(out, "    {%u, %zu, %u, %zu, %u, %zu, %u, %zu, %u, %u},\n", at[0], c.params.size(), at[1], c.qm.size(), at[2], c.slices.size(), at[3], c.bitstream.size(),
+              unsigned(pp.CurrPic & 0x7F), display[i]);
+    }
+    fprintf(out, "};\nstatic const unsigned g_%s_fnv[%zu] = {", stream, outputs.size());
+    for (size_t i = 0; i < outputs.size(); ++i) {
+      uint32_t h = 0x811c9dc5u;
+      for (uint8_t b : outputs[i].second) { h ^= b; h *= 0x01000193u; }
+      fprintf(out, "%s0x%08xu", i ? ", " : "", h);
+    }
+    fprintf(out, "};\nstatic const unsigned char g_%s_bytes[%zu] __attribute__((aligned(4))) = {", stream, bytes.size());
+    for (size_t i = 0; i < bytes.size(); ++i) fprintf(out, "%s%u", i % 40 == 0 ? "\n    " : "", bytes[i]), fputc(i + 1 < bytes.size() ? ',' : '\n', out);
+    fprintf(out, "};\n");
+    dxva::PicParamsHevc first;
+    memcpy(&first, calls[0].params.data(), sizeof first);
+    const unsigned w = unsigned(first.PicWidthInMinCbsY) << (first.log2_min_luma_coding_block_size_minus3 + 3);
+    const unsigned h = unsigned(first.PicHeightInMinCbsY) << (first.log2_min_luma_coding_block_size_minus3 + 3);
+    char line[400];
+    snprintf(line, sizeof line, "    {\"%s\", %u, %u, %u, %zu, g_%s_bytes, g_%s_pictures, g_%s_fnv},\n", stream, w, h, unsigned(h265::kMaxPics), calls.size(), stream, stream, stream);
+    names.push_back(line);
+  }
+  fprintf(out, "static const Hevc10Stream g_hevc10_streams[%zu] = {\n", names.size());
+  for (const std::string& l : names) fputs(l.c_str(), out);
+  fprintf(out, "};\n");
+  fclose(out);
+  printf("  wrote %s\n", path);
+}
+
+// Main 10: what the profile takes and refuses.
+void dxva_hevc_main10_errors() {
+  // the formats: Main 10 decodes into P010 only, Main into NV12 only
+  CHECK(dxva_profile_supports(DxvaProfile::HevcVldMain10, PixelFormat::P010, 160, 96));
+  CHECK(!dxva_profile_supports(DxvaProfile::HevcVldMain10, PixelFormat::Nv12, 160, 96));
+  CHECK(!dxva_profile_supports(DxvaProfile::HevcVldMain, PixelFormat::P010, 160, 96));
+  TestAllocator alloc;
+  {
+    DxvaDecoderConfig cfg;
+    cfg.profile = DxvaProfile::HevcVldMain10;
+    cfg.width = 160;
+    cfg.height = 96;
+    cfg.surfaces = 17;
+    cfg.output = PixelFormat::Nv12;
+    CHECK(!create_dxva_decoder(alloc, cfg));
+    cfg.output = PixelFormat::P010;
+    UniquePointer<IDxvaDecoder> d = create_dxva_decoder(alloc, cfg);
+    CHECK(d && d->profile() == DxvaProfile::HevcVldMain10);
+  }
+  std::vector<DxvaRecordedCall> calls;
+  int total = 0;
+  dxva_hevc_stream("hevc10_bframes.h265", DxvaNaming::D3d11, &calls, &total);
+  CHECK(calls.size() >= 4);
+  if (calls.size() < 4) return;
+  {
+    UniquePointer<IDxvaDecoder> d = hevc_make_decoder(alloc, calls[0]);
+    CHECK(d && d->profile() == DxvaProfile::HevcVldMain10);
+    if (!d) return;
+    DxvaDecodedPicture o;
+    CHECK(d->decode(calls[0].picture(), &o) == DxvaResult::Ok && o.frame.format.pixel_format == PixelFormat::P010 && o.frame.stride[0] == 2 * o.frame.format.width);
+    dxva::PicParamsHevc pp;
+    memcpy(&pp, calls[0].params.data(), sizeof pp);
+    DxvaRecordedCall c = calls[0];
+    // 11-bit luma or chroma (a range extension profile): Unsupported
+    dxva::PicParamsHevc bad = pp;
+    bad.wFormatAndSequenceInfoFlags = static_cast<uint16_t>((bad.wFormatAndSequenceInfoFlags & ~(7u << 3)) | (3u << 3));
+    c.params = hevc_bytes(bad);
+    CHECK(d->decode(c.picture(), &o) == DxvaResult::Unsupported && o.detail != nullptr);
+    bad = pp;
+    bad.wFormatAndSequenceInfoFlags = static_cast<uint16_t>((bad.wFormatAndSequenceInfoFlags & ~(7u << 6)) | (4u << 6));
+    c.params = hevc_bytes(bad);
+    CHECK(d->decode(c.picture(), &o) == DxvaResult::Unsupported);
+    // init_qp_minus26 below -(26 + QpBdOffsetY)
+    bad = pp;
+    bad.init_qp_minus26 = -39;
+    c.params = hevc_bytes(bad);
+    CHECK(d->decode(c.picture(), &o) == DxvaResult::Invalid);
+    // PCM samples deeper than the picture's
+    bad = pp;
+    bad.dwCodingParamToolFlags = (bad.dwCodingParamToolFlags & ~((0xFu << 4) | (0xFu << 8) | (3u << 12) | (3u << 14))) | (1u << 3) | (10u << 4) | (7u << 8);
+    c.params = hevc_bytes(bad);
+    CHECK(d->decode(c.picture(), &o) == DxvaResult::Invalid);
+    // and the whole stream again after all that
+    d->reset();
+    for (const DxvaRecordedCall& call : calls) CHECK(d->decode(call.picture(), &o) == DxvaResult::Ok);
+  }
+  CHECK(alloc.live == 0);
 }
 
 }  // namespace
@@ -486,5 +679,27 @@ static void dxva_test_hevc() {
       total += t;
     }
   printf("DXVA HEVC: %d of %d pictures bit-exact with ffmpeg (hevc_cip: with its SEI MD5s; 20 streams, 3 ways of naming surfaces)\n", matched, total);
+  // Main 10 (tests/data/hevc10_*.h265, scripts/gen_hevc10_test_streams.sh), and 8-bit streams through the Main 10 decoder
+  static const char* kStreams10[] = {"hevc10_intra.h265",   "hevc10_intra_raw.h265", "hevc10_ipp.h265",      "hevc10_bframes.h265", "hevc10_weighted.h265",
+                                     "hevc10_tools.h265",   "hevc10_scaling.h265",   "hevc10_lossless.h265", "hevc10_culossless.h265", "hevc10_sao.h265",
+                                     "hevc10_lowrate.h265", "hevc10_highrate.h265",  "hevc10_chromaqp.h265", "hevc10_slices.h265",  "hevc10_wpp.h265",
+                                     "hevc10_cip.h265",     "hevc10_cra.h265",       "hevc10_oddsize.h265",  "hevc10_still.h265",   "hevc10_pcm.h265"};
+  matched = total = 0;
+  for (DxvaNaming naming : {DxvaNaming::D3d11, DxvaNaming::D3d12Shuffled, DxvaNaming::D3d12OutputKey})
+    for (const char* s : kStreams10) {
+      int t = 0;
+      matched += dxva_hevc_stream(s, naming, nullptr, &t);
+      total += t;
+    }
+  int matched8 = 0, total8 = 0;
+  for (const char* s : {"hevc_bframes.h265", "hevc_tools.h265", "hevc_weighted.h265", "hevc_oddsize.h265"}) {
+    int t = 0;
+    matched8 += dxva_hevc_stream(s, DxvaNaming::D3d12Shuffled, nullptr, &t, DxvaProfile::HevcVldMain10);
+    total8 += t;
+  }
+  printf("DXVA HEVC Main 10: %d of %d pictures bit-exact with the reference (20 streams, 3 ways of naming surfaces); 8-bit streams into P010: %d of %d\n", matched, total,
+         matched8, total8);
   dxva_hevc_errors();
+  dxva_hevc_main10_errors();
+  if (const char* dump = getenv("DXVA_HEVC10_DUMP")) hevc10_dump_windows_data(dump);
 }

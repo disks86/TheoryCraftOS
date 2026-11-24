@@ -183,8 +183,8 @@ struct Picture {
   int width = 0, height = 0;                          // luma samples, as coded
   int crop_l = 0, crop_r = 0, crop_t = 0, crop_b = 0; // the conformance window, in luma samples
   bool full_range = false;
-  // More than eight bits a sample: the planes hold 16-bit little-endian words with the value in the low bits (the form of the spec's picture hash), strides in bytes. Only
-  // an offload fills such a picture; depth_luma / depth_chroma are the bits a sample has.
+  // More than eight bits a sample: the planes hold 16-bit little-endian words with the value in the low bits (the form of the spec's picture hash), strides in bytes. The
+  // Core's own sample paths (samples<uint16_t>()) and an offload both fill such pictures; depth_luma / depth_chroma are the bits a sample has.
   bool deep = false;
   int depth_luma = 8, depth_chroma = 8;
   Mem<ColBlock> col;
@@ -196,11 +196,20 @@ struct Picture {
   uint32_t order = 0;   // decode order, for picking the oldest
 };
 
+// The samples of a plane as the sample type of its picture (uint8_t, or uint16_t for a deep picture). The one place the bytes are viewed as words: a plane is one
+// allocation of the allocator (aligned to at least 8 bytes, so the words are aligned) that lives as long as the picture's Mem, and a deep plane's words are
+// little-endian, the byte order of every CPU the system runs on. `stride_bytes / sizeof(Pel)` is the stride in samples.
+template <typename Pel>
+inline Pel* samples(const Mem<uint8_t>& plane) {
+  static_assert(sizeof(Pel) == 1 || sizeof(Pel) == 2, "8-bit or 16-bit samples");
+  return reinterpret_cast<Pel*>(plane.data());
+}
+
 struct SaoParams {
   uint8_t type[3] = {0, 0, 0};            // 0 off, 1 band, 2 edge
   uint8_t band_position[3] = {0, 0, 0};
   uint8_t eo_class[3] = {0, 0, 0};
-  int8_t offset[3][4] = {};               // SaoOffsetVal[1..4]
+  int16_t offset[3][4] = {};              // SaoOffsetVal[1..4], already scaled to the bit depth (<< (BitDepth - Min(BitDepth, 10)))
 };
 
 // A slice segment as the loop filters and the collocated prediction need it later.
@@ -353,13 +362,23 @@ class Core {
   void store_motion(int x0, int y0, int w, int h, const MvField& m);
 
   // --- H265Predict.cpp
+  // Each sample path is a template over the sample type: uint8_t for 8-bit pictures (the bit depth is then the constant 8, so the 8-bit code is what it always was) and
+  // uint16_t for deeper ones (Picture::deep; the bit depths bd_y_ / bd_c_ of the active SPS). The untemplated names pick one by the current picture.
   void predict_intra(int x0, int y0, int log2_size, int c_idx, int mode);
   void predict_inter(int x0, int y0, int w, int h, const MvField& m);
   void reconstruct_block(int x0, int y0, int log2_size, int c_idx);
+  template <typename Pel> void predict_intra_px(int x0, int y0, int log2_size, int c_idx, int mode);
+  template <typename Pel> void predict_inter_px(int x0, int y0, int w, int h, const MvField& m);
+  template <typename Pel> void reconstruct_px(int x0, int y0, int log2_size, int c_idx);
+  template <typename Pel> void read_pcm_px(int x0, int y0, int log2_size);
+  // Fills the planes of `p` with mid-grey (1 << (BitDepth - 1)), in its sample size.
+  static void fill_grey(Picture* p);
 
   // --- H265Filter.cpp
   void deblock_picture();
   void sao_picture();
+  template <typename Pel> void deblock_px();
+  template <typename Pel> void sao_px();
 
   allocators::IAllocator& allocator_;
 
@@ -389,6 +408,8 @@ class Core {
   const Sps* sp_ = nullptr;
   const Pps* pp_ = nullptr;
   bool picture_open_ = false;
+  int bd_y_ = 8, bd_c_ = 8;              // BitDepthY / BitDepthC of the active SPS
+  int qp_bd_y_ = 0, qp_bd_c_ = 0;        // QpBdOffsetY / QpBdOffsetC (6 * (BitDepth - 8))
   int w4_ = 0, h4_ = 0;                  // the picture in 4x4 blocks
   int ctb_w_ = 0, ctb_h_ = 0;
   SliceHeader first_header_, sh_;

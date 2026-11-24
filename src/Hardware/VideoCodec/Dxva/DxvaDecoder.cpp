@@ -48,7 +48,8 @@ bool dxva_profile_supports(DxvaProfile profile, DxvaSurfaceFormat surface, uint3
     case DxvaProfile::Mpeg4Pt2Simple:
     case DxvaProfile::Mpeg4Pt2AdvSimpleNoGmc:
     case DxvaProfile::Mpeg4Pt2AdvSimpleGmc: return output == PixelFormat::Nv12;
-    case DxvaProfile::Vp9Vld10BitProfile2: return output == PixelFormat::P010;
+    case DxvaProfile::Vp9Vld10BitProfile2:
+    case DxvaProfile::HevcVldMain10: return output == PixelFormat::P010;
     case DxvaProfile::Av1VldProfile0: return output == PixelFormat::Nv12 || output == PixelFormat::P010;
     default: return false;
   }
@@ -69,7 +70,8 @@ UniquePointer<IDxvaDecoder> create_dxva_decoder(allocators::IAllocator& allocato
     case DxvaProfile::Mpeg2and1Vld: return create_dxva_mpeg2(allocator, config);
     case DxvaProfile::Vp9VldProfile0:
     case DxvaProfile::Vp9Vld10BitProfile2: return create_dxva_vp9(allocator, config);
-    case DxvaProfile::HevcVldMain: return create_dxva_hevc(allocator, config);
+    case DxvaProfile::HevcVldMain:
+    case DxvaProfile::HevcVldMain10: return create_dxva_hevc(allocator, config);
     case DxvaProfile::Av1VldProfile0:
     case DxvaProfile::Av1VldProfile1:
     case DxvaProfile::Av1VldProfile2:

@@ -17,10 +17,11 @@
  */
 
 
-// An H.265 / HEVC decoder on the CPU: Main profile video (8-bit 4:2:0) with every coding tool of the Main profile - coding trees of 8x8 to 64x64 blocks, all intra
+// An H.265 / HEVC decoder on the CPU: Main, Main 10 and the Still Picture profiles (4:2:0 of 8 to 10 bits) with every coding tool of those profiles - coding trees of 8x8 to 64x64 blocks, all intra
 // modes, merge and AMVP motion prediction with temporal candidates, weighted prediction, transform skip, scaling lists, sign data hiding, PCM, lossless blocks, the
-// deblocking filter and sample adaptive offset, slices, dependent slice segments, tiles and wavefront substreams. Not covered: bit depths above 8, other chroma
-// formats, the range, multilayer and screen content extensions. Pictures come out in display order, cropped to the conformance window, as I420.
+// deblocking filter and sample adaptive offset, slices, dependent slice segments, tiles and wavefront substreams. Not covered: bit depths above 10, other chroma
+// formats, the range, multilayer and screen content extensions. Pictures come out in display order, cropped to the conformance window, as I420 (8-bit streams) or P010
+// (deeper ones: each sample in the top bits of a 16-bit word).
 //
 // Input is either Annex B (start codes, with VPS/SPS/PPS in the stream) or - after configure() with an hvcC record, as stored in MP4 files - length-prefixed NAL units.
 #pragma once
@@ -57,7 +58,7 @@ class H265Decoder {
   bool configure(ConstByteView hvcc);
   // Decodes one access unit (all NAL units of a picture, or any number of whole NAL units). False if the data holds nothing decodable.
   bool decode(ConstByteView access_unit, int64_t pts_us);
-  // The next picture in display order, as I420 (cropped). The planes stay valid until the next call on the decoder.
+  // The next picture in display order, as I420 or P010 (cropped). The planes stay valid until the next call on the decoder.
   bool receive(VideoFrame* frame);
   // The stream ends: pictures held for reordering become available.
   void flush();
