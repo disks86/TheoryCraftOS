@@ -1257,10 +1257,10 @@ NtStatus Kernel::update_tile_mappings(ProcessId pid, Handle reserved, uint32_t f
 
 // --- Video decoders -----------------------------------------------------------------------------------------------------------------------------------------------------
 
-bool Kernel::video_decode_supported(uint32_t profile, bool ten_bit, uint32_t width, uint32_t height) const {
+bool Kernel::video_decode_supported(uint32_t profile, uint32_t surface_format, uint32_t width, uint32_t height) const {
   // (the planes are 2D images: no bigger than the kernel's textures)
-  if (profile >= hardware::kDxvaProfileCount || width > kMaxTextureDimension || height > kMaxTextureDimension) return false;
-  return hardware::dxva_profile_supports(static_cast<hardware::DxvaProfile>(profile), ten_bit ? hardware::PixelFormat::P010 : hardware::PixelFormat::Nv12, width, height);
+  if (profile >= hardware::kDxvaProfileCount || surface_format >= hardware::kDxvaSurfaceFormatCount || width > kMaxTextureDimension || height > kMaxTextureDimension) return false;
+  return hardware::dxva_profile_supports(static_cast<hardware::DxvaProfile>(profile), static_cast<hardware::DxvaSurfaceFormat>(surface_format), width, height);
 }
 
 NtStatus Kernel::create_video_decoder(ProcessId pid, Handle device, const VideoDecoderDesc& desc, Handle* out) {
@@ -1268,14 +1268,14 @@ NtStatus Kernel::create_video_decoder(ProcessId pid, Handle device, const VideoD
   kernel::ScopedMutex g(lock_);
   Process* p = find_process(pid);
   if (!p || !p->devices.raw(device)) return status::kInvalidHandle;
-  if (desc.surfaces == 0 || desc.surfaces > kMaxVideoDecodeSurfaces || desc.ten_bit > 1) return status::kInvalidParameter;
-  if (!video_decode_supported(desc.profile, desc.ten_bit != 0, desc.width, desc.height)) return status::kNotSupported;
+  if (desc.surfaces == 0 || desc.surfaces > kMaxVideoDecodeSurfaces || desc.surface_format >= hardware::kDxvaSurfaceFormatCount) return status::kInvalidParameter;
+  if (!video_decode_supported(desc.profile, desc.surface_format, desc.width, desc.height)) return status::kNotSupported;
   hardware::DxvaDecoderConfig config;
   config.profile = static_cast<hardware::DxvaProfile>(desc.profile);
   config.width = desc.width;
   config.height = desc.height;
   config.surfaces = desc.surfaces;
-  config.output = desc.ten_bit ? hardware::PixelFormat::P010 : hardware::PixelFormat::Nv12;
+  config.surface = static_cast<hardware::DxvaSurfaceFormat>(desc.surface_format);
   UniquePointer<hardware::IDxvaDecoder> decoder = hardware::create_dxva_decoder(allocator_, config);
   if (!decoder) return status::kNoMemory;
   SharedPointer<VideoDecoderRec> rec = SharedPointer<VideoDecoderRec>::make(allocator_);
@@ -1323,7 +1323,7 @@ NtStatus Kernel::escape_d3d12(ProcessId pid, Handle device, uint32_t op, ByteRea
       desc.width = in.le32();
       desc.height = in.le32();
       desc.surfaces = in.le32();
-      desc.ten_bit = in.le32();
+      desc.surface_format = in.le32();
       if (!in.ok() || !in.at_end()) return status::kInvalidParameter;
       if (reply.size() < 4) return status::kBufferTooSmall;
       Handle h = 0;
@@ -1337,10 +1337,10 @@ NtStatus Kernel::escape_d3d12(ProcessId pid, Handle device, uint32_t op, ByteRea
       return destroy_video_decoder(pid, h);
     }
     case EscapeOp::QueryVideoDecodeSupport: {
-      const uint32_t profile = in.le32(), ten_bit = in.le32(), width = in.le32(), height = in.le32();
-      if (!in.ok() || !in.at_end() || ten_bit > 1) return status::kInvalidParameter;
+      const uint32_t profile = in.le32(), surface_format = in.le32(), width = in.le32(), height = in.le32();
+      if (!in.ok() || !in.at_end() || surface_format >= hardware::kDxvaSurfaceFormatCount) return status::kInvalidParameter;
       if (reply.size() < 4) return status::kBufferTooSmall;
-      out.le32(video_decode_supported(profile, ten_bit != 0, width, height) ? 1u : 0u);
+      out.le32(video_decode_supported(profile, surface_format, width, height) ? 1u : 0u);
       return status::kSuccess;
     }
     case EscapeOp::DestroyRootSignature:

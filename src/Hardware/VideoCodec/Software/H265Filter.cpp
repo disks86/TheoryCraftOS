@@ -27,7 +27,8 @@ namespace h265 {
 namespace {
 constexpr int clip3(int lo, int hi, int v) { return v < lo ? lo : v > hi ? hi : v; }
 constexpr int iabs(int a) { return a < 0 ? -a : a; }
-inline uint8_t clip_pixel(int v) { return static_cast<uint8_t>(v < 0 ? 0 : v > 255 ? 255 : v); }
+template <typename Pel>
+inline Pel clip_sample(int v, int max_value) { return static_cast<Pel>(v < 0 ? 0 : v > max_value ? max_value : v); }
 
 // Table 8-12
 const uint8_t kTcTable[54] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4,
@@ -49,6 +50,15 @@ struct BlockMotion {
 }  // namespace
 
 void Core::deblock_picture() {
+  if (cur_->deep) deblock_px<uint16_t>();
+  else deblock_px<uint8_t>();
+}
+
+// (Pel is the sample type, as in H265Predict.cpp: at 8 bits the depth is the constant 8; tC and beta are scaled by 1 << (BitDepth - 8), 8.7.2.5.3 / 8.7.2.5.5.)
+template <typename Pel>
+void Core::deblock_px() {
+  const int bd_y = sizeof(Pel) == 1 ? 8 : bd_y_, bd_c = sizeof(Pel) == 1 ? 8 : bd_c_;
+  const int max_y = (1 << bd_y) - 1, max_c = (1 << bd_c) - 1;
   const Sps& s = *sp_;
   const Pps& pps = *pp_;
   Picture* pic = cur_;
@@ -112,7 +122,7 @@ void Core::deblock_picture() {
     const int offset = c == 1 ? pps.cb_qp_offset : pps.cr_qp_offset;
     const int qpi = qp_avg + offset;
     const int qpc = qpi < 30 ? qpi : qpi >= 43 ? qpi - 6 : kChromaQp[qpi - 30];
-    return kTcTable[clip3(0, 53, qpc + 2 * (bs - 1) + (sl->tc_offset_div2 << 1))];
+    return kTcTable[clip3(0, 53, qpc + 2 * (bs - 1) + (sl->tc_offset_div2 << 1))] * (1 << (bd_c - 8));
   };
   for (int dir = 0; dir < 2; ++dir) {   // 0: vertical edges (filtering across x), 1: horizontal edges
     // luma
@@ -128,15 +138,16 @@ void Core::deblock_picture() {
         if (bs == 0) continue;
         const SliceInfo* qs = slice_of(x4, y4);
         const int qp = (qp_map_[static_cast<uint64_t>(py4) * w4 + px4] + qp_map_[static_cast<uint64_t>(y4) * w4 + x4] + 1) >> 1;
-        const int beta = kBetaTable[clip3(0, 51, qp + (qs->beta_offset_div2 << 1))];
-        const int tc = kTcTable[clip3(0, 53, qp + 2 * (bs - 1) + (qs->tc_offset_div2 << 1))];
+        const int beta = kBetaTable[clip3(0, 51, qp + (qs->beta_offset_div2 << 1))] * (1 << (bd_y - 8));
+        const int tc = kTcTable[clip3(0, 53, qp + 2 * (bs - 1) + (qs->tc_offset_div2 << 1))] * (1 << (bd_y - 8));
         const bool no_p = pred_mode_[static_cast<uint64_t>(py4) * w4 + px4] & 8, no_q = pred_mode_[static_cast<uint64_t>(y4) * w4 + x4] & 8;
         // the four lines across the edge
-        uint8_t* base = pic->plane[0].data() + static_cast<uint64_t>(y4 << 2) * pic->stride[0] + (x4 << 2);
-        const int along = dir == 0 ? pic->stride[0] : 1;    // step from one line to the next
-        const int across = dir == 0 ? 1 : pic->stride[0];   // step across the edge
-        auto P = [&](int line, int i) -> uint8_t& { return base[line * along - (i + 1) * across]; };
-        auto Q = [&](int line, int i) -> uint8_t& { return base[line * along + i * across]; };
+        const int luma_stride = pic->stride[0] / static_cast<int>(sizeof(Pel));
+        Pel* base = samples<Pel>(pic->plane[0]) + static_cast<uint64_t>(y4 << 2) * luma_stride + (x4 << 2);
+        const int along = dir == 0 ? luma_stride : 1;    // step from one line to the next
+        const int across = dir == 0 ? 1 : luma_stride;   // step across the edge
+        auto P = [&](int line, int i) -> Pel& { return base[line * along - (i + 1) * across]; };
+        auto Q = [&](int line, int i) -> Pel& { return base[line * along + i * across]; };
         const int dp0 = iabs(P(0, 2) - 2 * P(0, 1) + P(0, 0)), dp3 = iabs(P(3, 2) - 2 * P(3, 1) + P(3, 0));
         const int dq0 = iabs(Q(0, 2) - 2 * Q(0, 1) + Q(0, 0)), dq3 = iabs(Q(3, 2) - 2 * Q(3, 1) + Q(3, 0));
         const int dpq0 = dp0 + dq0, dpq3 = dp3 + dq3, dp = dp0 + dp3, dq = dq0 + dq3, d = dpq0 + dpq3;
@@ -151,26 +162,26 @@ void Core::deblock_picture() {
           const int q0 = Q(line, 0), q1 = Q(line, 1), q2 = Q(line, 2), q3 = Q(line, 3);
           if (strong_filter) {
             if (!no_p) {
-              P(line, 0) = static_cast<uint8_t>(clip3(p0 - 2 * tc, p0 + 2 * tc, (p2 + 2 * p1 + 2 * p0 + 2 * q0 + q1 + 4) >> 3));
-              P(line, 1) = static_cast<uint8_t>(clip3(p1 - 2 * tc, p1 + 2 * tc, (p2 + p1 + p0 + q0 + 2) >> 2));
-              P(line, 2) = static_cast<uint8_t>(clip3(p2 - 2 * tc, p2 + 2 * tc, (2 * p3 + 3 * p2 + p1 + p0 + q0 + 4) >> 3));
+              P(line, 0) = static_cast<Pel>(clip3(p0 - 2 * tc, p0 + 2 * tc, (p2 + 2 * p1 + 2 * p0 + 2 * q0 + q1 + 4) >> 3));
+              P(line, 1) = static_cast<Pel>(clip3(p1 - 2 * tc, p1 + 2 * tc, (p2 + p1 + p0 + q0 + 2) >> 2));
+              P(line, 2) = static_cast<Pel>(clip3(p2 - 2 * tc, p2 + 2 * tc, (2 * p3 + 3 * p2 + p1 + p0 + q0 + 4) >> 3));
             }
             if (!no_q) {
-              Q(line, 0) = static_cast<uint8_t>(clip3(q0 - 2 * tc, q0 + 2 * tc, (p1 + 2 * p0 + 2 * q0 + 2 * q1 + q2 + 4) >> 3));
-              Q(line, 1) = static_cast<uint8_t>(clip3(q1 - 2 * tc, q1 + 2 * tc, (p0 + q0 + q1 + q2 + 2) >> 2));
-              Q(line, 2) = static_cast<uint8_t>(clip3(q2 - 2 * tc, q2 + 2 * tc, (p0 + q0 + q1 + 3 * q2 + 2 * q3 + 4) >> 3));
+              Q(line, 0) = static_cast<Pel>(clip3(q0 - 2 * tc, q0 + 2 * tc, (p1 + 2 * p0 + 2 * q0 + 2 * q1 + q2 + 4) >> 3));
+              Q(line, 1) = static_cast<Pel>(clip3(q1 - 2 * tc, q1 + 2 * tc, (p0 + q0 + q1 + q2 + 2) >> 2));
+              Q(line, 2) = static_cast<Pel>(clip3(q2 - 2 * tc, q2 + 2 * tc, (p0 + q0 + q1 + 3 * q2 + 2 * q3 + 4) >> 3));
             }
           } else {
             int delta = (9 * (q0 - p0) - 3 * (q1 - p1) + 8) >> 4;
             if (iabs(delta) >= tc * 10) continue;
             delta = clip3(-tc, tc, delta);
             if (!no_p) {
-              P(line, 0) = clip_pixel(p0 + delta);
-              if (de_p) P(line, 1) = clip_pixel(p1 + clip3(-(tc >> 1), tc >> 1, (((p2 + p0 + 1) >> 1) - p1 + delta) >> 1));
+              P(line, 0) = clip_sample<Pel>(p0 + delta, max_y);
+              if (de_p) P(line, 1) = clip_sample<Pel>(p1 + clip3(-(tc >> 1), tc >> 1, (((p2 + p0 + 1) >> 1) - p1 + delta) >> 1), max_y);
             }
             if (!no_q) {
-              Q(line, 0) = clip_pixel(q0 - delta);
-              if (de_q) Q(line, 1) = clip_pixel(q1 + clip3(-(tc >> 1), tc >> 1, (((q2 + q0 + 1) >> 1) - q1 - delta) >> 1));
+              Q(line, 0) = clip_sample<Pel>(q0 - delta, max_y);
+              if (de_q) Q(line, 1) = clip_sample<Pel>(q1 + clip3(-(tc >> 1), tc >> 1, (((q2 + q0 + 1) >> 1) - q1 - delta) >> 1), max_y);
             }
           }
         }
@@ -180,8 +191,8 @@ void Core::deblock_picture() {
     // the first luma segment they cover
     const int cw = s.width / 2, ch = s.height / 2;
     for (int c = 1; c < 3; ++c) {
-      uint8_t* plane = pic->plane[c].data();
-      const int stride = pic->stride[c];
+      Pel* plane = samples<Pel>(pic->plane[c]);
+      const int stride = pic->stride[c] / static_cast<int>(sizeof(Pel));
       for (int yc = 0; yc < ch; yc += (dir == 0 ? 4 : 8)) {
         for (int xc = 0; xc < cw; xc += (dir == 0 ? 8 : 4)) {
           if (dir == 0 ? xc == 0 : yc == 0) continue;
@@ -198,12 +209,12 @@ void Core::deblock_picture() {
           const int tc = chroma_tc(qp, c, 2, qs);
           const bool no_p = pred_mode_[static_cast<uint64_t>(py4) * w4 + px4] & 8, no_q = pred_mode_[static_cast<uint64_t>(y4) * w4 + x4] & 8;
           for (int k = 0; k < 4; ++k) {
-            uint8_t* base = plane + static_cast<uint64_t>(yc + (dir == 0 ? k : 0)) * stride + xc + (dir == 0 ? 0 : k);
+            Pel* base = plane + static_cast<uint64_t>(yc + (dir == 0 ? k : 0)) * stride + xc + (dir == 0 ? 0 : k);
             const int across = dir == 0 ? 1 : stride;
             const int p0 = base[-across], p1 = base[-2 * across], q0 = base[0], q1 = base[across];
             const int delta = clip3(-tc, tc, ((((q0 - p0) << 2) + p1 - q1 + 4) >> 3));
-            if (!no_p) base[-across] = clip_pixel(p0 + delta);
-            if (!no_q) base[0] = clip_pixel(q0 - delta);
+            if (!no_p) base[-across] = clip_sample<Pel>(p0 + delta, max_c);
+            if (!no_q) base[0] = clip_sample<Pel>(q0 - delta, max_c);
           }
         }
       }
@@ -215,8 +226,15 @@ void Core::deblock_picture() {
 // Sample adaptive offset
 
 void Core::sao_picture() {
+  if (!sp_->sao) return;
+  if (cur_->deep) sao_px<uint16_t>();
+  else sao_px<uint8_t>();
+}
+
+// (8.7.3: the offsets come scaled to the bit depth from read_sao(); the bands are the top five bits of a sample, bandShift = BitDepth - 5.)
+template <typename Pel>
+void Core::sao_px() {
   const Sps& s = *sp_;
-  if (!s.sao) return;
   Picture* pic = cur_;
   bool any = false;
   for (int rs = 0; rs < ctb_w_ * ctb_h_ && !any; ++rs) {
@@ -242,10 +260,12 @@ void Core::sao_picture() {
         const int ctb = s.ctb_size / sub;
         const int x_begin = rx * ctb, y_begin = ry * ctb;
         const int x_end = x_begin + ctb < pw ? x_begin + ctb : pw, y_end = y_begin + ctb < ph ? y_begin + ctb : ph;
-        const uint8_t* src = sao_plane_[c].data();
-        uint8_t* dst = pic->plane[c].data();
-        const int stride = pic->stride[c];
-        int8_t offset_val[5] = {0, p.offset[c][0], p.offset[c][1], p.offset[c][2], p.offset[c][3]};
+        const int bd = sizeof(Pel) == 1 ? 8 : (c ? bd_c_ : bd_y_);
+        const int max_value = (1 << bd) - 1, band_shift = bd - 5;
+        const Pel* src = samples<Pel>(sao_plane_[c]);
+        Pel* dst = samples<Pel>(pic->plane[c]);
+        const int stride = pic->stride[c] / static_cast<int>(sizeof(Pel));
+        int offset_val[5] = {0, p.offset[c][0], p.offset[c][1], p.offset[c][2], p.offset[c][3]};
         uint8_t band_table[32] = {};
         if (p.type[c] == 1)
           for (int k = 0; k < 4; ++k) band_table[(k + p.band_position[c]) & 31] = static_cast<uint8_t>(k + 1);
@@ -258,7 +278,7 @@ void Core::sao_picture() {
             const int v = src[static_cast<uint64_t>(y) * stride + x];
             int idx;
             if (p.type[c] == 1) {
-              idx = band_table[v >> 3];
+              idx = band_table[v >> band_shift];
             } else {
               int edge_idx = 2;
               bool usable = true;
@@ -284,7 +304,7 @@ void Core::sao_picture() {
               // edgeIdx 0, 1, 2 map to 1, 2, 0; 3 and 4 stay
               idx = edge_idx == 2 ? 0 : (edge_idx < 2 ? edge_idx + 1 : edge_idx);
             }
-            dst[static_cast<uint64_t>(y) * stride + x] = clip_pixel(v + offset_val[idx]);
+            dst[static_cast<uint64_t>(y) * stride + x] = clip_sample<Pel>(v + offset_val[idx], max_value);
           }
         }
       }

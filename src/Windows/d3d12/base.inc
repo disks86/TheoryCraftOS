@@ -46,12 +46,15 @@ typedef struct FormatInfo {
   UINT depth;          /* depth/stencil format */
   UINT compressed;     /* block-compressed (BC1 .. BC3): the rows of a footprint are rows of blocks */
   UINT narrow;         /* NARROW_*: one or two 8- or 16-bit channels the kernel keeps widened (its CopyBufferImage NarrowLayout); `bytes` is the footprint's pixel */
-  UINT planar;         /* PLANAR_*: NV12 (8 bits), P010 / P016 (16 bits) - a luma plane and a half-size plane of U, V: each plane and array slice an allocation of its own */
+  UINT planar;         /* PLANAR_*: NV12 (8 bits), P010 / P016 (16 bits) - a luma plane and a half-size plane of U, V: each plane and array slice an allocation of its own;
+                        * P208 (U, V half as wide), V208 / V408 (three planes of R8: U and V half as high, or full size) */
+  UINT pair;           /* a packed 4:2:2 format (YUY2, Y210, Y216): a pixel of the kernel's image - and of a view, R8G8B8A8 / R16G16B16A16 - is a pair of the texture's (Y0, U, Y1,
+                        * V); the image is half as wide, `bytes` is the pair's */
 } FormatInfo;
 /* The kernel's NarrowLayout (src/Kernel/Dxgkrnl/CommandStream.hpp): an image of four channels the program sees as one or two. Copied into it a pixel becomes (r, g or 0, 0,
  * the maximum), so an R8 / R8G8 / R16 / R16G16 view of it samples what Direct3D says it does; render targets of these formats write their channels only (pso.inc). */
 enum { NARROW_NONE, NARROW_R8, NARROW_R8G8, NARROW_R16, NARROW_R16G16 };
-enum { PLANAR_NONE, PLANAR_8, PLANAR_16 };
+enum { PLANAR_NONE, PLANAR_8, PLANAR_16, PLANAR_P208, PLANAR_V208, PLANAR_V408 };
 
 static const FormatInfo g_formats[] = {
     {DXGI_FORMAT_R32G32B32A32_TYPELESS, KF_RGBA32F, 16, 0}, {DXGI_FORMAT_R32G32B32A32_FLOAT, KF_RGBA32F, 16, 0}, {DXGI_FORMAT_R32G32B32A32_UINT, KF_RGBA32UINT, 16, 0},
@@ -71,9 +74,36 @@ static const FormatInfo g_formats[] = {
     {DXGI_FORMAT_R16G16_TYPELESS, KF_RGBA16, 4, 0, 0, NARROW_R16G16}, {DXGI_FORMAT_R16G16_UNORM, KF_RGBA16, 4, 0, 0, NARROW_R16G16},
     {DXGI_FORMAT_R16G16_SINT, KF_RGBA16SINT, 4, 0, 0, NARROW_R16G16},      /* (the motion vectors ResolveMotionVectorHeap writes: kept as (x, y, 0, 1)) */
     {DXGI_FORMAT_NV12, KF_A8B8G8R8, 1, 0, 0, NARROW_R8, PLANAR_8}, {DXGI_FORMAT_P010, KF_RGBA16, 2, 0, 0, NARROW_R16, PLANAR_16}, {DXGI_FORMAT_P016, KF_RGBA16, 2, 0, 0, NARROW_R16, PLANAR_16},
+    /* the packed YUV formats, kept as the RGB format of their views (DXGI_FORMAT: AYUV is R8G8B8A8 - V, U, Y, A -, Y410 R10G10B10A2 - U, Y, V, A -, Y416 R16G16B16A16 - U, Y, V,
+     * A -, YUY2 R8G8B8A8 and Y210 / Y216 R16G16B16A16 of half the width - Y0, U, Y1, V), and the planar 4:2:2 / 4:4:0 / 4:4:4 ones of Direct3D 12 (P208, V208, V408) */
+    {DXGI_FORMAT_AYUV, KF_A8B8G8R8, 4, 0}, {DXGI_FORMAT_Y410, KF_RGB10A2, 4, 0}, {DXGI_FORMAT_Y416, KF_RGBA16, 8, 0},
+    {DXGI_FORMAT_YUY2, KF_A8B8G8R8, 4, 0, 0, 0, 0, 1}, {DXGI_FORMAT_Y210, KF_RGBA16, 8, 0, 0, 0, 0, 1}, {DXGI_FORMAT_Y216, KF_RGBA16, 8, 0, 0, 0, 0, 1},
+    {DXGI_FORMAT_P208, KF_A8B8G8R8, 1, 0, 0, NARROW_R8, PLANAR_P208}, {DXGI_FORMAT_V208, KF_A8B8G8R8, 1, 0, 0, NARROW_R8, PLANAR_V208},
+    {DXGI_FORMAT_V408, KF_A8B8G8R8, 1, 0, 0, NARROW_R8, PLANAR_V408},
 };
 /* The bytes of a row of a level `w` pixels wide (of blocks for a compressed format), and the rows of a level `h` high. */
-static UINT64 format_row_bytes(const FormatInfo *fi, UINT w) { return fi && fi->compressed ? (UINT64)((w + 3) / 4) * fi->bytes : (UINT64)w * (fi ? fi->bytes : 4); }
+static UINT64 format_row_bytes(const FormatInfo *fi, UINT w) {
+  return fi && fi->compressed ? (UINT64)((w + 3) / 4) * fi->bytes : fi && fi->pair ? (UINT64)((w + 1) / 2) * fi->bytes : (UINT64)w * (fi ? fi->bytes : 4);
+}
+/* A column and a width of a texture in pixels of the kernel's image (a packed 4:2:2 format's are pairs). */
+static UINT format_kx(const FormatInfo *fi, UINT x) { return fi && fi->pair ? x / 2 : x; }
+static UINT format_kw(const FormatInfo *fi, UINT w) { return fi && fi->pair ? (w + 1) / 2 : w; }
+/* A packed YUV format (AYUV, Y410, Y416, YUY2, Y210, Y216): a view of it has the format of its pixels (format_info's kernel format), never the YUV one. */
+static int format_packed_yuv(DXGI_FORMAT f) {
+  return f == DXGI_FORMAT_AYUV || f == DXGI_FORMAT_Y410 || f == DXGI_FORMAT_Y416 || f == DXGI_FORMAT_YUY2 || f == DXGI_FORMAT_Y210 || f == DXGI_FORMAT_Y216;
+}
+/* Whether `view` is a format a view of a texture of the packed YUV format `res` may have (DXGI_FORMAT: R8G8B8A8_UNORM / _UINT for AYUV and YUY2, R10G10B10A2_UNORM /
+ * _UINT for Y410, R16G16B16A16_UNORM / _UINT for Y416, Y210, Y216), and as a render target (AYUV's views alone: the others are SRV and UAV formats). The R32_UINT UAV view
+ * and YUY2's R8G8_B8G8_UNORM view are not offered: the kernel has no 32-bit integer view of a four-channel image and no hardware RGB reconstruction. */
+static int packed_yuv_view_ok(DXGI_FORMAT res, DXGI_FORMAT view, int render_target) {
+  switch (res) {
+    case DXGI_FORMAT_AYUV: return view == DXGI_FORMAT_R8G8B8A8_UNORM || view == DXGI_FORMAT_R8G8B8A8_UINT;
+    case DXGI_FORMAT_YUY2: return !render_target && (view == DXGI_FORMAT_R8G8B8A8_UNORM || view == DXGI_FORMAT_R8G8B8A8_UINT);
+    case DXGI_FORMAT_Y410: return !render_target && (view == DXGI_FORMAT_R10G10B10A2_UNORM || view == DXGI_FORMAT_R10G10B10A2_UINT);
+    case DXGI_FORMAT_Y416: case DXGI_FORMAT_Y210: case DXGI_FORMAT_Y216: return !render_target && (view == DXGI_FORMAT_R16G16B16A16_UNORM || view == DXGI_FORMAT_R16G16B16A16_UINT);
+    default: return 1;
+  }
+}
 static UINT format_rows(const FormatInfo *fi, UINT h) { return fi && fi->compressed ? (h + 3) / 4 : h; }
 
 static const FormatInfo *format_info(DXGI_FORMAT f) {
@@ -81,9 +111,18 @@ static const FormatInfo *format_info(DXGI_FORMAT f) {
     if (g_formats[i].dxgi == f) return &g_formats[i];
   return NULL;
 }
-/* A plane of a planar format, as the format of its footprints and views (R8 / R8G8, or R16 / R16G16): plane 0 the luma, plane 1 the chroma. */
+/* The planes of a planar format (0 for another). */
+static UINT format_planes(const FormatInfo *fi) { return !fi || !fi->planar ? 0 : fi->planar == PLANAR_V208 || fi->planar == PLANAR_V408 ? 3 : 2; }
+/* The size of plane `plane` of a level `*w` x `*h` of a planar format: the chroma of NV12 / P010 / P016 half both ways, of P208 half as wide, of V208 half as high. */
+static void plane_extent(const FormatInfo *fi, UINT plane, UINT *w, UINT *h) {
+  if (!fi || !fi->planar || plane == 0 || fi->planar == PLANAR_V408) return;
+  if (fi->planar != PLANAR_V208) *w = (*w + 1) / 2;
+  if (fi->planar != PLANAR_P208) *h = (*h + 1) / 2;
+}
+/* A plane of a planar format, as the format of its footprints and views (R8 / R8G8, or R16 / R16G16): plane 0 the luma, plane 1 the chroma; V208 / V408: three R8 planes. */
 static const FormatInfo *plane_format(const FormatInfo *fi, UINT plane) {
   if (!fi || !fi->planar) return fi;
+  if (fi->planar == PLANAR_V208 || fi->planar == PLANAR_V408) return format_info(DXGI_FORMAT_R8_TYPELESS);
   const int sixteen = fi->planar == PLANAR_16;
   return format_info(plane == 0 ? (sixteen ? DXGI_FORMAT_R16_TYPELESS : DXGI_FORMAT_R8_TYPELESS) : (sixteen ? DXGI_FORMAT_R16G16_TYPELESS : DXGI_FORMAT_R8G8_TYPELESS));
 }

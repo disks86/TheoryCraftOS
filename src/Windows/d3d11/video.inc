@@ -26,7 +26,7 @@
  * recorded (the list is sent first, and the queue runs the decode before it returns), so draws and copies before and after see the textures in order. The DXVA surface
  * indices of the parameters are the array slices of the texture the output view is of (as ffmpeg's d3d11va and Media Foundation give them): the reference list is every
  * slice of that texture, so index n is slice n. The status of each picture (DecoderExtension, DXVA_STATUS_REPORTING_FUNCTION) comes from Direct3D 12's decode statistics.
- * Profiles: what Direct3D 12 below decodes (H.264, MPEG-2, MPEG-1/2, VP9 profile 0 and 10-bit profile 2, HEVC Main, AV1 profile 0); all are VLD (bitstream) decoders, so
+ * Profiles: what Direct3D 12 below decodes (H.264, MPEG-2, MPEG-1/2, VP9 profile 0 and 10-bit profile 2, HEVC Main and Main 10, AV1 profile 0); all are VLD (bitstream) decoders, so
  * the buffers of the older acceleration modes (macroblock control, residual difference, deblocking, motion vectors, film grain) are not taken.
  *
  * Video processing. VideoProcessorBlt is one ProcessFrames on a VIDEO_PROCESS queue, ordered with the immediate context's work the same way. A processor keeps the
@@ -48,11 +48,20 @@
 
 /* ---- the codecs ------------------------------------------------------------------------------------------------------------------------------------------------ */
 
-enum { VSTATUS_NONE, VSTATUS_H264, VSTATUS_HEVC, VSTATUS_VPX, VSTATUS_AV1 };
+enum { VSTATUS_NONE, VSTATUS_H264, VSTATUS_HEVC, VSTATUS_VPX, VSTATUS_AV1, VSTATUS_VC1, VSTATUS_MPEG4 };
 #pragma pack(push, 1)
 /* (the HEVC status report of the DXVA HEVC specification, which dxva.h does not have) */
 typedef struct VideoStatusHevc { USHORT StatusReportFeedbackNumber; UCHAR CurrPic; UCHAR bBufType, bStatus, bReserved8Bits; USHORT wNumMbsAffected; } VideoStatusHevc;
+/* (the Windows SDK's DXVA_Status_VC1, which mingw-w64's dxva.h does not have; MPEG-4 Part 2 reports in the same form, its StatusReportFeedbackNumber the one of the
+ * picture parameters) */
+typedef struct VideoStatusVc1 {
+  USHORT StatusReportFeedbackNumber; WORD wDecodedPictureIndex, wDeblockedPictureIndex; UCHAR bPicStructure, bBufType, bStatus, bReserved8Bits; USHORT wNumMbsAffected;
+} VideoStatusVc1;
 #pragma pack(pop)
+/* DXVA_PicParams_MPEG4_PART2 (the Windows SDK's dxva.h; not in mingw-w64's): its size, and where it has the feedback number and the current picture */
+#define VIDEO_MPEG4_PP_BYTES 62u
+#define VIDEO_MPEG4_PP_FEEDBACK 56u
+#define VIDEO_MPEG4_PP_CURR 3u
 
 /* What Direct3D 11 says of a profile beyond what Direct3D 12 below does with it: ConfigBitstreamRaw (2: H.264's short slice format; 1: the others' bitstream format - HEVC,
  * VP9 and AV1 have short slices only, and ffmpeg takes 1 for them), the slice control entry and where its offset into the bitstream is, the status report, and where
@@ -77,6 +86,28 @@ static const VideoCodec g_video_codecs[] = {
      offsetof(DXVA_PicParams_HEVC, StatusReportFeedbackNumber), offsetof(DXVA_PicParams_HEVC, CurrPic)},
     {&DXVA_ModeAV1_VLD_Profile0, 1, sizeof(DXVA_Tile_AV1), offsetof(DXVA_Tile_AV1, DataOffset), VSTATUS_AV1, sizeof(DXVA_PicParams_AV1),
      offsetof(DXVA_PicParams_AV1, StatusReportFeedbackNumber), offsetof(DXVA_PicParams_AV1, CurrPicTextureIndex)},
+    /* (VC-1's feedback number is bPicScanFixed << 8 | bPicScanMethod: vdec_status_push reads it) */
+    {&D3D11_DECODER_PROFILE_VC1_VLD, 1, sizeof(DXVA_SliceInfo), offsetof(DXVA_SliceInfo, dwSliceDataLocation), VSTATUS_VC1, sizeof(DXVA_PictureParameters),
+     offsetof(DXVA_PictureParameters, bPicScanFixed), offsetof(DXVA_PictureParameters, wDecodedPictureIndex)},
+    {&D3D11_DECODER_PROFILE_VC1_D2010, 1, sizeof(DXVA_SliceInfo), offsetof(DXVA_SliceInfo, dwSliceDataLocation), VSTATUS_VC1, sizeof(DXVA_PictureParameters),
+     offsetof(DXVA_PictureParameters, bPicScanFixed), offsetof(DXVA_PictureParameters, wDecodedPictureIndex)},
+    {&D3D11_DECODER_PROFILE_MPEG4PT2_VLD_SIMPLE, 1, sizeof(DXVA_SliceInfo), offsetof(DXVA_SliceInfo, dwSliceDataLocation), VSTATUS_MPEG4, VIDEO_MPEG4_PP_BYTES,
+     VIDEO_MPEG4_PP_FEEDBACK, VIDEO_MPEG4_PP_CURR},
+    {&D3D11_DECODER_PROFILE_MPEG4PT2_VLD_ADVSIMPLE_NOGMC, 1, sizeof(DXVA_SliceInfo), offsetof(DXVA_SliceInfo, dwSliceDataLocation), VSTATUS_MPEG4, VIDEO_MPEG4_PP_BYTES,
+     VIDEO_MPEG4_PP_FEEDBACK, VIDEO_MPEG4_PP_CURR},
+    {&D3D11_DECODER_PROFILE_MPEG4PT2_VLD_ADVSIMPLE_GMC, 1, sizeof(DXVA_SliceInfo), offsetof(DXVA_SliceInfo, dwSliceDataLocation), VSTATUS_MPEG4, VIDEO_MPEG4_PP_BYTES,
+     VIDEO_MPEG4_PP_FEEDBACK, VIDEO_MPEG4_PP_CURR},
+    /* (AV1 profiles 1 and 2: the same buffers, other surface formats - Direct3D 12's profiles of the same GUIDs) */
+    {&DXVA_ModeAV1_VLD_Profile1, 1, sizeof(DXVA_Tile_AV1), offsetof(DXVA_Tile_AV1, DataOffset), VSTATUS_AV1, sizeof(DXVA_PicParams_AV1),
+     offsetof(DXVA_PicParams_AV1, StatusReportFeedbackNumber), offsetof(DXVA_PicParams_AV1, CurrPicTextureIndex)},
+    {&DXVA_ModeAV1_VLD_Profile2, 1, sizeof(DXVA_Tile_AV1), offsetof(DXVA_Tile_AV1, DataOffset), VSTATUS_AV1, sizeof(DXVA_PicParams_AV1),
+     offsetof(DXVA_PicParams_AV1, StatusReportFeedbackNumber), offsetof(DXVA_PicParams_AV1, CurrPicTextureIndex)},
+    {&DXVA_ModeAV1_VLD_12bit_Profile2, 1, sizeof(DXVA_Tile_AV1), offsetof(DXVA_Tile_AV1, DataOffset), VSTATUS_AV1, sizeof(DXVA_PicParams_AV1),
+     offsetof(DXVA_PicParams_AV1, StatusReportFeedbackNumber), offsetof(DXVA_PicParams_AV1, CurrPicTextureIndex)},
+    {&DXVA_ModeAV1_VLD_12bit_Profile2_420, 1, sizeof(DXVA_Tile_AV1), offsetof(DXVA_Tile_AV1, DataOffset), VSTATUS_AV1, sizeof(DXVA_PicParams_AV1),
+     offsetof(DXVA_PicParams_AV1, StatusReportFeedbackNumber), offsetof(DXVA_PicParams_AV1, CurrPicTextureIndex)},
+    {&D3D11_DECODER_PROFILE_HEVC_VLD_MAIN10, 1, sizeof(DXVA_Slice_HEVC_Short), offsetof(DXVA_Slice_HEVC_Short, BSNALunitDataLocation), VSTATUS_HEVC, sizeof(DXVA_PicParams_HEVC),
+     offsetof(DXVA_PicParams_HEVC, StatusReportFeedbackNumber), offsetof(DXVA_PicParams_HEVC, CurrPic)},
 };
 #define VIDEO_CODECS (sizeof g_video_codecs / sizeof g_video_codecs[0])
 
@@ -91,6 +122,8 @@ static UINT video_status_bytes(UINT status) {
     case VSTATUS_HEVC: return sizeof(VideoStatusHevc);
     case VSTATUS_VPX: return sizeof(DXVA_Status_VPx);
     case VSTATUS_AV1: return sizeof(DXVA_Status_AV1);
+    case VSTATUS_VC1:
+    case VSTATUS_MPEG4: return sizeof(VideoStatusVc1);
     default: return 0;
   }
 }
@@ -333,7 +366,15 @@ static VideoView *vview_new(Dev *d, Tex *t, UINT kind) {
 
 /* ---- the video processor's formats and colour spaces ------------------------------------------------------------------------------------------------------------ */
 
-static BOOL vp_yuv(DXGI_FORMAT f) { return f == DXGI_FORMAT_NV12 || f == DXGI_FORMAT_P010 || f == DXGI_FORMAT_P016; }
+static BOOL vp_yuv(DXGI_FORMAT f) {
+  return f == DXGI_FORMAT_NV12 || f == DXGI_FORMAT_P010 || f == DXGI_FORMAT_P016 || f == DXGI_FORMAT_AYUV || f == DXGI_FORMAT_Y410 || f == DXGI_FORMAT_Y416 ||
+         f == DXGI_FORMAT_YUY2 || f == DXGI_FORMAT_Y210 || f == DXGI_FORMAT_Y216;
+}
+/* A format the processor writes in Direct3D 11: one that may be a render target (an output view is of a render target) - not Y410, Y416, YUY2, Y210, Y216, whose views are
+ * shader resource and unordered access views. */
+static BOOL vp_output_format_ok(DXGI_FORMAT f) {
+  return f != DXGI_FORMAT_Y410 && f != DXGI_FORMAT_Y416 && f != DXGI_FORMAT_YUY2 && f != DXGI_FORMAT_Y210 && f != DXGI_FORMAT_Y216;
+}
 /* The formats the processor reads and writes (the kernel's VpFormat). */
 static BOOL vp_format_ok(DXGI_FORMAT f) {
   return vp_yuv(f) || f == DXGI_FORMAT_B8G8R8A8_UNORM || f == DXGI_FORMAT_B8G8R8X8_UNORM || f == DXGI_FORMAT_R8G8B8A8_UNORM || f == DXGI_FORMAT_R10G10B10A2_UNORM ||
@@ -656,7 +697,7 @@ static HRESULT STDMETHODCALLTYPE venum_GetVideoProcessorContentDesc(VideoEnum *e
 static HRESULT STDMETHODCALLTYPE venum_CheckVideoProcessorFormat(VideoEnum *e, DXGI_FORMAT format, UINT *flags) {
   (void)e;
   if (!flags) return E_INVALIDARG;
-  *flags = vp_format_ok(format) ? D3D11_VIDEO_PROCESSOR_FORMAT_SUPPORT_INPUT | D3D11_VIDEO_PROCESSOR_FORMAT_SUPPORT_OUTPUT : 0;
+  *flags = vp_format_ok(format) ? D3D11_VIDEO_PROCESSOR_FORMAT_SUPPORT_INPUT | (vp_output_format_ok(format) ? D3D11_VIDEO_PROCESSOR_FORMAT_SUPPORT_OUTPUT : 0) : 0;
   return S_OK;
 }
 /* What the processor does (see video.inc's head): range and matrix conversions; alpha fill, rotation, planar alpha, mirroring, the shader usage hint. Progressive input
@@ -698,7 +739,7 @@ static HRESULT STDMETHODCALLTYPE venum_CheckVideoProcessorFormatConversion(Video
   *supported = FALSE;
   EnterCriticalSection(&d->lock);
   VideoState *v = video_state(d);
-  if (v && vp_format_ok(in_format) && vp_format_ok(out_format)) {
+  if (v && vp_format_ok(in_format) && vp_format_ok(out_format) && vp_output_format_ok(out_format)) {
     D3D12_FEATURE_DATA_VIDEO_PROCESS_SUPPORT s;
     memset(&s, 0, sizeof s);
     s.InputSample.Width = e->desc.InputWidth;
@@ -792,7 +833,10 @@ static HRESULT STDMETHODCALLTYPE vdev_CreateVideoProcessorInputView(ID3D11VideoD
   if (desc->FourCC) {
 #define VIDEO_FOURCC(a, b, c, e) ((UINT)(BYTE)(a) | (UINT)(BYTE)(b) << 8 | (UINT)(BYTE)(c) << 16 | (UINT)(BYTE)(e) << 24)
     static const struct { UINT fourcc; DXGI_FORMAT format; } names[] = {{VIDEO_FOURCC('N', 'V', '1', '2'), DXGI_FORMAT_NV12}, {VIDEO_FOURCC('P', '0', '1', '0'), DXGI_FORMAT_P010},
-                                                                       {VIDEO_FOURCC('P', '0', '1', '6'), DXGI_FORMAT_P016}};
+                                                                       {VIDEO_FOURCC('P', '0', '1', '6'), DXGI_FORMAT_P016}, {VIDEO_FOURCC('A', 'Y', 'U', 'V'), DXGI_FORMAT_AYUV},
+                                                                       {VIDEO_FOURCC('Y', '4', '1', '0'), DXGI_FORMAT_Y410}, {VIDEO_FOURCC('Y', '4', '1', '6'), DXGI_FORMAT_Y416},
+                                                                       {VIDEO_FOURCC('Y', 'U', 'Y', '2'), DXGI_FORMAT_YUY2}, {VIDEO_FOURCC('Y', '2', '1', '0'), DXGI_FORMAT_Y210},
+                                                                       {VIDEO_FOURCC('Y', '2', '1', '6'), DXGI_FORMAT_Y216}};
 #undef VIDEO_FOURCC
     BOOL match = FALSE;
     for (UINT i = 0; i < sizeof names / sizeof names[0]; ++i) match |= names[i].fourcc == desc->FourCC && names[i].format == t->desc.Format;
@@ -815,7 +859,8 @@ static HRESULT STDMETHODCALLTYPE vdev_CreateVideoProcessorOutputView(ID3D11Video
   Tex *t = tex_of_resource(resource);
   VideoEnum *e = venum_of(enumerator);
   if (out) *out = NULL;
-  if (!t || !e || !desc || !out || !vp_texture_ok(t) || !vp_format_ok(t->desc.Format) || !(t->desc.BindFlags & D3D11_BIND_RENDER_TARGET)) return E_INVALIDARG;
+  if (!t || !e || !desc || !out || !vp_texture_ok(t) || !vp_format_ok(t->desc.Format) || !vp_output_format_ok(t->desc.Format) || !(t->desc.BindFlags & D3D11_BIND_RENDER_TARGET))
+    return E_INVALIDARG;
   UINT mip, slice;
   if (desc->ViewDimension == D3D11_VPOV_DIMENSION_TEXTURE2D) {
     mip = desc->Texture2D.MipSlice;
@@ -893,8 +938,10 @@ static HRESULT STDMETHODCALLTYPE vdev_GetVideoDecoderCaps(ID3D11VideoDevice2 *p,
   if (!codec) return E_INVALIDARG;
   BOOL any = FALSE;
   EnterCriticalSection(&d->lock);
-  for (UINT f = 0; f < 2 && !any; ++f) {
-    const D3D11_VIDEO_DECODER_DESC desc = {*profile, width, height, f ? DXGI_FORMAT_P010 : DXGI_FORMAT_NV12};
+  static const DXGI_FORMAT outputs[] = {DXGI_FORMAT_NV12, DXGI_FORMAT_P010, DXGI_FORMAT_P016, DXGI_FORMAT_AYUV, DXGI_FORMAT_Y410, DXGI_FORMAT_Y416, DXGI_FORMAT_YUY2,
+                                        DXGI_FORMAT_Y210, DXGI_FORMAT_Y216};
+  for (UINT f = 0; f < sizeof outputs / sizeof outputs[0] && !any; ++f) {
+    const D3D11_VIDEO_DECODER_DESC desc = {*profile, width, height, outputs[f]};
     any = video_desc_supported(d, &desc);
   }
   LeaveCriticalSection(&d->lock);
@@ -1129,7 +1176,14 @@ static void vdec_status_push(VideoDecoder *v, const D3D12_QUERY_DATA_VIDEO_DECOD
   VideoStatus s;
   memset(&s, 0, sizeof s);
   const BYTE *pp = v->picture.data;
-  if (v->picture.size >= k->pp_feedback + 4) memcpy(&s.feedback, pp + k->pp_feedback, 4);
+  if (k->status == VSTATUS_VC1) {
+    if (v->picture.size >= k->pp_feedback + 2) s.feedback = (UINT)pp[k->pp_feedback] << 8 | pp[k->pp_feedback + 1];      /* (bPicScanFixed, bPicScanMethod) */
+  } else if (k->status == VSTATUS_MPEG4) {
+    USHORT n16;
+    if (v->picture.size >= k->pp_feedback + 2) { memcpy(&n16, pp + k->pp_feedback, 2); s.feedback = n16; }
+  } else if (v->picture.size >= k->pp_feedback + 4) {
+    memcpy(&s.feedback, pp + k->pp_feedback, 4);
+  }
   if (v->picture.size > k->pp_curr) s.curr = pp[k->pp_curr];
   if (k->status == VSTATUS_H264 && v->picture.size >= offsetof(DXVA_PicParams_H264, wBitFields) + 2) {
     USHORT bits;
@@ -1263,6 +1317,13 @@ static HRESULT STDMETHODCALLTYPE vctx_DecoderExtension(ID3D11VideoContext3 *p, I
         r.bBufType = 0xFF;
         r.bStatus = s->status;
         r.wNumMbsAffected = s->macroblocks;
+        memcpy(at, &r, sizeof r);
+        break;
+      }
+      case VSTATUS_VC1:
+      case VSTATUS_MPEG4: {
+        /* (bPicStructure 3: the decoder takes frames only; wDeblockedPictureIndex is the decoded picture: no post-processing) */
+        VideoStatusVc1 r = {(USHORT)s->feedback, s->curr, s->curr, 3, 0xFF, s->status, 0, s->macroblocks};
         memcpy(at, &r, sizeof r);
         break;
       }
@@ -1687,7 +1748,11 @@ static HRESULT STDMETHODCALLTYPE vctx_VideoProcessorGetBehaviorHints(ID3D11Video
 
 /* Whether the processor below takes a subresource of a texture as it is: a planar texture's slice, or a 2D texture of one level (not an array, not drawn through a target
  * of its own). Any other is processed by way of a copy (vp_scratch). */
-static BOOL vp_direct(const Tex *t) { return t->planar || (t->desc.MipLevels == 1 && t->desc.ArraySize == 1 && t->kind == 0 && !t->shadowed && t->stored == t->desc.Format); }
+static BOOL vp_direct(const Tex *t) {
+  return t->planar || (t->fmt->flags & FMT_YUV) || (t->desc.MipLevels == 1 && t->desc.ArraySize == 1 && t->kind == 0 && !t->shadowed && t->stored == t->desc.Format);
+}
+/* The Direct3D 12 subresource a slice of a texture the processor takes as it is: a planar or packed YUV texture's slice (each an image of its own below), else 0. */
+static UINT vp_direct_sub(const Tex *t, UINT slice) { return t->planar || (t->fmt->flags & FMT_YUV) ? slice : 0; }
 /* A texture of one level and slice the size of a subresource of `t` (in its format), holding what the subresource has when `load`. */
 static HRESULT vp_scratch(Dev *d, Tex *t, UINT sub, BOOL load, Tex **out) {
   *out = NULL;
@@ -1864,7 +1929,7 @@ static HRESULT STDMETHODCALLTYPE vctx_VideoProcessorBlt(ID3D11VideoContext3 *p, 
       if (k < ninputs) {
         Tex *t = in_scratch[k] ? in_scratch[k] : inputs[k]->tex;
         ia[k].InputStream[0].pTexture2D = t->res;
-        ia[k].InputStream[0].Subresource = in_scratch[k] ? 0 : t->planar ? inputs[k]->slice : 0;
+        ia[k].InputStream[0].Subresource = in_scratch[k] ? 0 : vp_direct_sub(t, inputs[k]->slice);
       } else {
         /* (the background-only stream: empty rectangles of a picture of its own) */
         ia[k].InputStream[0].pTexture2D = nothing->res;
@@ -1875,7 +1940,7 @@ static HRESULT STDMETHODCALLTYPE vctx_VideoProcessorBlt(ID3D11VideoContext3 *p, 
     memset(&oa, 0, sizeof oa);
     Tex *target = out_scratch ? out_scratch : out_tex;
     oa.OutputStream[0].pTexture2D = target->res;
-    oa.OutputStream[0].Subresource = out_scratch ? 0 : target->planar ? ov->slice : 0;
+    oa.OutputStream[0].Subresource = out_scratch ? 0 : vp_direct_sub(target, ov->slice);
     const RECT whole = {0, 0, (LONG)ow, (LONG)oh};
     const RECT tr = vp_clip(v->target_enable ? v->target : whole, ow, oh);
     oa.TargetRectangle = (D3D12_RECT){tr.left, tr.top, tr.right, tr.bottom};

@@ -186,7 +186,10 @@ struct VideoDecoderDesc {
   uint32_t profile = 0;        // hardware::DxvaProfile
   uint32_t width = 0, height = 0;
   uint32_t surfaces = 0;       // how many surface indices the pictures may name (1 .. 128)
-  uint32_t ten_bit = 0;        // 1: P010 output, 0: NV12
+  // The surfaces' format (hardware::DxvaSurfaceFormat): 0 NV12, 1 P010, 2 P016 - two planes as above (P016's samples 12- or 16-bit, in the top bits) - or a packed format
+  // in one image (the chroma plane is kNoAllocation): 3 AYUV and 6 YUY2 in A8B8G8R8 (or X8B8G8R8) pixels, 4 Y410 in A2B10G10R10, 5 Y416 and 7 Y210 / 8 Y216 in
+  // A16B16G16R16. The 4:2:2 ones (YUY2, Y210, Y216) are images of pairs of pixels: half the surface's width, rounded up.
+  uint32_t surface_format = 0;
 };
 // What DecodeFrame writes to its status place (a D3D12_QUERY_DATA_VIDEO_DECODE_STATISTICS's first fields): `status` 0 the picture decoded, 1 decoded with a reference
 // missing (D3D12_VIDEO_DECODE_STATUS_CONTINUE_WITH_ERROR), 2 not decoded (CONTINUE_SKIP_DISPLAY: the buffers were invalid or need what the decoder has not);

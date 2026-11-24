@@ -28,7 +28,10 @@
 
 /* ---- the profiles ------------------------------------------------------------------------------------------------------------------------------------------------ */
 
-typedef struct VideoProfile { const GUID *guid; UINT kernel; DXGI_FORMAT formats[2]; UINT nformats; } VideoProfile;
+typedef struct VideoProfile { const GUID *guid; UINT kernel; DXGI_FORMAT formats[4]; UINT nformats; } VideoProfile;
+/* (MPEG-4 Part 2 Advanced Simple with GMC: d3d12video.h names no such profile, but it is DXVA's - D3D11_DECODER_PROFILE_MPEG4PT2_VLD_ADVSIMPLE_GMC,
+ * DXVA_ModeMPEG4pt2_VLD_AdvSimple_GMC - and Direct3D 11's decoders of it are made on this one) */
+static const GUID g_video_profile_mpeg4pt2_advsimple_gmc = {0xab998b5b, 0x4258, 0x44a9, {0x9f, 0xeb, 0x94, 0xe5, 0x97, 0xa6, 0xba, 0xae}};
 /* (`kernel` is hardware::DxvaProfile) */
 static const VideoProfile g_video_profiles[] = {
     {&D3D12_VIDEO_DECODE_PROFILE_H264, 0, {DXGI_FORMAT_NV12}, 1},
@@ -38,7 +41,43 @@ static const VideoProfile g_video_profiles[] = {
     {&D3D12_VIDEO_DECODE_PROFILE_VP9_10BIT_PROFILE2, 4, {DXGI_FORMAT_P010}, 1},
     {&D3D12_VIDEO_DECODE_PROFILE_HEVC_MAIN, 5, {DXGI_FORMAT_NV12}, 1},
     {&D3D12_VIDEO_DECODE_PROFILE_AV1_PROFILE0, 6, {DXGI_FORMAT_NV12, DXGI_FORMAT_P010}, 2},
+    {&D3D12_VIDEO_DECODE_PROFILE_VC1, 7, {DXGI_FORMAT_NV12}, 1},
+    {&D3D12_VIDEO_DECODE_PROFILE_VC1_D2010, 8, {DXGI_FORMAT_NV12}, 1},
+    {&D3D12_VIDEO_DECODE_PROFILE_MPEG4PT2_SIMPLE, 9, {DXGI_FORMAT_NV12}, 1},
+    {&D3D12_VIDEO_DECODE_PROFILE_MPEG4PT2_ADVSIMPLE_NOGMC, 10, {DXGI_FORMAT_NV12}, 1},
+    {&g_video_profile_mpeg4pt2_advsimple_gmc, 11, {DXGI_FORMAT_NV12}, 1},
+    /* (AV1 High: 4:4:4 of 8 and 10 bits; Professional: 4:2:2 of 8 and 10 bits and monochrome, and of 12 bits 4:2:2 / 4:4:4 or 4:2:0 / monochrome - the formats Windows'
+     * decoders write them in) */
+    {&D3D12_VIDEO_DECODE_PROFILE_AV1_PROFILE1, 12, {DXGI_FORMAT_AYUV, DXGI_FORMAT_Y410}, 2},
+    {&D3D12_VIDEO_DECODE_PROFILE_AV1_PROFILE2, 13, {DXGI_FORMAT_YUY2, DXGI_FORMAT_Y210, DXGI_FORMAT_NV12, DXGI_FORMAT_P010}, 4},
+    {&D3D12_VIDEO_DECODE_PROFILE_AV1_12BIT_PROFILE2, 14, {DXGI_FORMAT_Y216, DXGI_FORMAT_Y416}, 2},
+    {&D3D12_VIDEO_DECODE_PROFILE_AV1_12BIT_PROFILE2_420, 15, {DXGI_FORMAT_P016}, 1},
+    {&D3D12_VIDEO_DECODE_PROFILE_HEVC_MAIN10, 16, {DXGI_FORMAT_P010}, 1},
 };
+/* The kernel's surface format of a decoder's output (hardware::DxvaSurfaceFormat; DxgTypes.hpp VideoDecoderDesc::surface_format). */
+static UINT video_surface_format(DXGI_FORMAT f) {
+  switch (f) {
+    case DXGI_FORMAT_P010: return 1;
+    case DXGI_FORMAT_P016: return 2;
+    case DXGI_FORMAT_AYUV: return 3;
+    case DXGI_FORMAT_Y410: return 4;
+    case DXGI_FORMAT_Y416: return 5;
+    case DXGI_FORMAT_YUY2: return 6;
+    case DXGI_FORMAT_Y210: return 7;
+    case DXGI_FORMAT_Y216: return 8;
+    default: return 0;      /* NV12 */
+  }
+}
+/* The bytes of a pixel of a decoder's output, both planes (for the heap size estimate). */
+static UINT64 video_surface_bytes(DXGI_FORMAT f, UINT64 pixels) {
+  switch (f) {
+    case DXGI_FORMAT_NV12: return pixels * 3 / 2;
+    case DXGI_FORMAT_P010: case DXGI_FORMAT_P016: return pixels * 3;
+    case DXGI_FORMAT_YUY2: case DXGI_FORMAT_Y410: case DXGI_FORMAT_AYUV: return pixels * (f == DXGI_FORMAT_YUY2 ? 2 : 4);
+    case DXGI_FORMAT_Y210: case DXGI_FORMAT_Y216: return pixels * 4;
+    default: return pixels * 8;      /* Y416 */
+  }
+}
 #define VIDEO_PROFILES (sizeof g_video_profiles / sizeof g_video_profiles[0])
 enum { ESC_CREATE_VIDEO_DECODER = 15, ESC_DESTROY_VIDEO_DECODER = 16, ESC_QUERY_VIDEO_DECODE_SUPPORT = 17 };
 
@@ -54,13 +93,14 @@ static int video_decode_supported(Dev *d, const D3D12_VIDEO_DECODE_CONFIGURATION
   int known = 0;
   for (UINT i = 0; i < p->nformats; ++i) known |= p->formats[i] == format;
   if (!known || width == 0 || height == 0) return 0;
-  UINT request[5] = {ESC_QUERY_VIDEO_DECODE_SUPPORT, p->kernel, format == DXGI_FORMAT_P010 ? 1u : 0u, width, height}, reply[1] = {0};
+  UINT request[5] = {ESC_QUERY_VIDEO_DECODE_SUPPORT, p->kernel, video_surface_format(format), width, height}, reply[1] = {0};
   return KMT_OK(dev_escape(d, request, 5, reply, 1)) && reply[0] == 1;
 }
 
 /* ---- the video processor's formats and colour spaces (Hardware/VideoCodec/VideoProcess.hpp) ----------------------------------------------------------------------- */
 
-enum { VP_NV12, VP_P010, VP_P016, VP_BGRA8, VP_BGRX8, VP_RGBA8, VP_RGB10A2, VP_RGBA16F };
+enum { VP_NV12, VP_P010, VP_P016, VP_BGRA8, VP_BGRX8, VP_RGBA8, VP_RGB10A2, VP_RGBA16F, VP_AYUV, VP_Y410, VP_Y416, VP_YUY2, VP_Y210, VP_Y216, VP_P208 };
+static int vp_yuv(int v) { return v == VP_NV12 || v == VP_P010 || v == VP_P016 || v >= VP_AYUV; }
 static int vp_format(DXGI_FORMAT f) {
   switch (f) {
     case DXGI_FORMAT_NV12: return VP_NV12;
@@ -71,6 +111,13 @@ static int vp_format(DXGI_FORMAT f) {
     case DXGI_FORMAT_R8G8B8A8_UNORM: return VP_RGBA8;
     case DXGI_FORMAT_R10G10B10A2_UNORM: return VP_RGB10A2;
     case DXGI_FORMAT_R16G16B16A16_FLOAT: return VP_RGBA16F;
+    case DXGI_FORMAT_AYUV: return VP_AYUV;
+    case DXGI_FORMAT_Y410: return VP_Y410;
+    case DXGI_FORMAT_Y416: return VP_Y416;
+    case DXGI_FORMAT_YUY2: return VP_YUY2;
+    case DXGI_FORMAT_Y210: return VP_Y210;
+    case DXGI_FORMAT_Y216: return VP_Y216;
+    case DXGI_FORMAT_P208: return VP_P208;
     default: return -1;
   }
 }
@@ -78,7 +125,7 @@ static int vp_format(DXGI_FORMAT f) {
 static int vp_space_ok(DXGI_FORMAT f, DXGI_COLOR_SPACE_TYPE s) {
   const int v = vp_format(f);
   if (v < 0) return 0;
-  if (v <= VP_P016)
+  if (vp_yuv(v))
     return s == DXGI_COLOR_SPACE_YCBCR_FULL_G22_NONE_P709_X601 || s == DXGI_COLOR_SPACE_YCBCR_STUDIO_G22_LEFT_P601 || s == DXGI_COLOR_SPACE_YCBCR_FULL_G22_LEFT_P601 ||
            s == DXGI_COLOR_SPACE_YCBCR_STUDIO_G22_LEFT_P709 || s == DXGI_COLOR_SPACE_YCBCR_FULL_G22_LEFT_P709 || s == DXGI_COLOR_SPACE_YCBCR_STUDIO_G22_LEFT_P2020 ||
            s == DXGI_COLOR_SPACE_YCBCR_FULL_G22_LEFT_P2020 || s == DXGI_COLOR_SPACE_YCBCR_STUDIO_G22_TOPLEFT_P2020 || s == DXGI_COLOR_SPACE_YCBCR_STUDIO_G24_LEFT_P709 ||
@@ -230,7 +277,7 @@ static HRESULT STDMETHODCALLTYPE vdev_CheckFeatureSupport(ID3D12VideoDevice3 *v,
       if (!video_decode_supported(d, &h->Configuration, h->Format, h->DecodeWidth, h->DecodeHeight)) return E_INVALIDARG;
       /* (the kernel keeps the pictures the decoder needs: about a frame for each picture of the buffer, in system memory) */
       f->MemoryPoolL0Size = 0;
-      f->MemoryPoolL1Size = (UINT64)h->DecodeWidth * h->DecodeHeight * 3 / 2 * (h->MaxDecodePictureBufferCount + 1) * (h->Format == DXGI_FORMAT_P010 ? 2 : 1);
+      f->MemoryPoolL1Size = video_surface_bytes(h->Format, (UINT64)h->DecodeWidth * h->DecodeHeight) * (h->MaxDecodePictureBufferCount + 1);
       return S_OK;
     }
     case D3D12_FEATURE_VIDEO_DECODER_HEAP_SIZE1: {
@@ -239,7 +286,7 @@ static HRESULT STDMETHODCALLTYPE vdev_CheckFeatureSupport(ID3D12VideoDevice3 *v,
       const D3D12_VIDEO_DECODER_HEAP_DESC *h = &f->VideoDecoderHeapDesc;
       if (f->Protected || !video_decode_supported(d, &h->Configuration, h->Format, h->DecodeWidth, h->DecodeHeight)) return E_INVALIDARG;
       f->MemoryPoolL0Size = 0;
-      f->MemoryPoolL1Size = (UINT64)h->DecodeWidth * h->DecodeHeight * 3 / 2 * (h->MaxDecodePictureBufferCount + 1) * (h->Format == DXGI_FORMAT_P010 ? 2 : 1);
+      f->MemoryPoolL1Size = video_surface_bytes(h->Format, (UINT64)h->DecodeWidth * h->DecodeHeight) * (h->MaxDecodePictureBufferCount + 1);
       return S_OK;
     }
     case D3D12_FEATURE_VIDEO_PROCESS_SUPPORT: {
@@ -362,7 +409,7 @@ static HRESULT vdheap_make(Dev *d, const D3D12_VIDEO_DECODER_HEAP_DESC *desc, ID
   if (surfaces < 17) surfaces = 17;
   if (surfaces > 128) surfaces = 128;
   const VideoProfile *p = video_profile(&desc->Configuration.DecodeProfile);
-  UINT request[6] = {ESC_CREATE_VIDEO_DECODER, p->kernel, desc->DecodeWidth, desc->DecodeHeight, surfaces, desc->Format == DXGI_FORMAT_P010 ? 1u : 0u}, reply[1] = {0};
+  UINT request[6] = {ESC_CREATE_VIDEO_DECODER, p->kernel, desc->DecodeWidth, desc->DecodeHeight, surfaces, video_surface_format(desc->Format)}, reply[1] = {0};
   const NTSTATUS st = dev_escape(d, request, 6, reply, 1);
   if (!KMT_OK(st)) { dx_Release(OBJ(h)); return hr_from(st); }
   h->kdec = reply[0];
@@ -506,8 +553,12 @@ static UINT video_args_buffer(CmdList *l, const D3D12_VIDEO_DECODE_INPUT_STREAM_
   l->temps[l->ntemps++] = alloc;
   return alloc;
 }
-/* The luma plane allocation of a planar texture's slice `sub` (0: not one). */
-static UINT video_luma(Resource *r, UINT sub) { return r && r->planes && sub < r->layers ? r->plane_alloc[sub] : 0; }
+/* The luma plane allocation of a planar texture's slice `sub` - a packed YUV texture's one allocation of that slice (0: not one). */
+static UINT video_luma(Resource *r, UINT sub) {
+  if (!r || sub >= r->layers) return 0;
+  if (r->planes) return r->plane_alloc[sub];
+  return format_packed_yuv(r->desc.Format) && sub == 0 ? r->alloc : 0;
+}
 
 static void video_decode(CmdList *l, ID3D12VideoDecoder *decoder, ID3D12Resource *output, UINT sub, const D3D12_VIDEO_DECODE_INPUT_STREAM_ARGUMENTS *in) {
   VDec *dec = (VDec *)decoder;
@@ -516,7 +567,7 @@ static void video_decode(CmdList *l, ID3D12VideoDecoder *decoder, ID3D12Resource
   VDHeap *heap = (VDHeap *)in->pHeap;
   Resource *bits = (Resource *)in->CompressedBitstream.pBuffer;
   /* (the heap's profile is the decoder's; the output a slice of a texture of the heap's format) */
-  if (!heap || !heap->kdec || !guid_eq(&heap->desc.Configuration.DecodeProfile, &dec->desc.Configuration.DecodeProfile) || !out->planes || out->desc.Format != heap->desc.Format ||
+  if (!heap || !heap->kdec || !guid_eq(&heap->desc.Configuration.DecodeProfile, &dec->desc.Configuration.DecodeProfile) || !video_luma(out, sub) || out->desc.Format != heap->desc.Format ||
       sub >= out->layers || !bits || bits->desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER || in->CompressedBitstream.Offset > bits->desc.Width ||
       in->CompressedBitstream.Size > bits->desc.Width - in->CompressedBitstream.Offset || in->CompressedBitstream.Offset > 0xFFFFFFFFu || in->CompressedBitstream.Size > 0xFFFFFFFFu ||
       in->ReferenceFrames.NumTexture2Ds > 128)
@@ -533,8 +584,9 @@ static void video_decode(CmdList *l, ID3D12VideoDecoder *decoder, ID3D12Resource
   words[8] = alloc_index(l, bits->alloc);
   words[9] = (UINT)in->CompressedBitstream.Offset;
   words[10] = (UINT)in->CompressedBitstream.Size;
-  words[11] = alloc_index(l, out->plane_alloc[sub]);
-  words[12] = alloc_index(l, out->plane_alloc[out->layers + sub]);
+  words[11] = alloc_index(l, video_luma(out, sub));
+  /* (a packed format - AYUV, Y410, Y416, YUY2, Y210, Y216 - is one image) */
+  words[12] = format_packed_yuv(out->desc.Format) ? 0xFFFFFFFFu : alloc_index(l, out->plane_alloc[out->layers + sub]);
   words[13] = 0xFFFFFFFFu;      /* status: none (EndQuery points it at a query) */
   words[14] = 0;
   words[15] = 1;                /* (the current picture is known by its output) */
@@ -567,8 +619,16 @@ static void STDMETHODCALLTYPE vdlist_DecodeFrame1(CmdList *l, ID3D12VideoDecoder
 /* The planes of a picture for the kernel's VideoProcess: a planar texture's slice (both planes), or a 2D RGB texture of one level. 0: not one the processor takes. */
 static int video_planes(CmdList *l, Resource *r, UINT sub, UINT *p0, UINT *p1) {
   if (!r) return 0;
+  if (format_packed_yuv(r->desc.Format)) {
+    /* (a packed YUV texture: one image a slice) */
+    const UINT a = video_luma(r, sub);
+    if (!a) return 0;
+    *p0 = alloc_index(l, a);
+    *p1 = 0xFFFFFFFFu;
+    return 1;
+  }
   if (r->planes) {
-    if (sub >= r->layers) return 0;
+    if (sub >= r->layers || r->planes != 2) return 0;      /* (V208 / V408: not the processor's) */
     *p0 = alloc_index(l, r->plane_alloc[sub]);
     *p1 = alloc_index(l, r->plane_alloc[r->layers + sub]);
     return 1;
@@ -590,7 +650,7 @@ static void video_process(CmdList *l, VProc *p, const D3D12_VIDEO_PROCESS_OUTPUT
   w[n++] = p->out.ColorSpace;
   w[n++] = (UINT)out->TargetRectangle.left; w[n++] = (UINT)out->TargetRectangle.top; w[n++] = (UINT)out->TargetRectangle.right; w[n++] = (UINT)out->TargetRectangle.bottom;
   for (UINT c = 0; c < 4; ++c) w[n++] = float_word(p->out.BackgroundColor[c]);
-  w[n++] = vp_format(p->out.Format) <= VP_P016 ? 1u : 0u;      /* (the background is in the output's colour space) */
+  w[n++] = vp_yuv(vp_format(p->out.Format)) ? 1u : 0u;      /* (the background is in the output's colour space) */
   w[n++] = (UINT)p->out.AlphaFillMode;
   w[n++] = p->out.AlphaFillModeSourceStreamIndex;
   if (!video_planes(l, (Resource *)out->OutputStream[0].pTexture2D, out->OutputStream[0].Subresource, &w[n], &w[n + 1])) return;

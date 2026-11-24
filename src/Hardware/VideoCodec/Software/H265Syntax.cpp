@@ -272,7 +272,8 @@ bool Core::parse_sps(BitReader& br) {
   }
   s.bit_depth_luma = static_cast<int>(br.ue()) + 8;
   s.bit_depth_chroma = static_cast<int>(br.ue()) + 8;
-  // Up to ten bits (Main 10). Pictures deeper than eight bits are only decoded by an offload (IOffload): the Core itself has eight-bit pixel paths only.
+  // Up to ten bits (Main 10, Main 10 Still Picture), each component on its own. The sample paths take any depth up to 12 bits, but deeper streams are range extension
+  // profiles (Main 12 and up), whose SPS / PPS range extension (extended precision, persistent Rice adaptation, ...) is not read here: they are refused.
   if (s.bit_depth_luma > 10 || s.bit_depth_chroma > 10) return H265_FALSE;
   const uint32_t poc_bits = br.ue() + 4;
   if (poc_bits > 16) return H265_FALSE;
@@ -582,7 +583,7 @@ bool Core::parse_slice_header(BitReader& br, int nal_type, int temporal_id, Slic
       sh.max_num_merge_cand = merge;
     }
     sh.slice_qp = pps.init_qp + br.se();
-    if (sh.slice_qp < -0 || sh.slice_qp > 51) return H265_FALSE;
+    if (sh.slice_qp < -6 * (sps.bit_depth_luma - 8) || sh.slice_qp > 51) return H265_FALSE;   // (-QpBdOffsetY .. 51)
     if (pps.slice_chroma_qp_offsets_present) {
       sh.cb_qp_offset = br.se();
       sh.cr_qp_offset = br.se();

@@ -262,26 +262,30 @@ void Core::read_sao(int rx, int ry) {
       p.type[2] = p.type[1];
     }
     if (p.type[c] == 0) continue;
+    // sao_offset_abs: TR with cMax (1 << (Min(bitDepth, 10) - 5)) - 1 (7 at 8 bits, 31 at 10); SaoOffsetVal is it << (bitDepth - Min(bitDepth, 10)) (7.4.9.3.2)
+    const int bd = c == 0 ? bd_y_ : bd_c_;
+    const int bd10 = bd < 10 ? bd : 10;
+    const int c_max = (1 << (bd10 - 5)) - 1, scale = bd - bd10;
     int abs_offset[4];
     for (int i = 0; i < 4; ++i) {
       int v = 0;
-      while (v < 7 && cabac_.bypass()) ++v;   // TR with cMax (1 << (min(bitDepth, 10) - 5)) - 1 = 7
-      abs_offset[i] = v;
+      while (v < c_max && cabac_.bypass()) ++v;
+      abs_offset[i] = v << scale;
     }
     if (p.type[c] == 1) {
       int sign[4] = {0, 0, 0, 0};
       for (int i = 0; i < 4; ++i)
         if (abs_offset[i] != 0) sign[i] = cabac_.bypass();
       p.band_position[c] = static_cast<uint8_t>(cabac_.bypass_bits(5));
-      for (int i = 0; i < 4; ++i) p.offset[c][i] = static_cast<int8_t>(sign[i] ? -abs_offset[i] : abs_offset[i]);
+      for (int i = 0; i < 4; ++i) p.offset[c][i] = static_cast<int16_t>(sign[i] ? -abs_offset[i] : abs_offset[i]);
     } else {
       if (c == 0) p.eo_class[0] = static_cast<uint8_t>(cabac_.bypass_bits(2));
       else if (c == 1) p.eo_class[1] = static_cast<uint8_t>(cabac_.bypass_bits(2));
       else p.eo_class[2] = p.eo_class[1];
-      p.offset[c][0] = static_cast<int8_t>(abs_offset[0]);
-      p.offset[c][1] = static_cast<int8_t>(abs_offset[1]);
-      p.offset[c][2] = static_cast<int8_t>(-abs_offset[2]);
-      p.offset[c][3] = static_cast<int8_t>(-abs_offset[3]);
+      p.offset[c][0] = static_cast<int16_t>(abs_offset[0]);
+      p.offset[c][1] = static_cast<int16_t>(abs_offset[1]);
+      p.offset[c][2] = static_cast<int16_t>(-abs_offset[2]);
+      p.offset[c][3] = static_cast<int16_t>(-abs_offset[3]);
     }
   }
   (void)sps;
@@ -338,22 +342,22 @@ void Core::set_qp_block(int x0, int y0, int w, int h, int qp) {
     for (int x = x0 >> 2; x < (x0 + w) >> 2; ++x) qp_map_[static_cast<uint64_t>(y) * w4_ + x] = static_cast<int8_t>(qp);
 }
 
-// QpY of the coding unit (8-283), from the group's prediction and the delta decoded so far.
+// QpY of the coding unit (8-283), from the group's prediction and the delta decoded so far: ((qPY_PRED + CuQpDeltaVal + 52 + 2 * QpBdOffsetY) % (52 + QpBdOffsetY)) -
+// QpBdOffsetY, which is -QpBdOffsetY .. 51.
 void Core::update_qp(int x_cb, int y_cb) {
-  // (the delta is limited to -26 .. 25 by the standard; a damaged stream may say more, which must not give a negative quantiser)
-  cu_qp_delta_val_ = clip3(-26, 25, cu_qp_delta_val_);
-  qp_y_ = (((qg_pred_ + cu_qp_delta_val_) % 52) + 52) % 52;
+  // (the delta is limited to -(26 + QpBdOffsetY / 2) .. 25 + QpBdOffsetY / 2 by the standard; a damaged stream may say more, which must not leave the range)
+  cu_qp_delta_val_ = clip3(-(26 + qp_bd_y_ / 2), 25 + qp_bd_y_ / 2, cu_qp_delta_val_);
+  qp_y_ = ((qg_pred_ + cu_qp_delta_val_ + 52 + 2 * qp_bd_y_) % (52 + qp_bd_y_)) - qp_bd_y_;
   set_qp_block(x_cb, y_cb, 1 << cur_cb_log2_, 1 << cur_cb_log2_, qp_y_);
 }
 
-// 8.6.1: the quantiser of a chroma block
+// 8.6.1: the quantiser of a chroma block, Qp'C = qPC + QpBdOffsetC with qPC from Table 8-10 for qPi = Clip3(-QpBdOffsetC, 57, QpY + the offsets)
 int Core::chroma_qp(int c_idx) const {
   static const int kQpC[14] = {29, 30, 31, 32, 33, 33, 34, 34, 35, 35, 36, 36, 37, 37};
   const int offset = c_idx == 1 ? pp_->cb_qp_offset + slice_->cb_qp_offset : pp_->cr_qp_offset + slice_->cr_qp_offset;
-  const int qpi = clip3(0, 57, qp_y_ + offset);
-  if (qpi < 30) return qpi;
-  if (qpi >= 43) return qpi - 6;
-  return kQpC[qpi - 30];
+  const int qpi = clip3(-qp_bd_c_, 57, qp_y_ + offset);
+  const int qpc = qpi < 30 ? qpi : qpi >= 43 ? qpi - 6 : kQpC[qpi - 30];
+  return qpc + qp_bd_c_;
 }
 
 void Core::coding_unit(int x0, int y0, int log2_size) {
@@ -544,16 +548,29 @@ void Core::coding_unit(int x0, int y0, int log2_size) {
 }
 
 void Core::read_pcm(int x0, int y0, int log2_size) {
+  if (cur_->deep) read_pcm_px<uint16_t>(x0, y0, log2_size);
+  else read_pcm_px<uint8_t>(x0, y0, log2_size);
+}
+
+// 7.3.8.7 / 8.4.4.1: PCM samples of PcmBitDepth bits, scaled to the picture's bit depth (<< (BitDepth - PcmBitDepth)).
+template <typename Pel>
+void Core::read_pcm_px(int x0, int y0, int log2_size) {
   const Sps& sps = *sp_;
   br_->align();
   const int n = 1 << log2_size;
-  const int shift_y = 8 - sps.pcm_bit_depth_luma, shift_c = 8 - sps.pcm_bit_depth_chroma;
+  const int bd_y = sizeof(Pel) == 1 ? 8 : bd_y_, bd_c = sizeof(Pel) == 1 ? 8 : bd_c_;
+  const int shift_y = bd_y - sps.pcm_bit_depth_luma, shift_c = bd_c - sps.pcm_bit_depth_chroma;
   Picture* p = cur_;
+  const int stride_y = p->stride[0] / static_cast<int>(sizeof(Pel));
+  Pel* luma = samples<Pel>(p->plane[0]);
   for (int y = 0; y < n; ++y)
-    for (int x = 0; x < n; ++x) p->plane[0][static_cast<uint64_t>(y0 + y) * p->stride[0] + x0 + x] = static_cast<uint8_t>(br_->u(sps.pcm_bit_depth_luma) << shift_y);
-  for (int c = 1; c < 3; ++c)
+    for (int x = 0; x < n; ++x) luma[static_cast<uint64_t>(y0 + y) * stride_y + x0 + x] = static_cast<Pel>(br_->u(sps.pcm_bit_depth_luma) << shift_y);
+  for (int c = 1; c < 3; ++c) {
+    const int stride_c = p->stride[c] / static_cast<int>(sizeof(Pel));
+    Pel* chroma = samples<Pel>(p->plane[c]);
     for (int y = 0; y < n / 2; ++y)
-      for (int x = 0; x < n / 2; ++x) p->plane[c][static_cast<uint64_t>(y0 / 2 + y) * p->stride[c] + x0 / 2 + x] = static_cast<uint8_t>(br_->u(sps.pcm_bit_depth_chroma) << shift_c);
+      for (int x = 0; x < n / 2; ++x) chroma[static_cast<uint64_t>(y0 / 2 + y) * stride_c + x0 / 2 + x] = static_cast<Pel>(br_->u(sps.pcm_bit_depth_chroma) << shift_c);
+  }
   cabac_.init_engine();
 }
 
@@ -661,6 +678,13 @@ bool same_motion(const MvField& a, const MvField& b) {
 
 int16_t wrap16(int v) { return static_cast<int16_t>(static_cast<uint16_t>(v & 0xFFFF)); }
 
+// DiffPicOrderCnt(a, b), which a conforming stream keeps within -2^15 .. 2^15 - 1 (8.3.1); order counts handed in from outside (DXVA) may be anything, so the
+// difference is taken without overflow and limited to that range.
+int poc_diff(int a, int b) {
+  const int64_t d = static_cast<int64_t>(a) - b;
+  return static_cast<int>(d < -32768 ? -32768 : d > 32767 ? 32767 : d);
+}
+
 // 8-179 .. 8-182: scaling a motion vector by the ratio of two picture distances
 void scale_mv(int td, int tb, const int16_t in[2], int out[2]) {
   td = clip3(-128, 127, td);
@@ -692,8 +716,8 @@ bool Core::col_mv(const Picture* col, int xcol, int ycol, int ref_idx, int list,
   const bool cur_long = slice_->ref_long[list][ref_idx];
   const bool col_long = (b.long_term >> list_col) & 1;
   if (cur_long != col_long) return false;
-  const int col_diff = col->poc - b.ref_poc[list_col];
-  const int cur_diff = poc_ - slice_->ref_poc[list][ref_idx];
+  const int col_diff = poc_diff(col->poc, b.ref_poc[list_col]);
+  const int cur_diff = poc_diff(poc_, slice_->ref_poc[list][ref_idx]);
   if (cur_long || col_diff == cur_diff || col_diff == 0) {
     mv[0] = b.mv[list_col][0];
     mv[1] = b.mv[list_col][1];
@@ -862,7 +886,7 @@ void Core::amvp(int x_cb, int y_cb, int n_cb, int x_pb, int y_pb, int w, int h, 
       if ((n.pred_flags & (1 << l)) && slice_->ref_long[l][n.ref_idx[l]] == target_long) {
         const int ref_poc_n = slice_->ref_poc[l][n.ref_idx[l]];
         if (!target_long && !slice_->ref_long[l][n.ref_idx[l]]) {
-          scale_mv(poc_ - ref_poc_n, poc_ - target_poc, n.mv[l], mv);
+          scale_mv(poc_diff(poc_, ref_poc_n), poc_diff(poc_, target_poc), n.mv[l], mv);
         } else {
           mv[0] = n.mv[l][0];
           mv[1] = n.mv[l][1];

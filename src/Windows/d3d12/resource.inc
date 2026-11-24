@@ -225,14 +225,14 @@ static void get_footprints(const D3D12_RESOURCE_DESC *d, UINT first, UINT count,
   const FormatInfo *base_fi = format_info(d->Format);
   const UINT bytes = format_bytes(d->Format);
   /* (a planar format: the subresources of plane 1 follow those of plane 0, each plane a footprint of its own format and size) */
-  const UINT plane_subs = base_fi && base_fi->planar ? mips * depth_or_array : 0;
+  const UINT plane_subs = base_fi && base_fi->planar ? mips * depth_or_array : 0;      /* (the subresources of a plane) */
   for (UINT i = 0; i < count; ++i) {
     const UINT sub = first + i;
     const UINT plane = plane_subs ? sub / plane_subs : 0;
     const FormatInfo *fi = plane_format(base_fi, plane);
     const UINT level = sub % mips;
     UINT w = mip_extent((UINT)d->Width, level), h = mip_extent(d->Height, level);
-    if (plane) { w = (w + 1) / 2; h = (h + 1) / 2; }
+    plane_extent(base_fi, plane, &w, &h);
     const UINT depth = d->Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D ? mip_extent(depth_or_array, level) : 1;
     const UINT64 row_size = fi ? format_row_bytes(fi, w) : (UINT64)w * bytes;
     const UINT pitch = (UINT)KALIGN(row_size, 256);
@@ -439,10 +439,24 @@ static HRESULT resource_make_from(Dev *dev, const D3D12_HEAP_PROPERTIES *props, 
     if (fi->planar) {
       /* (NV12, P010, P016: a 2D texture or array of one level, of even width and height (the chroma is half of both), not multisampled, depth, tiled, CPU visible, placed
        * or shared; each plane of each slice is a 2D image of the kernel's, so the slices may be render targets) */
-      if (desc->Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || cube || r->mips != 1 || samples > 1 || want_depth || (desc->Width & 1) || (desc->Height & 1)) { hr = E_INVALIDARG; goto fail; }
+      /* (P208's chroma is half as wide - its width even -, V208's half as high - its height even -, V408's full size) */
+      const int even_w = fi->planar != PLANAR_V208 && fi->planar != PLANAR_V408, even_h = fi->planar != PLANAR_P208 && fi->planar != PLANAR_V408;
+      if (desc->Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || cube || r->mips != 1 || samples > 1 || want_depth || (even_w && (desc->Width & 1)) || (even_h && (desc->Height & 1))) { hr = E_INVALIDARG; goto fail; }
       if (reserved || cpu || heap || (hflags & (D3D12_HEAP_FLAG_SHARED | D3D12_HEAP_FLAG_SHARED_CROSS_ADAPTER)) || global_share) { hr = DXGI_ERROR_UNSUPPORTED; goto fail; }
       r->kind = 0;
-      r->planes = 2;
+      r->planes = format_planes(fi);
+    }
+    if (format_packed_yuv(desc->Format)) {
+      /* (the packed YUV formats: 2D textures and arrays of one level, not multisampled; YUY2, Y210, Y216 of even width (a pixel of the kernel's image is a pair); render
+       * targets of AYUV alone - DXGI gives the others shader resource and unordered access views only) */
+      if (desc->Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || cube || r->mips != 1 || samples > 1 || (fi->pair && (desc->Width & 1)) ||
+          (target && desc->Format != DXGI_FORMAT_AYUV)) { hr = E_INVALIDARG; goto fail; }
+      if (r->layers > 1) {
+        /* (an array: each slice an allocation of its own, as a planar texture's planes - `planes` 1 - so that a slice is a 2D image the decoder and the processor write) */
+        if (reserved || cpu || heap || (hflags & (D3D12_HEAP_FLAG_SHARED | D3D12_HEAP_FLAG_SHARED_CROSS_ADAPTER)) || global_share) { hr = DXGI_ERROR_UNSUPPORTED; goto fail; }
+        r->kind = 0;
+        r->planes = 1;
+      }
     }
     if ((r->kind != 0 || r->mips > 1) && (target || want_depth || (r->kind != 0 && r->mips > 1))) { hr = DXGI_ERROR_UNSUPPORTED; goto fail; }
     ad.flags = want_depth ? KA_DEPTH : (target ? (KA_RENDER_TARGET | KA_TEXTURE) : KA_TEXTURE);
@@ -453,7 +467,7 @@ static HRESULT resource_make_from(Dev *dev, const D3D12_HEAP_PROPERTIES *props, 
       r->reserved = 1;
     }
     ad.format = fi->kernel;
-    ad.width = (UINT)desc->Width;
+    ad.width = format_kw(fi, (UINT)desc->Width);
     ad.height = desc->Height;
     ad.mips = r->mips;
     ad.kind = r->kind;
@@ -512,7 +526,7 @@ static HRESULT resource_make_from(Dev *dev, const D3D12_HEAP_PROPERTIES *props, 
     r->bytes = 0;
     for (UINT i = 0; KMT_OK(st) && i < r->planes * r->layers; ++i) {
       KmtAllocDesc pd = ad;
-      if (i >= r->layers) { pd.width = (ad.width + 1) / 2; pd.height = (ad.height + 1) / 2; }
+      plane_extent(r->fmt, i / r->layers, &pd.width, &pd.height);
       UINT64 plane_bytes = 0;
       st = kmt_create_allocation(dev->kdev, &pd, &r->plane_alloc[i], &pitch, &plane_bytes);
       r->bytes += plane_bytes;
@@ -526,8 +540,8 @@ static HRESULT resource_make_from(Dev *dev, const D3D12_HEAP_PROPERTIES *props, 
   if (r->fmt && r->fmt->narrow && !source && !heap && !reserved) {
     const UINT count = r->planes ? r->planes * r->layers : 1;
     for (UINT i = 0; i < count; ++i) {
-      const int chroma = r->planes && i >= r->layers;
-      const UINT w = chroma ? ((UINT)desc->Width + 1) / 2 : (UINT)desc->Width, h = chroma ? (desc->Height + 1) / 2 : desc->Height;
+      UINT w = (UINT)desc->Width, h = desc->Height;
+      if (r->planes) plane_extent(r->fmt, i / r->layers, &w, &h);
       res_fill_alpha(dev, r->planes ? r->plane_alloc[i] : r->alloc, w, h, r->planes ? 1 : r->layers, r->mips, r->fmt->kernel == KF_RGBA16 ? 1 : r->fmt->kernel == KF_RGBA16SINT ? 2 : 0);
     }
   }
@@ -619,7 +633,7 @@ static D3D12_RESOURCE_ALLOCATION_INFO *STDMETHODCALLTYPE dev_GetResourceAllocati
       D3D12_RESOURCE_DESC d = descs[i];
       const UINT mips = d.MipLevels ? d.MipLevels : mip_count_for((UINT)d.Width, d.Height);
       const FormatInfo *dfi = format_info(d.Format);
-      const UINT subs = mips * (d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D ? 1 : (d.DepthOrArraySize ? d.DepthOrArraySize : 1)) * (dfi && dfi->planar ? 2 : 1);
+      const UINT subs = mips * (d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D ? 1 : (d.DepthOrArraySize ? d.DepthOrArraySize : 1)) * (dfi && dfi->planar ? format_planes(dfi) : 1);
       get_footprints(&d, 0, subs, 0, NULL, NULL, NULL, &n);
     }
     size += KALIGN(n, KTILE_BYTES);
@@ -679,6 +693,7 @@ static HRESULT res_texture_copy(Resource *r, UINT sub, const D3D12_BOX *box, BYT
   if (b.left >= b.right || b.top >= b.bottom || b.front >= b.back) return S_OK;
   if (b.right > w || b.bottom > h || b.back > d) return E_INVALIDARG;
   if (fi->compressed && (b.left % 4 || b.top % 4 || (b.right % 4 && b.right != w) || (b.bottom % 4 && b.bottom != h))) return E_INVALIDARG;
+  if (fi->pair && (b.left % 2 || (b.right % 2 && b.right != w))) return E_INVALIDARG;      /* (whole pairs of pixels) */
   const UINT64 pitch = format_row_bytes(fi, w), plane = pitch * format_rows(fi, h);
   const UINT64 x_bytes = format_row_bytes(fi, b.left), row_bytes = format_row_bytes(fi, b.right) - x_bytes;
   const UINT first_row = fi->compressed ? b.top / 4 : b.top, rows = format_rows(fi, b.bottom) - first_row;
