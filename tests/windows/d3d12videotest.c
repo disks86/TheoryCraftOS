@@ -409,7 +409,7 @@ static void test_features(void) {
   hd.Format = DXGI_FORMAT_P010;      /* (HEVC Main is 8 bits) */
   heap = NULL;
   CHECK(ID3D12VideoDevice_CreateVideoDecoderHeap(g_vdev, &hd, &IID_ID3D12VideoDecoderHeap, (void **)&heap) == E_INVALIDARG && !heap);
-  /* an encoder of nothing is refused, an HEVC one is not there (tests/windows/d3d12encodetest.c tests encoding) */
+  /* an encoder of nothing is refused, an HEVC one of no profile or format too, and a codec that is not one (tests/windows/d3d12encodetest.c and d3d12encodecodectest.c test encoding) */
   ID3D12VideoDevice3 *v3 = NULL;
   CHECK_HR(ID3D12VideoDevice_QueryInterface(g_vdev, &IID_ID3D12VideoDevice3, (void **)&v3));
   if (v3) {
@@ -419,7 +419,10 @@ static void test_features(void) {
     CHECK(ID3D12VideoDevice3_CreateVideoEncoder(v3, &ed, &IID_ID3D12VideoEncoder, &enc) == E_INVALIDARG && !enc);
     ed.EncodeCodec = D3D12_VIDEO_ENCODER_CODEC_HEVC;
     enc = (void *)1;
-    CHECK(ID3D12VideoDevice3_CreateVideoEncoder(v3, &ed, &IID_ID3D12VideoEncoder, &enc) == DXGI_ERROR_UNSUPPORTED && !enc);
+    CHECK(ID3D12VideoDevice3_CreateVideoEncoder(v3, &ed, &IID_ID3D12VideoEncoder, &enc) == E_INVALIDARG && !enc);
+    ed.EncodeCodec = (D3D12_VIDEO_ENCODER_CODEC)3;
+    enc = (void *)1;
+    CHECK(ID3D12VideoDevice3_CreateVideoEncoder(v3, &ed, &IID_ID3D12VideoEncoder, &enc) == E_INVALIDARG && !enc);
     ID3D12VideoDevice3_Release(v3);
   }
   /* the video queues, allocators and lists */
