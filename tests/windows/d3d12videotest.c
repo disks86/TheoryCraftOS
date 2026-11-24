@@ -37,6 +37,23 @@ static int checks, failed;
 
 /* (MPEG-4 Part 2 Advanced Simple with GMC: DXVA_ModeMPEG4pt2_VLD_AdvSimple_GMC, which d3d12video.h does not name) */
 static const GUID g_mpeg4pt2_advsimple_gmc = {0xab998b5b, 0x4258, 0x44a9, {0x9f, 0xeb, 0x94, 0xe5, 0x97, 0xa6, 0xba, 0xae}};
+/* The HEVC range extension profiles (D3D12_VIDEO_DECODE_PROFILE_HEVC_MAIN12 .. _HEVC_MAIN16_444, _HEVC_MONOCHROME, _HEVC_MONOCHROME10 of DirectX-Headers; the
+ * GUIDs of dxva.h's DXVA_ModeHEVC_VLD_*), which mingw-w64's d3d12video.h does not name: the kernel's number of each (hardware::DxvaProfile) and its formats. */
+static const GUID g_hevc_main12 = {0x1a72925f, 0x0c2c, 0x4f15, {0x96, 0xfb, 0xb1, 0x7d, 0x14, 0x73, 0x60, 0x3f}};
+static const GUID g_hevc_main10_422 = {0x0bac4fe5, 0x1532, 0x4429, {0xa8, 0x54, 0xf8, 0x4d, 0xe0, 0x49, 0x53, 0xdb}};
+static const GUID g_hevc_main12_422 = {0x55bcac81, 0xf311, 0x4093, {0xa7, 0xd0, 0x1c, 0xbc, 0x0b, 0x84, 0x9b, 0xee}};
+static const GUID g_hevc_main_444 = {0x4008018f, 0xf537, 0x4b36, {0x98, 0xcf, 0x61, 0xaf, 0x8a, 0x2c, 0x1a, 0x33}};
+static const GUID g_hevc_main10_ext = {0x9cc55490, 0xe37c, 0x4932, {0x86, 0x84, 0x49, 0x20, 0xf9, 0xf6, 0x40, 0x9c}};
+static const GUID g_hevc_main10_444 = {0x0dabeffa, 0x4458, 0x4602, {0xbc, 0x03, 0x07, 0x95, 0x65, 0x9d, 0x61, 0x7c}};
+static const GUID g_hevc_main12_444 = {0x9798634d, 0xfe9d, 0x48e5, {0xb4, 0xda, 0xdb, 0xec, 0x45, 0xb3, 0xdf, 0x01}};
+static const GUID g_hevc_main16_444 = {0xa4fbdbb0, 0xa113, 0x482b, {0xa2, 0x32, 0x63, 0x5c, 0xc0, 0x69, 0x7f, 0x6d}};
+static const GUID g_hevc_monochrome = {0x0685b993, 0x3d8c, 0x43a0, {0x8b, 0x28, 0xd7, 0x4c, 0x2d, 0x68, 0x99, 0xa4}};
+static const GUID g_hevc_monochrome10 = {0x142a1d0f, 0x69dd, 0x4ec9, {0x85, 0x91, 0xb1, 0x2f, 0xfc, 0xb9, 0x1a, 0x29}};
+static const struct { const GUID *profile; unsigned kernel; UINT n; DXGI_FORMAT f[2]; } g_hevc_rext_profiles[] = {
+    {&g_hevc_main12, 17, 1, {DXGI_FORMAT_P016}},     {&g_hevc_main10_422, 18, 2, {DXGI_FORMAT_Y210, DXGI_FORMAT_YUY2}}, {&g_hevc_main12_422, 19, 1, {DXGI_FORMAT_Y216}},
+    {&g_hevc_main_444, 20, 1, {DXGI_FORMAT_AYUV}},   {&g_hevc_main10_ext, 21, 1, {DXGI_FORMAT_P010}},   {&g_hevc_main10_444, 22, 1, {DXGI_FORMAT_Y410}},
+    {&g_hevc_main12_444, 23, 1, {DXGI_FORMAT_Y416}}, {&g_hevc_main16_444, 24, 1, {DXGI_FORMAT_Y416}},   {&g_hevc_monochrome, 25, 1, {DXGI_FORMAT_NV12}},
+    {&g_hevc_monochrome10, 26, 1, {DXGI_FORMAT_P010}}};
 static ID3D12Device *g_dev;
 static ID3D12CommandQueue *g_queue;
 static ID3D12Fence *g_fence;
@@ -193,12 +210,15 @@ static void test_features(void) {
   CHECK(area.VideoDecodeSupport && area.VideoProcessSupport && area.VideoEncodeSupport);      /* (encoding: d3d12encodetest) */
   D3D12_FEATURE_DATA_VIDEO_DECODE_PROFILE_COUNT count = {0};
   CHECK_HR(ID3D12VideoDevice_CheckFeatureSupport(g_vdev, D3D12_FEATURE_VIDEO_DECODE_PROFILE_COUNT, &count, sizeof count));
-  CHECK(count.ProfileCount == 17);      /* (H.264, MPEG-2, MPEG-1/2, VP9 0 and 2, HEVC Main and Main 10, AV1 0, VC-1 (two), MPEG-4 Part 2 (three), AV1 1, 2, 12-bit 2 and 12-bit 2 4:2:0) */
-  GUID profiles[24];
+  /* (H.264, MPEG-2, MPEG-1/2, VP9 0 and 2, HEVC Main and Main 10, AV1 0, VC-1 (two), MPEG-4 Part 2 (three), AV1 1, 2, 12-bit 2 and 12-bit 2 4:2:0, and the ten
+   * HEVC range extension profiles) */
+  CHECK(count.ProfileCount == 27);
+  GUID profiles[32];
   D3D12_FEATURE_DATA_VIDEO_DECODE_PROFILES list = {0, count.ProfileCount, profiles};
   CHECK_HR(ID3D12VideoDevice_CheckFeatureSupport(g_vdev, D3D12_FEATURE_VIDEO_DECODE_PROFILES, &list, sizeof list));
-  int h264 = 0, av1 = 0, main10 = 0, vc1 = 0, mpeg4 = 0, av1_high = 0;
-  for (UINT i = 0; i < count.ProfileCount && i < 24; ++i) {
+  int h264 = 0, av1 = 0, main10 = 0, vc1 = 0, mpeg4 = 0, av1_high = 0, hevc_rext = 0;
+  for (UINT i = 0; i < count.ProfileCount && i < 32; ++i) {
+    for (UINT k = 0; k < sizeof g_hevc_rext_profiles / sizeof g_hevc_rext_profiles[0]; ++k) hevc_rext += IsEqualGUID(&profiles[i], g_hevc_rext_profiles[k].profile);
     h264 |= IsEqualGUID(&profiles[i], &D3D12_VIDEO_DECODE_PROFILE_H264);
     av1 |= IsEqualGUID(&profiles[i], &D3D12_VIDEO_DECODE_PROFILE_AV1_PROFILE0);
     av1_high += IsEqualGUID(&profiles[i], &D3D12_VIDEO_DECODE_PROFILE_AV1_PROFILE1) + IsEqualGUID(&profiles[i], &D3D12_VIDEO_DECODE_PROFILE_AV1_PROFILE2) +
@@ -208,7 +228,7 @@ static void test_features(void) {
     mpeg4 += IsEqualGUID(&profiles[i], &D3D12_VIDEO_DECODE_PROFILE_MPEG4PT2_SIMPLE) + IsEqualGUID(&profiles[i], &D3D12_VIDEO_DECODE_PROFILE_MPEG4PT2_ADVSIMPLE_NOGMC) +
              IsEqualGUID(&profiles[i], &g_mpeg4pt2_advsimple_gmc);
   }
-  CHECK(h264 && av1 && main10 && vc1 == 2 && mpeg4 == 3 && av1_high == 4);
+  CHECK(h264 && av1 && main10 && vc1 == 2 && mpeg4 == 3 && av1_high == 4 && hevc_rext == 10);
   D3D12_FEATURE_DATA_VIDEO_DECODE_SUPPORT ds;
   memset(&ds, 0, sizeof ds);
   ds.Configuration.DecodeProfile = D3D12_VIDEO_DECODE_PROFILE_H264;
@@ -280,6 +300,25 @@ static void test_features(void) {
     CHECK_HR(ID3D12VideoDevice_CheckFeatureSupport(g_vdev, D3D12_FEATURE_VIDEO_DECODE_SUPPORT, &ds, sizeof ds));
     CHECK(ds.SupportFlags == D3D12_VIDEO_DECODE_SUPPORT_FLAG_SUPPORTED);
     ds.DecodeFormat = k == 3 ? DXGI_FORMAT_P010 : DXGI_FORMAT_P016;      /* (not one of the profile's) */
+    CHECK_HR(ID3D12VideoDevice_CheckFeatureSupport(g_vdev, D3D12_FEATURE_VIDEO_DECODE_SUPPORT, &ds, sizeof ds));
+    CHECK(ds.SupportFlags == D3D12_VIDEO_DECODE_SUPPORT_FLAG_NONE);
+  }
+  /* the HEVC range extension profiles: each one's formats, supported at 1920x1080, and a format of another chroma layout refused */
+  for (UINT k = 0; k < sizeof g_hevc_rext_profiles / sizeof g_hevc_rext_profiles[0]; ++k) {
+    fc.Configuration.DecodeProfile = *g_hevc_rext_profiles[k].profile;
+    CHECK_HR(ID3D12VideoDevice_CheckFeatureSupport(g_vdev, D3D12_FEATURE_VIDEO_DECODE_FORMAT_COUNT, &fc, sizeof fc));
+    CHECK(fc.FormatCount == g_hevc_rext_profiles[k].n);
+    D3D12_FEATURE_DATA_VIDEO_DECODE_FORMATS f2 = {0, fc.Configuration, fc.FormatCount, formats};
+    CHECK_HR(ID3D12VideoDevice_CheckFeatureSupport(g_vdev, D3D12_FEATURE_VIDEO_DECODE_FORMATS, &f2, sizeof f2));
+    for (UINT i = 0; i < g_hevc_rext_profiles[k].n && i < fc.FormatCount; ++i) CHECK(formats[i] == g_hevc_rext_profiles[k].f[i]);
+    memset(&ds, 0, sizeof ds);
+    ds.Configuration = fc.Configuration;
+    ds.Width = 1920;
+    ds.Height = 1080;
+    ds.DecodeFormat = g_hevc_rext_profiles[k].f[0];
+    CHECK_HR(ID3D12VideoDevice_CheckFeatureSupport(g_vdev, D3D12_FEATURE_VIDEO_DECODE_SUPPORT, &ds, sizeof ds));
+    CHECK(ds.SupportFlags == D3D12_VIDEO_DECODE_SUPPORT_FLAG_SUPPORTED);
+    ds.DecodeFormat = g_hevc_rext_profiles[k].f[0] == DXGI_FORMAT_Y216 ? DXGI_FORMAT_Y416 : DXGI_FORMAT_Y216;
     CHECK_HR(ID3D12VideoDevice_CheckFeatureSupport(g_vdev, D3D12_FEATURE_VIDEO_DECODE_SUPPORT, &ds, sizeof ds));
     CHECK(ds.SupportFlags == D3D12_VIDEO_DECODE_SUPPORT_FLAG_NONE);
   }
@@ -740,6 +779,8 @@ static void test_processor_yuv(void) {
 #include "dxva_streams.h"
 #include "d3d11video_data.h"
 #include "hevc10_dxva.h"
+#include "hevcrext_dxva.h"
+#include "hevcrext_unpack.h"
 #include "av1_dxva_data.h"
 static void test_decode(void);
 static void test_processor_effects(void);
@@ -1194,8 +1235,116 @@ static void decode_hevc10(const Hevc10Stream *st, int separate) {
   if (dec) ID3D12VideoDecoder_Release(dec);
 }
 
+/* A HEVC range extension stream (tests/windows/hevcrext_dxva.h: DXVA_PicParams_HEVC_RangeExt and the rest of every picture's buffers as ffmpeg makes them)
+ * decoded through ID3D12VideoDecodeCommandList into its profile's format (Y210, AYUV, Y416), compared in display order with the hash every picture carries (FNV
+ * hashes of the planar pictures). `separate`: every surface a texture of its own, else one array. */
+static void decode_hevcrext(const HevcRextStream *st, int separate) {
+  const unsigned surfaces = st->surfaces, w = st->width, h = st->height;
+  const GUID *profile = NULL;
+  for (UINT k = 0; k < sizeof g_hevc_rext_profiles / sizeof g_hevc_rext_profiles[0]; ++k)
+    if (g_hevc_rext_profiles[k].kernel == st->profile) profile = g_hevc_rext_profiles[k].profile;
+  const DXGI_FORMAT format = (DXGI_FORMAT)st->format;
+  CHECK(profile != NULL);
+  if (!profile) return;
+  D3D12_VIDEO_DECODER_DESC dd = {0, {*profile, D3D12_BITSTREAM_ENCRYPTION_TYPE_NONE, D3D12_VIDEO_FRAME_CODED_INTERLACE_TYPE_NONE}};
+  D3D12_FEATURE_DATA_VIDEO_DECODE_SUPPORT ds;
+  memset(&ds, 0, sizeof ds);
+  ds.Configuration = dd.Configuration;
+  ds.Width = w;
+  ds.Height = h;
+  ds.DecodeFormat = format;
+  CHECK_HR(ID3D12VideoDevice_CheckFeatureSupport(g_vdev, D3D12_FEATURE_VIDEO_DECODE_SUPPORT, &ds, sizeof ds));
+  CHECK(ds.SupportFlags == D3D12_VIDEO_DECODE_SUPPORT_FLAG_SUPPORTED);
+  D3D12_VIDEO_DECODER_HEAP_DESC hd;
+  memset(&hd, 0, sizeof hd);
+  hd.Configuration = dd.Configuration;
+  hd.DecodeWidth = w;
+  hd.DecodeHeight = h;
+  hd.Format = format;
+  hd.MaxDecodePictureBufferCount = surfaces;
+  ID3D12VideoDecoder *dec = NULL;
+  ID3D12VideoDecoderHeap *heap = NULL;
+  CHECK_HR(ID3D12VideoDevice_CreateVideoDecoder(g_vdev, &dd, &IID_ID3D12VideoDecoder, (void **)&dec));
+  CHECK_HR(ID3D12VideoDevice_CreateVideoDecoderHeap(g_vdev, &hd, &IID_ID3D12VideoDecoderHeap, (void **)&heap));
+  ID3D12Resource *tex[DXVA_STREAM_MAX_SURFACES] = {0};
+  UINT subs[DXVA_STREAM_MAX_SURFACES];
+  ID3D12Resource *array = separate ? NULL : texture(format, w, h, surfaces, D3D12_RESOURCE_FLAG_NONE);
+  for (unsigned i = 0; i < surfaces; ++i) {
+    tex[i] = separate ? texture(format, w, h, 1, D3D12_RESOURCE_FLAG_NONE) : array;
+    subs[i] = separate ? 0 : i;
+  }
+  D3D12_COMMAND_QUEUE_DESC qd = {D3D12_COMMAND_LIST_TYPE_VIDEO_DECODE, 0, D3D12_COMMAND_QUEUE_FLAG_NONE, 0};
+  ID3D12CommandQueue *vq = NULL;
+  ID3D12CommandAllocator *va = NULL;
+  ID3D12VideoDecodeCommandList *vl = NULL;
+  ID3D12Device_CreateCommandQueue(g_dev, &qd, &IID_ID3D12CommandQueue, (void **)&vq);
+  ID3D12Device_CreateCommandAllocator(g_dev, D3D12_COMMAND_LIST_TYPE_VIDEO_DECODE, &IID_ID3D12CommandAllocator, (void **)&va);
+  if (va) ID3D12Device_CreateCommandList(g_dev, 0, D3D12_COMMAND_LIST_TYPE_VIDEO_DECODE, va, NULL, &IID_ID3D12VideoDecodeCommandList, (void **)&vl);
+  ID3D12Resource *bits = buffer(D3D12_HEAP_TYPE_UPLOAD, 1 << 20);
+  CHECK(dec && heap && vq && vl && bits && tex[0]);
+  const int planar = format == DXGI_FORMAT_NV12 || format == DXGI_FORMAT_P010 || format == DXGI_FORMAT_P016;
+  /* the surface read back (8 bytes a pixel at most), the planar picture */
+  BYTE *p0 = malloc((size_t)w * h * 8), *p1 = malloc((size_t)w * h * 2), *f = malloc((size_t)w * h * 6);
+  unsigned hashes[64] = {0}, bad = 0, decoded = 0;
+  for (unsigned n = 0; dec && heap && vl && bits && tex[0] && n < st->count && n < 64; ++n) {
+    const HevcRextPicture *p = &st->pictures[n];
+    BYTE *map = NULL;
+    ID3D12Resource_Map(bits, 0, NULL, (void **)&map);
+    memcpy(map, st->bytes + p->bits, p->bits_size);
+    ID3D12Resource_Unmap(bits, 0, NULL);
+    D3D12_VIDEO_DECODE_INPUT_STREAM_ARGUMENTS in;
+    memset(&in, 0, sizeof in);
+    in.NumFrameArguments = 2;
+    in.FrameArguments[0] = (D3D12_VIDEO_DECODE_FRAME_ARGUMENT){D3D12_VIDEO_DECODE_ARGUMENT_TYPE_PICTURE_PARAMETERS, p->pp_size, (void *)(st->bytes + p->pp)};
+    in.FrameArguments[1] = (D3D12_VIDEO_DECODE_FRAME_ARGUMENT){D3D12_VIDEO_DECODE_ARGUMENT_TYPE_SLICE_CONTROL, p->slices_size, (void *)(st->bytes + p->slices)};
+    if (p->qm_size) {
+      in.FrameArguments[2] = (D3D12_VIDEO_DECODE_FRAME_ARGUMENT){D3D12_VIDEO_DECODE_ARGUMENT_TYPE_INVERSE_QUANTIZATION_MATRIX, p->qm_size, (void *)(st->bytes + p->qm)};
+      in.NumFrameArguments = 3;
+    }
+    in.ReferenceFrames.NumTexture2Ds = surfaces;
+    in.ReferenceFrames.ppTexture2Ds = tex;
+    in.ReferenceFrames.pSubresources = subs;
+    in.CompressedBitstream.pBuffer = bits;
+    in.CompressedBitstream.Size = p->bits_size;
+    in.pHeap = heap;
+    D3D12_VIDEO_DECODE_OUTPUT_STREAM_ARGUMENTS out;
+    memset(&out, 0, sizeof out);
+    out.pOutputTexture2D = tex[p->surface];
+    out.OutputSubresource = subs[p->surface];
+    ID3D12VideoDecodeCommandList_DecodeFrame(vl, dec, &out, &in);
+    ID3D12VideoDecodeCommandList_Close(vl);
+    ID3D12CommandList *lists[1] = {(ID3D12CommandList *)vl};
+    ID3D12CommandQueue_ExecuteCommandLists(vq, 1, lists);
+    wait_queue(vq);
+    ID3D12VideoDecodeCommandList_Reset(vl, va);
+    const UINT layers = separate ? 1 : surfaces;
+    copy_subresources(tex[p->surface], subs[p->surface], 1, p0, (size_t)w * h * 8, 0);
+    if (planar) copy_subresources(tex[p->surface], layers + subs[p->surface], 1, p1, (size_t)w * h * 2, 0);
+    const size_t size = hevcrext_unpack(format, st->chroma, st->depth, w, h, p0, p1, f, &bad);
+    if (p->display < 64) hashes[p->display] = fnv(f, size, 0x811c9dc5u);
+    ++decoded;
+  }
+  CHECK(decoded == st->count);
+  CHECK(bad == 0);   /* (the samples in the top bits of their fields, alpha opaque) */
+  unsigned same = 0;
+  for (unsigned i = 0; i < st->count && i < 64; ++i) same += hashes[i] == st->fnv[i];
+  printf("d3d12videotest: %s (HEVC range extensions, %s): %u of %u frames are the reference's, bit for bit\n", st->name, separate ? "a texture a surface" : "an array",
+         same, st->count);
+  CHECK(same == st->count);
+  free(p0); free(p1); free(f);
+  if (bits) ID3D12Resource_Release(bits);
+  if (vl) ID3D12VideoDecodeCommandList_Release(vl);
+  if (va) ID3D12CommandAllocator_Release(va);
+  if (vq) ID3D12CommandQueue_Release(vq);
+  if (separate) { for (unsigned i = 0; i < surfaces; ++i) if (tex[i]) ID3D12Resource_Release(tex[i]); }
+  else if (array) ID3D12Resource_Release(array);
+  if (heap) ID3D12VideoDecoderHeap_Release(heap);
+  if (dec) ID3D12VideoDecoder_Release(dec);
+}
+
 static void test_decode(void) {
   if (!g_vdev) return;
+  for (unsigned i = 0; i < sizeof g_hevcrext_streams / sizeof g_hevcrext_streams[0]; ++i) decode_hevcrext(&g_hevcrext_streams[i], (int)(i & 1));
   decode_hevc10(&g_hevc10_streams[0], 0);
   decode_hevc10(&g_hevc10_streams[1], 1);
   decode_stream("h264_bframes", DXVA_CODEC_H264, &D3D12_VIDEO_DECODE_PROFILE_H264, g_h264_bframes_b64, 17, g_h264_bframes_fnv, 14, 0, 0);

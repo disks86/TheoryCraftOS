@@ -308,12 +308,19 @@ Direct3D 11's and 12's video interfaces run on the kernel's codecs, on the CPU, 
   compressed data). `src/Hardware/VideoCodec/Dxva` decodes them (`IDxvaDecoder`, DxvaDecoder.hpp): H.264 VLD (short slices; progressive and interlaced - MBAFF frames
   and field pictures, whose references are the fields UsedForReferenceFlags marks - monochrome as NV12 with grey chroma, POC types 0-2), MPEG-2 and
   MPEG-1, VP9 profile 0 and 10-bit profile 2, HEVC Main (NV12) and Main 10 (P010: 8 to 10 bits for luma and chroma each, so Main and the Still Picture
-  profiles too), AV1 profile 0 (8 and 10 bits, monochrome, film grain), VC-1 (VC1_VLD and VC1_D2010: Simple, Main and
+  profiles too) and the HEVC range extension profiles (DXVA_PicParams_HEVC_RangeExt; DxvaProfile 17-26: Main12 into P016, Main10_422 into Y210 / YUY2,
+  Main12_422 into Y216, Main_444 into AYUV, Main10_Ext into P010, Main10_444 into Y410, Main12_444 and Main16 into Y416, Monochrome into NV12 and
+  Monochrome10 into P010 with neutral chroma - each profile's chroma format and bit depths and the smaller ones, into a surface of the picture's chroma format),
+  AV1 profile 0 (8 and 10 bits, monochrome, film grain), VC-1 (VC1_VLD and VC1_D2010: Simple, Main and
   Advanced profile, progressive pictures) and MPEG-4 Part 2 (MPEG4PT2_VLD_SIMPLE, _ADVSIMPLE_NOGMC, _ADVSIMPLE_GMC: B planes, quarter samples, interlace, GMC, the
   MPEG quantiser, video packets, data partitioning and RVLC, the short video header). H.264, MPEG-2 and VP9 rebuild what the software decoders read from the parameters;
   HEVC and AV1 fill the decoders' parameter sets and frame headers from them and take the reference sets DXVA gives. The CPU H.265 decoder
-  has every sample path at any depth up to 10 bits (templated on the sample type: 8-bit pictures take the 8-bit code as before, 10-bit ones 16-bit planes with
-  QpBdOffset, the interpolation shifts, weighted prediction offsets, bdShift, PCM at its own depth, tC / beta and SAO offsets scaled). VC-1 (DxvaVc1.cpp) makes the sequence and entry
+  has every sample path at any depth up to 16 bits (templated on the sample type: 8-bit pictures take the 8-bit code as before, deeper ones 16-bit planes with
+  QpBdOffset, the interpolation shifts, weighted prediction offsets, bdShift, PCM at its own depth, tC / beta scaled), the chroma formats 4:0:0, 4:2:2 (the
+  Table 8-3 mode mapping, two square chroma blocks a transform unit) and 4:4:4 (a chroma mode a part, chroma filtering of the intra references), and the range
+  extension tools: transform skip rotation and contexts, implicit and explicit RDPCM, transform skip up to 32x32, extended precision, intra smoothing disabled,
+  high precision weighted prediction offsets, persistent Rice adaptation (synchronised with the contexts for wavefront rows and dependent slices), CABAC bypass
+  alignment, cross-component prediction, the chroma QP offset lists and log2_sao_offset_scale. VC-1 (DxvaVc1.cpp) makes the sequence and entry
   point layers from DXVA_PictureParameters and hands the frame (with its start codes) to the CPU decoder's external mode (`vc1::Core::decode_external`: the caller's
   pictures, the rounding control bRcontrol, the intensity compensation a P picture applied kept with its surface for the B pictures that predict from it); MPEG-4
   (DxvaMpeg4.cpp) makes the video object layer from DXVA_PicParams_MPEG4_PART2 and DXVA_QmatrixData and takes the plane header from the bitstream (checked against
@@ -368,13 +375,19 @@ Direct3D 11's and 12's video interfaces run on the kernel's codecs, on the CPU, 
   macroblocks (the queries say multiple of 16). Not done: CABAC, 8x8 transform, direct / B_Skip, intra refresh, slices by bytes, frame analysis, HEVC and AV1 (the codec query
   says FALSE), EncodeCommandList4. Tests: `tests/run_host_tests.sh VideoEncodeTest`, `tests/h264_encode_ffmpeg.sh` (ffmpeg's decode = the reconstruction),
   `tests/emulated_dx.sh tests/windows/d3d12encodetest.c`, `tests/d3d12_qemu.sh d3d12encodetest`, `tests/wow64_qemu.sh d3d12encodetest`.
-- Not there: HEVC 4:2:2 / 4:4:4 and above 10 bits (the range extension profiles; their SPS / PPS extensions are not read), AV1 large-scale tiles, interlaced VC-1 (the CPU decoder has progressive pictures only), decode-time conversion and histograms, protected
+- Not there: HEVC 16-bit samples through DXVA (DXVA_PicParams_HEVC's bit depths are three bits: the Main16 profile takes 15 at most), HEVC separate colour planes (no
+  profile has them), extended precision and CABAC bypass alignment checked against a reference (no decoder at hand has them: implemented from the standard, not
+  verified), AV1 large-scale tiles, interlaced VC-1 (the CPU decoder has progressive pictures only), decode-time conversion and histograms, protected
   content (crypto sessions and authenticated channels are refused), unordered access to planes (the kernel has none to textures), layered rendering into several slices
   (no `SV_RenderTargetArrayIndex`: a render target view of several slices draws into the first).
 - Tests: `tests/run_host_tests.sh DxvaDecoderTest VideoProcessTest DxgkrnlTest` (every codec bit for bit with ffmpeg; the DXVA buffers filled as ffmpeg's dxva2_*.c
   fill them; interlaced H.264 from x264 MBAFF streams and cuts of the JVT conformance streams, tests/data/make_h264_interlaced_fixtures.py; VC-1 and MPEG-4 Part 2, which ffmpeg has no DXVA path for, from the software decoder's view of the stream; HEVC Main 10 over tests/data/hevc10_*.h265, scripts/gen_hevc10_test_streams.sh, with the PCM stream of
-  scripts/gen_hevc10_pcm_stream.py), `tests/emulated_dx.sh
-  tests/windows/d3d12videotest.c` and `d3d11videotest.c` (H.264 - progressive and an MBAFF + field picture stream -, HEVC Main 10 - tests/windows/hevc10_dxva.h, made by `DXVA_HEVC10_DUMP=... DxvaDecoderTest` -, VC-1, MPEG-4 Part 2 and AV1 profiles 1 and 2 decoded through both APIs, bit for bit with ffmpeg -
+  scripts/gen_hevc10_pcm_stream.py; the HEVC range extensions over tests/data/hevcrext_*.h265 - x265's 4:0:0 / 4:2:0 / 4:2:2 / 4:4:4 streams of 8 to 12 bits,
+  scripts/gen_hevc_rext_test_streams.sh - and hevcrexttool_*.h265, the range extension tools from the random-syntax encoder scripts/gen_hevc_rext_tool_streams.py,
+  every picture checked against the MD5 of each plane it carries: FFmpeg's decode, libde265's where FFmpeg decodes a tool otherwise than the standard (the script
+  lists where FFmpeg n9.0.2 and libde265 1.1.3 differ)), `tests/emulated_dx.sh
+  tests/windows/d3d12videotest.c` and `d3d11videotest.c` (H.264 - progressive and an MBAFF + field picture stream -, HEVC Main 10 - tests/windows/hevc10_dxva.h, made by `DXVA_HEVC10_DUMP=... DxvaDecoderTest` -, HEVC range extensions - 4:2:2 10-bit into Y210, 4:4:4 with the
+  range extension tools into AYUV, 4:4:4 12-bit into Y416: tests/windows/hevcrext_dxva.h, `DXVA_HEVCREXT_DUMP=... DxvaDecoderTest` -, VC-1, MPEG-4 Part 2 and AV1 profiles 1 and 2 decoded through both APIs, bit for bit with ffmpeg -
   the AV1 streams' DXVA buffers dumped by DxvaDecoderTest with DXVA_AV1_DUMP, tests/data/make_av1_dxva_data.py; the packed and planar YUV textures; the processor
   against BT.709; motion adaptive deinterlacing against ffmpeg's yadif output, bob, ProcAmp, luma key, stereo, HDR10 into SDR), `tests/d3d12_qemu.sh d3d12videotest`,
   `tests/wow64_qemu.sh d3d12videotest d3d11videotest` (32-bit). VideoProcessTest's references: tests/data/videoprocess/make_refs.sh (zscale, yadif, geq).

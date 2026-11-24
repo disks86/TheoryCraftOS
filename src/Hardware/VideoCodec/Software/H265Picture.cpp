@@ -32,22 +32,25 @@ constexpr int clip3(int lo, int hi, int v) { return v < lo ? lo : v > hi ? hi : 
 
 bool Core::alloc_picture(Picture* p) {
   const Sps& s = *sp_;
-  const int cw = s.width / 2, ch = s.height / 2;
   p->deep = s.bit_depth_luma > 8 || s.bit_depth_chroma > 8;
   p->depth_luma = s.bit_depth_luma;
   p->depth_chroma = s.bit_depth_chroma;
+  p->chroma_format = s.chroma_format_idc;
+  p->width = s.width;
+  p->height = s.height;
+  const int cw = p->chroma_width(), ch = p->chroma_height();
   const uint64_t bytes = p->deep ? 2 : 1;
   if (!p->plane[0].alloc(allocator_, static_cast<uint64_t>(s.width) * s.height * bytes) || !p->plane[1].alloc(allocator_, static_cast<uint64_t>(cw) * ch * bytes) ||
       !p->plane[2].alloc(allocator_, static_cast<uint64_t>(cw) * ch * bytes) || !p->col.alloc(allocator_, static_cast<uint64_t>((s.width + 15) / 16) * ((s.height + 15) / 16)))
     return false;
   p->stride[0] = s.width * static_cast<int>(bytes);
   p->stride[1] = p->stride[2] = cw * static_cast<int>(bytes);
-  p->width = s.width;
-  p->height = s.height;
   p->crop_l = s.crop_l;
   p->crop_r = s.crop_r;
   p->crop_t = s.crop_t;
   p->crop_b = s.crop_b;
+  p->full_range = s.full_range;
+  if (s.chroma_format_idc == 0) fill_grey(p);   // (a monochrome picture's chroma planes stay grey)
   return true;
 }
 
@@ -212,7 +215,9 @@ bool Core::start_picture(const SliceHeader& sh, int64_t pts) {
   if (!irap && no_rasl_output_ && after_eos_) return H265_FALSE;
 
   const bool new_cvs = irap && no_rasl_output_;
-  const bool size_change = sp_ && (sp_->width != sps.width || sp_->height != sps.height || sp_->log2_ctb != sps.log2_ctb);
+  if (!rext_ok(sps, pps)) return H265_FALSE;
+  const bool size_change = sp_ && (sp_->width != sps.width || sp_->height != sps.height || sp_->log2_ctb != sps.log2_ctb || sp_->chroma_format_idc != sps.chroma_format_idc ||
+                                   sp_->bit_depth_luma != sps.bit_depth_luma || sp_->bit_depth_chroma != sps.bit_depth_chroma);
   if (new_cvs) {
     // Pictures still waiting for output belong to the sequence that ends here: they go out first, unless the stream says to drop them.
     for (Picture& p : pics_) {
@@ -228,7 +233,8 @@ bool Core::start_picture(const SliceHeader& sh, int64_t pts) {
   if (size_change) {
     // Pictures of another size cannot be used or shown any more.
     for (Picture& p : pics_)
-      if (p.in_use && (p.width != sps.width || p.height != sps.height)) {
+      if (p.in_use && (p.width != sps.width || p.height != sps.height || p.chroma_format != sps.chroma_format_idc || p.depth_luma != sps.bit_depth_luma ||
+                       p.depth_chroma != sps.bit_depth_chroma)) {
         p.is_ref = p.is_long = false;
         p.needed_for_output = false;
         p.force_out = false;
@@ -273,7 +279,6 @@ bool Core::start_picture(const SliceHeader& sh, int64_t pts) {
   p->latency_count = 0;
   p->needed_for_output = false;   // decided when the picture is complete
   p->order = decode_counter_++;
-  p->full_range = false;
   for (uint64_t i = 0; i < p->col.size(); ++i) p->col[i].pred_flags = 0;
   cur_ = p;
   picture_open_ = true;
@@ -359,9 +364,13 @@ bool Core::setup_picture_state() {
   bd_c_ = s.bit_depth_chroma;
   qp_bd_y_ = 6 * (bd_y_ - 8);
   qp_bd_c_ = 6 * (bd_c_ - 8);
+  cat_ = s.chroma_array_type();
+  sub_w_ = s.sub_w_shift();
+  sub_h_ = s.sub_h_shift();
   const uint64_t sample_bytes = s.bit_depth_luma > 8 || s.bit_depth_chroma > 8 ? 2 : 1;   // (as alloc_picture lays the planes out)
+  const uint64_t cw = s.chroma_format_idc == 3 ? s.width : s.width / 2, ch = s.chroma_format_idc >= 2 ? s.height : s.height / 2;
   for (int c = 0; c < 3; ++c)
-    if (!sao_plane_[c].alloc(allocator_, static_cast<uint64_t>(c == 0 ? s.width : s.width / 2) * (c == 0 ? s.height : s.height / 2) * sample_bytes)) return false;
+    if (!sao_plane_[c].alloc(allocator_, (c == 0 ? static_cast<uint64_t>(s.width) * s.height : cw * ch) * sample_bytes)) return false;
   for (uint64_t i = 0; i < nctb; ++i) ctb_slice_[i] = -1;
   slices_.clear();
   slice_idx_ = -1;
@@ -468,7 +477,6 @@ void Core::finish_picture() {
   p->is_ref = true;
   p->is_long = false;
   p->needed_for_output = first_header_.pic_output_flag && !(is_rasl(first_header_.nal_type) && skip_rasl_);
-  p->full_range = false;
   if (p->needed_for_output) {
     for (Picture& q : pics_)
       if (q.in_use && q.needed_for_output && &q != p) ++q.latency_count;
@@ -536,8 +544,26 @@ bool Core::receive(VideoFrame* frame) {
   returned_ = best;
   const int w = best->width - best->crop_l - best->crop_r, h = best->height - best->crop_t - best->crop_b;
   const int cw = w / 2, ch = h / 2;
+  // A sample of a plane (a deep picture's planes hold 16-bit little-endian words).
+  auto sample = [](const Picture* p, int c, int x, int y) -> uint32_t {
+    if (!p->deep) return p->plane[c][static_cast<uint64_t>(y) * p->stride[c] + x];
+    const uint8_t* q = p->plane[c].data() + static_cast<uint64_t>(y) * p->stride[c] + static_cast<uint64_t>(x) * 2;
+    return static_cast<uint32_t>(q[0]) | (static_cast<uint32_t>(q[1]) << 8);
+  };
+  // The output is 4:2:0 (I420 or P010, the formats of VideoFrame): a 4:2:2 or 4:4:4 picture's chroma is the mean of the two or four samples of each 2x2 luma block
+  // (rounded; the exact planes are what DXVA gives, src/Hardware/VideoCodec/Dxva/DxvaHevc.cpp), a monochrome one's is mid-grey.
+  const int cl = best->crop_l / 2, ct = best->crop_t / 2;
+  auto chroma = [&](int c, int x, int y) -> uint32_t {
+    x += cl;
+    y += ct;
+    switch (best->chroma_format) {
+      case 2: return (sample(best, c, x, 2 * y) + sample(best, c, x, 2 * y + 1) + 1) >> 1;
+      case 3: return (sample(best, c, 2 * x, 2 * y) + sample(best, c, 2 * x + 1, 2 * y) + sample(best, c, 2 * x, 2 * y + 1) + sample(best, c, 2 * x + 1, 2 * y + 1) + 2) >> 2;
+      default: return sample(best, c, x, y);
+    }
+  };
   if (best->deep) {
-    // Cropped P010: every sample held in the top bits of its word (a 10-bit one shifted up by 6; one of fewer bits scaled up to them).
+    // Cropped P010: every sample held in the top bits of its word (a 10-bit one shifted up by 6; one of fewer bits scaled up to them, one of more cut down to 16).
     const uint64_t luma_bytes = static_cast<uint64_t>(w) * h * 2, total = luma_bytes + static_cast<uint64_t>(cw) * ch * 4;
     if (!out_frame_.alloc(allocator_, total)) return false;
     uint8_t* dst = out_frame_.data();
@@ -546,16 +572,12 @@ bool Core::receive(VideoFrame* frame) {
       *dst++ = static_cast<uint8_t>(word);
       *dst++ = static_cast<uint8_t>(word >> 8);
     };
-    auto sample = [](const Picture* p, int c, int x, int y) {
-      const uint8_t* q = p->plane[c].data() + static_cast<uint64_t>(y) * p->stride[c] + static_cast<uint64_t>(x) * 2;
-      return static_cast<uint32_t>(q[0]) | (static_cast<uint32_t>(q[1]) << 8);
-    };
     for (int y = 0; y < h; ++y)
       for (int x = 0; x < w; ++x) put(sample(best, 0, x + best->crop_l, y + best->crop_t), best->depth_luma);
     for (int y = 0; y < ch; ++y)
       for (int x = 0; x < cw; ++x) {
-        put(sample(best, 1, x + best->crop_l / 2, y + best->crop_t / 2), best->depth_chroma);
-        put(sample(best, 2, x + best->crop_l / 2, y + best->crop_t / 2), best->depth_chroma);
+        put(chroma(1, x, y), best->depth_chroma);
+        put(chroma(2, x, y), best->depth_chroma);
       }
     out_format_ = {static_cast<uint32_t>(w), static_cast<uint32_t>(h), PixelFormat::P010};
     VideoFrame f;
@@ -578,7 +600,7 @@ bool Core::receive(VideoFrame* frame) {
     for (int x = 0; x < w; ++x) *dst++ = best->plane[0][static_cast<uint64_t>(y + best->crop_t) * best->stride[0] + x + best->crop_l];
   for (int c = 1; c < 3; ++c)
     for (int y = 0; y < ch; ++y)
-      for (int x = 0; x < cw; ++x) *dst++ = best->plane[c][static_cast<uint64_t>(y + best->crop_t / 2) * best->stride[c] + x + best->crop_l / 2];
+      for (int x = 0; x < cw; ++x) *dst++ = static_cast<uint8_t>(chroma(c, x, y));
   out_format_ = {static_cast<uint32_t>(w), static_cast<uint32_t>(h), PixelFormat::I420};
   VideoFrame f;
   f.format = out_format_;
@@ -633,7 +655,9 @@ bool Core::external_begin(const ExternalPicture& e) {
     for (int i = 0; i < counts[set]; ++i) {
       const Picture* r = refs[set][i];
       // A reference must be a picture of this size other than the one being decoded (its motion is read per 16x16 block of this size).
-      if (!r || r == e.target || r->width != sp_->width || r->height != sp_->height || r->col.size() < e.target->col.size()) return H265_FALSE;
+      if (!r || r == e.target || r->width != sp_->width || r->height != sp_->height || r->chroma_format != sp_->chroma_format_idc || r->depth_luma != sp_->bit_depth_luma ||
+          r->depth_chroma != sp_->bit_depth_chroma || r->col.size() < e.target->col.size())
+        return H265_FALSE;
     }
   if (!setup_picture_state()) return H265_FALSE;
   Picture* p = e.target;
@@ -645,7 +669,6 @@ bool Core::external_begin(const ExternalPicture& e) {
   p->is_long = p->generated = p->force_out = p->needed_for_output = false;
   p->latency_count = 0;
   p->order = decode_counter_++;
-  p->full_range = false;
   poc_ = e.poc;
   num_st_before_ = e.st_before_count;
   num_st_after_ = e.st_after_count;

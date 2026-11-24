@@ -104,6 +104,7 @@ bool IntelHevcDecoder::accepts(const h265::Sps& sps, const h265::Pps& pps) {
   if (!buffers_.leased()) return false;
   if (!buffers_.engine_ready()) return buffers_.is_open();   // a wedged engine still owns the stream it was decoding; a stream that never started can go to the CPU
   if (sps.chroma_format_idc != 1 || sps.bit_depth_luma != 8 || sps.bit_depth_chroma != 8 || sps.width < 16 || sps.height < 16) return false;
+  if (sps.range_extension_tools() || pps.range_extension_tools()) return false;   // (Main profile engine: the range extension tools go to the CPU)
   if (static_cast<uint32_t>(sps.width) > IntelEngineBuffers::kMaxMbsPerSide * 16 || static_cast<uint32_t>(sps.height) > IntelEngineBuffers::kMaxMbsPerSide * 16) return false;
   if (sps.log2_ctb < 4 || sps.log2_ctb > 6) return false;
   return pps.num_tile_cols >= 1 && pps.num_tile_cols <= 19 && pps.num_tile_rows >= 1 && pps.num_tile_rows <= 21;

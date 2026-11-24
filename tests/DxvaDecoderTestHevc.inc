@@ -1,4 +1,5 @@
-// DxvaDecoderTest: the HEVC cases (DxvaProfile::HevcVldMain and HevcVldMain10, src/Hardware/VideoCodec/Dxva/DxvaHevc.cpp).
+// DxvaDecoderTest: the HEVC cases (DxvaProfile::HevcVldMain and HevcVldMain10, src/Hardware/VideoCodec/Dxva/DxvaHevc.cpp; the range extension profiles in
+// DxvaDecoderTestHevcRext.inc).
 //
 // The program: the kernel's own H.265 decoder (H265Decoder) parses each stream of tests/data/hevc_*.h265 and keeps the decoded picture buffer, as ffmpeg's hevc
 // decoder does for its hwaccel; its IOffload hook hands every picture over - parameter sets, slice headers, the reference picture sets as picture buffer slots, the
@@ -666,6 +667,8 @@ void dxva_hevc_main10_errors() {
 
 }  // namespace
 
+#include "DxvaDecoderTestHevcRext.inc"
+
 static void dxva_test_hevc() {
   static const char* kStreams[] = {"hevc_bframes.h265", "hevc_cip.h265",      "hevc_cra.h265",     "hevc_ctu64.h265",   "hevc_cutree_off.h265",
                                    "hevc_highrate.h265", "hevc_intra_filt.h265", "hevc_intra.h265",   "hevc_ipp_filt.h265", "hevc_ipp.h265",
@@ -702,4 +705,5 @@ static void dxva_test_hevc() {
   dxva_hevc_errors();
   dxva_hevc_main10_errors();
   if (const char* dump = getenv("DXVA_HEVC10_DUMP")) hevc10_dump_windows_data(dump);
+  dxva_test_hevc_rext();
 }

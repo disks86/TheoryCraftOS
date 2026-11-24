@@ -83,6 +83,21 @@ struct QmatrixHevc {
   uint8_t ucScalingListDCCoefSizeID3[2];
 };
 
+// DXVA_PicParams_HEVC_RangeExt (the DXVA HEVC range extension decoding specification; dxva.h): DXVA_PicParams_HEVC and then the SPS / PPS range extension fields,
+// which the range extension profiles (DXVA_ModeHEVC_VLD_Main12 .. _Main16, _Monochrome, _Monochrome10) take as their picture parameter buffer.
+struct PicParamsHevcRangeExt {
+  PicParamsHevc params;
+  uint16_t dwRangeExtensionFlags;                 // see hevc_rext
+  uint8_t diff_cu_chroma_qp_offset_depth;
+  uint8_t log2_sao_offset_scale_luma;
+  uint8_t log2_sao_offset_scale_chroma;
+  uint8_t log2_max_transform_skip_block_size_minus2;
+  int8_t cb_qp_offset_list[6];
+  int8_t cr_qp_offset_list[6];
+  uint8_t chroma_qp_offset_list_len_minus1;
+  uint16_t ReservedBits9;
+};
+
 struct SliceHevcShort {
   uint32_t BSNALunitDataLocation;
   uint32_t SliceBytesInBuffer;
@@ -99,6 +114,10 @@ static_assert(offsetof(PicParamsHevc, CurrPic) == 6 && offsetof(PicParamsHevc, w
                   offsetof(PicParamsHevc, PicOrderCntValList) == 140 && offsetof(PicParamsHevc, RefPicSetStCurrBefore) == 200 &&
                   offsetof(PicParamsHevc, StatusReportFeedbackNumber) == 228,
               "DXVA_PicParams_HEVC layout");
+static_assert(sizeof(PicParamsHevcRangeExt) == 253 && offsetof(PicParamsHevcRangeExt, dwRangeExtensionFlags) == 232 &&
+                  offsetof(PicParamsHevcRangeExt, cb_qp_offset_list) == 238 && offsetof(PicParamsHevcRangeExt, cr_qp_offset_list) == 244 &&
+                  offsetof(PicParamsHevcRangeExt, chroma_qp_offset_list_len_minus1) == 250,
+              "DXVA_PicParams_HEVC_RangeExt layout (mingw-w64's dxva.h: 253 bytes)");
 static_assert(sizeof(QmatrixHevc) == 1000, "DXVA_Qmatrix_HEVC is 1000 bytes");
 static_assert(sizeof(SliceHevcShort) == 10, "DXVA_Slice_HEVC_Short is 10 bytes");
 
@@ -119,6 +138,12 @@ constexpr int kConstrainedIntraPred = 0, kTransformSkip = 1, kCuQpDelta = 2, kSl
               kTransquantBypass = 6, kTiles = 7, kEntropyCodingSync = 8, kUniformSpacing = 9, kLoopFilterAcrossTiles = 10, kLoopFilterAcrossSlices = 11,
               kDeblockingOverride = 12, kDeblockingDisabled = 13, kListsModificationPresent = 14, kSliceHeaderExtensionPresent = 15, kIrapPic = 16, kIdrPic = 17,
               kIntraPic = 18;
+}
+
+// DXVA_PicParams_HEVC_RangeExt::dwRangeExtensionFlags: bit positions (note the order: persistent_rice before high_precision_offsets, unlike the SPS)
+namespace hevc_rext {
+constexpr int kTransformSkipRotation = 0, kTransformSkipContext = 1, kImplicitRdpcm = 2, kExplicitRdpcm = 3, kExtendedPrecision = 4, kIntraSmoothingDisabled = 5,
+              kPersistentRice = 6, kHighPrecisionOffsets = 7, kCabacBypassAlignment = 8, kCrossComponentPrediction = 9, kChromaQpOffsetList = 10;
 }
 
 }  // namespace dxva

@@ -243,6 +243,20 @@ static const Stream10 kStreams10[] = {
     {"hevc10_pcm", 2, false},
 };
 
+// The range extension streams: every chroma format at 8 to 12 bits (tests/data/hevcrext_*.h265, scripts/gen_hevc_rext_test_streams.sh, x265's), and the range extension
+// tools (tests/data/hevcrexttool_*.h265, scripts/gen_hevc_rext_tool_streams.py). Every picture carries an MD5 of each of its planes - x265's of its reconstruction, and in
+// the tool streams FFmpeg's decode of them, checked against libde265's - which the decoder checks over its own planes (the 4:2:0 frames it outputs say less for 4:2:2 and
+// 4:4:4: their chroma is averaged down).
+static const Stream10 kStreamsRext[] = {
+    {"hevcrext_400_8", 8, true},      {"hevcrext_400_12", 8, true},     {"hevcrext_420_12", 8, true},    {"hevcrext_420_12_lossless", 8, true}, {"hevcrext_422_8", 8, true},
+    {"hevcrext_422_10", 8, true},     {"hevcrext_422_10_intra", 4, true}, {"hevcrext_422_12", 8, true},  {"hevcrext_444_8", 8, true},           {"hevcrext_444_8_intra", 4, true},
+    {"hevcrext_444_10", 8, true},     {"hevcrext_444_12", 8, true},     {"hevcrext_444_12_ctu64", 6, true}, {"hevcrext_422_10_oddsize", 6, true},
+    {"hevcrext_444_10_scaling", 4, true},
+    {"hevcrexttool_444_8", 3, true},  {"hevcrexttool_444_8_lossless", 3, true}, {"hevcrexttool_444_12", 3, true}, {"hevcrexttool_422_10", 3, true},
+    {"hevcrexttool_420_8", 3, true},  {"hevcrexttool_400_10", 3, true}, {"hevcrexttool_444_10_lossless", 3, true}, {"hevcrexttool_444_12_hpo", 3, true},
+    {"hevcrexttool_422_10_sao_lossless", 3, true}, {"hevcrexttool_400_12_hpo", 3, true},
+};
+
 int main(int argc, char** argv) {
   setvbuf(stdout, nullptr, _IONBF, 0);
   for (const char* name : kStreams) {
@@ -295,7 +309,32 @@ int main(int argc, char** argv) {
     }
     CHECK(a.live == 0);
   }
+  for (const Stream10& st : kStreamsRext) {
+    if (argc > 1 && strcmp(argv[1], st.name) != 0) continue;
+    const char* dir = getenv("H265_DIR") ? getenv("H265_DIR") : "tests/data";
+    char path[160];
+    snprintf(path, sizeof path, "%s/%s.h265", dir, st.name);
+    const std::vector<uint8_t> stream = read_file(path);
+    CHECK(!stream.empty());
+    if (stream.empty()) continue;
+    TestAllocator a;
+    {
+      const Result r = decode_stream(a, stream, {});
+      printf("  %-32s %d pictures, %llu checked against the stream's hashes, %llu differ\n", st.name, r.frames, (unsigned long long)r.hash.checked,
+             (unsigned long long)r.hash.mismatched);
+      CHECK(r.frames == st.frames && r.hash.mismatched == 0);
+      CHECK(r.hash.checked == uint64_t(st.hashed ? r.frames : 0));
+    }
+    CHECK(a.live == 0);
+  }
   if (argc == 1) {
+    test_damaged("hevcrext_422_10");
+    test_damaged("hevcrext_444_8");
+    test_damaged("hevcrext_444_12");
+    test_damaged("hevcrext_400_12");
+    test_damaged("hevcrexttool_444_8");
+    test_damaged("hevcrexttool_444_12");
+    test_damaged("hevcrexttool_422_10_sao_lossless");
     test_damaged("hevc10_tools");
     test_damaged("hevc10_sao");
     test_damaged("hevc10_lossless");

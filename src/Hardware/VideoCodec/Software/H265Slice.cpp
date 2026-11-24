@@ -150,6 +150,19 @@ bool Core::decode_slice_data(const SliceHeader& sh, BitReader& br) {
   int ts = rs_to_ts_[sh.segment_address];
   bool first = true;
   cabac_.init_engine();
+  if (!sh.dependent_slice_segment) {
+    cu_qp_offset_cb_ = cu_qp_offset_cr_ = 0;
+    chroma_qp_offset_coded_ = false;
+  }
+  // The context variables and StatCoeff (9.3.2.4: they are stored and synchronised together).
+  auto restore = [&](const uint8_t* ctx, const int* stat) {
+    cabac_.restore(ctx);
+    for (int k = 0; k < 4; ++k) stat_coeff_[k] = stat[k];
+  };
+  auto save = [&](uint8_t* ctx, int* stat) {
+    cabac_.save(ctx);
+    for (int k = 0; k < 4; ++k) stat[k] = stat_coeff_[k];
+  };
   for (;;) {
     ctb_addr_ts_ = ts;
     ctb_addr_rs_ = ts_to_rs_[ts];
@@ -167,17 +180,20 @@ bool Core::decode_slice_data(const SliceHeader& sh, BitReader& br) {
         fresh = true;
       } else if (row_start) {
         if (available(x_ctb, y_ctb, x_ctb + sps.ctb_size, y_ctb - sps.ctb_size) && wpp_saved_valid_) {
-          cabac_.restore(wpp_saved_);
+          restore(wpp_saved_, wpp_stat_);
           fresh = false;
         } else if (first && sh.dependent_slice_segment && ctx_end_valid_) {
-          cabac_.restore(ctx_end_of_segment_);
+          restore(ctx_end_of_segment_, end_stat_);
           fresh = false;
         }
       } else if (first && sh.dependent_slice_segment && ctx_end_valid_) {
-        cabac_.restore(ctx_end_of_segment_);
+        restore(ctx_end_of_segment_, end_stat_);
         fresh = false;
       }
-      if (fresh) cabac_.init_contexts(init_type, sh.slice_qp);
+      if (fresh) {
+        cabac_.init_contexts(init_type, sh.slice_qp);
+        for (int& k : stat_coeff_) k = 0;
+      }
       if (tile_start || row_start) qp_y_prev_ = sh.slice_qp;
     }
     first = false;
@@ -188,12 +204,12 @@ bool Core::decode_slice_data(const SliceHeader& sh, BitReader& br) {
     const bool end_of_segment = cabac_.terminate() != 0;
     if (br.error()) return H265_FALSE;
     if (pps.entropy_coding_sync && rx == col_bd_[tile_col] + 1) {
-      cabac_.save(wpp_saved_);
+      save(wpp_saved_, wpp_stat_);
       wpp_saved_valid_ = true;
     }
     ++ts;
     if (end_of_segment) {
-      cabac_.save(ctx_end_of_segment_);
+      save(ctx_end_of_segment_, end_stat_);
       ctx_end_valid_ = true;
       return true;
     }
@@ -262,10 +278,11 @@ void Core::read_sao(int rx, int ry) {
       p.type[2] = p.type[1];
     }
     if (p.type[c] == 0) continue;
-    // sao_offset_abs: TR with cMax (1 << (Min(bitDepth, 10) - 5)) - 1 (7 at 8 bits, 31 at 10); SaoOffsetVal is it << (bitDepth - Min(bitDepth, 10)) (7.4.9.3.2)
+    // sao_offset_abs: TR with cMax (1 << (Min(bitDepth, 10) - 5)) - 1 (7 at 8 bits, 31 at 10 and more); SaoOffsetVal is it << log2OffsetScale, the PPS's
+    // log2_sao_offset_scale_luma / _chroma (0 without the range extension) (7-72)
     const int bd = c == 0 ? bd_y_ : bd_c_;
     const int bd10 = bd < 10 ? bd : 10;
-    const int c_max = (1 << (bd10 - 5)) - 1, scale = bd - bd10;
+    const int c_max = (1 << (bd10 - 5)) - 1, scale = c == 0 ? pp_->log2_sao_offset_scale_luma : pp_->log2_sao_offset_scale_chroma;
     int abs_offset[4];
     for (int i = 0; i < 4; ++i) {
       int v = 0;
@@ -307,6 +324,7 @@ void Core::coding_quadtree(int x0, int y0, int log2_size, int depth) {
   } else {
     split = log2_size > sps.log2_min_cb;
   }
+  if (sh_.cu_chroma_qp_offset_enabled && log2_size >= sps.log2_ctb - pps.diff_cu_chroma_qp_offset_depth) chroma_qp_offset_coded_ = false;
   if (pps.cu_qp_delta_enabled && log2_size >= sps.log2_ctb - pps.diff_cu_qp_delta_depth) {
     is_cu_qp_delta_coded_ = false;
     cu_qp_delta_val_ = 0;
@@ -351,13 +369,34 @@ void Core::update_qp(int x_cb, int y_cb) {
   set_qp_block(x_cb, y_cb, 1 << cur_cb_log2_, 1 << cur_cb_log2_, qp_y_);
 }
 
-// 8.6.1: the quantiser of a chroma block, Qp'C = qPC + QpBdOffsetC with qPC from Table 8-10 for qPi = Clip3(-QpBdOffsetC, 57, QpY + the offsets)
+// 8.6.1: the quantiser of a chroma block, Qp'C = qPC + QpBdOffsetC with qPC for qPi = Clip3(-QpBdOffsetC, 57, QpY + the offsets): Table 8-10 for 4:2:0, Min(qPi, 51)
+// for the other chroma formats. The offsets are the PPS's, the slice's and the coding unit's (CuQpOffsetCb / Cr, the range extension's chroma QP offset lists).
 int Core::chroma_qp(int c_idx) const {
   static const int kQpC[14] = {29, 30, 31, 32, 33, 33, 34, 34, 35, 35, 36, 36, 37, 37};
-  const int offset = c_idx == 1 ? pp_->cb_qp_offset + slice_->cb_qp_offset : pp_->cr_qp_offset + slice_->cr_qp_offset;
+  const int offset = c_idx == 1 ? pp_->cb_qp_offset + slice_->cb_qp_offset + cu_qp_offset_cb_ : pp_->cr_qp_offset + slice_->cr_qp_offset + cu_qp_offset_cr_;
   const int qpi = clip3(-qp_bd_c_, 57, qp_y_ + offset);
-  const int qpc = qpi < 30 ? qpi : qpi >= 43 ? qpi - 6 : kQpC[qpi - 30];
+  int qpc;
+  if (cat_ == 1) qpc = qpi < 30 ? qpi : qpi >= 43 ? qpi - 6 : kQpC[qpi - 30];
+  else qpc = qpi < 51 ? qpi : 51;
   return qpc + qp_bd_c_;
+}
+
+// 8.4.3: IntraPredModeC from intra_chroma_pred_mode (4: the luma mode) and the luma mode of the block (Table 8-2), mapped through Table 8-3 for 4:2:2.
+int Core::chroma_mode_from(int syntax, int luma_mode) const {
+  static const int kChromaModes[4] = {0, 26, 10, 1};
+  static const uint8_t kMode422[35] = {0, 1, 2, 2, 2, 2, 3, 5, 7, 8, 10, 12, 13, 15, 17, 18, 19, 20, 21, 22, 23, 23, 24, 24, 25, 25, 26, 27, 27, 28, 28, 29, 29, 30, 31};
+  int mode = syntax == 4 ? luma_mode : (kChromaModes[syntax] == luma_mode ? 34 : kChromaModes[syntax]);
+  if (cat_ == 2) mode = kMode422[mode];
+  return mode;
+}
+
+// 7.3.6.1 / 7.4.7.1 and the range extension's limits that tie the PPS to its SPS.
+bool Core::rext_ok(const Sps& sps, const Pps& pps) {
+  if (pps.cross_component_prediction && sps.chroma_array_type() != 3) return H265_FALSE;
+  if (pps.chroma_qp_offset_list && pps.diff_cu_chroma_qp_offset_depth > sps.log2_ctb - sps.log2_min_cb) return H265_FALSE;
+  const int sao_y = sps.bit_depth_luma > 10 ? sps.bit_depth_luma - 10 : 0, sao_c = sps.bit_depth_chroma > 10 ? sps.bit_depth_chroma - 10 : 0;
+  if (pps.log2_sao_offset_scale_luma > sao_y || pps.log2_sao_offset_scale_chroma > sao_c) return H265_FALSE;
+  return true;
 }
 
 void Core::coding_unit(int x0, int y0, int log2_size) {
@@ -500,16 +539,24 @@ void Core::coding_unit(int x0, int y0, int log2_size) {
       for (int y = yp >> 2; y < (yp + pb) >> 2; ++y)
         for (int x = xp >> 2; x < (xp + pb) >> 2; ++x) intra_mode_[static_cast<uint64_t>(y) * w4_ + x] = static_cast<uint8_t>(mode);
     }
-    // chroma mode (8.4.3, 4:2:0)
-    int chroma_syntax = 4;
-    if (cabac_.decision(kCtxChromaPred)) chroma_syntax = cabac_.bypass_bits(2);
-    static const int kChromaModes[4] = {0, 26, 10, 1};
-    const int luma0 = intra_luma_modes_[0];
-    int chroma_mode;
-    if (chroma_syntax == 4) chroma_mode = luma0;
-    else chroma_mode = kChromaModes[chroma_syntax] == luma0 ? 34 : kChromaModes[chroma_syntax];
-    for (int i = 0; i < 4; ++i) intra_chroma_mode_[i] = chroma_mode;
     if (parts == 1) for (int i = 1; i < 4; ++i) intra_luma_modes_[i] = intra_luma_modes_[0];
+    // chroma modes (8.4.3): one for the coding unit, or with 4:4:4 one for each part of an NxN unit; none for 4:0:0
+    const int chroma_parts = cat_ == 3 ? parts : cat_ != 0 ? 1 : 0;
+    for (int i = 0; i < 4; ++i) {
+      intra_chroma_mode_[i] = 0;
+      chroma_dm_[i] = false;
+    }
+    for (int i = 0; i < chroma_parts; ++i) {
+      int syntax = 4;
+      if (cabac_.decision(kCtxChromaPred)) syntax = cabac_.bypass_bits(2);
+      chroma_dm_[i] = syntax == 4;
+      intra_chroma_mode_[i] = chroma_mode_from(syntax, intra_luma_modes_[i]);
+    }
+    if (chroma_parts == 1)
+      for (int i = 1; i < 4; ++i) {
+        intra_chroma_mode_[i] = intra_chroma_mode_[0];
+        chroma_dm_[i] = chroma_dm_[0];
+      }
   } else {
     fill_mode(2);
     mark_cb_edges();
@@ -565,11 +612,13 @@ void Core::read_pcm_px(int x0, int y0, int log2_size) {
   Pel* luma = samples<Pel>(p->plane[0]);
   for (int y = 0; y < n; ++y)
     for (int x = 0; x < n; ++x) luma[static_cast<uint64_t>(y0 + y) * stride_y + x0 + x] = static_cast<Pel>(br_->u(sps.pcm_bit_depth_luma) << shift_y);
-  for (int c = 1; c < 3; ++c) {
+  // the chroma samples: (n / SubWidthC) x (n / SubHeightC) of each component, none for 4:0:0
+  for (int c = 1; c < 3 && cat_ != 0; ++c) {
     const int stride_c = p->stride[c] / static_cast<int>(sizeof(Pel));
     Pel* chroma = samples<Pel>(p->plane[c]);
-    for (int y = 0; y < n / 2; ++y)
-      for (int x = 0; x < n / 2; ++x) chroma[static_cast<uint64_t>(y0 / 2 + y) * stride_c + x0 / 2 + x] = static_cast<Pel>(br_->u(sps.pcm_bit_depth_chroma) << shift_c);
+    for (int y = 0; y < n >> sub_h_; ++y)
+      for (int x = 0; x < n >> sub_w_; ++x)
+        chroma[static_cast<uint64_t>((y0 >> sub_h_) + y) * stride_c + (x0 >> sub_w_) + x] = static_cast<Pel>(br_->u(sps.pcm_bit_depth_chroma) << shift_c);
   }
   cabac_.init_engine();
 }
@@ -577,6 +626,7 @@ void Core::read_pcm_px(int x0, int y0, int log2_size) {
 // ---------------------------------------------------------------------------------------------------------------------------------------------------------------
 // Transform tree and transform unit
 
+// 7.3.8.8. The chroma coded block flags: cbf_cb[0] / cbf_cr[0], and with 4:2:2 [1] for the lower of the two square chroma blocks of the transform block.
 void Core::transform_tree(int x0, int y0, int x_base, int y_base, int log2_size, int depth, int blk_idx, bool cbf_cb_parent[2], bool cbf_cr_parent[2], int inter_split) {
   const Sps& sps = *sp_;
   const bool intra_split = cur_intra_ && cur_part_mode_ == kPartNxN;
@@ -586,12 +636,23 @@ void Core::transform_tree(int x0, int y0, int x_base, int y_base, int log2_size,
   else
     split = log2_size > sps.log2_max_tb || (intra_split && depth == 0) || (inter_split && depth == 0);
   bool cbf_cb[2] = {false, false}, cbf_cr[2] = {false, false};
-  if (log2_size > 2) {
-    if (depth == 0 || cbf_cb_parent[0]) cbf_cb[0] = cabac_.decision(kCtxCbfChroma + depth) != 0;
-    if (depth == 0 || cbf_cr_parent[0]) cbf_cr[0] = cabac_.decision(kCtxCbfChroma + depth) != 0;
-  } else if (depth > 0) {
-    cbf_cb[0] = cbf_cb_parent[0];   // 4x4 luma blocks share the chroma blocks of their parent
+  if ((log2_size > 2 && cat_ != 0) || cat_ == 3) {
+    const int ctx = depth < 4 ? kCtxCbfChroma + depth : kCtxCbfChroma4;   // (depth 4 only with 4:4:4: 4x4 chroma blocks of a 64x64 coding unit)
+    const bool two = cat_ == 2 && (!split || log2_size == 3);
+    if (depth == 0 || cbf_cb_parent[0]) {
+      cbf_cb[0] = cabac_.decision(ctx) != 0;
+      if (two) cbf_cb[1] = cabac_.decision(ctx) != 0;
+    }
+    if (depth == 0 || cbf_cr_parent[0]) {
+      cbf_cr[0] = cabac_.decision(ctx) != 0;
+      if (two) cbf_cr[1] = cabac_.decision(ctx) != 0;
+    }
+  } else if (depth > 0 && cat_ != 0) {
+    // 4x4 luma blocks share the chroma blocks of their parent (4:2:0, 4:2:2)
+    cbf_cb[0] = cbf_cb_parent[0];
+    cbf_cb[1] = cbf_cb_parent[1];
     cbf_cr[0] = cbf_cr_parent[0];
+    cbf_cr[1] = cbf_cr_parent[1];
   }
   if (split) {
     const int half = 1 << (log2_size - 1);
@@ -601,17 +662,42 @@ void Core::transform_tree(int x0, int y0, int x_base, int y_base, int log2_size,
     transform_tree(x0 + half, y0 + half, x0, y0, log2_size - 1, depth + 1, 3, cbf_cb, cbf_cr, inter_split);
   } else {
     bool cbf_luma = true;
-    if (cur_intra_ || depth != 0 || cbf_cb[0] || cbf_cr[0]) cbf_luma = cabac_.decision(kCtxCbfLuma + (depth == 0 ? 1 : 0)) != 0;
+    if (cur_intra_ || depth != 0 || cbf_cb[0] || cbf_cr[0] || cbf_cb[1] || cbf_cr[1]) cbf_luma = cabac_.decision(kCtxCbfLuma + (depth == 0 ? 1 : 0)) != 0;
     transform_unit(x0, y0, x_base, y_base, log2_size, depth, blk_idx, cbf_luma, cbf_cb, cbf_cr);
   }
 }
 
+// 7.3.8.13
+void Core::chroma_qp_offset() {
+  if (!sh_.cu_chroma_qp_offset_enabled || chroma_qp_offset_coded_) return;
+  const bool flag = cabac_.decision(kCtxCuChromaQpOffsetFlag) != 0;
+  int idx = 0;
+  if (flag && pp_->chroma_qp_offset_list_len > 1) {   // TR, cMax chroma_qp_offset_list_len_minus1, every bin of the one context
+    const int c_max = pp_->chroma_qp_offset_list_len - 1;
+    while (idx < c_max && cabac_.decision(kCtxCuChromaQpOffsetIdx)) ++idx;
+  }
+  cu_qp_offset_cb_ = flag ? pp_->cb_qp_offset_list[idx] : 0;
+  cu_qp_offset_cr_ = flag ? pp_->cr_qp_offset_list[idx] : 0;
+  chroma_qp_offset_coded_ = true;
+}
+
+// 7.3.8.12: log2_res_scale_abs_plus1 (TR, cMax 4, context 4 * c + binIdx) and res_scale_sign_flag; ResScaleVal (7-81)
+int Core::cross_comp_pred(int c) {
+  int abs_plus1 = 0;
+  while (abs_plus1 < 4 && cabac_.decision(kCtxLog2ResScale + 4 * c + abs_plus1)) ++abs_plus1;
+  if (abs_plus1 == 0) return 0;
+  const int sign = cabac_.decision(kCtxResScaleSign + c);
+  return (1 << (abs_plus1 - 1)) * (1 - 2 * sign);
+}
+
+// 7.3.8.10
 void Core::transform_unit(int x0, int y0, int x_base, int y_base, int log2_size, int depth, int blk_idx, bool cbf_luma, bool cbf_cb[2], bool cbf_cr[2]) {
   const Pps& pps = *pp_;
-  const int log2_c = imax(2, log2_size - 1);
-  const bool chroma_here = log2_size > 2;
-  const bool chroma_blk = chroma_here || blk_idx == 3;   // chroma of four 4x4 luma blocks is handled with the last
-  const bool cbf_chroma = cbf_cb[0] || cbf_cr[0];
+  const int log2_c = imax(2, log2_size - (cat_ == 3 ? 0 : 1));   // log2TrafoSizeC
+  const bool chroma_here = cat_ != 0 && (log2_size > 2 || cat_ == 3);
+  const bool chroma_last = cat_ != 0 && !chroma_here && blk_idx == 3;   // the chroma of four 4x4 luma blocks goes with the last of them
+  const bool cbf_chroma = cat_ != 0 && (cbf_cb[0] || cbf_cr[0] || cbf_cb[1] || cbf_cr[1]);
+  const int chroma_blocks = cat_ == 2 ? 2 : 1;
   (void)depth;
   // The edges of the transform block are edges for the loop filter.
   for (int i = 0; i < (1 << log2_size) >> 2; ++i) {
@@ -633,27 +719,33 @@ void Core::transform_unit(int x0, int y0, int x_base, int y_base, int log2_size,
     cu_qp_delta_val_ = delta;
     update_qp(cur_cb_x_, cur_cb_y_);
   }
+  if (cbf_chroma && !cu_transquant_bypass_) chroma_qp_offset();
   const int half_cb = (1 << cur_cb_log2_) >> 1;
-  const int mode_idx = cur_intra_ && cur_part_mode_ == kPartNxN ? ((y0 - cur_cb_y_ >= half_cb ? 2 : 0) + (x0 - cur_cb_x_ >= half_cb ? 1 : 0)) : 0;
+  const int part = cur_intra_ && cur_part_mode_ == kPartNxN ? ((y0 - cur_cb_y_ >= half_cb ? 2 : 0) + (x0 - cur_cb_x_ >= half_cb ? 1 : 0)) : 0;
   // luma
-  if (cur_intra_) predict_intra(x0, y0, log2_size, 0, intra_luma_modes_[mode_idx]);
+  const int luma_mode = cur_intra_ ? intra_luma_modes_[part] : -1;
+  if (cur_intra_) predict_intra(x0, y0, log2_size, 0, luma_mode);
   if (cbf_luma) {
-    residual_coding(x0, y0, log2_size, 0);
-    reconstruct_block(x0, y0, log2_size, 0);
+    residual_coding(x0, y0, log2_size, 0, luma_mode);
+    reconstruct_block(x0, y0, log2_size, 0, luma_mode, true, 0);
     for (int y = y0 >> 2; y < (y0 + (1 << log2_size)) >> 2; ++y)
       for (int x = x0 >> 2; x < (x0 + (1 << log2_size)) >> 2; ++x) nz_[static_cast<uint64_t>(y) * w4_ + x] = 1;
   }
-  // chroma
-  if (chroma_blk) {
-    const int xc = chroma_here ? x0 / 2 : x_base / 2, yc = chroma_here ? y0 / 2 : y_base / 2;
-    const int lc = chroma_here ? log2_c : 2;
-    for (int c = 1; c < 3; ++c) {
-      if (cur_intra_) predict_intra(xc, yc, lc, c, intra_chroma_mode_[0]);
-      const bool cbf = c == 1 ? cbf_cb[0] : cbf_cr[0];
-      if (cbf) {
-        residual_coding(xc, yc, lc, c);
-        reconstruct_block(xc, yc, lc, c);
-      }
+  if (!chroma_here && !chroma_last) return;
+  // chroma: one block of (1 << log2_c) squared, or with 4:2:2 two of them, one above the other; each predicted from what the one before reconstructed
+  const int xc = (chroma_here ? x0 : x_base) >> sub_w_, yc = (chroma_here ? y0 : y_base) >> sub_h_;
+  const int lc = chroma_here ? log2_c : 2;
+  const int chroma_mode = cur_intra_ ? intra_chroma_mode_[part] : -1;
+  // cross-component prediction (4:4:4 only): the chroma residual takes a scaled copy of the luma one
+  const bool cross = pps.cross_component_prediction && cbf_luma && (!cur_intra_ || chroma_dm_[part]);
+  for (int c = 1; c < 3; ++c) {
+    const int res_scale = cross ? cross_comp_pred(c - 1) : 0;
+    for (int t = 0; t < chroma_blocks; ++t) {
+      const int yt = yc + (t << lc);
+      if (cur_intra_) predict_intra(xc, yt, lc, c, chroma_mode);
+      const bool cbf = c == 1 ? cbf_cb[t] : cbf_cr[t];
+      if (cbf) residual_coding(xc, yt, lc, c, chroma_mode);
+      if (cbf || res_scale != 0) reconstruct_block(xc, yt, lc, c, chroma_mode, cbf, res_scale);
     }
   }
 }
@@ -1013,12 +1105,21 @@ void Core::prediction_unit(int x0, int y0, int w, int h, int part_idx, int log2_
 // ---------------------------------------------------------------------------------------------------------------------------------------------------------------
 // Residual coding (7.3.8.11)
 
-void Core::residual_coding(int x0, int y0, int log2_size, int c_idx) {
+void Core::residual_coding(int x0, int y0, int log2_size, int c_idx, int intra_mode) {
   const Pps& pps = *pp_;
+  const Sps& sps = *sp_;
   const int n = 1 << log2_size;
   for (int i = 0; i < n * n; ++i) coeff_[i] = 0;
+  (void)x0;
+  (void)y0;
   ts_flag_ = false;
-  if (pps.transform_skip && !cu_transquant_bypass_ && log2_size <= 2) ts_flag_ = cabac_.decision(kCtxTransformSkip + (c_idx ? 1 : 0)) != 0;
+  rdpcm_ = 0;
+  if (pps.transform_skip && !cu_transquant_bypass_ && log2_size <= pps.log2_max_transform_skip) ts_flag_ = cabac_.decision(kCtxTransformSkip + (c_idx ? 1 : 0)) != 0;
+  // explicit_rdpcm_flag / explicit_rdpcm_dir_flag: inter blocks without a transform (0: horizontal, 1: vertical)
+  if (!cur_intra_ && sps.explicit_rdpcm && (ts_flag_ || cu_transquant_bypass_) && cabac_.decision(kCtxExplicitRdpcm + (c_idx ? 1 : 0)))
+    rdpcm_ = cabac_.decision(kCtxExplicitRdpcmDir + (c_idx ? 1 : 0)) ? 2 : 1;
+  const bool no_transform = ts_flag_ || cu_transquant_bypass_;
+  const bool implicit_rdpcm = cur_intra_ && sps.implicit_rdpcm && ts_flag_ && (intra_mode == 10 || intra_mode == 26);
 
   // last significant coefficient
   int ctx_offset, ctx_shift;
@@ -1037,12 +1138,11 @@ void Core::residual_coding(int x0, int y0, int log2_size, int c_idx) {
   if (px > 3) last_x = (1 << ((px >> 1) - 1)) * (2 + (px & 1)) + cabac_.bypass_bits((px >> 1) - 1);
   if (py > 3) last_y = (1 << ((py >> 1) - 1)) * (2 + (py & 1)) + cabac_.bypass_bits((py >> 1) - 1);
 
-  // scan order (7.4.9.11)
+  // scan order (7.4.9.11): mode dependent for intra 4x4 blocks and 8x8 luma (and 8x8 chroma of 4:4:4)
   int scan_idx = 0;
-  if (cur_intra_ && (log2_size == 2 || (log2_size == 3 && c_idx == 0))) {
-    const int mode = c_idx == 0 ? intra_mode_[static_cast<uint64_t>(y0 >> 2) * w4_ + (x0 >> 2)] : intra_chroma_mode_[0];
-    if (mode >= 6 && mode <= 14) scan_idx = 2;
-    else if (mode >= 22 && mode <= 30) scan_idx = 1;
+  if (cur_intra_ && (log2_size == 2 || (log2_size == 3 && (c_idx == 0 || cat_ == 3)))) {
+    if (intra_mode >= 6 && intra_mode <= 14) scan_idx = 2;
+    else if (intra_mode >= 22 && intra_mode <= 30) scan_idx = 1;
   }
   if (scan_idx == 2) { const int t = last_x; last_x = last_y; last_y = t; }
   if (last_x >= n || last_y >= n) return;   // (damaged stream)
@@ -1058,11 +1158,14 @@ void Core::residual_coding(int x0, int y0, int log2_size, int c_idx) {
   for (int i = 0; i < 16; ++i)
     if (px4[i] == (last_x & 3) && py4[i] == (last_y & 3)) { last_pos = i; break; }
 
+  // CoeffMin / CoeffMax (7-29 .. 7-32) and the persistent Rice parameter statistics (9.3.3.11: sbType)
+  const int log2_range = sps.log2_transform_range(c_idx ? bd_c_ : bd_y_);
+  const int coeff_max = (1 << log2_range) - 1, coeff_min = -(1 << log2_range);
+  const int sb_type = (c_idx == 0 ? 2 : 0) + (no_transform ? 1 : 0);
+  const bool sign_hiding_allowed = pps.sign_data_hiding && !cu_transquant_bypass_ && !implicit_rdpcm && rdpcm_ == 0;
   uint8_t csbf[8][8] = {};
   const int sb_w = 1 << (log2_size - 2);
   int c1 = 1;   // greater1Ctx carried between sub-blocks
-  bool first_subblock_done = false;
-  (void)first_subblock_done;
   for (int i = last_sub; i >= 0; --i) {
     const int xs = sbx[i], ys = sby[i];
     bool infer_dc = false;
@@ -1085,26 +1188,31 @@ void Core::residual_coding(int x0, int y0, int log2_size, int c_idx) {
       const int xp = px4[p], yp = py4[p];
       if (p > 0 || !infer_dc) {
         // sig_coeff_flag context (9.3.4.2.5)
-        int sig_ctx;
+        int ctx;
         const int xc = (xs << 2) + xp, yc = (ys << 2) + yp;
-        if (log2_size == 2) {
-          sig_ctx = kCtxIdxMap4x4[(yc << 2) + xc];
-        } else if (xc + yc == 0) {
-          sig_ctx = 0;
+        if (sps.transform_skip_context && no_transform) {
+          ctx = kCtxSigCoeffSkip + (c_idx ? 1 : 0);   // (sigCtx 42 for luma, 16 + 27 for chroma)
         } else {
-          if (prev_csbf == 0) sig_ctx = (xp + yp == 0) ? 2 : (xp + yp < 3) ? 1 : 0;
-          else if (prev_csbf == 1) sig_ctx = yp == 0 ? 2 : yp == 1 ? 1 : 0;
-          else if (prev_csbf == 2) sig_ctx = xp == 0 ? 2 : xp == 1 ? 1 : 0;
-          else sig_ctx = 2;
-          if (c_idx == 0) {
-            if (xs > 0 || ys > 0) sig_ctx += 3;
-            sig_ctx += log2_size == 3 ? (scan_idx == 0 ? 9 : 15) : 21;
+          int sig_ctx;
+          if (log2_size == 2) {
+            sig_ctx = kCtxIdxMap4x4[(yc << 2) + xc];
+          } else if (xc + yc == 0) {
+            sig_ctx = 0;
           } else {
-            sig_ctx += log2_size == 3 ? 9 : 12;
+            if (prev_csbf == 0) sig_ctx = (xp + yp == 0) ? 2 : (xp + yp < 3) ? 1 : 0;
+            else if (prev_csbf == 1) sig_ctx = yp == 0 ? 2 : yp == 1 ? 1 : 0;
+            else if (prev_csbf == 2) sig_ctx = xp == 0 ? 2 : xp == 1 ? 1 : 0;
+            else sig_ctx = 2;
+            if (c_idx == 0) {
+              if (xs > 0 || ys > 0) sig_ctx += 3;
+              sig_ctx += log2_size == 3 ? (scan_idx == 0 ? 9 : 15) : 21;
+            } else {
+              sig_ctx += log2_size == 3 ? 9 : 12;
+            }
           }
+          ctx = kCtxSigCoeff + sig_ctx + (c_idx > 0 ? 27 : 0);
         }
-        if (c_idx > 0) sig_ctx += 27;
-        sig[p] = static_cast<uint8_t>(cabac_.decision(kCtxSigCoeff + sig_ctx));
+        sig[p] = static_cast<uint8_t>(cabac_.decision(ctx));
         if (sig[p]) { ++num_sig; infer_dc = false; }
       } else {
         sig[0] = 1;   // inferred: a coded sub-block has at least one coefficient
@@ -1115,6 +1223,7 @@ void Core::residual_coding(int x0, int y0, int log2_size, int c_idx) {
     // levels
     uint8_t greater1[16] = {}, greater2[16] = {};
     int first_sig = 16, last_sig = -1, num_g1 = 0, last_g1_pos = -1;
+    bool escape = false;   // escapeDataPresent
     int ctx_set = (i == 0 || c_idx > 0) ? 0 : 2;
     if (c1 == 0) ++ctx_set;
     c1 = 1;
@@ -1127,42 +1236,75 @@ void Core::residual_coding(int x0, int y0, int log2_size, int c_idx) {
         if (greater1[p]) {
           c1 = 0;
           if (last_g1_pos == -1) last_g1_pos = p;
+          else escape = true;
         } else if (c1 > 0 && c1 < 3) {
           ++c1;
         }
+      } else {
+        escape = true;
       }
       if (last_sig == -1) last_sig = p;
       first_sig = p;
     }
-    const bool sign_hidden = pps.sign_data_hiding && !cu_transquant_bypass_ && (last_sig - first_sig > 3);
-    if (last_g1_pos != -1) greater2[last_g1_pos] = static_cast<uint8_t>(cabac_.decision(kCtxGreater2 + ctx_set + (c_idx > 0 ? 4 : 0)));
+    const bool sign_hidden = sign_hiding_allowed && (last_sig - first_sig > 3);
+    if (last_g1_pos != -1) {
+      greater2[last_g1_pos] = static_cast<uint8_t>(cabac_.decision(kCtxGreater2 + ctx_set + (c_idx > 0 ? 4 : 0)));
+      if (greater2[last_g1_pos]) escape = true;
+    }
+    if (sps.cabac_bypass_alignment && escape) cabac_.align_bypass();
     uint8_t sign[16] = {};
     for (int p = 15; p >= 0; --p)
       if (sig[p] && (!sign_hidden || p != first_sig)) sign[p] = static_cast<uint8_t>(cabac_.bypass());
-    int num_sig_coeff = 0, sum_abs = 0, rice = 0;
+    int num_sig_coeff = 0, sum_abs = 0;
+    int rice = sps.persistent_rice ? stat_coeff_[sb_type] / 4 : 0;
+    bool first_remaining = true;
     for (int p = 15; p >= 0; --p) {
       if (!sig[p]) continue;
       const int base = 1 + greater1[p] + greater2[p];
-      int level = base;
+      int64_t level = base;
       if (base == ((num_sig_coeff < 8) ? ((p == last_g1_pos) ? 3 : 2) : 1)) {
-        int prefix = 0;
-        while (prefix < 25 && cabac_.bypass()) ++prefix;   // (a conforming stream has at most 4 + 12; the limit keeps the shifts below in range for damaged ones)
-        int rem;
-        if (prefix <= 3) rem = (prefix << rice) + cabac_.bypass_bits(rice);
-        else rem = (((1 << (prefix - 3)) + 3 - 1) << rice) + cabac_.bypass_bits(prefix - 3 + rice);
+        const int64_t rem = coeff_abs_level_remaining(rice, log2_range);
         level = base + rem;
-        if (level > 3 * (1 << rice)) rice = imin(rice + 1, 4);
+        if (sps.persistent_rice && first_remaining) {
+          // 9.3.3.11: StatCoeff follows the first coeff_abs_level_remaining of each sub-block
+          const int init = stat_coeff_[sb_type] / 4;
+          if (rem >= (int64_t{3} << init)) ++stat_coeff_[sb_type];
+          else if (2 * rem < (int64_t{1} << init) && stat_coeff_[sb_type] > 0) --stat_coeff_[sb_type];
+        }
+        first_remaining = false;
+        if (level > (int64_t{3} << rice)) rice = sps.persistent_rice ? (rice < 30 ? rice + 1 : rice) : imin(rice + 1, 4);
       }
-      int value = sign[p] ? -level : level;
+      if (level > coeff_max + int64_t{1}) level = coeff_max + int64_t{1};   // (a conforming stream stays in CoeffMin .. CoeffMax; damaged ones are held there)
+      int value = static_cast<int>(sign[p] ? -level : level);
       if (sign_hidden) {
-        sum_abs += level;
+        sum_abs += static_cast<int>(level);
         if (p == first_sig && (sum_abs & 1)) value = -value;
       }
       ++num_sig_coeff;
       const int xc = (xs << 2) + px4[p], yc = (ys << 2) + py4[p];
-      coeff_[yc * n + xc] = clip3(-32768, 32767, value);   // (CoeffMinY .. CoeffMaxY)
+      coeff_[yc * n + xc] = clip3(coeff_min, coeff_max, value);
     }
   }
+}
+
+// 9.3.3.11 / 9.3.3.12: coeff_abs_level_remaining with Rice parameter `rice`: a prefix of ones (TR up to three, then the Exp-Golomb escape of order rice + 1);
+// with extended_precision_processing_flag the escape is the limited one of 9.3.3.4 (log2TransformRange bits at most, the prefix at most 32 - log2TransformRange).
+int64_t Core::coeff_abs_level_remaining(int rice, int log2_range) {
+  const bool limited = sp_->extended_precision;
+  const int longest = limited ? 32 - log2_range : 32;
+  int prefix = 0;
+  while (prefix < longest && cabac_.bypass()) ++prefix;
+  if (prefix <= 3) return (static_cast<int64_t>(prefix) << rice) + cabac_.bypass_bits(rice);
+  if (limited) {
+    const int prefix_length = prefix - 3, max_prefix_length = longest - 3;
+    const int suffix_bits = prefix_length == max_prefix_length ? log2_range - rice : prefix_length;
+    if (suffix_bits < 0 || suffix_bits + rice > 31) return int64_t{1} << 31;   // (damaged)
+    const int64_t code = (int64_t{1} << prefix_length) - 1 + cabac_.bypass_bits(suffix_bits);
+    return ((code + 3) << rice) + cabac_.bypass_bits(rice);
+  }
+  const int bits = prefix - 3 + rice;
+  if (bits > 31) return int64_t{1} << 31;   // (damaged: more than any coefficient needs)
+  return (((int64_t{1} << (prefix - 3)) + 3 - 1) << rice) + cabac_.bypass_bits(bits);
 }
 
 }  // namespace h265
