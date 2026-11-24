@@ -23,6 +23,7 @@
 #include "Process/LinuxSockets.hpp"
 #include "Process/LinuxThreads.hpp"
 #include "Process/LinuxPacket.hpp"
+#include "Process/LinuxRenderNode.hpp"
 #include "Process/MemoryFile.hpp"
 #include "Process/Process.hpp"
 #include "Process/Syscall.hpp"
@@ -328,6 +329,7 @@ uint64_t map_packet_rings(Process& process, AddressSpace& space, uint64_t addres
 
 uint64_t map_memory_file(Process& process, AddressSpace& space, uint64_t address, uint64_t size, uint64_t prot, uint64_t flags, uint64_t fd, uint64_t offset) {
   if (uint64_t link = 0; linuxabi::packet_descriptor(process, fd, &link)) return map_packet_rings(process, space, address, size, prot, flags, link, offset);
+  if (uint64_t mapped = 0; linuxabi::render_node_map(process, space, address, size, prot, flags, fd, offset, &mapped)) return mapped;      // (a buffer object: LinuxRenderNode.hpp)
   OpenObject* object = process.files().object(fd);
   if (!object) return error(kEbadf);
   if (offset % AddressSpace::kPageSize != 0) return error(kEinval);

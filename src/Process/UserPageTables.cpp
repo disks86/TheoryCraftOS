@@ -82,15 +82,25 @@ void UserPageTables::release_previous() {
   sets_[1 - active_].clear();
 }
 
-uint64_t UserPageTables::leaf_flags(uint8_t protection) const {
-  return kPresent | kUser | ((protection & kProtWrite) ? kWritable : 0) | ((nx_ && !(protection & kProtExecute)) ? kNoExecute : 0);
+namespace {
+bool g_write_combining = false;
+constexpr uint64_t kWriteThrough = 1ull << 3, kCacheDisable = 1ull << 4, kPat = 1ull << 7;   // (a 4 KiB entry's PWT, PCD and PAT bits)
+}  // namespace
+
+void UserPageTables::set_write_combining(bool available) { __atomic_store_n(&g_write_combining, available, __ATOMIC_RELEASE); }
+
+uint64_t UserPageTables::leaf_flags(uint8_t protection, MemoryCache cache) const {
+  uint64_t type = 0;   // PAT entry 0: write-back
+  if (cache == MemoryCache::WriteCombining && __atomic_load_n(&g_write_combining, __ATOMIC_ACQUIRE)) type = kPat;   // entry 4: write-combining
+  else if (cache != MemoryCache::WriteBack) type = kCacheDisable | kWriteThrough;                                    // entry 3: uncached
+  return kPresent | kUser | type | ((protection & kProtWrite) ? kWritable : 0) | ((nx_ && !(protection & kProtExecute)) ? kNoExecute : 0);
 }
 
 uint64_t UserPageTables::wanted(const AddressSpace& space, uint64_t address) const {
   AddressSpace::RegionInfo region;
   if (!space.region_at(space.region_index(address), &region) || region.base > address || region.protection == 0) return 0;      // (no access: no entry, any touch faults)
   const uint8_t* memory = space.page_memory(address);
-  return memory ? (address_of(memory) & kAddressMask) | leaf_flags(region.protection) : 0;
+  return memory ? (address_of(memory) & kAddressMask) | leaf_flags(region.protection, region.cache) : 0;
 }
 
 bool UserPageTables::rebuild(const AddressSpace& space, bool keep_previous) {
@@ -115,7 +125,7 @@ bool UserPageTables::rebuild(const AddressSpace& space, bool keep_previous) {
   for (uint64_t i = 0; space.region_at(i, &region); ++i) {
     // A region without access still gets pages in the address space, but none here: any touch faults, as it should.
     if (region.protection == 0) continue;
-    const uint64_t flags = leaf_flags(region.protection);
+    const uint64_t flags = leaf_flags(region.protection, region.cache);
     if (region.storage) {      // shared: every page has its memory
       for (uint64_t offset = 0; offset < region.size; offset += kPageSize) {
         if (!map_page(region.base + offset, address_of(region.storage) + offset, flags)) return abandon();
@@ -177,7 +187,7 @@ bool UserPageTables::update(const AddressSpace& space, uint64_t start, uint64_t 
   for (uint64_t i = space.region_index(start); ok && space.region_at(i, &region) && region.base < end; ++i) {
     if (region.protection == 0) continue;
     const uint64_t from = region.base > start ? region.base : start, to = region.base + region.size < end ? region.base + region.size : end;
-    const uint64_t flags = leaf_flags(region.protection);
+    const uint64_t flags = leaf_flags(region.protection, region.cache);
     if (region.storage) {
       for (uint64_t page = from; ok && page < to; page += kPageSize) install(page, address_of(region.storage) + (page - region.base), flags);
     } else {

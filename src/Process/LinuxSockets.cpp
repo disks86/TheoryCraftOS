@@ -16,6 +16,7 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 #include "Process/LinuxInput.hpp"
+#include "Process/LinuxRenderNode.hpp"
 #include "Process/LinuxNetlink.hpp"
 #include "Process/LinuxPacket.hpp"
 #include "Process/LinuxSockets.hpp"
@@ -532,6 +533,7 @@ uint64_t clock_now(Process& p, uint32_t clock) { return clock == 0 || clock == 8
 
 constexpr uint64_t kNever = ~uint64_t{0};
 constexpr uint64_t kInetPollNs = 2000000;      // how often a wait looks at a network socket again (see poll_events_locked)
+constexpr uint64_t kRenderPollNs = 1000000;    // the same for the render node's events and fences (LinuxRenderNode.hpp)
 constexpr uint64_t kInputPollNs = 4000000;     // the same for a game controller (the service polls the pads every 4 ms)
 
 // A timer brought up to now (the lock held): its expirations counted. *due (when given): made no later than when it next fires, on the monotonic clock.
@@ -604,6 +606,19 @@ uint16_t poll_events_locked(Process& p, UnixSocketManager* m, const Watched& w, 
     }
     return out;
   }
+  if (w.kind == DescriptorKind::RenderNode || w.kind == DescriptorKind::File) {      // the render node, a sync_file, a dma-buf (LinuxRenderNode.cpp)
+    uint16_t now = 0;
+    if (render_node_poll(p, w.id, &now)) {
+      // (nothing tells a wait when the GPU signals a fence: while it has nothing the descriptor is looked at again every millisecond)
+      const uint16_t out = now & (events | kPollHup | kPollErr | kPollNval);
+      if (out == 0 && due) {
+        const uint64_t mono = p.host().monotonic_ns(), again = mono > kNever - 1 - kRenderPollNs ? kNever - 1 : mono + kRenderPollNs;
+        if (again < *due) *due = again;
+      }
+      return out;
+    }
+    if (w.kind == DescriptorKind::RenderNode) return kPollNval;
+  }
   if (w.kind != DescriptorKind::UnixSocket || !m) return events & (kPollIn | kPollOut | kPollRdNorm | kPollWrNorm);
   advance_timer_locked(p, *m, w.id, due);
   if (const uint64_t look = refresh_linked_locked(p, *m, w.id); look != 0 && due) {
@@ -666,6 +681,7 @@ Watched watch(Process& p, uint64_t fd) {
   w.kind = p.files().kind(fd);
   if (w.kind == DescriptorKind::UnixSocket || w.kind == DescriptorKind::Socket) w.id = uint32_t(p.files().token(fd));
   if (w.kind == DescriptorKind::InputDevice) w.id = uint32_t(fd);      // (input_poll finds its client by the descriptor)
+  if (w.kind == DescriptorKind::RenderNode || w.kind == DescriptorKind::File) w.id = uint32_t(fd);      // (render_node_poll finds its object by the descriptor)
   return w;
 }
 
@@ -1349,7 +1365,7 @@ uint64_t sys_epoll_create1(Process& p, uint64_t flags) {
   return give_fd(p, *m, id, flags & kSockCloexec, false);
 }
 
-// epoll_ctl(epfd, op, fd, event): EPOLL_CTL_ADD 1, DEL 2, MOD 3. Regular files and folders are refused (EPERM), as on Linux; an epoll instance cannot watch
+// epoll_ctl(epfd, op, fd, event): EPOLL_CTL_ADD 1, DEL 2, MOD 3. Regular files and folders are refused (EPERM), as on Linux (files without a poll method); an epoll instance cannot watch
 // itself. EPOLLET is taken as level-triggered (a program that reads until EAGAIN, as edge-triggered ones must, sees the same); EPOLLONESHOT reports once.
 uint64_t sys_epoll_ctl(Process& p, uint64_t epfd, uint64_t op, uint64_t fd, uint64_t event) {
   Sock s;
@@ -1358,7 +1374,11 @@ uint64_t sys_epoll_ctl(Process& p, uint64_t epfd, uint64_t op, uint64_t fd, uint
   if (int64_t(fd) < 0 || fd > 0x7FFFFFFF) return error(kEbadf);
   UnixEpollEntry entry = identity(p, int32_t(fd));
   if (entry.kind == DescriptorKind::Closed) return error(kEbadf);
-  if (entry.kind == DescriptorKind::File || entry.kind == DescriptorKind::Directory) return error(kEperm);
+  if (entry.kind == DescriptorKind::Directory) return error(kEperm);
+  if (entry.kind == DescriptorKind::File) {      // (a file of the render node's, a sync_file or dma-buf, can be waited for; a /sys attribute too, as kernfs polls)
+    const OpenObject* object = p.files().object(fd);
+    if (!object || !object->virtual_file) return error(kEperm);
+  }
   if (fd == epfd) return error(kEinval);
   if (op != 2) {
     if (event == 0) return error(kEfault);

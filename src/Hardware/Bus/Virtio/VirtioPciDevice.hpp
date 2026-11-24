@@ -72,6 +72,15 @@ class VirtioPciDevice final : public IHardware {
   // The MSI-X entry enable_msix() set up now goes to the core with local APIC id `apic_id` (masked while it changes). False if MSI-X is off.
   bool retarget_msix(uint32_t apic_id);
 
+  // A shared memory region of the device (virtio 1.2 4.1.4.7: a PCI capability of type 8 names a range of one of its BARs and an id): memory the device and the
+  // driver both see, such as virtio-gpu's window onto host memory. Empty (length 0) if the device has none with that id. Known after initialize().
+  struct SharedMemoryRegion {
+    uint8_t id = 0;
+    uint64_t address = 0;   // physical
+    uint64_t length = 0;
+  };
+  SharedMemoryRegion shared_memory(uint8_t id) const;
+
   // Device-specific configuration space.
   uint8_t read_config8(uint32_t offset) const;
   void write_config8(uint32_t offset, uint8_t value) const;
@@ -99,6 +108,9 @@ class VirtioPciDevice final : public IHardware {
   efi::SystemTable* st_;
 
   Region common_, notify_, device_config_;
+  static constexpr uint32_t kMaxSharedMemory = 4;
+  SharedMemoryRegion shared_[kMaxSharedMemory];
+  uint32_t shared_count_ = 0;
   uint32_t notify_multiplier_ = 0;
   uint16_t queue_notify_offset_[kMaxQueues] = {};
   uint32_t requested_features_ = 0;

@@ -92,7 +92,7 @@ bool AddressSpace::overlaps_reserved(uint64_t start, uint64_t end, uint64_t* res
 bool AddressSpace::region_at(uint64_t index, RegionInfo* out) const {
   if (index >= regions_.count()) return false;
   const Region& r = *regions_[index];
-  *out = RegionInfo{r.base, r.size, r.protection, r.storage, r.allocation, r.attributes};
+  *out = RegionInfo{r.base, r.size, r.protection, r.storage, r.allocation, r.attributes, r.cache};
   return true;
 }
 
@@ -137,7 +137,7 @@ bool AddressSpace::map(uint64_t address, uint64_t size, uint8_t protection) {
   return true;
 }
 
-bool AddressSpace::map_shared(uint64_t address, uint64_t size, uint8_t protection, uint8_t* storage, SharedMemory* owner) {
+bool AddressSpace::map_shared(uint64_t address, uint64_t size, uint8_t protection, uint8_t* storage, SharedMemory* owner, MemoryCache cache) {
   uint64_t rounded = 0;
   if (!storage || !owner || size == 0 || address % kPageSize != 0 || !round_up(size, &rounded)) return false;
   if (address >= top_ || rounded > top_ - address) return false;
@@ -154,6 +154,7 @@ bool AddressSpace::map_shared(uint64_t address, uint64_t size, uint8_t protectio
   if (!regions_.insert(index, static_cast<UniquePointer<Region>&&>(region))) return false;      // (the region has no memory yet: nothing to let go of)
   regions_[index]->storage = storage;
   regions_[index]->shared = owner;
+  regions_[index]->cache = cache;
   owner->retain();
   shared_bytes_ += rounded;
   mapped_bytes_ += rounded;
@@ -168,7 +169,7 @@ bool AddressSpace::copy_from(const AddressSpace& source) {
   top_ = source.top_;
   for (uint64_t i = 0; i < source.regions_.count(); ++i) {
     const Region& from = *source.regions_[i];
-    const bool mapped = from.shared ? map_shared(from.base, from.size, from.protection, from.storage, from.shared) : map(from.base, from.size, from.protection);
+    const bool mapped = from.shared ? map_shared(from.base, from.size, from.protection, from.storage, from.shared, from.cache) : map(from.base, from.size, from.protection);
     if (!mapped) return false;
     Region& made = *regions_[regions_.count() - 1];      // (the regions come in address order: the new one is the last)
     made.allocation = from.allocation;
@@ -288,6 +289,7 @@ bool AddressSpace::split_at(uint64_t address) {
   if (r.shared) {      // the tail maps the same memory further on
     tail->storage = r.storage + offset;
     tail->shared = r.shared;
+    tail->cache = r.cache;
     r.shared->retain();
   }
   if (!regions_.insert(i + 1, static_cast<UniquePointer<Region>&&>(tail))) {

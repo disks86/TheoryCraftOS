@@ -18,9 +18,12 @@
 
 /* What the shared Vulkan driver (src/Vulkan, docs/Vulkan.md) needs from the system it runs on. The driver is one translation unit: a platform's source file
  *
- *   1. includes its own headers and the Khronos headers of its surface extension (vulkan_win32.h, ...), defines VK_OS_NAME, VK_OS_INSTANCE_EXTENSIONS and VK_OS_PROCS,
+ *   1. includes vk_names.h, then its own headers and the Khronos headers of its surface extension (vulkan_win32.h, ...), defines VK_OS_NAME, VK_OS_INSTANCE_EXTENSIONS,
+ *      VK_OS_PROCS and TCOS_VK_HAS_<function> for each function of its own (the dispatch layer exports those),
  *   2. includes "vk_driver.inc" (this header, the translator and the driver),
- *   3. defines the functions declared below and its surface functions (each one makes a Surface with make_surface()).
+ *   3. defines the functions declared below and its surface functions (each one makes a Surface with make_surface()),
+ *   4. includes "vk_dispatch.inc" last: the exported entry points, which call the Venus backend (vk_venus.inc) or the Direct3D backend (everything else here). Until
+ *      then every vkX the driver defines is dx_vkX (vk_names.h).
  *
  * The platforms: src/Windows/vulkan-1/vulkan-1.c (vulkan-1.dll over gdi32's D3DKMT thunks, VK_KHR_win32_surface) and src/Linux/libvulkan/libvulkan.c (libvulkan.a over /dev/dxg,
  * VK_EXT_headless_surface). Everything else - the objects, the formats, memory, pipelines, the SPIR-V translator, command buffers, swapchains - is shared. */
@@ -31,6 +34,7 @@
 #include <stdint.h>
 #include "khronos/vulkan/vulkan_core.h"
 #include "../Process/DxgDevice.h"   /* the TCOS_DXG_* service numbers */
+#include "../Process/VirtGpuDevice.h"   /* the render node's interface (the Venus backend) */
 
 #ifndef VK_OS_NAME
 #error "the platform defines VK_OS_NAME (the prefix of the driver's trace lines)"
@@ -44,7 +48,8 @@
 #ifndef VK_OS_EXPORT
 #error "the platform defines VK_OS_EXPORT (how a Vulkan entry point is made visible to programs)"
 #endif
-#define VKAPI VK_OS_EXPORT VKAPI_ATTR
+/* (the driver's functions are not exported themselves: vk_dispatch.inc's entry points are, with VK_OS_EXPORT) */
+#define VKAPI VKAPI_ATTR
 
 /* The status of a D3DKMT service (an NTSTATUS: negative is a failure). */
 typedef int32_t KmtStatus;
@@ -78,6 +83,22 @@ static void vk_os_close_fd(int fd);
  *   vk_os_swapchain_gone   takes them back, before they are freed
  *   vk_os_acquire          picks an image the compositor is done with and the program does not hold (waits up to `timeout` ns for one: VK_TIMEOUT / VK_NOT_READY)
  *   vk_os_present          shows image `index`; every submission before it has run, so the image holds the frame */
+
+/* The virtio-gpu render node (the Venus backend, vk_venus.inc and docs/Venus.md): a platform that has one defines VK_OS_VIRTGPU to 1 and these five. The node speaks
+ * Linux's virtio-gpu DRM interface (src/Process/VirtGpuDevice.h): open gives a handle (< 0: there is none), ioctl runs one TCOS_DRM_IOCTL_* request on it (0, or the
+ * positive Linux error number), map maps `size` bytes of a buffer object at the offset TCOS_DRM_IOCTL_VIRTGPU_MAP gave (NULL on failure), unmap undoes that. Without
+ * them the Venus backend is never selected. */
+#if VK_OS_VIRTGPU
+static int64_t vk_os_virtgpu_open(void);
+static int vk_os_virtgpu_ioctl(int64_t node, uint32_t request, void *argument);
+static void *vk_os_virtgpu_map(int64_t node, uint64_t offset, uint64_t size);
+static void vk_os_virtgpu_unmap(int64_t node, void *address, uint64_t size);
+static void vk_os_virtgpu_close(int64_t node);
+#endif
+/* Sleeps at least `ns` nanoseconds (the Venus backend's waits for the host). */
+static void vk_os_sleep_ns(uint64_t ns);
+/* The value of an environment variable (as much as fits `cap`, terminated); false when it is not set. */
+static bool vk_os_getenv(const char *name, char *out, size_t cap);
 
 /* (the driver also uses memcpy, memmove, memset and memcmp: the platform has them, from its C library or its own) */
 void *memcpy(void *d, const void *s, size_t n);

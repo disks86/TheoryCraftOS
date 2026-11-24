@@ -24,7 +24,7 @@ namespace hardware {
 
 namespace {
 // PCI vendor capability (id 0x09) cfg_type values.
-constexpr uint8_t kCapCommon = 1, kCapNotify = 2, kCapDevice = 4;
+constexpr uint8_t kCapCommon = 1, kCapNotify = 2, kCapDevice = 4, kCapSharedMemory = 8;
 constexpr uint8_t kPciCapabilityVendor = 0x09;
 
 // Common configuration structure offsets (virtio 1.x, section 4.1.4.3).
@@ -79,6 +79,7 @@ VirtioPciDevice::Region VirtioPciDevice::region_from_capability(uint16_t cap) co
 }
 
 bool VirtioPciDevice::find_regions() {
+  shared_count_ = 0;
   if (!(pci_.read32(device_.address, 0x04) & (1u << 20))) return false;  // no capability list
   uint16_t cap = pci_.read32(device_.address, 0x34) & 0xFC;
   for (int guard = 0; cap && guard < 48; ++guard) {
@@ -92,6 +93,14 @@ bool VirtioPciDevice::find_regions() {
         notify_multiplier_ = pci_.read32(device_.address, cap + 16);
       } else if (type == kCapDevice) {
         device_config_ = region_from_capability(cap);
+      } else if (type == kCapSharedMemory && shared_count_ < kMaxSharedMemory) {
+        // virtio_pci_cap64: the BAR, the region's id, then the offset and length in two halves each (low at 8 and 12, high at 16 and 20)
+        const uint32_t word = pci_.read32(device_.address, cap + 4);
+        const uint8_t bar = word & 0xFF, id = (word >> 8) & 0xFF;
+        const uint64_t offset = pci_.read32(device_.address, cap + 8) | (uint64_t{pci_.read32(device_.address, cap + 16)} << 32);
+        const uint64_t length = pci_.read32(device_.address, cap + 12) | (uint64_t{pci_.read32(device_.address, cap + 20)} << 32);
+        const uint64_t base = pci_.memory_bar(device_.address, bar);
+        if (base && length && offset <= ~uint64_t{0} - base) shared_[shared_count_++] = SharedMemoryRegion{id, base + offset, length};
       }
     }
     cap = (header >> 8) & 0xFC;
@@ -129,6 +138,12 @@ bool VirtioPciDevice::initialize() {
     return false;
   }
   return true;
+}
+
+VirtioPciDevice::SharedMemoryRegion VirtioPciDevice::shared_memory(uint8_t id) const {
+  for (uint32_t i = 0; i < shared_count_; ++i)
+    if (shared_[i].id == id) return shared_[i];
+  return {};
 }
 
 uint16_t VirtioPciDevice::queue_count() const { return common_.address ? common16(kNumQueues) : 0; }

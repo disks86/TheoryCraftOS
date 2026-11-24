@@ -32,6 +32,10 @@ struct AddressRange {
 
 constexpr uint8_t kProtRead = 1, kProtWrite = 2, kProtExecute = 4;
 
+// How the CPU caches a shared region's memory. Ordinary memory is write-back; memory another agent writes without the CPU's caches seeing it (a device's, a
+// host's that a virtual GPU hands out uncached or write-combined) must be mapped the way that agent says, or the program reads stale cache lines.
+enum class MemoryCache : uint8_t { WriteBack = 0, WriteCombining = 1, Uncached = 2 };
+
 // The memory of one user-mode process: a set of page-aligned regions, each with its own permissions. A private region's pages get memory of their own only when
 // they are first written (or touched by the program: the page fault asks for it), so reserving or committing even gigabytes costs nothing; a page without memory
 // reads as zeros. A shared region (a section view) shows memory that is not the address space's own. This is the kernel's view of the address space (the
@@ -101,7 +105,8 @@ class AddressSpace final : public IUserMemory {
   // Maps memory that is not the address space's own: `storage` (page-aligned, `size` bytes, rounded up to pages) stays as it is and is shared with whoever else maps it.
   // `owner` is told (retain) once for the mapping and again for every piece it is cut into, and (release) when a piece is unmapped, which with deferred freeing is when the
   // CPUs can no longer see it.
-  bool map_shared(uint64_t address, uint64_t size, uint8_t protection, uint8_t* storage, SharedMemory* owner);
+  // `cache`: how the CPU is to cache it (write-back unless the memory's owner says otherwise).
+  bool map_shared(uint64_t address, uint64_t size, uint8_t protection, uint8_t* storage, SharedMemory* owner, MemoryCache cache = MemoryCache::WriteBack);
   bool is_shared(uint64_t address) const;
   SharedMemory* shared_at(uint64_t address) const;
   // The pieces of regions that map `owner`'s memory: where each lies and which bytes of the owner it shows. Returns how many there are (at most `capacity` are written).
@@ -146,6 +151,7 @@ class AddressSpace final : public IUserMemory {
     const uint8_t* storage = nullptr;
     uint64_t allocation = 0;
     PageAttributes attributes;
+    MemoryCache cache = MemoryCache::WriteBack;
   };
   bool region_at(uint64_t index, RegionInfo* out) const;
   // The first region that ends above `address` (region_count() if none): where to start region_at() for a range.
@@ -225,6 +231,7 @@ class AddressSpace final : public IUserMemory {
     PageAttributes attributes;
     uint8_t* storage = nullptr;          // a shared region's memory (nullptr for a private one)
     SharedMemory* shared = nullptr;      // not ours: a section's memory, which we only map
+    MemoryCache cache = MemoryCache::WriteBack;
 
    private:
     allocators::IAllocator& allocator_;

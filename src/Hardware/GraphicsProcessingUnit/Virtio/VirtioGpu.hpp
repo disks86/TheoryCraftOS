@@ -25,6 +25,7 @@
 #include "Hardware/Monitor/IMonitorSource.hpp"
 #include "Kernel/Interrupts.hpp"
 #include "Kernel/Sync.hpp"
+#include "Utility/RangeAllocator.hpp"
 
 namespace hardware {
 
@@ -117,13 +118,75 @@ class VirtioGpu : public FramebufferGpu, public IMonitorSource {
   // A 3D command (a virgl context's) has a fence when `fence` is set: the host answers it only when its GPU has finished the work (and its fence poll has noticed). Without one the
   // host answers as soon as it has taken the command in, and the GPU works on while the guest goes on: the host runs the commands of the queue in order, and what reads back
   // (a transfer from the host) waits for the work before it, so only a caller that needs the GPU to be done - or the host to poll - asks for the fence.
-  uint32_t execute(ConstByteView request, ByteView response = ByteView(), bool fence = true);
+  // `context` is the 3D context the command is for (a command from kCmdCtxCreate on is stamped with it; resource creation of a blob carries it in
+  // its header itself): the virgl context by default, or one made by create_context().
+  uint32_t execute(ConstByteView request, ByteView response = ByteView(), bool fence = true, uint32_t context = kContextId);
   // execute() for commands that answer with "OK, no data".
   bool command(ConstByteView request, bool fence = true) { return execute(request, ByteView(), fence) == virtio_gpu::kRespOkNoData; }
   // Shows resource `id` (size w x h) on the screen and flushes it. The 2D screen comes back
   // on the next present() of this class.
   bool show_resource(uint32_t id, uint32_t width, uint32_t height);
   allocators::IAllocator& allocator() { return *allocator_; }
+  // The PCI function it is (what the render node's /sys entries describe) and its configuration space.
+  const PciDeviceInfo& pci_device() const { return device_; }
+  uint32_t read_pci_config32(uint16_t offset) const { return pci_ ? pci_->read32(device_.address, offset) : 0xFFFFFFFFu; }
+
+  // --- Contexts of their own type (Venus: the host's Vulkan driver) --------------------------------------------------------------------------------------
+  // A host with VIRTIO_GPU_F_CONTEXT_INIT makes contexts of a type the guest names (a capset id: kCapsetVenus, kCapsetDrm, ...), each with its own
+  // objects, and with VIRTIO_GPU_F_RESOURCE_BLOB resources that are memory of such a context (RESOURCE_CREATE_BLOB), which the guest sees by
+  // mapping them into the device's host-visible window (MAP_BLOB: a BAR range of QEMU's `hostmem`). The kernel's own 3D (virgl, kContextId) is not
+  // one of them. All of these are safe from any thread.
+  bool has_context_init() const { return ready_ && (transport_->accepted_features() & virtio_gpu::kFeatureContextInit); }
+  bool has_blob() const { return ready_ && (transport_->accepted_features() & virtio_gpu::kFeatureResourceBlob); }
+  // The capability sets the host has: bit n for capset id n (ids up to 63).
+  uint64_t capsets() const { return capsets_; }
+  bool has_capset(uint32_t id) const { return id < 64 && (capsets_ >> id) & 1; }
+  // The newest version of capset `id` and its size in bytes; false if the host does not have it.
+  bool capset_info(uint32_t id, uint32_t* max_version, uint32_t* max_size) const;
+  // Reads version `version` of capset `id` into `out` (at most its size); the bytes written, 0 on failure.
+  uint32_t read_capset(uint32_t id, uint32_t version, ByteView out);
+  // The window host memory is mapped into: its physical address and size (0 when the device has none: QEMU's hostmem=0). Pages of it are what
+  // map_blob() hands out.
+  uint64_t host_visible_base() const { return host_window_.address; }
+  uint64_t host_visible_size() const { return host_window_.length; }
+  // Makes a context of type `capset_id` (named `name` in the host's logs, up to 63 bytes). Its id, 0 if the host refused or cannot.
+  uint32_t create_context(uint32_t capset_id, ConstByteView name);
+  void destroy_context(uint32_t context);
+  // Creates a blob resource of `context`: `blob_mem` (kBlobMem*), `flags` (kBlobFlag*), `blob_id` (the context's name for the memory: a Venus
+  // VkDeviceMemory id, or 0 for shared memory the host allocates), `size` bytes; a guest blob is backed by `pages` (physical runs). The resource is
+  // attached to the context. Its id, 0 on failure.
+  uint32_t create_blob(uint32_t context, uint32_t blob_mem, uint32_t flags, uint64_t blob_id, uint64_t size, ArrayView<const virtio_gpu::MemEntry> pages = {});
+  // Maps a mappable host blob of `size` bytes into the window: `physical` is where the guest finds it, `map_info` how it is to be cached
+  // (kMapCache*). False if the window is full or the host refused.
+  bool map_blob(uint32_t context, uint32_t resource, uint64_t size, uint64_t* physical, uint32_t* map_info);
+  // Takes a mapping away again (no CPU may touch it any more: the window range is handed out anew).
+  bool unmap_blob(uint32_t context, uint32_t resource, uint64_t physical);
+  // Drops a resource (of any context). Its mapping, if it has one, must be gone first.
+  bool unref_resource(uint32_t resource);
+  bool attach_resource(uint32_t context, uint32_t resource);
+  bool detach_resource(uint32_t context, uint32_t resource);
+  // A 3D (virgl) resource of `context` described by `description` (its header and id are filled in) with guest backing `pages`, attached to the context.
+  // Its id, 0 on failure.
+  uint32_t create_resource_3d(uint32_t context, const virtio_gpu::ResourceCreate3d& description, ArrayView<const virtio_gpu::MemEntry> pages);
+  // A 3D transfer between a resource's backing and the host's copy, waited for. A fence number that is signaled (fence_signaled() is true for it), 0 on
+  // failure.
+  uint64_t transfer_3d(uint32_t context, uint32_t resource, bool to_host, const virtio_gpu::Box& box, uint32_t level, uint64_t offset, uint32_t stride, uint32_t layer_stride);
+  // Sends `commands` (a context's own command stream: venus commands for a Venus context) to `context`. With a fence the host answers once the work
+  // the commands made on ring `ring` (with kFeatureContextInit; ~0u: the context's shared timeline) is finished; without one, once it has taken them in.
+  // The response type (kRespOkNoData when it went well), 0 when the host did not answer.
+  static constexpr uint32_t kNoRing = ~0u;
+  uint32_t submit(uint32_t context, ConstByteView commands, bool fence = false, uint32_t ring = kNoRing);
+  // The same with a fence, without waiting for it: the command goes to the host and the call returns at once with the fence's number (0 if it could not
+  // be sent: no slot free, the host not answering, ...). fence_signaled() / wait_fence() tell when the host has finished the work. Up to kAsyncSlots
+  // such commands may be out at once.
+  uint64_t submit_async(uint32_t context, ConstByteView commands, uint32_t ring = kNoRing);
+  // Whether the host has answered the fenced command numbered `fence` (any number up to the last handed out that is no longer outstanding).
+  bool fence_signaled(uint64_t fence);
+  // Waits until it has, at most `timeout_us` (~0: for ever, as long as the host answers). False on a timeout.
+  bool wait_fence(uint64_t fence, uint64_t timeout_us);
+  static constexpr uint32_t kAsyncSlots = 32;
+  // The largest command stream submit() takes at once.
+  static constexpr uint64_t max_submit_bytes() { return kRequestBytes - sizeof(virtio_gpu::CmdSubmit); }
   // How many commands timed out so far (the host was not answering).
   uint32_t timeouts() const { return __atomic_load_n(&timeouts_, __ATOMIC_ACQUIRE); }
   static constexpr uint64_t kCommandTimeoutUs = 250000;
@@ -165,6 +228,19 @@ class VirtioGpu : public FramebufferGpu, public IMonitorSource {
   static bool retarget_interrupt(void* self, uint32_t core, uint64_t hardware_id);
   static kernel::Frame* on_interrupt(kernel::Frame* frame, void* self);
   uint64_t fence_ = 0;
+  // Commands posted by submit_async() that the host has not answered yet: each has descriptors 2 + 2 * slot and 2 + 2 * slot + 1 and a buffer of
+  // its own (the request, then room for the answer).
+  struct AsyncSlot {
+    bool busy = false;
+    uint64_t fence = 0;
+    ByteView buffer;
+    uint32_t request_bytes = 0;
+  };
+  AsyncSlot async_[kAsyncSlots];
+  static constexpr uint64_t kAsyncBufferBytes = 64 * 1024;
+  // Takes every answer the device has given (lock_ held): the synchronous command's (descriptor 0, `sync_done` set) and the asynchronous ones'.
+  void reap_locked(bool* sync_done);
+  bool lock_for_command();
   uint64_t work_sent_ = 0;   // (written under lock_)
   uint64_t work_done_ = 0;
   bool in_flight_ = false;  // a command timed out and the device still holds its buffers
@@ -179,6 +255,19 @@ class VirtioGpu : public FramebufferGpu, public IMonitorSource {
   ScanoutPlacement layout_[IMonitorSource::kMaxConnectors];   // what the scanouts show, when the screen is shared out among several monitors
   uint32_t layout_count_ = 0;
   uint32_t used_scanouts_ = 0;                                // bit mask of the scanouts that were given a resource
+
+  uint64_t capsets_ = 0;                 // bit n: the host has capset n
+  struct CapsetInfo {
+    uint32_t id = 0, max_version = 0, max_size = 0;
+  };
+  static constexpr uint32_t kMaxCapsets = 16;
+  CapsetInfo capset_infos_[kMaxCapsets];
+  uint32_t capset_count_ = 0;
+  uint32_t next_context_ = kContextId + 1;
+  VirtioPciDevice::SharedMemoryRegion host_window_;   // the host-visible window (shm id 1)
+  kernel::Mutex window_lock_;
+  RangeAllocator<1024> window_;                        // which pages of it are mapped (offsets from the start of the window)
+  void read_capsets();
 
   bool has_3d_ = false;
   uint32_t virgl_bset_ = 0, virgl_glsl_level_ = 0, virgl_max_samples_ = 0;

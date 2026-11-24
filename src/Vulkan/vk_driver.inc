@@ -11,3 +11,5 @@
 #include "vk_wsi.inc"
 #include "vk_external.inc"
 #include "vk_entry.inc"
+#include "vn_tables.inc"
+#include "vk_venus.inc"

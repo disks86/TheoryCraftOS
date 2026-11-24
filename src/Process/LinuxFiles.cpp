@@ -22,6 +22,7 @@
 #include "Process/DxgDevice.h"
 #include "Process/Fifo.hpp"
 #include "Process/LinuxInput.hpp"
+#include "Process/LinuxRenderNode.hpp"
 #include "Process/MemoryFile.hpp"
 #include "Process/Objects.hpp"
 #include "Process/UnixSockets.hpp"
@@ -183,11 +184,13 @@ int64_t describe_descriptor(Process& p, uint64_t fd, String* out) {
     case DescriptorKind::Random: return out->assign("/dev/urandom") ? 0 : -kEnomem;
     case DescriptorKind::Dxg: return out->assign("/dev/dxg") ? 0 : -kEnomem;
     case DescriptorKind::InputDevice: return files.object(fd) && out->assign(files.object(fd)->path.view()) ? 0 : -kEnomem;
+    case DescriptorKind::RenderNode: return render_node_descriptor_path(p, fd, out) ? 0 : -kEnomem;
     case DescriptorKind::UnixSocket: return named(is_pipe_descriptor(p, fd) ? "pipe" : "socket", files.token(fd));
     default: break;
   }
   const OpenObject* object = files.object(fd);
-  if (object && !object->memory && !object->gpu_buffer && !object->gpu_sync && !object->path.empty()) return out->assign(object->path.view()) ? 0 : -kEnomem;
+  if (object && !object->anonymous() && !object->path.empty()) return out->assign(object->path.view()) ? 0 : -kEnomem;
+  if (object && object->virtual_file) return render_node_descriptor_path(p, fd, out) ? 0 : -kEnomem;      // (a /sys attribute, a dma-buf, a sync_file)
   return out->assign("anon_inode:[unknown]") ? 0 : -kEnomem;
 }
 
@@ -309,6 +312,16 @@ Meta input_meta(const InputNodeMeta& n) {
   return m;
 }
 
+// The render node, its dma-bufs and sync_files, /dev/dri and /sys (LinuxRenderNode.hpp).
+Meta render_meta(const RenderNodeMeta& n) {
+  Meta m;
+  m.mode = n.mode;
+  m.ino = n.ino;
+  m.rdev = n.rdev;
+  m.size = n.size;
+  return m;
+}
+
 // struct stat as the kernel of each CPU lays it out (144 bytes on x86-64, 128 on the others).
 uint64_t write_stat(Process& p, UserArch arch, const Meta& m, uint64_t address) {
   uint8_t buffer[144] = {};
@@ -368,6 +381,7 @@ int64_t meta_of_fd(Process& p, uint64_t fd, Meta* m) {
     case DescriptorKind::Socket: *m = device_meta(kSIfSock | 0777, 0x10000 + p.files().token(fd)); return 0;      // (a network socket)
     default: break;
   }
+  if (RenderNodeMeta node; render_node_descriptor_meta(p, fd, &node)) { *m = render_meta(node); return 0; }      // (the render node, its files, a folder of /sys)
   if (InputNodeMeta input; input_descriptor_meta(p, fd, &input)) { *m = input_meta(input); return 0; }      // (a game controller's node, or /dev/input)
   OpenObject* object = p.files().object(fd);
   DirectoryEntry entry;
@@ -421,6 +435,13 @@ uint64_t sys_openat(Process& p, UserArch arch, uint64_t dirfd, uint64_t path, ui
   const int64_t r = resolve_at(p, dirfd, path, false, &virtual_path);
   if (r < 0) return error(-r);
   const bool cloexec = flags & kOCloexec;
+  if (RenderNodeMeta node; const int64_t at = render_node_at(virtual_path.view(), false, &node)) {      // /dev/dri and /sys (LinuxRenderNode.hpp)
+    if (at < 0) return error(-at);
+    if ((flags & kOCreat) && (flags & kOExcl)) return error(kEexist);
+    const bool no_follow = flags & (arch == UserArch::AArch64 ? 0x8000u : 0x20000u);      // O_NOFOLLOW
+    const int64_t fd = render_node_open(p, virtual_path.view(), flags, cloexec, flags & (arch == UserArch::AArch64 ? 0x4000u : 0x10000u), no_follow);
+    return fd < 0 ? error(-fd) : uint64_t(fd);
+  }
   if (InputNodeMeta input; const int64_t at = input_node_at(virtual_path.view(), &input, p.host().realtime_ns() / 1000000000ull)) {      // /dev/input (LinuxInput.hpp)
     if (at < 0) return error(-at);
     if ((flags & kOCreat) && (flags & kOExcl)) return error(kEexist);
@@ -479,6 +500,7 @@ namespace {
 uint64_t read_from(Process& p, uint64_t fd, uint64_t buffer, uint64_t count, bool positional, uint64_t offset) {
   if (count > kMaxIoBytes) count = kMaxIoBytes;
   ProcessFiles& files = p.files();
+  if (uint64_t result = 0; render_node_read(p, fd, buffer, count, &result)) return result;      // (the render node's events; nothing to read in a dma-buf or sync_file)
   switch (files.kind(fd)) {
     case DescriptorKind::Closed: return error(kEbadf);
     case DescriptorKind::ConsoleInput: {
@@ -546,6 +568,7 @@ uint64_t write_to(Process& p, uint64_t fd, uint64_t buffer, uint64_t count, bool
     }
     case DescriptorKind::Directory: return error(kEisdir);
     case DescriptorKind::Dxg: return error(kEinval);      // (only ioctl)
+    case DescriptorKind::RenderNode: return files.object(fd) && files.object(fd)->writable ? error(kEinval) : error(kEbadf);      // (drm has no write)
     case DescriptorKind::InputDevice: return positional ? error(kEspipe) : input_write(p, fd, buffer, count);
     case DescriptorKind::UnixSocket: return positional ? error(kEspipe) : socket_write(p, fd, buffer, count);
     case DescriptorKind::Socket: return positional ? error(kEspipe) : inet_sendto(p, fd, buffer, count, 0, 0, 0);
@@ -615,6 +638,7 @@ uint64_t sys_lseek(Process& p, uint64_t fd, uint64_t offset, uint64_t whence) {
   const DescriptorKind kind = files.kind(fd);
   if (kind == DescriptorKind::Closed) return error(kEbadf);
   if (kind == DescriptorKind::Null || kind == DescriptorKind::Zero || kind == DescriptorKind::Random) return 0;
+  if (uint64_t result = 0; render_node_seek(p, fd, int64_t(offset), whence, &result)) return result;      // (the render node, a dma-buf, a sync_file)
   if (kind != DescriptorKind::File && kind != DescriptorKind::Directory) return error(kEspipe);
   OpenObject& object = *files.object(fd);
   if (kind == DescriptorKind::Directory) {
@@ -650,6 +674,8 @@ uint64_t sys_statat(Process& p, UserArch arch, uint64_t dirfd, uint64_t path, ui
   const bool no_follow = flags & kAtSymlinkNofollow;
   const int64_t r = no_follow ? resolve_raw(p, dirfd, path, false, &virtual_path) : resolve_at(p, dirfd, path, false, &virtual_path);
   if (r < 0) return error(-r);
+  if (RenderNodeMeta node; const int64_t at = render_node_at(virtual_path.view(), no_follow, &node))      // /dev/dri and /sys (LinuxRenderNode.hpp)
+    return at < 0 ? error(-at) : write_stat(p, arch, render_meta(node), buffer);
   if (no_follow && link_meta(p, virtual_path.view(), &m)) return write_stat(p, arch, m, buffer);
   if (no_follow && follow_proc_self(p, &virtual_path) < 0) return error(kEnoent);
   if (InputNodeMeta input; const int64_t at = input_node_at(virtual_path.view(), &input, p.host().realtime_ns() / 1000000000ull))
@@ -680,7 +706,10 @@ uint64_t sys_statx(Process& p, uint64_t dirfd, uint64_t path, uint64_t flags, ui
     if (r < 0) return error(-r);
     DirectoryEntry entry;
     const DescriptorKind device = files.device_at(virtual_path.view());
-    if (no_follow && link_meta(p, virtual_path.view(), &m)) {
+    if (RenderNodeMeta node; const int64_t at = render_node_at(virtual_path.view(), no_follow, &node)) {      // /dev/dri and /sys
+      if (at < 0) return error(-at);
+      m = render_meta(node);
+    } else if (no_follow && link_meta(p, virtual_path.view(), &m)) {
       // (a link: m is set)
     } else if (no_follow && follow_proc_self(p, &virtual_path) < 0) {
       return error(kEnoent);
@@ -708,6 +737,8 @@ uint64_t sys_statx(Process& p, uint64_t dirfd, uint64_t path, uint64_t flags, ui
   put(v, 64, m.modified, 8);        // stx_atime.tv_sec
   put(v, 96, m.created, 8);         // stx_ctime
   put(v, 112, m.modified, 8);       // stx_mtime
+  put(v, 128, ((m.rdev >> 8) & 0xFFF) | ((m.rdev >> 32) & ~uint64_t{0xFFF}), 4);      // stx_rdev_major (glibc's major() of st_rdev)
+  put(v, 132, (m.rdev & 0xFF) | ((m.rdev >> 12) & ~uint64_t{0xFF}), 4);              // stx_rdev_minor
   return p.write_user(buffer, ConstByteView(out, sizeof(out))) ? 0 : error(kEfault);
 }
 
@@ -759,6 +790,7 @@ uint64_t read_entries(Process& p, uint64_t fd, uint64_t buffer, uint64_t count, 
       case filesystem::SpecialNode::BlockDevice: v[18] = 6; break;    // DT_BLK
       case filesystem::SpecialNode::None: if (fifo_listed(p, object, entry)) v[18] = 1; break;
     }
+    if (entry.is_symlink && entry.special == filesystem::SpecialNode::None && v[18] != 1) v[18] = 10;      // DT_LNK
     if (old_layout) {
       v[length - 1] = v[18];
       v[18] = 0;
@@ -896,6 +928,12 @@ uint64_t sys_faccessat(Process& p, uint64_t dirfd, uint64_t path, uint64_t mode)
   String virtual_path(files.allocator());
   const int64_t r = resolve_at(p, dirfd, path, false, &virtual_path);
   if (r < 0) return error(-r);
+  if (RenderNodeMeta node; const int64_t at = render_node_at(virtual_path.view(), false, &node)) {      // /dev/dri and /sys: by the node's permission bits
+    if (at < 0) return error(-at);
+    const bool root = p.linux_state().effective_user == 0;
+    const uint32_t bits = root ? 6u | ((node.mode & 0111) ? 1u : 0u) : node.mode & 7u;      // (the system's user may read and write anything, run what anyone may)
+    return (mode & 7 & ~bits) ? error(kEacces) : 0;
+  }
   if (files.device_at(virtual_path.view()) != DescriptorKind::Closed) return 0;
   if (InputNodeMeta input; const int64_t at = input_node_at(virtual_path.view(), &input, 0)) return at < 0 ? error(-at) : 0;
   DirectoryEntry entry;
@@ -1062,7 +1100,7 @@ uint64_t sys_fstatfs(Process& p, uint64_t fd, uint64_t buffer) {
     case DescriptorKind::File:
     case DescriptorKind::Directory: {
       const OpenObject* object = files.object(fd);
-      if (object && !object->memory && !object->gpu_buffer && !object->gpu_sync && !object->path.empty()) return statfs_of_path(p, object->path.view(), buffer);
+      if (object && !object->anonymous() && !object->path.empty()) return statfs_of_path(p, object->path.view(), buffer);
       break;
     }
     default: break;
@@ -1081,7 +1119,7 @@ uint64_t sys_linkat(Process& p, uint64_t old_dirfd, uint64_t old_path, uint64_t 
     if (files.kind(old_dirfd) == DescriptorKind::Closed) return error(kEbadf);
     const OpenObject* object = files.object(old_dirfd);
     if (files.kind(old_dirfd) == DescriptorKind::Directory) return error(kEperm);
-    if (files.kind(old_dirfd) != DescriptorKind::File || !object || object->memory || object->gpu_buffer || object->gpu_sync || object->path.empty()) return error(kExdev);
+    if (files.kind(old_dirfd) != DescriptorKind::File || !object || object->anonymous() || object->path.empty()) return error(kExdev);
     if (!from.assign(object->path.view())) return error(kEnomem);
   } else {
     const int64_t r = resolve_raw(p, old_dirfd, old_path, false, &from);
@@ -1121,8 +1159,7 @@ uint64_t sys_flock(Process& p, uint64_t fd, uint64_t operation) {
   ObjectManager* objects = system_objects();
   String path(files.allocator());
   // What has no name in the file system (a console, a pipe, a file in memory) can only be reached through this open file: its lock is always its own.
-  const bool named = (files.kind(fd) == DescriptorKind::File || files.kind(fd) == DescriptorKind::Directory) && object && !object->memory && !object->gpu_buffer &&
-                     !object->gpu_sync && !object->path.empty();
+  const bool named = (files.kind(fd) == DescriptorKind::File || files.kind(fd) == DescriptorKind::Directory) && object && !object->anonymous() && !object->path.empty();
   if (!named || !objects || !files.host_path_of(object->path.view(), &path)) return 0;
   if (what == kLockUn) {
     objects->unlock_range(path.view(), object, 0, ObjectManager::kWholeFile);
@@ -1204,8 +1241,7 @@ uint64_t record_lock(Process& p, uint64_t fd, uint64_t command, uint64_t argumen
   ObjectManager* objects = system_objects();
   String path(files.allocator());
   // What has no name in the file system (a console, a pipe, a file in memory) can only be reached through this descriptor's open file: nobody else could hold a lock.
-  const bool named = (files.kind(fd) == DescriptorKind::File || files.kind(fd) == DescriptorKind::Directory) && object && !object->memory && !object->gpu_buffer &&
-                     !object->gpu_sync && !object->path.empty();
+  const bool named = (files.kind(fd) == DescriptorKind::File || files.kind(fd) == DescriptorKind::Directory) && object && !object->anonymous() && !object->path.empty();
   if (!named || !objects || !files.host_path_of(object->path.view(), &path)) return get ? answer_unlocked() : 0;
   if (!get && ((type == 0 && !object->readable) || (type == 1 && !object->writable))) return error(kEbadf);
   const void* const owner = ofd ? static_cast<const void*>(object) : static_cast<const void*>(&p.linux_state());
@@ -1263,12 +1299,14 @@ uint64_t sys_fcntl(Process& p, uint64_t fd, uint64_t command, uint64_t argument)
       OpenObject* object = files.object(fd);
       if (!object) return files.kind(fd) == DescriptorKind::ConsoleInput ? 0 : kORdWr;
       return (object->readable && object->writable ? kORdWr : object->writable ? kOWrite : 0) | (object->append ? kOAppend : 0) |
-             (files.kind(fd) == DescriptorKind::InputDevice && input_non_blocking(p, fd) ? kONonBlock : 0);
+             (files.kind(fd) == DescriptorKind::InputDevice && input_non_blocking(p, fd) ? kONonBlock : 0) |
+             (render_node_non_blocking(p, fd) ? kONonBlock : 0);
     }
     case 4:        // F_SETFL: O_NONBLOCK of a socket; nothing else here can change
       if (files.kind(fd) == DescriptorKind::UnixSocket) set_socket_non_blocking(p, fd, (argument & kONonBlock) != 0);
       if (files.kind(fd) == DescriptorKind::Socket) set_inet_non_blocking(p, fd, (argument & kONonBlock) != 0);
       if (files.kind(fd) == DescriptorKind::InputDevice) set_input_non_blocking(p, fd, (argument & kONonBlock) != 0);
+      set_render_node_non_blocking(p, fd, (argument & kONonBlock) != 0);
       return 0;
     case 1031:     // F_SETPIPE_SZ / F_GETPIPE_SZ: a pipe's buffer is always kFifoBytes
     case 1032:
@@ -1308,6 +1346,11 @@ uint64_t sys_readlinkat(Process& p, uint64_t dirfd, uint64_t path, uint64_t buff
   String virtual_path(files.allocator()), target(files.allocator());
   const int64_t r = resolve_raw(p, dirfd, path, false, &virtual_path);
   if (r < 0) return error(-r);
+  if (const int64_t node = render_node_link(virtual_path.view(), &target)) {      // /sys's links (LinuxRenderNode.hpp)
+    if (node < 0) return error(-node);
+    const uint64_t n = target.size() < size ? target.size() : size;
+    return p.write_user(buffer, text_as_bytes(target.view().first(n))) ? n : error(kEfault);
+  }
   const int64_t proc = proc_self_link(p, virtual_path.view(), &target);
   if (proc < 0) return error(-proc);
   if (proc == 0) {
@@ -1487,6 +1530,7 @@ uint64_t sys_ioctl(Process& p, uint64_t fd, uint64_t request, uint64_t argument)
   const DescriptorKind kind = p.descriptor(fd);
   if (kind == DescriptorKind::Closed) return error(kEbadf);
   if (kind == DescriptorKind::UnixSocket || kind == DescriptorKind::Socket) return socket_ioctl(p, fd, request, argument);      // (FIONREAD, FIONBIO: LinuxSockets.cpp)
+  if (uint64_t result = 0; render_node_ioctl(p, fd, request, argument, &result)) return result;      // (the render node, its dma-bufs and sync_files: LinuxRenderNode.cpp)
   if (kind == DescriptorKind::File) return dmabuf_ioctl(p, fd, request, argument);
   if (kind == DescriptorKind::InputDevice) return input_ioctl(p, fd, request, argument);      // (evdev and joydev: LinuxInput.cpp)
   if (kind != DescriptorKind::Dxg) return error(kEnotty);
