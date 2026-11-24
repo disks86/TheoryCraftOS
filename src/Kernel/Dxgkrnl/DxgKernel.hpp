@@ -81,7 +81,8 @@ class IWaitHook {
 enum class EscapeOp : uint32_t {
   CreateShader = 1, CreatePipeline = 2, DestroyShader = 3, DestroyPipeline = 4, CreateComputePipeline = 5,
   CreateRootSignature = 6, DestroyRootSignature = 7, CreateDescriptorHeap = 8, DestroyDescriptorHeap = 9, WriteDescriptors = 10, CopyDescriptors = 11, UpdateTileMappings = 12, QuerySync = 13, QueryStreamOutput = 14,
-  // Video decoding: CreateVideoDecoder (profile, width, height, surfaces, ten_bit -> handle), DestroyVideoDecoder (handle), QueryVideoDecodeSupport (profile, ten_bit, width, height -> 1 or 0)
+  // Video decoding: CreateVideoDecoder (profile, width, height, surfaces, surface_format -> handle), DestroyVideoDecoder (handle), QueryVideoDecodeSupport (profile,
+  // surface_format, width, height -> 1 or 0); surface_format is VideoDecoderDesc's (0 NV12 and 1 P010, as the ten_bit word that was there before)
   CreateVideoDecoder = 15, DestroyVideoDecoder = 16, QueryVideoDecodeSupport = 17,
 };
 
@@ -242,7 +243,7 @@ class Kernel {
   // video_decode_supported says beforehand.
   NtStatus create_video_decoder(ProcessId pid, Handle device, const VideoDecoderDesc& desc, Handle* decoder);
   NtStatus destroy_video_decoder(ProcessId pid, Handle decoder);
-  bool video_decode_supported(uint32_t profile, bool ten_bit, uint32_t width, uint32_t height) const;
+  bool video_decode_supported(uint32_t profile, uint32_t surface_format, uint32_t width, uint32_t height) const;
   NtStatus destroy_shader(ProcessId pid, Handle shader);
   NtStatus destroy_pipeline(ProcessId pid, Handle pipeline);
   NtStatus escape(ProcessId pid, Handle device, ConstByteView request, ByteView reply, uint32_t* reply_bytes);

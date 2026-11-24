@@ -307,8 +307,18 @@ Direct3D 11's and 12's video interfaces run on the kernel's codecs, on the CPU, 
 - **Decoding** (DXVA). A program parses its stream and hands each picture's DXVA buffers (picture parameters, inverse quantization matrices, slice or tile controls,
   compressed data). `src/Hardware/VideoCodec/Dxva` decodes them (`IDxvaDecoder`, DxvaDecoder.hpp): H.264 VLD (short slices; progressive and interlaced - MBAFF frames
   and field pictures, whose references are the fields UsedForReferenceFlags marks - monochrome as NV12 with grey chroma, POC types 0-2), MPEG-2 and
-  MPEG-1, VP9 profile 0 and 10-bit profile 2, HEVC Main, AV1 profile 0 (8 and 10 bits, monochrome, film grain). H.264, MPEG-2 and VP9 rebuild what the software decoders
-  read from the parameters; HEVC and AV1 fill the decoders' parameter sets and frame headers from them and take the reference sets DXVA gives. Each picture comes back at
+  MPEG-1, VP9 profile 0 and 10-bit profile 2, HEVC Main (NV12) and Main 10 (P010: 8 to 10 bits for luma and chroma each, so Main and the Still Picture
+  profiles too), AV1 profile 0 (8 and 10 bits, monochrome, film grain), VC-1 (VC1_VLD and VC1_D2010: Simple, Main and
+  Advanced profile, progressive pictures) and MPEG-4 Part 2 (MPEG4PT2_VLD_SIMPLE, _ADVSIMPLE_NOGMC, _ADVSIMPLE_GMC: B planes, quarter samples, interlace, GMC, the
+  MPEG quantiser, video packets, data partitioning and RVLC, the short video header). H.264, MPEG-2 and VP9 rebuild what the software decoders read from the parameters;
+  HEVC and AV1 fill the decoders' parameter sets and frame headers from them and take the reference sets DXVA gives. The CPU H.265 decoder
+  has every sample path at any depth up to 10 bits (templated on the sample type: 8-bit pictures take the 8-bit code as before, 10-bit ones 16-bit planes with
+  QpBdOffset, the interpolation shifts, weighted prediction offsets, bdShift, PCM at its own depth, tC / beta and SAO offsets scaled). VC-1 (DxvaVc1.cpp) makes the sequence and entry
+  point layers from DXVA_PictureParameters and hands the frame (with its start codes) to the CPU decoder's external mode (`vc1::Core::decode_external`: the caller's
+  pictures, the rounding control bRcontrol, the intensity compensation a P picture applied kept with its surface for the B pictures that predict from it); MPEG-4
+  (DxvaMpeg4.cpp) makes the video object layer from DXVA_PicParams_MPEG4_PART2 and DXVA_QmatrixData and takes the plane header from the bitstream (checked against
+  the parameters) or, without a start code, from the parameters with wMBbitOffset; direct mode uses TRB / TRD. Refused as Unsupported: interlaced VC-1 pictures, VC-1
+  range reduction and range mapping, pan-scan, post-processing into wDeblockedPictureIndex, MPEG-4 static sprites and reduced resolution planes. Each picture comes back at
   once, in decoding order, kept under a key (the kernel's allocation of its luma plane), so the reference list may change from picture to picture. The kernel's decoder is
   a `VideoDecoderObject` (escapes CreateVideoDecoder / DestroyVideoDecoder / QueryVideoDecodeSupport); the stream's `DecodeFrame` decodes into the output planes and writes a
   `VideoDecodeStatus` (Direct3D 12's decode statistics). A picture that cannot be decoded leaves the planes alone and says so in the status: the stream goes on. An H.264
@@ -317,21 +327,48 @@ Direct3D 11's and 12's video interfaces run on the kernel's codecs, on the CPU, 
   `HEIGHT_ALIGNMENT_MULTIPLE_32_REQUIRED`), d3d11.dll's H.264 decoders are field-based.
 - **Processing.** The stream's `VideoProcess` (Hardware/VideoCodec/VideoProcess.hpp): up to 16 streams converted between NV12 / P010 / P016 / BGRA8 / BGRX8 / RGBA8 /
   RGB10A2 / RGBA16F and the SDR colour spaces (BT.601 / 709 / 2020, studio and full range, gamma 2.2, 2.4 and linear, chroma siting), scaled bilinearly, oriented, blended,
-  composed over a background in a target rectangle. No HDR tone mapping, deinterlacing, filters or luma keying.
+  composed over a background in a target rectangle; PQ and HLG (BT.2100) in and out, converted in absolute light (SDR white = BT.2408's 203 cd/m2) and tone mapped by
+  BT.2390's EETF on the brightest channel with the content's and the display's HDR10 light levels. Before sampling, a stream may be made a scratch picture of its own
+  (VideoProcessStages.inc, plane by plane in the source's layout, so it is format-independent): the view of a stereo picture (side by side, top and bottom, rows,
+  columns, checkerboard, mono offset, flipped frames), deinterlaced (bob, or motion adaptive: yadif's algorithm with a past and a future frame, the same as ffmpeg's yadif
+  sample for sample), noise reduced (3x3 sigma filter) and edge enhanced (3x3 unsharp mask). ProcAmp (DXVA's formulas on Y'CbCr: an affine map folded into the
+  conversion) and the luma key (D3D11's truncated code range) are applied per sample, anamorphic scaling in the destination mapping. `VideoProcess` takes these as an
+  optional part after the streams (`kVideoProcessExtension`, CommandStream.hpp: the display's light levels, then 25 words per stream, with the reference frames' planes).
 - **Planes.** The kernel has no one- or two-channel formats: NV12 / P010 planes, and R8 / R8G8 / R16 / R16G16 textures, are kept widened (`(r, g or 0, 0, maximum)` in an
   A8B8G8R8 or A16B16G16R16 image), so a view of the narrow format reads the right values; `CopyBufferImage` takes a `NarrowLayout` to copy the narrow rows, and render
   targets of those formats write their channels only. d3d12.dll makes every plane of every array slice of a planar texture an allocation of its own
   (`Resource.plane_alloc`), which keeps P010 arrays and planar render targets within what the kernel's images can be.
+- **4:2:2 and 4:4:4.** AV1 profiles 1 and 2 (`D3D12_VIDEO_DECODE_PROFILE_AV1_PROFILE1`, `_PROFILE2`, `_12BIT_PROFILE2`, `_12BIT_PROFILE2_420`; DXVA_ModeAV1_VLD_*) decode
+  into the formats Windows' decoders use: AYUV / Y410 (8- and 10-bit 4:4:4), YUY2 / Y210 (4:2:2) and NV12 / P010 (monochrome), Y216 / Y416 (12-bit 4:2:2 / 4:4:4),
+  P016 (12-bit 4:2:0 and monochrome; 12 bits in the top of each word). `VideoDecoderDesc::surface_format` (hardware::DxvaSurfaceFormat; 0 and 1 are NV12 and P010 as
+  the `ten_bit` word was) names it; the packed ones are one image of their views' pixels (AYUV and YUY2 A8B8G8R8, Y410 A2B10G10R10, Y416 / Y210 / Y216 A16B16G16R16;
+  the 4:2:2 ones half as wide, a pixel a pair), into which `DecodeFrame` copies the rows the decoder packed. d3d12.dll has the packed formats (views of their pixels'
+  format only, render targets of AYUV only, arrays one allocation a slice) and Direct3D 12's planar P208 / V208 / V408 (two or three planes); the processor reads and
+  writes AYUV, Y410, Y416, YUY2, Y210, Y216 and P208 (4:2:2 chroma sited as the colour space says, horizontally). Large-scale tiles (anchor frames) stay refused: the
+  core decodes whole frames.
 - d3d12.dll: `ID3D12VideoDevice` .. 3, decoders and heaps (a heap is the kernel's decoder), processors, the VIDEO_DECODE / VIDEO_PROCESS queues and lists, decode
   statistics queries (video.inc; video_types.h has what mingw's d3d12video.h lacks). d3d11.dll: `ID3D11VideoDevice` .. 2, `ID3D11VideoContext` .. 3 on those
   (docs/Direct3D11.md).
-- Not there: video encoding and motion estimation (reported as not supported; their creators answer DXGI_ERROR_UNSUPPORTED), HEVC Main10 and 4:2:2 / 4:4:4, AV1 profiles 1 and 2 and large-scale tiles, VC-1 and MPEG-4 part 2 DXVA profiles, decode-time conversion and histograms, protected
+- Encoding and motion estimation (Direct3D 12 only; `src/Kernel/Dxgkrnl/VideoEncode.{hpp,cpp}`, stream ops EstimateMotion / ResolveMotionVectors / EncodeFrame /
+  ResolveEncoderMetadata, states kVideoEncodeRead / Write; d3d12.dll `encode.inc`): the motion estimator (`Software/MotionEstimator`: 8x8 / 16x16 blocks, SAD, whole-sample
+  search +-8 around the predictors, then half and quarter refinement with H.264's interpolation; resolved into an R16G16_SINT texture, kept as A16B16G16R16Sint (x, y, 0, 1))
+  and an H.264 encoder driven like a D3D12 driver is (`Software/H264PictureEncoder`: the program keeps the DPB, names lists / marking / modifications and writes SPS and PPS;
+  the slices are CAVLC Main with Intra16x16 and 16x16 P / B partitions, quarter-sample vectors, filter modes 0-2, slices by macroblocks / rows / count, a QP per macroblock),
+  picture-level rate control `Software/VideoRateControl` (CQP, CBR, VBR, QVBR, absolute QP map; state in the encoder heap, re-encode on overflow). The resolution must be whole
+  macroblocks (the queries say multiple of 16). Not done: CABAC, 8x8 transform, direct / B_Skip, intra refresh, slices by bytes, frame analysis, HEVC and AV1 (the codec query
+  says FALSE), EncodeCommandList4. Tests: `tests/run_host_tests.sh VideoEncodeTest`, `tests/h264_encode_ffmpeg.sh` (ffmpeg's decode = the reconstruction),
+  `tests/emulated_dx.sh tests/windows/d3d12encodetest.c`, `tests/d3d12_qemu.sh d3d12encodetest`, `tests/wow64_qemu.sh d3d12encodetest`.
+- Not there: HEVC 4:2:2 / 4:4:4 and above 10 bits (the range extension profiles; their SPS / PPS extensions are not read), AV1 large-scale tiles, interlaced VC-1 (the CPU decoder has progressive pictures only), decode-time conversion and histograms, protected
   content (crypto sessions and authenticated channels are refused), shared planar textures, placed planar resources, views of several slices of a planar texture.
 - Tests: `tests/run_host_tests.sh DxvaDecoderTest VideoProcessTest DxgkrnlTest` (every codec bit for bit with ffmpeg; the DXVA buffers filled as ffmpeg's dxva2_*.c
-  fill them; interlaced H.264 from x264 MBAFF streams and cuts of the JVT conformance streams, tests/data/make_h264_interlaced_fixtures.py),
-  `tests/emulated_dx.sh tests/windows/d3d12videotest.c` and `d3d11videotest.c` (H.264, progressive and an MBAFF + field picture stream, decoded through both APIs, bit
-  for bit with ffmpeg; the processor
-  against BT.709), `tests/d3d12_qemu.sh d3d12videotest`, `tests/wow64_qemu.sh d3d12videotest d3d11videotest` (32-bit).
+  fill them; interlaced H.264 from x264 MBAFF streams and cuts of the JVT conformance streams, tests/data/make_h264_interlaced_fixtures.py; VC-1 and MPEG-4 Part 2, which ffmpeg has no DXVA path for, from the software decoder's view of the stream; HEVC Main 10 over tests/data/hevc10_*.h265, scripts/gen_hevc10_test_streams.sh, with the PCM stream of
+  scripts/gen_hevc10_pcm_stream.py), `tests/emulated_dx.sh
+  tests/windows/d3d12videotest.c` and `d3d11videotest.c` (H.264 - progressive and an MBAFF + field picture stream -, HEVC Main 10 - tests/windows/hevc10_dxva.h, made by `DXVA_HEVC10_DUMP=... DxvaDecoderTest` -, VC-1, MPEG-4 Part 2 and AV1 profiles 1 and 2 decoded through both APIs, bit for bit with ffmpeg -
+  the AV1 streams' DXVA buffers dumped by DxvaDecoderTest with DXVA_AV1_DUMP, tests/data/make_av1_dxva_data.py; the packed and planar YUV textures; the processor
+  against BT.709; motion adaptive deinterlacing against ffmpeg's yadif output, bob, ProcAmp, luma key, stereo, HDR10 into SDR), `tests/d3d12_qemu.sh d3d12videotest`,
+  `tests/wow64_qemu.sh d3d12videotest d3d11videotest` (32-bit). VideoProcessTest's references: tests/data/videoprocess/make_refs.sh (zscale, yadif, geq).
+- Not in the processor: inverse telecine and frame rate conversion, motion-compensated deinterlacing, the stereo adjustment filter and auto processing (not reported),
+  HDR10+ dynamic metadata (only HDR10's static light levels are read), scRGB (G10) input brighter than white is clipped, not tone mapped.
 
 ## Not done
 

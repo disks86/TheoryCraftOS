@@ -15,7 +15,8 @@
  * You should have received a copy of the GNU Affero General Public License
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
-// DXVA AV1 decoding (D3D11_DECODER_PROFILE_AV1_VLD_PROFILE0: 8- and 10-bit 4:2:0 and monochrome) on the CPU AV1 decoder (Software/Av1*.cpp).
+// DXVA AV1 decoding on the CPU AV1 decoder (Software/Av1*.cpp): D3D11_DECODER_PROFILE_AV1_VLD_PROFILE0 (8- and 10-bit 4:2:0 and monochrome), _PROFILE1 (8- and 10-bit
+// 4:4:4), _PROFILE2 (8- and 10-bit 4:2:2 and monochrome), _12BIT_PROFILE2 (12-bit 4:2:2 and 4:4:4) and _12BIT_PROFILE2_420 (12-bit 4:2:0 and monochrome).
 //
 // DXVA_PicParams_AV1 carries the sequence and frame header fields in force for the frame (the program's parser has already loaded what a header inherits from its
 // primary reference: segmentation features, loop filter deltas, film grain); the bitstream holds tile data only. So the decoder's header structures (dav1d's
@@ -25,8 +26,10 @@
 // header (order hints, sizes) - so all of it is kept per surface key; the eight slots of RefFrameMapTextureIndex name the surfaces, frame_refs[].Index the slots.
 //
 // The frame comes back at once, in decoding order, whether it is shown or not (show_frame 0: the program shows the surface itself later), at its size (the
-// upscaled width), as NV12 (8-bit) or P010 (10-bit, the value in the top bits). With apply_grain the film grain is applied to the output, as DXVA has the
-// accelerator do; the surface's reference picture stays without grain. Large-scale tile decoding (anchor frames) is not offered: Unsupported.
+// upscaled width), in the decoder's surface format (DxvaSurfaceFormat: NV12 / P010 / P016 for 4:2:0 and monochrome - neutral chroma -, AYUV / Y410 / Y416 for 4:4:4,
+// YUY2 / Y210 / Y216 for 4:2:2; deeper samples in the top bits of their words, alpha opaque). With apply_grain the film grain is applied to the output, as DXVA has the
+// accelerator do; the surface's reference picture stays without grain. Large-scale tile decoding (anchor frames and tile list OBUs) is not offered: Unsupported -
+// the core decodes whole frames only, and the Windows decoder profiles carry ordinary frames (every program's DXVA_Tile_AV1.anchor_frame is 0xFF).
 #include "Hardware/VideoCodec/Dxva/DxvaCodecs.hpp"
 #include "Hardware/VideoCodec/Dxva/DxvaSurfaces.hpp"
 #include "Hardware/VideoCodec/Dxva/DxvaTypesAv1.hpp"
@@ -67,7 +70,7 @@ class Av1DxvaDecoder final : public IDxvaDecoder {
     return static_cast<bool>(core_);
   }
 
-  DxvaProfile profile() const override { return DxvaProfile::Av1VldProfile0; }
+  DxvaProfile profile() const override { return config_.profile; }
 
   void reset() override {
     surfaces_.clear();
@@ -102,29 +105,61 @@ DxvaResult Av1DxvaDecoder::make_headers(const dxva::PicParamsAv1& pp, SequenceHe
   const uint32_t coding = pp.CodingParamToolFlags;
   const uint32_t format = pp.FormatAndPictureInfoFlags;
   const bool mono = bit(format, 6), ss_x = bit(format, 4), ss_y = bit(format, 5);
-  if (pp.seq_profile != 0) {
-    *why = "AV1: only the Main profile (seq_profile 0) is decoded";
+  // The stream's profile must be the one of the decoder's profile (Main: 0; High: 1; Professional: 2), and the format one the profile has (5.5.2: profile 0 is 8 or 10
+  // bits 4:2:0 or monochrome, profile 1 8 or 10 bits 4:4:4, profile 2 12 bits of any layout or 8 or 10 bits 4:2:2 or monochrome).
+  const uint32_t wanted = config_.profile == DxvaProfile::Av1VldProfile0 ? 0 : config_.profile == DxvaProfile::Av1VldProfile1 ? 1 : 2;
+  if (pp.seq_profile > 2) {
+    *why = "AV1: seq_profile out of range";
+    return DxvaResult::Invalid;
+  }
+  if (pp.seq_profile != wanted) {
+    *why = wanted == 0 ? "AV1: only the Main profile (seq_profile 0) is decoded by a profile 0 decoder" : "AV1: the stream's seq_profile is not the one of the decoder's profile";
     return DxvaResult::Unsupported;
   }
-  if (pp.bitdepth != 8 && pp.bitdepth != 10) {
-    *why = pp.bitdepth == 12 ? "AV1: 12-bit samples are not in profile 0" : "AV1: bitdepth out of range";
-    return pp.bitdepth == 12 ? DxvaResult::Unsupported : DxvaResult::Invalid;
+  if (pp.bitdepth != 8 && pp.bitdepth != 10 && pp.bitdepth != 12) {
+    *why = "AV1: bitdepth out of range";
+    return DxvaResult::Invalid;
   }
-  if (!ss_x || !ss_y) {
-    *why = "AV1: only 4:2:0 and monochrome are decoded (profile 0)";
-    return DxvaResult::Unsupported;
+  if ((mono && (!ss_x || !ss_y)) || (!ss_x && ss_y)) {
+    *why = "AV1: a chroma subsampling AV1 does not have (monochrome sets both flags; there is no 4:4:0)";
+    return DxvaResult::Invalid;
   }
-  if ((pp.bitdepth == 8) != (config_.output == PixelFormat::Nv12)) {
-    *why = "AV1: the frame's bit depth does not match the decoder's output format (8-bit: NV12, 10-bit: P010)";
+  const bool i444 = !ss_x && !ss_y, i422 = ss_x && !ss_y, i420 = ss_x && ss_y && !mono;
+  bool legal = false;
+  switch (pp.seq_profile) {
+    case 0: legal = pp.bitdepth != 12 && (i420 || mono); break;
+    case 1: legal = pp.bitdepth != 12 && i444; break;
+    default: legal = pp.bitdepth == 12 || i422 || mono; break;
+  }
+  if (!legal) {
+    *why = "AV1: the bit depth and chroma layout are not ones of seq_profile (5.5.2)";
+    return DxvaResult::Invalid;
+  }
+  // The decoder's surfaces hold one layout and depth.
+  using S = DxvaSurfaceFormat;
+  bool fits = false;
+  switch (config_.surface) {
+    case S::Nv12: fits = pp.bitdepth == 8 && (i420 || mono); break;
+    case S::P010: fits = pp.bitdepth == 10 && (i420 || mono); break;
+    case S::P016: fits = pp.bitdepth == 12 && (i420 || mono); break;
+    case S::Ayuv: fits = pp.bitdepth == 8 && i444; break;
+    case S::Y410: fits = pp.bitdepth == 10 && i444; break;
+    case S::Y416: fits = pp.bitdepth == 12 && i444; break;
+    case S::Yuy2: fits = pp.bitdepth == 8 && i422; break;
+    case S::Y210: fits = pp.bitdepth == 10 && i422; break;
+    case S::Y216: fits = pp.bitdepth == 12 && i422; break;
+  }
+  if (!fits) {
+    *why = "AV1: the frame's bit depth or chroma layout does not match the decoder's output format";
     return DxvaResult::Invalid;
   }
   *why = "AV1: picture parameters out of range";
   SequenceHeader seq{};
-  seq.profile = 0;
+  seq.profile = pp.seq_profile;
   seq.max_width = static_cast<int>(pp.max_width);
   seq.max_height = static_cast<int>(pp.max_height);
-  seq.layout = mono ? av1::PIXEL_LAYOUT_I400 : av1::PIXEL_LAYOUT_I420;
-  seq.hbd = pp.bitdepth == 10 ? 1 : 0;
+  seq.layout = mono ? av1::PIXEL_LAYOUT_I400 : i444 ? av1::PIXEL_LAYOUT_I444 : i422 ? av1::PIXEL_LAYOUT_I422 : av1::PIXEL_LAYOUT_I420;
+  seq.hbd = (pp.bitdepth - 8) / 2;
   seq.pri = av1::COLOR_PRI_UNKNOWN;
   seq.trc = av1::TRC_UNKNOWN;
   seq.mtrx = bit(pp.film_grain.ControlFlags, 12) ? av1::MC_IDENTITY : av1::MC_UNKNOWN;
@@ -144,7 +179,8 @@ DxvaResult Av1DxvaDecoder::make_headers(const dxva::PicParamsAv1& pp, SequenceHe
   seq.super_res = bit(coding, c::kSuperres);
   seq.cdef = bit(coding, c::kCdef);
   seq.restoration = bit(coding, c::kRestoration);
-  seq.ss_hor = seq.ss_ver = 1;
+  seq.ss_hor = ss_x ? 1 : 0;
+  seq.ss_ver = ss_y ? 1 : 0;
   seq.monochrome = mono;
   seq.film_grain_present = bit(coding, c::kFilmGrain);
   seq.screen_content_tools = bit(coding, c::kScreenContentTools) ? av1::ADAPTIVE : av1::OFF;
@@ -523,39 +559,93 @@ bool Av1DxvaDecoder::grey_reference(const SequenceHeader& seq, const FrameHeader
 
 bool Av1DxvaDecoder::output(const Picture& p, DxvaDecodedPicture* out) {
   const uint64_t w = static_cast<uint64_t>(p.width()), h = static_cast<uint64_t>(p.height());
-  const uint64_t cw = (w + 1) / 2, ch = (h + 1) / 2;
-  const bool deep = config_.output == PixelFormat::P010;
-  const uint64_t bytes = deep ? 2 : 1;
-  out_.clear();
-  if (!out_.put_zeros((w * h + cw * ch * 2) * bytes)) return false;
-  ByteWriter dst(out_.writable_view());
-  const int shift = deep ? 16 - p.bpc() : 0;
-  auto put = [&](uint32_t v) {
-    if (deep) dst.le16(static_cast<uint16_t>(v << shift));
-    else dst.u8(static_cast<uint8_t>(v));
-  };
-  const av1::PixelView y = p.plane(0);
-  for (uint64_t row = 0; row < h; ++row)
-    for (uint64_t x = 0; x < w; ++x) put(y.at(static_cast<int>(x), static_cast<int>(row)));
+  const DxvaSurfaceFormat surface = config_.surface;
+  const av1::PixelView y = p.plane(0), u = p.plane(1), v = p.plane(2);
+  const int shift = p.bpc() > 8 ? 16 - p.bpc() : 0;   // (deeper samples in the top bits of their words)
   const bool mono = p.layout() == av1::PIXEL_LAYOUT_I400;
   const uint32_t neutral = 1u << (p.bpc() - 1);
-  const av1::PixelView u = p.plane(1), v = p.plane(2);
+  auto Y = [&](uint64_t x, uint64_t row) { return static_cast<uint32_t>(y.at(static_cast<int>(x), static_cast<int>(row))); };
+  auto U = [&](uint64_t x, uint64_t row) { return static_cast<uint32_t>(u.at(static_cast<int>(x), static_cast<int>(row))); };
+  auto V = [&](uint64_t x, uint64_t row) { return static_cast<uint32_t>(v.at(static_cast<int>(x), static_cast<int>(row))); };
+  out_.clear();
+  VideoFrame f;
+  f.keyframe = p.hdr.frame_type == av1::FRAME_TYPE_KEY;
+  f.limited_range = true;
+  if (dxva_surface_packed(surface)) {
+    const uint64_t row_bytes = dxva_packed_row_bytes(surface, static_cast<uint32_t>(w));
+    if (!out_.put_zeros(row_bytes * h)) return false;
+    ByteWriter dst(out_.writable_view());
+    for (uint64_t row = 0; row < h; ++row) {
+      switch (surface) {
+        case DxvaSurfaceFormat::Ayuv:
+          for (uint64_t x = 0; x < w; ++x) {
+            dst.u8(static_cast<uint8_t>(V(x, row)));
+            dst.u8(static_cast<uint8_t>(U(x, row)));
+            dst.u8(static_cast<uint8_t>(Y(x, row)));
+            dst.u8(0xFF);
+          }
+          break;
+        case DxvaSurfaceFormat::Y410:
+          for (uint64_t x = 0; x < w; ++x) dst.le32(U(x, row) | Y(x, row) << 10 | V(x, row) << 20 | 3u << 30);
+          break;
+        case DxvaSurfaceFormat::Y416:
+          for (uint64_t x = 0; x < w; ++x) {
+            dst.le16(static_cast<uint16_t>(U(x, row) << shift));
+            dst.le16(static_cast<uint16_t>(Y(x, row) << shift));
+            dst.le16(static_cast<uint16_t>(V(x, row) << shift));
+            dst.le16(0xFFFF);
+          }
+          break;
+        default: {   // YUY2, Y210, Y216: Y0, U, Y1, V for each pair (an odd width's last pair repeats its luma)
+          const bool deep = surface != DxvaSurfaceFormat::Yuy2;
+          auto put = [&](uint32_t sample) {
+            if (deep) dst.le16(static_cast<uint16_t>(sample << shift));
+            else dst.u8(static_cast<uint8_t>(sample));
+          };
+          for (uint64_t x = 0; x < w; x += 2) {
+            put(Y(x, row));
+            put(U(x / 2, row));
+            put(Y(x + 1 < w ? x + 1 : x, row));
+            put(V(x / 2, row));
+          }
+          break;
+        }
+      }
+    }
+    if (!dst.ok()) return false;
+    f.format = {static_cast<uint32_t>(w), static_cast<uint32_t>(h), PixelFormat::Bgra8888};
+    f.plane[0] = out_.view().data();
+    f.stride[0] = static_cast<uint32_t>(row_bytes);
+    out->frame = f;
+    out->surface_format = surface;
+    return true;
+  }
+  // NV12, P010, P016: 4:2:0, or monochrome with neutral chroma
+  const uint64_t cw = (w + 1) / 2, ch = (h + 1) / 2;
+  const bool deep = surface != DxvaSurfaceFormat::Nv12;
+  const uint64_t bytes = deep ? 2 : 1;
+  if (!out_.put_zeros((w * h + cw * ch * 2) * bytes)) return false;
+  ByteWriter dst(out_.writable_view());
+  auto put = [&](uint32_t sample) {
+    if (deep) dst.le16(static_cast<uint16_t>(sample << shift));
+    else dst.u8(static_cast<uint8_t>(sample));
+  };
+  for (uint64_t row = 0; row < h; ++row)
+    for (uint64_t x = 0; x < w; ++x) put(Y(x, row));
   for (uint64_t row = 0; row < ch; ++row)
     for (uint64_t x = 0; x < cw; ++x) {
-      put(mono ? neutral : u.at(static_cast<int>(x), static_cast<int>(row)));
-      put(mono ? neutral : v.at(static_cast<int>(x), static_cast<int>(row)));
+      put(mono ? neutral : U(x, row));
+      put(mono ? neutral : V(x, row));
     }
   if (!dst.ok()) return false;
-  VideoFrame f;
   f.format = {static_cast<uint32_t>(w), static_cast<uint32_t>(h), deep ? PixelFormat::P010 : PixelFormat::Nv12};
   const ConstByteView all = out_.view();
   f.plane[0] = all.data();
   f.plane[1] = all.subview(w * h * bytes).data();
   f.stride[0] = static_cast<uint32_t>(w * bytes);
   f.stride[1] = static_cast<uint32_t>(cw * 2 * bytes);
-  f.keyframe = p.hdr.frame_type == av1::FRAME_TYPE_KEY;
-  f.limited_range = true;
   out->frame = f;
+  out->surface_format = surface;
   return true;
 }
 
@@ -684,7 +774,9 @@ DxvaResult Av1DxvaDecoder::decode(const DxvaPicture& picture, DxvaDecodedPicture
 }  // namespace
 
 UniquePointer<IDxvaDecoder> create_dxva_av1(allocators::IAllocator& allocator, const DxvaDecoderConfig& config) {
-  if (config.profile != DxvaProfile::Av1VldProfile0 || (config.output != PixelFormat::Nv12 && config.output != PixelFormat::P010)) return {};
+  const bool av1 = config.profile == DxvaProfile::Av1VldProfile0 || config.profile == DxvaProfile::Av1VldProfile1 || config.profile == DxvaProfile::Av1VldProfile2 ||
+                   config.profile == DxvaProfile::Av1Vld12BitProfile2 || config.profile == DxvaProfile::Av1Vld12BitProfile2_420;
+  if (!av1 || !dxva_profile_supports(config.profile, config.surface, config.width, config.height)) return {};
   UniquePointer<Av1DxvaDecoder> decoder = UniquePointer<Av1DxvaDecoder>::make(allocator, allocator, config);
   if (!decoder || !decoder->init()) return {};
   return UniquePointer<IDxvaDecoder>(util::move(decoder));

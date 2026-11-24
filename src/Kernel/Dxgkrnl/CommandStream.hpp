@@ -61,7 +61,8 @@
 //                    luma_index, chroma_index, status_index, status_offset, output_keyed, key_count, then key_count allocation indices   (outside a pass: decodes one picture with a video decoder of the
 //                    device (Kernel::create_video_decoder) - its DXVA picture parameters, inverse quantization matrices and slice controls are the three ranges of the buffer `buffer_index`
 //                    (a range of 0 bytes: none), the compressed data the range of `bitstream_index` - into the two planes of the output surface (2D images of one level, the formats of
-//                    DxgTypes.hpp VideoDecoderDesc, the luma at least the decoder's size, the chroma at least half of it). Key i is the luma allocation of the surface index i of the
+//                    DxgTypes.hpp VideoDecoderDesc, the luma at least the decoder's size, the chroma at least half of it; a packed surface format is the one image `luma_index`,
+//                    `chroma_index` kNoAllocation). Key i is the luma allocation of the surface index i of the
 //                    parameters (the current picture's and the references': what the decoder knows each decoded picture by; kNoAllocation for an index not used); output_keyed 1: the
 //                    current picture is known by its output (`luma_index`) whatever its index (Direct3D 12), 0: by the key of its index (Direct3D 11). status_index
 //                    (kNoAllocation: none) is a buffer the 16 bytes of a VideoDecodeStatus go to, at status_offset. A picture that cannot be decoded leaves the planes as they were and
@@ -69,9 +70,25 @@
 //   VideoProcess     output_format, output_color_space, target left, top, right, bottom, background r, g, b, a (float bits), background_is_yuv, alpha_fill, alpha_fill_stream,
 //                    output_plane0_index, output_plane1_index, stream_count, then per stream kVideoProcessStreamWords words: format, color_space, source left, top, right, bottom,
 //                    destination left, top, right, bottom, orientation, alpha_blend, alpha (float bits), plane0_index, plane1_index   (outside a pass: Hardware/VideoCodec/VideoProcess.hpp
-//                    on the CPU. Formats are hardware::VpFormat; a YUV image is two 2D images of one level as the runtime keeps NV12 / P010 / P016 (DxgTypes.hpp VideoDecoderDesc), an RGB one a
-//                    single image of the matching kernel format (Bgra8 A8R8G8B8, Bgrx8 X8R8G8B8, Rgba8 A8B8G8R8, Rgb10a2 A2B10G10R10, Rgba16f A16B16G16R16F); plane1_index is
-//                    kNoAllocation for RGB. At most kMaxVideoProcessStreams streams. A frame the processor refuses (rectangles, colour spaces) leaves the output as it was)
+//                    on the CPU. Formats are hardware::VpFormat; a planar YUV image is two 2D images of one level as the runtime keeps NV12 / P010 / P016 / P208 (DxgTypes.hpp
+//                    VideoDecoderDesc), an RGB one a single image of the matching kernel format (Bgra8 A8R8G8B8, Bgrx8 X8R8G8B8, Rgba8 A8B8G8R8, Rgb10a2 A2B10G10R10, Rgba16f
+//                    A16B16G16R16F), a packed YUV one a single image as VideoDecoderDesc keeps AYUV, Y410, Y416, YUY2, Y210, Y216; plane1_index is kNoAllocation for one image. At most kMaxVideoProcessStreams streams. A frame the processor refuses (rectangles, colour spaces) leaves the output as it was)
+//                    [, kVideoProcessExtension, the display's light levels (VpHdrMetadata: max_mastering, min_mastering, max_content, max_frame_average, float bits), then per
+//                    stream kVideoProcessStreamExtWords words: field_order, field, deinterlace, past plane0_index, plane1_index, future plane0_index, plane1_index
+//                    (kNoAllocation: none), stereo format, stereo frame, stereo flip, stereo offset (signed), brightness, contrast, hue, saturation, noise reduction,
+//                    edge enhancement, anamorphic (float bits), luma_key, lower, upper (float bits), the content's light levels (4 float bits)]   (the optional part: the
+//                    VpStream values; without it every stream is progressive, unfiltered and not stereo. The references are pictures like the stream's)
+//   EstimateMotion   block (8 or 16), width, height, current_luma_index, reference_luma_index, hint_index (kNoAllocation: none), hint_offset, heap_index, heap_offset   (outside a
+//                    pass: the motion vectors of the current picture's blocks into the reference (VideoEncode.hpp run_motion_estimation; the lumas are widened planes of at least
+//                    width x height, the heaps buffers: hint is an earlier heap, heap receives motion_vector_heap_bytes); the planes kVideoEncodeRead)
+//   ResolveMotionVectors heap_index, heap_offset, width, height, image_index, x, y   (outside a pass: the heap's vectors as R16G16_SINT pixels - an A16B16G16R16Sint image of one
+//                    level, (x, y, 0, 1) - at (x, y) of the image, which is kVideoEncodeWrite)
+//   EncodeFrame      args_index, args_offset, args_bytes, heap_index (kNoAllocation: none), heap_offset, input_luma, input_chroma, recon_luma, recon_chroma (kNoAllocation:
+//                    none), bitstream_index, bitstream_offset, metadata_index, metadata_offset, reference_count, then per reference its luma and chroma indices   (outside a
+//                    pass: codes one picture as VideoEncode.hpp says - the arguments are the args range, the heap holds kVideoEncodeHeapBytes of state; the input and references
+//                    kVideoEncodeRead, the reconstruction, bitstream and metadata kVideoEncodeWrite. A picture that cannot be coded is said so in the metadata)
+//   ResolveEncoderMetadata metadata_index, metadata_offset, out_index, out_offset   (outside a pass: EncodeFrame's metadata as D3D12_VIDEO_ENCODER_OUTPUT_METADATA and its slice
+//                    records into the buffer `out`, kVideoEncodeWrite)
 //   EndQuery         (the count of fragments that passed the depth and stencil tests since BeginQuery is written there - a little-endian 64-bit number - once the stream has run)
 #pragma once
 #include "Kernel/Dxgkrnl/DxgTypes.hpp"
@@ -113,8 +130,14 @@ enum class Op : uint16_t {
   CopyBufferImage,
   DecodeFrame,
   VideoProcess,
+  EstimateMotion,
+  ResolveMotionVectors,
+  EncodeFrame,
+  ResolveEncoderMetadata,
 };
 constexpr uint32_t kVideoProcessStreamWords = 15;
+constexpr uint32_t kVideoProcessExtension = 0x31585056;   // 'VPX1': VideoProcess's optional part follows
+constexpr uint32_t kVideoProcessStreamExtWords = 25;
 constexpr uint32_t kMaxVideoProcessStreams = 16;
 
 // How the vertices (or indices) of a draw make triangles (D3D10 IASetPrimitiveTopology / D3D9 primitive types); the default is a list. A strip or fan is expanded to a list of

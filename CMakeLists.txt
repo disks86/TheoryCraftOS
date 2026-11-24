@@ -682,6 +682,7 @@ add_executable(BOOTX64
   src/Kernel/Dxgkrnl/D3d9Ps1.cpp
   src/Kernel/Dxgkrnl/SelfTest.cpp
   src/Kernel/Dxgkrnl/Conformance.cpp
+  src/Kernel/Dxgkrnl/VideoEncode.cpp
   src/Kernel/Dxgkrnl/D3d9Devices.cpp
   src/Kernel/Dxgkrnl/D3d9Emit.cpp
   src/Kernel/Dxgkrnl/Adapter.cpp
@@ -1085,6 +1086,8 @@ add_executable(BOOTX64
   src/Hardware/VideoCodec/Dxva/DxvaVp9.cpp
   src/Hardware/VideoCodec/Dxva/DxvaHevc.cpp
   src/Hardware/VideoCodec/Dxva/DxvaAv1.cpp
+  src/Hardware/VideoCodec/Dxva/DxvaVc1.cpp
+  src/Hardware/VideoCodec/Dxva/DxvaMpeg4.cpp
   src/Hardware/VideoCodec/SystemVideoCodecs.cpp
   src/Hardware/VideoCodec/AMD/AmdIpDiscovery.cpp
   src/Hardware/VideoCodec/AMD/AmdVcnFirmware.cpp
@@ -1307,6 +1310,9 @@ add_executable(BOOTX64
   src/Hardware/VideoCodec/Software/H264Parser.cpp
   src/Hardware/VideoCodec/Software/H264Dpb.cpp
   src/Hardware/VideoCodec/Software/H264Encoder.cpp
+  src/Hardware/VideoCodec/Software/H264PictureEncoder.cpp
+  src/Hardware/VideoCodec/Software/MotionEstimator.cpp
+  src/Hardware/VideoCodec/Software/VideoRateControl.cpp
   src/Hardware/VideoCodec/Software/H264Macroblock.cpp
   src/Hardware/VideoCodec/Software/H264Cabac.cpp
   src/Hardware/VideoCodec/Software/H264Predict.cpp

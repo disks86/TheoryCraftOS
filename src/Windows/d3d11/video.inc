@@ -26,15 +26,18 @@
  * recorded (the list is sent first, and the queue runs the decode before it returns), so draws and copies before and after see the textures in order. The DXVA surface
  * indices of the parameters are the array slices of the texture the output view is of (as ffmpeg's d3d11va and Media Foundation give them): the reference list is every
  * slice of that texture, so index n is slice n. The status of each picture (DecoderExtension, DXVA_STATUS_REPORTING_FUNCTION) comes from Direct3D 12's decode statistics.
- * Profiles: what Direct3D 12 below decodes (H.264, MPEG-2, MPEG-1/2, VP9 profile 0 and 10-bit profile 2, HEVC Main, AV1 profile 0); all are VLD (bitstream) decoders, so
+ * Profiles: what Direct3D 12 below decodes (H.264, MPEG-2, MPEG-1/2, VP9 profile 0 and 10-bit profile 2, HEVC Main and Main 10, AV1 profile 0); all are VLD (bitstream) decoders, so
  * the buffers of the older acceleration modes (macroblock control, residual difference, deblocking, motion vectors, film grain) are not taken.
  *
  * Video processing. VideoProcessorBlt is one ProcessFrames on a VIDEO_PROCESS queue, ordered with the immediate context's work the same way. A processor keeps the
  * Direct3D 11 state (the output's and each stream's) and makes the Direct3D 12 processor of the formats and colour spaces it is blitted with (a few are kept). What it
  * does is what the kernel's processor does: colour space and format conversion (NV12, P010, P016, BGRA8, BGRX8, RGBA8, RGB10A2, RGBA16F; BT.601 / BT.709 / BT.2020,
- * studio and full range), bilinear scaling, rotation and mirroring, planar alpha, alpha fill, the background colour. Not: deinterlacing (progressive frames only:
- * one rate conversion with no past or future frames), filters, luma keys, palettes, stereo, constriction, pixel aspect ratio conversion, HDR tone mapping (the metadata
- * is kept and given back) - the caps say so, and a Blt that asks for them is E_INVALIDARG.
+ * studio and full range; PQ and HLG, tone mapped with the streams' and the output's HDR10 metadata), bilinear scaling, rotation and mirroring, planar alpha, alpha fill,
+ * the background colour, deinterlacing (two rate conversions: bob, and motion adaptive with a past and a future frame; normal and half rate), the ProcAmp, noise
+ * reduction, edge enhancement and anamorphic scaling filters, luma keys, stereo (every packing; output stereo into two slices of the output view). What Direct3D 12's
+ * processor has no words for (packings other than side by side and separate, the views' frames, flipped frames, the mono offset, HDR metadata, half rate) d3d12.dll
+ * takes from private data of the command list (../d3d12/video_extra.h). Not: palettes, constriction, pixel aspect ratio conversion, inverse telecine, frame rate
+ * conversion, custom rates, the stereo adjustment filter, HDR10+ (dynamic) metadata - the caps say so, and a Blt that asks for them is E_INVALIDARG.
  *
  * Content protection: there is none on this device. No crypto type, key exchange or protection capability is reported, and crypto sessions and authenticated channels
  * cannot be made (see video_crypto_*): the context's methods that take one have nothing valid to be given. */
@@ -45,14 +48,26 @@
 #define VIDEO_BUFFER_TYPES 9u        /* D3D11_VIDEO_DECODER_BUFFER_TYPE: PICTURE_PARAMETERS .. FILM_GRAIN */
 #define VIDEO_PROCESSOR_CACHE 4u     /* Direct3D 12 processors a Direct3D 11 one keeps */
 #define VIDEO_HDR_BYTES 128u         /* HDR metadata kept (DXGI_HDR_METADATA_HDR10 or HDR10PLUS) */
+#define VIDEO_RATE_CONVERSIONS 2u    /* 0: bob, 1: motion adaptive (a past and a future frame) */
+#define VIDEO_FILTERS 7u             /* D3D11_VIDEO_PROCESSOR_FILTER_BRIGHTNESS .. ANAMORPHIC_SCALING (not STEREO_ADJUSTMENT) */
+#include "../d3d12/video_extra.h"
 
 /* ---- the codecs ------------------------------------------------------------------------------------------------------------------------------------------------ */
 
-enum { VSTATUS_NONE, VSTATUS_H264, VSTATUS_HEVC, VSTATUS_VPX, VSTATUS_AV1 };
+enum { VSTATUS_NONE, VSTATUS_H264, VSTATUS_HEVC, VSTATUS_VPX, VSTATUS_AV1, VSTATUS_VC1, VSTATUS_MPEG4 };
 #pragma pack(push, 1)
 /* (the HEVC status report of the DXVA HEVC specification, which dxva.h does not have) */
 typedef struct VideoStatusHevc { USHORT StatusReportFeedbackNumber; UCHAR CurrPic; UCHAR bBufType, bStatus, bReserved8Bits; USHORT wNumMbsAffected; } VideoStatusHevc;
+/* (the Windows SDK's DXVA_Status_VC1, which mingw-w64's dxva.h does not have; MPEG-4 Part 2 reports in the same form, its StatusReportFeedbackNumber the one of the
+ * picture parameters) */
+typedef struct VideoStatusVc1 {
+  USHORT StatusReportFeedbackNumber; WORD wDecodedPictureIndex, wDeblockedPictureIndex; UCHAR bPicStructure, bBufType, bStatus, bReserved8Bits; USHORT wNumMbsAffected;
+} VideoStatusVc1;
 #pragma pack(pop)
+/* DXVA_PicParams_MPEG4_PART2 (the Windows SDK's dxva.h; not in mingw-w64's): its size, and where it has the feedback number and the current picture */
+#define VIDEO_MPEG4_PP_BYTES 62u
+#define VIDEO_MPEG4_PP_FEEDBACK 56u
+#define VIDEO_MPEG4_PP_CURR 3u
 
 /* What Direct3D 11 says of a profile beyond what Direct3D 12 below does with it: ConfigBitstreamRaw (2: H.264's short slice format; 1: the others' bitstream format - HEVC,
  * VP9 and AV1 have short slices only, and ffmpeg takes 1 for them), the slice control entry and where its offset into the bitstream is, the status report, and where
@@ -77,6 +92,28 @@ static const VideoCodec g_video_codecs[] = {
      offsetof(DXVA_PicParams_HEVC, StatusReportFeedbackNumber), offsetof(DXVA_PicParams_HEVC, CurrPic)},
     {&DXVA_ModeAV1_VLD_Profile0, 1, sizeof(DXVA_Tile_AV1), offsetof(DXVA_Tile_AV1, DataOffset), VSTATUS_AV1, sizeof(DXVA_PicParams_AV1),
      offsetof(DXVA_PicParams_AV1, StatusReportFeedbackNumber), offsetof(DXVA_PicParams_AV1, CurrPicTextureIndex)},
+    /* (VC-1's feedback number is bPicScanFixed << 8 | bPicScanMethod: vdec_status_push reads it) */
+    {&D3D11_DECODER_PROFILE_VC1_VLD, 1, sizeof(DXVA_SliceInfo), offsetof(DXVA_SliceInfo, dwSliceDataLocation), VSTATUS_VC1, sizeof(DXVA_PictureParameters),
+     offsetof(DXVA_PictureParameters, bPicScanFixed), offsetof(DXVA_PictureParameters, wDecodedPictureIndex)},
+    {&D3D11_DECODER_PROFILE_VC1_D2010, 1, sizeof(DXVA_SliceInfo), offsetof(DXVA_SliceInfo, dwSliceDataLocation), VSTATUS_VC1, sizeof(DXVA_PictureParameters),
+     offsetof(DXVA_PictureParameters, bPicScanFixed), offsetof(DXVA_PictureParameters, wDecodedPictureIndex)},
+    {&D3D11_DECODER_PROFILE_MPEG4PT2_VLD_SIMPLE, 1, sizeof(DXVA_SliceInfo), offsetof(DXVA_SliceInfo, dwSliceDataLocation), VSTATUS_MPEG4, VIDEO_MPEG4_PP_BYTES,
+     VIDEO_MPEG4_PP_FEEDBACK, VIDEO_MPEG4_PP_CURR},
+    {&D3D11_DECODER_PROFILE_MPEG4PT2_VLD_ADVSIMPLE_NOGMC, 1, sizeof(DXVA_SliceInfo), offsetof(DXVA_SliceInfo, dwSliceDataLocation), VSTATUS_MPEG4, VIDEO_MPEG4_PP_BYTES,
+     VIDEO_MPEG4_PP_FEEDBACK, VIDEO_MPEG4_PP_CURR},
+    {&D3D11_DECODER_PROFILE_MPEG4PT2_VLD_ADVSIMPLE_GMC, 1, sizeof(DXVA_SliceInfo), offsetof(DXVA_SliceInfo, dwSliceDataLocation), VSTATUS_MPEG4, VIDEO_MPEG4_PP_BYTES,
+     VIDEO_MPEG4_PP_FEEDBACK, VIDEO_MPEG4_PP_CURR},
+    /* (AV1 profiles 1 and 2: the same buffers, other surface formats - Direct3D 12's profiles of the same GUIDs) */
+    {&DXVA_ModeAV1_VLD_Profile1, 1, sizeof(DXVA_Tile_AV1), offsetof(DXVA_Tile_AV1, DataOffset), VSTATUS_AV1, sizeof(DXVA_PicParams_AV1),
+     offsetof(DXVA_PicParams_AV1, StatusReportFeedbackNumber), offsetof(DXVA_PicParams_AV1, CurrPicTextureIndex)},
+    {&DXVA_ModeAV1_VLD_Profile2, 1, sizeof(DXVA_Tile_AV1), offsetof(DXVA_Tile_AV1, DataOffset), VSTATUS_AV1, sizeof(DXVA_PicParams_AV1),
+     offsetof(DXVA_PicParams_AV1, StatusReportFeedbackNumber), offsetof(DXVA_PicParams_AV1, CurrPicTextureIndex)},
+    {&DXVA_ModeAV1_VLD_12bit_Profile2, 1, sizeof(DXVA_Tile_AV1), offsetof(DXVA_Tile_AV1, DataOffset), VSTATUS_AV1, sizeof(DXVA_PicParams_AV1),
+     offsetof(DXVA_PicParams_AV1, StatusReportFeedbackNumber), offsetof(DXVA_PicParams_AV1, CurrPicTextureIndex)},
+    {&DXVA_ModeAV1_VLD_12bit_Profile2_420, 1, sizeof(DXVA_Tile_AV1), offsetof(DXVA_Tile_AV1, DataOffset), VSTATUS_AV1, sizeof(DXVA_PicParams_AV1),
+     offsetof(DXVA_PicParams_AV1, StatusReportFeedbackNumber), offsetof(DXVA_PicParams_AV1, CurrPicTextureIndex)},
+    {&D3D11_DECODER_PROFILE_HEVC_VLD_MAIN10, 1, sizeof(DXVA_Slice_HEVC_Short), offsetof(DXVA_Slice_HEVC_Short, BSNALunitDataLocation), VSTATUS_HEVC, sizeof(DXVA_PicParams_HEVC),
+     offsetof(DXVA_PicParams_HEVC, StatusReportFeedbackNumber), offsetof(DXVA_PicParams_HEVC, CurrPic)},
 };
 #define VIDEO_CODECS (sizeof g_video_codecs / sizeof g_video_codecs[0])
 
@@ -91,6 +128,8 @@ static UINT video_status_bytes(UINT status) {
     case VSTATUS_HEVC: return sizeof(VideoStatusHevc);
     case VSTATUS_VPX: return sizeof(DXVA_Status_VPx);
     case VSTATUS_AV1: return sizeof(DXVA_Status_AV1);
+    case VSTATUS_VC1:
+    case VSTATUS_MPEG4: return sizeof(VideoStatusVc1);
     default: return 0;
   }
 }
@@ -333,7 +372,15 @@ static VideoView *vview_new(Dev *d, Tex *t, UINT kind) {
 
 /* ---- the video processor's formats and colour spaces ------------------------------------------------------------------------------------------------------------ */
 
-static BOOL vp_yuv(DXGI_FORMAT f) { return f == DXGI_FORMAT_NV12 || f == DXGI_FORMAT_P010 || f == DXGI_FORMAT_P016; }
+static BOOL vp_yuv(DXGI_FORMAT f) {
+  return f == DXGI_FORMAT_NV12 || f == DXGI_FORMAT_P010 || f == DXGI_FORMAT_P016 || f == DXGI_FORMAT_AYUV || f == DXGI_FORMAT_Y410 || f == DXGI_FORMAT_Y416 ||
+         f == DXGI_FORMAT_YUY2 || f == DXGI_FORMAT_Y210 || f == DXGI_FORMAT_Y216;
+}
+/* A format the processor writes in Direct3D 11: one that may be a render target (an output view is of a render target) - not Y410, Y416, YUY2, Y210, Y216, whose views are
+ * shader resource and unordered access views. */
+static BOOL vp_output_format_ok(DXGI_FORMAT f) {
+  return f != DXGI_FORMAT_Y410 && f != DXGI_FORMAT_Y416 && f != DXGI_FORMAT_YUY2 && f != DXGI_FORMAT_Y210 && f != DXGI_FORMAT_Y216;
+}
 /* The formats the processor reads and writes (the kernel's VpFormat). */
 static BOOL vp_format_ok(DXGI_FORMAT f) {
   return vp_yuv(f) || f == DXGI_FORMAT_B8G8R8A8_UNORM || f == DXGI_FORMAT_B8G8R8X8_UNORM || f == DXGI_FORMAT_R8G8B8A8_UNORM || f == DXGI_FORMAT_R10G10B10A2_UNORM ||
@@ -658,28 +705,36 @@ static HRESULT STDMETHODCALLTYPE venum_GetVideoProcessorContentDesc(VideoEnum *e
 static HRESULT STDMETHODCALLTYPE venum_CheckVideoProcessorFormat(VideoEnum *e, DXGI_FORMAT format, UINT *flags) {
   (void)e;
   if (!flags) return E_INVALIDARG;
-  *flags = vp_format_ok(format) ? D3D11_VIDEO_PROCESSOR_FORMAT_SUPPORT_INPUT | D3D11_VIDEO_PROCESSOR_FORMAT_SUPPORT_OUTPUT : 0;
+  *flags = vp_format_ok(format) ? D3D11_VIDEO_PROCESSOR_FORMAT_SUPPORT_INPUT | (vp_output_format_ok(format) ? D3D11_VIDEO_PROCESSOR_FORMAT_SUPPORT_OUTPUT : 0) : 0;
   return S_OK;
 }
-/* What the processor does (see video.inc's head): range and matrix conversions; alpha fill, rotation, planar alpha, mirroring, the shader usage hint. Progressive input
- * only: one rate conversion. */
+/* What the processor does (see video.inc's head): range and matrix conversions; alpha fill, rotation, planar alpha, mirroring, luma keys, stereo, the shader usage hint;
+ * ProcAmp, noise reduction, edge enhancement and anamorphic scaling, also of RGB input; deinterlacing of RGB too; the optional stereo packings and flipped frames. */
 static HRESULT STDMETHODCALLTYPE venum_GetVideoProcessorCaps(VideoEnum *e, D3D11_VIDEO_PROCESSOR_CAPS *caps) {
   (void)e;
   if (!caps) return E_INVALIDARG;
   memset(caps, 0, sizeof *caps);
   caps->DeviceCaps = D3D11_VIDEO_PROCESSOR_DEVICE_CAPS_RGB_RANGE_CONVERSION | D3D11_VIDEO_PROCESSOR_DEVICE_CAPS_YCbCr_MATRIX_CONVERSION | D3D11_VIDEO_PROCESSOR_DEVICE_CAPS_NOMINAL_RANGE;
   caps->FeatureCaps = D3D11_VIDEO_PROCESSOR_FEATURE_CAPS_ALPHA_FILL | D3D11_VIDEO_PROCESSOR_FEATURE_CAPS_ROTATION | D3D11_VIDEO_PROCESSOR_FEATURE_CAPS_ALPHA_STREAM |
-                      D3D11_VIDEO_PROCESSOR_FEATURE_CAPS_MIRROR | D3D11_VIDEO_PROCESSOR_FEATURE_CAPS_SHADER_USAGE;
-  caps->RateConversionCapsCount = 1;
+                      D3D11_VIDEO_PROCESSOR_FEATURE_CAPS_MIRROR | D3D11_VIDEO_PROCESSOR_FEATURE_CAPS_SHADER_USAGE | D3D11_VIDEO_PROCESSOR_FEATURE_CAPS_LUMA_KEY |
+                      D3D11_VIDEO_PROCESSOR_FEATURE_CAPS_STEREO;
+  caps->FilterCaps = (1u << VIDEO_FILTERS) - 1u;
+  caps->InputFormatCaps = D3D11_VIDEO_PROCESSOR_FORMAT_CAPS_RGB_INTERLACED | D3D11_VIDEO_PROCESSOR_FORMAT_CAPS_RGB_PROCAMP | D3D11_VIDEO_PROCESSOR_FORMAT_CAPS_RGB_LUMA_KEY;
+  caps->StereoCaps = D3D11_VIDEO_PROCESSOR_STEREO_CAPS_MONO_OFFSET | D3D11_VIDEO_PROCESSOR_STEREO_CAPS_ROW_INTERLEAVED | D3D11_VIDEO_PROCESSOR_STEREO_CAPS_COLUMN_INTERLEAVED |
+                     D3D11_VIDEO_PROCESSOR_STEREO_CAPS_CHECKERBOARD | D3D11_VIDEO_PROCESSOR_STEREO_CAPS_FLIP_MODE;
+  caps->RateConversionCapsCount = VIDEO_RATE_CONVERSIONS;
   caps->MaxInputStreams = VIDEO_STREAMS;
   caps->MaxStreamStates = VIDEO_STREAMS;
   return S_OK;
 }
-/* The one rate conversion: frames as they come, no past or future frames, no deinterlacing, inverse telecine or frame rate conversion, no custom rates. */
+/* The rate conversions: 0 deinterlaces by bob (no reference frames), 1 motion adaptively (yadif's algorithm) with a frame before and one after. Neither does inverse
+ * telecine, frame rate conversion or custom rates; progressive frames go through either as they are. */
 static HRESULT STDMETHODCALLTYPE venum_GetVideoProcessorRateConversionCaps(VideoEnum *e, UINT index, D3D11_VIDEO_PROCESSOR_RATE_CONVERSION_CAPS *caps) {
   (void)e;
-  if (!caps || index != 0) return E_INVALIDARG;
+  if (!caps || index >= VIDEO_RATE_CONVERSIONS) return E_INVALIDARG;
   memset(caps, 0, sizeof *caps);
+  caps->PastFrames = caps->FutureFrames = index == 1 ? 1 : 0;
+  caps->ProcessorCaps = index == 1 ? D3D11_VIDEO_PROCESSOR_PROCESSOR_CAPS_DEINTERLACE_ADAPTIVE : D3D11_VIDEO_PROCESSOR_PROCESSOR_CAPS_DEINTERLACE_BOB;
   return S_OK;
 }
 static HRESULT STDMETHODCALLTYPE venum_GetVideoProcessorCustomRate(VideoEnum *e, UINT type_index, UINT rate_index, D3D11_VIDEO_PROCESSOR_CUSTOM_RATE *rate) {
@@ -687,10 +742,16 @@ static HRESULT STDMETHODCALLTYPE venum_GetVideoProcessorCustomRate(VideoEnum *e,
   if (rate) memset(rate, 0, sizeof *rate);
   return E_INVALIDARG;      /* (the rate conversion has no custom rates: CustomRateCount 0) */
 }
+/* The filters' ranges: Direct3D 12's (d3d12.dll video.inc g_vp_filter_ranges, which take the same values) - in DXVA-HD's units once multiplied: brightness -100..100,
+ * contrast and saturation 0..10 (1), hue -180..180 degrees, noise reduction, edge enhancement and anamorphic scaling 0..1. No stereo adjustment. */
+static const D3D11_VIDEO_PROCESSOR_FILTER_RANGE g_video_filter_ranges[VIDEO_FILTERS] = {
+    {-400, 400, 0, 0.25f}, {0, 640, 64, 1.0f / 64}, {-720, 720, 0, 0.25f}, {0, 640, 64, 1.0f / 64}, {0, 64, 0, 1.0f / 64}, {0, 64, 0, 1.0f / 64}, {0, 64, 0, 1.0f / 64}};
 static HRESULT STDMETHODCALLTYPE venum_GetVideoProcessorFilterRange(VideoEnum *e, D3D11_VIDEO_PROCESSOR_FILTER filter, D3D11_VIDEO_PROCESSOR_FILTER_RANGE *range) {
-  (void)e; (void)filter;
-  if (range) memset(range, 0, sizeof *range);
-  return E_INVALIDARG;      /* (no filters: FilterCaps 0) */
+  (void)e;
+  if (!range) return E_INVALIDARG;
+  if ((UINT)filter >= VIDEO_FILTERS) { memset(range, 0, sizeof *range); return E_INVALIDARG; }
+  *range = g_video_filter_ranges[filter];
+  return S_OK;
 }
 /* Whether a conversion is had: what Direct3D 12's VIDEO_PROCESS_SUPPORT answers for the formats and colour spaces (the content's size). */
 static HRESULT STDMETHODCALLTYPE venum_CheckVideoProcessorFormatConversion(VideoEnum *e, DXGI_FORMAT in_format, DXGI_COLOR_SPACE_TYPE in_space, DXGI_FORMAT out_format,
@@ -700,14 +761,14 @@ static HRESULT STDMETHODCALLTYPE venum_CheckVideoProcessorFormatConversion(Video
   *supported = FALSE;
   EnterCriticalSection(&d->lock);
   VideoState *v = video_state(d);
-  if (v && vp_format_ok(in_format) && vp_format_ok(out_format)) {
+  if (v && vp_format_ok(in_format) && vp_format_ok(out_format) && vp_output_format_ok(out_format)) {
     D3D12_FEATURE_DATA_VIDEO_PROCESS_SUPPORT s;
     memset(&s, 0, sizeof s);
     s.InputSample.Width = e->desc.InputWidth;
     s.InputSample.Height = e->desc.InputHeight;
     s.InputSample.Format.Format = in_format;
     s.InputSample.Format.ColorSpace = in_space;
-    s.InputFieldType = D3D12_VIDEO_FIELD_TYPE_NONE;
+    s.InputFieldType = (D3D12_VIDEO_FIELD_TYPE)(e->desc.InputFrameFormat == D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE ? 0 : e->desc.InputFrameFormat);      /* (TFF 1, BFF 2: the same) */
     s.InputStereoFormat = D3D12_VIDEO_FRAME_STEREO_FORMAT_NONE;
     s.InputFrameRate = e->desc.InputFrameRate;
     s.OutputFormat.Format = out_format;
@@ -756,7 +817,7 @@ static HRESULT STDMETHODCALLTYPE vdev_CreateVideoProcessor(ID3D11VideoDevice2 *p
   Dev *d = dev_of_video(p);
   VideoEnum *e = venum_of(enumerator);
   if (out) *out = NULL;
-  if (!e || e->c.dev != d || !out || rate_index != 0) return E_INVALIDARG;
+  if (!e || e->c.dev != d || !out || rate_index >= VIDEO_RATE_CONVERSIONS) return E_INVALIDARG;
   VideoProcessor *v = child_new(sizeof *v, d, &vproc_vtbl, iids, vproc_destroy);
   if (!v) return E_OUTOFMEMORY;
   hold(e);
@@ -794,7 +855,10 @@ static HRESULT STDMETHODCALLTYPE vdev_CreateVideoProcessorInputView(ID3D11VideoD
   if (desc->FourCC) {
 #define VIDEO_FOURCC(a, b, c, e) ((UINT)(BYTE)(a) | (UINT)(BYTE)(b) << 8 | (UINT)(BYTE)(c) << 16 | (UINT)(BYTE)(e) << 24)
     static const struct { UINT fourcc; DXGI_FORMAT format; } names[] = {{VIDEO_FOURCC('N', 'V', '1', '2'), DXGI_FORMAT_NV12}, {VIDEO_FOURCC('P', '0', '1', '0'), DXGI_FORMAT_P010},
-                                                                       {VIDEO_FOURCC('P', '0', '1', '6'), DXGI_FORMAT_P016}};
+                                                                       {VIDEO_FOURCC('P', '0', '1', '6'), DXGI_FORMAT_P016}, {VIDEO_FOURCC('A', 'Y', 'U', 'V'), DXGI_FORMAT_AYUV},
+                                                                       {VIDEO_FOURCC('Y', '4', '1', '0'), DXGI_FORMAT_Y410}, {VIDEO_FOURCC('Y', '4', '1', '6'), DXGI_FORMAT_Y416},
+                                                                       {VIDEO_FOURCC('Y', 'U', 'Y', '2'), DXGI_FORMAT_YUY2}, {VIDEO_FOURCC('Y', '2', '1', '0'), DXGI_FORMAT_Y210},
+                                                                       {VIDEO_FOURCC('Y', '2', '1', '6'), DXGI_FORMAT_Y216}};
 #undef VIDEO_FOURCC
     BOOL match = FALSE;
     for (UINT i = 0; i < sizeof names / sizeof names[0]; ++i) match |= names[i].fourcc == desc->FourCC && names[i].format == t->desc.Format;
@@ -817,7 +881,8 @@ static HRESULT STDMETHODCALLTYPE vdev_CreateVideoProcessorOutputView(ID3D11Video
   Tex *t = tex_of_resource(resource);
   VideoEnum *e = venum_of(enumerator);
   if (out) *out = NULL;
-  if (!t || !e || !desc || !out || !vp_texture_ok(t) || !vp_format_ok(t->desc.Format) || !(t->desc.BindFlags & D3D11_BIND_RENDER_TARGET)) return E_INVALIDARG;
+  if (!t || !e || !desc || !out || !vp_texture_ok(t) || !vp_format_ok(t->desc.Format) || !vp_output_format_ok(t->desc.Format) || !(t->desc.BindFlags & D3D11_BIND_RENDER_TARGET))
+    return E_INVALIDARG;
   UINT mip, slice;
   if (desc->ViewDimension == D3D11_VPOV_DIMENSION_TEXTURE2D) {
     mip = desc->Texture2D.MipSlice;
@@ -895,8 +960,10 @@ static HRESULT STDMETHODCALLTYPE vdev_GetVideoDecoderCaps(ID3D11VideoDevice2 *p,
   if (!codec) return E_INVALIDARG;
   BOOL any = FALSE;
   EnterCriticalSection(&d->lock);
-  for (UINT f = 0; f < 2 && !any; ++f) {
-    const D3D11_VIDEO_DECODER_DESC desc = {*profile, width, height, f ? DXGI_FORMAT_P010 : DXGI_FORMAT_NV12};
+  static const DXGI_FORMAT outputs[] = {DXGI_FORMAT_NV12, DXGI_FORMAT_P010, DXGI_FORMAT_P016, DXGI_FORMAT_AYUV, DXGI_FORMAT_Y410, DXGI_FORMAT_Y416, DXGI_FORMAT_YUY2,
+                                        DXGI_FORMAT_Y210, DXGI_FORMAT_Y216};
+  for (UINT f = 0; f < sizeof outputs / sizeof outputs[0] && !any; ++f) {
+    const D3D11_VIDEO_DECODER_DESC desc = {*profile, width, height, outputs[f]};
     any = video_desc_supported(d, &desc);
   }
   LeaveCriticalSection(&d->lock);
@@ -1131,7 +1198,14 @@ static void vdec_status_push(VideoDecoder *v, const D3D12_QUERY_DATA_VIDEO_DECOD
   VideoStatus s;
   memset(&s, 0, sizeof s);
   const BYTE *pp = v->picture.data;
-  if (v->picture.size >= k->pp_feedback + 4) memcpy(&s.feedback, pp + k->pp_feedback, 4);
+  if (k->status == VSTATUS_VC1) {
+    if (v->picture.size >= k->pp_feedback + 2) s.feedback = (UINT)pp[k->pp_feedback] << 8 | pp[k->pp_feedback + 1];      /* (bPicScanFixed, bPicScanMethod) */
+  } else if (k->status == VSTATUS_MPEG4) {
+    USHORT n16;
+    if (v->picture.size >= k->pp_feedback + 2) { memcpy(&n16, pp + k->pp_feedback, 2); s.feedback = n16; }
+  } else if (v->picture.size >= k->pp_feedback + 4) {
+    memcpy(&s.feedback, pp + k->pp_feedback, 4);
+  }
   if (v->picture.size > k->pp_curr) s.curr = pp[k->pp_curr];
   if (k->status == VSTATUS_H264 && v->picture.size >= offsetof(DXVA_PicParams_H264, wBitFields) + 2) {
     USHORT bits;
@@ -1265,6 +1339,13 @@ static HRESULT STDMETHODCALLTYPE vctx_DecoderExtension(ID3D11VideoContext3 *p, I
         r.bBufType = 0xFF;
         r.bStatus = s->status;
         r.wNumMbsAffected = s->macroblocks;
+        memcpy(at, &r, sizeof r);
+        break;
+      }
+      case VSTATUS_VC1:
+      case VSTATUS_MPEG4: {
+        /* (bPicStructure 3: the decoder takes frames only; wDeblockedPictureIndex is the decoded picture: no post-processing) */
+        VideoStatusVc1 r = {(USHORT)s->feedback, s->curr, s->curr, 3, 0xFF, s->status, 0, s->macroblocks};
         memcpy(at, &r, sizeof r);
         break;
       }
@@ -1408,7 +1489,7 @@ static void STDMETHODCALLTYPE vctx_VideoProcessorGetOutputShaderUsage(ID3D11Vide
   VPROC_OR_RETURN(v);
   if (usage) *usage = v->shader_usage;
 }
-/* HDR metadata: kept and given back (no tone mapping is done with it). A type and the size of its structure (NONE: none). */
+/* HDR metadata: kept and given back; HDR10's light levels tone map (the output's: the display's). A type and the size of its structure (NONE: none). */
 static BOOL hdr_size_ok(DXGI_HDR_METADATA_TYPE type, UINT size, const void *data) {
   switch (type) {
     case DXGI_HDR_METADATA_TYPE_NONE: return size == 0;
@@ -1571,7 +1652,7 @@ static void STDMETHODCALLTYPE vctx_VideoProcessorGetStreamLumaKey(ID3D11VideoCon
   if (lower) *lower = s->luma_lower;
   if (upper) *upper = s->luma_upper;
 }
-/* (kept; a Blt of a stereo format other than mono is refused: there is no stereo) */
+/* (kept; used by Blt) */
 static void STDMETHODCALLTYPE vctx_VideoProcessorSetStreamStereoFormat(ID3D11VideoContext3 *p, ID3D11VideoProcessor *processor, UINT stream, BOOL enable,
                                                                       D3D11_VIDEO_PROCESSOR_STEREO_FORMAT format, BOOL left_frame0, BOOL base_frame0,
                                                                       D3D11_VIDEO_PROCESSOR_STEREO_FLIP_MODE flip, int mono_offset) {
@@ -1608,7 +1689,7 @@ static void STDMETHODCALLTYPE vctx_VideoProcessorGetStreamAutoProcessingMode(ID3
   STREAM_OR_RETURN(s);
   if (enabled) *enabled = s->auto_processing;
 }
-/* (kept; a Blt with a filter on is refused: FilterCaps 0) */
+/* (kept; a Blt with the stereo adjustment filter on is refused: FilterCaps has not got it) */
 static void STDMETHODCALLTYPE vctx_VideoProcessorSetStreamFilter(ID3D11VideoContext3 *p, ID3D11VideoProcessor *processor, UINT stream, D3D11_VIDEO_PROCESSOR_FILTER filter, BOOL enable,
                                                                 int level) {
   (void)p;
@@ -1689,7 +1770,11 @@ static HRESULT STDMETHODCALLTYPE vctx_VideoProcessorGetBehaviorHints(ID3D11Video
 
 /* Whether the processor below takes a subresource of a texture as it is: a planar texture's slice, or a 2D texture of one level (not an array, not drawn through a target
  * of its own). Any other is processed by way of a copy (vp_scratch). */
-static BOOL vp_direct(const Tex *t) { return t->planar || (t->desc.MipLevels == 1 && t->desc.ArraySize == 1 && t->kind == 0 && !t->shadowed && t->stored == t->desc.Format); }
+static BOOL vp_direct(const Tex *t) {
+  return t->planar || (t->fmt->flags & FMT_YUV) || (t->desc.MipLevels == 1 && t->desc.ArraySize == 1 && t->kind == 0 && !t->shadowed && t->stored == t->desc.Format);
+}
+/* The Direct3D 12 subresource a slice of a texture the processor takes as it is: a planar or packed YUV texture's slice (each an image of its own below), else 0. */
+static UINT vp_direct_sub(const Tex *t, UINT slice) { return t->planar || (t->fmt->flags & FMT_YUV) ? slice : 0; }
 /* A texture of one level and slice the size of a subresource of `t` (in its format), holding what the subresource has when `load`. */
 static HRESULT vp_scratch(Dev *d, Tex *t, UINT sub, BOOL load, Tex **out) {
   *out = NULL;
@@ -1754,10 +1839,51 @@ static ID3D12VideoProcessor *vp_processor(Dev *d, VideoProcessor *p, const D3D12
   return made;
 }
 
+/* What Direct3D 11's stereo format of a stream is in d3d12.dll's terms (TCOS_STEREO_*; MONO and stereo off: none). */
+static UINT vp_stereo_of(const VideoStreamState *s) {
+  if (!s->stereo_enable) return TCOS_STEREO_NONE;
+  switch (s->stereo_format) {
+    case D3D11_VIDEO_PROCESSOR_STEREO_FORMAT_HORIZONTAL: return TCOS_STEREO_HORIZONTAL;
+    case D3D11_VIDEO_PROCESSOR_STEREO_FORMAT_VERTICAL: return TCOS_STEREO_VERTICAL;
+    case D3D11_VIDEO_PROCESSOR_STEREO_FORMAT_SEPARATE: return TCOS_STEREO_SEPARATE;
+    case D3D11_VIDEO_PROCESSOR_STEREO_FORMAT_MONO_OFFSET: return TCOS_STEREO_MONO_OFFSET;
+    case D3D11_VIDEO_PROCESSOR_STEREO_FORMAT_ROW_INTERLEAVED: return TCOS_STEREO_ROWS;
+    case D3D11_VIDEO_PROCESSOR_STEREO_FORMAT_COLUMN_INTERLEAVED: return TCOS_STEREO_COLUMNS;
+    case D3D11_VIDEO_PROCESSOR_STEREO_FORMAT_CHECKERBOARD: return TCOS_STEREO_CHECKERBOARD;
+    default: return TCOS_STEREO_NONE;
+  }
+}
+/* HDR10 metadata's light levels in cd/m2 (max mastering, min mastering, MaxCLL, MaxFALL); none for other kinds (HDR10+'s dynamic metadata is not read). */
+static void vp_light_levels(DXGI_HDR_METADATA_TYPE type, UINT size, const BYTE *data, FLOAT out[4]) {
+  out[0] = out[1] = out[2] = out[3] = 0.0f;
+  if (type != DXGI_HDR_METADATA_TYPE_HDR10 || size != sizeof(DXGI_HDR_METADATA_HDR10)) return;
+  DXGI_HDR_METADATA_HDR10 m;
+  memcpy(&m, data, sizeof m);
+  out[0] = (FLOAT)m.MaxMasteringLuminance;
+  out[1] = (FLOAT)m.MinMasteringLuminance * 0.0001f;      /* (in 0.0001 cd/m2) */
+  out[2] = (FLOAT)m.MaxContentLightLevel;
+  out[3] = (FLOAT)m.MaxFrameAverageLightLevel;
+}
+/* A Direct3D 12 input picture of a view (a scratch copy when the processor cannot take the texture as it is: `scratch` gets it). */
+static HRESULT vp_input(Dev *d, VideoView *iv, Tex **scratch, D3D12_VIDEO_PROCESS_INPUT_STREAM *is) {
+  Tex *t = iv->tex;
+  tex_sync(d, t);
+  HRESULT hr = S_OK;
+  if (!vp_direct(t)) hr = vp_scratch(d, t, iv->mip + iv->slice * t->desc.MipLevels, TRUE, scratch);
+  if (FAILED(hr)) return hr;
+  Tex *used = *scratch ? *scratch : t;
+  is->pTexture2D = used->res;
+  is->Subresource = *scratch ? 0 : vp_direct_sub(used, iv->slice);
+  return S_OK;
+}
+
 /* The enabled streams into the output view: one ProcessFrames on a VIDEO_PROCESS queue after what the immediate context recorded. Each stream's source rectangle (all of
- * its picture when not enabled; clipped to it) goes to its destination rectangle (all of the output when not enabled) with its rotation and mirroring and its planar
- * alpha, over the background inside the target rectangle (all of the output when not enabled). E_INVALIDARG for what the processor does not do (see video.inc's head):
- * past or future frames, interlaced frames, stereo, luma keys, filters, constriction, a custom output rate, pixel aspect ratios that differ, xvYCC. */
+ * its picture - of its view, for a packed stereo picture - when not enabled; clipped to it) goes to its destination rectangle (all of the output when not enabled) with its
+ * rotation and mirroring, planar alpha, luma key and filters, over the background inside the target rectangle (all of the output when not enabled). An interlaced stream
+ * is deinterlaced by the processor's rate conversion (0 bob, 1 motion adaptive with its past and future frames), the field OutputIndex names (normal rate) or the first
+ * (half rate). Output stereo writes the left view into the first slice of the output view and the right into the second. E_INVALIDARG for what the processor does not do
+ * (see video.inc's head): more reference frames than the rate conversion takes, constriction, a custom output rate, the stereo adjustment filter, pixel aspect ratios that
+ * differ, xvYCC, stereo output into a view of one slice. */
 static HRESULT STDMETHODCALLTYPE vctx_VideoProcessorBlt(ID3D11VideoContext3 *p, ID3D11VideoProcessor *processor, ID3D11VideoProcessorOutputView *view, UINT frame, UINT count,
                                                          const D3D11_VIDEO_PROCESSOR_STREAM *streams) {
   Ctx *c = ctx_of_video(p);
@@ -1766,7 +1892,9 @@ static HRESULT STDMETHODCALLTYPE vctx_VideoProcessorBlt(ID3D11VideoContext3 *p, 
   VideoView *ov = vview_of(view, VVIEW_PROCESSOR_OUTPUT);
   (void)frame;
   if (!v || !ov || v->c.dev != d || ov->c.dev != d || !count || count > VIDEO_STREAMS || !streams) return E_INVALIDARG;
-  if (v->stereo || v->constriction) return E_INVALIDARG;
+  if (v->constriction) return E_INVALIDARG;
+  if (v->stereo && (ov->desc.pov.ViewDimension != D3D11_VPOV_DIMENSION_TEXTURE2DARRAY || ov->desc.pov.Texture2DArray.ArraySize < 2)) return E_INVALIDARG;
+  const UINT references = v->rate_index == 1 ? 1 : 0;
   const DXGI_FORMAT out_format = ov->format;
   const BOOL out_yuv = vp_yuv(out_format);
   DXGI_COLOR_SPACE_TYPE out_space;
@@ -1782,26 +1910,49 @@ static HRESULT STDMETHODCALLTYPE vctx_VideoProcessorBlt(ID3D11VideoContext3 *p, 
   od.AlphaFillMode = (D3D12_VIDEO_PROCESS_ALPHA_FILL_MODE)v->fill;      /* (the two enumerations are the same) */
   vp_background(v, out_space, out_yuv, od.BackgroundColor);
   od.FrameRate = v->enumerator->desc.OutputFrameRate;
+  od.EnableStereo = v->stereo;
   D3D12_VIDEO_PROCESS_INPUT_STREAM_DESC id[VIDEO_STREAMS];
   D3D12_VIDEO_PROCESS_INPUT_STREAM_ARGUMENTS ia[VIDEO_STREAMS];
-  VideoView *inputs[VIDEO_STREAMS];
+  TcosVideoProcessExtra extra;
+  /* the pictures each stream reads: [0] the current, [1] its past frame, [2] its future frame; [3..5] the same of the right view (separate stereo) */
+  VideoView *inputs[VIDEO_STREAMS][6];
   UINT n = 0;
   BOOL fill_found = v->fill != D3D11_VIDEO_PROCESSOR_ALPHA_FILL_MODE_SOURCE_STREAM;
   memset(id, 0, sizeof id);
   memset(ia, 0, sizeof ia);
+  memset(&extra, 0, sizeof extra);
+  memset(inputs, 0, sizeof inputs);
+  extra.version = 1;
+  vp_light_levels(v->hdr_type, v->hdr_size, v->hdr, extra.display);
   for (UINT i = 0; i < count; ++i) {
     const D3D11_VIDEO_PROCESSOR_STREAM *st = &streams[i];
     if (!st->Enable) continue;
     VideoView *iv = vview_of(st->pInputSurface, VVIEW_PROCESSOR_INPUT);
     const VideoStreamState *s = &v->streams[i];
-    if (!iv || iv->c.dev != d || st->PastFrames || st->FutureFrames || st->ppPastSurfaces || st->ppFutureSurfaces || st->pInputSurfaceRight || st->ppPastSurfacesRight ||
-        st->ppFutureSurfacesRight)
+    const UINT stereo = vp_stereo_of(s);
+    if (!iv || iv->c.dev != d || st->PastFrames > references || st->FutureFrames > references || (st->PastFrames && !st->ppPastSurfaces) || (st->FutureFrames && !st->ppFutureSurfaces))
       return E_INVALIDARG;
-    if (s->frame_format != D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE || s->luma_enable || (s->stereo_enable && s->stereo_format != D3D11_VIDEO_PROCESSOR_STEREO_FORMAT_MONO) ||
-        s->rate == D3D11_VIDEO_PROCESSOR_OUTPUT_RATE_CUSTOM)
-      return E_INVALIDARG;
-    for (UINT f = 0; f < 8; ++f) if (s->filter_enable[f]) return E_INVALIDARG;
+    VideoView *right = st->pInputSurfaceRight ? vview_of(st->pInputSurfaceRight, VVIEW_PROCESSOR_INPUT) : NULL;
+    if (stereo != TCOS_STEREO_SEPARATE && (st->pInputSurfaceRight || st->ppPastSurfacesRight || st->ppFutureSurfacesRight)) return E_INVALIDARG;
+    if (st->pInputSurfaceRight && (!right || right->c.dev != d || right->format != iv->format)) return E_INVALIDARG;
+    if (right && ((st->PastFrames && !st->ppPastSurfacesRight) || (st->FutureFrames && !st->ppFutureSurfacesRight))) return E_INVALIDARG;
+    if (s->rate == D3D11_VIDEO_PROCESSOR_OUTPUT_RATE_CUSTOM) return E_INVALIDARG;
+    if (s->filter_enable[D3D11_VIDEO_PROCESSOR_FILTER_STEREO_ADJUSTMENT]) return E_INVALIDARG;
     if (s->aspect_enable && (UINT64)s->aspect_source.Numerator * s->aspect_dest.Denominator != (UINT64)s->aspect_dest.Numerator * s->aspect_source.Denominator) return E_INVALIDARG;
+    inputs[n][0] = iv;
+    inputs[n][3] = right;
+    for (UINT k = 0; k < st->PastFrames; ++k) {
+      VideoView *r = vview_of(st->ppPastSurfaces[k], VVIEW_PROCESSOR_INPUT), *rr = right ? vview_of(st->ppPastSurfacesRight[k], VVIEW_PROCESSOR_INPUT) : NULL;
+      if (!r || r->c.dev != d || r->format != iv->format || (right && !rr)) return E_INVALIDARG;
+      inputs[n][1] = r;      /* (the last: the nearest in time) */
+      inputs[n][4] = rr;
+    }
+    for (UINT k = st->FutureFrames; k-- > 0;) {
+      VideoView *r = vview_of(st->ppFutureSurfaces[k], VVIEW_PROCESSOR_INPUT), *rr = right ? vview_of(st->ppFutureSurfacesRight[k], VVIEW_PROCESSOR_INPUT) : NULL;
+      if (!r || r->c.dev != d || r->format != iv->format || (right && !rr)) return E_INVALIDARG;
+      inputs[n][2] = r;      /* (the first: the nearest) */
+      inputs[n][5] = rr;
+    }
     D3D12_VIDEO_PROCESS_INPUT_STREAM_DESC *in = &id[n];
     in->Format = iv->format;
     if (s->use_space1) in->ColorSpace = s->space1;
@@ -1816,9 +1967,27 @@ static HRESULT STDMETHODCALLTYPE vctx_VideoProcessorBlt(ID3D11VideoContext3 *p, 
     const D3D12_VIDEO_PROCESS_ORIENTATION orientation = vp_orientation(s);
     in->EnableOrientation = orientation != D3D12_VIDEO_PROCESS_ORIENTATION_DEFAULT;
     in->EnableAlphaBlending = s->alpha_enable;
+    in->FieldType = (D3D12_VIDEO_FIELD_TYPE)(s->frame_format == D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE ? 0 : s->frame_format);
+    in->DeinterlaceMode = in->FieldType == D3D12_VIDEO_FIELD_TYPE_NONE ? D3D12_VIDEO_PROCESS_DEINTERLACE_FLAG_NONE
+                          : v->rate_index == 1 ? D3D12_VIDEO_PROCESS_DEINTERLACE_FLAG_CUSTOM : D3D12_VIDEO_PROCESS_DEINTERLACE_FLAG_BOB;
+    in->NumPastFrames = in->NumFutureFrames = references;
+    in->StereoFormat = stereo == TCOS_STEREO_SEPARATE && right ? D3D12_VIDEO_FRAME_STEREO_FORMAT_SEPARATE : D3D12_VIDEO_FRAME_STEREO_FORMAT_NONE;
+    in->LumaKey.Enable = s->luma_enable;
+    in->LumaKey.Lower = s->luma_lower;
+    in->LumaKey.Upper = s->luma_upper;
     D3D12_VIDEO_PROCESS_INPUT_STREAM_ARGUMENTS *a = &ia[n];
-    const RECT whole_in = {0, 0, (LONG)iw, (LONG)ih}, whole_out = {0, 0, (LONG)ow, (LONG)oh};
-    const RECT src = vp_clip(s->source_enable ? s->source : whole_in, iw, ih);
+    for (UINT f = 0; f < VIDEO_FILTERS; ++f) {
+      if (!s->filter_enable[f]) continue;
+      if (s->filter_level[f] < g_video_filter_ranges[f].Minimum || s->filter_level[f] > g_video_filter_ranges[f].Maximum) return E_INVALIDARG;
+      in->FilterFlags |= (D3D12_VIDEO_PROCESS_FILTER_FLAGS)(1u << f);
+      a->FilterLevels[f] = s->filter_level[f];
+    }
+    /* the view of a packed (or separate) picture: what the source rectangle is in, and each output view's frame */
+    UINT vw = iw, vh = ih;
+    if (stereo == TCOS_STEREO_HORIZONTAL || stereo == TCOS_STEREO_COLUMNS) vw = iw / 2;
+    if (stereo == TCOS_STEREO_VERTICAL || stereo == TCOS_STEREO_ROWS) vh = ih / 2;
+    const RECT whole_in = {0, 0, (LONG)vw, (LONG)vh}, whole_out = {0, 0, (LONG)ow, (LONG)oh};
+    const RECT src = vp_clip(s->source_enable ? s->source : whole_in, vw, vh);
     const RECT dst = s->dest_enable ? s->dest : whole_out;
     a->Transform.SourceRectangle = (D3D12_RECT){src.left, src.top, src.right, src.bottom};
     a->Transform.DestinationRectangle = (D3D12_RECT){dst.left, dst.top, dst.right, dst.bottom};
@@ -1827,15 +1996,28 @@ static HRESULT STDMETHODCALLTYPE vctx_VideoProcessorBlt(ID3D11VideoContext3 *p, 
     a->RateInfo.InputFrameOrField = st->InputFrameOrField;
     a->AlphaBlending.Enable = s->alpha_enable;
     a->AlphaBlending.Alpha = s->alpha_enable ? s->alpha : 1.0f;
+    TcosVideoStreamExtra *e = &extra.stream[n];
+    e->stereo = stereo == TCOS_STEREO_SEPARATE && !right ? TCOS_STEREO_NONE : stereo;      /* (separate without the right picture: the one view, mono) */
+    const UINT left = s->left_frame0 ? 0u : 1u;
+    e->view_frame[0] = v->stereo ? left : (s->base_frame0 ? 0u : 1u);
+    e->view_frame[1] = left ^ 1u;
+    if (e->stereo == TCOS_STEREO_NONE || e->stereo == TCOS_STEREO_MONO_OFFSET) e->view_frame[0] = 0, e->view_frame[1] = v->stereo ? 1u : 0u;
+    e->flip_frame = s->stereo_enable ? (UINT)s->flip_mode : 0u;
+    e->mono_offset = e->stereo == TCOS_STEREO_MONO_OFFSET ? s->mono_offset : 0;
+    e->field = s->rate == D3D11_VIDEO_PROCESSOR_OUTPUT_RATE_HALF ? 0u : TCOS_FIELD_FROM_INDEX;
+    vp_light_levels(s->hdr_type, s->hdr_size, s->hdr, e->hdr);
     if (v->fill == D3D11_VIDEO_PROCESSOR_ALPHA_FILL_MODE_SOURCE_STREAM && v->fill_stream == i) { od.AlphaFillModeSourceStreamIndex = n; fill_found = TRUE; }
-    inputs[n++] = iv;
+    ++n;
   }
   if (!fill_found) return E_INVALIDARG;      /* (the stream whose alpha fills the output is not one of those drawn) */
+  extra.count = n;
 
   HRESULT hr = S_OK;
   LOCK(c);
   VideoState *vs = video_state(d);
-  Tex *out_scratch = NULL, *in_scratch[VIDEO_STREAMS];
+  Tex *out_scratch[2] = {NULL, NULL}, *in_scratch[VIDEO_STREAMS][6];
+  ID3D12Resource *ref_res[VIDEO_STREAMS][2][2];      /* (the reference sets point here: kept until ProcessFrames has recorded) */
+  UINT ref_sub[VIDEO_STREAMS][2][2];
   memset(in_scratch, 0, sizeof in_scratch);
   if (!vs) hr = E_INVALIDARG;
   const UINT ninputs = n;
@@ -1851,45 +2033,66 @@ static HRESULT STDMETHODCALLTYPE vctx_VideoProcessorBlt(ID3D11VideoContext3 *p, 
     n = 1;
   }
   Tex *out_tex = ov->tex;
-  const UINT out_sub = ov->mip + ov->slice * out_tex->desc.MipLevels;
-  if (SUCCEEDED(hr) && !vp_direct(out_tex)) hr = vp_scratch(d, out_tex, out_sub, TRUE, &out_scratch);
+  const UINT views = v->stereo ? 2 : 1;
+  UINT out_sub[2];
+  for (UINT k = 0; k < views; ++k) {
+    out_sub[k] = ov->mip + (ov->slice + k) * out_tex->desc.MipLevels;
+    if (SUCCEEDED(hr) && !vp_direct(out_tex)) hr = vp_scratch(d, out_tex, out_sub[k], TRUE, &out_scratch[k]);
+  }
   for (UINT k = 0; SUCCEEDED(hr) && k < ninputs; ++k) {
-    Tex *t = inputs[k]->tex;
-    tex_sync(d, t);
-    if (!vp_direct(t)) hr = vp_scratch(d, t, inputs[k]->mip + inputs[k]->slice * t->desc.MipLevels, TRUE, &in_scratch[k]);
+    D3D12_VIDEO_PROCESS_INPUT_STREAM *is = ia[k].InputStream;
+    for (UINT side = 0; SUCCEEDED(hr) && side < 2; ++side) {
+      VideoView **pics = &inputs[k][3 * side];
+      if (!pics[0]) continue;
+      hr = vp_input(d, pics[0], &in_scratch[k][3 * side], &is[side]);
+      /* the reference frames: the nearest past and future ones (the caps' PastFrames and FutureFrames are at most 1) */
+      for (UINT r = 1; SUCCEEDED(hr) && r < 3; ++r) {
+        if (!pics[r]) continue;
+        D3D12_VIDEO_PROCESS_INPUT_STREAM ref;
+        memset(&ref, 0, sizeof ref);
+        hr = vp_input(d, pics[r], &in_scratch[k][3 * side + r], &ref);
+        if (FAILED(hr)) break;
+        ref_res[k][side][r - 1] = ref.pTexture2D;
+        ref_sub[k][side][r - 1] = ref.Subresource;
+        D3D12_VIDEO_PROCESS_REFERENCE_SET *set = &is[side].ReferenceSet;
+        if (r == 1) { set->NumPastFrames = 1; set->ppPastFrames = &ref_res[k][side][0]; set->pPastSubresources = &ref_sub[k][side][0]; }
+        else { set->NumFutureFrames = 1; set->ppFutureFrames = &ref_res[k][side][1]; set->pFutureSubresources = &ref_sub[k][side][1]; }
+      }
+    }
   }
   ID3D12VideoProcessor *p12 = NULL;
   if (SUCCEEDED(hr) && !(p12 = vp_processor(d, v, &od, id, n))) hr = E_INVALIDARG;
   if (SUCCEEDED(hr) && !video_queue_begin(d, &vs->process, D3D12_COMMAND_LIST_TYPE_VIDEO_PROCESS, &IID_ID3D12VideoProcessCommandList)) hr = E_OUTOFMEMORY;
   if (SUCCEEDED(hr)) {
-    for (UINT k = 0; k < n; ++k) {
-      if (k < ninputs) {
-        Tex *t = in_scratch[k] ? in_scratch[k] : inputs[k]->tex;
-        ia[k].InputStream[0].pTexture2D = t->res;
-        ia[k].InputStream[0].Subresource = in_scratch[k] ? 0 : t->planar ? inputs[k]->slice : 0;
-      } else {
-        /* (the background-only stream: empty rectangles of a picture of its own) */
-        ia[k].InputStream[0].pTexture2D = nothing->res;
-        ia[k].InputStream[0].Subresource = 0;
-      }
+    if (ninputs == 0) {
+      /* (the background-only stream: empty rectangles of a picture of its own) */
+      ia[0].InputStream[0].pTexture2D = nothing->res;
+      ia[0].InputStream[0].Subresource = 0;
     }
     D3D12_VIDEO_PROCESS_OUTPUT_STREAM_ARGUMENTS oa;
     memset(&oa, 0, sizeof oa);
-    Tex *target = out_scratch ? out_scratch : out_tex;
-    oa.OutputStream[0].pTexture2D = target->res;
-    oa.OutputStream[0].Subresource = out_scratch ? 0 : target->planar ? ov->slice : 0;
+    for (UINT k = 0; k < views; ++k) {
+      Tex *target = out_scratch[k] ? out_scratch[k] : out_tex;
+      oa.OutputStream[k].pTexture2D = target->res;
+      oa.OutputStream[k].Subresource = out_scratch[k] ? 0 : vp_direct_sub(target, ov->slice + k);
+    }
     const RECT whole = {0, 0, (LONG)ow, (LONG)oh};
     const RECT tr = vp_clip(v->target_enable ? v->target : whole, ow, oh);
     oa.TargetRectangle = (D3D12_RECT){tr.left, tr.top, tr.right, tr.bottom};
     tex_sync(d, out_tex);
-    ID3D12VideoProcessCommandList_ProcessFrames((ID3D12VideoProcessCommandList *)vs->process.list, p12, &oa, n, ia);
+    ID3D12VideoProcessCommandList *list = (ID3D12VideoProcessCommandList *)vs->process.list;
+    ID3D12VideoProcessCommandList_SetPrivateData(list, &TCOS_VIDEO_PROCESS_EXTRA_GUID, sizeof extra, &extra);
+    ID3D12VideoProcessCommandList_ProcessFrames(list, p12, &oa, n, ia);
+    ID3D12VideoProcessCommandList_SetPrivateData(list, &TCOS_VIDEO_PROCESS_EXTRA_GUID, 0, NULL);
     video_queue_run(d, &vs->process);
-    if (out_scratch) vp_scratch_store(d, out_scratch, out_tex, out_sub);
+    for (UINT k = 0; k < views; ++k)
+      if (out_scratch[k]) vp_scratch_store(d, out_scratch[k], out_tex, out_sub[k]);
     ++out_tex->version;      /* (a render target view's own copy of it is loaded again) */
   }
-  if (out_scratch) dx_Release(OBJ(out_scratch));
+  for (UINT k = 0; k < 2; ++k) if (out_scratch[k]) dx_Release(OBJ(out_scratch[k]));
   if (nothing) dx_Release(OBJ(nothing));
-  for (UINT k = 0; k < VIDEO_STREAMS; ++k) if (in_scratch[k]) dx_Release(OBJ(in_scratch[k]));
+  for (UINT k = 0; k < VIDEO_STREAMS; ++k)
+    for (UINT r = 0; r < 6; ++r) if (in_scratch[k][r]) dx_Release(OBJ(in_scratch[k][r]));
   UNLOCK(c);
   return hr;
 }
