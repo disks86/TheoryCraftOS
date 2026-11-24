@@ -300,6 +300,24 @@ class Core {
   }
   void set_frame_observer(IFrameObserver* observer) { observer_ = observer; }
 
+  // Decoding for a DXVA driver (src/Hardware/VideoCodec/Dxva/DxvaVc1.cpp): the caller gives the sequence (and entry point) layer as a SequenceHeader, keeps the
+  // pictures and says which ones a picture is decoded into and predicted from; the picture is decoded at once (decoding order) and nothing goes to the output
+  // queue. A Core used this way is used only this way.
+  struct ExternalPicture {
+    Picture* target = nullptr;     // the picture to fill (allocated here at the sequence's size when it is not)
+    Picture* forward = nullptr;    // P: the anchor it predicts from (a skipped P picture: the one it repeats); B: the older anchor
+    Picture* backward = nullptr;   // B: the newer anchor (its direct mode vectors are used too). Every reference the type needs must be given.
+    int rnd = -1;                  // Simple and Main profile: the picture's rounding control (DXVA's bRcontrol); -1: the decoder's own history
+    // B pictures: the intensity compensation of the forward reference, which the P picture of the backward anchor set.
+    bool ic_forward = false;
+    int ic_scale = 32, ic_shift = 0;
+  };
+  enum class ExternalStatus : uint8_t { Decoded, BadSequence, BadPicture, Interlaced, NoMemory };
+  // `data`: one frame, as decode() takes it (Advanced profile: the frame unit and its slice units with their start codes, or the frame without a start code; a
+  // sequence header or entry point unit in front is skipped: `seq` is what is in force). `header` receives the picture header the frame has (its type, whether it
+  // is skipped, its intensity compensation) also when the picture is refused after the header was read.
+  [[nodiscard]] ExternalStatus decode_external(const SequenceHeader& seq, ConstByteView data, const ExternalPicture& picture, PictureHeader* header);
+
  private:
   // --- Vc1Syntax.cpp
   bool build_vlcs();
@@ -376,6 +394,7 @@ class Core {
 
   IOffload* offload_ = nullptr;
   IFrameObserver* observer_ = nullptr;
+  const ExternalPicture* ext_ = nullptr;      // decode_external's picture while it is decoded
   bool offloaded_ = false;
   VideoFormat out_format_;
 

@@ -17,7 +17,7 @@
  */
 /* Direct3D 12 video (d3d12.dll video.inc over the kernel's DXVA decoders and video processor): planar NV12 / P010 textures and the narrow formats (footprints, copies through
  * buffers both ways, byte for byte), the video device's feature queries, decoders, heaps and processors made and refused, the video queues and lists, a video processor pass
- * (NV12 -> BGRA, scaled, against BT.709 computed here), and, with tests/windows/dxva_streams.h, an H.264 stream decoded through ID3D12VideoDecodeCommandList with its
+ * (NV12 -> BGRA, scaled, against BT.709 computed here), and, with tests/windows/dxva_streams.h, H.264, VC-1 and MPEG-4 Part 2 streams decoded through ID3D12VideoDecodeCommandList with their
  * statistics queried. */
 #define COBJMACROS
 #define INITGUID
@@ -35,6 +35,8 @@ static int checks, failed;
 #define CHECK(x) do { ++checks; if (!(x)) { ++failed; printf("FAILED line %d: %s\n", __LINE__, #x); } } while (0)
 #define CHECK_HR(x) do { HRESULT hr_ = (x); ++checks; if (FAILED(hr_)) { ++failed; printf("FAILED line %d: %s = %08lx\n", __LINE__, #x, (unsigned long)hr_); } } while (0)
 
+/* (MPEG-4 Part 2 Advanced Simple with GMC: DXVA_ModeMPEG4pt2_VLD_AdvSimple_GMC, which d3d12video.h does not name) */
+static const GUID g_mpeg4pt2_advsimple_gmc = {0xab998b5b, 0x4258, 0x44a9, {0x9f, 0xeb, 0x94, 0xe5, 0x97, 0xa6, 0xba, 0xae}};
 static ID3D12Device *g_dev;
 static ID3D12CommandQueue *g_queue;
 static ID3D12Fence *g_fence;
@@ -191,17 +193,20 @@ static void test_features(void) {
   CHECK(area.VideoDecodeSupport && area.VideoProcessSupport && !area.VideoEncodeSupport);
   D3D12_FEATURE_DATA_VIDEO_DECODE_PROFILE_COUNT count = {0};
   CHECK_HR(ID3D12VideoDevice_CheckFeatureSupport(g_vdev, D3D12_FEATURE_VIDEO_DECODE_PROFILE_COUNT, &count, sizeof count));
-  CHECK(count.ProfileCount == 7);
+  CHECK(count.ProfileCount == 12);
   GUID profiles[16];
   D3D12_FEATURE_DATA_VIDEO_DECODE_PROFILES list = {0, count.ProfileCount, profiles};
   CHECK_HR(ID3D12VideoDevice_CheckFeatureSupport(g_vdev, D3D12_FEATURE_VIDEO_DECODE_PROFILES, &list, sizeof list));
-  int h264 = 0, av1 = 0, main10 = 0;
+  int h264 = 0, av1 = 0, main10 = 0, vc1 = 0, mpeg4 = 0;
   for (UINT i = 0; i < count.ProfileCount && i < 16; ++i) {
     h264 |= IsEqualGUID(&profiles[i], &D3D12_VIDEO_DECODE_PROFILE_H264);
     av1 |= IsEqualGUID(&profiles[i], &D3D12_VIDEO_DECODE_PROFILE_AV1_PROFILE0);
     main10 |= IsEqualGUID(&profiles[i], &D3D12_VIDEO_DECODE_PROFILE_HEVC_MAIN10);
+    vc1 += IsEqualGUID(&profiles[i], &D3D12_VIDEO_DECODE_PROFILE_VC1) + IsEqualGUID(&profiles[i], &D3D12_VIDEO_DECODE_PROFILE_VC1_D2010);
+    mpeg4 += IsEqualGUID(&profiles[i], &D3D12_VIDEO_DECODE_PROFILE_MPEG4PT2_SIMPLE) + IsEqualGUID(&profiles[i], &D3D12_VIDEO_DECODE_PROFILE_MPEG4PT2_ADVSIMPLE_NOGMC) +
+             IsEqualGUID(&profiles[i], &g_mpeg4pt2_advsimple_gmc);
   }
-  CHECK(h264 && av1 && !main10);
+  CHECK(h264 && av1 && !main10 && vc1 == 2 && mpeg4 == 3);
   D3D12_FEATURE_DATA_VIDEO_DECODE_SUPPORT ds;
   memset(&ds, 0, sizeof ds);
   ds.Configuration.DecodeProfile = D3D12_VIDEO_DECODE_PROFILE_H264;
@@ -252,8 +257,21 @@ static void test_features(void) {
   D3D12_VIDEO_DECODER_DESC dd = {0, {D3D12_VIDEO_DECODE_PROFILE_H264, D3D12_BITSTREAM_ENCRYPTION_TYPE_NONE, D3D12_VIDEO_FRAME_CODED_INTERLACE_TYPE_NONE}};
   ID3D12VideoDecoder *dec = NULL, *bad = NULL;
   CHECK_HR(ID3D12VideoDevice_CreateVideoDecoder(g_vdev, &dd, &IID_ID3D12VideoDecoder, (void **)&dec));
-  dd.Configuration.DecodeProfile = D3D12_VIDEO_DECODE_PROFILE_VC1;
+  dd.Configuration.DecodeProfile = D3D12_VIDEO_DECODE_PROFILE_H264_STEREO;      /* (no MVC) */
   CHECK(ID3D12VideoDevice_CreateVideoDecoder(g_vdev, &dd, &IID_ID3D12VideoDecoder, (void **)&bad) == E_INVALIDARG && !bad);
+  dd.Configuration.DecodeProfile = D3D12_VIDEO_DECODE_PROFILE_VC1;
+  CHECK_HR(ID3D12VideoDevice_CreateVideoDecoder(g_vdev, &dd, &IID_ID3D12VideoDecoder, (void **)&bad));
+  if (bad) { ID3D12VideoDecoder_Release(bad); bad = NULL; }
+  ds.Configuration.DecodeProfile = D3D12_VIDEO_DECODE_PROFILE_MPEG4PT2_ADVSIMPLE_NOGMC;      /* (VC-1 and MPEG-4 Part 2: NV12, progressive) */
+  ds.DecodeFormat = DXGI_FORMAT_NV12;
+  ds.Width = 720;
+  ds.Height = 576;
+  CHECK_HR(ID3D12VideoDevice_CheckFeatureSupport(g_vdev, D3D12_FEATURE_VIDEO_DECODE_SUPPORT, &ds, sizeof ds));
+  CHECK(ds.SupportFlags == D3D12_VIDEO_DECODE_SUPPORT_FLAG_SUPPORTED);
+  ds.Configuration.DecodeProfile = D3D12_VIDEO_DECODE_PROFILE_VC1_D2010;
+  ds.DecodeFormat = DXGI_FORMAT_P010;
+  CHECK_HR(ID3D12VideoDevice_CheckFeatureSupport(g_vdev, D3D12_FEATURE_VIDEO_DECODE_SUPPORT, &ds, sizeof ds));
+  CHECK(ds.SupportFlags == D3D12_VIDEO_DECODE_SUPPORT_FLAG_NONE);
   if (dec) {
     ID3D12VideoDecoder1 *d1 = NULL;
     CHECK_HR(ID3D12VideoDecoder_QueryInterface(dec, &IID_ID3D12VideoDecoder1, (void **)&d1));
@@ -482,16 +500,17 @@ static int by_key(const void *a, const void *b) {
   return x < y ? -1 : x > y;
 }
 
-/* An H.264 stream decoded through ID3D12VideoDecodeCommandList, picture by picture, compared in display order with ffmpeg's (FNV hashes of the visible I420 picture).
+/* A stream (H.264, VC-1, MPEG-4 Part 2: `codec`, `profile`) decoded through ID3D12VideoDecodeCommandList, picture by picture, compared in display order with
+ * ffmpeg's (FNV hashes of the visible I420 picture).
  * `separate`: every surface a texture of its own (the reference frames are different resources at subresource 0), else one NV12 array (the indices are its slices).
  * The decode statistics of every picture are queried and resolved. */
-static void decode_h264(const char *name, const char *b64, unsigned surfaces, const unsigned *hashes, unsigned frames, int separate) {
+static void decode_stream(const char *name, int codec, const GUID *profile, const char *b64, unsigned surfaces, const unsigned *hashes, unsigned frames, int separate) {
   size_t size = 0;
   unsigned char *data = base64_decode(b64, &size);
   DxvaStream s;
   DxvaPicture p;
-  if (!data || dxva_stream_open(&s, DXVA_CODEC_H264, data, size, surfaces) != 0 || dxva_stream_next(&s, &p) != 1) { CHECK(0); free(data); return; }
-  D3D12_VIDEO_DECODER_DESC dd = {0, {D3D12_VIDEO_DECODE_PROFILE_H264, D3D12_BITSTREAM_ENCRYPTION_TYPE_NONE, D3D12_VIDEO_FRAME_CODED_INTERLACE_TYPE_NONE}};
+  if (!data || dxva_stream_open(&s, codec, data, size, surfaces) != 0 || dxva_stream_next(&s, &p) != 1) { CHECK(0); free(data); return; }
+  D3D12_VIDEO_DECODER_DESC dd = {0, {*profile, D3D12_BITSTREAM_ENCRYPTION_TYPE_NONE, D3D12_VIDEO_FRAME_CODED_INTERLACE_TYPE_NONE}};
   D3D12_VIDEO_DECODER_HEAP_DESC hd;
   memset(&hd, 0, sizeof hd);
   hd.Configuration = dd.Configuration;
@@ -535,10 +554,12 @@ static void decode_h264(const char *name, const char *b64, unsigned surfaces, co
     ID3D12Resource_Unmap(bits, 0, NULL);
     D3D12_VIDEO_DECODE_INPUT_STREAM_ARGUMENTS in;
     memset(&in, 0, sizeof in);
-    in.NumFrameArguments = 3;
-    in.FrameArguments[0] = (D3D12_VIDEO_DECODE_FRAME_ARGUMENT){D3D12_VIDEO_DECODE_ARGUMENT_TYPE_PICTURE_PARAMETERS, p.picture_parameters_size, (void *)p.picture_parameters};
-    in.FrameArguments[1] = (D3D12_VIDEO_DECODE_FRAME_ARGUMENT){D3D12_VIDEO_DECODE_ARGUMENT_TYPE_INVERSE_QUANTIZATION_MATRIX, p.qmatrix_size, (void *)p.qmatrix};
-    in.FrameArguments[2] = (D3D12_VIDEO_DECODE_FRAME_ARGUMENT){D3D12_VIDEO_DECODE_ARGUMENT_TYPE_SLICE_CONTROL, p.slice_control_size, (void *)p.slice_control};
+    /* (VC-1 has no matrix buffer) */
+    in.NumFrameArguments = 0;
+    in.FrameArguments[in.NumFrameArguments++] = (D3D12_VIDEO_DECODE_FRAME_ARGUMENT){D3D12_VIDEO_DECODE_ARGUMENT_TYPE_PICTURE_PARAMETERS, p.picture_parameters_size, (void *)p.picture_parameters};
+    if (p.qmatrix_size)
+      in.FrameArguments[in.NumFrameArguments++] = (D3D12_VIDEO_DECODE_FRAME_ARGUMENT){D3D12_VIDEO_DECODE_ARGUMENT_TYPE_INVERSE_QUANTIZATION_MATRIX, p.qmatrix_size, (void *)p.qmatrix};
+    in.FrameArguments[in.NumFrameArguments++] = (D3D12_VIDEO_DECODE_FRAME_ARGUMENT){D3D12_VIDEO_DECODE_ARGUMENT_TYPE_SLICE_CONTROL, p.slice_control_size, (void *)p.slice_control};
     in.ReferenceFrames.NumTexture2Ds = surfaces;
     in.ReferenceFrames.ppTexture2Ds = tex;
     in.ReferenceFrames.pSubresources = subs;
@@ -608,7 +629,9 @@ static void decode_h264(const char *name, const char *b64, unsigned surfaces, co
 
 static void test_decode(void) {
   if (!g_vdev) return;
-  decode_h264("h264_bframes", g_h264_bframes_b64, 17, g_h264_bframes_fnv, 14, 0);
-  decode_h264("h264_ltr", g_h264_ltr_b64, 20, g_h264_ltr_fnv, 24, 1);
-  decode_h264("h264_cqm", g_h264_cqm_b64, 17, g_h264_cqm_fnv, 9, 0);
+  decode_stream("h264_bframes", DXVA_CODEC_H264, &D3D12_VIDEO_DECODE_PROFILE_H264, g_h264_bframes_b64, 17, g_h264_bframes_fnv, 14, 0);
+  decode_stream("h264_ltr", DXVA_CODEC_H264, &D3D12_VIDEO_DECODE_PROFILE_H264, g_h264_ltr_b64, 20, g_h264_ltr_fnv, 24, 1);
+  decode_stream("h264_cqm", DXVA_CODEC_H264, &D3D12_VIDEO_DECODE_PROFILE_H264, g_h264_cqm_b64, 17, g_h264_cqm_fnv, 9, 0);
+  decode_stream("vc1_adv_ipb", DXVA_CODEC_VC1, &D3D12_VIDEO_DECODE_PROFILE_VC1_D2010, g_vc1_adv_ipb_b64, 8, g_vc1_adv_ipb_fnv, 10, 0);
+  decode_stream("m4vdec_bframes", DXVA_CODEC_MPEG4, &D3D12_VIDEO_DECODE_PROFILE_MPEG4PT2_ADVSIMPLE_NOGMC, g_m4vdec_bframes_b64, 8, g_m4vdec_bframes_fnv, 8, 1);
 }

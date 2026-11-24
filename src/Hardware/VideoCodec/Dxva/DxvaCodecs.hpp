@@ -15,7 +15,7 @@
  * You should have received a copy of the GNU Affero General Public License
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
-// The codecs of DxvaDecoder.hpp, one creator each (each in its own file: DxvaH264.cpp, DxvaMpeg2.cpp, DxvaVp9.cpp, DxvaHevc.cpp, DxvaAv1.cpp).
+// The codecs of DxvaDecoder.hpp, one creator each (each in its own file: DxvaH264.cpp, DxvaMpeg2.cpp, DxvaVp9.cpp, DxvaHevc.cpp, DxvaAv1.cpp, DxvaVc1.cpp, DxvaMpeg4.cpp).
 #pragma once
 #include "Hardware/VideoCodec/Dxva/DxvaDecoder.hpp"
 
@@ -25,4 +25,6 @@ UniquePointer<IDxvaDecoder> create_dxva_mpeg2(allocators::IAllocator& allocator,
 UniquePointer<IDxvaDecoder> create_dxva_vp9(allocators::IAllocator& allocator, const DxvaDecoderConfig& config);     // both VP9 profiles
 UniquePointer<IDxvaDecoder> create_dxva_hevc(allocators::IAllocator& allocator, const DxvaDecoderConfig& config);
 UniquePointer<IDxvaDecoder> create_dxva_av1(allocators::IAllocator& allocator, const DxvaDecoderConfig& config);
+UniquePointer<IDxvaDecoder> create_dxva_vc1(allocators::IAllocator& allocator, const DxvaDecoderConfig& config);     // Vc1Vld and Vc1D2010
+UniquePointer<IDxvaDecoder> create_dxva_mpeg4(allocators::IAllocator& allocator, const DxvaDecoderConfig& config);   // the three MPEG-4 Part 2 profiles
 }  // namespace hardware

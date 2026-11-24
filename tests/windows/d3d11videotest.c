@@ -18,7 +18,7 @@
 
 /* Direct3D 11's video (d3d11.dll's video.inc over d3d12.dll's video): NV12 / P010 textures (the rules they are made by, Map, UpdateSubresource and the copies byte for
  * byte, views of their planes sampled and drawn into), the decoder's profiles, formats and configurations, H.264 and MPEG-2 streams decoded through ID3D11VideoContext
- * (the DXVA buffers filled as ffmpeg does: dxva_streams.h) and compared with ffmpeg's decode (d3d11video_data.h), the video processor (formats, scaling, rotation,
+ * (the DXVA buffers filled as ffmpeg does: dxva_streams.h; also VC-1 and MPEG-4 Part 2) and compared with ffmpeg's decode (d3d11video_data.h), the video processor (formats, scaling, rotation,
  * mirroring, the background, alpha, the target rectangle, what it refuses), and the content protection there is not. Ends with exit code 42 when every check passed.
  *   tests/emulated_dx.sh tests/windows/d3d11videotest.c */
 #define COBJMACROS
@@ -491,7 +491,7 @@ static void test_planar_views(void) {
 
 static void test_decoder_caps(void) {
   const UINT count = ID3D11VideoDevice_GetVideoDecoderProfileCount(g_vdevice);
-  int h264 = 0, mpeg2 = 0, hevc = 0, vp9 = 0, av1 = 0;
+  int h264 = 0, mpeg2 = 0, hevc = 0, vp9 = 0, av1 = 0, vc1 = 0, mpeg4 = 0;
   for (UINT i = 0; i < count; ++i) {
     GUID g;
     if (FAILED(ID3D11VideoDevice_GetVideoDecoderProfile(g_vdevice, i, &g))) continue;
@@ -500,8 +500,12 @@ static void test_decoder_caps(void) {
     hevc |= IsEqualGUID(&g, &D3D11_DECODER_PROFILE_HEVC_VLD_MAIN);
     vp9 |= IsEqualGUID(&g, &D3D11_DECODER_PROFILE_VP9_VLD_PROFILE0);
     av1 |= IsEqualGUID(&g, &DXVA_ModeAV1_VLD_Profile0);
+    vc1 += IsEqualGUID(&g, &D3D11_DECODER_PROFILE_VC1_VLD) + IsEqualGUID(&g, &D3D11_DECODER_PROFILE_VC1_D2010);
+    mpeg4 += IsEqualGUID(&g, &D3D11_DECODER_PROFILE_MPEG4PT2_VLD_SIMPLE) + IsEqualGUID(&g, &D3D11_DECODER_PROFILE_MPEG4PT2_VLD_ADVSIMPLE_NOGMC) +
+             IsEqualGUID(&g, &D3D11_DECODER_PROFILE_MPEG4PT2_VLD_ADVSIMPLE_GMC);
   }
-  checkf(count == 7 && h264 && mpeg2 && hevc && vp9 && av1, "GetVideoDecoderProfileCount %u: H.264, MPEG-2, MPEG-1/2, VP9 (two), HEVC, AV1", count);
+  checkf(count == 12 && h264 && mpeg2 && hevc && vp9 && av1 && vc1 == 2 && mpeg4 == 3,
+         "GetVideoDecoderProfileCount %u: H.264, MPEG-2, MPEG-1/2, VP9 (two), HEVC, AV1, VC-1 (two), MPEG-4 Part 2 (three)", count);
   GUID g;
   check(ID3D11VideoDevice_GetVideoDecoderProfile(g_vdevice, count, &g) == E_INVALIDARG, "GetVideoDecoderProfile past the last: E_INVALIDARG");
   BOOL ok = FALSE;
@@ -522,6 +526,15 @@ static void test_decoder_caps(void) {
   check(ID3D11VideoDevice_GetVideoDecoderConfig(g_vdevice, &desc, 1, &c) == E_INVALIDARG, "GetVideoDecoderConfig past the last: E_INVALIDARG");
   D3D11_VIDEO_DECODER_DESC hevc_desc = {D3D11_DECODER_PROFILE_HEVC_VLD_MAIN, 64, 64, DXGI_FORMAT_NV12};
   check(SUCCEEDED(ID3D11VideoDevice_GetVideoDecoderConfig(g_vdevice, &hevc_desc, 0, &c)) && c.ConfigBitstreamRaw == 1, "the HEVC configuration: ConfigBitstreamRaw 1 (what ffmpeg takes)");
+  D3D11_VIDEO_DECODER_DESC vc1_desc = {D3D11_DECODER_PROFILE_VC1_D2010, 720, 576, DXGI_FORMAT_NV12};
+  check(SUCCEEDED(ID3D11VideoDevice_GetVideoDecoderConfigCount(g_vdevice, &vc1_desc, &configs)) && configs == 1 &&
+            SUCCEEDED(ID3D11VideoDevice_GetVideoDecoderConfig(g_vdevice, &vc1_desc, 0, &c)) && c.ConfigBitstreamRaw == 1,
+        "the VC-1 configuration: one, ConfigBitstreamRaw 1 (what ffmpeg's dxva2_vc1.c takes)");
+  D3D11_VIDEO_DECODER_DESC mpeg4_desc = {D3D11_DECODER_PROFILE_MPEG4PT2_VLD_ADVSIMPLE_GMC, 352, 288, DXGI_FORMAT_NV12};
+  check(SUCCEEDED(ID3D11VideoDevice_GetVideoDecoderConfigCount(g_vdevice, &mpeg4_desc, &configs)) && configs == 1 &&
+            SUCCEEDED(ID3D11VideoDevice_GetVideoDecoderConfig(g_vdevice, &mpeg4_desc, 0, &c)) && c.ConfigBitstreamRaw == 1,
+        "the MPEG-4 Part 2 (GMC) configuration: one, ConfigBitstreamRaw 1");
+  check(SUCCEEDED(ID3D11VideoDevice_CheckVideoDecoderFormat(g_vdevice, &D3D11_DECODER_PROFILE_VC1_VLD, DXGI_FORMAT_P010, &ok)) && !ok, "VC-1 does not decode into P010");
   D3D11_VIDEO_DECODER_DESC p010 = {D3D11_DECODER_PROFILE_H264_VLD_NOFGT, 64, 64, DXGI_FORMAT_P010};
   check(SUCCEEDED(ID3D11VideoDevice_GetVideoDecoderConfigCount(g_vdevice, &p010, &configs)) && configs == 0, "... no configuration of H.264 into P010");
   /* decoders */
@@ -789,10 +802,16 @@ static void decode_stream(const char *name, int codec, const GUID *profile, cons
   const UINT frame_bytes = vw * vh + 2 * cw * ch;
   Decoded *decoded = calloc(256, sizeof *decoded);
   BYTE *nv12 = malloc((size_t)s.width * s.height * 3 / 2);
-  UINT n = 0, failed = 0, last_feedback = 0;
+  UINT n = 0, failed = 0, last_feedback = 0, last_surface = 0;
   int r = 1;
   while (SUCCEEDED(hr) && dec && out && r == 1 && n < 256) {
     if (codec == DXVA_CODEC_H264) last_feedback = ((const DXVA_PicParams_H264 *)p.picture_parameters)->StatusReportFeedbackNumber;
+    if (codec == DXVA_CODEC_VC1) {
+      const DXVA_PictureParameters *pp = p.picture_parameters;
+      last_feedback = (UINT)pp->bPicScanFixed << 8 | pp->bPicScanMethod;      /* (VC-1's feedback number) */
+    }
+    if (codec == DXVA_CODEC_MPEG4) last_feedback = ((const DxvaPicParamsMpeg4 *)p.picture_parameters)->StatusReportFeedbackNumber;
+    last_surface = p.surface;
     const UINT slice_bytes = codec == DXVA_CODEC_H264 ? sizeof(DXVA_Slice_H264_Short) : sizeof(DXVA_SliceInfo);
     const UINT location = codec == DXVA_CODEC_H264 ? offsetof(DXVA_Slice_H264_Short, BSNALunitDataLocation) : offsetof(DXVA_SliceInfo, dwSliceDataLocation);
     if (!decode_picture(dec, views[p.surface], &p, slice_bytes, location, split) || !read_planar(out, p.surface, nv12)) { ++failed; break; }
@@ -855,6 +874,24 @@ static void decode_stream(const char *name, int codec, const GUID *profile, cons
     checkf(hr == S_OK && st[0].StatusReportFeedbackNumber == last_feedback && st[1].StatusReportFeedbackNumber == last_feedback - 1 && st[0].bStatus == 0 &&
                st[0].bDXVA_Func == DXVA_PICTURE_DECODING_FUNCTION && st[0].bBufType == 0xFF,
            "%s: the status reports, the newest first: feedback %u and %u, status %u", name, st[0].StatusReportFeedbackNumber, st[1].StatusReportFeedbackNumber, st[0].bStatus);
+  }
+  if (dec && (codec == DXVA_CODEC_VC1 || codec == DXVA_CODEC_MPEG4)) {
+    /* (DXVA_Status_VC1 of the Windows SDK; MPEG-4 Part 2 reports in the same form) */
+#pragma pack(push, 1)
+    typedef struct { USHORT StatusReportFeedbackNumber; WORD wDecodedPictureIndex, wDeblockedPictureIndex; UCHAR bPicStructure, bBufType, bStatus, bReserved8Bits; USHORT wNumMbsAffected; } StatusVc1;
+#pragma pack(pop)
+    StatusVc1 st[2];
+    memset(st, 0xCC, sizeof st);
+    D3D11_VIDEO_DECODER_EXTENSION ext;
+    memset(&ext, 0, sizeof ext);
+    ext.Function = DXVA_STATUS_REPORTING_FUNCTION;
+    ext.pPrivateOutputData = st;
+    ext.PrivateOutputDataSize = sizeof st;
+    hr = ID3D11VideoContext_DecoderExtension(g_vcontext, dec, &ext);
+    checkf(hr == S_OK && st[0].StatusReportFeedbackNumber == last_feedback && st[1].StatusReportFeedbackNumber == last_feedback - 1 && st[0].bStatus == 0 &&
+               st[0].wDecodedPictureIndex == last_surface && st[0].bPicStructure == 3 && st[0].bBufType == 0xFF && st[0].wNumMbsAffected == 0,
+           "%s: the status reports (DXVA_Status_VC1), the newest first: feedback %u and %u, picture %u, status %u", name, st[0].StatusReportFeedbackNumber,
+           st[1].StatusReportFeedbackNumber, st[0].wDecodedPictureIndex, st[0].bStatus);
   }
   for (UINT i = 0; i < n; ++i) free(decoded[i].frame);
   free(decoded);
@@ -1315,6 +1352,8 @@ int main(void) {
       decode_stream("h264_ltr", DXVA_CODEC_H264, &D3D11_DECODER_PROFILE_H264_VLD_NOFGT, g_h264_ltr_b64, 20, g_h264_ltr_fnv, 24, NULL, 0);
       decode_stream("h264_cqm", DXVA_CODEC_H264, &D3D11_DECODER_PROFILE_H264_VLD_NOFGT, g_h264_cqm_b64, 17, g_h264_cqm_fnv, 9, NULL, 2);
       decode_stream("mpeg2_ibp", DXVA_CODEC_MPEG2, &D3D11_DECODER_PROFILE_MPEG2_VLD, g_mpeg2_ibp_b64, 8, NULL, 8, g_mpeg2_ibp_means, 1);
+      decode_stream("vc1_adv_ipb", DXVA_CODEC_VC1, &D3D11_DECODER_PROFILE_VC1_VLD, g_vc1_adv_ipb_b64, 8, g_vc1_adv_ipb_fnv, 10, NULL, 0);
+      decode_stream("m4vdec_bframes", DXVA_CODEC_MPEG4, &D3D11_DECODER_PROFILE_MPEG4PT2_VLD_ADVSIMPLE_NOGMC, g_m4vdec_bframes_b64, 8, g_m4vdec_bframes_fnv, 8, NULL, 2);
       test_decode_then_draw();
       test_processor();
     }

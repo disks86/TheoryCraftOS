@@ -48,11 +48,20 @@
 
 /* ---- the codecs ------------------------------------------------------------------------------------------------------------------------------------------------ */
 
-enum { VSTATUS_NONE, VSTATUS_H264, VSTATUS_HEVC, VSTATUS_VPX, VSTATUS_AV1 };
+enum { VSTATUS_NONE, VSTATUS_H264, VSTATUS_HEVC, VSTATUS_VPX, VSTATUS_AV1, VSTATUS_VC1, VSTATUS_MPEG4 };
 #pragma pack(push, 1)
 /* (the HEVC status report of the DXVA HEVC specification, which dxva.h does not have) */
 typedef struct VideoStatusHevc { USHORT StatusReportFeedbackNumber; UCHAR CurrPic; UCHAR bBufType, bStatus, bReserved8Bits; USHORT wNumMbsAffected; } VideoStatusHevc;
+/* (the Windows SDK's DXVA_Status_VC1, which mingw-w64's dxva.h does not have; MPEG-4 Part 2 reports in the same form, its StatusReportFeedbackNumber the one of the
+ * picture parameters) */
+typedef struct VideoStatusVc1 {
+  USHORT StatusReportFeedbackNumber; WORD wDecodedPictureIndex, wDeblockedPictureIndex; UCHAR bPicStructure, bBufType, bStatus, bReserved8Bits; USHORT wNumMbsAffected;
+} VideoStatusVc1;
 #pragma pack(pop)
+/* DXVA_PicParams_MPEG4_PART2 (the Windows SDK's dxva.h; not in mingw-w64's): its size, and where it has the feedback number and the current picture */
+#define VIDEO_MPEG4_PP_BYTES 62u
+#define VIDEO_MPEG4_PP_FEEDBACK 56u
+#define VIDEO_MPEG4_PP_CURR 3u
 
 /* What Direct3D 11 says of a profile beyond what Direct3D 12 below does with it: ConfigBitstreamRaw (2: H.264's short slice format; 1: the others' bitstream format - HEVC,
  * VP9 and AV1 have short slices only, and ffmpeg takes 1 for them), the slice control entry and where its offset into the bitstream is, the status report, and where
@@ -77,6 +86,17 @@ static const VideoCodec g_video_codecs[] = {
      offsetof(DXVA_PicParams_HEVC, StatusReportFeedbackNumber), offsetof(DXVA_PicParams_HEVC, CurrPic)},
     {&DXVA_ModeAV1_VLD_Profile0, 1, sizeof(DXVA_Tile_AV1), offsetof(DXVA_Tile_AV1, DataOffset), VSTATUS_AV1, sizeof(DXVA_PicParams_AV1),
      offsetof(DXVA_PicParams_AV1, StatusReportFeedbackNumber), offsetof(DXVA_PicParams_AV1, CurrPicTextureIndex)},
+    /* (VC-1's feedback number is bPicScanFixed << 8 | bPicScanMethod: vdec_status_push reads it) */
+    {&D3D11_DECODER_PROFILE_VC1_VLD, 1, sizeof(DXVA_SliceInfo), offsetof(DXVA_SliceInfo, dwSliceDataLocation), VSTATUS_VC1, sizeof(DXVA_PictureParameters),
+     offsetof(DXVA_PictureParameters, bPicScanFixed), offsetof(DXVA_PictureParameters, wDecodedPictureIndex)},
+    {&D3D11_DECODER_PROFILE_VC1_D2010, 1, sizeof(DXVA_SliceInfo), offsetof(DXVA_SliceInfo, dwSliceDataLocation), VSTATUS_VC1, sizeof(DXVA_PictureParameters),
+     offsetof(DXVA_PictureParameters, bPicScanFixed), offsetof(DXVA_PictureParameters, wDecodedPictureIndex)},
+    {&D3D11_DECODER_PROFILE_MPEG4PT2_VLD_SIMPLE, 1, sizeof(DXVA_SliceInfo), offsetof(DXVA_SliceInfo, dwSliceDataLocation), VSTATUS_MPEG4, VIDEO_MPEG4_PP_BYTES,
+     VIDEO_MPEG4_PP_FEEDBACK, VIDEO_MPEG4_PP_CURR},
+    {&D3D11_DECODER_PROFILE_MPEG4PT2_VLD_ADVSIMPLE_NOGMC, 1, sizeof(DXVA_SliceInfo), offsetof(DXVA_SliceInfo, dwSliceDataLocation), VSTATUS_MPEG4, VIDEO_MPEG4_PP_BYTES,
+     VIDEO_MPEG4_PP_FEEDBACK, VIDEO_MPEG4_PP_CURR},
+    {&D3D11_DECODER_PROFILE_MPEG4PT2_VLD_ADVSIMPLE_GMC, 1, sizeof(DXVA_SliceInfo), offsetof(DXVA_SliceInfo, dwSliceDataLocation), VSTATUS_MPEG4, VIDEO_MPEG4_PP_BYTES,
+     VIDEO_MPEG4_PP_FEEDBACK, VIDEO_MPEG4_PP_CURR},
 };
 #define VIDEO_CODECS (sizeof g_video_codecs / sizeof g_video_codecs[0])
 
@@ -91,6 +111,8 @@ static UINT video_status_bytes(UINT status) {
     case VSTATUS_HEVC: return sizeof(VideoStatusHevc);
     case VSTATUS_VPX: return sizeof(DXVA_Status_VPx);
     case VSTATUS_AV1: return sizeof(DXVA_Status_AV1);
+    case VSTATUS_VC1:
+    case VSTATUS_MPEG4: return sizeof(VideoStatusVc1);
     default: return 0;
   }
 }
@@ -1129,7 +1151,14 @@ static void vdec_status_push(VideoDecoder *v, const D3D12_QUERY_DATA_VIDEO_DECOD
   VideoStatus s;
   memset(&s, 0, sizeof s);
   const BYTE *pp = v->picture.data;
-  if (v->picture.size >= k->pp_feedback + 4) memcpy(&s.feedback, pp + k->pp_feedback, 4);
+  if (k->status == VSTATUS_VC1) {
+    if (v->picture.size >= k->pp_feedback + 2) s.feedback = (UINT)pp[k->pp_feedback] << 8 | pp[k->pp_feedback + 1];      /* (bPicScanFixed, bPicScanMethod) */
+  } else if (k->status == VSTATUS_MPEG4) {
+    USHORT n16;
+    if (v->picture.size >= k->pp_feedback + 2) { memcpy(&n16, pp + k->pp_feedback, 2); s.feedback = n16; }
+  } else if (v->picture.size >= k->pp_feedback + 4) {
+    memcpy(&s.feedback, pp + k->pp_feedback, 4);
+  }
   if (v->picture.size > k->pp_curr) s.curr = pp[k->pp_curr];
   if (k->status == VSTATUS_H264 && v->picture.size >= offsetof(DXVA_PicParams_H264, wBitFields) + 2) {
     USHORT bits;
@@ -1263,6 +1292,13 @@ static HRESULT STDMETHODCALLTYPE vctx_DecoderExtension(ID3D11VideoContext3 *p, I
         r.bBufType = 0xFF;
         r.bStatus = s->status;
         r.wNumMbsAffected = s->macroblocks;
+        memcpy(at, &r, sizeof r);
+        break;
+      }
+      case VSTATUS_VC1:
+      case VSTATUS_MPEG4: {
+        /* (bPicStructure 3: the decoder takes frames only; wDeblockedPictureIndex is the decoded picture: no post-processing) */
+        VideoStatusVc1 r = {(USHORT)s->feedback, s->curr, s->curr, 3, 0xFF, s->status, 0, s->macroblocks};
         memcpy(at, &r, sizeof r);
         break;
       }

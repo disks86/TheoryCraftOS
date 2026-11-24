@@ -20,7 +20,7 @@
 // surface the picture goes into (an index: the CurrPic / CurrPicTextureIndex of the parameters) and the surfaces its references are in. decode() reconstructs that one
 // picture and gives it back at once, in decoding order - not display order: the program displays the surfaces in the order it decides.
 //
-// The structures are DXVA's (dxva.h: DXVA_PicParams_H264, DXVA_Qmatrix_H264, DXVA_Slice_H264_Short, DXVA_PictureParameters / DXVA_SliceInfo for MPEG-2,
+// The structures are DXVA's (dxva.h: DXVA_PicParams_H264, DXVA_Qmatrix_H264, DXVA_Slice_H264_Short, DXVA_PictureParameters / DXVA_SliceInfo for MPEG-2 and VC-1, DXVA_PicParams_MPEG4_PART2,
 // DXVA_PicParams_VP9 / DXVA_Slice_VPx_Short, DXVA_PicParams_HEVC / DXVA_Qmatrix_HEVC / DXVA_Slice_HEVC_Short, DXVA_PicParams_AV1 / DXVA_Tile_AV1), byte for byte as a
 // 64-bit or 32-bit Windows program lays them out (DxvaTypes.hpp mirrors them; they have the same layout in both). Every decoder takes the short slice format
 // (ConfigBitstreamRaw 2 for H.264 and HEVC: the slice NAL units whole, with their start codes).
@@ -45,8 +45,13 @@ enum class DxvaProfile : uint8_t {
   Vp9Vld10BitProfile2, // D3D11_DECODER_PROFILE_VP9_VLD_10BIT_PROFILE2 {a4c749ef-6ecf-48aa-8448-50a7a1165ff7}: 10-bit 4:2:0 -> P010
   HevcVldMain,         // D3D11_DECODER_PROFILE_HEVC_VLD_MAIN {5b11d51b-2f4c-4452-bcc3-09f2a1160cc0}: 8-bit 4:2:0 -> NV12
   Av1VldProfile0,      // D3D11_DECODER_PROFILE_AV1_VLD_PROFILE0 {b8be4ccb-cf53-46ba-8d59-d6b8a6da5d2a}: 8-bit (NV12) and 10-bit (P010) 4:2:0, monochrome
+  Vc1Vld,              // D3D11_DECODER_PROFILE_VC1_VLD (DXVA_ModeVC1_D) {1b81bea3-a0c7-11d3-b984-00c04f2e73c5}: Simple, Main and Advanced profile, progressive -> NV12
+  Vc1D2010,            // D3D11_DECODER_PROFILE_VC1_D2010 {1b81bea4-a0c7-11d3-b984-00c04f2e73c5}: the same, DXVA 2010's (start codes in the bitstream) -> NV12
+  Mpeg4Pt2Simple,      // D3D11_DECODER_PROFILE_MPEG4PT2_VLD_SIMPLE {efd64d74-c9e8-41d7-a5e9-e9b0e39fa319}: Simple profile (and the short video header) -> NV12
+  Mpeg4Pt2AdvSimpleNoGmc,   // D3D11_DECODER_PROFILE_MPEG4PT2_VLD_ADVSIMPLE_NOGMC {ed418a9f-010d-4eda-9ae3-9a65358d8d2e}: Advanced Simple without GMC -> NV12
+  Mpeg4Pt2AdvSimpleGmc,     // D3D11_DECODER_PROFILE_MPEG4PT2_VLD_ADVSIMPLE_GMC {ab998b5b-4258-44a9-9feb-94e597a6baae}: Advanced Simple with GMC -> NV12
 };
-constexpr uint32_t kDxvaProfileCount = 7;
+constexpr uint32_t kDxvaProfileCount = 12;
 
 // What the program gives for one picture (DXVA's buffer types: D3D11_VIDEO_DECODER_BUFFER_PICTURE_PARAMETERS, _INVERSE_QUANTIZATION_MATRIX, _SLICE_CONTROL, _BITSTREAM).
 // The views are of memory the caller keeps until decode() returns. A buffer the codec does not use may be empty; one it needs and does not get makes the picture invalid.

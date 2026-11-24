@@ -29,6 +29,9 @@
 /* ---- the profiles ------------------------------------------------------------------------------------------------------------------------------------------------ */
 
 typedef struct VideoProfile { const GUID *guid; UINT kernel; DXGI_FORMAT formats[2]; UINT nformats; } VideoProfile;
+/* (MPEG-4 Part 2 Advanced Simple with GMC: d3d12video.h names no such profile, but it is DXVA's - D3D11_DECODER_PROFILE_MPEG4PT2_VLD_ADVSIMPLE_GMC,
+ * DXVA_ModeMPEG4pt2_VLD_AdvSimple_GMC - and Direct3D 11's decoders of it are made on this one) */
+static const GUID g_video_profile_mpeg4pt2_advsimple_gmc = {0xab998b5b, 0x4258, 0x44a9, {0x9f, 0xeb, 0x94, 0xe5, 0x97, 0xa6, 0xba, 0xae}};
 /* (`kernel` is hardware::DxvaProfile) */
 static const VideoProfile g_video_profiles[] = {
     {&D3D12_VIDEO_DECODE_PROFILE_H264, 0, {DXGI_FORMAT_NV12}, 1},
@@ -38,6 +41,11 @@ static const VideoProfile g_video_profiles[] = {
     {&D3D12_VIDEO_DECODE_PROFILE_VP9_10BIT_PROFILE2, 4, {DXGI_FORMAT_P010}, 1},
     {&D3D12_VIDEO_DECODE_PROFILE_HEVC_MAIN, 5, {DXGI_FORMAT_NV12}, 1},
     {&D3D12_VIDEO_DECODE_PROFILE_AV1_PROFILE0, 6, {DXGI_FORMAT_NV12, DXGI_FORMAT_P010}, 2},
+    {&D3D12_VIDEO_DECODE_PROFILE_VC1, 7, {DXGI_FORMAT_NV12}, 1},
+    {&D3D12_VIDEO_DECODE_PROFILE_VC1_D2010, 8, {DXGI_FORMAT_NV12}, 1},
+    {&D3D12_VIDEO_DECODE_PROFILE_MPEG4PT2_SIMPLE, 9, {DXGI_FORMAT_NV12}, 1},
+    {&D3D12_VIDEO_DECODE_PROFILE_MPEG4PT2_ADVSIMPLE_NOGMC, 10, {DXGI_FORMAT_NV12}, 1},
+    {&g_video_profile_mpeg4pt2_advsimple_gmc, 11, {DXGI_FORMAT_NV12}, 1},
 };
 #define VIDEO_PROFILES (sizeof g_video_profiles / sizeof g_video_profiles[0])
 enum { ESC_CREATE_VIDEO_DECODER = 15, ESC_DESTROY_VIDEO_DECODER = 16, ESC_QUERY_VIDEO_DECODE_SUPPORT = 17 };
