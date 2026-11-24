@@ -108,15 +108,19 @@ class RootSignatureObject {
 // --- Descriptor heaps -----------------------------------------------------------------------------------------------------------------------------------------------
 
 enum class DescriptorHeapType : uint8_t { CbvSrvUav, Sampler };
-enum class DescriptorKind : uint8_t { None, Srv, Uav, Cbv, Sampler };
+// (UavTexture, 5: an unordered access view of a texture - a storage image, graphics::kFeature2StorageImages - the u# of a shader that declares a typed view of a texture)
+enum class DescriptorKind : uint8_t { None, Srv, Uav, Cbv, Sampler, UavTexture };
 
-// What a descriptor was made to say (CreateShaderResourceView and friends): a texture (Srv), a storage buffer range (Uav), a constant buffer range (Cbv) or a sampler.
+// What a descriptor was made to say (CreateShaderResourceView and friends): a texture (Srv), a storage buffer range (Uav), a constant buffer range (Cbv), a sampler, or a level and a run of
+// layers of a kAllocStorageImage texture (UavTexture).
 struct DescriptorDesc {
   DescriptorKind kind = DescriptorKind::None;
   Handle allocation = 0;
   uint64_t offset = 0, size = 0;   // buffers: the range (size 0: to the end)
   graphics::SamplerDesc sampler;
   Handle alternate = 0;            // a texture's view: the image a shader that declares a 2D array reads instead of `allocation`, a 2D image (0: none)
+  graphics::StorageImageView image;   // UavTexture: the level and the layers (an array's layers, a volume's slices)
+  uint32_t view_format = 0;           // ... and the format of the view (a dxgk::Format; 0: the allocation's own - another for a wide one: storage_view_format)
 };
 
 struct Descriptor {
@@ -124,6 +128,8 @@ struct Descriptor {
   SharedPointer<Allocation> allocation;
   uint64_t offset = 0, size = 0;
   graphics::SamplerDesc sampler;
+  graphics::StorageImageView image;   // UavTexture (its format the device's)
+  uint32_t view_format = 0;           // ... the view's dxgk::Format (0: the allocation's)
   // A view that is both a 2D image and an array of them (Direct3D's Texture2DArray view of one plane of a planar texture's slices: the slice's own image, and a mirror of the
   // slices, VidMm::set_mirror): the array, read by shaders that declare one.
   SharedPointer<Allocation> alternate;

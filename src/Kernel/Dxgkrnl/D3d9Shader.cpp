@@ -82,6 +82,8 @@ struct D3d9Program::State {
   const graphics::ComputeContext* compute = nullptr;
   bool no_stores = false;              // a run for a neighbour's sake (a helper pixel): nothing is written
   const ByteView* storage = nullptr;   // the storage buffers: a compute shader's, or those a draw's shaders can read (kMaxStorageBuffers views)
+  const graphics::IStorageImages* images = nullptr;   // the storage images (compute and pixel shaders)
+  Q layer = {{0, 0, 0, 0}};             // a geometry shader's SV_RenderTargetArrayIndex output (the integer in x)
   const graphics::GeometryInputData* geometry_in = nullptr;
   const graphics::HullInputData* hull_in = nullptr;        // a hull shader's input control points
   const graphics::HullOutputData* patch_in = nullptr;      // a domain shader's patch (control points and constants)
@@ -135,10 +137,17 @@ int8_t semantic_slot(uint32_t usage, uint32_t index) {
 
 }  // namespace
 
+uint32_t D3d9Program::required_features2() const {
+  uint32_t needed = image_mask_ ? graphics::kFeature2StorageImages : 0u;
+  if (image_mask_ && stage_ != graphics::ShaderStage::Compute) needed |= graphics::kFeature2StorageImagesInDraws;
+  if (writes_layer_) needed |= graphics::kFeature2LayeredTargets;
+  return needed;
+}
+
 uint32_t D3d9Program::required_features() const {
   uint32_t kinds = (uses_fragment_stores_ ? graphics::kFeatureFragmentStores : 0u) | (uses_vertex_stores_ ? graphics::kFeatureVertexStores : 0u) | (uses_geometry_stores_ ? graphics::kFeatureGeometryStores : 0u) | (uses_tessellation_stores_ ? graphics::kFeatureTessellationStores : 0u);
   for (graphics::TextureKind k : texture_kind_)
-    if (k != graphics::TextureKind::Texture2D) kinds = graphics::kFeatureTextureKinds;
+    if (k != graphics::TextureKind::Texture2D) kinds |= graphics::kFeatureTextureKinds;
   if (stage_ == graphics::ShaderStage::Compute) kinds |= graphics::kFeatureCompute;
   if (stage_ == graphics::ShaderStage::Geometry) kinds |= graphics::kFeatureGeometryShaders;
   if (stage_ == graphics::ShaderStage::Hull || stage_ == graphics::ShaderStage::Domain) kinds |= graphics::kFeatureTessellation;
@@ -571,7 +580,7 @@ void D3d9Program::execute(State& s, uint64_t begin, uint64_t end) const {
       case kTemp: target = &s.r[d.number]; break;
       case kAddrTex: target = &s.a0; break;
       case kPatchOut: target = d.number < graphics::kMaxPatchRegisters ? &s.patch_out[d.number] : nullptr; break;
-      case kRastOut: target = &s.pos; break;
+      case kRastOut: target = d.slot == kSlotLayer ? &s.layer : &s.pos; break;
       case kAttrOut:
       case kTexCrdOut: target = d.slot == kSlotPosition ? &s.pos : d.slot >= 0 ? &s.var[d.slot] : nullptr; break;
       case kColorOut: target = d.slot >= 0 && d.slot < static_cast<int8_t>(graphics::kMaxColorTargets) ? &s.color[d.slot] : nullptr; break;
@@ -720,6 +729,7 @@ void D3d9Program::execute(State& s, uint64_t begin, uint64_t end) const {
         graphics::ShaderIo& v = out->vertex[out->count];
         v.position = {s.pos.f[0], -s.pos.f[1], s.pos.f[2], s.pos.f[3]};
         for (uint32_t i = 0; i < graphics::kMaxVaryings; ++i) v.varying[i] = {s.var[i].f[0], s.var[i].f[1], s.var[i].f[2], s.var[i].f[3]};
+        v.layer = bits_of(s.layer.f[0]);
         const uint32_t stream = ins.control < graphics::kMaxGeometryStreams ? ins.control : 0;
         out->restart[out->count] = s.geometry_cut[stream];
         out->stream[out->count] = static_cast<uint8_t>(stream);
@@ -783,11 +793,60 @@ void D3d9Program::execute(State& s, uint64_t begin, uint64_t end) const {
             case kAtomicIMin: updated = static_cast<int32_t>(operand) < static_cast<int32_t>(old) ? operand : old; break;
             case kAtomicUMax: updated = operand > old ? operand : old; break;
             case kAtomicUMin: updated = operand < old ? operand : old; break;
+            case kAtomicCompareExchange: updated = old == bits_of(fetch(ins.src[2], 0).f[0]) ? operand : old; break;
             default: updated = operand; break;
           }
           put_word(address, updated);
           if (ins.op == kBufImmAtomic) store(ins.dst, splat(from_bits(old)));
         }
+        break;
+      }
+      case kImgLoad: case kImgStore: case kImgAtomic: case kImgImmAtomic: case kImgSize: {
+        // Storage images: the shader's coordinate as the device's (x, y, layer): a one-dimensional image is a two-dimensional one a texel high, its array's layer in the second component.
+        const uint32_t slot = ins.uav;
+        const ImageDim dim = image_dim(slot);
+        uint32_t x = bits_of(a.f[0]), y = 0, z = 0;
+        if (dim == ImageDim::Texture1DArray) z = bits_of(a.f[1]);
+        else if (dim == ImageDim::Texture2D) y = bits_of(a.f[1]);
+        else if (dim == ImageDim::Texture2DArray || dim == ImageDim::Texture3D) y = bits_of(a.f[1]), z = bits_of(a.f[2]);
+        const bool writes = !s.no_stores && s.capture_at == ~uint64_t{0};   // (a helper pixel's run, or one for a derivative, writes nothing)
+        if (ins.op == kImgSize) {
+          // resinfo: the width, then the height (a 1D array: its layers), then the layers of an array or the depth of a volume; the levels (the view's one)
+          uint32_t w = 0, h = 0, layers = 0;
+          float v[4] = {0, 0, 0, 0};
+          if (s.images && s.images->size(slot, &w, &h, &layers)) {
+            uint32_t n[4] = {w, 0, 0, 1};
+            if (dim == ImageDim::Texture1DArray) n[1] = layers;
+            else if (dim != ImageDim::Texture1D) n[1] = h;
+            if (dim == ImageDim::Texture2DArray || dim == ImageDim::Texture3D) n[2] = layers;
+            for (uint32_t k = 0; k < 4; ++k)
+              v[k] = ins.control == 2 ? from_bits(n[k]) : ins.control == 1 && k < 3 ? (n[k] ? 1.0f / static_cast<float>(n[k]) : 0.0f) : static_cast<float>(n[k]);
+          }
+          store(ins.dst, {{v[ins.tex_swizzle[0] & 3], v[ins.tex_swizzle[1] & 3], v[ins.tex_swizzle[2] & 3], v[ins.tex_swizzle[3] & 3]}});
+          break;
+        }
+        if (ins.op == kImgLoad) {
+          const graphics::Vec4 t = s.images ? s.images->load(slot, x, y, z) : graphics::Vec4{0, 0, 0, 0};
+          const float texel[4] = {t.x, t.y, t.z, t.w};
+          store(ins.dst, {{texel[ins.tex_swizzle[0] & 3], texel[ins.tex_swizzle[1] & 3], texel[ins.tex_swizzle[2] & 3], texel[ins.tex_swizzle[3] & 3]}});
+          break;
+        }
+        if (ins.op == kImgStore) {
+          if (!s.images || !writes) break;
+          const Q value = fetch(ins.src[1], 0);
+          s.images->store(slot, x, y, z, {value.f[0], value.f[1], value.f[2], value.f[3]});
+          break;
+        }
+        uint32_t old = 0;
+        if (s.images) {
+          const uint32_t operand = bits_of(fetch(ins.src[1], 0).f[0]), compare = ins.src_count > 2 ? bits_of(fetch(ins.src[2], 0).f[0]) : 0;
+          if (writes) {
+            if (ins.control > kAtomicCompareExchange || !s.images->atomic(slot, x, y, z, static_cast<graphics::ImageAtomic>(ins.control), operand, compare, &old)) old = 0;
+          } else {
+            old = bits_of(s.images->load(slot, x, y, z).x);   // (what is there, unchanged)
+          }
+        }
+        if (ins.op == kImgImmAtomic) store(ins.dst, splat(from_bits(old)));
         break;
       }
       case kDp2Add: b = fetch(ins.src[1], 0); c = fetch(ins.src[2], 0); store(ins.dst, splat(dot(a, b, 2) + c.f[0])); break;
@@ -1202,6 +1261,7 @@ bool D3d9Program::run_fragment_ex(const graphics::Vec4* varyings, const graphics
   s.sys[kSysPrimitiveId].f[0] = from_bits(context.primitive_id);
   s.fragment = &context;
   s.storage = context.storage;
+  s.images = context.images;
   s.no_stores = context.helper;
   execute(s);
   if (s.killed) return false;
@@ -1257,6 +1317,7 @@ void D3d9Program::run_geometry(const graphics::GeometryInputData& input, const u
   s.geometry_in = &upright;
   s.storage = input.storage;
   s.sys[kSysGsInstanceId].f[0] = from_bits(input.instance_id);
+  s.sys[kSysPrimitiveId].f[0] = from_bits(input.primitive_id);
   s.geometry_out = output;
   output->count = 0;
   execute(s);
@@ -1269,6 +1330,7 @@ void D3d9Program::run_compute(const graphics::ComputeContext& context, const uin
   s.compute = &context;
   s.storage = context.buffers;
   s.textures = context.textures;
+  s.images = context.images;
   for (uint32_t k = 0; k < 3; ++k) {
     s.sys[kSysDispatchThreadId].f[k] = from_bits(context.dispatch_id[k]);
     s.sys[kSysGroupId].f[k] = from_bits(context.group_id[k]);
@@ -1308,6 +1370,7 @@ void D3d9Program::run_compute_group(const graphics::ComputeContext& context, con
       s->compute = &group;
       s->storage = group.buffers;
       s->textures = group.textures;
+      s->images = group.images;
       const uint32_t i = constructed;
       const uint32_t tx = i % thread_group_[0], ty = (i / thread_group_[0]) % thread_group_[1], tz = i / (thread_group_[0] * thread_group_[1]);
       const uint32_t id[3] = {tx, ty, tz};

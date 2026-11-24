@@ -79,15 +79,18 @@ struct Luid {
 // A32B32G32R32Sint, A16B16G16R16Uint / Sint and A8B8G8R8Uint (DXGI R32G32B32A32_SINT, R16G16B16A16_UINT / SINT, R8G8B8A8_UINT) are the other integer formats (a narrow one saturates what a shader
 // writes); A16B16G16R16Snorm (R16G16B16A16_SNORM) and A2B10G10R10 (R10G10B10A2_UNORM, 2 bits of alpha) need kFeatureSnormFormats.
 // Like the floats, these have one mip level and cannot be presented or multisampled.
+// R32Uint, R32Sint, R32Float (DXGI R32_UINT / R32_SINT / R32_FLOAT, values 25 .. 27) keep one 32-bit channel (the adapter's kFeature2SingleChannelFormats): wide formats as well, read as
+// (r, 0, 0, 1); the integer ones are what the atomic operations of storage images take.
 enum class Format : uint32_t { Unknown, A8R8G8B8, X8R8G8B8, A8B8G8R8, X8B8G8R8, D32Float, D24S8, A16B16G16R16F, A32B32G32R32F, A8R8G8B8Srgb, A8B8G8R8Srgb, A16B16G16R16, A32B32G32R32Uint, A32B32G32R32Sint, A16B16G16R16Uint, A16B16G16R16Sint, A8B8G8R8Uint, A16B16G16R16Snorm, A2B10G10R10,
-                               Bc1, Bc2, Bc3, Bc1Srgb, Bc2Srgb, Bc3Srgb };   // (BC1 .. BC3: block-compressed, 4 x 4 pixels a block of 8 or 16 bytes - see is_compressed)
+                               Bc1, Bc2, Bc3, Bc1Srgb, Bc2Srgb, Bc3Srgb, R32Uint, R32Sint, R32Float };   // (BC1 .. BC3: block-compressed, 4 x 4 pixels a block of 8 or 16 bytes - see is_compressed)
 
 constexpr bool is_depth(Format f) { return f == Format::D32Float || f == Format::D24S8; }
 constexpr bool is_float(Format f) { return f == Format::A16B16G16R16F || f == Format::A32B32G32R32F; }
 constexpr bool is_srgb(Format f) { return f == Format::A8R8G8B8Srgb || f == Format::A8B8G8R8Srgb; }
-constexpr bool is_integer(Format f) { return f == Format::A32B32G32R32Uint || f == Format::A32B32G32R32Sint || f == Format::A16B16G16R16Uint || f == Format::A16B16G16R16Sint || f == Format::A8B8G8R8Uint; }
+constexpr bool is_integer(Format f) { return f == Format::A32B32G32R32Uint || f == Format::A32B32G32R32Sint || f == Format::A16B16G16R16Uint || f == Format::A16B16G16R16Sint || f == Format::A8B8G8R8Uint || f == Format::R32Uint || f == Format::R32Sint; }
+constexpr bool is_single_channel(Format f) { return f == Format::R32Uint || f == Format::R32Sint || f == Format::R32Float; }
 // Formats that are read and written as Vec4s (no 32-bit words), one level.
-constexpr bool is_wide(Format f) { return is_float(f) || f == Format::A16B16G16R16 || f == Format::A16B16G16R16Snorm || f == Format::A2B10G10R10 || is_integer(f); }
+constexpr bool is_wide(Format f) { return is_float(f) || f == Format::A16B16G16R16 || f == Format::A16B16G16R16Snorm || f == Format::A2B10G10R10 || is_integer(f) || f == Format::R32Float; }
 constexpr bool is_color(Format f) { return f == Format::A8R8G8B8 || f == Format::X8R8G8B8 || f == Format::A8B8G8R8 || f == Format::X8B8G8R8 || is_srgb(f) || is_wide(f); }
 constexpr bool has_alpha(Format f) { return f == Format::A8R8G8B8 || f == Format::A8B8G8R8 || is_srgb(f) || is_wide(f); }
 // Bytes of one pixel of a colour format.
@@ -147,6 +150,9 @@ enum AllocationFlags : uint32_t {
   kAllocReserved = 1u << 14,         // Direct3D 12 reserved (tiled) buffer: with the flags of a vertex, index, storage or stream output buffer; its size a multiple of kTileBytes; no memory of its own - Kernel::update_tile_mappings maps its 64 KiB tiles to places in heaps (an unmapped tile reads as zero and drops writes)
   kAllocTrackState = 1u << 12,       // Direct3D 12 resource states: AllocationDesc::initial_state is the state; ResourceBarrier moves it and uses of the allocation check it (CommandStream.hpp). Any other flags as usual.
   kAllocQueryResult = 1u << 8,   // a buffer the results of occlusion queries are written to (CommandStream.hpp BeginQuery); system memory only, never resident, read by locking it
+  // A texture shaders read and write texel by texel (Direct3D's unordered access views of textures: BindUavImage, the D3D12 descriptor DescriptorKind::UavTexture; the adapter's
+  // kFeature2StorageImages): with kAllocTexture (and kAllocRenderTarget, kAllocShared), a colour format that is not sRGB or block-compressed, one sample, not a cube. An image, not a buffer.
+  kAllocStorageImage = 1u << 15,
 };
 
 constexpr uint32_t kTileTexels = 128;   // ... a reserved texture of 4-byte pixels has tiles of kTileTexels x kTileTexels (so 64 KiB; the rows of a tile follow one another in the heap)
@@ -160,7 +166,8 @@ struct AllocationDesc {
   uint32_t width = 0, height = 0;    // images
   uint32_t mip_levels = 1;           // textures only; more than one needs a texture that is not a render target
   uint64_t size = 0;                 // buffers: bytes
-  graphics::TextureKind kind = graphics::TextureKind::Texture2D;   // textures: more than 2D needs the adapter's kFeatureTextureKinds, flags exactly kAllocTexture (kAllocShared too), one mip level, an 8-bit colour format
+  graphics::TextureKind kind = graphics::TextureKind::Texture2D;   // textures: more than 2D needs the adapter's kFeatureTextureKinds and one mip level; flags kAllocTexture (kAllocShared too), with
+                                                                   // kAllocRenderTarget or kAllocStorageImage, or a depth buffer (kAllocDepthStencil alone; an array or a cube) - those need kFeature2LayeredTargets
   uint32_t samples = 1;              // 2, 4 or 8 (the adapter's kFeatureMultisample and sample counts): a render target of an 8-bit colour format or a depth buffer, nothing else; it has no system-memory
                                      // backing, cannot be locked, copied, sampled or presented, and is turned into an ordinary image by the stream's ResolveRegion
   Handle heap = 0;                   // placed resource: the kAllocHeap allocation (of the same device) whose memory this allocation is, from heap_offset on; other placed allocations may overlap it
@@ -236,6 +243,7 @@ struct AdapterCaps {
   uint32_t device_kind = 0;          // graphics::DeviceKind: 0 software rasterizer, 1 virtual GPU, 2 GPU
   uint32_t vendor_id = 0;            // PCI vendor of the GPU behind the device (0x10005: the CPU renderer), from its name; a Vulkan driver reports it as VkPhysicalDeviceProperties::vendorID
   uint32_t device_id = 0;            // a number of the device within its vendor (what the kind of device says; the OS has no marketing ids for them)
+  uint32_t features2 = 0;            // graphics::DeviceFeature2 bits: storage images (in draws), layered render targets and depth buffers, the single-channel formats
   char name[64] = {};
 };
 

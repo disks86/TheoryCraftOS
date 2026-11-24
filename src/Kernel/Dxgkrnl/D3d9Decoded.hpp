@@ -56,6 +56,11 @@ enum Opcode : uint16_t {
   // words), kBufStore (dst.mask: how many words; src[2] the value), kBufAtomic / kBufImmAtomic (src[0] the address, src[1] the operand; the second also writes the old value to dst). The
   // buffer is `uav`; `stride` is 0 for a raw buffer (byte address) and the structure size for a structured one; an atomic's kind is `control` (AtomicKind).
   kBufLoad = 0x1400, kBufStore, kBufAtomic, kBufImmAtomic,
+  // Storage images (typed unordered access views of textures): kImgLoad (dst; src[0] the integer coordinate as the image's dimension has it - x, x and layer, x y, x y and layer or slice;
+  // tex_swizzle picks the components), kImgStore (src[0] the coordinate, src[1] the value), kImgAtomic / kImgImmAtomic (src[0] the coordinate, src[1] the operand, src[2] the compare
+  // value of a compare-exchange; the second writes the old value to dst; `control` the AtomicKind), kImgSize (resinfo of a u#: dst, src[0] the level; control as kTexSize's). The image
+  // is `uav` (its slot).
+  kImgLoad = 0x1700, kImgStore, kImgAtomic, kImgImmAtomic, kImgSize,
   // Geometry shaders: emit appends the output registers' vertex to the strip, cut ends the strip.
   kGsEmit = 0x1500, kGsCut,
   kBarrier = 0x1600,   // sync_g..: the thread waits until every thread of its group is here (a group runner switches threads there)
@@ -65,7 +70,7 @@ enum Opcode : uint16_t {
 enum RegType : uint8_t { kPatchOut = 21 /* a hull shader's patch constant output register (fork and join phases) */, kPatchIn = 22 /* a domain shader's patch constant input register */, kTemp = 0, kInput = 1, kConst = 2, kAddrTex = 3, kRastOut = 4, kAttrOut = 5, kTexCrdOut = 6, kColorOut = 8, kDepthOut = 9, kSampler = 10, kConstBool = 14,
                kSysValue = 20 /* (not in a token stream: a Shader Model 4 system value; number: kSysPosition ...) */ };
 enum SysValue : uint8_t { kSysPosition = 0, kSysFrontFacing, kSysPrimitiveId, kSysVertexId, kSysInstanceId, kSysDispatchThreadId, kSysGroupId, kSysGroupThreadId, kSysGroupIndex, kSysOutputControlPointId, kSysForkInstanceId, kSysJoinInstanceId, kSysDomainLocation, kSysGsInstanceId, kSysValueCount };
-enum AtomicKind : uint8_t { kAtomicAdd = 0, kAtomicAnd, kAtomicOr, kAtomicXor, kAtomicIMax, kAtomicIMin, kAtomicUMax, kAtomicUMin, kAtomicExchange };
+enum AtomicKind : uint8_t { kAtomicAdd = 0, kAtomicAnd, kAtomicOr, kAtomicXor, kAtomicIMax, kAtomicIMin, kAtomicUMax, kAtomicUMin, kAtomicExchange, kAtomicCompareExchange };
 enum Usage : uint8_t { kUsagePosition = 0, kUsageTexCoord = 5, kUsageColor = 10 };
 enum Modifier : uint8_t { kModNone, kModNeg, kModBias, kModBiasNeg, kModSign, kModSignNeg, kModComp, kModX2, kModX2Neg, kModDz, kModDw, kModAbs, kModAbsNeg, kModNot };
 
@@ -73,7 +78,7 @@ enum Modifier : uint8_t { kModNone, kModNeg, kModBias, kModBiasNeg, kModSign, kM
 // as many as its program uses (D3d9Program::temp_count_), so the size of the file costs nothing per vertex or pixel.
 constexpr uint32_t kMaxTemps = 256, kMaxInputs = 16, kMaxOutputs = 16;
 constexpr uint32_t kMaxD3d9Temps = 32;   // r0 .. r31 of a Direct3D 9 token stream
-constexpr int8_t kSlotNone = -1, kSlotPosition = -2;
+constexpr int8_t kSlotNone = -1, kSlotPosition = -2, kSlotLayer = -3;   // (kSlotLayer: a geometry shader's SV_RenderTargetArrayIndex output, a kRastOut register)
 
 }  // namespace d3d9
 

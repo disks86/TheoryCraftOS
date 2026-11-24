@@ -130,6 +130,11 @@ class Allocation {
   uint32_t mirror_channels_ = 0;        // a mirror that writes back: the channels it gives its source (bit 0 red .. bit 3 alpha)
 };
 
+// The device's format of a wide allocation format (is_wide), Undefined for another. A storage image's view of a wide allocation may name another wide format of the same pixel size (the
+// views of a typeless resource): `view` 0 (Unknown) is the allocation's own; false for a view it cannot have.
+graphics::Format device_wide_format(Format f);
+bool storage_view_format(Format allocation, Format view, graphics::Format* out);
+
 class VidMm {
  public:
   // `local_budget`: bytes that may be resident at once; `system_limit`: bytes of backing that may exist.

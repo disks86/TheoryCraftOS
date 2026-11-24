@@ -360,6 +360,7 @@ struct Dev {
   D3D_FEATURE_LEVEL level;
   UINT flags;
   ID3D12Device *d12;
+  int layered_targets;         /* Direct3D 12 below draws into arrays, cubes and volumes (render target and depth views of several slices): 0 not asked yet, 1 yes, 2 no */
   UINT next_tex_kind;                      /* what tex_make makes next, for the description a share carries: 0 as its arguments say, 2 one-dimensional (dev_CreateTexture1D) */
   ID3D12CommandQueue *queue;
   ID3D12CommandAllocator *allocator;
@@ -733,6 +734,19 @@ static HRESULT STDMETHODCALLTYPE dev_CreateBuffer(Dev *d, const D3D11_BUFFER_DES
 }
 
 /* ---- textures ---------------------------------------------------------------------------------------------------------------------------------------- */
+
+/* Whether Direct3D 12 below makes render targets of several slices (the kernel's layered targets): asked once, with a small array it is given to make. */
+static BOOL dev_layered_targets(Dev *d) {
+  if (!d->layered_targets) {
+    const D3D12_HEAP_PROPERTIES props = {D3D12_HEAP_TYPE_DEFAULT, D3D12_CPU_PAGE_PROPERTY_UNKNOWN, D3D12_MEMORY_POOL_UNKNOWN, 1, 1};
+    const D3D12_RESOURCE_DESC rd = {D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, 4, 4, 2, 1, DXGI_FORMAT_R8G8B8A8_UNORM, {1, 0}, D3D12_TEXTURE_LAYOUT_UNKNOWN, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET};
+    ID3D12Resource *probe = NULL;
+    const HRESULT hr = ID3D12Device_CreateCommittedResource(d->d12, &props, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_COMMON, NULL, &IID_ID3D12Resource, (void **)&probe);
+    d->layered_targets = SUCCEEDED(hr) && probe ? 1 : 2;
+    if (probe) ID3D12Resource_Release(probe);
+  }
+  return d->layered_targets == 1;
+}
 
 static UINT tex_subresources(const Tex *t) { return t->desc.MipLevels * t->desc.ArraySize; }
 static UINT mip_size(UINT size, UINT level) { size >>= level; return size ? size : 1; }
@@ -1108,14 +1122,16 @@ static HRESULT tex_make(Dev *d, const D3D11_TEXTURE2D_DESC *in, UINT slices, ID3
   if (cube && desc.ArraySize != 6) { tex_refused(&desc, "an array of cubes"); return DXGI_ERROR_UNSUPPORTED; }
   if (desc.ArraySize > 256) { tex_refused(&desc, "an array of more than 256"); return E_INVALIDARG; }
   const BOOL layered = cube || slices || desc.ArraySize > 1;
-  /* (a render target of levels or layers: the kernel draws into images of one level and one layer, so the texture is drawn into through targets of its own) */
-  const BOOL shadowed = !res && !planar && !yuv && (desc.BindFlags & D3D11_BIND_RENDER_TARGET) && desc.SampleDesc.Count == 1 && (desc.MipLevels != 1 || layered);
+  /* (a render target of levels - or of layers, on a device below that does not draw into them -: the kernel draws into images of one level, so the texture is drawn
+   * into through targets of its own) */
+  const BOOL shadowed = !res && !planar && !yuv && (desc.BindFlags & D3D11_BIND_RENDER_TARGET) && desc.SampleDesc.Count == 1 &&
+                        (desc.MipLevels != 1 || (layered && !dev_layered_targets(d)));
   /* (a format that cannot be had for that use: refused as such, before what the kernel cannot do) */
   if (!tex_format_for(desc.Format, desc.BindFlags) && !(res && tex_format(desc.Format))) { tex_refused(&desc, "the format, for that use"); return E_INVALIDARG; }
-  /* (the kernel samples volumes, arrays and cubes; it does not draw into them, nor give unordered access to textures; a depth buffer is drawn into whole) */
-  if (layered && !planar && (desc.BindFlags & (D3D11_BIND_DEPTH_STENCIL | D3D11_BIND_UNORDERED_ACCESS))) {
-    tex_refused(&desc, slices ? "a volume to draw into" : cube ? "a cube to draw into" : "an array to draw into");
-    return DXGI_ERROR_UNSUPPORTED;
+  /* (a depth buffer of several slices: an array or a cube - a volume is not one -, on a device below that draws into layers) */
+  if (layered && !planar && (desc.BindFlags & D3D11_BIND_DEPTH_STENCIL)) {
+    if (slices) return E_INVALIDARG;
+    if (!dev_layered_targets(d)) { tex_refused(&desc, cube ? "a cube to draw into" : "an array to draw into"); return DXGI_ERROR_UNSUPPORTED; }
   }
   const BOOL target = (desc.BindFlags & (D3D11_BIND_RENDER_TARGET | D3D11_BIND_DEPTH_STENCIL)) != 0;
   /* (a multisampled texture: a render target or depth buffer of one level and one layer, drawn into and resolved; the adapter says which counts it has) */
@@ -1163,6 +1179,7 @@ static HRESULT tex_make(Dev *d, const D3D11_TEXTURE2D_DESC *in, UINT slices, ID3
                               (UINT16)(slices ? slices : desc.ArraySize), (UINT16)t->kmips, t->stored, {desc.SampleDesc.Count, 0}, D3D12_TEXTURE_LAYOUT_UNKNOWN, D3D12_RESOURCE_FLAG_NONE};
     if ((desc.BindFlags & D3D11_BIND_RENDER_TARGET) && !shadowed) rd.Flags |= D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
     if (t->depth) rd.Flags |= D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
+    if (desc.BindFlags & D3D11_BIND_UNORDERED_ACCESS) rd.Flags |= D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;      /* (the kernel's storage images) */
     /* (a keyed mutex that orders its use between devices: free, with key 0, as DXGI makes one; shared with the texture's NT handle, or - a legacy share - with a
      * global share handle of its own, which the texture's description carries) */
     UINT mutex_global = 0;
@@ -1390,7 +1407,8 @@ static HRESULT rtv_create(Dev *d, ID3D11Resource *resource, const D3D11_RENDER_T
     if (plane_slice > 0) return E_INVALIDARG;      /* (a format of one plane) */
     if ((t->fmt->flags & FMT_YUV) && (!desc || !yuv_view_ok(t->desc.Format, desc->Format, TRUE))) return E_INVALIDARG;      /* (AYUV: as R8G8B8A8) */
     if (desc && !rtv_subresource(t, desc, &level, &layer)) return E_INVALIDARG;
-    if (!t->shadowed && (level || layer)) return E_INVALIDARG;
+    if (!t->shadowed && level) return E_INVALIDARG;
+    if (!t->shadowed && layer && t->kind == 0) return E_INVALIDARG;
   }
   EnterCriticalSection(&d->lock);
   if (d->rtv_free_count == 0) { LeaveCriticalSection(&d->lock); return E_OUTOFMEMORY; }
@@ -1417,9 +1435,10 @@ static HRESULT rtv_create(Dev *d, ID3D11Resource *resource, const D3D11_RENDER_T
     memset(&r, 0, sizeof r);
     r.Format = desc->Format;
     if (t->desc.ArraySize > 1) {
+      /* (a 2D array view of several slices: Direct3D 12 below draws into an array mirror of them, a primitive into the slice its SV_RenderTargetArrayIndex names) */
       r.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2DARRAY;
       r.Texture2DArray.FirstArraySlice = layer;
-      r.Texture2DArray.ArraySize = 1;
+      r.Texture2DArray.ArraySize = desc->ViewDimension == D3D11_RTV_DIMENSION_TEXTURE2DARRAY ? (desc->Texture2DArray.ArraySize == (UINT)-1 ? t->desc.ArraySize - layer : desc->Texture2DArray.ArraySize) : 1;
       r.Texture2DArray.PlaneSlice = plane;
     } else {
       r.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
@@ -1432,6 +1451,32 @@ static HRESULT rtv_create(Dev *d, ID3D11Resource *resource, const D3D11_RENDER_T
     LeaveCriticalSection(&d->lock);
     if (FAILED(hr)) { dx_Release(OBJ(v)); return hr; }
     ID3D12Device_CreateRenderTargetView(d->d12, v->scratch, NULL, v->handle);
+  } else if (t->kind != 0 && !(t->fmt->flags & FMT_YUV)) {
+    /* (an array, a cube or a volume Direct3D 12 below draws into: a view of the layers the description names - all of them without one) */
+    D3D12_RENDER_TARGET_VIEW_DESC r;
+    memset(&r, 0, sizeof r);
+    r.Format = t->stored;
+    UINT first = 0, count = t->kind == 1 ? t->slices : t->desc.ArraySize;
+    if (desc && desc->ViewDimension == D3D11_RTV_DIMENSION_TEXTURE2DARRAY) first = desc->Texture2DArray.FirstArraySlice, count = desc->Texture2DArray.ArraySize;
+    if (desc && desc->ViewDimension == D3D11_RTV_DIMENSION_TEXTURE1DARRAY) first = desc->Texture1DArray.FirstArraySlice, count = desc->Texture1DArray.ArraySize;
+    if (desc && desc->ViewDimension == D3D11_RTV_DIMENSION_TEXTURE3D) first = desc->Texture3D.FirstWSlice, count = desc->Texture3D.WSize;
+    if (desc && (desc->ViewDimension == D3D11_RTV_DIMENSION_TEXTURE2D || desc->ViewDimension == D3D11_RTV_DIMENSION_TEXTURE1D)) count = 1;
+    if (t->kind == 1) {
+      r.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE3D;
+      r.Texture3D.FirstWSlice = first;
+      r.Texture3D.WSize = count;
+    } else {
+      r.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2DARRAY;
+      r.Texture2DArray.FirstArraySlice = first;
+      r.Texture2DArray.ArraySize = count;
+    }
+    if (!desc) {
+      v->desc.rtv.ViewDimension = t->kind == 1 ? D3D11_RTV_DIMENSION_TEXTURE3D : t->one_d ? D3D11_RTV_DIMENSION_TEXTURE1DARRAY : D3D11_RTV_DIMENSION_TEXTURE2DARRAY;
+      if (t->kind == 1) v->desc.rtv.Texture3D.WSize = count;
+      else if (t->one_d) v->desc.rtv.Texture1DArray.ArraySize = count;
+      else v->desc.rtv.Texture2DArray.ArraySize = count;
+    }
+    ID3D12Device_CreateRenderTargetView(d->d12, t->res, &r, v->handle);
   } else if (t->desc.SampleDesc.Count > 1) {
     v->desc.rtv.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2DMS;
     D3D12_RENDER_TARGET_VIEW_DESC ms = {t->stored, D3D12_RTV_DIMENSION_TEXTURE2DMS, {{0}}};
@@ -1466,6 +1511,20 @@ static HRESULT STDMETHODCALLTYPE dev_CreateDepthStencilView(Dev *d, ID3D11Resour
   v->handle = ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(d->dsv_heap);
   v->handle.ptr += (SIZE_T)v->slot * ID3D12Device_GetDescriptorHandleIncrementSize(d->d12, D3D12_DESCRIPTOR_HEAP_TYPE_DSV);
   if (t->desc.SampleDesc.Count > 1) v->desc.dsv.ViewDimension = D3D11_DSV_DIMENSION_TEXTURE2DMS;
+  if (t->kind == 2 || t->kind == 3) {
+    /* (an array or a cube: a view of the slices the description names - all of them without one) */
+    D3D12_DEPTH_STENCIL_VIEW_DESC x;
+    memset(&x, 0, sizeof x);
+    x.Format = t->stored;
+    x.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2DARRAY;
+    x.Texture2DArray.ArraySize = t->desc.ArraySize;
+    if (desc && desc->ViewDimension == D3D11_DSV_DIMENSION_TEXTURE2DARRAY) x.Texture2DArray.FirstArraySlice = desc->Texture2DArray.FirstArraySlice, x.Texture2DArray.ArraySize = desc->Texture2DArray.ArraySize;
+    if (desc && desc->ViewDimension == D3D11_DSV_DIMENSION_TEXTURE1DARRAY) x.Texture2DArray.FirstArraySlice = desc->Texture1DArray.FirstArraySlice, x.Texture2DArray.ArraySize = desc->Texture1DArray.ArraySize;
+    if (desc && (desc->ViewDimension == D3D11_DSV_DIMENSION_TEXTURE2D || desc->ViewDimension == D3D11_DSV_DIMENSION_TEXTURE1D)) x.Texture2DArray.ArraySize = 1;
+    if (!desc) { v->desc.dsv.ViewDimension = D3D11_DSV_DIMENSION_TEXTURE2DARRAY; v->desc.dsv.Texture2DArray.ArraySize = t->desc.ArraySize; }
+    ID3D12Device_CreateDepthStencilView(d->d12, t->res, &x, v->handle);
+    return give(v, (void **)out);
+  }
   ID3D12Device_CreateDepthStencilView(d->d12, t->res, NULL, v->handle);      /* (the view follows the resource: a multisampled one is seen as such) */
   return give(v, (void **)out);
 }
@@ -1556,7 +1615,7 @@ static HRESULT STDMETHODCALLTYPE dev_CreateShaderResourceView(Dev *d, ID3D11Reso
 }
 
 /* An unordered access view. Of a buffer: raw (R32_TYPELESS, a buffer that allows raw views), structured (UNKNOWN; an append or counter view has a hidden count), or
- * typed. Of a texture: the view is made, but the kernel has no unordered access to textures, and a shader that declares one is refused (docs/Direct3D11.md). */
+ * typed. Of a texture: a level and layers of it (the kernel's storage images: context.inc texture_uav_descriptor), a plane of the slices of a planar one. */
 static HRESULT uav_create(Dev *d, ID3D11Resource *resource, const D3D11_UNORDERED_ACCESS_VIEW_DESC *desc, INT plane_slice, ID3D11UnorderedAccessView **out) {
   extern const ID3D11UnorderedAccessView1Vtbl uav_vtbl;
   static const GUID *const iids[] = {&IID_ID3D11DeviceChild, &IID_ID3D11View, &IID_ID3D11UnorderedAccessView, &IID_ID3D11UnorderedAccessView1, NULL};
@@ -1591,9 +1650,7 @@ static HRESULT uav_create(Dev *d, ID3D11Resource *resource, const D3D11_UNORDERE
     if (!planar_view(t, desc->Format, plane_slice, array, array ? desc->Texture2DArray.MipSlice : desc->Texture2D.MipSlice, 1, array ? desc->Texture2DArray.FirstArraySlice : 0,
                      array ? desc->Texture2DArray.ArraySize : 1, &plane, &slice))
       return E_INVALIDARG;
-    /* (not the integer forms: they are mirrors of the plane below, which a shader cannot write through - the kernel has no unordered access to textures, and the format
-     * support says no typed stores, so a view that would write is refused as one of a format without them) */
-    if (desc->Format == DXGI_FORMAT_R8_UINT || desc->Format == DXGI_FORMAT_R8G8_UINT || desc->Format == DXGI_FORMAT_R16_UINT || desc->Format == DXGI_FORMAT_R16G16_UINT) return E_INVALIDARG;
+    /* (written through a mirror of the plane below that gives the view's channels back after each dispatch or pass: d3d12.dll texture_uav) */
     probe.plane_format = desc->Format;
     probe.plane = plane;
     probe.array_slice = slice;

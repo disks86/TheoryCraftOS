@@ -142,12 +142,15 @@ struct CmdList {
   float blend_factor[4];       /* OMSetBlendFactor (0, 0, 0, 0 when the list is reset) */
   UINT rtv[8];                 /* the kernel's allocations of the colour targets */
   UINT rtv_count;
+  UINT rtv_layers[8][2];       /* ... the first layer and the count of each (an array's slices, a volume's depth slices: 0, 1 for a 2D view) */
   UINT dsv;
+  UINT dsv_layers[2];          /* ... and of the depth buffer */
   int pass_open;
   int pending_clear;           /* a depth/stencil clear waiting for a pass */
   UINT pending_width, pending_height, pending_samples;      /* (the buffer's size: for its companion, if no pass takes the clear) */
   UINT dsv_width, dsv_height, dsv_samples;                  /* the size of the depth buffer in `dsv` */
   UINT pending_alloc, pending_flags;
+  UINT pending_layers[2];      /* (the cleared view's first layer and count: the pass that takes the clear draws into those) */
   float pending_depth;
   UINT pending_stencil;
   /* what the chunk being recorded has already sent */
@@ -360,8 +363,9 @@ static void STDMETHODCALLTYPE list_ClearState(CmdList *This, ID3D12PipelineState
 /* The RTV/DSV a handle names. */
 static SoftDesc *view_at(D3D12_CPU_DESCRIPTOR_HANDLE h) { return desc_at(h); }
 
-static void begin_pass_packet(CmdList *l, UINT color_alloc, UINT depth_alloc, UINT flags, const float color[4], float depth, UINT stencil) {
-  UINT w[9 + 7];
+/* `layers`: the first layer and the count of each colour target and then of the depth buffer (NULL: layer 0 of each); a pass of layers says them (kPassLayers). */
+static void begin_pass_packet_layers(CmdList *l, UINT color_alloc, UINT depth_alloc, UINT flags, const float color[4], float depth, UINT stencil, const UINT (*layers)[2], const UINT *depth_layers) {
+  UINT w[9 + 7 + 18];
   UINT n = 0;
   w[n++] = alloc_index(l, color_alloc);
   w[n++] = depth_alloc ? alloc_index(l, depth_alloc) : 0xFFFFFFFFu;
@@ -373,8 +377,22 @@ static void begin_pass_packet(CmdList *l, UINT color_alloc, UINT depth_alloc, UI
   w[n++] = bits_of(depth);
   w[n++] = stencil;
   /* (the other colour targets, when the pass has them; clears of those are separate passes) */
-  for (UINT i = 1; i < l->rtv_count && i < 8 && flags != 0xFFFFFFFFu && color_alloc == l->rtv[0]; ++i) w[n++] = alloc_index(l, l->rtv[i]);
+  UINT targets = 1;
+  for (UINT i = 1; i < l->rtv_count && i < 8 && flags != 0xFFFFFFFFu && color_alloc == l->rtv[0]; ++i) w[n++] = alloc_index(l, l->rtv[i]), ++targets;
+  int layered = 0;
+  for (UINT i = 0; layers && i < targets; ++i) layered |= layers[i][0] != 0 || layers[i][1] > 1;
+  if (depth_layers && depth_alloc) layered |= depth_layers[0] != 0 || depth_layers[1] > 1;
+  if (layered) {
+    /* (kPassLayers: for each colour target and the depth buffer, its first layer and count) */
+    w[2] |= 8u;
+    for (UINT i = 0; i < targets; ++i) w[n++] = layers ? layers[i][0] : 0, w[n++] = layers && layers[i][1] ? layers[i][1] : 1;
+    w[n++] = depth_layers && depth_alloc ? depth_layers[0] : 0;
+    w[n++] = depth_layers && depth_alloc && depth_layers[1] ? depth_layers[1] : 1;
+  }
   packet(l, OP_BEGIN_PASS, w, n);
+}
+static void begin_pass_packet(CmdList *l, UINT color_alloc, UINT depth_alloc, UINT flags, const float color[4], float depth, UINT stencil) {
+  begin_pass_packet_layers(l, color_alloc, depth_alloc, flags, color, depth, stencil, NULL, NULL);
 }
 
 /* The kernel's passes have a colour target; Direct3D 12's need not (a shadow map is drawn with a depth buffer alone). Such a pass draws into a colour target of the depth
@@ -441,7 +459,7 @@ static void flush_pending_clear(CmdList *l) {
   ensure_room(l, ROOM_BYTES, ROOM_ALLOCS);
   const UINT saved = l->rtv_count;
   l->rtv_count = 1;
-  begin_pass_packet(l, color, l->pending_alloc, l->pending_flags, zero, l->pending_depth, l->pending_stencil);
+  begin_pass_packet_layers(l, color, l->pending_alloc, l->pending_flags, zero, l->pending_depth, l->pending_stencil, NULL, l->pending_layers);
   l->rtv_count = saved;
   packet(l, OP_END_PASS, NULL, 0);
 }
@@ -451,7 +469,7 @@ static int ensure_pass(CmdList *l) {
   static const float zero[4] = {0, 0, 0, 0};
   if (l->pass_open) return 1;
   UINT color = l->rtv_count ? l->rtv[0] : 0, depth = l->dsv;
-  if (l->pending_clear && l->pending_alloc != depth) flush_pending_clear(l);
+  if (l->pending_clear && (l->pending_alloc != depth || l->pending_layers[0] != l->dsv_layers[0] || l->pending_layers[1] != l->dsv_layers[1])) flush_pending_clear(l);
   const int companion = !color && depth && !(l->pso && l->pso->so_entries);
   if (companion) color = depth_companion(l->d.dev, depth, l->dsv_width, l->dsv_height, l->dsv_samples);
   if (!color && l->pso && l->pso->so_entries) {
@@ -480,10 +498,12 @@ static int ensure_pass(CmdList *l) {
   if (companion) {      /* (the pass has the companion alone as its colour target, whatever the list's render targets are) */
     const UINT saved = l->rtv_count;
     l->rtv_count = 1;
-    begin_pass_packet(l, color, depth, flags, zero, depth_value, stencil);
+    begin_pass_packet_layers(l, color, depth, flags, zero, depth_value, stencil, NULL, l->dsv_layers);
     l->rtv_count = saved;
   } else {
-    begin_pass_packet(l, color, depth, flags, zero, depth_value, stencil);
+    /* (the layers of the list's targets; a target of the device's own - stream output with none - is a 2D image) */
+    begin_pass_packet_layers(l, color, depth, flags, zero, depth_value, stencil, l->rtv_count && color == l->rtv[0] ? (const UINT(*)[2])l->rtv_layers : NULL,
+                             depth && depth == l->dsv ? l->dsv_layers : NULL);
   }
   l->pass_open = 1;
   /* a new pass forgets what was bound (a device may have its own idea of what carries over) */
@@ -551,7 +571,7 @@ static void send_binding(CmdList *l, Binding *b, int which) {
           if (reach > h->desc.NumDescriptors - index) reach = h->desc.NumDescriptors - index;
           for (UINT k = 0; k < reach && listed < TABLE_ALLOCS; ++k) {
             const SoftDesc *sd = &h->descs[index + k];
-            if (sd->alloc && (sd->kind == DK_SRV || sd->kind == DK_SRV_BUFFER || sd->kind == DK_UAV || sd->kind == DK_CBV)) { alloc_index(l, sd->alloc); ++listed; }
+            if (sd->alloc && (sd->kind == DK_SRV || sd->kind == DK_SRV_BUFFER || sd->kind == DK_UAV || sd->kind == DK_CBV || sd->kind == DK_UAV_TEXTURE)) { alloc_index(l, sd->alloc); ++listed; }
             if (sd->kind == DK_SRV && (sd->size & SRV_ALTERNATE) == SRV_ALTERNATE) { alloc_index(l, (UINT)sd->size); ++listed; }      /* (a view's array mirror too) */
           }
         }
@@ -611,7 +631,7 @@ static int binding_has_mirrors(CmdList *l, const Binding *b) {
     UINT reach = b->rs->pdescriptors[i];
     if (reach > h->desc.NumDescriptors - index) reach = h->desc.NumDescriptors - index;
     for (UINT k = 0; k < reach; ++k)
-      if (h->descs[index + k].kind == DK_SRV && (h->descs[index + k].offset & SRV_MIRRORS)) return 1;
+      if ((h->descs[index + k].kind == DK_SRV || h->descs[index + k].kind == DK_UAV_TEXTURE) && (h->descs[index + k].offset & SRV_MIRRORS)) return 1;
   }
   return 0;
 }
@@ -802,13 +822,18 @@ static void STDMETHODCALLTYPE list_OMSetRenderTargets(CmdList *l, UINT count, co
   for (UINT i = 0; i < count && i < 8 && i < l->d.dev->caps.max_color_targets && rtvs; ++i) {
     D3D12_CPU_DESCRIPTOR_HANDLE h = single ? (D3D12_CPU_DESCRIPTOR_HANDLE){rtvs[0].ptr + (SIZE_T)i * DESCRIPTOR_STRIDE} : rtvs[i];
     const SoftDesc *d = view_at(h);
-    l->rtv[l->rtv_count++] = d && d->kind == DK_RTV ? d->alloc : 0;
+    const int rtv = d && d->kind == DK_RTV;
+    l->rtv_layers[l->rtv_count][0] = rtv ? d->slice : 0;
+    l->rtv_layers[l->rtv_count][1] = rtv && d->stride ? d->stride : 1;
+    l->rtv[l->rtv_count++] = rtv ? d->alloc : 0;
   }
   l->dsv = 0;
+  l->dsv_layers[0] = 0, l->dsv_layers[1] = 1;
   if (dsv && dsv->ptr) {
     const SoftDesc *d = view_at(*dsv);
     if (d && d->kind == DK_DSV) {
       l->dsv = d->alloc;
+      l->dsv_layers[0] = d->slice, l->dsv_layers[1] = d->stride ? d->stride : 1;
       l->dsv_width = (UINT)d->size;
       l->dsv_height = (UINT)(d->size >> 32);
       l->dsv_samples = (UINT)d->offset;
@@ -904,7 +929,8 @@ static void STDMETHODCALLTYPE list_ClearRenderTargetView(CmdList *l, D3D12_CPU_D
       memcpy(&integers[c], &u, 4);
     }
   }
-  begin_pass_packet(l, d->alloc, 0, 1 /* clear colour */, integer ? integers : mask == 0xF ? color : narrow, 1.0f, 0);
+  const UINT layers[1][2] = {{d->slice, d->stride ? d->stride : 1}};      /* (the view's layers) */
+  begin_pass_packet_layers(l, d->alloc, 0, 1 /* clear colour */, integer ? integers : mask == 0xF ? color : narrow, 1.0f, 0, layers, NULL);
   l->rtv_count = saved;
   packet(l, OP_END_PASS, NULL, 0);
 }
@@ -912,10 +938,11 @@ static void STDMETHODCALLTYPE list_ClearDepthStencilView(CmdList *l, D3D12_CPU_D
   const SoftDesc *d = view_at(dsv);
   if (!d || d->kind != DK_DSV || !d->alloc) return;
   if (l->pass_open && l->dsv == d->alloc) end_pass(l);
-  if (l->pending_clear && l->pending_alloc != d->alloc) flush_pending_clear(l);
+  if (l->pending_clear && (l->pending_alloc != d->alloc || l->pending_layers[0] != d->slice || l->pending_layers[1] != (d->stride ? d->stride : 1))) flush_pending_clear(l);
   /* (kept until the next pass that uses the buffer, which clears as it begins; a pass of its own if none does: flush_pending_clear) */
   l->pending_clear = 1;
   l->pending_alloc = d->alloc;
+  l->pending_layers[0] = d->slice, l->pending_layers[1] = d->stride ? d->stride : 1;
   l->pending_width = (UINT)d->size;
   l->pending_height = (UINT)(d->size >> 32);
   l->pending_samples = (UINT)d->offset;

@@ -97,6 +97,11 @@ class ShaderObject {
   uint32_t geometry_streams_ = 1;                          // ... and how many output streams it has
   uint32_t tess_input_points_ = 0, tess_output_points_ = 0;   // a hull or domain shader's control points
   graphics::TessDomain tess_domain_ = graphics::TessDomain::Triangle;   // ... and the domain it tessellates
+  // The storage images a compute or pixel shader declares (bit n: u<n>), their dimensions and the values they read and write; a geometry shader that writes SV_RenderTargetArrayIndex.
+  uint32_t image_mask_ = 0;
+  D3d9Program::ImageDim image_dims_[graphics::kMaxStorageImages] = {};
+  D3d9Program::ImageReturn image_returns_[graphics::kMaxStorageImages] = {};
+  bool writes_layer_ = false;
   D3d9Binding d3d9_;              // Direct3D 9 bytecode being interpreted (the module's function finds the program through it)
 };
 
@@ -136,10 +141,17 @@ class PipelineObject {
   bool has_stream_output() const { return stream_output_buffers_ != 0; }
   // The kind of texture the shaders declared for a unit (2D when they do not say: only a DXBC program does).
   graphics::TextureKind texture_kind(uint32_t unit) const { return unit < graphics::kMaxTextureUnits ? texture_kinds_[unit] : graphics::TextureKind::Texture2D; }
+  // The storage images the compute shader or the pixel shader declares (bit n: u<n>), with each one's dimension and the values it reads and writes: a dispatch or draw needs them bound.
+  uint32_t image_mask() const { return image_mask_; }
+  D3d9Program::ImageDim image_dim(uint32_t slot) const { return slot < graphics::kMaxStorageImages ? image_dims_[slot] : D3d9Program::ImageDim::None; }
+  D3d9Program::ImageReturn image_return(uint32_t slot) const { return slot < graphics::kMaxStorageImages ? image_returns_[slot] : D3d9Program::ImageReturn::Float; }
 
  private:
   friend class Adapter;
   graphics::IGraphicsDevice& device_;
+  uint32_t image_mask_ = 0;
+  D3d9Program::ImageDim image_dims_[graphics::kMaxStorageImages] = {};
+  D3d9Program::ImageReturn image_returns_[graphics::kMaxStorageImages] = {};
   graphics::IPipeline* pipeline_ = nullptr;
   bool per_instance_ = false;
   uint32_t stream_output_buffers_ = 0;

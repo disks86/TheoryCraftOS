@@ -187,6 +187,19 @@ class Adapter::StreamRunner {
     return done ? status::kSuccess : status::kInvalidDeviceState;
   }
 
+  // Runs what was recorded (flush) and opens a command buffer that has what the stream bound outside a pass and does not bind again at the next draw or dispatch: the compute pipeline (the
+  // constants go again with the next one). What a mirror or a write-back needs the device's contents for, in the middle of a stream.
+  NtStatus flush_keeping_state() {
+    NtStatus s = flush();
+    if (s != status::kSuccess) return s;
+    constants_sent_ = false;
+    if (!compute_) return status::kSuccess;
+    s = ensure_cb();
+    if (s != status::kSuccess) return s;
+    cb_->bind_compute_pipeline(compute_->pipeline());
+    return status::kSuccess;
+  }
+
   // Writes the counts of the queries the device ran into the allocations they name (the CPU's copy: these allocations never go to the GPU).
   bool store_query_results() {
     for (uint64_t i = 0; i < pending_.count(); ++i) {
@@ -216,8 +229,10 @@ class Adapter::StreamRunner {
         in_pass_ = false;
         if (!exec_) return status::kSuccess;
         cb_->end_render_pass();
-        return write_back_targets();
+        const NtStatus s = write_back_targets();
+        return s == status::kSuccess ? write_back_images() : s;
       }
+      case Op::BindUavImage: return bind_uav_image(p);
       case Op::BindPipeline: return bind_pipeline(p);
       case Op::BindVertexBuffer: return bind_vertex_buffer(p);
       case Op::BindIndexBuffer: return bind_index_buffer(p);
@@ -303,13 +318,24 @@ class Adapter::StreamRunner {
     clear.x = bits_float(p.le32()), clear.y = bits_float(p.le32()), clear.z = bits_float(p.le32()), clear.w = bits_float(p.le32());
     const float clear_depth = bits_float(p.le32());
     const uint32_t clear_stencil = p.le32();
-    // Further colour targets, one word each (the adapter's kFeatureMultipleTargets).
+    // Further colour targets, one word each (the adapter's kFeatureMultipleTargets), and with kPassLayers the first layer and count of each target and of the depth buffer after them.
     Allocation* extras[graphics::kMaxColorTargets - 1] = {};
     uint32_t extra_count = 0;
-    while (!p.at_end() && p.ok() && extra_count < adapter_.caps_.max_color_targets - 1) {
+    const bool layered = (flags & kPassLayers) != 0;
+    const uint64_t rest = p.ok() ? p.remaining() / 4 : 0;
+    if (layered && (rest < 4 || (rest - 4) % 3)) return kBad;
+    const uint64_t extra_words = layered ? (rest - 4) / 3 : rest;
+    while (extra_count < extra_words && !p.at_end() && p.ok() && extra_count < adapter_.caps_.max_color_targets - 1) {
       extras[extra_count] = alloc(p.le32());
       if (!extras[extra_count]) return kBad;
       ++extra_count;
+    }
+    if (extra_count != extra_words) return kBad;
+    uint32_t first_layer[graphics::kMaxColorTargets + 1] = {}, layer_count[graphics::kMaxColorTargets + 1] = {1, 1, 1, 1, 1, 1, 1, 1, 1};
+    if (layered) {
+      for (uint32_t n = 0; n <= extra_count; ++n) first_layer[n] = p.le32(), layer_count[n] = p.le32();
+      first_layer[graphics::kMaxColorTargets] = p.le32(), layer_count[graphics::kMaxColorTargets] = p.le32();
+      if (!(adapter_.caps_.features2 & graphics::kFeature2LayeredTargets)) return kBad;
     }
     if (!exact(p) || in_pass_) return kBad;
     if (extra_count && !(adapter_.caps_.features & graphics::kFeatureMultipleTargets)) return kBad;
@@ -326,7 +352,13 @@ class Adapter::StreamRunner {
       for (uint32_t k = 0; k < n; ++k)
         if (extras[k] == e) return kBad;
     }
-    if (flags & ~(kPassClearColor | kPassClearDepth | kPassClearStencil)) return kBad;
+    if (flags & ~(kPassClearColor | kPassClearDepth | kPassClearStencil | kPassLayers)) return kBad;
+    // (the layers of each target are layers it has: a plain image's are layer 0 of 1, and so are those of the depth buffer of a pass without one)
+    for (uint32_t n = 0; n <= graphics::kMaxColorTargets; ++n) {
+      const Allocation* t = n == graphics::kMaxColorTargets ? depth : n == 0 ? color : n <= extra_count ? extras[n - 1] : nullptr;
+      const uint32_t layers = t ? t->layers() : 1;
+      if (layer_count[n] == 0 || first_layer[n] >= layers || layer_count[n] > layers - first_layer[n]) return kBad;
+    }
     // (the clear colour of an integer target is four integers as float bits: any bit pattern)
     if (!is_integer(color->desc().format) && (!finite_within(clear.x, 1e6f) || !finite_within(clear.y, 1e6f) || !finite_within(clear.z, 1e6f) || !finite_within(clear.w, 1e6f))) return kBad;
     if (!(clear_depth >= 0.0f && clear_depth <= 1.0f) || clear_stencil > 255) return kBad;
@@ -364,6 +396,7 @@ class Adapter::StreamRunner {
     pass.clear_stencil = (flags & kPassClearStencil) != 0;
     pass.clear_stencil_value = static_cast<uint8_t>(clear_stencil);
     for (uint32_t n = 0; n < extra_count; ++n) pass.extra_colors[n] = extras[n]->image();
+    for (uint32_t n = 0; n <= graphics::kMaxColorTargets; ++n) pass.first_layer[n] = first_layer[n], pass.layer_count[n] = layer_count[n];
     cb_->begin_render_pass(pass);
     mm_.note_gpu_write(*color);
     for (uint32_t n = 0; n < extra_count; ++n) mm_.note_gpu_write(*extras[n]);
@@ -495,13 +528,15 @@ class Adapter::StreamRunner {
     for (uint32_t u = 0; u < graphics::kMaxTextureUnits; ++u)   // (the textures the shader reads: bound, and of the kind it declared)
       if ((compute_->texture_mask() >> u & 1) && (!texture_bound_[u] || (texture_alloc_[u]->desc().samples > 1 ? graphics::TextureKind::Texture2DMS : texture_alloc_[u]->texture_kind()) != compute_->texture_kind(u)))
         return kBad;
+    if (!images_fit(*compute_)) return refuse(__LINE__);   // (the storage images it declares: bound, and of what it declared)
     if (x == 0 || y == 0 || z == 0 || !exec_) return status::kSuccess;
     const NtStatus s = ensure_cb();
     if (s != status::kSuccess) return s;
     cb_->dispatch(x, y, z);
     for (uint32_t slot = 0; slot < graphics::kMaxStorageBuffers; ++slot)
       if (uav_bound_[slot] && slot < graphics::kMaxUavBuffers) mm_.note_gpu_write(*uav_alloc_[slot]);
-    return status::kSuccess;
+    note_images_written(*compute_);
+    return write_back_images();
   }
 
   NtStatus bind_vertex_buffer(ByteReader& p) {
@@ -641,6 +676,7 @@ class Adapter::StreamRunner {
     if (pipeline_->color_target_count() > pass_target_count_) return refuse(__LINE__);
     for (uint32_t slot = 0; slot < graphics::kMaxStorageBuffers; ++slot)
       if ((pipeline_->storage_mask() >> slot & 1) && !uav_bound_[slot]) return refuse(__LINE__);   // (a buffer the shaders read must be bound)
+    if (!images_fit(*pipeline_)) return refuse(__LINE__);   // (the storage images the pixel shader declares)
     if (pipeline_->blends()) {   // (an integer target takes no blending)
       if (is_integer(pass_color_->desc().format)) return refuse(__LINE__);
       for (uint32_t n = 0; n + 1 < pass_target_count_; ++n)
@@ -721,6 +757,7 @@ class Adapter::StreamRunner {
 
   // The unordered access buffers the pipeline's pixel shader may have written are newer on the device than in the system.
   void note_storage_written() {
+    note_images_written(*pipeline_);   // (and the storage images the pixel shader declares)
     if (!pipeline_->writes_storage()) return;
     for (uint32_t slot = 0; slot < graphics::kMaxUavBuffers; ++slot)
       if ((pipeline_->storage_mask() >> slot & 1) && uav_bound_[slot]) mm_.note_gpu_write(*uav_alloc_[slot]);
@@ -1564,7 +1601,7 @@ class Adapter::StreamRunner {
     if (!exec_ || !a || !a->is_mirror()) return status::kSuccess;
     const bool read_back = may_flush && mm_.mirror_needs_read_back(*a);
     if (read_back) {
-      const NtStatus s = flush();
+      const NtStatus s = flush_keeping_state();
       if (s != status::kSuccess) return s;
     }
     return mm_.refresh_mirror(*a, read_back) ? status::kSuccess : status::kInvalidDeviceState;
@@ -1575,13 +1612,18 @@ class Adapter::StreamRunner {
     const PipelineObject* reads = bound_compute_ ? compute_ : pipeline_;
     for (uint32_t r = 0; r < rp.range_count; ++r) {
       const DescriptorRange& range = rp.ranges[r];
-      if (range.type != RangeType::Srv) continue;
+      if (range.type != RangeType::Srv && range.type != RangeType::Uav) continue;
       const uint64_t available = view_heap_->count() > first ? view_heap_->count() - first : 0;
       const uint64_t count = range.count == kUnboundedDescriptors ? (available > range.offset ? available - range.offset : 0) : range.count;
       for (uint64_t k = 0; k < count; ++k) {
         const uint64_t at = uint64_t{first} + range.offset + k;
         if (at >= view_heap_->count()) break;
         const Descriptor& d = view_heap_->at(at);
+        if (d.kind == DescriptorKind::UavTexture) {   // (an unordered access view of a plane: its mirror starts with what the plane has)
+          const NtStatus s = refresh_mirror(d.allocation.get(), true);
+          if (s != status::kSuccess) return s;
+          continue;
+        }
         if (d.kind != DescriptorKind::Srv) continue;
         const uint64_t reg = range.base_register + k;
         NtStatus s = status::kSuccess;
@@ -1604,7 +1646,7 @@ class Adapter::StreamRunner {
       write_back_[t] = nullptr;
       if (!target) continue;
       if (!flushed) {
-        const NtStatus s = flush();
+        const NtStatus s = flush_keeping_state();
         if (s != status::kSuccess) return s;
         flushed = true;
       }
@@ -1612,6 +1654,96 @@ class Adapter::StreamRunner {
     }
     return status::kSuccess;
   }
+  // After a dispatch, or a pass whose pixel shaders wrote storage images: the images that are mirrors that write back (unordered access views of planes) give their channels to their
+  // sources (what was recorded is run first).
+  NtStatus write_back_images() {
+    bool flushed = false;
+    for (Allocation*& target : image_write_back_) {
+      Allocation* a = target;
+      target = nullptr;
+      if (!a) continue;
+      if (!flushed) {
+        const NtStatus s = flush_keeping_state();
+        if (s != status::kSuccess) return s;
+        flushed = true;
+      }
+      if (!mm_.write_back_mirror(*a)) return status::kInvalidDeviceState;
+    }
+    return status::kSuccess;
+  }
+  Allocation* image_write_back_[graphics::kMaxStorageImages] = {};   // the storage images written since that are mirrors that write back
+  // Whether the image bound to storage slot `slot` is what a shader that declared it as `dim` with `ret` values may be given: a plain image (or one layer of an array) for a 1D or 2D one,
+  // an array or a plain image for an array one, a volume for a 3D one; float values for a format that is not an integer one, integers for one that is.
+  bool image_fits(uint32_t slot, D3d9Program::ImageDim dim, D3d9Program::ImageReturn ret) const {
+    if (slot >= graphics::kMaxStorageImages || !image_bound_[slot]) return false;
+    const Allocation* a = image_alloc_[slot];
+    const graphics::TextureKind kind = a->texture_kind();
+    const bool integer = is_integer(image_format_[slot]);   // (the view's format)
+    if ((ret != D3d9Program::ImageReturn::Float) != integer) return false;
+    switch (dim) {
+      case D3d9Program::ImageDim::Texture1D: case D3d9Program::ImageDim::Texture2D: return kind != graphics::TextureKind::Texture3D && image_view_[slot].layer_count == 1;
+      case D3d9Program::ImageDim::Texture1DArray: case D3d9Program::ImageDim::Texture2DArray: return kind != graphics::TextureKind::Texture3D;
+      case D3d9Program::ImageDim::Texture3D: return kind == graphics::TextureKind::Texture3D;
+      default: return false;
+    }
+  }
+  // The storage images a pipeline's shader declares: each bound and of what it declared.
+  bool images_fit(const PipelineObject& p) const {
+    for (uint32_t slot = 0; slot < graphics::kMaxStorageImages; ++slot)
+      if ((p.image_mask() >> slot & 1) && !image_fits(slot, p.image_dim(slot), p.image_return(slot))) return false;
+    return true;
+  }
+  // After a dispatch or a draw: the storage images its shader declares have newer contents on the device; those that are mirrors that write back are noted to give them back.
+  void note_images_written(const PipelineObject& p) {
+    for (uint32_t slot = 0; slot < graphics::kMaxStorageImages; ++slot) {
+      if (!(p.image_mask() >> slot & 1) || !image_bound_[slot]) continue;
+      mm_.note_gpu_write(*image_alloc_[slot]);
+      if (image_alloc_[slot]->writes_back()) image_write_back_[slot] = image_alloc_[slot];
+    }
+  }
+
+  NtStatus bind_uav_image(ByteReader& p) {
+    const uint32_t slot = p.le32(), index = p.le32(), level = p.le32(), first = p.le32(), count = p.le32();
+    const uint32_t view_format = p.ok() && !p.at_end() ? p.le32() : 0;   // (the view's format: 0 the allocation's own)
+    const uint32_t features2 = adapter_.caps_.features2;
+    if (!exact(p) || slot >= graphics::kMaxStorageImages || !(features2 & graphics::kFeature2StorageImages) || (in_pass_ && !(features2 & graphics::kFeature2StorageImagesInDraws))) return refuse(__LINE__);
+    if (index == kNoAllocation) {
+      image_bound_[slot] = false;
+      image_alloc_[slot] = nullptr;
+      if (!exec_) return status::kSuccess;
+      const NtStatus s = ensure_cb();
+      if (s != status::kSuccess) return s;
+      cb_->bind_storage_image(slot, nullptr, graphics::StorageImageView());
+      return status::kSuccess;
+    }
+    Allocation* a = alloc(index);
+    graphics::Format view = graphics::Format::Undefined;
+    if (!a || !a->is_image() || !(a->desc().flags & kAllocStorageImage) || level >= a->mip_levels() || count == 0 || first >= a->layers() || count > a->layers() - first ||
+        view_format > static_cast<uint32_t>(Format::R32Float) || !storage_view_format(a->desc().format, static_cast<Format>(view_format), &view) || !use(a, state::kUnorderedAccess))
+      return refuse(__LINE__);
+    image_bound_[slot] = true;
+    image_alloc_[slot] = a;
+    image_view_[slot] = graphics::StorageImageView{level, first, count, view};
+    image_format_[slot] = view_format ? static_cast<Format>(view_format) : a->desc().format;
+    if (!exec_) return status::kSuccess;
+    // (an unordered access view of a plane - a mirror - starts with what its source has; in a pass, with what the CPU has of it)
+    NtStatus s = refresh_mirror(a, !in_pass_);
+    if (s == status::kSuccess) s = resident(*a);
+    if (s == status::kSuccess) s = ensure_cb();
+    if (s != status::kSuccess) return s;
+    cb_->bind_storage_image(slot, a->image(), image_view_[slot]);
+    return status::kSuccess;
+  }
+
+  NtStatus lower_uav_image(uint32_t slot, Allocation* a, const graphics::StorageImageView& v, uint32_t view_format) {
+    uint32_t index = 0;
+    if (!a || !index_of(a, &index)) return refuse(__LINE__);
+    ByteBuffer packet(adapter_.allocator_);
+    for (uint32_t w : {slot, index, v.level, v.first_layer, v.layer_count, view_format}) packet.put32(w);
+    ByteReader reader(packet.view());
+    return bind_uav_image(reader);
+  }
+
   Allocation* write_back_[graphics::kMaxColorTargets] = {};   // the pass's targets that are mirrors that write back (begin_pass)
   // The image a texture view gives a shader that declares `unit` of `kind`: the view's own, or its alternate array (Descriptor::alternate) for a shader that declares an array.
   static Allocation* view_image(const Descriptor& d, graphics::TextureKind kind) {
@@ -1752,6 +1884,12 @@ class Adapter::StreamRunner {
               if (reg >= graphics::kMaxUavBuffers) return refuse(__LINE__);
               const NtStatus s = lower_uav(reg, d.allocation.get(), d.offset, d.size);
               if (s != status::kSuccess) return s;
+            } else if (range.type == RangeType::Uav && d.kind == DescriptorKind::UavTexture) {
+              // (a storage image: bound where a shader of the pipeline - the compute shader, a pixel shader in a pass - declares u<reg> a typed view of a texture)
+              const PipelineObject* reads = compute ? compute_ : pipeline_;
+              if (reg >= graphics::kMaxStorageImages || !reads || !(reads->image_mask() >> reg & 1)) continue;
+              const NtStatus s = lower_uav_image(reg, d.allocation.get(), d.image, d.view_format);
+              if (s != status::kSuccess) return s;
             } else if (range.type == RangeType::Cbv && d.kind == DescriptorKind::Cbv) {
               if (reg != 0 || constants_found) return refuse(__LINE__);
               constants_found = true;
@@ -1759,9 +1897,9 @@ class Adapter::StreamRunner {
               if (block_bytes == 0 || block_bytes > sizeof block || !use(d.allocation.get(), state::kVertexAndConstantBuffer)) return refuse(__LINE__);
               ByteView out(block, block_bytes);
               if (!out.copy_from(d.allocation->backing().subview(d.offset, block_bytes))) return refuse(__LINE__);
-            } else if (d.kind != DescriptorKind::Srv && d.kind != DescriptorKind::Uav && d.kind != DescriptorKind::Cbv) {
+            } else if (d.kind != DescriptorKind::Srv && d.kind != DescriptorKind::Uav && d.kind != DescriptorKind::Cbv && d.kind != DescriptorKind::UavTexture) {
               return refuse(__LINE__);
-            } else if ((range.type == RangeType::Srv) != (d.kind == DescriptorKind::Srv) || (range.type == RangeType::Uav) != (d.kind == DescriptorKind::Uav)) {
+            } else if ((range.type == RangeType::Srv) != (d.kind == DescriptorKind::Srv) || (range.type == RangeType::Uav) != (d.kind == DescriptorKind::Uav || d.kind == DescriptorKind::UavTexture)) {
               return refuse(__LINE__);   // (a descriptor of another kind than its range)
             }
           }
@@ -1857,6 +1995,10 @@ class Adapter::StreamRunner {
   Allocation* so_alloc_[graphics::kMaxStreamOutputBuffers] = {};
   bool uav_bound_[graphics::kMaxStorageBuffers] = {};
   Allocation* uav_alloc_[graphics::kMaxStorageBuffers] = {};
+  bool image_bound_[graphics::kMaxStorageImages] = {};
+  Allocation* image_alloc_[graphics::kMaxStorageImages] = {};
+  graphics::StorageImageView image_view_[graphics::kMaxStorageImages];
+  Format image_format_[graphics::kMaxStorageImages] = {};   // the format of each image's view
   Allocation* vertex_[graphics::kMaxVertexBuffers] = {};
   uint64_t vertex_offset_[graphics::kMaxVertexBuffers] = {};
   Allocation* index_ = nullptr;
@@ -1893,6 +2035,7 @@ Adapter::Adapter(allocators::IAllocator& allocator, graphics::IGraphicsDevice& d
   for (uint32_t i = 0; name && name[i] && i + 1 < sizeof(caps_.name); ++i) caps_.name[i] = name[i];
   caps_.sample_counts = info.sample_counts;
   caps_.blend_constant = info.blend_constant;
+  caps_.features2 = info.features2;
   caps_.device_kind = static_cast<uint32_t>(info.kind);
   // The vendor the name says (the names are those of the devices in src/Graphics/Graphics3D); the virtual GPUs have their hypervisor's.
   auto name_has = [&](const char* part) {
@@ -1997,6 +2140,7 @@ NtStatus Adapter::create_shader(const ShaderDesc& desc, SharedPointer<ShaderObje
       if (program->texture_unit_mask() >> caps_.max_texture_units) return status::kNotSupported;      // (a texture unit the device does not have)
       if (program->stage() == graphics::ShaderStage::Fragment && program->color_output_count() > caps_.max_color_targets) return status::kNotSupported;
       if (program->required_features() & ~caps_.features) return status::kNotSupported;   // (system values, texel access: the device must have them)   // (more constants than this device is given)
+      if (program->required_features2() & ~caps_.features2) return status::kNotSupported;   // (storage images, the layer output)
       // A GPU device (virgl) takes the shader as TGSI text; the others run it through the interpreter's native function. Both are given: each device uses what it understands.
       // A shader the text cannot say (see D3d9Tgsi.cpp) is still fine for the interpreter.
       const graphics::ShaderStage stage = program->stage();
@@ -2070,6 +2214,9 @@ NtStatus Adapter::create_shader(const ShaderDesc& desc, SharedPointer<ShaderObje
       shader->vertex_stores_ = program->uses_vertex_stores();
       shader->geometry_stores_ = program->uses_geometry_stores();
       shader->tessellation_stores_ = program->uses_tessellation_stores();
+      shader->image_mask_ = program->image_mask();
+      for (uint32_t u = 0; u < graphics::kMaxStorageImages; ++u) shader->image_dims_[u] = program->image_dim(u), shader->image_returns_[u] = program->image_return(u);
+      shader->writes_layer_ = program->writes_layer();
       const NtStatus b = shader->d3d9_.bind(util::move(program), &md);
       if (b != status::kSuccess && !md.tgsi) return b;
       no_functions = b;   // (out of trampolines is no matter to a device that takes the text)
@@ -2096,6 +2243,8 @@ NtStatus Adapter::create_compute_pipeline(const SharedPointer<ShaderObject>& sha
   pipeline->storage_mask_ = shader->storage_mask_;
   pipeline->texture_mask_ = shader->texture_mask_;
   for (uint32_t u = 0; u < graphics::kMaxTextureUnits; ++u) pipeline->texture_kinds_[u] = shader->texture_kind(u);
+  pipeline->image_mask_ = shader->image_mask_;
+  for (uint32_t u = 0; u < graphics::kMaxStorageImages; ++u) pipeline->image_dims_[u] = shader->image_dims_[u], pipeline->image_returns_[u] = shader->image_returns_[u];
   pipeline->vertex_ = shader;   // (kept alive for as long as the pipeline is)
   *out = pipeline;
   return status::kSuccess;
@@ -2190,7 +2339,7 @@ NtStatus Adapter::create_pipeline(const PipelineDesc& d, const SharedPointer<Sha
   for (uint32_t i = 0; i < d.attribute_count; ++i) pd.attributes[i] = d.attributes[i];
   pd.varying_count = d.varying_count;
   pd.texture_count = texture_count;
-  pd.fragment_stores = fragment->fragment_stores_;
+  pd.fragment_stores = fragment->fragment_stores_ || fragment->image_mask_ != 0;   // (a pixel shader that writes images runs for every fragment too)
   pd.vertex_stores = vertex->vertex_stores_;
   pd.geometry_stores = geometry && geometry->geometry_stores_;
   pd.tessellation_stores = (hull && hull->tessellation_stores_) || (domain && domain->tessellation_stores_);
@@ -2243,6 +2392,8 @@ NtStatus Adapter::create_pipeline(const PipelineDesc& d, const SharedPointer<Sha
   }
   pipeline->color_target_count_ = d.color_target_count;
   pipeline->fragment_stores_ = fragment->fragment_stores_;
+  pipeline->image_mask_ = fragment->image_mask_;
+  for (uint32_t u = 0; u < graphics::kMaxStorageImages; ++u) pipeline->image_dims_[u] = fragment->image_dims_[u], pipeline->image_returns_[u] = fragment->image_returns_[u];
   pipeline->vertex_stores_ = vertex->vertex_stores_;
   pipeline->geometry_stores_ = geometry && geometry->geometry_stores_;
   pipeline->tessellation_stores_ = (hull && hull->tessellation_stores_) || (domain && domain->tessellation_stores_);

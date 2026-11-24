@@ -79,7 +79,27 @@ static BOOL format_is_typeless(DXGI_FORMAT f) {
 }
 /* What a format may be used for here: textures (volumes, arrays and cubes of the formats the kernel keeps in 32 bits a texel or in blocks), render targets and depth
  * buffers, buffers, vertex and index data. No typed unordered access views (the kernel has none) and no mipmaps made by GenerateMips of a render target's format. */
+/* Unordered access to textures of the format, as Direct3D 12 below has it (the kernel's storage images: typed loads and stores, the atomics of R32_UINT / R32_SINT):
+ * for a format kept as it is and the planar ones - a format kept wider is not the program's texels to a shader that writes them. D3D11's bits are D3D12's. */
+static void dev_uav_support(Dev *d, DXGI_FORMAT format, UINT *support1, UINT *support2) {
+  const TexFormat *f = tex_format(format);
+  if (!f || (!(f->flags & FMT_PLANAR) && (f->channels || f->packed || (f->flags & (FMT_DEPTH | FMT_BLOCK))))) return;
+  D3D12_FEATURE_DATA_FORMAT_SUPPORT s = {format, D3D12_FORMAT_SUPPORT1_NONE, D3D12_FORMAT_SUPPORT2_NONE};
+  if (FAILED(ID3D12Device_CheckFeatureSupport(d->d12, D3D12_FEATURE_FORMAT_SUPPORT, &s, sizeof s))) return;
+  if (support1) *support1 |= s.Support1 & D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW;
+  if (support2)
+    *support2 |= s.Support2 & (D3D12_FORMAT_SUPPORT2_UAV_ATOMIC_ADD | D3D12_FORMAT_SUPPORT2_UAV_ATOMIC_BITWISE_OPS | D3D12_FORMAT_SUPPORT2_UAV_ATOMIC_COMPARE_STORE_OR_COMPARE_EXCHANGE |
+                               D3D12_FORMAT_SUPPORT2_UAV_ATOMIC_EXCHANGE | D3D12_FORMAT_SUPPORT2_UAV_ATOMIC_SIGNED_MIN_OR_MAX | D3D12_FORMAT_SUPPORT2_UAV_ATOMIC_UNSIGNED_MIN_OR_MAX |
+                               D3D12_FORMAT_SUPPORT2_UAV_TYPED_LOAD | D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE);
+}
+
+static HRESULT dev_check_format(Dev *d, DXGI_FORMAT format, UINT *support);
 static HRESULT STDMETHODCALLTYPE dev_CheckFormatSupport(Dev *d, DXGI_FORMAT format, UINT *support) {
+  const HRESULT hr = dev_check_format(d, format, support);
+  if (SUCCEEDED(hr) && support && *support) dev_uav_support(d, format, support, NULL);
+  return hr;
+}
+static HRESULT dev_check_format(Dev *d, DXGI_FORMAT format, UINT *support) {
   int convert;
   if (!support) return E_INVALIDARG;
   *support = 0;
@@ -157,12 +177,14 @@ static HRESULT STDMETHODCALLTYPE dev_CheckFeatureSupport(Dev *d, D3D11_FEATURE f
       return dev_CheckFormatSupport(d, f->InFormat, &f->OutFormatSupport);
     }
     case D3D11_FEATURE_FORMAT_SUPPORT2: {
-      /* (no unordered access to textures, typed loads, atomics, tiled or shareable-only formats: none of the second set, for a format the device knows) */
+      /* (unordered access to textures: typed loads and stores, the atomics of R32_UINT and R32_SINT; no tiled or shareable-only formats) */
       FEATURE_SIZE(D3D11_FEATURE_DATA_FORMAT_SUPPORT2);
       D3D11_FEATURE_DATA_FORMAT_SUPPORT2 *f = data;
       UINT first = 0;
       f->OutFormatSupport2 = 0;
-      return dev_CheckFormatSupport(d, f->InFormat, &first);
+      const HRESULT hr = dev_CheckFormatSupport(d, f->InFormat, &first);
+      if (SUCCEEDED(hr)) dev_uav_support(d, f->InFormat, NULL, &f->OutFormatSupport2);
+      return hr;
     }
     case D3D11_FEATURE_D3D11_OPTIONS: {
       FEATURE_SIZE(D3D11_FEATURE_DATA_D3D11_OPTIONS);

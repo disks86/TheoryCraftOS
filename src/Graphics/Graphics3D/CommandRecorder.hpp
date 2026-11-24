@@ -29,7 +29,7 @@ namespace graphics {
 struct RecordedCommand {
   enum class Type : uint8_t {
     BeginRenderPass, BindPipeline, BindVertexBuffer, BindIndexBuffer, PushConstants, BindTexture, SetViewport, SetScissor,
-    Draw, DrawIndexed, EndRenderPass, SetTopology, BeginQuery, EndQuery, BindComputePipeline, BindStorageBuffer, Dispatch, Resolve, SetPatchPoints, BindStreamOutput,
+    Draw, DrawIndexed, EndRenderPass, SetTopology, BeginQuery, EndQuery, BindComputePipeline, BindStorageBuffer, Dispatch, Resolve, SetPatchPoints, BindStreamOutput, BindStorageImage,
   };
   Type type = Type::Draw;
   RenderPassBegin pass;
@@ -48,6 +48,7 @@ struct RecordedCommand {
   IImage* image = nullptr;
   IImage* image2 = nullptr;   // Resolve: the source (image is the destination)
   SamplerDesc sampler;
+  StorageImageView storage_view;   // BindStorageImage (the slot in `unit`, the image in `image`)
 };
 
 class CommandRecorder : public ICommandBuffer {
@@ -200,6 +201,18 @@ class CommandRecorder : public ICommandBuffer {
     c.buffer = buffer;
     c.offset = offset;
     c.count = static_cast<uint32_t>(size > 0xFFFFFFFFu ? 0xFFFFFFFFu : size);
+    add(c);
+  }
+  void bind_storage_image(uint32_t slot, IImage* image, const StorageImageView& view) override {
+    if (slot >= kMaxStorageImages) {
+      ok_ = false;
+      return;
+    }
+    RecordedCommand c;
+    c.type = RecordedCommand::Type::BindStorageImage;
+    c.unit = slot;
+    c.image = image;
+    c.storage_view = view;
     add(c);
   }
   void dispatch(uint32_t groups_x, uint32_t groups_y, uint32_t groups_z) override {

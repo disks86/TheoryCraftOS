@@ -221,6 +221,9 @@ class VirglImage final : public IImage {
       case Format::R8G8B8A8Uint: color_format_ = virgl::kFormatR8G8B8A8Uint; break;
       case Format::R16G16B16A16Snorm: color_format_ = virgl::kFormatR16G16B16A16Snorm; break;
       case Format::R10G10B10A2Unorm: color_format_ = virgl::kFormatR10G10B10A2Unorm; break;
+      case Format::R32Uint: color_format_ = virgl::kFormatR32Uint; break;
+      case Format::R32Sint: color_format_ = virgl::kFormatR32Sint; break;
+      case Format::R32Float: color_format_ = virgl::kFormatR32Float; break;
       case Format::B8G8R8A8Srgb: case Format::R8G8B8A8Srgb: color_format_ = virgl::kFormatB8G8R8A8Srgb; break;
       case Format::Bc1Unorm: color_format_ = virgl::kFormatDxt1Rgba; break;
       case Format::Bc2Unorm: color_format_ = virgl::kFormatDxt3Rgba; break;
@@ -228,8 +231,12 @@ class VirglImage final : public IImage {
       case Format::Bc1Srgb: color_format_ = virgl::kFormatDxt1Srgba; break;
       case Format::Bc2Srgb: color_format_ = virgl::kFormatDxt3Srgba; break;
       case Format::Bc3Srgb: color_format_ = virgl::kFormatDxt5Srgba; break;
-      // (R8G8B8A8Unorm too is a BGRA image on the host: pixels go in and come out as 0xAARRGGBB words whatever the format's memory order, and a shader sees colours, not bytes)
-      default: color_format_ = virgl::kFormatB8G8R8A8Unorm; break;
+      // (R8G8B8A8Unorm too is a BGRA image on the host: pixels go in and come out as 0xAARRGGBB words whatever the format's memory order, and a shader sees colours, not bytes.
+      // A storage image is an RGBA one - the host's image units have no BGRA format -, its pixels' red and blue swapped on the way in and out)
+      default:
+        color_format_ = (desc.usage & kImageStorage) ? virgl::kFormatR8G8B8A8Unorm : virgl::kFormatB8G8R8A8Unorm;
+        swap_rb_ = (desc.usage & kImageStorage) != 0;
+        break;
     }
     const uint32_t depth_format = desc.stencil ? virgl::kFormatZ32FloatS8X24Uint : virgl::kFormatZ32Float;
     // A sampled image is stored top row first, the way write_pixels() gives it and the sampler reads it, so it does not take the Y_0_TOP flip of the images that are only
@@ -244,17 +251,15 @@ class VirglImage final : public IImage {
     ResourceCreate3d create{header(kCmdResourceCreate3d), id_, target,
                             depth ? depth_format : color_format_, bind,
                             desc.extent.width, desc.extent.height, desc.kind == TextureKind::Texture3D ? layers : 1u, desc.kind == TextureKind::Texture3D || desc.kind == TextureKind::Texture2D ? 1u : layers, desc.mip_levels - 1 /* last level */, desc.samples > 1 ? desc.samples : 0u,
-                            sampled ? 0u : kResourceFlagY0Top, 0};
+                            sampled || desc.kind != TextureKind::Texture2D ? 0u : kResourceFlagY0Top, 0};   // (the host takes the flag on 2D images alone: a layered depth buffer is kept the GL way)
     CtxResource ctx{header(kCmdCtxAttachResource), id_, 0};
     ok_ = gpu.command(as_bytes(create)) && gpu.command(as_bytes(ctx));
     accounted_ = uint64_t{desc.extent.width} * desc.extent.height * layer_count() * desc.samples * (depth ? 4u : bytes_per_pixel(desc.format));
     gpu.add_resource_bytes(accounted_);
     // The surface (a render-target view of the resource) is what the framebuffer state refers to.
     if (ok_ && (desc.usage & (kImageColorAttachment | kImageDepthAttachment))) {
-      surface_ = device.new_handle();
-      const uint32_t fmt = depth ? depth_format : color_format_;
-      const uint32_t cmd[] = {virgl::header(virgl::kCreateObject, virgl::kObjectSurface, 5), surface_, id_, fmt, 0, 0};
-      ok_ = device.send_commands(cmd, 6);
+      surface_ = surface(0, 1);
+      ok_ = surface_ != 0;
     }
     // The sampler view is what a texture unit is bound to: the whole resource, all of its levels, components in order.
     if (ok_ && sampled) {
@@ -268,7 +273,8 @@ class VirglImage final : public IImage {
   ~VirglImage() {
     hardware::VirtioGpu& gpu = device_.gpu();
     if (view_) device_.destroy_object(view_);
-    if (surface_) device_.destroy_object(surface_);
+    for (const LayerSurface& s : surfaces_)
+      if (s.handle) device_.destroy_object(s.handle);
     if (id_) {
       CtxResource detach{header(kCmdCtxDetachResource), id_, 0};
       ResourceUnref unref{header(kCmdResourceUnref), id_, 0};
@@ -281,6 +287,41 @@ class VirglImage final : public IImage {
   bool valid() const { return ok_; }
   uint32_t id() const { return id_; }
   uint32_t surface() const { return surface_; }
+  // The host's surface of layers first .. first + count - 1 (a layered one draws into the layer gl_Layer names, from the first), made on first use; 0 if the host refuses it.
+  uint32_t surface(uint32_t first, uint32_t count) {
+    for (const LayerSurface& s : surfaces_)
+      if (s.handle && s.first == first && s.count == count) return s.handle;
+    LayerSurface* free = nullptr;
+    for (LayerSurface& s : surfaces_)
+      if (!s.handle) { free = &s; break; }
+    if (!free || count == 0 || first + count > layer_count()) return 0;
+    const uint32_t handle = device_.new_handle();
+    const uint32_t fmt = desc_.format == Format::D32Float ? (desc_.stencil ? virgl::kFormatZ32FloatS8X24Uint : virgl::kFormatZ32Float) : color_format_;
+    const uint32_t cmd[] = {virgl::header(virgl::kCreateObject, virgl::kObjectSurface, 5), handle, id_, fmt, 0 /* level */, first | ((first + count - 1) << 16)};
+    if (!device_.send_commands(cmd, 6)) return 0;
+    *free = LayerSurface{first, count, handle};
+    return handle;
+  }
+  // The format a storage image is bound with (and what its shaders' IMGFMT<n> is): the image's own, or the view's of the same pixel size.
+  uint32_t image_format(Format view) const { return view == Format::Undefined || view == desc_.format ? color_format_ : host_format(view); }
+  static uint32_t host_format(Format f) {
+    switch (f) {
+      case Format::R32G32B32A32Float: return virgl::kFormatR32G32B32A32Float;
+      case Format::R16G16B16A16Float: return virgl::kFormatR16G16B16A16Float;
+      case Format::R16G16B16A16Unorm: return virgl::kFormatR16G16B16A16Unorm;
+      case Format::R32G32B32A32Uint: return virgl::kFormatR32G32B32A32Uint;
+      case Format::R32G32B32A32Sint: return virgl::kFormatR32G32B32A32Sint;
+      case Format::R16G16B16A16Uint: return virgl::kFormatR16G16B16A16Uint;
+      case Format::R16G16B16A16Sint: return virgl::kFormatR16G16B16A16Sint;
+      case Format::R8G8B8A8Uint: return virgl::kFormatR8G8B8A8Uint;
+      case Format::R16G16B16A16Snorm: return virgl::kFormatR16G16B16A16Snorm;
+      case Format::R10G10B10A2Unorm: return virgl::kFormatR10G10B10A2Unorm;
+      case Format::R32Uint: return virgl::kFormatR32Uint;
+      case Format::R32Sint: return virgl::kFormatR32Sint;
+      case Format::R32Float: return virgl::kFormatR32Float;
+      default: return virgl::kFormatR8G8B8A8Unorm;
+    }
+  }
   uint32_t view() const { return view_; }
   Extent2D extent() const override { return desc_.extent; }
   Format format() const override { return desc_.format; }
@@ -300,6 +341,7 @@ class VirglImage final : public IImage {
     if (level >= desc_.mip_levels || pixels.size() != count || !ensure_backing(uint64_t{desc_.extent.width} * desc_.extent.height)) return false;
     const ArrayView<uint32_t> staged = backing_.cast<uint32_t>();
     for (uint64_t i = 0; i < count; ++i) staged[i] = pixels[i];
+    swap_words(staged.first(count));
     TransferHost3d transfer{header(kCmdTransferToHost3d), {0, 0, 0, width, height, 1}, 0, id_, level, width * 4, 0};
     return device_.gpu().command(as_bytes(transfer), /*fence=*/false);
   }
@@ -320,6 +362,7 @@ class VirglImage final : public IImage {
     if (desc_.kind == TextureKind::Texture2D || layer >= layer_count() || pixels.size() != count || !ensure_backing(count)) return false;
     const ArrayView<uint32_t> staged = backing_.cast<uint32_t>();
     for (uint64_t i = 0; i < count; ++i) staged[i] = pixels[i];
+    swap_words(staged.first(count));
     TransferHost3d transfer{header(kCmdTransferToHost3d), {0, 0, layer, desc_.extent.width, desc_.extent.height, 1}, 0, id_, 0, desc_.extent.width * 4, 0};
     return device_.gpu().command(as_bytes(transfer), /*fence=*/false);
   }
@@ -339,11 +382,34 @@ class VirglImage final : public IImage {
     if (!device_.gpu().command(as_bytes(transfer))) return false;
     const ArrayView<uint32_t> pixels = backing_.cast<uint32_t>();
     for (uint64_t i = 0; i < count; ++i) out[i] = pixels[i];
+    swap_words(out.first(count));
+    return true;
+  }
+  bool read_layer_pixels_float(uint32_t layer, ArrayView<Vec4> out) override {
+    const uint64_t count = uint64_t{desc_.extent.width} * desc_.extent.height;
+    if (!is_wide_format(desc_.format) || desc_.kind == TextureKind::Texture2D || layer >= layer_count() || out.size() < count || !ensure_backing(count)) return false;
+    TransferHost3d transfer{header(kCmdTransferFromHost3d), {0, 0, layer, desc_.extent.width, desc_.extent.height, 1}, 0, id_, 0, desc_.extent.width * bytes_per_pixel(desc_.format), 0};
+    if (!device_.gpu().command(as_bytes(transfer))) return false;
+    ByteReader in{ConstByteView(backing_)};
+    for (uint64_t i = 0; i < count; ++i) out[i] = decode_wide_pixel(desc_.format, in);
+    return in.ok();
+  }
+  // A level above 0 (what a storage image's shaders wrote there): staged at the start of the backing.
+  bool read_mip_pixels(uint32_t level, ArrayView<uint32_t> out) override {
+    if (level == 0) return read_pixels(out);
+    const uint32_t width = mip_extent(desc_.extent.width, level), height = mip_extent(desc_.extent.height, level);
+    const uint64_t count = uint64_t{width} * height;
+    if (level >= desc_.mip_levels || is_wide_format(desc_.format) || out.size() < count || !ensure_backing(uint64_t{desc_.extent.width} * desc_.extent.height)) return false;
+    TransferHost3d transfer{header(kCmdTransferFromHost3d), {0, 0, 0, width, height, 1}, 0, id_, level, width * 4, 0};
+    if (!device_.gpu().command(as_bytes(transfer))) return false;
+    const ArrayView<uint32_t> pixels = backing_.cast<uint32_t>();
+    for (uint64_t i = 0; i < count; ++i) out[i] = pixels[i];
+    swap_words(out.first(count));
     return true;
   }
   // Stored with window y 0 at the top (drawn into and shown: the Y_0_TOP flag), or the way a texture is - row 0 first, window y 0 at the bottom of GL's window - which is what a
   // render target that is also sampled needs, so that the sampler reads it the way a texture is read (drawn upright by an unflipped viewport, see VirglPipeline).
-  bool y0_top() const { return !(desc_.usage & kImageSampled); }
+  bool y0_top() const { return !(desc_.usage & kImageSampled) && desc_.kind == TextureKind::Texture2D; }
 
   bool read_pixels(ArrayView<uint32_t> out) override {
     const uint64_t count = uint64_t{desc_.extent.width} * desc_.extent.height;
@@ -356,6 +422,7 @@ class VirglImage final : public IImage {
     if (!gpu.command(as_bytes(transfer))) return false;
     const ArrayView<uint32_t> pixels = backing_.cast<uint32_t>();
     for (uint64_t i = 0; i < count; ++i) out[i] = pixels[i];
+    swap_words(out.first(count));
     return true;
   }
 
@@ -387,6 +454,7 @@ class VirglImage final : public IImage {
     if (!ensure_backing(count)) return false;
     const ArrayView<uint32_t> staged = backing_.cast<uint32_t>();
     for (uint64_t i = 0; i < count; ++i) staged[i] = pixels[i];
+    swap_words(staged.first(count));
     TransferHost3d transfer{header(kCmdTransferToHost3d), {0, 0, 0, desc_.extent.width, desc_.extent.height, 1}, 0, id_, 0, desc_.extent.width * 4, 0};
     return device_.gpu().command(as_bytes(transfer), /*fence=*/false);
   }
@@ -400,7 +468,7 @@ class VirglImage final : public IImage {
     if (!ensure_backing(uint64_t{e.width} * e.height)) return false;
     const ArrayView<uint32_t> staged = backing_.cast<uint32_t>();
     for (uint32_t j = 0; j < area.height; ++j)
-      for (uint32_t i = 0; i < area.width; ++i) staged[uint64_t{static_cast<uint32_t>(area.y) + j} * e.width + static_cast<uint32_t>(area.x) + i] = pixels[uint64_t{j} * pitch + i];
+      for (uint32_t i = 0; i < area.width; ++i) staged[uint64_t{static_cast<uint32_t>(area.y) + j} * e.width + static_cast<uint32_t>(area.x) + i] = swap_word(pixels[uint64_t{j} * pitch + i]);
     const uint64_t offset = (uint64_t{static_cast<uint32_t>(area.y)} * e.width + static_cast<uint32_t>(area.x)) * 4;
     TransferHost3d transfer{header(kCmdTransferToHost3d), {static_cast<uint32_t>(area.x), static_cast<uint32_t>(area.y), 0, area.width, area.height, 1}, offset, id_, 0, e.width * 4, 0};
     return device_.gpu().command(as_bytes(transfer), /*fence=*/false);
@@ -423,6 +491,18 @@ class VirglImage final : public IImage {
     return true;
   }
 
+  // (a storage image of 8-bit colour is RGBA on the host: the 0xAARRGGBB words it is written and read in have red and blue turned around)
+  uint32_t swap_word(uint32_t w) const { return swap_rb_ ? (w & 0xFF00FF00u) | ((w & 0xFF) << 16) | ((w >> 16) & 0xFF) : w; }
+  void swap_words(ArrayView<uint32_t> words) const {
+    if (!swap_rb_) return;
+    for (uint32_t& w : words) w = swap_word(w);
+  }
+  struct LayerSurface {
+    uint32_t first = 0, count = 0, handle = 0;
+  };
+  static constexpr uint32_t kLayerSurfaces = 8;   // (the layer ranges render target views name: a few per image)
+  LayerSurface surfaces_[kLayerSurfaces];
+  bool swap_rb_ = false;
   VirglDevice& device_;
   ImageDesc desc_;
   uint32_t id_ = 0, surface_ = 0, view_ = 0, color_format_ = 0;
@@ -441,6 +521,14 @@ class VirglShaderModule final : public IShaderModule {
     for (uint32_t k = 0; k < 3; ++k) thread_group_[k] = desc.thread_group[k];
     streams_ = desc.geometry_streams;
     output_topology_ = desc.geometry_output;
+    desc_ = desc;
+    // A shader with storage images names their formats IMGFMT<n> (ShaderModuleDesc::tgsi): the host's shader is made for the formats of the images a dispatch or draw binds
+    // (variant), not now.
+    if (find(desc.tgsi, "IMGFMT") >= 0 && (desc.stage == ShaderStage::Compute || desc.stage == ShaderStage::Fragment)) {
+      has_images_ = true;
+      ok_ = true;
+      return;
+    }
     handle_ = device.new_handle();
     const uint32_t length = string_length(desc.tgsi) + 1;  // with the terminating NUL
     // A long text goes in pieces (the host's continuation packets: the first says the whole length, each one after it its offset with bit 31 set), each a command of its own with
@@ -485,6 +573,47 @@ class VirglShaderModule final : public IShaderModule {
   ShaderStage stage() const override { return stage_; }
   uint32_t handle() const { return handle_; }
   const char* tgsi() const { return tgsi_; }   // (the text the kernel keeps for the module's life)
+  bool has_images() const { return has_images_; }
+  // The host's shader for storage images of the formats `formats` (VIRGL_FORMAT_*, by slot): IMGFMT<n> made the name of slot n's format; made on first use and kept with the
+  // module (kVariants of them; the oldest goes when there is no room). 0 when the host refuses it.
+  uint32_t variant(VirglDevice& device, const uint32_t (&formats)[kMaxStorageImages]) const {
+    for (const Variant& v : variants_)
+      if (v.handle && __builtin_memcmp(v.formats, formats, sizeof formats) == 0) return v.handle;
+    const uint32_t length = string_length(tgsi_);
+    // (each IMGFMT<n> - seven characters - becomes a format's name, at most 32)
+    uint32_t marks = 0;
+    for (const char* p = tgsi_; (p = next_mark(p)) != nullptr; p += 6) ++marks;
+    const uint64_t capacity = uint64_t{length} + uint64_t{marks} * 32 + 1;
+    char* text = static_cast<char*>(device.gpu().allocator().allocate(capacity));
+    if (!text) return 0;
+    uint64_t n = 0;
+    for (const char* p = tgsi_; *p;) {
+      if (p[0] == 'I' && next_mark(p) == p && p[6] >= '0' && p[6] < '0' + static_cast<char>(kMaxStorageImages)) {
+        const char* name = format_name(formats[p[6] - '0']);
+        for (const char* c = name; *c && n + 1 < capacity; ++c) text[n++] = *c;
+        p += 7;
+        continue;
+      }
+      if (n + 1 < capacity) text[n++] = *p;
+      ++p;
+    }
+    text[n] = 0;
+    ShaderModuleDesc made = desc_;
+    made.tgsi = text;
+    VirglShaderModule module(device, made);
+    device.gpu().allocator().deallocate(text);
+    if (!module.valid() || !module.handle()) return 0;
+    Variant& slot = variants_[next_variant_];
+    next_variant_ = (next_variant_ + 1) % kVariants;
+    if (slot.handle) device.destroy_object(slot.handle);
+    slot.handle = module.handle();
+    for (uint32_t k = 0; k < kMaxStorageImages; ++k) slot.formats[k] = formats[k];
+    return slot.handle;
+  }
+  void destroy_variants(VirglDevice& device) const {
+    for (Variant& v : variants_)
+      if (v.handle) device.destroy_object(v.handle), v.handle = 0;
+  }
   uint32_t streams() const { return streams_; }
   GeometryTopology output_topology() const { return output_topology_; }
   uint32_t capture_vertices() const { return capture_vertices_; }   // (a geometry shader: the vertices of a primitive it captures)
@@ -493,6 +622,47 @@ class VirglShaderModule final : public IShaderModule {
   uint32_t thread_group(uint32_t axis) const { return thread_group_[axis]; }
 
  private:
+  // The place of `what` in `text` (-1: none).
+  static int64_t find(const char* text, const char* what) {
+    for (int64_t i = 0; text[i]; ++i) {
+      int64_t k = 0;
+      while (what[k] && text[i + k] == what[k]) ++k;
+      if (!what[k]) return i;
+    }
+    return -1;
+  }
+  static const char* next_mark(const char* p) {
+    const int64_t at = find(p, "IMGFMT");
+    return at < 0 ? nullptr : p + at;
+  }
+  // The TGSI name of a storage image's format (Gallium's util_format names, which the host's parser takes).
+  static const char* format_name(uint32_t format) {
+    switch (format) {
+      case virgl::kFormatR32G32B32A32Float: return "PIPE_FORMAT_R32G32B32A32_FLOAT";
+      case virgl::kFormatR16G16B16A16Float: return "PIPE_FORMAT_R16G16B16A16_FLOAT";
+      case virgl::kFormatR16G16B16A16Unorm: return "PIPE_FORMAT_R16G16B16A16_UNORM";
+      case virgl::kFormatR16G16B16A16Snorm: return "PIPE_FORMAT_R16G16B16A16_SNORM";
+      case virgl::kFormatR32G32B32A32Uint: return "PIPE_FORMAT_R32G32B32A32_UINT";
+      case virgl::kFormatR32G32B32A32Sint: return "PIPE_FORMAT_R32G32B32A32_SINT";
+      case virgl::kFormatR16G16B16A16Uint: return "PIPE_FORMAT_R16G16B16A16_UINT";
+      case virgl::kFormatR16G16B16A16Sint: return "PIPE_FORMAT_R16G16B16A16_SINT";
+      case virgl::kFormatR8G8B8A8Uint: return "PIPE_FORMAT_R8G8B8A8_UINT";
+      case virgl::kFormatR10G10B10A2Unorm: return "PIPE_FORMAT_R10G10B10A2_UNORM";
+      case virgl::kFormatR32Uint: return "PIPE_FORMAT_R32_UINT";
+      case virgl::kFormatR32Sint: return "PIPE_FORMAT_R32_SINT";
+      case virgl::kFormatR32Float: return "PIPE_FORMAT_R32_FLOAT";
+      default: return "PIPE_FORMAT_R8G8B8A8_UNORM";
+    }
+  }
+  struct Variant {
+    uint32_t formats[kMaxStorageImages] = {};
+    uint32_t handle = 0;
+  };
+  static constexpr uint32_t kVariants = 4;
+  mutable Variant variants_[kVariants];
+  mutable uint32_t next_variant_ = 0;
+  bool has_images_ = false;
+  ShaderModuleDesc desc_;
   uint32_t thread_group_[3] = {1, 1, 1};
   ShaderStage stage_;
   const char* tgsi_ = nullptr;
@@ -529,14 +699,16 @@ class VirglPipelineBase : public IPipeline {
 
 class VirglComputePipeline final : public VirglPipelineBase {
  public:
-  explicit VirglComputePipeline(const VirglShaderModule& shader) : VirglPipelineBase(true), shader_(shader.handle()) {
+  explicit VirglComputePipeline(const VirglShaderModule& shader) : VirglPipelineBase(true), shader_(shader.handle()), module_(&shader) {
     for (uint32_t k = 0; k < 3; ++k) group_[k] = shader.thread_group(k);
   }
   uint32_t shader() const { return shader_; }
+  const VirglShaderModule* module() const { return module_; }   // (whose storage images' formats pick the host's shader: VirglShaderModule::variant)
   uint32_t group(uint32_t axis) const { return group_[axis]; }
 
  private:
   uint32_t shader_;
+  const VirglShaderModule* module_;
   uint32_t group_[3];
 };
 
@@ -768,6 +940,8 @@ class VirglPipeline final : public VirglPipelineBase {
   bool stencil_enabled() const { return desc_.stencil.enable; }
   uint32_t vertex_shader() const { return vs_; }
   uint32_t fragment_shader() const { return fs_; }
+  // A fragment shader with storage images: the host's shader is the module's variant for the images bound at the draw.
+  const VirglShaderModule* fragment_module() const { return static_cast<const VirglShaderModule*>(desc_.fragment_shader); }
   uint32_t geometry_shader() const { return gs_; }   // (0: none)
   uint32_t hull_shader() const { return hs_; }
   uint32_t domain_shader() const { return ds_; }
@@ -885,7 +1059,11 @@ IImage* VirglDevice::create_image(const ImageDesc& desc) {
     }
     return image;
   }
-  if (desc.mip_levels != 1 && (desc.usage != kImageSampled || desc.kind != TextureKind::Texture2D || desc.samples != 1 || desc.layers != 1 ||
+  // (a storage image: sampled too, one sample, not a cube - the host's image units take it as it is kept, row 0 first)
+  if ((desc.usage & kImageStorage) && (!(desc.usage & kImageSampled) || desc.samples != 1 || desc.kind == TextureKind::TextureCube || desc.format == Format::D32Float || is_srgb_format(desc.format) ||
+                                       !(info().features2 & kFeature2StorageImages)))
+    return nullptr;
+  if (desc.mip_levels != 1 && ((desc.usage & ~kImageStorage) != kImageSampled || desc.kind != TextureKind::Texture2D || desc.samples != 1 || desc.layers != 1 ||
                                (desc.format != Format::B8G8R8A8Unorm && desc.format != Format::B8G8R8A8Srgb && desc.format != Format::R8G8B8A8Unorm && desc.format != Format::R8G8B8A8Srgb)))
     return nullptr;
   if (desc.samples != 1) {
@@ -894,10 +1072,14 @@ IImage* VirglDevice::create_image(const ImageDesc& desc) {
     if ((desc.samples != 2 && desc.samples != 4) || desc.kind != TextureKind::Texture2D || (depth ? desc.usage != kImageDepthAttachment : (desc.usage & ~kImageSampled) != kImageColorAttachment) || (!depth && desc.format != Format::B8G8R8A8Unorm && desc.format != Format::R8G8B8A8Unorm)) return nullptr;
   }
   if (desc.kind != TextureKind::Texture2D) {
-    // (a volume, array or cube is only sampled: 8-bit colour, one level - an array also of a wide format, its layers staged as such: write_layer_pixels_float)
+    // (a volume, array or cube: sampled - and drawn into, or a storage image, with kFeature2LayeredTargets / StorageImages -, 8-bit colour or a wide format (its layers staged as such:
+    // write_layer_pixels_float), one level; or a depth buffer of layers, an array or a cube)
     const uint32_t layers = desc.kind == TextureKind::TextureCube ? 6 : desc.layers;
-    const bool wide_array = desc.kind == TextureKind::Texture2DArray && is_wide_format(desc.format);
-    if (desc.usage != kImageSampled || (desc.format != Format::B8G8R8A8Unorm && desc.format != Format::R8G8B8A8Unorm && !wide_array) || layers == 0 || layers > kMaxTextureLayers || (desc.kind == TextureKind::TextureCube && desc.extent.width != desc.extent.height)) return nullptr;
+    const bool depth_layers = desc.format == Format::D32Float && desc.usage == kImageDepthAttachment && desc.kind != TextureKind::Texture3D;
+    const bool colour = (desc.usage & kImageSampled) && !(desc.usage & ~(kImageSampled | kImageColorAttachment | kImageStorage)) &&
+                        (desc.format == Format::B8G8R8A8Unorm || desc.format == Format::R8G8B8A8Unorm || is_wide_format(desc.format));
+    if ((!colour && !depth_layers) || layers == 0 || layers > kMaxTextureLayers || desc.mip_levels != 1 || (desc.kind == TextureKind::TextureCube && desc.extent.width != desc.extent.height)) return nullptr;
+    if ((depth_layers || (desc.usage & kImageColorAttachment)) && !(info().features2 & kFeature2LayeredTargets)) return nullptr;
   } else if (desc.layers != 1) {
     return nullptr;
   }
@@ -926,7 +1108,8 @@ IShaderModule* VirglDevice::create_shader_module(const ShaderModuleDesc& desc) {
 }
 void VirglDevice::destroy_shader_module(IShaderModule* module) {
   auto* m = static_cast<VirglShaderModule*>(module);
-  if (m) destroy_object(m->handle());
+  if (m && m->handle()) destroy_object(m->handle());
+  if (m) m->destroy_variants(*this);
   destroy(gpu_.allocator(), m);
 }
 
@@ -996,6 +1179,32 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
   uint64_t vertex_offsets[kMaxVertexBuffers] = {};
   const VirglImage* textures[kMaxTextureUnits] = {};
   SamplerDesc samplers[kMaxTextureUnits];
+  // The storage images bound (bind_storage_image), and the host's shaders bound for them (the variants of modules that have images).
+  VirglImage* images[kMaxStorageImages] = {};
+  StorageImageView image_views[kMaxStorageImages];
+  uint32_t bound_compute_shader = 0, bound_fragment_shader = 0;
+  // The formats the images bound now are seen as (VirglShaderModule::variant); the slots with nothing bound take RGBA8.
+  auto image_formats = [&](uint32_t (&out)[kMaxStorageImages]) {
+    for (uint32_t k = 0; k < kMaxStorageImages; ++k) out[k] = images[k] ? images[k]->image_format(image_views[k].format) : virgl::kFormatR8G8B8A8Unorm;
+  };
+  // SET_SHADER_IMAGES for a stage: the slots up to the last one bound (format, access, the layers first | last << 16, the level, the resource).
+  auto emit_images = [&](uint32_t stage) {
+    uint32_t count = 0;
+    for (uint32_t k = 0; k < kMaxStorageImages; ++k)
+      if (images[k]) count = k + 1;
+    if (!count) return;
+    stream.command(virgl::kSetShaderImages, 0, 2 + 5 * count);
+    stream.put(stage);
+    stream.put(0);
+    for (uint32_t k = 0; k < count; ++k) {
+      const StorageImageView& v = image_views[k];
+      stream.put(images[k] ? images[k]->image_format(v.format) : 0);
+      stream.put(virgl::kImageAccessReadWrite);
+      stream.put(images[k] ? v.first_layer | ((v.first_layer + v.layer_count - 1) << 16) : 0);
+      stream.put(images[k] ? v.level : 0);
+      stream.put(images[k] ? images[k]->id() : 0);
+    }
+  };
   bool textures_dirty = false, compute_textures_dirty = false;
   VirglBuffer* index_buffer = nullptr;
   uint64_t index_offset = 0;
@@ -1191,11 +1400,18 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
           target_count = n + 2;
         }
         for (uint32_t n = target_count - 1; n + 1 < kMaxColorTargets; ++n) extra_colors[n] = nullptr;
+        // (the surfaces of the layers the pass draws into: a layered one takes the primitives' gl_Layer)
+        uint32_t surfaces[kMaxColorTargets + 1] = {};
+        for (uint32_t n = 0; n <= kMaxColorTargets; ++n) {
+          VirglImage* image = n == kMaxColorTargets ? depth : n == 0 ? color : n < target_count ? extra_colors[n - 1] : nullptr;
+          if (!image) continue;
+          surfaces[n] = cmd.pass.first_layer[n] == 0 && cmd.pass.layer_count[n] == 1 ? image->surface() : image->surface(cmd.pass.first_layer[n], cmd.pass.layer_count[n]);
+          if (!surfaces[n]) return false;
+        }
         stream.command(virgl::kSetFramebufferState, 0, 2 + target_count);
         stream.put(target_count);
-        stream.put(depth ? depth->surface() : 0);
-        stream.put(color->surface());
-        for (uint32_t n = 0; n + 1 < target_count; ++n) stream.put(extra_colors[n]->surface());
+        stream.put(surfaces[kMaxColorTargets]);
+        for (uint32_t n = 0; n < target_count; ++n) stream.put(surfaces[n]);
         viewport = {0, 0, static_cast<float>(e.width), static_cast<float>(e.height), 0, 1};
         scissor = {0, 0, e.width, e.height};
         emit_viewport();
@@ -1260,6 +1476,7 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
         stream.command(virgl::kBindShader, 0, 2);
         stream.put(compute->shader());
         stream.put(virgl::kShaderCompute);
+        bound_compute_shader = compute->shader();   // (0 for a shader with images: its variant goes with the dispatch)
         compute_constants_dirty = constants_dwords != 0;
         break;
       }
@@ -1280,6 +1497,17 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
         end_stream_output();   // (the draws that follow start at this binding's beginning)
         so_slot[cmd.unit] = {target, start};
         use(target);
+        break;
+      }
+      case RecordedCommand::Type::BindStorageImage: {
+        if (cmd.unit >= kMaxStorageImages) return false;
+        VirglImage* image = static_cast<VirglImage*>(cmd.image);
+        const StorageImageView& v = cmd.storage_view;
+        if (image && (!(image->usage() & kImageStorage) || v.level >= image->mip_levels() || v.layer_count == 0 || v.first_layer + v.layer_count > image->layer_count() ||
+                      !storage_view_compatible(image->format(), v.format)))
+          return false;
+        images[cmd.unit] = image;
+        image_views[cmd.unit] = v;
         break;
       }
       case RecordedCommand::Type::BindStorageBuffer:
@@ -1331,6 +1559,20 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
           stream.put(0);
           for (uint32_t k = 0; k < constants_dwords; ++k) stream.put(constants[k]);
           compute_constants_dirty = false;
+        }
+        if (compute->module()->has_images()) {
+          // (the host's shader for the formats of the images bound, and the images)
+          uint32_t formats[kMaxStorageImages];
+          image_formats(formats);
+          const uint32_t shader = compute->module()->variant(*this, formats);
+          if (!shader) return false;
+          if (shader != bound_compute_shader) {
+            stream.command(virgl::kBindShader, 0, 2);
+            stream.put(shader);
+            stream.put(virgl::kShaderCompute);
+            bound_compute_shader = shader;
+          }
+          emit_images(virgl::kShaderCompute);
         }
         stream.command(virgl::kLaunchGrid, 0, 8);
         stream.put(compute->group(0));
@@ -1414,6 +1656,7 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
         stream.command(virgl::kBindShader, 0, 2);
         stream.put(pipeline->fragment_shader());
         stream.put(virgl::kShaderFragment);
+        bound_fragment_shader = pipeline->fragment_shader();
         // (always: the host keeps a geometry shader bound, across submits too, until another bind - none, handle 0, for a pipeline without one)
         stream.command(virgl::kBindShader, 0, 2);
         stream.put(pipeline->geometry_shader());
@@ -1563,6 +1806,20 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
           stream.put(index_type == IndexType::Uint16 ? 2 : 4);
           // (the host draws from the index buffer's offset and does not look at the draw's first index: the first index is part of the offset)
           stream.put(static_cast<uint32_t>(index_offset + uint64_t{cmd.first} * (index_type == IndexType::Uint16 ? 2 : 4)));
+        }
+        if (pipeline->fragment_module()->has_images()) {
+          // (a pixel shader with storage images: its host shader for their formats, and the images)
+          uint32_t formats[kMaxStorageImages];
+          image_formats(formats);
+          const uint32_t shader = pipeline->fragment_module()->variant(*this, formats);
+          if (!shader) return false;
+          if (shader != bound_fragment_shader) {
+            stream.command(virgl::kBindShader, 0, 2);
+            stream.put(shader);
+            stream.put(virgl::kShaderFragment);
+            bound_fragment_shader = shader;
+          }
+          emit_images(virgl::kShaderFragment);
         }
         const bool patches = topology == PrimitiveTopology::PatchList;
         stream.command(virgl::kDrawVbo, 0, patches ? 14 : 12);

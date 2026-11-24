@@ -32,6 +32,8 @@ typedef struct TileBind {
  * plane of slice `first` in the integer format of the same bits (an R8_UINT / R8G8_UINT / R16_UINT / R16G16_UINT view; MIRROR_WRITE_BACK: a render target whose `channels` go
  * back to the plane after each pass). Made when a view first needs it, kept until the resource goes. */
 enum { MIRROR_INTEGER = 1, MIRROR_WRITE_BACK = 2 };      /* (kMirrorInteger, kMirrorWriteBack) */
+/* (this DLL's own: the mirror is an unordered access view's - a storage image the shaders write, not a render target - of a plane, or of a narrow texture's one image) */
+enum { MIRROR_UAV = 4 };
 typedef struct Mirror { UINT alloc, plane, first, count, array, mode, channels; } Mirror;
 
 typedef struct HeapObj {
@@ -229,7 +231,9 @@ static int plane_integer_view(const Resource *r, DXGI_FORMAT f, UINT *plane, UIN
 /* The kernel's allocation of a mirror of r (made the first time it is asked for, then the same one): 0 when the description is not one of r's planes and slices or the
  * kernel cannot make it (a device without arrays of that format, or without integer formats). */
 static UINT res_mirror(Resource *r, UINT plane, UINT first, UINT count, int array, UINT mode, UINT channels) {
-  if (!r->planes || plane >= r->planes || count == 0 || first >= r->layers || count > r->layers - first || (!array && count != 1)) return 0;
+  /* (a texture that is not planar: its one image - a narrow texture of one level and slice - as "plane 0" of its one slice) */
+  const int single = !r->planes && r->fmt && r->kind == 0 && r->mips == 1 && plane == 0 && first == 0 && count == 1 && !array;
+  if (!single && (!r->planes || plane >= r->planes || count == 0 || first >= r->layers || count > r->layers - first || (!array && count != 1))) return 0;
   EnterCriticalSection(&g_lock);
   for (UINT i = 0; i < r->mirror_count; ++i) {
     const Mirror *m = &r->mirrors[i];
@@ -245,9 +249,10 @@ static UINT res_mirror(Resource *r, UINT plane, UINT first, UINT count, int arra
     r->mirrors = grown;
     KmtAllocDesc md;
     memset(&md, 0, sizeof md);
-    md.flags = KA_TEXTURE | ((mode & MIRROR_WRITE_BACK) ? KA_RENDER_TARGET : 0);
+    md.flags = KA_TEXTURE | ((mode & MIRROR_UAV) ? KA_STORAGE_IMAGE : (mode & MIRROR_WRITE_BACK) ? KA_RENDER_TARGET : 0);
     md.format = (mode & MIRROR_INTEGER) ? plane_integer_kernel_format(r->fmt) : r->fmt->kernel;
-    planar_extent(&r->desc, r->fmt, r->layers, plane * r->layers, &md.width, &md.height);
+    if (single) md.width = format_kw(r->fmt, (UINT)r->desc.Width), md.height = r->desc.Height;
+    else planar_extent(&r->desc, r->fmt, r->layers, plane * r->layers, &md.width, &md.height);
     md.mips = md.samples = 1;
     md.kind = array ? 2 : 0;
     md.layers = array ? count : 1;
@@ -255,10 +260,10 @@ static UINT res_mirror(Resource *r, UINT plane, UINT first, UINT count, int arra
       UINT request[5 + 128];
       request[0] = ESC_SET_MIRROR;
       request[1] = alloc;
-      request[2] = mode;
+      request[2] = mode & (MIRROR_INTEGER | MIRROR_WRITE_BACK);
       request[3] = channels;
       request[4] = count;
-      for (UINT i = 0; i < count; ++i) request[5 + i] = r->plane_alloc[plane * r->layers + first + i];
+      for (UINT i = 0; i < count; ++i) request[5 + i] = single ? r->alloc : r->plane_alloc[plane * r->layers + first + i];
       if (KMT_OK(dev_escape(r->d.dev, request, 5 + count, NULL, 0))) {
         const Mirror m = {alloc, plane, first, count, (UINT)array, mode, channels};
         r->mirrors[r->mirror_count++] = m;
@@ -583,8 +588,17 @@ static HRESULT resource_make_from(Dev *dev, const D3D12_HEAP_PROPERTIES *props, 
         r->planes = 1;
       }
     }
-    if ((r->kind != 0 || r->mips > 1) && (target || want_depth || (r->kind != 0 && r->mips > 1))) { hr = DXGI_ERROR_UNSUPPORTED; goto fail; }
+    /* (the kernel's arrays, volumes and cubes have one level; render targets and depth buffers one level too, and of several slices on a device that draws into layers) */
+    if ((r->kind != 0 && r->mips > 1) || (r->mips > 1 && (target || want_depth))) { hr = DXGI_ERROR_UNSUPPORTED; goto fail; }
+    if (r->kind != 0 && (target || want_depth) && !(dev->caps.features2 & DEV_FEATURE2_LAYERED_TARGETS)) { hr = DXGI_ERROR_UNSUPPORTED; goto fail; }
+    if (r->kind == 1 && want_depth) { hr = E_INVALIDARG; goto fail; }      /* (a volume is not a depth buffer) */
+    /* (unordered access: the kernel's storage images, of a colour format that is not sRGB and one sample; a planar or narrow texture is written through mirrors of its planes
+     * - res_mirror -, so its own images are not storage images; a cube's views are of an array, which the kernel's cube is not: no unordered access to cubes) */
+    const int uav = (desc->Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) != 0;
+    if (uav && (fi->depth || fi->kernel == KF_BGRA8_SRGB || fi->kernel == KF_RGBA8_SRGB || samples > 1)) { hr = E_INVALIDARG; goto fail; }
+    if (uav && (!(dev->caps.features2 & DEV_FEATURE2_STORAGE_IMAGES) || r->kind == 3)) { hr = DXGI_ERROR_UNSUPPORTED; goto fail; }
     ad.flags = want_depth ? KA_DEPTH : (target ? (KA_RENDER_TARGET | KA_TEXTURE) : KA_TEXTURE);
+    if (uav && !r->planes && !fi->narrow) ad.flags |= KA_STORAGE_IMAGE;
     if (reserved) {
       /* (the kernel's reserved textures: 4-byte colour pixels, whole tiles, one mip level, only sampled) */
       if (fi->bytes != 4 || fi->depth || !(fi->kernel <= KF_X8B8G8R8 || fi->kernel == KF_BGRA8_SRGB || fi->kernel == KF_RGBA8_SRGB) || desc->Width % 128 || desc->Height % 128 || r->kind != 0 || target || want_depth) { hr = DXGI_ERROR_UNSUPPORTED; goto fail; }

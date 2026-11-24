@@ -232,8 +232,8 @@ static void STDMETHODCALLTYPE list_Barrier(CmdList *l, UINT32 count, const D3D12
 
 /* ---- clearing unordered access views ------------------------------------------------------------------------------------------------------------------------------ */
 /* A buffer's range (the view's elements), filled with the value: Uint writes each 32-bit word (raw and structured views) or each element of a typed view's format;
- * Float the float's bits, or the element converted to the view's format. The pattern goes through an upload buffer of the list's and a copy. The kernel has no
- * unordered access to textures, so a texture's view is not cleared. */
+ * Float the float's bits, or the element converted to the view's format. The pattern goes through an upload buffer of the list's and a copy. A texture's view the same
+ * way, into each of its layers (uav_clear_texture). */
 /* A format's channels: count, bits of each, and what they hold (0 float, 1 unorm, 2 snorm, 3 uint, 4 sint). R10G10B10A2 is the one with uneven channels. */
 typedef struct UavFormat { DXGI_FORMAT f; BYTE channels, bits, kind; } UavFormat;
 static const UavFormat g_uav_formats[] = {
@@ -319,9 +319,63 @@ static UINT uav_clear_element(DXGI_FORMAT format, const UINT u[4], const float f
   }
   return size * uf->channels;
 }
+/* A texture's view (DK_UAV_TEXTURE): the rectangles (all of the level when there are none) of its level in each of its layers, filled with the value in the view's format - the
+ * element goes through an upload buffer of the list's and a copy into the image of each layer. A view through a mirror (a plane, a narrow texture) clears the planes or the
+ * texture it shows - each slice's plane allocation - with the narrow copy that keeps the widened image's other channels; the mirror takes it from them when it is next used. */
+static void uav_clear_texture(CmdList *l, const SoftDesc *d, Resource *r, const UINT u[4], const float f[4], int floats, UINT rect_count, const D3D12_RECT *rects) {
+  BYTE element[16];
+  const UINT bytes = uav_clear_element(d->format, u, f, floats, element);
+  if (!bytes || !r->fmt) return;
+  const int mirrored = (d->offset & SRV_MIRRORS) != 0;
+  const UINT narrow = (UINT)(d->size >> 32);
+  static const DXGI_FORMAT narrow_formats[5] = {DXGI_FORMAT_UNKNOWN, DXGI_FORMAT_R8_TYPELESS, DXGI_FORMAT_R8G8_TYPELESS, DXGI_FORMAT_R16_TYPELESS, DXGI_FORMAT_R16G16_TYPELESS};
+  const FormatInfo *copy_format = narrow && narrow < 5 ? format_info(narrow_formats[narrow]) : NULL;
+  const UINT plane = mirrored ? (d->pad & 0xFF) : 0, first = mirrored ? d->pad >> 8 : d->slice;
+  UINT width = mip_extent(format_kw(r->fmt, (UINT)r->desc.Width), d->mip), height = mip_extent(r->desc.Height, d->mip);
+  if (r->planes) {
+    UINT w = (UINT)r->desc.Width, h = r->desc.Height;
+    plane_extent(r->fmt, plane, &w, &h);
+    width = w, height = h;
+  }
+  for (UINT k = 0; k <= (rect_count ? rect_count - 1 : 0); ++k) {
+    UINT x0 = 0, y0 = 0, x1 = width, y1 = height;
+    if (rect_count) {
+      const D3D12_RECT *rc = &rects[k];
+      if (rc->right <= rc->left || rc->bottom <= rc->top || rc->right <= 0 || rc->bottom <= 0) continue;
+      x0 = rc->left < 0 ? 0 : (UINT)rc->left, y0 = rc->top < 0 ? 0 : (UINT)rc->top;
+      x1 = (UINT)rc->right > width ? width : (UINT)rc->right, y1 = (UINT)rc->bottom > height ? height : (UINT)rc->bottom;
+      if (x0 >= x1 || y0 >= y1) continue;
+    }
+    const UINT64 pitch = (UINT64)(x1 - x0) * bytes, span = pitch * (y1 - y0);
+    if (span > (64u << 20)) continue;
+    const D3D12_HEAP_PROPERTIES props = {D3D12_HEAP_TYPE_UPLOAD, D3D12_CPU_PAGE_PROPERTY_UNKNOWN, D3D12_MEMORY_POOL_UNKNOWN, 1, 1};
+    const D3D12_RESOURCE_DESC bd = {D3D12_RESOURCE_DIMENSION_BUFFER, 0, span, 1, 1, 1, DXGI_FORMAT_UNKNOWN, {1, 0}, D3D12_TEXTURE_LAYOUT_ROW_MAJOR, D3D12_RESOURCE_FLAG_NONE};
+    Resource *fill = NULL;
+    if (FAILED(resource_make(l->d.dev, &props, D3D12_HEAP_FLAG_NONE, &bd, NULL, 0, 0, &fill))) return;
+    for (UINT64 at = 0; at < span; at += bytes) memcpy(fill->shadow + at, element, bytes);
+    fill->dirty = 1;
+    const int kept_ = keep(l, (IUnknown *)fill);
+    dx_Release(OBJ(fill));      /* (the list's reference keeps it until the list is reset) */
+    if (!kept_) return;
+    keep(l, (IUnknown *)r);
+    end_pass(l);
+    for (UINT layer = 0; layer < d->stride; ++layer) {
+      /* (the image of the layer: a plane's slice of its own, the texture's one image, or the view's layer of the resource's image) */
+      const UINT image = r->planes ? (first + layer < r->layers ? r->plane_alloc[plane * r->layers + first + layer] : 0) : mirrored ? r->alloc : (UINT)d->size;
+      if (!image) continue;
+      ensure_room(l, 256, 4);
+      copy_buffer_image_packet(l, 0, alloc_index(l, image), mirrored ? 0 : d->mip, r->planes || mirrored ? 0 : first + layer, x0, y0, x1 - x0, y1 - y0, alloc_index(l, fill->alloc), 0, (UINT)pitch, copy_format);
+    }
+  }
+}
+
 static void uav_clear_list(CmdList *l, D3D12_CPU_DESCRIPTOR_HANDLE cpu, ID3D12Resource *resource, const UINT u[4], const float f[4], int floats, UINT rect_count, const D3D12_RECT *rects) {
   const SoftDesc *d = desc_at(cpu);
   Resource *r = (Resource *)resource;
+  if (d && d->kind == DK_UAV_TEXTURE && d->alloc && r && r->desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER && !l->bundle) {
+    uav_clear_texture(l, d, r, u, f, floats, rect_count, rects);
+    return;
+  }
   if (!d || d->kind != DK_UAV || !d->alloc || !r || r->desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER || l->bundle) return;
   BYTE element[16];
   const UINT bytes = uav_clear_element(d->format, u, f, floats, element);

@@ -101,11 +101,16 @@ enum ImageUsage : uint32_t {
   kImageDepthAttachment = 1u << 1,
   kImagePresent = 1u << 2,  // may be shown with present()
   kImageSampled = 1u << 3,  // may be bound as a texture with bind_texture() and filled with write_pixels()
+  // May be bound with bind_storage_image() and read and written texel by texel by shaders (DeviceInfo::features2 kFeature2StorageImages): a colour image of one sample, not sRGB or
+  // block-compressed, of any kind but a cube (a level of a mipmapped 2D image, or layers of an array or a volume). Always with kImageSampled too, so that the GPU devices keep it the
+  // way a texture is kept (row 0 first).
+  kImageStorage = 1u << 4,
 };
 
 // What a sampled image is (kFeatureTextureKinds for anything but Texture2D). Texture3D has `layers` slices of depth, Texture2DArray `layers` layers, TextureCube six faces in the order
-// +X, -X, +Y, -Y, +Z, -Z (`layers` is ignored). All but Texture2D have one mip level, a colour format of 8-bit channels and no usage but kImageSampled; they are filled and read
-// layer by layer (write_layer_pixels / read_layer_pixels), each layer a 2D image of `extent`.
+// +X, -X, +Y, -Y, +Z, -Z (`layers` is ignored). All but Texture2D have one mip level and kImageSampled, and (with kFeature2LayeredTargets) may be colour or depth attachments too,
+// a pass drawing into a run of their layers (RenderPassBegin::first_layer), or storage images (kImageStorage, not a cube); they are filled and read layer by layer (write_layer_pixels /
+// read_layer_pixels, or the _float forms for the wide formats), each layer a 2D image of `extent`.
 enum class TextureKind : uint8_t { Texture2D, Texture3D, Texture2DArray, TextureCube, Texture2DMS };   // (Texture2DMS: only what a shader declares for a unit - a multisampled colour image, whose ImageDesc::kind is Texture2D, is bound to it)
 constexpr uint32_t kMaxTextureLayers = 256;
 
@@ -172,12 +177,22 @@ class IImage {
     (void)layer, (void)pixels;
     return false;
   }
+  // ... and read (a layered image a pass drew into, or a storage image shaders wrote).
+  virtual bool read_layer_pixels_float(uint32_t layer, ArrayView<Vec4> out) {
+    (void)layer, (void)out;
+    return false;
+  }
   // The number of levels the image was made with.
   virtual uint32_t mip_levels() const { return 1; }
   // The same for level `level` of a mipmapped image (mip_extent() of the extent, rows top to bottom). Level 0 is write_pixels.
   virtual bool write_mip_pixels(uint32_t level, ArrayView<const uint32_t> pixels) {
     (void)level;
     (void)pixels;
+    return false;
+  }
+  // ... and read back (a level a storage image's shaders wrote). Level 0 is read_pixels.
+  virtual bool read_mip_pixels(uint32_t level, ArrayView<uint32_t> out) {
+    (void)level, (void)out;
     return false;
   }
   // The blocks of level `level` of layer `layer` (0 for a plain texture and a volume, whose slices come one after the other) of a block-compressed image
@@ -285,6 +300,45 @@ class ITextureSet {
 struct ShaderIo {
   Vec4 position;  // clip space (vertex stage only)
   Vec4 varying[kMaxVaryings];
+  // The layer of the pass's targets the primitive goes to (SV_RenderTargetArrayIndex, kFeature2LayeredTargets): written by a geometry shader; the primitive takes its first vertex's.
+  uint32_t layer = 0;
+};
+
+// --- Storage images (DeviceInfo::features2 kFeature2StorageImages) -----------
+// The images shaders read and write texel by texel (Direct3D's unordered access views of textures, RWTexture1D / 2D / 2DArray / 3D): slots 0 .. kMaxStorageImages - 1, the u# registers a
+// shader declares as typed views of textures (a register is a storage buffer or a storage image by its declaration). A slot shows one level of the image and a run of its layers (an array's
+// layers, a volume's slices), and the format is the image's own.
+constexpr uint32_t kMaxStorageImages = 8;
+struct StorageImageView {
+  uint32_t level = 0;         // the mip level (a mipmapped 2D image; 0 for the others, which have one)
+  uint32_t first_layer = 0;   // the first layer (an array, a volume's first slice) ...
+  uint32_t layer_count = 1;   // ... and how many from it the shader sees as z = 0 .. layer_count - 1
+  // The format the shader reads and writes the texels as: the image's own (Undefined), or - for a wide image - another wide format of the same pixel size, whose values are the image's bits
+  // seen that way (the views of a typeless Direct3D resource: an R32_UINT view of an R32_FLOAT image), or R8G8B8A8Uint of an R8G8B8A8Unorm image and the other way round.
+  Format format = Format::Undefined;
+};
+// Whether a storage image of `image` may be seen as `view` (StorageImageView::format).
+constexpr bool storage_view_compatible(Format image, Format view) {
+  return view == Format::Undefined || view == image || (is_wide_format(image) && is_wide_format(view) && bytes_per_pixel(image) == bytes_per_pixel(view)) ||
+         (image == Format::R8G8B8A8Unorm && view == Format::R8G8B8A8Uint) || (image == Format::R8G8B8A8Uint && view == Format::R8G8B8A8Unorm);
+}
+enum class ImageAtomic : uint8_t { Add, And, Or, Xor, IMax, IMin, UMax, UMin, Exchange, CompareExchange };
+// What a software shader reads and writes the bound storage images through. Values travel as the textures' do: floats for the normalised and float formats (what the format keeps of a stored
+// value: clamped and rounded to its steps), the bits of the integers in the Vec4's components for the integer formats; a component the format does not have reads as 0, the alpha as 1 (the
+// integer 1 for an integer format). A texel outside the view (or a slot with nothing bound) reads as zero, and a write there is dropped.
+class IStorageImages {
+ public:
+  // The width and height of the view's level and its layers (1 for a view of one layer); false when nothing is bound.
+  virtual bool size(uint32_t slot, uint32_t* width, uint32_t* height, uint32_t* layers) const = 0;
+  virtual Vec4 load(uint32_t slot, uint32_t x, uint32_t y, uint32_t z) const = 0;
+  virtual void store(uint32_t slot, uint32_t x, uint32_t y, uint32_t z, Vec4 value) const = 0;
+  // An atomic operation on the first channel of a texel of a 32-bit integer image (Format::R32Uint, R32Sint): `old` gets the value before; CompareExchange stores `operand` where the
+  // texel equals `compare`. False (and `old` 0) outside the view, for another format, or nothing bound.
+  virtual bool atomic(uint32_t slot, uint32_t x, uint32_t y, uint32_t z, ImageAtomic op, uint32_t operand, uint32_t compare, uint32_t* old) const = 0;
+
+ protected:
+  constexpr IStorageImages() = default;
+  ~IStorageImages() = default;
 };
 
 // Software shaders. `attributes` holds the pipeline's vertex attributes by location (unset
@@ -300,12 +354,14 @@ using TexturedFragmentShaderFn = bool (*)(const Vec4* varyings, const uint8_t* c
 // (position: x and y window coordinates of the pixel's centre, z the depth, w one over the clip space w), whether the triangle faces the viewer (lines and points: true) and which
 // primitive of the draw it belongs to.
 struct VertexContext {
+  const IStorageImages* images = nullptr;   // the storage images bound (kFeature2StorageImagesInDraws)
   const ByteView* storage = nullptr;   // the storage buffers bound (kFeatureStorageInDraws): kMaxStorageBuffers views, the shader resource views of buffers in the slots after the unordered access ones
   const ITextureSet* textures = nullptr;   // the textures bound for the draw (kFeatureTexelAccess): a vertex shader reads them at a level it names (no derivatives)
   uint32_t vertex_id = 0;     // the index of the vertex (or its number in a draw without indices), before the base vertex offset is added in
   uint32_t instance_id = 0;
 };
 struct FragmentContext {
+  const IStorageImages* images = nullptr;   // ... as for the vertex shader
   const ByteView* storage = nullptr;   // ... as for the vertex shader
   bool helper = false;                 // a run made only to learn something about a neighbour (the level of detail, a derivative): it writes no buffer
   Vec4 position;
@@ -397,6 +453,7 @@ struct ComputeContext {
   ByteView buffers[kMaxStorageBuffers];
   ByteView shared[kMaxSharedMemories];   // (made by a group function for the group it runs)
   const ITextureSet* textures = nullptr;   // the textures bound for the dispatch (kFeatureTexelAccess): read at a level the shader names, texel fetches and sizes (no derivatives)
+  const IStorageImages* images = nullptr;  // the storage images bound for the dispatch (kFeature2StorageImages)
 };
 using ComputeShaderFn = void (*)(const ComputeContext& context, const uint8_t* constants);
 // A compute shader that uses group-shared memory or barriers is run a whole group at a time: the function runs all the threads of the group named by group_id (thread_id, dispatch_id and
@@ -630,6 +687,11 @@ struct RenderPassBegin {
   float clear_depth_value = 1.0f;
   bool clear_stencil = true;   // if the depth image has a stencil plane
   uint8_t clear_stencil_value = 0;
+  // The layers drawn into (kFeature2LayeredTargets: colour and depth images that are arrays, volumes or cubes): target n (0 `color`, n `extra_colors[n - 1]`, kMaxColorTargets the depth
+  // image) has the layers first_layer[n] .. first_layer[n] + layer_count[n] - 1, and a primitive goes to the one of them its ShaderIo::layer names (the first when that is not below
+  // layer_count[n]). A clear clears those layers. A 2D image has layer 0 alone.
+  uint32_t first_layer[kMaxColorTargets + 1] = {};
+  uint32_t layer_count[kMaxColorTargets + 1] = {1, 1, 1, 1, 1, 1, 1, 1, 1};
 };
 
 class ICommandBuffer {
@@ -676,6 +738,9 @@ class ICommandBuffer {
     (void)slot, (void)buffer, (void)offset, (void)size;
   }
   virtual void dispatch(uint32_t groups_x, uint32_t groups_y, uint32_t groups_z) { (void)groups_x, (void)groups_y, (void)groups_z; }
+  // Storage images (kFeature2StorageImages; inside a pass kFeature2StorageImagesInDraws, for pixel shaders): makes `view` of `image` (a kImageStorage image; nullptr unbinds) slot
+  // 0 .. kMaxStorageImages - 1 for the dispatches and draws that follow. What the shaders write is in the image after the submit. A device without the feature ignores it.
+  virtual void bind_storage_image(uint32_t slot, IImage* image, const StorageImageView& view) { (void)slot, (void)image, (void)view; }
   // Occlusion queries (kFeatureOcclusionQueries), inside a render pass: from begin to end, the fragments that pass the stencil and depth tests (and that the shader did not
   // discard) are counted - one per pixel, however many targets the pipeline writes and whatever the blending or write masks do. `slot` (below kMaxOcclusionQueries) names the result; one query is open at a time and
   // it ends before the pass does. A device without the feature ignores both.
@@ -744,6 +809,13 @@ enum DeviceFeature : uint32_t {
   kFeatureCompressedFormats = 1u << 30,   // Format::Bc1Unorm .. Bc3Srgb sampled images (any kind, mip levels): IImage::write_compressed; without it the memory manager decodes them
   kFeatureAddressModes = 1u << 31,     // AddressMode::MirrorRepeat, ClampToBorder and MirrorOnce, SamplerDesc::border
 };
+// The second word of features (DeviceInfo::features2).
+enum DeviceFeature2 : uint32_t {
+  kFeature2StorageImages = 1u << 0,         // kImageStorage images, ICommandBuffer::bind_storage_image, IStorageImages in compute shaders (ComputeContext::images)
+  kFeature2StorageImagesInDraws = 1u << 1,  // ... also bound inside passes and read and written by pixel shaders (FragmentContext::images): they run for every fragment the rasterizer makes
+  kFeature2LayeredTargets = 1u << 2,        // colour and depth attachments that are arrays, volumes or cubes (one level), RenderPassBegin::first_layer / layer_count, ShaderIo::layer from geometry shaders
+  kFeature2SingleChannelFormats = 1u << 3,  // Format::R32Uint, R32Sint, R32Float: render targets, textures and storage images (the integer ones with atomics)
+};
 
 
 struct DeviceInfo {
@@ -755,6 +827,7 @@ struct DeviceInfo {
   uint32_t sample_counts = 0;               // kFeatureMultisample: bit n set: ImageDesc::samples = n is supported
   DeviceLimits limits;                      // vertex attributes, varyings, texture units, colour targets and vertex buffers the device takes
   bool blend_constant = false;              // with kFeatureBlendState: the BlendFactor Constant* factors and BlendState::constant
+  uint32_t features2 = 0;                   // DeviceFeature2 bits
 };
 
 class IGraphicsDevice {

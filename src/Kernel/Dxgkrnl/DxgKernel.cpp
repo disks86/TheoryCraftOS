@@ -1209,6 +1209,21 @@ NtStatus Kernel::write_descriptor(ProcessId pid, Handle heap, uint32_t index, co
     if (!a || a->device != h->device) return status::kInvalidHandle;
     const Allocation& alloc = *a->allocation;
     const bool buffer_view = desc.kind == DescriptorKind::Srv && alloc.is_buffer();
+    if (desc.kind == DescriptorKind::UavTexture) {
+      // (a level of the image and layers it has; the image a storage image)
+      const graphics::StorageImageView& v = desc.image;
+      graphics::Format view = graphics::Format::Undefined;
+      if (!alloc.is_image() || !(alloc.desc().flags & kAllocStorageImage) || v.level >= alloc.mip_levels() || v.layer_count == 0 || v.first_layer >= alloc.layers() ||
+          v.layer_count > alloc.layers() - v.first_layer || desc.view_format > static_cast<uint32_t>(Format::R32Float) ||
+          !storage_view_format(alloc.desc().format, static_cast<Format>(desc.view_format), &view))
+        return status::kInvalidParameter;
+      d.allocation = a->allocation;
+      d.image = v;
+      d.image.format = view;
+      d.view_format = desc.view_format;
+      h->heap->at(index) = d;
+      return status::kSuccess;
+    }
     if (desc.kind == DescriptorKind::Srv ? (buffer_view ? !(alloc.desc().flags & kAllocUnorderedAccess) : (!alloc.is_image() || !(alloc.desc().flags & kAllocTexture)))
         : desc.kind == DescriptorKind::Uav ? !(alloc.desc().flags & kAllocUnorderedAccess)
                                            : !alloc.is_buffer() || alloc.is_query_result())
@@ -1391,7 +1406,7 @@ NtStatus Kernel::escape_d3d12(ProcessId pid, Handle device, uint32_t op, ByteRea
         const uint32_t filter = in.le32(), au = in.le32(), av = in.le32(), mip = in.le32(), bias = in.le32(), min_lod = in.le32(), max_lod = in.le32();
         DescriptorDesc d;
         graphics::BorderColor no_border;
-        if (!in.ok() || kind > static_cast<uint32_t>(DescriptorKind::Sampler) || filter > 1 || !decode_address_word(au, &d.sampler.address_u, &d.sampler.border) ||
+        if (!in.ok() || kind > static_cast<uint32_t>(DescriptorKind::UavTexture) || filter > 1 || !decode_address_word(au, &d.sampler.address_u, &d.sampler.border) ||
             !decode_address_word(av, &d.sampler.address_v, &no_border) || mip > 2)
           return status::kInvalidParameter;
         d.kind = static_cast<DescriptorKind>(kind);
@@ -1407,6 +1422,12 @@ NtStatus Kernel::escape_d3d12(ProcessId pid, Handle device, uint32_t op, ByteRea
         if (d.kind == DescriptorKind::Srv && size_hi == 0xFFFFFFFFu) {
           d.alternate = size_lo;
           d.size = 0;
+        }
+        // (a texture's unordered access view: the level, the first layer and the layer count)
+        if (d.kind == DescriptorKind::UavTexture) {
+          d.image.level = off_lo, d.image.first_layer = off_hi, d.image.layer_count = size_lo;
+          d.view_format = size_hi;   // (the view's format: 0, the allocation's own)
+          d.offset = d.size = 0;
         }
         const NtStatus st = write_descriptor(pid, heap, index, d);
         if (st != status::kSuccess) return st;

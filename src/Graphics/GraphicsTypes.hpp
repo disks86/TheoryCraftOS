@@ -54,13 +54,17 @@ enum class Format : uint8_t {
   R10G10B10A2Unorm,    // 32-bit packed: R in bits 0-9, G 10-19, B 20-29, A 30-31, all normalised (kFeatureSnormFormats)
   // Block-compressed (Graphics/BlockCompression.hpp): 4 x 4 pixels a block of 8 (BC1) or 16 bytes; sampled only, filled with IImage::write_compressed (kFeatureCompressedFormats).
   Bc1Unorm, Bc2Unorm, Bc3Unorm, Bc1Srgb, Bc2Srgb, Bc3Srgb,
+  // 32-bit, one channel (kFeature2SingleChannelFormats): an unsigned or signed integer, or a float. Wide formats (the pixels travel as Vec4s: (r, 0, 0, 1), the 1 an integer one for the integer
+  // formats); the integer ones are what atomic operations on storage images take.
+  R32Uint, R32Sint, R32Float,
 };
 
 constexpr bool is_float_format(Format f) { return f == Format::R16G16B16A16Float || f == Format::R32G32B32A32Float; }
 constexpr bool is_srgb_format(Format f) { return f == Format::B8G8R8A8Srgb || f == Format::R8G8B8A8Srgb; }
-constexpr bool is_integer_format(Format f) { return f == Format::R32G32B32A32Uint || f == Format::R32G32B32A32Sint || f == Format::R16G16B16A16Uint || f == Format::R16G16B16A16Sint || f == Format::R8G8B8A8Uint; }
+constexpr bool is_integer_format(Format f) { return f == Format::R32G32B32A32Uint || f == Format::R32G32B32A32Sint || f == Format::R16G16B16A16Uint || f == Format::R16G16B16A16Sint || f == Format::R8G8B8A8Uint || f == Format::R32Uint || f == Format::R32Sint; }
+constexpr bool is_single_channel_format(Format f) { return f == Format::R32Uint || f == Format::R32Sint || f == Format::R32Float; }
 // Formats whose pixels do not fit a 32-bit word: they are read and written as Vec4s (read_pixels_float / write_pixels_float) and have one mip level.
-constexpr bool is_wide_format(Format f) { return is_float_format(f) || f == Format::R16G16B16A16Unorm || f == Format::R16G16B16A16Snorm || f == Format::R10G10B10A2Unorm || is_integer_format(f); }
+constexpr bool is_wide_format(Format f) { return is_float_format(f) || f == Format::R16G16B16A16Unorm || f == Format::R16G16B16A16Snorm || f == Format::R10G10B10A2Unorm || is_integer_format(f) || f == Format::R32Float; }
 constexpr uint32_t bytes_per_pixel(Format f) {
   switch (f) {
     case Format::Undefined: return 0;
