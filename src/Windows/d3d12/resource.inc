@@ -357,14 +357,14 @@ static HRESULT resource_make(Dev *dev, const D3D12_HEAP_PROPERTIES *props, D3D12
                              Resource **out) {
   return resource_make_from(dev, props, hflags, desc, heap, heap_offset, mode, NULL, out);
 }
-/* Every pixel of an allocation `w` x `h` (`layers` of it in each of its `mips` levels) to zeros with the maximum alpha: what a narrow format's image starts as. The kernel's lock
- * of a level is that level's texels, all layers, rows exactly the level's width. */
+/* Every pixel of an allocation `w` x `h` (`layers` of it in each of its `mips` levels) to zeros with the maximum alpha (1 for an integer format: `sixteen` 2): what a narrow
+ * format's image starts as. The kernel's lock of a level is that level's texels, all layers, rows exactly the level's width. */
 static void res_fill_alpha(Dev *dev, UINT alloc, UINT w, UINT h, UINT layers, UINT mips, int sixteen) {
   for (UINT level = 0; level < mips; ++level) {
     void *data = NULL;
     if (!KMT_OK(kmt_lock(dev->kdev, alloc, level, 0, &data)) || !data) return;
     const UINT64 pixels = (UINT64)mip_extent(w, level) * mip_extent(h, level) * layers;
-    if (sixteen) { UINT16 *p = data; for (UINT64 i = 0; i < pixels; ++i) { p[4 * i] = p[4 * i + 1] = p[4 * i + 2] = 0; p[4 * i + 3] = 0xFFFF; } }
+    if (sixteen) { UINT16 *p = data; for (UINT64 i = 0; i < pixels; ++i) { p[4 * i] = p[4 * i + 1] = p[4 * i + 2] = 0; p[4 * i + 3] = sixteen == 2 ? 1 : 0xFFFF; } }
     else { UINT *p = data; for (UINT64 i = 0; i < pixels; ++i) p[i] = 0xFF000000u; }
     kmt_unlock(dev->kdev, alloc);
   }
@@ -542,7 +542,7 @@ static HRESULT resource_make_from(Dev *dev, const D3D12_HEAP_PROPERTIES *props, 
     for (UINT i = 0; i < count; ++i) {
       UINT w = (UINT)desc->Width, h = desc->Height;
       if (r->planes) plane_extent(r->fmt, i / r->layers, &w, &h);
-      res_fill_alpha(dev, r->planes ? r->plane_alloc[i] : r->alloc, w, h, r->planes ? 1 : r->layers, r->mips, r->fmt->kernel == KF_RGBA16);
+      res_fill_alpha(dev, r->planes ? r->plane_alloc[i] : r->alloc, w, h, r->planes ? 1 : r->layers, r->mips, r->fmt->kernel == KF_RGBA16 ? 1 : r->fmt->kernel == KF_RGBA16SINT ? 2 : 0);
     }
   }
   if (desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {

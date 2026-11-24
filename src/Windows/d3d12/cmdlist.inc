@@ -180,7 +180,7 @@ static const GUID *const g_list_iids[] = {&IID_ID3D12Object, &IID_ID3D12DeviceCh
 static HRESULT STDMETHODCALLTYPE dev_CreateCommandAllocator(Dev *This, D3D12_COMMAND_LIST_TYPE type, REFIID riid, void **out) {
   extern const ID3D12CommandAllocatorVtbl alloc_vtbl;
   if (type != D3D12_COMMAND_LIST_TYPE_DIRECT && type != D3D12_COMMAND_LIST_TYPE_COMPUTE && type != D3D12_COMMAND_LIST_TYPE_COPY && type != D3D12_COMMAND_LIST_TYPE_BUNDLE &&
-      type != D3D12_COMMAND_LIST_TYPE_VIDEO_DECODE && type != D3D12_COMMAND_LIST_TYPE_VIDEO_PROCESS)
+      type != D3D12_COMMAND_LIST_TYPE_VIDEO_DECODE && type != D3D12_COMMAND_LIST_TYPE_VIDEO_PROCESS && type != D3D12_COMMAND_LIST_TYPE_VIDEO_ENCODE)
     return E_INVALIDARG;
   CmdAlloc *a = dobj_new(sizeof *a, This, &alloc_vtbl, g_alloc_iids, dobj_child_destroy);
   if (!a) return E_OUTOFMEMORY;
@@ -318,7 +318,8 @@ static void list_destroy(DxObj *o) {
 static HRESULT video_list_make(Dev *This, D3D12_COMMAND_LIST_TYPE type, REFIID riid, void **out);
 static HRESULT STDMETHODCALLTYPE dev_CreateCommandList(Dev *This, UINT mask, D3D12_COMMAND_LIST_TYPE type, ID3D12CommandAllocator *allocator, ID3D12PipelineState *initial, REFIID riid, void **out) {
   extern const ID3D12GraphicsCommandList7Vtbl list_vtbl;
-  if (allocator && (type == D3D12_COMMAND_LIST_TYPE_VIDEO_DECODE || type == D3D12_COMMAND_LIST_TYPE_VIDEO_PROCESS)) return video_list_make(This, type, riid, out);
+  if (allocator && (type == D3D12_COMMAND_LIST_TYPE_VIDEO_DECODE || type == D3D12_COMMAND_LIST_TYPE_VIDEO_PROCESS || type == D3D12_COMMAND_LIST_TYPE_VIDEO_ENCODE))
+    return video_list_make(This, type, riid, out);
   if (!allocator || (type != D3D12_COMMAND_LIST_TYPE_DIRECT && type != D3D12_COMMAND_LIST_TYPE_COMPUTE && type != D3D12_COMMAND_LIST_TYPE_COPY && type != D3D12_COMMAND_LIST_TYPE_BUNDLE)) return E_INVALIDARG;
   CmdList *l = dobj_new(sizeof *l, This, &list_vtbl, g_list_iids, list_destroy);
   if (!l) return E_OUTOFMEMORY;

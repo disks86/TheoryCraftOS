@@ -60,6 +60,11 @@ SPECS = {
         ('ID3D12VideoProcessor1', 'vproc_vtbl', ['vproc', 'dobj', 'obj']),
         ('ID3D12VideoDecodeCommandList3', 'vdlist_vtbl', ['vdlist', 'vlist', 'list', 'dobj', 'obj']),
         ('ID3D12VideoProcessCommandList3', 'vplist_vtbl', ['vplist', 'vlist', 'list', 'dobj', 'obj']),
+        ('ID3D12VideoMotionEstimator', 'vme_vtbl', ['vme', 'dobj', 'obj']),
+        ('ID3D12VideoMotionVectorHeap', 'vmvh_vtbl', ['vmvh', 'dobj', 'obj']),
+        ('ID3D12VideoEncoder', 'venc_vtbl', ['venc', 'dobj', 'obj']),
+        ('ID3D12VideoEncoderHeap', 'veheap_vtbl', ['veheap', 'dobj', 'obj']),
+        ('ID3D12VideoEncodeCommandList3', 'velist_vtbl', ['velist', 'vlist', 'list', 'dobj', 'obj']),
         ('ID3D10Blob', 'blob_vtbl', ['blob', 'obj']),
     ],
     'd3d11': [

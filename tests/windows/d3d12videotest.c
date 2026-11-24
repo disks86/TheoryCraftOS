@@ -190,7 +190,7 @@ static void test_features(void) {
   if (v2) ID3D12VideoDevice2_Release(v2);
   D3D12_FEATURE_DATA_VIDEO_FEATURE_AREA_SUPPORT area = {0};
   CHECK_HR(ID3D12VideoDevice_CheckFeatureSupport(g_vdev, D3D12_FEATURE_VIDEO_FEATURE_AREA_SUPPORT, &area, sizeof area));
-  CHECK(area.VideoDecodeSupport && area.VideoProcessSupport && !area.VideoEncodeSupport);
+  CHECK(area.VideoDecodeSupport && area.VideoProcessSupport && area.VideoEncodeSupport);      /* (encoding: d3d12encodetest) */
   D3D12_FEATURE_DATA_VIDEO_DECODE_PROFILE_COUNT count = {0};
   CHECK_HR(ID3D12VideoDevice_CheckFeatureSupport(g_vdev, D3D12_FEATURE_VIDEO_DECODE_PROFILE_COUNT, &count, sizeof count));
   CHECK(count.ProfileCount == 17);      /* (H.264, MPEG-2, MPEG-1/2, VP9 0 and 2, HEVC Main and Main 10, AV1 0, VC-1 (two), MPEG-4 Part 2 (three), AV1 1, 2, 12-bit 2 and 12-bit 2 4:2:0) */
@@ -363,13 +363,16 @@ static void test_features(void) {
   hd.Format = DXGI_FORMAT_P010;      /* (HEVC Main is 8 bits) */
   heap = NULL;
   CHECK(ID3D12VideoDevice_CreateVideoDecoderHeap(g_vdev, &hd, &IID_ID3D12VideoDecoderHeap, (void **)&heap) == E_INVALIDARG && !heap);
-  /* the encoder and the motion estimator are not there */
+  /* an encoder of nothing is refused, an HEVC one is not there (tests/windows/d3d12encodetest.c tests encoding) */
   ID3D12VideoDevice3 *v3 = NULL;
   CHECK_HR(ID3D12VideoDevice_QueryInterface(g_vdev, &IID_ID3D12VideoDevice3, (void **)&v3));
   if (v3) {
     D3D12_VIDEO_ENCODER_DESC ed;
     memset(&ed, 0, sizeof ed);
     void *enc = (void *)1;
+    CHECK(ID3D12VideoDevice3_CreateVideoEncoder(v3, &ed, &IID_ID3D12VideoEncoder, &enc) == E_INVALIDARG && !enc);
+    ed.EncodeCodec = D3D12_VIDEO_ENCODER_CODEC_HEVC;
+    enc = (void *)1;
     CHECK(ID3D12VideoDevice3_CreateVideoEncoder(v3, &ed, &IID_ID3D12VideoEncoder, &enc) == DXGI_ERROR_UNSUPPORTED && !enc);
     ID3D12VideoDevice3_Release(v3);
   }

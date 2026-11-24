@@ -1081,3 +1081,204 @@ struct ID3D12VideoProcessCommandList3 {
     CONST_VTBL ID3D12VideoProcessCommandList3Vtbl* lpVtbl;
 };
 #endif
+
+/* ---- video encoding (what mingw's d3d12video.h lacks of it: the feature structures it leaves out, ID3D12VideoEncodeCommandList3), DirectX-Headers' layouts ---- */
+typedef struct D3D12_FEATURE_DATA_VIDEO_MOTION_ESTIMATOR_SIZE {
+  UINT NodeIndex; DXGI_FORMAT InputFormat; D3D12_VIDEO_MOTION_ESTIMATOR_SEARCH_BLOCK_SIZE BlockSize; D3D12_VIDEO_MOTION_ESTIMATOR_VECTOR_PRECISION Precision; D3D12_VIDEO_SIZE_RANGE SizeRange;
+  BOOL Protected; UINT64 MotionVectorHeapMemoryPoolL0Size; UINT64 MotionVectorHeapMemoryPoolL1Size; UINT64 MotionEstimatorMemoryPoolL0Size; UINT64 MotionEstimatorMemoryPoolL1Size;
+} D3D12_FEATURE_DATA_VIDEO_MOTION_ESTIMATOR_SIZE;
+typedef struct D3D12_FEATURE_DATA_VIDEO_ENCODER_PROFILE_LEVEL {
+  UINT NodeIndex; D3D12_VIDEO_ENCODER_CODEC Codec; D3D12_VIDEO_ENCODER_PROFILE_DESC Profile; BOOL IsSupported; D3D12_VIDEO_ENCODER_LEVEL_SETTING MinSupportedLevel;
+  D3D12_VIDEO_ENCODER_LEVEL_SETTING MaxSupportedLevel;
+} D3D12_FEATURE_DATA_VIDEO_ENCODER_PROFILE_LEVEL;
+typedef struct D3D12_FEATURE_DATA_VIDEO_ENCODER_OUTPUT_RESOLUTION_RATIOS_COUNT { UINT NodeIndex; D3D12_VIDEO_ENCODER_CODEC Codec; UINT ResolutionRatiosCount; } D3D12_FEATURE_DATA_VIDEO_ENCODER_OUTPUT_RESOLUTION_RATIOS_COUNT;
+typedef struct D3D12_VIDEO_ENCODER_PICTURE_RESOLUTION_RATIO_DESC { UINT WidthRatio; UINT HeightRatio; } D3D12_VIDEO_ENCODER_PICTURE_RESOLUTION_RATIO_DESC;
+typedef struct D3D12_FEATURE_DATA_VIDEO_ENCODER_OUTPUT_RESOLUTION {
+  UINT NodeIndex; D3D12_VIDEO_ENCODER_CODEC Codec; UINT ResolutionRatiosCount; BOOL IsSupported; D3D12_VIDEO_ENCODER_PICTURE_RESOLUTION_DESC MinResolutionSupported;
+  D3D12_VIDEO_ENCODER_PICTURE_RESOLUTION_DESC MaxResolutionSupported; UINT ResolutionWidthMultipleRequirement; UINT ResolutionHeightMultipleRequirement;
+  D3D12_VIDEO_ENCODER_PICTURE_RESOLUTION_RATIO_DESC *pResolutionRatios;
+} D3D12_FEATURE_DATA_VIDEO_ENCODER_OUTPUT_RESOLUTION;
+typedef struct D3D12_FEATURE_DATA_VIDEO_ENCODER_INPUT_FORMAT {
+  UINT NodeIndex; D3D12_VIDEO_ENCODER_CODEC Codec; D3D12_VIDEO_ENCODER_PROFILE_DESC Profile; DXGI_FORMAT Format; BOOL IsSupported;
+} D3D12_FEATURE_DATA_VIDEO_ENCODER_INPUT_FORMAT;
+typedef struct D3D12_FEATURE_DATA_VIDEO_ENCODER_FRAME_SUBREGION_LAYOUT_MODE {
+  UINT NodeIndex; D3D12_VIDEO_ENCODER_CODEC Codec; D3D12_VIDEO_ENCODER_PROFILE_DESC Profile; D3D12_VIDEO_ENCODER_LEVEL_SETTING Level; D3D12_VIDEO_ENCODER_FRAME_SUBREGION_LAYOUT_MODE SubregionMode;
+  BOOL IsSupported;
+} D3D12_FEATURE_DATA_VIDEO_ENCODER_FRAME_SUBREGION_LAYOUT_MODE;
+typedef struct D3D12_FEATURE_DATA_VIDEO_ENCODER_HEAP_SIZE { D3D12_VIDEO_ENCODER_HEAP_DESC HeapDesc; BOOL IsSupported; UINT64 MemoryPoolL0Size; UINT64 MemoryPoolL1Size; } D3D12_FEATURE_DATA_VIDEO_ENCODER_HEAP_SIZE;
+/* (the D3D12_VIDEO_ENCODER_SUPPORT_FLAGS of later SDKs that mingw's enumeration does not name) */
+#define D3D12_VIDEO_ENCODER_SUPPORT_FLAG_READABLE_RECONSTRUCTED_PICTURE_LAYOUT_AVAILABLE_ ((D3D12_VIDEO_ENCODER_SUPPORT_FLAGS)0x8000)
+
+#ifndef __ID3D12VideoEncodeCommandList3_INTERFACE_DEFINED__
+#define __ID3D12VideoEncodeCommandList3_INTERFACE_DEFINED__
+DEFINE_GUID(IID_ID3D12VideoEncodeCommandList3, 0x7f027b22, 0x1515, 0x4e85, 0xaa, 0x0d, 0x02, 0x64, 0x86, 0x58, 0x05, 0x76);
+typedef struct ID3D12VideoEncodeCommandList3 ID3D12VideoEncodeCommandList3;
+typedef struct ID3D12VideoEncodeCommandList3Vtbl {
+    BEGIN_INTERFACE
+
+    /*** IUnknown methods ***/
+    HRESULT (STDMETHODCALLTYPE *QueryInterface)(
+        ID3D12VideoEncodeCommandList3 *This,
+        REFIID riid,
+        void **ppvObject);
+
+    ULONG (STDMETHODCALLTYPE *AddRef)(
+        ID3D12VideoEncodeCommandList3 *This);
+
+    ULONG (STDMETHODCALLTYPE *Release)(
+        ID3D12VideoEncodeCommandList3 *This);
+
+    /*** ID3D12Object methods ***/
+    HRESULT (STDMETHODCALLTYPE *GetPrivateData)(
+        ID3D12VideoEncodeCommandList3 *This,
+        REFGUID guid,
+        UINT *data_size,
+        void *data);
+
+    HRESULT (STDMETHODCALLTYPE *SetPrivateData)(
+        ID3D12VideoEncodeCommandList3 *This,
+        REFGUID guid,
+        UINT data_size,
+        const void *data);
+
+    HRESULT (STDMETHODCALLTYPE *SetPrivateDataInterface)(
+        ID3D12VideoEncodeCommandList3 *This,
+        REFGUID guid,
+        const IUnknown *data);
+
+    HRESULT (STDMETHODCALLTYPE *SetName)(
+        ID3D12VideoEncodeCommandList3 *This,
+        const WCHAR *name);
+
+    /*** ID3D12DeviceChild methods ***/
+    HRESULT (STDMETHODCALLTYPE *GetDevice)(
+        ID3D12VideoEncodeCommandList3 *This,
+        REFIID riid,
+        void **device);
+
+    /*** ID3D12CommandList methods ***/
+    D3D12_COMMAND_LIST_TYPE (STDMETHODCALLTYPE *GetType)(
+        ID3D12VideoEncodeCommandList3 *This);
+
+    /*** ID3D12VideoEncodeCommandList methods ***/
+    HRESULT (STDMETHODCALLTYPE *Close)(
+        ID3D12VideoEncodeCommandList3 *This);
+
+    HRESULT (STDMETHODCALLTYPE *Reset)(
+        ID3D12VideoEncodeCommandList3 *This,
+        ID3D12CommandAllocator *allocator);
+
+    void (STDMETHODCALLTYPE *ClearState)(
+        ID3D12VideoEncodeCommandList3 *This);
+
+    void (STDMETHODCALLTYPE *ResourceBarrier)(
+        ID3D12VideoEncodeCommandList3 *This,
+        UINT barriers_count,
+        const D3D12_RESOURCE_BARRIER *barriers);
+
+    void (STDMETHODCALLTYPE *DiscardResource)(
+        ID3D12VideoEncodeCommandList3 *This,
+        ID3D12Resource *resource,
+        const D3D12_DISCARD_REGION *region);
+
+    void (STDMETHODCALLTYPE *BeginQuery)(
+        ID3D12VideoEncodeCommandList3 *This,
+        ID3D12QueryHeap *query_heap,
+        D3D12_QUERY_TYPE type,
+        UINT index);
+
+    void (STDMETHODCALLTYPE *EndQuery)(
+        ID3D12VideoEncodeCommandList3 *This,
+        ID3D12QueryHeap *query_heap,
+        D3D12_QUERY_TYPE type,
+        UINT index);
+
+    void (STDMETHODCALLTYPE *ResolveQueryData)(
+        ID3D12VideoEncodeCommandList3 *This,
+        ID3D12QueryHeap *query_heap,
+        D3D12_QUERY_TYPE type,
+        UINT start_index,
+        UINT queries_count,
+        ID3D12Resource *destination_buffer,
+        UINT64 aligned_destination_buffer_offset);
+
+    void (STDMETHODCALLTYPE *SetPredication)(
+        ID3D12VideoEncodeCommandList3 *This,
+        ID3D12Resource *buffer,
+        UINT64 aligned_buffer_offset,
+        D3D12_PREDICATION_OP operation);
+
+    void (STDMETHODCALLTYPE *SetMarker)(
+        ID3D12VideoEncodeCommandList3 *This,
+        UINT metadata,
+        const void *data,
+        UINT size);
+
+    void (STDMETHODCALLTYPE *BeginEvent)(
+        ID3D12VideoEncodeCommandList3 *This,
+        UINT metadata,
+        const void *data,
+        UINT size);
+
+    void (STDMETHODCALLTYPE *EndEvent)(
+        ID3D12VideoEncodeCommandList3 *This);
+
+    void (STDMETHODCALLTYPE *EstimateMotion)(
+        ID3D12VideoEncodeCommandList3 *This,
+        ID3D12VideoMotionEstimator *motion_estimator,
+        const D3D12_VIDEO_MOTION_ESTIMATOR_OUTPUT *output_arguments,
+        const D3D12_VIDEO_MOTION_ESTIMATOR_INPUT *input_arguments);
+
+    void (STDMETHODCALLTYPE *ResolveMotionVectorHeap)(
+        ID3D12VideoEncodeCommandList3 *This,
+        const D3D12_RESOLVE_VIDEO_MOTION_VECTOR_HEAP_OUTPUT *output_arguments,
+        const D3D12_RESOLVE_VIDEO_MOTION_VECTOR_HEAP_INPUT *input_arguments);
+
+    void (STDMETHODCALLTYPE *WriteBufferImmediate)(
+        ID3D12VideoEncodeCommandList3 *This,
+        UINT count,
+        const D3D12_WRITEBUFFERIMMEDIATE_PARAMETER *params,
+        const D3D12_WRITEBUFFERIMMEDIATE_MODE *modes);
+
+    void (STDMETHODCALLTYPE *SetProtectedResourceSession)(
+        ID3D12VideoEncodeCommandList3 *This,
+        ID3D12ProtectedResourceSession *protected_resource_session);
+
+    /*** ID3D12VideoEncodeCommandList1 methods ***/
+    void (STDMETHODCALLTYPE *InitializeExtensionCommand)(
+        ID3D12VideoEncodeCommandList3 *This,
+        ID3D12VideoExtensionCommand *extension_command,
+        const void *initialization_parameters,
+        SIZE_T initialization_parameters_size_in_bytes);
+
+    void (STDMETHODCALLTYPE *ExecuteExtensionCommand)(
+        ID3D12VideoEncodeCommandList3 *This,
+        ID3D12VideoExtensionCommand *extension_command,
+        const void *execution_parameters,
+        SIZE_T execution_parameters_size_in_bytes);
+
+    /*** ID3D12VideoEncodeCommandList3 methods ***/
+    void (STDMETHODCALLTYPE *EncodeFrame)(
+        ID3D12VideoEncodeCommandList3 *This,
+        ID3D12VideoEncoder *encoder,
+        ID3D12VideoEncoderHeap *heap,
+        const D3D12_VIDEO_ENCODER_ENCODEFRAME_INPUT_ARGUMENTS *input_arguments,
+        const D3D12_VIDEO_ENCODER_ENCODEFRAME_OUTPUT_ARGUMENTS *output_arguments);
+
+    void (STDMETHODCALLTYPE *ResolveEncoderOutputMetadata)(
+        ID3D12VideoEncodeCommandList3 *This,
+        const D3D12_VIDEO_ENCODER_RESOLVE_METADATA_INPUT_ARGUMENTS *input_arguments,
+        const D3D12_VIDEO_ENCODER_RESOLVE_METADATA_OUTPUT_ARGUMENTS *output_arguments);
+
+    /*** ID3D12VideoEncodeCommandList3 methods ***/
+    void (STDMETHODCALLTYPE *Barrier)(
+        ID3D12VideoEncodeCommandList3 *This,
+        UINT32 NumBarrierGroups,
+        const D3D12_BARRIER_GROUP *pBarrierGroups);
+
+    END_INTERFACE
+} ID3D12VideoEncodeCommandList3Vtbl;
+struct ID3D12VideoEncodeCommandList3 {
+    CONST_VTBL ID3D12VideoEncodeCommandList3Vtbl* lpVtbl;
+};
+#endif

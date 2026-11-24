@@ -78,6 +78,17 @@
 //                    (kNoAllocation: none), stereo format, stereo frame, stereo flip, stereo offset (signed), brightness, contrast, hue, saturation, noise reduction,
 //                    edge enhancement, anamorphic (float bits), luma_key, lower, upper (float bits), the content's light levels (4 float bits)]   (the optional part: the
 //                    VpStream values; without it every stream is progressive, unfiltered and not stereo. The references are pictures like the stream's)
+//   EstimateMotion   block (8 or 16), width, height, current_luma_index, reference_luma_index, hint_index (kNoAllocation: none), hint_offset, heap_index, heap_offset   (outside a
+//                    pass: the motion vectors of the current picture's blocks into the reference (VideoEncode.hpp run_motion_estimation; the lumas are widened planes of at least
+//                    width x height, the heaps buffers: hint is an earlier heap, heap receives motion_vector_heap_bytes); the planes kVideoEncodeRead)
+//   ResolveMotionVectors heap_index, heap_offset, width, height, image_index, x, y   (outside a pass: the heap's vectors as R16G16_SINT pixels - an A16B16G16R16Sint image of one
+//                    level, (x, y, 0, 1) - at (x, y) of the image, which is kVideoEncodeWrite)
+//   EncodeFrame      args_index, args_offset, args_bytes, heap_index (kNoAllocation: none), heap_offset, input_luma, input_chroma, recon_luma, recon_chroma (kNoAllocation:
+//                    none), bitstream_index, bitstream_offset, metadata_index, metadata_offset, reference_count, then per reference its luma and chroma indices   (outside a
+//                    pass: codes one picture as VideoEncode.hpp says - the arguments are the args range, the heap holds kVideoEncodeHeapBytes of state; the input and references
+//                    kVideoEncodeRead, the reconstruction, bitstream and metadata kVideoEncodeWrite. A picture that cannot be coded is said so in the metadata)
+//   ResolveEncoderMetadata metadata_index, metadata_offset, out_index, out_offset   (outside a pass: EncodeFrame's metadata as D3D12_VIDEO_ENCODER_OUTPUT_METADATA and its slice
+//                    records into the buffer `out`, kVideoEncodeWrite)
 //   EndQuery         (the count of fragments that passed the depth and stencil tests since BeginQuery is written there - a little-endian 64-bit number - once the stream has run)
 #pragma once
 #include "Kernel/Dxgkrnl/DxgTypes.hpp"
@@ -119,6 +130,10 @@ enum class Op : uint16_t {
   CopyBufferImage,
   DecodeFrame,
   VideoProcess,
+  EstimateMotion,
+  ResolveMotionVectors,
+  EncodeFrame,
+  ResolveEncoderMetadata,
 };
 constexpr uint32_t kVideoProcessStreamWords = 15;
 constexpr uint32_t kVideoProcessExtension = 0x31585056;   // 'VPX1': VideoProcess's optional part follows
