@@ -69,6 +69,7 @@ static const FormatInfo g_formats[] = {
     {DXGI_FORMAT_R8G8_TYPELESS, KF_A8B8G8R8, 2, 0, 0, NARROW_R8G8}, {DXGI_FORMAT_R8G8_UNORM, KF_A8B8G8R8, 2, 0, 0, NARROW_R8G8},
     {DXGI_FORMAT_R16_TYPELESS, KF_RGBA16, 2, 0, 0, NARROW_R16}, {DXGI_FORMAT_R16_UNORM, KF_RGBA16, 2, 0, 0, NARROW_R16},
     {DXGI_FORMAT_R16G16_TYPELESS, KF_RGBA16, 4, 0, 0, NARROW_R16G16}, {DXGI_FORMAT_R16G16_UNORM, KF_RGBA16, 4, 0, 0, NARROW_R16G16},
+    {DXGI_FORMAT_R16G16_SINT, KF_RGBA16SINT, 4, 0, 0, NARROW_R16G16},      /* (the motion vectors ResolveMotionVectorHeap writes: kept as (x, y, 0, 1)) */
     {DXGI_FORMAT_NV12, KF_A8B8G8R8, 1, 0, 0, NARROW_R8, PLANAR_8}, {DXGI_FORMAT_P010, KF_RGBA16, 2, 0, 0, NARROW_R16, PLANAR_16}, {DXGI_FORMAT_P016, KF_RGBA16, 2, 0, 0, NARROW_R16, PLANAR_16},
 };
 /* The bytes of a row of a level `w` pixels wide (of blocks for a compressed format), and the rows of a level `h` high. */

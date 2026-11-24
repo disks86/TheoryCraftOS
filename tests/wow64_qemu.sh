@@ -27,14 +27,14 @@
 # autorun. Needs i686-w64-mingw32-gcc.
 #   share32  tests/windows/d3dsharetest.c: Direct3D shared handles - resources, heaps and fences between two devices and with a second process that inherits the
 #            handles, and gdi32's D3DKMT sharing functions with a 32-bit program's structures.
-# Usage: tests/wow64_qemu.sh [hello32] [crt32] [seh32] [gui32] [lib32] [old32] [dx32] [d3d11test] [d3d9test] [com32] [com64] [xml32] [cab32] [cab64] [share32] [d3d12videotest] [d3d11videotest]      (no arguments: all)
+# Usage: tests/wow64_qemu.sh [hello32] [crt32] [seh32] [gui32] [lib32] [old32] [dx32] [d3d11test] [d3d9test] [com32] [com64] [xml32] [cab32] [cab64] [share32] [d3d12videotest] [d3d11videotest] [d3d12encodetest]      (no arguments: all)
 set -euo pipefail
 cd "$(dirname "$0")/.."
 build=${BUILD:-build-wow64-qemu}
 work=${TMPDIR:-/tmp}/tcos-wow64-qemu
 rm -rf "$work"; mkdir -p "$work"
 programs=("$@")
-[ ${#programs[@]} -eq 0 ] && programs=(hello32 crt32 seh32 gui32 lib32 old32 dx32 d3d11test d3d9test com32 com64 xml32 cab32 cab64 share32 d3d12videotest d3d11videotest)
+[ ${#programs[@]} -eq 0 ] && programs=(hello32 crt32 seh32 gui32 lib32 old32 dx32 d3d11test d3d9test com32 com64 xml32 cab32 cab64 share32 d3d12videotest d3d11videotest d3d12encodetest)
 i686-w64-mingw32-gcc -O1 -ffreestanding -nostdlib -Isrc/Windows -Wl,--entry=_start32 -Wl,--subsystem,console -o "$work/hello32.exe" tests/windows/hello32.c
 i686-w64-mingw32-gcc -O1 -o "$work/crt32.exe" tests/windows/crt32.c
 i686-w64-mingw32-gcc -O1 -shared -o "$work/plug32.dll" tests/windows/plug32.c      # (a library crt32 loads while it runs)
@@ -93,6 +93,7 @@ i686-w64-mingw32-gcc -O1 -o "$work/share32.exe" tests/windows/d3dsharetest.c -ld
 # (Direct3D 12 and 11 video as 32-bit programs: the DXVA structures and the video interfaces' 32-bit layouts)
 i686-w64-mingw32-gcc -O1 -o "$work/d3d12videotest.exe" tests/windows/d3d12videotest.c -ld3d12 -ldxgi -luuid -ldxguid
 i686-w64-mingw32-gcc -O1 -I "$work" -o "$work/d3d11videotest.exe" tests/windows/d3d11videotest.c -ld3d11 -ld3d12 -ldxgi -luuid -ldxguid -luser32
+i686-w64-mingw32-gcc -O1 -o "$work/d3d12encodetest.exe" tests/windows/d3d12encodetest.c -ld3d12 -ldxgi -luuid -ldxguid      # (video encoding and motion estimation)
 status=0
 for program in "${programs[@]}"; do
   arguments=
@@ -105,9 +106,9 @@ for program in "${programs[@]}"; do
   qemu=$(sed -E 's/-audiodev [a-z]+,/-audiodev none,/' <<< "$qemu")
   rm -f "$build/debugcon.log"
   timeout "${QEMU_SECONDS:-120}" bash -c "$qemu -display none" </dev/null >/dev/null 2>&1 || true
-  if [ "$program" = d3d12videotest ]; then
-    grep -a -E "d3d12videotest|FAILED|autorun:|PANIC|user program:" "$build/debugcon.log" || echo "no output from $program"
-    grep -a -q -E "^d3d12videotest: [0-9]* checks, 0 failed" "$build/debugcon.log" || status=1
+  if [ "$program" = d3d12videotest ] || [ "$program" = d3d12encodetest ]; then
+    grep -a -E "$program|FAILED|autorun:|PANIC|user program:" "$build/debugcon.log" || echo "no output from $program"
+    grep -a -q -E "^$program: [0-9]* checks, 0 failed" "$build/debugcon.log" || status=1
     grep -a -q "autorun: ended, result 0, exit code 0x0* " "$build/debugcon.log" || status=1
     continue
   fi

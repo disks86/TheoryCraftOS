@@ -321,7 +321,16 @@ Direct3D 11's and 12's video interfaces run on the kernel's codecs, on the CPU, 
 - d3d12.dll: `ID3D12VideoDevice` .. 3, decoders and heaps (a heap is the kernel's decoder), processors, the VIDEO_DECODE / VIDEO_PROCESS queues and lists, decode
   statistics queries (video.inc; video_types.h has what mingw's d3d12video.h lacks). d3d11.dll: `ID3D11VideoDevice` .. 2, `ID3D11VideoContext` .. 3 on those
   (docs/Direct3D11.md).
-- Not there: video encoding and motion estimation (reported as not supported; their creators answer DXGI_ERROR_UNSUPPORTED), interlaced H.264 (field pictures, MBAFF),
+- Encoding and motion estimation (Direct3D 12 only; `src/Kernel/Dxgkrnl/VideoEncode.{hpp,cpp}`, stream ops EstimateMotion / ResolveMotionVectors / EncodeFrame /
+  ResolveEncoderMetadata, states kVideoEncodeRead / Write; d3d12.dll `encode.inc`): the motion estimator (`Software/MotionEstimator`: 8x8 / 16x16 blocks, SAD, whole-sample
+  search +-8 around the predictors, then half and quarter refinement with H.264's interpolation; resolved into an R16G16_SINT texture, kept as A16B16G16R16Sint (x, y, 0, 1))
+  and an H.264 encoder driven like a D3D12 driver is (`Software/H264PictureEncoder`: the program keeps the DPB, names lists / marking / modifications and writes SPS and PPS;
+  the slices are CAVLC Main with Intra16x16 and 16x16 P / B partitions, quarter-sample vectors, filter modes 0-2, slices by macroblocks / rows / count, a QP per macroblock),
+  picture-level rate control `Software/VideoRateControl` (CQP, CBR, VBR, QVBR, absolute QP map; state in the encoder heap, re-encode on overflow). The resolution must be whole
+  macroblocks (the queries say multiple of 16). Not done: CABAC, 8x8 transform, direct / B_Skip, intra refresh, slices by bytes, frame analysis, HEVC and AV1 (the codec query
+  says FALSE), EncodeCommandList4. Tests: `tests/run_host_tests.sh VideoEncodeTest`, `tests/h264_encode_ffmpeg.sh` (ffmpeg's decode = the reconstruction),
+  `tests/emulated_dx.sh tests/windows/d3d12encodetest.c`, `tests/d3d12_qemu.sh d3d12encodetest`, `tests/wow64_qemu.sh d3d12encodetest`.
+- Not there: interlaced H.264 (field pictures, MBAFF),
   HEVC Main10 and 4:2:2 / 4:4:4, AV1 profiles 1 and 2 and large-scale tiles, VC-1 and MPEG-4 part 2 DXVA profiles, decode-time conversion and histograms, protected
   content (crypto sessions and authenticated channels are refused), shared planar textures, placed planar resources, views of several slices of a planar texture.
 - Tests: `tests/run_host_tests.sh DxvaDecoderTest VideoProcessTest DxgkrnlTest` (every codec bit for bit with ffmpeg; the DXVA buffers filled as ffmpeg's dxva2_*.c

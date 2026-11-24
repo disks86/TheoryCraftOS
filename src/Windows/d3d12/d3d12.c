@@ -81,6 +81,7 @@ __asm__(".text\n.globl ___chkstk_ms\n___chkstk_ms:\n ret\n");
 #include "device.inc"
 #include "device1.inc"
 #include "video.inc"
+#include "encode.inc"
 #include "library.inc"
 
 #include "vtbl.inc"

@@ -152,7 +152,7 @@ static void STDMETHODCALLTYPE dev_GetCopyableFootprints1(Dev *This, const D3D12_
 static HRESULT STDMETHODCALLTYPE dev_CreateCommandList1(Dev *This, UINT mask, D3D12_COMMAND_LIST_TYPE type, D3D12_COMMAND_LIST_FLAGS flags, REFIID riid, void **out) {
   if (out) *out = NULL;
   if (flags != D3D12_COMMAND_LIST_FLAG_NONE || mask > 1) return E_INVALIDARG;
-  if (type == D3D12_COMMAND_LIST_TYPE_VIDEO_DECODE || type == D3D12_COMMAND_LIST_TYPE_VIDEO_PROCESS) {
+  if (type == D3D12_COMMAND_LIST_TYPE_VIDEO_DECODE || type == D3D12_COMMAND_LIST_TYPE_VIDEO_PROCESS || type == D3D12_COMMAND_LIST_TYPE_VIDEO_ENCODE) {
     const HRESULT vh = video_list_make(This, type, riid, out);
     if (SUCCEEDED(vh)) ((CmdList *)*out)->closed = 1;      /* (the interface is the list itself) */
     return vh;

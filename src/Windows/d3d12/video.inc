@@ -23,8 +23,8 @@
  * names the profile. Every picture is known by its texture (the kernel's allocation of its luma plane), so the reference list may change from picture to picture.
  * Video processing is the stream's VideoProcess (Hardware/VideoCodec/VideoProcess.hpp, on the CPU): colour space and format conversion, scaling, the eight orientations,
  * alpha blending and fill; no deinterlacing, filters, luma keying, stereo or auto processing (the feature queries say so).
- * Not here: video encoding and motion estimation (D3D12_FEATURE_VIDEO_FEATURE_AREA_SUPPORT says VideoEncodeSupport FALSE; their creators answer DXGI_ERROR_UNSUPPORTED),
- * extension commands (none are enumerated), protected sessions, decode histograms and decode-time conversion (reported as not supported), timestamps on video lists. */
+ * Video encoding and motion estimation are encode.inc's (included after this file); this file hands their feature queries and creators over.
+ * Not here: extension commands (none are enumerated), protected sessions, decode histograms and decode-time conversion (reported as not supported), timestamps on video lists. */
 
 /* ---- the profiles ------------------------------------------------------------------------------------------------------------------------------------------------ */
 
@@ -151,6 +151,13 @@ static HRESULT STDMETHODCALLTYPE dev_QueryInterface(Dev *This, REFIID riid, void
 static HRESULT STDMETHODCALLTYPE vdev_QueryInterface(ID3D12VideoDevice3 *v, REFIID riid, void **out) { return dev_QueryInterface(dev_of_video(v), riid, out); }
 static ULONG STDMETHODCALLTYPE vdev_AddRef(ID3D12VideoDevice3 *v) { return dx_AddRef(OBJ(dev_of_video(v))); }
 static ULONG STDMETHODCALLTYPE vdev_Release(ID3D12VideoDevice3 *v) { return dx_Release(OBJ(dev_of_video(v))); }
+
+/* (encode.inc) */
+static HRESULT venc_feature(Dev *d, D3D12_FEATURE_VIDEO feature, void *data, UINT size);
+static HRESULT vme_make(Dev *d, const D3D12_VIDEO_MOTION_ESTIMATOR_DESC *desc, ID3D12ProtectedResourceSession *session, REFIID riid, void **out);
+static HRESULT vmvh_make(Dev *d, const D3D12_VIDEO_MOTION_VECTOR_HEAP_DESC *desc, ID3D12ProtectedResourceSession *session, REFIID riid, void **out);
+static HRESULT venc_make(Dev *d, const D3D12_VIDEO_ENCODER_DESC *desc, REFIID riid, void **out);
+static HRESULT veheap_make(Dev *d, const D3D12_VIDEO_ENCODER_HEAP_DESC *desc, REFIID riid, void **out);
 
 #define VIDEO_FEATURE(type) do { if (size != sizeof(type)) return E_INVALIDARG; } while (0)
 static HRESULT STDMETHODCALLTYPE vdev_CheckFeatureSupport(ID3D12VideoDevice3 *v, D3D12_FEATURE_VIDEO feature, void *data, UINT size) {
@@ -296,16 +303,7 @@ static HRESULT STDMETHODCALLTYPE vdev_CheckFeatureSupport(ID3D12VideoDevice3 *v,
       if (f->NodeIndex) return E_INVALIDARG;
       f->VideoDecodeSupport = TRUE;
       f->VideoProcessSupport = TRUE;
-      f->VideoEncodeSupport = FALSE;
-      return S_OK;
-    }
-    case D3D12_FEATURE_VIDEO_MOTION_ESTIMATOR: {
-      VIDEO_FEATURE(D3D12_FEATURE_DATA_VIDEO_MOTION_ESTIMATOR);
-      D3D12_FEATURE_DATA_VIDEO_MOTION_ESTIMATOR *f = data;
-      if (f->NodeIndex) return E_INVALIDARG;
-      f->BlockSizeFlags = D3D12_VIDEO_MOTION_ESTIMATOR_SEARCH_BLOCK_SIZE_FLAG_NONE;
-      f->PrecisionFlags = D3D12_VIDEO_MOTION_ESTIMATOR_VECTOR_PRECISION_FLAG_NONE;
-      memset(&f->SizeRange, 0, sizeof f->SizeRange);
+      f->VideoEncodeSupport = TRUE;
       return S_OK;
     }
     case D3D12_FEATURE_VIDEO_EXTENSION_COMMAND_COUNT: {
@@ -330,15 +328,11 @@ static HRESULT STDMETHODCALLTYPE vdev_CheckFeatureSupport(ID3D12VideoDevice3 *v,
       ((D3D12_FEATURE_DATA_VIDEO_MOTION_ESTIMATOR_PROTECTED_RESOURCES *)data)->SupportFlags = D3D12_VIDEO_PROTECTED_RESOURCE_SUPPORT_FLAG_NONE;
       return S_OK;
     }
-    case D3D12_FEATURE_VIDEO_ENCODER_CODEC: {
-      /* (no encoder: every codec answers not supported; the other encoder queries describe an encoder of a codec that exists, so they are invalid here) */
-      VIDEO_FEATURE(D3D12_FEATURE_DATA_VIDEO_ENCODER_CODEC);
-      D3D12_FEATURE_DATA_VIDEO_ENCODER_CODEC *f = data;
-      if (f->NodeIndex) return E_INVALIDARG;
-      f->IsSupported = FALSE;
-      return S_OK;
+    default: {
+      /* (the motion estimator's and the encoder's: encode.inc) */
+      const HRESULT hr = venc_feature(d, feature, data, size);
+      return hr == S_FALSE ? E_INVALIDARG : hr;
     }
-    default: return E_INVALIDARG;
   }
 }
 #undef VIDEO_FEATURE
@@ -406,15 +400,13 @@ static HRESULT STDMETHODCALLTYPE vdev_CreateVideoProcessor1(ID3D12VideoDevice3 *
                                                            ID3D12ProtectedResourceSession *s, REFIID riid, void **out) {
   return vproc_make(dev_of_video(v), mask, o, n, in, s, riid, out);
 }
-/* (no motion estimation, encoding or extension commands: the feature queries say none is there) */
 static HRESULT STDMETHODCALLTYPE vdev_CreateVideoMotionEstimator(ID3D12VideoDevice3 *v, const D3D12_VIDEO_MOTION_ESTIMATOR_DESC *desc, ID3D12ProtectedResourceSession *s, REFIID riid, void **out) {
-  if (out) *out = NULL;
-  return DXGI_ERROR_UNSUPPORTED;
+  return vme_make(dev_of_video(v), desc, s, riid, out);
 }
 static HRESULT STDMETHODCALLTYPE vdev_CreateVideoMotionVectorHeap(ID3D12VideoDevice3 *v, const D3D12_VIDEO_MOTION_VECTOR_HEAP_DESC *desc, ID3D12ProtectedResourceSession *s, REFIID riid, void **out) {
-  if (out) *out = NULL;
-  return DXGI_ERROR_UNSUPPORTED;
+  return vmvh_make(dev_of_video(v), desc, s, riid, out);
 }
+/* (no extension commands: the feature queries say none is there) */
 static HRESULT STDMETHODCALLTYPE vdev_CreateVideoExtensionCommand(ID3D12VideoDevice3 *v, const D3D12_VIDEO_EXTENSION_COMMAND_DESC *desc, const void *params, SIZE_T size,
                                                                   ID3D12ProtectedResourceSession *s, REFIID riid, void **out) {
   if (out) *out = NULL;
@@ -423,14 +415,8 @@ static HRESULT STDMETHODCALLTYPE vdev_CreateVideoExtensionCommand(ID3D12VideoDev
 static HRESULT STDMETHODCALLTYPE vdev_ExecuteExtensionCommand(ID3D12VideoDevice3 *v, ID3D12VideoExtensionCommand *cmd, const void *params, SIZE_T size, void *output, SIZE_T output_size) {
   return E_INVALIDARG;      /* (no extension command can have been made) */
 }
-static HRESULT STDMETHODCALLTYPE vdev_CreateVideoEncoder(ID3D12VideoDevice3 *v, const D3D12_VIDEO_ENCODER_DESC *desc, REFIID riid, void **out) {
-  if (out) *out = NULL;
-  return DXGI_ERROR_UNSUPPORTED;
-}
-static HRESULT STDMETHODCALLTYPE vdev_CreateVideoEncoderHeap(ID3D12VideoDevice3 *v, const D3D12_VIDEO_ENCODER_HEAP_DESC *desc, REFIID riid, void **out) {
-  if (out) *out = NULL;
-  return DXGI_ERROR_UNSUPPORTED;
-}
+static HRESULT STDMETHODCALLTYPE vdev_CreateVideoEncoder(ID3D12VideoDevice3 *v, const D3D12_VIDEO_ENCODER_DESC *desc, REFIID riid, void **out) { return venc_make(dev_of_video(v), desc, riid, out); }
+static HRESULT STDMETHODCALLTYPE vdev_CreateVideoEncoderHeap(ID3D12VideoDevice3 *v, const D3D12_VIDEO_ENCODER_HEAP_DESC *desc, REFIID riid, void **out) { return veheap_make(dev_of_video(v), desc, riid, out); }
 
 /* ---- the video command lists ------------------------------------------------------------------------------------------------------------------------------------- */
 
@@ -438,13 +424,17 @@ static const GUID *const g_vdlist_iids[] = {&IID_ID3D12Object, &IID_ID3D12Device
                                             &IID_ID3D12VideoDecodeCommandList2, &IID_ID3D12VideoDecodeCommandList3, NULL};
 static const GUID *const g_vplist_iids[] = {&IID_ID3D12Object, &IID_ID3D12DeviceChild, &IID_ID3D12CommandList, &IID_ID3D12VideoProcessCommandList, &IID_ID3D12VideoProcessCommandList1,
                                             &IID_ID3D12VideoProcessCommandList2, &IID_ID3D12VideoProcessCommandList3, NULL};
+static const GUID *const g_velist_iids[] = {&IID_ID3D12Object, &IID_ID3D12DeviceChild, &IID_ID3D12CommandList, &IID_ID3D12VideoEncodeCommandList, &IID_ID3D12VideoEncodeCommandList1,
+                                            &IID_ID3D12VideoEncodeCommandList2, &IID_ID3D12VideoEncodeCommandList3, NULL};
 
 static HRESULT video_list_make(Dev *This, D3D12_COMMAND_LIST_TYPE type, REFIID riid, void **out) {
   extern const ID3D12VideoDecodeCommandList3Vtbl vdlist_vtbl;
   extern const ID3D12VideoProcessCommandList3Vtbl vplist_vtbl;
+  extern const ID3D12VideoEncodeCommandList3Vtbl velist_vtbl;
   if (out) *out = NULL;
-  const int decode = type == D3D12_COMMAND_LIST_TYPE_VIDEO_DECODE;
-  CmdList *l = dobj_new(sizeof *l, This, decode ? (const void *)&vdlist_vtbl : (const void *)&vplist_vtbl, decode ? g_vdlist_iids : g_vplist_iids, list_destroy);
+  const int decode = type == D3D12_COMMAND_LIST_TYPE_VIDEO_DECODE, encode = type == D3D12_COMMAND_LIST_TYPE_VIDEO_ENCODE;
+  CmdList *l = dobj_new(sizeof *l, This, decode ? (const void *)&vdlist_vtbl : encode ? (const void *)&velist_vtbl : (const void *)&vplist_vtbl,
+                        decode ? g_vdlist_iids : encode ? g_velist_iids : g_vplist_iids, list_destroy);
   if (!l) return E_OUTOFMEMORY;
   l->type = type;
   list_reset_state(l);
