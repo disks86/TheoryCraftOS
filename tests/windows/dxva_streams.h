@@ -22,9 +22,11 @@
  * surface index the picture goes into and the surface indices of the references it may read. The program maps the indices to its surfaces: in Direct3D 11 an index is
  * an array slice of the output texture; Direct3D 12 takes a list of reference textures, in which an index is a position.
  *
- *   H.264: Annex B byte streams of frames (frame_mbs_only_flag 1; no slice groups, no gaps in frame_num): SPS, PPS, POC types 0, 1 and 2, reference marking by the
- *          sliding window and by memory management control operations 1 .. 6, scaling lists with the fall-back rules; DXVA_PicParams_H264, DXVA_Qmatrix_H264 and the
- *          short slice format (DXVA_Slice_H264_Short, ConfigBitstreamRaw 2), each slice NAL unit with a 00 00 01 start code, the buffer padded to 128 bytes.
+ *   H.264: Annex B byte streams (no slice groups, no gaps in frame_num) of frames, MBAFF frames and field pictures: SPS, PPS, POC types 0, 1 and 2, reference
+ *          marking of frames and of fields by the sliding window and by memory management control operations 1 .. 6, a second field paired with its first (same
+ *          surface; the frame is a reference of the second field when its first field is), scaling lists with the fall-back rules; DXVA_PicParams_H264 (field_pic_flag,
+ *          MbaffFrameFlag, CurrPic's AssociatedFlag for a bottom field, UsedForReferenceFlags and FieldOrderCntList per field), DXVA_Qmatrix_H264 and the short slice
+ *          format (DXVA_Slice_H264_Short, ConfigBitstreamRaw 2), each slice NAL unit with a 00 00 01 start code, the buffer padded to 128 bytes.
  *   MPEG-1 / MPEG-2: video elementary streams, frame and field pictures; DXVA_PictureParameters, DXVA_QmatrixData (always sent), DXVA_SliceInfo, the slices back to
  *          back from their start codes, the buffer padded to 128 bytes.
  *
@@ -67,7 +69,7 @@ typedef struct DxvaPicture {
   long long display_key;                   /* sorts the pictures into display order (a field picture: both fields of a frame have the frame's) */
   int is_reference;                        /* (H.264: nal_ref_idc != 0; MPEG-2: an I or P picture) */
   char type;                               /* 'I', 'P' or 'B' (H.264: the lowest of the slices' types, I < P < B) */
-  int field;                               /* MPEG-2: 0 a frame picture, 1 the first field, 2 the second field */
+  int field;                               /* 0 a frame picture, 1 the first field, 2 the second field (H.264: the frame is whole after the second field) */
 } DxvaPicture;
 
 typedef struct DxvaH264State DxvaH264State;
@@ -192,7 +194,7 @@ typedef struct DxvaH264Pps {
   int init_qp, init_qs, chroma_qp_offset[2];
   unsigned char sl4[6][16], sl8[6][64];
 } DxvaH264Pps;
-typedef struct DxvaH264Ref { unsigned surface, frame_num, long_idx; int long_term; int poc[2]; } DxvaH264Ref;
+typedef struct DxvaH264Ref { unsigned surface, frame_num, long_idx; int long_term; int poc[2]; unsigned fields; } DxvaH264Ref;   /* (fields: bit 0 top, bit 1 bottom) */
 typedef struct DxvaH264Mmco { unsigned op, a, b; } DxvaH264Mmco;
 
 struct DxvaH264State {
@@ -217,6 +219,10 @@ struct DxvaH264State {
   unsigned frame_num_offset;
   char type;
   unsigned surface;
+  unsigned field_pic, bottom, second;       /* a field picture (and which), the second field of the frame of the picture before */
+  /* the picture before was a first field: of which surface, frame_num, parity, reference status and order count */
+  int first_active, first_ref, first_poc;
+  unsigned first_surface, first_frame_num, first_bottom;
 };
 
 /* The RBSP of a NAL unit (its emulation prevention bytes taken out), from the byte after its header. */
@@ -358,11 +364,11 @@ static int dxva_h264_begin_picture(DxvaStream *s) {
   unsigned busy[32], nbusy = 0;
   for (unsigned i = 0; i < h->short_count; ++i) busy[nbusy++] = h->shortr[i].surface;
   for (unsigned i = 0; i < 16; ++i) if (h->long_used[i]) busy[nbusy++] = h->longr[i].surface;
-  h->surface = dxva_pick_surface(s, busy, nbusy);
+  h->surface = h->second ? h->first_surface : dxva_pick_surface(s, busy, nbusy);   /* (a second field goes into its first field's surface) */
   if (h->surface == ~0u) { s->error = "no free surface (give more)"; return 0; }
   DXVA_PicParams_H264 pp;
   memset(&pp, 0, sizeof pp);
-  pp.CurrPic.bPicEntry = (UCHAR)h->surface;
+  pp.CurrPic.bPicEntry = (UCHAR)(h->surface | (h->field_pic && h->bottom ? 0x80 : 0));
   unsigned j = 0;
   for (unsigned i = 0; i < 16; ++i) {
     const DxvaH264Ref *r = NULL;
@@ -375,24 +381,24 @@ static int dxva_h264_begin_picture(DxvaStream *s) {
     }
     if (r) {
       pp.RefFrameList[i].bPicEntry = (UCHAR)(r->surface | (r->long_term ? 0x80 : 0));
-      pp.FieldOrderCntList[i][0] = r->poc[0];
-      pp.FieldOrderCntList[i][1] = r->poc[1];
+      if (r->fields & 1) pp.FieldOrderCntList[i][0] = r->poc[0];
+      if (r->fields & 2) pp.FieldOrderCntList[i][1] = r->poc[1];
       pp.FrameNumList[i] = (USHORT)(r->long_term ? r->long_idx : r->frame_num);
-      pp.UsedForReferenceFlags |= 3u << (2 * i);
+      pp.UsedForReferenceFlags |= (r->fields & 3u) << (2 * i);
     } else pp.RefFrameList[i].bPicEntry = 0xFF;
   }
   pp.wFrameWidthInMbsMinus1 = (USHORT)(sps->width_mbs - 1);
   pp.wFrameHeightInMbsMinus1 = (USHORT)(sps->height_map_units * (2 - sps->frame_mbs_only) - 1);
   pp.num_ref_frames = (UCHAR)sps->max_num_ref_frames;
-  pp.wBitFields = (USHORT)((0u << 0) | (0u << 1) | (sps->separate_colour_plane << 2) | (sps->chroma_format_idc << 4) | ((h->nal_ref_idc != 0) << 6) |
+  pp.wBitFields = (USHORT)((h->field_pic << 0) | ((sps->mb_aff && !h->field_pic) << 1) | (sps->separate_colour_plane << 2) | (sps->chroma_format_idc << 4) | ((h->nal_ref_idc != 0) << 6) |
                            (pps->constrained_intra_pred << 7) | (pps->weighted_pred << 8) | (pps->weighted_bipred_idc << 9) | (1u << 11) | (sps->frame_mbs_only << 12) |
                            (pps->transform_8x8 << 13) | ((sps->level_idc >= 31) << 14) | (1u << 15));
   pp.bit_depth_luma_minus8 = (UCHAR)(sps->bit_depth_luma - 8);
   pp.bit_depth_chroma_minus8 = (UCHAR)(sps->bit_depth_chroma - 8);
   pp.Reserved16Bits = 3;
   pp.StatusReportFeedbackNumber = ++s->feedback;
-  pp.CurrFieldOrderCnt[0] = h->poc[0];
-  pp.CurrFieldOrderCnt[1] = h->poc[1];
+  if (!h->field_pic || !h->bottom) pp.CurrFieldOrderCnt[0] = h->poc[0];   /* (a field: its own count only, as ffmpeg) */
+  if (!h->field_pic || h->bottom) pp.CurrFieldOrderCnt[1] = h->poc[1];
   pp.pic_init_qs_minus26 = (CHAR)(pps->init_qs - 26);
   pp.chroma_qp_index_offset = (CHAR)pps->chroma_qp_offset[0];
   pp.second_chroma_qp_index_offset = (CHAR)pps->chroma_qp_offset[1];
@@ -440,7 +446,8 @@ static int dxva_h264_begin_picture(DxvaStream *s) {
   return 1;
 }
 
-/* The picture order count of the picture (8.2.1), for frames. */
+/* The picture order count of the picture (8.2.1). A field's is poc[0] (top) or poc[1] (bottom): its header has no delta_pic_order_cnt_bottom and no second
+ * delta_pic_order_cnt, which the formulas below then take as 0. */
 static void dxva_h264_poc(DxvaH264State *h, int delta_bottom, const int delta[2]) {
   const DxvaH264Sps *sps = h->sps_cur;
   const unsigned max_frame_num = 1u << sps->log2_max_frame_num;
@@ -479,25 +486,53 @@ static void dxva_h264_poc(DxvaH264State *h, int delta_bottom, const int delta[2]
   }
 }
 
-/* A reference's PicNum among the short-term ones (FrameNumWrap: frames only). */
+/* A short-term reference's FrameNumWrap (8.2.4.1), and the PicNum of its field `f` (0 top, 1 bottom) when the current picture is a field. */
 static int dxva_h264_pic_num(const DxvaH264State *h, const DxvaH264Ref *r) {
   const unsigned max_frame_num = 1u << h->sps_cur->log2_max_frame_num;
   return r->frame_num > h->frame_num ? (int)r->frame_num - (int)max_frame_num : (int)r->frame_num;
 }
+static int dxva_h264_field_pic_num(const DxvaH264State *h, const DxvaH264Ref *r, unsigned f) { return 2 * dxva_h264_pic_num(h, r) + (f == h->bottom ? 1 : 0); }
 static void dxva_h264_remove_short(DxvaH264State *h, unsigned i) {
   memmove(&h->shortr[i], &h->shortr[i + 1], sizeof h->shortr[0] * (h->short_count - i - 1));
   --h->short_count;
 }
-/* The reference marking of the picture just decoded (8.2.5), then the state the next picture's order count starts from. */
+/* The short-term entry of a surface (the frame of a second field's first field), or -1. */
+static int dxva_h264_short_of(const DxvaH264State *h, unsigned surface) {
+  for (unsigned i = 0; i < h->short_count; ++i) if (h->shortr[i].surface == surface) return (int)i;
+  return -1;
+}
+/* LongTermFrameIdx `idx` goes to the frame of `surface`: whatever else had it is dropped (8.2.5.4.3 / 8.2.5.4.6: a field of the same frame keeps it). */
+static void dxva_h264_take_long(DxvaH264State *h, unsigned idx, unsigned surface) {
+  if (idx < 16 && h->long_used[idx] && h->longr[idx].surface != surface) h->long_used[idx] = 0;
+}
+/* Field `fields` of reference `r` becomes long-term with LongTermFrameIdx `idx` (joining its other field when that has the index already). */
+static void dxva_h264_make_long(DxvaH264State *h, DxvaH264Ref r, unsigned fields, unsigned idx) {
+  if (idx >= 16) return;
+  dxva_h264_take_long(h, idx, r.surface);
+  if (h->long_used[idx]) {
+    h->longr[idx].fields |= fields;
+    if (fields & 1) h->longr[idx].poc[0] = r.poc[0];
+    if (fields & 2) h->longr[idx].poc[1] = r.poc[1];
+    return;
+  }
+  r.long_term = 1;
+  r.long_idx = idx;
+  r.fields = fields;
+  h->longr[idx] = r;
+  h->long_used[idx] = 1;
+}
+/* The reference marking of the picture just decoded (8.2.5), of a frame or of a field, then the state the next picture's order count starts from. */
 static void dxva_h264_end_picture(DxvaH264State *h) {
   const DxvaH264Sps *sps = h->sps_cur;
   int mmco5 = 0, made_long = 0;
+  const unsigned own = h->field_pic ? (h->bottom ? 2u : 1u) : 3u;
   DxvaH264Ref cur;
   memset(&cur, 0, sizeof cur);
   cur.surface = h->surface;
   cur.frame_num = h->frame_num;
   cur.poc[0] = h->poc[0];
   cur.poc[1] = h->poc[1];
+  cur.fields = own;
   if (h->nal_ref_idc) {
     if (h->idr) {
       h->short_count = 0;
@@ -505,23 +540,50 @@ static void dxva_h264_end_picture(DxvaH264State *h) {
       if (h->long_term_reference) { cur.long_term = 1; cur.long_idx = 0; h->longr[0] = cur; h->long_used[0] = 1; h->max_long_idx = 0; made_long = 1; }
       else h->max_long_idx = -1;
     } else if (h->adaptive) {
+      const int curr_pic_num = h->field_pic ? 2 * (int)h->frame_num + 1 : (int)h->frame_num;
       for (unsigned m = 0; m < h->mmco_count; ++m) {
         const DxvaH264Mmco *op = &h->mmco[m];
-        const int pic_num_x = (int)h->frame_num - (int)(op->a + 1);
+        const int pic_num_x = curr_pic_num - (int)(op->a + 1);
         switch (op->op) {
-          case 1:
-            for (unsigned i = 0; i < h->short_count; ++i) if (dxva_h264_pic_num(h, &h->shortr[i]) == pic_num_x) { dxva_h264_remove_short(h, i); break; }
-            break;
-          case 2: if (op->a < 16) h->long_used[op->a] = 0; break;
-          case 3:
+          case 1:   /* a short-term frame, or one field of it, unused */
             for (unsigned i = 0; i < h->short_count; ++i) {
-              if (dxva_h264_pic_num(h, &h->shortr[i]) != pic_num_x || op->b >= 16) continue;
-              DxvaH264Ref r = h->shortr[i];
-              dxva_h264_remove_short(h, i);
-              r.long_term = 1;
-              r.long_idx = op->b;
-              h->longr[op->b] = r;
-              h->long_used[op->b] = 1;
+              DxvaH264Ref *r = &h->shortr[i];
+              if (!h->field_pic) {
+                if (dxva_h264_pic_num(h, r) == pic_num_x) { dxva_h264_remove_short(h, i); break; }
+                continue;
+              }
+              unsigned f = 0;
+              for (; f < 2; ++f) if ((r->fields >> f & 1) && dxva_h264_field_pic_num(h, r, f) == pic_num_x) break;
+              if (f == 2) continue;
+              r->fields &= ~(1u << f);
+              if (!r->fields) dxva_h264_remove_short(h, i);
+              break;
+            }
+            break;
+          case 2:   /* a long-term frame (or field: LongTermPicNum 2 * idx + 1 of the same parity, 2 * idx of the other) unused */
+            if (!h->field_pic) { if (op->a < 16) h->long_used[op->a] = 0; break; }
+            for (unsigned k = 0; k < 16; ++k) {
+              if (!h->long_used[k]) continue;
+              for (unsigned f = 0; f < 2; ++f)
+                if ((h->longr[k].fields >> f & 1) && 2 * k + (f == h->bottom ? 1u : 0u) == op->a) h->longr[k].fields &= ~(1u << f);
+              if (!h->longr[k].fields) h->long_used[k] = 0;
+            }
+            break;
+          case 3:   /* a short-term frame (or field) becomes long-term */
+            for (unsigned i = 0; i < h->short_count; ++i) {
+              DxvaH264Ref *r = &h->shortr[i];
+              unsigned fields = 0;
+              if (!h->field_pic) {
+                if (dxva_h264_pic_num(h, r) == pic_num_x) fields = r->fields;
+              } else {
+                for (unsigned f = 0; f < 2; ++f)
+                  if ((r->fields >> f & 1) && dxva_h264_field_pic_num(h, r, f) == pic_num_x) fields = 1u << f;
+              }
+              if (!fields || op->b >= 16) continue;
+              const DxvaH264Ref copy = *r;
+              r->fields &= ~fields;
+              if (!r->fields) dxva_h264_remove_short(h, i);
+              dxva_h264_make_long(h, copy, fields, op->b);
               break;
             }
             break;
@@ -535,37 +597,51 @@ static void dxva_h264_end_picture(DxvaH264State *h) {
             h->max_long_idx = -1;
             mmco5 = 1;
             break;
-          case 6:
-            if (op->a < 16) { cur.long_term = 1; cur.long_idx = op->a; h->longr[op->a] = cur; h->long_used[op->a] = 1; made_long = 1; }
+          case 6:   /* the current picture becomes long-term */
+            if (op->a < 16) {
+              dxva_h264_make_long(h, cur, own, op->a);
+              made_long = 1;
+            }
             break;
           default: break;
         }
       }
     } else {
-      unsigned longs = 0;
-      for (unsigned i = 0; i < 16; ++i) longs += h->long_used[i] != 0;
-      const unsigned max_refs = sps->max_num_ref_frames ? sps->max_num_ref_frames : 1;
-      if (h->short_count + longs >= max_refs && h->short_count) {
-        unsigned oldest = 0;
-        for (unsigned i = 1; i < h->short_count; ++i) if (dxva_h264_pic_num(h, &h->shortr[i]) < dxva_h264_pic_num(h, &h->shortr[oldest])) oldest = i;
-        dxva_h264_remove_short(h, oldest);
+      /* 8.2.5.3: the second field of a pair whose first field is short-term joins it; otherwise the oldest short-term frame goes when the frames are all used */
+      const int entry = h->second ? dxva_h264_short_of(h, h->surface) : -1;
+      if (entry < 0) {
+        unsigned longs = 0;
+        for (unsigned i = 0; i < 16; ++i) longs += h->long_used[i] != 0;
+        const unsigned max_refs = sps->max_num_ref_frames ? sps->max_num_ref_frames : 1;
+        if (h->short_count + longs >= max_refs && h->short_count) {
+          unsigned oldest = 0;
+          for (unsigned i = 1; i < h->short_count; ++i) if (dxva_h264_pic_num(h, &h->shortr[i]) < dxva_h264_pic_num(h, &h->shortr[oldest])) oldest = i;
+          dxva_h264_remove_short(h, oldest);
+        }
       }
     }
     if (mmco5) {
-      /* (the picture is frame_num 0 from now on, its order counts relative to itself) */
-      const int t = cur.poc[0] < cur.poc[1] ? cur.poc[0] : cur.poc[1];
+      /* (the picture is frame_num 0 from now on, its order counts relative to itself: a field's count becomes 0) */
+      const int t = h->field_pic ? (h->bottom ? cur.poc[1] : cur.poc[0]) : cur.poc[0] < cur.poc[1] ? cur.poc[0] : cur.poc[1];
       cur.poc[0] -= t;
       cur.poc[1] -= t;
       cur.frame_num = 0;
       if (made_long) { h->longr[cur.long_idx].poc[0] = cur.poc[0]; h->longr[cur.long_idx].poc[1] = cur.poc[1]; h->longr[cur.long_idx].frame_num = 0; }
     }
-    if (!made_long && h->short_count < 16) {
-      memmove(&h->shortr[1], &h->shortr[0], sizeof h->shortr[0] * h->short_count);
-      h->shortr[0] = cur;
-      ++h->short_count;
+    if (!made_long) {
+      const int entry = h->second ? dxva_h264_short_of(h, h->surface) : -1;
+      if (entry >= 0) {
+        h->shortr[entry].fields |= own;
+        if (own & 1) h->shortr[entry].poc[0] = cur.poc[0];
+        if (own & 2) h->shortr[entry].poc[1] = cur.poc[1];
+      } else if (h->short_count < 16) {
+        memmove(&h->shortr[1], &h->shortr[0], sizeof h->shortr[0] * h->short_count);
+        h->shortr[0] = cur;
+        ++h->short_count;
+      }
     }
     h->prev_poc_msb = mmco5 ? 0 : h->poc_msb;
-    h->prev_poc_lsb = mmco5 ? cur.poc[0] : h->poc_lsb;
+    h->prev_poc_lsb = mmco5 ? (h->field_pic && h->bottom ? 0 : cur.poc[0]) : h->poc_lsb;
     h->prev_ref_frame_num = mmco5 ? 0 : h->frame_num;
   }
   h->prev_frame_num = mmco5 ? 0 : h->frame_num;
@@ -587,21 +663,25 @@ static int dxva_h264_slice(DxvaStream *s, const unsigned char *nal, size_t size,
   const DxvaH264Pps *pps = &h->pps[pps_id];
   const DxvaH264Sps *sps = &h->sps[pps->sps_id];
   if (first_mb == 0) {
-    if (!sps->frame_mbs_only) { s->error = "field or MBAFF pictures"; return 0; }
     if (sps->separate_colour_plane) dxva_u(&b, 2);
     h->sps_cur = sps;
     h->pps_cur = pps;
     h->nal_ref_idc = nal_ref_idc;
     h->idr = nal_type == 5;
     h->frame_num = dxva_u(&b, sps->log2_max_frame_num);
+    h->field_pic = h->bottom = 0;
+    if (!sps->frame_mbs_only) {
+      h->field_pic = dxva_u(&b, 1);
+      if (h->field_pic) h->bottom = dxva_u(&b, 1);
+    }
     if (h->idr) dxva_ue(&b);
     int delta_bottom = 0, delta[2] = {0, 0};
     if (sps->poc_type == 0) {
       h->poc_lsb = (int)dxva_u(&b, sps->log2_max_poc_lsb);
-      if (pps->pic_order_present) delta_bottom = dxva_se(&b);
+      if (pps->pic_order_present && !h->field_pic) delta_bottom = dxva_se(&b);
     } else if (sps->poc_type == 1 && !sps->delta_pic_order_always_zero) {
       delta[0] = dxva_se(&b);
-      if (pps->pic_order_present) delta[1] = dxva_se(&b);
+      if (pps->pic_order_present && !h->field_pic) delta[1] = dxva_se(&b);
     }
     if (pps->redundant_pic_cnt_present) dxva_ue(&b);
     const int is_b = slice_type == 1, is_p = slice_type == 0 || slice_type == 3;
@@ -653,6 +733,12 @@ static int dxva_h264_slice(DxvaStream *s, const unsigned char *nal, size_t size,
     /* (no gaps in frame_num: the decoder is not given frames that do not exist) */
     const unsigned max_frame_num = 1u << sps->log2_max_frame_num;
     if (!h->idr && h->frame_num != h->prev_ref_frame_num && h->frame_num != (h->prev_ref_frame_num + 1) % max_frame_num) { s->error = "a gap in frame_num"; return 0; }
+    /* 7.4.1.2.4: the second field of a complementary (reference or non-reference) field pair - the next field of the other parity with the same frame_num */
+    int mmco5 = 0;
+    for (unsigned m = 0; m < h->mmco_count; ++m) mmco5 |= h->mmco[m].op == 5;
+    h->second = h->field_pic && h->first_active && h->first_bottom != h->bottom && h->first_frame_num == h->frame_num && !h->idr &&
+                (h->nal_ref_idc != 0) == (h->first_ref != 0) && !mmco5;
+    h->first_active = 0;
     if (h->idr) ++h->period;
     dxva_h264_poc(h, delta_bottom, delta);
     if (!dxva_h264_begin_picture(s)) return 0;
@@ -687,9 +773,21 @@ static int dxva_h264_finish(DxvaStream *s, DxvaPicture *p) {
   for (unsigned i = 0; i < 16 && p->ref_count < 16; ++i) if (h->long_used[i]) p->refs[p->ref_count++] = h->longr[i].surface;
   p->is_reference = h->nal_ref_idc != 0;
   p->type = h->type;
+  p->field = h->field_pic ? (h->second ? 2 : 1) : 0;
   const long long period = h->period;
-  const int poc = h->poc[0] < h->poc[1] ? h->poc[0] : h->poc[1];
+  const int own = h->bottom ? h->poc[1] : h->poc[0];
+  int poc = h->field_pic ? own : h->poc[0] < h->poc[1] ? h->poc[0] : h->poc[1];
+  if (h->second && h->first_poc < poc) poc = h->first_poc;   /* (a field pair: its frame's count, the smaller of its fields') */
+  const unsigned was_field = h->field_pic, was_second = h->second;
   dxva_h264_end_picture(h);
+  if (was_field && !was_second) {
+    h->first_active = 1;
+    h->first_surface = h->surface;
+    h->first_frame_num = h->frame_num;
+    h->first_bottom = h->bottom;
+    h->first_ref = h->nal_ref_idc != 0;
+    h->first_poc = h->bottom ? h->poc[1] : h->poc[0];
+  }
   /* (an MMCO 5 picture belongs to the period it begins, at its order count made relative to itself: 0) */
   p->display_key = h->period != period ? h->period * (1LL << 33) + (1LL << 32) : period * (1LL << 33) + (1LL << 32) + poc;
   p->picture_parameters = s->pp;

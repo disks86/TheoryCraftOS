@@ -147,7 +147,7 @@ struct VlcTree {
 struct Sps {
   bool valid = false;
   int profile_idc = 0, level_idc = 0, id = 0;
-  int chroma_format_idc = 1;
+  int chroma_format_idc = 1;  // 1 (4:2:0) or 0 (monochrome: the chroma planes are mid-grey)
   bool qpprime_bypass = false;
   bool scaling_matrix_present = false;
   uint8_t list4[6][16];  // raster order
@@ -224,12 +224,14 @@ struct SliceHeader {
   bool idr() const { return nal_unit_type == 5; }
 };
 
-// What later pictures need to know of a coded picture's motion (direct prediction) and the loop filter of this one.
+// What later pictures need to know of a coded picture's motion (direct prediction) and the loop filter of this one. A frame keeps one per macroblock address
+// (an MBAFF frame in its pair order); a frame decoded as two field pictures keeps the top field's macroblocks first, then the bottom field's.
 struct MotionMb {
-  int16_t mv[2][16][2];  // per 4x4 block, raster order
+  int16_t mv[2][16][2];  // per 4x4 block, raster order (vertical in field units for a field macroblock)
   int8_t ref[2][4];      // per 8x8 block, -1 if the list is not used
-  int32_t refid[2][4];   // the picture each reference index named (Picture::id), -1 if none
+  int32_t refid[2][4];   // the picture each reference index named: 4 * Picture::id + 1 (its top field), 2 (its bottom field) or 3 (the frame); -1 if none
   uint8_t intra;
+  uint8_t field;         // a field macroblock (of a field picture, or mb_field_decoding_flag in an MBAFF frame)
 };
 
 // What the decoded picture buffer needs to know of a picture, apart from its samples: order, reference status and output state. The decoder's pictures
@@ -238,10 +240,14 @@ struct PictureInfo {
   int slot = 0;              // index in the buffer, set by Dpb::attach
   int id = 0;
   int poc = 0, frame_num = 0, frame_num_wrap = 0, long_term_idx = 0;
-  int top_poc = 0, bottom_poc = 0;  // the order counts of the two fields of the frame (poc is the smaller)
+  int top_poc = 0, bottom_poc = 0;  // the order counts of the two fields of the frame (poc is the smaller of those decoded)
   bool in_use = false;       // the slot holds a picture that is a reference or waits for output (or is being decoded)
-  bool is_ref = false;       // used for (short- or long-term) reference
-  bool is_long = false;
+  bool is_ref = false;       // a field or both are used for (short- or long-term) reference (kept from field_ref)
+  bool is_long = false;      // a field or both are used for long-term reference (kept from field_ref)
+  uint8_t field_ref[2] = {0, 0};   // per field (top, bottom): 0 unused for reference, 1 short-term, 2 long-term
+  uint8_t decoded = 0;       // the fields that hold decoded samples (bit 0 top, bit 1 bottom; 3 for a frame)
+  bool field_coded = false;  // decoded as field pictures (a complementary field pair, or a field alone) rather than as a frame
+  bool mbaff = false;        // decoded as an MBAFF frame
   bool needed_for_output = false;
   bool non_existing = false;
   bool keyframe = false;
@@ -272,21 +278,29 @@ class Dpb {
   void reset();
 
   // Starts the picture of `sh` (its first slice): flushes at an IDR, computes the order count, picks a slot. Null if no slot can be freed. The caller allocates
-  // the slot's memory and sets `has_memory`, or calls abort_picture().
-  PictureInfo* begin_picture(const SliceHeader& sh, int64_t pts);
+  // the slot's memory and sets `has_memory`, or calls abort_picture(). The second field of a complementary field pair (7.4.1.2.4: the field after a first field of
+  // the other parity with the same frame_num and the same reference status) goes into the slot of the first: that slot comes back again, with its memory.
+  // `into` (decoding for a DXVA driver): the field goes into that slot, which holds the other field of its frame.
+  PictureInfo* begin_picture(const SliceHeader& sh, int64_t pts, PictureInfo* into = nullptr);
   void abort_picture();
-  // Decoding for a DXVA driver: the order counts of the current picture are the program's (after begin_picture()).
+  // Decoding for a DXVA driver: the order counts of the current picture are the program's (after begin_picture(); for a field only its own count is used).
   void set_current_poc(int top, int bottom);
+  // Decoding for a DXVA driver: the next field pairs only with the frame begin_picture() is told to put it into, not with the field decoded before it.
+  void forget_pending() { pending_ = nullptr; }
+  // The structure of the current picture: 1 a top field, 2 a bottom field, 3 a frame; and whether it is the second field of its frame.
+  int structure() const { return structure_; }
+  bool second_field() const { return second_field_; }
   // Decoding for a DXVA driver: finished pictures are not queued for output; the last one stays untouched until the next call that releases it.
   void set_decode_order(bool on) { decode_order_ = on; }
   // A new picture identity (for a picture the owner puts in a slot itself).
   int new_id() { return next_pic_id_++; }
   // The picture is decoded: marks references (8.2.5), updates the counters for the next picture, queues it for output.
   void finish_picture(const SliceHeader& last_slice);
-  // The reference lists (8.2.4) for a slice of the current picture. Entries without a picture repeat the first one.
+  // The reference lists (8.2.4) for a slice of the current picture. Entries without a picture repeat the first one. A field picture's entries are fields
+  // (ref_parity() says which field of the frame), a frame's are frames.
   void build_ref_lists(const SliceHeader& sh);
 
-  // Output, in display order.
+  // Output, in display order. A first field still waiting for its pair goes out (unpaired) when `all` is set.
   void bump_output(bool all);
   bool output_ready() const { return out_count_ > 0; }
   PictureInfo* take_output();       // the next picture; it stays in use until the next call that releases it
@@ -294,8 +308,9 @@ class Dpb {
 
   PictureInfo* cur() const { return cur_; }
   PictureInfo* ref(int list, int index) const { return ref_list_[list][index]; }
+  int ref_parity(int list, int index) const { return ref_parity_[list][index]; }   // 0 the frame, 1 its top field, 2 its bottom field
   int ref_count(int list) const { return ref_count_[list]; }
-  int pic_poc() const { return pic_poc_; }
+  int pic_poc() const { return pic_poc_; }   // PicOrderCnt( CurrPic ): the field's count for a field
   int top_poc() const { return top_poc_; }
   int bottom_poc() const { return bottom_poc_; }
 
@@ -307,13 +322,23 @@ class Dpb {
   void sliding_window();
   void apply_mmco(const SliceHeader& sh);
   void queue_output(PictureInfo* p);
+  void release_pending();
+  int entry_poc(const PictureInfo& p) const;
+  int field_pic_num(const PictureInfo& p, int parity) const;
 
   PictureInfo* slots_[kMaxPictures] = {};
   int slot_count_ = 0;
   const Sps* sps_ = nullptr;
   PictureInfo* cur_ = nullptr;
   PictureInfo* returned_ = nullptr;   // the picture last handed out (not reused until the next call)
+  PictureInfo* pending_ = nullptr;    // a first field whose frame waits for the second field
+  int pending_structure_ = 0;
+  bool pending_ref_ = false;
+  int structure_ = 3;                 // of the current picture
+  bool second_field_ = false;
+  bool cur_long_ = false;             // memory_management_control_operation 6 marked the current picture long-term
   PictureInfo* ref_list_[2][kMaxRefs + 1] = {};
+  uint8_t ref_parity_[2][kMaxRefs + 1] = {};
   int ref_count_[2] = {0, 0};
   PictureInfo* out_wait_[kMaxPictures] = {};   // decoded, waiting for the display order to allow them out
   int out_wait_count_ = 0;
@@ -342,6 +367,19 @@ struct MbCtx {
   uint8_t mvd[2][16][2];
   uint8_t dbf_idc;
   int8_t alpha_off, beta_off;
+  uint8_t field;         // a field macroblock (mb_field_decoding_flag; set for every macroblock of a field picture)
+};
+
+// A reference picture as the macroblocks of a slice use it: a frame (parity 0), or the top (1) or bottom (2) field of one.
+struct RefPic {
+  Picture* pic = nullptr;
+  uint8_t parity = 0;
+};
+
+// A neighbouring location (6.4.12): the macroblock that holds it (-1: not available) and the location inside that macroblock.
+struct NbLoc {
+  int addr = -1;
+  int x = 0, y = 0;
 };
 
 // The sequence and picture parameter sets seen so far, and the parsing of them and of slice headers (which depend on them). Shared by the
@@ -416,7 +454,7 @@ class Core {
   void reset();
   VideoFormat output_format() const;
   bool ready() const { return dpb_.output_ready(); }
-  H264Decoder::ExternalStatus decode_external(ConstByteView data, const H264Decoder::ExternalPicture& picture, VideoFrame* decoded);
+  H264Decoder::ExternalStatus decode_external(ConstByteView data, const H264Decoder::ExternalPicture& picture, VideoFrame* decoded, int* structure);
   void set_slice_observer(H264Decoder::SliceObserver observer, void* context) {
     observer_ = observer;
     observer_context_ = context;
@@ -426,18 +464,24 @@ class Core {
   // --- H264Syntax.cpp
   bool handle_nal(const uint8_t* nal, uint64_t size, int64_t pts);
   bool new_picture(const SliceHeader& a, const SliceHeader& b) const;
-  void build_ref_lists(const SliceHeader& sh);  // the Dpb's lists, as pictures, and the implicit weights
+  void build_ref_lists(const SliceHeader& sh);  // the Dpb's lists, as pictures, the lists of field macroblocks and the implicit weights
   bool start_picture(const SliceHeader& sh, int64_t pts);
   void finish_picture();
   bool allocate_pictures();
   bool alloc_picture(Picture* p);
-  bool apply_external_references();
+  bool apply_external_references(const SliceHeader& sh);
   void compute_scaling();
   void build_vlc();
+  void implicit_weights(int set, int cur_poc);
 
   // --- H264Macroblock.cpp
   bool decode_slice(BitReader& br, const SliceHeader& sh);
-  bool decode_mb_cavlc(BitReader& br, bool* is_end);
+  bool decode_slice_cavlc(BitReader& br, int addr);
+  bool decode_slice_cabac(int addr);
+  void setup_mb(int addr);
+  void set_mb_field(bool field);
+  bool inferred_mb_field() const;
+  bool decode_mb_cavlc(BitReader& br);
   bool parse_inter_cavlc_type(BitReader& br, int t0, bool* no_sub_lt8);
   bool finish_inter_parse(BitReader* br, int part_mode, const int* preds, const int* sub_shape, int refs[2][4]);
   void add_rect(int x, int y, int w, int h);
@@ -453,17 +497,32 @@ class Core {
   bool finish_mb(bool skipped);
   bool read_pcm(BitReader* br);
   int predicted_intra_mode(int bx, int by, bool is8x8) const;
-  void fetch_motion(int list, int bx, int by, int* ref, int16_t* mv, bool unused = false) const;
+  void fetch_motion(int list, int xn, int yn, int* ref, int16_t* mv) const;
   void predict_mv(int list, int bx, int by, int w, int h, int ref, int shape, int part, int* mvp);
   void set_motion(int list, int bx, int by, int w, int h, int ref, int mvx, int mvy);
   void set_mvd(int list, int bx, int by, int w, int h, int dx, int dy);
-  void col_motion(int cx, int cy, bool* intra, int* refidx, int* refid, int16_t* mv) const;
+  struct Colocated {
+    bool intra = true;      // (also: no motion to use)
+    int refidx = -1;        // refIdxCol
+    int refid = -1;         // the picture refIdxCol named (MotionMb::refid)
+    int16_t mv[2] = {0, 0}; // mvCol, unscaled
+    int scale = 0;          // vertMvScale: 0 One_To_One, 1 Frm_To_Fld, 2 Fld_To_Frm
+    bool field_mb = false;  // the co-located macroblock is a field macroblock
+  };
+  void col_motion(int bx, int by, Colocated* out) const;
+  int map_col_to_list0(const Colocated& col) const;
   void direct_spatial(int blk8_mask);
   void direct_temporal(int blk8_mask);
   void direct_block(int blk8_mask);
   void skip_motion();
-  const MbCtx* nb(int dx, int dy) const;
-  bool intra_nb_ok(int dx, int dy) const;
+  NbLoc neighbour(int xn, int yn, bool chroma) const;
+  const MbCtx* nb_mb(const NbLoc& n) const { return n.addr >= 0 ? &mbs_[static_cast<uint64_t>(n.addr)] : nullptr; }
+  const MbCtx* nb_a() const;
+  const MbCtx* nb_b() const;
+  bool intra_ok(int xn, int yn, bool chroma) const;
+  bool intra_rows_ok(int xn, int y0, int rows, bool chroma) const;
+  const MotionMb& motion_of(int addr) const { return cur_->motion[static_cast<uint64_t>(motion_base_ + addr)]; }
+  const RefPic& ref_pic(int list, int idx) const { return refs_[rl_][list][idx]; }
 
   // --- H264Cabac.cpp
   bool decode_mb_cabac();
@@ -477,6 +536,7 @@ class Core {
   void cabac_init_contexts();
   int cabac_mb_type_i(int base, bool in_pb);
   int cabac_mb_skip();
+  int cabac_mb_field();
   int cabac_ref_idx(int list, int bx, int by);
   int cabac_mvd(int list, int comp, int bx, int by);
   int cabac_cbp();
@@ -501,7 +561,8 @@ class Core {
   // --- H264Deblock.cpp
   void deblock_picture();
   void deblock_mb(int mbx, int mby);
-  int boundary_strength(int mb_p, int mb_q, int blk_p, int blk_q, bool mb_edge) const;
+  void deblock_mb_mbaff(int addr);
+  int boundary_strength(int mb_p, int mb_q, int blk_p, int blk_q, bool mb_edge, bool vertical) const;
 
   allocators::IAllocator& allocator_;
 
@@ -516,11 +577,27 @@ class Core {
   Dpb dpb_;                       // order counts, reference marking and lists, output order
   // Cached from dpb_ for the macroblock code: the picture being decoded and the reference lists of the current slice.
   Picture* cur_ = nullptr;
-  Picture* ref_list_[2][kMaxRefs + 1];
-  int ref_count_[2] = {0, 0};
-  int pic_poc_ = 0;
-  int mb_w_ = 0, mb_h_ = 0;
-  Mem<MbCtx> mbs_;
+  // The reference lists: [0] the slice's (frames, or fields in a field picture), [1] / [2] those of the top / bottom field macroblocks of an MBAFF frame (8.4.2.1:
+  // entry 2i the field of frame i with the macroblock's parity, 2i + 1 the other one).
+  RefPic refs_[3][2][2 * kMaxRefs + 1];
+  int ref_n_[3][2] = {};
+  int rl_ = 0;                    // the lists the current macroblock uses
+  int ref_count_[2] = {0, 0};     // (of refs_[rl_])
+  int pic_poc_ = 0;               // PicOrderCnt( CurrPic )
+  int mb_w_ = 0, mb_h_ = 0;       // the frame, in macroblocks
+  Mem<MbCtx> mbs_;                // per macroblock address of the current picture
+
+  // The current picture: its structure, and the planes it is decoded into (a field's are every other line of its frame).
+  int structure_ = 3;             // 1 top field, 2 bottom field, 3 frame
+  bool field_pic_ = false, mbaff_ = false;
+  bool mono_ = false;             // chroma_format_idc 0: no chroma syntax, the chroma planes stay mid-grey
+  int pic_mb_h_ = 0;              // PicHeightInMbs (rows of the field for a field picture)
+  int pic_mbs_ = 0;               // PicSizeInMbs
+  int motion_base_ = 0;           // where the current picture's macroblocks are in Picture::motion
+  uint8_t* pic_y_ = nullptr;
+  uint8_t* pic_u_ = nullptr;
+  uint8_t* pic_v_ = nullptr;
+  int pic_ls_ = 0, pic_cs_ = 0;   // line steps of the current picture's planes
 
   bool have_slice_ = false;
   SliceHeader prev_sh_;
@@ -540,7 +617,17 @@ class Core {
   int32_t level_scale8_[2][6][64];
 
   // the macroblock being decoded
-  int mbx_ = 0, mby_ = 0, mb_addr_ = 0;
+  int mbx_ = 0, mby_ = 0, mb_addr_ = 0;   // mby_: the row in the macroblock's own grid (a field macroblock's is the row of its pair)
+  bool mb_field_ = false;                 // a field macroblock (field picture, or mb_field_decoding_flag)
+  bool mb_bottom_ = false;                // MBAFF: the bottom macroblock of its pair
+  uint8_t* mb_y_ = nullptr;               // the macroblock's top-left samples
+  uint8_t* mb_u_ = nullptr;
+  uint8_t* mb_v_ = nullptr;
+  int mb_ls_ = 0, mb_cs_ = 0;             // and the steps from one of its lines to the next
+  int mc_y_ = 0, mc_h_ = 0;               // its top row and the height in the sample grid of its references (frame or field), luma
+  int mb_poc_ = 0;                        // the order count of the picture (or, for a field macroblock of a frame, the field) it is in
+  const uint8_t* scan4_ = nullptr;        // the inverse scans in use (8.5.6: zig-zag, or field scan for field macroblocks)
+  const uint8_t* scan8_ = nullptr;
   MbCtx* cm_ = nullptr;
   MotionMb* cmotion_ = nullptr;
   int mb_type_ = 0;     // MbKind in the .cpp files
@@ -555,6 +642,7 @@ class Core {
   bool coef_present_[3][16];
   uint8_t rect_[16][4];      // partitions for motion compensation: x, y, w, h in 4x4 units
   int rect_count_ = 0;
+  bool bottom_skip_known_ = false, bottom_skipped_ = false;   // MBAFF CABAC: the bottom macroblock's mb_skip_flag, read with the top's
 
   // CABAC engine
   BitReader* cbr_ = nullptr;
@@ -565,7 +653,8 @@ class Core {
   VlcTree total_zeros_[15], total_zeros_chroma_dc_[3], run_before_[7];
   bool vlc_ready_ = false;
 
-  int implicit_w_[kMaxRefs][kMaxRefs];  // weight of the list-1 prediction for implicit bi-prediction
+  // Weight of the list-1 prediction for implicit bi-prediction, per pair of reference indices, for each set of lists of refs_.
+  int implicit_w_[3][2 * kMaxRefs][2 * kMaxRefs];
 };
 
 

@@ -23,7 +23,12 @@
 // pic_order_cnt_type 1, whose offsets DXVA does not carry, decodes as well as the others) and keeps every decoded picture under the key of its surface. The picture
 // comes back at once, at its whole coded size, as NV12.
 //
-// Refused: field pictures and MBAFF frames (the CPU decoder decodes progressive frames only), monochrome, flexible macroblock ordering, slices chopped over buffers.
+// Interlaced coding: an MBAFF frame (MbaffFrameFlag), or a field picture (field_pic_flag, CurrPic's AssociatedFlag the bottom field), whose references are the fields
+// UsedForReferenceFlags marks (the program lists the frame of the current picture when its first field is one). A field is decoded into the frame of its surface:
+// the decoded picture says which field's lines are the picture (DxvaDecodedPicture::field), and the second field of a pair goes in beside the first. Monochrome
+// (chroma_format_idc 0) comes out as NV12 with mid-grey chroma.
+//
+// Refused: flexible macroblock ordering, slices chopped over buffers.
 #include "Hardware/VideoCodec/ColorConvert.hpp"
 #include "Hardware/VideoCodec/Dxva/DxvaCodecs.hpp"
 #include "Hardware/VideoCodec/Dxva/DxvaSurfaces.hpp"
@@ -107,9 +112,14 @@ void write_scaling_list(NalWriter& w, ArrayView<const uint8_t> list) {
   }
 }
 
-// Reads the pic_parameter_set_id of a slice NAL unit (the bytes after the header byte; emulation prevention is undone for the few bytes read).
-[[nodiscard]] bool slice_pps_id(ConstByteView nal_payload, uint32_t* pps_id) {
-  uint8_t rbsp[16];
+// The start of a slice header (7.3.3): pic_parameter_set_id, and field_pic_flag / bottom_field_flag when the frames are interlaced (`frame_num_bits` is
+// log2_max_frame_num). `nal_payload` is the bytes after the header byte; emulation prevention is undone for the few bytes read.
+struct SliceStart {
+  uint32_t pps_id = 0;
+  bool field_pic = false, bottom_field = false;
+};
+[[nodiscard]] bool slice_start(ConstByteView nal_payload, uint32_t frame_num_bits, bool frame_mbs_only, SliceStart* out) {
+  uint8_t rbsp[24];
   uint32_t n = 0;
   int zeros = 0;
   for (uint8_t b : nal_payload) {
@@ -141,8 +151,23 @@ void write_scaling_list(NalWriter& w, ArrayView<const uint8_t> list) {
     *v = static_cast<uint32_t>((uint64_t{1} << lz) - 1 + value);
     return true;
   };
+  auto bit = [&](uint32_t* v) {
+    if (pos >= limit) return false;
+    *v = (rbsp[pos >> 3] >> (7 - (pos & 7))) & 1;
+    ++pos;
+    return true;
+  };
   uint32_t first_mb = 0, type = 0;
-  return ue(&first_mb) && ue(&type) && ue(pps_id) && *pps_id <= 255;
+  if (!ue(&first_mb) || !ue(&type) || !ue(&out->pps_id) || out->pps_id > 255) return false;
+  if (frame_mbs_only) return true;
+  if (frame_num_bits > limit || pos > limit - frame_num_bits) return false;
+  pos += frame_num_bits;   // frame_num
+  uint32_t field = 0, bottom = 0;
+  if (!bit(&field)) return false;
+  if (field && !bit(&bottom)) return false;
+  out->field_pic = field != 0;
+  out->bottom_field = bottom != 0;
+  return true;
 }
 
 bool same_bytes(ConstByteView a, ConstByteView b) {
@@ -190,12 +215,9 @@ class DxvaH264Decoder final : public IDxvaDecoder {
     out->surface = index;
 
     const uint16_t f = pp.wBitFields;
-    if (f & dxva::kH264FieldPic) return refuse(out, DxvaResult::Unsupported, "field pictures (the decoder decodes progressive frames only)");
-    if (f & dxva::kH264MbaffFrame) return refuse(out, DxvaResult::Unsupported, "MBAFF frames (the decoder decodes progressive frames only)");
     const uint32_t chroma_format = (f >> dxva::kH264ChromaFormatShift) & 3;
-    if (chroma_format == 0) return refuse(out, DxvaResult::Unsupported, "monochrome pictures (chroma_format_idc 0)");
-    if (chroma_format != 1 || pp.bit_depth_luma_minus8 != 0 || pp.bit_depth_chroma_minus8 != 0 || (f & dxva::kH264ResidualColourTransform))
-      return refuse(out, DxvaResult::Invalid, "not 8-bit 4:2:0, which the profile takes");
+    if (chroma_format > 1 || pp.bit_depth_luma_minus8 != 0 || pp.bit_depth_chroma_minus8 != 0 || (f & dxva::kH264ResidualColourTransform))
+      return refuse(out, DxvaResult::Invalid, "not 8-bit 4:2:0 or monochrome, which the profile takes");
     if (pp.ContinuationFlag != 1) return refuse(out, DxvaResult::Invalid, "ContinuationFlag is not 1");
     if (pp.num_slice_groups_minus1 != 0) return refuse(out, DxvaResult::Unsupported, "flexible macroblock ordering (num_slice_groups_minus1 > 0)");
     if (pp.num_ref_frames > 16 || pp.log2_max_frame_num_minus4 > 12 || pp.pic_order_cnt_type > 2 || pp.log2_max_pic_order_cnt_lsb_minus4 > 12 ||
@@ -206,6 +228,9 @@ class DxvaH264Decoder final : public IDxvaDecoder {
         pp.deblocking_filter_control_present_flag > 1 || pp.redundant_pic_cnt_present_flag > 1)
       return refuse(out, DxvaResult::Invalid, "a picture parameter is out of its range");
     const bool frame_mbs_only = (f & dxva::kH264FrameMbsOnly) != 0;
+    const bool field_pic = (f & dxva::kH264FieldPic) != 0, mbaff_frame = (f & dxva::kH264MbaffFrame) != 0;
+    if ((field_pic || mbaff_frame) && frame_mbs_only) return refuse(out, DxvaResult::Invalid, "a field picture or an MBAFF frame where frame_mbs_only_flag is 1");
+    if (field_pic && mbaff_frame) return refuse(out, DxvaResult::Invalid, "MbaffFrameFlag set for a field picture");
     const uint32_t mb_w = uint32_t{pp.wFrameWidthInMbsMinus1} + 1, mb_h = uint32_t{pp.wFrameHeightInMbsMinus1} + 1;
     if (!frame_mbs_only && (mb_h & 1)) return refuse(out, DxvaResult::Invalid, "the frame height is not a whole number of field macroblock pairs");
     if (mb_w * 16 > (config_.width + 15) / 16 * 16 || mb_h * 16 > (config_.height + 15) / 16 * 16)
@@ -220,8 +245,8 @@ class DxvaH264Decoder final : public IDxvaDecoder {
       const uint8_t entry = pp.RefFrameList[i];
       const uint32_t used = (pp.UsedForReferenceFlags >> (2 * i)) & 3;
       if (entry == dxva::kH264NoPicture || used == 0) continue;
-      if (used != 3) return refuse(out, DxvaResult::Unsupported, "a reference of which one field only is used (field decoding)");
       H264Decoder::ExternalReference& r = refs[ref_count++];
+      r.fields = static_cast<uint8_t>(used);   // (a field picture can use one field of a frame, the first field of its own frame among them)
       if (!dxva::surface_key(picture, config_.surfaces, dxva::h264_pic_index(entry), &r.key)) return refuse(out, DxvaResult::Invalid, "a reference is outside the surfaces");
       r.long_term = dxva::h264_pic_flag(entry);
       r.non_existing = ((pp.NonExistingFrameFlags >> i) & 1) != 0;
@@ -278,10 +303,12 @@ class DxvaH264Decoder final : public IDxvaDecoder {
           const uint32_t t = data[k + 3] & 31;
           if (t != 1 && t != 5) return refuse(out, DxvaResult::Invalid, "a slice entry holds a NAL unit that is not a coded slice");
         }
-      uint32_t id = 0;
-      if (!slice_pps_id(data.subview(start + 1), &id)) return refuse(out, DxvaResult::Invalid, "a slice header cannot be read");
-      if (pps_id >= 0 && static_cast<uint32_t>(pps_id) != id) return refuse(out, DxvaResult::Invalid, "the slices name different picture parameter sets");
-      pps_id = id;
+      SliceStart ss;
+      if (!slice_start(data.subview(start + 1), pp.log2_max_frame_num_minus4 + 4u, frame_mbs_only, &ss)) return refuse(out, DxvaResult::Invalid, "a slice header cannot be read");
+      if (pps_id >= 0 && static_cast<uint32_t>(pps_id) != ss.pps_id) return refuse(out, DxvaResult::Invalid, "the slices name different picture parameter sets");
+      if (ss.field_pic != field_pic || (field_pic && ss.bottom_field != dxva::h264_pic_flag(pp.CurrPic)))
+        return refuse(out, DxvaResult::Invalid, "a slice is of another picture structure than field_pic_flag and CurrPic say");
+      pps_id = ss.pps_id;
       if (!au_.append(data)) return refuse(out, DxvaResult::Invalid, "out of memory");
     }
 
@@ -292,7 +319,7 @@ class DxvaH264Decoder final : public IDxvaDecoder {
       w.bits(0, 8);
       w.bits(51, 8);    // level_idc (the decoder sizes no output queue in this mode)
       w.ue(0);          // seq_parameter_set_id
-      w.ue(1);          // chroma_format_idc
+      w.ue(chroma_format);   // chroma_format_idc: 1, or 0 (monochrome)
       w.ue(0);
       w.ue(0);
       w.bits(0, 1);     // qpprime_y_zero_transform_bypass_flag
@@ -323,7 +350,10 @@ class DxvaH264Decoder final : public IDxvaDecoder {
       w.ue(mb_w - 1);
       w.ue(frame_mbs_only ? mb_h - 1 : mb_h / 2 - 1);
       w.bits(frame_mbs_only ? 1 : 0, 1);
-      if (!frame_mbs_only) w.bits(0, 1);   // mb_adaptive_frame_field_flag (MBAFF frames are refused above)
+      // mb_adaptive_frame_field_flag: DXVA says MbaffFrameFlag of a frame only (a field picture decodes the same either way), so a field picture keeps the
+      // flag the last frame had and the parameter set stays the same through a sequence of fields and MBAFF frames.
+      if (!field_pic) mbaff_ = mbaff_frame;
+      if (!frame_mbs_only) w.bits(mbaff_ ? 1 : 0, 1);
       w.bits(pp.direct_8x8_inference_flag, 1);
       w.bits(0, 1);     // frame_cropping_flag: the whole coded size
       w.bits(0, 1);     // vui_parameters_present_flag
@@ -362,7 +392,8 @@ class DxvaH264Decoder final : public IDxvaDecoder {
     ext.bottom_poc = pp.CurrFieldOrderCnt[1];
     ext.references = ArrayView<const H264Decoder::ExternalReference>(refs, ref_count);
     VideoFrame decoded;
-    const H264Decoder::ExternalStatus status = decoder_.decode_external(au_input_.view(), ext, &decoded);
+    int structure = 3;
+    const H264Decoder::ExternalStatus status = decoder_.decode_external(au_input_.view(), ext, &decoded, &structure);
     // The decoder has the parameter sets now (they were parsed even when no slice decoded).
     if (new_sps) {
       sent_sps_.clear();
@@ -378,6 +409,7 @@ class DxvaH264Decoder final : public IDxvaDecoder {
     if (!out_.allocate(format) || !convert_frame(decoded, out_)) return refuse(out, DxvaResult::Invalid, "out of memory");
     out->frame = out_.frame(0, decoded.keyframe);
     out->frame.limited_range = decoded.limited_range;
+    out->field = static_cast<uint8_t>(structure == 3 ? 0 : structure);
     if (status == H264Decoder::ExternalStatus::MissingReference) {
       out->detail = "a reference names a surface that holds no decoded picture";
       return DxvaResult::MissingReference;
@@ -392,6 +424,7 @@ class DxvaH264Decoder final : public IDxvaDecoder {
   ByteBuffer sps_, pps_;   // the parameter sets of this picture
   ByteBuffer sent_sps_, sent_pps_;   // the ones the decoder has
   VideoFrameBuffer out_;
+  bool mbaff_ = false;     // mb_adaptive_frame_field_flag of the parameter set (see above)
 };
 
 }  // namespace

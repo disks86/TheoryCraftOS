@@ -789,13 +789,22 @@ static void decode_stream(const char *name, int codec, const GUID *profile, cons
   const UINT frame_bytes = vw * vh + 2 * cw * ch;
   Decoded *decoded = calloc(256, sizeof *decoded);
   BYTE *nv12 = malloc((size_t)s.width * s.height * 3 / 2);
-  UINT n = 0, failed = 0, last_feedback = 0;
+  UINT n = 0, pictures = 0, failed = 0, last_feedback = 0;
   int r = 1;
   while (SUCCEEDED(hr) && dec && out && r == 1 && n < 256) {
     if (codec == DXVA_CODEC_H264) last_feedback = ((const DXVA_PicParams_H264 *)p.picture_parameters)->StatusReportFeedbackNumber;
     const UINT slice_bytes = codec == DXVA_CODEC_H264 ? sizeof(DXVA_Slice_H264_Short) : sizeof(DXVA_SliceInfo);
     const UINT location = codec == DXVA_CODEC_H264 ? offsetof(DXVA_Slice_H264_Short, BSNALunitDataLocation) : offsetof(DXVA_SliceInfo, dwSliceDataLocation);
-    if (!decode_picture(dec, views[p.surface], &p, slice_bytes, location, split) || !read_planar(out, p.surface, nv12)) { ++failed; break; }
+    if (!decode_picture(dec, views[p.surface], &p, slice_bytes, location, split)) { ++failed; break; }
+    /* (an H.264 first field: the frame is whole after the second field, which goes into the same surface next) */
+    if (codec == DXVA_CODEC_H264 && p.field == 1) {
+      ++pictures;
+      r = dxva_stream_next(&s, &p);
+      checkf(r != 1 || p.field == 2, "%s: a first field is followed by its second", name);
+      continue;
+    }
+    if (!read_planar(out, p.surface, nv12)) { ++failed; break; }
+    ++pictures;
     /* (the visible picture as I420) */
     BYTE *f = malloc(frame_bytes);
     for (UINT y = 0; y < vh; ++y) memcpy(f + (size_t)y * vw, nv12 + (size_t)(s.crop_top + y) * s.width + s.crop_left, vw);
@@ -811,7 +820,7 @@ static void decode_stream(const char *name, int codec, const GUID *profile, cons
     ++n;
     r = dxva_stream_next(&s, &p);
   }
-  checkf(!failed && r == 0, "%s: %u pictures decoded through ID3D11VideoContext%s (%s)", name, n,
+  checkf(!failed && r == 0, "%s: %u pictures decoded through ID3D11VideoContext%s (%s)", name, pictures,
          split == 2 ? "3 (DecoderBeginFrame1, SubmitDecoderBuffers2)" : split ? ", the slices of a picture in two SubmitDecoderBuffers calls" : "",
          s.error ? s.error : "to the end of the stream");
   qsort(decoded, n, sizeof *decoded, by_key);
@@ -1314,6 +1323,9 @@ int main(void) {
       decode_stream("h264_cavlc", DXVA_CODEC_H264, &D3D11_DECODER_PROFILE_H264_VLD_NOFGT, g_h264_cavlc_b64, 17, g_h264_cavlc_fnv, 10, NULL, 1);
       decode_stream("h264_ltr", DXVA_CODEC_H264, &D3D11_DECODER_PROFILE_H264_VLD_NOFGT, g_h264_ltr_b64, 20, g_h264_ltr_fnv, 24, NULL, 0);
       decode_stream("h264_cqm", DXVA_CODEC_H264, &D3D11_DECODER_PROFILE_H264_VLD_NOFGT, g_h264_cqm_b64, 17, g_h264_cqm_fnv, 9, NULL, 2);
+      /* interlaced: MBAFF frames and field pictures (a field writes its lines of the slice; the frame is compared after its second field) */
+      decode_stream("h264_paff_mbaff_cabac", DXVA_CODEC_H264, &D3D11_DECODER_PROFILE_H264_VLD_NOFGT, g_h264_paff_mbaff_cabac_b64, 17, g_h264_paff_mbaff_cabac_fnv, 8, NULL,
+                    0);
       decode_stream("mpeg2_ibp", DXVA_CODEC_MPEG2, &D3D11_DECODER_PROFILE_MPEG2_VLD, g_mpeg2_ibp_b64, 8, NULL, 8, g_mpeg2_ibp_means, 1);
       test_decode_then_draw();
       test_processor();

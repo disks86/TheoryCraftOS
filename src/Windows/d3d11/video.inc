@@ -591,7 +591,9 @@ static HRESULT STDMETHODCALLTYPE vdev_CreateVideoDecoder(ID3D11VideoDevice2 *p, 
     memset(&dd, 0, sizeof dd);
     dd.Configuration.DecodeProfile = desc->Guid;
     dd.Configuration.BitstreamEncryption = D3D12_BITSTREAM_ENCRYPTION_TYPE_NONE;
-    dd.Configuration.InterlaceType = D3D12_VIDEO_FRAME_CODED_INTERLACE_TYPE_NONE;
+    /* (a Direct3D 11 H.264 decoder decodes interlaced content too: field pictures and MBAFF frames) */
+    dd.Configuration.InterlaceType = guid_eq(&desc->Guid, &D3D11_DECODER_PROFILE_H264_VLD_NOFGT) ? D3D12_VIDEO_FRAME_CODED_INTERLACE_TYPE_FIELD_BASED
+                                                                                                    : D3D12_VIDEO_FRAME_CODED_INTERLACE_TYPE_NONE;
     hr = ID3D12VideoDevice_CreateVideoDecoder(vs->v12, &dd, &IID_ID3D12VideoDecoder, (void **)&v->dec12);
     if (SUCCEEDED(hr)) {
       D3D12_VIDEO_DECODER_HEAP_DESC hd;

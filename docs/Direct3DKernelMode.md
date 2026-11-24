@@ -305,12 +305,16 @@ the kernel side of each can be tried and timed on the machine at hand:
 Direct3D 11's and 12's video interfaces run on the kernel's codecs, on the CPU, whatever the adapter.
 
 - **Decoding** (DXVA). A program parses its stream and hands each picture's DXVA buffers (picture parameters, inverse quantization matrices, slice or tile controls,
-  compressed data). `src/Hardware/VideoCodec/Dxva` decodes them (`IDxvaDecoder`, DxvaDecoder.hpp): H.264 VLD (short slices; progressive frames, POC types 0-2), MPEG-2 and
+  compressed data). `src/Hardware/VideoCodec/Dxva` decodes them (`IDxvaDecoder`, DxvaDecoder.hpp): H.264 VLD (short slices; progressive and interlaced - MBAFF frames
+  and field pictures, whose references are the fields UsedForReferenceFlags marks - monochrome as NV12 with grey chroma, POC types 0-2), MPEG-2 and
   MPEG-1, VP9 profile 0 and 10-bit profile 2, HEVC Main, AV1 profile 0 (8 and 10 bits, monochrome, film grain). H.264, MPEG-2 and VP9 rebuild what the software decoders
   read from the parameters; HEVC and AV1 fill the decoders' parameter sets and frame headers from them and take the reference sets DXVA gives. Each picture comes back at
   once, in decoding order, kept under a key (the kernel's allocation of its luma plane), so the reference list may change from picture to picture. The kernel's decoder is
   a `VideoDecoderObject` (escapes CreateVideoDecoder / DestroyVideoDecoder / QueryVideoDecodeSupport); the stream's `DecodeFrame` decodes into the output planes and writes a
-  `VideoDecodeStatus` (Direct3D 12's decode statistics). A picture that cannot be decoded leaves the planes alone and says so in the status: the stream goes on.
+  `VideoDecodeStatus` (Direct3D 12's decode statistics). A picture that cannot be decoded leaves the planes alone and says so in the status: the stream goes on. An H.264
+  field picture writes only its field's lines of the planes (`DxvaDecodedPicture::field`); the second field of a pair goes into the same surface beside the first, and the
+  decoder decodes it into the frame it keeps for that surface. Direct3D 12 reports `D3D12_VIDEO_FRAME_CODED_INTERLACE_TYPE_FIELD_BASED` for H.264 (with
+  `HEIGHT_ALIGNMENT_MULTIPLE_32_REQUIRED`), d3d11.dll's H.264 decoders are field-based.
 - **Processing.** The stream's `VideoProcess` (Hardware/VideoCodec/VideoProcess.hpp): up to 16 streams converted between NV12 / P010 / P016 / BGRA8 / BGRX8 / RGBA8 /
   RGB10A2 / RGBA16F and the SDR colour spaces (BT.601 / 709 / 2020, studio and full range, gamma 2.2, 2.4 and linear, chroma siting), scaled bilinearly, oriented, blended,
   composed over a background in a target rectangle. No HDR tone mapping, deinterlacing, filters or luma keying.
@@ -321,11 +325,12 @@ Direct3D 11's and 12's video interfaces run on the kernel's codecs, on the CPU, 
 - d3d12.dll: `ID3D12VideoDevice` .. 3, decoders and heaps (a heap is the kernel's decoder), processors, the VIDEO_DECODE / VIDEO_PROCESS queues and lists, decode
   statistics queries (video.inc; video_types.h has what mingw's d3d12video.h lacks). d3d11.dll: `ID3D11VideoDevice` .. 2, `ID3D11VideoContext` .. 3 on those
   (docs/Direct3D11.md).
-- Not there: video encoding and motion estimation (reported as not supported; their creators answer DXGI_ERROR_UNSUPPORTED), interlaced H.264 (field pictures, MBAFF),
-  HEVC Main10 and 4:2:2 / 4:4:4, AV1 profiles 1 and 2 and large-scale tiles, VC-1 and MPEG-4 part 2 DXVA profiles, decode-time conversion and histograms, protected
+- Not there: video encoding and motion estimation (reported as not supported; their creators answer DXGI_ERROR_UNSUPPORTED), HEVC Main10 and 4:2:2 / 4:4:4, AV1 profiles 1 and 2 and large-scale tiles, VC-1 and MPEG-4 part 2 DXVA profiles, decode-time conversion and histograms, protected
   content (crypto sessions and authenticated channels are refused), shared planar textures, placed planar resources, views of several slices of a planar texture.
 - Tests: `tests/run_host_tests.sh DxvaDecoderTest VideoProcessTest DxgkrnlTest` (every codec bit for bit with ffmpeg; the DXVA buffers filled as ffmpeg's dxva2_*.c
-  fill them), `tests/emulated_dx.sh tests/windows/d3d12videotest.c` and `d3d11videotest.c` (H.264 decoded through both APIs, bit for bit with ffmpeg; the processor
+  fill them; interlaced H.264 from x264 MBAFF streams and cuts of the JVT conformance streams, tests/data/make_h264_interlaced_fixtures.py),
+  `tests/emulated_dx.sh tests/windows/d3d12videotest.c` and `d3d11videotest.c` (H.264, progressive and an MBAFF + field picture stream, decoded through both APIs, bit
+  for bit with ffmpeg; the processor
   against BT.709), `tests/d3d12_qemu.sh d3d12videotest`, `tests/wow64_qemu.sh d3d12videotest d3d11videotest` (32-bit).
 
 ## Not done

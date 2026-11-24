@@ -163,18 +163,19 @@ void Core::idct8x8_add(uint8_t* dst, int stride, int32_t* c) {
 // ---------------------------------------------------------------------------------------------------------------
 // Intra prediction
 
+// (The neighbouring samples are read through the macroblock's own line step: in an MBAFF frame they are those 6.4.12.2 names for a frame or a field macroblock.)
 void Core::predict_intra4x4(int bx, int by, int mode) {
-  uint8_t* base = cur_->y.data() + static_cast<int64_t>(mby_ * 16 + by * 4) * cur_->stride + mbx_ * 16 + bx * 4;
-  const int stride = cur_->stride;
-  const bool has_left = bx > 0 || intra_nb_ok(-1, 0);
-  const bool has_top = by > 0 || intra_nb_ok(0, -1);
+  uint8_t* base = mb_y_ + static_cast<int64_t>(by * 4) * mb_ls_ + bx * 4;
+  const int stride = mb_ls_;
+  const bool has_left = bx > 0 || intra_rows_ok(-1, 4 * by, 4, false);
+  const bool has_top = by > 0 || intra_ok(4 * bx, -1, false);
   bool has_tl;
   if (bx > 0 && by > 0) has_tl = true;
-  else if (bx == 0 && by > 0) has_tl = intra_nb_ok(-1, 0);
-  else if (by == 0 && bx > 0) has_tl = intra_nb_ok(0, -1);
-  else has_tl = intra_nb_ok(-1, -1);
+  else if (bx == 0 && by > 0) has_tl = intra_ok(-1, 4 * by - 1, false);
+  else if (by == 0 && bx > 0) has_tl = intra_ok(4 * bx - 1, -1, false);
+  else has_tl = intra_ok(-1, -1, false);
   bool has_tr;
-  if (by == 0) has_tr = bx < 3 ? intra_nb_ok(0, -1) : intra_nb_ok(1, -1);
+  if (by == 0) has_tr = intra_ok(4 * bx + 4, -1, false);
   else if (bx == 3) has_tr = false;
   else has_tr = kZOrder[(by - 1) * 4 + bx + 1] < kZOrder[by * 4 + bx];
   Neighbours nb;
@@ -192,18 +193,18 @@ void Core::predict_intra4x4(int bx, int by, int mode) {
 
 void Core::predict_intra8x8(int b8, int mode) {
   const int bx = (b8 & 1) * 2, by = (b8 >> 1) * 2;
-  uint8_t* base = cur_->y.data() + static_cast<int64_t>(mby_ * 16 + by * 4) * cur_->stride + mbx_ * 16 + bx * 4;
-  const int stride = cur_->stride;
-  const bool has_left = bx > 0 || intra_nb_ok(-1, 0);
-  const bool has_top = by > 0 || intra_nb_ok(0, -1);
+  uint8_t* base = mb_y_ + static_cast<int64_t>(by * 4) * mb_ls_ + bx * 4;
+  const int stride = mb_ls_;
+  const bool has_left = bx > 0 || intra_rows_ok(-1, 4 * by, 8, false);
+  const bool has_top = by > 0 || intra_ok(4 * bx, -1, false);
   bool has_tl;
   if (bx > 0 && by > 0) has_tl = true;
-  else if (bx == 0 && by > 0) has_tl = intra_nb_ok(-1, 0);
-  else if (by == 0 && bx > 0) has_tl = intra_nb_ok(0, -1);
-  else has_tl = intra_nb_ok(-1, -1);
+  else if (bx == 0 && by > 0) has_tl = intra_ok(-1, 4 * by - 1, false);
+  else if (by == 0 && bx > 0) has_tl = intra_ok(4 * bx - 1, -1, false);
+  else has_tl = intra_ok(-1, -1, false);
   bool has_tr;
-  if (b8 == 0) has_tr = intra_nb_ok(0, -1);
-  else if (b8 == 1) has_tr = intra_nb_ok(1, -1);
+  if (b8 == 0) has_tr = intra_ok(8, -1, false);
+  else if (b8 == 1) has_tr = intra_ok(16, -1, false);
   else if (b8 == 2) has_tr = true;
   else has_tr = false;
   int top[16], left[8], tl = 128;
@@ -244,9 +245,9 @@ void Core::predict_intra8x8(int b8, int mode) {
 }
 
 void Core::predict_intra16(int mode) {
-  uint8_t* base = cur_->y.data() + static_cast<int64_t>(mby_ * 16) * cur_->stride + mbx_ * 16;
-  const int stride = cur_->stride;
-  const bool has_top = intra_nb_ok(0, -1), has_left = intra_nb_ok(-1, 0), has_tl = intra_nb_ok(-1, -1);
+  uint8_t* base = mb_y_;
+  const int stride = mb_ls_;
+  const bool has_top = intra_ok(0, -1, false), has_left = intra_rows_ok(-1, 0, 16, false), has_tl = intra_ok(-1, -1, false);
   switch (mode) {
     case 0:
       for (int y = 0; y < 16; ++y)
@@ -299,31 +300,34 @@ void Core::predict_intra16(int mode) {
 }
 
 void Core::predict_chroma(int mode) {
-  const bool has_top = intra_nb_ok(0, -1), has_left = intra_nb_ok(-1, 0), has_tl = intra_nb_ok(-1, -1);
-  const int stride = cur_->cstride;
+  // (the DC prediction of each 4x4 block looks at its own four left samples, which in an MBAFF frame may come from another macroblock than the others: 8.3.4)
+  const bool left_blk[2] = {intra_rows_ok(-1, 0, 4, true), intra_rows_ok(-1, 4, 4, true)};
+  const bool has_top = intra_ok(0, -1, true), has_left = left_blk[0] && left_blk[1], has_tl = intra_ok(-1, -1, true);
+  const int stride = mb_cs_;
   for (int plane = 0; plane < 2; ++plane) {
-    uint8_t* base = (plane == 0 ? cur_->u.data() : cur_->v.data()) + static_cast<int64_t>(mby_ * 8) * stride + mbx_ * 8;
+    uint8_t* base = plane == 0 ? mb_u_ : mb_v_;
     switch (mode) {
       case 0: {
         for (int cy = 0; cy < 2; ++cy) {
+          const bool left_ok = left_blk[cy];
           for (int cx = 0; cx < 2; ++cx) {
             int st = 0, sl = 0;
             if (has_top)
               for (int i = 0; i < 4; ++i) st += base[cx * 4 + i - stride];
-            if (has_left)
+            if (left_ok)
               for (int i = 0; i < 4; ++i) sl += base[(cy * 4 + i) * stride - 1];
             int v;
             if ((cx == 0 && cy == 0) || (cx == 1 && cy == 1)) {
-              if (has_top && has_left) v = (st + sl + 4) >> 3;
-              else if (has_left) v = (sl + 2) >> 2;
+              if (has_top && left_ok) v = (st + sl + 4) >> 3;
+              else if (left_ok) v = (sl + 2) >> 2;
               else if (has_top) v = (st + 2) >> 2;
               else v = 128;
             } else if (cx == 1 && cy == 0) {
               if (has_top) v = (st + 2) >> 2;
-              else if (has_left) v = (sl + 2) >> 2;
+              else if (left_ok) v = (sl + 2) >> 2;
               else v = 128;
             } else {
-              if (has_left) v = (sl + 2) >> 2;
+              if (left_ok) v = (sl + 2) >> 2;
               else if (has_top) v = (st + 2) >> 2;
               else v = 128;
             }
@@ -438,35 +442,46 @@ void mc_chroma(const uint8_t* src, int stride, int pw, int ph, int xe, int ye, i
 void Core::mc_partition(int bx, int by, int w, int h) {
   const int b8 = (by >> 1) * 2 + (bx >> 1);
   const int refs[2] = {cmotion_->ref[0][b8], cmotion_->ref[1][b8]};
-  const int px = mbx_ * 16 + bx * 4, py = mby_ * 16 + by * 4;
+  // The partition's position in the sample grid of its references: the frame, or (field picture, field macroblock) a field (8.4.2.1).
+  const int px = mbx_ * 16 + bx * 4, py = mc_y_ + by * 4;
   const int W = w * 4, H = h * 4;
-  const int pw = mb_w_ * 16, ph = mb_h_ * 16;
+  const int pw = mb_w_ * 16, ph = mc_h_;
+  const int cur_parity = field_pic_ ? structure_ : (mb_bottom_ ? 2 : 1);   // (field macroblocks and field pictures)
   uint8_t pred[2][3][16 * 16];  // per list: luma, Cb, Cr (chroma uses 8x8 of the buffer)
   int used[2] = {0, 0};
   for (int l = 0; l < 2; ++l) {
-    if (refs[l] < 0) continue;
-    const Picture* ref = ref_list_[l][refs[l]];
+    if (refs[l] < 0 || refs[l] >= ref_count_[l]) continue;
+    const RefPic& rp = ref_pic(l, refs[l]);
+    const Picture* ref = rp.pic;
     if (!ref) continue;
     used[l] = 1;
+    const int ly = rp.parity == 2 ? ref->stride : 0, cy = rp.parity == 2 ? ref->cstride : 0;
+    const int ls = rp.parity ? 2 * ref->stride : ref->stride, cs = rp.parity ? 2 * ref->cstride : ref->cstride;
     const int mvx = cmotion_->mv[l][by * 4 + bx][0], mvy = cmotion_->mv[l][by * 4 + bx][1];
-    mc_luma(ref->y.data(), ref->stride, pw, ph, px * 4 + mvx, py * 4 + mvy, W, H, pred[l][0], 16);
-    mc_chroma(ref->u.data(), ref->cstride, pw / 2, ph / 2, (px / 2) * 8 + mvx, (py / 2) * 8 + mvy, W / 2, H / 2, pred[l][1], 16);
-    mc_chroma(ref->v.data(), ref->cstride, pw / 2, ph / 2, (px / 2) * 8 + mvx, (py / 2) * 8 + mvy, W / 2, H / 2, pred[l][2], 16);
+    mc_luma(ref->y.data() + ly, ls, pw, ph, px * 4 + mvx, py * 4 + mvy, W, H, pred[l][0], 16);
+    if (mono_) continue;
+    // Table 8-10: a field predicted from the field of the other parity moves its chroma vector by a quarter of a chroma field line.
+    int cmvy = mvy;
+    if (mb_field_ && rp.parity && rp.parity != cur_parity) cmvy += rp.parity == 1 ? 2 : -2;
+    mc_chroma(ref->u.data() + cy, cs, pw / 2, ph / 2, (px / 2) * 8 + mvx, (py / 2) * 8 + cmvy, W / 2, H / 2, pred[l][1], 16);
+    mc_chroma(ref->v.data() + cy, cs, pw / 2, ph / 2, (px / 2) * 8 + mvx, (py / 2) * 8 + cmvy, W / 2, H / 2, pred[l][2], 16);
   }
   if (!used[0] && !used[1]) return;
   const bool is_b = sh_.type == kSliceB;
   const bool explicit_w = (!is_b && pp_->weighted_pred) || (is_b && pp_->weighted_bipred_idc == 1);
   const bool implicit_w = is_b && pp_->weighted_bipred_idc == 2 && used[0] && used[1];
-  for (int plane = 0; plane < 3; ++plane) {
+  // 8-284: the explicit weights of a field macroblock of an MBAFF frame are those of the frame the field is in.
+  const int wi[2] = {(mbaff_ && mb_field_) ? refs[0] >> 1 : refs[0], (mbaff_ && mb_field_) ? refs[1] >> 1 : refs[1]};
+  for (int plane = 0; plane < (mono_ ? 1 : 3); ++plane) {
     const int pwid = plane == 0 ? W : W / 2, phei = plane == 0 ? H : H / 2;
     uint8_t* dst;
     int dstride;
     if (plane == 0) {
-      dst = cur_->y.data() + static_cast<int64_t>(py) * cur_->stride + px;
-      dstride = cur_->stride;
+      dst = mb_y_ + static_cast<int64_t>(by * 4) * mb_ls_ + bx * 4;
+      dstride = mb_ls_;
     } else {
-      dst = (plane == 1 ? cur_->u.data() : cur_->v.data()) + static_cast<int64_t>(py / 2) * cur_->cstride + px / 2;
-      dstride = cur_->cstride;
+      dst = (plane == 1 ? mb_u_ : mb_v_) + static_cast<int64_t>(by * 2) * mb_cs_ + bx * 2;
+      dstride = mb_cs_;
     }
     for (int y = 0; y < phei; ++y) {
       for (int x = 0; x < pwid; ++x) {
@@ -475,13 +490,13 @@ void Core::mc_partition(int bx, int by, int w, int h) {
           const int p0 = pred[0][plane][y * 16 + x], p1 = pred[1][plane][y * 16 + x];
           if (explicit_w) {
             const int log_wd = plane == 0 ? sh_.luma_log2_denom : sh_.chroma_log2_denom;
-            const int w0 = plane == 0 ? sh_.luma_weight[0][refs[0]] : sh_.chroma_weight[0][refs[0]][plane - 1];
-            const int w1 = plane == 0 ? sh_.luma_weight[1][refs[1]] : sh_.chroma_weight[1][refs[1]][plane - 1];
-            const int o0 = plane == 0 ? sh_.luma_offset[0][refs[0]] : sh_.chroma_offset[0][refs[0]][plane - 1];
-            const int o1 = plane == 0 ? sh_.luma_offset[1][refs[1]] : sh_.chroma_offset[1][refs[1]][plane - 1];
+            const int w0 = plane == 0 ? sh_.luma_weight[0][wi[0]] : sh_.chroma_weight[0][wi[0]][plane - 1];
+            const int w1 = plane == 0 ? sh_.luma_weight[1][wi[1]] : sh_.chroma_weight[1][wi[1]][plane - 1];
+            const int o0 = plane == 0 ? sh_.luma_offset[0][wi[0]] : sh_.chroma_offset[0][wi[0]][plane - 1];
+            const int o1 = plane == 0 ? sh_.luma_offset[1][wi[1]] : sh_.chroma_offset[1][wi[1]][plane - 1];
             v = clip3(0, 255, ((p0 * w0 + p1 * w1 + (1 << log_wd)) >> (log_wd + 1)) + ((o0 + o1 + 1) >> 1));
           } else if (implicit_w) {
-            const int w1 = implicit_w_[refs[0]][refs[1]], w0 = 64 - w1;
+            const int w1 = implicit_w_[rl_][refs[0]][refs[1]], w0 = 64 - w1;
             v = clip3(0, 255, (p0 * w0 + p1 * w1 + 32) >> 6);
           } else {
             v = (p0 + p1 + 1) >> 1;
@@ -491,8 +506,8 @@ void Core::mc_partition(int bx, int by, int w, int h) {
           const int p = pred[l][plane][y * 16 + x];
           if (explicit_w) {
             const int log_wd = plane == 0 ? sh_.luma_log2_denom : sh_.chroma_log2_denom;
-            const int wt = plane == 0 ? sh_.luma_weight[l][refs[l]] : sh_.chroma_weight[l][refs[l]][plane - 1];
-            const int o = plane == 0 ? sh_.luma_offset[l][refs[l]] : sh_.chroma_offset[l][refs[l]][plane - 1];
+            const int wt = plane == 0 ? sh_.luma_weight[l][wi[l]] : sh_.chroma_weight[l][wi[l]][plane - 1];
+            const int o = plane == 0 ? sh_.luma_offset[l][wi[l]] : sh_.chroma_offset[l][wi[l]][plane - 1];
             if (log_wd >= 1) v = clip3(0, 255, ((p * wt + (1 << (log_wd - 1))) >> log_wd) + o);
             else v = clip3(0, 255, p * wt + o);
           } else {
@@ -515,23 +530,24 @@ void Core::inter_predict() {
 void Core::residual_luma4x4(int bx, int by) {
   const int blk = by * 4 + bx;
   if (!coef_present_[0][blk]) return;
-  uint8_t* dst = cur_->y.data() + static_cast<int64_t>(mby_ * 16 + by * 4) * cur_->stride + mbx_ * 16 + bx * 4;
-  idct4x4_add(dst, cur_->stride, &coef_[0][blk * 16]);
+  uint8_t* dst = mb_y_ + static_cast<int64_t>(by * 4) * mb_ls_ + bx * 4;
+  idct4x4_add(dst, mb_ls_, &coef_[0][blk * 16]);
 }
 
 void Core::residual_luma8x8(int b8) {
   if (!coef_present_[0][b8]) return;
   const int bx = (b8 & 1) * 2, by = (b8 >> 1) * 2;
-  uint8_t* dst = cur_->y.data() + static_cast<int64_t>(mby_ * 16 + by * 4) * cur_->stride + mbx_ * 16 + bx * 4;
-  idct8x8_add(dst, cur_->stride, &coef_[0][b8 * 64]);
+  uint8_t* dst = mb_y_ + static_cast<int64_t>(by * 4) * mb_ls_ + bx * 4;
+  idct8x8_add(dst, mb_ls_, &coef_[0][b8 * 64]);
 }
 
 void Core::residual_chroma() {
+  if (mono_) return;
   for (int plane = 1; plane < 3; ++plane) {
-    uint8_t* base = (plane == 1 ? cur_->u.data() : cur_->v.data()) + static_cast<int64_t>(mby_ * 8) * cur_->cstride + mbx_ * 8;
+    uint8_t* base = plane == 1 ? mb_u_ : mb_v_;
     for (int s = 0; s < 4; ++s) {
       if (!coef_present_[plane][s]) continue;
-      idct4x4_add(base + (s >> 1) * 4 * cur_->cstride + (s & 1) * 4, cur_->cstride, &coef_[plane][s * 16]);
+      idct4x4_add(base + (s >> 1) * 4 * mb_cs_ + (s & 1) * 4, mb_cs_, &coef_[plane][s * 16]);
     }
   }
 }
@@ -570,7 +586,7 @@ void Core::reconstruct_mb() {
       residual_luma4x4(bx, by);
     }
   }
-  predict_chroma(cm_->chroma_mode);
+  if (!mono_) predict_chroma(cm_->chroma_mode);
   residual_chroma();
 }
 

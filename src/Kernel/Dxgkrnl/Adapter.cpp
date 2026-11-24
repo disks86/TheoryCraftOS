@@ -926,7 +926,9 @@ class Adapter::StreamRunner {
 
   // A plane the decoder made, written into an image the runtime keeps it in (DxgTypes.hpp VideoDecoderDesc): every sample of a channel becomes a channel of a pixel, the others 0 and
   // the last the maximum. `channels` 1 (luma) or 2 (chroma: U, V interleaved); `sixteen` samples of 16 bits. Only what both have is written.
-  static bool write_video_plane(VidMm& mm, Allocation& image, const uint8_t* plane, uint32_t stride, uint32_t width, uint32_t height, uint32_t channels, bool sixteen) {
+  // (`field` 1 / 2: only the lines of the top / bottom field - a decoded field picture; the image keeps its other lines)
+  static bool write_video_plane(VidMm& mm, Allocation& image, const uint8_t* plane, uint32_t stride, uint32_t width, uint32_t height, uint32_t channels, bool sixteen,
+                                uint32_t field = 0) {
     if (!plane) return false;
     const uint32_t w = width < image.desc().width ? width : image.desc().width, h = height < image.desc().height ? height : image.desc().height;
     const uint32_t sample = sixteen ? 2 : 1, pixel = 4 * sample;
@@ -935,7 +937,7 @@ class Adapter::StreamRunner {
     // (the decoder's plane as a view of what it says: stride bytes a row, h rows)
     if (uint64_t{w} * channels * sample > stride) return false;
     const ConstByteView source(plane, uint64_t{stride} * (h - 1) + uint64_t{w} * channels * sample);
-    for (uint32_t y = 0; y < h; ++y) {
+    for (uint32_t y = field ? field - 1 : 0; y < h; y += field ? 2 : 1) {
       ByteView row;
       if (!image.writable_backing().try_subview(pitch * y, uint64_t{w} * pixel, &row)) return false;
       const ConstByteView from = source.subview(uint64_t{stride} * y, uint64_t{w} * channels * sample);
@@ -1006,8 +1008,9 @@ class Adapter::StreamRunner {
     if (result == hardware::DxvaResult::Ok || result == hardware::DxvaResult::MissingReference) {
       const hardware::VideoFrame& f = decoded.frame;
       const bool sixteen = f.format.pixel_format == hardware::PixelFormat::P010;
-      const bool written = sixteen == (desc.ten_bit != 0) && write_video_plane(mm_, *luma, f.plane[0], f.stride[0], f.format.width, f.format.height, 1, sixteen) &&
-                           write_video_plane(mm_, *chroma, f.plane[1], f.stride[1], f.format.chroma_width(), f.format.chroma_height(), 2, sixteen);
+      const uint32_t field = decoded.field <= 2 ? decoded.field : 0;
+      const bool written = sixteen == (desc.ten_bit != 0) && write_video_plane(mm_, *luma, f.plane[0], f.stride[0], f.format.width, f.format.height, 1, sixteen, field) &&
+                           write_video_plane(mm_, *chroma, f.plane[1], f.stride[1], f.format.chroma_width(), f.format.chroma_height(), 2, sixteen, field);
       if (!written) return status::kInvalidDeviceState;
       unbind_textures_of(luma);
       unbind_textures_of(chroma);

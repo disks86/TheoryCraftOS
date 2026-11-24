@@ -47,10 +47,14 @@ static const VideoProfile *video_profile(const GUID *g) {
     if (guid_eq(g, g_video_profiles[i].guid)) return &g_video_profiles[i];
   return NULL;
 }
-/* Whether the kernel decodes the configuration into `format` at that size (progressive, not encrypted). */
+/* The interlace types a profile decodes: progressive, and field-based content (field pictures and MBAFF frames) for H.264, as Windows' H.264 drivers report. */
+static int video_interlace_ok(const VideoProfile *p, D3D12_VIDEO_FRAME_CODED_INTERLACE_TYPE t) {
+  return t == D3D12_VIDEO_FRAME_CODED_INTERLACE_TYPE_NONE || (t == D3D12_VIDEO_FRAME_CODED_INTERLACE_TYPE_FIELD_BASED && p && p->kernel == 0);
+}
+/* Whether the kernel decodes the configuration into `format` at that size (not encrypted). */
 static int video_decode_supported(Dev *d, const D3D12_VIDEO_DECODE_CONFIGURATION *c, DXGI_FORMAT format, UINT width, UINT height) {
   const VideoProfile *p = video_profile(&c->DecodeProfile);
-  if (!p || c->BitstreamEncryption != D3D12_BITSTREAM_ENCRYPTION_TYPE_NONE || c->InterlaceType != D3D12_VIDEO_FRAME_CODED_INTERLACE_TYPE_NONE) return 0;
+  if (!p || c->BitstreamEncryption != D3D12_BITSTREAM_ENCRYPTION_TYPE_NONE || !video_interlace_ok(p, c->InterlaceType)) return 0;
   int known = 0;
   for (UINT i = 0; i < p->nformats; ++i) known |= p->formats[i] == format;
   if (!known || width == 0 || height == 0) return 0;
@@ -163,7 +167,9 @@ static HRESULT STDMETHODCALLTYPE vdev_CheckFeatureSupport(ID3D12VideoDevice3 *v,
       if (f->NodeIndex) return E_INVALIDARG;
       const int ok = video_decode_supported(d, &f->Configuration, f->DecodeFormat, f->Width, f->Height);
       f->SupportFlags = ok ? D3D12_VIDEO_DECODE_SUPPORT_FLAG_SUPPORTED : D3D12_VIDEO_DECODE_SUPPORT_FLAG_NONE;
-      f->ConfigurationFlags = D3D12_VIDEO_DECODE_CONFIGURATION_FLAG_NONE;
+      /* (field-based content is coded in macroblock pairs: its surfaces are 32 lines aligned) */
+      f->ConfigurationFlags = ok && f->Configuration.InterlaceType == D3D12_VIDEO_FRAME_CODED_INTERLACE_TYPE_FIELD_BASED ? D3D12_VIDEO_DECODE_CONFIGURATION_FLAG_HEIGHT_ALIGNMENT_MULTIPLE_32_REQUIRED
+                                                                                                                       : D3D12_VIDEO_DECODE_CONFIGURATION_FLAG_NONE;
       /* (tier 2: a reference may be a texture of its own or a slice of an array, each picture is known by its texture) */
       f->DecodeTier = ok ? D3D12_VIDEO_DECODE_TIER_2 : D3D12_VIDEO_DECODE_TIER_NOT_SUPPORTED;
       return S_OK;
@@ -187,14 +193,14 @@ static HRESULT STDMETHODCALLTYPE vdev_CheckFeatureSupport(ID3D12VideoDevice3 *v,
       D3D12_FEATURE_DATA_VIDEO_DECODE_FORMAT_COUNT *f = data;
       const VideoProfile *p = video_profile(&f->Configuration.DecodeProfile);
       if (f->NodeIndex || !p) return E_INVALIDARG;
-      f->FormatCount = f->Configuration.BitstreamEncryption == D3D12_BITSTREAM_ENCRYPTION_TYPE_NONE && f->Configuration.InterlaceType == D3D12_VIDEO_FRAME_CODED_INTERLACE_TYPE_NONE ? p->nformats : 0;
+      f->FormatCount = f->Configuration.BitstreamEncryption == D3D12_BITSTREAM_ENCRYPTION_TYPE_NONE && video_interlace_ok(p, f->Configuration.InterlaceType) ? p->nformats : 0;
       return S_OK;
     }
     case D3D12_FEATURE_VIDEO_DECODE_FORMATS: {
       VIDEO_FEATURE(D3D12_FEATURE_DATA_VIDEO_DECODE_FORMATS);
       D3D12_FEATURE_DATA_VIDEO_DECODE_FORMATS *f = data;
       const VideoProfile *p = video_profile(&f->Configuration.DecodeProfile);
-      const UINT n = p && f->Configuration.BitstreamEncryption == D3D12_BITSTREAM_ENCRYPTION_TYPE_NONE && f->Configuration.InterlaceType == D3D12_VIDEO_FRAME_CODED_INTERLACE_TYPE_NONE ? p->nformats : 0;
+      const UINT n = p && f->Configuration.BitstreamEncryption == D3D12_BITSTREAM_ENCRYPTION_TYPE_NONE && video_interlace_ok(p, f->Configuration.InterlaceType) ? p->nformats : 0;
       if (f->NodeIndex || !p || f->FormatCount != n || (n && !f->pOutputFormats)) return E_INVALIDARG;
       for (UINT i = 0; i < n; ++i) f->pOutputFormats[i] = p->formats[i];
       return S_OK;
@@ -348,7 +354,7 @@ static HRESULT vdec_make(Dev *d, const D3D12_VIDEO_DECODER_DESC *desc, ID3D12Pro
   if (out) *out = NULL;
   if (!desc || !out || desc->NodeMask > 1 || session) return E_INVALIDARG;
   const VideoProfile *p = video_profile(&desc->Configuration.DecodeProfile);
-  if (!p || desc->Configuration.BitstreamEncryption != D3D12_BITSTREAM_ENCRYPTION_TYPE_NONE || desc->Configuration.InterlaceType != D3D12_VIDEO_FRAME_CODED_INTERLACE_TYPE_NONE)
+  if (!p || desc->Configuration.BitstreamEncryption != D3D12_BITSTREAM_ENCRYPTION_TYPE_NONE || !video_interlace_ok(p, desc->Configuration.InterlaceType))
     return E_INVALIDARG;
   VDec *v = dobj_new(sizeof *v, d, &vdec_vtbl, g_vdec_iids, dobj_child_destroy);
   if (!v) return E_OUTOFMEMORY;

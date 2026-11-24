@@ -214,9 +214,13 @@ static void test_features(void) {
   CHECK_HR(ID3D12VideoDevice_CheckFeatureSupport(g_vdev, D3D12_FEATURE_VIDEO_DECODE_SUPPORT, &ds, sizeof ds));
   CHECK(ds.SupportFlags == D3D12_VIDEO_DECODE_SUPPORT_FLAG_NONE);
   ds.DecodeFormat = DXGI_FORMAT_NV12;
-  ds.Configuration.InterlaceType = D3D12_VIDEO_FRAME_CODED_INTERLACE_TYPE_FIELD_BASED;      /* (progressive only) */
+  ds.Configuration.InterlaceType = D3D12_VIDEO_FRAME_CODED_INTERLACE_TYPE_FIELD_BASED;      /* (H.264 field pictures and MBAFF frames: 32 lines aligned) */
+  CHECK_HR(ID3D12VideoDevice_CheckFeatureSupport(g_vdev, D3D12_FEATURE_VIDEO_DECODE_SUPPORT, &ds, sizeof ds));
+  CHECK(ds.SupportFlags == D3D12_VIDEO_DECODE_SUPPORT_FLAG_SUPPORTED && ds.ConfigurationFlags == D3D12_VIDEO_DECODE_CONFIGURATION_FLAG_HEIGHT_ALIGNMENT_MULTIPLE_32_REQUIRED);
+  ds.Configuration.DecodeProfile = D3D12_VIDEO_DECODE_PROFILE_VP9;      /* (the other profiles are progressive here) */
   CHECK_HR(ID3D12VideoDevice_CheckFeatureSupport(g_vdev, D3D12_FEATURE_VIDEO_DECODE_SUPPORT, &ds, sizeof ds));
   CHECK(ds.SupportFlags == D3D12_VIDEO_DECODE_SUPPORT_FLAG_NONE);
+  ds.Configuration.DecodeProfile = D3D12_VIDEO_DECODE_PROFILE_H264;
   ds.Configuration.InterlaceType = D3D12_VIDEO_FRAME_CODED_INTERLACE_TYPE_NONE;
   ds.Width = 8192;      /* (the planes are the kernel's textures: 4096 at most) */
   CHECK_HR(ID3D12VideoDevice_CheckFeatureSupport(g_vdev, D3D12_FEATURE_VIDEO_DECODE_SUPPORT, &ds, sizeof ds));
@@ -484,14 +488,33 @@ static int by_key(const void *a, const void *b) {
 
 /* An H.264 stream decoded through ID3D12VideoDecodeCommandList, picture by picture, compared in display order with ffmpeg's (FNV hashes of the visible I420 picture).
  * `separate`: every surface a texture of its own (the reference frames are different resources at subresource 0), else one NV12 array (the indices are its slices).
- * The decode statistics of every picture are queried and resolved. */
-static void decode_h264(const char *name, const char *b64, unsigned surfaces, const unsigned *hashes, unsigned frames, int separate) {
+ * `interlaced`: field-based content (a decoder of D3D12_VIDEO_FRAME_CODED_INTERLACE_TYPE_FIELD_BASED): a field picture writes its field's lines of the surface, the
+ * frame is compared once its second field is in. The decode statistics of every picture are queried and resolved. */
+static void decode_h264(const char *name, const char *b64, unsigned surfaces, const unsigned *hashes, unsigned frames, int separate, int interlaced) {
   size_t size = 0;
   unsigned char *data = base64_decode(b64, &size);
   DxvaStream s;
   DxvaPicture p;
   if (!data || dxva_stream_open(&s, DXVA_CODEC_H264, data, size, surfaces) != 0 || dxva_stream_next(&s, &p) != 1) { CHECK(0); free(data); return; }
-  D3D12_VIDEO_DECODER_DESC dd = {0, {D3D12_VIDEO_DECODE_PROFILE_H264, D3D12_BITSTREAM_ENCRYPTION_TYPE_NONE, D3D12_VIDEO_FRAME_CODED_INTERLACE_TYPE_NONE}};
+  D3D12_VIDEO_DECODER_DESC dd = {0, {D3D12_VIDEO_DECODE_PROFILE_H264, D3D12_BITSTREAM_ENCRYPTION_TYPE_NONE,
+                                     interlaced ? D3D12_VIDEO_FRAME_CODED_INTERLACE_TYPE_FIELD_BASED : D3D12_VIDEO_FRAME_CODED_INTERLACE_TYPE_NONE}};
+  if (interlaced) {
+    /* field-based H.264 is supported, with surfaces 32 lines aligned; not for the other profiles */
+    D3D12_FEATURE_DATA_VIDEO_DECODE_SUPPORT fs;
+    memset(&fs, 0, sizeof fs);
+    fs.Configuration = dd.Configuration;
+    fs.Width = s.width;
+    fs.Height = s.height;
+    fs.DecodeFormat = DXGI_FORMAT_NV12;
+    CHECK_HR(ID3D12VideoDevice_CheckFeatureSupport(g_vdev, D3D12_FEATURE_VIDEO_DECODE_SUPPORT, &fs, sizeof fs));
+    CHECK((fs.SupportFlags & D3D12_VIDEO_DECODE_SUPPORT_FLAG_SUPPORTED) && (fs.ConfigurationFlags & D3D12_VIDEO_DECODE_CONFIGURATION_FLAG_HEIGHT_ALIGNMENT_MULTIPLE_32_REQUIRED));
+    fs.Configuration.DecodeProfile = D3D12_VIDEO_DECODE_PROFILE_HEVC_MAIN;
+    CHECK_HR(ID3D12VideoDevice_CheckFeatureSupport(g_vdev, D3D12_FEATURE_VIDEO_DECODE_SUPPORT, &fs, sizeof fs));
+    CHECK(!(fs.SupportFlags & D3D12_VIDEO_DECODE_SUPPORT_FLAG_SUPPORTED));
+    D3D12_FEATURE_DATA_VIDEO_DECODE_FORMAT_COUNT fc = {0, dd.Configuration, 0};
+    CHECK_HR(ID3D12VideoDevice_CheckFeatureSupport(g_vdev, D3D12_FEATURE_VIDEO_DECODE_FORMAT_COUNT, &fc, sizeof fc));
+    CHECK(fc.FormatCount == 1);
+  }
   D3D12_VIDEO_DECODER_HEAP_DESC hd;
   memset(&hd, 0, sizeof hd);
   hd.Configuration = dd.Configuration;
@@ -525,9 +548,9 @@ static void decode_h264(const char *name, const char *b64, unsigned surfaces, co
   const UINT vw = s.width - s.crop_left - s.crop_right, vh = s.height - s.crop_top - s.crop_bottom, cw = (vw + 1) / 2, ch = (vh + 1) / 2;
   BYTE *y = malloc((size_t)s.width * s.height), *uv = malloc((size_t)s.width * s.height / 2), *f = malloc((size_t)vw * vh + 2 * cw * ch);
   Decoded decoded[256];
-  unsigned n = 0, statuses_ok = 0;
+  unsigned n = 0, pictures = 0, statuses_ok = 0;
   int r = 1;
-  while (dec && heap && vl && bits && tex[0] && r == 1 && n < 256) {
+  while (dec && heap && vl && bits && tex[0] && r == 1 && pictures < 256) {
     /* (the compressed data in an upload buffer, the arguments as the program's own memory) */
     BYTE *map = NULL;
     ID3D12Resource_Map(bits, 0, NULL, (void **)&map);
@@ -550,12 +573,19 @@ static void decode_h264(const char *name, const char *b64, unsigned surfaces, co
     out.pOutputTexture2D = tex[p.surface];
     out.OutputSubresource = subs[p.surface];
     ID3D12VideoDecodeCommandList_DecodeFrame(vl, dec, &out, &in);
-    ID3D12VideoDecodeCommandList_EndQuery(vl, stats, D3D12_QUERY_TYPE_VIDEO_DECODE_STATISTICS, n);
+    ID3D12VideoDecodeCommandList_EndQuery(vl, stats, D3D12_QUERY_TYPE_VIDEO_DECODE_STATISTICS, pictures);
     ID3D12VideoDecodeCommandList_Close(vl);
     ID3D12CommandList *lists[1] = {(ID3D12CommandList *)vl};
     ID3D12CommandQueue_ExecuteCommandLists(vq, 1, lists);
     wait_queue(vq);
     ID3D12VideoDecodeCommandList_Reset(vl, va);
+    ++pictures;
+    /* (a first field: the frame is whole after the second, which the stream gives next in the same surface) */
+    if (p.field == 1) {
+      r = dxva_stream_next(&s, &p);
+      CHECK(r != 1 || p.field == 2);
+      continue;
+    }
     /* (the luma plane of the slice is subresource `slice`, the chroma `ArraySize + slice`) */
     const UINT layers = separate ? 1 : surfaces;
     copy_subresources(tex[p.surface], subs[p.surface], 1, y, (size_t)s.width * s.height, 0);
@@ -576,21 +606,21 @@ static void decode_h264(const char *name, const char *b64, unsigned surfaces, co
   qsort(decoded, n, sizeof *decoded, by_key);
   unsigned same = 0;
   for (unsigned i = 0; i < n && i < frames; ++i) same += decoded[i].hash == hashes[i];
-  printf("d3d12videotest: %s (%s): %u of %u frames are ffmpeg's, bit for bit\n", name, separate ? "a texture a surface" : "an array", same, frames);
+  printf("d3d12videotest: %s (%s%s): %u of %u frames are ffmpeg's, bit for bit\n", name, separate ? "a texture a surface" : "an array", interlaced ? ", field-based" : "", same, frames);
   CHECK(same == frames);
   /* every picture's statistics: decoded, nothing affected */
-  if (stats && n) {
+  if (stats && pictures) {
     ID3D12Resource *rb = buffer(D3D12_HEAP_TYPE_READBACK, 256 * sizeof(D3D12_QUERY_DATA_VIDEO_DECODE_STATISTICS));
     Copier c;
     copier_begin(&c);
-    ID3D12GraphicsCommandList_ResolveQueryData(c.l, stats, D3D12_QUERY_TYPE_VIDEO_DECODE_STATISTICS, 0, n, rb, 0);
+    ID3D12GraphicsCommandList_ResolveQueryData(c.l, stats, D3D12_QUERY_TYPE_VIDEO_DECODE_STATISTICS, 0, pictures, rb, 0);
     copier_run(&c);
     D3D12_QUERY_DATA_VIDEO_DECODE_STATISTICS *st = NULL;
     ID3D12Resource_Map(rb, 0, NULL, (void **)&st);
-    for (unsigned i = 0; st && i < n; ++i) statuses_ok += st[i].Status == D3D12_VIDEO_DECODE_STATUS_OK && st[i].NumMacroblocksAffected == 0;
+    for (unsigned i = 0; st && i < pictures; ++i) statuses_ok += st[i].Status == D3D12_VIDEO_DECODE_STATUS_OK && st[i].NumMacroblocksAffected == 0;
     ID3D12Resource_Unmap(rb, 0, NULL);
     ID3D12Resource_Release(rb);
-    CHECK(statuses_ok == n);
+    CHECK(statuses_ok == pictures);
   }
   free(y); free(uv); free(f);
   if (bits) ID3D12Resource_Release(bits);
@@ -608,7 +638,9 @@ static void decode_h264(const char *name, const char *b64, unsigned surfaces, co
 
 static void test_decode(void) {
   if (!g_vdev) return;
-  decode_h264("h264_bframes", g_h264_bframes_b64, 17, g_h264_bframes_fnv, 14, 0);
-  decode_h264("h264_ltr", g_h264_ltr_b64, 20, g_h264_ltr_fnv, 24, 1);
-  decode_h264("h264_cqm", g_h264_cqm_b64, 17, g_h264_cqm_fnv, 9, 0);
+  decode_h264("h264_bframes", g_h264_bframes_b64, 17, g_h264_bframes_fnv, 14, 0, 0);
+  decode_h264("h264_ltr", g_h264_ltr_b64, 20, g_h264_ltr_fnv, 24, 1, 0);
+  decode_h264("h264_cqm", g_h264_cqm_b64, 17, g_h264_cqm_fnv, 9, 0, 0);
+  /* interlaced: MBAFF frames and field pictures (P and B fields, B MBAFF frames), CABAC */
+  decode_h264("h264_paff_mbaff_cabac", g_h264_paff_mbaff_cabac_b64, 17, g_h264_paff_mbaff_cabac_fnv, 8, 0, 1);
 }

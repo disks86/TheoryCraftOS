@@ -50,17 +50,32 @@ const uint8_t kBlkRaster[16] = {0, 1, 4, 5, 2, 3, 6, 7, 8, 9, 12, 13, 10, 11, 14
 }  // namespace
 
 int Core::cabac_mb_skip() {
-  const MbCtx* a = nb(-1, 0);
-  const MbCtx* b = nb(0, -1);
+  const MbCtx* a = nb_a();
+  const MbCtx* b = nb_b();
   const int inc = (a && !a->skip) + (b && !b->skip);
   return cabac_decision((sh_.type == kSliceB ? 24 : 11) + inc);
+}
+
+// mb_field_decoding_flag (9.3.3.1.1.2): the pairs to the left and above (6.4.10) that are field pairs.
+int Core::cabac_mb_field() {
+  const int pair = mb_addr_ >> 1;
+  int inc = 0;
+  if (pair % mb_w_ > 0) {
+    const MbCtx& a = mbs_[static_cast<uint64_t>(2 * (pair - 1))];
+    if (a.slice == slice_no_ && a.field) ++inc;
+  }
+  if (pair >= mb_w_) {
+    const MbCtx& b = mbs_[static_cast<uint64_t>(2 * (pair - mb_w_))];
+    if (b.slice == slice_no_ && b.field) ++inc;
+  }
+  return cabac_decision(70 + inc);
 }
 
 // mb_type of an I macroblock; with `in_pb` the suffix of an intra type in a P or B slice (ctxIdxOffset `base`).
 int Core::cabac_mb_type_i(int base, bool in_pb) {
   if (!in_pb) {
-    const MbCtx* a = nb(-1, 0);
-    const MbCtx* b = nb(0, -1);
+    const MbCtx* a = nb_a();
+    const MbCtx* b = nb_b();
     auto cond = [](const MbCtx* n) { return n && (n->i16 || n->pcm || !n->intra); };
     if (!cabac_decision(base + cond(a) + cond(b))) return 0;
   } else if (!cabac_decision(base)) {
@@ -76,8 +91,8 @@ int Core::cabac_mb_type_i(int base, bool in_pb) {
 }
 
 int Core::cabac_intra_chroma_mode() {
-  const MbCtx* a = nb(-1, 0);
-  const MbCtx* b = nb(0, -1);
+  const MbCtx* a = nb_a();
+  const MbCtx* b = nb_b();
   auto cond = [](const MbCtx* n) { return n && n->intra && !n->pcm && n->chroma_mode != 0; };
   if (!cabac_decision(64 + cond(a) + cond(b))) return 0;
   if (!cabac_decision(64 + 3)) return 1;
@@ -85,8 +100,8 @@ int Core::cabac_intra_chroma_mode() {
 }
 
 bool Core::cabac_transform8x8_flag() {
-  const MbCtx* a = nb(-1, 0);
-  const MbCtx* b = nb(0, -1);
+  const MbCtx* a = nb_a();
+  const MbCtx* b = nb_b();
   return cabac_decision(399 + (a && a->t8x8) + (b && b->t8x8)) != 0;
 }
 
@@ -109,13 +124,14 @@ int Core::cabac_ref_idx(int list, int bx, int by) {
       ref = cmotion_->ref[list][b8];
       direct = (cm_->direct_mask >> b8) & 1;
     } else {
-      const MbCtx* n = x < 0 ? nb(-1, 0) : nb(0, -1);
+      const NbLoc loc = neighbour(x < 0 ? -1 : 4 * x, y < 0 ? -1 : 4 * y, false);
+      const MbCtx* n = nb_mb(loc);
       if (!n) return 0;
-      const int xx = x < 0 ? 3 : x, yy = y < 0 ? 3 : y;
-      const int b8 = (yy >> 1) * 2 + (xx >> 1);
-      const MotionMb& mo = cur_->motion[static_cast<uint64_t>((mby_ + (y < 0 ? -1 : 0)) * mb_w_ + mbx_ + (x < 0 ? -1 : 0))];
-      ref = mo.ref[list][b8];
+      const int b8 = (loc.y >> 3) * 2 + (loc.x >> 3);
+      ref = motion_of(loc.addr).ref[list][b8];
       direct = (n->direct_mask >> b8) & 1;
+      // (9-12: a frame macroblock beside a field macroblock compares the field's index with 1)
+      if (mbaff_ && !mb_field_ && n->field) return ref > 1 && !direct;
     }
     return ref > 0 && !direct;
   };
@@ -133,10 +149,12 @@ int Core::cabac_ref_idx(int list, int bx, int by) {
 int Core::cabac_mvd(int list, int comp, int bx, int by) {
   auto mvd_at = [&](int x, int y) -> int {
     if (x >= 0 && y >= 0) return cm_->mvd[list][y * 4 + x][comp];
-    const MbCtx* n = x < 0 ? nb(-1, 0) : nb(0, -1);
+    const NbLoc loc = neighbour(x < 0 ? -1 : 4 * x, y < 0 ? -1 : 4 * y, false);
+    const MbCtx* n = nb_mb(loc);
     if (!n) return 0;
-    const int xx = x < 0 ? 3 : x, yy = y < 0 ? 3 : y;
-    return n->mvd[list][yy * 4 + xx][comp];
+    int v = n->mvd[list][(loc.y >> 2) * 4 + (loc.x >> 2)][comp];
+    if (comp == 1 && mbaff_ && (n->field != 0) != mb_field_) v = mb_field_ ? v / 2 : v * 2;   // (9-15, 9-16)
+    return v;
   };
   const int sum = mvd_at(bx - 1, by) + mvd_at(bx, by - 1);
   const int base = comp ? 47 : 40;
@@ -160,18 +178,29 @@ int Core::cabac_mvd(int list, int comp, int bx, int by) {
 }
 
 int Core::cabac_cbp() {
-  const MbCtx* a = nb(-1, 0);
-  const MbCtx* b = nb(0, -1);
+  const MbCtx* a = nb_a();
+  const MbCtx* b = nb_b();
   int cbp = 0;
   for (int b8 = 0; b8 < 4; ++b8) {
     int ca, cb;
-    // A: the 8x8 block to the left; B: the 8x8 block above. A bit that is set (or an I_PCM macroblock) gives 0.
-    if (b8 & 1) ca = ((cbp >> (b8 - 1)) & 1) ? 0 : 1;
-    else ca = (a && (a->cbp >> (b8 + 1) & 1) == 0) ? 1 : 0;
-    if (b8 & 2) cb = ((cbp >> (b8 - 2)) & 1) ? 0 : 1;
-    else cb = (b && (b->cbp >> (b8 + 2) & 1) == 0) ? 1 : 0;
+    // A: the 8x8 block to the left; B: the 8x8 block above (6.4.11.2). A bit that is set (or an I_PCM macroblock) gives 0.
+    if (b8 & 1) {
+      ca = ((cbp >> (b8 - 1)) & 1) ? 0 : 1;
+    } else {
+      const NbLoc n = neighbour(-1, (b8 >> 1) * 8, false);
+      const MbCtx* m = nb_mb(n);
+      ca = (m && ((m->cbp >> ((n.y >> 3) * 2 + (n.x >> 3))) & 1) == 0) ? 1 : 0;
+    }
+    if (b8 & 2) {
+      cb = ((cbp >> (b8 - 2)) & 1) ? 0 : 1;
+    } else {
+      const NbLoc n = neighbour((b8 & 1) * 8, -1, false);
+      const MbCtx* m = nb_mb(n);
+      cb = (m && ((m->cbp >> ((n.y >> 3) * 2 + (n.x >> 3))) & 1) == 0) ? 1 : 0;
+    }
     if (cabac_decision(73 + ca + 2 * cb)) cbp |= 1 << b8;
   }
+  if (mono_) return cbp;   // (no chroma bins without chroma)
   auto cond1 = [](const MbCtx* n) { return n && (n->cbp >> 4) != 0; };
   auto cond2 = [](const MbCtx* n) { return n && (n->cbp >> 4) == 2; };
   if (cabac_decision(77 + cond1(a) + 2 * cond1(b))) {
@@ -183,9 +212,8 @@ int Core::cabac_cbp() {
 // coded_block_flag (9.3.3.1.1.9). cat: 0 Intra16x16 DC, 1 Intra16x16 AC, 2 luma 4x4, 3 chroma DC, 4 chroma AC.
 bool Core::cabac_cbf(int cat, int bx, int by, int plane) {
   const bool intra = mb_type_ != kInter;
-  auto cond = [&](int dx, int dy, int x, int y) -> int {
-    // (dx, dy): the neighbouring macroblock; x, y: the block in it (or in this macroblock when dx = dy = 0).
-    const MbCtx* n = (dx == 0 && dy == 0) ? cm_ : nb(dx, dy);
+  auto cond = [&](const MbCtx* n, int x, int y) -> int {
+    // n: the macroblock (null: not available); x, y: the block in it.
     if (!n) return intra ? 1 : 0;
     if (n->pcm) return 1;
     switch (cat) {
@@ -195,14 +223,24 @@ bool Core::cabac_cbf(int cat, int bx, int by, int plane) {
       default: return n->nz[y * 4 + x] != 0;
     }
   };
-  const int w = (cat == 3 || cat == 4) ? 2 : 4;
   int ca, cb;
   if (cat == 0 || cat == 3) {
-    ca = cond(-1, 0, 0, 0);
-    cb = cond(0, -1, 0, 0);
+    ca = cond(nb_a(), 0, 0);
+    cb = cond(nb_b(), 0, 0);
   } else {
-    ca = bx > 0 ? cond(0, 0, bx - 1, by) : cond(-1, 0, w - 1, by);
-    cb = by > 0 ? cond(0, 0, bx, by - 1) : cond(0, -1, bx, w - 1);
+    const bool chroma = cat == 4;
+    if (bx > 0) {
+      ca = cond(cm_, bx - 1, by);
+    } else {
+      const NbLoc n = neighbour(-1, 4 * by, chroma);
+      ca = cond(nb_mb(n), n.x >> 2, n.y >> 2);
+    }
+    if (by > 0) {
+      cb = cond(cm_, bx, by - 1);
+    } else {
+      const NbLoc n = neighbour(4 * bx, -1, chroma);
+      cb = cond(nb_mb(n), n.x >> 2, n.y >> 2);
+    }
   }
   return cabac_decision(85 + kCatOffCbf[cat] + ca + 2 * cb) != 0;
 }
@@ -210,14 +248,16 @@ bool Core::cabac_cbf(int cat, int bx, int by, int plane) {
 // 7.3.5.3.3 / 9.3.2.7: the significance map and levels of one block. lvl[0 .. max_coeff-1] in scan order.
 int Core::cabac_residual(int cat, int max_coeff, int* lvl) {
   for (int i = 0; i < max_coeff; ++i) lvl[i] = 0;
-  const int sig_base = cat == 5 ? 402 : 105 + kCatOffSig[cat];
-  const int last_base = cat == 5 ? 417 : 166 + kCatOffSig[cat];
+  // (ctxIdxOffset of Table 9-34: frame coded blocks, or field coded ones - field macroblocks and field pictures)
+  const int sig_base = cat == 5 ? (mb_field_ ? 436 : 402) : (mb_field_ ? 277 : 105) + kCatOffSig[cat];
+  const int last_base = cat == 5 ? (mb_field_ ? 451 : 417) : (mb_field_ ? 338 : 166) + kCatOffSig[cat];
+  const uint8_t* sig8 = mb_field_ ? kSig8x8CtxField : kSig8x8Ctx;
   const int abs_base = cat == 5 ? 426 : 227 + kCatOffAbs[cat];
   int pos[64];
   int n = 0;
   bool ended = false;
   for (int i = 0; i < max_coeff - 1; ++i) {
-    const int sc = cat == 3 ? imin(i, 2) : cat == 5 ? kSig8x8Ctx[i] : i;
+    const int sc = cat == 3 ? imin(i, 2) : cat == 5 ? sig8[i] : i;
     if (cabac_decision(sig_base + sc)) {
       pos[n++] = i;
       const int lc = cat == 3 ? imin(i, 2) : cat == 5 ? kLast8x8Ctx[i] : i;
@@ -302,7 +342,7 @@ bool Core::read_residual_cabac() {
       }
     }
   }
-  if (cbp_ >> 4) {
+  if ((cbp_ >> 4) && !mono_) {
     int dc[2][4] = {{0, 0, 0, 0}, {0, 0, 0, 0}};
     for (int c = 0; c < 2; ++c) {
       if (cabac_cbf(3, 0, 0, c + 1)) {
@@ -347,8 +387,8 @@ bool Core::decode_mb_cabac() {
       inter_type = cabac_decision(17) ? 1 : 2;
     }
   } else {
-    const MbCtx* a = nb(-1, 0);
-    const MbCtx* b = nb(0, -1);
+    const MbCtx* a = nb_a();
+    const MbCtx* b = nb_b();
     const int inc = (a && !(a->skip || a->direct16)) + (b && !(b->skip || b->direct16));
     if (!cabac_decision(27 + inc)) {
       inter_type = 0;
@@ -414,8 +454,9 @@ bool Core::decode_mb_cabac() {
       m->i16 = 1;
       i16_mode_ = (itype - 1) & 3;
       cbp_ = (((itype - 1) >> 2) % 3) << 4 | ((itype - 1) / 12 ? 15 : 0);
+      if (mono_ && (cbp_ >> 4)) return false;   // (CodedBlockPatternChroma is 0 without chroma)
     }
-    m->chroma_mode = static_cast<uint8_t>(cabac_intra_chroma_mode());
+    if (!mono_) m->chroma_mode = static_cast<uint8_t>(cabac_intra_chroma_mode());
   } else {
     mb_type_ = kInter;
     const bool is_b = sh_.type == kSliceB;

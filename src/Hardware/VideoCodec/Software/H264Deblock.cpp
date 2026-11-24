@@ -16,7 +16,7 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-// H.264 decoding, part 5: the deblocking filter (8.7) for progressive frames.
+// H.264 decoding, part 5: the deblocking filter (8.7) of frames, field pictures and MBAFF frames.
 
 #include "Hardware/VideoCodec/Software/H264Core.hpp"
 
@@ -88,21 +88,33 @@ void filter_edge(uint8_t* q, int across, int along, int count, const int* bs, in
 
 void Core::deblock_picture() {
   if (!cur_) return;
-  for (int y = 0; y < mb_h_; ++y)
+  if (mbaff_) {
+    // (in order of increasing macroblock addresses: the pairs, top macroblock first)
+    for (int addr = 0; addr < pic_mbs_; ++addr)
+      if (mbs_[static_cast<uint64_t>(addr)].slice >= 0) deblock_mb_mbaff(addr);
+    return;
+  }
+  for (int y = 0; y < pic_mb_h_; ++y)
     for (int x = 0; x < mb_w_; ++x) {
       if (mbs_[static_cast<uint64_t>(y) * mb_w_ + x].slice < 0) continue;
       deblock_mb(x, y);
     }
 }
 
-// 8.7.2.1: the strength of the edge between 4x4 block blk_p of macroblock mb_p and blk_q of mb_q.
-int Core::boundary_strength(int mb_p, int mb_q, int blk_p, int blk_q, bool mb_edge) const {
+// 8.7.2.1: the strength of the edge between 4x4 block blk_p of macroblock mb_p and blk_q of mb_q (macroblock addresses of the current picture).
+int Core::boundary_strength(int mb_p, int mb_q, int blk_p, int blk_q, bool mb_edge, bool vertical) const {
   const MbCtx& cp = mbs_[static_cast<uint64_t>(mb_p)];
   const MbCtx& cq = mbs_[static_cast<uint64_t>(mb_q)];
-  if (cp.intra || cq.intra) return mb_edge ? 4 : 3;
+  // mixedModeEdgeFlag: a frame macroblock pair beside a field macroblock pair.
+  const bool mixed = mbaff_ && cp.field != cq.field;
+  if (cp.intra || cq.intra) {
+    if (mb_edge && ((!cp.field && !cq.field) || ((mbaff_ || field_pic_) && vertical))) return 4;
+    return 3;
+  }
   if (((cp.nzmask >> blk_p) & 1) || ((cq.nzmask >> blk_q) & 1)) return 2;
-  const MotionMb& mp = cur_->motion[static_cast<uint64_t>(mb_p)];
-  const MotionMb& mq = cur_->motion[static_cast<uint64_t>(mb_q)];
+  if (mixed) return 1;
+  const MotionMb& mp = motion_of(mb_p);
+  const MotionMb& mq = motion_of(mb_q);
   const int b8p = ((blk_p >> 3) << 1) | ((blk_p & 3) >> 1), b8q = ((blk_q >> 3) << 1) | ((blk_q & 3) >> 1);
   int rp[2], rq[2];
   for (int l = 0; l < 2; ++l) {
@@ -111,7 +123,9 @@ int Core::boundary_strength(int mb_p, int mb_q, int blk_p, int blk_q, bool mb_ed
   }
   const int np = (rp[0] >= 0) + (rp[1] >= 0), nq = (rq[0] >= 0) + (rq[1] >= 0);
   if (np != nq) return 1;
-  auto far = [](const int16_t* a, const int16_t* b) { return iabs(a[0] - b[0]) >= 4 || iabs(a[1] - b[1]) >= 4; };
+  // A vertical difference of 4 quarter frame samples is one of 2 quarter field samples (NOTE 3).
+  const int vlimit = cq.field ? 2 : 4;
+  auto far = [vlimit](const int16_t* a, const int16_t* b) { return iabs(a[0] - b[0]) >= 4 || iabs(a[1] - b[1]) >= vlimit; };
   const int16_t* vp[2] = {mp.mv[0][blk_p], mp.mv[1][blk_p]};
   const int16_t* vq[2] = {mq.mv[0][blk_q], mq.mv[1][blk_q]};
   if (np == 1) {
@@ -129,6 +143,7 @@ int Core::boundary_strength(int mb_p, int mb_q, int blk_p, int blk_q, bool mb_ed
   return ((far(vp[0], vq[0]) || far(vp[1], vq[1])) && (far(vp[0], vq[1]) || far(vp[1], vq[0]))) ? 1 : 0;
 }
 
+// A frame or a field picture: every macroblock's neighbours are those of its own picture.
 void Core::deblock_mb(int mbx, int mby) {
   const int addr = mby * mb_w_ + mbx;
   const MbCtx& c = mbs_[static_cast<uint64_t>(addr)];
@@ -165,12 +180,12 @@ void Core::deblock_mb(int mbx, int mby) {
             blk_p = (e - 1) * 4 + s;
           }
         }
-        bs[dir][e][s] = boundary_strength(mb_p, addr, blk_p, blk_q, e == 0);
+        bs[dir][e][s] = boundary_strength(mb_p, addr, blk_p, blk_q, e == 0, dir == 0);
       }
     }
   }
-  uint8_t* ly = cur_->y.data() + static_cast<int64_t>(mby * 16) * cur_->stride + mbx * 16;
-  const int ls = cur_->stride;
+  uint8_t* ly = pic_y_ + static_cast<int64_t>(mby * 16) * pic_ls_ + mbx * 16;
+  const int ls = pic_ls_;
   for (int dir = 0; dir < 2; ++dir) {
     for (int e = 0; e < 4; ++e) {
       if (e == 0 && !(dir == 0 ? left_ok : top_ok)) continue;
@@ -184,9 +199,10 @@ void Core::deblock_mb(int mbx, int mby) {
       filter_edge(q, dir == 0 ? 1 : ls, dir == 0 ? ls : 1, 16, bs[dir][e], index_a, alpha, beta, false, 4);
     }
   }
-  const int cs = cur_->cstride;
+  if (mono_) return;
+  const int cs = pic_cs_;
   for (int plane = 0; plane < 2; ++plane) {
-    uint8_t* base = (plane == 0 ? cur_->u.data() : cur_->v.data()) + static_cast<int64_t>(mby * 8) * cs + mbx * 8;
+    uint8_t* base = (plane == 0 ? pic_u_ : pic_v_) + static_cast<int64_t>(mby * 8) * cs + mbx * 8;
     for (int dir = 0; dir < 2; ++dir) {
       for (int e = 0; e < 2; ++e) {  // chroma edges 0 and 4 (luma edges 0 and 2)
         if (e == 0 && !(dir == 0 ? left_ok : top_ok)) continue;
@@ -199,6 +215,161 @@ void Core::deblock_mb(int mbx, int mby) {
         filter_edge(q, dir == 0 ? 1 : cs, dir == 0 ? cs : 1, 8, bs[dir][e * 2], index_a, alpha, beta, true, 2);
       }
     }
+  }
+}
+
+// A macroblock of an MBAFF frame (8.7, MbaffFrameFlag 1). Its lines are every other line of its pair when it is a field macroblock; its left edge may meet a
+// pair of the other kind, line by line from either of that pair's macroblocks; the top edge of a frame macroblock under a field pair is filtered as two field
+// edges, and the top edge of a field macroblock reaches into the pair above by lines of its parity.
+void Core::deblock_mb_mbaff(int addr) {
+  const MbCtx& c = mbs_[static_cast<uint64_t>(addr)];
+  if (c.dbf_idc == 1) return;
+  const int pair = addr >> 1, px = pair % mb_w_, prow = pair / mb_w_;
+  const bool field = c.field != 0, bottom = (addr & 1) != 0;
+  const int dy = field ? 2 : 1;
+  const int yi = 32 * prow + (field ? (bottom ? 1 : 0) : (bottom ? 16 : 0));   // 6.4.1
+  const int yic = (yi + 1) / 2;
+  const int xi = 16 * px;
+  const int ls = pic_ls_, cs = pic_cs_;
+  // The macroblock of the pair in column px of pair row (row / span) holding picture line `row` (luma, or chroma with span 16), and that line inside it.
+  auto mb_holding = [&](int row, bool chroma, int* row_in) {
+    const int span = chroma ? 16 : 32;
+    const int top = 2 * ((row / span) * mb_w_ + px);
+    const int r = row % span;
+    if (mbs_[static_cast<uint64_t>(top)].field) {
+      *row_in = r >> 1;
+      return top + (r & 1);
+    }
+    *row_in = r % (span / 2);
+    return top + (r >= span / 2 ? 1 : 0);
+  };
+  auto usable = [&](int m) {
+    const MbCtx& n = mbs_[static_cast<uint64_t>(m)];
+    return n.slice >= 0 && !(c.dbf_idc == 2 && n.slice != c.slice);
+  };
+  auto thresholds = [&](int qp_p, int qp_q, int* index_a, int* alpha, int* beta) {
+    const int qpav = (qp_p + qp_q + 1) >> 1;
+    *index_a = clip3(0, 51, qpav + c.alpha_off);
+    *alpha = kAlpha[*index_a];
+    *beta = kBeta[clip3(0, 51, qpav + c.beta_off)];
+    return *alpha != 0 && *beta != 0;
+  };
+  int index_a, alpha, beta;
+
+  // --- the left edge, line by line
+  // (the pair to the left is in one slice)
+  const bool left = px > 0 && usable(2 * (pair - 1));
+  int left_bs[16] = {}, left_mb[16] = {};
+  if (left) {
+    for (int k = 0; k < 16; ++k) {
+      int row;
+      const int r = yi + dy * k;
+      // (the pair to the left, in column px - 1)
+      const int span_top = 2 * ((r / 32) * mb_w_ + px - 1);
+      int m;
+      const int rr = r % 32;
+      if (mbs_[static_cast<uint64_t>(span_top)].field) {
+        m = span_top + (rr & 1);
+        row = rr >> 1;
+      } else {
+        m = span_top + (rr >= 16 ? 1 : 0);
+        row = rr % 16;
+      }
+      left_mb[k] = m;
+      left_bs[k] = boundary_strength(m, addr, (row >> 2) * 4 + 3, (k >> 2) * 4, true, true);
+    }
+    for (int k = 0; k < 16; ++k) {
+      if (!left_bs[k] || !thresholds(mbs_[static_cast<uint64_t>(left_mb[k])].qp, c.qp, &index_a, &alpha, &beta)) continue;
+      filter_edge(pic_y_ + static_cast<int64_t>(yi + dy * k) * ls + xi, 1, 0, 1, &left_bs[k], index_a, alpha, beta, false, 1);
+    }
+  }
+  // --- the inner vertical edges, on the macroblock's own lines
+  uint8_t* ly = pic_y_ + static_cast<int64_t>(yi) * ls + xi;
+  const int mls = dy * ls;
+  int inner_bs[2][4][4] = {};
+  for (int e = 1; e < 4; ++e) {
+    if ((e & 1) && c.t8x8) continue;
+    for (int s = 0; s < 4; ++s) {
+      inner_bs[0][e][s] = boundary_strength(addr, addr, s * 4 + e - 1, s * 4 + e, false, true);
+      inner_bs[1][e][s] = boundary_strength(addr, addr, (e - 1) * 4 + s, e * 4 + s, false, false);
+    }
+  }
+  if (thresholds(c.qp, c.qp, &index_a, &alpha, &beta)) {
+    for (int e = 1; e < 4; ++e) {
+      if ((e & 1) && c.t8x8) continue;
+      filter_edge(ly + e * 4, 1, mls, 16, inner_bs[0][e], index_a, alpha, beta, false, 4);
+    }
+  }
+  // --- the top edge
+  bool top = prow > 0 || (!field && bottom);
+  const bool split = !field && !bottom && prow > 0 && mbs_[static_cast<uint64_t>(2 * (pair - mb_w_) + 1)].field;
+  int top_mb[2] = {0, 0};
+  int top_bs[2][4] = {};
+  if (top) {
+    if (split) {
+      // A frame macroblock under a field pair: field mode filtering of its top field lines with the top field macroblock above, then of its bottom field lines.
+      for (int f = 0; f < 2; ++f) {
+        top_mb[f] = 2 * (pair - mb_w_) + f;
+        for (int s = 0; s < 4; ++s) top_bs[f][s] = boundary_strength(top_mb[f], addr, 12 + s, s, true, false);
+      }
+      top = usable(top_mb[0]);
+    } else {
+      int row;
+      top_mb[0] = mb_holding(yi - dy, false, &row);
+      for (int s = 0; s < 4; ++s) top_bs[0][s] = boundary_strength(top_mb[0], addr, (row >> 2) * 4 + s, s, true, false);
+      top = usable(top_mb[0]);
+    }
+  }
+  if (top) {
+    for (int f = 0; f < (split ? 2 : 1); ++f) {
+      if (!thresholds(mbs_[static_cast<uint64_t>(top_mb[f])].qp, c.qp, &index_a, &alpha, &beta)) continue;
+      if (split) filter_edge(pic_y_ + static_cast<int64_t>(yi + f) * ls + xi, 2 * ls, 1, 16, top_bs[f], index_a, alpha, beta, false, 4);
+      else filter_edge(ly, mls, 1, 16, top_bs[0], index_a, alpha, beta, false, 4);
+    }
+  }
+  // --- the inner horizontal edges
+  if (thresholds(c.qp, c.qp, &index_a, &alpha, &beta)) {
+    for (int e = 1; e < 4; ++e) {
+      if ((e & 1) && c.t8x8) continue;
+      filter_edge(ly + e * 4 * mls, mls, 1, 16, inner_bs[1][e], index_a, alpha, beta, false, 4);
+    }
+  }
+  if (mono_) return;
+  // --- chroma: the same edges; a chroma line takes the strength of the luma line of its field (8.7.2)
+  for (int plane = 0; plane < 2; ++plane) {
+    uint8_t* const pl = plane == 0 ? pic_u_ : pic_v_;
+    uint8_t* cb = pl + static_cast<int64_t>(yic) * cs + xi / 2;
+    const int mcs = dy * cs;
+    if (left) {
+      for (int k = 0; k < 8; ++k) {
+        int row;
+        const int rc = yic + dy * k;
+        const int top_c = 2 * ((rc / 16) * mb_w_ + px - 1);
+        const int r = rc % 16;
+        int m;
+        if (mbs_[static_cast<uint64_t>(top_c)].field) {
+          m = top_c + (r & 1);
+          row = r >> 1;
+        } else {
+          m = top_c + (r >= 8 ? 1 : 0);
+          row = r % 8;
+        }
+        (void)row;
+        const int kl = field ? 2 * k : 4 * (k >> 1) + (k & 1);
+        int b = left_bs[kl];
+        if (!b || !thresholds(mbs_[static_cast<uint64_t>(m)].qpc[plane], c.qpc[plane], &index_a, &alpha, &beta)) continue;
+        filter_edge(pl + static_cast<int64_t>(rc) * cs + xi / 2, 1, 0, 1, &b, index_a, alpha, beta, true, 1);
+      }
+    }
+    if (thresholds(c.qpc[plane], c.qpc[plane], &index_a, &alpha, &beta)) filter_edge(cb + 4, 1, mcs, 8, inner_bs[0][2], index_a, alpha, beta, true, 2);
+    if (top) {
+      for (int f = 0; f < (split ? 2 : 1); ++f) {
+        if (!thresholds(mbs_[static_cast<uint64_t>(top_mb[f])].qpc[plane], c.qpc[plane], &index_a, &alpha, &beta)) continue;
+        if (split) filter_edge(pl + static_cast<int64_t>(yic + f) * cs + xi / 2, 2 * cs, 1, 8, top_bs[f], index_a, alpha, beta, true, 2);
+        else filter_edge(cb, mcs, 1, 8, top_bs[0], index_a, alpha, beta, true, 2);
+      }
+    }
+    if (thresholds(c.qpc[plane], c.qpc[plane], &index_a, &alpha, &beta)) filter_edge(cb + 4 * mcs, mcs, 1, 8, inner_bs[1][2], index_a, alpha, beta, true, 2);
   }
 }
 

@@ -39,7 +39,7 @@ struct H264Slice {
 // Reads the syntax of an H.264 stream without decoding any picture: parameter sets are kept, and every slice comes out with its parsed header
 // and position. This is the half of a decoder that does not depend on how the pixels are made, so a hardware engine (which is programmed from
 // the parameter sets and slice headers, and reads the slice data itself) and the CPU decoder see the same stream the same way. Supported:
-// what H264Decoder decodes (progressive 8-bit 4:2:0 Baseline/Main/High); anything else is refused at the parameter set or the slice.
+// what H264Decoder decodes (8-bit 4:2:0 or monochrome Baseline/Main/High, progressive or interlaced); anything else is refused at the parameter set or the slice.
 class H264StreamParser {
  public:
   explicit H264StreamParser(allocators::IAllocator& allocator) : allocator_(allocator) {}

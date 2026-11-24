@@ -27,10 +27,12 @@ namespace h264 {
 class Core;
 }
 
-// An H.264 / AVC decoder on the CPU: Baseline, Main and High profile video (8-bit 4:2:0, progressive frames, CAVLC or
-// CABAC, I/P/B slices, multiple reference frames, weighted prediction, 8x8 transform and scaling matrices, multiple
-// slices, deblocking). Not covered: interlaced coding (field pictures and MBAFF), flexible macroblock ordering,
-// data partitioning, SP/SI slices, high bit depths and 4:2:2 / 4:4:4. Pictures come out in display order.
+// An H.264 / AVC decoder on the CPU: Baseline, Main and High profile video (8-bit 4:2:0 or monochrome, CAVLC or CABAC, I/P/B
+// slices, multiple reference frames, weighted prediction, 8x8 transform and scaling matrices, multiple slices, deblocking),
+// progressive or interlaced: field pictures (alone or as complementary field pairs in one frame) and MBAFF frames (frame and
+// field macroblock pairs), with field reference lists, field order counts, direct modes and the loop filter of each. Not
+// covered: flexible macroblock ordering, data partitioning, SP/SI slices, high bit depths and 4:2:2 / 4:4:4. Pictures come
+// out in display order, as frames (a field pair in one frame; a field without its pair with the other field's lines grey).
 //
 // Input is either Annex B (start codes, with SPS and PPS in the stream) or - after configure() with an avcC record,
 // as stored in MP4 and AVI files - length-prefixed NAL units.
@@ -76,10 +78,13 @@ class H264Decoder {
     bool non_existing = false;  // a frame the program inferred for a gap in frame_num (never decoded: mid-grey, not reported missing)
     int frame_num = 0;          // FrameNum, or LongTermFrameIdx of a long-term reference
     int top_poc = 0, bottom_poc = 0;
+    uint8_t fields = 3;         // the fields used for reference: bit 0 the top field, bit 1 the bottom field (a frame picture uses a reference with both)
   };
   struct ExternalPicture {
     uint32_t key = 0;           // where the picture is kept (a reference to this key reads the picture that was there before)
-    int top_poc = 0, bottom_poc = 0;
+    int top_poc = 0, bottom_poc = 0;   // (a field picture: only its own field's count is used)
+    // (A field picture - its slices say which - is decoded into the frame of the surface: the other field's lines stay what the surface held, so the second
+    // field of a pair goes in beside the first.)
     ArrayView<const ExternalReference> references;   // at most 16
   };
   enum class ExternalStatus : uint8_t {
@@ -89,8 +94,9 @@ class H264Decoder {
     NoMemory,
   };
   // Decodes the one picture `access_unit` holds (Annex B: any parameter sets, then its slices; slices of a second picture are ignored) and gives it in `decoded` (I420,
-  // the whole coded size; valid until the next call). Pictures that are not IDR are decoded even without an IDR before them.
-  [[nodiscard]] ExternalStatus decode_external(ConstByteView access_unit, const ExternalPicture& picture, VideoFrame* decoded);
+  // the whole coded size of the frame - for a field picture the frame it is in; valid until the next call). Pictures that are not IDR are decoded even without an IDR
+  // before them. `structure` (when not null) gets the picture's structure (3 frame, 1 top field, 2 bottom field).
+  [[nodiscard]] ExternalStatus decode_external(ConstByteView access_unit, const ExternalPicture& picture, VideoFrame* decoded, int* structure = nullptr);
 
  private:
   allocators::IAllocator& allocator_;
