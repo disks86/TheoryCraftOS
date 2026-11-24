@@ -36,6 +36,9 @@
 #include "Hardware/VideoCodec/Software/Av1EncBitstream.hpp"
 #include "Hardware/VideoCodec/Software/Av1Msac.hpp"
 #include "Hardware/VideoCodec/Software/Av1PictureEncoder.hpp"
+#include "Kernel/Dxgkrnl/VideoEncode.hpp"
+#include "Kernel/Dxgkrnl/VideoEncodeCodecs.hpp"
+#include "Utility/ByteStream.hpp"
 
 using namespace hardware;
 
@@ -575,10 +578,195 @@ static void test_refusals() {
   CHECK(!Av1PictureEncoder::write_frame_obu(good, post, ConstByteView(), ArrayView<const Av1EncTile>(&one, 1), &out));
 }
 
+// ---- the kernel's EncodeFrame (src/Kernel/Dxgkrnl/VideoEncodeAv1.cpp): the arguments d3d12.dll writes, widened textures; the tiles and the reconstruction must be what
+// the encoder driven directly makes of the same frame, the metadata resolve to D3D12_VIDEO_ENCODER_OUTPUT_METADATA, a record a tile, the tile layout and the
+// post-encode values.
+struct Widened {
+  uint32_t w = 0, h = 0;
+  int bd = 8;
+  std::vector<uint8_t> luma, chroma;
+  uint64_t px() const { return bd > 8 ? 8 : 4; }
+  void make(uint32_t w_, uint32_t h_, int bd_) { w = w_; h = h_; bd = bd_; luma.assign(size_t(w) * h * px(), 0); chroma.assign(size_t(w / 2) * (h / 2) * px(), 0); }
+  void put(std::vector<uint8_t>& plane, size_t i, uint16_t v, int c) {
+    if (bd > 8) { const uint16_t s = uint16_t(v << 6); plane[i * 8 + c * 2] = uint8_t(s); plane[i * 8 + c * 2 + 1] = uint8_t(s >> 8); }
+    else plane[i * 4 + c] = uint8_t(v);
+  }
+  uint16_t get(const std::vector<uint8_t>& plane, size_t i, int c) const { return bd > 8 ? uint16_t((plane[i * 8 + c * 2] | plane[i * 8 + c * 2 + 1] << 8) >> 6) : plane[i * 4 + c]; }
+  void from(const Planes& p) {
+    for (size_t i = 0; i < size_t(w) * h; ++i) put(luma, i, p.y[i], 0);
+    for (size_t i = 0; i < size_t(w / 2) * (h / 2); ++i) { put(chroma, i, p.u[i], 0); put(chroma, i, p.v[i], 1); }
+  }
+  bool equals(const Planes& p) const {
+    for (size_t i = 0; i < size_t(w) * h; ++i) if (get(luma, i, 0) != p.y[i]) return false;
+    for (size_t i = 0; i < size_t(w / 2) * (h / 2); ++i) if (get(chroma, i, 0) != p.u[i] || get(chroma, i, 1) != p.v[i]) return false;
+    return true;
+  }
+  dxgk::VideoPictureImages images() const {
+    return {{ConstByteView(luma.data(), luma.size()), uint64_t(w) * px(), w, h}, {ConstByteView(chroma.data(), chroma.size()), uint64_t(w / 2) * px(), w / 2, h / 2}};
+  }
+  dxgk::VideoWritablePlaneImage wl() { return {ByteView(luma.data(), luma.size()), uint64_t(w) * px(), w, h}; }
+  dxgk::VideoWritablePlaneImage wc() { return {ByteView(chroma.data(), chroma.size()), uint64_t(w / 2) * px(), w / 2, h / 2}; }
+};
+static void put_word(std::vector<uint8_t>& b, uint32_t v) { for (int i = 0; i < 4; ++i) b.push_back(uint8_t(v >> (8 * i))); }
+
+static void test_kernel_side() {
+  for (int bd : {8, 10}) {
+    const uint32_t W = 160, H = 96;
+    Texture tex(int(W) + 120, int(H) + 60);
+    Av1PictureEncoder direct(g_alloc);
+    Planes slot_pic[8];
+    Widened slot_wide[8];
+    bool slot_valid[8] = {};
+    uint32_t slot_hint[8] = {};
+    std::vector<uint8_t> heap(dxgk::kVideoEncodeHeapBytes, 0);
+    for (int n = 0; n < 3; ++n) {
+      Planes src;
+      make_source(tex, n, &src, W, H, bd);
+      Widened wsrc;
+      wsrc.make(W, H, bd);
+      wsrc.from(src);
+      const bool key = n == 0;
+      const uint32_t qindex = key ? 100 : 130;
+      // directly
+      Av1EncPicture pic;
+      pic.seq.width = W; pic.seq.height = H; pic.seq.bit_depth = uint8_t(bd);
+      pic.seq.enable_order_hint = true; pic.seq.order_hint_bits = 7; pic.seq.enable_cdef = true; pic.seq.enable_intra_edge_filter = true;
+      pic.type = key ? Av1EncFrameType::Key : Av1EncFrameType::Inter;
+      pic.allow_high_precision_mv = !key;
+      pic.filter = n == 2 ? Av1EncFilter::Switchable : Av1EncFilter::EightTap;
+      pic.tx_mode = n == 1 ? Av1EncTxMode::Select : Av1EncTxMode::Largest;
+      pic.order_hint = uint32_t(n);
+      pic.refresh_frame_flags = key ? 0xFF : uint8_t(1u << n);
+      for (int i = 0; i < 8; ++i)
+        if (slot_valid[i]) {
+          pic.slots[i].valid = true;
+          pic.slots[i].picture = slot_pic[i].view();
+          pic.slots[i].order_hint = slot_hint[i];
+          pic.slots[i].frame_type = slot_hint[i] == 0 ? Av1EncFrameType::Key : Av1EncFrameType::Inter;
+        }
+      const uint8_t refs[7] = {uint8_t(n == 2 ? 1 : 0), 0, 0, 0, 0, 0, 0};
+      for (int i = 0; i < 7; ++i) pic.ref_frame_idx[i] = refs[i];
+      pic.base_q_idx = uint8_t(qindex);
+      pic.loop_filter.level[0] = 10; pic.loop_filter.level[1] = 8; pic.loop_filter.level[2] = 4; pic.loop_filter.level[3] = 5; pic.loop_filter.sharpness = 1;
+      pic.cdef.bits = 1; pic.cdef.damping_minus3 = 2; pic.cdef.y_pri[1] = 4; pic.cdef.y_sec[1] = 1; pic.cdef.uv_pri[1] = 2;
+      pic.tiles.uniform = true; pic.tiles.cols = 2; pic.tiles.rows = 1;
+      CHECK(Av1PictureEncoder::tile_layout(W, H, &pic.tiles));
+      Planes rec;
+      rec.make(W, H);
+      ByteBuffer out(g_alloc);
+      List<Av1EncTile> tiles(g_alloc);
+      Av1EncPostEncode post;
+      EncStatistics st;
+      CHECK(direct.encode(pic, src.view(), rec.wview(), &out, &tiles, &post, &st) == Av1EncResult::Ok);
+      // through the kernel
+      std::vector<uint32_t> w(dxgk::kVideoEncodeParamWords, 0);
+      w[0] = dxgk::kVideoEncodeCodecAv1; w[1] = 0; w[2] = W; w[3] = H; w[4] = 0x4 | 0x1000 | 0x8000 | 0x800000; w[5] = 6; w[6] = uint32_t(bd);
+      w[7] = 5; w[8] = 1; w[9] = 2;   // a uniform grid of 2 x 1
+      w[10] = 1; w[12] = 30; w[13] = 1; w[14] = 100; w[15] = 130; w[16] = 150; w[19] = 255;
+      w[34] = key ? 0 : 1; w[35] = key ? 0 : 0x4000; w[37] = uint32_t(pic.filter); w[38] = uint32_t(pic.tx_mode); w[39] = 8; w[40] = uint32_t(n);
+      w[44] = pic.refresh_frame_flags; w[47] = 64;
+      std::vector<uint8_t> args;
+      for (uint32_t v : w) put_word(args, v);
+      for (uint8_t r : refs) put_word(args, r);
+      std::vector<dxgk::VideoPictureImages> textures;
+      for (int i = 0; i < 8; ++i) {
+        if (slot_valid[i]) textures.push_back(slot_wide[i].images());
+        put_word(args, slot_valid[i] ? uint32_t(textures.size() - 1) : 0xFFFFFFFFu);
+        put_word(args, slot_hint[i]);
+        put_word(args, slot_hint[i] == 0 ? 0 : 1);
+        put_word(args, 0);
+      }
+      for (int i = 0; i < 6; ++i) put_word(args, 0);   // restoration
+      const uint32_t lf[18] = {10, 8, 4, 5, 1, 0, 0, 1, 0, 0, 0, uint32_t(-1), 0, uint32_t(-1), uint32_t(-1), 0, 0, 0};
+      for (uint32_t v : lf) put_word(args, v);
+      for (int i = 0; i < 3; ++i) put_word(args, 0);
+      for (int i = 0; i < 10; ++i) put_word(args, i == 0 ? 77 : 0);   // (BaseQIndex is the rate controller's)
+      for (int i = 0; i < 2; ++i) put_word(args, 0);
+      uint32_t cdef[34] = {1, 2};
+      cdef[2 + 1] = 4; cdef[10 + 1] = 2; cdef[18 + 1] = 1;
+      for (uint32_t v : cdef) put_word(args, v);
+      Widened wrec;
+      wrec.make(W, H, bd);
+      const size_t meta_bytes = dxgk::kVideoEncodeMetadataHeader + 64 * dxgk::kVideoEncodeSubregionBytes + dxgk::kVideoEncodeAv1TilesBytes + dxgk::kVideoEncodeAv1PostEncodeBytes;
+      std::vector<uint8_t> bits(1 << 20, 0), meta(meta_bytes, 0);
+      dxgk::VideoEncodeJob job;
+      job.params = ConstByteView(args.data(), args.size());
+      job.heap = ByteView(heap.data(), heap.size());
+      job.input = wsrc.images();
+      job.has_reconstruction = true;
+      job.reconstruction_luma = wrec.wl();
+      job.reconstruction_chroma = wrec.wc();
+      job.references = ArrayView<const dxgk::VideoPictureImages>(textures.data(), textures.size());
+      job.bitstream = ByteView(bits.data(), bits.size());
+      job.metadata = ByteView(meta.data(), meta.size());
+      CHECK(dxgk::run_video_encode(g_alloc, job));
+      std::vector<uint8_t> resolved(meta_bytes, 0xEE);
+      CHECK(dxgk::resolve_video_encode_metadata(ConstByteView(meta.data(), meta.size()), ByteView(resolved.data(), resolved.size())));
+      ByteReader m(ConstByteView(resolved.data(), resolved.size()));
+      const uint64_t errors = m.le64(), avg_qp = m.le64();
+      m.skip(40);
+      const uint64_t written = m.le64(), count = m.le64();
+      CHECK(errors == 0);
+      if (errors) printf("  frame %d (%d bits): errors %llx\n", n, bd, (unsigned long long)errors);
+      CHECK(avg_qp == qindex);
+      CHECK(written == out.size() && memcmp(bits.data(), out.view().data(), out.size()) == 0);
+      CHECK(count == tiles.count() && count == 2);
+      for (uint64_t i = 0; i < count && i < tiles.count(); ++i) {
+        CHECK(m.le64() == tiles[i].size);
+        CHECK(m.le64() == 0);
+        CHECK(m.le64() == 0);
+      }
+      CHECK(m.le64() == 1);   // RowCount
+      CHECK(m.le64() == 2);   // ColCount
+      CHECK(m.le64() == 2);   // RowHeights[0]: 96 lines are 2 superblocks
+      m.skip(63 * 8);
+      CHECK(m.le64() == 2);   // ColWidths[0]: 160 samples are 3 superblocks, cut 2 + 1
+      CHECK(m.le64() == 1);
+      m.skip(62 * 8);
+      CHECK(m.le64() == 0);   // ContextUpdateTileId
+      CHECK(m.le64() == 0);   // CompoundPredictionType
+      CHECK(m.le64() == 10 && m.le64() == 8 && m.le64() == 4 && m.le64() == 5 && m.le64() == 1);   // the loop filter as given
+      m.skip(8 * 13 + 24);
+      CHECK(m.le64() == qindex);   // BaseQIndex: what was coded
+      m.skip(9 * 8);
+      CHECK(m.le64() == 0);        // DeltaQPresent
+      m.skip(8);
+      CHECK(m.le64() == 1 && m.le64() == 2);   // CDEF bits, damping
+      m.skip(32 * 8 + 608);
+      CHECK(m.le64() == 7);        // PrimaryRefFrame: none
+      CHECK(m.le64() == refs[0]);
+      CHECK(m.remaining() >= 6 * 8);
+      CHECK(wrec.equals(rec));
+      for (int i = 0; i < 8; ++i)
+        if (pic.refresh_frame_flags & (1u << i)) { slot_pic[i] = rec; slot_wide[i] = wrec; slot_valid[i] = true; slot_hint[i] = uint32_t(n); }
+    }
+  }
+  // what the runtime found wrong, truncated arguments: the metadata says why, nothing is read past
+  std::vector<uint32_t> w(dxgk::kVideoEncodeParamWords, 0);
+  w[0] = dxgk::kVideoEncodeCodecAv1; w[46] = 0x2;
+  std::vector<uint8_t> args;
+  for (uint32_t v : w) put_word(args, v);
+  const size_t meta_bytes = dxgk::kVideoEncodeMetadataHeader + dxgk::kVideoEncodeAv1TilesBytes + dxgk::kVideoEncodeAv1PostEncodeBytes;
+  std::vector<uint8_t> meta(meta_bytes, 0), bits(64, 0), resolved(meta_bytes, 0);
+  dxgk::VideoEncodeJob job;
+  job.params = ConstByteView(args.data(), args.size());
+  job.bitstream = ByteView(bits.data(), bits.size());
+  job.metadata = ByteView(meta.data(), meta.size());
+  CHECK(dxgk::run_video_encode(g_alloc, job));
+  CHECK(dxgk::resolve_video_encode_metadata(ConstByteView(meta.data(), meta.size()), ByteView(resolved.data(), resolved.size())));
+  CHECK(ByteReader(ConstByteView(resolved.data(), 8)).le64() == 0x2);
+  CHECK(!dxgk::resolve_video_encode_metadata(ConstByteView(meta.data(), meta.size()), ByteView(resolved.data(), 100)));   // (no room for the AV1 layout)
+  job.params = ConstByteView(args.data(), 120);
+  CHECK(dxgk::run_video_encode(g_alloc, job));
+  CHECK(dxgk::resolve_video_encode_metadata(ConstByteView(meta.data(), meta.size()), ByteView(resolved.data(), resolved.size())));
+  CHECK(ByteReader(ConstByteView(resolved.data(), 8)).le64() == 0x1);
+}
+
 int main(int argc, char** argv) {
   const char* dir = argc > 1 ? argv[1] : nullptr;
   test_symbol_coder();
   test_refusals();
+  test_kernel_side();
   test_sequences(dir);
   printf("VideoEncodeAv1Test: %d checks, %d failed\n", g_checks, g_failed);
   return g_failed ? 1 : 0;

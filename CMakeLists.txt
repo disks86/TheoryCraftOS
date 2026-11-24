@@ -685,6 +685,7 @@ add_executable(BOOTX64
   src/Kernel/Dxgkrnl/VideoEncode.cpp
   src/Kernel/Dxgkrnl/VideoEncodeHevc.cpp
   src/Kernel/Dxgkrnl/VideoEncodeAv1.cpp
+  src/Kernel/Dxgkrnl/VideoEncodePlanes.cpp
   src/Kernel/Dxgkrnl/D3d9Devices.cpp
   src/Kernel/Dxgkrnl/D3d9Emit.cpp
   src/Kernel/Dxgkrnl/Adapter.cpp

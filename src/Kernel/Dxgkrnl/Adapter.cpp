@@ -1277,6 +1277,11 @@ class Adapter::StreamRunner {
     return a && a->is_image() && a->desc().kind == graphics::TextureKind::Texture2D && a->mip_levels() == 1 && a->desc().samples == 1 && a->layers() == 1 &&
            (a->desc().format == Format::A8B8G8R8 || a->desc().format == Format::X8B8G8R8);
   }
+  // (EncodeFrame also takes the 16-bit form P010 is kept in - A16B16G16R16 -: the HEVC and AV1 paths check the pixel size against the bit depth, VideoEncodeCodecs.hpp)
+  static bool encode_plane_image(Allocation* a) {
+    return plane_image(a) || (a && a->is_image() && a->desc().kind == graphics::TextureKind::Texture2D && a->mip_levels() == 1 && a->desc().samples == 1 &&
+                              a->layers() == 1 && a->desc().format == Format::A16B16G16R16);
+  }
   static VideoPlaneImage read_view(Allocation* a) {
     return {a->backing(), image_row_bytes(a->desc().format, a->desc().width), a->desc().width, a->desc().height};
   }
@@ -1351,7 +1356,7 @@ class Adapter::StreamRunner {
     if (!buffer_range(args, a_off, a_bytes) || (hi != kNoAllocation && !buffer_range(heap, h_off, kVideoEncodeHeapBytes)) || !buffer_range(bits, b_off, ~uint64_t{0}) ||
         !buffer_range(meta, m_off, ~uint64_t{0}))
       return refuse(__LINE__);
-    if (!plane_image(in_l) || !plane_image(in_c) || in_l == in_c || (rl == kNoAllocation) != (rc == kNoAllocation) || (rec_l && (!plane_image(rec_l) || !plane_image(rec_c) || rec_l == rec_c)))
+    if (!encode_plane_image(in_l) || !encode_plane_image(in_c) || in_l == in_c || (rl == kNoAllocation) != (rc == kNoAllocation) || (rec_l && (!encode_plane_image(rec_l) || !encode_plane_image(rec_c) || rec_l == rec_c)))
       return refuse(__LINE__);
     if (bits == meta || (rec_l && (rec_l == in_l || rec_l == in_c || rec_c == in_l || rec_c == in_c))) return refuse(__LINE__);
     if (!use(in_l, state::kVideoEncodeRead) || !use(in_c, state::kVideoEncodeRead) || !use(bits, state::kVideoEncodeWrite) || !use(meta, state::kVideoEncodeWrite) ||
@@ -1361,7 +1366,7 @@ class Adapter::StreamRunner {
     for (uint32_t i = 0; i < 2 * count; ++i) {
       refs[i] = alloc(ref_index[i]);
       // (a reference may be the reconstruction's own texture - a program passes its whole buffer of pictures -: the references are read before the reconstruction is written)
-      if (!plane_image(refs[i]) || !use(refs[i], state::kVideoEncodeRead)) return refuse(__LINE__);
+      if (!encode_plane_image(refs[i]) || !use(refs[i], state::kVideoEncodeRead)) return refuse(__LINE__);
     }
     if (!exec_) return status::kSuccess;
     NtStatus s = flush();

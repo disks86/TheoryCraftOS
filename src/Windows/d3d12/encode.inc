@@ -29,9 +29,12 @@
  * input maps from the CPU (QP map, dirty regions - unchanged macroblocks copy the reference -, motion hints from move regions) and the frame and subregion PSNR metadata.
  * The program writes the sequence and picture parameter sets (as H264PictureEncoder.hpp says they must read); EncodeFrame writes the slice NAL units.
  * What it does not do (the queries say so): input maps from GPU textures and so ResolveInputParamLayout, the per-block QP / SATD / bit allocation metadata maps (the
- * texture formats R8_SINT / R32_UINT are not there), frame analysis (two-pass), subregion notification, intra constrained slices, HEVC and AV1, protected content. */
+ * texture formats R8_SINT / R32_UINT are not there), frame analysis (two-pass), subregion notification, intra constrained slices, protected content.
+ * HEVC and AV1 are encode_codecs.inc's (hooked in where a function meets a codec other than H.264). */
 
 /* ---- the kernel's ops and layouts (src/Kernel/Dxgkrnl/CommandStream.hpp, VideoEncode.hpp) --------------------------------------------------------------------------- */
+
+#include "encode_codecs.h"   /* (HEVC and AV1: encode_codecs.inc, included at the end) */
 
 enum { OP_ESTIMATE_MOTION = OP_VIDEO_PROCESS + 1, OP_RESOLVE_MOTION_VECTORS, OP_ENCODE_FRAME, OP_RESOLVE_ENCODER_METADATA };
 #define VENC_PARAM_WORDS 64
@@ -444,7 +447,10 @@ static int venc_session_ok(const D3D12_VIDEO_ENCODER_INPUT_MAP_SESSION_INFO *si)
 /* The encoder's part of vdev_CheckFeatureSupport (video.inc): the motion estimator's and encoder's queries. S_FALSE: not one of them. */
 static HRESULT venc_feature(Dev *d, D3D12_FEATURE_VIDEO feature, void *data, UINT size) {
 #define ENC_FEATURE(type) do { if (size != sizeof(type)) return E_INVALIDARG; } while (0)
-  (void)d;
+  {
+    const HRESULT hr = vencx_feature(d, feature, data, size);   /* (HEVC and AV1) */
+    if (hr != S_FALSE) return hr;
+  }
   switch (feature) {
     case D3D12_FEATURE_VIDEO_MOTION_ESTIMATOR: {
       ENC_FEATURE(D3D12_FEATURE_DATA_VIDEO_MOTION_ESTIMATOR);
@@ -715,6 +721,7 @@ typedef struct VEnc {
   D3D12_VIDEO_ENCODER_DESC desc;
   D3D12_VIDEO_ENCODER_PROFILE_H264 profile;
   D3D12_VIDEO_ENCODER_CODEC_CONFIGURATION_H264 config;
+  VEncCodecData x;   /* (HEVC, AV1) */
 } VEnc;
 typedef struct VEncHeap {
   DObj d;
@@ -723,6 +730,7 @@ typedef struct VEncHeap {
   D3D12_VIDEO_ENCODER_LEVELS_H264 level;
   D3D12_VIDEO_ENCODER_PICTURE_RESOLUTION_DESC *resolutions;
   UINT alloc;      /* the rate controller's state and the reference store */
+  VEncCodecData x; /* (HEVC, AV1) */
 } VEncHeap;
 static const GUID *const g_venc_iids[] = {&IID_ID3D12Object, &IID_ID3D12DeviceChild, &IID_ID3D12Pageable, &IID_ID3D12VideoEncoder, NULL};
 static const GUID *const g_veheap_iids[] = {&IID_ID3D12Object, &IID_ID3D12DeviceChild, &IID_ID3D12Pageable, &IID_ID3D12VideoEncoderHeap, &IID_ID3D12VideoEncoderHeap1, NULL};
@@ -738,7 +746,7 @@ static HRESULT venc_make(Dev *d, const D3D12_VIDEO_ENCODER_DESC *desc, REFIID ri
   extern const ID3D12VideoEncoderVtbl venc_vtbl;
   if (out) *out = NULL;
   if (!desc || !out || desc->NodeMask > 1 || desc->Flags != D3D12_VIDEO_ENCODER_FLAG_NONE) return E_INVALIDARG;
-  if (desc->EncodeCodec != D3D12_VIDEO_ENCODER_CODEC_H264) return (UINT)desc->EncodeCodec <= D3D12_VIDEO_ENCODER_CODEC_AV1 ? DXGI_ERROR_UNSUPPORTED : E_INVALIDARG;
+  if (desc->EncodeCodec != D3D12_VIDEO_ENCODER_CODEC_H264) return vencx_codec(desc->EncodeCodec) ? vencx_make(d, desc, riid, out) : E_INVALIDARG;
   D3D12_VIDEO_ENCODER_PROFILE_H264 profile;
   D3D12_VIDEO_ENCODER_CODEC_CONFIGURATION_H264 config;
   if (!venc_profile(&desc->EncodeProfile, &profile) || desc->InputFormat != DXGI_FORMAT_NV12 || !venc_config(&desc->CodecConfiguration, &profile, &config) ||
@@ -759,7 +767,7 @@ static HRESULT veheap_make(Dev *d, const D3D12_VIDEO_ENCODER_HEAP_DESC1 *desc, R
   extern const ID3D12VideoEncoderHeap1Vtbl veheap_vtbl;
   if (out) *out = NULL;
   if (!desc || !out || desc->NodeMask > 1 || (desc->Flags & ~D3D12_VIDEO_ENCODER_HEAP_FLAG_ALLOW_DIRTY_REGIONS_)) return E_INVALIDARG;
-  if (desc->EncodeCodec != D3D12_VIDEO_ENCODER_CODEC_H264) return (UINT)desc->EncodeCodec <= D3D12_VIDEO_ENCODER_CODEC_AV1 ? DXGI_ERROR_UNSUPPORTED : E_INVALIDARG;
+  if (desc->EncodeCodec != D3D12_VIDEO_ENCODER_CODEC_H264) return vencx_codec(desc->EncodeCodec) ? vencx_heap_make(d, desc, riid, out) : E_INVALIDARG;
   if (desc->Pow2DownscaleFactor != 0) return DXGI_ERROR_UNSUPPORTED;
   D3D12_VIDEO_ENCODER_PROFILE_H264 profile;
   D3D12_VIDEO_ENCODER_LEVELS_H264 level;
@@ -786,11 +794,13 @@ static UINT STDMETHODCALLTYPE venc_GetNodeMask(VEnc *This) { return This->desc.N
 static D3D12_VIDEO_ENCODER_FLAGS STDMETHODCALLTYPE venc_GetEncoderFlags(VEnc *This) { return This->desc.Flags; }
 static D3D12_VIDEO_ENCODER_CODEC STDMETHODCALLTYPE venc_GetCodec(VEnc *This) { return This->desc.EncodeCodec; }
 static HRESULT STDMETHODCALLTYPE venc_GetCodecProfile(VEnc *This, D3D12_VIDEO_ENCODER_PROFILE_DESC dst) {
+  if (This->desc.EncodeCodec != D3D12_VIDEO_ENCODER_CODEC_H264) return vencx_get_profile(This->desc.EncodeCodec, &This->x, dst);
   if (dst.DataSize != sizeof(D3D12_VIDEO_ENCODER_PROFILE_H264) || !dst.pH264Profile) return E_INVALIDARG;
   *dst.pH264Profile = This->profile;
   return S_OK;
 }
 static HRESULT STDMETHODCALLTYPE venc_GetCodecConfiguration(VEnc *This, D3D12_VIDEO_ENCODER_CODEC_CONFIGURATION dst) {
+  if (This->desc.EncodeCodec != D3D12_VIDEO_ENCODER_CODEC_H264) return vencx_get_config(This->desc.EncodeCodec, &This->x, dst);
   if (dst.DataSize != sizeof(D3D12_VIDEO_ENCODER_CODEC_CONFIGURATION_H264) || !dst.pH264Config) return E_INVALIDARG;
   *dst.pH264Config = This->config;
   return S_OK;
@@ -801,11 +811,13 @@ static UINT STDMETHODCALLTYPE veheap_GetNodeMask(VEncHeap *This) { return This->
 static D3D12_VIDEO_ENCODER_HEAP_FLAGS STDMETHODCALLTYPE veheap_GetEncoderHeapFlags(VEncHeap *This) { return This->desc.Flags; }
 static D3D12_VIDEO_ENCODER_CODEC STDMETHODCALLTYPE veheap_GetCodec(VEncHeap *This) { return This->desc.EncodeCodec; }
 static HRESULT STDMETHODCALLTYPE veheap_GetCodecProfile(VEncHeap *This, D3D12_VIDEO_ENCODER_PROFILE_DESC dst) {
+  if (This->desc.EncodeCodec != D3D12_VIDEO_ENCODER_CODEC_H264) return vencx_get_profile(This->desc.EncodeCodec, &This->x, dst);
   if (dst.DataSize != sizeof(D3D12_VIDEO_ENCODER_PROFILE_H264) || !dst.pH264Profile) return E_INVALIDARG;
   *dst.pH264Profile = This->profile;
   return S_OK;
 }
 static HRESULT STDMETHODCALLTYPE veheap_GetCodecLevel(VEncHeap *This, D3D12_VIDEO_ENCODER_LEVEL_SETTING dst) {
+  if (This->desc.EncodeCodec != D3D12_VIDEO_ENCODER_CODEC_H264) return vencx_get_level(This->desc.EncodeCodec, &This->x, dst);
   if (dst.DataSize != sizeof(D3D12_VIDEO_ENCODER_LEVELS_H264) || !dst.pH264LevelSetting) return E_INVALIDARG;
   *dst.pH264LevelSetting = This->level;
   return S_OK;
@@ -864,6 +876,10 @@ static void venc_dirty_map(const D3D12_VIDEO_ENCODER_DIRTY_RECT_INFO *x, UINT mb
 static void venc_record(CmdList *l, VEnc *e, VEncHeap *h, const D3D12_VIDEO_ENCODER_SEQUENCE_CONTROL_DESC *seq, UINT refresh_index, D3D12_VIDEO_ENCODER_PICTURE_CONTROL_FLAGS pflags,
                         UINT codec_data_size, const D3D12_VIDEO_ENCODER_PICTURE_CONTROL_CODEC_DATA_H264 *p, const D3D12_VIDEO_ENCODE_REFERENCE_FRAMES *rf, Resource *input,
                         UINT input_sub, Resource *bits, UINT64 bits_offset, Resource *recon, UINT recon_sub, Resource *meta, UINT64 meta_offset, const VencExtras *x, UINT errors) {
+  if (e->desc.EncodeCodec != D3D12_VIDEO_ENCODER_CODEC_H264) {   /* (HEVC and AV1: encode_codecs.inc) */
+    vencx_record(l, e, h, seq, pflags, codec_data_size, p, rf, input, input_sub, bits, bits_offset, recon, recon_sub, meta, meta_offset, x, errors);
+    return;
+  }
   UINT il, ic, rl = 0, rc = 0;
   /* (what is not there to write into or read from makes no packet: the metadata could not say anything) */
   if (!bits || bits->desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER || bits_offset > bits->desc.Width || bits_offset > 0xFFFFFFFFu) return;
@@ -1115,13 +1131,14 @@ static void venc_resolve(CmdList *l, const D3D12_VIDEO_ENCODER_ENCODE_OPERATION_
 }
 static void STDMETHODCALLTYPE velist_ResolveEncoderOutputMetadata(CmdList *l, const D3D12_VIDEO_ENCODER_RESOLVE_METADATA_INPUT_ARGUMENTS *in,
                                                                   const D3D12_VIDEO_ENCODER_RESOLVE_METADATA_OUTPUT_ARGUMENTS *out) {
-  if (!in || !out || l->closed || in->EncoderCodec != D3D12_VIDEO_ENCODER_CODEC_H264) return;
+  if (!in || !out || l->closed || (UINT)in->EncoderCodec > D3D12_VIDEO_ENCODER_CODEC_AV1) return;
   venc_resolve(l, &in->HWLayoutMetadata, &out->ResolvedLayoutMetadata, NULL, NULL);
 }
 /* ResolveEncoderOutputMetadata1: also the frame's and the subregions' PSNR (three floats each); the per-block QP / SATD / bit allocation maps are not offered. */
 static void STDMETHODCALLTYPE velist_ResolveEncoderOutputMetadata1(CmdList *l, const D3D12_VIDEO_ENCODER_RESOLVE_METADATA_INPUT_ARGUMENTS1 *in,
                                                                    const D3D12_VIDEO_ENCODER_RESOLVE_METADATA_OUTPUT_ARGUMENTS1 *out) {
-  if (!in || !out || l->closed || in->EncoderCodec != D3D12_VIDEO_ENCODER_CODEC_H264 || (in->OptionalMetadata & ~VENC_OPTIONAL_PSNR) || out->pOutputQPMap || out->pOutputSATDMap ||
+  if (!in || !out || l->closed || (UINT)in->EncoderCodec > D3D12_VIDEO_ENCODER_CODEC_AV1 || (in->OptionalMetadata & ~VENC_OPTIONAL_PSNR) || out->pOutputQPMap || out->pOutputSATDMap ||
+      (in->EncoderCodec != D3D12_VIDEO_ENCODER_CODEC_H264 && in->OptionalMetadata) ||
       out->pOutputBitAllocationMap)
     return;
   const int frame = (in->OptionalMetadata & D3D12_VIDEO_ENCODER_OPTIONAL_METADATA_ENABLE_FLAG_FRAME_PSNR) != 0;
@@ -1136,3 +1153,5 @@ static void STDMETHODCALLTYPE velist_ResolveInputParamLayout(CmdList *l, const D
   (void)in;
   (void)out;
 }
+
+#include "encode_codecs.inc"

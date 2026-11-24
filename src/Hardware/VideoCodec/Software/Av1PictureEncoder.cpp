@@ -2052,8 +2052,9 @@ bool FrameEncoder::encode_b(BlockLevel bl, BlockSize bs, int edge_flags, uint64_
   if (d.intra) {
     stats_.intra += units;
   } else {
-    stats_.inter += units;
+    // (skipped blocks - no residual - are counted apart from the other inter blocks, as D3D12's statistics have them: intra + inter + skip = every unit)
     if (d.skip) stats_.skipped += units;
+    else stats_.inter += units;
     stats_.vector_x_sum += static_cast<int64_t>(units) * (d.mv.x / 2);
     stats_.vector_y_sum += static_cast<int64_t>(units) * (d.mv.y / 2);
   }

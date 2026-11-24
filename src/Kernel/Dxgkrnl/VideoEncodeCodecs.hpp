@@ -20,7 +20,7 @@
 // (VideoEncodePlanes.cpp). Both run on the CPU encoders of Hardware/VideoCodec/Software (H265PictureEncoder, Av1PictureEncoder) with the rate controller of the H.264
 // path. The pictures are widened planes (DxgTypes.hpp): NV12 as 4 bytes a pixel, P010 as 8 (four 16-bit words, the sample in the top ten bits of the first one or two).
 //
-// HEVC arguments (little-endian 32-bit words, kVideoEncodeParamWords of them, then the arrays):
+// HEVC arguments (little-endian 32-bit words, kVideoEncodeParamWords of them - those not named here zero -, then the arrays):
 //    0 codec (1)   1 profile (0 Main, 1 Main 10)   2 width   3 height (the coded size)   4 configuration flags (D3D12_VIDEO_ENCODER_CODEC_CONFIGURATION_HEVC_FLAGS)
 //    5 MinLumaCodingUnitSize   6 MaxLumaCodingUnitSize   7 MinLumaTransformUnitSize   8 MaxLumaTransformUnitSize (the D3D12 enumerations' values)
 //    9 max_transform_hierarchy_depth_inter | max_transform_hierarchy_depth_intra << 8
@@ -49,7 +49,7 @@
 //   delta (DeltaQPresent, DeltaQRes); CDEF (CdefBits, CdefDampingMinus3, Y primary[8], UV primary[8], Y secondary[8], UV secondary[8]). Signed values are two's
 //   complement words.
 //   then (CONFIGURABLE_GRID_PARTITION) the row heights and column widths in superblocks, then the QP map's 16-bit values (one a 64x64 superblock, padded to a word).
-// Its metadata (version 2): D3D12_VIDEO_ENCODER_OUTPUT_METADATA, a D3D12_VIDEO_ENCODER_FRAME_SUBREGION_METADATA a tile, then
+// Its metadata (version 3): D3D12_VIDEO_ENCODER_OUTPUT_METADATA, a D3D12_VIDEO_ENCODER_FRAME_SUBREGION_METADATA a tile, then
 // D3D12_VIDEO_ENCODER_AV1_PICTURE_CONTROL_SUBREGIONS_LAYOUT_DATA_TILES and D3D12_VIDEO_ENCODER_AV1_POST_ENCODE_VALUES - the layout ResolveEncoderOutputMetadata gives
 // an AV1 program - after the 8-byte header.
 #pragma once
@@ -57,15 +57,16 @@
 #include "Hardware/VideoCodec/Software/VideoEncPlanes.hpp"
 #include "Hardware/VideoCodec/Software/VideoRateControl.hpp"
 #include "Kernel/Dxgkrnl/VideoEncode.hpp"
+#include "Utility/ByteStream.hpp"
 #include "Utility/ArrayView.hpp"
 
 namespace dxgk {
 
 constexpr uint32_t kVideoEncodeCodecH264 = 0, kVideoEncodeCodecHevc = 1, kVideoEncodeCodecAv1 = 2;
-constexpr uint32_t kVideoEncodeMetadataVersionAv1 = 2;
+constexpr uint32_t kVideoEncodeMetadataVersionAv1 = 3;   // (1 and 2 are the H.264 / HEVC layouts: VideoEncode.hpp)
 constexpr uint32_t kVideoEncodeAv1FixedWords = 7 + 8 * 4 + 6 + 18 + 3 + 10 + 2 + 34;
 constexpr uint32_t kVideoEncodeAv1TilesBytes = 8 + 8 + 64 * 8 + 64 * 8 + 8;   // D3D12_VIDEO_ENCODER_AV1_PICTURE_CONTROL_SUBREGIONS_LAYOUT_DATA_TILES
-constexpr uint32_t kVideoEncodeAv1PostEncodeBytes = 8 + 152 + 24 + 80 + 16 + 272 + 608 + 8 + 56;   // D3D12_VIDEO_ENCODER_AV1_POST_ENCODE_VALUES
+constexpr uint32_t kVideoEncodeAv1PostEncodeBytes = 8 + 144 + 24 + 80 + 16 + 272 + 608 + 8 + 56;   // D3D12_VIDEO_ENCODER_AV1_POST_ENCODE_VALUES
 constexpr uint32_t kVideoEncodeOutputMetadataBytes = 72;                      // D3D12_VIDEO_ENCODER_OUTPUT_METADATA
 
 // D3D12_VIDEO_ENCODER_ENCODE_ERROR_FLAGS
@@ -74,7 +75,7 @@ constexpr uint64_t kEncodeErrorPictureControl = 0x1, kEncodeErrorSubregionLayout
 
 [[nodiscard]] bool run_video_encode_hevc(allocators::IAllocator& allocator, const VideoEncodeJob& job);
 [[nodiscard]] bool run_video_encode_av1(allocators::IAllocator& allocator, const VideoEncodeJob& job);
-// The resolved form of a version 2 (AV1) metadata buffer (`metadata` from its magic on) into `out`; false if `out` has no room.
+// The resolved form of a version 3 (AV1) metadata buffer (`metadata` from its magic on) into `out`; false if `out` has no room.
 [[nodiscard]] bool resolve_av1_encode_metadata(ConstByteView metadata, ByteView out);
 
 // The rate controller's state in the encoder heap (VideoEncode.cpp's, shared with the H.264 path).

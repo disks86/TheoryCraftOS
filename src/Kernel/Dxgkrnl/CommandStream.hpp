@@ -87,7 +87,7 @@
 //                    none), bitstream_index, bitstream_offset, metadata_index, metadata_offset, reference_count, then per reference its luma and chroma indices   (outside a
 //                    pass: codes one picture as VideoEncode.hpp says - the arguments are the args range, the heap (to the end of its buffer) holds at least kVideoEncodeHeapBytes of
 //                    state, and H.264's reference store if it has room (video_encode_heap_bytes); the input and references
-//                    kVideoEncodeRead, the reconstruction, bitstream and metadata kVideoEncodeWrite. A picture that cannot be coded is said so in the metadata)
+//                    kVideoEncodeRead, the reconstruction, bitstream and metadata kVideoEncodeWrite; the planes 8-bit widened, or A16B16G16R16 for HEVC / AV1 at 10 bits. A picture that cannot be coded is said so in the metadata)
 //   ResolveEncoderMetadata metadata_index, metadata_offset, out_index, out_offset[, frame_psnr_index, frame_psnr_offset, subregion_psnr_index, subregion_psnr_offset]
 //                    (outside a pass: EncodeFrame's metadata as D3D12_VIDEO_ENCODER_OUTPUT_METADATA and its slice records into the buffer `out`, and the PSNRs into the other two
 //                    when given - kNoAllocation for none; each kVideoEncodeWrite)

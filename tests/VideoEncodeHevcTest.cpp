@@ -34,6 +34,9 @@
 #include <vector>
 #include "Hardware/VideoCodec/Software/H265.hpp"
 #include "Hardware/VideoCodec/Software/H265PictureEncoder.hpp"
+#include "Kernel/Dxgkrnl/VideoEncode.hpp"
+#include "Kernel/Dxgkrnl/VideoEncodeCodecs.hpp"
+#include "Utility/ByteStream.hpp"
 
 using namespace hardware;
 #pragma GCC diagnostic ignored "-Wmissing-field-initializers"
@@ -683,9 +686,173 @@ static void test_refusals() {
   }
 }
 
+// ---- the kernel's EncodeFrame (src/Kernel/Dxgkrnl/VideoEncodeHevc.cpp): the arguments d3d12.dll writes, widened textures; the slices and the reconstruction must be
+// what the encoder driven directly makes of the same picture, the metadata resolve to D3D12_VIDEO_ENCODER_OUTPUT_METADATA and a record a slice.
+
+// A picture as a runtime keeps NV12 / P010: widened planes, 4 bytes a pixel (8 bits) or four 16-bit words (10 bits, the sample in the top ten).
+struct Widened {
+  int w = 0, h = 0, bd = 8;
+  std::vector<uint8_t> luma, chroma;
+  uint64_t px() const { return bd > 8 ? 8 : 4; }
+  void make(int w_, int h_, int bd_) {
+    w = w_; h = h_; bd = bd_;
+    luma.assign(size_t(w) * h * px(), 0);
+    chroma.assign(size_t(w / 2) * (h / 2) * px(), 0);
+  }
+  void from(const Pic& p) {
+    for (int y = 0; y < h; ++y)
+      for (int x = 0; x < w; ++x) put(luma, size_t(y) * w + x, p.y[size_t(y) * w + x], 0);
+    for (int y = 0; y < h / 2; ++y)
+      for (int x = 0; x < w / 2; ++x) {
+        put(chroma, size_t(y) * (w / 2) + x, p.u[size_t(y) * (w / 2) + x], 0);
+        put(chroma, size_t(y) * (w / 2) + x, p.v[size_t(y) * (w / 2) + x], 1);
+      }
+  }
+  void put(std::vector<uint8_t>& plane, size_t i, uint16_t v, int c) {
+    if (bd > 8) { const uint16_t s = uint16_t(v << 6); plane[i * 8 + c * 2] = uint8_t(s); plane[i * 8 + c * 2 + 1] = uint8_t(s >> 8); }
+    else plane[i * 4 + c] = uint8_t(v);
+  }
+  uint16_t get(const std::vector<uint8_t>& plane, size_t i, int c) const {
+    if (bd > 8) return uint16_t((plane[i * 8 + c * 2] | plane[i * 8 + c * 2 + 1] << 8) >> 6);
+    return plane[i * 4 + c];
+  }
+  bool equals(const Pic& p) const {
+    for (int y = 0; y < h; ++y)
+      for (int x = 0; x < w; ++x)
+        if (get(luma, size_t(y) * w + x, 0) != p.y[size_t(y) * w + x]) return false;
+    for (int y = 0; y < h / 2; ++y)
+      for (int x = 0; x < w / 2; ++x)
+        if (get(chroma, size_t(y) * (w / 2) + x, 0) != p.u[size_t(y) * (w / 2) + x] || get(chroma, size_t(y) * (w / 2) + x, 1) != p.v[size_t(y) * (w / 2) + x]) return false;
+    return true;
+  }
+  dxgk::VideoPictureImages images() const {
+    return {{ConstByteView(luma.data(), luma.size()), uint64_t(w) * px(), uint32_t(w), uint32_t(h)},
+            {ConstByteView(chroma.data(), chroma.size()), uint64_t(w / 2) * px(), uint32_t(w / 2), uint32_t(h / 2)}};
+  }
+  dxgk::VideoWritablePlaneImage wl() { return {ByteView(luma.data(), luma.size()), uint64_t(w) * px(), uint32_t(w), uint32_t(h)}; }
+  dxgk::VideoWritablePlaneImage wc() { return {ByteView(chroma.data(), chroma.size()), uint64_t(w / 2) * px(), uint32_t(w / 2), uint32_t(h / 2)}; }
+};
+
+static void put_word(std::vector<uint8_t>& b, uint32_t v) { for (int i = 0; i < 4; ++i) b.push_back(uint8_t(v >> (8 * i))); }
+
+static void test_kernel_side() {
+  for (int bd : {8, 10}) {
+    const int W = 96, H = 64;
+    H265EncSequence seq = base_seq(W, H);
+    seq.bit_depth = uint8_t(bd);
+    seq.sao = true;
+    seq.log2_ctb = 5;
+    Texture tex(W / 2 + 80, H / 2 + 60, 2);
+    H265PictureEncoder direct(g_alloc);
+    struct Ref { Pic pic; Widened wide; int poc; };
+    std::vector<Ref> dpb;
+    const H265EncFrameType types[3] = {H265EncFrameType::Idr, H265EncFrameType::P, H265EncFrameType::B};
+    const int pocs[3] = {0, 4, 2};
+    std::vector<uint8_t> heap(dxgk::kVideoEncodeHeapBytes, 0);
+    for (int n = 0; n < 3; ++n) {
+      Pic src;
+      src.make(W, H);
+      make_source(tex, pocs[n], bd, W, H, &src);
+      Widened wsrc;
+      wsrc.make(W, H, bd);
+      wsrc.from(src);
+      const int qp = n == 2 ? 32 : n == 1 ? 30 : 28;
+      // directly
+      std::vector<H265EncReference> desc;
+      for (const Ref& r : dpb) desc.push_back({r.pic.planes(), r.poc, false, true});
+      std::vector<uint8_t> l0, l1;
+      if (n == 1) l0 = {0};
+      if (n == 2) { l0 = {0}; l1 = {1}; }
+      H265EncPicture pic;
+      pic.seq = seq;
+      pic.type = types[n];
+      pic.poc = pocs[n];
+      pic.reference = n < 2;
+      pic.dpb = ArrayView<const H265EncReference>(desc.data(), desc.size());
+      pic.list[0] = ArrayView<const uint8_t>(l0.data(), l0.size());
+      pic.list[1] = ArrayView<const uint8_t>(l1.data(), l1.size());
+      pic.qp = int8_t(qp);
+      pic.slice_mode = H265EncSliceMode::RowsPerSlice;
+      pic.slice_value = 1;
+      Pic rec;
+      rec.make(W, H);
+      ByteBuffer out(g_alloc);
+      List<H265EncSlice> slices(g_alloc);
+      EncStatistics st;
+      CHECK(direct.encode(pic, src.planes(), rec.writable(), &out, &slices, &st) == H265EncResult::Ok);
+      // through the kernel
+      std::vector<uint32_t> w(dxgk::kVideoEncodeParamWords, 0);
+      w[0] = dxgk::kVideoEncodeCodecHevc; w[1] = bd == 10; w[2] = W; w[3] = H; w[4] = 0x4;   // (SAO)
+      w[5] = 0; w[6] = 2; w[7] = 0; w[8] = 3; w[9] = 1 | 1 << 8;   // CU 8 .. 32, TU 4 .. 32, depths 1
+      w[10] = 1; w[12] = 30; w[13] = 1; w[14] = 28; w[15] = 30; w[16] = 32; w[19] = 51;   // CQP 28 / 30 / 32
+      w[31] = 3; w[32] = 1; w[33] = 0;
+      w[34] = uint32_t(types[n]); w[35] = 0; w[36] = uint32_t(pocs[n]); w[37] = 0; w[38] = n < 2 ? 1 : 0; w[39] = 4;
+      w[40] = uint32_t(dpb.size()); w[41] = uint32_t(l0.size()); w[42] = uint32_t(l1.size());
+      w[47] = 64; w[48] = uint32_t(bd);
+      std::vector<uint8_t> args;
+      for (uint32_t v : w) put_word(args, v);
+      for (size_t i = 0; i < dpb.size(); ++i) { put_word(args, uint32_t(i)); put_word(args, 1); put_word(args, 0); put_word(args, uint32_t(dpb[i].poc)); put_word(args, 0); }
+      for (uint8_t v : l0) put_word(args, v);
+      for (uint8_t v : l1) put_word(args, v);
+      std::vector<dxgk::VideoPictureImages> refs;
+      for (const Ref& r : dpb) refs.push_back(r.wide.images());
+      Widened wrec;
+      wrec.make(W, H, bd);
+      std::vector<uint8_t> bits(1 << 20, 0), meta(dxgk::kVideoEncodeMetadataHeader + 64 * dxgk::kVideoEncodeSubregionBytes, 0);
+      dxgk::VideoEncodeJob job;
+      job.params = ConstByteView(args.data(), args.size());
+      job.heap = ByteView(heap.data(), heap.size());
+      job.input = wsrc.images();
+      job.has_reconstruction = true;
+      job.reconstruction_luma = wrec.wl();
+      job.reconstruction_chroma = wrec.wc();
+      job.references = ArrayView<const dxgk::VideoPictureImages>(refs.data(), refs.size());
+      job.bitstream = ByteView(bits.data(), bits.size());
+      job.metadata = ByteView(meta.data(), meta.size());
+      CHECK(dxgk::run_video_encode(g_alloc, job));
+      std::vector<uint8_t> resolved(72 + 64 * 24, 0xEE);
+      CHECK(dxgk::resolve_video_encode_metadata(ConstByteView(meta.data(), meta.size()), ByteView(resolved.data(), resolved.size())));
+      ByteReader m(ConstByteView(resolved.data(), resolved.size()));
+      const uint64_t errors = m.le64(), avg_qp = m.le64();
+      m.skip(40);
+      const uint64_t written = m.le64(), count = m.le64();
+      CHECK(errors == 0);
+      CHECK(avg_qp == uint64_t(qp));
+      CHECK(written == out.size());
+      CHECK(count == slices.count());
+      bool same_slices = count == slices.count();
+      for (uint64_t i = 0; same_slices && i < count; ++i) same_slices = m.le64() == slices[i].size && m.le64() == 0 && m.le64() == slices[i].header_bits;
+      CHECK(same_slices);
+      CHECK(written == out.size() && memcmp(bits.data(), out.view().data(), out.size()) == 0);
+      CHECK(wrec.equals(rec));
+      dpb.push_back({rec, wrec, pocs[n]});
+    }
+    // what the runtime found wrong goes to the metadata, nothing is coded; a reference outside the textures is refused
+    std::vector<uint32_t> w(dxgk::kVideoEncodeParamWords, 0);
+    w[0] = dxgk::kVideoEncodeCodecHevc; w[46] = 0x4;
+    std::vector<uint8_t> args;
+    for (uint32_t v : w) put_word(args, v);
+    std::vector<uint8_t> meta(dxgk::kVideoEncodeMetadataHeader + 24, 0), bits(64, 0);
+    dxgk::VideoEncodeJob job;
+    job.params = ConstByteView(args.data(), args.size());
+    job.bitstream = ByteView(bits.data(), bits.size());
+    job.metadata = ByteView(meta.data(), meta.size());
+    CHECK(dxgk::run_video_encode(g_alloc, job));
+    std::vector<uint8_t> resolved(72, 0);
+    CHECK(dxgk::resolve_video_encode_metadata(ConstByteView(meta.data(), meta.size()), ByteView(resolved.data(), resolved.size())));
+    CHECK(ByteReader(ConstByteView(resolved.data(), 8)).le64() == 0x4);
+    // (truncated arguments: refused as a picture control error, not read past)
+    job.params = ConstByteView(args.data(), 100);
+    CHECK(dxgk::run_video_encode(g_alloc, job));
+    CHECK(dxgk::resolve_video_encode_metadata(ConstByteView(meta.data(), meta.size()), ByteView(resolved.data(), resolved.size())));
+    CHECK(ByteReader(ConstByteView(resolved.data(), 8)).le64() == 0x1);
+  }
+}
+
 int main(int argc, char** argv) {
   const char* dump = argc > 1 ? argv[1] : nullptr;
   test_refusals();
+  test_kernel_side();
   test_sequences(dump);
   printf("%d checks, %d failed\n", g_checks, g_failed);
   return g_failed ? 1 : 0;
