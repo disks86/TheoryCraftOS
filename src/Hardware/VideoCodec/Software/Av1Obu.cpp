@@ -626,27 +626,34 @@ bool ObuParser::parse_frame_hdr(BitReader& gb) {
       hdr.segmentation.seg_data.last_active_segid = -1;
       for (int i = 0; i < MAX_SEGMENTS; i++) {
         SegmentationData& seg = hdr.segmentation.seg_data.d[i];
+        seg.feature_mask = 0;
         if (gb.bit()) {
+          seg.feature_mask |= 1;
           seg.delta_q = static_cast<int16_t>(gb.sbits(9));
           hdr.segmentation.seg_data.last_active_segid = static_cast<int8_t>(i);
         }
         if (gb.bit()) {
+          seg.feature_mask |= 2;
           seg.delta_lf_y_v = static_cast<int8_t>(gb.sbits(7));
           hdr.segmentation.seg_data.last_active_segid = static_cast<int8_t>(i);
         }
         if (gb.bit()) {
+          seg.feature_mask |= 4;
           seg.delta_lf_y_h = static_cast<int8_t>(gb.sbits(7));
           hdr.segmentation.seg_data.last_active_segid = static_cast<int8_t>(i);
         }
         if (gb.bit()) {
+          seg.feature_mask |= 8;
           seg.delta_lf_u = static_cast<int8_t>(gb.sbits(7));
           hdr.segmentation.seg_data.last_active_segid = static_cast<int8_t>(i);
         }
         if (gb.bit()) {
+          seg.feature_mask |= 16;
           seg.delta_lf_v = static_cast<int8_t>(gb.sbits(7));
           hdr.segmentation.seg_data.last_active_segid = static_cast<int8_t>(i);
         }
         if (gb.bit()) {
+          seg.feature_mask |= 32;
           seg.ref = static_cast<int8_t>(gb.bits(3));
           hdr.segmentation.seg_data.last_active_segid = static_cast<int8_t>(i);
           hdr.segmentation.seg_data.preskip = 1;
@@ -654,10 +661,12 @@ bool ObuParser::parse_frame_hdr(BitReader& gb) {
           seg.ref = -1;
         }
         if ((seg.skip = static_cast<uint8_t>(gb.bit()))) {
+          seg.feature_mask |= 64;
           hdr.segmentation.seg_data.last_active_segid = static_cast<int8_t>(i);
           hdr.segmentation.seg_data.preskip = 1;
         }
         if ((seg.globalmv = static_cast<uint8_t>(gb.bit()))) {
+          seg.feature_mask |= 128;
           hdr.segmentation.seg_data.last_active_segid = static_cast<int8_t>(i);
           hdr.segmentation.seg_data.preskip = 1;
         }

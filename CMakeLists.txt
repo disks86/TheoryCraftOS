@@ -1078,6 +1078,13 @@ add_executable(BOOTX64
   src/Hardware/VideoCodec/VideoTypes.cpp
   src/Hardware/VideoCodec/VideoFrameBuffer.cpp
   src/Hardware/VideoCodec/ColorConvert.cpp
+  src/Hardware/VideoCodec/VideoProcess.cpp
+  src/Hardware/VideoCodec/Dxva/DxvaDecoder.cpp
+  src/Hardware/VideoCodec/Dxva/DxvaH264.cpp
+  src/Hardware/VideoCodec/Dxva/DxvaMpeg2.cpp
+  src/Hardware/VideoCodec/Dxva/DxvaVp9.cpp
+  src/Hardware/VideoCodec/Dxva/DxvaHevc.cpp
+  src/Hardware/VideoCodec/Dxva/DxvaAv1.cpp
   src/Hardware/VideoCodec/SystemVideoCodecs.cpp
   src/Hardware/VideoCodec/AMD/AmdIpDiscovery.cpp
   src/Hardware/VideoCodec/AMD/AmdVcnFirmware.cpp
@@ -1383,6 +1390,7 @@ else()
 endif()
 file(GLOB TCOS_CODEC_SOURCES CONFIGURE_DEPENDS
   ${CMAKE_SOURCE_DIR}/src/Hardware/VideoCodec/Software/*.cpp ${CMAKE_SOURCE_DIR}/src/Hardware/VideoCodec/ColorConvert.cpp
+  ${CMAKE_SOURCE_DIR}/src/Hardware/VideoCodec/VideoProcess.cpp ${CMAKE_SOURCE_DIR}/src/Hardware/VideoCodec/Dxva/*.cpp
   ${CMAKE_SOURCE_DIR}/src/Media/Audio/*.cpp ${CMAKE_SOURCE_DIR}/src/Media/AudioCodecs.cpp ${CMAKE_SOURCE_DIR}/src/Media/Image/*.cpp
   ${CMAKE_SOURCE_DIR}/src/Media/ImageCodecs.cpp ${CMAKE_SOURCE_DIR}/src/Audio/Resampler.cpp)
 set_source_files_properties(${TCOS_CODEC_SOURCES} PROPERTIES COMPILE_OPTIONS "${TCOS_CODEC_OPT_FLAG}")

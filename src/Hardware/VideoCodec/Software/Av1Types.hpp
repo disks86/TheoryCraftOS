@@ -286,6 +286,7 @@ struct SegmentationData {
     int8_t ref;
     uint8_t skip;
     uint8_t globalmv;
+    uint8_t feature_mask;  ///< bit j: feature j was coded (alt_q, lf_y_v, lf_y_h, lf_u, lf_v, ref, skip, globalmv), as DXVA's feature_mask carries it
 };
 
 struct SegmentationDataSet {

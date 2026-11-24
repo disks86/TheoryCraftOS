@@ -67,6 +67,31 @@ class H264Decoder {
   using SliceObserver = void (*)(void* context, const SliceRefs& refs);
   void set_slice_observer(SliceObserver observer, void* context);
 
+  // Decoding as a DXVA driver does it (src/Hardware/VideoCodec/Dxva/DxvaH264.cpp): the program keeps the decoded picture buffer. For each picture it names the surface the
+  // picture goes into (a key) and the references with their order counts, frame numbers and long-term status; the decoder keeps each decoded picture under its key and
+  // builds the slices' reference lists from those references only (its own marking and order counting are not used), and the picture comes back at once, uncropped.
+  struct ExternalReference {
+    uint32_t key = 0;           // the surface the reference was decoded into
+    bool long_term = false;
+    bool non_existing = false;  // a frame the program inferred for a gap in frame_num (never decoded: mid-grey, not reported missing)
+    int frame_num = 0;          // FrameNum, or LongTermFrameIdx of a long-term reference
+    int top_poc = 0, bottom_poc = 0;
+  };
+  struct ExternalPicture {
+    uint32_t key = 0;           // where the picture is kept (a reference to this key reads the picture that was there before)
+    int top_poc = 0, bottom_poc = 0;
+    ArrayView<const ExternalReference> references;   // at most 16
+  };
+  enum class ExternalStatus : uint8_t {
+    Decoded,
+    MissingReference,   // decoded, but a reference's key holds no picture (mid-grey was used for it)
+    NotDecoded,         // the data holds no decodable slice of a picture
+    NoMemory,
+  };
+  // Decodes the one picture `access_unit` holds (Annex B: any parameter sets, then its slices; slices of a second picture are ignored) and gives it in `decoded` (I420,
+  // the whole coded size; valid until the next call). Pictures that are not IDR are decoded even without an IDR before them.
+  [[nodiscard]] ExternalStatus decode_external(ConstByteView access_unit, const ExternalPicture& picture, VideoFrame* decoded);
+
  private:
   allocators::IAllocator& allocator_;
   UniquePointer<h264::Core> core_;

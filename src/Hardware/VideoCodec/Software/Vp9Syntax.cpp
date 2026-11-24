@@ -180,6 +180,42 @@ void Core::reset() {
   offload_decided_ = offloaded_ = false;
 }
 
+void Core::hold_frame(int index) {
+  if (index >= 0 && index < kPoolSize) ++frames_[index].ref_count;
+}
+
+void Core::release_frame_hold(int index) {
+  if (index >= 0 && index < kPoolSize && frames_[index].ref_count > 0) --frames_[index].ref_count;
+}
+
+int Core::make_blank_frame(int width, int height, int ss_x, int ss_y, int bit_depth) {
+  if (width < 1 || height < 1 || width > 65536 || height > 65536 || ss_x < 0 || ss_x > 1 || ss_y < 0 || ss_y > 1 || (bit_depth != 8 && bit_depth != 10 && bit_depth != 12))
+    return -1;
+  int index = -1;
+  for (int i = 0; i < kPoolSize; ++i)
+    if (frames_[i].ref_count == 0 && i != new_fb_idx_ && i != prev_frame_idx_) {
+      index = i;
+      break;
+    }
+  if (index < 0) return -1;
+  // allocate_frame() lays the picture out in the current format: lend it the stand-in's.
+  const int saved_ss_x = ss_x_, saved_ss_y = ss_y_, saved_bd = bit_depth_;
+  ss_x_ = ss_x;
+  ss_y_ = ss_y;
+  bit_depth_ = bit_depth;
+  const bool ok = allocate_frame(&frames_[index], width, height);
+  ss_x_ = saved_ss_x;
+  ss_y_ = saved_ss_y;
+  bit_depth_ = saved_bd;
+  if (!ok) return -1;
+  Frame& f = frames_[index];
+  f.pixels.fill(static_cast<uint16_t>(1u << (bit_depth - 1)));
+  for (MvRef& m : f.mvs) m = MvRef();
+  f.corrupted = true;
+  f.ref_count = 1;
+  return index;
+}
+
 void Core::release_frame(Frame* f) {
   release_view(allocator_, f->pixels);
   release_view(allocator_, f->mvs);
@@ -549,8 +585,8 @@ bool Core::read_uncompressed_header(BitReader& rb, uint32_t* header_size, int* s
       refresh_frame_flags_ = rb.literal(REF_FRAMES);
       for (int i = 0; i < REFS_PER_FRAME; ++i) {
         const int ref = rb.literal(3);
-        const int idx = ref_frame_map_[ref];
-        if (idx < 0) return false;
+        const int idx = external_ ? external_->frame_ref[i] : ref_frame_map_[ref];
+        if (idx < 0 || idx >= kPoolSize || frames_[idx].width == 0) return false;
         frame_refs_[i].idx = idx;
         ref_slots_[i] = ref;
         ref_frame_sign_bias_[LAST_FRAME + i] = rb.bit();
@@ -1828,6 +1864,17 @@ bool Core::decode_frame(ConstByteView data, int* shown, FrameHeaderInfo* info) {
     need_resync_ = true;
     return false;
   };
+  if (external_) {
+    // The slots are what the caller says they are before this frame; it holds every picture it names, so none is freed here.
+    for (int i = 0; i < REF_FRAMES; ++i) {
+      const int old = ref_frame_map_[i];
+      if (old >= 0 && frames_[old].ref_count > 0) --frames_[old].ref_count;
+      const int idx = external_->slot[i];
+      ref_frame_map_[i] = idx >= 0 && idx < kPoolSize && frames_[idx].width > 0 ? idx : -1;
+      if (ref_frame_map_[i] >= 0) ++frames_[ref_frame_map_[i]].ref_count;
+    }
+    need_resync_ = false;
+  }
   BitReader rb(data);
   uint32_t header_size = 0;
   if (!read_uncompressed_header(rb, &header_size, shown, info)) return fail();

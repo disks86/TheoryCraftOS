@@ -54,6 +54,24 @@
 //   CopyBuffer       dst_index, dst_offset, src_index, src_offset, bytes   (outside a pass: between two buffer allocations (not heaps; a reserved buffer is read and written as the whole it appears to be; the source may be a kAllocQueryResult buffer: the results of the queries ended before); the ranges lie in the buffers, a copy inside one buffer must not overlap)
 //   CopyBufferImage  direction (0 buffer to image, 1 image to buffer), image_index, level, layer, x, y, width, height, buffer_index, buffer_offset, row_pitch   (outside a pass: a rectangle of one level of a colour image
 //                    (any kind: `layer` is the array slice or volume depth, 0 for a 2D image) and rows of the buffer, `row_pitch` bytes apart from `buffer_offset` on (at least width * the bytes of a pixel); a multisampled or depth image is refused)
+//                    [, narrow]   (a NarrowLayout: the buffer's pixels are narrower than the image's - one or two 8-bit channels of an A8B8G8R8 / X8B8G8R8 image, or one or two 16-bit channels of an
+//                    A16B16G16R16 one: copied into the image they become (r, g or 0, 0, maximum), out of it the first channels are taken. What a runtime keeps R8 / R8G8 / R16 / R16G16 textures and
+//                    the planes of NV12 / P010 in, as the kernel has no narrower formats)
+//   DecodeFrame      decoder handle, buffer_index, picture_offset, picture_bytes, matrix_offset, matrix_bytes, slices_offset, slices_bytes, bitstream_index, bitstream_offset, bitstream_bytes,
+//                    luma_index, chroma_index, status_index, status_offset, output_keyed, key_count, then key_count allocation indices   (outside a pass: decodes one picture with a video decoder of the
+//                    device (Kernel::create_video_decoder) - its DXVA picture parameters, inverse quantization matrices and slice controls are the three ranges of the buffer `buffer_index`
+//                    (a range of 0 bytes: none), the compressed data the range of `bitstream_index` - into the two planes of the output surface (2D images of one level, the formats of
+//                    DxgTypes.hpp VideoDecoderDesc, the luma at least the decoder's size, the chroma at least half of it). Key i is the luma allocation of the surface index i of the
+//                    parameters (the current picture's and the references': what the decoder knows each decoded picture by; kNoAllocation for an index not used); output_keyed 1: the
+//                    current picture is known by its output (`luma_index`) whatever its index (Direct3D 12), 0: by the key of its index (Direct3D 11). status_index
+//                    (kNoAllocation: none) is a buffer the 16 bytes of a VideoDecodeStatus go to, at status_offset. A picture that cannot be decoded leaves the planes as they were and
+//                    says so in the status: the stream goes on)
+//   VideoProcess     output_format, output_color_space, target left, top, right, bottom, background r, g, b, a (float bits), background_is_yuv, alpha_fill, alpha_fill_stream,
+//                    output_plane0_index, output_plane1_index, stream_count, then per stream kVideoProcessStreamWords words: format, color_space, source left, top, right, bottom,
+//                    destination left, top, right, bottom, orientation, alpha_blend, alpha (float bits), plane0_index, plane1_index   (outside a pass: Hardware/VideoCodec/VideoProcess.hpp
+//                    on the CPU. Formats are hardware::VpFormat; a YUV image is two 2D images of one level as the runtime keeps NV12 / P010 / P016 (DxgTypes.hpp VideoDecoderDesc), an RGB one a
+//                    single image of the matching kernel format (Bgra8 A8R8G8B8, Bgrx8 X8R8G8B8, Rgba8 A8B8G8R8, Rgb10a2 A2B10G10R10, Rgba16f A16B16G16R16F); plane1_index is
+//                    kNoAllocation for RGB. At most kMaxVideoProcessStreams streams. A frame the processor refuses (rectangles, colour spaces) leaves the output as it was)
 //   EndQuery         (the count of fragments that passed the depth and stencil tests since BeginQuery is written there - a little-endian 64-bit number - once the stream has run)
 #pragma once
 #include "Kernel/Dxgkrnl/DxgTypes.hpp"
@@ -93,7 +111,11 @@ enum class Op : uint16_t {
   ResourceBarrier,
   CopyBuffer,
   CopyBufferImage,
+  DecodeFrame,
+  VideoProcess,
 };
+constexpr uint32_t kVideoProcessStreamWords = 15;
+constexpr uint32_t kMaxVideoProcessStreams = 16;
 
 // How the vertices (or indices) of a draw make triangles (D3D10 IASetPrimitiveTopology / D3D9 primitive types); the default is a list. A strip or fan is expanded to a list of
 // triangles by the kernel, so any device draws it; with an index buffer the index 0xFFFF (0xFFFFFFFF for 32-bit indices) ends a strip and starts the next.
@@ -107,6 +129,9 @@ inline bool is_adjacency(Topology t) { return t == Topology::LineListAdjacency |
 inline uint32_t patch_points(Topology t) { return static_cast<uint32_t>(t) - kPatchListBase; }
 
 constexpr uint32_t kNoAllocation = 0xFFFFFFFFu;
+// CopyBufferImage's last word: how a buffer's pixels are narrower than the image's.
+enum class NarrowLayout : uint32_t { None = 0, R8 = 1, R8G8 = 2, R16 = 3, R16G16 = 4 };
+constexpr uint32_t narrow_pixel_bytes(NarrowLayout n) { return n == NarrowLayout::R8 ? 1 : n == NarrowLayout::R8G8 || n == NarrowLayout::R16 ? 2 : n == NarrowLayout::R16G16 ? 4 : 0; }
 constexpr uint32_t kStreamOutputAppendOffset = 0xFFFFFFFFu;   // SetStreamOutput's offset for "after what the last stream output into the buffer wrote"
 constexpr uint32_t kMaxPacketWords = 2 + graphics::kMaxPushConstantBytes / 4;   // (PushConstants is the longest: the byte count, then up to kMaxPushConstantBytes of constants)
 constexpr uint64_t kMaxCommandBytes = 16 * 1024 * 1024;
@@ -207,7 +232,26 @@ class CommandWriter {
   void copy_image_to_buffer(uint32_t image, uint32_t level, uint32_t layer, uint32_t x, uint32_t y, uint32_t width, uint32_t height, uint32_t buffer, uint32_t offset, uint32_t row_pitch) {
     packet(Op::CopyBufferImage, {1, image, level, layer, x, y, width, height, buffer, offset, row_pitch});
   }
+  // The same with the buffer's pixels narrower than the image's (NarrowLayout): direction 0 buffer to image, 1 image to buffer.
+  void copy_buffer_image_narrow(uint32_t direction, uint32_t image, uint32_t level, uint32_t layer, uint32_t x, uint32_t y, uint32_t width, uint32_t height, uint32_t buffer, uint32_t offset,
+                                uint32_t row_pitch, NarrowLayout narrow) {
+    packet(Op::CopyBufferImage, {direction, image, level, layer, x, y, width, height, buffer, offset, row_pitch, static_cast<uint32_t>(narrow)});
+  }
   void bind_uav(uint32_t slot, uint32_t allocation, uint32_t offset, uint32_t size) { packet(Op::BindUav, {slot, allocation, offset, size}); }
+  struct DecodeArgs {
+    Handle decoder = 0;
+    uint32_t buffer = kNoAllocation, picture_offset = 0, picture_bytes = 0, matrix_offset = 0, matrix_bytes = 0, slices_offset = 0, slices_bytes = 0;
+    uint32_t bitstream = kNoAllocation, bitstream_offset = 0, bitstream_bytes = 0;
+    uint32_t luma = kNoAllocation, chroma = kNoAllocation, status = kNoAllocation, status_offset = 0;
+    uint32_t output_keyed = 0;
+  };
+  void decode_frame(const DecodeArgs& a, ArrayView<const uint32_t> keys) {
+    ok_ &= bytes_.put32(static_cast<uint32_t>(Op::DecodeFrame) | ((18 + static_cast<uint32_t>(keys.size())) << 16));
+    for (uint32_t w : {a.decoder, a.buffer, a.picture_offset, a.picture_bytes, a.matrix_offset, a.matrix_bytes, a.slices_offset, a.slices_bytes, a.bitstream, a.bitstream_offset,
+                       a.bitstream_bytes, a.luma, a.chroma, a.status, a.status_offset, a.output_keyed, static_cast<uint32_t>(keys.size())})
+      ok_ &= bytes_.put32(w);
+    for (uint32_t k : keys) ok_ &= bytes_.put32(k);
+  }
   void dispatch(uint32_t x, uint32_t y = 1, uint32_t z = 1) { packet(Op::Dispatch, {x, y, z}); }
   // `mode`: a graphics::ResolveMode (0 average, 1 sample 0, 2 least, 3 greatest); a depth buffer needs 1 or the adapter's kFeatureResolveModes. Left out (0, two words), it is the average of a colour target.
   void resolve_region(uint32_t destination, uint32_t source, uint32_t mode = 0) {

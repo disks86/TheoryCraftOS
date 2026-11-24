@@ -39,6 +39,7 @@ void Dpb::clear_pictures() {
     PictureInfo& p = *slots_[i];
     p.in_use = false;
     p.is_ref = p.is_long = p.needed_for_output = false;
+    p.has_key = false;
   }
   out_count_ = 0;
   out_wait_count_ = 0;
@@ -52,6 +53,7 @@ void Dpb::reset() {
     p.is_ref = false;
     p.is_long = false;
     p.needed_for_output = false;
+    p.has_key = false;
   }
   out_count_ = 0;
   out_wait_count_ = 0;
@@ -115,6 +117,17 @@ PictureInfo* Dpb::begin_picture(const SliceHeader& sh, int64_t pts) {
   cur_->keyframe = sh.idr() || sh.type == kSliceI;
   cur_->pts = pts;
   return cur_;
+}
+
+void Dpb::set_current_poc(int top, int bottom) {
+  top_poc_ = top;
+  bottom_poc_ = bottom;
+  pic_poc_ = top < bottom ? top : bottom;
+  if (cur_) {
+    cur_->poc = pic_poc_;
+    cur_->top_poc = top;
+    cur_->bottom_poc = bottom;
+  }
 }
 
 void Dpb::abort_picture() {
@@ -210,9 +223,14 @@ void Dpb::finish_picture(const SliceHeader& sh) {
     prev_frame_num_ = sh.frame_num;
   }
   prev_ref_frame_num_ = sh.nal_ref_idc != 0 ? (mmco5 ? 0 : sh.frame_num) : prev_ref_frame_num_;
-  cur_->needed_for_output = true;
   PictureInfo* done = cur_;
   cur_ = nullptr;
+  if (decode_order_) {
+    done->needed_for_output = false;
+    returned_ = done;
+    return;
+  }
+  done->needed_for_output = true;
   queue_output(done);
 }
 

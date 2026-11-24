@@ -238,10 +238,16 @@ static HRESULT STDMETHODCALLTYPE dev_CheckFeatureSupport(Dev *This, D3D12_FEATUR
       const FormatInfo *i = format_info(f->Format);
       f->Support1 = D3D12_FORMAT_SUPPORT1_NONE;
       f->Support2 = D3D12_FORMAT_SUPPORT2_NONE;
-      if (i) {
+      if (i && i->planar) {
+        /* (NV12, P010, P016: 2D textures and arrays, sampled and drawn into by plane views, what the video decoder writes and the video processor reads and writes) */
+        f->Support1 = D3D12_FORMAT_SUPPORT1_TEXTURE2D | D3D12_FORMAT_SUPPORT1_SHADER_LOAD | D3D12_FORMAT_SUPPORT1_SHADER_SAMPLE | D3D12_FORMAT_SUPPORT1_RENDER_TARGET |
+                      D3D12_FORMAT_SUPPORT1_DECODER_OUTPUT | D3D12_FORMAT_SUPPORT1_VIDEO_PROCESSOR_OUTPUT | D3D12_FORMAT_SUPPORT1_VIDEO_PROCESSOR_INPUT;
+      } else if (i) {
         f->Support1 = D3D12_FORMAT_SUPPORT1_TEXTURE2D;
         if (i->depth) f->Support1 |= D3D12_FORMAT_SUPPORT1_DEPTH_STENCIL;
         else f->Support1 |= D3D12_FORMAT_SUPPORT1_SHADER_SAMPLE | D3D12_FORMAT_SUPPORT1_RENDER_TARGET | D3D12_FORMAT_SUPPORT1_BLENDABLE;
+        if (i->narrow || i->kernel == KF_A8R8G8B8 || i->kernel == KF_A8B8G8R8 || i->kernel == KF_X8R8G8B8 || i->kernel == KF_RGBA16 || i->kernel == KF_RGB10A2)
+          f->Support1 |= D3D12_FORMAT_SUPPORT1_VIDEO_PROCESSOR_OUTPUT | D3D12_FORMAT_SUPPORT1_VIDEO_PROCESSOR_INPUT;      /* (the video processor's RGB) */
       } else if (format_bytes(f->Format)) {
         f->Support1 = D3D12_FORMAT_SUPPORT1_IA_VERTEX_BUFFER;
       }
@@ -260,7 +266,8 @@ static HRESULT STDMETHODCALLTYPE dev_CheckFeatureSupport(Dev *This, D3D12_FEATUR
       if (size != sizeof *f) return E_INVALIDARG;
       /* (a format with depth and stencil has two planes; a format the device does not know is not one) */
       if (!format_info(f->Format) && !format_bytes(f->Format)) return E_INVALIDARG;
-      f->PlaneCount = f->Format == DXGI_FORMAT_D24_UNORM_S8_UINT ? 2 : 1;
+      const FormatInfo *fi = format_info(f->Format);
+      f->PlaneCount = f->Format == DXGI_FORMAT_D24_UNORM_S8_UINT || (fi && fi->planar) ? 2 : 1;
       return S_OK;
     }
     case D3D12_FEATURE_GPU_VIRTUAL_ADDRESS_SUPPORT: {
@@ -428,6 +435,10 @@ static Dev *dev_create(LUID luid, NTSTATUS *status_out) {
   if (!d) return NULL;
   extern const ID3D12Device10Vtbl dev_vtbl;
   dx_init(OBJ(d), &dev_vtbl, g_device_iids, dev_destroy);
+  {
+    extern const ID3D12VideoDevice3Vtbl vdev_vtbl;
+    d->video.lpVtbl = &vdev_vtbl;
+  }
   d->luid = luid;
   NTSTATUS st = kmt_open_adapter(luid, &d->adapter);
   if (KMT_OK(st)) st = kmt_create_device(d->adapter, &d->kdev);

@@ -51,6 +51,7 @@ struct SequenceHeader {
   uint8_t intra_matrix[64] = {};       // by position (row * 8 + column)
   uint8_t non_intra_matrix[64] = {};
   int mb_width = 0, mb_height = 0;     // of a frame, in macroblocks (a frame of an interlaced sequence is a whole number of macroblock pairs)
+  bool mpeg1 = false;                  // an ISO/IEC 11172-2 sequence (no sequence extension): MPEG-1 quantisation, escapes, stuffing and full-sample vectors
 };
 
 // 6.2.3 and 6.2.3.1: the picture header and the picture coding extension.
@@ -63,6 +64,7 @@ struct PictureHeader {
   bool top_field_first = false, frame_pred_frame_dct = false, concealment_motion_vectors = false, q_scale_type = false, intra_vlc_format = false;
   bool alternate_scan = false, repeat_first_field = false, chroma_420_type = false, progressive_frame = true;
   bool has_extension = false;
+  bool full_pel[2] = {false, false};         // MPEG-1: the forward / backward vectors are in whole samples
 };
 
 // A decoded frame (both fields, or the one picture).
@@ -171,6 +173,19 @@ class Core {
   void set_offload(IOffload* offload) { offload_ = offload; offloaded_ = false; }
   void set_frame_observer(IFrameObserver* observer) { observer_ = observer; }
 
+  // Decoding for a DXVA driver (src/Hardware/VideoCodec/Dxva/DxvaMpeg2.cpp): the caller keeps the pictures and says which ones a picture is decoded into and predicted
+  // from, and the picture comes back at once (decoding order); nothing goes to the output queue. A Core used this way is used only this way.
+  struct ExternalPicture {
+    Picture* target = nullptr;     // the frame the picture goes into (a second field: the frame its first field went into, which is kept)
+    Picture* forward = nullptr;    // P: the anchor it predicts from; B: the older anchor (null: missing, the prediction is left out)
+    Picture* backward = nullptr;   // B: the newer anchor
+    bool second_field = false;     // the second field of the frame in `target`
+  };
+  enum class ExternalStatus : uint8_t { Decoded, BadHeaders, NoSlices, NoMemory };
+  // `headers`: a sequence header (and, for MPEG-2, its extension, the quantiser matrix extension), the picture header (and its coding extension), each with its
+  // start code; `slices`: the slices of the picture, each starting at its start code.
+  [[nodiscard]] ExternalStatus decode_external(ConstByteView headers, ArrayView<const ConstByteView> slices, const ExternalPicture& picture);
+
  private:
   // 6.3.17.1 frame_motion_type / field_motion_type, normalized
   enum MotionType { kMvFrame = 0, kMvField = 1, kMv16x8 = 2, kMvDmv = 3 };
@@ -227,6 +242,7 @@ class Core {
 
   IOffload* offload_ = nullptr;
   IFrameObserver* observer_ = nullptr;
+  const ExternalPicture* external_ = nullptr;   // during decode_external()
   bool offloaded_ = false;
 
   // slice and macroblock state

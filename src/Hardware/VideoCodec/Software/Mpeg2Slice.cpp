@@ -97,8 +97,11 @@ bool Core::read_motion_vectors(BitReader& br, Mb& mb) {
         const int x = read_motion_component(br, fx, pmv[0][0]);
         const int y = read_motion_component(br, fy, pmv[0][1]);
         if (x == INT32_MIN || y == INT32_MIN) return false;
-        pmv[0][0] = pmv[1][0] = mb.mv[d][0][0] = x;
-        pmv[0][1] = pmv[1][1] = mb.mv[d][0][1] = y;
+        pmv[0][0] = pmv[1][0] = x;
+        pmv[0][1] = pmv[1][1] = y;
+        // MPEG-1 full_pel vectors count whole samples; the predictors stay in the coded units.
+        mb.mv[d][0][0] = pic_.full_pel[d] ? 2 * x : x;
+        mb.mv[d][0][1] = pic_.full_pel[d] ? 2 * y : y;
         break;
       }
       case kMvField:
@@ -169,6 +172,7 @@ bool Core::decode_block(BitReader& br, Mb& mb, int block, int16_t* out) {
   const int qscale = pic_.q_scale_type ? kNonLinearScale[quant_scale_code_] : quant_scale_code_ * 2;
   const uint8_t* matrix = mb.intra ? sequence_.intra_matrix : sequence_.non_intra_matrix;
   const uint16_t* table = lut_dct_[mb.intra && pic_.intra_vlc_format ? 1 : 0].data();
+  const bool mpeg1 = sequence_.mpeg1;
   int sum = 0;
   int i = -1;   // the scan position of the last coefficient read
   if (mb.intra) {
@@ -194,6 +198,7 @@ bool Core::decode_block(BitReader& br, Mb& mb, int block, int16_t* out) {
     const bool negative = br.bit() != 0;
     i = 0;
     int level = (((2 * 1 + 1) * qscale * matrix[scan[0]]) >> 5);
+    if (mpeg1 && level != 0 && !(level & 1)) --level;
     level = level > 2047 ? 2047 : level;
     out[scan[0]] = static_cast<int16_t>(negative ? -level : level);
     sum += negative ? -level : level;
@@ -206,7 +211,16 @@ bool Core::decode_block(BitReader& br, Mb& mb, int block, int16_t* out) {
     if (symbol == 112) break;   // end of block
     int run, level;
     bool negative;
-    if (symbol == 111) {   // escape: 6 bits of run, 12 of level (two's complement)
+    if (symbol == 111 && mpeg1) {   // MPEG-1 escape: 6 bits of run, then a level of 8 bits, or of 16 (an 8-bit 0 or -128 followed by 8 more)
+      run = static_cast<int>(br.get(6));
+      const int first_byte = static_cast<int>(br.get(8));
+      if (first_byte == 0) level = static_cast<int>(br.get(8));
+      else if (first_byte == 128) level = static_cast<int>(br.get(8)) - 256;
+      else level = first_byte >= 128 ? first_byte - 256 : first_byte;
+      if (level == 0 || level == -256) return false;
+      negative = level < 0;
+      if (negative) level = -level;
+    } else if (symbol == 111) {   // escape: 6 bits of run, 12 of level (two's complement)
       run = static_cast<int>(br.get(6));
       level = static_cast<int>(br.get(12));
       if (level >= 2048) level -= 4096;
@@ -224,13 +238,14 @@ bool Core::decode_block(BitReader& br, Mb& mb, int block, int16_t* out) {
     int value;
     if (mb.intra) value = (level * qscale * matrix[position]) >> 4;
     else value = ((2 * level + 1) * qscale * matrix[position]) >> 5;
+    if (mpeg1 && value != 0 && !(value & 1)) --value;   // 11172-2 2.4.4: MPEG-1 makes each coefficient odd (toward zero)
     if (negative) value = -value;
     value = value < -2048 ? -2048 : value > 2047 ? 2047 : value;
     out[position] = static_cast<int16_t>(value);
     sum += value;
   }
-  // 7.4.4 mismatch control: the sum of all the coefficients must be odd.
-  if (!(sum & 1)) out[63] = static_cast<int16_t>(out[63] ^ 1);
+  // 7.4.4 mismatch control: the sum of all the coefficients must be odd (MPEG-1 made each one odd instead).
+  if (!mpeg1 && !(sum & 1)) out[63] = static_cast<int16_t>(out[63] ^ 1);
   return !br.error();
 }
 
@@ -309,13 +324,17 @@ bool Core::decode_slice(ConstByteView unit, int mb_row) {
     BitReader hr(unit.subview(4));
     SliceInfo info;
     int info_row = mb_row;
-    if (sequence_.vertical_size > 2800) info_row += static_cast<int>(hr.get(3)) << 7;
+    if (!sequence_.mpeg1 && sequence_.vertical_size > 2800) info_row += static_cast<int>(hr.get(3)) << 7;
     info.quantiser_scale_code = static_cast<int>(hr.get(5));
     while (hr.bit()) hr.skip(8);
     info.mb_row = info_row;
     info.mb_bit_offset = 32 + static_cast<uint32_t>(hr.position());
     int increment = 0;
     for (;;) {
+      if (sequence_.mpeg1 && hr.peek(11) == 0x00F && !hr.error()) {   // MPEG-1 macroblock_stuffing
+        hr.skip(11);
+        continue;
+      }
       const uint16_t entry = lut_address_[hr.peek(11)];
       if (entry == 0 || hr.error()) break;
       hr.skip(entry & 31);
@@ -334,7 +353,7 @@ bool Core::decode_slice(ConstByteView unit, int mb_row) {
     }
   }
   BitReader br(unit.subview(4));
-  if (sequence_.vertical_size > 2800) mb_row += static_cast<int>(br.get(3)) << 7;
+  if (!sequence_.mpeg1 && sequence_.vertical_size > 2800) mb_row += static_cast<int>(br.get(3)) << 7;
   quant_scale_code_ = static_cast<int>(br.get(5));
   if (quant_scale_code_ == 0) return false;
   while (br.bit()) br.skip(8);   // slice_extension_flag and the extra slice information
@@ -353,6 +372,11 @@ bool Core::decode_slice(ConstByteView unit, int mb_row) {
     // macroblock_address_increment, with its escapes
     int increment = 0;
     for (;;) {
+      if (sequence_.mpeg1 && br.peek(11) == 0x00F) {   // MPEG-1 macroblock_stuffing
+        br.skip(11);
+        if (br.error()) return false;
+        continue;
+      }
       const uint16_t entry = lut_address_[br.peek(11)];
       if (entry == 0) return false;
       br.skip(entry & 31);
@@ -389,8 +413,9 @@ bool Core::decode_slice(ConstByteView unit, int mb_row) {
           skipped.field_dct = false;
           skipped.motion = field ? kMvField : kMvFrame;
           for (int d = 0; d < 2; ++d) {
-            skipped.mv[d][0][0] = pmv_[d][0][0];
-            skipped.mv[d][0][1] = pmv_[d][0][1];
+            const int scale = pic_.full_pel[d] ? 2 : 1;
+            skipped.mv[d][0][0] = pmv_[d][0][0] * scale;
+            skipped.mv[d][0][1] = pmv_[d][0][1] * scale;
             skipped.field_select[d][0] = pic_.structure == kBottomField ? 1 : 0;
           }
         }

@@ -45,7 +45,13 @@ typedef struct FormatInfo {
   UINT bytes;          /* of a pixel; of a 4 x 4 block of a compressed format */
   UINT depth;          /* depth/stencil format */
   UINT compressed;     /* block-compressed (BC1 .. BC3): the rows of a footprint are rows of blocks */
+  UINT narrow;         /* NARROW_*: one or two 8- or 16-bit channels the kernel keeps widened (its CopyBufferImage NarrowLayout); `bytes` is the footprint's pixel */
+  UINT planar;         /* PLANAR_*: NV12 (8 bits), P010 / P016 (16 bits) - a luma plane and a half-size plane of U, V: each plane and array slice an allocation of its own */
 } FormatInfo;
+/* The kernel's NarrowLayout (src/Kernel/Dxgkrnl/CommandStream.hpp): an image of four channels the program sees as one or two. Copied into it a pixel becomes (r, g or 0, 0,
+ * the maximum), so an R8 / R8G8 / R16 / R16G16 view of it samples what Direct3D says it does; render targets of these formats write their channels only (pso.inc). */
+enum { NARROW_NONE, NARROW_R8, NARROW_R8G8, NARROW_R16, NARROW_R16G16 };
+enum { PLANAR_NONE, PLANAR_8, PLANAR_16 };
 
 static const FormatInfo g_formats[] = {
     {DXGI_FORMAT_R32G32B32A32_TYPELESS, KF_RGBA32F, 16, 0}, {DXGI_FORMAT_R32G32B32A32_FLOAT, KF_RGBA32F, 16, 0}, {DXGI_FORMAT_R32G32B32A32_UINT, KF_RGBA32UINT, 16, 0},
@@ -59,6 +65,11 @@ static const FormatInfo g_formats[] = {
     {DXGI_FORMAT_BC1_TYPELESS, KF_BC1, 8, 0, 1}, {DXGI_FORMAT_BC1_UNORM, KF_BC1, 8, 0, 1}, {DXGI_FORMAT_BC1_UNORM_SRGB, KF_BC1_SRGB, 8, 0, 1},
     {DXGI_FORMAT_BC2_TYPELESS, KF_BC2, 16, 0, 1}, {DXGI_FORMAT_BC2_UNORM, KF_BC2, 16, 0, 1}, {DXGI_FORMAT_BC2_UNORM_SRGB, KF_BC2_SRGB, 16, 0, 1},
     {DXGI_FORMAT_BC3_TYPELESS, KF_BC3, 16, 0, 1}, {DXGI_FORMAT_BC3_UNORM, KF_BC3, 16, 0, 1}, {DXGI_FORMAT_BC3_UNORM_SRGB, KF_BC3_SRGB, 16, 0, 1},
+    {DXGI_FORMAT_R8_TYPELESS, KF_A8B8G8R8, 1, 0, 0, NARROW_R8}, {DXGI_FORMAT_R8_UNORM, KF_A8B8G8R8, 1, 0, 0, NARROW_R8},
+    {DXGI_FORMAT_R8G8_TYPELESS, KF_A8B8G8R8, 2, 0, 0, NARROW_R8G8}, {DXGI_FORMAT_R8G8_UNORM, KF_A8B8G8R8, 2, 0, 0, NARROW_R8G8},
+    {DXGI_FORMAT_R16_TYPELESS, KF_RGBA16, 2, 0, 0, NARROW_R16}, {DXGI_FORMAT_R16_UNORM, KF_RGBA16, 2, 0, 0, NARROW_R16},
+    {DXGI_FORMAT_R16G16_TYPELESS, KF_RGBA16, 4, 0, 0, NARROW_R16G16}, {DXGI_FORMAT_R16G16_UNORM, KF_RGBA16, 4, 0, 0, NARROW_R16G16},
+    {DXGI_FORMAT_NV12, KF_A8B8G8R8, 1, 0, 0, NARROW_R8, PLANAR_8}, {DXGI_FORMAT_P010, KF_RGBA16, 2, 0, 0, NARROW_R16, PLANAR_16}, {DXGI_FORMAT_P016, KF_RGBA16, 2, 0, 0, NARROW_R16, PLANAR_16},
 };
 /* The bytes of a row of a level `w` pixels wide (of blocks for a compressed format), and the rows of a level `h` high. */
 static UINT64 format_row_bytes(const FormatInfo *fi, UINT w) { return fi && fi->compressed ? (UINT64)((w + 3) / 4) * fi->bytes : (UINT64)w * (fi ? fi->bytes : 4); }
@@ -68,6 +79,18 @@ static const FormatInfo *format_info(DXGI_FORMAT f) {
   for (UINT i = 0; i < sizeof g_formats / sizeof g_formats[0]; ++i)
     if (g_formats[i].dxgi == f) return &g_formats[i];
   return NULL;
+}
+/* A plane of a planar format, as the format of its footprints and views (R8 / R8G8, or R16 / R16G16): plane 0 the luma, plane 1 the chroma. */
+static const FormatInfo *plane_format(const FormatInfo *fi, UINT plane) {
+  if (!fi || !fi->planar) return fi;
+  const int sixteen = fi->planar == PLANAR_16;
+  return format_info(plane == 0 ? (sixteen ? DXGI_FORMAT_R16_TYPELESS : DXGI_FORMAT_R8_TYPELESS) : (sixteen ? DXGI_FORMAT_R16G16_TYPELESS : DXGI_FORMAT_R8G8_TYPELESS));
+}
+/* The channels a render target of `f` has, as a write mask (an R8 target of the kernel's four-channel image writes red alone). */
+static UINT format_write_mask(DXGI_FORMAT f) {
+  const FormatInfo *fi = format_info(f);
+  if (!fi || !fi->narrow) return 0xF;
+  return fi->narrow == NARROW_R8 || fi->narrow == NARROW_R16 ? 0x1 : 0x3;
 }
 /* The bytes of a pixel of any format a buffer view or a vertex attribute may name (not only the ones a texture can have). */
 static UINT format_bytes(DXGI_FORMAT f) {
@@ -203,6 +226,7 @@ struct Dev {
   SRWLOCK fence_lock;
   struct ShaderCache *caches;      /* the shader cache sessions open (library.inc), for ShaderCacheControl */
   SRWLOCK cache_lock;
+  ID3D12VideoDevice3 video;        /* the same object as ID3D12VideoDevice .. 3 (video.inc) */
 };
 #define DEV_FEATURE_STREAM_OUTPUT (1u << 21)      /* graphics::kFeatureStreamOutput in KmtCaps.features */
 #define DEV_FEATURE_DEPTH_RESOLVE (1u << 19)      /* graphics::kFeatureDepthResolve */

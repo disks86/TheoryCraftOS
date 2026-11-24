@@ -31,6 +31,7 @@ static HRESULT STDMETHODCALLTYPE dev_QueryInterface(Dev *d, REFIID riid, void **
            guid_eq(riid, &IID_IDXGIDevice3)) *out = &d->dxgi;      /* (DXGI 1.2: ANGLE needs it to present to another process's window) */
   else if (guid_eq(riid, &IID_ITcosPresenter)) *out = &d->presenter;
   else if ((guid_eq(riid, &IID_ID3D11On12Device) || guid_eq(riid, &IID_ID3D11On12Device1)) && d->on12.lpVtbl) *out = &d->on12;      /* (a device of D3D11On12CreateDevice) */
+  else if (guid_eq(riid, &IID_ID3D11VideoDevice) || guid_eq(riid, &IID_ID3D11VideoDevice1) || guid_eq(riid, &IID_ID3D11VideoDevice2)) *out = &d->video;      /* (video.inc) */
   else { dx_no_interface("ID3D11Device", riid); return E_NOINTERFACE; }
   dx_AddRef(OBJ(d));
   return S_OK;
@@ -82,6 +83,15 @@ static HRESULT STDMETHODCALLTYPE dev_CheckFormatSupport(Dev *d, DXGI_FORMAT form
   int convert;
   if (!support) return E_INVALIDARG;
   *support = 0;
+  const TexFormat *planar = tex_format(format);
+  if (planar && (planar->flags & FMT_PLANAR)) {
+    /* (NV12, P010, P016: 2D textures and arrays of one level that the CPU reaches, sampled and drawn into by views of a plane, what the decoders write - NV12 and P010 -
+     * and the video processor reads and writes; no unordered access to them is drawn, no mipmaps, no multisampling) */
+    *support = D3D11_FORMAT_SUPPORT_TEXTURE2D | D3D11_FORMAT_SUPPORT_SHADER_LOAD | D3D11_FORMAT_SUPPORT_SHADER_SAMPLE | D3D11_FORMAT_SUPPORT_RENDER_TARGET |
+               D3D11_FORMAT_SUPPORT_CPU_LOCKABLE | D3D11_FORMAT_SUPPORT_VIDEO_PROCESSOR_INPUT | D3D11_FORMAT_SUPPORT_VIDEO_PROCESSOR_OUTPUT;
+    if (format != DXGI_FORMAT_P016) *support |= D3D11_FORMAT_SUPPORT_DECODER_OUTPUT;
+    return S_OK;
+  }
   const TexFormat *colour = tex_format_for(format, 0), *depth = tex_format_for(format, D3D11_BIND_DEPTH_STENCIL);
   if (colour) {
     const BOOL layered = colour->stored_bpp == 4 || (colour->flags & FMT_BLOCK);      /* (the kernel's volumes, arrays and cubes: 32-bit texels or blocks) */
@@ -101,6 +111,9 @@ static HRESULT STDMETHODCALLTYPE dev_CheckFormatSupport(Dev *d, DXGI_FORMAT form
     if (format == DXGI_FORMAT_B8G8R8A8_UNORM || format == DXGI_FORMAT_R8G8B8A8_UNORM || format == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB || format == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB ||
         format == DXGI_FORMAT_R16G16B16A16_FLOAT || format == DXGI_FORMAT_R10G10B10A2_UNORM)
       *support |= D3D11_FORMAT_SUPPORT_DISPLAY;      /* (what dxgi.dll's swap chains have) */
+    if (format == DXGI_FORMAT_B8G8R8A8_UNORM || format == DXGI_FORMAT_B8G8R8X8_UNORM || format == DXGI_FORMAT_R8G8B8A8_UNORM || format == DXGI_FORMAT_R10G10B10A2_UNORM ||
+        format == DXGI_FORMAT_R16G16B16A16_FLOAT)
+      *support |= D3D11_FORMAT_SUPPORT_VIDEO_PROCESSOR_INPUT | D3D11_FORMAT_SUPPORT_VIDEO_PROCESSOR_OUTPUT;      /* (the video processor's RGB formats: video.inc) */
   } else if (depth) {
     *support |= D3D11_FORMAT_SUPPORT_TEXTURE1D | D3D11_FORMAT_SUPPORT_TEXTURE2D | D3D11_FORMAT_SUPPORT_DEPTH_STENCIL | D3D11_FORMAT_SUPPORT_MIP;
     if (format_is_typeless(format)) *support |= D3D11_FORMAT_SUPPORT_CAST_WITHIN_BIT_LAYOUT;
@@ -189,7 +202,7 @@ static HRESULT STDMETHODCALLTYPE dev_CheckFeatureSupport(Dev *d, D3D11_FEATURE f
       g->MaxGPUVirtualAddressBitsPerProcess = g12.MaxGPUVirtualAddressBitsPerProcess;
       return S_OK;
     }
-    case D3D11_FEATURE_D3D11_OPTIONS4: FEATURE_SIZE(D3D11_FEATURE_DATA_D3D11_OPTIONS4); break;      /* (no NV12 textures to share) */
+    case D3D11_FEATURE_D3D11_OPTIONS4: FEATURE_SIZE(D3D11_FEATURE_DATA_D3D11_OPTIONS4); break;      /* (NV12 textures are not shared: tex_make refuses the shared flags for them) */
     case D3D11_FEATURE_SHADER_CACHE: FEATURE_SIZE(D3D11_FEATURE_DATA_SHADER_CACHE); break;      /* (D3D11_SHADER_CACHE_SUPPORT_NONE) */
     case D3D11_FEATURE_D3D11_OPTIONS5: {
       /* (resources and fences share through NT handles; the formats that share are Direct3D 12's tier) */
@@ -312,6 +325,7 @@ static void dev_destroy(DxObj *o) {
   InterlockedExchange(&d->o.ref, 16);      /* (the references given back below - the blank texture's, the bound state's - are not the last again) */
   removal_shutdown(d);
   if (d->list) flush(d);
+  video_shutdown(d);
   if (d->ctx) { ctx_release_all(d->ctx); mem_free(d->ctx); }
   if (d->blank) dx_Release(OBJ(d->blank));
   for (UINT k = 0; k < 4; ++k) if (d->blank_kind[k]) dx_Release(OBJ(d->blank_kind[k]));
@@ -453,6 +467,7 @@ static HRESULT dev_start(Dev *d) {
   dx_init(&c->o, &ctx_vtbl, g_ctx_iids, NULL);
   c->dev = d;
   ctx_init_faces(c);
+  c->video.lpVtbl = &vctx_vtbl;      /* (the immediate context's only) */
   c->sample_mask = 0xFFFFFFFFu;
   for (UINT i = 0; i < 4; ++i) c->blend_factor[i] = 1.0f;
   d->ctx = c;
@@ -473,6 +488,7 @@ static HRESULT dev_create_on(IDXGIAdapter *adapter, UINT flags, const D3D_FEATUR
   dx_init(&d->o, &dev_vtbl, g_dev_iids, dev_destroy);
   d->dxgi.lpVtbl = (const IDXGIDevice1Vtbl *)&g_dxgi_vtbl;      /* (IDXGIDevice3's table begins with IDXGIDevice1's) */
   d->presenter.lpVtbl = &g_presenter_vtbl;
+  d->video.lpVtbl = &vdev_vtbl;
   InitializeCriticalSection(&d->lock);
   d->level = level;
   d->flags = flags;

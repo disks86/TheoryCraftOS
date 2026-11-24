@@ -381,6 +381,15 @@ class Core {
   void set_offload(IOffload* offload) { offload_ = offload; }
   void set_frame_observer(IFrameObserver* observer) { observer_ = observer; }
 
+  // ---- decoding driven from outside (DXVA: src/Hardware/VideoCodec/Dxva/DxvaAv1.cpp). The caller made the headers (complete as the parser leaves them: sizes,
+  // tiling, segmentation data, lossless flags, skip mode references, ...), gives the tiles and the eight reference slots the header's refidx[] index (empty slots
+  // only where the frame does not use them), and gets the frame's state for later frames - the picture (after super-resolution, without film grain), segmentation
+  // map, motion vectors and CDFs - in *state. The parser and the Core's own slots are not used. False: the data is damaged (nothing is stored).
+  [[nodiscard]] bool decode_frame_external(const SequenceHeader& seq, const FrameHeader& hdr, ArrayView<const TileData> tiles, ArrayView<const RefSlot> refs,
+                                           RefSlot* state);
+  // `pic` with its film grain applied (into a picture the Core keeps, valid until the next call), or `pic` itself when its header has no grain. Null if out of memory.
+  const Picture* grained(const Picture& pic);
+
   // ---- reconstruction (Av1Recon.cpp). dav1d's bd_fn.
   // Intra block (dav1d_recon_b_intra): prediction and residual of luma and chroma, reads the coefficients.
   bool recon_b_intra(TaskContext& t, BlockSize bs, int intra_edge_flags, const Av1Block& b);
@@ -411,8 +420,8 @@ class Core {
   void read_restoration_info(TaskContext& t, RestorationUnit& lr, int p, RestorationType frame_type);
 
   // ---- Av1Frame.cpp
-  bool init_frame(const ObuParser& parser);
-  bool decode_tiles(const ObuParser& parser);
+  bool init_frame(const SequenceHeader* seq, const FrameHeader* hdr, ArrayView<const RefSlot> refs);
+  bool decode_tiles(ArrayView<const TileData> tiles);
   bool post_filter();
   bool apply_film_grain_to_output();
   bool decode_frame_offloaded();

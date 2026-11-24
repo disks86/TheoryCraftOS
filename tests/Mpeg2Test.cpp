@@ -124,11 +124,17 @@ static Result decode_stream(allocators::IAllocator& a, const std::vector<uint8_t
   return r;
 }
 
+// `name`: mpeg2_<name>.m2v, or "mpeg1_<name>" for tests/data/mpeg1_<name>.m1v (an MPEG-1 stream).
+static void stream_path(char* path, size_t size, const char* name, bool yuv) {
+  if (strncmp(name, "mpeg1_", 6) == 0) snprintf(path, size, "tests/data/%s.%s", name, yuv ? "yuv" : "m1v");
+  else snprintf(path, size, "tests/data/mpeg2_%s.%s", name, yuv ? "yuv" : "m2v");
+}
+
 static void test_stream(const char* name) {
   char path[160];
-  snprintf(path, sizeof path, "tests/data/mpeg2_%s.m2v", name);
+  stream_path(path, sizeof path, name, false);
   const std::vector<uint8_t> stream = read_file(path);
-  snprintf(path, sizeof path, "tests/data/mpeg2_%s.yuv", name);
+  stream_path(path, sizeof path, name, true);
   const std::vector<uint8_t> ref = read_file(path);
   CHECK(!stream.empty() && !ref.empty());
   if (stream.empty() || ref.empty()) return;
@@ -150,7 +156,7 @@ static void test_stream(const char* name) {
 // buffers (the sanitizers say so), not hang, and not leak.
 static void test_damaged(const char* name) {
   char path[160];
-  snprintf(path, sizeof path, "tests/data/mpeg2_%s.m2v", name);
+  stream_path(path, sizeof path, name, false);
   const std::vector<uint8_t> stream = read_file(path);
   CHECK(!stream.empty());
   if (stream.empty()) return;
@@ -177,9 +183,10 @@ static void test_damaged(const char* name) {
 }
 
 int main() {
-  static const char* const streams[] = {"intra", "ipp", "ibp", "interlaced", "interlaced_bff", "alt", "dc10", "highrate", "lowrate", "matrix", "oddsize", "syn_frames", "syn_fields", "syn_fields_bff"};
+  static const char* const streams[] = {"intra", "ipp", "ibp", "interlaced", "interlaced_bff", "alt", "dc10", "highrate", "lowrate", "matrix", "oddsize", "syn_frames", "syn_fields", "syn_fields_bff",
+                                       "mpeg1_ibp", "mpeg1_highrate", "mpeg1_matrix"};
   for (const char* name : streams) test_stream(name);
-  for (const char* name : {"ibp", "interlaced", "alt", "highrate", "syn_fields", "syn_frames"}) test_damaged(name);
+  for (const char* name : {"ibp", "interlaced", "alt", "highrate", "syn_fields", "syn_frames", "mpeg1_ibp", "mpeg1_highrate"}) test_damaged(name);
   if (g_failed) {
     printf("%d check(s) failed\n", g_failed);
     return 1;

@@ -106,6 +106,11 @@ struct CmdList {
   /* the render pass's resolve parameters, copied from the program's at BeginRenderPass (kept across resets: only the room) */
   D3D12_RENDER_PASS_ENDING_ACCESS_RESOLVE_SUBRESOURCE_PARAMETERS *rp_params;
   UINT rp_params_cap;
+  /* video lists (video.inc): the kernel buffers the recorded DecodeFrames' arguments were copied to (given back when the list is reset), and where the last DecodeFrame's
+   * status words are in the stream - an EndQuery of decode statistics points them at the query (chunk + 1: 0 none, and the byte offset in it) */
+  UINT *temps;
+  UINT ntemps, cap_temps;
+  UINT last_decode_chunk, last_decode_at;
   /* the kernel pipelines the recording binds, each once (its PSO keeps it until the list is reset: pso_use / pso_unuse) */
   struct BoundPipe { Pso *pso; UINT handle; } *bound;
   UINT nbound, cap_bound;
@@ -174,7 +179,9 @@ static const GUID *const g_list_iids[] = {&IID_ID3D12Object, &IID_ID3D12DeviceCh
 
 static HRESULT STDMETHODCALLTYPE dev_CreateCommandAllocator(Dev *This, D3D12_COMMAND_LIST_TYPE type, REFIID riid, void **out) {
   extern const ID3D12CommandAllocatorVtbl alloc_vtbl;
-  if (type != D3D12_COMMAND_LIST_TYPE_DIRECT && type != D3D12_COMMAND_LIST_TYPE_COMPUTE && type != D3D12_COMMAND_LIST_TYPE_COPY && type != D3D12_COMMAND_LIST_TYPE_BUNDLE) return E_INVALIDARG;
+  if (type != D3D12_COMMAND_LIST_TYPE_DIRECT && type != D3D12_COMMAND_LIST_TYPE_COMPUTE && type != D3D12_COMMAND_LIST_TYPE_COPY && type != D3D12_COMMAND_LIST_TYPE_BUNDLE &&
+      type != D3D12_COMMAND_LIST_TYPE_VIDEO_DECODE && type != D3D12_COMMAND_LIST_TYPE_VIDEO_PROCESS)
+    return E_INVALIDARG;
   CmdAlloc *a = dobj_new(sizeof *a, This, &alloc_vtbl, g_alloc_iids, dobj_child_destroy);
   if (!a) return E_OUTOFMEMORY;
   a->type = type;
@@ -243,7 +250,8 @@ static void ensure_room(CmdList *l, UINT bytes, UINT allocs) {
 
 enum { OP_BEGIN_PASS = 1, OP_END_PASS, OP_BIND_PIPELINE, OP_BIND_VB, OP_BIND_IB, OP_PUSH_CONSTANTS, OP_BIND_TEXTURE, OP_SET_VIEWPORT, OP_SET_SCISSOR, OP_DRAW, OP_DRAW_INDEXED, OP_COPY_REGION,
        OP_GENERATE_MIPMAPS, OP_SET_TOPOLOGY, OP_DRAW_INSTANCED, OP_DRAW_INDEXED_INSTANCED, OP_BEGIN_QUERY, OP_END_QUERY, OP_BIND_UAV, OP_DISPATCH, OP_RESOLVE_REGION, OP_SET_STREAM_OUTPUT,
-       OP_SET_ROOT_SIGNATURE, OP_SET_DESCRIPTOR_HEAPS, OP_SET_ROOT_CONSTANTS, OP_SET_ROOT_DESCRIPTOR, OP_SET_ROOT_TABLE, OP_RESOURCE_BARRIER, OP_COPY_BUFFER, OP_COPY_BUFFER_IMAGE };
+       OP_SET_ROOT_SIGNATURE, OP_SET_DESCRIPTOR_HEAPS, OP_SET_ROOT_CONSTANTS, OP_SET_ROOT_DESCRIPTOR, OP_SET_ROOT_TABLE, OP_RESOURCE_BARRIER, OP_COPY_BUFFER, OP_COPY_BUFFER_IMAGE,
+       OP_DECODE_FRAME, OP_VIDEO_PROCESS };
 
 static void end_pass(CmdList *l) {
   if (!l->pass_open) return;
@@ -284,6 +292,9 @@ static void list_free_recording(CmdList *l) {
   l->nbound = 0;
   for (UINT i = 0; i < l->nrefs; ++i) l->refs[i]->lpVtbl->Release(l->refs[i]);
   l->nrefs = 0;
+  for (UINT i = 0; i < l->ntemps; ++i) kmt_destroy_allocation(l->d.dev->kdev, l->temps[i]);
+  l->ntemps = 0;
+  l->last_decode_chunk = 0;
 }
 
 static void list_reset_state(CmdList *l) {
@@ -298,13 +309,16 @@ static void list_destroy(DxObj *o) {
   mem_free(l->chunks);
   mem_free(l->refs);
   mem_free(l->rp_params);
+  mem_free(l->temps);
   mem_free(l->bound);
   mem_free(l->log);
   dobj_child_destroy(o);
 }
 
+static HRESULT video_list_make(Dev *This, D3D12_COMMAND_LIST_TYPE type, REFIID riid, void **out);
 static HRESULT STDMETHODCALLTYPE dev_CreateCommandList(Dev *This, UINT mask, D3D12_COMMAND_LIST_TYPE type, ID3D12CommandAllocator *allocator, ID3D12PipelineState *initial, REFIID riid, void **out) {
   extern const ID3D12GraphicsCommandList7Vtbl list_vtbl;
+  if (allocator && (type == D3D12_COMMAND_LIST_TYPE_VIDEO_DECODE || type == D3D12_COMMAND_LIST_TYPE_VIDEO_PROCESS)) return video_list_make(This, type, riid, out);
   if (!allocator || (type != D3D12_COMMAND_LIST_TYPE_DIRECT && type != D3D12_COMMAND_LIST_TYPE_COMPUTE && type != D3D12_COMMAND_LIST_TYPE_COPY && type != D3D12_COMMAND_LIST_TYPE_BUNDLE)) return E_INVALIDARG;
   CmdList *l = dobj_new(sizeof *l, This, &list_vtbl, g_list_iids, list_destroy);
   if (!l) return E_OUTOFMEMORY;
@@ -842,7 +856,10 @@ static void STDMETHODCALLTYPE list_ClearRenderTargetView(CmdList *l, D3D12_CPU_D
   ensure_room(l, ROOM_BYTES, ROOM_ALLOCS);
   const UINT saved = l->rtv_count;
   l->rtv_count = 1;
-  begin_pass_packet(l, d->alloc, 0, 1 /* clear colour */, color, 1.0f, 0);
+  /* (a narrow view clears its channels: the kernel's image keeps the others as zeros and the maximum alpha) */
+  const UINT mask = format_write_mask(d->format);
+  const float narrow[4] = {color[0], (mask & 2) ? color[1] : 0.0f, 0.0f, 1.0f};
+  begin_pass_packet(l, d->alloc, 0, 1 /* clear colour */, mask == 0xF ? color : narrow, 1.0f, 0);
   l->rtv_count = saved;
   packet(l, OP_END_PASS, NULL, 0);
 }
@@ -888,6 +905,25 @@ static void sub_split(const Resource *r, UINT sub, UINT *level, UINT *layer) {
   *level = sub % r->mips;
   *layer = sub / r->mips;
 }
+/* What a subresource is in the kernel: the allocation, its level and layer, and the format of its texels (a plane's for a planar texture, whose every plane and slice is a 2D
+ * allocation of one level). 0 for a subresource the resource does not have. */
+static UINT sub_target(const Resource *r, UINT sub, UINT *level, UINT *layer, const FormatInfo **fi) {
+  if (sub >= res_subresources(r)) return 0;
+  if (r->planes) {
+    *level = *layer = 0;
+    *fi = plane_format(r->fmt, sub / r->layers);
+    return r->plane_alloc[sub];      /* (plane * layers + slice: the subresource index itself) */
+  }
+  sub_split(r, sub, level, layer);
+  *fi = r->fmt;
+  return r->alloc;
+}
+/* A CopyBufferImage packet: with the narrow layout of the texture's format as its twelfth word when it has one. */
+static void copy_buffer_image_packet(CmdList *l, UINT direction, UINT image, UINT level, UINT layer, UINT x, UINT y, UINT w, UINT h, UINT buffer, UINT offset, UINT pitch,
+                                     const FormatInfo *fi) {
+  UINT payload[12] = {direction, image, level, layer, x, y, w, h, buffer, offset, pitch, fi ? fi->narrow : 0};
+  packet(l, OP_COPY_BUFFER_IMAGE, payload, fi && fi->narrow ? 12 : 11);
+}
 
 static void STDMETHODCALLTYPE list_CopyTextureRegion(CmdList *l, const D3D12_TEXTURE_COPY_LOCATION *dst, UINT x, UINT y, UINT z, const D3D12_TEXTURE_COPY_LOCATION *src, const D3D12_BOX *box) {
   Resource *d = (Resource *)dst->pResource, *s = (Resource *)src->pResource;
@@ -898,32 +934,41 @@ static void STDMETHODCALLTYPE list_CopyTextureRegion(CmdList *l, const D3D12_TEX
     /* buffer to texture */
     const D3D12_SUBRESOURCE_FOOTPRINT *fp = &src->PlacedFootprint.Footprint;
     UINT level, layer;
-    sub_split(d, dst->SubresourceIndex, &level, &layer);
+    const FormatInfo *fi = NULL;
+    const UINT image = sub_target(d, dst->SubresourceIndex, &level, &layer, &fi);
+    if (!image) return;
     const UINT left = box ? box->left : 0, top = box ? box->top : 0, front = box ? box->front : 0;
     const UINT w = box ? box->right - box->left : fp->Width, h = box ? box->bottom - box->top : fp->Height, depth = box ? box->back - box->front : fp->Depth;
     for (UINT k = 0; k < depth; ++k) {
       /* (a compressed format's rows are rows of blocks: the box is on whole blocks) */
-      UINT64 offset = src->PlacedFootprint.Offset + (UINT64)(front + k) * fp->RowPitch * format_rows(d->fmt, fp->Height) + (UINT64)format_rows(d->fmt, top) * fp->RowPitch + format_row_bytes(d->fmt, left);
+      UINT64 offset = src->PlacedFootprint.Offset + (UINT64)(front + k) * fp->RowPitch * format_rows(fi, fp->Height) + (UINT64)format_rows(fi, top) * fp->RowPitch + format_row_bytes(fi, left);
       UINT image_layer = d->kind == 1 ? z + k : layer;
-      UINT payload[11] = {0, alloc_index(l, d->alloc), level, image_layer, x, y, w, h, alloc_index(l, s->alloc), (UINT)offset, fp->RowPitch};
-      packet(l, OP_COPY_BUFFER_IMAGE, payload, 11);
+      copy_buffer_image_packet(l, 0, alloc_index(l, image), level, image_layer, x, y, w, h, alloc_index(l, s->alloc), (UINT)offset, fp->RowPitch, fi);
     }
   } else if (dst->Type == D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT && src->Type == D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX) {
     /* texture to buffer */
     const D3D12_SUBRESOURCE_FOOTPRINT *fp = &dst->PlacedFootprint.Footprint;
     UINT level, layer;
-    sub_split(s, src->SubresourceIndex, &level, &layer);
+    const FormatInfo *fi = NULL;
+    const UINT image = sub_target(s, src->SubresourceIndex, &level, &layer, &fi);
+    if (!image) return;
     const UINT left = box ? box->left : 0, top = box ? box->top : 0, front = box ? box->front : 0;
     const UINT w = box ? box->right - box->left : fp->Width, h = box ? box->bottom - box->top : fp->Height, depth = box ? box->back - box->front : fp->Depth;
     for (UINT k = 0; k < depth; ++k) {
-      UINT64 offset = dst->PlacedFootprint.Offset + (UINT64)(z + k) * fp->RowPitch * format_rows(s->fmt, fp->Height) + (UINT64)format_rows(s->fmt, y) * fp->RowPitch + format_row_bytes(s->fmt, x);
+      UINT64 offset = dst->PlacedFootprint.Offset + (UINT64)(z + k) * fp->RowPitch * format_rows(fi, fp->Height) + (UINT64)format_rows(fi, y) * fp->RowPitch + format_row_bytes(fi, x);
       UINT image_layer = s->kind == 1 ? front + k : layer;
-      UINT payload[11] = {1, alloc_index(l, s->alloc), level, image_layer, left, top, w, h, alloc_index(l, d->alloc), (UINT)offset, fp->RowPitch};
-      packet(l, OP_COPY_BUFFER_IMAGE, payload, 11);
+      copy_buffer_image_packet(l, 1, alloc_index(l, image), level, image_layer, left, top, w, h, alloc_index(l, d->alloc), (UINT)offset, fp->RowPitch, fi);
     }
   } else if (dst->Type == D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX && src->Type == D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX && d->mips == 1 && s->mips == 1 && d->kind == 0 && s->kind == 0) {
-    const UINT w = box ? box->right - box->left : (UINT)s->desc.Width, h = box ? box->bottom - box->top : s->desc.Height;
-    UINT payload[8] = {alloc_index(l, d->alloc), x, y, alloc_index(l, s->alloc), box ? box->left : 0, box ? box->top : 0, w, h};
+    /* (2D images of one level: a planar texture's plane of a slice is one) */
+    UINT dl, dy, sl, sy;
+    const FormatInfo *dfi = NULL, *sfi = NULL;
+    const UINT di = sub_target(d, dst->SubresourceIndex, &dl, &dy, &dfi), si = sub_target(s, src->SubresourceIndex, &sl, &sy, &sfi);
+    if (!di || !si) return;
+    const int chroma = s->planes && src->SubresourceIndex >= s->layers;
+    const UINT sw = chroma ? ((UINT)s->desc.Width + 1) / 2 : (UINT)s->desc.Width, sh = chroma ? (s->desc.Height + 1) / 2 : s->desc.Height;
+    const UINT w = box ? box->right - box->left : sw, h = box ? box->bottom - box->top : sh;
+    UINT payload[8] = {alloc_index(l, di), x, y, alloc_index(l, si), box ? box->left : 0, box ? box->top : 0, w, h};
     packet(l, OP_COPY_REGION, payload, 8);
   }
 }
@@ -933,7 +978,17 @@ static void STDMETHODCALLTYPE list_CopyResource(CmdList *l, ID3D12Resource *dst,
   if (!d || !s) return;
   if (d->desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER && s->desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
     list_CopyBufferRegion(l, dst, 0, src, 0, s->desc.Width < d->desc.Width ? s->desc.Width : d->desc.Width);
-  } else if (d->mips == 1 && s->mips == 1 && d->kind == 0 && s->kind == 0 && d->fmt && s->fmt) {
+  } else if (d->planes && s->planes && d->planes == s->planes && d->layers == s->layers) {
+    /* (every plane of every slice) */
+    end_pass(l);
+    for (UINT i = 0; i < s->planes * s->layers; ++i) {
+      ensure_room(l, 256, 4);
+      const int chroma = i >= s->layers;
+      const UINT w = chroma ? ((UINT)s->desc.Width + 1) / 2 : (UINT)s->desc.Width, h = chroma ? (s->desc.Height + 1) / 2 : s->desc.Height;
+      UINT payload[8] = {alloc_index(l, d->plane_alloc[i]), 0, 0, alloc_index(l, s->plane_alloc[i]), 0, 0, w, h};
+      packet(l, OP_COPY_REGION, payload, 8);
+    }
+  } else if (d->mips == 1 && s->mips == 1 && d->kind == 0 && s->kind == 0 && d->fmt && s->fmt && !d->planes && !s->planes) {
     end_pass(l);
     ensure_room(l, 256, 4);
     UINT payload[8] = {alloc_index(l, d->alloc), 0, 0, alloc_index(l, s->alloc), 0, 0, (UINT)s->desc.Width, s->desc.Height};

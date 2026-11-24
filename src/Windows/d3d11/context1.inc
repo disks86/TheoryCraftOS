@@ -78,6 +78,16 @@ static void STDMETHODCALLTYPE ctx_ClearView(Ctx *c, ID3D11View *view, const FLOA
       buf_write_any(c->dev, v->buf, v->offset + (UINT64)left * v->stride, fill, span);
       mem_free(fill);
     }
+  } else if (v->tex->planar) {
+    /* (a view of a plane of a slice: the rectangles of that plane, in its texels) */
+    Tex *t = v->tex;
+    const UINT bytes = clear_element(v->plane_format, none, colour, TRUE, element);
+    tex_before_write(c->dev, t);
+    for (UINT r = 0; r < count; ++r) {
+      const LONG x0 = rects[r].left < 0 ? 0 : rects[r].left, y0 = rects[r].top < 0 ? 0 : rects[r].top;
+      if (rects[r].right <= x0 || rects[r].bottom <= y0) continue;
+      tex_plane_fill(c->dev, t, v->plane, v->array_slice, (UINT)x0, (UINT)y0, (UINT)rects[r].right, (UINT)rects[r].bottom, element, bytes);
+    }
   } else {
     Tex *t = v->tex;
     UINT level = 0;

@@ -73,17 +73,20 @@ static void qheap_destroy(DxObj *o) {
   dobj_child_destroy(o);
 }
 
+/* The bytes of one query's result: 8 (occlusion counts, timestamps), a D3D12_QUERY_DATA_VIDEO_DECODE_STATISTICS (32: the kernel's DecodeFrame writes its first 16, video.inc). */
+static UINT qheap_stride(D3D12_QUERY_HEAP_TYPE type) { return type == D3D12_QUERY_HEAP_TYPE_VIDEO_DECODE_STATISTICS ? 32 : 8; }
+
 static HRESULT STDMETHODCALLTYPE dev_CreateQueryHeap(Dev *This, const D3D12_QUERY_HEAP_DESC *desc, REFIID riid, void **out) {
   extern const ID3D12QueryHeapVtbl qheap_vtbl;
   if (!desc || desc->Count == 0 || desc->Count > 131072) return E_INVALIDARG;
-  if (desc->Type != D3D12_QUERY_HEAP_TYPE_OCCLUSION && desc->Type != D3D12_QUERY_HEAP_TYPE_TIMESTAMP) return DXGI_ERROR_UNSUPPORTED;
+  if (desc->Type != D3D12_QUERY_HEAP_TYPE_OCCLUSION && desc->Type != D3D12_QUERY_HEAP_TYPE_TIMESTAMP && desc->Type != D3D12_QUERY_HEAP_TYPE_VIDEO_DECODE_STATISTICS) return DXGI_ERROR_UNSUPPORTED;
   QHeap *h = dobj_new(sizeof *h, This, &qheap_vtbl, g_qheap_iids, qheap_destroy);
   if (!h) return E_OUTOFMEMORY;
   h->desc = *desc;
   KmtAllocDesc ad;
   memset(&ad, 0, sizeof ad);
   ad.flags = KA_QUERY;
-  ad.size = (UINT64)desc->Count * 8;
+  ad.size = (UINT64)desc->Count * qheap_stride(desc->Type);
   const NTSTATUS st = kmt_create_allocation(This->kdev, &ad, &h->alloc, NULL, NULL);
   if (!KMT_OK(st)) { dx_Release(OBJ(h)); return hr_from(st); }
   return query_out((IUnknown *)h, riid, out);
@@ -143,7 +146,9 @@ static void STDMETHODCALLTYPE list_ResolveQueryData(CmdList *l, ID3D12QueryHeap 
   if (l->bundle || !h || !d || !count || start > h->desc.Count || count > h->desc.Count - start || offset > 0xFFFFFFFFu) return;
   end_pass(l);
   ensure_room(l, 256, 4);
-  UINT w[5] = {alloc_index(l, d->alloc), (UINT)offset, alloc_index(l, h->alloc), start * 8, count * 8};
+  const UINT stride = qheap_stride(h->desc.Type);
+  if ((type == D3D12_QUERY_TYPE_VIDEO_DECODE_STATISTICS) != (h->desc.Type == D3D12_QUERY_HEAP_TYPE_VIDEO_DECODE_STATISTICS)) return;
+  UINT w[5] = {alloc_index(l, d->alloc), (UINT)offset, alloc_index(l, h->alloc), start * stride, count * stride};
   packet(l, OP_COPY_BUFFER, w, 5);
 }
 

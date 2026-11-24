@@ -525,11 +525,12 @@ bool Core::handle_nal(const uint8_t* nal, uint64_t size, int64_t pts) {
   sh.nal_ref_idc = ref_idc;
   if (!ps_.parse_slice_header(br, &sh)) return false;
   if (sh.redundant_pic_cnt > 0) return false;
-  if (waiting_for_idr_ && !sh.idr()) {
+  if (waiting_for_idr_ && !sh.idr() && !ext_) {
     // A stream can also start with a recovery point (an I picture); accept a plain I slice.
     if (sh.type != kSliceI) return false;
   }
   if (!have_slice_ || new_picture(prev_sh_, sh)) {
+    if (ext_ && ext_started_) return false;   // decode_external() takes one picture: the slices of another are not part of it
     if (have_slice_) finish_picture();
     if (!start_picture(sh, pts)) return false;
   }
@@ -745,7 +746,7 @@ bool Core::start_picture(const SliceHeader& sh, int64_t pts) {
   const Pps& p = ps_.pps[sh.pps_id];
   const Sps& s = ps_.sps[p.sps_id];
   if (sp_ == nullptr || mb_w_ != s.mb_w || mb_h_ != s.mb_h) {
-    if (sp_ == nullptr && !sh.idr() && sh.type != kSliceI) return false;
+    if (sp_ == nullptr && !sh.idr() && sh.type != kSliceI && !ext_) return false;
     dpb_.bump_output(true);
     sp_ = &s;
     dpb_.set_sps(sp_);
@@ -758,12 +759,23 @@ bool Core::start_picture(const SliceHeader& sh, int64_t pts) {
   dpb_.set_sps(sp_);
   pp_ = &p;
   active_sps_id_ = p.sps_id;
+  if (ext_ && !apply_external_references()) {
+    ext_no_memory_ = true;
+    return false;
+  }
   PictureInfo* info = dpb_.begin_picture(sh, pts);
   if (!info) return false;
   Picture* pic = static_cast<Picture*>(info);  // every slot of the buffer is one of our pictures
   if (!alloc_picture(pic)) {
     dpb_.abort_picture();
+    if (ext_) ext_no_memory_ = true;
     return false;
+  }
+  if (ext_) {
+    dpb_.set_current_poc(ext_->top_poc, ext_->bottom_poc);
+    // The surface's earlier picture (which this one may predict from) keeps its key until this one is finished.
+    pic->has_key = false;
+    ext_started_ = true;
   }
   cur_ = pic;
   pic_poc_ = dpb_.pic_poc();
@@ -785,8 +797,104 @@ void Core::finish_picture() {
   }
   have_slice_ = false;
   deblock_picture();
+  if (ext_) ext_decoded_ = cur_;
   dpb_.finish_picture(prev_sh_);
   cur_ = nullptr;
+}
+
+// Decoding for a DXVA driver: the slots hold the pictures of the program's surfaces, by key. Before a picture starts, exactly the pictures the program names are
+// references, with its frame numbers and order counts; a reference whose surface holds nothing gets a mid-grey stand-in (intra, so direct prediction from it has no
+// motion). Every other slot is free and forgets its key: a picture no longer referenced is never referenced again.
+bool Core::apply_external_references() {
+  const H264Decoder::ExternalPicture& ext = *ext_;
+  bool named[kMaxPictures] = {};
+  for (int i = 0; i < kMaxPictures; ++i) {
+    Picture& p = pics_[i];
+    p.is_ref = p.is_long = false;
+    if (!p.has_key) continue;
+    for (const H264Decoder::ExternalReference& r : ext.references)
+      if (r.key == p.key && !r.non_existing) named[i] = true;
+    if (!named[i]) p.has_key = false;
+  }
+  for (const H264Decoder::ExternalReference& r : ext.references) {
+    Picture* found = nullptr;
+    for (int i = 0; i < kMaxPictures && !found; ++i)
+      if (named[i] && pics_[i].key == r.key && !r.non_existing) found = &pics_[i];
+    if (found && found->is_ref) continue;   // named twice: the first entry stands
+    if (!found) {
+      if (!r.non_existing) ext_missing_ = true;
+      for (int i = 0; i < kMaxPictures && !found; ++i)
+        if (!named[i] && !pics_[i].is_ref && pics_[i].has_memory) found = &pics_[i];
+      for (int i = 0; i < kMaxPictures && !found; ++i)
+        if (!named[i] && !pics_[i].is_ref) found = &pics_[i];
+      if (!found || !alloc_picture(found)) return false;
+      for (uint64_t k = 0; k < found->y.size(); ++k) found->y[k] = 128;
+      for (uint64_t k = 0; k < found->u.size(); ++k) found->u[k] = found->v[k] = 128;
+      for (uint64_t k = 0; k < found->motion.size(); ++k) {
+        MotionMb& m = found->motion[k];
+        for (int l = 0; l < 2; ++l)
+          for (int b = 0; b < 4; ++b) {
+            m.ref[l][b] = -1;
+            m.refid[l][b] = -1;
+          }
+        for (int l = 0; l < 2; ++l)
+          for (int b = 0; b < 16; ++b) m.mv[l][b][0] = m.mv[l][b][1] = 0;
+        m.intra = 1;
+      }
+      found->id = dpb_.new_id();
+      found->has_key = false;
+      found->non_existing = r.non_existing;
+      found->keyframe = false;
+    }
+    found->in_use = true;
+    found->is_ref = true;
+    found->is_long = r.long_term;
+    found->needed_for_output = false;
+    if (r.long_term) found->long_term_idx = r.frame_num;
+    else found->frame_num = r.frame_num;
+    found->top_poc = r.top_poc;
+    found->bottom_poc = r.bottom_poc;
+    found->poc = r.top_poc < r.bottom_poc ? r.top_poc : r.bottom_poc;
+  }
+  for (Picture& p : pics_)
+    if (!p.is_ref) p.in_use = false;
+  return true;
+}
+
+H264Decoder::ExternalStatus Core::decode_external(ConstByteView data, const H264Decoder::ExternalPicture& picture, VideoFrame* decoded) {
+  dpb_.release_returned();
+  build_vlc();
+  // Whatever an earlier call left half-done is dropped: this call is one whole picture.
+  if (have_slice_) finish_picture();
+  ext_ = &picture;
+  ext_started_ = ext_missing_ = ext_no_memory_ = false;
+  ext_decoded_ = nullptr;
+  dpb_.set_decode_order(true);
+  for_each_nal(data, 0, [&](const uint8_t* nal, uint64_t size) { (void)handle_nal(nal, size, 0); });
+  finish_picture();
+  dpb_.set_decode_order(false);
+  const bool no_memory = ext_no_memory_, missing = ext_missing_;
+  Picture* p = ext_decoded_;
+  ext_ = nullptr;
+  ext_decoded_ = nullptr;
+  if (!p) return no_memory ? H264Decoder::ExternalStatus::NoMemory : H264Decoder::ExternalStatus::NotDecoded;
+  // The picture now is the surface's: an earlier one kept under the same key is gone.
+  for (Picture& q : pics_)
+    if (&q != p && q.has_key && q.key == picture.key) q.has_key = false;
+  p->has_key = true;
+  p->key = picture.key;
+  decoded->format.width = static_cast<uint32_t>(mb_w_ * 16);
+  decoded->format.height = static_cast<uint32_t>(mb_h_ * 16);
+  decoded->format.pixel_format = PixelFormat::I420;
+  decoded->plane[0] = p->y.data();
+  decoded->plane[1] = p->u.data();
+  decoded->plane[2] = p->v.data();
+  decoded->stride[0] = static_cast<uint32_t>(p->stride);
+  decoded->stride[1] = decoded->stride[2] = static_cast<uint32_t>(p->cstride);
+  decoded->pts_us = 0;
+  decoded->keyframe = p->keyframe;
+  decoded->limited_range = !sp_->full_range;
+  return missing ? H264Decoder::ExternalStatus::MissingReference : H264Decoder::ExternalStatus::Decoded;
 }
 
 void Core::flush() {
@@ -858,6 +966,12 @@ bool H264Decoder::decode(ConstByteView access_unit, int64_t pts_us) {
 }
 
 bool H264Decoder::receive(VideoFrame* frame) { return core_ && core_->receive(frame); }
+
+H264Decoder::ExternalStatus H264Decoder::decode_external(ConstByteView access_unit, const ExternalPicture& picture, VideoFrame* decoded) {
+  if (!core_) core_ = UniquePointer<h264::Core>::make(allocator_, allocator_);
+  if (!core_) return ExternalStatus::NoMemory;
+  return core_->decode_external(access_unit, picture, decoded);
+}
 
 void H264Decoder::flush() {
   if (core_) core_->flush();

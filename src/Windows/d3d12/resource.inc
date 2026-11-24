@@ -61,6 +61,10 @@ struct Resource {
   UINT tile_count;
   HeapObj *heap;               /* placed: the heap (a reference) */
   struct Resource *next_cpu;   /* the list of the resources with a shadow */
+  /* A planar texture (NV12, P010, P016: FormatInfo.planar): every plane of every array slice is a 2D allocation of its own - plane_alloc[plane * layers + layer], plane 1 half
+   * the size - since the kernel's arrays and render targets are of one plane. `alloc` is plane_alloc[0]. Its subresources are Direct3D's: plane * layers + layer (one level). */
+  UINT planes;
+  UINT *plane_alloc;
 };
 
 static Resource *g_cpu_resources;
@@ -178,6 +182,11 @@ static void depth_companion_drop(Dev *dev, UINT depth);      /* (cmdlist.inc) */
 static void resource_destroy(DxObj *o) {
   Resource *r = (Resource *)o;
   if (r->alloc && (r->desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL)) depth_companion_drop(r->d.dev, r->alloc);
+  if (r->plane_alloc) {
+    for (UINT i = 1; i < r->planes * r->layers; ++i)      /* (the first is `alloc`, given back below) */
+      if (r->plane_alloc[i]) kmt_destroy_allocation(r->d.dev->kdev, r->plane_alloc[i]);
+    mem_free(r->plane_alloc);
+  }
   EnterCriticalSection(&g_lock);
   for (Resource **pp = &g_cpu_resources; *pp; pp = &(*pp)->next_cpu)
     if (*pp == r) { *pp = r->next_cpu; break; }
@@ -213,12 +222,17 @@ static void get_footprints(const D3D12_RESOURCE_DESC *d, UINT first, UINT count,
   }
   const UINT mips = d->MipLevels ? d->MipLevels : mip_count_for((UINT)d->Width, d->Height);
   const UINT depth_or_array = d->DepthOrArraySize ? d->DepthOrArraySize : 1;
-  const FormatInfo *fi = format_info(d->Format);
+  const FormatInfo *base_fi = format_info(d->Format);
   const UINT bytes = format_bytes(d->Format);
+  /* (a planar format: the subresources of plane 1 follow those of plane 0, each plane a footprint of its own format and size) */
+  const UINT plane_subs = base_fi && base_fi->planar ? mips * depth_or_array : 0;
   for (UINT i = 0; i < count; ++i) {
     const UINT sub = first + i;
+    const UINT plane = plane_subs ? sub / plane_subs : 0;
+    const FormatInfo *fi = plane_format(base_fi, plane);
     const UINT level = sub % mips;
-    const UINT w = mip_extent((UINT)d->Width, level), h = mip_extent(d->Height, level);
+    UINT w = mip_extent((UINT)d->Width, level), h = mip_extent(d->Height, level);
+    if (plane) { w = (w + 1) / 2; h = (h + 1) / 2; }
     const UINT depth = d->Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D ? mip_extent(depth_or_array, level) : 1;
     const UINT64 row_size = fi ? format_row_bytes(fi, w) : (UINT64)w * bytes;
     const UINT pitch = (UINT)KALIGN(row_size, 256);
@@ -227,7 +241,7 @@ static void get_footprints(const D3D12_RESOURCE_DESC *d, UINT first, UINT count,
     if (layouts) {
       memset(&layouts[i], 0, sizeof layouts[i]);
       layouts[i].Offset = offset;
-      layouts[i].Footprint.Format = d->Format;
+      layouts[i].Footprint.Format = plane_subs ? fi->dxgi : d->Format;
       layouts[i].Footprint.Width = w;
       layouts[i].Footprint.Height = h;
       layouts[i].Footprint.Depth = depth;
@@ -343,6 +357,19 @@ static HRESULT resource_make(Dev *dev, const D3D12_HEAP_PROPERTIES *props, D3D12
                              Resource **out) {
   return resource_make_from(dev, props, hflags, desc, heap, heap_offset, mode, NULL, out);
 }
+/* Every pixel of an allocation `w` x `h` (`layers` of it in each of its `mips` levels) to zeros with the maximum alpha: what a narrow format's image starts as. The kernel's lock
+ * of a level is that level's texels, all layers, rows exactly the level's width. */
+static void res_fill_alpha(Dev *dev, UINT alloc, UINT w, UINT h, UINT layers, UINT mips, int sixteen) {
+  for (UINT level = 0; level < mips; ++level) {
+    void *data = NULL;
+    if (!KMT_OK(kmt_lock(dev->kdev, alloc, level, 0, &data)) || !data) return;
+    const UINT64 pixels = (UINT64)mip_extent(w, level) * mip_extent(h, level) * layers;
+    if (sixteen) { UINT16 *p = data; for (UINT64 i = 0; i < pixels; ++i) { p[4 * i] = p[4 * i + 1] = p[4 * i + 2] = 0; p[4 * i + 3] = 0xFFFF; } }
+    else { UINT *p = data; for (UINT64 i = 0; i < pixels; ++i) p[i] = 0xFF000000u; }
+    kmt_unlock(dev->kdev, alloc);
+  }
+}
+
 static HRESULT resource_make_from(Dev *dev, const D3D12_HEAP_PROPERTIES *props, D3D12_HEAP_FLAGS hflags, const D3D12_RESOURCE_DESC *desc, HeapObj *heap, UINT64 heap_offset,
                                   int mode, const ResourceSource *source, Resource **out) {
   extern const ID3D12Resource2Vtbl res_vtbl;
@@ -409,6 +436,14 @@ static HRESULT resource_make_from(Dev *dev, const D3D12_HEAP_PROPERTIES *props, 
       r->layers = 6;
     } else if (depth_or_array > 1) { r->kind = 2; r->layers = depth_or_array; }
     const int target = (desc->Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET) != 0;
+    if (fi->planar) {
+      /* (NV12, P010, P016: a 2D texture or array of one level, of even width and height (the chroma is half of both), not multisampled, depth, tiled, CPU visible, placed
+       * or shared; each plane of each slice is a 2D image of the kernel's, so the slices may be render targets) */
+      if (desc->Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || cube || r->mips != 1 || samples > 1 || want_depth || (desc->Width & 1) || (desc->Height & 1)) { hr = E_INVALIDARG; goto fail; }
+      if (reserved || cpu || heap || (hflags & (D3D12_HEAP_FLAG_SHARED | D3D12_HEAP_FLAG_SHARED_CROSS_ADAPTER)) || global_share) { hr = DXGI_ERROR_UNSUPPORTED; goto fail; }
+      r->kind = 0;
+      r->planes = 2;
+    }
     if ((r->kind != 0 || r->mips > 1) && (target || want_depth || (r->kind != 0 && r->mips > 1))) { hr = DXGI_ERROR_UNSUPPORTED; goto fail; }
     ad.flags = want_depth ? KA_DEPTH : (target ? (KA_RENDER_TARGET | KA_TEXTURE) : KA_TEXTURE);
     if (reserved) {
@@ -422,7 +457,7 @@ static HRESULT resource_make_from(Dev *dev, const D3D12_HEAP_PROPERTIES *props, 
     ad.height = desc->Height;
     ad.mips = r->mips;
     ad.kind = r->kind;
-    ad.layers = r->layers;
+    ad.layers = r->planes ? 1 : r->layers;
     r->desc.MipLevels = (UINT16)r->mips;
   }
   if (heap) {
@@ -468,10 +503,34 @@ static HRESULT resource_make_from(Dev *dev, const D3D12_HEAP_PROPERTIES *props, 
     /* (an NT-handle share - D3D12_HEAP_FLAG_SHARED - or, asked for alone, one with a global share handle) */
     st = kmt_create_allocation_shared(dev->kdev, &ad, blob, sizeof blob, &r->kresource, global_share && !(hflags & D3D12_HEAP_FLAG_SHARED) ? &r->global_share : NULL, &r->alloc,
                                       &pitch, &r->bytes);
+  } else if (r->planes) {
+    /* (a planar texture: plane 0 of every slice, then plane 1 of every slice) */
+    r->plane_alloc = mem_alloc(sizeof(UINT) * r->planes * r->layers);
+    if (!r->plane_alloc) { hr = E_OUTOFMEMORY; goto fail; }
+    memset(r->plane_alloc, 0, sizeof(UINT) * r->planes * r->layers);
+    st = 0;
+    r->bytes = 0;
+    for (UINT i = 0; KMT_OK(st) && i < r->planes * r->layers; ++i) {
+      KmtAllocDesc pd = ad;
+      if (i >= r->layers) { pd.width = (ad.width + 1) / 2; pd.height = (ad.height + 1) / 2; }
+      UINT64 plane_bytes = 0;
+      st = kmt_create_allocation(dev->kdev, &pd, &r->plane_alloc[i], &pitch, &plane_bytes);
+      r->bytes += plane_bytes;
+    }
+    r->alloc = r->plane_alloc[0];
   } else {
     st = kmt_create_allocation(dev->kdev, &ad, &r->alloc, &pitch, &r->bytes);
   }
   if (!KMT_OK(st)) { hr = hr_from(st); goto fail; }
+  /* (a narrow format's image starts as zeros in its channels and the maximum in the alpha the kernel keeps, as a copy into it would leave it) */
+  if (r->fmt && r->fmt->narrow && !source && !heap && !reserved) {
+    const UINT count = r->planes ? r->planes * r->layers : 1;
+    for (UINT i = 0; i < count; ++i) {
+      const int chroma = r->planes && i >= r->layers;
+      const UINT w = chroma ? ((UINT)desc->Width + 1) / 2 : (UINT)desc->Width, h = chroma ? (desc->Height + 1) / 2 : desc->Height;
+      res_fill_alpha(dev, r->planes ? r->plane_alloc[i] : r->alloc, w, h, r->planes ? 1 : r->layers, r->mips, r->fmt->kernel == KF_RGBA16);
+    }
+  }
   if (desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
     r->va = va_register(r, desc->Width);
     if (cpu && !reserved) {
@@ -559,7 +618,8 @@ static D3D12_RESOURCE_ALLOCATION_INFO *STDMETHODCALLTYPE dev_GetResourceAllocati
     } else {
       D3D12_RESOURCE_DESC d = descs[i];
       const UINT mips = d.MipLevels ? d.MipLevels : mip_count_for((UINT)d.Width, d.Height);
-      const UINT subs = mips * (d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D ? 1 : (d.DepthOrArraySize ? d.DepthOrArraySize : 1));
+      const FormatInfo *dfi = format_info(d.Format);
+      const UINT subs = mips * (d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D ? 1 : (d.DepthOrArraySize ? d.DepthOrArraySize : 1)) * (dfi && dfi->planar ? 2 : 1);
       get_footprints(&d, 0, subs, 0, NULL, NULL, NULL, &n);
     }
     size += KALIGN(n, KTILE_BYTES);
@@ -576,7 +636,9 @@ static void STDMETHODCALLTYPE dev_GetCopyableFootprints(Dev *This, const D3D12_R
 
 /* ---- ID3D12Resource ----------------------------------------------------------------------------------------------------------------------------------------------------------- */
 
-static UINT res_subresources(const Resource *r) { return r->desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER ? 1 : r->mips * (r->kind == 1 ? 1 : r->layers); }
+static UINT res_subresources(const Resource *r) {
+  return r->desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER ? 1 : r->mips * (r->kind == 1 ? 1 : r->layers) * (r->planes ? r->planes : 1);
+}
 static HRESULT STDMETHODCALLTYPE res_Map(Resource *This, UINT sub, const D3D12_RANGE *read, void **data) {
   if (This->cpu_texture) {
     /* (a texture of the driver's layout has no address the program could use: Map with no pointer only says it will be written and read with Write/ReadFromSubresource) */

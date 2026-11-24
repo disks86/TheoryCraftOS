@@ -20,8 +20,9 @@
 // An MPEG-2 video decoder on the CPU (ISO/IEC 13818-2): Main and High profile 4:2:0 video as it is stored in an elementary stream, a program stream or a transport
 // stream - frame pictures and field pictures, intra, predicted and bidirectionally predicted pictures, frame and field macroblock prediction (16x16, 16x8, field and
 // dual prime), frame and field DCT, both scans and both quantizer scale types, quantizer matrices, intra DC precision of 8 to 11 bits, slices and skipped macroblocks.
-// Not covered: MPEG-1 streams (those without a sequence extension), the 4:2:2 and 4:4:4 profiles, scalability and data partitioning. Pictures come out in display order,
-// cropped to the sequence's size, as I420.
+// MPEG-1 video (ISO/IEC 11172-2: a sequence header with no sequence extension) is decoded too: its quantisation, escapes, macroblock stuffing and whole-sample vectors.
+// Not covered: MPEG-1's D-pictures, the 4:2:2 and 4:4:4 profiles, scalability and data partitioning. Pictures come out in display order, cropped to the sequence's
+// size, as I420.
 //
 // The inverse transform is the integer one of the reference decoders of the standard (Chen and Wang's), which meets the accuracy requirements of IEEE 1180: another
 // decoder's pictures differ from this one's by a few levels in places, and the difference does not accumulate beyond a picture group.

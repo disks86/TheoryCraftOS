@@ -321,6 +321,24 @@ class Core {
   void set_offload(IOffload* offload) { offload_ = offload; offload_decided_ = false; offloaded_ = false; }
   void set_frame_observer(IFrameObserver* observer) { observer_ = observer; }
 
+  // --- For a decoder that is told which pictures the references are (a DXVA driver: src/Hardware/VideoCodec/Dxva/DxvaVp9.cpp). The caller keeps the pictures of its
+  // surfaces in the pool by holding them, and names them for each frame: the eight reference slots as they are before the frame, and the three pictures an inter frame
+  // predicts from (which win over the slots the frame header names). Frames are then decoded whatever came before (no key frame needs to start the stream, as long as
+  // one was decoded since the last reset() for the probabilities). nullptr goes back to the decoder's own slots.
+  struct ExternalReferences {
+    int slot[REF_FRAMES] = {-1, -1, -1, -1, -1, -1, -1, -1};   // pool indices, -1 for an empty slot
+    int frame_ref[REFS_PER_FRAME] = {-1, -1, -1};             // the last, golden and alt-ref pictures; -1 when there is none (the frame cannot be decoded)
+  };
+  void set_external_references(const ExternalReferences* refs) { external_ = refs; }
+  // A pool picture the caller keeps (it is not reused until released). Indices outside the pool are ignored.
+  void hold_frame(int index);
+  void release_frame_hold(int index);
+  // A mid-grey picture of the size and format given, held for the caller (who releases it): a stand-in for a reference that holds no picture. -1 if the pool is full or
+  // memory ran out.
+  [[nodiscard]] int make_blank_frame(int width, int height, int ss_x, int ss_y, int bit_depth);
+  // The pool index of the frame decode_frame() just decoded (after it returned true for a frame that is not show_existing_frame).
+  int decoded_frame() const { return new_fb_idx_; }
+
  private:
   friend struct Vp9Access;
   // --- Vp9Syntax.cpp: headers, probabilities, tiles, mode info, tokens
@@ -403,6 +421,7 @@ class Core {
   int frame_context_idx_ = 0;
   int ref_slots_[3] = {0, 0, 0};   // the reference slots the last, golden and alt-ref pictures were named by
   IOffload* offload_ = nullptr;
+  const ExternalReferences* external_ = nullptr;
   IFrameObserver* observer_ = nullptr;
   bool offload_decided_ = false, offloaded_ = false;
   int width_ = 0, height_ = 0, last_width_ = 0, last_height_ = 0;
@@ -425,7 +444,7 @@ class Core {
   uint8_t lf_lvl_[MAX_SEGMENTS][MAX_REF_FRAMES][2] = {};
   uint8_t lf_lim_[MAX_LOOP_FILTER + 1] = {}, lf_mblim_[MAX_LOOP_FILTER + 1] = {};
   int16_t y_dequant_[MAX_SEGMENTS][2] = {}, uv_dequant_[MAX_SEGMENTS][2] = {};
-  FrameContext fc_, frame_contexts_[FRAME_CONTEXTS];
+  FrameContext fc_ = {}, frame_contexts_[FRAME_CONTEXTS] = {};   // (zero: not initialized until a key frame sets them up)
   FrameCounts counts_;
   bool count_enabled_ = false;
 

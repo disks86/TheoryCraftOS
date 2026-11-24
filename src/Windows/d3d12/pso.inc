@@ -859,7 +859,7 @@ static UINT pso_pipeline_locked(Pso *p, const UINT strides[8], UINT stencil_ref,
   r[w++] = blend_factor(rt->DestBlendAlpha);
   r[w++] = blend_op(rt->BlendOp);
   r[w++] = blend_op(rt->BlendOpAlpha);
-  r[w++] = rt->RenderTargetWriteMask & 0xF;
+  r[w++] = rt->RenderTargetWriteMask & format_write_mask(p->rtv_formats[0]);      /* (a narrow target: its channels only) */
   UINT instance_bits = 0;
   for (UINT i = 0; i < p->attr_count && i < 4; ++i)
     if (p->attrs[i].per_instance) instance_bits |= 1u << i;
@@ -876,7 +876,7 @@ static UINT pso_pipeline_locked(Pso *p, const UINT strides[8], UINT stencil_ref,
     r[w++] = blend_factor(b->DestBlendAlpha);
     r[w++] = blend_op(b->BlendOp);
     r[w++] = blend_op(b->BlendOpAlpha);
-    r[w++] = b->RenderTargetWriteMask & 0xF;
+    r[w++] = b->RenderTargetWriteMask & format_write_mask(p->rtv_formats[t]);
   }
   r[w++] = p->samples > 1 ? (1u | (p->blend.AlphaToCoverageEnable ? 2u : 0u)) : 0u;      /* multisample: coverage for each sample, alpha to coverage */
   r[w++] = p->shaders[2];
@@ -922,7 +922,7 @@ static UINT pso_pipeline_locked(Pso *p, const UINT strides[8], UINT stencil_ref,
       r[w++] = blend_factor(b->DestBlendAlpha);
       r[w++] = blend_op(b->BlendOp);
       r[w++] = blend_op(b->BlendOpAlpha);
-      r[w++] = b->RenderTargetWriteMask & 0xF;
+      r[w++] = b->RenderTargetWriteMask & format_write_mask(p->rtv_formats[4 + k]);
     }
     if (p->blend_constant)
       for (UINT c = 0; c < 4; ++c) r[w++] = bits_of(factor[c]);      /* (the colour of the constant blend factors) */

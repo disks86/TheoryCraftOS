@@ -157,6 +157,8 @@ struct SliceHeader {
   uint64_t data_bit_offset = 0;   // where slice_segment_data() starts, in bits from the start of the payload (after the two header bytes), emulation prevention removed
   int num_pic_total_curr = 0;
   int num_delta_pocs_ref_rps_idx = 0;   // when the slice header's reference picture set is predicted from another: how many pictures that one names
+  bool st_rps_sps_flag = false;         // short_term_ref_pic_set_sps_flag: the set is one of the sequence parameter set's
+  int st_rps_bits = 0;                  // the size in bits of the st_ref_pic_set() the slice header carries (0 when it names one of the SPS)
 };
 
 // Motion of a 4x4 block.
@@ -277,6 +279,31 @@ class Core {
   // Pictures are decoded by `offload` from then on (nullptr: here again). Set it before the first picture.
   void set_offload(IOffload* offload) { offload_ = offload; }
 
+  // ---- Decoding driven from outside (DXVA: src/Hardware/VideoCodec/Dxva/DxvaHevc.cpp; in H265Picture.cpp). The caller gives the parameter sets as structures (a
+  // validated Sps with its derived fields, a Pps), the picture's order count and reference picture sets as the pictures themselves, and the picture to decode into;
+  // the Core reads the slice segment headers and decodes the slice data. The decoded picture buffer, the order count derivation and the output order of the Core are
+  // not used. A slice header's own short-term set (short_term_ref_pic_set_sps_flag 0) is skipped by its size: the sets come from the caller. The pictures belong to
+  // the caller and must have been decoded by this Core (or made by external_grey()) with the same size.
+  struct ExternalPicture {
+    Picture* target = nullptr;
+    int poc = 0;
+    Picture* st_before[8] = {};
+    Picture* st_after[8] = {};
+    Picture* lt_curr[8] = {};
+    int st_before_count = 0, st_after_count = 0, lt_count = 0;
+    int st_rps_bits = 0;   // wNumBitsForShortTermRPSInSlice
+  };
+  // Makes `sps` and `pps` the active parameter sets (the picture's size is the SPS's). Call first, for every picture.
+  void external_prepare(const Sps& sps, const Pps& pps);
+  // A mid-grey picture of the active size with no motion: what stands in for a reference that is not there (8.3.3).
+  [[nodiscard]] bool external_grey(Picture* picture, int poc);
+  // Starts the picture: allocates the target and sets up the per-picture state.
+  [[nodiscard]] bool external_begin(const ExternalPicture& picture);
+  // One slice segment NAL unit (header bytes included, no start code). False: not a slice of this picture, or damaged (what was decoded of it stays).
+  [[nodiscard]] bool external_slice(ConstByteView nal);
+  // Ends the picture: the in-loop filters and the motion kept for collocated prediction. False if no slice segment was decoded.
+  [[nodiscard]] bool external_end();
+
  private:
   // --- H265Syntax.cpp
   bool handle_nal(const uint8_t* nal, uint64_t size, int64_t pts);
@@ -381,7 +408,10 @@ class Core {
   List<SliceInfo> slices_;
   int slice_idx_ = -1;
   IOffload* offload_ = nullptr;
-  bool offloaded_ = false;               // the picture being decoded goes to the offload
+  bool offloaded_ = false;
+  bool external_ = false;                // driven by external_*(): see ExternalPicture
+  int external_total_curr_ = 0;          // NumPicTotalCurr of the external picture
+  int external_st_rps_bits_ = 0;               // the picture being decoded goes to the offload
   int rps_ref_delta_pocs_ = 0;
   List<ConstByteView> offload_nals_;     // the slice NAL units of the picture being collected for the offload
   List<SliceHeader> offload_headers_;    // their headers

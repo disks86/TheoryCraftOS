@@ -4798,6 +4798,62 @@ void test_d3d12_copies_and_escapes() {
     if (bad == 3) w.copy_buffer_to_image(0, 0, 0, 0, 0, 4, 4, 1, 0, 16);
     CHECK(e.render(w, {img, e.buffer(kAllocVertexBuffer, 32)}) == status::kInvalidParameter);
   }
+  // narrow layouts: R8 and R8G8 rows into an A8B8G8R8 image become (r, g or 0, 0, 255), and come out as the first channels; R16G16 of an A16B16G16R16 image the same in 16 bits
+  {
+    Handle wide8 = e.alloc(kTexture, Format::A8B8G8R8, 4, 2);
+    CHECK(e.fill(wide8, 0x11223344u));
+    Handle narrow = e.buffer(kAllocVertexBuffer, 64), out = e.buffer(kAllocVertexBuffer, 64);
+    std::vector<uint8_t> r8(64, 0);
+    for (uint32_t i = 0; i < 16; ++i) r8[i] = static_cast<uint8_t>(0xA0 + i);
+    CHECK(e.write(narrow, bytes_of(r8)));
+    {
+      CommandWriter w(e.allocator);
+      w.copy_buffer_image_narrow(0, 0, 0, 0, 0, 0, 4, 2, 1, 0, 8, NarrowLayout::R8);      // (rows 8 bytes apart: 4 used)
+      CHECK(e.render(w, {wide8, narrow}) == status::kSuccess);
+    }
+    CHECK(e.pixel(wide8, 0, 0) == 0xFF0000A0u && e.pixel(wide8, 3, 0) == 0xFF0000A3u && e.pixel(wide8, 0, 1) == 0xFF0000A8u);
+    {
+      CommandWriter w(e.allocator);
+      w.copy_buffer_image_narrow(0, 0, 0, 0, 1, 1, 2, 1, 1, 0, 16, NarrowLayout::R8G8);      // (a 2 x 1 rectangle at (1, 1): pairs A0A1, A2A3)
+      CHECK(e.render(w, {wide8, narrow}) == status::kSuccess);
+    }
+    CHECK(e.pixel(wide8, 1, 1) == 0xFF00A1A0u && e.pixel(wide8, 2, 1) == 0xFF00A3A2u && e.pixel(wide8, 3, 1) == 0xFF0000ABu);
+    {
+      CommandWriter w(e.allocator);
+      w.copy_buffer_image_narrow(1, 0, 0, 0, 0, 1, 4, 1, 1, 4, 4, NarrowLayout::R8);
+      CHECK(e.render(w, {wide8, out}) == status::kSuccess);
+    }
+    CHECK(read(out, 4) == 0xA8 && read(out, 5) == 0xA0 && read(out, 6) == 0xA2 && read(out, 7) == 0xAB && read(out, 3) == 0);
+    Handle wide16 = e.alloc(kTexture, Format::A16B16G16R16, 2, 1);
+    std::vector<uint8_t> rg16 = {0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08};
+    Handle n16 = e.buffer(kAllocVertexBuffer, 16);
+    CHECK(e.write(n16, bytes_of(rg16)));
+    {
+      CommandWriter w(e.allocator);
+      w.copy_buffer_image_narrow(0, 0, 0, 0, 0, 0, 2, 1, 1, 0, 8, NarrowLayout::R16G16);
+      CHECK(e.render(w, {wide16, n16}) == status::kSuccess);
+    }
+    LockResult lr;
+    if (e.kernel.lock(kPid, wide16, kLockReadOnly, 0, &lr) == status::kSuccess) {
+      const uint8_t want[16] = {0x01, 0x02, 0x03, 0x04, 0, 0, 0xFF, 0xFF, 0x05, 0x06, 0x07, 0x08, 0, 0, 0xFF, 0xFF};
+      bool same = lr.data.size() >= 16;
+      for (uint32_t i = 0; same && i < 16; ++i) same = lr.data[i] == want[i];
+      CHECK(same);
+      e.kernel.unlock(kPid, wide16);
+    } else {
+      CHECK(false);
+    }
+    // refused: a narrow layout of an image it does not fit (8-bit layout on a 16-bit image, a BGRA image), a layout number that is not one, a pitch shorter than the narrow row
+    for (int bad = 0; bad < 4; ++bad) {
+      CommandWriter w(e.allocator);
+      Handle bgra = e.alloc(kTexture, Format::A8R8G8B8, 4, 2);
+      if (bad == 0) w.copy_buffer_image_narrow(0, 0, 0, 0, 0, 0, 2, 1, 1, 0, 8, NarrowLayout::R8);
+      if (bad == 1) w.copy_buffer_image_narrow(0, 2, 0, 0, 0, 0, 2, 1, 1, 0, 8, NarrowLayout::R8);
+      if (bad == 2) w.copy_buffer_image_narrow(0, 3, 0, 0, 0, 0, 2, 1, 1, 0, 8, static_cast<NarrowLayout>(9));
+      if (bad == 3) w.copy_buffer_image_narrow(0, 3, 0, 0, 0, 0, 4, 1, 1, 0, 6, NarrowLayout::R8G8);
+      CHECK(e.render(w, {wide16, n16, bgra, wide8}) == status::kInvalidParameter);
+    }
+  }
 
   // the escapes: a root signature (RTS0 free serialized form, version 1.0, no parameters), a descriptor heap, descriptors, a fence's value
   auto escape = [&](std::vector<uint32_t> request, uint32_t reply_words, std::vector<uint32_t>* reply = nullptr) {

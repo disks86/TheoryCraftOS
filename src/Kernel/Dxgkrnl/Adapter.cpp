@@ -21,6 +21,7 @@
 #include "Graphics/Graphics3D/BuiltinShaders.hpp"
 #include "Graphics/Graphics3D/Mipmaps.hpp"
 #include "Kernel/Dxgkrnl/CommandStream.hpp"
+#include "Hardware/VideoCodec/VideoProcess.hpp"
 #include "Utility/AllocatedView.hpp"
 #include "Utility/ByteStream.hpp"
 #include "Utility/Move.hpp"
@@ -104,6 +105,10 @@ class Adapter::StreamRunner {
       for (uint64_t i = 0; i < shadow_.count() && i < allocations_.size(); ++i) allocations_[i]->set_state(shadow_[i]);
     return s;
   }
+
+  // The video decoders the stream's DecodeFrames name: collected while it is checked, given back in the same order when it runs.
+  void collect_decoders(List<SharedPointer<VideoDecoderObject>>* decoders) { collected_decoders_ = decoders; }
+  void replay_decoders(ArrayView<const SharedPointer<VideoDecoderObject>> decoders) { replay_decoders_ = decoders; }
 
   NtStatus execute(ArrayView<const SharedPointer<PipelineObject>> pipelines, ArrayView<const SharedPointer<RootSignatureObject>> signatures, ArrayView<const SharedPointer<DescriptorHeapObject>> heaps) {
     exec_ = true;
@@ -237,6 +242,8 @@ class Adapter::StreamRunner {
       case Op::ResourceBarrier: return resource_barrier(p);
       case Op::CopyBuffer: return copy_buffer(p);
       case Op::CopyBufferImage: return copy_buffer_image(p);
+      case Op::DecodeFrame: return decode_frame(p);
+      case Op::VideoProcess: return video_process_packet(p);
       case Op::Dispatch: return dispatch(p);
       case Op::SetTopology: {
         const uint32_t topology = p.le32();
@@ -839,7 +846,9 @@ class Adapter::StreamRunner {
 
   NtStatus copy_buffer_image(ByteReader& p) {
     const uint32_t direction = p.le32(), ii = p.le32(), level = p.le32(), layer = p.le32(), x = p.le32(), y = p.le32(), w = p.le32(), h = p.le32(), bi = p.le32(), boff = p.le32(), pitch = p.le32();
-    if (!exact(p) || in_pass_ || direction > 1 || w == 0 || h == 0) return kBad;
+    const uint32_t narrow_word = p.at_end() ? 0 : p.le32();      // (the optional twelfth word)
+    if (!exact(p) || in_pass_ || direction > 1 || w == 0 || h == 0 || narrow_word > static_cast<uint32_t>(NarrowLayout::R16G16)) return kBad;
+    const NarrowLayout narrow = static_cast<NarrowLayout>(narrow_word);
     Allocation* image = alloc(ii);
     Allocation* buffer = alloc(bi);
     if (!image || !image->is_image() || image->is_depth() || image->desc().samples != 1 || !copyable_buffer(buffer)) return kBad;
@@ -852,10 +861,16 @@ class Adapter::StreamRunner {
     const Format format = image->desc().format;
     const uint32_t unit = is_compressed(format) ? 4 : 1;
     if (uint64_t{x} + w > level_w || uint64_t{y} + h > level_h || x % unit || y % unit || ((x + w) % unit && x + w != level_w) || ((y + h) % unit && y + h != level_h)) return kBad;
+    // (a narrow buffer: of an 8-bit four-channel image, or of A16B16G16R16)
+    if (narrow != NarrowLayout::None) {
+      const bool eight = narrow == NarrowLayout::R8 || narrow == NarrowLayout::R8G8;
+      if (eight ? (format != Format::A8B8G8R8 && format != Format::X8B8G8R8) : format != Format::A16B16G16R16) return kBad;
+    }
     const uint64_t row_bytes = image_row_bytes(format, w), level_row_bytes = image_row_bytes(format, level_w), x_bytes = image_row_bytes(format, x);
+    const uint64_t buffer_row_bytes = narrow == NarrowLayout::None ? row_bytes : uint64_t{w} * narrow_pixel_bytes(narrow);
     const uint32_t rows = image_rows(format, h), first_row = y / unit;
-    if (pitch < row_bytes) return kBad;
-    if (uint64_t{boff} + uint64_t{pitch} * (rows - 1) + row_bytes > buffer->desc().size) return kBad;
+    if (pitch < buffer_row_bytes) return kBad;
+    if (uint64_t{boff} + uint64_t{pitch} * (rows - 1) + buffer_row_bytes > buffer->desc().size) return kBad;
     uint64_t level_offset = 0, level_bytes = 0;
     if (!image->level_range(level, &level_offset, &level_bytes)) return kBad;
     if (!exec_) return status::kSuccess;
@@ -868,6 +883,13 @@ class Adapter::StreamRunner {
       const uint64_t buffer_at = uint64_t{boff} + uint64_t{pitch} * row;
       ByteView to;
       ConstByteView from;
+      if (narrow != NarrowLayout::None) {
+        ByteView image_row, buffer_row;
+        if (!image->writable_backing().try_subview(image_at, row_bytes, &image_row) || !buffer->writable_backing().try_subview(buffer_at, buffer_row_bytes, &buffer_row))
+          return status::kInvalidDeviceState;
+        copy_narrow_row(direction == 0, narrow, w, image_row, buffer_row);
+        continue;
+      }
       if (direction == 0) {
         if (!image->writable_backing().try_subview(image_at, row_bytes, &to) || !buffer->backing().try_subview(buffer_at, row_bytes, &from)) return status::kInvalidDeviceState;
       } else {
@@ -880,6 +902,236 @@ class Adapter::StreamRunner {
       unbind_textures_of(image);
     } else {
       mm_.note_cpu_write(*buffer);
+    }
+    return status::kSuccess;
+  }
+
+  // One row of a narrow copy: `to_image` widens the buffer's pixels into the image's (missing channels 0, the last the maximum), else the image's first channels go into the buffer.
+  static void copy_narrow_row(bool to_image, NarrowLayout narrow, uint32_t width, ByteView image_row, ByteView buffer_row) {
+    const uint32_t channels = narrow == NarrowLayout::R8 || narrow == NarrowLayout::R16 ? 1 : 2;
+    const bool sixteen = narrow == NarrowLayout::R16 || narrow == NarrowLayout::R16G16;
+    const uint32_t sample = sixteen ? 2 : 1, image_pixel = 4 * sample, buffer_pixel = channels * sample;
+    for (uint32_t i = 0; i < width; ++i) {
+      ByteView pixel = image_row.subview(uint64_t{i} * image_pixel, image_pixel);
+      ByteView narrow_pixel = buffer_row.subview(uint64_t{i} * buffer_pixel, buffer_pixel);
+      if (to_image) {
+        pixel.fill(0);
+        pixel.subview(0, buffer_pixel).copy_from(narrow_pixel);
+        pixel.subview(3 * sample, sample).fill(0xFF);      // (alpha: the maximum)
+      } else {
+        narrow_pixel.copy_from(pixel.subview(0, buffer_pixel));
+      }
+    }
+  }
+
+  // A plane the decoder made, written into an image the runtime keeps it in (DxgTypes.hpp VideoDecoderDesc): every sample of a channel becomes a channel of a pixel, the others 0 and
+  // the last the maximum. `channels` 1 (luma) or 2 (chroma: U, V interleaved); `sixteen` samples of 16 bits. Only what both have is written.
+  static bool write_video_plane(VidMm& mm, Allocation& image, const uint8_t* plane, uint32_t stride, uint32_t width, uint32_t height, uint32_t channels, bool sixteen) {
+    if (!plane) return false;
+    const uint32_t w = width < image.desc().width ? width : image.desc().width, h = height < image.desc().height ? height : image.desc().height;
+    const uint32_t sample = sixteen ? 2 : 1, pixel = 4 * sample;
+    const uint64_t pitch = image_row_bytes(image.desc().format, image.desc().width);
+    if (!mm.read_back(image)) return false;
+    // (the decoder's plane as a view of what it says: stride bytes a row, h rows)
+    if (uint64_t{w} * channels * sample > stride) return false;
+    const ConstByteView source(plane, uint64_t{stride} * (h - 1) + uint64_t{w} * channels * sample);
+    for (uint32_t y = 0; y < h; ++y) {
+      ByteView row;
+      if (!image.writable_backing().try_subview(pitch * y, uint64_t{w} * pixel, &row)) return false;
+      const ConstByteView from = source.subview(uint64_t{stride} * y, uint64_t{w} * channels * sample);
+      for (uint32_t x = 0; x < w; ++x) {
+        ByteView to = row.subview(uint64_t{x} * pixel, pixel);
+        to.fill(0);
+        to.subview(0, channels * sample).copy_from(from.subview(uint64_t{x} * channels * sample, channels * sample));
+        to.subview(3 * sample, sample).fill(0xFF);
+      }
+    }
+    mm.note_cpu_write(image);
+    return true;
+  }
+
+  NtStatus decode_frame(ByteReader& p) {
+    const Handle handle = p.le32();
+    const uint32_t bi = p.le32(), pp_off = p.le32(), pp_bytes = p.le32(), qm_off = p.le32(), qm_bytes = p.le32(), sc_off = p.le32(), sc_bytes = p.le32();
+    const uint32_t si = p.le32(), bs_off = p.le32(), bs_bytes = p.le32(), li = p.le32(), ci = p.le32(), qi = p.le32(), q_off = p.le32(), output_keyed = p.le32(), key_count = p.le32();
+    if (!p.ok() || in_pass_ || key_count > kMaxVideoDecodeSurfaces || output_keyed > 1) return refuse(__LINE__);
+    uint32_t key_index[kMaxVideoDecodeSurfaces];
+    for (uint32_t i = 0; i < key_count; ++i) key_index[i] = p.le32();
+    if (!exact(p)) return refuse(__LINE__);
+    SharedPointer<VideoDecoderObject> decoder;
+    if (exec_) {
+      if (replay_decoder_cursor_ >= replay_decoders_.size()) return refuse(__LINE__);
+      decoder = replay_decoders_[replay_decoder_cursor_++];
+    } else {
+      decoder = lookup_->find_video_decoder(handle);
+      if (!decoder) return status::kInvalidHandle;
+      if (!collected_decoders_ || !collected_decoders_->push_back(decoder)) return status::kNoMemory;
+    }
+    const VideoDecoderDesc& desc = decoder->desc();
+    Allocation* buffer = alloc(bi);
+    Allocation* bitstream = alloc(si);
+    Allocation* luma = alloc(li);
+    Allocation* chroma = alloc(ci);
+    Allocation* status_buffer = qi == kNoAllocation ? nullptr : alloc(qi);
+    if (!copyable_buffer(buffer) || !copyable_buffer(bitstream) || (qi != kNoAllocation && !copyable_buffer(status_buffer, true))) return refuse(__LINE__);
+    if (uint64_t{pp_off} + pp_bytes > buffer->desc().size || uint64_t{qm_off} + qm_bytes > buffer->desc().size || uint64_t{sc_off} + sc_bytes > buffer->desc().size ||
+        uint64_t{bs_off} + bs_bytes > bitstream->desc().size || (status_buffer && uint64_t{q_off} + sizeof(VideoDecodeStatus) > status_buffer->desc().size))
+      return refuse(__LINE__);
+    const Format plane_format = desc.ten_bit ? Format::A16B16G16R16 : Format::A8B8G8R8;
+    auto plane_ok = [&](const Allocation* a, uint32_t w, uint32_t h) {
+      return a && a->is_image() && a->desc().kind == graphics::TextureKind::Texture2D && a->mip_levels() == 1 && a->desc().samples == 1 && a->desc().width >= w && a->desc().height >= h &&
+             (a->desc().format == plane_format || (!desc.ten_bit && a->desc().format == Format::X8B8G8R8));
+    };
+    if (!plane_ok(luma, desc.width, desc.height) || !plane_ok(chroma, (desc.width + 1) / 2, (desc.height + 1) / 2) || luma == chroma) return refuse(__LINE__);
+    if (!use(luma, state::kVideoDecodeWrite) || !use(chroma, state::kVideoDecodeWrite) || !use(buffer, state::kVideoDecodeRead) || !use(bitstream, state::kVideoDecodeRead)) return refuse(__LINE__);
+    for (uint32_t i = 0; i < key_count; ++i)
+      if (key_index[i] != kNoAllocation && !alloc(key_index[i])) return refuse(__LINE__);
+    if (!exec_) return status::kSuccess;
+    NtStatus s = flush();
+    if (s != status::kSuccess) return s;
+    if (!mm_.read_back(*buffer) || !mm_.read_back(*bitstream)) return status::kInvalidDeviceState;
+    // (a key is the allocation's number: the same allocation from picture to picture, whatever index the program gives it)
+    uint32_t keys[kMaxVideoDecodeSurfaces];
+    for (uint32_t i = 0; i < key_count; ++i) keys[i] = key_index[i] == kNoAllocation ? 0xFFFFFFFFu : static_cast<uint32_t>(alloc(key_index[i])->id());
+    hardware::DxvaPicture picture;
+    picture.picture_parameters = buffer->backing().subview(pp_off, pp_bytes);
+    picture.quantization_matrix = buffer->backing().subview(qm_off, qm_bytes);
+    picture.slice_control = buffer->backing().subview(sc_off, sc_bytes);
+    picture.bitstream = bitstream->backing().subview(bs_off, bs_bytes);
+    picture.surface_keys = ArrayView<const uint32_t>(keys, key_count);
+    if (output_keyed) picture.output_key = static_cast<uint32_t>(luma->id());
+    hardware::DxvaDecodedPicture decoded;
+    const hardware::DxvaResult result = decoder->decoder().decode(picture, &decoded);
+    VideoDecodeStatus record;
+    if (result == hardware::DxvaResult::Ok || result == hardware::DxvaResult::MissingReference) {
+      const hardware::VideoFrame& f = decoded.frame;
+      const bool sixteen = f.format.pixel_format == hardware::PixelFormat::P010;
+      const bool written = sixteen == (desc.ten_bit != 0) && write_video_plane(mm_, *luma, f.plane[0], f.stride[0], f.format.width, f.format.height, 1, sixteen) &&
+                           write_video_plane(mm_, *chroma, f.plane[1], f.stride[1], f.format.chroma_width(), f.format.chroma_height(), 2, sixteen);
+      if (!written) return status::kInvalidDeviceState;
+      unbind_textures_of(luma);
+      unbind_textures_of(chroma);
+      ++decoder->pictures;
+      if (result == hardware::DxvaResult::MissingReference) { record.status = 1; record.macroblocks_affected = ~uint64_t{0}; }
+    } else {
+      ++decoder->failures;
+      record.status = 2;
+      record.macroblocks_affected = ~uint64_t{0};
+    }
+    if (status_buffer) {
+      if (!mm_.read_back(*status_buffer)) return status::kInvalidDeviceState;
+      ByteView to;
+      if (!status_buffer->writable_backing().try_subview(q_off, sizeof record, &to)) return status::kInvalidDeviceState;
+      ByteWriter w(to);
+      w.le64(record.status);
+      w.le64(record.macroblocks_affected);
+      mm_.note_cpu_write(*status_buffer);
+    }
+    return status::kSuccess;
+  }
+
+  // A picture of the video processor's (hardware::VpImage) over the images it is kept in: a YUV one two planes of widened pixels, an RGB one one image. False when the
+  // allocations are not what `format` is kept as.
+  static bool video_image_of(hardware::VpFormat format, hardware::VpColorSpace space, Allocation* plane0, Allocation* plane1, hardware::VpImage* out) {
+    if (!plane0 || !plane0->is_image() || plane0->desc().kind != graphics::TextureKind::Texture2D || plane0->mip_levels() != 1 || plane0->desc().samples != 1) return false;
+    out->format = format;
+    out->color_space = space;
+    out->width = plane0->desc().width;
+    out->height = plane0->desc().height;
+    auto plane_of = [&](Allocation* a, hardware::VpPlane* p, uint32_t channels, uint32_t sample_bytes, std::initializer_list<uint8_t> offsets, uint32_t bits, bool half) {
+      p->memory = a->writable_backing();      // (an input's is only read: the processor takes one kind of view for both)
+      p->pitch = static_cast<uint32_t>(image_row_bytes(a->desc().format, a->desc().width));
+      p->step = sample_bytes;
+      p->width = a->desc().width;
+      p->height = a->desc().height;
+      uint32_t c = 0;
+      for (uint8_t o : offsets) p->offset[c++] = o;
+      p->channels = static_cast<uint8_t>(channels);
+      p->bits = static_cast<uint8_t>(bits);
+      p->half_float = half;
+    };
+    const Format f0 = plane0->desc().format;
+    switch (format) {
+      case hardware::VpFormat::Nv12:
+      case hardware::VpFormat::P010:
+      case hardware::VpFormat::P016: {
+        const bool sixteen = format != hardware::VpFormat::Nv12;
+        const Format want = sixteen ? Format::A16B16G16R16 : Format::A8B8G8R8;
+        if (!plane1 || plane1 == plane0 || !plane1->is_image() || plane1->desc().kind != graphics::TextureKind::Texture2D || plane1->mip_levels() != 1 || plane1->desc().samples != 1) return false;
+        if ((f0 != want && !(f0 == Format::X8B8G8R8 && !sixteen)) || (plane1->desc().format != want && !(plane1->desc().format == Format::X8B8G8R8 && !sixteen))) return false;
+        if (plane1->desc().width < (out->width + 1) / 2 || plane1->desc().height < (out->height + 1) / 2) return false;
+        plane_of(plane0, &out->plane[0], 1, sixteen ? 8 : 4, {0}, sixteen ? 16 : 8, false);
+        plane_of(plane1, &out->plane[1], 2, sixteen ? 8 : 4, {0, static_cast<uint8_t>(sixteen ? 2 : 1)}, sixteen ? 16 : 8, false);
+        return true;
+      }
+      case hardware::VpFormat::Bgra8: if (f0 != Format::A8R8G8B8) return false; plane_of(plane0, &out->plane[0], 4, 4, {2, 1, 0, 3}, 8, false); return true;
+      case hardware::VpFormat::Bgrx8: if (f0 != Format::X8R8G8B8 && f0 != Format::A8R8G8B8) return false; plane_of(plane0, &out->plane[0], 3, 4, {2, 1, 0, 3}, 8, false); return true;
+      case hardware::VpFormat::Rgba8: if (f0 != Format::A8B8G8R8 && f0 != Format::X8B8G8R8) return false; plane_of(plane0, &out->plane[0], f0 == Format::X8B8G8R8 ? 3 : 4, 4, {0, 1, 2, 3}, 8, false); return true;
+      case hardware::VpFormat::Rgb10a2: if (f0 != Format::A2B10G10R10) return false; plane_of(plane0, &out->plane[0], 4, 4, {0, 1, 2, 3}, 10, false); return true;
+      case hardware::VpFormat::Rgba16f: if (f0 != Format::A16B16G16R16F) return false; plane_of(plane0, &out->plane[0], 4, 8, {0, 2, 4, 6}, 16, true); return true;
+    }
+    return false;
+  }
+
+  NtStatus video_process_packet(ByteReader& p) {
+    const uint32_t out_format = p.le32(), out_space = p.le32();
+    hardware::VpOutput output;
+    output.target.left = static_cast<int32_t>(p.le32());
+    output.target.top = static_cast<int32_t>(p.le32());
+    output.target.right = static_cast<int32_t>(p.le32());
+    output.target.bottom = static_cast<int32_t>(p.le32());
+    for (float& c : output.background) c = bits_float(p.le32());
+    output.background_is_yuv = p.le32() != 0;
+    const uint32_t fill = p.le32();
+    output.alpha_fill_stream = p.le32();
+    const uint32_t o0 = p.le32(), o1 = p.le32(), count = p.le32();
+    if (!p.ok() || in_pass_ || out_format > static_cast<uint32_t>(hardware::VpFormat::Rgba16f) || fill > static_cast<uint32_t>(hardware::VpAlphaFill::SourceStream) || count > kMaxVideoProcessStreams)
+      return refuse(__LINE__);
+    output.alpha_fill = static_cast<hardware::VpAlphaFill>(fill);
+    struct StreamWords { uint32_t w[kVideoProcessStreamWords]; } words[kMaxVideoProcessStreams];
+    for (uint32_t s = 0; s < count; ++s)
+      for (uint32_t& w : words[s].w) w = p.le32();
+    if (!exact(p)) return refuse(__LINE__);
+    const hardware::VpFormat ofmt = static_cast<hardware::VpFormat>(out_format);
+    Allocation* out0 = alloc(o0);
+    Allocation* out1 = hardware::vp_is_yuv(ofmt) ? alloc(o1) : nullptr;
+    hardware::VpImage out_image;
+    if (!video_image_of(ofmt, out_space, out0, out1, &out_image)) return refuse(__LINE__);
+    if (!use(out0, state::kVideoProcessWrite) || (out1 && !use(out1, state::kVideoProcessWrite))) return refuse(__LINE__);
+    hardware::VpImage images[kMaxVideoProcessStreams];
+    hardware::VpStream streams[kMaxVideoProcessStreams];
+    Allocation* inputs[2 * kMaxVideoProcessStreams] = {};
+    for (uint32_t s = 0; s < count; ++s) {
+      const uint32_t* w = words[s].w;
+      if (w[0] > static_cast<uint32_t>(hardware::VpFormat::Rgba16f) || w[10] > static_cast<uint32_t>(hardware::VpOrientation::Clockwise270FlipHorizontal)) return refuse(__LINE__);
+      const hardware::VpFormat f = static_cast<hardware::VpFormat>(w[0]);
+      Allocation* a0 = alloc(w[13]);
+      Allocation* a1 = hardware::vp_is_yuv(f) ? alloc(w[14]) : nullptr;
+      if (!video_image_of(f, w[1], a0, a1, &images[s])) return refuse(__LINE__);
+      if (a0 == out0 || a0 == out1 || (a1 && (a1 == out0 || a1 == out1))) return refuse(__LINE__);      // (a stream is not its own output)
+      if (!use(a0, state::kVideoProcessRead) || (a1 && !use(a1, state::kVideoProcessRead))) return refuse(__LINE__);
+      inputs[2 * s] = a0;
+      inputs[2 * s + 1] = a1;
+      streams[s].image = &images[s];
+      streams[s].source = {static_cast<int32_t>(w[2]), static_cast<int32_t>(w[3]), static_cast<int32_t>(w[4]), static_cast<int32_t>(w[5])};
+      streams[s].destination = {static_cast<int32_t>(w[6]), static_cast<int32_t>(w[7]), static_cast<int32_t>(w[8]), static_cast<int32_t>(w[9])};
+      streams[s].orientation = static_cast<hardware::VpOrientation>(w[10]);
+      streams[s].alpha_blend = w[11] != 0;
+      streams[s].alpha = bits_float(w[12]);
+    }
+    if (!exec_) return status::kSuccess;
+    NtStatus st = flush();
+    if (st != status::kSuccess) return st;
+    for (Allocation* a : inputs)
+      if (a && !mm_.read_back(*a)) return status::kInvalidDeviceState;
+    if (!mm_.read_back(*out0) || (out1 && !mm_.read_back(*out1))) return status::kInvalidDeviceState;
+    // (the backings were read back above: the views of them are current; the output's are written)
+    if (!video_image_of(ofmt, out_space, out0, out1, &out_image)) return status::kInvalidDeviceState;
+    output.image = &out_image;
+    if (hardware::video_process(output, ArrayView<const hardware::VpStream>(streams, count)) == hardware::VpResult::Ok) {
+      mm_.note_cpu_write(*out0);
+      unbind_textures_of(out0);
+      if (out1) { mm_.note_cpu_write(*out1); unbind_textures_of(out1); }
     }
     return status::kSuccess;
   }
@@ -1225,6 +1477,9 @@ class Adapter::StreamRunner {
   List<SharedPointer<RootSignatureObject>>* collected_signatures_ = nullptr;
   List<SharedPointer<DescriptorHeapObject>>* collected_heaps_ = nullptr;
   ArrayView<const SharedPointer<RootSignatureObject>> replay_signatures_;
+  List<SharedPointer<VideoDecoderObject>>* collected_decoders_ = nullptr;
+  ArrayView<const SharedPointer<VideoDecoderObject>> replay_decoders_;
+  uint64_t replay_decoder_cursor_ = 0;
   ArrayView<const SharedPointer<DescriptorHeapObject>> replay_heaps_;
   uint64_t replay_signature_cursor_ = 0, replay_heap_cursor_ = 0;
   // Direct3D 12 binding: the root signature set, the heaps, and the arguments of its parameters.
@@ -1698,6 +1953,7 @@ NtStatus Adapter::queue_render(ContextObject& context, ConstByteView commands, A
   for (const SharedPointer<Allocation>& a : allocations)
     if (!s->allocations.push_back(a)) return status::kNoMemory;
   StreamRunner runner(*this, s->commands.view(), ArrayView<const SharedPointer<Allocation>>(s->allocations.view().data(), s->allocations.count()));
+  runner.collect_decoders(&s->decoders);
   const NtStatus v = runner.validate(pipelines, s->pipelines, s->signatures, s->heaps);
   if (v != status::kSuccess) return v;
   return queue(context, util::move(s));
@@ -1749,6 +2005,7 @@ NtStatus Adapter::queue_present(ContextObject& context, const PresentArgs& args,
 
 NtStatus Adapter::execute_render(Submission& s) {
   StreamRunner runner(*this, s.commands.view(), ArrayView<const SharedPointer<Allocation>>(s.allocations.view().data(), s.allocations.count()));
+  runner.replay_decoders(ArrayView<const SharedPointer<VideoDecoderObject>>(s.decoders.view().data(), s.decoders.count()));
   return runner.execute(ArrayView<const SharedPointer<PipelineObject>>(s.pipelines.view().data(), s.pipelines.count()), ArrayView<const SharedPointer<RootSignatureObject>>(s.signatures.view().data(), s.signatures.count()),
                         ArrayView<const SharedPointer<DescriptorHeapObject>>(s.heaps.view().data(), s.heaps.count()));
 }

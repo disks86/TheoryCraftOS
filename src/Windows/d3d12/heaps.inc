@@ -110,6 +110,18 @@ static void desc_write(D3D12_CPU_DESCRIPTOR_HANDLE handle, const SoftDesc *d) {
 
 /* ---- the views ------------------------------------------------------------------------------------------------------------------------------------------------------------------ */
 
+/* The allocation a view of a planar texture (NV12, P010, P016) names: its plane (the PlaneSlice; a view format of one channel is plane 0, of two plane 1) of its first slice.
+ * The kernel's view is of one 2D image: a view of several slices sees the first. Any other texture: its allocation. */
+static UINT view_alloc(const Resource *r, DXGI_FORMAT view_format, UINT plane, UINT slice) {
+  if (!r->planes) return r->alloc;
+  if (view_format != DXGI_FORMAT_UNKNOWN) {
+    const FormatInfo *vf = format_info(view_format);
+    if (vf && vf->narrow) plane = vf->narrow == NARROW_R8G8 || vf->narrow == NARROW_R16G16 ? 1 : 0;
+  }
+  if (plane >= r->planes || slice >= r->layers) return 0;
+  return r->plane_alloc[plane * r->layers + slice];
+}
+
 static void STDMETHODCALLTYPE dev_CreateConstantBufferView(Dev *This, const D3D12_CONSTANT_BUFFER_VIEW_DESC *desc, D3D12_CPU_DESCRIPTOR_HANDLE handle) {
   SoftDesc d;
   memset(&d, 0, sizeof d);
@@ -145,6 +157,13 @@ static void STDMETHODCALLTYPE dev_CreateShaderResourceView(Dev *This, ID3D12Reso
       d.size = count * stride;
     } else {
       d.kind = DK_SRV;
+      if (r->planes) {
+        UINT plane = 0, slice = 0;
+        if (desc && desc->ViewDimension == D3D12_SRV_DIMENSION_TEXTURE2D) plane = desc->Texture2D.PlaneSlice;
+        if (desc && desc->ViewDimension == D3D12_SRV_DIMENSION_TEXTURE2DARRAY) { plane = desc->Texture2DArray.PlaneSlice; slice = desc->Texture2DArray.FirstArraySlice; }
+        d.alloc = view_alloc(r, desc ? desc->Format : DXGI_FORMAT_UNKNOWN, plane, slice);
+        if (!d.alloc) d.kind = 0;
+      }
     }
     d.format = desc ? desc->Format : r->desc.Format;
   }
@@ -183,6 +202,13 @@ static void STDMETHODCALLTYPE dev_CreateRenderTargetView(Dev *This, ID3D12Resour
     d.alloc = r->alloc;
     d.format = desc ? desc->Format : r->desc.Format;
     if (desc && desc->ViewDimension == D3D12_RTV_DIMENSION_TEXTURE2D) d.mip = desc->Texture2D.MipSlice;
+    if (r->planes) {
+      UINT plane = 0, slice = 0;
+      if (desc && desc->ViewDimension == D3D12_RTV_DIMENSION_TEXTURE2D) plane = desc->Texture2D.PlaneSlice;
+      if (desc && desc->ViewDimension == D3D12_RTV_DIMENSION_TEXTURE2DARRAY) { plane = desc->Texture2DArray.PlaneSlice; slice = desc->Texture2DArray.FirstArraySlice; }
+      d.alloc = view_alloc(r, desc ? desc->Format : DXGI_FORMAT_UNKNOWN, plane, slice);
+      if (!d.alloc) d.kind = 0;
+    }
   }
   desc_write(handle, &d);
 }

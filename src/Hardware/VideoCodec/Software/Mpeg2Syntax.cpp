@@ -184,6 +184,7 @@ bool Core::parse_sequence_header(BitReader& br) {
   s.chroma_format = 1;
   s.low_delay = false;
   s.profile_and_level = 0;
+  s.mpeg1 = false;
   if (br.bit()) {
     for (int i = 0; i < 64; ++i) s.intra_matrix[kZigzagScan[i]] = static_cast<uint8_t>(br.get(8));
   } else {
@@ -260,12 +261,37 @@ bool Core::parse_picture_header(BitReader& br) {
   p.temporal_reference = static_cast<int>(br.get(10));
   p.type = static_cast<int>(br.get(3));
   br.skip(16);   // vbv_delay
+  int f_code[2] = {0, 0};   // MPEG-1's (the extension has the MPEG-2 ones)
   if (p.type == kPictureP || p.type == kPictureB) {
-    br.skip(1);   // full_pel_forward_vector (MPEG-1)
-    br.skip(3);   // forward_f_code (MPEG-1; the extension has the MPEG-2 ones)
-    if (p.type == kPictureB) br.skip(4);
+    p.full_pel[0] = br.bit() != 0;
+    f_code[0] = static_cast<int>(br.get(3));
+    if (p.type == kPictureB) {
+      p.full_pel[1] = br.bit() != 0;
+      f_code[1] = static_cast<int>(br.get(3));
+    }
   }
-  if (br.error() || p.type < kPictureI || p.type > kPictureB) return false;
+  if (br.error() || p.type < kPictureI || p.type > kPictureB) return false;   // (MPEG-1's D-pictures, type 4, are not decoded)
+  // A sequence header with no sequence extension before its first picture is MPEG-1 (ISO/IEC 11172-2): progressive 4:2:0 frames.
+  if (!have_sequence_ && !seq_.valid && seq_.horizontal_size > 0 && seq_.horizontal_size <= kMaxMbWidth * 16 && seq_.vertical_size <= kMaxMbHeight * 16) {
+    seq_.mpeg1 = true;
+    seq_.mb_width = (seq_.horizontal_size + 15) / 16;
+    seq_.mb_height = (seq_.vertical_size + 15) / 16;
+    seq_.valid = true;
+    have_sequence_ = true;
+    if (offload_) offloaded_ = offload_->accepts(seq_);
+  }
+  if (have_sequence_ && seq_.mpeg1) {
+    // 11172-2 2.4.2.5: the f_codes (1 to 7) apply to both components; everything the MPEG-2 coding extension would say is fixed.
+    for (int d = 0; d < 2; ++d) {
+      if ((p.type == kPictureP && d == 0) || p.type == kPictureB) {
+        if (f_code[d] == 0) return false;
+        p.f_code[d][0] = p.f_code[d][1] = f_code[d];
+      }
+    }
+    p.structure = kFramePicture;
+    p.frame_pred_frame_dct = true;
+    p.progressive_frame = true;
+  }
   pic_ = p;
   have_picture_header_ = true;
   return true;
@@ -274,7 +300,46 @@ bool Core::parse_picture_header(BitReader& br) {
 // ---- pictures ---------------------------------------------------------------------------------------------------------------------
 
 bool Core::start_picture() {
-  if (!have_sequence_ || !have_picture_header_ || !pic_.has_extension || !build_vlcs()) return false;
+  if (!have_sequence_ || !have_picture_header_ || (!pic_.has_extension && !seq_.mpeg1) || !build_vlcs()) return false;
+  if (external_) {
+    Picture* p = external_->target;
+    if (!p) return false;
+    const int w = seq_.mb_width * 16, h = seq_.mb_height * 16;
+    const bool fresh = !external_->second_field || p->width != w || p->height != h || !p->plane[0].data();
+    if (p->width != w || p->height != h || !p->plane[0].data()) {
+      if (!p->plane[0].alloc(allocator_, uint64_t(w) * h) || !p->plane[1].alloc(allocator_, uint64_t(w / 2) * (h / 2)) || !p->plane[2].alloc(allocator_, uint64_t(w / 2) * (h / 2)))
+        return false;
+      p->width = w;
+      p->height = h;
+      p->stride[0] = w;
+      p->stride[1] = p->stride[2] = w / 2;
+    }
+    if (fresh) {
+      for (int c = 0; c < 3; ++c)
+        for (uint64_t i = 0; i < p->plane[c].size(); ++i) p->plane[c][i] = 128;
+      p->type = pic_.type;
+      p->top_field_first = pic_.top_field_first;
+      p->progressive_frame = pic_.progressive_frame;
+      p->repeat_first_field = pic_.repeat_first_field;
+    }
+    p->in_use = true;
+    p->output_pending = false;
+    p->order = decode_counter_++;
+    cur_ = p;
+    second_field_ = external_->second_field;
+    anchor_[0] = anchor_[1] = nullptr;
+    if (pic_.type == kPictureP) anchor_[1] = external_->forward;
+    if (pic_.type == kPictureB) {
+      anchor_[0] = external_->forward;
+      anchor_[1] = external_->backward;
+    }
+    sequence_ = seq_;
+    picture_open_ = true;
+    slice_count_ = 0;
+    slices_.clear();
+    slice_infos_.clear();
+    return true;
+  }
   const bool field = pic_.structure != kFramePicture;
   if (pic_.type != kPictureI && need_intra_) return false;
   // The second field of the frame being decoded?
@@ -422,6 +487,55 @@ bool Core::decode(ConstByteView data, int64_t pts) {
   // A call holds whole pictures: the last one is complete now (a frame in field pictures waits for its second field).
   if (picture_open_) finish_picture();
   return any;
+}
+
+Core::ExternalStatus Core::decode_external(ConstByteView headers, ArrayView<const ConstByteView> slices, const ExternalPicture& picture) {
+  picture_open_ = false;
+  first_field_done_ = false;
+  cur_ = nullptr;
+  have_picture_header_ = false;
+  have_sequence_ = false;
+  seq_ = SequenceHeader();
+  if (!build_vlcs()) return ExternalStatus::NoMemory;
+  external_ = &picture;
+  const uint64_t n = headers.size();
+  auto next_code = [&](uint64_t from) {
+    for (uint64_t k = from; k + 3 <= n; ++k)
+      if (headers[k] == 0 && headers[k + 1] == 0 && headers[k + 2] == 1) return k;
+    return n;
+  };
+  bool headers_ok = true;
+  for (uint64_t i = next_code(0); i < n;) {
+    const uint64_t end = next_code(i + 3);
+    ConstByteView unit = headers.subview(i, end - i);
+    if (unit.size() < 4 || (unit[3] >= 0x01 && unit[3] <= 0xAF) || !handle_unit(unit, 0)) headers_ok = false;
+    i = end;
+  }
+  ExternalStatus status = ExternalStatus::BadHeaders;
+  if (headers_ok && have_sequence_ && have_picture_header_ && (pic_.has_extension || seq_.mpeg1)) {
+    if (!start_picture()) {
+      status = ExternalStatus::NoMemory;
+    } else {
+      int decoded = 0;
+      for (const ConstByteView& slice : slices) {
+        // The slice up to the next start code in it (a slice holds none; what follows one is not part of it).
+        uint64_t end = slice.size();
+        for (uint64_t k = 3; k + 3 <= slice.size(); ++k)
+          if (slice[k] == 0 && slice[k + 1] == 0 && slice[k + 2] == 1) {
+            end = k;
+            break;
+          }
+        if (end < 5 || slice[0] != 0 || slice[1] != 0 || slice[2] != 1 || slice[3] < 0x01 || slice[3] > 0xAF) continue;
+        if (decode_slice(slice.first(end), slice[3] - 1)) ++decoded;
+      }
+      status = decoded > 0 ? ExternalStatus::Decoded : ExternalStatus::NoSlices;
+    }
+  }
+  picture_open_ = false;
+  cur_ = nullptr;
+  anchor_[0] = anchor_[1] = nullptr;
+  external_ = nullptr;
+  return status;
 }
 
 bool Core::handle_unit(ConstByteView unit, int64_t) {

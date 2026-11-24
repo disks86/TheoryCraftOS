@@ -28,6 +28,7 @@ enum { PACK_NONE, PACK_R11G11B10, PACK_565, PACK_5551, PACK_4444, PACK_1010102U,
 #define FMT_DEPTH 2u       /* a depth-stencil format */
 #define FMT_BLOCK 4u       /* block-compressed (sampled only) */
 #define FMT_SAMPLE 8u      /* only sampled (no render target, no unordered access) */
+#define FMT_PLANAR 16u     /* NV12, P010, P016: a luma plane and a half-size plane of U, V (each a texture of its own below: `bpp` is a luma sample's bytes) */
 
 typedef struct TexFormat {
   DXGI_FORMAT format, stored;
@@ -112,6 +113,9 @@ static const TexFormat g_tex_formats[] = {
     F4(DXGI_FORMAT_BC2_UNORM, DXGI_FORMAT_BC2_UNORM, 16, FMT_BLOCK), F4(DXGI_FORMAT_BC2_UNORM_SRGB, DXGI_FORMAT_BC2_UNORM_SRGB, 16, FMT_BLOCK),
     F4(DXGI_FORMAT_BC3_TYPELESS, DXGI_FORMAT_BC3_TYPELESS, 16, FMT_BLOCK), F4(DXGI_FORMAT_BC3_UNORM, DXGI_FORMAT_BC3_UNORM, 16, FMT_BLOCK),
     F4(DXGI_FORMAT_BC3_UNORM_SRGB, DXGI_FORMAT_BC3_UNORM_SRGB, 16, FMT_BLOCK),
+    /* planar YUV: Direct3D 12's planar textures (each plane of each slice an image of the kernel's); their views are of one plane (R8 / R8G8, R16 / R16G16) */
+    F4(DXGI_FORMAT_NV12, DXGI_FORMAT_NV12, 1, FMT_TARGET | FMT_PLANAR), F4(DXGI_FORMAT_P010, DXGI_FORMAT_P010, 2, FMT_TARGET | FMT_PLANAR),
+    F4(DXGI_FORMAT_P016, DXGI_FORMAT_P016, 2, FMT_TARGET | FMT_PLANAR),
 };
 #undef F4
 #undef FW
@@ -306,4 +310,19 @@ static void row_to_stored(const TexFormat *f, const BYTE *in, BYTE *out, UINT w,
 static void row_from_stored(const TexFormat *f, const BYTE *in, BYTE *out, UINT w, UINT bytes) {
   if (!f->channels && !f->packed) { memcpy(out, in, bytes); return; }
   for (UINT i = 0; i < w; ++i) texel_from_stored(f, in + (SIZE_T)i * f->stored_bpp, out + (SIZE_T)i * f->bpp);
+}
+
+/* ---- planar formats ------------------------------------------------------------------------------------------------------------------------------------------------- */
+
+/* A plane of a planar format as a format of its own (what views and copies of it are): plane 0 the luma (R8 / R16), plane 1 U and V (R8G8 / R16G16). */
+static DXGI_FORMAT plane_format_of(DXGI_FORMAT planar, UINT plane) {
+  const BOOL sixteen = planar == DXGI_FORMAT_P010 || planar == DXGI_FORMAT_P016;
+  return plane == 0 ? (sixteen ? DXGI_FORMAT_R16_UNORM : DXGI_FORMAT_R8_UNORM) : (sixteen ? DXGI_FORMAT_R16G16_UNORM : DXGI_FORMAT_R8G8_UNORM);
+}
+/* The plane a view of a planar texture names by its format: R8_UNORM / R16_UNORM the luma, R8G8_UNORM / R16G16_UNORM the chroma. FALSE for another format: the planar
+ * format itself (a view is of one plane), and the integer and typeless forms of the planes' formats, which the kernel cannot give (it keeps a plane as unorm pixels). */
+static BOOL plane_of_view_format(DXGI_FORMAT planar, DXGI_FORMAT view, UINT *plane) {
+  for (UINT p = 0; p < 2; ++p)
+    if (view == plane_format_of(planar, p)) { *plane = p; return TRUE; }
+  return FALSE;
 }

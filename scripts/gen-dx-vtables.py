@@ -20,12 +20,12 @@ The C sources define each method as a function named <prefix>_<Method> (fac_Enum
 method list from the mingw headers and writes the vtable, taking each method from the first prefix that defines it and pointing the others at dx_not_implemented (E_NOTIMPL).
 A method defined with `#define <prefix>_<Method> <function>` counts too (the IUnknown and ID3D12Object methods all objects share).
 
-    python3 scripts/gen-dx-vtables.py
+    python3 scripts/gen-dx-vtables.py [dll ...]
 """
 import re, os, sys
 
 INC = '/usr/x86_64-w64-mingw32/include/'
-HEADERS = ['d3d12.h', 'd3d12sdklayers.h', 'dxgi1_6.h', 'dxgi1_5.h', 'dxgi1_4.h', 'dxgi1_3.h', 'dxgi1_2.h', 'dxgi.h', 'd3dcommon.h', 'd3d11.h', 'd3d11_1.h', 'd3d11_2.h', 'd3d11_3.h', 'd3d11_4.h', 'd3d9.h']
+HEADERS = ['d3d12.h', 'd3d12video.h', 'd3d12sdklayers.h', 'dxgi1_6.h', 'dxgi1_5.h', 'dxgi1_4.h', 'dxgi1_3.h', 'dxgi1_2.h', 'dxgi.h', 'd3dcommon.h', 'd3d11.h', 'd3d11_1.h', 'd3d11_2.h', 'd3d11_3.h', 'd3d11_4.h', 'd3d9.h']
 ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'src', 'Windows')
 
 # (interface, vtable variable, [prefixes in the order they are tried])
@@ -54,6 +54,12 @@ SPECS = {
         ('ID3D12LifetimeTracker', 'ltrack_vtbl', ['ltrack', 'dobj', 'obj']),
         ('ID3D12RootSignatureDeserializer', 'rsd_vtbl', ['rsd', 'obj']),
         ('ID3D12VersionedRootSignatureDeserializer', 'vrsd_vtbl', ['vrsd', 'obj']),
+        ('ID3D12VideoDevice3', 'vdev_vtbl', ['vdev']),
+        ('ID3D12VideoDecoder1', 'vdec_vtbl', ['vdec', 'dobj', 'obj']),
+        ('ID3D12VideoDecoderHeap1', 'vdheap_vtbl', ['vdheap', 'dobj', 'obj']),
+        ('ID3D12VideoProcessor1', 'vproc_vtbl', ['vproc', 'dobj', 'obj']),
+        ('ID3D12VideoDecodeCommandList3', 'vdlist_vtbl', ['vdlist', 'vlist', 'list', 'dobj', 'obj']),
+        ('ID3D12VideoProcessCommandList3', 'vplist_vtbl', ['vplist', 'vlist', 'list', 'dobj', 'obj']),
         ('ID3D10Blob', 'blob_vtbl', ['blob', 'obj']),
     ],
     'd3d11': [
@@ -85,6 +91,14 @@ SPECS = {
         ('ID3D11CommandList', 'cmdlist_vtbl', ['cmdlist', 'child', 'obj']),
         ('ID3DDeviceContextState', 'cstate_vtbl', ['cstate', 'child', 'obj']),
         ('ID3D11Fence', 'fence_vtbl', ['fence', 'child', 'obj']),
+        ('ID3D11VideoDevice2', 'vdev_vtbl', ['vdev']),
+        ('ID3D11VideoContext3', 'vctx_vtbl', ['vctx']),
+        ('ID3D11VideoDecoder', 'vdec_vtbl', ['vdec', 'child', 'obj']),
+        ('ID3D11VideoProcessorEnumerator1', 'venum_vtbl', ['venum', 'child', 'obj']),
+        ('ID3D11VideoProcessor', 'vproc_vtbl', ['vproc', 'child', 'obj']),
+        ('ID3D11VideoDecoderOutputView', 'dov_vtbl', ['dov', 'vview', 'child', 'obj']),
+        ('ID3D11VideoProcessorInputView', 'piv_vtbl', ['piv', 'vview', 'child', 'obj']),
+        ('ID3D11VideoProcessorOutputView', 'pov_vtbl', ['pov', 'vview', 'child', 'obj']),
     ],
     'd3d9': [
         ('IDirect3D9', 'd3d_vtbl', ['d3d', 'obj']),
@@ -103,6 +117,10 @@ SPECS = {
 }
 
 text = ''.join(open(INC + h).read() for h in HEADERS)
+# (what mingw's d3d12video.h lacks: the later video interfaces, as the Windows SDK has them)
+text += open(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'src', 'Windows', 'd3d12', 'video_types.h')).read()
+# (... and what mingw's d3d11_4.h lacks: ID3D11VideoDevice2, ID3D11VideoContext3)
+text += open(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'src', 'Windows', 'd3d11', 'video_types.h')).read()
 
 def members(iface):
     m = re.search(r'typedef struct %sVtbl \{(.*?)\} %sVtbl;' % (iface, iface), text, re.S)
@@ -207,7 +225,11 @@ def checked(iface, var, name, impl, parameters):
     return fn, ('static HRESULT STDMETHODCALLTYPE %s(%s) { const HRESULT hr = %s; if (FAILED(hr)) { static volatile LONG said; dx_failed(&said, "%s::%s", hr); } '
                 'return hr; }') % (fn, parameters, call, iface, name)
 
+# (the DLLs named on the command line, or all of them)
+only = set(sys.argv[1:])
 for dll, specs in SPECS.items():
+    if only and dll not in only:
+        continue
     folder = os.path.join(ROOT, dll)
     source = ''
     for f in sorted(os.listdir(folder)):

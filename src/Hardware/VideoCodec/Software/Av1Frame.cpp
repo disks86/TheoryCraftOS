@@ -136,11 +136,9 @@ void Core::reset() {
 
 // ---- frame set-up --------------------------------------------------------------------------------------------------------------------
 
-bool Core::init_frame(const ObuParser& parser) {
+bool Core::init_frame(const SequenceHeader* seq_in, const FrameHeader* hdr_in, ArrayView<const RefSlot> refs) {
   FrameContext& f = f_;
-  const SequenceHeader* seq_in = parser.sequence_header();
-  const FrameHeader* hdr_in = parser.frame_header();
-  if (!seq_in || !hdr_in) return false;
+  if (!seq_in || !hdr_in || refs.size() != NUM_REF_FRAMES) return false;
   f.seq_hdr_store = *seq_in;
   f.frame_hdr_store = *hdr_in;
   f.seq_hdr = &f.seq_hdr_store;
@@ -168,11 +166,11 @@ bool Core::init_frame(const ObuParser& parser) {
   if (inter) {
     if (hdr.primary_ref_frame != PRIMARY_REF_NONE) {
       const int pri_ref = hdr.refidx[hdr.primary_ref_frame];
-      if (!refs_[pri_ref].pic) return false;
+      if (!refs[pri_ref].pic) return false;
     }
     for (int i = 0; i < 7; i++) {
       const int refidx = hdr.refidx[i];
-      const SharedPointer<Picture>& rp = refs_[refidx].pic;
+      const SharedPointer<Picture>& rp = refs[refidx].pic;
       if (!rp || hdr.width[0] * 2 < rp->width() || hdr.height * 2 < rp->height() || hdr.width[0] > rp->width() * 16 ||
           hdr.height > rp->height() * 16 || rp->layout() != seq.layout || rp->bpc() != bpc)
         return false;
@@ -194,7 +192,7 @@ bool Core::init_frame(const ObuParser& parser) {
     if (!f.in_cdf) return false;
     cdf_load_default(*f.in_cdf, cdf_qcat(hdr.quant.yac));
   } else {
-    f.in_cdf = refs_[hdr.refidx[hdr.primary_ref_frame]].cdf;
+    f.in_cdf = refs[hdr.refidx[hdr.primary_ref_frame]].cdf;
     if (!f.in_cdf) return false;
   }
   if (hdr.refresh_context) {
@@ -235,7 +233,7 @@ bool Core::init_frame(const ObuParser& parser) {
     const MotionVectorStore* ref_stores[7] = {};
     if (hdr.use_ref_frame_mvs && inter) {
       for (int i = 0; i < 7; i++) {
-        const SharedPointer<MotionVectorStore>& m = refs_[hdr.refidx[i]].mvs;
+        const SharedPointer<MotionVectorStore>& m = refs[hdr.refidx[i]].mvs;
         ref_stores[i] = m ? m.get() : nullptr;
       }
     }
@@ -252,7 +250,7 @@ bool Core::init_frame(const ObuParser& parser) {
       const Picture& rp = *f.refp[pri_ref];
       const int ref_w = ((rp.hdr.width[0] + 7) >> 3) << 1;
       const int ref_h = ((rp.height() + 7) >> 3) << 1;
-      if (ref_w == f.bw && ref_h == f.bh) f.prev_segmap = refs_[hdr.refidx[pri_ref]].segmap;
+      if (ref_w == f.bw && ref_h == f.bh) f.prev_segmap = refs[hdr.refidx[pri_ref]].segmap;
     }
     if (hdr.segmentation.update_map || !f.prev_segmap) {
       f.cur_segmap = SharedPointer<SegmentMap>::make(allocator_, allocator_);
@@ -329,10 +327,9 @@ bool Core::init_frame(const ObuParser& parser) {
 
 // ---- tiles ---------------------------------------------------------------------------------------------------------------------------
 
-bool Core::decode_tiles(const ObuParser& parser) {
+bool Core::decode_tiles(ArrayView<const TileData> tiles) {
   FrameContext& f = f_;
   const FrameHeader& hdr = *f.frame_hdr;
-  const ArrayView<const TileData> tiles = parser.tiles();
   const int cols = hdr.tiling.cols, rows = hdr.tiling.rows;
   if (tiles.size() < static_cast<uint64_t>(cols) * static_cast<uint64_t>(rows)) return false;
   TaskContext& t = *t_;
@@ -487,7 +484,7 @@ bool Core::decode_frame_offloaded() {
 bool Core::decode_frame() {
   if (offload_ && parser_.sequence_header() && parser_.frame_header() && offload_->accepts(*parser_.sequence_header(), *parser_.frame_header()))
     return decode_frame_offloaded();
-  bool ok = init_frame(parser_) && decode_tiles(parser_) && post_filter();
+  bool ok = init_frame(parser_.sequence_header(), parser_.frame_header(), ArrayView<const RefSlot>(refs_)) && decode_tiles(parser_.tiles()) && post_filter();
   const FrameHeader& hdr = f_.frame_hdr_store;
   if (ok) {
     for (unsigned i = 0; i < NUM_REF_FRAMES; i++) {
@@ -507,6 +504,24 @@ bool Core::decode_frame() {
   } else {
     for (unsigned i = 0; i < NUM_REF_FRAMES; i++)
       if (hdr.refresh_frame_flags & (1u << i)) drop_slot(i);
+  }
+  finish_frame(ok);
+  return ok;
+}
+
+// ---- decoding driven from outside (DXVA) ------------------------------------------------------------------------------------------------
+
+bool Core::decode_frame_external(const SequenceHeader& seq, const FrameHeader& hdr, ArrayView<const TileData> tiles, ArrayView<const RefSlot> refs,
+                                 RefSlot* state) {
+  if (!state) return false;
+  const bool ok = init_frame(&seq, &hdr, refs) && decode_tiles(tiles) && post_filter();
+  if (ok) {
+    const FrameHeader& done = f_.frame_hdr_store;
+    state->pic = f_.sr_cur;
+    state->segmap = f_.cur_segmap;
+    state->mvs = done.allow_intrabc ? SharedPointer<MotionVectorStore>() : f_.mvs;
+    state->cdf = done.refresh_context ? f_.out_cdf : f_.in_cdf;
+    if (observer_) observer_->frame_decoded(f_.seq_hdr_store, done, tiles, *f_.sr_cur);
   }
   finish_frame(ok);
   return ok;
@@ -532,9 +547,14 @@ bool Core::show_existing_frame(unsigned idx, bool refresh_all) {
 const Picture* Core::output() {
   if (!out_) return nullptr;
   const Picture& pic = *out_;
-  const FilmGrainData& fg = pic.hdr.film_grain.data;
-  if (!pic.hdr.film_grain.present || !has_grain(fg)) return out_.get();
+  if (!pic.hdr.film_grain.present || !has_grain(pic.hdr.film_grain.data)) return out_.get();
   if (grain_valid_ && grain_) return grain_.get();
+  return grained(pic);
+}
+
+const Picture* Core::grained(const Picture& pic) {
+  const FilmGrainData& fg = pic.hdr.film_grain.data;
+  if (!pic.hdr.film_grain.present || !has_grain(fg)) return &pic;
   if (!grain_ || grain_->width() != pic.width() || grain_->height() != pic.height() || grain_->layout() != pic.layout() || grain_->bpc() != pic.bpc()) {
     grain_ = make_picture(allocator_, pic.layout(), pic.bpc(), pic.width(), pic.height());
     if (!grain_) return nullptr;

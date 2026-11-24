@@ -246,6 +246,8 @@ struct PictureInfo {
   bool non_existing = false;
   bool keyframe = false;
   bool has_memory = false;   // the owner has samples/buffers in this slot already (a slot with memory is reused first)
+  bool has_key = false;      // decoding for a DXVA driver: the slot holds the picture of surface `key`
+  uint32_t key = 0;
   int64_t pts = 0;
 };
 
@@ -273,6 +275,12 @@ class Dpb {
   // the slot's memory and sets `has_memory`, or calls abort_picture().
   PictureInfo* begin_picture(const SliceHeader& sh, int64_t pts);
   void abort_picture();
+  // Decoding for a DXVA driver: the order counts of the current picture are the program's (after begin_picture()).
+  void set_current_poc(int top, int bottom);
+  // Decoding for a DXVA driver: finished pictures are not queued for output; the last one stays untouched until the next call that releases it.
+  void set_decode_order(bool on) { decode_order_ = on; }
+  // A new picture identity (for a picture the owner puts in a slot itself).
+  int new_id() { return next_pic_id_++; }
   // The picture is decoded: marks references (8.2.5), updates the counters for the next picture, queues it for output.
   void finish_picture(const SliceHeader& last_slice);
   // The reference lists (8.2.4) for a slice of the current picture. Entries without a picture repeat the first one.
@@ -316,6 +324,7 @@ class Dpb {
   int prev_frame_num_offset_ = 0, prev_frame_num_ = 0, prev_ref_frame_num_ = 0, frame_num_offset_ = 0;
   int top_poc_ = 0, bottom_poc_ = 0, pic_poc_ = 0;
   int max_long_term_idx_ = -1;
+  bool decode_order_ = false;
 };
 
 // The macroblock-level state kept for the picture being decoded (neighbour contexts and the loop filter).
@@ -407,6 +416,7 @@ class Core {
   void reset();
   VideoFormat output_format() const;
   bool ready() const { return dpb_.output_ready(); }
+  H264Decoder::ExternalStatus decode_external(ConstByteView data, const H264Decoder::ExternalPicture& picture, VideoFrame* decoded);
   void set_slice_observer(H264Decoder::SliceObserver observer, void* context) {
     observer_ = observer;
     observer_context_ = context;
@@ -421,6 +431,7 @@ class Core {
   void finish_picture();
   bool allocate_pictures();
   bool alloc_picture(Picture* p);
+  bool apply_external_references();
   void compute_scaling();
   void build_vlc();
 
@@ -517,6 +528,10 @@ class Core {
   int slice_no_ = 0;
   int64_t pic_pts_ = 0;
   bool waiting_for_idr_ = true;
+  // Decoding for a DXVA driver (decode_external): the picture's description, and what happened while decoding it.
+  const H264Decoder::ExternalPicture* ext_ = nullptr;
+  bool ext_started_ = false, ext_missing_ = false, ext_no_memory_ = false;
+  Picture* ext_decoded_ = nullptr;
   H264Decoder::SliceObserver observer_ = nullptr;
   void* observer_context_ = nullptr;
 

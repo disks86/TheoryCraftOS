@@ -665,6 +665,12 @@ int16_t wrap16(int v) { return static_cast<int16_t>(static_cast<uint16_t>(v & 0x
 void scale_mv(int td, int tb, const int16_t in[2], int out[2]) {
   td = clip3(-128, 127, td);
   tb = clip3(-128, 127, tb);
+  if (td == 0) {
+    // Two pictures with one order count: not in a conforming stream (and only from damaged input reaching here); the motion is taken as it is.
+    out[0] = in[0];
+    out[1] = in[1];
+    return;
+  }
   const int tx = (16384 + iabs(td) / 2) / td;
   const int dist = clip3(-4096, 4095, (tb * tx + 32) >> 6);
   for (int i = 0; i < 2; ++i) {

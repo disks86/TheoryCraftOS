@@ -54,6 +54,8 @@
 #include "../dxcommon.h"
 #include <stddef.h>
 #include <d3d12.h>
+#include <d3d12video.h>
+#include "video_types.h"
 #include <dxgi1_6.h>
 #include "../tcosdx.h"
 
@@ -78,6 +80,7 @@ __asm__(".text\n.globl ___chkstk_ms\n___chkstk_ms:\n ret\n");
 #include "queue.inc"
 #include "device.inc"
 #include "device1.inc"
+#include "video.inc"
 #include "library.inc"
 
 #include "vtbl.inc"

@@ -177,6 +177,26 @@ struct AllocationInfo {
   bool shared = false;
 };
 
+// --- Video decoding ---------------------------------------------------------------
+// A decoder of DXVA pictures (Hardware/VideoCodec/Dxva/DxvaDecoder.hpp: a program parses the stream and hands over each picture's DXVA buffers), what Direct3D 11's and 12's
+// video decoders are made on. It decodes on the CPU into the planes of the output surface (the stream's DecodeFrame); the planes are 2D images in the formats a runtime keeps
+// NV12 and P010 in: X8B8G8R8 / A8B8G8R8 holding (Y, 0, 0, 255) and (U, V, 0, 255) for 8 bits, A16B16G16R16 holding (Y, 0, 0, 65535) and (U, V, 0, 65535) for 10 bits (the
+// samples in the top ten bits of each 16, as P010 has them). Not a device feature: any adapter has it.
+struct VideoDecoderDesc {
+  uint32_t profile = 0;        // hardware::DxvaProfile
+  uint32_t width = 0, height = 0;
+  uint32_t surfaces = 0;       // how many surface indices the pictures may name (1 .. 128)
+  uint32_t ten_bit = 0;        // 1: P010 output, 0: NV12
+};
+// What DecodeFrame writes to its status place (a D3D12_QUERY_DATA_VIDEO_DECODE_STATISTICS's first fields): `status` 0 the picture decoded, 1 decoded with a reference
+// missing (D3D12_VIDEO_DECODE_STATUS_CONTINUE_WITH_ERROR), 2 not decoded (CONTINUE_SKIP_DISPLAY: the buffers were invalid or need what the decoder has not);
+// `macroblocks_affected` 0 or ~0 (all).
+struct VideoDecodeStatus {
+  uint64_t status = 0;
+  uint64_t macroblocks_affected = 0;
+};
+constexpr uint32_t kMaxVideoDecodeSurfaces = 128;
+
 // --- Locking --------------------------------------------------------------------
 
 enum LockFlags : uint32_t {

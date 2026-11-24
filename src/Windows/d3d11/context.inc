@@ -64,7 +64,7 @@ static ID3D12PipelineState *pipeline_get(Dev *d, Ctx *c) {
   key.has_depth = c->dsv != NULL;
   key.samples = 1;
   for (UINT i = 0; i < c->rtv_count && i < 8; ++i) {
-    key.formats[i] = c->rtv[i]->tex->desc.Format;      /* (as the program made it: an R8 target is kept as RGBA8 but masked) */
+    key.formats[i] = c->rtv[i]->plane_format ? c->rtv[i]->plane_format : c->rtv[i]->tex->desc.Format;      /* (as the program made it: an R8 target is kept as RGBA8 but masked; a plane's view: its plane) */
     if (c->rtv[i]->tex->desc.SampleDesc.Count > 1) key.samples = c->rtv[i]->tex->desc.SampleDesc.Count;
   }
   if (c->dsv) {
@@ -118,7 +118,7 @@ static ID3D12PipelineState *pipeline_get(Dev *d, Ctx *c) {
     out->RenderTargetWriteMask = in->RenderTargetWriteMask;
   }
   for (UINT i = 0; i < c->rtv_count && i < 8; ++i) {      /* a target kept wider than its format: only its own channels are written */
-    const UINT8 mask = tex_format_mask(c->rtv[i]->tex->fmt);
+    const UINT8 mask = c->rtv[i]->plane_format ? (c->rtv[i]->plane ? 3 : 1) : tex_format_mask(c->rtv[i]->tex->fmt);
     if (mask == 0xF) continue;
     if (!pd.BlendState.IndependentBlendEnable) {
       for (UINT j = 1; j < 8; ++j) pd.BlendState.RenderTarget[j] = pd.BlendState.RenderTarget[0];
@@ -144,7 +144,7 @@ static ID3D12PipelineState *pipeline_get(Dev *d, Ctx *c) {
   if (c->layout) { pd.InputLayout.pInputElementDescs = c->layout->elements; pd.InputLayout.NumElements = c->layout->count; }
   pd.PrimitiveTopologyType = c->hs ? D3D12_PRIMITIVE_TOPOLOGY_TYPE_PATCH : D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
   pd.NumRenderTargets = c->rtv_count;
-  for (UINT i = 0; i < c->rtv_count; ++i) pd.RTVFormats[i] = c->rtv[i]->tex->stored;
+  for (UINT i = 0; i < c->rtv_count; ++i) pd.RTVFormats[i] = c->rtv[i]->plane_format ? c->rtv[i]->plane_format : c->rtv[i]->tex->stored;
   if (c->dsv) pd.DSVFormat = c->dsv->tex->stored == DXGI_FORMAT_R24G8_TYPELESS ? DXGI_FORMAT_D24_UNORM_S8_UINT
                            : c->dsv->tex->stored == DXGI_FORMAT_R32_TYPELESS ? DXGI_FORMAT_D32_FLOAT : c->dsv->tex->stored;
   pd.SampleDesc.Count = key.samples;
@@ -356,6 +356,24 @@ static BOOL tables_record(Dev *d, View *const *srvs, Sampler *const *samplers, c
       else if (!v && kinds[i] == KIND_BUFFER) {
         const View blank = {.buf = d->blank_buffer, .offset = 0, .size = d->blank_buffer->desc.ByteWidth};
         buffer_descriptor(d, &blank, FALSE, at);
+      } else if (v && v->tex->planar) {
+        /* (a view of a plane of a slice: Direct3D 12 keeps each as an image of its own) */
+        D3D12_SHADER_RESOURCE_VIEW_DESC r;
+        memset(&r, 0, sizeof r);
+        r.Format = v->plane_format;
+        r.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        if (v->tex->desc.ArraySize > 1) {
+          r.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
+          r.Texture2DArray.MipLevels = 1;
+          r.Texture2DArray.FirstArraySlice = v->array_slice;
+          r.Texture2DArray.ArraySize = 1;
+          r.Texture2DArray.PlaneSlice = v->plane;
+        } else {
+          r.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+          r.Texture2D.MipLevels = 1;
+          r.Texture2D.PlaneSlice = v->plane;
+        }
+        ID3D12Device_CreateShaderResourceView(d->d12, v->tex->res, &r, at);
       } else {
         Tex *t = v ? v->tex : kinds[i] >= 1 && kinds[i] <= 3 && d->blank_kind[kinds[i]] ? d->blank_kind[kinds[i]] : d->blank;
         ID3D12Device_CreateShaderResourceView(d->d12, t->res, NULL, at);
@@ -670,6 +688,9 @@ static HRESULT STDMETHODCALLTYPE ctx_QueryInterface(Ctx *c, REFIID riid, void **
     face = c;
   else if (guid_eq(riid, &IID_ID3D11Multithread) && !c->deferred) face = &c->multithread;      /* (the immediate context's only) */
   else if (guid_eq(riid, &IID_ID3DUserDefinedAnnotation)) face = &c->annotation;
+  else if ((guid_eq(riid, &IID_ID3D11VideoContext) || guid_eq(riid, &IID_ID3D11VideoContext1) || guid_eq(riid, &IID_ID3D11VideoContext2) || guid_eq(riid, &IID_ID3D11VideoContext3)) &&
+           !c->deferred && c->video.lpVtbl)
+    face = &c->video;      /* (video.inc: the immediate context's only, as on Windows) */
   if (!face) {
     dx_no_interface("ID3D11DeviceContext", riid);
     return E_NOINTERFACE;
@@ -1157,7 +1178,7 @@ static void STDMETHODCALLTYPE ctx_ClearRenderTargetView(Ctx *c, ID3D11RenderTarg
   if (predicated_out(c->dev)) return;
   LOCK(c);
   FLOAT kept[4] = {colour[0], colour[1], colour[2], colour[3]};      /* (a target kept wider than its format: the channels it does not have stay 0 and 1) */
-  const UINT8 mask = tex_format_mask(v->tex->fmt);
+  const UINT8 mask = v->plane_format ? (v->plane ? 3 : 1) : tex_format_mask(v->tex->fmt);
   for (UINT k = 0; k < 4; ++k) if (!(mask >> k & 1)) kept[k] = k == 3 ? 1.0f : 0.0f;
   if (v->scratch) rtv_load(c->dev, v, TRUE);      /* (all of it: nothing to load) */
   else tex_before_write(c->dev, v->tex);
@@ -1343,7 +1364,8 @@ static void STDMETHODCALLTYPE ctx_UpdateSubresource(Ctx *c, ID3D11Resource *reso
     const UINT z0 = box && t->kind == 1 ? box->front : 0, z1 = box && t->kind == 1 ? box->back : slices;
     const UINT pitch = row_pitch ? row_pitch : tex_pitch(t, x1 - x);
     const UINT slice_pitch = depth_pitch ? depth_pitch : pitch * tex_rows(t, y1 - y);
-    if (x < x1 && y < y1 && x1 <= w && y1 <= h && z0 < z1 && z1 <= slices)
+    /* (a planar texture: the box is on whole 2 x 2 blocks of luma, else Direct3D 11 writes nothing; the chroma's rows follow the luma's in `data`) */
+    if (x < x1 && y < y1 && x1 <= w && y1 <= h && z0 < z1 && z1 <= slices && !(t->planar && ((x | y | x1 | y1) & 1)))
       for (UINT z = z0; z < z1; ++z) tex_write(c->dev, t, sub, x, y, z, x1 - x, y1 - y, (const BYTE *)data + (SIZE_T)(z - z0) * slice_pitch, pitch);
   }
   UNLOCK(c);
@@ -1374,6 +1396,9 @@ static void STDMETHODCALLTYPE ctx_CopySubresourceRegion(Ctx *c, ID3D11Resource *
   if (bt && bf) {
     const UINT left = box ? box->left : 0, right = box ? box->right : bf->desc.ByteWidth;
     if (left < right && right <= bf->desc.ByteWidth && x <= bt->desc.ByteWidth && right - left <= bt->desc.ByteWidth - x) buf_copy(d, bt, x, bf, left, right - left);
+  } else if (tt && tf && (tt->planar || tf->planar)) {
+    /* (planar textures: a slice into a slice of one of the same format, both planes) */
+    if (tt->planar && tf->planar && to_sub < tex_subresources(tt) && from_sub < tex_subresources(tf)) tex_planar_copy(d, tt, to_sub, x, y, tf, from_sub, box);
   } else if (tt && tf && to_sub < tex_subresources(tt) && from_sub < tex_subresources(tf)) {
     tex_sync(d, tf);
     tex_sync(d, tt);
@@ -1406,6 +1431,17 @@ static void STDMETHODCALLTYPE ctx_CopyResource(Ctx *c, ID3D11Resource *to, ID3D1
   LOCK(c);
   if (bt && bf && bt != bf) {
     if (bt->desc.ByteWidth == bf->desc.ByteWidth) buf_copy(d, bt, 0, bf, 0, bt->desc.ByteWidth);      /* (CopyResource copies resources of one size) */
+  } else if (tt && tf && (tt->planar || tf->planar)) {
+    /* (planar textures: of one format, size and number of slices; Direct3D 12 below copies every plane of every slice) */
+    if (tt != tf && tt->planar && tf->planar && tt->desc.Format == tf->desc.Format && tt->desc.ArraySize == tf->desc.ArraySize && tt->desc.Width == tf->desc.Width &&
+        tt->desc.Height == tf->desc.Height) {
+      tex_before_write(d, tt);
+      tex_before_read(d, tf);
+      ID3D12GraphicsCommandList_CopyResource(d->list, tt->res, tf->res);
+      ++tt->version;
+      tt->used = tf->used = tt->written = d->epoch;
+      d->recorded = 1;
+    }
   } else if (tt && tf && tt != tf && tex_subresources(tt) == tex_subresources(tf) && tt->desc.Width == tf->desc.Width && tt->desc.Height == tf->desc.Height) {
     tex_sync(d, tf);
     tex_sync(d, tt);
@@ -1547,6 +1583,12 @@ static void uav_clear(Ctx *c, View *v, const UINT values[4], const FLOAT fvalues
     default: return;
   }
   const UINT bytes = clear_element(u->Format != DXGI_FORMAT_UNKNOWN ? u->Format : t->desc.Format, values, fvalues, floats, element);
+  if (t->planar) {      /* (a view of a plane: that plane of its slices) */
+    if (layers == (UINT)-1 || first + layers > t->desc.ArraySize) layers = first < t->desc.ArraySize ? t->desc.ArraySize - first : 0;
+    tex_before_write(d, t);
+    for (UINT k = first; k < first + layers; ++k) tex_plane_fill(d, t, v->plane, k, 0, 0, plane_width(t, v->plane), plane_height(t, v->plane), element, bytes);
+    return;
+  }
   if (!bytes || bytes != t->bpp || level >= t->desc.MipLevels) return;
   const UINT w = mip_size(t->desc.Width, level), h = mip_size(t->desc.Height, level);
   const UINT have = t->kind == 1 ? mip_size(t->slices, level) : t->desc.ArraySize;

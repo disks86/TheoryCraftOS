@@ -30,4 +30,14 @@ SRC="testsrc2=size=90x54:rate=30,noise=alls=12:allf=t+u,format=yuv420p" make odd
 # Field pictures, 16x8 and dual prime prediction, skipped macroblocks, B fields: streams ffmpeg's encoder cannot produce (see gen_mpeg2_synthetic.py)
 python3 "$(dirname "$0")/gen_mpeg2_synthetic.py" $out/mpeg2_syn
 for n in frames fields fields_bff; do ffmpeg -nostdin -hide_banner -loglevel error -y -idct simple -i $out/mpeg2_syn_$n.m2v -f rawvideo -pix_fmt yuv420p $out/mpeg2_syn_$n.yuv; done
-ls -l $out/mpeg2_*.m2v | awk '{print $5, $9}'
+# MPEG-1 (ISO/IEC 11172-2, no sequence extension): mpeg1_*.m1v and their pictures
+make1() {   # name, encoder options
+  local name=$1; shift
+  ffmpeg -nostdin -hide_banner -loglevel error -y -f lavfi -i "$src" -frames:v $n -c:v mpeg1video "$@" -f mpeg1video "$out/mpeg1_$name.m1v"
+  ffmpeg -nostdin -hide_banner -loglevel error -y -idct simple -i "$out/mpeg1_$name.m1v" -f rawvideo -pix_fmt yuv420p "$out/mpeg1_$name.yuv"
+}
+make1 ibp      -bf 2 -g 12 -qscale:v 3
+make1 highrate -bf 2 -g 12 -qscale:v 1
+make1 matrix   -intra_matrix 8,16,19,22,26,27,29,34,16,16,22,24,27,29,34,37,19,22,26,27,29,34,34,38,22,22,26,27,29,34,37,40,22,26,27,29,32,35,40,48,26,27,29,32,35,40,48,58,26,27,29,34,38,46,56,69,27,29,35,38,46,56,69,83 \
+               -bf 1 -g 12 -qscale:v 4
+ls -l $out/mpeg2_*.m2v $out/mpeg1_*.m1v | awk '{print $5, $9}'

@@ -27,7 +27,7 @@ cd "$(dirname "$0")/.."
 work=${TMPDIR:-/tmp}/tcos-vkx11
 mkdir -p "$work/obj"
 sources=(tests/EmulationRun.cpp src/Emulation/*.cpp src/Process/*.cpp src/Crypto/*.cpp src/Executable/*.cpp src/FileSystem/FileSystemTypes.cpp src/FileSystem/Ram/*.cpp src/Kernel/Sync.cpp
-         tests/KernelStubs.cpp src/Hardware/Keyboard/KeyCodes.cpp src/Process/Win32k/*.cpp src/Process/Win32k/Dxg/*.cpp src/Kernel/Dxgkrnl/*.cpp src/Math/FloatMath.cpp
+         tests/KernelStubs.cpp src/Hardware/Keyboard/KeyCodes.cpp src/Process/Win32k/*.cpp src/Process/Win32k/Dxg/*.cpp src/Kernel/Dxgkrnl/*.cpp src/Graphics/VirtGpu/VirtGpuSession.cpp src/Hardware/VideoCodec/Dxva/*.cpp src/Hardware/VideoCodec/VideoProcess.cpp src/Hardware/VideoCodec/Software/*.cpp src/Hardware/VideoCodec/ColorConvert.cpp src/Hardware/VideoCodec/VideoFrameBuffer.cpp src/Hardware/VideoCodec/VideoTypes.cpp src/Math/FloatMath.cpp
          src/Graphics/Graphics3D/BuiltinShaders.cpp src/Graphics/Graphics3D/Software/*.cpp src/Graphics/Graphics2D/Software/*.cpp src/Graphics/Graphics2D/Device/*.cpp
          src/Hardware/GraphicsProcessingUnit/Font8x16.cpp src/X11/*.cpp src/Kernel/Clipboard.cpp)
 flags="-std=c++20 -O1 -pthread -I src -w -DTCOS_EMU_DXG -DTCOS_EMU_X11"

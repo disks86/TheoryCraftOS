@@ -603,6 +603,108 @@ bool Core::receive(VideoFrame* frame) {
   return true;
 }
 
+// ---- decoding driven from outside (DXVA) ---------------------------------------------------------------------------------------------------------------------------
+
+void Core::external_prepare(const Sps& sps, const Pps& pps) {
+  if (picture_open_) finish_picture();
+  external_ = true;
+  active_sps_ = sps;
+  active_pps_ = pps;
+  sp_ = &active_sps_;
+  pp_ = &active_pps_;
+  cur_ = nullptr;
+  offloaded_ = false;
+}
+
+bool Core::external_grey(Picture* p, int poc) {
+  if (!external_ || !p || !alloc_picture(p)) return false;
+  for (int c = 0; c < 3; ++c)
+    for (uint64_t i = 0; i < p->plane[c].size(); ++i) p->plane[c][i] = 128;
+  for (uint64_t i = 0; i < p->col.size(); ++i) p->col[i].pred_flags = 0;
+  p->poc = poc;
+  p->generated = true;
+  p->in_use = p->is_ref = true;
+  p->is_long = p->needed_for_output = false;
+  return true;
+}
+
+bool Core::external_begin(const ExternalPicture& e) {
+  if (!external_ || !e.target || e.st_before_count < 0 || e.st_before_count > 8 || e.st_after_count < 0 || e.st_after_count > 8 || e.lt_count < 0 ||
+      e.lt_count > 8 || e.st_rps_bits < 0)
+    return H265_FALSE;
+  const Picture* refs[3][8];
+  for (int i = 0; i < 8; ++i) {
+    refs[0][i] = e.st_before[i];
+    refs[1][i] = e.st_after[i];
+    refs[2][i] = e.lt_curr[i];
+  }
+  const int counts[3] = {e.st_before_count, e.st_after_count, e.lt_count};
+  for (int set = 0; set < 3; ++set)
+    for (int i = 0; i < counts[set]; ++i) {
+      const Picture* r = refs[set][i];
+      // A reference must be a picture of this size other than the one being decoded (its motion is read per 16x16 block of this size).
+      if (!r || r == e.target || r->width != sp_->width || r->height != sp_->height || r->col.size() < e.target->col.size()) return H265_FALSE;
+    }
+  if (!setup_picture_state()) return H265_FALSE;
+  Picture* p = e.target;
+  if (!alloc_picture(p)) return H265_FALSE;
+  for (uint64_t i = 0; i < p->col.size(); ++i) p->col[i].pred_flags = 0;
+  p->poc = e.poc;
+  p->pts = 0;
+  p->in_use = p->is_ref = true;
+  p->is_long = p->generated = p->force_out = p->needed_for_output = false;
+  p->latency_count = 0;
+  p->order = decode_counter_++;
+  p->full_range = false;
+  poc_ = e.poc;
+  num_st_before_ = e.st_before_count;
+  num_st_after_ = e.st_after_count;
+  num_lt_curr_ = e.lt_count;
+  for (int i = 0; i < 16; ++i) {
+    rps_st_curr_before_[i] = i < e.st_before_count ? e.st_before[i] : nullptr;
+    rps_st_curr_after_[i] = i < e.st_after_count ? e.st_after[i] : nullptr;
+    rps_lt_curr_[i] = i < e.lt_count ? e.lt_curr[i] : nullptr;
+  }
+  external_total_curr_ = e.st_before_count + e.st_after_count + e.lt_count;
+  external_st_rps_bits_ = e.st_rps_bits;
+  cur_ = p;
+  picture_open_ = true;
+  pending_hash_.present = false;
+  ctx_end_valid_ = false;
+  wpp_saved_valid_ = false;
+  return true;
+}
+
+bool Core::external_slice(ConstByteView nal) {
+  if (!external_ || !picture_open_ || nal.size() < 3 || (nal[0] & 0x80)) return H265_FALSE;
+  const int type = (nal[0] >> 1) & 0x3F;
+  const int layer = ((nal[0] & 1) << 5) | (nal[1] >> 3);
+  const int tid = (nal[1] & 7) - 1;
+  const bool slice = type <= kRaslR || (type >= kBlaWLp && type <= kCra);
+  if (layer != 0 || tid < 0 || !slice) return H265_FALSE;
+  if (rbsp_.size() < nal.size() && !rbsp_.alloc(allocator_, nal.size() + 64)) return H265_FALSE;
+  const uint64_t n = h264::remove_emulation_prevention(nal.data() + 1, nal.size() - 1, rbsp_.data());
+  BitReader br;
+  br.init(rbsp_.data(), n);
+  SliceHeader sh;
+  current_nal_ = nal;
+  if (!parse_slice_header(br, type, tid, &sh)) return H265_FALSE;
+  // A second picture's first segment cannot come in the same call.
+  if (sh.first_slice_segment_in_pic && slices_.count() > 0) return H265_FALSE;
+  return decode_slice_data(sh, br);
+}
+
+bool Core::external_end() {
+  if (!external_ || !picture_open_) return false;
+  if (slices_.count() == 0) {
+    picture_open_ = false;
+    cur_ = nullptr;
+    return false;
+  }
+  finish_picture();
+  return true;
+}
+
 VideoFormat Core::output_format() const {
   VideoFormat f;
   if (sp_) {

@@ -419,11 +419,18 @@ bool Core::parse_slice_header(BitReader& br, int nal_type, int temporal_id, Slic
   sh.first_slice_segment_in_pic = br.u(1) != 0;
   if (nal_type >= kBlaWLp && nal_type <= 23) sh.no_output_of_prior_pics = br.u(1) != 0;
   const uint32_t pps_id = br.ue();
-  if (pps_id > 63 || !pps_[pps_id].valid) return H265_FALSE;
-  sh.pps_id = static_cast<int>(pps_id);
+  if (pps_id > 63) return H265_FALSE;
+  if (external_) {
+    // The parameter sets are the caller's, whatever number the slice gives (DXVA carries no parameter set ids).
+    if (!picture_open_) return H265_FALSE;
+    sh.pps_id = active_pps_.id;
+  } else {
+    if (!pps_[pps_id].valid) return H265_FALSE;
+    sh.pps_id = static_cast<int>(pps_id);
+  }
   // The slices after the first of a picture are read with the parameter sets the picture started with, whatever has been received since.
-  const bool continuing = picture_open_ && !sh.first_slice_segment_in_pic;
-  if (continuing && static_cast<int>(pps_id) != active_pps_.id) return H265_FALSE;
+  const bool continuing = external_ || (picture_open_ && !sh.first_slice_segment_in_pic);
+  if (continuing && !external_ && static_cast<int>(pps_id) != active_pps_.id) return H265_FALSE;
   const Pps& pps = continuing ? active_pps_ : pps_[pps_id];
   if (!continuing && !sps_[pps.sps_id].valid) return H265_FALSE;
   const Sps& sps = continuing ? active_sps_ : sps_[pps.sps_id];
@@ -454,10 +461,19 @@ bool Core::parse_slice_header(BitReader& br, int nal_type, int temporal_id, Slic
     if (!is_idr(nal_type)) {
       sh.poc_lsb = static_cast<int>(br.u(sps.log2_max_poc_lsb));
       const bool st_sps_flag = br.u(1) != 0;
+      sh.st_rps_sps_flag = st_sps_flag;
       if (!st_sps_flag) {
-        rps_ref_delta_pocs_ = 0;
-        if (!parse_st_rps(br, sps.num_st_rps, sps.num_st_rps, sps.st_rps, &sh.st_rps)) return H265_FALSE;
-        sh.num_delta_pocs_ref_rps_idx = rps_ref_delta_pocs_;
+        const uint64_t start = br.position();
+        if (external_) {
+          // The set itself comes with the picture; only its size is needed to find what follows.
+          for (int left = external_st_rps_bits_; left > 0; left -= 16) br.u(left < 16 ? left : 16);
+          if (br.error()) return H265_FALSE;
+        } else {
+          rps_ref_delta_pocs_ = 0;
+          if (!parse_st_rps(br, sps.num_st_rps, sps.num_st_rps, sps.st_rps, &sh.st_rps)) return H265_FALSE;
+          sh.num_delta_pocs_ref_rps_idx = rps_ref_delta_pocs_;
+        }
+        sh.st_rps_bits = static_cast<int>(br.position() - start);
       } else {
         int idx = 0;
         if (sps.num_st_rps > 1) idx = static_cast<int>(br.u(ceil_log2(static_cast<uint32_t>(sps.num_st_rps))));
@@ -499,6 +515,7 @@ bool Core::parse_slice_header(BitReader& br, int nal_type, int temporal_id, Slic
     for (int i = 0; i < sh.st_rps.num_negative; ++i) total += sh.st_rps.used_s0[i];
     for (int i = 0; i < sh.st_rps.num_positive; ++i) total += sh.st_rps.used_s1[i];
     for (int i = 0; i < sh.num_lt; ++i) total += sh.lt_used_by_curr[i];
+    if (external_) total = external_total_curr_;
     sh.num_pic_total_curr = total;
     if (sh.type != kSliceI) {
       sh.num_ref_idx[0] = pps.num_ref_idx_default[0];

@@ -53,6 +53,10 @@
 #include <d3d11on12.h>
 #include <d3d10_1.h>
 #include <d3d12.h>
+#include <d3d12video.h>
+#include "../d3d12/video_types.h"
+#include <dxva.h>
+#include "video_types.h"
 #include <dxgi1_3.h>
 #include <dxgi1_2.h>
 #include "../tcosdx.h"
@@ -164,6 +168,10 @@ struct Tex {
   IDXGIKeyedMutex dxgi_mutex;  /* ... and its keyed mutex (a texture made D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX, or opened with one: `keyed_mutex`) */
   UINT keyed_mutex;            /* the D3DKMT keyed mutex (0: none) */
   UINT global_share;           /* shared with a legacy handle (made SHARED / SHARED_KEYEDMUTEX without NTHANDLE, or opened by one): what GetSharedHandle answers */
+  /* A planar texture (NV12, P010, P016): the bytes of a luma sample (1 or 2; 0 for the other formats). Direct3D 12 below keeps each plane of each slice as a texture
+   * of its own (subresource plane * ArraySize + slice); here, as in Direct3D 11, a subresource is a slice with both planes: the CPU sees the luma rows and after them
+   * the rows of U, V pairs, at the same pitch (tex_rows counts both). */
+  UINT planar;
 };
 
 /* A render target, depth-stencil, shader resource or unordered access view: the texture (or buffer), and the descriptor of the first two. A view of a buffer names
@@ -185,6 +193,9 @@ typedef struct View {
   UINT level, layer, link_pitch, loaded_version;
   BOOL newer;
   struct View *next_rt;
+  /* a view of a planar texture: the plane it is of (its format: R8 / R8G8 or R16 / R16G16) and the slice */
+  DXGI_FORMAT plane_format;
+  UINT plane, array_slice;
   union { D3D11_RENDER_TARGET_VIEW_DESC rtv; D3D11_DEPTH_STENCIL_VIEW_DESC dsv; D3D11_SHADER_RESOURCE_VIEW_DESC srv; D3D11_UNORDERED_ACCESS_VIEW_DESC uav; } desc;
 } View;
 
@@ -319,6 +330,7 @@ typedef struct Ctx {
   struct Deferred *rec;               /* a deferred context: what it has recorded since the last FinishCommandList */
   struct CtxState *active;            /* SwapDeviceContextState: the context state object that is active (a reference; NULL: the device's own, not made yet) */
   BOOL hardware_protection;           /* SetHardwareProtectionState (device5.inc) */
+  ID3D11VideoContext3 video;          /* the immediate context's ID3D11VideoContext .. 3 (video.inc; a deferred context has none: NULL table) */
 } Ctx;
 #define CTX_OBJECTS_FIRST offsetof(Ctx, vs)
 #define CTX_OBJECTS_END (offsetof(Ctx, predicate) + sizeof(void *))
@@ -395,6 +407,8 @@ struct Dev {
   Ctx *ctx;
   StateObj *states[4];                     /* the state objects made, by kind (STATE_*): what CreateBlendState ... give again for the same description */
   struct RemovalWatch *removal;            /* RegisterDeviceRemovedEvent (device5.inc): the events to set when Direct3D 12 below loses the device */
+  ID3D11VideoDevice2 video;                /* the same object as ID3D11VideoDevice .. 2 (video.inc) */
+  struct VideoState *video_state;          /* ... and Direct3D 12's video below it (made when first needed) */
 };
 #define DIRTY_TARGETS 1u
 #define DIRTY_VIEWPORT 2u
@@ -472,6 +486,9 @@ extern const ID3D11DepthStencilStateVtbl depth_vtbl;
 extern const ID3D11RasterizerState2Vtbl raster_vtbl;
 extern const ID3D11SamplerStateVtbl sampler_vtbl;
 extern const ID3D11Query1Vtbl query_vtbl;
+extern const ID3D11VideoDevice2Vtbl vdev_vtbl;      /* (video.inc) */
+static void video_shutdown(Dev *d);
+extern const ID3D11VideoContext3Vtbl vctx_vtbl;
 
 static const GUID *const g_dev_iids[] = {&IID_ID3D11Device, NULL};
 static const GUID *const g_ctx_iids[] = {&IID_ID3D11DeviceChild, &IID_ID3D11DeviceContext, NULL};
@@ -727,17 +744,156 @@ static BOOL tex_d12_sub(const Tex *t, UINT sub, UINT *out) {
 }
 /* The bytes of a row of a level `w` pixels wide as the program has it (a row of blocks of a compressed format), and the rows of a level `h` high. */
 static UINT tex_pitch(const Tex *t, UINT w) { return t->block ? (w + 3) / 4 * t->block : w * t->bpp; }
-static UINT tex_rows(const Tex *t, UINT h) { return t->block ? (h + 3) / 4 : h; }
+static UINT tex_rows(const Tex *t, UINT h) { return t->block ? (h + 3) / 4 : t->planar ? h + (h + 1) / 2 : h; }      /* (a planar texture: the luma's rows and the chroma's) */
 /* The slices of a level of a volume (1 for the other kinds). */
 static UINT tex_slices(const Tex *t, UINT sub) { return t->kind == 1 ? mip_size(t->slices, sub % t->desc.MipLevels) : 1; }
 
 /* Sends rows of pixels (as the program has them, `pitch` bytes apart) into the rectangle (x, y, w, h) of a subresource. The list is sent with it. */
 static void tex_sync(Dev *d, Tex *t);      /* (rtshadow.inc) */
+/* ---- planar textures (NV12, P010, P016) ------------------------------------------------------------------------------------------------------------------ */
+
+/* The bytes of a texel of a plane: a luma sample, or a U, V pair. A plane's size: the luma's is the texture's, the chroma's half of it both ways (the sizes are even). */
+static UINT plane_texel(const Tex *t, UINT plane) { return plane ? 2 * t->planar : t->planar; }
+static UINT plane_width(const Tex *t, UINT plane) { return plane ? t->desc.Width / 2 : t->desc.Width; }
+static UINT plane_height(const Tex *t, UINT plane) { return plane ? t->desc.Height / 2 : t->desc.Height; }
+/* The Direct3D 12 subresource of a plane of a slice. */
+static UINT plane_sub(const Tex *t, UINT plane, UINT slice) { return plane * t->desc.ArraySize + slice; }
+
+/* Rows of a plane's texels (`pitch` bytes apart) into the rectangle (x, y, w, h) of that plane of a slice, in the plane's texels: a copy from upload memory recorded in
+ * order with the draws (as tex_write_rows does). The rectangle is inside the plane (the callers clip it). */
+static HRESULT tex_plane_write(Dev *d, Tex *t, UINT plane, UINT slice, UINT x, UINT y, UINT w, UINT h, const BYTE *rows, UINT pitch) {
+  if (!w || !h) return S_OK;
+  const UINT row_bytes = w * plane_texel(t, plane), row_pitch = (row_bytes + 255u) & ~255u;
+  settle(d, t->sampled);      /* (a texture the list sampled is not copied into in the same list) */
+  const UINT64 upload_bytes = (UINT64)row_pitch * h;
+  if (!retire_room(d, upload_bytes)) flush(d);
+  BYTE *memory = NULL;
+  UINT64 upload_size = 0;
+  ID3D12Resource *upload = take_upload(d, upload_bytes, &memory, &upload_size);
+  if (!upload) return E_OUTOFMEMORY;
+  for (UINT row = 0; row < h; ++row) memcpy(memory + (SIZE_T)row * row_pitch, rows + (SIZE_T)row * pitch, row_bytes);
+  ID3D12Resource_Unmap(upload, 0, NULL);
+  D3D12_TEXTURE_COPY_LOCATION to, from;
+  memset(&to, 0, sizeof to);
+  memset(&from, 0, sizeof from);
+  to.pResource = t->res;
+  to.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+  to.SubresourceIndex = plane_sub(t, plane, slice);
+  from.pResource = upload;
+  from.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+  from.PlacedFootprint.Footprint.Format = plane_format_of(t->desc.Format, plane);
+  from.PlacedFootprint.Footprint.Width = w;
+  from.PlacedFootprint.Footprint.Height = h;
+  from.PlacedFootprint.Footprint.Depth = 1;
+  from.PlacedFootprint.Footprint.RowPitch = row_pitch;
+  ID3D12GraphicsCommandList_CopyTextureRegion(d->list, &to, x, y, 0, &from, NULL);
+  d->recorded = 1;
+  ++t->version;
+  t->used = t->written = d->epoch;
+  retire(d, upload, NULL, upload_size);
+  return S_OK;
+}
+/* The rectangle (x, y, w, h) of a slice, in luma pixels on whole 2 x 2 blocks: `rows` has its luma rows and after them (h rows on) its rows of U, V pairs, `pitch` bytes
+ * apart. */
+static HRESULT tex_planar_write(Dev *d, Tex *t, UINT slice, UINT x, UINT y, UINT w, UINT h, const BYTE *rows, UINT pitch) {
+  if (slice >= t->desc.ArraySize || (x | y | w | h) & 1 || x > t->desc.Width || y > t->desc.Height || w > t->desc.Width - x || h > t->desc.Height - y) return E_INVALIDARG;
+  HRESULT hr = tex_plane_write(d, t, 0, slice, x, y, w, h, rows, pitch);
+  if (SUCCEEDED(hr)) hr = tex_plane_write(d, t, 1, slice, x / 2, y / 2, w / 2, h / 2, rows + (SIZE_T)pitch * h, pitch);
+  return hr;
+}
+/* A whole slice, both planes, as the CPU sees it (the luma's rows, then the chroma's, `pitch` bytes apart), after everything recorded before (the list is sent). */
+static HRESULT tex_planar_read(Dev *d, Tex *t, UINT slice, BYTE *rows, UINT pitch) {
+  if (slice >= t->desc.ArraySize) return E_INVALIDARG;
+  UINT64 offsets[2], total = 0;
+  UINT pitches[2];
+  for (UINT plane = 0; plane < 2; ++plane) {
+    pitches[plane] = (plane_width(t, plane) * plane_texel(t, plane) + 255u) & ~255u;
+    offsets[plane] = total;
+    total += ((UINT64)pitches[plane] * plane_height(t, plane) + 511u) & ~(UINT64)511u;      /* (a footprint's placement: 512-byte aligned) */
+  }
+  ID3D12Resource *readback = make_buffer(d, D3D12_HEAP_TYPE_READBACK, total);
+  if (!readback) return E_OUTOFMEMORY;
+  settle(d, t->written);      /* (... nor read in the list that wrote it) */
+  for (UINT plane = 0; plane < 2; ++plane) {
+    D3D12_TEXTURE_COPY_LOCATION to, from;
+    memset(&to, 0, sizeof to);
+    memset(&from, 0, sizeof from);
+    to.pResource = readback;
+    to.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    to.PlacedFootprint.Offset = offsets[plane];
+    to.PlacedFootprint.Footprint.Format = plane_format_of(t->desc.Format, plane);
+    to.PlacedFootprint.Footprint.Width = plane_width(t, plane);
+    to.PlacedFootprint.Footprint.Height = plane_height(t, plane);
+    to.PlacedFootprint.Footprint.Depth = 1;
+    to.PlacedFootprint.Footprint.RowPitch = pitches[plane];
+    from.pResource = t->res;
+    from.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    from.SubresourceIndex = plane_sub(t, plane, slice);
+    ID3D12GraphicsCommandList_CopyTextureRegion(d->list, &to, 0, 0, 0, &from, NULL);
+  }
+  d->recorded = 1;
+  t->used = d->epoch;
+  flush(d);
+  const BYTE *memory = NULL;
+  HRESULT hr = ID3D12Resource_Map(readback, 0, NULL, (void **)&memory);
+  if (SUCCEEDED(hr) && memory) {
+    BYTE *at = rows;
+    for (UINT plane = 0; plane < 2; ++plane) {
+      const UINT row_bytes = plane_width(t, plane) * plane_texel(t, plane);
+      for (UINT row = 0; row < plane_height(t, plane); ++row, at += pitch) memcpy(at, memory + offsets[plane] + (SIZE_T)row * pitches[plane], row_bytes);
+    }
+    ID3D12Resource_Unmap(readback, 0, NULL);
+  } else if (SUCCEEDED(hr)) hr = E_FAIL;
+  ID3D12Resource_Release(readback);
+  return hr;
+}
+/* One texel value (`bytes` of it) in the rectangle (x0, y0) .. (x1, y1) of a plane of a slice, in the plane's texels (clipped to the plane). */
+static void tex_plane_fill(Dev *d, Tex *t, UINT plane, UINT slice, UINT x0, UINT y0, UINT x1, UINT y1, const BYTE *element, UINT bytes) {
+  if (x1 > plane_width(t, plane)) x1 = plane_width(t, plane);
+  if (y1 > plane_height(t, plane)) y1 = plane_height(t, plane);
+  if (bytes != plane_texel(t, plane) || x0 >= x1 || y0 >= y1 || slice >= t->desc.ArraySize) return;
+  const UINT w = x1 - x0, h = y1 - y0;
+  BYTE *fill = mem_alloc((SIZE_T)w * h * bytes);
+  if (!fill) return;
+  for (SIZE_T at = 0; at < (SIZE_T)w * h * bytes; at += bytes) memcpy(fill + at, element, bytes);
+  tex_plane_write(d, t, plane, slice, x0, y0, w, h, fill, w * bytes);
+  mem_free(fill);
+}
+/* A box of a slice of one planar texture into another of the same format, both planes, as copies the list makes. Direct3D 11 copies nothing when the box or the place is
+ * not on whole 2 x 2 blocks of luma (the chroma's samples). */
+static void tex_planar_copy(Dev *d, Tex *to, UINT to_slice, UINT x, UINT y, Tex *from, UINT from_slice, const D3D11_BOX *box) {
+  const UINT x0 = box ? box->left : 0, y0 = box ? box->top : 0, x1 = box ? box->right : from->desc.Width, y1 = box ? box->bottom : from->desc.Height;
+  if (to->desc.Format != from->desc.Format || to_slice >= to->desc.ArraySize || from_slice >= from->desc.ArraySize || (to == from && to_slice == from_slice)) return;
+  if (x0 >= x1 || y0 >= y1 || x1 > from->desc.Width || y1 > from->desc.Height || (box && (box->front != 0 || box->back != 1))) return;
+  if ((x0 | y0 | x1 | y1 | x | y) & 1) return;
+  if (x > to->desc.Width || y > to->desc.Height || x1 - x0 > to->desc.Width - x || y1 - y0 > to->desc.Height - y) return;
+  settle(d, to->sampled);
+  settle(d, from->written);
+  for (UINT plane = 0; plane < 2; ++plane) {
+    const UINT s = plane ? 2 : 1;
+    D3D12_TEXTURE_COPY_LOCATION dst, src;
+    memset(&dst, 0, sizeof dst);
+    memset(&src, 0, sizeof src);
+    dst.pResource = to->res;
+    dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    dst.SubresourceIndex = plane_sub(to, plane, to_slice);
+    src.pResource = from->res;
+    src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    src.SubresourceIndex = plane_sub(from, plane, from_slice);
+    const D3D12_BOX region = {x0 / s, y0 / s, 0, x1 / s, y1 / s, 1};
+    ID3D12GraphicsCommandList_CopyTextureRegion(d->list, &dst, x / s, y / s, 0, &src, &region);
+  }
+  ++to->version;
+  to->used = from->used = to->written = d->epoch;
+  d->recorded = 1;
+}
+
 /* `raw`: the rows are in the stored format (GenerateMips), not the program's. */
 static HRESULT tex_write_rows(Dev *d, Tex *t, UINT sub, UINT x, UINT y, UINT z, UINT w, UINT h, const BYTE *rows, UINT pitch, BOOL raw);
 static HRESULT tex_write(Dev *d, Tex *t, UINT sub, UINT x, UINT y, UINT z, UINT w, UINT h, const BYTE *rows, UINT pitch) { return tex_write_rows(d, t, sub, x, y, z, w, h, rows, pitch, FALSE); }
 static HRESULT tex_write_rows(Dev *d, Tex *t, UINT sub, UINT x, UINT y, UINT z, UINT w, UINT h, const BYTE *rows, UINT pitch, BOOL raw) {
   if (t->depth || w == 0 || h == 0) return E_INVALIDARG;
+  if (t->planar) return tex_planar_write(d, t, sub, x, y, w, h, rows, pitch);      /* (both planes of the slice: `rows` has the chroma after the luma) */
   tex_sync(d, t);      /* (what views drew into it goes in first: this write comes after) */
   ++t->version;
   UINT d12_sub;
@@ -784,6 +940,7 @@ static HRESULT tex_read(Dev *d, Tex *t, UINT sub, UINT z, BYTE *rows) { return t
 /* `raw`: rows of `w * stored_bpp` bytes in the stored format. */
 static HRESULT tex_read_rows(Dev *d, Tex *t, UINT sub, UINT z, BYTE *rows, BOOL raw) {
   if (t->depth) return E_INVALIDARG;
+  if (t->planar) return tex_planar_read(d, t, sub, rows, tex_pitch(t, t->desc.Width));
   tex_sync(d, t);
   const UINT level = sub % t->desc.MipLevels, w = mip_size(t->desc.Width, level), h = mip_size(t->desc.Height, level);
   UINT d12_sub;
@@ -903,6 +1060,18 @@ static HRESULT tex_make(Dev *d, const D3D11_TEXTURE2D_DESC *in, UINT slices, ID3
       ((bind & D3D11_BIND_DEPTH_STENCIL) && (bind & (D3D11_BIND_RENDER_TARGET | D3D11_BIND_UNORDERED_ACCESS))))
     return E_INVALIDARG;
   if ((desc.MiscFlags & D3D11_RESOURCE_MISC_SHARED) && (desc.MiscFlags & D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX)) return E_INVALIDARG;
+  /* (what a video encoder reads: there is no encoder - no format has D3D11_FORMAT_SUPPORT_VIDEO_ENCODER -; what a decoder writes: the formats the decoders put out) */
+  const TexFormat *made_format = tex_format(desc.Format);
+  const BOOL planar = made_format && (made_format->flags & FMT_PLANAR);
+  if (bind & D3D11_BIND_VIDEO_ENCODER) return E_INVALIDARG;
+  if ((bind & D3D11_BIND_DECODER) && desc.Format != DXGI_FORMAT_NV12 && desc.Format != DXGI_FORMAT_P010) return E_INVALIDARG;
+  if (planar) {
+    /* NV12, P010, P016: a 2D texture or array of one level, of even width and height (the chroma is half of both), not multisampled, not a depth buffer, a cube or
+     * shared (D3D11_FEATURE_D3D11_OPTIONS4: no shared NV12); the CPU reaches one of a single slice (as on Windows, which has no CPU access to arrays of them) */
+    if (slices || (desc.Width & 1) || (desc.Height & 1) || desc.MipLevels != 1 || desc.SampleDesc.Count != 1 || desc.SampleDesc.Quality || desc.MiscFlags ||
+        (bind & D3D11_BIND_DEPTH_STENCIL) || ((desc.Usage == D3D11_USAGE_DYNAMIC || desc.Usage == D3D11_USAGE_STAGING) && desc.ArraySize != 1))
+      return E_INVALIDARG;
+  }
   if (desc.MiscFlags & (D3D11_RESOURCE_MISC_TILED | D3D11_RESOURCE_MISC_TILE_POOL)) return E_INVALIDARG;      /* (TiledResourcesTier NOT_SUPPORTED) */
   /* (shared through NT handles: with SHARED or SHARED_KEYEDMUTEX, in GPU memory) */
   const BOOL nt_shared = !res && (desc.MiscFlags & D3D11_RESOURCE_MISC_SHARED_NTHANDLE) != 0;
@@ -928,11 +1097,11 @@ static HRESULT tex_make(Dev *d, const D3D11_TEXTURE2D_DESC *in, UINT slices, ID3
   if (desc.ArraySize > 256) { tex_refused(&desc, "an array of more than 256"); return E_INVALIDARG; }
   const BOOL layered = cube || slices || desc.ArraySize > 1;
   /* (a render target of levels or layers: the kernel draws into images of one level and one layer, so the texture is drawn into through targets of its own) */
-  const BOOL shadowed = !res && (desc.BindFlags & D3D11_BIND_RENDER_TARGET) && desc.SampleDesc.Count == 1 && (desc.MipLevels != 1 || layered);
+  const BOOL shadowed = !res && !planar && (desc.BindFlags & D3D11_BIND_RENDER_TARGET) && desc.SampleDesc.Count == 1 && (desc.MipLevels != 1 || layered);
   /* (a format that cannot be had for that use: refused as such, before what the kernel cannot do) */
   if (!tex_format_for(desc.Format, desc.BindFlags) && !(res && tex_format(desc.Format))) { tex_refused(&desc, "the format, for that use"); return E_INVALIDARG; }
   /* (the kernel samples volumes, arrays and cubes; it does not draw into them, nor give unordered access to textures; a depth buffer is drawn into whole) */
-  if (layered && (desc.BindFlags & (D3D11_BIND_DEPTH_STENCIL | D3D11_BIND_UNORDERED_ACCESS))) {
+  if (layered && !planar && (desc.BindFlags & (D3D11_BIND_DEPTH_STENCIL | D3D11_BIND_UNORDERED_ACCESS))) {
     tex_refused(&desc, slices ? "a volume to draw into" : cube ? "a cube to draw into" : "an array to draw into");
     return DXGI_ERROR_UNSUPPORTED;
   }
@@ -957,11 +1126,12 @@ static HRESULT tex_make(Dev *d, const D3D11_TEXTURE2D_DESC *in, UINT slices, ID3
   if (!t) return E_OUTOFMEMORY;
   tex_dxgi_init(t);
   t->desc = desc;
-  t->kind = slices ? 1 : cube ? 3 : desc.ArraySize > 1 ? 2 : 0;
+  t->kind = slices ? 1 : cube ? 3 : desc.ArraySize > 1 && !planar ? 2 : 0;      /* (a planar array: each slice an image of its own below) */
   t->shadowed = shadowed;
   t->version = 1;
   t->slices = slices ? slices : 1;
   t->kmips = layered ? 1 : desc.MipLevels;      /* (the kernel's volumes, arrays and cubes have one level: the program's others are dropped) */
+  t->planar = planar ? made_format->bpp : 0;
   t->fmt = tex_format_for(desc.Format, desc.BindFlags);
   if (!t->fmt) { tex_refused(&desc, "the format, for that use"); dx_Release(OBJ(t)); return E_INVALIDARG; }
   t->stored = t->fmt->stored;
@@ -1179,15 +1349,36 @@ static BOOL buffer_view_range(const Buf *b, DXGI_FORMAT format, BOOL raw, UINT f
   return TRUE;
 }
 
+/* The plane and slice a view of a planar texture is of. Its format names the plane (R8 / R16 the luma, R8G8 / R16G16 U and V; `plane_slice`, a *1 description's, must
+ * be that one, -1: none given); a 2D view is of the first slice, a 2D array view of one level of its first (the kernel's view of a plane is one image). FALSE for any
+ * other view - of the planar format itself, of no format, of a level but the first: Direct3D 11 makes a view of a planar texture of one plane. */
+static BOOL planar_view(const Tex *t, DXGI_FORMAT format, INT plane_slice, BOOL array, UINT mip, UINT levels, UINT first, UINT size, UINT *plane, UINT *slice) {
+  if (!plane_of_view_format(t->desc.Format, format, plane) || (plane_slice >= 0 && (UINT)plane_slice != *plane) || mip != 0 || (levels != 1 && levels != (UINT)-1)) return FALSE;
+  *slice = 0;
+  if (!array) return TRUE;
+  if (first >= t->desc.ArraySize || size == 0 || (size != (UINT)-1 && size > t->desc.ArraySize - first)) return FALSE;
+  *slice = first;
+  return TRUE;
+}
+
 static BOOL rtv_subresource(const Tex *t, const D3D11_RENDER_TARGET_VIEW_DESC *desc, UINT *level, UINT *layer);
 static HRESULT rtv_shadow_make(Dev *d, View *v, UINT level, UINT layer);
-static HRESULT STDMETHODCALLTYPE dev_CreateRenderTargetView(Dev *d, ID3D11Resource *resource, const D3D11_RENDER_TARGET_VIEW_DESC *desc, ID3D11RenderTargetView **out) {
+static HRESULT rtv_create(Dev *d, ID3D11Resource *resource, const D3D11_RENDER_TARGET_VIEW_DESC *desc, INT plane_slice, ID3D11RenderTargetView **out) {
   if (out) *out = NULL;
   Tex *t = tex_of_resource(resource);
   if (!t || !(t->desc.BindFlags & D3D11_BIND_RENDER_TARGET)) return E_INVALIDARG;
-  UINT level = 0, layer = 0;
-  if (desc && !rtv_subresource(t, desc, &level, &layer)) return E_INVALIDARG;
-  if (!t->shadowed && (level || layer)) return E_INVALIDARG;
+  UINT level = 0, layer = 0, plane = 0;
+  if (t->planar) {
+    if (!desc || (desc->ViewDimension != D3D11_RTV_DIMENSION_TEXTURE2D && desc->ViewDimension != D3D11_RTV_DIMENSION_TEXTURE2DARRAY)) return E_INVALIDARG;
+    const BOOL array = desc->ViewDimension == D3D11_RTV_DIMENSION_TEXTURE2DARRAY;
+    if (!planar_view(t, desc->Format, plane_slice, array, array ? desc->Texture2DArray.MipSlice : desc->Texture2D.MipSlice, 1, array ? desc->Texture2DArray.FirstArraySlice : 0,
+                     array ? desc->Texture2DArray.ArraySize : 1, &plane, &layer))
+      return E_INVALIDARG;
+  } else {
+    if (plane_slice > 0) return E_INVALIDARG;      /* (a format of one plane) */
+    if (desc && !rtv_subresource(t, desc, &level, &layer)) return E_INVALIDARG;
+    if (!t->shadowed && (level || layer)) return E_INVALIDARG;
+  }
   EnterCriticalSection(&d->lock);
   if (d->rtv_free_count == 0) { LeaveCriticalSection(&d->lock); return E_OUTOFMEMORY; }
   View *v = child_new(sizeof *v, d, &rtv_vtbl, g_rtv_iids, rtv_destroy);
@@ -1202,7 +1393,27 @@ static HRESULT STDMETHODCALLTYPE dev_CreateRenderTargetView(Dev *d, ID3D11Resour
   v->handle.ptr += (SIZE_T)v->slot * ID3D12Device_GetDescriptorHandleIncrementSize(d->d12, D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
   v->width = mip_size(t->desc.Width, level);
   v->height = mip_size(t->desc.Height, level);
-  if (t->shadowed) {
+  if (t->planar) {
+    /* (a plane of a slice: an image of its own below, the size of the plane) */
+    v->plane_format = desc->Format;
+    v->plane = plane;
+    v->array_slice = layer;
+    v->width = plane_width(t, plane);
+    v->height = plane_height(t, plane);
+    D3D12_RENDER_TARGET_VIEW_DESC r;
+    memset(&r, 0, sizeof r);
+    r.Format = desc->Format;
+    if (t->desc.ArraySize > 1) {
+      r.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2DARRAY;
+      r.Texture2DArray.FirstArraySlice = layer;
+      r.Texture2DArray.ArraySize = 1;
+      r.Texture2DArray.PlaneSlice = plane;
+    } else {
+      r.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
+      r.Texture2D.PlaneSlice = plane;
+    }
+    ID3D12Device_CreateRenderTargetView(d->d12, t->res, &r, v->handle);
+  } else if (t->shadowed) {
     EnterCriticalSection(&d->lock);
     const HRESULT hr = rtv_shadow_make(d, v, level, layer);
     LeaveCriticalSection(&d->lock);
@@ -1214,6 +1425,9 @@ static HRESULT STDMETHODCALLTYPE dev_CreateRenderTargetView(Dev *d, ID3D11Resour
     ID3D12Device_CreateRenderTargetView(d->d12, t->res, &ms, v->handle);
   } else ID3D12Device_CreateRenderTargetView(d->d12, t->res, NULL, v->handle);
   return give(v, (void **)out);
+}
+static HRESULT STDMETHODCALLTYPE dev_CreateRenderTargetView(Dev *d, ID3D11Resource *resource, const D3D11_RENDER_TARGET_VIEW_DESC *desc, ID3D11RenderTargetView **out) {
+  return rtv_create(d, resource, desc, -1, out);
 }
 static HRESULT STDMETHODCALLTYPE dev_CreateDepthStencilView(Dev *d, ID3D11Resource *resource, const D3D11_DEPTH_STENCIL_VIEW_DESC *desc, ID3D11DepthStencilView **out) {
   if (out) *out = NULL;
@@ -1271,17 +1485,28 @@ static HRESULT srv_of_buffer(Dev *d, Buf *b, const D3D11_SHADER_RESOURCE_VIEW_DE
   return give(v, (void **)out);
 }
 
-static HRESULT STDMETHODCALLTYPE dev_CreateShaderResourceView(Dev *d, ID3D11Resource *resource, const D3D11_SHADER_RESOURCE_VIEW_DESC *desc, ID3D11ShaderResourceView **out) {
+static HRESULT srv_create(Dev *d, ID3D11Resource *resource, const D3D11_SHADER_RESOURCE_VIEW_DESC *desc, INT plane_slice, ID3D11ShaderResourceView **out) {
   if (out) *out = NULL;
   Buf *b = buf_of_resource(resource);
-  if (b) return srv_of_buffer(d, b, desc, out);
+  if (b) return plane_slice > 0 ? E_INVALIDARG : srv_of_buffer(d, b, desc, out);
   Tex *t = tex_of_resource(resource);
   if (!t) return E_INVALIDARG;
   if (!(t->desc.BindFlags & D3D11_BIND_SHADER_RESOURCE)) return E_INVALIDARG;      /* (a depth buffer made to be read too has one: ANGLE makes them for its depth renderbuffers) */
+  UINT plane = 0, slice = 0;
+  if (t->planar) {
+    if (!desc || (desc->ViewDimension != D3D11_SRV_DIMENSION_TEXTURE2D && desc->ViewDimension != D3D11_SRV_DIMENSION_TEXTURE2DARRAY)) return E_INVALIDARG;
+    const BOOL array = desc->ViewDimension == D3D11_SRV_DIMENSION_TEXTURE2DARRAY;
+    if (!planar_view(t, desc->Format, plane_slice, array, array ? desc->Texture2DArray.MostDetailedMip : desc->Texture2D.MostDetailedMip,
+                     array ? desc->Texture2DArray.MipLevels : desc->Texture2D.MipLevels, array ? desc->Texture2DArray.FirstArraySlice : 0, array ? desc->Texture2DArray.ArraySize : 1,
+                     &plane, &slice))
+      return E_INVALIDARG;
+  } else if (plane_slice > 0) return E_INVALIDARG;      /* (a format of one plane) */
+  if (!out) return S_FALSE;
   View *v = child_new(sizeof *v, d, &srv_vtbl, g_srv_iids, srv_destroy);
   if (!v) return E_OUTOFMEMORY;
   hold(t);      /* (a view's reference to its resource is the runtime's) */
   v->tex = t;
+  if (t->planar) { v->plane_format = desc->Format; v->plane = plane; v->array_slice = slice; }
   if (desc) v->desc.srv = *desc;
   else {
     /* (the whole texture, as what it is) */
@@ -1298,10 +1523,13 @@ static HRESULT STDMETHODCALLTYPE dev_CreateShaderResourceView(Dev *d, ID3D11Reso
   }
   return give(v, (void **)out);
 }
+static HRESULT STDMETHODCALLTYPE dev_CreateShaderResourceView(Dev *d, ID3D11Resource *resource, const D3D11_SHADER_RESOURCE_VIEW_DESC *desc, ID3D11ShaderResourceView **out) {
+  return srv_create(d, resource, desc, -1, out);
+}
 
 /* An unordered access view. Of a buffer: raw (R32_TYPELESS, a buffer that allows raw views), structured (UNKNOWN; an append or counter view has a hidden count), or
  * typed. Of a texture: the view is made, but the kernel has no unordered access to textures, and a shader that declares one is refused (docs/Direct3D11.md). */
-static HRESULT STDMETHODCALLTYPE dev_CreateUnorderedAccessView(Dev *d, ID3D11Resource *resource, const D3D11_UNORDERED_ACCESS_VIEW_DESC *desc, ID3D11UnorderedAccessView **out) {
+static HRESULT uav_create(Dev *d, ID3D11Resource *resource, const D3D11_UNORDERED_ACCESS_VIEW_DESC *desc, INT plane_slice, ID3D11UnorderedAccessView **out) {
   extern const ID3D11UnorderedAccessView1Vtbl uav_vtbl;
   static const GUID *const iids[] = {&IID_ID3D11DeviceChild, &IID_ID3D11View, &IID_ID3D11UnorderedAccessView, &IID_ID3D11UnorderedAccessView1, NULL};
   if (out) *out = NULL;
@@ -1326,7 +1554,20 @@ static HRESULT STDMETHODCALLTYPE dev_CreateUnorderedAccessView(Dev *d, ID3D11Res
     if ((flags & D3D11_BUFFER_UAV_FLAG_APPEND) && (flags & D3D11_BUFFER_UAV_FLAG_COUNTER)) return E_INVALIDARG;
     if ((flags & (D3D11_BUFFER_UAV_FLAG_APPEND | D3D11_BUFFER_UAV_FLAG_COUNTER)) && !(b->desc.MiscFlags & D3D11_RESOURCE_MISC_BUFFER_STRUCTURED)) return E_INVALIDARG;
     if (!buffer_view_range(b, desc->Format, (flags & D3D11_BUFFER_UAV_FLAG_RAW) != 0, desc->Buffer.FirstElement, desc->Buffer.NumElements, &probe)) return E_INVALIDARG;
+  } else if (t->planar) {
+    /* (a plane of a slice, as the other views of a planar texture) */
+    if (!(t->desc.BindFlags & D3D11_BIND_UNORDERED_ACCESS) || !desc || (desc->ViewDimension != D3D11_UAV_DIMENSION_TEXTURE2D && desc->ViewDimension != D3D11_UAV_DIMENSION_TEXTURE2DARRAY))
+      return E_INVALIDARG;
+    const BOOL array = desc->ViewDimension == D3D11_UAV_DIMENSION_TEXTURE2DARRAY;
+    UINT plane = 0, slice = 0;
+    if (!planar_view(t, desc->Format, plane_slice, array, array ? desc->Texture2DArray.MipSlice : desc->Texture2D.MipSlice, 1, array ? desc->Texture2DArray.FirstArraySlice : 0,
+                     array ? desc->Texture2DArray.ArraySize : 1, &plane, &slice))
+      return E_INVALIDARG;
+    probe.plane_format = desc->Format;
+    probe.plane = plane;
+    probe.array_slice = slice;
   } else {
+    if (plane_slice > 0) return E_INVALIDARG;      /* (a format of one plane) */
     if (!(t->desc.BindFlags & D3D11_BIND_UNORDERED_ACCESS)) return E_INVALIDARG;
     if (!desc) {
       whole.Format = t->desc.Format;
@@ -1349,8 +1590,14 @@ static HRESULT STDMETHODCALLTYPE dev_CreateUnorderedAccessView(Dev *d, ID3D11Res
   v->size = probe.size;
   v->stride = probe.stride;
   v->format = probe.format;
+  v->plane_format = probe.plane_format;
+  v->plane = probe.plane;
+  v->array_slice = probe.array_slice;
   v->desc.uav = *desc;
   return give(v, (void **)out);
+}
+static HRESULT STDMETHODCALLTYPE dev_CreateUnorderedAccessView(Dev *d, ID3D11Resource *resource, const D3D11_UNORDERED_ACCESS_VIEW_DESC *desc, ID3D11UnorderedAccessView **out) {
+  return uav_create(d, resource, desc, -1, out);
 }
 
 /* ---- shaders, layouts and states ------------------------------------------------------------------------------------------------------------------- */
@@ -1901,4 +2148,5 @@ static const ID3D11On12Device1Vtbl g_on12_vtbl;
 #include "interop.inc"
 #include "dxgi_resource.inc"
 #include "device5.inc"
+#include "video.inc"
 #include "vtbl.inc"

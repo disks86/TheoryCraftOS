@@ -141,7 +141,10 @@ extern const ITcosPresenterVtbl pres_vtbl;
 
 static HRESULT STDMETHODCALLTYPE dev_CreateCommandQueue(Dev *This, const D3D12_COMMAND_QUEUE_DESC *desc, REFIID riid, void **out) {
   extern const ID3D12CommandQueueVtbl queue_vtbl;
-  if (!desc || (desc->Type != D3D12_COMMAND_LIST_TYPE_DIRECT && desc->Type != D3D12_COMMAND_LIST_TYPE_COMPUTE && desc->Type != D3D12_COMMAND_LIST_TYPE_COPY)) return E_INVALIDARG;
+  /* (the video queues: decode and process; video encoding is not there - D3D12_FEATURE_VIDEO_FEATURE_AREA_SUPPORT says so) */
+  if (!desc || (desc->Type != D3D12_COMMAND_LIST_TYPE_DIRECT && desc->Type != D3D12_COMMAND_LIST_TYPE_COMPUTE && desc->Type != D3D12_COMMAND_LIST_TYPE_COPY &&
+                desc->Type != D3D12_COMMAND_LIST_TYPE_VIDEO_DECODE && desc->Type != D3D12_COMMAND_LIST_TYPE_VIDEO_PROCESS))
+    return E_INVALIDARG;
   Queue *q = dobj_new(sizeof *q, This, &queue_vtbl, g_queue_iids, queue_destroy);
   if (!q) return E_OUTOFMEMORY;
   InitializeCriticalSection(&q->lock);

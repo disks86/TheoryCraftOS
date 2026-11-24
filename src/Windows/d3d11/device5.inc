@@ -255,9 +255,10 @@ static void STDMETHODCALLTYPE query_GetDesc1(Query *q, D3D11_QUERY_DESC1 *desc) 
   desc->ContextType = q->context_type;
 }
 
-/* The *1 views: the descriptions of Direct3D 11.0 with a plane slice in the two-dimensional members. Every format here has one plane, so the slice is 0 (any other
- * is E_INVALIDARG, as for a format of one plane on Windows); the views are made, and kept, as their 11.0 descriptions. Every view has the *1 interface. */
-static BOOL rtv_desc_plain(const D3D11_RENDER_TARGET_VIEW_DESC1 *in, D3D11_RENDER_TARGET_VIEW_DESC *out) {
+/* The *1 views: the descriptions of Direct3D 11.0 with a plane slice in the two-dimensional members. A planar texture's (NV12, P010, P016) view is of the plane its
+ * format names, and the plane slice must be that one; every other format has one plane, so the slice is 0 (any other is E_INVALIDARG, as for a format of one plane on
+ * Windows). The views are made, and kept, as their 11.0 descriptions with the plane (View.plane). Every view has the *1 interface. */
+static BOOL rtv_desc_plain(const D3D11_RENDER_TARGET_VIEW_DESC1 *in, D3D11_RENDER_TARGET_VIEW_DESC *out, INT *plane) {
   memset(out, 0, sizeof *out);
   out->Format = in->Format;
   out->ViewDimension = in->ViewDimension;
@@ -267,12 +268,14 @@ static BOOL rtv_desc_plain(const D3D11_RENDER_TARGET_VIEW_DESC1 *in, D3D11_RENDE
     case D3D11_RTV_DIMENSION_TEXTURE1DARRAY: out->Texture1DArray = in->Texture1DArray; return TRUE;
     case D3D11_RTV_DIMENSION_TEXTURE2D:
       out->Texture2D.MipSlice = in->Texture2D.MipSlice;
-      return in->Texture2D.PlaneSlice == 0;
+      *plane = (INT)in->Texture2D.PlaneSlice;
+      return in->Texture2D.PlaneSlice < 2;
     case D3D11_RTV_DIMENSION_TEXTURE2DARRAY:
       out->Texture2DArray.MipSlice = in->Texture2DArray.MipSlice;
       out->Texture2DArray.FirstArraySlice = in->Texture2DArray.FirstArraySlice;
       out->Texture2DArray.ArraySize = in->Texture2DArray.ArraySize;
-      return in->Texture2DArray.PlaneSlice == 0;
+      *plane = (INT)in->Texture2DArray.PlaneSlice;
+      return in->Texture2DArray.PlaneSlice < 2;
     case D3D11_RTV_DIMENSION_TEXTURE2DMS: out->Texture2DMS = in->Texture2DMS; return TRUE;
     case D3D11_RTV_DIMENSION_TEXTURE2DMSARRAY: out->Texture2DMSArray = in->Texture2DMSArray; return TRUE;
     case D3D11_RTV_DIMENSION_TEXTURE3D: out->Texture3D = in->Texture3D; return TRUE;
@@ -289,11 +292,12 @@ static void STDMETHODCALLTYPE rtv_GetDesc1(View *v, D3D11_RENDER_TARGET_VIEW_DES
     case D3D11_RTV_DIMENSION_BUFFER: desc->Buffer = in->Buffer; break;
     case D3D11_RTV_DIMENSION_TEXTURE1D: desc->Texture1D = in->Texture1D; break;
     case D3D11_RTV_DIMENSION_TEXTURE1DARRAY: desc->Texture1DArray = in->Texture1DArray; break;
-    case D3D11_RTV_DIMENSION_TEXTURE2D: desc->Texture2D.MipSlice = in->Texture2D.MipSlice; break;
+    case D3D11_RTV_DIMENSION_TEXTURE2D: desc->Texture2D.MipSlice = in->Texture2D.MipSlice; desc->Texture2D.PlaneSlice = v->plane; break;
     case D3D11_RTV_DIMENSION_TEXTURE2DARRAY:
       desc->Texture2DArray.MipSlice = in->Texture2DArray.MipSlice;
       desc->Texture2DArray.FirstArraySlice = in->Texture2DArray.FirstArraySlice;
       desc->Texture2DArray.ArraySize = in->Texture2DArray.ArraySize;
+      desc->Texture2DArray.PlaneSlice = v->plane;
       break;
     case D3D11_RTV_DIMENSION_TEXTURE2DMS: desc->Texture2DMS = in->Texture2DMS; break;
     case D3D11_RTV_DIMENSION_TEXTURE2DMSARRAY: desc->Texture2DMSArray = in->Texture2DMSArray; break;
@@ -304,11 +308,12 @@ static void STDMETHODCALLTYPE rtv_GetDesc1(View *v, D3D11_RENDER_TARGET_VIEW_DES
 static HRESULT STDMETHODCALLTYPE dev_CreateRenderTargetView1(Dev *d, ID3D11Resource *resource, const D3D11_RENDER_TARGET_VIEW_DESC1 *desc, ID3D11RenderTargetView1 **out) {
   if (out) *out = NULL;
   D3D11_RENDER_TARGET_VIEW_DESC plain;
-  if (desc && !rtv_desc_plain(desc, &plain)) return E_INVALIDARG;
-  return dev_CreateRenderTargetView(d, resource, desc ? &plain : NULL, (ID3D11RenderTargetView **)out);
+  INT plane = 0;
+  if (desc && !rtv_desc_plain(desc, &plain, &plane)) return E_INVALIDARG;
+  return rtv_create(d, resource, desc ? &plain : NULL, desc ? plane : -1, (ID3D11RenderTargetView **)out);
 }
 
-static BOOL srv_desc_plain(const D3D11_SHADER_RESOURCE_VIEW_DESC1 *in, D3D11_SHADER_RESOURCE_VIEW_DESC *out) {
+static BOOL srv_desc_plain(const D3D11_SHADER_RESOURCE_VIEW_DESC1 *in, D3D11_SHADER_RESOURCE_VIEW_DESC *out, INT *plane) {
   memset(out, 0, sizeof *out);
   out->Format = in->Format;
   out->ViewDimension = in->ViewDimension;
@@ -319,13 +324,15 @@ static BOOL srv_desc_plain(const D3D11_SHADER_RESOURCE_VIEW_DESC1 *in, D3D11_SHA
     case D3D11_SRV_DIMENSION_TEXTURE2D:
       out->Texture2D.MostDetailedMip = in->Texture2D.MostDetailedMip;
       out->Texture2D.MipLevels = in->Texture2D.MipLevels;
-      return in->Texture2D.PlaneSlice == 0;
+      *plane = (INT)in->Texture2D.PlaneSlice;
+      return in->Texture2D.PlaneSlice < 2;
     case D3D11_SRV_DIMENSION_TEXTURE2DARRAY:
       out->Texture2DArray.MostDetailedMip = in->Texture2DArray.MostDetailedMip;
       out->Texture2DArray.MipLevels = in->Texture2DArray.MipLevels;
       out->Texture2DArray.FirstArraySlice = in->Texture2DArray.FirstArraySlice;
       out->Texture2DArray.ArraySize = in->Texture2DArray.ArraySize;
-      return in->Texture2DArray.PlaneSlice == 0;
+      *plane = (INT)in->Texture2DArray.PlaneSlice;
+      return in->Texture2DArray.PlaneSlice < 2;
     case D3D11_SRV_DIMENSION_TEXTURE2DMS: out->Texture2DMS = in->Texture2DMS; return TRUE;
     case D3D11_SRV_DIMENSION_TEXTURE2DMSARRAY: out->Texture2DMSArray = in->Texture2DMSArray; return TRUE;
     case D3D11_SRV_DIMENSION_TEXTURE3D: out->Texture3D = in->Texture3D; return TRUE;
@@ -348,12 +355,14 @@ static void STDMETHODCALLTYPE srv_GetDesc1(View *v, D3D11_SHADER_RESOURCE_VIEW_D
     case D3D11_SRV_DIMENSION_TEXTURE2D:
       desc->Texture2D.MostDetailedMip = in->Texture2D.MostDetailedMip;
       desc->Texture2D.MipLevels = in->Texture2D.MipLevels;
+      desc->Texture2D.PlaneSlice = v->plane;
       break;
     case D3D11_SRV_DIMENSION_TEXTURE2DARRAY:
       desc->Texture2DArray.MostDetailedMip = in->Texture2DArray.MostDetailedMip;
       desc->Texture2DArray.MipLevels = in->Texture2DArray.MipLevels;
       desc->Texture2DArray.FirstArraySlice = in->Texture2DArray.FirstArraySlice;
       desc->Texture2DArray.ArraySize = in->Texture2DArray.ArraySize;
+      desc->Texture2DArray.PlaneSlice = v->plane;
       break;
     case D3D11_SRV_DIMENSION_TEXTURE2DMS: desc->Texture2DMS = in->Texture2DMS; break;
     case D3D11_SRV_DIMENSION_TEXTURE2DMSARRAY: desc->Texture2DMSArray = in->Texture2DMSArray; break;
@@ -367,11 +376,12 @@ static void STDMETHODCALLTYPE srv_GetDesc1(View *v, D3D11_SHADER_RESOURCE_VIEW_D
 static HRESULT STDMETHODCALLTYPE dev_CreateShaderResourceView1(Dev *d, ID3D11Resource *resource, const D3D11_SHADER_RESOURCE_VIEW_DESC1 *desc, ID3D11ShaderResourceView1 **out) {
   if (out) *out = NULL;
   D3D11_SHADER_RESOURCE_VIEW_DESC plain;
-  if (desc && !srv_desc_plain(desc, &plain)) return E_INVALIDARG;
-  return dev_CreateShaderResourceView(d, resource, desc ? &plain : NULL, (ID3D11ShaderResourceView **)out);
+  INT plane = 0;
+  if (desc && !srv_desc_plain(desc, &plain, &plane)) return E_INVALIDARG;
+  return srv_create(d, resource, desc ? &plain : NULL, desc ? plane : -1, (ID3D11ShaderResourceView **)out);
 }
 
-static BOOL uav_desc_plain(const D3D11_UNORDERED_ACCESS_VIEW_DESC1 *in, D3D11_UNORDERED_ACCESS_VIEW_DESC *out) {
+static BOOL uav_desc_plain(const D3D11_UNORDERED_ACCESS_VIEW_DESC1 *in, D3D11_UNORDERED_ACCESS_VIEW_DESC *out, INT *plane) {
   memset(out, 0, sizeof *out);
   out->Format = in->Format;
   out->ViewDimension = in->ViewDimension;
@@ -381,12 +391,14 @@ static BOOL uav_desc_plain(const D3D11_UNORDERED_ACCESS_VIEW_DESC1 *in, D3D11_UN
     case D3D11_UAV_DIMENSION_TEXTURE1DARRAY: out->Texture1DArray = in->Texture1DArray; return TRUE;
     case D3D11_UAV_DIMENSION_TEXTURE2D:
       out->Texture2D.MipSlice = in->Texture2D.MipSlice;
-      return in->Texture2D.PlaneSlice == 0;
+      *plane = (INT)in->Texture2D.PlaneSlice;
+      return in->Texture2D.PlaneSlice < 2;
     case D3D11_UAV_DIMENSION_TEXTURE2DARRAY:
       out->Texture2DArray.MipSlice = in->Texture2DArray.MipSlice;
       out->Texture2DArray.FirstArraySlice = in->Texture2DArray.FirstArraySlice;
       out->Texture2DArray.ArraySize = in->Texture2DArray.ArraySize;
-      return in->Texture2DArray.PlaneSlice == 0;
+      *plane = (INT)in->Texture2DArray.PlaneSlice;
+      return in->Texture2DArray.PlaneSlice < 2;
     case D3D11_UAV_DIMENSION_TEXTURE3D: out->Texture3D = in->Texture3D; return TRUE;
     default: return FALSE;
   }
@@ -401,11 +413,12 @@ static void STDMETHODCALLTYPE uav_GetDesc1(View *v, D3D11_UNORDERED_ACCESS_VIEW_
     case D3D11_UAV_DIMENSION_BUFFER: desc->Buffer = in->Buffer; break;
     case D3D11_UAV_DIMENSION_TEXTURE1D: desc->Texture1D = in->Texture1D; break;
     case D3D11_UAV_DIMENSION_TEXTURE1DARRAY: desc->Texture1DArray = in->Texture1DArray; break;
-    case D3D11_UAV_DIMENSION_TEXTURE2D: desc->Texture2D.MipSlice = in->Texture2D.MipSlice; break;
+    case D3D11_UAV_DIMENSION_TEXTURE2D: desc->Texture2D.MipSlice = in->Texture2D.MipSlice; desc->Texture2D.PlaneSlice = v->plane; break;
     case D3D11_UAV_DIMENSION_TEXTURE2DARRAY:
       desc->Texture2DArray.MipSlice = in->Texture2DArray.MipSlice;
       desc->Texture2DArray.FirstArraySlice = in->Texture2DArray.FirstArraySlice;
       desc->Texture2DArray.ArraySize = in->Texture2DArray.ArraySize;
+      desc->Texture2DArray.PlaneSlice = v->plane;
       break;
     case D3D11_UAV_DIMENSION_TEXTURE3D: desc->Texture3D = in->Texture3D; break;
     default: break;
@@ -414,8 +427,9 @@ static void STDMETHODCALLTYPE uav_GetDesc1(View *v, D3D11_UNORDERED_ACCESS_VIEW_
 static HRESULT STDMETHODCALLTYPE dev_CreateUnorderedAccessView1(Dev *d, ID3D11Resource *resource, const D3D11_UNORDERED_ACCESS_VIEW_DESC1 *desc, ID3D11UnorderedAccessView1 **out) {
   if (out) *out = NULL;
   D3D11_UNORDERED_ACCESS_VIEW_DESC plain;
-  if (desc && !uav_desc_plain(desc, &plain)) return E_INVALIDARG;
-  return dev_CreateUnorderedAccessView(d, resource, desc ? &plain : NULL, (ID3D11UnorderedAccessView **)out);
+  INT plane = 0;
+  if (desc && !uav_desc_plain(desc, &plain, &plane)) return E_INVALIDARG;
+  return uav_create(d, resource, desc ? &plain : NULL, desc ? plane : -1, (ID3D11UnorderedAccessView **)out);
 }
 
 /* WriteToSubresource and ReadFromSubresource reach a default-usage texture the CPU has mapped (Map with no D3D11_MAPPED_SUBRESOURCE), which needs

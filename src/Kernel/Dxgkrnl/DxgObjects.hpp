@@ -21,6 +21,8 @@
 #pragma once
 #include "Kernel/Dxgkrnl/D3d12.hpp"
 #include "Kernel/Dxgkrnl/D3d9Shader.hpp"
+#include "Hardware/VideoCodec/Dxva/DxvaDecoder.hpp"
+#include "Utility/Move.hpp"
 #include "Kernel/Dxgkrnl/DxgTypes.hpp"
 #include "Kernel/Dxgkrnl/VidMm.hpp"
 #include "ObjectContainer/List.hpp"
@@ -166,11 +168,24 @@ class DeviceObject {
   Adapter& adapter_;
 };
 
+// A video decoder (Kernel::create_video_decoder): the DXVA decoder and what it was made for. The streams that decode with it hold it (Submission::decoders).
+class VideoDecoderObject {
+ public:
+  VideoDecoderObject(UniquePointer<hardware::IDxvaDecoder> decoder, const VideoDecoderDesc& desc) : decoder_(util::move(decoder)), desc_(desc) {}
+  hardware::IDxvaDecoder& decoder() { return *decoder_; }
+  const VideoDecoderDesc& desc() const { return desc_; }
+  uint64_t pictures = 0, failures = 0;   // decoded, and refused (diagnostics)
+
+ private:
+  UniquePointer<hardware::IDxvaDecoder> decoder_;
+  VideoDecoderDesc desc_;
+};
+
 // What waits in a context's queue (WDDM's per-context DMA buffer queue).
 enum class SubmissionKind : uint8_t { Render, Signal, Wait, Present };
 
 struct Submission {
-  explicit Submission(allocators::IAllocator& allocator) : commands(allocator), allocations(allocator), pipelines(allocator), signatures(allocator), heaps(allocator) {}
+  explicit Submission(allocators::IAllocator& allocator) : commands(allocator), allocations(allocator), pipelines(allocator), signatures(allocator), heaps(allocator), decoders(allocator) {}
   SubmissionKind kind = SubmissionKind::Render;
   // Render: a copy of the command stream (what the process wrote afterwards does not matter), the allocation list and the pipelines it binds, in the order it binds them.
   ByteBuffer commands;
@@ -178,6 +193,7 @@ struct Submission {
   List<SharedPointer<PipelineObject>> pipelines;
   List<SharedPointer<RootSignatureObject>> signatures;   // (Direct3D 12: the root signatures and descriptor heaps it sets, in order)
   List<SharedPointer<DescriptorHeapObject>> heaps;
+  List<SharedPointer<VideoDecoderObject>> decoders;   // (the video decoders its DecodeFrames name, in order)
   // Signal / Wait
   SharedPointer<SyncObject> sync;
   uint64_t value = 0;
@@ -202,6 +218,7 @@ class IPipelineLookup {
   virtual SharedPointer<PipelineObject> find_pipeline(Handle handle) = 0;
   virtual SharedPointer<RootSignatureObject> find_root_signature(Handle handle) = 0;
   virtual SharedPointer<DescriptorHeapObject> find_descriptor_heap(Handle handle) = 0;
+  virtual SharedPointer<VideoDecoderObject> find_video_decoder(Handle handle) = 0;
 
  protected:
   IPipelineLookup() = default;

@@ -64,6 +64,10 @@ struct HeapRec {
   SharedPointer<DescriptorHeapObject> heap;
   Handle device = 0;
 };
+struct VideoDecoderRec {
+  SharedPointer<VideoDecoderObject> decoder;
+  Handle device = 0;
+};
 
 struct Kernel::ShareToken {
   uint32_t token = 0;
@@ -73,7 +77,8 @@ struct Kernel::ShareToken {
 
 struct Kernel::Process {
   explicit Process(allocators::IAllocator& allocator, ProcessId pid)
-      : pid(pid), adapters(allocator, 1), devices(allocator, 2), contexts(allocator, 3), allocations(allocator, 4), syncs(allocator, 5), shaders(allocator, 6), pipelines(allocator, 7), signatures(allocator, 8), heaps(allocator, 9) {}
+      : pid(pid), adapters(allocator, 1), devices(allocator, 2), contexts(allocator, 3), allocations(allocator, 4), syncs(allocator, 5), shaders(allocator, 6), pipelines(allocator, 7), signatures(allocator, 8), heaps(allocator, 9),
+        video_decoders(allocator, 10) {}
   ProcessId pid;
   HandleTable<AdapterRec> adapters;
   HandleTable<DeviceObject> devices;
@@ -84,6 +89,7 @@ struct Kernel::Process {
   HandleTable<PipelineRec> pipelines;
   HandleTable<SignatureRec> signatures;
   HandleTable<HeapRec> heaps;
+  HandleTable<VideoDecoderRec> video_decoders;
 };
 
 namespace {
@@ -91,8 +97,8 @@ namespace {
 // The pipelines a stream may bind: this process's, made on the context's device.
 class DeviceLookup final : public IPipelineLookup {
  public:
-  DeviceLookup(const HandleTable<PipelineRec>& table, const HandleTable<SignatureRec>& signatures, const HandleTable<HeapRec>& heaps, Handle device)
-      : table_(table), signatures_(signatures), heaps_(heaps), device_(device) {}
+  DeviceLookup(const HandleTable<PipelineRec>& table, const HandleTable<SignatureRec>& signatures, const HandleTable<HeapRec>& heaps, const HandleTable<VideoDecoderRec>& decoders, Handle device)
+      : table_(table), signatures_(signatures), heaps_(heaps), decoders_(decoders), device_(device) {}
   SharedPointer<PipelineObject> find_pipeline(Handle handle) override {
     SharedPointer<PipelineRec> rec = table_.get(handle);
     return rec && rec->device == device_ ? rec->pipeline : SharedPointer<PipelineObject>();
@@ -105,11 +111,16 @@ class DeviceLookup final : public IPipelineLookup {
     SharedPointer<HeapRec> rec = heaps_.get(handle);
     return rec && rec->device == device_ ? rec->heap : SharedPointer<DescriptorHeapObject>();
   }
+  SharedPointer<VideoDecoderObject> find_video_decoder(Handle handle) override {
+    SharedPointer<VideoDecoderRec> rec = decoders_.get(handle);
+    return rec && rec->device == device_ ? rec->decoder : SharedPointer<VideoDecoderObject>();
+  }
 
  private:
   const HandleTable<PipelineRec>& table_;
   const HandleTable<SignatureRec>& signatures_;
   const HandleTable<HeapRec>& heaps_;
+  const HandleTable<VideoDecoderRec>& decoders_;
   Handle device_;
 };
 
@@ -374,6 +385,9 @@ void Kernel::destroy_device_locked(Process& p, Handle device) {
   doomed.clear();
   if (handles_of_device(p.heaps, device, doomed))
     for (Handle h : doomed.view()) p.heaps.remove(h);
+  doomed.clear();
+  if (handles_of_device(p.video_decoders, device, doomed))
+    for (Handle h : doomed.view()) p.video_decoders.remove(h);
   doomed.clear();
   if (handles_of_device(p.shaders, device, doomed))
     for (Handle h : doomed.view()) p.shaders.remove(h);
@@ -1040,7 +1054,7 @@ NtStatus Kernel::render(ProcessId pid, Handle context, ConstByteView commands, A
     if (&rec->allocation->manager() != &adapter.vidmm()) return status::kInvalidParameter;
     if (!list.push_back(rec->allocation)) return status::kNoMemory;
   }
-  DeviceLookup lookup(p->pipelines, p->signatures, p->heaps, c->device);
+  DeviceLookup lookup(p->pipelines, p->signatures, p->heaps, p->video_decoders, c->device);
   const NtStatus st = adapter.queue_render(*c->context, commands, ArrayView<const SharedPointer<Allocation>>(list.view().data(), list.count()), lookup);
   if (st == status::kSuccess) pump_locked();
   return st;
@@ -1241,6 +1255,44 @@ NtStatus Kernel::update_tile_mappings(ProcessId pid, Handle reserved, uint32_t f
   return r->allocation->manager().map_tiles(*r->allocation, first_tile, heap_allocation, heap_offset, tile_count);
 }
 
+// --- Video decoders -----------------------------------------------------------------------------------------------------------------------------------------------------
+
+bool Kernel::video_decode_supported(uint32_t profile, bool ten_bit, uint32_t width, uint32_t height) const {
+  // (the planes are 2D images: no bigger than the kernel's textures)
+  if (profile >= hardware::kDxvaProfileCount || width > kMaxTextureDimension || height > kMaxTextureDimension) return false;
+  return hardware::dxva_profile_supports(static_cast<hardware::DxvaProfile>(profile), ten_bit ? hardware::PixelFormat::P010 : hardware::PixelFormat::Nv12, width, height);
+}
+
+NtStatus Kernel::create_video_decoder(ProcessId pid, Handle device, const VideoDecoderDesc& desc, Handle* out) {
+  *out = 0;
+  kernel::ScopedMutex g(lock_);
+  Process* p = find_process(pid);
+  if (!p || !p->devices.raw(device)) return status::kInvalidHandle;
+  if (desc.surfaces == 0 || desc.surfaces > kMaxVideoDecodeSurfaces || desc.ten_bit > 1) return status::kInvalidParameter;
+  if (!video_decode_supported(desc.profile, desc.ten_bit != 0, desc.width, desc.height)) return status::kNotSupported;
+  hardware::DxvaDecoderConfig config;
+  config.profile = static_cast<hardware::DxvaProfile>(desc.profile);
+  config.width = desc.width;
+  config.height = desc.height;
+  config.surfaces = desc.surfaces;
+  config.output = desc.ten_bit ? hardware::PixelFormat::P010 : hardware::PixelFormat::Nv12;
+  UniquePointer<hardware::IDxvaDecoder> decoder = hardware::create_dxva_decoder(allocator_, config);
+  if (!decoder) return status::kNoMemory;
+  SharedPointer<VideoDecoderRec> rec = SharedPointer<VideoDecoderRec>::make(allocator_);
+  if (!rec) return status::kNoMemory;
+  rec->decoder = SharedPointer<VideoDecoderObject>::make(allocator_, util::move(decoder), desc);
+  if (!rec->decoder) return status::kNoMemory;
+  rec->device = device;
+  *out = p->video_decoders.insert(rec);
+  return *out ? status::kSuccess : status::kInsufficientResources;
+}
+
+NtStatus Kernel::destroy_video_decoder(ProcessId pid, Handle decoder) {
+  kernel::ScopedMutex g(lock_);
+  Process* p = find_process(pid);
+  return p && p->video_decoders.remove(decoder) ? status::kSuccess : status::kInvalidHandle;
+}
+
 NtStatus Kernel::destroy_shader(ProcessId pid, Handle shader) {
   kernel::ScopedMutex g(lock_);
   Process* p = find_process(pid);
@@ -1264,6 +1316,32 @@ NtStatus Kernel::escape_d3d12(ProcessId pid, Handle device, uint32_t op, ByteRea
       const NtStatus st = create_root_signature(pid, device, blob, &h);
       if (st == status::kSuccess) out.le32(h);
       return st;
+    }
+    case EscapeOp::CreateVideoDecoder: {
+      VideoDecoderDesc desc;
+      desc.profile = in.le32();
+      desc.width = in.le32();
+      desc.height = in.le32();
+      desc.surfaces = in.le32();
+      desc.ten_bit = in.le32();
+      if (!in.ok() || !in.at_end()) return status::kInvalidParameter;
+      if (reply.size() < 4) return status::kBufferTooSmall;
+      Handle h = 0;
+      const NtStatus st = create_video_decoder(pid, device, desc, &h);
+      if (st == status::kSuccess) out.le32(h);
+      return st;
+    }
+    case EscapeOp::DestroyVideoDecoder: {
+      const Handle h = in.le32();
+      if (!in.ok() || !in.at_end()) return status::kInvalidParameter;
+      return destroy_video_decoder(pid, h);
+    }
+    case EscapeOp::QueryVideoDecodeSupport: {
+      const uint32_t profile = in.le32(), ten_bit = in.le32(), width = in.le32(), height = in.le32();
+      if (!in.ok() || !in.at_end() || ten_bit > 1) return status::kInvalidParameter;
+      if (reply.size() < 4) return status::kBufferTooSmall;
+      out.le32(video_decode_supported(profile, ten_bit != 0, width, height) ? 1u : 0u);
+      return status::kSuccess;
     }
     case EscapeOp::DestroyRootSignature:
     case EscapeOp::DestroyDescriptorHeap: {

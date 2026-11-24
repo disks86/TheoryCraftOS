@@ -55,7 +55,16 @@ struct DxvaPicture {
   ConstByteView quantization_matrix;   // (empty: the codec's default matrices, or those the parameters say)
   ConstByteView slice_control;         // an array of the codec's slice (or AV1 tile) control structures
   ConstByteView bitstream;             // the compressed data the slice controls point into
+  // The surfaces the indices of the parameters stand for (the current picture's and the references'): surface_keys[i] is what index i is - a number that stays the same for the
+  // same surface from picture to picture (the kernel's allocation of it). Direct3D 12 indices are positions in the call's list of reference frames, which may change from one
+  // picture to the next; Direct3D 11's are array slices of the decoder's texture. The decoder keeps each decoded picture under its key and finds a reference by its key. Empty:
+  // index i is key i. An index at or past surface_keys.count() (when not empty) is Invalid.
+  ArrayView<const uint32_t> surface_keys;
+  // The key the current picture is kept under: the output surface's (Direct3D 12 names the output apart from the references, and the current picture's index need not be in
+  // the list). kNoDxvaKey: the key of its index, as for a reference. A reference whose key is the output's is the picture that was there before this one.
+  uint32_t output_key = 0xFFFFFFFFu;
 };
+constexpr uint32_t kNoDxvaKey = 0xFFFFFFFFu;
 
 enum class DxvaResult : uint8_t {
   Ok,
@@ -67,7 +76,7 @@ enum class DxvaResult : uint8_t {
 // The picture decode() made: the planes of the whole coded size (not cropped), in the profile's output format, and the surface it belongs in.
 struct DxvaDecodedPicture {
   VideoFrame frame;              // NV12 or P010 (frame.format.pixel_format); the planes stay valid until the next call on the decoder
-  uint32_t surface = 0;          // the surface index the parameters name for the current picture
+  uint32_t surface = 0;          // the surface index the parameters name for the current picture (an index, not its key)
   const char* detail = nullptr;  // for Unsupported / Invalid: what was refused (a constant string)
 };
 
