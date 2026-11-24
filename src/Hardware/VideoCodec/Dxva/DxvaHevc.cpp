@@ -368,6 +368,7 @@ bool HevcDxvaDecoder::output(const Picture& p, DxvaDecodedPicture* out) {
   f.keyframe = false;
   f.limited_range = true;
   out->frame = f;
+  out->surface_format = DxvaSurfaceFormat::Nv12;
   return true;
 }
 
@@ -413,6 +414,7 @@ bool HevcDxvaDecoder::output_p010(const Picture& p, DxvaDecodedPicture* out) {
   f.keyframe = false;
   f.limited_range = true;
   out->frame = f;
+  out->surface_format = DxvaSurfaceFormat::P010;
   return true;
 }
 
