@@ -2172,6 +2172,9 @@ STREAMS = {
     # Slices in interlaced frame pictures, odd size
     'adv_fr_slices': (208, 3, 106, 70, 8, dict(frames=['rI', 'rP', 'rB', 'rP', 'rB', 'rI', 'rP', 'rB'], slices=0.9, extended_mv=1, extended_dmv=1,
                                                dquant=1, loop_filter=1)),
+    # One macroblock column (the vector prediction of a picture one macroblock wide), interlaced frame pictures with slices
+    'adv_fr_narrow': (216, 3, 16, 96, 8, dict(frames=['rI', 'rP', 'rB', 'rP', 'rB', 'rX', 'rP', 'rB'], slices=0.5, extended_mv=1, dquant=1,
+                                              vstransform=1, loop_filter=1, overlap=1)),
     # Progressive, interlaced frame and field pictures in one sequence; B pictures of each kind between anchors of other kinds; slices
     'adv_mix_a': (209, 3, 112, 96, 12, dict(frames=['pI', 'fPP', 'rP', 'fBB', 'pP', 'rB', 'fPI', 'pB', 'rP', 'fBX', 'pS', 'fPP'], slices=0.5,
                                             extended_mv=1, dquant=1, loop_filter=1, overlap=1, vstransform=1)),

@@ -92,8 +92,8 @@ struct SequenceHeader {
 // 7 and 9: the picture layer. A field interlace frame (two field pictures) has one of these per field while it is decoded: the second field's starts as a copy of
 // the frame's part (FCM, FPTYPE, TFF, RNDCTRL, UVSAMP, REFDIST, BFRACTION) and has its own from PQINDEX on.
 struct PictureHeader {
-  // Frame interlace pictures are read only as far as the picture type and the engine takes the rest (so are field pictures when an engine decodes them): `type` is
-  // then the frame's class (an I or P frame has an intra first field; a B frame has B or BI fields only) and none of the fields below RNDCTRL are filled in.
+  // Interlaced pictures that an engine (or a DXVA driver) decodes are read only as far as UVSAMP and the engine takes the rest: `type` is then the frame's class
+  // (an I or P frame has an intra first field; a B frame has B or BI fields only) and none of the fields below RNDCTRL are filled in.
   int fcm = kFcmProgressive;
   int fptype = 0;            // the field picture type (field interlace): first field class in bits 2:1, second in bits 2 and 0
   bool tff = true, rff = false;
@@ -117,7 +117,9 @@ struct PictureHeader {
   bool use_ic = false;       // intensity compensation of the reference picture
   bool quarter_sample = true, mspel = true;
   int numref = 0, reffield = 0;        // P fields: two reference fields, else which one (0 the closest)
-  int mbmodetab = 0, imvtab = 0, icbptab = 0, fourmvbptab = 0;   // field pictures: the macroblock mode, motion vector, coded block and 4MV block pattern tables
+  int mbmodetab = 0, imvtab = 0, icbptab = 0, fourmvbptab = 0;   // interlaced pictures: the macroblock mode, motion vector, coded block and 4MV block pattern tables
+  int twomvbptab = 0;                  // interlaced frame pictures: the 2MV block pattern table
+  bool fourmvswitch = false;           // interlaced frame P pictures: macroblocks can have four vectors (4MVSWITCH)
   int tt_index = 0;
   bool ttmbf = true;
   int ttfrm = kTt8x8;
@@ -130,7 +132,7 @@ struct PictureHeader {
   int condover = kCondOverNone;
   int postproc = 0;
   // The bit planes (stored in the Core), and whether each is raw: coded bit by bit in the macroblock layer.
-  bool mv_type_raw = false, skip_raw = false, direct_raw = false, acpred_raw = false, overflags_raw = false, forward_raw = false;
+  bool mv_type_raw = false, skip_raw = false, direct_raw = false, acpred_raw = false, overflags_raw = false, forward_raw = false, fieldtx_raw = false;
 };
 
 // A decoded frame.
@@ -145,6 +147,7 @@ struct Picture {
   Mem<int16_t> direct_mv;        // per macroblock: the motion vector direct mode scales (the one of the first luma block; zero for intra). Two field pictures: the first
                                  // field's macroblocks, then the second's (by decoding order)
   Mem<uint8_t> mb_flags;         // field pictures, per macroblock as direct_mv: bit 0 intra, bits 1 to 4 the vector of luma block 0 to 3 refers to the opposite field
+  Mem<int16_t> direct_mv_bottom; // interlaced frame pictures, per macroblock: the vector of luma block 2 (direct_mv has block 0's), for the field vectors of direct mode
   bool interlaced = false;       // coded as fields or as an interlaced frame: a reference read field by field
   bool field_coded = false;      // two field pictures
 };
@@ -387,6 +390,10 @@ class Core {
   bool decode_p_mb_field(BitReader& br);
   bool decode_b_mb_field(BitReader& br);
   bool decode_field_intra_mb(BitReader& br, int idx_mbmode, bool put_now);
+  bool decode_p_mb_frame(BitReader& br);
+  bool decode_b_mb_frame(BitReader& br);
+  bool decode_frame_intra_mb(BitReader& br, bool put_now);
+  void pred_mv_frame(int n, int dmv_x, int dmv_y, int mvn, int dir);
   bool decode_field_residual(BitReader& br, int cbp, int mquant, uint32_t* block_cbp, uint32_t* block_tt);
   bool decode_mquant(BitReader& br, int* mquant);
   bool decode_ac_coeff(BitReader& br, int* last, int* skip, int* value, int codingset);
@@ -414,6 +421,9 @@ class Core {
   void mc_1mv(int dir);
   void mc_4mv_luma(int n, int dir);
   void mc_4mv_chroma(int dir);
+  void mc_4mv_luma_frame(int n, int dir, bool avg);
+  void mc_4mv_chroma_frame(int dir, int dir2, bool avg);
+  void store_frame_direct_mv(int n, int mx, int my);
   void interp_mc();
   void b_mc(bool direct, int mode);
   int16_t* mb_block(int mx, int my, int n) const;
@@ -424,6 +434,11 @@ class Core {
   void loop_filter_i();
   void loop_filter_p();
   void loop_filter_b_field();
+  void overlap_filter_frame(bool intra_picture);
+  void loop_filter_i_frame();
+  void loop_filter_inter_frame();
+  bool frame_interlace() const { return pic_.fcm == kFcmFrameInterlace; }
+  bool mb_fieldtx(int mx, int my) const;
   ByteView dst_plane(int c) const { return ByteView(cur_->plane[c].data(), cur_->plane[c].size()); }
 
   // --- state
@@ -471,6 +486,7 @@ class Core {
 
   // bit planes of the picture being decoded (one byte per macroblock)
   Buf<uint8_t> plane_skip_, plane_mvtype_, plane_direct_, plane_acpred_, plane_overflags_, plane_forward_;
+  Buf<uint8_t> plane_fieldtx_;   // interlaced frame pictures: the macroblock's luma blocks are fields (FIELDTX; P and B pictures: from the macroblock mode)
   List<UnitInfo> unit_infos_;
 
   // picture decoding state
@@ -506,6 +522,7 @@ class Core {
   Buf<uint8_t> mv_f_[2];                        // field pictures, per 8x8 luma block and direction: the vector refers to the opposite field
   Buf<int16_t> uvmv_;                           // per macroblock: the chroma vector
   Buf<uint8_t> uvmv_f_;                         // field pictures, per macroblock: the forward chroma vector refers to the opposite field
+  Buf<uint8_t> blk_mv_type_;                    // interlaced frame pictures, per 8x8 luma block: its vector is a field vector (2MV or 4MV field macroblocks)
   Buf<int16_t> dc_[3];                          // the quantized DC values of the blocks (luma 2 mb_w by 2 mb_h, chroma mb_w by mb_h)
   Buf<int16_t> ac_[3];                          // 16 values per block: the AC prediction values
   Buf<uint8_t> coded_;                          // luma blocks: the coded block flags, for prediction

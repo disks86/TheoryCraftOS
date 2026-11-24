@@ -446,8 +446,13 @@ void Core::predict_mb(const RefSel& ref, int mx, int my, int uvmx, int uvmy, boo
   } else {
     src_x = clip_int(src_x, -17, seq_.width);
     uvsrc_x = clip_int(uvsrc_x, -8, seq_.width >> 1);
-    src_y = clip_int(src_y, -18, seq_.height + 1);
-    uvsrc_y = clip_int(uvsrc_y, -8, seq_.height >> 1);
+    if (frame_interlace()) {   // (an interlaced frame keeps the line parity: each line stays in its field)
+      src_y = clip_int(src_y, -18 + (src_y & 1), seq_.height + (src_y & 1));
+      uvsrc_y = clip_int(uvsrc_y, -8 + (uvsrc_y & 1), (seq_.height >> 1) + (uvsrc_y & 1));
+    } else {
+      src_y = clip_int(src_y, -18, seq_.height + 1);
+      uvsrc_y = clip_int(uvsrc_y, -8, seq_.height >> 1);
+    }
   }
   ByteView dy = dst_plane(0), du = dst_plane(1), dv = dst_plane(2);
   const uint64_t loff = dst_off_[0] + static_cast<uint64_t>(mb_y_ * 16) * static_cast<uint64_t>(dst_stride_[0]) + static_cast<uint64_t>(mb_x_ * 16);
@@ -473,6 +478,7 @@ void Core::mc_1mv(int dir) {
     const uint64_t f = field_mb_index(mb_pos);
     cur_->direct_mv[f * 2] = s16(mx);
     cur_->direct_mv[f * 2 + 1] = s16(my);
+    if (frame_interlace()) store_frame_direct_mv(2, mx, my);
   }
   int uvmx, uvmy;
   chroma_vector(mx, my, &uvmx, &uvmy);
@@ -483,7 +489,7 @@ void Core::mc_1mv(int dir) {
     my = my - 2 + 4 * cur_field_;
     uvmy = uvmy - 2 + 4 * cur_field_;
   }
-  if (seq_.fastuvmc) {
+  if (seq_.fastuvmc && !frame_interlace()) {   // (FASTUVMC does not apply to an interlaced frame's 1MV macroblocks, as in the reference decoder)
     uvmx = uvmx + ((uvmx < 0) ? (uvmx & 1) : -(uvmx & 1));
     uvmy = uvmy + ((uvmy < 0) ? (uvmy & 1) : -(uvmy & 1));
   }
@@ -613,6 +619,91 @@ void Core::mc_4mv_chroma(int dir) {
   chroma_mc(dst_plane(1), coff, dst_stride_[1], u, uvsrc_x, uvsrc_y, fx, fy, pic_.rnd, 8, false);
   chroma_mc(dst_plane(2), coff, dst_stride_[2], v, uvsrc_x, uvsrc_y, fx, fy, pic_.rnd, 8, false);
   if (field_mode_ && dir == 0) uvmv_f_[mb_pos] = opposite ? 1 : 0;
+}
+
+// An interlaced frame P picture keeps the vectors of its luma blocks 0 and 2 for direct mode in the B pictures that follow it (the second is a 2MV field
+// macroblock's bottom field vector).
+void Core::store_frame_direct_mv(int n, int mx, int my) {
+  if (pic_.type != kPictureP) return;
+  const uint64_t mb_pos = static_cast<uint64_t>(mb_y_) * static_cast<uint64_t>(mb_w_) + static_cast<uint64_t>(mb_x_);
+  if (n == 0) {
+    cur_->direct_mv[mb_pos * 2] = s16(mx);
+    cur_->direct_mv[mb_pos * 2 + 1] = s16(my);
+  } else if (n == 2 && cur_->direct_mv_bottom.size() >= (mb_pos + 1) * 2) {
+    cur_->direct_mv_bottom[mb_pos * 2] = s16(mx);
+    cur_->direct_mv_bottom[mb_pos * 2 + 1] = s16(my);
+  }
+}
+
+// The luma block n of an interlaced frame macroblock with a vector per block or per field, direction dir (`avg`: averaged with the prediction already there, the
+// second direction of an interpolated or direct macroblock). A field vector's block is a field's 8 lines (blocks 0 and 1 the top field, 2 and 3 the bottom one)
+// predicted from the reference's lines of the parity the vector points to; the vector is pulled back to within a block of the picture first.
+void Core::mc_4mv_luma_frame(int n, int dir, bool avg) {
+  const RefSel ref = reference_for(dir, 0);
+  if (!ref.pic) return;
+  const int bw = 2 * mb_w_;
+  const bool fieldmv = blk_mv_type_[static_cast<uint64_t>(2 * mb_y_ + (n >> 1)) * static_cast<uint64_t>(bw) + static_cast<uint64_t>(2 * mb_x_ + (n & 1))] != 0;
+  int mx = mv_cur_[dir & 1][n][0], my = mv_cur_[dir & 1][n][1];
+  store_frame_direct_mv(n, mx, my);
+  {
+    const int width = seq_.width, height = seq_.height >> 1;
+    const int qx = mb_x_ * 16 + (mx >> 2), qy = mb_y_ * 8 + (my >> 3);
+    if (qx < -17) mx -= 4 * (qx + 17);
+    else if (qx > width) mx -= 4 * (qx - width);
+    if (qy < -18) my -= 8 * (qy + 18);
+    else if (qy > height + 1) my -= 8 * (qy - height - 1);
+  }
+  int src_x = mb_x_ * 16 + (n & 1) * 8 + (mx >> 2);
+  int src_y = mb_y_ * 16 + (fieldmv ? (n > 1 ? 1 : 0) : (n & 2) * 4) + (my >> 2);
+  src_x = clip_int(src_x, -17, seq_.width);
+  src_y = clip_int(src_y, -18 + (src_y & 1), seq_.height + (src_y & 1));
+  const int stride = dst_stride_[0];
+  const int dst_row = mb_y_ * 16 + (fieldmv ? (n > 1 ? 1 : 0) : (n & 2) * 4);
+  const uint64_t off = dst_off_[0] + static_cast<uint64_t>(dst_row) * static_cast<uint64_t>(stride) + static_cast<uint64_t>(mb_x_ * 16 + (n & 1) * 8);
+  Ref y = make_ref(ref.pic, 0, fieldmv ? (src_y & 1) : -1, ref_w_, ref_h_);
+  if (ref.ic && ref.ic->use)
+    for (int k = 0; k < 2; ++k) y.lut[k] = ArrayView<const uint8_t>(ref.ic->y[k], 256);
+  // (a field block reads the lines of one parity: its rows are counted in that field)
+  const int ry = fieldmv ? (src_y >> 1) : src_y;
+  mspel_mc(dst_plane(0), off, fieldmv ? stride * 2 : stride, y, src_x, ry, mx & 3, my & 3, pic_.rnd, 8, 8, avg);
+}
+
+// The chroma of an interlaced frame macroblock with vectors per block or per field: a 4x4 chroma block for each luma block (the upper two from direction dir,
+// the lower two from dir2), each with the chroma vector of its luma block; with field vectors each is 4 lines of a field and the vertical vector is rounded
+// for fields.
+void Core::mc_4mv_chroma_frame(int dir, int dir2, bool avg) {
+  static constexpr uint8_t kRoundField[16] = {0, 0, 1, 2, 4, 4, 5, 6, 2, 2, 3, 8, 6, 6, 7, 12};
+  const int bw = 2 * mb_w_;
+  const bool fieldmv = blk_mv_type_[static_cast<uint64_t>(2 * mb_y_) * static_cast<uint64_t>(bw) + static_cast<uint64_t>(2 * mb_x_)] != 0;
+  const int v_dist = fieldmv ? 1 : 4;   // (where the lower blocks start)
+  int uvmx[4], uvmy[4];
+  for (int i = 0; i < 4; ++i) {
+    const int d = (i < 2 ? dir : dir2) & 1;
+    const int tx = mv_cur_[d][i][0], ty = mv_cur_[d][i][1];
+    uvmx[i] = (tx + ((tx & 3) == 3)) >> 1;
+    uvmy[i] = fieldmv ? (ty >> 4) * 8 + kRoundField[ty & 0xF] : (ty + ((ty & 3) == 3)) >> 1;
+  }
+  const int cstride = dst_stride_[1];
+  for (int i = 0; i < 4; ++i) {
+    const int d = i < 2 ? dir : dir2;
+    const RefSel ref = reference_for(d, 0);
+    if (!ref.pic) return;
+    int uvsrc_x = mb_x_ * 8 + (i & 1) * 4 + (uvmx[i] >> 2);
+    int uvsrc_y = mb_y_ * 8 + ((i & 2) ? v_dist : 0) + (uvmy[i] >> 2);
+    uvsrc_x = clip_int(uvsrc_x, -8, seq_.width >> 1);
+    uvsrc_y = clip_int(uvsrc_y, -8 + (uvsrc_y & 1), (seq_.height >> 1) + (uvsrc_y & 1));
+    Ref u = make_ref(ref.pic, 1, fieldmv ? (uvsrc_y & 1) : -1, ref_w_, ref_h_);
+    Ref v = make_ref(ref.pic, 2, fieldmv ? (uvsrc_y & 1) : -1, ref_w_, ref_h_);
+    if (ref.ic && ref.ic->use)
+      for (int k = 0; k < 2; ++k) u.lut[k] = v.lut[k] = ArrayView<const uint8_t>(ref.ic->uv[k], 256);
+    const int ry = fieldmv ? (uvsrc_y >> 1) : uvsrc_y;
+    const int dst_row = mb_y_ * 8 + ((i & 2) ? v_dist : 0);
+    const uint64_t coff = dst_off_[1] + static_cast<uint64_t>(dst_row) * static_cast<uint64_t>(cstride) + static_cast<uint64_t>(mb_x_ * 8 + (i & 1) * 4);
+    const int ds = fieldmv ? cstride * 2 : cstride;
+    const int fx = (uvmx[i] & 3) << 1, fy = (uvmy[i] & 3) << 1;
+    chroma_mc(dst_plane(1), coff, ds, u, uvsrc_x, ry, fx, fy, pic_.rnd, 4, avg);
+    chroma_mc(dst_plane(2), coff, ds, v, uvsrc_x, ry, fx, fy, pic_.rnd, 4, avg);
+  }
 }
 
 // The backward prediction of an interpolated (or direct) B macroblock, averaged with the forward one already in the picture.
@@ -984,19 +1075,32 @@ void Core::finish_intra_and_filters() {
     case kPictureI:
     case kPictureBI: {
       const bool overlap = seq_.overlap && (adv ? (pic_.pq >= 9 || pic_.condover != kCondOverNone) : pic_.pq >= 9);
-      if (overlap) overlap_filter_i();
+      if (overlap) {
+        if (frame_interlace()) overlap_filter_frame(true);
+        else overlap_filter_i();
+      }
       put_intra_blocks(adv || (seq_.overlap && pic_.pq >= 9));
-      if (seq_.loop_filter) loop_filter_i();
+      if (seq_.loop_filter) {
+        if (frame_interlace()) loop_filter_i_frame();
+        else loop_filter_i();
+      }
       break;
     }
     case kPictureP:
-      if (seq_.overlap && pic_.pq >= 9) overlap_filter_p();
+      if (seq_.overlap && pic_.pq >= 9) {
+        if (frame_interlace()) overlap_filter_frame(false);
+        else overlap_filter_p();
+      }
       put_intra_blocks(true);
-      if (seq_.loop_filter) loop_filter_p();
+      if (seq_.loop_filter) {
+        if (frame_interlace()) loop_filter_inter_frame();
+        else loop_filter_p();
+      }
       break;
     default:
       if (seq_.loop_filter) {
         if (field_mode_) loop_filter_b_field();
+        else if (frame_interlace()) loop_filter_inter_frame();
         else loop_filter_i();
       }
       break;
@@ -1052,6 +1156,196 @@ void Core::loop_filter_b_field() {
           const uint32_t idx = (cbp | (cbp >> 1)) & 5;
           if (idx & 1) filter_edge(planes[plane], dst + 4 * st + 4, stride, 1, 4, pq);
           if (idx & 4) filter_edge(planes[plane], dst + 4, stride, 1, 4, pq);
+        }
+      }
+    }
+}
+
+// ---- interlaced frame pictures: overlap smoothing and the in-loop filter -------------------------------------------------------------------
+
+// The overlap smoothing of an interlaced frame picture: only the vertical edges (the edges between rows would mix the fields), line by line of the frame - a
+// macroblock with FIELDTX has its lines in its blocks field by field - with the rounding alternating by the line's parity. In an I picture the edges CONDOVER
+// and OVERFLAGS select, in a P picture the edges between intra macroblocks.
+void Core::overlap_filter_frame(bool intra_picture) {
+  const bool adv = seq_.profile == kAdvanced;
+  auto mb_index = [&](int mx, int my) { return static_cast<uint64_t>(my) * static_cast<uint64_t>(mb_w_) + static_cast<uint64_t>(mx); };
+  auto flag = [&](int mx, int my) { return plane_overflags_[mb_index(mx, my)] != 0; };
+  // Whether the edge left of the macroblock (`internal`: the one inside it) is smoothed.
+  auto smoothed = [&](int mx, int my, bool internal, int luma_bit) -> bool {
+    if (intra_picture) {
+      if (pic_.pq >= 9) return true;
+      if (!adv) return false;
+      if (pic_.condover == kCondOverAll) return true;
+      if (pic_.condover != kCondOverSelect || !flag(mx, my)) return false;
+      return internal || flag(mx - 1, my);
+    }
+    const uint8_t cur = intra_mask_[mb_index(mx, my)];
+    if (internal) return (cur & 1) && (cur & 2);
+    return ((cur >> luma_bit) & 1) && ((intra_mask_[mb_index(mx - 1, my)] >> (luma_bit < 4 ? luma_bit + 1 : luma_bit)) & 1);
+  };
+  // Line r (0..15), column c (0..15) of the macroblock's luma samples, wherever its blocks keep it.
+  auto luma = [&](int mx, int my, int r, int c) -> int16_t& {
+    const bool fields = mb_fieldtx(mx, my);
+    const int n = (c >> 3) + 2 * (fields ? (r & 1) : (r >> 3));
+    const int row = fields ? (r >> 1) : (r & 7);
+    return blocks_[(mb_index(mx, my) * 6 + static_cast<uint64_t>(n)) * 64 + static_cast<uint64_t>(row * 8 + (c & 7))];
+  };
+  auto chroma = [&](int mx, int my, int n, int r, int c) -> int16_t& {
+    return blocks_[(mb_index(mx, my) * 6 + static_cast<uint64_t>(n)) * 64 + static_cast<uint64_t>(r * 8 + c)];
+  };
+  // The smoothing of one line across an edge: the two samples on each side.
+  auto smooth = [](int16_t& a, int16_t& b, int16_t& c, int16_t& d, int r) {
+    const int rnd1 = (r & 1) ? 3 : 4, rnd2 = 7 - rnd1;
+    const int va = a, vb = b, vc = c, vd = d;
+    const int d1 = va - vd, d2 = va - vd + vb - vc;
+    a = s16(((va * 8) - d1 + rnd1) >> 3);
+    b = s16(((vb * 8) - d2 + rnd2) >> 3);
+    c = s16(((vc * 8) + d2 + rnd1) >> 3);
+    d = s16(((vd * 8) + d1 + rnd2) >> 3);
+  };
+  for (int my = 0; my < mb_rows_; ++my)
+    for (int mx = 0; mx < mb_w_; ++mx) {
+      if (mx > 0) {
+        for (int r = 0; r < 16; ++r) {
+          // (the reference decoder decides the upper and the lower half of the lines by the blocks 0 and 2: the same for a whole intra macroblock)
+          if (!smoothed(mx, my, false, r < 8 ? 0 : 2)) continue;
+          smooth(luma(mx - 1, my, r, 14), luma(mx - 1, my, r, 15), luma(mx, my, r, 0), luma(mx, my, r, 1), r);
+        }
+        for (int n = 4; n < 6; ++n) {
+          if (!smoothed(mx, my, false, n)) continue;
+          for (int r = 0; r < 8; ++r) smooth(chroma(mx - 1, my, n, r, 6), chroma(mx - 1, my, n, r, 7), chroma(mx, my, n, r, 0), chroma(mx, my, n, r, 1), r);
+        }
+      }
+      if (smoothed(mx, my, true, 0))
+        for (int r = 0; r < 16; ++r) smooth(luma(mx, my, r, 6), luma(mx, my, r, 7), luma(mx, my, r, 8), luma(mx, my, r, 9), r);
+    }
+}
+
+// The in-loop filter of interlaced frame I and BI pictures: every block edge, field by field (each filter takes the lines of one parity); a macroblock with
+// FIELDTX has no edge between its upper and lower blocks. The edges between rows of the whole picture first, then those between columns.
+void Core::loop_filter_i_frame() {
+  const int pq = pic_.pq;
+  ByteView planes[3] = {dst_plane(0), dst_plane(1), dst_plane(2)};
+  const int64_t ls = dst_stride_[0], cs = dst_stride_[1];
+  const uint64_t uls = static_cast<uint64_t>(ls), ucs = static_cast<uint64_t>(cs);
+  for (int my = 0; my < mb_rows_; ++my)
+    for (int mx = 0; mx < mb_w_; ++mx) {
+      const bool top = my == 0 || slice_start_row_[static_cast<uint64_t>(my)] != 0;
+      const uint64_t lo = dst_off_[0] + static_cast<uint64_t>(my * 16) * uls + static_cast<uint64_t>(mx * 16);
+      const uint64_t co = dst_off_[1] + static_cast<uint64_t>(my * 8) * ucs + static_cast<uint64_t>(mx * 8);
+      if (!top)
+        for (int f = 0; f < 2; ++f) filter_edge(planes[0], lo + static_cast<uint64_t>(f) * uls, 1, 2 * ls, 16, pq);
+      if (!mb_fieldtx(mx, my))
+        for (int f = 0; f < 2; ++f) filter_edge(planes[0], lo + static_cast<uint64_t>(8 + f) * uls, 1, 2 * ls, 16, pq);
+      if (!top)
+        for (int c = 1; c < 3; ++c)
+          for (int f = 0; f < 2; ++f) filter_edge(planes[c], co + static_cast<uint64_t>(f) * ucs, 1, 2 * cs, 8, pq);
+    }
+  for (int my = 0; my < mb_rows_; ++my)
+    for (int mx = 0; mx < mb_w_; ++mx) {
+      const uint64_t lo = dst_off_[0] + static_cast<uint64_t>(my * 16) * uls + static_cast<uint64_t>(mx * 16);
+      const uint64_t co = dst_off_[1] + static_cast<uint64_t>(my * 8) * ucs + static_cast<uint64_t>(mx * 8);
+      if (mx > 0)
+        for (int f = 0; f < 2; ++f) filter_edge(planes[0], lo + static_cast<uint64_t>(f) * uls, 2 * ls, 1, 8, pq);
+      for (int f = 0; f < 2; ++f) filter_edge(planes[0], lo + static_cast<uint64_t>(f) * uls + 8, 2 * ls, 1, 8, pq);
+      if (mx > 0)
+        for (int c = 1; c < 3; ++c)
+          for (int f = 0; f < 2; ++f) filter_edge(planes[c], co + static_cast<uint64_t>(f) * ucs, 2 * cs, 1, 4, pq);
+    }
+}
+
+// The in-loop filter of interlaced frame P and B pictures, as the reference decoder has it: field by field, every edge at the bottom and the right of the blocks
+// (not the picture's or the slice's last ones) whatever the blocks are, and the edges inside the blocks that have 8x4, 4x8 or 4x4 transforms - except the
+// horizontal ones inside the upper blocks of a slice's first row and of the lower blocks of its last row (not FIELDTX macroblocks). The edges between rows of the
+// whole picture first, then those between columns.
+void Core::loop_filter_inter_frame() {
+  const int pq = pic_.pq;
+  ByteView planes[3] = {dst_plane(0), dst_plane(1), dst_plane(2)};
+  const int64_t ls = dst_stride_[0], cs = dst_stride_[1];
+  const uint64_t uls = static_cast<uint64_t>(ls), ucs = static_cast<uint64_t>(cs);
+  auto tt_of = [&](uint64_t m, int n) { return static_cast<int>((ttblk_[m] >> (n * 4)) & 0xF); };
+  // A filter of `len` samples across rows (the edge above line `row` of the block at `at`), field by field.
+  auto rows = [&](ByteView p, uint64_t at, int row, int64_t stride, int len) { filter_edge(p, at + static_cast<uint64_t>(row) * static_cast<uint64_t>(stride), 1, 2 * stride, len, pq); };
+  auto cols = [&](ByteView p, uint64_t at, int64_t stride, int len) { filter_edge(p, at, 2 * stride, 1, len, pq); };
+  for (int my = 0; my < mb_rows_; ++my)
+    for (int mx = 0; mx < mb_w_; ++mx) {
+      const uint64_t m = static_cast<uint64_t>(my) * static_cast<uint64_t>(mb_w_) + static_cast<uint64_t>(mx);
+      const bool top = my == 0 || slice_start_row_[static_cast<uint64_t>(my)] != 0;
+      const bool bottom = my == mb_rows_ - 1 || slice_start_row_[static_cast<uint64_t>(my + 1)] != 0;
+      const bool fields = mb_fieldtx(mx, my);
+      const uint64_t lo = dst_off_[0] + static_cast<uint64_t>(my * 16) * uls + static_cast<uint64_t>(mx * 16);
+      const uint64_t co = dst_off_[1] + static_cast<uint64_t>(my * 8) * ucs + static_cast<uint64_t>(mx * 8);
+      for (int n = 0; n < 4; ++n) {
+        const uint64_t dst = lo + static_cast<uint64_t>((n & 2) * 4) * uls + static_cast<uint64_t>((n & 1) * 8);
+        const int tt = tt_of(m, n);
+        const bool split = tt == kTt4x4 || tt == kTt8x4;
+        if (fields) {
+          const int base = n < 2 ? 0 : -7;   // (the lower blocks are the bottom field: their lines start at line 1)
+          if (split) rows(planes[0], dst, base + 8, ls, 8);
+          if (!bottom) rows(planes[0], dst, base + 16, ls, 8);
+        } else if (n < 2) {
+          if (!top && split) {
+            rows(planes[0], dst, 4, ls, 8);
+            rows(planes[0], dst, 5, ls, 8);
+          }
+          rows(planes[0], dst, 8, ls, 8);
+          rows(planes[0], dst, 9, ls, 8);
+        } else if (!bottom) {
+          if (split) {
+            rows(planes[0], dst, 4, ls, 8);
+            rows(planes[0], dst, 5, ls, 8);
+          }
+          rows(planes[0], dst, 8, ls, 8);
+          rows(planes[0], dst, 9, ls, 8);
+        }
+      }
+      for (int n = 4; n < 6; ++n) {
+        if (bottom) continue;
+        const int tt = tt_of(m, n);
+        if (!top && (tt == kTt4x4 || tt == kTt8x4)) {
+          rows(planes[n - 3], co, 4, cs, 8);
+          rows(planes[n - 3], co, 5, cs, 8);
+        }
+        rows(planes[n - 3], co, 8, cs, 8);
+        rows(planes[n - 3], co, 9, cs, 8);
+      }
+    }
+  for (int my = 0; my < mb_rows_; ++my)
+    for (int mx = 0; mx < mb_w_; ++mx) {
+      const uint64_t m = static_cast<uint64_t>(my) * static_cast<uint64_t>(mb_w_) + static_cast<uint64_t>(mx);
+      const bool right = mx == mb_w_ - 1;
+      const bool fields = mb_fieldtx(mx, my);
+      const uint64_t lo = dst_off_[0] + static_cast<uint64_t>(my * 16) * uls + static_cast<uint64_t>(mx * 16);
+      const uint64_t co = dst_off_[1] + static_cast<uint64_t>(my * 8) * ucs + static_cast<uint64_t>(mx * 8);
+      for (int n = 0; n < 4; ++n) {
+        const int tt = tt_of(m, n);
+        const bool split = tt == kTt4x4 || tt == kTt4x8;
+        if (fields) {
+          // (block n's lines: the top field's for blocks 0 and 1, the bottom field's for 2 and 3)
+          const uint64_t dst = lo + static_cast<uint64_t>(n > 1 ? 1 : 0) * uls + static_cast<uint64_t>((n & 1) * 8);
+          if (split) cols(planes[0], dst + 4, ls, 8);
+          if (!right || !(n & 1)) cols(planes[0], dst + 8, ls, 8);
+        } else {
+          const uint64_t dst = lo + static_cast<uint64_t>((n & 2) * 4) * uls + static_cast<uint64_t>((n & 1) * 8);
+          if (split) {
+            cols(planes[0], dst + 4, ls, 4);
+            cols(planes[0], dst + uls + 4, ls, 4);
+          }
+          if (!right || !(n & 5)) {
+            cols(planes[0], dst + 8, ls, 4);
+            cols(planes[0], dst + uls + 8, ls, 4);
+          }
+        }
+      }
+      for (int n = 4; n < 6; ++n) {
+        const int tt = tt_of(m, n);
+        if (tt == kTt4x4 || tt == kTt4x8) {
+          cols(planes[n - 3], co + 4, cs, 4);
+          cols(planes[n - 3], co + ucs + 4, cs, 4);
+        }
+        if (!right) {
+          cols(planes[n - 3], co + 8, cs, 4);
+          cols(planes[n - 3], co + ucs + 8, cs, 4);
         }
       }
     }

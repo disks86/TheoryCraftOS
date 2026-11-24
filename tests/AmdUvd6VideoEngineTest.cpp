@@ -806,8 +806,10 @@ static void synthetic_interlaced(AmdUvd6VideoEngine& engine, Card& card, bool en
     p.pts_us = int64_t{i} * 1000;
     p.keyframe = i == 0;
     const SubmitResult r = session->submit(p);
-    const bool cpu_decodes = steps[i].fcm == 2 && steps[i].value == 1;   // (field pictures I/P after nothing it could decode: the only one with no reference)
-    CHECK((r == SubmitResult::Accepted) == (engine_takes || cpu_decodes));
+    // Without the engine the CPU decodes frame and field pictures itself; only the interlaced frame B picture is refused then: what follows its BFRACTION in
+    // the filler bytes is no valid bit plane (an engine reads none of that).
+    const bool cpu_refuses = steps[i].fcm == 1 && steps[i].value == 1;
+    CHECK((r == SubmitResult::Accepted) == (engine_takes || !cpu_refuses));
     while (session->receive(&f)) order.push_back(f.pts_us / 1000);
   }
   session->flush();
@@ -815,7 +817,9 @@ static void synthetic_interlaced(AmdUvd6VideoEngine& engine, Card& card, bool en
   card.capture_synthetic = false;
   CHECK(card.problems == problems_before);   // (the stand-in found nothing wrong with the jobs)
   if (!engine_takes) {
-    CHECK(order.size() == 1 && order[0] == 7 && card.captured.empty());
+    const int64_t cpu_want[] = {0, 3, 1, 5, 6, 4, 7};   // (the CPU's pictures in display order: all but the refused B frame)
+    CHECK(order.size() == 7 && card.captured.empty());
+    for (uint32_t i = 0; i < 7 && i < order.size(); ++i) CHECK(order[i] == cpu_want[i]);
     return;
   }
   const int64_t want[] = {0, 2, 3, 1, 5, 6, 4, 7};   // (display order: an anchor waits for the next anchor, a B frame goes out at once)

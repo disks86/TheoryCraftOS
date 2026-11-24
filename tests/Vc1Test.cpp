@@ -378,7 +378,8 @@ static void test_interlaced_pictures() {
     for (uint32_t i = 0; i < count && i < order.size(); ++i) CHECK(order[i] == want[i]);
   }
   {
-    // Without an engine the CPU has no pixel path for these pictures: they are refused, nothing comes out. An engine that refuses the sequence is no engine.
+    // Without an engine the CPU decodes these pictures itself (here an interlaced frame I picture whose macroblock data is nothing in particular): the picture
+    // comes out. An engine that refuses the sequence is no engine.
     TestAllocator a;
     InterlacedRecorder refusing;
     refusing.accept = false;
@@ -388,10 +389,10 @@ static void test_interlaced_pictures() {
       std::vector<uint8_t> unit = interlaced_headers(true);
       const std::vector<uint8_t> frame = interlaced_frame(1, 2, false);
       unit.insert(unit.end(), frame.begin(), frame.end());
-      CHECK(!cpu.decode(ConstByteView(unit.data(), unit.size()), 0));
+      CHECK(cpu.decode(ConstByteView(unit.data(), unit.size()), 0));
       cpu.flush();
       VideoFrame f;
-      CHECK(!cpu.receive(&f));
+      CHECK(cpu.receive(&f) && f.format.width == 64 && f.format.height == 64);
     }
     CHECK(refusing.seen.empty());
   }
@@ -425,10 +426,14 @@ int main() {
   static const char* const streams[] = {"simple_intra", "sm_intra", "sm_intra_lf", "sm_intra_q", "sm_intra_nu", "adv_intra", "adv_intra_lf", "adv_intra_odd", "sp_ipp", "sm_ipp", "sm_ipp_q", "sm_ipp_nu",
                                         "sm_ipb", "sm_ipb_f", "adv_ipp", "adv_ipb", "adv_ipp_odd", "adv_skip",
                                         "adv_il_ipb", "adv_il_ipp", "adv_il_skip",   // (an interlaced sequence whose frames are progressive)
-                                        "adv_fi_ipp", "adv_fi_mv", "adv_fi_b", "adv_fi_slices"};   // (field pictures)
+                                        "adv_fi_ipp", "adv_fi_mv", "adv_fi_b", "adv_fi_slices",    // (field pictures)
+                                        "adv_fr_i", "adv_fr_p", "adv_fr_b", "adv_fr_slices", "adv_fr_narrow",   // (interlaced frame pictures)
+                                        "adv_mix_a", "adv_mix_b", "adv_mix_odd"};                  // (progressive, frame and field pictures in one sequence)
   for (const char* name : streams) test_stream(name);
-  for (const char* name : {"sm_ipb_f", "sm_ipp_q", "adv_ipb", "adv_skip", "adv_ipp_odd", "sp_ipp", "adv_il_ipb", "adv_fi_ipp", "adv_fi_mv", "adv_fi_b", "adv_fi_slices"}) test_damaged(name);
-  for (const char* name : {"adv_fi_ipp", "adv_fi_b", "adv_fi_slices"}) test_damaged_fields(name);
+  for (const char* name : {"sm_ipb_f", "sm_ipp_q", "adv_ipb", "adv_skip", "adv_ipp_odd", "sp_ipp", "adv_il_ipb", "adv_fi_ipp", "adv_fi_mv", "adv_fi_b", "adv_fi_slices",
+                           "adv_fr_i", "adv_fr_p", "adv_fr_b", "adv_fr_slices", "adv_fr_narrow", "adv_mix_a", "adv_mix_b", "adv_mix_odd"})
+    test_damaged(name);
+  for (const char* name : {"adv_fi_ipp", "adv_fi_b", "adv_fi_slices", "adv_mix_a", "adv_mix_odd"}) test_damaged_fields(name);
   test_config();
   if (g_failed) {
     printf("%d check(s) failed\n", g_failed);

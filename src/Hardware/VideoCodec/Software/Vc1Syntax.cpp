@@ -249,7 +249,8 @@ bool Core::setup_sequence() {
     const uint64_t mbs = static_cast<uint64_t>(mbw) * static_cast<uint64_t>(mbh);
     const uint64_t b8 = 4 * mbs;
     bool ok = plane_skip_.alloc(allocator_, mbs) && plane_mvtype_.alloc(allocator_, mbs) && plane_direct_.alloc(allocator_, mbs) && plane_acpred_.alloc(allocator_, mbs) &&
-              plane_overflags_.alloc(allocator_, mbs) && plane_forward_.alloc(allocator_, mbs) && slice_start_row_.alloc(allocator_, static_cast<uint64_t>(mbh)) &&
+              plane_overflags_.alloc(allocator_, mbs) && plane_forward_.alloc(allocator_, mbs) && plane_fieldtx_.alloc(allocator_, mbs) &&
+              slice_start_row_.alloc(allocator_, static_cast<uint64_t>(mbh)) && blk_mv_type_.alloc(allocator_, b8) &&
               qscale_.alloc(allocator_, mbs) && intra_mask_.alloc(allocator_, mbs) && cbp_blocks_.alloc(allocator_, mbs) &&
               ttblk_.alloc(allocator_, mbs) && mv_.alloc(allocator_, b8 * 2) && mv_back_.alloc(allocator_, b8 * 2) && mv_f_[0].alloc(allocator_, b8) && mv_f_[1].alloc(allocator_, b8) &&
               uvmv_.alloc(allocator_, mbs * 2) && uvmv_f_.alloc(allocator_, mbs) &&
@@ -601,8 +602,8 @@ bool Core::parse_picture_header(BitReader& br, HeaderAt at) {
     }
     h.rnd = br.bit();
     if (seq_.interlace) h.uvsamp = br.bit() != 0;
-    // Frame interlace pictures, and field pictures that an engine (or a DXVA driver) decodes: the rest of the header, the bit planes and the macroblocks are theirs.
-    if (h.fcm != kFcmProgressive && (offloaded_ || ext_ || h.fcm == kFcmFrameInterlace)) {
+    // Interlaced pictures that an engine (or a DXVA driver) decodes: the rest of the header, the bit planes and the macroblocks are theirs.
+    if (h.fcm != kFcmProgressive && (offloaded_ || ext_)) {
       pic_ = h;
       return !br.error();
     }
@@ -628,7 +629,7 @@ bool Core::parse_picture_header(BitReader& br, HeaderAt at) {
         h.brfd = h.refdist - h.frfd - 1;
         if (h.brfd < 0) h.brfd = 0;
       }
-    } else {
+    } else if (h.fcm == kFcmProgressive) {   // (an interlaced frame picture has no INTERPFRM, and its BFRACTION follows POSTPROC)
       if (seq_.finterpflag) h.interpfrm = br.bit() != 0;
       if (h.type == kPictureB) {
         int index = static_cast<int>(br.get(3));
@@ -704,79 +705,128 @@ bool Core::parse_picture_header(BitReader& br, HeaderAt at) {
       set_ranges();
     }
     pic_.tt_index = (pic_.pq > 4) + (pic_.pq > 12);
-    const int lowquant = pic_.pq > 12 ? 0 : 1;
-    pic_.mv_mode = kMvPmodeTable[lowquant * 5 + br.unary(1, 4)];
-    if (pic_.mv_mode == kMvIntensityComp) {
-      pic_.mv_mode2 = kMvPmodeTable2[lowquant * 4 + br.unary(1, 3)];
-      // INTCOMPFIELD (field pictures): which reference fields are compensated, 1 both, 01 the bottom one, 00 the top one.
-      if (field) {
-        const int code = br.bit() ? 0 : 2 - br.bit();
-        pic_.intcompfield = code ^ 3;
-      } else {
+    if (frame_interlace()) {
+      // 10.3.1 an interlaced frame P picture: 4MVSWITCH, INTCOMP (LUMSCALE and LUMSHIFT for both fields of the reference), the skipped macroblocks, the tables of the
+      // macroblock mode, the vectors, the coded blocks and the block patterns. Its vectors are always in quarter samples with the bicubic filter.
+      pic_.fourmvswitch = br.bit() != 0;
+      pic_.mv_mode = pic_.mv_mode2 = kMv1Mv;
+      if (br.bit()) {
+        pic_.lumscale = pic_.lumscale2 = static_cast<int>(br.get(6));
+        pic_.lumshift = pic_.lumshift2 = static_cast<int>(br.get(6));
         pic_.intcompfield = 3;
-      }
-      pic_.lumscale = pic_.lumscale2 = 32;
-      pic_.lumshift = pic_.lumshift2 = 0;
-      if (pic_.intcompfield & 1) {
-        pic_.lumscale = static_cast<int>(br.get(6));
-        pic_.lumshift = static_cast<int>(br.get(6));
-      }
-      if ((pic_.intcompfield & 2) && field) {
-        pic_.lumscale2 = static_cast<int>(br.get(6));
-        pic_.lumshift2 = static_cast<int>(br.get(6));
-      } else if (!field) {
-        pic_.lumscale2 = pic_.lumscale;
-        pic_.lumshift2 = pic_.lumshift;
-      }
-      pic_.use_ic = true;
-      // The tables: the first field (and a frame) compensates both fields of the forward reference, on top of what they had. The second field of a field pair
-      // compensates the first field of its own frame (the opposite parity; it starts from the samples) and the field of the same parity of the reference frame
-      // (on top of what the first field did to it). The first scale and shift are the top field's, the second ones the bottom field's.
-      if (field && second_field_) {
-        if (cur_field_) {
-          init_lut(pic_.lumscale, pic_.lumshift, ic_curr(), 0, false);
-          init_lut(pic_.lumscale2, pic_.lumshift2, ic_last_, 1, true);
-        } else {
-          init_lut(pic_.lumscale2, pic_.lumshift2, ic_curr(), 1, false);
-          init_lut(pic_.lumscale, pic_.lumshift, ic_last_, 0, true);
-        }
-        ic_next_.use = true;
-        ic_curr().use = true;
-      } else {
+        pic_.use_ic = true;
         init_lut(pic_.lumscale, pic_.lumshift, ic_last_, 0, true);
-        init_lut(pic_.lumscale2, pic_.lumshift2, ic_last_, 1, true);
+        init_lut(pic_.lumscale, pic_.lumshift, ic_last_, 1, true);
+        ic_last_.use = true;
       }
-      ic_last_.use = true;
-      pic_.quarter_sample = pic_.mv_mode2 != kMv1MvHpel && pic_.mv_mode2 != kMv1MvHpelBilin;
-      pic_.mspel = pic_.mv_mode2 != kMv1MvHpelBilin;
-    } else {
-      pic_.quarter_sample = pic_.mv_mode != kMv1MvHpel && pic_.mv_mode != kMv1MvHpelBilin;
-      pic_.mspel = pic_.mv_mode != kMv1MvHpelBilin;
-    }
-    const bool mixed = (pic_.mv_mode == kMvIntensityComp && pic_.mv_mode2 == kMvMixed) || pic_.mv_mode == kMvMixed;
-    if (field) {
-      pic_.mbmodetab = static_cast<int>(br.get(3));
-      pic_.imvtab = static_cast<int>(br.get(2 + pic_.numref));
+      if (!decode_bitplane(br, &plane_skip_, &pic_.skip_raw)) return false;
+      pic_.mbmodetab = static_cast<int>(br.get(2));
+      pic_.imvtab = static_cast<int>(br.get(2));
       pic_.icbptab = static_cast<int>(br.get(3));
-      if (mixed) pic_.fourmvbptab = static_cast<int>(br.get(2));
+      pic_.twomvbptab = static_cast<int>(br.get(2));
+      if (pic_.fourmvswitch) pic_.fourmvbptab = static_cast<int>(br.get(2));
+      pic_.quarter_sample = true;
+      pic_.mspel = true;
+      if (seq_.dquant && !decode_dquant(br)) return false;
+      read_transform_info();
     } else {
-      if (mixed) {
-        if (!decode_bitplane(br, &plane_mvtype_, &pic_.mv_type_raw)) return false;
+      const int lowquant = pic_.pq > 12 ? 0 : 1;
+      pic_.mv_mode = kMvPmodeTable[lowquant * 5 + br.unary(1, 4)];
+      if (pic_.mv_mode == kMvIntensityComp) {
+        pic_.mv_mode2 = kMvPmodeTable2[lowquant * 4 + br.unary(1, 3)];
+        // INTCOMPFIELD (field pictures): which reference fields are compensated, 1 both, 01 the bottom one, 00 the top one.
+        if (field) {
+          const int code = br.bit() ? 0 : 2 - br.bit();
+          pic_.intcompfield = code ^ 3;
+        } else {
+          pic_.intcompfield = 3;
+        }
+        pic_.lumscale = pic_.lumscale2 = 32;
+        pic_.lumshift = pic_.lumshift2 = 0;
+        if (pic_.intcompfield & 1) {
+          pic_.lumscale = static_cast<int>(br.get(6));
+          pic_.lumshift = static_cast<int>(br.get(6));
+        }
+        if ((pic_.intcompfield & 2) && field) {
+          pic_.lumscale2 = static_cast<int>(br.get(6));
+          pic_.lumshift2 = static_cast<int>(br.get(6));
+        } else if (!field) {
+          pic_.lumscale2 = pic_.lumscale;
+          pic_.lumshift2 = pic_.lumshift;
+        }
+        pic_.use_ic = true;
+        // The tables: the first field (and a frame) compensates both fields of the forward reference, on top of what they had. The second field of a field pair
+        // compensates the first field of its own frame (the opposite parity; it starts from the samples) and the field of the same parity of the reference frame
+        // (on top of what the first field did to it). The first scale and shift are the top field's, the second ones the bottom field's.
+        if (field && second_field_) {
+          if (cur_field_) {
+            init_lut(pic_.lumscale, pic_.lumshift, ic_curr(), 0, false);
+            init_lut(pic_.lumscale2, pic_.lumshift2, ic_last_, 1, true);
+          } else {
+            init_lut(pic_.lumscale2, pic_.lumshift2, ic_curr(), 1, false);
+            init_lut(pic_.lumscale, pic_.lumshift, ic_last_, 0, true);
+          }
+          ic_next_.use = true;
+          ic_curr().use = true;
+        } else {
+          init_lut(pic_.lumscale, pic_.lumshift, ic_last_, 0, true);
+          init_lut(pic_.lumscale2, pic_.lumshift2, ic_last_, 1, true);
+        }
+        ic_last_.use = true;
+        pic_.quarter_sample = pic_.mv_mode2 != kMv1MvHpel && pic_.mv_mode2 != kMv1MvHpelBilin;
+        pic_.mspel = pic_.mv_mode2 != kMv1MvHpelBilin;
       } else {
-        pic_.mv_type_raw = false;
-        plane_mvtype_.fill(0);
+        pic_.quarter_sample = pic_.mv_mode != kMv1MvHpel && pic_.mv_mode != kMv1MvHpelBilin;
+        pic_.mspel = pic_.mv_mode != kMv1MvHpelBilin;
       }
-      if (!read_planes_and_tables()) return false;
+      const bool mixed = (pic_.mv_mode == kMvIntensityComp && pic_.mv_mode2 == kMvMixed) || pic_.mv_mode == kMvMixed;
+      if (field) {
+        pic_.mbmodetab = static_cast<int>(br.get(3));
+        pic_.imvtab = static_cast<int>(br.get(2 + pic_.numref));
+        pic_.icbptab = static_cast<int>(br.get(3));
+        if (mixed) pic_.fourmvbptab = static_cast<int>(br.get(2));
+      } else {
+        if (mixed) {
+          if (!decode_bitplane(br, &plane_mvtype_, &pic_.mv_type_raw)) return false;
+        } else {
+          pic_.mv_type_raw = false;
+          plane_mvtype_.fill(0);
+        }
+        if (!read_planes_and_tables()) return false;
+      }
+      if (seq_.dquant && !decode_dquant(br)) return false;
+      read_transform_info();
     }
-    if (seq_.dquant && !decode_dquant(br)) return false;
-    read_transform_info();
   } else if (type == kPictureB) {
+    if (frame_interlace()) {
+      // 10.3.2 an interlaced frame B picture: BFRACTION (a value of 0, a BI picture, is refused here as by the reference decoder), MVRANGE, DMVRANGE, INTCOMP
+      // (always 0), the direct and the skipped macroblocks, the tables.
+      int index = static_cast<int>(br.get(3));
+      if (index == 7) index = 7 + static_cast<int>(br.get(4));
+      if (index == 21 || index > 22) return false;
+      pic_.bfraction_index = index;
+      pic_.bfraction = kBfraction[index];
+      if (pic_.bfraction == 0) return false;
+    }
     if (adv) {
       pic_.mvrange = seq_.extended_mv ? br.unary(0, 3) : 0;
       set_ranges();
     }
     pic_.tt_index = (pic_.pq > 4) + (pic_.pq > 12);
-    if (field) {
+    if (frame_interlace()) {
+      if (seq_.extended_dmv) pic_.dmvrange = br.unary(0, 3);
+      br.skip(1);   // INTCOMP: present, but always 0 (a 1 is ignored, as by the reference decoder)
+      pic_.mv_mode = pic_.mv_mode2 = kMv1Mv;
+      pic_.quarter_sample = true;
+      pic_.mspel = true;
+      if (!decode_bitplane(br, &plane_direct_, &pic_.direct_raw)) return false;
+      if (!decode_bitplane(br, &plane_skip_, &pic_.skip_raw)) return false;
+      pic_.mbmodetab = static_cast<int>(br.get(2));
+      pic_.imvtab = static_cast<int>(br.get(2));
+      pic_.icbptab = static_cast<int>(br.get(3));
+      pic_.twomvbptab = static_cast<int>(br.get(2));
+      pic_.fourmvbptab = static_cast<int>(br.get(2));
+    } else if (field) {
       if (seq_.extended_dmv) pic_.dmvrange = br.unary(0, 3);
       const int lowquant = pic_.pq > 12 ? 0 : 1;
       pic_.mv_mode = kMvPmodeTable2[lowquant * 4 + br.unary(1, 3)];
@@ -798,6 +848,9 @@ bool Core::parse_picture_header(BitReader& br, HeaderAt at) {
     if (seq_.dquant && !decode_dquant(br)) return false;
     read_transform_info();
   } else if (adv) {   // I and BI of the Advanced profile
+    // FIELDTX (interlaced frame pictures): which macroblocks have their luma blocks as fields.
+    pic_.fieldtx_raw = false;
+    if (frame_interlace() && !decode_bitplane(br, &plane_fieldtx_, &pic_.fieldtx_raw)) return false;
     if (!decode_bitplane(br, &plane_acpred_, &pic_.acpred_raw)) return false;
     pic_.condover = kCondOverNone;
     if (seq_.overlap && pic_.pq <= 8) {
@@ -890,13 +943,15 @@ bool Core::start_picture() {
   if (!p) return false;
   // Two field pictures need their rows in whole macroblocks per field: the frame's macroblock rows rounded up to even.
   const bool fields = pic_.fcm == kFcmFieldInterlace && !offloaded_;
+  const bool frame = pic_.fcm == kFcmFrameInterlace && !offloaded_ && !ext_;
   const int rows = fields ? (mb_h_ + 1) & ~1 : mb_h_;
   const uint64_t w = static_cast<uint64_t>(mb_w_) * 16, h = static_cast<uint64_t>(rows) * 16;
   const uint64_t mbs = static_cast<uint64_t>(mb_w_) * static_cast<uint64_t>(rows);
   // (mb_flags is a field pair's only: a DXVA driver's pictures, which it sizes itself, have none)
-  if (p->width != static_cast<int>(w) || p->height != static_cast<int>(h) || p->plane[0].size() != w * h || p->direct_mv.size() != mbs * 2 || (fields && p->mb_flags.size() != mbs)) {
+  if (p->width != static_cast<int>(w) || p->height != static_cast<int>(h) || p->plane[0].size() != w * h || p->direct_mv.size() != mbs * 2 || (fields && p->mb_flags.size() != mbs) ||
+      (frame && p->direct_mv_bottom.size() != mbs * 2)) {
     if (!p->plane[0].alloc(allocator_, w * h) || !p->plane[1].alloc(allocator_, w * h / 4) || !p->plane[2].alloc(allocator_, w * h / 4) ||
-        !p->direct_mv.alloc(allocator_, mbs * 2) || (fields && !p->mb_flags.alloc(allocator_, mbs)))
+        !p->direct_mv.alloc(allocator_, mbs * 2) || (fields && !p->mb_flags.alloc(allocator_, mbs)) || (frame && !p->direct_mv_bottom.alloc(allocator_, mbs * 2)))
       return false;
     p->width = static_cast<int>(w);
     p->height = static_cast<int>(h);
@@ -907,6 +962,8 @@ bool Core::start_picture() {
   for (int c = 0; c < 3; ++c) ArrayView<uint8_t>(p->plane[c].data(), p->plane[c].size()).fill(128);
   ArrayView<int16_t>(p->direct_mv.data(), p->direct_mv.size()).fill(0);
   ArrayView<uint8_t>(p->mb_flags.data(), p->mb_flags.size()).fill(0);
+  if (!frame) p->direct_mv_bottom.release();   // (only an interlaced frame P picture has these vectors: others give direct mode their one vector)
+  ArrayView<int16_t>(p->direct_mv_bottom.data(), p->direct_mv_bottom.size()).fill(0);
   p->in_use = true;
   p->output_pending = false;
   p->type = pic_.type;
@@ -926,6 +983,8 @@ bool Core::start_picture() {
 void Core::reset_picture_state() {
   slice_start_row_.fill(0);
   intra_mask_.fill(0);
+  blk_mv_type_.fill(0);
+  if (pic_.type != kPictureI && pic_.type != kPictureBI) plane_fieldtx_.fill(0);   // (an intra picture's FIELDTX is the header's bit plane; others: each macroblock's)
   cbp_blocks_.fill(0);
   ttblk_.fill(0);
   mv_.fill(0);
@@ -1019,8 +1078,8 @@ bool Core::decode_frame(ArrayView<const Part> parts, ArrayView<const ConstByteVi
   if (!parse_picture_header(br, HeaderAt::Frame)) return false;
   // (DXVA: the rounding control of a Simple or Main profile picture is the one the program says; it follows from pictures the decoder may not have seen)
   if (ext_ && ext_->rnd >= 0 && seq_.profile != kAdvanced) pic_.rnd = ext_->rnd & 1;
-  // A frame interlace picture has no pixel path here: only an engine can decode it. (Field pictures are decoded here, but not for a DXVA driver.)
-  if (pic_.fcm != kFcmProgressive && (ext_ || (pic_.fcm == kFcmFrameInterlace && !offloaded_))) return false;
+  // Interlaced pictures are decoded here, but not for a DXVA driver.
+  if (pic_.fcm != kFcmProgressive && ext_) return false;
   if (ext_) {
     // The references are the caller's: every one the picture type needs must be there.
     anchor_[0] = anchor_[1] = nullptr;
