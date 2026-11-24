@@ -1374,7 +1374,7 @@ class Adapter::StreamRunner {
     for (uint32_t i = 0; i < count; ++i) references[i] = {read_view(refs[2 * i]), read_view(refs[2 * i + 1])};
     VideoEncodeJob job;
     job.params = args->backing().subview(a_off, a_bytes);
-    if (heap) job.heap = heap->writable_backing().subview(h_off, kVideoEncodeHeapBytes);
+    if (heap) job.heap = heap->writable_backing().subview(h_off, heap->desc().size - h_off);   // (the rate controller's state, then H.264's reference store)
     job.input = {read_view(in_l), read_view(in_c)};
     job.has_reconstruction = rec_l != nullptr;
     if (rec_l) {
@@ -1382,6 +1382,10 @@ class Adapter::StreamRunner {
       job.reconstruction_chroma = write_view(rec_c);
     }
     job.references = ArrayView<const VideoPictureImages>(references, count);
+    uint64_t reference_keys[kVideoEncodeMaxReferences];
+    for (uint32_t i = 0; i < count; ++i) reference_keys[i] = refs[2 * i]->id();
+    job.reference_keys = ArrayView<const uint64_t>(reference_keys, count);
+    if (rec_l) job.reconstruction_key = rec_l->id();
     job.bitstream = bits->writable_backing().subview(b_off, bits->desc().size - b_off);
     job.metadata = meta->writable_backing().subview(m_off, meta->desc().size - m_off);
     if (!run_video_encode(adapter_.allocator_, job)) return status::kNoMemory;
@@ -1396,16 +1400,35 @@ class Adapter::StreamRunner {
 
   NtStatus resolve_encoder_metadata_packet(ByteReader& p) {
     const uint32_t mi = p.le32(), m_off = p.le32(), oi = p.le32(), o_off = p.le32();
+    // (then optionally the frame PSNR and subregion PSNR buffers: index and offset each, kNoAllocation for none)
+    uint32_t fi = kNoAllocation, f_off = 0, si = kNoAllocation, s_off = 0;
+    if (p.remaining() == 16) {
+      fi = p.le32();
+      f_off = p.le32();
+      si = p.le32();
+      s_off = p.le32();
+    }
     if (!exact(p) || in_pass_) return refuse(__LINE__);
     Allocation* meta = alloc(mi);
     Allocation* out = alloc(oi);
+    Allocation* fpsnr = fi == kNoAllocation ? nullptr : alloc(fi);
+    Allocation* spsnr = si == kNoAllocation ? nullptr : alloc(si);
     if (!buffer_range(meta, m_off, ~uint64_t{0}) || !buffer_range(out, o_off, ~uint64_t{0}) || meta == out || !use(out, state::kVideoEncodeWrite)) return refuse(__LINE__);
+    if ((fi != kNoAllocation && (!buffer_range(fpsnr, f_off, ~uint64_t{0}) || fpsnr == meta || fpsnr == out || !use(fpsnr, state::kVideoEncodeWrite))) ||
+        (si != kNoAllocation && (!buffer_range(spsnr, s_off, ~uint64_t{0}) || spsnr == meta || spsnr == out || !use(spsnr, state::kVideoEncodeWrite))))
+      return refuse(__LINE__);
     if (!exec_) return status::kSuccess;
     NtStatus s = flush();
     if (s != status::kSuccess) return s;
-    if (!mm_.read_back(*meta) || !mm_.read_back(*out)) return status::kInvalidDeviceState;
-    // (an output buffer too small for what is to be written is left as it was)
-    if (resolve_video_encode_metadata(meta->backing().subview(m_off, meta->desc().size - m_off), out->writable_backing().subview(o_off, out->desc().size - o_off))) mm_.note_cpu_write(*out);
+    if (!mm_.read_back(*meta) || !mm_.read_back(*out) || (fpsnr && !mm_.read_back(*fpsnr)) || (spsnr && spsnr != fpsnr && !mm_.read_back(*spsnr))) return status::kInvalidDeviceState;
+    // (an output buffer too small for what is to be written is left as it was; the two PSNR records may share a buffer at different offsets)
+    const ByteView fview = fpsnr ? fpsnr->writable_backing().subview(f_off, fpsnr->desc().size - f_off) : ByteView();
+    const ByteView sview = spsnr ? spsnr->writable_backing().subview(s_off, spsnr->desc().size - s_off) : ByteView();
+    if (resolve_video_encode_metadata(meta->backing().subview(m_off, meta->desc().size - m_off), out->writable_backing().subview(o_off, out->desc().size - o_off), fview, sview)) {
+      mm_.note_cpu_write(*out);
+      if (fpsnr) mm_.note_cpu_write(*fpsnr);
+      if (spsnr && spsnr != fpsnr) mm_.note_cpu_write(*spsnr);
+    }
     return status::kSuccess;
   }
 

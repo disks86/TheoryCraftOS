@@ -266,7 +266,7 @@ struct Dev {
   SRWLOCK fence_lock;
   struct ShaderCache *caches;      /* the shader cache sessions open (library.inc), for ShaderCacheControl */
   SRWLOCK cache_lock;
-  ID3D12VideoDevice3 video;        /* the same object as ID3D12VideoDevice .. 3 (video.inc) */
+  ID3D12VideoDevice4 video;        /* the same object as ID3D12VideoDevice .. 4 (video.inc) */
 };
 #define DEV_FEATURE_STREAM_OUTPUT (1u << 21)      /* graphics::kFeatureStreamOutput in KmtCaps.features */
 #define DEV_FEATURE_DEPTH_RESOLVE (1u << 19)      /* graphics::kFeatureDepthResolve */

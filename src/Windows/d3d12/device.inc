@@ -454,7 +454,7 @@ static Dev *dev_create(LUID luid, NTSTATUS *status_out) {
   extern const ID3D12Device10Vtbl dev_vtbl;
   dx_init(OBJ(d), &dev_vtbl, g_device_iids, dev_destroy);
   {
-    extern const ID3D12VideoDevice3Vtbl vdev_vtbl;
+    extern const ID3D12VideoDevice4Vtbl vdev_vtbl;
     d->video.lpVtbl = &vdev_vtbl;
   }
   d->luid = luid;

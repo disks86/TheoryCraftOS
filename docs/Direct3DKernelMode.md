@@ -362,11 +362,20 @@ Direct3D 11's and 12's video interfaces run on the kernel's codecs, on the CPU, 
 - Encoding and motion estimation (Direct3D 12 only; `src/Kernel/Dxgkrnl/VideoEncode.{hpp,cpp}`, stream ops EstimateMotion / ResolveMotionVectors / EncodeFrame /
   ResolveEncoderMetadata, states kVideoEncodeRead / Write; d3d12.dll `encode.inc`): the motion estimator (`Software/MotionEstimator`: 8x8 / 16x16 blocks, SAD, whole-sample
   search +-8 around the predictors, then half and quarter refinement with H.264's interpolation; resolved into an R16G16_SINT texture, kept as A16B16G16R16Sint (x, y, 0, 1))
-  and an H.264 encoder driven like a D3D12 driver is (`Software/H264PictureEncoder`: the program keeps the DPB, names lists / marking / modifications and writes SPS and PPS;
-  the slices are CAVLC Main with Intra16x16 and 16x16 P / B partitions, quarter-sample vectors, filter modes 0-2, slices by macroblocks / rows / count, a QP per macroblock),
-  picture-level rate control `Software/VideoRateControl` (CQP, CBR, VBR, QVBR, absolute QP map; state in the encoder heap, re-encode on overflow). The resolution must be whole
-  macroblocks (the queries say multiple of 16). Not done: CABAC, 8x8 transform, direct / B_Skip, intra refresh, slices by bytes, frame analysis, HEVC and AV1 (the codec query
-  says FALSE), EncodeCommandList4. Tests: `tests/run_host_tests.sh VideoEncodeTest`, `tests/h264_encode_ffmpeg.sh` (ffmpeg's decode = the reconstruction),
+  and an H.264 encoder driven like a D3D12 driver is (`Software/H264PictureEncoder` + `H264PictureEncoderSyntax`: the program keeps the DPB, names lists / marking /
+  modifications and writes SPS and PPS; the slices are Main or High, CAVLC or CABAC, Intra16x16 and Intra8x8 (all 9 modes), 16x16 P / B partitions with 4x4 or adaptive 8x8
+  transforms, P_Skip, B_Skip / B_Direct_16x16 by spatial or temporal direct prediction (direct_8x8_inference 1), quarter-sample vectors, filter modes 0-2, row-based intra
+  refresh (the refreshed rows predict only from refreshed rows), slices by macroblocks / rows / count / bytes (a slice taken back to the macroblock that does not fit), a QP
+  per macroblock, cabac_zero_words where 9.3.4.6 needs them), picture-level rate control `Software/VideoRateControl` (CQP, CBR, VBR, QVBR, absolute QP map; state in the
+  encoder heap, re-encode on overflow). Any even size 16 .. 4096: coded in whole macroblocks, the program's SPS crops; the encoder heap (`video_encode_heap_bytes`) keeps,
+  after the rate control state, a reference store of 17 slots - each reconstructed reference's macroblock motion (the co-located picture of direct prediction) and the samples
+  of its coded size its texture has no room for - found by the texture's allocation id and POC (a reference not found: predictions keep inside its texture, no direct from
+  it). ID3D12VideoDevice4 / ID3D12VideoEncoderHeap1 / ID3D12VideoEncodeCommandList4: EncodeFrame1 with CPU input maps (dirty rectangles -> unchanged macroblocks copying the
+  reference, move regions -> per-macroblock search hints in the three search modes, the QP map of the picture control) and frame / subregion PSNR metadata through
+  ResolveEncoderOutputMetadata1 (ResolveEncoderMetadata's packet takes the two PSNR buffers). Not done, and the queries say so: input maps from GPU textures (so
+  ResolveInputParamLayout has nothing to resolve), the per-block QP / SATD / bit-allocation metadata maps (their R8_SINT / R32_UINT textures do not exist in d3d12.dll),
+  frame analysis (two-pass), subregion notification, intra constrained slices, deblocking modes 3-6 (SVC's), HEVC and AV1 (the codec query says FALSE). Tests:
+  `tests/run_host_tests.sh VideoEncodeTest`, `tests/h264_encode_ffmpeg.sh` (ffmpeg's decode = the reconstruction, 14 streams),
   `tests/emulated_dx.sh tests/windows/d3d12encodetest.c`, `tests/d3d12_qemu.sh d3d12encodetest`, `tests/wow64_qemu.sh d3d12encodetest`.
 - Not there: HEVC 4:2:2 / 4:4:4 and above 10 bits (the range extension profiles; their SPS / PPS extensions are not read), AV1 large-scale tiles, interlaced VC-1 (the CPU decoder has progressive pictures only), decode-time conversion and histograms, protected
   content (crypto sessions and authenticated channels are refused), unordered access to planes (the kernel has none to textures), layered rendering into several slices

@@ -15,16 +15,21 @@
  * You should have received a copy of the GNU Affero General Public License
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
-/* Direct3D 12 video encoding and motion estimation (d3d12.dll encode.inc over the kernel's CPU encoder): every encoder feature query (what is supported and what is refused),
- * the motion estimator (a textured picture shifted by a known amount gives that vector for every inner block, resolved into an R16G16_SINT texture), and an H.264 encode as a
- * program does it - its own SPS and PPS, the decoded picture buffer an NV12 array, IDR P B B P with two slices a picture - whose metadata is resolved and checked, then the
- * stream decoded again through ID3D12VideoDecodeCommandList (tests/windows/dxva_streams.h) and compared with the encoder's reconstructed pictures, sample for sample. */
+/* Direct3D 12 video encoding and motion estimation (d3d12.dll encode.inc over the kernel's CPU encoder): every encoder feature query (what is supported and what is refused,
+ * SUPPORT .. SUPPORT2, the input map queries of the later SDKs), the motion estimator (a textured picture shifted by a known amount gives that vector for every inner block,
+ * resolved into an R16G16_SINT texture), and H.264 encodes as a program does them - its own SPS and PPS, the decoded picture buffer an NV12 array of the picture's size,
+ * IDR P B B P - in four configurations: Main CAVLC with two slices; High CABAC with the 8x8 transform and temporal direct prediction at 100x60 (cropped); High CAVLC with the
+ * 8x8 transform, constrained intra prediction, spatial direct prediction, row-based intra refresh and slices of 400 bytes; Main CABAC with spatial direct prediction at
+ * 118x46, a slice a row, through ID3D12VideoEncodeCommandList4::EncodeFrame1 with dirty rectangles and move regions from the CPU and the PSNR metadata. Each picture's
+ * metadata is resolved and checked, then the stream decoded again through ID3D12VideoDecodeCommandList (tests/windows/dxva_streams.h) and compared with the encoder's
+ * reconstructed pictures, sample for sample. */
 #define COBJMACROS
 #define INITGUID
 #include <windows.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stddef.h>
 #include <d3d12.h>
 #include <d3d12video.h>
 #include <dxgi1_4.h>
@@ -181,7 +186,8 @@ static void test_features(void) {
   memset(&res, 0, sizeof res);
   res.Codec = D3D12_VIDEO_ENCODER_CODEC_H264;
   CHECK_HR(ID3D12VideoDevice3_CheckFeatureSupport(v, D3D12_FEATURE_VIDEO_ENCODER_OUTPUT_RESOLUTION, &res, sizeof res));
-  CHECK(res.IsSupported && res.MinResolutionSupported.Width == 16 && res.MaxResolutionSupported.Width == 4096 && res.ResolutionWidthMultipleRequirement == 16);
+  CHECK(res.IsSupported && res.MinResolutionSupported.Width == 16 && res.MaxResolutionSupported.Width == 4096 && res.ResolutionWidthMultipleRequirement == 2 &&
+        res.ResolutionHeightMultipleRequirement == 2);
   /* input formats */
   D3D12_FEATURE_DATA_VIDEO_ENCODER_INPUT_FORMAT inf = {0, D3D12_VIDEO_ENCODER_CODEC_H264, main_profile(), DXGI_FORMAT_NV12, FALSE};
   CHECK_HR(ID3D12VideoDevice3_CheckFeatureSupport(v, D3D12_FEATURE_VIDEO_ENCODER_INPUT_FORMAT, &inf, sizeof inf));
@@ -197,7 +203,7 @@ static void test_features(void) {
     modes += rm.IsSupported;
   }
   CHECK(modes == 5);
-  /* intra refresh: none only */
+  /* intra refresh: none and row based */
   D3D12_VIDEO_ENCODER_LEVELS_H264 level = D3D12_VIDEO_ENCODER_LEVELS_H264_31;
   D3D12_VIDEO_ENCODER_LEVEL_SETTING ls;
   ls.DataSize = sizeof level; ls.pH264LevelSetting = &level;
@@ -206,17 +212,20 @@ static void test_features(void) {
   CHECK(ir.IsSupported);
   ir.IntraRefreshMode = D3D12_VIDEO_ENCODER_INTRA_REFRESH_MODE_ROW_BASED;
   CHECK_HR(ID3D12VideoDevice3_CheckFeatureSupport(v, D3D12_FEATURE_VIDEO_ENCODER_INTRA_REFRESH_MODE, &ir, sizeof ir));
+  CHECK(ir.IsSupported);
+  ir.IntraRefreshMode = (D3D12_VIDEO_ENCODER_INTRA_REFRESH_MODE)2;
+  CHECK_HR(ID3D12VideoDevice3_CheckFeatureSupport(v, D3D12_FEATURE_VIDEO_ENCODER_INTRA_REFRESH_MODE, &ir, sizeof ir));
   CHECK(!ir.IsSupported);
-  /* slice layouts: full, macroblocks, rows, count; not bytes */
+  /* slice layouts: full, bytes, macroblocks, rows, count; not grids (AV1's) or automatic */
   int layouts = 0;
-  for (int m = 0; m <= 4; ++m) {
+  for (int m = 0; m <= 7; ++m) {
     D3D12_FEATURE_DATA_VIDEO_ENCODER_FRAME_SUBREGION_LAYOUT_MODE sm = {0, D3D12_VIDEO_ENCODER_CODEC_H264, main_profile(), ls, (D3D12_VIDEO_ENCODER_FRAME_SUBREGION_LAYOUT_MODE)m, FALSE};
     CHECK_HR(ID3D12VideoDevice3_CheckFeatureSupport(v, D3D12_FEATURE_VIDEO_ENCODER_FRAME_SUBREGION_LAYOUT_MODE, &sm, sizeof sm));
     layouts |= sm.IsSupported << m;
   }
-  CHECK(layouts == 0x1D);
-  /* the heap */
-  D3D12_VIDEO_ENCODER_PICTURE_RESOLUTION_DESC r96 = {96, 64}, odd = {100, 64};
+  CHECK(layouts == 0x1F);
+  /* the heap: the rate controller's state and the reference store (motion, the coded size's last columns and rows) */
+  D3D12_VIDEO_ENCODER_PICTURE_RESOLUTION_DESC r96 = {96, 64}, odd = {101, 64}, cropped = {100, 60};
   D3D12_FEATURE_DATA_VIDEO_ENCODER_HEAP_SIZE hs;
   memset(&hs, 0, sizeof hs);
   hs.HeapDesc.EncodeCodec = D3D12_VIDEO_ENCODER_CODEC_H264;
@@ -225,10 +234,30 @@ static void test_features(void) {
   hs.HeapDesc.ResolutionsListCount = 1;
   hs.HeapDesc.pResolutionList = &r96;
   CHECK_HR(ID3D12VideoDevice3_CheckFeatureSupport(v, D3D12_FEATURE_VIDEO_ENCODER_HEAP_SIZE, &hs, sizeof hs));
-  CHECK(hs.IsSupported && hs.MemoryPoolL1Size > 0);
+  CHECK(hs.IsSupported && hs.MemoryPoolL1Size == 256 + 32 + 17 * (64 + 24 * 40 + (15 * (96 + 64) * 3 / 2 + 7) / 8 * 8));
+  hs.HeapDesc.pResolutionList = &cropped;
+  CHECK_HR(ID3D12VideoDevice3_CheckFeatureSupport(v, D3D12_FEATURE_VIDEO_ENCODER_HEAP_SIZE, &hs, sizeof hs));
+  CHECK(hs.IsSupported);
   hs.HeapDesc.pResolutionList = &odd;
   CHECK_HR(ID3D12VideoDevice3_CheckFeatureSupport(v, D3D12_FEATURE_VIDEO_ENCODER_HEAP_SIZE, &hs, sizeof hs));
   CHECK(!hs.IsSupported);
+  D3D12_FEATURE_DATA_VIDEO_ENCODER_HEAP_SIZE1 hs1;
+  memset(&hs1, 0, sizeof hs1);
+  hs1.HeapDesc.Flags = D3D12_VIDEO_ENCODER_HEAP_FLAG_ALLOW_DIRTY_REGIONS_;
+  hs1.HeapDesc.EncodeCodec = D3D12_VIDEO_ENCODER_CODEC_H264;
+  hs1.HeapDesc.EncodeProfile = main_profile();
+  hs1.HeapDesc.EncodeLevel = ls;
+  hs1.HeapDesc.ResolutionsListCount = 1;
+  hs1.HeapDesc.pResolutionList = &r96;
+  CHECK_HR(ID3D12VideoDevice3_CheckFeatureSupport(v, D3D12_FEATURE_VIDEO_ENCODER_HEAP_SIZE1, &hs1, sizeof hs1));
+  CHECK(hs1.IsSupported && hs1.MemoryPoolL1Size == 256 + 32 + 17 * (64 + 24 * 40 + (15 * (96 + 64) * 3 / 2 + 7) / 8 * 8));
+  hs1.HeapDesc.Pow2DownscaleFactor = 1;      /* (frame analysis: not done) */
+  CHECK_HR(ID3D12VideoDevice3_CheckFeatureSupport(v, D3D12_FEATURE_VIDEO_ENCODER_HEAP_SIZE1, &hs1, sizeof hs1));
+  CHECK(!hs1.IsSupported);
+  hs1.HeapDesc.Pow2DownscaleFactor = 0;
+  hs1.HeapDesc.Flags = D3D12_VIDEO_ENCODER_HEAP_FLAG_ALLOW_SUBREGION_NOTIFICATION_ARRAY_OF_BUFFERS_;
+  CHECK_HR(ID3D12VideoDevice3_CheckFeatureSupport(v, D3D12_FEATURE_VIDEO_ENCODER_HEAP_SIZE1, &hs1, sizeof hs1));
+  CHECK(!hs1.IsSupported);
   /* the configuration's limits */
   D3D12_VIDEO_ENCODER_CODEC_CONFIGURATION_SUPPORT_H264 cs;
   D3D12_FEATURE_DATA_VIDEO_ENCODER_CODEC_CONFIGURATION_SUPPORT ccs;
@@ -239,7 +268,15 @@ static void test_features(void) {
   ccs.CodecSupportLimits.pH264Support = &cs;
   CHECK_HR(ID3D12VideoDevice3_CheckFeatureSupport(v, D3D12_FEATURE_VIDEO_ENCODER_CODEC_CONFIGURATION_SUPPORT, &ccs, sizeof ccs));
   CHECK(ccs.IsSupported && (cs.SupportFlags & D3D12_VIDEO_ENCODER_CODEC_CONFIGURATION_SUPPORT_H264_FLAG_CONSTRAINED_INTRAPREDICTION_SUPPORT) &&
-        !(cs.SupportFlags & D3D12_VIDEO_ENCODER_CODEC_CONFIGURATION_SUPPORT_H264_FLAG_CABAC_ENCODING_SUPPORT) && cs.DisableDeblockingFilterSupportedModes == 7);
+        (cs.SupportFlags & D3D12_VIDEO_ENCODER_CODEC_CONFIGURATION_SUPPORT_H264_FLAG_CABAC_ENCODING_SUPPORT) &&
+        (cs.SupportFlags & D3D12_VIDEO_ENCODER_CODEC_CONFIGURATION_SUPPORT_H264_FLAG_DIRECT_SPATIAL_ENCODING_SUPPORT) &&
+        (cs.SupportFlags & D3D12_VIDEO_ENCODER_CODEC_CONFIGURATION_SUPPORT_H264_FLAG_DIRECT_TEMPORAL_ENCODING_SUPPORT) &&
+        !(cs.SupportFlags & D3D12_VIDEO_ENCODER_CODEC_CONFIGURATION_SUPPORT_H264_FLAG_ADAPTIVE_8x8_TRANSFORM_ENCODING_SUPPORT) &&
+        !(cs.SupportFlags & D3D12_VIDEO_ENCODER_CODEC_CONFIGURATION_SUPPORT_H264_FLAG_INTRA_SLICE_CONSTRAINED_ENCODING_SUPPORT) && cs.DisableDeblockingFilterSupportedModes == 7);
+  D3D12_VIDEO_ENCODER_PROFILE_H264 high_profile = D3D12_VIDEO_ENCODER_PROFILE_H264_HIGH;
+  ccs.Profile.pH264Profile = &high_profile;      /* (the 8x8 transform is High's) */
+  CHECK_HR(ID3D12VideoDevice3_CheckFeatureSupport(v, D3D12_FEATURE_VIDEO_ENCODER_CODEC_CONFIGURATION_SUPPORT, &ccs, sizeof ccs));
+  CHECK(ccs.IsSupported && (cs.SupportFlags & D3D12_VIDEO_ENCODER_CODEC_CONFIGURATION_SUPPORT_H264_FLAG_ADAPTIVE_8x8_TRANSFORM_ENCODING_SUPPORT));
   /* the picture control's limits */
   D3D12_VIDEO_ENCODER_CODEC_PICTURE_CONTROL_SUPPORT_H264 ps;
   D3D12_FEATURE_DATA_VIDEO_ENCODER_CODEC_PICTURE_CONTROL_SUPPORT pcs;
@@ -273,20 +310,122 @@ static void test_features(void) {
   s.SubregionFrameEncodingData.pSlicesPartition_H264 = &two;
   CHECK_HR(ID3D12VideoDevice3_CheckFeatureSupport(v, D3D12_FEATURE_VIDEO_ENCODER_SUPPORT1, &s, sizeof s));
   CHECK(s.ValidationFlags == 0 && (s.SupportFlags & D3D12_VIDEO_ENCODER_SUPPORT_FLAG_GENERAL_SUPPORT_OK) && (s.SupportFlags & D3D12_VIDEO_ENCODER_SUPPORT_FLAG_RATE_CONTROL_DELTA_QP_AVAILABLE));
-  CHECK(suggested == D3D12_VIDEO_ENCODER_PROFILE_H264_MAIN && suggested_level == D3D12_VIDEO_ENCODER_LEVELS_H264_1 && limits.MaxSubregionsNumber == 24 && limits.SubregionBlockPixelsSize == 16);
+  CHECK(suggested == D3D12_VIDEO_ENCODER_PROFILE_H264_MAIN && suggested_level == D3D12_VIDEO_ENCODER_LEVELS_H264_1 && limits.MaxSubregionsNumber == 24 && limits.SubregionBlockPixelsSize == 16 &&
+        limits.MaxIntraRefreshFrameDuration == 4);
+  CHECK((s.SupportFlags & D3D12_VIDEO_ENCODER_SUPPORT_FLAG_FRAME_PSNR_METADATA_AVAILABLE_) && (s.SupportFlags & D3D12_VIDEO_ENCODER_SUPPORT_FLAG_SUBREGIONS_PSNR_METADATA_AVAILABLE_) &&
+        (s.SupportFlags & D3D12_VIDEO_ENCODER_SUPPORT_FLAG_INTRA_REFRESH_NO_SUBREGION_LAYOUT_CONSTRAINTS_AVAILABLE_) &&
+        !(s.SupportFlags & (D3D12_VIDEO_ENCODER_SUPPORT_FLAGS)(0x10000 | 0x20000 | 0x40000 | 0x80000 | 0x100000)) &&      /* (no per-block maps, no subregion notification) */
+        !(s.SupportFlags & D3D12_VIDEO_ENCODER_SUPPORT_FLAG_RATE_CONTROL_FRAME_ANALYSIS_AVAILABLE));
+  /* CABAC, the 8x8 transform (High suggested), direct prediction, intra refresh, slices by bytes, a cropped size: all taken */
   D3D12_VIDEO_ENCODER_CODEC_CONFIGURATION_H264 cabac = g_config;
-  cabac.ConfigurationFlags = D3D12_VIDEO_ENCODER_CODEC_CONFIGURATION_H264_FLAG_ENABLE_CABAC_ENCODING;
+  cabac.ConfigurationFlags = D3D12_VIDEO_ENCODER_CODEC_CONFIGURATION_H264_FLAG_ENABLE_CABAC_ENCODING | D3D12_VIDEO_ENCODER_CODEC_CONFIGURATION_H264_FLAG_USE_ADAPTIVE_8x8_TRANSFORM;
+  cabac.DirectModeConfig = D3D12_VIDEO_ENCODER_CODEC_CONFIGURATION_H264_DIRECT_MODES_TEMPORAL;
   s.CodecConfiguration.pH264Config = &cabac;
+  s.IntraRefresh = D3D12_VIDEO_ENCODER_INTRA_REFRESH_MODE_ROW_BASED;
+  CHECK_HR(ID3D12VideoDevice3_CheckFeatureSupport(v, D3D12_FEATURE_VIDEO_ENCODER_SUPPORT1, &s, sizeof s));
+  CHECK(s.ValidationFlags == 0 && (s.SupportFlags & D3D12_VIDEO_ENCODER_SUPPORT_FLAG_GENERAL_SUPPORT_OK) && suggested == D3D12_VIDEO_ENCODER_PROFILE_H264_HIGH);
+  s.IntraRefresh = D3D12_VIDEO_ENCODER_INTRA_REFRESH_MODE_NONE;
+  /* (the deblocking modes 3 - 6 are SVC's, intra constrained slices are not done) */
+  D3D12_VIDEO_ENCODER_CODEC_CONFIGURATION_H264 svc = g_config;
+  svc.DisableDeblockingFilterConfig = D3D12_VIDEO_ENCODER_CODEC_CONFIGURATION_H264_SLICES_DEBLOCKING_MODE_3_USE_TWO_STAGE_DEBLOCKING;
+  s.CodecConfiguration.pH264Config = &svc;
   CHECK_HR(ID3D12VideoDevice3_CheckFeatureSupport(v, D3D12_FEATURE_VIDEO_ENCODER_SUPPORT1, &s, sizeof s));
   CHECK((s.ValidationFlags & D3D12_VIDEO_ENCODER_VALIDATION_FLAG_CODEC_CONFIGURATION_NOT_SUPPORTED) && !(s.SupportFlags & D3D12_VIDEO_ENCODER_SUPPORT_FLAG_GENERAL_SUPPORT_OK));
+  svc = g_config;
+  svc.ConfigurationFlags = D3D12_VIDEO_ENCODER_CODEC_CONFIGURATION_H264_FLAG_ALLOW_REQUEST_INTRA_CONSTRAINED_SLICES;
+  CHECK_HR(ID3D12VideoDevice3_CheckFeatureSupport(v, D3D12_FEATURE_VIDEO_ENCODER_SUPPORT1, &s, sizeof s));
+  CHECK(s.ValidationFlags & D3D12_VIDEO_ENCODER_VALIDATION_FLAG_CODEC_CONFIGURATION_NOT_SUPPORTED);
   s.CodecConfiguration = config_desc();
+  D3D12_VIDEO_ENCODER_PICTURE_CONTROL_SUBREGIONS_LAYOUT_DATA_SLICES bytes = {{1000}};
+  s.SubregionFrameEncodingData.pSlicesPartition_H264 = &bytes;
   s.SubregionFrameEncoding = D3D12_VIDEO_ENCODER_FRAME_SUBREGION_LAYOUT_MODE_BYTES_PER_SUBREGION;
+  CHECK_HR(ID3D12VideoDevice3_CheckFeatureSupport(v, D3D12_FEATURE_VIDEO_ENCODER_SUPPORT1, &s, sizeof s));
+  CHECK(s.ValidationFlags == 0);
+  s.SubregionFrameEncodingData.pSlicesPartition_H264 = &two;
+  s.SubregionFrameEncoding = (D3D12_VIDEO_ENCODER_FRAME_SUBREGION_LAYOUT_MODE)5;      /* (UNIFORM_GRID_PARTITION, AV1's) */
   CHECK_HR(ID3D12VideoDevice3_CheckFeatureSupport(v, D3D12_FEATURE_VIDEO_ENCODER_SUPPORT1, &s, sizeof s));
   CHECK(s.ValidationFlags == D3D12_VIDEO_ENCODER_VALIDATION_FLAG_SUBREGION_LAYOUT_MODE_NOT_SUPPORTED);
   s.SubregionFrameEncoding = D3D12_VIDEO_ENCODER_FRAME_SUBREGION_LAYOUT_MODE_FULL_FRAME;
+  s.pResolutionList = &cropped;
+  CHECK_HR(ID3D12VideoDevice3_CheckFeatureSupport(v, D3D12_FEATURE_VIDEO_ENCODER_SUPPORT1, &s, sizeof s));
+  CHECK(s.ValidationFlags == 0 && limits.MaxSubregionsNumber == 28);
   s.pResolutionList = &odd;
   CHECK_HR(ID3D12VideoDevice3_CheckFeatureSupport(v, D3D12_FEATURE_VIDEO_ENCODER_SUPPORT1, &s, sizeof s));
   CHECK(s.ValidationFlags == D3D12_VIDEO_ENCODER_VALIDATION_FLAG_RESOLUTION_NOT_SUPPORTED_IN_LIST);
+  /* SUPPORT2: the input maps from the CPU are taken, from GPU textures not; no frame analysis */
+  {
+    D3D12_FEATURE_DATA_VIDEO_ENCODER_RESOLUTION_SUPPORT_LIMITS1 lim1;
+    D3D12_FEATURE_DATA_VIDEO_ENCODER_SUPPORT2 s2;
+    memset(&s2, 0, sizeof s2);
+    memcpy(&s2, &s, offsetof(D3D12_FEATURE_DATA_VIDEO_ENCODER_SUPPORT2, pResolutionDependentSupport));
+    s2.pResolutionList = &r96;
+    s2.pResolutionDependentSupport = &lim1;
+    s2.SubregionFrameEncodingData = s.SubregionFrameEncodingData;
+    s2.QPMap.Enabled = TRUE; s2.QPMap.MapSource = D3D12_VIDEO_ENCODER_INPUT_MAP_SOURCE_CPU_BUFFER;
+    s2.DirtyRegions.Enabled = TRUE; s2.DirtyRegions.MapSource = D3D12_VIDEO_ENCODER_INPUT_MAP_SOURCE_CPU_BUFFER; s2.DirtyRegions.MapValuesType = D3D12_VIDEO_ENCODER_DIRTY_REGIONS_MAP_VALUES_MODE_SKIP;
+    s2.MotionSearch.Enabled = TRUE; s2.MotionSearch.MapSource = D3D12_VIDEO_ENCODER_INPUT_MAP_SOURCE_CPU_BUFFER; s2.MotionSearch.MotionSearchMode = D3D12_VIDEO_ENCODER_FRAME_MOTION_SEARCH_MODE_START_HINT_LIMITED_DISTANCE;
+    CHECK_HR(ID3D12VideoDevice3_CheckFeatureSupport(v, D3D12_FEATURE_VIDEO_ENCODER_SUPPORT2, &s2, sizeof s2));
+    CHECK(s2.ValidationFlags == 0 && (s2.SupportFlags & D3D12_VIDEO_ENCODER_SUPPORT_FLAG_GENERAL_SUPPORT_OK) && lim1.MaxSubregionsNumber == 24 && lim1.MaxIntraRefreshFrameDuration == 4 &&
+          lim1.DirtyRegions.DirtyRegionsSupportFlags == (D3D12_VIDEO_ENCODER_DIRTY_REGIONS_SUPPORT_FLAG_REPEAT_FRAME | D3D12_VIDEO_ENCODER_DIRTY_REGIONS_SUPPORT_FLAG_DIRTY_REGIONS) &&
+          lim1.MotionSearch.SupportFlags == D3D12_VIDEO_ENCODER_MOTION_SEARCH_SUPPORT_FLAG_SUPPORTED && lim1.MotionSearch.MaxDeviation > 0 &&
+          lim1.FrameAnalysis.SupportFlags == D3D12_VIDEO_ENCODER_RATE_CONTROL_FRAME_ANALYSIS_SUPPORT_FLAG_NONE);
+    s2.QPMap.MapSource = s2.DirtyRegions.MapSource = s2.MotionSearch.MapSource = D3D12_VIDEO_ENCODER_INPUT_MAP_SOURCE_GPU_TEXTURE;
+    s2.FrameAnalysis.Enabled = TRUE;
+    CHECK_HR(ID3D12VideoDevice3_CheckFeatureSupport(v, D3D12_FEATURE_VIDEO_ENCODER_SUPPORT2, &s2, sizeof s2));
+    CHECK(s2.ValidationFlags == (D3D12_VIDEO_ENCODER_VALIDATION_FLAG_QPMAP_NOT_SUPPORTED_ | D3D12_VIDEO_ENCODER_VALIDATION_FLAG_DIRTY_REGIONS_NOT_SUPPORTED_ |
+                                 D3D12_VIDEO_ENCODER_VALIDATION_FLAG_MOTION_SEARCH_NOT_SUPPORTED_ | D3D12_VIDEO_ENCODER_VALIDATION_FLAG_FRAME_ANALYSIS_NOT_SUPPORTED_) &&
+          !(s2.SupportFlags & D3D12_VIDEO_ENCODER_SUPPORT_FLAG_GENERAL_SUPPORT_OK));
+    /* the input map queries */
+    D3D12_VIDEO_ENCODER_INPUT_MAP_SESSION_INFO si;
+    memset(&si, 0, sizeof si);
+    si.Codec = D3D12_VIDEO_ENCODER_CODEC_H264;
+    si.Profile = main_profile();
+    si.Level = ls;
+    si.InputFormat = DXGI_FORMAT_NV12;
+    si.InputResolution = r96;
+    si.CodecConfiguration = config_desc();
+    si.SubregionFrameEncoding = D3D12_VIDEO_ENCODER_FRAME_SUBREGION_LAYOUT_MODE_FULL_FRAME;
+    D3D12_FEATURE_DATA_VIDEO_ENCODER_QPMAP_INPUT qi = {0, si, D3D12_VIDEO_ENCODER_INPUT_MAP_SOURCE_CPU_BUFFER, FALSE, 0, 0};
+    CHECK_HR(ID3D12VideoDevice3_CheckFeatureSupport(v, D3D12_FEATURE_VIDEO_ENCODER_QPMAP_INPUT, &qi, sizeof qi));
+    CHECK(qi.IsSupported && qi.BlockSize == 16);
+    qi.MapSource = D3D12_VIDEO_ENCODER_INPUT_MAP_SOURCE_GPU_TEXTURE;
+    CHECK_HR(ID3D12VideoDevice3_CheckFeatureSupport(v, D3D12_FEATURE_VIDEO_ENCODER_QPMAP_INPUT, &qi, sizeof qi));
+    CHECK(!qi.IsSupported);
+    D3D12_FEATURE_DATA_VIDEO_ENCODER_DIRTY_REGIONS dr = {0, si, D3D12_VIDEO_ENCODER_INPUT_MAP_SOURCE_CPU_BUFFER, D3D12_VIDEO_ENCODER_DIRTY_REGIONS_MAP_VALUES_MODE_DIRTY, 0, 0};
+    CHECK_HR(ID3D12VideoDevice3_CheckFeatureSupport(v, D3D12_FEATURE_VIDEO_ENCODER_DIRTY_REGIONS, &dr, sizeof dr));
+    CHECK(dr.SupportFlags == (D3D12_VIDEO_ENCODER_DIRTY_REGIONS_SUPPORT_FLAG_REPEAT_FRAME | D3D12_VIDEO_ENCODER_DIRTY_REGIONS_SUPPORT_FLAG_DIRTY_REGIONS));
+    dr.MapSource = D3D12_VIDEO_ENCODER_INPUT_MAP_SOURCE_GPU_TEXTURE;
+    CHECK_HR(ID3D12VideoDevice3_CheckFeatureSupport(v, D3D12_FEATURE_VIDEO_ENCODER_DIRTY_REGIONS, &dr, sizeof dr));
+    CHECK(dr.SupportFlags == D3D12_VIDEO_ENCODER_DIRTY_REGIONS_SUPPORT_FLAG_NONE);
+    D3D12_FEATURE_DATA_VIDEO_ENCODER_MOTION_SEARCH ms;
+    memset(&ms, 0, sizeof ms);
+    ms.SessionInfo = si;
+    ms.MotionSearchMode = D3D12_VIDEO_ENCODER_FRAME_MOTION_SEARCH_MODE_START_HINT;
+    ms.MapSource = D3D12_VIDEO_ENCODER_INPUT_MAP_SOURCE_CPU_BUFFER;
+    ms.BidirectionalRefFrameEnabled = TRUE;
+    CHECK_HR(ID3D12VideoDevice3_CheckFeatureSupport(v, D3D12_FEATURE_VIDEO_ENCODER_MOTION_SEARCH, &ms, sizeof ms));
+    CHECK(ms.SupportFlags == D3D12_VIDEO_ENCODER_MOTION_SEARCH_SUPPORT_FLAG_SUPPORTED && ms.MaxMotionHints > 0 && ms.MotionUnitPrecisionSupport == 7);
+    ms.MapSource = D3D12_VIDEO_ENCODER_INPUT_MAP_SOURCE_GPU_TEXTURE;
+    CHECK_HR(ID3D12VideoDevice3_CheckFeatureSupport(v, D3D12_FEATURE_VIDEO_ENCODER_MOTION_SEARCH, &ms, sizeof ms));
+    CHECK(ms.SupportFlags == D3D12_VIDEO_ENCODER_MOTION_SEARCH_SUPPORT_FLAG_NONE);
+    for (int t = 0; t < 3; ++t) {
+      D3D12_FEATURE_DATA_VIDEO_ENCODER_RESOLVE_INPUT_PARAM_LAYOUT rl = {0, si, (D3D12_VIDEO_ENCODER_INPUT_MAP_TYPE)t, TRUE, 99};
+      CHECK_HR(ID3D12VideoDevice3_CheckFeatureSupport(v, D3D12_FEATURE_VIDEO_ENCODER_RESOLVE_INPUT_PARAM_LAYOUT, &rl, sizeof rl));
+      CHECK(!rl.IsSupported && rl.MaxResolvedBufferAllocationSize == 0);
+    }
+    D3D12_FEATURE_DATA_VIDEO_ENCODER_RATE_CONTROL_FRAME_ANALYSIS fa;
+    memset(&fa, 0, sizeof fa);
+    fa.Codec = D3D12_VIDEO_ENCODER_CODEC_H264;
+    fa.Profile = main_profile();
+    fa.Level = ls;
+    fa.InputFormat = DXGI_FORMAT_NV12;
+    fa.InputResolution = r96;
+    fa.CodecConfiguration = config_desc();
+    fa.Pow2DownscaleFactor = 1;
+    fa.SupportFlags = (D3D12_VIDEO_ENCODER_RATE_CONTROL_FRAME_ANALYSIS_SUPPORT_FLAGS)0x3F;
+    CHECK_HR(ID3D12VideoDevice3_CheckFeatureSupport(v, D3D12_FEATURE_VIDEO_ENCODER_RATE_CONTROL_FRAME_ANALYSIS, &fa, sizeof fa));
+    CHECK(fa.SupportFlags == D3D12_VIDEO_ENCODER_RATE_CONTROL_FRAME_ANALYSIS_SUPPORT_FLAG_NONE);
+  }
   /* (SUPPORT, the older one: a CBR rate with no bit rate is refused) */
   D3D12_VIDEO_ENCODER_RATE_CONTROL_CBR cbr;
   memset(&cbr, 0, sizeof cbr);
@@ -305,6 +444,35 @@ static void test_features(void) {
   D3D12_FEATURE_DATA_VIDEO_ENCODER_RESOURCE_REQUIREMENTS rr = {0, D3D12_VIDEO_ENCODER_CODEC_H264, main_profile(), DXGI_FORMAT_NV12, {96, 64}, FALSE, 0, 0, 0};
   CHECK_HR(ID3D12VideoDevice3_CheckFeatureSupport(v, D3D12_FEATURE_VIDEO_ENCODER_RESOURCE_REQUIREMENTS, &rr, sizeof rr));
   CHECK(rr.IsSupported && rr.MaxEncoderOutputMetadataBufferSize >= sizeof(D3D12_VIDEO_ENCODER_OUTPUT_METADATA) + 24 * sizeof(D3D12_VIDEO_ENCODER_FRAME_SUBREGION_METADATA));
+  D3D12_FEATURE_DATA_VIDEO_ENCODER_RESOURCE_REQUIREMENTS1 rr1;
+  memset(&rr1, 0, sizeof rr1);
+  rr1.Codec = D3D12_VIDEO_ENCODER_CODEC_H264;
+  rr1.Profile = main_profile();
+  rr1.InputFormat = DXGI_FORMAT_NV12;
+  rr1.PictureTargetResolution = cropped;
+  rr1.OptionalMetadata = D3D12_VIDEO_ENCODER_OPTIONAL_METADATA_ENABLE_FLAG_FRAME_PSNR | D3D12_VIDEO_ENCODER_OPTIONAL_METADATA_ENABLE_FLAG_SUBREGIONS_PSNR;
+  CHECK_HR(ID3D12VideoDevice3_CheckFeatureSupport(v, D3D12_FEATURE_VIDEO_ENCODER_RESOURCE_REQUIREMENTS1, &rr1, sizeof rr1));
+  CHECK(rr1.IsSupported && rr1.EncoderOutputMetadataFramePSNRComponentsNumber == 3 && rr1.EncoderOutputMetadataSubregionsPSNRComponentsNumber == 3 &&
+        rr1.EncoderOutputMetadataSubregionsPSNRResolvedMetadataBufferSize == 28 * 12 && rr1.MaxEncoderOutputMetadataBufferSize == 80 + 28 * 24 + 8 + 40 * 29);
+  rr1.OptionalMetadata = D3D12_VIDEO_ENCODER_OPTIONAL_METADATA_ENABLE_FLAG_QP_MAP;      /* (the per-block maps: not offered) */
+  CHECK_HR(ID3D12VideoDevice3_CheckFeatureSupport(v, D3D12_FEATURE_VIDEO_ENCODER_RESOURCE_REQUIREMENTS1, &rr1, sizeof rr1));
+  CHECK(!rr1.IsSupported);
+  /* the video device and the encode list of the later SDKs */
+  ID3D12VideoDevice4 *v4 = NULL;
+  CHECK_HR(ID3D12VideoDevice3_QueryInterface(v, &IID_ID3D12VideoDevice4, (void **)&v4));
+  if (v4) v4->lpVtbl->Release(v4);
+  /* (an encoder of the 8x8 transform is High's) */
+  D3D12_VIDEO_ENCODER_CODEC_CONFIGURATION_H264 t8 = g_config;
+  t8.ConfigurationFlags = D3D12_VIDEO_ENCODER_CODEC_CONFIGURATION_H264_FLAG_USE_ADAPTIVE_8x8_TRANSFORM;
+  D3D12_VIDEO_ENCODER_DESC bad;
+  memset(&bad, 0, sizeof bad);
+  bad.EncodeCodec = D3D12_VIDEO_ENCODER_CODEC_H264;
+  bad.EncodeProfile = main_profile();
+  bad.InputFormat = DXGI_FORMAT_NV12;
+  bad.CodecConfiguration.DataSize = sizeof t8;
+  bad.CodecConfiguration.pH264Config = &t8;
+  void *none = (void *)1;
+  CHECK(ID3D12VideoDevice3_CreateVideoEncoder(v, &bad, &IID_ID3D12VideoEncoder, &none) == E_INVALIDARG && !none);
   /* the motion estimator */
   D3D12_FEATURE_DATA_VIDEO_MOTION_ESTIMATOR me = {0, DXGI_FORMAT_NV12, 0, 0, {0, 0, 0, 0}};
   CHECK_HR(ID3D12VideoDevice3_CheckFeatureSupport(v, D3D12_FEATURE_VIDEO_MOTION_ESTIMATOR, &me, sizeof me));
@@ -429,14 +597,22 @@ static size_t nal(BYTE *out, int ref_idc, int type, const Bits *s) {
   }
   return n;
 }
-/* The program's parameter sets, as the encoder's slices need them (H264PictureEncoder.hpp): Main, CAVLC, POC type 0, pic_init_qp 26, deblocking control present. */
-static size_t parameter_sets(BYTE *out, UINT mbw, UINT mbh) {
+/* The program's parameter sets, as the encoder's slices need them (H264PictureEncoder.hpp): Main or High, CAVLC or CABAC, the 8x8 transform or not, POC type 0,
+ * pic_init_qp 26, deblocking control present, the visible size cropped from whole macroblocks. */
+static size_t parameter_sets(BYTE *out, UINT width, UINT height, int high, int cabac, int t8x8, int constrained) {
   Bits s = {{0}, 0}, p = {{0}, 0};
-  put(&s, 77, 8); put(&s, 0, 8); put(&s, 30, 8); ue(&s, 0);
+  const UINT mbw = (width + 15) / 16, mbh = (height + 15) / 16;
+  put(&s, high ? 100 : 77, 8); put(&s, 0, 8); put(&s, 31, 8); ue(&s, 0);
+  if (high) { ue(&s, 1); ue(&s, 0); ue(&s, 0); bit(&s, 0); bit(&s, 0); }
   ue(&s, g_gop.log2_max_frame_num_minus4); ue(&s, 0); ue(&s, g_gop.log2_max_pic_order_cnt_lsb_minus4);
-  ue(&s, 4); bit(&s, 0); ue(&s, mbw - 1); ue(&s, mbh - 1); bit(&s, 1); bit(&s, 1); bit(&s, 0); bit(&s, 0);
+  ue(&s, 4); bit(&s, 0); ue(&s, mbw - 1); ue(&s, mbh - 1); bit(&s, 1); bit(&s, 1);
+  const UINT cr = (mbw * 16 - width) / 2, cb = (mbh * 16 - height) / 2;
+  if (cr || cb) { bit(&s, 1); ue(&s, 0); ue(&s, cr); ue(&s, 0); ue(&s, cb); } else bit(&s, 0);
+  bit(&s, 0);
   trailing(&s);
-  ue(&p, 0); ue(&p, 0); bit(&p, 0); bit(&p, 0); ue(&p, 0); ue(&p, 0); ue(&p, 0); bit(&p, 0); put(&p, 0, 2); se(&p, 0); se(&p, 0); se(&p, 0); bit(&p, 1); bit(&p, 0); bit(&p, 0);
+  ue(&p, 0); ue(&p, 0); bit(&p, cabac ? 1 : 0); bit(&p, 0); ue(&p, 0); ue(&p, 0); ue(&p, 0); bit(&p, 0); put(&p, 0, 2); se(&p, 0); se(&p, 0); se(&p, 0); bit(&p, 1);
+  bit(&p, constrained ? 1 : 0); bit(&p, 0);
+  if (high) { bit(&p, t8x8 ? 1 : 0); bit(&p, 0); se(&p, 0); }
   trailing(&p);
   size_t n = nal(out, 3, 7, &s);
   return n + nal(out + n, 3, 8, &p);
@@ -444,9 +620,22 @@ static size_t parameter_sets(BYTE *out, UINT mbw, UINT mbh) {
 
 #include "dxva_streams.h"
 
+/* One sequence: IDR P B B P coded as a program codes it (its DPB an NV12 array of the picture's size, its own parameter sets), every picture's metadata checked, the stream
+ * decoded again through ID3D12VideoDecodeCommandList and compared with the reconstructions sample for sample. */
+typedef struct EncodeCase {
+  const char *name;
+  UINT width, height;
+  UINT flags;                                   /* D3D12_VIDEO_ENCODER_CODEC_CONFIGURATION_H264_FLAGS */
+  D3D12_VIDEO_ENCODER_CODEC_CONFIGURATION_H264_DIRECT_MODES direct;
+  D3D12_VIDEO_ENCODER_FRAME_SUBREGION_LAYOUT_MODE layout;
+  UINT layout_value;
+  UINT refresh;                                 /* the intra refresh wave's length (0: none) */
+  int encode1;                                  /* EncodeFrame1: dirty rectangles and a move region on the P pictures, the PSNRs */
+} EncodeCase;
 #define FRAMES 5
-static void test_encode(void) {
-  const UINT W = 96, H = 64, DPB = 4;
+static void encode_case(const EncodeCase *c) {
+  const UINT W = c->width, H = c->height, DPB = 4, CW = (W + 1) / 2, CH = (H + 1) / 2;
+  const int high = (c->flags & D3D12_VIDEO_ENCODER_CODEC_CONFIGURATION_H264_FLAG_USE_ADAPTIVE_8x8_TRANSFORM) != 0;
   /* coding order: IDR (display 0), P (3), B (1), B (2), P (4); POC = 2 x display */
   static const struct { D3D12_VIDEO_ENCODER_FRAME_TYPE_H264 type; UINT display, slot, reference; int l0[2], l1; } frames[FRAMES] = {
       {D3D12_VIDEO_ENCODER_FRAME_TYPE_H264_IDR_FRAME, 0, 0, 1, {-1, -1}, -1},
@@ -454,68 +643,88 @@ static void test_encode(void) {
       {D3D12_VIDEO_ENCODER_FRAME_TYPE_H264_B_FRAME, 1, 2, 0, {0, -1}, 1},
       {D3D12_VIDEO_ENCODER_FRAME_TYPE_H264_B_FRAME, 2, 2, 0, {0, -1}, 1},
       {D3D12_VIDEO_ENCODER_FRAME_TYPE_H264_P_FRAME, 4, 3, 1, {1, 0}, -1}};
+  D3D12_VIDEO_ENCODER_PROFILE_H264 profile = high ? D3D12_VIDEO_ENCODER_PROFILE_H264_HIGH : D3D12_VIDEO_ENCODER_PROFILE_H264_MAIN;
+  D3D12_VIDEO_ENCODER_CODEC_CONFIGURATION_H264 config = g_config;
+  config.ConfigurationFlags = (D3D12_VIDEO_ENCODER_CODEC_CONFIGURATION_H264_FLAGS)c->flags;
+  config.DirectModeConfig = c->direct;
   D3D12_VIDEO_ENCODER_DESC ed;
   memset(&ed, 0, sizeof ed);
   ed.EncodeCodec = D3D12_VIDEO_ENCODER_CODEC_H264;
-  ed.EncodeProfile = main_profile();
+  ed.EncodeProfile.DataSize = sizeof profile;
+  ed.EncodeProfile.pH264Profile = &profile;
   ed.InputFormat = DXGI_FORMAT_NV12;
-  ed.CodecConfiguration = config_desc();
+  ed.CodecConfiguration.DataSize = sizeof config;
+  ed.CodecConfiguration.pH264Config = &config;
   ed.MaxMotionEstimationPrecision = D3D12_VIDEO_ENCODER_MOTION_ESTIMATION_PRECISION_MODE_MAXIMUM;
   ID3D12VideoEncoder *enc = NULL;
   CHECK_HR(ID3D12VideoDevice3_CreateVideoEncoder(g_vdev, &ed, &IID_ID3D12VideoEncoder, (void **)&enc));
-  D3D12_VIDEO_ENCODER_CODEC_CONFIGURATION_H264 cabac = g_config;
-  cabac.ConfigurationFlags = D3D12_VIDEO_ENCODER_CODEC_CONFIGURATION_H264_FLAG_ENABLE_CABAC_ENCODING;
-  D3D12_VIDEO_ENCODER_DESC bad = ed;
-  bad.CodecConfiguration.pH264Config = &cabac;
-  void *none = (void *)1;
-  CHECK(ID3D12VideoDevice3_CreateVideoEncoder(g_vdev, &bad, &IID_ID3D12VideoEncoder, &none) == E_INVALIDARG && !none);
   D3D12_VIDEO_ENCODER_LEVELS_H264 level = D3D12_VIDEO_ENCODER_LEVELS_H264_3;
   D3D12_VIDEO_ENCODER_PICTURE_RESOLUTION_DESC res = {W, H};
-  D3D12_VIDEO_ENCODER_HEAP_DESC hd;
-  memset(&hd, 0, sizeof hd);
-  hd.EncodeCodec = D3D12_VIDEO_ENCODER_CODEC_H264;
-  hd.EncodeProfile = main_profile();
-  hd.EncodeLevel.DataSize = sizeof level;
-  hd.EncodeLevel.pH264LevelSetting = &level;
-  hd.ResolutionsListCount = 1;
-  hd.pResolutionList = &res;
   ID3D12VideoEncoderHeap *heap = NULL;
-  CHECK_HR(ID3D12VideoDevice3_CreateVideoEncoderHeap(g_vdev, &hd, &IID_ID3D12VideoEncoderHeap, (void **)&heap));
-  if (enc && heap) {
-    D3D12_VIDEO_ENCODER_PROFILE_H264 p = 99;
-    D3D12_VIDEO_ENCODER_PROFILE_DESC pd = {sizeof p, {&p}};
-    CHECK_HR(ID3D12VideoEncoder_GetCodecProfile(enc, pd));
-    CHECK(p == D3D12_VIDEO_ENCODER_PROFILE_H264_MAIN && ID3D12VideoEncoder_GetInputFormat(enc) == DXGI_FORMAT_NV12 && ID3D12VideoEncoderHeap_GetResolutionListCount(heap) == 1);
-    D3D12_VIDEO_ENCODER_PICTURE_RESOLUTION_DESC back = {0, 0};
-    CHECK_HR(ID3D12VideoEncoderHeap_GetResolutionList(heap, 1, &back));
-    CHECK(back.Width == W && back.Height == H);
+  ID3D12VideoEncoderHeap1 *heap1 = NULL;
+  ID3D12VideoDevice4 *vdev4 = NULL;
+  if (c->encode1) {
+    /* (EncodeFrame1 takes ID3D12VideoEncoderHeap1, from ID3D12VideoDevice4; dirty regions are allowed by the heap) */
+    CHECK_HR(ID3D12VideoDevice3_QueryInterface(g_vdev, &IID_ID3D12VideoDevice4, (void **)&vdev4));
+    D3D12_VIDEO_ENCODER_HEAP_DESC1 hd;
+    memset(&hd, 0, sizeof hd);
+    hd.Flags = D3D12_VIDEO_ENCODER_HEAP_FLAG_ALLOW_DIRTY_REGIONS_;
+    hd.EncodeCodec = D3D12_VIDEO_ENCODER_CODEC_H264;
+    hd.EncodeProfile = ed.EncodeProfile;
+    hd.EncodeLevel.DataSize = sizeof level;
+    hd.EncodeLevel.pH264LevelSetting = &level;
+    hd.ResolutionsListCount = 1;
+    hd.pResolutionList = &res;
+    if (vdev4) CHECK_HR(vdev4->lpVtbl->CreateVideoEncoderHeap1(vdev4, &hd, &IID_ID3D12VideoEncoderHeap1, (void **)&heap1));
+    CHECK(heap1 && heap1->lpVtbl->GetPow2DownscaleFactor(heap1) == 0 && heap1->lpVtbl->GetEncoderHeapFlags(heap1) == D3D12_VIDEO_ENCODER_HEAP_FLAG_ALLOW_DIRTY_REGIONS_);
+    if (heap1) heap1->lpVtbl->QueryInterface(heap1, &IID_ID3D12VideoEncoderHeap, (void **)&heap);
+  } else {
+    D3D12_VIDEO_ENCODER_HEAP_DESC hd;
+    memset(&hd, 0, sizeof hd);
+    hd.EncodeCodec = D3D12_VIDEO_ENCODER_CODEC_H264;
+    hd.EncodeProfile = ed.EncodeProfile;
+    hd.EncodeLevel.DataSize = sizeof level;
+    hd.EncodeLevel.pH264LevelSetting = &level;
+    hd.ResolutionsListCount = 1;
+    hd.pResolutionList = &res;
+    CHECK_HR(ID3D12VideoDevice3_CreateVideoEncoderHeap(g_vdev, &hd, &IID_ID3D12VideoEncoderHeap, (void **)&heap));
   }
+  /* (the textures are of the picture's size: the coded size's last columns and rows are the heap's) */
   ID3D12Resource *input = texture(DXGI_FORMAT_NV12, W, H, 1), *dpb = texture(DXGI_FORMAT_NV12, W, H, DPB);
-  ID3D12Resource *bits = buffer(D3D12_HEAP_TYPE_READBACK, 1 << 18), *meta = buffer(D3D12_HEAP_TYPE_DEFAULT, 4096), *resolved = buffer(D3D12_HEAP_TYPE_READBACK, 4096);
+  ID3D12Resource *bits = buffer(D3D12_HEAP_TYPE_READBACK, 1 << 18), *meta = buffer(D3D12_HEAP_TYPE_DEFAULT, 1 << 16), *resolved = buffer(D3D12_HEAP_TYPE_READBACK, 1 << 16);
+  ID3D12Resource *psnr = buffer(D3D12_HEAP_TYPE_READBACK, 4096);
   D3D12_COMMAND_QUEUE_DESC qd = {D3D12_COMMAND_LIST_TYPE_VIDEO_ENCODE, 0, D3D12_COMMAND_QUEUE_FLAG_NONE, 0};
   ID3D12CommandQueue *q = NULL;
   ID3D12CommandAllocator *a = NULL;
   ID3D12VideoEncodeCommandList2 *l = NULL;
+  ID3D12VideoEncodeCommandList4 *l4 = NULL;
   ID3D12Device_CreateCommandQueue(g_dev, &qd, &IID_ID3D12CommandQueue, (void **)&q);
   ID3D12Device_CreateCommandAllocator(g_dev, D3D12_COMMAND_LIST_TYPE_VIDEO_ENCODE, &IID_ID3D12CommandAllocator, (void **)&a);
   if (a) ID3D12Device_CreateCommandList(g_dev, 0, D3D12_COMMAND_LIST_TYPE_VIDEO_ENCODE, a, NULL, &IID_ID3D12VideoEncodeCommandList2, (void **)&l);
-  CHECK(enc && heap && input && dpb && bits && meta && resolved && q && l);
-  if (!enc || !heap || !input || !dpb || !bits || !meta || !resolved || !q || !l) return;
+  if (l && c->encode1) CHECK_HR(ID3D12VideoEncodeCommandList2_QueryInterface(l, &IID_ID3D12VideoEncodeCommandList4, (void **)&l4));
+  CHECK(enc && heap && input && dpb && bits && meta && resolved && psnr && q && l && (!c->encode1 || l4));
+  if (!enc || !heap || !input || !dpb || !bits || !meta || !resolved || !psnr || !q || !l || (c->encode1 && !l4)) return;
   static BYTE stream[1 << 18];
-  size_t stream_size = parameter_sets(stream, W / 16, H / 16);
-  static BYTE recon_y[FRAMES][96 * 64], recon_uv[FRAMES][96 * 32], src_y[96 * 64], src_uv[96 * 32];
-  ID3D12Resource *dpb_list[DPB];
-  UINT dpb_subs[DPB];
+  size_t stream_size = parameter_sets(stream, W, H, high, (c->flags & D3D12_VIDEO_ENCODER_CODEC_CONFIGURATION_H264_FLAG_ENABLE_CABAC_ENCODING) != 0, high,
+                                      (c->flags & D3D12_VIDEO_ENCODER_CODEC_CONFIGURATION_H264_FLAG_USE_CONSTRAINED_INTRAPREDICTION) != 0);
+  static BYTE recon_y[FRAMES][128 * 128], recon_uv[FRAMES][128 * 64], src_y[128 * 128], src_uv[128 * 64];
+  const size_t luma_bytes = (size_t)W * H, chroma_bytes = (size_t)CW * 2 * CH;
+  ID3D12Resource *dpb_list[4];
+  UINT dpb_subs[4];
   for (UINT i = 0; i < DPB; ++i) { dpb_list[i] = dpb; dpb_subs[i] = i; }
-  int ok_meta = 0, total_slices = 0;
+  int ok_meta = 0, total_slices = 0, psnr_ok = 0;
+  UINT64 skipped_b = 0;
   for (UINT f = 0; f < FRAMES; ++f) {
-    /* the picture: the pattern moving 1.25 samples right and 0.5 down a frame */
+    /* the picture: the pattern moving 1.25 samples right and 0.5 down a frame, its lowest quarter still */
     for (UINT j = 0; j < H; ++j)
-      for (UINT i = 0; i < W; ++i) src_y[j * W + i] = pattern((int)(i * 4 + frames[f].display * 5) / 4, (int)(j * 4 + frames[f].display * 2) / 4);
-    for (UINT j = 0; j < H / 2; ++j)
-      for (UINT i = 0; i < W; ++i) src_uv[j * W + i] = (BYTE)(i & 1 ? 150 - j : 100 + (i / 2 + frames[f].display) % 32);
-    copy_subresource(input, 0, src_y, sizeof src_y, 1);
-    copy_subresource(input, 1, src_uv, sizeof src_uv, 1);
+      for (UINT i = 0; i < W; ++i) {
+        const UINT t = j >= H * 3 / 4 ? 0 : frames[f].display;
+        src_y[j * W + i] = pattern((int)(i * 4 + t * 5) / 4, (int)(j * 4 + t * 2) / 4);
+      }
+    for (UINT j = 0; j < CH; ++j)
+      for (UINT i = 0; i < CW * 2; ++i) src_uv[j * CW * 2 + i] = (BYTE)(i & 1 ? 150 - j : 100 + (i / 2) % 32);
+    copy_subresource(input, 0, src_y, luma_bytes, 1);
+    copy_subresource(input, 1, src_uv, chroma_bytes, 1);
     /* the picture control: the references by their slots in the buffer, POC 2 x display, frame_num the reference pictures before */
     D3D12_VIDEO_ENCODER_REFERENCE_PICTURE_DESCRIPTOR_H264 desc[2];
     UINT list0[2], list1[1], n0 = 0, n1 = 0, nd = 0;
@@ -539,38 +748,109 @@ static void test_encode(void) {
     pic.List0ReferenceFramesCount = n0; pic.pList0ReferenceFrames = list0;
     pic.List1ReferenceFramesCount = n1; pic.pList1ReferenceFrames = list1;
     pic.ReferenceFramesReconPictureDescriptorsCount = nd; pic.pReferenceFramesReconPictureDescriptors = desc;
-    D3D12_VIDEO_ENCODER_PICTURE_CONTROL_SUBREGIONS_LAYOUT_DATA_SLICES two = {{2}};
-    D3D12_VIDEO_ENCODER_ENCODEFRAME_INPUT_ARGUMENTS in;
-    memset(&in, 0, sizeof in);
-    in.SequenceControlDesc.RateControl = cqp_desc();
-    in.SequenceControlDesc.PictureTargetResolution = res;
-    in.SequenceControlDesc.SelectedLayoutMode = D3D12_VIDEO_ENCODER_FRAME_SUBREGION_LAYOUT_MODE_UNIFORM_PARTITIONING_SUBREGIONS_PER_FRAME;
-    in.SequenceControlDesc.FrameSubregionsLayoutData.DataSize = sizeof two;
-    in.SequenceControlDesc.FrameSubregionsLayoutData.pSlicesPartition_H264 = &two;
-    in.SequenceControlDesc.CodecGopSequence = gop_desc();
-    in.PictureControlDesc.Flags = frames[f].reference ? D3D12_VIDEO_ENCODER_PICTURE_CONTROL_FLAG_USED_AS_REFERENCE_PICTURE : D3D12_VIDEO_ENCODER_PICTURE_CONTROL_FLAG_NONE;
-    in.PictureControlDesc.PictureControlCodecData.DataSize = sizeof pic;
-    in.PictureControlDesc.PictureControlCodecData.pH264PicData = &pic;
-    in.PictureControlDesc.ReferenceFrames.NumTexture2Ds = DPB;
-    in.PictureControlDesc.ReferenceFrames.ppTexture2Ds = dpb_list;
-    in.PictureControlDesc.ReferenceFrames.pSubresources = dpb_subs;
-    in.pInputFrame = input;
-    D3D12_VIDEO_ENCODER_ENCODEFRAME_OUTPUT_ARGUMENTS out;
-    memset(&out, 0, sizeof out);
-    out.Bitstream.pBuffer = bits;
-    out.ReconstructedPicture.pReconstructedPicture = dpb;
-    out.ReconstructedPicture.ReconstructedPictureSubresource = frames[f].slot;
-    out.EncoderOutputMetadata.pBuffer = meta;
-    ID3D12VideoEncodeCommandList2_EncodeFrame(l, enc, heap, &in, &out);
+    D3D12_VIDEO_ENCODER_PICTURE_CONTROL_SUBREGIONS_LAYOUT_DATA_SLICES slices = {{c->layout_value}};
+    D3D12_VIDEO_ENCODER_SEQUENCE_CONTROL_DESC seq;
+    memset(&seq, 0, sizeof seq);
+    seq.RateControl = cqp_desc();
+    seq.PictureTargetResolution = res;
+    seq.SelectedLayoutMode = c->layout;
+    seq.FrameSubregionsLayoutData.DataSize = sizeof slices;
+    seq.FrameSubregionsLayoutData.pSlicesPartition_H264 = &slices;
+    seq.CodecGopSequence = gop_desc();
+    seq.IntraRefreshConfig.Mode = c->refresh ? D3D12_VIDEO_ENCODER_INTRA_REFRESH_MODE_ROW_BASED : D3D12_VIDEO_ENCODER_INTRA_REFRESH_MODE_NONE;
+    seq.IntraRefreshConfig.IntraRefreshDuration = c->refresh;
+    const D3D12_VIDEO_ENCODER_PICTURE_CONTROL_FLAGS reference = frames[f].reference ? D3D12_VIDEO_ENCODER_PICTURE_CONTROL_FLAG_USED_AS_REFERENCE_PICTURE : D3D12_VIDEO_ENCODER_PICTURE_CONTROL_FLAG_NONE;
+    const UINT refresh_index = c->refresh ? f % c->refresh : 0;
     D3D12_VIDEO_ENCODER_RESOLVE_METADATA_INPUT_ARGUMENTS ri;
     memset(&ri, 0, sizeof ri);
     ri.EncoderCodec = D3D12_VIDEO_ENCODER_CODEC_H264;
-    ri.EncoderProfile = main_profile();
+    ri.EncoderProfile = ed.EncodeProfile;
     ri.EncoderInputFormat = DXGI_FORMAT_NV12;
     ri.EncodedPictureEffectiveResolution = res;
     ri.HWLayoutMetadata.pBuffer = meta;
     D3D12_VIDEO_ENCODER_RESOLVE_METADATA_OUTPUT_ARGUMENTS ro = {{resolved, 0}};
-    ID3D12VideoEncodeCommandList2_ResolveEncoderOutputMetadata(l, &ri, &ro);
+    if (!c->encode1) {
+      D3D12_VIDEO_ENCODER_ENCODEFRAME_INPUT_ARGUMENTS in;
+      memset(&in, 0, sizeof in);
+      in.SequenceControlDesc = seq;
+      in.PictureControlDesc.IntraRefreshFrameIndex = refresh_index;
+      in.PictureControlDesc.Flags = reference;
+      in.PictureControlDesc.PictureControlCodecData.DataSize = sizeof pic;
+      in.PictureControlDesc.PictureControlCodecData.pH264PicData = &pic;
+      in.PictureControlDesc.ReferenceFrames.NumTexture2Ds = DPB;
+      in.PictureControlDesc.ReferenceFrames.ppTexture2Ds = dpb_list;
+      in.PictureControlDesc.ReferenceFrames.pSubresources = dpb_subs;
+      in.pInputFrame = input;
+      D3D12_VIDEO_ENCODER_ENCODEFRAME_OUTPUT_ARGUMENTS out;
+      memset(&out, 0, sizeof out);
+      out.Bitstream.pBuffer = bits;
+      out.ReconstructedPicture.pReconstructedPicture = dpb;
+      out.ReconstructedPicture.ReconstructedPictureSubresource = frames[f].slot;
+      out.EncoderOutputMetadata.pBuffer = meta;
+      ID3D12VideoEncodeCommandList2_EncodeFrame(l, enc, heap, &in, &out);
+      ID3D12VideoEncodeCommandList2_ResolveEncoderOutputMetadata(l, &ri, &ro);
+    } else {
+      /* P pictures: the still quarter is not dirty, and a move region says where the rest came from (the first reference: 1.25 samples a frame -> whole samples) */
+      RECT dirty = {0, 0, (LONG)W, (LONG)(H * 3 / 4) & ~15};
+      D3D12_VIDEO_ENCODER_DIRTY_RECT_INFO dri = {FALSE, D3D12_VIDEO_ENCODER_DIRTY_REGIONS_MAP_VALUES_MODE_DIRTY, 1, &dirty, 0};
+      D3D12_VIDEO_ENCODER_MOVE_RECT move;
+      D3D12_VIDEO_ENCODER_MOVEREGION_INFO mri;
+      memset(&mri, 0, sizeof mri);
+      const int p_frame = frames[f].type == D3D12_VIDEO_ENCODER_FRAME_TYPE_H264_P_FRAME;
+      if (p_frame) {
+        const UINT r = (UINT)frames[f].l0[0];
+        const LONG dt = (LONG)(frames[f].display - frames[r].display);
+        dri.SourceDPBFrameReference = frames[r].slot;
+        move.DestRect = dirty;
+        move.SourcePoint.x = (5 * dt + 2) / 4;
+        move.SourcePoint.y = (2 * dt + 2) / 4;
+        mri.NumMoveRegions = 1;
+        mri.pMoveRegions = &move;
+        mri.MotionSearchModeConfiguration.MotionSearchMode = D3D12_VIDEO_ENCODER_FRAME_MOTION_SEARCH_MODE_START_HINT;
+        mri.SourceDPBFrameReference = frames[r].slot;
+        mri.MotionUnitPrecision = D3D12_VIDEO_ENCODER_FRAME_INPUT_MOTION_UNIT_PRECISION_FULL_PIXEL;
+      }
+      D3D12_VIDEO_ENCODER_ENCODEFRAME_INPUT_ARGUMENTS1 in;
+      memset(&in, 0, sizeof in);
+      in.SequenceControlDesc = seq;
+      in.PictureControlDesc.IntraRefreshFrameIndex = refresh_index;
+      in.PictureControlDesc.Flags = reference | (p_frame ? D3D12_VIDEO_ENCODER_PICTURE_CONTROL_FLAG_ENABLE_DIRTY_REGIONS_INPUT_ | D3D12_VIDEO_ENCODER_PICTURE_CONTROL_FLAG_ENABLE_MOTION_VECTORS_INPUT_ : 0);
+      in.PictureControlDesc.PictureControlCodecData.DataSize = sizeof pic;
+      in.PictureControlDesc.PictureControlCodecData.pH264PicData = &pic;
+      in.PictureControlDesc.ReferenceFrames.NumTexture2Ds = DPB;
+      in.PictureControlDesc.ReferenceFrames.ppTexture2Ds = dpb_list;
+      in.PictureControlDesc.ReferenceFrames.pSubresources = dpb_subs;
+      in.PictureControlDesc.DirtyRects.MapSource = D3D12_VIDEO_ENCODER_INPUT_MAP_SOURCE_CPU_BUFFER;
+      in.PictureControlDesc.DirtyRects.pCPUBuffer = &dri;
+      in.PictureControlDesc.MotionVectors.MapSource = D3D12_VIDEO_ENCODER_INPUT_MAP_SOURCE_CPU_BUFFER;
+      in.PictureControlDesc.MotionVectors.pCPUBuffer = &mri;
+      in.pInputFrame = input;
+      in.OptionalMetadata = D3D12_VIDEO_ENCODER_OPTIONAL_METADATA_ENABLE_FLAG_FRAME_PSNR | D3D12_VIDEO_ENCODER_OPTIONAL_METADATA_ENABLE_FLAG_SUBREGIONS_PSNR;
+      D3D12_VIDEO_ENCODER_ENCODEFRAME_OUTPUT_ARGUMENTS1 out;
+      memset(&out, 0, sizeof out);
+      out.Bitstream.NotificationMode = D3D12_VIDEO_ENCODER_COMPRESSED_BITSTREAM_NOTIFICATION_MODE_FULL_FRAME;
+      out.Bitstream.FrameOutputBuffer.pBuffer = bits;
+      out.ReconstructedPicture.pReconstructedPicture = dpb;
+      out.ReconstructedPicture.ReconstructedPictureSubresource = frames[f].slot;
+      out.EncoderOutputMetadata.pBuffer = meta;
+      l4->lpVtbl->EncodeFrame1(l4, enc, heap1, &in, &out);
+      D3D12_VIDEO_ENCODER_RESOLVE_METADATA_INPUT_ARGUMENTS1 ri1;
+      memset(&ri1, 0, sizeof ri1);
+      ri1.EncoderCodec = D3D12_VIDEO_ENCODER_CODEC_H264;
+      ri1.EncoderProfile = ed.EncodeProfile;
+      ri1.EncoderInputFormat = DXGI_FORMAT_NV12;
+      ri1.EncodedPictureEffectiveResolution = res;
+      ri1.HWLayoutMetadata.pBuffer = meta;
+      ri1.OptionalMetadata = in.OptionalMetadata;
+      ri1.CodecConfiguration = ed.CodecConfiguration;
+      D3D12_VIDEO_ENCODER_RESOLVE_METADATA_OUTPUT_ARGUMENTS1 ro1;
+      memset(&ro1, 0, sizeof ro1);
+      ro1.ResolvedLayoutMetadata.pBuffer = resolved;
+      ro1.ResolvedFramePSNRData.pBuffer = psnr;
+      ro1.ResolvedSubregionsPSNRData.pBuffer = psnr;
+      ro1.ResolvedSubregionsPSNRData.Offset = 256;
+      l4->lpVtbl->ResolveEncoderOutputMetadata1(l4, &ri1, &ro1);
+    }
     run_video(q, (ID3D12CommandList *)l, a, 1);
     /* the metadata, and the slices it describes */
     BYTE *m = NULL, *b = NULL;
@@ -580,71 +860,51 @@ static void test_encode(void) {
     memcpy(&md, m, sizeof md);
     const D3D12_VIDEO_ENCODER_FRAME_SUBREGION_METADATA *sub = (const D3D12_VIDEO_ENCODER_FRAME_SUBREGION_METADATA *)(m + sizeof md);
     UINT64 sum = 0;
-    int starts = 1;
-    for (UINT64 i = 0; i < md.WrittenSubregionsCount && i < 24; ++i) {
+    int starts = 1, small = 1;
+    for (UINT64 i = 0; i < md.WrittenSubregionsCount && i < 256; ++i) {
       starts &= b[sum] == 0 && b[sum + 1] == 0 && b[sum + 2] == 0 && b[sum + 3] == 1 && sub[i].bStartOffset == 0 && sub[i].bHeaderSize > 40;
+      small &= c->layout != D3D12_VIDEO_ENCODER_FRAME_SUBREGION_LAYOUT_MODE_BYTES_PER_SUBREGION || sub[i].bSize <= c->layout_value || md.WrittenSubregionsCount == 1;
       sum += sub[i].bSize;
     }
-    const int good = md.EncodeErrorFlags == 0 && md.WrittenSubregionsCount == 2 && sum == md.EncodedBitstreamWrittenBytesCount && starts && md.EncodedBitstreamWrittenBytesCount > 0 &&
-                     md.EncodeStats.IntraCodingUnitsCount + md.EncodeStats.InterCodingUnitsCount + md.EncodeStats.SkipCodingUnitsCount == (W / 16) * (H / 16);
-    if (!good) printf("frame %u: errors %llx, %llu subregions, %llu bytes\n", f, (unsigned long long)md.EncodeErrorFlags, (unsigned long long)md.WrittenSubregionsCount, (unsigned long long)md.EncodedBitstreamWrittenBytesCount);
+    const UINT mbs = ((W + 15) / 16) * ((H + 15) / 16);
+    const int expect_slices = c->layout == D3D12_VIDEO_ENCODER_FRAME_SUBREGION_LAYOUT_MODE_UNIFORM_PARTITIONING_SUBREGIONS_PER_FRAME ? (int)c->layout_value
+                              : c->layout == D3D12_VIDEO_ENCODER_FRAME_SUBREGION_LAYOUT_MODE_FULL_FRAME ? 1 : -1;
+    const int good = md.EncodeErrorFlags == 0 && (expect_slices < 0 || md.WrittenSubregionsCount == (UINT64)expect_slices) && sum == md.EncodedBitstreamWrittenBytesCount && starts &&
+                     small && md.EncodedBitstreamWrittenBytesCount > 0 && md.EncodeStats.IntraCodingUnitsCount + md.EncodeStats.InterCodingUnitsCount + md.EncodeStats.SkipCodingUnitsCount == mbs;
+    if (!good) printf("%s frame %u: errors %llx, %llu subregions, %llu bytes\n", c->name, f, (unsigned long long)md.EncodeErrorFlags, (unsigned long long)md.WrittenSubregionsCount, (unsigned long long)md.EncodedBitstreamWrittenBytesCount);
     ok_meta += good;
     total_slices += (int)md.WrittenSubregionsCount;
+    if (frames[f].type == D3D12_VIDEO_ENCODER_FRAME_TYPE_H264_B_FRAME) skipped_b += md.EncodeStats.SkipCodingUnitsCount;
+    /* (intra refresh: a P picture's rows of the wave are intra) */
+    if (c->refresh && frames[f].type == D3D12_VIDEO_ENCODER_FRAME_TYPE_H264_P_FRAME) CHECK(md.EncodeStats.IntraCodingUnitsCount >= (W + 15) / 16);
     if (md.EncodeErrorFlags == 0 && stream_size + md.EncodedBitstreamWrittenBytesCount <= sizeof stream) {
       memcpy(stream + stream_size, b, (size_t)md.EncodedBitstreamWrittenBytesCount);
       stream_size += (size_t)md.EncodedBitstreamWrittenBytesCount;
     }
-    if (f == 1) printf("d3d12encodetest: P picture: %llu intra, %llu inter, %llu skipped macroblocks, average QP %llu\n", (unsigned long long)md.EncodeStats.IntraCodingUnitsCount,
-                       (unsigned long long)md.EncodeStats.InterCodingUnitsCount, (unsigned long long)md.EncodeStats.SkipCodingUnitsCount, (unsigned long long)md.EncodeStats.AverageQP);
+    if (c->encode1) {
+      float *ps = NULL;
+      ID3D12Resource_Map(psnr, 0, NULL, (void **)&ps);
+      psnr_ok += ps && ps[0] > 25 && ps[0] < 100 && ps[1] > 25 && ps[2] > 25 && ps[64] > 20;
+      ID3D12Resource_Unmap(psnr, 0, NULL);
+    }
     ID3D12Resource_Unmap(bits, 0, NULL);
     ID3D12Resource_Unmap(resolved, 0, NULL);
     /* the reconstruction */
-    copy_subresource(dpb, frames[f].slot, recon_y[f], sizeof recon_y[f], 0);
-    copy_subresource(dpb, DPB + frames[f].slot, recon_uv[f], sizeof recon_uv[f], 0);
+    copy_subresource(dpb, frames[f].slot, recon_y[f], luma_bytes, 0);
+    copy_subresource(dpb, DPB + frames[f].slot, recon_uv[f], chroma_bytes, 0);
   }
-  printf("d3d12encodetest: %d of %d pictures encoded with good metadata (%d slices), %u bytes with the parameter sets\n", ok_meta, FRAMES, total_slices, (unsigned)stream_size);
+  printf("d3d12encodetest %s (%ux%u): %d of %d pictures with good metadata (%d slices, %llu B_Skip), %u bytes with the parameter sets\n", c->name, W, H, ok_meta, FRAMES, total_slices,
+         (unsigned long long)skipped_b, (unsigned)stream_size);
   CHECK(ok_meta == FRAMES);
-
-  /* a picture the encoder refuses: slices by bytes - the metadata says so, nothing is written */
-  {
-    D3D12_VIDEO_ENCODER_PICTURE_CONTROL_CODEC_DATA_H264 pic;
-    memset(&pic, 0, sizeof pic);
-    pic.FrameType = D3D12_VIDEO_ENCODER_FRAME_TYPE_H264_IDR_FRAME;
-    D3D12_VIDEO_ENCODER_PICTURE_CONTROL_SUBREGIONS_LAYOUT_DATA_SLICES bytes = {{500}};
-    D3D12_VIDEO_ENCODER_ENCODEFRAME_INPUT_ARGUMENTS in;
-    memset(&in, 0, sizeof in);
-    in.SequenceControlDesc.RateControl = cqp_desc();
-    in.SequenceControlDesc.PictureTargetResolution = res;
-    in.SequenceControlDesc.SelectedLayoutMode = D3D12_VIDEO_ENCODER_FRAME_SUBREGION_LAYOUT_MODE_BYTES_PER_SUBREGION;
-    in.SequenceControlDesc.FrameSubregionsLayoutData.DataSize = sizeof bytes;
-    in.SequenceControlDesc.FrameSubregionsLayoutData.pSlicesPartition_H264 = &bytes;
-    in.SequenceControlDesc.CodecGopSequence = gop_desc();
-    in.PictureControlDesc.Flags = D3D12_VIDEO_ENCODER_PICTURE_CONTROL_FLAG_USED_AS_REFERENCE_PICTURE;
-    in.PictureControlDesc.PictureControlCodecData.DataSize = sizeof pic;
-    in.PictureControlDesc.PictureControlCodecData.pH264PicData = &pic;
-    in.pInputFrame = input;
-    D3D12_VIDEO_ENCODER_ENCODEFRAME_OUTPUT_ARGUMENTS out;
-    memset(&out, 0, sizeof out);
-    out.Bitstream.pBuffer = bits;
-    out.EncoderOutputMetadata.pBuffer = meta;
-    ID3D12VideoEncodeCommandList2_EncodeFrame(l, enc, heap, &in, &out);
-    D3D12_VIDEO_ENCODER_RESOLVE_METADATA_INPUT_ARGUMENTS ri;
-    memset(&ri, 0, sizeof ri);
-    ri.EncoderCodec = D3D12_VIDEO_ENCODER_CODEC_H264;
-    ri.HWLayoutMetadata.pBuffer = meta;
-    D3D12_VIDEO_ENCODER_RESOLVE_METADATA_OUTPUT_ARGUMENTS ro = {{resolved, 0}};
-    ID3D12VideoEncodeCommandList2_ResolveEncoderOutputMetadata(l, &ri, &ro);
-    run_video(q, (ID3D12CommandList *)l, a, 1);
-    D3D12_VIDEO_ENCODER_OUTPUT_METADATA *md = NULL;
-    ID3D12Resource_Map(resolved, 0, NULL, (void **)&md);
-    CHECK(md && md->EncodeErrorFlags == D3D12_VIDEO_ENCODER_ENCODE_ERROR_FLAG_SUBREGION_LAYOUT_CONFIGURATION_NOT_SUPPORTED && md->EncodedBitstreamWrittenBytesCount == 0);
-    ID3D12Resource_Unmap(resolved, 0, NULL);
-  }
+  if (c->encode1) CHECK(psnr_ok == FRAMES);
+  if (c->direct != D3D12_VIDEO_ENCODER_CODEC_CONFIGURATION_H264_DIRECT_MODES_DISABLED) CHECK(skipped_b > 0);
+  if (l4) l4->lpVtbl->Release(l4);
   ID3D12VideoEncodeCommandList2_Release(l);
   ID3D12CommandAllocator_Release(a);
   ID3D12CommandQueue_Release(q);
 
-  /* decoded again by the decoder: every picture is the reconstruction */
+  /* decoded again by the decoder: every picture is the reconstruction (its visible part: the decoder's surfaces are whole macroblocks) */
+  const UINT DW = (W + 15) / 16 * 16, DH = (H + 15) / 16 * 16;
   DxvaStream s;
   DxvaPicture p;
   if (dxva_stream_open(&s, DXVA_CODEC_H264, stream, stream_size, 8) != 0 || dxva_stream_next(&s, &p) != 1) { CHECK(0); return; }
@@ -652,15 +912,15 @@ static void test_encode(void) {
   D3D12_VIDEO_DECODER_HEAP_DESC dh;
   memset(&dh, 0, sizeof dh);
   dh.Configuration = dd.Configuration;
-  dh.DecodeWidth = W;
-  dh.DecodeHeight = H;
+  dh.DecodeWidth = DW;
+  dh.DecodeHeight = DH;
   dh.Format = DXGI_FORMAT_NV12;
   dh.MaxDecodePictureBufferCount = 8;
   ID3D12VideoDecoder *dec = NULL;
   ID3D12VideoDecoderHeap *dheap = NULL;
   CHECK_HR(ID3D12VideoDevice3_CreateVideoDecoder(g_vdev, &dd, &IID_ID3D12VideoDecoder, (void **)&dec));
   CHECK_HR(ID3D12VideoDevice3_CreateVideoDecoderHeap(g_vdev, &dh, &IID_ID3D12VideoDecoderHeap, (void **)&dheap));
-  ID3D12Resource *surfaces = texture(DXGI_FORMAT_NV12, W, H, 8), *dbits = buffer(D3D12_HEAP_TYPE_UPLOAD, 1 << 18);
+  ID3D12Resource *surfaces = texture(DXGI_FORMAT_NV12, DW, DH, 8), *dbits = buffer(D3D12_HEAP_TYPE_UPLOAD, 1 << 18);
   ID3D12Resource *tex[8];
   UINT subs[8];
   for (UINT i = 0; i < 8; ++i) { tex[i] = surfaces; subs[i] = i; }
@@ -672,7 +932,7 @@ static void test_encode(void) {
   ID3D12Device_CreateCommandAllocator(g_dev, D3D12_COMMAND_LIST_TYPE_VIDEO_DECODE, &IID_ID3D12CommandAllocator, (void **)&va);
   if (va) ID3D12Device_CreateCommandList(g_dev, 0, D3D12_COMMAND_LIST_TYPE_VIDEO_DECODE, va, NULL, &IID_ID3D12VideoDecodeCommandList, (void **)&vl);
   CHECK(dec && dheap && surfaces && dbits && vq && vl);
-  static BYTE y[96 * 64], uv[96 * 32];
+  static BYTE y[128 * 128], uv[128 * 64];
   int n = 0, same = 0, r = 1;
   while (dec && dheap && vl && surfaces && dbits && r == 1 && n < FRAMES) {
     BYTE *map = NULL;
@@ -697,14 +957,17 @@ static void test_encode(void) {
     out.OutputSubresource = p.surface;
     ID3D12VideoDecodeCommandList_DecodeFrame(vl, dec, &out, &in);
     run_video(vq, (ID3D12CommandList *)vl, va, 0);
-    copy_subresource(surfaces, p.surface, y, sizeof y, 0);
-    copy_subresource(surfaces, 8 + p.surface, uv, sizeof uv, 0);
+    copy_subresource(surfaces, p.surface, y, (size_t)DW * DH, 0);
+    copy_subresource(surfaces, 8 + p.surface, uv, (size_t)DW * DH / 2, 0);
     /* (the decoder's pictures come in decoding order: picture n is the n-th one coded) */
-    same += memcmp(y, recon_y[n], sizeof y) == 0 && memcmp(uv, recon_uv[n], sizeof uv) == 0;
+    int eq = 1;
+    for (UINT j = 0; j < H; ++j) eq &= memcmp(y + (size_t)j * DW, recon_y[n] + (size_t)j * W, W) == 0;
+    for (UINT j = 0; j < CH; ++j) eq &= memcmp(uv + (size_t)j * DW, recon_uv[n] + (size_t)j * CW * 2, CW * 2) == 0;
+    same += eq;
     ++n;
     r = dxva_stream_next(&s, &p);
   }
-  printf("d3d12encodetest: the D3D12 decoder decodes %d of %d encoded pictures to their reconstructions, sample for sample\n", same, FRAMES);
+  printf("d3d12encodetest %s: the D3D12 decoder decodes %d of %d encoded pictures to their reconstructions, sample for sample\n", c->name, same, FRAMES);
   CHECK(n == FRAMES && same == FRAMES && r == 0);
   dxva_stream_close(&s);
   if (vl) ID3D12VideoDecodeCommandList_Release(vl);
@@ -714,13 +977,29 @@ static void test_encode(void) {
   if (surfaces) ID3D12Resource_Release(surfaces);
   if (dheap) ID3D12VideoDecoderHeap_Release(dheap);
   if (dec) ID3D12VideoDecoder_Release(dec);
+  ID3D12Resource_Release(psnr);
   ID3D12Resource_Release(resolved);
   ID3D12Resource_Release(meta);
   ID3D12Resource_Release(bits);
   ID3D12Resource_Release(dpb);
   ID3D12Resource_Release(input);
   ID3D12VideoEncoderHeap_Release(heap);
+  if (heap1) heap1->lpVtbl->Release(heap1);
+  if (vdev4) vdev4->lpVtbl->Release(vdev4);
   ID3D12VideoEncoder_Release(enc);
+}
+
+static void test_encode(void) {
+  const UINT cabac = D3D12_VIDEO_ENCODER_CODEC_CONFIGURATION_H264_FLAG_ENABLE_CABAC_ENCODING, t8x8 = D3D12_VIDEO_ENCODER_CODEC_CONFIGURATION_H264_FLAG_USE_ADAPTIVE_8x8_TRANSFORM;
+  const UINT constrained = D3D12_VIDEO_ENCODER_CODEC_CONFIGURATION_H264_FLAG_USE_CONSTRAINED_INTRAPREDICTION;
+  const EncodeCase cases[] = {
+      {"main", 96, 64, 0, D3D12_VIDEO_ENCODER_CODEC_CONFIGURATION_H264_DIRECT_MODES_DISABLED, D3D12_VIDEO_ENCODER_FRAME_SUBREGION_LAYOUT_MODE_UNIFORM_PARTITIONING_SUBREGIONS_PER_FRAME, 2, 0, 0},
+      {"cabac-8x8-temporal-cropped", 100, 60, cabac | t8x8, D3D12_VIDEO_ENCODER_CODEC_CONFIGURATION_H264_DIRECT_MODES_TEMPORAL, D3D12_VIDEO_ENCODER_FRAME_SUBREGION_LAYOUT_MODE_FULL_FRAME, 0, 0, 0},
+      {"cavlc-8x8-spatial-refresh-bytes", 96, 64, t8x8 | constrained, D3D12_VIDEO_ENCODER_CODEC_CONFIGURATION_H264_DIRECT_MODES_SPATIAL,
+       D3D12_VIDEO_ENCODER_FRAME_SUBREGION_LAYOUT_MODE_BYTES_PER_SUBREGION, 400, 2, 0},
+      {"cabac-spatial-encodeframe1", 118, 46, cabac, D3D12_VIDEO_ENCODER_CODEC_CONFIGURATION_H264_DIRECT_MODES_SPATIAL, D3D12_VIDEO_ENCODER_FRAME_SUBREGION_LAYOUT_MODE_UNIFORM_PARTITIONING_ROWS_PER_SUBREGION, 1, 0, 1},
+  };
+  for (UINT i = 0; i < sizeof cases / sizeof cases[0]; ++i) encode_case(&cases[i]);
 }
 
 int main(void) {
