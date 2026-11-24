@@ -433,9 +433,31 @@ Direct3D 11's and 12's video interfaces run on the kernel's codecs, on the CPU, 
   reference, move regions -> per-macroblock search hints in the three search modes, the QP map of the picture control) and frame / subregion PSNR metadata through
   ResolveEncoderOutputMetadata1 (ResolveEncoderMetadata's packet takes the two PSNR buffers). Not done, and the queries say so: input maps from GPU textures (so
   ResolveInputParamLayout has nothing to resolve), the per-block QP / SATD / bit-allocation metadata maps (their R8_SINT / R32_UINT textures do not exist in d3d12.dll),
-  frame analysis (two-pass), subregion notification, intra constrained slices, deblocking modes 3-6 (SVC's), HEVC and AV1 (the codec query says FALSE). Tests:
+  frame analysis (two-pass), subregion notification, intra constrained slices, deblocking modes 3-6 (SVC's). Tests:
   `tests/run_host_tests.sh VideoEncodeTest`, `tests/h264_encode_ffmpeg.sh` (ffmpeg's decode = the reconstruction, 14 streams),
   `tests/emulated_dx.sh tests/windows/d3d12encodetest.c`, `tests/d3d12_qemu.sh d3d12encodetest`, `tests/wow64_qemu.sh d3d12encodetest`.
+- HEVC and AV1 encoding (`src/Kernel/Dxgkrnl/VideoEncodeCodecs.hpp` - argument layouts and metadata -, `VideoEncodeHevc.cpp`, `VideoEncodeAv1.cpp`, `VideoEncodePlanes.cpp`;
+  d3d12.dll `encode_codecs.{h,inc}`, `video_encode_types.h`): EncodeFrame's word 0 names the codec and each has its own arguments; NV12 and P010 inputs (P010 widened as
+  A16B16G16R16, which the EncodeFrame packet takes for these two). `Software/H265PictureEncoder`: HEVC Main / Main 10 driven as D3D12 drives it (the program keeps the DPB -
+  every descriptor, used or not, short or long term - and writes VPS / SPS / PPS as the header says; the slices carry the reference picture set explicitly, list
+  modifications given or derived), CTB 16 / 32 / 64, coding quadtree by cost, 2Nx2N intra (35 modes) and inter (merge / skip / AMVP, one or two lists, MotionEstimator
+  candidates refined with HEVC's interpolation), CABAC, cu_qp_delta per CTB for QP maps, SAO chosen per CTB (coded once without, decoded, chosen, coded again), slices by
+  CTBs / rows / count; the reconstruction is the in-tree decoder's (`h265::Core::external_*`) of the slices, so deblocking and SAO are the decoder's. `Software/Av1PictureEncoder`
+  (+ `Av1EncBitstream`: the OBU bit writer, the od_ec symbol coder): AV1 Main 8 / 10 bits on the decoder's own block and context structures (contexts, ref MV stacks and
+  predictions are the decoder's), primary_ref_frame always none, single reference, 13 intra modes, NEAREST / NEAR / GLOBAL / NEWMV, every interpolation filter
+  (switchable too), TX_MODE_LARGEST / SELECT, delta q per superblock, cdef_idx chosen per 64x64; the program writes every OBU from the post-encode values, which
+  ResolveEncoderOutputMetadata gives after a record a tile (the tile layout, then D3D12_VIDEO_ENCODER_AV1_POST_ENCODE_VALUES); the reconstruction is
+  `av1::Core::decode_frame_external`'s of the tiles. Rate control as H.264's (AV1's quantizer indices put on its QP scale by the 8-bit AC quantizer). The queries
+  (`encode_codecs.inc`) say exactly this, including D3D12_FEATURE_VIDEO_ENCODER_FRAME_SUBREGION_LAYOUT_CONFIG for AV1 tiles. Not done (refused / not reported):
+  HEVC intra refresh, slices by bytes, intra constrained slices, NxN / AMP / rectangular partitions (AMP is allowed in the SPS, 2Nx2N coded), 4x4 luma transforms,
+  temporal MVP, the range extension values of PICTURE_CONTROL_CODEC_DATA_HEVC1; AV1 compound prediction and skip mode, palette, intra block copy, filter intra, CfL,
+  warped motion and OBMC, super-resolution, loop restoration, segmentation, delta LF, quantizer matrices, 128x128 superblocks, layers, CDF inheritance from references;
+  both: EncodeFrame1's input maps but the QP map, PSNR metadata, frame analysis. Tests: `tests/run_host_tests.sh VideoEncodeHevcTest VideoEncodeAv1Test` (every stream decoded
+  by the in-tree decoders = the reconstruction, the encoders' own pre-filter pictures = the decoders' (no drift), the kernel's EncodeFrame against the encoders driven
+  directly), `tests/hevc_encode_ffmpeg.sh` and `tests/av1_encode_ffmpeg.sh` (ffmpeg's HEVC decoder, libdav1d and libaom: their decode = the reconstruction, byte for
+  byte), `tests/emulated_dx.sh tests/windows/d3d12encodecodectest.c` (the queries, HEVC Main / Main 10 and AV1 8 / 10-bit encodes decoded again through
+  ID3D12VideoDecoder with DXVA parameters from the program's settings and the post-encode values), `tests/d3d12_qemu.sh d3d12encodecodectest`,
+  `tests/wow64_qemu.sh d3d12encodecodectest`.
 - Decode conversion and histograms (`DecodeFrame`'s optional parts, CommandStream.hpp `kDecodeConversion` / `kDecodeHistogram`): the picture is decoded into its
   surface - Direct3D 12's reference texture - and then converted by the video processor into another surface (any format and colour space the processor writes, from the
   decode colour space, scaled to any size: `D3D12_VIDEO_DECODE_CONVERSION_ARGUMENTS` / `ARGUMENTS1`, D3D11 decoder downsampling); histograms of the decoded picture

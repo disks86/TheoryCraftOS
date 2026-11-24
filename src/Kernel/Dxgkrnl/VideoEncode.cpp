@@ -17,6 +17,7 @@
  */
 
 #include "Kernel/Dxgkrnl/VideoEncode.hpp"
+#include "Kernel/Dxgkrnl/VideoEncodeCodecs.hpp"
 #include "Hardware/VideoCodec/Software/H264PictureEncoder.hpp"
 #include "Hardware/VideoCodec/Software/MotionEstimator.hpp"
 #include "Hardware/VideoCodec/Software/VideoRateControl.hpp"
@@ -383,7 +384,18 @@ void put_psnr(ByteWriter& w, ByteReader& r) {
 
 }  // namespace
 
+// (shared with the HEVC and AV1 paths: VideoEncodeCodecs.hpp)
+void load_rate_control_state(ConstByteView heap, hardware::RateControlState* state) { load_state(heap, state); }
+void store_rate_control_state(ByteView heap, const hardware::RateControlState& state) { store_state(heap, state); }
+
 bool run_video_encode(allocators::IAllocator& allocator, const VideoEncodeJob& job) {
+  // (HEVC and AV1 have argument layouts of their own: VideoEncodeCodecs.hpp)
+  {
+    ByteReader c(job.params);
+    const uint32_t codec = c.le32();
+    if (c.ok() && codec == kVideoEncodeCodecHevc) return run_video_encode_hevc(allocator, job);
+    if (c.ok() && codec == kVideoEncodeCodecAv1) return run_video_encode_av1(allocator, job);
+  }
   Outcome o;
   List<hardware::H264EncSlice> slices(allocator);
   uint32_t width = 0, height = 0, mb_w = 1;
@@ -730,6 +742,7 @@ bool resolve_video_encode_metadata(ConstByteView metadata, ByteView out, ByteVie
   ByteReader r(metadata);
   const uint32_t magic = r.le32(), version = r.le32();
   ByteWriter w(out);
+  if (r.ok() && magic == kVideoEncodeMetadataMagic && version == kVideoEncodeMetadataVersionAv1) return resolve_av1_encode_metadata(metadata, out);
   if (!r.ok() || magic != kVideoEncodeMetadataMagic || (version != 1 && version != 2)) {
     if (out.size() < 72) return false;
     w.le64(kErrorMetadataSource);

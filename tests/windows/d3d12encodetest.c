@@ -153,14 +153,17 @@ static void test_features(void) {
   D3D12_FEATURE_DATA_VIDEO_FEATURE_AREA_SUPPORT area = {0};
   CHECK_HR(ID3D12VideoDevice3_CheckFeatureSupport(v, D3D12_FEATURE_VIDEO_FEATURE_AREA_SUPPORT, &area, sizeof area));
   CHECK(area.VideoEncodeSupport && area.VideoDecodeSupport);
-  /* codecs: H.264 only */
+  /* codecs: H.264, HEVC and AV1 (d3d12encodecodectest.c tests the last two); a fourth is not one */
   D3D12_FEATURE_DATA_VIDEO_ENCODER_CODEC codec = {0, D3D12_VIDEO_ENCODER_CODEC_H264, FALSE};
   CHECK_HR(ID3D12VideoDevice3_CheckFeatureSupport(v, D3D12_FEATURE_VIDEO_ENCODER_CODEC, &codec, sizeof codec));
   CHECK(codec.IsSupported);
   codec.Codec = D3D12_VIDEO_ENCODER_CODEC_HEVC;
   CHECK_HR(ID3D12VideoDevice3_CheckFeatureSupport(v, D3D12_FEATURE_VIDEO_ENCODER_CODEC, &codec, sizeof codec));
-  CHECK(!codec.IsSupported);
+  CHECK(codec.IsSupported);
   codec.Codec = D3D12_VIDEO_ENCODER_CODEC_AV1;
+  CHECK_HR(ID3D12VideoDevice3_CheckFeatureSupport(v, D3D12_FEATURE_VIDEO_ENCODER_CODEC, &codec, sizeof codec));
+  CHECK(codec.IsSupported);
+  codec.Codec = (D3D12_VIDEO_ENCODER_CODEC)3;
   CHECK_HR(ID3D12VideoDevice3_CheckFeatureSupport(v, D3D12_FEATURE_VIDEO_ENCODER_CODEC, &codec, sizeof codec));
   CHECK(!codec.IsSupported);
   CHECK(ID3D12VideoDevice3_CheckFeatureSupport(v, D3D12_FEATURE_VIDEO_ENCODER_CODEC, &codec, sizeof codec - 1) == E_INVALIDARG);

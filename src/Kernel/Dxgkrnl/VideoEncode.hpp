@@ -21,7 +21,7 @@
 // pictures are the widened planes a runtime keeps NV12 in (DxgTypes.hpp VideoDecoderDesc: 4 bytes a pixel, Y or U, V in the first bytes).
 //
 // The arguments of an EncodeFrame (a buffer the stream names; little-endian 32-bit words, then the arrays):
-//    0 codec (0 H.264)   1 profile (0 Main, 1 High)   2 width   3 height (the target resolution: even; the coded size is that in whole macroblocks, the program's SPS crops it)
+//    0 codec (0 H.264; 1 HEVC and 2 AV1 have layouts of their own: VideoEncodeCodecs.hpp)   1 profile (0 Main, 1 High)   2 width   3 height (the target resolution: even; the coded size is that in whole macroblocks, the program's SPS crops it)
 //    4 configuration flags (D3D12_VIDEO_ENCODER_CODEC_CONFIGURATION_H264_FLAGS: constrained intra prediction, the 8x8 transform, CABAC)   5 direct mode (0 none, 1 temporal,
 //      2 spatial)   6 deblocking mode (disable_deblocking_filter_idc)
 //    7 pic_order_cnt_type   8 log2_max_frame_num_minus4   9 log2_max_pic_order_cnt_lsb_minus4

@@ -683,6 +683,9 @@ add_executable(BOOTX64
   src/Kernel/Dxgkrnl/SelfTest.cpp
   src/Kernel/Dxgkrnl/Conformance.cpp
   src/Kernel/Dxgkrnl/VideoEncode.cpp
+  src/Kernel/Dxgkrnl/VideoEncodeHevc.cpp
+  src/Kernel/Dxgkrnl/VideoEncodeAv1.cpp
+  src/Kernel/Dxgkrnl/VideoEncodePlanes.cpp
   src/Kernel/Dxgkrnl/D3d9Devices.cpp
   src/Kernel/Dxgkrnl/D3d9Emit.cpp
   src/Kernel/Dxgkrnl/Adapter.cpp
@@ -1324,6 +1327,7 @@ add_executable(BOOTX64
   src/Hardware/VideoCodec/Software/H265Slice.cpp
   src/Hardware/VideoCodec/Software/H265Predict.cpp
   src/Hardware/VideoCodec/Software/H265Filter.cpp
+  src/Hardware/VideoCodec/Software/H265PictureEncoder.cpp
   src/Hardware/VideoCodec/Software/Mpeg2Syntax.cpp
   src/Hardware/VideoCodec/Software/Mpeg2Slice.cpp
   src/Hardware/VideoCodec/Software/Mpeg2Recon.cpp
@@ -1355,6 +1359,8 @@ add_executable(BOOTX64
   src/Hardware/VideoCodec/Software/Av1LoopRestoration.cpp
   src/Hardware/VideoCodec/Software/Av1SuperRes.cpp
   src/Hardware/VideoCodec/Software/Av1FilmGrain.cpp
+  src/Hardware/VideoCodec/Software/Av1PictureEncoder.cpp
+  src/Hardware/VideoCodec/Software/Av1EncBitstream.cpp
   src/Hardware/VideoCodec/Software/JpegEncoder.cpp
   src/Gui/Controls/Menu.cpp
   src/Gui/Windows/Frame.cpp
