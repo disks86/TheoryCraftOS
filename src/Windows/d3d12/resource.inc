@@ -212,14 +212,16 @@ static void resource_destroy(DxObj *o) {
 
 /* ---- mirrors of planes ------------------------------------------------------------------------------------------------------------------------------------------------------ */
 
-static void planar_extent(const D3D12_RESOURCE_DESC *d, UINT layers, UINT i, UINT *w, UINT *h);
+static void planar_extent(const D3D12_RESOURCE_DESC *d, const FormatInfo *fi, UINT layers, UINT i, UINT *w, UINT *h);
 /* The integer format of a plane's bits: the kernel's R8G8B8A8_UINT of an 8-bit plane, R16G16B16A16_UINT of a 16-bit one. */
 static UINT plane_integer_kernel_format(const FormatInfo *fi) { return fi->planar == PLANAR_16 ? KF_RGBA16UINT : KF_RGBA8UINT; }
 /* Whether `f` is an integer view of a plane of r (R8_UINT the luma of NV12, R8G8_UINT its U and V; R16_UINT / R16G16_UINT those of P010 and P016): the plane and the
  * channels the view has (1: red, 3: red and green). */
 static int plane_integer_view(const Resource *r, DXGI_FORMAT f, UINT *plane, UINT *channels) {
-  if (!r->planes || !r->fmt) return 0;
+  if (!r->planes || !r->fmt || !r->fmt->planar) return 0;
   const int sixteen = r->fmt->planar == PLANAR_16;
+  /* (V208 / V408: three R8 planes, named by the PlaneSlice) */
+  if (format_planes(r->fmt) == 3) { if (f != DXGI_FORMAT_R8_UINT) return 0; *channels = 1; return 1; }
   if (f == (sixteen ? DXGI_FORMAT_R16_UINT : DXGI_FORMAT_R8_UINT)) { *plane = 0; *channels = 1; return 1; }
   if (f == (sixteen ? DXGI_FORMAT_R16G16_UINT : DXGI_FORMAT_R8G8_UINT)) { *plane = 1; *channels = 3; return 1; }
   return 0;
@@ -245,7 +247,7 @@ static UINT res_mirror(Resource *r, UINT plane, UINT first, UINT count, int arra
     memset(&md, 0, sizeof md);
     md.flags = KA_TEXTURE | ((mode & MIRROR_WRITE_BACK) ? KA_RENDER_TARGET : 0);
     md.format = (mode & MIRROR_INTEGER) ? plane_integer_kernel_format(r->fmt) : r->fmt->kernel;
-    planar_extent(&r->desc, r->layers, plane * r->layers, &md.width, &md.height);
+    planar_extent(&r->desc, r->fmt, r->layers, plane * r->layers, &md.width, &md.height);
     md.mips = md.samples = 1;
     md.kind = array ? 2 : 0;
     md.layers = array ? count : 1;
@@ -298,14 +300,14 @@ static void get_footprints(const D3D12_RESOURCE_DESC *d, UINT first, UINT count,
   const FormatInfo *base_fi = format_info(d->Format);
   const UINT bytes = format_bytes(d->Format);
   /* (a planar format: the subresources of plane 1 follow those of plane 0, each plane a footprint of its own format and size) */
-  const UINT plane_subs = base_fi && base_fi->planar ? mips * depth_or_array : 0;
+  const UINT plane_subs = base_fi && base_fi->planar ? mips * depth_or_array : 0;      /* (the subresources of a plane) */
   for (UINT i = 0; i < count; ++i) {
     const UINT sub = first + i;
     const UINT plane = plane_subs ? sub / plane_subs : 0;
     const FormatInfo *fi = plane_format(base_fi, plane);
     const UINT level = sub % mips;
     UINT w = mip_extent((UINT)d->Width, level), h = mip_extent(d->Height, level);
-    if (plane) { w = (w + 1) / 2; h = (h + 1) / 2; }
+    plane_extent(base_fi, plane, &w, &h);
     const UINT depth = d->Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D ? mip_extent(depth_or_array, level) : 1;
     const UINT64 row_size = fi ? format_row_bytes(fi, w) : (UINT64)w * bytes;
     const UINT pitch = (UINT)KALIGN(row_size, 256);
@@ -434,11 +436,12 @@ static UINT kernel_pixel_bytes(UINT kf) {
     default: return 4;
   }
 }
-/* The size of plane allocation `i` of a planar texture (plane_alloc's order: plane * layers + slice): the luma the texture's, the chroma half of it both ways. */
-static void planar_extent(const D3D12_RESOURCE_DESC *d, UINT layers, UINT i, UINT *w, UINT *h) {
-  const int chroma = i >= layers;
-  *w = chroma ? ((UINT)d->Width + 1) / 2 : (UINT)d->Width;
-  *h = chroma ? (d->Height + 1) / 2 : d->Height;
+/* The size of plane allocation `i` of a planar texture (plane_alloc's order: plane * layers + slice) of `fi`: the kernel's image of the plane (plane_extent; a packed YUV
+ * array's one plane in the kernel's pixels, format_kw). */
+static void planar_extent(const D3D12_RESOURCE_DESC *d, const FormatInfo *fi, UINT layers, UINT i, UINT *w, UINT *h) {
+  *w = format_kw(fi, (UINT)d->Width);
+  *h = d->Height;
+  plane_extent(fi, i / layers, w, h);
 }
 #define PLANE_PLACEMENT 4096u      /* (where each plane of a placed planar texture begins in the heap: a multiple of this) */
 /* Where in a heap each of the `count` plane allocations of a placed planar texture of `fi` begins (offsets, from the resource's own offset), and the bytes of all of
@@ -447,7 +450,7 @@ static UINT64 planar_layout(const D3D12_RESOURCE_DESC *d, const FormatInfo *fi, 
   UINT64 at = 0;
   for (UINT i = 0; i < count; ++i) {
     UINT w, h;
-    planar_extent(d, layers, i, &w, &h);
+    planar_extent(d, fi, layers, i, &w, &h);
     at = KALIGN(at, PLANE_PLACEMENT);
     if (offsets) offsets[i] = at;
     at += (UINT64)w * h * kernel_pixel_bytes(fi->kernel);
@@ -460,11 +463,11 @@ static UINT64 texture_kernel_bytes(const D3D12_RESOURCE_DESC *d) {
   const FormatInfo *fi = format_info(d->Format);
   if (!fi || !fi->kernel) return 0;
   const UINT layers = d->DepthOrArraySize ? d->DepthOrArraySize : 1;
-  if (fi->planar) return planar_layout(d, fi, layers, 2 * layers, NULL);
+  if (fi->planar) return planar_layout(d, fi, layers, format_planes(fi) * layers, NULL);
   const UINT mips = d->MipLevels ? d->MipLevels : mip_count_for((UINT)d->Width, d->Height);
   UINT64 total = 0;
   for (UINT level = 0; level < mips; ++level) {
-    const UINT w = mip_extent((UINT)d->Width, level), h = mip_extent(d->Height, level);
+    const UINT w = format_kw(fi, mip_extent((UINT)d->Width, level)), h = mip_extent(d->Height, level);
     total += fi->compressed ? (UINT64)((w + 3) / 4) * ((h + 3) / 4) * kernel_pixel_bytes(fi->kernel) : (UINT64)w * h * kernel_pixel_bytes(fi->kernel);
   }
   return total * layers;
@@ -555,16 +558,30 @@ static HRESULT resource_make_from(Dev *dev, const D3D12_HEAP_PROPERTIES *props, 
     } else if (depth_or_array > 1) { r->kind = 2; r->layers = depth_or_array; }
     const int target = (desc->Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET) != 0;
     if (fi->planar) {
-      /* (NV12, P010, P016: a 2D texture or array of one level, of even width and height (the chroma is half of both), not multisampled or depth; each plane of each slice is
-       * a 2D image of the kernel's, so the slices may be render targets. Committed, placed (the planes one after the other in the heap: planar_layout) or shared (every
-       * plane allocation in one resource of win32k's). Not reserved: tiling is not one of these formats' supports (D3D12_FORMAT_SUPPORT2_TILED; Windows' drivers do not
-       * tile video formats either), so a reserved one is a description the device refuses. Not CPU visible: the kernel's planes are widened, so the driver's layout a
-       * custom heap's texture is read in would not be what Direct3D says it is) */
-      if (desc->Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || cube || r->mips != 1 || samples > 1 || want_depth || (desc->Width & 1) || (desc->Height & 1) || reserved) { hr = E_INVALIDARG; goto fail; }
+      /* (NV12, P010, P016, P208, V208, V408: a 2D texture or array of one level, not multisampled or depth; each plane of each slice is a 2D image of the kernel's, so the
+       * slices may be render targets. Committed, placed (the planes one after the other in the heap: planar_layout) or shared (every plane allocation in one resource of
+       * win32k's). Not reserved: tiling is not one of these formats' supports (D3D12_FORMAT_SUPPORT2_TILED; Windows' drivers do not tile video formats either), so a
+       * reserved one is a description the device refuses. Not CPU visible: the kernel's planes are widened, so the driver's layout a custom heap's texture is read in would
+       * not be what Direct3D says it is) */
+      /* (P208's chroma is half as wide - its width even -, V208's half as high - its height even -, V408's full size; the 4:2:0 formats' half of both) */
+      const int even_w = fi->planar != PLANAR_V208 && fi->planar != PLANAR_V408, even_h = fi->planar != PLANAR_P208 && fi->planar != PLANAR_V408;
+      if (desc->Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || cube || r->mips != 1 || samples > 1 || want_depth || (even_w && (desc->Width & 1)) || (even_h && (desc->Height & 1)) || reserved) { hr = E_INVALIDARG; goto fail; }
       if (cpu) { hr = DXGI_ERROR_UNSUPPORTED; goto fail; }
-      if (2u * r->layers > KMT_MAX_RESOURCE_ALLOCATIONS) { hr = E_INVALIDARG; goto fail; }      /* (128 slices at most: two planes of each, one resource) */
+      if (format_planes(fi) * r->layers > KMT_MAX_RESOURCE_ALLOCATIONS) { hr = E_INVALIDARG; goto fail; }      /* (every plane of every slice in one resource) */
       r->kind = 0;
-      r->planes = 2;
+      r->planes = format_planes(fi);
+    }
+    if (format_packed_yuv(desc->Format)) {
+      /* (the packed YUV formats: 2D textures and arrays of one level, not multisampled; YUY2, Y210, Y216 of even width (a pixel of the kernel's image is a pair); render
+       * targets of AYUV alone - DXGI gives the others shader resource and unordered access views only) */
+      if (desc->Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || cube || r->mips != 1 || samples > 1 || (fi->pair && (desc->Width & 1)) ||
+          (target && desc->Format != DXGI_FORMAT_AYUV)) { hr = E_INVALIDARG; goto fail; }
+      if (r->layers > 1) {
+        /* (an array: each slice an allocation of its own, as a planar texture's planes - `planes` 1 - so that a slice is a 2D image the decoder and the processor write) */
+        if (reserved || cpu || heap || (hflags & (D3D12_HEAP_FLAG_SHARED | D3D12_HEAP_FLAG_SHARED_CROSS_ADAPTER)) || global_share) { hr = DXGI_ERROR_UNSUPPORTED; goto fail; }
+        r->kind = 0;
+        r->planes = 1;
+      }
     }
     if ((r->kind != 0 || r->mips > 1) && (target || want_depth || (r->kind != 0 && r->mips > 1))) { hr = DXGI_ERROR_UNSUPPORTED; goto fail; }
     ad.flags = want_depth ? KA_DEPTH : (target ? (KA_RENDER_TARGET | KA_TEXTURE) : KA_TEXTURE);
@@ -575,7 +592,7 @@ static HRESULT resource_make_from(Dev *dev, const D3D12_HEAP_PROPERTIES *props, 
       r->reserved = 1;
     }
     ad.format = fi->kernel;
-    ad.width = (UINT)desc->Width;
+    ad.width = format_kw(fi, (UINT)desc->Width);
     ad.height = desc->Height;
     ad.mips = r->mips;
     ad.kind = r->kind;
@@ -611,7 +628,7 @@ static HRESULT resource_make_from(Dev *dev, const D3D12_HEAP_PROPERTIES *props, 
     planar_layout(desc, r->fmt, r->layers, plane_count, offsets);
     for (UINT i = 0; i < plane_count; ++i) {
       plane_descs[i] = ad;
-      planar_extent(desc, r->layers, i, &plane_descs[i].width, &plane_descs[i].height);
+      planar_extent(desc, r->fmt, r->layers, i, &plane_descs[i].width, &plane_descs[i].height);
       if (heap) plane_descs[i].heap_offset = heap_offset + offsets[i];
     }
     mem_free(offsets);
@@ -673,8 +690,8 @@ static HRESULT resource_make_from(Dev *dev, const D3D12_HEAP_PROPERTIES *props, 
   if (r->fmt && r->fmt->narrow && !source && !heap && !reserved) {
     const UINT count = r->planes ? r->planes * r->layers : 1;
     for (UINT i = 0; i < count; ++i) {
-      const int chroma = r->planes && i >= r->layers;
-      const UINT w = chroma ? ((UINT)desc->Width + 1) / 2 : (UINT)desc->Width, h = chroma ? (desc->Height + 1) / 2 : desc->Height;
+      UINT w = (UINT)desc->Width, h = desc->Height;
+      if (r->planes) plane_extent(r->fmt, i / r->layers, &w, &h);
       res_fill_alpha(dev, r->planes ? r->plane_alloc[i] : r->alloc, w, h, r->planes ? 1 : r->layers, r->mips, r->fmt->kernel == KF_RGBA16);
     }
   }
@@ -771,7 +788,7 @@ static D3D12_RESOURCE_ALLOCATION_INFO *STDMETHODCALLTYPE dev_GetResourceAllocati
       D3D12_RESOURCE_DESC d = descs[i];
       const UINT mips = d.MipLevels ? d.MipLevels : mip_count_for((UINT)d.Width, d.Height);
       const FormatInfo *dfi = format_info(d.Format);
-      const UINT subs = mips * (d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D ? 1 : (d.DepthOrArraySize ? d.DepthOrArraySize : 1)) * (dfi && dfi->planar ? 2 : 1);
+      const UINT subs = mips * (d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D ? 1 : (d.DepthOrArraySize ? d.DepthOrArraySize : 1)) * (dfi && dfi->planar ? format_planes(dfi) : 1);
       get_footprints(&d, 0, subs, 0, NULL, NULL, NULL, &n);
       /* (what the kernel keeps of it: a narrow format's and a plane's pixels are widened, so a placed one needs more of its heap than its footprints) */
       const UINT64 kernel = texture_kernel_bytes(&d);
@@ -834,6 +851,7 @@ static HRESULT res_texture_copy(Resource *r, UINT sub, const D3D12_BOX *box, BYT
   if (b.left >= b.right || b.top >= b.bottom || b.front >= b.back) return S_OK;
   if (b.right > w || b.bottom > h || b.back > d) return E_INVALIDARG;
   if (fi->compressed && (b.left % 4 || b.top % 4 || (b.right % 4 && b.right != w) || (b.bottom % 4 && b.bottom != h))) return E_INVALIDARG;
+  if (fi->pair && (b.left % 2 || (b.right % 2 && b.right != w))) return E_INVALIDARG;      /* (whole pairs of pixels) */
   const UINT64 pitch = format_row_bytes(fi, w), plane = pitch * format_rows(fi, h);
   const UINT64 x_bytes = format_row_bytes(fi, b.left), row_bytes = format_row_bytes(fi, b.right) - x_bytes;
   const UINT first_row = fi->compressed ? b.top / 4 : b.top, rows = format_rows(fi, b.bottom) - first_row;

@@ -139,6 +139,23 @@ class Core {
   VideoFormat output_format() const;
   bool ready() const { return queue_count_ > 0; }
 
+  // Decoding for a DXVA driver (src/Hardware/VideoCodec/Dxva/DxvaMpeg4.cpp): the caller gives the layer as a Vol (with its matrices), keeps the pictures and says
+  // which ones a plane is decoded into and predicted from, and the distances of direct mode; the picture is decoded at once (decoding order) and nothing goes to
+  // the output queue. A Core used this way is used only this way.
+  struct ExternalPicture {
+    Picture* target = nullptr;     // the picture to fill (allocated here at the layer's size when it is not)
+    Picture* forward = nullptr;    // P and S: the anchor it predicts from; B: the older anchor
+    Picture* backward = nullptr;   // B: the newer anchor (whose macroblocks direct mode uses). Every reference the type needs must be given.
+    // B planes: TRD and TRB of direct mode (7.6.9.5, in ticks of the time base), and their field counterparts (interlaced direct mode), as FFmpeg derives them.
+    int64_t pp_time = 0, pb_time = 0, pp_field_time = 0, pb_field_time = 0;
+  };
+  enum class ExternalStatus : uint8_t { Decoded, NotCoded, BadHeader, NoMemory };
+  // A plane of an MPEG-4 layer. `header` null: `body` is what follows the plane's start code and the plane header is read from it; otherwise `body` starts where
+  // the header would and the first macroblock is header->header_bits into it. `parsed` receives the header that was used. NotCoded: vop_coded is 0 (nothing decoded).
+  [[nodiscard]] ExternalStatus decode_external(const Vol& vol, const VopHeader* header, ConstByteView body, const ExternalPicture& picture, VopHeader* parsed);
+  // An MPEG-4 short video header picture (H.263 baseline: no optional modes): `data` starts at its picture start code. `parsed` receives its header.
+  [[nodiscard]] ExternalStatus decode_external_short(ConstByteView data, const ExternalPicture& picture, ShortHeader* parsed);
+
  private:
   // --- Mpeg4Syntax.cpp
   bool build_vlcs();
@@ -210,6 +227,7 @@ class Core {
   Picture* queue_[kOutputQueue] = {};
   int queue_count_ = 0;
   Picture* returned_ = nullptr;
+  Picture* ext_target_ = nullptr;        // decode_external's target while a plane is decoded
   bool need_intra_ = true;
   // A packed bitstream (DivX: an anchor and the B plane after it in one packet, then a placeholder packet): the B picture waits for the next packet and
   // takes its time, so that each picture carries the time of the packet that stands for it, as an unpacked stream's would.

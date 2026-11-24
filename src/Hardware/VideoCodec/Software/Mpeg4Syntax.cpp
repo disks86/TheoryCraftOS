@@ -383,6 +383,116 @@ bool Core::decode_h263(ConstByteView data, int64_t pts) {
   return true;
 }
 
+// ---- decoding for a DXVA driver ------------------------------------------------------------------------------------------------------------
+
+Core::ExternalStatus Core::decode_external(const Vol& vol, const VopHeader* given, ConstByteView body, const ExternalPicture& picture, VopHeader* parsed) {
+  *parsed = VopHeader();
+  if (!picture.target || !build_vlcs()) return ExternalStatus::NoMemory;
+  if (!configure(static_cast<int>(vol.width), static_cast<int>(vol.height))) return ExternalStatus::BadHeader;
+  vol_ = vol;
+  for (int i = 0; i < 64; ++i) {
+    intra_matrix_[kZigzag[i]] = vol.intra_matrix[i];
+    inter_matrix_[kZigzag[i]] = vol.non_intra_matrix[i];
+  }
+  have_vol_ = true;
+  short_header_ = false;
+  pb_mode_ = 0;
+  VopHeader h;
+  if (given) {
+    h = *given;
+    if (h.header_bits > body.size() * 8) return ExternalStatus::BadHeader;
+  } else if (!parse_vop_header(body, vol_, &h)) {
+    return ExternalStatus::BadHeader;
+  }
+  *parsed = h;
+  if (h.type == VopType::S && !vol_.gmc) return ExternalStatus::BadHeader;
+  if (!h.coded) return ExternalStatus::NotCoded;
+  if (h.quant < 1 || h.quant > 31 || h.fcode_forward < 1 || h.fcode_forward > 7 || h.fcode_backward < 1 || h.fcode_backward > 7) return ExternalStatus::BadHeader;
+  PlaneParams p;
+  p.type = h.type == VopType::S ? kPictureP : static_cast<int>(h.type);
+  p.quant = h.quant;
+  p.fcode_forward = h.fcode_forward;
+  p.fcode_backward = h.fcode_backward;
+  p.no_rounding = h.rounding_type;
+  p.dc_threshold = kIntraDcThreshold[h.intra_dc_vlc_thr & 7];
+  p.alternate_scan = h.alternate_vertical_scan;
+  p.top_field_first = h.top_field_first;
+  anchor_[0] = anchor_[1] = nullptr;
+  if (p.type == kPictureP) {
+    if (!picture.forward) return ExternalStatus::BadHeader;
+    anchor_[1] = picture.forward;
+  } else if (p.type == kPictureB) {
+    if (!picture.forward || !picture.backward) return ExternalStatus::BadHeader;
+    // (the distances: 0 < TRB < TRD, as a decoder that derives them from the plane times has them)
+    if (picture.pp_time <= 0 || picture.pb_time <= 0 || picture.pb_time >= picture.pp_time || picture.pp_time > 0xFFFF) return ExternalStatus::BadHeader;
+    if (vol_.interlaced && (picture.pb_field_time <= 0 || picture.pb_field_time >= picture.pp_field_time || picture.pp_field_time > 0xFFFF)) return ExternalStatus::BadHeader;
+    anchor_[0] = picture.forward;
+    anchor_[1] = picture.backward;
+    pp_time_ = picture.pp_time;
+    pb_time_ = picture.pb_time;
+    pp_field_time_ = vol_.interlaced ? picture.pp_field_time : 4;
+    pb_field_time_ = vol_.interlaced ? picture.pb_field_time : 2;
+  }
+  pic_ = p;
+  ExternalStatus status = ExternalStatus::Decoded;
+  if (h.type == VopType::S && !setup_sprite(h)) {
+    status = ExternalStatus::BadHeader;
+  } else {
+    ext_target_ = picture.target;
+    if (!begin_picture(0)) {
+      status = ExternalStatus::NoMemory;
+    } else {
+      BitReader br(body);
+      br.skip(static_cast<int>(h.header_bits));
+      decode_macroblocks(br);
+    }
+  }
+  ext_target_ = nullptr;
+  cur_ = nullptr;
+  anchor_[0] = anchor_[1] = nullptr;
+  return status;
+}
+
+Core::ExternalStatus Core::decode_external_short(ConstByteView data, const ExternalPicture& picture, ShortHeader* parsed) {
+  *parsed = ShortHeader();
+  if (!picture.target || !build_vlcs()) return ExternalStatus::NoMemory;
+  ShortHeader h;
+  if (!parse_short_header(data, nullptr, &h)) return ExternalStatus::BadHeader;
+  *parsed = h;
+  // (the short video header of MPEG-4 is H.263's baseline: none of its optional modes)
+  if (h.plus || h.long_vectors || h.advanced_prediction || h.pb || h.b_picture) return ExternalStatus::BadHeader;
+  if (!configure(static_cast<int>(h.width), static_cast<int>(h.height))) return ExternalStatus::BadHeader;
+  short_header_ = true;
+  have_vol_ = false;
+  h263_ = h;
+  have_h263_ = true;
+  pb_mode_ = 0;
+  PlaneParams p;
+  p.type = h.inter ? kPictureP : kPictureI;
+  p.short_header = true;
+  p.quant = h.quant;
+  p.continuous_presence = h.continuous_presence;
+  anchor_[0] = anchor_[1] = nullptr;
+  if (p.type == kPictureP) {
+    if (!picture.forward) return ExternalStatus::BadHeader;
+    anchor_[1] = picture.forward;
+  }
+  pic_ = p;
+  ExternalStatus status = ExternalStatus::Decoded;
+  ext_target_ = picture.target;
+  if (!begin_picture(0)) {
+    status = ExternalStatus::NoMemory;
+  } else {
+    BitReader br(data);
+    br.skip(static_cast<int>(h.header_bits));
+    decode_macroblocks(br);
+  }
+  ext_target_ = nullptr;
+  cur_ = nullptr;
+  anchor_[0] = anchor_[1] = nullptr;
+  return status;
+}
+
 bool Core::configure(int width, int height) {
   if (width <= 0 || height <= 0) return false;
   const int mb_w = (width + 15) / 16, mb_h = (height + 15) / 16;
@@ -408,7 +518,7 @@ bool Core::configure(int width, int height) {
 }
 
 bool Core::begin_picture(int64_t pts) {
-  Picture* p = find_free_picture();
+  Picture* p = ext_target_ ? ext_target_ : find_free_picture();
   if (!p) return false;
   const int w = mb_w_ * 16, h = mb_h_ * 16;
   if (p->width != w || p->height != h || p->mbs.size() != static_cast<uint64_t>(mb_count_)) {

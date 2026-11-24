@@ -676,7 +676,7 @@ void Core::reset() {
 
 // Takes a picture from the pool for the one being decoded.
 bool Core::start_picture() {
-  Picture* p = find_free_picture();
+  Picture* p = ext_ ? ext_->target : find_free_picture();
   if (!p) return false;
   const uint64_t w = static_cast<uint64_t>(mb_w_) * 16, h = static_cast<uint64_t>(mb_h_) * 16;
   if (p->width != static_cast<int>(w) || p->height != static_cast<int>(h) || p->plane[0].size() != w * h) {
@@ -773,17 +773,41 @@ bool Core::decode(ConstByteView data, int64_t pts) {
 bool Core::decode_frame(ConstByteView frame, ArrayView<const ConstByteView> slices, ArrayView<const ConstByteView> raw_units) {
   BitReader br(frame);
   if (!parse_picture_header(br)) return false;
+  // (DXVA: the rounding control of a Simple or Main profile picture is the one the program says; it follows from pictures the decoder may not have seen)
+  if (ext_ && ext_->rnd >= 0 && seq_.profile != kAdvanced) pic_.rnd = ext_->rnd & 1;
   // An interlaced picture (frame or field coding) has no pixel path here: only an engine can decode it.
-  if (pic_.fcm != kFcmProgressive && !offloaded_) return false;
-  // Pictures that cannot be decoded: a stream starts at an intra picture, and a B picture needs both anchors.
-  if (need_intra_ && pic_.type != kPictureI) return false;
-  if ((pic_.type == kPictureB || pic_.type == kPictureBI) && !anchor_[0]) return false;
-  if (pic_.type == kPictureP && !pic_.skipped && !anchor_[1]) return false;
-  if (pic_.skipped && !anchor_[1]) return false;
-  if (pic_.type != kPictureB && pic_.type != kPictureBI) {
-    ic_use_ = pic_.use_ic && pic_.type == kPictureP;
-    ic_scale_ = pic_.lumscale;
-    ic_shift_ = pic_.lumshift;
+  if (pic_.fcm != kFcmProgressive && (!offloaded_ || ext_)) return false;
+  if (ext_) {
+    // The references are the caller's: every one the picture type needs must be there.
+    anchor_[0] = anchor_[1] = nullptr;
+    if (pic_.type == kPictureP) {
+      if (!ext_->forward) return false;
+      anchor_[1] = ext_->forward;
+    } else if (pic_.type == kPictureB) {
+      if (!ext_->forward || !ext_->backward) return false;
+      anchor_[0] = ext_->forward;
+      anchor_[1] = ext_->backward;
+    }
+    if (pic_.type == kPictureB) {
+      ic_use_ = ext_->ic_forward;
+      ic_scale_ = ext_->ic_scale;
+      ic_shift_ = ext_->ic_shift;
+    } else {
+      ic_use_ = pic_.use_ic && pic_.type == kPictureP;
+      ic_scale_ = pic_.lumscale;
+      ic_shift_ = pic_.lumshift;
+    }
+  } else {
+    // Pictures that cannot be decoded: a stream starts at an intra picture, and a B picture needs both anchors.
+    if (need_intra_ && pic_.type != kPictureI) return false;
+    if ((pic_.type == kPictureB || pic_.type == kPictureBI) && !anchor_[0]) return false;
+    if (pic_.type == kPictureP && !pic_.skipped && !anchor_[1]) return false;
+    if (pic_.skipped && !anchor_[1]) return false;
+    if (pic_.type != kPictureB && pic_.type != kPictureBI) {
+      ic_use_ = pic_.use_ic && pic_.type == kPictureP;
+      ic_scale_ = pic_.lumscale;
+      ic_shift_ = pic_.lumshift;
+    }
   }
   if (!start_picture()) return false;
   if (pic_.type == kPictureI) need_intra_ = false;
@@ -843,6 +867,10 @@ bool Core::decode_frame(ConstByteView frame, ArrayView<const ConstByteView> slic
 }
 
 void Core::finish_picture(ArrayView<const ConstByteView> units) {
+  if (ext_) {   // (the caller keeps the picture; nothing is output)
+    cur_ = nullptr;
+    return;
+  }
   if (offloaded_ || observer_) {
     OffloadPicture o;
     o.seq = &seq_;
@@ -898,6 +926,76 @@ void Core::finish_picture(ArrayView<const ConstByteView> units) {
     held_ = p;
   }
   cur_ = nullptr;
+}
+
+// ---- decoding for a DXVA driver --------------------------------------------------------------------------------------------------------
+
+Core::ExternalStatus Core::decode_external(const SequenceHeader& seq, ConstByteView data, const ExternalPicture& picture, PictureHeader* header) {
+  *header = PictureHeader();
+  pic_ = PictureHeader();
+  if (!picture.target || data.empty()) return ExternalStatus::BadPicture;
+  offload_ = nullptr;
+  observer_ = nullptr;
+  seq_ = seq;
+  seq_.valid = true;
+  have_seq_ = true;
+  if (!setup_sequence()) return ExternalStatus::BadSequence;
+  Buf<uint8_t> scratch;
+  if (!scratch.alloc(allocator_, data.size() + 8)) return ExternalStatus::NoMemory;
+  List<ConstByteView> slices(allocator_), units(allocator_);
+  ConstByteView frame;
+  bool have_frame = false;
+  uint64_t used = 0;
+  const bool adv = seq_.profile == kAdvanced;
+  auto stash = [&](ConstByteView unit) -> ConstByteView {
+    const uint64_t n = unescape(unit, ByteView(scratch.data(), scratch.size()).subview(used));
+    ConstByteView out = ConstByteView(scratch.data(), scratch.size()).subview(used, n);
+    used += n;
+    return out;
+  };
+  const bool coded = adv && data.size() >= 4 && data[0] == 0 && data[1] == 0 && data[2] == 1;
+  if (!coded) {
+    frame = adv ? stash(data) : data;
+    have_frame = true;
+    if (!units.push_back(data)) return ExternalStatus::NoMemory;
+  } else {
+    uint64_t i = 0;
+    while (i < data.size()) {
+      const uint64_t start = next_start_code(data, i);
+      if (start >= data.size()) break;
+      const uint64_t end = next_start_code(data, start + 3);
+      if (start + 4 > end) {
+        i = end;
+        continue;
+      }
+      const uint32_t code = data[start + 3];
+      ConstByteView unit = data.subview(start + 4, end - (start + 4));
+      ConstByteView whole = data.subview(start, end - start);
+      if (code == kCodeFrame) {
+        if (have_frame) break;   // (a second frame: not this picture's)
+        frame = stash(unit);
+        have_frame = true;
+        if (!units.push_back(whole)) return ExternalStatus::NoMemory;
+      } else if (code == kCodeSlice) {
+        if (!have_frame) return ExternalStatus::BadPicture;
+        if (!slices.push_back(stash(unit)) || !units.push_back(whole)) return ExternalStatus::NoMemory;
+      } else if (code == kCodeField) {
+        // The second field of a field interlace frame (DXVA sends it as a picture of its own).
+        return ExternalStatus::Interlaced;
+      }
+      // (sequence headers, entry points, end of sequence and user data: the parameters are `seq`)
+      i = end;
+    }
+  }
+  if (!have_frame) return ExternalStatus::BadPicture;
+  ext_ = &picture;
+  const bool ok = decode_frame(frame, slices.view(), units.view());
+  ext_ = nullptr;
+  anchor_[0] = anchor_[1] = nullptr;
+  cur_ = nullptr;
+  *header = pic_;
+  if (!ok) return pic_.fcm != kFcmProgressive ? ExternalStatus::Interlaced : ExternalStatus::BadPicture;
+  return ExternalStatus::Decoded;
 }
 
 }  // namespace vc1

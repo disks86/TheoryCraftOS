@@ -15,16 +15,19 @@
  * You should have received a copy of the GNU Affero General Public License
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
-// DXVA HEVC decoding (D3D11_DECODER_PROFILE_HEVC_VLD_MAIN) on the CPU H.265 decoder (Software/H265*.cpp).
+// DXVA HEVC decoding (D3D11_DECODER_PROFILE_HEVC_VLD_MAIN into NV12, _HEVC_VLD_MAIN10 into P010) on the CPU H.265 decoder (Software/H265*.cpp).
 //
 // DXVA_PicParams_HEVC carries the sequence and picture parameter set fields a decoder needs, but not the short-term reference picture sets of the SPS that the slice
 // headers name, nor the long-term pictures of the SPS: instead it gives the reference picture sets of the picture itself (RefPicList with the order counts, and the
 // StCurrBefore / StCurrAfter / LtCurr sets as indexes into it), the picture's order count and the size of the set a slice header carries itself. So the parameter sets
 // are made as structures from the parameters, and the H.265 core is driven "from outside" (h265::Core::external_*): it reads each slice segment header with those
 // sets (skipping the slice's own short-term set by its size) and decodes the slice data, with the references being the pictures this decoder made earlier in the
-// surfaces RefPicList names. Pictures are kept per surface key. The picture comes back at once, in decoding order, at the coded size (no conformance window), as NV12.
+// surfaces RefPicList names. Pictures are kept per surface key. The picture comes back at once, in decoding order, at the coded size (no conformance window), as NV12
+// (Main) or P010 (Main 10: every sample in the top bits of its 16-bit word).
 //
-// Main profile only (8-bit 4:2:0: the core's sample paths are 8-bit): another chroma format or bit depth is Unsupported.
+// 4:2:0 only. The Main profile decoder takes 8-bit pictures (Main, Main Still Picture); the Main 10 one 8 to 10 bits for luma and chroma each (Main 10, and Main and
+// the Still Picture profiles, which are subsets of it), as hardware DXVA Main 10 decoders do. Another chroma format or a deeper sample (the range extension profiles,
+// which have DXVA profiles of their own) is Unsupported.
 #include "Hardware/VideoCodec/Dxva/DxvaCodecs.hpp"
 #include "Hardware/VideoCodec/Dxva/DxvaSurfaces.hpp"
 #include "Hardware/VideoCodec/Dxva/DxvaTypesHevc.hpp"
@@ -97,7 +100,7 @@ class HevcDxvaDecoder final : public IDxvaDecoder {
     return static_cast<bool>(core_);
   }
 
-  DxvaProfile profile() const override { return DxvaProfile::HevcVldMain; }
+  DxvaProfile profile() const override { return config_.profile; }
 
   void reset() override {
     surfaces_.clear();
@@ -116,6 +119,7 @@ class HevcDxvaDecoder final : public IDxvaDecoder {
   // The slice segments of the picture: each control's bytes, chopped pieces put together, split at start codes. False: a control is out of the bitstream.
   [[nodiscard]] bool run_slices(const DxvaPicture& picture, bool* damaged, const char** why);
   [[nodiscard]] bool output(const Picture& p, DxvaDecodedPicture* out);
+  [[nodiscard]] bool output_p010(const Picture& p, DxvaDecodedPicture* out);
 
   allocators::IAllocator& allocator_;
   DxvaDecoderConfig config_;
@@ -139,8 +143,10 @@ DxvaResult HevcDxvaDecoder::make_parameter_sets(const dxva::PicParamsHevc& pp, C
     *why = "HEVC: only 4:2:0 is decoded (Main profile)";
     return DxvaResult::Unsupported;
   }
-  if (field(format, fmt::kBitDepthLumaMinus8, 3) != 0 || field(format, fmt::kBitDepthChromaMinus8, 3) != 0) {
-    *why = "HEVC: only 8-bit samples are decoded (Main profile)";
+  const int depth_luma = 8 + static_cast<int>(field(format, fmt::kBitDepthLumaMinus8, 3)), depth_chroma = 8 + static_cast<int>(field(format, fmt::kBitDepthChromaMinus8, 3));
+  const int max_depth = config_.profile == DxvaProfile::HevcVldMain10 ? 10 : 8;
+  if (depth_luma > max_depth || depth_chroma > max_depth) {
+    *why = max_depth == 8 ? "HEVC: the Main profile decodes 8-bit samples only" : "HEVC: the Main 10 profile decodes up to 10-bit samples";
     return DxvaResult::Unsupported;
   }
   *why = "HEVC: picture parameters out of range";
@@ -167,7 +173,8 @@ DxvaResult HevcDxvaDecoder::make_parameter_sets(const dxva::PicParamsHevc& pp, C
   }
   s.width = static_cast<int>(width);
   s.height = static_cast<int>(height);
-  s.bit_depth_luma = s.bit_depth_chroma = 8;
+  s.bit_depth_luma = depth_luma;
+  s.bit_depth_chroma = depth_chroma;
   s.scaling_list_enabled = flag(tools, tool::kScalingListEnabled);
   s.amp = flag(tools, tool::kAmp);
   s.sao = flag(tools, tool::kSao);
@@ -178,7 +185,7 @@ DxvaResult HevcDxvaDecoder::make_parameter_sets(const dxva::PicParamsHevc& pp, C
     s.log2_min_pcm = static_cast<int>(field(tools, tool::kLog2MinPcmMinus3, 2)) + 3;
     s.log2_max_pcm = s.log2_min_pcm + static_cast<int>(field(tools, tool::kLog2DiffMaxMinPcm, 2));
     s.pcm_loop_filter_disabled = flag(tools, tool::kPcmLoopFilterDisabled);
-    if (s.pcm_bit_depth_luma > 8 || s.pcm_bit_depth_chroma > 8 || s.log2_max_pcm > 5 || s.log2_min_pcm < s.log2_min_cb) return DxvaResult::Invalid;
+    if (s.pcm_bit_depth_luma > depth_luma || s.pcm_bit_depth_chroma > depth_chroma || s.log2_max_pcm > 5 || s.log2_min_pcm < s.log2_min_cb) return DxvaResult::Invalid;
   }
   // The sets themselves come with each picture; the slice headers only need how many there are to read their index.
   if (pp.num_short_term_ref_pic_sets > 64 || pp.num_long_term_ref_pics_sps > 32) return DxvaResult::Invalid;
@@ -218,7 +225,7 @@ DxvaResult HevcDxvaDecoder::make_parameter_sets(const dxva::PicParamsHevc& pp, C
   if (pp.num_ref_idx_l0_default_active_minus1 > 14 || pp.num_ref_idx_l1_default_active_minus1 > 14) return DxvaResult::Invalid;
   p.num_ref_idx_default[0] = pp.num_ref_idx_l0_default_active_minus1 + 1;
   p.num_ref_idx_default[1] = pp.num_ref_idx_l1_default_active_minus1 + 1;
-  if (pp.init_qp_minus26 < -26 || pp.init_qp_minus26 > 25) return DxvaResult::Invalid;
+  if (pp.init_qp_minus26 < -(26 + 6 * (depth_luma - 8)) || pp.init_qp_minus26 > 25) return DxvaResult::Invalid;   // (-(26 + QpBdOffsetY) .. 25)
   p.init_qp = 26 + pp.init_qp_minus26;
   p.constrained_intra_pred = flag(props, pic::kConstrainedIntraPred);
   p.transform_skip = flag(props, pic::kTransformSkip);
@@ -337,6 +344,7 @@ bool HevcDxvaDecoder::run_slices(const DxvaPicture& picture, bool* damaged, cons
 bool HevcDxvaDecoder::output(const Picture& p, DxvaDecodedPicture* out) {
   const uint64_t w = static_cast<uint64_t>(p.width), h = static_cast<uint64_t>(p.height);
   const uint64_t cw = w / 2, ch = h / 2;
+  if (config_.output == PixelFormat::P010) return output_p010(p, out);
   out_.clear();
   if (!out_.put_zeros(w * h + cw * ch * 2)) return false;
   ByteView dst = out_.writable_view();
@@ -360,6 +368,53 @@ bool HevcDxvaDecoder::output(const Picture& p, DxvaDecodedPicture* out) {
   f.keyframe = false;
   f.limited_range = true;
   out->frame = f;
+  out->surface_format = DxvaSurfaceFormat::Nv12;
+  return true;
+}
+
+// P010 of the whole coded size: each sample (of a deep picture: a 16-bit little-endian word with the value in its low bits; of an 8-bit one: a byte) moved to the top bits of
+// its word, Cb and Cr interleaved.
+bool HevcDxvaDecoder::output_p010(const Picture& p, DxvaDecodedPicture* out) {
+  const uint64_t w = static_cast<uint64_t>(p.width), h = static_cast<uint64_t>(p.height);
+  const uint64_t cw = w / 2, ch = h / 2;
+  out_.clear();
+  if (!out_.put_zeros(w * h * 2 + cw * ch * 4)) return false;
+  ByteView dst = out_.writable_view();
+  const ConstByteView plane[3] = {ConstByteView(p.plane[0].data(), p.plane[0].size()), ConstByteView(p.plane[1].data(), p.plane[1].size()),
+                                  ConstByteView(p.plane[2].data(), p.plane[2].size())};
+  const uint64_t bytes = p.deep ? 2 : 1;
+  auto sample = [&](int c, uint64_t x, uint64_t y) -> uint32_t {
+    const ConstByteView s = plane[c].subview(y * static_cast<uint64_t>(p.stride[c]) + x * bytes, bytes);
+    return bytes == 2 ? static_cast<uint32_t>(s[0]) | (static_cast<uint32_t>(s[1]) << 8) : s[0];
+  };
+  auto put = [](ByteView at, uint32_t value, int depth) {
+    const uint32_t word = (value << (16 - depth)) & 0xFFFFu;
+    at[0] = static_cast<uint8_t>(word);
+    at[1] = static_cast<uint8_t>(word >> 8);
+  };
+  const int depth_luma = p.deep ? p.depth_luma : 8, depth_chroma = p.deep ? p.depth_chroma : 8;
+  for (uint64_t y = 0; y < h; ++y) {
+    ByteView row = dst.subview(y * w * 2, w * 2);
+    for (uint64_t x = 0; x < w; ++x) put(row.subview(x * 2, 2), sample(0, x, y), depth_luma);
+  }
+  ByteView uv = dst.subview(w * h * 2);
+  for (uint64_t y = 0; y < ch; ++y) {
+    ByteView row = uv.subview(y * cw * 4, cw * 4);
+    for (uint64_t x = 0; x < cw; ++x) {
+      put(row.subview(x * 4, 2), sample(1, x, y), depth_chroma);
+      put(row.subview(x * 4 + 2, 2), sample(2, x, y), depth_chroma);
+    }
+  }
+  VideoFrame f;
+  f.format = {static_cast<uint32_t>(w), static_cast<uint32_t>(h), PixelFormat::P010};
+  const ConstByteView all = out_.view();
+  f.plane[0] = all.data();
+  f.plane[1] = all.subview(w * h * 2).data();
+  f.stride[0] = f.stride[1] = static_cast<uint32_t>(w * 2);
+  f.keyframe = false;
+  f.limited_range = true;
+  out->frame = f;
+  out->surface_format = DxvaSurfaceFormat::P010;
   return true;
 }
 
@@ -426,7 +481,8 @@ DxvaResult HevcDxvaDecoder::decode(const DxvaPicture& picture, DxvaDecodedPictur
         HevcSurface* surface = surfaces_.find(ref_key[entry]);
         if (ref_key[entry] == cur_key) self_reference = true;   // the picture that was in the output surface before this one
         Picture* r = surface && surface->valid ? surface->picture.get() : nullptr;
-        if (r && (r->width != sps.width || r->height != sps.height)) r = nullptr;   // a picture of another size cannot be referred to
+        // a picture of another size or bit depth cannot be referred to
+        if (r && (r->width != sps.width || r->height != sps.height || r->depth_luma != sps.bit_depth_luma || r->depth_chroma != sps.bit_depth_chroma)) r = nullptr;
         if (r) {
           surfaces_.touch(ref_key[entry]);
         } else {
@@ -478,7 +534,8 @@ DxvaResult HevcDxvaDecoder::decode(const DxvaPicture& picture, DxvaDecodedPictur
 }  // namespace
 
 UniquePointer<IDxvaDecoder> create_dxva_hevc(allocators::IAllocator& allocator, const DxvaDecoderConfig& config) {
-  if (config.profile != DxvaProfile::HevcVldMain || config.output != PixelFormat::Nv12) return {};
+  const bool main10 = config.profile == DxvaProfile::HevcVldMain10;
+  if ((config.profile != DxvaProfile::HevcVldMain && !main10) || config.output != (main10 ? PixelFormat::P010 : PixelFormat::Nv12)) return {};
   UniquePointer<HevcDxvaDecoder> decoder = UniquePointer<HevcDxvaDecoder>::make(allocator, allocator, config);
   if (!decoder || !decoder->init()) return {};
   return UniquePointer<IDxvaDecoder>(util::move(decoder));

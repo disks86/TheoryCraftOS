@@ -27,8 +27,10 @@
 
 namespace hardware {
 
-// The formats (DXGI_FORMAT_NV12, P010, P016, B8G8R8A8_UNORM, B8G8R8X8_UNORM, R8G8B8A8_UNORM, R10G10B10A2_UNORM, R16G16B16A16_FLOAT).
-enum class VpFormat : uint8_t { Nv12, P010, P016, Bgra8, Bgrx8, Rgba8, Rgb10a2, Rgba16f };
+// The formats (DXGI_FORMAT_NV12, P010, P016, B8G8R8A8_UNORM, B8G8R8X8_UNORM, R8G8B8A8_UNORM, R10G10B10A2_UNORM, R16G16B16A16_FLOAT, then the 4:4:4 and 4:2:2 YUV
+// ones: AYUV, Y410, Y416, YUY2, Y210, Y216, P208).
+enum class VpFormat : uint8_t { Nv12, P010, P016, Bgra8, Bgrx8, Rgba8, Rgb10a2, Rgba16f, Ayuv, Y410, Y416, Yuy2, Y210, Y216, P208 };
+constexpr VpFormat kVpLastFormat = VpFormat::P208;
 // The colour spaces: DXGI_COLOR_SPACE_TYPE values (the numbers are DXGI's). What vp_color_space_supported says is taken.
 using VpColorSpace = uint32_t;
 constexpr VpColorSpace kVpRgbFullG22P709 = 0, kVpRgbFullG10P709 = 1, kVpRgbStudioG22P709 = 2, kVpRgbStudioG22P2020 = 3, kVpYcbcrFullG22P709X601 = 5,
@@ -41,11 +43,17 @@ constexpr VpColorSpace kVpRgbFullG22P709 = 0, kVpRgbFullG10P709 = 1, kVpRgbStudi
 // sets is meant, and Windows' processors do not convert them either). X601 is the BT.601 matrix over P709 primaries (JPEG); LEFT chroma is co-sited horizontally and
 // centred vertically (MPEG-2), TOPLEFT co-sited both ways, NONE centred both ways.
 bool vp_color_space_supported(VpFormat format, VpColorSpace space);
-constexpr bool vp_is_yuv(VpFormat f) { return f == VpFormat::Nv12 || f == VpFormat::P010 || f == VpFormat::P016; }
+constexpr bool vp_is_yuv(VpFormat f) { return f == VpFormat::Nv12 || f == VpFormat::P010 || f == VpFormat::P016 || (f >= VpFormat::Ayuv && f <= kVpLastFormat); }
+// The planes an image of the format has (VpImage::plane): two for the planar YUV formats (NV12, P010, P016, P208), one for the packed ones and RGB.
+constexpr uint32_t vp_plane_count(VpFormat f) { return f == VpFormat::Nv12 || f == VpFormat::P010 || f == VpFormat::P016 || f == VpFormat::P208 ? 2 : 1; }
 
 // One plane: memory, rows `pitch` bytes apart, samples `step` bytes apart, `width` x `height` samples. A sample's channels: `offset[c]` bytes into it, each `bits` wide
-// (8 or 16; 10 for Rgb10a2, which is a packed 32-bit word and ignores offsets; 16 with `half_float` for Rgba16f). For a YUV plane 0 is Y (channel 0), plane 1 is U, V
-// (channels 0 and 1); an RGB image has one plane with R, G, B, A (channels 0..3; X8 formats have no alpha: `channels` 3).
+// (8 or 16; 10 for Rgb10a2 and Y410, a packed 32-bit word whose offsets are the numbers of the 10-bit fields - 0..2, the 2-bit one 3; 16 with `half_float` for Rgba16f).
+// For a planar YUV image plane 0 is Y (channel 0), plane 1 is U, V (channels 0 and 1; P208's plane 1 is half as wide and as high as the picture, the others' half both
+// ways); an RGB image has one plane with R, G, B, A (channels 0..3; X8 formats have no alpha: `channels` 3). A packed 4:4:4 image (AYUV, Y410, Y416) has one plane of
+// pixels with Y, U, V, A as channels 0..3 (AYUV's bytes V, U, Y, A: offsets 2, 1, 0, 3; Y416's words U, Y, V, A: offsets 2, 0, 4, 6; Y410's fields: 1, 0, 2, 3). A
+// packed 4:2:2 image (YUY2, Y210, Y216) has one plane of pairs of pixels - `width` the pairs, (picture width + 1) / 2 - with Y0, U, Y1, V as channels 0..3 (offsets 0,
+// 1, 2, 3 for YUY2, 0, 2, 4, 6 for Y210 / Y216). 16-bit samples of P010 and Y210 hold the value in their top ten bits (value << 6); P016, Y216, Y416 are 16-bit values.
 struct VpPlane {
   ByteView memory;            // (an input's is only read)
   uint32_t pitch = 0, step = 0, width = 0, height = 0;

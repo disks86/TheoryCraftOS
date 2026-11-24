@@ -200,35 +200,49 @@ M3 rgb_to_xyz(Primaries p) {
 
 enum class SampleKind : uint8_t { U8, U16, Half, Packed1010102 };
 
+constexpr uint8_t kNoPair = 0xFF;
+
 struct PlaneAccess {
   ByteView memory;
   uint64_t pitch = 0, step = 0;
-  uint8_t offset[4] = {};
+  uint8_t offset[4] = {};   // (Packed1010102: the number of the field of each channel)
   SampleKind kind = SampleKind::U8;
   uint8_t shift = 0;   // U16: the value's position in the word (P010: 6)
+  // The luma of a packed 4:2:2 image (YUY2, Y210, Y216): sample x is in pair x / 2, channel 0 at offset[0] for an even x and at pair_offset for an odd one.
+  uint8_t pair_offset = kNoPair;
 
   uint32_t le16(uint64_t at) const { return uint32_t{memory[at]} | uint32_t{memory[at + 1]} << 8; }
   uint32_t le32(uint64_t at) const { return le16(at) | le16(at + 2) << 16; }
+  uint64_t address(uint32_t x, uint32_t y, uint32_t c) const {
+    if (pair_offset != kNoPair && c == 0) return y * pitch + (x >> 1) * step + ((x & 1) ? pair_offset : offset[0]);
+    return y * pitch + x * step + (kind == SampleKind::Packed1010102 ? 0 : offset[c]);
+  }
   // Channel `c` of sample (x, y) as its code (an integer, or the float of a half).
   float read(uint32_t x, uint32_t y, uint32_t c) const {
-    const uint64_t at = y * pitch + x * step;
+    const uint64_t at = address(x, y, c);
     switch (kind) {
-      case SampleKind::U8: return memory[at + offset[c]];
-      case SampleKind::U16: return static_cast<float>(le16(at + offset[c]) >> shift);
-      case SampleKind::Half: return graphics::half_to_float(static_cast<uint16_t>(le16(at + offset[c])));
-      case SampleKind::Packed1010102: return static_cast<float>((le32(at) >> (10 * c)) & (c == 3 ? 0x3u : 0x3FFu));
+      case SampleKind::U8: return memory[at];
+      case SampleKind::U16: return static_cast<float>(le16(at) >> shift);
+      case SampleKind::Half: return graphics::half_to_float(static_cast<uint16_t>(le16(at)));
+      case SampleKind::Packed1010102: return static_cast<float>((le32(at) >> (10 * offset[c])) & (offset[c] == 3 ? 0x3u : 0x3FFu));
     }
     return 0.0f;
   }
   void put16(uint64_t at, uint32_t v) const { memory[at] = static_cast<uint8_t>(v); memory[at + 1] = static_cast<uint8_t>(v >> 8); }
-  // Channel `c` of sample (x, y) from a code already rounded and clamped (packed samples: write_packed).
+  // Channel `c` of sample (x, y) from a code already rounded and clamped (a packed 10-bit word: its field, the others kept; RGB rows use write_packed).
   void write(uint32_t x, uint32_t y, uint32_t c, float code) const {
-    const uint64_t at = y * pitch + x * step + offset[c];
+    const uint64_t at = address(x, y, c);
     switch (kind) {
       case SampleKind::U8: memory[at] = static_cast<uint8_t>(code); return;
       case SampleKind::U16: put16(at, static_cast<uint32_t>(code) << shift); return;
       case SampleKind::Half: put16(at, graphics::float_to_half(code)); return;
-      case SampleKind::Packed1010102: return;
+      case SampleKind::Packed1010102: {
+        const uint32_t field = offset[c], mask = (field == 3 ? 0x3u : 0x3FFu) << (10 * field);
+        const uint32_t word = (le32(at) & ~mask) | ((static_cast<uint32_t>(code) << (10 * field)) & mask);
+        put16(at, word & 0xFFFF);
+        put16(at + 2, word >> 16);
+        return;
+      }
     }
   }
   void write_packed(uint32_t x, uint32_t y, const float code[4], bool alpha) const {
@@ -246,6 +260,10 @@ bool check_plane(const VpPlane& p, SampleKind kind, uint8_t bits, bool half, uin
   if (p.bits != bits || p.half_float != half || p.channels < min_channels || p.channels > 4 || p.step == 0 || p.width < need_w || p.height < need_h || need_w == 0 || need_h == 0)
     return false;
   uint64_t extent = 4;   // the bytes of one sample that are touched
+  if (kind == SampleKind::Packed1010102) {
+    for (uint32_t c = 0; c < p.channels; ++c)
+      if (p.offset[c] > 3) return false;
+  }
   if (kind != SampleKind::Packed1010102) {
     const uint64_t bytes = kind == SampleKind::U8 ? 1 : 2;
     extent = 0;
@@ -275,12 +293,13 @@ struct ImageAccess {
   PlaneAccess plane[2];
   uint32_t width = 0, height = 0;
   bool yuv = false, has_alpha = false, is_float = false;
+  uint8_t ss_x = 1, ss_y = 1;   // a YUV image's chroma subsampling (shifts): 4:2:0 1, 1; 4:2:2 1, 0; 4:4:4 0, 0
   // code = nominal * scale + bias, for the first channel (Y or R, G, B), the chroma channels and alpha; codes are clamped to 0..max
   float scale[3] = {}, bias[3] = {}, max[3] = {};
 };
 
 VpResult prepare_image(const VpImage& image, ImageAccess* out) {
-  if (static_cast<uint8_t>(image.format) > static_cast<uint8_t>(VpFormat::Rgba16f)) return VpResult::Invalid;
+  if (static_cast<uint8_t>(image.format) > static_cast<uint8_t>(kVpLastFormat)) return VpResult::Invalid;
   if (!vp_color_space_supported(image.format, image.color_space)) return VpResult::Unsupported;
   if (image.width == 0 || image.height == 0) return VpResult::Invalid;
   out->space = space_info(image.color_space);
@@ -317,6 +336,42 @@ VpResult prepare_image(const VpImage& image, ImageAccess* out) {
       out->has_alpha = channels == 4;
       out->is_float = true;
       break;
+    case VpFormat::P208:
+      // (NV12 with chroma of the picture's height)
+      if (!check_plane(image.plane[0], SampleKind::U8, 8, false, 1, image.width, image.height, 0, &out->plane[0], &channels)) return VpResult::Invalid;
+      if (!check_plane(image.plane[1], SampleKind::U8, 8, false, 2, (image.width + 1) / 2, image.height, 0, &out->plane[1], &chroma_channels)) return VpResult::Invalid;
+      out->ss_y = 0;
+      break;
+    case VpFormat::Ayuv:
+    case VpFormat::Y410:
+    case VpFormat::Y416:
+    case VpFormat::Yuy2:
+    case VpFormat::Y210:
+    case VpFormat::Y216: {
+      // One plane: the luma access is it with Y as channel 0 (and alpha 3); the chroma access the same memory with U, V as channels 0 and 1.
+      const VpFormat f = image.format;
+      const bool pairs = f == VpFormat::Yuy2 || f == VpFormat::Y210 || f == VpFormat::Y216;
+      const SampleKind kind = f == VpFormat::Y410 ? SampleKind::Packed1010102 : f == VpFormat::Ayuv || f == VpFormat::Yuy2 ? SampleKind::U8 : SampleKind::U16;
+      const uint8_t bits = f == VpFormat::Y410 ? 10 : kind == SampleKind::U8 ? 8 : 16;
+      const uint8_t shift = f == VpFormat::Y210 ? 6 : 0;
+      depth = f == VpFormat::Ayuv || f == VpFormat::Yuy2 ? 8 : f == VpFormat::Y410 || f == VpFormat::Y210 ? 10 : 16;
+      if (!check_plane(image.plane[0], kind, bits, false, 4, pairs ? (image.width + 1) / 2 : image.width, image.height, shift, &out->plane[0], &channels))
+        return VpResult::Invalid;
+      const VpPlane& p = image.plane[0];
+      out->plane[1] = out->plane[0];
+      if (pairs) {
+        out->plane[0].pair_offset = p.offset[2];
+        out->plane[1].offset[0] = p.offset[1];
+        out->plane[1].offset[1] = p.offset[3];
+        out->ss_y = 0;
+      } else {
+        out->plane[1].offset[0] = p.offset[1];
+        out->plane[1].offset[1] = p.offset[2];
+        out->has_alpha = true;
+        out->ss_x = out->ss_y = 0;
+      }
+      break;
+    }
   }
   if (out->is_float) {
     out->scale[0] = out->space.full ? 1.0f : 219.0f / 255.0f;
@@ -333,7 +388,7 @@ VpResult prepare_image(const VpImage& image, ImageAccess* out) {
       out->scale[0] = 219.0f * k; out->bias[0] = 16.0f * k;
       out->scale[1] = 224.0f * k; out->bias[1] = 128.0f * k;
     }
-    out->max[2] = image.format == VpFormat::Rgb10a2 ? 3.0f : max;
+    out->max[2] = image.format == VpFormat::Rgb10a2 || image.format == VpFormat::Y410 ? 3.0f : max;
     out->scale[2] = out->max[2];
   }
   return VpResult::Ok;
@@ -456,10 +511,10 @@ struct StreamState {
       return;
     }
     code[0] = bilinear(p0, x0, x1, y0, y1, wx, wy, 0);
-    code[3] = 0.0f;
-    // chroma sample i sits at luma position 2 i + chroma_x: (clamped to the chroma samples of the source rectangle)
-    double cx = (sx - chroma_x) * 0.5, cy = (sy - chroma_y) * 0.5;
-    const double clo_x = source.left / 2, chi_x = (source.right - 1) / 2, clo_y = source.top / 2, chi_y = (source.bottom - 1) / 2;
+    code[3] = image.has_alpha ? bilinear(p0, x0, x1, y0, y1, wx, wy, 3) : 0.0f;
+    // chroma sample i sits at luma position 2 i + chroma_x where chroma is subsampled (at i where it is not): clamped to the chroma samples of the source rectangle
+    double cx = image.ss_x ? (sx - chroma_x) * 0.5 : sx, cy = image.ss_y ? (sy - chroma_y) * 0.5 : sy;
+    const double clo_x = source.left >> image.ss_x, chi_x = (source.right - 1) >> image.ss_x, clo_y = source.top >> image.ss_y, chi_y = (source.bottom - 1) >> image.ss_y;
     cx = cx < clo_x ? clo_x : cx > chi_x ? chi_x : cx;
     cy = cy < clo_y ? clo_y : cy > chi_y ? chi_y : cy;
     const double fcx = floor_d(cx), fcy = floor_d(cy);
@@ -508,9 +563,9 @@ struct Context {
     const uint32_t ux = static_cast<uint32_t>(x), uy = static_cast<uint32_t>(y);
     if (out.yuv) {
       px->v[0] = (out.plane[0].read(ux, uy, 0) - out.bias[0]) / out.scale[0];
-      px->v[1] = (out.plane[1].read(ux / 2, uy / 2, 0) - out.bias[1]) / out.scale[1];
-      px->v[2] = (out.plane[1].read(ux / 2, uy / 2, 1) - out.bias[1]) / out.scale[1];
-      px->v[3] = 1.0f;
+      px->v[1] = (out.plane[1].read(ux >> out.ss_x, uy >> out.ss_y, 0) - out.bias[1]) / out.scale[1];
+      px->v[2] = (out.plane[1].read(ux >> out.ss_x, uy >> out.ss_y, 1) - out.bias[1]) / out.scale[1];
+      px->v[3] = out.has_alpha ? out.plane[0].read(ux, uy, 3) / out.max[2] : 1.0f;
       return;
     }
     for (uint32_t c = 0; c < 3; ++c) px->v[c] = (out.plane[0].read(ux, uy, c) - out.bias[0]) / out.scale[0];
@@ -589,13 +644,15 @@ struct Context {
   void run_yuv() const {
     const int32_t w = static_cast<int32_t>(out.width), h = static_cast<int32_t>(out.height);
     const Siting siting = out.space.siting;
-    const int32_t ci0 = target.left / 2, ci1 = (target.right + 1) / 2, cj0 = target.top / 2, cj1 = (target.bottom + 1) / 2;
+    const int32_t sx = out.ss_x, sy = out.ss_y;   // (shifts: 1 subsampled, 0 not)
+    const int32_t ci0 = target.left >> sx, ci1 = (target.right + (1 << sx) - 1) >> sx, cj0 = target.top >> sy, cj1 = (target.bottom + (1 << sy) - 1) >> sy;
+    const int32_t chunk = kChunk >> sx;   // chroma columns per chunk
     Px rows[3][kLine];
     int32_t row_of[3];
-    for (int32_t i0 = ci0; i0 < ci1; i0 += kChunk / 2) {
-      const int32_t i1 = ci1 - i0 > kChunk / 2 ? i0 + kChunk / 2 : ci1;
-      const int32_t lx0 = 2 * i0 - 1 < 0 ? 0 : 2 * i0 - 1, lx1 = 2 * i1 < w ? 2 * i1 : w;
-      const int32_t own0 = 2 * i0 > target.left ? 2 * i0 : target.left, own1 = 2 * i1 < target.right ? 2 * i1 : target.right;   // the luma this chunk writes
+    for (int32_t i0 = ci0; i0 < ci1; i0 += chunk) {
+      const int32_t i1 = ci1 - i0 > chunk ? i0 + chunk : ci1;
+      const int32_t lx0 = sx ? (2 * i0 - 1 < 0 ? 0 : 2 * i0 - 1) : i0, lx1 = (i1 << sx) < w ? (i1 << sx) : w;
+      const int32_t own0 = (i0 << sx) > target.left ? (i0 << sx) : target.left, own1 = (i1 << sx) < target.right ? (i1 << sx) : target.right;   // the luma this chunk writes
       row_of[0] = row_of[1] = row_of[2] = -1;
       auto row = [&](int32_t r) -> const Px* {
         r = r < 0 ? 0 : r >= h ? h - 1 : r;
@@ -604,8 +661,10 @@ struct Context {
           row_of[slot] = r;
           compute_row(r, lx0, lx1, rows[slot]);
           if (r >= target.top && r < target.bottom)
-            for (int32_t x = own0; x < own1; ++x)
+            for (int32_t x = own0; x < own1; ++x) {
               out.plane[0].write(static_cast<uint32_t>(x), static_cast<uint32_t>(r), 0, code_of(rows[slot][x - lx0].v[0], 0));
+              if (write_alpha) out.plane[0].write(static_cast<uint32_t>(x), static_cast<uint32_t>(r), 3, code_of(rows[slot][x - lx0].v[3], 2));
+            }
         }
         return rows[slot];
       };
@@ -615,7 +674,10 @@ struct Context {
         const Px* taps[3];
         float vw[3];
         int vn = 0;
-        if (siting == Siting::TopLeft) {
+        if (!sy) {
+          taps[0] = row(j);
+          vw[0] = 1.0f; vn = 1;
+        } else if (siting == Siting::TopLeft) {
           taps[0] = row(2 * j - 1); taps[1] = row(2 * j); taps[2] = row(2 * j + 1);
           vw[0] = 0.25f; vw[1] = 0.5f; vw[2] = 0.25f; vn = 3;
         } else {
@@ -626,7 +688,10 @@ struct Context {
           int32_t cols[3];
           float hw[3];
           int hn = 0;
-          if (siting == Siting::Centre) {
+          if (!sx) {
+            cols[0] = column(i);
+            hw[0] = 1.0f; hn = 1;
+          } else if (siting == Siting::Centre) {
             cols[0] = column(2 * i); cols[1] = column(2 * i + 1);
             hw[0] = 0.5f; hw[1] = 0.5f; hn = 2;
           } else {
@@ -651,7 +716,7 @@ struct Context {
 }  // namespace
 
 bool vp_color_space_supported(VpFormat format, VpColorSpace space) {
-  if (static_cast<uint8_t>(format) > static_cast<uint8_t>(VpFormat::Rgba16f)) return false;
+  if (static_cast<uint8_t>(format) > static_cast<uint8_t>(kVpLastFormat)) return false;
   const SpaceInfo info = space_info(space);
   return info.known && info.yuv == vp_is_yuv(format);
 }
@@ -712,7 +777,7 @@ VpResult video_process(const VpOutput& output, ArrayView<const VpStream> streams
       break;
     }
   }
-  ctx.write_alpha = !ctx.out.yuv && ctx.out.has_alpha;
+  ctx.write_alpha = ctx.out.has_alpha;   // (an RGB output with alpha, AYUV, Y410, Y416)
 
   // The background in the output's nominal values.
   const float* bg = output.background;

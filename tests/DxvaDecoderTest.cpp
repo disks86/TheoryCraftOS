@@ -86,6 +86,16 @@ static void dxva_test_hevc() {}
 #else
 static void dxva_test_av1() {}
 #endif
+#if !defined(DXVA_TEST_ONLY) || defined(DXVA_TEST_ONLY_VC1)
+#include "DxvaDecoderTestVc1.inc"
+#else
+static void dxva_test_vc1() {}
+#endif
+#if !defined(DXVA_TEST_ONLY) || defined(DXVA_TEST_ONLY_MPEG4)
+#include "DxvaDecoderTestMpeg4.inc"
+#else
+static void dxva_test_mpeg4() {}
+#endif
 
 int main() {
   dxva_test_h264();
@@ -93,6 +103,8 @@ int main() {
   dxva_test_vp9();
   dxva_test_hevc();
   dxva_test_av1();
+  dxva_test_vc1();
+  dxva_test_mpeg4();
   if (g_failed) {
     printf("%d check(s) failed\n", g_failed);
     return 1;

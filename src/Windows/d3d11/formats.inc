@@ -29,6 +29,7 @@ enum { PACK_NONE, PACK_R11G11B10, PACK_565, PACK_5551, PACK_4444, PACK_1010102U,
 #define FMT_BLOCK 4u       /* block-compressed (sampled only) */
 #define FMT_SAMPLE 8u      /* only sampled (no render target, no unordered access) */
 #define FMT_PLANAR 16u     /* NV12, P010, P016: a luma plane and a half-size plane of U, V (each a texture of its own below: `bpp` is a luma sample's bytes) */
+#define FMT_YUV 32u        /* AYUV, Y410, Y416, YUY2, Y210, Y216: packed YUV, kept as it is (Direct3D 12's), seen through views of its pixels' RGB format only */
 
 typedef struct TexFormat {
   DXGI_FORMAT format, stored;
@@ -116,7 +117,25 @@ static const TexFormat g_tex_formats[] = {
     /* planar YUV: Direct3D 12's planar textures (each plane of each slice an image of the kernel's); their views are of one plane (R8 / R8G8, R16 / R16G16) */
     F4(DXGI_FORMAT_NV12, DXGI_FORMAT_NV12, 1, FMT_TARGET | FMT_PLANAR), F4(DXGI_FORMAT_P010, DXGI_FORMAT_P010, 2, FMT_TARGET | FMT_PLANAR),
     F4(DXGI_FORMAT_P016, DXGI_FORMAT_P016, 2, FMT_TARGET | FMT_PLANAR),
+    /* packed YUV (DXGI_FORMAT): AYUV as R8G8B8A8 (V, U, Y, A; drawn into too), Y410 as R10G10B10A2 (U, Y, V, A), Y416 as R16G16B16A16 (U, Y, V, A); YUY2 as R8G8B8A8 and
+     * Y210 / Y216 as R16G16B16A16 of half the width (Y0, U, Y1, V: `bpp` is a pixel's share of a pair). Shader resource and unordered access views of the others */
+    F4(DXGI_FORMAT_AYUV, DXGI_FORMAT_AYUV, 4, FMT_TARGET | FMT_YUV), F4(DXGI_FORMAT_Y410, DXGI_FORMAT_Y410, 4, FMT_YUV), F4(DXGI_FORMAT_Y416, DXGI_FORMAT_Y416, 8, FMT_YUV),
+    F4(DXGI_FORMAT_YUY2, DXGI_FORMAT_YUY2, 2, FMT_YUV), F4(DXGI_FORMAT_Y210, DXGI_FORMAT_Y210, 4, FMT_YUV), F4(DXGI_FORMAT_Y216, DXGI_FORMAT_Y216, 4, FMT_YUV),
 };
+/* A packed 4:2:2 format: a pixel of its views is a pair of the texture's (columns and widths on whole pairs). */
+static BOOL format_pairs(DXGI_FORMAT f) { return f == DXGI_FORMAT_YUY2 || f == DXGI_FORMAT_Y210 || f == DXGI_FORMAT_Y216; }
+/* Whether a view of a packed YUV texture may have `view` (DXGI_FORMAT): R8G8B8A8_UNORM / _UINT for AYUV and YUY2, R10G10B10A2_UNORM / _UINT for Y410, R16G16B16A16_UNORM /
+ * _UINT for Y416, Y210, Y216; render targets of AYUV alone. (The R32_UINT unordered access view and YUY2's R8G8_B8G8_UNORM view are not had: Direct3D 12 below has
+ * neither.) */
+static BOOL yuv_view_ok(DXGI_FORMAT tex, DXGI_FORMAT view, BOOL render_target) {
+  switch (tex) {
+    case DXGI_FORMAT_AYUV: return view == DXGI_FORMAT_R8G8B8A8_UNORM || view == DXGI_FORMAT_R8G8B8A8_UINT;
+    case DXGI_FORMAT_YUY2: return !render_target && (view == DXGI_FORMAT_R8G8B8A8_UNORM || view == DXGI_FORMAT_R8G8B8A8_UINT);
+    case DXGI_FORMAT_Y410: return !render_target && (view == DXGI_FORMAT_R10G10B10A2_UNORM || view == DXGI_FORMAT_R10G10B10A2_UINT);
+    case DXGI_FORMAT_Y416: case DXGI_FORMAT_Y210: case DXGI_FORMAT_Y216: return !render_target && (view == DXGI_FORMAT_R16G16B16A16_UNORM || view == DXGI_FORMAT_R16G16B16A16_UINT);
+    default: return FALSE;
+  }
+}
 #undef F4
 #undef FW
 #undef FP
