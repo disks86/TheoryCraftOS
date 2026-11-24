@@ -871,7 +871,13 @@ static void d12_write_nv12(D12 *d, ID3D12Resource *tex, UINT layers, UINT seed) 
       for (UINT x = 0; x < row_bytes[sub]; ++x) p[fp[sub].Offset + (UINT64)y * fp[sub].Footprint.RowPitch + x] = nv12_byte(seed, sub % layers, sub / layers, x, y);
   ID3D12Resource_Unmap(up, 0, NULL);
   for (UINT sub = 0; sub < 2 * layers; ++sub) {
-    D3D12_TEXTURE_COPY_LOCATION to = {tex, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, {0}}, from = {up, D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, {0}};
+    D3D12_TEXTURE_COPY_LOCATION to, from;
+    memset(&to, 0, sizeof to);
+    memset(&from, 0, sizeof from);
+    to.pResource = tex;
+    to.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    from.pResource = up;
+    from.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
     to.SubresourceIndex = sub;
     from.PlacedFootprint = fp[sub];
     ID3D12GraphicsCommandList_CopyTextureRegion(d->list, &to, 0, 0, 0, &from, NULL);
@@ -889,7 +895,13 @@ static int d12_nv12_is(D12 *d, ID3D12Resource *tex, UINT layers, UINT seed, UINT
   ID3D12Resource *down = buffer(d->dev, D3D12_HEAP_TYPE_READBACK, D3D12_HEAP_FLAG_NONE, total, D3D12_RESOURCE_STATE_COPY_DEST);
   if (!down) return 0;
   for (UINT sub = 0; sub < 2 * layers; ++sub) {
-    D3D12_TEXTURE_COPY_LOCATION to = {down, D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, {0}}, from = {tex, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, {0}};
+    D3D12_TEXTURE_COPY_LOCATION to, from;
+    memset(&to, 0, sizeof to);
+    memset(&from, 0, sizeof from);
+    to.pResource = down;
+    to.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    from.pResource = tex;
+    from.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
     to.PlacedFootprint = fp[sub];
     from.SubresourceIndex = sub;
     ID3D12GraphicsCommandList_CopyTextureRegion(d->list, &to, 0, 0, 0, &from, NULL);
