@@ -19,7 +19,8 @@
 
 // Synthetic VC-1 access units for interlaced sequences, shared by the decoder tests: an Advanced profile sequence header and entry point, and frames of any frame coding mode
 // whose picture data is nothing (no byte is zero, so no start code or escape can appear in it). They are enough for everything that reads only the picture-level
-// syntax - the Core when an engine decodes the pixels - and for nothing that decodes macroblocks.
+// syntax - the Core when an engine decodes the pixels; the CPU decoder reads the filler as picture data, so what it makes of them is nothing in particular
+// (and it refuses an interlaced frame B picture, whose bit planes the filler does not code).
 #pragma once
 #include <stdint.h>
 #include <vector>

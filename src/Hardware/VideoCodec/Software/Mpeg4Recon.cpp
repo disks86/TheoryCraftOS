@@ -955,5 +955,238 @@ void Core::conceal(int from, int to) {
   }
 }
 
+
+// ---- static sprites (7.8) ----
+namespace {
+
+// 64-bit arithmetic that notes an overflow instead of wrapping (the products of the perspective transform can be large: 7.8.4 warns that 32 bits do not do).
+struct Checked {
+  bool ok = true;
+  int64_t mul(int64_t a, int64_t b) {
+    int64_t r = 0;
+    if (__builtin_mul_overflow(a, b, &r)) ok = false;
+    return r;
+  }
+  int64_t add(int64_t a, int64_t b) {
+    int64_t r = 0;
+    if (__builtin_add_overflow(a, b, &r)) ok = false;
+    return r;
+  }
+  int64_t sub(int64_t a, int64_t b) {
+    int64_t r = 0;
+    if (__builtin_sub_overflow(a, b, &r)) ok = false;
+    return r;
+  }
+  int64_t mag(int64_t a) {
+    if (a == INT64_MIN) {
+      ok = false;
+      return 0;
+    }
+    return a < 0 ? -a : a;
+  }
+};
+
+int64_t floor_div(int64_t n, int64_t d) {   // d > 0
+  const int64_t q = n / d;
+  return (n % d != 0 && n < 0) ? q - 1 : q;
+}
+
+// "//" of the standard: to the nearest integer, halves away from zero (d > 0).
+int64_t div_nearest(int64_t n, int64_t d) { return n >= 0 ? (n + d / 2) / d : -((-n + d / 2) / d); }
+
+// One coordinate of the warp, in 1/s samples: (nx x + ny y + n0) /// (dx x + dy y + d0), where "///" rounds to the nearest integer with halves toward plus
+// infinity (positive halves away from zero, negative ones toward it). The affine warps have a constant power-of-two denominator (the shift forms of 7.8.4);
+// the perspective one does not.
+struct WarpCoordinate {
+  int64_t nx = 0, ny = 0, n0 = 0, dx = 0, dy = 0, d0 = 1;
+  int shift = -1;   // the denominator is 1 << shift (dx = dy = 0); -1: divide
+};
+
+// Whether the numerator and denominator stay below 2^61 for 0 <= x <= max_x, 0 <= y <= max_y (twice the numerator plus the denominator then fits).
+bool warp_fits(const WarpCoordinate& w, int64_t max_x, int64_t max_y) {
+  Checked c;
+  constexpr int64_t kLimit = int64_t{1} << 61;
+  const int64_t n = c.add(c.add(c.mul(c.mag(w.nx), max_x), c.mul(c.mag(w.ny), max_y)), c.mag(w.n0));
+  const int64_t d = c.add(c.add(c.mul(c.mag(w.dx), max_x), c.mul(c.mag(w.dy), max_y)), c.mag(w.d0));
+  return c.ok && n < kLimit && d < kLimit;
+}
+
+// The coordinate at (x, y); false where the denominator is 0 (a perspective whose horizon crosses the plane: no picture can be made of it).
+bool warp_at(const WarpCoordinate& w, int64_t x, int64_t y, int64_t* out) {
+  const int64_t n = w.nx * x + w.ny * y + w.n0;
+  if (w.shift >= 0) {
+    *out = w.shift == 0 ? n : (n + (int64_t{1} << (w.shift - 1))) >> w.shift;
+    return true;
+  }
+  int64_t d = w.dx * x + w.dy * y + w.d0;
+  if (d == 0) return false;
+  int64_t num = n;
+  if (d < 0) {
+    num = -num;
+    d = -d;
+  }
+  *out = floor_div(2 * num + d, 2 * d);
+  return true;
+}
+
+// The sample of a sprite plane at (fx, fy) in 1/2^shift samples of the sprite's coordinates (7.8.5): bilinear between the four samples around it, the sprite
+// padded (its edge samples repeated) outside its area [origin, origin + size).
+uint8_t sprite_sample(const PlaneRef& p, int64_t origin_x, int64_t origin_y, int64_t size_x, int64_t size_y, int64_t fx, int64_t fy, int shift) {
+  const int64_t s = int64_t{1} << shift;
+  const int64_t x = fx >> shift, y = fy >> shift, rx = fx & (s - 1), ry = fy & (s - 1);
+  auto at = [&](int64_t xx, int64_t yy) -> int64_t {
+    xx -= origin_x;
+    yy -= origin_y;
+    xx = xx < 0 ? 0 : xx >= size_x ? size_x - 1 : xx;
+    yy = yy < 0 ? 0 : yy >= size_y ? size_y - 1 : yy;
+    return p.data[static_cast<uint64_t>(yy) * static_cast<uint64_t>(p.stride) + static_cast<uint64_t>(xx)];
+  };
+  const int64_t v = (s - ry) * ((s - rx) * at(x, y) + rx * at(x + 1, y)) + ry * ((s - rx) * at(x, y + 1) + rx * at(x + 1, y + 1));
+  return static_cast<uint8_t>((v + s * s / 2) >> (2 * shift));   // (rounding_control is 0: static sprite planes have no vop_rounding_type)
+}
+
+}  // namespace
+
+// 7.8.4 / 7.8.5: an S plane of a static sprite layer, the sprite warped with the plane's trajectory (0 points: stationary, 1: a translation, 2: rotation and
+// zoom, 3: affine, 4: perspective), then the brightness change. The reference points of the plane are its corners (a rectangular layer: i0 = j0 = 0, W and H
+// the layer's size); the sprite's samples are at sprite_left_coordinate, sprite_top_coordinate onwards (its chrominance at half those, rounded toward zero).
+// The affine cases are the shift forms of the equations (the ones FFmpeg's GMC uses); a single point's chrominance offset is (i0' >> 1) | (i0' & 1) as there.
+// The brightness change, Y * (brightness_change_factor * 0.01 + 1) clipped to 0 .. 255, is on luminance only and rounds to the nearest integer (halves up):
+// the standard does not say how the product becomes an integer. False when the warp does not fit 64-bit arithmetic or a perspective denominator is 0.
+bool Core::warp_sprite(const VopHeader& h) {
+  if (!sprite_ready_ || !cur_) return false;
+  const int acc = vol_.warping_accuracy, points = vol_.warping_points, shift = acc + 1;
+  const int64_t s = int64_t{2} << acc, r = 16 / s, rho = 3 - acc;
+  const int64_t W = width_, H = height_;
+  int64_t du[4] = {}, dv[4] = {};
+  for (int i = 0; i < points && i < 4; ++i) {
+    du[i] = h.sprite_trajectory[i][0];
+    dv[i] = h.sprite_trajectory[i][1];
+  }
+  // The sprite reference points (1/s samples; the trajectory values are at most 14 bits, so none of this is near 64 bits).
+  const int64_t i0 = (s / 2) * du[0], j0 = (s / 2) * dv[0];
+  const int64_t i1 = (s / 2) * (2 * W + du[1] + du[0]), j1 = (s / 2) * (dv[1] + dv[0]);
+  const int64_t i2 = (s / 2) * (du[2] + du[0]), j2 = (s / 2) * (2 * H + dv[2] + dv[0]);
+  const int64_t i3 = (s / 2) * (2 * W + du[3] + du[2] + du[1] + du[0]), j3 = (s / 2) * (2 * H + dv[3] + dv[2] + dv[1] + dv[0]);
+  int alpha = 1, beta = 1;
+  while ((int64_t{1} << alpha) < W) ++alpha;
+  while ((int64_t{1} << beta) < H) ++beta;
+  const int64_t w2 = int64_t{1} << alpha, h2 = int64_t{1} << beta;
+  // The virtual sprite points (1/16 samples) of two and three points.
+  const int64_t i1v = 16 * w2 + div_nearest((W - w2) * (r * i0) + w2 * (r * i1 - 16 * W), W);
+  const int64_t j1v = div_nearest((W - w2) * (r * j0) + w2 * (r * j1), W);
+  const int64_t i2v = div_nearest((H - h2) * (r * i0) + h2 * (r * i2), H);
+  const int64_t j2v = 16 * h2 + div_nearest((H - h2) * (r * j0) + h2 * (r * j2 - 16 * H), H);
+
+  // The four coordinates: luma (F, G) of (i, j), chroma (Fc, Gc) of (ic, jc).
+  WarpCoordinate f, g, fc, gc;
+  Checked c;
+  switch (points) {
+    case 0:
+      f.nx = s, f.shift = 0;
+      g.ny = s, g.shift = 0;
+      fc.nx = s, fc.shift = 0;
+      gc.ny = s, gc.shift = 0;
+      break;
+    case 1:
+      f.nx = s, f.n0 = i0, f.shift = 0;
+      g.ny = s, g.n0 = j0, g.shift = 0;
+      fc.nx = s, fc.n0 = (i0 >> 1) | (i0 & 1), fc.shift = 0;
+      gc.ny = s, gc.n0 = (j0 >> 1) | (j0 & 1), gc.shift = 0;
+      break;
+    case 2: {
+      // F = i0' + ((-r i0' + i1'') I + (r j0' - j1'') J) /// (W' r); chroma with Ic = 4 ic + 1, Jc = 4 jc + 1 and the denominator 4 W' r.
+      const int k = alpha + static_cast<int>(rho);
+      const int64_t a = -r * i0 + i1v, b = r * j0 - j1v, d = -r * j0 + j1v, e = -r * i0 + i1v;
+      f.nx = a, f.ny = b, f.n0 = c.mul(i0, int64_t{1} << k), f.shift = k;
+      g.nx = d, g.ny = e, g.n0 = c.mul(j0, int64_t{1} << k), g.shift = k;
+      fc.nx = 4 * a, fc.ny = 4 * b, fc.n0 = a + b + 2 * w2 * r * i0 - 16 * w2, fc.shift = k + 2;
+      gc.nx = 4 * d, gc.ny = 4 * e, gc.n0 = d + e + 2 * w2 * r * j0 - 16 * w2, gc.shift = k + 2;
+      break;
+    }
+    case 3: {
+      // F = i0' + ((-r i0' + i1'') H' I + (-r i0' + i2'') W' J) /// (W' H' r), the numerator and denominator divided by min(W', H').
+      const int m = alpha < beta ? alpha : beta;
+      const int64_t w3 = w2 >> m, h3 = h2 >> m;
+      const int k = alpha + beta + static_cast<int>(rho) - m;
+      const int64_t a = (-r * i0 + i1v) * h3, b = (-r * i0 + i2v) * w3, d = (-r * j0 + j1v) * h3, e = (-r * j0 + j2v) * w3;
+      f.nx = a, f.ny = b, f.n0 = c.mul(i0, int64_t{1} << k), f.shift = k;
+      g.nx = d, g.ny = e, g.n0 = c.mul(j0, int64_t{1} << k), g.shift = k;
+      fc.nx = 4 * a, fc.ny = 4 * b, fc.n0 = a + b + 2 * w2 * h3 * r * i0 - 16 * w2 * h3, fc.shift = k + 2;
+      gc.nx = 4 * d, gc.ny = 4 * e, gc.n0 = d + e + 2 * w2 * h3 * r * j0 - 16 * w2 * h3, gc.shift = k + 2;
+      break;
+    }
+    default: {
+      // Perspective: F = (a I + b J + c) /// (g I + h J + D W H), G = (d I + e J + f) /// (the same); chroma (2 a Ic + 2 b Jc + 4 c - (g Ic + h Jc + 2 D W H) s)
+      // /// (4 g Ic + 4 h Jc + 8 D W H), here expanded in ic and jc.
+      const int64_t sx = c.add(c.sub(c.sub(i0, i1), i2), i3), sy = c.add(c.sub(c.sub(j0, j1), j2), j3);
+      const int64_t pg = c.mul(c.sub(c.mul(sx, c.sub(j2, j3)), c.mul(c.sub(i2, i3), sy)), H);
+      const int64_t ph = c.mul(c.sub(c.mul(c.sub(i1, i3), sy), c.mul(sx, c.sub(j1, j3))), W);
+      const int64_t pd = c.sub(c.mul(c.sub(i1, i3), c.sub(j2, j3)), c.mul(c.sub(i2, i3), c.sub(j1, j3)));
+      const int64_t dwh = c.mul(c.mul(pd, W), H);
+      const int64_t pa = c.add(c.mul(c.mul(pd, c.sub(i1, i0)), H), c.mul(pg, i1));
+      const int64_t pb = c.add(c.mul(c.mul(pd, c.sub(i2, i0)), W), c.mul(ph, i2));
+      const int64_t pc = c.mul(dwh, i0);
+      const int64_t pe = c.add(c.mul(c.mul(pd, c.sub(j1, j0)), H), c.mul(pg, j1));
+      const int64_t pf = c.add(c.mul(c.mul(pd, c.sub(j2, j0)), W), c.mul(ph, j2));
+      const int64_t pj = c.mul(dwh, j0);
+      f.nx = pa, f.ny = pb, f.n0 = pc;
+      g.nx = pe, g.ny = pf, g.n0 = pj;
+      f.dx = g.dx = pg, f.dy = g.dy = ph, f.d0 = g.d0 = dwh;
+      // chroma: N = (8a - 4 s g) ic + (8b - 4 s h) jc + (2a + 2b + 4c - s (g + h + 2 D W H)), D = 16 g ic + 16 h jc + (4g + 4h + 8 D W H)
+      const int64_t base = c.mul(s, c.add(c.add(pg, ph), c.mul(2, dwh)));
+      fc.nx = c.sub(c.mul(8, pa), c.mul(c.mul(4, s), pg));
+      fc.ny = c.sub(c.mul(8, pb), c.mul(c.mul(4, s), ph));
+      fc.n0 = c.sub(c.add(c.add(c.mul(2, pa), c.mul(2, pb)), c.mul(4, pc)), base);
+      gc.nx = c.sub(c.mul(8, pe), c.mul(c.mul(4, s), pg));
+      gc.ny = c.sub(c.mul(8, pf), c.mul(c.mul(4, s), ph));
+      gc.n0 = c.sub(c.add(c.add(c.mul(2, pe), c.mul(2, pf)), c.mul(4, pj)), base);
+      fc.dx = gc.dx = c.mul(16, pg);
+      fc.dy = gc.dy = c.mul(16, ph);
+      fc.d0 = gc.d0 = c.add(c.add(c.mul(4, pg), c.mul(4, ph)), c.mul(8, dwh));
+      break;
+    }
+  }
+  const int64_t luma_w = mb_w_ * 16, luma_h = mb_h_ * 16;
+  if (!c.ok || !warp_fits(f, luma_w, luma_h) || !warp_fits(g, luma_w, luma_h) || !warp_fits(fc, luma_w / 2, luma_h / 2) || !warp_fits(gc, luma_w / 2, luma_h / 2))
+    return false;
+
+  // The sprite's planes and extents (7.8.2).
+  const int64_t left = vol_.sprite_left, top = vol_.sprite_top, sw = vol_.sprite_width, sh = vol_.sprite_height;
+  const int64_t cleft = left / 2, ctop = top / 2;
+  int64_t cw = (left + sw) / 2 - cleft, ch = (top + sh) / 2 - ctop;
+  const PlaneRef sy = plane_of(sprite_, 0), su = plane_of(sprite_, 1), sv = plane_of(sprite_, 2);
+  const int64_t lw = sw < sy.width ? sw : sy.width, lh = sh < sy.height ? sh : sy.height;
+  cw = cw < 1 ? 1 : cw > su.width ? su.width : cw;
+  ch = ch < 1 ? 1 : ch > su.height ? su.height : ch;
+  const bool bright = vol_.sprite_brightness_change;
+  const int64_t factor = 100 + h.brightness_change_factor;
+  for (int64_t j = 0; j < luma_h; ++j) {
+    const ByteView row = cur_->view(0).subview(static_cast<uint64_t>(j) * static_cast<uint64_t>(cur_->stride[0]), static_cast<uint64_t>(luma_w));
+    for (int64_t i = 0; i < luma_w; ++i) {
+      int64_t fx = 0, fy = 0;
+      if (!warp_at(f, i, j, &fx) || !warp_at(g, i, j, &fy)) return false;
+      int64_t v = sprite_sample(sy, left, top, lw, lh, fx, fy, shift);
+      if (bright) {
+        const int64_t product = v * factor;
+        v = product <= 0 ? 0 : (product + 50) / 100;
+      }
+      row[static_cast<uint64_t>(i)] = clip_pixel(v);
+    }
+  }
+  for (int p = 1; p < 3; ++p) {
+    const PlaneRef& src = p == 1 ? su : sv;
+    for (int64_t j = 0; j < luma_h / 2; ++j) {
+      const ByteView row = cur_->view(p).subview(static_cast<uint64_t>(j) * static_cast<uint64_t>(cur_->stride[p]), static_cast<uint64_t>(luma_w / 2));
+      for (int64_t i = 0; i < luma_w / 2; ++i) {
+        int64_t fx = 0, fy = 0;
+        if (!warp_at(fc, i, j, &fx) || !warp_at(gc, i, j, &fy)) return false;
+        row[static_cast<uint64_t>(i)] = sprite_sample(src, cleft, ctop, cw, ch, fx, fy, shift);
+      }
+    }
+  }
+  return true;
+}
+
 }  // namespace mpeg4
 }  // namespace hardware

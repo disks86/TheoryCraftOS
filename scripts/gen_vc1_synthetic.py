@@ -4,12 +4,21 @@ patterns, quantizer changes and coefficients (all small, so that nothing saturat
 what matters is that a reference decoder (ffmpeg's) and this OS's decoder read the same streams and make the same pictures. The expected pictures come from ffmpeg.
 
   gen_vc1_synthetic.py out_dir      writes out_dir/vc1_<name>.rcv (Simple and Main profile, "RCV" files) and out_dir/vc1_<name>.vc1 (Advanced profile elementary streams)
+  gen_vc1_synthetic.py --expect bits.json out_dir
+                                    the same, and writes where the header and the macroblock data of every start code unit end (bit positions in the unescaped
+                                    payload, per stream and frame), to check a decoder's bit consumption against
+  gen_vc1_synthetic.py --rangemap name pictures.yuv
+                                    applies the range mapping of stream `name` (RANGE_MAPY / RANGE_MAPUV) to FFmpeg's pictures of it, which FFmpeg does not do
   gen_vc1_synthetic.py --selftest out.inc
                                     writes the streams of the VCN VC-1 self-test (src/Hardware/VideoCodec/AMD/AmdVcnSelfTestVc1Stream.inc) as C++ arrays
 
-The variable length codes are read from src/Hardware/VideoCodec/Software/Vc1Tables.inc, the decoder's own tables: a reference decoder that reads the streams the way the
-standard says proves them right. The generator mirrors the parts of the decoder state that decide which bits are present (coded block flag prediction, the hybrid motion
-vector prediction bit, the escape code lengths, the transform type state).
+The variable length codes are read from src/Hardware/VideoCodec/Software/Vc1Tables.inc, the decoder's own tables, and for the interlaced syntax from
+scripts/vc1_interlaced_tables.py (taken from FFmpeg): a reference decoder that reads the streams the way the standard says proves them right. The generator mirrors the
+parts of the decoder state that decide which bits are present (coded block flag prediction, the hybrid motion vector prediction bit of progressive and of P field
+pictures (with the field predictor scaling), the escape code lengths, the transform type state, slice boundaries).
+
+Interlaced streams (IEnc, stream_interlaced) mix field pictures (both fields, the second behind a field start code), interlaced frame pictures and progressive pictures,
+optionally cut into slices; FFmpeg is the reference for the syntax (vc1.c ff_vc1_parse_frame_header_adv, vc1_block.c, vc1_pred.c), see the notes at IEnc.
 """
 import os
 import random
@@ -93,11 +102,19 @@ class Enc:
         self.w, self.h = width, height
         self.mbw, self.mbh = (width + 15) // 16, (height + 15) // 16
         f = dict(loop_filter=0, multires=0, fastuvmc=1, extended_mv=0, dquant=0, vstransform=0, overlap=0, rangered=0, max_b_frames=0, quantizer=0, finterp=0,
-                 postproc=0, broadcast=0, tfcntr=0, hrd=0, resync=0, no_ic=0, interlace=0, psf=0, extended_dmv=0)
+                 postproc=0, broadcast=0, tfcntr=0, hrd=0, resync=0, no_ic=0, interlace=0, psf=0, extended_dmv=0, refdist=0, range_mapy=None,
+                 range_mapuv=None)
         f.update(flags)
         self.f = f
         self.rnd = 0
         self.res_x8 = 0
+        # Picture geometry and slices (the interlaced streams change these per picture; a progressive picture without slices keeps the defaults).
+        self.cur_mbh = self.mbh     # macroblock rows of the picture being written (of one field in a field picture)
+        self.slice_rows = ()        # rows (of the picture) at which a slice starts
+        self.slice_top = 0          # first row of the current slice
+        self.addr_base = 0          # added to a row to make SLICE_ADDR (the field's row count for the second field)
+        self.units = None           # the start code units of the frame being written (interlaced streams), see Unit
+        self.expect = []            # per frame: [(unit, header end, macroblock data end)] (bit positions), see --expect
 
     # ---- sequence level
     def struct_c(self):
@@ -129,7 +146,7 @@ class Enc:
     def adv_entry_point(self, size_override=False):
         f = self.f
         b = Bits()
-        b.put(0, 1); b.put(1, 1); b.put(0, 1); b.put(0, 1)
+        b.put(0, 1); b.put(1, 1); b.put(0, 1); b.put(f['refdist'], 1)   # BROKEN_LINK, CLOSED_ENTRY, PANSCAN_FLAG, REFDIST_FLAG
         b.put(f['loop_filter'], 1); b.put(f['fastuvmc'], 1); b.put(f['extended_mv'], 1); b.put(f['dquant'], 2); b.put(f['vstransform'], 1); b.put(f['overlap'], 1)
         b.put(f['quantizer'], 2)
         if f['hrd']:
@@ -140,14 +157,17 @@ class Enc:
             b.put((self.w >> 1) - 1, 12); b.put((self.h >> 1) - 1, 12)
         if f['extended_mv']:
             b.put(f['extended_dmv'], 1)
-        b.put(0, 1); b.put(0, 1)
+        for m in (f['range_mapy'], f['range_mapuv']):   # RANGE_MAPY_FLAG, RANGE_MAPY, RANGE_MAPUV_FLAG, RANGE_MAPUV
+            b.put(0 if m is None else 1, 1)
+            if m is not None:
+                b.put(m, 3)
         return b.data(stop_bit=True)
 
     # ---- bit planes (8.7)
     def put_plane(self, b, plane, mode, invert, w=None, h=None):
         """Writes `plane` (rows of 0/1, mbh rows of mbw) with IMODE `mode` (0 raw ... 6 column skip) and the invert bit."""
         w = self.mbw if w is None else w
-        h = self.mbh if h is None else h
+        h = self.cur_mbh if h is None else h
         b.put(invert, 1)
         b.code(T['kImodeCode'], T['kImodeBits'], mode)
         if mode == 0:
@@ -225,12 +245,13 @@ class Enc:
             colskip(0, w, 0, h)
 
     def random_plane(self, density):
-        return [[1 if self.rng.random() < density else 0 for _ in range(self.mbw)] for _ in range(self.mbh)]
+        return [[1 if self.rng.random() < density else 0 for _ in range(self.mbw)] for _ in range(self.cur_mbh)]
 
     def plane_with_random_mode(self, b, density):
         """Writes a random plane in a random mode; returns (plane, raw)."""
         plane = self.random_plane(density)
         mode = self.rng.choice([0, 1, 2, 3, 4, 5, 6])
+        self.count('imode%d' % mode)
         self.put_plane(b, plane, mode, self.rng.randint(0, 1))
         return plane, mode == 0
 
@@ -309,6 +330,7 @@ class Enc:
         f = self.f
         if f['dquant'] != 1:
             return
+        self.count('dquantfrm%d dqprofile%d dqbilevel%d' % (p['dquantfrm'], p['dqprofile'], p['dqbilevel']) if p['dquantfrm'] else 'dquantfrm0')
         b.put(p['dquantfrm'], 1)
         if not p['dquantfrm']:
             return
@@ -336,7 +358,13 @@ class Enc:
                 b.put(p['interpfrm'], 1)
             b.put(r.randint(0, 3), 2)
             if f['rangered']:
-                b.put(0, 1)
+                p['rangeredfrm'] = p.get('rangeredfrm', r.randint(0, 1))   # RANGEREDFRM (no stream without range reduction gets here)
+                # SMPTE 421M 7.1.1.3: a B or BI frame has the RANGEREDFRM of the anchor after it in display order (the last one coded); the anchors pick theirs.
+                if t in ('B', 'BI'):
+                    p['rangeredfrm'] = getattr(self, 'anchor_rangeredfrm', 0)
+                else:
+                    self.anchor_rangeredfrm = p['rangeredfrm']
+                b.put(p['rangeredfrm'], 1)
             if t == 'P':
                 b.put(1, 1)
             else:
@@ -469,7 +497,7 @@ class Enc:
             else:
                 b.put(0, 1)
                 p['quarter'] = False
-            pl['direct'] = self.plane_with_random_mode(b, float(os.environ.get('VC1_BDIRECT', 0.3)))
+            pl['direct'] = self.plane_with_random_mode(b, p.get('direct_density', float(os.environ.get('VC1_BDIRECT', 0.3))))
             pl['skip'] = self.plane_with_random_mode(b, 0.3)
             b.put(p['mv_table'], 2)
             b.put(p['cbptab'], 2)
@@ -501,6 +529,7 @@ class Enc:
     def transform_info(self, b, p):
         f = self.f
         if f['vstransform']:
+            self.count('ttmbf%d' % p['ttmbf'])
             b.put(p['ttmbf'], 1)
             if p['ttmbf']:
                 b.put(p['ttfrm_code'], 2)
@@ -648,11 +677,46 @@ class Enc:
             mquant = -p['altpq']
         if (edges & 4) and mbx == self.mbw - 1:
             mquant = -p['altpq']
-        if (edges & 8) and mby == self.mbh - 1:
+        if (edges & 8) and mby == self.cur_mbh - 1:
             mquant = -p['altpq']
         if mquant == 0 or mquant > 31 or mquant < -31:
             mquant = 1
         return mquant
+
+    def count(self, key):
+        """Counts a syntax element value for a coverage summary (IEnc.stats; no effect on the stream)."""
+        stats = getattr(self, 'stats', None)
+        if stats is not None:
+            stats[key] = stats.get(key, 0) + 1
+
+    # ---- slices
+    def slice_hook(self, b, mby, st, coded=None):
+        """Called at the start of every macroblock row: at the first row of a slice (other than the picture's first) ends the current start code unit
+        and starts a slice unit (SLICE_ADDR, PIC_HEADER_FLAG 0). A slice starts the escape mode 3 code lengths again, and its first row has no
+        neighbours above (the decoder's first_slice_line: motion vector, coded block and AC prediction)."""
+        if mby == 0 or mby not in self.slice_rows:
+            if self.units is not None:
+                self.units[-1].rows += 1
+            return b
+        self.close_unit()
+        u = Unit(0x0B)
+        u.b.put(self.addr_base + mby, 9)   # SLICE_ADDR
+        u.b.put(0, 1)                      # PIC_HEADER_FLAG
+        u.hdr_end = u.b.tell()
+        u.rows = 1
+        self.units.append(u)
+        st['esc3'] = None
+        self.slice_top = mby
+        self.count('slice')
+        if coded is not None:   # (the decoder clears the coded block flags of the row above)
+            for x in range(len(coded[0])):
+                coded[2 * mby - 1][x] = 0
+        return u.b
+
+    def close_unit(self):
+        u = self.units[-1]
+        if u.mb_end is None:
+            u.mb_end = u.b.tell()
 
     # ---- picture bodies
     def body_intra_picture(self, b, p):
@@ -664,8 +728,12 @@ class Enc:
         cs_intra, cs_inter = self.coding_sets(p)
         coded = [[0] * (2 * mbw) for _ in range(2 * mbh)]
         pl = p['planes']
-        for mby in range(mbh):
+        fieldtx_plane, fieldtx_raw = pl.get('fieldtx', (None, False))
+        for mby in range(self.cur_mbh):
+            b = self.slice_hook(b, mby, st, coded)
             for mbx in range(mbw):
+                if fieldtx_raw:   # FIELDTX (interlaced frame I pictures)
+                    b.put(fieldtx_plane[mby][mbx], 1)
                 flags = [r.randint(0, 1) for _ in range(6)]
                 diffs = []
                 for k in range(4):
@@ -756,7 +824,7 @@ class Enc:
                 for k in range(1, 4):
                     mv[(2 * mbx + (k & 1), 2 * mby + (k >> 1))] = (0, 0)
             return
-        first = mby == 0
+        first = mby == self.slice_top
         a_valid = (not first) or n in (2, 3)
         b_valid = a_valid
         c_valid = mbx > 0 or n in (1, 3)
@@ -873,7 +941,8 @@ class Enc:
         self.intra_mask = {(x, y): 0 for x in range(mbw) for y in range(mbh)}
         pl = p['planes']
         skip_plane, skip_raw = pl['skip']
-        for mby in range(mbh):
+        for mby in range(self.cur_mbh):
+            b = self.slice_hook(b, mby, st)
             for mbx in range(mbw):
                 if p['type'] == 'P':
                     self.p_macroblock(b, p, mbx, mby, pl, skip_plane[mby][mbx], skip_raw, st, cs_intra, cs_inter)
@@ -969,10 +1038,10 @@ class Enc:
                 continue
             if i < 4:
                 bx, by = 2 * mbx + (i & 1), 2 * mby + (i >> 1)
-                a_av = self.intra_flag(mbx, mby, bx, by - 1) if (i in (2, 3) or mby > 0) else 0
+                a_av = self.intra_flag(mbx, mby, bx, by - 1) if (i in (2, 3) or mby > self.slice_top) else 0
                 c_av = self.intra_flag(mbx, mby, bx - 1, by) if (i in (1, 3) or mbx > 0) else 0
             else:
-                a_av = ((self.intra_mask[(mbx, mby - 1)] >> i) & 1) if mby > 0 else 0
+                a_av = ((self.intra_mask[(mbx, mby - 1)] >> i) & 1) if mby > self.slice_top else 0
                 c_av = ((self.intra_mask[(mbx - 1, mby)] >> i) & 1) if mbx > 0 else 0
             if a_av or c_av:
                 intrapred = True
@@ -1047,6 +1116,7 @@ class Enc:
     def frame_bytes(self, p):
         b = Bits()
         self.header(b, p)
+        hdr_end = b.tell()
         if os.environ.get('VC1_DEBUG'):
             sys.stderr.write('picture %s\n' % {k: v for k, v in p.items() if k not in ('planes',)})
         if p['skipped']:
@@ -1055,9 +1125,856 @@ class Enc:
             self.body_intra_picture(b, p)
         else:
             self.body_inter_picture(b, p)
+        self.expect.append([('frame', hdr_end, b.tell())])
         if b.tell() % 8 == 0:   # (ffmpeg wants a spare bit after the last macroblock when a bit plane is raw)
             b.put(0, 1)
         return b.data()
+
+
+# ======================================================================================================================================
+# Interlaced pictures (Advanced profile): field pictures (FCM 11), frame pictures (FCM 10) and progressive pictures (FCM 0) in one interlaced
+# sequence, with slices. The syntax is the one FFmpeg's decoder reads (libavcodec/vc1.c ff_vc1_parse_frame_header_adv, vc1_block.c
+# vc1_decode_p_mb_intfr / _intfi, vc1_decode_b_mb_intfi / _intfr, vc1_pred.c ff_vc1_pred_mv).
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import vc1_interlaced_tables as IT   # noqa: E402
+
+OFFSET_TABLE = [[0, 1, 2, 4, 8, 16, 32, 64, 128], [0, 1, 3, 7, 15, 31, 63, 127, 255]]   # (index 1: DMVRANGE extends the component)
+
+
+def check_vlc(name, codes, bits):
+    """Every code fits its length and none is the prefix of another."""
+    words = sorted(format(c, '0%db' % n) for c, n in zip(codes, bits))
+    assert all(c < (1 << n) for c, n in zip(codes, bits)), name
+    for a, b in zip(words, words[1:]):
+        assert not b.startswith(a), (name, a, b)
+
+
+for _name in ('FOURMVBP', 'TWOMVBP', 'INTFR_4MV_MBMODE', 'INTFR_NON4MV_MBMODE', 'IF_MMV_MBMODE', 'IF_1MV_MBMODE', 'MVDATA_1REF', 'MVDATA_2REF', 'ICBPCY'):
+    for _k, (_c, _b) in enumerate(zip(getattr(IT, _name + '_CODES'), getattr(IT, _name + '_BITS'))):
+        check_vlc('%s[%d]' % (_name, _k), _c, _b)
+
+
+class Unit:
+    """One start code unit of a frame: the frame (0x0D), the second field (0x0C) or a slice (0x0B); where its header and its macroblock data end
+    (bit positions in the unescaped payload) and how many macroblock rows it has."""
+    NAMES = {0x0D: 'frame', 0x0C: 'field', 0x0B: 'slice'}
+
+    def __init__(self, code):
+        self.code = code
+        self.b = Bits()
+        self.hdr_end = None
+        self.mb_end = None
+        self.rows = 0
+
+
+def clip(v, lo, hi):
+    return lo if v < lo else hi if v > hi else v
+
+
+class IEnc(Enc):
+    """An Advanced profile stream in an interlaced sequence. Besides what Enc mirrors it mirrors the motion vector prediction of P field pictures
+    (which decides whether a hybrid prediction bit is there: the predictors of the same and the opposite field, scaled by the reference distance),
+    the slice boundaries (the first row of a slice has no neighbours above) and the frame coding mode of the last anchor (direct mode needs an
+    anchor of the same kind in FFmpeg).
+
+    What FFmpeg does, which the streams follow (and a decoder that matches FFmpeg must do too):
+    - the second field's header (behind the field start code 0x0C) starts at PQINDEX; FPTYPE, TFF, RNDCTRL, REFDIST and BFRACTION are the frame's.
+    - REFDIST is read only in I/I I/P P/I P/P frames (and is 0 without REFDIST_FLAG); B fields use the value of the last field pair that had it.
+    - BFRACTION of an interlaced frame B picture comes after PQINDEX .. POSTPROC; its value must not be 0 (index 21 and 22 are refused).
+    - SLICE_ADDR counts the rows of the second field on from the first field's: a slice of the second field at its row r has the address
+      (field rows) + r. A field has (height / 2 + 15) / 16 macroblock rows (FFmpeg: FFALIGN(frame rows, 2) / 2).
+    - motion vector prediction of field pictures: no pull back; predictors of intra blocks are not available; for a 1MV macroblock of a mixed-MV
+      field picture predictor B is 2 blocks right (left in the last column) of the block above (1 left in other field pictures); hybrid prediction
+      only in P fields, compared after the same/opposite field scaling; no hybrid prediction in interlaced frame pictures.
+    - direct mode in a B field needs a field anchor ("Mixed field/frame direct mode not supported"); an interlaced frame B picture with a field
+      anchor warns; so the generator uses direct mode only when the backward anchor is of the picture's own kind (also for progressive B).
+    - every macroblock needs at least 2 bits left in the unit when it starts, else FFmpeg stops the slice without a message: each unit has at
+      least one bit after its last macroblock."""
+
+    FPTYPE = {('I', 'I'): 0, ('I', 'P'): 1, ('P', 'I'): 2, ('P', 'P'): 3, ('B', 'B'): 4, ('B', 'BI'): 5, ('BI', 'B'): 6, ('BI', 'BI'): 7}
+
+    def __init__(self, seed, width, height, **flags):
+        flags.setdefault('interlace', 1)
+        self.slices = flags.pop('slices', 0)          # probability that a picture is cut into slices
+        self.ic_prob = flags.pop('ic_prob', 0)        # probability that a P field picture uses intensity compensation (else 1 in 5)
+        self.garbage = None
+        super().__init__(seed, 3, width, height, **flags)
+        if os.environ.get('VC1_GARBAGE'):            # a variant whose bits after the macroblock data are random (the pictures must not change)
+            self.garbage = random.Random(seed * 7919 + 1)
+        self.refdist = 0
+        self.anchor_fcm = None   # frame coding mode of the last anchor: 'p' progressive, 'r' interlaced frame, 'f' field pair
+        self.anchors = 0
+        self.expect = []         # per frame: [(unit, header end, macroblock data end)], for the check against an instrumented decoder
+        self.stats = {}          # how often each syntax element value was written (coverage)
+
+    # ---- units, slices, small syntax helpers
+    def begin_frame(self):
+        self.units = [Unit(0x0D)]
+        self.slice_top = 0
+        self.slice_rows = ()
+        self.addr_base = 0
+        return self.units[0].b
+
+    def mark_header(self, b):
+        self.units[-1].hdr_end = b.tell()
+
+    def pick_slices(self, rows):
+        if not self.slices or rows < 2 or self.rng.random() >= self.slices:
+            return ()
+        k = self.rng.randint(1, min(3, rows - 1))
+        return tuple(sorted(self.rng.sample(range(1, rows), k)))
+
+    def finish_frame(self, rows_expected):
+        self.close_unit()
+        g = self.garbage
+        assert sum(u.rows for u in self.units) == rows_expected, ([u.rows for u in self.units], rows_expected)
+        out, exp = [], []
+        for u in self.units:
+            if u.code == 0x0B:
+                assert u.rows >= 1
+            bits = list(u.b.bits)
+            bits.append(g.randint(0, 1) if g else 0)   # (at least one bit after the last macroblock: FFmpeg stops at a macroblock with <= 1 bit left)
+            while len(bits) % 8:
+                bits.append(g.randint(0, 1) if g else 0)
+            data = bytes(int(''.join(map(str, bits[i:i + 8])), 2) for i in range(0, len(bits), 8))
+            if g:
+                data += bytes(g.randint(1, 255) for _ in range(g.randint(1, 3)))
+            out.append((u.code, data))
+            exp.append((Unit.NAMES[u.code], u.hdr_end, u.mb_end))
+        self.expect.append(exp)
+        self.units = None
+        return out
+
+    @staticmethod
+    def put_unary_ones(b, v, limit):
+        """get_unary(gb, 0, limit): v ones, then a zero unless v == limit."""
+        for _ in range(v):
+            b.put(1, 1)
+        if v < limit:
+            b.put(0, 1)
+
+    @staticmethod
+    def put_unary_zeros(b, v, limit):
+        """get_unary(gb, 1, limit): v zeros, then a one unless v == limit."""
+        for _ in range(v):
+            b.put(0, 1)
+        if v < limit:
+            b.put(1, 1)
+
+    def put_bfraction(self, b, idx):
+        if idx < 7:
+            b.put(idx, 3)
+        else:
+            b.put(7, 3); b.put(idx - 7, 4)
+
+    def common_info(self, b, p):
+        """PQINDEX HALFQP PQUANTIZER POSTPROC: the part every picture and field header has."""
+        b.put(p['pqindex'], 5)
+        if p['pqindex'] < 9:
+            b.put(p['halfpq'], 1)
+        if self.f['quantizer'] == 1:
+            b.put(p['pquantizer'], 1)
+        if self.f['postproc']:
+            b.put(self.rng.randint(0, 3), 2)
+
+    def mv_ranges(self, b, p):
+        """MVRANGE and DMVRANGE."""
+        if self.f['extended_mv']:
+            self.put_unary_ones(b, p['mvrange'], 3)
+        p['dmvrange'] = 0
+        if self.f['extended_dmv']:
+            p['dmvrange'] = self.rng.randint(0, 3)
+            self.put_unary_ones(b, p['dmvrange'], 3)
+
+    def lum(self, b):
+        """LUMSCALE and LUMSHIFT: mild, so that a chain of intensity compensated pictures does not end up flat."""
+        b.put(self.rng.randint(26, 38), 6)
+        b.put(self.rng.choice([0, 1, 2, 3, 61, 62, 63]), 6)
+
+    def tail(self, b, p, intra):
+        """TRANSACFRM (TRANSACFRM2) TRANSDCTAB, and VOPDQUANT of an intra picture."""
+        self.put012(b, p['c_ac'])
+        if intra:
+            self.put012(b, p['y_ac'])
+        b.put(p['dc_table'], 1)
+        if intra:
+            self.vop_dquant(b, p)
+
+    def write_icbp(self, b, p):
+        """ICBPCY (interlaced pictures code 1 .. 63)."""
+        cbp = self.rng.randint(1, 63)
+        b.put(IT.ICBPCY_CODES[p['icbptab']][cbp - 1], IT.ICBPCY_BITS[p['icbptab']][cbp - 1])
+        return cbp
+
+    def residual(self, b, p, mbx, mby, cbp, st, cs_inter):
+        """MQUANT and TTMB when there is a coded block, then the coded inter blocks."""
+        quant = p['pq']
+        ttmb = p['ttfrm']
+        first = True
+        if cbp:
+            quant = abs(self.mquant_bits(b, p, mbx, mby))
+            if not p['ttmbf']:
+                ttmb = self.write_ttmb(b, p)
+        for i in range(6):
+            if (cbp >> (5 - i)) & 1:
+                ttmb, first = self.write_inter_block(b, p, ttmb, first, cs_inter, quant, st)
+
+    def write_imvdata(self, b, p):
+        """MVDATA of an interlaced picture (get_mvdata_interlaced); returns (dmv_x, dmv_y, pred_flag) as the decoder makes them."""
+        r = self.rng
+        numref = p['numref']
+        if numref:
+            codes, bits, esc, ymax = IT.MVDATA_2REF_CODES[p['imvtab']], IT.MVDATA_2REF_BITS[p['imvtab']], 125, 13
+        else:
+            codes, bits, esc, ymax = IT.MVDATA_1REF_CODES[p['imvtab']], IT.MVDATA_1REF_BITS[p['imvtab']], 71, 7
+        ex, ey = p['dmvrange'] & 1, (p['dmvrange'] >> 1) & 1
+        self.count('mvdata%dref' % (numref + 1))
+        if r.random() < 0.05:   # escape: the differentials as k_x and k_y bit numbers (for two references the low bit of y is the predictor flag)
+            b.put(codes[esc], bits[esc])
+            self.count('mvescape')
+            dx, dy = r.randint(0, 15), r.randint(0, 15)
+            b.put(dx, p['k_x']); b.put(dy, p['k_y'])
+            pf = 0
+            if numref:
+                pf = dy & 1
+                dy = (dy + (dy & 1)) >> 1
+            return dx, dy, pf
+        while True:
+            xi = r.choice([0, 0, 1, 1, 2, 2, 3, 4, 5])
+            yi = r.choice([0, 0, 1, 1, 2, 2, 3, 4, 5]) if not numref else r.choice([0, 1, 0, 1, 2, 3, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11])
+            if (xi or yi) and yi <= ymax:
+                break
+        index = xi + 9 * yi - 1
+        b.put(codes[index], bits[index])
+        dx = dy = 0
+        if xi:
+            n = xi + ex
+            val = r.randint(0, (1 << n) - 1)
+            b.put(val, n)
+            sign = -(val & 1)
+            dx = (sign ^ ((val >> 1) + OFFSET_TABLE[ex][xi])) - sign
+        pf = (yi & 1) if numref else 0
+        if yi > numref:
+            ys = yi >> numref
+            n = ys + ey
+            val = r.randint(0, (1 << n) - 1)
+            b.put(val, n)
+            sign = -(val & 1)
+            dy = (sign ^ ((val >> 1) + OFFSET_TABLE[ey][ys])) - sign
+        return dx, dy, pf
+
+    # ---- motion vector prediction of P field pictures (ff_vc1_pred_mv, field branch)
+    def scale_same(self, p, v, dim):
+        hpel = 0 if p['quarter'] else 1
+        n = v >> hpel
+        S = IT.FIELD_MVPRED_SCALES[p['second']]
+        rd = min(self.refdist, 3)
+        if dim == 0:
+            if abs(n) > 255:
+                s = n
+            elif abs(n) < S[3][rd]:
+                s = (n * S[1][rd]) >> 8
+            else:
+                s = ((n * S[2][rd]) >> 8) + (-S[5][rd] if n < 0 else S[5][rd])
+            s = clip(s, -p['range_x'], p['range_x'] - 1)
+        else:
+            if abs(n) > 63:
+                s = n
+            elif abs(n) < S[4][rd]:
+                s = (n * S[1][rd]) >> 8
+            else:
+                s = ((n * S[2][rd]) >> 8) + (-S[6][rd] if n < 0 else S[6][rd])
+            half = p['range_y'] // 2
+            if p['cft'] and not p['ref_ft']:
+                s = clip(s, -half + 1, half)
+            else:
+                s = clip(s, -half, half - 1)
+        return s * (1 << hpel)
+
+    def scale_opp(self, p, v, dim):
+        hpel = 0 if p['quarter'] else 1
+        n = v >> hpel
+        rd = min(self.refdist, 3)
+        return ((n * IT.FIELD_MVPRED_SCALES[p['second']][0][rd]) >> 8) * (1 << hpel)
+
+    def pred_mv_field(self, b, p, mbx, mby, n, dmv_x, dmv_y, mv1, pred_flag):
+        if not p['quarter']:
+            dmv_x *= 2
+            dmv_y *= 2
+        mbw = self.mbw
+        bx, by = 2 * mbx + (n & 1), 2 * mby + (n >> 1)
+        a_valid = mby != self.slice_top or n in (2, 3)
+        b_valid = a_valid
+        c_valid = mbx > 0 or n in (1, 3)
+        if mv1:
+            if p['mixed']:
+                off = -2 if mbx == mbw - 1 else 2
+            else:
+                off = -1 if mbx == mbw - 1 else 2
+            b_valid = b_valid and mbw > 1
+        else:
+            off = {0: (-1 if mbx else 1), 1: (-1 if mbx == mbw - 1 else 1), 2: 1, 3: -1}[n]
+            if mbw == 1:
+                b_valid = b_valid and c_valid
+        fi = self.fintra
+        pos = {'A': (bx, by - 1), 'B': (bx + off, by - 1), 'C': (bx - 1, by)}
+        valid = {'A': a_valid and not fi.get(pos['A'], 0), 'B': b_valid and not fi.get(pos['B'], 0), 'C': c_valid and not fi.get(pos['C'], 0)}
+        num_opp = num_same = 0
+        pr = {}
+        for k in 'ABC':
+            if valid[k]:
+                x, y = self.fmv[pos[k]]
+                fl = self.fmvf[pos[k]]
+                num_opp += fl
+                num_same += 1 - fl
+            else:
+                x = y = fl = 0
+            pr[k] = (x, y, fl)
+        if p['numref'] == 0:
+            opposite = 1 - p['reffield']
+        elif num_same <= num_opp:
+            opposite = 1 - pred_flag
+        else:
+            opposite = pred_flag
+        p['ref_ft'] = (1 - p['cft']) if opposite else p['cft']
+        for k in 'ABC':
+            x, y, fl = pr[k]
+            if valid[k] and fl != opposite:
+                if opposite:
+                    x, y = self.scale_opp(p, x, 0), self.scale_opp(p, y, 1)
+                else:
+                    x, y = self.scale_same(p, x, 0), self.scale_same(p, y, 1)
+            pr[k] = (x, y)
+        A, B, C = pr['A'], pr['B'], pr['C']
+        if valid['A']:
+            px, py = A
+        elif valid['C']:
+            px, py = C
+        elif valid['B']:
+            px, py = B
+        else:
+            px = py = 0
+        if num_same + num_opp > 1:
+            px, py = self.mid3(A[0], B[0], C[0]), self.mid3(A[1], B[1], C[1])
+        if valid['A'] and valid['C']:   # hybrid prediction (P field pictures; never in B field pictures)
+            if abs(px - A[0]) + abs(py - A[1]) > 32 or abs(px - C[0]) + abs(py - C[1]) > 32:
+                bit = self.rng.randint(0, 1)
+                b.put(bit, 1)
+                px, py = A if bit else C
+                self.stats['hybrid'] = self.stats.get('hybrid', 0) + 1
+        rx = p['range_x']
+        ry = p['range_y'] >> 1 if p['numref'] else p['range_y']
+        yb = 1 if (p['cft'] and p['ref_ft'] == 0) else 0
+        mx = ((px + dmv_x + rx) & ((rx << 1) - 1)) - rx
+        my = ((py + dmv_y + ry - yb) & ((ry << 1) - 1)) - ry + yb
+        blocks = [(2 * mbx + (k & 1), 2 * mby + (k >> 1)) for k in range(4)] if mv1 else [(bx, by)]
+        for q in blocks:
+            self.fmv[q] = (mx, my)
+            self.fmvf[q] = opposite
+        self.stats['opp' if opposite else 'same'] = self.stats.get('opp' if opposite else 'same', 0) + 1
+
+    # ---- macroblocks shared by field and frame pictures
+    def intra_mb_blocks(self, b, p, cbp, quant, st, cs_intra, cs_inter):
+        for i in range(6):
+            self.write_intra_block(b, p, i, (cbp >> (5 - i)) & 1, cs_intra if i < 4 else cs_inter, quant, st)
+
+    def field_intra_mb(self, b, p, mbx, mby, has_cbp, st, cs_intra, cs_inter):
+        """An intra macroblock of a P or B field: MQUANT, ACPRED, ICBPCY (MBMODE says whether)."""
+        quant = abs(self.mquant_bits(b, p, mbx, mby))
+        b.put(self.rng.randint(0, 1), 1)
+        cbp = self.write_icbp(b, p) if has_cbp else 0
+        self.intra_mb_blocks(b, p, cbp, quant, st, cs_intra, cs_inter)
+        for k in range(4):
+            self.fintra[(2 * mbx + (k & 1), 2 * mby + (k >> 1))] = 1
+        self.stats['intra'] = self.stats.get('intra', 0) + 1
+
+    def frame_intra_mb(self, b, p, mbx, mby, st, cs_intra, cs_inter):
+        """An intra macroblock of an interlaced frame P or B picture: FIELDTX, CBPPRESENT, ICBPCY, ACPRED, MQUANT."""
+        r = self.rng
+        b.put(r.randint(0, 1), 1)
+        has = r.randint(0, 1)
+        b.put(has, 1)
+        cbp = self.write_icbp(b, p) if has else 0
+        b.put(r.randint(0, 1), 1)
+        quant = abs(self.mquant_bits(b, p, mbx, mby))
+        self.intra_mb_blocks(b, p, cbp, quant, st, cs_intra, cs_inter)
+        self.stats['intra'] = self.stats.get('intra', 0) + 1
+
+    def pick(self, weights):
+        return self.rng.choices(range(len(weights)), weights)[0]
+
+    # ---- picture headers
+    def intra_header(self, b, p, fieldtx):
+        """The rest of an I or BI picture header: FIELDTX (interlaced frame), ACPRED, CONDOVER, OVERFLAGS, then the AC and DC tables and VOPDQUANT."""
+        pl = p['planes'] = {}
+        if fieldtx:
+            pl['fieldtx'] = self.plane_with_random_mode(b, 0.5)
+        pl['acpred'] = self.plane_with_random_mode(b, 0.5)
+        p['condover'] = 0
+        if self.f['overlap'] and p['pq'] <= 8:
+            p['condover'] = self.rng.randint(0, 2)
+            self.count('condover%d' % p['condover'])
+            self.put012(b, p['condover'])
+            if p['condover'] == 2:
+                pl['overflags'] = self.plane_with_random_mode(b, 0.5)
+        self.tail(b, p, True)
+
+    def p_field_header(self, b, p):
+        r = self.rng
+        f = self.f
+        p['planes'] = {}
+        first_frame = not self.anchors
+        p['numref'] = 0 if first_frame else r.randint(0, 1)    # NUMREF (in the first frame the only field before is the first field)
+        b.put(p['numref'], 1)
+        p['reffield'] = 0
+        if not p['numref']:
+            p['reffield'] = 0 if first_frame else r.randint(0, 1)   # REFFIELD
+            b.put(p['reffield'], 1)
+        self.mv_ranges(b, p)
+        lowquant = 0 if p['pq'] > 12 else 1
+        if self.ic_prob and r.random() < self.ic_prob:
+            m = 3   # (MVMODE index 3 is intensity compensation in both tables)
+        else:
+            m = r.randint(0, 3 if f['no_ic'] else 4)
+        self.put_unary_zeros(b, m, 4)
+        mvmode = T['kMvPmodeTable'][lowquant * 5 + m]
+        eff = mvmode
+        p['intcompfield'] = 0
+        if mvmode == 4:   # intensity compensation: MVMODE2, INTCOMPFIELD, LUMSCALE/LUMSHIFT of the top and/or the bottom reference field
+            m2 = r.randint(0, 3)
+            self.put_unary_zeros(b, m2, 3)
+            eff = T['kMvPmodeTable2'][lowquant * 4 + m2]
+            icf = p['intcompfield'] = r.choice([1, 2, 3])
+            if icf == 3:
+                b.put(1, 1)
+            else:
+                b.put(0, 1); b.put(1 if icf == 2 else 0, 1)
+            if icf & 1:
+                self.lum(b)
+            if icf & 2:
+                self.lum(b)
+        p['mv_mode'], p['mv_mode_eff'] = mvmode, eff
+        p['quarter'] = eff not in (0, 2)
+        p['mixed'] = eff == 3
+        self.count('Pfield numref%d reffield%d mvmode%d/%d icf%d mvrange%d dmvrange%d' % (p['numref'], p['reffield'], mvmode, eff, p['intcompfield'], p['mvrange'], p['dmvrange']))
+        p['mbmodetab'] = r.randint(0, 7); b.put(p['mbmodetab'], 3)
+        p['imvtab'] = r.randint(0, 7 if p['numref'] else 3); b.put(p['imvtab'], 2 + p['numref'])
+        p['icbptab'] = r.randint(0, 7); b.put(p['icbptab'], 3)
+        if p['mixed']:
+            p['fourmvbptab'] = r.randint(0, 3); b.put(p['fourmvbptab'], 2)
+        self.vop_dquant(b, p)
+        self.transform_info(b, p)
+        self.tail(b, p, False)
+        if not p['quarter']:
+            p['range_x'] <<= 1
+            p['range_y'] <<= 1
+
+    def b_field_header(self, b, p):
+        r = self.rng
+        pl = p['planes'] = {}
+        self.mv_ranges(b, p)
+        lowquant = 0 if p['pq'] > 12 else 1
+        m = r.randint(0, 3)
+        self.put_unary_zeros(b, m, 3)
+        p['mv_mode'] = p['mv_mode_eff'] = mv = T['kMvPmodeTable2'][lowquant * 4 + m]
+        p['quarter'] = mv in (1, 3)
+        p['mixed'] = mv == 3
+        self.count('Bfield mvmode%d' % mv)
+        pl['forward'] = self.plane_with_random_mode(b, 0.3)
+        p['mbmodetab'] = r.randint(0, 7); b.put(p['mbmodetab'], 3)
+        p['imvtab'] = r.randint(0, 7); b.put(p['imvtab'], 3)
+        p['icbptab'] = r.randint(0, 7); b.put(p['icbptab'], 3)
+        if p['mixed']:
+            p['fourmvbptab'] = r.randint(0, 3); b.put(p['fourmvbptab'], 2)
+        self.vop_dquant(b, p)
+        self.transform_info(b, p)
+        self.tail(b, p, False)
+        p['numref'] = 1   # (B fields always have two references)
+
+    def p_frame_header(self, b, p):
+        r = self.rng
+        pl = p['planes'] = {}
+        p['numref'] = 0
+        self.mv_ranges(b, p)
+        p['fourmvswitch'] = r.randint(0, 1); b.put(p['fourmvswitch'], 1)
+        ic = 0 if self.f['no_ic'] else r.randint(0, 1)
+        self.count('Pframe 4mvswitch%d intcomp%d' % (p['fourmvswitch'], ic))
+        b.put(ic, 1)   # INTCOMP
+        if ic:
+            self.lum(b)
+        pl['skip'] = self.plane_with_random_mode(b, 0.25)
+        p['mbmodetab'] = r.randint(0, 3); b.put(p['mbmodetab'], 2)
+        p['imvtab'] = r.randint(0, 3); b.put(p['imvtab'], 2)
+        p['icbptab'] = r.randint(0, 7); b.put(p['icbptab'], 3)
+        p['twomvbptab'] = r.randint(0, 3); b.put(p['twomvbptab'], 2)
+        if p['fourmvswitch']:
+            p['fourmvbptab'] = r.randint(0, 3); b.put(p['fourmvbptab'], 2)
+        self.vop_dquant(b, p)
+        self.transform_info(b, p)
+        self.tail(b, p, False)
+        p['quarter'] = True
+
+    def b_frame_header(self, b, p, allow_direct):
+        r = self.rng
+        pl = p['planes'] = {}
+        p['numref'] = 0
+        idx = p['bfraction_index'] if p['bfraction_index'] <= 20 else 1
+        self.put_bfraction(b, idx)
+        self.mv_ranges(b, p)
+        b.put(0, 1)   # INTCOMP (always 0 in B pictures)
+        pl['direct'] = self.plane_with_random_mode(b, 0.3 if allow_direct else 0.0)
+        pl['skip'] = self.plane_with_random_mode(b, 0.25)
+        p['mbmodetab'] = r.randint(0, 3); b.put(p['mbmodetab'], 2)
+        p['imvtab'] = r.randint(0, 3); b.put(p['imvtab'], 2)
+        p['icbptab'] = r.randint(0, 7); b.put(p['icbptab'], 3)
+        p['twomvbptab'] = r.randint(0, 3); b.put(p['twomvbptab'], 2)
+        p['fourmvbptab'] = r.randint(0, 3); b.put(p['fourmvbptab'], 2)
+        self.vop_dquant(b, p)
+        self.transform_info(b, p)
+        self.tail(b, p, False)
+        p['quarter'] = True
+
+    # ---- picture bodies
+    def body_p_field(self, b, p):
+        r = self.rng
+        st = {'esc3': None}
+        cs_intra, cs_inter = self.coding_sets(p)
+        self.fmv, self.fmvf, self.fintra = {}, {}, {}
+        tab = p['mbmodetab']
+        codes, bits = (IT.IF_MMV_MBMODE_CODES[tab], IT.IF_MMV_MBMODE_BITS[tab]) if p['mixed'] else (IT.IF_1MV_MBMODE_CODES[tab], IT.IF_1MV_MBMODE_BITS[tab])
+        weights = [1, 1, 3, 3, 3, 3] + ([3, 3] if p['mixed'] else [])
+        for mby in range(self.cur_mbh):
+            b = self.slice_hook(b, mby, st)
+            for mbx in range(self.mbw):
+                idx = self.pick(weights)
+                b.put(codes[idx], bits[idx])
+                if idx <= 1:
+                    self.field_intra_mb(b, p, mbx, mby, idx & 1, st, cs_intra, cs_inter)
+                    continue
+                for k in range(4):
+                    self.fintra[(2 * mbx + (k & 1), 2 * mby + (k >> 1))] = 0
+                if idx <= 5:   # 1MV: MVDATA if idx & 1, coded blocks unless idx & 2
+                    dx = dy = pf = 0
+                    if idx & 1:
+                        dx, dy, pf = self.write_imvdata(b, p)
+                    self.pred_mv_field(b, p, mbx, mby, 0, dx, dy, True, pf)
+                    coeffs = not (idx & 2)
+                else:          # 4MV: 4MVBP, the vectors it says, coded blocks if idx & 1
+                    bp = r.randint(0, 15)
+                    b.put(IT.FOURMVBP_CODES[p['fourmvbptab']][bp], IT.FOURMVBP_BITS[p['fourmvbptab']][bp])
+                    for n in range(4):
+                        dx = dy = pf = 0
+                        if bp & (8 >> n):
+                            dx, dy, pf = self.write_imvdata(b, p)
+                        self.pred_mv_field(b, p, mbx, mby, n, dx, dy, False, pf)
+                    coeffs = idx & 1
+                    self.stats['4mv'] = self.stats.get('4mv', 0) + 1
+                cbp = self.write_icbp(b, p) if coeffs else 0
+                self.residual(b, p, mbx, mby, cbp, st, cs_inter)
+
+    def body_b_field(self, b, p, allow_direct):
+        r = self.rng
+        st = {'esc3': None}
+        cs_intra, cs_inter = self.coding_sets(p)
+        self.fintra = {}
+        tab = p['mbmodetab']
+        codes, bits = (IT.IF_MMV_MBMODE_CODES[tab], IT.IF_MMV_MBMODE_BITS[tab]) if p['mixed'] else (IT.IF_1MV_MBMODE_CODES[tab], IT.IF_1MV_MBMODE_BITS[tab])
+        weights = [1, 1, 3, 3, 3, 3] + ([3, 3] if p['mixed'] else [])
+        fplane, fraw = p['planes']['forward']
+        for mby in range(self.cur_mbh):
+            b = self.slice_hook(b, mby, st)
+            for mbx in range(self.mbw):
+                idx = self.pick(weights)
+                b.put(codes[idx], bits[idx])
+                if idx <= 1:
+                    self.field_intra_mb(b, p, mbx, mby, idx & 1, st, cs_intra, cs_inter)
+                    continue
+                fwd = fplane[mby][mbx]
+                if fraw:
+                    b.put(fwd, 1)   # FORWARDBIT
+                if idx <= 5:
+                    t = 'F'
+                    if not fwd:    # BMVTYPE: 0 backward, 10 direct, 11 interpolated (then INTERPMVP)
+                        t = r.choice(['B', 'I'] + (['D'] if allow_direct else []))
+                        self.put012(b, {'B': 0, 'D': 1, 'I': 2}[t])
+                    interpmvp = 0
+                    if t == 'I':
+                        interpmvp = r.randint(0, 1)
+                        b.put(interpmvp, 1)
+                    if t != 'D' and idx & 1:
+                        self.write_imvdata(b, p)
+                    if interpmvp:
+                        self.write_imvdata(b, p)
+                    self.stats['b' + t] = self.stats.get('b' + t, 0) + 1
+                    coeffs = not (idx & 2)
+                else:
+                    bp = r.randint(0, 15)
+                    b.put(IT.FOURMVBP_CODES[p['fourmvbptab']][bp], IT.FOURMVBP_BITS[p['fourmvbptab']][bp])
+                    for n in range(4):
+                        if bp & (8 >> n):
+                            self.write_imvdata(b, p)
+                    coeffs = idx & 1
+                    self.stats['4mv'] = self.stats.get('4mv', 0) + 1
+                cbp = self.write_icbp(b, p) if coeffs else 0
+                self.residual(b, p, mbx, mby, cbp, st, cs_inter)
+
+    def body_p_frame(self, b, p):
+        r = self.rng
+        st = {'esc3': None}
+        cs_intra, cs_inter = self.coding_sets(p)
+        sw = p['fourmvswitch']
+        table = IT.INTFR_MBMODE[sw]
+        tab = p['mbmodetab']
+        codes, bits = (IT.INTFR_4MV_MBMODE_CODES[tab], IT.INTFR_4MV_MBMODE_BITS[tab]) if sw else (IT.INTFR_NON4MV_MBMODE_CODES[tab], IT.INTFR_NON4MV_MBMODE_BITS[tab])
+        weights = [3] * (len(table) - 1) + [2]
+        skip_plane, skip_raw = p['planes']['skip']
+        for mby in range(self.cur_mbh):
+            b = self.slice_hook(b, mby, st)
+            for mbx in range(self.mbw):
+                skipped = skip_plane[mby][mbx]
+                if skip_raw:
+                    b.put(skipped, 1)
+                if skipped:
+                    continue
+                idx = self.pick(weights)
+                b.put(codes[idx], bits[idx])
+                typ, _fieldtx, mvp, cbpp = table[idx]
+                self.stats['P' + typ] = self.stats.get('P' + typ, 0) + 1
+                if typ == 'INTRA':
+                    self.frame_intra_mb(b, p, mbx, mby, st, cs_intra, cs_inter)
+                    continue
+                cbp = self.write_icbp(b, p) if cbpp else 0
+                if typ == '2MV_FIELD':
+                    bp = r.randint(0, 3)
+                    b.put(IT.TWOMVBP_CODES[p['twomvbptab']][bp], IT.TWOMVBP_BITS[p['twomvbptab']][bp])
+                    for bit in (2, 1):
+                        if bp & bit:
+                            self.write_imvdata(b, p)
+                elif typ in ('4MV', '4MV_FIELD'):
+                    bp = r.randint(0, 15)
+                    b.put(IT.FOURMVBP_CODES[p['fourmvbptab']][bp], IT.FOURMVBP_BITS[p['fourmvbptab']][bp])
+                    for n in range(4):
+                        if bp & (8 >> n):
+                            self.write_imvdata(b, p)
+                elif mvp:
+                    self.write_imvdata(b, p)
+                self.residual(b, p, mbx, mby, cbp, st, cs_inter)
+
+    def body_b_frame(self, b, p):
+        r = self.rng
+        st = {'esc3': None}
+        cs_intra, cs_inter = self.coding_sets(p)
+        table = IT.INTFR_MBMODE[0]
+        tab = p['mbmodetab']
+        codes, bits = IT.INTFR_NON4MV_MBMODE_CODES[tab], IT.INTFR_NON4MV_MBMODE_BITS[tab]
+        weights = [3] * 8 + [2]
+        skip_plane, skip_raw = p['planes']['skip']
+        dplane, draw = p['planes']['direct']
+        for mby in range(self.cur_mbh):
+            b = self.slice_hook(b, mby, st)
+            for mbx in range(self.mbw):
+                skipped = skip_plane[mby][mbx]
+                if skip_raw:
+                    b.put(skipped, 1)
+                typ, mvp, cbpp = '1MV', 0, 0
+                if not skipped:
+                    idx = self.pick(weights)
+                    b.put(codes[idx], bits[idx])
+                    typ, _fieldtx, mvp, cbpp = table[idx]
+                    if typ == 'INTRA':
+                        self.frame_intra_mb(b, p, mbx, mby, st, cs_intra, cs_inter)
+                        continue
+                twomv = typ == '2MV_FIELD'
+                direct = dplane[mby][mbx]
+                if draw:
+                    b.put(direct, 1)   # DIRECTBBIT
+                bt = None
+                if not direct:
+                    bt = r.randint(0, 2)   # BMVTYPE: 0 and 1 forward / backward (which depends on BFRACTION), 2 interpolated
+                    self.put012(b, bt)
+                    if twomv and bt != 2:
+                        b.put(r.randint(0, 1), 1)   # MVSW
+                self.stats['B%s%s' % (typ, 'D' if direct else bt)] = self.stats.get('B%s%s' % (typ, 'D' if direct else bt), 0) + 1
+                if skipped:
+                    continue
+                cbp = self.write_icbp(b, p) if cbpp else 0
+                if not direct:
+                    if bt == 2 and twomv:
+                        bp = r.randint(0, 15)
+                        b.put(IT.FOURMVBP_CODES[p['fourmvbptab']][bp], IT.FOURMVBP_BITS[p['fourmvbptab']][bp])
+                        for i in range(4):
+                            if (bp >> (3 - i)) & 1:
+                                self.write_imvdata(b, p)
+                    elif bt == 2 or twomv:
+                        bp = r.randint(0, 3)
+                        b.put(IT.TWOMVBP_CODES[p['twomvbptab']][bp], IT.TWOMVBP_BITS[p['twomvbptab']][bp])
+                        for bit in (2, 1):
+                            if bp & bit:
+                                self.write_imvdata(b, p)
+                    elif mvp:
+                        self.write_imvdata(b, p)
+                self.residual(b, p, mbx, mby, cbp, st, cs_inter)
+
+    # ---- frames
+    def anchor(self, fcm):
+        self.anchor_fcm = fcm
+        self.anchors += 1
+
+    def field_frame(self, types):
+        """A field pair: FCM 11, FPTYPE, TFCNTR, TFF/RFF, RNDCTRL, UVSAMP, REFDIST or BFRACTION, the first field, a field start code, the second
+        field; slices in either field."""
+        r = self.rng
+        f = self.f
+        b = self.begin_frame()
+        b.put(3, 2)
+        b.put(self.FPTYPE[types], 3)
+        if f['tfcntr']:
+            b.put(r.randint(0, 255), 8)
+        tff = 1
+        if f['broadcast']:
+            tff = r.randint(0, 1)
+            b.put(tff, 1); b.put(r.randint(0, 1), 1)
+        b.put(r.randint(0, 1), 1)   # RNDCTRL
+        b.put(r.randint(0, 1), 1)   # UVSAMP
+        is_b = types[0] in ('B', 'BI')
+        self.count('fptype %s/%s tff%d' % (types[0], types[1], tff))
+        if not f['refdist']:
+            self.refdist = 0
+        elif not is_b:   # REFDIST: 2 bits, 3 and up continue in unary
+            rd = r.choice([0, 1, 2, 3, 4, 6])
+            b.put(min(rd, 3), 2)
+            if rd >= 3:
+                self.put_unary_ones(b, rd - 3, 14)
+            self.refdist = rd
+            self.count('refdist%d' % rd)
+        bfi = None
+        if is_b:
+            bfi = r.choice([0, 1, 2, 3, 4, 5, 6, 8, 10, 15, 20])
+            self.put_bfraction(b, bfi)
+        allow_direct = self.anchor_fcm == 'f'
+        self.cur_mbh = (self.mbh + 1) // 2   # (a field has (height / 2 + 15) / 16 rows)
+        for k, t in enumerate(types):
+            if k:
+                self.close_unit()
+                self.units.append(Unit(0x0C))
+                b = self.units[-1].b
+            p = self.new_picture(t)
+            p.update(second=k, cft=0 if (tff ^ k) else 1, field=True)
+            if bfi is not None:
+                p['bfraction_index'] = bfi
+            self.slice_top = 0
+            self.slice_rows = self.pick_slices(self.cur_mbh)
+            self.addr_base = k * self.cur_mbh
+            self.common_info(b, p)
+            if t in ('I', 'BI'):
+                self.intra_header(b, p, False)
+                self.mark_header(b)
+                self.body_intra_picture(b, p)
+            elif t == 'P':
+                self.p_field_header(b, p)
+                self.mark_header(b)
+                self.body_p_field(b, p)
+            else:
+                self.b_field_header(b, p)
+                self.mark_header(b)
+                self.body_b_field(b, p, allow_direct)
+        rows = 2 * self.cur_mbh
+        self.cur_mbh = self.mbh
+        if not is_b:
+            self.anchor('f')
+        return self.finish_frame(rows)
+
+    def frame_interlaced(self, t):
+        """An interlaced frame picture: FCM 10, PTYPE, TFCNTR, TFF/RFF, RNDCTRL, UVSAMP, the picture header, the macroblocks (and slices)."""
+        r = self.rng
+        f = self.f
+        b = self.begin_frame()
+        b.put(2, 2)
+        u = {'P': 0, 'B': 1, 'I': 2, 'BI': 3, 'S': 4}[t]
+        self.put_unary_ones(b, u, 4)
+        if f['tfcntr']:
+            b.put(r.randint(0, 255), 8)
+        if f['broadcast']:
+            b.put(r.randint(0, 1), 1); b.put(r.randint(0, 1), 1)
+        if t == 'S':
+            self.mark_header(b)
+            self.units[0].rows = self.mbh
+            self.anchor('r')
+            return self.finish_frame(self.mbh)
+        b.put(r.randint(0, 1), 1)   # RNDCTRL
+        b.put(r.randint(0, 1), 1)   # UVSAMP
+        p = self.new_picture(t)
+        allow_direct = self.anchor_fcm == 'r'
+        self.slice_rows = self.pick_slices(self.mbh)
+        self.common_info(b, p)
+        if t in ('I', 'BI'):
+            self.intra_header(b, p, True)
+            self.mark_header(b)
+            self.body_intra_picture(b, p)
+        elif t == 'P':
+            self.p_frame_header(b, p)
+            self.mark_header(b)
+            self.body_p_frame(b, p)
+        else:
+            self.b_frame_header(b, p, allow_direct)
+            self.mark_header(b)
+            self.body_b_frame(b, p)
+        if t in ('I', 'P'):
+            self.anchor('r')
+        return self.finish_frame(self.mbh)
+
+    def frame_progressive(self, t):
+        """A progressive picture in the interlaced sequence (FCM 0), possibly in slices."""
+        b = self.begin_frame()
+        if t == 'S':
+            p = self.new_picture('P', skipped=True)
+            self.header(b, p)
+            self.mark_header(b)
+            self.units[0].rows = self.mbh
+            self.anchor('p')
+            return self.finish_frame(self.mbh)
+        p = self.new_picture(t)
+        if t == 'B' and self.anchor_fcm != 'p':
+            p['direct_density'] = 0.0
+        self.slice_rows = self.pick_slices(self.mbh)
+        self.header(b, p)
+        self.mark_header(b)
+        if t in ('I', 'BI'):
+            self.body_intra_picture(b, p)
+        else:
+            self.body_inter_picture(b, p)
+        if t in ('I', 'P'):
+            self.anchor('p')
+        return self.finish_frame(self.mbh)
+
+    def frame(self, token):
+        """token: 'f' + the field types ('fIP', 'fBX': X is BI), 'r' + type (interlaced frame), 'p' + type (progressive); types I P B X(BI) S(skipped)."""
+        kind, rest = token[0], token[1:].replace('X', 'Y')
+        types = [{'Y': 'BI'}.get(c, c) for c in rest]
+        if kind == 'f':
+            return self.field_frame(tuple(types))
+        if kind == 'r':
+            return self.frame_interlaced(types[0])
+        return self.frame_progressive(types[0])
+
+
+def stream_interlaced(seed, profile, w, h, n, frames=(), **flags):
+    enc = IEnc(seed, w, h, **flags)
+    out = [enc.frame(t) for t in frames]
+    assert len(out) == n, (len(out), n)
+    return enc, out
+
+
+def write_units(path, enc, frames):
+    """An Advanced profile elementary stream of frames made of start code units."""
+    out = bytearray()
+    out += b'\x00\x00\x01\x0f' + escape_bytes(enc.adv_sequence())
+    out += b'\x00\x00\x01\x0e' + escape_bytes(enc.adv_entry_point())
+    for units in frames:
+        for code, data in units:
+            out += bytes([0, 0, 1, code]) + escape_bytes(data)
+    open(path, 'wb').write(bytes(out))
 
 
 def write_rcv(path, enc, frames):
@@ -1159,20 +2076,53 @@ def write_selftest(path):
     open(path, 'w').write(text)
 
 
+def range_map(name, yuv):
+    """Applies the range mapping of stream `name` (RANGE_MAPY / RANGE_MAPUV of its entry point, SMPTE 421M 6.2.15 and 6.2.16) to the decoded
+    pictures in `yuv`: FFmpeg parses the fields but does not map ("Luma scaling is not supported"), so the expected pictures are FFmpeg's
+    (which are right before the mapping: the mapping only changes the output, not the reference pictures) mapped here."""
+    seed, profile, w, h, n, flags = STREAMS[name]
+    data = bytearray(open(yuv, 'rb').read())
+    ysize, csize = w * h, (w // 2) * (h // 2)
+    assert len(data) == n * (ysize + 2 * csize)
+
+    def lut(m):
+        return bytes(range(256)) if m is None else bytes(clip((((v - 128) * (m + 9) + 4) >> 3) + 128, 0, 255) for v in range(256))
+    ly, luv = lut(flags.get('range_mapy')), lut(flags.get('range_mapuv'))
+    for i in range(n):
+        o = i * (ysize + 2 * csize)
+        data[o:o + ysize] = data[o:o + ysize].translate(ly)
+        data[o + ysize:o + ysize + 2 * csize] = data[o + ysize:o + ysize + 2 * csize].translate(luv)
+    open(yuv, 'wb').write(bytes(data))
+
+
 def main():
     if len(sys.argv) == 3 and sys.argv[1] == '--selftest':
         write_selftest(sys.argv[2])
         return
+    if len(sys.argv) == 4 and sys.argv[1] == '--rangemap':
+        range_map(sys.argv[2], sys.argv[3])
+        return
+    expect = None
+    if len(sys.argv) == 4 and sys.argv[1] == '--expect':
+        expect = sys.argv[2]
+        del sys.argv[1:3]
     if len(sys.argv) != 2:
         sys.exit(__doc__)
     out = sys.argv[1]
     os.makedirs(out, exist_ok=True)
+    expected = {}
     for name, (seed, profile, w, h, n, flags) in STREAMS.items():
         enc, frames = BUILDERS[name](seed, profile, w, h, n, **flags)
-        if profile == 3:
+        if 'frames' in flags:
+            write_units(os.path.join(out, 'vc1_%s.vc1' % name), enc, frames)
+        elif profile == 3:
             write_adv(os.path.join(out, 'vc1_%s.vc1' % name), enc, frames)
         else:
             write_rcv(os.path.join(out, 'vc1_%s.rcv' % name), enc, frames)
+        expected[name] = enc.expect
+    if expect:
+        import json
+        json.dump(expected, open(expect, 'w'))
 
 
 STREAMS = {
@@ -1202,8 +2152,51 @@ STREAMS = {
     'adv_il_ipb': (31, 3, 96, 64, 10, dict(pattern='IPBBPBXB', interlace=1, loop_filter=1, overlap=1, dquant=1, extended_mv=1, vstransform=1, finterp=1, broadcast=1, tfcntr=1)),
     'adv_il_ipp': (32, 3, 90, 54, 8, dict(pattern='IPPBPP', interlace=1, loop_filter=1, overlap=1, quantizer=1, postproc=1, broadcast=1, extended_mv=1, extended_dmv=1)),
     'adv_il_skip': (33, 3, 80, 48, 10, dict(pattern='IPSPPSSP', interlace=1, extended_mv=1, loop_filter=1, overlap=1)),
+    # Interlaced pictures (stream_interlaced; `frames` in decoding order: 'f' + the two field types (X = BI), 'r' + the type of an interlaced
+    # frame picture, 'p' + the type of a progressive picture, S = skipped; `slices` the probability that a picture is cut into slices).
+    # Field pictures: FPTYPE I/I I/P P/I P/P, NUMREF 0/1, REFFIELD, MVMODE incl. intensity compensation (INTCOMPFIELD), 1MV and mixed-MV fields
+    'adv_fi_ipp': (201, 3, 96, 64, 8, dict(frames=['fII', 'fIP', 'fPP', 'fPI', 'fPP', 'fPP', 'fIP', 'fPP'], loop_filter=1, overlap=1, ic_prob=0.5)),
+    # ... with MVRANGE and DMVRANGE, REFDIST, DQUANT, VSTRANSFORM, overlap, TFF/RFF, TFCNTR, explicit quantizer; 3 macroblock rows per field
+    'adv_fi_mv': (202, 3, 112, 96, 10, dict(frames=['fII', 'fPP', 'fPP', 'fPI', 'fPP', 'fIP', 'fPP', 'fPP', 'fPP', 'fPP'], extended_mv=1, extended_dmv=1,
+                                            refdist=1, dquant=1, vstransform=1, overlap=1, loop_filter=1, broadcast=1, tfcntr=1, quantizer=1,
+                                            ic_prob=0.3)),
+    # B fields: FPTYPE B/B B/BI BI/B BI/BI, BFRACTION, FORWARDMB, BMVTYPE (forward, backward, direct, interpolated), 4MV B fields
+    'adv_fi_b': (203, 3, 96, 64, 12, dict(frames=['fII', 'fPP', 'fBB', 'fPP', 'fBX', 'fXB', 'fPI', 'fXX', 'fBB', 'fPP', 'fBB', 'fBB'], refdist=1,
+                                          broadcast=1, extended_mv=1, dquant=1, vstransform=1, loop_filter=1)),
+    # Slices in both fields (SLICE_ADDR of the second field counts on from the first field's rows), odd size, 3 rows per field
+    'adv_fi_slices': (204, 3, 122, 90, 8, dict(frames=['fII', 'fPP', 'fIP', 'fBB', 'fPP', 'fBX', 'fPI', 'fBB'], slices=0.9, dquant=1, overlap=1,
+                                               loop_filter=1, extended_mv=1, extended_dmv=1)),
+    # Interlaced frame pictures: I with FIELDTX, ACPRED, CONDOVER/OVERFLAGS; BI
+    'adv_fr_i': (206, 3, 96, 64, 6, dict(frames=['rI', 'rI', 'rP', 'rX', 'rI', 'rX'], overlap=1, dquant=1, loop_filter=1)),
+    # P: every MBMODE (1MV, 2MV field, 4MV, 4MV field, intra, skipped), 4MVSWITCH, INTCOMP, 2MVBP/4MVBP, MVRANGE/DMVRANGE, a skipped frame; 5 rows
+    'adv_fr_p': (205, 3, 112, 80, 10, dict(frames=['rI', 'rP', 'rP', 'rP', 'rS', 'rP', 'rP', 'rI', 'rP', 'rP'], extended_mv=1, extended_dmv=1,
+                                           vstransform=1, dquant=1, loop_filter=1, quantizer=2)),
+    # B: direct (DIRECTMB), forward/backward/interpolated, 2MV field B with MVSW, skipped
+    'adv_fr_b': (207, 3, 96, 64, 10, dict(frames=['rI', 'rP', 'rB', 'rB', 'rP', 'rB', 'rX', 'rP', 'rB', 'rB'], dquant=1, vstransform=1, extended_mv=1,
+                                          loop_filter=1, broadcast=1, overlap=1)),
+    # Slices in interlaced frame pictures, odd size
+    'adv_fr_slices': (208, 3, 106, 70, 8, dict(frames=['rI', 'rP', 'rB', 'rP', 'rB', 'rI', 'rP', 'rB'], slices=0.9, extended_mv=1, extended_dmv=1,
+                                               dquant=1, loop_filter=1)),
+    # One macroblock column (the vector prediction of a picture one macroblock wide), interlaced frame pictures with slices
+    'adv_fr_narrow': (216, 3, 16, 96, 8, dict(frames=['rI', 'rP', 'rB', 'rP', 'rB', 'rX', 'rP', 'rB'], slices=0.5, extended_mv=1, dquant=1,
+                                              vstransform=1, loop_filter=1, overlap=1)),
+    # Progressive, interlaced frame and field pictures in one sequence; B pictures of each kind between anchors of other kinds; slices
+    'adv_mix_a': (209, 3, 112, 96, 12, dict(frames=['pI', 'fPP', 'rP', 'fBB', 'pP', 'rB', 'fPI', 'pB', 'rP', 'fBX', 'pS', 'fPP'], slices=0.5,
+                                            extended_mv=1, dquant=1, loop_filter=1, overlap=1, vstransform=1)),
+    'adv_mix_b': (210, 3, 106, 90, 12, dict(frames=['fII', 'rP', 'pP', 'fBB', 'pB', 'rB', 'fPP', 'rS', 'pS', 'fXB', 'rX', 'pX'], slices=0.6,
+                                            refdist=1, broadcast=1, tfcntr=1, quantizer=1, postproc=1, extended_mv=1, extended_dmv=1, loop_filter=1)),
+    # An odd number of macroblock rows in the frame (5: each field has 3, the last one half outside the field), 5 columns, all three kinds, slices
+    'adv_mix_odd': (215, 3, 74, 80, 10, dict(frames=['fII', 'pP', 'rP', 'fBB', 'fPP', 'rB', 'pB', 'fIP', 'fXB', 'rP'], slices=0.6, dquant=1,
+                                              extended_mv=1, vstransform=1, loop_filter=1, overlap=1)),
+    # Range mapping (entry point RANGE_MAPY / RANGE_MAPUV; the expected pictures are mapped by range_map, see there)
+    'adv_rmap_p': (211, 3, 96, 64, 8, dict(pattern='IPBBPBXB', range_mapy=3, range_mapuv=6, loop_filter=1, vstransform=1)),
+    'adv_rmap_il': (212, 3, 96, 64, 8, dict(frames=['fII', 'rP', 'fBB', 'pP', 'rB', 'fPP', 'pB', 'rP'], range_mapy=7, loop_filter=1)),
+    # Main profile range reduction (RANGERED, RANGEREDFRM random per picture, so P and B pictures follow pictures with the other value)
+    'main_rr_ipb': (213, 1, 96, 64, 10, dict(pattern='IPBBPBBX', max_b_frames=2, rangered=1, loop_filter=1, overlap=1, vstransform=1, dquant=1)),
+    'main_rr_ipp': (214, 1, 80, 64, 10, dict(pattern='IPPP', rangered=1, extended_mv=1, quantizer=1, loop_filter=1)),
 }
-BUILDERS = {name: (stream_pattern if 'pattern' in STREAMS[name][5] else stream_i_only) for name in STREAMS}
+BUILDERS = {name: (stream_interlaced if 'frames' in STREAMS[name][5] else stream_pattern if 'pattern' in STREAMS[name][5] else stream_i_only)
+            for name in STREAMS}
 
 if __name__ == '__main__':
     main()

@@ -275,7 +275,115 @@ static void test_built_layers() {
   }
 }
 
+// Static sprite layers (scripts/gen_mpeg4_sprite_streams.py): the layer header's sprite fields and the S planes' trajectory and brightness change factor
+// (parse_vol_header / parse_vop_header, the CPU decoder's parse); the hardware decoders' parse_packet refuses them; a low latency sprite layer is refused.
+static void test_static_sprites() {
+  struct Units {
+    std::vector<uint8_t> d;
+    std::vector<std::pair<size_t, size_t>> bodies;   // after each start code, with the code
+    std::vector<uint8_t> codes;
+  };
+  auto units = [](const char* path) {
+    Units u;
+    u.d = read_file(path);
+    std::vector<size_t> starts;
+    for (size_t i = 0; i + 3 < u.d.size(); ++i)
+      if (u.d[i] == 0 && u.d[i + 1] == 0 && u.d[i + 2] == 1) { starts.push_back(i); i += 2; }
+    for (size_t k = 0; k < starts.size(); ++k) {
+      const size_t end = k + 1 < starts.size() ? starts[k + 1] : u.d.size();
+      u.codes.push_back(u.d[starts[k] + 3]);
+      u.bodies.push_back({starts[k] + 4, end - starts[k] - 4});
+    }
+    return u;
+  };
+  {
+    const Units u = units("tests/data/m4vdec_sprite_p1.m4v");
+    CHECK(!u.d.empty());
+    mpeg4::Vol vol;
+    std::vector<mpeg4::VopHeader> planes;
+    bool have = false;
+    for (size_t k = 0; k < u.codes.size(); ++k) {
+      const ConstByteView body(u.d.data() + u.bodies[k].first, u.bodies[k].second);
+      if (u.codes[k] >= 0x20 && u.codes[k] <= 0x2F) {
+        have = mpeg4::parse_vol_header(body, 0x32, &vol);
+        CHECK(have);
+        mpeg4::Packet packet;
+        CHECK(!mpeg4::parse_packet(ConstByteView(u.d.data(), u.bodies[k].first + u.bodies[k].second), nullptr, &packet));   // (no sprites there)
+      } else if (u.codes[k] == 0xB6 && have) {
+        mpeg4::VopHeader h;
+        CHECK(mpeg4::parse_vop_header(body, vol, &h));
+        planes.push_back(h);
+      }
+    }
+    CHECK(vol.static_sprite && !vol.gmc && vol.verid == 2 && vol.width == 40 && vol.height == 24 && vol.sprite_width == 96 && vol.sprite_height == 64 &&
+          vol.sprite_left == -24 && vol.sprite_top == -20 && vol.warping_points == 1 && vol.warping_accuracy == 3 && vol.sprite_brightness_change);
+    CHECK(planes.size() == 6 && planes[0].type == mpeg4::VopType::I && planes[0].quant >= 4);
+    const int32_t factors[5] = {-12, 30, -80, 200, 1000};
+    const int32_t du[5] = {37, -411, 1203, 5, -3}, dv[5] = {-21, 133, 700, 9, -1};
+    for (size_t i = 1; i < planes.size() && i <= 5; ++i) {
+      const mpeg4::VopHeader& h = planes[i];
+      CHECK(h.type == mpeg4::VopType::S && h.coded && !h.rounding_type && h.brightness_change_factor == factors[i - 1] && h.sprite_trajectory[0][0] == du[i - 1] &&
+            h.sprite_trajectory[0][1] == dv[i - 1]);
+      // (the header is all of an S plane: it ends at the stuffing before the next start code)
+      CHECK(h.header_bits < u.bodies[i + 4].second * 8 && h.header_bits + 8 >= u.bodies[i + 4].second * 8);
+    }
+    // A P plane in a static sprite layer is refused (7.8.1: S planes only after the sprite).
+    if (planes.size() > 1) {
+      std::vector<uint8_t> body(u.d.begin() + static_cast<long>(u.bodies[5].first), u.d.begin() + static_cast<long>(u.bodies[5].first + u.bodies[5].second));
+      body[0] = static_cast<uint8_t>((body[0] & 0x3F) | 0x40);   // vop_coding_type 01
+      mpeg4::VopHeader h;
+      CHECK(!mpeg4::parse_vop_header(ConstByteView(body.data(), body.size()), vol, &h));
+    }
+  }
+  {
+    // Four warping points (perspective) in a version 1 layer; three, two, none.
+    const char* names[4] = {"tests/data/m4vdec_sprite_p4.m4v", "tests/data/m4vdec_sprite_p3.m4v", "tests/data/m4vdec_sprite_p2.m4v", "tests/data/m4vdec_sprite_p0.m4v"};
+    const uint8_t points[4] = {4, 3, 2, 0};
+    for (int n = 0; n < 4; ++n) {
+      const Units u = units(names[n]);
+      mpeg4::Vol vol;
+      bool ok = false;
+      int s_planes = 0;
+      for (size_t k = 0; k < u.codes.size(); ++k) {
+        const ConstByteView body(u.d.data() + u.bodies[k].first, u.bodies[k].second);
+        if (u.codes[k] >= 0x20 && u.codes[k] <= 0x2F) ok = mpeg4::parse_vol_header(body, 0x32, &vol);
+        mpeg4::VopHeader h;
+        if (u.codes[k] == 0xB6 && ok && mpeg4::parse_vop_header(body, vol, &h) && h.type == mpeg4::VopType::S) ++s_planes;
+      }
+      CHECK(ok && vol.static_sprite && vol.warping_points == points[n] && s_planes == 3);
+    }
+  }
+  {
+    // low_latency_sprite_enable 1: refused (pieces and updates are not decoded).
+    const Units u = units("tests/data/m4vdec_sprite_lowlatency.m4v");
+    bool seen = false;
+    for (size_t k = 0; k < u.codes.size(); ++k) {
+      if (u.codes[k] < 0x20 || u.codes[k] > 0x2F) continue;
+      mpeg4::Vol vol;
+      CHECK(!mpeg4::parse_vol_header(ConstByteView(u.d.data() + u.bodies[k].first, u.bodies[k].second), 0x32, &vol));
+      seen = true;
+    }
+    CHECK(seen);
+  }
+  {
+    // Cut short anywhere, the layer header fails rather than reading past its end.
+    const Units u = units("tests/data/m4vdec_sprite_p1.m4v");
+    for (size_t k = 0; k < u.codes.size(); ++k) {
+      if (u.codes[k] < 0x20 || u.codes[k] > 0x2F) continue;
+      for (size_t cut = 0; cut + 1 < u.bodies[k].second; ++cut) {
+        mpeg4::Vol vol;
+        (void)mpeg4::parse_vol_header(ConstByteView(u.d.data() + u.bodies[k].first, cut), 0x32, &vol);
+      }
+      for (size_t cut = 0; cut < 12; ++cut) {
+        mpeg4::Vol vol;
+        CHECK(!mpeg4::parse_vol_header(ConstByteView(u.d.data() + u.bodies[k].first, cut), 0x32, &vol));
+      }
+    }
+  }
+}
+
 int main() {
+  test_static_sprites();
   test_built_layers();
   test_tables();
   test_streams();

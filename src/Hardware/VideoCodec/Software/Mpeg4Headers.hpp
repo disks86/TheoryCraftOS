@@ -27,6 +27,7 @@ namespace mpeg4 {
 // size, time base, the tools in use, the quantiser matrices) and, for each video object plane, its coding type and whether it carries a picture. Everything below the
 // plane header is the decoder's. Only what the Simple and Advanced Simple profiles use is understood - rectangular 4:2:0, 8-bit, no scalability, no sprites, no
 // complexity estimation, no new prediction, no reduced resolution; anything else (and the H.263 short header) makes the parse fail, so a stream is taken whole or not at all.
+// (parse_vol_header and parse_vop_header, for the CPU decoder, also take GMC and the basic static sprites of the Main profile: 7.8.)
 // The parse follows the order of fields in the standard (and was checked against FFmpeg's decode_vol_header on streams from FFmpeg's encoder).
 
 // The default quantiser matrices (the standard's tables, in raster order), and the zigzag scan that takes a raster index to the scan position. Matrices in a Vol are
@@ -54,7 +55,13 @@ struct Vol {
   uint8_t object_type = 0;                          // video_object_type_indication (1 Simple, 17 Advanced Simple, ...)
   bool vol_control_parameters = false;              // the layer said whether it has B planes (low_delay) itself
   bool gmc = false;                                 // sprite_enable = GMC: S planes with global motion compensation (parse_vol_header only)
-  uint8_t warping_points = 0, warping_accuracy = 0; // no_of_sprite_warping_points (0..3), sprite_warping_accuracy (0..3)
+  uint8_t warping_points = 0, warping_accuracy = 0; // no_of_sprite_warping_points (GMC 0..3, static 0..4), sprite_warping_accuracy (0..3)
+  // sprite_enable = static (7.8, parse_vol_header only): the layer's first plane is an I plane of the sprite's size (the sprite, not shown), the others are S
+  // planes warped from it. Basic sprites only: a layer with low_latency_sprite_enable 1 (pieces and updates, sprite_transmit_mode) is refused.
+  bool static_sprite = false;
+  uint32_t sprite_width = 0, sprite_height = 0;     // 1 .. 8191 luma samples
+  int32_t sprite_left = 0, sprite_top = 0;          // sprite_left_coordinate, sprite_top_coordinate (13-bit signed): where the sprite's first sample is
+  bool sprite_brightness_change = false;            // S planes carry a brightness_change_factor
   uint8_t intra_matrix[64] = {};                    // scan order
   uint8_t non_intra_matrix[64] = {};
 };
@@ -67,17 +74,18 @@ struct Vop {
   uint32_t modulo_time_base = 0, time_increment = 0;
 };
 
-// Everything in a plane header up to its first macroblock, for a decoder (the Simple and Advanced Simple profile fields; no sprites, no shape).
+// Everything in a plane header up to its first macroblock, for a decoder (the Simple and Advanced Simple profile fields, and static sprites' S planes; no shape).
 struct VopHeader {
   VopType type = VopType::I;
   bool coded = false;
   uint32_t modulo_time_base = 0, time_increment = 0;
-  bool rounding_type = false;                       // vop_rounding_type (P planes; 0 otherwise)
+  bool rounding_type = false;                       // vop_rounding_type (P and GMC S planes; 0 otherwise)
   uint8_t intra_dc_vlc_thr = 0;                     // 0..7
   bool top_field_first = false, alternate_vertical_scan = false;   // interlaced layers only
   uint8_t quant = 0;                                // vop_quant, 1..31
   uint8_t fcode_forward = 1, fcode_backward = 1;    // 1..7
-  int32_t sprite_trajectory[3][2] = {};             // S planes: the warping points' du, dv
+  int32_t sprite_trajectory[4][2] = {};             // S planes: the warping points' du, dv
+  int32_t brightness_change_factor = 0;             // static sprite S planes of a layer with sprite_brightness_change: -112 .. 1648 (never 0)
   uint64_t header_bits = 0;                         // bits of the plane's body (after the start code) the header takes
 };
 
@@ -126,10 +134,11 @@ struct Packet {
 bool parse_packet(ConstByteView data, const Vol* current, Packet* packet);
 
 // One video object layer header: `body` is what follows its start code (00 00 01 2x). Fails as parse_packet does on a tool listed above, except that GMC
-// (global motion compensation sprites, without brightness change) is accepted.
+// (global motion compensation sprites, without brightness change) and basic static sprites (not low latency ones) are accepted.
 [[nodiscard]] bool parse_vol_header(ConstByteView body, uint8_t profile_and_level, Vol* vol);
-// One plane header: `body` is what follows the plane's start code (00 00 01 B6). Fails on a cut header, a bad marker, a zero quantiser or f_code, or an S plane
-// of a layer without GMC.
+// One plane header: `body` is what follows the plane's start code (00 00 01 B6). Fails on a cut header, a bad marker, a zero quantiser or f_code, an S plane
+// of a layer without sprites, or a P or B plane of a static sprite layer. A static sprite's S plane ends after its trajectory and brightness change factor (it
+// has no quantiser and no macroblocks).
 [[nodiscard]] bool parse_vop_header(ConstByteView body, const Vol& vol, VopHeader* header);
 // Whether `data` starts with an H.263 picture start code (22 bits: 0000 0000 0000 0000 1000 00).
 bool is_short_header(ConstByteView data);

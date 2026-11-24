@@ -139,6 +139,12 @@ static const VideoCodec g_video_codecs[] = {
 };
 #define VIDEO_CODECS (sizeof g_video_codecs / sizeof g_video_codecs[0])
 
+/* The profiles whose Direct3D 11 decoders decode interlaced content too, made on a field-based Direct3D 12 decoder: H.264 (field pictures and MBAFF frames)
+ * and VC-1 (field interlace frames as two field pictures, interlaced frame pictures). */
+static int vdec_field_based(const GUID *g) {
+  return guid_eq(g, &D3D11_DECODER_PROFILE_H264_VLD_NOFGT) || guid_eq(g, &D3D11_DECODER_PROFILE_VC1_VLD) || guid_eq(g, &D3D11_DECODER_PROFILE_VC1_D2010);
+}
+
 static const VideoCodec *video_codec(const GUID *profile) {
   for (UINT i = 0; profile && i < VIDEO_CODECS; ++i)
     if (guid_eq(profile, g_video_codecs[i].profile)) return &g_video_codecs[i];
@@ -605,6 +611,13 @@ static void video_config(const VideoCodec *codec, D3D11_VIDEO_DECODER_CONFIG *c)
   c->ConfigResidDiffAccelerator = 1;
   c->ConfigHostInverseScan = 1;
   c->ConfigSpecificIDCT = 2;
+  if (codec->status == VSTATUS_MPEG4) {
+    /* (the DXVA specification of MPEG-4 Part 2 VLD decoding, 2.2: every residual-difference field "shall be 0" - ConfigResidDiffAccelerator, and so
+     * ConfigHostInverseScan and ConfigSpecificIDCT; ConfigDecoderSpecific 0: no deblocking or deringing post-processing is offered) */
+    c->ConfigResidDiffAccelerator = 0;
+    c->ConfigHostInverseScan = 0;
+    c->ConfigSpecificIDCT = 0;
+  }
   c->ConfigMinRenderTargetBuffCount = 0;      /* (no surfaces beyond the stream's references: the decoder writes the output directly) */
 }
 static HRESULT STDMETHODCALLTYPE vdev_GetVideoDecoderConfigCount(ID3D11VideoDevice2 *p, const D3D11_VIDEO_DECODER_DESC *desc, UINT *count) {
@@ -678,9 +691,7 @@ static HRESULT STDMETHODCALLTYPE vdev_CreateVideoDecoder(ID3D11VideoDevice2 *p, 
     memset(&dd, 0, sizeof dd);
     dd.Configuration.DecodeProfile = desc->Guid;
     dd.Configuration.BitstreamEncryption = D3D12_BITSTREAM_ENCRYPTION_TYPE_NONE;
-    /* (a Direct3D 11 H.264 decoder decodes interlaced content too: field pictures and MBAFF frames) */
-    dd.Configuration.InterlaceType = guid_eq(&desc->Guid, &D3D11_DECODER_PROFILE_H264_VLD_NOFGT) ? D3D12_VIDEO_FRAME_CODED_INTERLACE_TYPE_FIELD_BASED
-                                                                                                    : D3D12_VIDEO_FRAME_CODED_INTERLACE_TYPE_NONE;
+    dd.Configuration.InterlaceType = vdec_field_based(&desc->Guid) ? D3D12_VIDEO_FRAME_CODED_INTERLACE_TYPE_FIELD_BASED : D3D12_VIDEO_FRAME_CODED_INTERLACE_TYPE_NONE;
     hr = ID3D12VideoDevice_CreateVideoDecoder(vs->v12, &dd, &IID_ID3D12VideoDecoder, (void **)&v->dec12);
     if (SUCCEEDED(hr)) {
       D3D12_VIDEO_DECODER_HEAP_DESC hd;
@@ -1358,6 +1369,7 @@ static void vdec_status_push(VideoDecoder *v, const D3D12_QUERY_DATA_VIDEO_DECOD
   const BYTE *pp = v->picture.data;
   if (k->status == VSTATUS_VC1) {
     if (v->picture.size >= k->pp_feedback + 2) s.feedback = (UINT)pp[k->pp_feedback] << 8 | pp[k->pp_feedback + 1];      /* (bPicScanFixed, bPicScanMethod) */
+    if (v->picture.size > offsetof(DXVA_PictureParameters, bPicStructure)) s.field = pp[offsetof(DXVA_PictureParameters, bPicStructure)];   /* (a field: 1 or 2) */
   } else if (k->status == VSTATUS_MPEG4) {
     USHORT n16;
     if (v->picture.size >= k->pp_feedback + 2) { memcpy(&n16, pp + k->pp_feedback, 2); s.feedback = n16; }
@@ -1589,8 +1601,10 @@ static HRESULT STDMETHODCALLTYPE vctx_DecoderExtension(ID3D11VideoContext3 *p, I
       }
       case VSTATUS_VC1:
       case VSTATUS_MPEG4: {
-        /* (bPicStructure 3: the decoder takes frames only; wDeblockedPictureIndex is the decoded picture: no post-processing) */
-        VideoStatusVc1 r = {(USHORT)s->feedback, s->curr, s->curr, 3, 0xFF, s->status, 0, s->macroblocks};
+        /* (bPicStructure: the picture's - 1 or 2 a VC-1 field picture, else 3, MPEG-4 Part 2 has frames only; wDeblockedPictureIndex is the decoded picture: no
+         * post-processing) */
+        const UCHAR structure = v->codec->status == VSTATUS_VC1 && (s->field == 1 || s->field == 2) ? s->field : 3;
+        VideoStatusVc1 r = {(USHORT)s->feedback, s->curr, s->curr, structure, 0xFF, s->status, 0, s->macroblocks};
         memcpy(at, &r, sizeof r);
         break;
       }

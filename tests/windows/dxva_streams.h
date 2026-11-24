@@ -29,10 +29,14 @@
  *          format (DXVA_Slice_H264_Short, ConfigBitstreamRaw 2), each slice NAL unit with a 00 00 01 start code, the buffer padded to 128 bytes.
  *   MPEG-1 / MPEG-2: video elementary streams, frame and field pictures; DXVA_PictureParameters, DXVA_QmatrixData (always sent), DXVA_SliceInfo, the slices back to
  *          back from their start codes, the buffer padded to 128 bytes.
- *   VC-1: Advanced profile elementary streams (sequence header, entry point, frames and slices; progressive pictures): DXVA_PictureParameters as dxva2_vc1.c fills
- *          them from the sequence, entry point and picture headers, no matrix buffer, one DXVA_SliceInfo per frame or slice unit with its start code (00 00 01 0D,
- *          0B), the buffer padded to 128 bytes. The picture layer is read only as far as PQINDEX: wMBbitOffset, the motion vector mode, 4MV and the intensity
- *          compensation fields (which a decoder reads from the bitstream itself; reading them would take the picture's bit planes) are left 0.
+ *   VC-1: Advanced profile elementary streams (sequence header, entry point, frames and slices; progressive pictures, interlaced frame pictures and field
+ *          interlace frames): DXVA_PictureParameters as dxva2_vc1.c fills them from the sequence, entry point and picture headers, no matrix buffer, one
+ *          DXVA_SliceInfo per frame, field or slice unit with its start code (00 00 01 0D, 0C, 0B), the buffer padded to 128 bytes. A field interlace frame is two
+ *          pictures into the same surface (`field` 1 and 2): the first field (bPicStructure 1 or 2 by TFF; the frame unit and the first field's slices) and the
+ *          second (bSecondField; the field unit and its slices); bPicExtrapolation 2 for interlaced pictures, bMV_RPS REFDIST + 9 for B fields, the range mapping
+ *          of the entry point in bPicOBMC. The picture layer is read only as far as PQINDEX (BFRACTION of an interlaced frame B picture): wMBbitOffset, the motion
+ *          vector mode, 4MV and the intensity compensation fields (which a decoder reads from the bitstream itself; reading them would take the picture's bit
+ *          planes) are left 0, and so is the intensity compensation flag of bBidirectionalAveragingMode.
  *   MPEG-4 Part 2: elementary streams of a rectangular video object layer (Simple and Advanced Simple: B planes, quarter samples, interlace, GMC, the MPEG
  *          quantiser and its matrices, video packets, data partitioning); DXVA_PicParams_MPEG4_PART2 (TRB / TRD of B planes as ffmpeg derives them from the
  *          plane times), DXVA_QmatrixData (always sent), one DXVA_SliceInfo per plane from its start code (00 00 01 B6), wMBbitOffset at its first macroblock.
@@ -77,7 +81,7 @@ typedef struct DxvaPicture {
   long long display_key;                   /* sorts the pictures into display order (a field picture: both fields of a frame have the frame's) */
   int is_reference;                        /* (H.264: nal_ref_idc != 0; MPEG-2: an I or P picture) */
   char type;                               /* 'I', 'P' or 'B' (H.264: the lowest of the slices' types, I < P < B; VC-1 BI: 'B'; MPEG-4 S: 'P') */
-  int field;                               /* MPEG-2 and H.264: 0 a frame picture, 1 the first field, 2 the second field (H.264: the frame is whole after the second) */
+  int field;                               /* MPEG-2, H.264 and VC-1: 0 a frame picture, 1 the first field, 2 the second field (H.264, VC-1: the frame is whole after the second) */
 } DxvaPicture;
 
 typedef struct DxvaH264State DxvaH264State;
@@ -1127,6 +1131,18 @@ static int dxva_mpeg2_next(DxvaStream *s, DxvaPicture *p) {
 
 /* ---- VC-1 (Advanced profile) ---------------------------------------------------------------------------------------------------------------------------------- */
 
+/* One DXVA picture: a frame, or a field of a field interlace frame (all a frame's pictures have the frame's surface and display key). */
+typedef struct DxvaVc1Pic {
+  unsigned surface;
+  int fwd, bwd;                                /* the reference surfaces (-1: none) */
+  int intra, bpic, skipped;
+  unsigned structure, second, interlaced;      /* bPicStructure (3 a frame, 1 top field, 2 bottom field), bSecondField, bPicExtrapolation 2 */
+  unsigned rnd, pq, bfraction, refdist;
+  long long display_key;
+  char type;
+  int field, is_reference;
+} DxvaVc1Pic;
+
 struct DxvaVc1State {
   int have_seq, have_entry;
   /* the sequence header */
@@ -1135,6 +1151,10 @@ struct DxvaVc1State {
   unsigned panscan, refdist, loopfilter, fastuvmc, extended_mv, dquant, vstransform, overlap, quantizer, coded_width, coded_height, extended_dmv, range_mapy, range_mapuv;
   int older, newer;                            /* the surfaces of the two anchors (-1: none) */
   long long older_key, newer_key, b_count, count;
+  unsigned last_refdist;                       /* REFDIST of the last frame of I and P fields (a B field pair's) */
+  int pending;                                 /* a field interlace frame's second field is to come: its units and description */
+  size_t pend_at, pend_end;
+  DxvaVc1Pic pend;
   unsigned char *unit;                         /* a unit without its emulation prevention bytes */
   size_t unit_cap;
 };
@@ -1213,49 +1233,17 @@ static int dxva_vc1_entry_point(DxvaStream *s, const unsigned char *d, size_t n)
   v->have_entry = 1;
   return 1;
 }
-/* A frame unit and the slice units after it: [at, end) of the stream. */
-static int dxva_vc1_frame(DxvaStream *s, DxvaPicture *p, size_t at, size_t end) {
+
+/* The buffers of a picture: the units [at, end) of the stream (the frame unit or, of a second field, the field unit, then its slice units). */
+static int dxva_vc1_picture(DxvaStream *s, DxvaPicture *p, size_t at, size_t end, const DxvaVc1Pic *q) {
   DxvaVc1State *v = s->vc1;
-  if (!v->have_entry) { s->error = "a VC-1 frame before an entry point"; return -1; }
-  const size_t first_end = dxva_find_start(s->data, end, at + 4);
-  const size_t size = dxva_vc1_unescape(v, s->data + at + 4, first_end - at - 4);
-  size_t pos = 0;
-  if (v->interlace && dxva_vc1_bits(v, size, &pos, 1)) { s->error = "an interlaced VC-1 frame (field or frame coded)"; return -1; }
-  unsigned ptype = 0;
-  while (ptype < 4 && dxva_vc1_bits(v, size, &pos, 1)) ++ptype;   /* 0 P, 10 B, 110 I, 1110 BI, 1111 a skipped P */
-  const int type = ptype == 0 || ptype == 4 ? 2 : ptype == 1 ? 3 : ptype == 2 ? 1 : 3, skipped = ptype == 4;
-  int bi = ptype == 3;
-  if (v->tfcntrflag) dxva_vc1_bits(v, size, &pos, 8);
-  if (v->pulldown) dxva_vc1_bits(v, size, &pos, 2);
-  unsigned rnd = 0, bfraction = 0, pqindex = 0;
-  if (!skipped) {
-    rnd = dxva_vc1_bits(v, size, &pos, 1);
-    if (v->interlace) dxva_vc1_bits(v, size, &pos, 1);              /* UVSAMP */
-    if (v->finterpflag) dxva_vc1_bits(v, size, &pos, 1);
-    if (type == 3 && !bi) {
-      bfraction = dxva_vc1_bits(v, size, &pos, 3);
-      if (bfraction == 7) bfraction = 7 + dxva_vc1_bits(v, size, &pos, 4);
-      if (bfraction == 22) bi = 1;                                  /* (BFRACTION 0: a BI picture) */
-    }
-    pqindex = dxva_vc1_bits(v, size, &pos, 5);
-  }
-  static const unsigned char implicit_pq[32] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 27, 29, 31};
-  const unsigned pq = v->quantizer == 0 ? implicit_pq[pqindex & 31] : pqindex;
-  const int intra = type == 1 || bi, bpic = type == 3 && !bi;
-  /* the surfaces: the anchors stay out of the pool */
-  unsigned busy[2], nb = 0;
-  if (v->older >= 0) busy[nb++] = (unsigned)v->older;
-  if (v->newer >= 0) busy[nb++] = (unsigned)v->newer;
-  const unsigned surface = dxva_pick_surface(s, busy, nb);
-  if (surface == ~0u) { s->error = "no free surface (give more)"; return -1; }
-  const int fwd = bpic ? v->older : v->newer, bwd = v->newer;
-  if ((!intra && fwd < 0) || (bpic && bwd < 0)) { s->error = "a VC-1 picture whose references are not there (the stream starts with it)"; return -1; }
   DXVA_PictureParameters pp;
   memset(&pp, 0, sizeof pp);
   const unsigned w = v->coded_width, h = v->coded_height;
-  pp.wDecodedPictureIndex = pp.wDeblockedPictureIndex = (WORD)surface;
-  pp.wForwardRefPictureIndex = (WORD)(intra ? 0xFFFF : (unsigned)fwd);
-  pp.wBackwardRefPictureIndex = (WORD)(bpic ? (unsigned)bwd : 0xFFFF);
+  const int field = q->structure != 3;
+  pp.wDecodedPictureIndex = pp.wDeblockedPictureIndex = (WORD)q->surface;
+  pp.wForwardRefPictureIndex = (WORD)(q->intra ? 0xFFFF : (unsigned)q->fwd);
+  pp.wBackwardRefPictureIndex = (WORD)(q->bpic ? (unsigned)q->bwd : 0xFFFF);
   pp.wPicWidthInMBminus1 = (WORD)(w - 1);       /* (the Advanced profile: the coded size in samples, minus 1) */
   pp.wPicHeightInMBminus1 = (WORD)(h - 1);
   pp.bMacroblockWidthMinus1 = 15;
@@ -1263,24 +1251,26 @@ static int dxva_vc1_frame(DxvaStream *s, DxvaPicture *p, size_t at, size_t end) 
   pp.bBlockWidthMinus1 = 7;
   pp.bBlockHeightMinus1 = 7;
   pp.bBPPminus1 = 7;
-  pp.bPicStructure = 3;
-  pp.bPicIntra = (BYTE)intra;
-  pp.bPicBackwardPrediction = (BYTE)bpic;
+  pp.bPicStructure = (BYTE)q->structure;
+  pp.bSecondField = (BYTE)q->second;
+  pp.bPicIntra = (BYTE)q->intra;
+  pp.bPicBackwardPrediction = (BYTE)q->bpic;
   pp.bBidirectionalAveragingMode = 0x80 | 0x08;     /* (VC-1 rounding, the Advanced profile) */
   pp.bMVprecisionAndChromaRelation = 4;
   pp.bChromaFormat = 1;
   ++s->feedback;
   pp.bPicScanFixed = (BYTE)(s->feedback >> 8);
   pp.bPicScanMethod = (BYTE)(s->feedback & 0xFF);
-  pp.bRcontrol = (BYTE)rnd;
+  pp.bRcontrol = (BYTE)q->rnd;
   pp.bPicSpatialResid8 = (BYTE)(v->panscan << 7 | v->refdist << 6 | v->loopfilter << 5 | v->fastuvmc << 4 | v->extended_mv << 3 | v->dquant << 1 | v->vstransform);
   pp.bPicOverflowBlocks = (BYTE)(v->quantizer << 6 | 7);
-  pp.bPicExtrapolation = 1;
-  pp.bPicDeblocked = (BYTE)((!bpic && v->overlap) << 6 | v->loopfilter << 1);
-  pp.bPicDeblockConfined = (BYTE)(v->postprocflag << 7 | v->pulldown << 6 | v->interlace << 5 | v->tfcntrflag << 4 | v->finterpflag << 3 | (!bpic) << 2 | v->psf << 1 | v->extended_dmv);
+  pp.bPicExtrapolation = (BYTE)(q->interlaced ? 2 : 1);
+  pp.bPicDeblocked = (BYTE)((!q->bpic && v->overlap) << 6 | v->loopfilter << 1);
+  pp.bPicDeblockConfined = (BYTE)(v->postprocflag << 7 | v->pulldown << 6 | v->interlace << 5 | v->tfcntrflag << 4 | v->finterpflag << 3 | (!q->bpic) << 2 | v->psf << 1 | v->extended_dmv);
   pp.bPicOBMC = (BYTE)(v->range_mapy | v->range_mapuv);
-  pp.bReservedBits = (BYTE)pq;
-  pp.wBitstreamFcodes = 32;
+  pp.bMV_RPS = (BYTE)(field && q->bpic ? q->refdist + 9 : 0);      /* (a B field pair's REFDIST, which is in an earlier frame) */
+  pp.bReservedBits = (BYTE)q->pq;
+  pp.wBitstreamFcodes = (WORD)(field ? 32 << 8 | 32 : 32);
   size_t cap = 0;
   free(s->pp);
   s->pp = NULL;
@@ -1289,7 +1279,7 @@ static int dxva_vc1_frame(DxvaStream *s, DxvaPicture *p, size_t at, size_t end) 
   s->qm_size = 0;
   s->sc_size = s->bs_size = 0;
   s->slices = 0;
-  const unsigned mb_width = (w + 15) / 16, mb_height = (h + 15) / 16;
+  const unsigned mb_width = (w + 15) / 16, mb_height = (h + 15) / 16, field_rows = (h + 31) >> 5;
   for (size_t u = at; u < end;) {
     const size_t next = dxva_find_start(s->data, end, u + 4);
     DXVA_SliceInfo si;
@@ -1298,15 +1288,17 @@ static int dxva_vc1_frame(DxvaStream *s, DxvaPicture *p, size_t at, size_t end) 
     if (u != at) {
       size_t rp = 0;
       const size_t n = dxva_vc1_unescape(v, s->data + u + 4, next - u - 4);
-      row = dxva_bits_at(v->unit, n, &rp, 9);                        /* SLICE_ADDR */
+      row = dxva_bits_at(v->unit, n, &rp, 9);                        /* SLICE_ADDR (a second field's: counted on from the first field's rows) */
+    } else if (q->second) {
+      row = field_rows;                                              /* (ffmpeg: a second field begins at the first field's rows) */
     }
     si.wVerticalPosition = (WORD)row;
     si.dwSliceBitsInBuffer = (DWORD)(8 * (next - u));
     si.dwSliceDataLocation = (DWORD)s->bs_size;
-    si.bReservedBits = (BYTE)(bpic ? bfraction + 9 : 0);
-    si.wMBbitOffset = (WORD)(skipped ? 0xFFFF : 0);
-    si.wNumberMBsInSlice = (WORD)(row * mb_width);                   /* (made a count below) */
-    si.wQuantizerScaleCode = (WORD)pq;
+    si.bReservedBits = (BYTE)(q->bpic ? q->bfraction + 9 : 0);
+    si.wMBbitOffset = (WORD)(q->skipped ? 0xFFFF : 0);
+    si.wNumberMBsInSlice = (WORD)((row >> field) * mb_width);         /* (made a count below; ffmpeg halves a field's addresses) */
+    si.wQuantizerScaleCode = (WORD)q->pq;
     if (!dxva_append(&s->bs, &s->bs_size, &s->bs_cap, s->data + u, next - u) || !dxva_append(&s->sc, &s->sc_size, &s->sc_cap, &si, sizeof si)) return -1;
     ++s->slices;
     u = next;
@@ -1314,7 +1306,7 @@ static int dxva_vc1_frame(DxvaStream *s, DxvaPicture *p, size_t at, size_t end) 
   for (unsigned i = 0; i < s->slices; ++i) {
     DXVA_SliceInfo a, b;
     memcpy(&a, s->sc + i * sizeof a, sizeof a);
-    unsigned next_first = mb_width * mb_height;
+    unsigned next_first = mb_width * (mb_height >> field);
     if (i + 1 < s->slices) { memcpy(&b, s->sc + (i + 1) * sizeof b, sizeof b); next_first = b.wNumberMBsInSlice; }
     a.wNumberMBsInSlice = (WORD)(next_first - a.wNumberMBsInSlice);
     memcpy(s->sc + i * sizeof a, &a, sizeof a);
@@ -1333,23 +1325,15 @@ static int dxva_vc1_frame(DxvaStream *s, DxvaPicture *p, size_t at, size_t end) 
   s->crop_right = s->width - w;
   s->crop_bottom = s->height - h;
   memset(p, 0, sizeof *p);
-  p->surface = surface;
-  if (!intra) p->refs[p->ref_count++] = (unsigned)fwd;
-  if (bpic && bwd != fwd) p->refs[p->ref_count++] = (unsigned)bwd;
-  p->is_reference = type != 3;
-  p->type = type == 1 ? 'I' : type == 2 ? 'P' : 'B';
-  /* display order: a B or BI picture comes between the two anchors, an anchor after the B pictures that follow it in the stream */
-  ++v->count;
-  if (type == 3) {
-    p->display_key = v->older_key + ++v->b_count;
-  } else {
-    v->older_key = v->newer_key;
-    v->newer_key = v->count * 4096;
-    v->b_count = 0;
-    p->display_key = v->newer_key;
-    v->older = v->newer;
-    v->newer = (int)surface;
-  }
+  p->surface = q->surface;
+  if (!q->intra && q->fwd >= 0) p->refs[p->ref_count++] = (unsigned)q->fwd;
+  if (q->bpic && q->bwd != q->fwd) p->refs[p->ref_count++] = (unsigned)q->bwd;
+  /* (a second field also reads its first field, in its own surface) */
+  if (q->second && !q->intra) p->refs[p->ref_count++] = q->surface;
+  p->is_reference = q->is_reference;
+  p->type = q->type;
+  p->field = q->field;
+  p->display_key = q->display_key;
   p->picture_parameters = s->pp;
   p->picture_parameters_size = (unsigned)s->pp_size;
   p->qmatrix = NULL;
@@ -1361,7 +1345,155 @@ static int dxva_vc1_frame(DxvaStream *s, DxvaPicture *p, size_t at, size_t end) 
   p->bitstream_size = (unsigned)s->bs_size;
   return 1;
 }
+
+/* A frame unit and the units after it that belong to it: slices, and (a field interlace frame) the field unit of the second field and its slices; [at, end) of the
+ * stream. A field interlace frame gives its first field now and its second field at the next call. */
+static int dxva_vc1_frame(DxvaStream *s, DxvaPicture *p, size_t at, size_t end) {
+  DxvaVc1State *v = s->vc1;
+  if (!v->have_entry) { s->error = "a VC-1 frame before an entry point"; return -1; }
+  const size_t first_end = dxva_find_start(s->data, end, at + 4);
+  const size_t size = dxva_vc1_unescape(v, s->data + at + 4, first_end - at - 4);
+  size_t pos = 0;
+  /* FCM: 0 progressive, 10 an interlaced frame, 11 a field interlace frame (two field pictures) */
+  unsigned fcm = 0;
+  if (v->interlace && dxva_vc1_bits(v, size, &pos, 1)) fcm = 1 + dxva_vc1_bits(v, size, &pos, 1);
+  int type = 1, skipped = 0, bi = 0, second_type = 1, second_bi = 0;   /* (1 I, 2 P, 3 B; bi: a BI picture of type 3) */
+  if (fcm == 2) {
+    const unsigned fptype = dxva_vc1_bits(v, size, &pos, 3);      /* FPTYPE: B fields in bit 2, the other kind (BI, P) in bit 1 for the first field, bit 0 for the second */
+    type = fptype & 4 ? 3 : fptype & 2 ? 2 : 1;
+    bi = (fptype & 4) && (fptype & 2);
+    second_type = fptype & 4 ? 3 : fptype & 1 ? 2 : 1;
+    second_bi = (fptype & 4) && (fptype & 1);
+  } else {
+    unsigned ptype = 0;
+    while (ptype < 4 && dxva_vc1_bits(v, size, &pos, 1)) ++ptype;   /* 0 P, 10 B, 110 I, 1110 BI, 1111 a skipped P */
+    type = ptype == 0 || ptype == 4 ? 2 : ptype == 1 ? 3 : ptype == 2 ? 1 : 3;
+    skipped = ptype == 4;
+    bi = ptype == 3;
+  }
+  if (v->tfcntrflag) dxva_vc1_bits(v, size, &pos, 8);
+  unsigned tff = 1;
+  if (v->pulldown) {
+    if (!v->interlace || v->psf) dxva_vc1_bits(v, size, &pos, 2);   /* RPTFRM */
+    else { tff = dxva_vc1_bits(v, size, &pos, 1); dxva_vc1_bits(v, size, &pos, 1); }   /* TFF, RFF */
+  }
+  unsigned rnd = 0, bfraction = 0, pqindex = 0;
+  const int b_frame = type == 3;
+  if (!skipped) {
+    rnd = dxva_vc1_bits(v, size, &pos, 1);
+    if (v->interlace) dxva_vc1_bits(v, size, &pos, 1);              /* UVSAMP */
+    if (fcm == 2) {
+      /* REFDIST: in a frame of I and P fields (0 without REFDIST_FLAG); a B field pair has the last one */
+      if (!v->refdist) {
+        v->last_refdist = 0;
+      } else if (!b_frame) {
+        unsigned r = dxva_vc1_bits(v, size, &pos, 2);
+        if (r == 3) while (r < 17 && dxva_vc1_bits(v, size, &pos, 1)) ++r;
+        v->last_refdist = r;
+      }
+      if (b_frame) {
+        bfraction = dxva_vc1_bits(v, size, &pos, 3);
+        if (bfraction == 7) bfraction = 7 + dxva_vc1_bits(v, size, &pos, 4);
+      }
+    } else if (fcm == 0) {
+      if (v->finterpflag) dxva_vc1_bits(v, size, &pos, 1);
+      if (type == 3 && !bi) {
+        bfraction = dxva_vc1_bits(v, size, &pos, 3);
+        if (bfraction == 7) bfraction = 7 + dxva_vc1_bits(v, size, &pos, 4);
+        if (bfraction == 22) bi = 1;                                /* (BFRACTION 0: a BI picture) */
+      }
+    }
+    pqindex = dxva_vc1_bits(v, size, &pos, 5);
+    if (fcm == 1 && type == 3 && !bi) {
+      /* (an interlaced frame B picture: BFRACTION after HALFQP, PQUANTIZER and POSTPROC) */
+      if (pqindex < 9) dxva_vc1_bits(v, size, &pos, 1);
+      if (v->quantizer == 1) dxva_vc1_bits(v, size, &pos, 1);
+      if (v->postprocflag) dxva_vc1_bits(v, size, &pos, 2);
+      bfraction = dxva_vc1_bits(v, size, &pos, 3);
+      if (bfraction == 7) bfraction = 7 + dxva_vc1_bits(v, size, &pos, 4);
+    }
+  }
+  static const unsigned char implicit_pq[32] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 27, 29, 31};
+  const unsigned pq = v->quantizer == 0 ? implicit_pq[pqindex & 31] : pqindex;
+  const int intra = type == 1 || bi, bpic = type == 3 && !bi;
+  /* the second field: where its field unit begins, its PQINDEX */
+  size_t field_at = end;
+  unsigned pq2 = pq;
+  if (fcm == 2) {
+    for (size_t u = at; u < end; u = dxva_find_start(s->data, end, u + 4))
+      if (u != at && s->data[u + 3] == 0x0C) { field_at = u; break; }
+    if (field_at == end) { s->error = "a VC-1 field interlace frame without its second field"; return -1; }
+    const size_t fe = dxva_find_start(s->data, end, field_at + 4);
+    const size_t fn = dxva_vc1_unescape(v, s->data + field_at + 4, fe - field_at - 4);
+    size_t fp = 0;
+    const unsigned q2 = dxva_bits_at(v->unit, fn, &fp, 5);
+    pq2 = v->quantizer == 0 ? implicit_pq[q2 & 31] : q2;
+  }
+  /* the surfaces: the anchors stay out of the pool */
+  unsigned busy[2], nb = 0;
+  if (v->older >= 0) busy[nb++] = (unsigned)v->older;
+  if (v->newer >= 0) busy[nb++] = (unsigned)v->newer;
+  const unsigned surface = dxva_pick_surface(s, busy, nb);
+  if (surface == ~0u) { s->error = "no free surface (give more)"; return -1; }
+  /* a B frame predicts from the two anchors, an I or P frame (and its second field) from the newer one */
+  const int fwd = b_frame ? v->older : v->newer, bwd = v->newer;
+  const int second_intra = second_type == 1 || second_bi, second_bpic = second_type == 3 && !second_bi;
+  if ((!intra && fwd < 0) || (bpic && bwd < 0) || (fcm == 2 && ((!second_intra && fwd < 0) || (second_bpic && bwd < 0)))) {
+    s->error = "a VC-1 picture whose references are not there (the stream starts with it)";
+    return -1;
+  }
+  /* display order: a B or BI frame comes between the two anchors, an anchor after the B frames that follow it in the stream */
+  long long key;
+  ++v->count;
+  if (b_frame) {
+    key = v->older_key + ++v->b_count;
+  } else {
+    v->older_key = v->newer_key;
+    v->newer_key = v->count * 4096;
+    v->b_count = 0;
+    key = v->newer_key;
+    v->older = v->newer;
+    v->newer = (int)surface;
+  }
+  DxvaVc1Pic q;
+  memset(&q, 0, sizeof q);
+  q.surface = surface;
+  q.fwd = fwd;
+  q.bwd = bwd;
+  q.intra = intra;
+  q.bpic = bpic;
+  q.skipped = skipped;
+  q.structure = fcm == 2 ? (tff ? 1 : 2) : 3;
+  q.interlaced = fcm != 0;
+  q.rnd = rnd;
+  q.pq = pq;
+  q.bfraction = bfraction;
+  q.refdist = v->last_refdist;
+  q.display_key = key;
+  q.type = type == 1 ? 'I' : type == 2 ? 'P' : 'B';
+  q.field = fcm == 2 ? 1 : 0;
+  q.is_reference = !b_frame;
+  if (fcm == 2) {
+    v->pending = 1;
+    v->pend_at = field_at;
+    v->pend_end = end;
+    v->pend = q;
+    v->pend.second = 1;
+    v->pend.structure = 3 - q.structure;
+    v->pend.intra = second_intra;
+    v->pend.bpic = second_bpic;
+    v->pend.pq = pq2;
+    v->pend.type = second_type == 1 ? 'I' : second_type == 2 ? 'P' : 'B';
+    v->pend.field = 2;
+  }
+  return dxva_vc1_picture(s, p, at, field_at, &q);
+}
 static int dxva_vc1_next(DxvaStream *s, DxvaPicture *p) {
+  DxvaVc1State *v = s->vc1;
+  if (v->pending) {
+    v->pending = 0;
+    return dxva_vc1_picture(s, p, v->pend_at, v->pend_end, &v->pend);
+  }
   while (s->pos < s->size) {
     const size_t at = dxva_find_start(s->data, s->size, s->pos);
     if (at + 3 >= s->size) { s->pos = s->size; break; }
@@ -1372,12 +1504,12 @@ static int dxva_vc1_next(DxvaStream *s, DxvaPicture *p) {
     } else if (code == 0x0E) {
       if (!dxva_vc1_entry_point(s, s->data + at + 4, end - at - 4)) return -1;
     } else if (code == 0x0D) {
-      /* (the frame and the slice units after it) */
-      while (end + 3 < s->size && s->data[end + 3] == 0x0B) end = dxva_find_start(s->data, s->size, end + 3);
+      /* (the frame and the units after it: its slices, a second field's field unit and slices) */
+      while (end + 3 < s->size && (s->data[end + 3] == 0x0B || s->data[end + 3] == 0x0C)) end = dxva_find_start(s->data, s->size, end + 3);
       s->pos = end;
       return dxva_vc1_frame(s, p, at, end);
     } else if (code == 0x0C) {
-      s->error = "a field interlace VC-1 frame";
+      s->error = "a VC-1 field unit without its frame";
       return -1;
     }
     s->pos = end;
@@ -1419,7 +1551,7 @@ static const unsigned char g_dxva_m4_default_inter[64] = {
 
 struct DxvaMpeg4State {
   int have_vol;
-  unsigned profile_and_level, verid, resolution, time_bits, width, height, interlaced, gmc, points, accuracy, quant_type, quarter_sample, resync_disable,
+  unsigned profile_and_level, vo_verid, verid, resolution, time_bits, width, height, interlaced, gmc, points, accuracy, quant_type, quarter_sample, resync_disable,
       partitioned, rvlc;
   unsigned char intra[64], inter[64];          /* scan order, as the stream sends them and DXVA_QmatrixData has them */
   long long time_base, last_time_base, time, last_non_b_time, pp_time, pb_time, t_frame;
@@ -1442,7 +1574,9 @@ static int dxva_mpeg4_vol(DxvaStream *s, size_t at, size_t end) {
   size_t pos = (at + 4) * 8;
   dxva_bits_at(d, end, &pos, 1);                                    /* random_accessible_vol */
   dxva_bits_at(d, end, &pos, 8);                                    /* video_object_type_indication */
-  m->verid = 1;
+  /* (without is_object_layer_identifier the layer's version is the visual object's: ISO/IEC 14496-2 6.3.3, and the DXVA MPEG-4 Part 2 specification's
+     video_object_layer_verid) */
+  m->verid = m->vo_verid ? m->vo_verid : 1;
   if (dxva_bits_at(d, end, &pos, 1)) { m->verid = dxva_bits_at(d, end, &pos, 4); dxva_bits_at(d, end, &pos, 3); }
   if (dxva_bits_at(d, end, &pos, 4) == 15) dxva_bits_at(d, end, &pos, 16);   /* aspect_ratio_info, par_width / par_height */
   if (dxva_bits_at(d, end, &pos, 1)) {                              /* vol_control_parameters */
@@ -1527,7 +1661,7 @@ static int dxva_mpeg4_vop(DxvaStream *s, DxvaPicture *p, size_t at, size_t end) 
     if (pp_field <= pb_field || pb_field <= 1) { pb_field = 2; pp_field = 4; }
   }
   if (!coded) return 0;
-  unsigned rounding = 0, tff = 0, alt = 0, fwd_code = 0, bwd_code = 0;
+  unsigned rounding = 0, tff = 0, alt = 0, fwd_code = 1, bwd_code = 1;   /* (1 where the plane has none: the DXVA specification, 3.3) */
   int trajectory[3][2] = {{0, 0}, {0, 0}, {0, 0}};
   if (type == 1 || type == 3) rounding = dxva_bits_at(d, end, &pos, 1);
   const unsigned dc_thr = dxva_bits_at(d, end, &pos, 3);
@@ -1597,7 +1731,8 @@ static int dxva_mpeg4_vop(DxvaStream *s, DxvaPicture *p, size_t at, size_t end) 
   DXVA_QmatrixData qm;
   memset(&qm, 0, sizeof qm);
   qm.bNewQmatrix[0] = qm.bNewQmatrix[1] = 1;
-  for (int i = 0; i < 64; ++i) { qm.Qmatrix[0][i] = m->intra[i]; qm.Qmatrix[1][i] = m->inter[i]; }
+  /* (4.2: both sent for every picture; all 16 when quant_type is 0 - the H.263 quantiser has no matrices) */
+  for (int i = 0; i < 64; ++i) { qm.Qmatrix[0][i] = m->quant_type ? m->intra[i] : 16; qm.Qmatrix[1][i] = m->quant_type ? m->inter[i] : 16; }
   cap = 0;
   free(s->qm);
   s->qm = NULL;
@@ -1648,6 +1783,9 @@ static int dxva_mpeg4_next(DxvaStream *s, DxvaPicture *p) {
     s->pos = end;
     if (code == 0xB0 && at + 4 < s->size) {
       m->profile_and_level = s->data[at + 4];
+    } else if (code == 0xB5 && at + 4 < s->size) {
+      /* visual object: is_visual_object_identifier, visual_object_verid */
+      m->vo_verid = (s->data[at + 4] & 0x80) ? (unsigned)(s->data[at + 4] >> 3 & 15) : 1;
     } else if (code >= 0x20 && code <= 0x2F) {
       if (!dxva_mpeg4_vol(s, at, end)) return -1;
     } else if (code == 0xB6) {

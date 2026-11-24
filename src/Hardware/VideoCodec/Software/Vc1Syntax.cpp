@@ -91,6 +91,12 @@ Core::Core(allocators::IAllocator& allocator) : allocator_(allocator), unit_info
       const int p = kScan8x8[k * 64 + i];
       zz_8x8_[k][i] = static_cast<uint8_t>((p >> 3) | ((p & 7) << 3));   // (transposed: the block holds the coefficients the way the transform wants them)
     }
+  for (int i = 0; i < 64; ++i) zzi_8x8_[i] = static_cast<uint8_t>((kScan8x8Interlaced[i] >> 3) | ((kScan8x8Interlaced[i] & 7) << 3));
+  IcLuts* const all_luts[3] = {&ic_last_, &ic_next_, &ic_aux_};
+  for (IcLuts* l : all_luts) {
+    init_lut(32, 0, *l, 0, false);
+    init_lut(32, 0, *l, 1, false);
+  }
 }
 
 bool Core::build_vlcs() {
@@ -104,6 +110,17 @@ bool Core::build_vlcs() {
   for (int t = 0; t < 3 && ok; ++t)
     ok = vlc_ttmb_[t].build(allocator_, kTtmbCode + t * 16, kTtmbBits + t * 16, 16, 9) && vlc_ttblk_[t].build(allocator_, kTtblkCode + t * 8, kTtblkBits + t * 8, 8, 5) &&
          vlc_subblkpat_[t].build(allocator_, kSubblkpatCode + t * 15, kSubblkpatBits + t * 15, 15, 6);
+  // interlaced pictures
+  for (int t = 0; t < 8 && ok; ++t)
+    ok = vlc_if_mmv_mbmode_[t].build(allocator_, kIfMmvMbmodeCode + t * 8, kIfMmvMbmodeBits + t * 8, 8, 6) &&
+         vlc_if_1mv_mbmode_[t].build(allocator_, kIf1MvMbmodeCode + t * 6, kIf1MvMbmodeBits + t * 6, 6, 5) &&
+         vlc_mvdata2_[t].build(allocator_, kMvdata2RefCode + t * 126, kMvdata2RefBits + t * 126, 126, 9) &&
+         vlc_icbpcy_[t].build(allocator_, kIcbpcyCode + t * 63, kIcbpcyBits + t * 63, 63, 9);
+  for (int t = 0; t < 4 && ok; ++t)
+    ok = vlc_mvdata1_[t].build(allocator_, kMvdata1RefCode + t * 72, kMvdata1RefBits + t * 72, 72, 9) &&
+         vlc_4mvbp_[t].build(allocator_, k4MvBpCode + t * 16, k4MvBpBits + t * 16, 16, 6) && vlc_2mvbp_[t].build(allocator_, k2MvBpCode + t * 4, k2MvBpBits + t * 4, 4, 3) &&
+         vlc_intfr_4mv_mbmode_[t].build(allocator_, kIntfr4MvMbmodeCode + t * 15, kIntfr4MvMbmodeBits + t * 15, 15, 9) &&
+         vlc_intfr_non4mv_mbmode_[t].build(allocator_, kIntfrNon4MvMbmodeCode + t * 9, kIntfrNon4MvMbmodeBits + t * 9, 9, 6);
   vlcs_ready_ = ok;
   return ok;
 }
@@ -212,11 +229,12 @@ bool Core::parse_entry_point(BitReader& br) {
     seq_.height = seq_.max_coded_height;
   }
   if (seq_.extended_mv) seq_.extended_dmv = br.bit() != 0;
+  // RANGE_MAPY and RANGE_MAPUV (6.2.15, 6.2.16): the output pictures of the entry point segment are mapped (each picture keeps the values it was decoded with).
   seq_.range_mapy_flag = br.bit() != 0;
-  if (seq_.range_mapy_flag) br.skip(3);
+  seq_.range_mapy = seq_.range_mapy_flag ? static_cast<int>(br.get(3)) : 0;
   seq_.range_mapuv_flag = br.bit() != 0;
-  if (seq_.range_mapuv_flag) br.skip(3);
-  return !br.error() && !seq_.panscanflag && !seq_.range_mapy_flag && !seq_.range_mapuv_flag;
+  seq_.range_mapuv = seq_.range_mapuv_flag ? static_cast<int>(br.get(3)) : 0;
+  return !br.error() && !seq_.panscanflag;
 }
 
 // What follows from a sequence: the size in macroblocks, the buffers of the decoding state, the scans.
@@ -232,13 +250,17 @@ bool Core::setup_sequence() {
     const uint64_t mbs = static_cast<uint64_t>(mbw) * static_cast<uint64_t>(mbh);
     const uint64_t b8 = 4 * mbs;
     bool ok = plane_skip_.alloc(allocator_, mbs) && plane_mvtype_.alloc(allocator_, mbs) && plane_direct_.alloc(allocator_, mbs) && plane_acpred_.alloc(allocator_, mbs) &&
-              plane_overflags_.alloc(allocator_, mbs) && slice_start_row_.alloc(allocator_, static_cast<uint64_t>(mbh)) && qscale_.alloc(allocator_, mbs) && intra_mask_.alloc(allocator_, mbs) && cbp_blocks_.alloc(allocator_, mbs) &&
-              ttblk_.alloc(allocator_, mbs) && mv_.alloc(allocator_, b8 * 2) && mv_back_.alloc(allocator_, b8 * 2) && uvmv_.alloc(allocator_, mbs * 2) &&
+              plane_overflags_.alloc(allocator_, mbs) && plane_forward_.alloc(allocator_, mbs) && plane_fieldtx_.alloc(allocator_, mbs) &&
+              slice_start_row_.alloc(allocator_, static_cast<uint64_t>(mbh)) && blk_mv_type_.alloc(allocator_, b8) &&
+              qscale_.alloc(allocator_, mbs) && intra_mask_.alloc(allocator_, mbs) && cbp_blocks_.alloc(allocator_, mbs) &&
+              ttblk_.alloc(allocator_, mbs) && mv_.alloc(allocator_, b8 * 2) && mv_back_.alloc(allocator_, b8 * 2) && mv_f_[0].alloc(allocator_, b8) && mv_f_[1].alloc(allocator_, b8) &&
+              uvmv_.alloc(allocator_, mbs * 2) && uvmv_f_.alloc(allocator_, mbs) &&
               dc_[0].alloc(allocator_, b8) && dc_[1].alloc(allocator_, mbs) && dc_[2].alloc(allocator_, mbs) && ac_[0].alloc(allocator_, b8 * 16) &&
               ac_[1].alloc(allocator_, mbs * 16) && ac_[2].alloc(allocator_, mbs * 16) && coded_.alloc(allocator_, b8) && blocks_.alloc(allocator_, mbs * 6 * 64);
     if (!ok) return false;
     mb_w_ = mbw;
     mb_h_ = mbh;
+    mb_rows_ = mbh;
     // Pictures of the old size are of no use.
     for (Picture& p : pool_) {
       p.in_use = false;
@@ -256,7 +278,8 @@ bool Core::setup_sequence() {
   ref_h_ = seq_.profile == kAdvanced ? seq_.height : mbh * 16;
   out_format_ = VideoFormat{static_cast<uint32_t>(seq_.width), static_cast<uint32_t>(seq_.height), PixelFormat::I420};
   sequence_ok_ = true;
-  offloaded_ = offload_ && offload_->accepts(seq_);
+  // (range reduction and range mapping are decoded here: no engine's handling of them has been checked against a reference)
+  offloaded_ = offload_ && !seq_.rangered && !seq_.range_mapy_flag && !seq_.range_mapuv_flag && offload_->accepts(seq_);
   return true;
 }
 
@@ -299,7 +322,7 @@ bool Core::configure(ConstByteView extradata, uint32_t width, uint32_t height) {
 
 // 8.7 bit plane coding. `raw`: the plane is not coded here; its bits come with each macroblock.
 bool Core::decode_bitplane(BitReader& br, Buf<uint8_t>* plane, bool* raw) {
-  const int width = mb_w_, height = mb_h_, stride = mb_w_;
+  const int width = mb_w_, height = mb_rows_, stride = mb_w_;   // (a field picture's plane has the field's rows)
   const bool invert = br.bit() != 0;
   const int imode = vlc_imode_.decode(br);
   *raw = false;
@@ -442,11 +465,145 @@ bool Core::decode_dquant(BitReader& br) {
   return !br.error();
 }
 
-bool Core::parse_picture_header(BitReader& br) {
+// ---- intensity compensation tables ------------------------------------------------------------------------------------------------------
+
+namespace {
+int clip255(int v) { return v < 0 ? 0 : v > 255 ? 255 : v; }
+}  // namespace
+
+// The tables of one reference field (or, of a frame, the lines of one parity) for LUMSCALE and LUMSHIFT (8.3.8). `chain`: they apply to what the tables give
+// already - a reference compensated before is compensated again, as the reference decoder does it -, otherwise to the samples themselves.
+void Core::init_lut(int lumscale, int lumshift, IcLuts& luts, int field, bool chain) {
+  int scale, shift;
+  if (!lumscale) {
+    scale = -64;
+    shift = (255 - lumshift * 2) * 64;
+    if (lumshift > 31) shift += 128 << 6;
+  } else {
+    scale = lumscale + 32;
+    shift = lumshift > 31 ? (lumshift - 64) * 64 : lumshift << 6;
+  }
+  ArrayView<uint8_t> y(luts.y[field & 1], 256), uv(luts.uv[field & 1], 256);
+  for (int i = 0; i < 256; ++i) {
+    const int iy = chain ? y[static_cast<uint64_t>(i)] : i;
+    const int iu = chain ? uv[static_cast<uint64_t>(i)] : i;
+    y[static_cast<uint64_t>(i)] = static_cast<uint8_t>(clip255((scale * iy + shift + 32) >> 6));
+    uv[static_cast<uint64_t>(i)] = static_cast<uint8_t>(clip255((scale * (iu - 128) + 128 * 64 + 32) >> 6));
+  }
+}
+
+void Core::identity_luts(IcLuts& luts) {
+  init_lut(32, 0, luts, 0, false);
+  init_lut(32, 0, luts, 1, false);
+  luts.use = false;
+}
+
+// At the first header of every picture (not a slice's, not a second field's; nor a skipped picture's): an I or P picture becomes the backward anchor, so the tables
+// of the anchor before it (what its own second field did to its first, or nothing) become the forward ones, and the current frame starts uncompensated; a B
+// picture keeps both and has tables of its own for its first field.
+void Core::rotate_luts(int type) {
+  if (type == kPictureB || type == kPictureBI) {
+    ic_curr_is_aux_ = true;
+  } else {
+    const IcLuts last = ic_last_;
+    ic_last_ = ic_next_;
+    ic_next_ = last;
+    ic_curr_is_aux_ = false;
+  }
+  IcLuts& c = ic_curr();
+  init_lut(32, 0, c, 0, false);
+  init_lut(32, 0, c, 1, false);
+  c.use = false;
+}
+
+// Range reduction (8.3.4.11, 8.4.4.14): a range reduced picture is reconstructed in reduced range and kept that way as a reference. A reference whose RANGEREDFRM is
+// not the current picture's is scaled first - down, ((v - 128) >> 1) + 128, when only the current picture is reduced; up, CLIP((v - 128) * 2 + 128), when only the
+// reference is - and then goes through its intensity compensation; both are one table per direction. (A B picture has its backward anchor's RANGEREDFRM, so only
+// its forward reference differs in a conforming stream; a stream where the backward one differs too is scaled the same way.)
+void Core::prepare_range_scaling() {
+  range_scale_[0] = range_scale_[1] = false;
+  if (seq_.profile == kAdvanced || !seq_.rangered || pic_.skipped || field_mode_) return;
+  for (int dir = 0; dir < 2; ++dir) {
+    const Picture* ref = pic_.type == kPictureP ? (dir == 0 ? anchor_[1] : nullptr) : pic_.type == kPictureB ? anchor_[dir] : nullptr;
+    if (!ref || ref->range_reduced == pic_.rangeredfrm) continue;
+    const IcLuts& ic = dir == 0 ? ic_last_ : ic_next_;   // (as reference_for reads them)
+    IcLuts& out = range_luts_[dir];
+    for (int k = 0; k < 2; ++k) {
+      const ArrayView<uint8_t> y(out.y[k], 256), uv(out.uv[k], 256);
+      const ArrayView<const uint8_t> icy(ic.y[k], 256), icuv(ic.uv[k], 256);
+      for (int i = 0; i < 256; ++i) {
+        const int s = pic_.rangeredfrm ? ((i - 128) >> 1) + 128 : clip255((i - 128) * 2 + 128);
+        y[static_cast<uint64_t>(i)] = ic.use ? icy[static_cast<uint64_t>(s)] : static_cast<uint8_t>(s);
+        uv[static_cast<uint64_t>(i)] = ic.use ? icuv[static_cast<uint64_t>(s)] : static_cast<uint8_t>(s);
+      }
+    }
+    out.use = true;
+    range_scale_[dir] = true;
+  }
+}
+
+OutputMap output_map(const Picture& picture) {
+  OutputMap m;
+  const ArrayView<uint8_t> y(m.y, 256), uv(m.uv, 256);
+  for (int i = 0; i < 256; ++i) {
+    // 8.1.1.4: a range reduced reconstruction is output scaled up.
+    const int v = picture.range_reduced ? clip255((i - 128) * 2 + 128) : i;
+    y[static_cast<uint64_t>(i)] = uv[static_cast<uint64_t>(i)] = static_cast<uint8_t>(v);
+  }
+  // 6.2.15.1 and 6.2.16.1: range mapping, after every other decoding stage.
+  const auto map = [](ArrayView<uint8_t> lut, int value) {
+    for (uint8_t& s : lut) s = static_cast<uint8_t>(clip255((((static_cast<int>(s) - 128) * (value + 9) + 4) >> 3) + 128));
+  };
+  if (picture.range_map_y >= 0) map(y, picture.range_map_y);
+  if (picture.range_map_uv >= 0) map(uv, picture.range_map_uv);
+  m.any = picture.range_reduced || picture.range_map_y >= 0 || picture.range_map_uv >= 0;
+  return m;
+}
+
+// The output of a picture the Core outputs itself, when it is not the reconstruction (start_picture allocated the planes for it).
+bool Core::make_output(Picture* p) {
+  p->out_mapped = false;
+  const OutputMap m = output_map(*p);
+  if (!m.any) return true;
+  for (int c = 0; c < 3; ++c) {
+    if (p->out_plane[c].size() != p->plane[c].size()) return false;
+    const ArrayView<const uint8_t> lut(c ? m.uv : m.y, 256);
+    const ArrayView<const uint8_t> src(p->plane[c].data(), p->plane[c].size());
+    const ArrayView<uint8_t> dst(p->out_plane[c].data(), p->out_plane[c].size());
+    for (uint64_t i = 0; i < src.size(); ++i) dst[i] = lut[src[i]];
+  }
+  p->out_mapped = true;
+  return true;
+}
+
+// ---- the picture header ----------------------------------------------------------------------------------------------------------------
+
+// 7.1 (progressive) and 9.1 (interlaced) the picture header, read from `at`; leaves it in pic_ (and the bit planes in the Core).
+bool Core::parse_picture_header(BitReader& br, HeaderAt at) {
   PictureHeader h;
   const bool adv = seq_.profile == kAdvanced;
-  h.rnd = rnd_;
-  if (!adv) {
+  if (at == HeaderAt::SecondField) {
+    // The second field of a field pair: the frame's part is the first field's; the type is the second one of FPTYPE; the header goes on at PQINDEX.
+    if (pic_.fcm != kFcmFieldInterlace || !field_mode_) return false;
+    h.fcm = pic_.fcm;
+    h.fptype = pic_.fptype;
+    h.tff = pic_.tff;
+    h.rff = pic_.rff;
+    h.rptfrm = pic_.rptfrm;
+    h.uvsamp = pic_.uvsamp;
+    h.rnd = pic_.rnd;
+    h.interpfrm = pic_.interpfrm;
+    h.bfraction_index = pic_.bfraction_index;
+    h.bfraction = pic_.bfraction;
+    h.refdist = pic_.refdist;
+    h.frfd = pic_.frfd;
+    h.brfd = pic_.brfd;
+    if (h.fptype & 4) h.type = (h.fptype & 1) ? kPictureBI : kPictureB;
+    else h.type = (h.fptype & 1) ? kPictureP : kPictureI;
+  } else if (!adv) {
+    field_mode_ = false;
+    mb_rows_ = mb_h_;
+    h.rnd = rnd_;
     if (seq_.finterpflag) h.interpfrm = br.bit() != 0;
     br.skip(2);   // frame count
     if (seq_.rangered) h.rangeredfrm = br.bit() != 0;
@@ -470,13 +627,22 @@ bool Core::parse_picture_header(BitReader& br) {
     else if (h.type == kPictureP) h.rnd ^= 1;
   } else {
     // In an interlaced sequence the frame starts with its coding mode: 0 progressive, 10 frame interlace, 11 field interlace (two field pictures).
-    if (seq_.interlace && br.bit()) h.fcm = br.bit() ? kFcmFieldInterlace : kFcmFrameInterlace;
-    if (h.fcm == kFcmFieldInterlace) {
-      // FPTYPE: bit 2 says the fields are B pictures, bit 1 that the first is the second kind (BI, P), bit 0 the same for the second field.
+    const int fcm = seq_.interlace ? br.decode012() : kFcmProgressive;
+    const bool field = fcm == kFcmFieldInterlace;
+    if (at == HeaderAt::Slice && field != field_mode_) return false;   // (a slice's header cannot change the frame's coding mode)
+    h.fcm = fcm;
+    field_mode_ = field;
+    mb_rows_ = field ? (mb_h_ + 1) / 2 : mb_h_;   // (a field has half the rows: the frame's rounded up to even, halved)
+    int first_field_type = kPictureI;
+    if (field) {
+      // FPTYPE: bit 2 says the fields are B pictures, bit 1 that the first is the second kind (BI, P), bit 0 the same for the second field. `type` is the frame's
+      // class while only the frame is described (an I frame has an intra first field and can be decoded alone, whatever its second field; a B frame is BI only
+      // when both fields are), the first field's type once the fields are decoded here.
       h.fptype = static_cast<int>(br.get(3));
       const bool b_fields = (h.fptype & 4) != 0, first_other = (h.fptype & 2) != 0, second_other = (h.fptype & 1) != 0;
       if (b_fields) h.type = first_other && second_other ? kPictureBI : kPictureB;
-      else h.type = first_other ? kPictureP : kPictureI;   // (a frame whose first field is intra can be decoded alone: it is an I frame, whatever its second field)
+      else h.type = first_other ? kPictureP : kPictureI;
+      first_field_type = b_fields ? (first_other ? kPictureBI : kPictureB) : h.type;
     } else {
       switch (br.unary(0, 4)) {
         case 0: h.type = kPictureP; break;
@@ -490,27 +656,63 @@ bool Core::parse_picture_header(BitReader& br) {
       }
     }
     if (seq_.tfcntrflag) br.skip(8);
-    if (seq_.broadcast) br.skip(2);   // RPTFRM (progressive, or psf), or TFF and RFF
+    if (seq_.broadcast) {
+      if (!seq_.interlace || seq_.psf) {
+        h.rptfrm = static_cast<int>(br.get(2));
+      } else {
+        h.tff = br.bit() != 0;
+        h.rff = br.bit() != 0;
+      }
+    }
     if (h.skipped) {
       pic_ = h;
       return !br.error();
     }
     h.rnd = br.bit();
     if (seq_.interlace) h.uvsamp = br.bit() != 0;
-    if (h.fcm != kFcmProgressive) {
-      pic_ = h;   // (the rest of the header, the bit planes and the macroblocks are the engine's)
+    // Interlaced pictures that an engine decodes: the rest of the header, the bit planes and the macroblocks are its.
+    if (h.fcm != kFcmProgressive && offloaded_) {
+      pic_ = h;
       return !br.error();
     }
-    if (seq_.finterpflag) h.interpfrm = br.bit() != 0;
-    if (h.type == kPictureB) {
-      int index = static_cast<int>(br.get(3));
-      if (index == 7) index = 7 + static_cast<int>(br.get(4));
-      if (index == 21 || index > 22) return false;
-      h.bfraction_index = index;
-      h.bfraction = kBfraction[index];
-      if (h.bfraction == 0) h.type = kPictureBI;
+    if (field) {
+      h.type = first_field_type;
+      // REFDIST: read in a frame of I and P fields (0 without REFDIST_FLAG); a B field pair uses the last one sent.
+      if (!seq_.refdist_flag) {
+        refdist_ = 0;
+      } else if (h.type != kPictureB && h.type != kPictureBI) {
+        int refdist = static_cast<int>(br.get(2));
+        if (refdist == 3) refdist += br.unary(0, 14);
+        if (refdist > 16) return false;
+        refdist_ = refdist;
+      }
+      // (DXVA: a B field pair's REFDIST is the one the program says, bMV_RPS; it was in a frame the decoder may not have seen)
+      if (ext_ && ext_->refdist >= 0 && (h.type == kPictureB || h.type == kPictureBI)) refdist_ = ext_->refdist;
+      h.refdist = refdist_;
+      if (h.type == kPictureB || h.type == kPictureBI) {
+        int index = static_cast<int>(br.get(3));
+        if (index == 7) index = 7 + static_cast<int>(br.get(4));
+        if (index == 21 || index > 22) return false;
+        h.bfraction_index = index;
+        h.bfraction = kBfraction[index];
+        h.frfd = (h.bfraction * h.refdist) >> 8;
+        h.brfd = h.refdist - h.frfd - 1;
+        if (h.brfd < 0) h.brfd = 0;
+      }
+    } else if (h.fcm == kFcmProgressive) {   // (an interlaced frame picture has no INTERPFRM, and its BFRACTION follows POSTPROC)
+      if (seq_.finterpflag) h.interpfrm = br.bit() != 0;
+      if (h.type == kPictureB) {
+        int index = static_cast<int>(br.get(3));
+        if (index == 7) index = 7 + static_cast<int>(br.get(4));
+        if (index == 21 || index > 22) return false;
+        h.bfraction_index = index;
+        h.bfraction = kBfraction[index];
+        if (h.bfraction == 0) h.type = kPictureBI;
+      }
     }
   }
+  // Which field this is: the top one is first when TFF is set.
+  if (field_mode_) cur_field_ = h.tff == second_field_ ? 1 : 0;
   const int pqindex = static_cast<int>(br.get(5));
   if (!pqindex) return false;
   h.pqindex = pqindex;
@@ -524,6 +726,7 @@ bool Core::parse_picture_header(BitReader& br) {
   }
   pic_ = h;   // (the helpers below read and extend pic_)
   if (adv) {
+    // POSTPROC (7.1.1.27): a hint for an optional post filter of the display process (deblocking, deringing: Annex H); it does not change the decoded picture.
     if (seq_.postprocflag) pic_.postproc = static_cast<int>(br.get(2));
   } else {
     if (seq_.extended_mv) pic_.mvrange = br.unary(0, 3);
@@ -534,8 +737,13 @@ bool Core::parse_picture_header(BitReader& br) {
     if (seq_.multires && pic_.type != kPictureB) pic_.respic = static_cast<int>(br.get(2));
     if (seq_.res_x8 && (pic_.type == kPictureI || pic_.type == kPictureBI) && br.bit()) return false;   // the X8 intra coding of Windows Media Image streams
   }
-  if (pic_.rangeredfrm || pic_.respic) return false;
+  // RESPIC (multiresolution coding): a picture coded at half the width or the height is refused. It is reconstructed small, its references are resampled to its size
+  // and it is upsampled for output (Annex B), which neither this decoder nor the reference decoder (FFmpeg) does, so nothing could be checked. A range reduced
+  // picture (RANGEREDFRM) is decoded: see prepare_range_scaling.
+  if (pic_.respic) return false;
+  if (at == HeaderAt::Frame) rotate_luts(pic_.type);
   const int type = pic_.type;
+  const bool field = field_mode_;
   const auto read_planes_and_tables = [&]() -> bool {
     if (!decode_bitplane(br, &plane_skip_, &pic_.skip_raw)) return false;
     pic_.mv_table_index = static_cast<int>(br.get(2));
@@ -551,55 +759,172 @@ bool Core::parse_picture_header(BitReader& br) {
       pic_.ttfrm = kTt8x8;
     }
   };
+  const auto set_ranges = [&]() {
+    pic_.k_x = pic_.mvrange + 9 + (pic_.mvrange >> 1);
+    pic_.k_y = pic_.mvrange + 8;
+    pic_.range_x = 1 << (pic_.k_x - 1);
+    pic_.range_y = 1 << (pic_.k_y - 1);
+  };
   if (type == kPictureP) {
+    if (field) {
+      pic_.numref = br.bit();
+      if (!pic_.numref) {
+        pic_.reffield = br.bit();
+        ref_field_[0] = pic_.reffield ^ (cur_field_ ^ 1);
+      }
+    }
     if (adv) {
       pic_.mvrange = seq_.extended_mv ? br.unary(0, 3) : 0;
-      if (seq_.interlace && seq_.extended_dmv) br.unary(0, 3);   // DMVRANGE (only the interlaced pictures use it)
-      pic_.k_x = pic_.mvrange + 9 + (pic_.mvrange >> 1);
-      pic_.k_y = pic_.mvrange + 8;
-      pic_.range_x = 1 << (pic_.k_x - 1);
-      pic_.range_y = 1 << (pic_.k_y - 1);
+      if (seq_.interlace) pic_.dmvrange = seq_.extended_dmv ? br.unary(0, 3) : 0;   // DMVRANGE (only the interlaced pictures use it)
+      set_ranges();
     }
     pic_.tt_index = (pic_.pq > 4) + (pic_.pq > 12);
-    const int lowquant = pic_.pq > 12 ? 0 : 1;
-    pic_.mv_mode = kMvPmodeTable[lowquant * 5 + br.unary(1, 4)];
-    if (pic_.mv_mode == kMvIntensityComp) {
-      pic_.mv_mode2 = kMvPmodeTable2[lowquant * 4 + br.unary(1, 3)];
-      pic_.lumscale = static_cast<int>(br.get(6));
-      pic_.lumshift = static_cast<int>(br.get(6));
-      pic_.use_ic = true;
-      pic_.quarter_sample = pic_.mv_mode2 != kMv1MvHpel && pic_.mv_mode2 != kMv1MvHpelBilin;
-      pic_.mspel = pic_.mv_mode2 != kMv1MvHpelBilin;
+    if (frame_interlace()) {
+      // 10.3.1 an interlaced frame P picture: 4MVSWITCH, INTCOMP (LUMSCALE and LUMSHIFT for both fields of the reference), the skipped macroblocks, the tables of the
+      // macroblock mode, the vectors, the coded blocks and the block patterns. Its vectors are always in quarter samples with the bicubic filter.
+      pic_.fourmvswitch = br.bit() != 0;
+      pic_.mv_mode = pic_.mv_mode2 = kMv1Mv;
+      if (br.bit()) {
+        pic_.lumscale = pic_.lumscale2 = static_cast<int>(br.get(6));
+        pic_.lumshift = pic_.lumshift2 = static_cast<int>(br.get(6));
+        pic_.intcompfield = 3;
+        pic_.use_ic = true;
+        init_lut(pic_.lumscale, pic_.lumshift, ic_last_, 0, true);
+        init_lut(pic_.lumscale, pic_.lumshift, ic_last_, 1, true);
+        ic_last_.use = true;
+      }
+      if (!decode_bitplane(br, &plane_skip_, &pic_.skip_raw)) return false;
+      pic_.mbmodetab = static_cast<int>(br.get(2));
+      pic_.imvtab = static_cast<int>(br.get(2));
+      pic_.icbptab = static_cast<int>(br.get(3));
+      pic_.twomvbptab = static_cast<int>(br.get(2));
+      if (pic_.fourmvswitch) pic_.fourmvbptab = static_cast<int>(br.get(2));
+      pic_.quarter_sample = true;
+      pic_.mspel = true;
+      if (seq_.dquant && !decode_dquant(br)) return false;
+      read_transform_info();
     } else {
-      pic_.quarter_sample = pic_.mv_mode != kMv1MvHpel && pic_.mv_mode != kMv1MvHpelBilin;
-      pic_.mspel = pic_.mv_mode != kMv1MvHpelBilin;
+      const int lowquant = pic_.pq > 12 ? 0 : 1;
+      pic_.mv_mode = kMvPmodeTable[lowquant * 5 + br.unary(1, 4)];
+      if (pic_.mv_mode == kMvIntensityComp) {
+        pic_.mv_mode2 = kMvPmodeTable2[lowquant * 4 + br.unary(1, 3)];
+        // INTCOMPFIELD (field pictures): which reference fields are compensated, 1 both, 01 the bottom one, 00 the top one.
+        if (field) {
+          const int code = br.bit() ? 0 : 2 - br.bit();
+          pic_.intcompfield = code ^ 3;
+        } else {
+          pic_.intcompfield = 3;
+        }
+        pic_.lumscale = pic_.lumscale2 = 32;
+        pic_.lumshift = pic_.lumshift2 = 0;
+        if (pic_.intcompfield & 1) {
+          pic_.lumscale = static_cast<int>(br.get(6));
+          pic_.lumshift = static_cast<int>(br.get(6));
+        }
+        if ((pic_.intcompfield & 2) && field) {
+          pic_.lumscale2 = static_cast<int>(br.get(6));
+          pic_.lumshift2 = static_cast<int>(br.get(6));
+        } else if (!field) {
+          pic_.lumscale2 = pic_.lumscale;
+          pic_.lumshift2 = pic_.lumshift;
+        }
+        pic_.use_ic = true;
+        // The tables: the first field (and a frame) compensates both fields of the forward reference, on top of what they had. The second field of a field pair
+        // compensates the first field of its own frame (the opposite parity; it starts from the samples) and the field of the same parity of the reference frame
+        // (on top of what the first field did to it). The first scale and shift are the top field's, the second ones the bottom field's.
+        if (field && second_field_) {
+          if (cur_field_) {
+            init_lut(pic_.lumscale, pic_.lumshift, ic_curr(), 0, false);
+            init_lut(pic_.lumscale2, pic_.lumshift2, ic_last_, 1, true);
+          } else {
+            init_lut(pic_.lumscale2, pic_.lumshift2, ic_curr(), 1, false);
+            init_lut(pic_.lumscale, pic_.lumshift, ic_last_, 0, true);
+          }
+          ic_next_.use = true;
+          ic_curr().use = true;
+        } else {
+          init_lut(pic_.lumscale, pic_.lumshift, ic_last_, 0, true);
+          init_lut(pic_.lumscale2, pic_.lumshift2, ic_last_, 1, true);
+        }
+        ic_last_.use = true;
+        pic_.quarter_sample = pic_.mv_mode2 != kMv1MvHpel && pic_.mv_mode2 != kMv1MvHpelBilin;
+        pic_.mspel = pic_.mv_mode2 != kMv1MvHpelBilin;
+      } else {
+        pic_.quarter_sample = pic_.mv_mode != kMv1MvHpel && pic_.mv_mode != kMv1MvHpelBilin;
+        pic_.mspel = pic_.mv_mode != kMv1MvHpelBilin;
+      }
+      const bool mixed = (pic_.mv_mode == kMvIntensityComp && pic_.mv_mode2 == kMvMixed) || pic_.mv_mode == kMvMixed;
+      if (field) {
+        pic_.mbmodetab = static_cast<int>(br.get(3));
+        pic_.imvtab = static_cast<int>(br.get(2 + pic_.numref));
+        pic_.icbptab = static_cast<int>(br.get(3));
+        if (mixed) pic_.fourmvbptab = static_cast<int>(br.get(2));
+      } else {
+        if (mixed) {
+          if (!decode_bitplane(br, &plane_mvtype_, &pic_.mv_type_raw)) return false;
+        } else {
+          pic_.mv_type_raw = false;
+          plane_mvtype_.fill(0);
+        }
+        if (!read_planes_and_tables()) return false;
+      }
+      if (seq_.dquant && !decode_dquant(br)) return false;
+      read_transform_info();
     }
-    if ((pic_.mv_mode == kMvIntensityComp && pic_.mv_mode2 == kMvMixed) || pic_.mv_mode == kMvMixed) {
-      if (!decode_bitplane(br, &plane_mvtype_, &pic_.mv_type_raw)) return false;
-    } else {
-      pic_.mv_type_raw = false;
-      plane_mvtype_.fill(0);
-    }
-    if (!read_planes_and_tables()) return false;
-    if (seq_.dquant && !decode_dquant(br)) return false;
-    read_transform_info();
   } else if (type == kPictureB) {
+    if (frame_interlace()) {
+      // 10.3.2 an interlaced frame B picture: BFRACTION (a value of 0, a BI picture, is refused here as by the reference decoder), MVRANGE, DMVRANGE, INTCOMP
+      // (always 0), the direct and the skipped macroblocks, the tables.
+      int index = static_cast<int>(br.get(3));
+      if (index == 7) index = 7 + static_cast<int>(br.get(4));
+      if (index == 21 || index > 22) return false;
+      pic_.bfraction_index = index;
+      pic_.bfraction = kBfraction[index];
+      if (pic_.bfraction == 0) return false;
+    }
     if (adv) {
       pic_.mvrange = seq_.extended_mv ? br.unary(0, 3) : 0;
-      pic_.k_x = pic_.mvrange + 9 + (pic_.mvrange >> 1);
-      pic_.k_y = pic_.mvrange + 8;
-      pic_.range_x = 1 << (pic_.k_x - 1);
-      pic_.range_y = 1 << (pic_.k_y - 1);
+      set_ranges();
     }
     pic_.tt_index = (pic_.pq > 4) + (pic_.pq > 12);
-    pic_.mv_mode = br.bit() ? kMv1Mv : kMv1MvHpelBilin;
-    pic_.quarter_sample = pic_.mv_mode == kMv1Mv;
-    pic_.mspel = pic_.quarter_sample;
-    if (!decode_bitplane(br, &plane_direct_, &pic_.direct_raw)) return false;
-    if (!read_planes_and_tables()) return false;
+    if (frame_interlace()) {
+      if (seq_.extended_dmv) pic_.dmvrange = br.unary(0, 3);
+      br.skip(1);   // INTCOMP: present, but always 0 (a 1 is ignored, as by the reference decoder)
+      pic_.mv_mode = pic_.mv_mode2 = kMv1Mv;
+      pic_.quarter_sample = true;
+      pic_.mspel = true;
+      if (!decode_bitplane(br, &plane_direct_, &pic_.direct_raw)) return false;
+      if (!decode_bitplane(br, &plane_skip_, &pic_.skip_raw)) return false;
+      pic_.mbmodetab = static_cast<int>(br.get(2));
+      pic_.imvtab = static_cast<int>(br.get(2));
+      pic_.icbptab = static_cast<int>(br.get(3));
+      pic_.twomvbptab = static_cast<int>(br.get(2));
+      pic_.fourmvbptab = static_cast<int>(br.get(2));
+    } else if (field) {
+      if (seq_.extended_dmv) pic_.dmvrange = br.unary(0, 3);
+      const int lowquant = pic_.pq > 12 ? 0 : 1;
+      pic_.mv_mode = kMvPmodeTable2[lowquant * 4 + br.unary(1, 3)];
+      pic_.quarter_sample = pic_.mv_mode == kMv1Mv || pic_.mv_mode == kMvMixed;
+      pic_.mspel = pic_.mv_mode != kMv1MvHpelBilin;
+      if (!decode_bitplane(br, &plane_forward_, &pic_.forward_raw)) return false;
+      pic_.mbmodetab = static_cast<int>(br.get(3));
+      pic_.imvtab = static_cast<int>(br.get(3));
+      pic_.icbptab = static_cast<int>(br.get(3));
+      if (pic_.mv_mode == kMvMixed) pic_.fourmvbptab = static_cast<int>(br.get(2));
+      pic_.numref = 1;   // (a B field always has two reference fields per direction)
+    } else {
+      pic_.mv_mode = br.bit() ? kMv1Mv : kMv1MvHpelBilin;
+      pic_.quarter_sample = pic_.mv_mode == kMv1Mv;
+      pic_.mspel = pic_.quarter_sample;
+      if (!decode_bitplane(br, &plane_direct_, &pic_.direct_raw)) return false;
+      if (!read_planes_and_tables()) return false;
+    }
     if (seq_.dquant && !decode_dquant(br)) return false;
     read_transform_info();
   } else if (adv) {   // I and BI of the Advanced profile
+    // FIELDTX (interlaced frame pictures): which macroblocks have their luma blocks as fields.
+    pic_.fieldtx_raw = false;
+    if (frame_interlace() && !decode_bitplane(br, &plane_fieldtx_, &pic_.fieldtx_raw)) return false;
     if (!decode_bitplane(br, &plane_acpred_, &pic_.acpred_raw)) return false;
     pic_.condover = kCondOverNone;
     if (seq_.overlap && pic_.pq <= 8) {
@@ -608,7 +933,12 @@ bool Core::parse_picture_header(BitReader& br) {
     }
   }
   pic_.c_ac_table_index = br.decode012();
-  if (type == kPictureI || type == kPictureBI) pic_.y_ac_table_index = br.decode012();
+  if (type == kPictureI || type == kPictureBI) {
+    pic_.y_ac_table_index = br.decode012();
+  } else if (pic_.fcm != kFcmProgressive && !pic_.quarter_sample) {
+    pic_.range_x <<= 1;   // (interlaced pictures with half sample vectors: the range is in half samples)
+    pic_.range_y <<= 1;
+  }
   pic_.dc_table_index = br.bit();
   if (adv && (type == kPictureI || type == kPictureBI) && seq_.dquant && !decode_dquant(br)) return false;
   return !br.error();
@@ -647,7 +977,7 @@ bool Core::receive(VideoFrame* frame) {
   returned_ = p;
   frame->format = output_format();
   for (int c = 0; c < 3; ++c) {
-    frame->plane[c] = p->plane[c].data();
+    frame->plane[c] = p->out_mapped ? p->out_plane[c].data() : p->plane[c].data();
     frame->stride[c] = static_cast<uint32_t>(p->stride[c]);
   }
   frame->pts_us = p->pts;
@@ -663,6 +993,13 @@ void Core::flush() {
 
 void Core::reset() {
   ic_use_ = false;
+  IcLuts* const all_luts[3] = {&ic_last_, &ic_next_, &ic_aux_};
+  for (IcLuts* l : all_luts) {
+    init_lut(32, 0, *l, 0, false);
+    init_lut(32, 0, *l, 1, false);
+    l->use = false;
+  }
+  ic_curr_is_aux_ = false;
   cur_ = nullptr;
   anchor_[0] = anchor_[1] = nullptr;
   held_ = nullptr;
@@ -678,10 +1015,17 @@ void Core::reset() {
 bool Core::start_picture() {
   Picture* p = ext_ ? ext_->target : find_free_picture();
   if (!p) return false;
-  const uint64_t w = static_cast<uint64_t>(mb_w_) * 16, h = static_cast<uint64_t>(mb_h_) * 16;
-  if (p->width != static_cast<int>(w) || p->height != static_cast<int>(h) || p->plane[0].size() != w * h) {
+  // Two field pictures need their rows in whole macroblocks per field: the frame's macroblock rows rounded up to even.
+  const bool fields = pic_.fcm == kFcmFieldInterlace && !offloaded_;
+  const bool frame = pic_.fcm == kFcmFrameInterlace && !offloaded_;
+  const int rows = fields ? (mb_h_ + 1) & ~1 : mb_h_;
+  const uint64_t w = static_cast<uint64_t>(mb_w_) * 16, h = static_cast<uint64_t>(rows) * 16;
+  const uint64_t mbs = static_cast<uint64_t>(mb_w_) * static_cast<uint64_t>(rows);
+  // (mb_flags is a field pair's only: a DXVA driver's pictures, which it sizes itself, have none)
+  if (p->width != static_cast<int>(w) || p->height != static_cast<int>(h) || p->plane[0].size() != w * h || p->direct_mv.size() != mbs * 2 || (fields && p->mb_flags.size() != mbs) ||
+      (frame && p->direct_mv_bottom.size() != mbs * 2)) {
     if (!p->plane[0].alloc(allocator_, w * h) || !p->plane[1].alloc(allocator_, w * h / 4) || !p->plane[2].alloc(allocator_, w * h / 4) ||
-        !p->direct_mv.alloc(allocator_, static_cast<uint64_t>(mb_w_) * static_cast<uint64_t>(mb_h_) * 2))
+        !p->direct_mv.alloc(allocator_, mbs * 2) || (fields && !p->mb_flags.alloc(allocator_, mbs)) || (frame && !p->direct_mv_bottom.alloc(allocator_, mbs * 2)))
       return false;
     p->width = static_cast<int>(w);
     p->height = static_cast<int>(h);
@@ -691,12 +1035,54 @@ bool Core::start_picture() {
   // A picture nobody decodes into stays grey.
   for (int c = 0; c < 3; ++c) ArrayView<uint8_t>(p->plane[c].data(), p->plane[c].size()).fill(128);
   ArrayView<int16_t>(p->direct_mv.data(), p->direct_mv.size()).fill(0);
+  ArrayView<uint8_t>(p->mb_flags.data(), p->mb_flags.size()).fill(0);
+  if (!frame) p->direct_mv_bottom.release();   // (only an interlaced frame P picture has these vectors: others give direct mode their one vector)
+  ArrayView<int16_t>(p->direct_mv_bottom.data(), p->direct_mv_bottom.size()).fill(0);
   p->in_use = true;
   p->output_pending = false;
   p->type = pic_.type;
   p->pts = pts_;
+  p->interlaced = pic_.fcm != kFcmProgressive;
+  p->field_coded = pic_.fcm == kFcmFieldInterlace;
+  p->range_reduced = seq_.profile != kAdvanced && pic_.rangeredfrm;
+  p->range_map_y = seq_.profile == kAdvanced && seq_.range_mapy_flag ? seq_.range_mapy : -1;
+  p->range_map_uv = seq_.profile == kAdvanced && seq_.range_mapuv_flag ? seq_.range_mapuv : -1;
+  p->out_mapped = false;
+  // The Core's own output of a picture whose output is not its reconstruction needs planes of its own (a DXVA driver's pictures are mapped by the driver).
+  const bool mapped = !ext_ && output_map(*p).any;
+  for (int c = 0; c < 3; ++c) {
+    if (!mapped) {
+      p->out_plane[c].release();
+    } else if (p->out_plane[c].size() != p->plane[c].size() && !p->out_plane[c].alloc(allocator_, p->plane[c].size())) {
+      return false;
+    }
+  }
   cur_ = p;
+  // The picture being decoded is the frame (a field picture changes this, see begin_field).
+  for (int c = 0; c < 3; ++c) {
+    dst_off_[c] = 0;
+    dst_stride_[c] = p->stride[c];
+  }
   return true;
+}
+
+// The decoding state of a picture (or a field) that starts.
+void Core::reset_picture_state() {
+  slice_start_row_.fill(0);
+  intra_mask_.fill(0);
+  blk_mv_type_.fill(0);
+  if (pic_.type != kPictureI && pic_.type != kPictureBI) plane_fieldtx_.fill(0);   // (an intra picture's FIELDTX is the header's bit plane; others: each macroblock's)
+  cbp_blocks_.fill(0);
+  ttblk_.fill(0);
+  mv_.fill(0);
+  mv_back_.fill(0);
+  mv_f_[0].fill(0);
+  mv_f_[1].fill(0);
+  uvmv_.fill(0);
+  uvmv_f_.fill(0);
+  qscale_.fill(0);
+  esc3_level_length_ = 0;
+  esc3_run_length_ = 0;
 }
 
 // ---- the frame -----------------------------------------------------------------------------------------------------------------------
@@ -708,9 +1094,9 @@ bool Core::decode(ConstByteView data, int64_t pts) {
   const bool coded = data.size() >= 4 && data[0] == 0 && data[1] == 0 && data[2] == 1;
   Buf<uint8_t> scratch;
   if (!scratch.alloc(allocator_, data.size() + 8)) return false;
-  ConstByteView frame;
   bool have_frame = false;
-  List<ConstByteView> slices(allocator_), units(allocator_);
+  List<Part> parts(allocator_);
+  List<ConstByteView> units(allocator_);
   uint64_t used = 0;
   auto stash = [&](ConstByteView unit) -> ConstByteView {
     const uint64_t n = (coded || seq_.profile == kAdvanced) ? unescape(unit, ByteView(scratch.data(), scratch.size()).subview(used)) : 0;
@@ -720,13 +1106,12 @@ bool Core::decode(ConstByteView data, int64_t pts) {
   };
   if (!coded) {
     if (!have_seq_ || !sequence_ok_) return false;
-    if (seq_.profile == kAdvanced) {
-      frame = stash(data);
-    } else {
-      frame = data;
-    }
+    Part frame;
+    frame.code = kCodeFrame;
+    frame.data = seq_.profile == kAdvanced ? stash(data) : data;
+    frame.raw = data;
     have_frame = true;
-    if (!units.push_back(data)) return false;
+    if (!parts.push_back(frame) || !units.push_back(data)) return false;
   } else {
     uint64_t i = 0;
     while (i < data.size()) {
@@ -752,31 +1137,36 @@ bool Core::decode(ConstByteView data, int64_t pts) {
         if (seq_.width != w || seq_.height != h || !sequence_ok_) {
           if (!setup_sequence()) return false;
         }
-      } else if (code == kCodeFrame) {
-        if (!have_seq_ || !sequence_ok_) return false;
-        frame = stash(unit);
-        have_frame = true;
-        if (!units.push_back(whole)) return false;
-      } else if (code == kCodeSlice) {
-        if (!have_frame || !slices.push_back(stash(unit)) || !units.push_back(whole)) return false;
-      } else if (code == kCodeField) {
-        // The second field of a field interlace frame: its data goes to the engine with the rest of the frame, in order.
-        if (!have_frame || !units.push_back(whole)) return false;
+      } else if (code == kCodeFrame || code == kCodeSlice || code == kCodeField) {
+        // The frame, its slices and (field interlace) the second field, in order. A second frame is not this one's.
+        if (code == kCodeFrame) {
+          if (have_frame) break;
+          if (!have_seq_ || !sequence_ok_) return false;
+          have_frame = true;
+        } else if (!have_frame) {
+          return false;
+        }
+        Part part;
+        part.code = code;
+        part.data = stash(unit);
+        part.raw = whole;
+        if (!parts.push_back(part) || !units.push_back(whole)) return false;
       }
       i = end;
     }
   }
   if (!have_frame) return false;
-  return decode_frame(frame, slices.view(), units.view());
+  return decode_frame(parts.view(), units.view());
 }
 
-bool Core::decode_frame(ConstByteView frame, ArrayView<const ConstByteView> slices, ArrayView<const ConstByteView> raw_units) {
-  BitReader br(frame);
-  if (!parse_picture_header(br)) return false;
+bool Core::decode_frame(ArrayView<const Part> parts, ArrayView<const ConstByteView> raw_units) {
+  BitReader br(parts[0].data);
+  second_field_ = false;
+  if (!parse_picture_header(br, HeaderAt::Frame)) return false;
   // (DXVA: the rounding control of a Simple or Main profile picture is the one the program says; it follows from pictures the decoder may not have seen)
   if (ext_ && ext_->rnd >= 0 && seq_.profile != kAdvanced) pic_.rnd = ext_->rnd & 1;
-  // An interlaced picture (frame or field coding) has no pixel path here: only an engine can decode it.
-  if (pic_.fcm != kFcmProgressive && (!offloaded_ || ext_)) return false;
+  // (DXVA: the caller says whether the picture is a frame or the first field of a field pair; the bitstream must agree)
+  if (ext_ && (pic_.fcm == kFcmFieldInterlace) != (ext_->part == ExternalPicture::Part::FirstField)) return false;
   if (ext_) {
     // The references are the caller's: every one the picture type needs must be there.
     anchor_[0] = anchor_[1] = nullptr;
@@ -788,15 +1178,7 @@ bool Core::decode_frame(ConstByteView frame, ArrayView<const ConstByteView> slic
       anchor_[0] = ext_->forward;
       anchor_[1] = ext_->backward;
     }
-    if (pic_.type == kPictureB) {
-      ic_use_ = ext_->ic_forward;
-      ic_scale_ = ext_->ic_scale;
-      ic_shift_ = ext_->ic_shift;
-    } else {
-      ic_use_ = pic_.use_ic && pic_.type == kPictureP;
-      ic_scale_ = pic_.lumscale;
-      ic_shift_ = pic_.lumshift;
-    }
+    // (the intensity compensation tables are the caller's: decode_external set them before the header was read)
   } else {
     // Pictures that cannot be decoded: a stream starts at an intra picture, and a B picture needs both anchors.
     if (need_intra_ && pic_.type != kPictureI) return false;
@@ -809,60 +1191,213 @@ bool Core::decode_frame(ConstByteView frame, ArrayView<const ConstByteView> slic
       ic_shift_ = pic_.lumshift;
     }
   }
+  prepare_range_scaling();
   if (!start_picture()) return false;
   if (pic_.type == kPictureI) need_intra_ = false;
   if (pic_.skipped) {
     // The picture repeats the one before it.
     Picture* last = anchor_[1];
     for (int c = 0; c < 3; ++c) ArrayView<uint8_t>(cur_->plane[c].data(), cur_->plane[c].size()).copy_from(ConstByteView(last->plane[c].data(), last->plane[c].size()));
+  } else if (pic_.fcm == kFcmFieldInterlace && !offloaded_) {
+    // Two field pictures; what describes the frame afterwards is its first field's header.
+    const PictureHeader frame_header = pic_;
+    if (!decode_field_pair(br, parts, ext_ && ext_->part == ExternalPicture::Part::FirstField)) return false;
+    pic_ = frame_header;
+    field_mode_ = false;
+    second_field_ = false;
+    mb_rows_ = mb_h_;
   } else {
-    // Per picture state.
-    if (!offloaded_) {
-      slice_start_row_.fill(0);
-      intra_mask_.fill(0);
-      cbp_blocks_.fill(0);
-      ttblk_.fill(0);
-      mv_.fill(0);
-      mv_back_.fill(0);
-      uvmv_.fill(0);
-      qscale_.fill(0);
-      esc3_level_length_ = 0;
-      esc3_run_length_ = 0;
-    }
-    // Switch to the first slice at the macroblock row it names. (With the pixel work offloaded the slices are only walked, to know where their macroblocks begin.)
-    unit_infos_.clear();
-    UnitInfo first;
-    first.mb_bit_offset = static_cast<uint32_t>(br.position());
-    if (!unit_infos_.push_back(first)) return false;
-    int slice_count = static_cast<int>(slices.size());
-    for (int s = 0; s <= slice_count; ++s) {
-      BitReader sbr = br;
-      int start_row = 0, end_row = mb_h_;
-      if (s > 0) {
-        sbr = BitReader(slices[static_cast<uint64_t>(s - 1)]);
-        start_row = static_cast<int>(sbr.get(9));
-        if (sbr.bit()) {
-          if (!parse_picture_header(sbr)) return false;
-        }
-        UnitInfo info;
-        info.start_row = start_row;
-        info.mb_bit_offset = static_cast<uint32_t>(sbr.position());
-        if (!unit_infos_.push_back(info)) return false;
-      }
-      if (offloaded_) continue;
-      if (s < slice_count) {
-        BitReader nbr(slices[static_cast<uint64_t>(s)]);
-        end_row = static_cast<int>(nbr.get(9));
-      }
-      if (end_row > mb_h_) end_row = mb_h_;
-      if (start_row >= mb_h_ || end_row <= start_row) continue;
-      if (!decode_slice_blocks(sbr, start_row, end_row)) {
-        // A damaged slice leaves the rest of its rows as they are (grey, or a prediction).
-      }
-    }
+    if (!offloaded_) reset_picture_state();
+    if (!walk_progressive_slices(br, parts)) return false;
     if (!offloaded_) finish_intra_and_filters();
   }
   finish_picture(raw_units);
+  return true;
+}
+
+// The frame unit and its slices (with the pixel work offloaded they are only walked, to know where their macroblocks begin). False: a slice header is damaged.
+bool Core::walk_progressive_slices(BitReader& br, ArrayView<const Part> parts) {
+  unit_infos_.clear();
+  UnitInfo first;
+  first.mb_bit_offset = static_cast<uint32_t>(br.position());
+  if (!unit_infos_.push_back(first)) return false;
+  // The slices, in order (a field unit of a field pair that an engine decodes is the engine's).
+  List<ConstByteView> slice_list(allocator_);
+  for (const Part& p : parts)
+    if (p.code == kCodeSlice && !slice_list.push_back(p.data)) return false;
+  const ArrayView<ConstByteView> slices = slice_list.view();
+  const int slice_count = static_cast<int>(slices.size());
+  for (int s = 0; s <= slice_count; ++s) {
+    BitReader sbr = br;
+    int start_row = 0, end_row = mb_h_;
+    if (s > 0) {
+      sbr = BitReader(slices[static_cast<uint64_t>(s - 1)]);
+      start_row = static_cast<int>(sbr.get(9));
+      if (sbr.bit()) {
+        if (!parse_picture_header(sbr, HeaderAt::Slice)) return false;
+      }
+      UnitInfo info;
+      info.start_row = start_row;
+      info.mb_bit_offset = static_cast<uint32_t>(sbr.position());
+      if (!unit_infos_.push_back(info)) return false;
+    }
+    if (offloaded_) continue;
+    if (s < slice_count) {
+      BitReader nbr(slices[static_cast<uint64_t>(s)]);
+      end_row = static_cast<int>(nbr.get(9));
+    }
+    if (end_row > mb_h_) end_row = mb_h_;
+    if (start_row >= mb_h_ || end_row <= start_row) continue;
+    if (!decode_slice_blocks(sbr, start_row, end_row)) {
+      // A damaged slice leaves the rest of its rows as they are (grey, or a prediction).
+    }
+  }
+  return true;
+}
+
+// The decoding state of a field that starts: its parity, where its lines are in the frame, the per picture state.
+void Core::begin_field(bool second) {
+  second_field_ = second;
+  field_mode_ = true;
+  cur_field_ = pic_.tff == second ? 1 : 0;
+  mb_rows_ = (mb_h_ + 1) / 2;
+  for (int c = 0; c < 3; ++c) {
+    dst_stride_[c] = cur_->stride[c] * 2;
+    dst_off_[c] = cur_field_ ? static_cast<uint64_t>(cur_->stride[c]) : 0;
+  }
+  reset_picture_state();
+}
+
+// What follows the macroblocks of a field: its overlap smoothing, intra samples and in-loop filter (the second field predicts from the finished first one).
+void Core::finish_field() { finish_intra_and_filters(); }
+
+// 9.1: a frame of two field pictures. The frame unit holds the first field (and its slices follow it), the field unit (start code 0x0C) the second field's header
+// and macroblocks (and its slices follow it). The units are taken in order the way the reference decoder takes them: a slice belongs to the second field when its
+// address (SLICE_ADDR, counted on from the first field's rows in the second field) is past the first field, and a slice's rows end where the next unit's begin.
+// `first_only` (a DXVA first field picture): the units are the first field's alone, and it is decoded although no second field follows; a slice of the second
+// field among them makes the picture bad (false).
+bool Core::decode_field_pair(BitReader& br, ArrayView<const Part> parts, bool first_only) {
+  const int rows = (mb_h_ + 1) / 2;
+  const int64_t n_slices = static_cast<int64_t>(parts.size()) - 1;   // the units after the frame unit (slices and field units)
+  // The index (among those units) of the last field unit, less one: the last unit of the first field (-1 without a field unit).
+  int64_t n_slices1 = first_only ? n_slices - 1 : -1;
+  for (int64_t k = 0; k < n_slices; ++k)
+    if (parts[static_cast<uint64_t>(k + 1)].code == kCodeField) n_slices1 = k - 1;
+  // The first macroblock row (as an address) of the unit after the frame unit with index k.
+  auto address = [&](int64_t k) -> int {
+    const Part& p = parts[static_cast<uint64_t>(k + 1)];
+    if (p.code == kCodeField) return rows;
+    BitReader a(p.data);
+    return static_cast<int>(a.get(9));
+  };
+  unit_infos_.clear();
+  begin_field(false);
+  bool header_ok = true;
+  for (int64_t i = 0; i <= n_slices; ++i) {
+    BitReader rbr = br;
+    if (i > 0) {
+      rbr = BitReader(parts[static_cast<uint64_t>(i)].data);
+      if (parts[static_cast<uint64_t>(i)].code == kCodeSlice) rbr.skip(9);
+    }
+    const bool second = i > 0 && address(i - 1) >= rows;
+    if (second != second_field_) {
+      if (!second) continue;   // (a slice of the first field after the second one began: no stream has that)
+      if (first_only) return false;
+      finish_field();
+      begin_field(true);
+    }
+    if (i > 0) {
+      if (i == n_slices1 + 2) {
+        header_ok = parse_picture_header(rbr, HeaderAt::SecondField);
+        if (header_ok) second_header_ = pic_;
+      } else if (rbr.bit()) {
+        header_ok = parse_picture_header(rbr, HeaderAt::Slice);
+      }
+    }
+    if (!header_ok) continue;   // (a damaged header: the units up to the next good one are skipped)
+    UnitInfo info;
+    info.start_row = i == 0 ? 0 : address(i - 1);
+    info.mb_bit_offset = static_cast<uint32_t>(rbr.position());
+    if (!unit_infos_.push_back(info)) return false;
+    int start = i == 0 ? 0 : address(i - 1) % rows;
+    if (start < 0) start = 0;
+    int end;
+    if (second_field_) {
+      end = i == n_slices ? rows : address(i) % rows;
+    } else {
+      if (i >= n_slices && !first_only) continue;   // (a first field without a second one is not decoded, as by the reference decoder)
+      end = i == n_slices1 + 1 ? rows : address(i) % rows;
+    }
+    if (end > rows) end = rows;
+    if (end <= start) continue;
+    if (!decode_slice_blocks(rbr, start, end)) {
+      // A damaged slice leaves the rest of its rows as they are.
+    }
+  }
+  finish_field();
+  return true;
+}
+
+// DXVA: the second field of a field pair whose first field the call before decoded into the same target. `parts`: the field unit (its header from PQINDEX on),
+// then the second field's slices, whose addresses are counted on from the first field's rows. `first`: the first field's header (the frame's part of it).
+bool Core::decode_second_field_external(ArrayView<const Part> parts, const PictureHeader& first) {
+  if (first.fcm != kFcmFieldInterlace || parts.empty() || parts[0].code != kCodeField) return false;
+  cur_ = ext_->target;
+  const int rows = (mb_h_ + 1) / 2;
+  const uint64_t mbs = static_cast<uint64_t>(mb_w_) * static_cast<uint64_t>(rows) * 2;
+  if (!cur_->field_coded || cur_->plane[0].size() != mbs * 256 || cur_->direct_mv.size() != mbs * 2 || cur_->mb_flags.size() != mbs) return false;
+  anchor_[0] = ext_->backward ? ext_->forward : nullptr;
+  anchor_[1] = ext_->backward ? ext_->backward : ext_->forward;
+  pic_ = first;
+  field_mode_ = true;
+  second_field_ = true;
+  mb_rows_ = rows;
+  // The tables as the first field left them (a B frame's second field reads its first field through tables of its own, which start as they are).
+  identity_luts(ic_aux_);
+  if (ext_->forward_ic) ic_last_ = *ext_->forward_ic;
+  else identity_luts(ic_last_);
+  const bool b_frame = (first.fptype & 4) != 0;
+  if (b_frame) {
+    if (ext_->backward_ic) ic_next_ = *ext_->backward_ic;
+    else identity_luts(ic_next_);
+  } else if (ext_->target_ic) {
+    ic_next_ = *ext_->target_ic;
+  } else {
+    identity_luts(ic_next_);
+  }
+  ic_curr_is_aux_ = b_frame;
+  unit_infos_.clear();
+  // The unit after the one with index k: its first macroblock row as an address (the field unit's is the first field's rows).
+  auto address = [&](uint64_t k) -> int {
+    if (k >= parts.size()) return 2 * rows;
+    BitReader a(parts[k].data);
+    return static_cast<int>(a.get(9));
+  };
+  begin_field(true);
+  for (uint64_t i = 0; i < parts.size(); ++i) {
+    BitReader rbr(parts[i].data);
+    int start = 0;
+    if (i == 0) {
+      if (!parse_picture_header(rbr, HeaderAt::SecondField)) return false;
+    } else {
+      if (parts[i].code != kCodeSlice) return false;
+      start = static_cast<int>(rbr.get(9)) - rows;
+      if (start < 0 || start >= rows) return false;   // (a slice of the first field, or past the field)
+      if (rbr.bit() && !parse_picture_header(rbr, HeaderAt::Slice)) continue;
+    }
+    UnitInfo info;
+    info.start_row = start + rows;
+    info.mb_bit_offset = static_cast<uint32_t>(rbr.position());
+    if (!unit_infos_.push_back(info)) return false;
+    int end = address(i + 1) - rows;
+    if (end > rows) end = rows;
+    if (end <= start) continue;
+    if ((pic_.type == kPictureP && !anchor_[1]) || (pic_.type == kPictureB && (!anchor_[0] || !anchor_[1]))) return false;
+    if (!decode_slice_blocks(rbr, start, end)) {
+      // A damaged slice leaves the rest of its rows as they are.
+    }
+  }
+  finish_field();
   return true;
 }
 
@@ -885,9 +1420,10 @@ void Core::finish_picture(ArrayView<const ConstByteView> units) {
       if (anchor_[i]) o.anchor_slot[i] = static_cast<int>(anchor_[i] - pool_);
     o.units = units;
     o.unit_info = unit_infos_.view();
-    if (!pic_.skipped) {
+    if (pic_.fcm == kFcmFieldInterlace && !offloaded_) o.second_field = &second_header_;
+    if (!pic_.skipped && pic_.fcm == kFcmProgressive) {   // (an interlaced picture's bit planes are not described)
       const bool intra_like = pic_.type == kPictureI || pic_.type == kPictureBI;
-      const bool adv = seq_.profile == kAdvanced && pic_.fcm == kFcmProgressive;   // (an interlaced picture's bit planes are not read here)
+      const bool adv = seq_.profile == kAdvanced;
       auto plane = [&](const Buf<uint8_t>& b) { return ArrayView<const uint8_t>(b.data(), b.size()); };
       if (pic_.type == kPictureP) {
         if (!pic_.skip_raw) o.skip_plane = plane(plane_skip_);
@@ -913,6 +1449,7 @@ void Core::finish_picture(ArrayView<const ConstByteView> units) {
   if (pic_.type == kPictureI || pic_.type == kPictureP) rnd_ = pic_.rnd;
   else if (pic_.type == kPictureBI) rnd_ = pic_.rnd;
   Picture* p = cur_;
+  if (!make_output(p)) p->out_mapped = false;   // (start_picture sized the planes, so this does not happen)
   if (pic_.type == kPictureB || pic_.type == kPictureBI) {
     output_picture(p);
   } else if (low_delay_) {
@@ -932,8 +1469,16 @@ void Core::finish_picture(ArrayView<const ConstByteView> units) {
 
 Core::ExternalStatus Core::decode_external(const SequenceHeader& seq, ConstByteView data, const ExternalPicture& picture, PictureHeader* header) {
   *header = PictureHeader();
+  using PicturePart = ExternalPicture::Part;
+  const bool second = picture.part == PicturePart::SecondField;
+  // A second field completes the first field the call before decoded into the same target (anything else between them ends the pair).
+  const bool pair_ok = pair_open_ && pair_target_ == picture.target && seq.width == seq_.width && seq.height == seq_.height;
+  const PictureHeader first = pair_header_;
+  pair_open_ = false;
+  pair_target_ = nullptr;
   pic_ = PictureHeader();
   if (!picture.target || data.empty()) return ExternalStatus::BadPicture;
+  if (second && !pair_ok) return ExternalStatus::Structure;
   offload_ = nullptr;
   observer_ = nullptr;
   seq_ = seq;
@@ -942,8 +1487,8 @@ Core::ExternalStatus Core::decode_external(const SequenceHeader& seq, ConstByteV
   if (!setup_sequence()) return ExternalStatus::BadSequence;
   Buf<uint8_t> scratch;
   if (!scratch.alloc(allocator_, data.size() + 8)) return ExternalStatus::NoMemory;
-  List<ConstByteView> slices(allocator_), units(allocator_);
-  ConstByteView frame;
+  List<Part> parts(allocator_);
+  List<ConstByteView> units(allocator_);
   bool have_frame = false;
   uint64_t used = 0;
   const bool adv = seq_.profile == kAdvanced;
@@ -953,48 +1498,101 @@ Core::ExternalStatus Core::decode_external(const SequenceHeader& seq, ConstByteV
     used += n;
     return out;
   };
+  // The unit that starts the picture: the frame's (0D), or a second field's (0C).
+  const uint32_t first_code = second ? kCodeField : kCodeFrame;
   const bool coded = adv && data.size() >= 4 && data[0] == 0 && data[1] == 0 && data[2] == 1;
+  if (second && !adv) return ExternalStatus::Structure;
+  uint64_t i = 0;
   if (!coded) {
-    frame = adv ? stash(data) : data;
+    // The first unit without its start code: up to the first start code (Advanced profile: its slices may follow behind theirs), or all of it.
+    const uint64_t end = adv ? next_start_code(data, 0) : data.size();
+    const ConstByteView whole = data.first(end);
+    Part frame;
+    frame.code = first_code;
+    frame.data = adv ? stash(whole) : whole;
+    frame.raw = whole;
     have_frame = true;
-    if (!units.push_back(data)) return ExternalStatus::NoMemory;
-  } else {
-    uint64_t i = 0;
-    while (i < data.size()) {
-      const uint64_t start = next_start_code(data, i);
-      if (start >= data.size()) break;
-      const uint64_t end = next_start_code(data, start + 3);
-      if (start + 4 > end) {
-        i = end;
-        continue;
-      }
-      const uint32_t code = data[start + 3];
-      ConstByteView unit = data.subview(start + 4, end - (start + 4));
-      ConstByteView whole = data.subview(start, end - start);
-      if (code == kCodeFrame) {
-        if (have_frame) break;   // (a second frame: not this picture's)
-        frame = stash(unit);
-        have_frame = true;
-        if (!units.push_back(whole)) return ExternalStatus::NoMemory;
-      } else if (code == kCodeSlice) {
-        if (!have_frame) return ExternalStatus::BadPicture;
-        if (!slices.push_back(stash(unit)) || !units.push_back(whole)) return ExternalStatus::NoMemory;
-      } else if (code == kCodeField) {
-        // The second field of a field interlace frame (DXVA sends it as a picture of its own).
-        return ExternalStatus::Interlaced;
-      }
-      // (sequence headers, entry points, end of sequence and user data: the parameters are `seq`)
+    if (!parts.push_back(frame) || !units.push_back(whole)) return ExternalStatus::NoMemory;
+    i = end;
+  }
+  while (i < data.size()) {
+    const uint64_t start = next_start_code(data, i);
+    if (start >= data.size()) break;
+    const uint64_t end = next_start_code(data, start + 3);
+    if (start + 4 > end) {
       i = end;
+      continue;
     }
+    const uint32_t code = data[start + 3];
+    ConstByteView unit = data.subview(start + 4, end - (start + 4));
+    ConstByteView whole = data.subview(start, end - start);
+    if (code == kCodeFrame || code == kCodeField || code == kCodeSlice) {
+      if (code != kCodeSlice) {
+        if (have_frame) break;   // (another frame or field: not this picture's)
+        if (code != first_code) return ExternalStatus::Structure;
+      } else if (!have_frame) {
+        return ExternalStatus::BadPicture;
+      }
+      have_frame = true;
+      Part part;
+      part.code = code;
+      part.data = stash(unit);
+      part.raw = whole;
+      if (!parts.push_back(part) || !units.push_back(whole)) return ExternalStatus::NoMemory;
+    }
+    // (sequence headers, entry points, end of sequence and user data: the parameters are `seq`)
+    i = end;
   }
   if (!have_frame) return ExternalStatus::BadPicture;
   ext_ = &picture;
-  const bool ok = decode_frame(frame, slices.view(), units.view());
+  bool ok;
+  if (second) {
+    ok = decode_second_field_external(parts.view(), first);
+  } else {
+    // The intensity compensation tables of the references as the caller keeps them, placed where the header's tables are kept: an I or P picture makes its forward
+    // reference's the `last` ones when it starts (rotate_luts), a B picture finds its references' in `last` and `next`.
+    identity_luts(ic_aux_);
+    if (picture.backward_ic) {
+      if (picture.forward_ic) ic_last_ = *picture.forward_ic;
+      else identity_luts(ic_last_);
+      ic_next_ = *picture.backward_ic;
+    } else {
+      identity_luts(ic_last_);
+      if (picture.forward_ic) ic_next_ = *picture.forward_ic;
+      else identity_luts(ic_next_);
+    }
+    ic_curr_is_aux_ = false;
+    ok = decode_frame(parts.view(), units.view());
+  }
   ext_ = nullptr;
   anchor_[0] = anchor_[1] = nullptr;
   cur_ = nullptr;
   *header = pic_;
-  if (!ok) return pic_.fcm != kFcmProgressive ? ExternalStatus::Interlaced : ExternalStatus::BadPicture;
+  if (!ok) {
+    const bool field = pic_.fcm == kFcmFieldInterlace;
+    if (!second && pic_.pqindex != 0 && field != (picture.part == PicturePart::FirstField)) return ExternalStatus::Structure;
+    if (!second && pic_.skipped && picture.part == PicturePart::FirstField) return ExternalStatus::Structure;
+    return ExternalStatus::BadPicture;
+  }
+  // The tables after the picture: a P picture's compensation of its forward reference (and the second field's of the first), kept with the pictures. A skipped
+  // picture repeats its reference with its tables; a B picture changes nothing but has tables of its own (none).
+  const bool b_picture = pic_.type == kPictureB || pic_.type == kPictureBI;
+  if (pic_.skipped) {
+    if (picture.target_ic) {
+      if (picture.forward_ic) *picture.target_ic = *picture.forward_ic;
+      else identity_luts(*picture.target_ic);
+    }
+  } else if (b_picture) {
+    if (picture.target_ic) identity_luts(*picture.target_ic);
+  } else {
+    if (picture.forward_ic) *picture.forward_ic = ic_last_;
+    if (picture.target_ic) *picture.target_ic = ic_next_;
+  }
+  if (picture.part == PicturePart::FirstField) {
+    pair_open_ = true;
+    pair_target_ = picture.target;
+    pair_header_ = pic_;
+  }
   return ExternalStatus::Decoded;
 }
 

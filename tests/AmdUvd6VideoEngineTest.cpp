@@ -781,7 +781,8 @@ static bool run_mpeg4_stream(IVideoDecoder& session, const Mpeg4Expected& e, boo
 
 // Interlaced pictures with no stream to decode them from: frame and field coded ones, with headers and nothing else (tests/Vc1InterlacedFrames.hpp). When the engine takes interlaced
 // sequences every one of them reaches it - the sequence flag set in the message, the frame's units behind their start codes in order, the field unit after the frame - and comes
-// out in display order; otherwise (an engine that failed its interlaced test) the CPU has no pixel path for them, and not a picture comes out nor a job is sent.
+// out in display order; otherwise (an engine that failed its interlaced test) no job is sent: the CPU has no pixel path for the frame coded ones, and the field coded ones
+// it decodes itself need their references - of these frames only the last one (I/P fields: an intra first field) can be decoded, and only it comes out.
 static void synthetic_interlaced(AmdUvd6VideoEngine& engine, Card& card, bool engine_takes) {
   struct Step { int fcm, value; bool field_unit; };
   const Step steps[] = {{1, 2, false}, {2, 3, true}, {1, 1, false}, {2, 4, true}, {2, 2, true}, {2, 5, true}, {2, 7, true}, {2, 1, true}};
@@ -805,7 +806,10 @@ static void synthetic_interlaced(AmdUvd6VideoEngine& engine, Card& card, bool en
     p.pts_us = int64_t{i} * 1000;
     p.keyframe = i == 0;
     const SubmitResult r = session->submit(p);
-    CHECK((r == SubmitResult::Accepted) == engine_takes);
+    // Without the engine the CPU decodes frame and field pictures itself; only the interlaced frame B picture is refused then: what follows its BFRACTION in
+    // the filler bytes is no valid bit plane (an engine reads none of that).
+    const bool cpu_refuses = steps[i].fcm == 1 && steps[i].value == 1;
+    CHECK((r == SubmitResult::Accepted) == (engine_takes || !cpu_refuses));
     while (session->receive(&f)) order.push_back(f.pts_us / 1000);
   }
   session->flush();
@@ -813,7 +817,9 @@ static void synthetic_interlaced(AmdUvd6VideoEngine& engine, Card& card, bool en
   card.capture_synthetic = false;
   CHECK(card.problems == problems_before);   // (the stand-in found nothing wrong with the jobs)
   if (!engine_takes) {
-    CHECK(order.empty() && card.captured.empty());
+    const int64_t cpu_want[] = {0, 3, 1, 5, 6, 4, 7};   // (the CPU's pictures in display order: all but the refused B frame)
+    CHECK(order.size() == 7 && card.captured.empty());
+    for (uint32_t i = 0; i < 7 && i < order.size(); ++i) CHECK(order[i] == cpu_want[i]);
     return;
   }
   const int64_t want[] = {0, 2, 3, 1, 5, 6, 4, 7};   // (display order: an anchor waits for the next anchor, a B frame goes out at once)
@@ -1116,8 +1122,8 @@ static void run_case(Fault fault) {
           CHECK(static_cast<bool>(second) && run_hevc10_stream(*second, hevc10, PixelFormat::P010) && card.hevc10_decodes == engine_before);
         }
       }
-      // The interlaced VC-1 stream (progressive frames) decodes either way, on the engine when its interlaced test passed and on the CPU when it did not; frame and field coded
-      // pictures only on the engine.
+      // The interlaced VC-1 stream (progressive frames) decodes either way, on the engine when its interlaced test passed and on the CPU when it did not; frame coded
+      // pictures only on the engine (field coded ones on the CPU too).
       {
         DecoderConfig vc1_config = h264_config();
         vc1_config.codec = VideoCodec::Vc1;

@@ -118,6 +118,8 @@ static bool load(const char* name, Stream* s) {
 struct Result {
   int frames = 0;
   int max_diff = 0;
+  int first_bad = -1;            // the first picture (display order) that differs, and where
+  int bad_plane = 0, bad_x = 0, bad_y = 0;
   uint32_t width = 0, height = 0;
 };
 
@@ -135,6 +137,12 @@ static void collect(Vc1Decoder& dec, const std::vector<uint8_t>& ref, Result* r)
           for (uint32_t x = 0; x < f.format.plane_width(c); ++x) {
             const int d = abs(int(f.plane[c][size_t(y) * f.stride[c] + x]) - int(ref[p++]));
             if (d > r->max_diff) r->max_diff = d;
+            if (d && r->first_bad < 0) {
+              r->first_bad = r->frames;
+              r->bad_plane = int(c);
+              r->bad_x = int(x);
+              r->bad_y = int(y);
+            }
           }
     } else {
       r->max_diff = 255;   // more pictures than the reference has
@@ -171,7 +179,9 @@ static void test_stream(const char* name) {
   {
     const Result r = decode_stream(a, s, ref);
     const size_t frame_bytes = size_t(r.width) * r.height + 2 * size_t((r.width + 1) / 2) * ((r.height + 1) / 2);
-    printf("  %-12s %ux%u, %d pictures, largest difference %d\n", name, r.width, r.height, r.frames, r.max_diff);
+    printf("  %-12s %ux%u, %d pictures, largest difference %d", name, r.width, r.height, r.frames, r.max_diff);
+    if (r.first_bad >= 0) printf(" (first in picture %d, plane %d at %d,%d)", r.first_bad, r.bad_plane, r.bad_x, r.bad_y);
+    printf("\n");
     CHECK(frame_bytes && size_t(r.frames) * frame_bytes == ref.size() && size_t(r.frames) == s.units.size());
     CHECK(r.max_diff == 0);
   }
@@ -206,6 +216,71 @@ static void test_damaged(const char* name) {
     }
   }
   CHECK(runs > 100 && a.live == 0);
+}
+
+// Field pictures damaged where their structure is: the field start code missing or doubled, the second field cut right after its start code or with a header
+// that fails (PQINDEX 0), slice addresses out of range or pointing back into the first field, a field unit before the frame's slices. Nothing may fault or leak,
+// and the frames after the damaged one still decode.
+static void test_damaged_fields(const char* name) {
+  Stream s;
+  CHECK(load(name, &s));
+  if (s.units.empty()) return;
+  TestAllocator a;
+  int runs = 0, pictures = 0;
+  {
+    for (int variant = 0; variant < 8; ++variant) {
+      Vc1Decoder dec(a);
+      VideoFrame f;
+      for (size_t u = 0; u < s.units.size(); ++u) {
+        std::vector<uint8_t> au(s.bytes.begin() + long(s.units[u].first), s.bytes.begin() + long(s.units[u].first + s.units[u].second));
+        // Where the field unit and the slice units start.
+        std::vector<size_t> field, slice;
+        for (size_t i = 0; i + 4 <= au.size(); ++i)
+          if (!au[i] && !au[i + 1] && au[i + 2] == 1) {
+            if (au[i + 3] == 0x0C) field.push_back(i);
+            if (au[i + 3] == 0x0B) slice.push_back(i);
+          }
+        if (u > 0 && (u + size_t(variant)) % 2 == 0 && !field.empty()) {
+          const size_t at = field[0];
+          switch (variant) {
+            case 0: au.erase(au.begin() + long(at), au.end()); break;                                                     // no second field
+            case 1: au.resize(at + 4); break;                                                                             // its start code only
+            case 2: if (at + 4 < au.size()) au[at + 4] = 0; break;                                                        // PQINDEX 0: its header fails
+            case 3: { std::vector<uint8_t> copy(au.begin() + long(at), au.end()); au.insert(au.end(), copy.begin(), copy.end()); break; }   // twice
+            case 4:                                                                                                       // slice addresses past the frame
+              for (size_t k : slice)
+                if (k + 5 < au.size()) { au[k + 4] = 0xFF; au[k + 5] |= 0x80; }
+              break;
+            case 5:                                                                                                       // a second field slice that says row 0
+              for (size_t k : slice)
+                if (k > at && k + 5 < au.size()) { au[k + 4] = 0; au[k + 5] &= 0x7F; }
+              break;
+            case 6:                                                                                                       // the field unit moved to the front
+              if (at > 4) {
+                std::vector<uint8_t> second(au.begin() + long(at), au.end());
+                au.erase(au.begin() + long(at), au.end());
+                std::vector<uint8_t> moved;
+                size_t frame = 0;
+                for (size_t i = 0; i + 4 <= au.size(); ++i)
+                  if (!au[i] && !au[i + 1] && au[i + 2] == 1 && au[i + 3] == 0x0D) { frame = i; break; }
+                moved.insert(moved.end(), au.begin(), au.begin() + long(frame));
+                moved.insert(moved.end(), second.begin(), second.end());
+                moved.insert(moved.end(), au.begin() + long(frame), au.end());
+                au = moved;
+              }
+              break;
+            default: au.resize(at + (au.size() - at) / 3); break;                                                         // the second field cut short
+          }
+        }
+        dec.decode(ConstByteView(au.data(), au.size()), int64_t(u) * 1000);
+        while (dec.receive(&f)) ++pictures;
+        ++runs;
+      }
+      dec.flush();
+      while (dec.receive(&f)) ++pictures;
+    }
+  }
+  CHECK(runs > 30 && pictures > 0 && a.live == 0);
 }
 
 static void test_config() {
@@ -303,7 +378,8 @@ static void test_interlaced_pictures() {
     for (uint32_t i = 0; i < count && i < order.size(); ++i) CHECK(order[i] == want[i]);
   }
   {
-    // Without an engine the CPU has no pixel path for these pictures: they are refused, nothing comes out. An engine that refuses the sequence is no engine.
+    // Without an engine the CPU decodes these pictures itself (here an interlaced frame I picture whose macroblock data is nothing in particular): the picture
+    // comes out. An engine that refuses the sequence is no engine.
     TestAllocator a;
     InterlacedRecorder refusing;
     refusing.accept = false;
@@ -313,10 +389,10 @@ static void test_interlaced_pictures() {
       std::vector<uint8_t> unit = interlaced_headers(true);
       const std::vector<uint8_t> frame = interlaced_frame(1, 2, false);
       unit.insert(unit.end(), frame.begin(), frame.end());
-      CHECK(!cpu.decode(ConstByteView(unit.data(), unit.size()), 0));
+      CHECK(cpu.decode(ConstByteView(unit.data(), unit.size()), 0));
       cpu.flush();
       VideoFrame f;
-      CHECK(!cpu.receive(&f));
+      CHECK(cpu.receive(&f) && f.format.width == 64 && f.format.height == 64);
     }
     CHECK(refusing.seen.empty());
   }
@@ -349,9 +425,18 @@ int main() {
   test_interlaced_pictures();
   static const char* const streams[] = {"simple_intra", "sm_intra", "sm_intra_lf", "sm_intra_q", "sm_intra_nu", "adv_intra", "adv_intra_lf", "adv_intra_odd", "sp_ipp", "sm_ipp", "sm_ipp_q", "sm_ipp_nu",
                                         "sm_ipb", "sm_ipb_f", "adv_ipp", "adv_ipb", "adv_ipp_odd", "adv_skip",
-                                        "adv_il_ipb", "adv_il_ipp", "adv_il_skip"};   // (the last three: an interlaced sequence whose frames are progressive)
+                                        "adv_il_ipb", "adv_il_ipp", "adv_il_skip",   // (an interlaced sequence whose frames are progressive)
+                                        "adv_fi_ipp", "adv_fi_mv", "adv_fi_b", "adv_fi_slices",    // (field pictures)
+                                        "adv_fr_i", "adv_fr_p", "adv_fr_b", "adv_fr_slices", "adv_fr_narrow",   // (interlaced frame pictures)
+                                        "adv_mix_a", "adv_mix_b", "adv_mix_odd",                   // (progressive, frame and field pictures in one sequence)
+                                        "main_rr_ipb", "main_rr_ipp",       // (range reduction: the pictures of FFmpeg with scripts/ffmpeg-vc1-range-reduction.patch)
+                                        "adv_rmap_p", "adv_rmap_il"};       // (range mapping)
   for (const char* name : streams) test_stream(name);
-  for (const char* name : {"sm_ipb_f", "sm_ipp_q", "adv_ipb", "adv_skip", "adv_ipp_odd", "sp_ipp", "adv_il_ipb"}) test_damaged(name);
+  for (const char* name : {"sm_ipb_f", "sm_ipp_q", "adv_ipb", "adv_skip", "adv_ipp_odd", "sp_ipp", "adv_il_ipb", "adv_fi_ipp", "adv_fi_mv", "adv_fi_b", "adv_fi_slices",
+                           "adv_fr_i", "adv_fr_p", "adv_fr_b", "adv_fr_slices", "adv_fr_narrow", "adv_mix_a", "adv_mix_b", "adv_mix_odd", "main_rr_ipb", "main_rr_ipp",
+                           "adv_rmap_p", "adv_rmap_il"})
+    test_damaged(name);
+  for (const char* name : {"adv_fi_ipp", "adv_fi_b", "adv_fi_slices", "adv_mix_a", "adv_mix_odd"}) test_damaged_fields(name);
   test_config();
   if (g_failed) {
     printf("%d check(s) failed\n", g_failed);

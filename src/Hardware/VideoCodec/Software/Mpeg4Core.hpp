@@ -168,7 +168,9 @@ class Core {
   void reconstruct_b_part(Mb& mb);
   int b_quant() const;
   bool decode_vop(ConstByteView body, int64_t pts);
+  bool decode_sprite(ConstByteView body, const VopHeader& h);
   bool configure(int width, int height);
+  bool size_planes(int width, int height);
   bool begin_picture(int64_t pts);
   void end_picture();
   void output_picture(Picture* p);
@@ -205,6 +207,7 @@ class Core {
   int global_vector(int component) const;
   void global_motion(const Picture& ref);
   // --- Mpeg4Recon.cpp
+  [[nodiscard]] bool warp_sprite(const VopHeader& h);
   void reconstruct(Mb& mb);
   void conceal(int from, int to);
   void motion(const Mb& mb, int dir, const Picture& ref, bool average, bool truncate = false);
@@ -229,6 +232,10 @@ class Core {
   Picture* returned_ = nullptr;
   Picture* ext_target_ = nullptr;        // decode_external's target while a plane is decoded
   bool need_intra_ = true;
+  // A static sprite layer (7.8): its sprite (the layer's I plane, at the sprite's size, whole macroblocks), which every S plane is warped from. It outlives
+  // reset() (a seek): the layer sends it once, before its first S plane; a new layer header drops it.
+  Picture sprite_;
+  bool sprite_ready_ = false;
   // A packed bitstream (DivX: an anchor and the B plane after it in one packet, then a placeholder packet): the B picture waits for the next packet and
   // takes its time, so that each picture carries the time of the packet that stands for it, as an unpacked stream's would.
   Picture* awaiting_time_ = nullptr;

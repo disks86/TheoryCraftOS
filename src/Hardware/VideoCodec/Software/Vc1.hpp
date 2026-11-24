@@ -19,8 +19,11 @@
 
 // A VC-1 video decoder on the CPU (SMPTE 421M): Simple and Main profile (WMV9) and Advanced profile bitstreams of progressive 4:2:0 frames - I, P, B and BI pictures,
 // 1MV and 4MV prediction, quarter and half sample motion, intensity compensation, all four transform sizes, bit planes, quantizer variations, overlap smoothing and the
-// in-loop filter. Not covered: interlaced content (field and frame coded pictures), range reduction and multiple resolution coding, sprites, pan-scan windows and
-// the Complex profile; streams that use one of them are refused. The pictures are bit exact with the reference decoders.
+// in-loop filter - of interlaced field pictures (a frame of two fields: I, P, B and BI fields, one or two reference fields, field intensity compensation, slices
+// in either field) and of interlaced frame pictures (I, P, B and BI frames: FIELDTX, 1MV, 2MV field, 4MV and 4MV field macroblocks, direct mode with field
+// vectors, intensity compensation, field by field overlap smoothing and in-loop filter), the three kinds mixed in one sequence. Not covered: range reduction and
+// multiple resolution coding, sprites, pan-scan windows and the Complex profile; streams that use one of them are refused. The pictures are bit exact with the
+// reference decoders.
 //
 // Input: for Simple and Main profile configure() is given the 4 byte sequence header (STRUCT_C of a Windows Media video track) and the picture size, and every decode()
 // is one frame as it is stored in the container. Advanced profile is the elementary stream with start codes (sequence header 0F, entry point 0E, frame 0D, slice 0B);

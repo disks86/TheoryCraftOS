@@ -250,6 +250,8 @@ bool Core::decode_mpeg4(ConstByteView data, int64_t pts) {
       Vol v;
       if (parse_vol_header(body, profile_and_level_, &v) && configure(static_cast<int>(v.width), static_cast<int>(v.height))) {
         if (!have_vol_ || short_header_) low_delay_ = v.low_delay;
+        if (v.static_sprite) low_delay_ = true;   // (an I plane, the sprite, then S planes only: no reordering)
+        sprite_ready_ = false;                    // (a static sprite layer sends its sprite right after the header)
         vol_ = v;
         for (int i = 0; i < 64; ++i) {
           intra_matrix_[kZigzag[i]] = v.intra_matrix[i];
@@ -305,6 +307,21 @@ bool Core::decode_vop(ConstByteView body, int64_t pts) {
   p.dc_threshold = kIntraDcThreshold[h.intra_dc_vlc_thr & 7];
   p.alternate_scan = h.alternate_vertical_scan;
   p.top_field_first = h.top_field_first;
+  if (vol_.static_sprite) {
+    // 7.8: the I plane is the sprite (decoded at its size, not shown); an S plane is the sprite warped, with nothing else coded. (parse_vop_header refuses
+    // P and B planes in such a layer.) S planes before the sprite (a stream cut at its start) give nothing.
+    pic_ = p;
+    if (h.type == VopType::I) return decode_sprite(body, h);
+    if (!sprite_ready_) return true;
+    if (!begin_picture(pts)) return false;
+    ArrayView<MbInfo>(cur_->mbs.data(), cur_->mbs.size()).fill(MbInfo{});
+    if (!warp_sprite(h)) {
+      cur_ = nullptr;   // (the picture goes back to the pool)
+      return false;
+    }
+    end_picture();
+    return true;
+  }
   if (p.type == kPictureB) {
     low_delay_ = false;   // the layer said otherwise, wrongly
     if (!anchor_[0] || !anchor_[1]) return true;
@@ -493,7 +510,43 @@ Core::ExternalStatus Core::decode_external_short(ConstByteView data, const Exter
   return status;
 }
 
+// The sprite of a static sprite layer: its I plane, decoded at the sprite's size (the per-macroblock state is sized for it meanwhile) into sprite_. A damaged
+// macroblock of it is grey: the pictures of the layer have another size, so nothing is copied from them.
+bool Core::decode_sprite(ConstByteView body, const VopHeader& h) {
+  sprite_ready_ = false;
+  const int layer_width = width_, layer_height = height_;
+  if (!size_planes(static_cast<int>(vol_.sprite_width), static_cast<int>(vol_.sprite_height))) {
+    (void)size_planes(layer_width, layer_height);
+    return false;
+  }
+  Picture* const anchors[2] = {anchor_[0], anchor_[1]};
+  anchor_[0] = anchor_[1] = nullptr;
+  ext_target_ = &sprite_;
+  const bool begun = begin_picture(0);
+  if (begun) {
+    BitReader br(body);
+    br.skip(static_cast<int>(h.header_bits));
+    decode_macroblocks(br);
+  }
+  ext_target_ = nullptr;
+  cur_ = nullptr;
+  anchor_[0] = anchors[0];
+  anchor_[1] = anchors[1];
+  if (!size_planes(layer_width, layer_height)) return false;
+  sprite_ready_ = begun;
+  return begun;
+}
+
 bool Core::configure(int width, int height) {
+  if (width == width_ && height == height_ && mb_count_ > 0) return true;
+  if (!size_planes(width, height)) return false;
+  out_format_ = VideoFormat{static_cast<uint32_t>(width), static_cast<uint32_t>(height), PixelFormat::I420};
+  reset();
+  return true;
+}
+
+// The per-macroblock state for planes of `width` x `height` (configure: the layer's; decode_sprite: a static sprite's for a while).
+bool Core::size_planes(int width, int height) {
   if (width <= 0 || height <= 0) return false;
   const int mb_w = (width + 15) / 16, mb_h = (height + 15) / 16;
   if (mb_w > kMaxMbWidth || mb_h > kMaxMbHeight) return false;
@@ -512,8 +565,6 @@ bool Core::configure(int width, int height) {
   mb_w_ = mb_w;
   mb_h_ = mb_h;
   mb_count_ = mb_w * mb_h;
-  out_format_ = VideoFormat{static_cast<uint32_t>(width), static_cast<uint32_t>(height), PixelFormat::I420};
-  reset();
   return true;
 }
 

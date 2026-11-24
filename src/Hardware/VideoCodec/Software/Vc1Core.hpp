@@ -84,33 +84,44 @@ struct SequenceHeader {
   bool panscanflag = false, refdist_flag = false, extended_dmv = false, hrd_param_flag = false;
   int hrd_num_leaky_buckets = 0;
   int max_coded_width = 0, max_coded_height = 0;
+  // Range mapping (entry point RANGE_MAPY / RANGE_MAPUV, 6.2.15 and 6.2.16): the output pictures are scaled by (value + 9) / 8 around 128; the references are not.
   bool range_mapy_flag = false, range_mapuv_flag = false;
+  int range_mapy = 0, range_mapuv = 0;
   // The size of the pictures (the container's for Simple and Main, the entry point's or the sequence's for Advanced) and what follows from it.
   int width = 0, height = 0, mb_width = 0, mb_height = 0;
 };
 
-// 7: the picture layer, for progressive pictures.
+// 7 and 9: the picture layer. A field interlace frame (two field pictures) has one of these per field while it is decoded: the second field's starts as a copy of
+// the frame's part (FCM, FPTYPE, TFF, RNDCTRL, UVSAMP, REFDIST, BFRACTION) and has its own from PQINDEX on.
 struct PictureHeader {
-  // Only a progressive frame is decoded here: for the other modes (frame interlace, and field interlace with its two field pictures) the header is read as far as the picture
-  // type and the engine takes the rest, so `type` is the frame's class (an I or P frame has an intra first field; a B frame has B or BI fields only) and none of the fields
-  // below it are filled in.
+  // Interlaced pictures that an engine (or a DXVA driver) decodes are read only as far as UVSAMP and the engine takes the rest: `type` is then the frame's class
+  // (an I or P frame has an intra first field; a B frame has B or BI fields only) and none of the fields below RNDCTRL are filled in.
   int fcm = kFcmProgressive;
   int fptype = 0;            // the field picture type (field interlace): first field class in bits 2:1, second in bits 2 and 0
+  bool tff = true, rff = false;
+  int rptfrm = 0;
   bool uvsamp = false;
   int type = kPictureI;
   bool skipped = false;      // a P picture that repeats the one before
   bool rangeredfrm = false;
   bool interpfrm = false;
   int bfraction_index = 0, bfraction = 0;
+  int refdist = 0, frfd = 0, brfd = 0;   // field pictures: the reference distance (REFDIST), and for B fields the forward and backward distances from it
   int rnd = 0;
   int pqindex = 0, pq = 0;
   bool halfpq = false, pquantizer = false;
-  int mvrange = 0, k_x = 0, k_y = 0, range_x = 0, range_y = 0;
+  int mvrange = 0, dmvrange = 0, k_x = 0, k_y = 0, range_x = 0, range_y = 0;
   int respic = 0;
   int mv_mode = kMv1Mv, mv_mode2 = kMv1Mv;
   int lumscale = 32, lumshift = 0;
+  int lumscale2 = 32, lumshift2 = 0;   // field pictures: the bottom reference field's (the first pair is the top one's)
+  int intcompfield = 0;                // field pictures: which reference fields are compensated (bit 0 top, bit 1 bottom)
   bool use_ic = false;       // intensity compensation of the reference picture
   bool quarter_sample = true, mspel = true;
+  int numref = 0, reffield = 0;        // P fields: two reference fields, else which one (0 the closest)
+  int mbmodetab = 0, imvtab = 0, icbptab = 0, fourmvbptab = 0;   // interlaced pictures: the macroblock mode, motion vector, coded block and 4MV block pattern tables
+  int twomvbptab = 0;                  // interlaced frame pictures: the 2MV block pattern table
+  bool fourmvswitch = false;           // interlaced frame P pictures: macroblocks can have four vectors (4MVSWITCH)
   int tt_index = 0;
   bool ttmbf = true;
   int ttfrm = kTt8x8;
@@ -123,7 +134,7 @@ struct PictureHeader {
   int condover = kCondOverNone;
   int postproc = 0;
   // The bit planes (stored in the Core), and whether each is raw: coded bit by bit in the macroblock layer.
-  bool mv_type_raw = false, skip_raw = false, direct_raw = false, acpred_raw = false, overflags_raw = false;
+  bool mv_type_raw = false, skip_raw = false, direct_raw = false, acpred_raw = false, overflags_raw = false, forward_raw = false, fieldtx_raw = false;
 };
 
 // A decoded frame.
@@ -135,8 +146,27 @@ struct Picture {
   int type = kPictureI;
   bool in_use = false;           // not available for a new picture
   bool output_pending = false;   // in the output queue
-  Mem<int16_t> direct_mv;        // per macroblock: the motion vector direct mode scales (the one of the first luma block; zero for intra)
+  Mem<int16_t> direct_mv;        // per macroblock: the motion vector direct mode scales (the one of the first luma block; zero for intra). Two field pictures: the first
+                                 // field's macroblocks, then the second's (by decoding order)
+  Mem<uint8_t> mb_flags;         // field pictures, per macroblock as direct_mv: bit 0 intra, bits 1 to 4 the vector of luma block 0 to 3 refers to the opposite field
+  Mem<int16_t> direct_mv_bottom; // interlaced frame pictures, per macroblock: the vector of luma block 2 (direct_mv has block 0's), for the field vectors of direct mode
+  bool interlaced = false;       // coded as fields or as an interlaced frame: a reference read field by field
+  bool field_coded = false;      // two field pictures
+  // What turns the reconstruction (which stays the reference) into the output picture: range reduction (RANGEREDFRM: the planes are in reduced range and the output
+  // is scaled up, 8.1.1.4) and range mapping (the entry point's RANGE_MAPY / RANGE_MAPUV in force when the picture was decoded, -1: none).
+  bool range_reduced = false;
+  int range_map_y = -1, range_map_uv = -1;
+  Mem<uint8_t> out_plane[3];     // the output picture when it differs from the reconstruction (filled by the Core's own output; same layout as `plane`)
+  bool out_mapped = false;       // out_plane holds the output
 };
+
+// The sample mapping from a picture's reconstruction to its output (range reduction, then range mapping): `any` is false when the output is the reconstruction.
+struct OutputMap {
+  bool any = false;
+  uint8_t y[256];
+  uint8_t uv[256];
+};
+[[nodiscard]] OutputMap output_map(const Picture& picture);
 
 // What an offload (a hardware decoder) is given for each picture: the headers, the pictures it refers to (by slot: the index in the Core's pool) and the picture's
 // data: the frame unit and its slice units, as they are in the stream (Advanced profile: each behind its start code; Simple and Main: the frame as stored).
@@ -155,6 +185,7 @@ struct OffloadPicture {
   int anchor_slot[2] = {-1, -1};               // the older and the newer anchor picture when this one starts: the pictures an offload must still hold
   ArrayView<const ConstByteView> units;
   ArrayView<const UnitInfo> unit_info;         // one per unit
+  const PictureHeader* second_field = nullptr; // a field interlace frame: the second field's header (`pic` is the first field's, which describes the frame)
   // The bit planes the picture codes (one byte per macroblock, 0 or 1, in raster order); empty for a plane that is not there or is coded in the macroblock layer ("raw").
   ArrayView<const uint8_t> skip_plane, mv_type_plane, direct_plane, acpred_plane, overflags_plane;
   // Intensity compensation of the forward reference (set by the P picture that follows it, and in force for the B pictures between): the 6 bit scale and shift of the header.
@@ -300,6 +331,16 @@ class Core {
   }
   void set_frame_observer(IFrameObserver* observer) { observer_ = observer; }
 
+  // Intensity compensation tables (the model of the reference decoder, which the reference pictures follow): for each reference field (or line parity of a frame)
+  // a luma and a chroma table, and whether they are in force. Updates chain onto what is there.
+  struct IcLuts {
+    uint8_t y[2][256];
+    uint8_t uv[2][256];
+    bool use = false;
+  };
+  // Tables that leave the samples as they are.
+  static void identity_luts(IcLuts& luts);
+
   // Decoding for a DXVA driver (src/Hardware/VideoCodec/Dxva/DxvaVc1.cpp): the caller gives the sequence (and entry point) layer as a SequenceHeader, keeps the
   // pictures and says which ones a picture is decoded into and predicted from; the picture is decoded at once (decoding order) and nothing goes to the output
   // queue. A Core used this way is used only this way.
@@ -308,31 +349,71 @@ class Core {
     Picture* forward = nullptr;    // P: the anchor it predicts from (a skipped P picture: the one it repeats); B: the older anchor
     Picture* backward = nullptr;   // B: the newer anchor (its direct mode vectors are used too). Every reference the type needs must be given.
     int rnd = -1;                  // Simple and Main profile: the picture's rounding control (DXVA's bRcontrol); -1: the decoder's own history
-    // B pictures: the intensity compensation of the forward reference, which the P picture of the backward anchor set.
-    bool ic_forward = false;
-    int ic_scale = 32, ic_shift = 0;
+    // What part of a frame the picture is (DXVA's bPicStructure and bSecondField): the whole frame (progressive, or an interlaced frame picture), or the first or
+    // the second field of a field interlace frame. A second field comes right after its first field and goes into the same target; what the first field's
+    // header says of the frame (FPTYPE, TFF, RNDCTRL, REFDIST, BFRACTION ...) is kept from that call.
+    enum class Part : uint8_t { Frame, FirstField, SecondField };
+    Part part = Part::Frame;
+    int refdist = -1;              // B field pictures: the REFDIST of the pair (DXVA's bMV_RPS - 9: it is in an earlier frame's header); -1: the last one read here
+    // Intensity compensation is a modification of the reference pictures (DXVA's "reference picture modification"): each picture the caller keeps has tables its
+    // samples are read through, and the Core updates them as the reference decoder does - a P picture (or field) chains its compensation onto its forward
+    // reference's tables, the second field of a P frame onto those of its first field. Null: tables that leave the samples as they are.
+    IcLuts* forward_ic = nullptr;          // in and out: the forward reference's
+    const IcLuts* backward_ic = nullptr;   // in: the backward reference's (B pictures)
+    IcLuts* target_ic = nullptr;           // out: the target's (in as well for a second field: what the first field left)
   };
-  enum class ExternalStatus : uint8_t { Decoded, BadSequence, BadPicture, Interlaced, NoMemory };
-  // `data`: one frame, as decode() takes it (Advanced profile: the frame unit and its slice units with their start codes, or the frame without a start code; a
-  // sequence header or entry point unit in front is skipped: `seq` is what is in force). `header` receives the picture header the frame has (its type, whether it
-  // is skipped, its intensity compensation) also when the picture is refused after the header was read.
+  enum class ExternalStatus : uint8_t { Decoded, BadSequence, BadPicture, Structure, NoMemory };
+  // `data`: one picture, as decode() takes a frame (Advanced profile: the frame unit and its slice units with their start codes, or the frame without a start code;
+  // a sequence header or entry point unit in front is skipped: `seq` is what is in force). The first field of a field interlace frame is its frame unit and the
+  // first field's slices; the second field is the field unit (start code 0C, or no start code) and its slices. `header` receives the picture header (a field's own,
+  // with its type, whether it is skipped, its intensity compensation) also when the picture is refused after the header was read. Structure: the bitstream's
+  // frame coding mode is not the part given (a field picture sent as a frame, or the other way round), or a second field without its first field.
   [[nodiscard]] ExternalStatus decode_external(const SequenceHeader& seq, ConstByteView data, const ExternalPicture& picture, PictureHeader* header);
 
+  // A unit of a frame as decode() found it: its start code (0x0D for the frame itself, also when it has none), the bits with the emulation prevention bytes removed,
+  // and the unit as it is in the stream.
+  struct Part {
+    uint32_t code = 0;
+    ConstByteView data, raw;
+  };
+
  private:
+  // Where a picture header is read from: the frame's, a slice's (SLICE_ADDR then PIC_HEADER_FLAG set: the whole picture header again), the second field's (after
+  // the field start code: it starts at PQINDEX).
+  enum class HeaderAt : uint8_t { Frame, Slice, SecondField };
+  // A reference for motion compensation: the picture, which of its fields (-1: the frame) and the tables its samples go through (null: none).
+  struct RefSel {
+    const Picture* pic = nullptr;
+    int field = -1;
+    const IcLuts* ic = nullptr;
+  };
+
   // --- Vc1Syntax.cpp
   bool build_vlcs();
   bool parse_sequence_sm(BitReader& br);
   bool parse_sequence_adv(BitReader& br);
   bool parse_entry_point(BitReader& br);
-  bool parse_picture_header(BitReader& br);
-  bool decode_bitplane(BitReader& br, Buf<uint8_t>* plane, bool* raw);
-  bool decode_dquant(BitReader& br);
+  [[nodiscard]] bool parse_picture_header(BitReader& br, HeaderAt at);
+  [[nodiscard]] bool decode_bitplane(BitReader& br, Buf<uint8_t>* plane, bool* raw);
+  [[nodiscard]] bool decode_dquant(BitReader& br);
   bool setup_sequence();
-  bool decode_frame(ConstByteView frame, ArrayView<const ConstByteView> slices, ArrayView<const ConstByteView> raw_units);
+  bool decode_frame(ArrayView<const Part> parts, ArrayView<const ConstByteView> raw_units);
+  [[nodiscard]] bool walk_progressive_slices(BitReader& br, ArrayView<const Part> parts);
+  [[nodiscard]] bool decode_field_pair(BitReader& br, ArrayView<const Part> parts, bool first_only);
+  [[nodiscard]] bool decode_second_field_external(ArrayView<const Part> parts, const PictureHeader& first);
+  void begin_field(bool second);
+  void finish_field();
   bool start_picture();
   void finish_picture(ArrayView<const ConstByteView> units);
   void output_picture(Picture* p);
   Picture* find_free_picture();
+  void reset_picture_state();
+  // intensity compensation
+  void rotate_luts(int type);
+  static void init_lut(int lumscale, int lumshift, IcLuts& luts, int field, bool chain);
+  void prepare_range_scaling();
+  [[nodiscard]] bool make_output(Picture* p);
+  IcLuts& ic_curr() { return ic_curr_is_aux_ ? ic_aux_ : ic_next_; }
   // --- Vc1Block.cpp
   bool decode_slice_blocks(BitReader& br, int start_mb_y, int end_mb_y);
   void select_coding_sets(bool intra_picture);
@@ -340,6 +421,14 @@ class Core {
   bool decode_i_mb_adv(BitReader& br);
   bool decode_p_mb(BitReader& br);
   bool decode_b_mb(BitReader& br);
+  bool decode_p_mb_field(BitReader& br);
+  bool decode_b_mb_field(BitReader& br);
+  bool decode_field_intra_mb(BitReader& br, int idx_mbmode, bool put_now);
+  bool decode_p_mb_frame(BitReader& br);
+  bool decode_b_mb_frame(BitReader& br);
+  bool decode_frame_intra_mb(BitReader& br, bool put_now);
+  void pred_mv_frame(int n, int dmv_x, int dmv_y, int mvn, int dir);
+  bool decode_field_residual(BitReader& br, int cbp, int mquant, uint32_t* block_cbp, uint32_t* block_tt);
   bool decode_mquant(BitReader& br, int* mquant);
   bool decode_ac_coeff(BitReader& br, int* last, int* skip, int* value, int codingset);
   bool decode_i_block(BitReader& br, int16_t* block, int n, bool coded, int codingset);
@@ -347,23 +436,28 @@ class Core {
   bool decode_intra_block(BitReader& br, int16_t* block, int n, bool coded, int mquant, int codingset);
   int decode_p_block(BitReader& br, int16_t* block, int n, int mquant, int ttmb, bool first_block, ByteView plane, uint64_t offset, int stride, uint32_t* ttmb_out);
   bool read_mvdata(BitReader& br, int* dmv_x, int* dmv_y, bool* has_coeffs, bool* intra);
+  bool read_mvdata_interlaced(BitReader& br, int* dmv_x, int* dmv_y, int* pred_flag);
   int pred_dc(int n, int quant, bool a_avail, bool c_avail, int16_t** dc_val, int* dir);
   int pred_dc_i(int n, int16_t** dc_val, int* dir);
   int coded_block_pred(int n, int diff);
   void pred_mv(BitReader& br, int n, int dmv_x, int dmv_y, bool mv1, int r_x, int r_y);
+  void pred_mv_field(BitReader& br, int n, int dmv_x, int dmv_y, bool mv1, int pred_flag, int dir);
+  int scale_for_same(int value, int dim, int dir) const;
+  int scale_for_opp(int value, int dim, int dir) const;
   void pred_b_mv(int dmv_x[2], int dmv_y[2], bool direct, int mvtype);
+  [[nodiscard]] bool pred_b_mv_field(int n, int dmv_x[2], int dmv_y[2], bool mv1, int pred_flag[2]);
   void block_target(int n, int* plane, uint64_t* offset, int* stride) const;
   void keep_intra_block(int n, const int16_t* block);
+  uint64_t field_mb_index(uint64_t mb_pos) const { return (second_field_ ? static_cast<uint64_t>(mb_w_) * static_cast<uint64_t>(mb_rows_) : 0) + mb_pos; }
   // --- Vc1Recon.cpp
-  const Picture* reference_for(int dir) const;
-  // Intensity compensation of the forward reference: a P picture's own, kept for the B pictures that follow it (they predict from the compensated reference too).
-  bool ic_use_ = false;
-  int ic_scale_ = 32, ic_shift_ = 0;
-  void make_refs(const Picture* ref, bool use_ic, void* luma, void* cb, void* cr) const;
-  void predict_mb(const Picture* ref, bool use_ic, int mx, int my, int uvmx, int uvmy, bool avg);
+  RefSel reference_for(int dir, int ref_field) const;
+  void predict_mb(const RefSel& ref, int mx, int my, int uvmx, int uvmy, bool avg);
   void mc_1mv(int dir);
-  void mc_4mv_luma(int n);
-  void mc_4mv_chroma();
+  void mc_4mv_luma(int n, int dir);
+  void mc_4mv_chroma(int dir);
+  void mc_4mv_luma_frame(int n, int dir, bool avg);
+  void mc_4mv_chroma_frame(int dir, int dir2, bool avg);
+  void store_frame_direct_mv(int n, int mx, int my);
   void interp_mc();
   void b_mc(bool direct, int mode);
   int16_t* mb_block(int mx, int my, int n) const;
@@ -373,6 +467,13 @@ class Core {
   void put_intra_blocks(bool signed_put);
   void loop_filter_i();
   void loop_filter_p();
+  void loop_filter_b_field();
+  void overlap_filter_frame(bool intra_picture);
+  void loop_filter_i_frame();
+  void loop_filter_inter_frame();
+  bool frame_interlace() const { return pic_.fcm == kFcmFrameInterlace; }
+  bool mb_fieldtx(int mx, int my) const;
+  ByteView dst_plane(int c) const { return ByteView(cur_->plane[c].data(), cur_->plane[c].size()); }
 
   // --- state
   allocators::IAllocator& allocator_;
@@ -392,25 +493,48 @@ class Core {
   bool low_delay_ = true;
   int rnd_ = 0;                               // the rounding control of Simple and Main profile (toggles at each P picture)
 
+  // Intensity compensation as an offload is told of it: a P picture's own, kept for the B pictures that follow it (they predict from the compensated reference too).
+  bool ic_use_ = false;
+  int ic_scale_ = 32, ic_shift_ = 0;
+  // ... and the tables the CPU decoder reads its references through: `last` for the forward reference, `next` for the backward one (and, in a P frame, for the
+  // current frame's first field as its second field sees it), `aux` for the first field of a B frame as its second field sees it.
+  IcLuts ic_last_, ic_next_, ic_aux_;
+  bool ic_curr_is_aux_ = false;
+  // Range reduction (Simple and Main profile, 8.3.4.11 and 8.4.4.14): a reference whose RANGEREDFRM is not the current picture's is read scaled (down or up), before
+  // its intensity compensation; per direction, the tables of both together (in force when range_scale_[dir]).
+  IcLuts range_luts_[2];
+  bool range_scale_[2] = {false, false};
+
   IOffload* offload_ = nullptr;
   IFrameObserver* observer_ = nullptr;
   const ExternalPicture* ext_ = nullptr;      // decode_external's picture while it is decoded
+  // decode_external: the first field just decoded, which the next call may complete (its target and its header)
+  bool pair_open_ = false;
+  const Picture* pair_target_ = nullptr;
+  PictureHeader pair_header_;
+  PictureHeader second_header_;               // the second field's header of the last field pair decoded (for the observer)
   bool offloaded_ = false;
   VideoFormat out_format_;
 
   // tables
   bool vlcs_ready_ = false;
   Vlc vlc_imode_, vlc_norm2_, vlc_norm6_, vlc_intra_cbpcy_, vlc_ac_[8], vlc_dc_[2][2], vlc_cbpcy_[4], vlc_ttmb_[3], vlc_ttblk_[3], vlc_subblkpat_[3], vlc_mv_diff_[4];
+  // interlaced pictures (the frame picture ones too)
+  Vlc vlc_if_mmv_mbmode_[8], vlc_if_1mv_mbmode_[8], vlc_mvdata1_[4], vlc_mvdata2_[8], vlc_icbpcy_[8], vlc_4mvbp_[4], vlc_2mvbp_[4], vlc_intfr_4mv_mbmode_[4],
+      vlc_intfr_non4mv_mbmode_[4];
   uint8_t zz_8x8_[4][64];
+  uint8_t zzi_8x8_[64];   // the 8x8 scan of interlaced pictures (transposed too)
   const uint8_t* zz_8x4_ = nullptr;
   const uint8_t* zz_4x8_ = nullptr;
 
   // bit planes of the picture being decoded (one byte per macroblock)
-  Buf<uint8_t> plane_skip_, plane_mvtype_, plane_direct_, plane_acpred_, plane_overflags_;
+  Buf<uint8_t> plane_skip_, plane_mvtype_, plane_direct_, plane_acpred_, plane_overflags_, plane_forward_;
+  Buf<uint8_t> plane_fieldtx_;   // interlaced frame pictures: the macroblock's luma blocks are fields (FIELDTX; P and B pictures: from the macroblock mode)
   List<UnitInfo> unit_infos_;
 
   // picture decoding state
   int mb_w_ = 0, mb_h_ = 0;
+  int mb_rows_ = 0;                            // the macroblock rows of the picture being decoded (a field: half the frame's, rounded up)
   int mb_x_ = 0, mb_y_ = 0;
   int start_mb_y_ = 0, end_mb_y_ = 0;
   bool first_slice_line_ = true;
@@ -421,13 +545,27 @@ class Core {
   int a_avail_ = 0, c_avail_ = 0;
   bool ac_pred_ = false;
   int ref_w_ = 0, ref_h_ = 0;                  // the size motion vectors are clamped to
+  // Field pictures: the picture is a field, which one in decoding order, its parity (0 top, 1 bottom), the parity of the field each direction's vector refers to,
+  // and the prediction type of the B macroblock being decoded.
+  bool field_mode_ = false;
+  bool second_field_ = false;
+  int refdist_ = 0;                            // REFDIST of the last field pair that had it (B field pairs use it)
+  int cur_field_ = 0;
+  int ref_field_[2] = {0, 0};
+  int bmvtype_ = kBmvBackward;
+  // Where the picture being decoded starts in the planes of cur_ and the distance of its lines (a field: every other line of the frame).
+  uint64_t dst_off_[3] = {0, 0, 0};
+  int dst_stride_[3] = {0, 0, 0};
   Buf<uint8_t> slice_start_row_;                // per macroblock row: the row starts a slice
   Buf<int8_t> qscale_;                          // per macroblock: the quantizer, negative for "no half step"
   Buf<uint8_t> intra_mask_;                     // per macroblock: bit i set when block i is intra
   Buf<uint32_t> cbp_blocks_, ttblk_;            // per macroblock: the coded sub-blocks of each block (4 bits each), the transform types
   Buf<int16_t> mv_;                             // per 8x8 luma block (2 mb_w by 2 mb_h), x and y: the vector of the forward direction
   Buf<int16_t> mv_back_;                        // the same for the backward direction (B pictures)
+  Buf<uint8_t> mv_f_[2];                        // field pictures, per 8x8 luma block and direction: the vector refers to the opposite field
   Buf<int16_t> uvmv_;                           // per macroblock: the chroma vector
+  Buf<uint8_t> uvmv_f_;                         // field pictures, per macroblock: the forward chroma vector refers to the opposite field
+  Buf<uint8_t> blk_mv_type_;                    // interlaced frame pictures, per 8x8 luma block: its vector is a field vector (2MV or 4MV field macroblocks)
   Buf<int16_t> dc_[3];                          // the quantized DC values of the blocks (luma 2 mb_w by 2 mb_h, chroma mb_w by mb_h)
   Buf<int16_t> ac_[3];                          // 16 values per block: the AC prediction values
   Buf<uint8_t> coded_;                          // luma blocks: the coded block flags, for prediction
