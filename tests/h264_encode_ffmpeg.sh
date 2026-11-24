@@ -16,24 +16,33 @@
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 #
 # The H.264 picture encoder (src/Hardware/VideoCodec/Software/H264PictureEncoder, what Direct3D 12's video encoder runs on) checked against ffmpeg: tests/VideoEncodeTest
-# writes an IDR P B B P B B stream (three slices a picture, constrained intra prediction, the program's own parameter sets) with its reconstruction and its source;
-# ffmpeg's decode must be the reconstruction byte for byte, and the PSNR against the source is printed.
+# writes its sequences (the program's own parameter sets; CAVLC and CABAC, the 8x8 transform and Intra8x8, B_Skip / B_Direct_16x16 with spatial and temporal direct
+# prediction, slices by rows, macroblocks, count and bytes, intra refresh, cropped sizes, unchanged macroblocks, motion hints) with their reconstructions and sources;
+# ffmpeg's decode of each must be the reconstruction byte for byte, and the PSNR against the source is printed.
 # Usage: tests/h264_encode_ffmpeg.sh      (needs ffmpeg; uses $TMPDIR)
 set -euo pipefail
 cd "$(dirname "$0")/.."
 work=${TMPDIR:-/tmp}/tcos-h264-encode
+rm -rf "$work"
 mkdir -p "$work"
 TMPDIR="$work" tests/run_host_tests.sh VideoEncodeTest >/dev/null
 "$work/tcos-host-tests/VideoEncodeTest" "$work" | tail -1
-ffmpeg -v error -threads 1 -i "$work/stream.h264" -f rawvideo -pix_fmt yuv420p -y "$work/ffmpeg.yuv"
-frames=$(( $(stat -c %s "$work/ffmpeg.yuv") / (96 * 64 * 3 / 2) ))
-same=0
-if cmp -s "$work/ffmpeg.yuv" "$work/recon.yuv"; then
-  echo "ffmpeg decodes $frames pictures to the encoder's reconstruction, byte for byte"
-  same=1
-else
-  echo "ffmpeg's decode differs from the reconstruction"
-fi
-ffmpeg -hide_banner -f rawvideo -pix_fmt yuv420p -s 96x64 -i "$work/ffmpeg.yuv" -f rawvideo -pix_fmt yuv420p -s 96x64 -i "$work/source.yuv" -lavfi psnr -f null - 2>&1 |
-  grep -o "PSNR y:[^ ]* u:[^ ]* v:[^ ]* average:[^ ]*" || true
-[ "$same" = 1 ] && [ "$frames" = 7 ]
+failed=0 count=0
+for info in "$work"/*.size; do
+  name=$(basename "$info" .size)
+  read -r size frames < "$info"
+  ffmpeg -v error -threads 1 -i "$work/$name.h264" -f rawvideo -pix_fmt yuv420p -y "$work/$name.ffmpeg.yuv"
+  w=${size%x*} h=${size#*x}
+  got=$(( $(stat -c %s "$work/$name.ffmpeg.yuv") / (w * h * 3 / 2) ))
+  psnr=$(ffmpeg -hide_banner -f rawvideo -pix_fmt yuv420p -s "$size" -i "$work/$name.ffmpeg.yuv" -f rawvideo -pix_fmt yuv420p -s "$size" -i "$work/$name.source.yuv" \
+           -lavfi psnr -f null - 2>&1 | grep -o "average:[^ ]*" || true)
+  count=$((count + 1))
+  if cmp -s "$work/$name.ffmpeg.yuv" "$work/$name.recon.yuv" && [ "$got" = "$frames" ]; then
+    echo "$name ($size): ffmpeg decodes $got pictures to the encoder's reconstruction, byte for byte ($psnr)"
+  else
+    echo "$name ($size): ffmpeg's decode ($got of $frames pictures) differs from the reconstruction"
+    failed=$((failed + 1))
+  fi
+done
+echo "$((count - failed)) of $count streams match"
+[ "$failed" = 0 ] && [ "$count" -gt 0 ]

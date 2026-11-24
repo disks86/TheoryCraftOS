@@ -204,13 +204,14 @@ static HRESULT STDMETHODCALLTYPE vproc_GetInputStreamDescs(VProc *This, UINT cou
 }
 static D3D12_VIDEO_PROCESS_OUTPUT_STREAM_DESC *STDMETHODCALLTYPE vproc_GetOutputStreamDesc(VProc *This, D3D12_VIDEO_PROCESS_OUTPUT_STREAM_DESC *ret) { *ret = This->out; return ret; }
 
-/* ---- ID3D12VideoDevice .. 3 -------------------------------------------------------------------------------------------------------------------------------------- */
+/* ---- ID3D12VideoDevice .. 4 -------------------------------------------------------------------------------------------------------------------------------------- */
 
-static Dev *dev_of_video(ID3D12VideoDevice3 *v) { return (Dev *)((BYTE *)v - offsetof(Dev, video)); }
+static Dev *dev_of_video(ID3D12VideoDevice3 *v) { return (Dev *)((BYTE *)v - offsetof(Dev, video)); }   /* (ID3D12VideoDevice4 starts as 3 does) */
 
 /* The device answers the video device's interfaces with its second face. */
 static HRESULT STDMETHODCALLTYPE dev_QueryInterface(Dev *This, REFIID riid, void **out) {
-  if (out && riid && (guid_eq(riid, &IID_ID3D12VideoDevice) || guid_eq(riid, &IID_ID3D12VideoDevice1) || guid_eq(riid, &IID_ID3D12VideoDevice2) || guid_eq(riid, &IID_ID3D12VideoDevice3))) {
+  if (out && riid && (guid_eq(riid, &IID_ID3D12VideoDevice) || guid_eq(riid, &IID_ID3D12VideoDevice1) || guid_eq(riid, &IID_ID3D12VideoDevice2) || guid_eq(riid, &IID_ID3D12VideoDevice3) ||
+                         guid_eq(riid, &IID_ID3D12VideoDevice4))) {
     dx_AddRef(OBJ(This));
     *out = &This->video;
     return S_OK;
@@ -226,7 +227,7 @@ static HRESULT venc_feature(Dev *d, D3D12_FEATURE_VIDEO feature, void *data, UIN
 static HRESULT vme_make(Dev *d, const D3D12_VIDEO_MOTION_ESTIMATOR_DESC *desc, ID3D12ProtectedResourceSession *session, REFIID riid, void **out);
 static HRESULT vmvh_make(Dev *d, const D3D12_VIDEO_MOTION_VECTOR_HEAP_DESC *desc, ID3D12ProtectedResourceSession *session, REFIID riid, void **out);
 static HRESULT venc_make(Dev *d, const D3D12_VIDEO_ENCODER_DESC *desc, REFIID riid, void **out);
-static HRESULT veheap_make(Dev *d, const D3D12_VIDEO_ENCODER_HEAP_DESC *desc, REFIID riid, void **out);
+static HRESULT veheap_make(Dev *d, const D3D12_VIDEO_ENCODER_HEAP_DESC1 *desc, REFIID riid, void **out);
 
 #define VIDEO_FEATURE(type) do { if (size != sizeof(type)) return E_INVALIDARG; } while (0)
 static HRESULT STDMETHODCALLTYPE vdev_CheckFeatureSupport(ID3D12VideoDevice3 *v, D3D12_FEATURE_VIDEO feature, void *data, UINT size) {
@@ -491,7 +492,14 @@ static HRESULT STDMETHODCALLTYPE vdev_ExecuteExtensionCommand(ID3D12VideoDevice3
   return E_INVALIDARG;      /* (no extension command can have been made) */
 }
 static HRESULT STDMETHODCALLTYPE vdev_CreateVideoEncoder(ID3D12VideoDevice3 *v, const D3D12_VIDEO_ENCODER_DESC *desc, REFIID riid, void **out) { return venc_make(dev_of_video(v), desc, riid, out); }
-static HRESULT STDMETHODCALLTYPE vdev_CreateVideoEncoderHeap(ID3D12VideoDevice3 *v, const D3D12_VIDEO_ENCODER_HEAP_DESC *desc, REFIID riid, void **out) { return veheap_make(dev_of_video(v), desc, riid, out); }
+static HRESULT STDMETHODCALLTYPE vdev_CreateVideoEncoderHeap(ID3D12VideoDevice3 *v, const D3D12_VIDEO_ENCODER_HEAP_DESC *desc, REFIID riid, void **out) {
+  if (!desc) { if (out) *out = NULL; return E_INVALIDARG; }
+  /* (HEAP_DESC1 is HEAP_DESC with Pow2DownscaleFactor after it) */
+  D3D12_VIDEO_ENCODER_HEAP_DESC1 d1 = {desc->NodeMask, desc->Flags, desc->EncodeCodec, desc->EncodeProfile, desc->EncodeLevel, desc->ResolutionsListCount, desc->pResolutionList, 0};
+  return veheap_make(dev_of_video(v), &d1, riid, out);
+}
+/* ID3D12VideoDevice4 */
+static HRESULT STDMETHODCALLTYPE vdev_CreateVideoEncoderHeap1(ID3D12VideoDevice3 *v, const D3D12_VIDEO_ENCODER_HEAP_DESC1 *desc, REFIID riid, void **out) { return veheap_make(dev_of_video(v), desc, riid, out); }
 
 /* ---- the video command lists ------------------------------------------------------------------------------------------------------------------------------------- */
 
@@ -500,12 +508,12 @@ static const GUID *const g_vdlist_iids[] = {&IID_ID3D12Object, &IID_ID3D12Device
 static const GUID *const g_vplist_iids[] = {&IID_ID3D12Object, &IID_ID3D12DeviceChild, &IID_ID3D12CommandList, &IID_ID3D12VideoProcessCommandList, &IID_ID3D12VideoProcessCommandList1,
                                             &IID_ID3D12VideoProcessCommandList2, &IID_ID3D12VideoProcessCommandList3, NULL};
 static const GUID *const g_velist_iids[] = {&IID_ID3D12Object, &IID_ID3D12DeviceChild, &IID_ID3D12CommandList, &IID_ID3D12VideoEncodeCommandList, &IID_ID3D12VideoEncodeCommandList1,
-                                            &IID_ID3D12VideoEncodeCommandList2, &IID_ID3D12VideoEncodeCommandList3, NULL};
+                                            &IID_ID3D12VideoEncodeCommandList2, &IID_ID3D12VideoEncodeCommandList3, &IID_ID3D12VideoEncodeCommandList4, NULL};
 
 static HRESULT video_list_make(Dev *This, D3D12_COMMAND_LIST_TYPE type, REFIID riid, void **out) {
   extern const ID3D12VideoDecodeCommandList3Vtbl vdlist_vtbl;
   extern const ID3D12VideoProcessCommandList3Vtbl vplist_vtbl;
-  extern const ID3D12VideoEncodeCommandList3Vtbl velist_vtbl;
+  extern const ID3D12VideoEncodeCommandList4Vtbl velist_vtbl;
   if (out) *out = NULL;
   const int decode = type == D3D12_COMMAND_LIST_TYPE_VIDEO_DECODE, encode = type == D3D12_COMMAND_LIST_TYPE_VIDEO_ENCODE;
   CmdList *l = dobj_new(sizeof *l, This, decode ? (const void *)&vdlist_vtbl : encode ? (const void *)&velist_vtbl : (const void *)&vplist_vtbl,

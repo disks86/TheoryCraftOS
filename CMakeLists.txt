@@ -1311,6 +1311,7 @@ add_executable(BOOTX64
   src/Hardware/VideoCodec/Software/H264Dpb.cpp
   src/Hardware/VideoCodec/Software/H264Encoder.cpp
   src/Hardware/VideoCodec/Software/H264PictureEncoder.cpp
+  src/Hardware/VideoCodec/Software/H264PictureEncoderSyntax.cpp
   src/Hardware/VideoCodec/Software/MotionEstimator.cpp
   src/Hardware/VideoCodec/Software/VideoRateControl.cpp
   src/Hardware/VideoCodec/Software/H264Macroblock.cpp
