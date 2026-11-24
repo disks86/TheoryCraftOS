@@ -656,6 +656,7 @@ add_executable(BOOTX64
   src/Graphics/Graphics3D/Vega/VegaGraphicsDevice.cpp
   src/Hardware/GraphicsProcessingUnit/QEMU/QemuStdVgaGpu.cpp
   src/Hardware/GraphicsProcessingUnit/Virtio/VirtioGpu.cpp
+  src/Graphics/VirtGpu/VirtGpuSession.cpp
   src/Hardware/GraphicsProcessingUnit/VMware/VmwareSvgaGpu.cpp
   src/Graphics/Graphics2D/ScaledRenderer2D.cpp
   src/Graphics/Graphics2D/MultiScaleRenderer2D.cpp
@@ -924,6 +925,7 @@ add_executable(BOOTX64
   src/Process/WindowsAudio.cpp
   src/Process/WindowsCabinet.cpp
   src/Process/WindowsGamepad.cpp
+  src/Process/WindowsVirtGpu.cpp
   src/Process/WindowsMemory.cpp
   src/Process/WindowsSockets.cpp
   src/Process/WindowsUnixSockets.cpp
@@ -987,6 +989,7 @@ add_executable(BOOTX64
   src/Process/LinuxSignals.cpp
   src/Process/LinuxVdso.cpp
   src/Process/LinuxInput.cpp
+  src/Process/LinuxRenderNode.cpp
   src/Process/ProcessFiles.cpp
   src/Process/WindowsFiles.cpp
   src/Process/ProgramEnvironment.cpp

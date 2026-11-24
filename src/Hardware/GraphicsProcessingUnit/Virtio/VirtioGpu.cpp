@@ -23,6 +23,7 @@
 #include "Kernel/Delay.hpp"
 #include "console.hpp"
 #include "Utility/AllocatedView.hpp"
+#include "Utility/ByteBuffer.hpp"
 
 namespace hardware {
 
@@ -48,41 +49,61 @@ ControlHeader header(uint32_t type) {
 }
 }  // namespace
 
-uint32_t VirtioGpu::execute(ConstByteView request, ByteView response, bool fence) {
-  if (!ready_ || request.size() < sizeof(ControlHeader) || request.size() > request_.size()) return 0;
+bool VirtioGpu::lock_for_command() {
   // A caller with interrupts masked (the console draws under its spinlock) must not block on the mutex while another thread has a command out: it looks
   // for the mutex again instead (blocking there is a kernel panic), and not for ever: the thread that holds it may be waiting for the host's answer on this
   // very core, which cannot switch to it while interrupts are masked - spinning on would hang the machine. It gives up, as for a host that does not answer
   // (the console skips a frame).
-  if (alone_) {
-    // (no lock: see take_over_for_panic)
-  } else if (kernel::irq_enabled() || !kernel::running()) {
+  if (alone_) return true;   // (no lock: see take_over_for_panic)
+  if (kernel::irq_enabled() || !kernel::running()) {
     lock_.lock();
-  } else {
-    const uint64_t start = uptime_us();
-    while (!lock_.try_lock()) {
-      if (uptime_us() - start >= kMaskedLockWaitUs) return 0;
-      delay_spin_us(20);
+    return true;
+  }
+  const uint64_t start = uptime_us();
+  while (!lock_.try_lock()) {
+    if (uptime_us() - start >= kMaskedLockWaitUs) return false;
+    delay_spin_us(20);
+  }
+  return true;
+}
+
+void VirtioGpu::reap_locked(bool* sync_done) {
+  uint16_t index;
+  uint32_t length;
+  while (control_.take_used(&index, &length)) {
+    if (index == 0) {
+      if (in_flight_) in_flight_ = false;   // (the answer to a command that timed out: its buffers are ours again)
+      else if (sync_done) *sync_done = true;
+      continue;
+    }
+    if (index < 2) continue;
+    const uint32_t slot = (index - 2) / 2;
+    if (slot < kAsyncSlots && async_[slot].busy) {
+      __atomic_thread_fence(__ATOMIC_ACQUIRE);
+      __atomic_store_n(&async_[slot].busy, false, __ATOMIC_RELEASE);
     }
   }
+}
+
+uint32_t VirtioGpu::execute(ConstByteView request, ByteView response, bool fence, uint32_t context) {
+  if (!ready_ || request.size() < sizeof(ControlHeader) || request.size() > request_.size()) return 0;
+  if (!lock_for_command()) return 0;
   struct Release {
     kernel::Mutex& mutex;
     bool locked;
     ~Release() { if (locked) mutex.unlock(); }
   } guard{lock_, !alone_};
-  uint16_t index;
-  uint32_t length;
-  if (in_flight_) {  // an earlier command never got its answer: the buffers still belong to the device
-    if (!control_.take_used(&index, &length)) return 0;
-    in_flight_ = false;
-  }
+  reap_locked(nullptr);
+  if (in_flight_) return 0;   // an earlier command never got its answer: the buffers still belong to the device
   request_.copy_from(request);
   auto* head = reinterpret_cast<ControlHeader*>(request_.data());
   uint64_t work = 0;   // (the number of this command, for a 3D one)
   if (head->type >= kCmdCtxCreate) {
-    work = work_sent_ + 1;
-    __atomic_store_n(&work_sent_, work, __ATOMIC_RELEASE);
-    head->context_id = kContextId;
+    if (context == kContextId) {   // (work_sent/work_done count the virgl context's commands)
+      work = work_sent_ + 1;
+      __atomic_store_n(&work_sent_, work, __ATOMIC_RELEASE);
+    }
+    head->context_id = context;
     // With a fence the host answers when the work is finished (see execute() in the header). Either way our buffers are free to reuse once it answers: it has read the request.
     if (fence) {
       head->flags |= kFlagFence;
@@ -102,7 +123,10 @@ uint32_t VirtioGpu::execute(ConstByteView request, ByteView response, bool fence
   // (delay_us sleeps from 200 us on, where that is allowed) and checks again.
   const uint64_t start = uptime_us();
   const uint64_t limit = head->type >= kCmdCtxCreate ? k3dCommandTimeoutUs : kCommandTimeoutUs;
-  while (!control_.take_used(&index, &length)) {
+  bool answered = false;
+  for (;;) {
+    reap_locked(&answered);
+    if (answered) break;
     const uint64_t waited = uptime_us() - start;
     if (waited >= limit) {
       in_flight_ = true;
@@ -120,6 +144,81 @@ uint32_t VirtioGpu::execute(ConstByteView request, ByteView response, bool fence
   if (work && fence && type >= kRespOkNoData && type < kRespErrUnspec && work > __atomic_load_n(&work_done_, __ATOMIC_RELAXED)) __atomic_store_n(&work_done_, work, __ATOMIC_RELEASE);
   if (!response.empty()) response.copy_from(ConstByteView(response_).at_most(response.size()));
   return type;
+}
+
+uint64_t VirtioGpu::submit_async(uint32_t context, ConstByteView commands, uint32_t ring) {
+  if (!ready_ || alone_ || context == 0 || context == kContextId || (commands.size() & 3)) return 0;
+  if (commands.size() > max_submit_bytes()) return 0;
+  if (ring != kNoRing && (ring > 63 || !has_context_init())) return 0;
+  if (control_.size() < 2 + 2 * kAsyncSlots) return 0;   // (a queue too small for the slots: everything is synchronous)
+  if (!lock_for_command()) return 0;
+  struct Release {
+    kernel::Mutex& mutex;
+    ~Release() { mutex.unlock(); }
+  } guard{lock_};
+  reap_locked(nullptr);
+  uint32_t slot = kAsyncSlots;
+  for (uint32_t i = 0; i < kAsyncSlots; ++i)
+    if (!__atomic_load_n(&async_[i].busy, __ATOMIC_ACQUIRE)) {
+      slot = i;
+      break;
+    }
+  if (slot == kAsyncSlots) return 0;
+  AsyncSlot& s = async_[slot];
+  const uint64_t needed = sizeof(CmdSubmit) + commands.size() + sizeof(ControlHeader);
+  if (s.buffer.size() < needed) {   // (a slot's buffer grows to the largest submission it carried)
+    if (!s.buffer.empty()) release_view(*allocator_, s.buffer);
+    s.buffer = allocate_dma_view<uint8_t>(*allocator_, needed > kAsyncBufferBytes ? needed : kAsyncBufferBytes, 4096);
+    if (s.buffer.empty()) return 0;
+  }
+  CmdSubmit head{};
+  head.header = header(kCmdSubmit3d);
+  head.header.context_id = context;
+  head.header.flags = kFlagFence;
+  head.header.fence_id = fence_ + 1;   // (published below, once the slot says it is outstanding: fence_signaled() must not see the number first)
+  if (ring != kNoRing) {
+    head.header.flags |= kFlagInfoRingIndex;
+    head.header.ring_index = static_cast<uint8_t>(ring);
+  }
+  head.size = static_cast<uint32_t>(commands.size());
+  const uint64_t request_bytes = sizeof(CmdSubmit) + commands.size();
+  ByteWriter out(s.buffer.first(request_bytes));
+  out.bytes(as_bytes(head));
+  out.bytes(commands);
+  if (!out.ok()) return 0;
+  s.fence = head.header.fence_id;
+  s.request_bytes = static_cast<uint32_t>(request_bytes);
+  __atomic_store_n(&s.busy, true, __ATOMIC_RELEASE);
+  __atomic_store_n(&fence_, s.fence, __ATOMIC_RELEASE);
+  ByteView answer = s.buffer.subview(request_bytes, sizeof(ControlHeader));
+  const Virtqueue::Segment segments[2] = {{s.buffer.data(), static_cast<uint32_t>(request_bytes), false},
+                                          {answer.data(), static_cast<uint32_t>(answer.size()), true}};
+  control_.post_chain(static_cast<uint16_t>(2 + 2 * slot), segments, 2);
+  transport_->notify(0);
+  return s.fence;
+}
+
+bool VirtioGpu::fence_signaled(uint64_t fence) {
+  if (fence == 0 || fence > __atomic_load_n(&fence_, __ATOMIC_ACQUIRE)) return false;
+  if (lock_.try_lock()) {   // (collect answers that came in; a holder of the lock does that itself)
+    reap_locked(nullptr);
+    lock_.unlock();
+  }
+  for (const AsyncSlot& s : async_)
+    if (__atomic_load_n(&s.busy, __ATOMIC_ACQUIRE) && s.fence == fence) return false;
+  return true;
+}
+
+bool VirtioGpu::wait_fence(uint64_t fence, uint64_t timeout_us) {
+  const uint64_t start = uptime_us();
+  for (uint64_t waited = 0;; waited = uptime_us() - start) {
+    if (fence_signaled(fence)) return true;
+    if (!ready_) return false;
+    if (timeout_us != ~uint64_t{0} && waited >= timeout_us) return false;
+    if (waited < kSpinWaitUs) delay_us(10);
+    else if (interrupts_ && kernel::running() && kernel::irq_enabled()) completion_.wait(kInterruptWaitUs);
+    else delay_us(250);
+  }
 }
 
 kernel::Frame* VirtioGpu::on_interrupt(kernel::Frame* frame, void* self) {
@@ -188,7 +287,7 @@ void VirtioGpu::drop_interrupt_handler() {
 bool VirtioGpu::initialize() {
   if (!pci_ || !allocator_ || device_.vendor_id != kPciVendor || device_.device_id != kPciDeviceId) return false;
   transport_ = new (transport_storage_) VirtioPciDevice(*pci_, device_, *allocator_, st_);
-  transport_->request_features(kFeatureVirgl | kFeatureEdid);
+  transport_->request_features(kFeatureVirgl | kFeatureEdid | kFeatureResourceBlob | kFeatureContextInit);
   if (!transport_->initialize() || !transport_->setup_queue(0, &control_) || !transport_->start()) {
     transport_->shutdown();
     transport_ = nullptr;
@@ -211,24 +310,208 @@ bool VirtioGpu::initialize() {
     shutdown();
     return false;
   }
+  read_capsets();
+  if (transport_->accepted_features() & kFeatureResourceBlob) {
+    host_window_ = transport_->shared_memory(kShmHostVisible);
+    if (host_window_.length && !window_.reset(0, host_window_.length)) host_window_ = {};
+  }
   if (transport_->accepted_features() & kFeatureVirgl) has_3d_ = setup_3d();
   return true;
 }
 
-bool VirtioGpu::setup_3d() {
-  uint32_t capsets = 0;
-  for (int i = 0; i < 4; ++i) capsets |= uint32_t{transport_->read_config8(12 + i)} << (8 * i);
-  bool virgl = false;
-  for (uint32_t i = 0; i < capsets && i < 16; ++i) {
+// Which capability sets the host has (GET_CAPSET_INFO for each of num_capsets): virgl's for the kernel's 3D, Venus and the others for contexts of their own.
+void VirtioGpu::read_capsets() {
+  capsets_ = 0;
+  capset_count_ = 0;
+  uint32_t count = 0;
+  for (int i = 0; i < 4; ++i) count |= uint32_t{transport_->read_config8(12 + i)} << (8 * i);
+  for (uint32_t i = 0; i < count && capset_count_ < kMaxCapsets; ++i) {
     GetCapsetInfo query{header(kCmdGetCapsetInfo), i, 0};
     RespCapsetInfo info{};
-    if (execute(as_bytes(query), ByteView(reinterpret_cast<uint8_t*>(&info), sizeof(info))) != kRespOkCapsetInfo)
-      continue;
-    if (info.capset_id == kCapsetVirgl || info.capset_id == kCapsetVirgl2) {
+    if (execute(as_bytes(query), ByteView(reinterpret_cast<uint8_t*>(&info), sizeof(info))) != kRespOkCapsetInfo) continue;
+    capset_infos_[capset_count_++] = CapsetInfo{info.capset_id, info.max_version, info.max_size};
+    if (info.capset_id < 64) capsets_ |= uint64_t{1} << info.capset_id;
+  }
+}
+
+bool VirtioGpu::capset_info(uint32_t id, uint32_t* max_version, uint32_t* max_size) const {
+  for (uint32_t i = 0; i < capset_count_; ++i) {
+    if (capset_infos_[i].id != id) continue;
+    if (max_version) *max_version = capset_infos_[i].max_version;
+    if (max_size) *max_size = capset_infos_[i].max_size;
+    return true;
+  }
+  return false;
+}
+
+uint32_t VirtioGpu::read_capset(uint32_t id, uint32_t version, ByteView out) {
+  uint32_t max_version = 0, max_size = 0;
+  if (!capset_info(id, &max_version, &max_size) || version > max_version || out.empty()) return 0;
+  if (max_size > kResponseBytes - sizeof(ControlHeader)) return 0;   // (no capset is near that size; the response buffer is the limit)
+  GetCapset request{header(kCmdGetCapset), id, version};
+  uint8_t reply[kResponseBytes];
+  ByteView answer(reply, sizeof(ControlHeader) + max_size);
+  if (execute(as_bytes(request), answer) != kRespOkCapset) return 0;
+  const ConstByteView data = ConstByteView(answer).subview(sizeof(ControlHeader)).at_most(out.size());
+  out.copy_from(data);
+  return static_cast<uint32_t>(data.size());
+}
+
+uint32_t VirtioGpu::create_context(uint32_t capset_id, ConstByteView name) {
+  // (capset 0: the host's default type, a virgl context, which needs no context-init)
+  if (!ready_ || capset_id > kContextInitCapsetMask) return 0;
+  if (capset_id == 0 ? !has_3d_ : (!has_context_init() || !has_capset(capset_id))) return 0;
+  const uint32_t id = __atomic_fetch_add(&next_context_, 1u, __ATOMIC_RELAXED);
+  if (id == 0 || id == kContextId) return 0;   // (wrapped: four billion contexts later)
+  CtxCreate ctx{};
+  ctx.header = header(kCmdCtxCreate);
+  ctx.context_init = capset_id;
+  const ConstByteView shown = name.at_most(sizeof(ctx.debug_name) - 1);
+  ByteView(reinterpret_cast<uint8_t*>(ctx.debug_name), shown.size()).copy_from(shown);
+  ctx.name_length = static_cast<uint32_t>(shown.size());
+  return execute(as_bytes(ctx), ByteView(), true, id) == kRespOkNoData ? id : 0;
+}
+
+void VirtioGpu::destroy_context(uint32_t context) {
+  if (!ready_ || context == 0 || context == kContextId) return;
+  const ControlHeader destroy = header(kCmdCtxDestroy);
+  execute(as_bytes(destroy), ByteView(), true, context);
+}
+
+uint32_t VirtioGpu::create_blob(uint32_t context, uint32_t blob_mem, uint32_t flags, uint64_t blob_id, uint64_t size, ArrayView<const MemEntry> pages) {
+  if (!ready_ || !has_blob() || size == 0) return 0;
+  if (pages.size() > (kRequestBytes - sizeof(ResourceCreateBlob)) / sizeof(MemEntry)) return 0;
+  const uint32_t id = allocate_resource_id();
+  ResourceCreateBlob create{};
+  create.header = header(kCmdResourceCreateBlob);
+  create.header.context_id = context;   // (a host blob is the context's memory; the host attaches the resource to it)
+  create.resource_id = id;
+  create.blob_mem = blob_mem;
+  create.blob_flags = flags;
+  create.entry_count = static_cast<uint32_t>(pages.size());
+  create.blob_id = blob_id;
+  create.size = size;
+  ByteBuffer request(*allocator_);
+  if (!request.append(as_bytes(create))) return 0;
+  for (const MemEntry& entry : pages)
+    if (!request.append(as_bytes(entry))) return 0;
+  return execute(request.view(), ByteView(), true, context) == kRespOkNoData ? id : 0;
+}
+
+bool VirtioGpu::map_blob(uint32_t context, uint32_t resource, uint64_t size, uint64_t* physical, uint32_t* map_info) {
+  if (!ready_ || !host_window_.length || size == 0 || !physical) return false;
+  uint64_t bytes = 0;
+  if (size > ~uint64_t{0} - 4095) return false;
+  bytes = (size + 4095) & ~uint64_t{4095};
+  Optional<uint64_t> offset;
+  {
+    window_lock_.lock();
+    offset = window_.allocate(bytes, 4096);
+    window_lock_.unlock();
+  }
+  if (!offset) return false;
+  ResourceMapBlob map{};
+  map.header = header(kCmdResourceMapBlob);
+  map.resource_id = resource;
+  map.offset = *offset;
+  RespMapInfo info{};
+  if (execute(as_bytes(map), ByteView(reinterpret_cast<uint8_t*>(&info), sizeof(info)), true, context) != kRespOkMapInfo) {
+    window_lock_.lock();
+    (void)window_.release(*offset);
+    window_lock_.unlock();
+    return false;
+  }
+  *physical = host_window_.address + *offset;
+  if (map_info) *map_info = info.map_info;
+  return true;
+}
+
+bool VirtioGpu::unmap_blob(uint32_t context, uint32_t resource, uint64_t physical) {
+  if (!ready_ || physical < host_window_.address || physical - host_window_.address >= host_window_.length) return false;
+  ResourceUnmapBlob unmap{header(kCmdResourceUnmapBlob), resource, 0};
+  if (execute(as_bytes(unmap), ByteView(), true, context) != kRespOkNoData) return false;
+  window_lock_.lock();
+  const bool released = window_.release(physical - host_window_.address);
+  window_lock_.unlock();
+  return released;
+}
+
+bool VirtioGpu::unref_resource(uint32_t resource) {
+  ResourceUnref unref{header(kCmdResourceUnref), resource, 0};
+  return command(as_bytes(unref));
+}
+
+bool VirtioGpu::attach_resource(uint32_t context, uint32_t resource) {
+  CtxResource attach{header(kCmdCtxAttachResource), resource, 0};
+  return execute(as_bytes(attach), ByteView(), true, context) == kRespOkNoData;
+}
+
+bool VirtioGpu::detach_resource(uint32_t context, uint32_t resource) {
+  CtxResource detach{header(kCmdCtxDetachResource), resource, 0};
+  return execute(as_bytes(detach), ByteView(), true, context) == kRespOkNoData;
+}
+
+uint32_t VirtioGpu::create_resource_3d(uint32_t context, const ResourceCreate3d& description, ArrayView<const MemEntry> pages) {
+  if (!ready_ || !has_3d_ || pages.size() > (kRequestBytes - 32) / sizeof(MemEntry)) return 0;
+  const uint32_t id = allocate_resource_id();
+  ResourceCreate3d create = description;
+  create.header = header(kCmdResourceCreate3d);
+  create.resource_id = id;
+  if (execute(as_bytes(create), ByteView(), true, context) != kRespOkNoData) return 0;
+  // (the backing: RESOURCE_ATTACH_BACKING with every run, then the resource is the context's)
+  struct AttachHead {
+    ControlHeader header;
+    uint32_t resource_id, entry_count;
+  } head{header(kCmdResourceAttachBacking), id, static_cast<uint32_t>(pages.size())};
+  ByteBuffer request(*allocator_);
+  bool ok = request.append(as_bytes(head));
+  for (const MemEntry& entry : pages) ok = ok && request.append(as_bytes(entry));
+  if (!ok || execute(request.view()) != kRespOkNoData || !attach_resource(context, id)) {
+    unref_resource(id);
+    return 0;
+  }
+  return id;
+}
+
+uint64_t VirtioGpu::transfer_3d(uint32_t context, uint32_t resource, bool to_host, const Box& box, uint32_t level, uint64_t offset, uint32_t stride, uint32_t layer_stride) {
+  if (!ready_ || !has_3d_) return 0;
+  TransferHost3d transfer{};
+  transfer.header = header(to_host ? kCmdTransferToHost3d : kCmdTransferFromHost3d);
+  transfer.box = box;
+  transfer.offset = offset;
+  transfer.resource_id = resource;
+  transfer.level = level;
+  transfer.stride = stride;
+  transfer.layer_stride = layer_stride;
+  // Fenced and waited for here: a transfer is short, and its fence is what tells the guest the bytes have arrived (or left).
+  if (execute(as_bytes(transfer), ByteView(), true, context) != kRespOkNoData) return 0;
+  return __atomic_load_n(&fence_, __ATOMIC_ACQUIRE);
+}
+
+uint32_t VirtioGpu::submit(uint32_t context, ConstByteView commands, bool fence, uint32_t ring) {
+  if (!ready_ || context == 0 || context == kContextId || commands.size() > max_submit_bytes() || (commands.size() & 3)) return 0;
+  CmdSubmit head{};
+  head.header = header(kCmdSubmit3d);
+  head.size = static_cast<uint32_t>(commands.size());
+  if (ring != kNoRing) {
+    if (ring > 63 || !has_context_init()) return 0;
+    head.header.flags |= kFlagInfoRingIndex;
+    head.header.ring_index = static_cast<uint8_t>(ring);
+  }
+  ByteBuffer request(*allocator_);
+  if (!request.append(as_bytes(head)) || !request.append(commands)) return 0;
+  return execute(request.view(), ByteView(), fence, context);
+}
+
+bool VirtioGpu::setup_3d() {
+  bool virgl = false;
+  for (uint32_t i = 0; i < capset_count_; ++i) {
+    const CapsetInfo& info = capset_infos_[i];
+    if (info.id == kCapsetVirgl || info.id == kCapsetVirgl2) {
       virgl = true;
       if (!virgl_bset_) {
         // (version 1 of either set starts with virgl_caps_v1: max_version, four 64-byte format masks, then bset and glsl_level)
-        GetCapset request{header(kCmdGetCapset), info.capset_id, 1};
+        GetCapset request{header(kCmdGetCapset), info.id, 1};
         RespCapset caps{};
         if (execute(as_bytes(request), ByteView(reinterpret_cast<uint8_t*>(&caps), sizeof(caps))) == kRespOkCapset) {
           ByteReader in{ConstByteView(caps.data, sizeof(caps.data))};
@@ -497,6 +780,10 @@ void VirtioGpu::shutdown() {
     if (!backing_.empty()) release_view(*allocator_, backing_);
     release_view(*allocator_, request_);
     release_view(*allocator_, response_);
+    for (AsyncSlot& slot : async_) {   // (the device was reset: nothing of ours is in use any more)
+      if (!slot.buffer.empty()) release_view(*allocator_, slot.buffer);
+      slot.busy = false;
+    }
     control_.release(*allocator_);
   }
   screen_resource_ = 0;

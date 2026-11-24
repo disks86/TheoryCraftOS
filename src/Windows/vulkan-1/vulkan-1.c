@@ -28,6 +28,8 @@
 #define WIN32_LEAN_AND_MEAN
 #define VK_USE_PLATFORM_WIN32_KHR
 #include <windows.h>
+#include <winternl.h>
+#include "../../Vulkan/vk_names.h"
 #include "../../Vulkan/khronos/vulkan/vulkan_core.h"
 #include "../../Vulkan/khronos/vulkan/vulkan_win32.h"
 
@@ -35,6 +37,9 @@
 #define VK_OS_EXPORT __declspec(dllexport)
 #define VK_OS_INSTANCE_EXTENSIONS {VK_KHR_WIN32_SURFACE_EXTENSION_NAME, VK_KHR_WIN32_SURFACE_SPEC_VERSION},
 #define VK_OS_PROCS(X) X(vkCreateWin32SurfaceKHR) X(vkGetPhysicalDeviceWin32PresentationSupportKHR)
+#define TCOS_VK_HAS_vkCreateWin32SurfaceKHR 1
+#define TCOS_VK_HAS_vkGetPhysicalDeviceWin32PresentationSupportKHR 1
+#define VK_OS_VIRTGPU 1   /* the render node through NtTcosVirtGpu (the Venus backend) */
 #include "../../Vulkan/vk_driver.inc"
 
 __asm__(".text\n.globl ___chkstk_ms\n___chkstk_ms:\n ret\n");
@@ -144,6 +149,49 @@ VKAPI VkBool32 VKAPI_CALL vkGetPhysicalDeviceWin32PresentationSupportKHR(VkPhysi
   return family == 0;
 }
 
+/* (on Venus a queue family that can do the copy to the screen can present: vk_venus.inc) */
+static VkBool32 VKAPI_CALL vn_vkGetPhysicalDeviceWin32PresentationSupportKHR(VkPhysicalDevice pd, uint32_t family) {
+  return vn_family_can_present(vn_physical(pd), family) ? VK_TRUE : VK_FALSE;
+}
+
+/* ---- the render node: NtTcosVirtGpu (src/Process/VirtGpuDevice.h) ------------------------------------------------------------------------------------------------- */
+__declspec(dllimport) NTSTATUS NTAPI NtTcosVirtGpu(ULONG64 *arguments);
+__declspec(dllimport) NTSTATUS NTAPI NtDelayExecution(BOOLEAN alertable, PLARGE_INTEGER interval);
+
+static int64_t vk_os_virtgpu_open(void) {
+  ULONG64 a[8] = {TCOS_VIRTGPU_OP_OPEN};
+  return NtTcosVirtGpu(a) >= 0 ? (int64_t)a[4] : -1;
+}
+static int vk_os_virtgpu_ioctl(int64_t node, uint32_t request, void *argument) {
+  ULONG64 a[8] = {TCOS_VIRTGPU_OP_IOCTL, (ULONG64)node, request, (ULONG64)(ULONG_PTR)argument};
+  const NTSTATUS st = NtTcosVirtGpu(a);
+  if (st < 0) return st == (NTSTATUS)0xC0000005L ? 14 : 9;   /* (EFAULT for memory it could not read, EBADF for a handle that is not a node) */
+  return (int)a[4];
+}
+static void *vk_os_virtgpu_map(int64_t node, uint64_t offset, uint64_t size) {
+  ULONG64 a[8] = {TCOS_VIRTGPU_OP_MAP, (ULONG64)node, offset, size};
+  return NtTcosVirtGpu(a) >= 0 ? (void *)(ULONG_PTR)a[4] : NULL;
+}
+static void vk_os_virtgpu_unmap(int64_t node, void *address, uint64_t size) {
+  ULONG64 a[8] = {TCOS_VIRTGPU_OP_UNMAP, (ULONG64)node, (ULONG64)(ULONG_PTR)address, size};
+  NtTcosVirtGpu(a);
+}
+static void vk_os_virtgpu_close(int64_t node) {
+  ULONG64 a[8] = {TCOS_VIRTGPU_OP_CLOSE, (ULONG64)node};
+  NtTcosVirtGpu(a);
+}
+
+static void vk_os_sleep_ns(uint64_t ns) {
+  LARGE_INTEGER interval;
+  interval.QuadPart = -(LONGLONG)((ns + 99) / 100);   /* (relative, in 100 ns units) */
+  NtDelayExecution(FALSE, &interval);
+}
+
+static bool vk_os_getenv(const char *name, char *out, size_t cap) {
+  const DWORD n = GetEnvironmentVariableA(name, out, (DWORD)cap);
+  return n > 0 && n < cap;
+}
+
 static bool vk_os_surface_extent(const Surface *s, uint32_t *w, uint32_t *h) {
   RECT r;
   if (!s->window || !GetClientRect((HWND)(ULONG_PTR)s->window, &r)) return false;
@@ -155,3 +203,6 @@ BOOL WINAPI DllMain(HINSTANCE module, DWORD reason, LPVOID reserved) {
   (void)module, (void)reason, (void)reserved;
   return TRUE;
 }
+
+/* the exported entry points (last: they use the names the driver's functions had) */
+#include "../../Vulkan/vk_dispatch.inc"

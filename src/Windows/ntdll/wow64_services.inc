@@ -1350,13 +1350,6 @@ EXPORT NTSTATUS NTAPI NtTcosCabinet(ULONG64 * a0) {
   return status;
 }
 EXPORT NTSTATUS NTAPI ZwTcosCabinet(ULONG64 * a0) { return NtTcosCabinet(a0); }
-EXPORT NTSTATUS NTAPI NtTcosGamepad(ULONG64 * a0) {
-  ULONG64 v[4] = {0};
-  v[0] = (ULONG64)(ULONG_PTR)a0;
-  const NTSTATUS status = (NTSTATUS)wow_service(NT_SERVICE_NtTcosGamepad, v);
-  return status;
-}
-EXPORT NTSTATUS NTAPI ZwTcosGamepad(ULONG64 * a0) { return NtTcosGamepad(a0); }
 EXPORT NTSTATUS NTAPI NtTcosCommonDialog(void * a0) {
   ULONG64 v[4] = {0};
   v[0] = (ULONG64)(ULONG_PTR)a0;
@@ -1398,6 +1391,13 @@ EXPORT NTSTATUS NTAPI NtTcosFont(void * a0) {
   return status;
 }
 EXPORT NTSTATUS NTAPI ZwTcosFont(void * a0) { return NtTcosFont(a0); }
+EXPORT NTSTATUS NTAPI NtTcosGamepad(ULONG64 * a0) {
+  ULONG64 v[4] = {0};
+  v[0] = (ULONG64)(ULONG_PTR)a0;
+  const NTSTATUS status = (NTSTATUS)wow_service(NT_SERVICE_NtTcosGamepad, v);
+  return status;
+}
+EXPORT NTSTATUS NTAPI ZwTcosGamepad(ULONG64 * a0) { return NtTcosGamepad(a0); }
 EXPORT NTSTATUS NTAPI NtTcosLinkModules(PVOID a0, PVOID a1) {
   ULONG64 v[4] = {0};
   v[0] = (ULONG64)(ULONG_PTR)a0;
@@ -1413,6 +1413,13 @@ EXPORT NTSTATUS NTAPI NtTcosOpenGl(void * a0) {
   return status;
 }
 EXPORT NTSTATUS NTAPI ZwTcosOpenGl(void * a0) { return NtTcosOpenGl(a0); }
+EXPORT NTSTATUS NTAPI NtTcosVirtGpu(ULONG64 * a0) {
+  ULONG64 v[4] = {0};
+  v[0] = (ULONG64)(ULONG_PTR)a0;
+  const NTSTATUS status = (NTSTATUS)wow_service(NT_SERVICE_NtTcosVirtGpu, v);
+  return status;
+}
+EXPORT NTSTATUS NTAPI ZwTcosVirtGpu(ULONG64 * a0) { return NtTcosVirtGpu(a0); }
 EXPORT NTSTATUS NTAPI NtTerminateJobObject(HANDLE a0, NTSTATUS a1) {
   ULONG64 v[4] = {0};
   v[0] = WOW_HANDLE(a0);

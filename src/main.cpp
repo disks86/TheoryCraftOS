@@ -54,6 +54,10 @@
 #include "Allocators/Allocator.hpp"
 #include "Hardware/Bus/Pci/PciBar.hpp"
 #include "Hardware/MmioMapper.hpp"
+#include "Graphics/VirtGpu/VirtioVirtGpuHost.hpp"
+#include "Process/WindowsVirtGpu.hpp"
+#include "Process/LinuxRenderNode.hpp"
+#include "Process/UserPageTables.hpp"
 #include "Hardware/MidiDevice/X86MidiPortIo.hpp"
 #include "Hardware/MidiDevice/Usb/UsbMidiService.hpp"
 #include "Hardware/GameController/GameControllerService.hpp"
@@ -741,6 +745,8 @@ static efi::Status kernel_main(efi::Handle image, efi::SystemTable* st) {
   hardware::MmioMapper mmio(paging, ram);
   if (paging_ok) {
     const uint32_t mapped_bars = hardware::pci_map_all_bars(pci, mmio);
+    // (user mappings of device memory a host hands out write-combined need the PAT's write-combining entry: VirtGpuSession's host blobs)
+    process::UserPageTables::set_write_combining(paging.enable_write_combining());
     if (mapped_bars) Entry(Level::Info, "MMIO").dec(mapped_bars).text(" BAR(s) mapped that the firmware had not mapped");
   }
   struct MmioRegisterMapper final : hardware::IRegisterMapper {
@@ -905,6 +911,29 @@ static efi::Status kernel_main(efi::Handle image, efi::SystemTable* st) {
 #endif
       } else {
         Entry(Level::Info, "GPU").text("virtio-gpu has no usable interrupt; waiting for commands by polling");
+      }
+      // Contexts of their own type (Venus: the host's Vulkan driver, reached through /dev/dri/renderD128 and NtTcosVirtGpu).
+      if (virtio->capsets() & ~uint64_t{0x6}) {
+        Entry e(Level::Info, "GPU");
+        e.text("virtio-gpu capsets ").hex(virtio->capsets()).text(virtio->has_context_init() ? ", context types" : ", no context types").text(virtio->has_blob() ? ", blobs" : ", no blobs");
+        e.text(", host-visible window ").dec(virtio->host_visible_size() >> 20).text(" MiB");
+        if (virtio->has_capset(hardware::virtio_gpu::kCapsetVenus)) e.text(virtio->has_context_init() && virtio->has_blob() && virtio->host_visible_size() ? ": Venus (host Vulkan) available" : ": Venus needs context types, blobs and a host-visible window (QEMU: venus=on,blob=on,hostmem=)");
+      }
+      // The render node (/dev/dri/renderD128, NtTcosVirtGpu): processes' own contexts on the device. As on Linux, only a device with 3D has one.
+      if (virtio->has_3d()) {
+        static graphics::virtgpu::VirtioVirtGpuHost render_node_host(*virtio);
+        graphics::virtgpu::set_system_host(&render_node_host);
+        // (its PCI function in /sys: libdrm finds the device there, then opens the node; segment 0, as the firmware's tables give it)
+        static process::RenderNodePci render_node_pci;
+        render_node_pci.bus = virtio->pci_device().address.bus, render_node_pci.device = virtio->pci_device().address.device;
+        render_node_pci.function = virtio->pci_device().address.function;
+        for (uint16_t offset = 0; offset < sizeof(render_node_pci.config); offset += 4) {
+          const uint32_t word = virtio->read_pci_config32(offset);
+          for (uint32_t b = 0; b < 4; ++b) render_node_pci.config[offset + b] = static_cast<uint8_t>(word >> (8 * b));
+        }
+        process::set_render_node_pci(&render_node_pci);
+        if (process::windowsabi::install_virtgpu_service(shared_allocator))
+          process::win32k::register_process_exit_hook([](uint64_t pid) { process::windowsabi::virtgpu_process_exited(pid); });
       }
     }
     // The JIT's code memory, checked once the cores run: compile a small program, switch its pages to executable through the page tables, run it.

@@ -1007,10 +1007,16 @@ static void test_timestamps(Rig *r) {
   VkQueryPool pool = VK_NULL_HANDLE;
   check(p_vkCreateQueryPool(r->dev, &qci, NULL, &pool) == VK_SUCCESS && pool, "a timestamp query pool");
   if (!pool) return;
+  /* (a query is undefined until it is reset: the pool is reset first, then a query that was not written since is not available) */
+  VkCommandBufferBeginInfo cbi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+  p_vkResetCommandBuffer(r->cb, 0);
+  p_vkBeginCommandBuffer(r->cb, &cbi);
+  p_vkCmdResetQueryPool(r->cb, pool, 0, 4);
+  p_vkEndCommandBuffer(r->cb);
+  submit_and_wait(r);
   unsigned long long before[2] = {0, 0};
   check(p_vkGetQueryPoolResults(r->dev, pool, 0, 1, sizeof before, before, 16, VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WITH_AVAILABILITY_BIT) == VK_NOT_READY && before[1] == 0,
         "a timestamp that was not written is not available");
-  VkCommandBufferBeginInfo cbi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
   p_vkResetCommandBuffer(r->cb, 0);
   p_vkBeginCommandBuffer(r->cb, &cbi);
   p_vkCmdResetQueryPool(r->cb, pool, 0, 4);
@@ -1402,7 +1408,17 @@ static void test_device(VkPhysicalDevice pd, unsigned index) {
   p_vkBeginCommandBuffer(r.cb, &cbi);
   VkClearColorValue cc = {{0.0f, 1.0f, 0.0f, 1.0f}};
   VkImageSubresourceRange range = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+  /* (valid on any GPU: the image goes to TRANSFER_DST for the clear, and the clear is finished and the image in TRANSFER_SRC before the copy reads it) */
+  VkImageMemoryBarrier to_dst = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+  to_dst.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT | VK_ACCESS_MEMORY_READ_BIT, to_dst.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+  to_dst.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED, to_dst.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+  to_dst.srcQueueFamilyIndex = to_dst.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, to_dst.image = s.target, to_dst.subresourceRange = range;
+  p_vkCmdPipelineBarrier(r.cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, &to_dst);
   p_vkCmdClearColorImage(r.cb, s.target, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &cc, 1, &range);
+  VkImageMemoryBarrier to_src = to_dst;
+  to_src.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT, to_src.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+  to_src.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, to_src.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+  p_vkCmdPipelineBarrier(r.cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, &to_src);
   VkBufferImageCopy full;
   memset(&full, 0, sizeof full);
   full.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, full.imageSubresource.layerCount = 1, full.imageExtent.width = W, full.imageExtent.height = H, full.imageExtent.depth = 1;

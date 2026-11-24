@@ -35,6 +35,7 @@
  * systems that keep the real loader as /usr/lib/libvulkan.so.1. Then only the loader's entry points are exported (vk_icdNegotiateLoaderICDInterfaceVersion,
  * vk_icdGetInstanceProcAddr, vk_icdGetPhysicalDeviceProcAddr: interface version 5), every vk* function is internal (found by name), and each dispatchable
  * object starts with the loader's magic word, which the loader replaces with its dispatch table (vk_base.inc's Hdr). */
+#include "../../Vulkan/vk_names.h"
 #include "../../Vulkan/khronos/vulkan/vulkan_core.h"
 struct wl_display;
 struct wl_surface;
@@ -60,14 +61,24 @@ typedef unsigned long VisualID;
 #define VK_OS_PROCS(X) X(vkCreateHeadlessSurfaceEXT) X(vkGetMemoryFdKHR) X(vkGetMemoryFdPropertiesKHR) X(vkCreateWaylandSurfaceKHR) \
                        X(vkGetPhysicalDeviceWaylandPresentationSupportKHR) X(vkCreateXcbSurfaceKHR) X(vkGetPhysicalDeviceXcbPresentationSupportKHR) \
                        X(vkCreateXlibSurfaceKHR) X(vkGetPhysicalDeviceXlibPresentationSupportKHR)
+#define TCOS_VK_HAS_vkCreateHeadlessSurfaceEXT 1
+#define TCOS_VK_HAS_vkGetMemoryFdKHR 1
+#define TCOS_VK_HAS_vkGetMemoryFdPropertiesKHR 1
+#define TCOS_VK_HAS_vkCreateWaylandSurfaceKHR 1
+#define TCOS_VK_HAS_vkGetPhysicalDeviceWaylandPresentationSupportKHR 1
+#define TCOS_VK_HAS_vkCreateXcbSurfaceKHR 1
+#define TCOS_VK_HAS_vkGetPhysicalDeviceXcbPresentationSupportKHR 1
+#define TCOS_VK_HAS_vkCreateXlibSurfaceKHR 1
+#define TCOS_VK_HAS_vkGetPhysicalDeviceXlibPresentationSupportKHR 1
 #define VK_OS_EXTERNAL_MEMORY_FD 1   /* images as dmabufs of /dev/dxg (vk_external.inc) */
 #define VK_OS_COMPOSITOR_SURFACES 1  /* Wayland surfaces (wayland.inc) */
+#define VK_OS_VIRTGPU 1              /* the render node /dev/dri/renderD128 (the Venus backend) */
 #include "../../Vulkan/vk_driver.inc"
 
 
 /* ---- Linux system calls ------------------------------------------------------------------------------------------------------------------------------------------------ */
 #if defined(__x86_64__)
-enum { SYS_WRITE = 1, SYS_MMAP = 9, SYS_MUNMAP = 11, SYS_IOCTL = 16, SYS_CLOSE = 3, SYS_CLOCK_GETTIME = 228, SYS_OPENAT = 257 };
+enum { SYS_WRITE = 1, SYS_MMAP = 9, SYS_MUNMAP = 11, SYS_IOCTL = 16, SYS_CLOSE = 3, SYS_CLOCK_GETTIME = 228, SYS_OPENAT = 257, SYS_CLOCK_NANOSLEEP = 230 };
 static long linux_call(long n, long a, long b, long c, long d, long e, long f) {
   register long r10 __asm__("r10") = d;
   register long r8 __asm__("r8") = e;
@@ -78,7 +89,7 @@ static long linux_call(long n, long a, long b, long c, long d, long e, long f) {
 }
 #elif defined(__aarch64__) || defined(__riscv) || defined(__loongarch64)
 /* the "generic" table */
-enum { SYS_WRITE = 64, SYS_MMAP = 222, SYS_MUNMAP = 215, SYS_IOCTL = 29, SYS_CLOSE = 57, SYS_CLOCK_GETTIME = 113, SYS_OPENAT = 56 };
+enum { SYS_WRITE = 64, SYS_MMAP = 222, SYS_MUNMAP = 215, SYS_IOCTL = 29, SYS_CLOSE = 57, SYS_CLOCK_GETTIME = 113, SYS_OPENAT = 56, SYS_CLOCK_NANOSLEEP = 115 };
 static long linux_call(long n, long a, long b, long c, long d, long e, long f) {
 #if defined(__aarch64__)
   register long x8 __asm__("x8") = n;
@@ -110,7 +121,7 @@ static long linux_call(long n, long a, long b, long c, long d, long e, long f) {
 #error "libvulkan: no system call interface for this CPU"
 #endif
 
-enum { AT_FDCWD = -100, O_RDWR = 2, O_CLOEXEC = 0x80000, PROT_READ = 1, PROT_WRITE = 2, MAP_PRIVATE = 2, MAP_ANONYMOUS = 0x20, CLOCK_MONOTONIC = 1 };
+enum { AT_FDCWD = -100, O_RDWR = 2, O_CLOEXEC = 0x80000, PROT_READ = 1, PROT_WRITE = 2, MAP_SHARED = 1, MAP_PRIVATE = 2, MAP_ANONYMOUS = 0x20, CLOCK_MONOTONIC = 1 };
 #define PAGE_BYTES 4096u
 
 static void *map_pages(size_t bytes) {
@@ -251,6 +262,44 @@ static uint64_t vk_os_now_ns(void) {
   return (uint64_t)t.seconds * 1000000000ull + (uint64_t)t.nanoseconds;
 }
 
+static void vk_os_sleep_ns(uint64_t ns) {
+  struct {
+    int64_t seconds, nanoseconds;
+  } t = {(int64_t)(ns / 1000000000ull), (int64_t)(ns % 1000000000ull)};
+  linux_call(SYS_CLOCK_NANOSLEEP, CLOCK_MONOTONIC, 0, (long)&t, 0, 0, 0);
+}
+
+static bool vk_os_getenv(const char *name, char *out, size_t cap) {
+  if (!(&environ && environ) || cap == 0) return false;
+  for (char **e = environ; *e; ++e) {
+    const char *v = *e, *n = name;
+    while (*n && *v == *n) ++v, ++n;
+    if (*n || *v != '=') continue;
+    copy_string(out, cap, v + 1);
+    return true;
+  }
+  return false;
+}
+
+/* ---- the render node: /dev/dri/renderD128 (src/Process/VirtGpuDevice.h) ------------------------------------------------------------------------------------------ */
+static int64_t vk_os_virtgpu_open(void) {
+  const long fd = linux_call(SYS_OPENAT, AT_FDCWD, (long)TCOS_VIRTGPU_RENDER_NODE_PATH, O_RDWR | O_CLOEXEC, 0, 0, 0);
+  return fd < 0 ? -1 : fd;
+}
+static int vk_os_virtgpu_ioctl(int64_t node, uint32_t request, void *argument) {
+  const long r = linux_call(SYS_IOCTL, (long)node, (long)request, (long)argument, 0, 0, 0);
+  return r < 0 ? (int)-r : 0;
+}
+static void *vk_os_virtgpu_map(int64_t node, uint64_t offset, uint64_t size) {
+  const long r = linux_call(SYS_MMAP, 0, (long)size, PROT_READ | PROT_WRITE, MAP_SHARED, (long)node, (long)offset);
+  return r < 0 && r > -4096 ? NULL : (void *)r;
+}
+static void vk_os_virtgpu_unmap(int64_t node, void *address, uint64_t size) {
+  (void)node;
+  linux_call(SYS_MUNMAP, (long)address, (long)size, 0, 0, 0, 0);
+}
+static void vk_os_virtgpu_close(int64_t node) { linux_call(SYS_CLOSE, (long)node, 0, 0, 0, 0, 0); }
+
 /* ---- the D3DKMT services: ioctl on /dev/dxg ---------------------------------------------------------------------------------------------------------------------------- */
 #define STATUS_NO_SUCH_DEVICE_KMT ((KmtStatus)0xC000000Eu)
 #define STATUS_INVALID_PARAMETER_KMT ((KmtStatus)0xC000000Du)
@@ -329,6 +378,22 @@ static void vk_os_swapchain_gone(Swapchain *sc) {
 }
 static VkResult vk_os_acquire(Swapchain *sc, uint64_t timeout, uint32_t *index) { return x11_surface(sc->surface) ? x11_acquire(sc, timeout, index) : wl_acquire(sc, timeout, index); }
 static VkResult vk_os_present(Swapchain *sc, uint32_t index) { return x11_surface(sc->surface) ? x11_present(sc, index) : wl_present(sc, index); }
+
+/* Presentation on Venus (vk_venus.inc): a queue family that can do the copy to the screen, on a connection that works. */
+static VkBool32 VKAPI_CALL vn_vkGetPhysicalDeviceWaylandPresentationSupportKHR(VkPhysicalDevice pd, uint32_t family, struct wl_display *display) {
+  return vn_family_can_present(vn_physical(pd), family) && display != NULL && wayland_load();
+}
+static VkBool32 VKAPI_CALL vn_vkGetPhysicalDeviceXcbPresentationSupportKHR(VkPhysicalDevice pd, uint32_t family, xcb_connection_t *connection, xcb_visualid_t visual) {
+  (void)visual;
+  return vn_family_can_present(vn_physical(pd), family) && connection != NULL && xcb_load();
+}
+static VkBool32 VKAPI_CALL vn_vkGetPhysicalDeviceXlibPresentationSupportKHR(VkPhysicalDevice pd, uint32_t family, Display *display, VisualID visual) {
+  (void)visual;
+  return vn_family_can_present(vn_physical(pd), family) && display != NULL && xcb_load() && g_xcb.xlib_connection;
+}
+
+/* the exported entry points (after every function of the driver: they use the names those had) */
+#include "../../Vulkan/vk_dispatch.inc"
 
 /* ---- the Khronos loader's interface (-DVK_ICD) ------------------------------------------------------------------------------------------------------------------------ */
 #if defined(VK_ICD)

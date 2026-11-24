@@ -48,7 +48,8 @@ enum class DescriptorKind : uint8_t { Closed, ConsoleInput, ConsoleOutput, Conso
                                     UnixSocket /* an AF_UNIX socket (UnixSockets.hpp), shared with Windows programs */,
                                     InputDevice /* /dev/input/eventN or jsN: a game controller for a Linux process (LinuxInput.hpp) */,
                                     DxgSharedResource /* an NT handle of a shared Direct3D resource (ObjectKind::DxgSharedResource) */,
-                                    DxgSharedSync /* an NT handle of a shared Direct3D fence (ObjectKind::DxgSharedSync) */ };
+                                    DxgSharedSync /* an NT handle of a shared Direct3D fence (ObjectKind::DxgSharedSync) */,
+                                    RenderNode /* /dev/dri/renderD128: the virtio-gpu DRM render node for a Linux process (LinuxRenderNode.hpp) */ };
 
 // How open() treats the path. (The Linux O_* and Windows dispositions both reduce to these.)
 struct OpenFlags {
@@ -66,6 +67,8 @@ class MemoryFile;
 class DxgBufferFile;
 class DxgSyncFile;
 class InputClient;
+class RenderNodeClient;
+class VirtualFile;
 
 struct OpenObject {
   explicit OpenObject(allocators::IAllocator& allocator) : path(allocator), pattern(allocator) {}
@@ -74,6 +77,8 @@ struct OpenObject {
   DxgBufferFile* gpu_buffer = nullptr;      // `file` is a GPU image (a dmabuf of /dev/dxg, DxgBufferFile.hpp): this is it (not owned)
   DxgSyncFile* gpu_sync = nullptr;          // `file` is a fence (a sync object's timeline of /dev/dxg, DxgBufferFile.hpp): this is it (not owned)
   UniquePointer<InputClient> input;         // an InputDevice descriptor's own state (a /dev/input node, LinuxInput.hpp)
+  UniquePointer<RenderNodeClient> render;   // a RenderNode descriptor's own state: its session on the GPU (LinuxRenderNode.hpp)
+  VirtualFile* virtual_file = nullptr;      // `file` is one the kernel makes up (a /sys attribute, a dma-buf or sync_file of the render node: LinuxRenderNode.hpp): this is it (not owned)
   UniquePointer<filesystem::IDirectory> directory;
   String path;                       // the cleaned virtual path it was opened by
   String pattern;                    // directory listing: only names matching this (Windows wildcards); empty = all
@@ -93,6 +98,9 @@ struct OpenObject {
   uint32_t io_port = 0;              // the I/O completion port the file object is tied to (a referenced port object; 0: none), the key it was tied with, and the FILE_SKIP_* flags
   uint64_t io_key = 0;
   uint32_t io_flags = 0;
+
+  // A file with no name in the file tree (a file in memory, a GPU image, a fence, a made-up file): nothing to look up by its path.
+  bool anonymous() const { return memory || gpu_buffer || gpu_sync || virtual_file; }
 };
 
 // The descriptor table and file operations of one process. Console descriptors 0..2 exist from the start; the file system is attached once.

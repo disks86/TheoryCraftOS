@@ -32,6 +32,9 @@ namespace process {
 // regions' backing memory. root() is what goes into CR3.
 class UserPageTables {
  public:
+  // Whether the CPUs' page attribute table has the write-combining entry (index 4: kernel::PageTables::enable_write_combining). Without it a write-combined
+  // region is mapped uncached. Set once at start-up.
+  static void set_write_combining(bool available);
   // `nx` says the CPU has no-execute enabled (EFER.NXE); without it the bit would be a reserved bit and fault.
   UserPageTables(allocators::IAllocator& allocator, bool nx) : allocator_(allocator), nx_(nx) {}
   ~UserPageTables() { release(); release_previous(); }
@@ -75,7 +78,7 @@ class UserPageTables {
   void release();
   // The entry `address` should have now (0: none).
   uint64_t wanted(const AddressSpace& space, uint64_t address) const;
-  uint64_t leaf_flags(uint8_t protection) const;
+  uint64_t leaf_flags(uint8_t protection, MemoryCache cache = MemoryCache::WriteBack) const;
   // The first pass of update(): every present user entry of [start, end) below `table` (a table of `level`, covering from `base`) set to what it should be.
   void refresh(const AddressSpace& space, uint64_t table, uint32_t level, uint64_t base, uint64_t start, uint64_t end, bool* flush);
 

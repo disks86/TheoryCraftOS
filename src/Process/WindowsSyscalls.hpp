@@ -125,6 +125,7 @@ enum class WindowsSyscallNumber : uint32_t {
   NtTcosGamepad = 512,
   // a Windows-shaped stub of a function ntdll.dll implements in C (see nt_tcos_wrapped in WindowsSyscalls.cpp)
   NtTcosWrapped = 513,
+  NtTcosVirtGpu = 514,
   NtCreateSocket = 87,
   NtBindSocket = 88,
   NtConnectSocket = 89,
@@ -2084,7 +2085,7 @@ enum class WindowsSyscallNumber : uint32_t {
   NtUserTcosResume = 5638,
 };
 
-constexpr uint32_t kWindowsServiceCount = 514;      // numbers below this are services of the executive (the ones without code answer STATUS_NOT_IMPLEMENTED)
+constexpr uint32_t kWindowsServiceCount = 515;      // numbers below this are services of the executive (the ones without code answer STATUS_NOT_IMPLEMENTED)
 constexpr uint32_t kWin32kServiceBase = 4096, kWin32kServiceEnd = 5639;      // the services of win32k (NtUser*, NtGdi*, ...) are these numbers; same answer
 constexpr uint32_t kStatusInvalidSystemService = 0xC000001Cu;      // the answer for a number that is no service
 

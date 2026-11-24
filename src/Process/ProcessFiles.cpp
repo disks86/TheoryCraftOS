@@ -17,6 +17,7 @@
  */
 #include "Process/ProcessFiles.hpp"
 #include "Process/LinuxInput.hpp"
+#include "Process/LinuxRenderNode.hpp"
 #include "Process/UnixSockets.hpp"
 #include "Process/Objects.hpp"
 #include "FileSystem/SystemLayout.hpp"
@@ -511,6 +512,7 @@ DescriptorKind ProcessFiles::device_at(StringView virtual_path) const {
   if (virtual_path == StringView("/dev/tty")) return DescriptorKind::ConsoleOutput;
   if (virtual_path == StringView("/dev/dxg")) return DescriptorKind::Dxg;
   if (linuxabi::input_device_exists(virtual_path)) return DescriptorKind::InputDevice;      // /dev/input/eventN, jsN (LinuxInput.hpp)
+  if (linuxabi::render_node_device_exists(virtual_path)) return DescriptorKind::RenderNode;      // /dev/dri/renderD128 (LinuxRenderNode.hpp)
   return DescriptorKind::Closed;
 }
 
