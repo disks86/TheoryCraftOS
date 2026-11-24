@@ -236,6 +236,7 @@ typedef struct Sampler { StateObj s; D3D11_SAMPLER_DESC desc; } Sampler;
 typedef struct Query {
   Child c;
   D3D11_QUERY_DESC desc;
+  D3D11_CONTEXT_TYPE context_type;            /* CreateQuery1: the kind of work it is for (what GetDesc1 gives back; every context here is one queue, which does all kinds) */
   BOOL begun, ended, active;
   UINT64 start, stop;                         /* QueryPerformanceCounter at Begin and End */
   UINT64 samples;
@@ -317,6 +318,7 @@ typedef struct Ctx {
   UINT flags;                         /* CreateDeferredContext's ContextFlags */
   struct Deferred *rec;               /* a deferred context: what it has recorded since the last FinishCommandList */
   struct CtxState *active;            /* SwapDeviceContextState: the context state object that is active (a reference; NULL: the device's own, not made yet) */
+  BOOL hardware_protection;           /* SetHardwareProtectionState (device5.inc) */
 } Ctx;
 #define CTX_OBJECTS_FIRST offsetof(Ctx, vs)
 #define CTX_OBJECTS_END (offsetof(Ctx, predicate) + sizeof(void *))
@@ -392,6 +394,7 @@ struct Dev {
   UINT clear_count;
   Ctx *ctx;
   StateObj *states[4];                     /* the state objects made, by kind (STATE_*): what CreateBlendState ... give again for the same description */
+  struct RemovalWatch *removal;            /* RegisterDeviceRemovedEvent (device5.inc): the events to set when Direct3D 12 below loses the device */
 };
 #define DIRTY_TARGETS 1u
 #define DIRTY_VIEWPORT 2u
@@ -451,13 +454,13 @@ static void bind(void *slot_address, void *object) {
   unhold(old);
 }
 
-extern const ID3D11Device1Vtbl dev_vtbl;
-extern const ID3D11DeviceContext1Vtbl ctx_vtbl;
+extern const ID3D11Device5Vtbl dev_vtbl;
+extern const ID3D11DeviceContext4Vtbl ctx_vtbl;
 extern const ID3D11BufferVtbl buf_vtbl;
-extern const ID3D11Texture2DVtbl tex_vtbl;
-extern const ID3D11RenderTargetViewVtbl rtv_vtbl;
+extern const ID3D11Texture2D1Vtbl tex_vtbl;
+extern const ID3D11RenderTargetView1Vtbl rtv_vtbl;
 extern const ID3D11DepthStencilViewVtbl dsv_vtbl;
-extern const ID3D11ShaderResourceViewVtbl srv_vtbl;
+extern const ID3D11ShaderResourceView1Vtbl srv_vtbl;
 extern const ID3D11VertexShaderVtbl vs_vtbl;
 extern const ID3D11PixelShaderVtbl ps_vtbl;
 extern const ID3D11GeometryShaderVtbl gs_vtbl;
@@ -466,18 +469,18 @@ extern const ID3D11DomainShaderVtbl ds_vtbl;
 extern const ID3D11InputLayoutVtbl layout_vtbl;
 extern const ID3D11BlendState1Vtbl blend_vtbl;
 extern const ID3D11DepthStencilStateVtbl depth_vtbl;
-extern const ID3D11RasterizerState1Vtbl raster_vtbl;
+extern const ID3D11RasterizerState2Vtbl raster_vtbl;
 extern const ID3D11SamplerStateVtbl sampler_vtbl;
-extern const ID3D11QueryVtbl query_vtbl;
+extern const ID3D11Query1Vtbl query_vtbl;
 
 static const GUID *const g_dev_iids[] = {&IID_ID3D11Device, NULL};
 static const GUID *const g_ctx_iids[] = {&IID_ID3D11DeviceChild, &IID_ID3D11DeviceContext, NULL};
 static const GUID *const g_buf_iids[] = {&IID_ID3D11DeviceChild, &IID_ID3D11Resource, &IID_ID3D11Buffer, NULL};
-static const GUID *const g_tex_iids[] = {&IID_ID3D11DeviceChild, &IID_ID3D11Resource, &IID_ID3D11Texture2D, NULL};
-static const GUID *const g_tex3_iids[] = {&IID_ID3D11DeviceChild, &IID_ID3D11Resource, &IID_ID3D11Texture3D, NULL};
-static const GUID *const g_rtv_iids[] = {&IID_ID3D11DeviceChild, &IID_ID3D11View, &IID_ID3D11RenderTargetView, NULL};
+static const GUID *const g_tex_iids[] = {&IID_ID3D11DeviceChild, &IID_ID3D11Resource, &IID_ID3D11Texture2D, &IID_ID3D11Texture2D1, NULL};
+static const GUID *const g_tex3_iids[] = {&IID_ID3D11DeviceChild, &IID_ID3D11Resource, &IID_ID3D11Texture3D, &IID_ID3D11Texture3D1, NULL};
+static const GUID *const g_rtv_iids[] = {&IID_ID3D11DeviceChild, &IID_ID3D11View, &IID_ID3D11RenderTargetView, &IID_ID3D11RenderTargetView1, NULL};
 static const GUID *const g_dsv_iids[] = {&IID_ID3D11DeviceChild, &IID_ID3D11View, &IID_ID3D11DepthStencilView, NULL};
-static const GUID *const g_srv_iids[] = {&IID_ID3D11DeviceChild, &IID_ID3D11View, &IID_ID3D11ShaderResourceView, NULL};
+static const GUID *const g_srv_iids[] = {&IID_ID3D11DeviceChild, &IID_ID3D11View, &IID_ID3D11ShaderResourceView, &IID_ID3D11ShaderResourceView1, NULL};
 static const GUID *const g_vs_iids[] = {&IID_ID3D11DeviceChild, &IID_ID3D11VertexShader, NULL};
 static const GUID *const g_ps_iids[] = {&IID_ID3D11DeviceChild, &IID_ID3D11PixelShader, NULL};
 static const GUID *const g_gs_iids[] = {&IID_ID3D11DeviceChild, &IID_ID3D11GeometryShader, NULL};
@@ -486,7 +489,7 @@ static const GUID *const g_ds_iids[] = {&IID_ID3D11DeviceChild, &IID_ID3D11Domai
 static const GUID *const g_layout_iids[] = {&IID_ID3D11DeviceChild, &IID_ID3D11InputLayout, NULL};
 static const GUID *const g_depth_iids[] = {&IID_ID3D11DeviceChild, &IID_ID3D11DepthStencilState, NULL};
 static const GUID *const g_sampler_iids[] = {&IID_ID3D11DeviceChild, &IID_ID3D11SamplerState, NULL};
-static const GUID *const g_query_iids[] = {&IID_ID3D11DeviceChild, &IID_ID3D11Asynchronous, &IID_ID3D11Query, NULL};
+static const GUID *const g_query_iids[] = {&IID_ID3D11DeviceChild, &IID_ID3D11Asynchronous, &IID_ID3D11Query, &IID_ID3D11Query1, NULL};
 
 /* ---- the command list ------------------------------------------------------------------------------------------------------------------------------- */
 
@@ -520,6 +523,7 @@ static void spares_release(Dev *d) {
 static ID3D12Resource *make_buffer(Dev *d, D3D12_HEAP_TYPE heap, UINT64 bytes);
 static ID3D12Resource *make_buffer_flags(Dev *d, D3D12_HEAP_TYPE heap, UINT64 bytes, D3D12_RESOURCE_FLAGS flags);
 static void flush(Dev *d);
+static void removal_shutdown(Dev *d);
 /* An upload buffer of at least `bytes`, mapped: a spare (at most twice the size) or a new one. NULL if there is none. `uav`: one shaders may read as a shader resource
  * view (the kernel takes buffer views of unordered-access allocations only). */
 static ID3D12Resource *take_upload_of(Dev *d, UINT64 bytes, int uav, BYTE **data, UINT64 *size) {
@@ -662,6 +666,7 @@ static BOOL buffer_desc_valid(const D3D11_BUFFER_DESC *desc, const D3D11_SUBRESO
   const UINT known_bind = D3D11_BIND_VERTEX_BUFFER | D3D11_BIND_INDEX_BUFFER | D3D11_BIND_CONSTANT_BUFFER | D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_STREAM_OUTPUT |
                           D3D11_BIND_UNORDERED_ACCESS;
   if (desc->ByteWidth == 0 || desc->ByteWidth > (256u << 20) || (bind & ~known_bind)) return FALSE;
+  if (misc & (D3D11_RESOURCE_MISC_TILED | D3D11_RESOURCE_MISC_TILE_POOL)) return FALSE;      /* (TiledResourcesTier NOT_SUPPORTED) */
   if (desc->Usage > D3D11_USAGE_STAGING || (desc->CPUAccessFlags & ~(UINT)(D3D11_CPU_ACCESS_READ | D3D11_CPU_ACCESS_WRITE))) return FALSE;
   switch (desc->Usage) {
     case D3D11_USAGE_DEFAULT: if (desc->CPUAccessFlags) return FALSE; break;
@@ -898,6 +903,7 @@ static HRESULT tex_make(Dev *d, const D3D11_TEXTURE2D_DESC *in, UINT slices, ID3
       ((bind & D3D11_BIND_DEPTH_STENCIL) && (bind & (D3D11_BIND_RENDER_TARGET | D3D11_BIND_UNORDERED_ACCESS))))
     return E_INVALIDARG;
   if ((desc.MiscFlags & D3D11_RESOURCE_MISC_SHARED) && (desc.MiscFlags & D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX)) return E_INVALIDARG;
+  if (desc.MiscFlags & (D3D11_RESOURCE_MISC_TILED | D3D11_RESOURCE_MISC_TILE_POOL)) return E_INVALIDARG;      /* (TiledResourcesTier NOT_SUPPORTED) */
   /* (shared through NT handles: with SHARED or SHARED_KEYEDMUTEX, in GPU memory) */
   const BOOL nt_shared = !res && (desc.MiscFlags & D3D11_RESOURCE_MISC_SHARED_NTHANDLE) != 0;
   if (nt_shared && (!(desc.MiscFlags & (D3D11_RESOURCE_MISC_SHARED | D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX)) || desc.Usage != D3D11_USAGE_DEFAULT || desc.CPUAccessFlags))
@@ -1027,7 +1033,7 @@ static HRESULT STDMETHODCALLTYPE dev_CreateTexture2D(Dev *d, const D3D11_TEXTURE
 }
 
 static HRESULT STDMETHODCALLTYPE dev_CreateTexture3D(Dev *d, const D3D11_TEXTURE3D_DESC *desc, const D3D11_SUBRESOURCE_DATA *initial, ID3D11Texture3D **out) {
-  extern const ID3D11Texture3DVtbl tex3_vtbl;
+  extern const ID3D11Texture3D1Vtbl tex3_vtbl;
   if (out) *out = NULL;
   if (!desc || desc->Depth == 0) return E_INVALIDARG;
   const D3D11_TEXTURE2D_DESC as2d = {desc->Width, desc->Height, desc->MipLevels, 1, desc->Format, {1, 0}, desc->Usage, desc->BindFlags, desc->CPUAccessFlags,
@@ -1078,7 +1084,7 @@ static HRESULT STDMETHODCALLTYPE dev_CreateTexture1D(Dev *d, const D3D11_TEXTURE
 /* ---- views --------------------------------------------------------------------------------------------------------------------------------------------- */
 
 static Tex *tex_of_resource(ID3D11Resource *resource) {
-  extern const ID3D11Texture3DVtbl tex3_vtbl;
+  extern const ID3D11Texture3D1Vtbl tex3_vtbl;
   extern const ID3D11Texture1DVtbl tex1d_vtbl;
   if (!resource) return NULL;
   const void *v = ((DxObj *)resource)->lpVtbl;
@@ -1296,8 +1302,8 @@ static HRESULT STDMETHODCALLTYPE dev_CreateShaderResourceView(Dev *d, ID3D11Reso
 /* An unordered access view. Of a buffer: raw (R32_TYPELESS, a buffer that allows raw views), structured (UNKNOWN; an append or counter view has a hidden count), or
  * typed. Of a texture: the view is made, but the kernel has no unordered access to textures, and a shader that declares one is refused (docs/Direct3D11.md). */
 static HRESULT STDMETHODCALLTYPE dev_CreateUnorderedAccessView(Dev *d, ID3D11Resource *resource, const D3D11_UNORDERED_ACCESS_VIEW_DESC *desc, ID3D11UnorderedAccessView **out) {
-  extern const ID3D11UnorderedAccessViewVtbl uav_vtbl;
-  static const GUID *const iids[] = {&IID_ID3D11DeviceChild, &IID_ID3D11View, &IID_ID3D11UnorderedAccessView, NULL};
+  extern const ID3D11UnorderedAccessView1Vtbl uav_vtbl;
+  static const GUID *const iids[] = {&IID_ID3D11DeviceChild, &IID_ID3D11View, &IID_ID3D11UnorderedAccessView, &IID_ID3D11UnorderedAccessView1, NULL};
   if (out) *out = NULL;
   Buf *b = buf_of_resource(resource);
   Tex *t = tex_of_resource(resource);
@@ -1785,8 +1791,8 @@ static HRESULT STDMETHODCALLTYPE dev_CreateDepthStencilState(Dev *d, const D3D11
 }
 /* CreateRasterizerState1: ForcedSampleCount is a feature of level 11_1; at 11_0 it must be 0. */
 static HRESULT STDMETHODCALLTYPE dev_CreateRasterizerState1(Dev *d, const D3D11_RASTERIZER_DESC1 *desc, ID3D11RasterizerState1 **out) {
-  extern const ID3D11RasterizerState1Vtbl raster_vtbl;
-  static const GUID *const iids[] = {&IID_ID3D11DeviceChild, &IID_ID3D11RasterizerState, &IID_ID3D11RasterizerState1, NULL};
+  extern const ID3D11RasterizerState2Vtbl raster_vtbl;
+  static const GUID *const iids[] = {&IID_ID3D11DeviceChild, &IID_ID3D11RasterizerState, &IID_ID3D11RasterizerState1, &IID_ID3D11RasterizerState2, NULL};
   if (out) *out = NULL;
   if (!desc) return E_INVALIDARG;
   if (desc->FillMode < D3D11_FILL_WIREFRAME || desc->FillMode > D3D11_FILL_SOLID || desc->CullMode < D3D11_CULL_NONE || desc->CullMode > D3D11_CULL_BACK || desc->ForcedSampleCount)
@@ -1894,4 +1900,5 @@ static const ID3D11On12Device1Vtbl g_on12_vtbl;
 #include "device.inc"
 #include "interop.inc"
 #include "dxgi_resource.inc"
+#include "device5.inc"
 #include "vtbl.inc"

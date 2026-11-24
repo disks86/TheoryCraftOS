@@ -665,7 +665,9 @@ static HRESULT STDMETHODCALLTYPE ctx_QueryInterface(Ctx *c, REFIID riid, void **
   if (!out) return E_POINTER;
   *out = NULL;
   void *face = NULL;
-  if (guid_eq(riid, &IID_IUnknown) || guid_eq(riid, &IID_ID3D11DeviceChild) || guid_eq(riid, &IID_ID3D11DeviceContext) || guid_eq(riid, &IID_ID3D11DeviceContext1)) face = c;
+  if (guid_eq(riid, &IID_IUnknown) || guid_eq(riid, &IID_ID3D11DeviceChild) || guid_eq(riid, &IID_ID3D11DeviceContext) || guid_eq(riid, &IID_ID3D11DeviceContext1) ||
+      guid_eq(riid, &IID_ID3D11DeviceContext2) || guid_eq(riid, &IID_ID3D11DeviceContext3) || guid_eq(riid, &IID_ID3D11DeviceContext4))
+    face = c;
   else if (guid_eq(riid, &IID_ID3D11Multithread) && !c->deferred) face = &c->multithread;      /* (the immediate context's only) */
   else if (guid_eq(riid, &IID_ID3DUserDefinedAnnotation)) face = &c->annotation;
   if (!face) {

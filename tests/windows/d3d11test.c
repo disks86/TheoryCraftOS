@@ -2144,6 +2144,261 @@ static UINT32 subresource_texel(ID3D11Texture2D *texture, UINT sub, UINT w, UINT
   ID3D11Texture2D_Release(staging);
   return texel;
 }
+/* ID3D11Device2 .. 5 and ID3D11DeviceContext2 .. 4 (the fences are in d3dsharetest): the *1 creators and descriptions, what CheckFeatureSupport says, the calls of a
+ * device without tiled resources, and the device-removed events of a device on Direct3D 12 that is removed. */
+static void test_device5(void) {
+  ID3D11Device5 *d5 = NULL;
+  ID3D11DeviceContext4 *c4 = NULL;
+  ID3D11Device_QueryInterface(g_device, &IID_ID3D11Device5, (void **)&d5);
+  ID3D11DeviceContext_QueryInterface(g_context, &IID_ID3D11DeviceContext4, (void **)&c4);
+  check(d5 && c4, "the device is an ID3D11Device5, its context an ID3D11DeviceContext4");
+  if (!d5 || !c4) { if (d5) ID3D11Device5_Release(d5); if (c4) ID3D11DeviceContext4_Release(c4); return; }
+  ID3D11DeviceContext3 *c3 = NULL;
+  ID3D11Device5_GetImmediateContext3(d5, &c3);
+  check(c3 == (ID3D11DeviceContext3 *)c4, "GetImmediateContext3 gives the immediate context");
+  if (c3) ID3D11DeviceContext3_Release(c3);
+  ID3D11DeviceContext3 *deferred = NULL;
+  check(SUCCEEDED(ID3D11Device5_CreateDeferredContext3(d5, 0, &deferred)) && deferred && ID3D11DeviceContext3_GetType(deferred) == D3D11_DEVICE_CONTEXT_DEFERRED,
+        "CreateDeferredContext3 makes a deferred context");
+  check(ID3D11Device5_CreateDeferredContext2(d5, 1, (ID3D11DeviceContext2 **)&c3) == E_INVALIDARG, "CreateDeferredContext2 refuses flags (none are defined)");
+  check(ID3D11Device5_GetDeviceRemovedReason(d5) == S_OK, "GetDeviceRemovedReason: S_OK on a device that is there");
+
+  /* the *1 texture: the layout is the driver's (UNDEFINED); ROW_MAJOR and the standard swizzle need what the device does not have */
+  D3D11_TEXTURE2D_DESC1 td = {8, 8, 1, 1, DXGI_FORMAT_R8G8B8A8_UNORM, {1, 0}, D3D11_USAGE_DEFAULT, D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS, 0, 0,
+                          D3D11_TEXTURE_LAYOUT_UNDEFINED};
+  ID3D11Texture2D1 *t1 = NULL, *bad = NULL;
+  check(SUCCEEDED(ID3D11Device5_CreateTexture2D1(d5, &td, NULL, &t1)) && t1, "CreateTexture2D1 with the UNDEFINED layout");
+  td.TextureLayout = D3D11_TEXTURE_LAYOUT_ROW_MAJOR;
+  check(ID3D11Device5_CreateTexture2D1(d5, &td, NULL, &bad) == E_INVALIDARG && !bad, "CreateTexture2D1 refuses ROW_MAJOR (no MapOnDefaultTextures)");
+  td.TextureLayout = D3D11_TEXTURE_LAYOUT_64K_STANDARD_SWIZZLE;
+  check(ID3D11Device5_CreateTexture2D1(d5, &td, NULL, &bad) == E_INVALIDARG && !bad, "CreateTexture2D1 refuses 64K_STANDARD_SWIZZLE (no StandardSwizzle)");
+  if (t1) {
+    D3D11_TEXTURE2D_DESC1 got;
+    memset(&got, 0xCC, sizeof got);
+    ID3D11Texture2D1_GetDesc1(t1, &got);
+    check(got.Width == 8 && got.Height == 8 && got.Format == DXGI_FORMAT_R8G8B8A8_UNORM && got.TextureLayout == D3D11_TEXTURE_LAYOUT_UNDEFINED, "Texture2D1::GetDesc1");
+    /* every 2D texture is an ID3D11Texture2D1 */
+    ID3D11Texture2D1 *again = NULL;
+    check(SUCCEEDED(ID3D11Texture2D_QueryInterface(g_target, &IID_ID3D11Texture2D1, (void **)&again)) && again, "a texture of CreateTexture2D is an ID3D11Texture2D1");
+    if (again) ID3D11Texture2D1_Release(again);
+    /* the *1 views: plane slice 0; 1 is refused (no format here has two planes) */
+    D3D11_RENDER_TARGET_VIEW_DESC1 rd;
+    memset(&rd, 0, sizeof rd);
+    rd.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    rd.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D;
+    ID3D11RenderTargetView1 *rtv = NULL;
+    check(SUCCEEDED(ID3D11Device5_CreateRenderTargetView1(d5, (ID3D11Resource *)t1, &rd, &rtv)) && rtv, "CreateRenderTargetView1, plane slice 0");
+    if (rtv) {
+      D3D11_RENDER_TARGET_VIEW_DESC1 back;
+      memset(&back, 0xCC, sizeof back);
+      ID3D11RenderTargetView1_GetDesc1(rtv, &back);
+      check(back.ViewDimension == D3D11_RTV_DIMENSION_TEXTURE2D && back.Texture2D.MipSlice == 0 && back.Texture2D.PlaneSlice == 0, "RenderTargetView1::GetDesc1");
+      const float blue_colour[4] = {0, 0, 1, 1};
+      ID3D11DeviceContext_ClearRenderTargetView(g_context, (ID3D11RenderTargetView *)rtv, blue_colour);      /* (the view draws) */
+      ID3D11RenderTargetView1_Release(rtv);
+    }
+    rd.Texture2D.PlaneSlice = 1;
+    rtv = NULL;
+    check(ID3D11Device5_CreateRenderTargetView1(d5, (ID3D11Resource *)t1, &rd, &rtv) == E_INVALIDARG && !rtv, "CreateRenderTargetView1 refuses plane slice 1");
+    D3D11_SHADER_RESOURCE_VIEW_DESC1 sd;
+    memset(&sd, 0, sizeof sd);
+    sd.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    sd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+    sd.Texture2D.MipLevels = 1;
+    ID3D11ShaderResourceView1 *srv = NULL;
+    check(SUCCEEDED(ID3D11Device5_CreateShaderResourceView1(d5, (ID3D11Resource *)t1, &sd, &srv)) && srv, "CreateShaderResourceView1");
+    if (srv) {
+      D3D11_SHADER_RESOURCE_VIEW_DESC1 back;
+      memset(&back, 0xCC, sizeof back);
+      ID3D11ShaderResourceView1_GetDesc1(srv, &back);
+      check(back.ViewDimension == D3D11_SRV_DIMENSION_TEXTURE2D && back.Texture2D.MipLevels == 1 && back.Texture2D.PlaneSlice == 0, "ShaderResourceView1::GetDesc1");
+      ID3D11ShaderResourceView1_Release(srv);
+    }
+    sd.Texture2D.PlaneSlice = 2;
+    srv = NULL;
+    check(ID3D11Device5_CreateShaderResourceView1(d5, (ID3D11Resource *)t1, &sd, &srv) == E_INVALIDARG && !srv, "CreateShaderResourceView1 refuses plane slice 2");
+    ID3D11Texture2D1_Release(t1);
+  }
+  /* an unordered access view of a buffer through the *1 creator */
+  D3D11_BUFFER_DESC bd = {256, D3D11_USAGE_DEFAULT, D3D11_BIND_UNORDERED_ACCESS, 0, D3D11_RESOURCE_MISC_BUFFER_ALLOW_RAW_VIEWS, 0};
+  ID3D11Buffer *raw = NULL;
+  ID3D11Device5_CreateBuffer(d5, &bd, NULL, &raw);
+  if (raw) {
+    D3D11_UNORDERED_ACCESS_VIEW_DESC1 ud;
+    memset(&ud, 0, sizeof ud);
+    ud.Format = DXGI_FORMAT_R32_TYPELESS;
+    ud.ViewDimension = D3D11_UAV_DIMENSION_BUFFER;
+    ud.Buffer.NumElements = 64;
+    ud.Buffer.Flags = D3D11_BUFFER_UAV_FLAG_RAW;
+    ID3D11UnorderedAccessView1 *uav = NULL;
+    check(SUCCEEDED(ID3D11Device5_CreateUnorderedAccessView1(d5, (ID3D11Resource *)raw, &ud, &uav)) && uav, "CreateUnorderedAccessView1 of a raw buffer");
+    if (uav) {
+      D3D11_UNORDERED_ACCESS_VIEW_DESC1 back;
+      memset(&back, 0xCC, sizeof back);
+      ID3D11UnorderedAccessView1_GetDesc1(uav, &back);
+      check(back.ViewDimension == D3D11_UAV_DIMENSION_BUFFER && back.Buffer.NumElements == 64 && back.Buffer.Flags == D3D11_BUFFER_UAV_FLAG_RAW, "UnorderedAccessView1::GetDesc1");
+      ID3D11UnorderedAccessView1_Release(uav);
+    }
+    ID3D11Buffer_Release(raw);
+  }
+  /* no tiled resources: a tiled buffer and a tile pool are refused, and the tile calls refuse what they get */
+  D3D11_BUFFER_DESC tiled = {65536, D3D11_USAGE_DEFAULT, D3D11_BIND_SHADER_RESOURCE, 0, D3D11_RESOURCE_MISC_TILED, 0};
+  ID3D11Buffer *none = NULL;
+  check(ID3D11Device5_CreateBuffer(d5, &tiled, NULL, &none) == E_INVALIDARG && !none, "CreateBuffer refuses D3D11_RESOURCE_MISC_TILED (TiledResourcesTier NOT_SUPPORTED)");
+  tiled.MiscFlags = D3D11_RESOURCE_MISC_TILE_POOL;
+  check(ID3D11Device5_CreateBuffer(d5, &tiled, NULL, &none) == E_INVALIDARG && !none, "CreateBuffer refuses D3D11_RESOURCE_MISC_TILE_POOL");
+  check(ID3D11DeviceContext4_UpdateTileMappings(c4, (ID3D11Resource *)g_target, 0, NULL, NULL, NULL, 0, NULL, NULL, NULL, 0) == E_INVALIDARG,
+        "UpdateTileMappings of a resource that is not tiled: E_INVALIDARG");
+  check(ID3D11DeviceContext4_ResizeTilePool(c4, g_matrix, 65536) == E_INVALIDARG, "ResizeTilePool of a buffer that is not a tile pool: E_INVALIDARG");
+  UINT tiles = 7, subs = 3;
+  D3D11_PACKED_MIP_DESC packed;
+  D3D11_TILE_SHAPE shape;
+  memset(&packed, 0xCC, sizeof packed);
+  memset(&shape, 0xCC, sizeof shape);
+  ID3D11Device5_GetResourceTiling(d5, (ID3D11Resource *)g_target, &tiles, &packed, &shape, &subs, 0, NULL);
+  check(tiles == 0 && subs == 0 && packed.NumStandardMips == 0 && shape.WidthInTexels == 0, "GetResourceTiling of a resource that is not tiled: no tiles");
+  UINT levels = 9;
+  check(SUCCEEDED(ID3D11Device5_CheckMultisampleQualityLevels1(d5, DXGI_FORMAT_R8G8B8A8_UNORM, 4, D3D11_CHECK_MULTISAMPLE_QUALITY_LEVELS_TILED_RESOURCE, &levels)) && levels == 0,
+        "CheckMultisampleQualityLevels1 for tiled resources: none");
+  UINT plain_levels = 0;
+  ID3D11Device5_CheckMultisampleQualityLevels(d5, DXGI_FORMAT_R8G8B8A8_UNORM, 1, &plain_levels);
+  check(SUCCEEDED(ID3D11Device5_CheckMultisampleQualityLevels1(d5, DXGI_FORMAT_R8G8B8A8_UNORM, 1, 0, &levels)) && levels == plain_levels && levels == 1,
+        "CheckMultisampleQualityLevels1 without flags: as CheckMultisampleQualityLevels");
+  check(ID3D11Device5_CheckMultisampleQualityLevels1(d5, DXGI_FORMAT_R8G8B8A8_UNORM, 1, 2, &levels) == E_INVALIDARG, "CheckMultisampleQualityLevels1 refuses unknown flags");
+
+  /* RasterizerState2: conservative rasterization is refused (no tier) */
+  D3D11_RASTERIZER_DESC2 r2 = {D3D11_FILL_SOLID, D3D11_CULL_NONE, FALSE, 0, 0, 0, TRUE, FALSE, FALSE, FALSE, 0, D3D11_CONSERVATIVE_RASTERIZATION_MODE_OFF};
+  ID3D11RasterizerState2 *rs2 = NULL, *rs_bad = NULL;
+  check(SUCCEEDED(ID3D11Device5_CreateRasterizerState2(d5, &r2, &rs2)) && rs2, "CreateRasterizerState2, conservative rasterization off");
+  if (rs2) {
+    D3D11_RASTERIZER_DESC2 back;
+    memset(&back, 0xCC, sizeof back);
+    ID3D11RasterizerState2_GetDesc2(rs2, &back);
+    check(back.CullMode == D3D11_CULL_NONE && back.DepthClipEnable == TRUE && back.ConservativeRaster == D3D11_CONSERVATIVE_RASTERIZATION_MODE_OFF, "RasterizerState2::GetDesc2");
+    ID3D11RasterizerState2_Release(rs2);
+  }
+  r2.ConservativeRaster = D3D11_CONSERVATIVE_RASTERIZATION_MODE_ON;
+  check(ID3D11Device5_CreateRasterizerState2(d5, &r2, &rs_bad) == E_INVALIDARG && !rs_bad, "CreateRasterizerState2 refuses conservative rasterization");
+  /* Query1 keeps its context type */
+  D3D11_QUERY_DESC1 qd = {D3D11_QUERY_EVENT, 0, D3D11_CONTEXT_TYPE_COMPUTE};
+  ID3D11Query1 *q1 = NULL;
+  check(SUCCEEDED(ID3D11Device5_CreateQuery1(d5, &qd, &q1)) && q1, "CreateQuery1");
+  if (q1) {
+    D3D11_QUERY_DESC1 back;
+    memset(&back, 0xCC, sizeof back);
+    ID3D11Query1_GetDesc1(q1, &back);
+    check(back.Query == D3D11_QUERY_EVENT && back.MiscFlags == 0 && back.ContextType == D3D11_CONTEXT_TYPE_COMPUTE, "Query1::GetDesc1 gives the context type back");
+    ID3D11DeviceContext_End(g_context, (ID3D11Asynchronous *)q1);
+    BOOL done = FALSE;
+    HRESULT hr;
+    while ((hr = ID3D11DeviceContext_GetData(g_context, (ID3D11Asynchronous *)q1, &done, sizeof done, 0)) == S_FALSE) {}
+    check(hr == S_OK && done, "a Query1 of D3D11_QUERY_EVENT ends");
+    ID3D11Query1_Release(q1);
+  }
+  qd.ContextType = (D3D11_CONTEXT_TYPE)9;
+  q1 = NULL;
+  check(ID3D11Device5_CreateQuery1(d5, &qd, &q1) == E_INVALIDARG && !q1, "CreateQuery1 refuses an unknown context type");
+
+  /* what the device says it does */
+  D3D11_FEATURE_DATA_D3D11_OPTIONS o;
+  memset(&o, 0xCC, sizeof o);
+  check(SUCCEEDED(ID3D11Device5_CheckFeatureSupport(d5, D3D11_FEATURE_D3D11_OPTIONS, &o, sizeof o)) && o.ClearView && o.ConstantBufferOffsetting &&
+        o.MapNoOverwriteOnDynamicConstantBuffer && !o.OutputMergerLogicOp && !o.ExtendedDoublesShaderInstructions, "D3D11_FEATURE_D3D11_OPTIONS");
+  D3D11_FEATURE_DATA_D3D11_OPTIONS2 o2;
+  memset(&o2, 0xCC, sizeof o2);
+  check(SUCCEEDED(ID3D11Device5_CheckFeatureSupport(d5, D3D11_FEATURE_D3D11_OPTIONS2, &o2, sizeof o2)) && o2.TiledResourcesTier == D3D11_TILED_RESOURCES_NOT_SUPPORTED &&
+        o2.ConservativeRasterizationTier == D3D11_CONSERVATIVE_RASTERIZATION_NOT_SUPPORTED && !o2.MapOnDefaultTextures && !o2.StandardSwizzle, "D3D11_FEATURE_D3D11_OPTIONS2");
+  D3D11_FEATURE_DATA_D3D11_OPTIONS5 o5;
+  memset(&o5, 0xCC, sizeof o5);
+  check(SUCCEEDED(ID3D11Device5_CheckFeatureSupport(d5, D3D11_FEATURE_D3D11_OPTIONS5, &o5, sizeof o5)) && (UINT)o5.SharedResourceTier <= D3D11_SHARED_RESOURCE_TIER_3,
+        "D3D11_FEATURE_D3D11_OPTIONS5");
+  D3D11_FEATURE_DATA_FORMAT_SUPPORT fs = {DXGI_FORMAT_R8G8B8A8_UNORM, 0};
+  check(SUCCEEDED(ID3D11Device5_CheckFeatureSupport(d5, D3D11_FEATURE_FORMAT_SUPPORT, &fs, sizeof fs)) && (fs.OutFormatSupport & D3D11_FORMAT_SUPPORT_RENDER_TARGET),
+        "D3D11_FEATURE_FORMAT_SUPPORT");
+  D3D11_FEATURE_DATA_GPU_VIRTUAL_ADDRESS_SUPPORT va = {0, 0};
+  check(SUCCEEDED(ID3D11Device5_CheckFeatureSupport(d5, D3D11_FEATURE_GPU_VIRTUAL_ADDRESS_SUPPORT, &va, sizeof va)) && va.MaxGPUVirtualAddressBitsPerProcess >= 32,
+        "D3D11_FEATURE_GPU_VIRTUAL_ADDRESS_SUPPORT (Direct3D 12's)");
+  D3D11_FEATURE_DATA_D3D9_OPTIONS1 o9;
+  check(SUCCEEDED(ID3D11Device5_CheckFeatureSupport(d5, D3D11_FEATURE_D3D9_OPTIONS1, &o9, sizeof o9)) && o9.FullNonPow2TextureSupported && o9.SimpleInstancingSupported,
+        "D3D11_FEATURE_D3D9_OPTIONS1");
+  check(ID3D11Device5_CheckFeatureSupport(d5, D3D11_FEATURE_D3D11_OPTIONS, &o, sizeof o - 4) == E_INVALIDARG, "CheckFeatureSupport refuses a structure of the wrong size");
+  check(ID3D11Device5_CheckFeatureSupport(d5, (D3D11_FEATURE)99, &o, sizeof o) == E_INVALIDARG, "CheckFeatureSupport refuses an unknown feature");
+
+  /* the context's newer calls */
+  HANDLE flushed = CreateEventW(NULL, TRUE, FALSE, NULL);
+  ID3D11DeviceContext4_Flush1(c4, D3D11_CONTEXT_TYPE_ALL, flushed);
+  check(WaitForSingleObject(flushed, 10000) == WAIT_OBJECT_0, "Flush1 sets its event once the work has run");
+  CloseHandle(flushed);
+  check(!ID3D11DeviceContext4_IsAnnotationEnabled(c4), "IsAnnotationEnabled: no tool is attached");
+  ID3D11DeviceContext4_BeginEventInt(c4, L"scene", 1);
+  ID3D11DeviceContext4_SetMarkerInt(c4, L"mark", 2);
+  ID3D11DeviceContext4_EndEvent(c4);
+  BOOL protection = TRUE;
+  ID3D11DeviceContext4_GetHardwareProtectionState(c4, &protection);
+  check(!protection, "hardware protection starts off");
+  ID3D11DeviceContext4_SetHardwareProtectionState(c4, TRUE);
+  ID3D11DeviceContext4_GetHardwareProtectionState(c4, &protection);
+  check(protection, "SetHardwareProtectionState is kept");
+  ID3D11DeviceContext4_SetHardwareProtectionState(c4, FALSE);
+  if (deferred) {
+    ID3D11DeviceContext4 *dc4 = NULL;
+    ID3D11DeviceContext3_QueryInterface(deferred, &IID_ID3D11DeviceContext4, (void **)&dc4);
+    ID3D11Fence *f = NULL;
+    ID3D11Device5_CreateFence(d5, 0, D3D11_FENCE_FLAG_NONE, &IID_ID3D11Fence, (void **)&f);
+    check(dc4 && f && ID3D11DeviceContext4_Signal(dc4, f, 1) == DXGI_ERROR_INVALID_CALL && ID3D11DeviceContext4_Wait(dc4, f, 1) == DXGI_ERROR_INVALID_CALL,
+          "a deferred context has no Signal or Wait");
+    if (f) ID3D11Fence_Release(f);
+    if (dc4) ID3D11DeviceContext4_Release(dc4);
+    ID3D11DeviceContext3_Release(deferred);
+  }
+
+  /* device-removed events: registered and unregistered on this device (not set: it is there); on a device on Direct3D 12 that RemoveDevice loses, set */
+  HANDLE gone = CreateEventW(NULL, TRUE, FALSE, NULL);
+  DWORD cookie = 0;
+  check(SUCCEEDED(ID3D11Device5_RegisterDeviceRemovedEvent(d5, gone, &cookie)) && cookie != 0, "RegisterDeviceRemovedEvent gives a cookie");
+  check(WaitForSingleObject(gone, 50) == WAIT_TIMEOUT, "... and the event is not set while the device is there");
+  ID3D11Device5_UnregisterDeviceRemoved(d5, cookie);
+  check(ID3D11Device5_RegisterDeviceRemovedEvent(d5, NULL, &cookie) == E_INVALIDARG, "RegisterDeviceRemovedEvent refuses no event");
+  ID3D12Device *d12 = NULL;
+  ID3D12CommandQueue *queue = NULL;
+  D3D12_COMMAND_QUEUE_DESC qdesc = {D3D12_COMMAND_LIST_TYPE_DIRECT, 0, D3D12_COMMAND_QUEUE_FLAG_NONE, 0};
+  if (SUCCEEDED(D3D12CreateDevice(NULL, D3D_FEATURE_LEVEL_11_0, &IID_ID3D12Device, (void **)&d12)) && d12)
+    ID3D12Device_CreateCommandQueue(d12, &qdesc, &IID_ID3D12CommandQueue, (void **)&queue);
+  ID3D11Device *on12 = NULL;
+  ID3D11Device5 *on12_5 = NULL;
+  if (queue) D3D11On12CreateDevice((IUnknown *)d12, 0, NULL, 0, (IUnknown **)&queue, 1, 0, &on12, NULL, NULL);
+  if (on12) ID3D11Device_QueryInterface(on12, &IID_ID3D11Device5, (void **)&on12_5);
+  ID3D12Device5 *d12_5 = NULL;
+  if (d12) ID3D12Device_QueryInterface(d12, &IID_ID3D12Device5, (void **)&d12_5);
+  check(on12_5 && d12_5, "a Direct3D 11 device on a Direct3D 12 device, for removal");
+  if (on12_5 && d12_5) {
+    HANDLE lost = CreateEventW(NULL, TRUE, FALSE, NULL), kept = CreateEventW(NULL, TRUE, FALSE, NULL);
+    DWORD c_lost = 0, c_kept = 0;
+    check(SUCCEEDED(ID3D11Device5_RegisterDeviceRemovedEvent(on12_5, lost, &c_lost)) && SUCCEEDED(ID3D11Device5_RegisterDeviceRemovedEvent(on12_5, kept, &c_kept)) &&
+          c_lost != c_kept, "two events registered, two cookies");
+    ID3D11Device5_UnregisterDeviceRemoved(on12_5, c_kept);
+    ID3D12Device5_RemoveDevice(d12_5);
+    check(WaitForSingleObject(lost, 10000) == WAIT_OBJECT_0, "RemoveDevice of the Direct3D 12 device sets the registered event");
+    check(WaitForSingleObject(kept, 100) == WAIT_TIMEOUT, "... and not the one unregistered");
+    check(ID3D11Device5_GetDeviceRemovedReason(on12_5) == DXGI_ERROR_DEVICE_REMOVED, "GetDeviceRemovedReason then: DXGI_ERROR_DEVICE_REMOVED");
+    HANDLE late = CreateEventW(NULL, TRUE, FALSE, NULL);
+    DWORD c_late = 0;
+    check(SUCCEEDED(ID3D11Device5_RegisterDeviceRemovedEvent(on12_5, late, &c_late)) && WaitForSingleObject(late, 0) == WAIT_OBJECT_0,
+          "an event registered after the removal is set at once");
+    CloseHandle(late);
+    CloseHandle(lost);
+    CloseHandle(kept);
+  }
+  if (d12_5) ID3D12Device5_Release(d12_5);
+  if (on12_5) ID3D11Device5_Release(on12_5);
+  if (on12) ID3D11Device_Release(on12);
+  if (queue) ID3D12CommandQueue_Release(queue);
+  if (d12) ID3D12Device_Release(d12);
+  CloseHandle(gone);
+  ID3D11DeviceContext4_Release(c4);
+  ID3D11Device5_Release(d5);
+}
+
 static void test_render_to_levels(void) {
   D3D11_TEXTURE2D_DESC desc = {8, 8, 0, 1, DXGI_FORMAT_R8G8B8A8_UNORM, {1, 0}, D3D11_USAGE_DEFAULT, D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE, 0,
                                D3D11_RESOURCE_MISC_GENERATE_MIPS};
@@ -2268,6 +2523,7 @@ int main(void) {
       test_formats();
       test_creation_and_interop();
       test_render_to_levels();
+      test_device5();
     }
     ID3D11DeviceContext_ClearState(g_context);
     ID3D11DeviceContext_Flush(g_context);

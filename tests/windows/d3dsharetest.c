@@ -28,7 +28,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <d3d12.h>
-#include <d3d11_1.h>
+#include <d3d11_4.h>
 #include <dxgi1_6.h>
 #include <winternl.h>
 
@@ -436,6 +436,143 @@ typedef NTSTATUS(WINAPI *KmtByNameFn)(KmtOpenByName *);
 typedef NTSTATUS(WINAPI *KmtOpenSyncFn)(KmtOpenSync *);
 typedef NTSTATUS(WINAPI *KmtShareFn)(UINT, const UINT *, OBJECT_ATTRIBUTES *, DWORD, HANDLE *);
 typedef NTSTATUS(WINAPI *KmtDestroySyncFn)(UINT *);
+/* ---- Direct3D 11 fences (ID3D11Device5, ID3D11DeviceContext4) ------------------------------------------------------------------------------------------------------ */
+
+static ID3D11Device5 *device5(ID3D11DeviceContext4 **context) {
+  ID3D11Device *dev = NULL;
+  ID3D11DeviceContext *ctx = NULL;
+  ID3D11Device5 *d5 = NULL;
+  *context = NULL;
+  CHECK_HR(D3D11CreateDevice(NULL, D3D_DRIVER_TYPE_HARDWARE, NULL, 0, NULL, 0, D3D11_SDK_VERSION, &dev, NULL, &ctx));
+  if (!dev) return NULL;
+  CHECK_HR(ID3D11Device_QueryInterface(dev, &IID_ID3D11Device5, (void **)&d5));
+  CHECK_HR(ID3D11DeviceContext_QueryInterface(ctx, &IID_ID3D11DeviceContext4, (void **)context));
+  ID3D11DeviceContext_Release(ctx);
+  ID3D11Device_Release(dev);
+  return d5;
+}
+typedef struct LateSignal { ID3D11DeviceContext4 *ctx; ID3D11Fence *fence; UINT64 value; volatile LONG done; } LateSignal;
+static DWORD WINAPI late_signal(void *p) {
+  LateSignal *s = p;
+  Sleep(300);
+  InterlockedExchange(&s->done, 1);
+  ID3D11DeviceContext4_Signal(s->ctx, s->fence, s->value);
+  return 0;
+}
+static void test_d3d11_fences(D12 *a) {
+  ID3D11DeviceContext4 *cx = NULL, *cy = NULL;
+  ID3D11Device5 *x = device5(&cx), *y = device5(&cy);
+  if (!x || !y || !cx || !cy) goto done;
+  ID3D11Fence *fence = NULL, *plain = NULL, *none1 = NULL, *bad = NULL, *opened = NULL;
+  CHECK_HR(ID3D11Device5_CreateFence(x, 3, D3D11_FENCE_FLAG_SHARED, &IID_ID3D11Fence, (void **)&fence));
+  CHECK_HR(ID3D11Device5_CreateFence(x, 0, (D3D11_FENCE_FLAG)0, &IID_ID3D11Fence, (void **)&plain));
+  CHECK_HR(ID3D11Device5_CreateFence(x, 0, D3D11_FENCE_FLAG_NONE, &IID_ID3D11Fence, (void **)&none1));
+  CHECK(ID3D11Device5_CreateFence(x, 0, D3D11_FENCE_FLAG_SHARED | D3D11_FENCE_FLAG_SHARED_CROSS_ADAPTER, &IID_ID3D11Fence, (void **)&bad) == DXGI_ERROR_UNSUPPORTED && !bad);
+  CHECK(ID3D11Device5_CreateFence(x, 0, (D3D11_FENCE_FLAG)0x10, &IID_ID3D11Fence, (void **)&bad) == E_INVALIDARG && !bad);
+  CHECK(ID3D11Device5_CreateFence(x, 0, D3D11_FENCE_FLAG_NONE, &IID_ID3D11Device, (void **)&bad) == E_NOINTERFACE && !bad);
+  if (!fence || !plain) goto fences_done;
+  CHECK(ID3D11Fence_GetCompletedValue(fence) == 3);
+  ID3D11Device *owner = NULL;
+  ID3D11Fence_GetDevice(fence, &owner);
+  CHECK(owner == (ID3D11Device *)x);
+  if (owner) ID3D11Device_Release(owner);
+  ID3D11DeviceChild *as_child = NULL;
+  CHECK_HR(ID3D11Fence_QueryInterface(fence, &IID_ID3D11DeviceChild, (void **)&as_child));
+  if (as_child) ID3D11DeviceChild_Release(as_child);
+  /* handles: GENERIC_ALL only, and only of a shared fence */
+  HANDLE handle = NULL, none = NULL;
+  CHECK(ID3D11Fence_CreateSharedHandle(plain, NULL, GENERIC_ALL, NULL, &none) == E_INVALIDARG && !none);
+  CHECK(ID3D11Fence_CreateSharedHandle(fence, NULL, GENERIC_READ, NULL, &none) == E_INVALIDARG && !none);
+  CHECK_HR(ID3D11Fence_CreateSharedHandle(fence, NULL, GENERIC_ALL, L"TcosShareTestFence11", &handle));
+  if (!handle) goto fences_done;
+  CHECK_HR(ID3D11Device5_OpenSharedFence(y, handle, &IID_ID3D11Fence, (void **)&opened));
+  CHECK(ID3D11Device5_OpenSharedFence(y, NULL, &IID_ID3D11Fence, (void **)&bad) == E_INVALIDARG && !bad);
+  if (opened) {
+    CHECK(ID3D11Fence_GetCompletedValue(opened) == 3);
+    /* a signal of one device's context is the other's value */
+    CHECK_HR(ID3D11DeviceContext4_Signal(cx, fence, 5));
+    CHECK(ID3D11Fence_GetCompletedValue(opened) == 5);
+    HANDLE event = CreateEventW(NULL, FALSE, FALSE, NULL);
+    CHECK_HR(ID3D11Fence_SetEventOnCompletion(fence, 7, event));
+    CHECK(WaitForSingleObject(event, 0) == WAIT_TIMEOUT);
+    CHECK_HR(ID3D11DeviceContext4_Signal(cy, opened, 7));
+    CHECK(WaitForSingleObject(event, 10000) == WAIT_OBJECT_0);
+    CHECK(ID3D11Fence_GetCompletedValue(fence) == 7);
+    CHECK(ID3D11Fence_SetEventOnCompletion(fence, 8, NULL) == E_INVALIDARG);
+    /* a wait of one context holds back what follows it until the other device signals: x waits for 11, then signals `plain` with 1 */
+    LateSignal late = {cy, opened, 11, 0};
+    HANDLE thread = CreateThread(NULL, 0, late_signal, &late, 0, NULL);
+    CHECK(thread != NULL);
+    if (thread) {
+      CHECK_HR(ID3D11DeviceContext4_Wait(cx, fence, 11));
+      CHECK_HR(ID3D11DeviceContext4_Signal(cx, plain, 1));
+      CHECK_HR(ID3D11Fence_SetEventOnCompletion(plain, 1, event));
+      CHECK(WaitForSingleObject(event, 10000) == WAIT_OBJECT_0);
+      CHECK(late.done == 1);      /* (not before the other device's signal) */
+      CHECK(ID3D11Fence_GetCompletedValue(plain) == 1 && ID3D11Fence_GetCompletedValue(fence) == 11);
+      WaitForSingleObject(thread, 10000);
+      CloseHandle(thread);
+    }
+    CloseHandle(event);
+    CHECK(ID3D11DeviceContext4_Signal(cx, NULL, 1) == E_INVALIDARG);
+    CHECK(ID3D11DeviceContext4_Signal(cx, (ID3D11Fence *)x, 1) == E_INVALIDARG);      /* (not a fence) */
+    ID3D11Fence_Release(opened);
+  }
+  /* the same fence is Direct3D 12's: its handle opens there, and a Direct3D 12 fence's opens here */
+  ID3D12Fence *f12 = NULL;
+  CHECK_HR(ID3D12Device_OpenSharedHandle(a->dev, handle, &IID_ID3D12Fence, (void **)&f12));
+  if (f12) {
+    CHECK(ID3D12Fence_GetCompletedValue(f12) == 11);
+    CHECK_HR(ID3D12CommandQueue_Signal(a->queue, f12, 13));
+    CHECK(ID3D11Fence_GetCompletedValue(fence) == 13);
+    ID3D12Fence_Release(f12);
+  }
+  ID3D12Fence *from12 = NULL;
+  HANDLE h12 = NULL;
+  CHECK_HR(ID3D12Device_CreateFence(a->dev, 21, D3D12_FENCE_FLAG_SHARED, &IID_ID3D12Fence, (void **)&from12));
+  if (from12) CHECK_HR(ID3D12Device_CreateSharedHandle(a->dev, (ID3D12DeviceChild *)from12, NULL, GENERIC_ALL, NULL, &h12));
+  if (h12) {
+    ID3D11Fence *in11 = NULL;
+    CHECK_HR(ID3D11Device5_OpenSharedFence(x, h12, &IID_ID3D11Fence, (void **)&in11));
+    if (in11) {
+      CHECK(ID3D11Fence_GetCompletedValue(in11) == 21);
+      CHECK_HR(ID3D11DeviceContext4_Signal(cx, in11, 22));
+      CHECK(ID3D12Fence_GetCompletedValue(from12) == 22);
+      HANDLE again = NULL;      /* (an opened fence is shared too: it gives a handle of its own) */
+      CHECK_HR(ID3D11Fence_CreateSharedHandle(in11, NULL, GENERIC_ALL, NULL, &again));
+      if (again) CloseHandle(again);
+      ID3D11Fence_Release(in11);
+    }
+    CloseHandle(h12);
+  }
+  if (from12) ID3D12Fence_Release(from12);
+  /* a resource's handle is not a fence's */
+  ID3D12Resource *res = buffer(a->dev, D3D12_HEAP_TYPE_DEFAULT, D3D12_HEAP_FLAG_SHARED, 256, D3D12_RESOURCE_STATE_COMMON);
+  HANDLE hres = NULL;
+  if (res) CHECK_HR(ID3D12Device_CreateSharedHandle(a->dev, (ID3D12DeviceChild *)res, NULL, GENERIC_ALL, NULL, &hres));
+  if (hres) { CHECK(FAILED(ID3D11Device5_OpenSharedFence(x, hres, &IID_ID3D11Fence, (void **)&bad)) && !bad); CloseHandle(hres); }
+  if (res) ID3D12Resource_Release(res);
+  /* by name */
+  HANDLE by_name = NULL;
+  CHECK_HR(ID3D12Device_OpenSharedHandleByName(a->dev, L"TcosShareTestFence11", GENERIC_ALL, &by_name));
+  if (by_name) {
+    ID3D11Fence *named = NULL;
+    CHECK_HR(ID3D11Device5_OpenSharedFence(y, by_name, &IID_ID3D11Fence, (void **)&named));
+    if (named) { CHECK(ID3D11Fence_GetCompletedValue(named) == 13); ID3D11Fence_Release(named); }
+    CloseHandle(by_name);
+  }
+  CloseHandle(handle);
+fences_done:
+  if (fence) ID3D11Fence_Release(fence);
+  if (plain) ID3D11Fence_Release(plain);
+  if (none1) ID3D11Fence_Release(none1);
+done:
+  if (cx) ID3D11DeviceContext4_Release(cx);
+  if (cy) ID3D11DeviceContext4_Release(cy);
+  if (x) ID3D11Device5_Release(x);
+  if (y) ID3D11Device5_Release(y);
+}
+
 static void name_attributes(OBJECT_ATTRIBUTES *oa, UNICODE_STRING *us, const WCHAR *text) {
   us->Buffer = (WCHAR *)text;
   us->Length = (USHORT)(wcslen(text) * 2);
@@ -753,7 +890,27 @@ static void child_legacy(HANDLE legacy) {
   ID3D11DeviceContext_Release(ctx);
   ID3D11Device_Release(dev);
 }
-static int child(HANDLE buffer_handle, HANDLE fence_handle, HANDLE texture_handle, HANDLE legacy) {
+/* The parent's Direct3D 11 fence: the child's context waits for 1 (the parent's signal) and then signals 2, which the parent waits for. */
+static void child_fence11(HANDLE fence_handle) {
+  ID3D11DeviceContext4 *ctx = NULL;
+  ID3D11Device5 *dev = device5(&ctx);
+  ID3D11Fence *fence = NULL;
+  if (dev) CHECK_HR(ID3D11Device5_OpenSharedFence(dev, fence_handle, &IID_ID3D11Fence, (void **)&fence));
+  if (fence && ctx) {
+    CHECK_HR(ID3D11DeviceContext4_Wait(ctx, fence, 1));
+    CHECK_HR(ID3D11DeviceContext4_Signal(ctx, fence, 2));
+    /* (the wait is the GPU's: the CPU goes on, and the signal behind it is done once the parent signals 1 - the child stays until then) */
+    HANDLE done = CreateEventW(NULL, FALSE, FALSE, NULL);
+    CHECK_HR(ID3D11Fence_SetEventOnCompletion(fence, 2, done));
+    CHECK(WaitForSingleObject(done, 60000) == WAIT_OBJECT_0);
+    CHECK(ID3D11Fence_GetCompletedValue(fence) == 2);
+    CloseHandle(done);
+  }
+  if (fence) ID3D11Fence_Release(fence);
+  if (ctx) ID3D11DeviceContext4_Release(ctx);
+  if (dev) ID3D11Device5_Release(dev);
+}
+static int child(HANDLE buffer_handle, HANDLE fence_handle, HANDLE texture_handle, HANDLE legacy, HANDLE fence11) {
   D12 c;
   if (!d12_make(&c)) { printf("child: no device\n"); return 1; }
   ID3D12Resource *shared = NULL;
@@ -774,6 +931,7 @@ static int child(HANDLE buffer_handle, HANDLE fence_handle, HANDLE texture_handl
   d12_free(&c);
   if (texture_handle) child_keyed(texture_handle);
   if (legacy) child_legacy(legacy);
+  if (fence11) child_fence11(fence11);
   printf("d3dsharetest child: %d checks, %d failed\n", checks, failed);
   return failed ? 1 : 0;
 }
@@ -815,10 +973,18 @@ static void test_processes(D12 *a) {
     legacy_tex = legacy_texture(x, cx, D3D11_RESOURCE_MISC_SHARED, yellow);
     if (legacy_tex) hl = legacy_handle(legacy_tex);
   }
+  /* (and a Direct3D 11 fence: the child waits on it for 1, then signals 2) */
+  ID3D11Device5 *x5 = NULL;
+  ID3D11DeviceContext4 *cx4 = NULL;
+  ID3D11Fence *f11 = NULL;
+  HANDLE hf11 = NULL;
+  if (x) { CHECK_HR(ID3D11Device_QueryInterface(x, &IID_ID3D11Device5, (void **)&x5)); CHECK_HR(ID3D11DeviceContext_QueryInterface(cx, &IID_ID3D11DeviceContext4, (void **)&cx4)); }
+  if (x5) CHECK_HR(ID3D11Device5_CreateFence(x5, 0, D3D11_FENCE_FLAG_SHARED, &IID_ID3D11Fence, (void **)&f11));
+  if (f11) CHECK_HR(ID3D11Fence_CreateSharedHandle(f11, &inherit, GENERIC_ALL, NULL, &hf11));
   WCHAR self[MAX_PATH], line[MAX_PATH + 128];
   GetModuleFileNameW(NULL, self, MAX_PATH);
-  swprintf(line, sizeof line / sizeof line[0], L"\"%ls\" child %llu %llu %llu %llu", self, (unsigned long long)(UINT_PTR)hb, (unsigned long long)(UINT_PTR)hf,
-           (unsigned long long)(UINT_PTR)ht, (unsigned long long)(UINT_PTR)hl);
+  swprintf(line, sizeof line / sizeof line[0], L"\"%ls\" child %llu %llu %llu %llu %llu", self, (unsigned long long)(UINT_PTR)hb, (unsigned long long)(UINT_PTR)hf,
+           (unsigned long long)(UINT_PTR)ht, (unsigned long long)(UINT_PTR)hl, (unsigned long long)(UINT_PTR)hf11);
   STARTUPINFOW si;
   PROCESS_INFORMATION pi;
   memset(&si, 0, sizeof si);
@@ -830,6 +996,13 @@ static void test_processes(D12 *a) {
     HANDLE event = CreateEventW(NULL, FALSE, FALSE, NULL);
     CHECK_HR(ID3D12Fence_SetEventOnCompletion(fence, 2, event));
     CHECK(WaitForSingleObject(event, 60000) == WAIT_OBJECT_0);
+    if (f11 && cx4) {
+      Sleep(200);      /* (the child is waiting on the fence by now, most likely: the signal releases it) */
+      CHECK_HR(ID3D11DeviceContext4_Signal(cx4, f11, 1));
+      CHECK_HR(ID3D11Fence_SetEventOnCompletion(f11, 2, event));
+      CHECK(WaitForSingleObject(event, 60000) == WAIT_OBJECT_0);      /* (the child's signal, after its wait) */
+      CHECK(ID3D11Fence_GetCompletedValue(f11) == 2);
+    }
     CloseHandle(event);
     CHECK(WaitForSingleObject(pi.hProcess, 60000) == WAIT_OBJECT_0);
     DWORD code = 99;
@@ -848,6 +1021,10 @@ static void test_processes(D12 *a) {
   CloseHandle(hb);
   CloseHandle(hf);
   if (ht) CloseHandle(ht);
+  if (hf11) CloseHandle(hf11);
+  if (f11) ID3D11Fence_Release(f11);
+  if (cx4) ID3D11DeviceContext4_Release(cx4);
+  if (x5) ID3D11Device5_Release(x5);
   if (km) IDXGIKeyedMutex_Release(km);
   if (legacy_tex) ID3D11Texture2D_Release(legacy_tex);
   if (tex) ID3D11Texture2D_Release(tex);
@@ -858,9 +1035,9 @@ static void test_processes(D12 *a) {
 }
 
 int main(int argc, char **argv) {
-  if (argc == 6 && strcmp(argv[1], "child") == 0)
+  if (argc == 7 && strcmp(argv[1], "child") == 0)
     return child((HANDLE)(UINT_PTR)_strtoui64(argv[2], NULL, 10), (HANDLE)(UINT_PTR)_strtoui64(argv[3], NULL, 10), (HANDLE)(UINT_PTR)_strtoui64(argv[4], NULL, 10),
-                 (HANDLE)(UINT_PTR)_strtoui64(argv[5], NULL, 10));
+                 (HANDLE)(UINT_PTR)_strtoui64(argv[5], NULL, 10), (HANDLE)(UINT_PTR)_strtoui64(argv[6], NULL, 10));
   const int processes = argc > 1 && strcmp(argv[1], "processes") == 0;
   D12 a, b;
   if (!d12_make(&a) || !d12_make(&b)) {
@@ -875,6 +1052,7 @@ int main(int argc, char **argv) {
   test_kmt_direct(&a);
   test_keyed_mutex();
   test_legacy(&a);
+  test_d3d11_fences(&a);
   if (processes) test_processes(&a);
   d12_free(&a);
   d12_free(&b);
