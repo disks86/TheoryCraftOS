@@ -243,7 +243,7 @@ bool ParameterSets::parse_sps(BitReader& br) {
     if (s.chroma_format_idc == 3) br.u(1);
     const int bdl = static_cast<int>(br.ue()), bdc = static_cast<int>(br.ue());
     s.qpprime_bypass = br.u(1) != 0;
-    if (s.chroma_format_idc != 1 || bdl != 0 || bdc != 0 || s.qpprime_bypass) return false;  // 8-bit 4:2:0 only
+    if (s.chroma_format_idc > 1 || bdl != 0 || bdc != 0 || s.qpprime_bypass) return false;  // 8-bit 4:2:0 and monochrome only
     s.scaling_matrix_present = br.u(1) != 0;
     if (s.scaling_matrix_present) {
       ScalingRaw raw = {};
@@ -280,12 +280,12 @@ bool ParameterSets::parse_sps(BitReader& br) {
   if (!s.frame_mbs_only) s.mbaff = br.u(1) != 0;
   s.direct_8x8_inference = br.u(1) != 0;
   if (br.error() || s.max_num_ref_frames > 16) return false;
-  if (s.mbaff) return false;  // interlaced coding is not supported
   s.mb_w = w;
   s.mb_h = hmap * (s.frame_mbs_only ? 1 : 2);
   if (w < 1 || s.mb_h < 1 || static_cast<int64_t>(w) * s.mb_h > kMaxMbs || w > 1024 || s.mb_h > 1024) return false;
   if (br.u(1)) {
-    const int unit_x = 2, unit_y = 2 * (s.frame_mbs_only ? 1 : 2);
+    const int sub = s.chroma_format_idc == 0 ? 1 : 2;   // CropUnitX / CropUnitY (7-19 .. 7-22)
+    const int unit_x = sub, unit_y = sub * (s.frame_mbs_only ? 1 : 2);
     uint32_t crop[4];
     for (uint32_t& c : crop) {
       c = br.ue();
@@ -544,10 +544,11 @@ bool Core::handle_nal(const uint8_t* nal, uint64_t size, int64_t pts) {
     refs.first_mb = sh.first_mb;
     refs.current_poc = pic_poc_;
     for (int l = 0; l < 2; ++l) {
-      refs.count[l] = ref_count_[l] < 32 ? ref_count_[l] : 32;
+      refs.count[l] = ref_n_[0][l] < 32 ? ref_n_[0][l] : 32;
       for (int i = 0; i < refs.count[l]; ++i) {
-        refs.poc[l][i] = ref_list_[l][i]->poc;
-        refs.long_term[l][i] = ref_list_[l][i]->is_long;
+        const RefPic& r = refs_[0][l][i];
+        refs.poc[l][i] = r.parity == 1 ? r.pic->top_poc : r.parity == 2 ? r.pic->bottom_poc : r.pic->poc;
+        refs.long_term[l][i] = r.parity ? r.pic->field_ref[r.parity - 1] == 2 : r.pic->is_long;
       }
     }
     observer_(observer_context_, refs);
@@ -562,6 +563,7 @@ bool Core::handle_nal(const uint8_t* nal, uint64_t size, int64_t pts) {
 // 7.4.1.2.4
 bool ParameterSets::new_picture(const Sps& sps, const SliceHeader& a, const SliceHeader& b) {
   if (a.frame_num != b.frame_num || a.pps_id != b.pps_id) return true;
+  if (a.field_pic != b.field_pic || (a.field_pic && a.bottom_field != b.bottom_field)) return true;
   if ((a.nal_ref_idc == 0) != (b.nal_ref_idc == 0)) return true;
   if (a.idr() != b.idr()) return true;
   if (b.idr() && a.idr_pic_id != b.idr_pic_id) return true;
@@ -605,15 +607,15 @@ bool ParameterSets::parse_slice_header(BitReader& br, SliceHeader* sh) const {
   sh->frame_num = static_cast<int>(br.u(s.log2_max_frame_num));
   if (!s.frame_mbs_only) {
     sh->field_pic = br.u(1) != 0;
-    if (sh->field_pic) return false;  // field pictures are not supported
+    if (sh->field_pic) sh->bottom_field = br.u(1) != 0;
   }
   if (sh->idr()) sh->idr_pic_id = static_cast<int>(br.ue());
   if (s.poc_type == 0) {
     sh->poc_lsb = static_cast<int>(br.u(s.log2_max_poc_lsb));
-    if (p.bottom_field_pic_order) sh->delta_poc_bottom = br.se();
+    if (p.bottom_field_pic_order && !sh->field_pic) sh->delta_poc_bottom = br.se();
   } else if (s.poc_type == 1 && !s.delta_pic_order_always_zero) {
     sh->delta_poc[0] = br.se();
-    if (p.bottom_field_pic_order) sh->delta_poc[1] = br.se();
+    if (p.bottom_field_pic_order && !sh->field_pic) sh->delta_poc[1] = br.se();
   }
   if (p.redundant_pic_cnt_present) sh->redundant_pic_cnt = static_cast<int>(br.ue());
   if (sh->type == kSliceB) sh->direct_spatial_mv_pred = br.u(1) != 0;
@@ -655,7 +657,7 @@ bool ParameterSets::parse_slice_header(BitReader& br, SliceHeader* sh) const {
           sh->luma_weight[l][i] = br.se();
           sh->luma_offset[l][i] = br.se();
         }
-        sh->chroma_weight_flag[l][i] = br.u(1) != 0;
+        sh->chroma_weight_flag[l][i] = s.chroma_format_idc != 0 && br.u(1) != 0;   // (no chroma weights without chroma)
         for (int c = 0; c < 2; ++c) {
           sh->chroma_weight[l][i][c] = 1 << sh->chroma_log2_denom;
           sh->chroma_offset[l][i][c] = 0;
@@ -705,7 +707,10 @@ bool ParameterSets::parse_slice_header(BitReader& br, SliceHeader* sh) const {
       if (sh->alpha_off < -12 || sh->alpha_off > 12 || sh->beta_off < -12 || sh->beta_off > 12) return false;
     }
   }
-  return !br.error() && sh->first_mb < s.mb_w * s.mb_h;
+  // first_mb_in_slice counts macroblock pairs in an MBAFF frame (CurrMbAddr = first_mb_in_slice * ( 1 + MbaffFrameFlag )) and the macroblocks of the field in a field picture.
+  const int pic_mbs = s.mb_w * (sh->field_pic ? s.mb_h / 2 : s.mb_h);
+  const int first_addr = (s.mbaff && !sh->field_pic) ? 2 * sh->first_mb : sh->first_mb;
+  return !br.error() && first_addr < pic_mbs;
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -755,18 +760,30 @@ bool Core::start_picture(const SliceHeader& sh, int64_t pts) {
       return false;
     }
   }
+  if (sh.field_pic && (s.mb_h & 1)) return false;   // (a field needs whole macroblock pairs: frame_mbs_only_flag 0 makes the height even)
   sp_ = &s;
   dpb_.set_sps(sp_);
   pp_ = &p;
   active_sps_id_ = p.sps_id;
-  if (ext_ && !apply_external_references()) {
+  if (ext_ && !apply_external_references(sh)) {
     ext_no_memory_ = true;
     return false;
   }
-  PictureInfo* info = dpb_.begin_picture(sh, pts);
+  // Decoding for a DXVA driver, a field: the surface's frame (the picture the key held) is where the field goes. When it holds the other field only, the
+  // field is decoded into it (the second field of a pair); otherwise into a new picture that takes the frame's other lines.
+  Picture* surface = nullptr;
+  if (ext_ && sh.field_pic) {
+    for (Picture& q : pics_)
+      if (q.has_key && q.key == ext_->key) surface = &q;
+  }
+  const uint8_t own = static_cast<uint8_t>(sh.bottom_field ? 2 : 1);
+  Picture* into = (surface && surface->decoded && !(surface->decoded & own) && surface->has_memory) ? surface : nullptr;
+  if (ext_) dpb_.forget_pending();
+  PictureInfo* info = dpb_.begin_picture(sh, pts, into);
   if (!info) return false;
   Picture* pic = static_cast<Picture*>(info);  // every slot of the buffer is one of our pictures
-  if (!alloc_picture(pic)) {
+  const bool second = dpb_.second_field();
+  if (!second && !alloc_picture(pic)) {
     dpb_.abort_picture();
     if (ext_) ext_no_memory_ = true;
     return false;
@@ -774,17 +791,55 @@ bool Core::start_picture(const SliceHeader& sh, int64_t pts) {
   if (ext_) {
     dpb_.set_current_poc(ext_->top_poc, ext_->bottom_poc);
     // The surface's earlier picture (which this one may predict from) keeps its key until this one is finished.
-    pic->has_key = false;
+    if (!second && pic != surface) pic->has_key = false;
     ext_started_ = true;
   }
+  structure_ = dpb_.structure();
+  field_pic_ = structure_ != 3;
+  mbaff_ = s.mbaff && !field_pic_;
+  mono_ = s.chroma_format_idc == 0;
+  pic_mb_h_ = field_pic_ ? mb_h_ / 2 : mb_h_;
+  pic_mbs_ = mb_w_ * pic_mb_h_;
+  motion_base_ = structure_ == 2 ? pic_mbs_ : 0;
+  pic_ls_ = field_pic_ ? 2 * pic->stride : pic->stride;
+  pic_cs_ = field_pic_ ? 2 * pic->cstride : pic->cstride;
+  pic_y_ = pic->y.data() + (structure_ == 2 ? pic->stride : 0);
+  pic_u_ = pic->u.data() + (structure_ == 2 ? pic->cstride : 0);
+  pic_v_ = pic->v.data() + (structure_ == 2 ? pic->cstride : 0);
   cur_ = pic;
   pic_poc_ = dpb_.pic_poc();
   pic_pts_ = pts;
   slice_no_ = 0;
-  for (uint64_t i = 0; i < mbs_.size(); ++i) mbs_[i].slice = -1;
-  // Samples of macroblocks never decoded stay mid-grey.
-  for (uint64_t i = 0; i < cur_->y.size(); ++i) cur_->y[i] = 128;
-  for (uint64_t i = 0; i < cur_->u.size(); ++i) cur_->u[i] = cur_->v[i] = 128;
+  for (int i = 0; i < pic_mbs_; ++i) mbs_[static_cast<uint64_t>(i)].slice = -1;
+  if (!second) {
+    if (surface && surface != pic) {
+      // (a field into a surface that held a frame or the same field: the other lines are the surface's)
+      for (uint64_t i = 0; i < pic->y.size(); ++i) pic->y[i] = surface->y[i];
+      for (uint64_t i = 0; i < pic->u.size(); ++i) {
+        pic->u[i] = surface->u[i];
+        pic->v[i] = surface->v[i];
+      }
+    } else if (surface != pic) {
+      // Samples of macroblocks never decoded stay mid-grey (and so do a field's other lines until its pair comes).
+      for (uint64_t i = 0; i < pic->y.size(); ++i) pic->y[i] = 128;
+      for (uint64_t i = 0; i < pic->u.size(); ++i) pic->u[i] = pic->v[i] = 128;
+    }
+    if (field_pic_) {
+      // The other field's macroblocks have no motion until it is decoded (a direct prediction from it sees intra macroblocks).
+      const int other = structure_ == 2 ? 0 : pic_mbs_;
+      for (int i = 0; i < pic_mbs_; ++i) {
+        MotionMb& m = pic->motion[static_cast<uint64_t>(other + i)];
+        m.intra = 1;
+        m.field = 1;
+        for (int l = 0; l < 2; ++l)
+          for (int b = 0; b < 4; ++b) {
+            m.ref[l][b] = -1;
+            m.refid[l][b] = -1;
+          }
+      }
+    }
+  }
+  pic->mbaff = mbaff_;
   compute_scaling();
   waiting_for_idr_ = false;
   return true;
@@ -803,20 +858,26 @@ void Core::finish_picture() {
 }
 
 // Decoding for a DXVA driver: the slots hold the pictures of the program's surfaces, by key. Before a picture starts, exactly the pictures the program names are
-// references, with its frame numbers and order counts; a reference whose surface holds nothing gets a mid-grey stand-in (intra, so direct prediction from it has no
-// motion). Every other slot is free and forgets its key: a picture no longer referenced is never referenced again.
-bool Core::apply_external_references() {
+// references, with its frame numbers, order counts and the fields it says are used; a reference whose surface holds nothing gets a mid-grey stand-in (intra, so
+// direct prediction from it has no motion). Every other slot is free and forgets its key: a picture no longer referenced is never referenced again - except, for a
+// field picture, the frame of the output surface, which the field goes into.
+bool Core::apply_external_references(const SliceHeader& sh) {
   const H264Decoder::ExternalPicture& ext = *ext_;
   bool named[kMaxPictures] = {};
+  bool kept[kMaxPictures] = {};
   for (int i = 0; i < kMaxPictures; ++i) {
     Picture& p = pics_[i];
+    p.field_ref[0] = p.field_ref[1] = 0;
     p.is_ref = p.is_long = false;
     if (!p.has_key) continue;
     for (const H264Decoder::ExternalReference& r : ext.references)
       if (r.key == p.key && !r.non_existing) named[i] = true;
-    if (!named[i]) p.has_key = false;
+    kept[i] = named[i] || (sh.field_pic && p.key == ext.key);
+    if (!kept[i]) p.has_key = false;
   }
   for (const H264Decoder::ExternalReference& r : ext.references) {
+    const uint8_t fields = r.fields & 3;
+    if (!fields) continue;
     Picture* found = nullptr;
     for (int i = 0; i < kMaxPictures && !found; ++i)
       if (named[i] && pics_[i].key == r.key && !r.non_existing) found = &pics_[i];
@@ -824,9 +885,9 @@ bool Core::apply_external_references() {
     if (!found) {
       if (!r.non_existing) ext_missing_ = true;
       for (int i = 0; i < kMaxPictures && !found; ++i)
-        if (!named[i] && !pics_[i].is_ref && pics_[i].has_memory) found = &pics_[i];
+        if (!kept[i] && !pics_[i].is_ref && pics_[i].has_memory) found = &pics_[i];
       for (int i = 0; i < kMaxPictures && !found; ++i)
-        if (!named[i] && !pics_[i].is_ref) found = &pics_[i];
+        if (!kept[i] && !pics_[i].is_ref) found = &pics_[i];
       if (!found || !alloc_picture(found)) return false;
       for (uint64_t k = 0; k < found->y.size(); ++k) found->y[k] = 128;
       for (uint64_t k = 0; k < found->u.size(); ++k) found->u[k] = found->v[k] = 128;
@@ -840,28 +901,34 @@ bool Core::apply_external_references() {
         for (int l = 0; l < 2; ++l)
           for (int b = 0; b < 16; ++b) m.mv[l][b][0] = m.mv[l][b][1] = 0;
         m.intra = 1;
+        m.field = 0;
       }
       found->id = dpb_.new_id();
       found->has_key = false;
       found->non_existing = r.non_existing;
       found->keyframe = false;
+      found->decoded = 3;
+      found->field_coded = false;
+      found->mbaff = false;
     }
     found->in_use = true;
+    for (int f = 0; f < 2; ++f) found->field_ref[f] = (fields >> f) & 1 ? (r.long_term ? 2 : 1) : 0;
     found->is_ref = true;
     found->is_long = r.long_term;
     found->needed_for_output = false;
     if (r.long_term) found->long_term_idx = r.frame_num;
     else found->frame_num = r.frame_num;
-    found->top_poc = r.top_poc;
-    found->bottom_poc = r.bottom_poc;
-    found->poc = r.top_poc < r.bottom_poc ? r.top_poc : r.bottom_poc;
+    // (an unused field's count is not given: it takes the used field's, which makes PicOrderCnt( ) of the entry that field's)
+    found->top_poc = (fields & 1) ? r.top_poc : r.bottom_poc;
+    found->bottom_poc = (fields & 2) ? r.bottom_poc : r.top_poc;
+    found->poc = found->top_poc < found->bottom_poc ? found->top_poc : found->bottom_poc;
   }
-  for (Picture& p : pics_)
-    if (!p.is_ref) p.in_use = false;
+  for (int i = 0; i < kMaxPictures; ++i)
+    if (!pics_[i].is_ref && !kept[i]) pics_[i].in_use = false;
   return true;
 }
 
-H264Decoder::ExternalStatus Core::decode_external(ConstByteView data, const H264Decoder::ExternalPicture& picture, VideoFrame* decoded) {
+H264Decoder::ExternalStatus Core::decode_external(ConstByteView data, const H264Decoder::ExternalPicture& picture, VideoFrame* decoded, int* structure) {
   dpb_.release_returned();
   build_vlc();
   // Whatever an earlier call left half-done is dropped: this call is one whole picture.
@@ -871,6 +938,7 @@ H264Decoder::ExternalStatus Core::decode_external(ConstByteView data, const H264
   ext_decoded_ = nullptr;
   dpb_.set_decode_order(true);
   for_each_nal(data, 0, [&](const uint8_t* nal, uint64_t size) { (void)handle_nal(nal, size, 0); });
+  const int pic_structure = structure_;
   finish_picture();
   dpb_.set_decode_order(false);
   const bool no_memory = ext_no_memory_, missing = ext_missing_;
@@ -880,7 +948,10 @@ H264Decoder::ExternalStatus Core::decode_external(ConstByteView data, const H264
   if (!p) return no_memory ? H264Decoder::ExternalStatus::NoMemory : H264Decoder::ExternalStatus::NotDecoded;
   // The picture now is the surface's: an earlier one kept under the same key is gone.
   for (Picture& q : pics_)
-    if (&q != p && q.has_key && q.key == picture.key) q.has_key = false;
+    if (&q != p && q.has_key && q.key == picture.key) {
+      q.has_key = false;
+      if (!q.is_ref) q.in_use = false;
+    }
   p->has_key = true;
   p->key = picture.key;
   decoded->format.width = static_cast<uint32_t>(mb_w_ * 16);
@@ -894,6 +965,7 @@ H264Decoder::ExternalStatus Core::decode_external(ConstByteView data, const H264
   decoded->pts_us = 0;
   decoded->keyframe = p->keyframe;
   decoded->limited_range = !sp_->full_range;
+  if (structure) *structure = pic_structure;
   return missing ? H264Decoder::ExternalStatus::MissingReference : H264Decoder::ExternalStatus::Decoded;
 }
 
@@ -921,29 +993,61 @@ bool Core::receive(VideoFrame* frame) {
   return true;
 }
 
-// The reference lists of a slice (the Dpb builds them), as pictures with samples, plus the implicit bi-prediction weights.
+namespace {
+
+int poc_of(const RefPic& r) { return r.parity == 1 ? r.pic->top_poc : r.parity == 2 ? r.pic->bottom_poc : r.pic->poc; }
+bool long_of(const RefPic& r) { return r.parity ? r.pic->field_ref[r.parity - 1] == 2 : r.pic->is_long; }
+
+}  // namespace
+
+// Implicit bi-prediction weights (8.4.2.3.1) for every pair of references of the list set `set`, the current picture (or field) counting `cur_poc`.
+void Core::implicit_weights(int set, int cur_poc) {
+  for (int i = 0; i < ref_n_[set][0]; ++i) {
+    for (int j = 0; j < ref_n_[set][1]; ++j) {
+      const RefPic& r0 = refs_[set][0][i];
+      const RefPic& r1 = refs_[set][1][j];
+      int w1 = 32;
+      const int poc0 = poc_of(r0), poc1 = poc_of(r1);
+      const int td = clip3(-128, 127, poc1 - poc0);
+      if (poc1 != poc0 && !long_of(r0) && !long_of(r1)) {
+        const int tb = clip3(-128, 127, cur_poc - poc0);
+        const int tx = (16384 + iabs(td / 2)) / td;
+        const int dsf = clip3(-1024, 1023, (tb * tx + 32) >> 6);
+        if ((dsf >> 2) >= -64 && (dsf >> 2) <= 128) w1 = dsf >> 2;
+      }
+      implicit_w_[set][i][j] = w1;
+    }
+  }
+}
+
+// The reference lists of a slice (the Dpb builds them), as pictures with samples; in an MBAFF frame also the field lists of its field macroblocks (8.4.2.1); and
+// the implicit bi-prediction weights of each.
 void Core::build_ref_lists(const SliceHeader& sh) {
   dpb_.build_ref_lists(sh);
   for (int l = 0; l < 2; ++l) {
-    ref_count_[l] = dpb_.ref_count(l);
-    for (int i = 0; i <= kMaxRefs; ++i) ref_list_[l][i] = static_cast<Picture*>(dpb_.ref(l, i));
+    ref_n_[0][l] = dpb_.ref_count(l);
+    for (int i = 0; i <= kMaxRefs; ++i) {
+      refs_[0][l][i].pic = static_cast<Picture*>(dpb_.ref(l, i));
+      refs_[0][l][i].parity = static_cast<uint8_t>(dpb_.ref_parity(l, i));
+    }
+    for (int set = 1; set < 3; ++set) {
+      ref_n_[set][l] = 0;
+      if (!mbaff_) continue;
+      // set 1: top field macroblocks, set 2: bottom field macroblocks
+      const uint8_t same = static_cast<uint8_t>(set), other = static_cast<uint8_t>(3 - set);
+      for (int i = 0; i < ref_n_[0][l]; ++i) {
+        refs_[set][l][2 * i] = RefPic{refs_[0][l][i].pic, same};
+        refs_[set][l][2 * i + 1] = RefPic{refs_[0][l][i].pic, other};
+      }
+      ref_n_[set][l] = 2 * ref_n_[0][l];
+      refs_[set][l][ref_n_[set][l]] = RefPic{};
+    }
   }
   if (sh.type == kSliceB) {
-    // Implicit bi-prediction weights (8.4.2.3.1) for every pair of references.
-    for (int i = 0; i < ref_count_[0]; ++i) {
-      for (int j = 0; j < ref_count_[1]; ++j) {
-        const Picture* p0 = ref_list_[0][i];
-        const Picture* p1 = ref_list_[1][j];
-        int w1 = 32;
-        const int td = clip3(-128, 127, p1->poc - p0->poc);
-        if (td != 0 && !p0->is_long && !p1->is_long) {
-          const int tb = clip3(-128, 127, pic_poc_ - p0->poc);
-          const int tx = (16384 + iabs(td / 2)) / td;
-          const int dsf = clip3(-1024, 1023, (tb * tx + 32) >> 6);
-          if ((dsf >> 2) >= -64 && (dsf >> 2) <= 128) w1 = dsf >> 2;
-        }
-        implicit_w_[i][j] = w1;
-      }
+    implicit_weights(0, pic_poc_);
+    if (mbaff_) {
+      implicit_weights(1, dpb_.top_poc());
+      implicit_weights(2, dpb_.bottom_poc());
     }
   }
 }
@@ -967,10 +1071,10 @@ bool H264Decoder::decode(ConstByteView access_unit, int64_t pts_us) {
 
 bool H264Decoder::receive(VideoFrame* frame) { return core_ && core_->receive(frame); }
 
-H264Decoder::ExternalStatus H264Decoder::decode_external(ConstByteView access_unit, const ExternalPicture& picture, VideoFrame* decoded) {
+H264Decoder::ExternalStatus H264Decoder::decode_external(ConstByteView access_unit, const ExternalPicture& picture, VideoFrame* decoded, int* structure) {
   if (!core_) core_ = UniquePointer<h264::Core>::make(allocator_, allocator_);
   if (!core_) return ExternalStatus::NoMemory;
-  return core_->decode_external(access_unit, picture, decoded);
+  return core_->decode_external(access_unit, picture, decoded, structure);
 }
 
 void H264Decoder::flush() {

@@ -1036,3 +1036,20 @@ static const uint8_t kLast8x8Ctx[64] = {
 2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,
 3,3,3,3,3,3,3,3,4,4,4,4,4,4,4,4,
 5,5,5,5,6,6,6,6,7,7,7,7,8,8,8,8};
+// 8.5.6, Table 8-13: the field scans (raster positions) of field macroblocks and field pictures.
+static const uint8_t kFieldScan4x4[16] = {
+0,4,1,8,12,5,9,13,2,6,10,14,3,7,11,15};
+static const uint8_t kFieldScan8x8[64] = {
+0,8,16,1,9,24,32,17,2,25,40,48,56,33,10,3,
+18,41,49,57,26,11,4,19,34,42,50,58,27,12,5,20,
+35,43,51,59,28,13,6,21,36,44,52,60,29,14,22,37,
+45,53,61,30,7,15,38,46,54,62,23,31,39,47,55,63};
+// Table 9-43: ctxIdxInc of significant_coeff_flag in a field coded 8x8 block (last_significant_coeff_flag uses kLast8x8Ctx for both).
+static const uint8_t kSig8x8CtxField[64] = {
+0,1,1,2,2,3,3,4,5,6,7,7,7,8,4,5,
+6,9,10,10,8,11,12,11,9,9,10,10,8,11,12,11,
+9,9,10,10,8,11,12,11,9,9,10,10,8,13,13,9,
+9,10,10,8,13,13,9,9,10,10,14,14,14,14,14,14};
+// Table 9-4, ChromaArrayType 0 (monochrome): coded_block_pattern of codeNum 0..15 for Intra_4x4 / Intra_8x8 and for Inter macroblocks.
+static const uint8_t kCbpIntraMono[16] = {15,0,7,11,13,14,3,5,10,12,1,2,4,8,6,9};
+static const uint8_t kCbpInterMono[16] = {0,1,2,4,8,3,5,10,12,15,7,11,13,14,6,9};

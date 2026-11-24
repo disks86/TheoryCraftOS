@@ -108,6 +108,9 @@ struct DxvaDecodedPicture {
   DxvaSurfaceFormat surface_format = DxvaSurfaceFormat::Nv12;
   uint32_t surface = 0;          // the surface index the parameters name for the current picture (an index, not its key)
   const char* detail = nullptr;  // for Unsupported / Invalid: what was refused (a constant string)
+  // 0: the picture is the whole frame. 1 / 2: it is a field (an interlaced H.264 field picture): only the lines of the top (0, 2, 4 ...) / bottom (1, 3, 5 ...)
+  // field of `frame` are the picture's and go into the surface; the surface keeps its other lines (`frame` holds what the decoder knows of them).
+  uint8_t field = 0;
 };
 
 struct DxvaDecoderConfig {

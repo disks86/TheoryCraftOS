@@ -3,7 +3,9 @@
 // and DXVA_Slice_H264_Short as ffmpeg's libavcodec/dxva2_h264.c does (RefFrameList / FrameNumList / FieldOrderCntList / UsedForReferenceFlags from the buffer, the
 // scaling lists in zigzag order, each slice NAL unit after a 00 00 01 start code, the last slice padded to 128 bytes). Every picture the DXVA decoder gives (decoding
 // order, uncropped NV12) is cropped and compared with ffmpeg's decode of the stream (tests/data/dxva_h264_md5.txt, display order: see make_dxva_h264_references.sh)
-// and with this project's H264Decoder - bit exact.
+// and with this project's H264Decoder - bit exact. Interlaced streams: field pictures are named as ffmpeg names them (field_pic_flag, CurrPic's AssociatedFlag, the
+// fields a reference is used by, the frame of a second field's first field among the references); a field writes its lines of the surface the test keeps, and a
+// frame is compared once its second field is in.
 #include <algorithm>
 #include <random>
 #include "Crypto/Crypto.hpp"
@@ -21,6 +23,8 @@ struct Call {
   std::vector<uint8_t> params, qm, slices, bitstream;
   uint32_t surface = 0;
   bool intra = false;     // every slice is I (decodes without references)
+  uint8_t field = 0;      // 0 a frame, 1 / 2 a top / bottom field picture
+  size_t completes = 0;   // the call after which the frame of this picture is whole (a first field's pair; else the call itself)
 };
 
 struct Stream {
@@ -70,8 +74,10 @@ bool record(TestAllocator& alloc, const std::vector<uint8_t>& data, Stream* st) 
     h264::PictureInfo* cur = dpb.begin_picture(s0.header, 0);
     if (!cur) return false;
     cur->has_memory = true;
-    // A surface no reference is in, taken round the pool.
-    for (uint32_t tries = 0; tries < kPool; ++tries) {
+    const bool second = dpb.second_field();
+    const int structure = dpb.structure();
+    // A surface no reference is in, taken round the pool (the second field of a pair goes into its first field's).
+    for (uint32_t tries = 0; tries < kPool && !second; ++tries) {
       const uint32_t s = (next_surface + tries) % kPool;
       bool busy = false;
       for (int i = 0; i < h264::kMaxPictures; ++i)
@@ -86,12 +92,14 @@ bool record(TestAllocator& alloc, const std::vector<uint8_t>& data, Stream* st) 
     memset(&pp, 0, sizeof pp);
     pp.wFrameWidthInMbsMinus1 = static_cast<uint16_t>(sps.mb_w - 1);
     pp.wFrameHeightInMbsMinus1 = static_cast<uint16_t>(sps.mb_h - 1);
-    pp.CurrPic = static_cast<uint8_t>(slot_surface[cur->slot]);
+    pp.CurrPic = static_cast<uint8_t>(slot_surface[cur->slot] | (structure == 2 ? 0x80 : 0));   // AssociatedFlag: the bottom field
     pp.num_ref_frames = static_cast<uint8_t>(sps.max_num_ref_frames);
     bool intra = true;
     for (uint64_t k = first; k < end; ++k) intra = intra && slices[k].header.type == h264::kSliceI;
     uint16_t f = 0;
-    f |= static_cast<uint16_t>(1u << dxva::kH264ChromaFormatShift);
+    if (structure != 3) f |= dxva::kH264FieldPic;
+    if (structure == 3 && sps.mbaff) f |= dxva::kH264MbaffFrame;
+    f |= static_cast<uint16_t>(sps.chroma_format_idc << dxva::kH264ChromaFormatShift);
     if (s0.header.nal_ref_idc) f |= dxva::kH264RefPic;
     if (pps.constrained_intra_pred) f |= dxva::kH264ConstrainedIntraPred;
     if (pps.weighted_pred) f |= dxva::kH264WeightedPred;
@@ -106,19 +114,21 @@ bool record(TestAllocator& alloc, const std::vector<uint8_t>& data, Stream* st) 
     pp.StatusReportFeedbackNumber = ++feedback;
     memset(pp.RefFrameList, 0xFF, sizeof pp.RefFrameList);
     int n = 0;
-    for (int pass = 0; pass < 2; ++pass)   // short-term references, then long-term ones (ffmpeg's order)
+    // Short-term references, then long-term ones (ffmpeg's order); the frame of a second field is one when its first field is. The counts of the fields used.
+    for (int pass = 0; pass < 2; ++pass)
       for (int i = 0; i < h264::kMaxPictures; ++i) {
         const h264::PictureInfo& r = infos[i];
-        if (&r == cur || !r.is_ref || r.is_long != (pass == 1) || n >= 16) continue;
+        if ((&r == cur && !second) || !r.is_ref || r.is_long != (pass == 1) || n >= 16) continue;
         pp.RefFrameList[n] = static_cast<uint8_t>(slot_surface[i] | (r.is_long ? 0x80 : 0));
-        pp.FieldOrderCntList[n][0] = r.top_poc;
-        pp.FieldOrderCntList[n][1] = r.bottom_poc;
+        if (r.field_ref[0]) pp.FieldOrderCntList[n][0] = r.top_poc;
+        if (r.field_ref[1]) pp.FieldOrderCntList[n][1] = r.bottom_poc;
         pp.FrameNumList[n] = static_cast<uint16_t>(r.is_long ? r.long_term_idx : r.frame_num);
-        pp.UsedForReferenceFlags |= 3u << (2 * n);
+        if (r.field_ref[0]) pp.UsedForReferenceFlags |= 1u << (2 * n);
+        if (r.field_ref[1]) pp.UsedForReferenceFlags |= 2u << (2 * n);
         ++n;
       }
-    pp.CurrFieldOrderCnt[0] = cur->top_poc;
-    pp.CurrFieldOrderCnt[1] = cur->bottom_poc;
+    pp.CurrFieldOrderCnt[0] = (structure & 1) ? cur->top_poc : 0;
+    pp.CurrFieldOrderCnt[1] = (structure & 2) ? cur->bottom_poc : 0;
     pp.pic_init_qs_minus26 = static_cast<int8_t>(pps.pic_init_qs - 26);
     pp.chroma_qp_index_offset = static_cast<int8_t>(pps.chroma_qp_offset[0]);
     pp.second_chroma_qp_index_offset = static_cast<int8_t>(pps.chroma_qp_offset[1]);
@@ -142,8 +152,11 @@ bool record(TestAllocator& alloc, const std::vector<uint8_t>& data, Stream* st) 
     parser.parameter_sets()->effective_scaling(sps, pps, w4, w8);
     h264::ParameterSets::scaling_to_bitstream_order(w4, w8, qm.bScalingLists4x4, qm.bScalingLists8x8);
     Call call;
-    call.surface = pp.CurrPic;
+    call.surface = pp.CurrPic & 0x7F;
     call.intra = intra;
+    call.field = static_cast<uint8_t>(structure == 3 ? 0 : structure);
+    call.completes = st->calls.size();
+    if (second && !st->calls.empty() && st->calls.back().field && st->calls.back().surface == call.surface) st->calls.back().completes = st->calls.size();
     call.params = bytes_of(pp);
     call.qm = bytes_of(qm);
     for (uint64_t k = first; k < end; ++k) {
@@ -256,7 +269,7 @@ Call remap(const Call& c, const std::vector<uint32_t>& keys, bool output_key_ind
       if (keys[i] == 1000 + 7 * surface) return i;
     return 0u;
   };
-  r.params[4] = static_cast<uint8_t>(output_key_index ? 120 : index_of(c.params[4] & 0x7F));
+  r.params[4] = static_cast<uint8_t>((output_key_index ? 120 : index_of(c.params[4] & 0x7F)) | (c.params[4] & 0x80));
   for (int i = 0; i < 16; ++i) {
     const uint8_t e = c.params[16 + i];
     if (e != 0xFF) r.params[16 + i] = static_cast<uint8_t>((e & 0x80) | index_of(e & 0x7F));
@@ -265,10 +278,24 @@ Call remap(const Call& c, const std::vector<uint32_t>& keys, bool output_key_ind
 }
 
 struct RunResult {
-  std::vector<std::vector<uint8_t>> pictures;   // NV12, decoding order
+  std::vector<std::vector<uint8_t>> pictures;   // the surface of each call after it (NV12), decoding order
   uint32_t width = 0, height = 0;
   int ok = 0;
 };
+
+// What the decoded picture puts into its surface: all lines, or a field picture's lines only (the surface keeps the others), as the kernel writes them.
+void put_picture(std::vector<uint8_t>& surface, const DxvaDecodedPicture& out) {
+  const std::vector<uint8_t> pic = copy_nv12(out.frame);
+  if (surface.size() != pic.size() || !out.field) {
+    surface = pic;
+    return;
+  }
+  const uint32_t w = out.frame.format.width, h = out.frame.format.height, cw = 2 * ((w + 1) / 2);
+  for (uint32_t y = out.field - 1u; y < h; y += 2) std::copy(pic.begin() + y * w, pic.begin() + (y + 1) * w, surface.begin() + y * w);
+  const size_t c0 = size_t{w} * h;
+  for (uint32_t y = out.field - 1u; y < (h + 1) / 2; y += 2)
+    std::copy(pic.begin() + c0 + y * cw, pic.begin() + c0 + (y + 1) * cw, surface.begin() + c0 + y * cw);
+}
 
 RunResult run(TestAllocator& alloc, const Stream& st, KeyMode mode, uint32_t seed) {
   RunResult res;
@@ -278,6 +305,7 @@ RunResult run(TestAllocator& alloc, const Stream& st, KeyMode mode, uint32_t see
   std::mt19937 rng(seed);
   std::vector<uint32_t> keys(kPool);
   for (uint32_t i = 0; i < kPool; ++i) keys[i] = 1000 + 7 * i;
+  std::vector<std::vector<uint8_t>> surfaces(kPool);
   for (const Call& c : st.calls) {
     Call use = c;
     DxvaPicture p;
@@ -311,11 +339,13 @@ RunResult run(TestAllocator& alloc, const Stream& st, KeyMode mode, uint32_t see
       res.pictures.push_back({});
       continue;
     }
-    CHECK(out.surface == use.params[4]);
+    CHECK(out.surface == (use.params[4] & 0x7Fu));
     CHECK(out.frame.format.pixel_format == PixelFormat::Nv12 && out.frame.format.width == st.mb_w * 16 && out.frame.format.height == st.mb_h * 16);
+    CHECK(out.field == c.field);
     res.width = out.frame.format.width;
     res.height = out.frame.format.height;
-    res.pictures.push_back(copy_nv12(out.frame));
+    put_picture(surfaces[c.surface], out);
+    res.pictures.push_back(surfaces[c.surface]);
     ++res.ok;
   }
   return res;
@@ -370,9 +400,15 @@ void refusals(IDxvaDecoder& dec, const Call& c) {
   with_params([](PicParamsH264& pp) { pp.CurrPic = static_cast<uint8_t>(kPool + 3); }, DxvaResult::Invalid);
   with_params([](PicParamsH264& pp) { pp.CurrPic = 0xFF; }, DxvaResult::Invalid);
   with_params([](PicParamsH264& pp) { pp.RefFrameList[15] = 100; pp.UsedForReferenceFlags |= 3u << 30; }, DxvaResult::Invalid);
-  with_params([](PicParamsH264& pp) { pp.wBitFields |= dxva::kH264FieldPic; }, DxvaResult::Unsupported);
-  with_params([](PicParamsH264& pp) { pp.wBitFields |= dxva::kH264MbaffFrame; }, DxvaResult::Unsupported);
-  with_params([](PicParamsH264& pp) { pp.wBitFields &= static_cast<uint16_t>(~(3u << dxva::kH264ChromaFormatShift)); }, DxvaResult::Unsupported);
+  {
+    PicParamsH264 pp;
+    memcpy(&pp, c.params.data(), sizeof pp);
+    const bool frame_mbs_only = (pp.wBitFields & dxva::kH264FrameMbsOnly) != 0, field = (pp.wBitFields & dxva::kH264FieldPic) != 0;
+    // field_pic_flag that the slices do not have (or a field picture said to be a frame); a field said to be the other one; MBAFF where it cannot be.
+    with_params([](PicParamsH264& q) { q.wBitFields ^= dxva::kH264FieldPic; q.wBitFields &= static_cast<uint16_t>(~dxva::kH264MbaffFrame); }, DxvaResult::Invalid);
+    if (field) with_params([](PicParamsH264& q) { q.CurrPic ^= 0x80; }, DxvaResult::Invalid);
+    if (frame_mbs_only || field) with_params([](PicParamsH264& q) { q.wBitFields |= dxva::kH264MbaffFrame; }, DxvaResult::Invalid);
+  }
   with_params([](PicParamsH264& pp) { pp.wBitFields |= static_cast<uint16_t>(2u << dxva::kH264ChromaFormatShift); }, DxvaResult::Invalid);
   with_params([](PicParamsH264& pp) { pp.bit_depth_luma_minus8 = 2; }, DxvaResult::Invalid);
   with_params([](PicParamsH264& pp) { pp.num_slice_groups_minus1 = 1; }, DxvaResult::Unsupported);
@@ -437,6 +473,42 @@ void fuzz(TestAllocator& alloc, const Stream& st, uint32_t seed) {
   printf("  fuzzed: %d ok, %d invalid, %d unsupported, %d missing reference\n", counts[0], counts[1], counts[2], counts[3]);
 }
 
+// The CPU decoder on damaged access units (cut short, bits flipped, in decoding order, its state carried on): it must not fault, and every frame it gives is
+// whole. (Interlaced streams take the field pairing, MBAFF pair and field reference paths through damaged data.)
+void sw_fuzz(TestAllocator& alloc, const std::vector<uint8_t>& data, const Stream& st, uint32_t seed) {
+  std::mt19937 rng(seed);
+  H264Decoder sw(alloc);
+  VideoFrame f;
+  int frames = 0;
+  auto drain = [&]() {
+    while (sw.receive(&f)) {
+      uint64_t sum = 0;
+      for (uint8_t v : frame_i420(f)) sum += v;
+      CHECK(sum > 0 && f.format.width == st.mb_w * 16 - st.crop_l - st.crop_r);
+      ++frames;
+    }
+  };
+  for (const auto& au : st.access_units) {
+    for (int variant = 0; variant < 4; ++variant) {
+      std::vector<uint8_t> d(data.begin() + static_cast<long>(au.first), data.begin() + static_cast<long>(au.second));
+      if (d.empty()) continue;
+      if (variant % 2 == 0) {
+        d.resize(rng() % d.size());
+      } else {
+        const int flips = 1 + static_cast<int>(rng() % 8);
+        for (int k = 0; k < flips; ++k) d[rng() % d.size()] ^= static_cast<uint8_t>(1u << (rng() % 8));
+      }
+      (void)sw.decode(ConstByteView(d.data(), d.size()), 0);
+      drain();
+    }
+    (void)sw.decode(ConstByteView(data.data() + au.first, au.second - au.first), 0);
+    drain();
+  }
+  sw.flush();
+  drain();
+  printf("  CPU decoder on damaged access units: %d frames out\n", frames);
+}
+
 void test_stream(const char* name, bool damage) {
   TestAllocator alloc;
   {
@@ -475,8 +547,10 @@ void test_stream(const char* name, bool damage) {
         // Every picture against ffmpeg (through the display order) and against the CPU decoder's output.
         int exact = 0;
         for (size_t i = 0; i < shown.size() && i < ref.size(); ++i) {
-          const int64_t k = shown[i].first;
-          if (k < 0 || static_cast<size_t>(k) >= r.pictures.size() || r.pictures[k].empty()) continue;
+          int64_t k = shown[i].first;
+          if (k < 0 || static_cast<size_t>(k) >= r.pictures.size()) continue;
+          k = static_cast<int64_t>(st.calls[static_cast<size_t>(k)].completes);   // (a field pair is whole after its second field)
+          if (r.pictures[k].empty()) continue;
           const std::vector<uint8_t> cropped = crop_to_i420(r.pictures[k], r.width, r.height, st);
           const bool same = md5_hex(cropped) == ref[i] && cropped == shown[i].second;
           if (!same) printf("  %s: display picture %zu (decoded %lld) differs\n", name, i, static_cast<long long>(k));
@@ -492,12 +566,13 @@ void test_stream(const char* name, bool damage) {
     if (damage) {
       // Refusals before every picture leave the decoding unchanged.
       UniquePointer<IDxvaDecoder> dec = make_decoder(alloc, st);
-      std::vector<std::vector<uint8_t>> got;
+      std::vector<std::vector<uint8_t>> got, surfaces(kPool);
       for (const Call& c : st.calls) {
         refusals(*dec, c);
         DxvaDecodedPicture out;
         CHECK(dec->decode(picture_of(c), &out) == DxvaResult::Ok);
-        got.push_back(out.frame.plane[0] ? copy_nv12(out.frame) : std::vector<uint8_t>());
+        if (out.frame.plane[0]) put_picture(surfaces[c.surface], out);
+        got.push_back(out.frame.plane[0] ? surfaces[c.surface] : std::vector<uint8_t>());
       }
       CHECK(got == plain.pictures);
       // After reset() the references are gone: a picture that has some decodes with mid-grey for them and says so.
@@ -512,7 +587,7 @@ void test_stream(const char* name, bool damage) {
       // A reference whose key is the output's own is the picture that was there before: decoding picture k into the surface of one of its references.
       for (size_t k = 0; k < st.calls.size(); ++k) {
         const Call& c = st.calls[k];
-        if (c.intra || c.params[16] == 0xFF) continue;
+        if (c.intra || c.params[16] == 0xFF || c.field) continue;   // (a field keeps the other lines of the surface it goes into)
         UniquePointer<IDxvaDecoder> d2 = make_decoder(alloc, st);
         for (size_t j = 0; j < k; ++j) {
           DxvaDecodedPicture o;
@@ -530,7 +605,7 @@ void test_stream(const char* name, bool damage) {
         const Call& c = st.calls[k];
         PicParamsH264 pp;
         memcpy(&pp, c.params.data(), sizeof pp);
-        if (c.intra || pp.RefFrameList[1] == 0xFF || pp.CurrFieldOrderCnt[0] <= pp.FieldOrderCntList[0][0]) continue;
+        if (c.intra || c.field || pp.RefFrameList[1] == 0xFF || pp.CurrFieldOrderCnt[0] <= pp.FieldOrderCntList[0][0]) continue;
         bool after = false;   // a B picture has references on both sides
         for (int i = 0; i < 16; ++i) after = after || (pp.RefFrameList[i] != 0xFF && pp.FieldOrderCntList[i][0] > pp.CurrFieldOrderCnt[0]);
         if (!after) continue;
@@ -553,6 +628,7 @@ void test_stream(const char* name, bool damage) {
         break;
       }
       fuzz(alloc, st, 99);
+      sw_fuzz(alloc, data, st, 5);
     }
   }
   CHECK(alloc.live == 0);
@@ -567,7 +643,10 @@ static void dxva_test_h264() {
     bool damage;
   };
   const Case cases[] = {{"h264_bframes", true}, {"h264_cavlc", true}, {"h264_cqm", true}, {"h264_intra", false}, {"h264_ltr", true}, {"h264_noise", false},
-                        {"h264_pcm_cabac", false}, {"h264_pcm_cavlc", false}, {"h264_dxva_poc2", true}, {"h264_dxva_poc1", true}, {"h264_dxva_pyramid", true}};
+                        {"h264_pcm_cabac", false}, {"h264_pcm_cavlc", false}, {"h264_dxva_poc2", true}, {"h264_dxva_poc1", true}, {"h264_dxva_pyramid", true},
+                        // interlaced: MBAFF frames (x264), field pictures and mixed field/frame streams, MBAFF with constrained intra (JVT conformance cuts); monochrome
+                        {"h264_mbaff_cabac", true}, {"h264_mbaff_cavlc", true}, {"h264_paff_mbaff_cabac", true}, {"h264_fields_cavlc", false},
+                        {"h264_picaff_cabac", false}, {"h264_fields_mmco", true}, {"h264_mbaff_ci", false}, {"h264_mono_cavlc", true}, {"h264_mono_cabac", false}};
   for (const Case& c : cases) test_stream(c.name, c.damage);
   // The profile takes NV12 only.
   TestAllocator alloc;

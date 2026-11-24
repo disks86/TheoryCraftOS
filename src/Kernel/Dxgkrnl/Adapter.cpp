@@ -22,6 +22,7 @@
 #include "Graphics/Graphics3D/Mipmaps.hpp"
 #include "Kernel/Dxgkrnl/CommandStream.hpp"
 #include "Hardware/VideoCodec/VideoProcess.hpp"
+#include "Kernel/Dxgkrnl/VideoEncode.hpp"
 #include "Utility/AllocatedView.hpp"
 #include "Utility/ByteStream.hpp"
 #include "Utility/Move.hpp"
@@ -245,6 +246,10 @@ class Adapter::StreamRunner {
       case Op::CopyBufferImage: return copy_buffer_image(p);
       case Op::DecodeFrame: return decode_frame(p);
       case Op::VideoProcess: return video_process_packet(p);
+      case Op::EstimateMotion: return estimate_motion_packet(p);
+      case Op::ResolveMotionVectors: return resolve_motion_vectors_packet(p);
+      case Op::EncodeFrame: return encode_frame_packet(p);
+      case Op::ResolveEncoderMetadata: return resolve_encoder_metadata_packet(p);
       case Op::Dispatch: return dispatch(p);
       case Op::SetTopology: {
         const uint32_t topology = p.le32();
@@ -872,7 +877,7 @@ class Adapter::StreamRunner {
     // (a narrow buffer: of an 8-bit four-channel image, or of A16B16G16R16)
     if (narrow != NarrowLayout::None) {
       const bool eight = narrow == NarrowLayout::R8 || narrow == NarrowLayout::R8G8;
-      if (eight ? (format != Format::A8B8G8R8 && format != Format::X8B8G8R8) : format != Format::A16B16G16R16) return kBad;
+      if (eight ? (format != Format::A8B8G8R8 && format != Format::X8B8G8R8) : (format != Format::A16B16G16R16 && format != Format::A16B16G16R16Sint)) return kBad;
     }
     const uint64_t row_bytes = image_row_bytes(format, w), level_row_bytes = image_row_bytes(format, level_w), x_bytes = image_row_bytes(format, x);
     const uint64_t buffer_row_bytes = narrow == NarrowLayout::None ? row_bytes : uint64_t{w} * narrow_pixel_bytes(narrow);
@@ -895,7 +900,7 @@ class Adapter::StreamRunner {
         ByteView image_row, buffer_row;
         if (!image->writable_backing().try_subview(image_at, row_bytes, &image_row) || !buffer->writable_backing().try_subview(buffer_at, buffer_row_bytes, &buffer_row))
           return status::kInvalidDeviceState;
-        copy_narrow_row(direction == 0, narrow, w, image_row, buffer_row);
+        copy_narrow_row(direction == 0, narrow, w, image_row, buffer_row, format == Format::A16B16G16R16Sint);
         continue;
       }
       if (direction == 0) {
@@ -915,7 +920,8 @@ class Adapter::StreamRunner {
   }
 
   // One row of a narrow copy: `to_image` widens the buffer's pixels into the image's (missing channels 0, the last the maximum), else the image's first channels go into the buffer.
-  static void copy_narrow_row(bool to_image, NarrowLayout narrow, uint32_t width, ByteView image_row, ByteView buffer_row) {
+  // (`integer`: the image is of an integer format, whose missing alpha is 1)
+  static void copy_narrow_row(bool to_image, NarrowLayout narrow, uint32_t width, ByteView image_row, ByteView buffer_row, bool integer = false) {
     const uint32_t channels = narrow == NarrowLayout::R8 || narrow == NarrowLayout::R16 ? 1 : 2;
     const bool sixteen = narrow == NarrowLayout::R16 || narrow == NarrowLayout::R16G16;
     const uint32_t sample = sixteen ? 2 : 1, image_pixel = 4 * sample, buffer_pixel = channels * sample;
@@ -925,7 +931,12 @@ class Adapter::StreamRunner {
       if (to_image) {
         pixel.fill(0);
         pixel.subview(0, buffer_pixel).copy_from(narrow_pixel);
-        pixel.subview(3 * sample, sample).fill(0xFF);      // (alpha: the maximum)
+        if (integer) {
+          pixel.subview(3 * sample, sample).fill(0);
+          pixel[3 * sample] = 1;
+        } else {
+          pixel.subview(3 * sample, sample).fill(0xFF);      // (alpha: the maximum)
+        }
       } else {
         narrow_pixel.copy_from(pixel.subview(0, buffer_pixel));
       }
@@ -934,7 +945,9 @@ class Adapter::StreamRunner {
 
   // A plane the decoder made, written into an image the runtime keeps it in (DxgTypes.hpp VideoDecoderDesc): every sample of a channel becomes a channel of a pixel, the others 0 and
   // the last the maximum. `channels` 1 (luma) or 2 (chroma: U, V interleaved); `sixteen` samples of 16 bits. Only what both have is written.
-  static bool write_video_plane(VidMm& mm, Allocation& image, const uint8_t* plane, uint32_t stride, uint32_t width, uint32_t height, uint32_t channels, bool sixteen) {
+  // (`field` 1 / 2: only the lines of the top / bottom field - a decoded field picture; the image keeps its other lines)
+  static bool write_video_plane(VidMm& mm, Allocation& image, const uint8_t* plane, uint32_t stride, uint32_t width, uint32_t height, uint32_t channels, bool sixteen,
+                                uint32_t field = 0) {
     if (!plane) return false;
     const uint32_t w = width < image.desc().width ? width : image.desc().width, h = height < image.desc().height ? height : image.desc().height;
     const uint32_t sample = sixteen ? 2 : 1, pixel = 4 * sample;
@@ -943,7 +956,7 @@ class Adapter::StreamRunner {
     // (the decoder's plane as a view of what it says: stride bytes a row, h rows)
     if (uint64_t{w} * channels * sample > stride) return false;
     const ConstByteView source(plane, uint64_t{stride} * (h - 1) + uint64_t{w} * channels * sample);
-    for (uint32_t y = 0; y < h; ++y) {
+    for (uint32_t y = field ? field - 1 : 0; y < h; y += field ? 2 : 1) {
       ByteView row;
       if (!image.writable_backing().try_subview(pitch * y, uint64_t{w} * pixel, &row)) return false;
       const ConstByteView from = source.subview(uint64_t{stride} * y, uint64_t{w} * channels * sample);
@@ -1048,9 +1061,11 @@ class Adapter::StreamRunner {
       if (written && packed) {
         written = write_packed_surface(mm_, *luma, f.plane[0], f.stride[0], hardware::dxva_packed_row_bytes(surface, f.format.width), f.format.height);
       } else if (written) {
+        // (an H.264 field picture writes its field's lines only: DxvaDecodedPicture::field)
         const bool sixteen = f.format.pixel_format == hardware::PixelFormat::P010;
-        written = sixteen == (surface != S::Nv12) && write_video_plane(mm_, *luma, f.plane[0], f.stride[0], f.format.width, f.format.height, 1, sixteen) &&
-                  write_video_plane(mm_, *chroma, f.plane[1], f.stride[1], f.format.chroma_width(), f.format.chroma_height(), 2, sixteen);
+        const uint32_t field = decoded.field <= 2 ? decoded.field : 0;
+        written = sixteen == (surface != S::Nv12) && write_video_plane(mm_, *luma, f.plane[0], f.stride[0], f.format.width, f.format.height, 1, sixteen, field) &&
+                  write_video_plane(mm_, *chroma, f.plane[1], f.stride[1], f.format.chroma_width(), f.format.chroma_height(), 2, sixteen, field);
       }
       if (!written) return status::kInvalidDeviceState;
       unbind_textures_of(luma);
@@ -1157,16 +1172,29 @@ class Adapter::StreamRunner {
     struct StreamWords { uint32_t w[kVideoProcessStreamWords]; } words[kMaxVideoProcessStreams];
     for (uint32_t s = 0; s < count; ++s)
       for (uint32_t& w : words[s].w) w = p.le32();
+    // the optional part: the streams' interlacing, stereo, filters, luma keys and light levels, the display's light levels
+    struct ExtWords { uint32_t w[kVideoProcessStreamExtWords]; } ext[kMaxVideoProcessStreams] = {};
+    const bool extended = p.ok() && !p.at_end();
+    if (extended) {
+      if (p.le32() != kVideoProcessExtension) return refuse(__LINE__);
+      output.hdr.max_mastering = bits_float(p.le32());
+      output.hdr.min_mastering = bits_float(p.le32());
+      output.hdr.max_content = bits_float(p.le32());
+      output.hdr.max_frame_average = bits_float(p.le32());
+      for (uint32_t s = 0; s < count; ++s)
+        for (uint32_t& w : ext[s].w) w = p.le32();
+    }
     if (!exact(p)) return refuse(__LINE__);
+    output.allocator = &adapter_.allocator_;
     const hardware::VpFormat ofmt = static_cast<hardware::VpFormat>(out_format);
     Allocation* out0 = alloc(o0);
     Allocation* out1 = hardware::vp_plane_count(ofmt) == 2 ? alloc(o1) : nullptr;
     hardware::VpImage out_image;
     if (!video_image_of(ofmt, out_space, out0, out1, &out_image)) return refuse(__LINE__);
     if (!use(out0, state::kVideoProcessWrite) || (out1 && !use(out1, state::kVideoProcessWrite))) return refuse(__LINE__);
-    hardware::VpImage images[kMaxVideoProcessStreams];
+    hardware::VpImage images[kMaxVideoProcessStreams], references[2 * kMaxVideoProcessStreams];
     hardware::VpStream streams[kMaxVideoProcessStreams];
-    Allocation* inputs[2 * kMaxVideoProcessStreams] = {};
+    Allocation* inputs[6 * kMaxVideoProcessStreams] = {};
     for (uint32_t s = 0; s < count; ++s) {
       const uint32_t* w = words[s].w;
       if (w[0] > static_cast<uint32_t>(hardware::kVpLastFormat) || w[10] > static_cast<uint32_t>(hardware::VpOrientation::Clockwise270FlipHorizontal)) return refuse(__LINE__);
@@ -1176,14 +1204,54 @@ class Adapter::StreamRunner {
       if (!video_image_of(f, w[1], a0, a1, &images[s])) return refuse(__LINE__);
       if (a0 == out0 || a0 == out1 || (a1 && (a1 == out0 || a1 == out1))) return refuse(__LINE__);      // (a stream is not its own output)
       if (!use(a0, state::kVideoProcessRead) || (a1 && !use(a1, state::kVideoProcessRead))) return refuse(__LINE__);
-      inputs[2 * s] = a0;
-      inputs[2 * s + 1] = a1;
+      inputs[6 * s] = a0;
+      inputs[6 * s + 1] = a1;
       streams[s].image = &images[s];
       streams[s].source = {static_cast<int32_t>(w[2]), static_cast<int32_t>(w[3]), static_cast<int32_t>(w[4]), static_cast<int32_t>(w[5])};
       streams[s].destination = {static_cast<int32_t>(w[6]), static_cast<int32_t>(w[7]), static_cast<int32_t>(w[8]), static_cast<int32_t>(w[9])};
       streams[s].orientation = static_cast<hardware::VpOrientation>(w[10]);
       streams[s].alpha_blend = w[11] != 0;
       streams[s].alpha = bits_float(w[12]);
+      if (!extended) continue;
+      const uint32_t* e = ext[s].w;
+      hardware::VpStream& st = streams[s];
+      if (e[0] > static_cast<uint32_t>(hardware::VpFieldOrder::BottomFieldFirst) || e[1] > 1 || e[2] > static_cast<uint32_t>(hardware::VpDeinterlace::Adaptive) ||
+          e[7] > static_cast<uint32_t>(hardware::VpStereoFormat::MonoOffset) || e[8] > 1 || e[9] > 1 || e[18] > 1)
+        return refuse(__LINE__);
+      st.field_order = static_cast<hardware::VpFieldOrder>(e[0]);
+      st.field = static_cast<uint8_t>(e[1]);
+      st.deinterlace = static_cast<hardware::VpDeinterlace>(e[2]);
+      for (uint32_t k = 0; k < 2; ++k) {   // the frames before and after: two planes each (the second kNoAllocation for RGB), pictures like the stream's
+        const uint32_t i0 = e[3 + 2 * k], i1 = e[4 + 2 * k];
+        if (i0 == kNoAllocation) continue;
+        Allocation* r0 = alloc(i0);
+        Allocation* r1 = hardware::vp_plane_count(f) == 2 ? alloc(i1) : nullptr;
+        hardware::VpImage& ri = references[2 * s + k];
+        if (!video_image_of(f, w[1], r0, r1, &ri) || ri.width != images[s].width || ri.height != images[s].height) return refuse(__LINE__);
+        if (r0 == out0 || r0 == out1 || (r1 && (r1 == out0 || r1 == out1))) return refuse(__LINE__);
+        if (!use(r0, state::kVideoProcessRead) || (r1 && !use(r1, state::kVideoProcessRead))) return refuse(__LINE__);
+        inputs[6 * s + 2 + 2 * k] = r0;
+        inputs[6 * s + 3 + 2 * k] = r1;
+        (k ? st.future : st.past) = &ri;
+      }
+      st.stereo = static_cast<hardware::VpStereoFormat>(e[7]);
+      st.stereo_frame = static_cast<uint8_t>(e[8]);
+      st.stereo_flip = e[9] != 0;
+      st.stereo_offset = static_cast<int32_t>(e[10]);
+      st.brightness = bits_float(e[11]);
+      st.contrast = bits_float(e[12]);
+      st.hue = bits_float(e[13]);
+      st.saturation = bits_float(e[14]);
+      st.noise_reduction = bits_float(e[15]);
+      st.edge_enhancement = bits_float(e[16]);
+      st.anamorphic = bits_float(e[17]);
+      st.luma_key = e[18] != 0;
+      st.luma_lower = bits_float(e[19]);
+      st.luma_upper = bits_float(e[20]);
+      st.hdr.max_mastering = bits_float(e[21]);
+      st.hdr.min_mastering = bits_float(e[22]);
+      st.hdr.max_content = bits_float(e[23]);
+      st.hdr.max_frame_average = bits_float(e[24]);
     }
     if (!exec_) return status::kSuccess;
     NtStatus st = flush();
@@ -1199,6 +1267,145 @@ class Adapter::StreamRunner {
       unbind_textures_of(out0);
       if (out1) { mm_.note_cpu_write(*out1); unbind_textures_of(out1); }
     }
+    return status::kSuccess;
+  }
+
+  // --- Video encoding and motion estimation (VideoEncode.hpp) -----------------------------------------------------------------------------------------------------
+
+  // Whether the allocation is an 8-bit widened plane (what a runtime keeps NV12's planes in), as the encoder reads it.
+  static bool plane_image(Allocation* a) {
+    return a && a->is_image() && a->desc().kind == graphics::TextureKind::Texture2D && a->mip_levels() == 1 && a->desc().samples == 1 && a->layers() == 1 &&
+           (a->desc().format == Format::A8B8G8R8 || a->desc().format == Format::X8B8G8R8);
+  }
+  static VideoPlaneImage read_view(Allocation* a) {
+    return {a->backing(), image_row_bytes(a->desc().format, a->desc().width), a->desc().width, a->desc().height};
+  }
+  static VideoWritablePlaneImage write_view(Allocation* a) {
+    return {a->writable_backing(), image_row_bytes(a->desc().format, a->desc().width), a->desc().width, a->desc().height};
+  }
+  // A buffer range: `offset` and `bytes` inside the buffer (bytes ~0: to the end).
+  static bool buffer_range(Allocation* a, uint32_t offset, uint64_t bytes) {
+    return copyable_buffer(a) && offset <= a->desc().size && (bytes == ~uint64_t{0} || bytes <= a->desc().size - offset);
+  }
+
+  NtStatus estimate_motion_packet(ByteReader& p) {
+    const uint32_t block = p.le32(), width = p.le32(), height = p.le32(), ci = p.le32(), ri = p.le32(), hi = p.le32(), h_off = p.le32(), mi = p.le32(), m_off = p.le32();
+    if (!exact(p) || in_pass_ || (block != 8 && block != 16) || width == 0 || height == 0 || width > 16384 || height > 16384) return refuse(__LINE__);
+    Allocation* cur = alloc(ci);
+    Allocation* ref = alloc(ri);
+    Allocation* hint = hi == kNoAllocation ? nullptr : alloc(hi);
+    Allocation* heap = alloc(mi);
+    if (!plane_image(cur) || !plane_image(ref) || cur->desc().width < width || cur->desc().height < height || ref->desc().width < width || ref->desc().height < height)
+      return refuse(__LINE__);
+    const uint64_t need = motion_vector_heap_bytes(width, height, block);
+    if (!buffer_range(heap, m_off, need) || (hi != kNoAllocation && (!buffer_range(hint, h_off, need) || hint == heap))) return refuse(__LINE__);
+    if (!use(cur, state::kVideoEncodeRead) || !use(ref, state::kVideoEncodeRead)) return refuse(__LINE__);
+    if (!exec_) return status::kSuccess;
+    NtStatus s = flush();
+    if (s != status::kSuccess) return s;
+    if (!mm_.read_back(*cur) || !mm_.read_back(*ref) || !mm_.read_back(*heap) || (hint && !mm_.read_back(*hint))) return status::kInvalidDeviceState;
+    const ConstByteView hints = hint ? hint->backing().subview(h_off, need) : ConstByteView();
+    if (!run_motion_estimation(adapter_.allocator_, read_view(cur), read_view(ref), width, height, block, hints, heap->writable_backing().subview(m_off, need)))
+      return status::kNoMemory;
+    mm_.note_cpu_write(*heap);
+    return status::kSuccess;
+  }
+
+  NtStatus resolve_motion_vectors_packet(ByteReader& p) {
+    const uint32_t mi = p.le32(), m_off = p.le32(), width = p.le32(), height = p.le32(), ii = p.le32(), x = p.le32(), y = p.le32();
+    if (!exact(p) || in_pass_ || width == 0 || height == 0 || width > 16384 || height > 16384) return refuse(__LINE__);
+    Allocation* heap = alloc(mi);
+    Allocation* image = alloc(ii);
+    if (!buffer_range(heap, m_off, kMotionVectorHeapHeader) || !image || !image->is_image() || image->desc().kind != graphics::TextureKind::Texture2D || image->mip_levels() != 1 ||
+        image->layers() != 1 || image->desc().samples != 1 || image->desc().format != Format::A16B16G16R16Sint)
+      return refuse(__LINE__);
+    if (!use(image, state::kVideoEncodeWrite)) return refuse(__LINE__);
+    if (!exec_) return status::kSuccess;
+    NtStatus s = flush();
+    if (s != status::kSuccess) return s;
+    if (!mm_.read_back(*heap) || !mm_.read_back(*image)) return status::kInvalidDeviceState;
+    VideoWritablePlaneImage out = {image->writable_backing(), image_row_bytes(image->desc().format, image->desc().width), image->desc().width, image->desc().height};
+    // (a heap that does not hold vectors of that size, or that do not fit at (x, y), leaves the image as it was)
+    if (resolve_motion_vectors(heap->backing().subview(m_off, heap->desc().size - m_off), width, height, out, x, y)) {
+      mm_.note_cpu_write(*image);
+      unbind_textures_of(image);
+    }
+    return status::kSuccess;
+  }
+
+  NtStatus encode_frame_packet(ByteReader& p) {
+    const uint32_t ai = p.le32(), a_off = p.le32(), a_bytes = p.le32(), hi = p.le32(), h_off = p.le32(), il = p.le32(), ic = p.le32(), rl = p.le32(), rc = p.le32();
+    const uint32_t bi = p.le32(), b_off = p.le32(), mi = p.le32(), m_off = p.le32(), count = p.le32();
+    if (!p.ok() || in_pass_ || count > kVideoEncodeMaxReferences) return refuse(__LINE__);
+    uint32_t ref_index[2 * kVideoEncodeMaxReferences];
+    for (uint32_t i = 0; i < 2 * count; ++i) ref_index[i] = p.le32();
+    if (!exact(p)) return refuse(__LINE__);
+    Allocation* args = alloc(ai);
+    Allocation* heap = hi == kNoAllocation ? nullptr : alloc(hi);
+    Allocation* in_l = alloc(il);
+    Allocation* in_c = alloc(ic);
+    Allocation* rec_l = rl == kNoAllocation ? nullptr : alloc(rl);
+    Allocation* rec_c = rc == kNoAllocation ? nullptr : alloc(rc);
+    Allocation* bits = alloc(bi);
+    Allocation* meta = alloc(mi);
+    if (!buffer_range(args, a_off, a_bytes) || (hi != kNoAllocation && !buffer_range(heap, h_off, kVideoEncodeHeapBytes)) || !buffer_range(bits, b_off, ~uint64_t{0}) ||
+        !buffer_range(meta, m_off, ~uint64_t{0}))
+      return refuse(__LINE__);
+    if (!plane_image(in_l) || !plane_image(in_c) || in_l == in_c || (rl == kNoAllocation) != (rc == kNoAllocation) || (rec_l && (!plane_image(rec_l) || !plane_image(rec_c) || rec_l == rec_c)))
+      return refuse(__LINE__);
+    if (bits == meta || (rec_l && (rec_l == in_l || rec_l == in_c || rec_c == in_l || rec_c == in_c))) return refuse(__LINE__);
+    if (!use(in_l, state::kVideoEncodeRead) || !use(in_c, state::kVideoEncodeRead) || !use(bits, state::kVideoEncodeWrite) || !use(meta, state::kVideoEncodeWrite) ||
+        (rec_l && (!use(rec_l, state::kVideoEncodeWrite) || !use(rec_c, state::kVideoEncodeWrite))))
+      return refuse(__LINE__);
+    Allocation* refs[2 * kVideoEncodeMaxReferences] = {};
+    for (uint32_t i = 0; i < 2 * count; ++i) {
+      refs[i] = alloc(ref_index[i]);
+      // (a reference may be the reconstruction's own texture - a program passes its whole buffer of pictures -: the references are read before the reconstruction is written)
+      if (!plane_image(refs[i]) || !use(refs[i], state::kVideoEncodeRead)) return refuse(__LINE__);
+    }
+    if (!exec_) return status::kSuccess;
+    NtStatus s = flush();
+    if (s != status::kSuccess) return s;
+    for (Allocation* a : {args, heap, in_l, in_c, rec_l, rec_c, bits, meta})
+      if (a && !mm_.read_back(*a)) return status::kInvalidDeviceState;
+    for (uint32_t i = 0; i < 2 * count; ++i)
+      if (!mm_.read_back(*refs[i])) return status::kInvalidDeviceState;
+    VideoPictureImages references[kVideoEncodeMaxReferences];
+    for (uint32_t i = 0; i < count; ++i) references[i] = {read_view(refs[2 * i]), read_view(refs[2 * i + 1])};
+    VideoEncodeJob job;
+    job.params = args->backing().subview(a_off, a_bytes);
+    if (heap) job.heap = heap->writable_backing().subview(h_off, kVideoEncodeHeapBytes);
+    job.input = {read_view(in_l), read_view(in_c)};
+    job.has_reconstruction = rec_l != nullptr;
+    if (rec_l) {
+      job.reconstruction_luma = write_view(rec_l);
+      job.reconstruction_chroma = write_view(rec_c);
+    }
+    job.references = ArrayView<const VideoPictureImages>(references, count);
+    job.bitstream = bits->writable_backing().subview(b_off, bits->desc().size - b_off);
+    job.metadata = meta->writable_backing().subview(m_off, meta->desc().size - m_off);
+    if (!run_video_encode(adapter_.allocator_, job)) return status::kNoMemory;
+    for (Allocation* a : {heap, bits, meta, rec_l, rec_c})
+      if (a) mm_.note_cpu_write(*a);
+    if (rec_l) {
+      unbind_textures_of(rec_l);
+      unbind_textures_of(rec_c);
+    }
+    return status::kSuccess;
+  }
+
+  NtStatus resolve_encoder_metadata_packet(ByteReader& p) {
+    const uint32_t mi = p.le32(), m_off = p.le32(), oi = p.le32(), o_off = p.le32();
+    if (!exact(p) || in_pass_) return refuse(__LINE__);
+    Allocation* meta = alloc(mi);
+    Allocation* out = alloc(oi);
+    if (!buffer_range(meta, m_off, ~uint64_t{0}) || !buffer_range(out, o_off, ~uint64_t{0}) || meta == out || !use(out, state::kVideoEncodeWrite)) return refuse(__LINE__);
+    if (!exec_) return status::kSuccess;
+    NtStatus s = flush();
+    if (s != status::kSuccess) return s;
+    if (!mm_.read_back(*meta) || !mm_.read_back(*out)) return status::kInvalidDeviceState;
+    // (an output buffer too small for what is to be written is left as it was)
+    if (resolve_video_encode_metadata(meta->backing().subview(m_off, meta->desc().size - m_off), out->writable_backing().subview(o_off, out->desc().size - o_off))) mm_.note_cpu_write(*out);
     return status::kSuccess;
   }
 
