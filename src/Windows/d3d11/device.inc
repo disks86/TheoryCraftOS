@@ -24,7 +24,9 @@
 static HRESULT STDMETHODCALLTYPE dev_QueryInterface(Dev *d, REFIID riid, void **out) {
   if (!out) return E_POINTER;
   *out = NULL;
-  if (guid_eq(riid, &IID_IUnknown) || guid_eq(riid, &IID_ID3D11Device) || guid_eq(riid, &IID_ID3D11Device1)) *out = d;
+  if (guid_eq(riid, &IID_IUnknown) || guid_eq(riid, &IID_ID3D11Device) || guid_eq(riid, &IID_ID3D11Device1) || guid_eq(riid, &IID_ID3D11Device2) || guid_eq(riid, &IID_ID3D11Device3) ||
+      guid_eq(riid, &IID_ID3D11Device4) || guid_eq(riid, &IID_ID3D11Device5))
+    *out = d;
   else if (guid_eq(riid, &IID_IDXGIObject) || guid_eq(riid, &IID_IDXGIDevice) || guid_eq(riid, &IID_IDXGIDevice1) || guid_eq(riid, &IID_IDXGIDevice2) ||
            guid_eq(riid, &IID_IDXGIDevice3)) *out = &d->dxgi;      /* (DXGI 1.2: ANGLE needs it to present to another process's window) */
   else if (guid_eq(riid, &IID_ITcosPresenter)) *out = &d->presenter;
@@ -35,7 +37,8 @@ static HRESULT STDMETHODCALLTYPE dev_QueryInterface(Dev *d, REFIID riid, void **
 }
 static D3D_FEATURE_LEVEL STDMETHODCALLTYPE dev_GetFeatureLevel(Dev *d) { return d->level; }
 static UINT STDMETHODCALLTYPE dev_GetCreationFlags(Dev *d) { return d->flags; }
-static HRESULT STDMETHODCALLTYPE dev_GetDeviceRemovedReason(Dev *d) { (void)d; return S_OK; }
+/* (the device is Direct3D 12's below: lost when it is - RemoveDevice of a device D3D11On12CreateDevice was given, or the adapter gone) */
+static HRESULT STDMETHODCALLTYPE dev_GetDeviceRemovedReason(Dev *d) { return d->d12 ? ID3D12Device_GetDeviceRemovedReason(d->d12) : S_OK; }
 static HRESULT STDMETHODCALLTYPE dev_SetExceptionMode(Dev *d, UINT flags) { (void)d; (void)flags; return S_OK; }
 static UINT STDMETHODCALLTYPE dev_GetExceptionMode(Dev *d) { (void)d; return 0; }
 static void STDMETHODCALLTYPE dev_GetImmediateContext(Dev *d, ID3D11DeviceContext **out) {
@@ -116,15 +119,91 @@ static HRESULT STDMETHODCALLTYPE dev_CheckMultisampleQualityLevels(Dev *d, DXGI_
   *levels = samples >= 1 && samples <= D3D11_MAX_MULTISAMPLE_SAMPLE_COUNT ? dev_ms_levels(d, format, samples) : 0;
   return S_OK;
 }
+/* What the device can do beyond its feature level. Every answer is what this runtime and the kernel below do: no driver command lists or concurrent creates (the runtime
+ * records deferred contexts itself), no doubles, no tiled resources, conservative rasterization, rasterizer ordered views or typed unordered access loads, and no
+ * CPU access to default-usage textures; ClearView, constant buffer windows (VSSetConstantBuffers1 ...) and NO_OVERWRITE maps of dynamic constant and shader resource
+ * buffers are there. The structure must be the size of the feature's. */
 static HRESULT STDMETHODCALLTYPE dev_CheckFeatureSupport(Dev *d, D3D11_FEATURE feature, void *data, UINT size) {
-  (void)d;
   if (!data) return E_INVALIDARG;
-  switch (feature) {      /* (all "no": no concurrent creates or command lists of the driver, no doubles, no compute on a level below 11) */
-    case D3D11_FEATURE_THREADING: if (size != sizeof(D3D11_FEATURE_DATA_THREADING)) return E_INVALIDARG; break;
-    case D3D11_FEATURE_DOUBLES: if (size != sizeof(D3D11_FEATURE_DATA_DOUBLES)) return E_INVALIDARG; break;
-    case D3D11_FEATURE_D3D10_X_HARDWARE_OPTIONS: if (size != sizeof(D3D11_FEATURE_DATA_D3D10_X_HARDWARE_OPTIONS)) return E_INVALIDARG; break;
+#define FEATURE_SIZE(type) do { if (size != sizeof(type)) return E_INVALIDARG; } while (0)
+  switch (feature) {
+    case D3D11_FEATURE_THREADING: FEATURE_SIZE(D3D11_FEATURE_DATA_THREADING); break;
+    case D3D11_FEATURE_DOUBLES: FEATURE_SIZE(D3D11_FEATURE_DATA_DOUBLES); break;
+    case D3D11_FEATURE_D3D10_X_HARDWARE_OPTIONS: FEATURE_SIZE(D3D11_FEATURE_DATA_D3D10_X_HARDWARE_OPTIONS); break;
+    case D3D11_FEATURE_FORMAT_SUPPORT: {
+      FEATURE_SIZE(D3D11_FEATURE_DATA_FORMAT_SUPPORT);
+      D3D11_FEATURE_DATA_FORMAT_SUPPORT *f = data;
+      return dev_CheckFormatSupport(d, f->InFormat, &f->OutFormatSupport);
+    }
+    case D3D11_FEATURE_FORMAT_SUPPORT2: {
+      /* (no unordered access to textures, typed loads, atomics, tiled or shareable-only formats: none of the second set, for a format the device knows) */
+      FEATURE_SIZE(D3D11_FEATURE_DATA_FORMAT_SUPPORT2);
+      D3D11_FEATURE_DATA_FORMAT_SUPPORT2 *f = data;
+      UINT first = 0;
+      f->OutFormatSupport2 = 0;
+      return dev_CheckFormatSupport(d, f->InFormat, &first);
+    }
+    case D3D11_FEATURE_D3D11_OPTIONS: {
+      FEATURE_SIZE(D3D11_FEATURE_DATA_D3D11_OPTIONS);
+      D3D11_FEATURE_DATA_D3D11_OPTIONS *o = data;
+      memset(o, 0, size);
+      o->ClearView = TRUE;
+      o->ConstantBufferOffsetting = TRUE;
+      o->MapNoOverwriteOnDynamicConstantBuffer = TRUE;
+      o->MapNoOverwriteOnDynamicBufferSRV = TRUE;
+      return S_OK;      /* (ConstantBufferPartialUpdate no: UpdateSubresource of a constant buffer writes it whole) */
+    }
+    case D3D11_FEATURE_ARCHITECTURE_INFO: FEATURE_SIZE(D3D11_FEATURE_DATA_ARCHITECTURE_INFO); break;      /* (not a tile-based deferred renderer) */
+    case D3D11_FEATURE_D3D9_OPTIONS: {
+      FEATURE_SIZE(D3D11_FEATURE_DATA_D3D9_OPTIONS);
+      ((D3D11_FEATURE_DATA_D3D9_OPTIONS *)data)->FullNonPow2TextureSupport = TRUE;
+      return S_OK;
+    }
+    case D3D11_FEATURE_SHADER_MIN_PRECISION_SUPPORT: FEATURE_SIZE(D3D11_FEATURE_DATA_SHADER_MIN_PRECISION_SUPPORT); break;      /* (every stage computes in 32 bits) */
+    case D3D11_FEATURE_D3D9_SHADOW_SUPPORT: FEATURE_SIZE(D3D11_FEATURE_DATA_D3D9_SHADOW_SUPPORT); break;
+    case D3D11_FEATURE_D3D11_OPTIONS1: FEATURE_SIZE(D3D11_FEATURE_DATA_D3D11_OPTIONS1); break;      /* (TiledResourcesTier NOT_SUPPORTED is 0) */
+    case D3D11_FEATURE_D3D9_SIMPLE_INSTANCING_SUPPORT: {
+      FEATURE_SIZE(D3D11_FEATURE_DATA_D3D9_SIMPLE_INSTANCING_SUPPORT);
+      ((D3D11_FEATURE_DATA_D3D9_SIMPLE_INSTANCING_SUPPORT *)data)->SimpleInstancingSupported = TRUE;
+      return S_OK;
+    }
+    case D3D11_FEATURE_MARKER_SUPPORT: FEATURE_SIZE(D3D11_FEATURE_DATA_MARKER_SUPPORT); break;      /* (no profiling markers reach a driver) */
+    case D3D11_FEATURE_D3D9_OPTIONS1: {
+      FEATURE_SIZE(D3D11_FEATURE_DATA_D3D9_OPTIONS1);
+      D3D11_FEATURE_DATA_D3D9_OPTIONS1 *o = data;
+      memset(o, 0, size);
+      o->FullNonPow2TextureSupported = TRUE;
+      o->SimpleInstancingSupported = TRUE;
+      return S_OK;
+    }
+    case D3D11_FEATURE_D3D11_OPTIONS2: FEATURE_SIZE(D3D11_FEATURE_DATA_D3D11_OPTIONS2); break;
+    case D3D11_FEATURE_D3D11_OPTIONS3: FEATURE_SIZE(D3D11_FEATURE_DATA_D3D11_OPTIONS3); break;
+    case D3D11_FEATURE_GPU_VIRTUAL_ADDRESS_SUPPORT: {
+      /* (Direct3D 12's answer: the same address space) */
+      FEATURE_SIZE(D3D11_FEATURE_DATA_GPU_VIRTUAL_ADDRESS_SUPPORT);
+      D3D11_FEATURE_DATA_GPU_VIRTUAL_ADDRESS_SUPPORT *g = data;
+      D3D12_FEATURE_DATA_GPU_VIRTUAL_ADDRESS_SUPPORT g12 = {0, 0};
+      const HRESULT hr = ID3D12Device_CheckFeatureSupport(d->d12, D3D12_FEATURE_GPU_VIRTUAL_ADDRESS_SUPPORT, &g12, sizeof g12);
+      if (FAILED(hr)) return hr;
+      g->MaxGPUVirtualAddressBitsPerResource = g12.MaxGPUVirtualAddressBitsPerResource;
+      g->MaxGPUVirtualAddressBitsPerProcess = g12.MaxGPUVirtualAddressBitsPerProcess;
+      return S_OK;
+    }
+    case D3D11_FEATURE_D3D11_OPTIONS4: FEATURE_SIZE(D3D11_FEATURE_DATA_D3D11_OPTIONS4); break;      /* (no NV12 textures to share) */
+    case D3D11_FEATURE_SHADER_CACHE: FEATURE_SIZE(D3D11_FEATURE_DATA_SHADER_CACHE); break;      /* (D3D11_SHADER_CACHE_SUPPORT_NONE) */
+    case D3D11_FEATURE_D3D11_OPTIONS5: {
+      /* (resources and fences share through NT handles; the formats that share are Direct3D 12's tier) */
+      FEATURE_SIZE(D3D11_FEATURE_DATA_D3D11_OPTIONS5);
+      D3D12_FEATURE_DATA_D3D12_OPTIONS4 o12;
+      memset(&o12, 0, sizeof o12);
+      const HRESULT hr = ID3D12Device_CheckFeatureSupport(d->d12, D3D12_FEATURE_D3D12_OPTIONS4, &o12, sizeof o12);
+      if (FAILED(hr)) return hr;
+      ((D3D11_FEATURE_DATA_D3D11_OPTIONS5 *)data)->SharedResourceTier = (D3D11_SHARED_RESOURCE_TIER)o12.SharedResourceCompatibilityTier;
+      return S_OK;
+    }
     default: return E_INVALIDARG;
   }
+#undef FEATURE_SIZE
   memset(data, 0, size);
   return S_OK;
 }
@@ -231,6 +310,7 @@ static const ITcosPresenterVtbl g_presenter_vtbl = {pres_QueryInterface, pres_Ad
 static void dev_destroy(DxObj *o) {
   Dev *d = (Dev *)o;
   InterlockedExchange(&d->o.ref, 16);      /* (the references given back below - the blank texture's, the bound state's - are not the last again) */
+  removal_shutdown(d);
   if (d->list) flush(d);
   if (d->ctx) { ctx_release_all(d->ctx); mem_free(d->ctx); }
   if (d->blank) dx_Release(OBJ(d->blank));

@@ -71,8 +71,7 @@ static UINT query_measures(D3D11_QUERY q) {
 
 static void query_destroy(DxObj *o) { child_destroy(o); }
 static HRESULT query_make(Dev *d, const D3D11_QUERY_DESC *desc, BOOL predicate, void **out) {
-  extern const ID3D11PredicateVtbl pred_vtbl;
-  static const GUID *const pred_iids[] = {&IID_ID3D11DeviceChild, &IID_ID3D11Asynchronous, &IID_ID3D11Query, &IID_ID3D11Predicate, NULL};
+  static const GUID *const pred_iids[] = {&IID_ID3D11DeviceChild, &IID_ID3D11Asynchronous, &IID_ID3D11Query, &IID_ID3D11Query1, &IID_ID3D11Predicate, NULL};
   if (out) *out = NULL;
   if (!desc || (desc->MiscFlags & ~(UINT)D3D11_QUERY_MISC_PREDICATEHINT) || query_data_size(desc->Query) == 0) return E_INVALIDARG;
   if (predicate && !query_is_predicate(desc->Query)) return E_INVALIDARG;
@@ -81,7 +80,8 @@ static HRESULT query_make(Dev *d, const D3D11_QUERY_DESC *desc, BOOL predicate, 
   if (query_measures(desc->Query) != ~0u && !d->measure_heap) return DXGI_ERROR_UNSUPPORTED;
   if (!out) return S_FALSE;
   const BOOL is_predicate = query_is_predicate(desc->Query);
-  Query *q = child_new(sizeof *q, d, is_predicate ? (const void *)&pred_vtbl : (const void *)&query_vtbl, is_predicate ? pred_iids : g_query_iids, query_destroy);
+  /* (a predicate is a query with no methods of its own: the same table, ID3D11Query1's, serves it) */
+  Query *q = child_new(sizeof *q, d, &query_vtbl, is_predicate ? pred_iids : g_query_iids, query_destroy);
   if (!q) return E_OUTOFMEMORY;
   q->desc = *desc;
   return give(q, out);

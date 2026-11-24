@@ -31,7 +31,7 @@ static ULONG STDMETHODCALLTYPE on12_Release(ID3D11On12Device1 *p) { return dx_Re
  * A texture's format must be one the kernel keeps as it is (formats.inc): a texture of a format kept wider has no Direct3D 12 resource of its own format. */
 static HRESULT STDMETHODCALLTYPE on12_CreateWrappedResource(ID3D11On12Device1 *p, IUnknown *resource12, const D3D11_RESOURCE_FLAGS *flags, D3D12_RESOURCE_STATES in_state,
                                                             D3D12_RESOURCE_STATES out_state, REFIID riid, void **out) {
-  extern const ID3D11Texture3DVtbl tex3_vtbl;
+  extern const ID3D11Texture3D1Vtbl tex3_vtbl;
   extern const ID3D11Texture1DVtbl tex1d_vtbl;
   (void)in_state; (void)out_state;      /* (the kernel's allocations are not state tracked: there is no transition to make) */
   Dev *d = dev_of_on12(p);
@@ -82,7 +82,7 @@ static HRESULT STDMETHODCALLTYPE on12_CreateWrappedResource(ID3D11On12Device1 *p
     }
     if (SUCCEEDED(hr) && t) {
       if (rd.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D) {
-        static const GUID *const iids3[] = {&IID_ID3D11DeviceChild, &IID_ID3D11Resource, &IID_ID3D11Texture3D, NULL};
+        static const GUID *const iids3[] = {&IID_ID3D11DeviceChild, &IID_ID3D11Resource, &IID_ID3D11Texture3D, &IID_ID3D11Texture3D1, NULL};
         t->c.o.lpVtbl = (const void *)&tex3_vtbl;
         t->c.o.iids = iids3;
         const D3D11_TEXTURE3D_DESC d3 = {desc.Width, desc.Height, rd.DepthOrArraySize, t->desc.MipLevels, desc.Format, desc.Usage, desc.BindFlags, desc.CPUAccessFlags, desc.MiscFlags};
@@ -110,9 +110,9 @@ static HRESULT STDMETHODCALLTYPE on12_CreateWrappedResource(ID3D11On12Device1 *p
  * same memory. A resource Direct3D 12 shared (no description of ours) is opened as the texture its Direct3D 12 description says, bound as its flags allow. The legacy
  * shared handles of IDXGIResource::GetSharedHandle are not made (DXGI_ERROR_UNSUPPORTED there), so OpenSharedResource takes none. */
 static void tex_take_kind(Tex *t, UINT kind, UINT depth) {
-  extern const ID3D11Texture3DVtbl tex3_vtbl;
+  extern const ID3D11Texture3D1Vtbl tex3_vtbl;
   extern const ID3D11Texture1DVtbl tex1d_vtbl;
-  static const GUID *const iids3[] = {&IID_ID3D11DeviceChild, &IID_ID3D11Resource, &IID_ID3D11Texture3D, NULL};
+  static const GUID *const iids3[] = {&IID_ID3D11DeviceChild, &IID_ID3D11Resource, &IID_ID3D11Texture3D, &IID_ID3D11Texture3D1, NULL};
   static const GUID *const iids1[] = {&IID_ID3D11DeviceChild, &IID_ID3D11Resource, &IID_ID3D11Texture1D, NULL};
   if (kind == 1) {
     t->c.o.lpVtbl = (const void *)&tex3_vtbl;

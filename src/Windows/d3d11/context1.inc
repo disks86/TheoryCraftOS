@@ -50,7 +50,7 @@ static void tex_fill_rect(Dev *d, Tex *t, UINT sub, UINT z, UINT x0, UINT y0, UI
 /* ClearView: a render target or unordered access view cleared with a colour (converted to the view's format), all of it or the rectangles given (clipped to
  * the view; of a buffer, a rectangle's left and right are elements). */
 static void STDMETHODCALLTYPE ctx_ClearView(Ctx *c, ID3D11View *view, const FLOAT colour[4], const D3D11_RECT *rects, UINT count) {
-  extern const ID3D11UnorderedAccessViewVtbl uav_vtbl;
+  extern const ID3D11UnorderedAccessView1Vtbl uav_vtbl;
   View *v = (View *)view;
   if (!v || !colour || (count && !rects)) return;
   if (c->deferred) { deferred_record(c, &(RecArgs){.op = REC_CLEAR_VIEW, .obj = {view}, .f = {colour[0], colour[1], colour[2], colour[3]}, .rects = rects, .rect_count = count}); return; }

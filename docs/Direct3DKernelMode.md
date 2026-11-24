@@ -418,7 +418,8 @@ with up to 64 bytes for the runtime above: d3d11.dll's texture description throu
 both sides alias the same memory) or a fence on any device of the adapter, in this process or another; `OpenSharedHandleByName` finds the handle. d3d11.dll shares
 `D3D11_RESOURCE_MISC_SHARED_NTHANDLE` textures with `IDXGIResource1::CreateSharedHandle` and opens them, and Direct3D 12's, with `OpenSharedResource1` /
 `OpenSharedResourceByName`. `OpenSharedHandle` also opens the legacy (global share) handles d3d11.dll's `GetSharedHandle` gives (resources made with the private
-option `TCOS_RESOURCE_GLOBAL_SHARE`; `TcosD3D12OpenShared` takes one kind only). Tested by tests/windows/d3dsharetest.c (two devices on the emulator; `ARGS=processes tests/d3d12_qemu.sh d3dsharetest` also a second process
+option `TCOS_RESOURCE_GLOBAL_SHARE`; `TcosD3D12OpenShared` takes one kind only). d3d11.dll's `ID3D11Fence` is a Direct3D 12 fence of its device, so its handles and
+Direct3D 12's open in either runtime (`ID3D11Device5::OpenSharedFence`). Tested by tests/windows/d3dsharetest.c (two devices on the emulator; `ARGS=processes tests/d3d12_qemu.sh d3dsharetest` also a second process
 that inherits the handles).
 
 **The later interfaces** (`ID3D12Device1` .. `ID3D12Device10`, `ID3D12GraphicsCommandList1` .. `7`, `ID3D12Fence1`, `ID3D12Resource2`, `ID3D12Heap1`; every vtable slot
