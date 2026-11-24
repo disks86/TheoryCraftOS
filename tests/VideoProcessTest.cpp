@@ -34,11 +34,18 @@ static int g_failed = 0;
 static int g_reported = 0;
 #define CHECK(...) do { if (!(__VA_ARGS__)) { if (g_reported++ < 40) printf("FAILED line %d: %s\n", __LINE__, #__VA_ARGS__); ++g_failed; } } while (0)
 
-static const VpFormat kFormats[] = {VpFormat::Nv12, VpFormat::P010, VpFormat::P016, VpFormat::Bgra8, VpFormat::Bgrx8, VpFormat::Rgba8, VpFormat::Rgb10a2, VpFormat::Rgba16f};
+static const VpFormat kFormats[] = {VpFormat::Nv12, VpFormat::P010, VpFormat::P016, VpFormat::Bgra8, VpFormat::Bgrx8, VpFormat::Rgba8, VpFormat::Rgb10a2, VpFormat::Rgba16f,
+                                    VpFormat::Ayuv, VpFormat::Y410, VpFormat::Y416, VpFormat::Yuy2, VpFormat::Y210, VpFormat::Y216, VpFormat::P208};
+constexpr uint32_t kFormatCount = sizeof kFormats / sizeof kFormats[0];
 static const char* format_name(VpFormat f) {
-  static const char* const names[] = {"NV12", "P010", "P016", "BGRA8", "BGRX8", "RGBA8", "RGB10A2", "RGBA16F"};
+  static const char* const names[] = {"NV12", "P010", "P016", "BGRA8", "BGRX8", "RGBA8", "RGB10A2", "RGBA16F", "AYUV", "Y410", "Y416", "YUY2", "Y210", "Y216", "P208"};
   return names[static_cast<int>(f)];
 }
+// The chroma subsampling (shifts) of a YUV format: 4:2:0 1, 1; 4:2:2 1, 0; 4:4:4 0, 0.
+static int ss_x(VpFormat f) { return f == VpFormat::Ayuv || f == VpFormat::Y410 || f == VpFormat::Y416 ? 0 : 1; }
+static int ss_y(VpFormat f) { return f == VpFormat::Nv12 || f == VpFormat::P010 || f == VpFormat::P016 ? 1 : 0; }
+static bool pairs(VpFormat f) { return f == VpFormat::Yuy2 || f == VpFormat::Y210 || f == VpFormat::Y216; }
+static bool packed444(VpFormat f) { return f == VpFormat::Ayuv || f == VpFormat::Y410 || f == VpFormat::Y416; }
 
 // ---- pictures in memory (the test's own layout code)
 
@@ -74,6 +81,17 @@ static Pic make_pic(VpFormat f, VpColorSpace space, uint32_t w, uint32_t h, bool
   pic.img.height = h;
   const uint32_t cw = (w + 1) / 2, ch = (h + 1) / 2;
   switch (f) {
+    // (the packed formats are kept by the kernel as they are: AYUV / YUY2 in A8B8G8R8 pixels, Y410 in A2B10G10R10, Y416 / Y210 / Y216 in A16B16G16R16)
+    case VpFormat::Ayuv: set_plane(pic.img.plane[0], pic.mem[0], w, h, 4, pad, {2, 1, 0, 3}, 8, false); break;
+    case VpFormat::Y410: set_plane(pic.img.plane[0], pic.mem[0], w, h, 4, 4 * pad, {1, 0, 2, 3}, 10, false); break;
+    case VpFormat::Y416: set_plane(pic.img.plane[0], pic.mem[0], w, h, 8, 8 * pad, {2, 0, 4, 6}, 16, false); break;
+    case VpFormat::Yuy2: set_plane(pic.img.plane[0], pic.mem[0], cw, h, 4, pad, {0, 1, 2, 3}, 8, false); break;
+    case VpFormat::Y210:
+    case VpFormat::Y216: set_plane(pic.img.plane[0], pic.mem[0], cw, h, 8, 8 * pad, {0, 2, 4, 6}, 16, false); break;
+    case VpFormat::P208:
+      if (widened) { set_plane(pic.img.plane[0], pic.mem[0], w, h, 4, 0, {0}, 8, false); set_plane(pic.img.plane[1], pic.mem[1], cw, h, 4, 0, {0, 1}, 8, false); }
+      else { set_plane(pic.img.plane[0], pic.mem[0], w, h, 1, pad, {0}, 8, false); set_plane(pic.img.plane[1], pic.mem[1], cw, h, 2, pad, {0, 1}, 8, false); }
+      break;
     case VpFormat::Nv12:
       if (widened) { set_plane(pic.img.plane[0], pic.mem[0], w, h, 4, 0, {0}, 8, false); set_plane(pic.img.plane[1], pic.mem[1], cw, ch, 4, 0, {0, 1}, 8, false); }
       else { set_plane(pic.img.plane[0], pic.mem[0], w, h, 1, pad, {0}, 8, false); set_plane(pic.img.plane[1], pic.mem[1], cw, ch, 2, pad, {0, 1}, 8, false); }
@@ -92,13 +110,19 @@ static Pic make_pic(VpFormat f, VpColorSpace space, uint32_t w, uint32_t h, bool
   return pic;
 }
 
-static bool is_yuv(VpFormat f) { return f == VpFormat::Nv12 || f == VpFormat::P010 || f == VpFormat::P016; }
+static bool is_yuv(VpFormat f) { return f == VpFormat::Nv12 || f == VpFormat::P010 || f == VpFormat::P016 || f >= VpFormat::Ayuv; }
 static bool is_float(VpFormat f) { return f == VpFormat::Rgba16f; }
-static int depth(VpFormat f) { return f == VpFormat::Nv12 ? 8 : f == VpFormat::P010 || f == VpFormat::Rgb10a2 ? 10 : f == VpFormat::P016 ? 16 : 8; }
-static bool has_alpha(VpFormat f) { return f == VpFormat::Bgra8 || f == VpFormat::Rgba8 || f == VpFormat::Rgb10a2 || f == VpFormat::Rgba16f; }
+static int depth(VpFormat f) {
+  switch (f) {
+    case VpFormat::P010: case VpFormat::Rgb10a2: case VpFormat::Y410: case VpFormat::Y210: return 10;
+    case VpFormat::P016: case VpFormat::Y416: case VpFormat::Y216: return 16;
+    default: return 8;
+  }
+}
+static bool has_alpha(VpFormat f) { return f == VpFormat::Bgra8 || f == VpFormat::Rgba8 || f == VpFormat::Rgb10a2 || f == VpFormat::Rgba16f || packed444(f); }
 static double code_max(VpFormat f, int c) {
   if (is_float(f)) return 1.0;
-  if (f == VpFormat::Rgb10a2 && c == 3) return 3.0;
+  if ((f == VpFormat::Rgb10a2 || f == VpFormat::Y410) && c == 3) return 3.0;
   return (1 << depth(f)) - 1;
 }
 
@@ -106,27 +130,61 @@ static uint32_t rd16(const uint8_t* p) { return p[0] | p[1] << 8; }
 static void wr16(uint8_t* p, uint32_t v) { p[0] = static_cast<uint8_t>(v); p[1] = static_cast<uint8_t>(v >> 8); }
 
 // Channel c of sample (x, y) of plane `pl`, as its code (an integer, or a float for half floats).
+// The packed YUV formats (one plane): `pl` 0 is the luma (channel 0) and alpha (3) of pixel x, `pl` 1 the U (0) and V (1) of chroma sample x; where they are in memory.
+static size_t packed_at(const Pic& pic, int pl, uint32_t x, uint32_t y, int c, int* field) {
+  const VpPlane& p = pic.img.plane[0];
+  const size_t row = size_t{y} * p.pitch;
+  *field = -1;
+  if (pic.format == VpFormat::Y410) { *field = pl == 0 ? (c == 3 ? 3 : 1) : (c == 0 ? 0 : 2); return row + size_t{x} * 4; }
+  if (packed444(pic.format)) return row + size_t{x} * p.step + p.offset[pl == 0 ? (c == 3 ? 3 : 0) : 1 + c];
+  if (pl == 0) return row + size_t{x / 2} * p.step + p.offset[x % 2 ? 2 : 0];
+  return row + size_t{x} * p.step + p.offset[c == 0 ? 1 : 3];
+}
 static double get_code(const Pic& pic, int pl, uint32_t x, uint32_t y, int c) {
+  if (packed444(pic.format) || pairs(pic.format)) {
+    int field;
+    const uint8_t* s = pic.mem[0].data() + packed_at(pic, pl, x, y, c, &field);
+    if (field >= 0) { const uint32_t v = rd16(s) | rd16(s + 2) << 16; return field == 3 ? v >> 30 : (v >> (10 * field)) & 0x3FF; }
+    if (depth(pic.format) == 8) return s[0];
+    return pic.format == VpFormat::Y210 ? rd16(s) >> 6 : rd16(s);
+  }
   const VpPlane& p = pic.img.plane[pl];
   const uint8_t* s = pic.mem[pl].data() + size_t{y} * p.pitch + size_t{x} * p.step;
   switch (pic.format) {
-    case VpFormat::Nv12: case VpFormat::Bgra8: case VpFormat::Bgrx8: case VpFormat::Rgba8: return s[p.offset[c]];
+    case VpFormat::Nv12: case VpFormat::P208: case VpFormat::Bgra8: case VpFormat::Bgrx8: case VpFormat::Rgba8: return s[p.offset[c]];
     case VpFormat::P010: return rd16(s + p.offset[c]) >> 6;
     case VpFormat::P016: return rd16(s + p.offset[c]);
     case VpFormat::Rgb10a2: { const uint32_t v = rd16(s) | rd16(s + 2) << 16; return c == 3 ? v >> 30 : (v >> (10 * c)) & 0x3FF; }
     case VpFormat::Rgba16f: return graphics::half_to_float(static_cast<uint16_t>(rd16(s + p.offset[c])));
+    default: break;
   }
   return 0;
 }
 static void set_code(Pic& pic, int pl, uint32_t x, uint32_t y, int c, double code) {
-  const VpPlane& p = pic.img.plane[pl];
-  uint8_t* s = pic.mem[pl].data() + size_t{y} * p.pitch + size_t{x} * p.step;
-  const double mx = code_max(pic.format, c);
+  const double mx = code_max(pic.format, pl == 0 ? c : 0);
   if (!is_float(pic.format)) code = floor(code + 0.5);
   if (code < 0) code = 0;
   if (code > mx) code = mx;
+  if (packed444(pic.format) || pairs(pic.format)) {
+    int field;
+    uint8_t* s = pic.mem[0].data() + packed_at(pic, pl, x, y, c, &field);
+    if (field >= 0) {
+      uint32_t v = rd16(s) | rd16(s + 2) << 16;
+      const uint32_t shift = 10 * field, mask = field == 3 ? 3u : 0x3FFu;
+      v = (v & ~(mask << shift)) | (static_cast<uint32_t>(code) << shift);
+      wr16(s, v & 0xFFFF);
+      wr16(s + 2, v >> 16);
+    } else if (depth(pic.format) == 8) {
+      s[0] = static_cast<uint8_t>(code);
+    } else {
+      wr16(s, static_cast<uint32_t>(code) << (pic.format == VpFormat::Y210 ? 6 : 0));
+    }
+    return;
+  }
+  const VpPlane& p = pic.img.plane[pl];
+  uint8_t* s = pic.mem[pl].data() + size_t{y} * p.pitch + size_t{x} * p.step;
   switch (pic.format) {
-    case VpFormat::Nv12: case VpFormat::Bgra8: case VpFormat::Bgrx8: case VpFormat::Rgba8: s[p.offset[c]] = static_cast<uint8_t>(code); return;
+    case VpFormat::Nv12: case VpFormat::P208: case VpFormat::Bgra8: case VpFormat::Bgrx8: case VpFormat::Rgba8: s[p.offset[c]] = static_cast<uint8_t>(code); return;
     case VpFormat::P010: wr16(s + p.offset[c], static_cast<uint32_t>(code) << 6); return;
     case VpFormat::P016: wr16(s + p.offset[c], static_cast<uint32_t>(code)); return;
     case VpFormat::Rgb10a2: {
@@ -138,6 +196,7 @@ static void set_code(Pic& pic, int pl, uint32_t x, uint32_t y, int c, double cod
       return;
     }
     case VpFormat::Rgba16f: wr16(s + p.offset[c], graphics::float_to_half(static_cast<float>(code))); return;
+    default: return;
   }
 }
 
@@ -310,8 +369,13 @@ static void fill_patches(Pic& pic, double nominal[8][4]) {
     for (int y = py; y < py + 8; ++y)
       for (int x = px; x < px + 8; ++x) {
         if (s.yuv) {
+          const int sx = ss_x(pic.format), sy = ss_y(pic.format);
           set_code(pic, 0, x, y, 0, encode(pic.format, s, 0, v[0]));
-          if (x % 2 == 0 && y % 2 == 0) { set_code(pic, 1, x / 2, y / 2, 0, encode(pic.format, s, 1, v[1])); set_code(pic, 1, x / 2, y / 2, 1, encode(pic.format, s, 1, v[2])); }
+          if (has_alpha(pic.format)) set_code(pic, 0, x, y, 3, encode(pic.format, s, 2, alpha));
+          if (x % (1 << sx) == 0 && y % (1 << sy) == 0) {
+            set_code(pic, 1, x >> sx, y >> sy, 0, encode(pic.format, s, 1, v[1]));
+            set_code(pic, 1, x >> sx, y >> sy, 1, encode(pic.format, s, 1, v[2]));
+          }
         } else {
           for (int c = 0; c < 3; ++c) set_code(pic, 0, x, y, c, encode(pic.format, s, 0, v[c]));
           if (has_alpha(pic.format)) set_code(pic, 0, x, y, 3, encode(pic.format, s, 2, alpha));
@@ -319,10 +383,11 @@ static void fill_patches(Pic& pic, double nominal[8][4]) {
       }
     // what was stored
     if (s.yuv) {
+      const int sx = ss_x(pic.format), sy = ss_y(pic.format);
       nominal[p][0] = decode(pic.format, s, 0, get_code(pic, 0, px, py, 0));
-      nominal[p][1] = decode(pic.format, s, 1, get_code(pic, 1, px / 2, py / 2, 0));
-      nominal[p][2] = decode(pic.format, s, 1, get_code(pic, 1, px / 2, py / 2, 1));
-      nominal[p][3] = 1;
+      nominal[p][1] = decode(pic.format, s, 1, get_code(pic, 1, px >> sx, py >> sy, 0));
+      nominal[p][2] = decode(pic.format, s, 1, get_code(pic, 1, px >> sx, py >> sy, 1));
+      nominal[p][3] = has_alpha(pic.format) ? decode(pic.format, s, 2, get_code(pic, 0, px, py, 3)) : 1.0;
     } else {
       for (int c = 0; c < 3; ++c) nominal[p][c] = decode(pic.format, s, 0, get_code(pic, 0, px, py, c));
       nominal[p][3] = has_alpha(pic.format) ? decode(pic.format, s, 2, get_code(pic, 0, px, py, 3)) : 1.0;
@@ -351,6 +416,7 @@ static void check_pair(VpFormat fi, VpColorSpace si, VpFormat fo, VpColorSpace s
         if (os.yuv) {
           const double want = encode(fo, os, 0, e[0]), got = get_code(out, 0, x, y, 0);
           if (fabs(clamp01(want / code_max(fo, 0)) * code_max(fo, 0) - got) > tol) ++bad;
+          if (has_alpha(fo) && get_code(out, 0, x, y, 3) != code_max(fo, 3)) ++bad;   // (Opaque fill)
         } else {
           for (int c = 0; c < 3; ++c) {
             const double want = clamp01(encode(fo, os, 0, e[c]) / code_max(fo, 0)) * code_max(fo, 0), got = get_code(out, 0, x, y, c);
@@ -363,8 +429,8 @@ static void check_pair(VpFormat fi, VpColorSpace si, VpFormat fo, VpColorSpace s
         }
       }
     if (os.yuv)
-      for (int j = py / 2 + 1; j <= py / 2 + 2; ++j)
-        for (int i = px / 2 + 1; i <= px / 2 + 2; ++i)
+      for (int j = (py >> ss_y(fo)) + 1; j <= ((py + 8) >> ss_y(fo)) - 2; ++j)
+        for (int i = (px >> ss_x(fo)) + 1; i <= ((px + 8) >> ss_x(fo)) - 2; ++i)
           for (int c = 0; c < 2; ++c) {
             const double want = clamp01(encode(fo, os, 1, e[1 + c]) / code_max(fo, 0)) * code_max(fo, 0), got = get_code(out, 1, i, j, c);
             if (fabs(want - got) > tol) {
@@ -492,15 +558,65 @@ static void test_ffmpeg() {
   CHECK(worst_y <= 1 && worst_c <= 2);
 }
 
+// The 4:2:2 and 4:4:4 formats against zscale: the gradient's yuv422p (LEFT chroma) and yuv444p to RGB, and the gradient from RGB to them (10- and 16-bit formats hold
+// the 8-bit codes times 4 and 256: the same values).
+static void test_ffmpeg_422_444() {
+  const std::vector<uint8_t> bgra = read_file("tests/data/videoprocess/gradient.bgra");
+  const std::vector<uint8_t> y422 = read_file("tests/data/videoprocess/gradient_709.yuv422p"), y444 = read_file("tests/data/videoprocess/gradient_709.yuv444p");
+  const std::vector<uint8_t> to422 = read_file("tests/data/videoprocess/yuv422p_709_to.gbrp"), to444 = read_file("tests/data/videoprocess/yuv444p_709_to.gbrp");
+  CHECK(bgra.size() == 64 * 32 * 4 && y422.size() == 64 * 32 * 2 && y444.size() == 64 * 32 * 3 && to422.size() == 64 * 32 * 3 && to444.size() == to422.size());
+  if (g_failed) return;
+  for (VpFormat f : {VpFormat::Yuy2, VpFormat::Y210, VpFormat::Y216, VpFormat::P208, VpFormat::Ayuv, VpFormat::Y410, VpFormat::Y416}) {
+    const bool full = ss_x(f) == 0;
+    const std::vector<uint8_t>& yuv = full ? y444 : y422;
+    const std::vector<uint8_t>& ref = full ? to444 : to422;
+    const uint32_t cw = full ? 64 : 32;
+    const double k = 1 << (depth(f) - 8);
+    for (bool widened : {false, true}) {
+      Pic in = make_pic(f, kVpYcbcrStudioG22LeftP709, 64, 32, widened);
+      for (uint32_t y = 0; y < 32; ++y) for (uint32_t x = 0; x < 64; ++x) { set_code(in, 0, x, y, 0, yuv[y * 64 + x] * k); if (has_alpha(f)) set_code(in, 0, x, y, 3, code_max(f, 3)); }
+      for (uint32_t y = 0; y < 32; ++y)
+        for (uint32_t x = 0; x < cw; ++x)
+          for (int c = 0; c < 2; ++c) set_code(in, 1, x, y, c, yuv[64 * 32 + c * cw * 32 + y * cw + x] * k);
+      Pic out = make_pic(VpFormat::Bgra8, kVpRgbFullG22P709, 64, 32);
+      CHECK(process(out, whole(out), {stream_of(in, whole(in), whole(out))}) == VpResult::Ok);
+      int worst = 0;
+      for (uint32_t y = 0; y < 32; ++y)
+        for (uint32_t x = 0; x < 64; ++x)
+          for (int c = 0; c < 3; ++c) {
+            const int plane = c == 0 ? 2 : c == 1 ? 0 : 1;   // (planar G, B, R)
+            const int d = abs(static_cast<int>(get_code(out, 0, x, y, c)) - ref[plane * 64 * 32 + y * 64 + x]);
+            worst = d > worst ? d : worst;
+          }
+      if (!widened) printf("  ffmpeg zscale %s BT.709 -> BGRA: worst difference %d\n", format_name(f), worst);
+      CHECK(worst <= 1);
+    }
+    // RGB -> the format: luma per pixel, chroma by the LEFT filter (4:2:2) or the pixel's own (4:4:4)
+    Pic in = make_pic(VpFormat::Bgra8, kVpRgbFullG22P709, 64, 32);
+    for (uint32_t y = 0; y < 32; ++y) for (uint32_t x = 0; x < 64; ++x) for (int c = 0; c < 4; ++c) set_code(in, 0, x, y, c, bgra[(y * 64 + x) * 4 + (c == 3 ? 3 : 2 - c)]);
+    Pic out = make_pic(f, kVpYcbcrStudioG22LeftP709, 64, 32, true);
+    CHECK(process(out, whole(out), {stream_of(in, whole(in), whole(out))}) == VpResult::Ok);
+    double worst_y = 0, worst_c = 0;
+    for (uint32_t y = 0; y < 32; ++y) for (uint32_t x = 0; x < 64; ++x) worst_y = fmax(worst_y, fabs(get_code(out, 0, x, y, 0) / k - yuv[y * 64 + x]));
+    for (uint32_t y = 0; y < 32; ++y)
+      for (uint32_t x = 0; x < cw; ++x)
+        for (int c = 0; c < 2; ++c) worst_c = fmax(worst_c, fabs(get_code(out, 1, x, y, c) / k - yuv[64 * 32 + c * cw * 32 + y * cw + x]));
+    printf("  ffmpeg zscale BGRA -> %s BT.709: worst luma difference %.2f, chroma %.2f\n", format_name(f), worst_y, worst_c);
+    CHECK(worst_y <= 1 && worst_c <= 2);
+  }
+}
+
 // ---- chroma siting: upsampling and downsampling at each siting
 
 static void test_siting() {
   // upsampling: constant luma, chroma ramps (Cb across, Cr down); the RGB output's pixels show the chroma interpolated at the siting
+  for (VpFormat sf : {VpFormat::P016, VpFormat::Y216})
   for (VpColorSpace space : {kVpYcbcrFullG22P709X601, kVpYcbcrFullG22LeftP709, kVpYcbcrStudioG22TopLeftP2020}) {
     const Space s = space_of(space);
-    Pic in = make_pic(VpFormat::P016, space, 12, 8);
+    const int vy = ss_y(sf);   // (4:2:2: no vertical subsampling, no vertical siting)
+    Pic in = make_pic(sf, space, 12, 8);
     for (uint32_t y = 0; y < 8; ++y) for (uint32_t x = 0; x < 12; ++x) set_code(in, 0, x, y, 0, encode(in.format, s, 0, 0.5));
-    for (uint32_t j = 0; j < 4; ++j)
+    for (uint32_t j = 0; j < (8u >> vy); ++j)
       for (uint32_t i = 0; i < 6; ++i) { set_code(in, 1, i, j, 0, encode(in.format, s, 1, -0.2 + 0.06 * i)); set_code(in, 1, i, j, 1, encode(in.format, s, 1, -0.15 + 0.08 * j)); }
     Pic out = make_pic(VpFormat::Rgba16f, s.p2020 ? kVpRgbFullG22P2020 : kVpRgbFullG22P709, 12, 8);
     CHECK(process(out, whole(out), {stream_of(in, whole(in), whole(out))}) == VpResult::Ok);
@@ -508,7 +624,7 @@ static void test_siting() {
     int bad = 0;
     for (uint32_t y = 0; y < 8; ++y)
       for (uint32_t x = 0; x < 12; ++x) {
-        const double ci = fmin(fmax((x - ox) / 2, 0), 5), cj = fmin(fmax((y - oy) / 2, 0), 3);
+        const double ci = fmin(fmax((x - ox) / 2, 0), 5), cj = vy ? fmin(fmax((y - oy) / 2, 0), 3) : y;
         const double v[3] = {decode(in.format, s, 0, get_code(in, 0, x, y, 0)), decode(in.format, s, 1, encode(in.format, s, 1, -0.2 + 0.06 * ci)),
                              decode(in.format, s, 1, encode(in.format, s, 1, -0.15 + 0.08 * cj))};
         double e[3];
@@ -518,8 +634,10 @@ static void test_siting() {
     CHECK(bad == 0);
   }
   // downsampling: an RGB picture whose chroma changes per column / row; each output chroma sample is the filter at its siting over the pixels' chroma
+  for (VpFormat sf : {VpFormat::P016, VpFormat::Y216})
   for (VpColorSpace space : {kVpYcbcrFullG22P709X601, kVpYcbcrFullG22LeftP709, kVpYcbcrStudioG22TopLeftP2020}) {
     const Space s = space_of(space);
+    const int vy = ss_y(sf);
     const uint32_t W = 11, H = 7;   // (odd: the last chroma sample has one column / row)
     Pic in = make_pic(VpFormat::Rgba16f, s.p2020 ? kVpRgbFullG22P2020 : kVpRgbFullG22P709, W, H);
     double cb[H][W], cr[H][W], yy[H][W];
@@ -533,19 +651,19 @@ static void test_siting() {
         rgb_to_yuv(s.matrix, st, yuv);
         yy[y][x] = yuv[0]; cb[y][x] = yuv[1]; cr[y][x] = yuv[2];
       }
-    Pic out = make_pic(VpFormat::P016, space, W, H, true);
+    Pic out = make_pic(sf, space, W, H, true);
     CHECK(process(out, whole(out), {stream_of(in, whole(in), whole(out))}) == VpResult::Ok);
     int bad = 0;
     auto at = [&](double (*m)[W], int x, int y) { x = x < 0 ? 0 : x >= int(W) ? W - 1 : x; y = y < 0 ? 0 : y >= int(H) ? H - 1 : y; return m[y][x]; };
-    for (int j = 0; j < int(H + 1) / 2; ++j)
+    for (int j = 0; j < (vy ? int(H + 1) / 2 : int(H)); ++j)
       for (int i = 0; i < int(W + 1) / 2; ++i) {
         double e[2] = {0, 0};
         const double h3[3] = {0.25, 0.5, 0.25}, h2[2] = {0.5, 0.5};
-        const int nh = s.siting == 0 ? 2 : 3, nv = s.siting == 2 ? 3 : 2;
+        const int nh = s.siting == 0 ? 2 : 3, nv = !vy ? 1 : s.siting == 2 ? 3 : 2;
         for (int a = 0; a < nv; ++a)
           for (int b = 0; b < nh; ++b) {
-            const int x = nh == 2 ? 2 * i + b : 2 * i - 1 + b, y = nv == 2 ? 2 * j + a : 2 * j - 1 + a;
-            const double w = (nv == 2 ? h2[a] : h3[a]) * (nh == 2 ? h2[b] : h3[b]);
+            const int x = nh == 2 ? 2 * i + b : 2 * i - 1 + b, y = nv == 1 ? j : nv == 2 ? 2 * j + a : 2 * j - 1 + a;
+            const double w = (nv == 1 ? 1.0 : nv == 2 ? h2[a] : h3[a]) * (nh == 2 ? h2[b] : h3[b]);
             e[0] += w * at(cb, x, y);
             e[1] += w * at(cr, x, y);
           }
@@ -820,7 +938,8 @@ static void test_yuv_targets() {
     if (widened) CHECK(out.mem[0][1] == 0xA5 && out.mem[0][3] == 0xA5 && out.mem[1][2] == 0xA5 && out.mem[1][3] == 0xA5);
   }
   // odd sizes, every YUV format both ways, a flat colour: every sample is exact
-  for (VpFormat f : {VpFormat::Nv12, VpFormat::P010, VpFormat::P016})
+  for (VpFormat f : {VpFormat::Nv12, VpFormat::P010, VpFormat::P016, VpFormat::Ayuv, VpFormat::Y410, VpFormat::Y416, VpFormat::Yuy2, VpFormat::Y210, VpFormat::Y216,
+                     VpFormat::P208})
     for (bool widened : {false, true}) {
       const Space s = space_of(kVpYcbcrStudioG22LeftP2020);
       Pic in = make_pic(VpFormat::Rgba8, kVpRgbFullG22P2020, 5, 3);
@@ -832,7 +951,12 @@ static void test_yuv_targets() {
       rgb_to_yuv(2020, rgb, yuv);
       int bad = 0;
       for (int y = 0; y < 3; ++y) for (int x = 0; x < 5; ++x) if (fabs(get_code(out, 0, x, y, 0) - encode(f, s, 0, yuv[0])) > tolerance(f)) ++bad;
-      for (int j = 0; j < 2; ++j) for (int i = 0; i < 3; ++i) for (int c = 0; c < 2; ++c) if (fabs(get_code(out, 1, i, j, c) - encode(f, s, 1, yuv[1 + c])) > tolerance(f)) ++bad;
+      for (int j = 0; j < (ss_y(f) ? 2 : 3); ++j)
+        for (int i = 0; i < (ss_x(f) ? 3 : 5); ++i)
+          for (int c = 0; c < 2; ++c) if (fabs(get_code(out, 1, i, j, c) - encode(f, s, 1, yuv[1 + c])) > tolerance(f)) ++bad;
+      if (has_alpha(f)) for (int y = 0; y < 3; ++y) for (int x = 0; x < 5; ++x) if (get_code(out, 0, x, y, 3) != code_max(f, 3)) ++bad;
+      // the last pixel of an odd width (the first of a pair of a 4:2:2 packed format) is written; the second of that pair is not a pixel
+      if (pairs(f)) for (int y = 0; y < 3; ++y) if (get_code(out, 0, 4, y, 0) != get_code(out, 0, 0, y, 0)) ++bad;
       // and back to RGB from the odd-sized YUV picture
       Pic back = make_pic(VpFormat::Rgba8, kVpRgbFullG22P2020, 5, 3);
       CHECK(process(back, whole(back), {stream_of(out, whole(out), whole(back))}) == VpResult::Ok);
@@ -876,7 +1000,8 @@ static void test_refusals() {
   CHECK(with([](VpImage& i) { i.plane[1].offset[1] = 2; }) == VpResult::Invalid);   // past the 2-byte sample
   CHECK(with([](VpImage& i) { i.plane[0].pitch = 4; }) == VpResult::Invalid);
   CHECK(with([](VpImage& i) { i.width = 0; }) == VpResult::Invalid);
-  CHECK(with([](VpImage& i) { i.format = static_cast<VpFormat>(9); }) == VpResult::Invalid);
+  CHECK(with([](VpImage& i) { i.format = static_cast<VpFormat>(static_cast<int>(kVpLastFormat) + 1); }) == VpResult::Invalid);
+  CHECK(with([](VpImage& i) { i.format = VpFormat::P208; }) == VpResult::Invalid);   // (NV12's chroma plane is half as high as P208's)
   CHECK(with([](VpImage& i) { i.plane[0].half_float = true; }) == VpResult::Invalid);
   // colour spaces
   for (VpColorSpace bad : {4u, 12u, 13u, 14u, 16u, 18u, 19u, 25u, 0xFFFFFFFFu}) {
@@ -904,7 +1029,7 @@ static uint32_t rnd() { g_seed = g_seed * 1103515245u + 12345u; return g_seed >>
 static void test_garbage() {
   int ok = 0;
   for (int iter = 0; iter < 4000; ++iter) {
-    const VpFormat fi = kFormats[rnd() % 8], fo = kFormats[rnd() % 8];
+    const VpFormat fi = kFormats[rnd() % kFormatCount], fo = kFormats[rnd() % kFormatCount];
     const uint32_t w = 1 + rnd() % 9, h = 1 + rnd() % 9;
     Pic in = make_pic(fi, is_yuv(fi) ? kYuvSpaces[rnd() % 11] : kRgbSpaces[rnd() % 7], w, h, rnd() & 1);
     Pic out = make_pic(fo, is_yuv(fo) ? kYuvSpaces[rnd() % 11] : kRgbSpaces[rnd() % 7], 1 + rnd() % 9, 1 + rnd() % 9, rnd() & 1);
@@ -968,6 +1093,7 @@ int main() {
   test_format_pairs();
   printf("  %d format pairs, %d conversions checked\n", g_pairs, g_pair_runs);
   test_ffmpeg();
+  test_ffmpeg_422_444();
   test_siting();
   test_scaling();
   test_orientations();
