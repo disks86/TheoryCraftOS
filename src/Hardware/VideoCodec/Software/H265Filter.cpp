@@ -118,10 +118,11 @@ void Core::deblock_px() {
 
   // bS of every 4-sample edge segment, vertical edges first (8.7.2 filters all vertical edges of the picture, then all horizontal edges)
   static const int kChromaQp[14] = {29, 30, 31, 32, 33, 33, 34, 34, 35, 35, 36, 36, 37, 37};
+  // QpC of the edge (8.7.2.5.5): Table 8-10 of qPi = ((QpQ + QpP + 1) >> 1) + cQpPicOffset for 4:2:0, Min(qPi, 51) for the other chroma formats
   auto chroma_tc = [&](int qp_avg, int c, int bs, const SliceInfo* sl) {
     const int offset = c == 1 ? pps.cb_qp_offset : pps.cr_qp_offset;
     const int qpi = qp_avg + offset;
-    const int qpc = qpi < 30 ? qpi : qpi >= 43 ? qpi - 6 : kChromaQp[qpi - 30];
+    const int qpc = cat_ != 1 ? (qpi < 51 ? qpi : 51) : qpi < 30 ? qpi : qpi >= 43 ? qpi - 6 : kChromaQp[qpi - 30];
     return kTcTable[clip3(0, 53, qpc + 2 * (bs - 1) + (sl->tc_offset_div2 << 1))] * (1 << (bd_c - 8));
   };
   for (int dir = 0; dir < 2; ++dir) {   // 0: vertical edges (filtering across x), 1: horizontal edges
@@ -187,16 +188,16 @@ void Core::deblock_px() {
         }
       }
     }
-    // chroma: edges on the 8-sample chroma grid (16 luma samples), filtered where bS is 2, in segments of four chroma samples that take bS and the quantiser from
-    // the first luma segment they cover
-    const int cw = s.width / 2, ch = s.height / 2;
-    for (int c = 1; c < 3; ++c) {
+    // chroma: edges on the 8-sample chroma grid (16 luma samples across a subsampled direction, 8 across a full one), filtered where bS is 2, in segments of four
+    // chroma samples that take bS and the quantiser from the luma segment at their first sample
+    const int cw = s.width >> sub_w_, ch = s.height >> sub_h_;
+    for (int c = 1; c < 3 && cat_ != 0; ++c) {
       Pel* plane = samples<Pel>(pic->plane[c]);
       const int stride = pic->stride[c] / static_cast<int>(sizeof(Pel));
       for (int yc = 0; yc < ch; yc += (dir == 0 ? 4 : 8)) {
         for (int xc = 0; xc < cw; xc += (dir == 0 ? 8 : 4)) {
           if (dir == 0 ? xc == 0 : yc == 0) continue;
-          const int xl = xc * 2, yl = yc * 2;   // luma position of the segment's first sample on the edge
+          const int xl = xc << sub_w_, yl = yc << sub_h_;   // luma position of the segment's first sample on the edge
           const int x4 = xl >> 2, y4 = yl >> 2;
           const uint8_t e = edge_[static_cast<uint64_t>(y4) * w4 + x4];
           const bool tu = dir == 0 ? (e & 1) : (e & 4), pu = dir == 0 ? (e & 2) : (e & 8);
@@ -253,13 +254,13 @@ void Core::sao_px() {
       if (si < 0) continue;
       const SliceInfo& info = slices_[static_cast<uint64_t>(si)];
       const SaoParams& p = sao_[rs];
-      for (int c = 0; c < 3; ++c) {
+      for (int c = 0; c < (cat_ != 0 ? 3 : 1); ++c) {
         if (!(c == 0 ? info.sao_luma : info.sao_chroma) || p.type[c] == 0) continue;
-        const int sub = c ? 2 : 1;
-        const int pw = s.width / sub, ph = s.height / sub;
-        const int ctb = s.ctb_size / sub;
-        const int x_begin = rx * ctb, y_begin = ry * ctb;
-        const int x_end = x_begin + ctb < pw ? x_begin + ctb : pw, y_end = y_begin + ctb < ph ? y_begin + ctb : ph;
+        const int sx = c ? sub_w_ : 0, sy = c ? sub_h_ : 0;
+        const int pw = s.width >> sx, ph = s.height >> sy;
+        const int ctb_w = s.ctb_size >> sx, ctb_h = s.ctb_size >> sy;
+        const int x_begin = rx * ctb_w, y_begin = ry * ctb_h;
+        const int x_end = x_begin + ctb_w < pw ? x_begin + ctb_w : pw, y_end = y_begin + ctb_h < ph ? y_begin + ctb_h : ph;
         const int bd = sizeof(Pel) == 1 ? 8 : (c ? bd_c_ : bd_y_);
         const int max_value = (1 << bd) - 1, band_shift = bd - 5;
         const Pel* src = samples<Pel>(sao_plane_[c]);
@@ -273,7 +274,7 @@ void Core::sao_px() {
         static const int kVPos[4][2] = {{0, 0}, {-1, 1}, {-1, 1}, {-1, 1}};
         for (int y = y_begin; y < y_end; ++y) {
           for (int x = x_begin; x < x_end; ++x) {
-            const int l4x = (x * sub) >> 2, l4y = (y * sub) >> 2;
+            const int l4x = (x << sx) >> 2, l4y = (y << sy) >> 2;
             if (pred_mode_[static_cast<uint64_t>(l4y) * w4_ + l4x] & 8) continue;   // pcm / lossless samples are left alone
             const int v = src[static_cast<uint64_t>(y) * stride + x];
             int idx;
@@ -285,8 +286,8 @@ void Core::sao_px() {
               for (int k = 0; k < 2 && usable; ++k) {
                 const int xn = x + kHPos[p.eo_class[c]][k], yn = y + kVPos[p.eo_class[c]][k];
                 if (xn < 0 || yn < 0 || xn >= pw || yn >= ph) { usable = false; break; }
-                const int nl4x = (xn * sub) >> 2, nl4y = (yn * sub) >> 2;
-                const int nctb = ((yn * sub) >> s.log2_ctb) * ctb_w_ + ((xn * sub) >> s.log2_ctb);
+                const int nl4x = (xn << sx) >> 2, nl4y = (yn << sy) >> 2;
+                const int nctb = ((yn << sy) >> s.log2_ctb) * ctb_w_ + ((xn << sx) >> s.log2_ctb);
                 if (nctb != rs) {
                   const int nsi = ctb_slice_[nctb];
                   if (nsi < 0) { usable = false; break; }

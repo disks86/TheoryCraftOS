@@ -15,6 +15,11 @@ LAYOUT = [
     ('PartMode', 4, 13), ('PrevIntraLuma', 1, 17), ('ChromaPred', 1, 18), ('MergeFlag', 1, 20), ('MergeIdx', 1, 21), ('InterPredIdc', 5, 22), ('RefIdx', 2, 27),
     ('MvpFlag', 1, 35), ('RqtRootCbf', 1, 36), ('SplitTransform', 3, 37), ('CbfLuma', 2, 40), ('CbfChroma', 4, 42), ('MvdGreater0', 1, 31), ('MvdGreater1', 1, 34),
     ('TransformSkip', 2, 47), ('LastX', 18, 53), ('LastY', 18, 71), ('CodedSubBlock', 4, 89), ('SigCoeff', 42, 93), ('Greater1', 24, 137), ('Greater2', 6, 161),
+    # the range extensions (appended, so the contexts of version 1 keep their numbers): the fifth cbf_cb / cbf_cr context (4:4:4 at transform depth 4), the
+    # sig_coeff_flag contexts of transform-skipped and bypassed blocks (transform_skip_context_enabled_flag), explicit_rdpcm_flag and _dir_flag,
+    # log2_res_scale_abs_plus1 and res_scale_sign_flag (cross-component prediction), cu_chroma_qp_offset_flag and _idx
+    ('CbfChroma4', 1, 46), ('SigCoeffSkip', 2, 135), ('ExplicitRdpcm', 2, 49), ('ExplicitRdpcmDir', 2, 51), ('Log2ResScale', 8, 167), ('ResScaleSign', 2, 175),
+    ('CuChromaQpOffsetFlag', 1, 177), ('CuChromaQpOffsetIdx', 1, 178),
 ]
 
 

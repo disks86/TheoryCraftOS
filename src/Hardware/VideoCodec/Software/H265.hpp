@@ -17,11 +17,15 @@
  */
 
 
-// An H.265 / HEVC decoder on the CPU: Main, Main 10 and the Still Picture profiles (4:2:0 of 8 to 10 bits) with every coding tool of those profiles - coding trees of 8x8 to 64x64 blocks, all intra
-// modes, merge and AMVP motion prediction with temporal candidates, weighted prediction, transform skip, scaling lists, sign data hiding, PCM, lossless blocks, the
-// deblocking filter and sample adaptive offset, slices, dependent slice segments, tiles and wavefront substreams. Not covered: bit depths above 10, other chroma
-// formats, the range, multilayer and screen content extensions. Pictures come out in display order, cropped to the conformance window, as I420 (8-bit streams) or P010
-// (deeper ones: each sample in the top bits of a 16-bit word).
+// An H.265 / HEVC decoder on the CPU: Main, Main 10, the Still Picture profiles and the format range extensions profiles (Monochrome, Main 12, Main 4:2:2 10 / 12,
+// Main 4:4:4 8 / 10 / 12, their Intra and 16-bit Intra profiles: 4:0:0, 4:2:0, 4:2:2 and 4:4:4 of 8 to 16 bits) with every coding tool of those profiles - coding trees
+// of 8x8 to 64x64 blocks, all intra modes, merge and AMVP motion prediction with temporal candidates, weighted prediction, transform skip, scaling lists, sign data
+// hiding, PCM, lossless blocks, the deblocking filter and sample adaptive offset, slices, dependent slice segments, tiles and wavefront substreams, and the range
+// extension tools (transform skip rotation and contexts, implicit and explicit RDPCM, transform skip blocks up to 32x32, extended precision, intra smoothing
+// disabled, high precision offsets, persistent Rice adaptation, CABAC bypass alignment, cross-component prediction, chroma QP offset lists, SAO offset scaling).
+// Not covered: separate colour planes (no profile has them), the multilayer, 3D and screen content extensions. Pictures come out in display order, cropped to the
+// conformance window, as I420 (8-bit streams) or P010 (deeper ones: each sample in the top bits of a 16-bit word); a 4:2:2 or 4:4:4 picture's chroma is averaged
+// down to 4:2:0 for that (the exact planes are what an IOffload or DXVA gets), a monochrome one's is mid-grey.
 //
 // Input is either Annex B (start codes, with VPS/SPS/PPS in the stream) or - after configure() with an hvcC record, as stored in MP4 files - length-prefixed NAL units.
 #pragma once

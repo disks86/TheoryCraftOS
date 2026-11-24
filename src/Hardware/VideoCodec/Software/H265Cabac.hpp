@@ -59,7 +59,10 @@ enum Ctx : int {
   kCtxSaoMerge = 0, kCtxSaoType = 1, kCtxSplitCu = 2, kCtxTransquantBypass = 5, kCtxSkip = 6, kCtxCuQpDelta = 9, kCtxPredMode = 11, kCtxPartMode = 12,
   kCtxPrevIntraLuma = 16, kCtxChromaPred = 17, kCtxMergeFlag = 18, kCtxMergeIdx = 19, kCtxInterPredIdc = 20, kCtxRefIdx = 25, kCtxMvpFlag = 27, kCtxRqtRootCbf = 28,
   kCtxSplitTransform = 29, kCtxCbfLuma = 32, kCtxCbfChroma = 34, kCtxMvdGreater0 = 38, kCtxMvdGreater1 = 39, kCtxTransformSkip = 40, kCtxLastX = 42, kCtxLastY = 60,
-  kCtxCodedSubBlock = 78, kCtxSigCoeff = 82, kCtxGreater1 = 124, kCtxGreater2 = 148, kContextCount = 154
+  kCtxCodedSubBlock = 78, kCtxSigCoeff = 82, kCtxGreater1 = 124, kCtxGreater2 = 148,
+  // the range extensions' (appended after those of version 1)
+  kCtxCbfChroma4 = 154, kCtxSigCoeffSkip = 155, kCtxExplicitRdpcm = 157, kCtxExplicitRdpcmDir = 159, kCtxLog2ResScale = 161, kCtxResScaleSign = 169,
+  kCtxCuChromaQpOffsetFlag = 171, kCtxCuChromaQpOffsetIdx = 172, kContextCount = 173
 };
 
 class Cabac {
@@ -100,6 +103,9 @@ class Cabac {
     }
     return 0;
   }
+  // 9.3.4.3.6: with cabac_bypass_alignment_enabled_flag the bypass bins of a sub-block's signs and remaining levels are read with ivlCurrRange 256, which makes each
+  // bin the next bit of the stream.
+  void align_bypass() { range_ = 256; }
   int bypass_bits(int n) {
     int v = 0;
     for (int i = 0; i < n; ++i) v = (v << 1) | bypass();

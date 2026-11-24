@@ -55,8 +55,20 @@ enum class DxvaProfile : uint8_t {
   Av1Vld12BitProfile2, // D3D11_DECODER_PROFILE_AV1_VLD_12BIT_PROFILE2 {17127009-a00f-4ce1-994e-bf4081f6f3f0}: 12-bit 4:2:2 (Y216) and 4:4:4 (Y416)
   Av1Vld12BitProfile2_420,   // D3D11_DECODER_PROFILE_AV1_VLD_12BIT_PROFILE2_420 {2d80bed6-9cac-4835-9e91-327bbc4f9ee8}: 12-bit 4:2:0 and monochrome (P016)
   HevcVldMain10,       // D3D11_DECODER_PROFILE_HEVC_VLD_MAIN10 {107af0e0-ef1a-4d19-aba8-67a163073d13}: 8-bit to 10-bit 4:2:0 (Main 10, Main, the Still Picture profiles) -> P010
+  // The HEVC range extension profiles (DXVA_ModeHEVC_VLD_* of dxva.h, D3D12_VIDEO_DECODE_PROFILE_HEVC_* of d3d12video.h): DXVA_PicParams_HEVC_RangeExt pictures with
+  // the range extension tools, of the chroma format and bit depths each names (a stream of a smaller format or depth too, into a surface of its own chroma format).
+  HevcVldMain12,       // 17 DXVA_ModeHEVC_VLD_Main12 {1a72925f-0c2c-4f15-96fb-b17d1473603f}: up to 12-bit 4:2:0 and 4:0:0 -> P016
+  HevcVldMain10_422,   // 18 DXVA_ModeHEVC_VLD_Main10_422 {0bac4fe5-1532-4429-a854-f84de04953db}: up to 10-bit 4:2:2 -> Y210 (8-bit: YUY2 too)
+  HevcVldMain12_422,   // 19 DXVA_ModeHEVC_VLD_Main12_422 {55bcac81-f311-4093-a7d0-1cbc0b849bee}: up to 12-bit 4:2:2 -> Y216
+  HevcVldMain444,      // 20 DXVA_ModeHEVC_VLD_Main_444 {4008018f-f537-4b36-98cf-61af8a2c1a33}: 8-bit 4:4:4 -> AYUV
+  HevcVldMain10Ext,    // 21 DXVA_ModeHEVC_VLD_Main10_Ext {9cc55490-e37c-4932-8684-4920f9f6409c}: up to 10-bit 4:2:0 and 4:0:0 with the range extension tools -> P010
+  HevcVldMain10_444,   // 22 DXVA_ModeHEVC_VLD_Main10_444 {0dabeffa-4458-4602-bc03-0795659d617c}: up to 10-bit 4:4:4 -> Y410
+  HevcVldMain12_444,   // 23 DXVA_ModeHEVC_VLD_Main12_444 {9798634d-fe9d-48e5-b4da-dbec45b3df01}: up to 12-bit 4:4:4 -> Y416
+  HevcVldMain16,       // 24 DXVA_ModeHEVC_VLD_Main16 {a4fbdbb0-a113-482b-a232-635cc0697f6d}: up to 16-bit 4:4:4 (Main 4:4:4 16 Intra) -> Y416
+  HevcVldMonochrome,   // 25 DXVA_ModeHEVC_VLD_Monochrome {0685b993-3d8c-43a0-8b28-d74c2d6899a4}: 8-bit 4:0:0 -> NV12 (neutral chroma)
+  HevcVldMonochrome10, // 26 DXVA_ModeHEVC_VLD_Monochrome10 {142a1d0f-69dd-4ec9-8591-b12ffcb91a29}: up to 10-bit 4:0:0 -> P010 (neutral chroma)
 };
-constexpr uint32_t kDxvaProfileCount = 17;
+constexpr uint32_t kDxvaProfileCount = 27;
 
 // The formats of the surfaces a decoder writes (DXGI_FORMAT_NV12, P010, P016, AYUV, Y410, Y416, YUY2, Y210, Y216). The numbers are the kernel's (DxgTypes.hpp
 // VideoDecoderDesc::surface_format): 0 and 1 are NV12 and P010 as before. The 16-bit formats hold the value in the top bits of each word (P016 / Y216 / Y416 with

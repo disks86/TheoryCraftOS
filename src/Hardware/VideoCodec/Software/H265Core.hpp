@@ -92,9 +92,24 @@ struct Sps {
   int lt_ref_pic_poc_lsb_sps[33] = {};
   bool used_by_curr_pic_lt_sps[33] = {};
   bool temporal_mvp = false, strong_intra_smoothing = false;
+  bool full_range = false;                         // VUI video_full_range_flag
   ScalingList scaling;
+  // 7.3.2.2.2 sps_range_extension() (all false when it is not there)
+  bool transform_skip_rotation = false, transform_skip_context = false, implicit_rdpcm = false, explicit_rdpcm = false, extended_precision = false;
+  bool intra_smoothing_disabled = false, high_precision_offsets = false, persistent_rice = false, cabac_bypass_alignment = false;
   // derived
   int ctb_size = 16, pic_w_ctb = 0, pic_h_ctb = 0;
+  // ChromaArrayType (separate colour planes are not taken: it is chroma_format_idc) and log2 of SubWidthC / SubHeightC (0 for 4:0:0 and 4:4:4)
+  int chroma_array_type() const { return chroma_format_idc; }
+  int sub_w_shift() const { return chroma_format_idc == 1 || chroma_format_idc == 2 ? 1 : 0; }
+  int sub_h_shift() const { return chroma_format_idc == 1 ? 1 : 0; }
+  // CoeffMinY/C .. CoeffMaxY/C are -(1 << log2) .. (1 << log2) - 1, log2TransformRange (7-27): 15, or Max(15, BitDepth + 6) with extended precision
+  int log2_transform_range(int bit_depth) const { return extended_precision && bit_depth + 6 > 15 ? bit_depth + 6 : 15; }
+  // Whether any range extension tool is on (hardware engines that decode Main / Main 10 only refuse such a sequence).
+  bool range_extension_tools() const {
+    return transform_skip_rotation || transform_skip_context || implicit_rdpcm || explicit_rdpcm || extended_precision || intra_smoothing_disabled || high_precision_offsets ||
+           persistent_rice || cabac_bypass_alignment;
+  }
 };
 
 struct Pps {
@@ -121,6 +136,17 @@ struct Pps {
   bool lists_modification_present = false;
   int log2_parallel_merge_level = 2;
   bool slice_header_extension_present = false;
+  // 7.3.2.3.2 pps_range_extension()
+  int log2_max_transform_skip = 2;                 // Log2MaxTransformSkipSize (log2_max_transform_skip_block_size_minus2 + 2)
+  bool cross_component_prediction = false;
+  bool chroma_qp_offset_list = false;              // chroma_qp_offset_list_enabled_flag
+  int diff_cu_chroma_qp_offset_depth = 0;
+  int chroma_qp_offset_list_len = 0;               // chroma_qp_offset_list_len_minus1 + 1 (1 .. 6) when the list is enabled
+  int cb_qp_offset_list[6] = {}, cr_qp_offset_list[6] = {};
+  int log2_sao_offset_scale_luma = 0, log2_sao_offset_scale_chroma = 0;
+  bool range_extension_tools() const {
+    return log2_max_transform_skip != 2 || cross_component_prediction || chroma_qp_offset_list || log2_sao_offset_scale_luma != 0 || log2_sao_offset_scale_chroma != 0;
+  }
 };
 
 struct SliceHeader {
@@ -150,6 +176,7 @@ struct SliceHeader {
   int max_num_merge_cand = 5;
   int slice_qp = 26;
   int cb_qp_offset = 0, cr_qp_offset = 0;
+  bool cu_chroma_qp_offset_enabled = false;
   bool deblocking_disabled = false;
   int beta_offset_div2 = 0, tc_offset_div2 = 0;
   bool loop_filter_across_slices = false;
@@ -187,6 +214,11 @@ struct Picture {
   // Core's own sample paths (samples<uint16_t>()) and an offload both fill such pictures; depth_luma / depth_chroma are the bits a sample has.
   bool deep = false;
   int depth_luma = 8, depth_chroma = 8;
+  // chroma_format_idc: 1 (4:2:0) has chroma planes of half the width and height, 2 (4:2:2) of half the width, 3 (4:4:4) of the full size. 0 (4:0:0, monochrome) has no
+  // chroma: its chroma planes are 4:2:0-sized and mid-grey (1 << (depth_chroma - 1)), never decoded into, so that a monochrome picture reads as a grey 4:2:0 one.
+  int chroma_format = 1;
+  int chroma_width() const { return chroma_format == 3 ? width : (width + 1) / 2; }
+  int chroma_height() const { return chroma_format >= 2 ? height : (height + 1) / 2; }
   Mem<ColBlock> col;
   int poc = 0;
   bool in_use = false, is_ref = false, is_long = false, needed_for_output = false, generated = false;
@@ -254,7 +286,7 @@ struct OffloadPicture {
   uint8_t list[2][kMaxRefs - 1] = {};                 // the first slice's final reference picture lists, as indexes into refs (0xFF: no entry)
   ArrayView<const ConstByteView> slices;              // the NAL units of the picture, header bytes included
   ArrayView<const OffloadSlice> slice_info;           // one per entry of `slices`
-  ByteView plane[3];                                  // I420, the coded size
+  ByteView plane[3];                                  // the coded size, the planes of the picture's chroma format (Picture::chroma_format: 4:0:0 has grey 4:2:0 ones)
   int stride[3] = {0, 0, 0};
 };
 class IOffload {
@@ -302,6 +334,8 @@ class Core {
     int st_before_count = 0, st_after_count = 0, lt_count = 0;
     int st_rps_bits = 0;   // wNumBitsForShortTermRPSInSlice
   };
+  // The range extension limits that need both parameter sets (cross-component prediction with 4:4:4 only, the chroma QP offset depth, the SAO offset scales).
+  [[nodiscard]] static bool rext_ok(const Sps& sps, const Pps& pps);
   // Makes `sps` and `pps` the active parameter sets (the picture's size is the SPS's). Call first, for every picture.
   void external_prepare(const Sps& sps, const Pps& pps);
   // A mid-grey picture of the active size with no motion: what stands in for a reference that is not there (8.3.3).
@@ -346,7 +380,14 @@ class Core {
   void prediction_unit(int x0, int y0, int w, int h, int part_idx, int log2_cb, int x_cb, int y_cb);
   void transform_tree(int x0, int y0, int x_base, int y_base, int log2_size, int depth, int blk_idx, bool cbf_cb_parent[2], bool cbf_cr_parent[2], int inter_split_flag);
   void transform_unit(int x0, int y0, int x_base, int y_base, int log2_size, int depth, int blk_idx, bool cbf_luma, bool cbf_cb[2], bool cbf_cr[2]);
-  void residual_coding(int x0, int y0, int log2_size, int c_idx);
+  // residual_coding(): the coefficient levels into coeff_ (and transform_skip_flag, explicit_rdpcm_flag / _dir_flag into ts_flag_ / rdpcm_); `intra_mode` is
+  // predModeIntra of the block (the chroma one for chroma: after the 4:2:2 mapping), -1 for an inter block.
+  void residual_coding(int x0, int y0, int log2_size, int c_idx, int intra_mode);
+  [[nodiscard]] int64_t coeff_abs_level_remaining(int rice, int log2_range);
+  void chroma_qp_offset();                 // 7.3.8.13
+  int cross_comp_pred(int c);              // 7.3.8.12: ResScaleVal of chroma component c (0: Cb, 1: Cr)
+  // IntraPredModeC from intra_chroma_pred_mode and the luma mode (8.4.3, Table 8-2; Table 8-3 for 4:2:2)
+  int chroma_mode_from(int syntax, int luma_mode) const;
   void read_sao(int rx, int ry);
   void read_pcm(int x0, int y0, int log2_size);
   void update_qp(int x_cb, int y_cb);
@@ -366,10 +407,13 @@ class Core {
   // uint16_t for deeper ones (Picture::deep; the bit depths bd_y_ / bd_c_ of the active SPS). The untemplated names pick one by the current picture.
   void predict_intra(int x0, int y0, int log2_size, int c_idx, int mode);
   void predict_inter(int x0, int y0, int w, int h, const MvField& m);
-  void reconstruct_block(int x0, int y0, int log2_size, int c_idx);
+  // Adds the residual of the block to its prediction: from coeff_ when `coded` (residual_coding() was called), plus, for 4:4:4 chroma with cross-component prediction,
+  // ResScaleVal `res_scale` times the luma residual kept in res_y_ (8.6.6). A luma block's residual is kept there when cross-component prediction is on.
+  void reconstruct_block(int x0, int y0, int log2_size, int c_idx, int intra_mode, bool coded, int res_scale);
   template <typename Pel> void predict_intra_px(int x0, int y0, int log2_size, int c_idx, int mode);
   template <typename Pel> void predict_inter_px(int x0, int y0, int w, int h, const MvField& m);
-  template <typename Pel> void reconstruct_px(int x0, int y0, int log2_size, int c_idx);
+  template <typename Pel> void reconstruct_px(int x0, int y0, int log2_size, int c_idx, int intra_mode, bool coded, int res_scale);
+  void residual_px(int log2_size, int c_idx, int intra_mode, int32_t* r);   // 8.6.2 - 8.6.4 (and 8.6.8, the RDPCM accumulation): the residual of coeff_ into r
   template <typename Pel> void read_pcm_px(int x0, int y0, int log2_size);
   // Fills the planes of `p` with mid-grey (1 << (BitDepth - 1)), in its sample size.
   static void fill_grey(Picture* p);
@@ -409,6 +453,7 @@ class Core {
   const Pps* pp_ = nullptr;
   bool picture_open_ = false;
   int bd_y_ = 8, bd_c_ = 8;              // BitDepthY / BitDepthC of the active SPS
+  int cat_ = 1, sub_w_ = 1, sub_h_ = 1;  // ChromaArrayType and log2 of SubWidthC / SubHeightC of the active SPS
   int qp_bd_y_ = 0, qp_bd_c_ = 0;        // QpBdOffsetY / QpBdOffsetC (6 * (BitDepth - 8))
   int w4_ = 0, h4_ = 0;                  // the picture in 4x4 blocks
   int ctb_w_ = 0, ctb_h_ = 0;
@@ -444,6 +489,14 @@ class Core {
   Cabac cabac_;
   uint8_t wpp_saved_[kContextCount] = {};
   bool wpp_saved_valid_ = false;
+  // StatCoeff (9.3.2.?: persistent_rice_adaptation_enabled_flag), stored and synchronised with the context variables
+  int stat_coeff_[4] = {}, wpp_stat_[4] = {}, end_stat_[4] = {};
+  // chroma QP offsets of the coding units (7.3.8.13): IsCuChromaQpOffsetCoded, CuQpOffsetCb / Cr
+  bool chroma_qp_offset_coded_ = false;
+  int cu_qp_offset_cb_ = 0, cu_qp_offset_cr_ = 0;
+  // of the block residual_coding() read last: explicit_rdpcm_flag (0 none, 1 horizontal, 2 vertical)
+  int rdpcm_ = 0;
+  bool chroma_dm_[4] = {};               // intra_chroma_pred_mode of each part is 4 (the luma mode): what cross-component prediction of intra blocks needs
   SliceInfo* slice_ = nullptr;
   int slice_addr_rs_ = 0;
   int ctb_addr_ts_ = 0, ctb_addr_rs_ = 0;
@@ -468,13 +521,16 @@ class Core {
   bool no_backward_pred_ = false;
   int32_t coeff_[32 * 32];
   int32_t resid_[32 * 32];
-  int16_t pred_buf_[2][64 * 64];
+  int32_t res_y_[32 * 32];               // the luma residual of the transform unit (cross-component prediction)
+  int32_t pred_buf_[2][64 * 64];         // 14-bit intermediate predictions (BitDepth + 2 bits above 12 bits a sample)
+  int32_t interp_tmp_[(64 + 7) * 64];    // the first stage of a two-dimensional interpolation
 
   Mem<uint8_t> rbsp_;
   // the decoded picture hash (D.3.19) announced for the picture being decoded
   struct PendingHash {
     bool present = false;
     int type = 0;              // 0 MD5, 1 CRC, 2 checksum
+    int components = 3;        // (1 for 4:0:0)
     uint8_t md5[3][16] = {};
     uint32_t value[3] = {};    // CRC or checksum
   } pending_hash_;

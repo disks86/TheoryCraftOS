@@ -80,9 +80,10 @@ bool AmdVcnHevcDecoder::allocate_buffers() {
   return true;
 }
 
-bool AmdVcnHevcDecoder::accepts(const h265::Sps& sps, const h265::Pps&) {
+bool AmdVcnHevcDecoder::accepts(const h265::Sps& sps, const h265::Pps& pps) {
   if (!leased_ || engine_.ring->wedged()) return open_;   // a wedged engine still owns the stream it was decoding; a stream that never started can go to the CPU
   if (sps.chroma_format_idc != 1 || sps.bit_depth_luma != 8 || sps.bit_depth_chroma != 8 || sps.width <= 0 || sps.height <= 0) return false;
+  if (sps.range_extension_tools() || pps.range_extension_tools()) return false;   // (Main profile engine: the range extension tools go to the CPU)
   const uint32_t width = static_cast<uint32_t>(sps.width), height = static_cast<uint32_t>(sps.height);
   if (open_ && width == width_ && height == height_) return true;
   const int dpb = sps.max_dec_pic_buffering[sps.max_sub_layers - 1];

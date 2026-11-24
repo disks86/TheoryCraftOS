@@ -36,6 +36,18 @@ typedef struct VideoProfile { const GUID *guid; UINT kernel; DXGI_FORMAT formats
 /* (MPEG-4 Part 2 Advanced Simple with GMC: d3d12video.h names no such profile, but it is DXVA's - D3D11_DECODER_PROFILE_MPEG4PT2_VLD_ADVSIMPLE_GMC,
  * DXVA_ModeMPEG4pt2_VLD_AdvSimple_GMC - and Direct3D 11's decoders of it are made on this one) */
 static const GUID g_video_profile_mpeg4pt2_advsimple_gmc = {0xab998b5b, 0x4258, 0x44a9, {0x9f, 0xeb, 0x94, 0xe5, 0x97, 0xa6, 0xba, 0xae}};
+/* The HEVC range extension profiles: d3d12video.h of DirectX-Headers names them D3D12_VIDEO_DECODE_PROFILE_HEVC_MAIN12 .. _HEVC_MAIN16_444 and _HEVC_MONOCHROME /
+ * _MONOCHROME10 (the GUIDs of DXVA_ModeHEVC_VLD_Main12 .. _Main16, _Monochrome, _Monochrome10 of dxva.h), which mingw-w64's d3d12video.h does not have yet. */
+static const GUID g_video_profile_hevc_main12 = {0x1a72925f, 0x0c2c, 0x4f15, {0x96, 0xfb, 0xb1, 0x7d, 0x14, 0x73, 0x60, 0x3f}};
+static const GUID g_video_profile_hevc_main10_422 = {0x0bac4fe5, 0x1532, 0x4429, {0xa8, 0x54, 0xf8, 0x4d, 0xe0, 0x49, 0x53, 0xdb}};
+static const GUID g_video_profile_hevc_main12_422 = {0x55bcac81, 0xf311, 0x4093, {0xa7, 0xd0, 0x1c, 0xbc, 0x0b, 0x84, 0x9b, 0xee}};
+static const GUID g_video_profile_hevc_main_444 = {0x4008018f, 0xf537, 0x4b36, {0x98, 0xcf, 0x61, 0xaf, 0x8a, 0x2c, 0x1a, 0x33}};
+static const GUID g_video_profile_hevc_main10_ext = {0x9cc55490, 0xe37c, 0x4932, {0x86, 0x84, 0x49, 0x20, 0xf9, 0xf6, 0x40, 0x9c}};
+static const GUID g_video_profile_hevc_main10_444 = {0x0dabeffa, 0x4458, 0x4602, {0xbc, 0x03, 0x07, 0x95, 0x65, 0x9d, 0x61, 0x7c}};
+static const GUID g_video_profile_hevc_main12_444 = {0x9798634d, 0xfe9d, 0x48e5, {0xb4, 0xda, 0xdb, 0xec, 0x45, 0xb3, 0xdf, 0x01}};
+static const GUID g_video_profile_hevc_main16_444 = {0xa4fbdbb0, 0xa113, 0x482b, {0xa2, 0x32, 0x63, 0x5c, 0xc0, 0x69, 0x7f, 0x6d}};
+static const GUID g_video_profile_hevc_monochrome = {0x0685b993, 0x3d8c, 0x43a0, {0x8b, 0x28, 0xd7, 0x4c, 0x2d, 0x68, 0x99, 0xa4}};
+static const GUID g_video_profile_hevc_monochrome10 = {0x142a1d0f, 0x69dd, 0x4ec9, {0x85, 0x91, 0xb1, 0x2f, 0xfc, 0xb9, 0x1a, 0x29}};
 /* (`kernel` is hardware::DxvaProfile) */
 static const VideoProfile g_video_profiles[] = {
     {&D3D12_VIDEO_DECODE_PROFILE_H264, 0, {DXGI_FORMAT_NV12}, 1},
@@ -57,6 +69,17 @@ static const VideoProfile g_video_profiles[] = {
     {&D3D12_VIDEO_DECODE_PROFILE_AV1_12BIT_PROFILE2, 14, {DXGI_FORMAT_Y216, DXGI_FORMAT_Y416}, 2},
     {&D3D12_VIDEO_DECODE_PROFILE_AV1_12BIT_PROFILE2_420, 15, {DXGI_FORMAT_P016}, 1},
     {&D3D12_VIDEO_DECODE_PROFILE_HEVC_MAIN10, 16, {DXGI_FORMAT_P010}, 1},
+    /* (HEVC range extensions: each profile's pictures, of its chroma format and up to its bit depth, in the formats Windows' decoders write them in) */
+    {&g_video_profile_hevc_main12, 17, {DXGI_FORMAT_P016}, 1},
+    {&g_video_profile_hevc_main10_422, 18, {DXGI_FORMAT_Y210, DXGI_FORMAT_YUY2}, 2},
+    {&g_video_profile_hevc_main12_422, 19, {DXGI_FORMAT_Y216}, 1},
+    {&g_video_profile_hevc_main_444, 20, {DXGI_FORMAT_AYUV}, 1},
+    {&g_video_profile_hevc_main10_ext, 21, {DXGI_FORMAT_P010}, 1},
+    {&g_video_profile_hevc_main10_444, 22, {DXGI_FORMAT_Y410}, 1},
+    {&g_video_profile_hevc_main12_444, 23, {DXGI_FORMAT_Y416}, 1},
+    {&g_video_profile_hevc_main16_444, 24, {DXGI_FORMAT_Y416}, 1},
+    {&g_video_profile_hevc_monochrome, 25, {DXGI_FORMAT_NV12}, 1},
+    {&g_video_profile_hevc_monochrome10, 26, {DXGI_FORMAT_P010}, 1},
 };
 /* The kernel's surface format of a decoder's output (hardware::DxvaSurfaceFormat; DxgTypes.hpp VideoDecoderDesc::surface_format). */
 static UINT video_surface_format(DXGI_FORMAT f) {

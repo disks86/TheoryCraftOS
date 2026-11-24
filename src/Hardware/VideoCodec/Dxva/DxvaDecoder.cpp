@@ -35,6 +35,18 @@ bool dxva_profile_supports(DxvaProfile profile, DxvaSurfaceFormat surface, uint3
     case DxvaProfile::Av1VldProfile2: return surface == S::Yuy2 || surface == S::Y210 || surface == S::Nv12 || surface == S::P010;
     case DxvaProfile::Av1Vld12BitProfile2: return surface == S::Y216 || surface == S::Y416;
     case DxvaProfile::Av1Vld12BitProfile2_420: return surface == S::P016;
+    case DxvaProfile::HevcVldMain:
+    case DxvaProfile::HevcVldMain10:
+    case DxvaProfile::HevcVldMain12:
+    case DxvaProfile::HevcVldMain10_422:
+    case DxvaProfile::HevcVldMain12_422:
+    case DxvaProfile::HevcVldMain444:
+    case DxvaProfile::HevcVldMain10Ext:
+    case DxvaProfile::HevcVldMain10_444:
+    case DxvaProfile::HevcVldMain12_444:
+    case DxvaProfile::HevcVldMain16:
+    case DxvaProfile::HevcVldMonochrome:
+    case DxvaProfile::HevcVldMonochrome10: return dxva_hevc_supports(profile, surface);
     default: break;
   }
   switch (profile) {
@@ -42,14 +54,12 @@ bool dxva_profile_supports(DxvaProfile profile, DxvaSurfaceFormat surface, uint3
     case DxvaProfile::Mpeg2Vld:
     case DxvaProfile::Mpeg2and1Vld:
     case DxvaProfile::Vp9VldProfile0:
-    case DxvaProfile::HevcVldMain:
     case DxvaProfile::Vc1Vld:
     case DxvaProfile::Vc1D2010:
     case DxvaProfile::Mpeg4Pt2Simple:
     case DxvaProfile::Mpeg4Pt2AdvSimpleNoGmc:
     case DxvaProfile::Mpeg4Pt2AdvSimpleGmc: return output == PixelFormat::Nv12;
-    case DxvaProfile::Vp9Vld10BitProfile2:
-    case DxvaProfile::HevcVldMain10: return output == PixelFormat::P010;
+    case DxvaProfile::Vp9Vld10BitProfile2: return output == PixelFormat::P010;
     case DxvaProfile::Av1VldProfile0: return output == PixelFormat::Nv12 || output == PixelFormat::P010;
     default: return false;
   }
@@ -71,7 +81,17 @@ UniquePointer<IDxvaDecoder> create_dxva_decoder(allocators::IAllocator& allocato
     case DxvaProfile::Vp9VldProfile0:
     case DxvaProfile::Vp9Vld10BitProfile2: return create_dxva_vp9(allocator, config);
     case DxvaProfile::HevcVldMain:
-    case DxvaProfile::HevcVldMain10: return create_dxva_hevc(allocator, config);
+    case DxvaProfile::HevcVldMain10:
+    case DxvaProfile::HevcVldMain12:
+    case DxvaProfile::HevcVldMain10_422:
+    case DxvaProfile::HevcVldMain12_422:
+    case DxvaProfile::HevcVldMain444:
+    case DxvaProfile::HevcVldMain10Ext:
+    case DxvaProfile::HevcVldMain10_444:
+    case DxvaProfile::HevcVldMain12_444:
+    case DxvaProfile::HevcVldMain16:
+    case DxvaProfile::HevcVldMonochrome:
+    case DxvaProfile::HevcVldMonochrome10: return create_dxva_hevc(allocator, config);
     case DxvaProfile::Av1VldProfile0:
     case DxvaProfile::Av1VldProfile1:
     case DxvaProfile::Av1VldProfile2:

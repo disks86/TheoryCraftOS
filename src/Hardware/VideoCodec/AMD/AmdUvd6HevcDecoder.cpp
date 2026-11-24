@@ -108,10 +108,10 @@ amd_vcn::TargetLayout AmdUvd6HevcDecoder::target_for(uint32_t width, uint32_t he
   return amd_vcn::target_layout(deep ? width * 2 : width, height);
 }
 
-bool AmdUvd6HevcDecoder::accepts(const h265::Sps& sps, const h265::Pps&) {
+bool AmdUvd6HevcDecoder::accepts(const h265::Sps& sps, const h265::Pps& pps) {
   if (!leased_ || engine_.ring->wedged()) return open_;   // a wedged engine still owns the stream it was decoding; a stream that never started can go to the CPU
   bool deep = false;
-  if (!sequence_ok(sps, &deep)) return false;
+  if (!sequence_ok(sps, &deep) || sps.range_extension_tools() || pps.range_extension_tools()) return false;   // (Main / Main 10 engine: the range extension tools go to the CPU)
   const uint32_t width = static_cast<uint32_t>(sps.width), height = static_cast<uint32_t>(sps.height);
   if (open_ && width == width_ && height == height_ && deep == deep_) return true;
   const int dpb = sps.max_dec_pic_buffering[sps.max_sub_layers - 1];

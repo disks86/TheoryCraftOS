@@ -28,7 +28,8 @@
  * current-picture index (CurrPic, wDecodedPictureIndex, CurrPicTextureIndex) it was went into, so the pictures of a stream may be in the slices of one array texture
  * (index n slice n, as ffmpeg's d3d11va gives them; an array's slices start out as those indices) or in textures of their own (one index each, as the program numbers
  * them). The status of each picture (DecoderExtension, DXVA_STATUS_REPORTING_FUNCTION) comes from Direct3D 12's decode statistics.
- * Profiles: what Direct3D 12 below decodes (H.264, MPEG-2, MPEG-1/2, VP9 profile 0 and 10-bit profile 2, HEVC Main and Main 10, AV1 profile 0); all are VLD (bitstream) decoders, so
+ * Profiles: what Direct3D 12 below decodes (H.264, MPEG-2, MPEG-1/2, VP9 profile 0 and 10-bit profile 2, HEVC Main and Main 10 and the range extension profiles
+ * (DXVA_ModeHEVC_VLD_Main12 .. _Main16, _Monochrome, _Monochrome10), AV1 profile 0); all are VLD (bitstream) decoders, so
  * the buffers of the older acceleration modes (macroblock control, residual difference, deblocking, motion vectors, film grain) are not taken.
  *
  * Video processing. VideoProcessorBlt is one ProcessFrames on a VIDEO_PROCESS queue, ordered with the immediate context's work the same way. A processor keeps the
@@ -116,6 +117,15 @@ static const VideoCodec g_video_codecs[] = {
      offsetof(DXVA_PicParams_AV1, StatusReportFeedbackNumber), offsetof(DXVA_PicParams_AV1, CurrPicTextureIndex)},
     {&D3D11_DECODER_PROFILE_HEVC_VLD_MAIN10, 1, sizeof(DXVA_Slice_HEVC_Short), offsetof(DXVA_Slice_HEVC_Short, BSNALunitDataLocation), VSTATUS_HEVC, sizeof(DXVA_PicParams_HEVC),
      offsetof(DXVA_PicParams_HEVC, StatusReportFeedbackNumber), offsetof(DXVA_PicParams_HEVC, CurrPic)},
+    /* (the HEVC range extension profiles: DXVA_PicParams_HEVC_RangeExt, whose first part is DXVA_PicParams_HEVC; Direct3D 12's profiles of the same GUIDs) */
+#define VIDEO_HEVC_REXT(guid)                                                                                                                                     \
+  {&guid, 1, sizeof(DXVA_Slice_HEVC_Short), offsetof(DXVA_Slice_HEVC_Short, BSNALunitDataLocation), VSTATUS_HEVC, sizeof(DXVA_PicParams_HEVC_RangeExt),          \
+   offsetof(DXVA_PicParams_HEVC, StatusReportFeedbackNumber), offsetof(DXVA_PicParams_HEVC, CurrPic)}
+    VIDEO_HEVC_REXT(DXVA_ModeHEVC_VLD_Main12), VIDEO_HEVC_REXT(DXVA_ModeHEVC_VLD_Main10_422), VIDEO_HEVC_REXT(DXVA_ModeHEVC_VLD_Main12_422),
+    VIDEO_HEVC_REXT(DXVA_ModeHEVC_VLD_Main_444), VIDEO_HEVC_REXT(DXVA_ModeHEVC_VLD_Main10_Ext), VIDEO_HEVC_REXT(DXVA_ModeHEVC_VLD_Main10_444),
+    VIDEO_HEVC_REXT(DXVA_ModeHEVC_VLD_Main12_444), VIDEO_HEVC_REXT(DXVA_ModeHEVC_VLD_Main16), VIDEO_HEVC_REXT(DXVA_ModeHEVC_VLD_Monochrome),
+    VIDEO_HEVC_REXT(DXVA_ModeHEVC_VLD_Monochrome10),
+#undef VIDEO_HEVC_REXT
 };
 #define VIDEO_CODECS (sizeof g_video_codecs / sizeof g_video_codecs[0])
 

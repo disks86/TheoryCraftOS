@@ -241,6 +241,79 @@ bool skip_profile_tier_level(BitReader& br, int max_sub_layers_minus1) {
   }
   return !br.error();
 }
+
+// E.2.3: sub_layer_hrd_parameters(), read past
+void skip_sub_layer_hrd(BitReader& br, uint32_t cpb_count, bool sub_pic) {
+  for (uint32_t i = 0; i < cpb_count && !br.error(); ++i) {
+    br.ue();
+    br.ue();
+    if (sub_pic) {
+      br.ue();
+      br.ue();
+    }
+    br.u(1);
+  }
+}
+
+// E.2.2: hrd_parameters(commonInfPresentFlag 1, maxNumSubLayersMinus1), read past
+bool skip_hrd_parameters(BitReader& br, int max_sub_layers_minus1) {
+  const bool nal = br.u(1) != 0, vcl = br.u(1) != 0;
+  bool sub_pic = false;
+  if (nal || vcl) {
+    sub_pic = br.u(1) != 0;
+    if (sub_pic) br.u(8 + 5 + 1 + 5);   // tick_divisor_minus2, du_cpb_removal_delay_increment_length_minus1, sub_pic_cpb_params_in_pic_timing_sei_flag, dpb_output_delay_du_length_minus1
+    br.u(4 + 4);                        // bit_rate_scale, cpb_size_scale
+    if (sub_pic) br.u(4);               // cpb_size_du_scale
+    br.u(5 + 5 + 5);                    // the three delay lengths
+  }
+  for (int i = 0; i <= max_sub_layers_minus1 && !br.error(); ++i) {
+    const bool fixed_general = br.u(1) != 0;
+    bool fixed_within_cvs = true;
+    if (!fixed_general) fixed_within_cvs = br.u(1) != 0;
+    bool low_delay = false;
+    if (fixed_within_cvs) br.ue();      // elemental_duration_in_tc_minus1
+    else low_delay = br.u(1) != 0;
+    uint32_t cpb_count = 1;
+    if (!low_delay) {
+      cpb_count = br.ue() + 1;
+      if (cpb_count > 32) return H265_FALSE;
+    }
+    if (nal) skip_sub_layer_hrd(br, cpb_count, sub_pic);
+    if (vcl) skip_sub_layer_hrd(br, cpb_count, sub_pic);
+  }
+  return !br.error();
+}
+
+// E.2.1: vui_parameters(); the decoder keeps video_full_range_flag, and reads the rest to get to the SPS extensions after it.
+bool parse_vui(BitReader& br, int max_sub_layers_minus1, Sps* s) {
+  if (br.u(1)) {                       // aspect_ratio_info_present_flag
+    if (br.u(8) == 255) br.u(32);      // EXTENDED_SAR: sar_width, sar_height
+  }
+  if (br.u(1)) br.u(1);                // overscan_info_present_flag, overscan_appropriate_flag
+  if (br.u(1)) {                       // video_signal_type_present_flag
+    br.u(3);                           // video_format
+    s->full_range = br.u(1) != 0;
+    if (br.u(1)) br.u(24);             // colour_primaries, transfer_characteristics, matrix_coeffs
+  }
+  if (br.u(1)) {                       // chroma_loc_info_present_flag
+    br.ue();
+    br.ue();
+  }
+  br.u(3);                             // neutral_chroma_indication_flag, field_seq_flag, frame_field_info_present_flag
+  if (br.u(1))                         // default_display_window_flag
+    for (int i = 0; i < 4; ++i) br.ue();
+  if (br.u(1)) {                       // vui_timing_info_present_flag
+    br.u(32);
+    br.u(32);
+    if (br.u(1)) br.ue();              // vui_poc_proportional_to_timing_flag, vui_num_ticks_poc_diff_one_minus1
+    if (br.u(1) && !skip_hrd_parameters(br, max_sub_layers_minus1)) return H265_FALSE;
+  }
+  if (br.u(1)) {                       // bitstream_restriction_flag
+    br.u(3);
+    for (int i = 0; i < 5; ++i) br.ue();
+  }
+  return !br.error();
+}
 }  // namespace
 
 // 7.3.2.2
@@ -255,26 +328,31 @@ bool Core::parse_sps(BitReader& br) {
   const uint32_t id = br.ue();
   if (id > 15) return H265_FALSE;
   s.id = static_cast<int>(id);
-  s.chroma_format_idc = static_cast<int>(br.ue());
-  if (s.chroma_format_idc != 1) return H265_FALSE;   // 4:2:0 only
+  const uint32_t chroma_format = br.ue();
+  if (chroma_format > 3) return H265_FALSE;
+  s.chroma_format_idc = static_cast<int>(chroma_format);
+  // separate_colour_plane_flag: the three colour planes coded as three monochrome pictures (colour_plane_id). No profile of the standard allows it (A.3: the
+  // profiles' SPSs have it 0), and no other decoder takes it (FFmpeg, libde265 and the HM refuse it as well): it is refused.
+  if (s.chroma_format_idc == 3 && br.u(1)) return H265_FALSE;
   const uint32_t w = br.ue(), h = br.ue();
   if (w == 0 || h == 0 || w > 8192 || h > 8192) return H265_FALSE;
   s.width = static_cast<int>(w);
   s.height = static_cast<int>(h);
-  if (br.u(1)) {   // conformance window, in units of chroma samples (2 luma samples)
+  if (br.u(1)) {   // conformance window, in units of chroma samples (SubWidthC x SubHeightC luma samples; one for 4:0:0 and 4:4:4)
     const uint32_t l = br.ue(), r = br.ue(), t = br.ue(), b = br.ue();
-    if (l > 4096 || r > 4096 || t > 4096 || b > 4096) return H265_FALSE;
-    s.crop_l = static_cast<int>(l) * 2;
-    s.crop_r = static_cast<int>(r) * 2;
-    s.crop_t = static_cast<int>(t) * 2;
-    s.crop_b = static_cast<int>(b) * 2;
+    if (l > 8192 || r > 8192 || t > 8192 || b > 8192) return H265_FALSE;
+    const int unit_x = 1 << s.sub_w_shift(), unit_y = 1 << s.sub_h_shift();
+    s.crop_l = static_cast<int>(l) * unit_x;
+    s.crop_r = static_cast<int>(r) * unit_x;
+    s.crop_t = static_cast<int>(t) * unit_y;
+    s.crop_b = static_cast<int>(b) * unit_y;
     if (s.crop_l + s.crop_r >= s.width || s.crop_t + s.crop_b >= s.height) return H265_FALSE;
   }
-  s.bit_depth_luma = static_cast<int>(br.ue()) + 8;
-  s.bit_depth_chroma = static_cast<int>(br.ue()) + 8;
-  // Up to ten bits (Main 10, Main 10 Still Picture), each component on its own. The sample paths take any depth up to 12 bits, but deeper streams are range extension
-  // profiles (Main 12 and up), whose SPS / PPS range extension (extended precision, persistent Rice adaptation, ...) is not read here: they are refused.
-  if (s.bit_depth_luma > 10 || s.bit_depth_chroma > 10) return H265_FALSE;
+  // 8 to 16 bits a sample, each component on its own (bit_depth_luma_minus8 0..8, 7.4.3.2.1).
+  const uint32_t depth_luma = br.ue(), depth_chroma = br.ue();
+  if (depth_luma > 8 || depth_chroma > 8) return H265_FALSE;
+  s.bit_depth_luma = static_cast<int>(depth_luma) + 8;
+  s.bit_depth_chroma = static_cast<int>(depth_chroma) + 8;
   const uint32_t poc_bits = br.ue() + 4;
   if (poc_bits > 16) return H265_FALSE;
   s.log2_max_poc_lsb = static_cast<int>(poc_bits);
@@ -333,7 +411,27 @@ bool Core::parse_sps(BitReader& br) {
   }
   s.temporal_mvp = br.u(1) != 0;
   s.strong_intra_smoothing = br.u(1) != 0;
-  // The video usability information and the extensions that follow are not needed for Main profile decoding.
+  if (br.u(1) && !parse_vui(br, s.max_sub_layers - 1, &s)) return H265_FALSE;
+  if (br.u(1)) {   // sps_extension_present_flag
+    const bool range = br.u(1) != 0, multilayer = br.u(1) != 0;
+    br.u(1);       // sps_3d_extension_flag: the depth tools of 3D-HEVC layers, which a base layer does not use
+    const bool scc = br.u(1) != 0;
+    br.u(4);       // sps_extension_4bits (then sps_extension_data_flag, ignored)
+    if (range) {   // 7.3.2.2.2
+      s.transform_skip_rotation = br.u(1) != 0;
+      s.transform_skip_context = br.u(1) != 0;
+      s.implicit_rdpcm = br.u(1) != 0;
+      s.explicit_rdpcm = br.u(1) != 0;
+      s.extended_precision = br.u(1) != 0;
+      s.intra_smoothing_disabled = br.u(1) != 0;
+      s.high_precision_offsets = br.u(1) != 0;
+      s.persistent_rice = br.u(1) != 0;
+      s.cabac_bypass_alignment = br.u(1) != 0;
+    }
+    if (multilayer) br.u(1);   // inter_view_mv_vert_constraint_flag (other layers only)
+    // The screen content coding extension (palettes, intra block copy, adaptive colour transform) changes the decoding of the base layer: not supported.
+    if (scc) return H265_FALSE;
+  }
   if (br.error()) return H265_FALSE;
   s.ctb_size = 1 << s.log2_ctb;
   s.pic_w_ctb = (s.width + s.ctb_size - 1) >> s.log2_ctb;
@@ -405,7 +503,38 @@ bool Core::parse_pps(BitReader& br) {
   p.log2_parallel_merge_level = static_cast<int>(br.ue()) + 2;
   if (p.log2_parallel_merge_level > 6) return H265_FALSE;
   p.slice_header_extension_present = br.u(1) != 0;
-  // The extensions (range, multilayer, 3D, screen content) are not supported: a stream that uses them is refused when it is decoded.
+  if (br.u(1)) {   // pps_extension_present_flag
+    const bool range = br.u(1) != 0;
+    br.u(1);       // pps_multilayer_extension_flag and pps_3d_extension_flag: what layers other than the base layer use (read after the range extension, so not needed)
+    br.u(1);
+    const bool scc = br.u(1) != 0;
+    br.u(4);
+    if (range) {   // 7.3.2.3.2; the limits that depend on the SPS (bit depths, ChromaArrayType, the coding block sizes) are checked when a picture starts (rext_ok)
+      if (p.transform_skip) {
+        const uint32_t ts = br.ue();
+        if (ts > 3) return H265_FALSE;
+        p.log2_max_transform_skip = static_cast<int>(ts) + 2;
+      }
+      p.cross_component_prediction = br.u(1) != 0;
+      p.chroma_qp_offset_list = br.u(1) != 0;
+      if (p.chroma_qp_offset_list) {
+        const uint32_t depth = br.ue(), len = br.ue() + 1;
+        if (depth > 3 || len > 6) return H265_FALSE;
+        p.diff_cu_chroma_qp_offset_depth = static_cast<int>(depth);
+        p.chroma_qp_offset_list_len = static_cast<int>(len);
+        for (int i = 0; i < p.chroma_qp_offset_list_len; ++i) {
+          p.cb_qp_offset_list[i] = br.se();
+          p.cr_qp_offset_list[i] = br.se();
+          if (p.cb_qp_offset_list[i] < -12 || p.cb_qp_offset_list[i] > 12 || p.cr_qp_offset_list[i] < -12 || p.cr_qp_offset_list[i] > 12) return H265_FALSE;
+        }
+      }
+      const uint32_t sao_luma = br.ue(), sao_chroma = br.ue();
+      if (sao_luma > 6 || sao_chroma > 6) return H265_FALSE;
+      p.log2_sao_offset_scale_luma = static_cast<int>(sao_luma);
+      p.log2_sao_offset_scale_chroma = static_cast<int>(sao_chroma);
+    }
+    if (scc) return H265_FALSE;   // (the screen content coding extension: not supported)
+  }
   if (br.error()) return H265_FALSE;
   p.valid = true;
   pps_[p.id] = p;
@@ -509,7 +638,7 @@ bool Core::parse_slice_header(BitReader& br, int nal_type, int temporal_id, Slic
     }
     if (sps.sao) {
       sh.sao_luma = br.u(1) != 0;
-      sh.sao_chroma = br.u(1) != 0;
+      if (sps.chroma_array_type() != 0) sh.sao_chroma = br.u(1) != 0;
     }
     // NumPicTotalCurr (7-55)
     int total = 0;
@@ -547,19 +676,24 @@ bool Core::parse_slice_header(BitReader& br, int nal_type, int temporal_id, Slic
         }
       }
       if ((pps.weighted_pred && sh.type == kSliceP) || (pps.weighted_bipred && sh.type == kSliceB)) {
+        // 7.3.6.3 pred_weight_table(); the offsets are in units of 8-bit samples unless high_precision_offsets_enabled_flag (WpOffsetHalfRangeY / C, 7-56)
+        const bool chroma = sps.chroma_array_type() != 0;
+        const int half_y = 1 << (sps.high_precision_offsets ? sps.bit_depth_luma - 1 : 7);
+        const int half_c = 1 << (sps.high_precision_offsets ? sps.bit_depth_chroma - 1 : 7);
         sh.luma_log2_denom = static_cast<int>(br.ue());
         if (sh.luma_log2_denom > 7) return H265_FALSE;
-        sh.chroma_log2_denom = sh.luma_log2_denom + br.se();
+        sh.chroma_log2_denom = sh.luma_log2_denom;
+        if (chroma) sh.chroma_log2_denom += br.se();
         if (sh.chroma_log2_denom < 0 || sh.chroma_log2_denom > 7) return H265_FALSE;
         for (int l = 0; l < (sh.type == kSliceB ? 2 : 1); ++l) {
           for (int i = 0; i < sh.num_ref_idx[l]; ++i) sh.luma_weight_flag[l][i] = br.u(1) != 0;
-          for (int i = 0; i < sh.num_ref_idx[l]; ++i) sh.chroma_weight_flag[l][i] = br.u(1) != 0;
+          for (int i = 0; i < sh.num_ref_idx[l]; ++i) sh.chroma_weight_flag[l][i] = chroma && br.u(1) != 0;
           for (int i = 0; i < sh.num_ref_idx[l]; ++i) {
             sh.luma_weight[l][i] = 1 << sh.luma_log2_denom;
             sh.luma_offset[l][i] = 0;
             if (sh.luma_weight_flag[l][i]) {
               const int dw = br.se(), off = br.se();
-              if (dw < -128 || dw > 127 || off < -128 || off > 127) return H265_FALSE;
+              if (dw < -128 || dw > 127 || off < -half_y || off >= half_y) return H265_FALSE;
               sh.luma_weight[l][i] += dw;
               sh.luma_offset[l][i] = off;
             }
@@ -570,10 +704,10 @@ bool Core::parse_slice_header(BitReader& br, int nal_type, int temporal_id, Slic
             if (sh.chroma_weight_flag[l][i])
               for (int j = 0; j < 2; ++j) {
                 const int dw = br.se(), doff = br.se();
-                if (dw < -128 || dw > 127 || doff < -512 || doff > 511) return H265_FALSE;
+                if (dw < -128 || dw > 127 || doff < -4 * half_c || doff >= 4 * half_c) return H265_FALSE;
                 const int w = (1 << sh.chroma_log2_denom) + dw;
                 sh.chroma_weight[l][i][j] = w;
-                sh.chroma_offset[l][i][j] = clip3(-128, 127, (128 + doff) - ((128 * w) >> sh.chroma_log2_denom));
+                sh.chroma_offset[l][i][j] = clip3(-half_c, half_c - 1, (half_c + doff) - ((half_c * w) >> sh.chroma_log2_denom));   // (7-56)
               }
           }
         }
@@ -591,6 +725,7 @@ bool Core::parse_slice_header(BitReader& br, int nal_type, int temporal_id, Slic
           pps.cr_qp_offset + sh.cr_qp_offset > 12)
         return H265_FALSE;
     }
+    if (pps.chroma_qp_offset_list) sh.cu_chroma_qp_offset_enabled = br.u(1) != 0;
     bool deblocking_override = false;
     if (pps.deblocking_override_enabled) deblocking_override = br.u(1) != 0;
     sh.deblocking_disabled = pps.deblocking_disabled;
@@ -642,7 +777,9 @@ void Core::parse_sei(BitReader& br) {
       PendingHash h;
       h.type = static_cast<int>(br.u(8));
       bool ok = h.type <= 2;
-      for (int c = 0; c < 3 && ok; ++c) {
+      // one hash for each colour component: only luma for 4:0:0 (the active SPS's, which a suffix SEI follows)
+      h.components = sp_ && sp_->chroma_format_idc == 0 ? 1 : 3;
+      for (int c = 0; c < h.components && ok; ++c) {
         if (h.type == 0) for (int i = 0; i < 16; ++i) h.md5[c][i] = static_cast<uint8_t>(br.u(8));
         else if (h.type == 1) h.value[c] = br.u(16);
         else h.value[c] = br.u(32);
@@ -660,11 +797,13 @@ void Core::verify_picture_hash() {
   const PendingHash h = pending_hash_;
   pending_hash_.present = false;
   bool match = true;
-  for (int c = 0; c < 3; ++c) {
+  // (a monochrome picture's hash has luma alone; its chroma planes are not the picture's)
+  const int components = cur_->chroma_format == 0 ? 1 : h.components;
+  for (int c = 0; c < components; ++c) {
     // A picture deeper than eight bits holds 16-bit little-endian words: the hashes (8.? / D.3.19) run over those words as two bytes each, the low byte first, which is
     // what hashing the plane's bytes does; `w` counts bytes in the MD5 and CRC, samples in the checksum.
     const int bytes = cur_->deep ? 2 : 1;
-    const int w = c ? cur_->width / 2 : cur_->width, hh = c ? cur_->height / 2 : cur_->height;
+    const int w = c ? cur_->chroma_width() : cur_->width, hh = c ? cur_->chroma_height() : cur_->height;
     const uint8_t* plane = cur_->plane[c].data();
     const int stride = cur_->stride[c];
     if (h.type == 0) {
