@@ -1010,7 +1010,9 @@ static void decode_av1(const char *name, const char *b64, const GUID *profile, D
   UINT rows = 0;
   UINT64 row_bytes = 0, total = 0;
   if (tex[0]) ID3D12Device_GetCopyableFootprints(g_dev, &rd, 0, 1, 0, &fp, &rows, &row_bytes, &total);
-  BYTE *picture = malloc((size_t)(row_bytes * rows) + 1);
+  /* (NV12, a large-scale tile list's output frame: both planes, hashed as I420 as the reference is) */
+  const int nv12 = format == DXGI_FORMAT_NV12;
+  BYTE *picture = malloc(nv12 ? (size_t)w * h * 3 + 1 : (size_t)(row_bytes * rows) + 1);
   unsigned shown = 0, same = 0;
   size_t at = 32;
   for (UINT e = 0; e < events && dec && heap && vl && bits && tex[0] && surfaces <= 16 && picture; ++e) {
@@ -1051,13 +1053,28 @@ static void decode_av1(const char *name, const char *b64, const GUID *profile, D
       at += pp + sc + bs;
     }
     if (!show) continue;
+    if (nv12) {
+      BYTE *uv = picture + (size_t)w * h, *i420 = picture + (size_t)w * h * 3 / 2;
+      copy_subresources(tex[surface], subs[surface], 1, picture, (UINT64)w * h, 0);
+      copy_subresources(tex[surface], (separate ? 1 : surfaces) + subs[surface], 1, uv, (UINT64)w * h / 2, 0);
+      memcpy(i420, picture, (size_t)w * h);
+      for (UINT y = 0; y < h / 2; ++y)
+        for (UINT x = 0; x < w / 2; ++x) {
+          i420[(size_t)w * h + (size_t)y * (w / 2) + x] = uv[(size_t)y * w + 2 * x];
+          i420[(size_t)w * h * 5 / 4 + (size_t)y * (w / 2) + x] = uv[(size_t)y * w + 2 * x + 1];
+        }
+      const unsigned hash = fnv(i420, (size_t)w * h * 3 / 2, 0x811c9dc5u);
+      if (shown < frames) same += hash == hashes[shown];
+      ++shown;
+      continue;
+    }
     copy_subresources(tex[surface], subs[surface], 1, picture, row_bytes * rows, 0);
     const unsigned hash = fnv(picture, (size_t)(row_bytes * rows), 0x811c9dc5u);
     if (shown < frames) same += hash == hashes[shown];
     ++shown;
   }
   printf("d3d12videotest: %s into %s (%s): %u of %u pictures are ffmpeg's, bit for bit\n", name,
-         format == DXGI_FORMAT_AYUV ? "AYUV" : format == DXGI_FORMAT_Y210 ? "Y210" : format == DXGI_FORMAT_Y416 ? "Y416" : "?", separate ? "a texture a surface" : "an array",
+         format == DXGI_FORMAT_AYUV ? "AYUV" : format == DXGI_FORMAT_Y210 ? "Y210" : format == DXGI_FORMAT_Y416 ? "Y416" : nv12 ? "NV12" : "?", separate ? "a texture a surface" : "an array",
          same, frames);
   CHECK(shown == frames && same == frames);
   free(picture);
@@ -1203,11 +1220,17 @@ static void test_decode(void) {
   decode_stream("h264_cqm", DXVA_CODEC_H264, &D3D12_VIDEO_DECODE_PROFILE_H264, g_h264_cqm_b64, 17, g_h264_cqm_fnv, 9, 0, 0);
   /* interlaced: MBAFF frames and field pictures (P and B fields, B MBAFF frames), CABAC */
   decode_stream("h264_paff_mbaff_cabac", DXVA_CODEC_H264, &D3D12_VIDEO_DECODE_PROFILE_H264, g_h264_paff_mbaff_cabac_b64, 17, g_h264_paff_mbaff_cabac_fnv, 8, 0, 1);
+  /* gaps in frame_num: "non-existing" frames named with the surface of the reference before them, as ffmpeg does */
+  decode_stream("h264_dxva_gaps", DXVA_CODEC_H264, &D3D12_VIDEO_DECODE_PROFILE_H264, g_h264_dxva_gaps_b64, 17, g_h264_dxva_gaps_fnv, 18, 0, 0);
+  decode_stream("h264_dxva_gaps_p", DXVA_CODEC_H264, &D3D12_VIDEO_DECODE_PROFILE_H264, g_h264_dxva_gaps_p_b64, 17, g_h264_dxva_gaps_p_fnv, 19, 1, 0);
   decode_stream("vc1_adv_ipb", DXVA_CODEC_VC1, &D3D12_VIDEO_DECODE_PROFILE_VC1_D2010, g_vc1_adv_ipb_b64, 8, g_vc1_adv_ipb_fnv, 10, 0, 0);
   decode_stream("m4vdec_bframes", DXVA_CODEC_MPEG4, &D3D12_VIDEO_DECODE_PROFILE_MPEG4PT2_ADVSIMPLE_NOGMC, g_m4vdec_bframes_b64, 8, g_m4vdec_bframes_fnv, 8, 1, 0);
   decode_av1("av1_422_10bit (profile 2, film grain)", g_av1_422_10bit_dxva_b64, &D3D12_VIDEO_DECODE_PROFILE_AV1_PROFILE2, DXGI_FORMAT_Y210, g_av1_422_10bit_dxva_fnv, 6, 0);
   decode_av1("av1_444 (profile 1)", g_av1_444_dxva_b64, &D3D12_VIDEO_DECODE_PROFILE_AV1_PROFILE1, DXGI_FORMAT_AYUV, g_av1_444_dxva_fnv, 6, 1);
   decode_av1("av1_444_12bit (12-bit profile 2)", g_av1_444_12bit_dxva_b64, &D3D12_VIDEO_DECODE_PROFILE_AV1_12BIT_PROFILE2, DXGI_FORMAT_Y416, g_av1_444_12bit_dxva_fnv, 6, 0);
+  /* large-scale tile decoding: the anchors, then tile lists (DXVA_Tile_AV1.anchor_frame) into 512 x 512 NV12 output frames, libaom's */
+  decode_av1("av1_lst (large-scale tile)", g_av1_lst_dxva_b64, &D3D12_VIDEO_DECODE_PROFILE_AV1_PROFILE0, DXGI_FORMAT_NV12, g_av1_lst_dxva_fnv, 3, 0);
+  decode_av1("av1_lst (large-scale tile)", g_av1_lst_dxva_b64, &D3D12_VIDEO_DECODE_PROFILE_AV1_PROFILE0, DXGI_FORMAT_NV12, g_av1_lst_dxva_fnv, 3, 1);
 }
 
 /* ---- the video processor's deinterlacing, filters, luma key, stereo and HDR ---------------------------------------------------------------------------------------- */

@@ -18,6 +18,7 @@
 
 #include "Hardware/VideoCodec/Software/Av1Obu.hpp"
 #include "Utility/AllocatedView.hpp"
+#include "Utility/ByteStream.hpp"
 
 namespace hardware {
 namespace av1 {
@@ -125,6 +126,8 @@ void ObuParser::reset() {
   frame_open_ = false;
   have_cll_ = have_mdcv_ = false;
   n_tiles_ = 0;
+  have_camera_ = false;
+  tile_list_count_ = 0;
   operating_point_idc_ = 0;
   max_spatial_id_ = 0;
   error_ = ObuError::None;
@@ -1067,6 +1070,31 @@ bool ObuParser::parse_metadata(BitReader& gb, ObuEvent& event) {
   return true;
 }
 
+// tile_list_obu() (5.12.1) and tile_list_entry() (5.12.2), with the constraints of 6.11 (counts) and 7.3.1 (the output frame holds every tile).
+bool ObuParser::parse_tile_list(ConstByteView payload, ObuEvent& event) {
+  tile_list_count_ = 0;
+  ByteReader in(payload);
+  const unsigned width = in.u8() + 1u, height = in.u8() + 1u;
+  const unsigned count = in.be16() + 1u;
+  if (!in.ok()) return fail(ObuError::Truncated);
+  if (count > kMaxTileListEntries || count > width * height) return fail(ObuError::Syntax);
+  for (unsigned i = 0; i < count; ++i) {
+    TileListEntry& e = tile_list_[i];
+    e.anchor_frame_idx = in.u8();
+    e.tile_row = in.u8();
+    e.tile_col = in.u8();
+    const uint64_t size = uint64_t{in.be16()} + 1;
+    e.data = in.take(size);
+    if (!in.ok()) return fail(ObuError::Truncated);
+    if (e.anchor_frame_idx >= kMaxAnchorFrames || e.tile_row >= frame_.tiling.rows || e.tile_col >= frame_.tiling.cols) return fail(ObuError::Syntax);
+  }
+  tile_list_width_ = width;
+  tile_list_height_ = height;
+  tile_list_count_ = count;
+  event.kind = ObuEventKind::TileList;
+  return true;
+}
+
 bool ObuParser::handle_show_existing(ObuEvent& event) {
   const unsigned idx = frame_.existing_frame_idx;
   if (!refs_[idx].valid) return fail(ObuError::BadReference);
@@ -1167,6 +1195,7 @@ bool ObuParser::parse_obu(ConstByteView data, uint64_t& consumed, ObuEvent& even
       frame_ = FrameHeader{};
       have_frame_ = false;
       frame_open_ = false;
+      have_camera_ = false;
       frame_.temporal_id = static_cast<uint8_t>(temporal_id);
       frame_.spatial_id = static_cast<uint8_t>(spatial_id);
       if (!parse_frame_hdr(gb)) return false;
@@ -1180,11 +1209,18 @@ bool ObuParser::parse_obu(ConstByteView data, uint64_t& consumed, ObuEvent& even
         return fail(ObuError::FrameSize);
       have_frame_ = true;
       if (frame_.show_existing_frame) {
-        // OBU_FRAMEs shouldn't be signaled with show_existing_frame
-        if (type == OBU_FRAME) return fail(ObuError::Syntax);
+        // OBU_FRAMEs shouldn't be signaled with show_existing_frame (nor camera frame headers: 7.3.1)
+        if (type == OBU_FRAME || large_scale_tile_) return fail(ObuError::Syntax);
         return handle_show_existing(event);
       }
       if (!check_references()) return false;
+      if (large_scale_tile_) {
+        // The camera frame header (7.3): the tile lists that follow are decoded with it; an OBU_FRAME's tile groups are not (libaom skips them too).
+        have_camera_ = true;
+        tile_list_count_ = 0;
+        event.kind = ObuEventKind::CameraFrameHeader;
+        return true;
+      }
       if (!reserve_tiles(static_cast<uint64_t>(frame_.tiling.cols) * frame_.tiling.rows)) return fail(ObuError::NoMemory);
       frame_open_ = true;
       event.kind = ObuEventKind::FrameHeader;
@@ -1202,6 +1238,10 @@ bool ObuParser::parse_obu(ConstByteView data, uint64_t& consumed, ObuEvent& even
     case OBU_TD:
       event.kind = ObuEventKind::TemporalDelimiter;
       return true;
+    case OBU_TILE_LIST:
+      if (!large_scale_tile_) return true;   // only large-scale tile decoding uses it
+      if (!have_camera_ || !have_frame_) return fail(ObuError::NoSequence);
+      return parse_tile_list(payload, event);
     case OBU_PADDING:
     default:
       return true;

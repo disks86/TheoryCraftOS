@@ -33,7 +33,7 @@ class IFrameObserver;
 // An AV1 decoder on the CPU: the Main, High and Professional profiles (8-, 10- and 12-bit; 4:0:0, 4:2:0, 4:2:2 and 4:4:4), every coding tool
 // of the specification (all block sizes and partitions, intra and inter prediction with compound, OBMC, warped and global motion, palette,
 // intra block copy, CfL, filter-intra, switchable transforms and quantiser matrices, segmentation, delta q/lf, tiles, super-resolution,
-// loop filter, CDEF, loop restoration, film grain, scalable streams at operating point 0). A packet is a temporal unit as the low-overhead
+// loop filter, CDEF, loop restoration, film grain, scalable streams at operating point 0, large-scale tile decoding of tile list OBUs). A packet is a temporal unit as the low-overhead
 // bitstream format stores it (what MP4, WebM and IVF carry). Pictures come out as 8-bit I420 (deeper samples are rounded down, 4:4:4 and
 // 4:2:2 chroma is averaged down, monochrome pictures get neutral chroma), at most one per packet (the last shown frame of the unit).
 class Av1Decoder {
@@ -61,6 +61,13 @@ class Av1Decoder {
   void set_offload(av1::IOffload* offload);
   // For diagnostics and tests: the observer is told of every frame this decoder decodes itself (see Av1Core.hpp).
   void set_frame_observer(av1::IFrameObserver* observer);
+
+  // Large-scale tile decoding (AV1 7.3, libaom's "tile mode" 1; a light field, for example). The anchor frames are frames this decoder decoded: after a packet,
+  // keep_anchor_frame(i) makes its picture anchor frame i (0..127; false if the packet showed none). Then set_large_scale_tile(true): the next frame header OBU is
+  // the camera frame header (nothing comes out for it), and each tile list OBU after it gives one picture, the output frame of the list (its tiles in raster
+  // order; samples no tile was written to are 0). set_large_scale_tile(false) goes back to ordinary decoding.
+  void set_large_scale_tile(bool on);
+  [[nodiscard]] bool keep_anchor_frame(unsigned index);
 
  private:
   bool convert();

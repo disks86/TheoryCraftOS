@@ -329,6 +329,15 @@ struct OffloadFrame {
   PixelView plane[3];               // the picture to fill: hdr->width[1] x hdr->height luma samples (chroma as the layout says)
   int width = 0, height = 0;
 };
+// Large-scale tile decoding handed over: the camera frame header, the tile list and the output frame to fill (width x height). The anchor frames are the offload's
+// own (the frames it decoded that the caller made anchors).
+struct OffloadTileList {
+  const SequenceHeader* seq = nullptr;
+  const FrameHeader* camera = nullptr;
+  TileList list;
+  PixelView plane[3];
+  int width = 0, height = 0;
+};
 class IOffload {
  public:
   // Whether this frame (and so, in practice, its sequence) is one the offload can decode. A frame it refuses is decoded here.
@@ -339,6 +348,13 @@ class IOffload {
   virtual void show_existing(unsigned idx, bool refresh_all) = 0;
   // A new sequence began: every slot is empty.
   virtual void new_sequence() = 0;
+  // Large-scale tile decoding (7.3): whether the offload decodes tile lists; one that does not leaves them to the Core (the default).
+  virtual bool takes_tile_lists() const { return false; }
+  // Decodes the tile list into the output frame's planes. False: the list is lost (nothing is output).
+  virtual bool decode_tile_list(const OffloadTileList& list) {
+    (void)list;
+    return false;
+  }
 
  protected:
   constexpr IOffload() = default;
@@ -390,6 +406,21 @@ class Core {
   // `pic` with its film grain applied (into a picture the Core keeps, valid until the next call), or `pic` itself when its header has no grain. Null if out of memory.
   const Picture* grained(const Picture& pic);
 
+  // ---- large-scale tile decoding (7.3). The anchor frames are given by external means: here the frames this decoder decoded before (libaom's
+  // AV1_COPY_NEW_FRAME_IMAGE), for DXVA the program's surfaces.
+  // Anchor frame `index` (< kMaxAnchorFrames) is from now on the picture last output (the frame of the last shown frame). False if there is none.
+  [[nodiscard]] bool keep_anchor_frame(unsigned index);
+  void clear_anchor_frames();
+  // ObuEventKind::TileList: decodes parser().tile_list() with the camera frame header (parser().frame_header()), the reference slots and the anchor frames, and
+  // makes the output frame the output. False if the list cannot be decoded (a missing anchor frame, damaged tile data, a camera frame header that breaks the
+  // constraints of 7.3.1 this decoder needs); the references are not changed either way (refresh_frame_flags is 0).
+  [[nodiscard]] bool decode_tile_list();
+  // The same driven from outside (DXVA): the camera frame header made by the caller (complete as for decode_frame_external), its eight reference slots, the anchor
+  // frames by index (null where there is none) and the list. The output frame (width_in_tiles x height_in_tiles tiles, the camera frame's tile size; samples no
+  // tile is written to are 0, as libaom leaves them) comes back in *output.
+  [[nodiscard]] bool decode_tile_list_external(const SequenceHeader& seq, const FrameHeader& camera, ArrayView<const RefSlot> refs,
+                                               ArrayView<const SharedPointer<Picture>> anchors, const TileList& list, SharedPointer<Picture>* output);
+
   // ---- reconstruction (Av1Recon.cpp). dav1d's bd_fn.
   // Intra block (dav1d_recon_b_intra): prediction and residual of luma and chroma, reads the coefficients.
   bool recon_b_intra(TaskContext& t, BlockSize bs, int intra_edge_flags, const Av1Block& b);
@@ -427,6 +458,8 @@ class Core {
   bool decode_frame_offloaded();
   void finish_frame(bool ok);
   void drop_slot(unsigned i);
+  bool run_tile_list(const SequenceHeader& seq, const FrameHeader& camera, ArrayView<const RefSlot> refs, ArrayView<const SharedPointer<Picture>> anchors,
+                     const TileList& list, SharedPointer<Picture>* output);
 
   allocators::IAllocator& allocator_;
   ObuParser parser_;
@@ -440,6 +473,7 @@ class Core {
   SharedPointer<Picture> out_;
   SharedPointer<Picture> grain_;  // the output with film grain applied
   bool grain_valid_ = false;
+  SharedPointer<Picture> anchors_[kMaxAnchorFrames];   // AnchorFrames of large-scale tile decoding
 };
 
 }  // namespace av1

@@ -44,6 +44,9 @@ bool run_obus(av1::Core& core, ConstByteView data) {
       case av1::ObuEventKind::FrameReady:
         if (!core.decode_frame()) return false;
         break;
+      case av1::ObuEventKind::TileList:
+        if (!core.decode_tile_list()) return false;
+        break;
       default:
         break;
     }
@@ -71,6 +74,13 @@ void Av1Decoder::set_frame_observer(av1::IFrameObserver* observer) {
   if (!core_) core_ = UniquePointer<av1::Core>::make(allocator_, allocator_);
   if (core_) core_->set_frame_observer(observer);
 }
+
+void Av1Decoder::set_large_scale_tile(bool on) {
+  if (!core_) core_ = UniquePointer<av1::Core>::make(allocator_, allocator_);
+  if (core_) core_->parser().set_large_scale_tile(on);
+}
+
+bool Av1Decoder::keep_anchor_frame(unsigned index) { return core_ && core_->keep_anchor_frame(index); }
 
 bool Av1Decoder::configure(ConstByteView av1c) {
   // av1C: marker and version, profile and level, flags, delay; then the configuration OBUs.

@@ -325,6 +325,18 @@ Direct3D 11's and 12's video interfaces run on the kernel's codecs, on the CPU, 
   field picture writes only its field's lines of the planes (`DxvaDecodedPicture::field`); the second field of a pair goes into the same surface beside the first, and the
   decoder decodes it into the frame it keeps for that surface. Direct3D 12 reports `D3D12_VIDEO_FRAME_CODED_INTERLACE_TYPE_FIELD_BASED` for H.264 (with
   `HEIGHT_ALIGNMENT_MULTIPLE_32_REQUIRED`), d3d11.dll's H.264 decoders are field-based.
+- **H.264 gaps in frame_num** (8.2.5.2): the program infers the "non-existing" frames (`h264::Dpb::fill_frame_num_gap`, which the CPU decoder runs itself) and names
+  them in RefFrameList with their own FrameNumList entries. ffmpeg's dxva2_h264.c / d3d12va_h264.c give such a frame the surface of the short-term reference before it
+  and leave NonExistingFrameFlags 0: the decoder then keeps a copy of that surface's picture under the second frame number (`Picture::alias`). An entry
+  NonExistingFrameFlags marks is a mid-grey frame whose surface is not read. Either way it takes its place in the P lists by FrameNumWrap and, with
+  pic_order_cnt_type 0, stays out of a B slice's lists (8.2.4.2.3).
+- **AV1 large-scale tiles** (7.3, a light field's tile lists): DXVA has only `DXVA_Tile_AV1.anchor_frame`. A call whose first tile control names an anchor frame is
+  one tile list: the picture parameters are the camera frame header, control i is tile_list_entry() i (row / column the anchor tile, the anchor a surface index - a
+  frame decoded into it before), and the output frame goes into CurrPicTextureIndex. Neither DXVA_PicParams_AV1 nor D3D12 (its decode arguments are the same DXVA
+  structures) can say output_frame_width_in_tiles_minus_1 / _height_: the output frame is the decoder's size in whole tiles (SampleWidth / TileWidth columns),
+  entry i at (i % columns, i / columns), samples no tile wrote 0 (as libaom), and a list that does not fit is refused. `av1::Core::decode_tile_list_external`
+  decodes it; the CPU decoder takes tile list OBUs itself (`Av1Decoder::set_large_scale_tile`, anchors by `keep_anchor_frame`). Bit for bit with libaom's
+  lightfield_tile_list_decoder (tests/data/av1_lst.ivf, make_av1_large_scale_tile.sh).
 - **Processing.** The stream's `VideoProcess` (Hardware/VideoCodec/VideoProcess.hpp): up to 16 streams converted between NV12 / P010 / P016 / BGRA8 / BGRX8 / RGBA8 /
   RGB10A2 / RGBA16F and the SDR colour spaces (BT.601 / 709 / 2020, studio and full range, gamma 2.2, 2.4 and linear, chroma siting), scaled bilinearly, oriented, blended,
   composed over a background in a target rectangle; PQ and HLG (BT.2100) in and out, converted in absolute light (SDR white = BT.2408's 203 cd/m2) and tone mapped by
@@ -354,8 +366,7 @@ Direct3D 11's and 12's video interfaces run on the kernel's codecs, on the CPU, 
   the `ten_bit` word was) names it; the packed ones are one image of their views' pixels (AYUV and YUY2 A8B8G8R8, Y410 A2B10G10R10, Y416 / Y210 / Y216 A16B16G16R16;
   the 4:2:2 ones half as wide, a pixel a pair), into which `DecodeFrame` copies the rows the decoder packed. d3d12.dll has the packed formats (views of their pixels'
   format only, render targets of AYUV only, arrays one allocation a slice) and Direct3D 12's planar P208 / V208 / V408 (two or three planes); the processor reads and
-  writes AYUV, Y410, Y416, YUY2, Y210, Y216 and P208 (4:2:2 chroma sited as the colour space says, horizontally). Large-scale tiles (anchor frames) stay refused: the
-  core decodes whole frames.
+  writes AYUV, Y410, Y416, YUY2, Y210, Y216 and P208 (4:2:2 chroma sited as the colour space says, horizontally).
 - d3d12.dll: `ID3D12VideoDevice` .. 3, decoders and heaps (a heap is the kernel's decoder), processors, the VIDEO_DECODE / VIDEO_PROCESS queues and lists, decode
   statistics queries (video.inc; video_types.h has what mingw's d3d12video.h lacks). d3d11.dll: `ID3D11VideoDevice` .. 2, `ID3D11VideoContext` .. 3 on those
   (docs/Direct3D11.md).
@@ -368,7 +379,7 @@ Direct3D 11's and 12's video interfaces run on the kernel's codecs, on the CPU, 
   macroblocks (the queries say multiple of 16). Not done: CABAC, 8x8 transform, direct / B_Skip, intra refresh, slices by bytes, frame analysis, HEVC and AV1 (the codec query
   says FALSE), EncodeCommandList4. Tests: `tests/run_host_tests.sh VideoEncodeTest`, `tests/h264_encode_ffmpeg.sh` (ffmpeg's decode = the reconstruction),
   `tests/emulated_dx.sh tests/windows/d3d12encodetest.c`, `tests/d3d12_qemu.sh d3d12encodetest`, `tests/wow64_qemu.sh d3d12encodetest`.
-- Not there: HEVC 4:2:2 / 4:4:4 and above 10 bits (the range extension profiles; their SPS / PPS extensions are not read), AV1 large-scale tiles, interlaced VC-1 (the CPU decoder has progressive pictures only), decode-time conversion and histograms, protected
+- Not there: HEVC 4:2:2 / 4:4:4 and above 10 bits (the range extension profiles; their SPS / PPS extensions are not read), AV1 tile lists whose output frame is not the decoder's size (DXVA cannot say), interlaced VC-1 (the CPU decoder has progressive pictures only), decode-time conversion and histograms, protected
   content (crypto sessions and authenticated channels are refused), unordered access to planes (the kernel has none to textures), layered rendering into several slices
   (no `SV_RenderTargetArrayIndex`: a render target view of several slices draws into the first).
 - Tests: `tests/run_host_tests.sh DxvaDecoderTest VideoProcessTest DxgkrnlTest` (every codec bit for bit with ffmpeg; the DXVA buffers filled as ffmpeg's dxva2_*.c

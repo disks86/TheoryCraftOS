@@ -527,6 +527,158 @@ bool Core::decode_frame_external(const SequenceHeader& seq, const FrameHeader& h
   return ok;
 }
 
+// ---- large-scale tile decoding (7.3) ---------------------------------------------------------------------------------------------------
+
+bool Core::keep_anchor_frame(unsigned index) {
+  if (index >= kMaxAnchorFrames || !out_) return false;
+  anchors_[index] = out_;
+  return true;
+}
+
+void Core::clear_anchor_frames() {
+  for (SharedPointer<Picture>& a : anchors_) a.reset();
+}
+
+namespace {
+
+// The constraints of 7.3.1 the process depends on - an inter frame with colour, no super-resolution, tiles of one width (the last column may be narrower where the
+// frame ends) and one superblock high, a list the output frame holds - and the tile size and the output frame's. False if the list cannot be decoded.
+bool tile_list_geometry(const SequenceHeader& seq, const FrameHeader& camera, const TileList& list, int* tile_w, int* tile_h, int* out_w, int* out_h) {
+  if (list.entries.empty() || list.width_in_tiles == 0 || list.height_in_tiles == 0 || list.entries.size() > uint64_t{list.width_in_tiles} * list.height_in_tiles)
+    return false;
+  if (!is_inter_or_switch(camera) || seq.layout == PIXEL_LAYOUT_I400 || camera.width[0] != camera.width[1] || camera.show_existing_frame) return false;
+  const auto& tiling = camera.tiling;
+  const int sb_px = 64 << seq.sb128;
+  const int tile_w_sb = tiling.col_start_sb[1] - tiling.col_start_sb[0];
+  for (int c = 0; c + 1 < tiling.cols; ++c)
+    if (tiling.col_start_sb[c + 1] - tiling.col_start_sb[c] != tile_w_sb) return false;
+  for (int r = 0; r + 1 < tiling.rows; ++r)
+    if (tiling.row_start_sb[r + 1] - tiling.row_start_sb[r] != 1) return false;
+  *tile_w = tile_w_sb * sb_px;
+  *tile_h = sb_px;
+  const uint64_t w = uint64_t{list.width_in_tiles} * static_cast<uint64_t>(*tile_w), h = uint64_t{list.height_in_tiles} * static_cast<uint64_t>(*tile_h);
+  if (*tile_w <= 0 || w > 16384 || h > 16384) return false;   // this decoder's limit for the output frame (the syntax allows 256 x 4096 samples a side)
+  for (const TileListEntry& e : list.entries)
+    if (e.tile_row >= tiling.rows || e.tile_col >= tiling.cols) return false;
+  *out_w = static_cast<int>(w);
+  *out_h = static_cast<int>(h);
+  return true;
+}
+
+}  // namespace
+
+bool Core::decode_tile_list() {
+  const SequenceHeader* seq = parser_.sequence_header();
+  const FrameHeader* camera = parser_.frame_header();
+  if (!seq || !camera) return false;
+  if (offload_ && offload_->takes_tile_lists()) {
+    int tile_w = 0, tile_h = 0, out_w = 0, out_h = 0;
+    const TileList list = parser_.tile_list();
+    if (!tile_list_geometry(*seq, *camera, list, &tile_w, &tile_h, &out_w, &out_h)) return false;
+    SharedPointer<Picture> pic = make_picture(allocator_, seq->layout, 8 + 2 * seq->hbd, out_w, out_h);
+    if (!pic) return false;
+    OffloadTileList o;
+    o.seq = seq;
+    o.camera = camera;
+    o.list = list;
+    for (int p = 0; p < 3; ++p) o.plane[p] = pic->plane(p);
+    o.width = out_w;
+    o.height = out_h;
+    if (!offload_->decode_tile_list(o)) return false;
+    pic->hdr = *camera;
+    pic->hdr.width[0] = pic->hdr.width[1] = out_w;
+    pic->hdr.height = out_h;
+    pic->hdr.film_grain.present = 0;
+    out_ = pic;
+    grain_valid_ = false;
+    return true;
+  }
+  SharedPointer<Picture> pic;
+  if (!run_tile_list(*seq, *camera, ArrayView<const RefSlot>(refs_), ArrayView<const SharedPointer<Picture>>(anchors_), parser_.tile_list(), &pic)) return false;
+  out_ = pic;
+  grain_valid_ = false;
+  return true;
+}
+
+bool Core::decode_tile_list_external(const SequenceHeader& seq, const FrameHeader& camera, ArrayView<const RefSlot> refs,
+                                     ArrayView<const SharedPointer<Picture>> anchors, const TileList& list, SharedPointer<Picture>* output) {
+  return output && run_tile_list(seq, camera, refs, anchors, list, output);
+}
+
+// 7.3.1 and 7.3.2. Each entry: the anchor frame replaces the picture of slot ref_frame_idx[0] (LAST_FRAME; the frame's size and format are taken as the anchor's,
+// so an anchor of another size or format is refused), the tile (anchor_tile_row, anchor_tile_col) is decoded with the camera frame header's CDFs and no adaptation,
+// without loop filter, CDEF, super-resolution or loop restoration, and its samples go to tile i of the output frame (raster order, width_in_tiles a row). The
+// frame-level state (CDFs, quantizers, references, motion vector buffers) is set up once per list; the above contexts are cleared for every tile, which decodes
+// a tile that comes twice the same way each time.
+bool Core::run_tile_list(const SequenceHeader& seq, const FrameHeader& camera, ArrayView<const RefSlot> refs, ArrayView<const SharedPointer<Picture>> anchors,
+                         const TileList& list, SharedPointer<Picture>* output) {
+  int tile_w = 0, tile_h = 0, out_w = 0, out_h = 0;
+  if (refs.size() != NUM_REF_FRAMES || !tile_list_geometry(seq, camera, list, &tile_w, &tile_h, &out_w, &out_h)) return false;
+  const auto& tiling = camera.tiling;
+  const int sb_px = 64 << seq.sb128;
+  const int bpc = 8 + 2 * seq.hbd;
+  const int last = camera.refidx[0];
+  for (const TileListEntry& e : list.entries) {
+    if (e.anchor_frame_idx >= anchors.size()) return false;
+    const SharedPointer<Picture>& a = anchors[e.anchor_frame_idx];
+    if (!a || a->layout() != seq.layout || a->bpc() != bpc || a->width() != camera.width[0] || a->height() != camera.height) return false;
+  }
+  FrameHeader hdr = camera;
+  hdr.disable_cdf_update = 1;   // 7.3.1 requires it; libaom decodes the tiles without adaptation whatever the header says
+  hdr.refresh_context = 0;
+  hdr.refresh_frame_flags = 0;
+  // The slots: LAST_FRAME's is the anchor. The other references are not predicted from (7.3.2: RefFrame[0] is LAST_FRAME, RefFrame[1] NONE); an empty one gets the
+  // first anchor so the set-up has a picture for it.
+  RefSlot slots[NUM_REF_FRAMES];
+  for (int i = 0; i < NUM_REF_FRAMES; ++i) slots[i] = refs[static_cast<uint64_t>(i)];
+  const SharedPointer<Picture>& first = anchors[list.entries[0].anchor_frame_idx];
+  slots[last].pic = first;
+  for (int i = 0; i < REFS_PER_FRAME; ++i)
+    if (!slots[hdr.refidx[i]].pic) slots[hdr.refidx[i]].pic = first;
+  SharedPointer<Picture> out = make_picture(allocator_, seq.layout, bpc, static_cast<int>(out_w), static_cast<int>(out_h));
+  if (!out) return false;
+  if (!init_frame(&seq, &hdr, ArrayView<const RefSlot>(slots))) {
+    finish_frame(false);
+    return false;
+  }
+  FrameContext& f = f_;
+  TaskContext& t = *t_;
+  TileState& ts = *ts_;
+  t.f = &f;
+  t.ts = &ts;
+  const Picture& cur = *f.cur;
+  uint64_t index = 0;
+  for (const TileListEntry& e : list.entries) {
+    const SharedPointer<Picture>& anchor = anchors[e.anchor_frame_idx];
+    for (int i = 0; i < REFS_PER_FRAME; ++i)
+      if (hdr.refidx[i] == last) f.refp[i] = anchor;
+    for (BlockContext& c : f.a.view()) reset_block_context(c, false);
+    if (!setup_tile(ts, e.tile_row, e.tile_col, e.data) || !decode_tile(t, e.tile_row, e.tile_col)) {
+      finish_frame(false);
+      return false;
+    }
+    // The tile's samples into the output frame.
+    const int x0 = tiling.col_start_sb[e.tile_col] * sb_px, y0 = tiling.row_start_sb[e.tile_row] * sb_px;
+    const int w = imin(tile_w, camera.width[0] - x0), h = imin(tile_h, camera.height - y0);
+    const int dx = static_cast<int>(index % list.width_in_tiles) * tile_w, dy = static_cast<int>(index / list.width_in_tiles) * tile_h;
+    for (int p = 0; p < 3; ++p) {
+      const int sx = p ? cur.ss_hor() : 0, sy = p ? cur.ss_ver() : 0;
+      const PixelView src = cur.plane(p), dst = out->plane(p);
+      for (int y = 0; y < (h >> sy); ++y)
+        for (int x = 0; x < (w >> sx); ++x) dst.at((dx >> sx) + x, (dy >> sy) + y) = src.at((x0 >> sx) + x, (y0 >> sy) + y);
+    }
+    ++index;
+  }
+  out->hdr = hdr;
+  out->hdr.width[0] = out->hdr.width[1] = static_cast<int>(out_w);
+  out->hdr.height = static_cast<int>(out_h);
+  out->hdr.film_grain.present = 0;
+  out->hdr.show_frame = 1;
+  finish_frame(true);
+  *output = out;
+  return true;
+}
+
 bool Core::show_existing_frame(unsigned idx, bool refresh_all) {
   if (idx >= NUM_REF_FRAMES || !refs_[idx].pic) return false;
   if (offload_) offload_->show_existing(idx, refresh_all);
