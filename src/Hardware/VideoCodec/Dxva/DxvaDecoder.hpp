@@ -45,8 +45,9 @@ enum class DxvaProfile : uint8_t {
   Vp9Vld10BitProfile2, // D3D11_DECODER_PROFILE_VP9_VLD_10BIT_PROFILE2 {a4c749ef-6ecf-48aa-8448-50a7a1165ff7}: 10-bit 4:2:0 -> P010
   HevcVldMain,         // D3D11_DECODER_PROFILE_HEVC_VLD_MAIN {5b11d51b-2f4c-4452-bcc3-09f2a1160cc0}: 8-bit 4:2:0 -> NV12
   Av1VldProfile0,      // D3D11_DECODER_PROFILE_AV1_VLD_PROFILE0 {b8be4ccb-cf53-46ba-8d59-d6b8a6da5d2a}: 8-bit (NV12) and 10-bit (P010) 4:2:0, monochrome
+  HevcVldMain10,       // D3D11_DECODER_PROFILE_HEVC_VLD_MAIN10 {107af0e0-ef1a-4d19-aba8-67a163073d13}: 8-bit to 10-bit 4:2:0 (Main 10, Main, the Still Picture profiles) -> P010
 };
-constexpr uint32_t kDxvaProfileCount = 7;
+constexpr uint32_t kDxvaProfileCount = 8;
 
 // What the program gives for one picture (DXVA's buffer types: D3D11_VIDEO_DECODER_BUFFER_PICTURE_PARAMETERS, _INVERSE_QUANTIZATION_MATRIX, _SLICE_CONTROL, _BITSTREAM).
 // The views are of memory the caller keeps until decode() returns. A buffer the codec does not use may be empty; one it needs and does not get makes the picture invalid.

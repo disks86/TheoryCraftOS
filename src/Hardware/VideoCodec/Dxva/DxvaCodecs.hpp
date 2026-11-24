@@ -23,6 +23,6 @@ namespace hardware {
 UniquePointer<IDxvaDecoder> create_dxva_h264(allocators::IAllocator& allocator, const DxvaDecoderConfig& config);
 UniquePointer<IDxvaDecoder> create_dxva_mpeg2(allocators::IAllocator& allocator, const DxvaDecoderConfig& config);   // Mpeg2Vld and Mpeg2and1Vld
 UniquePointer<IDxvaDecoder> create_dxva_vp9(allocators::IAllocator& allocator, const DxvaDecoderConfig& config);     // both VP9 profiles
-UniquePointer<IDxvaDecoder> create_dxva_hevc(allocators::IAllocator& allocator, const DxvaDecoderConfig& config);
+UniquePointer<IDxvaDecoder> create_dxva_hevc(allocators::IAllocator& allocator, const DxvaDecoderConfig& config);   // HevcVldMain and HevcVldMain10
 UniquePointer<IDxvaDecoder> create_dxva_av1(allocators::IAllocator& allocator, const DxvaDecoderConfig& config);
 }  // namespace hardware

@@ -181,7 +181,7 @@ static bool make_hevc_expected(allocators::IAllocator& a, HevcExpected* out) {
 }
 
 // The ten-bit H.265 stream: the pictures the engine must write, per picture in decode order, as P010 words (a 16-bit little-endian word per sample, the value in the top ten bits,
-// Cb and Cr interleaved), with the order count the message must carry. The CPU cannot decode ten bits, so the pictures are FFmpeg's (tests/data/hevc10_selftest.yuv, made by
+// Cb and Cr interleaved), with the order count the message must carry. The pictures are FFmpeg's (not the CPU decoder's, which is checked against them) (tests/data/hevc10_selftest.yuv, made by
 // scripts/gen_hevc_test_streams.sh, planar 16-bit in display order); the stream's order counts say which of them each picture is.
 struct Hevc10Expected {
   std::vector<int32_t> poc;
@@ -829,25 +829,6 @@ static void synthetic_interlaced(AmdUvd6VideoEngine& engine, Card& card, bool en
   }
 }
 
-// A session with no way to decode the ten-bit stream (the CPU's, or the engine's when its test did not pass): not a single picture comes out of it.
-static bool ten_bit_refused(IVideoDecoder& session) {
-  const ConstByteView stream(kHevc10SelfTestStream);
-  uint32_t frames = 0;
-  VideoFrame f;
-  for (uint32_t i = 0; i < kHevc10SelfTestPictures; ++i) {
-    VideoPacket p;
-    const uint64_t start = i == 0 ? 0 : kHevc10SelfTestEnds[i - 1];
-    p.data = stream.subview(start, kHevc10SelfTestEnds[i] - start);
-    p.pts_us = int64_t{i} * 1000;
-    p.keyframe = i == 0;
-    session.submit(p);
-    while (session.receive(&f)) ++frames;
-  }
-  session.flush();
-  while (session.receive(&f)) ++frames;
-  return frames == 0;
-}
-
 // Feeds the H.265 self-test stream to a session; true when every picture came out as the CPU's (by presentation time) and none was missing.
 static bool run_hevc_stream(IVideoDecoder& session, const HevcExpected& e) {
   const ConstByteView stream(kHevcSelfTestStream);
@@ -1114,7 +1095,7 @@ static void run_case(Fault fault) {
         CHECK(static_cast<bool>(second) && run_hevc_stream(*second, hevc) && card.hevc_decodes == before);
         CHECK(run_hevc_stream(*first, hevc) && card.hevc_decodes == before + (hevc_on ? int(kHevcSelfTestPictures) : 0));
       }
-      // Ten-bit H.265 is the engine's alone when its test passed (the CPU has no ten-bit decoder): P010 as the engine wrote it, or converted. When it did not pass, nothing decodes it.
+      // Ten-bit H.265 is the engine's when its test passed: P010 as the engine wrote it, or converted. When it did not pass, the CPU's Main 10 decoder gives the same pictures.
       {
         DecoderConfig hevc_config = h264_config();
         hevc_config.codec = VideoCodec::Hevc;
@@ -1123,19 +1104,16 @@ static void run_case(Fault fault) {
           hevc_config.output = output;
           UniquePointer<IVideoDecoder> session = engine.create_decoder(hevc_config);
           CHECK(static_cast<bool>(session));
-          if (hevc10_on) {
-            CHECK(run_hevc10_stream(*session, hevc10, output));
-          } else {
-            CHECK(ten_bit_refused(*session));
-          }
+          CHECK(run_hevc10_stream(*session, hevc10, output));   // (the engine's, or the CPU's when its test did not pass)
         }
         CHECK(card.hevc10_decodes == before + (hevc10_on ? 2 * int(kHevc10SelfTestPictures) : 0));
-        // While the engine serves one session, a ten-bit stream on a second one has no CPU to fall back on.
+        // While the engine serves one session, a ten-bit stream on a second one is the CPU's (the same pictures, none of them the engine's).
         if (hevc10_on) {
           hevc_config.output = PixelFormat::P010;
           UniquePointer<IVideoDecoder> busy = engine.create_decoder(hevc_config);
           UniquePointer<IVideoDecoder> second = engine.create_decoder(hevc_config);
-          CHECK(static_cast<bool>(second) && ten_bit_refused(*second));
+          const int engine_before = card.hevc10_decodes;
+          CHECK(static_cast<bool>(second) && run_hevc10_stream(*second, hevc10, PixelFormat::P010) && card.hevc10_decodes == engine_before);
         }
       }
       // The interlaced VC-1 stream (progressive frames) decodes either way, on the engine when its interlaced test passed and on the CPU when it did not; frame and field coded

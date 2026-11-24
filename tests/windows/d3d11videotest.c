@@ -34,6 +34,7 @@
 #include "dxfixtures.h"
 #include "dxva_streams.h"
 #include "d3d11video_data.h"
+#include "hevc10_dxva.h"
 
 /* (what mingw's d3d11_4.h does not have: the Windows SDK's) */
 DEFINE_GUID(IID_ID3D11VideoDevice2_, 0x59c0cb01, 0x35f0, 0x4a70, 0x8f, 0x67, 0x87, 0x90, 0x5c, 0x90, 0x6a, 0x53);
@@ -491,7 +492,7 @@ static void test_planar_views(void) {
 
 static void test_decoder_caps(void) {
   const UINT count = ID3D11VideoDevice_GetVideoDecoderProfileCount(g_vdevice);
-  int h264 = 0, mpeg2 = 0, hevc = 0, vp9 = 0, av1 = 0;
+  int h264 = 0, mpeg2 = 0, hevc = 0, vp9 = 0, av1 = 0, hevc10 = 0;
   for (UINT i = 0; i < count; ++i) {
     GUID g;
     if (FAILED(ID3D11VideoDevice_GetVideoDecoderProfile(g_vdevice, i, &g))) continue;
@@ -500,14 +501,18 @@ static void test_decoder_caps(void) {
     hevc |= IsEqualGUID(&g, &D3D11_DECODER_PROFILE_HEVC_VLD_MAIN);
     vp9 |= IsEqualGUID(&g, &D3D11_DECODER_PROFILE_VP9_VLD_PROFILE0);
     av1 |= IsEqualGUID(&g, &DXVA_ModeAV1_VLD_Profile0);
+    hevc10 |= IsEqualGUID(&g, &D3D11_DECODER_PROFILE_HEVC_VLD_MAIN10);
   }
-  checkf(count == 7 && h264 && mpeg2 && hevc && vp9 && av1, "GetVideoDecoderProfileCount %u: H.264, MPEG-2, MPEG-1/2, VP9 (two), HEVC, AV1", count);
+  checkf(count == 8 && h264 && mpeg2 && hevc && vp9 && av1 && hevc10, "GetVideoDecoderProfileCount %u: H.264, MPEG-2, MPEG-1/2, VP9 (two), HEVC Main and Main 10, AV1", count);
   GUID g;
   check(ID3D11VideoDevice_GetVideoDecoderProfile(g_vdevice, count, &g) == E_INVALIDARG, "GetVideoDecoderProfile past the last: E_INVALIDARG");
   BOOL ok = FALSE;
   check(SUCCEEDED(ID3D11VideoDevice_CheckVideoDecoderFormat(g_vdevice, &D3D11_DECODER_PROFILE_H264_VLD_NOFGT, DXGI_FORMAT_NV12, &ok)) && ok, "H.264 decodes into NV12");
   check(SUCCEEDED(ID3D11VideoDevice_CheckVideoDecoderFormat(g_vdevice, &D3D11_DECODER_PROFILE_H264_VLD_NOFGT, DXGI_FORMAT_P010, &ok)) && !ok, "... not into P010");
   check(SUCCEEDED(ID3D11VideoDevice_CheckVideoDecoderFormat(g_vdevice, &D3D11_DECODER_PROFILE_VP9_VLD_10BIT_PROFILE2, DXGI_FORMAT_P010, &ok)) && ok, "VP9 profile 2 decodes into P010");
+  check(SUCCEEDED(ID3D11VideoDevice_CheckVideoDecoderFormat(g_vdevice, &D3D11_DECODER_PROFILE_HEVC_VLD_MAIN10, DXGI_FORMAT_P010, &ok)) && ok, "HEVC Main 10 decodes into P010");
+  check(SUCCEEDED(ID3D11VideoDevice_CheckVideoDecoderFormat(g_vdevice, &D3D11_DECODER_PROFILE_HEVC_VLD_MAIN10, DXGI_FORMAT_NV12, &ok)) && !ok, "... not into NV12");
+  check(SUCCEEDED(ID3D11VideoDevice_CheckVideoDecoderFormat(g_vdevice, &D3D11_DECODER_PROFILE_HEVC_VLD_MAIN, DXGI_FORMAT_P010, &ok)) && !ok, "HEVC Main does not decode into P010");
   check(ID3D11VideoDevice_CheckVideoDecoderFormat(g_vdevice, &D3D11_DECODER_PROFILE_WMV9_IDCT, DXGI_FORMAT_NV12, &ok) == E_INVALIDARG, "a profile there is not: E_INVALIDARG");
   D3D11_VIDEO_DECODER_DESC desc = {D3D11_DECODER_PROFILE_H264_VLD_NOFGT, 480, 320, DXGI_FORMAT_NV12};
   UINT configs = 0;
@@ -864,6 +869,75 @@ static void decode_stream(const char *name, int codec, const GUID *profile, cons
   if (dec) ID3D11VideoDecoder_Release(dec);
   dxva_stream_close(&s);
   free(data);
+}
+
+/* A Main 10 stream (hevc10_dxva.h: the DXVA buffers of every picture as ffmpeg fills them) decoded into a P010 array through ID3D11VideoContext; each picture read
+ * back as it is decoded and compared in display order with the reference (FNV hashes of the pictures as yuv420p10le). */
+static void decode_hevc10(const Hevc10Stream *st) {
+  const UINT w = st->width, h = st->height, surfaces = st->surfaces;
+  const D3D11_VIDEO_DECODER_DESC desc = {D3D11_DECODER_PROFILE_HEVC_VLD_MAIN10, w, h, DXGI_FORMAT_P010};
+  D3D11_VIDEO_DECODER_CONFIG config;
+  UINT count = 0;
+  HRESULT hr = ID3D11VideoDevice_GetVideoDecoderConfigCount(g_vdevice, &desc, &count);
+  if (SUCCEEDED(hr) && count) hr = ID3D11VideoDevice_GetVideoDecoderConfig(g_vdevice, &desc, 0, &config);
+  checkf(SUCCEEDED(hr) && count == 1 && config.ConfigBitstreamRaw == 1, "%s: one HEVC Main 10 configuration into P010 (ConfigBitstreamRaw 1)", st->name);
+  ID3D11VideoDecoder *dec = NULL;
+  if (SUCCEEDED(hr)) hr = ID3D11VideoDevice_CreateVideoDecoder(g_vdevice, &desc, &config, &dec);
+  ID3D11Texture2D *out = texture(w, h, surfaces, DXGI_FORMAT_P010, D3D11_USAGE_DEFAULT, D3D11_BIND_DECODER, 0, NULL, NULL);
+  ID3D11VideoDecoderOutputView *views[DXVA_STREAM_MAX_SURFACES] = {0};
+  for (unsigned i = 0; SUCCEEDED(hr) && out && i < surfaces; ++i) {
+    D3D11_VIDEO_DECODER_OUTPUT_VIEW_DESC vd = {D3D11_DECODER_PROFILE_HEVC_VLD_MAIN10, D3D11_VDOV_DIMENSION_TEXTURE2D, {{i}}};
+    hr = ID3D11VideoDevice_CreateVideoDecoderOutputView(g_vdevice, (ID3D11Resource *)out, &vd, &views[i]);
+  }
+  checkf(SUCCEEDED(hr) && dec && out, "%s: a Main 10 decoder of %u x %u, a P010 array of %u slices and their output views", st->name, w, h, surfaces);
+  BYTE *p010 = malloc((size_t)w * h * 3), *f = malloc((size_t)w * h * 3);
+  unsigned hashes[64] = {0}, n = 0, low_bits = 0;
+  for (; SUCCEEDED(hr) && dec && out && n < st->count && n < 64; ++n) {
+    const Hevc10Picture *p = &st->pictures[n];
+    if (FAILED(ID3D11VideoContext_DecoderBeginFrame(g_vcontext, dec, views[p->surface], 0, NULL))) break;
+    int ok = fill_buffer(dec, D3D11_VIDEO_DECODER_BUFFER_PICTURE_PARAMETERS, 0, st->bytes + p->pp, p->pp_size) &&
+             (!p->qm_size || fill_buffer(dec, D3D11_VIDEO_DECODER_BUFFER_INVERSE_QUANTIZATION_MATRIX, 0, st->bytes + p->qm, p->qm_size)) &&
+             fill_buffer(dec, D3D11_VIDEO_DECODER_BUFFER_SLICE_CONTROL, 0, st->bytes + p->slices, p->slices_size) &&
+             fill_buffer(dec, D3D11_VIDEO_DECODER_BUFFER_BITSTREAM, 0, st->bytes + p->bits, p->bits_size);
+    D3D11_VIDEO_DECODER_BUFFER_DESC b[4];
+    UINT nb = 0;
+    b[nb++] = buffer_desc(D3D11_VIDEO_DECODER_BUFFER_PICTURE_PARAMETERS, 0, p->pp_size);
+    if (p->qm_size) b[nb++] = buffer_desc(D3D11_VIDEO_DECODER_BUFFER_INVERSE_QUANTIZATION_MATRIX, 0, p->qm_size);
+    b[nb++] = buffer_desc(D3D11_VIDEO_DECODER_BUFFER_SLICE_CONTROL, 0, p->slices_size);
+    b[nb++] = buffer_desc(D3D11_VIDEO_DECODER_BUFFER_BITSTREAM, 0, p->bits_size);
+    ok = ok && SUCCEEDED(ID3D11VideoContext_SubmitDecoderBuffers(g_vcontext, dec, nb, b));
+    ok = SUCCEEDED(ID3D11VideoContext_DecoderEndFrame(g_vcontext, dec)) && ok;
+    if (!ok || !read_planar(out, p->surface, p010)) break;
+    /* (luma rows of w words, then h / 2 rows of w / 2 Cb, Cr pairs: as yuv420p10le, planar) */
+    BYTE *at = f;
+    for (UINT i = 0; i < w * h; ++i) {
+      const unsigned v = (unsigned)p010[2 * i] | ((unsigned)p010[2 * i + 1] << 8);
+      low_bits |= v & 0x3F;
+      *at++ = (BYTE)(v >> 6);
+      *at++ = (BYTE)(v >> 14);
+    }
+    const BYTE *chroma = p010 + (size_t)w * h * 2;
+    for (int c = 0; c < 2; ++c)
+      for (UINT i = 0; i < w * h / 4; ++i) {
+        const unsigned v = (unsigned)chroma[4 * i + 2 * c] | ((unsigned)chroma[4 * i + 2 * c + 1] << 8);
+        low_bits |= v & 0x3F;
+        *at++ = (BYTE)(v >> 6);
+        *at++ = (BYTE)(v >> 14);
+      }
+    if (p->display < 64) hashes[p->display] = fnv(f, (size_t)w * h * 3, 0x811c9dc5u);
+  }
+  checkf(n == st->count && low_bits == 0, "%s: %u pictures decoded through ID3D11VideoContext into P010 (the samples in the top ten bits)", st->name, n);
+  UINT same = 0, first_bad = ~0u;
+  for (UINT i = 0; i < st->count && i < 64; ++i) {
+    if (hashes[i] == st->fnv[i]) ++same;
+    else if (first_bad == ~0u) first_bad = i;
+  }
+  checkf(same == st->count, "%s: in display order every frame is the reference's, bit for bit (%u of %u; the first that differs: %d)", st->name, same, st->count, (int)first_bad);
+  free(p010);
+  free(f);
+  for (unsigned i = 0; i < surfaces; ++i) if (views[i]) ID3D11VideoDecoderOutputView_Release(views[i]);
+  if (out) ID3D11Texture2D_Release(out);
+  if (dec) ID3D11VideoDecoder_Release(dec);
 }
 
 /* A decoded picture sampled in a draw: the draw after the decode sees it (the device orders its video work with its draws). */
@@ -1315,6 +1389,7 @@ int main(void) {
       decode_stream("h264_ltr", DXVA_CODEC_H264, &D3D11_DECODER_PROFILE_H264_VLD_NOFGT, g_h264_ltr_b64, 20, g_h264_ltr_fnv, 24, NULL, 0);
       decode_stream("h264_cqm", DXVA_CODEC_H264, &D3D11_DECODER_PROFILE_H264_VLD_NOFGT, g_h264_cqm_b64, 17, g_h264_cqm_fnv, 9, NULL, 2);
       decode_stream("mpeg2_ibp", DXVA_CODEC_MPEG2, &D3D11_DECODER_PROFILE_MPEG2_VLD, g_mpeg2_ibp_b64, 8, NULL, 8, g_mpeg2_ibp_means, 1);
+      for (unsigned i = 0; i < sizeof g_hevc10_streams / sizeof g_hevc10_streams[0]; ++i) decode_hevc10(&g_hevc10_streams[i]);
       test_decode_then_draw();
       test_processor();
     }

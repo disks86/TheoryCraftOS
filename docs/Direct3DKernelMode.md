@@ -306,8 +306,11 @@ Direct3D 11's and 12's video interfaces run on the kernel's codecs, on the CPU, 
 
 - **Decoding** (DXVA). A program parses its stream and hands each picture's DXVA buffers (picture parameters, inverse quantization matrices, slice or tile controls,
   compressed data). `src/Hardware/VideoCodec/Dxva` decodes them (`IDxvaDecoder`, DxvaDecoder.hpp): H.264 VLD (short slices; progressive frames, POC types 0-2), MPEG-2 and
-  MPEG-1, VP9 profile 0 and 10-bit profile 2, HEVC Main, AV1 profile 0 (8 and 10 bits, monochrome, film grain). H.264, MPEG-2 and VP9 rebuild what the software decoders
-  read from the parameters; HEVC and AV1 fill the decoders' parameter sets and frame headers from them and take the reference sets DXVA gives. Each picture comes back at
+  MPEG-1, VP9 profile 0 and 10-bit profile 2, HEVC Main (NV12) and Main 10 (P010: 8 to 10 bits for luma and chroma each, so Main and the Still Picture profiles too),
+  AV1 profile 0 (8 and 10 bits, monochrome, film grain). H.264, MPEG-2 and VP9 rebuild what the software decoders
+  read from the parameters; HEVC and AV1 fill the decoders' parameter sets and frame headers from them and take the reference sets DXVA gives. The CPU H.265 decoder
+  has every sample path at any depth up to 10 bits (templated on the sample type: 8-bit pictures take the 8-bit code as before, 10-bit ones 16-bit planes with
+  QpBdOffset, the interpolation shifts, weighted prediction offsets, bdShift, PCM at its own depth, tC / beta and SAO offsets scaled). Each picture comes back at
   once, in decoding order, kept under a key (the kernel's allocation of its luma plane), so the reference list may change from picture to picture. The kernel's decoder is
   a `VideoDecoderObject` (escapes CreateVideoDecoder / DestroyVideoDecoder / QueryVideoDecodeSupport); the stream's `DecodeFrame` decodes into the output planes and writes a
   `VideoDecodeStatus` (Direct3D 12's decode statistics). A picture that cannot be decoded leaves the planes alone and says so in the status: the stream goes on.
@@ -322,11 +325,12 @@ Direct3D 11's and 12's video interfaces run on the kernel's codecs, on the CPU, 
   statistics queries (video.inc; video_types.h has what mingw's d3d12video.h lacks). d3d11.dll: `ID3D11VideoDevice` .. 2, `ID3D11VideoContext` .. 3 on those
   (docs/Direct3D11.md).
 - Not there: video encoding and motion estimation (reported as not supported; their creators answer DXGI_ERROR_UNSUPPORTED), interlaced H.264 (field pictures, MBAFF),
-  HEVC Main10 and 4:2:2 / 4:4:4, AV1 profiles 1 and 2 and large-scale tiles, VC-1 and MPEG-4 part 2 DXVA profiles, decode-time conversion and histograms, protected
+  HEVC 4:2:2 / 4:4:4 and above 10 bits (the range extension profiles; their SPS / PPS extensions are not read), AV1 profiles 1 and 2 and large-scale tiles, VC-1 and MPEG-4 part 2 DXVA profiles, decode-time conversion and histograms, protected
   content (crypto sessions and authenticated channels are refused), shared planar textures, placed planar resources, views of several slices of a planar texture.
 - Tests: `tests/run_host_tests.sh DxvaDecoderTest VideoProcessTest DxgkrnlTest` (every codec bit for bit with ffmpeg; the DXVA buffers filled as ffmpeg's dxva2_*.c
-  fill them), `tests/emulated_dx.sh tests/windows/d3d12videotest.c` and `d3d11videotest.c` (H.264 decoded through both APIs, bit for bit with ffmpeg; the processor
-  against BT.709), `tests/d3d12_qemu.sh d3d12videotest`, `tests/wow64_qemu.sh d3d12videotest d3d11videotest` (32-bit).
+  fill them; HEVC Main 10 over tests/data/hevc10_*.h265, scripts/gen_hevc10_test_streams.sh, with the PCM stream of scripts/gen_hevc10_pcm_stream.py),
+  `tests/emulated_dx.sh tests/windows/d3d12videotest.c` and `d3d11videotest.c` (H.264 decoded through both APIs, bit for bit with ffmpeg; HEVC Main 10 into P010 from
+  the recorded DXVA calls of tests/windows/hevc10_dxva.h, made by `DXVA_HEVC10_DUMP=... DxvaDecoderTest`; the processor against BT.709), `tests/d3d12_qemu.sh d3d12videotest`, `tests/wow64_qemu.sh d3d12videotest d3d11videotest` (32-bit).
 
 ## Not done
 
