@@ -135,7 +135,10 @@ struct M4Buffers {
   }
 };
 
-enum M4Mode { kM4StartCode = 0, kM4AfterStartCode = 1, kM4Split = 2 };
+// How a plane is handed over: from its start code; after it (the first macroblock at wMBbitOffset); in two pieces; from its start code with TRB[0] / TRD[0] in
+// field periods (the DXVA specification's text, 3.3, rather than ticks of the time base); from its start code with an S plane's vop_coding_type 1 (the
+// specification's "shall not be 3").
+enum M4Mode { kM4StartCode = 0, kM4AfterStartCode = 1, kM4Split = 2, kM4FieldPeriods = 3, kM4GmcAsP = 4 };
 
 static M4Buffers m4_fill(const M4Stream& s, const M4Plane& p, uint16_t cur, uint16_t fwd, uint16_t bwd, uint16_t feedback, M4Mode mode) {
   M4Buffers b;
@@ -160,7 +163,7 @@ static M4Buffers m4_fill(const M4Stream& s, const M4Plane& p, uint16_t cur, uint
     const mpeg4::Vol& v = p.vol;
     const mpeg4::VopHeader& h = p.header;
     const bool b_plane = h.type == mpeg4::VopType::B;
-    pp.vop_coding_type = static_cast<uint8_t>(h.type);
+    pp.vop_coding_type = static_cast<uint8_t>(mode == kM4GmcAsP && h.type == mpeg4::VopType::S ? 1 : static_cast<int>(h.type));
     pp.vop_quant = h.quant;
     pp.wForwardRefPictureIndex = h.type != mpeg4::VopType::I ? fwd : 0xFFFF;
     pp.wBackwardRefPictureIndex = b_plane ? bwd : 0xFFFF;
@@ -170,6 +173,10 @@ static M4Buffers m4_fill(const M4Stream& s, const M4Plane& p, uint16_t cur, uint
       pp.TRD[0] = static_cast<uint32_t>(p.pp_time);
       pp.TRB[1] = static_cast<uint32_t>(p.pb_field_time);
       pp.TRD[1] = static_cast<uint32_t>(p.pp_field_time);
+      if (mode == kM4FieldPeriods) {
+        pp.TRB[0] = pp.TRB[1];
+        pp.TRD[0] = pp.TRD[1];
+      }
     }
     uint16_t f = 0;
     if (v.interlaced) f |= dxva::kMpeg4PicInterlaced;
@@ -192,13 +199,14 @@ static M4Buffers m4_fill(const M4Stream& s, const M4Plane& p, uint16_t cur, uint
     if (h.type == mpeg4::VopType::S)
       for (int i = 0; i < 3; ++i)
         for (int c = 0; c < 2; ++c) pp.warping_mv[i][c] = static_cast<int16_t>(h.sprite_trajectory[i][c]);
-    pp.wFcodeBitFields = static_cast<uint8_t>((h.type != mpeg4::VopType::I ? h.fcode_forward : 0) | (b_plane ? h.fcode_backward : 0) << 3);
+    // (3.3: an f_code the plane does not have is 1; 4.2: both matrices for every picture, all 16 under the H.263 quantiser)
+    pp.wFcodeBitFields = static_cast<uint8_t>((h.type != mpeg4::VopType::I ? h.fcode_forward : 1) | (b_plane ? h.fcode_backward : 1) << 3);
     for (int m = 0; m < 2; ++m) {
       b.qm.bNewQmatrix[m] = 1;
-      for (int i = 0; i < 64; ++i) b.qm.Qmatrix[m][i] = m ? v.non_intra_matrix[i] : v.intra_matrix[i];
+      for (int i = 0; i < 64; ++i) b.qm.Qmatrix[m][i] = !v.quant_type_mpeg ? 16 : m ? v.non_intra_matrix[i] : v.intra_matrix[i];
     }
   }
-  const size_t skip = !p.is_short && mode != kM4StartCode ? 4 : 0;   // (the start code)
+  const size_t skip = !p.is_short && (mode == kM4AfterStartCode || mode == kM4Split) ? 4 : 0;   // (the start code)
   std::vector<uint8_t> data(s.bytes.begin() + long(p.start + skip), s.bytes.begin() + long(p.end));
   const uint32_t mb_offset = p.is_short ? uint32_t(p.short_header.header_bits) : uint32_t(p.header.header_bits) + (skip ? 0 : 32);
   if (mode == kM4Split && data.size() > 8) {
@@ -372,6 +380,8 @@ static void m4_test_stream(const char* file, const char* reference) {
     CHECK(m4_run(a, profile, s, kM4AfterStartCode, false).decoded == run.decoded);
     CHECK(m4_run(a, profile, s, kM4Split, false).decoded == run.decoded);
     CHECK(m4_run(a, profile, s, kM4StartCode, true).decoded == run.decoded);
+    CHECK(m4_run(a, profile, s, kM4FieldPeriods, false).decoded == run.decoded);
+    if (profile == DxvaProfile::Mpeg4Pt2AdvSimpleGmc) CHECK(m4_run(a, profile, s, kM4GmcAsP, false).decoded == run.decoded);
     // The GMC profile takes every stream the others take.
     if (profile != DxvaProfile::Mpeg4Pt2AdvSimpleGmc) CHECK(m4_run(a, DxvaProfile::Mpeg4Pt2AdvSimpleGmc, s, kM4StartCode, false).decoded == run.decoded);
   }
@@ -469,20 +479,35 @@ static void m4_test_refusals() {
     if (bi >= s.planes.size() || pi >= s.planes.size()) return;
     const M4Buffers ib = m4_fill(s, s.planes[0], 0, 0xFFFF, 0xFFFF, 1, kM4StartCode);
     CHECK(asp->decode(ib.view(), &out) == DxvaResult::Ok);
-    // A B plane with the Simple profile; GMC without the GMC profile; static sprites; reduced resolution; post-processing.
+    // A B plane with the Simple profile; GMC without the GMC profile; static sprites (no DXVA MPEG-4 profile has them); reduced resolution; post-processing,
+    // which the configuration does not offer.
     const M4Buffers bb = m4_fill(s, s.planes[bi], 1, 0, 2, 2, kM4StartCode);
     CHECK(simple->decode(bb.view(), &out) == DxvaResult::Invalid);
     const M4Buffers gi = m4_fill(g, g.planes[0], 0, 0xFFFF, 0xFFFF, 1, kM4StartCode);
     CHECK(asp->decode(gi.view(), &out) == DxvaResult::Invalid);
     M4Buffers c = ib;
     c.pp.wSpriteBitFields = 1;
-    CHECK(asp->decode(c.view(), &out) == DxvaResult::Unsupported && out.detail);
+    CHECK(asp->decode(c.view(), &out) == DxvaResult::Invalid && out.detail);
     c = ib;
     c.pp.wPicFlagBitFields |= dxva::kMpeg4PicReducedResolution;
     CHECK(asp->decode(c.view(), &out) == DxvaResult::Unsupported);
     c = ib;
     c.pp.wPicFlagBitFields |= 1;
-    CHECK(asp->decode(c.view(), &out) == DxvaResult::Unsupported);
+    CHECK(asp->decode(c.view(), &out) == DxvaResult::Invalid);
+    // A P plane whose bitstream header says S, in a layer without GMC: not the plane the parameters describe.
+    {
+      c = m4_fill(g, g.planes[0], 0, 0xFFFF, 0xFFFF, 1, kM4StartCode);
+      size_t si = 0;
+      while (si < g.planes.size() && g.planes[si].header.type != mpeg4::VopType::S) ++si;
+      CHECK(si < g.planes.size());
+      if (si < g.planes.size()) {
+        UniquePointer<IDxvaDecoder> gmc = create_dxva_decoder(a, DxvaDecoderConfig{DxvaProfile::Mpeg4Pt2AdvSimpleGmc, g.width, g.height, 4, PixelFormat::Nv12});
+        CHECK(gmc && gmc->decode(c.view(), &out) == DxvaResult::Ok);
+        M4Buffers sp = m4_fill(g, g.planes[si], 1, 0, 0xFFFF, 2, kM4GmcAsP);
+        sp.pp.wSpriteBitFields = 0;   // (the layer has no GMC: the header in the bitstream cannot be read as the parameters say)
+        CHECK(gmc && gmc->decode(sp.view(), &out) == DxvaResult::Invalid);
+      }
+    }
     // The header in the bitstream is not the parameters' (another quantiser); TRB not below TRD; a version 1 layer with quarter samples.
     c = ib;
     c.pp.vop_quant = static_cast<uint8_t>(c.pp.vop_quant == 31 ? 30 : c.pp.vop_quant + 1);
@@ -508,6 +533,12 @@ static void m4_test_refusals() {
     c = m4_fill(s, s.planes[pi], 2, 0, 0xFFFF, 6, kM4AfterStartCode);
     c.pp.wPicFlagBitFields &= static_cast<uint16_t>(~dxva::kMpeg4PicVopCoded);
     CHECK(asp->decode(c.view(), &out) == DxvaResult::Ok && m4_i420(out.frame) == intra);
+    // ... also when it comes without slice control and bitstream (there is nothing to parse); a coded plane without them is refused.
+    c.slices.clear();
+    c.bitstream.clear();
+    CHECK(asp->decode(c.view(), &out) == DxvaResult::Ok && m4_i420(out.frame) == intra);
+    c.pp.wPicFlagBitFields |= dxva::kMpeg4PicVopCoded;
+    CHECK(asp->decode(c.view(), &out) == DxvaResult::Invalid);
     // After reset() the reference is gone.
     asp->reset();
     pb = m4_fill(s, s.planes[pi], 1, 0, 0xFFFF, 7, kM4StartCode);

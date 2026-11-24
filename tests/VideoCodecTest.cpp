@@ -27,6 +27,7 @@
 #include "Hardware/VideoCodec/Software/H264Encoder.hpp"
 #include "Hardware/VideoCodec/Software/H264Parser.hpp"
 #include "Hardware/VideoCodec/Software/Jpeg.hpp"
+#include "Hardware/VideoCodec/Software/Mpeg4.hpp"
 #include "Hardware/VideoCodec/Software/SoftwareVideoCodec.hpp"
 #include "Hardware/VideoCodec/Software/Vp8.hpp"
 #include "Hardware/VideoCodec/Software/Av1.hpp"
@@ -42,6 +43,11 @@
 #include "Utility/Crc32.hpp"
 
 using namespace hardware;
+
+// (the kernel clock, which the secondary GPU drivers that the codec list brings along read: the tests need none)
+namespace hardware {
+uint64_t uptime_us() { return 0; }
+}  // namespace hardware
 
 struct TestAllocator final : allocators::IAllocator {
   int live = 0; bool fail = false;
@@ -2100,7 +2106,11 @@ static void test_mpeg4() {
                         {"h263dec_plus.h263", VideoCodec::H263, 112, 80, 8},      {"m4vdec_rvlc.m4v", VideoCodec::Mpeg4, 48, 32, 4},
                         // (PB-frames, Improved PB-frames and B pictures: streams and pictures from scripts/gen_h263_bframe_streams.py's model of the Recommendation)
                         {"h263dec_pb.h263", VideoCodec::H263, 128, 96, 9},        {"h263dec_ipb.h263", VideoCodec::H263, 128, 96, 9},
-                        {"h263dec_b.h263", VideoCodec::H263, 128, 96, 5}};
+                        {"h263dec_b.h263", VideoCodec::H263, 128, 96, 5},
+                        // (static sprites, 0 .. 4 warping points, brightness change: streams and pictures from scripts/gen_mpeg4_sprite_streams.py's model of 7.8)
+                        {"m4vdec_sprite_p0.m4v", VideoCodec::Mpeg4, 48, 32, 2},   {"m4vdec_sprite_p1.m4v", VideoCodec::Mpeg4, 40, 24, 5},
+                        {"m4vdec_sprite_p2.m4v", VideoCodec::Mpeg4, 48, 32, 3},   {"m4vdec_sprite_p3.m4v", VideoCodec::Mpeg4, 48, 32, 3},
+                        {"m4vdec_sprite_p4.m4v", VideoCodec::Mpeg4, 48, 32, 3}};
   TestAllocator a;
   for (const Case& c : cases) {
     const std::vector<uint8_t> stream = read_data_file(c.name);
@@ -2199,12 +2209,79 @@ static void test_h263_obmc() {
   CHECK(a.live == 0);
 }
 
+// Static sprites beyond the pictures of test_mpeg4: a low latency sprite layer is refused; S planes without their sprite (the stream joined after its I plane)
+// give nothing; the sprite outlives reset() (a seek: the layer sends it only once), so the S planes after it come out as before; a new layer header drops it.
+static void test_mpeg4_sprites() {
+  TestAllocator a;
+  {
+    const std::vector<uint8_t> stream = read_data_file("m4vdec_sprite_lowlatency.m4v");
+    CHECK(!stream.empty());
+    const Mpeg4Run run = mpeg4_run(a, VideoCodec::Mpeg4, stream, nullptr, 0, 0);
+    CHECK(!run.decoded_all && run.frames == 0);
+  }
+  const std::vector<uint8_t> stream = read_data_file("m4vdec_sprite_p4.m4v"), ref = read_data_file("m4vdec_sprite_p4.yuv");
+  CHECK(!stream.empty() && !ref.empty());
+  if (stream.empty() || ref.empty()) return;
+  const std::vector<std::pair<size_t, size_t>> units = split_mpeg4(stream);   // [0]: the headers and the sprite; [1..3]: the S planes
+  CHECK(units.size() == 4);
+  if (units.size() != 4) return;
+  // The headers alone (the I plane cut off), then the S planes: no picture.
+  size_t vop = 0;
+  for (size_t i = units[0].first; i + 3 < units[0].second; ++i)
+    if (stream[i] == 0 && stream[i + 1] == 0 && stream[i + 2] == 1 && stream[i + 3] == 0xB6) {
+      vop = i;
+      break;
+    }
+  CHECK(vop > 0);
+  {
+    std::vector<uint8_t> joined(stream.begin(), stream.begin() + static_cast<long>(vop));
+    joined.insert(joined.end(), stream.begin() + static_cast<long>(units[1].first), stream.end());
+    const Mpeg4Run run = mpeg4_run(a, VideoCodec::Mpeg4, joined, nullptr, 0, 0);
+    CHECK(run.frames == 0);
+  }
+  {
+    const size_t frame_bytes = 48 * 32 * 3 / 2;
+    Mpeg4Decoder dec(a);
+    VideoFrame f;
+    CHECK(dec.decode(ConstByteView(stream.data(), units[0].second), 0) && !dec.receive(&f));   // (the sprite is not shown)
+    int frames = 0;
+    bool same = true;
+    auto take = [&](size_t u) {
+      CHECK(dec.decode(ConstByteView(stream.data() + units[u].first, units[u].second - units[u].first), static_cast<int64_t>(u)));
+      while (dec.receive(&f)) {
+        const uint8_t* r = ref.data() + static_cast<size_t>(u - 1) * frame_bytes;
+        CHECK(f.format.width == 48 && f.format.height == 32 && !f.keyframe);
+        for (uint32_t y = 0; y < 32; ++y) same = same && memcmp(f.plane[0] + y * f.stride[0], r + y * 48, 48) == 0;
+        for (int c = 1; c < 3; ++c)
+          for (uint32_t y = 0; y < 16; ++y) same = same && memcmp(f.plane[c] + y * f.stride[c], r + 48 * 32 + (c - 1) * 24 * 16 + y * 24, 24) == 0;
+        ++frames;
+      }
+    };
+    take(1);
+    dec.reset();
+    take(2);
+    take(3);
+    CHECK(frames == 3 && same);
+    // A new layer header without its sprite: the S planes give nothing.
+    size_t vol = 0;
+    for (size_t i = 0; i + 3 < units[0].second; ++i)
+      if (stream[i] == 0 && stream[i + 1] == 0 && stream[i + 2] == 1 && stream[i + 3] == 0x20) {
+        vol = i;
+        break;
+      }
+    CHECK(dec.decode(ConstByteView(stream.data() + vol, vop - vol), 10));
+    CHECK(dec.decode(ConstByteView(stream.data() + units[1].first, units[1].second - units[1].first), 11) && !dec.receive(&f));
+  }
+  CHECK(a.live == 0);
+}
+
 // Cut-short and bit-flipped streams: every packet of a stream cut at many points, and copies of the whole stream with bits flipped, decode without a fault (the
 // sanitizers watch) and leave nothing allocated.
 static void test_mpeg4_robustness() {
   TestAllocator a;
   const char* names[] = {"m4vdec_packets.m4v", "m4vdec_bframes.m4v",     "m4vdec_qpel.m4v",   "m4vdec_interlaced.m4v", "m4vdec_xvid.m4v",
-                         "m4vdec_partitioned.m4v", "m4vdec_gmc.m4v", "m4vdec_rvlc.m4v", "h263dec_ip.h263", "h263dec_plus.h263",     "h263dec_obmcplus.h263", "h263dec_pb.h263", "h263dec_ipb.h263", "h263dec_b.h263"};
+                         "m4vdec_partitioned.m4v", "m4vdec_gmc.m4v", "m4vdec_rvlc.m4v", "h263dec_ip.h263", "h263dec_plus.h263",     "h263dec_obmcplus.h263", "h263dec_pb.h263", "h263dec_ipb.h263", "h263dec_b.h263",
+                         "m4vdec_sprite_p1.m4v", "m4vdec_sprite_p2.m4v", "m4vdec_sprite_p3.m4v", "m4vdec_sprite_p4.m4v"};
   uint32_t seed = 12345;
   auto random = [&seed]() {
     seed = seed * 1103515245u + 12345u;
@@ -2285,6 +2362,7 @@ int main() {
   test_vp8_robustness();
   test_mpeg4();
   test_h263_obmc();
+  test_mpeg4_sprites();
   test_mpeg4_robustness();
   if (g_failed) { printf("%d check(s) failed\n", g_failed); return 1; }
   printf("video codec tests passed\n");

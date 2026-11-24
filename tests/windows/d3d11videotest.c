@@ -706,8 +706,9 @@ static void test_decoder_caps(void) {
         "the VC-1 configuration: one, ConfigBitstreamRaw 1 (what ffmpeg's dxva2_vc1.c takes)");
   D3D11_VIDEO_DECODER_DESC mpeg4_desc = {D3D11_DECODER_PROFILE_MPEG4PT2_VLD_ADVSIMPLE_GMC, 352, 288, DXGI_FORMAT_NV12};
   check(SUCCEEDED(ID3D11VideoDevice_GetVideoDecoderConfigCount(g_vdevice, &mpeg4_desc, &configs)) && configs == 1 &&
-            SUCCEEDED(ID3D11VideoDevice_GetVideoDecoderConfig(g_vdevice, &mpeg4_desc, 0, &c)) && c.ConfigBitstreamRaw == 1,
-        "the MPEG-4 Part 2 (GMC) configuration: one, ConfigBitstreamRaw 1");
+            SUCCEEDED(ID3D11VideoDevice_GetVideoDecoderConfig(g_vdevice, &mpeg4_desc, 0, &c)) && c.ConfigBitstreamRaw == 1 && !c.ConfigResidDiffAccelerator &&
+            !c.ConfigHostInverseScan && !c.ConfigSpecificIDCT && !c.ConfigDecoderSpecific && !c.ConfigMBcontrolRasterOrder && !c.ConfigResidDiffHost,
+        "the MPEG-4 Part 2 (GMC) configuration: one, ConfigBitstreamRaw 1, the residual-difference fields 0 (DXVA MPEG-4 Part 2 specification 2.2)");
   check(SUCCEEDED(ID3D11VideoDevice_CheckVideoDecoderFormat(g_vdevice, &D3D11_DECODER_PROFILE_VC1_VLD, DXGI_FORMAT_P010, &ok)) && !ok, "VC-1 does not decode into P010");
   D3D11_VIDEO_DECODER_DESC p010 = {D3D11_DECODER_PROFILE_H264_VLD_NOFGT, 64, 64, DXGI_FORMAT_P010};
   check(SUCCEEDED(ID3D11VideoDevice_GetVideoDecoderConfigCount(g_vdevice, &p010, &configs)) && configs == 0, "... no configuration of H.264 into P010");

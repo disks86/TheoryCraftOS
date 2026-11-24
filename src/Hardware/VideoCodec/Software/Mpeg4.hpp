@@ -22,8 +22,10 @@
 // matrices), AC/DC prediction, four motion vectors per macroblock, quarter-sample motion, unrestricted motion vectors, video packets (resync markers), data
 // partitioning with or without reversible VLCs, packed bitstreams (several planes in one packet), and interlaced video (field DCT, field motion vectors, field
 // direct mode); and H.263 with Annexes D (unrestricted vectors), F (advanced prediction: overlapped block motion compensation), I (advanced intra coding),
-// J (deblocking filter), K (slices), S (alternative inter VLC) and T (modified quantisation), at standard or custom sizes. Not covered: static sprites,
-// shapes, scalability, studio profiles, and H.263's PB and B pictures, arithmetic coding and reference picture selection or resampling. Pictures come out in
+// J (deblocking filter), K (slices), S (alternative inter VLC) and T (modified quantisation), at standard or custom sizes; and the Main profile's basic static
+// sprites of rectangular layers (7.8: the sprite as the layer's first, unshown, I plane; S planes warped from it with 0 to 4 warping points - perspective
+// included - and the brightness change). Not covered: low latency sprites (pieces and updates: such a layer is refused), shapes, scalability, studio profiles,
+// and H.263's arithmetic coding and reference picture selection or resampling. Pictures come out in
 // display order, cropped, as I420; each carries the time of the packet it came in (a packed bitstream's B picture: the time of the placeholder after it).
 //
 // The decoder follows FFmpeg's (which the encoders in use were tuned against) where the standard leaves room: the inverse transform is the integer "simple"

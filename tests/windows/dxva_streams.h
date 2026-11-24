@@ -1357,7 +1357,7 @@ static const unsigned char g_dxva_m4_default_inter[64] = {
 
 struct DxvaMpeg4State {
   int have_vol;
-  unsigned profile_and_level, verid, resolution, time_bits, width, height, interlaced, gmc, points, accuracy, quant_type, quarter_sample, resync_disable,
+  unsigned profile_and_level, vo_verid, verid, resolution, time_bits, width, height, interlaced, gmc, points, accuracy, quant_type, quarter_sample, resync_disable,
       partitioned, rvlc;
   unsigned char intra[64], inter[64];          /* scan order, as the stream sends them and DXVA_QmatrixData has them */
   long long time_base, last_time_base, time, last_non_b_time, pp_time, pb_time, t_frame;
@@ -1380,7 +1380,9 @@ static int dxva_mpeg4_vol(DxvaStream *s, size_t at, size_t end) {
   size_t pos = (at + 4) * 8;
   dxva_bits_at(d, end, &pos, 1);                                    /* random_accessible_vol */
   dxva_bits_at(d, end, &pos, 8);                                    /* video_object_type_indication */
-  m->verid = 1;
+  /* (without is_object_layer_identifier the layer's version is the visual object's: ISO/IEC 14496-2 6.3.3, and the DXVA MPEG-4 Part 2 specification's
+     video_object_layer_verid) */
+  m->verid = m->vo_verid ? m->vo_verid : 1;
   if (dxva_bits_at(d, end, &pos, 1)) { m->verid = dxva_bits_at(d, end, &pos, 4); dxva_bits_at(d, end, &pos, 3); }
   if (dxva_bits_at(d, end, &pos, 4) == 15) dxva_bits_at(d, end, &pos, 16);   /* aspect_ratio_info, par_width / par_height */
   if (dxva_bits_at(d, end, &pos, 1)) {                              /* vol_control_parameters */
@@ -1465,7 +1467,7 @@ static int dxva_mpeg4_vop(DxvaStream *s, DxvaPicture *p, size_t at, size_t end) 
     if (pp_field <= pb_field || pb_field <= 1) { pb_field = 2; pp_field = 4; }
   }
   if (!coded) return 0;
-  unsigned rounding = 0, tff = 0, alt = 0, fwd_code = 0, bwd_code = 0;
+  unsigned rounding = 0, tff = 0, alt = 0, fwd_code = 1, bwd_code = 1;   /* (1 where the plane has none: the DXVA specification, 3.3) */
   int trajectory[3][2] = {{0, 0}, {0, 0}, {0, 0}};
   if (type == 1 || type == 3) rounding = dxva_bits_at(d, end, &pos, 1);
   const unsigned dc_thr = dxva_bits_at(d, end, &pos, 3);
@@ -1535,7 +1537,8 @@ static int dxva_mpeg4_vop(DxvaStream *s, DxvaPicture *p, size_t at, size_t end) 
   DXVA_QmatrixData qm;
   memset(&qm, 0, sizeof qm);
   qm.bNewQmatrix[0] = qm.bNewQmatrix[1] = 1;
-  for (int i = 0; i < 64; ++i) { qm.Qmatrix[0][i] = m->intra[i]; qm.Qmatrix[1][i] = m->inter[i]; }
+  /* (4.2: both sent for every picture; all 16 when quant_type is 0 - the H.263 quantiser has no matrices) */
+  for (int i = 0; i < 64; ++i) { qm.Qmatrix[0][i] = m->quant_type ? m->intra[i] : 16; qm.Qmatrix[1][i] = m->quant_type ? m->inter[i] : 16; }
   cap = 0;
   free(s->qm);
   s->qm = NULL;
@@ -1586,6 +1589,9 @@ static int dxva_mpeg4_next(DxvaStream *s, DxvaPicture *p) {
     s->pos = end;
     if (code == 0xB0 && at + 4 < s->size) {
       m->profile_and_level = s->data[at + 4];
+    } else if (code == 0xB5 && at + 4 < s->size) {
+      /* visual object: is_visual_object_identifier, visual_object_verid */
+      m->vo_verid = (s->data[at + 4] & 0x80) ? (unsigned)(s->data[at + 4] >> 3 & 15) : 1;
     } else if (code >= 0x20 && code <= 0x2F) {
       if (!dxva_mpeg4_vol(s, at, end)) return -1;
     } else if (code == 0xB6) {

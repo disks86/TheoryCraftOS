@@ -128,14 +128,33 @@ bool parse_vol(ConstByteView body, uint8_t profile_and_level, Vol* vol) {
   if (v.width == 0 || v.height == 0) return false;
   v.interlaced = b.u(1) != 0;
   v.obmc_disable = b.u(1) != 0;
+  // sprite_enable (Table 6-19): a flag in a version 1 layer (1: static sprites), else 00 none, 01 static, 10 GMC, 11 reserved.
   const uint32_t sprite_enable = v.verid == 1 ? b.u(1) : b.u(2);
-  if (sprite_enable == 1 || sprite_enable == 3) return false;   // static sprites (and the reserved value)
-  if (sprite_enable == 2) {   // GMC
+  if (sprite_enable == 3) return false;
+  if (sprite_enable == 1) {   // static sprites (7.8)
+    v.static_sprite = true;
+    auto signed13 = [](uint32_t raw) { return static_cast<int32_t>(raw & 0xFFF) - static_cast<int32_t>(raw & 0x1000); };
+    v.sprite_width = b.u(13);
+    b.marker();
+    v.sprite_height = b.u(13);
+    b.marker();
+    v.sprite_left = signed13(b.u(13));
+    b.marker();
+    v.sprite_top = signed13(b.u(13));
+    b.marker();
+    if (v.sprite_width == 0 || v.sprite_height == 0) return false;
+    v.warping_points = static_cast<uint8_t>(b.u(6));
+    if (v.warping_points > 4) return false;   // (0 stationary, 1 translation, 2 and 3 affine, 4 perspective)
+    v.warping_accuracy = static_cast<uint8_t>(b.u(2));
+    v.sprite_brightness_change = b.u(1) != 0;
+    // low_latency_sprite_enable: low latency sprites (the sprite sent in pieces and updates inside S planes, sprite_transmit_mode) are not decoded.
+    if (b.u(1)) return false;
+  } else if (sprite_enable == 2) {   // GMC
     v.gmc = true;
     v.warping_points = static_cast<uint8_t>(b.u(6));
     if (v.warping_points > 3) return false;
     v.warping_accuracy = static_cast<uint8_t>(b.u(2));
-    if (b.u(1)) return false;   // sprite_brightness_change
+    if (b.u(1)) return false;   // sprite_brightness_change (not with GMC: the M4IF interoperability clarification)
   }
   if (b.u(1)) return false;                                  // not_8_bit
   v.quant_type_mpeg = b.u(1) != 0;
@@ -203,9 +222,10 @@ bool parse_vop_full(ConstByteView body, const Vol& vol, VopHeader* header) {
   b.marker();
   h.coded = b.u(1) != 0;
   if (!b.ok()) return false;
-  if (h.type == VopType::S && !vol.gmc) return false;
+  if (h.type == VopType::S && !vol.gmc && !vol.static_sprite) return false;
+  if (vol.static_sprite && (h.type == VopType::P || h.type == VopType::B)) return false;   // (7.8.1: an I plane, the sprite, then S planes only)
   if (h.coded) {
-    if (h.type == VopType::P || h.type == VopType::S) h.rounding_type = b.u(1) != 0;
+    if (h.type == VopType::P || (h.type == VopType::S && vol.gmc)) h.rounding_type = b.u(1) != 0;
     h.intra_dc_vlc_thr = static_cast<uint8_t>(b.u(3));
     if (vol.interlaced) {
       h.top_field_first = b.u(1) != 0;
@@ -238,6 +258,28 @@ bool parse_vop_full(ConstByteView body, const Vol& vol, VopHeader* header) {
           h.sprite_trajectory[i][c] = value;
           b.marker();
         }
+      }
+      if (vol.static_sprite) {
+        // brightness_change_factor() (Table B-34): a length code 0, 10, 110, 1110, 1111, then 5, 6, 7, 9 or 10 bits: -16..-1 / 1..16, -48..-17 / 17..48,
+        // -112..-49 / 49..112, 113..624, 625..1648 (0 is not in the table).
+        if (vol.sprite_brightness_change) {
+          uint32_t prefix = 0;
+          while (prefix < 4 && b.u(1)) ++prefix;
+          static const uint8_t kBits[5] = {5, 6, 7, 9, 10};
+          static const int32_t kLow[3] = {16, 48, 112};
+          const uint32_t raw = b.u(kBits[prefix]);
+          if (prefix < 3) {
+            const uint32_t half = 1u << (kBits[prefix] - 1);
+            h.brightness_change_factor = raw < half ? static_cast<int32_t>(raw) - kLow[prefix] : static_cast<int32_t>(raw) - 15;
+          } else {
+            h.brightness_change_factor = static_cast<int32_t>(raw) + (prefix == 3 ? 113 : 625);
+          }
+        }
+        // (low latency sprites would have their pieces here.) next_start_code(): the S plane of a static sprite has nothing more.
+        if (!b.ok()) return false;
+        h.header_bits = b.position();
+        *header = h;
+        return true;
       }
     }
     h.quant = static_cast<uint8_t>(b.u(5));   // quant_precision is 5 for 8-bit video
@@ -409,7 +451,7 @@ bool parse_packet(ConstByteView data, const Vol* current, Packet* packet) {
       profile_and_level = body[0];
     } else if (code >= 0x20 && code <= 0x2F) {
       Vol v;
-      if (!parse_vol(body, profile_and_level, &v) || v.gmc) return false;   // (this parse takes no sprites at all)
+      if (!parse_vol(body, profile_and_level, &v) || v.gmc || v.static_sprite) return false;   // (this parse takes no sprites at all)
       out.vol = v;
       out.has_vol = true;
       vol = &out.vol;

@@ -26,10 +26,40 @@
 // the parameters say; otherwise the data begins where the header would and the first macroblock is wMBbitOffset bits into it, and the header is the parameters'.
 // A short video header picture (short_video_header 1: H.263 baseline) is sent from its picture start code and its header is read from it.
 //
-// Planes with vop_coded 0 repeat their forward reference. Not decoded, refused as Unsupported: reduced resolution planes, static sprites, post-processing into
-// wDeblockedPictureIndex (unPicPostProc). The tools a profile does not have are refused as Invalid with that profile: B and S planes, quarter samples, interlace and
-// the MPEG quantiser with the Simple profile, S planes (GMC) without the GMC profile. Xvid streams are decoded with the standard IDCT (the stream's user data that
-// makes a software decoder choose Xvid's is not sent through DXVA), as hardware decoders do.
+// Planes with vop_coded 0 repeat their forward reference (they may come without slice control and bitstream: there is nothing to parse). Not decoded, refused
+// as Unsupported: reduced resolution planes. The tools a profile does not have are refused as Invalid with that profile: B and S planes, quarter samples,
+// interlace and the MPEG quantiser with the Simple profile, S planes (GMC) without the GMC profile. Xvid streams are decoded with the standard IDCT (the stream's
+// user data that makes a software decoder choose Xvid's is not sent through DXVA), as hardware decoders do.
+//
+// The conventions, checked against Microsoft's "DirectX Video Acceleration Specification of Off-Host VLD Mode for MPEG-4 Part 2 Video Decoding" (March 2011,
+// DXVA_MPEG4pt2_VLD.pdf; section numbers are its own):
+// - 3.2: the structure and its bit fields are DxvaTypesMpeg4.hpp's. 3.3 says vop_coding_type "shall not be 3" (it reasons that the Simple and Advanced Simple
+//   profiles have no S planes, overlooking GMC, which section 1.6 and vop_rounding_type's "S(GMC)-VOPs" do have): an S (GMC) plane may come as 3 or, from a
+//   host that follows that sentence, as 1 (P) - then the plane header in the bitstream (from its start code) says S, and the plane is decoded as the S plane
+//   it is. Without the start code a 1 is a P plane.
+// - 3.3 TRB / TRD: "distances in time expressed in field periods", [0] for the top field and [1] for the bottom one. The field-dependent part of interlaced
+//   direct mode (the field a co-located vector points to: ISO/IEC 14496-2 7.7.2.2) is per macroblock, so the two picture-level values are the same and the
+//   accelerator adds that part. This decoder takes [0] as the distances of frame direct mode and [1] as the field distances (in field periods); for [0] it
+//   accepts either ticks of the time base (as FFmpeg's decoder computes TRB and TRD) or field periods (the text): for a stream of constant frame rate the two
+//   are proportional, and direct mode only uses their ratio (TRB * MV / TRD, truncating), so the pictures are the same.
+// - 4.2: DXVA_QmatrixData is sent for every picture with bNewQmatrix[0] = bNewQmatrix[1] = 1 (16s when quant_type is 0), in the order the layer header sends
+//   them (zigzag scan), [2] and [3] 0 (no chrominance matrices in these profiles; ignored). A picture without the buffer keeps the matrices of the last one.
+// - 5: DXVA_SliceInfo as for the other codecs: the data of a plane from its start code (00 00 01 B6), one or more pieces (video packets), whose
+//   dwSliceDataLocation / dwSliceBitsInBuffer locate them; wMBbitOffset of the first counts from the start of its data (with the start code: 32 + the header
+//   bits). The decoder reads the plane header from the data itself when the start code is there; without it (a host that sends the data after the plane
+//   header) the first macroblock is wMBbitOffset bits into the data. wHorizontalPosition / wVerticalPosition / wNumberMBsInSlice / wQuantizerScaleCode are
+//   not needed: the video packets carry their own macroblock_number and quant_scale. The bitstream buffer may be padded to 128 bytes (1.8); the padding is
+//   outside the pieces.
+// - 3.3: wForwardRefPictureIndex is the past anchor (P, S: the anchor; B: the older one), wBackwardRefPictureIndex the future one (B only; direct mode reads the
+//   macroblock modes and vectors kept with that surface); 0xFFFF where not used.
+// - 2.2 / 3.3 / Annex A: no deblocking or deringing (ConfigDecoderSpecific 0), so unPicPostProc must be 0 and the output is wDecodedPictureIndex alone; a
+//   picture that asks for post-processing is refused as Invalid.
+// - Static sprites (sprite_enable 1, "static"): they belong to the Main profile, not to the Simple or Advanced Simple profiles these three profiles are for
+//   (7.1: the NoGMC profile says sprite_enable shall be 0; 7.2: the GMC profile is the Advanced Simple profile's tools), and the structure cannot express them
+//   (no sprite_width / height / left / top, no brightness change factor, no low latency pieces). Refused as Invalid. (The CPU decoder decodes them.)
+// - 7: the profile GUIDs are D3D11_DECODER_PROFILE_MPEG4PT2_VLD_SIMPLE {EFD64D74-C9E8-41D7-A5E9-E9B0E39FA319}, _ADVSIMPLE_NOGMC
+//   {ED418A9F-010D-4EDA-9AE3-9A65358D8D2E} and _ADVSIMPLE_GMC {AB998B5B-4258-44A9-9FEB-94E597A6BAAE} (d3d11 / d3d12 video.inc); ConfigBitstreamRaw 1 and
+//   every residual-difference field 0 (2.2).
 #include "Hardware/VideoCodec/Dxva/DxvaCodecs.hpp"
 #include "Hardware/VideoCodec/Dxva/DxvaSurfaces.hpp"
 #include "Hardware/VideoCodec/Dxva/DxvaTypesMpeg4.hpp"
@@ -161,7 +191,6 @@ DxvaResult DxvaMpeg4Decoder::decode(const DxvaPicture& picture, DxvaDecodedPictu
   PicParamsMpeg4Part2 pp;
   if (picture.picture_parameters.size() < sizeof(PicParamsMpeg4Part2) || !dxva::read_mpeg4_picture_parameters(picture.picture_parameters, &pp))
     return refuse(out, DxvaResult::Invalid, "the picture parameters are missing or shorter than DXVA_PicParams_MPEG4_PART2");
-  if (picture.slice_control.empty() || picture.bitstream.empty()) return refuse(out, DxvaResult::Invalid, "no slice control or bitstream buffer");
   out->surface = pp.wDecodedPictureIndex;
 
   // --- what the plane is
@@ -170,7 +199,8 @@ DxvaResult DxvaMpeg4Decoder::decode(const DxvaPicture& picture, DxvaDecodedPictu
   if (pp.short_video_header > 1) return refuse(out, DxvaResult::Invalid, "short_video_header is not 0 or 1");
   if (pp.vop_coding_type > 3) return refuse(out, DxvaResult::Invalid, "vop_coding_type is not 0 .. 3");
   const mpeg4::VopType type = static_cast<mpeg4::VopType>(pp.vop_coding_type);
-  if ((flags & dxva::kMpeg4PicPostProcMask) != 0) return refuse(out, DxvaResult::Unsupported, "post-processing (unPicPostProc: deblocking or deringing into wDeblockedPictureIndex)");
+  if ((flags & dxva::kMpeg4PicPostProcMask) != 0)
+    return refuse(out, DxvaResult::Invalid, "post-processing (unPicPostProc) that the configuration does not offer (ConfigDecoderSpecific 0: no deblocking or deringing)");
   const bool simple = config_.profile == DxvaProfile::Mpeg4Pt2Simple, gmc_profile = config_.profile == DxvaProfile::Mpeg4Pt2AdvSimpleGmc;
   const uint32_t sprite_enable = pp.wSpriteBitFields & dxva::kMpeg4SpriteEnableMask;
   const uint32_t warping_points = (pp.wSpriteBitFields >> dxva::kMpeg4SpritePointsShift) & 63, warping_accuracy = (pp.wSpriteBitFields >> dxva::kMpeg4SpriteAccuracyShift) & 3;
@@ -182,7 +212,8 @@ DxvaResult DxvaMpeg4Decoder::decode(const DxvaPicture& picture, DxvaDecodedPictu
     if (type != mpeg4::VopType::I && type != mpeg4::VopType::P) return refuse(out, DxvaResult::Invalid, "a short video header picture that is not I or P");
   } else {
     if ((flags & dxva::kMpeg4PicReducedResolution) != 0) return refuse(out, DxvaResult::Unsupported, "reduced resolution planes (reduced_resolution_vop_enable)");
-    if (sprite_enable == 1) return refuse(out, DxvaResult::Unsupported, "static sprites");
+    if (sprite_enable == 1)
+      return refuse(out, DxvaResult::Invalid, "static sprites (sprite_enable 1): a Main profile tool, which no DXVA MPEG-4 Part 2 profile has or can describe");
     if (sprite_enable == 3) return refuse(out, DxvaResult::Invalid, "sprite_enable 3 is reserved");
     if (sprite_enable == 2 && !gmc_profile) return refuse(out, DxvaResult::Invalid, "global motion compensation (sprite_enable 2) needs the ADVSIMPLE_GMC profile");
     if (sprite_enable == 2 && warping_points > 3) return refuse(out, DxvaResult::Invalid, "more than 3 warping points (the Advanced Simple profile has at most 3)");
@@ -196,6 +227,7 @@ DxvaResult DxvaMpeg4Decoder::decode(const DxvaPicture& picture, DxvaDecodedPictu
     if (pp.vop_time_increment_resolution == 0) return refuse(out, DxvaResult::Invalid, "vop_time_increment_resolution is 0");
   }
   const bool coded = short_header || (flags & dxva::kMpeg4PicVopCoded) != 0;
+  if (coded && (picture.slice_control.empty() || picture.bitstream.empty())) return refuse(out, DxvaResult::Invalid, "no slice control or bitstream buffer");
   if (coded) {
     if (pp.vop_quant < 1 || pp.vop_quant > 31) return refuse(out, DxvaResult::Invalid, "vop_quant outside 1..31");
     if (!short_header && type != mpeg4::VopType::I && fcode_forward == 0) return refuse(out, DxvaResult::Invalid, "vop_fcode_forward is 0");
@@ -302,21 +334,28 @@ DxvaResult DxvaMpeg4Decoder::decode(const DxvaPicture& picture, DxvaDecodedPictu
     header.quant = pp.vop_quant;
     header.fcode_forward = static_cast<uint8_t>(type == mpeg4::VopType::I ? 1 : fcode_forward);
     header.fcode_backward = static_cast<uint8_t>(type == mpeg4::VopType::B ? fcode_backward : 1);
-    if (type == mpeg4::VopType::S)
+    auto take_trajectory = [&]() {
       for (uint32_t i = 0; i < 3; ++i)
         for (int c = 0; c < 2; ++c) header.sprite_trajectory[i][c] = i < vol.warping_points ? pp.warping_mv[i][c] : 0;
+    };
+    if (type == mpeg4::VopType::S) take_trajectory();
     header.header_bits = mb_bit_offset;
     if (with_start_code) {
       // The plane header is in the data: it must be the one the parameters describe.
       body = data.subview(4);
       mpeg4::VopHeader h;
       if (!mpeg4::parse_vop_header(body, vol, &h)) return refuse(out, DxvaResult::Invalid, "the plane header in the bitstream cannot be read with the layer the parameters describe");
+      if (h.type == mpeg4::VopType::S && type == mpeg4::VopType::P && vol.gmc) {
+        // An S (GMC) plane sent as a P plane, as the specification's "vop_coding_type shall not be 3" has it (see the top of the file).
+        header.type = mpeg4::VopType::S;
+        take_trajectory();
+      }
       bool same = h.type == header.type && h.coded == header.coded;
       if (same && h.coded) {
         same = h.rounding_type == header.rounding_type && h.intra_dc_vlc_thr == header.intra_dc_vlc_thr && h.quant == header.quant &&
                (type == mpeg4::VopType::I || h.fcode_forward == header.fcode_forward) && (type != mpeg4::VopType::B || h.fcode_backward == header.fcode_backward) &&
                (!interlaced || (h.top_field_first == header.top_field_first && h.alternate_vertical_scan == header.alternate_vertical_scan));
-        for (uint32_t i = 0; same && type == mpeg4::VopType::S && i < vol.warping_points; ++i)
+        for (uint32_t i = 0; same && header.type == mpeg4::VopType::S && i < vol.warping_points; ++i)
           same = h.sprite_trajectory[i][0] == header.sprite_trajectory[i][0] && h.sprite_trajectory[i][1] == header.sprite_trajectory[i][1];
       }
       if (!same) return refuse(out, DxvaResult::Invalid, "the plane header in the bitstream is not the one the picture parameters describe");

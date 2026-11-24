@@ -31,21 +31,22 @@ namespace dxva {
 
 struct __attribute__((packed)) PicParamsMpeg4Part2 {   // DXVA_PicParams_MPEG4_PART2
   uint8_t short_video_header;          // 1: an H.263 baseline picture (the short video header)
-  uint8_t vop_coding_type;             // 0 I, 1 P, 2 B, 3 S (GMC)
+  uint8_t vop_coding_type;             // 0 I, 1 P, 2 B, 3 S (GMC; also sent as 1 by a host that follows the specification's "shall not be 3": DxvaMpeg4.cpp)
   uint8_t vop_quant;
   uint16_t wDecodedPictureIndex;
   uint16_t wDeblockedPictureIndex;
   uint16_t wForwardRefPictureIndex;    // 0xFFFF: none
   uint16_t wBackwardRefPictureIndex;
   uint16_t vop_time_increment_resolution;
-  uint32_t TRB[2];                     // B: the distances of direct mode, [0] in ticks of the frames, [1] of the fields (interlaced direct mode)
+  uint32_t TRB[2];                     // B: the distances of direct mode; [0]: of frame direct mode, in ticks of the time base or (the specification's text)
+                                       // in field periods; [1]: of field direct mode (interlaced), in field periods (DxvaMpeg4.cpp)
   uint32_t TRD[2];
   uint16_t wPicFlagBitFields;          // kMpeg4Pic*
   uint8_t profile_and_level_indication;
   uint8_t video_object_layer_verid;
   uint16_t vop_width;                  // samples
   uint16_t vop_height;
-  uint16_t wSpriteBitFields;           // sprite_enable 1-0, no_of_sprite_warping_points 7-2, sprite_warping_accuracy 9-8
+  uint16_t wSpriteBitFields;           // sprite_enable 1-0 (1 static: refused, 2 GMC), no_of_sprite_warping_points 7-2, sprite_warping_accuracy 9-8
   int16_t warping_mv[4][2];            // S: the sprite trajectory's du, dv per warping point, as coded
   uint8_t wFcodeBitFields;             // vop_fcode_forward 2-0, vop_fcode_backward 5-3
   uint16_t StatusReportFeedbackNumber;

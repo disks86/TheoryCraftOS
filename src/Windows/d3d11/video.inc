@@ -572,6 +572,13 @@ static void video_config(const VideoCodec *codec, D3D11_VIDEO_DECODER_CONFIG *c)
   c->ConfigResidDiffAccelerator = 1;
   c->ConfigHostInverseScan = 1;
   c->ConfigSpecificIDCT = 2;
+  if (codec->status == VSTATUS_MPEG4) {
+    /* (the DXVA specification of MPEG-4 Part 2 VLD decoding, 2.2: every residual-difference field "shall be 0" - ConfigResidDiffAccelerator, and so
+     * ConfigHostInverseScan and ConfigSpecificIDCT; ConfigDecoderSpecific 0: no deblocking or deringing post-processing is offered) */
+    c->ConfigResidDiffAccelerator = 0;
+    c->ConfigHostInverseScan = 0;
+    c->ConfigSpecificIDCT = 0;
+  }
   c->ConfigMinRenderTargetBuffCount = 0;      /* (no surfaces beyond the stream's references: the decoder writes the output directly) */
 }
 static HRESULT STDMETHODCALLTYPE vdev_GetVideoDecoderConfigCount(ID3D11VideoDevice2 *p, const D3D11_VIDEO_DECODER_DESC *desc, UINT *count) {
