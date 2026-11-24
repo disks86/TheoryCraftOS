@@ -28,6 +28,7 @@
 #include "Graphics/GraphicsTypes.hpp"
 #include "Allocators/IAllocator.hpp"
 #include "Utility/AllocatedView.hpp"
+#include "Hardware/VideoCodec/Software/MotionEstimator.hpp"
 
 namespace hardware {
 
@@ -210,6 +211,62 @@ struct ToneMap {
     const double one = 1.0 - e2;
     const double e3 = e2 + min_lum * one * one * one * one;
     return pq_to_nits(e3 * src_range + src_lo);
+  }
+};
+
+// HDR10+'s tone mapping (ST 2094-40's basis OOTF, applied to the brightest channel as the standard's maxRGB): the content, normalized to its scene peak `ls` (the largest
+// maxscl), goes along the metadata's curve - a line from (0, 0) to the knee point (Kx, Ky), then the Bernstein-Bezier curve of the anchors from the knee to (1, 1) - to
+// the targeted display's peak `lt`. A display of another peak `ld` is met as ST 2094-40's display adaptation intends: one at least as bright as the scene peak shows
+// the content as it is; one between the target and the scene peak a mix of the curve and the content as it is, weighted by where it lies between them; one darker
+// than the target the curve followed by BT.2390's EETF from the target down to it. Without a curve (tone_mapping_flag 0) the scene peak drives BT.2390's EETF.
+struct DynamicToneMap {
+  double ls = 1000.0, lt = 1000.0, ld = 1000.0, kx = 0.0, ky = 0.0;
+  double p[17] = {};   // the Bezier control points P0 = 0 .. PN = 1 (N at most 16)
+  int n = 1;           // its order
+  bool curve = false, passthrough = false, mix = false, below = false;
+  double weight = 0.0;
+  ToneMap eetf;
+
+  void setup(const VpHdr10Plus& m, double black, double display_black, double display_peak) {
+    double peak = m.maxscl[0] > m.maxscl[1] ? m.maxscl[0] : m.maxscl[1];
+    if (m.maxscl[2] > peak) peak = m.maxscl[2];
+    ls = peak > 1.0 ? peak : 10000.0;
+    lt = m.target_peak > 0.0f ? m.target_peak : display_peak;
+    ld = display_peak;
+    passthrough = ld >= ls;
+    curve = m.tone_mapping && lt < ls;
+    if (!curve) {   // (no curve to follow: the scene peak onto the display)
+      eetf.setup(black, ls, display_black, ld);
+      return;
+    }
+    kx = m.knee_x;
+    ky = m.knee_y;
+    n = m.anchor_count + 1;
+    p[0] = 0.0;
+    for (int i = 1; i < n; ++i) p[i] = m.anchors[i - 1];
+    p[n] = 1.0;
+    mix = !passthrough && ld > lt;
+    weight = mix ? (ld - lt) / (ls - lt) : 0.0;
+    below = ld < lt;
+    if (below) eetf.setup(0.0, lt, display_black, ld);
+  }
+  double bezier(double t) const {   // sum C(n, k) t^k (1 - t)^(n - k) p[k], by de Casteljau's steps
+    double q[17];
+    for (int i = 0; i <= n; ++i) q[i] = p[i];
+    for (int r = 1; r <= n; ++r)
+      for (int i = 0; i <= n - r; ++i) q[i] = q[i] * (1.0 - t) + q[i + 1] * t;
+    return q[0];
+  }
+  double apply(double nits) const {
+    if (passthrough) return nits < ld ? nits : ld;
+    if (!curve) return eetf.apply(nits);
+    double x = nits / ls;
+    x = x < 0.0 ? 0.0 : x > 1.0 ? 1.0 : x;
+    const double y = x <= kx ? (kx > 0.0 ? ky / kx * x : 0.0) : ky + (1.0 - ky) * bezier((x - kx) / (1.0 - kx));
+    double out = y * lt;
+    if (mix) out = (1.0 - weight) * out + weight * (nits < ls ? nits : ls);
+    else if (below) out = eetf.apply(out);
+    return out < ld ? out : ld;
   }
 };
 
@@ -508,6 +565,7 @@ struct StreamEffects {
   bool luma_key = false;
   float luma_lower = 0.0f, luma_upper = 0.0f;
   VpHdrMetadata hdr, display;
+  const VpHdr10Plus* dynamic = nullptr;   // the picture's HDR10+ metadata (when present), or none
   bool procamp() const { return brightness != 0.0f || contrast != 1.0f || hue != 0.0f || saturation != 1.0f; }
 };
 
@@ -521,6 +579,9 @@ struct Conversion {
   double top = 1.0;          // the brightest linear light the output's transfer is given (HLG: scene light 1)
   bool tone_map = false;
   ToneMap curve;
+  bool dynamic = false;      // tone mapped by HDR10+ metadata (dynamic_curve rather than curve)
+  DynamicToneMap dynamic_curve;
+  double saturation = 1.0;   // HDR10+'s colour saturation weight: chroma in linear light around the luminance, after tone mapping
   float alpha_scale = 0.0f;  // 1 / the alpha code's maximum; 0 when the source has no alpha (alpha 1)
   bool key = false;          // luma key: the luma code (key_row . codes) within key_lo..key_hi is transparent
   float key_row[3] = {}, key_lo = 0.0f, key_hi = 0.0f;
@@ -540,8 +601,15 @@ struct Conversion {
       if (tone_map) {   // by the brightest channel: the hue is kept and no channel passes the display's peak
         const double peak = lin[0] > lin[1] ? (lin[0] > lin[2] ? lin[0] : lin[2]) : (lin[1] > lin[2] ? lin[1] : lin[2]);
         if (peak > 0.0) {
-          const double gain = curve.apply(peak * kWhite) / kWhite / peak;
+          const double gain = (dynamic ? dynamic_curve.apply(peak * kWhite) : curve.apply(peak * kWhite)) / kWhite / peak;
           for (double& v : lin) v *= gain;
+        }
+        if (saturation != 1.0) {   // (the luminance of the content's BT.2020 primaries)
+          const double y = 0.2627 * lin[0] + 0.6780 * lin[1] + 0.0593 * lin[2];
+          for (double& v : lin) {
+            v = y + (v - y) * saturation;
+            if (v < 0.0) v = 0.0;
+          }
         }
       }
       for (int i = 0; i < 3; ++i) mapped[i] = gamut[i][0] * lin[0] + gamut[i][1] * lin[1] + gamut[i][2] * lin[2];
@@ -622,6 +690,12 @@ Conversion make_conversion(const ImageAccess& src, const ImageAccess& dst, const
     if (content > out_peak * kWhite * 1.0001 || display_black > black) {
       c.tone_map = true;
       c.curve.setup(black, content, display_black, out_peak * kWhite);
+    }
+    if (fx.dynamic && fx.dynamic->present && c.from == Transfer::Pq) {   // (HDR10+ describes PQ content: its curve replaces the static levels')
+      c.tone_map = true;
+      c.dynamic = true;
+      c.dynamic_curve.setup(*fx.dynamic, black, display_black, out_peak * kWhite);
+      if (fx.dynamic->saturation_mapping) c.saturation = fx.dynamic->saturation_weight;
     }
   }
   c.linear = c.from != c.to || src.space.primaries != dst.space.primaries || c.tone_map;
@@ -923,14 +997,29 @@ bool hdr_ok(const VpHdrMetadata& m) {
 }
 // The ranges of a stream's interlacing, stereo and filter values (VpStream).
 bool stream_effects_ok(const VpStream& in) {
-  if (static_cast<uint8_t>(in.field_order) > static_cast<uint8_t>(VpFieldOrder::BottomFieldFirst) || static_cast<uint8_t>(in.deinterlace) > static_cast<uint8_t>(VpDeinterlace::Adaptive) ||
-      in.field > 1 || static_cast<uint8_t>(in.stereo) > static_cast<uint8_t>(VpStereoFormat::MonoOffset) || in.stereo_frame > 1)
+  if (static_cast<uint8_t>(in.field_order) > static_cast<uint8_t>(VpFieldOrder::BottomFieldFirst) ||
+      static_cast<uint8_t>(in.deinterlace) > static_cast<uint8_t>(VpDeinterlace::MotionCompensated) || in.field > 1 ||
+      static_cast<uint8_t>(in.stereo) > static_cast<uint8_t>(VpStereoFormat::MonoOffset) || in.stereo_frame > 1)
     return false;
-  if (in.stereo_offset < -65536 || in.stereo_offset > 65536) return false;
+  if (in.stereo_offset < -65536 || in.stereo_offset > 65536 || in.stereo_adjust < -65536 || in.stereo_adjust > 65536) return false;
+  if (static_cast<uint8_t>(in.temporal) > static_cast<uint8_t>(VpTemporal::InverseTelecine) || !finite_in(in.blend, 0.0f, 1.0f) || (in.auto_processing & ~kVpAutoAll)) return false;
+  if (in.temporal == VpTemporal::InverseTelecine &&
+      (in.ivtc_cycle < 1 || in.ivtc_cycle + 2u > kVpMaxTelecineFrames || in.ivtc_drop >= in.ivtc_cycle || in.ivtc_output >= in.ivtc_cycle - in.ivtc_drop))
+    return false;
   if (!finite_in(in.brightness, -100.0f, 100.0f) || !finite_in(in.contrast, 0.0f, 10.0f) || !finite_in(in.hue, -180.0f, 180.0f) || !finite_in(in.saturation, 0.0f, 10.0f) ||
       !finite_in(in.noise_reduction, 0.0f, 1.0f) || !finite_in(in.edge_enhancement, 0.0f, 1.0f) || !finite_in(in.anamorphic, 0.0f, 1.0f))
     return false;
   if (in.luma_key && !(finite_in(in.luma_lower, 0.0f, 1.0f) && finite_in(in.luma_upper, in.luma_lower, 1.0f))) return false;
+  const VpHdr10Plus& d = in.hdr10plus;
+  if (d.present) {
+    if (!finite_in(d.target_peak, 0.0f, 10000.0f) || d.anchor_count > 15 || !finite_in(d.knee_x, 0.0f, 1.0f) || !finite_in(d.knee_y, 0.0f, 1.0f) ||
+        !finite_in(d.saturation_weight, 0.0f, 8.0f))
+      return false;
+    for (float v : d.maxscl)
+      if (!finite_in(v, 0.0f, 10000.0f)) return false;
+    for (float v : d.anchors)
+      if (!finite_in(v, 0.0f, 1.0f)) return false;
+  }
   return hdr_ok(in.hdr);
 }
 
@@ -940,6 +1029,171 @@ bool vp_color_space_supported(VpFormat format, VpColorSpace space) {
   if (static_cast<uint8_t>(format) > static_cast<uint8_t>(kVpLastFormat)) return false;
   const SpaceInfo info = space_info(space);
   return info.known && info.yuv == vp_is_yuv(format);
+}
+
+namespace {
+// Bits of a byte string, most significant first; reading past its end sets `bad` and gives zeros.
+struct MetadataBits {
+  ConstByteView data;
+  uint64_t at = 0;
+  bool bad = false;
+  uint32_t read(uint32_t n) {
+    uint32_t v = 0;
+    for (uint32_t i = 0; i < n; ++i) {
+      uint8_t byte = 0;
+      if (!data.try_get(at >> 3, &byte)) { bad = true; return 0; }
+      v = v << 1 | ((byte >> (7 - (at & 7))) & 1u);
+      ++at;
+    }
+    return v;
+  }
+};
+}  // namespace
+
+// ST 2094-40's syntax (its Annex: the application's metadata in a T.35 message), the layout ffmpeg's ff_parse_itu_t_t35_to_dynamic_hdr10_plus reads.
+bool vp_parse_hdr10plus(ConstByteView data, VpHdr10Plus* out) {
+  if (!out) return false;
+  *out = VpHdr10Plus{};
+  // (the T.35 header: United States, the provider and its oriented code of HDR10+, application 4)
+  uint8_t head[6] = {};
+  bool header = data.size() >= 6;
+  for (uint32_t i = 0; header && i < 6; ++i) header = data.try_get(i, &head[i]);
+  if (header && head[0] == 0xB5 && head[1] == 0x00 && head[2] == 0x3C && head[3] == 0x00 && head[4] == 0x01 && head[5] == 0x04) data = data.subview(6);
+  MetadataBits b{data};
+  VpHdr10Plus m;
+  m.application_version = static_cast<uint8_t>(b.read(8));
+  m.windows = static_cast<uint8_t>(b.read(2));
+  if (m.windows < 1 || m.application_version > 1) return false;   // (versions 0 and 1 have this syntax)
+  for (uint32_t w = 1; w < m.windows; ++w) {   // (the ellipses of windows 1 and 2: read, not applied)
+    for (int i = 0; i < 6; ++i) b.read(16);    // corners, centre
+    b.read(8);                                 // rotation angle
+    for (int i = 0; i < 3; ++i) b.read(16);    // axes
+    b.read(1);                                 // overlap process option
+  }
+  const uint32_t target = b.read(27);
+  if (target > 10000) return false;
+  m.target_peak = static_cast<float>(target);
+  auto skip_luminance_table = [&]() {
+    const uint32_t rows = b.read(5), cols = b.read(5);
+    if (rows < 2 || rows > 25 || cols < 2 || cols > 25) return false;
+    for (uint32_t i = 0; i < rows * cols; ++i) b.read(4);
+    return true;
+  };
+  if (b.read(1) && !skip_luminance_table()) return false;   // (the targeted display's actual peak luminance: not used)
+  for (uint32_t w = 0; w < m.windows; ++w) {
+    uint32_t maxscl[3], average;
+    for (uint32_t& v : maxscl) v = b.read(17);
+    average = b.read(17);
+    const uint32_t count = b.read(4);
+    uint32_t percentages[15] = {}, percentiles[15] = {};
+    for (uint32_t i = 0; i < count; ++i) {
+      percentages[i] = b.read(7);
+      percentiles[i] = b.read(17);
+      if (percentages[i] > 100 || percentiles[i] > 100000) return false;
+    }
+    const uint32_t bright = b.read(10);
+    for (uint32_t v : maxscl)
+      if (v > 100000) return false;
+    if (average > 100000 || bright > 1000) return false;
+    if (w == 0) {   // (in units of 0.00001 of 10000 cd/m2)
+      for (int c = 0; c < 3; ++c) m.maxscl[c] = static_cast<float>(maxscl[c]) * 0.1f;
+      m.average_maxrgb = static_cast<float>(average) * 0.1f;
+      m.percentile_count = static_cast<uint8_t>(count);
+      for (uint32_t i = 0; i < count; ++i) {
+        m.percentages[i] = static_cast<uint8_t>(percentages[i]);
+        m.percentiles[i] = static_cast<float>(percentiles[i]) * 0.1f;
+      }
+      m.fraction_bright_pixels = static_cast<float>(bright) / 1000.0f;
+    }
+  }
+  if (b.read(1) && !skip_luminance_table()) return false;   // (the mastering display's actual peak luminance: not used)
+  for (uint32_t w = 0; w < m.windows; ++w) {
+    const bool tone = b.read(1) != 0;
+    uint32_t kx = 0, ky = 0, anchors = 0, anchor[15] = {};
+    if (tone) {
+      kx = b.read(12);
+      ky = b.read(12);
+      anchors = b.read(4);
+      for (uint32_t i = 0; i < anchors; ++i) anchor[i] = b.read(10);
+    }
+    const bool saturation = b.read(1) != 0;
+    const uint32_t weight = saturation ? b.read(6) : 8;
+    if (w == 0) {
+      m.tone_mapping = tone;
+      m.knee_x = static_cast<float>(kx) / 4095.0f;
+      m.knee_y = static_cast<float>(ky) / 4095.0f;
+      m.anchor_count = static_cast<uint8_t>(anchors);
+      for (uint32_t i = 0; i < anchors; ++i) m.anchors[i] = static_cast<float>(anchor[i]) / 1023.0f;
+      m.saturation_mapping = saturation;
+      m.saturation_weight = static_cast<float>(weight) / 8.0f;
+    }
+  }
+  if (b.bad) return false;
+  if (m.tone_mapping && (m.knee_x >= 1.0f || m.knee_y > 1.0f)) return false;   // (the knee is below the curve's end)
+  m.present = true;
+  *out = m;
+  return true;
+}
+
+uint32_t vp_histogram_components(VpFormat f) {
+  if (static_cast<uint8_t>(f) > static_cast<uint8_t>(kVpLastFormat)) return 0;
+  const bool alpha = f == VpFormat::Bgra8 || f == VpFormat::Rgba8 || f == VpFormat::Rgb10a2 || f == VpFormat::Rgba16f || f == VpFormat::Ayuv || f == VpFormat::Y410 ||
+                     f == VpFormat::Y416;
+  return 0x7u | (alpha ? 0x8u : 0u);
+}
+
+VpResult vp_histogram(const VpImage& image, uint32_t width, uint32_t height, uint32_t components, ArrayView<uint32_t> out[4]) {
+  ImageAccess img;
+  const VpResult r = prepare_image(image, &img);
+  if (r != VpResult::Ok) return r;
+  if ((components & ~vp_histogram_components(image.format)) || width == 0 || height == 0 || width > image.width || height > image.height) return VpResult::Invalid;
+  // the depth of the codes (bin = code * bins >> depth)
+  uint32_t depth = 8;
+  switch (image.format) {
+    case VpFormat::P010: case VpFormat::Rgb10a2: case VpFormat::Y410: case VpFormat::Y210: depth = 10; break;
+    case VpFormat::P016: case VpFormat::Y416: case VpFormat::Y216: depth = 16; break;
+    default: break;
+  }
+  for (uint32_t c = 0; c < 4; ++c) {
+    if (!(components & (1u << c))) continue;
+    const uint64_t bins = out[c].size();
+    if (bins == 0 || bins > kVpMaxHistogramBins) return VpResult::Invalid;
+    out[c].fill(0);
+  }
+  auto count = [&](uint32_t c, float code) {
+    if (!(components & (1u << c))) return;
+    const uint64_t bins = out[c].size();
+    uint64_t bin;
+    if (img.is_float) {
+      const float v = code > 0.0f ? (code < 1.0f ? code : 1.0f) : 0.0f;
+      bin = static_cast<uint64_t>(v * static_cast<float>(bins));
+      if (bin >= bins) bin = bins - 1;
+    } else {
+      const uint32_t d = c == 3 && (image.format == VpFormat::Rgb10a2 || image.format == VpFormat::Y410) ? 2 : depth;
+      bin = (static_cast<uint64_t>(code) * bins) >> d;
+    }
+    ++out[c][bin];
+  };
+  if (img.yuv) {
+    for (uint32_t y = 0; y < height; ++y)
+      for (uint32_t x = 0; x < width; ++x) {
+        count(0, img.plane[0].read(x, y, 0));
+        if (img.has_alpha) count(3, img.plane[0].read(x, y, 3));
+      }
+    const uint32_t cw = (width + (1u << img.ss_x) - 1) >> img.ss_x, ch = (height + (1u << img.ss_y) - 1) >> img.ss_y;
+    for (uint32_t y = 0; y < ch; ++y)
+      for (uint32_t x = 0; x < cw; ++x) {
+        count(1, img.plane[1].read(x, y, 0));
+        count(2, img.plane[1].read(x, y, 1));
+      }
+  } else {
+    for (uint32_t y = 0; y < height; ++y)
+      for (uint32_t x = 0; x < width; ++x) {
+        for (uint32_t c = 0; c < 3; ++c) count(c, img.plane[0].read(x, y, c));
+        if (img.has_alpha) count(3, img.plane[0].read(x, y, 3));
+      }
+  }
+  return VpResult::Ok;
 }
 
 VpResult video_process(const VpOutput& output, ArrayView<const VpStream> streams) {
@@ -958,7 +1212,7 @@ VpResult video_process(const VpOutput& output, ArrayView<const VpStream> streams
 
   if (!hdr_ok(output.hdr)) return VpResult::Invalid;
   StreamState states[kVpMaxStreams];
-  ScratchPlanes scratch[kVpMaxStreams][2];   // (the stages' pictures: given back when the call returns)
+  ScratchPlanes scratch[kVpMaxStreams][3];   // (the stages' pictures: given back when the call returns)
   for (uint32_t s = 0; s < streams.size(); ++s) {
     const VpStream& in = streams[s];
     StreamState& st = states[s];
@@ -972,17 +1226,49 @@ VpResult video_process(const VpOutput& output, ArrayView<const VpStream> streams
       if (!rect_ordered(in.source) || in.source.left < 0 || in.source.top < 0 || static_cast<int64_t>(in.source.right) > static_cast<int64_t>(vw) ||
           static_cast<int64_t>(in.source.bottom) > static_cast<int64_t>(vh))
         return VpResult::Invalid;
-      // the frames before and after: pictures like the current one
-      ImageAccess refs[2];
+      // the frames before and after and an inverse telecine window: pictures like the current one
+      auto like = [&](const VpImage* g) {
+        return g->format == in.image->format && g->color_space == in.image->color_space && g->width == in.image->width && g->height == in.image->height;
+      };
+      ImageAccess refs[2], window[kVpMaxTelecineFrames];
+      StageFrames frames;
       const VpImage* given[2] = {in.past, in.future};
       for (int k = 0; k < 2; ++k) {
         if (!given[k]) continue;
-        if (given[k]->format != in.image->format || given[k]->color_space != in.image->color_space || given[k]->width != in.image->width || given[k]->height != in.image->height)
-          return VpResult::Invalid;
+        if (!like(given[k])) return VpResult::Invalid;
         r = prepare_image(*given[k], &refs[k]);
         if (r != VpResult::Ok) return r;
       }
-      r = run_stages(in, &st.image, in.past ? &refs[0] : nullptr, in.future ? &refs[1] : nullptr, output.allocator, scratch[s]);
+      frames.past = in.past ? &refs[0] : nullptr;
+      frames.future = in.future ? &refs[1] : nullptr;
+      if (in.temporal == VpTemporal::InverseTelecine) {
+        frames.window_count = uint32_t{in.ivtc_cycle} + 2;
+        bool known = false;
+        for (uint32_t k = 0; k < frames.window_count; ++k) {
+          if (!in.telecine[k]) continue;
+          if (!like(in.telecine[k])) return VpResult::Invalid;
+          r = prepare_image(*in.telecine[k], &window[k]);
+          if (r != VpResult::Ok) return r;
+          frames.window[k] = &window[k];
+          frames.given[k] = true;
+          known = true;
+        }
+        if (!known) return VpResult::Invalid;
+        for (uint32_t k = 0; k < frames.window_count; ++k) {   // (a frame not given: the nearest given one, the earlier of two as near)
+          if (in.telecine[k]) continue;
+          for (uint32_t d = 1; d < frames.window_count && !frames.window[k]; ++d) {
+            if (k >= d && in.telecine[k - d]) frames.window[k] = &window[k - d];
+            else if (k + d < frames.window_count && in.telecine[k + d]) frames.window[k] = &window[k + d];
+          }
+        }
+      }
+      // (how much the stream is enlarged: automatic edge enhancement)
+      const double sw = static_cast<double>(in.source.right - in.source.left), sh = static_cast<double>(in.source.bottom - in.source.top);
+      const double dw = static_cast<double>(int64_t{in.destination.right} - in.destination.left), dh = static_cast<double>(int64_t{in.destination.bottom} - in.destination.top);
+      const bool turned = in.orientation == VpOrientation::Clockwise90 || in.orientation == VpOrientation::Clockwise90FlipHorizontal ||
+                          in.orientation == VpOrientation::Clockwise270 || in.orientation == VpOrientation::Clockwise270FlipHorizontal;
+      const double ex = (turned ? dh : dw) / sw, ey = (turned ? dw : dh) / sh;
+      r = run_stages(in, &st.image, frames, ex > ey ? ex : ey, output.allocator, scratch[s]);
       if (r != VpResult::Ok) return r;
     }
     if (!rect_ordered(in.source) || !rect_ordered(in.destination) || in.source.left < 0 || in.source.top < 0 ||
@@ -1000,6 +1286,7 @@ VpResult video_process(const VpOutput& output, ArrayView<const VpStream> streams
     fx.luma_upper = in.luma_upper;
     fx.hdr = in.hdr;
     fx.display = output.hdr;
+    fx.dynamic = in.hdr10plus.present ? &in.hdr10plus : nullptr;
     st.conversion = make_conversion(st.image, ctx.out, fx);
     st.anamorphic = 0.5 * in.anamorphic;
     st.source = in.source;

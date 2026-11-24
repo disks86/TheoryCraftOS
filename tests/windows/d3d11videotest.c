@@ -704,8 +704,9 @@ static void test_decoder_caps(void) {
     if (SUCCEEDED(ID3D11VideoDevice_QueryInterface(g_vdevice, &IID_ID3D11VideoDevice1, (void **)&vd1))) {
       UINT caps = 1;
       const DXGI_RATIONAL rate = {30, 1};
-      check(SUCCEEDED(ID3D11VideoDevice1_GetVideoDecoderCaps(vd1, &DXVA_ModeAV1_VLD_Profile2, 1920, 1080, &rate, 0, NULL, &caps)) && caps == 0,
-            "GetVideoDecoderCaps of AV1 profile 2: decoded (into YUY2 / Y210 / NV12 / P010)");
+      check(SUCCEEDED(ID3D11VideoDevice1_GetVideoDecoderCaps(vd1, &DXVA_ModeAV1_VLD_Profile2, 1920, 1080, &rate, 0, NULL, &caps)) &&
+                caps == (D3D11_VIDEO_DECODER_CAPS_DOWNSAMPLE | D3D11_VIDEO_DECODER_CAPS_DOWNSAMPLE_DYNAMIC),
+            "GetVideoDecoderCaps of AV1 profile 2: decoded (into YUY2 / Y210 / NV12 / P010), downsampled too");
       ID3D11VideoDevice1_Release(vd1);
     }
   }
@@ -822,10 +823,21 @@ static void test_decoder_caps(void) {
     check(ID3D11VideoContext_DecoderBeginFrame(g_vcontext, dec, view, 16, key) == E_INVALIDARG, "DecoderBeginFrame with a content key (no encryption): E_INVALIDARG");
     void *c3 = NULL;
     if (SUCCEEDED(ID3D11VideoContext_QueryInterface(g_vcontext, &IID_ID3D11VideoContext3_, &c3))) {
-      const UINT offsets[1] = {0};
-      ID3D11Buffer *histogram = NULL;
-      check(((DecoderBeginFrame1Fn)vtable_entry(c3, VIDEO_CONTEXT2_METHODS))(c3, dec, view, 0, NULL, 1, offsets, &histogram) == E_INVALIDARG,
-            "DecoderBeginFrame1 with a histogram (there are none): E_INVALIDARG");
+      const UINT offsets[4] = {100, 0, 0, 0};
+      const D3D11_BUFFER_DESC hd = {4096, D3D11_USAGE_DEFAULT, 0, 0, 0, 0};
+      ID3D11Buffer *histogram = NULL, *histograms[4] = {NULL, NULL, NULL, NULL};
+      ID3D11Device_CreateBuffer(g_device, &hd, NULL, &histogram);
+      histograms[0] = histogram;
+      check(((DecoderBeginFrame1Fn)vtable_entry(c3, VIDEO_CONTEXT2_METHODS))(c3, dec, view, 0, NULL, 1, offsets, histograms) == E_INVALIDARG,
+            "DecoderBeginFrame1 with a histogram at an offset not 256-aligned: E_INVALIDARG");
+      check(((DecoderBeginFrame1Fn)vtable_entry(c3, VIDEO_CONTEXT2_METHODS))(c3, dec, view, 0, NULL, 5, offsets, histograms) == E_INVALIDARG,
+            "... with five components: E_INVALIDARG");
+      const UINT alpha_offsets[4] = {0, 0, 0, 256};
+      histograms[0] = NULL;
+      histograms[3] = histogram;
+      check(((DecoderBeginFrame1Fn)vtable_entry(c3, VIDEO_CONTEXT2_METHODS))(c3, dec, view, 0, NULL, 4, alpha_offsets, histograms) == E_INVALIDARG,
+            "... of alpha, which NV12 has not got: E_INVALIDARG");
+      if (histogram) ID3D11Buffer_Release(histogram);
       IUnknown_Release((IUnknown *)c3);
     }
     check(ID3D11VideoContext_DecoderBeginFrame(g_vcontext, dec, view, 0, NULL) == S_OK, "DecoderBeginFrame");
@@ -848,17 +860,26 @@ static void test_decoder_caps(void) {
   if (SUCCEEDED(ID3D11VideoDevice_QueryInterface(g_vdevice, &IID_ID3D11VideoDevice1, (void **)&v1))) {
     UINT caps = 0xFF;
     const DXGI_RATIONAL rate = {30, 1};
-    check(SUCCEEDED(ID3D11VideoDevice1_GetVideoDecoderCaps(v1, &D3D11_DECODER_PROFILE_H264_VLD_NOFGT, 480, 320, &rate, 0, NULL, &caps)) && caps == 0, "GetVideoDecoderCaps: no downsampling");
+    check(SUCCEEDED(ID3D11VideoDevice1_GetVideoDecoderCaps(v1, &D3D11_DECODER_PROFILE_H264_VLD_NOFGT, 480, 320, &rate, 0, NULL, &caps)) &&
+              caps == (D3D11_VIDEO_DECODER_CAPS_DOWNSAMPLE | D3D11_VIDEO_DECODER_CAPS_DOWNSAMPLE_DYNAMIC),
+          "GetVideoDecoderCaps: downsampling, also changed while decoding");
     check(SUCCEEDED(ID3D11VideoDevice1_GetVideoDecoderCaps(v1, &D3D11_DECODER_PROFILE_H264_VLD_NOFGT, 480, 320, &rate, 0, &D3D11_CRYPTO_TYPE_AES128_CTR_, &caps)) &&
               caps == D3D11_VIDEO_DECODER_CAPS_UNSUPPORTED,
           "... encrypted: UNSUPPORTED");
     BOOL supported = TRUE, real_time = TRUE;
     D3D11_VIDEO_SAMPLE_DESC sample = {240, 160, DXGI_FORMAT_NV12, DXGI_COLOR_SPACE_YCBCR_STUDIO_G22_LEFT_P709};
     video_config_of(&config, 2);
-    check(SUCCEEDED(ID3D11VideoDevice1_CheckVideoDecoderDownsampling(v1, &desc, DXGI_COLOR_SPACE_YCBCR_STUDIO_G22_LEFT_P709, &config, &rate, &sample, &supported, &real_time)) && !supported,
-          "CheckVideoDecoderDownsampling: not supported");
-    check(ID3D11VideoDevice1_RecommendVideoDecoderDownsampleParameters(v1, &desc, DXGI_COLOR_SPACE_YCBCR_STUDIO_G22_LEFT_P709, &config, &rate, &sample) == E_INVALIDARG,
-          "RecommendVideoDecoderDownsampleParameters: E_INVALIDARG");
+    check(SUCCEEDED(ID3D11VideoDevice1_CheckVideoDecoderDownsampling(v1, &desc, DXGI_COLOR_SPACE_YCBCR_STUDIO_G22_LEFT_P709, &config, &rate, &sample, &supported, &real_time)) &&
+              supported && real_time,
+          "CheckVideoDecoderDownsampling: NV12 BT.709 to half size, in real time");
+    D3D11_VIDEO_SAMPLE_DESC rgb = {240, 160, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709};
+    check(SUCCEEDED(ID3D11VideoDevice1_CheckVideoDecoderDownsampling(v1, &desc, DXGI_COLOR_SPACE_YCBCR_STUDIO_G22_LEFT_P709, &config, &rate, &rgb, &supported, &real_time)) && !supported,
+          "... not to RGB (decoder output views are of YUV formats)");
+    D3D11_VIDEO_SAMPLE_DESC recommended;
+    check(SUCCEEDED(ID3D11VideoDevice1_RecommendVideoDecoderDownsampleParameters(v1, &desc, DXGI_COLOR_SPACE_YCBCR_STUDIO_G22_LEFT_P709, &config, &rate, &recommended)) &&
+              recommended.Width == desc.SampleWidth && recommended.Height == desc.SampleHeight && recommended.Format == DXGI_FORMAT_NV12 &&
+              recommended.ColorSpace == DXGI_COLOR_SPACE_YCBCR_STUDIO_G22_LEFT_P709,
+          "RecommendVideoDecoderDownsampleParameters: the decoder's own size and format");
     UINT in = 1, outsz = 1;
     check(ID3D11VideoDevice1_GetCryptoSessionPrivateDataSize(v1, &D3D11_CRYPTO_TYPE_AES128_CTR_, NULL, &D3D11_KEY_EXCHANGE_HW_PROTECTION_, &in, &outsz) == E_INVALIDARG && !in && !outsz,
           "GetCryptoSessionPrivateDataSize: E_INVALIDARG (no crypto type)");
@@ -869,7 +890,8 @@ static void test_decoder_caps(void) {
     /* D3D11_FEATURE_DATA_VIDEO_DECODER_HISTOGRAM: the decoder's description, then the components, bins and counter bits */
     struct { D3D11_VIDEO_DECODER_DESC desc; UINT components, bins, bits; } h = {desc, 0xFF, 0xFF, 0xFF};
     VideoCheckFeatureSupportFn f = (VideoCheckFeatureSupportFn)vtable_entry(v2, VIDEO_DEVICE1_METHODS);
-    check(SUCCEEDED(f(v2, 0, &h, sizeof h)) && h.components == 0 && h.bins == 0 && h.bits == 0, "ID3D11VideoDevice2::CheckFeatureSupport(DECODER_HISTOGRAM): no histograms");
+    check(SUCCEEDED(f(v2, 0, &h, sizeof h)) && h.components == 7 && h.bins == 64 && h.bits == 32,
+          "ID3D11VideoDevice2::CheckFeatureSupport(DECODER_HISTOGRAM): Y, U and V, 64 bins of 32-bit counters");
     check(f(v2, 1, &h, sizeof h) == E_INVALIDARG, "... a feature there is not: E_INVALIDARG");
     IUnknown_Release((IUnknown *)v2);
   }
@@ -1647,16 +1669,22 @@ static void test_processor(void) {
   const UINT want_features = D3D11_VIDEO_PROCESSOR_FEATURE_CAPS_ALPHA_FILL | D3D11_VIDEO_PROCESSOR_FEATURE_CAPS_ROTATION | D3D11_VIDEO_PROCESSOR_FEATURE_CAPS_ALPHA_STREAM |
                              D3D11_VIDEO_PROCESSOR_FEATURE_CAPS_MIRROR;
   checkf(SUCCEEDED(hr) && (caps.FeatureCaps & want_features) == want_features && !(caps.FeatureCaps & D3D11_VIDEO_PROCESSOR_FEATURE_CAPS_CONSTRICTION) &&
-             caps.FilterCaps == 0x7F && caps.RateConversionCapsCount == 2 && caps.MaxInputStreams == 16 && caps.MaxStreamStates == 16,
+             caps.FilterCaps == 0xFF && caps.RateConversionCapsCount == 3 && caps.MaxInputStreams == 16 && caps.MaxStreamStates == 16,
          "GetVideoProcessorCaps: device %#x, features %#x, filters %#x, %u rate conversions, %u streams", caps.DeviceCaps, caps.FeatureCaps, caps.FilterCaps, caps.RateConversionCapsCount,
          caps.MaxInputStreams);
   D3D11_VIDEO_PROCESSOR_RATE_CONVERSION_CAPS rate;
-  check(SUCCEEDED(ID3D11VideoProcessorEnumerator_GetVideoProcessorRateConversionCaps(e, 0, &rate)) && !rate.PastFrames && !rate.FutureFrames &&
-            rate.ProcessorCaps == D3D11_VIDEO_PROCESSOR_PROCESSOR_CAPS_DEINTERLACE_BOB && !rate.CustomRateCount,
-        "the first rate conversion: no past or future frames, bob deinterlacing");
-  check(ID3D11VideoProcessorEnumerator_GetVideoProcessorRateConversionCaps(e, 2, &rate) == E_INVALIDARG, "... there are two: E_INVALIDARG for the third");
+  check(SUCCEEDED(ID3D11VideoProcessorEnumerator_GetVideoProcessorRateConversionCaps(e, 0, &rate)) && !rate.PastFrames && rate.FutureFrames == 1 &&
+            rate.ProcessorCaps == (D3D11_VIDEO_PROCESSOR_PROCESSOR_CAPS_DEINTERLACE_BOB | D3D11_VIDEO_PROCESSOR_PROCESSOR_CAPS_FRAME_RATE_CONVERSION) && rate.CustomRateCount == 5,
+        "the first rate conversion: bob deinterlacing, frame rate conversion (five custom rates, a future frame)");
+  check(ID3D11VideoProcessorEnumerator_GetVideoProcessorRateConversionCaps(e, 3, &rate) == E_INVALIDARG, "... there are three: E_INVALIDARG for the fourth");
   D3D11_VIDEO_PROCESSOR_CUSTOM_RATE custom;
-  check(ID3D11VideoProcessorEnumerator_GetVideoProcessorCustomRate(e, 0, 0, &custom) == E_INVALIDARG, "GetVideoProcessorCustomRate: none (E_INVALIDARG)");
+  check(SUCCEEDED(ID3D11VideoProcessorEnumerator_GetVideoProcessorCustomRate(e, 0, 0, &custom)) && custom.CustomRate.Numerator == 5 && custom.CustomRate.Denominator == 2 &&
+            custom.OutputFrames == 5 && !custom.InputInterlaced && custom.InputFramesOrFields == 2,
+        "GetVideoProcessorCustomRate(0, 0): 24p to 60p, five frames of two");
+  check(ID3D11VideoProcessorEnumerator_GetVideoProcessorCustomRate(e, 0, 5, &custom) == E_INVALIDARG, "... the first conversion has no inverse telecine rates (E_INVALIDARG)");
+  check(SUCCEEDED(ID3D11VideoProcessorEnumerator_GetVideoProcessorCustomRate(e, 1, 5, &custom)) && custom.CustomRate.Numerator == 4 && custom.CustomRate.Denominator == 5 &&
+            custom.OutputFrames == 4 && custom.InputInterlaced && custom.InputFramesOrFields == 10,
+        "GetVideoProcessorCustomRate(1, 5): 3:2 pulldown, four frames of ten fields");
   D3D11_VIDEO_PROCESSOR_FILTER_RANGE range;
   check(SUCCEEDED(ID3D11VideoProcessorEnumerator_GetVideoProcessorFilterRange(e, D3D11_VIDEO_PROCESSOR_FILTER_BRIGHTNESS, &range)) && range.Minimum == -400 && range.Maximum == 400 &&
             range.Multiplier == 0.25f,
@@ -1676,7 +1704,7 @@ static void test_processor(void) {
     ID3D11VideoProcessorEnumerator1_Release(e1);
   } else check(0, "the enumerator is an ID3D11VideoProcessorEnumerator1");
   ID3D11VideoProcessor *vp = NULL;
-  check(ID3D11VideoDevice_CreateVideoProcessor(g_vdevice, e, 2, &vp) == E_INVALIDARG, "CreateVideoProcessor of a rate conversion there is not: E_INVALIDARG");
+  check(ID3D11VideoDevice_CreateVideoProcessor(g_vdevice, e, 3, &vp) == E_INVALIDARG, "CreateVideoProcessor of a rate conversion there is not: E_INVALIDARG");
   hr = ID3D11VideoDevice_CreateVideoProcessor(g_vdevice, e, 0, &vp);
   check(SUCCEEDED(hr) && vp, "CreateVideoProcessor");
   if (!vp) { ID3D11VideoProcessorEnumerator_Release(e); return; }
@@ -1999,23 +2027,34 @@ static void test_processor_effects(void) {
   D3D11_VIDEO_PROCESSOR_CAPS caps;
   ID3D11VideoProcessorEnumerator_GetVideoProcessorCaps(e, &caps);
   checkf((caps.FeatureCaps & (D3D11_VIDEO_PROCESSOR_FEATURE_CAPS_LUMA_KEY | D3D11_VIDEO_PROCESSOR_FEATURE_CAPS_STEREO)) == (D3D11_VIDEO_PROCESSOR_FEATURE_CAPS_LUMA_KEY | D3D11_VIDEO_PROCESSOR_FEATURE_CAPS_STEREO) &&
-             caps.FilterCaps == 0x7F && caps.StereoCaps == 0x1F && caps.RateConversionCapsCount == 2 && caps.AutoStreamCaps == 0 && caps.InputFormatCaps == 7,
-         "the caps: luma key, stereo (and every optional packing, flipping), seven filters, two rate conversions (features %#x, filters %#x, stereo %#x)", caps.FeatureCaps,
+             caps.FilterCaps == 0xFF && caps.StereoCaps == 0x1F && caps.RateConversionCapsCount == 3 && caps.AutoStreamCaps == 0xF && caps.InputFormatCaps == 7,
+         "the caps: luma key, stereo (and every optional packing, flipping), eight filters, three rate conversions, automatic denoise, deringing, edge enhancement and "
+         "colour correction (features %#x, filters %#x, stereo %#x)", caps.FeatureCaps,
          caps.FilterCaps, caps.StereoCaps);
   D3D11_VIDEO_PROCESSOR_RATE_CONVERSION_CAPS rc;
-  check(SUCCEEDED(ID3D11VideoProcessorEnumerator_GetVideoProcessorRateConversionCaps(e, 0, &rc)) && rc.ProcessorCaps == D3D11_VIDEO_PROCESSOR_PROCESSOR_CAPS_DEINTERLACE_BOB &&
-            !rc.PastFrames && !rc.FutureFrames && !rc.ITelecineCaps,
-        "rate conversion 0: bob, no reference frames");
-  check(SUCCEEDED(ID3D11VideoProcessorEnumerator_GetVideoProcessorRateConversionCaps(e, 1, &rc)) && rc.ProcessorCaps == D3D11_VIDEO_PROCESSOR_PROCESSOR_CAPS_DEINTERLACE_ADAPTIVE &&
-            rc.PastFrames == 1 && rc.FutureFrames == 1 && !rc.CustomRateCount,
-        "rate conversion 1: motion adaptive, a past and a future frame");
+  check(SUCCEEDED(ID3D11VideoProcessorEnumerator_GetVideoProcessorRateConversionCaps(e, 0, &rc)) && (rc.ProcessorCaps & D3D11_VIDEO_PROCESSOR_PROCESSOR_CAPS_DEINTERLACE_BOB) &&
+            !rc.PastFrames && rc.FutureFrames == 1 && !rc.ITelecineCaps,
+        "rate conversion 0: bob, a future frame (frame rate conversion), no inverse telecine");
+  const UINT itc = D3D11_VIDEO_PROCESSOR_ITELECINE_CAPS_32 | D3D11_VIDEO_PROCESSOR_ITELECINE_CAPS_22 | D3D11_VIDEO_PROCESSOR_ITELECINE_CAPS_2224 | D3D11_VIDEO_PROCESSOR_ITELECINE_CAPS_2332;
+  check(SUCCEEDED(ID3D11VideoProcessorEnumerator_GetVideoProcessorRateConversionCaps(e, 1, &rc)) &&
+            rc.ProcessorCaps == (D3D11_VIDEO_PROCESSOR_PROCESSOR_CAPS_DEINTERLACE_ADAPTIVE | D3D11_VIDEO_PROCESSOR_PROCESSOR_CAPS_INVERSE_TELECINE |
+                                 D3D11_VIDEO_PROCESSOR_PROCESSOR_CAPS_FRAME_RATE_CONVERSION) &&
+            rc.PastFrames == 5 && rc.FutureFrames == 5 && rc.CustomRateCount == 7 && rc.ITelecineCaps == itc,
+        "rate conversion 1: motion adaptive, inverse telecine (3:2, 2:2, 2:2:2:4, 2:3:3:2), frame rate conversion, five frames either way");
+  check(SUCCEEDED(ID3D11VideoProcessorEnumerator_GetVideoProcessorRateConversionCaps(e, 2, &rc)) &&
+            rc.ProcessorCaps == (D3D11_VIDEO_PROCESSOR_PROCESSOR_CAPS_DEINTERLACE_MOTION_COMPENSATION | D3D11_VIDEO_PROCESSOR_PROCESSOR_CAPS_INVERSE_TELECINE |
+                                 D3D11_VIDEO_PROCESSOR_PROCESSOR_CAPS_FRAME_RATE_CONVERSION) &&
+            rc.PastFrames == 5 && rc.FutureFrames == 5 && rc.ITelecineCaps == itc,
+        "rate conversion 2: motion compensated, the same");
   D3D11_VIDEO_PROCESSOR_FILTER_RANGE fr;
   check(SUCCEEDED(ID3D11VideoProcessorEnumerator_GetVideoProcessorFilterRange(e, D3D11_VIDEO_PROCESSOR_FILTER_HUE, &fr)) && fr.Minimum == -720 && fr.Maximum == 720 && fr.Default == 0 &&
             fr.Multiplier == 0.25f,
         "the hue filter's range: -720..720 times 0.25 (degrees)");
   check(SUCCEEDED(ID3D11VideoProcessorEnumerator_GetVideoProcessorFilterRange(e, D3D11_VIDEO_PROCESSOR_FILTER_CONTRAST, &fr)) && fr.Default == 64 && fr.Multiplier == 1.0f / 64,
         "the contrast filter's range: default 64 times 1/64");
-  check(ID3D11VideoProcessorEnumerator_GetVideoProcessorFilterRange(e, D3D11_VIDEO_PROCESSOR_FILTER_STEREO_ADJUSTMENT, &fr) == E_INVALIDARG, "no stereo adjustment filter: E_INVALIDARG");
+  check(SUCCEEDED(ID3D11VideoProcessorEnumerator_GetVideoProcessorFilterRange(e, D3D11_VIDEO_PROCESSOR_FILTER_STEREO_ADJUSTMENT, &fr)) && fr.Minimum == -128 && fr.Maximum == 127 &&
+            fr.Default == 0 && fr.Multiplier == 1.0f,
+        "the stereo adjustment filter's range: -128..127 pixels");
   ID3D11VideoProcessor *bob = NULL, *adaptive = NULL;
   ID3D11VideoDevice_CreateVideoProcessor(g_vdevice, e, 0, &bob);
   ID3D11VideoDevice_CreateVideoProcessor(g_vdevice, e, 1, &adaptive);
@@ -2119,9 +2158,9 @@ static void test_processor_effects(void) {
            "ProcAmp (brightness -10, contrast 1.25, hue -30, saturation 1.5): (%d, %d, %d), DXVA's formulas (%d, %d, %d)", red(got), green(got), blue(got), want[0], want[1], want[2]);
     ID3D11VideoContext_VideoProcessorSetStreamFilter(v, bob, 0, D3D11_VIDEO_PROCESSOR_FILTER_CONTRAST, TRUE, 1000);
     check(ID3D11VideoContext_VideoProcessorBlt(v, bob, ov, 0, 1, &s) == E_INVALIDARG, "a filter level outside its range: E_INVALIDARG");
-    ID3D11VideoContext_VideoProcessorSetStreamFilter(v, bob, 0, D3D11_VIDEO_PROCESSOR_FILTER_STEREO_ADJUSTMENT, TRUE, 0);
+    ID3D11VideoContext_VideoProcessorSetStreamFilter(v, bob, 0, D3D11_VIDEO_PROCESSOR_FILTER_STEREO_ADJUSTMENT, TRUE, 200);
     ID3D11VideoContext_VideoProcessorSetStreamFilter(v, bob, 0, D3D11_VIDEO_PROCESSOR_FILTER_CONTRAST, FALSE, 0);
-    check(ID3D11VideoContext_VideoProcessorBlt(v, bob, ov, 0, 1, &s) == E_INVALIDARG, "the stereo adjustment filter: E_INVALIDARG (FilterCaps has not got it)");
+    check(ID3D11VideoContext_VideoProcessorBlt(v, bob, ov, 0, 1, &s) == E_INVALIDARG, "the stereo adjustment filter outside its range: E_INVALIDARG");
     for (UINT k = 0; k < 8; ++k) ID3D11VideoContext_VideoProcessorSetStreamFilter(v, bob, 0, (D3D11_VIDEO_PROCESSOR_FILTER)k, FALSE, 0);
     /* luma key: Y 120 of 0..255 (0.47) is in 0.4 .. 0.6: the background (green) instead */
     const D3D11_VIDEO_COLOR green_bg = {{{0, 1, 0, 1}}};
@@ -2248,6 +2287,483 @@ done:
   ID3D11VideoProcessorEnumerator_Release(e);
 }
 
+/* ---- frame rate conversion, inverse telecine, motion compensated deinterlacing, stereo adjustment, HDR10+ -------------------------------------------------------- */
+
+/* The test's own sine and cosine (a reduced argument's Taylor series): the CPU emulator's x87 fsin gives NaN, and the scene must not depend on it. */
+static double tsin(double x) {
+  const double pi = 3.14159265358979323846;
+  x = fmod(x, 2 * pi);
+  if (x > pi) x -= 2 * pi;
+  if (x < -pi) x += 2 * pi;
+  double term = x, sum = 0;
+  for (int k = 1; k < 40; k += 2) { sum += term; term *= -x * x / ((k + 1) * (k + 2)); }
+  return sum;
+}
+static double tcos(double x) { return tsin(x + 1.57079632679489661923); }
+/* The moving test picture (full-range NV12; d3d12videotest has the same): luma and a little colour, at film frame (time) k, moving 3 and 1 pixels a frame. */
+static BYTE scene_luma(double x, double y, double k) {
+  const double fx = x - 3.0 * k, fy = y - 1.0 * k;
+  double v = 120 + 50 * tsin(0.27 * fx + 0.11 * fy) + 30 * tsin(0.61 * fy - 0.2 * fx) + 20 * tsin(0.9 * fx + 0.75 * fy);
+  if ((fx - 20) * (fx - 20) + (fy - 12) * (fy - 12) < 49) v += 60;
+  return (BYTE)(v < 0 ? 0 : v > 255 ? 255 : v);
+}
+static void scene_frame(BYTE *f, UINT w, UINT h, double k) {
+  for (UINT y = 0; y < h; ++y) for (UINT x = 0; x < w; ++x) f[y * w + x] = scene_luma(x, y, k);
+  for (UINT y = 0; y < h / 2; ++y)
+    for (UINT x = 0; x < w / 2; ++x) {
+      f[w * h + y * w + 2 * x] = (BYTE)(128 + 30 * tsin(0.2 * (2.0 * x - 3 * k)));
+      f[w * h + y * w + 2 * x + 1] = (BYTE)(128 + 20 * tcos(0.15 * (2.0 * y - k)));
+    }
+}
+static void field_rows(BYTE *to, const BYTE *from, UINT w, UINT h, int parity) {
+  for (UINT y = (UINT)parity; y < h; y += 2) memcpy(to + y * w, from + y * w, w);
+  for (UINT y = (UINT)parity; y < h / 2; y += 2) memcpy(to + w * h + y * w, from + w * h + y * w, w);
+}
+static ID3D11Texture2D *nv12_texture(const BYTE *f, UINT w, UINT h, UINT bind) {
+  const D3D11_SUBRESOURCE_DATA init = {f, w, 0};
+  return texture(w, h, 1, DXGI_FORMAT_NV12, D3D11_USAGE_DEFAULT, bind, 0, f ? &init : NULL, NULL);
+}
+static double luma_psnr(const BYTE *a, const BYTE *b, UINT w, UINT h, UINT border) {
+  double se = 0;
+  UINT n = 0;
+  for (UINT y = border; y + border < h; ++y) for (UINT x = border; x + border < w; ++x) { const double d = (double)a[y * w + x] - b[y * w + x]; se += d * d; ++n; }
+  return se == 0 ? 99.0 : 10 * log10(255.0 * 255.0 / (se / n));
+}
+/* A bit writer for HDR10+ metadata (ST 2094-40) */
+typedef struct Bits { BYTE *b; UINT n; } Bits;
+static void put_bits(Bits *w, UINT v, UINT n) {
+  for (UINT i = n; i-- > 0; ++w->n)
+    if ((v >> i) & 1) w->b[w->n / 8] |= (BYTE)(0x80 >> (w->n % 8));
+}
+
+static void test_processor_rates(void) {
+  ID3D11VideoContext *v = g_vcontext;
+  enum { W = 64, H = 48 };
+  const D3D11_VIDEO_PROCESSOR_COLOR_SPACE full = {0, 0, 1, 0, 2, 0};      /* (YCbCr BT.709, 0..255) */
+  static BYTE frame[W * H * 3 / 2], got[W * H * 3 / 2], want[W * H * 3 / 2];
+
+  /* frame rate conversion by a custom rate, 24p to 60p: blended (the frames' luma 40 and 200: 40, 104, 168), or repeated */
+  {
+    ID3D11VideoProcessorEnumerator *e = enumerator_of(D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE, W, H, W, H);
+    ID3D11VideoProcessor *vp = NULL;
+    if (e) ID3D11VideoDevice_CreateVideoProcessor(g_vdevice, e, 0, &vp);
+    memset(frame, 40, W * H);
+    memset(frame + W * H, 128, W * H / 2);
+    ID3D11Texture2D *a = nv12_texture(frame, W, H, D3D11_BIND_SHADER_RESOURCE);
+    memset(frame, 200, W * H);
+    ID3D11Texture2D *b = nv12_texture(frame, W, H, D3D11_BIND_SHADER_RESOURCE), *out = nv12_texture(NULL, W, H, D3D11_BIND_RENDER_TARGET);
+    ID3D11VideoProcessorInputView *ia = input_view(a, e, 0), *ib = input_view(b, e, 0);
+    ID3D11VideoProcessorOutputView *ov = output_view(out, e, 0);
+    int blended = 0, repeated = 0;
+    if (vp && ia && ib && ov) {
+      ID3D11VideoContext_VideoProcessorSetStreamColorSpace(v, vp, 0, &full);
+      ID3D11VideoContext_VideoProcessorSetOutputColorSpace(v, vp, &full);
+      ID3D11VideoContext_VideoProcessorSetStreamAutoProcessingMode(v, vp, 0, FALSE);
+      const DXGI_RATIONAL five_halves = {5, 2}, seven_thirds = {7, 3};
+      for (int repeat = 0; repeat < 2; ++repeat) {
+        ID3D11VideoContext_VideoProcessorSetStreamOutputRate(v, vp, 0, D3D11_VIDEO_PROCESSOR_OUTPUT_RATE_CUSTOM, repeat, &five_halves);
+        for (UINT k = 0; k < 3; ++k) {
+          D3D11_VIDEO_PROCESSOR_STREAM s;
+          memset(&s, 0, sizeof s);
+          s.Enable = TRUE;
+          s.OutputIndex = k;
+          s.InputFrameOrField = 0;
+          s.FutureFrames = 1;
+          s.ppFutureSurfaces = &ib;
+          s.pInputSurface = ia;
+          const HRESULT hr = ID3D11VideoContext_VideoProcessorBlt(v, vp, ov, k, 1, &s);
+          const int luma = SUCCEEDED(hr) && read_planar(out, 0, got) ? got[W * 10 + 10] : -1;
+          const int expect = repeat ? 40 : (int)(40 + 160 * (2.0 * k / 5));
+          if (close_to(luma, expect, 1) && repeat) ++repeated;
+          else if (close_to(luma, expect, 1)) ++blended;
+          else printf("d3d11videotest: 24p -> 60p output %u (%s): luma %d, want %d (%#lx)\n", k, repeat ? "repeated" : "blended", luma, expect, hr);
+        }
+      }
+      ID3D11VideoContext_VideoProcessorSetStreamOutputRate(v, vp, 0, D3D11_VIDEO_PROCESSOR_OUTPUT_RATE_CUSTOM, FALSE, &seven_thirds);
+      D3D11_VIDEO_PROCESSOR_STREAM s = {TRUE, 0, 0, 0, 0, NULL, ia, NULL, NULL, NULL, NULL};
+      check(ID3D11VideoContext_VideoProcessorBlt(v, vp, ov, 0, 1, &s) == E_INVALIDARG, "a custom rate the processor has not got (7/3): E_INVALIDARG");
+      ID3D11VideoContext_VideoProcessorSetStreamOutputRate(v, vp, 0, D3D11_VIDEO_PROCESSOR_OUTPUT_RATE_NORMAL, FALSE, NULL);
+    }
+    check(blended == 3 && repeated == 3, "custom rate 5/2 (24p to 60p): outputs blended between the frames around them, or repeated with RepeatFrame");
+    if (ia) ID3D11VideoProcessorInputView_Release(ia);
+    if (ib) ID3D11VideoProcessorInputView_Release(ib);
+    if (ov) ID3D11VideoProcessorOutputView_Release(ov);
+    if (a) ID3D11Texture2D_Release(a);
+    if (b) ID3D11Texture2D_Release(b);
+    if (out) ID3D11Texture2D_Release(out);
+    if (vp) ID3D11VideoProcessor_Release(vp);
+    if (e) ID3D11VideoProcessorEnumerator_Release(e);
+  }
+
+  /* inverse telecine: 3:2 pulldown (custom rate 4/5 of interlaced input) and 2:2 (1/1) of the moving picture, each output the film frame bit for bit (both rate
+   * conversions that do it) */
+  {
+    enum { FILM = 12, FRAMES = 15 };
+    static BYTE film[FILM][W * H * 3 / 2], tele[FRAMES][W * H * 3 / 2], two[FILM][W * H * 3 / 2];
+    for (int k = 0; k < FILM; ++k) scene_frame(film[k], W, H, k);
+    int field = 0, parity = 0;
+    for (int k = 0; k < FILM && field / 2 < FRAMES; ++k)
+      for (int n = 0; n < (k % 2 ? 3 : 2) && field / 2 < FRAMES; ++n, ++field, parity ^= 1) field_rows(tele[field / 2], film[k], W, H, parity);
+    for (int k = 0; k + 1 < FILM; ++k) { field_rows(two[k], film[k], W, H, 0); field_rows(two[k], film[k + 1], W, H, 1); }      /* (2:2, a field late: phase-shifted) */
+    ID3D11VideoProcessorEnumerator *e = enumerator_of(D3D11_VIDEO_FRAME_FORMAT_INTERLACED_TOP_FIELD_FIRST, W, H, W, H);
+    ID3D11Texture2D *t[FRAMES], *f[FILM], *tw[FILM];
+    ID3D11VideoProcessorInputView *it[FRAMES], *ifm[FILM], *itw[FILM];
+    for (int k = 0; k < FRAMES; ++k) { t[k] = nv12_texture(tele[k], W, H, D3D11_BIND_SHADER_RESOURCE); it[k] = input_view(t[k], e, 0); }
+    for (int k = 0; k < FILM; ++k) {
+      f[k] = nv12_texture(film[k], W, H, D3D11_BIND_SHADER_RESOURCE);
+      ifm[k] = input_view(f[k], e, 0);
+      tw[k] = nv12_texture(two[k], W, H, D3D11_BIND_SHADER_RESOURCE);
+      itw[k] = input_view(tw[k], e, 0);
+    }
+    ID3D11Texture2D *out = nv12_texture(NULL, W, H, D3D11_BIND_RENDER_TARGET), *ref = nv12_texture(NULL, W, H, D3D11_BIND_RENDER_TARGET);
+    ID3D11VideoProcessorOutputView *ov = output_view(out, e, 0), *rv = output_view(ref, e, 0);
+    int same = 0, outputs = 0;
+    for (UINT index = 1; e && ov && rv && index < 3; ++index) {
+      ID3D11VideoProcessor *vp = NULL;
+      ID3D11VideoDevice_CreateVideoProcessor(g_vdevice, e, index, &vp);
+      if (!vp) continue;
+      ID3D11VideoContext_VideoProcessorSetStreamColorSpace(v, vp, 0, &full);
+      ID3D11VideoContext_VideoProcessorSetOutputColorSpace(v, vp, &full);
+      ID3D11VideoContext_VideoProcessorSetStreamAutoProcessingMode(v, vp, 0, FALSE);
+      for (int pattern = 0; pattern < 2; ++pattern) {
+        const DXGI_RATIONAL rate = pattern == 0 ? (DXGI_RATIONAL){4, 5} : (DXGI_RATIONAL){1, 1};
+        for (int n = pattern == 0 ? 5 : 2; n < (pattern == 0 ? 10 : 7); ++n) {      /* (2:2: frames 2 .. 6, their five future frames within the stream) */
+          if (pattern == 0 && n % 5 == 4) continue;      /* (the cycle's last frame makes no output) */
+          ID3D11VideoContext_VideoProcessorSetStreamFrameFormat(v, vp, 0, D3D11_VIDEO_FRAME_FORMAT_INTERLACED_TOP_FIELD_FIRST);
+          ID3D11VideoContext_VideoProcessorSetStreamOutputRate(v, vp, 0, D3D11_VIDEO_PROCESSOR_OUTPUT_RATE_CUSTOM, FALSE, &rate);
+          ID3D11VideoProcessorInputView **frames = pattern == 0 ? it : itw;
+          ID3D11VideoProcessorInputView *past[5], *future[5];
+          const int npast = n < 5 ? n : 5;
+          for (int k = 0; k < 5; ++k) { past[k] = n - npast + k >= 0 ? frames[n - npast + k] : NULL; future[k] = frames[n + 1 + k]; }
+          D3D11_VIDEO_PROCESSOR_STREAM s = {TRUE, 0, (UINT)n, (UINT)npast, 5, past, frames[n], future, NULL, NULL, NULL};
+          const HRESULT hr = ID3D11VideoContext_VideoProcessorBlt(v, vp, ov, 0, 1, &s);
+          const int film_frame = pattern == 0 ? 4 + (n % 5 * 4 + 4) / 5 : n;      /* (3:2: the second cycle's film frames 4 .. 7; 2:2: frame n) */
+          ID3D11VideoContext_VideoProcessorSetStreamFrameFormat(v, vp, 0, D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE);
+          ID3D11VideoContext_VideoProcessorSetStreamOutputRate(v, vp, 0, D3D11_VIDEO_PROCESSOR_OUTPUT_RATE_NORMAL, FALSE, NULL);
+          D3D11_VIDEO_PROCESSOR_STREAM p = {TRUE, 0, 0, 0, 0, NULL, ifm[film_frame], NULL, NULL, NULL, NULL};
+          const HRESULT hr2 = ID3D11VideoContext_VideoProcessorBlt(v, vp, rv, 0, 1, &p);
+          const int ok = SUCCEEDED(hr) && SUCCEEDED(hr2) && read_planar(out, 0, got) && read_planar(ref, 0, want) && !memcmp(got, want, sizeof got);
+          if (!ok) printf("d3d11videotest: inverse telecine (%s, rate conversion %u) of frame %d: not film frame %d (%#lx)\n", pattern ? "2:2" : "3:2", index, n, film_frame, hr);
+          same += ok;
+          ++outputs;
+        }
+      }
+      ID3D11VideoProcessor_Release(vp);
+    }
+    checkf(outputs == 18 && same == outputs, "inverse telecine (3:2 at 4/5, 2:2 at 1/1, motion adaptive and compensated): %d of %d outputs the film frames, bit for bit", same, outputs);
+    for (int k = 0; k < FRAMES; ++k) { if (it[k]) ID3D11VideoProcessorInputView_Release(it[k]); if (t[k]) ID3D11Texture2D_Release(t[k]); }
+    for (int k = 0; k < FILM; ++k) {
+      if (ifm[k]) ID3D11VideoProcessorInputView_Release(ifm[k]);
+      if (f[k]) ID3D11Texture2D_Release(f[k]);
+      if (itw[k]) ID3D11VideoProcessorInputView_Release(itw[k]);
+      if (tw[k]) ID3D11Texture2D_Release(tw[k]);
+    }
+    if (ov) ID3D11VideoProcessorOutputView_Release(ov);
+    if (rv) ID3D11VideoProcessorOutputView_Release(rv);
+    if (out) ID3D11Texture2D_Release(out);
+    if (ref) ID3D11Texture2D_Release(ref);
+    if (e) ID3D11VideoProcessorEnumerator_Release(e);
+  }
+
+  /* motion compensated deinterlacing (rate conversion 2) of an interlaced capture of the moving picture - each field at its own time - against the progressive
+   * picture at each field's time: better than motion adaptive (1) */
+  {
+    enum { N = 5 };
+    static BYTE inter[N][W * H * 3 / 2], truth[W * H * 3 / 2], half_frame[W * H * 3 / 2];
+    for (int n = 0; n < N; ++n) {
+      scene_frame(half_frame, W, H, n);
+      field_rows(inter[n], half_frame, W, H, 0);
+      scene_frame(half_frame, W, H, n + 0.5);
+      field_rows(inter[n], half_frame, W, H, 1);
+    }
+    ID3D11VideoProcessorEnumerator *e = enumerator_of(D3D11_VIDEO_FRAME_FORMAT_INTERLACED_TOP_FIELD_FIRST, W, H, W, H);
+    ID3D11Texture2D *t[N];
+    ID3D11VideoProcessorInputView *iv[N];
+    for (int n = 0; n < N; ++n) { t[n] = nv12_texture(inter[n], W, H, D3D11_BIND_SHADER_RESOURCE); iv[n] = input_view(t[n], e, 0); }
+    ID3D11Texture2D *out = nv12_texture(NULL, W, H, D3D11_BIND_RENDER_TARGET);
+    ID3D11VideoProcessorOutputView *ov = output_view(out, e, 0);
+    double psnr[3] = {0, 0, 0};
+    int runs = 0;
+    for (UINT index = 1; e && ov && index < 3; ++index) {
+      ID3D11VideoProcessor *vp = NULL;
+      ID3D11VideoDevice_CreateVideoProcessor(g_vdevice, e, index, &vp);
+      if (!vp) continue;
+      ID3D11VideoContext_VideoProcessorSetStreamColorSpace(v, vp, 0, &full);
+      ID3D11VideoContext_VideoProcessorSetOutputColorSpace(v, vp, &full);
+      ID3D11VideoContext_VideoProcessorSetStreamAutoProcessingMode(v, vp, 0, FALSE);
+      ID3D11VideoContext_VideoProcessorSetStreamFrameFormat(v, vp, 0, D3D11_VIDEO_FRAME_FORMAT_INTERLACED_TOP_FIELD_FIRST);
+      for (int n = 1; n + 1 < N; ++n)
+        for (UINT fieldn = 0; fieldn < 2; ++fieldn) {
+          D3D11_VIDEO_PROCESSOR_STREAM s = {TRUE, fieldn, (UINT)n, 1, 1, &iv[n - 1], iv[n], &iv[n + 1], NULL, NULL, NULL};
+          if (FAILED(ID3D11VideoContext_VideoProcessorBlt(v, vp, ov, fieldn, 1, &s)) || !read_planar(out, 0, got)) continue;
+          scene_frame(truth, W, H, n + 0.5 * fieldn);
+          psnr[index] += luma_psnr(got, truth, W, H, 4);
+          if (index == 2) ++runs;
+        }
+      ID3D11VideoProcessor_Release(vp);
+    }
+    psnr[1] /= runs ? runs : 1;
+    psnr[2] /= runs ? runs : 1;
+    checkf(runs == 6 && psnr[2] > psnr[1] + 1.0, "motion compensated deinterlacing: luma PSNR %.2f dB, motion adaptive %.2f dB", psnr[2], psnr[1]);
+    for (int n = 0; n < N; ++n) { if (iv[n]) ID3D11VideoProcessorInputView_Release(iv[n]); if (t[n]) ID3D11Texture2D_Release(t[n]); }
+    if (ov) ID3D11VideoProcessorOutputView_Release(ov);
+    if (out) ID3D11Texture2D_Release(out);
+    if (e) ID3D11VideoProcessorEnumerator_Release(e);
+  }
+
+  /* the stereo adjustment filter: a side by side picture into the two views of a stereo output, moved apart by the level */
+  {
+    for (UINT y = 0; y < H; ++y) for (UINT x = 0; x < W; ++x) frame[y * W + x] = (BYTE)(x < W / 2 ? 4 * x : 4 * (x - W / 2) + 100);
+    memset(frame + W * H, 128, W * H / 2);
+    ID3D11VideoProcessorEnumerator *e = enumerator_of(D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE, W, H, W / 2, H);
+    ID3D11VideoProcessor *vp = NULL;
+    if (e) ID3D11VideoDevice_CreateVideoProcessor(g_vdevice, e, 0, &vp);
+    ID3D11Texture2D *in = nv12_texture(frame, W, H, D3D11_BIND_SHADER_RESOURCE);
+    ID3D11Texture2D *out = texture(W / 2, H, 2, DXGI_FORMAT_NV12, D3D11_USAGE_DEFAULT, D3D11_BIND_RENDER_TARGET, 0, NULL, NULL);
+    ID3D11VideoProcessorInputView *iv = input_view(in, e, 0);
+    ID3D11VideoProcessorOutputView *ov = output_view(out, e, 2);
+    int right = 0;
+    if (vp && iv && ov) {
+      ID3D11VideoContext_VideoProcessorSetStreamColorSpace(v, vp, 0, &full);
+      ID3D11VideoContext_VideoProcessorSetOutputColorSpace(v, vp, &full);
+      ID3D11VideoContext_VideoProcessorSetStreamAutoProcessingMode(v, vp, 0, FALSE);
+      ID3D11VideoContext_VideoProcessorSetOutputStereoMode(v, vp, TRUE);
+      ID3D11VideoContext_VideoProcessorSetStreamStereoFormat(v, vp, 0, TRUE, D3D11_VIDEO_PROCESSOR_STEREO_FORMAT_HORIZONTAL, TRUE, TRUE, D3D11_VIDEO_PROCESSOR_STEREO_FLIP_NONE, 0);
+      ID3D11VideoContext_VideoProcessorSetStreamFilter(v, vp, 0, D3D11_VIDEO_PROCESSOR_FILTER_STEREO_ADJUSTMENT, TRUE, 3);
+      D3D11_VIDEO_PROCESSOR_STREAM s = {TRUE, 0, 0, 0, 0, NULL, iv, NULL, NULL, NULL, NULL};
+      if (SUCCEEDED(ID3D11VideoContext_VideoProcessorBlt(v, vp, ov, 0, 1, &s)))
+        for (UINT k = 0; k < 2; ++k) {
+          static BYTE view[W / 2 * H * 3 / 2];
+          if (!read_planar(out, k, view)) continue;
+          for (int x = 0; x < W / 2; ++x) {
+            int from = k == 0 ? x + 3 : x - 3;
+            from = from < 0 ? 0 : from > W / 2 - 1 ? W / 2 - 1 : from;
+            right += view[5 * (W / 2) + x] == (k == 0 ? 4 * from : 4 * from + 100);
+          }
+        }
+    }
+    checkf(right == W, "the stereo adjustment filter (3): %d of %d columns of the two views moved apart", right, W);
+    if (iv) ID3D11VideoProcessorInputView_Release(iv);
+    if (ov) ID3D11VideoProcessorOutputView_Release(ov);
+    if (in) ID3D11Texture2D_Release(in);
+    if (out) ID3D11Texture2D_Release(out);
+    if (vp) ID3D11VideoProcessor_Release(vp);
+    if (e) ID3D11VideoProcessorEnumerator_Release(e);
+  }
+
+  /* HDR10+ metadata of a stream (DXGI_HDR_METADATA_TYPE_HDR10PLUS, ST 2094-40): grey PQ content of 2000 cd/m2 onto a 1000 cd/m2 PQ display goes along the metadata's
+   * curve (the scene's peak 4000, the targeted display 1000, the knee at (0.25, 0.5), anchors 0.6 .. 0.9) - not the static levels' curve */
+  {
+    BYTE meta[72];
+    memset(meta, 0, sizeof meta);
+    Bits b = {meta, 0};
+    put_bits(&b, 0xB5, 8); put_bits(&b, 0x003C, 16); put_bits(&b, 0x0001, 16); put_bits(&b, 4, 8);      /* (the T.35 header) */
+    put_bits(&b, 1, 8); put_bits(&b, 1, 2);      /* application version, one window */
+    put_bits(&b, 1000, 27); put_bits(&b, 0, 1);
+    for (int c = 0; c < 3; ++c) put_bits(&b, 40000, 17);
+    put_bits(&b, 5000, 17); put_bits(&b, 0, 4); put_bits(&b, 0, 10);
+    put_bits(&b, 0, 1);
+    put_bits(&b, 1, 1); put_bits(&b, 1024, 12); put_bits(&b, 2048, 12); put_bits(&b, 4, 4);
+    const UINT anchors[4] = {614, 716, 819, 921};
+    for (int i = 0; i < 4; ++i) put_bits(&b, anchors[i], 10);
+    put_bits(&b, 0, 1);
+    ID3D11VideoProcessorEnumerator *e = enumerator_of(D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE, 16, 8, 16, 8);
+    ID3D11VideoProcessor *vp = NULL;
+    if (e) ID3D11VideoDevice_CreateVideoProcessor(g_vdevice, e, 0, &vp);
+    static UINT16 p010[16 * 8 * 3 / 2];
+    const double grey = pq_signal(2000.0);
+    for (int i = 0; i < 16 * 8; ++i) p010[i] = (UINT16)(lround(64 + 876 * grey) << 6);
+    for (int i = 16 * 8; i < 16 * 8 * 3 / 2; ++i) p010[i] = 512 << 6;
+    const D3D11_SUBRESOURCE_DATA init = {p010, 32, 0};
+    ID3D11Texture2D *in = texture(16, 8, 1, DXGI_FORMAT_P010, D3D11_USAGE_DEFAULT, D3D11_BIND_SHADER_RESOURCE, 0, &init, NULL);
+    ID3D11Texture2D *out = texture(16, 8, 1, DXGI_FORMAT_R10G10B10A2_UNORM, D3D11_USAGE_DEFAULT, D3D11_BIND_RENDER_TARGET, 0, NULL, NULL);
+    ID3D11VideoProcessorInputView *iv = input_view(in, e, 0);
+    ID3D11VideoProcessorOutputView *ov = output_view(out, e, 0);
+    ID3D11VideoContext2 *v2 = NULL;
+    double nits[2] = {-1, -1};
+    if (vp && iv && ov && SUCCEEDED(ID3D11VideoContext_QueryInterface(v, &IID_ID3D11VideoContext2, (void **)&v2))) {
+      ID3D11VideoContext2_VideoProcessorSetStreamColorSpace1(v2, vp, 0, DXGI_COLOR_SPACE_YCBCR_STUDIO_G2084_LEFT_P2020);
+      ID3D11VideoContext2_VideoProcessorSetOutputColorSpace1(v2, vp, DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020);
+      ID3D11VideoContext2_VideoProcessorSetStreamAutoProcessingMode(v2, vp, 0, FALSE);
+      DXGI_HDR_METADATA_HDR10 display, content;
+      memset(&display, 0, sizeof display);
+      memset(&content, 0, sizeof content);
+      display.MaxMasteringLuminance = 1000;
+      content.MaxMasteringLuminance = 4000;
+      content.MaxContentLightLevel = 4000;
+      ID3D11VideoContext2_VideoProcessorSetOutputHDRMetaData(v2, vp, DXGI_HDR_METADATA_TYPE_HDR10, sizeof display, &display);
+      for (int k = 0; k < 2; ++k) {
+        if (k == 0) ID3D11VideoContext2_VideoProcessorSetStreamHDRMetaData(v2, vp, 0, DXGI_HDR_METADATA_TYPE_HDR10, sizeof content, &content);
+        else ID3D11VideoContext2_VideoProcessorSetStreamHDRMetaData(v2, vp, 0, DXGI_HDR_METADATA_TYPE_HDR10PLUS, sizeof meta, meta);
+        D3D11_VIDEO_PROCESSOR_STREAM s = {TRUE, 0, 0, 0, 0, NULL, iv, NULL, NULL, NULL, NULL};
+        static UINT32 px[16 * 8];
+        if (SUCCEEDED(ID3D11VideoContext2_VideoProcessorBlt(v2, vp, ov, 0, 1, &s)) && read_bgra(out, px)) {
+          const double e1 = ((px[4 * 16 + 8] >> 10) & 0x3FF) / 1023.0;      /* (green, PQ) */
+          const double m1 = 2610.0 / 16384, m2 = 2523.0 / 4096 * 128, c1 = 3424.0 / 4096, c2 = 2413.0 / 4096 * 32, c3 = 2392.0 / 4096 * 32, pp = pow(e1, 1 / m2);
+          nits[k] = 10000 * pow(fmax(pp - c1, 0) / (c2 - c3 * pp), 1 / m1);
+        }
+      }
+      ID3D11VideoContext2_Release(v2);
+    }
+    /* the curve: x = 2000 / 4000 = 0.5 past the knee 0.25: t = 1/3 on the Bezier curve of 0, 0.6, 0.7, 0.8, 0.9, 1 from y 0.5, times the target's 1000 */
+    const double kx = 1024 / 4095.0, ky = 2048 / 4095.0, t = (0.5 - kx) / (1 - kx), pts[6] = {0, 614 / 1023.0, 716 / 1023.0, 819 / 1023.0, 921 / 1023.0, 1};
+    double bez = 0, binom = 1;
+    for (int k = 0; k <= 5; ++k) { bez += binom * pow(t, k) * pow(1 - t, 5 - k) * pts[k]; binom = binom * (5 - k) / (k + 1); }
+    const double want_nits = (ky + (1 - ky) * bez) * 1000;
+    checkf(fabs(nits[1] - want_nits) < 0.03 * want_nits && fabs(nits[0] - nits[1]) > 20,
+           "HDR10+ metadata: 2000 cd/m2 -> %.0f cd/m2 on a 1000 cd/m2 display (the ST 2094-40 curve: %.0f; by the static levels: %.0f)", nits[1], want_nits, nits[0]);
+    if (iv) ID3D11VideoProcessorInputView_Release(iv);
+    if (ov) ID3D11VideoProcessorOutputView_Release(ov);
+    if (in) ID3D11Texture2D_Release(in);
+    if (out) ID3D11Texture2D_Release(out);
+    if (vp) ID3D11VideoProcessor_Release(vp);
+    if (e) ID3D11VideoProcessorEnumerator_Release(e);
+  }
+}
+
+/* ---- downsampling while decoding, histograms ----------------------------------------------------------------------------------------------------------------------- */
+
+/* h264_bframes decoded twice: as it is, and by a decoder that downsamples into half-size NV12 output views (DecoderEnableDownsampling), the Y, U and V histograms of
+ * every other picture asked for (DecoderBeginFrame1). Each downsampled picture is what VideoProcessorBlt makes of the full-size one at that size, bit for bit; the
+ * histograms are the full-size picture's counted here; after DecoderUpdateDownsampling the pictures are of the new size. */
+static void test_decode_downsampling(void) {
+  size_t size = 0;
+  unsigned char *data = base64_decode(g_h264_bframes_b64, &size);
+  DxvaStream s[2];
+  DxvaPicture p[2];
+  const unsigned surfaces = 17;
+  if (!data || dxva_stream_open(&s[0], DXVA_CODEC_H264, data, size, surfaces) != 0 || dxva_stream_open(&s[1], DXVA_CODEC_H264, data, size, surfaces) != 0 ||
+      dxva_stream_next(&s[0], &p[0]) != 1 || dxva_stream_next(&s[1], &p[1]) != 1) {
+    check(0, "downsampling: the stream parses");
+    free(data);
+    return;
+  }
+  const UINT w = s[0].width, h = s[0].height, hw = w / 2, hh = h / 2;
+  const D3D11_VIDEO_DECODER_DESC desc = {D3D11_DECODER_PROFILE_H264_VLD_NOFGT, w, h, DXGI_FORMAT_NV12};
+  D3D11_VIDEO_DECODER_CONFIG config;
+  video_config_of(&config, 2);
+  ID3D11VideoDecoder *dec[2] = {NULL, NULL};
+  for (int k = 0; k < 2; ++k) ID3D11VideoDevice_CreateVideoDecoder(g_vdevice, &desc, &config, &dec[k]);
+  ID3D11VideoContext1 *c1 = NULL;
+  ID3D11VideoContext_QueryInterface(g_vcontext, &IID_ID3D11VideoContext1, (void **)&c1);
+  void *c3 = NULL;
+  ID3D11VideoContext_QueryInterface(g_vcontext, &IID_ID3D11VideoContext3_, &c3);
+  const DXGI_COLOR_SPACE_TYPE studio = DXGI_COLOR_SPACE_YCBCR_STUDIO_G22_LEFT_P709;
+  const D3D11_VIDEO_SAMPLE_DESC half = {hw, hh, DXGI_FORMAT_NV12, studio}, smaller = {w * 3 / 8, h * 3 / 8, DXGI_FORMAT_NV12, studio};
+  if (!dec[0] || !dec[1] || !c1 || !c3) { check(0, "downsampling: two decoders, ID3D11VideoContext1 and 3"); goto done; }
+  check(ID3D11VideoContext1_DecoderUpdateDownsampling(c1, dec[1], &half) == E_INVALIDARG, "DecoderUpdateDownsampling of a decoder that does not downsample: E_INVALIDARG");
+  check(SUCCEEDED(ID3D11VideoContext1_DecoderEnableDownsampling(c1, dec[1], studio, &half, surfaces)), "DecoderEnableDownsampling: half size NV12");
+  check(ID3D11VideoContext1_DecoderEnableDownsampling(c1, dec[1], studio, &half, surfaces) == E_INVALIDARG, "... again: E_INVALIDARG (DecoderUpdateDownsampling changes it)");
+  {
+    ID3D11Texture2D *full = texture(w, h, surfaces, DXGI_FORMAT_NV12, D3D11_USAGE_DEFAULT, D3D11_BIND_DECODER | D3D11_BIND_SHADER_RESOURCE, 0, NULL, NULL);
+    ID3D11Texture2D *small = texture(hw, hh, surfaces, DXGI_FORMAT_NV12, D3D11_USAGE_DEFAULT, D3D11_BIND_DECODER | D3D11_BIND_SHADER_RESOURCE, 0, NULL, NULL);
+    ID3D11VideoDecoderOutputView *fv[DXVA_STREAM_MAX_SURFACES] = {0}, *sv[DXVA_STREAM_MAX_SURFACES] = {0};
+    for (unsigned i = 0; full && small && i < surfaces; ++i) {
+      D3D11_VIDEO_DECODER_OUTPUT_VIEW_DESC vd = {D3D11_DECODER_PROFILE_H264_VLD_NOFGT, D3D11_VDOV_DIMENSION_TEXTURE2D, {{i}}};
+      ID3D11VideoDevice_CreateVideoDecoderOutputView(g_vdevice, (ID3D11Resource *)full, &vd, &fv[i]);
+      ID3D11VideoDevice_CreateVideoDecoderOutputView(g_vdevice, (ID3D11Resource *)small, &vd, &sv[i]);
+    }
+    /* the processor that makes the reference pictures, and the histograms' buffer and its staging copy */
+    const D3D11_VIDEO_PROCESSOR_CONTENT_DESC cd = {D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE, {30, 1}, w, h, {30, 1}, hw, hh, D3D11_VIDEO_USAGE_PLAYBACK_NORMAL};
+    ID3D11VideoProcessorEnumerator *e = NULL;
+    ID3D11VideoDevice_CreateVideoProcessorEnumerator(g_vdevice, &cd, &e);
+    ID3D11VideoProcessor *vp = NULL;
+    if (e) ID3D11VideoDevice_CreateVideoProcessor(g_vdevice, e, 0, &vp);
+    const D3D11_VIDEO_PROCESSOR_COLOR_SPACE bt709 = {0, 0, 1, 0, 1, 0};      /* (YCbCr BT.709, 16..235) */
+    if (vp) {
+      ID3D11VideoContext_VideoProcessorSetStreamColorSpace(g_vcontext, vp, 0, &bt709);
+      ID3D11VideoContext_VideoProcessorSetOutputColorSpace(g_vcontext, vp, &bt709);
+      ID3D11VideoContext_VideoProcessorSetStreamAutoProcessingMode(g_vcontext, vp, 0, FALSE);
+    }
+    ID3D11Texture2D *expect = texture(hw, hh, 1, DXGI_FORMAT_NV12, D3D11_USAGE_DEFAULT, D3D11_BIND_RENDER_TARGET, 0, NULL, NULL);
+    ID3D11VideoProcessorOutputView *ev = output_view(expect, e, 0);
+    const D3D11_BUFFER_DESC bd = {1024, D3D11_USAGE_DEFAULT, 0, 0, 0, 0}, sd = {1024, D3D11_USAGE_STAGING, 0, D3D11_CPU_ACCESS_READ, 0, 0};
+    ID3D11Buffer *hist = NULL, *hist_read = NULL;
+    ID3D11Device_CreateBuffer(g_device, &bd, NULL, &hist);
+    ID3D11Device_CreateBuffer(g_device, &sd, NULL, &hist_read);
+    BYTE *a = malloc((size_t)w * h * 3 / 2), *b = malloc((size_t)w * h * 3 / 2), *ref = malloc((size_t)w * h * 3 / 2);
+    int pictures = 0, same = 0, hist_ok = 0, updated_same = 0, r = 1;
+    while (full && small && vp && ev && hist && hist_read && a && b && ref && r == 1 && pictures < 64) {
+      if (pictures == 10) check(SUCCEEDED(ID3D11VideoContext1_DecoderUpdateDownsampling(c1, dec[1], &smaller)), "DecoderUpdateDownsampling: 3/8 of the size");
+      const D3D11_VIDEO_SAMPLE_DESC *now = pictures >= 10 ? &smaller : &half;
+      const int with_histograms = pictures % 2 == 1;
+      int ok = decode_picture(dec[0], fv[p[0].surface], &p[0], sizeof(DXVA_Slice_H264_Short), offsetof(DXVA_Slice_H264_Short, BSNALunitDataLocation), 0);
+      if (with_histograms) {
+        const UINT offsets[4] = {0, 256, 512, 0};
+        ID3D11Buffer *buffers[4] = {hist, hist, hist, NULL};
+        ok = ok && SUCCEEDED(((DecoderBeginFrame1Fn)vtable_entry(c3, VIDEO_CONTEXT2_METHODS))(c3, dec[1], sv[p[1].surface], 0, NULL, 3, offsets, buffers));
+        ok = ok && fill_buffer(dec[1], D3D11_VIDEO_DECODER_BUFFER_PICTURE_PARAMETERS, 0, p[1].picture_parameters, p[1].picture_parameters_size) &&
+             fill_buffer(dec[1], D3D11_VIDEO_DECODER_BUFFER_INVERSE_QUANTIZATION_MATRIX, 0, p[1].qmatrix, p[1].qmatrix_size) &&
+             fill_buffer(dec[1], D3D11_VIDEO_DECODER_BUFFER_SLICE_CONTROL, 0, p[1].slice_control, p[1].slice_control_size) &&
+             fill_buffer(dec[1], D3D11_VIDEO_DECODER_BUFFER_BITSTREAM, 0, p[1].bitstream, p[1].bitstream_size);
+        D3D11_VIDEO_DECODER_BUFFER_DESC bdesc[4] = {buffer_desc(D3D11_VIDEO_DECODER_BUFFER_PICTURE_PARAMETERS, 0, p[1].picture_parameters_size),
+                                                    buffer_desc(D3D11_VIDEO_DECODER_BUFFER_INVERSE_QUANTIZATION_MATRIX, 0, p[1].qmatrix_size),
+                                                    buffer_desc(D3D11_VIDEO_DECODER_BUFFER_SLICE_CONTROL, 0, p[1].slice_control_size),
+                                                    buffer_desc(D3D11_VIDEO_DECODER_BUFFER_BITSTREAM, 0, p[1].bitstream_size)};
+        ok = ok && SUCCEEDED(ID3D11VideoContext_SubmitDecoderBuffers(g_vcontext, dec[1], 4, bdesc)) && SUCCEEDED(ID3D11VideoContext_DecoderEndFrame(g_vcontext, dec[1]));
+      } else {
+        ok = ok && decode_picture(dec[1], sv[p[1].surface], &p[1], sizeof(DXVA_Slice_H264_Short), offsetof(DXVA_Slice_H264_Short, BSNALunitDataLocation), 0);
+      }
+      /* the reference: the full-size picture through the processor at the output's size */
+      ID3D11VideoProcessorInputView *iv = NULL;
+      const D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC ivd = {0, D3D11_VPIV_DIMENSION_TEXTURE2D, {{0, p[0].surface}}};
+      ID3D11VideoDevice_CreateVideoProcessorInputView(g_vdevice, (ID3D11Resource *)full, e, &ivd, &iv);
+      const RECT target = {0, 0, (LONG)now->Width, (LONG)now->Height};
+      ID3D11VideoContext_VideoProcessorSetOutputTargetRect(g_vcontext, vp, TRUE, &target);
+      ID3D11VideoContext_VideoProcessorSetStreamDestRect(g_vcontext, vp, 0, TRUE, &target);
+      D3D11_VIDEO_PROCESSOR_STREAM st = {TRUE, 0, 0, 0, 0, NULL, iv, NULL, NULL, NULL, NULL};
+      ok = ok && iv && SUCCEEDED(ID3D11VideoContext_VideoProcessorBlt(g_vcontext, vp, ev, 0, 1, &st));
+      if (iv) ID3D11VideoProcessorInputView_Release(iv);
+      /* (the picture's region of the output: the rest of a slice is what an earlier, larger picture left) */
+      ok = ok && read_planar(small, p[1].surface, a) && read_planar(expect, 0, b);
+      int match = ok;
+      for (UINT y = 0; match && y < now->Height; ++y) match = !memcmp(a + (size_t)y * hw, b + (size_t)y * hw, now->Width);
+      for (UINT y = 0; match && y < now->Height / 2; ++y) match = !memcmp(a + (size_t)(hh + y) * hw, b + (size_t)(hh + y) * hw, now->Width);
+      if (pictures >= 10) updated_same += match; else same += match;
+      if (with_histograms && ok) {
+        UINT want[3][64];
+        memset(want, 0, sizeof want);
+        if (read_planar(full, p[0].surface, ref)) {
+          for (UINT i = 0; i < w * h; ++i) ++want[0][ref[i] >> 2];
+          for (UINT i = 0; i < w * h / 4; ++i) { ++want[1][ref[w * h + 2 * i] >> 2]; ++want[2][ref[w * h + 2 * i + 1] >> 2]; }
+        }
+        ID3D11DeviceContext_CopyResource(g_context, (ID3D11Resource *)hist_read, (ID3D11Resource *)hist);
+        D3D11_MAPPED_SUBRESOURCE m;
+        if (SUCCEEDED(ID3D11DeviceContext_Map(g_context, (ID3D11Resource *)hist_read, 0, D3D11_MAP_READ, 0, &m)) && m.pData) {
+          int all = 1;
+          for (int c = 0; c < 3; ++c) all &= !memcmp((const BYTE *)m.pData + 256 * c, want[c], sizeof want[c]);
+          hist_ok += all;
+          ID3D11DeviceContext_Unmap(g_context, (ID3D11Resource *)hist_read, 0);
+        }
+      }
+      ++pictures;
+      r = dxva_stream_next(&s[0], &p[0]);
+      if (dxva_stream_next(&s[1], &p[1]) != r) r = -1;
+    }
+    checkf(r == 0 && pictures == 14 && same == 10 && updated_same == 4,
+           "downsampled decoding: %d of %d half-size pictures and %d of %d at 3/8 (after DecoderUpdateDownsampling) the processor's of the full-size ones, bit for bit", same, 10,
+           updated_same, 4);
+    checkf(hist_ok == 7, "DecoderBeginFrame1 histograms: %d of 7 pictures' Y, U and V the full-size picture's counted here", hist_ok);
+    free(a); free(b); free(ref);
+    if (hist) ID3D11Buffer_Release(hist);
+    if (hist_read) ID3D11Buffer_Release(hist_read);
+    if (ev) ID3D11VideoProcessorOutputView_Release(ev);
+    if (expect) ID3D11Texture2D_Release(expect);
+    if (vp) ID3D11VideoProcessor_Release(vp);
+    if (e) ID3D11VideoProcessorEnumerator_Release(e);
+    for (unsigned i = 0; i < surfaces; ++i) { if (fv[i]) ID3D11VideoDecoderOutputView_Release(fv[i]); if (sv[i]) ID3D11VideoDecoderOutputView_Release(sv[i]); }
+    if (full) ID3D11Texture2D_Release(full);
+    if (small) ID3D11Texture2D_Release(small);
+  }
+done:
+  if (c3) IUnknown_Release((IUnknown *)c3);
+  if (c1) ID3D11VideoContext1_Release(c1);
+  for (int k = 0; k < 2; ++k) if (dec[k]) ID3D11VideoDecoder_Release(dec[k]);
+  dxva_stream_close(&s[0]);
+  dxva_stream_close(&s[1]);
+  free(data);
+}
+
 /* ---- content protection: there is none -------------------------------------------------------------------------------------------------------------------------- */
 
 static void test_content_protection(void) {
@@ -2322,6 +2838,8 @@ int main(void) {
       test_decode_then_draw();
       test_processor();
       test_processor_effects();
+      test_processor_rates();
+      test_decode_downsampling();
     }
     test_content_protection();
   }

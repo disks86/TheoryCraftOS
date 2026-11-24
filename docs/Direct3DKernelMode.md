@@ -400,9 +400,14 @@ Direct3D 11's and 12's video interfaces run on the kernel's codecs, on the CPU, 
   frame analysis (two-pass), subregion notification, intra constrained slices, deblocking modes 3-6 (SVC's), HEVC and AV1 (the codec query says FALSE). Tests:
   `tests/run_host_tests.sh VideoEncodeTest`, `tests/h264_encode_ffmpeg.sh` (ffmpeg's decode = the reconstruction, 14 streams),
   `tests/emulated_dx.sh tests/windows/d3d12encodetest.c`, `tests/d3d12_qemu.sh d3d12encodetest`, `tests/wow64_qemu.sh d3d12encodetest`.
+- Decode conversion and histograms (`DecodeFrame`'s optional parts, CommandStream.hpp `kDecodeConversion` / `kDecodeHistogram`): the picture is decoded into its
+  surface - Direct3D 12's reference texture - and then converted by the video processor into another surface (any format and colour space the processor writes, from the
+  decode colour space, scaled to any size: `D3D12_VIDEO_DECODE_CONVERSION_ARGUMENTS` / `ARGUMENTS1`, D3D11 decoder downsampling); histograms of the decoded picture
+  (`hardware::vp_histogram`: Y, U, V and the alpha of AYUV / Y410 / Y416, 64 bins of the codes, 32-bit counters, at 256-aligned offsets) go to the program's buffers.
+  d3d12.dll reports both truthfully (`DECODE_CONVERSION_SUPPORT`: supported for every pair the processor converts, sizes 1 .. 16384; `DECODE_HISTOGRAM`).
 - Not there: HEVC 16-bit samples through DXVA (DXVA_PicParams_HEVC's bit depths are three bits: the Main16 profile takes 15 at most), HEVC separate colour planes (no
   profile has them), extended precision and CABAC bypass alignment checked against a reference (no decoder at hand has them: implemented from the standard, not
-  verified), AV1 tile lists whose output frame is not the decoder's size (DXVA cannot say), interlaced VC-1 (the CPU decoder has progressive pictures only), decode-time conversion and histograms, protected
+  verified), AV1 tile lists whose output frame is not the decoder's size (DXVA cannot say), interlaced VC-1 (the CPU decoder has progressive pictures only), protected
   content (crypto sessions and authenticated channels are refused), unordered access to planes (the kernel has none to textures), layered rendering into several slices
   (no `SV_RenderTargetArrayIndex`: a render target view of several slices draws into the first).
 - Tests: `tests/run_host_tests.sh DxvaDecoderTest VideoProcessTest DxgkrnlTest` (every codec bit for bit with ffmpeg; the DXVA buffers filled as ffmpeg's dxva2_*.c
@@ -416,8 +421,24 @@ Direct3D 11's and 12's video interfaces run on the kernel's codecs, on the CPU, 
   the AV1 streams' DXVA buffers dumped by DxvaDecoderTest with DXVA_AV1_DUMP, tests/data/make_av1_dxva_data.py; the packed and planar YUV textures; the processor
   against BT.709; motion adaptive deinterlacing against ffmpeg's yadif output, bob, ProcAmp, luma key, stereo, HDR10 into SDR), `tests/d3d12_qemu.sh d3d12videotest`,
   `tests/wow64_qemu.sh d3d12videotest d3d11videotest` (32-bit). VideoProcessTest's references: tests/data/videoprocess/make_refs.sh (zscale, yadif, geq).
-- Not in the processor: inverse telecine and frame rate conversion, motion-compensated deinterlacing, the stereo adjustment filter and auto processing (not reported),
-  HDR10+ dynamic metadata (only HDR10's static light levels are read), scRGB (G10) input brighter than white is clipped, not tone mapped.
+- Temporal processing (`VideoProcessTemporal.inc`; VideoProcess's second optional part, `kVideoProcessExtension2`): frame rate conversion (an output between two
+  progressive frames blends them by its time, or repeats the earlier; d3d12.dll reads the input over output frame rate and `RateInfo` as DXVA-HD's stream data are read -
+  `InputFrameOrField` the input frame, `OutputIndex` the outputs made from it -, video.inc VideoRate); inverse telecine of 3:2, 2:3:3:2, 2:2:2:4 (a cycle of five
+  frames to four: 30i to 24p) and 2:2 pulldown - ffmpeg `fieldmatch` (c / p / n matches, the least combing) then `decimate` (the frame most like its predecessor of
+  each cycle dropped), a frame still combed (fieldmatch's comb test) deinterlaced instead; a clean telecine gives the film frames bit for bit, as ffmpeg's
+  `fieldmatch,decimate` does (tests/data/videoprocess/ivtc_ffmpeg.sh); motion compensated deinterlacing - bwdif with the other fields' samples taken along each 8x8 block's
+  motion (MotionEstimator between the missing field's neighbours, bilateral candidate check, Catmull-Rom field interpolation): on the test's moving scenes 41.8 / 41.0 dB
+  luma PSNR against the progressive truth where ffmpeg's yadif gives 34.1 / 33.6, bwdif 41.1 / 38.3, mcdeint 40.5 / 39.5 (tests/data/videoprocess/mcdeint_ffmpeg.sh).
+  D3D12 has no MC flag (its CUSTOM deinterlacing stays motion adaptive): d3d11.dll's rate conversion 2 asks for it through video_extra.h.
+- The stereo adjustment filter (the views moved apart: left left, right right, -128..127 pixels; D3D12 filter 7), automatic processing (`VideoProcessAuto.inc`; D3D12
+  `AutoProcessingSupport` / D3D11 `AutoStreamCaps` denoise, deringing, edge enhancement, colour correction: each when the picture calls for it - Immerkaer's noise
+  measure, ripples beside strong edges, enlargement of 1.5 and more, a luma range of a tenth to six tenths - so a clean picture comes out as it went in), HDR10+
+  dynamic metadata of a stream (`vp_parse_hdr10plus`: the ST 2094-40 T.35 payload as DXGI_HDR_METADATA_HDR10PLUS holds it; tone mapping along its basis OOTF - the
+  knee and Bezier curve - from the scene peak to the targeted display, adapted to the actual display, its colour saturation weight; window 0 only, as HDR10+'s
+  profiles have).
+- Not in the processor: inverse telecine of other cadences (3:2:3:2:2, 5:5, 6:4, 8:7, 2:2:2:2:2:2:2:2:2:2:2:3: not reported), frame rate conversion of interlaced
+  frames other than deinterlacing and inverse telecine (VIDEO_PROCESS_SUPPORT says unsupported), HDR10+ windows 1 and 2 (read, not applied), the auto processing kinds
+  flesh tone mapping, image stabilization, super resolution and anamorphic scaling (not reported), scRGB (G10) input brighter than white is clipped, not tone mapped.
 
 ## Not done
 
