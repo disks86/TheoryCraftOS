@@ -229,6 +229,7 @@ DxvaResult DxvaVp9Decoder::decode(const DxvaPicture& picture, DxvaDecodedPicture
   }
 
   out->frame = out_.frame(0, info.key_frame);
+  out->surface_format = config_.output == PixelFormat::P010 ? DxvaSurfaceFormat::P010 : DxvaSurfaceFormat::Nv12;
   out->frame.limited_range = !core_.frame(index).full_range;
   return missing ? DxvaResult::MissingReference : DxvaResult::Ok;
 }

@@ -231,6 +231,13 @@ static void test_features(void) {
   CHECK(ID3D12VideoDevice_CheckFeatureSupport(g_vdev, D3D12_FEATURE_VIDEO_DECODE_SUPPORT, &ds, sizeof ds - 4) == E_INVALIDARG);
   DXGI_FORMAT formats[4];
   D3D12_FEATURE_DATA_VIDEO_DECODE_FORMAT_COUNT fc;
+  memset(&fc, 0, sizeof fc);
+  fc.Configuration.DecodeProfile = D3D12_VIDEO_DECODE_PROFILE_AV1_PROFILE0;
+  CHECK_HR(ID3D12VideoDevice_CheckFeatureSupport(g_vdev, D3D12_FEATURE_VIDEO_DECODE_FORMAT_COUNT, &fc, sizeof fc));
+  CHECK(fc.FormatCount == 2);
+  D3D12_FEATURE_DATA_VIDEO_DECODE_FORMATS ff = {0, fc.Configuration, fc.FormatCount, formats};
+  CHECK_HR(ID3D12VideoDevice_CheckFeatureSupport(g_vdev, D3D12_FEATURE_VIDEO_DECODE_FORMATS, &ff, sizeof ff));
+  CHECK(formats[0] == DXGI_FORMAT_NV12 && formats[1] == DXGI_FORMAT_P010);
   /* HEVC Main 10: into P010 only */
   fc.Configuration.DecodeProfile = D3D12_VIDEO_DECODE_PROFILE_HEVC_MAIN10;
   CHECK_HR(ID3D12VideoDevice_CheckFeatureSupport(g_vdev, D3D12_FEATURE_VIDEO_DECODE_FORMAT_COUNT, &fc, sizeof fc));
@@ -248,13 +255,6 @@ static void test_features(void) {
   ds.DecodeFormat = DXGI_FORMAT_NV12;
   CHECK_HR(ID3D12VideoDevice_CheckFeatureSupport(g_vdev, D3D12_FEATURE_VIDEO_DECODE_SUPPORT, &ds, sizeof ds));
   CHECK(ds.SupportFlags == D3D12_VIDEO_DECODE_SUPPORT_FLAG_NONE);
-  memset(&fc, 0, sizeof fc);
-  fc.Configuration.DecodeProfile = D3D12_VIDEO_DECODE_PROFILE_AV1_PROFILE0;
-  CHECK_HR(ID3D12VideoDevice_CheckFeatureSupport(g_vdev, D3D12_FEATURE_VIDEO_DECODE_FORMAT_COUNT, &fc, sizeof fc));
-  CHECK(fc.FormatCount == 2);
-  D3D12_FEATURE_DATA_VIDEO_DECODE_FORMATS ff = {0, fc.Configuration, fc.FormatCount, formats};
-  CHECK_HR(ID3D12VideoDevice_CheckFeatureSupport(g_vdev, D3D12_FEATURE_VIDEO_DECODE_FORMATS, &ff, sizeof ff));
-  CHECK(formats[0] == DXGI_FORMAT_NV12 && formats[1] == DXGI_FORMAT_P010);
   /* AV1 profiles 1 and 2: the formats Windows' decoders write them in */
   static const struct { const GUID *profile; UINT n; DXGI_FORMAT f[4]; } av1_formats[] = {
       {&D3D12_VIDEO_DECODE_PROFILE_AV1_PROFILE1, 2, {DXGI_FORMAT_AYUV, DXGI_FORMAT_Y410}},
@@ -439,7 +439,6 @@ static void test_processor(void) {
   CHECK_HR(ID3D12VideoDevice_CreateVideoProcessor(g_vdev, 0, &osd, 1, &isd, &IID_ID3D12VideoProcessor, (void **)&vp));
   D3D12_VIDEO_PROCESS_INPUT_STREAM_DESC deint = isd;
   deint.DeinterlaceMode = D3D12_VIDEO_PROCESS_DEINTERLACE_FLAG_BOB;
-#include "hevc10_dxva.h"
   ID3D12VideoProcessor *bad = NULL;
   CHECK(ID3D12VideoDevice_CreateVideoProcessor(g_vdev, 0, &osd, 1, &deint, &IID_ID3D12VideoProcessor, (void **)&bad) == E_INVALIDARG && !bad);
   if (!vp) return;
@@ -730,6 +729,7 @@ static void test_processor_yuv(void) {
 
 #include "dxva_streams.h"
 #include "d3d11video_data.h"
+#include "hevc10_dxva.h"
 #include "av1_dxva_data.h"
 static void test_decode(void);
 
