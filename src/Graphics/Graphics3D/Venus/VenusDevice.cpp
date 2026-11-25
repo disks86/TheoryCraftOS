@@ -172,7 +172,7 @@ DeviceInfo VenusDevice::info() const {
   // (multisampled images read by shaders - OpImageFetch with a sample, depth ones too, arrays of them -, Flat / NoPerspective / Centroid / Sample inputs, SampleId, the
   // InterpolateAt* of GLSL.std.450 and SampleMask in and out: every Vulkan device with sampleRateShading, as RADV has it; inner coverage would need
   // VK_EXT_conservative_rasterization's fullyCoveredFragmentShaderInputVariable, which the device does not ask for)
-  i.features3 = kFeature3InterpolationModes;
+  i.features3 |= kFeature3InterpolationModes;
   if (i.sample_counts && c.sample_rate_shading)
     i.features3 |= kFeature3MultisampleLoads | kFeature3MultisampleArrays | kFeature3MultisampleDepthLoads | kFeature3SampleShading | kFeature3EvaluateAttributes | kFeature3Coverage;
   i.limits.texture_units = kMaxTextureUnits;
