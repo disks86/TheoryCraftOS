@@ -427,7 +427,8 @@ bool VenusPipeline::make(Variant& v) {
   for (uint32_t s = 0; s < count && ok; ++s) {
     const VenusShaderModule& m = *modules[s];
     tgsi::CompileOptions o;
-    o.constant_rows = kSamplerCompareRegister + kMaxTextureUnits;
+    o.constant_rows = kVenusConstantRows;
+    o.system_row = kVenusSystemRow;
     o.stage_slot = s;
     for (uint32_t u = 0; u < tgsi::kMaxUnits; ++u) o.sview_type[u] = static_cast<tgsi::ValueType>(v.key.unit_type[u]);
     for (uint32_t k = 0; k < tgsi::kMaxTexelViews; ++k) o.sview_type[tgsi::kMaxUnits + k] = static_cast<tgsi::ValueType>(v.key.texel_type[s][k]);
@@ -465,6 +466,7 @@ bool VenusPipeline::make(Variant& v) {
         const bool gs_points = desc_.geometry_shader && static_cast<const VenusShaderModule*>(desc_.geometry_shader)->desc().geometry_output == GeometryTopology::PointList;
         const bool tes_points = desc_.domain_shader && static_cast<const VenusShaderModule*>(desc_.domain_shader)->desc().tess_output == TessOutput::Point;
         o.write_point_size = desc_.geometry_shader ? gs_points : desc_.domain_shader ? tes_points : topology == PrimitiveTopology::PointList;
+        o.view_offsets = (v.key.flags & kVariantViewOffsets) != 0;
         o.stream_output = so_count ? so : nullptr;
         o.stream_output_count = so_count;
         for (uint32_t b = 0; b < kMaxStreamOutputBuffers; ++b) o.stream_output_stride[b] = desc_.stream_output_stride[b] / 4;
@@ -481,6 +483,7 @@ bool VenusPipeline::make(Variant& v) {
       o.shared_bytes = m.desc().shared_memory_bytes;
     }
     o.ddy_up = m.desc().tgsi_gl;
+    o.unnormalized_units = v.key.unnormalized;
     // The program: the module's, or (marks) its text read with the bound views' numbers.
     tgsi::Program marked(device_.allocator());
     const tgsi::Program* program = &m.program();
@@ -710,7 +713,13 @@ bool VenusPipeline::make_graphics(Variant& v, const VkPipelineShaderStageCreateI
   VkSampleLocationEXT centres[16];
   for (VkSampleLocationEXT& c : centres) c = {0.5f, 0.5f};
   VkPipelineSampleLocationsStateCreateInfoEXT locations = vk_struct<VkPipelineSampleLocationsStateCreateInfoEXT>(VK_STRUCTURE_TYPE_PIPELINE_SAMPLE_LOCATIONS_STATE_CREATE_INFO_EXT);
-  if (!d.multisample && ms.rasterizationSamples > 1) {
+  if (v.key.flags & kVariantSampleLocations) {
+    // (kFeature2SamplePositions: the positions the command buffer sets - Replay::set_sample_locations, before each draw)
+    if (!(ctx.caps().sample_location_counts & ms.rasterizationSamples)) return false;
+    locations.sampleLocationsEnable = VK_TRUE;
+    locations.sampleLocationsInfo = vk_struct<VkSampleLocationsInfoEXT>(VK_STRUCTURE_TYPE_SAMPLE_LOCATIONS_INFO_EXT);
+    ms.pNext = &locations;
+  } else if (!d.multisample && ms.rasterizationSamples > 1) {
     if (!(ctx.caps().sample_location_counts & ms.rasterizationSamples)) return false;
     locations.sampleLocationsEnable = VK_TRUE;
     locations.sampleLocationsInfo = vk_struct<VkSampleLocationsInfoEXT>(VK_STRUCTURE_TYPE_SAMPLE_LOCATIONS_INFO_EXT);
@@ -770,10 +779,15 @@ bool VenusPipeline::make_graphics(Variant& v, const VkPipelineShaderStageCreateI
   __builtin_memcpy(cb.blendConstants, d.blend.constant, sizeof(cb.blendConstants));
   // the state set per draw
   // (the depth bounds test - kFeature2DepthBounds - is the command buffer's state, not the pipeline's)
-  const VkDynamicState dynamic[] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR, VK_DYNAMIC_STATE_STENCIL_REFERENCE, VK_DYNAMIC_STATE_DEPTH_BOUNDS,
-                                    VK_DYNAMIC_STATE_DEPTH_BOUNDS_TEST_ENABLE};
+  // (and so are the sample locations a command buffer sets, kFeature2SamplePositions, and coarse shading's rate and combiners, kFeature2ShadingRate)
+  VkDynamicState dynamic[8] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR, VK_DYNAMIC_STATE_STENCIL_REFERENCE};
+  uint32_t dynamic_count = 3;
+  if (ctx.caps().depth_bounds) dynamic[dynamic_count++] = VK_DYNAMIC_STATE_DEPTH_BOUNDS, dynamic[dynamic_count++] = VK_DYNAMIC_STATE_DEPTH_BOUNDS_TEST_ENABLE;
+  if (v.key.flags & kVariantSampleLocations) dynamic[dynamic_count++] = VK_DYNAMIC_STATE_SAMPLE_LOCATIONS_EXT;
+  const bool rates = device_.offers_shading_rate();
+  if (rates) dynamic[dynamic_count++] = VK_DYNAMIC_STATE_FRAGMENT_SHADING_RATE_KHR;
   VkPipelineDynamicStateCreateInfo dyn = vk_struct<VkPipelineDynamicStateCreateInfo>(VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO);
-  dyn.dynamicStateCount = ctx.caps().depth_bounds ? 5u : 3u, dyn.pDynamicStates = dynamic;
+  dyn.dynamicStateCount = dynamic_count, dyn.pDynamicStates = dynamic;
   // the attachments' formats (dynamic rendering)
   VkFormat colors[kMaxColorTargets];
   uint32_t color_count = 0;
@@ -782,8 +796,14 @@ bool VenusPipeline::make_graphics(Variant& v, const VkPipelineShaderStageCreateI
   rendering.colorAttachmentCount = color_count, rendering.pColorAttachmentFormats = colors;
   rendering.depthAttachmentFormat = static_cast<VkFormat>(v.key.depth_format);
   rendering.stencilAttachmentFormat = v.key.depth_format == VK_FORMAT_D32_SFLOAT_S8_UINT ? VK_FORMAT_D32_SFLOAT_S8_UINT : VK_FORMAT_UNDEFINED;
+  // (coarse shading: a rate of 1x1 kept by both combiners until the command buffer sets its own; a rendering may have a shading-rate image)
+  VkPipelineFragmentShadingRateStateCreateInfoKHR rate = vk_struct<VkPipelineFragmentShadingRateStateCreateInfoKHR>(VK_STRUCTURE_TYPE_PIPELINE_FRAGMENT_SHADING_RATE_STATE_CREATE_INFO_KHR);
+  rate.fragmentSize = {1, 1};
+  rate.combinerOps[0] = rate.combinerOps[1] = VK_FRAGMENT_SHADING_RATE_COMBINER_OP_KEEP_KHR;
+  if (rates) rate.pNext = rendering.pNext, rendering.pNext = &rate;
   VkGraphicsPipelineCreateInfo ci = vk_struct<VkGraphicsPipelineCreateInfo>(VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO);
   ci.pNext = &rendering;
+  if (rates) ci.flags |= VK_PIPELINE_CREATE_RENDERING_FRAGMENT_SHADING_RATE_ATTACHMENT_BIT_KHR;
   ci.stageCount = stage_count, ci.pStages = stages;
   ci.pVertexInputState = &vi, ci.pInputAssemblyState = &ia;
   ci.pTessellationState = d.hull_shader ? &ts : nullptr;

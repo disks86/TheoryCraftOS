@@ -3085,7 +3085,7 @@ NtStatus Adapter::create_shader(const ShaderDesc& desc, SharedPointer<ShaderObje
       // A shader the text cannot say (see D3d9Tgsi.cpp) is still fine for the interpreter.
       const graphics::ShaderStage stage = program->stage();
       String text(allocator_);
-      const NtStatus t = program->emit_tgsi(&text, caps_.max_varyings, &md.tgsi_bindings, caps_.d3d_sample_order);
+      const NtStatus t = program->emit_tgsi(&text, caps_.max_varyings, &md.tgsi_bindings, caps_.d3d_sample_order, caps_.features2);
       if (t == status::kNoMemory) return t;
       if (t == status::kSuccess) {
         md.sampler_constants = program->compare_units() != 0;   // (its comparisons read the bound samplers' from the constants)

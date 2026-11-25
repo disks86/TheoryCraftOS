@@ -104,6 +104,13 @@ struct CompileOptions {
   bool ddy_up = false;
   // The device has shaderOutputLayer / shaderOutputViewportIndex (a layer or viewport from a vertex or domain shader).
   bool output_layer_any_stage = false;
+  // The constant buffer's system row (0: none): x the view instance (SV VIEWINDEX), y and z what view instancing adds to the primitives' viewport and layer.
+  uint32_t system_row = 0;
+  // The last stage before the rasterizer adds the system row's y and z to the viewport index and the layer it writes (and writes them when the text does not).
+  bool view_offsets = false;
+  // Texture units whose sampler takes coordinates in texels (bit u; Direct3D 12's non-normalized samplers): the 2D coordinates of a lookup are divided by the
+  // size of the view's first level, and the lookups read that level (the sampler's levels are 0 .. 0).
+  uint32_t unnormalized_units = 0;
 };
 
 struct CompileResult {

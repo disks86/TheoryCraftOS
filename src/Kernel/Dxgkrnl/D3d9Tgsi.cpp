@@ -60,6 +60,9 @@ class TgsiEmitter {
 
   NtStatus run(String* out);
   void set_d3d_sample_order(bool v) { d3d_sample_order_ = v; }
+  // The device's graphics::DeviceFeature2 bits: what the text may say besides what virgl takes (SV_ViewID, SV_Barycentrics, GetAttributeAtVertex, SV_ShadingRate,
+  // residency feedback; the Venus device's TGSI reader takes them, VirglDevice never offers their features).
+  void set_features2(uint32_t v) { features2_ = v; }
 
  private:
   // (the emitter's registers come after the program's temporaries: the text declares no more registers than it uses)
@@ -73,11 +76,16 @@ class TgsiEmitter {
   const uint32_t kLayer = kPatchBase + graphics::kMaxPatchRegisters;   // a geometry shader's SV_RenderTargetArrayIndex (the integer in x)
   const uint32_t kCompare = kLayer + 1, kCompare2 = kLayer + 2;   // the comparison lookups' own (kTexCompare: a cube's face, the passes)
   const uint32_t kViewportIndex = kLayer + 3;                       // ... and a geometry shader's SV_ViewportArrayIndex
-  const uint32_t kTempCount = kLayer + 4;
+  const uint32_t kShadingRate = kLayer + 4;                         // ... and a vertex or geometry shader's SV_ShadingRate (the integer in x; kFeature2ShadingRate)
+  const uint32_t kTempCount = kLayer + 5;
+  static constexpr uint32_t kViewIdSv = 7;                          // SV[7]: VIEWINDEX in every stage (kFeature2ViewInstancing)
   uint32_t color_register(uint32_t target) const { return target == 0 ? kColor : kColorExtra + target - 1; }
   // The first output after the position and the varyings: the position as the shader wrote it (one a stream), or a hull shader's tessellation factors. (With the device's four
   // varyings of old it was OUT[5]; virgl's stream output declaration names the same register: VirglShaderModule.)
   uint32_t extra() const { return varyings_ + 1; }
+  // A vertex or geometry shader's SV_ShadingRate output (kFeature2ShadingRate): after the position as written, and a geometry shader's layer and viewport.
+  uint32_t rate_output() const { return geometry_ ? extra() + p_.geometry_streams() + (p_.writes_layer_ ? 1 : 0) + (p_.writes_viewport_ ? 1 : 0) : extra() + 1; }
+  bool writes_rate_ = false;
   static constexpr uint32_t kMaxOutput = 8u << 20;   // (virgl takes the text in pieces: VirglShaderModule)
 
   struct Imm {
@@ -325,12 +333,18 @@ class TgsiEmitter {
     return temp(kWork3, ".xxxx");
   }
   bool instruction(const Instr& ins);
+  bool instruction_body(const Instr& ins);
   bool compare(const Instr& ins);
   void assemble(String* out);
   void write_control_point_outputs();
 
   const D3d9Program& p_;
   bool d3d_sample_order_ = false;
+  uint32_t features2_ = 0;
+  bool per_vertex_in_[16] = {};   // a pixel shader's input read at a vertex (GetAttributeAtVertex): declared per vertex, its other reads vertex 0's (it is nointerpolation)
+  bool views() const { return (features2_ & graphics::kFeature2ViewInstancing) != 0; }
+  bool barycentrics() const { return (features2_ & graphics::kFeature2Barycentrics) != 0; }
+  bool shading_rates() const { return (features2_ & graphics::kFeature2ShadingRate) != 0; }
   allocators::IAllocator& a_;
   String body_;
   List<Imm> imms_;
@@ -379,8 +393,19 @@ String TgsiEmitter::operand(const Instr::Src& s, uint32_t offset, uint32_t slot,
       add(base, "]");
       break;
     case kInput:
-      if (s.at_vertex) {   // (GetAttributeAtVertex: virgl's TGSI here has no per-vertex inputs of a pixel shader)
+      if (s.at_vertex && (!barycentrics() || vertex_ || geometry_ || hull_ || domain_ || compute_ || s.slot < 0 || s.slot >= 16 || s.vertex > 2)) {
+        // (GetAttributeAtVertex: a pixel shader's per-vertex input, on a device with kFeature2Barycentrics; virgl's TGSI has none)
         unsupported_ = true;
+        break;
+      }
+      if (!vertex_ && !geometry_ && !hull_ && !domain_ && !compute_ && s.slot >= 0 && s.slot < 16 && per_vertex_in_[s.slot]) {
+        // IN[vertex][slot] (a nointerpolation input: every other read of it is the first vertex's, which is what a flat one gives)
+        in_used_[s.slot] = true;
+        add(base, "IN[");
+        add_uint(base, s.at_vertex ? s.vertex : 0u);
+        add(base, "][");
+        add_uint(base, static_cast<uint32_t>(s.slot));
+        add(base, "]");
         break;
       }
       if (hull_ || domain_) {
@@ -447,6 +472,13 @@ String TgsiEmitter::operand(const Instr::Src& s, uint32_t offset, uint32_t slot,
       add(base, "]");
       break;
     case kSysValue:   // (copied to a register by the prologue; the stage decides which exist)
+      if (s.number == kSysViewId && views() && !compute_) {
+        // (SV_ViewID of view instancing: the prologue's copy of SV[7], VIEWINDEX)
+        add(base, "TEMP[");
+        add_uint(base, kSys + s.number);
+        add(base, "]");
+        break;
+      }
       if (s.number == kSysViewId) {
         // (SV_ViewID on a device without view instancing - virgl -: every draw is view 0, which Direct3D 12 says a driver without it gives a shader that reads it)
         const float none[4] = {0, 0, 0, 0};
@@ -461,6 +493,18 @@ String TgsiEmitter::operand(const Instr::Src& s, uint32_t offset, uint32_t slot,
       }
       if (s.number == kSysDomainLocation && !domain_) {
         unsupported_ = true;
+        break;
+      }
+      if ((s.number == kSysBarycentrics || s.number == kSysBarycentricsLinear) && barycentrics() && !vertex_ && !geometry_ && !hull_ && !domain_ && !compute_) {
+        add(base, "TEMP[");   // (SV_Barycentrics of a pixel shader: the prologue's copy of its BARYCENTRIC input)
+        add_uint(base, kSys + s.number);
+        add(base, "]");
+        break;
+      }
+      if (s.number == kSysShadingRate && shading_rates() && !vertex_ && !geometry_ && !hull_ && !domain_ && !compute_) {
+        add(base, "TEMP[");   // (SV_ShadingRate of a pixel shader: its SHADINGRATE input)
+        add_uint(base, kSys + s.number);
+        add(base, "]");
         break;
       }
       if (s.number >= kSysViewId || (geometry_ ? s.number != kSysGsInstanceId && s.number != kSysPrimitiveId : s.number == kSysGsInstanceId) || (compute_ || hull_ || domain_ ? s.number < kSysDispatchThreadId : vertex_ ? s.number != kSysVertexId && s.number != kSysInstanceId : s.number == kSysVertexId || s.number == kSysInstanceId || s.number >= kSysDispatchThreadId)) {
@@ -569,8 +613,9 @@ String TgsiEmitter::destination(const Instr::Dst& d) {
     case kTemp: return temp(d.number, "");
     case kRastOut:
       if ((d.slot == kSlotLayer || d.slot == kSlotViewport) && !geometry_) unsupported_ = true;
-      if (d.slot == kSlotShadingRate) unsupported_ = true;   // (SV_ShadingRate: virgl has no coarse shading)   // (virglrenderer takes a vertex or evaluation shader's layer and viewport from no TGSI it is given)
-      return temp(d.slot == kSlotLayer ? kLayer : d.slot == kSlotViewport ? kViewportIndex : kPosition, "");
+      // (SV_ShadingRate: a vertex or geometry shader's, on a device with coarse shading - virgl has none)   // (virglrenderer takes a vertex or evaluation shader's layer and viewport from no TGSI it is given)
+      if (d.slot == kSlotShadingRate && (!shading_rates() || !(vertex_ || geometry_))) unsupported_ = true;
+      return temp(d.slot == kSlotLayer ? kLayer : d.slot == kSlotViewport ? kViewportIndex : d.slot == kSlotShadingRate ? kShadingRate : kPosition, "");
     case kAttrOut:
     case kTexCrdOut:
       if (d.slot == kSlotPosition) return temp(kPosition, "");
@@ -631,7 +676,28 @@ bool TgsiEmitter::compare(const Instr& ins) {
   return true;
 }
 
+// An instruction, and around a lookup with residency feedback or a clamp (kFeature2TileResidency) SPARSE_BEGIN [clamp] and SPARSE_END status: the Venus device's
+// reader makes the lookups between them sparse ones (the status 1 when every texel they read was resident, 0 if not, as the interpreter's end_feedback gives).
 bool TgsiEmitter::instruction(const Instr& ins) {
+  if (!ins.feedback) return instruction_body(ins);
+  if (!(features2_ & graphics::kFeature2TileResidency)) {
+    unsupported_ = true;
+    return true;
+  }
+  if (ins.has_clamp) {
+    const String clamp = component(ins.clamp, 0, 3);
+    line("SPARSE_BEGIN", &clamp);
+  } else {
+    line("SPARSE_BEGIN");
+  }
+  const bool ok = instruction_body(ins);
+  String status = ins.status.mask ? destination(ins.status) : temp(kWork3);
+  if (ins.status.mask) add(status, mask_text(ins.status.mask).view());
+  line("SPARSE_END", &status);
+  return ok;
+}
+
+bool TgsiEmitter::instruction_body(const Instr& ins) {
   force_integer_ = false;
   const uint16_t op = ins.op;
   relative_key_ = -2;
@@ -1001,6 +1067,14 @@ bool TgsiEmitter::instruction(const Instr& ins) {
         add(index, "].x");
         const String value = temp(p_.viewport_shares_layer_ ? kLayer : kViewportIndex, kSplat[p_.viewport_component_ & 3]);
         line("MOV", &index, &value);
+      }
+      if (writes_rate_) {   // (SV_ShadingRate: the output after those)
+        String rate = str();
+        add(rate, "OUT[");
+        add_uint(rate, rate_output());
+        add(rate, "].x");
+        const String value = temp(kShadingRate, ".xxxx");
+        line("MOV", &rate, &value);
       }
       line("EMIT", &stream);
       return true;
@@ -1882,6 +1956,11 @@ void TgsiEmitter::assemble(String* out) {
       add_uint(*out, extra() + p_.geometry_streams() + (p_.writes_layer_ ? 1 : 0));
       add(*out, "], VIEWPORT_INDEX\n");
     }
+    if (writes_rate_) {
+      add(*out, "DCL OUT[");
+      add_uint(*out, rate_output());
+      add(*out, "], SHADINGRATE\n");
+    }
   }
   if (hull_ || domain_) {
     if (hull_) {
@@ -1964,18 +2043,39 @@ void TgsiEmitter::assemble(String* out) {
     add(*out, "], GENERIC[");
     add_uint(*out, varyings_);
     add(*out, "]\n");
+    if (writes_rate_) {
+      add(*out, "DCL OUT[");
+      add_uint(*out, rate_output());
+      add(*out, "], SHADINGRATE\n");
+    }
   } else {
     for (uint32_t i = 0; i < 16; ++i) {
       if (!in_used_[i]) continue;
-      add(*out, "DCL IN[");
+      add(*out, per_vertex_in_[i] ? "DCL IN[][" : "DCL IN[");
       add_uint(*out, i);
       add(*out, "], GENERIC[");
       add_uint(*out, i);
-      add(*out, "], PERSPECTIVE\n");
+      add(*out, per_vertex_in_[i] ? "]\n" : "], PERSPECTIVE\n");
     }
     if (sys_used_[kSysPosition]) add(*out, "DCL IN[16], POSITION, LINEAR\n");
     if (sys_used_[kSysFrontFacing]) add(*out, "DCL IN[17], FACE, CONSTANT\n");
     if (sys_used_[kSysPrimitiveId]) add(*out, "DCL IN[18], PRIM_ID, CONSTANT\n");
+    // (Shader Model 6.1's pixel inputs, on the devices that have them: SV_Barycentrics perspective-correct and noperspective, SV_ShadingRate)
+    if (sys_used_[kSysBarycentrics] && barycentrics()) {
+      add(*out, "DCL IN[");
+      add_uint(*out, 16 + kSysBarycentrics);
+      add(*out, "], BARYCENTRIC, PERSPECTIVE\n");
+    }
+    if (sys_used_[kSysBarycentricsLinear] && barycentrics()) {
+      add(*out, "DCL IN[");
+      add_uint(*out, 16 + kSysBarycentricsLinear);
+      add(*out, "], BARYCENTRIC, LINEAR\n");
+    }
+    if (sys_used_[kSysShadingRate] && shading_rates()) {
+      add(*out, "DCL IN[");
+      add_uint(*out, 16 + kSysShadingRate);
+      add(*out, "], SHADINGRATE, CONSTANT\n");
+    }
     add(*out, "DCL OUT[0], COLOR\n");
     for (uint32_t i = 1; i < p_.color_outputs_; ++i) {
       add(*out, "DCL OUT[");
@@ -1984,6 +2084,11 @@ void TgsiEmitter::assemble(String* out) {
       add_uint(*out, i);
       add(*out, "]\n");
     }
+  }
+  if (sys_used_[kSysViewId] && views() && !compute_) {
+    add(*out, "DCL SV[");
+    add_uint(*out, kViewIdSv);
+    add(*out, "], VIEWINDEX\n");
   }
   // The samplers and views the program reads, in whichever stage it is (a vertex or compute shader reads textures too)
   for (uint32_t i = 0; i < graphics::kMaxTextureUnits; ++i) {
@@ -2090,6 +2195,14 @@ if (vertex_ || domain_) {
       const String v = temp(kVarying + i);
       line("MOV", &target, &v);
     }
+    if (writes_rate_ && vertex_) {
+      String rate = str();
+      add(rate, "OUT[");
+      add_uint(rate, rate_output());
+      add(rate, "].x");
+      const String value = temp(kShadingRate, ".xxxx");
+      line("MOV", &rate, &value);
+    }
 } else if (!compute_) {
     for (uint32_t i = 0; i < p_.color_outputs_; ++i) {
       String o = str();
@@ -2137,11 +2250,14 @@ NtStatus TgsiEmitter::run(String* out) {
   if (!assign_bindings()) return status::kNotSupported;   // (more buffers, images or views of buffers than the host binds in a stage)
   for (const Instr& ins : p_.code_.view()) {
     if (ins.dst.type == kAddrTex) addr_used_ = true;
+    if (ins.dst.type == kRastOut && ins.dst.slot == kSlotShadingRate) writes_rate_ = true;
     for (uint32_t k = 0; k < ins.src_count; ++k) {
       if (ins.src[k].relative) addr_used_ = true;
       if (ins.src[k].type == kSysValue && ins.src[k].number < kSysValueCount) sys_used_[ins.src[k].number] = true;
+      if (ins.src[k].type == kInput && ins.src[k].at_vertex && ins.src[k].slot >= 0 && ins.src[k].slot < 16) per_vertex_in_[ins.src[k].slot] = true;
     }
   }
+  if (writes_rate_ && (!shading_rates() || !(vertex_ || geometry_))) return status::kNotSupported;
 
   // A geometry shader's input positions, turned back to Direct3D's clip space (the vertex shader's text flips Y for the host).
   if (geometry_) {
@@ -2169,6 +2285,24 @@ NtStatus TgsiEmitter::run(String* out) {
   for (uint32_t k = 0; k < kSysValueCount; ++k) {
     if (!sys_used_[k]) continue;
     const String reg = temp(kSys + k), reg_x = temp(kSys + k, ".x");
+    if (k == kSysViewId && views() && !compute_) {   // (SV_ViewID: VIEWINDEX, in every stage)
+      String source = str();
+      add(source, "SV[");
+      add_uint(source, kViewIdSv);
+      add(source, "].xxxx");
+      line("MOV", &reg, &z);
+      line("MOV", &reg_x, &source);
+      continue;
+    }
+    if (k == kSysViewId) continue;   // (read as the immediate 0)
+    if ((k == kSysBarycentrics || k == kSysBarycentricsLinear) && barycentrics() && !vertex_ && !compute_ && !geometry_ && !hull_ && !domain_) {
+      String source = str();   // (the three weights, w 0)
+      add(source, "IN[");
+      add_uint(source, 16 + k);
+      add(source, "]");
+      line("MOV", &reg, &source);
+      continue;
+    }
     if (compute_) {
       // (the thread's numbers: BLOCK_ID and THREAD_ID of TGSI, and the dispatch number and the number in the group worked out from them)
       const String z0 = zero();
@@ -2257,6 +2391,10 @@ NtStatus TgsiEmitter::run(String* out) {
     line("MOV", &reg, &z);
     if (k == kSysFrontFacing) line("FSGE", &reg_x, &source, &z);   // (TGSI's FACE is +1 or -1)
     else line("MOV", &reg_x, &source);
+  }
+  if (writes_rate_) {
+    const String rate = temp(kShadingRate);
+    line("MOV", &rate, &z);
   }
   if (vertex_ || geometry_ || hull_ || domain_) {
     const String pos = temp(kPosition);
@@ -2373,10 +2511,12 @@ NtStatus TgsiEmitter::run(String* out) {
   return status::kSuccess;
 }
 
-NtStatus D3d9Program::emit_tgsi(String* out, uint32_t varyings, graphics::TgsiBindings* bindings, bool d3d_sample_order) const {
-  if (uses_feedback_) return status::kNotSupported;   // (TGSI has no residency feedback or per-lookup clamp: virgl reports tiled resources tier 1)
+NtStatus D3d9Program::emit_tgsi(String* out, uint32_t varyings, graphics::TgsiBindings* bindings, bool d3d_sample_order, uint32_t features2) const {
+  // (Gallium's TGSI has no residency feedback or per-lookup clamp - virgl reports tiled resources tier 1 -; the Venus device's reader has SPARSE_BEGIN / SPARSE_END)
+  if (uses_feedback_ && !(features2 & graphics::kFeature2TileResidency)) return status::kNotSupported;
   TgsiEmitter emitter(*this, allocator_, varyings < graphics::kMaxVaryings ? varyings : graphics::kMaxVaryings);
   emitter.set_d3d_sample_order(d3d_sample_order);
+  emitter.set_features2(features2);
   const NtStatus s = emitter.run(out);
   if (s == status::kSuccess && bindings) *bindings = emitter.bindings();
   return s;

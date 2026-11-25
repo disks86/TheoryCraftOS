@@ -20,6 +20,10 @@
 // src/WebGl/TgsiTranslator.cpp, the built-in shaders and the devices' own small shaders). This is the reader the Venus device's SPIR-V compiler (TgsiSpirv.hpp)
 // works from; it reads the whole language those producers write, the way Gallium's tgsi_text.c does:
 //
+// Besides Gallium's language it takes what the Direct3D layer writes for the devices that offer more than virgl: the semantics BARYCENTRIC (a fragment input:
+// SV_Barycentrics, PERSPECTIVE or LINEAR) and SHADINGRATE (SV_ShadingRate: a vertex or geometry output, or a fragment input), per-vertex fragment inputs
+// (DCL IN[][a]: GetAttributeAtVertex, IN[v][a] the value of vertex v of the primitive), and SPARSE_BEGIN / SPARSE_END around the lookups of one residency feedback.
+//
 //   VERT | FRAG | GEOM | TESS_CTRL | TESS_EVAL | COMP
 //   PROPERTY <NAME> <value>...
 //   DCL <FILE>[a] | [a..b] | [][a] | [][a..b] | [a][b..c] [, <semantic>[<index>]] [, <interpolation>] [, <target>, <return type> | <format>, WR] [, ARRAY(n)] [, SHARED]
@@ -62,6 +66,9 @@ enum class Op : uint8_t {
   Load, Store, Resq, AtomUadd, AtomAnd, AtomOr, AtomXor, AtomImax, AtomImin, AtomUmax, AtomUmin, AtomXchg, AtomCas,
   // control
   If, Uif, Else, EndIf, BgnLoop, EndLoop, Brk, Cont, Ret, End, Emit, EndPrim, Membar, Barrier, Nop,
+  // residency feedback (this reader's own, which only the Direct3D layer writes for a device with kFeature2TileResidency): the texture lookups between SPARSE_BEGIN
+  // [lod] and SPARSE_END dst report whether every texel they read was resident - dst is 1 then, 0 if not -, and take `lod` (a float) as their finest level of detail
+  SparseBegin, SparseEnd,
   kCount,
 };
 
@@ -81,7 +88,10 @@ enum class ReturnType : uint8_t { Float, Unorm, Snorm, Uint, Sint };
 enum class Semantic : uint8_t { None, Position, Color, BColor, Fog, Psize, Generic, Normal, Face, EdgeFlag, PrimId, InstanceId, VertexId, StencilRef, CullDist, ClipDist,
                                 ClipVertex, GridSize, BlockId, BlockSize, ThreadId, TexCoord, Pcoord, ViewportIndex, Layer, SampleId, SamplePos, SampleMask,
                                 InvocationId, VertexIdNoBase, BaseVertex, PrimitiveId, TessCoord, VerticesIn, Patch, TessOuter, TessInner, VertexOut, ViewportMask,
-                                HelperInvocation, BaseInstance, DrawId, WorkDim, SubgroupSize, SubgroupInvocation };
+                                HelperInvocation, BaseInstance, DrawId, WorkDim, SubgroupSize, SubgroupInvocation, ViewIndex,
+                                // (not Gallium's: the Direct3D layer's SV_Barycentrics - a fragment input, PERSPECTIVE or LINEAR - and SV_ShadingRate - a vertex
+                                // or geometry output, the primitive's rate, or a fragment input, the coarse pixel's)
+                                Barycentric, ShadingRate };
 
 enum class Interpolation : uint8_t { Default, Constant, Linear, Perspective, Color };
 enum class InterpolationLocation : uint8_t { Center, Centroid, Sample };

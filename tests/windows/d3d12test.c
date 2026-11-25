@@ -40,6 +40,8 @@ static int checks, failed;
 
 static int g_hardware;      /* the adapter is a GPU (not the CPU renderer) */
 static int g_layer_any;     /* the adapter takes a layer and a viewport from a vertex or domain shader: the CPU renderer and the Venus device (the host's Vulkan), not virgl */
+static int g_venus;         /* the adapter is the Venus device (the host's Vulkan): sample positions, view instancing, barycentrics, coordinates in texels and tiled tier 4 as the CPU
+                             * renderer, where the host's driver has them (RADV here); coarse shading only where its coarse pixels reach 4x4 */
 static const float kIdentity[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
 
 static ID3D12Resource *make_buffer(ID3D12Device *dev, D3D12_HEAP_TYPE type, UINT64 size, D3D12_RESOURCE_FLAGS flags, D3D12_RESOURCE_STATES state) {
@@ -73,7 +75,8 @@ static void test_dxgi(IDXGIAdapter1 **adapter_out) {
     printf("adapter: %ls (flags %x)\n", d.Description, (unsigned)d.Flags);
     printf("device: %s\n", (d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) ? "software (the CPU renderer)" : "hardware");
     g_hardware = !(d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE);
-    g_layer_any = !g_hardware || wcsstr(d.Description, L"Venus") != NULL;
+    g_venus = wcsstr(d.Description, L"Venus") != NULL;
+    g_layer_any = !g_hardware || g_venus;
     IDXGIOutput *output = NULL;
     CHECK_HR(IDXGIAdapter1_EnumOutputs(adapter, 0, &output));
     if (output) {
@@ -1370,7 +1373,7 @@ static void test_tiled(Scene *c) {
   ID3D12Device *dev = c->dev;
   D3D12_FEATURE_DATA_D3D12_OPTIONS opts;
   CHECK_HR(ID3D12Device_CheckFeatureSupport(dev, D3D12_FEATURE_D3D12_OPTIONS, &opts, sizeof opts));
-  CHECK(opts.TiledResourcesTier == (g_hardware ? D3D12_TILED_RESOURCES_TIER_1 : D3D12_TILED_RESOURCES_TIER_4));      /* (test_tiled_tiers) */
+  CHECK(opts.TiledResourcesTier == (g_hardware && !g_venus ? D3D12_TILED_RESOURCES_TIER_1 : D3D12_TILED_RESOURCES_TIER_4));      /* (test_tiled_tiers) */
   D3D12_HEAP_DESC hd;
   memset(&hd, 0, sizeof hd);
   hd.SizeInBytes = 2 * 65536;
@@ -7270,7 +7273,7 @@ static void test_tiled_tiers(Scene *c) {
   CHECK_HR(ID3D12Device_CheckFeatureSupport(dev, D3D12_FEATURE_D3D12_OPTIONS, &opts, sizeof opts));
   const D3D12_TILED_RESOURCES_TIER tier = opts.TiledResourcesTier;
   printf("tiled resources tier %d\n", (int)tier);
-  CHECK(tier == (g_hardware ? D3D12_TILED_RESOURCES_TIER_1 : D3D12_TILED_RESOURCES_TIER_4));
+  CHECK(tier == (g_hardware && !g_venus ? D3D12_TILED_RESOURCES_TIER_1 : D3D12_TILED_RESOURCES_TIER_4));      /* (Venus: sparse images) */
   /* (tiled formats: block-compressed ones too, not depth; no multisampled reserved textures) */
   CHECK(format_support2(dev, DXGI_FORMAT_BC1_UNORM) & D3D12_FORMAT_SUPPORT2_TILED);
   CHECK(format_support2(dev, DXGI_FORMAT_BC7_UNORM) & D3D12_FORMAT_SUPPORT2_TILED);
@@ -7873,7 +7876,7 @@ static void test_sampler_filters(Scene *c) {
       CHECK(near_value(got[0][0], 0.5f, 0.02f) && near_value(got[1][1], 96.0f / 255.0f, 0.01f) && got[5][2] == 0.0f);
     } else CHECK(0);
     s.Filter = D3D12_FILTER_MAXIMUM_MIN_MAG_LINEAR_MIP_POINT;
-    if (software && sampler_dispatch(c, rs, tex, DXGI_FORMAT_R8G8B8A8_UNORM, &s, 0.0f, 1, got)) CHECK(got[0][0] == 1.0f);
+    if ((software || g_venus) && sampler_dispatch(c, rs, tex, DXGI_FORMAT_R8G8B8A8_UNORM, &s, 0.0f, 1, got)) CHECK(got[0][0] == 1.0f);
   }
   /* (the descriptions a non-normalized sampler may not have, a filter that is not one and flags that do not exist write null descriptors: CreateSampler2 is void - the call is
    * made, and nothing crashes) */
@@ -8246,7 +8249,7 @@ static void test_later_queries(ID3D12Device *dev) {
   D3D12_FEATURE_DATA_D3D12_OPTIONS3 o3;
   CHECK_HR(ID3D12Device_CheckFeatureSupport(dev, D3D12_FEATURE_D3D12_OPTIONS3, &o3, sizeof o3));
   CHECK(o3.WriteBufferImmediateSupportFlags & D3D12_COMMAND_LIST_SUPPORT_FLAG_DIRECT);
-  CHECK(o3.ViewInstancingTier == (g_hardware ? D3D12_VIEW_INSTANCING_TIER_NOT_SUPPORTED : D3D12_VIEW_INSTANCING_TIER_2));      /* (draw-call looping on the CPU renderer: test_raster_features) */
+  CHECK(o3.ViewInstancingTier == (g_hardware && !g_venus ? D3D12_VIEW_INSTANCING_TIER_NOT_SUPPORTED : D3D12_VIEW_INSTANCING_TIER_2));      /* (draw-call looping on the CPU renderer and Venus: test_raster_features) */
   D3D12_FEATURE_DATA_D3D12_OPTIONS5 o5;
   CHECK_HR(ID3D12Device_CheckFeatureSupport(dev, D3D12_FEATURE_D3D12_OPTIONS5, &o5, sizeof o5));
   CHECK(o5.RenderPassesTier == D3D12_RENDER_PASS_TIER_0 && o5.RaytracingTier == D3D12_RAYTRACING_TIER_NOT_SUPPORTED);
@@ -8825,7 +8828,7 @@ static void test_cpu_texture(ID3D12Device *dev, ID3D12CommandQueue *queue, ID3D1
   D3D12_FEATURE_DATA_D3D12_OPTIONS options;
   memset(&options, 0, sizeof options);
   CHECK_HR(ID3D12Device_CheckFeatureSupport(dev, D3D12_FEATURE_D3D12_OPTIONS, &options, sizeof options));
-  CHECK(options.StandardSwizzle64KBSupported && options.TiledResourcesTier == (g_hardware ? D3D12_TILED_RESOURCES_TIER_1 : D3D12_TILED_RESOURCES_TIER_4) &&
+  CHECK(options.StandardSwizzle64KBSupported && options.TiledResourcesTier == (g_hardware && !g_venus ? D3D12_TILED_RESOURCES_TIER_1 : D3D12_TILED_RESOURCES_TIER_4) &&
         options.ConservativeRasterizationTier <= D3D12_CONSERVATIVE_RASTERIZATION_TIER_1);
   D3D12_RESOURCE_DESC sd = {D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, 16, 16, 1, 1, DXGI_FORMAT_R8G8B8A8_UNORM, {1, 0}, D3D12_TEXTURE_LAYOUT_64KB_STANDARD_SWIZZLE, D3D12_RESOURCE_FLAG_NONE};
   ID3D12Resource *sw = NULL;
@@ -9002,7 +9005,7 @@ static void test_root_signature_12(ID3D12Device *dev) {
    * (a MaxLOD that is not 0) is a root signature no device takes, one that keeps them is made (the draws that use it are the device's to refuse) */
   D3D12_FEATURE_DATA_D3D12_OPTIONS17 o17;
   CHECK_HR(ID3D12Device_CheckFeatureSupport(dev, D3D12_FEATURE_D3D12_OPTIONS17, &o17, sizeof o17));
-  CHECK(o17.NonNormalizedCoordinateSamplersSupported == !g_hardware);
+  CHECK(o17.NonNormalizedCoordinateSamplersSupported == (!g_hardware || g_venus));      /* (Venus: the shaders divide by the level's size) */
   ss[0].Flags = D3D12_SAMPLER_FLAG_NON_NORMALIZED_COORDINATES;
   ss[0].BorderColor = D3D12_STATIC_BORDER_COLOR_OPAQUE_BLACK;
   ss[0].MaxLOD = 0.0f;
@@ -9627,7 +9630,8 @@ static UINT32 scene_pixel(Scene *c, int x, int y) {
   return v;
 }
 
-/* What the device says of the five features, the same throughout: the CPU renderer has them all, a GPU here none (virgl). */
+/* What the device says of the five features, the same throughout: the CPU renderer has them all, virgl none, the Venus device (RADV here) all but coarse shading, whose
+ * coarse pixels stop at 2x2 there (Direct3D's tier 2 has 4x4 with AdditionalShadingRatesSupported). */
 static void test_raster_caps(ID3D12Device *dev, D3D12_FEATURE_DATA_D3D12_OPTIONS2 *o2, D3D12_FEATURE_DATA_D3D12_OPTIONS3 *o3, D3D12_FEATURE_DATA_D3D12_OPTIONS6 *o6) {
   D3D12_FEATURE_DATA_D3D12_OPTIONS10 o10;
   CHECK_HR(ID3D12Device_CheckFeatureSupport(dev, D3D12_FEATURE_D3D12_OPTIONS2, o2, sizeof *o2));
@@ -9642,6 +9646,10 @@ static void test_raster_caps(ID3D12Device *dev, D3D12_FEATURE_DATA_D3D12_OPTIONS
     CHECK(o2->DepthBoundsTestSupported && o2->ProgrammableSamplePositionsTier == D3D12_PROGRAMMABLE_SAMPLE_POSITIONS_TIER_2);
     CHECK(o3->ViewInstancingTier == D3D12_VIEW_INSTANCING_TIER_2 && o3->BarycentricsSupported);
     CHECK(o6->VariableShadingRateTier == D3D12_VARIABLE_SHADING_RATE_TIER_2 && o6->ShadingRateImageTileSize == 16 && o6->AdditionalShadingRatesSupported && !o6->BackgroundProcessingSupported);
+  }
+  if (g_venus) {
+    CHECK(o2->DepthBoundsTestSupported && o2->ProgrammableSamplePositionsTier == D3D12_PROGRAMMABLE_SAMPLE_POSITIONS_TIER_2);
+    CHECK(o3->ViewInstancingTier == D3D12_VIEW_INSTANCING_TIER_2 && o3->BarycentricsSupported);
   }
   /* (tier 2 has the tile size of 8 or 16, the others none; the SUM combiner goes with tier 2) */
   CHECK(o6->VariableShadingRateTier == D3D12_VARIABLE_SHADING_RATE_TIER_2 ? o6->ShadingRateImageTileSize == 8 || o6->ShadingRateImageTileSize == 16 : o6->ShadingRateImageTileSize == 0);

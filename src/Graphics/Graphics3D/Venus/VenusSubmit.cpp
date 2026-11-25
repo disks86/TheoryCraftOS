@@ -22,6 +22,7 @@
 #include <new>
 #include "Graphics/Graphics3D/Mipmaps.hpp"
 #include "Graphics/Graphics3D/Venus/VenusObjects.hpp"
+#include "Utility/ByteStream.hpp"
 
 namespace graphics {
 
@@ -218,6 +219,7 @@ class Replay {
   Replay(VenusDevice& device, VenusCommands& commands)
       : d_(device), vk_(device.vk()), rec_(commands), views_(device.allocator()), pipelines_(device.allocator()), segments_(device.allocator()), so_draws_(device.allocator()) {
     for (int32_t& c : current_) c = -1;
+    features2_ = device.info().features2;
   }
   bool run();
   void release();   // (after the GPU is done: what the replay made for itself)
@@ -245,6 +247,21 @@ class Replay {
   void segment_open(uint32_t category, bool no_fragment);
   void set_depth_bounds_state();
   bool copy_samples(const RecordedCommand& c);
+  // gap pass 5: sample positions, view instancing, coarse shading
+  bool set_sample_positions(const RecordedCommand& c, ConstByteView all_constants);
+  bool custom_locations() const;
+  void set_sample_locations();
+  bool set_shading_rate_image(VenusImage* image);
+  bool prepare_rate_attachment();
+  VkRenderingFragmentShadingRateAttachmentInfoKHR rate_info() {
+    VkRenderingFragmentShadingRateAttachmentInfoKHR r = vk_struct<VkRenderingFragmentShadingRateAttachmentInfoKHR>(VK_STRUCTURE_TYPE_RENDERING_FRAGMENT_SHADING_RATE_ATTACHMENT_INFO_KHR);
+    const VenusDevice::RateAttachment* a = rate_attached_ ? d_.rate_attachment(cb_) : nullptr;
+    r.imageView = a ? a->view : nullptr;
+    r.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+    r.shadingRateAttachmentTexelSize = {d_.context().caps().shading_rate_texel, d_.context().caps().shading_rate_texel};
+    return r;
+  }
+  void set_fragment_shading_rate();
   bool read_queries();
   bool resolve(const RecordedCommand& c);
   // stream output
@@ -293,6 +310,17 @@ class Replay {
   // the depth bounds test (kFeature2DepthBounds; dynamic state, set before a draw when it changed or the command buffer is new)
   bool depth_bounds_ = false, depth_bounds_dirty_ = true;
   float depth_min_ = 0, depth_max_ = 1;
+  uint32_t features2_ = 0;   // (the device's DeviceInfo::features2: the commands of features it does not offer fail the submit)
+  // the sample positions set (kFeature2SamplePositions; 0 pixels: the standard ones)
+  uint32_t positions_samples_ = 0, positions_pixels_ = 0;
+  SamplePosition positions_[kMaxSamplePositions];
+  // view instancing (kFeature2ViewInstancing): the view of the draws that follow and what is added to their viewport and layer (the constants' system row)
+  uint32_t view_id_ = 0, view_viewport_ = 0, view_layer_ = 0;
+  // coarse shading (kFeature2ShadingRate): the rate, the combiners, the shading-rate image and whether the current rendering reads it
+  uint32_t rate_ = 0;
+  ShadingRateCombiner rate_primitive_ = ShadingRateCombiner::Passthrough, rate_image_combiner_ = ShadingRateCombiner::Passthrough;
+  VenusImage* rate_image_ = nullptr;
+  bool rate_attached_ = false;
   // what the replay made
   struct MadeView {
     VkBufferView view;
@@ -486,6 +514,9 @@ bool Replay::begin_pass(const RenderPassBegin& p) {
   ri.pDepthAttachment = depth ? &dz : nullptr;
   ri.pStencilAttachment = depth && depth->desc().stencil ? &st : nullptr;
   segments_close();
+  if (!prepare_rate_attachment()) return false;
+  VkRenderingFragmentShadingRateAttachmentInfoKHR rate = rate_info();
+  if (rate_attached_) ri.pNext = &rate;
   vk_.CmdBeginRendering(cb_, &ri);
   rendering_ = true;
   segments_open();
@@ -514,6 +545,9 @@ bool Replay::resume_rendering() {
   ri.pDepthAttachment = depth_ ? &dz : nullptr;
   ri.pStencilAttachment = depth_ && depth_->desc().stencil ? &dz : nullptr;
   segments_close();
+  if (!prepare_rate_attachment()) return false;
+  VkRenderingFragmentShadingRateAttachmentInfoKHR rate = rate_info();
+  if (rate_attached_) ri.pNext = &rate;
   vk_.CmdBeginRendering(cb_, &ri);
   rendering_ = true;
   segments_open();
@@ -537,7 +571,7 @@ void Replay::end_pass() {
 uint32_t Replay::constants_offset(bool* ok) {
   *ok = true;
   if (!constants_dirty_) return constants_at_;
-  constexpr uint32_t kBlock = (kSamplerCompareRegister + kMaxTextureUnits) * 16;
+  constexpr uint32_t kBlock = kVenusConstantRows * 16;
   const uint32_t align = d_.uniform_alignment();
   const uint32_t at = (ring_used_ + align - 1) / align * align;
   VenusMemory& ring = d_.constants_ring();
@@ -553,6 +587,9 @@ uint32_t Replay::constants_offset(bool* ok) {
     sampler_compare_constant(textures_[u].image ? textures_[u].sampler.compare : CompareOp::Never, textures_[u].image && textures_[u].sampler.filter == Filter::Linear, row);
     (void)block.subview(uint64_t{kSamplerCompareRegister + u} * 16, 16).copy_from(ConstByteView(reinterpret_cast<const uint8_t*>(row), 16));   // (four floats' bytes)
   }
+  // (the system row: the view of view instancing - SV_ViewID - and what is added to the primitives' viewport and layer, as 32-bit unsigned numbers)
+  ByteWriter system(block.subview(uint64_t{kVenusSystemRow} * 16, 16));
+  system.le32(view_id_), system.le32(view_viewport_), system.le32(view_layer_), system.le32(0);
   constants_at_ = at;
   ring_used_ = at + kBlock;
   constants_dirty_ = false;
@@ -566,6 +603,7 @@ bool Replay::key_for(VenusPipeline& p, VenusVariantKey* key) {
     if (textures_[u].image) {
       const bool stencil = textures_[u].sampler.stencil && textures_[u].image->desc().stencil;
       key->unit_type[u] = static_cast<uint8_t>(stencil ? tgsi::ValueType::Uint : value_of(textures_[u].image->format()));
+      if (textures_[u].sampler.unnormalized) key->unnormalized |= 1u << u;   // (the shaders divide the coordinates by the size)
     }
   const VenusShaderModule* modules[tgsi::kMaxStages] = {};
   const uint32_t n = p.stage_modules(modules);
@@ -593,6 +631,8 @@ bool Replay::key_for(VenusPipeline& p, VenusVariantKey* key) {
     key->samples = targets_[0]->desc().samples;
     key->topology = static_cast<uint32_t>(topology_);
     key->patch_points = topology_ == PrimitiveTopology::PatchList ? patch_points_ : 0;
+    if (custom_locations()) key->flags |= kVariantSampleLocations;
+    if (view_viewport_ || view_layer_) key->flags |= kVariantViewOffsets;
   }
   return true;
 }
@@ -633,7 +673,7 @@ bool Replay::bind_resources(VenusPipeline& p, VenusPipeline::Variant& v, VkPipel
   const bool null_ok = d_.context().caps().null_descriptor;
   {
     write(tgsi::kBindingConstants, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC);
-    buffer_infos[n - 1] = {d_.constants_ring().buffer, 0, (kSamplerCompareRegister + kMaxTextureUnits) * 16};
+    buffer_infos[n - 1] = {d_.constants_ring().buffer, 0, kVenusConstantRows * 16};
   }
   // texture units: draws bind units 0 .. texture_count - 1 and every one must be bound; a dispatch the units up to the highest bound (the others null)
   for (uint32_t u = 0; u < tgsi::kMaxUnits; ++u) {
@@ -797,6 +837,8 @@ bool Replay::draw(const RecordedCommand& c, bool indexed) {
     vk_.CmdBindVertexBuffers(cb_, b, 1, &buffer, &offset);
   }
   if (depth_bounds_dirty_) set_depth_bounds_state();
+  if (key.flags & kVariantSampleLocations) set_sample_locations();
+  set_fragment_shading_rate();
   if (desc.stream_output_count && !begin_stream_output(p)) return false;
   // (a fragment shader that stands in for no pixel shader: Vulkan counts its runs, Direct3D none - the draw gets a statistics segment of its own whose PsInvocations
   // are left out)
@@ -1103,6 +1145,11 @@ bool Replay::resolve(const RecordedCommand& c) {
         vk_.CmdSetViewport(cb_, 0, count, vps);
         vk_.CmdSetScissor(cb_, 0, count, scs);
         vk_.CmdSetStencilReference(cb_, VK_STENCIL_FACE_FRONT_AND_BACK, 0);
+        if (features2_ & kFeature2ShadingRate) {   // (every pixel shaded: the draws set their own rate again)
+          const VkExtent2D one = {1, 1};
+          const VkFragmentShadingRateCombinerOpKHR keep[2] = {VK_FRAGMENT_SHADING_RATE_COMBINER_OP_KEEP_KHR, VK_FRAGMENT_SHADING_RATE_COMBINER_OP_KEEP_KHR};
+          vk_.CmdSetFragmentShadingRateKHR(cb_, &one, keep);
+        }
         if (d_.context().caps().depth_bounds) {   // (the pipeline's dynamic state: the test off for the resolve, the user's set again before the next draw)
           vk_.CmdSetDepthBoundsTestEnable(cb_, VK_FALSE);
           vk_.CmdSetDepthBounds(cb_, 0.0f, 1.0f);
@@ -1275,6 +1322,112 @@ void Replay::stream_output_results() {
   }
 }
 
+// ---- gap pass 5: sample positions, coarse shading ------------------------------------------------------------------------------------------------------
+// The positions (kFeature2SamplePositions): `count` samples of `first` pixels (1, or 4 for a 2 x 2 quad), as x, y bytes in the recorder's constants.
+bool Replay::set_sample_positions(const RecordedCommand& c, ConstByteView all_constants) {
+  if (!(features2_ & kFeature2SamplePositions)) return false;
+  const uint32_t samples = c.count, pixels = c.first;
+  if (pixels == 0) {
+    positions_samples_ = positions_pixels_ = 0;
+    return true;
+  }
+  if ((pixels != 1 && pixels != 4) || (samples != 1 && samples != 2 && samples != 4 && samples != 8 && samples != 16) || uint64_t{samples} * pixels > kMaxSamplePositions) return false;
+  ConstByteView bytes;
+  if (c.constants_size != samples * pixels * 2 || !all_constants.try_subview(c.constants_offset, c.constants_size, &bytes)) return false;
+  for (uint32_t i = 0; i < samples * pixels; ++i) {
+    positions_[i].x = static_cast<int8_t>(bytes[uint64_t{i} * 2]);
+    positions_[i].y = static_cast<int8_t>(bytes[uint64_t{i} * 2 + 1]);
+    if (positions_[i].x < -8 || positions_[i].x > 7 || positions_[i].y < -8 || positions_[i].y > 7) return false;
+  }
+  positions_samples_ = samples, positions_pixels_ = pixels;
+  return true;
+}
+
+// Whether the draws of the pass take the positions set: those of the pass's sample count, for a pipeline that multisamples (one that does not puts every sample at
+// the pixel's centre) or a pass of one sample.
+bool Replay::custom_locations() const {
+  if (!positions_pixels_ || !in_pass_ || !pipeline_ || target_count_ == 0) return false;
+  const uint32_t samples = targets_[0]->desc().samples;
+  return positions_samples_ == samples && (samples == 1 || pipeline_->desc().multisample);
+}
+
+void Replay::set_sample_locations() {
+  // (Direct3D's sixteenths of a pixel from its centre, -8 .. 7, +y down, are Vulkan's 0 .. 15/16 from its top left corner; a quad's patterns are a 2 x 2 grid in
+  // Direct3D's order - upper left, upper right, lower left, lower right -, which is Vulkan's: pixel (x, y) of the grid at (x + y * 2) * samples)
+  VkSampleLocationEXT at[kMaxSamplePositions];
+  const uint32_t n = positions_samples_ * positions_pixels_;
+  for (uint32_t i = 0; i < n && i < kMaxSamplePositions; ++i) at[i] = {(positions_[i].x + 8) / 16.0f, (positions_[i].y + 8) / 16.0f};
+  VkSampleLocationsInfoEXT info = vk_struct<VkSampleLocationsInfoEXT>(VK_STRUCTURE_TYPE_SAMPLE_LOCATIONS_INFO_EXT);
+  info.sampleLocationsPerPixel = static_cast<VkSampleCountFlagBits>(positions_samples_);
+  info.sampleLocationGridSize = positions_pixels_ == 4 ? VkExtent2D{2, 2} : VkExtent2D{1, 1};
+  info.sampleLocationsCount = n;
+  info.pSampleLocations = at;
+  vk_.CmdSetSampleLocationsEXT(cb_, &info);
+}
+
+// Coarse shading (kFeature2ShadingRate): Direct3D's rate is Vulkan's fragment size in the same log2 axes ((x << 2) | y), and its combiners are Vulkan's in the
+// same places (PASSTHROUGH keeps, OVERRIDE replaces, MIN, MAX; SUM adds the axes' logarithms, which is MUL of the sizes). Set before every draw: the state is
+// dynamic in every pipeline of the device.
+void Replay::set_fragment_shading_rate() {
+  if (!(features2_ & kFeature2ShadingRate)) return;
+  auto op = [](ShadingRateCombiner c) {
+    switch (c) {
+      case ShadingRateCombiner::Passthrough: return VK_FRAGMENT_SHADING_RATE_COMBINER_OP_KEEP_KHR;
+      case ShadingRateCombiner::Override: return VK_FRAGMENT_SHADING_RATE_COMBINER_OP_REPLACE_KHR;
+      case ShadingRateCombiner::Min: return VK_FRAGMENT_SHADING_RATE_COMBINER_OP_MIN_KHR;
+      case ShadingRateCombiner::Max: return VK_FRAGMENT_SHADING_RATE_COMBINER_OP_MAX_KHR;
+      case ShadingRateCombiner::Sum: return VK_FRAGMENT_SHADING_RATE_COMBINER_OP_MUL_KHR;
+    }
+    return VK_FRAGMENT_SHADING_RATE_COMBINER_OP_KEEP_KHR;
+  };
+  const uint32_t rate = valid_shading_rate(rate_) ? rate_ : 0;
+  const VkExtent2D size = {shading_rate_x(rate), shading_rate_y(rate)};
+  // (without a shading-rate image the image's rate is 1x1, which Vulkan's attachment rate is when the rendering has none)
+  const VkFragmentShadingRateCombinerOpKHR ops[2] = {op(rate_primitive_), op(rate_image_combiner_)};
+  vk_.CmdSetFragmentShadingRateKHR(cb_, &size, ops);
+}
+
+// The shading-rate image of the draws that follow (an R8_UINT image of one level, one sample; nullptr: none). Inside a pass the rendering ends and resumes with it.
+bool Replay::set_shading_rate_image(VenusImage* image) {
+  if (!(features2_ & kFeature2ShadingRate)) return false;
+  if (image && (image->format() != Format::R8Uint || image->mip_levels() != 1 || image->desc().samples != 1 || image->desc().kind != TextureKind::Texture2D)) return false;
+  if (image == rate_image_) return true;
+  rate_image_ = image;
+  if (!rendering_) return true;
+  end_stream_output();
+  segments_close();
+  vk_.CmdEndRendering(cb_);
+  rendering_ = false;
+  barrier();
+  return resume_rendering();
+}
+
+// Before a rendering: the shading-rate image's tiles (kShadingRateTileSize pixels) into the attachment's texels (the host's texel size, a divisor of the tile):
+// each tile is (16 / texel)^2 texels of its rate, and everything past the image is 1x1 (0). False when it cannot be made.
+bool Replay::prepare_rate_attachment() {
+  rate_attached_ = false;
+  if (!rate_image_) return true;
+  const VenusDevice::RateAttachment* a = d_.rate_attachment(cb_);
+  if (!a) return false;
+  const uint32_t texel = d_.context().caps().shading_rate_texel, scale = kShadingRateTileSize / texel;
+  barrier();
+  const VkClearColorValue zero = {};
+  const VkImageSubresourceRange range = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+  vk_.CmdClearColorImage(cb_, a->image, VK_IMAGE_LAYOUT_GENERAL, &zero, 1, &range);
+  barrier();
+  uint32_t w = rate_image_->extent().width, h = rate_image_->extent().height;
+  if (w > a->width / scale) w = a->width / scale;
+  if (h > a->height / scale) h = a->height / scale;
+  VkImageBlit b{};
+  b.srcSubresource = b.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+  b.srcOffsets[1] = {static_cast<int32_t>(w), static_cast<int32_t>(h), 1};
+  b.dstOffsets[1] = {static_cast<int32_t>(w * scale), static_cast<int32_t>(h * scale), 1};
+  vk_.CmdBlitImage(cb_, rate_image_->image(), VK_IMAGE_LAYOUT_GENERAL, a->image, VK_IMAGE_LAYOUT_GENERAL, 1, &b, VK_FILTER_NEAREST);
+  barrier();
+  rate_attached_ = true;
+  return true;
+}
+
 bool Replay::run() {
   cb_ = d_.begin_main();
   if (!cb_) return false;
@@ -1417,11 +1570,26 @@ bool Replay::run() {
         depth_bounds_dirty_ = true;
         break;
       case RecordedCommand::Type::CopySamples: ok = copy_samples(c); break;
-      // (not offered - DeviceInfo has no kFeature2SamplePositions, kFeature2ViewInstancing or kFeature2ShadingRate -: the kernel sends none; a stray one fails the submit)
-      case RecordedCommand::Type::SetSamplePositions:
+      // (each only where the device offers its feature: the kernel sends none otherwise, and a stray one fails the submit)
+      case RecordedCommand::Type::SetSamplePositions: ok = set_sample_positions(c, all_constants); break;
       case RecordedCommand::Type::SetViewInstance:
+        if (!(features2_ & kFeature2ViewInstancing)) {
+          ok = false;
+          break;
+        }
+        view_id_ = c.count, view_viewport_ = c.first, view_layer_ = c.unit;
+        constants_dirty_ = true;
+        break;
       case RecordedCommand::Type::SetShadingRate:
-      case RecordedCommand::Type::SetShadingRateImage: ok = false; break;
+        if (!(features2_ & kFeature2ShadingRate) || (c.first & 0xFF) > static_cast<uint32_t>(ShadingRateCombiner::Sum) ||
+            (c.first >> 8 & 0xFF) > static_cast<uint32_t>(ShadingRateCombiner::Sum)) {
+          ok = false;
+          break;
+        }
+        rate_ = c.count;
+        rate_primitive_ = static_cast<ShadingRateCombiner>(c.first & 0xFF), rate_image_combiner_ = static_cast<ShadingRateCombiner>(c.first >> 8 & 0xFF);
+        break;
+      case RecordedCommand::Type::SetShadingRateImage: ok = set_shading_rate_image(static_cast<VenusImage*>(c.image)); break;
     }
     if (!ok) break;
   }

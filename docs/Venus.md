@@ -121,6 +121,30 @@ compositor, the windows of Wayland and X11 clients, and the Vulkan driver's Dire
   VK_EXT_line_rasterization's smooth lines for alpha-antialiased ones, rectangular lines 1.4 and 1.0 pixels wide for the quadrilateral ones), the depth bounds test
   (`kFeature2DepthBounds`, dynamic state), a stream output binding's end (the transform feedback binding's size), and pipeline statistics that leave out a
   stand-in pixel shader (`stand_in_fragment`: the draw has a statistics segment of its own whose PsInvocations are not added).
+* **Gap pass 5** (Direct3D 12's optional rasterizer features and tiled resources), each offered only where the host's Vulkan has what it takes (`VenusCaps`):
+  * programmable sample positions (`kFeature2SamplePositions`, ProgrammableSamplePositionsTier 2): VK_EXT_sample_locations' dynamic locations - Direct3D's sixteenths
+    from the centre as Vulkan's 0 .. 15/16 from the corner, a quad's patterns as a 2 x 2 grid - in a variant of the pipeline (`kVariantSampleLocations`) for the draws
+    whose pass has the positions' sample count; it needs variableSampleLocations, a 2 x 2 grid for one sample and every offered count, and depth images are made
+    SAMPLE_LOCATIONS_COMPATIBLE_DEPTH;
+  * view instancing (`kFeature2ViewInstancing`, tier 2): the CPU renderer's draw loop (the kernel draws once for each view). The view, and what is added to the
+    primitives' viewport and layer, are the constant block's system row (`kVenusSystemRow`, after the samplers' comparison rows): SV_ViewID is `DCL SV[7], VIEWINDEX`
+    in every stage, and with offsets (`kVariantViewOffsets`) the last stage before the rasterizer adds them to the layer and viewport it writes, or writes them;
+  * barycentrics (`kFeature2Barycentrics`): VK_KHR_fragment_shader_barycentric - `BARYCENTRIC, PERSPECTIVE / LINEAR` inputs (BaryCoordKHR / BaryCoordNoPerspKHR),
+    and GetAttributeAtVertex as per-vertex fragment inputs (`DCL IN[][a]`, PerVertexKHR; the input's other reads are vertex 0's, which a nointerpolation input is);
+  * coordinates in texels (`kFeature2UnnormalizedCoordinates`): not Vulkan's unnormalized samplers (no offsets, no array views, no gathers): a normalised sampler of
+    the view's first level alone (min and max level 0), and the shaders divide the coordinates - and a TXD's gradients - by that level's size (`CompileOptions::
+    unnormalized_units`, from the variant key's bound samplers);
+  * residency feedback (`kFeature2TileResidency`: Direct3D 12's tiled resources tier 4, Direct3D 11's tier 3): `IImage::set_residency` makes the image a sparse one
+    the first time (VK_IMAGE_CREATE_SPARSE_RESIDENCY, the host's standard block shapes, which must be Direct3D's tiles and whose mip tail must start at Direct3D's
+    packed levels) and binds each tile's block - and each slice's tail - where the memory manager says it is mapped (vkQueueBindSparse, waited for); unbound texels
+    read zero (residencyNonResidentStrict). The memory manager now pushes the residency before it uploads the contents, so the tiles bound anew get them. The shaders'
+    lookups between `SPARSE_BEGIN [clamp]` and `SPARSE_END status` are OpImageSparse* ones, with the clamp as MinLod (the larger of it and an explicit level), and
+    the status is 1 when every texel was resident (OpImageSparseTexelsResident);
+  * coarse shading (`kFeature2ShadingRate`): VK_KHR_fragment_shading_rate with the pipeline's, the primitive's (`SHADINGRATE` output: PrimitiveShadingRateKHR) and an
+    attachment's rate, the combiners as Direct3D's (SUM is MUL), SV_ShadingRate in the pixel shader (ShadingRateKHR), the shading-rate image's 16-pixel tiles blitted
+    into an R8_UINT attachment of the host's texel size before each rendering that reads it (`VenusDevice::rate_attachment`, one image for the largest target). Offered
+    only where the host's coarse pixels reach 4x4: Direct3D's tier 2 reports AdditionalShadingRatesSupported, which RADV (coarse pixels up to 2x2) cannot give, and
+    there is no feature bit yet that would let d3d12.dll say otherwise. VenusHostTest turns it on (`offer_for_tests`) to check the rest of it with rates up to 2x2.
 * **present()** copies the image into the virtio-gpu's 2D screen (`blit` + `present` of the display driver), one copy through guest memory per frame.
 * **Which device** (`RenderNode::build_venus`): with `TCOS_GPU_BACKEND=AUTO` (the default) the Venus device is used when it opens, draws the self-test picture and offers
   every feature and limit that a virgl device on the same host would (a virgl device is made for the comparison and given back) and the host has every extension the
@@ -198,13 +222,13 @@ Gaps of the kernel's Venus device:
   image exported as a dma-buf).
 * Images are always in the GENERAL layout (no compression a driver keeps for attachment layouts); barriers are full memory barriers at every pass, dispatch and storing
   draw, not the narrow ones Vulkan allows.
-* As on virgl: depth resolves to the least or greatest sample are not offered (`kFeatureResolveModes`), nor coordinates in texels
-  (`kFeature2UnnormalizedCoordinates`: Vulkan's unnormalized samplers take no levels, borders or offsets, which Direct3D's do).
-* Not offered yet, though the host's Vulkan has them (each needs the TGSI text to carry something it does not say, or more state through the replay): programmable
-  sample positions (`kFeature2SamplePositions`, VK_EXT_sample_locations' dynamic locations and the depth buffer's own), view instancing (`kFeature2ViewInstancing`,
-  SV_ViewID / multiview), coarse shading (`kFeature2ShadingRate`, VK_KHR_fragment_shading_rate), barycentrics (`kFeature2Barycentrics`,
-  VK_KHR_fragment_shader_barycentric) and residency feedback (`kFeature2TileResidency`, sparse residency). The device does not offer them, so the Direct3D layer
-  reports the lower tiers, and a command for one of them fails the submit.
+* As on virgl: depth resolves to the least or greatest sample are not offered (`kFeatureResolveModes`).
+* Coarse shading is not offered on hosts whose coarse pixels stop at 2x2 (RADV), for want of a way to report AdditionalShadingRatesSupported = FALSE (a feature bit of
+  its own); the device clamps to the host's rates (as Direct3D does without them) and works when turned on. At 8 samples RADV shades every pixel (its coarse pixels
+  take 4 samples at most), where Direct3D's rule allows 2x1.
+* Residency feedback is the host's footprint (the texels the hardware reads, which may include ones a linear filter weighs 0 - the CPU renderer leaves those out); an
+  image whose format's block is not Direct3D's tile, or whose mip tail does not begin at Direct3D's packed levels, keeps no residency (`set_residency` is false: its
+  lookups report everything resident); sparse volumes cannot be render targets (no 2D-array view of a sparse 3D image).
 * What the host's Vulkan lacks is not offered (each feature follows `VenusCaps`); a host without `VK_EXT_sample_locations` refuses pipelines that turn multisampling off on
   a multisampled target, one without `VK_EXT_depth_bias_control`'s float representation the depth bias of normalised depth formats, one without
   `VK_EXT_provoking_vertex` the GL translator's flat varyings. AUTO keeps virgl on such a host (`parity_gaps`); `TCOS_GPU_BACKEND=VENUS` takes Venus anyway.

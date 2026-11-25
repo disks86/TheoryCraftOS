@@ -3752,7 +3752,7 @@ static void test_tiled_resources(ID3D11Device5 *d5, ID3D11DeviceContext4 *c4) {
  * (none with packed levels: Direct3D 11 has no tier 4), residency feedback and a lookup's clamp in shaders (tier 2), ResizeTilePool down to nothing and back. */
 static void test_tiled_tiers(ID3D11Device5 *d5, ID3D11DeviceContext4 *c4) {
   const UINT TILE = 65536;
-  int software = 0;
+  int residency = 0;
   IDXGIDevice *dxgi = NULL;
   if (SUCCEEDED(ID3D11Device5_QueryInterface(d5, &IID_IDXGIDevice, (void **)&dxgi)) && dxgi) {
     IDXGIAdapter *adapter = NULL;
@@ -3764,19 +3764,19 @@ static void test_tiled_tiers(ID3D11Device5 *d5, ID3D11DeviceContext4 *c4) {
         IDXGIAdapter1_GetDesc1(a1, &ad);
         IDXGIAdapter1_Release(a1);
       }
-      software = (ad.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) != 0;
+      residency = (ad.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) != 0 || wcsstr(ad.Description, L"Venus") != NULL;   /* (Venus: sparse images, as the CPU renderer's tier) */
       IDXGIAdapter_Release(adapter);
     }
     IDXGIDevice_Release(dxgi);
   }
-  const D3D11_TILED_RESOURCES_TIER want = software ? D3D11_TILED_RESOURCES_TIER_3 : D3D11_TILED_RESOURCES_TIER_1;
+  const D3D11_TILED_RESOURCES_TIER want = residency ? D3D11_TILED_RESOURCES_TIER_3 : D3D11_TILED_RESOURCES_TIER_1;
   D3D11_FEATURE_DATA_D3D11_OPTIONS1 o1;
   D3D11_FEATURE_DATA_D3D11_OPTIONS2 o2;
   memset(&o1, 0xCC, sizeof o1);
   memset(&o2, 0xCC, sizeof o2);
   check(SUCCEEDED(ID3D11Device5_CheckFeatureSupport(d5, D3D11_FEATURE_D3D11_OPTIONS1, &o1, sizeof o1)) && o1.TiledResourcesTier == want &&
             SUCCEEDED(ID3D11Device5_CheckFeatureSupport(d5, D3D11_FEATURE_D3D11_OPTIONS2, &o2, sizeof o2)) && o2.TiledResourcesTier == want,
-        software ? "tiled resources tier 3 on the CPU renderer" : "tiled resources tier 1 on a GPU without residency feedback");
+        residency ? "tiled resources tier 3 on the CPU renderer and Venus" : "tiled resources tier 1 on a GPU without residency feedback");
   D3D11_BUFFER_DESC pd = {8 * TILE, D3D11_USAGE_DEFAULT, 0, 0, D3D11_RESOURCE_MISC_TILE_POOL, 0};
   ID3D11Buffer *pool = NULL;
   check(SUCCEEDED(ID3D11Device5_CreateBuffer(d5, &pd, NULL, &pool)) && pool, "CreateBuffer: a tile pool of eight tiles");

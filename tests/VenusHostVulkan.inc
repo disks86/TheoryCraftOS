@@ -129,6 +129,13 @@ namespace { TRAMPOLINE(CmdEndTransformFeedbackEXT, void, (VkCommandBuffer comman
 namespace { TRAMPOLINE(CmdBeginQueryIndexedEXT, void, (VkCommandBuffer commandBuffer, VkQueryPool queryPool, uint32_t query, VkQueryControlFlags flags, uint32_t index), (commandBuffer, queryPool, query, flags, index)) }
 namespace { TRAMPOLINE(CmdEndQueryIndexedEXT, void, (VkCommandBuffer commandBuffer, VkQueryPool queryPool, uint32_t query, uint32_t index), (commandBuffer, queryPool, query, index)) }
 namespace { TRAMPOLINE(CmdDrawIndirectByteCountEXT, void, (VkCommandBuffer commandBuffer, uint32_t instanceCount, uint32_t firstInstance, VkBuffer counterBuffer, VkDeviceSize counterBufferOffset, uint32_t counterOffset, uint32_t vertexStride), (commandBuffer, instanceCount, firstInstance, counterBuffer, counterBufferOffset, counterOffset, vertexStride)) }
+namespace { TRAMPOLINE(CmdSetSampleLocationsEXT, void, (VkCommandBuffer commandBuffer, const VkSampleLocationsInfoEXT* pSampleLocationsInfo), (commandBuffer, pSampleLocationsInfo)) }
+namespace { TRAMPOLINE(GetPhysicalDeviceMultisamplePropertiesEXT, void, (VkPhysicalDevice physicalDevice, VkSampleCountFlagBits samples, VkMultisamplePropertiesEXT* pMultisampleProperties), (physicalDevice, samples, pMultisampleProperties)) }
+namespace { TRAMPOLINE(CmdSetFragmentShadingRateKHR, void, (VkCommandBuffer commandBuffer, const VkExtent2D* pFragmentSize, const VkFragmentShadingRateCombinerOpKHR combinerOps[2]), (commandBuffer, pFragmentSize, combinerOps)) }
+namespace { TRAMPOLINE(GetPhysicalDeviceFragmentShadingRatesKHR, VkResult, (VkPhysicalDevice physicalDevice, uint32_t* pFragmentShadingRateCount, VkPhysicalDeviceFragmentShadingRateKHR* pFragmentShadingRates), (physicalDevice, pFragmentShadingRateCount, pFragmentShadingRates)) }
+namespace { TRAMPOLINE(QueueBindSparse, VkResult, (VkQueue queue, uint32_t bindInfoCount, const VkBindSparseInfo* pBindInfo, VkFence fence), (queue, bindInfoCount, pBindInfo, fence)) }
+namespace { TRAMPOLINE(GetImageSparseMemoryRequirements, void, (VkDevice device, VkImage image, uint32_t* pSparseMemoryRequirementCount, VkSparseImageMemoryRequirements* pSparseMemoryRequirements), (device, image, pSparseMemoryRequirementCount, pSparseMemoryRequirements)) }
+namespace { TRAMPOLINE(GetPhysicalDeviceSparseImageFormatProperties, void, (VkPhysicalDevice physicalDevice, VkFormat format, VkImageType type, VkSampleCountFlagBits samples, VkImageUsageFlags usage, VkImageTiling tiling, uint32_t* pPropertyCount, VkSparseImageFormatProperties* pProperties), (physicalDevice, format, type, samples, usage, tiling, pPropertyCount, pProperties)) }
 static void fill_table(TcosKernelVulkan* t) {
   t->CreateInstance = t_CreateInstance;
   t->DestroyInstance = t_DestroyInstance;
@@ -261,4 +268,11 @@ static void fill_table(TcosKernelVulkan* t) {
   t->CmdBeginQueryIndexedEXT = t_CmdBeginQueryIndexedEXT;
   t->CmdEndQueryIndexedEXT = t_CmdEndQueryIndexedEXT;
   t->CmdDrawIndirectByteCountEXT = t_CmdDrawIndirectByteCountEXT;
+  t->CmdSetSampleLocationsEXT = t_CmdSetSampleLocationsEXT;
+  t->GetPhysicalDeviceMultisamplePropertiesEXT = t_GetPhysicalDeviceMultisamplePropertiesEXT;
+  t->CmdSetFragmentShadingRateKHR = t_CmdSetFragmentShadingRateKHR;
+  t->GetPhysicalDeviceFragmentShadingRatesKHR = t_GetPhysicalDeviceFragmentShadingRatesKHR;
+  t->QueueBindSparse = t_QueueBindSparse;
+  t->GetImageSparseMemoryRequirements = t_GetImageSparseMemoryRequirements;
+  t->GetPhysicalDeviceSparseImageFormatProperties = t_GetPhysicalDeviceSparseImageFormatProperties;
 }

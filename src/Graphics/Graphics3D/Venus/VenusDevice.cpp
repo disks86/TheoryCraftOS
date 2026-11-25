@@ -30,7 +30,7 @@
 namespace graphics {
 
 namespace {
-constexpr uint64_t kConstantRingBytes = 8u << 20;   // (a submit's constant blocks: 4352 bytes each at most, so ~1900 draws; more and the submit is split)
+constexpr uint64_t kConstantRingBytes = 8u << 20;   // (a submit's constant blocks: 4368 bytes each at most, so ~1900 draws; more and the submit is split)
 constexpr uint64_t kStagingStart = 4u << 20;
 }  // namespace
 
@@ -68,6 +68,7 @@ VenusDevice::~VenusDevice() {
     destroy_shader_module(r.vs);
   }
   destroy_image(resolve_scratch_);
+  free_rate_attachment();
   for (CachedSampler& s : samplers_) vk().DestroySampler(device(), s.sampler, nullptr);
   for (VkDescriptorPool p : pools_) vk().DestroyDescriptorPool(device(), p, nullptr);
   for (VkQueryPool p : pools_by_kind_)
@@ -109,6 +110,9 @@ bool VenusDevice::initialize() {
   const VkSampleCountFlags counts = l.framebufferColorSampleCounts & l.framebufferDepthSampleCounts & l.sampledImageColorSampleCounts;
   for (uint32_t n = 2; n <= 16; n *= 2)
     if (counts & n) sample_counts_ |= 1u << n;
+  // (coarse shading's attachment is R8_UINT, filled by blits from the Direct3D layer's shading-rate image)
+  shading_rate_usable_ = ctx_.caps().shading_rate &&
+                         format_supports(VK_FORMAT_R8_UINT, VK_FORMAT_FEATURE_BLIT_SRC_BIT | VK_FORMAT_FEATURE_BLIT_DST_BIT | VK_FORMAT_FEATURE_FRAGMENT_SHADING_RATE_ATTACHMENT_BIT_KHR);
   initialized_ = true;
   return true;
 }
@@ -166,6 +170,21 @@ DeviceInfo VenusDevice::info() const {
   if (c.depth_bounds) i.features2 |= kFeature2DepthBounds;
   i.sample_counts = sample_counts_ & ((1u << 2) | (1u << 4) | (1u << 8));
   if (i.sample_counts) i.features |= kFeatureMultisample | kFeatureDepthResolve, i.features2 |= kFeature2ColorResolveModes;
+  // (gap pass 5, each where the host has what it takes: programmable sample positions - dynamic sample locations of one sample and of every offered count, a quad's
+  // patterns in a 2 x 2 grid, pipelines of other locations in the same rendering -; view instancing - the draw loop of the CPU renderer, with SV_ViewID and the offsets
+  // of the viewport and the layer in the constants' system row, which the last stage before the rasterizer adds to what it writes -; coarse shading - the pipeline's,
+  // the primitive's and an attachment's rate with every combiner, up to 4x4 coarse pixels, Direct3D's AdditionalShadingRatesSupported -; barycentrics)
+  if (c.sample_locations && c.variable_sample_locations && (c.sample_location_quad_counts & (1u << 1)) && (i.sample_counts & ~c.sample_location_quad_counts) == 0)
+    i.features2 |= kFeature2SamplePositions;
+  if (c.multi_viewport && c.shader_output_layer && c.shader_output_viewport_index) i.features2 |= kFeature2ViewInstancing;
+  if (shading_rate_usable_ && ((c.max_fragment_width >= 4 && c.max_fragment_height >= 4) || (test_features2_ & kFeature2ShadingRate))) i.features2 |= kFeature2ShadingRate;
+  if (c.fragment_barycentric) i.features2 |= kFeature2Barycentrics;
+  i.features2 |= kFeature2UnnormalizedCoordinates;   // (normalised samplers of one level, the shaders dividing by its size: VenusDevice::sampler_for)
+  // (residency feedback - Direct3D's tiled resources tier 2, and with volumes and arrays of levels tiers 3 and 4 -: sparse 2D and 3D images of the standard block
+  // shapes whose unbound texels read zero, bound by a queue of the device, the shaders' sparse lookups with a minimum level of detail: VenusImage::set_residency)
+  if (c.sparse_queue && c.sparse_residency_2d && c.sparse_residency_3d && c.shader_resource_residency && c.shader_resource_min_lod && c.residency_standard_2d &&
+      c.residency_standard_3d && c.residency_strict)
+    i.features2 |= kFeature2TileResidency;
   i.d3d_sample_order = true;   // (Vulkan's standard sample locations are Direct3D's)
   i.limits.texture_units = kMaxTextureUnits;
   i.limits.vertex_attributes = kMaxVertexAttributes;
@@ -240,6 +259,14 @@ bool VenusDevice::lock_queue() {
   return true;
 }
 void VenusDevice::unlock_queue() { queue_lock_.unlock(); }
+
+bool VenusDevice::bind_sparse(const VkBindSparseInfo& info) {
+  if (!ctx_.caps().sparse_queue) return false;
+  lock_queue();
+  const bool ok = vk().QueueBindSparse(ctx_.queue(), 1, &info, fence_) == VK_SUCCESS && wait_fence(fence_);
+  unlock_queue();
+  return ok;
+}
 
 bool VenusDevice::wait_fence(VkFence fence) {
   // (the backend polls the host; 20 s, as virgl's 3D commands wait for a cold shader compile)
@@ -333,6 +360,67 @@ VenusImage* VenusDevice::resolve_scratch(Format format, Extent2D extent) {
   destroy_image(resolve_scratch_);
   resolve_scratch_ = static_cast<VenusImage*>(create_image({extent, format, kImageColorAttachment}));
   return resolve_scratch_;
+}
+
+void VenusDevice::free_rate_attachment() {
+  if (accounted_rate_) add_video_memory(-static_cast<int64_t>(accounted_rate_));
+  accounted_rate_ = 0;
+  if (rate_attachment_.view) vk().DestroyImageView(device(), rate_attachment_.view, nullptr);
+  if (rate_attachment_.image) vk().DestroyImage(device(), rate_attachment_.image, nullptr);
+  if (rate_attachment_.memory) vk().FreeMemory(device(), rate_attachment_.memory, nullptr);
+  rate_attachment_ = RateAttachment();
+}
+
+const VenusDevice::RateAttachment* VenusDevice::rate_attachment(VkCommandBuffer cb) {
+  if (!ctx_.caps().shading_rate || !ctx_.caps().shading_rate_texel) return nullptr;
+  if (rate_attachment_.view) return &rate_attachment_;
+  // (one image for every target there may be: it never has to grow while a command buffer refers to it)
+  const uint32_t texel = ctx_.caps().shading_rate_texel;
+  const uint32_t side = (max_image_dimension() + texel - 1) / texel;
+  VkImageCreateInfo ci = vk_struct<VkImageCreateInfo>(VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO);
+  ci.imageType = VK_IMAGE_TYPE_2D, ci.format = VK_FORMAT_R8_UINT, ci.extent = {side, side, 1}, ci.mipLevels = 1, ci.arrayLayers = 1;
+  ci.samples = VK_SAMPLE_COUNT_1_BIT, ci.tiling = VK_IMAGE_TILING_OPTIMAL;
+  ci.usage = VK_IMAGE_USAGE_FRAGMENT_SHADING_RATE_ATTACHMENT_BIT_KHR | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+  ci.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+  if (vk().CreateImage(device(), &ci, nullptr, &rate_attachment_.image) != VK_SUCCESS) {
+    rate_attachment_.image = nullptr;
+    return nullptr;
+  }
+  VkMemoryRequirements req{};
+  vk().GetImageMemoryRequirements(device(), rate_attachment_.image, &req);
+  int32_t type = ctx_.memory_type(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+  if (type < 0) type = ctx_.memory_type(req.memoryTypeBits, 0);
+  VkMemoryAllocateInfo mi = vk_struct<VkMemoryAllocateInfo>(VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO);
+  mi.allocationSize = req.size, mi.memoryTypeIndex = static_cast<uint32_t>(type);
+  if (type < 0 || vk().AllocateMemory(device(), &mi, nullptr, &rate_attachment_.memory) != VK_SUCCESS) {
+    rate_attachment_.memory = nullptr;
+    free_rate_attachment();
+    return nullptr;
+  }
+  VkImageViewCreateInfo vi = vk_struct<VkImageViewCreateInfo>(VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO);
+  vi.image = rate_attachment_.image, vi.viewType = VK_IMAGE_VIEW_TYPE_2D, vi.format = VK_FORMAT_R8_UINT;
+  vi.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+  if (vk().BindImageMemory(device(), rate_attachment_.image, rate_attachment_.memory, 0) != VK_SUCCESS ||
+      vk().CreateImageView(device(), &vi, nullptr, &rate_attachment_.view) != VK_SUCCESS) {
+    rate_attachment_.view = nullptr;
+    free_rate_attachment();
+    return nullptr;
+  }
+  rate_attachment_.width = rate_attachment_.height = side;
+  accounted_rate_ = req.size;
+  add_video_memory(static_cast<int64_t>(accounted_rate_));
+  // (in GENERAL from here on, as every image of the device)
+  VkImageMemoryBarrier2 b = vk_struct<VkImageMemoryBarrier2>(VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2);
+  b.srcStageMask = VK_PIPELINE_STAGE_2_NONE, b.dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+  b.dstAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT | VK_ACCESS_2_MEMORY_READ_BIT;
+  b.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED, b.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+  b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+  b.image = rate_attachment_.image;
+  b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+  VkDependencyInfo di = vk_struct<VkDependencyInfo>(VK_STRUCTURE_TYPE_DEPENDENCY_INFO);
+  di.imageMemoryBarrierCount = 1, di.pImageMemoryBarriers = &b;
+  vk().CmdPipelineBarrier2(cb, &di);
+  return &rate_attachment_;
 }
 
 VenusPipeline* VenusDevice::extreme_resolve_pipeline(VkFormat target, uint32_t samples, bool greatest) {
@@ -520,8 +608,8 @@ float clamp_lod(float v, float lo, float hi) { return !(v >= lo) ? lo : v > hi ?
 VkSampler VenusDevice::sampler_for(const SamplerDesc& d, bool integer) {
   for (const CachedSampler& c : samplers_)
     if (c.integer == integer && same_sampler(c.desc, d)) return c.sampler;
-  // (coordinates in texels are not offered: Vulkan's unnormalized samplers take no levels, borders or offsets; reductions need the host's samplerFilterMinmax)
-  if (d.unnormalized || (d.reduction != SamplerReduction::Weighted && !ctx_.caps().sampler_minmax)) return nullptr;
+  // (reductions need the host's samplerFilterMinmax)
+  if (d.reduction != SamplerReduction::Weighted && !ctx_.caps().sampler_minmax) return nullptr;
   VkSamplerCreateInfo si = vk_struct<VkSamplerCreateInfo>(VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO);
   const bool linear = d.filter == Filter::Linear && !integer;
   si.minFilter = linear ? VK_FILTER_LINEAR : VK_FILTER_NEAREST;
@@ -530,15 +618,18 @@ VkSampler VenusDevice::sampler_for(const SamplerDesc& d, bool integer) {
   si.addressModeU = address_mode(d.address_u);
   si.addressModeV = address_mode(d.address_v);
   si.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-  if (d.mip_filter == MipFilter::None) {
+  if (d.mip_filter == MipFilter::None || d.unnormalized) {
+    // (coordinates in texels, kFeature2UnnormalizedCoordinates: a normalised sampler of the view's first level alone - the shader divides the coordinates by that
+    // level's size, Venus' TgsiSpirv unnormalized_units -, not Vulkan's unnormalized samplers, which take no offsets, borders of every kind or array views)
     si.minLod = si.maxLod = 0, si.mipLodBias = 0;
+    if (d.unnormalized) si.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
   } else {
     si.mipLodBias = clamp_lod(d.lod_bias, -16, 16);
     si.minLod = clamp_lod(d.min_lod, 0, 16);
     si.maxLod = clamp_lod(d.max_lod, 0, 16);
     if (si.maxLod < si.minLod) si.maxLod = si.minLod;
   }
-  if (linear && d.max_anisotropy > 1 && ctx_.caps().sampler_anisotropy) {
+  if (linear && d.max_anisotropy > 1 && ctx_.caps().sampler_anisotropy && !d.unnormalized) {
     si.anisotropyEnable = VK_TRUE;
     const float most = ctx_.caps().max_anisotropy < 16 ? ctx_.caps().max_anisotropy : 16;
     si.maxAnisotropy = d.max_anisotropy > most ? most : d.max_anisotropy;
@@ -677,6 +768,14 @@ bool VenusImage::create() {
   if (format_ == VK_FORMAT_UNDEFINED) return false;
   aspect_ = depth ? (d.stencil ? VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT : VK_IMAGE_ASPECT_DEPTH_BIT) : VK_IMAGE_ASPECT_COLOR_BIT;
   layers_ = image_layer_count(d.kind, d.layers);
+  return make_image(false);
+}
+
+bool VenusImage::make_image(bool sparse) {
+  const ImageDesc& d = desc_;
+  const bool compressed = is_compressed_format(d.format);
+  const bool depth = d.format == Format::D32Float;
+  const bool storage = (d.usage & kImageStorage) != 0;
   VkImageCreateInfo ci = vk_struct<VkImageCreateInfo>(VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO);
   ci.imageType = d.kind == TextureKind::Texture3D ? VK_IMAGE_TYPE_3D : VK_IMAGE_TYPE_2D;
   ci.format = format_;
@@ -694,7 +793,10 @@ bool VenusImage::create() {
   // (a 2D array of square faces in sixes may be seen as a cube; a storage image may be seen in another format of its size)
   if (ci.imageType == VK_IMAGE_TYPE_2D && layers_ >= 6 && d.extent.width == d.extent.height && d.samples == 1) ci.flags |= VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT;
   if (storage || (d.usage & kImageSampled)) ci.flags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
-  if (ci.imageType == VK_IMAGE_TYPE_3D && (d.usage & (kImageColorAttachment | kImageDepthAttachment))) ci.flags |= VK_IMAGE_CREATE_2D_ARRAY_COMPATIBLE_BIT;
+  if (ci.imageType == VK_IMAGE_TYPE_3D && (d.usage & (kImageColorAttachment | kImageDepthAttachment)) && !sparse) ci.flags |= VK_IMAGE_CREATE_2D_ARRAY_COMPATIBLE_BIT;
+  if (sparse) ci.flags |= VK_IMAGE_CREATE_SPARSE_BINDING_BIT | VK_IMAGE_CREATE_SPARSE_RESIDENCY_BIT;   // (kFeature2TileResidency: make_sparse)
+  // (a depth buffer a pipeline of other sample locations draws into: the centre's of a pipeline without multisampling, or the positions set, kFeature2SamplePositions)
+  if (depth && (d.usage & kImageDepthAttachment) && device_.context().caps().sample_locations) ci.flags |= VK_IMAGE_CREATE_SAMPLE_LOCATIONS_COMPATIBLE_DEPTH_BIT_EXT;
   ci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
   ci.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
   const TcosKernelVulkan& vk = device_.vk();
@@ -713,7 +815,9 @@ bool VenusImage::create() {
     memory_ = nullptr;
     return false;
   }
-  if (vk.BindImageMemory(device_.device(), image_, memory_, 0) != VK_SUCCESS) return false;
+  // (a sparse image's memory is bound block by block: bind_residency; the blocks are at multiples of the alignment, in the order of ImageResidency's bytes)
+  if (!sparse && vk.BindImageMemory(device_.device(), image_, memory_, 0) != VK_SUCCESS) return false;
+  block_bytes_ = req.alignment;
   accounted_ = req.size;
   device_.add_video_memory(static_cast<int64_t>(accounted_));
   // In GENERAL from here on, cleared to zero (what a fresh image holds on every device of this system).
@@ -729,7 +833,7 @@ bool VenusImage::create() {
     di.imageMemoryBarrierCount = 1, di.pImageMemoryBarriers = &b;
     vk.CmdPipelineBarrier2(cb, &di);
     const VkImageSubresourceRange range = {aspect_, 0, VK_REMAINING_MIP_LEVELS, 0, VK_REMAINING_ARRAY_LAYERS};
-    if (compressed) return;   // (only copies may write a compressed image)
+    if (compressed || sparse) return;   // (only copies may write a compressed image; a sparse one has nothing bound yet, and is written after its binding)
     if (depth) {
       const VkClearDepthStencilValue z = {0.0f, 0};
       vk.CmdClearDepthStencilImage(cb, image_, VK_IMAGE_LAYOUT_GENERAL, &z, 1, &range);
@@ -738,6 +842,167 @@ bool VenusImage::create() {
       vk.CmdClearColorImage(cb, image_, VK_IMAGE_LAYOUT_GENERAL, &c, 1, &range);
     }
   });
+}
+
+// ---- residency (kFeature2TileResidency) ------------------------------------------------------------------------------------------------------------------------
+bool VenusImage::set_residency(const ImageResidency& r) {
+  if (!(device_.info().features2 & kFeature2TileResidency)) return false;
+  const ImageDesc& d = desc_;
+  const bool volume = d.kind == TextureKind::Texture3D;
+  if (d.samples != 1 || d.format == Format::D32Float || aspect_ != VK_IMAGE_ASPECT_COLOR_BIT || widened_) return false;
+  if (d.kind != TextureKind::Texture2D && d.kind != TextureKind::Texture2DArray && !volume) return false;
+  if (r.tile_width == 0 || r.tile_height == 0 || r.tile_depth == 0 || r.standard_levels > d.mip_levels || r.slices != (volume ? 1u : layers_)) return false;
+  // (the bytes: each slice's standard levels' tiles, then a byte for its packed levels when it has any)
+  uint64_t per_slice = 0;
+  for (uint32_t level = 0; level < r.standard_levels; ++level) {
+    const uint64_t w = mip_extent(d.extent.width, level), h = mip_extent(d.extent.height, level), z = volume ? mip_extent(d.layers, level) : 1;
+    per_slice += ((w + r.tile_width - 1) / r.tile_width) * ((h + r.tile_height - 1) / r.tile_height) * ((z + r.tile_depth - 1) / r.tile_depth);
+  }
+  const bool tail = r.standard_levels < d.mip_levels;
+  if (tail) ++per_slice;
+  if (per_slice == 0 || r.mapped.size() != per_slice * r.slices) return false;
+  if (!sparse_ && !make_sparse(r)) return false;
+  return bind_residency(r);
+}
+
+// The image again as a sparse one (its views go: they are made again when asked for). Refused - the image stays as it is - when the host's blocks are not the tiles.
+bool VenusImage::make_sparse(const ImageResidency& r) {
+  const TcosKernelVulkan& vk = device_.vk();
+  VenusContext& ctx = device_.context();
+  const ImageDesc& d = desc_;
+  const bool volume = d.kind == TextureKind::Texture3D;
+  if (volume && (d.usage & (kImageColorAttachment | kImageDepthAttachment))) return false;   // (a sparse volume cannot be drawn into as layers)
+  VkImageUsageFlags usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+  if (d.usage & kImageSampled) usage |= VK_IMAGE_USAGE_SAMPLED_BIT;
+  if (d.usage & kImageColorAttachment) usage |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+  if (d.usage & kImageStorage) usage |= VK_IMAGE_USAGE_STORAGE_BIT;
+  VkSparseImageFormatProperties props[4] = {};
+  uint32_t count = 4;
+  vk.GetPhysicalDeviceSparseImageFormatProperties(ctx.physical(), format_, volume ? VK_IMAGE_TYPE_3D : VK_IMAGE_TYPE_2D, VK_SAMPLE_COUNT_1_BIT, usage, VK_IMAGE_TILING_OPTIMAL, &count,
+                                                  props);
+  bool shaped = false;
+  for (uint32_t i = 0; i < count && i < 4; ++i)
+    if ((props[i].aspectMask & VK_IMAGE_ASPECT_COLOR_BIT) && !(props[i].flags & VK_SPARSE_IMAGE_FORMAT_NONSTANDARD_BLOCK_SIZE_BIT) &&
+        props[i].imageGranularity.width == r.tile_width && props[i].imageGranularity.height == r.tile_height && props[i].imageGranularity.depth == r.tile_depth)
+      shaped = true;
+  if (!shaped) return false;   // (Direct3D's tile is not the host's block for this format: no residency)
+  // the old image goes (the memory manager writes the contents after the binding)
+  for (const View& v : views_) vk.DestroyImageView(device_.device(), v.view, nullptr);
+  for (const Target& t : targets_) vk.DestroyImageView(device_.device(), t.view, nullptr);
+  views_.clear(), targets_.clear();
+  VkImage old_image = image_;
+  VkDeviceMemory old_memory = memory_;
+  const uint64_t old_accounted = accounted_;
+  image_ = nullptr, memory_ = nullptr, accounted_ = 0;
+  sparse_ = true;
+  bool ok = make_image(true);
+  if (ok) {
+    VkSparseImageMemoryRequirements req[4] = {};
+    uint32_t n = 4;
+    vk.GetImageSparseMemoryRequirements(device_.device(), image_, &n, req);
+    ok = false;
+    for (uint32_t i = 0; i < n && i < 4; ++i) {
+      if (!(req[i].formatProperties.aspectMask & VK_IMAGE_ASPECT_COLOR_BIT)) continue;
+      block_ = req[i].formatProperties.imageGranularity;
+      tail_first_ = req[i].imageMipTailFirstLod;
+      tail_size_ = req[i].imageMipTailSize, tail_offset_ = req[i].imageMipTailOffset, tail_stride_ = req[i].imageMipTailStride;
+      single_tail_ = (req[i].formatProperties.flags & VK_SPARSE_IMAGE_FORMAT_SINGLE_MIPTAIL_BIT) != 0;
+      // (the host's mip tail must begin where Direct3D's packed levels do: then a tail is a slice's packed levels)
+      const bool tail = r.standard_levels < d.mip_levels;
+      ok = tail ? tail_first_ == r.standard_levels : tail_first_ >= d.mip_levels;
+      if (tail && single_tail_ && r.slices > 1) ok = false;   // (one tail for every layer: Direct3D's are per slice)
+    }
+    // (the memory is the blocks of every slice's standard levels in ImageResidency's order, then every slice's tail)
+    uint64_t blocks = 0;
+    for (uint32_t level = 0; ok && level < r.standard_levels; ++level) {
+      const uint64_t w = mip_extent(d.extent.width, level), h = mip_extent(d.extent.height, level), z = volume ? mip_extent(d.layers, level) : 1;
+      blocks += ((w + block_.width - 1) / block_.width) * ((h + block_.height - 1) / block_.height) * ((z + block_.depth - 1) / block_.depth);
+    }
+    blocks *= r.slices;
+    const uint64_t tails = r.standard_levels < d.mip_levels ? (tail_size_ + block_bytes_ - 1) / block_bytes_ * r.slices : 0;
+    if (ok && (blocks + tails) * block_bytes_ > accounted_) {
+      // (more than the image asked for: a memory of that size)
+      const uint64_t bytes = (blocks + tails) * block_bytes_;
+      VkMemoryRequirements mr{};
+      vk.GetImageMemoryRequirements(device_.device(), image_, &mr);
+      vk.FreeMemory(device_.device(), memory_, nullptr);
+      device_.add_video_memory(-static_cast<int64_t>(accounted_));
+      memory_ = nullptr, accounted_ = 0;
+      const int32_t type = ctx.memory_type(mr.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+      VkMemoryAllocateInfo mi = vk_struct<VkMemoryAllocateInfo>(VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO);
+      mi.allocationSize = bytes, mi.memoryTypeIndex = static_cast<uint32_t>(type);
+      ok = type >= 0 && vk.AllocateMemory(device_.device(), &mi, nullptr, &memory_) == VK_SUCCESS;
+      if (!ok) memory_ = nullptr;
+      else accounted_ = bytes, device_.add_video_memory(static_cast<int64_t>(bytes));
+    }
+  }
+  if (!ok) {
+    // (back to the old image, whole)
+    if (image_) vk.DestroyImage(device_.device(), image_, nullptr);
+    if (memory_) vk.FreeMemory(device_.device(), memory_, nullptr);
+    if (accounted_) device_.add_video_memory(-static_cast<int64_t>(accounted_));
+    image_ = old_image, memory_ = old_memory, accounted_ = old_accounted;
+    sparse_ = false;
+    return false;
+  }
+  vk.DestroyImage(device_.device(), old_image, nullptr);
+  vk.FreeMemory(device_.device(), old_memory, nullptr);
+  device_.add_video_memory(-static_cast<int64_t>(old_accounted));
+  return true;
+}
+
+// Every block and tail bound or unbound as `r` says, in one vkQueueBindSparse that is waited for.
+bool VenusImage::bind_residency(const ImageResidency& r) {
+  const TcosKernelVulkan& vk = device_.vk();
+  const ImageDesc& d = desc_;
+  const bool volume = d.kind == TextureKind::Texture3D;
+  List<VkSparseImageMemoryBind> binds(device_.allocator());
+  List<VkSparseMemoryBind> tails(device_.allocator());
+  uint64_t block = 0;   // (the block's place in the memory)
+  uint64_t byte = 0;    // (its byte in r.mapped)
+  const bool has_tail = r.standard_levels < d.mip_levels;
+  uint64_t standard_blocks = 0;
+  for (uint32_t level = 0; level < r.standard_levels; ++level) {
+    const uint64_t w = mip_extent(d.extent.width, level), h = mip_extent(d.extent.height, level), z = volume ? mip_extent(d.layers, level) : 1;
+    standard_blocks += ((w + block_.width - 1) / block_.width) * ((h + block_.height - 1) / block_.height) * ((z + block_.depth - 1) / block_.depth);
+  }
+  for (uint32_t slice = 0; slice < r.slices; ++slice) {
+    for (uint32_t level = 0; level < r.standard_levels; ++level) {
+      const uint32_t w = mip_extent(d.extent.width, level), h = mip_extent(d.extent.height, level), z = volume ? mip_extent(d.layers, level) : 1;
+      for (uint32_t bz = 0; bz < z; bz += block_.depth)
+        for (uint32_t by = 0; by < h; by += block_.height)
+          for (uint32_t bx = 0; bx < w; bx += block_.width) {
+            VkSparseImageMemoryBind b{};
+            b.subresource = {VK_IMAGE_ASPECT_COLOR_BIT, level, volume ? 0u : slice};
+            b.offset = {static_cast<int32_t>(bx), static_cast<int32_t>(by), static_cast<int32_t>(bz)};
+            // (a block at the level's edge is bound to the edge: Vulkan wants the extent a multiple of the block or reaching the end)
+            b.extent = {w - bx < block_.width ? w - bx : block_.width, h - by < block_.height ? h - by : block_.height, z - bz < block_.depth ? z - bz : block_.depth};
+            const bool mapped = byte < r.mapped.size() && r.mapped[byte] != 0;
+            b.memory = mapped ? memory_ : nullptr;
+            b.memoryOffset = mapped ? block * block_bytes_ : 0;
+            if (!binds.push_back(b)) return false;
+            ++block, ++byte;
+          }
+    }
+    if (has_tail) {
+      // (the slice's packed levels: its mip tail, after every slice's blocks)
+      const uint64_t tail_blocks = (tail_size_ + block_bytes_ - 1) / block_bytes_;
+      VkSparseMemoryBind t{};
+      t.resourceOffset = tail_offset_ + (single_tail_ ? 0 : uint64_t{slice} * tail_stride_);
+      t.size = tail_size_;
+      const bool mapped = byte < r.mapped.size() && r.mapped[byte] != 0;
+      t.memory = mapped ? memory_ : nullptr;
+      t.memoryOffset = mapped ? (standard_blocks * r.slices + uint64_t{slice} * tail_blocks) * block_bytes_ : 0;
+      if (!tails.push_back(t)) return false;
+      ++byte;
+    }
+  }
+  VkSparseImageMemoryBindInfo image_info{image_, static_cast<uint32_t>(binds.count()), binds.view().data()};
+  VkSparseImageOpaqueMemoryBindInfo opaque_info{image_, static_cast<uint32_t>(tails.count()), tails.view().data()};
+  VkBindSparseInfo bi = vk_struct<VkBindSparseInfo>(VK_STRUCTURE_TYPE_BIND_SPARSE_INFO);
+  bi.imageBindCount = binds.count() ? 1 : 0, bi.pImageBinds = &image_info;
+  bi.imageOpaqueBindCount = tails.count() ? 1 : 0, bi.pImageOpaqueBinds = &opaque_info;
+  return device_.bind_sparse(bi);
 }
 
 uint32_t VenusImage::level_layers(uint32_t level) const { return level_layer_count(desc_.kind, desc_.layers, level); }

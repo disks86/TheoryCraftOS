@@ -41,20 +41,24 @@
  *     depth buffer, not of several samples when read by shaders, the samples of a multisampled one not copied to buffers (Direct3D 12 has no such copy)
  *   - ResourceMinLODClamp (a view's least level of detail, in the resource's levels) raises the sampler's MinLOD in the kernel; SampleCmp of a mipmapped texture compares the view's
  *     first level on virgl
- *   - samplers: the MINIMUM_ / MAXIMUM_ filters and coordinates in texels (D3D12_SAMPLER_FLAG_NON_NORMALIZED_COORDINATES) where the kernel's device has them (the CPU renderer;
- *     a draw with one is refused on virgl); the separate minification and magnification filters on the CPU renderer and virgl (one filter, linear where either is, elsewhere)
+ *   - samplers: the MINIMUM_ / MAXIMUM_ filters and coordinates in texels (D3D12_SAMPLER_FLAG_NON_NORMALIZED_COORDINATES) where the kernel's device has them (the CPU renderer
+ *     and Venus - whose shaders divide the coordinates by the level's size -; a draw with one is refused on virgl); the separate minification and magnification filters on the
+ *     CPU renderer, Venus and virgl (one filter, linear where either is, elsewhere)
  *   - lines: aliased, alpha-antialiased and quadrilateral 1.4 / 1.0 wide on the CPU renderer; virgl's are the host's smooth and multisampled lines (its aliased line on a target
  *     of one sample); the other devices draw aliased lines and refuse narrow quadrilateral ones
  *   - a pass with a depth buffer and no render target draws into a colour image of the buffer's size that nothing reads (cmdlist.inc depth_companion): it costs that memory
  *   - multisampled images are render targets and depth buffers of the adapter's sample counts, drawn into and resolved (not read by shaders through this DLL)
- *   - tiled resources (extras.inc, base.inc dev_tiled_tier): tier 4 on the CPU renderer, tier 1 on virgl (TGSI has no residency feedback or lookup clamp); no reserved depth
+ *   - tiled resources (extras.inc, base.inc dev_tiled_tier): tier 4 on the CPU renderer and Venus (the host's sparse images and sparse lookups, where its blocks are the
+ *     tiles), tier 1 on virgl (TGSI has no residency feedback or lookup clamp); no reserved depth
  *     buffers or multisampled textures (the kernel's have no backing for the tiles: no D3D12_FORMAT_SUPPORT2_TILED depth format, no tiled quality level), no status of buffer and UAV loads (ld_raw_s / ld_structured_s / ld_uav_typed_s: the kernel refuses
  *     the shader); heaps shared across adapters (DXGI_ERROR_UNSUPPORTED; shared handles of one adapter's resources and heaps, and of fences of any
  *     adapter, are made: device.inc), resource state validation (barriers are accepted and not looked at, except aliasing), the debug layer
  *   - of the later interfaces (ID3D12Device1 .. 14, ID3D12GraphicsCommandList1 .. 10: device1.inc, cmdlist1.inc, library.inc, rootsig.inc; what mingw lacks of them is in
  *     d3d12_types.h), the features reported at their "not supported" tier: ray tracing, mesh shaders, sampler feedback, work graphs, protected sessions, meta commands
  *     (D3D12_SAMPLER_DESC2, the strip cut of the command list and triangle fans are done: heaps.inc sampler_descriptor, cmdlist1.inc IASetIndexBufferStripCutValue); and on
- *     virgl (the CPU renderer has them: cmdlist1.inc) the depth bounds test, programmable sample positions, view instancing, variable-rate shading and barycentrics
+ *     virgl (the CPU renderer has them: cmdlist1.inc) the depth bounds test, programmable sample positions, view instancing, variable-rate shading and barycentrics; on
+ *     Venus variable-rate shading where the host's coarse pixels reach 4x4 (AdditionalShadingRatesSupported is not a feature of its own yet: RADV's stop at 2x2, so Venus there
+ *     reports tier 0), the others where the host's Vulkan has them (sample locations, fragment shader barycentrics; view instancing is the draw loop)
  *   - of those: view instancing is tier 2 (draw-call looping; every stage runs for every view), no centroid or sample interpolation (EvaluateAttributeSnapped, per-sample
  *     shading) or SV_Coverage, and HighestShaderModel stays 5.1 (DXIL of 6.1 - 6.6 with SV_ViewID, SV_Barycentrics, GetAttributeAtVertex, SV_ShadingRate and IsHelperLane is
  *     taken, but the wave operations of 6.0 are not translated)

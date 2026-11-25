@@ -146,6 +146,92 @@ int main() {
     if (fs) device.destroy_shader_module(fs);
     if (vs) device.destroy_shader_module(vs);
   }
+  // Coarse shading (kFeature2ShadingRate) on the device itself: the pipeline's rate, a vertex shader's per-primitive rate and a shading-rate image, each with its
+  // combiner. The fragment shader shows where it ran (red: frac(x / 8) of SV_Position, the coarse pixel's centre) and the rate it reads (blue: rate / 16). Rates of
+  // 2x2 and less, which every host with the extension has (RADV's coarse pixels stop there: the device offers the feature only with 4x4, so it is turned on here).
+  if (device.context().caps().shading_rate) {
+    device.offer_for_tests(graphics::kFeature2ShadingRate);
+    static const char kVs[] = "VERT\nDCL IN[0]\nDCL OUT[0], POSITION\nDCL OUT[1], SHADINGRATE\nIMM[0] UINT32 {5, 5, 5, 5}\n"
+                              "  0: MOV OUT[0], IN[0]\n  1: MOV OUT[1].x, IMM[0].xxxx\n  2: END\n";
+    static const char kVsPlain[] = "VERT\nDCL IN[0]\nDCL OUT[0], POSITION\n  0: MOV OUT[0], IN[0]\n  1: END\n";
+    static const char kFs[] = "FRAG\nDCL IN[0], POSITION, LINEAR\nDCL IN[1], SHADINGRATE, CONSTANT\nDCL OUT[0], COLOR\nDCL TEMP[0]\n"
+                              "IMM[0] FLT32 {0.125000000000, 0.062500000000, 1.000000000000, 0.000000000000}\n"
+                              "  0: MUL TEMP[0].xy, IN[0].xyyy, IMM[0].xxxx\n  1: FRC TEMP[0].xy, TEMP[0].xyyy\n  2: U2F TEMP[0].z, IN[1].xxxx\n"
+                              "  3: MUL TEMP[0].z, TEMP[0].zzzz, IMM[0].yyyy\n  4: MOV TEMP[0].w, IMM[0].zzzz\n  5: MOV OUT[0], TEMP[0]\n  6: END\n";
+    graphics::ShaderModuleDesc vd, pd_, fd;
+    vd.stage = pd_.stage = graphics::ShaderStage::Vertex, vd.tgsi = kVsPlain, pd_.tgsi = kVs;
+    fd.stage = graphics::ShaderStage::Fragment, fd.tgsi = kFs;
+    graphics::IShaderModule* vs = device.create_shader_module(vd);
+    graphics::IShaderModule* vs_rate = device.create_shader_module(pd_);
+    graphics::IShaderModule* fs = device.create_shader_module(fd);
+    graphics::GraphicsPipelineDesc pd;
+    pd.vertex_shader = vs, pd.fragment_shader = fs, pd.vertex_stride = 16, pd.attribute_count = 1;
+    pd.attributes[0] = {0, graphics::VertexFormat::Float4, 0};
+    pd.cull_mode = graphics::CullMode::None;
+    graphics::IPipeline* plain = vs && fs ? device.create_graphics_pipeline(pd) : nullptr;
+    pd.vertex_shader = vs_rate;
+    graphics::IPipeline* primitive = vs_rate && fs ? device.create_graphics_pipeline(pd) : nullptr;
+    const float tri[12] = {-1, -1, 0.5f, 1, 3, -1, 0.5f, 1, -1, 3, 0.5f, 1};
+    graphics::IBuffer* vb = device.create_buffer(sizeof tri, graphics::kBufferVertex);
+    if (vb) {
+      memcpy(vb->map().data(), tri, sizeof tri);
+      vb->unmap();
+    }
+    // the image: 2 x 2 tiles of 16 pixels, the left column 1x1, the right 2x2 (R8_UINT, a wide format: its integers travel as the bits of Vec4 floats)
+    graphics::IImage* rates = device.create_image({{2, 2}, graphics::Format::R8Uint, graphics::kImageSampled});
+    auto bits = [](uint32_t v) { return __builtin_bit_cast(float, v); };
+    const graphics::Vec4 rate_texels[4] = {{bits(0), 0, 0, 0}, {bits(5), 0, 0, 0}, {bits(0), 0, 0, 0}, {bits(5), 0, 0, 0}};
+    const bool rates_ok = rates && rates->write_pixels_float(ArrayView<const graphics::Vec4>(rate_texels, 4));
+    using C = graphics::ShadingRateCombiner;
+    struct Case {
+      const char* what;
+      graphics::IPipeline* pipe;
+      uint32_t rate;
+      C primitive, image;
+      bool with_image;
+      uint32_t red0, red1, red16, red17, blue0, blue16;   // (at pixels x 0, 1, 16, 17 of row 4)
+    };
+    const Case cases[] = {{"1x1", plain, 0x0, C::Passthrough, C::Passthrough, false, 16, 48, 16, 48, 0, 0},
+                          {"2x2 of the pipeline", plain, 0x5, C::Passthrough, C::Passthrough, false, 32, 32, 32, 32, 80, 80},
+                          {"2x2 of the primitive", primitive, 0x0, C::Override, C::Passthrough, false, 32, 32, 32, 32, 80, 80},
+                          {"1x1 and 2x2 of the image", plain, 0x0, C::Passthrough, C::Override, true, 16, 48, 32, 32, 0, 80},
+                          {"2x1 sum the image (4x2 there: 2x2 on the host)", plain, 0x4, C::Passthrough, C::Sum, true, 32, 32, 32, 32, 64, 80}};
+    for (const Case& k : cases) {
+      graphics::IImage* image = device.create_image({{32, 32}, graphics::Format::B8G8R8A8Unorm, graphics::kImageColorAttachment | graphics::kImageSampled});
+      graphics::ICommandBuffer* cb = device.create_command_buffer();
+      bool ok = image && cb && k.pipe && vb && (rates_ok || !k.with_image);
+      uint32_t px[32 * 32] = {};
+      if (ok) {
+        graphics::RenderPassBegin pass;
+        pass.color = image;
+        cb->begin();
+        cb->set_shading_rate(k.rate, k.primitive, k.image);
+        cb->set_shading_rate_image(k.with_image ? rates : nullptr);
+        cb->begin_render_pass(pass);
+        cb->bind_pipeline(k.pipe);
+        cb->bind_vertex_buffer(vb);
+        cb->draw(3);
+        cb->end_render_pass();
+        ok = cb->end() && device.submit(cb) && image->read_pixels(ArrayView<uint32_t>(px, 32 * 32));
+      }
+      auto red = [&](uint32_t x) { return px[4 * 32 + x] >> 16 & 0xFF; };
+      auto blue = [&](uint32_t x) { return px[4 * 32 + x] & 0xFF; };
+      auto near = [](uint32_t a, uint32_t b) { return a + 1 >= b && a <= b + 1; };
+      const bool right = ok && near(red(0), k.red0) && near(red(1), k.red1) && near(red(16), k.red16) && near(red(17), k.red17) && near(blue(0), k.blue0) && near(blue(16), k.blue16);
+      printf("  shading rate %s: %s (red %u %u %u %u, blue %u %u%s)\n", k.what, right ? "right" : "FAILED", red(0), red(1), red(16), red(17), blue(0), blue(16), ok ? "" : rates_ok ? ", not drawn" : ", no image");
+      if (!right) ++g_failed;
+      if (cb) device.destroy_command_buffer(cb);
+      if (image) device.destroy_image(image);
+    }
+    if (rates) device.destroy_image(rates);
+    if (vb) device.destroy_buffer(vb);
+    if (primitive) device.destroy_pipeline(primitive);
+    if (plain) device.destroy_pipeline(plain);
+    if (fs) device.destroy_shader_module(fs);
+    if (vs_rate) device.destroy_shader_module(vs_rate);
+    if (vs) device.destroy_shader_module(vs);
+    device.offer_for_tests(0);
+  }
   // what format_caps says of each format is what create_image does (the kernel hands the caps to user mode as format support)
   for (uint32_t fi = 64; fi < 128; ++fi) {
     const graphics::Format f = static_cast<graphics::Format>(fi);
