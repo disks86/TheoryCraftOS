@@ -123,7 +123,7 @@ bool Allocation::subresource_range(uint32_t level, uint32_t layer, uint64_t* off
 }
 
 Allocation::Allocation(VidMm& manager, allocators::IAllocator& allocator, const AllocationDesc& desc, uint64_t id)
-    : manager_(manager), allocator_(allocator), desc_(desc), id_(id), placed_(allocator), tiles_(allocator), mirror_sources_(allocator) {}
+    : manager_(manager), allocator_(allocator), desc_(desc), id_(id), placed_(allocator), tile_users_(allocator), tiles_(allocator), mirror_sources_(allocator) {}
 
 Allocation::~Allocation() { manager_.forget(*this); }
 
@@ -162,102 +162,122 @@ uint32_t VidMm::from_logical(Format f, uint32_t pixel) {
 }
 
 // --- Reserved textures: the numbering of tiles ----------------------------------------------------------------------------------------------------------------------------
-// A reserved texture's texels are `texel_bytes` each in the heaps - its image's pixels, or the narrower ones its tile_narrow names (Direct3D's R8 / R8G8 / R16 / R16G16, which
-// the image keeps widened) -, so its tiles have Direct3D's standard shape for that size (tile_shape). The levels that are at least a tile in both directions - the standard ones -
-// are cut into tiles, row by row, level after level; a tile of one is its rows one after the other in the heap, each tile_shape().width texels (the part of an edge tile outside
-// the level is not used). The smaller levels (the packed mips) come last: their texels one level after the other, row by row, over as many tiles as they fill.
-namespace {
-uint32_t tile_texel_bytes(const AllocationDesc& d) { return d.tile_narrow ? narrow_pixel_bytes(static_cast<NarrowLayout>(d.tile_narrow)) : pixel_bytes(d.format); }
-uint32_t standard_levels(const AllocationDesc& d) {
-  const TileShape t = tile_shape(tile_texel_bytes(d));
-  uint32_t n = 0;
-  while (n < d.mip_levels && graphics::mip_extent(d.width, n) >= t.width && graphics::mip_extent(d.height, n) >= t.height) ++n;
-  return n;
-}
-uint64_t level_tile_columns(const AllocationDesc& d, uint32_t level) {
-  const uint32_t across = tile_shape(tile_texel_bytes(d)).width;
-  return (graphics::mip_extent(d.width, level) + uint64_t{across} - 1) / across;
-}
-uint64_t level_tile_rows(const AllocationDesc& d, uint32_t level) {
-  const uint32_t down = tile_shape(tile_texel_bytes(d)).height;
-  return (graphics::mip_extent(d.height, level) + uint64_t{down} - 1) / down;
-}
-// The heap bytes of the packed levels, and the tiles they take.
-uint64_t packed_bytes(const AllocationDesc& d) {
+// (see ReservedLayout in VidMm.hpp: Direct3D's numbering of a reserved texture's tiles, its standard tile shapes and the packed levels of each slice)
+bool reserved_layout(const AllocationDesc& d, ReservedLayout* out) {
+  *out = ReservedLayout();
+  ReservedLayout& l = *out;
+  const bool compressed = dxgk::is_compressed(d.format);
+  l.volume = d.kind == graphics::TextureKind::Texture3D;
+  l.block = compressed ? 4 : 1;
+  l.image_bytes = compressed ? block_bytes(d.format) : pixel_bytes(d.format);
+  l.element_bytes = d.tile_narrow ? narrow_pixel_bytes(static_cast<NarrowLayout>(d.tile_narrow)) : l.image_bytes;
+  l.shape = tile_shape(l.element_bytes, l.volume);
+  if (!l.shape.width || d.width == 0 || d.height == 0 || d.mip_levels == 0 || d.mip_levels > kMaxReservedLevels) return false;
+  l.mips = d.mip_levels;
+  l.slices = l.volume ? 1 : graphics::image_layer_count(d.kind, d.layers);
+  if (l.slices == 0) return false;
+  const uint32_t tile_w = l.shape.width * l.block, tile_h = l.shape.height * l.block;
   uint64_t n = 0;
-  for (uint32_t l = standard_levels(d); l < d.mip_levels; ++l) n += uint64_t{graphics::mip_extent(d.width, l)} * graphics::mip_extent(d.height, l) * tile_texel_bytes(d);
-  return n;
+  while (l.standard < l.mips && graphics::mip_extent(d.width, l.standard) >= tile_w && graphics::mip_extent(d.height, l.standard) >= tile_h &&
+         (!l.volume || reserved_depth(d, l.standard) >= l.shape.depth)) {
+    const uint32_t level = l.standard++;
+    l.first[level] = n;
+    l.columns[level] = (uint64_t{reserved_elements_x(l, d, level)} + l.shape.width - 1) / l.shape.width;
+    l.rows[level] = (uint64_t{reserved_elements_y(l, d, level)} + l.shape.height - 1) / l.shape.height;
+    l.deep[level] = (uint64_t{reserved_depth(d, level)} + l.shape.depth - 1) / l.shape.depth;
+    n += l.columns[level] * l.rows[level] * l.deep[level];
+  }
+  l.packed_first = n;
+  for (uint32_t level = l.standard; level < l.mips; ++level)
+    l.packed_bytes += uint64_t{reserved_elements_x(l, d, level)} * reserved_elements_y(l, d, level) * reserved_depth(d, level) * l.element_bytes;
+  l.packed_tiles = (l.packed_bytes + kTileBytes - 1) / kTileBytes;
+  l.per_slice = n + l.packed_tiles;
+  l.total = l.per_slice * l.slices;
+  return true;
 }
-uint64_t packed_tiles(const AllocationDesc& d) { return (packed_bytes(d) + kTileBytes - 1) / kTileBytes; }
-uint64_t texture_tile_count(const AllocationDesc& d) {
-  const uint32_t standard = standard_levels(d);
-  uint64_t n = packed_tiles(d);
-  for (uint32_t l = 0; l < standard; ++l) n += level_tile_columns(d, l) * level_tile_rows(d, l);
-  return n;
-}
+uint32_t reserved_elements_x(const ReservedLayout& l, const AllocationDesc& d, uint32_t level) { return (graphics::mip_extent(d.width, level) + l.block - 1) / l.block; }
+uint32_t reserved_elements_y(const ReservedLayout& l, const AllocationDesc& d, uint32_t level) { return (graphics::mip_extent(d.height, level) + l.block - 1) / l.block; }
+uint32_t reserved_depth(const AllocationDesc& d, uint32_t level) { return d.kind == graphics::TextureKind::Texture3D ? graphics::level_layer_count(d.kind, d.layers, level) : 1; }
+
+namespace {
 struct TileSpot {
-  uint32_t level = 0, x = 0, y = 0;   // a standard level's tile: its column and row in the level
+  uint32_t slice = 0, level = 0;
+  uint64_t x = 0, y = 0, z = 0;       // a standard level's tile: its column, row and depth in the level
   bool packed = false;
-  uint64_t packed_index = 0;          // a tile of the packed levels: which of them
+  uint64_t packed_index = 0;          // a tile of the packed levels: which of the slice's
 };
-bool tile_spot(const AllocationDesc& d, uint64_t tile, TileSpot* out) {
-  const uint32_t standard = standard_levels(d);
-  for (uint32_t l = 0; l < standard; ++l) {
-    const uint64_t across = level_tile_columns(d, l), count = across * level_tile_rows(d, l);
-    if (tile < count) {
-      *out = {l, static_cast<uint32_t>(tile % across), static_cast<uint32_t>(tile / across), false, 0};
+bool tile_spot(const ReservedLayout& l, uint64_t tile, TileSpot* out) {
+  if (!l.per_slice || tile >= l.total) return false;
+  TileSpot s;
+  s.slice = static_cast<uint32_t>(tile / l.per_slice);
+  uint64_t in_slice = tile % l.per_slice;
+  if (in_slice >= l.packed_first) {
+    s.level = l.standard;
+    s.packed = true;
+    s.packed_index = in_slice - l.packed_first;
+    *out = s;
+    return true;
+  }
+  for (uint32_t level = 0; level < l.standard; ++level) {
+    const uint64_t count = l.columns[level] * l.rows[level] * l.deep[level];
+    if (in_slice < count) {
+      s.level = level;
+      s.x = in_slice % l.columns[level];
+      s.y = in_slice / l.columns[level] % l.rows[level];
+      s.z = in_slice / (l.columns[level] * l.rows[level]);
+      *out = s;
       return true;
     }
-    tile -= count;
-  }
-  if (tile < packed_tiles(d)) {
-    *out = {standard, 0, 0, true, tile};
-    return true;
+    in_slice -= count;
   }
   return false;
 }
-// The texels of tile `tile` of a reserved texture: calls use(image_run, heap_at, texels) for each run of them that is contiguous in both - `image_run` the run's pixels in the
-// backing, `heap_at` where its texels start in the heap's tile.
+// The elements of tile `tile` of a reserved texture: calls use(image_run, heap_at, elements) for each run of them that is contiguous in both - `image_run` the run's pixels (or
+// blocks) in the backing, `heap_at` where its elements start in the heap's tile.
 template <typename Use>
-void for_tile_runs(const Allocation& a, uint64_t tile, ByteView backing, Use use) {
+void for_tile_runs(const Allocation& a, const ReservedLayout& l, uint64_t tile, ByteView backing, Use use) {
   const AllocationDesc& d = a.desc();
   TileSpot spot;
-  if (!tile_spot(d, tile, &spot)) return;
-  const uint32_t image_bytes = pixel_bytes(d.format), texel_bytes = tile_texel_bytes(d);
+  if (!tile_spot(l, tile, &spot)) return;
+  // (the rows of one slice of a level - an array's slice, or a volume's slice z at that level - in the backing: subresource_range of that layer, rows of `columns` elements)
+  auto row_of = [&](uint32_t level, uint32_t z, uint64_t y, uint64_t x, uint64_t count, ByteView* run) {
+    uint64_t offset = 0, bytes = 0;
+    if (!a.subresource_range(level, l.volume ? z : spot.slice, &offset, &bytes)) return false;
+    const uint64_t columns = reserved_elements_x(l, d, level);
+    return backing.try_subview(offset + (y * columns + x) * l.image_bytes, count * l.image_bytes, run);
+  };
   if (spot.packed) {
-    // (the packed levels as one run of texels, of which this tile is the kTileBytes from packed_index * kTileBytes on; texel_bytes divides kTileBytes, so no texel straddles two)
+    // (the slice's packed levels as one run of elements, of which this tile is the kTileBytes from packed_index * kTileBytes on)
     const uint64_t low = spot.packed_index * kTileBytes, high = low + kTileBytes;
     uint64_t at = 0;
-    for (uint32_t l = spot.level; l < d.mip_levels && at < high; ++l) {
-      const uint32_t w = graphics::mip_extent(d.width, l), h = graphics::mip_extent(d.height, l);
-      const uint64_t row = uint64_t{w} * texel_bytes;
-      if (at + row * h <= low) {
-        at += row * h;
+    for (uint32_t level = l.standard; level < l.mips && at < high; ++level) {
+      const uint64_t columns = reserved_elements_x(l, d, level), rows = reserved_elements_y(l, d, level), depth = reserved_depth(d, level);
+      const uint64_t row = columns * l.element_bytes;
+      if (at + row * rows * depth <= low) {
+        at += row * rows * depth;
         continue;
       }
-      uint64_t offset = 0, bytes = 0;
-      if (!a.level_range(l, &offset, &bytes)) return;
-      for (uint32_t y = 0; y < h && at < high; ++y, at += row) {
-        const uint64_t from = at > low ? at : low, to = at + row < high ? at + row : high;
-        if (from >= to) continue;
-        const uint64_t first = (from - at) / texel_bytes, count = (to - from) / texel_bytes;
-        ByteView run;
-        if (backing.try_subview(offset + (uint64_t{y} * w + first) * image_bytes, count * image_bytes, &run)) use(run, from - low, static_cast<uint32_t>(count));
-      }
+      for (uint64_t z = 0; z < depth && at < high; ++z)
+        for (uint64_t y = 0; y < rows && at < high; ++y, at += row) {
+          const uint64_t from = at > low ? at : low, to = at + row < high ? at + row : high;
+          if (from >= to) continue;
+          const uint64_t first = (from - at) / l.element_bytes, count = (to - from) / l.element_bytes;
+          ByteView run;
+          if (row_of(level, static_cast<uint32_t>(z), y, first, count, &run)) use(run, from - low, static_cast<uint32_t>(count));
+        }
     }
     return;
   }
-  uint64_t offset = 0, bytes = 0;
-  if (!a.level_range(spot.level, &offset, &bytes)) return;
-  const TileShape shape = tile_shape(texel_bytes);
-  const uint32_t level_w = graphics::mip_extent(d.width, spot.level), level_h = graphics::mip_extent(d.height, spot.level);
-  const uint32_t x0 = spot.x * shape.width, y0 = spot.y * shape.height;
-  const uint32_t columns = level_w - x0 < shape.width ? level_w - x0 : shape.width, rows = level_h - y0 < shape.height ? level_h - y0 : shape.height;
-  for (uint32_t row = 0; row < rows; ++row) {
-    ByteView run;
-    if (backing.try_subview(offset + (uint64_t{y0 + row} * level_w + x0) * image_bytes, uint64_t{columns} * image_bytes, &run))
-      use(run, uint64_t{row} * shape.width * texel_bytes, columns);
-  }
+  const uint64_t columns = reserved_elements_x(l, d, spot.level), rows = reserved_elements_y(l, d, spot.level), depth = reserved_depth(d, spot.level);
+  const uint64_t x0 = spot.x * l.shape.width, y0 = spot.y * l.shape.height, z0 = spot.z * l.shape.depth;
+  const uint64_t across = columns - x0 < l.shape.width ? columns - x0 : l.shape.width, down = rows - y0 < l.shape.height ? rows - y0 : l.shape.height,
+                 deep = depth - z0 < l.shape.depth ? depth - z0 : l.shape.depth;
+  for (uint64_t z = 0; z < deep; ++z)
+    for (uint64_t row = 0; row < down; ++row) {
+      ByteView run;
+      if (row_of(spot.level, static_cast<uint32_t>(z0 + z), y0 + row, x0, across, &run))
+        use(run, (z * l.shape.height + row) * l.shape.width * l.element_bytes, static_cast<uint32_t>(across));
+    }
 }
 // A run of `texels` of a reserved texture between its image's pixels and the heap's texels: the same bytes, or - a narrow layout - the first channels of each pixel, widened back
 // to (r, g or 0, 0, the maximum; 1 for an integer image) as CopyBufferImage widens. An empty `heap` (a tile mapped nowhere) gives zero texels.
@@ -314,9 +334,10 @@ NtStatus VidMm::create(const AllocationDesc& requested, SharedPointer<Allocation
   desc.flags &= ~kAllocTrackState;
   const bool reserved = (desc.flags & kAllocReserved) != 0;
   desc.flags &= ~kAllocReserved;
-  // A reserved resource is a buffer of whole tiles, or a plain sampled texture of colour pixels (one sample and layer; its tiles of tile_shape(), its mip levels below a tile in
-  // either direction packed at the end, see tile_spot()), whose texels in the heaps may be narrower than its pixels (tile_narrow).
-  const bool reserved_texture = reserved && desc.flags == kAllocTexture;
+  // A reserved resource is a buffer of whole tiles, or a sampled texture of colour pixels or blocks of one sample - of any kind and levels, also drawn into or a storage image -
+  // (its tiles of tile_shape(), numbered as ReservedLayout says), whose texels in the heaps may be narrower than its pixels (tile_narrow). The rest of its description is checked as
+  // any texture's below.
+  const bool reserved_texture = reserved && (desc.flags & kAllocTexture) && !(desc.flags & ~(kAllocTexture | kAllocRenderTarget | kAllocStorageImage));
   if (reserved && (heap || requested.heap || (desc.flags & (kAllocQueryResult | kAllocConstantBuffer | kAllocHeap | kAllocShared))) ) return status::kInvalidParameter;
   if (reserved && !reserved_texture && (!(desc.flags & (kAllocVertexBuffer | kAllocIndexBuffer | kAllocUnorderedAccess | kAllocStreamOutput)) || desc.size == 0 || desc.size % kTileBytes)) return status::kInvalidParameter;
   if (desc.tile_narrow != 0) {
@@ -328,8 +349,9 @@ NtStatus VidMm::create(const AllocationDesc& requested, SharedPointer<Allocation
         (sixteen && desc.format != Format::A16B16G16R16 && desc.format != Format::A16B16G16R16Sint))
       return status::kInvalidParameter;
   }
-  if (reserved_texture && (!dxgk::is_color(desc.format) || tile_shape(tile_texel_bytes(desc)).width == 0 || desc.width == 0 || desc.height == 0 || desc.mip_levels == 0 ||
-                           desc.samples != 1 || desc.kind != graphics::TextureKind::Texture2D || desc.layers != 1))
+  ReservedLayout tiles;
+  if (reserved_texture && ((!dxgk::is_color(desc.format) && !dxgk::is_compressed(desc.format)) || desc.samples != 1 || desc.kind == graphics::TextureKind::Texture2DMS ||
+                           !reserved_layout(desc, &tiles) || tiles.total > 0xFFFFFFFFull))
     return status::kInvalidParameter;
   if (track_state && (requested.initial_state & ~kStateMask)) return status::kInvalidParameter;
   if (desc.flags == 0 || (desc.flags & ~kKnownFlags)) return status::kInvalidParameter;
@@ -479,7 +501,7 @@ sized:
   }
   ++next_id_;
   if (reserved)
-    for (uint64_t i = 0, tiles = reserved_texture ? texture_tile_count(desc) : desc.size / kTileBytes; i < tiles; ++i)
+    for (uint64_t i = 0, count = reserved_texture ? tiles.total : desc.size / kTileBytes; i < count; ++i)
       if (!a->tiles_.push_back(Allocation::TileBinding())) return status::kNoMemory;
   a->reserved_ = reserved;
   a->state_tracked_ = track_state;
@@ -492,6 +514,19 @@ sized:
 
 void VidMm::forget(Allocation& a) {
   if (a.resident()) release_device_object(a);
+  if (a.reserved_) {
+    // (the heaps its tiles are in stop telling it of their changes)
+    const Allocation* last = nullptr;
+    for (const Allocation::TileBinding& b : a.tiles_)
+      if (b.heap && b.heap.get() != last) {
+        last = b.heap.get();
+        for (uint64_t i = 0; i < b.heap->tile_users_.count(); ++i)
+          if (b.heap->tile_users_[i] == &a) {
+            b.heap->tile_users_.remove_at(i);
+            break;
+          }
+      }
+  }
   if (a.heap_) {
     for (uint64_t i = 0; i < a.heap_->placed_.count(); ++i)
       if (a.heap_->placed_[i] == &a) {
@@ -566,15 +601,45 @@ bool VidMm::create_device_object(Allocation& a) {
   return a.image_ != nullptr;
 }
 
+// What the GPU wrote into the allocations that share a heap's memory - placed in it, or reserved ones with tiles there - goes into the memory first (their read-back scatters a
+// reserved one's tiles), so that a reserved allocation gathering from it sees it (Direct3D's aliasing: the tiles of one heap seen through several resources).
+void VidMm::flush_heap_writers(Allocation& heap, const Allocation* except) {
+  for (Allocation* other : heap.placed_)
+    if (other != except && other->gpu_newer_) read_back(*other);
+  for (Allocation* other : heap.tile_users_)
+    if (other != except && other->gpu_newer_) read_back(*other);
+}
+
+// The allocations that share a heap's memory (placed in it, or reserved ones with tiles there): what lies there changed, their device objects are stale.
+void VidMm::heap_changed(Allocation& heap, const Allocation* except) {
+  for (Allocation* other : heap.placed_) {
+    if (other == except) continue;
+    other->device_stale_ = other->cpu_written_ = true;
+    ++other->version_;
+  }
+  for (Allocation* other : heap.tile_users_) {
+    if (other == except) continue;
+    other->device_stale_ = other->cpu_written_ = true;
+    ++other->version_;
+  }
+}
+
 void VidMm::gather_tiles(Allocation& a) {
+  const Allocation* last = nullptr;
+  for (const Allocation::TileBinding& b : a.tiles_)
+    if (b.heap && b.heap.get() != last) {
+      last = b.heap.get();
+      flush_heap_writers(*b.heap, &a);
+    }
   if (a.is_image()) {
+    ReservedLayout layout;
+    if (!reserved_layout(a.desc_, &layout)) return;
     for (uint64_t i = 0; i < a.tiles_.count(); ++i) {
       const Allocation::TileBinding& b = a.tiles_[i];
-      for_tile_runs(a, i, a.cpu_, [&](ByteView image, uint64_t at, uint32_t texels) {
+      for_tile_runs(a, layout, i, a.cpu_, [&](ByteView image, uint64_t at, uint32_t elements) {
         ConstByteView from;
-        const uint64_t heap_bytes = uint64_t{texels} * tile_texel_bytes(a.desc_);
-        if (!b.heap || !b.heap->backing().try_subview(b.offset + at, heap_bytes, &from)) from = ConstByteView();   // (nowhere: zero texels)
-        image_from_heap(a.desc_, image, from, texels);
+        if (!b.heap || !b.heap->backing().try_subview(b.offset + at, uint64_t{elements} * layout.element_bytes, &from)) from = ConstByteView();   // (nowhere: zero texels)
+        image_from_heap(a.desc_, image, from, elements);
       });
     }
     return;
@@ -591,16 +656,18 @@ void VidMm::gather_tiles(Allocation& a) {
 
 // The tiles the device changed go back to their heaps. Only those: tiles that alias one place of a heap (Direct3D's REUSE_SINGLE_TILE, CopyTileMappings, two resources on
 // one heap) are each the heap's bytes as gather_tiles left them, so an unchanged one must not put the old bytes back over a changed one. The changed tiles are found first,
-// against the heaps as they are before any is written.
+// against the heaps as they are before any is written. A tile mapped nowhere keeps nothing: what was written there is dropped.
 void VidMm::scatter_tiles(Allocation& a) {
+  ReservedLayout layout;
+  if (a.is_image() && !reserved_layout(a.desc_, &layout)) return;
   for (uint64_t i = 0; i < a.tiles_.count(); ++i) {
     Allocation::TileBinding& b = a.tiles_[i];
     b.changed = false;
     if (!b.heap) continue;
     if (a.is_image()) {
-      for_tile_runs(a, i, a.cpu_, [&](ByteView image, uint64_t at, uint32_t texels) {
+      for_tile_runs(a, layout, i, a.cpu_, [&](ByteView image, uint64_t at, uint32_t elements) {
         ConstByteView held;
-        if (!b.heap->backing().try_subview(b.offset + at, uint64_t{texels} * tile_texel_bytes(a.desc_), &held) || image_differs_from_heap(a.desc_, ConstByteView(image), held, texels))
+        if (!b.heap->backing().try_subview(b.offset + at, uint64_t{elements} * layout.element_bytes, &held) || image_differs_from_heap(a.desc_, ConstByteView(image), held, elements))
           b.changed = true;
       });
     } else {
@@ -614,32 +681,122 @@ void VidMm::scatter_tiles(Allocation& a) {
     b.changed = false;
     ByteView from, to;
     if (a.is_image()) {
-      for_tile_runs(a, i, a.cpu_, [&](ByteView image, uint64_t at, uint32_t texels) {
-        if (b.heap->cpu_.try_subview(b.offset + at, uint64_t{texels} * tile_texel_bytes(a.desc_), &to)) heap_from_image(a.desc_, to, ConstByteView(image), texels);
+      for_tile_runs(a, layout, i, a.cpu_, [&](ByteView image, uint64_t at, uint32_t elements) {
+        if (b.heap->cpu_.try_subview(b.offset + at, uint64_t{elements} * layout.element_bytes, &to)) heap_from_image(a.desc_, to, ConstByteView(image), elements);
       });
     } else if (a.cpu_.try_subview(i * kTileBytes, kTileBytes, &from) && b.heap->cpu_.try_subview(b.offset, kTileBytes, &to)) to.copy_from(ConstByteView(from));
-    // (what lies in the heap's memory under placed allocations is theirs to see: their device objects are stale now)
-    for (Allocation* other : b.heap->placed_) {
-      other->device_stale_ = other->cpu_written_ = true;
-      ++other->version_;
-    }
+    // (what lies in the heap's memory under placed allocations, and under other reserved ones' tiles, is theirs to see: their device objects are stale now)
+    heap_changed(*b.heap, &a);
   }
+}
+
+// What the GPU wrote into a reserved allocation, now in its backing, goes to the mapped tiles (scatter_tiles); what it wrote into the unmapped ones is dropped - the backing
+// gathers the tiles again, so that it reads as zero there, and the device object is uploaded again before its next use (Direct3D's tier 2: reads of unmapped tiles are zero).
+void VidMm::settle_tiles(Allocation& a) {
+  scatter_tiles(a);
+  gather_tiles(a);
+  a.device_stale_ = true;
+}
+
+// A reserved texture's device image learns which of its tiles are mapped (graphics::ImageResidency): one byte per tile of each slice's standard levels, then one for the slice's
+// packed levels - mapped when all their tiles are (Direct3D leaves a partly mapped tail undefined).
+void VidMm::push_residency(Allocation& a) {
+  if (!a.image_ || !a.reserved_) return;
+  ReservedLayout layout;
+  if (!reserved_layout(a.desc_, &layout)) return;
+  const uint64_t standard_tiles = layout.packed_first, per_slice = standard_tiles + (layout.packed_tiles ? 1 : 0);
+  scratch_.clear();
+  if (!scratch_.put_zeros(per_slice * layout.slices)) return;
+  ByteView bytes = scratch_.writable_view();
+  for (uint32_t slice = 0; slice < layout.slices; ++slice) {
+    for (uint64_t t = 0; t < standard_tiles; ++t) bytes[slice * per_slice + t] = a.tiles_[slice * layout.per_slice + t].heap ? 1 : 0;
+    if (!layout.packed_tiles) continue;
+    bool all = true;
+    for (uint64_t t = 0; t < layout.packed_tiles; ++t) all = all && a.tiles_[slice * layout.per_slice + layout.packed_first + t].heap;
+    bytes[slice * per_slice + standard_tiles] = all ? 1 : 0;
+  }
+  graphics::ImageResidency r;
+  r.tile_width = layout.shape.width * layout.block;
+  r.tile_height = layout.shape.height * layout.block;
+  r.tile_depth = layout.shape.depth;
+  r.standard_levels = layout.standard;
+  r.slices = layout.slices;
+  r.mapped = ConstByteView(bytes);
+  (void)a.image_->set_residency(r);   // (a device without kFeature2TileResidency keeps none: its shaders have no residency feedback)
 }
 
 NtStatus VidMm::map_tiles(Allocation& reserved, uint32_t first, const SharedPointer<Allocation>& heap, uint64_t heap_offset, uint32_t count) {
   if (!reserved.reserved_ || count == 0 || first > reserved.tiles_.count() || count > reserved.tiles_.count() - first) return status::kInvalidParameter;
   if (heap && (!heap->is_heap() || &heap->manager() != this || heap_offset % kTileBytes || heap_offset > heap->desc().size || uint64_t{count} * kTileBytes > heap->desc().size - heap_offset))
     return status::kInvalidParameter;
-  for (uint32_t i = 0; i < count; ++i) {
-    reserved.tiles_[first + i].heap = heap;
-    reserved.tiles_[first + i].offset = heap_offset + uint64_t{i} * kTileBytes;
+  // (what the GPU wrote through the old mapping goes to the old places first: the new mapping shows what is at the new ones)
+  if (reserved.gpu_newer_ && !read_back(reserved)) return status::kInvalidDeviceState;
+  if (heap) {
+    bool known = false;
+    for (const Allocation* u : heap->tile_users_) known = known || u == &reserved;
+    if (!known && !heap->tile_users_.push_back(&reserved)) return status::kNoMemory;
   }
+  List<SharedPointer<Allocation>> old_heaps(allocator_);   // (the other heaps tiles leave: few)
+  for (uint32_t i = 0; i < count; ++i) {
+    Allocation::TileBinding& b = reserved.tiles_[first + i];
+    if (b.heap && b.heap != heap) {
+      bool listed = false;
+      for (const SharedPointer<Allocation>& o : old_heaps) listed = listed || o == b.heap;
+      if (!listed && !old_heaps.push_back(b.heap)) return status::kNoMemory;
+    }
+    b.heap = heap;
+    b.offset = heap_offset + uint64_t{i} * kTileBytes;
+  }
+  for (const SharedPointer<Allocation>& o : old_heaps) forget_tile_user(*o, reserved);
   reserved.device_stale_ = true;
   return status::kSuccess;
 }
 
+bool VidMm::copy_tiles(Allocation& reserved, uint32_t first, uint32_t count, Allocation& buffer, uint64_t offset, bool to_buffer) {
+  if (!reserved.reserved_ || first > reserved.tiles_.count() || count > reserved.tiles_.count() - first || offset > buffer.cpu_.size() || uint64_t{count} * kTileBytes > buffer.cpu_.size() - offset)
+    return false;
+  if (!read_back(buffer)) return false;
+  if (reserved.gpu_newer_ && !read_back(reserved)) return false;   // (its writes go into the heaps first)
+  for (uint32_t i = 0; i < count; ++i) {
+    const Allocation::TileBinding& b = reserved.tiles_[first + i];
+    if (b.heap) flush_heap_writers(*b.heap, &reserved);
+  }
+  for (uint32_t i = 0; i < count; ++i) {
+    const Allocation::TileBinding& b = reserved.tiles_[first + i];
+    ByteView part = buffer.cpu_.subview(offset + uint64_t{i} * kTileBytes, kTileBytes), heap_part;
+    const bool mapped = b.heap && b.heap->cpu_.try_subview(b.offset, kTileBytes, &heap_part);
+    if (to_buffer) {
+      if (mapped) part.copy_from(ConstByteView(heap_part));
+      else part.fill(0);   // (nowhere: zeros)
+    } else if (mapped) {
+      heap_part.copy_from(ConstByteView(part));
+      heap_changed(*b.heap, nullptr);   // (the reserved allocation too: it gathers its tiles again)
+    }
+  }
+  if (to_buffer) note_cpu_write(buffer);
+  return true;
+}
+
+// `reserved` no longer needs to be told of changes to `heap` once none of its tiles is there.
+void VidMm::forget_tile_user(Allocation& heap, Allocation& reserved) {
+  for (const Allocation::TileBinding& b : reserved.tiles_)
+    if (b.heap.get() == &heap) return;
+  for (uint64_t i = 0; i < heap.tile_users_.count(); ++i)
+    if (heap.tile_users_[i] == &reserved) {
+      heap.tile_users_.remove_at(i);
+      return;
+    }
+}
+
 bool VidMm::upload(Allocation& a) {
-  if (a.reserved_) gather_tiles(a);
+  if (!a.reserved_) return upload_contents(a);
+  gather_tiles(a);
+  if (!upload_contents(a)) return false;
+  push_residency(a);
+  return true;
+}
+
+bool VidMm::upload_contents(Allocation& a) {
   if (a.buffer_) {
     ByteView mapped = a.buffer_->map();
     const bool ok = mapped.copy_from(ConstByteView(a.cpu_));
@@ -805,6 +962,7 @@ bool VidMm::read_back_packed32(Allocation& a) {
 bool VidMm::read_back(Allocation& a) {
   if (dxgk::is_compressed(a.desc_.format)) {   // (sampled only: the GPU never writes it)
     a.gpu_newer_ = false;
+    if (a.reserved_) gather_tiles(a);   // (a reserved one: the heaps may have changed under it)
     return true;
   }
   if (!a.gpu_newer_) {
@@ -816,7 +974,7 @@ bool VidMm::read_back(Allocation& a) {
     if (!a.buffer_->read_back()) return false;
     ConstByteView mapped = a.buffer_->map();
     if (!a.cpu_.copy_from(mapped.first(a.cpu_.size() < mapped.size() ? a.cpu_.size() : mapped.size()))) return false;
-    if (a.reserved_) scatter_tiles(a);
+    if (a.reserved_) settle_tiles(a);
     a.gpu_newer_ = false;
     return true;
   }
@@ -829,6 +987,7 @@ bool VidMm::read_back(Allocation& a) {
   if (is_packed32(f)) {
     if (!read_back_packed32(a)) return false;
     a.gpu_newer_ = false;
+    if (a.reserved_) settle_tiles(a);
     return true;
   }
   const bool wide = dxgk::is_wide(f);
@@ -866,6 +1025,7 @@ bool VidMm::read_back(Allocation& a) {
     }
   }
   a.gpu_newer_ = false;
+  if (a.reserved_) settle_tiles(a);   // (a reserved texture drawn into or written as a storage image: the mapped tiles get what was written, the others drop it)
   return true;
 }
 

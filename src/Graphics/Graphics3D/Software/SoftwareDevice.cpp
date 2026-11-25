@@ -150,6 +150,7 @@ class SoftwareImage final : public IImage {
     for (uint8_t& v : stencil_) v = 0;
   }
   ~SoftwareImage() {
+    release_view(allocator_, residency_);
     release_view(allocator_, color_);
     release_view(allocator_, hdr_);
     release_view(allocator_, depth_);
@@ -293,6 +294,48 @@ class SoftwareImage final : public IImage {
     return has(level, layer) && !stencil_.empty() ? stencil_.subview(level_offset_[level] + uint64_t{layer} * level_pixels(level), level_pixels(level)) : ArrayView<uint8_t>();
   }
 
+  // --- tiled images (kFeature2TileResidency)
+  bool set_residency(const ImageResidency& r) override {
+    const bool volume = desc_.kind == TextureKind::Texture3D;
+    if (!r.tile_width || !r.tile_height || !r.tile_depth || r.standard_levels > desc_.mip_levels || r.slices != (volume ? 1u : layer_count()) || desc_.samples != 1) return false;
+    uint64_t per_slice = 0;
+    for (uint32_t level = 0; level < r.standard_levels; ++level) {
+      const Extent2D e = level_extent(level);
+      residency_first_[level] = per_slice;
+      residency_columns_[level] = (e.width + r.tile_width - 1) / r.tile_width;
+      residency_rows_[level] = (e.height + r.tile_height - 1) / r.tile_height;
+      const uint64_t deep = volume ? (level_layers(level) + r.tile_depth - 1) / r.tile_depth : 1;
+      per_slice += uint64_t{residency_columns_[level]} * residency_rows_[level] * deep;
+    }
+    residency_tail_ = per_slice;
+    if (r.standard_levels < desc_.mip_levels) ++per_slice;   // (the coarser levels' one unit)
+    if (r.mapped.size() != per_slice * r.slices) return false;
+    if (residency_.size() != r.mapped.size()) {
+      release_view(allocator_, residency_);
+      residency_ = allocate_view<uint8_t>(allocator_, r.mapped.size());
+      if (residency_.size() != r.mapped.size()) return false;
+    }
+    for (uint64_t i = 0; i < r.mapped.size(); ++i) residency_[i] = r.mapped[i];
+    residency_info_ = r;
+    residency_info_.mapped = ConstByteView();
+    residency_per_slice_ = per_slice;
+    return true;
+  }
+  // Whether texel (x, y) of layer `layer` (a volume's slice) of level `level` lies in a mapped tile: always, for an image that is not tiled.
+  bool texel_mapped(uint32_t level, uint32_t layer, int64_t x, int64_t y) const {
+    if (residency_.empty() || x < 0 || y < 0) return true;
+    const bool volume = desc_.kind == TextureKind::Texture3D;
+    const uint64_t slice_base = (volume ? 0 : uint64_t{layer}) * residency_per_slice_;
+    uint64_t at = slice_base + residency_tail_;
+    if (level < residency_info_.standard_levels) {
+      const uint64_t z = volume ? layer / residency_info_.tile_depth : 0;
+      const uint64_t column = static_cast<uint64_t>(x) / residency_info_.tile_width, row = static_cast<uint64_t>(y) / residency_info_.tile_height;
+      if (column >= residency_columns_[level] || row >= residency_rows_[level]) return true;
+      at = slice_base + residency_first_[level] + (z * residency_rows_[level] + row) * residency_columns_[level] + column;
+    }
+    return at < residency_.size() ? residency_[at] != 0 : true;
+  }
+
  private:
   uint64_t level_pixels(uint32_t level) const { return uint64_t{mip_extent(desc_.extent.width, level)} * mip_extent(desc_.extent.height, level) * desc_.samples; }
   allocators::IAllocator& allocator_;
@@ -302,6 +345,12 @@ class SoftwareImage final : public IImage {
   ArrayView<float> depth_;
   ArrayView<uint8_t> stencil_;
   uint64_t level_offset_[kMaxMipLevels] = {};   // (in values, from the start of the storage)
+  // A tiled image's residency (set_residency): one byte per unit, the slices one after the other, each its standard levels' tiles and then its coarser levels' unit.
+  ArrayView<uint8_t> residency_;
+  ImageResidency residency_info_;
+  uint64_t residency_per_slice_ = 0, residency_tail_ = 0;
+  uint64_t residency_first_[kMaxMipLevels] = {};
+  uint32_t residency_columns_[kMaxMipLevels] = {}, residency_rows_[kMaxMipLevels] = {};
 };
 class SoftwareShaderModule final : public IShaderModule {
  public:
@@ -459,6 +508,19 @@ class TextureSet final : public ITextureSet {
     for (uint32_t unit = 0; unit < kMaxTextureUnits; ++unit) lambda_[unit] = 0.0f, aniso_count_[unit] = 1;
   }
 
+  // Residency feedback and the lookups' own minimum level of detail (kFeature2TileResidency): see ITextureSet.
+  void begin_feedback(float min_lod) const override {
+    feedback_ = true;
+    unmapped_ = false;
+    min_lod_clamp_ = min_lod == min_lod ? min_lod : kNoClamp;
+  }
+  bool end_feedback() const override {
+    const bool mapped = !unmapped_;
+    feedback_ = unmapped_ = false;
+    min_lod_clamp_ = kNoClamp;
+    return mapped;
+  }
+
   Vec4 sample_volume(uint32_t unit, float u, float v, float w) const override {
     const Bound* b = bound_for(unit);
     if (!b) return {0, 0, 0, 1};
@@ -556,7 +618,8 @@ class TextureSet final : public ITextureSet {
       int64_t l = floor_to(unit_coordinate(w) + 0.5f);
       layer = static_cast<uint32_t>(l < 0 ? 0 : l >= b->layers ? b->layers - 1 : l);
     }
-    const float lambda = level_zero ? 0.0f : lambda_[unit];
+    float lambda = level_zero ? 0.0f : lambda_[unit];
+    if (lambda < min_lod_clamp_) lambda = min_lod_clamp_;   // (a lookup's own clamp: SampleCmp with a clamp)
     return filtered(*b, sampler, lambda, [&](uint32_t level) {
       const float value = compare_level(view_plane(*b, level, layer), sampler, u, v, reference);
       return Vec4{value, value, value, value};
@@ -599,17 +662,21 @@ class TextureSet final : public ITextureSet {
     if (lambda > sampler.max_lod) lambda = sampler.max_lod;
     return lambda;
   }
-  // One layer of one level a lookup reads: its surface, and of a depth image (kFeature2DepthTextures) its depth and stencil planes there - the surface then only says the size.
+  // One layer of one level a lookup reads: its surface, and of a depth image (kFeature2DepthTextures) its depth and stencil planes there - the surface then only says the size. (The
+  // image, level and layer: for the residency feedback of a tiled image.)
   struct Plane {
     Surface surface;
     ArrayView<float> depth;
     ArrayView<uint8_t> stencil;
+    const SoftwareImage* image = nullptr;
+    uint32_t level = 0, layer = 0;
   };
   // Layer `layer` of the view's level `level` (of a volume's: its slice there), with the planes of a depth image.
   static Plane view_plane(const Bound& b, uint32_t level, uint32_t layer) {
     const uint32_t at_level = b.base_level + level, at_layer = b.kind == TextureKind::Texture3D ? layer : b.first_layer + layer;
     Plane p;
     p.surface = b.image->surface(at_level, at_layer);
+    p.image = b.image, p.level = at_level, p.layer = at_layer;
     if (b.image->format() == Format::D32Float) p.depth = b.image->depth_layer(at_layer, at_level), p.stencil = b.image->stencil_layer(at_layer, at_level);
     return p;
   }
@@ -661,8 +728,9 @@ class TextureSet final : public ITextureSet {
   }
   // A lookup in the view at a level of detail: (u, v) of a 2D image, and w the layer of an array, the depth of a volume, or with (u, v) the direction of a cube (whose number in a
   // cube array is `cube`).
-  static Vec4 lookup(const Bound& b, const SamplerDesc& given, float u, float v, float w, float cube, float lambda) {
+  Vec4 lookup(const Bound& b, const SamplerDesc& given, float u, float v, float w, float cube, float lambda) const {
     SamplerDesc sampler = given;
+    if (lambda < min_lod_clamp_) lambda = min_lod_clamp_;   // (a lookup's own clamp: Direct3D's SampleClamp)
     w = unit_coordinate(w);
     switch (b.kind) {
       case TextureKind::TextureCube: case TextureKind::TextureCubeArray: {
@@ -716,7 +784,7 @@ class TextureSet final : public ITextureSet {
     return true;
   }
   // One level's comparison: reference <op> each texel the sampler's filter reads (a texel outside an image with a border: the border colour's red), filtered by that filter.
-  static float compare_level(const Plane& texels, const SamplerDesc& sampler, float u, float v, float reference) {
+  float compare_level(const Plane& texels, const SamplerDesc& sampler, float u, float v, float reference) const {
     const int64_t w = texels.surface.width, h = texels.surface.height;
     if (!w || !h) return 0.0f;
     SamplerDesc plane = sampler;
@@ -733,7 +801,7 @@ class TextureSet final : public ITextureSet {
     return top * (1 - ty) + bottom * ty;
   }
 
-  static Vec4 sample_level(const Plane& texels, const SamplerDesc& sampler, float u, float v) {
+  Vec4 sample_level(const Plane& texels, const SamplerDesc& sampler, float u, float v) const {
     const Surface& surface = texels.surface;
     if (!surface.width || !surface.height) return {0, 0, 0, 0};
     const int64_t w = surface.width, h = surface.height;
@@ -746,20 +814,24 @@ class TextureSet final : public ITextureSet {
     const float tx = fx - static_cast<float>(x0), ty = fy - static_cast<float>(y0);
     const int64_t xs[2] = {index(x0, w, sampler.address_u), index(x0 + 1, w, sampler.address_u)};
     const int64_t ys[2] = {index(y0, h, sampler.address_v), index(y0 + 1, h, sampler.address_v)};
-    const Vec4 a = texel_or_border(texels, sampler, xs[0], ys[0]), b = texel_or_border(texels, sampler, xs[1], ys[0]), c = texel_or_border(texels, sampler, xs[0], ys[1]),
-               d = texel_or_border(texels, sampler, xs[1], ys[1]);
+    // (a texel of no weight - the point on a texel's middle row or column - is not read: what it holds counts for nothing, and the residency feedback of a tiled image reports the
+    // texels the filter takes)
+    const Vec4 none{0, 0, 0, 0};
+    const Vec4 a = texel_or_border(texels, sampler, xs[0], ys[0]), b = tx != 0 ? texel_or_border(texels, sampler, xs[1], ys[0]) : none,
+               c = ty != 0 ? texel_or_border(texels, sampler, xs[0], ys[1]) : none, d = tx != 0 && ty != 0 ? texel_or_border(texels, sampler, xs[1], ys[1]) : none;
     const Vec4 top = a * (1 - tx) + b * tx, bottom = c * (1 - tx) + d * tx;
     return top * (1 - ty) + bottom * ty;
   }
   // (index() gives -1 for a texel outside an image whose sampler has a border there)
   static bool anisotropic(const SamplerDesc& s) { return s.max_anisotropy > 1 && s.filter == Filter::Linear; }
   static float sqrt_of(float v) { return v > 0.0f ? __builtin_sqrtf(v) : 0.0f; }
-  static Vec4 texel_or_border(const Plane& texels, const SamplerDesc& sampler, int64_t x, int64_t y) {
+  Vec4 texel_or_border(const Plane& texels, const SamplerDesc& sampler, int64_t x, int64_t y) const {
     if (x < 0 || y < 0) return sampler_border_value(sampler);
     return image_texel(texels, sampler.stencil, x, y);
   }
   // A texel of a colour image, or of the depth or stencil plane of a depth image (kFeature2DepthTextures): the depth as (depth, 0, 0, 1), the stencil as the integers (0, stencil, 0, 1).
-  static Vec4 image_texel(const Plane& texels, bool stencil, int64_t x, int64_t y) {
+  Vec4 image_texel(const Plane& texels, bool stencil, int64_t x, int64_t y) const {
+    if (feedback_ && texels.image && !texels.image->texel_mapped(texels.level, texels.layer, x, y)) unmapped_ = true;   // (a texel of an unmapped tile: it reads as zero)
     if (texels.surface.format != Format::D32Float) return texel(texels.surface, x, y);
     const uint64_t at = static_cast<uint64_t>(y) * texels.surface.width + static_cast<uint64_t>(x);
     if (stencil) {
@@ -819,6 +891,9 @@ class TextureSet final : public ITextureSet {
   mutable float lambda_[kMaxTextureUnits] = {};
   mutable uint32_t aniso_count_[kMaxTextureUnits] = {1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1};   // (the lookups of an anisotropic filter, and the axis they are spread over in u, v)
   mutable float aniso_du_[kMaxTextureUnits] = {}, aniso_dv_[kMaxTextureUnits] = {};
+  static constexpr float kNoClamp = -1e30f;
+  mutable bool feedback_ = false, unmapped_ = false;   // (begin_feedback .. end_feedback: whether a texel read lay in an unmapped tile)
+  mutable float min_lod_clamp_ = kNoClamp;
 };
 
 // The storage images bound (bind_storage_image), as the shaders read and write them: a texel of the view is texel (x, y) of layer first_layer + z (of level `level`). A slot may instead

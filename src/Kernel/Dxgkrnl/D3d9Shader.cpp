@@ -156,6 +156,7 @@ uint32_t D3d9Program::required_features2() const {
   if (writes_layer_) needed |= graphics::kFeature2LayeredTargets;
   if (writes_viewport_) needed |= graphics::kFeature2Viewports;
   if (layer_before_geometry_) needed |= graphics::kFeature2LayerFromAnyStage;
+  if (uses_feedback_) needed |= graphics::kFeature2TileResidency;   // (residency feedback and lookup clamps: Direct3D tiled resources tier 2)
   return needed;
 }
 
@@ -667,6 +668,11 @@ void D3d9Program::execute(State& s, uint64_t begin, uint64_t end) const {
     double_mode = ins.op >= kDoubleFirst && ins.op <= kDoubleLast;
     Q a = {{0, 0, 0, 0}}, b = a, c = a, r = a;
     if (ins.src_count > 0 && ins.op != kM4x4 && ins.op != kM4x3 && ins.op != kM3x4 && ins.op != kM3x3 && ins.op != kM3x2) a = fetch(ins.src[0], 0);
+    // (a lookup with residency feedback or a clamp: the feedback covers the lookup's own texel reads - begun here, or for sample_b, whose level needs the neighbours' coordinates
+    // first and so runs their programs, once those are in - and ends after it. Not in a neighbour's run: it only wants a coordinate)
+    const bool feedback = ins.feedback && s.textures && s.derivative_depth == 0 && s.capture_at == ~uint64_t{0};
+    const float feedback_clamp = ins.has_clamp ? fetch(ins.clamp, 0).f[0] : -1e30f;
+    if (feedback && ins.op != kTexBias && ins.op != kTexQueryLod) s.textures->begin_feedback(feedback_clamp);
     switch (ins.op) {
       case kNop: case kElse: case kEndIf: break;
       case kIf: {
@@ -1238,6 +1244,7 @@ void D3d9Program::execute(State& s, uint64_t begin, uint64_t end) const {
             }
             gx = quad_difference(a, pc - 1, false, false), gy = quad_difference(a, pc - 1, true, false);
             if (ins.op == kTexBias) bias = fetch(ins.src[2], 0).f[0];
+            if (feedback) s.textures->begin_feedback(feedback_clamp);
           }
           const float fw = static_cast<float>(w), fh = static_cast<float>(h);
           const float lx = sqrt_(gx.f[0] * gx.f[0] * fw * fw + gx.f[1] * gx.f[1] * fh * fh), ly = sqrt_(gy.f[0] * gy.f[0] * fw * fw + gy.f[1] * gy.f[1] * fh * fh);
@@ -1265,6 +1272,13 @@ void D3d9Program::execute(State& s, uint64_t begin, uint64_t end) const {
         break;
       }
       default: break;
+    }
+    if (feedback) {
+      // (sample_b of a texture of no size never began: end_feedback then reports what an empty lookup read - nothing unmapped)
+      const bool mapped = s.textures->end_feedback();
+      if (ins.status.mask) store(ins.status, splat(from_bits(mapped ? 1u : 0u)));
+    } else if (ins.feedback && ins.status.mask) {
+      store(ins.status, splat(from_bits(1u)));   // (no textures, or a neighbour's run: nothing was read)
     }
     if (ins.op == kElse) pc = ins.target;   // reached by running through the true branch: leave the construct
   }

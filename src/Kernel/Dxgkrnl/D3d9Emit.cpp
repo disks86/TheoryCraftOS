@@ -515,6 +515,7 @@ NtStatus D3d9Writer::run(List<uint32_t>* out) {
 }
 
 NtStatus D3d9Program::emit_d3d9_tokens(List<uint32_t>* out) const {
+  if (uses_feedback_) return status::kNotSupported;   // (Direct3D 9 tokens have no residency feedback or per-lookup clamp)
   D3d9Writer writer(*this, allocator_);
   return writer.run(out);
 }

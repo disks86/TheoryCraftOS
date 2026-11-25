@@ -134,89 +134,120 @@ static UINT mip_extent(UINT size, UINT level) { UINT v = size >> level; return v
 
 /* ---- the tiles of a reserved resource ---------------------------------------------------------------------------------------------------------------------------------- */
 
-/* The tile numbering the kernel has (VidMm.cpp): a buffer is a row of 64 KiB tiles; a texture has the tiles of its standard mip levels (at least a tile in both directions), level after level,
- * row by row, and then the packed levels (the mip tail): their texels one level after the other, over as many tiles as they fill. A tile has Direct3D's standard shape for the
- * bytes of a texel of the format (tile_texels): 8 bits 256 x 256, 16 bits 256 x 128, 32 bits 128 x 128, 64 bits 128 x 64, 128 bits 64 x 64; a tile in a heap is its rows one
- * after the other, `tile_w` texels each (the kernel widens the texels of R8 / R8G8 / R16 / R16G16 into its images and narrows them back: AllocationDesc::tile_narrow). */
+/* The tile numbering the kernel has (VidMm.hpp ReservedLayout), which is Direct3D's: a buffer is a row of 64 KiB tiles; a texture's slices (an array's or a cube's layers; a
+ * volume has one) follow one another, each with the tiles of its standard mip levels - at least a tile in every direction -, level after level, a level's tiles in x, then y,
+ * then z order, and then its packed levels (the mip tail): their elements level after level (a volume's level slice after slice), row by row, over as many tiles as they fill.
+ * A tile has Direct3D's standard shape for the bytes of an element of the format - a texel, or a 4 x 4 block of a block-compressed one (tile_shape) - and is its rows one
+ * after the other in the heap, `elem_w` elements each (the kernel widens the texels of R8 / R8G8 / R16 / R16G16 into its images and narrows them back:
+ * AllocationDesc::tile_narrow). */
+#define TILE_LEVELS 16
 typedef struct TileLayout {
   UINT standard;               /* the standard mip levels */
   UINT mips;
-  UINT total;
-  UINT first[16], across[16], down[16];
-  UINT tail_first;             /* the first tile of the packed levels (when standard < mips) */
-  UINT tail_tiles;             /* ... and how many they fill */
-  UINT tile_w, tile_h;         /* a texture's tile shape, in texels */
-  UINT texel;                  /* ... and the bytes of a texel in the heap */
-  int buffer;                  /* a buffer: its tiles are numbered by X alone */
+  UINT slices;                 /* array slices (6 a cube; 1 a volume) */
+  UINT per_slice, total;
+  UINT first[TILE_LEVELS], across[TILE_LEVELS], down[TILE_LEVELS], deep[TILE_LEVELS];   /* a standard level's first tile in a slice, and its tiles in x, y, z */
+  UINT tail_first;             /* the first tile of a slice's packed levels (when standard < mips), in the slice */
+  UINT tail_tiles;             /* ... and how many they fill, in each slice */
+  UINT tile_w, tile_h, tile_d; /* a texture's tile shape, in texels */
+  UINT elem_w, elem_h;         /* ... in elements */
+  UINT texel;                  /* the bytes of an element in the heap */
+  UINT block;                  /* texels per element across and down (4: block-compressed) */
+  int buffer, volume;          /* a buffer: its tiles are numbered by X alone */
 } TileLayout;
 
-/* The standard tile shape for texels of `bytes` (0 x 0 for a size that has none). */
-static void tile_texels(UINT bytes, UINT *w, UINT *h) {
-  switch (bytes) {
-    case 1: *w = 256; *h = 256; return;
-    case 2: *w = 256; *h = 128; return;
-    case 4: *w = 128; *h = 128; return;
-    case 8: *w = 128; *h = 64; return;
-    case 16: *w = 64; *h = 64; return;
-    default: *w = *h = 0; return;
-  }
+/* The standard tile shape, in elements, for elements of `bytes` of a 2D texture or array, or of a volume (0 x 0 x 0 for a size that has none). */
+static void tile_shape(UINT bytes, int volume, UINT *w, UINT *h, UINT *d) {
+  static const UINT flat[5][3] = {{256, 256, 1}, {256, 128, 1}, {128, 128, 1}, {128, 64, 1}, {64, 64, 1}};
+  static const UINT vol[5][3] = {{64, 32, 32}, {32, 32, 32}, {32, 32, 16}, {32, 16, 16}, {16, 16, 16}};
+  const int i = bytes == 1 ? 0 : bytes == 2 ? 1 : bytes == 4 ? 2 : bytes == 8 ? 3 : bytes == 16 ? 4 : -1;
+  *w = *h = *d = 0;
+  if (i < 0) return;
+  *w = volume ? vol[i][0] : flat[i][0];
+  *h = volume ? vol[i][1] : flat[i][1];
+  *d = volume ? vol[i][2] : flat[i][2];
+}
+
+static UINT mip_depth(const D3D12_RESOURCE_DESC *d, UINT level) {
+  return d->Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D ? mip_extent(d->DepthOrArraySize ? d->DepthOrArraySize : 1, level) : 1;
 }
 
 static void tile_layout(const D3D12_RESOURCE_DESC *d, TileLayout *t) {
   memset(t, 0, sizeof *t);
   if (d->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
     t->buffer = 1;
-    t->mips = 1;
-    t->total = t->across[0] = (UINT)((d->Width + KTILE_BYTES - 1) / KTILE_BYTES);
-    t->down[0] = 1;
+    t->mips = t->slices = 1;
+    t->total = t->per_slice = t->across[0] = (UINT)((d->Width + KTILE_BYTES - 1) / KTILE_BYTES);
+    t->down[0] = t->deep[0] = 1;
+    t->standard = 1;
     return;
   }
   const FormatInfo *fi = format_info(d->Format);
-  t->texel = fi ? fi->bytes : 4;
-  tile_texels(t->texel, &t->tile_w, &t->tile_h);
-  if (!t->tile_w) return;
+  t->volume = d->Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D;
+  t->texel = fi ? fi->bytes : 4;      /* (an element: a texel - the narrow formats' own size -, or a block) */
+  t->block = fi && fi->compressed ? 4 : 1;
+  UINT ed = 1;
+  tile_shape(t->texel, t->volume, &t->elem_w, &t->elem_h, &ed);
+  if (!t->elem_w) return;
+  t->tile_w = t->elem_w * t->block;
+  t->tile_h = t->elem_h * t->block;
+  t->tile_d = ed;
   t->mips = d->MipLevels ? d->MipLevels : 1;
-  if (t->mips > 16) t->mips = 16;
-  while (t->standard < t->mips && mip_extent((UINT)d->Width, t->standard) >= t->tile_w && mip_extent(d->Height, t->standard) >= t->tile_h) {
+  if (t->mips > TILE_LEVELS) t->mips = TILE_LEVELS;
+  t->slices = t->volume ? 1 : (d->DepthOrArraySize ? d->DepthOrArraySize : 1);
+  while (t->standard < t->mips && mip_extent((UINT)d->Width, t->standard) >= t->tile_w && mip_extent(d->Height, t->standard) >= t->tile_h &&
+         mip_depth(d, t->standard) >= t->tile_d) {
     const UINT l = t->standard++;
-    t->first[l] = t->total;
-    t->across[l] = (mip_extent((UINT)d->Width, l) + t->tile_w - 1) / t->tile_w;
-    t->down[l] = (mip_extent(d->Height, l) + t->tile_h - 1) / t->tile_h;
-    t->total += t->across[l] * t->down[l];
+    const UINT ew = (mip_extent((UINT)d->Width, l) + t->block - 1) / t->block, eh = (mip_extent(d->Height, l) + t->block - 1) / t->block;
+    t->first[l] = t->per_slice;
+    t->across[l] = (ew + t->elem_w - 1) / t->elem_w;
+    t->down[l] = (eh + t->elem_h - 1) / t->elem_h;
+    t->deep[l] = (mip_depth(d, l) + t->tile_d - 1) / t->tile_d;
+    t->per_slice += t->across[l] * t->down[l] * t->deep[l];
   }
-  t->tail_first = t->total;
+  t->tail_first = t->per_slice;
   UINT64 packed = 0;
-  for (UINT l = t->standard; l < t->mips; ++l) packed += (UINT64)mip_extent((UINT)d->Width, l) * mip_extent(d->Height, l) * t->texel;
-  t->tail_tiles = (UINT)((packed + KTILE_BYTES - 1) / KTILE_BYTES);
-  t->total += t->tail_tiles;
-}
-
-/* The linear number of the tile at a coordinate (Z is not used: textures are 2D); (UINT)-1 for one that is not there. */
-static UINT tile_number(const TileLayout *t, D3D12_TILED_RESOURCE_COORDINATE c) {
-  UINT n;
-  if (t->buffer) n = c.Subresource == 0 ? c.X : (UINT)-1;
-  else if (c.Subresource < t->standard) {
-    if (c.X >= t->across[c.Subresource] || c.Y >= t->down[c.Subresource]) return (UINT)-1;
-    n = t->first[c.Subresource] + c.Y * t->across[c.Subresource] + c.X;
+  for (UINT l = t->standard; l < t->mips; ++l) {
+    const UINT64 ew = (mip_extent((UINT)d->Width, l) + t->block - 1) / t->block, eh = (mip_extent(d->Height, l) + t->block - 1) / t->block;
+    packed += ew * eh * mip_depth(d, l) * t->texel;
   }
-  else if (c.Subresource < t->mips) n = c.X < t->tail_tiles ? t->tail_first + c.X : (UINT)-1;      /* (a packed level: X counts the packed tiles) */
-  else return (UINT)-1;
-  return n < t->total ? n : (UINT)-1;
+  t->tail_tiles = (UINT)((packed + KTILE_BYTES - 1) / KTILE_BYTES);
+  t->per_slice += t->tail_tiles;
+  t->total = t->per_slice * t->slices;
 }
 
-/* The tiles of a region, appended to out (at most `room`); returns the new count. */
+/* The linear number of the tile at a coordinate; (UINT)-1 for one that is not there. A texture's subresource is its level plus its slice times the levels; Z is a volume's
+ * (an array's slices are subresources); a packed level's tiles are counted by X alone, Y and Z 0. */
+static UINT tile_number(const TileLayout *t, D3D12_TILED_RESOURCE_COORDINATE c) {
+  if (t->buffer) return c.Subresource == 0 && c.Y == 0 && c.Z == 0 && c.X < t->total ? c.X : (UINT)-1;
+  if (!t->mips || !t->per_slice) return (UINT)-1;
+  const UINT level = c.Subresource % t->mips, slice = c.Subresource / t->mips;
+  if (slice >= t->slices) return (UINT)-1;
+  const UINT base = slice * t->per_slice;
+  if (level < t->standard) {
+    if (c.X >= t->across[level] || c.Y >= t->down[level] || c.Z >= t->deep[level]) return (UINT)-1;
+    return base + t->first[level] + (c.Z * t->down[level] + c.Y) * t->across[level] + c.X;
+  }
+  return c.Y == 0 && c.Z == 0 && c.X < t->tail_tiles ? base + t->tail_first + c.X : (UINT)-1;
+}
+
+/* The tiles of a region, appended to out (at most `room`); returns the new count. A box goes over x, then y, then z - a volume's tiles in depth, an array's slices (the next
+ * slice's same level) -; a run of NumTiles goes on from the coordinate's tile in the numbering, over levels and slices in subresource order (a tile past the last: (UINT)-1). */
 static UINT region_tiles(const TileLayout *t, D3D12_TILED_RESOURCE_COORDINATE c, D3D12_TILE_REGION_SIZE sz, UINT *out, UINT n, UINT room) {
   if (sz.UseBox) {
-    for (UINT y = 0; y < sz.Height; ++y)
-      for (UINT x = 0; x < sz.Width && n < room; ++x) {
-        D3D12_TILED_RESOURCE_COORDINATE at = c;
-        at.X += x;
-        at.Y += y;
-        out[n++] = tile_number(t, at);
-      }
+    for (UINT z = 0; z < sz.Depth; ++z)
+      for (UINT y = 0; y < sz.Height; ++y)
+        for (UINT x = 0; x < sz.Width && n < room; ++x) {
+          D3D12_TILED_RESOURCE_COORDINATE at = c;
+          at.X += x;
+          at.Y += y;
+          if (t->volume || t->buffer) at.Z += z;
+          else at.Subresource += z * t->mips;
+          out[n++] = tile_number(t, at);
+        }
   } else {
     const UINT first = tile_number(t, c);
-    for (UINT k = 0; k < sz.NumTiles && n < room; ++k) out[n++] = first == (UINT)-1 ? first : first + k;
+    for (UINT k = 0; k < sz.NumTiles && n < room; ++k) out[n++] = first == (UINT)-1 || first + k >= t->total ? (UINT)-1 : first + k;
   }
   return n;
 }
@@ -754,11 +785,26 @@ static HRESULT resource_make_from(Dev *dev, const D3D12_HEAP_PROPERTIES *props, 
     if (want_depth && !(desc->Flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE) && samples == 1 && (dev->caps.features2 & DEV_FEATURE2_DEPTH_TEXTURES)) ad.flags |= KA_TEXTURE;
     if (uav && !r->planes && !fi->narrow) ad.flags |= KA_STORAGE_IMAGE;
     if (reserved) {
-      /* (the kernel's reserved textures: of the formats tiling is a support of (format_tiled: not the video formats, whose tiles Direct3D does not define, nor
-       * block-compressed or depth ones), any size, with mip levels - the 64-bit and 128-bit formats one: the kernel's wide images have one -, only sampled) */
-      if (!format_tiled(fi) || r->planes) { hr = E_INVALIDARG; goto fail; }
-      if (r->kind != 0 || target || want_depth || (r->mips > 1 && !device_format_levels(dev, fi->kernel))) { hr = DXGI_ERROR_UNSUPPORTED; goto fail; }
-      ad.flags = KA_TEXTURE | KA_RESERVED;
+      /* (the kernel's reserved textures (VidMm ReservedLayout, tile_layout): of the formats tiling is a support of (format_tiled: not the video formats, whose tiles Direct3D
+       * does not define, nor depth ones), in the 64 KiB layout whose swizzle is the driver's (64KB_UNDEFINED_SWIZZLE); 2D textures, arrays and cubes, volumes from tier 3 (no 1D
+       * ones: Direct3D has no tiles for them), sampled, drawn into and unordered access - of the formats the kernel's storage images have: a narrow one is written through a
+       * mirror, which cannot be of a reserved image -, one sample (no D3D12_MULTISAMPLE_QUALITY_LEVELS_FLAG_TILED_RESOURCE level). An array of more than one slice may have
+       * packed levels - each slice its own - from tier 4; at tiers 2 and 3 all its levels must be at least a tile, at tier 1 whole tiles (D3D12_TILED_RESOURCES_TIER)) */
+      const D3D12_TILED_RESOURCES_TIER tier = dev_tiled_tier(dev);
+      if (!format_tiled(fi) || r->planes || desc->Layout != D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE || desc->Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D || want_depth ||
+          (r->kind == 1 && tier < D3D12_TILED_RESOURCES_TIER_3)) { hr = E_INVALIDARG; goto fail; }
+      if (uav && fi->narrow) { hr = DXGI_ERROR_UNSUPPORTED; goto fail; }      /* (see above: no mirror of a reserved image) */
+      if (r->mips > 1 && !device_format_levels(dev, fi->kernel)) { hr = DXGI_ERROR_UNSUPPORTED; goto fail; }
+      D3D12_RESOURCE_DESC whole = *desc;
+      whole.MipLevels = (UINT16)r->mips;
+      TileLayout tl;
+      tile_layout(&whole, &tl);
+      if (!tl.total) { hr = E_INVALIDARG; goto fail; }
+      if (tl.slices > 1 && tl.standard < tl.mips && tier < D3D12_TILED_RESOURCES_TIER_4) { hr = E_INVALIDARG; goto fail; }
+      if (tl.slices > 1 && tier == D3D12_TILED_RESOURCES_TIER_1)
+        for (UINT l = 0; l < tl.mips; ++l)
+          if (mip_extent((UINT)desc->Width, l) % tl.tile_w || mip_extent(desc->Height, l) % tl.tile_h) { hr = E_INVALIDARG; goto fail; }
+      ad.flags = KA_TEXTURE | KA_RESERVED | (target ? KA_RENDER_TARGET : 0) | (uav ? KA_STORAGE_IMAGE : 0);
       ad.tile_narrow = fi->narrow;      /* (NARROW_* is the kernel's NarrowLayout) */
       r->reserved = 1;
     }

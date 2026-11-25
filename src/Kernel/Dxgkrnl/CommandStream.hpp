@@ -84,6 +84,9 @@
 //                    [, narrow]   (a NarrowLayout: the buffer's pixels are narrower than the image's - one or two 8-bit channels of an A8B8G8R8 / X8B8G8R8 image, or one or two 16-bit channels of an
 //                    A16B16G16R16 one: copied into the image they become (r, g or 0, 0, maximum), out of it the first channels are taken. What a runtime keeps R8 / R8G8 / R16 / R16G16 textures and
 //                    the planes of NV12 / P010 in, as the kernel has no narrower formats)
+//   CopyTiles        direction (0 buffer to tiles, 1 tiles to buffer), reserved_index, first_tile, tile_count, buffer_index, buffer_offset   (outside a pass: tiles first_tile ..
+//                    first_tile + tile_count - 1 of a reserved buffer or texture (VidMm ReservedLayout's numbering) as the 64 KiB each holds in its heap, one after the other in the buffer from
+//                    buffer_offset on - Direct3D's CopyTiles. A tile mapped nowhere reads as zeros and drops what is written to it; a plain buffer, not a heap or a reserved one)
 //   DecodeFrame      decoder handle, buffer_index, picture_offset, picture_bytes, matrix_offset, matrix_bytes, slices_offset, slices_bytes, bitstream_index, bitstream_offset, bitstream_bytes,
 //                    luma_index, chroma_index, status_index, status_offset, output_keyed, key_count, then key_count allocation indices
 //                    [, kDecodeConversion, output format (hardware::VpFormat), output colour space, decode colour space, output plane0_index, plane1_index (kNoAllocation for
@@ -191,6 +194,7 @@ enum class Op : uint16_t {
   ResolveEncoderMetadata,
   BindUavImage,   // (37)
   BindTexelBuffer,   // (38)
+  CopyTiles = 48,    // (numbered apart from the ones other work is adding)
 };
 constexpr uint32_t kVideoProcessStreamWords = 15;
 constexpr uint32_t kVideoProcessExtension = 0x31585056;   // 'VPX1': VideoProcess's optional part follows
@@ -380,6 +384,9 @@ class CommandWriter {
   void copy_buffer_image_narrow(uint32_t direction, uint32_t image, uint32_t level, uint32_t layer, uint32_t x, uint32_t y, uint32_t width, uint32_t height, uint32_t buffer, uint32_t offset,
                                 uint32_t row_pitch, NarrowLayout narrow) {
     packet(Op::CopyBufferImage, {direction, image, level, layer, x, y, width, height, buffer, offset, row_pitch, static_cast<uint32_t>(narrow)});
+  }
+  void copy_tiles(uint32_t direction, uint32_t reserved, uint32_t first_tile, uint32_t tile_count, uint32_t buffer, uint32_t offset) {
+    packet(Op::CopyTiles, {direction, reserved, first_tile, tile_count, buffer, offset});
   }
   void bind_uav(uint32_t slot, uint32_t allocation, uint32_t offset, uint32_t size) { packet(Op::BindUav, {slot, allocation, offset, size}); }
   void bind_uav_image(uint32_t slot, uint32_t allocation, uint32_t level = 0, uint32_t first_layer = 0, uint32_t layer_count = 1, Format view = Format::Unknown) {

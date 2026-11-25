@@ -126,6 +126,12 @@ struct D3d9Program::Instruction {
   uint32_t stride = 0;
   uint8_t tex_swizzle[4] = {0, 1, 2, 3};   // texld: which texel component each result component takes
   int8_t texel_offset[2] = {0, 0};          // gather4: the static offset of the footprint, in texels (the extended opcode token's)
+  // The residency feedback forms of the texture lookups (Shader Model 5's tiled resources: sample_cl_s, ld_s, gather4_s, ...): the lookup reports into `status` (one component;
+  // mask 0: the status is not wanted) 1 when every texel it read was mapped, 0 when one was not (ITextureSet::begin_feedback / end_feedback), and `clamp` (when has_clamp) is the
+  // finest level of detail it may use (sample_cl_s, sample_b_cl_s, sample_d_cl_s, sample_c_cl_s).
+  bool feedback = false, has_clamp = false;
+  Dst status;
+  Src clamp;
   Dst dst;
   Src src[4];
   uint8_t src_count = 0;

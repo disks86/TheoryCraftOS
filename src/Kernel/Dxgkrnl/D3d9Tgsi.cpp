@@ -2344,6 +2344,7 @@ NtStatus TgsiEmitter::run(String* out) {
 }
 
 NtStatus D3d9Program::emit_tgsi(String* out, uint32_t varyings, graphics::TgsiBindings* bindings) const {
+  if (uses_feedback_) return status::kNotSupported;   // (TGSI has no residency feedback or per-lookup clamp: virgl reports tiled resources tier 1)
   TgsiEmitter emitter(*this, allocator_, varyings < graphics::kMaxVaryings ? varyings : graphics::kMaxVaryings);
   const NtStatus s = emitter.run(out);
   if (s == status::kSuccess && bindings) *bindings = emitter.bindings();
