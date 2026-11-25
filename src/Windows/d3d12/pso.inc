@@ -323,7 +323,7 @@ EXPORT HRESULT WINAPI D3D12SerializeVersionedRootSignature(const D3D12_VERSIONED
 /* One kernel pipeline of a PSO: what it was made for, and how many unreset command lists bound it (it is destroyed only when none does). */
 typedef struct PsoPipe { UINT strides[8], stencil_ref, handle; float blend_factor[4]; UINT users; } PsoPipe;
 
-typedef struct Attr { UINT location, format, offset, per_instance, slot; } Attr;      /* (format: the kernel's graphics::VertexFormat) */
+typedef struct Attr { UINT location, format, offset, per_instance, slot, step_rate; } Attr;      /* (format: the kernel's graphics::VertexFormat; step_rate: InstanceDataStepRate) */
 
 struct Pso {
   DObj d;
@@ -552,7 +552,8 @@ static HRESULT make_shader(Dev *dev, const D3D12_SHADER_BYTECODE *code, UINT sta
 }
 
 /* A vertex element's format as the kernel's graphics::VertexFormat (type * 4 + components - 1 with the types float, unorm8, snorm8, uint8, sint8, unorm16, snorm16, uint16,
- * sint16, half, uint32, sint32; 48 is B8G8R8A8_UNORM and 49 R10G10B10A2_UNORM) and the bytes it takes in the buffer; -1 for a format a vertex cannot have. Formats other
+ * sint16, half, uint32, sint32; 48 is B8G8R8A8_UNORM, 49 R10G10B10A2_UNORM, 50 R10G10B10A2_UINT, 51 R11G11B10_FLOAT and 52 B8G8R8X8_UNORM) and the bytes it takes in
+ * the buffer; -1 for a format a vertex cannot have (Direct3D's IA_VERTEX_BUFFER formats are all here; B5G6R5, B5G5R5A1 and B4G4R4A4 are not among them). Formats other
  * than 32-bit floats need a device that reads them (DEV_FEATURE_VERTEX_FORMATS; the kernel refuses the pipeline on one that does not). */
 static int vertex_format(DXGI_FORMAT f, UINT *bytes) {
 #define VF(type, components, size) (*bytes = (size) * (components), (type) * 4 + (components) - 1)
@@ -598,6 +599,9 @@ static int vertex_format(DXGI_FORMAT f, UINT *bytes) {
     case DXGI_FORMAT_R32G32B32A32_SINT: return VF(11, 4, 4);
     case DXGI_FORMAT_B8G8R8A8_UNORM: *bytes = 4; return 48;
     case DXGI_FORMAT_R10G10B10A2_UNORM: *bytes = 4; return 49;
+    case DXGI_FORMAT_R10G10B10A2_UINT: *bytes = 4; return 50;
+    case DXGI_FORMAT_R11G11B10_FLOAT: *bytes = 4; return 51;
+    case DXGI_FORMAT_B8G8R8X8_UNORM: *bytes = 4; return 52;
     default: *bytes = 0; return -1;
   }
 #undef VF
@@ -650,11 +654,14 @@ static HRESULT STDMETHODCALLTYPE dev_CreateGraphicsPipelineState(Dev *This, cons
     const D3D12_INPUT_ELEMENT_DESC *e = &desc->InputLayout.pInputElementDescs[i];
     UINT bytes = 0;
     const int format = vertex_format(e->Format, &bytes);
-    if (e->InputSlot >= dev->caps.max_vertex_buffers || e->InputSlot >= 8 || format < 0 || (format > 3 && !(dev->caps.features & DEV_FEATURE_VERTEX_FORMATS))) { dx_Release(OBJ(p)); return DXGI_ERROR_UNSUPPORTED; }
+    /* (a format no vertex has, or a classification that is neither: the description is wrong) */
+    if (format < 0 || (e->InputSlotClass != D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA && e->InputSlotClass != D3D12_INPUT_CLASSIFICATION_PER_INSTANCE_DATA)) { dx_Release(OBJ(p)); return E_INVALIDARG; }
+    if (e->InputSlot >= dev->caps.max_vertex_buffers || e->InputSlot >= 8 || (format > 3 && !(dev->caps.features & DEV_FEATURE_VERTEX_FORMATS))) { dx_Release(OBJ(p)); return DXGI_ERROR_UNSUPPORTED; }
     Attr *a = &p->attrs[p->attr_count++];
     a->format = (UINT)format;
     a->slot = e->InputSlot;
     a->per_instance = e->InputSlotClass == D3D12_INPUT_CLASSIFICATION_PER_INSTANCE_DATA;
+    a->step_rate = a->per_instance ? e->InstanceDataStepRate : 0;      /* (0: every instance reads the draw's first; a per-vertex element's is not looked at) */
     /* (an appended element starts at the next multiple of its size, of four bytes at most) */
     const UINT unit = bytes >= 4 ? 4 : bytes ? bytes : 1;
     a->offset = e->AlignedByteOffset == D3D12_APPEND_ALIGNED_ELEMENT ? (appended[e->InputSlot] + unit - 1) / unit * unit : e->AlignedByteOffset;
@@ -893,7 +900,10 @@ static UINT pso_pipeline_locked(Pso *p, const UINT strides[8], UINT stencil_ref,
   for (UINT i = 0; i < p->attr_count; ++i)
     if (p->attrs[i].slot > max_slot) max_slot = p->attrs[i].slot;
   const UINT more_blends = p->blend.IndependentBlendEnable && p->render_targets > 4 ? p->render_targets - 4 : 0;
-  if (p->attr_count > 4 || max_slot > 0 || more_blends || p->blend_constant) {
+  UINT rates = 0;      /* (the attributes up to the last per-instance one that does not step by 1: the kernel's step rates) */
+  for (UINT i = 0; i < p->attr_count; ++i)
+    if (p->attrs[i].per_instance && p->attrs[i].step_rate != 1) rates = i + 1;
+  if (p->attr_count > 4 || max_slot > 0 || more_blends || p->blend_constant || rates) {
     if (!p->so_entries) r[w++] = 0;
     const UINT extra = p->attr_count > 4 ? p->attr_count - 4 : 0;
     r[w++] = extra;
@@ -924,8 +934,12 @@ static UINT pso_pipeline_locked(Pso *p, const UINT strides[8], UINT stencil_ref,
       r[w++] = blend_op(b->BlendOpAlpha);
       r[w++] = b->RenderTargetWriteMask & format_write_mask(p->rtv_formats[4 + k]);
     }
-    if (p->blend_constant)
+    if (p->blend_constant || rates)
       for (UINT c = 0; c < 4; ++c) r[w++] = bits_of(factor[c]);      /* (the colour of the constant blend factors) */
+    if (rates) {      /* (the step rates: a per-vertex attribute's word is 0, a per-instance one's its InstanceDataStepRate) */
+      r[w++] = rates;
+      for (UINT i = 0; i < rates; ++i) r[w++] = p->attrs[i].per_instance ? p->attrs[i].step_rate : 0;
+    }
   }
   UINT reply[1] = {0};
   if (!KMT_OK(dev_escape(p->d.dev, r, w, reply, 1))) return 0;

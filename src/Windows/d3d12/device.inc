@@ -297,6 +297,12 @@ static HRESULT STDMETHODCALLTYPE dev_CheckFeatureSupport(Dev *This, D3D12_FEATUR
       } else if (format_bytes(f->Format)) {
         f->Support1 = D3D12_FORMAT_SUPPORT1_IA_VERTEX_BUFFER;
       }
+      {      /* (a vertex element: the formats vertex_format knows, those beyond 32-bit floats on a device that reads them) */
+        UINT vertex_bytes;
+        const int vf = vertex_format(f->Format, &vertex_bytes);
+        if (vf >= 0 && (vf <= 3 || (This->caps.features & DEV_FEATURE_VERTEX_FORMATS))) f->Support1 |= D3D12_FORMAT_SUPPORT1_IA_VERTEX_BUFFER;
+        else f->Support1 &= ~D3D12_FORMAT_SUPPORT1_IA_VERTEX_BUFFER;
+      }
       if (f->Format == DXGI_FORMAT_R16_UINT || f->Format == DXGI_FORMAT_R32_UINT) f->Support1 |= D3D12_FORMAT_SUPPORT1_IA_INDEX_BUFFER;
       format_uav_support(This, f->Format, &f->Support1, &f->Support2);
       return S_OK;

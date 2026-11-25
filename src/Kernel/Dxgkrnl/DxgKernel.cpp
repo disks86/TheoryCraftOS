@@ -1655,6 +1655,15 @@ NtStatus Kernel::escape(ProcessId pid, Handle device, ConstByteView request, Byt
                           desc.blend.constant[c] = constant[c];
                           for (graphics::BlendState& t : desc.target_blend) t.constant[c] = constant[c];
                         }
+                        if (!in.at_end()) {   // (and, after that, the step rates of the per-instance attributes: their count, then a word for each attribute from the first; a per-vertex one's is 0)
+                          const uint32_t rates = in.le32();
+                          if (!in.ok() || rates > desc.attribute_count || rates > graphics::kMaxVertexAttributes) return status::kInvalidParameter;
+                          for (uint32_t k = 0; k < rates; ++k) {
+                            const uint32_t rate = in.le32();
+                            if (!in.ok() || (!desc.attributes[k].per_instance && rate != 0)) return status::kInvalidParameter;
+                            if (desc.attributes[k].per_instance) desc.attributes[k].step_rate = rate;
+                          }
+                        }
                       }
                     }
                   }

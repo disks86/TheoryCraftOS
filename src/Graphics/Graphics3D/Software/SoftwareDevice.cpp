@@ -1253,8 +1253,9 @@ struct VertexStreams {
   uint64_t offset[kMaxVertexBuffers] = {};
 };
 
-// `vertex` is the vertex's number in the buffers, `instance` the instance's (for the per-instance attributes).
-ClipVertex run_vertex_shader(const SoftwarePipeline& pipeline, const VertexStreams& streams, uint64_t vertex, uint64_t instance,
+// `vertex` is the vertex's number in the buffers; a per-instance attribute reads the element of instance `instance` (from 0) of a draw from `first_instance`
+// (instance_element: its step rate divides the instance).
+ClipVertex run_vertex_shader(const SoftwarePipeline& pipeline, const VertexStreams& streams, uint64_t vertex, uint32_t first_instance, uint32_t instance,
                              const uint8_t* constants, const VertexContext& context) {
   const GraphicsPipelineDesc& pd = pipeline.desc();
   Vec4 attributes[kMaxVertexAttributes];
@@ -1264,7 +1265,7 @@ ClipVertex run_vertex_shader(const SoftwarePipeline& pipeline, const VertexStrea
     if (at.location >= kMaxVertexAttributes) continue;
     const uint32_t slot = at.slot < kMaxVertexBuffers ? at.slot : 0;
     const uint32_t stride = slot == 0 ? pd.vertex_stride : pd.slot_strides[slot];
-    const uint64_t base = streams.offset[slot] + (at.per_instance ? instance : vertex) * stride;
+    const uint64_t base = streams.offset[slot] + (at.per_instance ? instance_element(at, first_instance, instance) : vertex) * stride;
     attributes[at.location] = read_vertex_attribute(streams.data[slot], base + at.offset, at.format);
   }
   ShaderIo io;
@@ -1998,16 +1999,14 @@ bool SoftwareDevice::submit(ICommandBuffer* commands) {
             v += cmd.first;
           }
           if (v < 0) return false;
-          // (per-instance attributes: the element numbered by the instance, in the same buffer at the same stride; every vertex fits in its buffer)
-          const uint64_t instance_number = uint64_t{cmd.first_instance} + instance;
-          for (uint32_t slot = 0; slot < kMaxVertexBuffers; ++slot) {
+          // (per-instance attributes: the element instance_element numbers, in the same buffer at the same stride; every element read fits in its buffer)
+          for (uint32_t k = 0; k < pd.attribute_count; ++k) {
+            const VertexAttribute& at = pd.attributes[k];
+            const uint32_t slot = at.slot < kMaxVertexBuffers ? at.slot : 0;
             if (!(slots_used >> slot & 1)) continue;
             const uint32_t stride = slot == 0 ? pd.vertex_stride : pd.slot_strides[slot];
-            bool per_vertex = false, per_instance = false;
-            for (uint32_t k = 0; k < pd.attribute_count; ++k)
-              if (pd.attributes[k].slot == slot) (pd.attributes[k].per_instance ? per_instance : per_vertex) = true;
-            if (per_vertex && streams.offset[slot] + (static_cast<uint64_t>(v) + 1) * stride > streams.data[slot].size()) return false;
-            if (per_instance && streams.offset[slot] + (instance_number + 1) * stride > streams.data[slot].size()) return false;
+            const uint64_t element = at.per_instance ? instance_element(at, cmd.first_instance, instance) : static_cast<uint64_t>(v);
+            if (streams.offset[slot] + (element + 1) * stride > streams.data[slot].size()) return false;
           }
           VertexContext context;
           context.vertex_id = static_cast<uint32_t>(v);
@@ -2015,7 +2014,7 @@ bool SoftwareDevice::submit(ICommandBuffer* commands) {
           context.storage = s.storage;
           context.textures = &s.textures;
           ++stat_vs;
-          *out = run_vertex_shader(*s.pipeline, streams, static_cast<uint64_t>(v), instance_number, s.constants, context);
+          *out = run_vertex_shader(*s.pipeline, streams, static_cast<uint64_t>(v), cmd.first_instance, instance, s.constants, context);
           return true;
         };
         const uint32_t instances = cmd.instance_count;

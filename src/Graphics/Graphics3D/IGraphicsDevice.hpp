@@ -544,9 +544,12 @@ enum class VertexFormat : uint8_t {
   Sint16x1 = 32, Sint16x2, Sint16x3, Sint16x4, Half1 = 36, Half2, Half3, Half4, Uint32x1 = 40, Uint32x2, Uint32x3, Uint32x4, Sint32x1 = 44, Sint32x2, Sint32x3, Sint32x4,
   Bgra8Unorm = 48,     // four bytes B, G, R, A read as the colour (R, G, B, A)
   Rgb10A2Unorm = 49,   // a 32-bit word: R in bits 0-9, G in 10-19, B in 20-29, A in 30-31
+  Rgb10A2Uint = 50,    // the same word, the four fields as unsigned integers
+  Rg11B10Float = 51,   // a 32-bit word of three unsigned floats without a sign: R an 11-bit one in bits 0-10 (5-bit exponent, 6-bit mantissa), G in 11-21, B a 10-bit one in 22-31; A is 1
+  Bgrx8Unorm = 52,     // four bytes B, G, R and one not read: the colour (R, G, B, 1)
 };
-constexpr uint32_t kVertexFormatCount = 50;
-constexpr bool vertex_format_packed(VertexFormat f) { return f == VertexFormat::Bgra8Unorm || f == VertexFormat::Rgb10A2Unorm; }
+constexpr uint32_t kVertexFormatCount = 53;
+constexpr bool vertex_format_packed(VertexFormat f) { return static_cast<uint32_t>(f) >= static_cast<uint32_t>(VertexFormat::Bgra8Unorm); }
 constexpr VertexType vertex_format_type(VertexFormat f) { return vertex_format_packed(f) ? VertexType::Unorm8 : static_cast<VertexType>(static_cast<uint32_t>(f) / 4); }
 constexpr uint32_t vertex_format_components(VertexFormat f) { return vertex_format_packed(f) ? 4 : static_cast<uint32_t>(f) % 4 + 1; }
 constexpr uint32_t vertex_type_bytes(VertexType t) {
@@ -560,6 +563,7 @@ constexpr uint32_t vertex_type_bytes(VertexType t) {
 constexpr uint32_t vertex_format_bytes(VertexFormat f) { return vertex_format_packed(f) ? 4 : vertex_type_bytes(vertex_format_type(f)) * vertex_format_components(f); }
 constexpr bool vertex_format_is_integer(VertexFormat f) {
   const VertexType t = vertex_format_type(f);
+  if (f == VertexFormat::Rgb10A2Uint) return true;
   return !vertex_format_packed(f) && (t == VertexType::Uint8 || t == VertexType::Sint8 || t == VertexType::Uint16 || t == VertexType::Sint16 || t == VertexType::Uint32 || t == VertexType::Sint32);
 }
 
@@ -567,9 +571,14 @@ struct VertexAttribute {
   uint32_t location;  // which input of the vertex shader
   VertexFormat format;
   uint32_t offset;  // bytes from the start of the vertex
-  bool per_instance = false;   // kFeatureInstancing: the attribute steps with the instance, not the vertex (element number = the instance, at the same stride)
+  bool per_instance = false;   // kFeatureInstancing: the attribute steps with the instance, not the vertex (element number below, at the same stride)
   uint8_t slot = 0;            // the vertex buffer it is read from (below DeviceLimits::vertex_buffers); slot 0's stride is GraphicsPipelineDesc::vertex_stride
+  // A per-instance attribute's step rate (Direct3D's InstanceDataStepRate): instance n of a draw from first_instance reads element first_instance + n / step_rate, and with 0
+  // every instance reads element first_instance. A per-vertex attribute does not look at it.
+  uint32_t step_rate = 1;
 };
+// The element a per-instance attribute reads for instance `instance` (counted from 0) of a draw whose first instance is `first_instance`.
+constexpr uint64_t instance_element(const VertexAttribute& a, uint32_t first_instance, uint32_t instance) { return uint64_t{first_instance} + (a.step_rate ? instance / a.step_rate : 0); }
 
 // The stencil test of a pipeline, one state for front and back faces: a fragment passes when (reference & compare_mask) <compare> (stored & compare_mask); what is written back
 // is (stored & ~write_mask) | (op result & write_mask), the op depending on whether the stencil test failed, the stencil test passed but the depth test failed, or both passed.

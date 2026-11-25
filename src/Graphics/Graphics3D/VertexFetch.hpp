@@ -46,6 +46,19 @@ inline Vec4 read_vertex_attribute(ConstByteView bytes, uint64_t offset, VertexFo
     const uint32_t v = read_vertex_unsigned(bytes, offset, 4);
     return {static_cast<float>(v & 0x3FF) / 1023.0f, static_cast<float>((v >> 10) & 0x3FF) / 1023.0f, static_cast<float>((v >> 20) & 0x3FF) / 1023.0f, static_cast<float>(v >> 30) / 3.0f};
   }
+  if (format == VertexFormat::Rgb10A2Uint) {   // (integers: their bits in the register)
+    const uint32_t v = read_vertex_unsigned(bytes, offset, 4);
+    return {__builtin_bit_cast(float, v & 0x3FF), __builtin_bit_cast(float, (v >> 10) & 0x3FF), __builtin_bit_cast(float, (v >> 20) & 0x3FF), __builtin_bit_cast(float, v >> 30)};
+  }
+  if (format == VertexFormat::Rg11B10Float) {
+    // (an 11-bit float is a half float's exponent and the top six bits of its mantissa, a 10-bit one the top five; neither has a sign)
+    const uint32_t v = read_vertex_unsigned(bytes, offset, 4);
+    return {half_to_float(static_cast<uint16_t>((v & 0x7FF) << 4)), half_to_float(static_cast<uint16_t>(((v >> 11) & 0x7FF) << 4)), half_to_float(static_cast<uint16_t>((v >> 22) << 5)), 1.0f};
+  }
+  if (format == VertexFormat::Bgrx8Unorm) {
+    const uint32_t v = read_vertex_unsigned(bytes, offset, 4);
+    return {static_cast<float>((v >> 16) & 0xFF) / 255.0f, static_cast<float>((v >> 8) & 0xFF) / 255.0f, static_cast<float>(v & 0xFF) / 255.0f, 1.0f};
+  }
   const VertexType type = vertex_format_type(format);
   const uint32_t size = vertex_type_bytes(type), components = vertex_format_components(format);
   const bool integer = vertex_format_is_integer(format);

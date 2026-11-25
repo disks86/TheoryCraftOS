@@ -29,6 +29,7 @@
 #include <d3d12.h>
 #include <dxgi1_6.h>
 #include "dxfixtures.h"
+#include "vertex_formats.h"
 
 static int checks, failed;
 #define CHECK(x) do { ++checks; if (!(x)) { ++failed; printf("FAILED line %d: %s\n", __LINE__, #x); } } while (0)
@@ -1816,6 +1817,158 @@ static void test_vertex_formats(Scene *c) {
   pd.SampleDesc.Count = 1;
   pso = NULL;
   CHECK(FAILED(ID3D12Device_CreateGraphicsPipelineState(c->dev, &pd, &IID_ID3D12PipelineState, (void **)&pso)) && pso == NULL);
+}
+
+/* Every vertex format (vertex_formats.h, the vs_fmt shaders) and instance step rates other than 1, with vertex buffers in several slots. */
+static ID3D12PipelineState *fmt_pipeline(Scene *c, const D3D12_INPUT_ELEMENT_DESC *layout, UINT elements, int shader, HRESULT *hr_out) {
+  static const BYTE *const code[3] = {dx_vs_fmt_dxbc, dx_vs_fmt_uint_dxbc, dx_vs_fmt_sint_dxbc};
+  static const SIZE_T bytes[3] = {sizeof dx_vs_fmt_dxbc, sizeof dx_vs_fmt_uint_dxbc, sizeof dx_vs_fmt_sint_dxbc};
+  D3D12_GRAPHICS_PIPELINE_STATE_DESC pd;
+  memset(&pd, 0, sizeof pd);
+  pd.pRootSignature = c->rs;
+  pd.VS.pShaderBytecode = code[shader];
+  pd.VS.BytecodeLength = bytes[shader];
+  pd.PS.pShaderBytecode = dx_ps_color_dxbc;
+  pd.PS.BytecodeLength = sizeof dx_ps_color_dxbc;
+  pd.SampleMask = 0xFFFFFFFFu;
+  pd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+  pd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+  pd.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+  pd.InputLayout.pInputElementDescs = layout;
+  pd.InputLayout.NumElements = elements;
+  pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+  pd.NumRenderTargets = 1;
+  pd.RTVFormats[0] = DXGI_FORMAT_B8G8R8A8_UNORM;
+  pd.SampleDesc.Count = 1;
+  ID3D12PipelineState *pso = NULL;
+  const HRESULT hr = ID3D12Device_CreateGraphicsPipelineState(c->dev, &pd, &IID_ID3D12PipelineState, (void **)&pso);
+  if (hr_out) *hr_out = hr;
+  return SUCCEEDED(hr) ? pso : NULL;
+}
+/* Draws 3 vertices, `instances` instances from `first`, with the views of slots 0 .. 7 (a size of 0: none) and reads the four probe pixels (the quarters' corners) and the middle. */
+static int fmt_draw(Scene *c, ID3D12PipelineState *pso, const D3D12_VERTEX_BUFFER_VIEW *views, UINT instances, UINT first, UINT32 out[5]) {
+  ID3D12GraphicsCommandList *list = NULL;
+  CHECK_HR(ID3D12CommandAllocator_Reset(c->allocator));
+  CHECK_HR(ID3D12Device_CreateCommandList(c->dev, 0, D3D12_COMMAND_LIST_TYPE_DIRECT, c->allocator, pso, &IID_ID3D12GraphicsCommandList, (void **)&list));
+  if (!list) return 0;
+  scene_begin(c, list, 1);
+  ID3D12GraphicsCommandList_SetGraphicsRootSignature(list, c->rs);
+  ID3D12GraphicsCommandList_SetGraphicsRoot32BitConstants(list, 0, 16, kIdentity, 0);
+  ID3D12GraphicsCommandList_IASetPrimitiveTopology(list, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+  ID3D12GraphicsCommandList_IASetVertexBuffers(list, 0, 8, views);
+  ID3D12GraphicsCommandList_DrawInstanced(list, 3, instances, 0, first);
+  scene_read_target(c, list);
+  scene_run(c, list);
+  ID3D12GraphicsCommandList_Release(list);
+  const UINT32 *pixels = NULL;
+  if (FAILED(ID3D12Resource_Map(c->readback, 0, NULL, (void **)&pixels)) || !pixels) return 0;
+  const int at_x[5] = {4, 36, 4, 36, 32}, at_y[5] = {4, 4, 36, 36, 32};
+  for (int q = 0; q < 5; ++q) out[q] = pixels[at_y[q] * 64 + at_x[q]];
+  ID3D12Resource_Unmap(c->readback, 0, NULL);
+  return 1;
+}
+
+static void test_all_vertex_formats(Scene *c) {
+  /* slot 0: a triangle over the whole target; slot 4: the colour of each vertex (16 bytes each); slot 7: an offset of 0, per instance */
+  const float big[9] = {-1, -1, 0.5f, -1, 3, 0.5f, 3, -1, 0.5f}, zero[2] = {0, 0};
+  ID3D12Resource *positions = upload_floats(c->dev, big, 9), *offsets = upload_floats(c->dev, zero, 2);
+  ID3D12Resource *colours = make_buffer(c->dev, D3D12_HEAP_TYPE_UPLOAD, 256, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ);
+  if (!positions || !offsets || !colours) { CHECK(0); return; }
+  D3D12_VERTEX_BUFFER_VIEW views[8];
+  memset(views, 0, sizeof views);
+  views[0].BufferLocation = ID3D12Resource_GetGPUVirtualAddress(positions), views[0].SizeInBytes = 36, views[0].StrideInBytes = 12;
+  views[4].BufferLocation = ID3D12Resource_GetGPUVirtualAddress(colours), views[4].SizeInBytes = 48, views[4].StrideInBytes = 16;
+  views[7].BufferLocation = ID3D12Resource_GetGPUVirtualAddress(offsets), views[7].SizeInBytes = 8, views[7].StrideInBytes = 8;
+  int formats_ok = 0, formats = 0, support_ok = 1;
+  for (UINT f = 0; f < sizeof g_vertex_formats / sizeof g_vertex_formats[0]; ++f) {
+    const VertexFormatCase *t = &g_vertex_formats[f];
+    D3D12_FEATURE_DATA_FORMAT_SUPPORT support = {t->format, D3D12_FORMAT_SUPPORT1_NONE, D3D12_FORMAT_SUPPORT2_NONE};
+    if (FAILED(ID3D12Device_CheckFeatureSupport(c->dev, D3D12_FEATURE_FORMAT_SUPPORT, &support, sizeof support)) || !(support.Support1 & D3D12_FORMAT_SUPPORT1_IA_VERTEX_BUFFER)) {
+      printf("all vertex formats: (%s: no IA_VERTEX_BUFFER)\n", t->name);
+      support_ok = 0;
+    }
+    const D3D12_INPUT_ELEMENT_DESC e[3] = {{"POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
+                                           {"COLOR", 0, t->format, 4, 0, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
+                                           {"OFFSET", 0, DXGI_FORMAT_R32G32_FLOAT, 7, 0, D3D12_INPUT_CLASSIFICATION_PER_INSTANCE_DATA, 1}};
+    ++formats;
+    ID3D12PipelineState *pso = fmt_pipeline(c, e, 3, t->shader, NULL);
+    if (!pso) { printf("all vertex formats: (%s: no pipeline)\n", t->name); continue; }
+    void *mapped = NULL;
+    if (SUCCEEDED(ID3D12Resource_Map(colours, 0, NULL, &mapped)) && mapped) {
+      for (int v = 0; v < 3; ++v) memcpy((BYTE *)mapped + v * 16, t->bytes, 16);
+      ID3D12Resource_Unmap(colours, 0, NULL);
+    }
+    UINT32 shown[5];
+    if (fmt_draw(c, pso, views, 1, 0, shown) && colour_is(shown[4], t->rgba)) ++formats_ok;
+    else printf("all vertex formats: (%s: %08x, expected %d %d %d %d)\n", t->name, (unsigned)shown[4], t->rgba[0], t->rgba[1], t->rgba[2], t->rgba[3]);
+    ID3D12PipelineState_Release(pso);
+  }
+  printf("all vertex formats: %d of %d\n", formats_ok, formats);
+  CHECK(formats_ok == formats);
+  CHECK(support_ok);
+  /* Formats that are no vertex element: no IA_VERTEX_BUFFER, and the pipeline is refused (E_INVALIDARG); so is a classification that is neither. */
+  {
+    static const DXGI_FORMAT not_vertex[] = {DXGI_FORMAT_B5G6R5_UNORM, DXGI_FORMAT_B5G5R5A1_UNORM, DXGI_FORMAT_B4G4R4A4_UNORM, DXGI_FORMAT_R8G8B8A8_UNORM_SRGB, DXGI_FORMAT_R16G16B16A16_TYPELESS};
+    int refused = 1;
+    for (UINT i = 0; i < sizeof not_vertex / sizeof not_vertex[0]; ++i) {
+      D3D12_FEATURE_DATA_FORMAT_SUPPORT support = {not_vertex[i], D3D12_FORMAT_SUPPORT1_NONE, D3D12_FORMAT_SUPPORT2_NONE};
+      ID3D12Device_CheckFeatureSupport(c->dev, D3D12_FEATURE_FORMAT_SUPPORT, &support, sizeof support);
+      const D3D12_INPUT_ELEMENT_DESC e[3] = {{"POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
+                                             {"COLOR", 0, not_vertex[i], 4, 0, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
+                                             {"OFFSET", 0, DXGI_FORMAT_R32G32_FLOAT, 7, 0, D3D12_INPUT_CLASSIFICATION_PER_INSTANCE_DATA, 1}};
+      HRESULT hr = S_OK;
+      ID3D12PipelineState *pso = fmt_pipeline(c, e, 3, 0, &hr);
+      if (pso || hr != E_INVALIDARG || (support.Support1 & D3D12_FORMAT_SUPPORT1_IA_VERTEX_BUFFER)) { printf("all vertex formats: (format %u taken)\n", (unsigned)not_vertex[i]); refused = 0; }
+      if (pso) ID3D12PipelineState_Release(pso);
+    }
+    const D3D12_INPUT_ELEMENT_DESC odd[3] = {{"POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
+                                             {"COLOR", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 4, 0, (D3D12_INPUT_CLASSIFICATION)7, 0},
+                                             {"OFFSET", 0, DXGI_FORMAT_R32G32_FLOAT, 7, 0, D3D12_INPUT_CLASSIFICATION_PER_INSTANCE_DATA, 1}};
+    HRESULT hr = S_OK;
+    ID3D12PipelineState *pso = fmt_pipeline(c, odd, 3, 0, &hr);
+    CHECK(refused && !pso && hr == E_INVALIDARG);
+    if (pso) ID3D12PipelineState_Release(pso);
+  }
+  /* Step rates: a triangle over the top left quarter (slot 1, per vertex) moved by an offset (slot 3, per instance) and coloured by a colour (slot 6, per instance). */
+  {
+    const float quarter[9] = {-1, 1, 0.5f, 0, 1, 0.5f, -1, 0, 0.5f};
+    const float moves[8] = {0, 0, 1, 0, 0, -1, 1, -1};
+    const float tints[16] = {1, -1, -1, 1, -1, 1, -1, 1, -1, -1, 1, 1, 1, 1, 1, 1};
+    ID3D12Resource *corner = upload_floats(c->dev, quarter, 9), *move = upload_floats(c->dev, moves, 8), *tint = upload_floats(c->dev, tints, 16);
+    if (!corner || !move || !tint) { CHECK(0); return; }
+    D3D12_VERTEX_BUFFER_VIEW v[8];
+    memset(v, 0, sizeof v);
+    v[1].BufferLocation = ID3D12Resource_GetGPUVirtualAddress(corner), v[1].SizeInBytes = 36, v[1].StrideInBytes = 12;
+    v[3].BufferLocation = ID3D12Resource_GetGPUVirtualAddress(move), v[3].SizeInBytes = 32, v[3].StrideInBytes = 8;
+    v[6].BufferLocation = ID3D12Resource_GetGPUVirtualAddress(tint), v[6].SizeInBytes = 64, v[6].StrideInBytes = 16;
+    struct { UINT move_rate, tint_rate, instances, first; UINT32 expect[4]; } cases[] = {
+      {1, 1, 4, 0, {0xFFFF0000u, 0xFF00FF00u, 0xFF0000FFu, 0xFFFFFFFFu}},
+      {2, 3, 4, 0, {0xFFFF0000u, 0xFF00FF00u, 0xFF000000u, 0xFF000000u}},
+      {2, 3, 4, 1, {0xFF000000u, 0xFF00FF00u, 0xFF0000FFu, 0xFF000000u}},
+      {1, 0, 3, 1, {0xFF000000u, 0xFF00FF00u, 0xFF00FF00u, 0xFF00FF00u}},
+      {0, 1, 3, 0, {0xFF0000FFu, 0xFF000000u, 0xFF000000u, 0xFF000000u}},
+    };
+    for (UINT k = 0; k < sizeof cases / sizeof cases[0]; ++k) {
+      /* (a per-vertex element's InstanceDataStepRate is not looked at: 5 here) */
+      const D3D12_INPUT_ELEMENT_DESC e[3] = {{"POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 1, 0, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 5},
+                                             {"COLOR", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 6, 0, D3D12_INPUT_CLASSIFICATION_PER_INSTANCE_DATA, cases[k].tint_rate},
+                                             {"OFFSET", 0, DXGI_FORMAT_R32G32_FLOAT, 3, 0, D3D12_INPUT_CLASSIFICATION_PER_INSTANCE_DATA, cases[k].move_rate}};
+      ID3D12PipelineState *pso = fmt_pipeline(c, e, 3, 0, NULL);
+      UINT32 shown[5] = {0};
+      int ok = pso && fmt_draw(c, pso, v, cases[k].instances, cases[k].first, shown);
+      for (int q = 0; q < 4; ++q) ok = ok && shown[q] == cases[k].expect[q];
+      printf("step rates %u %u, %u instances from %u: %08x %08x %08x %08x\n", cases[k].move_rate, cases[k].tint_rate, cases[k].instances, cases[k].first, (unsigned)shown[0], (unsigned)shown[1],
+             (unsigned)shown[2], (unsigned)shown[3]);
+      CHECK(ok);
+      if (pso) ID3D12PipelineState_Release(pso);
+    }
+    ID3D12Resource_Release(corner);
+    ID3D12Resource_Release(move);
+    ID3D12Resource_Release(tint);
+  }
+  ID3D12Resource_Release(positions);
+  ID3D12Resource_Release(offsets);
+  ID3D12Resource_Release(colours);
 }
 
 /* A pass with a depth buffer and no render target (the way a shadow map is drawn): a small near triangle goes into the depth buffer alone; a big farther one drawn afterwards
@@ -3620,6 +3773,7 @@ static void test_extras(ID3D12Device *dev, ID3D12CommandQueue *queue, ID3D12Fenc
   test_stream_output(&c);
   test_mip_tails(&c);
   test_vertex_formats(&c);
+  test_all_vertex_formats(&c);
   test_depth_only(&c);
   test_multisample(&c);
   test_limits(&c);

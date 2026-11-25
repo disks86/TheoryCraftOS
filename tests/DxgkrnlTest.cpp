@@ -28,6 +28,8 @@
 #include <vector>
 #include "Graphics/Graphics3D/BuiltinShaders.hpp"
 #include "Graphics/Graphics3D/Software/SoftwareDevice.hpp"
+#include "Graphics/Graphics3D/VertexFetch.hpp"
+#include "Graphics/Graphics3D/Virgl/VirglVertexPatch.hpp"
 #include "Kernel/Dxgkrnl/Conformance.hpp"
 #include "Kernel/Dxgkrnl/CommandStream.hpp"
 #include "Kernel/Dxgkrnl/ConformanceBlobs.hpp"
@@ -8186,6 +8188,282 @@ void test_d3d10_state() {
   }
 }
 
+// --- Vertex formats and instance step rates -------------------------------------------------------------------------------------------------------------------------------------
+
+// What every VertexFormat reads (graphics::read_vertex_attribute: the software and Vega devices), and what a buffer that ends early gives.
+void test_vertex_fetch_formats() {
+  using graphics::VertexFormat;
+  auto bits = [](float f) { return __builtin_bit_cast(uint32_t, f); };
+  auto read = [](std::vector<uint8_t> bytes, VertexFormat f, uint64_t offset = 0) { return graphics::read_vertex_attribute(ConstByteView(bytes.data(), bytes.size()), offset, f); };
+  auto near = [](float a, float b) { return fabsf(a - b) < 1e-5f; };
+  // R10G10B10A2: R = 1023, G = 512, B = 1, A = 2
+  const uint32_t word = 1023u | 512u << 10 | 1u << 20 | 2u << 30;
+  const std::vector<uint8_t> w = {static_cast<uint8_t>(word), static_cast<uint8_t>(word >> 8), static_cast<uint8_t>(word >> 16), static_cast<uint8_t>(word >> 24)};
+  graphics::Vec4 v = read(w, VertexFormat::Rgb10A2Uint);
+  CHECK(bits(v.x) == 1023 && bits(v.y) == 512 && bits(v.z) == 1 && bits(v.w) == 2);
+  CHECK(graphics::vertex_format_is_integer(VertexFormat::Rgb10A2Uint) && !graphics::vertex_format_is_integer(VertexFormat::Rgb10A2Unorm) && !graphics::vertex_format_is_integer(VertexFormat::Rg11B10Float));
+  v = read(w, VertexFormat::Rgb10A2Unorm);
+  CHECK(near(v.x, 1.0f) && near(v.y, 512.0f / 1023.0f) && near(v.z, 1.0f / 1023.0f) && near(v.w, 2.0f / 3.0f));
+  // R11G11B10: R = 1.0 (exponent 15, mantissa 0), G = 0.5 + 0.5 / 64 * 32 = 0.75, B = 2.0 (a 10-bit one: exponent 16)
+  const uint32_t r11 = 15u << 6, g11 = 14u << 6 | 32u, b10 = 16u << 5;
+  const uint32_t packed = r11 | g11 << 11 | b10 << 22;
+  v = read({static_cast<uint8_t>(packed), static_cast<uint8_t>(packed >> 8), static_cast<uint8_t>(packed >> 16), static_cast<uint8_t>(packed >> 24)}, VertexFormat::Rg11B10Float);
+  CHECK(v.x == 1.0f && v.y == 0.75f && v.z == 2.0f && v.w == 1.0f);
+  // (the R11G11B10 value Wine's d3d11 test_vertex_formats expects: 1.89453125e-01, 1.3e+01, 3.8125)
+  {
+    const uint32_t wine = (12u << 6 | 33u) | (18u << 6 | 40u) << 11 | (16u << 5 | 29u) << 22;   // 0.125 * (1 + 33 / 64), 8 * (1 + 40 / 64), 2 * (1 + 29 / 32)
+    v = read({static_cast<uint8_t>(wine), static_cast<uint8_t>(wine >> 8), static_cast<uint8_t>(wine >> 16), static_cast<uint8_t>(wine >> 24)}, VertexFormat::Rg11B10Float);
+    CHECK(near(v.x, 0.1894531f) && near(v.y, 13.0f) && near(v.z, 3.8125f));
+  }
+  // B8G8R8X8: the fourth byte is not read
+  v = read({0x40, 0x80, 0xFF, 0x12}, VertexFormat::Bgrx8Unorm);
+  CHECK(v.x == 1.0f && near(v.y, 128.0f / 255.0f) && near(v.z, 64.0f / 255.0f) && v.w == 1.0f);
+  v = read({0x40, 0x80, 0xFF, 0x33}, VertexFormat::Bgra8Unorm);
+  CHECK(v.x == 1.0f && near(v.w, 0x33 / 255.0f));
+  // signed normalised: the most negative value is -1; integers sign extended; missing components 0, 0, 0 and 1 (the integer 1)
+  v = read({0x80, 0x81, 0x7F}, VertexFormat::Snorm8x3);
+  CHECK(v.x == -1.0f && v.y == -1.0f && v.z == 1.0f && v.w == 1.0f);
+  v = read({0x00, 0x80, 0x01, 0x80}, VertexFormat::Snorm16x2);
+  CHECK(v.x == -1.0f && near(v.y, -32767.0f / 32767.0f) && v.z == 0.0f && v.w == 1.0f);
+  v = read({0xFE, 0xFF}, VertexFormat::Sint16x1);
+  CHECK(bits(v.x) == 0xFFFFFFFEu && bits(v.y) == 0 && bits(v.w) == 1);
+  v = read({0xFF, 0x02}, VertexFormat::Uint8x2);
+  CHECK(bits(v.x) == 255 && bits(v.y) == 2 && bits(v.z) == 0 && bits(v.w) == 1);
+  v = read({0x00, 0x3C, 0x00, 0xC0}, VertexFormat::Half2);   // 1.0, -2.0
+  CHECK(v.x == 1.0f && v.y == -2.0f && v.z == 0.0f && v.w == 1.0f);
+  v = read({0xFF, 0xFF, 0x00, 0x00}, VertexFormat::Unorm16x2);
+  CHECK(v.x == 1.0f && v.y == 0.0f);
+  // a buffer that ends inside the element: what is outside reads as 0 (and nothing is read past the end, ASan)
+  v = read({0x01, 0x02}, VertexFormat::Rgb10A2Uint);
+  CHECK(bits(v.x) == 0 && bits(v.y) == 0 && bits(v.w) == 0);
+  v = read({0x00, 0x00, 0x80, 0x3F, 0x00}, VertexFormat::Float2, 2);   // (the second float is cut off)
+  CHECK(v.x == 0.0f && v.y == 0.0f);
+  v = read({}, VertexFormat::Rg11B10Float, ~uint64_t{0} - 2);
+  CHECK(v.x == 0.0f && v.w == 1.0f);
+  // every format's size, and that the count covers the new ones
+  CHECK(graphics::kVertexFormatCount == 53 && graphics::vertex_format_bytes(VertexFormat::Rgb10A2Uint) == 4 && graphics::vertex_format_bytes(VertexFormat::Rg11B10Float) == 4 &&
+        graphics::vertex_format_bytes(VertexFormat::Bgrx8Unorm) == 4 && graphics::vertex_format_bytes(VertexFormat::Half3) == 6 && graphics::vertex_format_bytes(VertexFormat::Sint8x3) == 3);
+  // instance_element: first_instance + instance / rate, rate 0 never steps
+  graphics::VertexAttribute a{1, VertexFormat::Float2, 0, true};
+  CHECK(graphics::instance_element(a, 5, 7) == 12);
+  a.step_rate = 3;
+  CHECK(graphics::instance_element(a, 5, 7) == 7 && graphics::instance_element(a, 0, 2) == 0);
+  a.step_rate = 0;
+  CHECK(graphics::instance_element(a, 5, 1000) == 5);
+}
+
+// The virgl device's vertex shader copy for the formats its host reads otherwise (VirglVertexPatch.hpp).
+void test_virgl_vertex_patch() {
+  using graphics::virgl_patch::InputFix;
+  const char* text = "VERT\nDCL IN[0]\nDCL IN[1]\nDCL IN[2]\nDCL OUT[0], POSITION\nDCL TEMP[0..3]\nIMM[0] FLT32 {1.0000, 0.0000, 0.0000, 0.0000}\n"
+                     "  0: MOV TEMP[0], IN[0]\n  1: ADD TEMP[1], IN[1].xyzw, -IN[2]\n  2: MOV OUT[0], TEMP[0]\n  3: END\n";
+  InputFix fixes[3] = {InputFix::None, InputFix::UnpackRgb10A2Uint, InputFix::ForceW1};
+  HostAllocator allocator;
+  String out(allocator);
+  CHECK(graphics::virgl_patch::patch_vertex_inputs(StringView(text), ArrayView<const InputFix>(fixes, 3), &out));
+  const std::string s(out.c_str());
+  CHECK(s.find("DCL TEMP[0..5]") != std::string::npos && s.find("DCL TEMP[0..3]") == std::string::npos);
+  CHECK(s.find("IMM[1] UINT32 {0, 10, 20, 30}\nIMM[2] UINT32 {1023, 1023, 1023, 3}\nIMM[3] UINT32 {0, 0, 0, 1065353216}\n") != std::string::npos);
+  CHECK(s.find("  USHR TEMP[4], IN[1].xxxx, IMM[1]\n  AND TEMP[4], TEMP[4], IMM[2]\n  MOV TEMP[5], IN[2]\n  MOV TEMP[5].w, IMM[3].wwww\n  0: MOV TEMP[0], IN[0]\n") != std::string::npos);
+  CHECK(s.find("ADD TEMP[1], TEMP[4].xyzw, -TEMP[5]") != std::string::npos);
+  // the new instructions come after every declaration
+  CHECK(s.find("USHR") > s.find("IMM[3]") && s.find("DCL IN[2]") < s.find("USHR"));
+  // nothing to fix: the same text
+  InputFix none[3] = {};
+  CHECK(graphics::virgl_patch::patch_vertex_inputs(StringView(text), ArrayView<const InputFix>(none, 3), &out) && std::string(out.c_str()) == text);
+  // an input read through the address register cannot be followed; a text with no instructions is not a shader
+  CHECK(!graphics::virgl_patch::patch_vertex_inputs(StringView("VERT\nDCL IN[0]\nDCL TEMP[0]\n  0: MOV TEMP[0], IN[ADDR[0].x]\n  1: END\n"), ArrayView<const InputFix>(fixes, 3), &out));
+  CHECK(!graphics::virgl_patch::patch_vertex_inputs(StringView("VERT\nDCL IN[0]\n"), ArrayView<const InputFix>(fixes, 3), &out));
+  CHECK(!graphics::virgl_patch::patch_vertex_inputs(StringView("VERT\nDCL TEMP[x]\n  0: END\n"), ArrayView<const InputFix>(fixes, 3), &out));
+  // every prefix of the text (a cut-off shader) and every byte changed: refused or patched, never read past the end (ASan)
+  const std::string full(text);
+  for (size_t n = 0; n < full.size(); ++n) (void)graphics::virgl_patch::patch_vertex_inputs(StringView(full.data(), n), ArrayView<const InputFix>(fixes, 3), &out);
+  for (size_t i = 0; i < full.size(); ++i)
+    for (uint32_t bit = 0; bit < 8; ++bit) {
+      std::string flipped = full;
+      flipped[i] = static_cast<char>(flipped[i] ^ (1u << bit));
+      if (flipped[i] == 0) continue;
+      (void)graphics::virgl_patch::patch_vertex_inputs(StringView(flipped.c_str()), ArrayView<const InputFix>(fixes, 3), &out);
+    }
+}
+
+// Draws with the new formats and with step rates other than 1 on the software device, through the kernel (and its escape).
+void test_vertex_formats_and_step_rates() {
+  Env e;
+  Handle rt = e.alloc(kTarget, Format::A8R8G8B8, 16, 16), vb = e.buffer(kAllocVertexBuffer, 512);
+  // vs_2_0: the position is v0 + v1 (a per-instance offset), the colour v2
+  Asm vs(true, 2, 0);
+  vs.dcl(0, 0, kRegInput, 0).dcl(5, 0, kRegInput, 1).dcl(10, 0, kRegInput, 2);
+  vs.def(4, 0, 0, 0, 1);
+  vs.op(kOpAdd, {Asm::dst(kRegRastOut, 0, 0x7), Asm::src(kRegInput, 0), Asm::src(kRegInput, 1)});
+  vs.op(kOpMov, {Asm::dst(kRegRastOut, 0, 0x8), Asm::src(kRegConst, 4)});
+  vs.op(kOpMov, {Asm::dst(kRegAttrOut, 0), Asm::src(kRegInput, 2)});
+  vs.end();
+  const Handle vsh = d3d9_shader(e, vs), psh = d3d9_shader(e, color_ps());
+  // slot 0: a triangle over a quarter (per vertex); slot 1 at byte 64: offsets (per instance); slot 2 at byte 128: colours (per instance or per vertex)
+  const float triangle[9] = {-1.0f, -1.0f, 0.5f, 0.0f, -1.0f, 0.5f, -1.0f, 0.0f, 0.5f};
+  const float offsets[6] = {0.0f, 0.0f, 1.0f, 0.0f, 0.0f, 1.0f};   // (0, 0), (1, 0) and (0, 1): three quarters
+  auto put = [&](uint32_t at, ConstByteView bytes) {
+    std::vector<uint8_t> all(512, 0);
+    LockResult r;
+    if (e.kernel.lock(kPid, vb, kLockReadOnly, 0, &r) == status::kSuccess) {
+      for (uint64_t i = 0; i < r.data.size() && i < all.size(); ++i) all[i] = r.data[i];
+      e.kernel.unlock(kPid, vb);
+    }
+    for (uint64_t i = 0; i < bytes.size(); ++i) all[at + i] = bytes[i];
+    CHECK(e.write(vb, ConstByteView(all.data(), all.size())));
+  };
+  put(0, floats(triangle, 9));
+  put(64, floats(offsets, 6));
+  auto make = [&](graphics::VertexFormat colour, bool colour_per_instance, uint32_t offset_rate, uint32_t colour_rate, uint32_t colour_stride, NtStatus* status_out = nullptr) {
+    PipelineDesc pd;
+    pd.vertex_shader = vsh, pd.fragment_shader = psh, pd.vertex_stride = 12, pd.attribute_count = 3, pd.varying_count = 1;
+    pd.attributes[0] = {0, graphics::VertexFormat::Float3, 0};
+    pd.attributes[1] = {1, graphics::VertexFormat::Float2, 0, true, 1, offset_rate};
+    pd.attributes[2] = {2, colour, 0, colour_per_instance, 2, colour_rate};
+    pd.slot_strides[1] = 8, pd.slot_strides[2] = colour_stride;
+    pd.cull_mode = graphics::CullMode::None;
+    Handle h = 0;
+    const NtStatus s = e.kernel.create_pipeline(kPid, e.dev, pd, &h);
+    if (status_out) *status_out = s;
+    else CHECK(s == status::kSuccess);
+    return h;
+  };
+  auto picture = [&](Handle pipe, uint32_t instances, uint32_t first_instance, uint32_t colour_at = 128, NtStatus* status_out = nullptr) {
+    CommandWriter w(e.allocator);
+    w.begin_pass(0, kNoAllocation, kPassClearColor, {0, 0, 0, 1}, 1, 0);
+    w.bind_pipeline(pipe);
+    w.bind_vertex_buffer_slot(0, 1, 0);
+    w.bind_vertex_buffer_slot(1, 1, 64);
+    w.bind_vertex_buffer_slot(2, 1, colour_at);
+    w.draw_instanced(3, instances, 0, first_instance);
+    w.end_pass();
+    const NtStatus s = e.render(w, {rt, vb});
+    if (status_out) *status_out = s;
+    std::vector<uint32_t> out;
+    if (s != status::kSuccess) return out;
+    for (uint32_t y = 0; y < 16; ++y)
+      for (uint32_t x = 0; x < 16; ++x) out.push_back(e.pixel(rt, x, y));
+    return out;
+  };
+  // (a pixel well inside each place's triangle: the place of offset (0, 0), (1, 0) and (0, 1); the picture's first row is clip space's y = +1)
+  auto at = [](const std::vector<uint32_t>& img, uint32_t quarter) { return img.empty() ? 0xDEADDEADu : img[(quarter == 2 ? 6 : 14) * 16 + (quarter == 1 ? 9 : 1)]; };
+
+  // Colours as B8G8R8X8 (the fourth byte is not alpha: the picture's alpha is 1), one an instance with step rate 1: instance n gets element n.
+  const uint8_t bgrx[12] = {0x00, 0x00, 0xFF, 0x00, 0x00, 0xFF, 0x00, 0x10, 0xFF, 0x00, 0x00, 0x7F};   // red, green, blue
+  put(128, ConstByteView(bgrx, 12));
+  Handle pipe = make(graphics::VertexFormat::Bgrx8Unorm, true, 1, 1, 4);
+  std::vector<uint32_t> img = picture(pipe, 3, 0);
+  CHECK(at(img, 0) == 0xFFFF0000u && at(img, 1) == 0xFF00FF00u && at(img, 2) == 0xFF0000FFu);
+  // Offsets stepping every second instance, colours every third: instances 0, 1 at offset 0, 2, 3 at offset 1; colours 0, 0, 0, 1 - the last one drawn over a place wins.
+  pipe = make(graphics::VertexFormat::Bgrx8Unorm, true, 2, 3, 4);
+  img = picture(pipe, 4, 0);
+  CHECK(at(img, 0) == 0xFFFF0000u && at(img, 1) == 0xFF00FF00u && at(img, 2) == 0xFF000000u);
+  // ... from the first instance 1: offsets 1 + n / 2 (offsets 1, then 2), colours 1 + n / 3 (green, green, green, blue)
+  img = picture(pipe, 4, 1);
+  CHECK(at(img, 0) == 0xFF000000u && at(img, 1) == 0xFF00FF00u && at(img, 2) == 0xFF0000FFu);
+  // A colour of step rate 0: every instance reads the first instance's element.
+  pipe = make(graphics::VertexFormat::Bgrx8Unorm, true, 1, 0, 4);
+  img = picture(pipe, 3, 0);
+  CHECK(at(img, 0) == 0xFFFF0000u && at(img, 1) == 0xFFFF0000u && at(img, 2) == 0xFFFF0000u);
+  img = picture(pipe, 2, 1);   // (instances 1, 2: offsets 1 and 2, the colour of element 1)
+  CHECK(at(img, 0) == 0xFF000000u && at(img, 1) == 0xFF00FF00u && at(img, 2) == 0xFF00FF00u);
+  // The bounds: a slot whose elements end where the instances' last read is fits, one element fewer does not. Rate 2, 4 instances: 2 offset elements (slot 1 at 64 + 8 bytes
+  // of 512: put its view 16 bytes before the end).
+  {
+    put(512 - 16, floats(offsets, 4));
+    pipe = make(graphics::VertexFormat::Bgrx8Unorm, true, 2, 0, 4);
+    auto run = [&](uint32_t offset_at, uint32_t instances) {
+      CommandWriter c(e.allocator);
+      c.begin_pass(0, kNoAllocation, kPassClearColor, {0, 0, 0, 1}, 1, 0);
+      c.bind_pipeline(pipe);
+      c.bind_vertex_buffer_slot(0, 1, 0);
+      c.bind_vertex_buffer_slot(1, 1, offset_at);
+      c.bind_vertex_buffer_slot(2, 1, 512 - 4);   // (a rate-0 colour: one element)
+      c.draw_instanced(3, instances, 0, 0);
+      c.end_pass();
+      return e.render(c, {rt, vb});
+    };
+    CHECK(run(512 - 16, 4) == status::kSuccess);
+    CHECK(run(512 - 16, 5) == status::kInvalidParameter);   // (instance 4 reads element 2)
+    CHECK(run(512 - 8, 4) == status::kInvalidParameter);
+    CHECK(run(512 - 8, 2) == status::kSuccess);
+  }
+
+  // The new formats as per-vertex colours (a red triangle: what each reads as red 1, green 0.5, blue 0).
+  {
+    // R11G11B10_FLOAT: R 1.0, G 0.5 (exponent 14), B 0; the alpha is 1
+    const uint32_t f11 = (15u << 6) | ((14u << 6) << 11);
+    const uint32_t f11s[3] = {f11, f11, f11};
+    put(128, ConstByteView(reinterpret_cast<const uint8_t*>(f11s), 12));
+    pipe = make(graphics::VertexFormat::Rg11B10Float, false, 1, 0, 4);
+    img = picture(pipe, 1, 0);
+    CHECK(close8(at(img, 0) >> 16 & 0xFF, 255) && close8(at(img, 0) >> 8 & 0xFF, 128) && close8(at(img, 0) & 0xFF, 0) && (at(img, 0) >> 24) == 255);
+    // R10G10B10A2_UINT is integers in the shader's register: a vs_2_0 reads them as floats (tiny ones: black); the integer path is in test_vertex_fetch_formats and the
+    // Direct3D 11/12 tests. Here: the pipeline is made and draws.
+    pipe = make(graphics::VertexFormat::Rgb10A2Uint, false, 1, 0, 4);
+    img = picture(pipe, 1, 0);
+    CHECK(!img.empty() && (at(img, 0) & 0xFFFFFF) == 0);
+  }
+
+  // The escape: the step rates after the constant blend colour (their count, then a word for each attribute from the first; a per-vertex one's is 0).
+  {
+    put(128, ConstByteView(bgrx, 12));
+    ByteBuffer req(e.allocator);
+    req.put32(static_cast<uint32_t>(EscapeOp::CreatePipeline)), req.put32(vsh), req.put32(psh), req.put32(12), req.put32(3), req.put32(1), req.put32(0);
+    req.put32(0), req.put32(0), req.put32(0);   // cull none, front face, flags
+    const uint32_t attributes[12] = {0, 2, 0, 1, 1, 0, 2, static_cast<uint32_t>(graphics::VertexFormat::Bgrx8Unorm), 0, 0, 0, 0};
+    for (uint32_t w : attributes) req.put32(w);
+    for (uint32_t w : {0u, 7u, 0u, 0u, 0u, 255u, 255u, 0u}) req.put32(w);   // stencil off
+    for (uint32_t w : {3u, 0u, 0u, 1u, 0u, 1u, 0u, 0u, 0u, 15u, 6u}) req.put32(w);   // depth compare LessEqual, no blending, attributes 1 and 2 per instance
+    req.put32(1), req.put32(0);   // one colour output, no independent blending
+    for (uint32_t t = 0; t < 3; ++t)
+      for (uint32_t w : {0u, 0u, 1u, 0u, 1u, 0u, 0u, 0u, 15u}) req.put32(w);
+    req.put32(0), req.put32(0), req.put32(0), req.put32(0), req.put32(0);   // multisample, geometry, hull, domain, stream output entries
+    req.put32(0), req.put32(0), req.put32(0 | 1u << 4 | 2u << 8), req.put32(2), req.put32(8), req.put32(4), req.put32(0);   // no extra attributes, slots 0 1 2, strides of 1 and 2, no more blends
+    for (uint32_t i = 0; i < 4; ++i) req.put32(0);   // the constant blend colour
+    const uint64_t before_rates = req.size();
+    req.put32(3), req.put32(0), req.put32(2), req.put32(3);   // offsets every second instance, colours every third
+    uint8_t reply[16];
+    uint32_t reply_bytes = 0;
+    CHECK(e.kernel.escape(kPid, e.dev, req.view(), ByteView(reply, sizeof reply), &reply_bytes) == status::kSuccess && reply_bytes == 4);
+    const Handle via_escape = ByteReader(ConstByteView(reply, 4)).le32();
+    CHECK(picture(via_escape, 4, 0) == picture(make(graphics::VertexFormat::Bgrx8Unorm, true, 2, 3, 4), 4, 0));
+    // fewer rate words than attributes: the rest step by 1
+    ByteBuffer two(e.allocator);
+    CHECK(two.append(req.view().first(before_rates)));
+    two.put32(2), two.put32(0), two.put32(2);
+    CHECK(e.kernel.escape(kPid, e.dev, two.view(), ByteView(reply, sizeof reply), &reply_bytes) == status::kSuccess);
+    CHECK(picture(ByteReader(ConstByteView(reply, 4)).le32(), 4, 0) == picture(make(graphics::VertexFormat::Bgrx8Unorm, true, 2, 1, 4), 4, 0));
+    // refused: more rate words than attributes, a per-vertex attribute with a rate, a count with its words cut off, a word too many, a format past the last
+    auto refused = [&](std::initializer_list<uint32_t> tail, uint64_t keep) {
+      ByteBuffer b(e.allocator);
+      CHECK(b.append(req.view().first(keep)));
+      for (uint32_t w : tail) b.put32(w);
+      return e.kernel.escape(kPid, e.dev, b.view(), ByteView(reply, sizeof reply), &reply_bytes) == status::kInvalidParameter;
+    };
+    CHECK(refused({4, 0, 1, 1, 1}, before_rates));
+    CHECK(refused({1, 5}, before_rates));
+    CHECK(refused({3, 0, 2}, before_rates));
+    CHECK(refused({3, 0, 2, 3, 9}, before_rates));
+    CHECK(refused({0xFFFFFFFFu}, before_rates));
+    for (uint64_t cut = before_rates + 1; cut < req.size(); ++cut) CHECK(refused({}, cut));   // (a word cut in the middle)
+    ByteBuffer bad_format(e.allocator);
+    CHECK(bad_format.append(req.view()));
+    bad_format.writable_view()[4 * (10 + 7)] = static_cast<uint8_t>(graphics::kVertexFormatCount);   // (attribute 2's format word)
+    CHECK(e.kernel.escape(kPid, e.dev, bad_format.view(), ByteView(reply, sizeof reply), &reply_bytes) == status::kInvalidParameter);
+    // every bit of the rate part flipped: made or refused, never anything else (and never a read past the request: ASan)
+    for (uint64_t i = before_rates; i < req.size(); ++i)
+      for (uint32_t bit = 0; bit < 8; ++bit) {
+        ByteBuffer f(e.allocator);
+        CHECK(f.append(req.view()));
+        f.writable_view()[i] = static_cast<uint8_t>(f.view()[i] ^ (1u << bit));
+        const NtStatus s = e.kernel.escape(kPid, e.dev, f.view(), ByteView(reply, sizeof reply), &reply_bytes);
+        CHECK(s == status::kSuccess || s == status::kInvalidParameter);
+      }
+  }
+}
+
 // --- Direct3D 10 system values and texel access (shaders from a real compiler) ------------------------------------------------------------------------------------------------
 
 void test_dxbc_system_values() {
@@ -8519,6 +8797,9 @@ int main() {
   test_dxbc_loops();
   test_topologies();
   test_d3d10_state();
+  test_vertex_fetch_formats();
+  test_virgl_vertex_patch();
+  test_vertex_formats_and_step_rates();
   test_dxbc_system_values();
   test_device_forms();
   test_sm3_and_sm51();

@@ -696,7 +696,9 @@ class Adapter::StreamRunner {
       if (!vertex_[slot]) return refuse(__LINE__);
       const uint64_t stride = pipeline_->slot_stride(slot);
       if (pipeline_->per_instance_slots() >> slot & 1) {
-        const uint64_t end = uint64_t{first_instance} + instance_count;
+        // (the last element an instance reads: the attributes that step slowest stop soonest; one that never steps reads first_instance)
+        const uint32_t rate = pipeline_->slot_step_rate(slot);
+        const uint64_t end = uint64_t{first_instance} + (rate ? (instance_count - 1) / rate : 0) + 1;
         if (vertex_offset_[slot] + end * stride > vertex_[slot]->desc().size) return refuse(__LINE__);
       }
       if (!indexed && (pipeline_->per_vertex_slots() >> slot & 1)) {
@@ -2441,7 +2443,7 @@ NtStatus Adapter::create_pipeline(const PipelineDesc& d, const SharedPointer<Sha
       if (((vertex->texture_mask_ | fragment->texture_mask_) >> u) & 1) used = u + 1;
     if (used < texture_count) texture_count = used;
   }
-  uint32_t vertex_slots = 0, instance_slots = 0;
+  uint32_t vertex_slots = 0, instance_slots = 0, slot_rates[graphics::kMaxVertexBuffers] = {};
   for (uint32_t i = 0; i < d.attribute_count; ++i) {
     const graphics::VertexAttribute& a = d.attributes[i];
     if (a.location >= caps_.max_vertex_attributes || a.slot >= caps_.max_vertex_buffers || static_cast<uint32_t>(a.format) >= graphics::kVertexFormatCount) return status::kInvalidParameter;
@@ -2449,6 +2451,7 @@ NtStatus Adapter::create_pipeline(const PipelineDesc& d, const SharedPointer<Sha
     const uint32_t stride = a.slot == 0 ? d.vertex_stride : d.slot_strides[a.slot];
     if (stride == 0 || a.offset > stride || graphics::vertex_format_bytes(a.format) > stride - a.offset) return status::kInvalidParameter;
     (a.per_instance ? instance_slots : vertex_slots) |= 1u << a.slot;
+    if (a.per_instance && a.step_rate && (slot_rates[a.slot] == 0 || a.step_rate < slot_rates[a.slot])) slot_rates[a.slot] = a.step_rate;
   }
   const graphics::StencilState& st = d.stencil;
   if (static_cast<uint32_t>(d.cull_mode) > 2 || static_cast<uint32_t>(d.front_face) > 1 || static_cast<uint32_t>(st.compare) > 7 || static_cast<uint32_t>(st.fail_op) > 7 ||
@@ -2555,6 +2558,7 @@ NtStatus Adapter::create_pipeline(const PipelineDesc& d, const SharedPointer<Sha
   pipeline->stride_ = d.vertex_stride;
   pipeline->vertex_slot_mask_ = vertex_slots;
   pipeline->instance_slot_mask_ = instance_slots;
+  for (uint32_t s = 0; s < graphics::kMaxVertexBuffers; ++s) pipeline->slot_step_rates_[s] = slot_rates[s];
   for (uint32_t s = 1; s < graphics::kMaxVertexBuffers; ++s) pipeline->slot_strides_[s] = d.slot_strides[s];
   for (uint32_t i = 0; i < d.attribute_count; ++i) pipeline->per_instance_ = pipeline->per_instance_ || d.attributes[i].per_instance;
   pipeline->attribute_count_ = d.attribute_count;

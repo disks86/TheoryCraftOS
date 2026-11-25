@@ -22,6 +22,7 @@
 #include "Graphics/BlockCompression.hpp"
 #include <new>
 #include "Graphics/Graphics3D/Virgl/VirglProtocol.hpp"
+#include "Graphics/Graphics3D/Virgl/VirglVertexPatch.hpp"
 #include "Utility/AllocatedView.hpp"
 #include "Utility/ByteStream.hpp"
 
@@ -680,8 +681,10 @@ class VirglShaderModule final : public IShaderModule {
 uint32_t virgl_vertex_format(VertexFormat format) {
   static const uint32_t kFirst[] = {virgl::kFormatR32Float, 64 /* R8_UNORM */, 74 /* R8_SNORM */, 177 /* R8_UINT */, 181 /* R8_SINT */, 48 /* R16_UNORM */, 56 /* R16_SNORM */,
                                     185 /* R16_UINT */, 189 /* R16_SINT */, 91 /* R16_FLOAT */, 193 /* R32_UINT */, 197 /* R32_SINT */};
-  if (format == VertexFormat::Bgra8Unorm) return virgl::kFormatB8G8R8A8Unorm;
+  if (format == VertexFormat::Bgra8Unorm || format == VertexFormat::Bgrx8Unorm) return virgl::kFormatB8G8R8A8Unorm;   // (B8G8R8X8: its w made 1 in the shader, VirglVertexPatch.hpp)
   if (format == VertexFormat::Rgb10A2Unorm) return virgl::kFormatR10G10B10A2Unorm;
+  if (format == VertexFormat::Rgb10A2Uint) return virgl::kFormatR32Uint;   // (the word, unpacked in the shader: OpenGL has no such integer attribute)
+  if (format == VertexFormat::Rg11B10Float) return 124;   // R11G11B10_FLOAT (GL_UNSIGNED_INT_10F_11F_11F_REV)
   return kFirst[static_cast<uint32_t>(vertex_format_type(format))] + vertex_format_components(format) - 1;
 }
 
@@ -726,9 +729,33 @@ class VirglPipeline final : public VirglPipelineBase {
     }
     if (desc.geometry_shader) capture_vertices_ = static_cast<const VirglShaderModule*>(desc.geometry_shader)->capture_vertices();
     else if (desc.hull_shader) capture_vertices_ = static_cast<const VirglShaderModule*>(desc.hull_shader)->tess_output() == TessOutput::Point ? 1 : static_cast<const VirglShaderModule*>(desc.hull_shader)->tess_output() == TessOutput::Line ? 2 : 3;
+    // Vertex formats the host does not read as Direct3D does (VirglVertexPatch.hpp): the vertex shader is a copy of the module's text that makes them right. It has the stream output
+    // declaration when the vertex shader is the last stage before the rasterizer.
+    {
+      virgl_patch::InputFix fixes[kMaxVertexAttributes] = {};
+      bool any = false;
+      for (uint32_t i = 0; i < desc.attribute_count; ++i) {
+        const VertexAttribute& a = desc.attributes[i];
+        if (a.location >= kMaxVertexAttributes) return;
+        if (a.format == VertexFormat::Rgb10A2Uint) fixes[a.location] = virgl_patch::InputFix::UnpackRgb10A2Uint, any = true;
+        else if (a.format == VertexFormat::Bgrx8Unorm) fixes[a.location] = virgl_patch::InputFix::ForceW1, any = true;
+      }
+      if (any) {
+        const auto* vertex = static_cast<const VirglShaderModule*>(desc.vertex_shader);
+        if (!vertex->tgsi()) return;
+        String text(device.gpu().allocator());
+        if (!virgl_patch::patch_vertex_inputs(StringView(vertex->tgsi()), ArrayView<const virgl_patch::InputFix>(fixes, kMaxVertexAttributes), &text)) return;
+        ShaderModuleDesc variant;
+        variant.stage = ShaderStage::Vertex;
+        variant.tgsi = text.c_str();
+        VirglShaderModule module(device, variant, desc.stream_output_count && !gs_ && !ds_ ? &desc : nullptr);
+        if (!module.valid()) return;
+        vs_ = own_vs_ = module.handle();
+      }
+    }
     // Stream output goes with the last vertex-processing shader on the host (the geometry shader, else the domain shader, else the vertex shader): a copy of it that has the declaration.
     if (desc.stream_output_count) {
-      if (!gs_ && !ds_) {
+      if (!gs_ && !ds_ && !own_vs_) {
         const auto* vertex = static_cast<const VirglShaderModule*>(desc.vertex_shader);
         if (!vertex->tgsi()) return;
         ShaderModuleDesc variant;
@@ -887,8 +914,10 @@ class VirglPipeline final : public VirglPipelineBase {
     cmd[n++] = 0;
 
     // Vertex elements. Element n is the vertex shader's input n on the host, so they are laid out by location (a location nothing feeds repeats the first attribute: the
-    // shader does not read it). The host keeps the instance divisor with a buffer binding, so every vertex buffer slot in use gets a binding for its per-vertex attributes and
-    // another for its per-instance ones (bindings_[], which the draw fills with the slots' buffers).
+    // shader does not read it). The host keeps the instance divisor with a buffer binding, and sets binding n's divisor from element n (glVertexBindingDivisor(n, ...) for
+    // each element n): so element n reads binding m, the first element with its slot and divisor, whose divisor element m set. Binding n is slot n's element's slot
+    // (bindings_[], which the draw fills with the slots' buffers), used or not. A step rate of 0 (every instance reads the draw's first instance) is the largest divisor:
+    // OpenGL's divisor 0 is per vertex.
     uint32_t by_location[kMaxVertexAttributes];
     uint32_t element_count = 0;
     for (uint32_t& a : by_location) a = kMaxVertexAttributes;
@@ -900,20 +929,23 @@ class VirglPipeline final : public VirglPipelineBase {
     }
     cmd[n++] = virgl::header(virgl::kCreateObject, virgl::kObjectVertexElements, element_count * 4 + 1);
     cmd[n++] = elements_;
+    auto divisor_of = [](const VertexAttribute& a) { return !a.per_instance ? 0u : a.step_rate ? a.step_rate : 0xFFFFFFFFu; };
+    auto attribute_at = [&](uint32_t location) -> const VertexAttribute& { return desc.attributes[by_location[location] != kMaxVertexAttributes ? by_location[location] : 0]; };
     for (uint32_t location = 0; location < element_count; ++location) {
-      const VertexAttribute& a = desc.attributes[by_location[location] != kMaxVertexAttributes ? by_location[location] : 0];
-      const uint8_t key = static_cast<uint8_t>(a.slot * 2 + (a.per_instance ? 1 : 0));
+      const VertexAttribute& a = attribute_at(location);
       uint32_t binding = 0;
-      while (binding < binding_count_ && bindings_[binding] != key) ++binding;
-      if (binding == binding_count_) bindings_[binding_count_++] = key;
+      while (binding < location && (attribute_at(binding).slot != a.slot || divisor_of(attribute_at(binding)) != divisor_of(a))) ++binding;
+      bindings_[location] = a.slot;
       cmd[n++] = a.offset;
-      cmd[n++] = a.per_instance ? 1 : 0;   // instance divisor
+      cmd[n++] = divisor_of(a);   // instance divisor
       cmd[n++] = binding;
       cmd[n++] = virgl_vertex_format(a.format);
     }
+    binding_count_ = element_count;
     ok_ = n <= sizeof cmd / sizeof cmd[0] && device.send_commands(cmd, n);
   }
   ~VirglPipeline() {
+    device_.destroy_object(own_vs_);
     device_.destroy_object(blend_);
     device_.destroy_object(dsa_);
     device_.destroy_object(rasterizer_);
@@ -927,7 +959,7 @@ class VirglPipeline final : public VirglPipelineBase {
   uint32_t elements() const { return elements_; }
   // The host's vertex buffer bindings: binding n is vertex buffer slot binding_slot(n), with the stride of that slot.
   uint32_t binding_count() const { return binding_count_; }
-  uint32_t binding_slot(uint32_t binding) const { return bindings_[binding] / 2; }
+  uint32_t binding_slot(uint32_t binding) const { return bindings_[binding]; }
   uint8_t stencil_reference() const { return stencil_reference_; }
   bool uses_blend_constant() const {
     if (!desc_.blend.custom) return false;
@@ -957,7 +989,8 @@ class VirglPipeline final : public VirglPipelineBase {
   uint8_t so_stream_of_buffer_[kMaxStreamOutputBuffers] = {};
   uint8_t stencil_reference_ = 0;
   uint32_t blend_ = 0, dsa_ = 0, rasterizer_ = 0, elements_ = 0;
-  uint8_t bindings_[kMaxVertexBuffers * 2] = {};   // slot * 2 + per_instance of each host vertex buffer binding
+  uint8_t bindings_[kMaxVertexAttributes] = {};   // the slot of each host vertex buffer binding
+  uint32_t own_vs_ = 0;   // the vertex shader made for this pipeline's vertex formats (0: none)
   uint32_t binding_count_ = 0;
   bool ok_ = false;
 };

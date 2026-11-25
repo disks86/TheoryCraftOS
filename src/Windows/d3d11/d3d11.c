@@ -1945,57 +1945,135 @@ static HRESULT STDMETHODCALLTYPE dev_CreateComputeShader(Dev *d, const void *cod
   return shader_make(d, code, bytes, &cs_vtbl, iids, (void **)out);
 }
 
-/* The floats a vertex element is for the pipeline (1 .. 4), and whether it has to be converted to them; 0 for a format that cannot be had. */
-static UINT element_floats(DXGI_FORMAT format, int *convert) {
-  *convert = 0;
-  switch (format) {
-    case DXGI_FORMAT_R32_FLOAT: return 1;
-    case DXGI_FORMAT_R32G32_FLOAT: return 2;
-    case DXGI_FORMAT_R32G32B32_FLOAT: return 3;
-    case DXGI_FORMAT_R32G32B32A32_FLOAT: return 4;
-    case DXGI_FORMAT_R8G8B8A8_UNORM: case DXGI_FORMAT_B8G8R8A8_UNORM: *convert = 1; return 4;
-    default: return 0;
+/* ---- input layouts ----------------------------------------------------------------------------------------------------------------------------------------------- */
+/* What a vertex element of a format is: its components, the bytes of each (a packed format's whole word: 4), and how they reach the shader (VK_* below); 0 components for
+ * a format that is not one a vertex buffer holds (D3D11_FORMAT_SUPPORT_IA_VERTEX_BUFFER: the 32, 16 and 8-bit FLOAT/UNORM/SNORM/UINT/SINT ones, R10G10B10A2_UNORM and
+ * _UINT, R11G11B10_FLOAT, B8G8R8A8_UNORM and B8G8R8X8_UNORM; not B5G6R5, B5G5R5A1 or B4G4R4A4, nor the sRGB, typeless, depth and block formats). */
+enum { VK_FLOAT, VK_HALF, VK_UNORM, VK_SNORM, VK_UINT, VK_SINT, VK_RGB10A2_UNORM, VK_RGB10A2_UINT, VK_RG11B10_FLOAT, VK_BGRA8_UNORM, VK_BGRX8_UNORM };
+static UINT vertex_element(DXGI_FORMAT f, UINT *size, UINT *kind) {
+#define VE(n, bytes, k) return (*size = (bytes), *kind = (k), (n))
+  switch (f) {
+    case DXGI_FORMAT_R32G32B32A32_FLOAT: VE(4, 4, VK_FLOAT); case DXGI_FORMAT_R32G32B32A32_UINT: VE(4, 4, VK_UINT); case DXGI_FORMAT_R32G32B32A32_SINT: VE(4, 4, VK_SINT);
+    case DXGI_FORMAT_R32G32B32_FLOAT: VE(3, 4, VK_FLOAT); case DXGI_FORMAT_R32G32B32_UINT: VE(3, 4, VK_UINT); case DXGI_FORMAT_R32G32B32_SINT: VE(3, 4, VK_SINT);
+    case DXGI_FORMAT_R32G32_FLOAT: VE(2, 4, VK_FLOAT); case DXGI_FORMAT_R32G32_UINT: VE(2, 4, VK_UINT); case DXGI_FORMAT_R32G32_SINT: VE(2, 4, VK_SINT);
+    case DXGI_FORMAT_R32_FLOAT: VE(1, 4, VK_FLOAT); case DXGI_FORMAT_R32_UINT: VE(1, 4, VK_UINT); case DXGI_FORMAT_R32_SINT: VE(1, 4, VK_SINT);
+    case DXGI_FORMAT_R16G16B16A16_FLOAT: VE(4, 2, VK_HALF); case DXGI_FORMAT_R16G16B16A16_UNORM: VE(4, 2, VK_UNORM); case DXGI_FORMAT_R16G16B16A16_SNORM: VE(4, 2, VK_SNORM);
+    case DXGI_FORMAT_R16G16B16A16_UINT: VE(4, 2, VK_UINT); case DXGI_FORMAT_R16G16B16A16_SINT: VE(4, 2, VK_SINT);
+    case DXGI_FORMAT_R16G16_FLOAT: VE(2, 2, VK_HALF); case DXGI_FORMAT_R16G16_UNORM: VE(2, 2, VK_UNORM); case DXGI_FORMAT_R16G16_SNORM: VE(2, 2, VK_SNORM);
+    case DXGI_FORMAT_R16G16_UINT: VE(2, 2, VK_UINT); case DXGI_FORMAT_R16G16_SINT: VE(2, 2, VK_SINT);
+    case DXGI_FORMAT_R16_FLOAT: VE(1, 2, VK_HALF); case DXGI_FORMAT_R16_UNORM: VE(1, 2, VK_UNORM); case DXGI_FORMAT_R16_SNORM: VE(1, 2, VK_SNORM);
+    case DXGI_FORMAT_R16_UINT: VE(1, 2, VK_UINT); case DXGI_FORMAT_R16_SINT: VE(1, 2, VK_SINT);
+    case DXGI_FORMAT_R8G8B8A8_UNORM: VE(4, 1, VK_UNORM); case DXGI_FORMAT_R8G8B8A8_SNORM: VE(4, 1, VK_SNORM); case DXGI_FORMAT_R8G8B8A8_UINT: VE(4, 1, VK_UINT);
+    case DXGI_FORMAT_R8G8B8A8_SINT: VE(4, 1, VK_SINT);
+    case DXGI_FORMAT_R8G8_UNORM: VE(2, 1, VK_UNORM); case DXGI_FORMAT_R8G8_SNORM: VE(2, 1, VK_SNORM); case DXGI_FORMAT_R8G8_UINT: VE(2, 1, VK_UINT); case DXGI_FORMAT_R8G8_SINT: VE(2, 1, VK_SINT);
+    case DXGI_FORMAT_R8_UNORM: VE(1, 1, VK_UNORM); case DXGI_FORMAT_R8_SNORM: VE(1, 1, VK_SNORM); case DXGI_FORMAT_R8_UINT: VE(1, 1, VK_UINT); case DXGI_FORMAT_R8_SINT: VE(1, 1, VK_SINT);
+    case DXGI_FORMAT_R10G10B10A2_UNORM: VE(4, 4, VK_RGB10A2_UNORM); case DXGI_FORMAT_R10G10B10A2_UINT: VE(4, 4, VK_RGB10A2_UINT);
+    case DXGI_FORMAT_R11G11B10_FLOAT: VE(3, 4, VK_RG11B10_FLOAT);
+    case DXGI_FORMAT_B8G8R8A8_UNORM: VE(4, 4, VK_BGRA8_UNORM); case DXGI_FORMAT_B8G8R8X8_UNORM: VE(3, 4, VK_BGRX8_UNORM);
+    default: *size = 0; *kind = 0; return 0;
   }
+#undef VE
 }
+/* The bytes an element of the format takes in the buffer (0: not a vertex format). */
 static UINT element_bytes(DXGI_FORMAT format) {
-  int convert;
-  const UINT floats = element_floats(format, &convert);
-  return convert ? 4 : floats * 4;
+  UINT size, kind;
+  const UINT n = vertex_element(format, &size, &kind);
+  return n && kind >= VK_RGB10A2_UNORM ? 4 : n * size;
 }
+static BOOL element_integer(DXGI_FORMAT format) {
+  UINT size, kind;
+  return vertex_element(format, &size, &kind) && (kind == VK_UINT || kind == VK_SINT || kind == VK_RGB10A2_UINT);
+}
+/* An element as the shader's input register: four 32-bit values, the bits of floats (normalised values in 0 .. 1 or -1 .. 1, the most negative one -1) or of integers;
+ * what the format has not is 0, 0, 0 and 1 (the integer 1 for an integer format). `p` has element_bytes(format) bytes. */
+static void element_decode(DXGI_FORMAT format, const BYTE *p, UINT32 out[4]) {
+  UINT size, kind;
+  const UINT n = vertex_element(format, &size, &kind);
+  FLOAT f[4] = {0.0f, 0.0f, 0.0f, 1.0f};
+  const BOOL integer = element_integer(format);
+  if (integer) { out[0] = out[1] = out[2] = 0; out[3] = 1; }
+  if (kind == VK_RGB10A2_UNORM || kind == VK_RGB10A2_UINT) {
+    const UINT32 v = load32(p), field[4] = {v & 1023u, (v >> 10) & 1023u, (v >> 20) & 1023u, v >> 30};
+    for (UINT k = 0; k < 4; ++k) {
+      if (integer) out[k] = field[k];
+      else f[k] = (FLOAT)field[k] / (k == 3 ? 3.0f : 1023.0f);
+    }
+  } else if (kind == VK_RG11B10_FLOAT) {
+    const UINT32 v = load32(p);
+    f[0] = small_float_to_float(v & 0x7FFu, 6); f[1] = small_float_to_float((v >> 11) & 0x7FFu, 6); f[2] = small_float_to_float(v >> 22, 5);
+  } else if (kind == VK_BGRA8_UNORM || kind == VK_BGRX8_UNORM) {
+    f[0] = p[2] / 255.0f; f[1] = p[1] / 255.0f; f[2] = p[0] / 255.0f;
+    if (kind == VK_BGRA8_UNORM) f[3] = p[3] / 255.0f;
+  } else {
+    for (UINT k = 0; k < n; ++k) {
+      const BYTE *c = p + k * size;
+      const UINT32 raw = size == 1 ? c[0] : size == 2 ? load16(c) : load32(c);
+      const INT32 wide = size == 1 ? (INT32)(INT8)raw : size == 2 ? (INT32)(INT16)raw : (INT32)raw;      /* (sign extended) */
+      switch (kind) {
+        case VK_FLOAT: memcpy(&f[k], &raw, 4); break;
+        case VK_HALF: f[k] = half_to_float((UINT16)raw); break;
+        case VK_UNORM: f[k] = (FLOAT)raw / (size == 1 ? 255.0f : 65535.0f); break;
+        case VK_SNORM: { const FLOAT top = size == 1 ? 127.0f : 32767.0f; f[k] = (FLOAT)wide / top; if (f[k] < -1.0f) f[k] = -1.0f; break; }
+        case VK_UINT: out[k] = raw; break;
+        case VK_SINT: out[k] = (UINT32)wide; break;
+      }
+    }
+  }
+  if (!integer) memcpy(out, f, 16);
+}
+
 static HRESULT STDMETHODCALLTYPE dev_CreateInputLayout(Dev *d, const D3D11_INPUT_ELEMENT_DESC *elements, UINT count, const void *code, SIZE_T bytes, ID3D11InputLayout **out) {
   (void)code; (void)bytes;
-  static const DXGI_FORMAT float_formats[5] = {0, DXGI_FORMAT_R32_FLOAT, DXGI_FORMAT_R32G32_FLOAT, DXGI_FORMAT_R32G32B32_FLOAT, DXGI_FORMAT_R32G32B32A32_FLOAT};
   if (out) *out = NULL;
   if ((!elements && count) || count > 16) return E_INVALIDARG;
+  /* What Direct3D 11 refuses: an element with no semantic name, an input slot past the last, a format no vertex has, a classification that is neither, a per-vertex
+   * element with a step rate, elements of one slot that differ in classification or step rate, two elements with the same semantic, an offset that is not a
+   * multiple of the element's size or of 4 if that is smaller. */
+  for (UINT i = 0; i < count; ++i) {
+    const D3D11_INPUT_ELEMENT_DESC *e = &elements[i];
+    const UINT size = element_bytes(e->Format), unit = size >= 4 ? 4 : size;
+    if (!e->SemanticName || e->InputSlot >= VERTEX_SLOTS || !size) return E_INVALIDARG;
+    if (e->InputSlotClass != D3D11_INPUT_PER_VERTEX_DATA && e->InputSlotClass != D3D11_INPUT_PER_INSTANCE_DATA) return E_INVALIDARG;
+    if (e->InputSlotClass == D3D11_INPUT_PER_VERTEX_DATA && e->InstanceDataStepRate != 0) return E_INVALIDARG;
+    if (e->AlignedByteOffset != D3D11_APPEND_ALIGNED_ELEMENT && e->AlignedByteOffset % unit) return E_INVALIDARG;
+    for (UINT k = 0; k < i; ++k) {
+      const D3D11_INPUT_ELEMENT_DESC *o = &elements[k];
+      if (o->InputSlot == e->InputSlot && (o->InputSlotClass != e->InputSlotClass || o->InstanceDataStepRate != e->InstanceDataStepRate)) return E_INVALIDARG;
+      if (o->SemanticIndex == e->SemanticIndex && !lstrcmpiA(o->SemanticName, e->SemanticName)) return E_INVALIDARG;
+    }
+  }
   Layout *l = child_new(sizeof *l, d, &layout_vtbl, g_layout_iids, child_destroy);
   if (!l) return E_OUTOFMEMORY;
   UINT next[VERTEX_SLOTS] = {0}, slot_needs[VERTEX_SLOTS] = {0};
   l->count = count;
   for (UINT i = 0; i < count; ++i) {
-    int convert;
-    const UINT slot = elements[i].InputSlot;
-    if (slot >= VERTEX_SLOTS || !elements[i].SemanticName || !element_floats(elements[i].Format, &convert)) { dx_Release(OBJ(l)); return E_INVALIDARG; }
+    const UINT slot = elements[i].InputSlot, size = element_bytes(elements[i].Format), unit = size >= 4 ? 4 : size;
     SIZE_T n = 0;
     while (elements[i].SemanticName[n] && n + 1 < sizeof l->names[i]) { l->names[i][n] = elements[i].SemanticName[n]; ++n; }
     memcpy(&l->elements[i], &elements[i], sizeof l->elements[i]);      /* (the two structures are the same) */
     l->elements[i].SemanticName = l->names[i];
     l->source_format[i] = elements[i].Format;
-    l->source_offset[i] = elements[i].AlignedByteOffset == D3D11_APPEND_ALIGNED_ELEMENT ? (next[slot] + 3u) & ~3u : elements[i].AlignedByteOffset;
-    next[slot] = l->source_offset[i] + element_bytes(elements[i].Format);
+    /* (an appended element starts at the next multiple of its size, of four bytes at most) */
+    l->source_offset[i] = elements[i].AlignedByteOffset == D3D11_APPEND_ALIGNED_ELEMENT ? (next[slot] + unit - 1) / unit * unit : elements[i].AlignedByteOffset;
+    next[slot] = l->source_offset[i] + size;
     l->elements[i].AlignedByteOffset = l->source_offset[i];
-    if (convert) slot_needs[slot] = 1;
+    /* (a format the Direct3D 12 device does not read is converted: see below) */
+    D3D12_FEATURE_DATA_FORMAT_SUPPORT support = {elements[i].Format, D3D12_FORMAT_SUPPORT1_NONE, D3D12_FORMAT_SUPPORT2_NONE};
+    if (FAILED(ID3D12Device_CheckFeatureSupport(d->d12, D3D12_FEATURE_FORMAT_SUPPORT, &support, sizeof support)) || !(support.Support1 & D3D12_FORMAT_SUPPORT1_IA_VERTEX_BUFFER))
+      slot_needs[slot] = 1;
   }
-  /* A slot with an element that is not floats is repacked: its elements one after the other, each as floats. */
+  /* A slot with an element of a format the device does not read is repacked: its elements one after the other, each as four 32-bit floats or integers (element_decode,
+   * vertex_source). */
   for (UINT slot = 0; slot < VERTEX_SLOTS; ++slot) {
     if (!slot_needs[slot]) continue;
     UINT offset = 0;
     for (UINT i = 0; i < count; ++i) {
-      int convert;
       if (l->elements[i].InputSlot != slot) continue;
-      const UINT floats = element_floats(l->source_format[i], &convert);
-      l->elements[i].Format = float_formats[floats];
+      UINT size, kind;
+      vertex_element(l->source_format[i], &size, &kind);
+      l->elements[i].Format = !element_integer(l->source_format[i]) ? DXGI_FORMAT_R32G32B32A32_FLOAT : kind == VK_SINT ? DXGI_FORMAT_R32G32B32A32_SINT : DXGI_FORMAT_R32G32B32A32_UINT;
       l->elements[i].AlignedByteOffset = offset;
-      offset += floats * 4;
+      offset += 16;
     }
     l->slot_converted[slot] = offset;
   }

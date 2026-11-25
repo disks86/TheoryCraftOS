@@ -204,14 +204,12 @@ static ID3D12Resource *vertex_source(Dev *d, Ctx *c, UINT slot, UINT *stride, UI
       const BYTE *in = source + *offset + (SIZE_T)v * *stride;
       for (UINT i = 0; i < l->count; ++i) {
         if (l->elements[i].InputSlot != slot) continue;
-        FLOAT *to = (FLOAT *)(out + (SIZE_T)v * out_stride + l->elements[i].AlignedByteOffset);
+        BYTE *to = out + (SIZE_T)v * out_stride + l->elements[i].AlignedByteOffset;
         const BYTE *from = in + l->source_offset[i];
-        int convert;
-        const UINT floats = element_floats(l->source_format[i], &convert);
-        if (l->source_offset[i] + (convert ? 4 : floats * 4) > *stride) continue;
-        if (!convert) memcpy(to, from, floats * 4);
-        else if (l->source_format[i] == DXGI_FORMAT_B8G8R8A8_UNORM) { to[0] = from[2] / 255.0f; to[1] = from[1] / 255.0f; to[2] = from[0] / 255.0f; to[3] = from[3] / 255.0f; }
-        else for (UINT k = 0; k < 4; ++k) to[k] = from[k] / 255.0f;
+        if (l->source_offset[i] + element_bytes(l->source_format[i]) > *stride) continue;      /* (an element beyond the stride: not read) */
+        UINT32 value[4];
+        element_decode(l->source_format[i], from, value);
+        memcpy(to, value, 16);
       }
     }
     ID3D12Resource_Unmap(b->converted, 0, NULL);

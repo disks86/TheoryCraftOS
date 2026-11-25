@@ -100,7 +100,6 @@ static HRESULT STDMETHODCALLTYPE dev_CheckFormatSupport(Dev *d, DXGI_FORMAT form
   return hr;
 }
 static HRESULT dev_check_format(Dev *d, DXGI_FORMAT format, UINT *support) {
-  int convert;
   if (!support) return E_INVALIDARG;
   *support = 0;
   const TexFormat *planar = tex_format(format);
@@ -149,7 +148,7 @@ static HRESULT dev_check_format(Dev *d, DXGI_FORMAT format, UINT *support) {
     if (format_is_typeless(format)) *support |= D3D11_FORMAT_SUPPORT_CAST_WITHIN_BIT_LAYOUT;
   }
   if (buffer_format_bytes(format)) *support |= D3D11_FORMAT_SUPPORT_BUFFER;
-  if (element_floats(format, &convert)) *support |= D3D11_FORMAT_SUPPORT_IA_VERTEX_BUFFER;
+  if (element_bytes(format)) *support |= D3D11_FORMAT_SUPPORT_IA_VERTEX_BUFFER;      /* (read by the device, or converted for it: dev_CreateInputLayout) */
   if (format == DXGI_FORMAT_R32_FLOAT || format == DXGI_FORMAT_R32G32_FLOAT || format == DXGI_FORMAT_R32G32B32_FLOAT || format == DXGI_FORMAT_R32G32B32A32_FLOAT)
     *support |= D3D11_FORMAT_SUPPORT_SO_BUFFER;
   if (format == DXGI_FORMAT_R16_UINT || format == DXGI_FORMAT_R32_UINT) *support |= D3D11_FORMAT_SUPPORT_IA_INDEX_BUFFER;

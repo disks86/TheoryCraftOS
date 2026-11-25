@@ -124,10 +124,15 @@ The kernel-mode driver is the D3DKMT layer, which Direct3D 9, 10, 11 and 12 all 
   - `kFeatureSystemInputs`: `VertexShaderFnEx` / `FragmentShaderFnEx` carry `SV_VertexID`, `SV_InstanceID`, `SV_Position` (pixel centre, depth, 1/w), `SV_IsFrontFace` and
     `SV_PrimitiveID`; the DXBC front end reads them from the declarations (`dcl_input_sgv` / `siv`), and a program that uses them needs the feature.
   - `kFeatureInstancing`: `draw(..., instance_count, first_instance)` and `VertexAttribute::per_instance` (the element numbered by the instance, in the same buffer at the same stride);
-    the command stream has `DrawInstanced` / `DrawIndexedInstanced`.
+    `VertexAttribute::step_rate` (Direct3D's `InstanceDataStepRate`, 1 when not said): instance n of a draw reads element `first_instance + n / step_rate`, with 0 always
+    `first_instance` (`instance_element`); a draw is refused when the last element an instance reads (the slot's smallest rate decides) is past its buffer.
+    The command stream has `DrawInstanced` / `DrawIndexedInstanced`.
   - `kFeatureLines`: `set_primitive_topology` for line lists and point lists, one pixel wide (a step per pixel along the longer axis, perspective-correct varyings); the stream's
     `Topology::LineList`, `LineStrip` (expanded to a list) and `PointList`.
-  The escape ABI's `CreatePipeline` takes the blend state, the depth comparison and the per-instance bits as optional trailing words.
+  The escape ABI's `CreatePipeline` takes the blend state, the depth comparison and the per-instance bits as optional trailing words. After the last of them (the four
+  floats of the constant blend colour) come the step rates: a count n (at most the attribute count and 16) and n words, word k the step rate of attribute k (a per-instance
+  one's: any number, 0 never stepping; a per-vertex one's must be 0, else `kInvalidParameter`). Attributes past n step by 1, and a request without the words is what it was.
+  d3d12.dll sends them (with the blend colour before them, whatever it is) when a per-instance element's rate is not 1.
 - **Checked against a real compiler:** `ps_texel` (Load, SampleLevel, GetDimensions, SV_Position, SV_IsFrontFace, SV_PrimitiveID) and `vs_ids` (SV_VertexID, SV_InstanceID with a
   per-instance input) from Wine's HLSL compiler run through the kernel on the software device with the expected pictures.
 - **Not done for Direct3D 10:** stream output and geometry shader features beyond the basics (see Geometry shaders below), `sample_b` / `sample_c` / derivatives, more than four vertex attributes, more than four varyings (and semantics
@@ -597,14 +602,20 @@ that ask for 11_0 get no device on them.
 
 What the device interface gained for it (each a `DeviceFeature`, so a device without it is refused or given the nearest thing, never handed something it would misread):
 
-- **Vertex formats** (`kFeatureVertexFormats`, `graphics::VertexFormat`): normalised and integer bytes and 16-bit numbers, half floats, 32-bit integers, `B8G8R8A8` and
-  `R10G10B10A2`. Normalised values reach the shader as floats, integers as integers. The CPU renderer converts as it reads a vertex (`read_attribute`); virgl names the
-  host's vertex element format. The pipeline escape's format word is the `VertexFormat`.
+- **Vertex formats** (`kFeatureVertexFormats`, `graphics::VertexFormat`): normalised and integer bytes and 16-bit numbers, half floats, 32-bit integers (0 .. 47: type * 4 +
+  components - 1), `Bgra8Unorm` = 48, `Rgb10A2Unorm` = 49, `Rgb10A2Uint` = 50 (the four fields as integers), `Rg11B10Float` = 51 (unsigned 11/11/10-bit floats, w 1) and
+  `Bgrx8Unorm` = 52 (the fourth byte not read, w 1); `kVertexFormatCount` = 53. Normalised values reach the shader as floats (the most negative signed value -1), integers as
+  integers (their bits in the register), missing components as 0, 0, 0, 1 (the integer 1). The CPU renderer and the Vega device convert as they read a vertex
+  (`read_vertex_attribute`, VertexFetch.hpp); virgl names the host's vertex element format, except for what OpenGL cannot fetch as Direct3D reads it: `Rgb10A2Uint` goes to the
+  host as the R32_UINT word and `Bgrx8Unorm` as B8G8R8A8, and the pipeline binds a copy of the vertex shader's TGSI that unpacks the fields or sets w to 1 in a temporary before
+  its first instruction (VirglVertexPatch.hpp). The pipeline escape's format word is the `VertexFormat`.
 - **Address modes** (`kFeatureAddressModes`): mirror, border and mirror once beside wrap and clamp, with one of three border colours (transparent black, opaque black,
   opaque white: what a static sampler can have). In the stream and in a descriptor the mode is the low byte of the address word and the border colour bits 8-9 of the
   word of U (`address_word`, DxgTypes.hpp). A device without the feature gets wrap for the mirrored mode and clamp for the others (`base_address_mode`).
-- **Vertex buffer slots and targets on virgl**: the host keeps the instance divisor with a buffer binding, so every slot in use has a binding for its per-vertex
-  attributes and one for its per-instance ones; the elements are laid out by the shader's input number.
+- **Vertex buffer slots and targets on virgl**: the host keeps the instance divisor with a buffer binding, and sets binding n's divisor from vertex element n
+  (`glVertexBindingDivisor(n, ...)` for every element n), so element n reads binding m, the first element with the same slot and divisor, whose divisor element m set; binding
+  n is bound to element n's slot whether it is read or not. The elements are laid out by the shader's input number. The divisor is the step rate; a step rate of 0 (every
+  instance reads the first instance's element) is the largest divisor, as OpenGL's divisor 0 is per vertex.
 
 Things the host taught: a buffer may have only one bind flag when it is made, though the buffer object can then be bound as anything (a buffer of several uses is made
 as a vertex buffer); an indexed draw's first index is ignored (the host draws from the index buffer's offset, so the first index is part of the offset); mip levels are

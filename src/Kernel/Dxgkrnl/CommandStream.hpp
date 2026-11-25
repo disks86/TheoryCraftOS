@@ -222,6 +222,7 @@ class CommandWriter {
   void end_pass() { packet(Op::EndPass, {}); }
   void bind_pipeline(Handle pipeline) { packet(Op::BindPipeline, {pipeline}); }
   void bind_vertex_buffer(uint32_t allocation, uint32_t offset = 0) { packet(Op::BindVertexBuffer, {allocation, offset}); }
+  void bind_vertex_buffer_slot(uint32_t slot, uint32_t allocation, uint32_t offset = 0) { packet(Op::BindVertexBuffer, {allocation, offset, slot}); }
   void bind_index_buffer(uint32_t allocation, graphics::IndexType type, uint32_t offset = 0) { packet(Op::BindIndexBuffer, {allocation, type == graphics::IndexType::Uint32 ? 1u : 0u, offset}); }
   void push_constants(ConstByteView data) {
     const uint32_t words = static_cast<uint32_t>((data.size() + 3) / 4);

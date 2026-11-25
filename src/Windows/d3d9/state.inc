@@ -24,6 +24,7 @@ static const D3DMATRIX g_identity = {{{1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0,
 /* The state of a new device (and of one that was reset). `depth`: it has a depth buffer of its own. */
 static void state_defaults(State *s, BOOL depth, UINT width, UINT height) {
   memset(s->rs, 0, sizeof s->rs);
+  for (UINT i = 0; i < STREAMS; ++i) s->stream[i].freq = 1;
   s->rs[D3DRS_ZENABLE] = depth ? D3DZB_TRUE : D3DZB_FALSE;
   s->rs[D3DRS_FILLMODE] = D3DFILL_SOLID;
   s->rs[D3DRS_SHADEMODE] = D3DSHADE_GOURAUD;
@@ -283,11 +284,19 @@ static HRESULT STDMETHODCALLTYPE dev_GetStreamSource(Dev *d, UINT stream, IDirec
   if (stride) *stride = d->state.stream[stream].stride;
   return D3D_OK;
 }
-static HRESULT STDMETHODCALLTYPE dev_SetStreamSourceFreq(Dev *d, UINT stream, UINT divider) { (void)d; (void)divider; return stream < STREAMS ? D3D_OK : D3DERR_INVALIDCALL; }
+/* A stream's frequency (instancing, draw.inc): D3DSTREAMSOURCE_INDEXEDDATA | n on stream 0 draws n instances of an indexed draw, the streams with that flag (or none)
+ * are per vertex, and those with D3DSTREAMSOURCE_INSTANCEDATA | n give instance i element i / n. A plain divider is kept and given back; vertex processing that is
+ * not in software takes no frequency for non-indexed data, so it changes no draw. What Direct3D 9 refuses: 0, both flags, the instance flag on stream 0. */
+static HRESULT STDMETHODCALLTYPE dev_SetStreamSourceFreq(Dev *d, UINT stream, UINT divider) {
+  if (stream >= STREAMS || divider == 0 || (divider & D3DSTREAMSOURCE_INDEXEDDATA && divider & D3DSTREAMSOURCE_INSTANCEDATA) ||
+      (stream == 0 && (divider & D3DSTREAMSOURCE_INSTANCEDATA)))
+    return D3DERR_INVALIDCALL;
+  d->state.stream[stream].freq = divider;
+  return D3D_OK;
+}
 static HRESULT STDMETHODCALLTYPE dev_GetStreamSourceFreq(Dev *d, UINT stream, UINT *divider) {
-  (void)d;
   if (stream >= STREAMS || !divider) return D3DERR_INVALIDCALL;
-  *divider = 1;
+  *divider = d->state.stream[stream].freq ? d->state.stream[stream].freq : 1;
   return D3D_OK;
 }
 static HRESULT STDMETHODCALLTYPE dev_SetIndices(Dev *d, IDirect3DIndexBuffer9 *buffer) {
