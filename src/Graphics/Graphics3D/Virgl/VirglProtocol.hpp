@@ -20,6 +20,7 @@
 // virgl_hw.h, which in turn follow Gallium's state model) that VirglDevice uses.
 #pragma once
 #include <stdint.h>
+#include "Graphics/GraphicsTypes.hpp"
 
 namespace graphics::virgl {
 
@@ -98,6 +99,53 @@ constexpr uint32_t kFormatDxt5Rgba = 108;
 constexpr uint32_t kFormatDxt1Srgba = 110;
 constexpr uint32_t kFormatDxt3Srgba = 111;
 constexpr uint32_t kFormatDxt5Srgba = 112;
+// The host's format of each graphics::Format numbered from 64 (virglrenderer's virgl_hw.h: Gallium's pipe_format numbers, whose memory layouts are Direct3D's; 0: none).
+constexpr uint32_t extra_format(Format f) {
+  switch (f) {
+    case Format::R8Unorm: return 64;
+    case Format::R8G8Unorm: return 65;
+    case Format::A8Unorm: return 10;
+    case Format::B5G6R5Unorm: return 7;
+    case Format::B5G5R5A1Unorm: return 5;
+    case Format::B4G4R4A4Unorm: return 6;
+    case Format::R8Snorm: return 74;
+    case Format::R8Uint: return 177;
+    case Format::R8Sint: return 181;
+    case Format::R8G8Snorm: return 75;
+    case Format::R8G8Uint: return 178;
+    case Format::R8G8Sint: return 182;
+    case Format::R8G8B8A8Snorm: return 77;
+    case Format::R8G8B8A8Sint: return 184;
+    case Format::R16Unorm: return 48;
+    case Format::R16Snorm: return 56;
+    case Format::R16Uint: return 185;
+    case Format::R16Sint: return 189;
+    case Format::R16Float: return 91;
+    case Format::R16G16Unorm: return 49;
+    case Format::R16G16Snorm: return 57;
+    case Format::R16G16Uint: return 186;
+    case Format::R16G16Sint: return 190;
+    case Format::R16G16Float: return 92;
+    case Format::R32G32Uint: return 194;
+    case Format::R32G32Sint: return 198;
+    case Format::R32G32Float: return 29;
+    case Format::R32G32B32Uint: return 195;
+    case Format::R32G32B32Sint: return 199;
+    case Format::R32G32B32Float: return 30;
+    case Format::R11G11B10Float: return 124;
+    case Format::R9G9B9E5Float: return 125;
+    case Format::R10G10B10A2Uint: return 253;
+    case Format::Bc4Unorm: return 113;   // (RGTC1)
+    case Format::Bc4Snorm: return 114;
+    case Format::Bc5Unorm: return 115;   // (RGTC2)
+    case Format::Bc5Snorm: return 116;
+    case Format::Bc6hSfloat: return 257;   // (BPTC_RGB_FLOAT)
+    case Format::Bc6hUfloat: return 258;   // (BPTC_RGB_UFLOAT)
+    case Format::Bc7Unorm: return 255;   // (BPTC_RGBA_UNORM)
+    case Format::Bc7Srgb: return 256;    // (BPTC_SRGBA)
+    default: return 0;
+  }
+}
 
 // Resource bind flags (VIRGL_BIND_*).
 constexpr uint32_t kBindDepthStencil = 1u << 0;

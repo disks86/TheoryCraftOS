@@ -213,8 +213,13 @@ static D3D_FEATURE_LEVEL dev_feature_level(const Dev *d) {
 /* Whether a format holds integers (no filtering, no blending). */
 static int format_integer(DXGI_FORMAT f) {
   const FormatInfo *i = format_info(f);
-  return i && (i->kernel == KF_RGBA32UINT || i->kernel == KF_RGBA32SINT || i->kernel == KF_RGBA16UINT || i->kernel == KF_RGBA16SINT || i->kernel == KF_RGBA8UINT || i->kernel == KF_R32UINT ||
-               i->kernel == KF_R32SINT || f == DXGI_FORMAT_R16G16_SINT);
+  if (!i) return 0;
+  switch (i->kernel) {
+    case KF_RGBA32UINT: case KF_RGBA32SINT: case KF_RGBA16UINT: case KF_RGBA16SINT: case KF_RGBA8UINT: case KF_R32UINT: case KF_R32SINT: case KF_R8UINT: case KF_R8SINT: case KF_R8G8UINT:
+    case KF_R8G8SINT: case KF_RGBA8SINT: case KF_R16UINT: case KF_R16SINT: case KF_R16G16UINT: case KF_R16G16SINT: case KF_R32G32UINT: case KF_R32G32SINT: case KF_R32G32B32UINT:
+    case KF_R32G32B32SINT: case KF_RGB10A2UINT: return 1;
+    default: return 0;
+  }
 }
 /* Unordered access to textures of the format (the kernel's storage images, DEV_FEATURE2_STORAGE_IMAGES): typed loads and stores of every format a texture's view can be
  * made of - the colour formats that are not sRGB or block-compressed, the narrow ones and the planes of the planar ones through mirrors (texture_uav) -, and the atomic
@@ -222,6 +227,7 @@ static int format_integer(DXGI_FORMAT f) {
 static void format_uav_support(const Dev *dev, DXGI_FORMAT format, D3D12_FORMAT_SUPPORT1 *s1, D3D12_FORMAT_SUPPORT2 *s2) {
   const FormatInfo *i = format_info(format);
   if (!(dev->caps.features2 & DEV_FEATURE2_STORAGE_IMAGES) || !i || !i->kernel || i->depth || i->compressed || i->kernel == KF_BGRA8_SRGB || i->kernel == KF_RGBA8_SRGB) return;
+  if (i->kernel >= KF_FIRST_EXTRA && !(dev_format_caps(dev, i->kernel) & KFC_STORAGE)) return;      /* (the formats numbered from 64: what the adapter's storage images take) */
   if (i->narrow && i->kernel != KF_A8B8G8R8 && i->kernel != KF_RGBA16) return;      /* (a mirror is of 8- or 16-bit RGBA: not of R16G16_SINT's image) */
   *s1 |= D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW;
   *s2 |= D3D12_FORMAT_SUPPORT2_UAV_TYPED_LOAD | D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE;
@@ -284,6 +290,21 @@ static HRESULT STDMETHODCALLTYPE dev_CheckFeatureSupport(Dev *This, D3D12_FEATUR
         if (f->Format == DXGI_FORMAT_AYUV) f->Support1 |= D3D12_FORMAT_SUPPORT1_RENDER_TARGET;
         /* (AYUV has mip levels; Y416 would - DXGI's tables give it them -, but the kernel's 16-bit images have one level; the others have none in DXGI's tables) */
         if (format_packed_yuv_mips(f->Format) && kernel_format_levels(i->kernel)) f->Support1 |= D3D12_FORMAT_SUPPORT1_MIP;
+      } else if (i && i->kernel >= KF_FIRST_EXTRA) {
+        /* (the formats numbered from 64: what the adapter says it does with them - KmtCaps::format_caps. Textures of every dimension (a 1D one is a 2D one a texel high, a cube
+         * six faces - of formats that are not 96-bit, which Direct3D does not give cubes); loaded, sampled where filtered, drawn into, blended, levels, tiled, the CPU's copies) */
+        const UINT kc = dev_format_caps(This, i->kernel);
+        if (kc & KFC_SAMPLED) {
+          f->Support1 = D3D12_FORMAT_SUPPORT1_TEXTURE1D | D3D12_FORMAT_SUPPORT1_TEXTURE2D | D3D12_FORMAT_SUPPORT1_TEXTURE3D | D3D12_FORMAT_SUPPORT1_SHADER_LOAD |
+                        D3D12_FORMAT_SUPPORT1_CAST_WITHIN_BIT_LAYOUT;
+          if (i->bytes != 12) f->Support1 |= D3D12_FORMAT_SUPPORT1_TEXTURECUBE;
+          if (kc & KFC_FILTERED) f->Support1 |= D3D12_FORMAT_SUPPORT1_SHADER_SAMPLE | D3D12_FORMAT_SUPPORT1_SHADER_GATHER;
+          if (kc & KFC_MIPMAPS) f->Support1 |= D3D12_FORMAT_SUPPORT1_MIP;
+          if (kc & KFC_RENDER_TARGET) f->Support1 |= D3D12_FORMAT_SUPPORT1_RENDER_TARGET;
+          if ((kc & KFC_RENDER_TARGET) && (kc & KFC_BLENDABLE)) f->Support1 |= D3D12_FORMAT_SUPPORT1_BLENDABLE;
+          if (kc & KFC_MULTISAMPLE) f->Support1 |= D3D12_FORMAT_SUPPORT1_MULTISAMPLE_RENDERTARGET | D3D12_FORMAT_SUPPORT1_MULTISAMPLE_RESOLVE;
+          if (format_tiled(i)) f->Support2 |= D3D12_FORMAT_SUPPORT2_TILED;
+        }
       } else if (i) {
         f->Support1 = D3D12_FORMAT_SUPPORT1_TEXTURE2D;
         /* (levels: the kernel's 8-bit and block-compressed images have them, its wider ones - 16 and 32-bit channels, 10-bit, integer - and depth buffers one) */
@@ -291,13 +312,18 @@ static HRESULT STDMETHODCALLTYPE dev_CheckFeatureSupport(Dev *This, D3D12_FEATUR
         if (format_tiled(i)) f->Support2 |= D3D12_FORMAT_SUPPORT2_TILED;      /* (the kernel's reserved textures: tile_layout) */
         if (i->depth) f->Support1 |= D3D12_FORMAT_SUPPORT1_DEPTH_STENCIL;
         else if (format_integer(f->Format)) f->Support1 |= D3D12_FORMAT_SUPPORT1_SHADER_LOAD | D3D12_FORMAT_SUPPORT1_RENDER_TARGET;      /* (integers: loaded, not filtered or blended) */
-        else f->Support1 |= D3D12_FORMAT_SUPPORT1_SHADER_SAMPLE | D3D12_FORMAT_SUPPORT1_RENDER_TARGET | D3D12_FORMAT_SUPPORT1_BLENDABLE;
+        else if (i->compressed) f->Support1 |= D3D12_FORMAT_SUPPORT1_SHADER_LOAD | D3D12_FORMAT_SUPPORT1_SHADER_SAMPLE;      /* (sampled only) */
+        else f->Support1 |= D3D12_FORMAT_SUPPORT1_SHADER_LOAD | D3D12_FORMAT_SUPPORT1_SHADER_SAMPLE | D3D12_FORMAT_SUPPORT1_RENDER_TARGET | D3D12_FORMAT_SUPPORT1_BLENDABLE;
         if (i->narrow || i->kernel == KF_A8R8G8B8 || i->kernel == KF_A8B8G8R8 || i->kernel == KF_X8R8G8B8 || i->kernel == KF_RGBA16 || i->kernel == KF_RGB10A2)
           f->Support1 |= D3D12_FORMAT_SUPPORT1_VIDEO_PROCESSOR_OUTPUT | D3D12_FORMAT_SUPPORT1_VIDEO_PROCESSOR_INPUT;      /* (the video processor's RGB) */
       } else if (format_bytes(f->Format)) {
         f->Support1 = D3D12_FORMAT_SUPPORT1_IA_VERTEX_BUFFER;
       }
       if (f->Format == DXGI_FORMAT_R16_UINT || f->Format == DXGI_FORMAT_R32_UINT) f->Support1 |= D3D12_FORMAT_SUPPORT1_IA_INDEX_BUFFER;
+      {
+        UINT vertex_bytes = 0;      /* (a vertex element format: pso.inc's, with the device's vertex formats for the ones other than 32-bit floats) */
+        if (vertex_format(f->Format, &vertex_bytes) >= 0 && (vertex_format(f->Format, &vertex_bytes) <= 3 || (This->caps.features & DEV_FEATURE_VERTEX_FORMATS))) f->Support1 |= D3D12_FORMAT_SUPPORT1_IA_VERTEX_BUFFER;
+      }
       format_uav_support(This, f->Format, &f->Support1, &f->Support2);
       return S_OK;
     }
@@ -305,7 +331,8 @@ static HRESULT STDMETHODCALLTYPE dev_CheckFeatureSupport(Dev *This, D3D12_FEATUR
       D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS *m = data;
       if (size != sizeof *m) return E_INVALIDARG;
       /* (one quality level - the standard sample pattern - for the counts the adapter has, on the formats a render target or depth buffer can have) */
-      m->NumQualityLevels = m->SampleCount == 1 || (m->SampleCount < 32 && ((This->caps.sample_counts >> m->SampleCount) & 1) && format_info(m->Format) && format_info(m->Format)->bytes == 4) ? 1 : 0;
+      m->NumQualityLevels = m->SampleCount == 1 || (m->SampleCount < 32 && ((This->caps.sample_counts >> m->SampleCount) & 1) && format_info(m->Format) && format_info(m->Format)->bytes == 4 &&
+                                                                                                   (format_info(m->Format)->kernel < KF_FIRST_EXTRA || (dev_format_caps(This, format_info(m->Format)->kernel) & KFC_MULTISAMPLE))) ? 1 : 0;
       return S_OK;
     }
     case D3D12_FEATURE_FORMAT_INFO: {

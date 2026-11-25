@@ -504,23 +504,44 @@ uint32_t VirtioGpu::submit(uint32_t context, ConstByteView commands, bool fence,
 }
 
 bool VirtioGpu::setup_3d() {
-  bool virgl = false;
-  for (uint32_t i = 0; i < capset_count_; ++i) {
-    const CapsetInfo& info = capset_infos_[i];
-    if (info.id == kCapsetVirgl || info.id == kCapsetVirgl2) {
-      virgl = true;
-      if (!virgl_bset_) {
-        // (version 1 of either set starts with virgl_caps_v1: max_version, four 64-byte format masks, then bset and glsl_level)
-        GetCapset request{header(kCmdGetCapset), info.id, 1};
-        RespCapset caps{};
+  // (the second virgl set when the host has it - its version 2 says more -, else the first)
+  const CapsetInfo* chosen = nullptr;
+  for (uint32_t i = 0; i < capset_count_; ++i)
+    if ((capset_infos_[i].id == kCapsetVirgl && !chosen) || capset_infos_[i].id == kCapsetVirgl2) chosen = &capset_infos_[i];
+  const bool virgl = chosen != nullptr;
+  if (chosen) {
+    const CapsetInfo& info = *chosen;
+    {
+      {
+        // (version 1 of either set starts with virgl_caps_v1: max_version, four 64-byte format masks - sampler, render, depth/stencil, vertex buffer -, then bset and glsl_level;
+        // version 2 of the second set is virgl_caps_v2, which goes on to max_texture_2d_size at byte 484)
+        const uint32_t version = info.id == kCapsetVirgl2 && info.max_version >= 2 ? 2 : 1;
+        GetCapset request{header(kCmdGetCapset), info.id, version};
+        struct {
+          ControlHeader header;
+          uint8_t data[1024];
+        } caps{};
         if (execute(as_bytes(request), ByteView(reinterpret_cast<uint8_t*>(&caps), sizeof(caps))) == kRespOkCapset) {
           ByteReader in{ConstByteView(caps.data, sizeof(caps.data))};
-          in.skip(4 + 4 * 64);
+          in.skip(4);
+          for (uint32_t& w : virgl_sampler_mask_) w = in.le32();
+          for (uint32_t& w : virgl_render_mask_) w = in.le32();
+          in.skip(2 * 64);
           virgl_bset_ = in.le32();
           virgl_glsl_level_ = in.le32();
           in.skip(4 * 4);   // (max_texture_array_layers, max_streamout_buffers, max_dual_source_render_targets, max_render_targets)
           virgl_max_samples_ = in.le32();
-          if (!in.ok()) virgl_bset_ = virgl_glsl_level_ = virgl_max_samples_ = 0;
+          if (version == 2) {
+            ByteReader v2{ConstByteView(caps.data, sizeof(caps.data))};
+            v2.skip(484);
+            virgl_max_texture_2d_ = v2.le32();
+            if (!v2.ok()) virgl_max_texture_2d_ = 0;
+          }
+          if (!in.ok()) {
+            virgl_bset_ = virgl_glsl_level_ = virgl_max_samples_ = virgl_max_texture_2d_ = 0;
+            for (uint32_t& w : virgl_sampler_mask_) w = 0;
+            for (uint32_t& w : virgl_render_mask_) w = 0;
+          }
         }
       }
     }

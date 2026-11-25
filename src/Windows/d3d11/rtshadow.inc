@@ -193,11 +193,24 @@ static BOOL texel_decode(DXGI_FORMAT f, const BYTE *in, FLOAT out[4]) {
       out[0] = (v & 1023u) / 1023.0f; out[1] = ((v >> 10) & 1023u) / 1023.0f; out[2] = ((v >> 20) & 1023u) / 1023.0f; out[3] = (v >> 30) / 3.0f;
       return TRUE;
     }
+    /* (the one- and two-channel 8-bit ones, alpha alone, and the 16-bit packed ones: the channels they have, the others 0 and alpha 1) */
+    case DXGI_FORMAT_R8_UNORM: case DXGI_FORMAT_R8_TYPELESS: out[0] = in[0] / 255.0f; out[1] = out[2] = 0.0f; out[3] = 1.0f; return TRUE;
+    case DXGI_FORMAT_R8G8_UNORM: case DXGI_FORMAT_R8G8_TYPELESS: out[0] = in[0] / 255.0f; out[1] = in[1] / 255.0f; out[2] = 0.0f; out[3] = 1.0f; return TRUE;
+    case DXGI_FORMAT_A8_UNORM: out[0] = out[1] = out[2] = 0.0f; out[3] = in[0] / 255.0f; return TRUE;
+    case DXGI_FORMAT_B5G6R5_UNORM: { const UINT v = load16(in); out[0] = (v >> 11) / 31.0f; out[1] = ((v >> 5) & 63u) / 63.0f; out[2] = (v & 31u) / 31.0f; out[3] = 1.0f; return TRUE; }
+    case DXGI_FORMAT_B5G5R5A1_UNORM: { const UINT v = load16(in); out[0] = ((v >> 10) & 31u) / 31.0f; out[1] = ((v >> 5) & 31u) / 31.0f; out[2] = (v & 31u) / 31.0f; out[3] = (FLOAT)(v >> 15); return TRUE; }
+    case DXGI_FORMAT_B4G4R4A4_UNORM: { const UINT v = load16(in); out[0] = ((v >> 8) & 15u) / 15.0f; out[1] = ((v >> 4) & 15u) / 15.0f; out[2] = (v & 15u) / 15.0f; out[3] = (v >> 12) / 15.0f; return TRUE; }
     default: return FALSE;
   }
 }
 static void texel_encode(DXGI_FORMAT f, const FLOAT in[4], BYTE *out) {
   switch (f) {
+    case DXGI_FORMAT_R8_UNORM: case DXGI_FORMAT_R8_TYPELESS: out[0] = (BYTE)unorm_of(in[0], 8); return;
+    case DXGI_FORMAT_R8G8_UNORM: case DXGI_FORMAT_R8G8_TYPELESS: out[0] = (BYTE)unorm_of(in[0], 8); out[1] = (BYTE)unorm_of(in[1], 8); return;
+    case DXGI_FORMAT_A8_UNORM: out[0] = (BYTE)unorm_of(in[3], 8); return;
+    case DXGI_FORMAT_B5G6R5_UNORM: store16(out, (UINT16)(unorm_of(in[2], 5) | unorm_of(in[1], 6) << 5 | unorm_of(in[0], 5) << 11)); return;
+    case DXGI_FORMAT_B5G5R5A1_UNORM: store16(out, (UINT16)(unorm_of(in[2], 5) | unorm_of(in[1], 5) << 5 | unorm_of(in[0], 5) << 10 | unorm_of(in[3], 1) << 15)); return;
+    case DXGI_FORMAT_B4G4R4A4_UNORM: store16(out, (UINT16)(unorm_of(in[2], 4) | unorm_of(in[1], 4) << 4 | unorm_of(in[0], 4) << 8 | unorm_of(in[3], 4) << 12)); return;
     case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB: case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB:
       for (UINT k = 0; k < 4; ++k) out[k] = (BYTE)unorm_of(k < 3 ? linear_to_srgb(in[k]) : in[k], 8);
       return;

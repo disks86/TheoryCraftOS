@@ -57,22 +57,71 @@ enum class Format : uint8_t {
   // 32-bit, one channel (kFeature2SingleChannelFormats): an unsigned or signed integer, or a float. Wide formats (the pixels travel as Vec4s: (r, 0, 0, 1), the 1 an integer one for the integer
   // formats); the integer ones are what atomic operations on storage images take.
   R32Uint, R32Sint, R32Float,
+  // The rest of the Direct3D 11 / 12 colour formats (numbered from 64, so that formats other changes append above stay where they are). DeviceFormatCaps / IGraphicsDevice::format_caps
+  // say what a device does with each.
+  // Packed into 32-bit pixels like B8G8R8A8Unorm (not wide: mip levels as the 8-bit formats have them): a device keeps them as 0xAARRGGBB with the channels the format does not have
+  // at 0 (alpha 255) and the channels it has rounded to its bits (Surface::encode); in memory they are their own size (texel_bytes).
+  R8Unorm = 64, R8G8Unorm, A8Unorm, B5G6R5Unorm, B5G5R5A1Unorm, B4G4R4A4Unorm,
+  // Wide (the pixels travel as Vec4s: WidePixels.hpp): one- and two-channel 8-, 16- and 32-bit formats and the signed 8-bit four-channel ones, the 96-bit ones, the packed floats and
+  // R10G10B10A2Uint. The channels a format does not have read as 0 and alpha as 1 (an integer 1 for the integer formats).
+  R8Snorm, R8Uint, R8Sint, R8G8Snorm, R8G8Uint, R8G8Sint, R8G8B8A8Snorm, R8G8B8A8Sint,
+  R16Unorm, R16Snorm, R16Uint, R16Sint, R16Float, R16G16Unorm, R16G16Snorm, R16G16Uint, R16G16Sint, R16G16Float,
+  R32G32Uint, R32G32Sint, R32G32Float, R32G32B32Uint, R32G32B32Sint, R32G32B32Float,
+  R11G11B10Float, R9G9B9E5Float, R10G10B10A2Uint,
+  // Block-compressed (Graphics/BlockCompression.hpp): BC4 (one channel, 8 bytes a block), BC5 (two), BC6H (half floats, unsigned and signed), BC7.
+  Bc4Unorm, Bc4Snorm, Bc5Unorm, Bc5Snorm, Bc6hUfloat, Bc6hSfloat, Bc7Unorm, Bc7Srgb,
 };
 
 constexpr bool is_float_format(Format f) { return f == Format::R16G16B16A16Float || f == Format::R32G32B32A32Float; }
 constexpr bool is_srgb_format(Format f) { return f == Format::B8G8R8A8Srgb || f == Format::R8G8B8A8Srgb; }
-constexpr bool is_integer_format(Format f) { return f == Format::R32G32B32A32Uint || f == Format::R32G32B32A32Sint || f == Format::R16G16B16A16Uint || f == Format::R16G16B16A16Sint || f == Format::R8G8B8A8Uint || f == Format::R32Uint || f == Format::R32Sint; }
+// The formats numbered from 64 (the packed 32-bit ones and the wide ones after them; not the block-compressed ones).
+constexpr bool is_packed32_format(Format f) { return f >= Format::R8Unorm && f <= Format::B4G4R4A4Unorm; }
+constexpr bool is_extra_wide_format(Format f) { return f >= Format::R8Snorm && f <= Format::R10G10B10A2Uint; }
+constexpr bool is_integer_format(Format f) {
+  switch (f) {
+    case Format::R32G32B32A32Uint: case Format::R32G32B32A32Sint: case Format::R16G16B16A16Uint: case Format::R16G16B16A16Sint: case Format::R8G8B8A8Uint: case Format::R32Uint: case Format::R32Sint:
+    case Format::R8Uint: case Format::R8Sint: case Format::R8G8Uint: case Format::R8G8Sint: case Format::R8G8B8A8Sint: case Format::R16Uint: case Format::R16Sint: case Format::R16G16Uint:
+    case Format::R16G16Sint: case Format::R32G32Uint: case Format::R32G32Sint: case Format::R32G32B32Uint: case Format::R32G32B32Sint: case Format::R10G10B10A2Uint: return true;
+    default: return false;
+  }
+}
+constexpr bool is_signed_integer_format(Format f) {
+  return f == Format::R32G32B32A32Sint || f == Format::R16G16B16A16Sint || f == Format::R32Sint || f == Format::R8Sint || f == Format::R8G8Sint || f == Format::R8G8B8A8Sint || f == Format::R16Sint ||
+         f == Format::R16G16Sint || f == Format::R32G32Sint || f == Format::R32G32B32Sint;
+}
 constexpr bool is_single_channel_format(Format f) { return f == Format::R32Uint || f == Format::R32Sint || f == Format::R32Float; }
-// Formats whose pixels do not fit a 32-bit word: they are read and written as Vec4s (read_pixels_float / write_pixels_float) and have one mip level.
-constexpr bool is_wide_format(Format f) { return is_float_format(f) || f == Format::R16G16B16A16Unorm || f == Format::R16G16B16A16Snorm || f == Format::R10G10B10A2Unorm || is_integer_format(f) || f == Format::R32Float; }
+// Formats whose pixels do not fit a 32-bit word of 0xAARRGGBB: they are read and written as Vec4s (read_pixels_float / write_pixels_float) and have one mip level.
+constexpr bool is_wide_format(Format f) {
+  return is_float_format(f) || f == Format::R16G16B16A16Unorm || f == Format::R16G16B16A16Snorm || f == Format::R10G10B10A2Unorm || is_integer_format(f) || f == Format::R32Float || is_extra_wide_format(f);
+}
+// The bytes of one pixel in memory (of the packed 32-bit formats: their own size, not the 32-bit word a device may keep them in; 0 for the block-compressed formats and Undefined).
 constexpr uint32_t bytes_per_pixel(Format f) {
   switch (f) {
     case Format::Undefined: return 0;
     case Format::R16G16B16A16Float: case Format::R16G16B16A16Unorm: case Format::R16G16B16A16Snorm: case Format::R16G16B16A16Uint: case Format::R16G16B16A16Sint: return 8;
     case Format::R32G32B32A32Float: case Format::R32G32B32A32Uint: case Format::R32G32B32A32Sint: return 16;
+    case Format::R8Unorm: case Format::A8Unorm: case Format::R8Snorm: case Format::R8Uint: case Format::R8Sint: return 1;
+    case Format::R8G8Unorm: case Format::B5G6R5Unorm: case Format::B5G5R5A1Unorm: case Format::B4G4R4A4Unorm: case Format::R8G8Snorm: case Format::R8G8Uint: case Format::R8G8Sint:
+    case Format::R16Unorm: case Format::R16Snorm: case Format::R16Uint: case Format::R16Sint: case Format::R16Float: return 2;
+    case Format::R32G32Uint: case Format::R32G32Sint: case Format::R32G32Float: return 8;
+    case Format::R32G32B32Uint: case Format::R32G32B32Sint: case Format::R32G32B32Float: return 12;
+    case Format::Bc1Unorm: case Format::Bc2Unorm: case Format::Bc3Unorm: case Format::Bc1Srgb: case Format::Bc2Srgb: case Format::Bc3Srgb: case Format::Bc4Unorm: case Format::Bc4Snorm:
+    case Format::Bc5Unorm: case Format::Bc5Snorm: case Format::Bc6hUfloat: case Format::Bc6hSfloat: case Format::Bc7Unorm: case Format::Bc7Srgb: return 4;   // (as before: callers ask the block size)
     default: return 4;
   }
 }
+
+// What a device does with images of a format (IGraphicsDevice::format_caps). The kernel's adapters hand the same bits to user mode for each of their allocation formats.
+enum FormatCap : uint32_t {
+  kFormatSampled = 1u << 0,       // a texture shaders read (sample or load)
+  kFormatFiltered = 1u << 1,      // ... with linear filtering
+  kFormatRenderTarget = 1u << 2,  // a colour attachment
+  kFormatBlendable = 1u << 3,     // ... that blends
+  kFormatStorage = 1u << 4,       // a storage image (typed loads and stores)
+  kFormatMipmaps = 1u << 5,       // images of more than one level
+  kFormatMultisample = 1u << 6,   // multisampled attachments
+  kFormatNative = 1u << 7,        // (block-compressed formats) sampled as blocks: IImage::write_compressed; without it the memory manager decodes them (BlockCompression.hpp decoded_format)
+};
 
 // IEEE half floats (1 sign, 5 exponent, 10 fraction bits) to and from float; to_half rounds to nearest even, saturates to infinity, and keeps NaN.
 inline float half_to_float(uint16_t h) {
@@ -213,6 +262,53 @@ inline uint32_t pack_color(Vec4 c) {
          to_unorm8(c.z);
 }
 
+// The packed 32-bit formats (is_packed32_format) as 0xAARRGGBB words, and in memory (little endian, their own size). A channel of n bits is expanded to 8 by rounding (v * 255 / max) and
+// narrowed by rounding back, which gives the same n-bit value again; the channels a format does not have are 0 (alpha 255; A8Unorm has alpha alone).
+namespace packed_detail {
+constexpr uint32_t expand(uint32_t v, uint32_t max) { return (v * 255u + max / 2) / max; }
+constexpr uint32_t narrow(uint32_t c, uint32_t max) { return (c * max + 127u) / 255u; }
+constexpr uint32_t argb(uint32_t a, uint32_t r, uint32_t g, uint32_t b) { return a << 24 | r << 16 | g << 8 | b; }
+}  // namespace packed_detail
+// The texel bits of a packed 32-bit format of a colour (0xAARRGGBB), and back.
+constexpr uint32_t packed32_from_argb(Format f, uint32_t c) {
+  using namespace packed_detail;
+  const uint32_t a = c >> 24, r = (c >> 16) & 0xFF, g = (c >> 8) & 0xFF, b = c & 0xFF;
+  switch (f) {
+    case Format::R8Unorm: return r;
+    case Format::R8G8Unorm: return r | g << 8;
+    case Format::A8Unorm: return a;
+    case Format::B5G6R5Unorm: return narrow(b, 31) | narrow(g, 63) << 5 | narrow(r, 31) << 11;
+    case Format::B5G5R5A1Unorm: return narrow(b, 31) | narrow(g, 31) << 5 | narrow(r, 31) << 10 | narrow(a, 1) << 15;
+    case Format::B4G4R4A4Unorm: return narrow(b, 15) | narrow(g, 15) << 4 | narrow(r, 15) << 8 | narrow(a, 15) << 12;
+    default: return c;
+  }
+}
+constexpr uint32_t packed32_to_argb(Format f, uint32_t v) {
+  using namespace packed_detail;
+  switch (f) {
+    case Format::R8Unorm: return argb(255, v & 0xFF, 0, 0);
+    case Format::R8G8Unorm: return argb(255, v & 0xFF, (v >> 8) & 0xFF, 0);
+    case Format::A8Unorm: return argb(v & 0xFF, 0, 0, 0);
+    case Format::B5G6R5Unorm: return argb(255, expand((v >> 11) & 31, 31), expand((v >> 5) & 63, 63), expand(v & 31, 31));
+    case Format::B5G5R5A1Unorm: return argb(((v >> 15) & 1) ? 255 : 0, expand((v >> 10) & 31, 31), expand((v >> 5) & 31, 31), expand(v & 31, 31));
+    case Format::B4G4R4A4Unorm: return argb(expand((v >> 12) & 15, 15), expand((v >> 8) & 15, 15), expand((v >> 4) & 15, 15), expand(v & 15, 15));
+    default: return v;
+  }
+}
+// What an image of the format keeps of a colour.
+constexpr uint32_t quantize_packed32(Format f, uint32_t argb) { return is_packed32_format(f) ? packed32_to_argb(f, packed32_from_argb(f, argb)) : argb; }
+// The colour a pixel of a packed 32-bit format kept as 0xAARRGGBB (quantize_packed32) means, exactly: its n-bit codes over 2^n - 1 (the 8-bit word is only near that for 5, 6 and 4 bits).
+inline void packed32_to_floats(Format f, uint32_t argb, float out[4]) {
+  const uint32_t v = packed32_from_argb(f, argb);
+  auto ch = [](uint32_t code, uint32_t max) { return static_cast<float>(code) / static_cast<float>(max); };
+  switch (f) {
+    case Format::B5G6R5Unorm: out[0] = ch((v >> 11) & 31, 31), out[1] = ch((v >> 5) & 63, 63), out[2] = ch(v & 31, 31), out[3] = 1.0f; return;
+    case Format::B5G5R5A1Unorm: out[0] = ch((v >> 10) & 31, 31), out[1] = ch((v >> 5) & 31, 31), out[2] = ch(v & 31, 31), out[3] = static_cast<float>((v >> 15) & 1); return;
+    case Format::B4G4R4A4Unorm: out[0] = ch((v >> 8) & 15, 15), out[1] = ch((v >> 4) & 15, 15), out[2] = ch(v & 15, 15), out[3] = ch((v >> 12) & 15, 15); return;
+    default: out[0] = ch((argb >> 16) & 0xFF, 255), out[1] = ch((argb >> 8) & 0xFF, 255), out[2] = ch(argb & 0xFF, 255), out[3] = ch(argb >> 24, 255); return;
+  }
+}
+
 // A CPU-visible 32-bit pixel buffer. Callers always hand colors over as
 // 0xAARRGGBB; encode()/decode() convert to and from the memory layout the
 // format asks for (B8G8R8A8 stores 0xAARRGGBB little-endian as is, R8G8B8A8
@@ -227,12 +323,13 @@ struct Surface {
   bool valid() const { return width && height && pitch >= width && (pixels.size() >= uint64_t{pitch} * height || floats.size() >= uint64_t{pitch} * height); }
   Vec4* float_row(uint32_t y) const { return floats.data() + uint64_t{y} * pitch; }
   uint32_t* row(uint32_t y) const { return pixels.data() + uint64_t{y} * pitch; }
-  // 0xAARRGGBB <-> storage.
+  // 0xAARRGGBB <-> storage. The packed 32-bit formats are kept as 0xAARRGGBB of what the format holds of the colour (quantize_packed32).
   uint32_t encode(uint32_t argb) const {
+    if (is_packed32_format(format)) return quantize_packed32(format, argb);
     if (format != Format::R8G8B8A8Unorm && format != Format::R8G8B8A8Srgb) return argb;
     return (argb & 0xFF00FF00u) | ((argb & 0xFF) << 16) | ((argb >> 16) & 0xFF);
   }
-  uint32_t decode(uint32_t stored) const { return encode(stored); }  // the swap is its own inverse
+  uint32_t decode(uint32_t stored) const { return is_packed32_format(format) ? stored : encode(stored); }  // the swap is its own inverse
 };
 
 }  // namespace graphics

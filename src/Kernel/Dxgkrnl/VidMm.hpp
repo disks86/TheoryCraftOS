@@ -144,6 +144,9 @@ class VidMm {
   VidMm& operator=(const VidMm&) = delete;
 
   graphics::IGraphicsDevice& device() { return device_; }
+  // What allocations of a format numbered from 64 may be (graphics::FormatCap bits), and the largest width and height of a texture of this device.
+  uint32_t format_caps(Format f) const;
+  uint32_t max_image_dimension() const;
   allocators::IAllocator& allocator() { return allocator_; }
   uint64_t budget() const { return budget_; }
   uint64_t resident_bytes() const { return resident_bytes_; }
@@ -206,6 +209,9 @@ class VidMm {
   void forget(Allocation& a);   // called by ~Allocation
   bool upload(Allocation& a);
   bool upload_compressed(Allocation& a);   // (the part of upload for a block-compressed texture)
+  bool upload_packed32(Allocation& a);
+  bool read_back_packed32(Allocation& a);
+  bool native_compressed(Format f) const;   // (a block-compressed format the device samples as blocks)
   void gather_tiles(Allocation& a);
   void scatter_tiles(Allocation& a);
   void release_device_object(Allocation& a);

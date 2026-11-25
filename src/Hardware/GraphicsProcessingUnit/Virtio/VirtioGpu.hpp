@@ -91,6 +91,11 @@ class VirtioGpu : public FramebufferGpu, public IMonitorSource {
   // OpenGL 4.3 / GLSL 4.30; a host below that (or one that did not say) gets none. (The capability bits `bset` were read as well, but their numbering is not relied on.)
   // Most samples per pixel the host's multisampled images have (0 when it did not say).
   uint32_t virgl_max_samples() const { return has_3d_ ? virgl_max_samples_ : 0; }
+  // Whether the host samples / draws into images of a virgl format (virgl_caps_v1's sampler and render masks; false for every format when the set could not be read), and the largest
+  // width and height of its 2D images (virgl_caps_v2's max_texture_2d_size; 0 when the host did not say).
+  bool virgl_format_sampled(uint32_t format) const { return has_3d_ && format < 512 && ((virgl_sampler_mask_[format / 32] >> (format % 32)) & 1); }
+  bool virgl_format_renderable(uint32_t format) const { return has_3d_ && format < 512 && ((virgl_render_mask_[format / 32] >> (format % 32)) & 1); }
+  uint32_t virgl_max_texture_2d() const { return has_3d_ ? virgl_max_texture_2d_ : 0; }
   // Geometry shaders are core in OpenGL 3.2 / GLSL 1.50.
   // Tessellation is core in OpenGL 4.0 / GLSL 4.00.
   bool virgl_has_tessellation() const { return has_3d_ && virgl_glsl_level_ >= 400; }
@@ -270,7 +275,8 @@ class VirtioGpu : public FramebufferGpu, public IMonitorSource {
   void read_capsets();
 
   bool has_3d_ = false;
-  uint32_t virgl_bset_ = 0, virgl_glsl_level_ = 0, virgl_max_samples_ = 0;
+  uint32_t virgl_bset_ = 0, virgl_glsl_level_ = 0, virgl_max_samples_ = 0, virgl_max_texture_2d_ = 0;
+  uint32_t virgl_sampler_mask_[16] = {}, virgl_render_mask_[16] = {};
   uint32_t next_resource_ = 1;
   uint64_t resource_bytes_ = 0;   // live 3D resources, see add_resource_bytes()
   uint32_t screen_resource_ = 0;  // the 2D framebuffer resource

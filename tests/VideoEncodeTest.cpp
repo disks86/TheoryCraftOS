@@ -862,6 +862,15 @@ static void test_kernel_side() {
   CHECK(mx == 8 && my == 4 && img[6] == 1);
   CHECK(!dxgk::resolve_motion_vectors(ConstByteView(mvheap.data(), mvheap.size()), 64, 32, {ByteView(img.data(), img.size()), 4 * 8, 4, 2}, 1, 0));   // (does not fit at x 1)
   CHECK(!dxgk::resolve_motion_vectors(ConstByteView(junk.data(), junk.size()), 64, 32, {ByteView(img.data(), img.size()), 4 * 8, 4, 2}, 0, 0));
+  {
+    // (into an R16G16Sint image: the vector alone, 4 bytes a pixel, as the 8-byte one has it)
+    std::vector<uint8_t> narrow(4 * 2 * 4, 0xEE);
+    CHECK(dxgk::resolve_motion_vectors(ConstByteView(mvheap.data(), mvheap.size()), 64, 32, {ByteView(narrow.data(), narrow.size()), 4 * 4, 4, 2}, 0, 0, 4));
+    bool same = true;
+    for (uint32_t i = 0; i < 8; ++i) same = same && narrow[i * 4] == img[i * 8] && narrow[i * 4 + 1] == img[i * 8 + 1] && narrow[i * 4 + 2] == img[i * 8 + 2] && narrow[i * 4 + 3] == img[i * 8 + 3];
+    CHECK(same);
+    CHECK(!dxgk::resolve_motion_vectors(ConstByteView(mvheap.data(), mvheap.size()), 64, 32, {ByteView(narrow.data(), narrow.size()), 4 * 4, 4, 2}, 0, 0, 3));
+  }
   CHECK(!dxgk::run_motion_estimation(g_alloc, c, r, 64, 32, 16, {}, ByteView(mvheap.data(), 20)));
 }
 

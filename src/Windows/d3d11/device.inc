@@ -73,6 +73,7 @@ static BOOL format_is_typeless(DXGI_FORMAT f) {
     case DXGI_FORMAT_R32G32B32A32_TYPELESS: case DXGI_FORMAT_R32G32B32_TYPELESS: case DXGI_FORMAT_R16G16B16A16_TYPELESS: case DXGI_FORMAT_R32G32_TYPELESS: case DXGI_FORMAT_R32G8X24_TYPELESS:
     case DXGI_FORMAT_R10G10B10A2_TYPELESS: case DXGI_FORMAT_R8G8B8A8_TYPELESS: case DXGI_FORMAT_R16G16_TYPELESS: case DXGI_FORMAT_R32_TYPELESS: case DXGI_FORMAT_R24G8_TYPELESS:
     case DXGI_FORMAT_R8G8_TYPELESS: case DXGI_FORMAT_R16_TYPELESS: case DXGI_FORMAT_R8_TYPELESS: case DXGI_FORMAT_BC1_TYPELESS: case DXGI_FORMAT_BC2_TYPELESS: case DXGI_FORMAT_BC3_TYPELESS:
+    case DXGI_FORMAT_BC4_TYPELESS: case DXGI_FORMAT_BC5_TYPELESS: case DXGI_FORMAT_BC6H_TYPELESS: case DXGI_FORMAT_BC7_TYPELESS:
     case DXGI_FORMAT_B8G8R8A8_TYPELESS: case DXGI_FORMAT_B8G8R8X8_TYPELESS: return TRUE;
     default: return FALSE;
   }
@@ -123,7 +124,23 @@ static HRESULT dev_check_format(Dev *d, DXGI_FORMAT format, UINT *support) {
     return S_OK;
   }
   const TexFormat *colour = tex_format_for(format, 0), *depth = tex_format_for(format, D3D11_BIND_DEPTH_STENCIL);
-  if (colour) {
+  if (colour && (colour->flags & FMT_EXTRA)) {
+    /* (a format whose textures are what the adapter makes of them: Direct3D 12's answer - its bits are Direct3D 11's -; the CPU reaches every texture; a typeless format is the
+     * textures and the casts alone; GenerateMips where the format is drawn into, filtered and has levels, and the shadow copies of rtshadow.inc can read it) */
+    D3D12_FEATURE_DATA_FORMAT_SUPPORT s12 = {format, D3D12_FORMAT_SUPPORT1_NONE, D3D12_FORMAT_SUPPORT2_NONE};
+    if (SUCCEEDED(ID3D12Device_CheckFeatureSupport(d->d12, D3D12_FEATURE_FORMAT_SUPPORT, &s12, sizeof s12)) && s12.Support1) {
+      const UINT textures = D3D11_FORMAT_SUPPORT_TEXTURE1D | D3D11_FORMAT_SUPPORT_TEXTURE2D | D3D11_FORMAT_SUPPORT_TEXTURE3D | D3D11_FORMAT_SUPPORT_TEXTURECUBE | D3D11_FORMAT_SUPPORT_MIP;
+      const UINT uses = D3D11_FORMAT_SUPPORT_SHADER_LOAD | D3D11_FORMAT_SUPPORT_SHADER_SAMPLE | D3D11_FORMAT_SUPPORT_SHADER_GATHER | D3D11_FORMAT_SUPPORT_RENDER_TARGET |
+                        D3D11_FORMAT_SUPPORT_BLENDABLE | D3D11_FORMAT_SUPPORT_MULTISAMPLE_RENDERTARGET | D3D11_FORMAT_SUPPORT_MULTISAMPLE_RESOLVE;
+      *support |= s12.Support1 & (textures | (format_is_typeless(format) ? D3D11_FORMAT_SUPPORT_RENDER_TARGET : uses));
+      if (*support & textures) *support |= D3D11_FORMAT_SUPPORT_CPU_LOCKABLE;
+      if (format_is_typeless(format)) *support |= D3D11_FORMAT_SUPPORT_CAST_WITHIN_BIT_LAYOUT;
+      FLOAT probe[4];
+      const BYTE zero[16] = {0};
+      if ((*support & D3D11_FORMAT_SUPPORT_RENDER_TARGET) && (*support & D3D11_FORMAT_SUPPORT_SHADER_SAMPLE) && (*support & D3D11_FORMAT_SUPPORT_MIP) && texel_decode(colour->stored, zero, probe))
+        *support |= D3D11_FORMAT_SUPPORT_MIP_AUTOGEN;
+    }
+  } else if (colour) {
     const BOOL layered = colour->stored_bpp == 4 || (colour->flags & FMT_BLOCK);      /* (the kernel's volumes, arrays and cubes: 32-bit texels or blocks) */
     *support |= D3D11_FORMAT_SUPPORT_TEXTURE1D | D3D11_FORMAT_SUPPORT_TEXTURE2D | D3D11_FORMAT_SUPPORT_MIP | D3D11_FORMAT_SUPPORT_CPU_LOCKABLE;
     if (layered) *support |= D3D11_FORMAT_SUPPORT_TEXTURE3D | D3D11_FORMAT_SUPPORT_TEXTURECUBE;

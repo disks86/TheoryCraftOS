@@ -2007,6 +2007,66 @@ static void test_formats(void) {
   ID3D11Device_CheckFormatSupport(g_device, DXGI_FORMAT_R16G16_FLOAT, &support);
   check((support & D3D11_FORMAT_SUPPORT_RENDER_TARGET) && (support & D3D11_FORMAT_SUPPORT_SHADER_SAMPLE) && (support & D3D11_FORMAT_SUPPORT_BLENDABLE),
         "CheckFormatSupport of R16G16_FLOAT: a render target, sampled, blended");
+
+  /* The formats kept as they are (Direct3D 12 has each with its own channels): a texture of each written with its own texels and sampled (ps_tex: red times 0.1), where the
+   * device says it samples it; R9G9B9E5 is never a render target, the 96-bit formats never unordered access, and a texture 16384 wide can be made where the device has them */
+  static const struct { DXGI_FORMAT f; UINT bytes; BYTE texel[8]; float red; } sampled[] = {
+      {DXGI_FORMAT_BC4_UNORM, 8, {200, 200, 0, 0, 0, 0, 0, 0}, 200.0f / 255.0f}, {DXGI_FORMAT_R8_SNORM, 1, {64}, 64.0f / 127.0f}, {DXGI_FORMAT_R16_FLOAT, 2, {0x00, 0x3A}, 0.75f},
+      {DXGI_FORMAT_B5G6R5_UNORM, 2, {0x00, 0xF8}, 1.0f}, {DXGI_FORMAT_R11G11B10_FLOAT, 4, {0x80, 0x03, 0, 0}, 0.5f}, {DXGI_FORMAT_R32G32_FLOAT, 8, {0, 0, 0x40, 0x3F}, 0.75f},
+      {DXGI_FORMAT_BC7_UNORM, 16, {0x40, 0, 0, 0, 0, 0, 0, 0}, 0.0f}};      /* (BC7: made, not drawn - d3d12test reads its texels) */
+  for (UINT i = 0; i < sizeof sampled / sizeof sampled[0]; ++i) {
+    support = 0;
+    ID3D11Device_CheckFormatSupport(g_device, sampled[i].f, &support);
+    const int block = sampled[i].f == DXGI_FORMAT_BC4_UNORM || sampled[i].f == DXGI_FORMAT_BC7_UNORM;
+    BYTE data[4 * 16];
+    memset(data, 0, sizeof data);
+    for (UINT k = 0; k < (block ? 1u : 4u); ++k) memcpy(data + k * sampled[i].bytes, sampled[i].texel, sampled[i].bytes < 8 ? sampled[i].bytes : 8);
+    D3D11_TEXTURE2D_DESC td = {block ? 4u : 2u, block ? 4u : 2u, 1, 1, sampled[i].f, {1, 0}, D3D11_USAGE_DEFAULT, D3D11_BIND_SHADER_RESOURCE, 0, 0};
+    D3D11_SUBRESOURCE_DATA init = {data, block ? sampled[i].bytes : 2 * sampled[i].bytes, 0};
+    ID3D11Texture2D *tex = NULL;
+    ID3D11ShaderResourceView *srv = NULL;
+    const HRESULT made = ID3D11Device_CreateTexture2D(g_device, &td, &init, &tex);
+    char what[160];
+    snprintf(what, sizeof what, "format %u: a texture can be made exactly when CheckFormatSupport says it can be sampled (%08x)", sampled[i].f, support);
+    check(SUCCEEDED(made) == ((support & D3D11_FORMAT_SUPPORT_SHADER_SAMPLE) != 0), what);
+    if (tex) ID3D11Device_CreateShaderResourceView(g_device, (ID3D11Resource *)tex, NULL, &srv);
+    if (srv && sampled[i].f != DXGI_FORMAT_BC7_UNORM) {
+      ID3D11SamplerState *point = point_sampler();
+      ID3D11Buffer *tri = triangle(0.5f, 0.1f, 0.1f, 1.0f);
+      begin(NULL);
+      clear(0, 0, 0);
+      bind_floats(tri);
+      ID3D11DeviceContext_PSSetShader(g_context, g_ps_tex, NULL, 0);
+      ID3D11DeviceContext_PSSetShaderResources(g_context, 0, 1, &srv);
+      ID3D11DeviceContext_PSSetSamplers(g_context, 0, 1, &point);
+      ID3D11DeviceContext_Draw(g_context, 3, 0);
+      read_target();
+      const UINT32 px = pixel(32, 32);
+      const int want = (int)(sampled[i].red * 0.1f * 255.0f + 0.5f);
+      snprintf(what, sizeof what, "format %u sampled: red %u (about %d), green and blue 0", sampled[i].f, red(px), want);
+      check((int)red(px) >= want - 2 && (int)red(px) <= want + 2 && green(px) == 0 && blue(px) == 0, what);
+      ID3D11ShaderResourceView *none = NULL;
+      ID3D11DeviceContext_PSSetShaderResources(g_context, 0, 1, &none);
+      if (tri) ID3D11Buffer_Release(tri);
+      if (point) ID3D11SamplerState_Release(point);
+    }
+    if (srv) ID3D11ShaderResourceView_Release(srv);
+    if (tex) ID3D11Texture2D_Release(tex);
+  }
+  support = 0;
+  ID3D11Device_CheckFormatSupport(g_device, DXGI_FORMAT_R9G9B9E5_SHAREDEXP, &support);
+  check(!(support & D3D11_FORMAT_SUPPORT_RENDER_TARGET), "R9G9B9E5 is not a render target");
+  support = 0;
+  ID3D11Device_CheckFormatSupport(g_device, DXGI_FORMAT_R32G32B32_FLOAT, &support);
+  check(!(support & D3D11_FORMAT_SUPPORT_TYPED_UNORDERED_ACCESS_VIEW) && (support & D3D11_FORMAT_SUPPORT_IA_VERTEX_BUFFER), "R32G32B32_FLOAT: vertices, no unordered access");
+  D3D11_TEXTURE2D_DESC wide = {16384, 1, 1, 1, DXGI_FORMAT_R8G8B8A8_UNORM, {1, 0}, D3D11_USAGE_DEFAULT, D3D11_BIND_SHADER_RESOURCE, 0, 0};
+  ID3D11Texture2D *big = NULL;
+  check(SUCCEEDED(ID3D11Device_CreateTexture2D(g_device, &wide, NULL, &big)) && big, "a texture 16384 wide");
+  if (big) ID3D11Texture2D_Release(big);
+  wide.Width = 16385;
+  big = NULL;
+  check(FAILED(ID3D11Device_CreateTexture2D(g_device, &wide, NULL, &big)) && !big, "a texture 16385 wide is refused");
+  begin(NULL);
 }
 
 /* ---- making devices, 11 on 12, the Windows Runtime's face ------------------------------------------------------------------------------------------------ */

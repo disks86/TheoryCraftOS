@@ -31,6 +31,8 @@ class LockedDevice final : public IGraphicsDevice {
   explicit LockedDevice(IGraphicsDevice& inner) : inner_(inner) {}
 
   DeviceInfo info() const override { return inner_.info(); }
+  uint32_t format_caps(Format format) const override { return inner_.format_caps(format); }
+  uint32_t max_image_dimension() const override { return inner_.max_image_dimension(); }
   IBuffer* create_buffer(uint64_t size, uint32_t usage) override { kernel::ScopedMutex g(lock_); return inner_.create_buffer(size, usage); }
   void destroy_buffer(IBuffer* buffer) override { kernel::ScopedMutex g(lock_); inner_.destroy_buffer(buffer); }
   IImage* create_image(const ImageDesc& desc) override { kernel::ScopedMutex g(lock_); return inner_.create_image(desc); }

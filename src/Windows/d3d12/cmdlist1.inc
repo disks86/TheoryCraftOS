@@ -300,6 +300,24 @@ static UINT uav_clear_element(DXGI_FORMAT format, const UINT u[4], const float f
     memcpy(out, floats ? (const void *)&f[0] : (const void *)&u[0], 4);
     return 4;
   }
+  if (format == DXGI_FORMAT_R11G11B10_FLOAT) {
+    /* (Uint: the low 11, 11 and 10 bits of the first three values; Float: each value as the unsigned small float of its channel - 6 and 5 bits of mantissa, the half's exponent -,
+     * negative numbers and NaN as 0, what is too large as infinity) */
+    UINT32 w = 0;
+    for (UINT c = 0; c < 3; ++c) {
+      const UINT mantissa = c == 2 ? 5 : 6, bits = mantissa + 5;
+      UINT32 v;
+      if (!floats) v = u[c] & ((1u << bits) - 1);
+      else if (!(f[c] > 0)) v = 0;
+      else {
+        const UINT16 h = float_to_half(f[c]);      /* (truncated, as this file's half conversion is; then the mantissa cut to its bits) */
+        v = (h & 0x7C00u) == 0x7C00u ? (31u << mantissa) | ((h & 0x3FFu) ? 1u : 0u) : (UINT32)(h & 0x7FFFu) >> (10 - mantissa);
+      }
+      w |= v << (c == 0 ? 0 : c == 1 ? 11 : 22);
+    }
+    memcpy(out, &w, 4);
+    return 4;
+  }
   const UavFormat *uf = NULL;
   for (UINT i = 0; i < sizeof g_uav_formats / sizeof g_uav_formats[0]; ++i)
     if (g_uav_formats[i].f == format) uf = &g_uav_formats[i];

@@ -36,8 +36,17 @@ enum {
   KF_UNKNOWN, KF_A8R8G8B8, KF_X8R8G8B8, KF_A8B8G8R8, KF_X8B8G8R8, KF_D32F, KF_D24S8, KF_RGBA16F, KF_RGBA32F, KF_BGRA8_SRGB, KF_RGBA8_SRGB, KF_RGBA16, KF_RGBA32UINT, KF_RGBA32SINT,
   KF_RGBA16UINT, KF_RGBA16SINT, KF_RGBA8UINT, KF_RGBA16SNORM, KF_RGB10A2, KF_BC1, KF_BC2, KF_BC3, KF_BC1_SRGB, KF_BC2_SRGB, KF_BC3_SRGB,
   KF_R32UINT, KF_R32SINT, KF_R32F,      /* (25 .. 27: one 32-bit channel) */
+  /* (64 ..: the rest of Direct3D's colour formats, as they are in memory - dxgk::Format from R8Unorm on; what the adapter does with each is its format caps, dev_format_caps) */
+  KF_R8 = 64, KF_R8G8, KF_A8, KF_B5G6R5, KF_B5G5R5A1, KF_B4G4R4A4,      /* (64 .. 69: kept in 32-bit pixels by the devices, so with levels) */
+  KF_R8SNORM, KF_R8UINT, KF_R8SINT, KF_R8G8SNORM, KF_R8G8UINT, KF_R8G8SINT, KF_RGBA8SNORM, KF_RGBA8SINT,
+  KF_R16, KF_R16SNORM, KF_R16UINT, KF_R16SINT, KF_R16F, KF_R16G16, KF_R16G16SNORM, KF_R16G16UINT, KF_R16G16SINT, KF_R16G16F,
+  KF_R32G32UINT, KF_R32G32SINT, KF_R32G32F, KF_R32G32B32UINT, KF_R32G32B32SINT, KF_R32G32B32F, KF_R11G11B10F, KF_R9G9B9E5, KF_RGB10A2UINT,
+  KF_BC4, KF_BC4_SNORM, KF_BC5, KF_BC5_SNORM, KF_BC6H_UF16, KF_BC6H_SF16, KF_BC7, KF_BC7_SRGB,
 };
-#define KMAX_TEXTURE_DIMENSION 4096
+#define KF_FIRST_EXTRA KF_R8
+/* graphics::FormatCap (src/Graphics/GraphicsTypes.hpp): what allocations of a format from KF_FIRST_EXTRA on may be on this adapter (KmtCaps::format_caps) */
+enum { KFC_SAMPLED = 1, KFC_FILTERED = 2, KFC_RENDER_TARGET = 4, KFC_BLENDABLE = 8, KFC_STORAGE = 16, KFC_MIPMAPS = 32, KFC_MULTISAMPLE = 64, KFC_NATIVE = 128 };
+#define KMAX_TEXTURE_DIMENSION 4096      /* (the video surfaces' limit; textures: the adapter's KmtCaps::max_texture_dimension, up to 16384) */
 #define KTILE_BYTES 65536
 
 typedef struct FormatInfo {
@@ -70,11 +79,26 @@ static const FormatInfo g_formats[] = {
     {DXGI_FORMAT_BC1_TYPELESS, KF_BC1, 8, 0, 1}, {DXGI_FORMAT_BC1_UNORM, KF_BC1, 8, 0, 1}, {DXGI_FORMAT_BC1_UNORM_SRGB, KF_BC1_SRGB, 8, 0, 1},
     {DXGI_FORMAT_BC2_TYPELESS, KF_BC2, 16, 0, 1}, {DXGI_FORMAT_BC2_UNORM, KF_BC2, 16, 0, 1}, {DXGI_FORMAT_BC2_UNORM_SRGB, KF_BC2_SRGB, 16, 0, 1},
     {DXGI_FORMAT_BC3_TYPELESS, KF_BC3, 16, 0, 1}, {DXGI_FORMAT_BC3_UNORM, KF_BC3, 16, 0, 1}, {DXGI_FORMAT_BC3_UNORM_SRGB, KF_BC3_SRGB, 16, 0, 1},
+    {DXGI_FORMAT_BC4_TYPELESS, KF_BC4, 8, 0, 1}, {DXGI_FORMAT_BC4_UNORM, KF_BC4, 8, 0, 1}, {DXGI_FORMAT_BC4_SNORM, KF_BC4_SNORM, 8, 0, 1},
+    {DXGI_FORMAT_BC5_TYPELESS, KF_BC5, 16, 0, 1}, {DXGI_FORMAT_BC5_UNORM, KF_BC5, 16, 0, 1}, {DXGI_FORMAT_BC5_SNORM, KF_BC5_SNORM, 16, 0, 1},
+    {DXGI_FORMAT_BC6H_TYPELESS, KF_BC6H_UF16, 16, 0, 1}, {DXGI_FORMAT_BC6H_UF16, KF_BC6H_UF16, 16, 0, 1}, {DXGI_FORMAT_BC6H_SF16, KF_BC6H_SF16, 16, 0, 1},
+    {DXGI_FORMAT_BC7_TYPELESS, KF_BC7, 16, 0, 1}, {DXGI_FORMAT_BC7_UNORM, KF_BC7, 16, 0, 1}, {DXGI_FORMAT_BC7_UNORM_SRGB, KF_BC7_SRGB, 16, 0, 1},
+    /* the formats the kernel keeps as they are (numbered from 64): their own bytes in memory, the channels they have */
+    {DXGI_FORMAT_A8_UNORM, KF_A8, 1, 0}, {DXGI_FORMAT_R8_SNORM, KF_R8SNORM, 1, 0}, {DXGI_FORMAT_R8_UINT, KF_R8UINT, 1, 0}, {DXGI_FORMAT_R8_SINT, KF_R8SINT, 1, 0},
+    {DXGI_FORMAT_R8G8_SNORM, KF_R8G8SNORM, 2, 0}, {DXGI_FORMAT_R8G8_UINT, KF_R8G8UINT, 2, 0}, {DXGI_FORMAT_R8G8_SINT, KF_R8G8SINT, 2, 0},
+    {DXGI_FORMAT_R8G8B8A8_SNORM, KF_RGBA8SNORM, 4, 0}, {DXGI_FORMAT_R8G8B8A8_SINT, KF_RGBA8SINT, 4, 0},
+    {DXGI_FORMAT_R16_FLOAT, KF_R16F, 2, 0}, {DXGI_FORMAT_R16_SNORM, KF_R16SNORM, 2, 0}, {DXGI_FORMAT_R16_UINT, KF_R16UINT, 2, 0}, {DXGI_FORMAT_R16_SINT, KF_R16SINT, 2, 0},
+    {DXGI_FORMAT_R16G16_FLOAT, KF_R16G16F, 4, 0}, {DXGI_FORMAT_R16G16_SNORM, KF_R16G16SNORM, 4, 0}, {DXGI_FORMAT_R16G16_UINT, KF_R16G16UINT, 4, 0},
+    {DXGI_FORMAT_R32G32_TYPELESS, KF_R32G32F, 8, 0}, {DXGI_FORMAT_R32G32_FLOAT, KF_R32G32F, 8, 0}, {DXGI_FORMAT_R32G32_UINT, KF_R32G32UINT, 8, 0}, {DXGI_FORMAT_R32G32_SINT, KF_R32G32SINT, 8, 0},
+    {DXGI_FORMAT_R32G32B32_TYPELESS, KF_R32G32B32F, 12, 0}, {DXGI_FORMAT_R32G32B32_FLOAT, KF_R32G32B32F, 12, 0}, {DXGI_FORMAT_R32G32B32_UINT, KF_R32G32B32UINT, 12, 0},
+    {DXGI_FORMAT_R32G32B32_SINT, KF_R32G32B32SINT, 12, 0},
+    {DXGI_FORMAT_R11G11B10_FLOAT, KF_R11G11B10F, 4, 0}, {DXGI_FORMAT_R9G9B9E5_SHAREDEXP, KF_R9G9B9E5, 4, 0}, {DXGI_FORMAT_R10G10B10A2_UINT, KF_RGB10A2UINT, 4, 0},
+    {DXGI_FORMAT_B5G6R5_UNORM, KF_B5G6R5, 2, 0}, {DXGI_FORMAT_B5G5R5A1_UNORM, KF_B5G5R5A1, 2, 0}, {DXGI_FORMAT_B4G4R4A4_UNORM, KF_B4G4R4A4, 2, 0},
     {DXGI_FORMAT_R8_TYPELESS, KF_A8B8G8R8, 1, 0, 0, NARROW_R8}, {DXGI_FORMAT_R8_UNORM, KF_A8B8G8R8, 1, 0, 0, NARROW_R8},
     {DXGI_FORMAT_R8G8_TYPELESS, KF_A8B8G8R8, 2, 0, 0, NARROW_R8G8}, {DXGI_FORMAT_R8G8_UNORM, KF_A8B8G8R8, 2, 0, 0, NARROW_R8G8},
     {DXGI_FORMAT_R16_TYPELESS, KF_RGBA16, 2, 0, 0, NARROW_R16}, {DXGI_FORMAT_R16_UNORM, KF_RGBA16, 2, 0, 0, NARROW_R16},
     {DXGI_FORMAT_R16G16_TYPELESS, KF_RGBA16, 4, 0, 0, NARROW_R16G16}, {DXGI_FORMAT_R16G16_UNORM, KF_RGBA16, 4, 0, 0, NARROW_R16G16},
-    {DXGI_FORMAT_R16G16_SINT, KF_RGBA16SINT, 4, 0, 0, NARROW_R16G16},      /* (the motion vectors ResolveMotionVectorHeap writes: kept as (x, y, 0, 1)) */
+    {DXGI_FORMAT_R16G16_SINT, KF_R16G16SINT, 4, 0},      /* (also what ResolveMotionVectorHeap writes the motion vectors into) */
     {DXGI_FORMAT_NV12, KF_A8B8G8R8, 1, 0, 0, NARROW_R8, PLANAR_8}, {DXGI_FORMAT_P010, KF_RGBA16, 2, 0, 0, NARROW_R16, PLANAR_16}, {DXGI_FORMAT_P016, KF_RGBA16, 2, 0, 0, NARROW_R16, PLANAR_16},
     /* the packed YUV formats, kept as the RGB format of their views (DXGI_FORMAT: AYUV is R8G8B8A8 - V, U, Y, A -, Y410 R10G10B10A2 - U, Y, V, A -, Y416 R16G16B16A16 - U, Y, V,
      * A -, YUY2 R8G8B8A8 and Y210 / Y216 R16G16B16A16 of half the width - Y0, U, Y1, V), and the planar 4:2:2 / 4:4:0 / 4:4:4 ones of Direct3D 12 (P208, V208, V408) */
@@ -287,6 +311,17 @@ struct Dev {
 #define DEV_FEATURE2_STORAGE_IMAGES_IN_DRAWS (1u << 1)   /* ... and in pixel shaders */
 #define DEV_FEATURE2_LAYERED_TARGETS (1u << 2)           /* render targets and depth buffers of several slices, SV_RenderTargetArrayIndex */
 #define DEV_FEATURE2_SINGLE_CHANNEL (1u << 3)            /* R32_UINT, R32_SINT, R32_FLOAT */
+/* What allocations of a kernel format numbered from KF_FIRST_EXTRA may be on the device's adapter (KFC_* bits; 0 for any other format, or from a kernel that has no table) */
+static UINT dev_format_caps(const Dev *d, UINT kf) {
+  const KmtCaps *c = &d->caps;
+  if (kf < KF_FIRST_EXTRA || c->format_first != KF_FIRST_EXTRA || c->format_count > sizeof c->format_caps / sizeof c->format_caps[0] || kf - c->format_first >= c->format_count) return 0;
+  return c->format_caps[kf - c->format_first];
+}
+/* The largest width and height of a texture of the device (the adapter's, 4096 .. 16384) */
+static UINT dev_max_texture(const Dev *d) {
+  const UINT m = d->caps.max_texture_dimension;
+  return m < 4096 ? 4096 : m > 16384 ? 16384 : m;
+}
 
 static const GUID *const g_device_iids[] = {&IID_ID3D12Object, &IID_ID3D12Device, &IID_ID3D12Device1, &IID_ID3D12Device2, &IID_ID3D12Device3, &IID_ID3D12Device4,
                                             &IID_ID3D12Device5, &IID_ID3D12Device6, &IID_ID3D12Device7, &IID_ID3D12Device8, &IID_ID3D12Device9, &IID_ID3D12Device10, NULL};
