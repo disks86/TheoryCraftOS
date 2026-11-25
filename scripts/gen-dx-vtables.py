@@ -37,10 +37,10 @@ SPECS = {
         ('IDXGISwapChain3', 'sc_vtbl', ['sc', 'obj']),
     ],
     'd3d12': [
-        ('ID3D12Device10', 'dev_vtbl', ['dev', 'dobj', 'obj']),
+        ('ID3D12Device14', 'dev_vtbl', ['dev', 'dobj', 'obj']),
         ('ID3D12CommandQueue', 'queue_vtbl', ['queue', 'dobj', 'obj']),
         ('ID3D12CommandAllocator', 'alloc_vtbl', ['alloc', 'dobj', 'obj']),
-        ('ID3D12GraphicsCommandList7', 'list_vtbl', ['list', 'dobj', 'obj']),
+        ('ID3D12GraphicsCommandList10', 'list_vtbl', ['list', 'dobj', 'obj']),
         ('ID3D12Fence1', 'fence_vtbl', ['fence', 'dobj', 'obj']),
         ('ID3D12Resource2', 'res_vtbl', ['res', 'dobj', 'obj']),
         ('ID3D12Heap1', 'heap_vtbl', ['heap', 'dobj', 'obj']),
@@ -122,6 +122,8 @@ SPECS = {
 }
 
 text = ''.join(open(INC + h).read() for h in HEADERS)
+# (what mingw's d3d12.h lacks: the interfaces of the later Agility SDKs)
+text += open(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'src', 'Windows', 'd3d12', 'd3d12_types.h')).read()
 # (what mingw's d3d12video.h lacks: the later video interfaces, as the Windows SDK has them)
 text += open(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'src', 'Windows', 'd3d12', 'video_types.h')).read()
 # (... and what mingw's d3d11_4.h lacks: ID3D11VideoDevice2, ID3D11VideoContext3)

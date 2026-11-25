@@ -54,18 +54,19 @@ static void fence_destroy(DxObj *o) {
 }
 
 /* A fence of the device: a new synchronization object (opened 0), or one opened from a shared fence's NT handle (device1.inc's OpenSharedHandle), which is then the
- * fence's. D3D12_FENCE_FLAG_SHARED makes it one CreateSharedHandle shares; D3D12_FENCE_FLAG_NON_MONITORED changes nothing (no fence here keeps its value in
- * memory a process could map); one shared across adapters needs the kernel's cross-adapter objects, which it does not have. */
+ * fence's. D3D12_FENCE_FLAG_SHARED makes it one CreateSharedHandle shares; D3D12_FENCE_FLAG_SHARED_CROSS_ADAPTER one that devices of other adapters open too (the
+ * kernel's synchronization objects are of no adapter: a context of any adapter signals and waits for the same one), which is shared as well;
+ * D3D12_FENCE_FLAG_NON_MONITORED changes nothing (no fence here keeps its value in memory a process could map). */
 static HRESULT fence_make(Dev *This, UINT64 initial, D3D12_FENCE_FLAGS flags, UINT opened, Fence **out) {
   extern const ID3D12Fence1Vtbl fence_vtbl;
   *out = NULL;
   if (flags & ~(D3D12_FENCE_FLAG_SHARED | D3D12_FENCE_FLAG_SHARED_CROSS_ADAPTER | D3D12_FENCE_FLAG_NON_MONITORED)) return E_INVALIDARG;
-  if (flags & D3D12_FENCE_FLAG_SHARED_CROSS_ADAPTER) return DXGI_ERROR_UNSUPPORTED;
   Fence *f = dobj_new(sizeof *f, This, &fence_vtbl, g_fence_iids, fence_destroy);
   if (!f) return E_OUTOFMEMORY;
   if (opened) f->sync = opened;
   else {
-    const NTSTATUS st = (flags & D3D12_FENCE_FLAG_SHARED) ? kmt_create_shared_fence(This->kdev, initial, &f->sync) : kmt_create_fence(This->kdev, initial, &f->sync);
+    const NTSTATUS st = (flags & (D3D12_FENCE_FLAG_SHARED | D3D12_FENCE_FLAG_SHARED_CROSS_ADAPTER)) ? kmt_create_shared_fence(This->kdev, initial, &f->sync)
+                                                                                                   : kmt_create_fence(This->kdev, initial, &f->sync);
     if (!KMT_OK(st)) { dx_Release(OBJ(f)); return hr_from(st); }
   }
   f->flags = flags;

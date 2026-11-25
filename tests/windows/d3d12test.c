@@ -29,6 +29,7 @@
 #include <math.h>
 #include <d3d12.h>
 #include <dxgi1_6.h>
+#include "../../src/Windows/d3d12/d3d12_types.h"      /* (what the later Agility SDKs add: root signature 1.2, Device11 .. 14, List8 .. 10) */
 #include "dxfixtures.h"
 
 static int checks, failed;
@@ -1994,14 +1995,18 @@ static void test_multisample(Scene *c) {
     CHECK(grey > 40 && grey < 400);
     CHECK((pixels[40 * 64 + 32] & 0xFFFFFF) == 0xFFFFFF && (pixels[0] & 0xFFFFFF) == 0);
     /* (what the region resolved below covers: averaged, its edge pixels are grey) */
-    int covered = 0;
+    int covered = 0, full = 0;
     static UINT32 averaged[32][32];
     for (int y = 24; y < 56; ++y)
-      for (int x = 16; x < 48; ++x) { covered += (pixels[y * 64 + x] & 0xFF) != 0; averaged[y - 24][x - 16] = pixels[y * 64 + x]; }
+      for (int x = 16; x < 48; ++x) {
+        covered += (pixels[y * 64 + x] & 0xFF) != 0;
+        full += (pixels[y * 64 + x] & 0xFF) == 0xFF;
+        averaged[y - 24][x - 16] = pixels[y * 64 + x];
+      }
     ID3D12Resource_Unmap(c->readback, 0, NULL);
-    /* ResolveSubresourceRegion: a part of the image into the corner of a target cleared red, averaged (every adapter), then its greatest samples (the CPU
-     * renderer: virgl's resolves are averages, so the device leaves the call out) */
-    for (int pass = 0; pass < (g_hardware ? 1 : 2); ++pass) {
+    /* ResolveSubresourceRegion: a part of the image into the corner of a target cleared red, averaged, then its greatest samples (the CPU renderer's resolve
+     * modes; on virgl a pass of texel fetches) */
+    for (int pass = 0; pass < 3; ++pass) {      /* (average, greatest, least) */
     ID3D12GraphicsCommandList1 *list1 = NULL;
     CHECK_HR(ID3D12CommandAllocator_Reset(c->allocator));
     CHECK_HR(ID3D12GraphicsCommandList_Reset(list, c->allocator, NULL));
@@ -2010,7 +2015,8 @@ static void test_multisample(Scene *c) {
       const float red[4] = {1, 0, 0, 1};
       ID3D12GraphicsCommandList_ClearRenderTargetView(list, c->rtv, red, 0, NULL);
       D3D12_RECT region = {16, 24, 48, 56};
-      ID3D12GraphicsCommandList1_ResolveSubresourceRegion(list1, c->target, 0, 0, 0, target, 0, &region, DXGI_FORMAT_B8G8R8A8_UNORM, pass ? D3D12_RESOLVE_MODE_MAX : D3D12_RESOLVE_MODE_AVERAGE);
+      ID3D12GraphicsCommandList1_ResolveSubresourceRegion(list1, c->target, 0, 0, 0, target, 0, &region, DXGI_FORMAT_B8G8R8A8_UNORM,
+                                                            pass == 2 ? D3D12_RESOLVE_MODE_MIN : pass ? D3D12_RESOLVE_MODE_MAX : D3D12_RESOLVE_MODE_AVERAGE);
       ID3D12GraphicsCommandList1_Release(list1);
       scene_read_target(c, list);
       scene_run(c, list);
@@ -2024,13 +2030,59 @@ static void test_multisample(Scene *c) {
           }
         for (int y = 0; y < 64; ++y)
           for (int x = 32; x < 64; ++x) outside_red &= pixels[y * 64 + x] == 0xFFFF0000u;
-        printf("resolve region (%s): %d of %d covered pixels white, %d grey\n", pass ? "greatest" : "average", max_white, covered, max_grey);
-        if (pass) CHECK(max_grey == 0 && max_white == covered && covered > 100);
+        printf("resolve region (%s): %d of %d covered pixels white, %d grey\n", pass == 2 ? "least" : pass ? "greatest" : "average", max_white, covered, max_grey);
+        if (pass == 2) CHECK(max_grey == 0 && max_white == full && full > 100);      /* (an edge pixel's least sample is black) */
+        else if (pass) CHECK(max_grey == 0 && max_white == covered && covered > 100);
         else CHECK(same);      /* (the region as the whole image's average resolve has it) */
         CHECK(outside_red && pixels[40 * 64 + 8] == 0xFFFF0000u);
         ID3D12Resource_Unmap(c->readback, 0, NULL);
       }
     }
+    }
+    /* ResolveSubresourceRegion into a subresource other than 0: the same region into level 1 of a texture of two levels, and into layer 1 of an array of two,
+     * each read back and compared with the average of the whole image; then a region that does not fit the level, which is left out */
+    for (int kind = 0; kind < 2; ++kind) {
+      D3D12_RESOURCE_DESC dd = {D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, kind ? 32 : 64, kind ? 32 : 64, kind ? 2 : 1, kind ? 1 : 2, DXGI_FORMAT_B8G8R8A8_UNORM, {1, 0},
+                                D3D12_TEXTURE_LAYOUT_UNKNOWN, D3D12_RESOURCE_FLAG_NONE};
+      ID3D12Resource *sub = NULL;
+      CHECK_HR(ID3D12Device_CreateCommittedResource(dev, &defaults, D3D12_HEAP_FLAG_NONE, &dd, D3D12_RESOURCE_STATE_COPY_DEST, NULL, &IID_ID3D12Resource, (void **)&sub));
+      ID3D12GraphicsCommandList1 *list1 = NULL;
+      CHECK_HR(ID3D12CommandAllocator_Reset(c->allocator));
+      CHECK_HR(ID3D12GraphicsCommandList_Reset(list, c->allocator, NULL));
+      CHECK_HR(ID3D12GraphicsCommandList_QueryInterface(list, &IID_ID3D12GraphicsCommandList1, (void **)&list1));
+      if (!sub || !list1) { if (sub) ID3D12Resource_Release(sub); if (list1) ID3D12GraphicsCommandList1_Release(list1); continue; }
+      /* (the readback cleared first: a resolve left out must show) */
+      UINT32 *clear = NULL;
+      if (SUCCEEDED(ID3D12Resource_Map(c->readback, 0, NULL, (void **)&clear)) && clear) { memset(clear, 0, 64 * 64 * 4); ID3D12Resource_Unmap(c->readback, 0, NULL); }
+      D3D12_RECT region = {16, 24, 48, 56}, too_big = {0, 0, 40, 40};
+      ID3D12GraphicsCommandList1_ResolveSubresourceRegion(list1, sub, 1, 0, 0, target, 0, &region, DXGI_FORMAT_B8G8R8A8_UNORM, D3D12_RESOLVE_MODE_AVERAGE);
+      ID3D12GraphicsCommandList1_ResolveSubresourceRegion(list1, sub, 1, 0, 0, target, 0, &too_big, DXGI_FORMAT_B8G8R8A8_UNORM, D3D12_RESOLVE_MODE_AVERAGE);
+      ID3D12GraphicsCommandList1_ResolveSubresourceRegion(list1, sub, 2, 0, 0, target, 0, &region, DXGI_FORMAT_B8G8R8A8_UNORM, D3D12_RESOLVE_MODE_AVERAGE);
+      ID3D12GraphicsCommandList1_Release(list1);
+      D3D12_TEXTURE_COPY_LOCATION to, from;
+      memset(&to, 0, sizeof to);
+      memset(&from, 0, sizeof from);
+      to.pResource = c->readback;
+      to.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+      to.PlacedFootprint.Footprint.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+      to.PlacedFootprint.Footprint.Width = 32;
+      to.PlacedFootprint.Footprint.Height = 32;
+      to.PlacedFootprint.Footprint.Depth = 1;
+      to.PlacedFootprint.Footprint.RowPitch = 256;
+      from.pResource = sub;
+      from.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+      from.SubresourceIndex = 1;
+      ID3D12GraphicsCommandList_CopyTextureRegion(list, &to, 0, 0, 0, &from, NULL);
+      scene_run(c, list);
+      if (SUCCEEDED(ID3D12Resource_Map(c->readback, 0, NULL, (void **)&pixels)) && pixels) {
+        int same = 1;
+        for (int y = 0; y < 32; ++y)
+          for (int x = 0; x < 32; ++x) same &= pixels[y * 64 + x] == averaged[y][x];
+        printf("resolve region into %s 1: %s\n", kind ? "layer" : "level", same ? "the average" : "not the average");
+        CHECK(same);
+        ID3D12Resource_Unmap(c->readback, 0, NULL);
+      }
+      ID3D12Resource_Release(sub);
     }
   }
   ID3D12GraphicsCommandList_Release(list);
@@ -5541,6 +5593,684 @@ static void test_cpu_texture(ID3D12Device *dev, ID3D12CommandQueue *queue, ID3D1
   }
 }
 
+/* ---- the interfaces and descriptions of the later Agility SDKs (d3d12_types.h) ------------------------------------------------------------------------------------------ */
+
+/* A pipeline-state stream as CD3DX12 lays one out: each subobject its type and then its contents at their own alignment, the whole of it aligned to a pointer. */
+typedef struct Stream { BYTE bytes[1024]; SIZE_T size; } Stream;
+static void stream_add(Stream *s, UINT type, const void *data, SIZE_T size, SIZE_T align) {
+  const SIZE_T word = sizeof(void *);      /* (alignas(void *): 8 bytes in a 64-bit program, 4 in a 32-bit one) */
+  SIZE_T at = (s->size + word - 1) & ~(word - 1);
+  memcpy(s->bytes + at, &type, 4);
+  SIZE_T inner = (at + 4 + align - 1) & ~(align - 1);
+  memcpy(s->bytes + inner, data, size);
+  s->size = (inner + size + word - 1) & ~(word - 1);
+}
+static HRESULT stream_make(ID3D12Device2 *dev2, const Stream *s, ID3D12PipelineState **out) {
+  D3D12_PIPELINE_STATE_STREAM_DESC sd = {s->size, (void *)s->bytes};
+  *out = NULL;
+  return ID3D12Device2_CreatePipelineState(dev2, &sd, &IID_ID3D12PipelineState, (void **)out);
+}
+
+static void test_root_signature_12(ID3D12Device *dev) {
+  D3D12_FEATURE_DATA_ROOT_SIGNATURE rsv = {D3D_ROOT_SIGNATURE_VERSION_1_2};
+  CHECK_HR(ID3D12Device_CheckFeatureSupport(dev, D3D12_FEATURE_ROOT_SIGNATURE, &rsv, sizeof rsv));
+  CHECK(rsv.HighestVersion == D3D_ROOT_SIGNATURE_VERSION_1_2);
+  D3D12_ROOT_PARAMETER1 param;
+  memset(&param, 0, sizeof param);
+  param.ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+  param.Constants.Num32BitValues = 4;
+  D3D12_STATIC_SAMPLER_DESC1 ss[2];
+  memset(ss, 0, sizeof ss);
+  for (int i = 0; i < 2; ++i) {
+    ss[i].Filter = D3D12_FILTER_MIN_MAG_MIP_POINT;
+    ss[i].AddressU = ss[i].AddressV = ss[i].AddressW = D3D12_TEXTURE_ADDRESS_MODE_BORDER;
+    ss[i].MaxLOD = 1000.0f;
+    ss[i].ShaderRegister = (UINT)i;
+    ss[i].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+  }
+  ss[0].BorderColor = D3D12_STATIC_BORDER_COLOR_OPAQUE_WHITE_UINT;
+  ss[0].Flags = D3D12_SAMPLER_FLAG_UINT_BORDER_COLOR;
+  ss[1].BorderColor = D3D12_STATIC_BORDER_COLOR_OPAQUE_BLACK;
+  D3D12_VERSIONED_ROOT_SIGNATURE_DESC2 vd;
+  memset(&vd, 0, sizeof vd);
+  vd.Version = D3D_ROOT_SIGNATURE_VERSION_1_2;
+  vd.Desc_1_2.NumParameters = 1;
+  vd.Desc_1_2.pParameters = &param;
+  vd.Desc_1_2.NumStaticSamplers = 2;
+  vd.Desc_1_2.pStaticSamplers = ss;
+  ID3DBlob *b12 = NULL, *error = NULL;
+  CHECK_HR(D3D12SerializeVersionedRootSignature((const D3D12_VERSIONED_ROOT_SIGNATURE_DESC *)&vd, &b12, &error));
+  if (!b12) return;
+  const BYTE *bytes = ID3D10Blob_GetBufferPointer(b12);
+  const SIZE_T size = ID3D10Blob_GetBufferSize(b12);
+  CHECK(size == 24 + 12 + 12 + 2 * 56 && bytes[0] == 3);      /* (version 3; a sampler of 1.2 is 56 bytes) */
+  ID3D12VersionedRootSignatureDeserializer *v = NULL;
+  CHECK_HR(D3D12CreateVersionedRootSignatureDeserializer(bytes, size, &IID_ID3D12VersionedRootSignatureDeserializer, (void **)&v));
+  if (v) {
+    const D3D12_VERSIONED_ROOT_SIGNATURE_DESC2 *un = (const D3D12_VERSIONED_ROOT_SIGNATURE_DESC2 *)ID3D12VersionedRootSignatureDeserializer_GetUnconvertedRootSignatureDesc(v);
+    CHECK(un && un->Version == D3D_ROOT_SIGNATURE_VERSION_1_2 && un->Desc_1_2.NumStaticSamplers == 2 && un->Desc_1_2.NumParameters == 1);
+    if (un && un->Desc_1_2.NumStaticSamplers == 2) {
+      CHECK(un->Desc_1_2.pStaticSamplers[0].Flags == D3D12_SAMPLER_FLAG_UINT_BORDER_COLOR && un->Desc_1_2.pStaticSamplers[0].BorderColor == D3D12_STATIC_BORDER_COLOR_OPAQUE_WHITE_UINT);
+      CHECK(un->Desc_1_2.pStaticSamplers[1].Flags == 0 && un->Desc_1_2.pStaticSamplers[1].ShaderRegister == 1 && un->Desc_1_2.pParameters[0].Constants.Num32BitValues == 4);
+    }
+    /* (a sampler with flags has no 1.1 or 1.0 description) */
+    const D3D12_VERSIONED_ROOT_SIGNATURE_DESC *down = (const D3D12_VERSIONED_ROOT_SIGNATURE_DESC *)1;
+    CHECK(ID3D12VersionedRootSignatureDeserializer_GetRootSignatureDescAtVersion(v, D3D_ROOT_SIGNATURE_VERSION_1_1, &down) == E_INVALIDARG && down == NULL);
+    ID3D12VersionedRootSignatureDeserializer_Release(v);
+  }
+  ID3D12RootSignatureDeserializer *plain = NULL;
+  CHECK(FAILED(D3D12CreateRootSignatureDeserializer(bytes, size, &IID_ID3D12RootSignatureDeserializer, (void **)&plain)) && !plain);
+  ID3D12RootSignature *rs = NULL;
+  CHECK_HR(ID3D12Device_CreateRootSignature(dev, 0, bytes, size, &IID_ID3D12RootSignature, (void **)&rs));
+  if (rs) ID3D12RootSignature_Release(rs);
+  /* every truncation and every flipped bit: refused or read, never a crash; what is read gives each version's description or a refusal */
+  for (SIZE_T n = 0; n <= size; ++n) {
+    v = NULL;
+    if (SUCCEEDED(D3D12CreateVersionedRootSignatureDeserializer(bytes, n, &IID_ID3D12VersionedRootSignatureDeserializer, (void **)&v)) && v) ID3D12VersionedRootSignatureDeserializer_Release(v);
+  }
+  BYTE flipped[256];
+  int read_back = 0;
+  for (SIZE_T bit = 0; bit < size * 8; ++bit) {
+    memcpy(flipped, bytes, size);
+    flipped[bit / 8] ^= (BYTE)(1u << (bit % 8));
+    v = NULL;
+    if (SUCCEEDED(D3D12CreateVersionedRootSignatureDeserializer(flipped, size, &IID_ID3D12VersionedRootSignatureDeserializer, (void **)&v)) && v) {
+      for (UINT k = 1; k <= 3; ++k) {
+        const D3D12_VERSIONED_ROOT_SIGNATURE_DESC *at = NULL;
+        if (SUCCEEDED(ID3D12VersionedRootSignatureDeserializer_GetRootSignatureDescAtVersion(v, (D3D_ROOT_SIGNATURE_VERSION)k, &at)) && at) ++read_back;
+      }
+      ID3D12VersionedRootSignatureDeserializer_Release(v);
+    }
+  }
+  CHECK(read_back > 0);
+  ID3D10Blob_Release(b12);
+  /* without sampler flags a 1.2 root signature reads back at 1.0 and 1.1 */
+  ss[0].BorderColor = D3D12_STATIC_BORDER_COLOR_TRANSPARENT_BLACK;
+  ss[0].Flags = 0;
+  CHECK_HR(D3D12SerializeVersionedRootSignature((const D3D12_VERSIONED_ROOT_SIGNATURE_DESC *)&vd, &b12, &error));
+  if (b12) {
+    v = NULL;
+    CHECK_HR(D3D12CreateVersionedRootSignatureDeserializer(ID3D10Blob_GetBufferPointer(b12), ID3D10Blob_GetBufferSize(b12), &IID_ID3D12VersionedRootSignatureDeserializer, (void **)&v));
+    if (v) {
+      const D3D12_VERSIONED_ROOT_SIGNATURE_DESC *d10 = NULL, *d11 = NULL;
+      CHECK_HR(ID3D12VersionedRootSignatureDeserializer_GetRootSignatureDescAtVersion(v, D3D_ROOT_SIGNATURE_VERSION_1_0, &d10));
+      CHECK_HR(ID3D12VersionedRootSignatureDeserializer_GetRootSignatureDescAtVersion(v, D3D_ROOT_SIGNATURE_VERSION_1_1, &d11));
+      CHECK(d10 && d10->Version == D3D_ROOT_SIGNATURE_VERSION_1_0 && d10->Desc_1_0.NumStaticSamplers == 2 && d10->Desc_1_0.pStaticSamplers[1].ShaderRegister == 1);
+      CHECK(d11 && d11->Version == D3D_ROOT_SIGNATURE_VERSION_1_1 && d11->Desc_1_1.NumParameters == 1 && d11->Desc_1_1.pParameters[0].Constants.Num32BitValues == 4);
+      ID3D12VersionedRootSignatureDeserializer_Release(v);
+    }
+    ID3D10Blob_Release(b12);
+  }
+  /* what the serializer refuses: an integer colour without its flag, the flag with a float colour, a flag that does not exist, an integer colour before 1.2 */
+  ss[0].BorderColor = D3D12_STATIC_BORDER_COLOR_OPAQUE_BLACK_UINT;
+  b12 = NULL;
+  CHECK(D3D12SerializeVersionedRootSignature((const D3D12_VERSIONED_ROOT_SIGNATURE_DESC *)&vd, &b12, &error) == E_INVALIDARG && !b12);
+  ss[0].BorderColor = D3D12_STATIC_BORDER_COLOR_OPAQUE_BLACK;
+  ss[0].Flags = D3D12_SAMPLER_FLAG_UINT_BORDER_COLOR;
+  CHECK(D3D12SerializeVersionedRootSignature((const D3D12_VERSIONED_ROOT_SIGNATURE_DESC *)&vd, &b12, &error) == E_INVALIDARG && !b12);
+  ss[0].Flags = (D3D12_SAMPLER_FLAGS)4;
+  CHECK(D3D12SerializeVersionedRootSignature((const D3D12_VERSIONED_ROOT_SIGNATURE_DESC *)&vd, &b12, &error) == E_INVALIDARG && !b12);
+  D3D12_STATIC_SAMPLER_DESC old;
+  memcpy(&old, &ss[1], sizeof old);
+  old.BorderColor = D3D12_STATIC_BORDER_COLOR_OPAQUE_WHITE_UINT;
+  D3D12_VERSIONED_ROOT_SIGNATURE_DESC v11;
+  memset(&v11, 0, sizeof v11);
+  v11.Version = D3D_ROOT_SIGNATURE_VERSION_1_1;
+  v11.Desc_1_1.NumParameters = 1;
+  v11.Desc_1_1.pParameters = &param;
+  v11.Desc_1_1.NumStaticSamplers = 1;
+  v11.Desc_1_1.pStaticSamplers = &old;
+  CHECK(D3D12SerializeVersionedRootSignature(&v11, &b12, &error) == E_INVALIDARG && !b12);
+  /* coordinates in texels: written, but no device here samples with them (NonNormalizedCoordinateSamplersSupported is FALSE) */
+  D3D12_FEATURE_DATA_D3D12_OPTIONS17 o17;
+  CHECK_HR(ID3D12Device_CheckFeatureSupport(dev, D3D12_FEATURE_D3D12_OPTIONS17, &o17, sizeof o17));
+  CHECK(!o17.NonNormalizedCoordinateSamplersSupported);
+  ss[0].Flags = D3D12_SAMPLER_FLAG_NON_NORMALIZED_COORDINATES;
+  CHECK_HR(D3D12SerializeVersionedRootSignature((const D3D12_VERSIONED_ROOT_SIGNATURE_DESC *)&vd, &b12, &error));
+  if (b12) {
+    rs = NULL;
+    CHECK(ID3D12Device_CreateRootSignature(dev, 0, ID3D10Blob_GetBufferPointer(b12), ID3D10Blob_GetBufferSize(b12), &IID_ID3D12RootSignature, (void **)&rs) == E_INVALIDARG && !rs);
+    ID3D10Blob_Release(b12);
+  }
+  /* a 1.0 root signature read at 1.2: the flags of a 1.0 root signature, no sampler flags */
+  D3D12_DESCRIPTOR_RANGE range = {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0, 0, 0};
+  D3D12_ROOT_PARAMETER p10;
+  memset(&p10, 0, sizeof p10);
+  p10.ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+  p10.DescriptorTable.NumDescriptorRanges = 1;
+  p10.DescriptorTable.pDescriptorRanges = &range;
+  D3D12_ROOT_SIGNATURE_DESC d10 = {1, &p10, 1, &old, D3D12_ROOT_SIGNATURE_FLAG_NONE};
+  old.BorderColor = D3D12_STATIC_BORDER_COLOR_OPAQUE_WHITE;
+  ID3DBlob *b10 = NULL;
+  CHECK_HR(D3D12SerializeRootSignature(&d10, D3D_ROOT_SIGNATURE_VERSION_1_0, &b10, &error));
+  if (b10) {
+    v = NULL;
+    CHECK_HR(D3D12CreateVersionedRootSignatureDeserializer(ID3D10Blob_GetBufferPointer(b10), ID3D10Blob_GetBufferSize(b10), &IID_ID3D12VersionedRootSignatureDeserializer, (void **)&v));
+    if (v) {
+      const D3D12_VERSIONED_ROOT_SIGNATURE_DESC *at = NULL;
+      CHECK_HR(ID3D12VersionedRootSignatureDeserializer_GetRootSignatureDescAtVersion(v, D3D_ROOT_SIGNATURE_VERSION_1_2, &at));
+      const D3D12_VERSIONED_ROOT_SIGNATURE_DESC2 *at12 = (const D3D12_VERSIONED_ROOT_SIGNATURE_DESC2 *)at;
+      CHECK(at12 && at12->Version == D3D_ROOT_SIGNATURE_VERSION_1_2 && at12->Desc_1_2.NumStaticSamplers == 1 && at12->Desc_1_2.pStaticSamplers[0].Flags == 0 &&
+            at12->Desc_1_2.pStaticSamplers[0].BorderColor == D3D12_STATIC_BORDER_COLOR_OPAQUE_WHITE);
+      CHECK(at12 && at12->Desc_1_2.pParameters[0].DescriptorTable.pDescriptorRanges[0].Flags ==
+                        (D3D12_DESCRIPTOR_RANGE_FLAG_DESCRIPTORS_VOLATILE | D3D12_DESCRIPTOR_RANGE_FLAG_DATA_VOLATILE));
+      ID3D12VersionedRootSignatureDeserializer_Release(v);
+    }
+    ID3D10Blob_Release(b10);
+  }
+}
+
+/* The root signatures of a DXIL library (rootsig_lib.hlsl, made by dxc as lib_6_3: a GlobalRootSignature "grs", a LocalRootSignature "lrs" and a StateObjectConfig "cfg"). */
+static void test_library_root_signatures(ID3D12Device *dev) {
+  /* (an export of the Agility SDK's d3d12.dll that mingw's import library does not have) */
+  typedef HRESULT(WINAPI * FromLibrary)(const void *, SIZE_T, LPCWSTR, REFIID, void **);
+  const FromLibrary from_library = (FromLibrary)(void *)GetProcAddress(GetModuleHandleA("d3d12.dll"), "D3D12CreateVersionedRootSignatureDeserializerFromSubobjectInLibrary");
+  CHECK(from_library != NULL);
+  if (!from_library) return;
+  ID3D12VersionedRootSignatureDeserializer *v = NULL;
+  CHECK_HR(from_library(dx_rootsig_lib_dxbc, sizeof dx_rootsig_lib_dxbc, L"grs",
+                                                                              &IID_ID3D12VersionedRootSignatureDeserializer, (void **)&v));
+  if (v) {
+    const D3D12_VERSIONED_ROOT_SIGNATURE_DESC *un = ID3D12VersionedRootSignatureDeserializer_GetUnconvertedRootSignatureDesc(v);
+    CHECK(un && un->Version == D3D_ROOT_SIGNATURE_VERSION_1_1 && un->Desc_1_1.NumParameters == 2 && un->Desc_1_1.NumStaticSamplers == 1);
+    if (un && un->Desc_1_1.NumParameters == 2) {
+      CHECK(un->Desc_1_1.pParameters[0].ParameterType == D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS && un->Desc_1_1.pParameters[0].Constants.Num32BitValues == 4);
+      CHECK(un->Desc_1_1.pParameters[1].ParameterType == D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE && un->Desc_1_1.pParameters[1].DescriptorTable.NumDescriptorRanges == 2);
+    }
+    ID3D12VersionedRootSignatureDeserializer_Release(v);
+  }
+  v = NULL;
+  CHECK_HR(from_library(dx_rootsig_lib_dxbc, sizeof dx_rootsig_lib_dxbc, L"lrs",
+                                                                              &IID_ID3D12VersionedRootSignatureDeserializer, (void **)&v));
+  if (v) {
+    const D3D12_VERSIONED_ROOT_SIGNATURE_DESC *un = ID3D12VersionedRootSignatureDeserializer_GetUnconvertedRootSignatureDesc(v);
+    CHECK(un && un->Desc_1_1.NumParameters == 1 && un->Desc_1_1.pParameters[0].ParameterType == D3D12_ROOT_PARAMETER_TYPE_CBV &&
+          un->Desc_1_1.pParameters[0].Descriptor.ShaderRegister == 3);
+    ID3D12VersionedRootSignatureDeserializer_Release(v);
+  }
+  static const WCHAR *const not_there[] = {L"cfg", L"gr", L"grsx", L"none"};
+  for (UINT i = 0; i < 4; ++i) {
+    v = NULL;
+    CHECK(from_library(dx_rootsig_lib_dxbc, sizeof dx_rootsig_lib_dxbc, not_there[i],
+                                                                             &IID_ID3D12VersionedRootSignatureDeserializer, (void **)&v) == E_INVALIDARG && !v);
+  }
+  /* (a shader with no library part, a library cut short, and every 7th bit flipped: refused or read, never a crash) */
+  v = NULL;
+  CHECK(FAILED(from_library(dx_cs_fill_dxbc, sizeof dx_cs_fill_dxbc, L"grs", &IID_ID3D12VersionedRootSignatureDeserializer, (void **)&v)));
+  for (SIZE_T n = 0; n < sizeof dx_rootsig_lib_dxbc; n += 13) {
+    v = NULL;
+    if (SUCCEEDED(from_library(dx_rootsig_lib_dxbc, n, L"grs", &IID_ID3D12VersionedRootSignatureDeserializer, (void **)&v)) && v)
+      ID3D12VersionedRootSignatureDeserializer_Release(v);
+  }
+  static BYTE lib[sizeof dx_rootsig_lib_dxbc];
+  for (SIZE_T bit = 0; bit < sizeof lib * 8; bit += 7) {
+    memcpy(lib, dx_rootsig_lib_dxbc, sizeof lib);
+    lib[bit / 8] ^= (BYTE)(1u << (bit % 8));
+    v = NULL;
+    if (SUCCEEDED(from_library(lib, sizeof lib, L"grs", &IID_ID3D12VersionedRootSignatureDeserializer, (void **)&v)) && v)
+      ID3D12VersionedRootSignatureDeserializer_Release(v);
+  }
+  ID3D12Device14 *dev14 = NULL;
+  CHECK_HR(ID3D12Device_QueryInterface(dev, &IID_ID3D12Device14, (void **)&dev14));
+  if (dev14) {
+    ID3D12RootSignature *rs = NULL;
+    CHECK_HR(ID3D12Device14_CreateRootSignatureFromSubobjectInLibrary(dev14, 0, dx_rootsig_lib_dxbc, sizeof dx_rootsig_lib_dxbc, L"grs", &IID_ID3D12RootSignature, (void **)&rs));
+    if (rs) ID3D12RootSignature_Release(rs);
+    rs = NULL;
+    CHECK(ID3D12Device14_CreateRootSignatureFromSubobjectInLibrary(dev14, 0, dx_rootsig_lib_dxbc, sizeof dx_rootsig_lib_dxbc, L"cfg", &IID_ID3D12RootSignature, (void **)&rs) == E_INVALIDARG && !rs);
+    ID3D12Device14_Release(dev14);
+  }
+}
+
+static void test_agility_streams(ID3D12Device *dev) {
+  ID3D12Device2 *dev2 = NULL;
+  CHECK_HR(ID3D12Device_QueryInterface(dev, &IID_ID3D12Device2, (void **)&dev2));
+  if (!dev2) return;
+  /* (root signatures as blobs: the compute one of the pipeline library test, and one with the 16 constants the vertex shader reads) */
+  D3D12_ROOT_PARAMETER params[4];
+  memset(params, 0, sizeof params);
+  params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+  params[0].Constants.Num32BitValues = 4;
+  for (int i = 1; i < 4; ++i) {
+    params[i].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+    params[i].Descriptor.ShaderRegister = (UINT)(i - 1);
+  }
+  D3D12_ROOT_SIGNATURE_DESC crsd = {4, params, 0, NULL, D3D12_ROOT_SIGNATURE_FLAG_NONE};
+  ID3DBlob *cblob = NULL, *gblob = NULL, *error = NULL;
+  CHECK_HR(D3D12SerializeRootSignature(&crsd, D3D_ROOT_SIGNATURE_VERSION_1_0, &cblob, &error));
+  D3D12_ROOT_PARAMETER gp;
+  memset(&gp, 0, sizeof gp);
+  gp.ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+  gp.Constants.Num32BitValues = 16;
+  D3D12_ROOT_SIGNATURE_DESC grsd = {1, &gp, 0, NULL, D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT};
+  CHECK_HR(D3D12SerializeRootSignature(&grsd, D3D_ROOT_SIGNATURE_VERSION_1_0, &gblob, &error));
+  if (!cblob || !gblob) { ID3D12Device2_Release(dev2); return; }
+  D3D12_SERIALIZED_ROOT_SIGNATURE_DESC csr = {ID3D10Blob_GetBufferPointer(cblob), ID3D10Blob_GetBufferSize(cblob)};
+  D3D12_SERIALIZED_ROOT_SIGNATURE_DESC gsr = {ID3D10Blob_GetBufferPointer(gblob), ID3D10Blob_GetBufferSize(gblob)};
+  D3D12_SHADER_BYTECODE cs = {dx_cs_fill_dxbc, sizeof dx_cs_fill_dxbc}, vs = {dx_vs_dxbc, sizeof dx_vs_dxbc}, ps = {dx_ps_color_dxbc, sizeof dx_ps_color_dxbc};
+  /* a compute pipeline with its root signature as a blob */
+  Stream s;
+  ID3D12PipelineState *pso = NULL;
+  memset(&s, 0, sizeof s);
+  stream_add(&s, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SERIALIZED_ROOT_SIGNATURE, &csr, sizeof csr, sizeof(void *));
+  stream_add(&s, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CS, &cs, sizeof cs, sizeof(void *));
+  CHECK_HR(stream_make(dev2, &s, &pso));
+  if (pso) {
+    ID3D12RootSignature *got = NULL;
+    /* (the pipeline holds the root signature it made: the device is still the one) */
+    ID3D12Device *owner = NULL;
+    CHECK_HR(ID3D12PipelineState_GetDevice(pso, &IID_ID3D12Device, (void **)&owner));
+    if (owner) ID3D12Device_Release(owner);
+    (void)got;
+    ID3D12PipelineState_Release(pso);
+  }
+  /* ... and with a root signature object as well: two of one kind */
+  ID3D12RootSignature *rs = NULL;
+  CHECK_HR(ID3D12Device_CreateRootSignature(dev, 0, csr.pSerializedBlob, csr.SerializedBlobSizeInBytes, &IID_ID3D12RootSignature, (void **)&rs));
+  stream_add(&s, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, &rs, sizeof rs, sizeof(void *));
+  CHECK(stream_make(dev2, &s, &pso) == E_INVALIDARG && !pso);
+  /* (a blob that is not a root signature) */
+  memset(&s, 0, sizeof s);
+  D3D12_SERIALIZED_ROOT_SIGNATURE_DESC junk = {dx_cs_fill_dxbc, 16};
+  stream_add(&s, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SERIALIZED_ROOT_SIGNATURE, &junk, sizeof junk, sizeof(void *));
+  stream_add(&s, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CS, &cs, sizeof cs, sizeof(void *));
+  CHECK(FAILED(stream_make(dev2, &s, &pso)) && !pso);
+  /* graphics pipelines with RASTERIZER2 / RASTERIZER1 and DEPTH_STENCIL2 */
+  D3D12_INPUT_ELEMENT_DESC layout[2] = {{"POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
+                                        {"COLOR", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 12, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0}};
+  D3D12_INPUT_LAYOUT_DESC il = {layout, 2};
+  const D3D12_PRIMITIVE_TOPOLOGY_TYPE topology = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+  struct D3D12_RT_FORMAT_ARRAY rt;
+  memset(&rt, 0, sizeof rt);
+  rt.NumRenderTargets = 1;
+  rt.RTFormats[0] = DXGI_FORMAT_B8G8R8A8_UNORM;
+  D3D12_RASTERIZER_DESC2 r2;
+  memset(&r2, 0, sizeof r2);
+  r2.FillMode = D3D12_FILL_MODE_SOLID;
+  r2.CullMode = D3D12_CULL_MODE_NONE;
+  r2.DepthBias = 2.4f;
+  r2.DepthClipEnable = TRUE;
+  r2.LineRasterizationMode = D3D12_LINE_RASTERIZATION_MODE_ALIASED;
+  D3D12_DEPTH_STENCIL_DESC2 ds2;
+  memset(&ds2, 0, sizeof ds2);
+  ds2.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
+  ds2.DepthFunc = D3D12_COMPARISON_FUNC_LESS;
+  const D3D12_DEPTH_STENCILOP_DESC1 keep = {D3D12_STENCIL_OP_KEEP, D3D12_STENCIL_OP_KEEP, D3D12_STENCIL_OP_KEEP, D3D12_COMPARISON_FUNC_ALWAYS, 0xFF, 0xFF};
+  ds2.FrontFace = ds2.BackFace = keep;
+  for (int variant = 0; variant < 9; ++variant) {
+    memset(&s, 0, sizeof s);
+    stream_add(&s, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SERIALIZED_ROOT_SIGNATURE, &gsr, sizeof gsr, sizeof(void *));
+    stream_add(&s, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS, &vs, sizeof vs, sizeof(void *));
+    stream_add(&s, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, &ps, sizeof ps, sizeof(void *));
+    stream_add(&s, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_INPUT_LAYOUT, &il, sizeof il, sizeof(void *));
+    stream_add(&s, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY, &topology, 4, 4);
+    stream_add(&s, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS, &rt, sizeof rt, 4);
+    D3D12_RASTERIZER_DESC2 r = r2;
+    D3D12_DEPTH_STENCIL_DESC2 d = ds2;
+    HRESULT want = S_OK;
+    if (variant == 1) { r.LineRasterizationMode = D3D12_LINE_RASTERIZATION_MODE_QUADRILATERAL_NARROW; want = E_INVALIDARG; }      /* (NarrowQuadrilateralLinesSupported FALSE) */
+    if (variant == 2) { r.LineRasterizationMode = (D3D12_LINE_RASTERIZATION_MODE)7; want = E_INVALIDARG; }
+    if (variant == 3) { d.StencilEnable = TRUE; d.BackFace.StencilReadMask = 0x0F; want = E_INVALIDARG; }      /* (IndependentFrontAndBackStencilRefMaskSupported FALSE) */
+    if (variant == 4) { d.BackFace.StencilReadMask = 0x0F; }      /* (masks that differ with the stencil test off) */
+    if (variant == 5) { d.DepthBoundsTestEnable = TRUE; want = E_INVALIDARG; }
+    if (variant == 7) r.LineRasterizationMode = D3D12_LINE_RASTERIZATION_MODE_QUADRILATERAL_WIDE;
+    if (variant == 6) {
+      /* RASTERIZER1 in place of RASTERIZER2, with RASTERIZER as well: two of one kind */
+      D3D12_RASTERIZER_DESC1 r1;
+      memset(&r1, 0, sizeof r1);
+      r1.FillMode = D3D12_FILL_MODE_SOLID;
+      r1.CullMode = D3D12_CULL_MODE_BACK;
+      r1.DepthBias = -1.5f;
+      r1.DepthClipEnable = TRUE;
+      stream_add(&s, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER1, &r1, sizeof r1, 4);
+      ID3D12PipelineState *one = NULL;
+      CHECK_HR(stream_make(dev2, &s, &one));
+      if (one) ID3D12PipelineState_Release(one);
+      D3D12_RASTERIZER_DESC r0;
+      memset(&r0, 0, sizeof r0);
+      r0.FillMode = D3D12_FILL_MODE_SOLID;
+      r0.CullMode = D3D12_CULL_MODE_BACK;
+      stream_add(&s, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER, &r0, sizeof r0, 4);
+      want = E_INVALIDARG;
+    } else {
+      stream_add(&s, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER2, &r, sizeof r, 4);
+    }
+    stream_add(&s, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL2, &d, sizeof d, 4);
+    if (variant == 8) {
+      /* DEPTH_STENCIL1 after DEPTH_STENCIL2: two of one kind */
+      D3D12_DEPTH_STENCIL_DESC1 d1;
+      memset(&d1, 0, sizeof d1);
+      stream_add(&s, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL1, &d1, sizeof d1, 4);
+      want = E_INVALIDARG;
+    }
+    pso = NULL;
+    const HRESULT hr = stream_make(dev2, &s, &pso);
+    printf("pipeline stream variant %d: %08lx\n", variant, (unsigned long)hr);
+    CHECK(hr == want && (SUCCEEDED(hr) ? pso != NULL : pso == NULL));
+    if (pso) ID3D12PipelineState_Release(pso);
+  }
+  /* a subobject type of a later SDK than this one knows (PSDB), and the dynamic depth bias and strip cut, which this device has not (OPTIONS16 / 15) */
+  memset(&s, 0, sizeof s);
+  stream_add(&s, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SERIALIZED_ROOT_SIGNATURE, &csr, sizeof csr, sizeof(void *));
+  stream_add(&s, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CS, &cs, sizeof cs, sizeof(void *));
+  Stream with_flags = s;
+  const UINT junk_psdb[4] = {0};
+  stream_add(&s, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PSDB, junk_psdb, sizeof junk_psdb, sizeof(void *));
+  CHECK(stream_make(dev2, &s, &pso) == E_INVALIDARG && !pso);
+  D3D12_FEATURE_DATA_D3D12_OPTIONS16 o16;
+  CHECK_HR(ID3D12Device_CheckFeatureSupport(dev, D3D12_FEATURE_D3D12_OPTIONS16, &o16, sizeof o16));
+  CHECK(!o16.DynamicDepthBiasSupported);
+  const D3D12_PIPELINE_STATE_FLAGS dynamic = D3D12_PIPELINE_STATE_FLAG_DYNAMIC_DEPTH_BIAS;
+  stream_add(&with_flags, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_FLAGS, &dynamic, 4, 4);
+  CHECK(stream_make(dev2, &with_flags, &pso) == E_INVALIDARG && !pso);
+  /* the library takes the stream with a serialized root signature as the description with the object: the same fingerprint */
+  ID3D12Device1 *dev1 = NULL;
+  CHECK_HR(ID3D12Device_QueryInterface(dev, &IID_ID3D12Device1, (void **)&dev1));
+  if (dev1 && rs) {
+    D3D12_COMPUTE_PIPELINE_STATE_DESC cd;
+    memset(&cd, 0, sizeof cd);
+    cd.pRootSignature = rs;
+    cd.CS = cs;
+    ID3D12PipelineState *stored = NULL;
+    CHECK_HR(ID3D12Device_CreateComputePipelineState(dev, &cd, &IID_ID3D12PipelineState, (void **)&stored));
+    ID3D12PipelineLibrary1 *lib = NULL;
+    CHECK_HR(ID3D12Device1_CreatePipelineLibrary(dev1, NULL, 0, &IID_ID3D12PipelineLibrary1, (void **)&lib));
+    if (lib && stored) {
+      CHECK_HR(ID3D12PipelineLibrary1_StorePipeline(lib, L"fill", stored));
+      memset(&s, 0, sizeof s);
+      stream_add(&s, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SERIALIZED_ROOT_SIGNATURE, &csr, sizeof csr, sizeof(void *));
+      stream_add(&s, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CS, &cs, sizeof cs, sizeof(void *));
+      D3D12_PIPELINE_STATE_STREAM_DESC sd = {s.size, s.bytes};
+      ID3D12PipelineState *loaded = NULL;
+      CHECK_HR(ID3D12PipelineLibrary1_LoadPipeline(lib, L"fill", &sd, &IID_ID3D12PipelineState, (void **)&loaded));
+      if (loaded) ID3D12PipelineState_Release(loaded);
+    }
+    if (lib) ID3D12PipelineLibrary1_Release(lib);
+    if (stored) ID3D12PipelineState_Release(stored);
+  }
+  if (dev1) ID3D12Device1_Release(dev1);
+  if (rs) ID3D12RootSignature_Release(rs);
+  ID3D10Blob_Release(cblob);
+  ID3D10Blob_Release(gblob);
+  ID3D12Device2_Release(dev2);
+}
+
+/* Sessions of one identifier are of one store: on one device the same session, on another a session of the same store, and two disk sessions write one file. */
+static void test_shared_shader_cache(ID3D12Device *dev) {
+  ID3D12Device9 *dev9 = NULL, *other9 = NULL;
+  ID3D12Device *other = NULL;
+  CHECK_HR(ID3D12Device_QueryInterface(dev, &IID_ID3D12Device9, (void **)&dev9));
+  LUID luid = ID3D12Device_GetAdapterLuid(dev);
+  IDXGIFactory4 *factory = NULL;
+  IDXGIAdapter *adapter = NULL;
+  CHECK_HR(CreateDXGIFactory1(&IID_IDXGIFactory4, (void **)&factory));
+  if (factory) CHECK_HR(IDXGIFactory4_EnumAdapterByLuid(factory, luid, &IID_IDXGIAdapter, (void **)&adapter));
+  if (adapter) CHECK_HR(D3D12CreateDevice((IUnknown *)adapter, D3D_FEATURE_LEVEL_11_0, &IID_ID3D12Device, (void **)&other));
+  if (other) CHECK_HR(ID3D12Device_QueryInterface(other, &IID_ID3D12Device9, (void **)&other9));
+  if (!dev9 || !other9) goto done;
+  for (int mode = 0; mode < 2; ++mode) {
+    D3D12_SHADER_CACHE_SESSION_DESC sd;
+    memset(&sd, 0, sizeof sd);
+    sd.Identifier.Data1 = 0x5A4E0000u + (UINT)mode;
+    sd.Identifier.Data2 = (USHORT)GetCurrentProcessId();
+    sd.Mode = mode ? D3D12_SHADER_CACHE_MODE_DISK : D3D12_SHADER_CACHE_MODE_MEMORY;
+    if (mode) sd.Flags = D3D12_SHADER_CACHE_FLAG_USE_WORKING_DIR;
+    sd.Version = 3;
+    ID3D12ShaderCacheSession *a = NULL, *b = NULL, *c = NULL, *mismatch = NULL;
+    CHECK_HR(ID3D12Device9_CreateShaderCacheSession(dev9, &sd, &IID_ID3D12ShaderCacheSession, (void **)&a));
+    CHECK_HR(ID3D12Device9_CreateShaderCacheSession(dev9, &sd, &IID_ID3D12ShaderCacheSession, (void **)&b));
+    CHECK_HR(ID3D12Device9_CreateShaderCacheSession(other9, &sd, &IID_ID3D12ShaderCacheSession, (void **)&c));
+    CHECK(a && a == b && c && c != a);      /* (the same session on one device, another session of the store on the other) */
+    D3D12_SHADER_CACHE_SESSION_DESC changed = sd;
+    changed.Version = 4;
+    CHECK(ID3D12Device9_CreateShaderCacheSession(dev9, &changed, &IID_ID3D12ShaderCacheSession, (void **)&mismatch) == DXGI_ERROR_ALREADY_EXISTS && !mismatch);
+    CHECK(ID3D12Device9_CreateShaderCacheSession(other9, &changed, &IID_ID3D12ShaderCacheSession, (void **)&mismatch) == DXGI_ERROR_ALREADY_EXISTS && !mismatch);
+    if (a && c) {
+      UINT size = 0;
+      CHECK_HR(ID3D12ShaderCacheSession_StoreValue(a, "one", 4, "first", 6));
+      CHECK_HR(ID3D12ShaderCacheSession_StoreValue(c, "two", 4, "second", 7));
+      CHECK(ID3D12ShaderCacheSession_StoreValue(c, "one", 4, "again", 6) == DXGI_ERROR_ALREADY_EXISTS);
+      CHECK_HR(ID3D12ShaderCacheSession_FindValue(a, "two", 4, NULL, &size));
+      CHECK(size == 7);
+      CHECK_HR(ID3D12ShaderCacheSession_FindValue(c, "one", 4, NULL, &size));
+      CHECK(size == 6);
+    }
+    if (a) ID3D12ShaderCacheSession_Release(a);
+    if (b) ID3D12ShaderCacheSession_Release(b);
+    if (c) ID3D12ShaderCacheSession_Release(c);
+    /* every session gone: a memory store is gone with them; a disk store's file has what both devices stored */
+    a = NULL;
+    CHECK_HR(ID3D12Device9_CreateShaderCacheSession(other9, &sd, &IID_ID3D12ShaderCacheSession, (void **)&a));
+    if (a) {
+      char got[16];
+      UINT size = sizeof got;
+      const HRESULT one = ID3D12ShaderCacheSession_FindValue(a, "one", 4, got, &size);
+      size = sizeof got;
+      const HRESULT two = ID3D12ShaderCacheSession_FindValue(a, "two", 4, got, &size);
+      printf("shader cache (%s) reopened: %08lx %08lx\n", mode ? "disk" : "memory", (unsigned long)one, (unsigned long)two);
+      if (mode) CHECK(one == S_OK && two == S_OK && size == 7 && memcmp(got, "second", 7) == 0);
+      else CHECK(one == DXGI_ERROR_NOT_FOUND && two == DXGI_ERROR_NOT_FOUND);
+      ID3D12ShaderCacheSession_SetDeleteOnDestroy(a);
+      ID3D12ShaderCacheSession_Release(a);
+    }
+    if (mode) {
+      /* (deleted with its last session: a new one starts empty) */
+      a = NULL;
+      CHECK_HR(ID3D12Device9_CreateShaderCacheSession(dev9, &sd, &IID_ID3D12ShaderCacheSession, (void **)&a));
+      if (a) {
+        UINT size = 0;
+        CHECK(ID3D12ShaderCacheSession_FindValue(a, "one", 4, NULL, &size) == DXGI_ERROR_NOT_FOUND);
+        ID3D12ShaderCacheSession_SetDeleteOnDestroy(a);
+        ID3D12ShaderCacheSession_Release(a);
+      }
+    }
+  }
+done:
+  if (other9) ID3D12Device9_Release(other9);
+  if (other) ID3D12Device_Release(other);
+  if (adapter) IDXGIAdapter_Release(adapter);
+  if (factory) IDXGIFactory4_Release(factory);
+  if (dev9) ID3D12Device9_Release(dev9);
+}
+
+/* ID3D12Device11 .. 14, ID3D12GraphicsCommandList8 .. 10, the features of OPTIONS12 .. 21, and an aliasing done with an enhanced barrier. */
+static void test_agility_interfaces(ID3D12Device *dev, ID3D12CommandQueue *queue, ID3D12Fence *fence, UINT64 *fence_value) {
+  static const IID *const iids[] = {&IID_ID3D12Device11, &IID_ID3D12Device12, &IID_ID3D12Device13, &IID_ID3D12Device14};
+  for (UINT i = 0; i < 4; ++i) {
+    IUnknown *u = NULL;
+    CHECK_HR(ID3D12Device_QueryInterface(dev, iids[i], (void **)&u));
+    CHECK(u == (IUnknown *)dev);
+    if (u) IUnknown_Release(u);
+  }
+  D3D12_FEATURE_DATA_D3D12_OPTIONS12 o12;
+  D3D12_FEATURE_DATA_D3D12_OPTIONS19 o19;
+  D3D12_FEATURE_DATA_D3D12_OPTIONS20 o20;
+  D3D12_FEATURE_DATA_D3D12_OPTIONS21 o21;
+  CHECK_HR(ID3D12Device_CheckFeatureSupport(dev, D3D12_FEATURE_D3D12_OPTIONS12, &o12, sizeof o12));
+  CHECK(o12.EnhancedBarriersSupported && !o12.RelaxedFormatCastingSupported);
+  CHECK_HR(ID3D12Device_CheckFeatureSupport(dev, D3D12_FEATURE_D3D12_OPTIONS19, &o19, sizeof o19));
+  CHECK(o19.RasterizerDesc2Supported && !o19.NarrowQuadrilateralLinesSupported && o19.MaxSamplerDescriptorHeapSize == 2048 && o19.MaxViewDescriptorHeapSize == 1000000);
+  CHECK(ID3D12Device_CheckFeatureSupport(dev, D3D12_FEATURE_D3D12_OPTIONS19, &o19, sizeof o19 - 4) == E_INVALIDARG);
+  CHECK_HR(ID3D12Device_CheckFeatureSupport(dev, D3D12_FEATURE_D3D12_OPTIONS20, &o20, sizeof o20));
+  CHECK(o20.RecreateAtTier == D3D12_RECREATE_AT_TIER_NOT_SUPPORTED);
+  CHECK_HR(ID3D12Device_CheckFeatureSupport(dev, D3D12_FEATURE_D3D12_OPTIONS21, &o21, sizeof o21));
+  CHECK(o21.WorkGraphsTier == D3D12_WORK_GRAPHS_TIER_NOT_SUPPORTED && o21.ExecuteIndirectTier == D3D12_EXECUTE_INDIRECT_TIER_1_0);
+  ID3D12Device11 *dev11 = NULL;
+  ID3D12Device12 *dev12 = NULL;
+  ID3D12Device13 *dev13 = NULL;
+  CHECK_HR(ID3D12Device_QueryInterface(dev, &IID_ID3D12Device11, (void **)&dev11));
+  CHECK_HR(ID3D12Device_QueryInterface(dev, &IID_ID3D12Device12, (void **)&dev12));
+  CHECK_HR(ID3D12Device_QueryInterface(dev, &IID_ID3D12Device13, (void **)&dev13));
+  if (dev11) {
+    D3D12_DESCRIPTOR_HEAP_DESC hd = {D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER, 2, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
+    ID3D12DescriptorHeap *heap = NULL;
+    CHECK_HR(ID3D12Device_CreateDescriptorHeap(dev, &hd, &IID_ID3D12DescriptorHeap, (void **)&heap));
+    if (heap) {
+      D3D12_SAMPLER_DESC2 s2;
+      memset(&s2, 0, sizeof s2);
+      s2.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+      s2.AddressU = s2.AddressV = s2.AddressW = D3D12_TEXTURE_ADDRESS_MODE_BORDER;
+      s2.UintBorderColor[0] = s2.UintBorderColor[3] = 255;
+      s2.MaxLOD = 1000.0f;
+      s2.Flags = D3D12_SAMPLER_FLAG_UINT_BORDER_COLOR;
+      ID3D12Device11_CreateSampler2(dev11, &s2, ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(heap));
+      ID3D12DescriptorHeap_Release(heap);
+    }
+    ID3D12Device11_Release(dev11);
+  }
+  if (dev12) {
+    D3D12_RESOURCE_DESC1 rd;
+    memset(&rd, 0, sizeof rd);
+    rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    rd.Width = rd.Height = 64;
+    rd.DepthOrArraySize = rd.MipLevels = 1;
+    rd.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    rd.SampleDesc.Count = 1;
+    const UINT32 none = 0, one = 1;
+    const DXGI_FORMAT cast = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB, *casts = &cast;
+    D3D12_RESOURCE_ALLOCATION_INFO i2 = ID3D12Device12_GetResourceAllocationInfo2(dev12, 0, 1, &rd, NULL);
+    D3D12_RESOURCE_ALLOCATION_INFO i3 = ID3D12Device12_GetResourceAllocationInfo3(dev12, 0, 1, &rd, &none, &casts, NULL);
+    CHECK(i3.SizeInBytes == i2.SizeInBytes && i3.Alignment == i2.Alignment && i2.SizeInBytes != ~(UINT64)0);
+    i3 = ID3D12Device12_GetResourceAllocationInfo3(dev12, 0, 1, &rd, &one, &casts, NULL);
+    CHECK(i3.SizeInBytes == ~(UINT64)0);      /* (RelaxedFormatCastingSupported is FALSE) */
+    ID3D12Device12_Release(dev12);
+  }
+  if (dev13) {
+    ID3D12Heap *heap = NULL;
+    static BYTE memory[65536];
+    CHECK(ID3D12Device13_OpenExistingHeapFromAddress1(dev13, memory, sizeof memory, &IID_ID3D12Heap, (void **)&heap) == DXGI_ERROR_UNSUPPORTED && !heap);
+    CHECK(ID3D12Device13_OpenExistingHeapFromAddress1(dev13, NULL, 0, &IID_ID3D12Heap, (void **)&heap) == E_INVALIDARG && !heap);
+    ID3D12Device13_Release(dev13);
+  }
+  /* the later lists, and an aliasing barrier said the enhanced way: a placed buffer written, given up (access NO_ACCESS), and the buffer placed at the same bytes read */
+  ID3D12CommandAllocator *allocator = NULL;
+  ID3D12GraphicsCommandList *list = NULL;
+  CHECK_HR(ID3D12Device_CreateCommandAllocator(dev, D3D12_COMMAND_LIST_TYPE_DIRECT, &IID_ID3D12CommandAllocator, (void **)&allocator));
+  if (allocator) CHECK_HR(ID3D12Device_CreateCommandList(dev, 0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator, NULL, &IID_ID3D12GraphicsCommandList, (void **)&list));
+  if (!list) { if (allocator) ID3D12CommandAllocator_Release(allocator); return; }
+  ID3D12GraphicsCommandList8 *l8 = NULL;
+  ID3D12GraphicsCommandList9 *l9 = NULL;
+  ID3D12GraphicsCommandList10 *l10 = NULL;
+  CHECK_HR(ID3D12GraphicsCommandList_QueryInterface(list, &IID_ID3D12GraphicsCommandList8, (void **)&l8));
+  CHECK_HR(ID3D12GraphicsCommandList_QueryInterface(list, &IID_ID3D12GraphicsCommandList9, (void **)&l9));
+  CHECK_HR(ID3D12GraphicsCommandList_QueryInterface(list, &IID_ID3D12GraphicsCommandList10, (void **)&l10));
+  CHECK((void *)l8 == (void *)list && (void *)l9 == (void *)list && (void *)l10 == (void *)list);
+  if (l8) { ID3D12GraphicsCommandList8_OMSetFrontAndBackStencilRef(l8, 3, 3); ID3D12GraphicsCommandList8_Release(l8); }
+  if (l9) ID3D12GraphicsCommandList9_Release(l9);
+  if (l10) ID3D12GraphicsCommandList10_Release(l10);
+  D3D12_HEAP_DESC hd;
+  memset(&hd, 0, sizeof hd);
+  hd.SizeInBytes = 65536;
+  hd.Properties.Type = D3D12_HEAP_TYPE_DEFAULT;
+  hd.Flags = D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS;
+  ID3D12Heap *heap = NULL;
+  CHECK_HR(ID3D12Device_CreateHeap(dev, &hd, &IID_ID3D12Heap, (void **)&heap));
+  D3D12_RESOURCE_DESC bd = {D3D12_RESOURCE_DIMENSION_BUFFER, 0, 256, 1, 1, 1, DXGI_FORMAT_UNKNOWN, {1, 0}, D3D12_TEXTURE_LAYOUT_ROW_MAJOR, D3D12_RESOURCE_FLAG_NONE};
+  ID3D12Resource *first = NULL, *second = NULL;
+  if (heap) {
+    CHECK_HR(ID3D12Device_CreatePlacedResource(dev, heap, 0, &bd, D3D12_RESOURCE_STATE_COMMON, NULL, &IID_ID3D12Resource, (void **)&first));
+    CHECK_HR(ID3D12Device_CreatePlacedResource(dev, heap, 0, &bd, D3D12_RESOURCE_STATE_COMMON, NULL, &IID_ID3D12Resource, (void **)&second));
+  }
+  ID3D12Resource *upload = make_buffer(dev, D3D12_HEAP_TYPE_UPLOAD, 256, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ);
+  ID3D12Resource *readback = make_buffer(dev, D3D12_HEAP_TYPE_READBACK, 256, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);
+  ID3D12GraphicsCommandList7 *l7 = NULL;
+  CHECK_HR(ID3D12GraphicsCommandList_QueryInterface(list, &IID_ID3D12GraphicsCommandList7, (void **)&l7));
+  if (first && second && upload && readback && l7) {
+    UINT32 *p = NULL;
+    CHECK_HR(ID3D12Resource_Map(upload, 0, NULL, (void **)&p));
+    if (p) for (UINT i = 0; i < 64; ++i) p[i] = 0xA1A50000u + i;
+    ID3D12Resource_Unmap(upload, 0, NULL);
+    /* (the second buffer used first, so its device object holds bytes of its own) */
+    ID3D12GraphicsCommandList_CopyBufferRegion(list, readback, 0, second, 0, 256);
+    ID3D12GraphicsCommandList_CopyBufferRegion(list, first, 0, upload, 0, 256);
+    D3D12_BUFFER_BARRIER bb[2];
+    memset(bb, 0, sizeof bb);
+    bb[0].SyncBefore = D3D12_BARRIER_SYNC_COPY;
+    bb[0].SyncAfter = D3D12_BARRIER_SYNC_NONE;
+    bb[0].AccessBefore = D3D12_BARRIER_ACCESS_COPY_DEST;
+    bb[0].AccessAfter = D3D12_BARRIER_ACCESS_NO_ACCESS;
+    bb[0].pResource = first;
+    bb[0].Size = ~(UINT64)0;
+    bb[1].SyncBefore = D3D12_BARRIER_SYNC_NONE;
+    bb[1].SyncAfter = D3D12_BARRIER_SYNC_COPY;
+    bb[1].AccessBefore = D3D12_BARRIER_ACCESS_NO_ACCESS;
+    bb[1].AccessAfter = D3D12_BARRIER_ACCESS_COPY_SOURCE;
+    bb[1].pResource = second;
+    bb[1].Size = ~(UINT64)0;
+    D3D12_BARRIER_GROUP group = {D3D12_BARRIER_TYPE_BUFFER, 2, {.pBufferBarriers = bb}};
+    ID3D12GraphicsCommandList7_Barrier(l7, 1, &group);
+    ID3D12GraphicsCommandList_CopyBufferRegion(list, readback, 0, second, 0, 256);
+    run_list(queue, fence, fence_value, list);
+    UINT32 *got = NULL;
+    if (SUCCEEDED(ID3D12Resource_Map(readback, 0, NULL, (void **)&got)) && got) {
+      int same = 1;
+      for (UINT i = 0; i < 64; ++i) same &= got[i] == 0xA1A50000u + i;
+      printf("enhanced barrier aliasing: %s\n", same ? "the second buffer has the first's bytes" : "the second buffer kept its own");
+      CHECK(same);
+      ID3D12Resource_Unmap(readback, 0, NULL);
+    }
+  } else {
+    CHECK_HR(ID3D12GraphicsCommandList_Close(list));
+  }
+  /* a GPU upload heap (OPTIONS16): the CPU's writes reach the GPU, and the GPU's the CPU */
+  D3D12_FEATURE_DATA_D3D12_OPTIONS16 o16;
+  CHECK_HR(ID3D12Device_CheckFeatureSupport(dev, D3D12_FEATURE_D3D12_OPTIONS16, &o16, sizeof o16));
+  CHECK(o16.GPUUploadHeapSupported);
+  const D3D12_HEAP_PROPERTIES custom = ID3D12Device_GetCustomHeapProperties(dev, 0, D3D12_HEAP_TYPE_GPU_UPLOAD);
+  CHECK(custom.Type == D3D12_HEAP_TYPE_CUSTOM && custom.CPUPageProperty == D3D12_CPU_PAGE_PROPERTY_WRITE_COMBINE && custom.MemoryPoolPreference == D3D12_MEMORY_POOL_L1);
+  ID3D12Resource *gpu_upload = make_buffer(dev, D3D12_HEAP_TYPE_GPU_UPLOAD, 256, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON);
+  CHECK(gpu_upload != NULL);
+  if (gpu_upload && upload && readback && allocator) {
+    D3D12_HEAP_PROPERTIES hp;
+    D3D12_HEAP_FLAGS hf;
+    CHECK_HR(ID3D12Resource_GetHeapProperties(gpu_upload, &hp, &hf));
+    CHECK(hp.Type == D3D12_HEAP_TYPE_GPU_UPLOAD);
+    UINT32 *p = NULL;
+    CHECK_HR(ID3D12Resource_Map(gpu_upload, 0, NULL, (void **)&p));
+    if (p) { for (UINT i = 0; i < 64; ++i) p[i] = 0x6B000000u + i; ID3D12Resource_Unmap(gpu_upload, 0, NULL); }
+    p = NULL;
+    CHECK_HR(ID3D12Resource_Map(upload, 0, NULL, (void **)&p));
+    if (p) { for (UINT i = 0; i < 64; ++i) p[i] = 0x5C000000u + i; ID3D12Resource_Unmap(upload, 0, NULL); }
+    CHECK_HR(ID3D12CommandAllocator_Reset(allocator));
+    CHECK_HR(ID3D12GraphicsCommandList_Reset(list, allocator, NULL));
+    ID3D12GraphicsCommandList_CopyBufferRegion(list, readback, 0, gpu_upload, 0, 256);
+    ID3D12GraphicsCommandList_CopyBufferRegion(list, gpu_upload, 128, upload, 0, 128);
+    run_list(queue, fence, fence_value, list);
+    UINT32 *got = NULL;
+    if (SUCCEEDED(ID3D12Resource_Map(readback, 0, NULL, (void **)&got)) && got) {
+      int same = 1;
+      for (UINT i = 0; i < 64; ++i) same &= got[i] == 0x6B000000u + i;
+      CHECK(same);      /* (the CPU's writes, as the GPU saw them) */
+      ID3D12Resource_Unmap(readback, 0, NULL);
+    }
+    got = NULL;
+    if (SUCCEEDED(ID3D12Resource_Map(gpu_upload, 0, NULL, (void **)&got)) && got) {
+      int same = 1;
+      for (UINT i = 0; i < 32; ++i) same &= got[i] == 0x6B000000u + i && got[32 + i] == 0x5C000000u + i;
+      printf("GPU upload heap: %s\n", same ? "the CPU and the GPU see each other's writes" : "a write is missing");
+      CHECK(same);      /* (the GPU's copy into it, as the CPU reads it) */
+      ID3D12Resource_Unmap(gpu_upload, 0, NULL);
+    }
+  }
+  if (gpu_upload) ID3D12Resource_Release(gpu_upload);
+  if (l7) ID3D12GraphicsCommandList7_Release(l7);
+  if (upload) ID3D12Resource_Release(upload);
+  if (readback) ID3D12Resource_Release(readback);
+  if (first) ID3D12Resource_Release(first);
+  if (second) ID3D12Resource_Release(second);
+  if (heap) ID3D12Heap_Release(heap);
+  ID3D12GraphicsCommandList_Release(list);
+  ID3D12CommandAllocator_Release(allocator);
+}
+
+static void test_agility(ID3D12Device *dev, ID3D12CommandQueue *queue, ID3D12Fence *fence, UINT64 *fence_value) {
+  test_root_signature_12(dev);
+  test_library_root_signatures(dev);
+  test_agility_streams(dev);
+  test_shared_shader_cache(dev);
+  test_agility_interfaces(dev, queue, fence, fence_value);
+}
+
 static void test_later(ID3D12Device *dev, ID3D12CommandQueue *queue, ID3D12Fence *fence, UINT64 *fence_value) {
   test_later_queries(dev);
   test_later_objects(dev, queue);
@@ -5550,6 +6280,7 @@ static void test_later(ID3D12Device *dev, ID3D12CommandQueue *queue, ID3D12Fence
   test_pipeline_library(dev);
   test_shader_cache(dev);
   test_cpu_texture(dev, queue, fence, fence_value);
+  test_agility(dev, queue, fence, fence_value);
 }
 
 int main(void) {

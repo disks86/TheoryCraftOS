@@ -36,12 +36,12 @@
  *   - a pass with a depth buffer and no render target draws into a colour image of the buffer's size that nothing reads (cmdlist.inc depth_companion): it costs that memory
  *   - sampler border colours are the three of a static sampler (another colour is the nearest of them); a device with wrap and clamp alone uses the nearer of those
  *   - multisampled images are render targets and depth buffers of the adapter's sample counts, drawn into and resolved (not read by shaders through this DLL)
- *   - pipeline statistics and stream output queries, tiled depth/multisampled/array resources, sharing across adapters (DXGI_ERROR_UNSUPPORTED; shared handles of one
- *     adapter's resources, heaps and fences are made: device.inc),
+ *   - pipeline statistics and stream output queries, tiled depth/multisampled/array resources, heaps shared across adapters (DXGI_ERROR_UNSUPPORTED; shared handles of
+ *     one adapter's resources and heaps, and of fences of any adapter, are made: device.inc),
  *     resource state validation (barriers are accepted and not looked at, except aliasing), the debug layer, dual-source blending, unordered access to textures
- *   - of the later interfaces (ID3D12Device1 .. 10, ID3D12GraphicsCommandList1 .. 7: device1.inc, cmdlist1.inc, library.inc, rootsig.inc), the features reported at their
- *     "not supported" tier: ray tracing, mesh shaders, variable-rate shading, view instancing, depth bounds, sample positions, sampler feedback, protected sessions, meta
- *     commands
+ *   - of the later interfaces (ID3D12Device1 .. 14, ID3D12GraphicsCommandList1 .. 10: device1.inc, cmdlist1.inc, library.inc, rootsig.inc; what mingw lacks of them is in
+ *     d3d12_types.h), the features reported at their "not supported" tier: ray tracing, mesh shaders, variable-rate shading, view instancing, depth bounds, sample
+ *     positions, sampler feedback, work graphs, protected sessions, meta commands, a depth bias and strip cut set by the command list
  *   - vertex elements: 32-bit floats on every device; bytes, 16-bit numbers, half floats and 32-bit integers (pso.inc vertex_format) where the device reads them (the CPU
  *     renderer and virgl)
  *     (queries are occlusion, binary occlusion and timestamps; ExecuteIndirect is made when the list is executed; bundles replay their calls: extras.inc)
@@ -55,6 +55,7 @@
 #include <stddef.h>
 #include <d3d12.h>
 #include <d3d12video.h>
+#include "d3d12_types.h"
 #include "video_types.h"
 #include <dxgi1_6.h>
 #include "../tcosdx.h"

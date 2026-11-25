@@ -196,6 +196,8 @@ static D3D12_HEAP_PROPERTIES *STDMETHODCALLTYPE dev_GetCustomHeapProperties(Dev 
   switch (type) {
     case D3D12_HEAP_TYPE_DEFAULT: ret->CPUPageProperty = D3D12_CPU_PAGE_PROPERTY_NOT_AVAILABLE; ret->MemoryPoolPreference = D3D12_MEMORY_POOL_L1; break;
     case D3D12_HEAP_TYPE_UPLOAD: ret->CPUPageProperty = D3D12_CPU_PAGE_PROPERTY_WRITE_COMBINE; ret->MemoryPoolPreference = D3D12_MEMORY_POOL_L0; break;
+    /* (GPU memory the CPU maps, as Direct3D 12 describes a GPU upload heap) */
+    case D3D12_HEAP_TYPE_GPU_UPLOAD: ret->CPUPageProperty = D3D12_CPU_PAGE_PROPERTY_WRITE_COMBINE; ret->MemoryPoolPreference = D3D12_MEMORY_POOL_L1; break;
     default: ret->CPUPageProperty = D3D12_CPU_PAGE_PROPERTY_WRITE_BACK; ret->MemoryPoolPreference = D3D12_MEMORY_POOL_L0; break;
   }
   return ret;
@@ -368,9 +370,8 @@ static HRESULT STDMETHODCALLTYPE dev_CheckFeatureSupport(Dev *This, D3D12_FEATUR
     case D3D12_FEATURE_ROOT_SIGNATURE: {
       D3D12_FEATURE_DATA_ROOT_SIGNATURE *r = data;
       if (size != sizeof *r) return E_INVALIDARG;
-      /* (the highest of the asked-for version and 1.1: 1.2's static sampler descriptions are not read) */
-      if (r->HighestVersion < D3D_ROOT_SIGNATURE_VERSION_1_0 || r->HighestVersion > (D3D_ROOT_SIGNATURE_VERSION)3) return E_INVALIDARG;      /* (3: version 1.2) */
-      if (r->HighestVersion > D3D_ROOT_SIGNATURE_VERSION_1_1) r->HighestVersion = D3D_ROOT_SIGNATURE_VERSION_1_1;
+      /* (any of 1.0, 1.1 and 1.2 is read: rootsig.inc and the kernel's D3d12.cpp; the asked-for version is the answer) */
+      if (r->HighestVersion < D3D_ROOT_SIGNATURE_VERSION_1_0 || r->HighestVersion > D3D_ROOT_SIGNATURE_VERSION_1_2) return E_INVALIDARG;
       return S_OK;
     }
     case D3D12_FEATURE_D3D12_OPTIONS1: {
@@ -502,9 +503,42 @@ static HRESULT STDMETHODCALLTYPE dev_CheckFeatureSupport(Dev *This, D3D12_FEATUR
     case D3D12_FEATURE_D3D12_OPTIONS13: { FEATURE(D3D12_FEATURE_DATA_D3D12_OPTIONS13, o); memset(o, 0, sizeof *o); return S_OK; }
     case D3D12_FEATURE_D3D12_OPTIONS14: { FEATURE(D3D12_FEATURE_DATA_D3D12_OPTIONS14, o); memset(o, 0, sizeof *o); return S_OK; }
     case D3D12_FEATURE_D3D12_OPTIONS15: { FEATURE(D3D12_FEATURE_DATA_D3D12_OPTIONS15, o); memset(o, 0, sizeof *o); return S_OK; }
-    case D3D12_FEATURE_D3D12_OPTIONS16: { FEATURE(D3D12_FEATURE_DATA_D3D12_OPTIONS16, o); memset(o, 0, sizeof *o); return S_OK; }
+    case D3D12_FEATURE_D3D12_OPTIONS16: {
+      /* (no depth bias set by the command list - RSSetDepthBias: the pipeline's bias is the rasterizer state's; GPU upload heaps: resource.inc heap_cpu_access) */
+      FEATURE(D3D12_FEATURE_DATA_D3D12_OPTIONS16, o);
+      o->DynamicDepthBiasSupported = FALSE;
+      o->GPUUploadHeapSupported = TRUE;
+      return S_OK;
+    }
     case D3D12_FEATURE_D3D12_OPTIONS17: { FEATURE(D3D12_FEATURE_DATA_D3D12_OPTIONS17, o); memset(o, 0, sizeof *o); return S_OK; }
     case D3D12_FEATURE_D3D12_OPTIONS18: { FEATURE(D3D12_FEATURE_DATA_D3D12_OPTIONS18, o); o->RenderPassesValid = TRUE; return S_OK; }
+    case D3D12_FEATURE_D3D12_OPTIONS19: {
+      /* (RASTERIZER2 subobjects are read, narrow quadrilateral lines refused: device1.inc stream_parse; a pass with no target at all is of one sample; the heaps take
+       * Direct3D 12's limits of tier 1 - heaps.inc) */
+      FEATURE(D3D12_FEATURE_DATA_D3D12_OPTIONS19, o);
+      memset(o, 0, sizeof *o);
+      o->SupportedSampleCountsWithNoOutputs = 0x1;
+      o->RasterizerDesc2Supported = TRUE;
+      o->MaxSamplerDescriptorHeapSize = 2048;
+      o->MaxSamplerDescriptorHeapSizeWithStaticSamplers = 2048;
+      o->MaxViewDescriptorHeapSize = 1000000;
+      return S_OK;
+    }
+    case D3D12_FEATURE_D3D12_OPTIONS20: {
+      FEATURE(D3D12_FEATURE_DATA_D3D12_OPTIONS20, o);
+      o->ComputeOnlyWriteWatchSupported = FALSE;
+      o->RecreateAtTier = D3D12_RECREATE_AT_TIER_NOT_SUPPORTED;
+      return S_OK;
+    }
+    case D3D12_FEATURE_D3D12_OPTIONS21: {
+      /* (no work graphs: they are DXIL libraries of node shaders, which the kernel's translator does not read) */
+      FEATURE(D3D12_FEATURE_DATA_D3D12_OPTIONS21, o);
+      o->WorkGraphsTier = D3D12_WORK_GRAPHS_TIER_NOT_SUPPORTED;
+      o->ExecuteIndirectTier = D3D12_EXECUTE_INDIRECT_TIER_1_0;
+      o->SampleCmpGradientAndBiasSupported = FALSE;
+      o->ExtendedCommandInfoSupported = FALSE;
+      return S_OK;
+    }
 #undef FEATURE
     default: return E_INVALIDARG;
   }
@@ -515,7 +549,7 @@ static HRESULT STDMETHODCALLTYPE dev_CheckFeatureSupport(Dev *This, D3D12_FEATUR
 static Dev *dev_create(LUID luid, NTSTATUS *status_out) {
   Dev *d = mem_alloc(sizeof *d);
   if (!d) return NULL;
-  extern const ID3D12Device10Vtbl dev_vtbl;
+  extern const ID3D12Device14Vtbl dev_vtbl;
   dx_init(OBJ(d), &dev_vtbl, g_device_iids, dev_destroy);
   {
     extern const ID3D12VideoDevice4Vtbl vdev_vtbl;

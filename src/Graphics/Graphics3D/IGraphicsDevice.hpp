@@ -1023,6 +1023,7 @@ enum DeviceFeature2 : uint32_t {
   // IImage::write_subresource / read_subresource, texture views (ICommandBuffer::bind_texture_view), passes that draw into a level (RenderPassBegin::level), storage images of a cube's
   // faces (as an array) and of any level of a layered image (StorageImageView::level).
   kFeature2MipmappedLayers = 1u << 10,
+  kFeature2ColorResolveModes = 1u << 14,    // resolve_image of a colour image with ResolveMode::Min / Max (what kFeatureResolveModes has, without the depth modes)
 };
 
 

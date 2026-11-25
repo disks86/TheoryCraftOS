@@ -134,12 +134,14 @@ static HRESULT STDMETHODCALLTYPE plib_LoadPipeline(Plib *l, const WCHAR *name, c
   D3D12_GRAPHICS_PIPELINE_STATE_DESC g;
   D3D12_COMPUTE_PIPELINE_STATE_DESC c;
   BOOL compute;
+  ID3D12RootSignature *made;
   if (out) *out = NULL;
-  HRESULT hr = stream_parse(stream, &g, &c, &compute);
+  HRESULT hr = stream_parse(l->d.dev, stream, &g, &c, &compute, &made);
   if (FAILED(hr)) return hr;
   hr = plib_check(l, name, compute ? 1 : 0, compute ? desc_hash_compute(&c) : desc_hash_graphics(&g));
-  if (FAILED(hr)) return hr;
-  return compute ? dev_CreateComputePipelineState(l->d.dev, &c, riid, out) : dev_CreateGraphicsPipelineState(l->d.dev, &g, riid, out);
+  if (SUCCEEDED(hr)) hr = compute ? dev_CreateComputePipelineState(l->d.dev, &c, riid, out) : dev_CreateGraphicsPipelineState(l->d.dev, &g, riid, out);
+  if (made) ID3D12RootSignature_Release(made);
+  return hr;
 }
 static SIZE_T plib_size(Plib *l) {
   SIZE_T n = 12;
@@ -173,11 +175,15 @@ static HRESULT STDMETHODCALLTYPE plib_Serialize(Plib *l, void *data, SIZE_T size
 }
 
 /* ---- shader cache sessions -------------------------------------------------------------------------------------------------------------------------------------------- */
+/* A session is a view of a store. Sessions of one identifier (and mode, and for disk caches one file) are of the same store, as Direct3D 12 has them: a second
+ * CreateShaderCacheSession with the description of an open one gives that session again on the same device, and a session of the same store on another device; one
+ * with another description (version, limits, flags) is DXGI_ERROR_ALREADY_EXISTS. A store goes when its last session does (and its file then, when a session asked
+ * for that with SetDeleteOnDestroy). */
 
 typedef struct CacheEntry { BYTE *key; UINT key_size; BYTE *value; UINT value_size; } CacheEntry;
-typedef struct ShaderCache {
-  DObj d;
-  D3D12_SHADER_CACHE_SESSION_DESC desc;
+typedef struct CacheStore {
+  LONG refs;                   /* the sessions on it (g_store_lock) */
+  D3D12_SHADER_CACHE_SESSION_DESC desc;      /* (with the defaults filled in) */
   CacheEntry *entries;
   UINT count, cap;
   UINT64 bytes;
@@ -185,12 +191,19 @@ typedef struct ShaderCache {
   BOOL rewrite;                /* the file is not what the store holds (a clear it did not take): the next store writes all of it */
   WCHAR path[MAX_PATH];        /* disk mode: the file */
   CRITICAL_SECTION lock;
-  struct ShaderCache *next;    /* the device's sessions (Dev.caches: ShaderCacheControl clears them) */
+  struct CacheStore *next;     /* the process's stores (g_stores) */
+} CacheStore;
+typedef struct ShaderCache {
+  DObj d;
+  CacheStore *store;
+  struct ShaderCache *next;    /* the device's sessions (Dev.caches: ShaderCacheControl clears them, and a second session of an open one is that one) */
 } ShaderCache;
 static const GUID *const g_scache_iids[] = {&IID_ID3D12Object, &IID_ID3D12DeviceChild, &IID_ID3D12ShaderCacheSession, NULL};
 static const char g_scache_magic[8] = {'T', 'C', 'O', 'S', 'S', 'C', 'C', '1'};
+static CacheStore *g_stores;
+static SRWLOCK g_store_lock = SRWLOCK_INIT;
 
-static void scache_clear(ShaderCache *c) {
+static void scache_clear(CacheStore *c) {
   for (UINT i = 0; i < c->count; ++i) { mem_free(c->entries[i].key); mem_free(c->entries[i].value); }
   c->count = 0;
   c->bytes = 0;
@@ -202,7 +215,7 @@ static BOOL scache_write_entry(HANDLE f, const CacheEntry *e) {
 }
 /* Returns the error of a write that failed as an HRESULT (S_OK: written; memory mode: nothing to write). */
 static HRESULT scache_io_error(void) { const DWORD e = GetLastError(); return e ? HRESULT_FROM_WIN32(e) : E_FAIL; }
-static HRESULT scache_save(ShaderCache *c) {
+static HRESULT scache_save(CacheStore *c) {
   if (!c->path[0]) return S_OK;
   HANDLE f = CreateFileW(c->path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
   if (f == INVALID_HANDLE_VALUE) return scache_io_error();
@@ -213,7 +226,7 @@ static HRESULT scache_save(ShaderCache *c) {
   return hr;
 }
 /* Disk mode: one new entry added at the end of the file (the whole file is written only when it is new or cleared). */
-static HRESULT scache_append(ShaderCache *c, const CacheEntry *e) {
+static HRESULT scache_append(CacheStore *c, const CacheEntry *e) {
   if (!c->path[0]) return S_OK;
   if (c->rewrite) {
     const HRESULT hr = scache_save(c);
@@ -228,10 +241,11 @@ static HRESULT scache_append(ShaderCache *c, const CacheEntry *e) {
   CloseHandle(f);
   return hr;
 }
-static HRESULT scache_put(ShaderCache *c, const void *key, UINT key_size, const void *value, UINT value_size) {
+static HRESULT scache_put(CacheStore *c, const void *key, UINT key_size, const void *value, UINT value_size) {
   if (c->count == c->cap) {
+    if (c->cap > 0x7FFFFFFFu / 2) return E_OUTOFMEMORY;
     const UINT cap = c->cap ? c->cap * 2 : 32;
-    CacheEntry *n = mem_grow(c->entries, sizeof *n * cap);
+    CacheEntry *n = mem_grow(c->entries, sizeof *n * (SIZE_T)cap);
     if (!n) return E_OUTOFMEMORY;
     c->entries = n;
     c->cap = cap;
@@ -245,7 +259,7 @@ static HRESULT scache_put(ShaderCache *c, const void *key, UINT key_size, const 
   return S_OK;
 }
 /* Disk mode: what the file holds, when it is of this version (a file of another version is started over, as Direct3D 12 does). */
-static void scache_load(ShaderCache *c) {
+static void scache_load(CacheStore *c) {
   HANDLE f = CreateFileW(c->path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
   if (f == INVALID_HANDLE_VALUE) return;
   char magic[8];
@@ -267,23 +281,11 @@ static void scache_load(ShaderCache *c) {
   }
   CloseHandle(f);
 }
-static void scache_destroy(DxObj *o) {
-  ShaderCache *c = (ShaderCache *)o;
-  Dev *d = c->d.dev;
-  AcquireSRWLockExclusive(&d->cache_lock);
-  for (ShaderCache **at = &d->caches; *at; at = &(*at)->next) if (*at == c) { *at = c->next; break; }
-  ReleaseSRWLockExclusive(&d->cache_lock);
-  if (c->path[0] && c->delete_on_destroy) DeleteFileW(c->path);
-  scache_clear(c);
-  mem_free(c->entries);
-  DeleteCriticalSection(&c->lock);
-  dobj_child_destroy(o);
-}
 /* %LOCALAPPDATA%\D3DSCache\<program>\<identifier>.tcos (or the working directory's <identifier>.tcos), the folders made. */
-static BOOL scache_path(ShaderCache *c) {
+static BOOL scache_path(const D3D12_SHADER_CACHE_SESSION_DESC *desc, WCHAR path[MAX_PATH]) {
   WCHAR dir[MAX_PATH];
   DWORD n;
-  if (c->desc.Flags & D3D12_SHADER_CACHE_FLAG_USE_WORKING_DIR) {
+  if (desc->Flags & D3D12_SHADER_CACHE_FLAG_USE_WORKING_DIR) {
     n = GetCurrentDirectoryW(MAX_PATH, dir);
     if (!n || n >= MAX_PATH - 48) return FALSE;
   } else {
@@ -304,13 +306,90 @@ static BOOL scache_path(ShaderCache *c) {
   }
   /* the identifier as 32 hex digits */
   static const WCHAR hex[] = L"0123456789abcdef";
-  const BYTE *g = (const BYTE *)&c->desc.Identifier;
+  const BYTE *g = (const BYTE *)&desc->Identifier;
   dir[n++] = L'\\';
   for (UINT i = 0; i < 16; ++i) { dir[n++] = hex[g[i] >> 4]; dir[n++] = hex[g[i] & 15]; }
   static const WCHAR ext[] = L".tcos";
   memcpy(dir + n, ext, sizeof ext);
-  memcpy(c->path, dir, sizeof c->path);
+  memcpy(path, dir, sizeof dir);
   return TRUE;
+}
+static BOOL same_path(const WCHAR *a, const WCHAR *b) {
+  for (;; ++a, ++b) {
+    WCHAR x = *a, y = *b;
+    if (x >= L'A' && x <= L'Z') x += 32;
+    if (y >= L'A' && y <= L'Z') y += 32;
+    if (x != y) return FALSE;
+    if (!x) return TRUE;
+  }
+}
+static BOOL same_session_desc(const D3D12_SHADER_CACHE_SESSION_DESC *a, const D3D12_SHADER_CACHE_SESSION_DESC *b) {
+  return a->Mode == b->Mode && a->Flags == b->Flags && a->MaximumInMemoryCacheSizeBytes == b->MaximumInMemoryCacheSizeBytes &&
+         a->MaximumInMemoryCacheEntries == b->MaximumInMemoryCacheEntries && a->MaximumValueFileSizeBytes == b->MaximumValueFileSizeBytes && a->Version == b->Version;
+}
+/* Drops a session's reference to its store; the last one frees it (and deletes its file when asked to). */
+static void store_release(CacheStore *c) {
+  AcquireSRWLockExclusive(&g_store_lock);
+  const BOOL last = --c->refs == 0;
+  if (last)
+    for (CacheStore **at = &g_stores; *at; at = &(*at)->next)
+      if (*at == c) { *at = c->next; break; }
+  ReleaseSRWLockExclusive(&g_store_lock);
+  if (!last) return;
+  if (c->path[0] && c->delete_on_destroy) DeleteFileW(c->path);
+  scache_clear(c);
+  mem_free(c->entries);
+  DeleteCriticalSection(&c->lock);
+  mem_free(c);
+}
+/* The store of a description (defaults filled in): the open one of its identifier, mode and file with a reference more, or a new one, loaded from its file. */
+static HRESULT store_open(const D3D12_SHADER_CACHE_SESSION_DESC *desc, CacheStore **out) {
+  *out = NULL;
+  WCHAR path[MAX_PATH];
+  path[0] = 0;
+  if (desc->Mode == D3D12_SHADER_CACHE_MODE_DISK && !scache_path(desc, path)) return E_FAIL;
+  AcquireSRWLockExclusive(&g_store_lock);
+  for (CacheStore *c = g_stores; c; c = c->next) {
+    if (c->desc.Mode != desc->Mode || memcmp(&c->desc.Identifier, &desc->Identifier, sizeof desc->Identifier) != 0 || !same_path(c->path, path)) continue;
+    HRESULT hr = DXGI_ERROR_ALREADY_EXISTS;      /* (open with another description) */
+    if (same_session_desc(&c->desc, desc)) { ++c->refs; *out = c; hr = S_OK; }
+    ReleaseSRWLockExclusive(&g_store_lock);
+    return hr;
+  }
+  CacheStore *c = mem_alloc(sizeof *c);
+  if (!c) { ReleaseSRWLockExclusive(&g_store_lock); return E_OUTOFMEMORY; }
+  c->refs = 1;
+  c->desc = *desc;
+  memcpy(c->path, path, sizeof path);
+  InitializeCriticalSection(&c->lock);
+  HRESULT hr = S_OK;
+  if (c->path[0]) {
+    scache_load(c);
+    /* (the file as this store has it: a file of another version, or cut short, is started over, so later entries can be added at its end) */
+    hr = scache_save(c);
+  }
+  if (FAILED(hr)) {
+    ReleaseSRWLockExclusive(&g_store_lock);
+    scache_clear(c);
+    mem_free(c->entries);
+    DeleteCriticalSection(&c->lock);
+    mem_free(c);
+    return hr;
+  }
+  c->next = g_stores;
+  g_stores = c;
+  ReleaseSRWLockExclusive(&g_store_lock);
+  *out = c;
+  return S_OK;
+}
+static void scache_destroy(DxObj *o) {
+  ShaderCache *s = (ShaderCache *)o;
+  Dev *d = s->d.dev;
+  AcquireSRWLockExclusive(&d->cache_lock);
+  for (ShaderCache **at = &d->caches; *at; at = &(*at)->next) if (*at == s) { *at = s->next; break; }
+  ReleaseSRWLockExclusive(&d->cache_lock);
+  if (s->store) store_release(s->store);
+  dobj_child_destroy(o);
 }
 static HRESULT STDMETHODCALLTYPE dev_CreateShaderCacheSession(Dev *This, const D3D12_SHADER_CACHE_SESSION_DESC *desc, REFIID riid, void **out) {
   extern const ID3D12ShaderCacheSessionVtbl scache_vtbl;
@@ -319,34 +398,49 @@ static HRESULT STDMETHODCALLTYPE dev_CreateShaderCacheSession(Dev *This, const D
   if (desc->Mode == D3D12_SHADER_CACHE_MODE_MEMORY && desc->Flags) return E_INVALIDARG;      /* (the flags are of disk caches) */
   if (desc->Mode == D3D12_SHADER_CACHE_MODE_MEMORY && desc->MaximumValueFileSizeBytes) return E_INVALIDARG;
   if (!out) return S_FALSE;
-  ShaderCache *c = dobj_new(sizeof *c, This, &scache_vtbl, g_scache_iids, scache_destroy);
-  if (!c) return E_OUTOFMEMORY;
-  InitializeCriticalSection(&c->lock);
-  c->desc = *desc;
   /* (the defaults Direct3D 12 gives what is left 0) */
-  if (!c->desc.MaximumInMemoryCacheSizeBytes) c->desc.MaximumInMemoryCacheSizeBytes = 1u << 20;
-  if (!c->desc.MaximumInMemoryCacheEntries) c->desc.MaximumInMemoryCacheEntries = 128;
-  if (desc->Mode == D3D12_SHADER_CACHE_MODE_DISK && !c->desc.MaximumValueFileSizeBytes) c->desc.MaximumValueFileSizeBytes = 128u << 20;
-  if (desc->Mode == D3D12_SHADER_CACHE_MODE_DISK) {
-    if (!scache_path(c)) { dx_Release(OBJ(c)); return E_FAIL; }
-    scache_load(c);
-    /* (the file as this session has it: a file of another version, or cut short, is started over, so later entries can be added at its end) */
-    const HRESULT saved = scache_save(c);
-    if (FAILED(saved)) { dx_Release(OBJ(c)); return saved; }
+  D3D12_SHADER_CACHE_SESSION_DESC full = *desc;
+  if (!full.MaximumInMemoryCacheSizeBytes) full.MaximumInMemoryCacheSizeBytes = 1u << 20;
+  if (!full.MaximumInMemoryCacheEntries) full.MaximumInMemoryCacheEntries = 128;
+  if (full.Mode == D3D12_SHADER_CACHE_MODE_DISK && !full.MaximumValueFileSizeBytes) full.MaximumValueFileSizeBytes = 128u << 20;
+  /* (a session of this device on that store already: that one) */
+  AcquireSRWLockShared(&This->cache_lock);
+  for (ShaderCache *s = This->caches; s; s = s->next) {
+    const CacheStore *c = s->store;
+    if (c->desc.Mode != full.Mode || memcmp(&c->desc.Identifier, &full.Identifier, sizeof full.Identifier) != 0) continue;
+    if (full.Mode == D3D12_SHADER_CACHE_MODE_DISK && (c->desc.Flags & D3D12_SHADER_CACHE_FLAG_USE_WORKING_DIR) != (full.Flags & D3D12_SHADER_CACHE_FLAG_USE_WORKING_DIR)) continue;
+    HRESULT hr = DXGI_ERROR_ALREADY_EXISTS;
+    if (same_session_desc(&c->desc, &full)) {
+      /* (a reference for query_out to give up - unless the session is being destroyed, its last reference gone: then it is not there any more) */
+      LONG ref = OBJ(s)->ref;
+      while (ref > 0 && InterlockedCompareExchange(&OBJ(s)->ref, ref + 1, ref) != ref) ref = OBJ(s)->ref;
+      if (ref <= 0) continue;
+      hr = query_out((IUnknown *)s, riid, out);
+    }
+    ReleaseSRWLockShared(&This->cache_lock);
+    return hr;
   }
+  ReleaseSRWLockShared(&This->cache_lock);
+  CacheStore *store;
+  const HRESULT opened = store_open(&full, &store);
+  if (FAILED(opened)) return opened;
+  ShaderCache *s = dobj_new(sizeof *s, This, &scache_vtbl, g_scache_iids, scache_destroy);
+  if (!s) { store_release(store); return E_OUTOFMEMORY; }
+  s->store = store;
   AcquireSRWLockExclusive(&This->cache_lock);
-  c->next = This->caches;
-  This->caches = c;
+  s->next = This->caches;
+  This->caches = s;
   ReleaseSRWLockExclusive(&This->cache_lock);
-  return query_out((IUnknown *)c, riid, out);
+  return query_out((IUnknown *)s, riid, out);
 }
-static CacheEntry *scache_find(ShaderCache *c, const void *key, UINT key_size) {
+static CacheEntry *scache_find(CacheStore *c, const void *key, UINT key_size) {
   for (UINT i = 0; i < c->count; ++i)
     if (c->entries[i].key_size == key_size && memcmp(c->entries[i].key, key, key_size) == 0) return &c->entries[i];
   return NULL;
 }
-static HRESULT STDMETHODCALLTYPE scache_FindValue(ShaderCache *c, const void *key, UINT key_size, void *value, UINT *value_size) {
+static HRESULT STDMETHODCALLTYPE scache_FindValue(ShaderCache *s, const void *key, UINT key_size, void *value, UINT *value_size) {
   if (!key || !key_size || !value_size) return E_INVALIDARG;
+  CacheStore *c = s->store;
   EnterCriticalSection(&c->lock);
   const CacheEntry *e = scache_find(c, key, key_size);
   HRESULT hr = DXGI_ERROR_NOT_FOUND;
@@ -359,8 +453,9 @@ static HRESULT STDMETHODCALLTYPE scache_FindValue(ShaderCache *c, const void *ke
   LeaveCriticalSection(&c->lock);
   return hr;
 }
-static HRESULT STDMETHODCALLTYPE scache_StoreValue(ShaderCache *c, const void *key, UINT key_size, const void *value, UINT value_size) {
+static HRESULT STDMETHODCALLTYPE scache_StoreValue(ShaderCache *s, const void *key, UINT key_size, const void *value, UINT value_size) {
   if (!key || !key_size || !value || !value_size) return E_INVALIDARG;
+  CacheStore *c = s->store;
   EnterCriticalSection(&c->lock);
   HRESULT hr;
   /* (a memory session holds what its in-memory limits allow; a disk session what its file may hold - the in-memory limits bound only what is kept in memory on Windows,
@@ -385,11 +480,16 @@ static HRESULT STDMETHODCALLTYPE scache_StoreValue(ShaderCache *c, const void *k
   LeaveCriticalSection(&c->lock);
   return hr;
 }
-static void STDMETHODCALLTYPE scache_SetDeleteOnDestroy(ShaderCache *c) { c->delete_on_destroy = TRUE; }
-static D3D12_SHADER_CACHE_SESSION_DESC *STDMETHODCALLTYPE scache_GetDesc(ShaderCache *c, D3D12_SHADER_CACHE_SESSION_DESC *ret) { *ret = c->desc; return ret; }
+/* (of the store: its file goes when the last session of it does) */
+static void STDMETHODCALLTYPE scache_SetDeleteOnDestroy(ShaderCache *s) {
+  EnterCriticalSection(&s->store->lock);
+  s->store->delete_on_destroy = TRUE;
+  LeaveCriticalSection(&s->store->lock);
+}
+static D3D12_SHADER_CACHE_SESSION_DESC *STDMETHODCALLTYPE scache_GetDesc(ShaderCache *s, D3D12_SHADER_CACHE_SESSION_DESC *ret) { *ret = s->store->desc; return ret; }
 
 /* The caches of the system and the driver: there are none here (pipelines are made from their descriptions), so disabling, enabling or clearing them has nothing
- * to do; clearing the application's empties the device's sessions. */
+ * to do; clearing the application's empties the stores of the device's sessions. */
 static HRESULT STDMETHODCALLTYPE dev_ShaderCacheControl(Dev *This, D3D12_SHADER_CACHE_KIND_FLAGS kinds, D3D12_SHADER_CACHE_CONTROL_FLAGS control) {
   const UINT all_kinds = D3D12_SHADER_CACHE_KIND_FLAG_IMPLICIT_D3D_CACHE_FOR_DRIVER | D3D12_SHADER_CACHE_KIND_FLAG_IMPLICIT_D3D_CONVERSIONS |
                          D3D12_SHADER_CACHE_KIND_FLAG_IMPLICIT_DRIVER_MANAGED | D3D12_SHADER_CACHE_KIND_FLAG_APPLICATION_MANAGED;
@@ -398,7 +498,8 @@ static HRESULT STDMETHODCALLTYPE dev_ShaderCacheControl(Dev *This, D3D12_SHADER_
   if ((control & D3D12_SHADER_CACHE_CONTROL_FLAG_DISABLE) && (control & D3D12_SHADER_CACHE_CONTROL_FLAG_ENABLE)) return E_INVALIDARG;
   if ((kinds & D3D12_SHADER_CACHE_KIND_FLAG_APPLICATION_MANAGED) && (control & D3D12_SHADER_CACHE_CONTROL_FLAG_CLEAR)) {
     AcquireSRWLockShared(&This->cache_lock);
-    for (ShaderCache *c = This->caches; c; c = c->next) {
+    for (ShaderCache *s = This->caches; s; s = s->next) {
+      CacheStore *c = s->store;
       EnterCriticalSection(&c->lock);
       scache_clear(c);
       c->rewrite = FAILED(scache_save(c));      /* (a clear the file could not take: the next StoreValue writes it again) */

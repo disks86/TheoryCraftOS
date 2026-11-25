@@ -301,9 +301,11 @@ struct Dev {
 #define DEV_FEATURE2_STORAGE_ALL_STAGES (1u << 6)        /* storage images and typed views of buffers in vertex, geometry, hull and domain shaders too */
 #define DEV_FEATURE2_MIPMAPPED_LAYERS (1u << 10)         /* graphics::kFeature2MipmappedLayers: levels of arrays, cubes, volumes, targets, depth buffers and the wide formats, cube arrays,
                                                           * shader resource views of levels and layers, render targets and depth views of a level */
+#define DEV_FEATURE2_COLOR_RESOLVE_MODES (1u << 14)      /* graphics::kFeature2ColorResolveModes: resolves of a colour image's least and greatest samples */
 
 static const GUID *const g_device_iids[] = {&IID_ID3D12Object, &IID_ID3D12Device, &IID_ID3D12Device1, &IID_ID3D12Device2, &IID_ID3D12Device3, &IID_ID3D12Device4,
-                                            &IID_ID3D12Device5, &IID_ID3D12Device6, &IID_ID3D12Device7, &IID_ID3D12Device8, &IID_ID3D12Device9, &IID_ID3D12Device10, NULL};
+                                            &IID_ID3D12Device5, &IID_ID3D12Device6, &IID_ID3D12Device7, &IID_ID3D12Device8, &IID_ID3D12Device9, &IID_ID3D12Device10,
+                                            &IID_ID3D12Device11, &IID_ID3D12Device12, &IID_ID3D12Device13, &IID_ID3D12Device14, NULL};
 
 static void dev_addref(Dev *d) { dx_AddRef(OBJ(d)); }
 static void dev_release(Dev *d) { dx_Release(OBJ(d)); }

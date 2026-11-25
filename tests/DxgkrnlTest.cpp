@@ -5122,21 +5122,24 @@ std::vector<uint8_t> serialize_signature(uint32_t version, const std::vector<Sig
       payload.push_back(static_cast<uint32_t>(p.ranges.size())), payload.push_back(ranges_at * 4);
       for (const SigRange& r : p.ranges) {
         payload.push_back(r.type), payload.push_back(r.count), payload.push_back(r.base), payload.push_back(r.space);
-        if (version == 2) payload.push_back(0);
+        if (version >= 2) payload.push_back(0);
         payload.push_back(r.offset);
       }
     } else if (p.type == 1) {
       payload.push_back(p.reg), payload.push_back(p.space), payload.push_back(p.num);
     } else {
       payload.push_back(p.reg), payload.push_back(p.space);
-      if (version == 2) payload.push_back(0);
+      if (version >= 2) payload.push_back(0);
     }
   }
   (void)range_words;
   w[4] = (cursor + static_cast<uint32_t>(payload.size())) * 4;
   w.insert(w.end(), array.begin(), array.end());
   w.insert(w.end(), payload.begin(), payload.end());
-  for (const std::vector<uint32_t>& sampler : samplers) w.insert(w.end(), sampler.begin(), sampler.end());
+  for (const std::vector<uint32_t>& sampler : samplers) {
+    w.insert(w.end(), sampler.begin(), sampler.begin() + 13);
+    if (version == 3) w.push_back(sampler.size() > 13 ? sampler[13] : 0);   // (1.2: D3D12_SAMPLER_FLAGS after each static sampler)
+  }
   std::vector<uint8_t> bytes;
   for (uint32_t word : w)
     for (int i = 0; i < 4; ++i) bytes.push_back(static_cast<uint8_t>(word >> (8 * i)));
@@ -5155,7 +5158,7 @@ void test_root_signature_parse() {
       {2, 0, {}, 1, 0, 0},                                              // a root constant buffer view at b1
       {0, 0, {{3, 4, 0, 0, 0}}},                                        // a sampler table of four
   };
-  for (uint32_t version : {1u, 2u}) {
+  for (uint32_t version : {1u, 2u, 3u}) {
     const std::vector<uint8_t> blob = serialize_signature(version, params, {static_sampler(0x15, 3, 0)});
     RootSignatureDesc desc;
     CHECK(parse_root_signature(ConstByteView(blob.data(), blob.size()), &desc) == status::kSuccess);
@@ -5188,6 +5191,30 @@ void test_root_signature_parse() {
   CHECK(bad({{0, 0, {{0, 0xFFFFFFFFu, 0, 0, 0}, {0, 1, 0, 0, 0xFFFFFFFFu}}}}));                  // (unbounded, then another)
   CHECK(bad({{0, 0, {}}}));                                                                       // (no ranges)
   CHECK(bad({{1, 0, {}, 0, 0, 0}}));                                                              // (no values)
+  // Version 1.2's static samplers: the integer border colours with their flag (the same colours as the float ones), not without it nor the flag without them; no
+  // sampler of coordinates in texels (NonNormalizedCoordinateSamplersSupported is FALSE); the colours of 1.2 are not 1.0's or 1.1's.
+  {
+    auto sampler12 = [](uint32_t border, uint32_t flags) {
+      std::vector<uint32_t> s = static_sampler(0x15, 4, 0);
+      s[7] = border;
+      s.push_back(flags);
+      return s;
+    };
+    auto parse12 = [&](uint32_t version, const std::vector<uint32_t>& sampler, RootSignatureDesc* out) {
+      const std::vector<uint8_t> blob = serialize_signature(version, {{1, 0, {}, 0, 0, 4}}, {sampler});
+      return parse_root_signature(ConstByteView(blob.data(), blob.size()), out);
+    };
+    RootSignatureDesc s12;
+    CHECK(parse12(3, sampler12(4, 1), &s12) == status::kSuccess && s12.sampler_count == 1 && s12.samplers[0].sampler.border == graphics::BorderColor::OpaqueWhite);
+    CHECK(parse12(3, sampler12(3, 1), &s12) == status::kSuccess && s12.samplers[0].sampler.border == graphics::BorderColor::OpaqueBlack);
+    CHECK(parse12(3, sampler12(2, 0), &s12) == status::kSuccess && s12.samplers[0].sampler.border == graphics::BorderColor::OpaqueWhite);
+    CHECK(parse12(3, sampler12(4, 0), &s12) == status::kInvalidParameter);   // (an integer colour without its flag)
+    CHECK(parse12(3, sampler12(1, 1), &s12) == status::kInvalidParameter);   // (the flag with a float colour)
+    CHECK(parse12(3, sampler12(0, 2), &s12) == status::kInvalidParameter);   // (coordinates in texels)
+    CHECK(parse12(3, sampler12(0, 8), &s12) == status::kInvalidParameter);   // (a flag that does not exist)
+    CHECK(parse12(2, sampler12(3, 0), &s12) == status::kInvalidParameter);   // (1.2's colour in a 1.1 root signature)
+    CHECK(parse12(3, sampler12(5, 1), &s12) == status::kInvalidParameter);   // (no sixth colour)
+  }
   std::vector<uint8_t> blob = serialize_signature(1, {{1, 0, {}, 0, 0, 4}});
   blob[0] = 7;
   CHECK(parse_root_signature(ConstByteView(blob.data(), blob.size()), &d) == status::kInvalidParameter);

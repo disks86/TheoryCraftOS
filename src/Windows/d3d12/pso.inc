@@ -142,7 +142,7 @@ static void rs_scan(RootSig *r, const BYTE *b, SIZE_T n) {
   if (rts0) { b = rts0; n = chunk; }
   if (n < 24) return;
   const UINT version = rd32(b), count = rd32(b + 4), params = rd32(b + 8);
-  if (version != 1 && version != 2) return;
+  if (version < 1 || version > 3) return;      /* (1.0, 1.1, 1.2: 1.2 differs from 1.1 in its static samplers alone) */
   r->parameter_count = count;
   for (UINT i = 0; i < count && i < 16; ++i) {
     if (params + (SIZE_T)i * 12 + 12 > n) return;
@@ -150,7 +150,7 @@ static void rs_scan(RootSig *r, const BYTE *b, SIZE_T n) {
     r->ptype[i] = type;
     if (type == 1 && payload + 12 <= n) r->pconstants[i] = rd32(b + payload + 8);
     if (type != 0 || payload + 8 > n) continue;
-    const UINT range_count = rd32(b + payload), ranges = rd32(b + payload + 4), stride = version == 2 ? 24 : 20;
+    const UINT range_count = rd32(b + payload), ranges = rd32(b + payload + 4), stride = version >= 2 ? 24 : 20;
     UINT next = 0;      /* where a range that is appended begins */
     for (UINT k = 0; k < range_count && k < 8; ++k) {
       if (ranges + (SIZE_T)k * stride + stride > n) return;
@@ -194,128 +194,7 @@ static HRESULT STDMETHODCALLTYPE dev_CreateRootSignature(Dev *This, UINT mask, c
   return query_out((IUnknown *)r, riid, out);
 }
 
-/* ---- the serializer ---------------------------------------------------------------------------------------------------------------------------------------------------------- */
-
-typedef struct Bytes { BYTE *p; SIZE_T size, cap; int bad; } Bytes;
-static void bytes_put(Bytes *b, UINT v) {
-  if (b->size + 4 > b->cap) {
-    const SIZE_T cap = b->cap ? b->cap * 2 : 256;
-    BYTE *n = mem_grow(b->p, cap);
-    if (!n) { b->bad = 1; return; }
-    b->p = n; b->cap = cap;
-  }
-  memcpy(b->p + b->size, &v, 4);
-  b->size += 4;
-}
-
-/* Writes a root signature of version 1.0 (`v11` 0) or 1.1 from the 1.0 description, or a 1.1 description (`d11` set). Parameter payloads follow the parameter array, then ranges,
- * then the static samplers. */
-static Blob *serialize_root_signature(const D3D12_ROOT_SIGNATURE_DESC *d10, const D3D12_ROOT_SIGNATURE_DESC1 *d11, int out_v11) {
-  Bytes b = {0};
-  const UINT np = d11 ? d11->NumParameters : d10->NumParameters;
-  const UINT ns = d11 ? d11->NumStaticSamplers : d10->NumStaticSamplers;
-  const D3D12_STATIC_SAMPLER_DESC *samplers = d11 ? d11->pStaticSamplers : d10->pStaticSamplers;
-  const UINT flags = d11 ? d11->Flags : d10->Flags;
-  const UINT range_stride = out_v11 ? 24 : 20;
-  /* pass 1: the sizes */
-  UINT payload_bytes = 0, range_bytes = 0;
-  for (UINT i = 0; i < np; ++i) {
-    const UINT type = d11 ? d11->pParameters[i].ParameterType : d10->pParameters[i].ParameterType;
-    if (type == D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE) {
-      payload_bytes += 8;
-      range_bytes += (d11 ? d11->pParameters[i].DescriptorTable.NumDescriptorRanges : d10->pParameters[i].DescriptorTable.NumDescriptorRanges) * range_stride;
-    } else if (type == D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS) {
-      payload_bytes += 12;
-    } else {
-      payload_bytes += out_v11 ? 12 : 8;
-    }
-  }
-  const UINT params_at = 24, payloads_at = params_at + np * 12, ranges_at = payloads_at + payload_bytes, samplers_at = ranges_at + range_bytes;
-  bytes_put(&b, out_v11 ? 2 : 1);
-  bytes_put(&b, np);
-  bytes_put(&b, params_at);
-  bytes_put(&b, ns);
-  bytes_put(&b, samplers_at);
-  bytes_put(&b, flags);
-  UINT payload = payloads_at;
-  for (UINT i = 0; i < np; ++i) {
-    const UINT type = d11 ? d11->pParameters[i].ParameterType : d10->pParameters[i].ParameterType;
-    const UINT vis = d11 ? d11->pParameters[i].ShaderVisibility : d10->pParameters[i].ShaderVisibility;
-    bytes_put(&b, type);
-    bytes_put(&b, vis);
-    bytes_put(&b, payload);
-    payload += type == D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE ? 8 : type == D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS ? 12 : (out_v11 ? 12 : 8);
-  }
-  UINT range_at = ranges_at;
-  for (UINT i = 0; i < np; ++i) {
-    const UINT type = d11 ? d11->pParameters[i].ParameterType : d10->pParameters[i].ParameterType;
-    if (type == D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE) {
-      const UINT n = d11 ? d11->pParameters[i].DescriptorTable.NumDescriptorRanges : d10->pParameters[i].DescriptorTable.NumDescriptorRanges;
-      bytes_put(&b, n);
-      bytes_put(&b, range_at);
-      range_at += n * range_stride;
-    } else if (type == D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS) {
-      const D3D12_ROOT_CONSTANTS *c = d11 ? &d11->pParameters[i].Constants : &d10->pParameters[i].Constants;
-      bytes_put(&b, c->ShaderRegister); bytes_put(&b, c->RegisterSpace); bytes_put(&b, c->Num32BitValues);
-    } else {
-      const D3D12_ROOT_DESCRIPTOR *rd = d11 ? (const D3D12_ROOT_DESCRIPTOR *)&d11->pParameters[i].Descriptor : &d10->pParameters[i].Descriptor;
-      bytes_put(&b, rd->ShaderRegister); bytes_put(&b, rd->RegisterSpace);
-      if (out_v11) bytes_put(&b, d11 ? d11->pParameters[i].Descriptor.Flags : 0);
-    }
-  }
-  for (UINT i = 0; i < np; ++i) {
-    const UINT type = d11 ? d11->pParameters[i].ParameterType : d10->pParameters[i].ParameterType;
-    if (type != D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE) continue;
-    const UINT n = d11 ? d11->pParameters[i].DescriptorTable.NumDescriptorRanges : d10->pParameters[i].DescriptorTable.NumDescriptorRanges;
-    for (UINT k = 0; k < n; ++k) {
-      UINT rt, num, base, space, offset, rflags = 0;
-      if (d11) {
-        const D3D12_DESCRIPTOR_RANGE1 *r = &d11->pParameters[i].DescriptorTable.pDescriptorRanges[k];
-        rt = r->RangeType; num = r->NumDescriptors; base = r->BaseShaderRegister; space = r->RegisterSpace; offset = r->OffsetInDescriptorsFromTableStart; rflags = r->Flags;
-      } else {
-        const D3D12_DESCRIPTOR_RANGE *r = &d10->pParameters[i].DescriptorTable.pDescriptorRanges[k];
-        rt = r->RangeType; num = r->NumDescriptors; base = r->BaseShaderRegister; space = r->RegisterSpace; offset = r->OffsetInDescriptorsFromTableStart;
-      }
-      bytes_put(&b, rt); bytes_put(&b, num); bytes_put(&b, base); bytes_put(&b, space);
-      if (out_v11) bytes_put(&b, rflags);
-      bytes_put(&b, offset);
-    }
-  }
-  for (UINT i = 0; i < ns; ++i) {
-    const D3D12_STATIC_SAMPLER_DESC *s = &samplers[i];
-    bytes_put(&b, s->Filter); bytes_put(&b, s->AddressU); bytes_put(&b, s->AddressV); bytes_put(&b, s->AddressW);
-    bytes_put(&b, bits_of(s->MipLODBias)); bytes_put(&b, s->MaxAnisotropy); bytes_put(&b, s->ComparisonFunc); bytes_put(&b, s->BorderColor);
-    bytes_put(&b, bits_of(s->MinLOD)); bytes_put(&b, bits_of(s->MaxLOD)); bytes_put(&b, s->ShaderRegister); bytes_put(&b, s->RegisterSpace); bytes_put(&b, s->ShaderVisibility);
-  }
-  if (b.bad) { mem_free(b.p); return NULL; }
-  Blob *blob = blob_new(b.p, b.size);
-  mem_free(b.p);
-  return blob;
-}
-
-EXPORT HRESULT WINAPI D3D12SerializeRootSignature(const D3D12_ROOT_SIGNATURE_DESC *desc, D3D_ROOT_SIGNATURE_VERSION version, ID3DBlob **blob, ID3DBlob **error) {
-  if (blob) *blob = NULL;
-  if (error) *error = NULL;
-  if (!desc || !blob || (version != D3D_ROOT_SIGNATURE_VERSION_1_0 && version != D3D_ROOT_SIGNATURE_VERSION_1_1)) return E_INVALIDARG;
-  if ((desc->NumParameters && !desc->pParameters) || (desc->NumStaticSamplers && !desc->pStaticSamplers)) return E_INVALIDARG;
-  Blob *b = serialize_root_signature(desc, NULL, version == D3D_ROOT_SIGNATURE_VERSION_1_1);
-  if (!b) return E_OUTOFMEMORY;
-  *blob = (ID3DBlob *)b;
-  return S_OK;
-}
-
-EXPORT HRESULT WINAPI D3D12SerializeVersionedRootSignature(const D3D12_VERSIONED_ROOT_SIGNATURE_DESC *desc, ID3DBlob **blob, ID3DBlob **error) {
-  if (blob) *blob = NULL;
-  if (error) *error = NULL;
-  if (!desc || !blob) return E_INVALIDARG;
-  Blob *b = NULL;
-  if (desc->Version == D3D_ROOT_SIGNATURE_VERSION_1_0) b = serialize_root_signature(&desc->Desc_1_0, NULL, 0);
-  else if (desc->Version == D3D_ROOT_SIGNATURE_VERSION_1_1) b = serialize_root_signature(NULL, &desc->Desc_1_1, 1);
-  else return E_INVALIDARG;
-  if (!b) return E_OUTOFMEMORY;
-  *blob = (ID3DBlob *)b;
-  return S_OK;
-}
+/* (the serializer, D3D12SerializeRootSignature and D3D12SerializeVersionedRootSignature, is in rootsig.inc) */
 
 /* ---- pipeline states ----------------------------------------------------------------------------------------------------------------------------------------------------------- */
 
@@ -607,6 +486,8 @@ static HRESULT blend_state_check(const Dev *dev, const D3D12_BLEND_DESC *b, UINT
 static HRESULT STDMETHODCALLTYPE dev_CreateGraphicsPipelineState(Dev *This, const D3D12_GRAPHICS_PIPELINE_STATE_DESC *desc, REFIID riid, void **out) {
   extern const ID3D12PipelineStateVtbl pso_vtbl;
   if (!desc || !desc->pRootSignature || !desc->VS.pShaderBytecode) return E_INVALIDARG;
+  /* (a depth bias or strip cut set by the command list: DynamicDepthBiasSupported and DynamicIndexBufferStripCutSupported are FALSE, OPTIONS16 / 15) */
+  if (desc->Flags & (D3D12_PIPELINE_STATE_FLAG_DYNAMIC_DEPTH_BIAS | D3D12_PIPELINE_STATE_FLAG_DYNAMIC_INDEX_BUFFER_STRIP_CUT)) return E_INVALIDARG;
   if (desc->SampleDesc.Count > 1 && (desc->SampleDesc.Count >= 32 || !((This->caps.sample_counts >> desc->SampleDesc.Count) & 1))) return DXGI_ERROR_UNSUPPORTED;
   if (desc->StreamOutput.NumEntries > 16 || desc->StreamOutput.NumStrides > 4) return DXGI_ERROR_UNSUPPORTED;
   Pso *p = dobj_new(sizeof *p, This, &pso_vtbl, g_pso_iids, pso_destroy);
@@ -725,6 +606,7 @@ static HRESULT STDMETHODCALLTYPE dev_CreateGraphicsPipelineState(Dev *This, cons
 static HRESULT STDMETHODCALLTYPE dev_CreateComputePipelineState(Dev *This, const D3D12_COMPUTE_PIPELINE_STATE_DESC *desc, REFIID riid, void **out) {
   extern const ID3D12PipelineStateVtbl pso_vtbl;
   if (!desc || !desc->pRootSignature || !desc->CS.pShaderBytecode) return E_INVALIDARG;
+  if (desc->Flags & (D3D12_PIPELINE_STATE_FLAG_DYNAMIC_DEPTH_BIAS | D3D12_PIPELINE_STATE_FLAG_DYNAMIC_INDEX_BUFFER_STRIP_CUT)) return E_INVALIDARG;
   Pso *p = dobj_new(sizeof *p, This, &pso_vtbl, g_pso_iids, pso_destroy);
   if (!p) return E_OUTOFMEMORY;
   p->compute = 1;

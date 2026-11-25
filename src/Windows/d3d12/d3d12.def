@@ -10,6 +10,7 @@ D3D12CoreGetLayeredDeviceSize @104
 D3D12CoreRegisterLayers @105
 D3D12CreateRootSignatureDeserializer @106
 D3D12CreateVersionedRootSignatureDeserializer @107
+D3D12CreateVersionedRootSignatureDeserializerFromSubobjectInLibrary
 D3D12EnableExperimentalFeatures @109
 D3D12GetInterface @110
 D3D12PIXEventsReplaceBlock @111

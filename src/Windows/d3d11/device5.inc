@@ -54,15 +54,15 @@ static HRESULT fence_wrap(Dev *d, ID3D12Fence *f12, UINT flags, REFIID riid, voi
   return hr;
 }
 
-/* D3D11_FENCE_FLAG_NONE is 1 in some headers and 0 in others: both mean none. SHARED is a fence CreateSharedHandle shares; NON_MONITORED changes nothing (no fence
- * here keeps its value in memory a process maps); one shared across adapters needs cross-adapter objects the kernel does not have. */
+/* D3D11_FENCE_FLAG_NONE is 1 in some headers and 0 in others: both mean none. SHARED is a fence CreateSharedHandle shares; SHARED_CROSS_ADAPTER one devices of other
+ * adapters open too (Direct3D 12's, d3d12.dll queue.inc); NON_MONITORED changes nothing (no fence here keeps its value in memory a process maps). */
 static HRESULT STDMETHODCALLTYPE dev_CreateFence(Dev *d, UINT64 initial, D3D11_FENCE_FLAG flags, REFIID riid, void **out) {
   if (out) *out = NULL;
   if (!riid || !out) return E_INVALIDARG;
   if ((UINT)flags & ~(UINT)(D3D11_FENCE_FLAG_NONE | D3D11_FENCE_FLAG_SHARED | D3D11_FENCE_FLAG_SHARED_CROSS_ADAPTER | D3D11_FENCE_FLAG_NON_MONITORED)) return E_INVALIDARG;
-  if ((UINT)flags & D3D11_FENCE_FLAG_SHARED_CROSS_ADAPTER) return DXGI_ERROR_UNSUPPORTED;
   D3D12_FENCE_FLAGS f12flags = D3D12_FENCE_FLAG_NONE;
   if ((UINT)flags & D3D11_FENCE_FLAG_SHARED) f12flags |= D3D12_FENCE_FLAG_SHARED;
+  if ((UINT)flags & D3D11_FENCE_FLAG_SHARED_CROSS_ADAPTER) f12flags |= D3D12_FENCE_FLAG_SHARED_CROSS_ADAPTER;
   if ((UINT)flags & D3D11_FENCE_FLAG_NON_MONITORED) f12flags |= D3D12_FENCE_FLAG_NON_MONITORED;
   ID3D12Fence *f12 = NULL;
   const HRESULT hr = ID3D12Device_CreateFence(d->d12, initial, f12flags, &IID_ID3D12Fence, (void **)&f12);
