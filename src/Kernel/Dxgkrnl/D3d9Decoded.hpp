@@ -75,7 +75,7 @@ enum Opcode : uint16_t {
   // rasterizer - the pass's positions -; (x, y, 0, 0) in pixels from the centre, swizzled by tex_swizzle, (0, 0, 0, 0) for an index past the count). The evaluations of a pixel shader's input
   // src[0] (an input register: its varying, swizzle and modifier) at a point of the pixel: kEvalSample at the sample src[1] names, kEvalCentroid at the centroid, kEvalSnapped at the
   // offset src[1] gives (integers x y, sixteenths of a pixel from the centre, -8 .. 7: the low four bits, signed).
-  kSamplePos = 0x1800, kEvalSample, kEvalCentroid, kEvalSnapped,
+  kSamplePos = 0x1900, kEvalSample, kEvalCentroid, kEvalSnapped,
   kLoopBegin = 0x1200, kLoopEnd, kBreak0, kBreakNz, kBreakZ, kContinue0, kContinueNz, kContinueZ,
   // Wave operations (Shader Model 6, from the DXIL translator: D3d9Dxbc.cpp's private opcodes kDxbcWaveFirst ..). They read the lanes of the wave that are at the same instruction (see
   // WaveRunner in D3d9Shader.cpp): the active lanes, which are those lanes but a pixel shader's helpers, and for the quad operations the helpers too. `stride` is the site: the DXIL
@@ -92,6 +92,7 @@ enum Opcode : uint16_t {
   kWaveCountBits, kWavePrefixCountBits, kQuadReadLaneAt, kQuadReadAcross, kWaveMatch, kWaveMultiPrefix, kWaveMultiPrefixCountBits, kQuadAny, kQuadAll,
   kWaveFirst = kWaveIsFirstLane, kWaveLast = kQuadAll,
 };
+static_assert(kSamplePos > kWaveLast || kEvalSnapped < kWaveFirst, "the multisampling operations and the wave operations share numbers");
 // The value type (low four bits of `control`) and the operation (high four) of a typed wave operation.
 enum WaveType : uint8_t { kWaveF32 = 0, kWaveI32, kWaveU32, kWaveF64, kWaveI64, kWaveU64 };
 enum WaveOp : uint8_t { kWaveSum = 0, kWaveProduct, kWaveMin, kWaveMax, kWaveAnd, kWaveOr, kWaveXor };
