@@ -22,7 +22,10 @@
 
 /* ---- vertices --------------------------------------------------------------------------------------------------------------------------------------- */
 
-typedef struct Source { const BYTE *data; UINT bytes, stride; } Source;
+/* A stream as a draw reads it: per vertex, or (instanced) one element for every vertex of the instance being drawn. */
+typedef struct Source { const BYTE *data; UINT bytes, stride; BOOL instanced; UINT element; } Source;
+/* Where an attribute of vertex `vertex` is. */
+static const BYTE *source_at(const Source *s, UINT vertex, UINT offset) { return s->data + (SIZE_T)(s->instanced ? s->element : vertex) * s->stride + offset; }
 
 static float half_to_float(WORD h) {
   const UINT exponent = (h >> 10) & 31, mantissa = h & 1023;
@@ -62,12 +65,26 @@ static void decode_element(BYTE type, const BYTE *p, float out[4]) {
     case D3DDECLTYPE_UBYTE4N: for (int i = 0; i < 4; ++i) out[i] = p[i] / 255.0f; break;
     case D3DDECLTYPE_SHORT2: memcpy(s, p, 4); out[0] = (float)s[0]; out[1] = (float)s[1]; break;
     case D3DDECLTYPE_SHORT4: memcpy(s, p, 8); for (int i = 0; i < 4; ++i) out[i] = (float)s[i]; break;
-    case D3DDECLTYPE_SHORT2N: memcpy(s, p, 4); out[0] = s[0] / 32767.0f; out[1] = s[1] / 32767.0f; break;
-    case D3DDECLTYPE_SHORT4N: memcpy(s, p, 8); for (int i = 0; i < 4; ++i) out[i] = s[i] / 32767.0f; break;
+    /* (signed normalised: -32768 is -1 as -32767 is) */
+    case D3DDECLTYPE_SHORT2N: memcpy(s, p, 4); for (int i = 0; i < 2; ++i) out[i] = s[i] < -32767 ? -1.0f : s[i] / 32767.0f; break;
+    case D3DDECLTYPE_SHORT4N: memcpy(s, p, 8); for (int i = 0; i < 4; ++i) out[i] = s[i] < -32767 ? -1.0f : s[i] / 32767.0f; break;
     case D3DDECLTYPE_USHORT2N: memcpy(w, p, 4); out[0] = w[0] / 65535.0f; out[1] = w[1] / 65535.0f; break;
     case D3DDECLTYPE_USHORT4N: memcpy(w, p, 8); for (int i = 0; i < 4; ++i) out[i] = w[i] / 65535.0f; break;
     case D3DDECLTYPE_FLOAT16_2: memcpy(w, p, 4); out[0] = half_to_float(w[0]); out[1] = half_to_float(w[1]); break;
     case D3DDECLTYPE_FLOAT16_4: memcpy(w, p, 8); for (int i = 0; i < 4; ++i) out[i] = half_to_float(w[i]); break;
+    case D3DDECLTYPE_UDEC3: case D3DDECLTYPE_DEC3N: {      /* (three 10-bit fields from bit 0; the top two bits are not read; UDEC3 unsigned as they are, DEC3N signed and normalised) */
+      UINT v;
+      memcpy(&v, p, 4);
+      for (int i = 0; i < 3; ++i) {
+        const UINT field = (v >> (10 * i)) & 1023u;
+        if (type == D3DDECLTYPE_UDEC3) out[i] = (float)field;
+        else {
+          const int value = field & 512u ? (int)field - 1024 : (int)field;
+          out[i] = value < -511 ? -1.0f : value / 511.0f;
+        }
+      }
+      break;
+    }
     default: break;
   }
 }
@@ -77,6 +94,7 @@ static BOOL attribute_inside(const Attribute *a, const Source *sources, UINT fir
   const Source *s = &sources[a->stream];
   const UINT size = type_bytes(a->type);
   if (!s->data || !size || count == 0) return FALSE;
+  if (s->instanced) return (UINT64)s->element * s->stride + a->offset + size <= s->bytes;      /* (the instance's one element) */
   const UINT64 last = (UINT64)(first + count - 1) * s->stride + a->offset + size;
   return first <= 0xFFFFFFFFu - count && last <= s->bytes;
 }
@@ -94,24 +112,24 @@ static void decode_vertices(const Layout *l, const Source *sources, UINT first, 
   for (UINT v = 0; v < count; ++v, out += VERTEX_BYTES(c->sets)) {
     float *f = (float *)out, value[4];
     f[3] = 1.0f;      /* (the fourth of a position that are pixels is 1 / w; one of three numbers has none) */
-    decode_element(l->position.type, sources[l->position.stream].data + (SIZE_T)(first + v) * sources[l->position.stream].stride + l->position.offset, f);
+    decode_element(l->position.type, source_at(&sources[l->position.stream], first + v, l->position.offset), f);
     f[4] = f[5] = f[6] = f[7] = 1.0f;
-    if (l->colour.type != 255) decode_element(l->colour.type, sources[l->colour.stream].data + (SIZE_T)(first + v) * sources[l->colour.stream].stride + l->colour.offset, f + 4);
+    if (l->colour.type != 255) decode_element(l->colour.type, source_at(&sources[l->colour.stream], first + v, l->colour.offset), f + 4);
     float normal[4] = {0.0f, 0.0f, 0.0f, 0.0f};
     if ((lit || c->needs_normal) && l->normal.type != 255)
-      decode_element(l->normal.type, sources[l->normal.stream].data + (SIZE_T)(first + v) * sources[l->normal.stream].stride + l->normal.offset, normal);
+      decode_element(l->normal.type, source_at(&sources[l->normal.stream], first + v, l->normal.offset), normal);
     for (UINT t = 0; t < c->sets; ++t) {
       const Attribute *a = &l->texture[c->set[t]];
       value[0] = value[1] = value[2] = 0.0f;
       value[3] = 1.0f;
-      if (a->type != 255) decode_element(a->type, sources[a->stream].data + (SIZE_T)(first + v) * sources[a->stream].stride + a->offset, value);
+      if (a->type != 255) decode_element(a->type, source_at(&sources[a->stream], first + v, a->offset), value);
       ffl_texture_coordinates(&c->stage[t], c->world_view, c->normal, c->normalize, f, normal, value, a->type != 255 ? type_components(a->type) : 0, c->for_program,
                               f + 12 + 4 * t);
     }
     /* the second colour, and the fog factor a vertex brings, which is its alpha; a vertex without one brings none (1) */
     float second[4] = {0.0f, 0.0f, 0.0f, 1.0f};
     if (l->specular.type != 255)
-      decode_element(l->specular.type, sources[l->specular.stream].data + (SIZE_T)(first + v) * sources[l->specular.stream].stride + l->specular.offset, second);
+      decode_element(l->specular.type, source_at(&sources[l->specular.stream], first + v, l->specular.offset), second);
     f[8] = second[3];
     f[9] = second[0]; f[10] = second[1]; f[11] = second[2];
     if (lit) {
@@ -139,7 +157,7 @@ static void decode_shader_vertices(const Attribute *a, UINT inputs, const Source
   for (UINT v = 0; v < count; ++v) {
     for (UINT i = 0; i < inputs; ++i, out += 16) {
       float value[4] = {0.0f, 0.0f, 0.0f, 1.0f};
-      if (a[i].type != 255) decode_element(a[i].type, sources[a[i].stream].data + (SIZE_T)(first + v) * sources[a[i].stream].stride + a[i].offset, value);
+      if (a[i].type != 255) decode_element(a[i].type, source_at(&sources[a[i].stream], first + v, a[i].offset), value);
       memcpy(out, value, 16);
     }
   }
@@ -845,12 +863,22 @@ static HRESULT draw(Dev *d, D3DPRIMITIVETYPE type, UINT primitives, const Source
   return D3D_OK;
 }
 
+/* The streams of a draw; a stream of instance data (D3DSTREAMSOURCE_INSTANCEDATA) gives every vertex its element of instance 0 (instance_sources). */
 static void stream_sources(Dev *d, Source *sources) {
   for (UINT i = 0; i < STREAMS; ++i) {
     const Stream *s = &d->state.stream[i];
     sources[i].data = s->buffer && s->offset < s->buffer->length ? s->buffer->data + s->offset : NULL;
     sources[i].bytes = sources[i].data ? s->buffer->length - s->offset : 0;
     sources[i].stride = s->stride;
+    sources[i].instanced = (s->freq & D3DSTREAMSOURCE_INSTANCEDATA) != 0;
+    sources[i].element = 0;
+  }
+}
+/* The streams of instance data at instance `instance`: element instance / n of a stream of D3DSTREAMSOURCE_INSTANCEDATA | n (n = 0: element 0, it does not step). */
+static void instance_sources(Dev *d, Source *sources, UINT instance) {
+  for (UINT i = 0; i < STREAMS; ++i) {
+    const UINT n = d->state.stream[i].freq & ~(D3DSTREAMSOURCE_INDEXEDDATA | D3DSTREAMSOURCE_INSTANCEDATA);
+    if (sources[i].instanced) sources[i].element = n ? instance / n : 0;
   }
 }
 
@@ -872,7 +900,14 @@ static HRESULT STDMETHODCALLTYPE dev_DrawIndexedPrimitive(Dev *d, D3DPRIMITIVETY
   if ((INT64)base + lowest < 0) return D3DERR_INVALIDCALL;
   EnterCriticalSection(&d->lock);
   stream_sources(d, sources);
-  const HRESULT hr = draw(d, type, primitives, sources, (UINT)(base + (INT)lowest), vertices, ib->data + (SIZE_T)start * index_bytes, index_bytes, base);
+  /* Instancing: stream 0's D3DSTREAMSOURCE_INDEXEDDATA | n draws the indices n times (n = 0: no instance), the instance data streams stepping with the instances. */
+  const DWORD freq0 = d->state.stream[0].freq;
+  const UINT instances = freq0 & D3DSTREAMSOURCE_INDEXEDDATA ? freq0 & ~D3DSTREAMSOURCE_INDEXEDDATA : 1;
+  HRESULT hr = D3D_OK;
+  for (UINT instance = 0; instance < instances && SUCCEEDED(hr); ++instance) {
+    instance_sources(d, sources, instance);
+    hr = draw(d, type, primitives, sources, (UINT)(base + (INT)lowest), vertices, ib->data + (SIZE_T)start * index_bytes, index_bytes, base);
+  }
   LeaveCriticalSection(&d->lock);
   return hr;
 }

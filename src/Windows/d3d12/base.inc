@@ -310,6 +310,9 @@ struct Dev {
 };
 #define DEV_FEATURE_STREAM_OUTPUT (1u << 21)      /* graphics::kFeatureStreamOutput in KmtCaps.features */
 #define DEV_FEATURE_COMPUTE (1u << 10)            /* graphics::kFeatureCompute: storage buffers (KA_UAV), which shader resource views of buffers are too */
+#define DEV_FEATURE_OCCLUSION_QUERIES (1u << 7)   /* graphics::kFeatureOcclusionQueries: the kernel's queries */
+#define DEV_FEATURE_STATISTICS_QUERIES (1u << 18) /* graphics::kFeatureStatisticsQueries: pipeline and stream output statistics */
+#define DEV_FEATURE_TIMESTAMP_QUERIES (1u << 22)  /* graphics::kFeatureTimestampQueries */
 #define DEV_FEATURE_DEPTH_RESOLVE (1u << 19)      /* graphics::kFeatureDepthResolve */
 #define DEV_FEATURE_RESOLVE_MODES (1u << 20)      /* graphics::kFeatureResolveModes: resolves of the least, greatest (and a depth image's mean) samples */
 #define DEV_FEATURE_VERTEX_FORMATS (1u << 29)     /* graphics::kFeatureVertexFormats: vertex elements other than 32-bit floats */

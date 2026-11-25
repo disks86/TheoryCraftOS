@@ -65,7 +65,7 @@ bool storage_view_format(Format allocation, Format view, graphics::Format* out) 
 
 namespace {
 
-constexpr uint64_t kMaxQueryResultBytes = 1 << 20;
+constexpr uint64_t kMaxQueryResultBytes = 1 << 24;   // (131072 Direct3D 12 pipeline statistics queries of 112 bytes fit)
 constexpr uint32_t kKnownFlags = kAllocVertexBuffer | kAllocIndexBuffer | kAllocTexture | kAllocRenderTarget | kAllocDepthStencil | kAllocPresent | kAllocStaging | kAllocShared | kAllocQueryResult | kAllocUnorderedAccess | kAllocStreamOutput | kAllocConstantBuffer | kAllocTrackState | kAllocHeap | kAllocReserved | kAllocStorageImage;
 
 // The bytes of all levels and layers of an image of the description (pixels, or blocks of a compressed format; a volume's levels have fewer slices). (The width and height are at most

@@ -28,21 +28,23 @@
  *   - State does not carry over from stream to stream: the pipeline, buffers, viewport, root signature and its arguments are sent again before the first draw of a chunk, and again
  *     whenever they changed. The graphics and compute root signatures are separate in Direct3D 12 and one in the stream: the one that is not in use is sent again when used.
  *   - The vertex buffer is one (slot 0); the stride is part of the kernel's pipeline, so the pipeline is chosen at the draw (pso_pipeline).
- *   - Resource barriers are not forwarded (the allocations are not state tracked) except for aliasing; queries, predication, indirect execution, stream output and bundles are not
- *     implemented (their calls do nothing, ExecuteBundle and ExecuteIndirect report nothing: the debug layer is not here to complain). */
+ *   - Resource barriers are not forwarded (the allocations are not state tracked) except for aliasing. Queries, predication, indirect execution, stream output and bundles are
+ *     extras.inc's. */
 
 #define CHUNK_BYTES 65000
 #define CHUNK_ALLOCS 1000
 #define ROOM_BYTES 4096
 #define ROOM_ALLOCS 160      /* (what a draw uses itself, and the resources its tables of descriptors reach: TABLE_ALLOCS a table) */
 #define TABLE_ALLOCS 32
+#define MAX_OPEN_QUERIES 64  /* queries open at once in a list */
+#define CHUNK_QUERIES 250    /* the device queries of a chunk (graphics::kMaxOcclusionQueries, 256, in the kernel) */
 
 struct Indirect;
 typedef struct Chunk {
   BYTE *bytes;
   UINT size;
   struct Indirect *indirect;   /* not a stream: ExecuteIndirect, made into one when the list is executed (the arguments are read then) */
-  UINT queries;                /* queries begun in the stream (the kernel takes 64) */
+  UINT queries;                /* the kernel's device queries the stream's queries take (it takes 256: CHUNK_QUERIES here) */
   struct Resource *pred;       /* predication: the 64-bit value that decides whether the chunk runs */
   UINT64 pred_off;
   int pred_op;
@@ -116,7 +118,9 @@ struct CmdList {
   UINT nbound, cap_bound;
   /* the state of the recording */
   Pso *pso;
-  int query_open;
+  /* the queries open (extras.inc): each is begun again in every chunk it goes on into, adding to what the chunks before counted */
+  struct OpenQuery { struct QHeap *heap; UINT index; D3D12_QUERY_TYPE type; UINT kind; } open_q[MAX_OPEN_QUERIES];
+  UINT nopen_q;
   Resource *pred;              /* the predication in force */
   UINT64 pred_off;
   int pred_op;
@@ -200,7 +204,10 @@ static HRESULT STDMETHODCALLTYPE alloc_Reset(CmdAlloc *This) { return S_OK; }
 
 static Chunk *chunk_cur(CmdList *l) { return l->nchunks ? l->chunks[l->nchunks - 1] : NULL; }
 
+static void queries_suspend(CmdList *l);
+static void queries_resume(CmdList *l);
 static int chunk_new(CmdList *l) {
+  if (l->nopen_q && chunk_cur(l) && !chunk_cur(l)->indirect) queries_suspend(l);      /* (the open queries' part in this stream ends with it) */
   if (l->nchunks == l->cap_chunks) {
     const UINT cap = l->cap_chunks ? l->cap_chunks * 2 : 4;
     Chunk **n = mem_grow(l->chunks, cap * sizeof *n);
@@ -210,7 +217,7 @@ static int chunk_new(CmdList *l) {
   }
   Chunk *c = mem_alloc(sizeof *c);
   if (!c) return 0;
-  c->bytes = mem_alloc(CHUNK_BYTES + 256);
+  c->bytes = mem_alloc(CHUNK_BYTES + 256 + MAX_OPEN_QUERIES * 12);      /* (room for the EndQuery of every open query) */
   if (!c->bytes) { mem_free(c); return 0; }
   c->pred = l->pred;
   c->pred_off = l->pred_off;
@@ -225,6 +232,7 @@ static int chunk_new(CmdList *l) {
   l->sent_ib_alloc = 0;
   l->sent_viewport = l->sent_scissor = 0;
   l->dirty_heaps = 1;
+  if (l->nopen_q) queries_resume(l);
   return 1;
 }
 
@@ -262,7 +270,6 @@ enum { OP_BEGIN_PASS = 1, OP_END_PASS, OP_BIND_PIPELINE, OP_BIND_VB, OP_BIND_IB,
 
 static void end_pass(CmdList *l) {
   if (!l->pass_open) return;
-  if (l->query_open) { packet(l, OP_END_QUERY, NULL, 0); l->query_open = 0; }
   packet(l, OP_END_PASS, NULL, 0);
   l->pass_open = 0;
 }
@@ -340,10 +347,12 @@ static HRESULT STDMETHODCALLTYPE dev_CreateCommandList(Dev *This, UINT mask, D3D
 
 static D3D12_COMMAND_LIST_TYPE STDMETHODCALLTYPE list_GetType(CmdList *This) { return This->type; }
 static void flush_pending_clear(CmdList *l);
+static void queries_end_all(CmdList *l);
 static HRESULT STDMETHODCALLTYPE list_Close(CmdList *This) {
   if (This->closed) return E_FAIL;
   end_pass(This);
   if (!This->bundle) flush_pending_clear(This);
+  queries_end_all(This);      /* (a query begun and not ended: it ends with the list, as the kernel's stream needs every query ended) */
   This->closed = 1;
   return S_OK;
 }
@@ -1197,11 +1206,14 @@ static void STDMETHODCALLTYPE list_ResolveSubresource(CmdList *l, ID3D12Resource
 
 /* ---- barriers, queries, markers ------------------------------------------------------------------------------------------------------------------------------------ */
 
+static int unpredicated_begin(CmdList *l);
+static void unpredicated_end(CmdList *l, int split);
 static void STDMETHODCALLTYPE list_ResourceBarrier(CmdList *l, UINT count, const D3D12_RESOURCE_BARRIER *barriers) {
   for (UINT i = 0; i < count; ++i) {
     if (barriers[i].Type != D3D12_RESOURCE_BARRIER_TYPE_ALIASING) continue;
     const Resource *before = (const Resource *)barriers[i].Aliasing.pResourceBefore, *after = (const Resource *)barriers[i].Aliasing.pResourceAfter;
     end_pass(l);
+    const int split = unpredicated_begin(l);      /* (a barrier is not predicated) */
     /* (a planar texture is an allocation for each plane of each slice: every one of the outgoing resource's goes out, every one of the incoming's comes in) */
     const UINT outs = before && before->planes ? before->planes * before->layers : 1, ins = after && after->planes ? after->planes * after->layers : 1;
     for (UINT o = 0; o < outs; ++o)
@@ -1211,6 +1223,7 @@ static void STDMETHODCALLTYPE list_ResourceBarrier(CmdList *l, UINT count, const
         UINT w[7] = {1, 2, out_alloc ? alloc_index(l, out_alloc) : 0xFFFFFFFFu, in_alloc ? alloc_index(l, in_alloc) : 0xFFFFFFFFu, 0, 0, 0};
         packet(l, OP_RESOURCE_BARRIER, w, 6);
       }
+    unpredicated_end(l, split);
   }
 }
 static void STDMETHODCALLTYPE list_SetMarker(CmdList *l, UINT m, const void *d, UINT s) {}

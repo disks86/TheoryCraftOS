@@ -18,9 +18,12 @@
 
 /* d3d12.dll: queries (ID3D12QueryHeap), indirect execution (ID3D12CommandSignature), bundles and tiled (reserved) resources. Included by d3d12.c after the command lists.
  *
- * Queries are the kernel's (BeginQuery / EndQuery in a render pass write 64-bit counts into a kAllocQueryResult buffer): occlusion and binary occlusion, and timestamps (nanoseconds,
- * GetTimestampFrequency says 10^9). Pipeline statistics and stream output statistics are not made. A query is a begin and an end in one pass; a pass the list has to end early (a
- * copy, a clear, a full chunk) ends the query with it. ResolveQueryData copies the results with CopyBuffer.
+ * Queries are the kernel's (BeginQuery / EndQuery write 64-bit counts into a kAllocQueryResult buffer, the query heap): occlusion and binary occlusion, pipeline statistics (and
+ * PIPELINE_STATISTICS1, whose amplification and mesh shader counts are 0: there are no such stages), stream output statistics of each stream, and timestamps (nanoseconds,
+ * GetTimestampFrequency says 10^9; on copy lists into COPY_QUEUE_TIMESTAMP heaps). Any number may be open at once (MAX_OPEN_QUERIES), of one type or several, across passes, clears,
+ * copies and everything else of the list: the kernel's queries span its passes, and a query that goes on into the next chunk is begun again there with kQueryAccumulate, so the
+ * chunks' counts add up. ResolveQueryData copies the results with CopyBuffer. BeginQuery, EndQuery and ResolveQueryData are not predicated (Direct3D 12 predicates draws,
+ * dispatches, clears, copies, resolves and ExecuteIndirect): while predication is in force they go into a chunk of their own that is not.
  *
  * The kernel has no indirect draws, so ExecuteIndirect is made when the list is executed: the list keeps a copy of its state at the call, the argument buffer is read then (after
  * everything before it has run) and the commands it holds are recorded as a list of their own and run. The arguments may set root constants, root views, a vertex buffer and an index buffer.
@@ -75,13 +78,36 @@ static void qheap_destroy(DxObj *o) {
   dobj_child_destroy(o);
 }
 
-/* The bytes of one query's result: 8 (occlusion counts, timestamps), a D3D12_QUERY_DATA_VIDEO_DECODE_STATISTICS (32: the kernel's DecodeFrame writes its first 16, video.inc). */
-static UINT qheap_stride(D3D12_QUERY_HEAP_TYPE type) { return type == D3D12_QUERY_HEAP_TYPE_VIDEO_DECODE_STATISTICS ? 32 : 8; }
+/* The bytes of one query's result: 8 (occlusion counts, timestamps), a D3D12_QUERY_DATA_PIPELINE_STATISTICS (88), D3D12_QUERY_DATA_PIPELINE_STATISTICS1 (112),
+ * D3D12_QUERY_DATA_SO_STATISTICS (16), a D3D12_QUERY_DATA_VIDEO_DECODE_STATISTICS (32: the kernel's DecodeFrame writes its first 16, video.inc). */
+static UINT qheap_stride(D3D12_QUERY_HEAP_TYPE type) {
+  switch (type) {
+    case D3D12_QUERY_HEAP_TYPE_PIPELINE_STATISTICS: return sizeof(D3D12_QUERY_DATA_PIPELINE_STATISTICS);
+    case D3D12_QUERY_HEAP_TYPE_PIPELINE_STATISTICS1: return sizeof(D3D12_QUERY_DATA_PIPELINE_STATISTICS1);
+    case D3D12_QUERY_HEAP_TYPE_SO_STATISTICS: return sizeof(D3D12_QUERY_DATA_SO_STATISTICS);
+    case D3D12_QUERY_HEAP_TYPE_VIDEO_DECODE_STATISTICS: return 32;
+    default: return 8;
+  }
+}
 
 static HRESULT STDMETHODCALLTYPE dev_CreateQueryHeap(Dev *This, const D3D12_QUERY_HEAP_DESC *desc, REFIID riid, void **out) {
   extern const ID3D12QueryHeapVtbl qheap_vtbl;
+  if (out) *out = NULL;
   if (!desc || desc->Count == 0 || desc->Count > 131072) return E_INVALIDARG;
-  if (desc->Type != D3D12_QUERY_HEAP_TYPE_OCCLUSION && desc->Type != D3D12_QUERY_HEAP_TYPE_TIMESTAMP && desc->Type != D3D12_QUERY_HEAP_TYPE_VIDEO_DECODE_STATISTICS) return DXGI_ERROR_UNSUPPORTED;
+  const UINT features = This->caps.features;
+  switch (desc->Type) {
+    case D3D12_QUERY_HEAP_TYPE_OCCLUSION: case D3D12_QUERY_HEAP_TYPE_VIDEO_DECODE_STATISTICS: break;
+    case D3D12_QUERY_HEAP_TYPE_TIMESTAMP: case D3D12_QUERY_HEAP_TYPE_COPY_QUEUE_TIMESTAMP:
+      if (!(features & DEV_FEATURE_TIMESTAMP_QUERIES)) return DXGI_ERROR_UNSUPPORTED;      /* (an adapter whose GPU has no clock the kernel reads) */
+      break;
+    case D3D12_QUERY_HEAP_TYPE_PIPELINE_STATISTICS: case D3D12_QUERY_HEAP_TYPE_PIPELINE_STATISTICS1:
+      if (!(features & DEV_FEATURE_STATISTICS_QUERIES)) return DXGI_ERROR_UNSUPPORTED;
+      break;
+    case D3D12_QUERY_HEAP_TYPE_SO_STATISTICS:
+      if ((features & (DEV_FEATURE_STATISTICS_QUERIES | DEV_FEATURE_STREAM_OUTPUT)) != (DEV_FEATURE_STATISTICS_QUERIES | DEV_FEATURE_STREAM_OUTPUT)) return DXGI_ERROR_UNSUPPORTED;
+      break;
+    default: return E_INVALIDARG;
+  }
   QHeap *h = dobj_new(sizeof *h, This, &qheap_vtbl, g_qheap_iids, qheap_destroy);
   if (!h) return E_OUTOFMEMORY;
   h->desc = *desc;
@@ -94,64 +120,163 @@ static HRESULT STDMETHODCALLTYPE dev_CreateQueryHeap(Dev *This, const D3D12_QUER
   return query_out((IUnknown *)h, riid, out);
 }
 
-/* The kernel's query kind of a Direct3D 12 one (0 occlusion, 1 occlusion predicate, 6 timestamp). */
-static UINT query_kind(D3D12_QUERY_TYPE t) { return t == D3D12_QUERY_TYPE_OCCLUSION ? 0 : t == D3D12_QUERY_TYPE_BINARY_OCCLUSION ? 1 : 6; }
+/* Whether a query type goes with a heap type (BeginQuery, EndQuery and ResolveQueryData take nothing else). */
+static int query_fits_heap(D3D12_QUERY_TYPE t, D3D12_QUERY_HEAP_TYPE h) {
+  switch (t) {
+    case D3D12_QUERY_TYPE_OCCLUSION: case D3D12_QUERY_TYPE_BINARY_OCCLUSION: return h == D3D12_QUERY_HEAP_TYPE_OCCLUSION;
+    case D3D12_QUERY_TYPE_TIMESTAMP: return h == D3D12_QUERY_HEAP_TYPE_TIMESTAMP || h == D3D12_QUERY_HEAP_TYPE_COPY_QUEUE_TIMESTAMP;
+    case D3D12_QUERY_TYPE_PIPELINE_STATISTICS: return h == D3D12_QUERY_HEAP_TYPE_PIPELINE_STATISTICS;
+    case D3D12_QUERY_TYPE_PIPELINE_STATISTICS1: return h == D3D12_QUERY_HEAP_TYPE_PIPELINE_STATISTICS1;
+    case D3D12_QUERY_TYPE_SO_STATISTICS_STREAM0: case D3D12_QUERY_TYPE_SO_STATISTICS_STREAM1: case D3D12_QUERY_TYPE_SO_STATISTICS_STREAM2: case D3D12_QUERY_TYPE_SO_STATISTICS_STREAM3:
+      return h == D3D12_QUERY_HEAP_TYPE_SO_STATISTICS;
+    case D3D12_QUERY_TYPE_VIDEO_DECODE_STATISTICS: return h == D3D12_QUERY_HEAP_TYPE_VIDEO_DECODE_STATISTICS;
+    default: return 0;
+  }
+}
+/* Whether a list of `type` runs a query of type t: copy lists only timestamps (into COPY_QUEUE_TIMESTAMP heaps), compute lists timestamps and pipeline statistics, direct
+ * lists all but the copy queue's timestamps and video decode statistics (a video list's: video.inc). */
+static int query_fits_list(D3D12_COMMAND_LIST_TYPE type, D3D12_QUERY_TYPE t, D3D12_QUERY_HEAP_TYPE h) {
+  if (t == D3D12_QUERY_TYPE_VIDEO_DECODE_STATISTICS) return 0;
+  if (type == D3D12_COMMAND_LIST_TYPE_COPY) return t == D3D12_QUERY_TYPE_TIMESTAMP && h == D3D12_QUERY_HEAP_TYPE_COPY_QUEUE_TIMESTAMP;
+  if (h == D3D12_QUERY_HEAP_TYPE_COPY_QUEUE_TIMESTAMP) return 0;
+  if (type == D3D12_COMMAND_LIST_TYPE_COMPUTE) return t == D3D12_QUERY_TYPE_TIMESTAMP || t == D3D12_QUERY_TYPE_PIPELINE_STATISTICS || t == D3D12_QUERY_TYPE_PIPELINE_STATISTICS1;
+  return 1;
+}
+
+/* The kernel's query kind of a Direct3D 12 one (CommandStream.hpp: 0 occlusion, 1 occlusion predicate, 6 timestamp, 11 pipeline statistics, 12 pipeline statistics 1, 13 stream output
+ * statistics with the stream in bits 8-9). */
+#define KQ_ACCUMULATE (1u << 16)      /* kQueryAccumulate: the counts are added to what the place holds */
+static UINT query_kind(D3D12_QUERY_TYPE t) {
+  switch (t) {
+    case D3D12_QUERY_TYPE_OCCLUSION: return 0;
+    case D3D12_QUERY_TYPE_BINARY_OCCLUSION: return 1;
+    case D3D12_QUERY_TYPE_PIPELINE_STATISTICS: return 11;
+    case D3D12_QUERY_TYPE_PIPELINE_STATISTICS1: return 12;
+    case D3D12_QUERY_TYPE_SO_STATISTICS_STREAM0: case D3D12_QUERY_TYPE_SO_STATISTICS_STREAM1: case D3D12_QUERY_TYPE_SO_STATISTICS_STREAM2: case D3D12_QUERY_TYPE_SO_STATISTICS_STREAM3:
+      return 13u | (UINT)(t - D3D12_QUERY_TYPE_SO_STATISTICS_STREAM0) << 8;
+    default: return 6;
+  }
+}
+/* The kernel's device queries a query of `kind` takes in a stream (a stream output statistics query two, the others one). */
+static UINT query_weight(UINT kind) { return (kind & 0xFF) == 13 ? 2 : 1; }
+
+/* While predication is in force, a command Direct3D 12 does not predicate goes into a chunk of its own without the predicate (returns whether it did: the caller ends it with
+ * unpredicated_end, which goes back to a chunk that has it). */
+static int unpredicated_begin(CmdList *l) {
+  if (!l->pred) return 0;
+  end_pass(l);
+  Resource *p = l->pred;
+  l->pred = NULL;
+  chunk_new(l);
+  l->pred = p;
+  return 1;
+}
+static void unpredicated_end(CmdList *l, int split) {
+  if (!split) return;
+  end_pass(l);
+  chunk_new(l);
+}
+
+static void begin_query_packet(CmdList *l, const struct OpenQuery *q, UINT flags) {
+  UINT w[3] = {alloc_index(l, q->heap->alloc), q->index * qheap_stride(q->heap->desc.Type), q->kind | flags};
+  packet(l, OP_BEGIN_QUERY, w, 3);
+  chunk_cur(l)->queries += query_weight(q->kind);
+}
+static void end_query_packet(CmdList *l, const struct OpenQuery *q) {
+  UINT w[2] = {alloc_index(l, q->heap->alloc), q->index * qheap_stride(q->heap->desc.Type)};
+  packet(l, OP_END_QUERY, w, 2);
+}
+/* The end of a chunk the open queries go on after (chunk_new, ExecuteIndirect): their part in it ends. The chunk has room (CHUNK_BYTES leaves it). */
+static void queries_suspend(CmdList *l) {
+  for (UINT i = 0; i < l->nopen_q; ++i) end_query_packet(l, &l->open_q[i]);
+}
+/* The start of the next chunk: they begin again, adding to what they counted. */
+static void queries_resume(CmdList *l) {
+  for (UINT i = 0; i < l->nopen_q; ++i) begin_query_packet(l, &l->open_q[i], KQ_ACCUMULATE);
+}
+static void queries_end_all(CmdList *l) {
+  if (!l->nopen_q || !chunk_cur(l)) return;
+  queries_suspend(l);
+  l->nopen_q = 0;
+}
+/* Room in the chunk for a query of `weight` more device queries and its packets (a new chunk when there is none: the open queries take theirs again in it). 0 when there is none. */
+static int query_room(CmdList *l, UINT weight) {
+  ensure_room(l, 512 + MAX_OPEN_QUERIES * 16, MAX_OPEN_QUERIES + 4);
+  if (chunk_cur(l)->queries + weight > CHUNK_QUERIES) { end_pass(l); chunk_new(l); }
+  return chunk_cur(l) && chunk_cur(l)->queries + weight <= CHUNK_QUERIES;
+}
+
+static void begin_query(CmdList *l, QHeap *h, UINT index, D3D12_QUERY_TYPE type, UINT kind) {
+  if (l->nopen_q == MAX_OPEN_QUERIES) return;      /* (more open at once than this library keeps: not begun, and its End finds nothing) */
+  for (UINT i = 0; i < l->nopen_q; ++i)
+    if (l->open_q[i].heap == h && l->open_q[i].index == index) return;      /* (begun already: an error the runtime leaves to the debug layer; it goes on as it was) */
+  const int split = unpredicated_begin(l);
+  if (query_room(l, query_weight(kind))) {
+    struct OpenQuery *q = &l->open_q[l->nopen_q];
+    q->heap = h, q->index = index, q->type = type, q->kind = kind;
+    begin_query_packet(l, q, 0);
+    ++l->nopen_q;
+  }
+  unpredicated_end(l, split);
+}
 
 static void STDMETHODCALLTYPE list_BeginQuery(CmdList *l, ID3D12QueryHeap *heap, D3D12_QUERY_TYPE type, UINT index) {
   QHeap *h = (QHeap *)heap;
-  if (l->bundle || !h || index >= h->desc.Count || type == D3D12_QUERY_TYPE_TIMESTAMP || l->query_open) return;
-  if (type != D3D12_QUERY_TYPE_OCCLUSION && type != D3D12_QUERY_TYPE_BINARY_OCCLUSION) return;
-  ensure_room(l, 512, 4);
-  if (chunk_cur(l)->queries >= 60) { end_pass(l); chunk_new(l); }
-  if (!ensure_pass(l)) return;
-  UINT w[3] = {alloc_index(l, h->alloc), index * 8, query_kind(type)};
-  packet(l, OP_BEGIN_QUERY, w, type == D3D12_QUERY_TYPE_OCCLUSION ? 2 : 3);
-  chunk_cur(l)->queries++;
-  l->query_open = 1;
+  /* (a timestamp only ends; a query whose type is not the heap's, past its end or on a list that does not run it is an error the runtime ignores) */
+  if (l->bundle || !h || index >= h->desc.Count || type == D3D12_QUERY_TYPE_TIMESTAMP || !query_fits_heap(type, h->desc.Type) || !query_fits_list(l->type, type, h->desc.Type)) return;
+  begin_query(l, h, index, type, query_kind(type));
 }
 
-/* A query of one of the kernel's kinds (graphics::QueryKind: 0 occlusion, 1 occlusion predicate, 5 pixel shader invocations, 8 | stream << 8 stream output primitives
- * needed ...) into slot `index` of an occlusion heap, for the runtimes layered on this one (TcosD3D12BeginQueryKind). EndQuery with D3D12_QUERY_TYPE_OCCLUSION ends it. */
+/* A query of one of the kernel's kinds of one 64-bit value (graphics::QueryKind 0 .. 10: 0 occlusion, 1 occlusion predicate, 5 pixel shader invocations, 8 | stream << 8
+ * stream output primitives needed ...) into slot `index` of an occlusion heap, for the runtimes layered on this one (TcosD3D12BeginQueryKind). EndQuery with
+ * D3D12_QUERY_TYPE_OCCLUSION ends it. */
 static void list_begin_query_kind(CmdList *l, QHeap *h, UINT index, UINT kind) {
-  if (l->bundle || !h || h->desc.Type != D3D12_QUERY_HEAP_TYPE_OCCLUSION || index >= h->desc.Count || l->query_open) return;
-  ensure_room(l, 512, 4);
-  if (chunk_cur(l)->queries >= 60) { end_pass(l); chunk_new(l); }
-  if (!ensure_pass(l)) return;
-  UINT w[3] = {alloc_index(l, h->alloc), index * 8, kind};
-  packet(l, OP_BEGIN_QUERY, w, 3);
-  chunk_cur(l)->queries++;
-  l->query_open = 1;
+  if (l->bundle || !h || h->desc.Type != D3D12_QUERY_HEAP_TYPE_OCCLUSION || index >= h->desc.Count || (kind & 0xFF) > 10 || (kind & ~0x3FFu)) return;
+  begin_query(l, h, index, D3D12_QUERY_TYPE_OCCLUSION, kind);
 }
 
 static void STDMETHODCALLTYPE list_EndQuery(CmdList *l, ID3D12QueryHeap *heap, D3D12_QUERY_TYPE type, UINT index) {
   QHeap *h = (QHeap *)heap;
-  if (l->bundle || !h || index >= h->desc.Count) return;
+  if (l->bundle || !h || index >= h->desc.Count || !query_fits_heap(type, h->desc.Type) || !query_fits_list(l->type, type, h->desc.Type)) return;
   if (type == D3D12_QUERY_TYPE_TIMESTAMP) {
-    if (l->query_open) return;      /* (the kernel runs one query at a time) */
-    ensure_room(l, 512, 4);
-    if (chunk_cur(l)->queries >= 60) { end_pass(l); chunk_new(l); }
-    if (!ensure_pass(l)) return;
-    UINT w[3] = {alloc_index(l, h->alloc), index * 8, query_kind(type)};
-    packet(l, OP_BEGIN_QUERY, w, 3);
-    packet(l, OP_END_QUERY, NULL, 0);
-    chunk_cur(l)->queries++;
+    /* (the time it is run: begun and ended at once) */
+    const int split = unpredicated_begin(l);
+    if (query_room(l, 1)) {
+      const struct OpenQuery q = {h, index, type, 6};
+      begin_query_packet(l, &q, 0);
+      end_query_packet(l, &q);
+    }
+    unpredicated_end(l, split);
     return;
   }
-  if (!l->query_open) return;
-  packet(l, OP_END_QUERY, NULL, 0);
-  l->query_open = 0;
+  for (UINT i = 0; i < l->nopen_q; ++i) {
+    if (l->open_q[i].heap != h || l->open_q[i].index != index || l->open_q[i].type != type) continue;
+    const int split = unpredicated_begin(l);
+    ensure_room(l, 64, 4);
+    end_query_packet(l, &l->open_q[i]);
+    l->open_q[i] = l->open_q[--l->nopen_q];
+    unpredicated_end(l, split);
+    return;
+  }
+  /* (one that was not begun in this list: nothing to end) */
 }
 
+/* The results of queries into a buffer, `offset` a multiple of 8: what each query wrote (a binary occlusion query 0 or 1, the statistics structures as they are). The type must be
+ * the heap's, the queries inside it and the range inside the buffer; anything else is an error the runtime ignores. */
 static void STDMETHODCALLTYPE list_ResolveQueryData(CmdList *l, ID3D12QueryHeap *heap, D3D12_QUERY_TYPE type, UINT start, UINT count, ID3D12Resource *dst, UINT64 offset) {
   QHeap *h = (QHeap *)heap;
   Resource *d = (Resource *)dst;
-  if (l->bundle || !h || !d || !count || start > h->desc.Count || count > h->desc.Count - start || offset > 0xFFFFFFFFu) return;
+  if (l->bundle || !h || !d || !count || start > h->desc.Count || count > h->desc.Count - start || offset % 8 || !query_fits_heap(type, h->desc.Type)) return;
+  if (d->desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER || !d->alloc) return;
+  const UINT stride = qheap_stride(h->desc.Type);
+  const UINT64 bytes = (UINT64)count * stride;
+  if (offset > d->desc.Width || bytes > d->desc.Width - offset || offset > 0xFFFFFFFFu) return;
+  const int split = unpredicated_begin(l);
   end_pass(l);
   ensure_room(l, 256, 4);
-  const UINT stride = qheap_stride(h->desc.Type);
-  if ((type == D3D12_QUERY_TYPE_VIDEO_DECODE_STATISTICS) != (h->desc.Type == D3D12_QUERY_HEAP_TYPE_VIDEO_DECODE_STATISTICS)) return;
-  UINT w[5] = {alloc_index(l, d->alloc), (UINT)offset, alloc_index(l, h->alloc), start * stride, count * stride};
+  UINT w[5] = {alloc_index(l, d->alloc), (UINT)offset, alloc_index(l, h->alloc), start * stride, (UINT)bytes};
   packet(l, OP_COPY_BUFFER, w, 5);
+  unpredicated_end(l, split);
 }
 
 /* ---- command signatures and indirect execution ------------------------------------------------------------------------------------------------------------------------- */
@@ -227,6 +352,7 @@ static void STDMETHODCALLTYPE list_ExecuteIndirect(CmdList *l, ID3D12CommandSign
   BUNDLE_LOG(l, B_INDIRECT, (UINT64)(UINT_PTR)sig, max, (UINT64)(UINT_PTR)args, args_offset, (UINT64)(UINT_PTR)count, count_offset);
   if (!sig || !args || !max) return;
   end_pass(l);
+  if (l->nopen_q) queries_suspend(l);      /* (the open queries go on in the commands made from the call, and in the chunk after it) */
   Indirect *in = mem_alloc(sizeof *in);
   if (!in) return;
   in->state = mem_alloc(sizeof(CmdList));
@@ -236,7 +362,7 @@ static void STDMETHODCALLTYPE list_ExecuteIndirect(CmdList *l, ID3D12CommandSign
   s->chunks = NULL; s->nchunks = s->cap_chunks = 0;
   s->refs = NULL; s->nrefs = s->cap_refs = 0;
   s->log = NULL; s->nlog = s->cap_log = 0;
-  s->bundle = 0; s->pass_open = 0; s->query_open = 0; s->closed = 0;
+  s->bundle = 0; s->pass_open = 0; s->closed = 0;      /* (the open queries stay: the commands made from the call go on with them) */
   in->sig = (CmdSig *)sig;
   in->args = (Resource *)args;
   in->count = (Resource *)count;
@@ -305,6 +431,7 @@ static CmdList *indirect_expand(Indirect *in) {
   }
   mem_free(data);
   end_pass(t);
+  if (t->nopen_q) queries_suspend(t);
   return t;
 }
 
@@ -608,8 +735,14 @@ static int chunk_skipped(const Chunk *c) {
   return c->pred_op == D3D12_PREDICATION_OP_EQUAL_ZERO ? v == 0 : v != 0;
 }
 
+/* SetPredication: the commands Direct3D 12 predicates that follow (draws, dispatches, clears, copies, resolves, ExecuteIndirect) are left out when the 64-bit value at `offset`
+ * of the buffer is zero (EQUAL_ZERO) or is not (NOT_EQUAL_ZERO), read when they run; NULL ends predication. An offset that is not a multiple of 8, past the buffer, or an
+ * operation that is neither is an error the runtime ignores. */
 static void STDMETHODCALLTYPE list_SetPredication(CmdList *l, ID3D12Resource *buffer, UINT64 offset, D3D12_PREDICATION_OP op) {
   if (l->bundle) return;
+  const Resource *r = (const Resource *)buffer;
+  if (r && (offset % 8 || r->desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER || offset > r->desc.Width || r->desc.Width - offset < 8)) return;
+  if (r && op != D3D12_PREDICATION_OP_EQUAL_ZERO && op != D3D12_PREDICATION_OP_NOT_EQUAL_ZERO) return;
   end_pass(l);
   l->pred = (Resource *)buffer;
   l->pred_off = offset;

@@ -1598,6 +1598,9 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
   }
   // (a vertex shader that reads textures is given them through its context: the function with system values)
   if (vertex && program->uses_textures_) program->uses_system_values_ = true;
+  // A shader that declares textures and reads none of them (d3d11.dll's specialisation for class instances that sample nothing leaves the declarations of
+  // the others) takes no texture units: a pipeline gets the units its shaders read.
+  if (!program->uses_textures_) program->texture_unit_mask_ = 0;
   program->count_temps();
   *out = util::move(program);
   return status::kSuccess;

@@ -34,6 +34,7 @@
 #include <d3d12.h>
 #include <dxgi1_3.h>
 #include "dxfixtures.h"
+#include "vertex_formats.h"
 
 static int g_passed, g_failed;
 static void check(int ok, const char *what) {
@@ -1803,6 +1804,126 @@ static void test_stream_output(void) {
   ID3D11Query_Release(so_stats);
   ID3D11Buffer_Release(small);
   ID3D11Buffer_Release(captured);
+  ID3D11GeometryShader_Release(so);
+}
+
+/* Queries of every kind active at once, nested and begun again, over clears and several draws: each gets exact counts (the kernel measures a draw for all of them at once);
+ * the stream output overflow predicate of all streams decides predication. */
+static void test_simultaneous_queries(void) {
+  const D3D11_SO_DECLARATION_ENTRY entries[2] = {{0, "SV_POSITION", 0, 0, 4, 0}, {0, "COLOR", 0, 0, 4, 0}};
+  const UINT stride = 32;
+  ID3D11GeometryShader *so = NULL;
+  ID3D11Device_CreateGeometryShaderWithStreamOutput(g_device, dx_vs_dxbc, sizeof dx_vs_dxbc, entries, 2, &stride, 1, 0, NULL, &so);
+  D3D11_BUFFER_DESC desc = {2 * 3 * 32, D3D11_USAGE_DEFAULT, D3D11_BIND_STREAM_OUTPUT | D3D11_BIND_VERTEX_BUFFER, 0, 0, 0};      /* (room for two triangles) */
+  ID3D11Buffer *target = NULL;
+  ID3D11Device_CreateBuffer(g_device, &desc, NULL, &target);
+  const D3D11_QUERY_DESC occlusion_desc = {D3D11_QUERY_OCCLUSION, 0}, stats_desc = {D3D11_QUERY_PIPELINE_STATISTICS, 0}, so_desc = {D3D11_QUERY_SO_STATISTICS_STREAM0, 0},
+                         so_all_desc = {D3D11_QUERY_SO_STATISTICS, 0}, predicate_desc = {D3D11_QUERY_OCCLUSION_PREDICATE, D3D11_QUERY_MISC_PREDICATEHINT},
+                         overflow_desc = {D3D11_QUERY_SO_OVERFLOW_PREDICATE, 0}, overflow1_desc = {D3D11_QUERY_SO_OVERFLOW_PREDICATE_STREAM1, 0};
+  ID3D11Query *occlusion = NULL, *inner = NULL, *again = NULL, *stats = NULL, *so_stats = NULL, *so_all = NULL;
+  ID3D11Predicate *visible = NULL, *overflow = NULL, *overflow1 = NULL;
+  ID3D11Device_CreateQuery(g_device, &occlusion_desc, &occlusion);
+  ID3D11Device_CreateQuery(g_device, &occlusion_desc, &inner);
+  ID3D11Device_CreateQuery(g_device, &occlusion_desc, &again);
+  ID3D11Device_CreateQuery(g_device, &stats_desc, &stats);
+  ID3D11Device_CreateQuery(g_device, &so_desc, &so_stats);
+  ID3D11Device_CreateQuery(g_device, &so_all_desc, &so_all);
+  ID3D11Device_CreatePredicate(g_device, &predicate_desc, &visible);
+  ID3D11Device_CreatePredicate(g_device, &overflow_desc, &overflow);
+  ID3D11Device_CreatePredicate(g_device, &overflow1_desc, &overflow1);
+  ID3D11Query *hinted = NULL;
+  const D3D11_QUERY_DESC hint_desc = {D3D11_QUERY_OCCLUSION, D3D11_QUERY_MISC_PREDICATEHINT};
+  check(so && target && occlusion && inner && again && stats && so_stats && so_all && visible && overflow && overflow1 &&
+        ID3D11Device_CreateQuery(g_device, &hint_desc, &hinted) == E_INVALIDARG && !hinted,
+        "queries of every kind (and the predicate hint only on a predicate)");
+  if (!so || !target || !occlusion || !inner || !again || !stats || !so_stats || !so_all || !visible || !overflow || !overflow1) return;
+  const VertexF v[3] = {{-0.8f, -0.8f, 0.5f, 1, 0, 0, 1}, {0.8f, -0.8f, 0.5f, 0, 1, 0, 1}, {0.0f, 0.8f, 0.5f, 0, 0, 1, 1}};
+  ID3D11Buffer *vertices = make_buffer(D3D11_BIND_VERTEX_BUFFER, D3D11_USAGE_DEFAULT, 0, v, sizeof v);
+  begin(NULL);
+  clear(0, 0, 0);
+  bind_floats(vertices);
+  set_matrix(1, 1, 0, 0);
+  ID3D11DeviceContext_PSSetShader(g_context, g_ps_color, NULL, 0);
+  /* the samples of one draw */
+  ID3D11DeviceContext_Begin(g_context, (ID3D11Asynchronous *)occlusion);
+  ID3D11DeviceContext_Draw(g_context, 3, 0);
+  ID3D11DeviceContext_End(g_context, (ID3D11Asynchronous *)occlusion);
+  const UINT64 one = query_result(occlusion);
+
+  /* Round 0: no stream output (the stream output statistics are 0, nothing overflows); over a clear. Round 1: a vertex shader's stream output into room for two triangles. */
+  ID3D11Asynchronous *all[7] = {(ID3D11Asynchronous *)occlusion, (ID3D11Asynchronous *)stats, (ID3D11Asynchronous *)so_stats, (ID3D11Asynchronous *)so_all,
+                                (ID3D11Asynchronous *)visible, (ID3D11Asynchronous *)overflow, (ID3D11Asynchronous *)overflow1};
+  UINT offset = 0;
+  for (int round = 0; round < 2; ++round) {
+    if (round == 1) {
+      ID3D11DeviceContext_GSSetShader(g_context, so, NULL, 0);
+      ID3D11DeviceContext_SOSetTargets(g_context, 1, &target, &offset);
+    }
+    for (int i = 0; i < 7; ++i) ID3D11DeviceContext_Begin(g_context, all[i]);
+    ID3D11DeviceContext_Begin(g_context, (ID3D11Asynchronous *)again);
+    ID3D11DeviceContext_Draw(g_context, 3, 0);
+    ID3D11DeviceContext_Begin(g_context, (ID3D11Asynchronous *)again);      /* (begun again: it counts from here) */
+    if (round == 0) clear(0, 0, 0);
+    ID3D11DeviceContext_Begin(g_context, (ID3D11Asynchronous *)inner);
+    ID3D11DeviceContext_Draw(g_context, 3, 0);
+    ID3D11DeviceContext_End(g_context, (ID3D11Asynchronous *)inner);
+    ID3D11DeviceContext_Draw(g_context, 3, 0);      /* (with stream output: the third triangle does not fit) */
+    ID3D11DeviceContext_End(g_context, (ID3D11Asynchronous *)again);
+    for (int i = 6; i >= 0; --i) ID3D11DeviceContext_End(g_context, all[i]);
+    D3D11_QUERY_DATA_PIPELINE_STATISTICS ps;
+    D3D11_QUERY_DATA_SO_STATISTICS st0 = {99, 99}, sta = {99, 99};
+    BOOL seen = FALSE, over = FALSE, over1 = TRUE;
+    memset(&ps, 0xFF, sizeof ps);
+    while (ID3D11DeviceContext_GetData(g_context, (ID3D11Asynchronous *)stats, &ps, sizeof ps, 0) == S_FALSE) {}
+    while (ID3D11DeviceContext_GetData(g_context, (ID3D11Asynchronous *)so_stats, &st0, sizeof st0, 0) == S_FALSE) {}
+    while (ID3D11DeviceContext_GetData(g_context, (ID3D11Asynchronous *)so_all, &sta, sizeof sta, 0) == S_FALSE) {}
+    while (ID3D11DeviceContext_GetData(g_context, (ID3D11Asynchronous *)visible, &seen, sizeof seen, 0) == S_FALSE) {}
+    while (ID3D11DeviceContext_GetData(g_context, (ID3D11Asynchronous *)overflow, &over, sizeof over, 0) == S_FALSE) {}
+    while (ID3D11DeviceContext_GetData(g_context, (ID3D11Asynchronous *)overflow1, &over1, sizeof over1, 0) == S_FALSE) {}
+    const UINT64 samples = query_result(occlusion), nested = query_result(inner), restarted = query_result(again);
+    printf("d3d11test: (all at once, round %d: one draw %u samples; %u, nested %u, again %u; IA %u/%u VS %u C %u/%u PS %u HS %u DS %u CS %u; stream 0 %u/%u, all %u/%u; visible %d overflow %d %d)\n",
+           round, (unsigned)one, (unsigned)samples, (unsigned)nested, (unsigned)restarted, (unsigned)ps.IAVertices, (unsigned)ps.IAPrimitives, (unsigned)ps.VSInvocations,
+           (unsigned)ps.CInvocations, (unsigned)ps.CPrimitives, (unsigned)ps.PSInvocations, (unsigned)ps.HSInvocations, (unsigned)ps.DSInvocations, (unsigned)ps.CSInvocations,
+           (unsigned)st0.NumPrimitivesWritten, (unsigned)st0.PrimitivesStorageNeeded, (unsigned)sta.NumPrimitivesWritten, (unsigned)sta.PrimitivesStorageNeeded, seen, over, over1);
+    check(one > 600 && samples == 3 * one && nested == one && restarted == 2 * one,
+          round ? "... with stream output too" : "occlusion queries active together, nested and begun again (over a clear) each count their draws");
+    check(ps.IAVertices == 9 && ps.IAPrimitives == 3 && ps.VSInvocations == 9 && ps.CInvocations == 3 && ps.CPrimitives == 3 && ps.PSInvocations == 3 * one &&
+          ps.HSInvocations == 0 && ps.DSInvocations == 0 && ps.CSInvocations == 0, "... with a pipeline statistics query: every count exact");
+    if (round == 0)
+      check(st0.NumPrimitivesWritten == 0 && st0.PrimitivesStorageNeeded == 0 && sta.NumPrimitivesWritten == 0 && sta.PrimitivesStorageNeeded == 0 && seen == TRUE && over == FALSE &&
+            over1 == FALSE, "... and stream output statistics of none (no stream output), the occlusion predicate true, the overflow predicates false");
+    else
+      check(st0.NumPrimitivesWritten == 2 && st0.PrimitivesStorageNeeded == 3 && sta.NumPrimitivesWritten == 2 && sta.PrimitivesStorageNeeded == 3 && seen == TRUE && over == TRUE &&
+            over1 == FALSE, "... and stream output statistics of stream 0 and of all streams (two written of three), overflow of all streams true and of stream 1 false");
+  }
+
+  /* predication by the overflow predicate: left out while it is TRUE (the value given), done when FALSE is given */
+  ID3D11DeviceContext_SOSetTargets(g_context, 0, NULL, NULL);
+  ID3D11DeviceContext_GSSetShader(g_context, NULL, NULL, 0);
+  clear(0, 0, 0);
+  ID3D11DeviceContext_SetPredication(g_context, overflow, TRUE);
+  clear(1, 0, 0);
+  ID3D11DeviceContext_Draw(g_context, 3, 0);
+  ID3D11DeviceContext_SetPredication(g_context, NULL, FALSE);
+  read_target();
+  check(pixel(1, 1) == 0xFF000000u && pixel(32, 32) == 0xFF000000u, "SetPredication with an overflow predicate that is true: the clear and the draw are left out");
+  ID3D11DeviceContext_SetPredication(g_context, overflow, FALSE);
+  clear(1, 0, 0);
+  ID3D11DeviceContext_SetPredication(g_context, overflow1, TRUE);      /* (stream 1 did not overflow: done) */
+  ID3D11DeviceContext_Draw(g_context, 3, 0);
+  ID3D11DeviceContext_SetPredication(g_context, NULL, FALSE);
+  read_target();
+  check(pixel(1, 1) == 0xFFFF0000u && (pixel(32, 32) & 0xFFFFFF) != 0xFF0000u, "... and done when the value given is not the predicate's");
+  /* a predicate's data: a BOOL; another size is refused */
+  UINT64 wide = 0;
+  check(ID3D11DeviceContext_GetData(g_context, (ID3D11Asynchronous *)overflow, &wide, sizeof wide, 0) == E_INVALIDARG &&
+        ID3D11Asynchronous_GetDataSize((ID3D11Asynchronous *)overflow) == sizeof(BOOL), "GetData of a predicate takes a BOOL");
+
+  ID3D11Buffer_Release(vertices);
+  for (int i = 0; i < 7; ++i) IUnknown_Release((IUnknown *)all[i]);
+  ID3D11Query_Release(inner);
+  ID3D11Query_Release(again);
+  ID3D11Buffer_Release(target);
   ID3D11GeometryShader_Release(so);
 }
 
@@ -4592,6 +4713,320 @@ static void test_sampler_state(void) {
   }
 }
 
+/* ---- vertex formats and instance step rates ------------------------------------------------------------------------------------------------------------------------------ */
+
+
+static void test_vertex_formats(void) {
+  ID3D11VertexShader *shaders[3] = {NULL, NULL, NULL};
+  const BYTE *code[3] = {dx_vs_fmt_dxbc, dx_vs_fmt_uint_dxbc, dx_vs_fmt_sint_dxbc};
+  const SIZE_T code_bytes[3] = {sizeof dx_vs_fmt_dxbc, sizeof dx_vs_fmt_uint_dxbc, sizeof dx_vs_fmt_sint_dxbc};
+  for (int i = 0; i < 3; ++i) ID3D11Device_CreateVertexShader(g_device, code[i], code_bytes[i], NULL, &shaders[i]);
+  check(shaders[0] && shaders[1] && shaders[2], "the vertex shaders of float, unsigned and signed colour inputs");
+  if (!shaders[0] || !shaders[1] || !shaders[2]) return;
+  /* slot 0: a triangle over the whole target; slot 3: the colour, per vertex (16 bytes a vertex); slot 6: an offset of 0, per instance */
+  const float big[9] = {-1, -1, 0.5f, -1, 3, 0.5f, 3, -1, 0.5f}, zero[2] = {0, 0};
+  ID3D11Buffer *positions = make_buffer(D3D11_BIND_VERTEX_BUFFER, D3D11_USAGE_DEFAULT, 0, big, sizeof big);
+  ID3D11Buffer *offsets = make_buffer(D3D11_BIND_VERTEX_BUFFER, D3D11_USAGE_DEFAULT, 0, zero, sizeof zero);
+  ID3D11Buffer *colours = make_buffer(D3D11_BIND_VERTEX_BUFFER, D3D11_USAGE_DYNAMIC, D3D11_CPU_ACCESS_WRITE, NULL, 3 * 16);
+  int formats_ok = 0, formats = 0, support_ok = 1;
+  for (UINT f = 0; f < sizeof g_vertex_formats / sizeof g_vertex_formats[0]; ++f) {
+    const VertexFormatCase *t = &g_vertex_formats[f];
+    UINT support = 0;
+    if (FAILED(ID3D11Device_CheckFormatSupport(g_device, t->format, &support)) || !(support & D3D11_FORMAT_SUPPORT_IA_VERTEX_BUFFER)) {
+      printf("d3d11test: (%s: no IA_VERTEX_BUFFER)\n", t->name);
+      support_ok = 0;
+    }
+    const D3D11_INPUT_ELEMENT_DESC e[3] = {{"POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0, D3D11_INPUT_PER_VERTEX_DATA, 0},
+                                           {"COLOR", 0, t->format, 3, 0, D3D11_INPUT_PER_VERTEX_DATA, 0},
+                                           {"OFFSET", 0, DXGI_FORMAT_R32G32_FLOAT, 6, 0, D3D11_INPUT_PER_INSTANCE_DATA, 1}};
+    ID3D11InputLayout *layout = NULL;
+    ++formats;
+    if (FAILED(ID3D11Device_CreateInputLayout(g_device, e, 3, code[t->shader], code_bytes[t->shader], &layout)) || !layout) { printf("d3d11test: (%s: no layout)\n", t->name); continue; }
+    D3D11_MAPPED_SUBRESOURCE mapped;
+    if (SUCCEEDED(ID3D11DeviceContext_Map(g_context, (ID3D11Resource *)colours, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped))) {
+      for (int v = 0; v < 3; ++v) memcpy((BYTE *)mapped.pData + v * 16, t->bytes, 16);
+      ID3D11DeviceContext_Unmap(g_context, (ID3D11Resource *)colours, 0);
+    }
+    begin(NULL);
+    clear(0, 0, 0);
+    ID3D11Buffer *buffers[7] = {positions, NULL, NULL, colours, NULL, NULL, offsets};
+    const UINT strides[7] = {12, 0, 0, 16, 0, 0, 8}, starts[7] = {0};
+    ID3D11DeviceContext_IASetInputLayout(g_context, layout);
+    ID3D11DeviceContext_IASetVertexBuffers(g_context, 0, 7, buffers, strides, starts);
+    ID3D11DeviceContext_VSSetShader(g_context, shaders[t->shader], NULL, 0);
+    ID3D11DeviceContext_PSSetShader(g_context, g_ps_color, NULL, 0);
+    ID3D11DeviceContext_DrawInstanced(g_context, 3, 1, 0, 0);
+    if (read_target() && colour_is(pixel(32, 32), t->rgba)) ++formats_ok;
+    else printf("d3d11test: (%s: %08x, expected %d %d %d %d)\n", t->name, (unsigned)pixel(32, 32), t->rgba[0], t->rgba[1], t->rgba[2], t->rgba[3]);
+    ID3D11InputLayout_Release(layout);
+  }
+  check(formats_ok == formats, "every IA_VERTEX_BUFFER format reaches the vertex shader as Direct3D reads it (normalised, sign extended, integers, packed, missing components 0 0 0 1)");
+  check(support_ok, "CheckFormatSupport says IA_VERTEX_BUFFER for each of them");
+
+  /* What CreateInputLayout refuses (E_INVALIDARG) and CheckFormatSupport does not say: formats no vertex has; a per-vertex element with a step rate; a classification that is
+   * neither; one slot with two classifications or two step rates; an offset not aligned to the element (or 4); the same semantic twice. */
+  {
+    static const DXGI_FORMAT not_vertex[] = {DXGI_FORMAT_B5G6R5_UNORM, DXGI_FORMAT_B5G5R5A1_UNORM, DXGI_FORMAT_B4G4R4A4_UNORM, DXGI_FORMAT_R8G8B8A8_UNORM_SRGB,
+                                             DXGI_FORMAT_R32G32B32A32_TYPELESS, DXGI_FORMAT_D32_FLOAT, DXGI_FORMAT_BC1_UNORM, DXGI_FORMAT_R9G9B9E5_SHAREDEXP, DXGI_FORMAT_UNKNOWN};
+    int refused = 1;
+    for (UINT i = 0; i < sizeof not_vertex / sizeof not_vertex[0]; ++i) {
+      UINT support = 0;
+      ID3D11Device_CheckFormatSupport(g_device, not_vertex[i], &support);
+      const D3D11_INPUT_ELEMENT_DESC e[1] = {{"COLOR", 0, not_vertex[i], 0, 0, D3D11_INPUT_PER_VERTEX_DATA, 0}};
+      ID3D11InputLayout *layout = (ID3D11InputLayout *)1;
+      if (ID3D11Device_CreateInputLayout(g_device, e, 1, dx_vs_fmt_dxbc, sizeof dx_vs_fmt_dxbc, &layout) != E_INVALIDARG || layout || (support & D3D11_FORMAT_SUPPORT_IA_VERTEX_BUFFER)) {
+        printf("d3d11test: (format %u is taken as a vertex element)\n", (unsigned)not_vertex[i]);
+        refused = 0;
+      }
+    }
+    check(refused, "formats that are no vertex element (B5G6R5, B5G5R5A1, B4G4R4A4, sRGB, typeless, depth, block): E_INVALIDARG, no IA_VERTEX_BUFFER");
+    const D3D11_INPUT_ELEMENT_DESC step_on_vertex[1] = {{"COLOR", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 0, D3D11_INPUT_PER_VERTEX_DATA, 1}};
+    const D3D11_INPUT_ELEMENT_DESC bad_class[1] = {{"COLOR", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 0, (D3D11_INPUT_CLASSIFICATION)2, 0}};
+    const D3D11_INPUT_ELEMENT_DESC mixed_class[2] = {{"POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0, D3D11_INPUT_PER_VERTEX_DATA, 0},
+                                                     {"COLOR", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 12, D3D11_INPUT_PER_INSTANCE_DATA, 1}};
+    const D3D11_INPUT_ELEMENT_DESC mixed_rate[2] = {{"POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 1, 0, D3D11_INPUT_PER_INSTANCE_DATA, 1},
+                                                    {"COLOR", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 1, 12, D3D11_INPUT_PER_INSTANCE_DATA, 2}};
+    const D3D11_INPUT_ELEMENT_DESC unaligned[1] = {{"COLOR", 0, DXGI_FORMAT_R32_FLOAT, 0, 2, D3D11_INPUT_PER_VERTEX_DATA, 0}};
+    const D3D11_INPUT_ELEMENT_DESC twice[2] = {{"COLOR", 0, DXGI_FORMAT_R32_FLOAT, 0, 0, D3D11_INPUT_PER_VERTEX_DATA, 0}, {"color", 0, DXGI_FORMAT_R32_FLOAT, 0, 4, D3D11_INPUT_PER_VERTEX_DATA, 0}};
+    const D3D11_INPUT_ELEMENT_DESC far_slot[1] = {{"COLOR", 0, DXGI_FORMAT_R32_FLOAT, D3D11_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT, 0, D3D11_INPUT_PER_VERTEX_DATA, 0}};
+    const D3D11_INPUT_ELEMENT_DESC fine[4] = {{"POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0, D3D11_INPUT_PER_VERTEX_DATA, 0},
+                                              {"COLOR", 0, DXGI_FORMAT_R16_UNORM, 1, 2, D3D11_INPUT_PER_VERTEX_DATA, 0}, {"OFFSET", 0, DXGI_FORMAT_R8_UNORM, 1, 5, D3D11_INPUT_PER_VERTEX_DATA, 0},
+                                              {"TEXCOORD", 0, DXGI_FORMAT_R32_FLOAT, 2, 0, D3D11_INPUT_PER_INSTANCE_DATA, 0}};
+    ID3D11InputLayout *layout = NULL;
+    check(ID3D11Device_CreateInputLayout(g_device, step_on_vertex, 1, dx_vs_fmt_dxbc, sizeof dx_vs_fmt_dxbc, &layout) == E_INVALIDARG &&
+          ID3D11Device_CreateInputLayout(g_device, bad_class, 1, dx_vs_fmt_dxbc, sizeof dx_vs_fmt_dxbc, &layout) == E_INVALIDARG &&
+          ID3D11Device_CreateInputLayout(g_device, mixed_class, 2, dx_vs_fmt_dxbc, sizeof dx_vs_fmt_dxbc, &layout) == E_INVALIDARG &&
+          ID3D11Device_CreateInputLayout(g_device, mixed_rate, 2, dx_vs_fmt_dxbc, sizeof dx_vs_fmt_dxbc, &layout) == E_INVALIDARG &&
+          ID3D11Device_CreateInputLayout(g_device, unaligned, 1, dx_vs_fmt_dxbc, sizeof dx_vs_fmt_dxbc, &layout) == E_INVALIDARG &&
+          ID3D11Device_CreateInputLayout(g_device, twice, 2, dx_vs_fmt_dxbc, sizeof dx_vs_fmt_dxbc, &layout) == E_INVALIDARG &&
+          ID3D11Device_CreateInputLayout(g_device, far_slot, 1, dx_vs_fmt_dxbc, sizeof dx_vs_fmt_dxbc, &layout) == E_INVALIDARG && !layout,
+          "CreateInputLayout refuses a step rate on per-vertex data, an unknown classification, a slot of two classifications or rates, an unaligned offset, a semantic twice");
+    check(SUCCEEDED(ID3D11Device_CreateInputLayout(g_device, fine, 4, dx_vs_fmt_dxbc, sizeof dx_vs_fmt_dxbc, &layout)) && layout,
+          "... and takes a 16-bit element at offset 2, an 8-bit one at 5, per-instance data that never steps (rate 0)");
+    if (layout) ID3D11InputLayout_Release(layout);
+  }
+
+  /* Step rates: a triangle over the top left quarter (slot 0, per vertex), moved by an offset (slot 2, per instance) to the top right or the bottom left, coloured by a colour
+   * (slot 5, per instance). */
+  {
+    const float quarter[9] = {-1, 1, 0.5f, 0, 1, 0.5f, -1, 0, 0.5f};
+    const float moves[8] = {0, 0, 1, 0, 0, -1, 1, -1};      /* top left, top right, bottom left, bottom right */
+    const float tints[16] = {1, -1, -1, 1, -1, 1, -1, 1, -1, -1, 1, 1, 1, 1, 1, 1};      /* (red, green, blue and white, as vs_fmt shows them: c * 0.5 + 0.5) */
+    ID3D11Buffer *corner = make_buffer(D3D11_BIND_VERTEX_BUFFER, D3D11_USAGE_DEFAULT, 0, quarter, sizeof quarter);
+    ID3D11Buffer *move = make_buffer(D3D11_BIND_VERTEX_BUFFER, D3D11_USAGE_DEFAULT, 0, moves, sizeof moves);
+    ID3D11Buffer *tint = make_buffer(D3D11_BIND_VERTEX_BUFFER, D3D11_USAGE_DEFAULT, 0, tints, sizeof tints);
+    /* (what a quarter shows: its corner pixel inside the triangle) */
+    const int at_x[4] = {4, 36, 4, 36}, at_y[4] = {4, 4, 36, 36};
+    UINT32 shown[4];
+    struct { UINT move_rate, tint_rate, instances, first; UINT32 expect[4]; const char *what; } cases[] = {
+      {1, 1, 4, 0, {0xFFFF0000u, 0xFF00FF00u, 0xFF0000FFu, 0xFFFFFFFFu}, "step rate 1: instance n reads element n"},
+      {2, 3, 4, 0, {0xFFFF0000u, 0xFF00FF00u, 0xFF000000u, 0xFF000000u}, "rates 2 and 3: offsets 0 0 1 1, colours 0 0 0 1 (the last instance at a place shows)"},
+      {2, 3, 4, 1, {0xFF000000u, 0xFF00FF00u, 0xFF0000FFu, 0xFF000000u}, "rates 2 and 3 from StartInstanceLocation 1: offsets 1 1 2 2, colours 1 1 1 2"},
+      {1, 0, 3, 1, {0xFF000000u, 0xFF00FF00u, 0xFF00FF00u, 0xFF00FF00u}, "rate 0: every instance reads the element of StartInstanceLocation"},
+      {0, 1, 3, 0, {0xFF0000FFu, 0xFF000000u, 0xFF000000u, 0xFF000000u}, "an offset of rate 0 with colours of rate 1: all at the first place, the last colour"},
+    };
+    int all_ok = 1;
+    for (UINT c = 0; c < sizeof cases / sizeof cases[0]; ++c) {
+      const D3D11_INPUT_ELEMENT_DESC e[3] = {{"POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0, D3D11_INPUT_PER_VERTEX_DATA, 0},
+                                             {"COLOR", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 5, 0, D3D11_INPUT_PER_INSTANCE_DATA, cases[c].tint_rate},
+                                             {"OFFSET", 0, DXGI_FORMAT_R32G32_FLOAT, 2, 0, D3D11_INPUT_PER_INSTANCE_DATA, cases[c].move_rate}};
+      ID3D11InputLayout *layout = NULL;
+      if (FAILED(ID3D11Device_CreateInputLayout(g_device, e, 3, dx_vs_fmt_dxbc, sizeof dx_vs_fmt_dxbc, &layout)) || !layout) { all_ok = 0; continue; }
+      begin(NULL);
+      clear(0, 0, 0);
+      ID3D11Buffer *buffers[6] = {corner, NULL, move, NULL, NULL, tint};
+      const UINT strides[6] = {12, 0, 8, 0, 0, 16}, starts[6] = {0};
+      ID3D11DeviceContext_IASetInputLayout(g_context, layout);
+      ID3D11DeviceContext_IASetVertexBuffers(g_context, 0, 6, buffers, strides, starts);
+      ID3D11DeviceContext_VSSetShader(g_context, shaders[0], NULL, 0);
+      ID3D11DeviceContext_PSSetShader(g_context, g_ps_color, NULL, 0);
+      ID3D11DeviceContext_DrawInstanced(g_context, 3, cases[c].instances, 0, cases[c].first);
+      int ok = read_target();
+      for (int q = 0; q < 4; ++q) { shown[q] = pixel(at_x[q], at_y[q]); ok = ok && shown[q] == cases[c].expect[q]; }
+      if (!ok) printf("d3d11test: (%s: %08x %08x %08x %08x)\n", cases[c].what, (unsigned)shown[0], (unsigned)shown[1], (unsigned)shown[2], (unsigned)shown[3]);
+      check(ok, cases[c].what);
+      all_ok = all_ok && ok;
+      ID3D11InputLayout_Release(layout);
+    }
+    /* The same with an index buffer: DrawIndexedInstanced steps the instance data the same way. */
+    {
+      const D3D11_INPUT_ELEMENT_DESC e[3] = {{"POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0, D3D11_INPUT_PER_VERTEX_DATA, 0},
+                                             {"COLOR", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 5, 0, D3D11_INPUT_PER_INSTANCE_DATA, 3},
+                                             {"OFFSET", 0, DXGI_FORMAT_R32G32_FLOAT, 2, 0, D3D11_INPUT_PER_INSTANCE_DATA, 2}};
+      const WORD indices[3] = {2, 1, 0};
+      ID3D11Buffer *index = make_buffer(D3D11_BIND_INDEX_BUFFER, D3D11_USAGE_DEFAULT, 0, indices, sizeof indices);
+      ID3D11InputLayout *layout = NULL;
+      int ok = SUCCEEDED(ID3D11Device_CreateInputLayout(g_device, e, 3, dx_vs_fmt_dxbc, sizeof dx_vs_fmt_dxbc, &layout)) && layout && index;
+      if (ok) {
+        begin(NULL);
+        clear(0, 0, 0);
+        ID3D11Buffer *buffers[6] = {corner, NULL, move, NULL, NULL, tint};
+        const UINT strides[6] = {12, 0, 8, 0, 0, 16}, starts[6] = {0};
+        ID3D11DeviceContext_IASetInputLayout(g_context, layout);
+        ID3D11DeviceContext_IASetVertexBuffers(g_context, 0, 6, buffers, strides, starts);
+        ID3D11DeviceContext_IASetIndexBuffer(g_context, index, DXGI_FORMAT_R16_UINT, 0);
+        ID3D11DeviceContext_VSSetShader(g_context, shaders[0], NULL, 0);
+        ID3D11DeviceContext_PSSetShader(g_context, g_ps_color, NULL, 0);
+        ID3D11DeviceContext_DrawIndexedInstanced(g_context, 3, 4, 0, 0, 1);
+        ok = read_target() && pixel(4, 4) == 0xFF000000u && pixel(36, 4) == 0xFF00FF00u && pixel(4, 36) == 0xFF0000FFu;
+        if (!ok) printf("d3d11test: (indexed: %08x %08x %08x)\n", (unsigned)pixel(4, 4), (unsigned)pixel(36, 4), (unsigned)pixel(4, 36));
+      }
+      check(ok, "DrawIndexedInstanced with step rates 2 and 3 from instance 1");
+      if (layout) ID3D11InputLayout_Release(layout);
+      if (index) ID3D11Buffer_Release(index);
+    }
+    ID3D11Buffer_Release(corner);
+    ID3D11Buffer_Release(move);
+    ID3D11Buffer_Release(tint);
+    (void)all_ok;
+  }
+  ID3D11Buffer_Release(positions);
+  ID3D11Buffer_Release(offsets);
+  ID3D11Buffer_Release(colours);
+  for (int i = 0; i < 3; ++i) ID3D11VertexShader_Release(shaders[i]);
+}
+
+/* Dynamic shader linkage: ps_iface (tests/data/dxbc/ps_iface.hlsl, Microsoft's compiler) returns g_first.get() + g_list[which].get() through the interface
+ * iColour, with cConst, cScaled (a return inside an if), cLoop (a return inside a loop) and cTex instances in its constant buffer and textures. */
+static UINT32 draw_linked(ID3D11VertexShader *vs, ID3D11PixelShader *ps, ID3D11ClassInstance *const *instances, UINT count, ID3D11Buffer *classes, ID3D11Buffer *params, UINT which) {
+  const UINT params_data[4] = {which, 0, 0, 0};
+  ID3D11DeviceContext_UpdateSubresource(g_context, (ID3D11Resource *)params, 0, NULL, params_data, 0, 0);
+  ID3D11Buffer *vertices = triangle(0.5f, 0.5f, 0.5f, 0);
+  begin(NULL);
+  clear(0, 0, 0);
+  bind_floats(vertices);
+  ID3D11DeviceContext_VSSetShader(g_context, vs, NULL, 0);
+  ID3D11DeviceContext_PSSetShader(g_context, ps, instances, count);
+  ID3D11Buffer *buffers[2] = {classes, params};
+  ID3D11DeviceContext_PSSetConstantBuffers(g_context, 0, 2, buffers);
+  ID3D11DeviceContext_Draw(g_context, 3, 0);
+  const UINT32 got = read_target() ? pixel(32, 40) : 0;
+  if (vertices) ID3D11Buffer_Release(vertices);
+  return got;
+}
+static int near_rgb(UINT32 p, int r, int g, int b) {
+  const int dr = red(p) - r, dg = green(p) - g, db = blue(p) - b;
+  return dr >= -2 && dr <= 2 && dg >= -2 && dg <= 2 && db >= -2 && db <= 2;
+}
+static void test_class_linkage(void) {
+  ID3D11ClassLinkage *linkage = NULL;
+  ID3D11VertexShader *vs = NULL;
+  ID3D11PixelShader *ps = NULL;
+  ID3D11ClassInstance *red_i = NULL, *greens1 = NULL, *halved = NULL, *loop = NULL, *greens0 = NULL, *tex = NULL, *made = NULL, *missing = NULL, *none = NULL;
+  ID3D11Buffer *classes = NULL, *params = NULL;
+  D3D11_CLASS_INSTANCE_DESC desc;
+  HRESULT hr = ID3D11Device_CreateClassLinkage(g_device, &linkage);
+  if (SUCCEEDED(hr)) hr = ID3D11Device_CreateVertexShader(g_device, dx_vs_vol_dxbc, sizeof dx_vs_vol_dxbc, NULL, &vs);
+  if (SUCCEEDED(hr)) hr = ID3D11Device_CreatePixelShader(g_device, dx_ps_iface_dxbc, sizeof dx_ps_iface_dxbc, linkage, &ps);
+  check(SUCCEEDED(hr) && linkage && vs && ps, "class linkage: a pixel shader with interfaces made with a linkage");
+  if (FAILED(hr)) goto done;
+  /* the instances the shader declares, found by name */
+  check(SUCCEEDED(ID3D11ClassLinkage_GetClassInstance(linkage, "red", 0, &red_i)) && red_i, "GetClassInstance finds a shader's instance by name");
+  if (!red_i) goto done;
+  ID3D11ClassInstance_GetDesc(red_i, &desc);
+  check(desc.InstanceId == 1 && desc.InstanceIndex == 0 && desc.TypeId == 3 && desc.ConstantBuffer == 0 && desc.BaseConstantBufferOffset == 0 && !desc.Created,
+        "... its description: the instance and type numbers of the shader, the buffer and offset of its data, not created");
+  {
+    char name[32];
+    SIZE_T length = sizeof name;
+    ID3D11ClassInstance_GetInstanceName(red_i, name, &length);
+    check(strcmp(name, "red") == 0 && length == 4, "... GetInstanceName");
+    length = sizeof name;
+    ID3D11ClassInstance_GetTypeName(red_i, name, &length);
+    check(strcmp(name, "cConst") == 0 && length == 7, "... GetTypeName");
+    ID3D11ClassLinkage *back = NULL;
+    ID3D11ClassInstance_GetClassLinkage(red_i, &back);
+    check(back == linkage, "... GetClassLinkage");
+    if (back) ID3D11ClassLinkage_Release(back);
+  }
+  check(SUCCEEDED(ID3D11ClassLinkage_GetClassInstance(linkage, "greens", 1, &greens1)) && greens1, "an element of an instance array");
+  if (greens1) { ID3D11ClassInstance_GetDesc(greens1, &desc); check(desc.InstanceIndex == 1 && desc.BaseConstantBufferOffset == 2, "... its data after the first element's"); }
+  check(ID3D11ClassLinkage_GetClassInstance(linkage, "greens", 2, &none) == E_INVALIDARG && !none, "an index past the array: E_INVALIDARG");
+  check(ID3D11ClassLinkage_GetClassInstance(linkage, "nothing", 0, &none) == E_INVALIDARG && !none, "a name no shader has: E_INVALIDARG");
+  ID3D11ClassLinkage_GetClassInstance(linkage, "halved", 0, &halved);
+  ID3D11ClassLinkage_GetClassInstance(linkage, "loop", 0, &loop);
+  ID3D11ClassLinkage_GetClassInstance(linkage, "greens", 0, &greens0);
+  ID3D11ClassLinkage_GetClassInstance(linkage, "texture_colour", 0, &tex);
+  if (tex) { ID3D11ClassInstance_GetDesc(tex, &desc); check(desc.BaseTexture == 0 && desc.BaseSampler == 0, "a class with a texture and a sampler: its first ones"); }
+  check(SUCCEEDED(ID3D11ClassLinkage_CreateClassInstance(linkage, "cConst", 0, 4, 0, 0, &made)) && made, "CreateClassInstance");
+  if (made) { ID3D11ClassInstance_GetDesc(made, &desc); check(desc.Created && desc.TypeId == 3 && desc.BaseConstantBufferOffset == 4, "... its description"); }
+  ID3D11ClassLinkage_CreateClassInstance(linkage, "cMissing", 0, 0, 0, 0, &missing);
+  check(ID3D11ClassLinkage_CreateClassInstance(linkage, NULL, 0, 0, 0, 0, &none) == E_INVALIDARG, "CreateClassInstance without a type: E_INVALIDARG");
+  if (!halved || !loop || !greens0 || !tex || !made || !greens1) goto done;
+  {
+    /* the constants: red, greens[0], greens[1], halved (colour, scale), loop.step */
+    float classes_data[6][4] = {{0.5f, 0, 0, 0}, {0, 0.5f, 0, 0}, {0, 0, 1, 0}, {0, 1, 0, 0}, {0.5f, 0, 0, 0}, {0.25f, 0, 0, 0.6f}};
+    const UINT params_data[4] = {0, 0, 0, 0};
+    classes = make_buffer(D3D11_BIND_CONSTANT_BUFFER, D3D11_USAGE_DEFAULT, 0, classes_data, sizeof classes_data);
+    params = make_buffer(D3D11_BIND_CONSTANT_BUFFER, D3D11_USAGE_DEFAULT, 0, params_data, sizeof params_data);
+    if (!classes || !params) goto done;
+    ID3D11ClassInstance *set1[3] = {red_i, halved, greens1};
+    check(near_rgb(draw_linked(vs, ps, set1, 3, classes, params, 0), 128, 128, 0), "a draw through interfaces: red + halved (a static and a dynamically indexed slot)");
+    check(near_rgb(draw_linked(vs, ps, set1, 3, classes, params, 1), 128, 0, 255), "... the other element of the array: red + greens[1]");
+    {
+      ID3D11ClassInstance *got[4] = {NULL, NULL, NULL, NULL};
+      UINT n = 4;
+      ID3D11PixelShader *bound = NULL;
+      ID3D11DeviceContext_PSGetShader(g_context, &bound, got, &n);
+      check(bound == ps && n == 3 && got[0] == red_i && got[1] == halved && got[2] == greens1 && !got[3], "PSGetShader gives back the instances bound");
+      if (bound) ID3D11PixelShader_Release(bound);
+      for (int i = 0; i < 4; ++i) if (got[i]) ID3D11ClassInstance_Release(got[i]);
+    }
+    classes_data[4][0] = -1;      /* (halved returns magenta from inside an if) */
+    ID3D11DeviceContext_UpdateSubresource(g_context, (ID3D11Resource *)classes, 0, NULL, classes_data, 0, 0);
+    check(near_rgb(draw_linked(vs, ps, set1, 3, classes, params, 0), 255, 0, 255), "a body that returns from inside an if");
+    classes_data[4][0] = 0.5f;
+    ID3D11DeviceContext_UpdateSubresource(g_context, (ID3D11Resource *)classes, 0, NULL, classes_data, 0, 0);
+    ID3D11ClassInstance *set2[3] = {loop, greens0, loop};
+    check(near_rgb(draw_linked(vs, ps, set2, 3, classes, params, 0), 191, 128, 0), "a body that returns from inside a loop (three steps of 0.25)");
+    ID3D11ClassInstance *set3[3] = {made, red_i, red_i};
+    check(near_rgb(draw_linked(vs, ps, set3, 3, classes, params, 1), 255, 0, 0), "a created instance with its data where it was made to be");
+    {
+      /* the texture class: the texture of slot t0 */
+      const UINT32 blue_texel = 0xFFFF0000u;      /* (R8G8B8A8: blue) */
+      D3D11_TEXTURE2D_DESC td = {1, 1, 1, 1, DXGI_FORMAT_R8G8B8A8_UNORM, {1, 0}, D3D11_USAGE_DEFAULT, D3D11_BIND_SHADER_RESOURCE, 0, 0};
+      D3D11_SUBRESOURCE_DATA initial = {&blue_texel, 4, 0};
+      ID3D11Texture2D *texture = NULL;
+      ID3D11ShaderResourceView *view = NULL;
+      ID3D11SamplerState *sampler = point_sampler();
+      if (SUCCEEDED(ID3D11Device_CreateTexture2D(g_device, &td, &initial, &texture)) &&
+          SUCCEEDED(ID3D11Device_CreateShaderResourceView(g_device, (ID3D11Resource *)texture, NULL, &view)) && sampler) {
+        ID3D11DeviceContext_PSSetShaderResources(g_context, 0, 1, &view);
+        ID3D11DeviceContext_PSSetSamplers(g_context, 0, 1, &sampler);
+        ID3D11ClassInstance *set4[3] = {tex, greens0, red_i};
+        check(near_rgb(draw_linked(vs, ps, set4, 3, classes, params, 1), 128, 0, 255), "a class with a texture: the instance's texture and sampler");
+        ID3D11ShaderResourceView *no_view = NULL;
+        ID3D11DeviceContext_PSSetShaderResources(g_context, 0, 1, &no_view);
+      } else {
+        check(0, "a texture for the texture class");
+      }
+      if (view) ID3D11ShaderResourceView_Release(view);
+      if (texture) ID3D11Texture2D_Release(texture);
+      if (sampler) ID3D11SamplerState_Release(sampler);
+    }
+    if (missing) {
+      /* an instance of a class the shader does not have: the draw is left out */
+      ID3D11ClassInstance *set5[3] = {missing, red_i, red_i};
+      check(near_rgb(draw_linked(vs, ps, set5, 3, classes, params, 0), 0, 0, 0), "an instance of a class the shader does not have: nothing drawn");
+    }
+    ID3D11DeviceContext_PSSetShader(g_context, NULL, NULL, 0);
+  }
+done:
+  if (classes) ID3D11Buffer_Release(classes);
+  if (params) ID3D11Buffer_Release(params);
+  if (red_i) ID3D11ClassInstance_Release(red_i);
+  if (greens1) ID3D11ClassInstance_Release(greens1);
+  if (greens0) ID3D11ClassInstance_Release(greens0);
+  if (halved) ID3D11ClassInstance_Release(halved);
+  if (loop) ID3D11ClassInstance_Release(loop);
+  if (tex) ID3D11ClassInstance_Release(tex);
+  if (made) ID3D11ClassInstance_Release(made);
+  if (missing) ID3D11ClassInstance_Release(missing);
+  if (ps) ID3D11PixelShader_Release(ps);
+  if (vs) ID3D11VertexShader_Release(vs);
+  if (linkage) ID3D11ClassLinkage_Release(linkage);
+}
+
 int main(void) {
   test_device();
   if (g_device && g_context) {
@@ -4620,12 +5055,15 @@ int main(void) {
       test_uav_only_draw();
       test_pixel_uav_and_queries();
       test_stream_output();
+      test_simultaneous_queries();
       test_indirect_draws();
       test_min_lod();
       test_deferred();
       test_d3d11_1();
       test_texture1d();
       test_formats();
+      test_vertex_formats();
+      test_class_linkage();
       test_creation_and_interop();
       test_render_to_levels();
       test_fixed_state();

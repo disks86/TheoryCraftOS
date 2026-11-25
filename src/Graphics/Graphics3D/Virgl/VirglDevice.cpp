@@ -22,6 +22,7 @@
 #include "Graphics/BlockCompression.hpp"
 #include <new>
 #include "Graphics/Graphics3D/Virgl/VirglProtocol.hpp"
+#include "Graphics/Graphics3D/Virgl/VirglVertexPatch.hpp"
 #include "Utility/AllocatedView.hpp"
 #include "Utility/ByteStream.hpp"
 #include "Utility/ByteBuffer.hpp"
@@ -108,6 +109,30 @@ class Stream {
 
 constexpr uint32_t kFillQueries = 16;   // the device's own queries in a submit (how far stream output buffers got)
 constexpr uint32_t kQuerySlots = kMaxOcclusionQueries + kFillQueries;
+// The host's query targets: what one host query counts. The host runs one query of a target at a time (GL's rule), so each of ours is made of segments of the targets it needs.
+constexpr uint32_t kTargetOcclusion = 0, kTargetStatistic = 1, kTargetWritten = kTargetStatistic + kPipelineStatisticCount, kTargetNeeded = kTargetWritten + kMaxGeometryStreams,
+                   kQueryTargets = kTargetNeeded + kMaxGeometryStreams;
+uint32_t host_query_type(uint32_t target) {
+  if (target == kTargetOcclusion) return virgl::kQueryOcclusionCounter;
+  if (target < kTargetWritten) return virgl::kQueryPipelineStatistics | ((target - kTargetStatistic) << 16);
+  if (target < kTargetNeeded) return virgl::kQueryPrimitivesEmitted | ((target - kTargetWritten) << 16);
+  return virgl::kQueryPrimitivesGenerated | ((target - kTargetNeeded) << 16);
+}
+// The targets a query of ours needs (bit n: target n); 0 for one the host does not count (timestamps are a host query of their own at the end, the frequency and disjoint answered here).
+uint32_t query_targets(QueryKind kind, uint32_t stream) {
+  auto statistic = [](PipelineStatistic s) { return 1u << (kTargetStatistic + static_cast<uint32_t>(s)); };
+  switch (kind) {
+    case QueryKind::Occlusion: case QueryKind::OcclusionPredicate: return 1u << kTargetOcclusion;
+    case QueryKind::IaVertices: return statistic(PipelineStatistic::IaVertices);
+    case QueryKind::IaPrimitives: return statistic(PipelineStatistic::IaPrimitives);
+    case QueryKind::VsInvocations: return statistic(PipelineStatistic::VsInvocations);
+    case QueryKind::PsInvocations: return statistic(PipelineStatistic::PsInvocations);
+    case QueryKind::SoPrimitivesWritten: return 1u << (kTargetWritten + stream);
+    case QueryKind::SoPrimitivesNeeded: return 1u << (kTargetNeeded + stream);
+    case QueryKind::PipelineStatistics: return ((1u << kPipelineStatisticCount) - 1) << kTargetStatistic;
+    default: return 0;
+  }
+}
 constexpr uint32_t kQueryPolls = 5000;   // how many empty commands to wait for the host's query results with
 
 // --- Objects -------------------------------------------------------------------
@@ -962,8 +987,10 @@ class VirglShaderModule final : public IShaderModule {
 uint32_t virgl_vertex_format(VertexFormat format) {
   static const uint32_t kFirst[] = {virgl::kFormatR32Float, 64 /* R8_UNORM */, 74 /* R8_SNORM */, 177 /* R8_UINT */, 181 /* R8_SINT */, 48 /* R16_UNORM */, 56 /* R16_SNORM */,
                                     185 /* R16_UINT */, 189 /* R16_SINT */, 91 /* R16_FLOAT */, 193 /* R32_UINT */, 197 /* R32_SINT */};
-  if (format == VertexFormat::Bgra8Unorm) return virgl::kFormatB8G8R8A8Unorm;
+  if (format == VertexFormat::Bgra8Unorm || format == VertexFormat::Bgrx8Unorm) return virgl::kFormatB8G8R8A8Unorm;   // (B8G8R8X8: its w made 1 in the shader, VirglVertexPatch.hpp)
   if (format == VertexFormat::Rgb10A2Unorm) return virgl::kFormatR10G10B10A2Unorm;
+  if (format == VertexFormat::Rgb10A2Uint) return virgl::kFormatR32Uint;   // (the word, unpacked in the shader: OpenGL has no such integer attribute)
+  if (format == VertexFormat::Rg11B10Float) return 124;   // R11G11B10_FLOAT (GL_UNSIGNED_INT_10F_11F_11F_REV)
   return kFirst[static_cast<uint32_t>(vertex_format_type(format))] + vertex_format_components(format) - 1;
 }
 
@@ -1091,9 +1118,33 @@ class VirglPipeline final : public VirglPipelineBase {
     }
     if (desc.geometry_shader) capture_vertices_ = static_cast<const VirglShaderModule*>(desc.geometry_shader)->capture_vertices();
     else if (desc.hull_shader) capture_vertices_ = static_cast<const VirglShaderModule*>(desc.hull_shader)->tess_output() == TessOutput::Point ? 1 : static_cast<const VirglShaderModule*>(desc.hull_shader)->tess_output() == TessOutput::Line ? 2 : 3;
+    // Vertex formats the host does not read as Direct3D does (VirglVertexPatch.hpp): the vertex shader is a copy of the module's text that makes them right. It has the stream output
+    // declaration when the vertex shader is the last stage before the rasterizer.
+    {
+      virgl_patch::InputFix fixes[kMaxVertexAttributes] = {};
+      bool any = false;
+      for (uint32_t i = 0; i < desc.attribute_count; ++i) {
+        const VertexAttribute& a = desc.attributes[i];
+        if (a.location >= kMaxVertexAttributes) return;
+        if (a.format == VertexFormat::Rgb10A2Uint) fixes[a.location] = virgl_patch::InputFix::UnpackRgb10A2Uint, any = true;
+        else if (a.format == VertexFormat::Bgrx8Unorm) fixes[a.location] = virgl_patch::InputFix::ForceW1, any = true;
+      }
+      if (any) {
+        const auto* vertex = static_cast<const VirglShaderModule*>(desc.vertex_shader);
+        if (!vertex->tgsi()) return;
+        String text(device.gpu().allocator());
+        if (!virgl_patch::patch_vertex_inputs(StringView(vertex->tgsi()), ArrayView<const virgl_patch::InputFix>(fixes, kMaxVertexAttributes), &text)) return;
+        ShaderModuleDesc variant;
+        variant.stage = ShaderStage::Vertex;
+        variant.tgsi = text.c_str();
+        VirglShaderModule module(device, variant, desc.stream_output_count && !gs_ && !ds_ ? &desc : nullptr);
+        if (!module.valid()) return;
+        vs_ = own_vs_ = module.handle();
+      }
+    }
     // Stream output goes with the last vertex-processing shader on the host (the geometry shader, else the domain shader, else the vertex shader): a copy of it that has the declaration.
     if (desc.stream_output_count) {
-      if (!desc.geometry_shader && !desc.domain_shader) {
+      if (!desc.geometry_shader && !desc.domain_shader && !own_vs_) {
         const auto* vertex = static_cast<const VirglShaderModule*>(desc.vertex_shader);
         if (!vertex->tgsi()) return;
         ShaderModuleDesc variant;
@@ -1277,8 +1328,10 @@ class VirglPipeline final : public VirglPipelineBase {
     cmd[n++] = float_bits(offset ? desc.depth_bias.clamp : 0.0f);                                                         // offset clamp
 
     // Vertex elements. Element n is the vertex shader's input n on the host, so they are laid out by location (a location nothing feeds repeats the first attribute: the
-    // shader does not read it). The host keeps the instance divisor with a buffer binding, so every vertex buffer slot in use gets a binding for its per-vertex attributes and
-    // another for its per-instance ones (bindings_[], which the draw fills with the slots' buffers).
+    // shader does not read it). The host keeps the instance divisor with a buffer binding, and sets binding n's divisor from element n (glVertexBindingDivisor(n, ...) for
+    // each element n): so element n reads binding m, the first element with its slot and divisor, whose divisor element m set. Binding n is slot n's element's slot
+    // (bindings_[], which the draw fills with the slots' buffers), used or not. A step rate of 0 (every instance reads the draw's first instance) is the largest divisor:
+    // OpenGL's divisor 0 is per vertex.
     uint32_t by_location[kMaxVertexAttributes];
     uint32_t element_count = 0;
     for (uint32_t& a : by_location) a = kMaxVertexAttributes;
@@ -1290,21 +1343,24 @@ class VirglPipeline final : public VirglPipelineBase {
     }
     cmd[n++] = virgl::header(virgl::kCreateObject, virgl::kObjectVertexElements, element_count * 4 + 1);
     cmd[n++] = elements_;
+    auto divisor_of = [](const VertexAttribute& a) { return !a.per_instance ? 0u : a.step_rate ? a.step_rate : 0xFFFFFFFFu; };
+    auto attribute_at = [&](uint32_t location) -> const VertexAttribute& { return desc.attributes[by_location[location] != kMaxVertexAttributes ? by_location[location] : 0]; };
     for (uint32_t location = 0; location < element_count; ++location) {
-      const VertexAttribute& a = desc.attributes[by_location[location] != kMaxVertexAttributes ? by_location[location] : 0];
-      const uint8_t key = static_cast<uint8_t>(a.slot * 2 + (a.per_instance ? 1 : 0));
+      const VertexAttribute& a = attribute_at(location);
       uint32_t binding = 0;
-      while (binding < binding_count_ && bindings_[binding] != key) ++binding;
-      if (binding == binding_count_) bindings_[binding_count_++] = key;
+      while (binding < location && (attribute_at(binding).slot != a.slot || divisor_of(attribute_at(binding)) != divisor_of(a))) ++binding;
+      bindings_[location] = a.slot;
       cmd[n++] = a.offset;
-      cmd[n++] = a.per_instance ? 1 : 0;   // instance divisor
+      cmd[n++] = divisor_of(a);   // instance divisor
       cmd[n++] = binding;
       cmd[n++] = virgl_vertex_format(a.format);
     }
+    binding_count_ = element_count;
     ok_ = n <= sizeof cmd / sizeof cmd[0] && device.send_commands(cmd, n);
   }
   ~VirglPipeline() {
     if (own_fs_) device_.destroy_object(own_fs_);
+    if (own_vs_) device_.destroy_object(own_vs_);
     device_.destroy_object(blend_);
     device_.destroy_object(dsa_);
     device_.destroy_object(rasterizer_);
@@ -1318,7 +1374,7 @@ class VirglPipeline final : public VirglPipelineBase {
   uint32_t elements() const { return elements_; }
   // The host's vertex buffer bindings: binding n is vertex buffer slot binding_slot(n), with the stride of that slot.
   uint32_t binding_count() const { return binding_count_; }
-  uint32_t binding_slot(uint32_t binding) const { return bindings_[binding] / 2; }
+  uint32_t binding_slot(uint32_t binding) const { return bindings_[binding]; }
   uint8_t stencil_reference() const { return stencil_reference_; }
   uint8_t stencil_back_reference() const { return stencil_back_reference_; }   // (the second DSA stencil state's)
   bool uses_blend_constant() const {
@@ -1362,7 +1418,8 @@ class VirglPipeline final : public VirglPipelineBase {
   uint8_t stencil_reference_ = 0, stencil_back_reference_ = 0;
   uint32_t blend_ = 0, dsa_ = 0, rasterizer_ = 0, elements_ = 0;
   uint32_t own_fs_ = 0;   // (a fragment shader of the pipeline's own: the depth bias of a normalised format)
-  uint8_t bindings_[kMaxVertexBuffers * 2] = {};   // slot * 2 + per_instance of each host vertex buffer binding
+  uint8_t bindings_[kMaxVertexAttributes] = {};   // the slot of each host vertex buffer binding
+  uint32_t own_vs_ = 0;   // the vertex shader made for this pipeline's vertex formats (0: none)
   uint32_t binding_count_ = 0;
   bool ok_ = false;
 };
@@ -1761,25 +1818,152 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
   Stream stream(gpu_.allocator());
   if (!stream.valid()) return false;
 
-  // Occlusion queries: one host query object per slot, each with a buffer of its own for its result (16 bytes: state, size, the count) that the host fills in when asked for
-  // it after the commands have run. (The host takes no offset into a shared buffer: two queries on one buffer overwrite each other.)
+  // Queries: the host's query objects, each with a buffer of its own for its result (16 bytes: state, size, the count) that the host fills in when asked for it after the commands
+  // have run (the host takes no offset into a shared buffer: two queries on one buffer overwrite each other). Ours may be any number open at once, of one kind or several and nested,
+  // while the host runs one of each target at a time: a target's host queries are segments, one ending where the next begins whenever one of ours that needs the target begins or ends
+  // (and around a blit, which the host may draw), and each of ours adds up the segments of each of its targets between its begin and its end. The slots from kMaxOcclusionQueries on
+  // are the device's own: the stream output primitives a transform feedback wrote, to know how far a buffer got.
+  struct Segment {
+    uint32_t target;
+    uint32_t host;   // (the index in Queries::host)
+  };
+  struct UserQuery {
+    bool open = false, synthetic = false;
+    QueryKind kind = QueryKind::Occlusion;
+    uint32_t stream = 0, targets = 0;
+    uint64_t synthetic_value = 0;
+    uint32_t timestamp = 0;   // (the host query of a timestamp)
+    uint64_t first[kQueryTargets] = {}, end[kQueryTargets] = {};   // (the segments it spans: indices in Queries::segments, from first to before end)
+  };
+  struct HostQuery {
+    VirglBuffer* result = nullptr;
+    uint32_t object = 0;
+  };
   struct Queries {
-    explicit Queries(VirglDevice& d) : device(d) {}
+    explicit Queries(VirglDevice& d) : device(d), host(d.gpu().allocator()), segments(d.gpu().allocator()), users(d.gpu().allocator()) {}
     ~Queries() {
-      for (uint32_t handle : objects)
-        if (handle) device.destroy_object(handle);
-      for (VirglBuffer* buffer : results)
-        if (buffer) destroy(device.gpu().allocator(), buffer);
+      for (const HostQuery& q : host.view()) {
+        if (q.object) device.destroy_object(q.object);
+        if (q.result) destroy(device.gpu().allocator(), q.result);
+      }
     }
     VirglDevice& device;
-    // (the slots from kMaxOcclusionQueries on are the device's own: the stream output primitives a transform feedback wrote, to know how far a buffer got)
-    VirglBuffer* results[kQuerySlots] = {};
-    uint32_t objects[kQuerySlots] = {};
-    bool used[kQuerySlots] = {};
-    bool synthetic[kQuerySlots] = {};   // (answered here, not by the host)
-    uint64_t synthetic_value[kQuerySlots] = {};
-    uint32_t open = kMaxOcclusionQueries;   // the slot between begin and end
+    List<HostQuery> host;
+    List<Segment> segments;
+    List<UserQuery> users;
+    int32_t slot_user[kQuerySlots];            // (the index in `users` of a slot, -1 for none)
+    int64_t active[kQueryTargets];             // (the segment of a target the host is running, -1 for none)
+    uint32_t open_users[kQueryTargets] = {};   // (how many of ours that need the target are open)
+    uint32_t open_count = 0;
   } queries(*this);
+  for (int32_t& u : queries.slot_user) u = -1;
+  for (int64_t& a : queries.active) a = -1;
+  bool disjoint_asked = false;
+  // A transform feedback is alive on the host (from the first draw with stream output to its end): only then do the targets of the primitives written and needed run. (A pipeline
+  // without stream output writes and needs none; and the host draws wrongly with a PRIMITIVES_GENERATED query running and no transform feedback.)
+  bool so_set = false, so_alive = false;
+  auto target_runs = [&](uint32_t target) { return target < kTargetWritten || so_alive; };
+  // A host query of `type` made and begun (and ended at once, for a timestamp): its index in queries.host, or -1.
+  auto host_query = [&](uint32_t type, bool end_now) -> int64_t {
+    HostQuery q;
+    q.result = make<VirglBuffer>(gpu_.allocator(), *this, 16, 0, virgl::kBindCustom);
+    if (!q.result) return -1;
+    if (!q.result->valid() || !queries.host.push_back(q)) {
+      destroy(gpu_.allocator(), q.result);
+      return -1;
+    }
+    HostQuery& made = queries.host[queries.host.count() - 1];
+    made.object = new_handle();
+    stream.command(virgl::kCreateObject, virgl::kObjectQuery, 4);
+    stream.put(made.object);
+    stream.put(type);
+    stream.put(0);
+    stream.put(made.result->id());
+    stream.command(virgl::kBeginQuery, 0, 1);
+    stream.put(made.object);
+    if (end_now) {
+      stream.command(virgl::kEndQuery, 0, 1);
+      stream.put(made.object);
+    }
+    return static_cast<int64_t>(queries.host.count() - 1);
+  };
+  auto begin_segment = [&](uint32_t target) {
+    if (!target_runs(target)) return true;   // (counted from when it runs: while a transform feedback is alive)
+    const int64_t h = host_query(host_query_type(target), false);
+    if (h < 0 || !queries.segments.push_back({target, static_cast<uint32_t>(h)})) return false;
+    queries.active[target] = static_cast<int64_t>(queries.segments.count() - 1);
+    return true;
+  };
+  auto end_segment = [&](uint32_t target) {
+    if (queries.active[target] < 0) return;
+    stream.command(virgl::kEndQuery, 0, 1);
+    stream.put(queries.host[queries.segments[static_cast<uint64_t>(queries.active[target])].host].object);
+    queries.active[target] = -1;
+  };
+  // Begins query `slot` of ours (false if it cannot be: a slot begun twice, no memory).
+  auto begin_user = [&](uint32_t slot, QueryKind kind, uint32_t output_stream) {
+    if (slot >= kQuerySlots || queries.slot_user[slot] >= 0) return false;
+    UserQuery u;
+    u.open = true;
+    u.kind = kind;
+    u.stream = output_stream;
+    u.targets = query_targets(kind, output_stream);
+    if (kind == QueryKind::TimestampFrequency || kind == QueryKind::TimestampDisjoint) {
+      // (the host has no such query: its timestamps are nanoseconds and it cannot say whether the clock was interrupted)
+      u.synthetic = true;
+      u.synthetic_value = kind == QueryKind::TimestampFrequency ? 1000000000u : (clock_interrupted_ ? 1u : 0u);
+      disjoint_asked = disjoint_asked || kind == QueryKind::TimestampDisjoint;
+    }
+    for (uint32_t t = 0; t < kQueryTargets; ++t) {
+      if (!(u.targets >> t & 1)) continue;
+      end_segment(t);   // (the others that need it go on in the next segment)
+      if (!begin_segment(t)) return false;
+      u.first[t] = queries.active[t] >= 0 ? static_cast<uint64_t>(queries.active[t]) : queries.segments.count();
+      ++queries.open_users[t];
+    }
+    if (!queries.users.push_back(u)) return false;
+    queries.slot_user[slot] = static_cast<int32_t>(queries.users.count() - 1);
+    ++queries.open_count;
+    return true;
+  };
+  auto end_user = [&](uint32_t slot) {
+    if (slot >= kQuerySlots || queries.slot_user[slot] < 0) return false;
+    UserQuery& u = queries.users[static_cast<uint64_t>(queries.slot_user[slot])];
+    if (!u.open) return false;
+    u.open = false;
+    --queries.open_count;
+    if (u.kind == QueryKind::Timestamp) {
+      const int64_t h = host_query(virgl::kQueryTimestamp, true);
+      if (h < 0) return false;
+      u.timestamp = static_cast<uint32_t>(h);
+    }
+    for (uint32_t t = 0; t < kQueryTargets; ++t) {
+      if (!(u.targets >> t & 1)) continue;
+      u.end[t] = queries.active[t] >= 0 ? static_cast<uint64_t>(queries.active[t]) + 1 : queries.segments.count();
+      end_segment(t);
+      if (--queries.open_users[t] && !begin_segment(t)) return false;
+    }
+    return true;
+  };
+  // The query of the commands begun last that is still open (what an EndQuery that names none ends): its slot, or kQuerySlots.
+  auto last_open_slot = [&]() {
+    uint32_t slot = kQuerySlots;
+    int32_t latest = -1;
+    for (uint32_t k = 0; k < kMaxOcclusionQueries; ++k) {
+      const int32_t u = queries.slot_user[k];
+      if (u > latest && queries.users[static_cast<uint64_t>(u)].open) latest = u, slot = k;
+    }
+    return slot;
+  };
+  // Around a command that is not a draw or a dispatch (a blit, which the host may make with draws of its own): no segment runs.
+  auto pause_queries = [&]() {
+    for (uint32_t t = 0; t < kQueryTargets; ++t) end_segment(t);
+  };
+  auto resume_queries = [&]() {
+    for (uint32_t t = 0; t < kQueryTargets; ++t)
+      if (queries.open_users[t] && queries.active[t] < 0 && !begin_segment(t)) return false;
+    return true;
+  };
 
   const VirglPipeline* pipeline = nullptr;
   VirglImage* color = nullptr;
@@ -1896,17 +2080,13 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
   } so_slot[kMaxStreamOutputBuffers];
   uint32_t so_handles[kMaxStreamOutputBuffers] = {};
   uint32_t so_program[5] = {};   // (the shaders of the pipeline the transform feedback began with)
-  bool so_alive = false, so_set = false, disjoint_asked = false;
-  uint32_t so_query_slot[kMaxGeometryStreams] = {};   // (0: none, else the slot of the Queries)
+  uint32_t so_query_slot[kMaxGeometryStreams] = {};   // (0: none, else the slot of our query of the primitives the stream wrote)
   struct Fill {
     VirglBuffer* buffer = nullptr;
     uint64_t base = 0;
     uint32_t stride = 0, vertices = 0, query = 0;   // (query 0: not counted)
   } fills[kFillQueries];
   uint32_t fill_count = 0, internal_queries = 0;
-  bool user_so_query[kMaxGeometryStreams] = {};   // (a stream output statistics query of the commands: the host allows one at a time, ours stand aside)
-  for (const RecordedCommand& c : recorder.commands())
-    if (c.type == RecordedCommand::Type::BeginQuery && (c.count & 0xFF) == static_cast<uint32_t>(QueryKind::SoPrimitivesWritten)) user_so_query[c.count >> 8 & 3] = true;
   const ConstByteView pool = recorder.constants();
 
   // The buffers the commands bind (vertex, index, storage and stream output): each part of the stream that goes out tells them its work number, so that a
@@ -2052,19 +2232,19 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
   auto end_stream_output = [&]() {
     if (!so_alive) return;
     unset_stream_output();
+    so_alive = false;   // (the stream output targets' segments end with it, and none begins until the next)
     for (uint32_t k = 0; k < kMaxGeometryStreams; ++k) {
       if (!so_query_slot[k]) continue;
-      stream.command(virgl::kEndQuery, 0, 1);
-      stream.put(queries.objects[so_query_slot[k]]);
+      end_user(so_query_slot[k]);
       so_query_slot[k] = 0;
     }
+    for (uint32_t t = kTargetWritten; t < kQueryTargets; ++t) end_segment(t);
     for (uint32_t& handle : so_handles) {
       if (!handle) continue;
       stream.command(virgl::kDestroyObject, 0, 1);
       stream.put(handle);
       handle = 0;
     }
-    so_alive = false;
   };
   // Makes the targets current for a draw of `pipeline`.
   auto begin_stream_output = [&]() -> bool {
@@ -2078,38 +2258,36 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
       if (!pipeline->geometry_shader() && !pipeline->domain_shader()) vertices = topology == PrimitiveTopology::TriangleList ? 3 : topology == PrimitiveTopology::LineList ? 2 : 1;
       for (uint32_t k = 0; k < kMaxStreamOutputBuffers; ++k) {
         if (!so_slot[k].buffer) continue;
+        // (a buffer that is full - an append after the records that filled it - takes nothing more; GL refuses a range of no bytes, so the target is its last 4 bytes, where no record of
+        // more than 4 bytes fits: the primitives are needed and not written, as for a full buffer. Records of 4 bytes or less would be written there: refused.)
+        uint64_t offset = so_slot[k].offset, room = so_slot[k].buffer->size() - offset;
+        if (room < 4) {
+          const uint64_t record = uint64_t{pd.stream_output_stride[k]} * vertices;
+          if (record <= 4 || so_slot[k].buffer->size() < 4) return false;
+          offset = so_slot[k].buffer->size() - 4, room = 4;
+        }
         so_handles[k] = new_handle();
         stream.command(virgl::kCreateObject, virgl::kObjectStreamoutTarget, 4);
-        stream.put(so_handles[k]), stream.put(so_slot[k].buffer->id()), stream.put(static_cast<uint32_t>(so_slot[k].offset)), stream.put(static_cast<uint32_t>(so_slot[k].buffer->size() - so_slot[k].offset));
+        stream.put(so_handles[k]), stream.put(so_slot[k].buffer->id()), stream.put(static_cast<uint32_t>(offset)), stream.put(static_cast<uint32_t>(room));
       }
-      // The primitives a stream wrote, for each stream the declaration takes buffers from (unless the commands have a query of that kind, which the host cannot run twice at once).
+      // The primitives a stream wrote, for each stream the declaration takes buffers from.
       for (uint32_t b = 0; b < kMaxStreamOutputBuffers; ++b) {
         if (!so_slot[b].buffer || !(pipeline->stream_output_buffers() >> b & 1)) continue;
         if (fill_count >= kFillQueries) return false;
         Fill& fill = fills[fill_count++];
         fill = {so_slot[b].buffer, so_slot[b].offset, pd.stream_output_stride[b], vertices, 0};
         const uint32_t output_stream = pipeline->stream_of_buffer(b);
-        if (user_so_query[output_stream]) continue;
         if (!so_query_slot[output_stream]) {
           if (internal_queries >= kFillQueries) return false;
           const uint32_t slot = kMaxOcclusionQueries + internal_queries++;
-          queries.results[slot] = make<VirglBuffer>(gpu_.allocator(), *this, 16, 0, virgl::kBindCustom);
-          if (!queries.results[slot] || !queries.results[slot]->valid()) return false;
-          queries.objects[slot] = new_handle();
-          queries.used[slot] = true;
-          stream.command(virgl::kCreateObject, virgl::kObjectQuery, 4);
-          stream.put(queries.objects[slot]);
-          stream.put(virgl::kQueryPrimitivesEmitted | (output_stream << 16));
-          stream.put(0);
-          stream.put(queries.results[slot]->id());
-          stream.command(virgl::kBeginQuery, 0, 1);
-          stream.put(queries.objects[slot]);
+          if (!begin_user(slot, QueryKind::SoPrimitivesWritten, output_stream)) return false;
           so_query_slot[output_stream] = slot;
         }
         fill.query = so_query_slot[output_stream];
       }
       for (uint32_t k = 0; k < 5; ++k) so_program[k] = program[k];
       so_alive = true;
+      if (!resume_queries()) return false;   // (the stream output targets' segments of the queries open: they count from here)
     }
     if (!so_set) {
       stream.command(virgl::kSetStreamoutTargets, 0, 5);
@@ -2249,7 +2427,6 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
         patch_points = cmd.count;
         break;
       case RecordedCommand::Type::EndRenderPass:
-        if (queries.open != kMaxOcclusionQueries) return false;
         unset_stream_output();
         in_pass = false;
         for (uint32_t n = 0; n < kMaxColorTargets; ++n) {   // (what was drawn through stand-ins goes into the targets)
@@ -2280,6 +2457,7 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
         // (the host's blit averages colour and takes the first sample of depth: the other modes of a depth image are not made)
         if (mode != (depth ? ResolveMode::Sample0 : ResolveMode::Average)) return false;
         const bool flip = !depth && to->y0_top();   // (a multisampled image does not take the flag: the host stores it the way GL does, and only a destination kept upright needs the blit to turn it over)
+        pause_queries();
         stream.command(virgl::kBlit, 0, 21);
         stream.put(depth ? (to->has_stencil() ? 0x30u : 0x10u) : 0xFu);   // (all four channels, or depth and stencil; nearest, no scissor)
         stream.put(0);
@@ -2288,6 +2466,7 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
         stream.put(0), stream.put(flip ? e.height : 0), stream.put(0), stream.put(e.width), stream.put(flip ? static_cast<uint32_t>(-static_cast<int32_t>(e.height)) : e.height), stream.put(1);
         stream.put(from->id()), stream.put(0), stream.put(from->blit_format());
         stream.put(0), stream.put(0), stream.put(0), stream.put(e.width), stream.put(e.height), stream.put(1);
+        if (!resume_queries()) return false;
         break;
       }
       case RecordedCommand::Type::BindComputePipeline: {
@@ -2413,47 +2592,13 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
         stream.put(0xFFFFFFFFu);
         break;
       }
-      case RecordedCommand::Type::BeginQuery: {
-        if (!in_pass || queries.open != kMaxOcclusionQueries || cmd.unit >= kMaxOcclusionQueries || queries.used[cmd.unit] || (cmd.count & 0xFF) > static_cast<uint32_t>(QueryKind::TimestampDisjoint)) return false;
-        if ((cmd.count & 0xFF) >= static_cast<uint32_t>(QueryKind::TimestampFrequency)) {
-          // (the host has no such query: its timestamps are nanoseconds and it cannot say whether the clock was interrupted)
-          queries.used[cmd.unit] = queries.synthetic[cmd.unit] = true;
-          queries.synthetic_value[cmd.unit] = (cmd.count & 0xFF) == static_cast<uint32_t>(QueryKind::TimestampFrequency) ? 1000000000u : (clock_interrupted_ ? 1u : 0u);
-          disjoint_asked = disjoint_asked || (cmd.count & 0xFF) == static_cast<uint32_t>(QueryKind::TimestampDisjoint);
-          queries.open = cmd.unit;
-          break;
-        }
-        queries.results[cmd.unit] = make<VirglBuffer>(gpu_.allocator(), *this, 16, 0, virgl::kBindCustom);
-        if (!queries.results[cmd.unit] || !queries.results[cmd.unit]->valid()) return false;
-        const uint32_t handle = new_handle();
-        stream.command(virgl::kCreateObject, virgl::kObjectQuery, 4);
-        stream.put(handle);
-        {
-          const QueryKind kind = static_cast<QueryKind>(cmd.count & 0xFF);
-          const uint32_t output_stream = cmd.count >> 8 & 3;
-          stream.put(kind == QueryKind::Occlusion ? virgl::kQueryOcclusionCounter
-                     : kind == QueryKind::OcclusionPredicate ? virgl::kQueryOcclusionPredicate
-                     : kind == QueryKind::Timestamp ? virgl::kQueryTimestamp
-                     : kind == QueryKind::SoPrimitivesWritten ? virgl::kQueryPrimitivesEmitted | (output_stream << 16)
-                     : kind == QueryKind::SoPrimitivesNeeded ? virgl::kQueryPrimitivesGenerated | (output_stream << 16)
-                                                             : virgl::kQueryPipelineStatistics | ((kind == QueryKind::IaVertices ? 0u : kind == QueryKind::IaPrimitives ? 1u : kind == QueryKind::VsInvocations ? 2u : 7u) << 16));
-        }
-        stream.put(0);
-        stream.put(queries.results[cmd.unit]->id());
-        stream.command(virgl::kBeginQuery, 0, 1);
-        stream.put(handle);
-        queries.objects[cmd.unit] = handle;
-        queries.used[cmd.unit] = true;
-        queries.open = cmd.unit;
+      case RecordedCommand::Type::BeginQuery:
+        if (cmd.unit >= kMaxOcclusionQueries || (cmd.count & 0xFF) > static_cast<uint32_t>(QueryKind::PipelineStatistics) ||
+            !begin_user(cmd.unit, static_cast<QueryKind>(cmd.count & 0xFF), cmd.count >> 8 & 3))
+          return false;
         break;
-      }
       case RecordedCommand::Type::EndQuery:
-        if (queries.open == kMaxOcclusionQueries) return false;
-        if (!queries.synthetic[queries.open]) {
-          stream.command(virgl::kEndQuery, 0, 1);
-          stream.put(queries.objects[queries.open]);
-        }
-        queries.open = kMaxOcclusionQueries;
+        if (!end_user(cmd.count ? cmd.unit : last_open_slot())) return false;
         break;
       case RecordedCommand::Type::BindPipeline: {
         pipeline = static_cast<const VirglPipeline*>(cmd.pipeline);
@@ -2681,24 +2826,22 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
     if (stream.count() > Stream::kCapacity - 512 && !flush()) return false;  // leave room for the next command
   }
   end_stream_output();
-  if (in_pass || !flush()) return false;
+  if (in_pass || queries.open_count || !flush()) return false;
   // Ask the host for each query's count (waiting for the draws), then read what it wrote into the buffer.
-  bool asked = false;
-  for (uint32_t slot = 0; slot < kQuerySlots; ++slot) {
-    if (!queries.used[slot] || queries.synthetic[slot]) continue;
+  for (const HostQuery& q : queries.host.view()) {
     stream.command(virgl::kGetQueryResult, 0, 2);
-    stream.put(queries.objects[slot]);
+    stream.put(q.object);
     stream.put(1);
-    asked = true;
+    if (stream.count() > Stream::kCapacity - 512 && !flush()) return false;
   }
+  const bool asked = queries.host.count() != 0;
   if (asked && !flush()) return false;
   // (the host writes each result - state, size, count - straight into the buffer's guest memory when its GL says the query is complete. It checks as it polls, which it does while
   // commands with fences are coming in: so keep it busy with empty ones until every state reads DONE. Pulling a buffer from the host would overwrite what it wrote.)
   for (uint32_t attempt = 0; asked; ++attempt) {
     bool pending = false;
-    for (uint32_t slot = 0; slot < kQuerySlots; ++slot) {
-      if (!queries.used[slot] || queries.synthetic[slot]) continue;
-      ByteReader in(queries.results[slot]->map());
+    for (const HostQuery& q : queries.host.view()) {
+      ByteReader in(q.result->map());
       if (in.le32() != virgl::kQueryStateDone) pending = true;
     }
     if (!pending) break;
@@ -2706,22 +2849,46 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
     if (attempt > kQueryPolls || !send_commands(&nop, 1, /*fence=*/true)) return false;   // (a fenced one: the host looks at its queries while it waits for fences)
   }
   if (disjoint_asked) clock_interrupted_ = false;
-  uint64_t counts[kMaxOcclusionQueries + kFillQueries] = {};
-  for (uint32_t slot = 0; slot < kQuerySlots; ++slot) {
-    if (!queries.used[slot]) continue;
-    if (queries.synthetic[slot]) {
-      counts[slot] = queries.synthetic_value[slot];
-      recorder.set_occlusion_result(slot, counts[slot]);
-      continue;
-    }
-    ByteReader in(queries.results[slot]->map());
+  auto host_value = [&](uint32_t index, uint64_t* value) {
+    ByteReader in(queries.host[index].result->map());
     in.le32();   // (the state, DONE)
     in.le32();   // (the size of the result: 4 for a sample count, 8 for a time)
     const uint64_t low = in.le32();
     const uint64_t high = in.le32();
-    if (!in.ok()) return false;
-    counts[slot] = low | (high << 32);
-    if (slot < kMaxOcclusionQueries) recorder.set_occlusion_result(slot, counts[slot]);
+    *value = low | (high << 32);
+    return in.ok();
+  };
+  // (what a query of ours counted of a target: its segments of the target added up)
+  auto target_sum = [&](const UserQuery& u, uint32_t target, uint64_t* sum) {
+    *sum = 0;
+    for (uint64_t k = u.first[target]; k < u.end[target] && k < queries.segments.count(); ++k) {
+      if (queries.segments[k].target != target) continue;
+      uint64_t v = 0;
+      if (!host_value(queries.segments[k].host, &v)) return false;
+      *sum += v;
+    }
+    return true;
+  };
+  uint64_t counts[kQuerySlots] = {};
+  for (uint32_t slot = 0; slot < kQuerySlots; ++slot) {
+    if (queries.slot_user[slot] < 0) continue;
+    const UserQuery& u = queries.users[static_cast<uint64_t>(queries.slot_user[slot])];
+    uint64_t values[kMaxQueryValues] = {};
+    if (u.synthetic) {
+      values[0] = u.synthetic_value;
+    } else if (u.kind == QueryKind::Timestamp) {
+      if (!host_value(u.timestamp, &values[0])) return false;
+    } else if (u.kind == QueryKind::PipelineStatistics) {
+      for (uint32_t k = 0; k < kPipelineStatisticCount; ++k)
+        if (!target_sum(u, kTargetStatistic + k, &values[k])) return false;
+    } else {
+      uint32_t target = 0;
+      while (target < kQueryTargets && !(u.targets >> target & 1)) ++target;
+      if (target == kQueryTargets || !target_sum(u, target, &values[0])) return false;
+      if (u.kind == QueryKind::OcclusionPredicate) values[0] = values[0] ? 1 : 0;
+    }
+    counts[slot] = values[0];
+    if (slot < kMaxOcclusionQueries) recorder.set_query_values(slot, ArrayView<const uint64_t>(values));
   }
   // How far each stream output buffer got (the last binding of a buffer in the commands counts; where the commands had a query of the kind that ours stand aside for, nobody knows).
   for (uint32_t f = 0; f < fill_count; ++f) {

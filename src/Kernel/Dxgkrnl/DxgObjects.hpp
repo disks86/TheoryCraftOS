@@ -127,6 +127,8 @@ class PipelineObject {
   uint32_t vertex_slots() const { return vertex_slot_mask_ | instance_slot_mask_; }
   uint32_t per_vertex_slots() const { return vertex_slot_mask_; }
   uint32_t per_instance_slots() const { return instance_slot_mask_; }
+  // The smallest step rate of the per-instance attributes a slot feeds, of those that step (graphics::VertexAttribute::step_rate); 0 when none of them steps.
+  uint32_t slot_step_rate(uint32_t slot) const { return slot < graphics::kMaxVertexBuffers ? slot_step_rates_[slot] : 0; }
   uint32_t slot_stride(uint32_t slot) const { return slot == 0 ? stride_ : slot_strides_[slot]; }
   uint32_t attribute_count() const { return attribute_count_; }
   uint32_t texture_count() const { return texture_count_; }
@@ -184,6 +186,7 @@ class PipelineObject {
   uint32_t texture_mask_ = 0;   // a compute pipeline: the units its shader reads, which a dispatch needs bound
   uint32_t declared_units_ = 0;
   uint32_t vertex_slot_mask_ = 0, instance_slot_mask_ = 0, slot_strides_[graphics::kMaxVertexBuffers] = {};
+  uint32_t slot_step_rates_[graphics::kMaxVertexBuffers] = {};
   uint32_t stride_ = 0, attribute_count_ = 0, texture_count_ = 0, color_target_count_ = 1;
 };
 

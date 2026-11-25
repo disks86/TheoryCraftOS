@@ -740,9 +740,12 @@ enum class VertexFormat : uint8_t {
   Sint16x1 = 32, Sint16x2, Sint16x3, Sint16x4, Half1 = 36, Half2, Half3, Half4, Uint32x1 = 40, Uint32x2, Uint32x3, Uint32x4, Sint32x1 = 44, Sint32x2, Sint32x3, Sint32x4,
   Bgra8Unorm = 48,     // four bytes B, G, R, A read as the colour (R, G, B, A)
   Rgb10A2Unorm = 49,   // a 32-bit word: R in bits 0-9, G in 10-19, B in 20-29, A in 30-31
+  Rgb10A2Uint = 50,    // the same word, the four fields as unsigned integers
+  Rg11B10Float = 51,   // a 32-bit word of three unsigned floats without a sign: R an 11-bit one in bits 0-10 (5-bit exponent, 6-bit mantissa), G in 11-21, B a 10-bit one in 22-31; A is 1
+  Bgrx8Unorm = 52,     // four bytes B, G, R and one not read: the colour (R, G, B, 1)
 };
-constexpr uint32_t kVertexFormatCount = 50;
-constexpr bool vertex_format_packed(VertexFormat f) { return f == VertexFormat::Bgra8Unorm || f == VertexFormat::Rgb10A2Unorm; }
+constexpr uint32_t kVertexFormatCount = 53;
+constexpr bool vertex_format_packed(VertexFormat f) { return static_cast<uint32_t>(f) >= static_cast<uint32_t>(VertexFormat::Bgra8Unorm); }
 constexpr VertexType vertex_format_type(VertexFormat f) { return vertex_format_packed(f) ? VertexType::Unorm8 : static_cast<VertexType>(static_cast<uint32_t>(f) / 4); }
 constexpr uint32_t vertex_format_components(VertexFormat f) { return vertex_format_packed(f) ? 4 : static_cast<uint32_t>(f) % 4 + 1; }
 constexpr uint32_t vertex_type_bytes(VertexType t) {
@@ -756,6 +759,7 @@ constexpr uint32_t vertex_type_bytes(VertexType t) {
 constexpr uint32_t vertex_format_bytes(VertexFormat f) { return vertex_format_packed(f) ? 4 : vertex_type_bytes(vertex_format_type(f)) * vertex_format_components(f); }
 constexpr bool vertex_format_is_integer(VertexFormat f) {
   const VertexType t = vertex_format_type(f);
+  if (f == VertexFormat::Rgb10A2Uint) return true;
   return !vertex_format_packed(f) && (t == VertexType::Uint8 || t == VertexType::Sint8 || t == VertexType::Uint16 || t == VertexType::Sint16 || t == VertexType::Uint32 || t == VertexType::Sint32);
 }
 
@@ -763,9 +767,14 @@ struct VertexAttribute {
   uint32_t location;  // which input of the vertex shader
   VertexFormat format;
   uint32_t offset;  // bytes from the start of the vertex
-  bool per_instance = false;   // kFeatureInstancing: the attribute steps with the instance, not the vertex (element number = the instance, at the same stride)
+  bool per_instance = false;   // kFeatureInstancing: the attribute steps with the instance, not the vertex (element number below, at the same stride)
   uint8_t slot = 0;            // the vertex buffer it is read from (below DeviceLimits::vertex_buffers); slot 0's stride is GraphicsPipelineDesc::vertex_stride
+  // A per-instance attribute's step rate (Direct3D's InstanceDataStepRate): instance n of a draw from first_instance reads element first_instance + n / step_rate, and with 0
+  // every instance reads element first_instance. A per-vertex attribute does not look at it.
+  uint32_t step_rate = 1;
 };
+// The element a per-instance attribute reads for instance `instance` (counted from 0) of a draw whose first instance is `first_instance`.
+constexpr uint64_t instance_element(const VertexAttribute& a, uint32_t first_instance, uint32_t instance) { return uint64_t{first_instance} + (a.step_rate ? instance / a.step_rate : 0); }
 
 // The stencil test of a pipeline, one state for front and back faces: a fragment passes when (reference & compare_mask) <compare> (stored & compare_mask); what is written back
 // is (stored & ~write_mask) | (op result & write_mask), the op depending on whether the stencil test failed, the stencil test passed but the depth test failed, or both passed.
@@ -938,7 +947,12 @@ enum class IndexType : uint8_t { Uint16, Uint32 };
 
 // What the vertices of a draw make (set_primitive_topology, DeviceFeature kFeatureLines for anything but triangles). Lines and points are one pixel wide.
 enum class ResolveMode : uint8_t { Average, Sample0, Min, Max };
-enum class QueryKind : uint8_t { Occlusion, OcclusionPredicate, IaVertices, IaPrimitives, VsInvocations, PsInvocations, Timestamp, SoPrimitivesWritten, SoPrimitivesNeeded, TimestampFrequency, TimestampDisjoint };
+enum class QueryKind : uint8_t { Occlusion, OcclusionPredicate, IaVertices, IaPrimitives, VsInvocations, PsInvocations, Timestamp, SoPrimitivesWritten, SoPrimitivesNeeded, TimestampFrequency, TimestampDisjoint,
+                                 PipelineStatistics };
+// The values of a PipelineStatistics query (ICommandBuffer::query_value), in Direct3D's order (D3D11_QUERY_DATA_PIPELINE_STATISTICS, Gallium's pipe_query_data_pipeline_statistics).
+enum class PipelineStatistic : uint8_t { IaVertices, IaPrimitives, VsInvocations, GsInvocations, GsPrimitives, ClipperInvocations, ClipperPrimitives, PsInvocations, HsInvocations, DsInvocations, CsInvocations };
+constexpr uint32_t kPipelineStatisticCount = 11;
+constexpr uint32_t kMaxQueryValues = kPipelineStatisticCount;   // (the most values one query has)
 enum class PrimitiveTopology : uint8_t { TriangleList, LineList, PointList, PatchList, LineListAdjacency, TriangleListAdjacency };   // (the adjacency lists need a geometry shader that takes them)   // (PatchList: kFeatureTessellation, with set_patch_control_points)
 
 struct Viewport {
@@ -946,8 +960,8 @@ struct Viewport {
   float min_depth = 0, max_depth = 1;
 };
 
-// The occlusion queries one command buffer can hold (kFeatureOcclusionQueries): slots 0 .. kMaxOcclusionQueries - 1.
-constexpr uint32_t kMaxOcclusionQueries = 64;
+// The queries one command buffer can hold (kFeatureOcclusionQueries): slots 0 .. kMaxOcclusionQueries - 1.
+constexpr uint32_t kMaxOcclusionQueries = 256;
 
 struct RenderPassBegin {
   IImage* color = nullptr;
@@ -1034,27 +1048,39 @@ class ICommandBuffer {
   // Typed views of buffers (kFeature2TexelBuffers): makes `view` of `buffer` (kBufferStorage; nullptr unbinds) image slot `slot` (below kMaxImageSlots: the u# ones below kMaxStorageImages,
   // read and written, and the t# ones from kTexelBufferSlotBase, read) for the dispatches and draws that follow. The view lies in the buffer and its offset is a multiple of the element.
   virtual void bind_storage_texel_buffer(uint32_t slot, IBuffer* buffer, const TexelBufferView& view) { (void)slot, (void)buffer, (void)view; }
-  // Occlusion queries (kFeatureOcclusionQueries), inside a render pass: from begin to end, the fragments that pass the stencil and depth tests (and that the shader did not
-  // discard) are counted - one per pixel, however many targets the pipeline writes and whatever the blending or write masks do. `slot` (below kMaxOcclusionQueries) names the result; one query is open at a time and
-  // it ends before the pass does. A device without the feature ignores both.
+  // Queries (kFeatureOcclusionQueries). Occlusion counts, from begin to end, the fragments that pass the stencil and depth tests (and that the shader did not discard) - one per sample, however
+  // many targets the pipeline writes and whatever the blending or write masks do. `slot` (below kMaxOcclusionQueries, each used once in a command buffer) names the result. Any number of queries
+  // may be open at once, of one kind or of several, nested or overlapping, begun and ended inside or outside render passes (what the draws and dispatches between begin and end did counts, and
+  // nothing else: clears, copies, resolves and mipmaps do not); every query begun is ended before end(). A device without the feature ignores them.
   virtual void begin_occlusion_query(uint32_t slot) { (void)slot; }
-  // The other queries (kFeatureStatisticsQueries), begun and ended the same way and read with occlusion_result: OcclusionPredicate is 1 if any fragment passed, else 0; IaVertices the vertices
+  // The other queries (kFeatureStatisticsQueries), read with query_value: OcclusionPredicate is 1 if any fragment passed, else 0; IaVertices the vertices
   // the draws between begin and end took (a draw of n vertices and i instances: n * i), IaPrimitives the primitives they assembled (a patch is a primitive), VsInvocations the vertex shader
   // runs (a device may run it fewer times than there are vertices, by reusing results) and PsInvocations the fragment shader runs (a device may shade more pixels than it writes).
   // Timestamp (kFeatureTimestampQueries): the time the query ends, in nanoseconds of a clock that never goes back (the software rasterizer's is a count that goes up by 1000 for each timestamp, unless the
   // kernel gives it a clock). TimestampFrequency (kFeatureTimestampQueries) is the ticks a second of the timestamps (1000000000: they are nanoseconds) and TimestampDisjoint 1 if the clock was
   // interrupted (a frequency change, a reset) while the query was open, else 0: a device that cannot tell says 0. Neither needs a draw. SoPrimitivesWritten / SoPrimitivesNeeded (kFeatureStatisticsQueries with kFeatureStreamOutput), of the output stream `stream`: the primitives the draws between begin and
-  // end wrote to stream output buffers, and those the geometry shader made for that stream, whether or not they fit.
+  // end wrote to stream output buffers, and those the geometry shader made for that stream, whether or not they fit. PipelineStatistics has kPipelineStatisticCount values (PipelineStatistic):
+  // the vertices and primitives assembled, the vertex shader runs, the geometry shader runs (once for each primitive and instance it takes) and the primitives it made (on every stream), the
+  // primitives given to the clipper and those that came out of it (not wholly outside the view volume), the fragment shader runs, the hull shader runs (one a patch), the domain shader runs and
+  // the compute shader threads the dispatches ran.
   virtual void begin_query(uint32_t slot, QueryKind kind, uint32_t stream = 0) {
     (void)stream;
     if (kind == QueryKind::Occlusion) begin_occlusion_query(slot);
   }
+  // Ends the query most recently begun that is still open.
   virtual void end_occlusion_query() {}
+  // Ends the open query of `slot`.
+  virtual void end_query(uint32_t slot) {
+    (void)slot;
+    end_occlusion_query();
+  }
   // After submit(): the count of a query that was begun and ended (false for a slot that was not).
   virtual bool occlusion_result(uint32_t slot, uint64_t* samples) const {
     (void)slot, (void)samples;
     return false;
   }
+  // After submit(): value `index` of a query's result (index 0 is occlusion_result; a PipelineStatistics query has kPipelineStatisticCount). False for a slot not begun and ended, or past its values.
+  virtual bool query_value(uint32_t slot, uint32_t index, uint64_t* value) const { return index == 0 && occlusion_result(slot, value); }
   // False if recording failed (out of memory, or a command used a resource wrongly).
   virtual bool end() = 0;
 

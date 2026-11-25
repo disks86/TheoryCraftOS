@@ -157,7 +157,7 @@ typedef struct Decl {
   Layout layout;
 } Decl;
 
-typedef struct Stream { Buffer *buffer; UINT offset, stride; } Stream;
+typedef struct Stream { Buffer *buffer; UINT offset, stride, freq; } Stream;      /* (freq: SetStreamSourceFreq's value) */
 
 /* A vertex or pixel shader of the program's: its tokens (GetFunction gives them back) and what the translator made of them. */
 typedef struct Shader {

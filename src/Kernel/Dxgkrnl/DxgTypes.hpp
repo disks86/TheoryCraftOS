@@ -351,9 +351,11 @@ struct ShaderDesc {
 };
 
 // The escape CreatePipeline's tagged parts after the constant blend colour (DxgKernel.cpp): the rasterizer state of PipelineDesc (fill mode .. logic_op, and the back faces' stencil
-// reference), 16 words.
-constexpr uint32_t kPipelineRasterTag = 0x31545352;   // 'RST1'
+// reference), 16 words; the step rates of the per-instance attributes (graphics::VertexAttribute::step_rate), a word for each attribute from the first (a per-vertex
+// one's 0), at most the pipeline's attribute count. Each part comes at most once, in any order.
+constexpr uint32_t kPipelineRasterTag = 0x31545352;     // 'RST1'
 constexpr uint32_t kPipelineRasterWords = 16;
+constexpr uint32_t kPipelineStepRateTag = 0x31505453;   // 'STP1'
 
 struct PipelineDesc {
   Handle vertex_shader = 0, fragment_shader = 0;

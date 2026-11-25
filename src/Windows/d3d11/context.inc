@@ -50,11 +50,20 @@ static D3D11_BLEND_DESC default_blend(void) {
 static ID3D12PipelineState *pipeline_get(Dev *d, Ctx *c) {
   Pipeline key;
   memset(&key, 0, sizeof key);
-  key.vs = c->vs->c.id;
-  key.ps = c->ps ? c->ps->c.id : 0;
-  key.gs = c->gs ? c->gs->c.id : 0;
-  key.hs = c->hs ? c->hs->c.id : 0;
-  key.ds = c->ds ? c->ds->c.id : 0;
+  /* the code of each stage: the shader's, or for one with interfaces the shader specialised for the class instances bound with it */
+  Shader *const stage_shader[5] = {c->vs, c->ps, c->gs, c->hs, c->ds};
+  const BYTE *code[5] = {NULL, NULL, NULL, NULL, NULL};
+  SIZE_T code_bytes[5] = {0, 0, 0, 0, 0};
+  UINT code_id[5] = {0, 0, 0, 0, 0};
+  for (UINT k = 0; k < 5; ++k) {
+    Variant *variant;
+    if (stage_shader[k] && !shader_code(d, c, k, stage_shader[k], &code[k], &code_bytes[k], &code_id[k], &variant)) return NULL;
+  }
+  key.vs = code_id[0];
+  key.ps = code_id[1];
+  key.gs = code_id[2];
+  key.hs = code_id[3];
+  key.ds = code_id[4];
   key.layout = c->layout ? c->layout->c.id : 0;
   key.blend = c->blend ? c->blend->desc : default_blend();
   key.logic_op = c->blend && c->blend->desc1.RenderTarget[0].LogicOpEnable ? (UINT)c->blend->desc1.RenderTarget[0].LogicOp + 1 : 0;
@@ -89,10 +98,10 @@ static ID3D12PipelineState *pipeline_get(Dev *d, Ctx *c) {
   D3D12_GRAPHICS_PIPELINE_STATE_DESC pd;
   memset(&pd, 0, sizeof pd);
   pd.pRootSignature = d->root;
-  pd.VS.pShaderBytecode = c->vs->code;
-  pd.VS.BytecodeLength = c->vs->bytes;
-  if (c->ps) { pd.PS.pShaderBytecode = c->ps->code; pd.PS.BytecodeLength = c->ps->bytes; }
-  if (c->gs && !c->gs->so_only) { pd.GS.pShaderBytecode = c->gs->code; pd.GS.BytecodeLength = c->gs->bytes; }
+  pd.VS.pShaderBytecode = code[0];
+  pd.VS.BytecodeLength = code_bytes[0];
+  if (c->ps) { pd.PS.pShaderBytecode = code[1]; pd.PS.BytecodeLength = code_bytes[1]; }
+  if (c->gs && !c->gs->so_only) { pd.GS.pShaderBytecode = code[2]; pd.GS.BytecodeLength = code_bytes[2]; }
   if (c->gs && c->gs->so) {
     /* (stream output: of the geometry shader, or of the stage whose code the "geometry shader" is - which is then the vertex or domain shader bound) */
     pd.StreamOutput.pSODeclaration = (const D3D12_SO_DECLARATION_ENTRY *)c->gs->so;      /* (the two structures are the same) */
@@ -101,8 +110,8 @@ static ID3D12PipelineState *pipeline_get(Dev *d, Ctx *c) {
     pd.StreamOutput.NumStrides = c->gs->so_stride_count;
     pd.StreamOutput.RasterizedStream = c->gs->so_rasterized;
   }
-  if (c->hs) { pd.HS.pShaderBytecode = c->hs->code; pd.HS.BytecodeLength = c->hs->bytes; }
-  if (c->ds) { pd.DS.pShaderBytecode = c->ds->code; pd.DS.BytecodeLength = c->ds->bytes; }
+  if (c->hs) { pd.HS.pShaderBytecode = code[3]; pd.HS.BytecodeLength = code_bytes[3]; }
+  if (c->ds) { pd.DS.pShaderBytecode = code[4]; pd.DS.BytecodeLength = code_bytes[4]; }
   pd.SampleMask = 0xFFFFFFFFu;
   pd.BlendState.AlphaToCoverageEnable = key.blend.AlphaToCoverageEnable;
   pd.BlendState.IndependentBlendEnable = key.blend.IndependentBlendEnable;
@@ -212,14 +221,12 @@ static ID3D12Resource *vertex_source(Dev *d, Ctx *c, UINT slot, UINT *stride, UI
       const BYTE *in = source + *offset + (SIZE_T)v * *stride;
       for (UINT i = 0; i < l->count; ++i) {
         if (l->elements[i].InputSlot != slot) continue;
-        FLOAT *to = (FLOAT *)(out + (SIZE_T)v * out_stride + l->elements[i].AlignedByteOffset);
+        BYTE *to = out + (SIZE_T)v * out_stride + l->elements[i].AlignedByteOffset;
         const BYTE *from = in + l->source_offset[i];
-        int convert;
-        const UINT floats = element_floats(l->source_format[i], &convert);
-        if (l->source_offset[i] + (convert ? 4 : floats * 4) > *stride) continue;
-        if (!convert) memcpy(to, from, floats * 4);
-        else if (l->source_format[i] == DXGI_FORMAT_B8G8R8A8_UNORM) { to[0] = from[2] / 255.0f; to[1] = from[1] / 255.0f; to[2] = from[0] / 255.0f; to[3] = from[3] / 255.0f; }
-        else for (UINT k = 0; k < 4; ++k) to[k] = from[k] / 255.0f;
+        if (l->source_offset[i] + element_bytes(l->source_format[i]) > *stride) continue;      /* (an element beyond the stride: not read) */
+        UINT32 value[4];
+        element_decode(l->source_format[i], from, value);
+        memcpy(to, value, 16);
       }
     }
     ID3D12Resource_Unmap(b->converted, 0, NULL);
@@ -707,33 +714,6 @@ static void so_collect(Dev *d) {
   }
   d->so_written_count = 0;
 }
-/* The bytes the targets of a stream hold (what the bound geometry shader's declaration sends to it). */
-static UINT64 so_filled(Ctx *c, UINT stream) {
-  UINT64 total = 0;
-  if (!c->gs || !c->gs->so) return 0;
-  for (UINT slot = 0; slot < 4; ++slot) {
-    if (!c->so_buf[slot]) continue;
-    for (UINT i = 0; i < c->gs->so_count; ++i)
-      if (c->gs->so[i].OutputSlot == slot && c->gs->so[i].Stream == stream) { total += c->so_buf[slot]->so_end; break; }
-  }
-  return total;
-}
-/* The bytes a primitive of a stream takes in its targets: the strides of its buffers times the vertices of a primitive (the geometry shader's, else the draw's). */
-static UINT64 so_primitive_bytes(Ctx *c, UINT stream) {
-  if (!c->gs || !c->gs->so) return 0;
-  UINT64 stride = 0;
-  for (UINT slot = 0; slot < 4; ++slot) {
-    if (!c->so_buf[slot]) continue;
-    for (UINT i = 0; i < c->gs->so_count; ++i)
-      if (c->gs->so[i].OutputSlot == slot && c->gs->so[i].Stream == stream) { stride += c->gs->so_strides[slot]; break; }
-  }
-  UINT vertices = c->gs->so_only ? 0 : c->gs->out_vertices;
-  if (!vertices) {
-    const D3D11_PRIMITIVE_TOPOLOGY t = c->topology;
-    vertices = t == D3D11_PRIMITIVE_TOPOLOGY_POINTLIST ? 1 : (t == D3D11_PRIMITIVE_TOPOLOGY_LINELIST || t == D3D11_PRIMITIVE_TOPOLOGY_LINESTRIP) ? 2 : 3;
-  }
-  return stride * vertices;
-}
 /* Before what reads where a target's records end: the list that writes them is sent. */
 static void so_settle(Dev *d, const Buf *b) { if (b->so_fill && b->written == d->epoch) flush(d); }
 
@@ -1061,10 +1041,18 @@ static void STDMETHODCALLTYPE ctx_DSSetConstantBuffers(Ctx *c, UINT start, UINT 
 static void STDMETHODCALLTYPE ctx_DSSetConstantBuffers1(Ctx *c, UINT start, UINT count, ID3D11Buffer *const *buffers, const UINT *first, const UINT *number) { cb_set(c, 4, start, count, buffers, first, number); }
 static void STDMETHODCALLTYPE ctx_DSGetConstantBuffers(Ctx *c, UINT start, UINT count, ID3D11Buffer **buffers) { cb_get(c, 4, start, count, buffers, NULL, NULL); }
 static void STDMETHODCALLTYPE ctx_DSGetConstantBuffers1(Ctx *c, UINT start, UINT count, ID3D11Buffer **buffers, UINT *first, UINT *number) { cb_get(c, 4, start, count, buffers, first, number); }
-/* The class instances bound with a stage's shader (at most 8 are kept: the kernel runs no shader that uses them, see docs/Direct3D11.md). */
+/* The class instances bound with a stage's shader, by interface slot (linkage.inc specialises the shader for them). Only class instances of this
+ * library are taken (another object in the array: the slot is empty). */
 static void set_instances(Ctx *c, UINT stage, ID3D11ClassInstance *const *instances, UINT count) {
-  for (UINT i = 0; i < 8; ++i) bind(&c->instances[stage][i], i < count && instances ? instances[i] : NULL);
-  c->instance_count[stage] = instances ? (count < 8 ? count : 8) : 0;
+  extern const ID3D11ClassInstanceVtbl inst_vtbl;
+  if (!instances || count > D3D11_SHADER_MAX_INTERFACES) count = 0;
+  for (UINT i = 0; i < D3D11_SHADER_MAX_INTERFACES; ++i) {
+    ID3D11ClassInstance *in = i < count ? instances[i] : NULL;
+    if (in && ((DxObj *)in)->lpVtbl != (const void *)&inst_vtbl) in = NULL;
+    if (i >= count && i >= c->instance_count[stage] && !c->instances[stage][i]) break;      /* (nothing above: nothing to undo) */
+    bind(&c->instances[stage][i], in);
+  }
+  c->instance_count[stage] = count;
 }
 /* (*count in: the room in `instances`; out: how many are bound) */
 static void get_instances(Ctx *c, UINT stage, ID3D11ClassInstance **instances, UINT *count) {
@@ -1223,16 +1211,16 @@ static void STDMETHODCALLTYPE ctx_RSGetScissorRects(Ctx *c, UINT *count, D3D11_R
   }
 }
 
-/* A draw: left out while predicated, measured for the active queries, counted for the pipeline statistics. */
+/* A draw: left out while predicated, measured for the active queries. */
 static void draw_any(Ctx *c, BOOL indexed, UINT count, UINT instances, UINT start, INT base_vertex, UINT start_instance) {
   Dev *d = c->dev;
   LOCK(c);
-  if (!count || !instances || predicated_out(d) || !draw_prepare(c, indexed)) { UNLOCK(c); return; }
-  const BOOL measured = measure_begin(d);
+  if (!count || !instances || predicated_out(d)) { UNLOCK(c); return; }
+  measure_room(d);
+  if (!draw_prepare(c, indexed)) { UNLOCK(c); return; }
+  measure_draw(d);
   if (indexed) ID3D12GraphicsCommandList_DrawIndexedInstanced(d->list, count, instances, start, base_vertex, start_instance);
   else ID3D12GraphicsCommandList_DrawInstanced(d->list, count, instances, start, start_instance);
-  measure_end(d, measured);
-  query_count_draw(c, count, instances);
   UNLOCK(c);
 }
 static void STDMETHODCALLTYPE ctx_Draw(Ctx *c, UINT count, UINT start) {
@@ -1245,16 +1233,6 @@ static void STDMETHODCALLTYPE ctx_DrawIndexedInstanced(Ctx *c, UINT count, UINT 
   if (c->deferred) { deferred_record(c, &(RecArgs){.op = REC_DRAW_INDEXED_INSTANCED, .u = {count, instances, start, (UINT)base_vertex, start_instance}}); return; }
   draw_any(c, TRUE, count, instances, start, base_vertex, start_instance);
 }
-/* The arguments of an indirect draw or dispatch, read on the CPU (for the pipeline statistics, when a query counts them): FALSE when they cannot be had. */
-static BOOL indirect_args(Dev *d, Buf *b, UINT offset, UINT bytes, UINT *out) {
-  if (b->gpu) return SUCCEEDED(buf_gpu_read(d, b, offset, bytes, out));
-  memcpy(out, b->data + offset, bytes);
-  return TRUE;
-}
-static BOOL stats_active(const Dev *d) {
-  for (UINT i = 0; i < d->active_count; ++i) if (d->active[i]->desc.Query == D3D11_QUERY_PIPELINE_STATISTICS) return TRUE;
-  return FALSE;
-}
 /* A draw whose arguments are in a buffer (made with D3D11_RESOURCE_MISC_DRAWINDIRECT_ARGS): the vertex count, instances, first vertex and first instance (and for an
  * indexed one the index count, instances, first index, base vertex and first instance), as the GPU finds them when the list runs. */
 static void draw_indirect(Ctx *c, BOOL indexed, ID3D11Buffer *buffer, UINT offset) {
@@ -1263,14 +1241,12 @@ static void draw_indirect(Ctx *c, BOOL indexed, ID3D11Buffer *buffer, UINT offse
   const UINT bytes = indexed ? 20 : 16;
   if (!b || !(b->desc.MiscFlags & D3D11_RESOURCE_MISC_DRAWINDIRECT_ARGS) || offset % 4 || offset > b->desc.ByteWidth || b->desc.ByteWidth - offset < bytes) return;
   LOCK(c);
-  UINT args[5] = {0};
-  const BOOL counted = stats_active(d) && indirect_args(d, b, offset, bytes, args);
-  if (predicated_out(d) || !draw_prepare(c, indexed)) { UNLOCK(c); return; }
-  const BOOL measured = measure_begin(d);
+  if (predicated_out(d)) { UNLOCK(c); return; }
+  measure_room(d);
+  if (!draw_prepare(c, indexed)) { UNLOCK(c); return; }
+  measure_draw(d);
   ID3D12GraphicsCommandList_ExecuteIndirect(d->list, indexed ? d->sig_draw_indexed : d->sig_draw, 1, b->res, offset, NULL, 0);
-  measure_end(d, measured);
   b->used = d->epoch;
-  if (counted) query_count_draw(c, args[0], args[1]);
   UNLOCK(c);
 }
 static void STDMETHODCALLTYPE ctx_DrawInstancedIndirect(Ctx *c, ID3D11Buffer *buffer, UINT offset) {
@@ -1283,12 +1259,11 @@ static void STDMETHODCALLTYPE ctx_DispatchIndirect(Ctx *c, ID3D11Buffer *buffer,
   Buf *b = (Buf *)buffer;
   if (!b || !(b->desc.MiscFlags & D3D11_RESOURCE_MISC_DRAWINDIRECT_ARGS) || offset % 4 || offset > b->desc.ByteWidth || b->desc.ByteWidth - offset < 12) return;
   LOCK(c);
-  UINT args[3] = {0};
-  const BOOL counted = stats_active(d) && indirect_args(d, b, offset, 12, args);
+  if (!predicated_out(d)) measure_room(d);
   if (!predicated_out(d) && compute_prepare(c)) {
+    measure_draw(d);
     ID3D12GraphicsCommandList_ExecuteIndirect(d->list, d->sig_dispatch, 1, b->res, offset, NULL, 0);
     b->used = d->epoch;
-    if (counted) query_count_dispatch(c, args[0], args[1], args[2]);
   }
   UNLOCK(c);
 }
@@ -1386,14 +1361,21 @@ static BOOL compute_prepare(Ctx *c) {
   for (UINT i = 0; i < view_count; ++i) if (c->cs_srv[i] && c->cs_srv[i]->tex) tex_before_read(d, c->cs_srv[i]->tex);
   uav_textures_before(d, c->cs_uav, cs->uav_mask);
   if (d->ring_used + CONSTANT_BLOCK > RING_BYTES || d->view_used + SRV_SLOTS + UAV_SLOTS > VIEW_HEAP || d->sampler_used + TEXTURE_SLOTS > VIEW_HEAP) flush(d);
-  if (!cs->compute) {
+  /* (a shader with interfaces: the variant for the instances bound keeps the pipeline) */
+  const BYTE *cs_code;
+  SIZE_T cs_bytes;
+  UINT cs_id;
+  Variant *variant;
+  if (!shader_code(d, c, 5, cs, &cs_code, &cs_bytes, &cs_id, &variant)) return FALSE;
+  ID3D12PipelineState **pipeline = variant ? &variant->compute : &cs->compute;
+  if (!*pipeline) {
     D3D12_COMPUTE_PIPELINE_STATE_DESC pd;
     memset(&pd, 0, sizeof pd);
     pd.pRootSignature = cs->wide ? d->root_wide : d->root;
-    pd.CS.pShaderBytecode = cs->code;
-    pd.CS.BytecodeLength = cs->bytes;
-    if (FAILED(ID3D12Device_CreateComputePipelineState(d->d12, &pd, &IID_ID3D12PipelineState, (void **)&cs->compute)) || !cs->compute) {
-      cs->compute = NULL;
+    pd.CS.pShaderBytecode = cs_code;
+    pd.CS.BytecodeLength = cs_bytes;
+    if (FAILED(ID3D12Device_CreateComputePipelineState(d->d12, &pd, &IID_ID3D12PipelineState, (void **)pipeline)) || !*pipeline) {
+      *pipeline = NULL;
       static volatile LONG said;
       if (!InterlockedExchange(&said, 1)) dx_say("dx: refused: a compute shader the kernel does not take (see docs/Direct3D11.md)");
       return FALSE;
@@ -1403,7 +1385,7 @@ static BOOL compute_prepare(Ctx *c) {
   ID3D12DescriptorHeap *heaps[2] = {d->view_heap, d->sampler_heap};
   ID3D12GraphicsCommandList_SetComputeRootSignature(list, cs->wide ? d->root_wide : d->root);
   ID3D12GraphicsCommandList_SetDescriptorHeaps(list, 2, heaps);
-  ID3D12GraphicsCommandList_SetPipelineState(list, cs->compute);
+  ID3D12GraphicsCommandList_SetPipelineState(list, *pipeline);
   const Shader *const stages[1] = {cs};
   static const UINT stage_of[1] = {5};
   constants_record(d, c, stages, stage_of, 1);
@@ -1415,6 +1397,7 @@ static BOOL compute_prepare(Ctx *c) {
   ID3D12GraphicsCommandList_SetComputeRootDescriptorTable(list, 3, uavs);
   tables_mark_used(d, c->cs_srv, c->cs_uav, cs->uav_mask);
   cs->used = d->epoch;
+  if (variant) variant->used = d->epoch;
   d->dirty |= DIRTY_ROOT;      /* (the next draw sets the graphics root signature and the heaps again) */
   d->recorded = 1;
   return TRUE;
@@ -1422,10 +1405,11 @@ static BOOL compute_prepare(Ctx *c) {
 static void STDMETHODCALLTYPE ctx_Dispatch(Ctx *c, UINT x, UINT y, UINT z) {
   if (c->deferred) { deferred_record(c, &(RecArgs){.op = REC_DISPATCH, .u = {x, y, z}}); return; }
   LOCK(c);
+  if (!predicated_out(c->dev)) measure_room(c->dev);
   if (!predicated_out(c->dev) && x && y && z && x <= D3D11_CS_DISPATCH_MAX_THREAD_GROUPS_PER_DIMENSION && y <= D3D11_CS_DISPATCH_MAX_THREAD_GROUPS_PER_DIMENSION &&
       z <= D3D11_CS_DISPATCH_MAX_THREAD_GROUPS_PER_DIMENSION && compute_prepare(c)) {
+    measure_draw(c->dev);
     ID3D12GraphicsCommandList_Dispatch(c->dev->list, x, y, z);
-    query_count_dispatch(c, x, y, z);
   }
   UNLOCK(c);
 }

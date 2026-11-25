@@ -1604,6 +1604,171 @@ static void test_compressed(void) {
   check(FAILED(IDirect3DDevice9_CreateRenderTarget(g_device, 8, 8, D3DFMT_DXT1, D3DMULTISAMPLE_NONE, 0, FALSE, &target, NULL)) && !target, "a DXT1 render target is refused");
 }
 
+/* ---- vertex declaration types and instancing ---------------------------------------------------------------------------------------------------------------------------- */
+
+/* Every D3DDECLTYPE through a vertex shader that shows its value v as v * 0.5 + 0.5; then instancing (SetStreamSourceFreq) with instance data of two step rates. */
+static void test_declaration_types_and_instancing(void) {
+  static const DWORD show_vs[] = {
+      0xFFFE0101,                                                      /* vs_1_1 */
+      0x0000001F, 0x80000000, 0x900F0000,                              /* dcl_position v0 */
+      0x0000001F, 0x8000000A, 0x900F0001,                              /* dcl_color v1 */
+      0x00000051, 0xA00F0000, 0x3F000000, 0x3F000000, 0x3F000000, 0x3F000000,   /* def c0, 0.5, 0.5, 0.5, 0.5 */
+      0x00000001, 0xC00F0000, 0x90E40000,                              /* mov oPos, v0 */
+      0x00000004, 0xD00F0000, 0x90E40001, 0xA0E40000, 0xA0E40000,      /* mad oD0, v1, c0, c0 */
+      0x0000FFFF};
+  static const DWORD offset_vs[] = {
+      0xFFFE0101,                                                      /* vs_1_1 */
+      0x0000001F, 0x80000000, 0x900F0000,                              /* dcl_position v0 */
+      0x0000001F, 0x8000000A, 0x900F0001,                              /* dcl_color v1 */
+      0x0000001F, 0x80000005, 0x900F0002,                              /* dcl_texcoord v2 */
+      0x00000002, 0xC0030000, 0x90E40000, 0x90E40002,                  /* add oPos.xy, v0, v2 */
+      0x00000001, 0xC00C0000, 0x90E40000,                              /* mov oPos.zw, v0 */
+      0x00000001, 0xD00F0000, 0x90E40001,                              /* mov oD0, v1 */
+      0x0000FFFF};
+  IDirect3DVertexShader9 *show = NULL, *offset = NULL;
+  check(IDirect3DDevice9_CreateVertexShader(g_device, show_vs, &show) == D3D_OK && IDirect3DDevice9_CreateVertexShader(g_device, offset_vs, &offset) == D3D_OK,
+        "the vertex shaders of the declaration types");
+  if (!show || !offset) return;
+  D3DCAPS9 caps;
+  memset(&caps, 0, sizeof caps);
+  IDirect3DDevice9_GetDeviceCaps(g_device, &caps);
+  const DWORD all_types = D3DDTCAPS_UBYTE4 | D3DDTCAPS_UBYTE4N | D3DDTCAPS_SHORT2N | D3DDTCAPS_SHORT4N | D3DDTCAPS_USHORT2N | D3DDTCAPS_USHORT4N | D3DDTCAPS_UDEC3 | D3DDTCAPS_DEC3N |
+                          D3DDTCAPS_FLOAT16_2 | D3DDTCAPS_FLOAT16_4;
+  check((caps.DeclTypes & all_types) == all_types, "the caps have every declaration type, UDEC3 and DEC3N too");
+  IDirect3DDevice9_SetRenderState(g_device, D3DRS_CULLMODE, D3DCULL_NONE);
+  IDirect3DDevice9_SetRenderState(g_device, D3DRS_LIGHTING, FALSE);
+  IDirect3DDevice9_SetPixelShader(g_device, NULL);
+  IDirect3DDevice9_SetTexture(g_device, 0, NULL);
+  /* (each case: the type, its bytes, and the colour it shows; the vertex is a float3 position and then the element) */
+#define W32(v) (BYTE)((v) & 255), (BYTE)(((v) >> 8) & 255), (BYTE)(((v) >> 16) & 255), (BYTE)(((unsigned)(v) >> 24) & 255)
+#define W16(v) (BYTE)((v) & 255), (BYTE)(((v) >> 8) & 255)
+  static const struct { BYTE type; BYTE bytes[16]; int r, g, b; const char *name; } cases[] = {
+    {D3DDECLTYPE_FLOAT1, {W32(0xBF000000u)}, 64, 128, 128, "FLOAT1 (y, z 0)"},
+    {D3DDECLTYPE_FLOAT2, {W32(0x3F800000u), W32(0xBF800000u)}, 255, 0, 128, "FLOAT2"},
+    {D3DDECLTYPE_FLOAT3, {W32(0x3F000000u), W32(0), W32(0xBF000000u)}, 191, 128, 64, "FLOAT3"},
+    {D3DDECLTYPE_FLOAT4, {W32(0), W32(0x3F800000u), W32(0), W32(0)}, 128, 255, 128, "FLOAT4"},
+    {D3DDECLTYPE_D3DCOLOR, {0x00, 0x80, 0xFF, 0xFF}, 255, 191, 128, "D3DCOLOR (blue first)"},
+    {D3DDECLTYPE_UBYTE4, {1, 0, 3, 0}, 255, 128, 255, "UBYTE4 (as they are: 1, 0, 3)"},
+    {D3DDECLTYPE_SHORT2, {W16(0xFFFF), W16(1)}, 0, 255, 128, "SHORT2 (-1, 1)"},
+    {D3DDECLTYPE_SHORT4, {W16(0), W16(0xFFFF), W16(1), W16(0)}, 128, 0, 255, "SHORT4"},
+    {D3DDECLTYPE_UBYTE4N, {255, 0, 128, 0}, 255, 128, 192, "UBYTE4N"},
+    {D3DDECLTYPE_SHORT2N, {W16(0x8000), W16(16384)}, 0, 191, 128, "SHORT2N (-32768 is -1)"},
+    {D3DDECLTYPE_SHORT4N, {W16(32767), W16(0x8001), W16(0), W16(0)}, 255, 0, 128, "SHORT4N"},
+    {D3DDECLTYPE_USHORT2N, {W16(65535), W16(0)}, 255, 128, 128, "USHORT2N"},
+    {D3DDECLTYPE_USHORT4N, {W16(0), W16(32768), W16(65535), W16(0)}, 128, 191, 255, "USHORT4N"},
+    {D3DDECLTYPE_UDEC3, {W32(1u | 0u << 10 | 3u << 20 | 3u << 30)}, 255, 128, 255, "UDEC3 (1, 0, 3 as they are; the top bits are not read)"},
+    {D3DDECLTYPE_DEC3N, {W32(511u | 0x201u << 10 | 0u << 20 | 1u << 30)}, 255, 0, 128, "DEC3N (511 is 1, -511 is -1)"},
+    {D3DDECLTYPE_FLOAT16_2, {W16(0x3800), W16(0xBC00)}, 191, 0, 128, "FLOAT16_2"},
+    {D3DDECLTYPE_FLOAT16_4, {W16(0), W16(0x3C00), W16(0xB800), W16(0)}, 128, 255, 64, "FLOAT16_4"},
+  };
+  int types_ok = 0;
+  for (UINT i = 0; i < sizeof cases / sizeof cases[0]; ++i) {
+    const D3DVERTEXELEMENT9 elements[3] = {{0, 0, D3DDECLTYPE_FLOAT3, 0, D3DDECLUSAGE_POSITION, 0}, {0, 12, cases[i].type, 0, D3DDECLUSAGE_COLOR, 0}, D3DDECL_END()};
+    IDirect3DVertexDeclaration9 *declaration = NULL;
+    if (FAILED(IDirect3DDevice9_CreateVertexDeclaration(g_device, elements, &declaration)) || !declaration) { printf("d3d9test: (%s: no declaration)\n", cases[i].name); continue; }
+    BYTE vertices[3][28];
+    const float corners[3][3] = {{-1, -1, 0.5f}, {-1, 3, 0.5f}, {3, -1, 0.5f}};
+    for (int v = 0; v < 3; ++v) { memcpy(vertices[v], corners[v], 12); memcpy(vertices[v] + 12, cases[i].bytes, 16); }
+    IDirect3DDevice9_SetVertexShader(g_device, show);
+    IDirect3DDevice9_SetVertexDeclaration(g_device, declaration);
+    clear(0xFF000000);
+    IDirect3DDevice9_DrawPrimitiveUP(g_device, D3DPT_TRIANGLELIST, 1, vertices, 28);
+    read_back();
+    if (near_colour(pixel(32, 32), cases[i].r, cases[i].g, cases[i].b)) ++types_ok;
+    else printf("d3d9test: (%s)\n", cases[i].name);
+    IDirect3DVertexDeclaration9_Release(declaration);
+  }
+  check(types_ok == (int)(sizeof cases / sizeof cases[0]), "every declaration type reaches the vertex shader as Direct3D 9 reads it (UDEC3, DEC3N, the normalised ones, half floats)");
+
+  /* Stream frequencies: what SetStreamSourceFreq refuses, and what GetStreamSourceFreq gives back. */
+  UINT freq = 0;
+  check(IDirect3DDevice9_GetStreamSourceFreq(g_device, 1, &freq) == D3D_OK && freq == 1 &&
+        IDirect3DDevice9_SetStreamSourceFreq(g_device, 1, 0) == D3DERR_INVALIDCALL &&
+        IDirect3DDevice9_SetStreamSourceFreq(g_device, 0, D3DSTREAMSOURCE_INSTANCEDATA | 1) == D3DERR_INVALIDCALL &&
+        IDirect3DDevice9_SetStreamSourceFreq(g_device, 1, D3DSTREAMSOURCE_INSTANCEDATA | D3DSTREAMSOURCE_INDEXEDDATA | 1) == D3DERR_INVALIDCALL &&
+        IDirect3DDevice9_SetStreamSourceFreq(g_device, 1, 2) == D3D_OK && IDirect3DDevice9_GetStreamSourceFreq(g_device, 1, &freq) == D3D_OK && freq == 2 &&
+        IDirect3DDevice9_SetStreamSourceFreq(g_device, 1, D3DSTREAMSOURCE_INSTANCEDATA | 0) == D3D_OK && IDirect3DDevice9_GetStreamSourceFreq(g_device, 1, &freq) == D3D_OK &&
+        freq == D3DSTREAMSOURCE_INSTANCEDATA && IDirect3DDevice9_SetStreamSourceFreq(g_device, 1, 1) == D3D_OK,
+        "SetStreamSourceFreq refuses 0, instance data on stream 0 and both flags; GetStreamSourceFreq gives back what was set");
+
+  /* Instancing: a triangle over the top left quarter (stream 0) moved by an offset (stream 2, a new one every second instance) and coloured by a colour (stream 1, every
+   * instance): stream 0's frequency says how many instances an indexed draw makes. */
+  {
+    const float quarter[3][3] = {{-1, 1, 0.5f}, {0, 1, 0.5f}, {-1, 0, 0.5f}};
+    const DWORD colours[4] = {0xFFFF0000u, 0xFF00FF00u, 0xFF0000FFu, 0xFFFFFFFFu};
+    const float moves[4][2] = {{0, 0}, {1, 0}, {0, -1}, {1, -1}};
+    const WORD indices[3] = {0, 1, 2};
+    const D3DVERTEXELEMENT9 elements[4] = {{0, 0, D3DDECLTYPE_FLOAT3, 0, D3DDECLUSAGE_POSITION, 0}, {1, 0, D3DDECLTYPE_D3DCOLOR, 0, D3DDECLUSAGE_COLOR, 0},
+                                           {2, 0, D3DDECLTYPE_FLOAT2, 0, D3DDECLUSAGE_TEXCOORD, 0}, D3DDECL_END()};
+    IDirect3DVertexDeclaration9 *declaration = NULL;
+    IDirect3DVertexBuffer9 *vb[3] = {NULL, NULL, NULL};
+    IDirect3DIndexBuffer9 *ib = NULL;
+    const void *data[3] = {quarter, colours, moves};
+    const UINT sizes[3] = {sizeof quarter, sizeof colours, sizeof moves}, strides[3] = {12, 4, 8};
+    void *memory = NULL;
+    IDirect3DDevice9_CreateVertexDeclaration(g_device, elements, &declaration);
+    for (int s = 0; s < 3; ++s) {
+      IDirect3DDevice9_CreateVertexBuffer(g_device, sizes[s], 0, 0, D3DPOOL_MANAGED, &vb[s], NULL);
+      if (vb[s] && SUCCEEDED(IDirect3DVertexBuffer9_Lock(vb[s], 0, 0, &memory, 0))) { memcpy(memory, data[s], sizes[s]); IDirect3DVertexBuffer9_Unlock(vb[s]); }
+    }
+    IDirect3DDevice9_CreateIndexBuffer(g_device, sizeof indices, 0, D3DFMT_INDEX16, D3DPOOL_MANAGED, &ib, NULL);
+    if (ib && SUCCEEDED(IDirect3DIndexBuffer9_Lock(ib, 0, 0, &memory, 0))) { memcpy(memory, indices, sizeof indices); IDirect3DIndexBuffer9_Unlock(ib); }
+    if (declaration && vb[0] && vb[1] && vb[2] && ib) {
+      IDirect3DDevice9_SetVertexShader(g_device, offset);
+      IDirect3DDevice9_SetVertexDeclaration(g_device, declaration);
+      for (int s = 0; s < 3; ++s) IDirect3DDevice9_SetStreamSource(g_device, s, vb[s], 0, strides[s]);
+      IDirect3DDevice9_SetIndices(g_device, ib);
+      IDirect3DDevice9_SetStreamSourceFreq(g_device, 0, D3DSTREAMSOURCE_INDEXEDDATA | 4);
+      IDirect3DDevice9_SetStreamSourceFreq(g_device, 1, D3DSTREAMSOURCE_INSTANCEDATA | 1);
+      IDirect3DDevice9_SetStreamSourceFreq(g_device, 2, D3DSTREAMSOURCE_INSTANCEDATA | 2);
+      clear(0xFF000000);
+      HRESULT hr = IDirect3DDevice9_DrawIndexedPrimitive(g_device, D3DPT_TRIANGLELIST, 0, 0, 3, 0, 1);
+      read_back();
+      /* instances 0 and 1 at the first place (the second's green over the first's red), 2 and 3 at the second (white over blue) */
+      check(hr == D3D_OK && pixel(4, 4) == 0x00FF00 && pixel(36, 4) == 0xFFFFFF && pixel(4, 36) == 0 && pixel(36, 36) == 0,
+            "an indexed draw of four instances: instance data of divider 1 and 2");
+      if (!(pixel(4, 4) == 0x00FF00 && pixel(36, 4) == 0xFFFFFF)) printf("d3d9test: (instancing: %06lx %06lx %06lx %06lx)\n", (unsigned long)pixel(4, 4), (unsigned long)pixel(36, 4), (unsigned long)pixel(4, 36), (unsigned long)pixel(36, 36));
+      /* a draw without indices makes one instance, the instance data's first element */
+      clear(0xFF000000);
+      hr = IDirect3DDevice9_DrawPrimitive(g_device, D3DPT_TRIANGLELIST, 0, 1);
+      read_back();
+      check(hr == D3D_OK && pixel(4, 4) == 0xFF0000 && pixel(36, 4) == 0, "a draw without indices: one instance");
+      /* dividers 1 and 1: four places; then stream 0's count 0: nothing */
+      IDirect3DDevice9_SetStreamSourceFreq(g_device, 2, D3DSTREAMSOURCE_INSTANCEDATA | 1);
+      clear(0xFF000000);
+      IDirect3DDevice9_DrawIndexedPrimitive(g_device, D3DPT_TRIANGLELIST, 0, 0, 3, 0, 1);
+      read_back();
+      check(pixel(4, 4) == 0xFF0000 && pixel(36, 4) == 0x00FF00 && pixel(4, 36) == 0x0000FF && pixel(36, 36) == 0xFFFFFF, "four instances at four places, each its colour");
+      IDirect3DDevice9_SetStreamSourceFreq(g_device, 0, D3DSTREAMSOURCE_INDEXEDDATA | 0);
+      clear(0xFF000000);
+      IDirect3DDevice9_DrawIndexedPrimitive(g_device, D3DPT_TRIANGLELIST, 0, 0, 3, 0, 1);
+      read_back();
+      check(pixel(4, 4) == 0 && pixel(36, 4) == 0, "stream 0's count of 0 draws no instance");
+      /* a state block keeps the frequencies */
+      IDirect3DDevice9_SetStreamSourceFreq(g_device, 0, D3DSTREAMSOURCE_INDEXEDDATA | 3);
+      IDirect3DStateBlock9 *block = NULL;
+      IDirect3DDevice9_CreateStateBlock(g_device, D3DSBT_ALL, &block);
+      IDirect3DDevice9_SetStreamSourceFreq(g_device, 0, 1);
+      if (block) IDirect3DStateBlock9_Apply(block);
+      check(block && IDirect3DDevice9_GetStreamSourceFreq(g_device, 0, &freq) == D3D_OK && freq == (D3DSTREAMSOURCE_INDEXEDDATA | 3), "a state block keeps the stream frequencies");
+      if (block) IDirect3DStateBlock9_Release(block);
+      for (int s = 0; s < 3; ++s) { IDirect3DDevice9_SetStreamSourceFreq(g_device, s, 1); IDirect3DDevice9_SetStreamSource(g_device, s, NULL, 0, 0); }
+      IDirect3DDevice9_SetIndices(g_device, NULL);
+    } else {
+      check(0, "the instancing buffers and declaration");
+    }
+    for (int s = 0; s < 3; ++s) if (vb[s]) IDirect3DVertexBuffer9_Release(vb[s]);
+    if (ib) IDirect3DIndexBuffer9_Release(ib);
+    if (declaration) IDirect3DVertexDeclaration9_Release(declaration);
+  }
+#undef W32
+#undef W16
+  IDirect3DDevice9_SetVertexShader(g_device, NULL);
+  IDirect3DDevice9_SetVertexDeclaration(g_device, NULL);
+  IDirect3DVertexShader9_Release(show);
+  IDirect3DVertexShader9_Release(offset);
+}
+
 int main(void) {
   test_object();
   if (g_d3d && make_device()) {
@@ -1621,6 +1786,7 @@ int main(void) {
     test_render_to_texture();
     test_cube_and_volume();
     test_compressed();
+    test_declaration_types_and_instancing();
     test_present_and_reset();
     check(IDirect3DDevice9_Release(g_device) == 0, "the device is gone with its last reference");
   }

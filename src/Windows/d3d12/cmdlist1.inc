@@ -133,6 +133,7 @@ static void STDMETHODCALLTYPE list_ResolveSubresourceRegion(CmdList *l, ID3D12Re
  * one command after the other). */
 static void STDMETHODCALLTYPE list_WriteBufferImmediate(CmdList *l, UINT count, const D3D12_WRITEBUFFERIMMEDIATE_PARAMETER *params, const D3D12_WRITEBUFFERIMMEDIATE_MODE *modes) {
   if (!params || l->bundle) return;
+  const int split = unpredicated_begin(l);      /* (the writes are not predicated: the copies they are made of go where predication does not reach) */
   for (UINT i = 0; i < count; ++i) {
     if (modes && modes[i] > D3D12_WRITEBUFFERIMMEDIATE_MODE_MARKER_OUT) continue;
     UINT64 offset = 0;
@@ -155,6 +156,7 @@ static void STDMETHODCALLTYPE list_WriteBufferImmediate(CmdList *l, UINT count, 
     list_CopyBufferRegion(l, (ID3D12Resource *)dst, offset, (ID3D12Resource *)l->immediate, l->immediate_used, 4);
     l->immediate_used += 4;
   }
+  unpredicated_end(l, split);
 }
 
 /* ---- ID3D12GraphicsCommandList3, 4 ------------------------------------------------------------------------------------------------------------------------------------- */

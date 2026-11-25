@@ -1724,11 +1724,24 @@ NtStatus Kernel::escape(ProcessId pid, Handle device, ConstByteView request, Byt
                           desc.blend.constant[c] = constant[c];
                           for (graphics::BlendState& t : desc.target_blend) t.constant[c] = constant[c];
                         }
-                        // (and, after that, tagged parts: a tag, the count of the words that follow, the words)
+                        // (and, after that, tagged parts in any order, each at most once: a tag, the count of the words that follow, the words)
+                        bool seen_raster = false, seen_step_rates = false;
                         while (!in.at_end()) {
                           const uint32_t tag = in.le32(), words = in.le32();
                           if (!in.ok()) return status::kInvalidParameter;
-                          if (tag != kPipelineRasterTag || words != kPipelineRasterWords) return status::kInvalidParameter;
+                          if (tag == kPipelineStepRateTag) {
+                            // kPipelineStepRateTag: the step rates of the per-instance attributes, a word for each attribute from the first (a per-vertex one's is 0)
+                            if (seen_step_rates || words > desc.attribute_count || words > graphics::kMaxVertexAttributes) return status::kInvalidParameter;
+                            seen_step_rates = true;
+                            for (uint32_t k = 0; k < words; ++k) {
+                              const uint32_t rate = in.le32();
+                              if (!in.ok() || (!desc.attributes[k].per_instance && rate != 0)) return status::kInvalidParameter;
+                              if (desc.attributes[k].per_instance) desc.attributes[k].step_rate = rate;
+                            }
+                            continue;
+                          }
+                          if (tag != kPipelineRasterTag || words != kPipelineRasterWords || seen_raster) return status::kInvalidParameter;
+                          seen_raster = true;
                           // kPipelineRasterTag: fill mode, depth clip, depth bias (constant, slope and clamp as float bits, the format's bits), the back faces' stencil state (separate, compare,
                           // fail, depth fail, pass, compare mask, write mask), logic operation (enable, op), the back faces' stencil reference (with separate)
                           const uint32_t fill = in.le32(), clip = in.le32(), bias = in.le32(), slope = in.le32(), clamp = in.le32(), bits = in.le32();

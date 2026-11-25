@@ -151,7 +151,7 @@ PipelineObject::~PipelineObject() {
 class Adapter::StreamRunner {
  public:
   StreamRunner(Adapter& adapter, ConstByteView commands, ArrayView<const SharedPointer<Allocation>> allocations)
-      : adapter_(adapter), mm_(adapter.vidmm_), commands_(commands), allocations_(allocations), pending_(adapter.allocator_), transient_(adapter.allocator_) {}
+      : adapter_(adapter), mm_(adapter.vidmm_), commands_(commands), allocations_(allocations), queries_(adapter.allocator_), transient_(adapter.allocator_) {}
   
   ~StreamRunner() { release_transient(); }
 
@@ -189,6 +189,21 @@ class Adapter::StreamRunner {
 
  private:
   static constexpr NtStatus kBad = status::kInvalidParameter;
+  static constexpr uint32_t kPipelineStatistics1Values = graphics::kPipelineStatisticCount + 3;   // (and the amplification and mesh shader invocations and mesh primitives: none)
+  static constexpr uint32_t kMaxStreamQueryValues = kPipelineStatistics1Values;
+  struct StreamQuery {
+    Allocation* allocation = nullptr;
+    uint64_t offset = 0;
+    uint32_t kind = 0;        // (a graphics::QueryKind, kQueryKindPipelineStatistics1 or kQueryKindSoStatistics)
+    uint32_t stream = 0;
+    bool accumulate = false;
+    bool open = true;
+    bool written = false;
+    bool segment = false;     // (it has device queries in the command buffer being recorded, from first_slot on)
+    uint32_t first_slot = 0;
+    uint64_t sums[kMaxStreamQueryValues] = {};   // what its segments counted so far
+    int64_t vertex_adjust = 0;   // what the strips and fans drawn as lists while it was open take from (or add to) the vertices and vertex shader runs the device counted
+  };
 
   Allocation* alloc(uint32_t index) const { return index < allocations_.size() ? allocations_[index].get() : nullptr; }
   static bool exact(const ByteReader& p) { return p.ok() && p.at_end(); }
@@ -221,6 +236,8 @@ class Adapter::StreamRunner {
       ++commands;
     }
     if (in_pass_) return kBad;   // a pass left open
+    for (const StreamQuery& q : queries_.view())
+      if (q.open) return kBad;   // a query left open
     return exec_ ? flush() : status::kSuccess;
   }
 
@@ -232,18 +249,26 @@ class Adapter::StreamRunner {
     device_topology_ = graphics::PrimitiveTopology::TriangleList;
     device_patch_points_ = 0;
     cb_->begin();
+    // (the queries still open go on in this command buffer: a segment each)
+    for (StreamQuery& q : queries_.view())
+      if (q.open) begin_segment(q);
     return status::kSuccess;
   }
   // Runs what has been recorded so far. Needed before the CPU touches an allocation the recorded commands use.
   NtStatus flush() {
-    if (!cb_) return status::kSuccess;
+    if (!cb_) return store_query_results() ? status::kSuccess : status::kInvalidDeviceState;
+    // (the open queries' segments end with the command buffer; the next one begins new ones)
+    for (StreamQuery& q : queries_.view())
+      if (q.open && q.segment) end_segment(q);
     const bool ended = cb_->end();
     bool done = ended && adapter_.device_.submit(cb_);
+    if (done) done = collect_segments();
     if (done) done = store_query_results();
     adapter_.device_.destroy_command_buffer(cb_);
     cb_ = nullptr;
-    pending_.clear();
+    for (StreamQuery& q : queries_.view()) q.segment = false;
     next_slot_ = 0;
+    constants_sent_ = false;   // (the next command buffer has none of the root arguments' constants: the next draw or dispatch sends them again)
     release_transient();
     return done ? status::kSuccess : status::kInvalidDeviceState;
   }
@@ -261,15 +286,86 @@ class Adapter::StreamRunner {
     return status::kSuccess;
   }
 
-  // Writes the counts of the queries the device ran into the allocations they name (the CPU's copy: these allocations never go to the GPU).
+  // --- Queries ---
+  // A query of the stream is open from its BeginQuery to its EndQuery, across passes and the command buffers a flush in the middle of the stream cuts it into: each command buffer it is
+  // open in has a segment of it - the device queries it is made of (query_device_slots) - and what the segments counted is added up (query_sum) and written when it has ended.
+
+  // The values a kernel query kind writes (8 bytes each), and the device queries one segment of it takes.
+  static uint32_t query_values(uint32_t kind) {
+    return kind == static_cast<uint32_t>(graphics::QueryKind::PipelineStatistics) ? graphics::kPipelineStatisticCount
+           : kind == kQueryKindPipelineStatistics1 ? kPipelineStatistics1Values
+           : kind == kQueryKindSoStatistics ? 2u : 1u;
+  }
+  static uint32_t query_device_slots(uint32_t kind) { return kind == kQueryKindSoStatistics ? 2u : 1u; }
+
+  // Begins a segment of `q` in the command buffer being recorded.
+  void begin_segment(StreamQuery& q) {
+    q.first_slot = next_slot_;
+    q.segment = true;
+    next_slot_ += query_device_slots(q.kind);
+    if (q.kind == kQueryKindSoStatistics) {
+      cb_->begin_query(q.first_slot, graphics::QueryKind::SoPrimitivesWritten, q.stream);
+      cb_->begin_query(q.first_slot + 1, graphics::QueryKind::SoPrimitivesNeeded, q.stream);
+      return;
+    }
+    const uint32_t device_kind = q.kind == kQueryKindPipelineStatistics1 ? static_cast<uint32_t>(graphics::QueryKind::PipelineStatistics) : q.kind;
+    cb_->begin_query(q.first_slot, static_cast<graphics::QueryKind>(device_kind), q.stream);
+  }
+  void end_segment(StreamQuery& q) {
+    for (uint32_t k = 0; k < query_device_slots(q.kind); ++k) cb_->end_query(q.first_slot + k);
+  }
+  // After the device ran a command buffer: what each segment in it counted, added to its query.
+  bool collect_segments() {
+    for (StreamQuery& q : queries_.view()) {
+      if (!q.segment) continue;
+      using graphics::QueryKind;
+      if (q.kind == kQueryKindSoStatistics) {
+        uint64_t written = 0, needed = 0;
+        if (!cb_->query_value(q.first_slot, 0, &written) || !cb_->query_value(q.first_slot + 1, 0, &needed)) return false;
+        q.sums[0] += written;
+        q.sums[1] += needed;
+        continue;
+      }
+      const uint32_t values = q.kind == kQueryKindPipelineStatistics1 ? graphics::kPipelineStatisticCount : query_values(q.kind);
+      for (uint32_t k = 0; k < values; ++k) {
+        uint64_t v = 0;
+        if (!cb_->query_value(q.first_slot, k, &v)) return false;
+        // (a time is the last segment's - the time the query ended -, a frequency the same in every one; counts, predicates and the disjoint flag add up)
+        if (q.kind == static_cast<uint32_t>(QueryKind::Timestamp) || q.kind == static_cast<uint32_t>(QueryKind::TimestampFrequency)) q.sums[k] = v;
+        else q.sums[k] += v;
+      }
+    }
+    return true;
+  }
+  // Writes the results of the queries that ended into the allocations they name (the CPU's copy: these allocations never go to the GPU). A query begun with kQueryAccumulate adds
+  // its counts to what is there (a predicate: 1 if either is not 0).
   bool store_query_results() {
-    for (uint64_t i = 0; i < pending_.count(); ++i) {
-      const PendingQuery& q = pending_[i];
-      uint64_t samples = 0;
+    for (StreamQuery& q : queries_.view()) {
+      if (q.open || q.written) continue;
+      q.written = true;
+      const uint32_t values = query_values(q.kind);
       ByteView where;
-      if (!cb_->occlusion_result(q.slot, &samples) || !q.allocation->writable_backing().try_subview(q.offset, 8, &where)) return false;
-      ByteWriter out(where);
-      out.le64(samples);
+      if (!q.allocation->writable_backing().try_subview(q.offset, uint64_t{values} * 8, &where)) return false;
+      const bool predicate = q.kind == static_cast<uint32_t>(graphics::QueryKind::OcclusionPredicate) || q.kind == static_cast<uint32_t>(graphics::QueryKind::TimestampDisjoint);
+      // (the vertices and vertex shader runs of strips and fans, as Direct3D counts them)
+      auto adjust = [&](uint32_t k) {
+        const int64_t v = static_cast<int64_t>(q.sums[k]) + q.vertex_adjust;
+        q.sums[k] = v > 0 ? static_cast<uint64_t>(v) : 0;
+      };
+      if (q.kind == static_cast<uint32_t>(graphics::QueryKind::IaVertices) || q.kind == static_cast<uint32_t>(graphics::QueryKind::VsInvocations)) adjust(0);
+      if (q.kind == static_cast<uint32_t>(graphics::QueryKind::PipelineStatistics) || q.kind == kQueryKindPipelineStatistics1) {
+        adjust(static_cast<uint32_t>(graphics::PipelineStatistic::IaVertices));
+        adjust(static_cast<uint32_t>(graphics::PipelineStatistic::VsInvocations));
+      }
+      uint64_t out[kMaxStreamQueryValues] = {};
+      ByteReader before(where);
+      for (uint32_t k = 0; k < values; ++k) {
+        const uint64_t there = before.le64();
+        const uint64_t value = predicate ? (q.sums[k] ? 1 : 0) : q.sums[k];
+        out[k] = !q.accumulate ? value : predicate ? ((there || value) ? 1 : 0) : there + value;
+      }
+      ByteWriter w(where);
+      for (uint32_t k = 0; k < values; ++k) w.le64(out[k]);
       mm_.note_cpu_write(*q.allocation);
     }
     return true;
@@ -331,7 +427,7 @@ class Adapter::StreamRunner {
     switch (op) {
       case Op::BeginPass: return begin_pass(p);
       case Op::EndPass: {
-        if (!exact(p) || !in_pass_ || query_open_) return kBad;
+        if (!exact(p) || !in_pass_) return kBad;
         in_pass_ = false;
         if (!exec_) return status::kSuccess;
         cb_->end_render_pass();
@@ -387,35 +483,65 @@ class Adapter::StreamRunner {
 
   NtStatus begin_query(ByteReader& p) {
     const uint32_t index = p.le32(), offset = p.le32();
-    uint32_t kind = 0;
-    if (!p.at_end()) kind = p.le32();
-    if (!exact(p) || !in_pass_ || query_open_ || !(adapter_.caps_.features & graphics::kFeatureOcclusionQueries)) return kBad;
-    // (the kind in the low byte, the output stream of a stream output query above it)
-    const uint32_t stream = kind >> 8;
-    kind &= 0xFF;
+    uint32_t word = 0;
+    if (!p.at_end()) word = p.le32();
+    if (!exact(p) || !(adapter_.caps_.features & graphics::kFeatureOcclusionQueries)) return kBad;
+    // (the kind in the low byte, the output stream of a stream output query in bits 8-9, kQueryAccumulate; nothing else)
+    const uint32_t kind = word & 0xFF, stream = word >> 8 & 0xFF;
+    const bool accumulate = (word & kQueryAccumulate) != 0;
+    if (word & ~(0xFFFFu | kQueryAccumulate)) return kBad;
+    using graphics::QueryKind;
     const uint32_t features = adapter_.caps_.features;
-    const bool so_kind = kind == static_cast<uint32_t>(graphics::QueryKind::SoPrimitivesWritten) || kind == static_cast<uint32_t>(graphics::QueryKind::SoPrimitivesNeeded);
-    if (kind > static_cast<uint32_t>(graphics::QueryKind::TimestampDisjoint) || stream >= (so_kind ? graphics::kMaxGeometryStreams : 1u)) return kBad;
-    if (kind == static_cast<uint32_t>(graphics::QueryKind::Timestamp) || kind == static_cast<uint32_t>(graphics::QueryKind::TimestampFrequency) || kind == static_cast<uint32_t>(graphics::QueryKind::TimestampDisjoint) ? !(features & graphics::kFeatureTimestampQueries)
+    const bool so_kind = kind == static_cast<uint32_t>(QueryKind::SoPrimitivesWritten) || kind == static_cast<uint32_t>(QueryKind::SoPrimitivesNeeded) || kind == kQueryKindSoStatistics;
+    const bool time_kind = kind == static_cast<uint32_t>(QueryKind::Timestamp) || kind == static_cast<uint32_t>(QueryKind::TimestampFrequency) || kind == static_cast<uint32_t>(QueryKind::TimestampDisjoint);
+    if (kind > kQueryKindSoStatistics || stream >= (so_kind ? graphics::kMaxGeometryStreams : 1u)) return kBad;
+    if (time_kind ? !(features & graphics::kFeatureTimestampQueries)
         : so_kind ? (features & (graphics::kFeatureStatisticsQueries | graphics::kFeatureStreamOutput)) != (graphics::kFeatureStatisticsQueries | graphics::kFeatureStreamOutput)
         : (kind != 0 && !(features & graphics::kFeatureStatisticsQueries))) return kBad;
+    // (a time is not added to another)
+    if (accumulate && (kind == static_cast<uint32_t>(QueryKind::Timestamp) || kind == static_cast<uint32_t>(QueryKind::TimestampFrequency))) return kBad;
     Allocation* a = alloc(index);
-    if (!a || !a->is_query_result() || offset % 8 || offset > a->desc().size - 8) return kBad;
-    if (queries_in_stream_ >= graphics::kMaxOcclusionQueries) return kBad;
-    ++queries_in_stream_;
-    query_open_ = true;
-    if (!exec_) return status::kSuccess;
-    const NtStatus s = ensure_cb();
+    const uint64_t bytes = uint64_t{query_values(kind)} * 8;
+    if (!a || !a->is_query_result() || offset % 8 || bytes > a->desc().size || offset > a->desc().size - bytes) return kBad;
+    // (no two open queries write the same bytes)
+    for (const StreamQuery& q : queries_.view())
+      if (q.open && q.allocation == a && offset < q.offset + uint64_t{query_values(q.kind)} * 8 && q.offset < offset + bytes) return kBad;
+    if (query_slots_in_stream_ + query_device_slots(kind) > graphics::kMaxOcclusionQueries) return kBad;
+    query_slots_in_stream_ += query_device_slots(kind);
+    StreamQuery q;
+    q.allocation = a;
+    q.offset = offset;
+    q.kind = kind;
+    q.stream = stream;
+    q.accumulate = accumulate;
+    if (!exec_) return queries_.push_back(q) ? status::kSuccess : status::kNoMemory;
+    const NtStatus s = ensure_cb();   // (before the query is in the list: ensure_cb begins segments of those already open)
     if (s != status::kSuccess) return s;
-    if (!pending_.push_back({a, offset, next_slot_})) return status::kNoMemory;
-    cb_->begin_query(next_slot_++, static_cast<graphics::QueryKind>(kind), stream);
+    if (!queries_.push_back(q)) return status::kNoMemory;
+    begin_segment(queries_[queries_.count() - 1]);
     return status::kSuccess;
   }
 
+  // EndQuery [allocation_index, offset]: the open query that writes there, or the one begun last that is still open.
   NtStatus end_query(ByteReader& p) {
-    if (!exact(p) || !query_open_) return kBad;
-    query_open_ = false;
-    if (exec_) cb_->end_occlusion_query();
+    bool named = false;
+    uint32_t index = 0, offset = 0;
+    if (!p.at_end()) {
+      index = p.le32(), offset = p.le32();
+      named = true;
+    }
+    if (!exact(p)) return kBad;
+    const Allocation* a = named ? alloc(index) : nullptr;
+    if (named && !a) return kBad;
+    uint64_t at = queries_.count();
+    for (uint64_t k = 0; k < queries_.count(); ++k) {
+      const StreamQuery& q = queries_[k];
+      if (q.open && (!named || (q.allocation == a && q.offset == offset))) at = k;
+    }
+    if (at == queries_.count()) return kBad;
+    StreamQuery& q = queries_[at];
+    q.open = false;
+    if (exec_ && cb_ && q.segment) end_segment(q);   // (without a command buffer since the last flush nothing more was counted)
     return status::kSuccess;
   }
 
@@ -911,7 +1037,9 @@ class Adapter::StreamRunner {
       if (!vertex_[slot]) return refuse(__LINE__);
       const uint64_t stride = pipeline_->slot_stride(slot);
       if (pipeline_->per_instance_slots() >> slot & 1) {
-        const uint64_t end = uint64_t{first_instance} + instance_count;
+        // (the last element an instance reads: the attributes that step slowest stop soonest; one that never steps reads first_instance)
+        const uint32_t rate = pipeline_->slot_step_rate(slot);
+        const uint64_t end = uint64_t{first_instance} + (rate ? (instance_count - 1) / rate : 0) + 1;
         if (vertex_offset_[slot] + end * stride > vertex_[slot]->desc().size) return refuse(__LINE__);
       }
       if (!indexed && (pipeline_->per_vertex_slots() >> slot & 1)) {
@@ -1045,6 +1173,10 @@ class Adapter::StreamRunner {
       emitted += 3;
     }
     strip_triangle_ = 0;
+    // (the input assembler of Direct3D reads the strip's `count` vertices, and its vertex shader runs once for each, where the device draws `emitted`: the open queries are told)
+    const int64_t more = (int64_t{count} - static_cast<int64_t>(emitted)) * int64_t{instance_count};
+    for (StreamQuery& q : queries_.view())
+      if (q.open) q.vertex_adjust += more;
     if (emitted == 0) return status::kSuccess;
     graphics::IBuffer* buffer = adapter_.device_.create_buffer(out.size(), graphics::kBufferIndex);
     if (!buffer) return status::kNoMemory;
@@ -2461,15 +2593,9 @@ class Adapter::StreamRunner {
   graphics::ICommandBuffer* cb_ = nullptr;
   // The state a stream builds up, to check the draws.
   bool in_pass_ = false;
-  struct PendingQuery {
-    Allocation* allocation;
-    uint64_t offset;
-    uint32_t slot;
-  };
-  bool query_open_ = false;
-  uint32_t queries_in_stream_ = 0;       // the queries begun so far (at most kMaxOcclusionQueries in a stream)
-  uint32_t next_slot_ = 0;               // the slot of the next query in the command buffer being recorded
-  List<PendingQuery> pending_;           // the queries recorded in it: where their counts go
+  uint32_t query_slots_in_stream_ = 0;   // the device queries the stream's queries take (at most kMaxOcclusionQueries: a command buffer holds no more)
+  uint32_t next_slot_ = 0;               // the slot of the next device query in the command buffer being recorded
+  List<StreamQuery> queries_;            // the queries of the stream, in the order they began
   const Allocation* pass_color_ = nullptr;
   const Allocation* pass_extra_[graphics::kMaxColorTargets - 1] = {};
   uint32_t pass_target_count_ = 1;
@@ -2787,7 +2913,7 @@ NtStatus Adapter::create_pipeline(const PipelineDesc& d, const SharedPointer<Sha
     if (used < texture_count) texture_count = used;
     if (paired > texture_count) texture_count = paired;
   }
-  uint32_t vertex_slots = 0, instance_slots = 0;
+  uint32_t vertex_slots = 0, instance_slots = 0, slot_rates[graphics::kMaxVertexBuffers] = {};
   for (uint32_t i = 0; i < d.attribute_count; ++i) {
     const graphics::VertexAttribute& a = d.attributes[i];
     if (a.location >= caps_.max_vertex_attributes || a.slot >= caps_.max_vertex_buffers || static_cast<uint32_t>(a.format) >= graphics::kVertexFormatCount) return status::kInvalidParameter;
@@ -2795,6 +2921,7 @@ NtStatus Adapter::create_pipeline(const PipelineDesc& d, const SharedPointer<Sha
     const uint32_t stride = a.slot == 0 ? d.vertex_stride : d.slot_strides[a.slot];
     if (stride == 0 || a.offset > stride || graphics::vertex_format_bytes(a.format) > stride - a.offset) return status::kInvalidParameter;
     (a.per_instance ? instance_slots : vertex_slots) |= 1u << a.slot;
+    if (a.per_instance && a.step_rate && (slot_rates[a.slot] == 0 || a.step_rate < slot_rates[a.slot])) slot_rates[a.slot] = a.step_rate;
   }
   const graphics::StencilState& st = d.stencil;
   if (static_cast<uint32_t>(d.cull_mode) > 2 || static_cast<uint32_t>(d.front_face) > 1 || static_cast<uint32_t>(st.compare) > 7 || static_cast<uint32_t>(st.fail_op) > 7 ||
@@ -2924,6 +3051,7 @@ NtStatus Adapter::create_pipeline(const PipelineDesc& d, const SharedPointer<Sha
   pipeline->stride_ = d.vertex_stride;
   pipeline->vertex_slot_mask_ = vertex_slots;
   pipeline->instance_slot_mask_ = instance_slots;
+  for (uint32_t s = 0; s < graphics::kMaxVertexBuffers; ++s) pipeline->slot_step_rates_[s] = slot_rates[s];
   for (uint32_t s = 1; s < graphics::kMaxVertexBuffers; ++s) pipeline->slot_strides_[s] = d.slot_strides[s];
   for (uint32_t i = 0; i < d.attribute_count; ++i) pipeline->per_instance_ = pipeline->per_instance_ || d.attributes[i].per_instance;
   pipeline->attribute_count_ = d.attribute_count;

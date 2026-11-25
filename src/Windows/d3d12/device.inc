@@ -332,6 +332,12 @@ static HRESULT STDMETHODCALLTYPE dev_CheckFeatureSupport(Dev *This, D3D12_FEATUR
       } else if (format_bytes(f->Format)) {
         f->Support1 = D3D12_FORMAT_SUPPORT1_IA_VERTEX_BUFFER;
       }
+      {      /* (a vertex element: the formats vertex_format knows, those beyond 32-bit floats on a device that reads them) */
+        UINT vertex_bytes;
+        const int vf = vertex_format(f->Format, &vertex_bytes);
+        if (vf >= 0 && (vf <= 3 || (This->caps.features & DEV_FEATURE_VERTEX_FORMATS))) f->Support1 |= D3D12_FORMAT_SUPPORT1_IA_VERTEX_BUFFER;
+        else f->Support1 &= ~D3D12_FORMAT_SUPPORT1_IA_VERTEX_BUFFER;
+      }
       if (f->Format == DXGI_FORMAT_R16_UINT || f->Format == DXGI_FORMAT_R32_UINT) f->Support1 |= D3D12_FORMAT_SUPPORT1_IA_INDEX_BUFFER;
       /* (the views of depth buffers: their depth sampled, compared and gathered, their stencil loaded - on a device that reads depth buffers -; R32_FLOAT and R16_UNORM textures
        * are compared too) */
@@ -446,6 +452,7 @@ static HRESULT STDMETHODCALLTYPE dev_CheckFeatureSupport(Dev *This, D3D12_FEATUR
       FEATURE(D3D12_FEATURE_DATA_D3D12_OPTIONS3, o);
       memset(o, 0, sizeof *o);
       o->WriteBufferImmediateSupportFlags = D3D12_COMMAND_LIST_SUPPORT_FLAG_DIRECT | D3D12_COMMAND_LIST_SUPPORT_FLAG_COMPUTE | D3D12_COMMAND_LIST_SUPPORT_FLAG_COPY;
+      o->CopyQueueTimestampQueriesSupported = (This->caps.features & DEV_FEATURE_TIMESTAMP_QUERIES) ? TRUE : FALSE;      /* (EndQuery of a timestamp on a copy list: extras.inc) */
       o->ViewInstancingTier = D3D12_VIEW_INSTANCING_TIER_NOT_SUPPORTED;
       return S_OK;
     }
@@ -518,6 +525,7 @@ static HRESULT STDMETHODCALLTYPE dev_CheckFeatureSupport(Dev *This, D3D12_FEATUR
     case D3D12_FEATURE_D3D12_OPTIONS9: {
       FEATURE(D3D12_FEATURE_DATA_D3D12_OPTIONS9, o);
       memset(o, 0, sizeof *o);
+      /* (MeshShaderPipelineStatsSupported FALSE: there are no mesh or amplification shaders; a PIPELINE_STATISTICS1 query's counts of them are 0) */
       o->WaveMMATier = D3D12_WAVE_MMA_TIER_NOT_SUPPORTED;
       return S_OK;
     }
