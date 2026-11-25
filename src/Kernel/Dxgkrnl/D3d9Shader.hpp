@@ -114,8 +114,9 @@ class D3d9Program {
   ImageDim image_dim(uint32_t slot) const { return slot < graphics::kMaxStorageImages ? image_dim_[slot] : ImageDim::None; }
   ImageReturn image_return(uint32_t slot) const { return slot < graphics::kMaxStorageImages ? image_return_[slot] : ImageReturn::Float; }
   uint32_t image_mask() const { return image_mask_; }   // (bit n: u<n> is a storage image)
-  // A geometry shader that writes SV_RenderTargetArrayIndex (ShaderIo::layer).
+  // A geometry shader that writes SV_RenderTargetArrayIndex (ShaderIo::layer) or SV_ViewportArrayIndex (ShaderIo::viewport) - or a vertex or domain shader that does (layer_before_geometry).
   bool writes_layer() const { return writes_layer_; }
+  bool writes_viewport() const { return writes_viewport_; }
   // The graphics::DeviceFeature2 bits the program needs (storage images; the layer output).
   uint32_t required_features2() const;
   // What the pixel shader declared texture unit `unit` to be (a DXBC dcl_resource; the others: 2D). Binding another kind to the unit makes a draw wrong, so the kernel refuses it.
@@ -202,7 +203,12 @@ class D3d9Program {
   ImageDim image_dim_[graphics::kMaxStorageImages] = {};
   ImageReturn image_return_[graphics::kMaxStorageImages] = {};
   uint32_t image_mask_ = 0;
-  bool writes_layer_ = false;
+  bool writes_layer_ = false, writes_viewport_ = false, layer_before_geometry_ = false;
+  // The components of their output registers the layer and the viewport are in, and whether the viewport is in the layer's register (both integers packed into one).
+  uint8_t layer_component_ = 0, viewport_component_ = 0;
+  bool viewport_shares_layer_ = false;
+  uint32_t layer_out(const float* layer, const float* viewport) const;   // (the layer of the registers' values; and the viewport: viewport_out)
+  uint32_t viewport_out(const float* layer, const float* viewport) const;
   graphics::TextureKind texture_kind_[graphics::kMaxTextureUnits] = {};
   uint8_t texture_samples_[graphics::kMaxTextureUnits] = {};   // the sample count a multisampled texture was declared with
   bool uses_system_values_ = false, uses_texel_access_ = false, uses_graphics_storage_ = false, uses_fragment_stores_ = false, uses_vertex_stores_ = false, uses_geometry_stores_ = false, uses_tessellation_stores_ = false;

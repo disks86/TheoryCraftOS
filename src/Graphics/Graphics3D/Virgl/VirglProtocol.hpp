@@ -127,7 +127,10 @@ constexpr uint32_t kShaderFragment = 1;
 constexpr uint32_t kPrimPoints = 0, kPrimLines = 1, kPrimTriangles = 4, kPrimLinesAdjacency = 10, kPrimTrianglesAdjacency = 12;
 constexpr uint32_t kFuncLess = 1, kFuncLequal = 3, kFuncAlways = 7;
 constexpr uint32_t kBlendAdd = 0;   // (PIPE_BLEND_ADD, SUBTRACT, REVERSE_SUBTRACT, MIN, MAX: 0 .. 4, as BlendOp)
-constexpr uint32_t kBlendFactors[] = {0x11, 1, 2, 0x12, 3, 0x13, 5, 0x15, 4, 0x14, 6, 7, 0x17, 8, 0x18};   // by BlendFactor: ZERO ONE SRC_COLOR INV_SRC_COLOR SRC_ALPHA INV_SRC_ALPHA DST_COLOR INV_DST_COLOR DST_ALPHA INV_DST_ALPHA SRC_ALPHA_SATURATE CONST_COLOR INV_CONST_COLOR CONST_ALPHA INV_CONST_ALPHA
+constexpr uint32_t kBlendFactors[] = {0x11, 1, 2, 0x12, 3, 0x13, 5, 0x15, 4, 0x14, 6, 7, 0x17, 8, 0x18, 9, 0x19, 0x0A, 0x1A};   // by BlendFactor: ZERO ONE SRC_COLOR INV_SRC_COLOR SRC_ALPHA INV_SRC_ALPHA DST_COLOR INV_DST_COLOR DST_ALPHA INV_DST_ALPHA SRC_ALPHA_SATURATE CONST_COLOR INV_CONST_COLOR CONST_ALPHA INV_CONST_ALPHA SRC1_COLOR INV_SRC1_COLOR SRC1_ALPHA INV_SRC1_ALPHA
+// PIPE_LOGICOP_* by graphics::LogicOp (Direct3D's order: CLEAR SET COPY COPY_INVERTED NOOP INVERT AND NAND OR NOR XOR EQUIV AND_REVERSE AND_INVERTED OR_REVERSE OR_INVERTED)
+constexpr uint32_t kLogicOps[] = {0, 15, 12, 3, 10, 5, 8, 7, 14, 1, 6, 9, 4, 2, 13, 11};
+constexpr uint32_t kPolygonFill = 0, kPolygonLine = 1;   // (PIPE_POLYGON_MODE_FILL, _LINE)
 constexpr uint32_t kStencilOps[] = {0, 1, 2, 3, 4, 7, 5, 6};   // by StencilOp (Keep Zero Replace IncrementClamp DecrementClamp Invert IncrementWrap DecrementWrap): PIPE_STENCIL_OP_*
 constexpr uint32_t kBlendFactorOne = 1, kBlendFactorSrcAlpha = 3, kBlendFactorInvSrcAlpha = 0x13;
 constexpr uint32_t kClearDepth = 1u << 0, kClearStencil = 1u << 1, kClearColor0 = 1u << 2;

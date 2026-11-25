@@ -79,6 +79,7 @@ enum Modifier : uint8_t { kModNone, kModNeg, kModBias, kModBiasNeg, kModSign, kM
 constexpr uint32_t kMaxTemps = 256, kMaxInputs = 16, kMaxOutputs = 16;
 constexpr uint32_t kMaxD3d9Temps = 32;   // r0 .. r31 of a Direct3D 9 token stream
 constexpr int8_t kSlotNone = -1, kSlotPosition = -2, kSlotLayer = -3;   // (kSlotLayer: a geometry shader's SV_RenderTargetArrayIndex output, a kRastOut register)
+constexpr int8_t kSlotViewport = -4;   // (SV_ViewportArrayIndex, the same way)
 
 }  // namespace d3d9
 

@@ -261,6 +261,7 @@ typedef struct Pipeline {
   UINT vs, ps, layout;
   UINT gs, hs, ds;
   D3D11_BLEND_DESC blend;
+  UINT logic_op;                      /* the blend state's logic operation (Direct3D 11.1, every target's): the D3D11_LOGIC_OP + 1, 0 none */
   D3D11_DEPTH_STENCIL_DESC depth;
   D3D11_RASTERIZER_DESC raster;
   UINT targets, has_depth;
@@ -2046,8 +2047,14 @@ static BOOL blend_valid(D3D11_BLEND b, BOOL alpha) {
   return !alpha || (b != D3D11_BLEND_SRC_COLOR && b != D3D11_BLEND_INV_SRC_COLOR && b != D3D11_BLEND_DEST_COLOR && b != D3D11_BLEND_INV_DEST_COLOR &&
                     b != D3D11_BLEND_SRC1_COLOR && b != D3D11_BLEND_INV_SRC1_COLOR);
 }
+/* Whether Direct3D 12 below has logic operations (D3D11_FEATURE_DATA_D3D11_OPTIONS.OutputMergerLogicOp). */
+static BOOL dev_logic_ops(Dev *d) {
+  D3D12_FEATURE_DATA_D3D12_OPTIONS o;
+  memset(&o, 0, sizeof o);
+  return SUCCEEDED(ID3D12Device_CheckFeatureSupport(d->d12, D3D12_FEATURE_D3D12_OPTIONS, &o, sizeof o)) && o.OutputMergerLogicOp;
+}
 /* CreateBlendState1: every target as the description says (all as the first without IndependentBlendEnable); a target that does not blend has the default
- * factors. Logic operations need D3D11_FEATURE_DATA_D3D11_OPTIONS.OutputMergerLogicOp, which this device does not have. */
+ * factors. Logic operations need D3D11_FEATURE_DATA_D3D11_OPTIONS.OutputMergerLogicOp, a target that does not blend and no independent blending (the runtime's rules). */
 static HRESULT STDMETHODCALLTYPE dev_CreateBlendState1(Dev *d, const D3D11_BLEND_DESC1 *desc, ID3D11BlendState1 **out) {
   extern const ID3D11BlendState1Vtbl blend_vtbl;
   static const GUID *const iids[] = {&IID_ID3D11DeviceChild, &IID_ID3D11BlendState, &IID_ID3D11BlendState1, NULL};
@@ -2061,7 +2068,7 @@ static HRESULT STDMETHODCALLTYPE dev_CreateBlendState1(Dev *d, const D3D11_BLEND
     const D3D11_RENDER_TARGET_BLEND_DESC1 *in = &desc->RenderTarget[desc->IndependentBlendEnable ? i : 0];
     D3D11_RENDER_TARGET_BLEND_DESC1 *t = &key.RenderTarget[i];
     if (in->BlendEnable && in->LogicOpEnable) return E_INVALIDARG;
-    if (in->LogicOpEnable) return E_INVALIDARG;      /* (no logic operations: OutputMergerLogicOp is FALSE) */
+    if (in->LogicOpEnable && (desc->IndependentBlendEnable || in->LogicOp < D3D11_LOGIC_OP_CLEAR || in->LogicOp > D3D11_LOGIC_OP_OR_INVERTED || !dev_logic_ops(d))) return E_INVALIDARG;
     if (in->BlendEnable) {
       if (!blend_valid(in->SrcBlend, FALSE) || !blend_valid(in->DestBlend, FALSE) || !blend_valid(in->SrcBlendAlpha, TRUE) || !blend_valid(in->DestBlendAlpha, TRUE) ||
           in->BlendOp < D3D11_BLEND_OP_ADD || in->BlendOp > D3D11_BLEND_OP_MAX || in->BlendOpAlpha < D3D11_BLEND_OP_ADD || in->BlendOpAlpha > D3D11_BLEND_OP_MAX)
@@ -2073,8 +2080,8 @@ static HRESULT STDMETHODCALLTYPE dev_CreateBlendState1(Dev *d, const D3D11_BLEND
       t->DestBlend = t->DestBlendAlpha = D3D11_BLEND_ZERO;
       t->BlendOp = t->BlendOpAlpha = D3D11_BLEND_OP_ADD;
     }
-    t->LogicOpEnable = FALSE;
-    t->LogicOp = D3D11_LOGIC_OP_NOOP;
+    t->LogicOpEnable = !!in->LogicOpEnable;
+    t->LogicOp = in->LogicOpEnable ? in->LogicOp : D3D11_LOGIC_OP_NOOP;
     if (in->RenderTargetWriteMask > D3D11_COLOR_WRITE_ENABLE_ALL) return E_INVALIDARG;
     t->RenderTargetWriteMask = in->RenderTargetWriteMask;
   }

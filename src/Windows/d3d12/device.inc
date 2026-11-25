@@ -244,6 +244,9 @@ static HRESULT STDMETHODCALLTYPE dev_CheckFeatureSupport(Dev *This, D3D12_FEATUR
       o->TiledResourcesTier = D3D12_TILED_RESOURCES_TIER_1;
       o->ResourceHeapTier = D3D12_RESOURCE_HEAP_TIER_2;
       o->CrossNodeSharingTier = D3D12_CROSS_NODE_SHARING_TIER_NOT_SUPPORTED;
+      o->OutputMergerLogicOp = (This->caps.features2 & DEV_FEATURE2_LOGIC_OPS) ? TRUE : FALSE;
+      /* (the CPU renderer takes the layer and viewport from a vertex or domain shader itself; no geometry shader is put in for it) */
+      o->VPAndRTArrayIndexFromAnyShaderFeedingRasterizerSupportedWithoutGSEmulation = (This->caps.features2 & DEV_FEATURE2_LAYER_ANY_STAGE) ? TRUE : FALSE;
       return S_OK;
     }
     case D3D12_FEATURE_ARCHITECTURE: {

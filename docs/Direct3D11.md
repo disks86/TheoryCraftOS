@@ -83,8 +83,11 @@ float, D32_FLOAT_S8X24_UINT in D24S8 (with its stencil, 24 bits of depth). R24G8
 - Below `d3d11.dll`, in the kernel: more than one level of an array, a cube or a volume (the others are dropped), arrays of cubes; depth buffers of
   several levels, and sampling a depth buffer; unordered access to cubes and to the dropped levels, typed buffer loads and stores (`Buffer<>`, `RWBuffer<>`),
   append and consume buffers (`imm_atomic_alloc` / `consume`), unordered access buffer slots above u3 (image slots above u7) and buffer shader resources above t3;
-  storage images in other stages than the compute and pixel shaders; dynamic shader linkage; textures above 4096 a side; BC4 - BC7; `SV_ViewportArrayIndex` (several
-  viewports: the first is drawn with), and `SV_RenderTargetArrayIndex` from a vertex or domain shader; dual-source blend factors (`D3D11_BLEND_SRC1_*`: the pipeline is refused), the blend factor on GPUs other than virgl, wireframe, depth bias, the back face's stencil operations, anisotropy, border colours.
+  storage images in other stages than the compute and pixel shaders; dynamic shader linkage; textures above 4096 a side; BC4 - BC7; on virgl `SV_RenderTargetArrayIndex` and
+  `SV_ViewportArrayIndex` from a vertex or domain shader (`D3D11_FEATURE_D3D11_OPTIONS3` says FALSE there; the CPU renderer has them) and anisotropic filtering
+  (virglrenderer 1.3.0 drops it: trilinear); on the GPUs other than virgl and the CPU renderer the blend factor and the fixed state of Direct3D 10 / 11
+  ([Direct3DKernelMode.md](Direct3DKernelMode.md), "The fixed state of Direct3D 10 and 11"); `AntialiasedLineEnable` and the multisampled line modes (lines are aliased and
+  one pixel wide); separate minification and magnification filters (a linear one of the two makes both linear).
 - The sampler of t<n> is s<n>: the kernel pairs them by number. A shader that samples one texture with two samplers gets one.
 - One query of the kernel's is open at a time: a draw is measured for one kind (above).
 - Shared resources: textures made `D3D11_RESOURCE_MISC_SHARED_NTHANDLE` (with `SHARED` or `SHARED_KEYEDMUTEX`) are shared through NT handles

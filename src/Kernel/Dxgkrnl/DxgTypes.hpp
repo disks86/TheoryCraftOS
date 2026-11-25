@@ -307,6 +307,10 @@ struct ShaderDesc {
   uint32_t constant_base = 0;   // Dxbc: where the program's constant buffers begin in the pipeline's block of constants, in 16-byte registers (D3d9Program::compile_dxbc)
 };
 
+// The escape CreatePipeline's tagged parts after the constant blend colour (DxgKernel.cpp): the rasterizer state of PipelineDesc (fill mode .. logic_op), 15 words.
+constexpr uint32_t kPipelineRasterTag = 0x31545352;   // 'RST1'
+constexpr uint32_t kPipelineRasterWords = 15;
+
 struct PipelineDesc {
   Handle vertex_shader = 0, fragment_shader = 0;
   Handle hull_shader = 0, domain_shader = 0;   // not 0: tessellation (both, stages Hull and Domain; needs kFeatureTessellation; the draws are PatchList topology with the hull shader's input control point count)
@@ -336,6 +340,16 @@ struct PipelineDesc {
   int32_t rasterized_stream = 0;
   bool alpha_to_coverage = false;    // with multisample: the first target's alpha says how many samples a pixel's colour reaches (see graphics::GraphicsPipelineDesc::alpha_to_coverage)
   uint32_t color_target_count = 1;   // the colour outputs the pixel shader fills (SV_Target0 ..); more than one needs the adapter's kFeatureMultipleTargets, and a pass with that many targets
+  // The rasterizer state of Direct3D 10+ (the adapter's kFeature2RasterizerState, see graphics::GraphicsPipelineDesc): fill mode, depth bias (DepthBias, SlopeScaledDepthBias, DepthBiasClamp
+  // and the depth format's unit), depth clipping, and the back faces' stencil state (its compare, ops and masks; stencil's enable and reference are both faces').
+  graphics::FillMode fill_mode = graphics::FillMode::Solid;
+  graphics::DepthBias depth_bias;
+  bool depth_clip = true;
+  bool separate_back_stencil = false;
+  graphics::StencilState back_stencil;
+  // A logic operation for every target in place of blending (kFeature2LogicOps). The Src1 blend factors need kFeature2DualSourceBlend and one colour target.
+  bool logic_op_enable = false;
+  graphics::LogicOp logic_op = graphics::LogicOp::Noop;
 };
 
 // --- Presenting -----------------------------------------------------------------------

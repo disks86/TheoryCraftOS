@@ -590,6 +590,15 @@ class Adapter::StreamRunner {
   NtStatus bind_texture(ByteReader& p) {
     const uint32_t unit = p.le32(), index = p.le32(), filter = p.le32(), au = p.le32(), av = p.le32(), mip = p.le32();
     const float bias = bits_float(p.le32()), min_lod = bits_float(p.le32()), max_lod = bits_float(p.le32());
+    // (the optional part: anisotropy and a border colour of any value, kFeature2SamplerState)
+    uint32_t anisotropy = 1, custom = 0;
+    float border_rgba[4] = {0, 0, 0, 0};
+    if (p.ok() && !p.at_end()) {
+      anisotropy = p.le32(), custom = p.le32();
+      for (float& c : border_rgba) c = bits_float(p.le32());
+      if (!p.ok() || anisotropy < 1 || anisotropy > graphics::kMaxAnisotropy || custom > 1) return refuse(__LINE__);
+      if (!(adapter_.caps_.features2 & graphics::kFeature2SamplerState)) return refuse(__LINE__);
+    }
     graphics::AddressMode mode_u, mode_v;
     graphics::BorderColor border, no_border;
     if (!exact(p) || unit >= adapter_.caps_.max_texture_units || filter > 1 || !decode_address_word(au, &mode_u, &border) || !decode_address_word(av, &mode_v, &no_border) || mip > 2) return refuse(__LINE__);
@@ -610,6 +619,9 @@ class Adapter::StreamRunner {
     sampler.lod_bias = bias;
     sampler.min_lod = min_lod;
     sampler.max_lod = max_lod;
+    sampler.max_anisotropy = static_cast<uint8_t>(anisotropy);
+    sampler.custom_border = custom != 0;
+    for (uint32_t c = 0; c < 4; ++c) sampler.border_rgba[c] = border_rgba[c];
     NtStatus s = resident(*a);
     if (s == status::kSuccess) s = ensure_cb();
     if (s != status::kSuccess) return s;
@@ -617,29 +629,47 @@ class Adapter::StreamRunner {
     return status::kSuccess;
   }
 
+  // One viewport, or several (kFeature2Viewports): six words each.
   NtStatus set_viewport(ByteReader& p) {
-    graphics::Viewport v;
-    v.x = bits_float(p.le32()), v.y = bits_float(p.le32()), v.width = bits_float(p.le32()), v.height = bits_float(p.le32());
-    v.min_depth = bits_float(p.le32()), v.max_depth = bits_float(p.le32());
-    if (!exact(p)) return kBad;
-    if (!finite_within(v.x, kMaxCoordinate) || !finite_within(v.y, kMaxCoordinate) || !finite_within(v.width, kMaxCoordinate) || !finite_within(v.height, kMaxCoordinate) ||
-        v.width < 0 || v.height < 0 || !finite_within(v.min_depth, 1.0f) || !finite_within(v.max_depth, 1.0f))
-      return kBad;
+    graphics::Viewport list[graphics::kMaxViewports];
+    uint32_t count = 0;
+    while (p.ok() && !p.at_end()) {
+      if (count == graphics::kMaxViewports) return kBad;
+      graphics::Viewport& v = list[count++];
+      v.x = bits_float(p.le32()), v.y = bits_float(p.le32()), v.width = bits_float(p.le32()), v.height = bits_float(p.le32());
+      v.min_depth = bits_float(p.le32()), v.max_depth = bits_float(p.le32());
+      if (!p.ok() || !finite_within(v.x, kMaxCoordinate) || !finite_within(v.y, kMaxCoordinate) || !finite_within(v.width, kMaxCoordinate) || !finite_within(v.height, kMaxCoordinate) ||
+          v.width < 0 || v.height < 0 || !finite_within(v.min_depth, 1.0f) || !finite_within(v.max_depth, 1.0f))
+        return kBad;
+    }
+    if (!exact(p) || count == 0) return kBad;
+    if (count > 1 && !(adapter_.caps_.features2 & graphics::kFeature2Viewports)) return refuse(__LINE__);
     if (!exec_) return status::kSuccess;
     const NtStatus s = ensure_cb();
     if (s != status::kSuccess) return s;
-    cb_->set_viewport(v);
+    if (count == 1) cb_->set_viewport(list[0]);
+    else cb_->set_viewports(ArrayView<const graphics::Viewport>(list, count));
     return status::kSuccess;
   }
 
+  // One scissor rectangle, or several (kFeature2Viewports): four words each.
   NtStatus set_scissor(ByteReader& p) {
-    const int32_t x = static_cast<int32_t>(p.le32()), y = static_cast<int32_t>(p.le32());
-    const uint32_t w = p.le32(), h = p.le32();
-    if (!exact(p) || x < -kMaxScissor || x > kMaxScissor || y < -kMaxScissor || y > kMaxScissor || w > static_cast<uint32_t>(kMaxScissor) || h > static_cast<uint32_t>(kMaxScissor)) return kBad;
+    graphics::Rect2D list[graphics::kMaxViewports];
+    uint32_t count = 0;
+    while (p.ok() && !p.at_end()) {
+      if (count == graphics::kMaxViewports) return kBad;
+      const int32_t x = static_cast<int32_t>(p.le32()), y = static_cast<int32_t>(p.le32());
+      const uint32_t w = p.le32(), h = p.le32();
+      if (!p.ok() || x < -kMaxScissor || x > kMaxScissor || y < -kMaxScissor || y > kMaxScissor || w > static_cast<uint32_t>(kMaxScissor) || h > static_cast<uint32_t>(kMaxScissor)) return kBad;
+      list[count++] = {x, y, w, h};
+    }
+    if (!exact(p) || count == 0) return kBad;
+    if (count > 1 && !(adapter_.caps_.features2 & graphics::kFeature2Viewports)) return refuse(__LINE__);
     if (!exec_) return status::kSuccess;
     const NtStatus s = ensure_cb();
     if (s != status::kSuccess) return s;
-    cb_->set_scissor({x, y, w, h});
+    if (count == 1) cb_->set_scissor(list[0]);
+    else cb_->set_scissors(ArrayView<const graphics::Rect2D>(list, count));
     return status::kSuccess;
   }
 
@@ -2102,6 +2132,13 @@ class Adapter::StreamRunner {
     for (uint32_t w : {unit, index, static_cast<uint32_t>(sampler.filter), address_word(sampler.address_u, sampler.border), address_word(sampler.address_v), static_cast<uint32_t>(sampler.mip_filter),
                        __builtin_bit_cast(uint32_t, sampler.lod_bias), __builtin_bit_cast(uint32_t, sampler.min_lod), __builtin_bit_cast(uint32_t, sampler.max_lod)})
       packet.put32(w);
+    // (anisotropy and a border colour of any value: the optional part; on a device without them a descriptor's anisotropy is filtered without - the quality of anisotropic filtering is
+    // the device's - and its border colour is the nearest of the three every device has)
+    if ((sampler.max_anisotropy > 1 || sampler.custom_border) && (adapter_.caps_.features2 & graphics::kFeature2SamplerState)) {
+      for (uint32_t w : {uint32_t{sampler.max_anisotropy}, sampler.custom_border ? 1u : 0u, __builtin_bit_cast(uint32_t, sampler.border_rgba[0]), __builtin_bit_cast(uint32_t, sampler.border_rgba[1]),
+                         __builtin_bit_cast(uint32_t, sampler.border_rgba[2]), __builtin_bit_cast(uint32_t, sampler.border_rgba[3])})
+        packet.put32(w);
+    }
     ByteReader reader(packet.view());
     return bind_texture(reader);
   }
@@ -2471,6 +2508,20 @@ NtStatus Adapter::create_pipeline(const PipelineDesc& d, const SharedPointer<Sha
   if (d.independent_blend)
     for (const graphics::BlendState& t : d.target_blend) constant_factors = constant_factors || (t.custom && t.uses_constant());
   if (constant_factors && !caps_.blend_constant) return status::kNotSupported;
+  // (dual-source blending: the Src1 factors of target 0 - a pipeline of one colour target, Direct3D's rule -; logic operations; the rasterizer state of Direct3D 10)
+  bool dual_source = bs.custom && bs.uses_dual_source();
+  if (d.independent_blend)
+    for (const graphics::BlendState& t : d.target_blend) dual_source = dual_source || (t.custom && t.uses_dual_source());
+  if (dual_source && !(caps_.features2 & graphics::kFeature2DualSourceBlend)) return status::kNotSupported;
+  if (dual_source && d.color_target_count != 1) return status::kInvalidParameter;
+  if (static_cast<uint32_t>(d.logic_op) >= graphics::kLogicOpCount || static_cast<uint32_t>(d.fill_mode) > 1) return status::kInvalidParameter;
+  if (d.logic_op_enable && !(caps_.features2 & graphics::kFeature2LogicOps)) return status::kNotSupported;
+  const graphics::StencilState& back = d.back_stencil;
+  if (static_cast<uint32_t>(back.compare) > 7 || static_cast<uint32_t>(back.fail_op) > 7 || static_cast<uint32_t>(back.depth_fail_op) > 7 || static_cast<uint32_t>(back.pass_op) > 7) return status::kInvalidParameter;
+  const graphics::DepthBias& bias = d.depth_bias;
+  if ((bias.unorm_bits != 0 && bias.unorm_bits != 16 && bias.unorm_bits != 24) || bias.slope != bias.slope || bias.clamp != bias.clamp) return status::kInvalidParameter;
+  const bool raster_state = d.fill_mode != graphics::FillMode::Solid || bias.enabled() || !d.depth_clip || d.separate_back_stencil;
+  if (raster_state && !(caps_.features2 & graphics::kFeature2RasterizerState)) return status::kNotSupported;
   if (d.independent_blend && !(caps_.features & graphics::kFeatureIndependentBlend)) return status::kNotSupported;
   if ((d.multisample || d.alpha_to_coverage) && !(caps_.features & graphics::kFeatureMultisample)) return status::kNotSupported;
   if (d.alpha_to_coverage && !d.multisample) return status::kInvalidParameter;
@@ -2538,6 +2589,13 @@ NtStatus Adapter::create_pipeline(const PipelineDesc& d, const SharedPointer<Sha
   for (uint32_t i = 0; i < graphics::kMaxColorTargets - 1; ++i) pd.target_blend[i] = d.target_blend[i];
   pd.depth_compare = d.depth_compare;
   pd.color_target_count = d.color_target_count;
+  pd.fill_mode = d.fill_mode;
+  pd.depth_bias = d.depth_bias;
+  pd.depth_clip = d.depth_clip;
+  pd.separate_back_stencil = d.separate_back_stencil;
+  pd.back_stencil = d.back_stencil;
+  pd.logic_op_enable = d.logic_op_enable;
+  pd.logic_op = d.logic_op;
 
   SharedPointer<PipelineObject> pipeline = SharedPointer<PipelineObject>::make(allocator_, device_);
   if (!pipeline) return status::kNoMemory;

@@ -1402,9 +1402,18 @@ NtStatus Kernel::escape_d3d12(ProcessId pid, Handle device, uint32_t op, ByteRea
       const uint32_t count = in.le32();
       if (!in.ok() || count > 4096) return status::kInvalidParameter;
       for (uint32_t i = 0; i < count; ++i) {
-        const uint32_t index = in.le32(), kind = in.le32(), allocation = in.le32(), off_lo = in.le32(), off_hi = in.le32(), size_lo = in.le32(), size_hi = in.le32();
+        const uint32_t index = in.le32(), kind_word = in.le32(), allocation = in.le32(), off_lo = in.le32(), off_hi = in.le32(), size_lo = in.le32(), size_hi = in.le32();
         const uint32_t filter = in.le32(), au = in.le32(), av = in.le32(), mip = in.le32(), bias = in.le32(), min_lod = in.le32(), max_lod = in.le32();
         DescriptorDesc d;
+        // (kDescriptorSamplerExtras in the kind word: six more words follow, a sampler's anisotropy, whether its border colour is its own, and the colour's r, g, b, a)
+        const uint32_t kind = kind_word & ~kDescriptorSamplerExtras;
+        if (kind_word & kDescriptorSamplerExtras) {
+          const uint32_t anisotropy = in.le32(), custom = in.le32();
+          for (float& c : d.sampler.border_rgba) c = bits_float(in.le32());
+          if (!in.ok() || anisotropy < 1 || anisotropy > graphics::kMaxAnisotropy || custom > 1) return status::kInvalidParameter;
+          d.sampler.max_anisotropy = static_cast<uint8_t>(anisotropy);
+          d.sampler.custom_border = custom != 0;
+        }
         graphics::BorderColor no_border;
         if (!in.ok() || kind > static_cast<uint32_t>(DescriptorKind::UavTexture) || filter > 1 || !decode_address_word(au, &d.sampler.address_u, &d.sampler.border) ||
             !decode_address_word(av, &d.sampler.address_v, &no_border) || mip > 2)
@@ -1654,6 +1663,35 @@ NtStatus Kernel::escape(ProcessId pid, Handle device, ConstByteView request, Byt
                         for (uint32_t c = 0; c < 4; ++c) {
                           desc.blend.constant[c] = constant[c];
                           for (graphics::BlendState& t : desc.target_blend) t.constant[c] = constant[c];
+                        }
+                        // (and, after that, tagged parts: a tag, the count of the words that follow, the words)
+                        while (!in.at_end()) {
+                          const uint32_t tag = in.le32(), words = in.le32();
+                          if (!in.ok()) return status::kInvalidParameter;
+                          if (tag != kPipelineRasterTag || words != kPipelineRasterWords) return status::kInvalidParameter;
+                          // kPipelineRasterTag: fill mode, depth clip, depth bias (constant, slope and clamp as float bits, the format's bits), the back faces' stencil state (separate, compare,
+                          // fail, depth fail, pass, compare mask, write mask), logic operation (enable, op)
+                          const uint32_t fill = in.le32(), clip = in.le32(), bias = in.le32(), slope = in.le32(), clamp = in.le32(), bits = in.le32();
+                          const uint32_t separate = in.le32(), bcompare = in.le32(), bfail = in.le32(), bdepth_fail = in.le32(), bpass = in.le32(), bcompare_mask = in.le32(), bwrite_mask = in.le32();
+                          const uint32_t logic = in.le32(), logic_op = in.le32();
+                          if (!in.ok() || fill > 1 || clip > 1 || (bits != 0 && bits != 16 && bits != 24) || separate > 1 || bcompare > 7 || bfail > 7 || bdepth_fail > 7 || bpass > 7 || bcompare_mask > 255 ||
+                              bwrite_mask > 255 || logic > 1 || logic_op >= graphics::kLogicOpCount)
+                            return status::kInvalidParameter;
+                          desc.fill_mode = static_cast<graphics::FillMode>(fill);
+                          desc.depth_clip = clip != 0;
+                          desc.depth_bias.constant = static_cast<int32_t>(bias);
+                          __builtin_memcpy(&desc.depth_bias.slope, &slope, 4);
+                          __builtin_memcpy(&desc.depth_bias.clamp, &clamp, 4);
+                          desc.depth_bias.unorm_bits = static_cast<uint8_t>(bits);
+                          desc.separate_back_stencil = separate != 0;
+                          desc.back_stencil.compare = static_cast<graphics::CompareOp>(bcompare);
+                          desc.back_stencil.fail_op = static_cast<graphics::StencilOp>(bfail);
+                          desc.back_stencil.depth_fail_op = static_cast<graphics::StencilOp>(bdepth_fail);
+                          desc.back_stencil.pass_op = static_cast<graphics::StencilOp>(bpass);
+                          desc.back_stencil.compare_mask = static_cast<uint8_t>(bcompare_mask);
+                          desc.back_stencil.write_mask = static_cast<uint8_t>(bwrite_mask);
+                          desc.logic_op_enable = logic != 0;
+                          desc.logic_op = static_cast<graphics::LogicOp>(logic_op);
                         }
                       }
                     }

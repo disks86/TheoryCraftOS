@@ -91,6 +91,9 @@ class VirtioGpu : public FramebufferGpu, public IMonitorSource {
   // OpenGL 4.3 / GLSL 4.30; a host below that (or one that did not say) gets none. (The capability bits `bset` were read as well, but their numbering is not relied on.)
   // Most samples per pixel the host's multisampled images have (0 when it did not say).
   uint32_t virgl_max_samples() const { return has_3d_ ? virgl_max_samples_ : 0; }
+  // The colour targets the host blends with two sources (dual-source blending; 0: none), and how many viewports a draw has (GL_MAX_VIEWPORTS; 0 when it did not say).
+  uint32_t virgl_max_dual_source_targets() const { return has_3d_ ? virgl_max_dual_source_ : 0; }
+  uint32_t virgl_max_viewports() const { return has_3d_ ? virgl_max_viewports_ : 0; }
   // Geometry shaders are core in OpenGL 3.2 / GLSL 1.50.
   // Tessellation is core in OpenGL 4.0 / GLSL 4.00.
   bool virgl_has_tessellation() const { return has_3d_ && virgl_glsl_level_ >= 400; }
@@ -270,7 +273,7 @@ class VirtioGpu : public FramebufferGpu, public IMonitorSource {
   void read_capsets();
 
   bool has_3d_ = false;
-  uint32_t virgl_bset_ = 0, virgl_glsl_level_ = 0, virgl_max_samples_ = 0;
+  uint32_t virgl_bset_ = 0, virgl_glsl_level_ = 0, virgl_max_samples_ = 0, virgl_max_dual_source_ = 0, virgl_max_viewports_ = 0;
   uint32_t next_resource_ = 1;
   uint64_t resource_bytes_ = 0;   // live 3D resources, see add_resource_bytes()
   uint32_t screen_resource_ = 0;  // the 2D framebuffer resource

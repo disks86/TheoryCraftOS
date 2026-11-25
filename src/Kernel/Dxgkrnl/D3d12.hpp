@@ -113,6 +113,10 @@ enum class DescriptorKind : uint8_t { None, Srv, Uav, Cbv, Sampler, UavTexture }
 
 // What a descriptor was made to say (CreateShaderResourceView and friends): a texture (Srv), a storage buffer range (Uav), a constant buffer range (Cbv), a sampler, or a level and a run of
 // layers of a kAllocStorageImage texture (UavTexture).
+// The escape WriteDescriptors' kind word with this bit: six more words follow the entry - a sampler's max_anisotropy, custom_border (0 or 1) and border_rgba (bits) - graphics::SamplerDesc's
+// kFeature2SamplerState state.
+constexpr uint32_t kDescriptorSamplerExtras = 1u << 16;
+
 struct DescriptorDesc {
   DescriptorKind kind = DescriptorKind::None;
   Handle allocation = 0;

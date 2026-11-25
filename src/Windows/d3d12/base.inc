@@ -287,6 +287,12 @@ struct Dev {
 #define DEV_FEATURE2_STORAGE_IMAGES_IN_DRAWS (1u << 1)   /* ... and in pixel shaders */
 #define DEV_FEATURE2_LAYERED_TARGETS (1u << 2)           /* render targets and depth buffers of several slices, SV_RenderTargetArrayIndex */
 #define DEV_FEATURE2_SINGLE_CHANNEL (1u << 3)            /* R32_UINT, R32_SINT, R32_FLOAT */
+#define DEV_FEATURE2_RASTERIZER_STATE (1u << 16)         /* fill mode, depth bias, depth clip, back faces' stencil (graphics::kFeature2RasterizerState) */
+#define DEV_FEATURE2_DUAL_SOURCE (1u << 17)              /* the SRC1 blend factors */
+#define DEV_FEATURE2_LOGIC_OPS (1u << 18)                /* LogicOpEnable */
+#define DEV_FEATURE2_SAMPLER_STATE (1u << 19)            /* anisotropy, border colours of any value */
+#define DEV_FEATURE2_VIEWPORTS (1u << 20)                /* sixteen viewports and scissor rectangles, SV_ViewportArrayIndex from geometry shaders */
+#define DEV_FEATURE2_LAYER_ANY_STAGE (1u << 21)          /* SV_RenderTargetArrayIndex and SV_ViewportArrayIndex from vertex and domain shaders */
 
 static const GUID *const g_device_iids[] = {&IID_ID3D12Object, &IID_ID3D12Device, &IID_ID3D12Device1, &IID_ID3D12Device2, &IID_ID3D12Device3, &IID_ID3D12Device4,
                                             &IID_ID3D12Device5, &IID_ID3D12Device6, &IID_ID3D12Device7, &IID_ID3D12Device8, &IID_ID3D12Device9, &IID_ID3D12Device10, NULL};

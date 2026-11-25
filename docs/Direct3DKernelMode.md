@@ -650,11 +650,71 @@ has its method, `scripts/gen-dx-vtables.py` names the latest interface of each o
   virgl, `DeviceInfo::blend_constant`); a pipeline is made for each factor a draw uses, as for each stencil reference. d3d11 and d3d9 (`D3DRS_BLENDFACTOR`,
   `D3DBLEND_BOTHSRCALPHA`) pass theirs on.
 
+### The fixed state of Direct3D 10 and 11: rasterizer, depth-stencil, blend, samplers, viewports
+
+What `D3D11_RASTERIZER_DESC`, `D3D11_DEPTH_STENCIL_DESC`, `D3D11_BLEND_DESC1`, `D3D11_SAMPLER_DESC` and `RSSetViewports` (and their Direct3D 12 forms) say, as state of the
+kernel's pipelines, samplers and streams. `graphics::DeviceFeature2` bits say which device has what (the CPU renderer all; virgl as noted):
+
+- **`kFeature2RasterizerState`** (`GraphicsPipelineDesc::fill_mode`, `depth_bias`, `depth_clip`, `separate_back_stencil` / `back_stencil`):
+  - *Depth bias* as Direct3D defines it: `bias = DepthBias * r + SlopeScaledDepthBias * max(|dz/dx|, |dz/dy|)`, held to `DepthBiasClamp` (above 0 at most, below 0 at
+    least), the biased depth clamped to the viewport's range. `r` is the depth format's unit (`DepthBias::unorm_bits`): `1 / (2^n - 1)` for D16 and D24, and for the float
+    formats `2^(e - 23)`, `e` the exponent of the triangle's largest depth (`depth_bias_unit`). d3d12.dll takes `n` from the PSO's `DSVFormat`; d3d11.dll passes the
+    program's own depth format (its D16 is kept in a float image, its D32_FLOAT_S8X24 in D24S8: the unit is the format the program made). Triangles are biased (a wireframe
+    triangle's edges too), lines and points not - as OpenGL's polygon offset. On virgl the host's depth buffers are 32-bit floats and its polygon offset counts in their
+    unit, which is Direct3D's float unit: the float formats are `offset_units` / `offset_scale` / `offset_clamp` (`glPolygonOffsetClamp`); a normalised format's bias
+    (whose constant part GL cannot express on a float buffer) is added by the pipeline's own fragment shader (`depth_bias_fragment_text`: the slope from `DDX` / `DDY` of the
+    window depth at the start of the shader, `MOV_SAT` of the biased depth to `POSITION.z` wherever it ends). A pipeline whose fragment shader has storage images (a shader
+    made for each draw's images) and a normalised bias is not made on virgl.
+  - *Depth clip*: with `DepthClipEnable` primitives are clipped against `0 <= z <= w` (the CPU renderer now clips the far plane too, as GPUs do); without it they are not and
+    every fragment's depth is clamped to the viewport's range (virgl `depth_clip` 0: `GL_DEPTH_CLAMP`). The CPU renderer clips against `w > 0` then.
+  - *Wireframe*: a triangle that is not culled is drawn as its edges, lines one pixel wide with the triangle's depth bias and facing (virgl `fill_front` / `fill_back`
+    `PIPE_POLYGON_MODE_LINE`). The edges a near-plane cut makes are drawn; the inner edges of the fan a cut polygon is split into are not.
+  - *Two-sided stencil*: back faces use `back_stencil`'s comparison, operations and masks (`enable` and the reference are both faces'; lines and points are front faces).
+    That is also what D3D12's `D3D12_DEPTH_STENCIL_DESC2` front and back masks need: d3d12.dll's `Pso::back_read_mask` / `back_write_mask` (the front ones' until a parser of
+    the `DEPTH_STENCIL2` subobject - which the compiler's headers here do not have - sets them). virgl: the DSA object's second stencil state.
+- **`kFeature2DualSourceBlend`**: `BlendFactor::Src1Color`, `InvSrc1Color`, `Src1Alpha`, `InvSrc1Alpha` (15 .. 18): the pixel shader's `SV_Target1` as a factor of target 0's blend,
+  in a pipeline of one colour target (more is `kInvalidParameter`; D3D12 `E_INVALIDARG`). virgl when the host blends a target so (`max_dual_source_render_targets`).
+- **`kFeature2LogicOps`** (`logic_op_enable`, `logic_op`, numbered as `D3D11_LOGIC_OP`): in place of blending, for every target, on the bits of the stored channels
+  (`R8G8B8A8_UINT` and the other integer formats, which Direct3D defines it for, the 8-bit normalised ones' bytes and R16G16B16A16_UNORM's 16 bits as OpenGL does; float, sRGB,
+  snorm and 10-bit targets are written as without one). `D3D11_FEATURE_DATA_D3D11_OPTIONS::OutputMergerLogicOp` and D3D12's say it. d3d11's `CreateBlendState1` refuses a
+  logic operation with blending or with `IndependentBlendEnable` (the runtime's rules, which Wine's `test_logic_op` checks); d3d12 one whose targets differ in it.
+- **`kFeature2SamplerState`** (`SamplerDesc::max_anisotropy`, `custom_border` / `border_rgba`): anisotropic filtering by the reference method of
+  `EXT_texture_filter_anisotropic` (`N = min(ceil(Pmax / Pmin), MaxAnisotropy)` lookups along the longer axis of the footprint at the level of `Pmax / N`); border colours of any
+  value (an integer texture's as its integers' bits: Direct3D 12's static `OPAQUE_BLACK_UINT` / `OPAQUE_WHITE_UINT`). The stream's `BindTexture` and the descriptor escape's
+  sampler entries (`kDescriptorSamplerExtras`) carry them; a device without the bit draws a descriptor's sampler without anisotropy and with the nearest of the three
+  border colours every device has (a stream that names them is refused there). The levels of detail (`MipLODBias`, `MinLOD`, `MaxLOD`) go to virgl as they are (they were
+  rounded to sixteenths). virgl's border colour is set as the bits it is (`glSamplerParameterIuiv`); **virglrenderer 1.3.0 leaves anisotropy out**: it sets
+  `GL_TEXTURE_MAX_ANISOTROPY` on the texture, which the sampler objects it binds override, so virgl filters trilinearly whatever is asked (the quality of anisotropic
+  filtering is the implementation's; the state is sent as it is).
+- **`kFeature2Viewports`**: up to `kMaxViewports` (16) viewports and scissor rectangles (the stream's `SetViewport` / `SetScissor` packets take several, six and four words
+  each; `ICommandBuffer::set_viewports` / `set_scissors`), a primitive drawn with the pair its first vertex's `SV_ViewportArrayIndex` (`ShaderIo::viewport`) names - the first
+  when that is past the ones set. Geometry shaders write it (TGSI `VIEWPORT_INDEX`); virgl sets all sixteen of the host's (those past the ones given to the first, so that an
+  index past them is drawn as on the CPU renderer) when the host has 16 (`max_viewports`) and geometry shaders.
+- **`kFeature2LayerFromAnyStage`**: `SV_RenderTargetArrayIndex` and `SV_ViewportArrayIndex` written by the vertex or domain shader that feeds the rasterizer (Direct3D 11.3's
+  `VPAndRTArrayIndexFromAnyShaderFeedingRasterizer`, D3D12's `...SupportedWithoutGSEmulation`): the CPU renderer. virgl has not got it - virglrenderer takes a vertex shader's
+  layer only with `GL_ARB_shader_viewport_layer_array` and an evaluation shader's not at all - so such a shader is refused there (`kNotSupported`) and the options say FALSE.
+
+The escape `CreatePipeline` carries the state in a tagged part after the constant blend colour: `kPipelineRasterTag` ('RST1'), `kPipelineRasterWords` (15), then fill mode,
+depth clip, depth bias (constant, slope and clamp as float bits, the format's bits), the back faces' stencil (separate, compare, fail, depth fail, pass, compare mask, write
+mask) and the logic operation (enable, op). Direct3D 9 (d3d9.dll) uses it too: `D3DRS_FILLMODE` wireframe (`D3DFILL_POINT` is drawn solid: Direct3D 12 below has no point
+fill), `D3DRS_DEPTHBIAS` / `D3DRS_SLOPESCALEDEPTHBIAS` (the bias a depth: in units of the device's D24 buffer), `D3DRS_TWOSIDEDSTENCILMODE` with the `D3DRS_CCW_STENCIL*`
+operations (the counter-clockwise faces are the back ones), and the samplers' `D3DSAMP_MAXANISOTROPY`, `D3DSAMP_BORDERCOLOR`, `D3DSAMP_MIPMAPLODBIAS` and
+`D3DSAMP_MAXMIPLEVEL`; its caps say `D3DPRASTERCAPS_DEPTHBIAS`, `SLOPESCALEDEPTHBIAS`, `ANISOTROPY`, `D3DSTENCILCAPS_TWOSIDED`, `MaxAnisotropy` 16 and the border and mirror
+address modes.
+
+Tests: the conformance scenes "depth bias, float format", "depth bias, normalised formats", "two-sided stencil", "wireframe", "depth clip and clamp", "dual-source blending",
+"logic operations", "border colours" and "several viewports and SV_ViewportArrayIndex" (each with its pixels checked in `DxgkrnlTest`'s `test_conformance`, and all the same on
+real virglrenderer 1.3.0); `test_rasterizer_state` (the refusals, a device without the bits, the escape's tagged part); `test_viewports_from_vertex_shader`
+(`vs_viewport.dxbc`: the viewport and the layer from a vertex shader); d3d12test's `test_fixed_state` and d3d11test's `test_fixed_state`, `test_viewports` and
+`test_sampler_state` (Wine's `test_logic_op` table on an `R8G8B8A8_UINT` target, the depth formats' units, `MaxLOD` / `MinLOD` / `MipLODBias` of 0.3, anisotropy of 2 and 4
+on the CPU renderer).
+
 Not done, in the order a program is likely to meet them: texture formats of fewer than four channels, packed floats and block compression beyond BC1 - BC3 (above); a depth buffer read as a texture (shadow maps: virgl keeps textures and attachments in opposite row order, and the
 kernel refuses the combination); rendering into a mip level; unordered access to cubes, to mipmapped arrays and volumes (the kernel keeps one level of them), to narrow
-arrays or narrow textures with levels, to typed buffers; `CopyResource` of arrays, volumes and textures with levels; depth bias
-and back-face stencil state; dual-source blending (`SRC1_*` factors: the pipeline is refused with `DXGI_ERROR_UNSUPPORTED`); several viewports; more than four unordered
-access buffers; pipeline statistics queries from the DLL; shared resources across adapters (`D3D12_HEAP_FLAG_SHARED_CROSS_ADAPTER`,
+arrays or narrow textures with levels, to typed buffers; `CopyResource` of arrays, volumes and textures with levels; the layer and viewport from a vertex or domain shader
+on virgl, anisotropic filtering on virgl (virglrenderer 1.3.0 drops it), antialiased lines (`AntialiasedLineEnable`, `MultisampleEnable`'s line modes: lines are one pixel wide
+and aliased), separate minification and magnification filters (`MIN_POINT_MAG_LINEAR` and the like: a linear one makes both linear), `D3D12_SAMPLER_DESC2` (`CreateSampler2`,
+non-normalized coordinates); more than four unordered access buffers; pipeline statistics queries from the DLL; shared resources across adapters (`D3D12_HEAP_FLAG_SHARED_CROSS_ADAPTER`,
 `D3D12_FENCE_FLAG_SHARED_CROSS_ADAPTER`: `DXGI_ERROR_UNSUPPORTED`); the blend factor on Vega and the other fixed backends; ray tracing,
 mesh shaders, variable rate shading, view instancing, sampler feedback, protected sessions and meta commands (reported unsupported); `ResolveSubresourceRegion` into a
 subresource other than 0 and the least / greatest colour resolves on virgl (its resolves are averages: the call is left out there); typed UAV clears of formats outside

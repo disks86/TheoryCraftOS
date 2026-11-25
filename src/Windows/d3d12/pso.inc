@@ -337,6 +337,7 @@ struct Pso {
   int blend_constant;          /* a target blends with the blend factor (OMSetBlendFactor): the kernel pipelines are made for each factor too */
   D3D12_RASTERIZER_DESC raster;
   D3D12_DEPTH_STENCIL_DESC depth;
+  UINT8 back_read_mask, back_write_mask;      /* the back faces' stencil masks (D3D12_DEPTH_STENCIL_DESC2's own; else the front's) */
   UINT render_targets;
   DXGI_FORMAT rtv_formats[8];
   UINT slots_used;             /* the vertex buffers (input slots) the layout reads, as a mask */
@@ -604,6 +605,7 @@ static int vertex_format(DXGI_FORMAT f, UINT *bytes) {
 }
 
 static HRESULT blend_state_check(const Dev *dev, const D3D12_BLEND_DESC *b, UINT targets, int *constant);
+static HRESULT raster_state_check(const Dev *dev, const D3D12_RASTERIZER_DESC *r, const D3D12_DEPTH_STENCIL_DESC *z);
 static HRESULT STDMETHODCALLTYPE dev_CreateGraphicsPipelineState(Dev *This, const D3D12_GRAPHICS_PIPELINE_STATE_DESC *desc, REFIID riid, void **out) {
   extern const ID3D12PipelineStateVtbl pso_vtbl;
   if (!desc || !desc->pRootSignature || !desc->VS.pShaderBytecode) return E_INVALIDARG;
@@ -621,6 +623,12 @@ static HRESULT STDMETHODCALLTYPE dev_CreateGraphicsPipelineState(Dev *This, cons
   }
   p->raster = desc->RasterizerState;
   p->depth = desc->DepthStencilState;
+  p->back_read_mask = desc->DepthStencilState.StencilReadMask;
+  p->back_write_mask = desc->DepthStencilState.StencilWriteMask;
+  {
+    const HRESULT rh = raster_state_check(This, &desc->RasterizerState, &desc->DepthStencilState);
+    if (FAILED(rh)) { dx_Release(OBJ(p)); return rh; }
+  }
   p->render_targets = desc->NumRenderTargets;
   p->samples = desc->SampleDesc.Count > 1 ? desc->SampleDesc.Count : 1;
   memcpy(p->rtv_formats, desc->RTVFormats, sizeof p->rtv_formats);
@@ -751,32 +759,73 @@ static UINT blend_factor(UINT f) {
     case D3D12_BLEND_INV_BLEND_FACTOR: return 12;
     case D3D12_BLEND_ALPHA_FACTOR: return 13;            /* (ConstantAlpha: the factor's alpha in every channel) */
     case D3D12_BLEND_INV_ALPHA_FACTOR: return 14;
+    case D3D12_BLEND_SRC1_COLOR: return 15;              /* (dual-source blending: the pixel shader's SV_Target1) */
+    case D3D12_BLEND_INV_SRC1_COLOR: return 16;
+    case D3D12_BLEND_SRC1_ALPHA: return 17;
+    case D3D12_BLEND_INV_SRC1_ALPHA: return 18;
     default: return 1;
   }
 }
-/* What a blend factor needs: 0 nothing more, 1 the blend factor (OMSetBlendFactor), -1 something the kernel does not have (the second colour of dual-source blending)
- * or a value that is not a factor. */
+/* What a blend factor needs: 0 nothing more, 1 the blend factor (OMSetBlendFactor), 2 the pixel shader's second colour (dual-source blending), -1 a value that is not a factor. */
 static int blend_factor_need(UINT f) {
   if (f == D3D12_BLEND_BLEND_FACTOR || f == D3D12_BLEND_INV_BLEND_FACTOR || f == D3D12_BLEND_ALPHA_FACTOR || f == D3D12_BLEND_INV_ALPHA_FACTOR) return 1;
+  if (f >= D3D12_BLEND_SRC1_COLOR && f <= D3D12_BLEND_INV_SRC1_ALPHA) return 2;
   return (f >= D3D12_BLEND_ZERO && f <= D3D12_BLEND_SRC_ALPHA_SAT) ? 0 : -1;
 }
-/* The blend state's needs, over the targets that blend: E_INVALIDARG for a value that is no factor, DXGI_ERROR_UNSUPPORTED for dual-source blending and for the blend factor
- * on a device without it; *constant: some target uses the blend factor. */
+/* The blend state's needs, over the targets that blend: E_INVALIDARG for a value that is no factor, an operation that is none, a target that blends and has a logic
+ * operation, targets of independent blending with different logic operations (the kernel's pipeline has one) and dual-source blending into more than one target;
+ * DXGI_ERROR_UNSUPPORTED for dual-source blending, the blend factor and logic operations on a device without them. *constant: some target uses the blend factor. */
 static HRESULT blend_state_check(const Dev *dev, const D3D12_BLEND_DESC *b, UINT targets, int *constant) {
   *constant = 0;
+  int dual = 0, logic = 0;
   const UINT n = b->IndependentBlendEnable ? (targets ? targets : 1) : 1;
   for (UINT t = 0; t < n && t < 8; ++t) {
     const D3D12_RENDER_TARGET_BLEND_DESC *rt = &b->RenderTarget[t];
+    if (rt->LogicOpEnable) {
+      /* (one logic operation for every target: with independent blending each target must have the same) */
+      if (rt->BlendEnable || (UINT)rt->LogicOp > D3D12_LOGIC_OP_OR_INVERTED) return E_INVALIDARG;
+      logic = 1;
+    }
+    if (b->IndependentBlendEnable && t > 0 && (!rt->LogicOpEnable != !b->RenderTarget[0].LogicOpEnable || (rt->LogicOpEnable && rt->LogicOp != b->RenderTarget[0].LogicOp))) return E_INVALIDARG;
     if (!rt->BlendEnable) continue;
+    if (rt->BlendOp < D3D12_BLEND_OP_ADD || rt->BlendOp > D3D12_BLEND_OP_MAX || rt->BlendOpAlpha < D3D12_BLEND_OP_ADD || rt->BlendOpAlpha > D3D12_BLEND_OP_MAX) return E_INVALIDARG;
     const UINT factors[4] = {rt->SrcBlend, rt->DestBlend, rt->SrcBlendAlpha, rt->DestBlendAlpha};
     for (UINT k = 0; k < 4; ++k) {
       const int need = blend_factor_need(factors[k]);
-      if (need < 0) return factors[k] >= D3D12_BLEND_SRC1_COLOR && factors[k] <= D3D12_BLEND_INV_SRC1_ALPHA ? DXGI_ERROR_UNSUPPORTED : E_INVALIDARG;
-      if (need) *constant = 1;
+      if (need < 0) return E_INVALIDARG;
+      if (need == 1) *constant = 1;
+      if (need == 2) dual = 1;
     }
   }
+  if (dual && targets > 1) return E_INVALIDARG;      /* (dual-source blending writes one target: the second colour is a source of its blend) */
+  if (dual && !(dev->caps.features2 & DEV_FEATURE2_DUAL_SOURCE)) return DXGI_ERROR_UNSUPPORTED;
+  if (logic && !(dev->caps.features2 & DEV_FEATURE2_LOGIC_OPS)) return DXGI_ERROR_UNSUPPORTED;
   if (*constant && !(dev->caps.flags & KMT_CAPS_BLEND_CONSTANT)) return DXGI_ERROR_UNSUPPORTED;
   return S_OK;
+}
+/* The rasterizer and depth-stencil state beyond what every kernel pipeline has: E_INVALIDARG for values that are none, DXGI_ERROR_UNSUPPORTED on a device without it. */
+static HRESULT raster_state_check(const Dev *dev, const D3D12_RASTERIZER_DESC *r, const D3D12_DEPTH_STENCIL_DESC *z) {
+  if (r->FillMode != D3D12_FILL_MODE_WIREFRAME && r->FillMode != D3D12_FILL_MODE_SOLID) return E_INVALIDARG;
+  if (r->CullMode < D3D12_CULL_MODE_NONE || r->CullMode > D3D12_CULL_MODE_BACK) return E_INVALIDARG;
+  if (r->SlopeScaledDepthBias != r->SlopeScaledDepthBias || r->DepthBiasClamp != r->DepthBiasClamp) return E_INVALIDARG;
+  const D3D12_DEPTH_STENCILOP_DESC *faces[2] = {&z->FrontFace, &z->BackFace};
+  for (UINT f = 0; f < 2 && z->StencilEnable; ++f)
+    if (faces[f]->StencilFunc < D3D12_COMPARISON_FUNC_NEVER || faces[f]->StencilFunc > D3D12_COMPARISON_FUNC_ALWAYS || faces[f]->StencilFailOp < D3D12_STENCIL_OP_KEEP ||
+        faces[f]->StencilFailOp > D3D12_STENCIL_OP_DECR || faces[f]->StencilDepthFailOp < D3D12_STENCIL_OP_KEEP || faces[f]->StencilDepthFailOp > D3D12_STENCIL_OP_DECR ||
+        faces[f]->StencilPassOp < D3D12_STENCIL_OP_KEEP || faces[f]->StencilPassOp > D3D12_STENCIL_OP_DECR)
+      return E_INVALIDARG;
+  if ((r->FillMode == D3D12_FILL_MODE_WIREFRAME || r->DepthBias || r->SlopeScaledDepthBias != 0.0f || !r->DepthClipEnable ||
+       (z->StencilEnable && memcmp(&z->FrontFace, &z->BackFace, sizeof z->FrontFace) != 0)) && !(dev->caps.features2 & DEV_FEATURE2_RASTERIZER_STATE))
+    return DXGI_ERROR_UNSUPPORTED;
+  return S_OK;
+}
+/* The bits of a depth format's unit of depth bias (D3D12_RASTERIZER_DESC::DepthBias): 16 and 24 for the normalised formats, 0 for the float ones (and none). */
+static UINT depth_bias_bits(DXGI_FORMAT f) {
+  switch (f) {
+    case DXGI_FORMAT_D16_UNORM: case DXGI_FORMAT_R16_TYPELESS: case DXGI_FORMAT_R16_UNORM: return 16;
+    case DXGI_FORMAT_D24_UNORM_S8_UINT: case DXGI_FORMAT_R24G8_TYPELESS: case DXGI_FORMAT_R24_UNORM_X8_TYPELESS: return 24;
+    default: return 0;
+  }
 }
 static UINT blend_op(UINT o) { return o >= 1 && o <= 5 ? o - 1 : 0; }
 static UINT cmp_func(UINT f) { return f >= 1 && f <= 8 ? f - 1 : 7; }
@@ -893,7 +942,13 @@ static UINT pso_pipeline_locked(Pso *p, const UINT strides[8], UINT stencil_ref,
   for (UINT i = 0; i < p->attr_count; ++i)
     if (p->attrs[i].slot > max_slot) max_slot = p->attrs[i].slot;
   const UINT more_blends = p->blend.IndependentBlendEnable && p->render_targets > 4 ? p->render_targets - 4 : 0;
-  if (p->attr_count > 4 || max_slot > 0 || more_blends || p->blend_constant) {
+  /* (the rasterizer state of the tagged part: a fill mode, depth bias, depth clipping, the back faces' stencil and a logic operation other than the plain ones) */
+  const D3D12_DEPTH_STENCILOP_DESC *back = &p->depth.BackFace, *front = &p->depth.FrontFace;
+  const int separate_back = p->depth.StencilEnable && (memcmp(back, front, sizeof *back) != 0 || p->back_read_mask != p->depth.StencilReadMask || p->back_write_mask != p->depth.StencilWriteMask);
+  const int bias = p->dsv_format != DXGI_FORMAT_UNKNOWN && (p->raster.DepthBias != 0 || p->raster.SlopeScaledDepthBias != 0.0f);
+  const int logic = rt->LogicOpEnable;      /* (every target's: blend_state_check) */
+  const int raster_part = p->raster.FillMode == D3D12_FILL_MODE_WIREFRAME || bias || !p->raster.DepthClipEnable || separate_back || logic;
+  if (p->attr_count > 4 || max_slot > 0 || more_blends || p->blend_constant || raster_part) {
     if (!p->so_entries) r[w++] = 0;
     const UINT extra = p->attr_count > 4 ? p->attr_count - 4 : 0;
     r[w++] = extra;
@@ -924,8 +979,27 @@ static UINT pso_pipeline_locked(Pso *p, const UINT strides[8], UINT stencil_ref,
       r[w++] = blend_op(b->BlendOpAlpha);
       r[w++] = b->RenderTargetWriteMask & format_write_mask(p->rtv_formats[4 + k]);
     }
-    if (p->blend_constant)
+    if (p->blend_constant || raster_part)
       for (UINT c = 0; c < 4; ++c) r[w++] = bits_of(factor[c]);      /* (the colour of the constant blend factors) */
+    if (raster_part) {
+      r[w++] = 0x31545352u;      /* 'RST1' (dxgk::kPipelineRasterTag), and its 15 words */
+      r[w++] = 15;
+      r[w++] = p->raster.FillMode == D3D12_FILL_MODE_WIREFRAME ? 1 : 0;
+      r[w++] = p->raster.DepthClipEnable ? 1 : 0;
+      r[w++] = bias ? (UINT)p->raster.DepthBias : 0;
+      r[w++] = bias ? bits_of(p->raster.SlopeScaledDepthBias) : 0;
+      r[w++] = bias ? bits_of(p->raster.DepthBiasClamp) : 0;
+      r[w++] = depth_bias_bits(p->dsv_format);
+      r[w++] = separate_back ? 1 : 0;
+      r[w++] = cmp_func(back->StencilFunc);
+      r[w++] = stencil_op(back->StencilFailOp);
+      r[w++] = stencil_op(back->StencilDepthFailOp);
+      r[w++] = stencil_op(back->StencilPassOp);
+      r[w++] = p->back_read_mask;
+      r[w++] = p->back_write_mask;
+      r[w++] = logic ? 1 : 0;
+      r[w++] = logic ? (UINT)rt->LogicOp : 4;      /* (D3D12_LOGIC_OP and graphics::LogicOp are numbered alike) */
+    }
   }
   UINT reply[1] = {0};
   if (!KMT_OK(dev_escape(p->d.dev, r, w, reply, 1))) return 0;

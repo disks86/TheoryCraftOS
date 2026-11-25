@@ -205,6 +205,8 @@ bool write_triangle(Env& e, Handle vb, float r, float g, float b) {
   return e.write(vb, floats(v, 21));
 }
 
+bool close8(uint32_t a, uint32_t b, uint32_t tolerance = 2) { return (a > b ? a - b : b - a) <= tolerance; }
+
 void test_handle_table() {
   HostAllocator a;
   HandleTable<int> t(a, 3);
@@ -7224,6 +7226,69 @@ void test_conformance() {
       if (__builtin_strstr(r.name, "cube texture"))
         CHECK(px(2, 16) == 0xfa0000 && px(12, 16) == 0x006464 && px(22, 16) == 0x004000 && px(2, 0) == 0x640064 && px(12, 0) == 0x000064 && px(22, 0) == 0xfafa00);   // +X -X +Y, -Y +Z -Z
     }
+    if (r.device_picture && getenv("DXGK_DUMP_SCENE") && __builtin_strstr(r.name, getenv("DXGK_DUMP_SCENE"))) {
+      // (DXGK_DUMP_SCENE=<part of a name>: the scene's picture, a pixel a word)
+      printf("  %s:\n", r.name);
+      for (uint32_t y = 0; y < 32; ++y) {
+        for (uint32_t x = 0; x < 32; ++x) printf("%08x ", r.device_picture[y * 32 + x]);
+        printf("\n");
+      }
+    }
+    if (r.device_picture) {
+      // The rasterizer, depth-stencil and blend state of Direct3D 10 / 11 (Conformance.cpp says what each scene draws).
+      auto px = [&](uint32_t x, uint32_t y) { return r.device_picture[y * 32 + x] & 0xFFFFFF; };
+      auto argb = [&](uint32_t x, uint32_t y) { return r.device_picture[y * 32 + x]; };
+      auto count = [&](uint32_t colour) {
+        uint32_t n = 0;
+        for (uint32_t i = 0; i < 32 * 32; ++i) n += (r.device_picture[i] & 0xFFFFFF) == colour;
+        return n;
+      };
+      // (the scenes' vertex shaders have +y up: a clip-space y of -1 is the bottom row, so the rows the scenes describe are counted from the bottom here)
+      auto at = [&](uint32_t x, uint32_t y_from_bottom) { return px(x, 31 - y_from_bottom); };
+      auto at_argb = [&](uint32_t x, uint32_t y_from_bottom) { return argb(x, 31 - y_from_bottom); };
+      if (!__builtin_strcmp(r.name, "Direct3D 10 depth bias, float format")) {
+        for (uint32_t x : {1u, 16u, 30u}) CHECK(at(x, 3) == 0x00FF00 && at(x, 11) == 0xFF0000 && at(x, 19) == 0x0000FF && at(x, 27) == 0xFF0000);
+      }
+      if (!__builtin_strcmp(r.name, "Direct3D 10 depth bias, normalised formats")) {
+        for (uint32_t x : {1u, 16u, 30u}) CHECK(at(x, 3) == 0xFF0000 && at(x, 9) == 0x00FF00 && at(x, 16) == 0x00FF00 && at(x, 22) == 0xFF0000 && at(x, 29) == 0x0000FF);
+      }
+      if (!__builtin_strcmp(r.name, "Direct3D 10 two-sided stencil")) {
+        // (the left triangle faces away: its stencil is inverted to 0x0F, which the back faces' test finds; the right one's is 1)
+        CHECK(at(4, 15) == 0xFFFFFF && at(28, 15) == 0x00FF00 && at(16, 2) == 0 && at(16, 30) == 0);
+      }
+      if (!__builtin_strcmp(r.name, "Direct3D 10 wireframe")) {
+        // (edges only: the triangles' insides stay black; the third triangle faces away and is culled)
+        CHECK(count(0xFF0000) >= 30 && count(0x00FF00) >= 30 && count(0x0000FF) == 0 && at(6, 15) == 0 && at(26, 15) == 0);
+      }
+      if (!__builtin_strcmp(r.name, "Direct3D 10 depth clip and clamp")) {
+        // (left: cut where the depth passes 1 or 0 - at half the height of each triangle; right: all of it)
+        CHECK(at(8, 3) == 0xFF0000 && at(8, 13) == 0 && at(24, 3) == 0x00FF00 && at(24, 13) == 0x00FF00);
+        CHECK(at(8, 19) == 0x0000FF && at(8, 29) == 0 && at(24, 19) == 0xFFFF00 && at(24, 29) == 0xFFFF00);
+      }
+      if (!__builtin_strcmp(r.name, "Direct3D 10 dual-source blending (DXBC)")) {
+        // (0.6, 0.2, 0.1) + 0.5 * (0.1, 0.2, 0.6) = (0.65, 0.3, 0.4); alpha 1 + 0.5 * (1 - 1)
+        const uint32_t c = argb(16, 16);
+        CHECK(close8(c >> 16 & 0xFF, 166) && close8(c >> 8 & 0xFF, 77) && close8(c & 0xFF, 102) && (c >> 24) == 0xFF);
+        CHECK(argb(1, 30) == 0xFF808080u);
+      }
+      if (!__builtin_strcmp(r.name, "Direct3D 10 border colours (DXBC)")) {
+        // (the corners are the border's colour, (0.2, 0.4, 0.6) - point filtered on the left, linear on the right; the middle of each half is the checker)
+        CHECK(px(1, 1) == 0x336699 && px(14, 30) == 0x336699 && px(17, 1) == 0x336699 && px(30, 30) == 0x336699);
+        CHECK(px(8, 16) != 0x336699 && px(24, 16) != 0x336699 && px(8, 16) != 0);
+      }
+      if (!__builtin_strcmp(r.name, "Direct3D 10 several viewports and SV_ViewportArrayIndex (DXBC)")) {
+        // (red in the left half above row 20 - its scissor rectangle -, green in the right half, blue in the middle of the left half; nothing in the left half below the scissor)
+        CHECK(px(2, 2) == 0xFF0000 && px(29, 2) == 0x00FF00 && px(29, 29) == 0x00FF00 && px(8, 14) == 0x0000FF && px(2, 28) == 0 && px(14, 25) == 0);
+      }
+      if (!__builtin_strcmp(r.name, "Direct3D 11.1 logic operations")) {
+        // clear (33 66 99 ff); XOR (ff 66 00 ff) -> (cc 00 99 00); OR_INVERTED of (33 ff cc ff) on the right; SET of green and alpha in the corner
+        CHECK(at_argb(4, 4) == 0x00CC0099u);       // (XOR alone)
+        CHECK(at_argb(29, 20) == 0xFFFF66BBu);     // (OR_INVERTED over the clear colour: ff 66 bb ff, as ARGB ff ff 66 bb)
+        CHECK(at_argb(20, 4) == 0x00CC00BBu);      // (OR_INVERTED over the XOR: cc 00 bb 00)
+        CHECK(at_argb(2, 29) == 0xFF33FF99u);      // (SET of green and alpha over the clear colour)
+        CHECK(at_argb(16, 1) == 0xFF336699u);      // (nothing drawn)
+      }
+    }
     if (__builtin_strstr(r.name, "independent blend")) {
       // In the overlap target 0 (even columns) holds both triangles added to the grey (red 0.1 + 0.5 + 0.1 ~ 0xb4), target 1 (odd ones) the second triangle alone, red and blue
       // swapped (0.3, 0.4, 0.1 ~ 4d 66 1a); where only the first triangle is, target 0 shows 9a 34 34 and target 1 its swap.
@@ -7969,7 +8034,191 @@ void test_topologies() {
 
 // --- Direct3D 10 pipeline state, instancing, lines and points -------------------------------------------------------------------------------------------------------------
 
-bool close8(uint32_t a, uint32_t b, uint32_t tolerance = 2) { return (a > b ? a - b : b - a) <= tolerance; }
+
+// The rasterizer state of Direct3D 10+ (kFeature2RasterizerState), dual-source blending and logic operations: what is refused, by a device without them and as values, and the
+// escape's tagged part (the same pipeline through the escape draws the same picture). The pictures themselves are the conformance scenes'.
+void test_rasterizer_state() {
+  Env e;
+  auto shaders = [](Kernel& kernel, Handle dev, PipelineDesc* pd) {
+    Handle vs = 0, fs = 0;
+    CHECK(kernel.create_shader(kPid, dev, {ShaderKind::ColoredVertex, graphics::ShaderStage::Vertex, {}}, &vs) == status::kSuccess);
+    CHECK(kernel.create_shader(kPid, dev, {ShaderKind::ColoredFragment, graphics::ShaderStage::Fragment, {}}, &fs) == status::kSuccess);
+    graphics::GraphicsPipelineDesc gd;
+    graphics::describe_colored_pipeline(&gd);
+    pd->vertex_shader = vs, pd->fragment_shader = fs, pd->vertex_stride = gd.vertex_stride, pd->attribute_count = 2, pd->varying_count = 1;
+    pd->attributes[0] = gd.attributes[0], pd->attributes[1] = gd.attributes[1];
+    pd->cull_mode = graphics::CullMode::None;
+  };
+  auto make = [&](Kernel& kernel, Handle dev, PipelineDesc pd) {
+    shaders(kernel, dev, &pd);
+    Handle h = 0;
+    return kernel.create_pipeline(kPid, dev, pd, &h);
+  };
+  PipelineDesc wire, bias, clamp, two_sided, logic, dual;
+  wire.fill_mode = graphics::FillMode::Wireframe;
+  bias.depth_bias.constant = 4, bias.depth_bias.slope = 1.5f, bias.depth_bias.unorm_bits = 24;
+  clamp.depth_clip = false;
+  two_sided.separate_back_stencil = true, two_sided.back_stencil.pass_op = graphics::StencilOp::Invert;
+  logic.logic_op_enable = true, logic.logic_op = graphics::LogicOp::Xor;
+  dual.blend.custom = dual.blend.enable = true, dual.blend.dst_color = graphics::BlendFactor::InvSrc1Color;
+  for (const PipelineDesc& pd : {wire, bias, clamp, two_sided, logic, dual}) CHECK(make(e.kernel, e.dev, pd) == status::kSuccess);
+  // (values that are none)
+  PipelineDesc bad = bias;
+  bad.depth_bias.unorm_bits = 8;
+  CHECK(make(e.kernel, e.dev, bad) == status::kInvalidParameter);
+  bad = logic, bad.logic_op = static_cast<graphics::LogicOp>(16);
+  CHECK(make(e.kernel, e.dev, bad) == status::kInvalidParameter);
+  bad = dual, bad.color_target_count = 2;   // (dual-source blending into more than one target)
+  CHECK(make(e.kernel, e.dev, bad) == status::kInvalidParameter);
+  bad = bias, bad.depth_bias.slope = __builtin_nanf("");
+  CHECK(make(e.kernel, e.dev, bad) == status::kInvalidParameter);
+  // A device without the state refuses each of them, and makes the pipelines that do not use it.
+  {
+    FakeScreen screen(8, 6);
+    graphics::SoftwareDevice software(e.allocator, &screen);
+    SpyDevice limited(software);
+    limited.feature2_mask = ~(graphics::kFeature2RasterizerState | graphics::kFeature2DualSourceBlend | graphics::kFeature2LogicOps);
+    Kernel kernel(e.allocator);
+    AdapterConfig c;
+    c.display = &screen;
+    kernel.add_adapter(limited, c);
+    Handle adapter = 0, dev = 0;
+    CHECK(kernel.open_process(kPid) == status::kSuccess && kernel.open_adapter_from_index(kPid, 0, &adapter) == status::kSuccess && kernel.create_device(kPid, adapter, &dev) == status::kSuccess);
+    for (const PipelineDesc& pd : {wire, bias, clamp, two_sided, logic, dual}) CHECK(make(kernel, dev, pd) == status::kNotSupported);
+    PipelineDesc off = dual;
+    off.blend.enable = false;   // (blending off: the factors are not used)
+    CHECK(make(kernel, dev, off) == status::kSuccess && make(kernel, dev, PipelineDesc()) == status::kSuccess);
+  }
+  // The escape's tagged part: a wireframe, XOR pipeline drawn both ways gives the same picture, which differs from the plain one.
+  {
+    Handle rt = e.alloc(kTarget, Format::A8R8G8B8, 16, 16), vb = e.buffer(kAllocVertexBuffer, 256);
+    const float tri[21] = {-0.8f, -0.7f, 0.5f, 1, 0.4f, 0, 1, 0.7f, -0.6f, 0.5f, 1, 0.4f, 0, 1, -0.1f, 0.8f, 0.5f, 1, 0.4f, 0, 1};
+    CHECK(e.write(vb, floats(tri, 21)));
+    const float identity[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+    auto picture = [&](Handle pipe) {
+      CommandWriter w(e.allocator);
+      w.begin_pass(0, kNoAllocation, kPassClearColor, {0.2f, 0.4f, 0.6f, 1.0f}, 1, 0);
+      w.bind_pipeline(pipe);
+      w.bind_vertex_buffer(1);
+      w.push_constants(floats(identity, 16));
+      w.draw(3);
+      w.end_pass();
+      CHECK(e.render(w, {rt, vb}) == status::kSuccess);
+      std::vector<uint32_t> out;
+      for (uint32_t y = 0; y < 16; ++y)
+        for (uint32_t x = 0; x < 16; ++x) out.push_back(e.pixel(rt, x, y));
+      return out;
+    };
+    PipelineDesc both = wire;
+    both.logic_op_enable = true, both.logic_op = graphics::LogicOp::Xor;
+    shaders(e.kernel, e.dev, &both);
+    Handle direct = 0;
+    CHECK(e.kernel.create_pipeline(kPid, e.dev, both, &direct) == status::kSuccess);
+    ByteBuffer req(e.allocator);
+    req.put32(static_cast<uint32_t>(EscapeOp::CreatePipeline)), req.put32(both.vertex_shader), req.put32(both.fragment_shader), req.put32(28), req.put32(2), req.put32(1), req.put32(0);
+    req.put32(0), req.put32(0), req.put32(0);   // cull none, front face, flags
+    for (uint32_t w : {0u, 2u, 0u, 1u, 3u, 12u, 0u, 0u, 0u, 0u, 0u, 0u}) req.put32(w);
+    for (uint32_t w : {0u, 7u, 0u, 0u, 0u, 255u, 255u, 0u}) req.put32(w);                  // stencil off
+    for (uint32_t w : {3u, 0u, 0u, 1u, 0u, 1u, 0u, 0u, 0u, 15u, 0u}) req.put32(w);         // depth compare, no blending, no per-instance attributes
+    req.put32(1), req.put32(0);                                                                // one colour output, no independent blending
+    for (uint32_t t = 0; t < 3; ++t)
+      for (uint32_t w : {0u, 0u, 1u, 0u, 1u, 0u, 0u, 0u, 15u}) req.put32(w);
+    req.put32(0), req.put32(0), req.put32(0), req.put32(0), req.put32(0);                     // multisample, geometry, hull, domain shaders, no stream output
+    req.put32(0), req.put32(0), req.put32(0), req.put32(0), req.put32(0);                     // no more attributes, instances, slots, strides or blends
+    for (uint32_t c = 0; c < 4; ++c) req.put32(0);                                            // the constant colour
+    const uint64_t tagged = req.view().size();
+    req.put32(kPipelineRasterTag), req.put32(kPipelineRasterWords);
+    for (uint32_t w : {1u, 1u, 0u, 0u, 0u, 0u, 0u, 7u, 0u, 0u, 0u, 255u, 255u, 1u, static_cast<uint32_t>(graphics::LogicOp::Xor)}) req.put32(w);
+    uint8_t reply[16];
+    uint32_t reply_bytes = 0;
+    CHECK(e.kernel.escape(kPid, e.dev, req.view(), ByteView(reply, sizeof reply), &reply_bytes) == status::kSuccess && reply_bytes == 4);
+    const Handle via_escape = ByteReader(ConstByteView(reply, 4)).le32();
+    const std::vector<uint32_t> a = picture(via_escape), b = picture(direct);
+    PipelineDesc plain;
+    shaders(e.kernel, e.dev, &plain);
+    Handle plain_pipe = 0;
+    CHECK(e.kernel.create_pipeline(kPid, e.dev, plain, &plain_pipe) == status::kSuccess);
+    CHECK(!a.empty() && a == b && a != picture(plain_pipe));
+    // (the outline only: the middle of the triangle keeps the clear colour)
+    CHECK(!a.empty() && (a[8 * 16 + 7] & 0xFFFFFF) == 0x336699);
+    // A part of the wrong size, an unknown tag and a value that is none are refused.
+    auto patched = [&](uint64_t offset, uint32_t value) {
+      ByteBuffer copy(e.allocator);
+      CHECK(copy.append(req.view()) && copy.patch32(offset, value));
+      return e.kernel.escape(kPid, e.dev, copy.view(), ByteView(reply, sizeof reply), &reply_bytes);
+    };
+    CHECK(patched(tagged + 4, kPipelineRasterWords - 1) == status::kInvalidParameter);
+    CHECK(patched(tagged, 0x12345678u) == status::kInvalidParameter);
+    CHECK(patched(tagged + 8 + 5 * 4, 12) == status::kInvalidParameter);   // (the depth format's bits: 12)
+    CHECK(patched(tagged + 8 + 14 * 4, 16) == status::kInvalidParameter);  // (logic operation 16)
+  }
+}
+
+// SV_ViewportArrayIndex and SV_RenderTargetArrayIndex written by a vertex shader (vs_viewport.dxbc: the colour's alpha says them), kFeature2LayerFromAnyStage; a device without it refuses the
+// shader, and one without several viewports a stream that sets them.
+void test_viewports_from_vertex_shader() {
+  Env e;
+  const std::vector<uint8_t> vs_code = read_blob("vs_viewport.dxbc"), ps_code = read_blob("ps_color.dxbc");
+  CHECK(!vs_code.empty() && !ps_code.empty());
+  Handle vs = 0, ps = 0, pipe = 0;
+  CHECK(e.kernel.create_shader(kPid, e.dev, {ShaderKind::Dxbc, graphics::ShaderStage::Vertex, ConstByteView(vs_code.data(), vs_code.size())}, &vs) == status::kSuccess);
+  CHECK(e.kernel.create_shader(kPid, e.dev, {ShaderKind::Dxbc, graphics::ShaderStage::Fragment, ConstByteView(ps_code.data(), ps_code.size())}, &ps) == status::kSuccess);
+  PipelineDesc pd;
+  pd.vertex_shader = vs, pd.fragment_shader = ps, pd.vertex_stride = 28, pd.attribute_count = 2, pd.varying_count = 3;
+  pd.attributes[0] = {0, graphics::VertexFormat::Float3, 0};
+  pd.attributes[1] = {1, graphics::VertexFormat::Float4, 12};
+  pd.cull_mode = graphics::CullMode::None;
+  CHECK(e.kernel.create_pipeline(kPid, e.dev, pd, &pipe) == status::kSuccess);
+  // Two layers of 16 x 16; viewports: the left and the right half. A red triangle to viewport 0 layer 0 (alpha 0), a green one to viewport 1 layer 0 (alpha 0.5), a blue one to
+  // viewport 1 layer 1 (alpha 0.625).
+  AllocationDesc ad;
+  ad.flags = kAllocTexture | kAllocRenderTarget, ad.format = Format::A8R8G8B8, ad.width = 16, ad.height = 16, ad.kind = graphics::TextureKind::Texture2DArray, ad.layers = 2;
+  Handle rt = 0;
+  CHECK(e.kernel.create_allocation(kPid, e.dev, ad, &rt) == status::kSuccess);
+  Handle vb = e.buffer(kAllocVertexBuffer, 256);
+  const float tri[63] = {-1, -1, 0.5f, 1, 0, 0, 0, 3, -1, 0.5f, 1, 0, 0, 0, -1, 3, 0.5f, 1, 0, 0, 0,
+                         -1, -1, 0.5f, 0, 1, 0, 0.5f, 3, -1, 0.5f, 0, 1, 0, 0.5f, -1, 3, 0.5f, 0, 1, 0, 0.5f,
+                         -1, -1, 0.5f, 0, 0, 1, 0.625f, 3, -1, 0.5f, 0, 0, 1, 0.625f, -1, 3, 0.5f, 0, 0, 1, 0.625f};
+  CHECK(e.write(vb, floats(tri, 63)));
+  const float identity[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+  const graphics::Viewport viewports[2] = {{0, 0, 8, 16, 0, 1}, {8, 0, 8, 16, 0, 1}};
+  CommandWriter w(e.allocator);
+  w.begin_pass_layers(0, {}, kNoAllocation, kPassClearColor, {0, 0, 0, 1}, 1, 0, {0, 2, 0, 1});
+  w.bind_pipeline(pipe);
+  w.bind_vertex_buffer(1);
+  w.push_constants(floats(identity, 16));
+  w.set_viewports(ArrayView<const graphics::Viewport>(viewports, 2));
+  w.draw(9);
+  w.end_pass();
+  CHECK(w.ok() && e.render(w, {rt, vb}) == status::kSuccess);
+  // (the layers one after the other in the allocation's memory, 16 x 16 pixels each)
+  auto at = [&](uint32_t layer, uint32_t x, uint32_t y) {
+    LockResult l;
+    uint32_t out = 0xDEADBEEFu;
+    if (e.kernel.lock(kPid, rt, kLockReadOnly, 0, &l) == status::kSuccess) {
+      ByteReader in(l.data.subview(uint64_t{layer} * 16 * 16 * 4 + (uint64_t{y} * 16 + x) * 4, 4));
+      out = in.le32() & 0xFFFFFF;
+      e.kernel.unlock(kPid, rt);
+    }
+    return out;
+  };
+  if (!(at(0, 3, 8) == 0xFF0000 && at(0, 12, 8) == 0x00FF00 && at(1, 3, 8) == 0 && at(1, 12, 8) == 0x0000FF))
+    printf("  viewports from the vertex shader: %06x %06x / %06x %06x\n", at(0, 3, 8), at(0, 12, 8), at(1, 3, 8), at(1, 12, 8));
+  CHECK(at(0, 3, 8) == 0xFF0000 && at(0, 12, 8) == 0x00FF00 && at(1, 3, 8) == 0 && at(1, 12, 8) == 0x0000FF);
+  // A device without the layer from the vertex shader refuses it; one without several viewports, a stream that sets two.
+  FakeScreen screen(8, 6);
+  graphics::SoftwareDevice software(e.allocator, &screen);
+  SpyDevice limited(software);
+  limited.feature2_mask = ~(graphics::kFeature2LayerFromAnyStage | graphics::kFeature2Viewports);
+  Kernel kernel(e.allocator);
+  AdapterConfig c;
+  c.display = &screen;
+  kernel.add_adapter(limited, c);
+  Handle adapter = 0, dev = 0, ctx = 0, shader = 0;
+  CHECK(kernel.open_process(kPid) == status::kSuccess && kernel.open_adapter_from_index(kPid, 0, &adapter) == status::kSuccess && kernel.create_device(kPid, adapter, &dev) == status::kSuccess);
+  CHECK(kernel.create_context(kPid, dev, ContextPriority::Normal, &ctx) == status::kSuccess);
+  CHECK(kernel.create_shader(kPid, dev, {ShaderKind::Dxbc, graphics::ShaderStage::Vertex, ConstByteView(vs_code.data(), vs_code.size())}, &shader) == status::kNotSupported);
+}
 
 void test_d3d10_state() {
   Env e;
@@ -8519,6 +8768,8 @@ int main() {
   test_dxbc_loops();
   test_topologies();
   test_d3d10_state();
+  test_rasterizer_state();
+  test_viewports_from_vertex_shader();
   test_dxbc_system_values();
   test_device_forms();
   test_sm3_and_sm51();

@@ -135,8 +135,9 @@ struct CmdList {
   struct { UINT alloc, stride; UINT64 offset, size; } vb[8];      /* the vertex buffers (input slots) */
   UINT ib_alloc, ib_format;
   UINT64 ib_offset;
-  D3D12_VIEWPORT viewport;
-  D3D12_RECT scissor;
+  D3D12_VIEWPORT viewports[16];      /* (D3D12_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE; the kernel's device takes them all with DEV_FEATURE2_VIEWPORTS, else the first) */
+  D3D12_RECT scissors[16];
+  UINT viewport_count, scissor_count;
   int have_viewport, have_scissor;
   UINT stencil_ref;
   float blend_factor[4];       /* OMSetBlendFactor (0, 0, 0, 0 when the list is reset) */
@@ -699,15 +700,28 @@ static int prepare_draw(CmdList *l, int indexed) {
     l->sent_ib_offset = l->ib_offset;
     l->sent_ib_format = l->ib_format;
   }
+  const UINT several = (l->d.dev->caps.features2 & DEV_FEATURE2_VIEWPORTS) ? 16u : 1u;
   if (l->have_viewport && !l->sent_viewport) {
-    UINT w[6] = {bits_of(l->viewport.TopLeftX), bits_of(l->viewport.TopLeftY), bits_of(l->viewport.Width), bits_of(l->viewport.Height), bits_of(l->viewport.MinDepth), bits_of(l->viewport.MaxDepth)};
-    packet(l, OP_SET_VIEWPORT, w, 6);
+    UINT w[6 * 16];
+    const UINT n = l->viewport_count < several ? l->viewport_count : several;
+    for (UINT i = 0; i < n; ++i) {
+      const D3D12_VIEWPORT *v = &l->viewports[i];
+      const UINT words[6] = {bits_of(v->TopLeftX), bits_of(v->TopLeftY), bits_of(v->Width), bits_of(v->Height), bits_of(v->MinDepth), bits_of(v->MaxDepth)};
+      memcpy(w + 6 * i, words, sizeof words);
+    }
+    packet(l, OP_SET_VIEWPORT, w, 6 * n);
     l->sent_viewport = 1;
   }
   if (l->have_scissor && !l->sent_scissor) {
-    LONG width = l->scissor.right - l->scissor.left, height = l->scissor.bottom - l->scissor.top;
-    UINT w[4] = {(UINT)l->scissor.left, (UINT)l->scissor.top, width > 0 ? (UINT)width : 0, height > 0 ? (UINT)height : 0};
-    packet(l, OP_SET_SCISSOR, w, 4);
+    UINT w[4 * 16];
+    const UINT n = l->scissor_count < several ? l->scissor_count : several;
+    for (UINT i = 0; i < n; ++i) {
+      const D3D12_RECT *r = &l->scissors[i];
+      const LONG width = r->right - r->left, height = r->bottom - r->top;
+      const UINT words[4] = {(UINT)r->left, (UINT)r->top, width > 0 ? (UINT)width : 0, height > 0 ? (UINT)height : 0};
+      memcpy(w + 4 * i, words, sizeof words);
+    }
+    packet(l, OP_SET_SCISSOR, w, 4 * n);
     l->sent_scissor = 1;
   }
   return 1;
@@ -759,15 +773,21 @@ static void STDMETHODCALLTYPE list_SetPipelineState(CmdList *l, ID3D12PipelineSt
   keep(l, (IUnknown *)p);
 }
 static void STDMETHODCALLTYPE list_IASetPrimitiveTopology(CmdList *l, D3D12_PRIMITIVE_TOPOLOGY t) { BUNDLE_LOG(l, B_TOPOLOGY, t); l->topology = t; }
+/* (up to D3D12_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE: a primitive is drawn with the pair its SV_ViewportArrayIndex names; more than that is the debug layer's error,
+ * and the first sixteen are taken) */
 static void STDMETHODCALLTYPE list_RSSetViewports(CmdList *l, UINT n, const D3D12_VIEWPORT *v) {
   if (!n || !v) return;
-  l->viewport = v[0];
+  if (n > 16) n = 16;
+  memcpy(l->viewports, v, (SIZE_T)n * sizeof *v);
+  l->viewport_count = n;
   l->have_viewport = 1;
   l->sent_viewport = 0;
 }
 static void STDMETHODCALLTYPE list_RSSetScissorRects(CmdList *l, UINT n, const D3D12_RECT *r) {
   if (!n || !r) return;
-  l->scissor = r[0];
+  if (n > 16) n = 16;
+  memcpy(l->scissors, r, (SIZE_T)n * sizeof *r);
+  l->scissor_count = n;
   l->have_scissor = 1;
   l->sent_scissor = 0;
 }

@@ -57,6 +57,7 @@ static ID3D12PipelineState *pipeline_get(Dev *d, Ctx *c) {
   key.ds = c->ds ? c->ds->c.id : 0;
   key.layout = c->layout ? c->layout->c.id : 0;
   key.blend = c->blend ? c->blend->desc : default_blend();
+  key.logic_op = c->blend && c->blend->desc1.RenderTarget[0].LogicOpEnable ? (UINT)c->blend->desc1.RenderTarget[0].LogicOp + 1 : 0;
   key.depth = c->depth ? c->depth->desc : g_default_depth;
   key.raster = c->raster ? c->raster->desc : g_default_raster;
   key.raster.ScissorEnable = 0;      /* (not the pipeline's: the scissor rectangle is set with the viewport) */
@@ -68,7 +69,7 @@ static ID3D12PipelineState *pipeline_get(Dev *d, Ctx *c) {
     if (c->rtv[i]->tex->desc.SampleDesc.Count > 1) key.samples = c->rtv[i]->tex->desc.SampleDesc.Count;
   }
   if (c->dsv) {
-    key.depth_format = c->dsv->tex->stored;
+    key.depth_format = c->dsv->tex->desc.Format;      /* (the program's format: a depth bias counts in its unit, D16 and D32 being kept alike) */
     if (c->dsv->tex->desc.SampleDesc.Count > 1) key.samples = c->dsv->tex->desc.SampleDesc.Count;
   }
   if (!c->dsv) { key.depth.DepthEnable = FALSE; key.depth.StencilEnable = FALSE; }
@@ -77,7 +78,7 @@ static ID3D12PipelineState *pipeline_get(Dev *d, Ctx *c) {
     Pipeline *p = &d->pipelines[i];
     if (p->vs == key.vs && p->ps == key.ps && p->gs == key.gs && p->hs == key.hs && p->ds == key.ds && p->layout == key.layout && p->targets == key.targets && p->has_depth == key.has_depth && p->samples == key.samples &&
         memcmp(p->formats, key.formats, sizeof key.formats) == 0 && p->depth_format == key.depth_format &&
-        memcmp(&p->blend, &key.blend, sizeof key.blend) == 0 && memcmp(&p->depth, &key.depth, sizeof key.depth) == 0 && memcmp(&p->raster, &key.raster, sizeof key.raster) == 0) {
+        memcmp(&p->blend, &key.blend, sizeof key.blend) == 0 && p->logic_op == key.logic_op && memcmp(&p->depth, &key.depth, sizeof key.depth) == 0 && memcmp(&p->raster, &key.raster, sizeof key.raster) == 0) {
       p->last_used = ++d->pipeline_clock;
       return p->state;
     }
@@ -114,7 +115,8 @@ static ID3D12PipelineState *pipeline_get(Dev *d, Ctx *c) {
     out->SrcBlendAlpha = (D3D12_BLEND)in->SrcBlendAlpha;
     out->DestBlendAlpha = (D3D12_BLEND)in->DestBlendAlpha;
     out->BlendOpAlpha = (D3D12_BLEND_OP)in->BlendOpAlpha;
-    out->LogicOp = D3D12_LOGIC_OP_NOOP;
+    out->LogicOpEnable = key.logic_op != 0;
+    out->LogicOp = key.logic_op ? (D3D12_LOGIC_OP)(key.logic_op - 1) : D3D12_LOGIC_OP_NOOP;      /* (the two enumerations are the same) */
     out->RenderTargetWriteMask = in->RenderTargetWriteMask;
   }
   for (UINT i = 0; i < c->rtv_count && i < 8; ++i) {      /* a target kept wider than its format: only its own channels are written */
@@ -145,8 +147,12 @@ static ID3D12PipelineState *pipeline_get(Dev *d, Ctx *c) {
   pd.PrimitiveTopologyType = c->hs ? D3D12_PRIMITIVE_TOPOLOGY_TYPE_PATCH : D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
   pd.NumRenderTargets = c->rtv_count;
   for (UINT i = 0; i < c->rtv_count; ++i) pd.RTVFormats[i] = c->rtv[i]->plane_format ? c->rtv[i]->plane_format : c->rtv[i]->tex->stored;
-  if (c->dsv) pd.DSVFormat = c->dsv->tex->stored == DXGI_FORMAT_R24G8_TYPELESS ? DXGI_FORMAT_D24_UNORM_S8_UINT
-                           : c->dsv->tex->stored == DXGI_FORMAT_R32_TYPELESS ? DXGI_FORMAT_D32_FLOAT : c->dsv->tex->stored;
+  if (c->dsv) {
+    /* (the program's depth format, typeless ones as the depth format they are: what the depth bias's unit is) */
+    const DXGI_FORMAT f = c->dsv->tex->desc.Format;
+    pd.DSVFormat = f == DXGI_FORMAT_R24G8_TYPELESS ? DXGI_FORMAT_D24_UNORM_S8_UINT : f == DXGI_FORMAT_R32_TYPELESS ? DXGI_FORMAT_D32_FLOAT : f == DXGI_FORMAT_R16_TYPELESS ? DXGI_FORMAT_D16_UNORM
+                 : f == DXGI_FORMAT_R32G8X24_TYPELESS ? DXGI_FORMAT_D32_FLOAT_S8X24_UINT : f;
+  }
   pd.SampleDesc.Count = key.samples;
   ID3D12PipelineState *state = NULL;
   /* (the pixel shader's constant buffers come after the vertex shader's, then the geometry, hull and domain shaders' in that order: as draw_prepare lays them out) */
@@ -694,15 +700,24 @@ static BOOL draw_prepare(Ctx *c, BOOL indexed) {
     static const Tex none = {.desc = {1, 1}};
     const Tex *target = c->rtv_count ? c->rtv[0]->tex : c->dsv ? c->dsv->tex : &none;
     const UINT tw = c->rtv_count ? c->rtv[0]->width : target->desc.Width, th = c->rtv_count ? c->rtv[0]->height : target->desc.Height;      /* (the level a view names) */
-    D3D12_VIEWPORT vp = {0, 0, (FLOAT)tw, (FLOAT)th, 0, 1};
-    D3D12_RECT sc = {0, 0, (LONG)tw, (LONG)th};
-    if (c->viewport_count) memcpy(&vp, &c->viewports[0], sizeof vp);      /* (the two structures are the same; the kernel has one viewport) */
-    if (c->raster && c->raster->desc.ScissorEnable) {
-      if (c->scissor_count) memcpy(&sc, &c->scissors[0], sizeof sc);
-      else sc.right = sc.bottom = 0;      /* (the scissor test with no rectangle set: nothing passes) */
+    /* (the viewports bound - the whole target when none is -, and for each the scissor rectangle of the same number when the rasterizer state has the scissor test, else all
+     * of the target; with the test a rectangle not set lets nothing pass) */
+    D3D12_VIEWPORT vp[D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE];
+    D3D12_RECT sc[D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE];
+    const UINT n = c->viewport_count ? c->viewport_count : 1;
+    for (UINT i = 0; i < n; ++i) {
+      const D3D12_VIEWPORT whole = {0, 0, (FLOAT)tw, (FLOAT)th, 0, 1};
+      const D3D12_RECT all = {0, 0, (LONG)tw, (LONG)th}, none = {0, 0, 0, 0};
+      vp[i] = whole;
+      if (i < c->viewport_count) memcpy(&vp[i], &c->viewports[i], sizeof vp[i]);      /* (the two structures are the same) */
+      sc[i] = all;
+      if (c->raster && c->raster->desc.ScissorEnable) {
+        if (i < c->scissor_count) memcpy(&sc[i], &c->scissors[i], sizeof sc[i]);
+        else sc[i] = none;
+      }
     }
-    ID3D12GraphicsCommandList_RSSetViewports(list, 1, &vp);
-    ID3D12GraphicsCommandList_RSSetScissorRects(list, 1, &sc);
+    ID3D12GraphicsCommandList_RSSetViewports(list, n, vp);
+    ID3D12GraphicsCommandList_RSSetScissorRects(list, n, sc);
   }
   ID3D12GraphicsCommandList_SetPipelineState(list, pipeline);
   if ((d->dirty & DIRTY_SO) && streams) so_record(d, c);
