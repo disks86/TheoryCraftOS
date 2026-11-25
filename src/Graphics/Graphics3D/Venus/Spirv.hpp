@@ -45,6 +45,7 @@ enum Op : uint16_t {
   OpUGreaterThanEqual = 174, OpSGreaterThanEqual = 175, OpULessThan = 176, OpSLessThan = 177, OpULessThanEqual = 178, OpSLessThanEqual = 179,
   OpFOrdEqual = 180, OpFUnordEqual = 181, OpFOrdNotEqual = 182, OpFUnordNotEqual = 183, OpFOrdLessThan = 184, OpFUnordLessThan = 185, OpFOrdGreaterThan = 186,
   OpFUnordGreaterThan = 187, OpFOrdLessThanEqual = 188, OpFUnordLessThanEqual = 189, OpFOrdGreaterThanEqual = 190, OpFUnordGreaterThanEqual = 191,
+  OpBitFieldInsert = 201, OpBitFieldSExtract = 202, OpBitFieldUExtract = 203, OpBitReverse = 204, OpBitCount = 205,
   OpShiftRightLogical = 194, OpShiftRightArithmetic = 195, OpShiftLeftLogical = 196, OpBitwiseOr = 197, OpBitwiseXor = 198, OpBitwiseAnd = 199, OpNot = 200,
   OpDPdx = 207, OpDPdy = 208, OpDPdxFine = 210, OpDPdyFine = 211, OpDPdxCoarse = 213, OpDPdyCoarse = 214, OpEmitVertex = 218, OpEndPrimitive = 219,
   OpEmitStreamVertex = 220, OpEndStreamPrimitive = 221, OpControlBarrier = 224, OpMemoryBarrier = 225, OpAtomicExchange = 229, OpAtomicCompareExchange = 230,
@@ -100,7 +101,7 @@ enum Semantics : uint32_t {
 enum Glsl : uint32_t {
   GlslRoundEven = 2, GlslTrunc = 3, GlslFAbs = 4, GlslSAbs = 5, GlslFSign = 6, GlslSSign = 7, GlslFloor = 8, GlslCeil = 9, GlslFract = 10, GlslSin = 13,
   GlslCos = 14, GlslPow = 26, GlslExp2 = 29, GlslLog2 = 30, GlslSqrt = 31, GlslInverseSqrt = 32, GlslUMin = 38, GlslSMin = 39, GlslUMax = 41, GlslSMax = 42,
-  GlslFClamp = 43, GlslFma = 50, GlslCross = 68, GlslNMin = 79, GlslNMax = 80,
+  GlslFClamp = 43, GlslFma = 50, GlslCross = 68, GlslFindILsb = 73, GlslFindSMsb = 74, GlslFindUMsb = 75, GlslNMin = 79, GlslNMax = 80,
 };
 
 // The image formats of OpTypeImage.

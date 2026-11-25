@@ -88,6 +88,9 @@ struct Operand {
   uint16_t relative_temp = 0;
   uint8_t relative_component = 0;
   bool vertex_from_id = false;   // a control point operand indexed by vOutputControlPointID
+  bool vertex_relative = false;  // a geometry, hull or domain shader's input whose vertex (control point) is a temporary's component plus index[0]: v[r1.x + 1][2]
+  uint16_t vertex_temp = 0;
+  uint8_t vertex_component = 0;
 };
 
 struct SigElement {
@@ -903,21 +906,31 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
         const uint32_t temp = p.le32();
         if (!p.ok() || temp >= kMaxTemps) return status::kNotSupported;
         o->relative_temp = static_cast<uint16_t>(temp);
-      } else if ((representation == 2 || representation == 3) && i == 0 && o->dims == 2 && patch_stage && (o->type == kOpInput || o->type == kOpInputControlPoint)) {
+      } else if ((representation == 2 || representation == 3) && i == 0 && o->dims == 2 && (patch_stage || geometry) && (o->type == kOpInput || o->type == kOpInputControlPoint)) {
         // vicp[vOutputControlPointID][register]: the control point being made - or vicp[rN.c + 0][register] with rN.c holding vOutputControlPointID (moved there in the same
-        // straight run of instructions, not written since: what the compiler makes of it in a subroutine)
+        // straight run of instructions, not written since: what the compiler makes of it in a subroutine). Any other temporary's component (plus the immediate) picks the vertex
+        // or control point at run time: v[r0.x + 1][2] of a geometry shader's loop over its vertices (vertex_relative: emit chooses among them)
         const uint32_t offset = representation == 3 ? p.le32() : 0;
         const uint32_t sub = p.le32();
         if (!p.ok() || (sub >> 31)) return status::kNotSupported;
         if (((sub >> 12) & 0xFF) == kOpTemp && ((sub >> 20) & 3) == 1 && ((sub >> 22) & 7) == 0 && (sub & 3) == 2) {
           const uint32_t temp = p.le32();
           const uint8_t component = static_cast<uint8_t>(((sub >> 2) & 3) == 0 ? 0 : (sub >> 4) & 3);
-          if (!p.ok() || offset != 0 || !cp_id_marked(temp, component)) return status::kNotSupported;
-        } else if (((sub >> 12) & 0xFF) != kOpOutputControlPointId || ((sub >> 20) & 3) != 0 || offset != 0) {
+          if (!p.ok() || temp >= kMaxTemps) return status::kNotSupported;
+          if (patch_stage && offset == 0 && cp_id_marked(temp, component)) {
+            o->vertex_from_id = true;
+            o->index[0] = 0;
+          } else {
+            o->vertex_relative = true;
+            o->vertex_temp = static_cast<uint16_t>(temp), o->vertex_component = component;
+            o->index[0] = offset;
+          }
+        } else if (((sub >> 12) & 0xFF) == kOpOutputControlPointId && ((sub >> 20) & 3) == 0 && offset == 0 && patch_stage) {
+          o->vertex_from_id = true;
+          o->index[0] = 0;
+        } else {
           return status::kNotSupported;
         }
-        o->vertex_from_id = true;
-        o->index[0] = 0;
       } else {
         return status::kNotSupported;   // 64-bit indices, relative anywhere else
       }
@@ -991,10 +1004,12 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
         if (geometry || patch_stage) {
           // v[vertex][register]: the vertex immediate, or for a hull shader's control point phase the control point being made
           const uint32_t limit = geometry ? geometry_vertices : input_points;
-          if (o.dims != 2 || (!o.vertex_from_id && o.index[0] >= limit) || o.index[1] >= kRegisters || in_slot[o.index[1]] == kSlotNone) return status::kNotSupported;
+          if (o.dims != 2 || (!o.vertex_from_id && !o.vertex_relative && o.index[0] >= limit) || o.index[1] >= kRegisters || in_slot[o.index[1]] == kSlotNone) return status::kNotSupported;
           if (o.vertex_from_id && !(hull && phase == 1)) return status::kNotSupported;
+          if (o.vertex_relative && (limit == 0 || limit > graphics::kMaxPatchControlPoints || o.index[0] >= 256)) return status::kNotSupported;
           s->type = kInput, s->number = static_cast<uint16_t>(o.index[1]), s->slot = in_slot[o.index[1]], s->vertex = static_cast<uint8_t>(o.index[0]);
           s->vertex_from_id = o.vertex_from_id;
+          if (o.vertex_relative) s->vertex_temp = static_cast<int16_t>(o.vertex_temp), s->vertex_component = o.vertex_component;
           return status::kSuccess;
         }
         if (o.dims == 1 && o.index[0] < kRegisters && in_sys[o.index[0]] >= 0) {
@@ -1140,6 +1155,9 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
       {27, kFtoI, 1, false}, {28, kFtoU, 1, false}, {43, kItoF, 1, false}, {86, kUtoF, 1, false}, {32, kIEq, 2, false}, {39, kINe, 2, false}, {34, kILt, 2, false}, {33, kIGe, 2, false},
       {79, kULt, 2, false}, {80, kUGe, 2, false},
       {130, kF32ToF16, 1, false}, {131, kF16ToF32, 1, false},
+      // bit operations of Shader Model 5 (countbits, firstbit_hi / _lo / _shi, ubfe, ibfe, bfi, bfrev)
+      {134, kCountBits, 1, false}, {135, kFirstBitHi, 1, false}, {136, kFirstBitLo, 1, false}, {137, kFirstBitSHi, 1, false}, {138, kUBfe, 3, false}, {139, kIBfe, 3, false},
+      {140, kBfi, 4, false}, {141, kBfrev, 1, false},
       // double precision (opcode numbers of d3d11tokenizedprogramformat.hpp)
       {191, kDAdd, 2, false}, {192, kDMax, 2, false}, {193, kDMin, 2, false}, {194, kDMul, 2, false}, {195, kDEq, 2, false}, {196, kDGe, 2, false}, {197, kDLt, 2, false}, {198, kDNe, 2, false},
       {199, kDMov, 1, false}, {200, kDMovc, 3, false}, {201, kDToF, 1, false}, {202, kFToD, 1, false}, {209, kDDiv, 2, false}, {210, kDFma, 3, false}, {211, kDRcp, 1, false},
@@ -1157,7 +1175,7 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
   };
   List<LoopFrame> loops(allocator);
   List<uint64_t> pending_exits(allocator), pending_continues(allocator);   // (loop depth << 32) | instruction index
-  auto emit = [&](Instr& ins) -> NtStatus {
+  auto emit_one = [&](Instr& ins) -> NtStatus {
     if (program->code_.count() >= kMaxInstructions) return status::kNotSupported;
     const uint32_t index = static_cast<uint32_t>(program->code_.count());
     if (ins.op == kLoopBegin) {
@@ -1200,6 +1218,60 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
     }
     return program->code_.push_back(ins) ? status::kSuccess : status::kNoMemory;
   };
+  // An instruction whose source is an input of a vertex (control point) a temporary picks (Src::vertex_temp, from v[rN.c + k][register]): that source is first gathered into a
+  // temporary above the declared ones - the input of the first vertex, then for each other one a movc of it where the index is that vertex - and the instruction reads that.
+  // Every device runs the plain instructions; an index outside the primitive reads the first vertex (Direct3D leaves it undefined).
+  uint32_t declared_temps = 0;
+  auto emit = [&](Instr& ins) -> NtStatus {
+    uint32_t gathered = 0;
+    for (uint32_t k = 0; k < ins.src_count && k < 4; ++k) {
+      Instr::Src& src = ins.src[k];
+      if (src.type != kInput || src.vertex_temp < 0) continue;
+      const uint32_t limit = geometry ? geometry_vertices : input_points;
+      const uint32_t value_temp = declared_temps + 2 * gathered, cond_temp = value_temp + 1;
+      if (limit == 0 || cond_temp >= kMaxTemps - 3) return status::kNotSupported;   // (the last three are the one-dimensional textures')
+      ++gathered;
+      Instr::Src vertex_input = src;
+      vertex_input.vertex_temp = -1;
+      vertex_input.modifier = kModNone;
+      for (uint32_t c = 0; c < 4; ++c) vertex_input.swizzle[c] = static_cast<uint8_t>(c);
+      Instr first;
+      first.op = kMov;
+      first.dst.type = kTemp, first.dst.number = static_cast<uint16_t>(value_temp), first.dst.mask = 0xF;
+      first.src[0] = vertex_input;
+      first.src[0].vertex = 0;
+      first.src_count = 1;
+      NtStatus st = emit_one(first);
+      for (uint32_t v = 1; v < limit && st == status::kSuccess; ++v) {
+        Instr test;
+        test.op = kIEq;
+        test.dst.type = kTemp, test.dst.number = static_cast<uint16_t>(cond_temp), test.dst.mask = 1;
+        test.src[0].type = kTemp, test.src[0].number = static_cast<uint16_t>(src.vertex_temp);
+        for (uint8_t& c : test.src[0].swizzle) c = src.vertex_component;
+        const uint32_t wanted = v - src.vertex;   // (the temporary's value that picks vertex v: v minus the immediate, wrapping as the integers do)
+        const float bits[4] = {__builtin_bit_cast(float, wanted), __builtin_bit_cast(float, wanted), __builtin_bit_cast(float, wanted), __builtin_bit_cast(float, wanted)};
+        uint16_t number = 0;
+        if ((st = literal(bits, &number)) != status::kSuccess) break;
+        test.src[1].type = kConst, test.src[1].number = number;
+        test.src_count = 2;
+        if ((st = emit_one(test)) != status::kSuccess) break;
+        Instr pick;
+        pick.op = kSelect;
+        pick.dst.type = kTemp, pick.dst.number = static_cast<uint16_t>(value_temp), pick.dst.mask = 0xF;
+        pick.src[0].type = kTemp, pick.src[0].number = static_cast<uint16_t>(cond_temp);
+        for (uint8_t& c : pick.src[0].swizzle) c = 0;
+        pick.src[1] = vertex_input;
+        pick.src[1].vertex = static_cast<uint8_t>(v);
+        pick.src[2].type = kTemp, pick.src[2].number = static_cast<uint16_t>(value_temp);
+        pick.src_count = 3;
+        st = emit_one(pick);
+      }
+      if (st != status::kSuccess) return st;
+      // (the instruction reads the gathered value with its own swizzle and modifier)
+      src.type = kTemp, src.number = static_cast<uint16_t>(value_temp), src.slot = kSlotNone, src.vertex = 0, src.vertex_temp = -1;
+    }
+    return emit_one(ins);
+  };
 
   // Whether the atomic instruction at `at` (its operands) works on a storage image: its u# (the first operand, or the second of an immediate one) was declared typed.
   auto atomic_on_image = [&](const ByteReader& at, uint32_t op) {
@@ -1214,7 +1286,7 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
   // One-dimensional textures (texture1d, texture1darray) are two-dimensional ones a texel high, and arrays of those. An access to one goes through the last three
   // temporaries, which such a program may not declare: its coordinate (and the gradients of sample_d) gets a second component - the middle of the row to sample, row 0
   // to load - and an array's layer moves from the second component to the third; resinfo's result gets its second component back (0, or the array's size).
-  uint32_t one_d_units = 0, declared_temps = 0;
+  uint32_t one_d_units = 0;
   auto one_d_fix = [&](Instr& ins) -> NtStatus {
     constexpr uint16_t kScratch = static_cast<uint16_t>(kMaxTemps - 1), kGradX = static_cast<uint16_t>(kMaxTemps - 2), kGradY = static_cast<uint16_t>(kMaxTemps - 3);
     if (declared_temps > kMaxTemps - 3) return status::kNotSupported;
@@ -1397,7 +1469,7 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
 
   // --- the instructions
   while (!in.at_end()) {
-    if (feedback_unchecked) return status::kNotSupported;   // (a status of a buffer or storage image load: those reads have no residency feedback here)
+    if (feedback_unchecked) return status::kNotSupported;   // (a status of an instruction that has none)
     if (returned) return status::kNotSupported;   // (code after a ret)
     const uint32_t token = in.le32();
     uint32_t words = (token >> 24) & 0x7F;
@@ -2291,9 +2363,10 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
     }
     if (!p.at_end()) return status::kInvalidParameter;
     if (ins.feedback) {
-      // (the lookups of textures report residency; a load of a buffer or a storage image with a status is refused at the next instruction)
+      // (the lookups of textures report residency, and the loads of buffers and storage images - ld_raw_s, ld_structured_s, ld_uav_typed_s -; anything else with a status is
+      // refused at the next instruction)
       const bool lookup = ins.op == kTexLd || ins.op == kTexFetch || ins.op == kTexFetchMs || ins.op == kTexLod || ins.op == kTexGrad || ins.op == kTexBias || ins.op == kTexCompare ||
-                          ins.op == kTexGather;
+                          ins.op == kTexGather || ins.op == kBufLoad || ins.op == kImgLoad;
       if (lookup) feedback_unchecked = false;
       program->uses_feedback_ = true;
     }

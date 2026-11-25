@@ -52,6 +52,8 @@ enum class Op : uint8_t {
   // integer
   Uadd, Ineg, Iabs, Isgn, Umul, UmulHi, ImulHi, Umad, Imin, Imax, Umin, Umax, Udiv, Idiv, Umod, Mod, And, Or, Xor, Not, Shl, Ishr, Ushr, F2i, F2u, I2f, U2f,
   Useq, Usne, Islt, Isge, Uslt, Usge, Ucmp,
+  // bits (GLSL 4's bitfield operations)
+  Popc, Lsb, Imsb, Umsb, Ubfe, Ibfe, Bfi, Brev,
   // double (register pairs)
   Dadd, Dmul, Ddiv, Dfma, Dmad, Drcp, Dsqrt, Drsq, Dmin, Dmax, Dmov, Dneg, Dabs, Dseq, Dsge, Dslt, Dsne, D2f, D2i, D2u, F2d, I2d, U2d,
   // address

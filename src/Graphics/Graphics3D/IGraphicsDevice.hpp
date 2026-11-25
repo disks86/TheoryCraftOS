@@ -77,6 +77,7 @@ enum BufferUsage : uint32_t {
   kBufferStreamOutput = 1u << 3,   // kFeatureStreamOutput: a geometry shader's stream output goes here (bind_stream_output); read back with IBuffer::read_back
 };
 
+constexpr uint64_t kBufferTileBytes = 65536;   // a tile of a tiled buffer (IBuffer::set_residency): Direct3D's 64 KiB
 class IBuffer {
  public:
   virtual uint64_t size() const = 0;
@@ -85,6 +86,13 @@ class IBuffer {
   virtual void unmap() = 0;
   // After a submit() in which the GPU may have written the buffer (a storage buffer a compute shader wrote): brings what it holds into map(). True if the contents are current.
   virtual bool read_back() { return true; }
+  // A tiled buffer (the memory manager's reserved buffers, Direct3D's tiled resources; kFeature2TileResidency): one byte per kBufferTileBytes of the buffer, non-zero where that
+  // tile is backed by memory - what the shaders' residency feedback of buffer loads (IStorageImages::buffer_mapped) reports. The buffer copies it. False when the device keeps
+  // none (the default) or it does not fit the buffer.
+  virtual bool set_residency(ConstByteView mapped) {
+    (void)mapped;
+    return false;
+  }
   // A stream output buffer: the offset the last bound stream output reached (bind_stream_output with kStreamOutputAppend starts there).
   uint64_t stream_output_filled() const { return stream_output_filled_; }
   void set_stream_output_filled(uint64_t offset) { stream_output_filled_ = offset; }
@@ -546,6 +554,16 @@ class IStorageImages {
   // An atomic operation on the first channel of a texel of a 32-bit integer image (Format::R32Uint, R32Sint): `old` gets the value before; CompareExchange stores `operand` where the
   // texel equals `compare`. False (and `old` 0) outside the view, for another format, or nothing bound.
   virtual bool atomic(uint32_t slot, uint32_t x, uint32_t y, uint32_t z, ImageAtomic op, uint32_t operand, uint32_t compare, uint32_t* old) const = 0;
+  // Residency feedback (kFeature2TileResidency) of the loads that report it: whether the texel load() reads at (x, y, z) lies in a mapped tile of a tiled image or buffer
+  // (IImage / IBuffer::set_residency), and whether `bytes` at `offset` of storage buffer `slot` (the bound range) do. True for what is not tiled, and outside the image or buffer.
+  virtual bool texel_mapped(uint32_t slot, uint32_t x, uint32_t y, uint32_t z) const {
+    (void)slot, (void)x, (void)y, (void)z;
+    return true;
+  }
+  virtual bool buffer_mapped(uint32_t slot, uint64_t offset, uint64_t bytes) const {
+    (void)slot, (void)offset, (void)bytes;
+    return true;
+  }
 
  protected:
   constexpr IStorageImages() = default;

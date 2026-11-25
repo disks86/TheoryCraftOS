@@ -38,7 +38,11 @@ enum Opcode : uint16_t {
   kDdx, kDdy, kDdxCoarse, kDdyCoarse,   // (derivatives over the 2 x 2 quad: fine takes the pair of the pixel's own row or column, coarse the quad's first)
   // Integer and bitwise instructions: the 32 bits of a register component are the integer (the interpreter keeps them in the float's bits), comparisons give all ones or zero.
   kIAdd = 0x1100, kINeg, kIMul, kIMad, kIMin, kIMax, kUMin, kUMax, kUMul, kUMad, kUDiv, kURem, kIShl, kIShr, kUShr, kAnd, kOr, kXor, kNot, kFtoI, kFtoU, kItoF, kUtoF, kIEq, kINe, kILt, kIGe, kULt, kUGe, kUMulHi, kIMulHi,   // (the high word of a 32 x 32 product)
-  kIntegerFirst = kIAdd, kIntegerLast = kIMulHi,
+  // Shader Model 5's bit operations, as Direct3D defines them: countbits; firstbit_hi / firstbit_shi the place of the first bit (set, or other than the sign) counted from the top,
+  // firstbit_lo from the bottom, all ones when there is none; ubfe / ibfe (src[0] the width, src[1] the offset, src[2] the value: the low five bits of each count, the field ends at
+  // bit 31) extract unsigned / sign extended; bfi (width, offset, insert, base) puts the insert's low bits at the offset into the base; bfrev reverses the bits.
+  kCountBits, kFirstBitHi, kFirstBitLo, kFirstBitSHi, kUBfe, kIBfe, kBfi, kBfrev,
+  kIntegerFirst = kIAdd, kIntegerLast = kBfrev,
   // Loops (Shader Model 4): `target` of a loop is the instruction after its endloop, of an endloop the one after its loop; break leaves, continue goes to the endloop.
   // Texture access of Shader Model 4: ld (src[0] the integer coordinates, x y in the first two components and the level in the last; src[1] the unit), sample_l (src[0] the
   // coordinate, src[1] the unit, src[2] the level), resinfo (src[0] the level, src[1] the unit; control: 0 floats, 1 reciprocals, 2 unsigned integers).
@@ -105,6 +109,8 @@ struct D3d9Program::Instruction {
     uint16_t number = 0;
     uint8_t vertex = 0;        // a geometry, hull or domain shader's input: which vertex or control point (v[vertex][register])
     bool vertex_from_id = false;   // ... the one the hull shader's control point phase is making (vOutputControlPointID)
+    int16_t vertex_temp = -1;      // ... (the DXBC front end, until emit gathers it) the one a temporary's component picks, `vertex` added: v[r0.x + 1][2]
+    uint8_t vertex_component = 0;
     bool at_vertex = false;        // a pixel shader's input at vertex `vertex` of the primitive (GetAttributeAtVertex), not interpolated
     int8_t slot = kSlotNone;   // inputs: the attribute location / varying
     uint8_t swizzle[4] = {0, 1, 2, 3};

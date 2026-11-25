@@ -228,12 +228,12 @@ class TgsiEmitter {
     }
     add(body_, "\n");
   }
-  void line(const char* op, const String* d = nullptr, const String* s0 = nullptr, const String* s1 = nullptr, const String* s2 = nullptr) {
+  void line(const char* op, const String* d = nullptr, const String* s0 = nullptr, const String* s1 = nullptr, const String* s2 = nullptr, const String* s3 = nullptr) {
     add(body_, "  ");
     add_uint(body_, inst_++);
     add(body_, ": ");
     add(body_, op);
-    const String* parts[4] = {d, s0, s1, s2};
+    const String* parts[5] = {d, s0, s1, s2, s3};
     bool first = true;
     for (const String* part : parts) {
       if (!part) continue;
@@ -802,6 +802,9 @@ bool TgsiEmitter::instruction(const Instr& ins) {
     case kIGe: simple = "ISGE", sources = 2; break;
     case kULt: simple = "USLT", sources = 2; break;
     case kUGe: simple = "USGE", sources = 2; break;
+    case kCountBits: simple = "POPC", sources = 1; break;
+    case kFirstBitLo: simple = "LSB", sources = 1; break;
+    case kBfrev: simple = "BREV", sources = 1; break;
     default: break;
   }
   if (simple && ins.mask_result) {   // (a Shader Model 4 comparison is all ones for true: TGSI's FS comparisons)
@@ -925,6 +928,47 @@ bool TgsiEmitter::instruction(const Instr& ins) {
       t = begin_result(ins, false, &direct);
       const String a = operand(ins.src[0], 0, 0, nullptr, false), b = operand(ins.src[1], 0, 1, nullptr, false), c = operand(ins.src[2], 0, 2, nullptr, false);
       line("UCMP", &t, &a, &b, &c);
+      break;
+    }
+    case kFirstBitHi: case kFirstBitSHi: {
+      // (TGSI's UMSB / IMSB count from the bottom, as GLSL's findMSB; Direct3D's from the top: 31 minus it, all ones staying all ones)
+      t = begin_result(ins, true, &direct);
+      const String a = operand(ins.src[0], 0, 0, nullptr, false), w2 = temp(kWork2), w3 = temp(kWork3), z = zero();
+      String top = str();
+      add(top, "IMM[");
+      add_uint(top, imm4_bits(31, 31, 31, 31));
+      add(top, "]");
+      line(op == kFirstBitHi ? "UMSB" : "IMSB", &w2, &a);
+      line("INEG", &w3, &w2);
+      line("UADD", &w3, &w3, &top);
+      line("ISLT", &t, &w2, &z);
+      line("UCMP", &t, &t, &w2, &w3);
+      break;
+    }
+    case kUBfe: case kIBfe: case kBfi: {
+      // (the width's and offset's low five bits; the field ends at bit 31 - Direct3D's rule -, where GLSL's bitfieldExtract / bitfieldInsert leave a longer one undefined: the
+      // width taken as at most 32 - offset)
+      t = begin_result(ins, true, &direct);
+      const String width = operand(ins.src[0], 0, 0, nullptr, false), offset = operand(ins.src[1], 0, 1, nullptr, false), value = operand(ins.src[2], 0, 2, nullptr, false);
+      const String w2 = temp(kWork2), w3 = temp(kWork3);
+      String mask = str(), room = str();
+      add(mask, "IMM[");
+      add_uint(mask, imm4_bits(31, 31, 31, 31));
+      add(mask, "]");
+      add(room, "IMM[");
+      add_uint(room, imm4_bits(32, 32, 32, 32));
+      add(room, "]");
+      line("AND", &w2, &offset, &mask);
+      line("AND", &w3, &width, &mask);
+      line("INEG", &t, &w2);
+      line("UADD", &t, &t, &room);
+      line("UMIN", &w3, &w3, &t);
+      if (op == kBfi) {
+        const String base = operand(ins.src[3], 0, 3, nullptr, false);
+        line("BFI", &t, &base, &value, &w2, &w3);
+      } else {
+        line(op == kUBfe ? "UBFE" : "IBFE", &t, &value, &w2, &w3);
+      }
       break;
     }
     case kIShl: case kIShr: case kUShr: {   // (only the low five bits of the count count)

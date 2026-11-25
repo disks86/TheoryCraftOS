@@ -25,6 +25,10 @@
 #include "Utility/Move.hpp"
 
 namespace dxgk {
+namespace {
+// `v` shifted right by `count` (below 32): arithmetically (ibfe) or logically (ubfe).
+inline uint32_t shift_right(bool arithmetic, uint32_t v, uint32_t count) { return arithmetic ? static_cast<uint32_t>(static_cast<int32_t>(v) >> count) : v >> count; }
+}  // namespace
 
 namespace {
 
@@ -685,7 +689,9 @@ void D3d9Program::execute(State& s, uint64_t begin, uint64_t end) const {
     if (ins.src_count > 0 && ins.op != kM4x4 && ins.op != kM4x3 && ins.op != kM3x4 && ins.op != kM3x3 && ins.op != kM3x2) a = fetch(ins.src[0], 0);
     // (a lookup with residency feedback or a clamp: the feedback covers the lookup's own texel reads - begun here, or for sample_b, whose level needs the neighbours' coordinates
     // first and so runs their programs, once those are in - and ends after it. Not in a neighbour's run: it only wants a coordinate)
-    const bool feedback = ins.feedback && s.textures && s.derivative_depth == 0 && s.capture_at == ~uint64_t{0};
+    // (a load of a storage buffer or image with a status reports its own: kBufLoad, kImgLoad)
+    const bool own_feedback = ins.op == kBufLoad || ins.op == kImgLoad;
+    const bool feedback = ins.feedback && !own_feedback && s.textures && s.derivative_depth == 0 && s.capture_at == ~uint64_t{0};
     const float feedback_clamp = ins.has_clamp ? fetch(ins.clamp, 0).f[0] : -1e30f;
     if (feedback && ins.op != kTexBias && ins.op != kTexQueryLod) s.textures->begin_feedback(feedback_clamp);
     switch (ins.op) {
@@ -812,6 +818,14 @@ void D3d9Program::execute(State& s, uint64_t begin, uint64_t end) const {
           }
           for (uint32_t k = 0; k < 4; ++k) r.f[k] = words.f[ins.tex_swizzle[k] & 3];
           store(ins.dst, r);
+          if (ins.feedback && ins.status.mask) {
+            // (ld_raw_s / ld_structured_s: whether the words the destination takes lie in mapped tiles of a tiled buffer; group-shared memory always is)
+            uint32_t words_read = 0;
+            for (uint32_t k = 0; k < 4; ++k)
+              if ((ins.dst.mask >> k & 1) && (ins.tex_swizzle[k] & 3) + 1u > words_read) words_read = (ins.tex_swizzle[k] & 3) + 1u;
+            const bool mapped = ins.uav >= graphics::kMaxStorageBuffers || !s.images || s.images->buffer_mapped(ins.uav, address, 4ull * words_read);
+            store(ins.status, splat(from_bits(mapped ? 1u : 0u)));
+          }
         } else if (ins.op == kBufStore) {
           const Q value = fetch(ins.src[2], 0);
           uint32_t written = 0;
@@ -891,6 +905,7 @@ void D3d9Program::execute(State& s, uint64_t begin, uint64_t end) const {
           const graphics::Vec4 t = s.images ? s.images->load(slot, x, y, z) : graphics::Vec4{0, 0, 0, 0};
           const float texel[4] = {t.x, t.y, t.z, t.w};
           store(ins.dst, {{texel[ins.tex_swizzle[0] & 3], texel[ins.tex_swizzle[1] & 3], texel[ins.tex_swizzle[2] & 3], texel[ins.tex_swizzle[3] & 3]}});
+          if (ins.feedback && ins.status.mask) store(ins.status, splat(from_bits(!s.images || s.images->texel_mapped(slot, x, y, z) ? 1u : 0u)));   // (ld_uav_typed_s)
           break;
         }
         if (ins.op == kImgStore) {
@@ -987,11 +1002,13 @@ void D3d9Program::execute(State& s, uint64_t begin, uint64_t end) const {
         break;
       }
       case kIAdd: case kINeg: case kIMul: case kIMad: case kIMin: case kIMax: case kUMin: case kUMax: case kUMul: case kUMad: case kUDiv: case kURem: case kIShl: case kIShr: case kUShr:
-      case kAnd: case kOr: case kXor: case kNot: case kFtoI: case kFtoU: case kItoF: case kUtoF: case kIEq: case kINe: case kILt: case kIGe: case kULt: case kUGe: case kUMulHi: case kIMulHi: {
+      case kAnd: case kOr: case kXor: case kNot: case kFtoI: case kFtoU: case kItoF: case kUtoF: case kIEq: case kINe: case kILt: case kIGe: case kULt: case kUGe: case kUMulHi: case kIMulHi:
+      case kCountBits: case kFirstBitHi: case kFirstBitLo: case kFirstBitSHi: case kUBfe: case kIBfe: case kBfi: case kBfrev: {
         if (ins.src_count > 1) b = fetch(ins.src[1], 0);
         if (ins.src_count > 2) c = fetch(ins.src[2], 0);
+        const Q e = ins.src_count > 3 ? fetch(ins.src[3], 0) : Q{{0, 0, 0, 0}};
         for (int i = 0; i < 4; ++i) {
-          const uint32_t x = bits_of(a.f[i]), y = bits_of(b.f[i]), z = bits_of(c.f[i]);
+          const uint32_t x = bits_of(a.f[i]), y = bits_of(b.f[i]), z = bits_of(c.f[i]), base = bits_of(e.f[i]);
           const int32_t sx = static_cast<int32_t>(x), sy = static_cast<int32_t>(y);
           uint32_t out = 0;
           switch (ins.op) {
@@ -1024,6 +1041,36 @@ void D3d9Program::execute(State& s, uint64_t begin, uint64_t end) const {
             case kIGe: out = sx >= sy ? 0xFFFFFFFFu : 0; break;
             case kULt: out = x < y ? 0xFFFFFFFFu : 0; break;
             case kUGe: out = x >= y ? 0xFFFFFFFFu : 0; break;
+            case kCountBits: out = static_cast<uint32_t>(__builtin_popcount(x)); break;
+            case kFirstBitHi: out = x ? static_cast<uint32_t>(__builtin_clz(x)) : 0xFFFFFFFFu; break;   // (counted from the top bit)
+            case kFirstBitLo: out = x ? static_cast<uint32_t>(__builtin_ctz(x)) : 0xFFFFFFFFu; break;
+            case kFirstBitSHi: {   // (the first bit other than the sign, from the top: of a negative number the first 0)
+              const uint32_t v = sx < 0 ? ~x : x;
+              out = v ? static_cast<uint32_t>(__builtin_clz(v)) : 0xFFFFFFFFu;
+              break;
+            }
+            case kUBfe: case kIBfe: {   // (x the width, y the offset, z the value)
+              const uint32_t width = x & 31, offset = y & 31;
+              const bool arithmetic = ins.op == kIBfe;
+              if (width == 0) out = 0;
+              else if (width + offset < 32) out = shift_right(arithmetic, z << (32 - width - offset), 32 - width);
+              else out = shift_right(arithmetic, z, offset);
+              break;
+            }
+            case kBfi: {   // (x the width, y the offset, z the insert, base the base)
+              const uint32_t width = x & 31, offset = y & 31, mask = (width ? (0xFFFFFFFFu >> (32 - width)) : 0u) << offset;
+              out = ((z << offset) & mask) | (base & ~mask);
+              break;
+            }
+            case kBfrev: {
+              uint32_t v = x;
+              v = ((v >> 1) & 0x55555555u) | ((v & 0x55555555u) << 1);
+              v = ((v >> 2) & 0x33333333u) | ((v & 0x33333333u) << 2);
+              v = ((v >> 4) & 0x0F0F0F0Fu) | ((v & 0x0F0F0F0Fu) << 4);
+              v = ((v >> 8) & 0x00FF00FFu) | ((v & 0x00FF00FFu) << 8);
+              out = (v >> 16) | (v << 16);
+              break;
+            }
             default: break;
           }
           r.f[i] = from_bits(out);
@@ -1294,7 +1341,7 @@ void D3d9Program::execute(State& s, uint64_t begin, uint64_t end) const {
       // (sample_b of a texture of no size never began: end_feedback then reports what an empty lookup read - nothing unmapped)
       const bool mapped = s.textures->end_feedback();
       if (ins.status.mask) store(ins.status, splat(from_bits(mapped ? 1u : 0u)));
-    } else if (ins.feedback && ins.status.mask) {
+    } else if (ins.feedback && ins.status.mask && !own_feedback) {
       store(ins.status, splat(from_bits(1u)));   // (no textures, or a neighbour's run: nothing was read)
     }
     if (ins.op == kElse) pc = ins.target;   // reached by running through the true branch: leave the construct

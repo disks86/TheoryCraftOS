@@ -115,16 +115,40 @@ class SoftwareBuffer final : public IBuffer {
     data_ = allocate_view<uint8_t>(allocator, size);
     if (!data_.empty()) data_.fill(0);
   }
-  ~SoftwareBuffer() { release_view(allocator_, data_); }
+  ~SoftwareBuffer() {
+    release_view(allocator_, data_);
+    release_view(allocator_, residency_);
+  }
   bool valid() const { return !data_.empty(); }
   uint64_t size() const override { return data_.size(); }
   ByteView map() override { return data_; }
   void unmap() override {}
+  bool set_residency(ConstByteView mapped) override {
+    if (mapped.size() != (data_.size() + kBufferTileBytes - 1) / kBufferTileBytes) return false;
+    if (residency_.size() != mapped.size()) {
+      release_view(allocator_, residency_);
+      residency_ = allocate_view<uint8_t>(allocator_, mapped.size());
+      if (residency_.size() != mapped.size()) return false;
+    }
+    residency_.copy_from(mapped);
+    return true;
+  }
+  // One byte a tile, non-zero where it is mapped; empty for a buffer that is not tiled.
+  ConstByteView residency() const { return ConstByteView(residency_.data(), residency_.size()); }
 
  private:
   allocators::IAllocator& allocator_;
   ByteView data_;
+  ByteView residency_;
 };
+// Whether `bytes` at `offset` of a tiled buffer's tiles (one byte a tile: SoftwareBuffer::residency) are all mapped; a buffer that is not tiled, or bytes past its tiles, are.
+inline bool tiles_mapped(ConstByteView residency, uint64_t offset, uint64_t bytes) {
+  if (residency.empty() || bytes == 0) return true;
+  const uint64_t first = offset / kBufferTileBytes, last = (offset + bytes - 1) / kBufferTileBytes;   // (offset and bytes are below 2^40)
+  for (uint64_t t = first; t <= last && t < residency.size(); ++t)
+    if (!residency[t]) return false;
+  return true;
+}
 
 class SoftwareImage final : public IImage {
  public:
@@ -977,12 +1001,33 @@ class StorageImageSet final : public IStorageImages {
     views_[slot] = view;
     elements_[slot] = ByteView();
   }
-  // `elements`: the bytes of the view's elements (empty unbinds).
-  void bind_texel_buffer(uint32_t slot, ByteView elements, TexelFormat format) {
+  // `elements`: the bytes of the view's elements (empty unbinds); `residency` the buffer's tiles (SoftwareBuffer::residency) and `base` where the elements start in it.
+  void bind_texel_buffer(uint32_t slot, ByteView elements, TexelFormat format, ConstByteView residency = ConstByteView(), uint64_t base = 0) {
     if (slot >= kMaxImageSlots) return;
     images_[slot] = nullptr;
     elements_[slot] = elements;
     texel_formats_[slot] = format;
+    texel_residency_[slot] = residency;
+    texel_base_[slot] = base;
+  }
+  // The tiles of the buffer bound to storage buffer slot `slot` and where the bound range starts in it (residency feedback of buffer loads).
+  void bind_buffer_residency(uint32_t slot, ConstByteView residency, uint64_t base) {
+    if (slot >= kMaxStorageBuffers) return;
+    buffer_residency_[slot] = residency;
+    buffer_base_[slot] = base;
+  }
+  bool texel_mapped(uint32_t slot, uint32_t x, uint32_t y, uint32_t z) const override {
+    if (slot >= kMaxImageSlots) return true;
+    if (!elements_[slot].empty()) {
+      const uint64_t bytes = texel_bytes(texel_formats_[slot]);
+      return tiles_mapped(texel_residency_[slot], texel_base_[slot] + uint64_t{x} * bytes, bytes);
+    }
+    if (!images_[slot]) return true;
+    const StorageImageView& view = views_[slot];
+    return images_[slot]->texel_mapped(view.level, view.first_layer + z, x, y);
+  }
+  bool buffer_mapped(uint32_t slot, uint64_t offset, uint64_t bytes) const override {
+    return slot >= kMaxStorageBuffers || offset > (uint64_t{1} << 40) || tiles_mapped(buffer_residency_[slot], buffer_base_[slot] + offset, bytes);
   }
   bool size(uint32_t slot, uint32_t* width, uint32_t* height, uint32_t* layers) const override {
     if (slot < kMaxImageSlots && !elements_[slot].empty()) {
@@ -1101,6 +1146,8 @@ class StorageImageSet final : public IStorageImages {
   }
   SoftwareImage* images_[kMaxImageSlots] = {};
   StorageImageView views_[kMaxImageSlots];
+  ConstByteView texel_residency_[kMaxImageSlots], buffer_residency_[kMaxStorageBuffers];
+  uint64_t texel_base_[kMaxImageSlots] = {}, buffer_base_[kMaxStorageBuffers] = {};
   ByteView elements_[kMaxImageSlots];
   TexelFormat texel_formats_[kMaxImageSlots] = {};
 };
@@ -2762,7 +2809,7 @@ bool SoftwareDevice::submit(ICommandBuffer* commands) {
         if (!texel_format_valid(view.format) || (cmd.unit < kMaxStorageImages && !texel_format_storable(view.format)) || view.elements == 0 || view.offset % bytes) return false;
         ByteView part;
         if (!cmd.buffer->map().try_subview(view.offset, uint64_t{view.elements} * bytes, &part)) return false;
-        images.bind_texel_buffer(cmd.unit, part, view.format);
+        images.bind_texel_buffer(cmd.unit, part, view.format, static_cast<SoftwareBuffer*>(cmd.buffer)->residency(), view.offset);
         break;
       }
       case RecordedCommand::Type::BindStorageBuffer: {
@@ -2770,6 +2817,7 @@ bool SoftwareDevice::submit(ICommandBuffer* commands) {
         ByteView whole = cmd.buffer->map(), part;
         if (!whole.try_subview(cmd.offset, cmd.count, &part)) return false;
         storage[cmd.unit] = part;
+        images.bind_buffer_residency(cmd.unit, static_cast<SoftwareBuffer*>(cmd.buffer)->residency(), cmd.offset);
         break;
       }
       case RecordedCommand::Type::Dispatch: {
