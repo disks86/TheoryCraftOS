@@ -23,7 +23,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 work=${TMPDIR:-/tmp}/tcos-emudx
-export TCOS_EMU_SECONDS=${TCOS_EMU_SECONDS:-300}      # (the Direct3D suites run longer than the runner's 60 seconds)
+export TCOS_EMU_SECONDS=${TCOS_EMU_SECONDS:-900}      # (the Direct3D suites run longer than the runner's 60 seconds, and d3d11test nears 300 on a busy machine)
 mkdir -p "$work/sys32" "$work/obj"
 if [ ! -f "$work/build/build.ninja" ]; then
   cmake -S . -B "$work/build" -G Ninja -DCMAKE_TOOLCHAIN_FILE="$PWD/cmake/toolchain-x86_64-uefi.cmake" -DCMAKE_BUILD_TYPE=Debug > /dev/null
@@ -62,10 +62,10 @@ python3 - "$work/dxfixtures.h" <<'PY'
 import sys
 out = open(sys.argv[1], "w")
 import glob, os
-for path in sorted(glob.glob("tests/data/dxbc/*.dxbc")):
-    n = os.path.basename(path)[:-5]
+for path in sorted(glob.glob("tests/data/dxbc/*.dxbc") + glob.glob("tests/data/dxbc/*.dxil")):      # (dx_<name>_dxbc, dx_<name>_dxil: as tests/d3d12_qemu.sh names them)
+    n = os.path.basename(path).replace(".", "_")
     data = open(path, "rb").read()
-    out.write("static const unsigned char dx_%s_dxbc[] = {%s};\n" % (n, ",".join(str(b) for b in data)))
+    out.write("static const unsigned char dx_%s[] = {%s};\n" % (n, ",".join(str(b) for b in data)))
 PY
 
 programs=("$@")

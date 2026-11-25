@@ -64,7 +64,7 @@ is "0.5 < a" and a select; the source and result modifiers (`_bx2`, `_x2`, `_sat
 (the devices have two units and two coordinate sets). The fixed-point ranges of the model (registers clamped to [-1, 1]) are not imitated. Checked on hand-written programs for each
 instruction group against their definitions, as TGSI text, and with a ps_1_4 shader from Wine's HLSL compiler (it cannot make `tex` for 1.1 - 1.3).
 
-**DXBC** (`ShaderKind::Dxbc`, `D3d9Dxbc.cpp`): the container the Direct3D 10/11 runtimes pass a driver, Shader Model 4.0 / 4.1 / 5.0 / 5.1 vertex and pixel shaders (5.1 declares constant buffers, textures and samplers as ranges with a space: `cb[ID][index][element]`, `t[ID][index]`; only space 0, single-register ranges, `b0` as the push constants and `t0`/`t1` are taken). The container is A program that declares textures and reads none takes no texture units (a pipeline gets the units its shaders read: d3d11.dll's specialisation for class instances leaves the declarations of the textures other classes would sample). Interfaces and `fcall` are not taken here: d3d11.dll specialises such a shader first (docs/Direct3D11.md, class linkage).
+**DXBC** (`ShaderKind::Dxbc`, `D3d9Dxbc.cpp`): the container the Direct3D 10/11 runtimes pass a driver, Shader Model 4.0 / 4.1 / 5.0 / 5.1 vertex and pixel shaders (5.1 declares constant buffers, textures and samplers as ranges with a space: `cb[ID][index][element]`, `t[ID][index]`; only space 0, single-register ranges, `b0` as the push constants and `t0`/`t1` are taken). The container is A program that declares textures and reads none takes no texture units (a pipeline gets the units its shaders read: d3d11.dll's specialisation for class instances leaves the declarations of the textures other classes would sample). Interfaces and `fcall` are not taken here: d3d11.dll specialises such a shader first (docs/Direct3D11.md, class linkage). Subroutines and switches are: see "Subroutines and switches in DXBC" below.
 checked, the SHDR / SHEX program and the ISGN / OSGN signatures are read, and the program is decoded into the same instruction form, so the interpreter, the TGSI text and the
 device forms below all apply. Registers map as in Direct3D 9 (`vN` = attribute location N, outputs and pixel inputs by COLOR0/1 and TEXCOORD0/1, SV_Position, `cb0[0..7]` the push
 constants, literals become constants, `t0`/`t1` 2D textures). Taken: the float arithmetic, dot products, comparisons (as 1.0 / 0.0), movc, rounding, sincos / sqrt / rsq / exp / log / div,
@@ -255,7 +255,9 @@ range of levels are the host's texture views) every image of one sample may have
   backing, after the GPU's contents are read back (a level 0 drawn into); block-compressed and integer images are refused.
 - **Storage images** of any level of a layered image (`BindUavImage`'s layers are the level's).
 - **Mirrors of subresources**: `SetMirror`'s optional words name the subresource (level | layer << 16) each layer of the mirror shows - what d3d12.dll makes a narrow texture's
-  unordered access view of a level, or of layers of an array, of (`narrow_mirror`: an R8 / R8G8 / R16 / R16G16 view of the widened image, whose channels go back).
+  unordered access view of a level, or of layers of an array, of (`narrow_mirror`: an R8 / R8G8 / R16 / R16G16 view of the widened image, whose channels go back). A mirror may
+  be a volume of one level too, each of its slices a source's subresource (subresource words required): what an unordered access view of slices of a level of a narrow volume
+  writes through (`RWTexture3D` of an R8 / R16G16 ... volume).
 - **The DLLs**: d3d12.dll makes resources of any levels and kinds (cube arrays: `TcosD3D12ResourceOptions(TCOS_RESOURCE_CUBE)` of a multiple of six; a plain Direct3D 12
   program's arrays of six or twelve are cubes and cube arrays through their views), honours a shader resource view's `MostDetailedMip` / `MipLevels` and slices
   (`srv_view`), render target and depth stencil views' `MipSlice` (the level and its size into the pass; a depth-only pass's companion target is of the level's size),
@@ -270,11 +272,37 @@ range of levels are the host's texture views) every image of one sample may have
 
 ## Depth buffers read as textures, comparisons, texture and sampler pairs
 
-A depth buffer is a texture too when it is made `kAllocDepthStencil | kAllocTexture` (one sample, one level; a 2D image, an array or a cube - not a volume): the adapter's
+A depth buffer is a texture too when it is made `kAllocDepthStencil | kAllocTexture` (one sample; one level, or any on a device with `kFeature2MipmappedLayers`; a 2D image, an array, a cube or a cube array - not a volume): the adapter's
 `graphics::kFeature2DepthTextures` (bit 16 of `DeviceInfo::features2`; the CPU renderer and virgl), `kNotSupported` without it. Its device image is `kImageDepthAttachment |
 kImageSampled`. A unit bound to it reads the depth as (depth, 0, 0, 1) - every depth is a float here, so a D16 or D24 buffer's is not rounded to its bits -, or, with
-`SamplerDesc::stencil`, the stencil plane of a D24S8 buffer as the integers (0, stencil, 0, 1) (Direct3D's X24_TYPELESS_G8_UINT view, read with `Load`). Drawing into it while a unit
-reads it is refused (as for any target).
+`SamplerDesc::stencil`, the stencil plane of a D24S8 buffer as the integers (0, stencil, 0, 1) (Direct3D's X24_TYPELESS_G8_UINT view, read with `Load`). A unit's view of it
+(`BindTexture`'s view words, a descriptor's view) is of any of its levels and layers, of another kind than the image's as for colour textures (a slice of an array as a 2D texture,
+six layers as a cube, an array of whole cubes as a cube array): the CPU renderer reads the view's level and layer planes, virgl's sampler views show those levels and layers of the
+host's depth texture. Drawing into a level and layer of it while a unit reads that one is refused (as for any target); other levels and layers of it may be read meanwhile.
+
+**Copies** (`kFeature2DepthCopies`: the CPU renderer and virgl). The system keeps no memory of a depth buffer or of a multisampled image, so the device copies them:
+`IImage::copy_subresource` copies a whole subresource into another image of the same format, sample count and size there (a depth buffer's planes asked for), and
+`IImage::read_depth_subresource` / `write_depth_subresource` give the CPU a depth buffer's depth plane as floats and its stencil plane as bytes. `CopyRegion` of two depth buffers or two
+multisampled images is such a copy of whole subresources (the rectangle all of the destination's level at 0, 0; anything else is refused), with an optional fourteenth word, the planes
+(bit 0 the depth, bit 1 the stencil; 0 every plane the buffers have). `CopyBufferImage` of a depth buffer needs one of the depth layouts in its twelfth word - `NarrowLayout::DepthFloat32`
+(5: the depth as 32-bit floats), `DepthUnorm16` (6: 16-bit codes), `DepthUnorm24` (7: 24-bit codes in the low bits of a word whose high byte is 0) or `Stencil8` (8: a D24S8 buffer's stencil as
+bytes) - and copies a rectangle of a level's layer of that plane into the buffer or out of it (the rest of the plane and the other plane keep what they had); into the buffer a depth is
+rounded to the nearest code, into the image a code becomes the float it stands for. On virgl the planes go through transfers of the host's Z32_FLOAT / Z32_FLOAT_S8X24_UINT resource
+(a float, then a word with the stencil in its low byte), the subresource copies are blits of the planes asked for (masks Z and S; the rows turned over between images kept in the two
+orders - a multisampled image never is). Direct3D 12's rules come first in d3d12.dll: a depth buffer or a multisampled image is copied whole, a subresource of a D24S8 / D32S8 buffer is
+of one plane (the stencil's subresources after the depth's, `D3D12_FEATURE_FORMAT_INFO`'s `PlaneCount` 2 also for the typeless forms; the footprints of the depth plane are
+`R32_TYPELESS` words and of the stencil plane `R8_TYPELESS` bytes), and a copy against the rules is not made (the debug layer's error on Windows).
+
+**The least level of detail of a view** (Direct3D 12's `ResourceMinLODClamp`, Direct3D 11's `SetResourceMinLOD`): a texture descriptor's `min_lod` word (`EscapeOp::WriteDescriptors`; a
+float, 0 none, at most 1000) is the most detailed level its lookups take, counted in the image's levels. At each draw the binding raises the sampler's `min_lod` to the clamp less the
+view's first level (and its `max_lod` with it: Direct3D clamps the sampler's level first, then takes the greater of it and the clamp), and gives a sampler without levels the nearest
+level; a clamp past the view's last level reads that last level. Loads are not clamped. Every device has it (it is the sampler's state).
+
+**Gathers of cube arrays.** gather4 and gather4_c (Gather, GatherRed / Green / Blue / Alpha, GatherCmp*) of a `TextureCubeArray` take the direction and the cube from the coordinate's
+four components (no offsets: Direct3D has none for cubes): the CPU renderer looks the taps up on the face of the cube the direction names (`sample_lod_cube_array`, as a cube's with
+the neighbouring face for a tap off the face), TGSI's `TG4` has the coordinate's four components on `CUBEARRAY` (DXIL's cube arrays are SM5's resource dimension 10 now, their
+`textureGather` the same). The component a gather takes is the one the four-component sampler operand selects (fxc's and Wine's `s0.z` of GatherBlue), through the resource operand's
+swizzle (the DXIL translator writes it on the resource, with a sampler of no components).
 
 **Comparisons.** `SamplerDesc::compare` (a `graphics::CompareOp`, never .. always; Never when the sampler does not compare) is what `sample_c` / `sample_c_lz` (SampleCmp,
 SampleCmpLevelZero) and `gather4_c` / `gather4_po_c` (GatherCmp) compare with: a texel passes when reference <op> texel. `ITextureSet::sample_compare` filters the passes as the
@@ -283,8 +311,8 @@ cubes (the face the direction points at, no filtering across faces); a static te
 the four texels by `ITextureSet::compare_op`. Any texture whose red is the depth can be compared (R32_FLOAT and R16_UNORM textures too). The TGSI text compares by hand - a TG4 of
 the red channels, the passes, the weights from the place in the footprint (on a cube from the face's place, worked out from the direction) -, reading each unit's comparison from the
 constants: `CONST[kSamplerCompareRegister + unit]` (register 256, after the most a program may have) holds (less passes, equal passes, greater passes, linear filter) as 1 or 0
-(`graphics::sampler_compare_constant`), which virgl puts after the push constants for a pipeline whose modules say `ShaderModuleDesc::sampler_constants`. The level is the base
-one there (textures that are compared - depth buffers - have one).
+(`graphics::sampler_compare_constant`), which virgl puts after the push constants for a pipeline whose modules say `ShaderModuleDesc::sampler_constants`. The level is the view's
+first one there (SampleCmpLevelZero's; a SampleCmp of a mipmapped texture compares that level on virgl).
 
 **In the stream and the descriptors.** `BindTexture` takes an optional tenth word, `texture_view_word()` of DxgTypes.hpp: the comparison in bits 0-3 and the stencil plane in bit 8
 (refused for an image that is not a D24S8 depth buffer). Direct3D 12's descriptors (`EscapeOp::WriteDescriptors`): a sampler's offset low word is its comparison (`CompareOp`, 0
@@ -698,12 +726,38 @@ out (`pixel_bytes`: 1, 2, 4, 8 or 12 bytes; BC4 blocks are 8 bytes, the others 1
 - **Sizes**: `kMaxTextureDimension` is 16384 (Direct3D 11's); `IGraphicsDevice::max_image_dimension` says what a device has (4096 unless it says more: the CPU renderer 16384,
   virgl the host's `max_texture_2d_size` from `virgl_caps_v2`, read with version 2 of the second capability set), and `AdapterCaps::max_texture_dimension` is that (VidMm
   refuses larger textures with `kNotSupported`). Video surfaces stay at most 4096 (`kMinTextureDimension`).
-- d3d12.dll keeps R8 / R8G8 / R16 / R16G16 unorm as it did - widened into four-channel images, the planes of the video formats
-  and their mirrors depend on that -; every other format above is a format of its own there (`KF_R8` .. `KF_BC7_SRGB`), and d3d11.dll keeps every format as it is.
+- d3d12.dll keeps R8 / R8G8 / R16 / R16G16 unorm and typeless as the kernel's own narrow formats where the adapter has them for the texture's use, widened into four-channel
+  images elsewhere and for the planes of the video formats (see *Strip cuts, filters, samplers of Direct3D 12, line modes, narrow formats* below); every other format above is a
+  format of its own there (`KF_R8` .. `KF_BC7_SRGB`), and d3d11.dll keeps every format as it is.
   `TextureFormatsTest` checks the conversions (every code of the packed and the 8- and 16-bit formats, the small floats, the shared exponent); d3d12test's `test_formats`
   checks on each adapter that the support answers are what can be made, that a shader's `Load` reads what was written in each format, copies keep the bytes, render targets of
   each kind keep what a pixel shader wrote in their encoding, BC4 - BC7 blocks are read as their decoded texels (BC7's sRGB form linearised and filtered on linear values), a
   typed clear of R11G11B10 and 16384-wide textures.
+
+### Subroutines and switches in DXBC
+
+`D3d9Dxbc.cpp` (`Flattener`) rewrites a program's words before they are compiled, for every stage and every device (the interpreter and TGSI for virgl run the same
+flow control):
+- `call l#` is the subroutine (from `label l#` to the next label or the end) inlined; `callc_z` / `callc_nz` is that inside `if_z` / `if_nz`. Calls nest 32 deep (Direct3D's
+  limit); deeper can only be recursion, which Direct3D does not have: kInvalidParameter. A subroutine that returns before its end is a loop run once, its returns breaks; from
+  inside its own loops and switches a return sets a flag first and each loop and switch out to the subroutine's breaks on when it ends with the flag (cleared after it).
+  A label of a function body (an interface's) is kNotSupported: d3d11.dll specialises those shaders, inlining their subroutines itself so that each has its body's `this`.
+- `retc_z` / `retc_nz` of the main program is `if`, `ret`, `endif` (a return inside an if ends the program: `kRetEarly`); in a hull shader, where `ret` ends a phase, it is
+  kNotSupported.
+- A switch whose cases each end in a break at their top level (or a return or continue), with no other break of the switch, is a chain of `if` / `else` on the selector
+  (copied first into a temporary of its own); the default case is the last else, case labels together are one case. Any other switch (a break inside an if of a case,
+  `breakc`, a case that falls into the next, a default between cases) is a loop run once around one `if` per case, taken when the selector matched that case or one before
+  it, or when it is none of the cases for the default (computed before the loop); the breaks of the cases break the loop. A `continue` of a loop outside such a switch sets a
+  flag and breaks; after the switch it continues (or breaks on to the next such switch out).
+- The temporaries: one for the flags and one for each level of switches inside switches, after the program's own (every `dcl_temps` is made larger; more than 253 in all
+  is kNotSupported). A program without these instructions is left as it is. Loops and ifs nest 64 deep in the instruction form (was 8 and 24).
+- A hull shader that moves `vOutputControlPointID` into a temporary and indexes the control points with it (`v[r1.x + 0][0]`, what Microsoft's compiler makes in a
+  subroutine) reads the control point being made, as `vicp[vOutputControlPointID]`: the temporary is followed through the instructions without flow control after the
+  move and until it is written. A geometry shader's inputs indexed by a register are still not taken (`[unroll]` the loop).
+- Fixed on the way: a geometry shader's `dcl_input v[N][r]` before its `dcl_inputprimitive` (the order Microsoft's compiler writes) was refused.
+- Tests: `tests/run_host_tests.sh DxbcFlowTest` - Microsoft's compiler's `[call] switch` and switch shaders (`tests/data/dxbc/*call*.hlsl`, `ps_switch.hlsl`, every stage)
+  run on the interpreter and as TGSI on the test's TGSI machine against what the HLSL says, hand-made programs (returns out of loops of nested subroutines, continue from a
+  switch, a falling case, callc, retc, the nesting limit, recursion), truncations and every bit turned under the sanitizers; d3d11test / d3d12test draw with them.
 
 ### More queries
 
@@ -729,6 +783,15 @@ A multisampled colour allocation may also be a texture (`kAllocRenderTarget | kA
 
 ### Several geometry-shader output streams, and stream output
 
+(`SetStreamOutput` takes a fourth word, optional: `end`, the byte the binding's writes stop at - a primitive that does not fit before it is not written, nor any after it,
+and it counts as needed and not written, as at the buffer's end; `kStreamOutputNoEnd` or left out: the buffer's end; a multiple of 4 within the allocation and not before
+the offset. `ICommandBuffer::bind_stream_output` takes it (the CPU renderer cuts its view of the buffer there, virgl makes the host's target that size). d3d12.dll binds
+a view with BufferLocation + SizeInBytes as the end, its start read from BufferFilledSizeLocation when the chunk runs.)
+
+(A pipeline whose fragment shader stands in for none - d3d12.dll's null pixel shader for a pipeline state without one - has `kPipelineFlagStandInFragment` (8) in the
+CreatePipeline escape's flags word, `GraphicsPipelineDesc::stand_in_fragment`: its runs are not counted as PSInvocations - the CPU renderer does not count them, virgl
+ends the pixel shader invocations' host query segment around the draw.)
+
 `dcl_stream` and `emit_stream` / `cut_stream` / `emitthencut_stream` (gs_5_0; at most `kMaxGeometryStreams` = 4 streams, and D3D's rule that more than one stream means every one is a point list) write each vertex to the stream it names; the shader's outputs belong to the stream whose emit follows their writes (the `OSG5` signature names the stream of each). `PipelineDesc::stream_output_count` entries (`StreamOutputEntry{stream, output, start_component, component_count, buffer}`, at most 16, `output` 0 the position as the shader wrote it, +Y up, and n the vertex shader's varying n - 1), `stream_output_stride[4]` (bytes) and `rasterized_stream` (the stream that is drawn, -1 for none) say what is captured; entries of one buffer must be of one stream. The buffers are `kAllocStreamOutput` allocations (`kBufferStreamOutput`) bound with `CommandWriter::set_stream_output(slot, allocation, offset)`; a draw refuses when a buffer its pipeline writes is unbound. Records are appended from the bound offset on; a primitive that does not fit is dropped whole and its stream stops (strips are written as lists of triangles, with the rasterizer's swap of every second one). The escape ABI has trailing words after the hull / domain ones: the entry count and, when it is not 0, the rasterized stream, four strides and, for each entry, `stream | output << 8 | start << 16 | count << 24` and the buffer. `kFeatureStreamOutput` (the CPU renderer and virgl).
 
 **Later additions.** *Stages*: stream output also takes the outputs of a vertex shader (no geometry or tessellation: a primitive of the draw's list topology) or of a domain shader (the tessellator's primitives); only stream 0 exists there, and `rasterized_stream` is -1 or 0. *Drawing another stream*: `rasterized_stream` may name any stream of a geometry shader (its position and varyings go through the pipeline as stream 0's would). *Appending*: `set_stream_output(slot, allocation, kStreamOutputAppendOffset)` (`graphics::kStreamOutputAppend` on the device interface) starts where the last stream output into that buffer ended; the device keeps that in `IBuffer::stream_output_filled`, VidMm keeps it across a device object being dropped. *Queries*: `QueryKind::Timestamp` (`kFeatureTimestampQueries`; the CPU renderer's clock counts 1000 ns for every timestamp unless `SoftwareDevice::set_clock` gives it a real one; the value is taken when the query ends) and `SoPrimitivesWritten` / `SoPrimitivesNeeded` (the kind word's bits 8-9 are the output stream); a primitive that does not fit counts as needed, not as written, and the stream stays closed.
@@ -750,8 +813,10 @@ virgl, in more detail than above: the declaration goes with the last vertex-proc
 - **Resource states**: an allocation made with `kAllocTrackState` (any other flags as usual) has a state (`AllocationDesc::initial_state`, D3D12's bits: `state::kRenderTarget` ...). `ResourceBarrier` moves it (a transition names the state it expects; the same state twice, a writing state combined with another, and a state that does not exist are refused; split barriers begin/end; unordered access barriers need an allocation in that state; aliasing barriers are no-ops), and a pass target, a vertex / index / constant buffer, a bound texture, an unordered access view, a stream output buffer, a copy and a resolve each need the matching state (the common state is promoted for reads and copies, as D3D12 does). The states a stream leaves are kept for the next stream; a stream that is refused changes nothing. Allocations without the flag are not checked.
 - **Conformance** (virgl matches the CPU renderer): the compute scene through root signature with root constants, root UAVs and a table, and the 3D texture scene through a table, root constants and a static sampler, with barriers.
 
-Reserved (tiled) buffers (`kAllocReserved`, `Kernel::update_tile_mappings`): a buffer of whole 64 KiB tiles with its own backing; each tile is mapped to a heap range or to nothing (reads zero, writes dropped) and is gathered from / scattered to the heap's memory on upload, read-back and CPU writes, so placed allocations and the GPU see the same bytes. Reserved textures too (`kAllocReserved` with `kAllocTexture`, sampled only): a plain 2D texture of any colour format that is not block-compressed, of any size, on Direct3D's standard 64 KiB tile shapes for the bytes of its texels in the heaps (`tile_shape`: 8 bits 256 x 256, 16 bits 256 x 128, 32 bits 128 x 128, 64 bits 128 x 64, 128 bits 64 x 64). `AllocationDesc::tile_narrow` (a `NarrowLayout`, the optional private-data word `kAwTileNarrow`) says the heaps hold Direct3D's R8 / R8G8 / R16 / R16G16 texels, which the image keeps widened as every narrow format: gathering widens them to (r, g or 0, 0, maximum), scattering keeps the first channels. The tiles of the standard levels (at least a tile both ways) are numbered row by row, level after level; the smaller levels (the packed mips) follow as one run of texels over as many tiles as they fill; `update_tile_mappings` takes those numbers; a tile in a heap is its rows one after the other (the layout is ours, not a GPU's swizzle); the conformance scene draws one mapped to two placed textures. Only the tiles the device or the CPU changed are scattered back (`TileBinding::changed`, found against the heaps
-before any is written), so tiles that alias one place of a heap (Direct3D's `REUSE_SINGLE_TILE`, `CopyTileMappings`) show a write through any of them. The 64- and 128-bit formats have one level (the kernel's wide images do). Not done: tiled render targets, depth and mipped textures (D3D12's packed mips), command lists / bundles / `ExecuteIndirect` as such (a stream is the command list), a root signature checked against the pipeline, more than one constant buffer, register spaces other than 0, descriptor heaps with copy-on-use semantics for `D3D12_DESCRIPTOR_RANGE_FLAG_*`, the escape ABI for the new objects (they are `Kernel` methods; the user-mode DLLs do not exist yet).
+Reserved (tiled) buffers (`kAllocReserved`, `Kernel::update_tile_mappings`): a buffer of whole 64 KiB tiles with its own backing; each tile is mapped to a heap range or to nothing (reads zero, writes dropped) and is gathered from / scattered to the heap's memory on upload, read-back and CPU writes, so placed allocations and the GPU see the same bytes. Reserved textures too (`kAllocReserved` with `kAllocTexture`, and `kAllocRenderTarget` or `kAllocStorageImage`): a 2D texture, array, cube or volume of any colour or block-compressed format (sampled only), any size and levels, one sample, on Direct3D's standard 64 KiB tile shapes for the bytes of its elements - texels, or 4 x 4 blocks - in the heaps (`tile_shape`: 8 bits 256 x 256, 16 bits 256 x 128, 32 bits 128 x 128, 64 bits 128 x 64, 128 bits 64 x 64; a volume 64 x 32 x 32, 32 x 32 x 32, 32 x 32 x 16, 32 x 16 x 16, 16 x 16 x 16). No reserved depth buffer or multisampled image: those have no backing the tiles could be gathered into. `AllocationDesc::tile_narrow` (a `NarrowLayout`, the optional private-data word `kAwTileNarrow`) says the heaps hold Direct3D's R8 / R8G8 / R16 / R16G16 texels, which the image keeps widened as every narrow format: gathering widens them to (r, g or 0, 0, maximum), scattering keeps the first channels. `ReservedLayout` (VidMm.hpp) is the numbering, Direct3D's: each slice has the tiles of its standard levels (at least a tile in every direction, in texels) level after level, a level's tiles in x, then y, then z order, then its packed levels as one run of elements (a volume's level slice after slice) over as many tiles as they fill; the slices follow one another; `update_tile_mappings` takes those numbers; a tile in a heap is its rows one after the other (the layout is ours, not a GPU's swizzle), or - `kTileStandardSwizzle` (bit 8 of `tile_narrow`: Direct3D's `64KB_STANDARD_SWIZZLE`) - its elements where Direct3D's standard swizzle puts them (`ReservedLayout::swizzle_x/y/z`, the patterns of src/Windows/tcos_swizzle.h; the packed levels stay rows); the conformance scene draws one mapped to two placed textures. Only the tiles the device or the CPU changed are scattered back (`TileBinding::changed`, found against the heaps
+before any is written), so tiles that alias one place of a heap (Direct3D's `REUSE_SINGLE_TILE`, `CopyTileMappings`) show a write through any of them. A heap knows the reserved allocations with tiles in it (`tile_users_`): a write into it makes them stale, and their GPU writes come back before another one gathers from it. What the GPU draws or stores into a reserved texture goes to its mapped tiles when it is read back (`settle_tiles`); what fell on unmapped tiles is dropped - the backing is gathered again and the image uploaded before its next use, so it reads as zero (Direct3D's tier 2). A remapping reads the GPU's writes back first. The device image is told which tiles are mapped (`graphics::ImageResidency`, `IImage::set_residency`: one unit per tile of the standard levels, one per slice for the packed ones); on a device with `kFeature2TileResidency` (the CPU renderer) the shaders' residency feedback counts the texels each lookup reads in unmapped units. The stream op `CopyTiles` (48: direction, reserved, first tile, count, buffer, offset) moves the 64 KiB a tile holds in its heap to or from a buffer (an unmapped tile gives zeros and drops what it is given) - Direct3D's `CopyTiles`.
+
+Residency feedback in shaders (Direct3D's tiled resources tier 2): the DXBC decoder takes the `_s` forms of the lookups - gather4_s 0xDB, gather4_c_s 0xDC, gather4_po_s 0xDD, gather4_po_c_s 0xDE, ld_s 0xDF, ld2dms_s 0xE0, sample_l_s 0xE4, sample_c_lz_s 0xE5, sample_cl_s 0xE6, sample_b_cl_s 0xE7, sample_d_cl_s 0xE8, sample_c_cl_s 0xE9 (the status destination after the first operand, the clamp - the finest level of detail - last for the `_cl_` ones) - as the plain lookup with `Instruction::feedback`, `status` and `clamp`; the interpreter brackets the lookup with `ITextureSet::begin_feedback(clamp)` / `end_feedback()` and writes the status (1: every texel read was mapped). `check_access_fully_mapped` (0xEA) is an integer compare with 0. The DXIL translator writes the same forms for `Sample` / `SampleBias` / `SampleGrad` / `SampleCmp` with a clamp argument and for any lookup whose ResRet status (element 4) is read, and `CheckAccessFullyMapped` (dx.op 71). A program with them needs `kFeature2TileResidency` (`required_features2`); the TGSI and Direct3D 9 token emitters refuse them, so virgl has none (Direct3D 12 tier 1 there). `ld_uav_typed_s` (0xE1), `ld_raw_s` (0xE2) and `ld_structured_s` (0xE3) are refused: the storage buffers and images have no residency here. Not done: tiled depth and multisampled textures, command lists / bundles / `ExecuteIndirect` as such (a stream is the command list), a root signature checked against the pipeline, more than one constant buffer, register spaces other than 0, descriptor heaps with copy-on-use semantics for `D3D12_DESCRIPTOR_RANGE_FLAG_*`, the escape ABI for the new objects (they are `Kernel` methods; the user-mode DLLs do not exist yet).
 
 ### Direct3D 12: resource heaps (placed resources)
 
@@ -879,8 +944,9 @@ later stream subobjects, `OPTIONS19` .. `21`, the GPU upload heap, `ID3D12Device
   ending-access resolves), the enhanced barriers (`ID3D12GraphicsCommandList7::Barrier`, `OPTIONS12.EnhancedBarriersSupported`: layouts and accesses need no transition;
   a placed resource whose access after is `NO_ACCESS` goes out of use as with an aliasing barrier - its bytes written to the heap's memory and the allocations sharing
   them marked to take them up), `ID3D12GraphicsCommandList8::OMSetFrontAndBackStencilRef` (one reference for both faces), `List9::RSSetDepthBias` /
-  `IASetIndexBufferStripCutValue` and `List10::SetProgram` / `DispatchGraph` (features at "not supported": left out), and `ClearUnorderedAccessViewUint/Float` of buffer views (raw, structured and typed, each format's conversion). The calls of the features the device reports at
-  the "not supported" tier (depth bounds, sample positions, view instancing, meta commands, raytracing, shading rate, mesh shaders) are calls a program may not make here.
+  `IASetIndexBufferStripCutValue` and `List10::SetProgram` / `DispatchGraph` (features at "not supported": left out), and `ClearUnorderedAccessViewUint/Float` of buffer views (raw, structured and typed, each format's conversion). Depth bounds, sample positions,
+  view instancing and variable-rate shading are below ("Direct3D 12's optional rasterizer features"); the calls of the features the device reports at the "not supported" tier
+  (meta commands, raytracing, mesh shaders; and those four where the adapter lacks them: virgl) are calls a program may not make here.
 - `resource.inc`: textures in custom heaps the CPU sees (`D3D12_CPU_PAGE_PROPERTY_WRITE_BACK` / `WRITE_COMBINE`, the driver's layout), `Map` with no pointer and
   `WriteToSubresource` / `ReadFromSubresource`, which lock the kernel's image of the subresource (a plane of a planar texture's slice, a slice of a packed YUV array; the
   texels of the narrow formats and planes widened into the kernel's pixels and narrowed back). `D3D12_TEXTURE_LAYOUT_64KB_STANDARD_SWIZZLE` (`StandardSwizzle64KBSupported`):
@@ -930,7 +996,9 @@ kernel's pipelines, samplers and streams. `graphics::DeviceFeature2` bits say wh
   snorm and 10-bit targets are written as without one). `D3D11_FEATURE_DATA_D3D11_OPTIONS::OutputMergerLogicOp` and D3D12's say it. d3d11's `CreateBlendState1` refuses a
   logic operation with blending or with `IndependentBlendEnable` (the runtime's rules, which Wine's `test_logic_op` checks); d3d12 one whose targets differ in it.
 - **`kFeature2SamplerState`** (`SamplerDesc::max_anisotropy`, `custom_border` / `border_rgba`): anisotropic filtering by the reference method of
-  `EXT_texture_filter_anisotropic` (`N = min(ceil(Pmax / Pmin), MaxAnisotropy)` lookups along the longer axis of the footprint at the level of `Pmax / N`); border colours of any
+  `EXT_texture_filter_anisotropic` (`N = min(ceil(Pmax / Pmin), MaxAnisotropy)` lookups along the longer axis of the footprint at the level of `Pmax / N`; the CPU renderer's axis is
+  the change of the coordinate its lookups take - (u, v) of a 2D texture or an array, (u, v, w) of a volume, the direction of a cube or a cube array, whose footprint is measured on the
+  face); border colours of any
   value (an integer texture's as its integers' bits: Direct3D 12's static `OPAQUE_BLACK_UINT` / `OPAQUE_WHITE_UINT`). The stream's `BindTexture` (its 15th to 20th words, after the view word and
   the view) and the descriptor escape's sampler entries (`kDescriptorSamplerExtras` in the kind word; six words after the entry, the comparison staying in the offset's low word)
   carry them; a device without the bit draws a descriptor's sampler without anisotropy and with the nearest of the three
@@ -946,7 +1014,64 @@ kernel's pipelines, samplers and streams. `graphics::DeviceFeature2` bits say wh
   `VPAndRTArrayIndexFromAnyShaderFeedingRasterizer`, D3D12's `...SupportedWithoutGSEmulation`): the CPU renderer. virgl has not got it - virglrenderer takes a vertex shader's
   layer only with `GL_ARB_shader_viewport_layer_array` and an evaluation shader's not at all - so such a shader is refused there (`kNotSupported`) and the options say FALSE.
 
-The escape `CreatePipeline` carries the state in a tagged part after the constant blend colour (beside the step rates' 'STP1', in either order): `kPipelineRasterTag` ('RST1'), `kPipelineRasterWords` (16), then fill mode,
+### Strip cuts, filters, samplers of Direct3D 12, line modes, narrow formats (gap pass 4)
+
+- **Strip cuts** (`SetTopology`'s optional second word, `StripCut`: 0 none, 1 0xFFFF, 2 0xFFFFFFFF - Direct3D 12's `D3D12_INDEX_BUFFER_STRIP_CUT_VALUE` -, 3 or no word the index
+  buffer's largest index, as Direct3D 10 and 11 cut). The kernel expands strips and fans itself (`draw_expanded`), so every device draws them; an index that cuts names no
+  vertex (the vertex-range check skips it). A fan is cut as a strip is (a new fan from the next index). d3d12.dll sends the pipeline's `IBStripCutValue` (also of a pipeline made
+  with `D3D12_PIPELINE_STATE_FLAG_DYNAMIC_INDEX_BUFFER_STRIP_CUT`), which `SetPipelineState` sets and `IASetIndexBufferStripCutValue` replaces (bundles record it); OPTIONS15
+  says `DynamicIndexBufferStripCutSupported` and `TriangleFanSupported` (`D3D_PRIMITIVE_TOPOLOGY_TRIANGLEFAN`, 6) on every device. d3d11.dll's pipelines are dynamic and it sets
+  the cut of its index buffer's format at each indexed draw; d3d9.dll's are `DISABLED` (Direct3D 9 has no restart index).
+- **`kFeature2SeparateFilters`** (`SamplerDesc::separate_mag` / `mag_filter`; the filter word's bits 1 and 2, `filter_word`): a magnification filter of its own - a lookup
+  minifies where its level of detail, with the bias and the `MinLOD` / `MaxLOD` clamps, is above 0, else it magnifies - Direct3D's `MIN_POINT_MAG_LINEAR`,
+  `MIN_LINEAR_MAG_POINT` .. . CPU renderer (`TextureSet::at_lod`; the derivatives are taken when the two filters differ even without levels) and virgl (the sampler state's
+  `mag_img_filter`). A descriptor's filters on a device without the bit are the one filter, linear where either is (`lower_texture`); a stream that names them there is refused.
+- **`kFeature2SamplerReductions`** (`SamplerDesc::reduction`, bits 4-5): Direct3D's `MINIMUM_*` / `MAXIMUM_*` filters - each channel's least or greatest value among the texels
+  the filter gives a weight above 0, also across a linear mip filter's two levels, a volume's two slices and an anisotropic filter's lookups. The CPU renderer; virglrenderer's
+  sampler state has no reduction mode, so virgl refuses them (`kNotSupported`) - d3d11's `MinMaxFiltering` (`D3D11_FEATURE_DATA_D3D11_OPTIONS1`) says so and its
+  `CreateSamplerState` refuses those filters there with `E_INVALIDARG`; Direct3D 12 has no option for them (a draw with one is refused on virgl).
+- **`kFeature2UnnormalizedCoordinates`** (`SamplerDesc::unnormalized`, bit 8): the coordinates of a 2D image (or array) are in texels of the view's first level, which every
+  lookup reads - `D3D12_SAMPLER_FLAG_NON_NORMALIZED_COORDINATES` (OPTIONS17 `NonNormalizedCoordinateSamplersSupported`), with Direct3D 12's rules (min and mag filter alike, a
+  point mip filter, no anisotropy or comparison, clamp or border in U and V, MinLOD and MaxLOD 0: d3d12.dll's `CreateSampler2` writes a null descriptor and the root
+  signature parser refuses a static sampler that breaks them). The CPU renderer; virgl's sampler state has no `normalized_coords` (`kNotSupported`, the option FALSE).
+- **`D3D12_SAMPLER_DESC2`** (`CreateSampler2`): every filter of `D3D12_FILTER`, also the anisotropic ones with a point mip filter (0x54, 0xD4, 0x154, 0x1D4:
+  `AnisoFilterWithPointMipSupported`, OPTIONS19 - on a device without anisotropy they filter as `MIN_MAG_LINEAR_MIP_POINT`, as the others filter trilinearly there), a border
+  colour of integers (`D3D12_SAMPLER_FLAG_UINT_BORDER_COLOR`: the four words as the bits of `border_rgba`, which an integer texture's channels are) and coordinates in texels.
+  A value of `D3D12_FILTER` that is none, or flags that do not exist, make a null descriptor (the call is void). Static samplers of root signature 1.2 the same
+  (`d3d12_filter`, `D3D12_STATIC_SAMPLER_DESC1::Flags`).
+- **`kFeature2LineModes`** (`GraphicsPipelineDesc::line_mode`, `graphics::LineMode`; the escape's tagged part `kPipelineLineTag` 'LIN1', one word): aliased (the device's line,
+  as before), alpha-antialiased (a rectangle one pixel wide between the two ends, not lengthened; each pixel it touches is shaded once at its centre with the attributes of the
+  nearest point of the line, and the first target's alpha is multiplied by the part of the pixel the rectangle covers - measured on 8 x 8 points - before blending: Direct3D's
+  `AntialiasedLineEnable`, which needs blending to show), quadrilateral 1.4 pixels wide (`MultisampleEnable`, `QUADRILATERAL_WIDE`) and 1.0 wide (`QUADRILATERAL_NARROW`,
+  `NarrowQuadrilateralLinesSupported`): the rectangle as two triangles, its samples or pixel centres by the triangle rules. Wireframe triangles' edges are drawn in the
+  pipeline's line mode. d3d12.dll takes the mode from `RASTERIZER2`'s `LineRasterizationMode`, or `MultisampleEnable` before `AntialiasedLineEnable` (D3D10 - 12's choice),
+  d3d11.dll forwards its rasterizer state's two flags. CPU renderer; virgl: smooth lines (`line_smooth`, the host's `GL_LINE_SMOOTH`: its coverage, not this rectangle's, in the
+  alpha) and multisampled lines of the width 1.4 or 1.0 - which the host draws as rectangles on a multisampled target; on a target of one sample it draws its own aliased line.
+  A device without the bit makes no pipeline of another mode (`kNotSupported`); d3d12.dll draws lines aliased there and refuses narrow quadrilateral ones (`E_INVALIDARG`).
+- **Narrow formats kept as they are**: d3d12.dll makes R8 / R8G8 / R16 / R16G16 textures - unorm and typeless - of the kernel's own `R8Unorm`, `R8G8Unorm`, `R16Unorm` and
+  `R16G16Unorm` where the adapter has that format for all the texture is made for (sampled and filtered; drawn into and blended; storage; levels; samples: `g_native_narrow`),
+  and widened into four channels as before elsewhere (and always for the planes of the video formats). A typeless one's views of the other kinds of its family (R8 / R8G8: snorm,
+  uint, sint; R16 / R16G16 also float) are **mirrors** in the view's format: VidMm's mirrors now take the one- and two-channel 8- and 16-bit families (a mirror and its sources of
+  one family: the same bytes) and several levels (`set_mirror` with a source for each subresource, levels first). A shader resource view is a mirror of its levels and layers
+  (`typed_mirror`; at most 256 subresources), a render target view and an unordered access view a write-back mirror of its level and layers (the view's channels given back
+  after each pass or dispatch). A view of another family, or of a typeless format, is a null descriptor. d3d11.dll passes the view's format for such textures (`view_format12`)
+  and keeps an `R16_TYPELESS` colour texture typeless (it was R16_UNORM).
+- **`R1_UNORM`**: a bit a pixel, the first pixel of a row the most significant bit of its first byte (as DirectXTex reads it), rows of `(width + 7) / 8` bytes in footprints. The
+  kernel keeps it as bytes of 0 or 255 in red of an `R8Unorm` image (or widened into `A8B8G8R8`), and `CopyBufferImage` with `NarrowLayout::R1` (9) packs and unpacks the bits (a
+  red of 128 or more is a 1; bits of the last byte past the width are left as they are). Direct3D 12: 1D and 2D textures, arrays and levels, sampled (as 0 and 1 in red) and
+  loaded - no render target, unordered access, volume, cube, tiles, multisampling or CPU-visible memory (`E_INVALIDARG`; the format support says the same); a footprint box
+  or place that does not start on a byte is not copied. Direct3D 11 the same (initial data, `UpdateSubresource`, copies; no staging or dynamic texture). Direct3D 10's
+  `D3D10_FILTER_TEXT_1BIT` has no Direct3D 11 / 12 form, so nothing else filters it.
+
+Tests: `DxgkrnlTest`'s `test_fixed_state_gaps` (the filter word and `d3d12_filter`, the strip cut word, the three line widths and an alpha-antialiased line, the 'LIN1' part and
+a device without the bits, R1 copies into R8Unorm and A8B8G8R8 and back, mirrors of the narrow families and of two levels) and the conformance scenes "separate minification and
+magnification filters", "minimum and maximum filters", "non-normalized sampler coordinates" and "index buffer strip cut" (pixels checked in `test_conformance`); d3d12test's
+`test_fixed_state_gaps` (strip cuts of the pipeline, of the list, from a bundle, of 32-bit indices, a fan; the separate filters, reductions, anisotropy with a point mip filter,
+an integer border colour and coordinates in texels through `CreateSampler2` in a compute shader, `cs_smp_lod.dxbc`; the three line modes and `RASTERIZER2`'s narrow lines; every
+view of the four typeless families read with `Load`, typeless R8 / R16 drawn into as `R8_UINT` / `R16_UINT`; R1_UNORM footprints, copies, `Load` and `Sample`) and d3d11test's
+`test_fixed_state_gaps` (strip cuts, separate filters, `MinMaxFiltering`, line modes, an R16_TYPELESS texture as R16_FLOAT, R1_UNORM).
+
+The escape `CreatePipeline` carries the state in a tagged part after the constant blend colour (beside the step rates' 'STP1' and the line mode's 'LIN1', in any order): `kPipelineRasterTag` ('RST1'), `kPipelineRasterWords` (16), then fill mode,
 depth clip, depth bias (constant, slope and clamp as float bits - `DepthBias::constant` is a float, so that `RASTERIZER1/2`'s float `DepthBias` goes as it is -, the format's bits), the back faces' stencil (separate, compare, fail, depth fail, pass, compare mask, write
 mask), the logic operation (enable, op) and the back faces' stencil reference (with separate: Direct3D 12's `OMSetFrontAndBackStencilRef`). Direct3D 9 (d3d9.dll) uses it too: `D3DRS_FILLMODE` wireframe (`D3DFILL_POINT` is drawn solid: Direct3D 12 below has no point
 fill), `D3DRS_DEPTHBIAS` / `D3DRS_SLOPESCALEDEPTHBIAS` (the bias a depth: in units of the device's D24 buffer), `D3DRS_TWOSIDEDSTENCILMODE` with the `D3DRS_CCW_STENCIL*`
@@ -961,18 +1086,17 @@ real virglrenderer 1.3.0); `test_rasterizer_state` (the refusals, a device witho
 `test_sampler_state` (Wine's `test_logic_op` table on an `R8G8B8A8_UINT` target, the depth formats' units, `MaxLOD` / `MinLOD` / `MipLODBias` of 0.3, anisotropy of 2 and 4
 on the CPU renderer).
 
-Not done, in the order a program is likely to meet them: views of a typeless R8 / R8G8 / R16 / R16G16 texture in a format of another kind than unorm (the texture is kept widened; its other views are not made); `R1_UNORM` (no format here); a depth buffer read
-by shaders while it is also the pass's (read-only) depth buffer, depth buffers of several samples or levels read as textures, SampleCmp of the levels of a mipmapped colour texture on virgl
-(the base level is compared), a vertex and a pixel shader that read one unit as different texture and sampler pairs; unordered access to the slices of a narrow (R8 / R8G8 /
-R16 / R16G16) volume (its mirror would be a volume); copies of depth buffers (the kernel keeps no memory of them: `CopyRegion` refuses them);
-a Direct3D 12 view's `ResourceMinLODClamp` (the sampler's `MinLOD` and d3d11's `SetResourceMinLOD` are applied); gather of a cube array; the layer and viewport from a vertex or domain shader on virgl,
-anisotropic filtering on virgl (virglrenderer 1.3.0 drops it), antialiased lines (`AntialiasedLineEnable`, `MultisampleEnable`'s line modes: lines are one pixel wide and aliased),
-separate minification and magnification filters (`MIN_POINT_MAG_LINEAR` and the like: a linear one makes both linear), `D3D12_SAMPLER_DESC2` (`CreateSampler2`,
-non-normalized coordinates); more than four unordered access buffers; heaps and textures shared across adapters (`D3D12_HEAP_FLAG_SHARED_CROSS_ADAPTER`: `DXGI_ERROR_UNSUPPORTED`,
+Not done, in the order a program is likely to meet them: views of a typeless R8 / R8G8 / R16 / R16G16 texture in another kind on a device without that narrow format (the texture is
+kept widened there, its other views not made), typed views of such a volume's slices or of more than 256 subresources (a mirror is 2D or an array of at most that many); a depth buffer read
+by shaders while it is also the pass's (read-only) depth buffer, depth buffers of several samples read as textures, SampleCmp of the levels of a mipmapped texture on virgl
+(the view's first level is compared), a vertex and a pixel shader that read one unit as different texture and sampler pairs; CPU access to the samples of a multisampled image
+(`read_depth_subresource` and the depth layouts are of one sample; multisampled images are copied whole, image to image, only); the layer and viewport from a vertex or domain shader on virgl,
+anisotropic filtering on virgl (virglrenderer 1.3.0 drops it; the CPU renderer filters 2D textures, arrays, cubes, cube arrays and volumes anisotropically), the minimum and maximum filters and coordinates in texels on virgl (its sampler state has neither), virgl's
+quadrilateral lines on a target of one sample (the host's aliased line) and its smooth lines' coverage (the host's); more than four unordered access buffers; heaps and textures shared across adapters (`D3D12_HEAP_FLAG_SHARED_CROSS_ADAPTER`: `DXGI_ERROR_UNSUPPORTED`,
 `CrossAdapterRowMajorTextureSupported` FALSE: an allocation is of one adapter's memory manager, and sharing one needs a backing both adapters' memory managers keep coherent
 at the fences - read back after one adapter's work, uploaded before the other's -, which `VidMm` does not have; fences shared across adapters are done, the kernel's
-synchronization objects being of no adapter); the blend factor on Vega and the other fixed backends; ray tracing, mesh shaders, variable rate shading, view instancing,
-sampler feedback, work graphs, protected sessions and meta commands (reported unsupported - see below); a depth image's average, least and greatest resolves on virgl
+synchronization objects being of no adapter); the blend factor on Vega and the other fixed backends; ray tracing, mesh shaders, depth bounds, sample positions, variable rate
+shading, view instancing and barycentrics on virgl (below), sampler feedback, work graphs, protected sessions and meta commands (reported unsupported - see below); a depth image's average, least and greatest resolves on virgl
 (the host's blit takes sample 0, and its multisampled depth buffers are attachments a shader does not read); typed UAV clears of formats outside `g_uav_formats`
 (R11G11B10, B5G6R5 ...); and all of it on the GPU backends other than virgl.
 
@@ -980,9 +1104,63 @@ What the Shader Model 6 features would take (the DXIL front end, `DxilTranslate.
 shaders into Shader Model 5 tokens): **ray tracing** - DXIL libraries of many entry functions and their `RDAT` (the root signature subobjects are read already),
 state objects and shader tables, acceleration structures built on the device (a BVH in a buffer), and `TraceRay` / `ReportHit` / `CallShader` lowered into a compute
 program with a traversal loop and the hit groups called as functions (inline ray queries, `RayQuery`, are the smaller first step); **mesh and amplification shaders** -
-the two stages translated and run as compute dispatches whose output primitives feed an indirect draw; **variable rate shading** - coarse pixel shading in the CPU
-renderer, and nothing on virgl (the host's GL has no shading-rate extension through virglrenderer); **sampler feedback** - `WriteSamplerFeedback` writing MinMip and
+the two stages translated and run as compute dispatches whose output primitives feed an indirect draw; **sampler feedback** - `WriteSamplerFeedback` writing MinMip and
 MipRegionUsed maps (opaque formats) from the sampler's footprint; **work graphs** - node shaders and a scheduler of records between dispatches.
+
+### Direct3D 12's optional rasterizer features: depth bounds, sample positions, view instancing, variable-rate shading, barycentrics
+
+What `OPTIONS2`, `OPTIONS3`, `OPTIONS6` and `OPTIONS10` report above their "not supported" tiers, done on the CPU renderer. Each is a `graphics::DeviceFeature2` bit of the device
+(high bits, apart from the run the other features fill): `kFeature2SamplePositions` (1 << 25), `kFeature2ViewInstancing` (26), `kFeature2Barycentrics` (28),
+`kFeature2SampleCopies` (29), `kFeature2DepthBounds` (30), `kFeature2ShadingRate` (31); d3d12.dll mirrors them as `DEV_FEATURE2_*` and reports a feature only where the adapter has it. virgl has
+none of them: virglrenderer's protocol carries no depth bounds, sample locations or shading rate, the TGSI emitted here has no view id, barycentric or per-vertex pixel inputs,
+and a copy of samples would be a host blit - its tiers stay "not supported" (with the QEMU backend moving to Venus, Vulkan's `depthBounds`, `VK_EXT_sample_locations`,
+`VK_KHR_fragment_shading_rate`, multiview and `VK_KHR_fragment_shader_barycentric` are the way there).
+
+The state is the command stream's, not the pipeline's: four ops numbered apart from the others (`Op::SetDepthBounds` 56, `SetSamplePositions` 57, `SetViewInstance` 58,
+`SetShadingRate` 59; `CommandStream.hpp` has their words), valid inside and outside passes, kept for the stream across passes and command buffers (`StreamRunner::RasterState`,
+given to the device's command buffer before the next draw, `apply_raster`); a stream starts with the defaults. The device interface has the matching `ICommandBuffer` calls
+(`set_depth_bounds`, `set_sample_positions`, `set_view_instance`, `set_shading_rate` / `set_shading_rate_image`, `copy_samples`), recorded by `CommandRecorder`.
+
+- **Depth bounds** (`OMSetDepthBounds`, `DEPTH_STENCIL1/2.DepthBoundsTestEnable`): a sample whose depth buffer value, as it was before the draw, is outside `min .. max`
+  (inclusive) is not drawn - no shader result, depth or stencil write, no occlusion count; triangles, lines and points; a pass without a depth buffer passes everything. The
+  enable is the PSO's, sent with the list's range before each draw that changes them (`send_raster_state`); a range outside 0 .. 1 or with `min > max` is a call left out.
+- **Programmable sample positions** (`SetSamplePositions`, tier 2): 1, 2, 4, 8 or 16 positions in sixteenths of a pixel (-8 .. 7) for one pixel, or for each pixel of a 2 x 2
+  quad aligned to even coordinates (at most 16 in all) - the triangles' coverage and the depth of each sample come from them; a single-sample pass covers a pixel by its one
+  moved sample; positions of another count than the pass's are not used; `(0, 0, NULL)` the standard ones again. Not in bundles (they inherit the caller's). The CPU renderer
+  keeps every sample's depth, so depth is never "compressed": the rules of the interplay with clears, copies and resolves hold by themselves. `ResolveSubresourceRegion` with
+  `D3D12_RESOLVE_MODE_DECOMPRESS` is a copy of every sample of the region (colour, depth and stencil) into another resource of the format and sample count (`ResolveRegion` of
+  mode `kResolveCopySamples` 16 and six words of region, `kFeature2SampleCopies`; one sample: an ordinary copy); in place it does nothing. Centroid interpolation is not done,
+  so the positions' order (the centroid priority) has no effect.
+- **View instancing** (`VIEW_INSTANCING` subobject, `SetViewInstanceMask`, `SV_ViewID`; tier 2): draw-call looping in d3d12.dll (`draw_views`): each draw is made once for each
+  view of the PSO - with `ENABLE_VIEW_INSTANCE_MASKING` those of the list's mask (0 when reset; a bundle starts with 0 and its last mask carries back) -, each after a
+  `SetViewInstance` of the view and its location; the kernel's device gives the view to every stage (`VertexContext` / `GeometryInputData` / `HullInputData` / `HullOutputData` /
+  `FragmentContext::view_id`) and adds the location's viewport and render target array index to the primitive's own (32-bit wrapping; out of range: the first, as for the
+  shaders' own). Every stage runs for every view and counts in the pipeline statistics, which tier 2 allows and tier 3 does not. At most 4 views; a location of viewport 16+
+  or layer 2048+, more than 4 views, no locations or another flag is `E_INVALIDARG`. ExecuteIndirect's draws loop the same way.
+- **Variable-rate shading** (tier 2, `AdditionalShadingRatesSupported`, 16 x 16 tiles, the SUM combiner): `RSSetShadingRate` (the rate and the two combiners),
+  `RSSetShadingRateImage` (an R8_UINT texture of one level and sample, a rate a tile; past its edge 1x1), `SV_ShadingRate` written by a vertex or geometry shader (the
+  primitive's first vertex's) and read by a pixel shader. The rate of a tile is `combiner1(combiner0(rate, primitive's), image's)` per axis (`combine_shading_rate`), made what the
+  pass's samples allow (`sanitize_shading_rate`: with 2+ samples an axis at most 2x but 2x4 with 2, never more than 16 samples a coarse pixel, 4x1 / 1x4 the finer 2x1 / 1x2). The
+  CPU renderer then shades each coarse pixel (on a grid from the target's origin, inside the tile) once at its centre - varyings, `SV_Position` and depth there, derivatives and
+  the level of detail over the 2 x 2 quad of coarse pixels - and writes the colour to every covered sample of its pixels, depth and stencil tested per sample at full
+  resolution; a discard drops the whole coarse pixel. Lines and points are shaded per pixel. The image is read when the list runs (`D3D12_RESOURCE_STATE_SHADING_RATE_SOURCE`
+  is `state::kShadingRateSource`).
+- **Barycentrics and the other SM 6.1+ pixel values** (the DXIL translator, `DxilTranslate.cpp`, with operand types no DXBC shader has, `0xF0` .. `0xF3`, read by `D3d9Dxbc.cpp`):
+  `SV_ViewID` (`dx.op.viewID`, any graphics stage), `SV_Barycentrics` (a system value with no register, perspective-correct or - `noperspective` - linear in the screen: the
+  rasterizer carries each vertex's weights through clipping and interpolates them like a varying, so a clipped triangle keeps the weights of the whole one; derivatives of them
+  through `FragmentContext::quad_bary_fn`), `GetAttributeAtVertex` (`dx.op.attributeAtVertex`: a pixel shader's input as vertex 0, 1 or 2 of the primitive made it, in the draw's
+  vertex order: `FragmentContext::vertex_varyings`), `SV_ShadingRate` (D3D_NAME 24 in and out), `IsHelperLane` (SM 6.6). Barycentrics, attributes at vertices and shading rates make the program
+  need their feature bit, so a device without it is not given the shader (`kNotSupported`), and the TGSI emitter refuses them; `SV_ViewID` needs none - a device without view
+  instancing draws every draw as view 0, as Direct3D 12 has a driver without it do (TGSI: the immediate 0), so such shaders run on virgl too.
+- **Tests**: `DxgkrnlTest` (`test_depth_bounds_kernel`, `test_sample_positions_kernel` with the copies of samples, `test_view_instance_kernel`, `test_shading_rate_kernel`,
+  `test_dxil_sm61_values`, `test_barycentrics_kernel`: pixels through the kernel's stream on the CPU renderer, refusals, a device without each feature; the DXIL fixtures
+  `dxil_vs_view`, `dxil_ps_view`, `dxil_ps_bary`, `dxil_ps_attr`, `dxil_ps_rate`, `dxil_vs_rate`, `dxil_ps_helper` made with dxc, truncated and bit-flipped); `d3d12test`'s
+  `test_raster_features` (the caps, and each feature drawn through d3d12.dll and read back: bands of depth, a resolved edge under three sample patterns and a DECOMPRESS, two
+  layers of views with masks and a bundle, three rate sources, barycentric weights and vertex attributes). The emulator's fixture header now has the `.dxil` blobs too
+  (`dx_<name>_dxil`, as `d3d12_qemu.sh` had).
+- **Not done**: centroid and sample interpolation (and so `EvaluateAttributeSnapped` and per-sample shading at all), `SV_Coverage` in and out, tier 3 view instancing (the
+  stages before the first that reads `SV_ViewID` are run for each view), the shader model the device reports stays 5.1 (`D3D12_FEATURE_SHADER_MODEL`): DXIL shaders of 6.1 - 6.6
+  with these values run, but an application that checks the model first will not use them; wave operations, which 6.0 needs, are not translated.
 
 ### The other GPU backends and feature level 11_0
 

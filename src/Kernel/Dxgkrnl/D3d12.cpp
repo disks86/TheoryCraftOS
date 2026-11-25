@@ -46,6 +46,25 @@ graphics::AddressMode address_of(uint32_t mode) {
   }
 }
 
+}  // namespace
+
+bool d3d12_filter(uint32_t filter, graphics::SamplerDesc* s) {
+  // (D3D12_FILTER: bit 0 the mip filter, bit 2 the magnification filter, bit 4 the minification filter - 1 linear -, bit 6 anisotropic - with min and mag linear, and mip linear or,
+  // AnisoFilterWithPointMipSupported, point: 0x55 / 0x54 -, bits 7-8 the reduction: 0 standard, 1 comparison, 2 minimum, 3 maximum)
+  if (filter & ~0x1D5u) return false;
+  const bool anisotropic = (filter & 0x40u) != 0;
+  if (anisotropic && (filter & 0x14u) != 0x14u) return false;
+  s->filter = (filter & 0x10u) ? graphics::Filter::Linear : graphics::Filter::Nearest;
+  s->mag_filter = (filter & 0x04u) ? graphics::Filter::Linear : graphics::Filter::Nearest;
+  s->separate_mag = s->mag_filter != s->filter;
+  s->mip_filter = (filter & 0x01u) ? graphics::MipFilter::Linear : graphics::MipFilter::Nearest;
+  const uint32_t reduction = (filter >> 7) & 3u;
+  s->reduction = reduction == 2 ? graphics::SamplerReduction::Minimum : reduction == 3 ? graphics::SamplerReduction::Maximum : graphics::SamplerReduction::Weighted;
+  return true;
+}
+
+namespace {
+
 NtStatus parse_blob(ConstByteView blob, RootSignatureDesc* out) {
   ByteReader head(blob);
   const uint32_t version = head.le32(), parameter_count = head.le32(), parameters_offset = head.le32(), sampler_count = head.le32(), samplers_offset = head.le32();
@@ -129,14 +148,21 @@ NtStatus parse_blob(ConstByteView blob, RootSignatureDesc* out) {
     const uint32_t reg = at.le32(), space = at.le32(), visibility = at.le32();
     const uint32_t sampler_flags = version == 3 ? at.le32() : 0;   // (D3D12_SAMPLER_FLAGS: 1 integer border colour, 2 coordinates in texels)
     if (!at.ok() || address_u < 1 || address_u > 5 || address_v < 1 || address_v > 5 || visibility > 5 || comparison > 8 || border > 4) return status::kInvalidParameter;
-    // (an integer border colour goes with its flag and the flag with it; no device takes coordinates in texels - the device reports
-    // NonNormalizedCoordinateSamplersSupported FALSE - so such a sampler is a root signature this adapter cannot have)
-    if ((sampler_flags & ~3u) || (sampler_flags & 2u) || ((border >= 3) != ((sampler_flags & 1u) != 0))) return status::kInvalidParameter;
-    if ((filter == 0x55 || filter == 0xD5) && (anisotropy < 1 || anisotropy > graphics::kMaxAnisotropy)) return status::kInvalidParameter;   // (D3D12_MAX_MAXANISOTROPY)
+    // (the flags: an integer border colour goes with its flag - D3D12_SAMPLER_FLAG_UINT_BORDER_COLOR - and the flag with it, as the serializer has them; coordinates in texels -
+    // D3D12_SAMPLER_FLAG_NON_NORMALIZED_COORDINATES - need a device with kFeature2UnnormalizedCoordinates when a draw uses the sampler)
+    if ((sampler_flags & ~3u) || ((border >= 3) != ((sampler_flags & 1u) != 0))) return status::kInvalidParameter;
     StaticSampler& s = out->samplers[i];
-    // (the filter: bit 0 mip, bit 2 mag, bit 4 min; anisotropic filtering (0x55) and comparison filters are the linear ones)
-    s.sampler.filter = (filter & 0x4) || filter == 0x55 || filter == 0xD5 ? graphics::Filter::Linear : graphics::Filter::Nearest;
-    s.sampler.mip_filter = filter & 0x1 ? graphics::MipFilter::Linear : graphics::MipFilter::Nearest;
+    if (!d3d12_filter(filter, &s.sampler)) return status::kInvalidParameter;
+    const bool anisotropic = (filter & 0x40u) != 0;
+    if (anisotropic && (anisotropy < 1 || anisotropy > graphics::kMaxAnisotropy)) return status::kInvalidParameter;   // (D3D12_MAX_MAXANISOTROPY)
+    if (sampler_flags & 2u) {
+      // (a non-normalized sampler: min and mag filter alike, point mip filter, no anisotropy or comparison, clamp or border addressing, levels of detail 0 - the rules of Direct3D 12)
+      const uint32_t reduction = (filter >> 7) & 3u;
+      if (s.sampler.separate_mag || s.sampler.mip_filter != graphics::MipFilter::Nearest || anisotropic || reduction == 1 || (address_u != 3 && address_u != 4) || (address_v != 3 && address_v != 4) ||
+          min_lod != 0.0f || max_lod != 0.0f)
+        return status::kInvalidParameter;
+      s.sampler.unnormalized = true;
+    }
     s.sampler.address_u = address_of(address_u);
     s.sampler.address_v = address_of(address_v);
     s.sampler.border = border == 1 || border == 3 ? graphics::BorderColor::OpaqueBlack : border == 2 || border == 4 ? graphics::BorderColor::OpaqueWhite : graphics::BorderColor::TransparentBlack;
@@ -147,7 +173,7 @@ NtStatus parse_blob(ConstByteView blob, RootSignatureDesc* out) {
       s.sampler.border_rgba[0] = s.sampler.border_rgba[1] = s.sampler.border_rgba[2] = __builtin_bit_cast(float, value);
       s.sampler.border_rgba[3] = __builtin_bit_cast(float, 1u);
     }
-    if (filter == 0x55 || filter == 0xD5) s.sampler.max_anisotropy = static_cast<uint8_t>(anisotropy);   // (the anisotropic filters, plain and comparing)
+    if (anisotropic) s.sampler.max_anisotropy = static_cast<uint8_t>(anisotropy);   // (the anisotropic filters: plain, comparing, minimum and maximum)
     s.sampler.lod_bias = bias == bias && bias > -100.0f && bias < 100.0f ? bias : 0.0f;
     s.sampler.min_lod = min_lod == min_lod && min_lod > -100.0f && min_lod < 1000.0f ? min_lod : 0.0f;
     s.sampler.max_lod = max_lod == max_lod && max_lod > -100.0f && max_lod < 1000.0f ? max_lod : 1000.0f;

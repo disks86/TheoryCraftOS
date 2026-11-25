@@ -197,23 +197,23 @@ void test_specialised(HostAllocator& allocator, const std::vector<uint8_t>& dxbc
 }
 
 // Every prefix, and every bit turned: no read outside, and what is made the kernel's front end reads without one.
-void test_damaged(HostAllocator& allocator, const std::vector<uint8_t>& dxbc, DlWork* work) {
+void test_damaged(HostAllocator& allocator, const std::vector<uint8_t>& dxbc, DlWork* work, const char* const* types, uint32_t slots) {
   std::unique_ptr<DlInfo> info(new DlInfo);
   DlBinding b[3];
   int specialised = 0;
   for (size_t n = 0; n < dxbc.size(); n += (n < 256 ? 1 : 7)) {
     std::vector<uint8_t> cut(dxbc.begin(), dxbc.begin() + static_cast<long>(n));
     if (dl_read_interfaces(cut.data(), cut.size(), info.get()) != DL_OK) continue;
-    for (uint32_t s = 0; s < 3; ++s) b[s] = bound(*info, "cConst", 0, s);
-    if (dl_specialise(cut.data(), cut.size(), info.get(), b, 3, work) == DL_OK) ++specialised;
+    for (uint32_t s = 0; s < slots; ++s) b[s] = bound(*info, types[s], 0, s, 0, 0);
+    if (dl_specialise(cut.data(), cut.size(), info.get(), b, slots, work) == DL_OK) ++specialised;
   }
   int taken = 0;
   for (size_t bit = 0; bit < dxbc.size() * 8; ++bit) {
     std::vector<uint8_t> turned = dxbc;
     turned[bit / 8] ^= static_cast<uint8_t>(1u << (bit % 8));
     if (dl_read_interfaces(turned.data(), turned.size(), info.get()) != DL_OK) continue;
-    for (uint32_t s = 0; s < 3; ++s) b[s] = bound(*info, s == 0 ? "cLoop" : s == 1 ? "cScaled" : "cConst", 0, s);
-    if (dl_specialise(turned.data(), turned.size(), info.get(), b, 3, work) != DL_OK) continue;
+    for (uint32_t s = 0; s < slots; ++s) b[s] = bound(*info, types[s], 0, s, 0, 0);
+    if (dl_specialise(turned.data(), turned.size(), info.get(), b, slots, work) != DL_OK) continue;
     ++taken;
     UniquePointer<D3d9Program> program;
     if (D3d9Program::compile_dxbc(allocator, ConstByteView(work->dxbc, work->dxbc_size), &program) == status::kSuccess) {
@@ -225,6 +225,97 @@ void test_damaged(HostAllocator& allocator, const std::vector<uint8_t>& dxbc, Dl
   }
   printf("  damaged: %d prefixes specialised, %d of %zu turned bits\n", specialised, taken, dxbc.size() * 8);
   CHECK(taken > 0);
+}
+
+// A texture set whose texel colour says the texture register it read (through the program's unit -> register mapping) and the sampler register.
+struct RegisterTextures final : graphics::ITextureSet {
+  const D3d9Program* program = nullptr;
+  graphics::Vec4 sample(uint32_t unit, float u, float v) const override {
+    (void)u, (void)v;
+    return {0.125f * static_cast<float>(program->texture_register(unit)), 0.125f * static_cast<float>(program->sampler_register(unit)), 0, 1};
+  }
+};
+
+// ps_iface_dyn: a body that samples t[this.texture + pick] (pick read from the instance's data): the index is a register the kernel cannot take, so the sample
+// is written once for each declared texture inside ifs; the call goes through an array indexed by a register (which).
+void test_dynamic_index(HostAllocator& allocator, DlWork* work) {
+  const std::vector<uint8_t> dxbc = read_file("tests/data/dxbc/ps_iface_dyn.dxbc");
+  CHECK(dxbc.size() > 100);
+  std::unique_ptr<DlInfo> info(new DlInfo);
+  CHECK(dl_read_interfaces(dxbc.data(), dxbc.size(), info.get()) == DL_OK && info->slot_count == 2);
+  // g_list = {picker (cb0[0], textures 0 and 1, sampler 0), picker_b (cb2[0], textures 2 and 3, sampler 1)}
+  DlBinding b[2] = {bound(*info, "cPick", 0, 0, 0, 0), bound(*info, "cPick", 2, 0, 2, 1)};
+  // the constants: cb0 (picker.pick, flat.colour), cb1 (which), cb2 (picker_b.pick)
+  struct {
+    uint32_t pick0[4], flat[4], which[4], pick1[4];
+  } c = {};
+  int ran = 0;
+  for (uint32_t which = 0; which < 2; ++which)
+    for (uint32_t pick = 0; pick < 2; ++pick) {
+      c.which[0] = which;
+      c.pick0[0] = pick, c.pick1[0] = pick;
+      if (dl_specialise(dxbc.data(), dxbc.size(), info.get(), b, 2, work) != DL_OK) continue;
+      UniquePointer<D3d9Program> program;
+      const NtStatus s = D3d9Program::compile_dxbc(allocator, ConstByteView(work->dxbc, work->dxbc_size), &program);
+      CHECK(s == status::kSuccess);
+      if (s != status::kSuccess) {
+        printf("  the kernel refused the specialised shader: %x\n", static_cast<unsigned>(s));
+        continue;
+      }
+      RegisterTextures textures;
+      textures.program = program.get();
+      graphics::Vec4 varyings[graphics::kMaxVaryings] = {};
+      graphics::Vec4 colour[graphics::kMaxColorTargets] = {};
+      CHECK(program->run_fragment(varyings, reinterpret_cast<const uint8_t*>(&c), &textures, colour));
+      const float texture = static_cast<float>(which * 2 + pick), sampler = static_cast<float>(which);
+      CHECK(fabsf(colour[0].x - 0.125f * texture) < 1e-6f && fabsf(colour[0].y - 0.125f * sampler) < 1e-6f);
+      if (!(fabsf(colour[0].x - 0.125f * texture) < 1e-6f)) printf("  which %u pick %u: texture %g sampler %g\n", which, pick, colour[0].x * 8, colour[0].y * 8);
+      ++ran;
+    }
+  CHECK(ran == 4);
+  const char* const types[3] = {"cPick", "cFlat", "cPick"};
+  test_damaged(allocator, dxbc, work, types, 2);
+}
+
+// Subroutines of call / label (a [call] switch: tests/data/dxbc/ps_call_switch.hlsl) are inlined by the specialisation itself, so that a body's subroutine
+// would have its `this`: the shader made has no call or label left and gives what the HLSL says.
+void test_subroutines(HostAllocator& allocator, DlWork* work) {
+  const std::vector<uint8_t> dxbc = read_file("tests/data/dxbc/ps_call_switch.dxbc");
+  CHECK(dxbc.size() > 100);
+  DlInfo none;
+  CHECK(dl_read_interfaces(dxbc.data(), dxbc.size(), &none) == DL_OK && none.slot_count == 0);
+  CHECK(dl_specialise(dxbc.data(), dxbc.size(), &none, nullptr, 0, work) == DL_OK);
+  for (uint32_t i = 2; i < work->out_count;) {
+    const uint32_t op = work->out[i] & 0x7FF, length = dl_ins_length(work->out, work->out_count, i);
+    CHECK(length != 0);
+    if (!length) break;
+    CHECK(op != DL_OP_CALL && op != DL_OP_CALLC && op != DL_OP_LABEL);
+    i += length;
+  }
+  UniquePointer<D3d9Program> program;
+  CHECK(D3d9Program::compile_dxbc(allocator, ConstByteView(work->dxbc, work->dxbc_size), &program) == status::kSuccess);
+  if (!program) return;
+  int bad = 0;
+  for (int32_t first = -1; first <= 4; ++first)
+    for (int32_t n = 0; n <= 4; ++n) {
+      struct { int32_t sel[4]; float a[4]; } c = {{first, n, 0, 0}, {0.25f, 0.6f, 0.125f, 0.75f}};
+      float want[4] = {0, 0, 0, 0};
+      for (int32_t i = 0; i < n; ++i) {
+        switch (first + i) {
+          case 0: want[0] += 1; break;
+          case 1: { float s = 0; for (int q = 0; q < 4; ++q) { s += c.a[0]; if (s > c.a[1]) break; } want[1] += s; break; }
+          case 2: case 3: want[2] += c.a[2]; if (c.a[3] > 0.5f) { want[3] += 1; break; } want[3] += 2; break;
+          default: for (float& v : want) v += 0.5f; break;
+        }
+      }
+      graphics::Vec4 varyings[graphics::kMaxVaryings] = {};
+      graphics::Vec4 colour[graphics::kMaxColorTargets] = {};
+      if (!program->run_fragment(varyings, reinterpret_cast<const uint8_t*>(&c), nullptr, colour)) ++bad;
+      const float got[4] = {colour[0].x, colour[0].y, colour[0].z, colour[0].w};
+      for (int k = 0; k < 4; ++k)
+        if (!(fabsf(got[k] - want[k]) < 1e-5f)) ++bad;
+    }
+  CHECK(bad == 0);
 }
 
 }  // namespace
@@ -239,7 +330,12 @@ int main() {
   CHECK(dl_read_interfaces(dxbc.data(), dxbc.size(), info.get()) == DL_OK);
   test_interfaces_read(dxbc, *info);
   test_specialised(allocator, dxbc, *info, work.get());
-  test_damaged(allocator, dxbc, work.get());
+  {
+    const char* const types[3] = {"cLoop", "cScaled", "cConst"};
+    test_damaged(allocator, dxbc, work.get(), types, 3);
+  }
+  test_dynamic_index(allocator, work.get());
+  test_subroutines(allocator, work.get());
   // a shader without interfaces: nothing to read
   {
     const std::vector<uint8_t> plain = read_file("tests/data/dxbc/ps_tex.dxbc");

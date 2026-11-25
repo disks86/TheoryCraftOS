@@ -36,10 +36,28 @@
 #define ROOM_BYTES 4096
 #define ROOM_ALLOCS 160      /* (what a draw uses itself, and the resources its tables of descriptors reach: TABLE_ALLOCS a table) */
 #define TABLE_ALLOCS 32
-#define MAX_OPEN_QUERIES 64  /* queries open at once in a list */
+#define GROUP_QUERIES 32     /* more queries open than this at the start of a chunk: those of one kind are counted there by one device query (QueryFan) */
+#define QUERY_SCRATCH_STRIDE 128u   /* the bytes of a fan's result in the list's scratch allocation (the largest result: 112) */
 #define CHUNK_QUERIES 250    /* the device queries of a chunk (graphics::kMaxOcclusionQueries, 256, in the kernel) */
 
 struct Indirect;
+/* A binding of a stream output target in a chunk that starts where the target's filled size says (Direct3D 12 appends at BufferLocation + *BufferFilledSizeLocation): the
+ * chunk's offset word at byte `at` is made from the value when the chunk is run (queue.inc: run_chunk). */
+typedef struct SoPatch {
+  UINT at;
+  struct Resource *fill;
+  UINT64 fill_offset, offset, size;
+} SoPatch;
+
+/* A device query of a chunk that counts for many of the list's open queries of one kind (more than GROUP_QUERIES open when the chunk began): it is written to
+ * slot `slot` of the list's scratch allocation, and when the chunk has run its values are added to each member's result (queue.inc: chunk_fan_out). */
+typedef struct FanMember { UINT alloc, offset; } FanMember;
+typedef struct QueryFan {
+  UINT kind, slot;
+  FanMember *members;
+  UINT nmembers;
+} QueryFan;
+
 typedef struct Chunk {
   BYTE *bytes;
   UINT size;
@@ -50,6 +68,11 @@ typedef struct Chunk {
   int pred_op;
   UINT allocs[CHUNK_ALLOCS];
   UINT nalloc;
+  SoPatch *so_patches;         /* the stream output bindings whose start is read when the chunk is run */
+  UINT nso_patches;
+  QueryFan *fans;              /* the chunk's device queries for groups of open queries, and the list's scratch allocation they write */
+  UINT nfans, fan_scratch;
+  int fans_open;               /* (their device queries are begun in the chunk and not yet ended) */
 } Chunk;
 
 typedef struct RootArg {
@@ -64,9 +87,14 @@ typedef struct RootArg {
 typedef struct SoTarget {
   UINT alloc;
   UINT64 offset;
+  UINT64 size;                 /* SizeInBytes: the writes stop at offset + size */
   struct Resource *fill;       /* BufferFilledSizeLocation */
   UINT64 fill_offset;
+  UINT sent_chunk;             /* (a fill: the chunk its binding was first sent in, ~0 before; its filled size is written after that chunk and every later one ...) */
+  UINT retired_chunk;          /* (... up to this one, the last its draws can be in: SOSetTargets bound another; ~0 while it is bound) */
+  UINT fill_entry;             /* (a target: its entry in CmdList.fills, ~0 for none) */
 } SoTarget;
+
 
 typedef struct Binding {
   RootSig *rs;
@@ -81,7 +109,7 @@ typedef struct CmdAlloc {
 typedef struct CmdList CmdList;
 enum { B_PSO = 1, B_TOPOLOGY, B_STENCIL_REF, B_INDEX_BUFFER, B_VERTEX_BUFFERS, B_HEAPS, B_GRAPHICS_SIGNATURE, B_COMPUTE_SIGNATURE, B_GRAPHICS_CONSTANTS, B_COMPUTE_CONSTANTS,
        B_GRAPHICS_CBV, B_GRAPHICS_SRV, B_GRAPHICS_UAV, B_COMPUTE_CBV, B_COMPUTE_SRV, B_COMPUTE_UAV, B_GRAPHICS_TABLE, B_COMPUTE_TABLE, B_DRAW, B_DRAW_INDEXED, B_DISPATCH, B_INDIRECT,
-       B_BLEND_FACTOR, B_STENCIL_REFS, B_DEPTH_BIAS };
+       B_BLEND_FACTOR, B_STENCIL_REFS, B_DEPTH_BIAS, B_DEPTH_BOUNDS, B_VIEW_MASK, B_SHADING_RATE, B_SHADING_RATE_IMAGE, B_STRIP_CUT };
 static void bundle_log(CmdList *l, UINT id, const UINT64 a[6], const UINT *data, UINT ndata);
 #define BUNDLE_LOG(l, id, ...) do { if ((l)->bundle) { UINT64 a_[6] = {__VA_ARGS__}; bundle_log((l), (id), a_, NULL, 0); return; } } while (0)
 #define BUNDLE_LOG_DATA(l, id, data, n, ...) do { if ((l)->bundle) { UINT64 a_[6] = {__VA_ARGS__}; bundle_log((l), (id), a_, (data), (n)); return; } } while (0)
@@ -116,10 +144,13 @@ struct CmdList {
   /* the kernel pipelines the recording binds, each once (its PSO keeps it until the list is reset: pso_use / pso_unuse) */
   struct BoundPipe { Pso *pso; UINT handle; } *bound;
   UINT nbound, cap_bound;
+  /* the queries open (extras.inc): each is begun again in every chunk it goes on into, adding to what the chunks before counted - or counted in a chunk by one device
+   * query for all of its kind (`grouped`) when many are open. Any number (the room is kept across resets); the scratch allocation of the groups' results. */
+  struct OpenQuery { struct QHeap *heap; UINT index; D3D12_QUERY_TYPE type; UINT kind; int grouped; } *open_q;
+  UINT cap_open_q;
+  UINT query_scratch;
   /* the state of the recording */
   Pso *pso;
-  /* the queries open (extras.inc): each is begun again in every chunk it goes on into, adding to what the chunks before counted */
-  struct OpenQuery { struct QHeap *heap; UINT index; D3D12_QUERY_TYPE type; UINT kind; } open_q[MAX_OPEN_QUERIES];
   UINT nopen_q;
   Resource *pred;              /* the predication in force */
   UINT64 pred_off;
@@ -136,6 +167,7 @@ struct CmdList {
   DescHeap *heaps_used[8];       /* every shader-visible heap the list set: their kernel copies are brought up to date when it is executed */
   UINT nheaps_used;
   D3D12_PRIMITIVE_TOPOLOGY topology;
+  UINT strip_cut;              /* D3D12_INDEX_BUFFER_STRIP_CUT_VALUE: the pipeline's IBStripCutValue, or IASetIndexBufferStripCutValue's (the kernel's SetTopology second word) */
   struct { UINT alloc, stride; UINT64 offset, size; } vb[8];      /* the vertex buffers (input slots) */
   UINT ib_alloc, ib_format;
   UINT64 ib_offset;
@@ -164,6 +196,7 @@ struct CmdList {
   int sent_valid;
   UINT sent_pipeline;
   UINT sent_topology;
+  UINT sent_strip_cut;
   UINT sent_vb_alloc[8], sent_ib_alloc;
   UINT64 sent_vb_offset[8], sent_ib_offset;
   UINT sent_ib_format;
@@ -178,6 +211,17 @@ struct CmdList {
   D3D12_RENDER_PASS_RENDER_TARGET_DESC rp_rts[8];
   D3D12_RENDER_PASS_DEPTH_STENCIL_DESC rp_ds;
   int rp_has_ds;
+  /* (cmdlist1.inc) the optional rasterizer state: OMSetDepthBounds (0 .. 1 when reset), SetSamplePositions (no pixels: the standard positions), SetViewInstanceMask (0),
+   * RSSetShadingRate / RSSetShadingRateImage (1x1, passthrough, none); and what the chunk being recorded has sent of it (raster_sent: words of each op, 0 not sent) */
+  float depth_bounds[2];
+  UINT sample_count_set, sample_pixels;
+  D3D12_SAMPLE_POSITION sample_positions[16];
+  UINT view_mask;
+  UINT shading_rate, rate_combiners[2];
+  struct Resource *rate_image;
+  int sent_bounds, sent_positions, sent_rate;      /* (bounds, rate: 0 the stream's defaults, 1 the words, 2 not known) */
+  UINT sent_bounds_words[3], sent_rate_words[4];
+  UINT sent_view;              /* (the SetViewInstance words sent, view | viewport << 8 | layer << 12; 0xFFFFFFFF none) */
 };
 
 static const GUID *const g_alloc_iids[] = {&IID_ID3D12Object, &IID_ID3D12DeviceChild, &IID_ID3D12Pageable, &IID_ID3D12CommandAllocator, NULL};
@@ -217,7 +261,7 @@ static int chunk_new(CmdList *l) {
   }
   Chunk *c = mem_alloc(sizeof *c);
   if (!c) return 0;
-  c->bytes = mem_alloc(CHUNK_BYTES + 256 + MAX_OPEN_QUERIES * 12);      /* (room for the EndQuery of every open query) */
+  c->bytes = mem_alloc(CHUNK_BYTES + 256 + CHUNK_QUERIES * 12);      /* (room for the EndQuery of every device query of the chunk) */
   if (!c->bytes) { mem_free(c); return 0; }
   c->pred = l->pred;
   c->pred_off = l->pred_off;
@@ -231,6 +275,9 @@ static int chunk_new(CmdList *l) {
   memset(l->sent_vb_alloc, 0, sizeof l->sent_vb_alloc);
   l->sent_ib_alloc = 0;
   l->sent_viewport = l->sent_scissor = 0;
+  l->sent_bounds = l->sent_rate = 0;      /* (a stream starts with the kernel's defaults of the rasterizer state: the standard sample positions too) */
+  l->sent_positions = l->sample_pixels == 0;
+  l->sent_view = 0;
   l->dirty_heaps = 1;
   if (l->nopen_q) queries_resume(l);
   return 1;
@@ -267,6 +314,9 @@ enum { OP_BEGIN_PASS = 1, OP_END_PASS, OP_BIND_PIPELINE, OP_BIND_VB, OP_BIND_IB,
        OP_GENERATE_MIPMAPS, OP_SET_TOPOLOGY, OP_DRAW_INSTANCED, OP_DRAW_INDEXED_INSTANCED, OP_BEGIN_QUERY, OP_END_QUERY, OP_BIND_UAV, OP_DISPATCH, OP_RESOLVE_REGION, OP_SET_STREAM_OUTPUT,
        OP_SET_ROOT_SIGNATURE, OP_SET_DESCRIPTOR_HEAPS, OP_SET_ROOT_CONSTANTS, OP_SET_ROOT_DESCRIPTOR, OP_SET_ROOT_TABLE, OP_RESOURCE_BARRIER, OP_COPY_BUFFER, OP_COPY_BUFFER_IMAGE,
        OP_DECODE_FRAME, OP_VIDEO_PROCESS };
+/* (the kernel's ops of the optional rasterizer state, numbered apart: CommandStream.hpp) */
+enum { OP_SET_DEPTH_BOUNDS = 56, OP_SET_SAMPLE_POSITIONS = 57, OP_SET_VIEW_INSTANCE = 58, OP_SET_SHADING_RATE = 59 };
+static void send_raster_state(CmdList *l);
 
 static void end_pass(CmdList *l) {
   if (!l->pass_open) return;
@@ -296,6 +346,9 @@ static void indirect_free(struct Indirect *i);
 static void list_free_recording(CmdList *l) {
   for (UINT i = 0; i < l->nchunks; ++i) {
     if (l->chunks[i]->indirect) indirect_free(l->chunks[i]->indirect);
+    for (UINT f = 0; f < l->chunks[i]->nfans; ++f) mem_free(l->chunks[i]->fans[f].members);
+    mem_free(l->chunks[i]->fans);
+    mem_free(l->chunks[i]->so_patches);
     mem_free(l->chunks[i]->bytes);
     mem_free(l->chunks[i]);
   }
@@ -314,6 +367,9 @@ static void list_free_recording(CmdList *l) {
 static void list_reset_state(CmdList *l) {
   memset(&l->pso, 0, sizeof *l - offsetof(CmdList, pso));
   l->topology = D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
+  l->depth_bounds[1] = 1.0f;
+  l->sent_view = 0xFFFFFFFFu;      /* (what the stream has is not known - ClearState in the middle of one -: sent again) */
+  l->sent_bounds = l->sent_rate = 2;
   l->dirty_gfx = l->dirty_cs = l->dirty_heaps = 1;
 }
 
@@ -326,6 +382,8 @@ static void list_destroy(DxObj *o) {
   mem_free(l->temps);
   mem_free(l->bound);
   mem_free(l->log);
+  mem_free(l->open_q);
+  if (l->query_scratch) kmt_destroy_allocation(l->d.dev->kdev, l->query_scratch);
   dobj_child_destroy(o);
 }
 
@@ -680,6 +738,7 @@ static UINT topology_code(D3D12_PRIMITIVE_TOPOLOGY t) {
     case D3D_PRIMITIVE_TOPOLOGY_LINESTRIP: return 4;
     case D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST: return 0;
     case D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP: return 1;
+    case 6: return 2;      /* (D3D_PRIMITIVE_TOPOLOGY_TRIANGLEFAN, TriangleFanSupported - OPTIONS15: the kernel expands fans for every device) */
     case D3D_PRIMITIVE_TOPOLOGY_LINELIST_ADJ: return 0x100;
     case D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST_ADJ: return 0x101;
     default:
@@ -763,18 +822,34 @@ static int prepare_draw(CmdList *l, int indexed) {
   for (UINT s = 0; s < 4; ++s) {
     const SoTarget *t = &l->so[s];
     if (t->alloc == l->sent_so_alloc[s] && !(t->alloc && l->so_dirty)) continue;
-    UINT w[3] = {s, t->alloc ? alloc_index(l, t->alloc) : 0xFFFFFFFFu, 0};
-    /* (the first time a bind is sent it starts at the view's offset; sent again after a new chunk it goes on from where the draws before ended) */
-    w[2] = !t->alloc ? 0 : l->so_started[s] && !l->so_dirty ? 0xFFFFFFFFu : (UINT)t->offset;
-    packet(l, OP_SET_STREAM_OUTPUT, w, 3);
+    UINT w[4] = {s, t->alloc ? alloc_index(l, t->alloc) : 0xFFFFFFFFu, 0, 0xFFFFFFFFu};
+    /* (the first time a bind is sent it starts at the view's offset - and after its filled size, read when the chunk is run -; sent again after a new chunk it goes on from
+     * where the draws before ended. The writes stop at the view's end, SizeInBytes after its offset.) */
+    const int fresh = !(l->so_started[s] && !l->so_dirty);
+    w[2] = !t->alloc ? 0 : fresh ? (UINT)t->offset : 0xFFFFFFFFu;
+    if (t->alloc) w[3] = (UINT)(t->offset + t->size);
+    Chunk *c = chunk_cur(l);
+    if (t->alloc && fresh && t->fill && c) {
+      SoPatch *grown = mem_grow(c->so_patches, (SIZE_T)(c->nso_patches + 1) * sizeof *grown);
+      if (grown) {
+        c->so_patches = grown;
+        const SoPatch p = {c->size + 12, t->fill, t->fill_offset, t->offset, t->size};      /* (the offset word: after the packet's header, the slot and the allocation) */
+        c->so_patches[c->nso_patches++] = p;
+      }
+    }
+    if (t->alloc && t->fill_entry < l->nfills && l->fills[t->fill_entry].sent_chunk == 0xFFFFFFFFu) l->fills[t->fill_entry].sent_chunk = l->nchunks - 1;
+    packet(l, OP_SET_STREAM_OUTPUT, w, t->alloc ? 4 : 3);
     l->sent_so_alloc[s] = t->alloc;
     l->so_started[s] = t->alloc != 0;
   }
   l->so_dirty = 0;
   const UINT topology = topology_code(l->topology);
-  if (topology != l->sent_topology) {
-    packet(l, OP_SET_TOPOLOGY, &topology, 1);
+  if (topology != l->sent_topology || l->strip_cut != l->sent_strip_cut) {
+    /* (the topology and which index ends a strip: the kernel's StripCut numbers D3D12_INDEX_BUFFER_STRIP_CUT_VALUE's) */
+    const UINT w[2] = {topology, l->strip_cut};
+    packet(l, OP_SET_TOPOLOGY, w, 2);
     l->sent_topology = topology;
+    l->sent_strip_cut = l->strip_cut;
   }
   for (UINT slot = 0; slot < 8; ++slot) {
     if (!(l->pso->slots_used >> slot & 1) || !l->vb[slot].alloc) continue;
@@ -815,29 +890,67 @@ static int prepare_draw(CmdList *l, int indexed) {
     packet(l, OP_SET_SCISSOR, w, 4 * n);
     l->sent_scissor = 1;
   }
+  send_raster_state(l);
   return 1;
 }
 
 /* ---- drawing and dispatching ------------------------------------------------------------------------------------------------------------------------------------------- */
 
+/* View instancing (a PSO with more than one view) is draw-call looping: the draw is made once for each view of the mask - all the PSO's views, or with
+ * D3D12_VIEW_INSTANCING_FLAG_ENABLE_VIEW_INSTANCE_MASKING those of SetViewInstanceMask's mask -, each after the kernel's SetViewInstance of the view (SV_ViewID) and its
+ * location (added to the shaders' viewport and render target array index). The views of one draw come one after the other: Direct3D 12 orders a view's primitives and
+ * leaves the order between views open. A PSO without views draws as view 0 at no offset. Returns the views (bit n: view n) and sends view 0's state for a plain PSO. */
+static UINT draw_views(CmdList *l) {
+  const Pso *p = l->pso;
+  if (!p->views_on) {
+    if (l->sent_view != 0 && (l->d.dev->caps.features2 & DEV_FEATURE2_VIEW_INSTANCING)) {
+      const UINT w[3] = {0, 0, 0};
+      packet(l, OP_SET_VIEW_INSTANCE, w, 3);
+      l->sent_view = 0;
+    }
+    return 1;
+  }
+  const UINT all = (1u << p->view_count) - 1;
+  return (p->view_flags & D3D12_VIEW_INSTANCING_FLAG_ENABLE_VIEW_INSTANCE_MASKING) ? l->view_mask & all : all;
+}
+static void view_select(CmdList *l, UINT view) {
+  const Pso *p = l->pso;
+  if (!p->views_on) return;
+  const UINT vp = p->view_loc[view].ViewportArrayIndex, rt = p->view_loc[view].RenderTargetArrayIndex;
+  const UINT key = view | vp << 8 | rt << 12;
+  if (key == l->sent_view) return;
+  const UINT w[3] = {view, vp, rt};
+  packet(l, OP_SET_VIEW_INSTANCE, w, 3);
+  l->sent_view = key;
+}
 static void STDMETHODCALLTYPE list_DrawInstanced(CmdList *l, UINT vertices, UINT instances, UINT first_vertex, UINT first_instance) { BUNDLE_LOG(l, B_DRAW, vertices, instances, first_vertex, first_instance);
   if (!vertices || !instances || !prepare_draw(l, 0)) return;
-  if (instances == 1 && first_instance == 0) {
-    UINT w[2] = {vertices, first_vertex};
-    packet(l, OP_DRAW, w, 2);
-  } else {
-    UINT w[4] = {vertices, first_vertex, instances, first_instance};
-    packet(l, OP_DRAW_INSTANCED, w, 4);
+  const UINT views = draw_views(l);
+  for (UINT view = 0; view < 4; ++view) {
+    if (!(views >> view & 1)) continue;
+    view_select(l, view);
+    if (instances == 1 && first_instance == 0) {
+      UINT w[2] = {vertices, first_vertex};
+      packet(l, OP_DRAW, w, 2);
+    } else {
+      UINT w[4] = {vertices, first_vertex, instances, first_instance};
+      packet(l, OP_DRAW_INSTANCED, w, 4);
+    }
   }
 }
 static void STDMETHODCALLTYPE list_DrawIndexedInstanced(CmdList *l, UINT indices, UINT instances, UINT first_index, INT base_vertex, UINT first_instance) { BUNDLE_LOG(l, B_DRAW_INDEXED, indices, instances, first_index, (UINT)base_vertex, first_instance);
   if (!indices || !instances || !l->ib_alloc || !prepare_draw(l, 1)) return;
-  if (instances == 1 && first_instance == 0) {
-    UINT w[3] = {indices, first_index, (UINT)base_vertex};
-    packet(l, OP_DRAW_INDEXED, w, 3);
-  } else {
-    UINT w[5] = {indices, first_index, (UINT)base_vertex, instances, first_instance};
-    packet(l, OP_DRAW_INDEXED_INSTANCED, w, 5);
+  const UINT views = draw_views(l);
+  for (UINT view = 0; view < 4; ++view) {
+    if (!(views >> view & 1)) continue;
+    view_select(l, view);
+    if (instances == 1 && first_instance == 0) {
+      UINT w[3] = {indices, first_index, (UINT)base_vertex};
+      packet(l, OP_DRAW_INDEXED, w, 3);
+    } else {
+      UINT w[5] = {indices, first_index, (UINT)base_vertex, instances, first_instance};
+      packet(l, OP_DRAW_INDEXED_INSTANCED, w, 5);
+    }
   }
 }
 static void STDMETHODCALLTYPE list_Dispatch(CmdList *l, UINT x, UINT y, UINT z) { BUNDLE_LOG(l, B_DISPATCH, x, y, z);
@@ -862,6 +975,8 @@ static void STDMETHODCALLTYPE list_Dispatch(CmdList *l, UINT x, UINT y, UINT z) 
 static void STDMETHODCALLTYPE list_SetPipelineState(CmdList *l, ID3D12PipelineState *p) { keep(l, (IUnknown *)p); BUNDLE_LOG(l, B_PSO, (UINT64)(UINT_PTR)p);
   l->pso = (Pso *)p;
   keep(l, (IUnknown *)p);
+  /* (a graphics pipeline brings its IBStripCutValue - also one made with D3D12_PIPELINE_STATE_FLAG_DYNAMIC_INDEX_BUFFER_STRIP_CUT: IASetIndexBufferStripCutValue changes it after) */
+  if (l->pso && !l->pso->compute) l->strip_cut = l->pso->strip_cut;
 }
 static void STDMETHODCALLTYPE list_IASetPrimitiveTopology(CmdList *l, D3D12_PRIMITIVE_TOPOLOGY t) { BUNDLE_LOG(l, B_TOPOLOGY, t); l->topology = t; }
 /* (up to D3D12_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE: a primitive is drawn with the pair its SV_ViewportArrayIndex names; more than that is the debug layer's error,
@@ -1075,13 +1190,16 @@ static void STDMETHODCALLTYPE list_DiscardResource(CmdList *l, ID3D12Resource *r
 
 /* ---- copies ------------------------------------------------------------------------------------------------------------------------------------------------------------------- */
 
+static void so_copy_order(CmdList *l, const ID3D12Resource *dst, const ID3D12Resource *src, int after);
 static void STDMETHODCALLTYPE list_CopyBufferRegion(CmdList *l, ID3D12Resource *dst, UINT64 dst_offset, ID3D12Resource *src, UINT64 src_offset, UINT64 bytes) {
+  if (!l->bundle) so_copy_order(l, dst, src, 0);
   Resource *d = (Resource *)dst, *s = (Resource *)src;
   if (!d || !s || !bytes || dst_offset > 0xFFFFFFFFu || src_offset > 0xFFFFFFFFu || bytes > 0xFFFFFFFFu) return;
   end_pass(l);
   ensure_room(l, 256, 4);
   UINT w[5] = {alloc_index(l, d->alloc), (UINT)dst_offset, alloc_index(l, s->alloc), (UINT)src_offset, (UINT)bytes};
   packet(l, OP_COPY_BUFFER, w, 5);
+  if (!l->bundle) so_copy_order(l, dst, src, 1);
 }
 
 /* The mip level and layer a subresource index names. */
@@ -1098,9 +1216,20 @@ static UINT sub_target(const Resource *r, UINT sub, UINT *level, UINT *layer, co
     *fi = plane_format(r->fmt, sub / r->layers);
     return r->plane_alloc[sub];      /* (plane * layers + slice: the subresource index itself) */
   }
-  sub_split(r, sub, level, layer);
-  *fi = r->fmt;
+  /* (a depth buffer's plane: its subresources after the depth's are the stencil's, whose footprints are bytes) */
+  const UINT per_plane = r->mips * (r->kind == 1 ? 1 : r->layers);
+  const int depth = r->fmt && r->fmt->depth;
+  sub_split(r, depth ? sub % per_plane : sub, level, layer);
+  *fi = depth ? depth_plane_format(r->desc.Format, sub / per_plane) : r->fmt;
   return r->alloc;
+}
+/* The plane a subresource of a depth buffer is of (0 the depth, 1 the stencil); 0 for the other textures' (planar textures are allocations of a plane each). */
+static UINT sub_depth_plane(const Resource *r, UINT sub) { return r->fmt && r->fmt->depth && !r->planes ? sub / (r->mips * (r->kind == 1 ? 1 : r->layers)) : 0; }
+/* Whether the kernel keeps no memory of the texture's contents - a depth buffer, a multisampled image -, which Direct3D 12 copies only as whole subresources: a copy of one has
+ * no box or one of the whole subresource, and goes to (0, 0, 0) (the debug layer's error on Windows otherwise; the copy is not made). */
+static int whole_copies_only(const Resource *r) { return (r->fmt && r->fmt->depth) || r->desc.SampleDesc.Count > 1; }
+static int whole_box(const D3D12_BOX *box, UINT w, UINT h, UINT d) {
+  return !box || (box->left == 0 && box->top == 0 && box->front == 0 && box->right == w && box->bottom == h && box->back == d);
 }
 /* A CopyBufferImage packet: with the narrow layout of the texture's format as its twelfth word when it has one. */
 static void copy_buffer_image_packet(CmdList *l, UINT direction, UINT image, UINT level, UINT layer, UINT x, UINT y, UINT w, UINT h, UINT buffer, UINT offset, UINT pitch,
@@ -1109,9 +1238,55 @@ static void copy_buffer_image_packet(CmdList *l, UINT direction, UINT image, UIN
   packet(l, OP_COPY_BUFFER_IMAGE, payload, fi && fi->narrow ? 12 : 11);
 }
 
+/* CopyTextureRegion of a depth buffer's plane, or of a multisampled image (whole_copies_only): between a subresource and a footprint (not of a multisampled image), the plane in the
+ * kernel's depth layout of the resource's format (depth_layout), or between two subresources of one format, sample count and size, the same plane of each. */
+static void copy_whole_region(CmdList *l, const D3D12_TEXTURE_COPY_LOCATION *dst, UINT x, UINT y, UINT z, const D3D12_TEXTURE_COPY_LOCATION *src, const D3D12_BOX *box) {
+  Resource *d = (Resource *)dst->pResource, *s = (Resource *)src->pResource;
+  if (x || y || z) return;
+  if (l->pending_clear) flush_pending_clear(l);      /* (a depth clear recorded before comes first) */
+  if (dst->Type == D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX && src->Type == D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX) {
+    UINT dl, dy, sl, sy;
+    const FormatInfo *dfi = NULL, *sfi = NULL;
+    const UINT di = sub_target(d, dst->SubresourceIndex, &dl, &dy, &dfi), si = sub_target(s, src->SubresourceIndex, &sl, &sy, &sfi);
+    if (!di || !si || !whole_copies_only(d) || !whole_copies_only(s) || !d->fmt || !s->fmt || d->fmt->kernel != s->fmt->kernel || !d->fmt->depth != !s->fmt->depth ||
+        d->desc.SampleDesc.Count != s->desc.SampleDesc.Count || d->kind == 1 || s->kind == 1)
+      return;
+    const UINT plane = sub_depth_plane(s, src->SubresourceIndex);
+    const UINT w = mip_extent((UINT)s->desc.Width, sl), h = mip_extent(s->desc.Height, sl);
+    if (plane != sub_depth_plane(d, dst->SubresourceIndex) || w != mip_extent((UINT)d->desc.Width, dl) || h != mip_extent(d->desc.Height, dl) || !whole_box(box, w, h, 1)) return;
+    end_pass(l);
+    ensure_room(l, 256, 4);
+    UINT payload[14] = {alloc_index(l, di), 0, 0, alloc_index(l, si), 0, 0, w, h, dl, dy, sl, sy, 1, d->fmt->depth ? 1u << plane : 0u};
+    packet(l, OP_COPY_REGION, payload, 14);
+    return;
+  }
+  const int to_texture = dst->Type == D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+  const D3D12_TEXTURE_COPY_LOCATION *texture = to_texture ? dst : src, *footprint = to_texture ? src : dst;
+  Resource *t = (Resource *)texture->pResource, *b = (Resource *)footprint->pResource;
+  if (footprint->Type != D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT || t->desc.SampleDesc.Count > 1 || !t->fmt || !t->fmt->depth || b->desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER) return;
+  UINT level, layer;
+  const FormatInfo *fi = NULL;
+  const UINT image = sub_target(t, texture->SubresourceIndex, &level, &layer, &fi);
+  const D3D12_SUBRESOURCE_FOOTPRINT *fp = &footprint->PlacedFootprint.Footprint;
+  const UINT w = mip_extent((UINT)t->desc.Width, level), h = mip_extent(t->desc.Height, level);
+  /* (the whole subresource: the footprint of its size - into the texture the box, if any, is of the whole footprint -, a pitch it fits in) */
+  if (!image || !fi || fp->Width != w || fp->Height != h || fp->Depth != 1 || !whole_box(box, w, h, 1) || fp->RowPitch < (UINT64)w * fi->bytes) return;
+  if (footprint->PlacedFootprint.Offset > 0xFFFFFFFFu || footprint->PlacedFootprint.Offset + (UINT64)fp->RowPitch * (h - 1) + (UINT64)w * fi->bytes > b->desc.Width) return;
+  end_pass(l);
+  ensure_room(l, 256, 4);
+  UINT payload[12] = {to_texture ? 0u : 1u, alloc_index(l, image), level, layer, 0, 0, w, h, alloc_index(l, b->alloc), (UINT)footprint->PlacedFootprint.Offset, fp->RowPitch,
+                      depth_layout(t->desc.Format, sub_depth_plane(t, texture->SubresourceIndex))};
+  packet(l, OP_COPY_BUFFER_IMAGE, payload, 12);
+}
+
 static void STDMETHODCALLTYPE list_CopyTextureRegion(CmdList *l, const D3D12_TEXTURE_COPY_LOCATION *dst, UINT x, UINT y, UINT z, const D3D12_TEXTURE_COPY_LOCATION *src, const D3D12_BOX *box) {
   Resource *d = (Resource *)dst->pResource, *s = (Resource *)src->pResource;
   if (!d || !s) return;
+  /* (depth buffers and multisampled images: whole subresources) */
+  if ((dst->Type == D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX && whole_copies_only(d)) || (src->Type == D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX && whole_copies_only(s))) {
+    copy_whole_region(l, dst, x, y, z, src, box);
+    return;
+  }
   end_pass(l);
   ensure_room(l, 1024, 8);
   if (dst->Type == D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX && src->Type == D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT) {
@@ -1123,6 +1298,7 @@ static void STDMETHODCALLTYPE list_CopyTextureRegion(CmdList *l, const D3D12_TEX
     if (!image) return;
     const UINT left = box ? box->left : 0, top = box ? box->top : 0, front = box ? box->front : 0;
     const UINT w = box ? box->right - box->left : fp->Width, h = box ? box->bottom - box->top : fp->Height, depth = box ? box->back - box->front : fp->Depth;
+    if (fi && fi->narrow == NARROW_R1 && (left % 8)) return;      /* (R1_UNORM: the footprint's box starts on a byte) */
     for (UINT k = 0; k < depth; ++k) {
       /* (a compressed format's rows are rows of blocks: the box is on whole blocks) */
       UINT64 offset = src->PlacedFootprint.Offset + (UINT64)(front + k) * fp->RowPitch * format_rows(fi, fp->Height) + (UINT64)format_rows(fi, top) * fp->RowPitch + format_row_bytes(fi, left);
@@ -1138,6 +1314,7 @@ static void STDMETHODCALLTYPE list_CopyTextureRegion(CmdList *l, const D3D12_TEX
     if (!image) return;
     const UINT left = box ? box->left : 0, top = box ? box->top : 0, front = box ? box->front : 0;
     const UINT w = box ? box->right - box->left : fp->Width, h = box ? box->bottom - box->top : fp->Height, depth = box ? box->back - box->front : fp->Depth;
+    if (fi && fi->narrow == NARROW_R1 && (x % 8)) return;      /* (R1_UNORM: the footprint's place starts on a byte) */
     for (UINT k = 0; k < depth; ++k) {
       UINT64 offset = dst->PlacedFootprint.Offset + (UINT64)(z + k) * fp->RowPitch * format_rows(fi, fp->Height) + (UINT64)format_rows(fi, y) * fp->RowPitch + format_row_bytes(fi, x);
       UINT image_layer = s->kind == 1 ? front + k : layer;
@@ -1180,7 +1357,12 @@ static void STDMETHODCALLTYPE list_CopyResource(CmdList *l, ID3D12Resource *dst,
       packet(l, OP_COPY_REGION, payload, 8);
     }
   } else if (d->fmt && s->fmt && !d->planes && !s->planes && d->mips == s->mips && d->kind == s->kind && d->layers == s->layers) {
-    /* (every level with all its layers - a volume's level its slices there; a 2D image of one level is the one packet of eight words every device takes) */
+    /* (every level with all its layers - a volume's level its slices there; a 2D image of one level is the one packet of eight words every device takes. Depth buffers - both planes - and
+     * multisampled images, which the device copies, of one format, sample count and size) */
+    if ((whole_copies_only(d) || whole_copies_only(s)) && (d->fmt->kernel != s->fmt->kernel || !d->fmt->depth != !s->fmt->depth || d->desc.SampleDesc.Count != s->desc.SampleDesc.Count ||
+                                                         d->desc.Width != s->desc.Width || d->desc.Height != s->desc.Height))
+      return;
+    if (l->pending_clear) flush_pending_clear(l);      /* (a depth clear recorded before comes first) */
     end_pass(l);
     for (UINT level = 0; level < s->mips; ++level) {
       ensure_room(l, 256, 4);

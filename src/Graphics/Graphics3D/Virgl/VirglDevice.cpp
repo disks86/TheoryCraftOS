@@ -280,7 +280,7 @@ class VirglBuffer final : public IBuffer {
 
 class VirglImage final : public IImage {
  public:
-  VirglImage(VirglDevice& device, const ImageDesc& desc) : device_(device), desc_(desc) {
+  VirglImage(VirglDevice& device, const ImageDesc& desc) : device_(device), desc_(desc), surfaces_(device.gpu().allocator()) {
     hardware::VirtioGpu& gpu = device.gpu();
     id_ = gpu.allocate_resource_id();
     const bool depth = desc.format == Format::D32Float;
@@ -374,7 +374,7 @@ class VirglImage final : public IImage {
     if (stencil_view_) device_.destroy_object(stencil_view_);
     if (stand_in_) destroy(gpu.allocator(), stand_in_);
     if (fetch_view_) device_.destroy_object(fetch_view_);
-    for (const LayerSurface& s : surfaces_)
+    for (const LayerSurface& s : surfaces_.view())
       if (s.handle) device_.destroy_object(s.handle);
     for (const View& v : views_)
       if (v.handle) device_.destroy_object(v.handle);
@@ -393,18 +393,19 @@ class VirglImage final : public IImage {
   // The host's surface of layers first .. first + count - 1 of level `level` (a layered one draws into the layer gl_Layer names, from the first), made on first use (the oldest of a full
   // cache is let go of first; never one the pass being recorded uses); 0 if the host refuses it.
   uint32_t surface(uint32_t level, uint32_t first, uint32_t count) {
-    for (const LayerSurface& s : surfaces_)
+    for (const LayerSurface& s : surfaces_.view())
       if (s.handle && s.level == level && s.first == first && s.count == count) return s.handle;
     if (count == 0 || level >= desc_.mip_levels || first >= level_layers(level) || count > level_layers(level) - first) return 0;
-    LayerSurface* free = nullptr;
-    for (LayerSurface& s : surfaces_)
-      if (!s.handle) { free = &s; break; }
-    if (!free) return 0;
+    // (kept as long as the image: a submit may name any number of them - every level of every face of a cube array drawn into or cleared one at a time -, and a surface the
+    // commands being encoded name may not go before they are sent)
     const uint32_t handle = device_.new_handle();
     const uint32_t fmt = desc_.format == Format::D32Float ? (desc_.stencil ? virgl::kFormatZ32FloatS8X24Uint : virgl::kFormatZ32Float) : color_format_;
     const uint32_t cmd[] = {virgl::header(virgl::kCreateObject, virgl::kObjectSurface, 5), handle, id_, fmt, level, first | ((first + count - 1) << 16)};
     if (!device_.send_commands(cmd, 6)) return 0;
-    *free = LayerSurface{level, first, count, handle};
+    if (!surfaces_.push_back(LayerSurface{level, first, count, handle})) {
+      device_.destroy_object(handle);
+      return 0;
+    }
     return handle;
   }
   // The layers of level `level` (a volume's slices there).
@@ -559,6 +560,69 @@ class VirglImage final : public IImage {
     ByteReader in{ConstByteView(backing_)};
     for (uint64_t i = 0; i < count; ++i) out[i] = decode_wide_pixel(desc_.format, in);
     return in.ok();
+  }
+  // The planes of a depth image of one sample (kFeature2DepthCopies), through the backing (room for level 0 of a layer: 4 bytes a texel, or with a stencil plane 8 - the host's
+  // Z32_FLOAT_S8X24_UINT transfers a float, then a word with the stencil in its low byte). The host turns the rows of an image kept the other way round, as for colour images.
+  bool depth_transfer(uint32_t level, uint32_t layer, bool to_host) {
+    const uint32_t width = mip_extent(desc_.extent.width, level), height = mip_extent(desc_.extent.height, level);
+    TransferHost3d transfer{header(to_host ? kCmdTransferToHost3d : kCmdTransferFromHost3d), {0, 0, layer, width, height, 1}, 0, id_, level, width * (desc_.stencil ? 8u : 4u), 0};
+    return device_.gpu().command(as_bytes(transfer), /*fence=*/!to_host);
+  }
+  bool depth_planes_ok(uint32_t level, uint32_t layer, uint64_t depth, uint64_t stencil) {
+    const uint64_t count = uint64_t{mip_extent(desc_.extent.width, level)} * mip_extent(desc_.extent.height, level);
+    return desc_.format == Format::D32Float && desc_.samples == 1 && level < desc_.mip_levels && layer < level_layers(level) && (depth == 0 || depth == count) &&
+           (stencil == 0 || (stencil == count && desc_.stencil)) && ensure_backing(uint64_t{desc_.extent.width} * desc_.extent.height * (desc_.stencil ? 2u : 1u));
+  }
+  bool read_depth_subresource(uint32_t level, uint32_t layer, ArrayView<float> depth, ArrayView<uint8_t> stencil) override {
+    if (!depth_planes_ok(level, layer, depth.size(), stencil.size()) || !depth_transfer(level, layer, false)) return false;
+    ByteReader in{ConstByteView(backing_)};
+    const uint64_t count = depth.empty() ? stencil.size() : depth.size();
+    for (uint64_t i = 0; i < count; ++i) {
+      const float d = __builtin_bit_cast(float, in.le32());
+      const uint32_t s = desc_.stencil ? in.le32() : 0u;
+      if (!depth.empty()) depth[i] = d;
+      if (!stencil.empty()) stencil[i] = static_cast<uint8_t>(s & 0xFF);
+    }
+    return in.ok();
+  }
+  bool write_depth_subresource(uint32_t level, uint32_t layer, ArrayView<const float> depth, ArrayView<const uint8_t> stencil) override {
+    if (!depth_planes_ok(level, layer, depth.size(), stencil.size()) || (depth.empty() && stencil.empty())) return false;
+    // (one plane of two: the other as the host has it, read first)
+    if (desc_.stencil && (depth.empty() || stencil.empty()) && !depth_transfer(level, layer, false)) return false;
+    const uint64_t count = depth.empty() ? stencil.size() : depth.size();
+    const uint32_t texel = desc_.stencil ? 8u : 4u;
+    for (uint64_t i = 0; i < count; ++i) {
+      ByteView at;
+      if (!backing_.try_subview(i * texel, texel, &at)) return false;
+      if (!depth.empty()) {
+        const float v = depth[i];
+        ByteWriter out{at.subview(0, 4)};
+        out.le32(__builtin_bit_cast(uint32_t, !(v == v) ? 0.0f : v < 0.0f ? 0.0f : v > 1.0f ? 1.0f : v));   // (a depth image keeps 0 .. 1)
+        if (!out.ok()) return false;
+      }
+      if (!stencil.empty()) {
+        ByteWriter out{at.subview(4, 4)};
+        out.le32(stencil[i]);
+        if (!out.ok()) return false;
+      }
+    }
+    return depth_transfer(level, layer, true);
+  }
+  // A whole subresource of another image (kFeature2DepthCopies: depth and multisampled images, which have no memory here): a blit of it, of the planes asked for, turning the rows over
+  // between images kept in the two orders (multisampled images are both kept the way GL keeps them).
+  bool copy_subresource(IImage& source_image, uint32_t level, uint32_t layer, uint32_t source_level, uint32_t source_layer, uint32_t planes) override {
+    VirglImage& from = static_cast<VirglImage&>(source_image);   // (the kernel copies between images of one device)
+    const bool depth = desc_.format == Format::D32Float;
+    const uint32_t width = mip_extent(desc_.extent.width, level), height = mip_extent(desc_.extent.height, level);
+    if (from.desc_.format != desc_.format || from.desc_.samples != desc_.samples || from.desc_.stencil != desc_.stencil || level >= desc_.mip_levels || layer >= level_layers(level) ||
+        source_level >= from.desc_.mip_levels || source_layer >= from.level_layers(source_level) || mip_extent(from.desc_.extent.width, source_level) != width ||
+        mip_extent(from.desc_.extent.height, source_level) != height || planes == 0 || planes > 3 || (!depth && planes != 1) || ((planes & 2) && !desc_.stencil))
+      return false;
+    const uint32_t mask = depth ? ((planes & 1) ? 0x10u : 0u) | ((planes & 2) ? 0x20u : 0u) : 0xFu;
+    const bool flip = desc_.samples == 1 && y0_top() != from.y0_top();
+    const uint32_t cmd[22] = {virgl::header(virgl::kBlit, 0, 21), mask, 0, width | (height << 16), id_, level, blit_format(), 0, flip ? height : 0u, layer, width,
+                              flip ? static_cast<uint32_t>(-static_cast<int32_t>(height)) : height, 1, from.id_, source_level, from.blit_format(), 0, 0, source_layer, width, height, 1};
+    return device_.send_commands(cmd, 22);
   }
   // A level above 0 of a mipmapped texture: staged at the start of the backing (which has room for level 0, the largest), from where the host copies it into the level.
   bool write_mip_pixels(uint32_t level, ArrayView<const uint32_t> pixels) override {
@@ -749,8 +813,6 @@ class VirglImage final : public IImage {
   struct LayerSurface {
     uint32_t level = 0, first = 0, count = 0, handle = 0;
   };
-  static constexpr uint32_t kLayerSurfaces = 16;   // (the levels and layer ranges render target views name: a few per image)
-  LayerSurface surfaces_[kLayerSurfaces];
   struct View {
     TextureView v;
     bool stencil = false;   // (of a depth buffer's stencil plane)
@@ -763,6 +825,7 @@ class VirglImage final : public IImage {
   bool swap_rb_ = false;
   VirglDevice& device_;
   ImageDesc desc_;
+  List<LayerSurface> surfaces_;   // (the levels and layer ranges render target and depth views name)
   uint32_t id_ = 0, surface_ = 0, view_ = 0, color_format_ = 0;
   uint32_t stencil_view_ = 0;          // a depth buffer read as a texture: the view of its stencil plane
   VirglImage* stand_in_ = nullptr;     // (stand_in)
@@ -1315,14 +1378,18 @@ class VirglPipeline final : public VirglPipelineBase {
     cmd[n++] = virgl::header(virgl::kCreateObject, virgl::kObjectRasterizer, 9);
     cmd[n++] = rasterizer_;
     const uint32_t fill = desc.fill_mode == FillMode::Wireframe ? virgl::kPolygonLine : virgl::kPolygonFill;
+    // (kFeature2LineModes: alpha-antialiased lines are the host's smooth lines - GL_LINE_SMOOTH, whose coverage the host multiplies into the alpha -, quadrilateral lines its
+    // multisampled lines, which GL draws as rectangles of the line width on a multisampled target - on a target of one sample the host draws its own aliased line)
+    const bool quad_lines = desc.line_mode == LineMode::QuadrilateralWide || desc.line_mode == LineMode::QuadrilateralNarrow;
     const bool offset = desc.depth_bias.enabled() && !desc.depth_bias.unorm_bits;   // (a normalised format's bias is the fragment shader's)
     cmd[n++] = (desc.depth_clip ? 1u << 1 : 0u) /*depth clip*/ | (1u << 2) /*clip half z*/ | (desc.stream_output_count && desc.rasterized_stream < 0 ? 1u << 3 : 0u) /*rasterizer discard*/ | (cull << 8) |
                (fill << 10) | (fill << 12) /*fill front, back*/ | (1u << 14) /*scissor*/ | ((front_ccw ? 1u : 0u) << 15) | (offset ? (1u << 18) | (1u << 20) : 0u) /*offset line (a wireframe triangle's), tri*/ |
-               (desc.multisample ? 1u << 25 : 0u) /*multisample*/ | (1u << 29) /*half pixel center*/ | (1u << 30) /*bottom edge rule*/;
+               (desc.multisample || quad_lines ? 1u << 25 : 0u) /*multisample*/ | (desc.line_mode == LineMode::AlphaAntialiased ? 1u << 26 : 0u) /*line smooth*/ |
+               (1u << 29) /*half pixel center*/ | (1u << 30) /*bottom edge rule*/;
     cmd[n++] = float_bits(1.0f);  // point size
     cmd[n++] = 0;                 // sprite coord enable
     cmd[n++] = uint32_t{desc.clip_distances} << 24;   // line stipple, clip planes (the clip distances enabled)
-    cmd[n++] = float_bits(1.0f);  // line width
+    cmd[n++] = float_bits(desc.line_mode == LineMode::QuadrilateralWide ? 1.4f : 1.0f);  // line width (Direct3D's quadrilateral lines: 1.4 or 1.0 pixels)
     cmd[n++] = float_bits(offset ? static_cast<float>(desc.depth_bias.constant) : 0.0f);   // offset units
     cmd[n++] = float_bits(offset ? desc.depth_bias.slope : 0.0f);                                                         // offset scale
     cmd[n++] = float_bits(offset ? desc.depth_bias.clamp : 0.0f);                                                         // offset clamp
@@ -1607,7 +1674,7 @@ VirglDevice::~VirglDevice() {
 namespace {
 SamplerDesc unfiltered_for(SamplerDesc sampler, const VirglImage* texture) {
   if (texture && is_integer_format(texture->format())) {
-    sampler.filter = Filter::Nearest;
+    sampler.filter = sampler.mag_filter = Filter::Nearest;
     if (sampler.mip_filter == MipFilter::Linear) sampler.mip_filter = MipFilter::Nearest;
   }
   return sampler;
@@ -1625,7 +1692,9 @@ uint32_t VirglDevice::sampler_state(const SamplerDesc& sampler) {
   auto within = [](float lod, float low, float high) { return lod != lod ? 0.0f : lod < low ? low : lod > high ? high : lod; };
   const uint32_t anisotropy = sampler.filter == Filter::Linear && sampler.max_anisotropy > 1 ? (sampler.max_anisotropy > kMaxAnisotropy ? kMaxAnisotropy : sampler.max_anisotropy) : 0u;
   SamplerState wanted;
-  wanted.bits = (sampler.filter == Filter::Linear ? 1u : 0u) | (u << 1) | (v << 4) | ((bordered && !sampler.custom_border ? border : 0u) << 7) | (mip << 9) | (anisotropy << 16);
+  const Filter mag = magnification_filter(sampler);   // (kFeature2SeparateFilters: the host's own magnification filter)
+  wanted.bits = (sampler.filter == Filter::Linear ? 1u : 0u) | (u << 1) | (v << 4) | ((bordered && !sampler.custom_border ? border : 0u) << 7) | (mip << 9) | (anisotropy << 16) |
+                ((mag == Filter::Linear ? 1u : 0u) << 24);
   if (sampler.mip_filter != MipFilter::None) {
     wanted.bias = within(sampler.lod_bias, -16.0f, 16.0f);
     wanted.min_lod = within(sampler.min_lod, 0.0f, 16.0f);
@@ -1643,10 +1712,10 @@ uint32_t VirglDevice::sampler_state(const SamplerDesc& sampler) {
   // (a program with more kinds of sampler than the table holds gets one that differs in its levels of detail at most; the states are the device's until it ends)
   if (sampler_state_count_ == kSamplerStates) return similar ? similar : sampler_states_[0].handle;
   const uint32_t handle = new_handle();
-  const uint32_t filter = sampler.filter == Filter::Linear ? virgl::kFilterLinear : virgl::kFilterNearest;
+  const uint32_t filter = sampler.filter == Filter::Linear ? virgl::kFilterLinear : virgl::kFilterNearest, mag_filter = mag == Filter::Linear ? virgl::kFilterLinear : virgl::kFilterNearest;
   // (S0: the wrap modes, filters, seamless cube maps - Direct3D always filters across the edges of a cube -, and the anisotropy in bits 20 - 24; the border colour's bits as they
   // are: the host sets it with glSamplerParameterIuiv, so an integer texture's border is its integers and a float one's its floats)
-  const uint32_t s0 = kWrap[u] | (kWrap[v] << 3) | (virgl::kWrapClampToEdge << 6) /* r: the slices of a volume are clamped */ | (filter << 9) | (kMip[mip] << 11) | (filter << 13) | (1u << 19) |
+  const uint32_t s0 = kWrap[u] | (kWrap[v] << 3) | (virgl::kWrapClampToEdge << 6) /* r: the slices of a volume are clamped */ | (filter << 9) | (kMip[mip] << 11) | (mag_filter << 13) | (1u << 19) |
                       ((anisotropy & 0x1F) << 20);
   const uint32_t cmd[] = {virgl::header(virgl::kCreateObject, virgl::kObjectSamplerState, 9), handle, s0, float_bits(wanted.bias), float_bits(wanted.min_lod),
                           float_bits(sampler.mip_filter != MipFilter::None ? wanted.max_lod : 0.0f), wanted.border[0], wanted.border[1], wanted.border[2], wanted.border[3]};
@@ -2077,6 +2146,7 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
   struct StreamOutputSlot {
     VirglBuffer* buffer = nullptr;
     uint64_t offset = 0;
+    uint64_t end = kStreamOutputNoEnd;   // (where the writes stop: the binding's end, or the buffer's)
   } so_slot[kMaxStreamOutputBuffers];
   uint32_t so_handles[kMaxStreamOutputBuffers] = {};
   uint32_t so_program[5] = {};   // (the shaders of the pipeline the transform feedback began with)
@@ -2260,11 +2330,12 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
         if (!so_slot[k].buffer) continue;
         // (a buffer that is full - an append after the records that filled it - takes nothing more; GL refuses a range of no bytes, so the target is its last 4 bytes, where no record of
         // more than 4 bytes fits: the primitives are needed and not written, as for a full buffer. Records of 4 bytes or less would be written there: refused.)
-        uint64_t offset = so_slot[k].offset, room = so_slot[k].buffer->size() - offset;
+        const uint64_t limit = so_slot[k].end == kStreamOutputNoEnd || so_slot[k].end > so_slot[k].buffer->size() ? so_slot[k].buffer->size() : so_slot[k].end;
+        uint64_t offset = so_slot[k].offset, room = limit > offset ? limit - offset : 0;
         if (room < 4) {
           const uint64_t record = uint64_t{pd.stream_output_stride[k]} * vertices;
-          if (record <= 4 || so_slot[k].buffer->size() < 4) return false;
-          offset = so_slot[k].buffer->size() - 4, room = 4;
+          if (record <= 4 || limit < 4) return false;
+          offset = limit - 4, room = 4;
         }
         so_handles[k] = new_handle();
         stream.command(virgl::kCreateObject, virgl::kObjectStreamoutTarget, 4);
@@ -2485,7 +2556,7 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
         if (cmd.unit >= kMaxStreamOutputBuffers) return false;
         VirglBuffer* target = static_cast<VirglBuffer*>(cmd.buffer);
         const bool append = cmd.offset == kStreamOutputAppend;
-        if (append && target && so_slot[cmd.unit].buffer == target) break;   // (it goes on where it is)
+        if (append && target && so_slot[cmd.unit].buffer == target && so_slot[cmd.unit].end == cmd.end) break;   // (it goes on where it is)
         uint64_t start = cmd.offset;
         if (append && target) {
           // (how far the buffer got in an earlier submit; one written in this one has no known end until the host has run it)
@@ -2496,7 +2567,7 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
         }
         if (target && start > target->size()) return false;
         end_stream_output();   // (the draws that follow start at this binding's beginning)
-        so_slot[cmd.unit] = {target, start};
+        so_slot[cmd.unit] = {target, start, cmd.end};
         use(target);
         break;
       }
@@ -2798,6 +2869,10 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
           stream.put(static_cast<uint32_t>(index_offset + uint64_t{cmd.first} * (index_type == IndexType::Uint16 ? 2 : 4)));
         }
         const bool patches = topology == PrimitiveTopology::PatchList;
+        // (a stand-in for no pixel shader: the host counts its runs, the API none - the pixel shader invocations' segment stops around the draw)
+        constexpr uint32_t kPsTarget = kTargetStatistic + static_cast<uint32_t>(PipelineStatistic::PsInvocations);
+        const bool pause_ps = pipeline->desc().stand_in_fragment && queries.active[kPsTarget] >= 0;
+        if (pause_ps) end_segment(kPsTarget);
         stream.command(virgl::kDrawVbo, 0, patches ? 14 : 12);
         stream.put(indexed ? 0 : cmd.first);
         stream.put(cmd.count);
@@ -2815,6 +2890,7 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
           stream.put(patch_points);
           stream.put(0);   // draw id
         }
+        if (pause_ps && queries.open_users[kPsTarget] && !begin_segment(kPsTarget)) return false;
         if (pipeline->desc().fragment_stores || pipeline->desc().vertex_stores || pipeline->desc().geometry_stores || pipeline->desc().tessellation_stores) {   // (what the shaders wrote is there for the next read, a transfer to the system included)
           stream.command(virgl::kMemoryBarrier, 0, 1);
           stream.put(0xFFFFFFFFu);

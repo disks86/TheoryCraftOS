@@ -1265,6 +1265,9 @@ NtStatus Kernel::write_descriptor(ProcessId pid, Handle heap, uint32_t index, co
       // (the texture view's plane of a depth buffer - the escape's texel-format word, which a texture's view has no other use for: 1 the stencil plane; DescriptorDesc::stencil)
       if (desc.texel_format > 1) return status::kInvalidParameter;
       if (desc.texel_format == 1) stencil = true;
+      // (the most detailed level the view's lookups take - Direct3D's ResourceMinLODClamp: 0 or more, of the image's levels, a level past the view's last reading its last)
+      if (!(desc.min_lod_clamp >= 0.0f && desc.min_lod_clamp <= 1000.0f)) return status::kInvalidParameter;
+      d.min_lod_clamp = desc.min_lod_clamp;
     }
     d.allocation = a->allocation;
     if (stencil) {
@@ -1453,14 +1456,13 @@ NtStatus Kernel::escape_d3d12(ProcessId pid, Handle device, uint32_t op, ByteRea
           d.sampler.custom_border = custom != 0;
         }
         graphics::BorderColor no_border;
-        if (!in.ok() || kind > static_cast<uint32_t>(DescriptorKind::UavTexture) || filter > 1 || !decode_address_word(au, &d.sampler.address_u, &d.sampler.border) ||
+        if (!in.ok() || kind > static_cast<uint32_t>(DescriptorKind::UavTexture) || !decode_filter_word(filter, &d.sampler) || !decode_address_word(au, &d.sampler.address_u, &d.sampler.border) ||
             !decode_address_word(av, &d.sampler.address_v, &no_border) || mip > 2)
           return status::kInvalidParameter;
         d.kind = static_cast<DescriptorKind>(kind);
         d.allocation = allocation;
         d.offset = off_lo | (uint64_t{off_hi} << 32);
         d.size = size_lo | (uint64_t{size_hi} << 32);
-        d.sampler.filter = static_cast<graphics::Filter>(filter);
         d.sampler.mip_filter = static_cast<graphics::MipFilter>(mip);
         d.sampler.lod_bias = bits_float(bias);
         d.sampler.min_lod = bits_float(min_lod);
@@ -1483,6 +1485,7 @@ NtStatus Kernel::escape_d3d12(ProcessId pid, Handle device, uint32_t op, ByteRea
           d.texel_format = bias;
           d.counter = min_lod;
           d.counter_offset = max_lod;
+          if (d.kind == DescriptorKind::Srv) d.min_lod_clamp = bits_float(min_lod);   // (a texture's view: its min_lod word is the clamp; a buffer's is 0)
           d.sampler.lod_bias = d.sampler.min_lod = 0.0f;
           d.sampler.max_lod = 1000.0f;
         }
@@ -1725,10 +1728,18 @@ NtStatus Kernel::escape(ProcessId pid, Handle device, ConstByteView request, Byt
                           for (graphics::BlendState& t : desc.target_blend) t.constant[c] = constant[c];
                         }
                         // (and, after that, tagged parts in any order, each at most once: a tag, the count of the words that follow, the words)
-                        bool seen_raster = false, seen_step_rates = false;
+                        bool seen_raster = false, seen_step_rates = false, seen_lines = false;
                         while (!in.at_end()) {
                           const uint32_t tag = in.le32(), words = in.le32();
                           if (!in.ok()) return status::kInvalidParameter;
+                          if (tag == kPipelineLineTag) {
+                            // kPipelineLineTag: how the lines are drawn (graphics::LineMode)
+                            const uint32_t mode = in.le32();
+                            if (seen_lines || words != kPipelineLineWords || !in.ok() || mode > static_cast<uint32_t>(graphics::LineMode::QuadrilateralNarrow)) return status::kInvalidParameter;
+                            seen_lines = true;
+                            desc.line_mode = static_cast<graphics::LineMode>(mode);
+                            continue;
+                          }
                           if (tag == kPipelineStepRateTag) {
                             // kPipelineStepRateTag: the step rates of the per-instance attributes, a word for each attribute from the first (a per-vertex one's is 0)
                             if (seen_step_rates || words > desc.attribute_count || words > graphics::kMaxVertexAttributes) return status::kInvalidParameter;
@@ -1785,6 +1796,7 @@ NtStatus Kernel::escape(ProcessId pid, Handle device, ConstByteView request, Byt
       desc.depth_test = (flags & 1) != 0;
       desc.depth_write = (flags & 2) != 0;
       desc.alpha_blend = (flags & 4) != 0;
+      desc.stand_in_fragment = (flags & kPipelineFlagStandInFragment) != 0;
       desc.stencil.enable = enable != 0;
       desc.stencil.compare = static_cast<graphics::CompareOp>(compare);
       desc.stencil.fail_op = static_cast<graphics::StencilOp>(fail);

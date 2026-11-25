@@ -34,7 +34,9 @@
 //   BindVertexBuffer allocation_index, offset
 //   BindIndexBuffer  allocation_index, index_type (0: 16 bit, 1: 32 bit), offset
 //   PushConstants    byte_count (a multiple of 16, at most the adapter's max_push_constant_bytes: 128 for most, 4096 for the CPU renderer and virgl), then the bytes padded to a whole word
-//   BindTexture      unit, allocation_index, filter, address_u, address_v (address_word() of DxgTypes.hpp: the mode, and the border colour in address_u), mip_filter, lod_bias, min_lod, max_lod (floats)
+//   BindTexture      unit, allocation_index, filter (filter_word() of DxgTypes.hpp: the filter, a magnification filter of its own - kFeature2SeparateFilters -, the minimum or maximum
+//                    reduction - kFeature2SamplerReductions -, coordinates in texels - kFeature2UnnormalizedCoordinates), address_u, address_v (address_word() of DxgTypes.hpp: the
+//                    mode, and the border colour in address_u), mip_filter, lod_bias, min_lod, max_lod (floats)
 //                    [, view: texture_view_word() of DxgTypes.hpp - the comparison of SampleCmp / GatherCmp, and the stencil plane of a D24S8 depth buffer (kFeature2DepthTextures:
 //                    a kAllocDepthStencil | kAllocTexture allocation)]
 //                    [, base_level, level_count, first_layer, layer_count]   (after the view word - the 11th to 14th words -: a view, the adapter's kFeature2MipmappedLayers: the unit shows
@@ -49,9 +51,14 @@
 //   SetScissor       x, y, width, height (x and y signed) [, the same for rectangles 1 ..]
 //   Draw             vertex_count, first_vertex
 //   DrawIndexed      index_count, first_index, vertex_offset (signed)
+//   SetTopology      topology (Topology, below) [, strip cut (StripCut: the index that ends a strip or fan; without the word the index buffer's largest index)]
 //   CopyRegion       dst_index, dst_x, dst_y, src_index, src_x, src_y, width, height   (colour images of one format, or of two whose pixels - or blocks - are as many bytes; also staging memory)
 //                    [, dst_level, dst_layer, src_level, src_layer, layer_count]   (between subresources: the rectangle of layer_count layers - a volume's slices - from those of the
 //                    levels; levels other than 0 of a layered image, and block-compressed images - whole blocks, as CopyBufferImage -, need the adapter's kFeature2MipmappedLayers)
+//                    [, planes]   (bit 0 the depth, bit 1 the stencil, of a copy between depth buffers; 0: every plane the buffers have)
+//                    (depth buffers and multisampled images - images whose contents the system has no memory of - are copied by the device, the adapter's kFeature2DepthCopies: whole
+//                    subresources (the rectangle all of a level that is the same size in both, at 0, 0) between two of one format and sample count, the planes of a depth buffer
+//                    asked for)
 //   GenerateMipmaps  allocation_index   (every level from level 0 by the box filter; with kFeature2MipmappedLayers also of an array's or a cube's layers, a volume - 2 x 2 x 2 - and the wide formats; not
 //                    of block-compressed or integer textures)
 //   BeginQuery       allocation_index, offset [, kind]   (kind, bits 0-7: a graphics::QueryKind, 0 occlusion count if left out, 1 occlusion predicate, 2 IA vertices, 3 IA primitives, 4 VS invocations,
@@ -66,8 +73,9 @@
 //                    nested or overlapping, inside passes and outside: each counts the draws and dispatches of every pass between its BeginQuery and its EndQuery (a clear, copy, resolve or
 //                    mipmap counts nothing). Two open queries do not write the same bytes, and every query begun is ended in the stream. A stream's queries take at most
 //                    kMaxOcclusionQueries device queries: kind 13 takes two, the others one)
-//   SetStreamOutput  slot, allocation_index (kNoAllocation: none), offset   (the buffer the pipeline's stream output declaration puts buffer `slot` in: a kAllocStreamOutput buffer, offset a multiple of 4 or kStreamOutputAppendOffset; anywhere,
-//                    the adapter's kFeatureStreamOutput)
+//   SetStreamOutput  slot, allocation_index (kNoAllocation: none), offset[, end]   (the buffer the pipeline's stream output declaration puts buffer `slot` in: a kAllocStreamOutput buffer, offset a multiple of 4 or kStreamOutputAppendOffset;
+//                    `end`, optional: the byte where its writes stop - a primitive that does not fit before it is not written, nor any after it, as at the buffer's end (Direct3D 12's SizeInBytes);
+//                    kStreamOutputNoEnd or left out: the buffer's end. Anywhere, the adapter's kFeatureStreamOutput)
 //   SetRootSignature root signature handle   (Direct3D 12 binding: forgets the root arguments; the draws and dispatches that follow bind textures, storage buffers and constants from them: see D3d12.hpp)
 //   SetDescriptorHeaps count (1 or 2), heap handles   (at most one of each type: views and samplers)
 //   SetRootConstants parameter, first value, count, values   (32-bit values into a root constants parameter)
@@ -78,12 +86,21 @@
 //   BindUav          slot, allocation_index, offset, size   (a storage buffer for compute shaders, outside a pass: slot below kMaxStorageBuffers, a kAllocUnorderedAccess buffer, offset and size multiples of 4)
 //   Dispatch         groups_x, groups_y, groups_z   (outside a pass, with a compute pipeline bound by BindPipeline and every storage slot its shader uses bound; each count at most kMaxDispatchGroups)
 //   ResolveRegion    destination_index, source_index   (outside a pass: the samples of a multisampled colour render target averaged into an ordinary image of the same format and size, the adapter's kFeatureMultisample)
+//                    [, mode]: a graphics::ResolveMode; or kResolveCopySamples and then x, y, width, height of the source's region and x, y in the destination: every sample of the region
+//                    copied into an image of the same format and samples (kFeature2SampleCopies; Direct3D 12's DECOMPRESS into another resource, depth and stencil too)
 //   CopyBuffer       dst_index, dst_offset, src_index, src_offset, bytes   (outside a pass: between two buffer allocations (not heaps; a reserved buffer is read and written as the whole it appears to be; the source may be a kAllocQueryResult buffer: the results of the queries ended before); the ranges lie in the buffers, a copy inside one buffer must not overlap)
 //   CopyBufferImage  direction (0 buffer to image, 1 image to buffer), image_index, level, layer, x, y, width, height, buffer_index, buffer_offset, row_pitch   (outside a pass: a rectangle of one level of a colour image
 //                    (any kind: `layer` is the array slice or volume depth, 0 for a 2D image) and rows of the buffer, `row_pitch` bytes apart from `buffer_offset` on (at least width * the bytes of a pixel); a multisampled or depth image is refused)
 //                    [, narrow]   (a NarrowLayout: the buffer's pixels are narrower than the image's - one or two 8-bit channels of an A8B8G8R8 / X8B8G8R8 image, or one or two 16-bit channels of an
 //                    A16B16G16R16 one: copied into the image they become (r, g or 0, 0, maximum), out of it the first channels are taken. What a runtime keeps R8 / R8G8 / R16 / R16G16 textures and
-//                    the planes of NV12 / P010 in, as the kernel has no narrower formats)
+//                    the planes of NV12 / P010 in, as the kernel has no narrower formats; or NarrowLayout::R1 - a bit a pixel, rows of (width + 7) / 8 bytes - of an R8Unorm, A8B8G8R8 or
+//                    X8B8G8R8 image: Direct3D's R1_UNORM)
+//                    (a depth buffer of one sample takes one of the depth layouts instead - and needs one -, the adapter's kFeature2DepthCopies: the buffer holds its depth as 32-bit floats,
+//                    16-bit or 24-bit normalised integers (the 24 bits in the low bits of a word whose high byte is 0, and is not read), or the stencil of a D24S8 buffer as bytes; copied
+//                    into the buffer a depth is rounded to the nearest code, into the image a code becomes the float it stands for)
+//   CopyTiles        direction (0 buffer to tiles, 1 tiles to buffer), reserved_index, first_tile, tile_count, buffer_index, buffer_offset   (outside a pass: tiles first_tile ..
+//                    first_tile + tile_count - 1 of a reserved buffer or texture (VidMm ReservedLayout's numbering) as the 64 KiB each holds in its heap, one after the other in the buffer from
+//                    buffer_offset on - Direct3D's CopyTiles. A tile mapped nowhere reads as zeros and drops what is written to it; a plain buffer, not a heap or a reserved one)
 //   DecodeFrame      decoder handle, buffer_index, picture_offset, picture_bytes, matrix_offset, matrix_bytes, slices_offset, slices_bytes, bitstream_index, bitstream_offset, bitstream_bytes,
 //                    luma_index, chroma_index, status_index, status_offset, output_keyed, key_count, then key_count allocation indices
 //                    [, kDecodeConversion, output format (hardware::VpFormat), output colour space, decode colour space, output plane0_index, plane1_index (kNoAllocation for
@@ -138,6 +155,16 @@
 //                    elements of `format` (a graphics::TexelFormat: DXGI_FORMAT's number; a u# view one texel_format_storable says) from element `first_element` of a kAllocUnorderedAccess buffer,
 //                    within it. Outside a pass, and in one with kFeature2StorageImagesInDraws; kNoAllocation: none. The counter of an append, consume or counter view u<n> is BindUav's slot
 //                    kCounterSlotBase + n: a word of a kAllocUnorderedAccess buffer)
+//   SetDepthBounds   enable, min, max   (the floats as bits, each 0 .. 1: the depth bounds test of the draws that follow - the adapter's kFeature2DepthBounds -, inside or outside a pass;
+//                    the stream starts with it off)
+//   SetSamplePositions samples, pixels, then samples * pixels words of x | y << 8 (signed bytes, -8 .. 7: sixteenths of a pixel from the centre)   (kFeature2SamplePositions: the positions of
+//                    the samples of the draws that follow, one pattern - pixels 1 - or one for each pixel of a 2 x 2 quad - pixels 4, at most 4 samples; pixels 0 with no positions: the
+//                    standard ones again, as the stream starts with)
+//   SetViewInstance  view, viewport_offset, layer_offset   (kFeature2ViewInstancing: the SV_ViewID of the draws that follow, below kMaxViewInstances, and what is added to the viewport (below 16)
+//                    and the render target array index (below 2048) of each primitive; the stream starts with 0, 0, 0)
+//   SetShadingRate   rate, primitive_combiner, image_combiner, allocation_index   (kFeature2ShadingRate: coarse pixel shading of the draws that follow - a D3D12_SHADING_RATE, two
+//                    D3D12_SHADING_RATE_COMBINERs, and the shading-rate image, an R8Uint texture of one level, layer and sample (kNoAllocation: none); the stream starts with 1x1,
+//                    passthrough, passthrough, none)
 //   EndQuery         [allocation_index, offset]   (ends the open query that writes there - with no words, the one begun last that is still open -; what it counted since its BeginQuery (for an
 //                    occlusion query the fragments that passed the depth and stencil tests: a little-endian 64-bit number a value) is written there once the stream has run)
 #pragma once
@@ -191,7 +218,15 @@ enum class Op : uint16_t {
   ResolveEncoderMetadata,
   BindUavImage,   // (37)
   BindTexelBuffer,   // (38)
+  // (the optional rasterizer features of Direct3D 12, numbered apart from the ops other changes add after 38)
+  SetDepthBounds = 56,
+  SetSamplePositions = 57,
+  SetViewInstance = 58,
+  SetShadingRate = 59,
+  CopyTiles = 48,    // (numbered apart from the ones other work is adding)
 };
+constexpr uint32_t kMaxViewInstances = 4;   // D3D12_MAX_VIEW_INSTANCE_COUNT
+constexpr uint32_t kResolveCopySamples = 16;   // ResolveRegion's mode word for a copy of samples (past the graphics::ResolveMode values)
 constexpr uint32_t kVideoProcessStreamWords = 15;
 constexpr uint32_t kVideoProcessExtension = 0x31585056;   // 'VPX1': VideoProcess's optional part follows
 constexpr uint32_t kVideoProcessStreamExtWords = 25;
@@ -212,12 +247,32 @@ inline Topology patch_list(uint32_t control_points) { return static_cast<Topolog
 inline bool is_patch_list(Topology t) { return static_cast<uint32_t>(t) > kPatchListBase && static_cast<uint32_t>(t) < 0x100; }
 inline bool is_adjacency(Topology t) { return t == Topology::LineListAdjacency || t == Topology::TriangleListAdjacency; }
 inline uint32_t patch_points(Topology t) { return static_cast<uint32_t>(t) - kPatchListBase; }
+// SetTopology's optional second word: which index ends a strip (Direct3D 12's D3D12_INDEX_BUFFER_STRIP_CUT_VALUE, the pipeline's IBStripCutValue or the command list's
+// IASetIndexBufferStripCutValue): none (0xFFFF and 0xFFFFFFFF are vertices like any other), 0xFFFF, 0xFFFFFFFF, or - the default, without the word - the largest index of the
+// index buffer's size (Direct3D 10 and 11). Strips and fans are cut (a fan begins again at the next index); the lists and patches take every index as a vertex.
+enum class StripCut : uint32_t { None = 0, Cut16 = 1, Cut32 = 2, IndexMax = 3 };
+// Whether index `raw` of an index buffer of `index_bytes` ends a strip.
+constexpr bool is_strip_cut(StripCut cut, uint32_t index_bytes, uint32_t raw) {
+  switch (cut) {
+    case StripCut::None: return false;
+    case StripCut::Cut16: return raw == 0xFFFFu;
+    case StripCut::Cut32: return raw == 0xFFFFFFFFu;
+    default: return raw == (index_bytes == 4 ? 0xFFFFFFFFu : 0xFFFFu);
+  }
+}
 
 constexpr uint32_t kNoAllocation = 0xFFFFFFFFu;
-// CopyBufferImage's last word: how a buffer's pixels are narrower than the image's.
-enum class NarrowLayout : uint32_t { None = 0, R8 = 1, R8G8 = 2, R16 = 3, R16G16 = 4 };
-constexpr uint32_t narrow_pixel_bytes(NarrowLayout n) { return n == NarrowLayout::R8 ? 1 : n == NarrowLayout::R8G8 || n == NarrowLayout::R16 ? 2 : n == NarrowLayout::R16G16 ? 4 : 0; }
+// CopyBufferImage's last word: how a buffer's pixels are narrower than the image's - or, of a depth buffer, which plane the buffer holds and how (DepthFloat32 .. Stencil8).
+// R1: a bit a pixel, the first pixel of a row in the most significant bit of its first byte (Direct3D's R1_UNORM), of an R8Unorm image or an A8B8G8R8 / X8B8G8R8 one: copied into the
+// image a pixel becomes 0 or the maximum in red (the widened one's alpha the maximum), out of it a red of at least half is a 1.
+enum class NarrowLayout : uint32_t { None = 0, R8 = 1, R8G8 = 2, R16 = 3, R16G16 = 4, DepthFloat32 = 5, DepthUnorm16 = 6, DepthUnorm24 = 7, Stencil8 = 8, R1 = 9 };
+constexpr bool is_depth_layout(NarrowLayout n) { return n == NarrowLayout::DepthFloat32 || n == NarrowLayout::DepthUnorm16 || n == NarrowLayout::DepthUnorm24 || n == NarrowLayout::Stencil8; }
+constexpr uint32_t narrow_pixel_bytes(NarrowLayout n) {   // (R1: 0, a bit a pixel)
+  return n == NarrowLayout::R8 || n == NarrowLayout::Stencil8 ? 1 : n == NarrowLayout::R8G8 || n == NarrowLayout::R16 || n == NarrowLayout::DepthUnorm16 ? 2
+         : n == NarrowLayout::R16G16 || n == NarrowLayout::DepthFloat32 || n == NarrowLayout::DepthUnorm24 ? 4 : 0;
+}
 constexpr uint32_t kStreamOutputAppendOffset = 0xFFFFFFFFu;   // SetStreamOutput's offset for "after what the last stream output into the buffer wrote"
+constexpr uint32_t kStreamOutputNoEnd = 0xFFFFFFFFu;          // SetStreamOutput's end for "the buffer's end"
 // (the longest packets: PushConstants - the byte count, then up to kMaxPushConstantBytes of constants - and a VideoProcess of every stream with both optional parts)
 constexpr uint32_t kMaxPacketWords = 1 + (1 + graphics::kMaxPushConstantBytes / 4 > kVideoProcessMaxWords ? 1 + graphics::kMaxPushConstantBytes / 4 : kVideoProcessMaxWords);
 constexpr uint64_t kMaxCommandBytes = 16 * 1024 * 1024;
@@ -283,20 +338,20 @@ class CommandWriter {
       bind_texture_view(unit, allocation, s, 0, 0, 0, 0);   // (the sampler's extra words come after the view's: all of the image)
       return;
     }
-    packet(Op::BindTexture, {unit, allocation, static_cast<uint32_t>(s.filter), address_word(s.address_u, s.border), address_word(s.address_v), static_cast<uint32_t>(s.mip_filter),
+    packet(Op::BindTexture, {unit, allocation, filter_word(s), address_word(s.address_u, s.border), address_word(s.address_v), static_cast<uint32_t>(s.mip_filter),
                              float_bits(s.lod_bias), float_bits(s.min_lod), float_bits(s.max_lod), texture_view_word(s)});
   }
   // The same through a view (kFeature2MipmappedLayers): levels base_level .., layers first_layer .. (counts of 0: to the last). With the sampler's anisotropy or border colour of
   // its own (kFeature2SamplerState) the six words of those follow.
   void bind_texture_view(uint32_t unit, uint32_t allocation, const graphics::SamplerDesc& s, uint32_t base_level, uint32_t level_count, uint32_t first_layer, uint32_t layer_count) {
     if (sampler_extras(s)) {
-      packet(Op::BindTexture, {unit, allocation, static_cast<uint32_t>(s.filter), address_word(s.address_u, s.border), address_word(s.address_v), static_cast<uint32_t>(s.mip_filter),
+      packet(Op::BindTexture, {unit, allocation, filter_word(s), address_word(s.address_u, s.border), address_word(s.address_v), static_cast<uint32_t>(s.mip_filter),
                                float_bits(s.lod_bias), float_bits(s.min_lod), float_bits(s.max_lod), texture_view_word(s), base_level, level_count, first_layer, layer_count,
                                s.max_anisotropy, s.custom_border ? 1u : 0u, float_bits(s.border_rgba[0]), float_bits(s.border_rgba[1]), float_bits(s.border_rgba[2]),
                                float_bits(s.border_rgba[3])});
       return;
     }
-    packet(Op::BindTexture, {unit, allocation, static_cast<uint32_t>(s.filter), address_word(s.address_u, s.border), address_word(s.address_v), static_cast<uint32_t>(s.mip_filter),
+    packet(Op::BindTexture, {unit, allocation, filter_word(s), address_word(s.address_u, s.border), address_word(s.address_v), static_cast<uint32_t>(s.mip_filter),
                              float_bits(s.lod_bias), float_bits(s.min_lod), float_bits(s.max_lod), texture_view_word(s), base_level, level_count, first_layer, layer_count});
   }
   static constexpr bool sampler_extras(const graphics::SamplerDesc& s) { return s.max_anisotropy > 1 || s.custom_border; }
@@ -316,6 +371,7 @@ class CommandWriter {
       for (uint32_t w : {static_cast<uint32_t>(r.x), static_cast<uint32_t>(r.y), r.width, r.height}) ok_ &= bytes_.put32(w);
   }
   void set_topology(Topology topology) { packet(Op::SetTopology, {static_cast<uint32_t>(topology)}); }
+  void set_topology(Topology topology, StripCut cut) { packet(Op::SetTopology, {static_cast<uint32_t>(topology), static_cast<uint32_t>(cut)}); }
   void draw(uint32_t vertex_count, uint32_t first_vertex = 0) { packet(Op::Draw, {vertex_count, first_vertex}); }
   // Several instances (the adapter's kFeatureInstancing): the draw is made instance_count times, numbered from first_instance; per-instance attributes step with them.
   void draw_instanced(uint32_t vertex_count, uint32_t instance_count, uint32_t first_vertex = 0, uint32_t first_instance = 0) { packet(Op::DrawInstanced, {vertex_count, first_vertex, instance_count, first_instance}); }
@@ -330,6 +386,12 @@ class CommandWriter {
                                uint32_t src_y, uint32_t width, uint32_t height, uint32_t layer_count = 1) {
     packet(Op::CopyRegion, {dst, dst_x, dst_y, src, src_x, src_y, width, height, dst_level, dst_layer, src_level, src_layer, layer_count});
   }
+  // A whole subresource (`layer_count` layers) of a depth buffer or a multisampled image into another (kFeature2DepthCopies): the planes of a depth buffer (bit 0 the depth, bit 1 the stencil;
+  // 0 every one), the size of the destination's level.
+  void copy_whole_subresources(uint32_t dst, uint32_t dst_level, uint32_t dst_layer, uint32_t src, uint32_t src_level, uint32_t src_layer, uint32_t width, uint32_t height, uint32_t layer_count = 1,
+                               uint32_t planes = 0) {
+    packet(Op::CopyRegion, {dst, 0, 0, src, 0, 0, width, height, dst_level, dst_layer, src_level, src_layer, layer_count, planes});
+  }
   void generate_mipmaps(uint32_t allocation) { packet(Op::GenerateMipmaps, {allocation}); }
   // `kind`: the kind word (0, the occlusion count, when it is left out: the packet then has two words)
   void begin_query(uint32_t allocation, uint32_t offset = 0, uint32_t kind = 0) {
@@ -342,6 +404,8 @@ class CommandWriter {
   // Stream output buffer `slot` (below kMaxStreamOutputBuffers) is the kAllocStreamOutput allocation, written from `offset` (a multiple of 4; the draws that follow append); kNoAllocation unbinds it.
   // (`offset` kStreamOutputAppendOffset: where the last stream output into the buffer ended)
   void set_stream_output(uint32_t slot, uint32_t allocation, uint32_t offset = 0) { packet(Op::SetStreamOutput, {slot, allocation, offset}); }
+  // (and the byte its writes stop at: `end`)
+  void set_stream_output(uint32_t slot, uint32_t allocation, uint32_t offset, uint32_t end) { packet(Op::SetStreamOutput, {slot, allocation, offset, end}); }
   void set_root_signature(Handle signature) { packet(Op::SetRootSignature, {signature}); }
   void set_descriptor_heaps(std::initializer_list<Handle> heaps) {
     ok_ &= bytes_.put32(static_cast<uint32_t>(Op::SetDescriptorHeaps) | ((2 + static_cast<uint32_t>(heaps.size())) << 16));
@@ -381,12 +445,24 @@ class CommandWriter {
                                 uint32_t row_pitch, NarrowLayout narrow) {
     packet(Op::CopyBufferImage, {direction, image, level, layer, x, y, width, height, buffer, offset, row_pitch, static_cast<uint32_t>(narrow)});
   }
+  void copy_tiles(uint32_t direction, uint32_t reserved, uint32_t first_tile, uint32_t tile_count, uint32_t buffer, uint32_t offset) {
+    packet(Op::CopyTiles, {direction, reserved, first_tile, tile_count, buffer, offset});
+  }
   void bind_uav(uint32_t slot, uint32_t allocation, uint32_t offset, uint32_t size) { packet(Op::BindUav, {slot, allocation, offset, size}); }
   void bind_uav_image(uint32_t slot, uint32_t allocation, uint32_t level = 0, uint32_t first_layer = 0, uint32_t layer_count = 1, Format view = Format::Unknown) {
     packet(Op::BindUavImage, {slot, allocation, level, first_layer, layer_count, static_cast<uint32_t>(view)});
   }
   void bind_texel_buffer(uint32_t slot, uint32_t allocation, uint32_t first_element, uint32_t element_count, graphics::TexelFormat format) {
     packet(Op::BindTexelBuffer, {slot, allocation, first_element, element_count, static_cast<uint32_t>(format)});
+  }
+  void set_depth_bounds(bool enable, float min, float max) { packet(Op::SetDepthBounds, {enable ? 1u : 0u, float_bits(min), float_bits(max)}); }
+  void set_sample_positions(uint32_t samples, uint32_t pixels, ArrayView<const graphics::SamplePosition> positions) {
+    ok_ &= bytes_.put32(static_cast<uint32_t>(Op::SetSamplePositions) | ((3 + static_cast<uint32_t>(positions.size())) << 16)) && bytes_.put32(samples) && bytes_.put32(pixels);
+    for (const graphics::SamplePosition& at : positions) ok_ &= bytes_.put32(static_cast<uint8_t>(at.x) | static_cast<uint32_t>(static_cast<uint8_t>(at.y)) << 8);
+  }
+  void set_view_instance(uint32_t view, uint32_t viewport_offset, uint32_t layer_offset) { packet(Op::SetViewInstance, {view, viewport_offset, layer_offset}); }
+  void set_shading_rate(uint32_t rate, uint32_t primitive_combiner, uint32_t image_combiner, uint32_t image = kNoAllocation) {
+    packet(Op::SetShadingRate, {rate, primitive_combiner, image_combiner, image});
   }
   struct DecodeArgs {
     Handle decoder = 0;
@@ -407,6 +483,9 @@ class CommandWriter {
   void resolve_region(uint32_t destination, uint32_t source, uint32_t mode = 0) {
     if (mode == 0) packet(Op::ResolveRegion, {destination, source});
     else packet(Op::ResolveRegion, {destination, source, mode});
+  }
+  void copy_samples(uint32_t destination, uint32_t source, const graphics::Rect2D& region, uint32_t x, uint32_t y) {
+    packet(Op::ResolveRegion, {destination, source, kResolveCopySamples, static_cast<uint32_t>(region.x), static_cast<uint32_t>(region.y), region.width, region.height, x, y});
   }
 
  private:

@@ -1252,6 +1252,86 @@ void scene_border_colour(Rig& rig, ArrayView<uint32_t> out) {
   rig.read(target, out);
 }
 
+
+// The checker texture magnified over each half (ps_show.dxbc): the left half with a point minification and a linear magnification filter (kFeature2SeparateFilters: blends between
+// the texels), the right half the other way round (the texels' own colours); or (`reduction`, kFeature2SamplerReductions) the linear filter's maximum on the left and minimum on the
+// right; or (`texels`, kFeature2UnnormalizedCoordinates) the right half's coordinates in texels (0 .. 4) with a point filter, as the left half's normalised ones.
+void sampler_scene(Rig& rig, ArrayView<uint32_t> out, int kind) {
+  const uint32_t need = kind == 0 ? graphics::kFeature2SeparateFilters : kind == 1 ? graphics::kFeature2SamplerReductions : graphics::kFeature2UnnormalizedCoordinates;
+  if ((rig.caps().features2 & need) != need) return void(rig.step(kind == 0 ? "separate filters" : kind == 1 ? "minimum and maximum filters" : "coordinates in texels", status::kNotSupported));
+  namespace b = conformance_blobs;
+  Handle pipe = dxbc_pipeline(rig, b::k_vs, sizeof b::k_vs, b::k_ps_show, sizeof b::k_ps_show, 1);
+  Handle target = rig.image(kAllocRenderTarget, Format::A8R8G8B8, kSize, kSize);
+  Handle texture = checker(rig);
+  const float right_scale = kind == 2 ? 4.0f : 1.0f;      // (texels: the right half's coordinates run to 4)
+  auto vert = [](float x, float y, float u, float v) { return Vertex{x, y, 0.5f, u / 2, v / 2, 1, 1}; };
+  const float r = right_scale;
+  const Vertex v[12] = {vert(-1, -1, 0, 0), vert(0, -1, 1, 0), vert(-1, 1, 0, 1), vert(-1, 1, 0, 1), vert(0, -1, 1, 0), vert(0, 1, 1, 1),
+                        vert(0, -1, 0, 0), vert(1, -1, r, 0), vert(0, 1, 0, r), vert(0, 1, 0, r), vert(1, -1, r, 0), vert(1, 1, r, r)};
+  Handle vb = rig.buffer(kAllocVertexBuffer, bytes_of(v, sizeof v));
+  graphics::SamplerDesc left, right;
+  left.address_u = left.address_v = right.address_u = right.address_v = graphics::AddressMode::ClampToEdge;
+  if (kind == 0) {
+    left.filter = graphics::Filter::Nearest, left.separate_mag = true, left.mag_filter = graphics::Filter::Linear;
+    right.filter = graphics::Filter::Linear, right.separate_mag = true, right.mag_filter = graphics::Filter::Nearest;
+  } else if (kind == 1) {
+    left.filter = right.filter = graphics::Filter::Linear;
+    left.reduction = graphics::SamplerReduction::Maximum, right.reduction = graphics::SamplerReduction::Minimum;
+  } else {
+    right.unnormalized = true;
+    right.max_lod = 0.0f;
+  }
+  CommandWriter w(rig.allocator());
+  begin(w, 0, kNoAllocation, {0, 0, 0, 1});
+  w.bind_pipeline(pipe);
+  w.bind_vertex_buffer(1);
+  w.push_constants(bytes_of(kIdentity, sizeof kIdentity));
+  w.bind_texture(0, 2, left);
+  w.draw(6, 0);
+  w.bind_texture(0, 2, right);
+  w.draw(6, 6);
+  w.end_pass();
+  rig.render(w, {target, vb, texture});
+  rig.read(target, out);
+}
+void scene_separate_filters(Rig& rig, ArrayView<uint32_t> out) { sampler_scene(rig, out, 0); }
+void scene_filter_reductions(Rig& rig, ArrayView<uint32_t> out) { sampler_scene(rig, out, 1); }
+void scene_texel_coordinates(Rig& rig, ArrayView<uint32_t> out) { sampler_scene(rig, out, 2); }
+
+// Strip cuts (SetTopology's second word): one strip of six vertices of 32-bit indices with a 0xFFFF after the third, drawn twice - on the left cut at 0xFFFF (StripCut::Cut16: two
+// triangles at the top), on the right not cut (StripCut::None: vertex 65535, at the bottom, is in the strip and its triangles fill the middle).
+void scene_strip_cut(Rig& rig, ArrayView<uint32_t> out) {
+  constexpr uint32_t kVertices = 65536;
+  ArrayView<Vertex> v = allocate_view<Vertex>(rig.allocator(), kVertices);
+  if (v.empty()) return void(rig.step("strip cut vertices", status::kNoMemory));
+  for (Vertex& x : v) x = Vertex{0, 0, 0.5f, 0, 0, 0, 1};
+  const Vertex strip[6] = {{-0.95f, 0.9f, 0.5f, 1, 0, 0, 1}, {-0.55f, 0.9f, 0.5f, 1, 0, 0, 1}, {-0.75f, 0.4f, 0.5f, 1, 0, 0, 1},
+                           {-0.45f, 0.9f, 0.5f, 0, 1, 0, 1}, {-0.05f, 0.9f, 0.5f, 0, 1, 0, 1}, {-0.25f, 0.4f, 0.5f, 0, 1, 0, 1}};
+  for (uint32_t i = 0; i < 6; ++i) v[i] = strip[i];
+  // (the right copy: the same strip moved right by one, vertices 6 .. 11; vertex 65535 is at the bottom of the right half, which only the strip that is not cut reaches)
+  for (uint32_t i = 0; i < 6; ++i) v[6 + i] = Vertex{strip[i].x + 1.0f, strip[i].y, strip[i].z, strip[i].r, strip[i].g, strip[i].b, 1};
+  v[65535] = Vertex{0.5f, -0.9f, 0.5f, 0, 0, 1, 1};
+  const uint32_t indices[14] = {0, 1, 2, 0xFFFF, 3, 4, 5, 6, 7, 8, 0xFFFF, 9, 10, 11};
+  Handle pipe = d3d9_pipeline(rig, false, false);
+  Handle target = rig.image(kAllocRenderTarget, Format::A8R8G8B8, kSize, kSize);
+  Handle vb = rig.buffer(kAllocVertexBuffer, bytes_of(v.data(), v.size() * sizeof(Vertex)));
+  release_view(rig.allocator(), v);   // (the buffer has its own copy)
+  Handle ib = rig.buffer(kAllocIndexBuffer, bytes_of(indices, sizeof indices));
+  CommandWriter w(rig.allocator());
+  begin(w, 0, kNoAllocation, {0, 0, 0, 1});
+  w.bind_pipeline(pipe);
+  w.bind_vertex_buffer(1);
+  w.bind_index_buffer(2, graphics::IndexType::Uint32);
+  w.push_constants(bytes_of(kIdentity, sizeof kIdentity));
+  w.set_topology(Topology::TriangleStrip, StripCut::Cut16);
+  w.draw_indexed(7, 0);
+  w.set_topology(Topology::TriangleStrip, StripCut::None);
+  w.draw_indexed(7, 7);
+  w.end_pass();
+  rig.render(w, {target, vb, ib});
+  rig.read(target, out);
+}
+
 // Several viewports and scissor rectangles, picked by a geometry shader's SV_ViewportArrayIndex (gs_viewport.dxbc: triangle n goes to viewport n): three triangles over the whole
 // picture - red into viewport 0 (the left half, its scissor rectangle the upper part of it), green into viewport 1 (the right half), and blue, whose index 2 is past the two set,
 // into viewport 0 again (in the middle of it, over the red).
@@ -3219,6 +3299,28 @@ void cube_array(Rig& rig, ArrayView<uint32_t> out, bool lod) {
 void scene_cube_array(Rig& rig, ArrayView<uint32_t> out) { cube_array(rig, out, false); }
 void scene_cube_array_level(Rig& rig, ArrayView<uint32_t> out) { cube_array(rig, out, true); }
 
+// gather4 of a cube array of two cubes, 4 x 4 (ps_gather_cubearray, or `dxil`: dxil_ps_gather_cubearray): the red and the blue of the four texels of the footprint on the six faces of
+// cube 1 (alpha 0.1) in the top half and of cube 0 in the bottom half, the footprint well inside each face.
+void gather_cube_array(Rig& rig, ArrayView<uint32_t> out, bool dxil) {
+  if (!rig.has2(graphics::kFeature2MipmappedLayers)) return void(rig.step("cube arrays", status::kNotSupported));
+  namespace b = conformance_blobs;
+  Handle texture = leveled_texture(rig, graphics::TextureKind::TextureCubeArray, 12, 4, 1);
+  Vertex v[72];
+  for (uint32_t half = 0; half < 2; ++half)
+    for (uint32_t face = 0; face < 6; ++face) {
+      const float x0 = static_cast<float>(1 + (face % 3) * 10), y0 = static_cast<float>(half * 16 + face / 3 * 8);
+      quad_pixels_alpha(v + 6 * (half * 6 + face), x0, y0, x0 + 10, y0 + 8, half == 0 ? 0.1f : 0.0f, [face](float u, float vv) {
+        const float a = 0.21f + 0.58f * u, c = 0.21f + 0.58f * vv, axis = face % 2 ? 0.0f : 1.0f;   // (the direction is the coordinate * 2 - 1: within -0.58 .. 0.58 of the face)
+        return face < 2 ? graphics::Vec3{axis, c, a} : face < 4 ? graphics::Vec3{a, axis, c} : graphics::Vec3{a, c, axis};
+      });
+    }
+  const ViewDraw dxbc[1] = {{b::k_ps_gather_cubearray, sizeof b::k_ps_gather_cubearray, 0, 12, 0, 0, 0, 0}};
+  const ViewDraw bitcode[1] = {{b::k_dxil_ps_gather_cubearray, sizeof b::k_dxil_ps_gather_cubearray, 0, 12, 0, 0, 0, 0}};
+  draw_views(rig, out, texture, v, 12, dxil ? bitcode : dxbc, 1);
+}
+void scene_gather_cube_array(Rig& rig, ArrayView<uint32_t> out) { gather_cube_array(rig, out, false); }
+void scene_dxil_gather_cube_array(Rig& rig, ArrayView<uint32_t> out) { gather_cube_array(rig, out, true); }
+
 // A volume of 8 x 8 x 4, three levels: level 1 (two slices) by SampleLevel 1 (ps_tex3d_lod), one slice across the top half and the depth running down the bottom half.
 void scene_volume_levels(Rig& rig, ArrayView<uint32_t> out) {
   if (!rig.has2(graphics::kFeature2MipmappedLayers)) return void(rig.step("levels of volumes", status::kNotSupported));
@@ -3429,6 +3531,8 @@ const Entry kScenes[] = {
     {"Direct3D 11 unordered access to levels of a cube's faces", scene_storage_cube_levels},
     {"Direct3D 11 cube array (DXBC)", scene_cube_array},
     {"Direct3D 11 SampleLevel of a cube array (DXBC)", scene_cube_array_level},
+    {"Direct3D 11 gather of a cube array (DXBC)", scene_gather_cube_array},
+    {"Direct3D 12 gather of a cube array (DXIL)", scene_dxil_gather_cube_array},
     {"Direct3D 10 depth bias, float format", scene_depth_bias},
     {"Direct3D 10 depth bias, normalised formats", scene_depth_bias_unorm},
     {"Direct3D 10 two-sided stencil", scene_stencil_two_sided},
@@ -3438,6 +3542,10 @@ const Entry kScenes[] = {
     {"Direct3D 11.1 logic operations", scene_logic_ops},
     {"Direct3D 10 border colours (DXBC)", scene_border_colour},
     {"Direct3D 10 several viewports and SV_ViewportArrayIndex (DXBC)", scene_viewports},
+    {"Direct3D 10 separate minification and magnification filters (DXBC)", scene_separate_filters, true},
+    {"Direct3D 11.1 minimum and maximum filters (DXBC)", scene_filter_reductions, true},
+    {"Direct3D 12 non-normalized sampler coordinates (DXBC)", scene_texel_coordinates, true},
+    {"Direct3D 12 index buffer strip cut", scene_strip_cut, true},
 };
 
 bool channels_close(uint32_t a, uint32_t b) {

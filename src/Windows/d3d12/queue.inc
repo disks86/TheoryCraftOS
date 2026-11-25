@@ -172,15 +172,54 @@ static void STDMETHODCALLTYPE queue_SetMarker(Queue *This, UINT m, const void *d
 static void STDMETHODCALLTYPE queue_BeginEvent(Queue *This, UINT m, const void *d, UINT s) {}
 static void STDMETHODCALLTYPE queue_EndEvent(Queue *This) {}
 
+/* After a chunk ran: each fan's counts (the device query its open queries of one kind shared in the chunk) added to each member's result - an occlusion predicate and a
+ * disjoint flag are or-ed, the timestamp frequency is set (CommandStream.hpp's kinds: 1 predicate, 9 frequency, 10 disjoint, 11 pipeline statistics (11 values), 12 the
+ * 14 of PIPELINE_STATISTICS1, 13 stream output statistics (2), the others one). */
+static void chunk_fan_out(Queue *q, const Chunk *c) {
+  if (!c->nfans || !c->fan_scratch) return;
+  const UINT kdev = q->d.dev->kdev;
+  void *scratch = NULL;
+  if (!KMT_OK(kmt_lock(kdev, c->fan_scratch, 0, KMT_LOCK_READ_ONLY, &scratch))) return;
+  UINT64 values[16];
+  for (UINT f = 0; f < c->nfans; ++f) {
+    const QueryFan *fan = &c->fans[f];
+    const UINT kind = fan->kind & 0xFF, n = kind == 11 ? 11 : kind == 12 ? 14 : kind == 13 ? 2 : 1;
+    memcpy(values, (const BYTE *)scratch + (SIZE_T)fan->slot * QUERY_SCRATCH_STRIDE, n * 8);
+    for (UINT m = 0; m < fan->nmembers; ++m) {
+      void *data = NULL;
+      if (!KMT_OK(kmt_lock(kdev, fan->members[m].alloc, 0, 0, &data))) continue;
+      UINT64 *to = (UINT64 *)((BYTE *)data + fan->members[m].offset);
+      for (UINT k = 0; k < n; ++k) {
+        UINT64 v;
+        memcpy(&v, &to[k], 8);
+        v = kind == 1 || kind == 10 ? (v || values[k] ? 1 : 0) : kind == 9 ? values[k] : v + values[k];
+        memcpy(&to[k], &v, 8);
+      }
+      kmt_unlock(kdev, fan->members[m].alloc);
+    }
+  }
+  kmt_unlock(kdev, c->fan_scratch);
+}
+
 static void run_chunk(Queue *q, const Chunk *c) {
   if (!c->size) return;
   if (c->size > q->ctx.command_bytes || c->nalloc > q->ctx.allocation_entries) return;
   memcpy(q->ctx.commands, c->bytes, c->size);
+  for (UINT i = 0; i < c->nso_patches; ++i) {
+    /* (a stream output binding that starts after the view's filled size as it is now) */
+    const SoPatch *p = &c->so_patches[i];
+    UINT64 filled = 0;
+    if (!res_read(p->fill, p->fill_offset, 8, &filled)) filled = 0;
+    if (filled > p->size) filled = p->size;
+    const UINT start = (UINT)(p->offset + (filled & ~(UINT64)3));
+    if (p->at + 4 <= c->size) memcpy((BYTE *)q->ctx.commands + p->at, &start, 4);
+  }
   for (UINT i = 0; i < c->nalloc; ++i) {
     q->ctx.allocation_list[i * 2] = c->allocs[i];
     q->ctx.allocation_list[i * 2 + 1] = 0;
   }
   kmt_render(&q->ctx, c->size, c->nalloc);      /* (a stream the kernel refuses is dropped: its work is not done) */
+  chunk_fan_out(q, c);
 }
 
 static void STDMETHODCALLTYPE queue_ExecuteCommandLists(Queue *This, UINT count, ID3D12CommandList *const *lists) {
@@ -194,16 +233,17 @@ static void STDMETHODCALLTYPE queue_ExecuteCommandLists(Queue *This, UINT count,
       if (chunk_skipped(l->chunks[k])) continue;
       if (l->chunks[k]->indirect) {
         CmdList *t = indirect_expand(l->chunks[k]->indirect);
-        if (!t) continue;
-        for (UINT m = 0; m < t->nchunks; ++m) run_chunk(This, t->chunks[m]);
-        list_free_recording(t);
-        mem_free(t->chunks);
-        mem_free(t);
+        if (t) {
+          for (UINT m = 0; m < t->nchunks; ++m) run_chunk(This, t->chunks[m]);
+          list_free_recording(t);
+          mem_free(t->chunks);
+          mem_free(t);
+        }
       } else {
         run_chunk(This, l->chunks[k]);
       }
+      list_apply_fills(l, k);      /* (the filled sizes the draws so far reached, for what reads them next) */
     }
-    list_apply_fills(l);
   }
   LeaveCriticalSection(&This->lock);
 }

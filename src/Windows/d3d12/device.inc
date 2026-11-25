@@ -230,7 +230,9 @@ static int format_integer(DXGI_FORMAT f) {
  * operations on R32_UINT and R32_SINT. (A cube has none: the kernel's cube is not an array.) */
 static void format_uav_support(const Dev *dev, DXGI_FORMAT format, D3D12_FORMAT_SUPPORT1 *s1, D3D12_FORMAT_SUPPORT2 *s2) {
   const FormatInfo *i = format_info(format);
-  if (!(dev->caps.features2 & DEV_FEATURE2_STORAGE_IMAGES) || !i || !i->kernel || i->depth || i->compressed || i->kernel == KF_BGRA8_SRGB || i->kernel == KF_RGBA8_SRGB) return;
+  if (!(dev->caps.features2 & DEV_FEATURE2_STORAGE_IMAGES) || !i || !i->kernel || i->depth || i->compressed || i->kernel == KF_BGRA8_SRGB || i->kernel == KF_RGBA8_SRGB ||
+      i->narrow == NARROW_R1)
+    return;
   if (i->kernel >= KF_FIRST_EXTRA && !(dev_format_caps(dev, i->kernel) & KFC_STORAGE)) return;      /* (the formats numbered from 64: what the adapter's storage images take) */
   if (i->narrow && i->kernel != KF_A8B8G8R8 && i->kernel != KF_RGBA16) return;      /* (a mirror is of 8- or 16-bit RGBA: not of R16G16_SINT's image) */
   *s1 |= D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW;
@@ -255,7 +257,7 @@ static HRESULT STDMETHODCALLTYPE dev_CheckFeatureSupport(Dev *This, D3D12_FEATUR
       /* (the CPU renderer covers every pixel a triangle's area touches - within tier 1's half-pixel uncertainty, degenerate triangles culled, no inner coverage -; virgl's
        * pipe state has no conservative mode) */
       o->ConservativeRasterizationTier = (This->caps.features2 & DEV_FEATURE2_CONSERVATIVE_RASTER) ? D3D12_CONSERVATIVE_RASTERIZATION_TIER_1 : D3D12_CONSERVATIVE_RASTERIZATION_TIER_NOT_SUPPORTED;
-      o->TiledResourcesTier = D3D12_TILED_RESOURCES_TIER_1;
+      o->TiledResourcesTier = dev_tiled_tier(This);      /* (base.inc: 4 on the CPU renderer, 1 on virgl) */
       o->ResourceHeapTier = D3D12_RESOURCE_HEAP_TIER_2;
       o->CrossNodeSharingTier = D3D12_CROSS_NODE_SHARING_TIER_NOT_SUPPORTED;
       o->StandardSwizzle64KBSupported = TRUE;      /* (resource.inc: CPU-visible textures of the standard swizzle are mapped in it) */
@@ -302,6 +304,9 @@ static HRESULT STDMETHODCALLTYPE dev_CheckFeatureSupport(Dev *This, D3D12_FEATUR
         if (f->Format == DXGI_FORMAT_AYUV) f->Support1 |= D3D12_FORMAT_SUPPORT1_RENDER_TARGET;
         /* (AYUV and Y416 have mip levels - Y416's where the kernel has levels of its 16-bit images; the others have none in DXGI's tables) */
         if (format_packed_yuv_mips(f->Format) && device_format_levels(This, i->kernel)) f->Support1 |= D3D12_FORMAT_SUPPORT1_MIP;
+      } else if (i && i->narrow == NARROW_R1) {
+        /* (R1_UNORM: 1D and 2D textures with levels, loaded and sampled - its bits as 0 and 1 in red -; not drawn into, not unordered access, not a volume, cube or tiles) */
+        f->Support1 = D3D12_FORMAT_SUPPORT1_TEXTURE1D | D3D12_FORMAT_SUPPORT1_TEXTURE2D | D3D12_FORMAT_SUPPORT1_MIP | D3D12_FORMAT_SUPPORT1_SHADER_LOAD | D3D12_FORMAT_SUPPORT1_SHADER_SAMPLE;
       } else if (i && i->kernel >= KF_FIRST_EXTRA) {
         /* (the formats numbered from 64: what the adapter says it does with them - KmtCaps::format_caps. Textures of every dimension (a 1D one is a 2D one a texel high, a cube
          * six faces - of formats that are not 96-bit, which Direct3D does not give cubes); loaded, sampled where filtered, drawn into, blended, levels, tiled, the CPU's copies) */
@@ -376,7 +381,14 @@ static HRESULT STDMETHODCALLTYPE dev_CheckFeatureSupport(Dev *This, D3D12_FEATUR
     case D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS: {
       D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS *m = data;
       if (size != sizeof *m) return E_INVALIDARG;
-      /* (one quality level - the standard sample pattern - for the counts the adapter has, on the formats a render target or depth buffer can have) */
+      /* (one quality level - the standard sample pattern - for the counts the adapter has, on the formats a render target or depth buffer can have; asked with
+       * D3D12_MULTISAMPLE_QUALITY_LEVELS_FLAG_TILED_RESOURCE, for reserved textures: one sample of a tiled format - the kernel's multisampled images have no backing its tiles
+       * could be gathered into, so there are no multisampled reserved textures) */
+      if (m->Flags & ~D3D12_MULTISAMPLE_QUALITY_LEVELS_FLAG_TILED_RESOURCE) return E_INVALIDARG;
+      if (m->Flags & D3D12_MULTISAMPLE_QUALITY_LEVELS_FLAG_TILED_RESOURCE) {
+        m->NumQualityLevels = m->SampleCount == 1 && format_tiled(format_info(m->Format)) ? 1 : 0;
+        return S_OK;
+      }
       m->NumQualityLevels = m->SampleCount == 1 || (m->SampleCount < 32 && ((This->caps.sample_counts >> m->SampleCount) & 1) && format_info(m->Format) && format_info(m->Format)->bytes == 4 &&
                                                                                                    (format_info(m->Format)->kernel < KF_FIRST_EXTRA || (dev_format_caps(This, format_info(m->Format)->kernel) & KFC_MULTISAMPLE))) ? 1 : 0;
       return S_OK;
@@ -385,9 +397,9 @@ static HRESULT STDMETHODCALLTYPE dev_CheckFeatureSupport(Dev *This, D3D12_FEATUR
       D3D12_FEATURE_DATA_FORMAT_INFO *f = data;
       if (size != sizeof *f) return E_INVALIDARG;
       /* (a format with depth and stencil has two planes; a format the device does not know is not one) */
-      if (!format_info(f->Format) && !format_bytes(f->Format)) return E_INVALIDARG;
+      if (!format_info(f->Format) && !format_bytes(f->Format) && depth_format_planes(f->Format) == 1) return E_INVALIDARG;
       const FormatInfo *fi = format_info(f->Format);
-      f->PlaneCount = f->Format == DXGI_FORMAT_D24_UNORM_S8_UINT || f->Format == DXGI_FORMAT_D32_FLOAT_S8X24_UINT ? 2 : fi && fi->planar ? (UINT8)format_planes(fi) : 1;
+      f->PlaneCount = depth_format_planes(f->Format) == 2 ? 2 : fi && fi->planar ? (UINT8)format_planes(fi) : 1;
       return S_OK;
     }
     case D3D12_FEATURE_GPU_VIRTUAL_ADDRESS_SUPPORT: {
@@ -440,7 +452,13 @@ static HRESULT STDMETHODCALLTYPE dev_CheckFeatureSupport(Dev *This, D3D12_FEATUR
       a->IsolatedMMU = TRUE;      /* (the device's addresses are its own: the kernel's allocations, not the process's) */
       return S_OK;
     }
-    case D3D12_FEATURE_D3D12_OPTIONS2: { FEATURE(D3D12_FEATURE_DATA_D3D12_OPTIONS2, o); memset(o, 0, sizeof *o); return S_OK; }
+    case D3D12_FEATURE_D3D12_OPTIONS2: {
+      /* (the depth bounds test and programmable sample positions - one pattern, or one for each pixel of a 2 x 2 quad: tier 2 - where the kernel's device has them: the CPU renderer) */
+      FEATURE(D3D12_FEATURE_DATA_D3D12_OPTIONS2, o);
+      o->DepthBoundsTestSupported = (This->caps.features2 & DEV_FEATURE2_DEPTH_BOUNDS) ? TRUE : FALSE;
+      o->ProgrammableSamplePositionsTier = (This->caps.features2 & DEV_FEATURE2_SAMPLE_POSITIONS) ? D3D12_PROGRAMMABLE_SAMPLE_POSITIONS_TIER_2 : D3D12_PROGRAMMABLE_SAMPLE_POSITIONS_TIER_NOT_SUPPORTED;
+      return S_OK;
+    }
     case D3D12_FEATURE_SHADER_CACHE: {
       FEATURE(D3D12_FEATURE_DATA_SHADER_CACHE, c);
       /* (CachedPSO blobs, pipeline libraries, and the sessions' ShaderCacheControl clear and SetDeleteOnDestroy) */
@@ -453,7 +471,10 @@ static HRESULT STDMETHODCALLTYPE dev_CheckFeatureSupport(Dev *This, D3D12_FEATUR
       memset(o, 0, sizeof *o);
       o->WriteBufferImmediateSupportFlags = D3D12_COMMAND_LIST_SUPPORT_FLAG_DIRECT | D3D12_COMMAND_LIST_SUPPORT_FLAG_COMPUTE | D3D12_COMMAND_LIST_SUPPORT_FLAG_COPY;
       o->CopyQueueTimestampQueriesSupported = (This->caps.features & DEV_FEATURE_TIMESTAMP_QUERIES) ? TRUE : FALSE;      /* (EndQuery of a timestamp on a copy list: extras.inc) */
-      o->ViewInstancingTier = D3D12_VIEW_INSTANCING_TIER_NOT_SUPPORTED;
+      /* (view instancing is draw-call looping - cmdlist.inc draw_views -: every stage of every view runs and counts in the statistics, which tiers 1 and 2 allow and tier 3 does not;
+       * tier 2 is tier 1 with the shaders' own array indices added to the locations, which the kernel's SetViewInstance does. Barycentrics: SV_Barycentrics and GetAttributeAtVertex.) */
+      o->ViewInstancingTier = (This->caps.features2 & DEV_FEATURE2_VIEW_INSTANCING) ? D3D12_VIEW_INSTANCING_TIER_2 : D3D12_VIEW_INSTANCING_TIER_NOT_SUPPORTED;
+      o->BarycentricsSupported = (This->caps.features2 & DEV_FEATURE2_BARYCENTRICS) ? TRUE : FALSE;
       return S_OK;
     }
     case D3D12_FEATURE_D3D12_OPTIONS4: {
@@ -490,7 +511,13 @@ static HRESULT STDMETHODCALLTYPE dev_CheckFeatureSupport(Dev *This, D3D12_FEATUR
     case D3D12_FEATURE_D3D12_OPTIONS6: {
       FEATURE(D3D12_FEATURE_DATA_D3D12_OPTIONS6, o);
       memset(o, 0, sizeof *o);
-      o->VariableShadingRateTier = D3D12_VARIABLE_SHADING_RATE_TIER_NOT_SUPPORTED;
+      /* (coarse pixel shading on the CPU renderer: tier 2 with the 2x4, 4x2 and 4x4 rates, per-primitive rates with any viewport, 16 x 16 tiles; nothing runs in the background) */
+      const BOOL vrs = (This->caps.features2 & DEV_FEATURE2_SHADING_RATE) != 0;
+      o->VariableShadingRateTier = vrs ? D3D12_VARIABLE_SHADING_RATE_TIER_2 : D3D12_VARIABLE_SHADING_RATE_TIER_NOT_SUPPORTED;
+      o->AdditionalShadingRatesSupported = vrs;
+      o->PerPrimitiveShadingRateSupportedWithViewportIndexing = vrs;
+      o->ShadingRateImageTileSize = vrs ? SHADING_RATE_TILE : 0;
+      o->BackgroundProcessingSupported = FALSE;
       return S_OK;
     }
     case D3D12_FEATURE_QUERY_META_COMMAND: {
@@ -529,7 +556,13 @@ static HRESULT STDMETHODCALLTYPE dev_CheckFeatureSupport(Dev *This, D3D12_FEATUR
       o->WaveMMATier = D3D12_WAVE_MMA_TIER_NOT_SUPPORTED;
       return S_OK;
     }
-    case D3D12_FEATURE_D3D12_OPTIONS10: { FEATURE(D3D12_FEATURE_DATA_D3D12_OPTIONS10, o); memset(o, 0, sizeof *o); return S_OK; }
+    case D3D12_FEATURE_D3D12_OPTIONS10: {
+      /* (the SUM combiner of variable-rate shading; no mesh shaders to give a primitive's rate) */
+      FEATURE(D3D12_FEATURE_DATA_D3D12_OPTIONS10, o);
+      o->VariableRateShadingSumCombinerSupported = (This->caps.features2 & DEV_FEATURE2_SHADING_RATE) ? TRUE : FALSE;
+      o->MeshShaderPerPrimitiveShadingRateSupported = FALSE;
+      return S_OK;
+    }
     case D3D12_FEATURE_D3D12_OPTIONS11: { FEATURE(D3D12_FEATURE_DATA_D3D12_OPTIONS11, o); memset(o, 0, sizeof *o); return S_OK; }
     case D3D12_FEATURE_D3D12_OPTIONS12: {
       FEATURE(D3D12_FEATURE_DATA_D3D12_OPTIONS12, o);
@@ -546,7 +579,14 @@ static HRESULT STDMETHODCALLTYPE dev_CheckFeatureSupport(Dev *This, D3D12_FEATUR
       o->IndependentFrontAndBackStencilRefMaskSupported = (This->caps.features2 & DEV_FEATURE2_RASTERIZER_STATE) ? TRUE : FALSE;
       return S_OK;
     }
-    case D3D12_FEATURE_D3D12_OPTIONS15: { FEATURE(D3D12_FEATURE_DATA_D3D12_OPTIONS15, o); memset(o, 0, sizeof *o); return S_OK; }
+    case D3D12_FEATURE_D3D12_OPTIONS15: {
+      /* (triangle fans - D3D_PRIMITIVE_TOPOLOGY_TRIANGLEFAN - and the strip cut of the command list - IASetIndexBufferStripCutValue -: the kernel expands strips and fans and
+       * cuts them by SetTopology's strip cut word, for every device) */
+      FEATURE(D3D12_FEATURE_DATA_D3D12_OPTIONS15, o);
+      o->TriangleFanSupported = TRUE;
+      o->DynamicIndexBufferStripCutSupported = TRUE;
+      return S_OK;
+    }
     case D3D12_FEATURE_D3D12_OPTIONS16: {
       /* (a depth bias set by the command list - RSSetDepthBias, D3D12_PIPELINE_STATE_FLAG_DYNAMIC_DEPTH_BIAS: kernel pipelines of each bias - where the device has the rasterizer
        * state; GPU upload heaps: resource.inc heap_cpu_access) */
@@ -555,18 +595,33 @@ static HRESULT STDMETHODCALLTYPE dev_CheckFeatureSupport(Dev *This, D3D12_FEATUR
       o->GPUUploadHeapSupported = TRUE;
       return S_OK;
     }
-    case D3D12_FEATURE_D3D12_OPTIONS17: { FEATURE(D3D12_FEATURE_DATA_D3D12_OPTIONS17, o); memset(o, 0, sizeof *o); return S_OK; }
+    case D3D12_FEATURE_D3D12_OPTIONS17: {
+      /* (samplers with coordinates in texels - D3D12_SAMPLER_FLAG_NON_NORMALIZED_COORDINATES - where the kernel's device has kFeature2UnnormalizedCoordinates: the CPU renderer; no
+       * manual write tracking - D3D12_HEAP_FLAG_TOOLS_USE_MANUAL_WRITE_TRACKING is a tools' feature) */
+      FEATURE(D3D12_FEATURE_DATA_D3D12_OPTIONS17, o);
+      memset(o, 0, sizeof *o);
+      o->NonNormalizedCoordinateSamplersSupported = (This->caps.features2 & DEV_FEATURE2_UNNORMALIZED_COORDINATES) ? TRUE : FALSE;
+      return S_OK;
+    }
     case D3D12_FEATURE_D3D12_OPTIONS18: { FEATURE(D3D12_FEATURE_DATA_D3D12_OPTIONS18, o); o->RenderPassesValid = TRUE; return S_OK; }
     case D3D12_FEATURE_D3D12_OPTIONS19: {
-      /* (RASTERIZER2 subobjects are read, narrow quadrilateral lines refused: device1.inc stream_parse; a pass with no target at all is of one sample; the heaps take
-       * Direct3D 12's limits of tier 1 - heaps.inc) */
+      /* (RASTERIZER2 subobjects are read - device1.inc stream_parse -, narrow quadrilateral lines where the device has the kernel's line modes; a pass with no output at all
+       * rasterizes with one sample or a ForcedSampleCount of 4, 8 or 16 the device has (bit n: 2^n samples); the anisotropic filters with a point mip filter on every device (where
+       * the device has no anisotropy they filter as MIN_MAG_LINEAR_MIP_POINT, as the plain anisotropic ones filter trilinearly there); point sampling takes the texel the
+       * coordinate is in (the CPU renderer's floor - never rounded up -; a GPU's rounding is its own); the render targets of a pass are of one size (the kernel's passes);
+       * shader-visible heaps hold at most 4096 descriptors (the kernel's heaps: heaps.inc) and static samplers take none of them; no custom heap of compute queues alone) */
       FEATURE(D3D12_FEATURE_DATA_D3D12_OPTIONS19, o);
       memset(o, 0, sizeof *o);
-      o->SupportedSampleCountsWithNoOutputs = 0x1;
+      o->MismatchingOutputDimensionsSupported = FALSE;
+      o->SupportedSampleCountsWithNoOutputs = 0x1 | (((This->caps.sample_counts >> 4) & 1) << 2) | (((This->caps.sample_counts >> 8) & 1) << 3) | (((This->caps.sample_counts >> 16) & 1) << 4);
+      o->PointSamplingAddressesNeverRoundUp = This->software ? TRUE : FALSE;
       o->RasterizerDesc2Supported = TRUE;
-      o->MaxSamplerDescriptorHeapSize = 2048;
-      o->MaxSamplerDescriptorHeapSizeWithStaticSamplers = 2048;
-      o->MaxViewDescriptorHeapSize = 1000000;
+      o->NarrowQuadrilateralLinesSupported = (This->caps.features2 & DEV_FEATURE2_LINE_MODES) ? TRUE : FALSE;
+      o->AnisoFilterWithPointMipSupported = TRUE;
+      o->MaxSamplerDescriptorHeapSize = 4096;
+      o->MaxSamplerDescriptorHeapSizeWithStaticSamplers = 4096;
+      o->MaxViewDescriptorHeapSize = 4096;
+      o->ComputeOnlyCustomHeapSupported = FALSE;
       return S_OK;
     }
     case D3D12_FEATURE_D3D12_OPTIONS20: {

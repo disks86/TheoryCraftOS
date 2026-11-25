@@ -128,6 +128,8 @@ class D3d9Program {
   // What a device must have for the program to run as written (graphics::DeviceFeature bits): a program that reads system values needs kFeatureSystemInputs (without it they read as
   // zero), one that fetches texels, samples at a level or asks the size of a texture kFeatureTexelAccess.
   uint32_t required_features() const;
+  // Whether it has lookups with residency feedback or a clamp (the _s forms of Shader Model 5 for tiled resources): a device needs graphics::kFeature2TileResidency.
+  bool uses_feedback() const { return uses_feedback_; }
   bool uses_system_values() const { return uses_system_values_; }
   bool uses_vertex_stores() const { return uses_vertex_stores_; }
   bool uses_geometry_stores() const { return uses_geometry_stores_; }
@@ -220,6 +222,9 @@ class D3d9Program {
   ImageMask image_mask_;
   bool writes_images_ = false;
   bool writes_layer_ = false, writes_viewport_ = false, layer_before_geometry_ = false;
+  // The graphics::DeviceFeature2 bits of what the front end met besides (SV_Barycentrics and GetAttributeAtVertex: kFeature2Barycentrics; SV_ShadingRate read or written:
+  // kFeature2ShadingRate; SV_ViewID needs none: without view instancing it is 0).
+  uint32_t extra_features2_ = 0;
   // The components of their output registers the layer and the viewport are in, and whether the viewport is in the layer's register (both integers packed into one).
   uint8_t layer_component_ = 0, viewport_component_ = 0;
   bool viewport_shares_layer_ = false;
@@ -232,7 +237,7 @@ class D3d9Program {
   uint8_t unit_sampler_[graphics::kMaxTextureUnits] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15};
   uint32_t compare_units_ = 0;   // (compare_units)
   uint32_t sampled_units_ = 0;   // (sampled_units)
-  bool uses_system_values_ = false, uses_texel_access_ = false, uses_graphics_storage_ = false, uses_fragment_stores_ = false, uses_vertex_stores_ = false, uses_geometry_stores_ = false, uses_tessellation_stores_ = false;
+  bool uses_system_values_ = false, uses_texel_access_ = false, uses_graphics_storage_ = false, uses_fragment_stores_ = false, uses_vertex_stores_ = false, uses_geometry_stores_ = false, uses_tessellation_stores_ = false, uses_feedback_ = false;
   uint32_t color_outputs_ = 1;
   uint32_t constant_registers_ = kPushConstantRegisters;
   List<Instruction> code_;

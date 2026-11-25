@@ -84,6 +84,8 @@ static const TexFormat g_tex_formats[] = {
     F4(DXGI_FORMAT_R11G11B10_FLOAT, DXGI_FORMAT_R11G11B10_FLOAT, 4, FMT_TARGET | FMT_EXTRA), F4(DXGI_FORMAT_B5G6R5_UNORM, DXGI_FORMAT_B5G6R5_UNORM, 2, FMT_TARGET | FMT_EXTRA),
     F4(DXGI_FORMAT_B5G5R5A1_UNORM, DXGI_FORMAT_B5G5R5A1_UNORM, 2, FMT_TARGET | FMT_EXTRA), F4(DXGI_FORMAT_B4G4R4A4_UNORM, DXGI_FORMAT_B4G4R4A4_UNORM, 2, FMT_TARGET | FMT_EXTRA),
     F4(DXGI_FORMAT_R10G10B10A2_UINT, DXGI_FORMAT_R10G10B10A2_UINT, 4, FMT_TARGET | FMT_EXTRA), F4(DXGI_FORMAT_R9G9B9E5_SHAREDEXP, DXGI_FORMAT_R9G9B9E5_SHAREDEXP, 4, FMT_SAMPLE | FMT_EXTRA),
+    /* (R1_UNORM: a bit a pixel - rows of (width + 7) / 8 bytes, the first pixel the most significant bit -, kept as it is by Direct3D 12; 1D and 2D textures, sampled and loaded only) */
+    F4(DXGI_FORMAT_R1_UNORM, DXGI_FORMAT_R1_UNORM, 1, FMT_SAMPLE | FMT_EXTRA),
     /* depth: the CPU does not reach them. (D16: in 32-bit float; D32 with 8 bits of stencil: in 24 bits of depth, the kernel having no 32-bit depth with stencil) */
     F4(DXGI_FORMAT_D32_FLOAT, DXGI_FORMAT_D32_FLOAT, 4, FMT_DEPTH), F4(DXGI_FORMAT_D24_UNORM_S8_UINT, DXGI_FORMAT_D24_UNORM_S8_UINT, 4, FMT_DEPTH),
     F4(DXGI_FORMAT_R32_TYPELESS, DXGI_FORMAT_R32_TYPELESS, 4, FMT_DEPTH), F4(DXGI_FORMAT_R24G8_TYPELESS, DXGI_FORMAT_R24G8_TYPELESS, 4, FMT_DEPTH),
@@ -130,6 +132,8 @@ static BOOL yuv_view_ok(DXGI_FORMAT tex, DXGI_FORMAT view, BOOL render_target) {
 
 static const TexFormat g_raw32 = {DXGI_FORMAT_R24G8_TYPELESS, DXGI_FORMAT_R8G8B8A8_TYPELESS, 4, 4, 0, 0, 0, 0, PACK_NONE, 0, FMT_SAMPLE};
 static const TexFormat g_raw64 = {DXGI_FORMAT_R32G8X24_TYPELESS, DXGI_FORMAT_R16G16B16A16_TYPELESS, 8, 8, 0, 0, 0, 0, PACK_NONE, 0, FMT_SAMPLE};
+/* R16_TYPELESS not made for depth: a colour texture of the family - Direct3D 12's R16_TYPELESS, whose views are R16_FLOAT, R16_UNORM, R16_UINT, R16_SNORM and R16_SINT */
+static const TexFormat g_r16_typeless = {DXGI_FORMAT_R16_TYPELESS, DXGI_FORMAT_R16_TYPELESS, 2, 2, 0, 0, 0, 0, PACK_NONE, 0, FMT_TARGET};
 static const TexFormat *tex_format(DXGI_FORMAT format) {
   for (UINT i = 0; i < sizeof g_tex_formats / sizeof g_tex_formats[0]; ++i)
     if (g_tex_formats[i].format == format) return &g_tex_formats[i];
@@ -142,7 +146,7 @@ static const TexFormat *tex_format_for(DXGI_FORMAT format, UINT bind) {
   const BOOL depth = (bind & D3D11_BIND_DEPTH_STENCIL) != 0;
   /* (R32_TYPELESS, R24G8_TYPELESS, R16_TYPELESS, R32G8X24_TYPELESS are depth formats only when bound as one: R32_TYPELESS and R16_TYPELESS are colour ones otherwise) */
   if (!depth && format == DXGI_FORMAT_R32_TYPELESS) return tex_format(DXGI_FORMAT_R32_FLOAT);
-  if (!depth && format == DXGI_FORMAT_R16_TYPELESS) return tex_format(DXGI_FORMAT_R16_UNORM);
+  if (!depth && format == DXGI_FORMAT_R16_TYPELESS) return &g_r16_typeless;
   /* (R24G8 and R32G8X24 not made for depth: their bytes, kept as they are in a format of their size - what views of them read is not converted) */
   if (!depth && format == DXGI_FORMAT_R24G8_TYPELESS && !(bind & (D3D11_BIND_RENDER_TARGET | D3D11_BIND_UNORDERED_ACCESS))) return &g_raw32;
   if (!depth && format == DXGI_FORMAT_R32G8X24_TYPELESS && !(bind & (D3D11_BIND_RENDER_TARGET | D3D11_BIND_UNORDERED_ACCESS))) return &g_raw64;
@@ -150,6 +154,17 @@ static const TexFormat *tex_format_for(DXGI_FORMAT format, UINT bind) {
   if ((f->flags & (FMT_BLOCK | FMT_SAMPLE)) && (bind & (D3D11_BIND_RENDER_TARGET | D3D11_BIND_UNORDERED_ACCESS))) return NULL;
   if ((bind & D3D11_BIND_RENDER_TARGET) && !(f->flags & FMT_TARGET)) return NULL;
   return f;
+}
+/* The format of a texture of `format` made for `bind` and `usage`: tex_format_for's, and a staging texture of a typed depth format (D32_FLOAT, D24_UNORM_S8_UINT, D16_UNORM,
+ * D32_FLOAT_S8X24_UINT) is a depth texture too - its texels a program maps, kept in a depth buffer below that copies take to and from depth textures. */
+static const TexFormat *tex_format_use(DXGI_FORMAT format, UINT bind, D3D11_USAGE usage) {
+  const TexFormat *f = tex_format_for(format, bind);
+  if (f || usage != D3D11_USAGE_STAGING || bind) return f;
+  f = tex_format(format);
+  return f && (f->flags & FMT_DEPTH) && format != DXGI_FORMAT_R32_TYPELESS && format != DXGI_FORMAT_R16_TYPELESS && format != DXGI_FORMAT_R24G8_TYPELESS &&
+                 format != DXGI_FORMAT_R32G8X24_TYPELESS
+             ? f
+             : NULL;
 }
 /* The write mask of a render target of a format of fewer channels than it is kept with (D3D12_COLOR_WRITE_ENABLE_*: the channels it has). */
 static UINT8 tex_format_mask(const TexFormat *f) {

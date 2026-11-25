@@ -249,6 +249,7 @@ class Adapter::StreamRunner {
     device_topology_ = graphics::PrimitiveTopology::TriangleList;
     device_patch_points_ = 0;
     cb_->begin();
+    raster_sent_ = false;   // (a new command buffer has the rasterizer state's defaults: the next draw sends the stream's)
     // (the queries still open go on in this command buffer: a segment each)
     for (StreamQuery& q : queries_.view())
       if (q.open) begin_segment(q);
@@ -436,6 +437,10 @@ class Adapter::StreamRunner {
       }
       case Op::BindUavImage: return bind_uav_image(p);
       case Op::BindTexelBuffer: return bind_texel_buffer(p);
+      case Op::SetDepthBounds: return set_depth_bounds(p);
+      case Op::SetSamplePositions: return set_sample_positions(p);
+      case Op::SetViewInstance: return set_view_instance(p);
+      case Op::SetShadingRate: return set_shading_rate(p);
       case Op::BindPipeline: return bind_pipeline(p);
       case Op::BindVertexBuffer: return bind_vertex_buffer(p);
       case Op::BindIndexBuffer: return bind_index_buffer(p);
@@ -462,6 +467,7 @@ class Adapter::StreamRunner {
       case Op::ResourceBarrier: return resource_barrier(p);
       case Op::CopyBuffer: return copy_buffer(p);
       case Op::CopyBufferImage: return copy_buffer_image(p);
+      case Op::CopyTiles: return copy_tiles(p);
       case Op::DecodeFrame: return decode_frame(p);
       case Op::VideoProcess: return video_process_packet(p);
       case Op::EstimateMotion: return estimate_motion_packet(p);
@@ -471,10 +477,12 @@ class Adapter::StreamRunner {
       case Op::Dispatch: return dispatch(p);
       case Op::SetTopology: {
         const uint32_t topology = p.le32();
+        const uint32_t cut = p.ok() && !p.at_end() ? p.le32() : static_cast<uint32_t>(StripCut::IndexMax);   // (the optional strip cut word)
         const bool adjacency = topology == static_cast<uint32_t>(Topology::LineListAdjacency) || topology == static_cast<uint32_t>(Topology::TriangleListAdjacency);
-        if (!exact(p) || (!adjacency && topology > kPatchListBase + graphics::kMaxPatchControlPoints)) return kBad;
+        if (!exact(p) || cut > static_cast<uint32_t>(StripCut::IndexMax) || (!adjacency && topology > kPatchListBase + graphics::kMaxPatchControlPoints)) return kBad;
         if (adjacency ? !(adapter_.caps_.features & graphics::kFeatureGeometryShaders) : (topology > static_cast<uint32_t>(Topology::PointList) && !(adapter_.caps_.features & graphics::kFeatureTessellation))) return kBad;
         topology_ = static_cast<Topology>(topology);
+        strip_cut_ = static_cast<StripCut>(cut);
         return status::kSuccess;
       }
     }
@@ -691,6 +699,7 @@ class Adapter::StreamRunner {
     const uint32_t to_index = p.le32(), from_index = p.le32();
     uint32_t mode = 0;
     if (!p.at_end()) mode = p.le32();
+    if (mode == kResolveCopySamples) return copy_samples(p, to_index, from_index);
     if (!exact(p) || in_pass_ || !(adapter_.caps_.features & graphics::kFeatureMultisample) || mode > static_cast<uint32_t>(graphics::ResolveMode::Max)) return kBad;
     Allocation* to = alloc(to_index);
     Allocation* from = alloc(from_index);
@@ -716,6 +725,30 @@ class Adapter::StreamRunner {
     return status::kSuccess;
   }
 
+  // ResolveRegion's copy of samples: a region of a multisampled image (colour, or depth with its stencil) into another of its format, samples and size kind (one level, one layer).
+  NtStatus copy_samples(ByteReader& p, uint32_t to_index, uint32_t from_index) {
+    const uint32_t sx = p.le32(), sy = p.le32(), w = p.le32(), h = p.le32(), dx = p.le32(), dy = p.le32();
+    if (!exact(p) || in_pass_ || !(adapter_.caps_.features2 & graphics::kFeature2SampleCopies)) return refuse(__LINE__);
+    Allocation* to = alloc(to_index);
+    Allocation* from = alloc(from_index);
+    if (!to || !from || to == from || !to->is_image() || !from->is_image() || to->is_staging() || from->is_staging() || !use(to, state::kResolveDest) || !use(from, state::kResolveSource)) return refuse(__LINE__);
+    if (to->desc().format != from->desc().format || to->desc().samples != from->desc().samples || from->desc().samples < 2 || to->mip_levels() != 1 || from->mip_levels() != 1 ||
+        to->layers() != 1 || from->layers() != 1)
+      return refuse(__LINE__);
+    if (w == 0 || h == 0 || sx > from->desc().width || w > from->desc().width - sx || sy > from->desc().height || h > from->desc().height - sy || dx > to->desc().width ||
+        w > to->desc().width - dx || dy > to->desc().height || h > to->desc().height - dy)
+      return refuse(__LINE__);
+    unbind_textures_of(to);
+    if (!exec_) return status::kSuccess;
+    NtStatus s = resident(*to);
+    if (s == status::kSuccess) s = resident(*from);
+    if (s == status::kSuccess) s = ensure_cb();
+    if (s != status::kSuccess) return s;
+    cb_->copy_samples(to->image(), from->image(), {static_cast<int32_t>(sx), static_cast<int32_t>(sy), w, h}, dx, dy);
+    mm_.note_gpu_write(*to);
+    return status::kSuccess;
+  }
+
   // After a draw: the buffers its pipeline's stream output wrote have newer contents on the device than anywhere else.
   void note_stream_output_written() {
     if (!pipeline_ || !pipeline_->has_stream_output()) return;
@@ -725,6 +758,7 @@ class Adapter::StreamRunner {
 
   NtStatus set_stream_output(ByteReader& p) {
     const uint32_t slot = p.le32(), index = p.le32(), offset = p.le32();
+    const uint32_t end = p.at_end() ? kStreamOutputNoEnd : p.le32();   // (optional: where the writes stop)
     if (!exact(p) || !(adapter_.caps_.features & graphics::kFeatureStreamOutput) || slot >= graphics::kMaxStreamOutputBuffers) return kBad;
     if (index == kNoAllocation) {
       so_bound_[slot] = false;
@@ -738,13 +772,14 @@ class Adapter::StreamRunner {
     Allocation* a = alloc(index);
     const bool append = offset == kStreamOutputAppendOffset;
     if (!a || !(a->desc().flags & kAllocStreamOutput) || (!append && (offset % 4 || offset > a->desc().size)) || !use(a, state::kStreamOut)) return kBad;
+    if (end != kStreamOutputNoEnd && (end % 4 || end > a->desc().size || (!append && end < offset))) return kBad;
     so_bound_[slot] = true;
     so_alloc_[slot] = a;
     if (!exec_) return status::kSuccess;
     NtStatus s = resident(*a);
     if (s == status::kSuccess) s = ensure_cb();
     if (s != status::kSuccess) return s;
-    cb_->bind_stream_output(slot, a->buffer(), append ? graphics::kStreamOutputAppend : offset);
+    cb_->bind_stream_output(slot, a->buffer(), append ? graphics::kStreamOutputAppend : offset, end == kStreamOutputNoEnd ? graphics::kStreamOutputNoEnd : end);
     return status::kSuccess;
   }
 
@@ -858,9 +893,13 @@ class Adapter::StreamRunner {
     graphics::BorderColor border, no_border;
     graphics::CompareOp compare = graphics::CompareOp::Never;
     bool stencil = false;
-    if (!exact(p) || unit >= adapter_.caps_.max_texture_units || filter > 1 || !decode_address_word(au, &mode_u, &border) || !decode_address_word(av, &mode_v, &no_border) || mip > 2 ||
-        !decode_texture_view_word(view, &compare, &stencil))
+    graphics::SamplerDesc sampler;
+    if (!exact(p) || unit >= adapter_.caps_.max_texture_units || !decode_filter_word(filter, &sampler) || !decode_address_word(au, &mode_u, &border) || !decode_address_word(av, &mode_v, &no_border) ||
+        mip > 2 || !decode_texture_view_word(view, &compare, &stencil))
       return refuse(__LINE__);
+    // (a filter of magnification of its own, a minimum or maximum, coordinates in texels: the device's kFeature2SeparateFilters, kFeature2SamplerReductions, kFeature2UnnormalizedCoordinates)
+    const uint32_t needs = graphics::sampler_features2(sampler);
+    if ((adapter_.caps_.features2 & needs) != needs) return refuse(__LINE__);
     if (!(adapter_.caps_.features & graphics::kFeatureAddressModes)) mode_u = base_address_mode(mode_u), mode_v = base_address_mode(mode_v);   // (the device has wrap and clamp alone)
     if (!finite_within(bias, 100.0f) || !finite_within(min_lod, 100.0f) || !finite_within(max_lod, 1000.0f)) return refuse(__LINE__);
     Allocation* a = alloc(index);
@@ -881,8 +920,6 @@ class Adapter::StreamRunner {
       texture_bound_[unit] = false;
       return refuse(__LINE__);
     }
-    graphics::SamplerDesc sampler;
-    sampler.filter = static_cast<graphics::Filter>(filter);
     sampler.address_u = mode_u;
     sampler.address_v = mode_v;
     sampler.border = border;
@@ -938,6 +975,102 @@ class Adapter::StreamRunner {
         break;
       }
     }
+  }
+
+  // --- The optional rasterizer state of Direct3D 12 (depth bounds, sample positions, view instancing, coarse shading): kept for the stream, across passes and command buffers, and given
+  // to the device's command buffer before the next draw (apply_raster).
+  struct RasterState {
+    bool depth_bounds = false;
+    float depth_min = 0.0f, depth_max = 1.0f;
+    uint32_t samples = 0, pixels = 0;
+    graphics::SamplePosition positions[graphics::kMaxSamplePositions] = {};
+    uint32_t view = 0, viewport_offset = 0, layer_offset = 0;
+    uint32_t rate = 0;
+    graphics::ShadingRateCombiner combiners[2] = {graphics::ShadingRateCombiner::Passthrough, graphics::ShadingRateCombiner::Passthrough};
+    Allocation* rate_image = nullptr;
+  };
+  RasterState raster_;
+  bool raster_sent_ = false;   // (the device's command buffer has raster_)
+  bool raster_used_ = false;   // (the stream set any of it: a stream that did not leaves the device's defaults alone)
+
+  NtStatus set_depth_bounds(ByteReader& p) {
+    const uint32_t enable = p.le32();
+    const float min = bits_float(p.le32()), max = bits_float(p.le32());
+    if (!exact(p) || enable > 1 || !(min >= 0.0f && min <= 1.0f) || !(max >= 0.0f && max <= 1.0f)) return refuse(__LINE__);   // (NaN fails both)
+    if (!(adapter_.caps_.features2 & graphics::kFeature2DepthBounds)) return refuse(__LINE__);
+    raster_.depth_bounds = enable != 0, raster_.depth_min = min, raster_.depth_max = max;
+    raster_used_ = true, raster_sent_ = false;
+    return status::kSuccess;
+  }
+  NtStatus set_sample_positions(ByteReader& p) {
+    const uint32_t samples = p.le32(), pixels = p.le32();
+    if (!p.ok() || !(adapter_.caps_.features2 & graphics::kFeature2SamplePositions)) return refuse(__LINE__);
+    RasterState next = raster_;
+    if (pixels == 0) {
+      if (!exact(p) || samples != 0) return refuse(__LINE__);
+      next.samples = next.pixels = 0;
+    } else {
+      // (1, 2, 4, 8 or 16 samples - a count the adapter has, or one -, one pixel or a quad of four, at most 16 positions)
+      if ((pixels != 1 && pixels != 4) || (samples != 1 && samples != 2 && samples != 4 && samples != 8 && samples != 16) || samples * pixels > graphics::kMaxSamplePositions) return refuse(__LINE__);
+      if (samples > 1 && !(adapter_.caps_.sample_counts >> samples & 1)) return refuse(__LINE__);
+      for (uint32_t k = 0; k < samples * pixels; ++k) {
+        const uint32_t w = p.le32();
+        const int8_t x = static_cast<int8_t>(w & 0xFF), y = static_cast<int8_t>(w >> 8 & 0xFF);
+        if (!p.ok() || (w >> 16) != 0 || x < -8 || x > 7 || y < -8 || y > 7) return refuse(__LINE__);
+        next.positions[k] = {x, y};
+      }
+      if (!exact(p)) return refuse(__LINE__);
+      next.samples = samples, next.pixels = pixels;
+    }
+    raster_ = next;
+    raster_used_ = true, raster_sent_ = false;
+    return status::kSuccess;
+  }
+  NtStatus set_view_instance(ByteReader& p) {
+    const uint32_t view = p.le32(), viewport = p.le32(), layer = p.le32();
+    if (!exact(p) || view >= kMaxViewInstances || viewport >= graphics::kMaxViewports || layer >= 2048) return refuse(__LINE__);
+    if (!(adapter_.caps_.features2 & graphics::kFeature2ViewInstancing)) return refuse(__LINE__);
+    raster_.view = view, raster_.viewport_offset = viewport, raster_.layer_offset = layer;
+    raster_used_ = true, raster_sent_ = false;
+    return status::kSuccess;
+  }
+  NtStatus set_shading_rate(ByteReader& p) {
+    const uint32_t rate = p.le32(), primitive = p.le32(), image = p.le32(), index = p.le32();
+    const uint32_t last = static_cast<uint32_t>(graphics::ShadingRateCombiner::Sum);
+    if (!exact(p) || !graphics::valid_shading_rate(rate) || primitive > last || image > last) return refuse(__LINE__);
+    if (!(adapter_.caps_.features2 & graphics::kFeature2ShadingRate)) return refuse(__LINE__);
+    Allocation* a = nullptr;
+    if (index != kNoAllocation) {
+      // (an R8_UINT texture of one level, one layer and one sample, which no shader of the draws writes: D3D12_RESOURCE_STATE_SHADING_RATE_SOURCE)
+      a = alloc(index);
+      if (!a || !a->is_image() || a->is_staging() || a->is_depth() || a->desc().format != Format::R8Uint || a->desc().samples > 1 || a->mip_levels() != 1 || a->layers() != 1 ||
+          !use(a, state::kShadingRateSource))
+        return refuse(__LINE__);
+    }
+    raster_.rate = rate;
+    raster_.combiners[0] = static_cast<graphics::ShadingRateCombiner>(primitive);
+    raster_.combiners[1] = static_cast<graphics::ShadingRateCombiner>(image);
+    raster_.rate_image = a;
+    raster_used_ = true, raster_sent_ = false;
+    return status::kSuccess;
+  }
+  // Before a draw: the device's command buffer gets the stream's rasterizer state if it does not have it (the shading-rate image made resident).
+  NtStatus apply_raster() {
+    if (!raster_used_ || raster_sent_) return status::kSuccess;
+    if (raster_.rate_image) {
+      const NtStatus s = resident(*raster_.rate_image);
+      if (s != status::kSuccess) return s;
+    }
+    const uint32_t features2 = adapter_.caps_.features2;
+    if (features2 & graphics::kFeature2DepthBounds) cb_->set_depth_bounds(raster_.depth_bounds, raster_.depth_min, raster_.depth_max);
+    if (features2 & graphics::kFeature2SamplePositions) cb_->set_sample_positions(raster_.samples, raster_.pixels, ArrayView<const graphics::SamplePosition>(raster_.positions, raster_.samples * raster_.pixels));
+    if (features2 & graphics::kFeature2ViewInstancing) cb_->set_view_instance(raster_.view, raster_.viewport_offset, raster_.layer_offset);
+    if (features2 & graphics::kFeature2ShadingRate) {
+      cb_->set_shading_rate(raster_.rate, raster_.combiners[0], raster_.combiners[1]);
+      cb_->set_shading_rate_image(raster_.rate_image ? raster_.rate_image->image() : nullptr);
+    }
+    raster_sent_ = true;
+    return status::kSuccess;
   }
 
   // One viewport, or several (kFeature2Viewports): six words each.
@@ -1060,10 +1193,10 @@ class Adapter::StreamRunner {
       ByteReader in(index_->backing());
       in.skip(index_offset_ + uint64_t{first} * index_bytes_);
       int64_t highest = -1;
-      const uint32_t restart = index_bytes_ == 4 ? 0xFFFFFFFFu : 0xFFFFu;
+      const bool strip = topology_ == Topology::TriangleStrip || topology_ == Topology::LineStrip || topology_ == Topology::TriangleFan;
       for (uint32_t i = 0; i < count; ++i) {
         const uint32_t raw = index_bytes_ == 4 ? in.le32() : in.le16();
-        if (topology_ != Topology::TriangleList && topology_ != Topology::LineList && topology_ != Topology::PointList && !is_patch_list(topology_) && raw == restart) continue;   // (ends a strip: names no vertex)
+        if (strip && is_strip_cut(strip_cut_, index_bytes_, raw)) continue;   // (ends a strip: names no vertex)
         const int64_t v = int64_t{raw} + vertex_offset;
         if (!in.ok() || v < 0) return refuse(__LINE__);
         if (v > highest) highest = v;
@@ -1071,7 +1204,8 @@ class Adapter::StreamRunner {
       for (uint32_t slot = 0; slot < graphics::kMaxVertexBuffers; ++slot)
         if ((pipeline_->per_vertex_slots() >> slot & 1) && vertex_offset_[slot] + static_cast<uint64_t>(highest + 1) * pipeline_->slot_stride(slot) > vertex_[slot]->desc().size) return refuse(__LINE__);
     }
-    const NtStatus s = ensure_cb();
+    NtStatus s = ensure_cb();
+    if (s == status::kSuccess) s = apply_raster();
     if (s != status::kSuccess) return s;
     align_planes(pipeline_->declared_units(), pipeline_->texture_count());
     if (topology_ == Topology::TriangleStrip || topology_ == Topology::TriangleFan || topology_ == Topology::LineStrip) {
@@ -1119,7 +1253,6 @@ class Adapter::StreamRunner {
     constexpr uint64_t kMaxExpandedIndices = 3u << 20;
     const bool fan = topology_ == Topology::TriangleFan;
     const bool lines = topology_ == Topology::LineStrip;
-    const uint32_t restart = index_bytes_ == 4 ? 0xFFFFFFFFu : 0xFFFFu;
     ByteBuffer out(adapter_.allocator_);
     uint32_t run[3];   // the vertices of the strip so far (for a fan: the first, the previous and the current)
     uint32_t seen = 0;
@@ -1132,7 +1265,7 @@ class Adapter::StreamRunner {
       if (indexed) {
         v = index_bytes_ == 4 ? in.le32() : in.le16();
         if (!in.ok()) return kBad;
-        if (v == restart) {
+        if (is_strip_cut(strip_cut_, index_bytes_, v)) {
           seen = 0;
           strip_triangle_ = 0;
           continue;
@@ -1204,12 +1337,16 @@ class Adapter::StreamRunner {
   NtStatus copy_region(ByteReader& p) {
     const uint32_t di = p.le32(), dx = p.le32(), dy = p.le32(), si = p.le32(), sx = p.le32(), sy = p.le32(), w = p.le32(), h = p.le32();
     // (optionally: the destination's level and first layer, the source's, and the number of layers - a volume's slices - from them)
-    uint32_t dst_level = 0, dst_layer = 0, src_level = 0, src_layer = 0, layers = 1;
+    uint32_t dst_level = 0, dst_layer = 0, src_level = 0, src_layer = 0, layers = 1, planes = 0;
     if (p.ok() && !p.at_end()) dst_level = p.le32(), dst_layer = p.le32(), src_level = p.le32(), src_layer = p.le32(), layers = p.le32();
-    if (!exact(p) || in_pass_ || w == 0 || h == 0 || layers == 0) return kBad;
+    if (p.ok() && !p.at_end()) planes = p.le32();   // (and after them the planes of a depth buffer)
+    if (!exact(p) || in_pass_ || w == 0 || h == 0 || layers == 0 || planes > 3) return kBad;
     Allocation* dst = alloc(di);
     Allocation* src = alloc(si);
-    if (!dst || !src || !dst->is_image() || !src->is_image() || dst->is_depth() || src->is_depth() || !use(dst, state::kCopyDest) || !use(src, state::kCopySource)) return kBad;
+    if (!dst || !src || !dst->is_image() || !src->is_image() || dst->is_depth() != src->is_depth() || !use(dst, state::kCopyDest) || !use(src, state::kCopySource)) return kBad;
+    if (dst->is_depth() || dst->desc().samples != 1 || src->desc().samples != 1)
+      return copy_device_subresources(dst, dst_level, dst_layer, src, src_level, src_layer, layers, w, h, dx, dy, sx, sy, planes);
+    if (planes) return kBad;   // (planes are a depth buffer's)
     // (formats whose pixels - or blocks - are the same bytes: one format, or two of one size and kind - what Direct3D's copies between the formats of one typeless group are)
     const Format df = dst->desc().format, sf = src->desc().format;
     if (df != sf && (is_compressed(df) != is_compressed(sf) || image_row_bytes(df, 4) != image_row_bytes(sf, 4))) return kBad;
@@ -1232,6 +1369,113 @@ class Adapter::StreamRunner {
     unbind_textures_of(dst);
     return s;
   }
+
+  // CopyRegion of depth buffers and multisampled images, whose contents the device alone keeps (kFeature2DepthCopies): whole subresources - the rectangle is all of the destination's level
+  // at 0, 0, and the source's level is that size - between images of one format and sample count, `layers` layers from each first one, the planes of a depth buffer asked for (0: all
+  // it has).
+  NtStatus copy_device_subresources(Allocation* dst, uint32_t dst_level, uint32_t dst_layer, Allocation* src, uint32_t src_level, uint32_t src_layer, uint32_t layers, uint32_t w, uint32_t h,
+                                    uint32_t dx, uint32_t dy, uint32_t sx, uint32_t sy, uint32_t planes) {
+    if (!(adapter_.caps_.features2 & graphics::kFeature2DepthCopies)) return kBad;
+    const AllocationDesc &dd = dst->desc(), &sd = src->desc();
+    if (dd.format != sd.format || dd.samples != sd.samples || dst->is_staging() || src->is_staging() || dst_level >= dst->mip_levels() || src_level >= src->mip_levels()) return kBad;
+    const uint32_t width = graphics::mip_extent(dd.width, dst_level), height = graphics::mip_extent(dd.height, dst_level);
+    if (dx || dy || sx || sy || w != width || h != height || graphics::mip_extent(sd.width, src_level) != width || graphics::mip_extent(sd.height, src_level) != height) return kBad;
+    if (dst_layer >= dst->level_layers(dst_level) || layers > dst->level_layers(dst_level) - dst_layer || src_layer >= src->level_layers(src_level) || layers > src->level_layers(src_level) - src_layer)
+      return kBad;
+    // (the planes: a depth buffer's depth, and the stencil of one that has it; a colour image's one)
+    const bool stencil = dd.format == Format::D24S8;
+    if (planes == 0) planes = dst->is_depth() && stencil ? 3u : 1u;
+    if ((planes & 2) && !stencil) return kBad;
+    if (!dst->is_depth() && planes != 1) return kBad;
+    if (dst == src && dst_level == src_level && dst_layer < src_layer + layers && src_layer < dst_layer + layers && dst_layer != src_layer) return kBad;   // (overlapping layers of one level)
+    if (!exec_) return status::kSuccess;
+    NtStatus s = flush();
+    if (s == status::kSuccess) s = resident(*dst);
+    if (s == status::kSuccess) s = resident(*src);
+    if (s != status::kSuccess) return s;
+    for (uint32_t k = 0; k < layers; ++k)
+      if (!dst->image()->copy_subresource(*src->image(), dst_level, dst_layer + k, src_level, src_layer + k, planes)) return status::kInvalidDeviceState;
+    mm_.note_gpu_write(*dst);
+    unbind_textures_of(dst);
+    return status::kSuccess;
+  }
+
+  // CopyBufferImage of a depth buffer of one sample (kFeature2DepthCopies): a rectangle of a level's layer, one plane - the depth as floats or 16- / 24-bit codes, or the stencil as bytes
+  // (`layout`) -, rows `pitch` bytes apart in the buffer from `boff`. Into the image the rest of the plane, and the other plane, keep what they had.
+  NtStatus copy_depth_buffer_image(uint32_t direction, Allocation* image, uint32_t level, uint32_t layer, uint32_t x, uint32_t y, uint32_t w, uint32_t h, Allocation* buffer, uint32_t boff,
+                                   uint32_t pitch, NarrowLayout layout) {
+    if (!(adapter_.caps_.features2 & graphics::kFeature2DepthCopies) || !is_depth_layout(layout)) return kBad;
+    const bool stencil_plane = layout == NarrowLayout::Stencil8;
+    if (stencil_plane && image->desc().format != Format::D24S8) return kBad;
+    if (level >= image->mip_levels() || layer >= image->level_layers(level)) return kBad;
+    const uint32_t level_w = graphics::mip_extent(image->desc().width, level), level_h = graphics::mip_extent(image->desc().height, level);
+    if (uint64_t{x} + w > level_w || uint64_t{y} + h > level_h) return kBad;
+    const uint32_t texel = narrow_pixel_bytes(layout);
+    if (pitch < uint64_t{w} * texel || uint64_t{boff} + uint64_t{pitch} * (h - 1) + uint64_t{w} * texel > buffer->desc().size) return kBad;
+    if (!exec_) return status::kSuccess;
+    NtStatus s = flush();
+    if (s == status::kSuccess) s = resident(*image);
+    if (s != status::kSuccess) return s;
+    if (!mm_.read_back(*buffer)) return status::kInvalidDeviceState;
+    // (the whole plane of the subresource: read, changed in the rectangle - or copied out of it -, written back)
+    const uint64_t count = uint64_t{level_w} * level_h;
+    PlaneScratch scratch(adapter_.allocator_, stencil_plane ? 0 : count, stencil_plane ? count : 0);
+    if (scratch.depth.size() + scratch.stencil.size() != count) return status::kNoMemory;
+    graphics::IImage* device_image = image->image();
+    if (!device_image->read_depth_subresource(level, layer, scratch.depth, scratch.stencil)) return status::kInvalidDeviceState;
+    const bool to_image = direction == 0;
+    ByteView bytes = buffer->writable_backing();
+    for (uint32_t row = 0; row < h; ++row) {
+      ByteView line;
+      if (!bytes.try_subview(uint64_t{boff} + uint64_t{pitch} * row, uint64_t{w} * texel, &line)) return status::kInvalidDeviceState;
+      for (uint32_t i = 0; i < w; ++i) {
+        const uint64_t at = uint64_t{y + row} * level_w + x + i;
+        ByteView cell = line.subview(uint64_t{i} * texel, texel);
+        if (stencil_plane) {
+          if (to_image) scratch.stencil[at] = cell[0];
+          else cell[0] = scratch.stencil[at];
+          continue;
+        }
+        if (to_image) {
+          ByteReader in{ConstByteView(cell)};
+          const uint32_t code = layout == NarrowLayout::DepthUnorm16 ? in.le16() : in.le32();
+          scratch.depth[at] = layout == NarrowLayout::DepthFloat32 ? bits_float(code)
+                              : layout == NarrowLayout::DepthUnorm16 ? static_cast<float>(code) / 65535.0f : static_cast<float>(static_cast<double>(code & 0xFFFFFFu) / 16777215.0);
+        } else {
+          ByteWriter out{cell};
+          const float d = scratch.depth[at];
+          const float v = !(d == d) ? 0.0f : d < 0.0f ? 0.0f : d > 1.0f ? 1.0f : d;
+          if (layout == NarrowLayout::DepthFloat32) out.le32(__builtin_bit_cast(uint32_t, d));
+          else if (layout == NarrowLayout::DepthUnorm16) out.le16(static_cast<uint16_t>(v * 65535.0f + 0.5f));
+          else out.le32(static_cast<uint32_t>(static_cast<double>(v) * 16777215.0 + 0.5));   // (the high byte 0)
+        }
+      }
+    }
+    if (to_image) {
+      if (!device_image->write_depth_subresource(level, layer, scratch.depth, scratch.stencil)) return status::kInvalidDeviceState;
+      mm_.note_gpu_write(*image);
+      unbind_textures_of(image);
+    } else {
+      mm_.note_cpu_write(*buffer);
+    }
+    return status::kSuccess;
+  }
+  // The planes of a depth subresource while a copy works on them (one of the two, the other empty), given back when it goes.
+  struct PlaneScratch {
+    PlaneScratch(allocators::IAllocator& a, uint64_t depth_count, uint64_t stencil_count) : allocator(a) {
+      if (depth_count) depth = allocate_view<float>(a, depth_count);
+      if (stencil_count) stencil = allocate_view<uint8_t>(a, stencil_count);
+    }
+    ~PlaneScratch() {
+      release_view(allocator, depth);
+      release_view(allocator, stencil);
+    }
+    PlaneScratch(const PlaneScratch&) = delete;
+    PlaneScratch& operator=(const PlaneScratch&) = delete;
+    allocators::IAllocator& allocator;
+    ArrayView<float> depth;
+    ArrayView<uint8_t> stencil;
+  };
 
   // A plain buffer (not a heap, a reserved buffer or a query result): what CopyBuffer and CopyBufferImage move bytes of.
   // (the results of queries can be a source: Direct3D 12's ResolveQueryData)
@@ -1259,15 +1503,36 @@ class Adapter::StreamRunner {
     return status::kSuccess;
   }
 
+  // CopyTiles: the tiles' heap bytes to or from a plain buffer (VidMm::copy_tiles).
+  NtStatus copy_tiles(ByteReader& p) {
+    const uint32_t direction = p.le32(), ri = p.le32(), first = p.le32(), count = p.le32(), bi = p.le32(), offset = p.le32();
+    if (!exact(p) || in_pass_ || direction > 1 || count == 0) return kBad;
+    Allocation* reserved = alloc(ri);
+    Allocation* buffer = alloc(bi);
+    if (!reserved || !reserved->reserved() || !copyable_buffer(buffer) || buffer->reserved()) return kBad;
+    if (!use(reserved, direction == 0 ? state::kCopyDest : state::kCopySource) || !use(buffer, direction == 0 ? state::kCopySource : state::kCopyDest)) return kBad;
+    if (first > reserved->tile_count() || count > reserved->tile_count() - first || uint64_t{count} * kTileBytes > buffer->desc().size || offset > buffer->desc().size - uint64_t{count} * kTileBytes)
+      return kBad;
+    if (!exec_) return status::kSuccess;
+    NtStatus s = flush();
+    if (s != status::kSuccess) return s;
+    if (!mm_.copy_tiles(*reserved, first, count, *buffer, offset, direction == 1)) return status::kInvalidDeviceState;
+    if (direction == 0) unbind_textures_of(reserved);
+    return status::kSuccess;
+  }
+
   NtStatus copy_buffer_image(ByteReader& p) {
     const uint32_t direction = p.le32(), ii = p.le32(), level = p.le32(), layer = p.le32(), x = p.le32(), y = p.le32(), w = p.le32(), h = p.le32(), bi = p.le32(), boff = p.le32(), pitch = p.le32();
     const uint32_t narrow_word = p.at_end() ? 0 : p.le32();      // (the optional twelfth word)
-    if (!exact(p) || in_pass_ || direction > 1 || w == 0 || h == 0 || narrow_word > static_cast<uint32_t>(NarrowLayout::R16G16)) return kBad;
+    if (!exact(p) || in_pass_ || direction > 1 || w == 0 || h == 0 || narrow_word > static_cast<uint32_t>(NarrowLayout::R1)) return kBad;
     const NarrowLayout narrow = static_cast<NarrowLayout>(narrow_word);
     Allocation* image = alloc(ii);
     Allocation* buffer = alloc(bi);
-    if (!image || !image->is_image() || image->is_depth() || image->desc().samples != 1 || !copyable_buffer(buffer)) return kBad;
+    if (!image || !image->is_image() || image->desc().samples != 1 || !copyable_buffer(buffer)) return kBad;
     if (!use(image, direction == 0 ? state::kCopyDest : state::kCopySource) || !use(buffer, direction == 0 ? state::kCopySource : state::kCopyDest)) return kBad;
+    // (a depth buffer: a plane in one of the depth layouts, by the device; the depth layouts are a depth buffer's)
+    if (image->is_depth()) return copy_depth_buffer_image(direction, image, level, layer, x, y, w, h, buffer, boff, pitch, narrow);
+    if (is_depth_layout(narrow)) return kBad;
     // (a layer of a level: an array's slice or a volume's slice at that level)
     if (level >= image->mip_levels() || layer >= image->level_layers(level)) return kBad;
     const uint32_t level_w = graphics::mip_extent(image->desc().width, level);
@@ -1277,12 +1542,14 @@ class Adapter::StreamRunner {
     const uint32_t unit = is_compressed(format) ? 4 : 1;
     if (uint64_t{x} + w > level_w || uint64_t{y} + h > level_h || x % unit || y % unit || ((x + w) % unit && x + w != level_w) || ((y + h) % unit && y + h != level_h)) return kBad;
     // (a narrow buffer: of an 8-bit four-channel image, or of A16B16G16R16)
-    if (narrow != NarrowLayout::None) {
+    if (narrow == NarrowLayout::R1) {
+      if (format != Format::R8Unorm && format != Format::A8B8G8R8 && format != Format::X8B8G8R8) return kBad;
+    } else if (narrow != NarrowLayout::None) {
       const bool eight = narrow == NarrowLayout::R8 || narrow == NarrowLayout::R8G8;
       if (eight ? (format != Format::A8B8G8R8 && format != Format::X8B8G8R8) : (format != Format::A16B16G16R16 && format != Format::A16B16G16R16Sint)) return kBad;
     }
     const uint64_t row_bytes = image_row_bytes(format, w), level_row_bytes = image_row_bytes(format, level_w), x_bytes = image_row_bytes(format, x);
-    const uint64_t buffer_row_bytes = narrow == NarrowLayout::None ? row_bytes : uint64_t{w} * narrow_pixel_bytes(narrow);
+    const uint64_t buffer_row_bytes = narrow == NarrowLayout::None ? row_bytes : narrow == NarrowLayout::R1 ? (uint64_t{w} + 7) / 8 : uint64_t{w} * narrow_pixel_bytes(narrow);
     const uint32_t rows = image_rows(format, h), first_row = y / unit;
     if (pitch < buffer_row_bytes) return kBad;
     if (uint64_t{boff} + uint64_t{pitch} * (rows - 1) + buffer_row_bytes > buffer->desc().size) return kBad;
@@ -1301,7 +1568,8 @@ class Adapter::StreamRunner {
         ByteView image_row, buffer_row;
         if (!image->writable_backing().try_subview(image_at, row_bytes, &image_row) || !buffer->writable_backing().try_subview(buffer_at, buffer_row_bytes, &buffer_row))
           return status::kInvalidDeviceState;
-        copy_narrow_row(direction == 0, narrow, w, image_row, buffer_row, format == Format::A16B16G16R16Sint);
+        if (narrow == NarrowLayout::R1) copy_bit_row(direction == 0, w, format == Format::R8Unorm ? 1u : 4u, image_row, buffer_row);
+        else copy_narrow_row(direction == 0, narrow, w, image_row, buffer_row, format == Format::A16B16G16R16Sint);
         continue;
       }
       if (direction == 0) {
@@ -1318,6 +1586,23 @@ class Adapter::StreamRunner {
       mm_.note_cpu_write(*buffer);
     }
     return status::kSuccess;
+  }
+
+  // One row of an R1 copy (NarrowLayout::R1): the buffer's bits, the first pixel's the most significant of the first byte, into the image's red - 0 or 255; an image of four channels
+  // (`image_pixel` 4) gets 0 green and blue and the maximum alpha - or out of it, a red of 128 or more a 1. The bits of the last byte past `width` are left as they are.
+  static void copy_bit_row(bool to_image, uint32_t width, uint32_t image_pixel, ByteView image_row, ByteView buffer_row) {
+    for (uint32_t i = 0; i < width; ++i) {
+      ByteView pixel = image_row.subview(uint64_t{i} * image_pixel, image_pixel);
+      uint8_t& bits = buffer_row[i / 8];
+      const uint8_t mask = static_cast<uint8_t>(0x80u >> (i % 8));
+      if (to_image) {
+        pixel.fill(0);
+        pixel[0] = (bits & mask) ? 0xFF : 0x00;
+        if (image_pixel == 4) pixel[3] = 0xFF;
+      } else {
+        bits = static_cast<uint8_t>(pixel[0] >= 0x80 ? (bits | mask) : (bits & ~mask));
+      }
+    }
   }
 
   // One row of a narrow copy: `to_image` widens the buffer's pixels into the image's (missing channels 0, the last the maximum), else the image's first channels go into the buffer.
@@ -2375,6 +2660,18 @@ class Adapter::StreamRunner {
     return exact(p) ? status::kSuccess : kBad;
   }
 
+  // A view's clamp of the levels of detail (Direct3D's ResourceMinLODClamp; d3d11's SetResourceMinLOD goes the same way): `clamp` counts the image's levels, the lookups count the view's
+  // from `base_level`, so the least level of detail of the sampler is raised to clamp - base_level, after the sampler's own MinLOD and MaxLOD (Direct3D clamps the level the sampler
+  // gives, then takes the greater of it and the clamp: a MaxLOD below the clamp is raised with it). A sampler without levels (a MaxLOD of 0: no mip filter) then reads the clamp's
+  // level, the nearest one; a clamp past the view's last level reads its last.
+  static void clamp_view_lod(graphics::SamplerDesc* sampler, float clamp, uint32_t base_level) {
+    const float relative = clamp - static_cast<float>(base_level);
+    if (!(relative > 0.0f)) return;
+    if (sampler->min_lod < relative) sampler->min_lod = relative;
+    if (sampler->max_lod < relative) sampler->max_lod = relative;
+    if (sampler->mip_filter == graphics::MipFilter::None) sampler->mip_filter = graphics::MipFilter::Nearest;
+  }
+
   // What a draw or dispatch binds from the root arguments: b0 (the first constant buffer: root constants, a root constant buffer view or a table's first view) as the push constants, the shader
   // resource views of tables as the texture units t<n> (with the sampler s<n> of a table or a static sampler, else s0, else the defaults), the unordered access views as storage slots u<n>.
   NtStatus apply_root_arguments(bool compute) {
@@ -2471,6 +2768,7 @@ class Adapter::StreamRunner {
                 Allocation* image = view_image(d, reads ? reads->texture_kind(unit) : graphics::TextureKind::Texture2D);
                 graphics::SamplerDesc sampler = sampler_for(reads ? reads->unit_sampler(unit) : unit);
                 sampler.stencil = d.stencil;   // (the view's plane of a depth buffer)
+                clamp_view_lod(&sampler, d.min_lod_clamp, d.view.base_level);
                 NtStatus s = refresh_mirror(image, false);
                 if (s == status::kSuccess) s = lower_texture(unit, image, sampler, image == d.allocation.get() ? d.view : graphics::TextureView());
                 if (s != status::kSuccess) return s;
@@ -2529,7 +2827,14 @@ class Adapter::StreamRunner {
     uint32_t index = 0;
     if (!a || !index_of(a, &index)) return refuse(__LINE__);   // (the allocation is in the list or the draw is refused)
     ByteBuffer packet(adapter_.allocator_);
-    for (uint32_t w : {unit, index, static_cast<uint32_t>(sampler.filter), address_word(sampler.address_u, sampler.border), address_word(sampler.address_v), static_cast<uint32_t>(sampler.mip_filter),
+    // (a descriptor's filters on a device that has no magnification filter of its own: the one filter, linear where either is - what such a device can come nearest with)
+    graphics::SamplerDesc lowered = sampler;
+    if (lowered.separate_mag && !(adapter_.caps_.features2 & graphics::kFeature2SeparateFilters)) {
+      if (lowered.mag_filter == graphics::Filter::Linear) lowered.filter = graphics::Filter::Linear;
+      lowered.separate_mag = false;
+      lowered.mag_filter = lowered.filter;
+    }
+    for (uint32_t w : {unit, index, filter_word(lowered), address_word(sampler.address_u, sampler.border), address_word(sampler.address_v), static_cast<uint32_t>(sampler.mip_filter),
                        __builtin_bit_cast(uint32_t, sampler.lod_bias), __builtin_bit_cast(uint32_t, sampler.min_lod), __builtin_bit_cast(uint32_t, sampler.max_lod), texture_view_word(sampler)})
       packet.put32(w);
     // (the descriptor's view: its levels and layers, on a device that has views - and all of the image before the sampler's part on one that has not)
@@ -2619,6 +2924,7 @@ class Adapter::StreamRunner {
   uint64_t index_offset_ = 0;
   uint32_t index_bytes_ = 2;
   Topology topology_ = Topology::TriangleList;
+  StripCut strip_cut_ = StripCut::IndexMax;   // which index ends a strip (SetTopology's second word)
   uint32_t device_patch_points_ = 0;
   graphics::PrimitiveTopology device_topology_ = graphics::PrimitiveTopology::TriangleList;   // what the recorded commands have set so far
   uint32_t strip_triangle_ = 0;      // the position of the triangle being made in its strip (for the winding)
@@ -2963,6 +3269,7 @@ NtStatus Adapter::create_pipeline(const PipelineDesc& d, const SharedPointer<Sha
   if ((d.multisample || d.alpha_to_coverage) && !(caps_.features & graphics::kFeatureMultisample)) return status::kNotSupported;
   if (d.alpha_to_coverage && !d.multisample) return status::kInvalidParameter;
   if (d.conservative && !(caps_.features2 & graphics::kFeature2ConservativeRaster)) return status::kNotSupported;
+  if (d.line_mode != graphics::LineMode::Aliased && !(caps_.features2 & graphics::kFeature2LineModes)) return status::kNotSupported;
   if (hull || domain) {
     if (!hull || !domain || hull->stage() != graphics::ShaderStage::Hull || domain->stage() != graphics::ShaderStage::Domain || hull->tess_output_points() != domain->tess_input_points() || hull->tess_domain() != domain->tess_domain()) return status::kInvalidParameter;
     if (!(caps_.features & graphics::kFeatureTessellation)) return status::kNotSupported;
@@ -3004,6 +3311,7 @@ NtStatus Adapter::create_pipeline(const PipelineDesc& d, const SharedPointer<Sha
   pd.varying_count = d.varying_count;
   pd.texture_count = texture_count;
   pd.fragment_stores = fragment->fragment_stores_ || fragment->image_mask_.any();   // (a pixel shader that writes images runs for every fragment too)
+  pd.stand_in_fragment = d.stand_in_fragment;
   pd.vertex_stores = vertex->vertex_stores_;
   pd.geometry_stores = geometry && geometry->geometry_stores_;
   pd.tessellation_stores = (hull && hull->tessellation_stores_) || (domain && domain->tessellation_stores_);
@@ -3035,6 +3343,7 @@ NtStatus Adapter::create_pipeline(const PipelineDesc& d, const SharedPointer<Sha
   pd.back_stencil = d.back_stencil;
   pd.logic_op_enable = d.logic_op_enable;
   pd.logic_op = d.logic_op;
+  pd.line_mode = d.line_mode;
 
   SharedPointer<PipelineObject> pipeline = SharedPointer<PipelineObject>::make(allocator_, device_);
   if (!pipeline) return status::kNoMemory;

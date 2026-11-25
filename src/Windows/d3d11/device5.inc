@@ -24,7 +24,7 @@
  * - The *1 textures, views, rasterizer state and query (Device3): the descriptions with a plane slice, a texture layout, conservative rasterization and a context
  *   type. The formats here have one plane, textures have the driver's layout, and conservative rasterization is not there (CheckFeatureSupport says so), so the
  *   creators take what that leaves and refuse the rest with E_INVALIDARG, as Windows does on such a device.
- * - Tiled resources (Device2 / Context2 tile calls): tiled.inc (TiledResourcesTier 1, over Direct3D 12's reserved resources).
+ * - Tiled resources (Device2 / Context2 tile calls): tiled.inc (TiledResourcesTier 1 - 3 as Direct3D 12 below has them, over its reserved resources).
  * - Device-removed events (Device4): the events are set when Direct3D 12 below loses the device. */
 
 /* ---- fences ------------------------------------------------------------------------------------------------------------------------------------------------- */

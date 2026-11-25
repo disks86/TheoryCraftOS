@@ -15,14 +15,17 @@
  * You should have received a copy of the GNU Affero General Public License
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
-/* Part of d3d11.c: tiled resources (Direct3D 11.2, TiledResourcesTier 1) over Direct3D 12's reserved resources and heaps.
+/* Part of d3d11.c: tiled resources (Direct3D 11.2 and 11.3, TiledResourcesTier 1 to 3 - what Direct3D 12 below has: dev_tiled_tier) over Direct3D 12's reserved resources and
+ * heaps. Tier 2's shader instructions (the _s forms of the lookups, check_access_fully_mapped, the lookups' clamps) are in the DXBC the kernel takes, which refuses them on a
+ * device without residency feedback.
  *
  * - A tile pool (D3D11_RESOURCE_MISC_TILE_POOL) is a list of Direct3D 12 heaps (TileChunk): the pool's tiles from `first` on are the chunk's heap's. ResizeTilePool adds a
  *   heap for the tiles it grows by; shrinking makes the tiles past the new size the pool's no longer (they may not be mapped again), the heaps staying until the pool goes,
  *   so that a mapping left on them never names freed memory - growing again uses them first. The pool's own `res` is a small buffer that nothing reads (a tile pool is bound
  *   to nothing).
- * - A tiled buffer or texture (D3D11_RESOURCE_MISC_TILED) is a reserved resource of Direct3D 12 (CreateReservedResource): a buffer of the GPU's memory, or a 2D texture in the
- *   program's format (Direct3D's tile shapes are the format's texels). An unmapped tile reads as zero and drops writes (the kernel's reserved allocations).
+ * - A tiled buffer or texture (D3D11_RESOURCE_MISC_TILED) is a reserved resource of Direct3D 12 (CreateReservedResource): a buffer of the GPU's memory, or a 2D texture, array
+ *   or volume in the program's format (Direct3D's tile shapes are the format's texels or blocks). An unmapped tile reads as zero and drops writes (the kernel's reserved
+ *   allocations). An array of more than one slice may not have packed levels (tiled_texture_check: Direct3D 11's tiers end at 3).
  * - UpdateTileMappings maps regions of the resource to ranges of the pool: it becomes Direct3D 12 UpdateTileMappings calls on the device's queue after what the context recorded
  *   was sent (the queue runs each list before it returns, so the new mapping is in order with the draws before and after): one for the ranges that unmap, one for each heap
  *   of the pool the ranges reach, the ranges of the others skipped in it (a range across two heaps is split). As in Direct3D 11, a resource is mapped into one pool at a time:
@@ -112,6 +115,22 @@ static BOOL tex_tiled_format(Dev *d, DXGI_FORMAT format) {
   return SUCCEEDED(ID3D12Device_CheckFeatureSupport(d->d12, D3D12_FEATURE_FORMAT_SUPPORT, &s, sizeof s)) && (s.Support2 & D3D12_FORMAT_SUPPORT2_TILED) != 0;
 }
 
+/* Whether a reserved texture just made is one Direct3D 11's tiers allow: an array of more than one slice whose levels are all standard - at tier 1 all whole tiles too. */
+static BOOL tiled_texture_check(Dev *d, ID3D12Resource *res, const D3D12_RESOURCE_DESC *rd) {
+  if (rd->Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || rd->DepthOrArraySize <= 1) return TRUE;
+  D3D12_PACKED_MIP_INFO packed;
+  D3D12_TILE_SHAPE shape;
+  UINT total = 0, none = 0;
+  ID3D12Device_GetResourceTiling(d->d12, res, &total, &packed, &shape, &none, 0, NULL);
+  if (packed.NumPackedMips) return FALSE;
+  if (dev_tiled_tier(d) == D3D11_TILED_RESOURCES_TIER_1 && shape.WidthInTexels && shape.HeightInTexels)
+    for (UINT l = 0; l < rd->MipLevels; ++l) {
+      const UINT w = (UINT)rd->Width >> l, h = rd->Height >> l;
+      if ((w ? w : 1) % shape.WidthInTexels || (h ? h : 1) % shape.HeightInTexels) return FALSE;
+    }
+  return TRUE;
+}
+
 /* The reserved resource of a tiled buffer or texture (NULL: the resource is not tiled), and where it keeps its pool. */
 static ID3D12Resource *tiled_of(ID3D11Resource *resource, Buf ***pool_slot) {
   Buf *b = buf_of_resource(resource);
@@ -148,23 +167,29 @@ static BOOL tile_info(Dev *d, ID3D12Resource *res, TileInfo *out) {
   return TRUE;
 }
 
-/* The tiles a region names (Direct3D 11's rules: a box of a subresource of standard tiles, or `NumTiles` tiles on from the start - through the subresources that follow, for a
- * standard subresource; within the packed tiles, for a packed level), checked against the resource. 0: the region is not one of it. */
-static UINT64 region_tiles_checked(const TileInfo *t, const D3D11_TILED_RESOURCE_COORDINATE *start, const D3D11_TILE_REGION_SIZE *size) {
+/* The tiles a region names (Direct3D 11's rules: a box of a subresource of standard tiles - its depth a volume's tiles in z, an array's slices of the same level -, or
+ * `NumTiles` tiles on from the start - through the subresources that follow, for a standard subresource; within the slice's packed tiles, for a packed level), checked
+ * against the resource. No size: one tile, or the whole resource for a call of one region with neither starts nor sizes (`whole`). 0: the region is not one of it. */
+static UINT64 region_tiles_checked(const TileInfo *t, const D3D11_TILED_RESOURCE_COORDINATE *start, const D3D11_TILE_REGION_SIZE *size, BOOL whole) {
+  if (whole && !start && !size) return t->total;
   const D3D11_TILED_RESOURCE_COORDINATE c = start ? *start : (D3D11_TILED_RESOURCE_COORDINATE){0, 0, 0, 0};
   const D3D11_TILE_REGION_SIZE s = size ? *size : (D3D11_TILE_REGION_SIZE){1, FALSE, 0, 0, 0};
   if (!s.NumTiles || c.Subresource >= t->subresources) return 0;
-  const BOOL packed = !t->buffer && c.Subresource >= t->packed.NumStandardMips && t->packed.NumPackedMips;
+  const UINT mips = t->packed.NumStandardMips + t->packed.NumPackedMips;
+  const UINT level = !t->buffer && mips ? c.Subresource % mips : 0;
+  const BOOL packed = !t->buffer && level >= t->packed.NumStandardMips && t->packed.NumPackedMips;
   if (packed) {
-    /* (a packed level: its tiles are the packed ones, numbered by X) */
+    /* (a packed level: its tiles are the slice's packed ones, numbered by X) */
     if (s.bUseBox || c.Y || c.Z || c.X >= t->packed.NumTilesForPackedMips || s.NumTiles > t->packed.NumTilesForPackedMips - c.X) return 0;
     return s.NumTiles;
   }
   const D3D12_SUBRESOURCE_TILING *st = &t->tilings[c.Subresource];
   if (c.X >= st->WidthInTiles || c.Y >= st->HeightInTiles || c.Z >= st->DepthInTiles) return 0;
   if (s.bUseBox) {
+    /* (an array's box goes on through the slices: as many as are left from this one) */
+    const UINT64 deep = st->DepthInTiles > 1 || !mips ? (UINT64)st->DepthInTiles - c.Z : (UINT64)(t->subresources - c.Subresource + mips - 1) / mips;
     if (!s.Width || !s.Height || !s.Depth || (UINT64)s.Width * s.Height * s.Depth != s.NumTiles || s.Width > st->WidthInTiles - c.X || s.Height > st->HeightInTiles - c.Y ||
-        s.Depth > st->DepthInTiles - c.Z)
+        s.Depth > deep)
       return 0;
     return s.NumTiles;
   }
@@ -208,7 +233,7 @@ static HRESULT tile_mappings_check(Dev *d, const TileMappingArgs *a, Buf *curren
   UINT64 region_total = 0;
   HRESULT hr = S_OK;
   for (UINT i = 0; i < a->regions && SUCCEEDED(hr); ++i) {
-    const UINT64 n = region_tiles_checked(&info, a->starts ? &a->starts[i] : NULL, a->sizes ? &a->sizes[i] : NULL);
+    const UINT64 n = region_tiles_checked(&info, a->starts ? &a->starts[i] : NULL, a->sizes ? &a->sizes[i] : NULL, a->regions == 1);
     if (!n) hr = E_INVALIDARG;
     region_total += n;
   }
@@ -248,7 +273,15 @@ static void tile_mappings_apply(Dev *d, const TileMappingArgs *a) {
   /* (the ranges, split where a range crosses from one heap of the pool into the next: kind 0 map, 1 unmap, 2 skip, 4 one tile again) */
   typedef struct Piece { UINT kind; UINT chunk; UINT64 heap_tile; UINT count; } Piece;
   UINT64 region_total = 0;
-  for (UINT i = 0; i < a->regions; ++i) region_total += a->sizes ? a->sizes[i].NumTiles : 1;
+  if (a->regions == 1 && !a->starts && !a->sizes) {
+    /* (one region with neither a start nor a size: the whole resource) */
+    TileInfo info;
+    if (!tile_info(d, res, &info)) return;
+    region_total = info.total;
+    mem_free(info.tilings);
+  } else {
+    for (UINT i = 0; i < a->regions; ++i) region_total += a->sizes ? a->sizes[i].NumTiles : 1;
+  }
   const TilePool *tp = pool ? pool->tile_pool : NULL;
   UINT cap = a->ranges + (tp ? tp->count : 0) * a->ranges + 1, n = 0;
   Piece *pieces = mem_alloc(sizeof *pieces * cap);
@@ -354,7 +387,7 @@ static HRESULT STDMETHODCALLTYPE ctx_CopyTileMappings(Ctx *c, ID3D11Resource *ds
   else {
     if (!tile_info(d, src12, &si)) hr = E_OUTOFMEMORY;
     else {
-      if (!region_tiles_checked(&di, dst_start, size) || !region_tiles_checked(&si, src_start, size)) hr = E_INVALIDARG;
+      if (!region_tiles_checked(&di, dst_start, size, FALSE) || !region_tiles_checked(&si, src_start, size, FALSE)) hr = E_INVALIDARG;
       mem_free(si.tilings);
     }
     if (SUCCEEDED(hr) && c->deferred) {
@@ -433,7 +466,7 @@ static UINT64 tile_region_of(Dev *d, ID3D11Resource *resource, const D3D11_TILED
   if (!res || !start || !size) return 0;
   TileInfo info;
   if (!tile_info(d, res, &info)) return 0;
-  const UINT64 n = region_tiles_checked(&info, start, size);
+  const UINT64 n = region_tiles_checked(&info, start, size, FALSE);
   mem_free(info.tilings);
   return n;
 }
@@ -505,11 +538,12 @@ static void STDMETHODCALLTYPE ctx_UpdateTiles(Ctx *c, ID3D11Resource *dst, const
   UNLOCK(c);
 }
 
-/* ResizeTilePool: a whole number of 64 KiB tiles, more than none. Growing adds a heap (E_OUTOFMEMORY: the pool stays as it was); shrinking takes the tiles past the size out of
- * the pool. The buffer's description has the new size. */
+/* ResizeTilePool: a whole number of 64 KiB tiles, or none. Growing adds a heap (E_OUTOFMEMORY: the pool stays as it was, its mappings too); shrinking - down to nothing -
+ * takes the tiles past the size out of the pool: they may not be mapped again, but the mappings into them stay and work (the heaps stay until the pool goes). The buffer's
+ * description has the new size. */
 static HRESULT STDMETHODCALLTYPE ctx_ResizeTilePool(Ctx *c, ID3D11Buffer *pool, UINT64 size) {
   Buf *b = pool_of(pool);
-  if (!b || !size || size % TILE_BYTES || size > 0xFFFFFFFFull) return E_INVALIDARG;
+  if (!b || size % TILE_BYTES || size > 0xFFFFFFFFull) return E_INVALIDARG;
   LOCK(c);
   HRESULT hr = S_OK;
   if (c->deferred) deferred_record(c, &(RecArgs){.op = REC_RESIZE_TILE_POOL, .obj = {pool}, .u = {(UINT)size}});

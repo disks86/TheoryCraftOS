@@ -95,14 +95,15 @@ static void dev_uav_support(Dev *d, DXGI_FORMAT format, UINT *support1, UINT *su
 }
 
 static HRESULT dev_check_format(Dev *d, DXGI_FORMAT format, UINT *support);
-/* The tiers of Direct3D 12 below, as Direct3D 11's (the enumerations have the same numbers): tiled resources (tier 1 at most - tiled.inc makes tier 1's resources), and
- * conservative rasterization (tier 1 on the CPU renderer, none on virgl). */
+/* The tiers of Direct3D 12 below, as Direct3D 11's (the enumerations have the same numbers): tiled resources - Direct3D 12's tier, its tier 4 (arrays with packed levels) Direct3D
+ * 11's tier 3, the highest it has (tiled.inc keeps to tier 3's rules: no array of more than one slice with packed levels): 3 on the CPU renderer, 1 on virgl -, and conservative
+ * rasterization (tier 1 on the CPU renderer, none on virgl). */
 static D3D11_TILED_RESOURCES_TIER dev_tiled_tier(Dev *d) {
   D3D12_FEATURE_DATA_D3D12_OPTIONS o;
   memset(&o, 0, sizeof o);
   if (FAILED(ID3D12Device_CheckFeatureSupport(d->d12, D3D12_FEATURE_D3D12_OPTIONS, &o, sizeof o)) || o.TiledResourcesTier == D3D12_TILED_RESOURCES_TIER_NOT_SUPPORTED)
     return D3D11_TILED_RESOURCES_NOT_SUPPORTED;
-  return D3D11_TILED_RESOURCES_TIER_1;
+  return o.TiledResourcesTier >= D3D12_TILED_RESOURCES_TIER_3 ? D3D11_TILED_RESOURCES_TIER_3 : (D3D11_TILED_RESOURCES_TIER)o.TiledResourcesTier;
 }
 static D3D11_CONSERVATIVE_RASTERIZATION_TIER dev_conservative_tier(Dev *d) {
   D3D12_FEATURE_DATA_D3D12_OPTIONS o;
@@ -253,10 +254,16 @@ static HRESULT STDMETHODCALLTYPE dev_CheckFeatureSupport(Dev *d, D3D11_FEATURE f
     case D3D11_FEATURE_SHADER_MIN_PRECISION_SUPPORT: FEATURE_SIZE(D3D11_FEATURE_DATA_SHADER_MIN_PRECISION_SUPPORT); break;      /* (every stage computes in 32 bits) */
     case D3D11_FEATURE_D3D9_SHADOW_SUPPORT: FEATURE_SIZE(D3D11_FEATURE_DATA_D3D9_SHADOW_SUPPORT); break;
     case D3D11_FEATURE_D3D11_OPTIONS1: {
-      /* (tiled resources: tier 1, over Direct3D 12's reserved resources - tiled.inc; no min/max filtering, ClearView of depth formats or Map of default buffers) */
+      /* (tiled resources: tier 1, over Direct3D 12's reserved resources - tiled.inc; min/max filtering where the kernel's device has kFeature2SamplerReductions - the CPU renderer -;
+       * no ClearView of depth formats or Map of default buffers) */
       FEATURE_SIZE(D3D11_FEATURE_DATA_D3D11_OPTIONS1);
       memset(data, 0, size);
       ((D3D11_FEATURE_DATA_D3D11_OPTIONS1 *)data)->TiledResourcesTier = dev_tiled_tier(d);
+      {
+        UINT features2 = 0;
+        TcosD3D12DeviceFeatures(d->d12, NULL, &features2);
+        ((D3D11_FEATURE_DATA_D3D11_OPTIONS1 *)data)->MinMaxFiltering = (features2 & (1u << 19)) ? TRUE : FALSE;
+      }
       return S_OK;
     }
     case D3D11_FEATURE_D3D9_SIMPLE_INSTANCING_SUPPORT: {

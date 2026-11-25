@@ -48,6 +48,7 @@ enum {
 enum { KFC_SAMPLED = 1, KFC_FILTERED = 2, KFC_RENDER_TARGET = 4, KFC_BLENDABLE = 8, KFC_STORAGE = 16, KFC_MIPMAPS = 32, KFC_MULTISAMPLE = 64, KFC_NATIVE = 128 };
 #define KMAX_TEXTURE_DIMENSION 4096      /* (the video surfaces' limit; textures: the adapter's KmtCaps::max_texture_dimension, up to 16384) */
 #define KTILE_BYTES 65536
+#define KTILE_STANDARD_SWIZZLE (1u << 8)   /* AllocationDesc::tile_narrow: Direct3D's standard swizzle inside the tiles (the kernel's kTileStandardSwizzle) */
 
 typedef struct FormatInfo {
   DXGI_FORMAT dxgi;
@@ -63,7 +64,9 @@ typedef struct FormatInfo {
 } FormatInfo;
 /* The kernel's NarrowLayout (src/Kernel/Dxgkrnl/CommandStream.hpp): an image of four channels the program sees as one or two. Copied into it a pixel becomes (r, g or 0, 0,
  * the maximum), so an R8 / R8G8 / R16 / R16G16 view of it samples what Direct3D says it does; render targets of these formats write their channels only (pso.inc). */
-enum { NARROW_NONE, NARROW_R8, NARROW_R8G8, NARROW_R16, NARROW_R16G16 };
+/* NARROW_R1: R1_UNORM, a bit a pixel (the first of a row the most significant bit of its first byte), which the kernel keeps as bytes of 0 or 255 in red - its R8Unorm image, or
+ * widened into A8B8G8R8 - and its copies pack and unpack (NarrowLayout::R1); `bytes` is 1, a row's bytes are (width + 7) / 8 (format_row_bytes). */
+enum { NARROW_NONE, NARROW_R8, NARROW_R8G8, NARROW_R16, NARROW_R16G16, NARROW_R1 = 9 };
 enum { PLANAR_NONE, PLANAR_8, PLANAR_16, PLANAR_P208, PLANAR_V208, PLANAR_V408 };
 
 static const FormatInfo g_formats[] = {
@@ -108,9 +111,25 @@ static const FormatInfo g_formats[] = {
     {DXGI_FORMAT_YUY2, KF_A8B8G8R8, 4, 0, 0, 0, 0, 1}, {DXGI_FORMAT_Y210, KF_RGBA16, 8, 0, 0, 0, 0, 1}, {DXGI_FORMAT_Y216, KF_RGBA16, 8, 0, 0, 0, 0, 1},
     {DXGI_FORMAT_P208, KF_A8B8G8R8, 1, 0, 0, NARROW_R8, PLANAR_P208}, {DXGI_FORMAT_V208, KF_A8B8G8R8, 1, 0, 0, NARROW_R8, PLANAR_V208},
     {DXGI_FORMAT_V408, KF_A8B8G8R8, 1, 0, 0, NARROW_R8, PLANAR_V408},
+    {DXGI_FORMAT_R1_UNORM, KF_A8B8G8R8, 1, 0, 0, NARROW_R1},
 };
+/* The narrow formats as the kernel's own one- and two-channel images (its formats numbered from 64: R8Unorm, R8G8Unorm, R16Unorm, R16G16Unorm), for a texture of one where the
+ * adapter has that image for all the texture is made for (native_narrow_format): its texels are kept as they are, no widening. A typeless one's views of the other kinds (R8_UINT,
+ * R16_FLOAT ...) are mirrors of it in the view's own kernel format - the same bytes (heaps.inc typed_view_alloc). */
+static const FormatInfo g_native_narrow[] = {
+    {DXGI_FORMAT_R8_TYPELESS, KF_R8, 1, 0}, {DXGI_FORMAT_R8_UNORM, KF_R8, 1, 0}, {DXGI_FORMAT_R8G8_TYPELESS, KF_R8G8, 2, 0}, {DXGI_FORMAT_R8G8_UNORM, KF_R8G8, 2, 0},
+    {DXGI_FORMAT_R16_TYPELESS, KF_R16, 2, 0}, {DXGI_FORMAT_R16_UNORM, KF_R16, 2, 0}, {DXGI_FORMAT_R16G16_TYPELESS, KF_R16G16, 4, 0}, {DXGI_FORMAT_R16G16_UNORM, KF_R16G16, 4, 0},
+    {DXGI_FORMAT_R1_UNORM, KF_R8, 1, 0, 0, NARROW_R1},      /* (its bits as bytes of the kernel's R8Unorm image) */
+};
+static const FormatInfo *native_narrow_entry(DXGI_FORMAT f) {
+  for (UINT i = 0; i < sizeof g_native_narrow / sizeof g_native_narrow[0]; ++i)
+    if (g_native_narrow[i].dxgi == f) return &g_native_narrow[i];
+  return NULL;
+}
+static int format_native_narrow(const FormatInfo *fi) { return fi && fi >= g_native_narrow && fi < g_native_narrow + sizeof g_native_narrow / sizeof g_native_narrow[0]; }
 /* The bytes of a row of a level `w` pixels wide (of blocks for a compressed format), and the rows of a level `h` high. */
 static UINT64 format_row_bytes(const FormatInfo *fi, UINT w) {
+  if (fi && fi->narrow == NARROW_R1) return ((UINT64)w + 7) / 8;      /* (R1_UNORM: a bit a pixel) */
   return fi && fi->compressed ? (UINT64)((w + 3) / 4) * fi->bytes : fi && fi->pair ? (UINT64)((w + 1) / 2) * fi->bytes : (UINT64)w * (fi ? fi->bytes : 4);
 }
 /* A column and a width of a texture in pixels of the kernel's image (a packed 4:2:2 format's are pairs). */
@@ -135,10 +154,12 @@ static int packed_yuv_view_ok(DXGI_FORMAT res, DXGI_FORMAT view, int render_targ
 static UINT format_rows(const FormatInfo *fi, UINT h) { return fi && fi->compressed ? (h + 3) / 4 : h; }
 /* The packed YUV formats that may have mip levels (DXGI's format tables: AYUV and Y416; Y410, YUY2, Y210 and Y216 have "Mipmap" disallowed). */
 static int format_packed_yuv_mips(DXGI_FORMAT f) { return f == DXGI_FORMAT_AYUV || f == DXGI_FORMAT_Y416; }
-/* Whether a texture of the format may be reserved (D3D12_FORMAT_SUPPORT2_TILED): a colour format the kernel keeps, of 1 to 16 bytes a texel, not block-compressed, not a video
- * format (planar or packed YUV: Direct3D defines no tiles for those, and its format tables have "Tiled Resource" disallowed for every one of them). */
+/* Whether a texture of the format may be reserved (D3D12_FORMAT_SUPPORT2_TILED): a colour format the kernel keeps, of 1 to 16 bytes a texel, or a block-compressed one (8 or 16
+ * bytes a block), not a video format (planar or packed YUV: Direct3D defines no tiles for those, and its format tables have "Tiled Resource" disallowed for every one of them),
+ * not R32G32B32 (96 bits: no tile shape). Not the depth formats: the kernel's depth buffers are the device's alone (no backing a tile could be gathered into), so no reserved
+ * depth buffer is offered - CreateReservedResource refuses them as a format without the support. */
 static int format_tiled(const FormatInfo *fi) {
-  if (!fi || !fi->kernel || fi->depth || fi->compressed || fi->planar || fi->pair || format_packed_yuv(fi->dxgi)) return 0;
+  if (!fi || !fi->kernel || fi->depth || fi->planar || fi->pair || format_packed_yuv(fi->dxgi) || fi->narrow == NARROW_R1) return 0;      /* (R1_UNORM: no tiles of bits) */
   return fi->bytes == 1 || fi->bytes == 2 || fi->bytes == 4 || fi->bytes == 8 || fi->bytes == 16;
 }
 
@@ -149,6 +170,30 @@ static const FormatInfo *format_info(DXGI_FORMAT f) {
 }
 /* The planes of a planar format (0 for another). */
 static UINT format_planes(const FormatInfo *fi) { return !fi || !fi->planar ? 0 : fi->planar == PLANAR_V208 || fi->planar == PLANAR_V408 ? 3 : 2; }
+/* The planes of a depth format, as Direct3D 12 counts them in subresource indices and footprints: 2 of the formats with stencil (plane 0 the depth, 1 the stencil), 1 of the others. */
+static UINT depth_format_planes(DXGI_FORMAT f) {
+  return f == DXGI_FORMAT_D24_UNORM_S8_UINT || f == DXGI_FORMAT_R24G8_TYPELESS || f == DXGI_FORMAT_D32_FLOAT_S8X24_UINT || f == DXGI_FORMAT_R32G8X24_TYPELESS ? 2 : 1;
+}
+/* The footprint format of plane `plane` of a depth format with stencil (GetCopyableFootprints, CopyTextureRegion): the depth as 32 bits (R32_TYPELESS: a float of D32_FLOAT_S8X24_UINT,
+ * the 24-bit normalised depth of D24_UNORM_S8_UINT in the low bits of a word whose high byte is 0), the stencil as bytes (R8_TYPELESS). The formats of one plane are their own. */
+static const FormatInfo *depth_plane_format(DXGI_FORMAT f, UINT plane) {
+  if (depth_format_planes(f) == 1) return format_info(f);
+  return format_info(plane ? DXGI_FORMAT_R8_TYPELESS : DXGI_FORMAT_R32_TYPELESS);
+}
+/* The kernel's CopyBufferImage layout of a plane of a depth buffer (its NarrowLayout DepthFloat32 5, DepthUnorm16 6, DepthUnorm24 7, Stencil8 8): of the resource's format as the program
+ * named it - D32_FLOAT and D32_FLOAT_S8X24_UINT floats, D16_UNORM 16-bit and D24_UNORM_S8_UINT 24-bit codes, the stencil bytes. */
+#define DEPTH_LAYOUT_FLOAT32 5u
+#define DEPTH_LAYOUT_UNORM16 6u
+#define DEPTH_LAYOUT_UNORM24 7u
+#define DEPTH_LAYOUT_STENCIL8 8u
+static UINT depth_layout(DXGI_FORMAT f, UINT plane) {
+  if (plane) return DEPTH_LAYOUT_STENCIL8;
+  switch (f) {
+    case DXGI_FORMAT_D16_UNORM: case DXGI_FORMAT_R16_TYPELESS: return DEPTH_LAYOUT_UNORM16;
+    case DXGI_FORMAT_D24_UNORM_S8_UINT: case DXGI_FORMAT_R24G8_TYPELESS: return DEPTH_LAYOUT_UNORM24;
+    default: return DEPTH_LAYOUT_FLOAT32;
+  }
+}
 /* The size of plane `plane` of a level `*w` x `*h` of a planar format: the chroma of NV12 / P010 / P016 half both ways, of P208 half as wide, of V208 half as high. */
 static void plane_extent(const FormatInfo *fi, UINT plane, UINT *w, UINT *h) {
   if (!fi || !fi->planar || plane == 0 || fi->planar == PLANAR_V408) return;
@@ -335,6 +380,19 @@ struct Dev {
 #define DEV_FEATURE2_SAMPLER_STATE (1u << 11)            /* anisotropy, border colours of any value */
 #define DEV_FEATURE2_VIEWPORTS (1u << 12)                /* sixteen viewports and scissor rectangles, SV_ViewportArrayIndex from geometry shaders */
 #define DEV_FEATURE2_LAYER_ANY_STAGE (1u << 13)          /* SV_RenderTargetArrayIndex and SV_ViewportArrayIndex from vertex and domain shaders */
+#define DEV_FEATURE2_DEPTH_BOUNDS (1u << 30)             /* the depth bounds test (the kernel's SetDepthBounds) */
+#define DEV_FEATURE2_SAMPLE_POSITIONS (1u << 25)         /* programmable sample positions, one pattern or one for each pixel of a 2 x 2 quad (SetSamplePositions) */
+#define DEV_FEATURE2_VIEW_INSTANCING (1u << 26)          /* SV_ViewID and the view's viewport and layer offsets (SetViewInstance): view instancing by draw-call looping */
+#define DEV_FEATURE2_SHADING_RATE (1u << 31)             /* coarse pixel shading: the rate, the combiners, the shading-rate image, SV_ShadingRate (SetShadingRate) */
+#define DEV_FEATURE2_BARYCENTRICS (1u << 28)             /* SV_Barycentrics and GetAttributeAtVertex in pixel shaders */
+#define DEV_FEATURE2_SAMPLE_COPIES (1u << 29)            /* a region of a multisampled image, every sample, into another (ResolveRegion's kResolveCopySamples): DECOMPRESS */
+#define SHADING_RATE_TILE 16                             /* graphics::kShadingRateTileSize: the pixels of a tile of the shading-rate image each way */
+#define DEV_FEATURE2_TILE_RESIDENCY (1u << 27)           /* graphics::kFeature2TileResidency: residency feedback (CheckAccessFullyMapped) and lookup clamps - tiled resources tier 2 and up */
+#define DEV_FEATURE_TEXTURE_KINDS (1u << 8)              /* graphics::kFeatureTextureKinds: volumes, arrays, cubes */
+#define DEV_FEATURE2_SEPARATE_FILTERS (1u << 18)         /* graphics::kFeature2SeparateFilters: minification and magnification filters of their own (MIN_POINT_MAG_LINEAR ...) */
+#define DEV_FEATURE2_SAMPLER_REDUCTIONS (1u << 19)       /* graphics::kFeature2SamplerReductions: the MINIMUM_ and MAXIMUM_ filters */
+#define DEV_FEATURE2_UNNORMALIZED_COORDINATES (1u << 20) /* graphics::kFeature2UnnormalizedCoordinates: samplers with D3D12_SAMPLER_FLAG_NON_NORMALIZED_COORDINATES */
+#define DEV_FEATURE2_LINE_MODES (1u << 21)               /* graphics::kFeature2LineModes: alpha-antialiased and quadrilateral lines (the CreatePipeline part 'LIN1') */
 /* What allocations of a kernel format numbered from KF_FIRST_EXTRA may be on the device's adapter (KFC_* bits; 0 for any other format, or from a kernel that has no table) */
 static UINT dev_format_caps(const Dev *d, UINT kf) {
   const KmtCaps *c = &d->caps;
@@ -345,6 +403,17 @@ static UINT dev_format_caps(const Dev *d, UINT kf) {
 static UINT dev_max_texture(const Dev *d) {
   const UINT m = d->caps.max_texture_dimension;
   return m < 4096 ? 4096 : m > 16384 ? 16384 : m;
+}
+/* The tiled resources tier of the device (D3D12_FEATURE_D3D12_OPTIONS): every adapter has the kernel's reserved buffers and 2D textures, arrays and cubes (tier 1; what an
+ * unmapped tile holds is read as zero and writes to it are dropped everywhere, since the kernel gathers and scatters the tiles); residency feedback and the lookups' own clamp
+ * (CheckAccessFullyMapped, Sample with a clamp: graphics::kFeature2TileResidency, the CPU renderer's) make tier 2; volumes (the kernel's texture kinds) tier 3; arrays whose
+ * levels are packed - each slice has its own packed levels (VidMm ReservedLayout) - on a device with levels of arrays, tier 4. virgl's shaders are TGSI, which has no residency
+ * feedback: tier 1 there. */
+static D3D12_TILED_RESOURCES_TIER dev_tiled_tier(const Dev *d) {
+  if (!(d->caps.features2 & DEV_FEATURE2_TILE_RESIDENCY)) return D3D12_TILED_RESOURCES_TIER_1;
+  if (!(d->caps.features & DEV_FEATURE_TEXTURE_KINDS)) return D3D12_TILED_RESOURCES_TIER_2;
+  if (!(d->caps.features2 & DEV_FEATURE2_MIPMAPPED_LAYERS)) return D3D12_TILED_RESOURCES_TIER_3;
+  return D3D12_TILED_RESOURCES_TIER_4;
 }
 
 static const GUID *const g_device_iids[] = {&IID_ID3D12Object, &IID_ID3D12Device, &IID_ID3D12Device1, &IID_ID3D12Device2, &IID_ID3D12Device3, &IID_ID3D12Device4,

@@ -35,6 +35,35 @@ namespace dxgk {
 
 class VidMm;
 
+// The tiles of a reserved texture (kAllocReserved), numbered as Direct3D numbers them (what GetResourceTiling reports): each slice of an array or cube - a volume has one - has
+// the tiles of its standard levels, level after level, each level's tiles in x, then y, then z order, and then the tiles of its packed levels; the slices follow one another.
+// A tile holds tile_shape(element_bytes, volume) elements - texels, or 4 x 4 blocks of a block-compressed format - in the heap as rows of `shape.width` elements, the rows of one
+// slice of the tile before those of the next (the part of an edge tile outside the level is not used). A level is standard when it is at least a tile in every direction (in
+// texels, Direct3D's tier 2 rule); it and the finer ones are, the coarser ones are packed: per slice, their elements level after level - a volume's level slice after slice -, row
+// by row, over as many tiles as they fill (an element never straddles two tiles: element_bytes divides kTileBytes).
+constexpr uint32_t kMaxReservedLevels = 16;
+struct ReservedLayout {
+  uint32_t element_bytes = 0;    // an element in the heaps (narrower than the image's pixel for AllocationDesc::tile_narrow)
+  uint32_t image_bytes = 0;      // ... and in the backing
+  uint32_t block = 1;            // texels per element across and down: 4 for a block-compressed format
+  bool volume = false;
+  // The standard swizzle (kTileStandardSwizzle): where an element (x, y, z) of a standard level's tile is in it - the bits of x * element_bytes, y and z deposited into these masks of
+  // the 16 bits of the offset (Direct3D's patterns, as src/Windows/tcos_swizzle.h has them); 0: rows. The packed levels stay rows of elements (their layout is the adapter's).
+  uint32_t swizzle_x = 0, swizzle_y = 0, swizzle_z = 0;
+  TileShape shape;               // in elements
+  uint32_t mips = 0, slices = 1, standard = 0;
+  uint64_t first[kMaxReservedLevels] = {}, columns[kMaxReservedLevels] = {}, rows[kMaxReservedLevels] = {}, deep[kMaxReservedLevels] = {};   // a standard level's tiles in one slice
+  uint64_t packed_first = 0;     // the packed levels' first tile in a slice
+  uint64_t packed_bytes = 0, packed_tiles = 0;   // ... their elements' bytes in one slice, and the tiles they fill
+  uint64_t per_slice = 0, total = 0;
+};
+// False for a description that has no tiles (not a texture of a format with a tile shape).
+bool reserved_layout(const AllocationDesc& d, ReservedLayout* out);
+// A level's elements across and down, and its depth (a volume's slices there; 1 for the other kinds).
+uint32_t reserved_elements_x(const ReservedLayout& l, const AllocationDesc& d, uint32_t level);
+uint32_t reserved_elements_y(const ReservedLayout& l, const AllocationDesc& d, uint32_t level);
+uint32_t reserved_depth(const AllocationDesc& d, uint32_t level);
+
 // VidMm::set_mirror's modes.
 constexpr uint32_t kMirrorInteger = 1u << 0, kMirrorWriteBack = 1u << 1;
 
@@ -51,7 +80,8 @@ class Allocation {
   uint64_t device_bytes() const { return device_bytes_; }
   const AllocationDesc& desc() const { return desc_; }
   bool is_buffer() const { return (desc_.flags & (kAllocVertexBuffer | kAllocIndexBuffer | kAllocQueryResult | kAllocUnorderedAccess | kAllocStreamOutput | kAllocConstantBuffer | kAllocHeap)) != 0; }
-  bool reserved() const { return reserved_; }   // a reserved (tiled) buffer: see kAllocReserved
+  bool reserved() const { return reserved_; }   // a reserved (tiled) buffer or texture: see kAllocReserved
+  uint64_t tile_count() const { return tiles_.count(); }
   bool is_heap() const { return (desc_.flags & kAllocHeap) != 0; }
   bool placed() const { return static_cast<bool>(heap_); }   // its backing is a part of a heap's memory
   const SharedPointer<Allocation>& heap() const { return heap_; }
@@ -110,12 +140,13 @@ class Allocation {
   SharedPointer<Allocation> heap_;     // placed: the heap (kept alive by it)
   uint64_t heap_offset_ = 0;
   List<Allocation*> placed_;           // a heap: the allocations placed in it
+  List<Allocation*> tile_users_;       // ... and the reserved ones with tiles in it
   struct TileBinding {
     SharedPointer<Allocation> heap;
     uint64_t offset = 0;
     bool changed = false;              // (scatter_tiles: the tile's bytes differ from what its heap holds)
   };
-  List<TileBinding> tiles_;            // a reserved buffer: where each of its tiles is (a null heap: nowhere)
+  List<TileBinding> tiles_;            // a reserved buffer or texture: where each of its tiles is (a null heap: nowhere), in ReservedLayout's order for a texture
   bool reserved_ = false;
   bool state_tracked_ = false;
   uint32_t state_ = 0;
@@ -182,12 +213,18 @@ class VidMm {
   // Reserved buffers: `count` tiles from `first` are put at `heap_offset` (a multiple of kTileBytes) of `heap` on, or nowhere (a null heap). The buffer's contents are gathered from the tiles whenever
   // the device or the CPU takes them and scattered back when the GPU's or the CPU's writes arrive.
   NtStatus map_tiles(Allocation& reserved, uint32_t first, const SharedPointer<Allocation>& heap, uint64_t heap_offset, uint32_t count);
+  // Direct3D's CopyTiles: `count` tiles of a reserved allocation from `first` on, the 64 KiB each holds in its heap, to (`to_buffer`) or from `buffer` (a plain buffer) at `offset`
+  // on, one after the other. A tile mapped nowhere gives zeros and drops what it is given. What the GPU wrote into the tiles' heaps comes back first; every allocation sharing a
+  // heap that was written is stale afterwards. False when a read-back failed or the ranges are not inside the allocations.
+  bool copy_tiles(Allocation& reserved, uint32_t first, uint32_t count, Allocation& buffer, uint64_t offset, bool to_buffer);
   void note_cpu_write(Allocation& a);
   void note_gpu_write(Allocation& a);
 
-  // Mirrors: `mirror` (a texture of one level and sample, 2D or a 2D array, not placed or reserved) shows `sources` - 2D images of one level and sample of its size whose pixels
-  // are as many bytes as its own and of the same channel width (8 or 16 bits): source n is layer n of an array, a 2D mirror has one source. Its contents are the sources'
-  // bytes; kMirrorInteger makes the alpha the integer 1 (the mirror is an integer image showing a normalised one: Direct3D's R8_UINT view of an NV12 plane), kMirrorWriteBack
+  // Mirrors: `mirror` (a texture of one sample, 2D or a 2D array, not placed or reserved) shows `sources` - 2D images of one level and sample of its size whose pixels have the
+  // same channels of the same width as its own (the four-channel 8- and 16-bit formats, normalised or integer, or the one- and two-channel 8- and 16-bit formats of any kind, each
+  // its own family): source n is layer n of an array, a 2D mirror has one source; a mirror of several levels (with `subresources`) has a source for each of its subresources, levels
+  // first - source n is layer n % layers of level n / layers. Its contents are the sources'
+  // bytes; kMirrorInteger makes the alpha of a four-channel mirror the integer 1 (the mirror is an integer image showing a normalised one: Direct3D's R8_UINT view of an NV12 plane), kMirrorWriteBack
   // gives the `channels` the GPU drew into the mirror back to its one source once the pass that drew is over (a render target of that integer view). The kernel's devices
   // have no views of other formats or of several images, so a mirror is a copy: command streams bring it up to date (refresh_mirror) before it is sampled or drawn into.
   // An empty `sources` makes it an ordinary image again. kInvalidParameter for images that cannot be mirrored so.
@@ -218,6 +255,12 @@ class VidMm {
   friend class Allocation;
   void forget(Allocation& a);   // called by ~Allocation
   bool upload(Allocation& a);
+  bool upload_contents(Allocation& a);     // (upload without a reserved allocation's tiles and residency)
+  void push_residency(Allocation& a);
+  void settle_tiles(Allocation& a);
+  void flush_heap_writers(Allocation& heap, const Allocation* except);
+  void heap_changed(Allocation& heap, const Allocation* except);
+  void forget_tile_user(Allocation& heap, Allocation& reserved);
   bool upload_compressed(Allocation& a);   // (the part of upload for a block-compressed texture)
   bool upload_packed32(Allocation& a);
   bool read_back_packed32(Allocation& a);

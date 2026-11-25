@@ -379,6 +379,10 @@ String TgsiEmitter::operand(const Instr::Src& s, uint32_t offset, uint32_t slot,
       add(base, "]");
       break;
     case kInput:
+      if (s.at_vertex) {   // (GetAttributeAtVertex: virgl's TGSI here has no per-vertex inputs of a pixel shader)
+        unsupported_ = true;
+        break;
+      }
       if (hull_ || domain_) {
         // IN[control point][1 + varying]; the control point being made is the invocation's (ADDR[1]); the position is turned back to Direct3D's +Y up into a scratch register
         if ((!s.vertex_from_id && s.vertex >= graphics::kMaxPatchControlPoints) || (s.slot != kSlotPosition && (s.slot < 0 || s.slot >= static_cast<int8_t>(graphics::kMaxVaryings)))) {
@@ -443,6 +447,14 @@ String TgsiEmitter::operand(const Instr::Src& s, uint32_t offset, uint32_t slot,
       add(base, "]");
       break;
     case kSysValue:   // (copied to a register by the prologue; the stage decides which exist)
+      if (s.number == kSysViewId) {
+        // (SV_ViewID on a device without view instancing - virgl -: every draw is view 0, which Direct3D 12 says a driver without it gives a shader that reads it)
+        const float none[4] = {0, 0, 0, 0};
+        add(base, "IMM[");
+        add_uint(base, imm4(none));
+        add(base, "]");
+        break;
+      }
       if (s.number == kSysOutputControlPointId && !hull_) {
         unsupported_ = true;
         break;
@@ -451,7 +463,7 @@ String TgsiEmitter::operand(const Instr::Src& s, uint32_t offset, uint32_t slot,
         unsupported_ = true;
         break;
       }
-      if (s.number >= kSysValueCount || (geometry_ ? s.number != kSysGsInstanceId && s.number != kSysPrimitiveId : s.number == kSysGsInstanceId) || (compute_ || hull_ || domain_ ? s.number < kSysDispatchThreadId : vertex_ ? s.number != kSysVertexId && s.number != kSysInstanceId : s.number == kSysVertexId || s.number == kSysInstanceId || s.number >= kSysDispatchThreadId)) {
+      if (s.number >= kSysViewId || (geometry_ ? s.number != kSysGsInstanceId && s.number != kSysPrimitiveId : s.number == kSysGsInstanceId) || (compute_ || hull_ || domain_ ? s.number < kSysDispatchThreadId : vertex_ ? s.number != kSysVertexId && s.number != kSysInstanceId : s.number == kSysVertexId || s.number == kSysInstanceId || s.number >= kSysDispatchThreadId)) {
         unsupported_ = true;
         break;
       }
@@ -556,7 +568,8 @@ String TgsiEmitter::destination(const Instr::Dst& d) {
   switch (d.type) {
     case kTemp: return temp(d.number, "");
     case kRastOut:
-      if ((d.slot == kSlotLayer || d.slot == kSlotViewport) && !geometry_) unsupported_ = true;   // (virglrenderer takes a vertex or evaluation shader's layer and viewport from no TGSI it is given)
+      if ((d.slot == kSlotLayer || d.slot == kSlotViewport) && !geometry_) unsupported_ = true;
+      if (d.slot == kSlotShadingRate) unsupported_ = true;   // (SV_ShadingRate: virgl has no coarse shading)   // (virglrenderer takes a vertex or evaluation shader's layer and viewport from no TGSI it is given)
       return temp(d.slot == kSlotLayer ? kLayer : d.slot == kSlotViewport ? kViewportIndex : kPosition, "");
     case kAttrOut:
     case kTexCrdOut:
@@ -1536,9 +1549,11 @@ bool TgsiEmitter::instruction(const Instr& ins) {
         break;
       }
       sampler_used_[unit] = true;
-      const uint8_t xyxy[4] = {0, 1, 0, 1}, xyzz[4] = {0, 1, 2, 2};
+      const uint8_t xyxy[4] = {0, 1, 0, 1}, xyzz[4] = {0, 1, 2, 2}, xyzw[4] = {0, 1, 2, 3};
       const bool flat = p_.texture_kind(unit) == graphics::TextureKind::Texture2D;
-      String coordinate = operand(ins.src[0], 0, 0, flat ? xyxy : xyzz, false);
+      // (a cube array's coordinate is the direction and the cube: all four)
+      const bool cube_array = p_.texture_kind(unit) == graphics::TextureKind::TextureCubeArray;
+      String coordinate = operand(ins.src[0], 0, 0, flat ? xyxy : cube_array ? xyzw : xyzz, false);
       String sampler = str();
       add(sampler, "SAMP[");
       add_uint(sampler, unit);
@@ -2359,6 +2374,7 @@ NtStatus TgsiEmitter::run(String* out) {
 }
 
 NtStatus D3d9Program::emit_tgsi(String* out, uint32_t varyings, graphics::TgsiBindings* bindings, bool d3d_sample_order) const {
+  if (uses_feedback_) return status::kNotSupported;   // (TGSI has no residency feedback or per-lookup clamp: virgl reports tiled resources tier 1)
   TgsiEmitter emitter(*this, allocator_, varyings < graphics::kMaxVaryings ? varyings : graphics::kMaxVaryings);
   emitter.set_d3d_sample_order(d3d_sample_order);
   const NtStatus s = emitter.run(out);

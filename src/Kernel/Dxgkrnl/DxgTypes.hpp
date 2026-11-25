@@ -128,6 +128,22 @@ constexpr bool decode_address_word(uint32_t word, graphics::AddressMode* mode, g
   *border = static_cast<graphics::BorderColor>(word >> 8);
   return true;
 }
+// The third word of BindTexture (and a descriptor's filter word): the filter in bit 0 (graphics::Filter: 0 nearest, 1 linear - of minification and magnification, or of minification
+// alone with bit 1), bit 1 a magnification filter of its own (SamplerDesc::separate_mag, kFeature2SeparateFilters) in bit 2, the reduction in bits 4-5 (graphics::SamplerReduction:
+// 0 weighted, 1 minimum, 2 maximum; kFeature2SamplerReductions), bit 8 coordinates in texels (SamplerDesc::unnormalized, kFeature2UnnormalizedCoordinates). The words 0 and 1
+// are the plain filters every device has. False for a word that is none of these.
+constexpr uint32_t filter_word(const graphics::SamplerDesc& s) {
+  return static_cast<uint32_t>(s.filter) | (s.separate_mag ? 2u | (static_cast<uint32_t>(s.mag_filter) << 2) : 0u) | (static_cast<uint32_t>(s.reduction) << 4) | (s.unnormalized ? 0x100u : 0u);
+}
+constexpr bool decode_filter_word(uint32_t word, graphics::SamplerDesc* s) {
+  if ((word & ~0x137u) || ((word >> 4) & 3) > static_cast<uint32_t>(graphics::SamplerReduction::Maximum) || (!(word & 2u) && (word & 4u))) return false;
+  s->filter = static_cast<graphics::Filter>(word & 1u);
+  s->separate_mag = (word & 2u) != 0;
+  s->mag_filter = s->separate_mag ? static_cast<graphics::Filter>((word >> 2) & 1u) : s->filter;
+  s->reduction = static_cast<graphics::SamplerReduction>((word >> 4) & 3u);
+  s->unnormalized = (word & 0x100u) != 0;
+  return true;
+}
 // The tenth word of BindTexture (and of a lowered root binding): the sampler's comparison (graphics::CompareOp, Never .. Always, in bits 0-3: SamplerDesc::compare) and, in bit 8, that the
 // unit reads the stencil plane of a depth buffer (SamplerDesc::stencil). Left out: no comparison (Never), the depth or colour. False for a word that is neither.
 constexpr uint32_t texture_view_word(const graphics::SamplerDesc& s) { return static_cast<uint32_t>(s.compare) | (s.stencil ? 0x100u : 0u); }
@@ -187,7 +203,9 @@ enum AllocationFlags : uint32_t {
   kAllocStreamOutput = 1u << 10,   // a buffer a geometry shader's stream output is written to (SetStreamOutput; the adapter's kFeatureStreamOutput): read by locking it
   kAllocConstantBuffer = 1u << 11,   // a buffer of constants (Direct3D 12 root constant buffer views and descriptors); system memory only, never resident: read by the CPU when a draw needs it
   kAllocHeap = 1u << 13,             // Direct3D 12 resource heap: memory other allocations are placed in (AllocationDesc::heap / heap_offset); system memory only, never resident, no other flags but kAllocShared-free
-  kAllocReserved = 1u << 14,         // Direct3D 12 reserved (tiled) buffer or texture (VidMm::create, tile_shape, AllocationDesc::tile_narrow). A buffer: with the flags of a vertex, index, storage or stream output buffer; its size a multiple of kTileBytes; no memory of its own - Kernel::update_tile_mappings maps its 64 KiB tiles to places in heaps (an unmapped tile reads as zero and drops writes)
+  kAllocReserved = 1u << 14,         // Direct3D 12 reserved (tiled) buffer or texture (VidMm::create, tile_shape, AllocationDesc::tile_narrow). A buffer: with the flags of a vertex, index, storage or stream output buffer; its size a multiple of kTileBytes; no memory of its own - Kernel::update_tile_mappings maps its 64 KiB tiles to places in heaps (an unmapped tile reads as zero and drops writes).
+                                     // A texture: of a colour or block-compressed format, one sample, any kind (2D, array, cube, volume), any levels; sampled (kAllocTexture), and also drawn into (kAllocRenderTarget) or a storage image - not block-compressed
+                                     // - (its tiles numbered as reserved_tile_layout says)
   kAllocTrackState = 1u << 12,       // Direct3D 12 resource states: AllocationDesc::initial_state is the state; ResourceBarrier moves it and uses of the allocation check it (CommandStream.hpp). Any other flags as usual.
   kAllocQueryResult = 1u << 8,   // a buffer the results of occlusion queries are written to (CommandStream.hpp BeginQuery); system memory only, never resident, read by locking it
   // A texture shaders read and write texel by texel (Direct3D's unordered access views of textures: BindUavImage, the D3D12 descriptor DescriptorKind::UavTexture; the adapter's
@@ -197,18 +215,31 @@ enum AllocationFlags : uint32_t {
 
 constexpr uint32_t kTileTexels = 128;   // ... a reserved texture of 4-byte texels has tiles of kTileTexels x kTileTexels (so 64 KiB; the rows of a tile follow one another in the heap)
 constexpr uint32_t kTileBytes = 65536;   // the size of a tile of a reserved resource
-// The shape of a 64 KiB tile of a reserved 2D texture whose texels are `texel_bytes` in the heaps (Direct3D's standard tile shapes: 8 bits 256 x 256, 16 bits 256 x 128,
-// 32 bits 128 x 128, 64 bits 128 x 64, 128 bits 64 x 64); 0 x 0 for another size.
+constexpr uint32_t kTileStandardSwizzle = 1u << 8;   // AllocationDesc::tile_narrow: the standard swizzle inside the tiles (its low 8 bits the NarrowLayout)
+// The shape of a 64 KiB tile of a reserved texture, in its elements - texels, or the 4 x 4 blocks of a block-compressed format - of `element_bytes` each in the heaps: Direct3D's
+// standard tile shapes. A 2D texture, an array or a cube (depth 1): 8 bits 256 x 256, 16 bits 256 x 128, 32 bits 128 x 128, 64 bits 128 x 64 (BC1 / BC4 blocks: 512 x 256 texels),
+// 128 bits 64 x 64 (the other BC blocks: 256 x 256 texels). A volume (Texture3D): 8 bits 64 x 32 x 32, 16 bits 32 x 32 x 32, 32 bits 32 x 32 x 16, 64 bits 32 x 16 x 16 (BC1 / BC4:
+// 128 x 64 x 16 texels), 128 bits 16 x 16 x 16 (the other BC: 64 x 64 x 16 texels). 0 x 0 x 0 for another size.
 struct TileShape {
-  uint32_t width = 0, height = 0;
+  uint32_t width = 0, height = 0, depth = 0;
 };
-constexpr TileShape tile_shape(uint32_t texel_bytes) {
-  switch (texel_bytes) {
-    case 1: return {256, 256};
-    case 2: return {256, 128};
-    case 4: return {kTileTexels, kTileTexels};
-    case 8: return {128, 64};
-    case 16: return {64, 64};
+constexpr TileShape tile_shape(uint32_t element_bytes, bool volume = false) {
+  if (volume) {
+    switch (element_bytes) {
+      case 1: return {64, 32, 32};
+      case 2: return {32, 32, 32};
+      case 4: return {32, 32, 16};
+      case 8: return {32, 16, 16};
+      case 16: return {16, 16, 16};
+      default: return {};
+    }
+  }
+  switch (element_bytes) {
+    case 1: return {256, 256, 1};
+    case 2: return {256, 128, 1};
+    case 4: return {kTileTexels, kTileTexels, 1};
+    case 8: return {128, 64, 1};
+    case 16: return {64, 64, 1};
     default: return {};
   }
 }
@@ -231,7 +262,8 @@ struct AllocationDesc {
   uint32_t initial_state = 0;        // kAllocTrackState: the resource state it starts in (D3d12.hpp ResourceState)
   uint32_t layers = 1;               // Texture3D: the depth; Texture2DArray: the array size (1 .. graphics::kMaxTextureLayers); TextureCube: 6 (width equals height)
   uint32_t tile_narrow = 0;          // a reserved texture: the NarrowLayout (CommandStream.hpp) of its texels in the heaps' tiles - Direct3D's R8 / R8G8 (of an A8B8G8R8 / X8B8G8R8
-                                     //   image) or R16 / R16G16 (of A16B16G16R16 / A16B16G16R16Sint), which the image keeps widened; 0: the tiles hold the image's own pixels
+                                     //   image) or R16 / R16G16 (of A16B16G16R16 / A16B16G16R16Sint), which the image keeps widened; 0: the tiles hold the image's own pixels.
+                                     //   With kTileStandardSwizzle: the elements of a standard level's tile are in Direct3D's 64 KiB standard swizzle (D3D12_TEXTURE_LAYOUT_64KB_STANDARD_SWIZZLE), not row by row
 };
 
 struct AllocationInfo {
@@ -357,6 +389,11 @@ struct ShaderDesc {
 constexpr uint32_t kPipelineRasterTag = 0x31545352;     // 'RST1'
 constexpr uint32_t kPipelineRasterWords = 16;
 constexpr uint32_t kPipelineStepRateTag = 0x31505453;   // 'STP1'
+// ... and how the pipeline's lines are drawn (graphics::LineMode: 0 aliased, 1 alpha-antialiased, 2 quadrilateral 1.4 pixels wide, 3 quadrilateral 1.0 wide), one word.
+constexpr uint32_t kPipelineLineTag = 0x314E494C;        // 'LIN1'
+constexpr uint32_t kPipelineLineWords = 1;
+// The escape CreatePipeline's flags word: 1 depth test, 2 depth write, 4 alpha blend, 8 the fragment shader stands in for none (PipelineDesc::stand_in_fragment).
+constexpr uint32_t kPipelineFlagStandInFragment = 8;
 
 struct PipelineDesc {
   Handle vertex_shader = 0, fragment_shader = 0;
@@ -372,6 +409,7 @@ struct PipelineDesc {
   graphics::CullMode cull_mode = graphics::CullMode::Back;
   graphics::FrontFace front_face = graphics::FrontFace::CounterClockwise;
   bool depth_test = false, depth_write = false, alpha_blend = false;
+  bool stand_in_fragment = false;   // the fragment shader is the driver's stand-in for a pipeline without a pixel shader (kPipelineFlagStandInFragment): not counted as PsInvocations
   graphics::StencilState stencil;
   graphics::BlendState blend;                                  // needs the adapter's kFeatureBlendState (caps.features)
   graphics::CompareOp depth_compare = graphics::CompareOp::LessEqual;   // ... as does any comparison but LessEqual
@@ -399,6 +437,7 @@ struct PipelineDesc {
   // A logic operation for every target in place of blending (kFeature2LogicOps). The Src1 blend factors need kFeature2DualSourceBlend and one colour target.
   bool logic_op_enable = false;
   graphics::LogicOp logic_op = graphics::LogicOp::Noop;
+  graphics::LineMode line_mode = graphics::LineMode::Aliased;   // kFeature2LineModes for the others (the tagged part kPipelineLineTag)
 };
 
 // --- Presenting -----------------------------------------------------------------------

@@ -375,8 +375,8 @@ static const D3D12_BLEND_DESC g_default_blend12 = {FALSE, FALSE, {{FALSE, FALSE,
  *     (IndependentFrontAndBackStencilRefMaskSupported, OPTIONS14); on a device without it masks that differ with the stencil test on are E_INVALIDARG, as Direct3D 12
  *     refuses them on such a device.
  *   - RASTERIZER1 / RASTERIZER2: the depth bias as a float, which the kernel pipeline's bias is (D3D12_RASTERIZER_DESC::DepthBias has it rounded); the clamp and the
- *     slope go as they are. RASTERIZER2's line mode is the pair of MultisampleEnable / AntialiasedLineEnable it replaces (aliased, alpha-antialiased, wide quadrilateral);
- *     narrow quadrilateral lines are E_INVALIDARG (NarrowQuadrilateralLinesSupported is FALSE, OPTIONS19).
+ *     slope go as they are. RASTERIZER2's line mode goes as it is (the kernel's line modes: aliased, alpha-antialiased, quadrilateral 1.4 and 1.0 pixels wide); narrow
+ *     quadrilateral lines on a device without the line modes are E_INVALIDARG (NarrowQuadrilateralLinesSupported FALSE there, OPTIONS19).
  *   - one subobject of each kind: DEPTH_STENCIL, DEPTH_STENCIL1 and DEPTH_STENCIL2 are one kind, the three rasterizers another, ROOT_SIGNATURE and SERIALIZED_ROOT_SIGNATURE
  *     a third; a second of a kind is E_INVALIDARG.
  *   - PSDB and the subobject types after it: E_INVALIDARG (a type this runtime does not know). */
@@ -472,7 +472,8 @@ static HRESULT stream_parse(Dev *dev, const D3D12_PIPELINE_STATE_STREAM_DESC *st
       case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL1: {
         D3D12_DEPTH_STENCIL_DESC1 d1;
         memcpy(&d1, p, inner);
-        if (d1.DepthBoundsTestEnable) STREAM_FAIL(E_INVALIDARG);      /* (DepthBoundsTestSupported is FALSE) */
+        if (d1.DepthBoundsTestEnable && !(dev->caps.features2 & DEV_FEATURE2_DEPTH_BOUNDS)) STREAM_FAIL(E_INVALIDARG);      /* (DepthBoundsTestSupported is FALSE there) */
+        x->depth_bounds = d1.DepthBoundsTestEnable != FALSE;
         g.DepthStencilState.DepthEnable = d1.DepthEnable;
         g.DepthStencilState.DepthWriteMask = d1.DepthWriteMask;
         g.DepthStencilState.DepthFunc = d1.DepthFunc;
@@ -500,15 +501,28 @@ static HRESULT stream_parse(Dev *dev, const D3D12_PIPELINE_STATE_STREAM_DESC *st
       case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CACHED_PSO: memcpy(&g.CachedPSO, p, inner); c.CachedPSO = g.CachedPSO; break;
       case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_FLAGS: memcpy(&g.Flags, p, 4); c.Flags = g.Flags; break;
       case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VIEW_INSTANCING: {
+        /* (at most D3D12_MAX_VIEW_INSTANCE_COUNT views - more than one needs the device's view instancing -, each with its location: a viewport below
+         * D3D12_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE and a render target array index below D3D12_REQ_TEXTURE2D_ARRAY_AXIS_DIMENSION; the flags NONE or
+         * ENABLE_VIEW_INSTANCE_MASKING. A count of 0 is none; one view counts where its location or the mask does: pso.inc views_on.) */
         D3D12_VIEW_INSTANCING_DESC v;
         memcpy(&v, p, inner);
-        if (v.ViewInstanceCount > 1) STREAM_FAIL(E_INVALIDARG);      /* (D3D12_VIEW_INSTANCING_TIER_NOT_SUPPORTED) */
+        if (v.ViewInstanceCount > D3D12_MAX_VIEW_INSTANCE_COUNT || (v.Flags & ~D3D12_VIEW_INSTANCING_FLAG_ENABLE_VIEW_INSTANCE_MASKING)) STREAM_FAIL(E_INVALIDARG);
+        if (v.ViewInstanceCount && !v.pViewInstanceLocations) STREAM_FAIL(E_INVALIDARG);
+        if (v.ViewInstanceCount > 1 && !(dev->caps.features2 & DEV_FEATURE2_VIEW_INSTANCING)) STREAM_FAIL(E_INVALIDARG);      /* (D3D12_VIEW_INSTANCING_TIER_NOT_SUPPORTED there) */
+        for (UINT k = 0; k < v.ViewInstanceCount; ++k)
+          if (v.pViewInstanceLocations[k].ViewportArrayIndex >= D3D12_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE ||
+              v.pViewInstanceLocations[k].RenderTargetArrayIndex >= D3D12_REQ_TEXTURE2D_ARRAY_AXIS_DIMENSION)
+            STREAM_FAIL(E_INVALIDARG);
+        x->view_count = v.ViewInstanceCount;
+        x->view_flags = (UINT)v.Flags;
+        for (UINT k = 0; k < v.ViewInstanceCount; ++k) x->views[k] = v.pViewInstanceLocations[k];
         break;
       }
       case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL2: {
         D3D12_DEPTH_STENCIL_DESC2 d2;
         memcpy(&d2, p, inner);
-        if (d2.DepthBoundsTestEnable) STREAM_FAIL(E_INVALIDARG);      /* (DepthBoundsTestSupported is FALSE) */
+        if (d2.DepthBoundsTestEnable && !(dev->caps.features2 & DEV_FEATURE2_DEPTH_BOUNDS)) STREAM_FAIL(E_INVALIDARG);      /* (DepthBoundsTestSupported is FALSE there) */
+        x->depth_bounds = d2.DepthBoundsTestEnable != FALSE;
         if (d2.StencilEnable && (d2.FrontFace.StencilReadMask != d2.BackFace.StencilReadMask || d2.FrontFace.StencilWriteMask != d2.BackFace.StencilWriteMask) &&
             !(dev->caps.features2 & DEV_FEATURE2_RASTERIZER_STATE))
           STREAM_FAIL(E_INVALIDARG);      /* (IndependentFrontAndBackStencilRefMaskSupported is FALSE there) */
@@ -547,7 +561,8 @@ static HRESULT stream_parse(Dev *dev, const D3D12_PIPELINE_STATE_STREAM_DESC *st
         D3D12_RASTERIZER_DESC2 r2;
         memcpy(&r2, p, inner);
         if ((UINT)r2.LineRasterizationMode > D3D12_LINE_RASTERIZATION_MODE_QUADRILATERAL_NARROW) STREAM_FAIL(E_INVALIDARG);
-        if (r2.LineRasterizationMode == D3D12_LINE_RASTERIZATION_MODE_QUADRILATERAL_NARROW) STREAM_FAIL(E_INVALIDARG);      /* (NarrowQuadrilateralLinesSupported is FALSE) */
+        x->has_line_mode = 1;      /* (narrow quadrilateral lines: where the device has the line modes - pso_create_graphics) */
+        x->line_mode = (UINT)r2.LineRasterizationMode;
         D3D12_RASTERIZER_DESC *r = &g.RasterizerState;
         r->FillMode = r2.FillMode; r->CullMode = r2.CullMode; r->FrontCounterClockwise = r2.FrontCounterClockwise;
         r->DepthBias = depth_bias_int(r2.DepthBias); r->DepthBiasClamp = r2.DepthBiasClamp; r->SlopeScaledDepthBias = r2.SlopeScaledDepthBias;
@@ -630,26 +645,12 @@ static D3D12_RESOURCE_DESC1 *STDMETHODCALLTYPE res_GetDesc1(Resource *This, D3D1
 
 /* ---- ID3D12Device11 .. 14 ------------------------------------------------------------------------------------------------------------------------------------------------ */
 
-/* CreateSampler2: the sampler of D3D12_SAMPLER_DESC2 - D3D12_SAMPLER_DESC with an integer border colour (D3D12_SAMPLER_FLAG_UINT_BORDER_COLOR: the colour is taken
- * as transparent black, opaque black or opaque white by the same rule as a float one, a channel that is not 0 counting as 1) or coordinates in texels, which no
- * device here samples with (NonNormalizedCoordinateSamplersSupported is FALSE, OPTIONS17): such a call, and one with flags that do not exist, is left out, as an
- * invalid call is. */
+/* CreateSampler2: the sampler of D3D12_SAMPLER_DESC2 - D3D12_SAMPLER_DESC with an integer border colour (D3D12_SAMPLER_FLAG_UINT_BORDER_COLOR) or coordinates in texels
+ * (D3D12_SAMPLER_FLAG_NON_NORMALIZED_COORDINATES, where the device has them): heaps.inc sampler_descriptor. */
 static void STDMETHODCALLTYPE dev_CreateSampler2(Dev *This, const D3D12_SAMPLER_DESC2 *desc, D3D12_CPU_DESCRIPTOR_HANDLE handle) {
-  if (!desc) { dev_CreateSampler(This, NULL, handle); return; }
-  if ((desc->Flags & ~(UINT)D3D12_SAMPLER_FLAG_UINT_BORDER_COLOR)) return;
-  D3D12_SAMPLER_DESC d;
-  d.Filter = desc->Filter;
-  d.AddressU = desc->AddressU;
-  d.AddressV = desc->AddressV;
-  d.AddressW = desc->AddressW;
-  d.MipLODBias = desc->MipLODBias;
-  d.MaxAnisotropy = desc->MaxAnisotropy;
-  d.ComparisonFunc = desc->ComparisonFunc;
-  for (UINT c = 0; c < 4; ++c)
-    d.BorderColor[c] = (desc->Flags & D3D12_SAMPLER_FLAG_UINT_BORDER_COLOR) ? (desc->UintBorderColor[c] ? 1.0f : 0.0f) : desc->FloatBorderColor[c];
-  d.MinLOD = desc->MinLOD;
-  d.MaxLOD = desc->MaxLOD;
-  dev_CreateSampler(This, &d, handle);
+  SoftDesc d;
+  sampler_descriptor(This, desc, &d);
+  desc_write(handle, &d);
 }
 /* GetResourceAllocationInfo3: GetResourceAllocationInfo2 with castable formats - which need RelaxedFormatCastingSupported (FALSE): a description with any is one that
  * cannot be had (a size of ~0). */

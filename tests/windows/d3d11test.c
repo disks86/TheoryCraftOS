@@ -2723,12 +2723,12 @@ static void test_device5(void) {
         o.MapNoOverwriteOnDynamicConstantBuffer && o.OutputMergerLogicOp && !o.ExtendedDoublesShaderInstructions, "D3D11_FEATURE_D3D11_OPTIONS");
   D3D11_FEATURE_DATA_D3D11_OPTIONS2 o2;
   memset(&o2, 0xCC, sizeof o2);
-  check(SUCCEEDED(ID3D11Device5_CheckFeatureSupport(d5, D3D11_FEATURE_D3D11_OPTIONS2, &o2, sizeof o2)) && o2.TiledResourcesTier == D3D11_TILED_RESOURCES_TIER_1 &&
+  check(SUCCEEDED(ID3D11Device5_CheckFeatureSupport(d5, D3D11_FEATURE_D3D11_OPTIONS2, &o2, sizeof o2)) && (o2.TiledResourcesTier == D3D11_TILED_RESOURCES_TIER_1 || o2.TiledResourcesTier == D3D11_TILED_RESOURCES_TIER_3) &&
         o2.ConservativeRasterizationTier <= D3D11_CONSERVATIVE_RASTERIZATION_TIER_1 && o2.MapOnDefaultTextures && o2.StandardSwizzle, "D3D11_FEATURE_D3D11_OPTIONS2");
   D3D11_FEATURE_DATA_D3D11_OPTIONS1 o1;
   memset(&o1, 0xCC, sizeof o1);
-  check(SUCCEEDED(ID3D11Device5_CheckFeatureSupport(d5, D3D11_FEATURE_D3D11_OPTIONS1, &o1, sizeof o1)) && o1.TiledResourcesTier == D3D11_TILED_RESOURCES_TIER_1 &&
-        !o1.MinMaxFiltering && !o1.MapOnDefaultBuffers, "D3D11_FEATURE_D3D11_OPTIONS1: tiled resources tier 1");
+  check(SUCCEEDED(ID3D11Device5_CheckFeatureSupport(d5, D3D11_FEATURE_D3D11_OPTIONS1, &o1, sizeof o1)) && o1.TiledResourcesTier == o2.TiledResourcesTier &&
+        !o1.MapOnDefaultBuffers, "D3D11_FEATURE_D3D11_OPTIONS1: tiled resources tier 1 or 3 (test_tiled_tiers)");
   D3D11_FEATURE_DATA_FORMAT_SUPPORT2 tf = {DXGI_FORMAT_R8G8B8A8_UNORM, 0};
   check(SUCCEEDED(ID3D11Device5_CheckFeatureSupport(d5, D3D11_FEATURE_FORMAT_SUPPORT2, &tf, sizeof tf)) && (tf.OutFormatSupport2 & D3D11_FORMAT_SUPPORT2_TILED),
         "FORMAT_SUPPORT2: R8G8B8A8_UNORM may be tiled");
@@ -3590,7 +3590,7 @@ static void test_tiled_resources(ID3D11Device5 *d5, ID3D11DeviceContext4 *c4) {
     D3D11_PACKED_MIP_DESC packed;
     D3D11_TILE_SHAPE shape;
     ID3D11Device5_GetResourceTiling(d5, (ID3D11Resource *)tb, &total, &packed, &shape, &subs, 0, NULL);
-    check(total == 3 && subs == 0, "GetResourceTiling of the tiled buffer: three tiles");
+    check(total == 3 && subs == 1, "GetResourceTiling of the tiled buffer: three tiles, one subresource tiling");
     memset(back, 0xEE, 3 * TILE);
     check(read_buffer(tb, back, 3 * TILE) && back[0] == 0 && back[3 * TILE - 1] == 0, "a tiled buffer with nothing mapped reads as zeros");
     /* (tile 0 on pool tile 1; tiles 1 and 2 on pool tile 0) */
@@ -3647,9 +3647,9 @@ static void test_tiled_resources(ID3D11Device5 *d5, ID3D11DeviceContext4 *c4) {
   td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
   td.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
   check(ID3D11Device5_CreateTexture2D(d5, &td, NULL, &tbad) == E_INVALIDARG && !tbad, "CreateTexture2D refuses a tiled texture the CPU reads");
-  D3D11_TEXTURE3D_DESC vd = {32, 32, 32, 1, DXGI_FORMAT_R8G8B8A8_UNORM, D3D11_USAGE_DEFAULT, D3D11_BIND_SHADER_RESOURCE, 0, D3D11_RESOURCE_MISC_TILED};
-  ID3D11Texture3D *vbad = NULL;
-  check(ID3D11Device5_CreateTexture3D(d5, &vd, NULL, &vbad) == E_INVALIDARG && !vbad, "CreateTexture3D refuses a tiled volume (tier 3)");
+  D3D11_TEXTURE1D_DESC od = {256, 1, 1, DXGI_FORMAT_R8G8B8A8_UNORM, D3D11_USAGE_DEFAULT, D3D11_BIND_SHADER_RESOURCE, 0, D3D11_RESOURCE_MISC_TILED};
+  ID3D11Texture1D *obad = NULL;
+  check(ID3D11Device5_CreateTexture1D(d5, &od, NULL, &obad) == E_INVALIDARG && !obad, "CreateTexture1D refuses a tiled texture (never tiled)");
   UINT32 *texels = malloc(256 * 256 * 4), *seen = malloc(256 * 256 * 4);
   if (tt && texels && seen) {
     UINT total = 0, subs = 1;
@@ -3745,6 +3745,156 @@ static void test_tiled_resources(ID3D11Device5 *d5, ID3D11DeviceContext4 *c4) {
   free(seen);
   free(bytes);
   free(back);
+  ID3D11Buffer_Release(pool);
+}
+
+/* Tiled resources tiers 2 and 3 (Direct3D 11.3): the tier per device (3 on the CPU renderer, 1 on virgl, whose shaders have no residency feedback), tiled volumes (tier 3), arrays
+ * (none with packed levels: Direct3D 11 has no tier 4), residency feedback and a lookup's clamp in shaders (tier 2), ResizeTilePool down to nothing and back. */
+static void test_tiled_tiers(ID3D11Device5 *d5, ID3D11DeviceContext4 *c4) {
+  const UINT TILE = 65536;
+  int software = 0;
+  IDXGIDevice *dxgi = NULL;
+  if (SUCCEEDED(ID3D11Device5_QueryInterface(d5, &IID_IDXGIDevice, (void **)&dxgi)) && dxgi) {
+    IDXGIAdapter *adapter = NULL;
+    IDXGIAdapter1 *a1 = NULL;
+    if (SUCCEEDED(IDXGIDevice_GetAdapter(dxgi, &adapter)) && adapter) {
+      DXGI_ADAPTER_DESC1 ad;
+      memset(&ad, 0, sizeof ad);
+      if (SUCCEEDED(IDXGIAdapter_QueryInterface(adapter, &IID_IDXGIAdapter1, (void **)&a1)) && a1) {
+        IDXGIAdapter1_GetDesc1(a1, &ad);
+        IDXGIAdapter1_Release(a1);
+      }
+      software = (ad.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) != 0;
+      IDXGIAdapter_Release(adapter);
+    }
+    IDXGIDevice_Release(dxgi);
+  }
+  const D3D11_TILED_RESOURCES_TIER want = software ? D3D11_TILED_RESOURCES_TIER_3 : D3D11_TILED_RESOURCES_TIER_1;
+  D3D11_FEATURE_DATA_D3D11_OPTIONS1 o1;
+  D3D11_FEATURE_DATA_D3D11_OPTIONS2 o2;
+  memset(&o1, 0xCC, sizeof o1);
+  memset(&o2, 0xCC, sizeof o2);
+  check(SUCCEEDED(ID3D11Device5_CheckFeatureSupport(d5, D3D11_FEATURE_D3D11_OPTIONS1, &o1, sizeof o1)) && o1.TiledResourcesTier == want &&
+            SUCCEEDED(ID3D11Device5_CheckFeatureSupport(d5, D3D11_FEATURE_D3D11_OPTIONS2, &o2, sizeof o2)) && o2.TiledResourcesTier == want,
+        software ? "tiled resources tier 3 on the CPU renderer" : "tiled resources tier 1 on a GPU without residency feedback");
+  D3D11_BUFFER_DESC pd = {8 * TILE, D3D11_USAGE_DEFAULT, 0, 0, D3D11_RESOURCE_MISC_TILE_POOL, 0};
+  ID3D11Buffer *pool = NULL;
+  check(SUCCEEDED(ID3D11Device5_CreateBuffer(d5, &pd, NULL, &pool)) && pool, "CreateBuffer: a tile pool of eight tiles");
+  if (!pool) return;
+  check(SUCCEEDED(ID3D11DeviceContext4_ResizeTilePool(c4, pool, 0)), "ResizeTilePool to no tiles at all");
+  D3D11_BUFFER_DESC bd;
+  ID3D11Buffer_GetDesc(pool, &bd);
+  check(bd.ByteWidth == 0, "the pool's description says it has no tiles");
+  check(SUCCEEDED(ID3D11DeviceContext4_ResizeTilePool(c4, pool, 8 * TILE)), "ResizeTilePool back to eight tiles");
+  /* arrays: one whose levels are all at least a tile (any tier), one with packed levels (no tier of Direct3D 11) */
+  D3D11_TEXTURE2D_DESC ad = {256, 256, 2, 2, DXGI_FORMAT_B8G8R8A8_UNORM, {1, 0}, D3D11_USAGE_DEFAULT, D3D11_BIND_SHADER_RESOURCE, 0, D3D11_RESOURCE_MISC_TILED};
+  ID3D11Texture2D *array = NULL, *bad = NULL;
+  check(SUCCEEDED(ID3D11Device5_CreateTexture2D(d5, &ad, NULL, &array)) && array, "CreateTexture2D: a tiled array of two slices, levels of whole tiles");
+  if (array) {
+    UINT total = 0, subs = 4;
+    D3D11_PACKED_MIP_DESC packed;
+    D3D11_TILE_SHAPE shape;
+    D3D11_SUBRESOURCE_TILING st[4];
+    ID3D11Device5_GetResourceTiling(d5, (ID3D11Resource *)array, &total, &packed, &shape, &subs, 0, st);
+    check(total == 10 && subs == 4 && st[2].StartTileIndexInOverallResource == 5 && st[3].StartTileIndexInOverallResource == 9 && packed.NumPackedMips == 0,
+          "GetResourceTiling of the array: five tiles a slice");
+    ID3D11Texture2D_Release(array);
+  }
+  ad.Width = ad.Height = 128, ad.ArraySize = 3, ad.MipLevels = 8;
+  check(ID3D11Device5_CreateTexture2D(d5, &ad, NULL, &bad) == E_INVALIDARG && !bad, "CreateTexture2D refuses a tiled array with packed levels");
+  ID3D11SamplerState *sampler = point_sampler();
+  ID3D11VertexShader *vs = NULL;
+  ID3D11PixelShader *ps = NULL, *ps3 = NULL, *psc = NULL;
+  ID3D11Device_CreateVertexShader(g_device, dx_vs_vol_dxbc, sizeof dx_vs_vol_dxbc, NULL, &vs);
+  const HRESULT hr_ps = ID3D11Device_CreatePixelShader(g_device, dx_ps_tiled_dxbc, sizeof dx_ps_tiled_dxbc, NULL, &ps);
+  ID3D11Device_CreatePixelShader(g_device, dx_ps_tiled_3d_dxbc, sizeof dx_ps_tiled_3d_dxbc, NULL, &ps3);
+  ID3D11Device_CreatePixelShader(g_device, dx_ps_tiled_clamp_dxbc, sizeof dx_ps_tiled_clamp_dxbc, NULL, &psc);
+  if (want >= D3D11_TILED_RESOURCES_TIER_2) check(SUCCEEDED(hr_ps) && ps && ps3 && psc, "pixel shaders of residency feedback and clamps (tier 2)");
+  else check(FAILED(hr_ps) && !ps, "tier 1: a pixel shader of residency feedback is refused");
+  /* a 2D texture of 256 x 256: tiles 0 and 3 on the pool, red; tiles 1 and 2 nowhere */
+  D3D11_TEXTURE2D_DESC td = {256, 256, 1, 1, DXGI_FORMAT_B8G8R8A8_UNORM, {1, 0}, D3D11_USAGE_DEFAULT, D3D11_BIND_SHADER_RESOURCE, 0, D3D11_RESOURCE_MISC_TILED};
+  ID3D11Texture2D *t = NULL;
+  UINT32 *texels = malloc(256 * 256 * 4), *seen = malloc(256 * 256 * 4);
+  check(SUCCEEDED(ID3D11Device5_CreateTexture2D(d5, &td, NULL, &t)) && t, "CreateTexture2D: a tiled texture of four tiles");
+  if (t && texels && seen) {
+    const D3D11_TILED_RESOURCE_COORDINATE starts[2] = {{0, 0, 0, 0}, {1, 1, 0, 0}};
+    const D3D11_TILE_REGION_SIZE sizes[2] = {{1, FALSE, 0, 0, 0}, {1, FALSE, 0, 0, 0}};
+    const UINT pool_starts[2] = {0, 1}, counts[2] = {1, 1};
+    check(SUCCEEDED(ID3D11DeviceContext4_UpdateTileMappings(c4, (ID3D11Resource *)t, 2, starts, sizes, pool, 2, NULL, pool_starts, counts, 0)), "UpdateTileMappings: tiles 0 and 3");
+    for (UINT i = 0; i < 256 * 256; ++i) texels[i] = 0xFFFF0000u;
+    ID3D11DeviceContext_UpdateSubresource(g_context, (ID3D11Resource *)t, 0, NULL, texels, 256 * 4, 0);
+    check(read_texture(t, 256, 256, seen) && seen[10 * 256 + 10] == 0xFFFF0000u && seen[200 * 256 + 200] == 0xFFFF0000u && seen[10 * 256 + 200] == 0 && seen[200 * 256 + 10] == 0,
+          "the unmapped tiles of a tiled texture drop what is written and read as zero");
+    ID3D11ShaderResourceView *view = NULL;
+    ID3D11Device_CreateShaderResourceView(g_device, (ID3D11Resource *)t, NULL, &view);
+    if (ps && view && vs && sampler) {
+      const UINT32 mapped = draw_lookup(vs, ps, view, sampler, 0.25f, 0.25f, 0), unmapped = draw_lookup(vs, ps, view, sampler, 0.75f, 0.25f, 0);
+      printf("d3d11 residency feedback: mapped %08x, unmapped %08x\n", mapped, unmapped);
+      check(mapped == 0xFFFFFFFFu && unmapped == 0, "residency feedback: CheckAccessFullyMapped of Sample, Load and GatherRed");
+    }
+    if (view) ID3D11ShaderResourceView_Release(view);
+  }
+  if (t) ID3D11Texture2D_Release(t);
+  /* a volume of 64 x 32 x 16 (tier 3): two tiles of 32 x 32 x 16, mapped whole by a region of no start and no size, then tile 1 unmapped by a box */
+  D3D11_TEXTURE3D_DESC vd = {64, 32, 16, 1, DXGI_FORMAT_B8G8R8A8_UNORM, D3D11_USAGE_DEFAULT, D3D11_BIND_SHADER_RESOURCE, 0, D3D11_RESOURCE_MISC_TILED};
+  ID3D11Texture3D *v = NULL;
+  const HRESULT hr_v = ID3D11Device5_CreateTexture3D(d5, &vd, NULL, &v);
+  if (want < D3D11_TILED_RESOURCES_TIER_3) {
+    check(hr_v == E_INVALIDARG && !v, "CreateTexture3D refuses a tiled volume below tier 3");
+  } else {
+    check(SUCCEEDED(hr_v) && v, "CreateTexture3D: a tiled volume (tier 3)");
+  }
+  if (v && texels) {
+    UINT total = 0, subs = 1;
+    D3D11_PACKED_MIP_DESC packed;
+    D3D11_TILE_SHAPE shape;
+    D3D11_SUBRESOURCE_TILING st;
+    ID3D11Device5_GetResourceTiling(d5, (ID3D11Resource *)v, &total, &packed, &shape, &subs, 0, &st);
+    check(total == 2 && shape.WidthInTexels == 32 && shape.HeightInTexels == 32 && shape.DepthInTexels == 16 && st.WidthInTiles == 2 && st.DepthInTiles == 1,
+          "GetResourceTiling of the volume: two tiles of 32 x 32 x 16");
+    const UINT pool_start = 2;
+    check(SUCCEEDED(ID3D11DeviceContext4_UpdateTileMappings(c4, (ID3D11Resource *)v, 1, NULL, NULL, pool, 1, NULL, &pool_start, NULL, 0)),
+          "UpdateTileMappings of the whole volume (no region given)");
+    for (UINT z = 0; z < 16; ++z)
+      for (UINT i = 0; i < 64 * 32; ++i) texels[z * 64 * 32 + i] = 0xFF000000u | (z * 16) << 16 | 0x4080u;
+    ID3D11DeviceContext_UpdateSubresource(g_context, (ID3D11Resource *)v, 0, NULL, texels, 64 * 4, 64 * 32 * 4);
+    const D3D11_TILED_RESOURCE_COORDINATE second = {1, 0, 0, 0};
+    const D3D11_TILE_REGION_SIZE box = {1, TRUE, 1, 1, 1};
+    const UINT null_flag = D3D11_TILE_RANGE_NULL;
+    check(SUCCEEDED(ID3D11DeviceContext4_UpdateTileMappings(c4, (ID3D11Resource *)v, 1, &second, &box, NULL, 1, &null_flag, NULL, NULL, 0)), "UpdateTileMappings: the volume's tile 1 unmapped");
+    ID3D11ShaderResourceView *view = NULL;
+    ID3D11Device_CreateShaderResourceView(g_device, (ID3D11Resource *)v, NULL, &view);
+    if (ps3 && view && vs && sampler) {
+      const UINT32 a = draw_lookup(vs, ps3, view, sampler, 0.1f, 0.5f, 5.5f / 16), b = draw_lookup(vs, ps3, view, sampler, 0.9f, 0.5f, 5.5f / 16);
+      printf("d3d11 tiled volume: %08x mapped, %08x not\n", a, b);
+      check(a == (0xFF000000u | 80u << 16 | 0x4080u) && b == 0, "a tiled volume read by a shader: slice 5 of the mapped tile, zero and unmapped in the other");
+    }
+    if (view) ID3D11ShaderResourceView_Release(view);
+    ID3D11Texture3D_Release(v);
+  }
+  /* a lookup's clamp of the level of detail: four levels of 8 x 8 each one colour, the clamp of 2 gives level 2 */
+  if (psc && vs && sampler) {
+    static UINT32 levels[4][64];
+    D3D11_SUBRESOURCE_DATA initial[4];
+    for (UINT l = 0; l < 4; ++l) {
+      for (UINT i = 0; i < 64; ++i) levels[l][i] = 0xFF000000u | (0x30u + l * 0x40u) << 16 | 0x2010u;
+      initial[l].pSysMem = levels[l], initial[l].SysMemPitch = (8 >> l) * 4, initial[l].SysMemSlicePitch = 0;
+    }
+    D3D11_TEXTURE2D_DESC md = {8, 8, 4, 1, DXGI_FORMAT_B8G8R8A8_UNORM, {1, 0}, D3D11_USAGE_DEFAULT, D3D11_BIND_SHADER_RESOURCE, 0, 0};
+    ID3D11Texture2D *m = NULL;
+    ID3D11ShaderResourceView *view = NULL;
+    if (SUCCEEDED(ID3D11Device5_CreateTexture2D(d5, &md, initial, &m)) && m) ID3D11Device_CreateShaderResourceView(g_device, (ID3D11Resource *)m, NULL, &view);
+    check(view && draw_lookup(vs, psc, view, sampler, 0.5f, 0.5f, 0) == levels[2][0], "Sample with a clamp of 2: level 2");
+    if (view) ID3D11ShaderResourceView_Release(view);
+    if (m) ID3D11Texture2D_Release(m);
+  }
+  free(texels);
+  free(seen);
+  if (psc) ID3D11PixelShader_Release(psc);
+  if (ps3) ID3D11PixelShader_Release(ps3);
+  if (ps) ID3D11PixelShader_Release(ps);
+  if (vs) ID3D11VertexShader_Release(vs);
+  if (sampler) ID3D11SamplerState_Release(sampler);
   ID3D11Buffer_Release(pool);
 }
 
@@ -4017,6 +4167,7 @@ static void test_d3d11_3(void) {
   ID3D11DeviceContext_QueryInterface(g_context, &IID_ID3D11DeviceContext4, (void **)&c4);
   if (d5 && c4) {
     test_tiled_resources(d5, c4);
+    test_tiled_tiers(d5, c4);
     test_default_texture_access(d5);
     test_conservative(d5);
   }
@@ -4604,6 +4755,77 @@ static UINT32 sample_quad(ID3D11ShaderResourceView *view, const D3D11_SAMPLER_DE
 }
 static int grey_near(UINT32 p, int value) { return red(p) >= value - 2 && red(p) <= value + 2 && green(p) == red(p) && blue(p) == red(p); }
 
+/* Draws a quad over the target with vs_vol (the texture coordinate is the vertex colour) from (u0, v0, w) at the top left to (u1, v1, w) at the bottom right, sampling `view` with
+ * `sd` through `ps_code`; the pixel in the middle. */
+static UINT32 sample_quad_vol(ID3D11ShaderResourceView *view, const D3D11_SAMPLER_DESC *sd, const BYTE *ps_code, SIZE_T ps_size, float u0, float v0, float u1, float v1, float w) {
+  const VertexF v[6] = {{-1, 1, 0.5f, u0, v0, w, 1}, {1, 1, 0.5f, u1, v0, w, 1}, {-1, -1, 0.5f, u0, v1, w, 1}, {-1, -1, 0.5f, u0, v1, w, 1}, {1, 1, 0.5f, u1, v0, w, 1}, {1, -1, 0.5f, u1, v1, w, 1}};
+  ID3D11Buffer *vb = make_buffer(D3D11_BIND_VERTEX_BUFFER, D3D11_USAGE_DEFAULT, 0, v, sizeof v);
+  ID3D11VertexShader *vs = NULL;
+  ID3D11PixelShader *ps = NULL;
+  ID3D11Device_CreateVertexShader(g_device, dx_vs_vol_dxbc, sizeof dx_vs_vol_dxbc, NULL, &vs);
+  ID3D11Device_CreatePixelShader(g_device, ps_code, ps_size, NULL, &ps);
+  ID3D11SamplerState *sampler = NULL;
+  ID3D11Device_CreateSamplerState(g_device, sd, &sampler);
+  UINT32 result = 0;
+  if (vb && vs && ps && sampler && view) {
+    begin(NULL);
+    clear(0, 0, 0);
+    ID3D11DeviceContext_VSSetShader(g_context, vs, NULL, 0);
+    ID3D11DeviceContext_PSSetShader(g_context, ps, NULL, 0);
+    ID3D11DeviceContext_PSSetShaderResources(g_context, 0, 1, &view);
+    ID3D11DeviceContext_PSSetSamplers(g_context, 0, 1, &sampler);
+    bind_floats(vb);
+    ID3D11DeviceContext_Draw(g_context, 6, 0);
+    read_target();
+    result = pixel(32, 32);
+    ID3D11ShaderResourceView *none = NULL;
+    ID3D11DeviceContext_PSSetShaderResources(g_context, 0, 1, &none);
+  }
+  if (sampler) ID3D11SamplerState_Release(sampler);
+  if (ps) ID3D11PixelShader_Release(ps);
+  if (vs) ID3D11VertexShader_Release(vs);
+  if (vb) ID3D11Buffer_Release(vb);
+  return result;
+}
+/* The trilinear (sd as it is), anisotropy 2 and anisotropy 4 lookups of a volume (256 x 64 x 4, its three levels each one grey of `shades`) and of a cube (faces 256 x 256, the same
+ * levels), each with four texels a pixel across and one down: the volume's slice in the middle, the cube's +Z face from (-1, -0.25) to (1, 0.25). */
+static void sample_aniso_kinds(D3D11_SAMPLER_DESC *sd, const BYTE *shades, UINT32 volume[3], UINT32 cube[3]) {
+  volume[0] = volume[1] = volume[2] = cube[0] = cube[1] = cube[2] = 0;
+  const D3D11_FILTER filter = sd->Filter;
+  D3D11_SUBRESOURCE_DATA initial[3 * 6];
+  /* (every subresource of a level points at one run of texels of its grey: the levels are at most 256 x 256) */
+  static UINT32 runs[3][256 * 256];
+  for (UINT l = 0; l < 3; ++l)
+    for (UINT i = 0; i < 256 * 256; ++i) runs[l][i] = 0xFF000000u | shades[l] * 0x010101u;
+  D3D11_TEXTURE3D_DESC vd = {256, 64, 4, 3, DXGI_FORMAT_B8G8R8A8_UNORM, D3D11_USAGE_DEFAULT, D3D11_BIND_SHADER_RESOURCE, 0, 0};
+  for (UINT l = 0; l < 3; ++l) initial[l].pSysMem = runs[l], initial[l].SysMemPitch = (256 >> l) * 4, initial[l].SysMemSlicePitch = (256 >> l) * (64 >> l) * 4;
+  ID3D11Texture3D *v3 = NULL;
+  ID3D11ShaderResourceView *view = NULL;
+  if (SUCCEEDED(ID3D11Device_CreateTexture3D(g_device, &vd, initial, &v3))) ID3D11Device_CreateShaderResourceView(g_device, (ID3D11Resource *)v3, NULL, &view);
+  for (UINT k = 0; k < 3 && view; ++k) {
+    sd->Filter = k == 0 ? filter : D3D11_FILTER_ANISOTROPIC;
+    sd->MaxAnisotropy = k == 0 ? 1 : 2 * k;
+    volume[k] = sample_quad_vol(view, sd, dx_ps_tex3d_dxbc, sizeof dx_ps_tex3d_dxbc, 0, 0, 1, 1, 0.5f);
+  }
+  if (view) ID3D11ShaderResourceView_Release(view);
+  if (v3) ID3D11Texture3D_Release(v3);
+  view = NULL;
+  D3D11_TEXTURE2D_DESC cd = {256, 256, 3, 6, DXGI_FORMAT_B8G8R8A8_UNORM, {1, 0}, D3D11_USAGE_DEFAULT, D3D11_BIND_SHADER_RESOURCE, 0, D3D11_RESOURCE_MISC_TEXTURECUBE};
+  for (UINT f = 0; f < 6; ++f)
+    for (UINT l = 0; l < 3; ++l) initial[f * 3 + l].pSysMem = runs[l], initial[f * 3 + l].SysMemPitch = (256 >> l) * 4, initial[f * 3 + l].SysMemSlicePitch = 0;
+  ID3D11Texture2D *c2 = NULL;
+  if (SUCCEEDED(ID3D11Device_CreateTexture2D(g_device, &cd, initial, &c2))) ID3D11Device_CreateShaderResourceView(g_device, (ID3D11Resource *)c2, NULL, &view);
+  for (UINT k = 0; k < 3 && view; ++k) {
+    sd->Filter = k == 0 ? filter : D3D11_FILTER_ANISOTROPIC;
+    sd->MaxAnisotropy = k == 0 ? 1 : 2 * k;
+    cube[k] = sample_quad_vol(view, sd, dx_ps_texcube_dxbc, sizeof dx_ps_texcube_dxbc, -1, -0.25f, 1, 0.25f, 1);
+  }
+  if (view) ID3D11ShaderResourceView_Release(view);
+  if (c2) ID3D11Texture2D_Release(c2);
+  sd->Filter = filter;
+  sd->MaxAnisotropy = 1;
+}
+
 /* Several viewports (RSSetViewports of two, RSGetViewports): a geometry shader sends triangle n to viewport n; and what OPTIONS3 says of the layer and viewport from a vertex shader. */
 static void test_viewports(int layer_any_stage) {
   ID3D11GeometryShader *gs = NULL;
@@ -4640,6 +4862,7 @@ static void test_viewports(int layer_any_stage) {
   if (gs) ID3D11GeometryShader_Release(gs);
 }
 
+static void test_fixed_state_gaps(int software);
 static void test_sampler_state(void) {
   IDXGIDevice *dxgi = NULL;
   IDXGIAdapter *adapter = NULL;
@@ -4658,6 +4881,7 @@ static void test_sampler_state(void) {
   const int software = (ad.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) != 0;
   /* (the CPU renderer and the Venus device - the host's Vulkan - take the layer and viewport from a vertex shader; virgl does not) */
   test_viewports(software || wcsstr(ad.Description, L"Venus") != NULL);
+  test_fixed_state_gaps(software);
   D3D11_SAMPLER_DESC sd;
   memset(&sd, 0, sizeof sd);
   sd.Filter = D3D11_FILTER_MIN_MAG_MIP_POINT;
@@ -4710,6 +4934,364 @@ static void test_sampler_state(void) {
     /* (the CPU renderer filters as EXT_texture_filter_anisotropic's reference; how a GPU does is its own - virglrenderer 1.3.0 leaves the anisotropy of its sampler objects out) */
     if (software) check(grey_near(two, 128) && grey_near(four, 255), "D3D11_FILTER_ANISOTROPIC: MaxAnisotropy lookups along the longer axis, at the level of the shorter");
     else check(red(two) >= red(trilinear) && red(four) >= red(two), "D3D11_FILTER_ANISOTROPIC: no blurrier than trilinear filtering");
+    if (view) ID3D11ShaderResourceView_Release(view);
+    if (tex) ID3D11Texture2D_Release(tex);
+  }
+  /* The same footprint on a volume (256 x 64 x 4, a slice in the middle) and on the +Z face of a cube (256 x 256, a quarter of its height over the target): the levels 255, 128, 0 */
+  {
+    const BYTE shades[3] = {255, 128, 0};
+    sd.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
+    sd.MaxAnisotropy = 1;
+    UINT32 volume[3], cube[3];
+    sample_aniso_kinds(&sd, shades, volume, cube);
+    printf("d3d11test: volume trilinear %08x, anisotropy 2 %08x, 4 %08x; cube %08x %08x %08x\n", (unsigned)volume[0], (unsigned)volume[1], (unsigned)volume[2], (unsigned)cube[0],
+           (unsigned)cube[1], (unsigned)cube[2]);
+    check(grey_near(volume[0], 0) && grey_near(cube[0], 0), "a volume and a cube four times narrower than high: trilinear filtering reads the level of the longer axis");
+    if (software)
+      check(grey_near(volume[1], 128) && grey_near(volume[2], 255) && grey_near(cube[1], 128) && grey_near(cube[2], 255),
+            "D3D11_FILTER_ANISOTROPIC of a volume and a cube: MaxAnisotropy lookups along the longer axis, at the level of the shorter");
+    else
+      check(red(volume[2]) >= red(volume[0]) && red(cube[2]) >= red(cube[0]), "D3D11_FILTER_ANISOTROPIC of a volume and a cube: no blurrier than trilinear filtering");
+  }
+}
+
+/* ---- depth views of levels and layers, copies of depth textures, SetResourceMinLOD ------------------------------------------------------------------------------------------ */
+
+static float depth11(UINT level, UINT layer) { return (float)(1 + 4 * level + layer) / 16.0f; }
+static UINT32 unorm24_11(float v) { return (UINT32)((double)v * 16777215.0 + 0.5); }
+/* A D24S8 depth texture (R24G8_TYPELESS, read by shaders too) of 16 x 16, two slices and two levels, each subresource cleared through a depth view of it to depth11(level, slice) and
+ * the stencil 10 * level + slice + 1. */
+static ID3D11Texture2D *cleared_depth11(DXGI_FORMAT format, DXGI_FORMAT dsv_format) {
+  D3D11_TEXTURE2D_DESC desc = {16, 16, 2, 2, format, {1, 0}, D3D11_USAGE_DEFAULT, D3D11_BIND_DEPTH_STENCIL | D3D11_BIND_SHADER_RESOURCE, 0, 0};
+  ID3D11Texture2D *t = NULL;
+  if (FAILED(ID3D11Device_CreateTexture2D(g_device, &desc, NULL, &t)) || !t) return NULL;
+  for (UINT m = 0; m < 2; ++m)
+    for (UINT l = 0; l < 2; ++l) {
+      D3D11_DEPTH_STENCIL_VIEW_DESC dv;
+      memset(&dv, 0, sizeof dv);
+      dv.Format = dsv_format;
+      dv.ViewDimension = D3D11_DSV_DIMENSION_TEXTURE2DARRAY;
+      dv.Texture2DArray.MipSlice = m, dv.Texture2DArray.FirstArraySlice = l, dv.Texture2DArray.ArraySize = 1;
+      ID3D11DepthStencilView *view = NULL;
+      if (SUCCEEDED(ID3D11Device_CreateDepthStencilView(g_device, (ID3D11Resource *)t, &dv, &view)) && view) {
+        ID3D11DeviceContext_ClearDepthStencilView(g_context, view, D3D11_CLEAR_DEPTH | D3D11_CLEAR_STENCIL, depth11(m, l), (UINT8)(10 * m + l + 1));
+        ID3D11DepthStencilView_Release(view);
+      }
+    }
+  return t;
+}
+/* A staging texture of 16 x 16, two slices and two levels. */
+static ID3D11Texture2D *staging11(DXGI_FORMAT format, UINT access) {
+  D3D11_TEXTURE2D_DESC desc = {16, 16, 2, 2, format, {1, 0}, D3D11_USAGE_STAGING, 0, access, 0};
+  ID3D11Texture2D *t = NULL;
+  return SUCCEEDED(ID3D11Device_CreateTexture2D(g_device, &desc, NULL, &t)) ? t : NULL;
+}
+
+/* Depth views of any level and slice: a slice of level 1 (an array view of one slice), sampled; copies of depth textures - into a staging texture of the typed format and of the
+ * typeless one (CopyResource; mapped: the 24-bit depth with the stencil above it), from a staging texture into a depth texture, a subresource into a subresource
+ * (CopySubresourceRegion: both planes), a part of one (not copied); and SetResourceMinLOD (the most detailed level of the texture, whatever level a view starts at). */
+static void test_depth_textures_11(void) {
+  ID3D11Texture2D *depth = cleared_depth11(DXGI_FORMAT_R24G8_TYPELESS, DXGI_FORMAT_D24_UNORM_S8_UINT);
+  check(depth != NULL, "a D24S8 depth texture of two slices and two levels that shaders read");
+  if (!depth) return;
+  /* the view of slice 1 of level 1, sampled by a shader that declares an array */
+  ID3D11VertexShader *vs = NULL;
+  ID3D11PixelShader *ps = NULL;
+  ID3D11SamplerState *sampler = point_sampler();
+  ID3D11Device_CreateVertexShader(g_device, dx_vs_vol_dxbc, sizeof dx_vs_vol_dxbc, NULL, &vs);
+  ID3D11Device_CreatePixelShader(g_device, dx_ps_texarray_dxbc, sizeof dx_ps_texarray_dxbc, NULL, &ps);
+  D3D11_SHADER_RESOURCE_VIEW_DESC sv;
+  memset(&sv, 0, sizeof sv);
+  sv.Format = DXGI_FORMAT_R24_UNORM_X8_TYPELESS;
+  sv.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2DARRAY;
+  sv.Texture2DArray.MostDetailedMip = 1, sv.Texture2DArray.MipLevels = 1, sv.Texture2DArray.FirstArraySlice = 1, sv.Texture2DArray.ArraySize = 1;
+  ID3D11ShaderResourceView *view = NULL;
+  const HRESULT hr = ID3D11Device_CreateShaderResourceView(g_device, (ID3D11Resource *)depth, &sv, &view);
+  check(SUCCEEDED(hr) && view, "a shader resource view of a slice of a level of a depth texture");
+  if (view && vs && ps && sampler) {
+    const UINT32 got = draw_lookup(vs, ps, view, sampler, 0.5f, 0.5f, 0);
+    printf("d3d11test: depth view of level 1 slice 1 %08x (want red %u)\n", (unsigned)got, (unsigned)(depth11(1, 1) * 255.0f + 0.5f));
+    check(red(got) == (int)(depth11(1, 1) * 255.0f + 0.5f), "the depth of level 1 slice 1 through a view of it");
+  }
+  if (view) ID3D11ShaderResourceView_Release(view);
+  if (ps) ID3D11PixelShader_Release(ps);
+  if (vs) ID3D11VertexShader_Release(vs);
+  if (sampler) ID3D11SamplerState_Release(sampler);
+  /* copies into staging textures, the typed depth format and the typeless one, mapped */
+  ID3D11Texture2D *typed = staging11(DXGI_FORMAT_D24_UNORM_S8_UINT, D3D11_CPU_ACCESS_READ | D3D11_CPU_ACCESS_WRITE), *raw = staging11(DXGI_FORMAT_R24G8_TYPELESS, D3D11_CPU_ACCESS_READ);
+  check(typed && raw, "staging textures of D24_UNORM_S8_UINT and R24G8_TYPELESS");
+  if (typed && raw) {
+    ID3D11DeviceContext_CopyResource(g_context, (ID3D11Resource *)typed, (ID3D11Resource *)depth);
+    ID3D11DeviceContext_CopyResource(g_context, (ID3D11Resource *)raw, (ID3D11Resource *)depth);
+    int wrong = 0;
+    for (UINT sub = 0; sub < 4; ++sub) {
+      const UINT m = sub % 2, l = sub / 2, w = 16 >> m;
+      const UINT32 want = unorm24_11(depth11(m, l)) | (10u * m + l + 1) << 24;
+      ID3D11Texture2D *both[2] = {typed, raw};
+      for (int k = 0; k < 2; ++k) {
+        D3D11_MAPPED_SUBRESOURCE mapped;
+        if (FAILED(ID3D11DeviceContext_Map(g_context, (ID3D11Resource *)both[k], sub, D3D11_MAP_READ, 0, &mapped)) || !mapped.pData) { ++wrong; continue; }
+        const UINT32 *texels = mapped.pData;
+        if (texels[0] != want || texels[(w - 1) * mapped.RowPitch / 4 + w - 1] != want) {
+          if (!wrong) printf("  d3d11test: depth copy subresource %u (%s) %08x, want %08x\n", sub, k ? "typeless" : "typed", (unsigned)texels[0], (unsigned)want);
+          ++wrong;
+        }
+        ID3D11DeviceContext_Unmap(g_context, (ID3D11Resource *)both[k], sub);
+      }
+    }
+    check(wrong == 0, "CopyResource of a depth texture into staging textures: the 24-bit depth and the stencil of every subresource");
+    /* a staging texture written and copied into a depth texture, then out again */
+    D3D11_MAPPED_SUBRESOURCE mapped;
+    if (SUCCEEDED(ID3D11DeviceContext_Map(g_context, (ID3D11Resource *)typed, 0, D3D11_MAP_WRITE, 0, &mapped)) && mapped.pData) {
+      for (UINT y = 0; y < 16; ++y)
+        for (UINT x = 0; x < 16; ++x) ((UINT32 *)((BYTE *)mapped.pData + y * mapped.RowPitch))[x] = (y * 16 + x) * 65793u | (x + y) << 24;
+      ID3D11DeviceContext_Unmap(g_context, (ID3D11Resource *)typed, 0);
+    }
+    ID3D11Texture2D *other = cleared_depth11(DXGI_FORMAT_R24G8_TYPELESS, DXGI_FORMAT_D24_UNORM_S8_UINT);
+    if (other) {
+      ID3D11DeviceContext_CopySubresourceRegion(g_context, (ID3D11Resource *)other, 0, 0, 0, 0, (ID3D11Resource *)typed, 0, NULL);
+      /* (a part of a subresource of a depth texture is not copied) */
+      const D3D11_BOX half = {0, 0, 0, 8, 16, 1};
+      ID3D11DeviceContext_CopySubresourceRegion(g_context, (ID3D11Resource *)other, 2, 0, 0, 0, (ID3D11Resource *)typed, 0, &half);
+      ID3D11DeviceContext_CopyResource(g_context, (ID3D11Resource *)raw, (ID3D11Resource *)other);
+      int bad = 0;
+      if (SUCCEEDED(ID3D11DeviceContext_Map(g_context, (ID3D11Resource *)raw, 0, D3D11_MAP_READ, 0, &mapped)) && mapped.pData) {
+        for (UINT y = 0; y < 16; ++y)
+          for (UINT x = 0; x < 16; ++x) bad += ((const UINT32 *)((const BYTE *)mapped.pData + y * mapped.RowPitch))[x] != ((y * 16 + x) * 65793u | (x + y) << 24);
+        ID3D11DeviceContext_Unmap(g_context, (ID3D11Resource *)raw, 0);
+      } else {
+        ++bad;
+      }
+      UINT32 kept = 0;
+      if (SUCCEEDED(ID3D11DeviceContext_Map(g_context, (ID3D11Resource *)raw, 2, D3D11_MAP_READ, 0, &mapped)) && mapped.pData) {
+        kept = *(const UINT32 *)mapped.pData;
+        ID3D11DeviceContext_Unmap(g_context, (ID3D11Resource *)raw, 2);
+      }
+      printf("d3d11test: a depth texture written from a staging one: %u texels wrong; slice 1 after a part copy %08x\n", bad, (unsigned)kept);
+      check(bad == 0, "CopySubresourceRegion from a staging texture into a depth texture: the depth and the stencil");
+      check(kept == (unorm24_11(depth11(0, 1)) | 2u << 24), "CopySubresourceRegion of part of a depth texture's subresource copies nothing");
+      ID3D11Texture2D_Release(other);
+    }
+  }
+  if (raw) ID3D11Texture2D_Release(raw);
+  if (typed) ID3D11Texture2D_Release(typed);
+  ID3D11Texture2D_Release(depth);
+
+  /* SetResourceMinLOD: levels 255, 128, 0 of a texture drawn at its size (level 0 of the view) */
+  const BYTE shades[3] = {255, 128, 0};
+  ID3D11Texture2D *tex = NULL;
+  ID3D11ShaderResourceView *whole = grey_levels(64, 64, 3, shades, &tex), *from1 = NULL;
+  if (tex) {
+    D3D11_SHADER_RESOURCE_VIEW_DESC v1;
+    memset(&v1, 0, sizeof v1);
+    v1.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    v1.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+    v1.Texture2D.MostDetailedMip = 1, v1.Texture2D.MipLevels = (UINT)-1;
+    ID3D11Device_CreateShaderResourceView(g_device, (ID3D11Resource *)tex, &v1, &from1);
+  }
+  D3D11_SAMPLER_DESC sd;
+  memset(&sd, 0, sizeof sd);
+  sd.Filter = D3D11_FILTER_MIN_MAG_MIP_POINT;
+  sd.AddressU = sd.AddressV = sd.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
+  sd.MaxLOD = 3.402823466e+38f;
+  if (whole && from1) {
+    const UINT32 none = sample_quad(whole, &sd, 0, 0, 1, 1);
+    ID3D11DeviceContext_SetResourceMinLOD(g_context, (ID3D11Resource *)tex, 1.0f);
+    const FLOAT got_lod = ID3D11DeviceContext_GetResourceMinLOD(g_context, (ID3D11Resource *)tex);
+    const UINT32 one = sample_quad(whole, &sd, 0, 0, 1, 1), view_one = sample_quad(from1, &sd, 0, 0, 1, 1);
+    ID3D11DeviceContext_SetResourceMinLOD(g_context, (ID3D11Resource *)tex, 2.0f);
+    const UINT32 view_two = sample_quad(from1, &sd, 0, 0, 1, 1);
+    ID3D11DeviceContext_SetResourceMinLOD(g_context, (ID3D11Resource *)tex, 0.0f);
+    const UINT32 back = sample_quad(whole, &sd, 0, 0, 1, 1);
+    printf("d3d11test: SetResourceMinLOD none %08x, 1 %08x (got %g), a view from level 1 with 1 %08x and 2 %08x, 0 again %08x\n", (unsigned)none, (unsigned)one, got_lod, (unsigned)view_one,
+           (unsigned)view_two, (unsigned)back);
+    check(grey_near(none, 255) && grey_near(one, 128) && got_lod == 1.0f && grey_near(back, 255), "SetResourceMinLOD 1: level 1 is the most detailed sampled; GetResourceMinLOD");
+    check(grey_near(view_one, 128) && grey_near(view_two, 0), "SetResourceMinLOD counts the texture's levels: a view from level 1 reads its first, then (2) its second");
+  }
+  if (from1) ID3D11ShaderResourceView_Release(from1);
+  if (whole) ID3D11ShaderResourceView_Release(whole);
+  if (tex) ID3D11Texture2D_Release(tex);
+}
+
+
+/* ---- strip cuts, separate filters and reductions, line modes, typeless narrow views, R1_UNORM -------------------------------------------------------------------------------- */
+
+/* Index buffer strip cuts (Direct3D 11 ends a strip at 0xFFFF of 16-bit and 0xFFFFFFFF of 32-bit indices: Direct3D 12's strip cut of the list, set with the index buffer), the
+ * minification and magnification filters of their own (a 2 x 2 texture over the target is magnified: MIN_LINEAR_MAG_POINT is the point filter's texels, MIN_POINT_MAG_LINEAR a
+ * blend), MINIMUM / MAXIMUM filters where MinMaxFiltering, the line modes (MultisampleEnable's quadrilateral lines 1.4 pixels wide, AntialiasedLineEnable's coverage in alpha),
+ * an R16_TYPELESS texture seen as R16_FLOAT, R1_UNORM textures. */
+static void test_fixed_state_gaps(int software) {
+  /* strip cuts: a strip of six vertices cut after the third, drawn with 16-bit and 32-bit indices; the middle below the two triangles stays black */
+  {
+    const VertexF v[6] = {{-0.9f, 0.9f, 0.5f, 1, 0, 0, 1}, {-0.1f, 0.9f, 0.5f, 1, 0, 0, 1}, {-0.5f, 0.3f, 0.5f, 1, 0, 0, 1},
+                          {0.1f, 0.9f, 0.5f, 0, 1, 0, 1}, {0.9f, 0.9f, 0.5f, 0, 1, 0, 1}, {0.5f, 0.3f, 0.5f, 0, 1, 0, 1}};
+    const UINT16 i16[7] = {0, 1, 2, 0xFFFF, 3, 4, 5};
+    const UINT32 i32[7] = {0, 1, 2, 0xFFFFFFFFu, 3, 4, 5};
+    ID3D11Buffer *vb = make_buffer(D3D11_BIND_VERTEX_BUFFER, D3D11_USAGE_DEFAULT, 0, v, sizeof v);
+    ID3D11Buffer *ib16 = make_buffer(D3D11_BIND_INDEX_BUFFER, D3D11_USAGE_DEFAULT, 0, i16, sizeof i16);
+    ID3D11Buffer *ib32 = make_buffer(D3D11_BIND_INDEX_BUFFER, D3D11_USAGE_DEFAULT, 0, i32, sizeof i32);
+    for (int wide = 0; wide < 2; ++wide) {
+      begin(NULL);
+      clear(0, 0, 0);
+      ID3D11DeviceContext_PSSetShader(g_context, g_ps_color, NULL, 0);
+      bind_floats(vb);
+      ID3D11DeviceContext_IASetIndexBuffer(g_context, wide ? ib32 : ib16, wide ? DXGI_FORMAT_R32_UINT : DXGI_FORMAT_R16_UINT, 0);
+      ID3D11DeviceContext_IASetPrimitiveTopology(g_context, D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+      ID3D11DeviceContext_DrawIndexed(g_context, 7, 0, 0);
+      read_target();
+      printf("d3d11test: strip cut (%s indices): %08x %08x %08x\n", wide ? "32-bit" : "16-bit", (unsigned)pixel(16, 8), (unsigned)pixel(48, 8), (unsigned)pixel(32, 40));
+      check(pixel(16, 8) == 0xFFFF0000u && pixel(48, 8) == 0xFF00FF00u && (pixel(32, 40) & 0xFFFFFF) == 0, "an index of all ones ends a strip");
+    }
+    if (vb) ID3D11Buffer_Release(vb);
+    if (ib16) ID3D11Buffer_Release(ib16);
+    if (ib32) ID3D11Buffer_Release(ib32);
+  }
+  /* separate filters on a 2 x 2 texture of black and white columns, magnified over the target: half way between the columns (the pixel at 31.5 of 64 is texel 0.98 of 2) */
+  {
+    UINT32 texels[4] = {0xFF000000u, 0xFFFFFFFFu, 0xFF000000u, 0xFFFFFFFFu};
+    D3D11_SUBRESOURCE_DATA initial = {texels, 8, 0};
+    D3D11_TEXTURE2D_DESC desc = {2, 2, 1, 1, DXGI_FORMAT_B8G8R8A8_UNORM, {1, 0}, D3D11_USAGE_DEFAULT, D3D11_BIND_SHADER_RESOURCE, 0, 0};
+    ID3D11Texture2D *tex = NULL;
+    ID3D11ShaderResourceView *view = NULL;
+    if (SUCCEEDED(ID3D11Device_CreateTexture2D(g_device, &desc, &initial, &tex))) ID3D11Device_CreateShaderResourceView(g_device, (ID3D11Resource *)tex, NULL, &view);
+    D3D11_SAMPLER_DESC sd;
+    memset(&sd, 0, sizeof sd);
+    sd.AddressU = sd.AddressV = sd.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
+    sd.ComparisonFunc = D3D11_COMPARISON_NEVER;
+    sd.MaxLOD = 3.402823466e+38f;
+    sd.Filter = D3D11_FILTER_MIN_POINT_MAG_LINEAR_MIP_POINT;
+    const UINT32 mag_linear = sample_quad(view, &sd, 0, 0, 1, 1);
+    sd.Filter = D3D11_FILTER_MIN_LINEAR_MAG_MIP_POINT;
+    const UINT32 mag_point = sample_quad(view, &sd, 0, 0, 1, 1);
+    printf("d3d11test: magnified, MIN_POINT_MAG_LINEAR %08x, MIN_LINEAR_MAG_POINT %08x\n", (unsigned)mag_linear, (unsigned)mag_point);
+    check(red(mag_linear) > 100 && red(mag_linear) < 155 && (red(mag_point) == 0 || red(mag_point) == 255), "a magnified texture takes the magnification filter");
+    /* (MINIMUM / MAXIMUM: CreateSamplerState takes them where MinMaxFiltering - the least and the greatest of the bilinear texels: black and white) */
+    D3D11_FEATURE_DATA_D3D11_OPTIONS1 o1;
+    memset(&o1, 0, sizeof o1);
+    ID3D11Device_CheckFeatureSupport(g_device, D3D11_FEATURE_D3D11_OPTIONS1, &o1, sizeof o1);
+    check(o1.MinMaxFiltering == software, "MinMaxFiltering on the CPU renderer");
+    sd.Filter = D3D11_FILTER_MAXIMUM_MIN_MAG_LINEAR_MIP_POINT;
+    ID3D11SamplerState *state = NULL;
+    const HRESULT hr = ID3D11Device_CreateSamplerState(g_device, &sd, &state);
+    check(o1.MinMaxFiltering ? SUCCEEDED(hr) && state : hr == E_INVALIDARG && !state, "MAXIMUM_ filters where MinMaxFiltering, E_INVALIDARG elsewhere");
+    if (state) ID3D11SamplerState_Release(state);
+    if (o1.MinMaxFiltering) {
+      const UINT32 greatest = sample_quad(view, &sd, 0, 0, 1, 1);
+      sd.Filter = D3D11_FILTER_MINIMUM_MIN_MAG_LINEAR_MIP_POINT;
+      const UINT32 least = sample_quad(view, &sd, 0, 0, 1, 1);
+      printf("d3d11test: MAXIMUM %08x, MINIMUM %08x\n", (unsigned)greatest, (unsigned)least);
+      check(red(greatest) == 255 && red(least) == 0, "MAXIMUM_ and MINIMUM_ filters: the greatest and least of the texels the filter weighs");
+    }
+    if (view) ID3D11ShaderResourceView_Release(view);
+    if (tex) ID3D11Texture2D_Release(tex);
+  }
+  /* line modes: a horizontal line between rows 31 and 32 */
+  {
+    const VertexF v[4] = {{-0.8f, 0.0f, 0.5f, 1, 0, 0, 1}, {0.8f, 0.0f, 0.5f, 1, 0, 0, 1}, {-0.8f, -0.6f, 0.5f, 1, 0, 0, 1}, {0.8f, 0.5f, 0.5f, 1, 0, 0, 1}};
+    ID3D11Buffer *vb = make_buffer(D3D11_BIND_VERTEX_BUFFER, D3D11_USAGE_DEFAULT, 0, v, sizeof v);
+    D3D11_RASTERIZER_DESC rd;
+    memset(&rd, 0, sizeof rd);
+    rd.FillMode = D3D11_FILL_SOLID;
+    rd.CullMode = D3D11_CULL_NONE;
+    rd.DepthClipEnable = TRUE;
+    ID3D11RasterizerState *aliased = NULL, *quad = NULL, *smooth = NULL;
+    ID3D11Device_CreateRasterizerState(g_device, &rd, &aliased);
+    rd.MultisampleEnable = TRUE;
+    ID3D11Device_CreateRasterizerState(g_device, &rd, &quad);
+    rd.MultisampleEnable = FALSE;
+    rd.AntialiasedLineEnable = TRUE;
+    ID3D11Device_CreateRasterizerState(g_device, &rd, &smooth);
+    D3D11_BLEND_DESC bd;
+    memset(&bd, 0, sizeof bd);
+    bd.RenderTarget[0].BlendEnable = TRUE;
+    bd.RenderTarget[0].SrcBlend = D3D11_BLEND_SRC_ALPHA, bd.RenderTarget[0].DestBlend = D3D11_BLEND_INV_SRC_ALPHA, bd.RenderTarget[0].BlendOp = D3D11_BLEND_OP_ADD;
+    bd.RenderTarget[0].SrcBlendAlpha = D3D11_BLEND_ONE, bd.RenderTarget[0].DestBlendAlpha = D3D11_BLEND_ZERO, bd.RenderTarget[0].BlendOpAlpha = D3D11_BLEND_OP_ADD;
+    bd.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
+    ID3D11BlendState *over = NULL;
+    ID3D11Device_CreateBlendState(g_device, &bd, &over);
+    int rows[2] = {0, 0};
+    ID3D11RasterizerState *states[2] = {aliased, quad};
+    for (int m = 0; m < 2 && vb; ++m) {
+      begin(NULL);
+      clear(0, 0, 0);
+      ID3D11DeviceContext_RSSetState(g_context, states[m]);
+      ID3D11DeviceContext_PSSetShader(g_context, g_ps_color, NULL, 0);
+      bind_floats(vb);
+      ID3D11DeviceContext_IASetPrimitiveTopology(g_context, D3D11_PRIMITIVE_TOPOLOGY_LINELIST);
+      ID3D11DeviceContext_Draw(g_context, 2, 0);
+      read_target();
+      for (int y = 0; y < SIZE; ++y) rows[m] += (pixel(32, y) & 0xFFFFFF) != 0;
+    }
+    printf("d3d11test: lines, aliased %d rows, MultisampleEnable %d\n", rows[0], rows[1]);
+    check(rows[0] == 1 && (software ? rows[1] == 2 : rows[1] >= 1), "MultisampleEnable lines: quadrilaterals 1.4 pixels wide");
+    int partial = 0;
+    if (vb && smooth && over) {
+      begin(NULL);
+      clear(0, 0, 0);
+      ID3D11DeviceContext_RSSetState(g_context, smooth);
+      ID3D11DeviceContext_OMSetBlendState(g_context, over, NULL, 0xFFFFFFFFu);
+      ID3D11DeviceContext_PSSetShader(g_context, g_ps_color, NULL, 0);
+      bind_floats(vb);
+      ID3D11DeviceContext_IASetPrimitiveTopology(g_context, D3D11_PRIMITIVE_TOPOLOGY_LINELIST);
+      ID3D11DeviceContext_Draw(g_context, 2, 2);
+      read_target();
+      for (int i = 0; i < SIZE * SIZE; ++i) partial += red(g_pixels[i]) > 0 && red(g_pixels[i]) < 250;
+    }
+    printf("d3d11test: alpha-antialiased line, %d pixels partly covered\n", partial);
+    check(partial > 10, "AntialiasedLineEnable: the coverage of each pixel in the alpha");
+    ID3D11RasterizerState *all[3] = {aliased, quad, smooth};
+    for (int i = 0; i < 3; ++i) if (all[i]) ID3D11RasterizerState_Release(all[i]);
+    if (over) ID3D11BlendState_Release(over);
+    if (vb) ID3D11Buffer_Release(vb);
+  }
+  /* R16_TYPELESS (not a depth texture) seen as R16_FLOAT: 0.5 in half float, sampled */
+  {
+    UINT16 halves[4] = {0x3800, 0x3800, 0x3800, 0x3800};
+    D3D11_SUBRESOURCE_DATA initial = {halves, 4, 0};
+    D3D11_TEXTURE2D_DESC desc = {2, 2, 1, 1, DXGI_FORMAT_R16_TYPELESS, {1, 0}, D3D11_USAGE_DEFAULT, D3D11_BIND_SHADER_RESOURCE, 0, 0};
+    ID3D11Texture2D *tex = NULL;
+    ID3D11ShaderResourceView *view = NULL;
+    const HRESULT hr = ID3D11Device_CreateTexture2D(g_device, &desc, &initial, &tex);
+    D3D11_SHADER_RESOURCE_VIEW_DESC vd;
+    memset(&vd, 0, sizeof vd);
+    vd.Format = DXGI_FORMAT_R16_FLOAT;
+    vd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+    vd.Texture2D.MipLevels = 1;
+    if (tex) ID3D11Device_CreateShaderResourceView(g_device, (ID3D11Resource *)tex, &vd, &view);
+    D3D11_SAMPLER_DESC sd;
+    memset(&sd, 0, sizeof sd);
+    sd.Filter = D3D11_FILTER_MIN_MAG_MIP_POINT;
+    sd.AddressU = sd.AddressV = sd.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
+    sd.MaxLOD = 3.402823466e+38f;
+    const UINT32 got = view ? sample_quad(view, &sd, 0, 0, 1, 1) : 0;
+    printf("d3d11test: R16_TYPELESS as R16_FLOAT %08x\n", (unsigned)got);
+    check(SUCCEEDED(hr) && view && red(got) >= 126 && red(got) <= 129 && green(got) == 0, "an R16_TYPELESS colour texture seen through an R16_FLOAT view");
+    if (view) ID3D11ShaderResourceView_Release(view);
+    if (tex) ID3D11Texture2D_Release(tex);
+  }
+  /* R1_UNORM: a 16 x 2 texture of bits (rows of two bytes, the first pixel the most significant bit), sampled - white where a bit is set -; no render target or CPU access */
+  {
+    UINT support = 0;
+    check(SUCCEEDED(ID3D11Device_CheckFormatSupport(g_device, DXGI_FORMAT_R1_UNORM, &support)) && (support & D3D11_FORMAT_SUPPORT_TEXTURE2D) && (support & D3D11_FORMAT_SUPPORT_SHADER_SAMPLE) &&
+          !(support & D3D11_FORMAT_SUPPORT_RENDER_TARGET), "R1_UNORM: 2D textures, sampled, no render target");
+    const BYTE bits[4] = {0xFF, 0x00, 0xFF, 0x00};      /* (the left eight pixels of each row set) */
+    D3D11_SUBRESOURCE_DATA initial = {bits, 2, 0};
+    D3D11_TEXTURE2D_DESC desc = {16, 2, 1, 1, DXGI_FORMAT_R1_UNORM, {1, 0}, D3D11_USAGE_DEFAULT, D3D11_BIND_SHADER_RESOURCE, 0, 0};
+    ID3D11Texture2D *tex = NULL, *bad = NULL;
+    ID3D11ShaderResourceView *view = NULL;
+    if (SUCCEEDED(ID3D11Device_CreateTexture2D(g_device, &desc, &initial, &tex))) ID3D11Device_CreateShaderResourceView(g_device, (ID3D11Resource *)tex, NULL, &view);
+    D3D11_SAMPLER_DESC sd;
+    memset(&sd, 0, sizeof sd);
+    sd.Filter = D3D11_FILTER_MIN_MAG_MIP_POINT;
+    sd.AddressU = sd.AddressV = sd.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
+    sd.MaxLOD = 3.402823466e+38f;
+    const UINT32 left = view ? sample_quad(view, &sd, 0, 0, 0.25f, 0.25f) : 0, right = view ? sample_quad(view, &sd, 0.75f, 0, 1, 1) : 0;
+    printf("d3d11test: R1_UNORM sampled %08x %08x\n", (unsigned)left, (unsigned)right);
+    check(view && red(left) == 255 && red(right) == 0, "R1_UNORM: its bits sampled as 1 and 0");
+    desc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
+    check(FAILED(ID3D11Device_CreateTexture2D(g_device, &desc, &initial, &bad)) && !bad, "R1_UNORM: no render target");
+    desc.BindFlags = 0, desc.Usage = D3D11_USAGE_STAGING, desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    check(FAILED(ID3D11Device_CreateTexture2D(g_device, &desc, NULL, &bad)) && !bad, "R1_UNORM: no staging texture");
     if (view) ID3D11ShaderResourceView_Release(view);
     if (tex) ID3D11Texture2D_Release(tex);
   }
@@ -5029,6 +5611,237 @@ done:
   if (linkage) ID3D11ClassLinkage_Release(linkage);
 }
 
+/* ---- shader and query gaps -------------------------------------------------------------------------------------------------------------------------------------------------- */
+
+/* CreateInputLayout checks the layout against the input signature of the shader given (tests/data/dxbc/vs_layout_sig.hlsl: POSITION, TEXCOORD3 and BLENDINDICES read,
+ * COLOR declared and never read, SV_VertexID and SV_InstanceID): E_INVALIDARG for an input it reads that the layout has not; elements it has no input for are fine. */
+static void test_input_layout_signature(void) {
+  const void *vs = dx_vs_layout_sig_dxbc;
+  const SIZE_T bytes = sizeof dx_vs_layout_sig_dxbc;
+  const D3D11_INPUT_ELEMENT_DESC full[3] = {{"POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0, D3D11_INPUT_PER_VERTEX_DATA, 0},
+                                            {"TEXCOORD", 3, DXGI_FORMAT_R32G32_FLOAT, 0, 12, D3D11_INPUT_PER_VERTEX_DATA, 0},
+                                            {"BLENDINDICES", 0, DXGI_FORMAT_R8G8B8A8_UINT, 0, 20, D3D11_INPUT_PER_VERTEX_DATA, 0}};
+  ID3D11InputLayout *l = NULL;
+  check(ID3D11Device_CreateInputLayout(g_device, full, 3, vs, bytes, &l) == S_OK && l, "CreateInputLayout: every input the shader reads, by semantic and index");
+  if (l) ID3D11InputLayout_Release(l), l = NULL;
+  check(ID3D11Device_CreateInputLayout(g_device, full, 3, vs, bytes, NULL) == S_FALSE, "... with no out pointer: S_FALSE (only checked)");
+  check(ID3D11Device_CreateInputLayout(g_device, full, 2, vs, bytes, &l) == E_INVALIDARG && !l, "... an input the shader reads left out: E_INVALIDARG");
+  D3D11_INPUT_ELEMENT_DESC changed[3];
+  memcpy(changed, full, sizeof full);
+  changed[1].SemanticIndex = 2;
+  check(ID3D11Device_CreateInputLayout(g_device, changed, 3, vs, bytes, &l) == E_INVALIDARG && !l, "... another semantic index: E_INVALIDARG");
+  memcpy(changed, full, sizeof full);
+  changed[0].SemanticName = "POSITIONS";
+  check(ID3D11Device_CreateInputLayout(g_device, changed, 3, vs, bytes, &l) == E_INVALIDARG && !l, "... another semantic name: E_INVALIDARG");
+  const D3D11_INPUT_ELEMENT_DESC more[7] = {{"position", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0, D3D11_INPUT_PER_VERTEX_DATA, 0},
+                                            {"NORMAL", 0, DXGI_FORMAT_R32G32B32_FLOAT, 1, 0, D3D11_INPUT_PER_VERTEX_DATA, 0},
+                                            {"TexCoord", 3, DXGI_FORMAT_R16G16_UNORM, 0, D3D11_APPEND_ALIGNED_ELEMENT, D3D11_INPUT_PER_VERTEX_DATA, 0},
+                                            {"BLENDINDICES", 0, DXGI_FORMAT_R32_FLOAT, 0, D3D11_APPEND_ALIGNED_ELEMENT, D3D11_INPUT_PER_VERTEX_DATA, 0},
+                                            {"COLOR", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 2, 0, D3D11_INPUT_PER_INSTANCE_DATA, 1},
+                                            {"SV_InstanceID", 0, DXGI_FORMAT_R32_UINT, 3, 0, D3D11_INPUT_PER_VERTEX_DATA, 0},
+                                            {"WEIGHTS", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 20, 0, D3D11_INPUT_PER_VERTEX_DATA, 0}};
+  check(ID3D11Device_CreateInputLayout(g_device, more, 7, vs, bytes, &l) == S_OK && l,
+        "... elements the shader has no input for (one in slot 20, one named like a system value), other letter cases, formats of another type and fewer components: S_OK");
+  if (l) ID3D11InputLayout_Release(l), l = NULL;
+  D3D11_INPUT_ELEMENT_DESC many[33];
+  for (UINT i = 0; i < 33; ++i) {
+    const D3D11_INPUT_ELEMENT_DESC e = {"TEXCOORD", i, DXGI_FORMAT_R32G32_FLOAT, 1, D3D11_APPEND_ALIGNED_ELEMENT, D3D11_INPUT_PER_VERTEX_DATA, 0};
+    many[i] = e;
+  }
+  many[0] = full[0];
+  many[1].SemanticName = "BLENDINDICES", many[1].SemanticIndex = 0, many[1].Format = DXGI_FORMAT_R8G8B8A8_UINT;
+  check(ID3D11Device_CreateInputLayout(g_device, many, 32, vs, bytes, &l) == S_OK && l, "... 32 elements (D3D11_IA_VERTEX_INPUT_STRUCTURE_ELEMENT_COUNT)");
+  if (l) ID3D11InputLayout_Release(l), l = NULL;
+  check(ID3D11Device_CreateInputLayout(g_device, many, 33, vs, bytes, &l) == E_INVALIDARG && !l, "... 33: E_INVALIDARG");
+  check(ID3D11Device_CreateInputLayout(g_device, full, 3, NULL, 0, &l) == E_INVALIDARG && !l, "... no shader: E_INVALIDARG");
+  const BYTE junk[64] = {'D', 'X', 'B', 'C'};
+  check(ID3D11Device_CreateInputLayout(g_device, full, 3, junk, sizeof junk, &l) == E_INVALIDARG && !l, "... a container with no input signature: E_INVALIDARG");
+  check(ID3D11Device_CreateInputLayout(g_device, NULL, 0, dx_ps_color_dxbc, sizeof dx_ps_color_dxbc, &l) == E_INVALIDARG && !l,
+        "... no elements for a shader that reads inputs: E_INVALIDARG");
+}
+
+/* Subroutines and switches of Microsoft's compiler (tests/data/dxbc/ps_call_switch.hlsl, ps_switch.hlsl, vs_call_switch.hlsl) drawn: what the HLSL says. */
+static UINT32 draw_selected(ID3D11VertexShader *vs, ID3D11PixelShader *ps, int s0, int s1, int s2, int s3, float a0, float a1, float a2, float a3) {
+  struct { int sel[4]; float a[4]; } k = {{s0, s1, s2, s3}, {a0, a1, a2, a3}};
+  ID3D11Buffer *constants = make_buffer(D3D11_BIND_CONSTANT_BUFFER, D3D11_USAGE_DEFAULT, 0, &k, sizeof k);
+  ID3D11Buffer *vertices = triangle(0.5f, 1, 1, 1);
+  begin(NULL);
+  clear(0, 0, 0);
+  bind_floats(vertices);
+  if (vs) {
+    ID3D11DeviceContext_VSSetShader(g_context, vs, NULL, 0);
+    ID3D11DeviceContext_VSSetConstantBuffers(g_context, 0, 1, &constants);
+  }
+  ID3D11DeviceContext_PSSetShader(g_context, ps, NULL, 0);
+  ID3D11DeviceContext_PSSetConstantBuffers(g_context, 0, 1, &constants);
+  ID3D11DeviceContext_Draw(g_context, 3, 0);
+  const UINT32 got = read_target() ? pixel(32, 40) : 0;
+  ID3D11DeviceContext_PSSetShader(g_context, NULL, NULL, 0);
+  if (constants) ID3D11Buffer_Release(constants);
+  if (vertices) ID3D11Buffer_Release(vertices);
+  return got;
+}
+static void test_subroutines_and_switches(void) {
+  ID3D11PixelShader *calls = NULL, *switches = NULL, *texcoord = NULL;
+  ID3D11VertexShader *vertex_calls = NULL;
+  ID3D11InputLayout *position = NULL;
+  ID3D11Device_CreatePixelShader(g_device, dx_ps_call_switch_dxbc, sizeof dx_ps_call_switch_dxbc, NULL, &calls);
+  ID3D11Device_CreatePixelShader(g_device, dx_ps_switch_dxbc, sizeof dx_ps_switch_dxbc, NULL, &switches);
+  ID3D11Device_CreatePixelShader(g_device, dx_ps_texcoord0_dxbc, sizeof dx_ps_texcoord0_dxbc, NULL, &texcoord);
+  ID3D11Device_CreateVertexShader(g_device, dx_vs_call_switch_dxbc, sizeof dx_vs_call_switch_dxbc, NULL, &vertex_calls);
+  const D3D11_INPUT_ELEMENT_DESC pos[1] = {{"POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0, D3D11_INPUT_PER_VERTEX_DATA, 0}};
+  ID3D11Device_CreateInputLayout(g_device, pos, 1, dx_vs_call_switch_dxbc, sizeof dx_vs_call_switch_dxbc, &position);
+  check(calls && switches && texcoord && vertex_calls && position, "shaders with subroutines (call / label / ret) and switches made");
+  if (calls && switches && texcoord && vertex_calls && position) {
+    UINT32 p = draw_selected(NULL, calls, 2, 1, 0, 0, 0.25f, 0.6f, 0.5f, 0.75f);
+    check(near_rgb(p, 0, 0, 128), "a [call] switch: case 2 as a subroutine that returns from inside an if");
+    p = draw_selected(NULL, calls, 0, 2, 0, 0, 0.25f, 0.6f, 0.5f, 0.75f);
+    check(near_rgb(p, 255, 191, 0), "... cases 0 and 1 in a loop (a loop with a break inside the subroutine)");
+    p = draw_selected(NULL, calls, -1, 1, 0, 0, 0.25f, 0.6f, 0.5f, 0.75f);
+    check(near_rgb(p, 128, 128, 128), "... the default");
+    p = draw_selected(NULL, switches, 1, 1, 0, 7, 0.75f, 0.25f, 0.75f, 0.75f);
+    check(near_rgb(p, 64, 255, 255), "a switch with a break inside an if of a case, then a switch of two cases");
+    p = draw_selected(NULL, switches, 4, 1, 0, 0, 0.75f, 0.25f, 0.75f, 0.75f);
+    check(near_rgb(p, 255, 255, 255), "... a return inside a case");
+    p = draw_selected(NULL, switches, 2, 1, 1, 0, 0.75f, 0.75f, 0.75f, 0.75f);
+    check(near_rgb(p, 64, 0, 255), "... a switch inside a case (its default)");
+    ID3D11DeviceContext_IASetInputLayout(g_context, position);
+    UINT32 v = 0;
+    {
+      struct { int sel[4]; float a[4]; } k = {{0, 0, 0, 0}, {0, 0, 0, 0}};
+      ID3D11Buffer *constants = make_buffer(D3D11_BIND_CONSTANT_BUFFER, D3D11_USAGE_DEFAULT, 0, &k, sizeof k);
+      ID3D11Buffer *vertices = triangle(0.5f, 1, 1, 1);
+      begin(NULL);
+      clear(0, 0, 0);
+      const UINT stride = sizeof(VertexF), offset = 0;
+      ID3D11DeviceContext_IASetInputLayout(g_context, position);
+      ID3D11DeviceContext_IASetVertexBuffers(g_context, 0, 1, &vertices, &stride, &offset);
+      ID3D11DeviceContext_VSSetShader(g_context, vertex_calls, NULL, 0);
+      ID3D11DeviceContext_VSSetConstantBuffers(g_context, 0, 1, &constants);
+      ID3D11DeviceContext_PSSetShader(g_context, texcoord, NULL, 0);
+      ID3D11DeviceContext_Draw(g_context, 3, 0);
+      v = read_target() ? pixel(32, 40) : 0;
+      k.sel[0] = 9;
+      ID3D11DeviceContext_UpdateSubresource(g_context, (ID3D11Resource *)constants, 0, NULL, &k, 0, 0);
+      clear(0, 0, 0);
+      ID3D11DeviceContext_Draw(g_context, 3, 0);
+      const UINT32 w = read_target() ? pixel(32, 40) : 0;
+      check(near_rgb(v, 255, 0, 0) && near_rgb(w, 0, 0, 255), "a vertex shader's [call] switch: case 0 and the default");
+      ID3D11DeviceContext_PSSetShader(g_context, NULL, NULL, 0);
+      if (constants) ID3D11Buffer_Release(constants);
+      if (vertices) ID3D11Buffer_Release(vertices);
+    }
+  }
+  if (calls) ID3D11PixelShader_Release(calls);
+  if (switches) ID3D11PixelShader_Release(switches);
+  if (texcoord) ID3D11PixelShader_Release(texcoord);
+  if (vertex_calls) ID3D11VertexShader_Release(vertex_calls);
+  if (position) ID3D11InputLayout_Release(position);
+}
+
+/* A draw with no pixel shader bound runs none: PSInvocations 0 (the device's stand-in is not counted), and the rest as with one. */
+static void test_no_pixel_shader_invocations(void) {
+  const D3D11_QUERY_DESC stats_desc = {D3D11_QUERY_PIPELINE_STATISTICS, 0};
+  ID3D11Query *with = NULL, *without = NULL;
+  ID3D11Device_CreateQuery(g_device, &stats_desc, &with);
+  ID3D11Device_CreateQuery(g_device, &stats_desc, &without);
+  ID3D11Buffer *vertices = triangle(0.5f, 1, 0, 0);
+  if (!with || !without || !vertices) { check(0, "queries for the draws without a pixel shader"); return; }
+  begin(NULL);
+  clear(0, 0, 0);
+  bind_floats(vertices);
+  ID3D11DeviceContext_PSSetShader(g_context, g_ps_color, NULL, 0);
+  ID3D11DeviceContext_Begin(g_context, (ID3D11Asynchronous *)with);
+  ID3D11DeviceContext_Draw(g_context, 3, 0);
+  ID3D11DeviceContext_End(g_context, (ID3D11Asynchronous *)with);
+  ID3D11DeviceContext_PSSetShader(g_context, NULL, NULL, 0);
+  ID3D11DeviceContext_Begin(g_context, (ID3D11Asynchronous *)without);
+  ID3D11DeviceContext_Draw(g_context, 3, 0);
+  ID3D11DeviceContext_End(g_context, (ID3D11Asynchronous *)without);
+  D3D11_QUERY_DATA_PIPELINE_STATISTICS a, b;
+  memset(&a, 0xFF, sizeof a);
+  memset(&b, 0xFF, sizeof b);
+  while (ID3D11DeviceContext_GetData(g_context, (ID3D11Asynchronous *)with, &a, sizeof a, 0) == S_FALSE) {}
+  while (ID3D11DeviceContext_GetData(g_context, (ID3D11Asynchronous *)without, &b, sizeof b, 0) == S_FALSE) {}
+  printf("d3d11test: (pixel shader invocations: %llu with one, %llu without; clipper %llu %llu)\n", (unsigned long long)a.PSInvocations, (unsigned long long)b.PSInvocations,
+         (unsigned long long)a.CInvocations, (unsigned long long)b.CInvocations);
+  check(a.PSInvocations > 600 && b.PSInvocations == 0 && b.VSInvocations == 3 && b.CInvocations == a.CInvocations && b.CPrimitives == a.CPrimitives,
+        "PSInvocations of a draw without a pixel shader: 0");
+  ID3D11Query_Release(with);
+  ID3D11Query_Release(without);
+  ID3D11Buffer_Release(vertices);
+}
+
+/* Dynamic linkage with a texture index the shader computes (tests/data/dxbc/ps_iface_dyn.hlsl: t[this.texture + pick]) through an interface array indexed by a register:
+ * the texture each instance and pick name. */
+static void test_dynamic_class_index(void) {
+  ID3D11ClassLinkage *linkage = NULL;
+  ID3D11VertexShader *vs = NULL;
+  ID3D11PixelShader *ps = NULL;
+  ID3D11ClassInstance *picker = NULL, *picker_b = NULL;
+  HRESULT hr = ID3D11Device_CreateClassLinkage(g_device, &linkage);
+  if (SUCCEEDED(hr)) hr = ID3D11Device_CreateVertexShader(g_device, dx_vs_vol_dxbc, sizeof dx_vs_vol_dxbc, NULL, &vs);
+  if (SUCCEEDED(hr)) hr = ID3D11Device_CreatePixelShader(g_device, dx_ps_iface_dyn_dxbc, sizeof dx_ps_iface_dyn_dxbc, linkage, &ps);
+  if (SUCCEEDED(hr)) hr = ID3D11ClassLinkage_GetClassInstance(linkage, "picker", 0, &picker);
+  if (SUCCEEDED(hr)) hr = ID3D11ClassLinkage_GetClassInstance(linkage, "picker_b", 0, &picker_b);
+  check(SUCCEEDED(hr) && picker && picker_b, "class linkage: a shader whose class indexes its textures with its own data");
+  ID3D11ShaderResourceView *views[4] = {NULL, NULL, NULL, NULL};
+  ID3D11Texture2D *textures[4] = {NULL, NULL, NULL, NULL};
+  ID3D11SamplerState *samplers[2] = {point_sampler(), point_sampler()};
+  const UINT32 texels[4] = {0xFF0000FFu, 0xFF00FF00u, 0xFFFF0000u, 0xFFFFFFFFu};      /* (R8G8B8A8: red, green, blue, white) */
+  for (UINT i = 0; i < 4; ++i) {
+    D3D11_TEXTURE2D_DESC td = {1, 1, 1, 1, DXGI_FORMAT_R8G8B8A8_UNORM, {1, 0}, D3D11_USAGE_DEFAULT, D3D11_BIND_SHADER_RESOURCE, 0, 0};
+    D3D11_SUBRESOURCE_DATA initial = {&texels[i], 4, 0};
+    if (SUCCEEDED(ID3D11Device_CreateTexture2D(g_device, &td, &initial, &textures[i]))) ID3D11Device_CreateShaderResourceView(g_device, (ID3D11Resource *)textures[i], NULL, &views[i]);
+  }
+  /* cb0: picker.pick, flat.colour; cb2 ($Globals): picker_b.pick */
+  UINT classes_data[2][4] = {{1, 0, 0, 0}, {0, 0, 0, 0}}, globals_data[4] = {1, 0, 0, 0}, params_data[4] = {0, 0, 0, 0};
+  ID3D11Buffer *classes = make_buffer(D3D11_BIND_CONSTANT_BUFFER, D3D11_USAGE_DEFAULT, 0, classes_data, sizeof classes_data);
+  ID3D11Buffer *params = make_buffer(D3D11_BIND_CONSTANT_BUFFER, D3D11_USAGE_DEFAULT, 0, params_data, sizeof params_data);
+  ID3D11Buffer *globals = make_buffer(D3D11_BIND_CONSTANT_BUFFER, D3D11_USAGE_DEFAULT, 0, globals_data, sizeof globals_data);
+  if (SUCCEEDED(hr) && views[3] && samplers[0] && samplers[1] && classes && params && globals) {
+    ID3D11DeviceContext_PSSetShaderResources(g_context, 0, 4, views);
+    ID3D11DeviceContext_PSSetSamplers(g_context, 0, 2, samplers);
+    ID3D11DeviceContext_PSSetConstantBuffers(g_context, 2, 1, &globals);
+    ID3D11ClassInstance *set[2] = {picker, picker_b};
+    const UINT32 a = draw_linked(vs, ps, set, 2, classes, params, 0);      /* picker: t[0 + 1] green */
+    const UINT32 b = draw_linked(vs, ps, set, 2, classes, params, 1);      /* picker_b: t[2 + 1] white */
+    classes_data[0][0] = 0;
+    globals_data[0] = 0;
+    ID3D11DeviceContext_UpdateSubresource(g_context, (ID3D11Resource *)classes, 0, NULL, classes_data, 0, 0);
+    ID3D11DeviceContext_UpdateSubresource(g_context, (ID3D11Resource *)globals, 0, NULL, globals_data, 0, 0);
+    const UINT32 c = draw_linked(vs, ps, set, 2, classes, params, 0);      /* t0 red */
+    const UINT32 d = draw_linked(vs, ps, set, 2, classes, params, 1);      /* t2 blue */
+    printf("d3d11test: (computed texture indices: %08x %08x %08x %08x)\n", (unsigned)a, (unsigned)b, (unsigned)c, (unsigned)d);
+    check(near_rgb(a, 0, 255, 0) && near_rgb(b, 255, 255, 255) && near_rgb(c, 255, 0, 0) && near_rgb(d, 0, 0, 255), "... the texture the instance's data names, through each slot of the array");
+    ID3D11ShaderResourceView *none[4] = {NULL, NULL, NULL, NULL};
+    ID3D11DeviceContext_PSSetShaderResources(g_context, 0, 4, none);
+    ID3D11DeviceContext_PSSetShader(g_context, NULL, NULL, 0);
+  } else {
+    check(0, "the textures, samplers and buffers of the computed texture index");
+  }
+  for (UINT i = 0; i < 4; ++i) {
+    if (views[i]) ID3D11ShaderResourceView_Release(views[i]);
+    if (textures[i]) ID3D11Texture2D_Release(textures[i]);
+  }
+  for (UINT i = 0; i < 2; ++i) if (samplers[i]) ID3D11SamplerState_Release(samplers[i]);
+  if (classes) ID3D11Buffer_Release(classes);
+  if (params) ID3D11Buffer_Release(params);
+  if (globals) ID3D11Buffer_Release(globals);
+  if (picker) ID3D11ClassInstance_Release(picker);
+  if (picker_b) ID3D11ClassInstance_Release(picker_b);
+  if (ps) ID3D11PixelShader_Release(ps);
+  if (vs) ID3D11VertexShader_Release(vs);
+  if (linkage) ID3D11ClassLinkage_Release(linkage);
+}
+
+static void test_shader_query_gaps(void) {
+  test_input_layout_signature();
+  test_subroutines_and_switches();
+  test_no_pixel_shader_invocations();
+  test_dynamic_class_index();
+}
+
 int main(void) {
   test_device();
   if (g_device && g_context) {
@@ -5066,10 +5879,12 @@ int main(void) {
       test_formats();
       test_vertex_formats();
       test_class_linkage();
+      test_shader_query_gaps();
       test_creation_and_interop();
       test_render_to_levels();
       test_fixed_state();
       test_sampler_state();
+      test_depth_textures_11();
       test_texture_uavs();
       test_pixel_texture_uavs();
       test_layered_target();

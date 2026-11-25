@@ -59,7 +59,8 @@ typedef struct SoftDesc {
                             * the element format of a typed view (0: raw or structured), and an unordered access view's counter - the kernel's allocation and the word's offset (0: none).
                             * A texture's shader resource view (DK_SRV): 0, then its plane of a depth buffer (SRV_STENCIL: the stencil), 0, 0.
                             * A sampler (DK_SAMPLER) keeps its comparison in `offset` (sampler_comparison: the kernel's Descriptor offset low word), its anisotropy in `format` (1: none),
-                            * in `pad` 1 when it has a border colour of its own (an address mode BORDER) and that colour's bits in `size` (red, green << 32), `slice` (blue) and `stride` (alpha) */
+                            * in `pad` 1 when it has a border colour of its own (an address mode BORDER) and that colour's bits in `size` (red, green << 32), `slice` (blue) and `stride` (alpha),
+                            * and in `dimension` 1 when its coordinates are in texels (D3D12_SAMPLER_FLAG_NON_NORMALIZED_COORDINATES: the filter word's bit 8) */
   UINT dimension;
   UINT slice;              /* the first layer of a view of layers */
   UINT stride;             /* buffer unordered access views: the bytes of an element (ClearUnorderedAccessView* rectangles count elements); render target, depth stencil and
@@ -176,6 +177,37 @@ static void plane_srv(Resource *r, DXGI_FORMAT format, UINT plane, UINT first, U
   d->size = alternate ? SRV_ALTERNATE | alternate : 0;
 }
 
+/* The family of a narrow format: 1 R8, 2 R8G8, 3 R16, 4 R16G16 (each with its typeless, unorm, snorm, uint, sint and - 16-bit - float forms; D3D12's casting within a typeless
+ * family), 0 for the others. */
+static UINT narrow_family(DXGI_FORMAT f) {
+  switch (f) {
+    case DXGI_FORMAT_R8_TYPELESS: case DXGI_FORMAT_R8_UNORM: case DXGI_FORMAT_R8_SNORM: case DXGI_FORMAT_R8_UINT: case DXGI_FORMAT_R8_SINT: return 1;
+    case DXGI_FORMAT_R8G8_TYPELESS: case DXGI_FORMAT_R8G8_UNORM: case DXGI_FORMAT_R8G8_SNORM: case DXGI_FORMAT_R8G8_UINT: case DXGI_FORMAT_R8G8_SINT: return 2;
+    case DXGI_FORMAT_R16_TYPELESS: case DXGI_FORMAT_R16_UNORM: case DXGI_FORMAT_R16_SNORM: case DXGI_FORMAT_R16_UINT: case DXGI_FORMAT_R16_SINT: case DXGI_FORMAT_R16_FLOAT: return 3;
+    case DXGI_FORMAT_R16G16_TYPELESS: case DXGI_FORMAT_R16G16_UNORM: case DXGI_FORMAT_R16G16_SNORM: case DXGI_FORMAT_R16G16_UINT: case DXGI_FORMAT_R16G16_SINT: case DXGI_FORMAT_R16G16_FLOAT:
+      return 4;
+    default: return 0;
+  }
+}
+/* How a view of `f` sees a typeless narrow texture the kernel keeps natively (format_native_narrow): 0 as its own image (the resource's format, UNKNOWN, or the unorm one of its
+ * family), 1 through a mirror in the kernel format *kformat (the family's other kinds; the adapter samples it, and `need` - KFC_* - of it), -1 not at all (another family, a
+ * typeless view format, or a kind the adapter lacks). Any other texture: 0. */
+static int typed_view_kind(const Dev *dev, const Resource *r, DXGI_FORMAT f, UINT need, UINT *kformat) {
+  *kformat = 0;
+  if (!format_native_narrow(r->fmt) || f == DXGI_FORMAT_UNKNOWN || f == r->desc.Format) return 0;
+  if (narrow_family(f) != narrow_family(r->desc.Format)) return -1;
+  const FormatInfo *native = native_narrow_entry(f);
+  if (native && native->kernel == r->fmt->kernel) return 0;      /* (the unorm view of the family's typeless texture) */
+  const FormatInfo *vf = format_info(f);
+  if (!vf || native || vf->narrow || !vf->kernel || vf->kernel < KF_FIRST_EXTRA) return -1;      /* (a typeless one: no view of that format) */
+  const UINT caps = dev_format_caps(dev, vf->kernel);
+  if ((caps & (KFC_SAMPLED | need)) != (KFC_SAMPLED | need)) return -1;
+  *kformat = vf->kernel;
+  return 1;
+}
+/* The channels of a narrow family's view as a write mask (red, or red and green). */
+static UINT narrow_family_mask(DXGI_FORMAT f) { const UINT n = narrow_family(f); return n == 2 || n == 4 ? 0x3 : 0x1; }
+
 static int view_layers_at(const Resource *r, UINT level, UINT first, UINT size, UINT *out_first, UINT *out_count);
 static int view_layers(const Resource *r, UINT first, UINT size, UINT *out_first, UINT *out_count) { return view_layers_at(r, 0, first, size, out_first, out_count); }
 
@@ -183,28 +215,37 @@ static int view_layers(const Resource *r, UINT first, UINT size, UINT *out_first
  * array slices of an array view (a TEXTURE2D / TEXTURE1D view: the first slice alone), a cube's six faces from the first, a cube array's six for each cube from First2DArrayFace.
  * 0 for levels or layers the resource does not have. */
 static int srv_view(const Resource *r, const D3D12_SHADER_RESOURCE_VIEW_DESC *desc, SoftDesc *d) {
-  d->mip = 0, d->stride = 0, d->slice = 0, d->pad = 0;
+  d->mip = 0, d->stride = 0, d->slice = 0, d->pad = 0, d->sampler[2] = 0;
   if (!desc) return 1;
   UINT first_level = 0, levels = 0xFFFFFFFFu, first = 0, count = 0xFFFFFFFFu;
+  FLOAT clamp = 0.0f;
   switch (desc->ViewDimension) {
-    case D3D12_SRV_DIMENSION_TEXTURE1D: first_level = desc->Texture1D.MostDetailedMip, levels = desc->Texture1D.MipLevels, count = 1; break;
+    case D3D12_SRV_DIMENSION_TEXTURE1D: first_level = desc->Texture1D.MostDetailedMip, levels = desc->Texture1D.MipLevels, count = 1, clamp = desc->Texture1D.ResourceMinLODClamp; break;
     case D3D12_SRV_DIMENSION_TEXTURE1DARRAY:
       first_level = desc->Texture1DArray.MostDetailedMip, levels = desc->Texture1DArray.MipLevels, first = desc->Texture1DArray.FirstArraySlice, count = desc->Texture1DArray.ArraySize;
+      clamp = desc->Texture1DArray.ResourceMinLODClamp;
       break;
-    case D3D12_SRV_DIMENSION_TEXTURE2D: first_level = desc->Texture2D.MostDetailedMip, levels = desc->Texture2D.MipLevels, count = 1; break;
+    case D3D12_SRV_DIMENSION_TEXTURE2D: first_level = desc->Texture2D.MostDetailedMip, levels = desc->Texture2D.MipLevels, count = 1, clamp = desc->Texture2D.ResourceMinLODClamp; break;
     case D3D12_SRV_DIMENSION_TEXTURE2DARRAY:
       first_level = desc->Texture2DArray.MostDetailedMip, levels = desc->Texture2DArray.MipLevels, first = desc->Texture2DArray.FirstArraySlice, count = desc->Texture2DArray.ArraySize;
+      clamp = desc->Texture2DArray.ResourceMinLODClamp;
       break;
     case D3D12_SRV_DIMENSION_TEXTURE2DMS: count = 1; break;
     case D3D12_SRV_DIMENSION_TEXTURE2DMSARRAY: first = desc->Texture2DMSArray.FirstArraySlice, count = desc->Texture2DMSArray.ArraySize; break;
-    case D3D12_SRV_DIMENSION_TEXTURE3D: first_level = desc->Texture3D.MostDetailedMip, levels = desc->Texture3D.MipLevels; break;
-    case D3D12_SRV_DIMENSION_TEXTURECUBE: first_level = desc->TextureCube.MostDetailedMip, levels = desc->TextureCube.MipLevels, count = 6; break;
+    case D3D12_SRV_DIMENSION_TEXTURE3D: first_level = desc->Texture3D.MostDetailedMip, levels = desc->Texture3D.MipLevels, clamp = desc->Texture3D.ResourceMinLODClamp; break;
+    case D3D12_SRV_DIMENSION_TEXTURECUBE:
+      first_level = desc->TextureCube.MostDetailedMip, levels = desc->TextureCube.MipLevels, count = 6, clamp = desc->TextureCube.ResourceMinLODClamp;
+      break;
     case D3D12_SRV_DIMENSION_TEXTURECUBEARRAY:
       first_level = desc->TextureCubeArray.MostDetailedMip, levels = desc->TextureCubeArray.MipLevels, first = desc->TextureCubeArray.First2DArrayFace;
       count = desc->TextureCubeArray.NumCubes > 0xFFFFFFFFu / 6 ? 0 : desc->TextureCubeArray.NumCubes * 6;
+      clamp = desc->TextureCubeArray.ResourceMinLODClamp;
       break;
     default: return 1;      /* (UNKNOWN: the whole of it) */
   }
+  /* (ResourceMinLODClamp: the most detailed level a lookup takes, counted in the resource's levels - not the view's -, which the kernel raises the sampler's MinLOD to (the
+   * descriptor's min_lod word); below 0 or not a number is no clamp, as the debug layer's error leaves it on Windows, and a clamp past the view's last level reads its last) */
+  if (clamp > 0.0f) d->sampler[2] = bits_of(clamp > 1000.0f ? 1000.0f : clamp);
   if (first_level >= r->mips || (levels != 0xFFFFFFFFu && (levels == 0 || levels > r->mips - first_level))) return 0;
   const UINT layers = r->kind == 0 || r->kind == 1 ? 1 : r->layers;
   if (count == 0xFFFFFFFFu) count = first < layers ? layers - first : 0;
@@ -221,8 +262,9 @@ static int srv_view(const Resource *r, const D3D12_SHADER_RESOURCE_VIEW_DESC *de
  * format names the plane, as DXGI's are: the depth of D32_FLOAT / R32_TYPELESS through R32_FLOAT, of D16_UNORM / R16_TYPELESS through R16_UNORM, of D24_UNORM_S8_UINT /
  * R24G8_TYPELESS through R24_UNORM_X8_TYPELESS (PlaneSlice 0) and of D32_FLOAT_S8X24_UINT / R32G8X24_TYPELESS through R32_FLOAT_X8X24_TYPELESS; the stencil through
  * X24_TYPELESS_G8_UINT / X32_TYPELESS_G8X24_UINT (PlaneSlice 1), read as integers in green. The depth reads as (depth, 0, 0, 1) - every depth is a float in the kernel, so
- * a D16 or D24 buffer's is not rounded to its bits. A 2D view, or a 2D array or cube view of a depth buffer of several slices; one level (a depth buffer has one). Any other
- * format, a typed depth format, or a buffer that cannot be read is a null view (the debug layer's error on Windows). */
+ * a D16 or D24 buffer's is not rounded to its bits. A 1D or 2D view (of a slice of an array too), an array view of any of its slices, a cube or a cube array view of its faces,
+ * of any of its levels from MostDetailedMip, with a ResourceMinLODClamp, as for a colour texture (srv_view). Any other format, a typed depth format, a dimension it cannot be seen
+ * as (a volume, multisampled) or a buffer that cannot be read is a null view (the debug layer's error on Windows). */
 static void depth_srv(const Resource *r, const D3D12_SHADER_RESOURCE_VIEW_DESC *desc, SoftDesc *d) {
   d->kind = 0;
   if (!desc || r->desc.SampleDesc.Count > 1) return;
@@ -239,24 +281,20 @@ static void depth_srv(const Resource *r, const D3D12_SHADER_RESOURCE_VIEW_DESC *
     case DXGI_FORMAT_X32_TYPELESS_G8X24_UINT: if (!d32s8) return; stencil = 1; break;
     default: return;
   }
-  UINT plane = 0, mip = 0, levels = 1;
+  UINT plane = 0;
+  const int cube = r->kind == 3 || r->kind == 5 || (r->kind == 2 && r->layers % 6 == 0);      /* (an array of whole cubes may be seen as cubes) */
   switch (desc->ViewDimension) {
-    case D3D12_SRV_DIMENSION_TEXTURE2D: plane = desc->Texture2D.PlaneSlice; mip = desc->Texture2D.MostDetailedMip; levels = desc->Texture2D.MipLevels; if (r->kind != 0) return; break;
-    case D3D12_SRV_DIMENSION_TEXTURE1D: mip = desc->Texture1D.MostDetailedMip; levels = desc->Texture1D.MipLevels; if (r->kind != 0) return; break;
-    case D3D12_SRV_DIMENSION_TEXTURE2DARRAY: {
-      plane = desc->Texture2DArray.PlaneSlice; mip = desc->Texture2DArray.MostDetailedMip; levels = desc->Texture2DArray.MipLevels;
-      UINT first = 0, count = 0;
-      if (r->kind != 2 || !view_layers(r, desc->Texture2DArray.FirstArraySlice, desc->Texture2DArray.ArraySize, &first, &count) || first != 0 || count != r->layers) return;      /* (all of an array: the kernel's array image) */
-      break;
-    }
-    case D3D12_SRV_DIMENSION_TEXTURECUBE: mip = desc->TextureCube.MostDetailedMip; levels = desc->TextureCube.MipLevels; if (r->kind != 3) return; break;
+    case D3D12_SRV_DIMENSION_TEXTURE2D: plane = desc->Texture2D.PlaneSlice; break;
+    case D3D12_SRV_DIMENSION_TEXTURE2DARRAY: plane = desc->Texture2DArray.PlaneSlice; break;
+    case D3D12_SRV_DIMENSION_TEXTURE1D: case D3D12_SRV_DIMENSION_TEXTURE1DARRAY: break;
+    case D3D12_SRV_DIMENSION_TEXTURECUBE: case D3D12_SRV_DIMENSION_TEXTURECUBEARRAY: if (!cube) return; break;
     default: return;
   }
   /* (the plane the format names: 1 the stencil's) */
-  if (plane != (UINT)stencil || mip != 0 || (levels != 1 && levels != 0xFFFFFFFFu)) return;
+  if (plane != (UINT)stencil || r->kind == 1) return;
   d->kind = DK_SRV;
   d->alloc = r->alloc;
-  if (!srv_view(r, desc, d)) { d->kind = 0; return; }      /* (its levels and layers: all of them) */
+  if (!srv_view(r, desc, d)) { d->kind = 0; return; }      /* (its levels and layers, and the clamp) */
   d->sampler[1] = stencil ? SRV_STENCIL : 0;
 }
 
@@ -307,6 +345,21 @@ static void STDMETHODCALLTYPE dev_CreateShaderResourceView(Dev *This, ID3D12Reso
       /* (a packed YUV texture is seen through a view of its pixels' format only) */
       if (format_packed_yuv(r->desc.Format) && (!desc || !packed_yuv_view_ok(r->desc.Format, desc->Format, 0))) d.kind = 0;
       if (!r->planes && !srv_view(r, desc, &d)) d.kind = 0;      /* (the levels and layers it shows) */
+      /* (a typeless narrow texture the kernel keeps natively, seen as another kind of its family: through a mirror of the view's levels and layers in the view's format, which the
+       * kernel brings up to date when the view is used; the view is then all of the mirror. Not of a volume: a mirror is 2D or an array) */
+      UINT kf = 0;
+      const int typed = d.kind && desc ? typed_view_kind(This, r, desc->Format, 0, &kf) : 0;
+      if (typed < 0) d.kind = 0;
+      if (typed > 0) {
+        const UINT layers = r->kind == 0 || r->kind == 1 ? 1 : r->layers;
+        const UINT levels = d.stride ? d.stride : r->mips - d.mip, count = d.pad ? d.pad : layers - d.slice;
+        const int array = desc->ViewDimension == D3D12_SRV_DIMENSION_TEXTURE2DARRAY || desc->ViewDimension == D3D12_SRV_DIMENSION_TEXTURE1DARRAY ||
+                          desc->ViewDimension == D3D12_SRV_DIMENSION_TEXTURECUBE || desc->ViewDimension == D3D12_SRV_DIMENSION_TEXTURECUBEARRAY;
+        d.alloc = r->kind == 1 ? 0 : typed_mirror(r, kf, d.mip, levels, d.slice, count, array, 0, 0);
+        d.mip = d.stride = d.slice = d.pad = 0;
+        d.offset = SRV_MIRRORS;
+        if (!d.alloc) d.kind = 0;
+      }
       if (r->planes) {
         if (desc && desc->ViewDimension == D3D12_SRV_DIMENSION_TEXTURE2DARRAY)
           plane_srv(r, desc->Format, desc->Texture2DArray.PlaneSlice, desc->Texture2DArray.FirstArraySlice, desc->Texture2DArray.ArraySize, 1, &d);
@@ -377,6 +430,27 @@ static void texture_uav(Dev *dev, Resource *r, const D3D12_UNORDERED_ACCESS_VIEW
   const int plane_integer = r->planes && plane_integer_view(r, format, &probe_plane, &probe_channels);
   if (!ok || (!vf && !plane_integer) || (vf && (vf->depth || vf->compressed || vf->kernel == KF_BGRA8_SRGB || vf->kernel == KF_RGBA8_SRGB)) || mip >= r->mips) return;
   if (format_packed_yuv(r->desc.Format) && !packed_yuv_view_ok(r->desc.Format, format, 0)) return;      /* (a packed YUV texture: through a view of its pixels' format) */
+  if (format_native_narrow(r->fmt)) {
+    /* (a narrow texture the kernel keeps natively: its own format's view - and the unorm one of a typeless texture - is of its image; another kind of its family is a write-back
+     * mirror of the view's level and layers in the view's format, its channels given back after each dispatch or pass) */
+    UINT kf = 0;
+    const int typed = typed_view_kind(dev, r, format, KFC_STORAGE, &kf);
+    if (typed < 0) return;
+    if (typed > 0) {
+      const int array = dim == D3D12_UAV_DIMENSION_TEXTURE2DARRAY || dim == D3D12_UAV_DIMENSION_TEXTURE1DARRAY;
+      d->alloc = typed_mirror(r, kf, mip, 1, first, count, array, MIRROR_WRITE_BACK | MIRROR_UAV, narrow_family_mask(format));
+      if (!d->alloc) return;
+      d->mip = 0, d->slice = 0, d->stride = count;
+      d->format = format;
+      d->dimension = dim;
+      d->offset = SRV_MIRRORS;
+      d->pad = (first & 0xFF) << 8 | mip << 16;      /* (what a clear writes: the texture's level and first layer, the bytes as they are - no narrow copy) */
+      d->size = (UINT64)r->alloc;
+      d->kind = DK_UAV_TEXTURE;
+      return;
+    }
+    vf = r->fmt;
+  }
   d->mip = mip;
   d->slice = first;
   d->stride = count;
@@ -391,10 +465,9 @@ static void texture_uav(Dev *dev, Resource *r, const D3D12_UNORDERED_ACCESS_VIEW
       if (r->planes && r->planes == 2) plane = vf->narrow == NARROW_R8G8 || vf->narrow == NARROW_R16G16 ? 1 : 0;
       channels = format_write_mask(format);
     }
-    /* (a narrow texture's mirror is of its one image, or - on a device with levels of every image - of the view's level and layers of it: narrow_mirror; not of a volume's slices, which a
-     * mirror - an array - cannot be the kind of) */
+    /* (a narrow texture's mirror is of its one image, or - on a device with levels of every image - of the view's level and layers of it, a volume's of the view's slices at its
+     * level: narrow_mirror) */
     const int levels_mirror = !r->planes && (r->kind != 0 || r->mips != 1);
-    if (levels_mirror && r->kind == 1) return;
     if (r->planes ? plane >= r->planes : plane != 0) return;
     const UINT source = r->planes ? (first < r->layers ? r->plane_alloc[plane * r->layers + first] : 0) : r->alloc;
     const UINT mirror_mode = (integer ? MIRROR_INTEGER : 0) | MIRROR_WRITE_BACK | MIRROR_UAV;
@@ -481,6 +554,19 @@ static void STDMETHODCALLTYPE dev_CreateRenderTargetView(Dev *This, ID3D12Resour
     /* (a level the resource has, on a device that draws into levels; a volume's slices of it) */
     if (d.mip >= r->mips || (d.mip && !(This->caps.features2 & DEV_FEATURE2_MIPMAPPED_LAYERS))) d.kind = 0;
     if (format_packed_yuv(r->desc.Format) && (!desc || !packed_yuv_view_ok(r->desc.Format, desc->Format, 1))) d.kind = 0;
+    {
+      /* (a typeless narrow texture the kernel keeps natively drawn into as another kind of its family: a write-back mirror of the view's level and layers, its channels given back
+       * after each pass) */
+      UINT kf = 0;
+      const int typed = d.kind && desc && !r->planes ? typed_view_kind(This, r, desc->Format, KFC_RENDER_TARGET, &kf) : 0;
+      if (typed < 0) d.kind = 0;
+      if (typed > 0) {
+        const int array = desc->ViewDimension == D3D12_RTV_DIMENSION_TEXTURE2DARRAY || desc->ViewDimension == D3D12_RTV_DIMENSION_TEXTURE1DARRAY;
+        d.alloc = (r->desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET) && r->kind != 1 ? typed_mirror(r, kf, d.mip, 1, d.slice, d.stride, array, MIRROR_WRITE_BACK, narrow_family_mask(desc->Format)) : 0;
+        d.mip = 0, d.slice = 0;
+        if (!d.alloc) d.kind = 0;
+      }
+    }
     if (r->planes) {
       UINT plane = 0, slice = 0, count = 1, channels = 0;
       if (desc && desc->ViewDimension == D3D12_RTV_DIMENSION_TEXTURE2D) plane = desc->Texture2D.PlaneSlice;
@@ -535,14 +621,23 @@ static void STDMETHODCALLTYPE dev_CreateDepthStencilView(Dev *This, ID3D12Resour
   desc_write(handle, &d);
 }
 
-/* The words of a sampler (D3D12_FILTER / D3D12_TEXTURE_ADDRESS_MODE) the way the kernel has them: the first word packs filter, address modes and mip filter; rest[0..2] are the
- * LOD bias, minimum and maximum LOD as bits. An address byte is the kernel's mode (0 wrap, 1 clamp, 2 mirror, 3 border, 4 mirror once) and, in the byte of U, the border colour
- * in bits 4-5 (0 transparent black, 1 opaque black, 2 opaque white: the three a static sampler can have; another colour is the nearest of them). A device with wrap and
- * clamp alone uses the nearer of the two (the kernel does that). */
+/* The words of a sampler (D3D12_FILTER / D3D12_TEXTURE_ADDRESS_MODE) the way the kernel has them: the first word packs the filter word, address modes and mip filter; rest[0..2] are
+ * the LOD bias, minimum and maximum LOD as bits. The filter word (the low byte; dxgk::filter_word) is the minification filter in bit 0, in bit 1 that the magnification filter is
+ * another, in bit 2 that one, in bits 4-5 the reduction (1 minimum, 2 maximum); its bit 8 - coordinates in texels - is the descriptor's `dimension`. An address byte is the kernel's
+ * mode (0 wrap, 1 clamp, 2 mirror, 3 border, 4 mirror once) and, in the byte of U, the border colour in bits 4-5 (0 transparent black, 1 opaque black, 2 opaque white: the three a
+ * static sampler can have; another colour is the nearest of them). A device with wrap and clamp alone uses the nearer of the two (the kernel does that). */
 static float lod_within(float value, float limit) { return !(value == value) ? 0.0f : value > limit ? limit : value < -limit ? -limit : value; }
+/* Whether `filter` is a D3D12_FILTER (bit 0 mip, bit 2 mag, bit 4 min - 1 linear -, bit 6 anisotropic, with min and mag linear and - AnisoFilterWithPointMipSupported - mip linear or
+ * point, bits 7-8 the reduction: standard, comparison, minimum, maximum). */
+static int d3d12_filter_valid(UINT filter) {
+  if (filter & ~0x1D5u) return 0;
+  return !(filter & 0x40u) || (filter & 0x14u) == 0x14u;
+}
 static UINT sampler_words(UINT filter, UINT au, UINT av, const float *border, float bias, float min_lod, float max_lod, UINT *rest) {
-  const UINT linear = (filter & 0x14u) != 0 || filter == D3D12_FILTER_ANISOTROPIC;
-  const UINT mip = (max_lod <= 0.0f) ? 0u : (((filter & 1u) || filter == D3D12_FILTER_ANISOTROPIC) ? 2u : 1u);
+  const UINT min_linear = (filter & 0x10u) ? 1u : 0u, mag_linear = (filter & 0x04u) ? 1u : 0u;      /* (anisotropic: both linear, d3d12_filter_valid) */
+  const UINT reduction = (filter >> 7) & 3u;
+  const UINT word = min_linear | (min_linear != mag_linear ? 2u | (mag_linear << 2) : 0u) | ((reduction == 2 ? 1u : reduction == 3 ? 2u : 0u) << 4);
+  const UINT mip = (max_lod <= 0.0f) ? 0u : ((filter & 1u) ? 2u : 1u);
   UINT a[2] = {au, av};
   for (int i = 0; i < 2; ++i)
     a[i] = a[i] == D3D12_TEXTURE_ADDRESS_MODE_WRAP ? 0u : a[i] == D3D12_TEXTURE_ADDRESS_MODE_MIRROR ? 2u : a[i] == D3D12_TEXTURE_ADDRESS_MODE_BORDER ? 3u :
@@ -553,7 +648,7 @@ static UINT sampler_words(UINT filter, UINT au, UINT av, const float *border, fl
   rest[0] = bits_of(lod_within(bias, 100.0f));
   rest[1] = bits_of(lod_within(min_lod, 100.0f));
   rest[2] = bits_of(lod_within(max_lod, 1000.0f));
-  return linear | (a[0] << 8) | (a[1] << 16) | (mip << 24);
+  return word | (a[0] << 8) | (a[1] << 16) | (mip << 24);
 }
 
 /* The comparison a sampler's lookups (SampleCmp, GatherCmp) make, as the kernel has it (graphics::CompareOp: never 0 .. always 7): a comparison filter's function (D3D12_COMPARISON_FUNC
@@ -562,24 +657,61 @@ static UINT sampler_comparison(UINT filter, UINT func) {
   if (((filter >> 7) & 3u) != 1u || func < D3D12_COMPARISON_FUNC_NEVER || func > D3D12_COMPARISON_FUNC_ALWAYS) return 0;
   return func - D3D12_COMPARISON_FUNC_NEVER;
 }
+/* Whether a non-normalized sampler (D3D12_SAMPLER_FLAG_NON_NORMALIZED_COORDINATES) keeps Direct3D 12's rules: min and mag filter alike and a point mip filter, no anisotropy or
+ * comparison (MIN_MAG_MIP_POINT, MIN_MAG_LINEAR_MIP_POINT and their MINIMUM_ / MAXIMUM_ forms), clamp or border addressing in U and V, MinLOD and MaxLOD 0. */
+static int unnormalized_sampler_ok(const D3D12_SAMPLER_DESC2 *d) {
+  const UINT f = (UINT)d->Filter & ~0x180u, reduction = ((UINT)d->Filter >> 7) & 3u;
+  if ((f != 0x00u && f != 0x14u) || reduction == 1) return 0;
+  if ((d->AddressU != D3D12_TEXTURE_ADDRESS_MODE_CLAMP && d->AddressU != D3D12_TEXTURE_ADDRESS_MODE_BORDER) ||
+      (d->AddressV != D3D12_TEXTURE_ADDRESS_MODE_CLAMP && d->AddressV != D3D12_TEXTURE_ADDRESS_MODE_BORDER))
+    return 0;
+  return d->MinLOD == 0.0f && d->MaxLOD == 0.0f;
+}
+/* A sampler descriptor from D3D12_SAMPLER_DESC2 (CreateSampler's description is one with no flags). The border colour of a sampler with a BORDER address mode is the kernel's
+ * colour of any value (on devices with kFeature2SamplerState; the nearest of transparent black, opaque black and white - sampler_words' - on the others): the floats as their bits,
+ * or - D3D12_SAMPLER_FLAG_UINT_BORDER_COLOR - the integers, which an integer texture's channels are in the kernel. Coordinates in texels (NON_NORMALIZED_COORDINATES) need the
+ * device's kFeature2UnnormalizedCoordinates (NonNormalizedCoordinateSamplersSupported, OPTIONS17) and Direct3D 12's rules for them; a description that breaks the rules - a filter
+ * that is not one, flags that do not exist - is an invalid call, and its descriptor a null one. */
+static void sampler_descriptor(Dev *This, const D3D12_SAMPLER_DESC2 *desc, SoftDesc *d) {
+  memset(d, 0, sizeof *d);
+  if (!desc) return;
+  const UINT flags = (UINT)desc->Flags;
+  if (!d3d12_filter_valid((UINT)desc->Filter) || (flags & ~(UINT)(D3D12_SAMPLER_FLAG_UINT_BORDER_COLOR | D3D12_SAMPLER_FLAG_NON_NORMALIZED_COORDINATES))) return;
+  if ((flags & D3D12_SAMPLER_FLAG_NON_NORMALIZED_COORDINATES) && (!(This->caps.features2 & DEV_FEATURE2_UNNORMALIZED_COORDINATES) || !unnormalized_sampler_ok(desc))) return;
+  const int uint_border = (flags & D3D12_SAMPLER_FLAG_UINT_BORDER_COLOR) != 0;
+  float nearest[4];
+  for (UINT c = 0; c < 4; ++c) nearest[c] = uint_border ? (desc->UintBorderColor[c] ? 1.0f : 0.0f) : desc->FloatBorderColor[c];
+  d->kind = DK_SAMPLER;
+  d->sampler[0] = sampler_words(desc->Filter, desc->AddressU, desc->AddressV, nearest, desc->MipLODBias, desc->MinLOD, desc->MaxLOD, &d->sampler[1]);
+  d->dimension = (flags & D3D12_SAMPLER_FLAG_NON_NORMALIZED_COORDINATES) ? 1u : 0u;      /* (the filter word's bit 8) */
+  d->offset = sampler_comparison(desc->Filter, desc->ComparisonFunc);
+  /* (the anisotropic filters' MaxAnisotropy, 1 .. 16 - plain, comparing, minimum, maximum, with a linear or a point mip filter) */
+  const UINT anisotropic = ((UINT)desc->Filter & 0x40u) != 0;
+  d->format = anisotropic ? (desc->MaxAnisotropy < 1 ? 1 : desc->MaxAnisotropy > 16 ? 16 : desc->MaxAnisotropy) : 1;
+  if (desc->AddressU == D3D12_TEXTURE_ADDRESS_MODE_BORDER || desc->AddressV == D3D12_TEXTURE_ADDRESS_MODE_BORDER || desc->AddressW == D3D12_TEXTURE_ADDRESS_MODE_BORDER) {
+    UINT bits[4];
+    for (UINT c = 0; c < 4; ++c) bits[c] = uint_border ? desc->UintBorderColor[c] : bits_of(desc->FloatBorderColor[c]);
+    d->pad = 1;
+    d->size = (UINT64)bits[0] | (UINT64)bits[1] << 32;
+    d->slice = bits[2];
+    d->stride = bits[3];
+  }
+}
 static void STDMETHODCALLTYPE dev_CreateSampler(Dev *This, const D3D12_SAMPLER_DESC *desc, D3D12_CPU_DESCRIPTOR_HANDLE handle) {
   SoftDesc d;
-  memset(&d, 0, sizeof d);
   if (desc) {
-    d.kind = DK_SAMPLER;
-    d.sampler[0] = sampler_words(desc->Filter, desc->AddressU, desc->AddressV, desc->BorderColor, desc->MipLODBias, desc->MinLOD, desc->MaxLOD, &d.sampler[1]);
-    d.offset = sampler_comparison(desc->Filter, desc->ComparisonFunc);
-    /* (the anisotropic filters' MaxAnisotropy, 1 .. 16; the border colour as it is: the kernel's sampler has any colour on the devices with kFeature2SamplerState, the nearest
-     * of black, opaque black and white - sampler_words' - on the others) */
-    const UINT anisotropic = desc->Filter == D3D12_FILTER_ANISOTROPIC || desc->Filter == D3D12_FILTER_COMPARISON_ANISOTROPIC || desc->Filter == D3D12_FILTER_MINIMUM_ANISOTROPIC ||
-                             desc->Filter == D3D12_FILTER_MAXIMUM_ANISOTROPIC;
-    d.format = anisotropic ? (desc->MaxAnisotropy < 1 ? 1 : desc->MaxAnisotropy > 16 ? 16 : desc->MaxAnisotropy) : 1;
-    if (desc->AddressU == D3D12_TEXTURE_ADDRESS_MODE_BORDER || desc->AddressV == D3D12_TEXTURE_ADDRESS_MODE_BORDER || desc->AddressW == D3D12_TEXTURE_ADDRESS_MODE_BORDER) {
-      d.pad = 1;
-      d.size = (UINT64)bits_of(desc->BorderColor[0]) | (UINT64)bits_of(desc->BorderColor[1]) << 32;
-      d.slice = bits_of(desc->BorderColor[2]);
-      d.stride = bits_of(desc->BorderColor[3]);
-    }
+    D3D12_SAMPLER_DESC2 d2;
+    memset(&d2, 0, sizeof d2);
+    d2.Filter = desc->Filter;
+    d2.AddressU = desc->AddressU, d2.AddressV = desc->AddressV, d2.AddressW = desc->AddressW;
+    d2.MipLODBias = desc->MipLODBias;
+    d2.MaxAnisotropy = desc->MaxAnisotropy;
+    d2.ComparisonFunc = desc->ComparisonFunc;
+    for (UINT c = 0; c < 4; ++c) d2.FloatBorderColor[c] = desc->BorderColor[c];
+    d2.MinLOD = desc->MinLOD, d2.MaxLOD = desc->MaxLOD;
+    sampler_descriptor(This, &d2, &d);
+  } else {
+    sampler_descriptor(This, NULL, &d);
   }
   desc_write(handle, &d);
 }
@@ -658,7 +790,7 @@ static void dheap_sync(DescHeap *h) {
       }
       request[w++] = d->kind == DK_SAMPLER ? 0 : (UINT)d->size;
       request[w++] = d->kind == DK_SAMPLER ? 0 : (UINT)(d->size >> 32);
-      request[w++] = d->sampler[0] & 0xFF;
+      request[w++] = (d->sampler[0] & 0xFF) | (d->kind == DK_SAMPLER && d->dimension ? 0x100u : 0u);      /* (the filter word; a sampler's coordinates in texels: bit 8) */
       request[w++] = ((d->sampler[0] >> 8) & 0xF) | (((d->sampler[0] >> 12) & 0xF) << 8);      /* (the mode, and the border colour above it) */
       request[w++] = (d->sampler[0] >> 16) & 0xFF;
       request[w++] = (d->sampler[0] >> 24) & 0xFF;

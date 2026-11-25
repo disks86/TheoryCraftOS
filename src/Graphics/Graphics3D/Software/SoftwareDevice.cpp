@@ -150,6 +150,7 @@ class SoftwareImage final : public IImage {
     for (uint8_t& v : stencil_) v = 0;
   }
   ~SoftwareImage() {
+    release_view(allocator_, residency_);
     release_view(allocator_, color_);
     release_view(allocator_, hdr_);
     release_view(allocator_, depth_);
@@ -270,6 +271,42 @@ class SoftwareImage final : public IImage {
     }
     return true;
   }
+  // The planes of a depth image (kFeature2DepthCopies): as the device keeps them, floats and bytes.
+  bool read_depth_subresource(uint32_t level, uint32_t layer, ArrayView<float> depth, ArrayView<uint8_t> stencil) override {
+    if (depth_.empty() || desc_.samples != 1 || !has(level, layer) || (!stencil.empty() && stencil_.empty())) return false;
+    const ArrayView<float> d = depth_layer(layer, level);
+    const ArrayView<uint8_t> s = stencil_layer(layer, level);
+    if (!depth.empty() && (depth.size() != d.size() || !depth.copy_from(d))) return false;
+    return stencil.empty() || (stencil.size() == s.size() && stencil.copy_from(s));
+  }
+  bool write_depth_subresource(uint32_t level, uint32_t layer, ArrayView<const float> depth, ArrayView<const uint8_t> stencil) override {
+    if (depth_.empty() || desc_.samples != 1 || !has(level, layer) || (!stencil.empty() && stencil_.empty())) return false;
+    const ArrayView<float> d = depth_layer(layer, level);
+    const ArrayView<uint8_t> s = stencil_layer(layer, level);
+    if ((!depth.empty() && depth.size() != d.size()) || (!stencil.empty() && stencil.size() != s.size())) return false;
+    for (uint64_t i = 0; i < depth.size(); ++i) {
+      const float v = depth[i];
+      d[i] = !(v == v) ? 0.0f : v < 0.0f ? 0.0f : v > 1.0f ? 1.0f : v;   // (a depth image keeps 0 .. 1)
+    }
+    return s.copy_from(stencil);
+  }
+  // A whole subresource of another image of this device: a depth image's planes, or a multisampled colour image's samples (and of any image of one sample, its texels).
+  bool copy_subresource(IImage& from, uint32_t level, uint32_t layer, uint32_t source_level, uint32_t source_layer, uint32_t planes) override {
+    SoftwareImage& source = static_cast<SoftwareImage&>(from);   // (the kernel copies between images of one device)
+    if (&source == this && level == source_level && layer == source_layer) return true;
+    if (source.desc_.format != desc_.format || source.desc_.samples != desc_.samples || source.desc_.stencil != desc_.stencil || !has(level, layer) ||
+        !source.has(source_level, source_layer) || level_pixels(level) != source.level_pixels(source_level) || level_extent(level).width != source.level_extent(source_level).width ||
+        planes == 0 || planes > 3)
+      return false;
+    if (!depth_.empty()) {
+      if ((planes & 2) && stencil_.empty()) return false;
+      if ((planes & 1) && !depth_layer(layer, level).copy_from(source.depth_layer(source_layer, source_level))) return false;
+      return !(planes & 2) || stencil_layer(layer, level).copy_from(source.stencil_layer(source_layer, source_level));
+    }
+    if (planes != 1) return false;
+    const Surface to = surface(level, layer), at = source.surface(source_level, source_layer);
+    return !hdr_.empty() ? to.floats.copy_from(at.floats) : to.pixels.copy_from(at.pixels);
+  }
   // Layer `layer` of level `level` (an empty surface for one the image does not have).
   Surface surface(uint32_t level = 0, uint32_t layer = 0) const {
     Surface s;
@@ -293,6 +330,48 @@ class SoftwareImage final : public IImage {
     return has(level, layer) && !stencil_.empty() ? stencil_.subview(level_offset_[level] + uint64_t{layer} * level_pixels(level), level_pixels(level)) : ArrayView<uint8_t>();
   }
 
+  // --- tiled images (kFeature2TileResidency)
+  bool set_residency(const ImageResidency& r) override {
+    const bool volume = desc_.kind == TextureKind::Texture3D;
+    if (!r.tile_width || !r.tile_height || !r.tile_depth || r.standard_levels > desc_.mip_levels || r.slices != (volume ? 1u : layer_count()) || desc_.samples != 1) return false;
+    uint64_t per_slice = 0;
+    for (uint32_t level = 0; level < r.standard_levels; ++level) {
+      const Extent2D e = level_extent(level);
+      residency_first_[level] = per_slice;
+      residency_columns_[level] = (e.width + r.tile_width - 1) / r.tile_width;
+      residency_rows_[level] = (e.height + r.tile_height - 1) / r.tile_height;
+      const uint64_t deep = volume ? (level_layers(level) + r.tile_depth - 1) / r.tile_depth : 1;
+      per_slice += uint64_t{residency_columns_[level]} * residency_rows_[level] * deep;
+    }
+    residency_tail_ = per_slice;
+    if (r.standard_levels < desc_.mip_levels) ++per_slice;   // (the coarser levels' one unit)
+    if (r.mapped.size() != per_slice * r.slices) return false;
+    if (residency_.size() != r.mapped.size()) {
+      release_view(allocator_, residency_);
+      residency_ = allocate_view<uint8_t>(allocator_, r.mapped.size());
+      if (residency_.size() != r.mapped.size()) return false;
+    }
+    for (uint64_t i = 0; i < r.mapped.size(); ++i) residency_[i] = r.mapped[i];
+    residency_info_ = r;
+    residency_info_.mapped = ConstByteView();
+    residency_per_slice_ = per_slice;
+    return true;
+  }
+  // Whether texel (x, y) of layer `layer` (a volume's slice) of level `level` lies in a mapped tile: always, for an image that is not tiled.
+  bool texel_mapped(uint32_t level, uint32_t layer, int64_t x, int64_t y) const {
+    if (residency_.empty() || x < 0 || y < 0) return true;
+    const bool volume = desc_.kind == TextureKind::Texture3D;
+    const uint64_t slice_base = (volume ? 0 : uint64_t{layer}) * residency_per_slice_;
+    uint64_t at = slice_base + residency_tail_;
+    if (level < residency_info_.standard_levels) {
+      const uint64_t z = volume ? layer / residency_info_.tile_depth : 0;
+      const uint64_t column = static_cast<uint64_t>(x) / residency_info_.tile_width, row = static_cast<uint64_t>(y) / residency_info_.tile_height;
+      if (column >= residency_columns_[level] || row >= residency_rows_[level]) return true;
+      at = slice_base + residency_first_[level] + (z * residency_rows_[level] + row) * residency_columns_[level] + column;
+    }
+    return at < residency_.size() ? residency_[at] != 0 : true;
+  }
+
  private:
   uint64_t level_pixels(uint32_t level) const { return uint64_t{mip_extent(desc_.extent.width, level)} * mip_extent(desc_.extent.height, level) * desc_.samples; }
   allocators::IAllocator& allocator_;
@@ -302,6 +381,12 @@ class SoftwareImage final : public IImage {
   ArrayView<float> depth_;
   ArrayView<uint8_t> stencil_;
   uint64_t level_offset_[kMaxMipLevels] = {};   // (in values, from the start of the storage)
+  // A tiled image's residency (set_residency): one byte per unit, the slices one after the other, each its standard levels' tiles and then its coarser levels' unit.
+  ArrayView<uint8_t> residency_;
+  ImageResidency residency_info_;
+  uint64_t residency_per_slice_ = 0, residency_tail_ = 0;
+  uint64_t residency_first_[kMaxMipLevels] = {};
+  uint32_t residency_columns_[kMaxMipLevels] = {}, residency_rows_[kMaxMipLevels] = {};
 };
 class SoftwareShaderModule final : public IShaderModule {
  public:
@@ -396,7 +481,7 @@ class TextureSet final : public ITextureSet {
   // Whether any bound unit reads mip levels or filters anisotropically: only then does a pixel need its quad's derivatives.
   bool uses_lod() const {
     for (uint32_t unit = 0; unit < kMaxTextureUnits; ++unit)
-      if (bound_[unit].image && ((bound_[unit].levels > 1 && samplers_[unit].mip_filter != MipFilter::None) || anisotropic(samplers_[unit]))) return true;
+      if (bound_[unit].image && ((bound_[unit].levels > 1 && samplers_[unit].mip_filter != MipFilter::None) || anisotropic(samplers_[unit]) || filters_differ(samplers_[unit]))) return true;
     return false;
   }
   // For the derivative passes: the next lookups record their first coordinates per unit and answer black.
@@ -436,8 +521,10 @@ class TextureSet final : public ITextureSet {
     const float rho_x = dx[0] * dx[0] + dx[1] * dx[1] + dx[2] * dx[2], rho_y = dy[0] * dy[0] + dy[1] * dy[1] + dy[2] * dy[2];
     float rho2 = rho_x > rho_y ? rho_x : rho_y;   // (the square of rho: log2(rho) is half of log2(rho2))
     aniso_count_[unit] = 1;
-    if (anisotropic(sampler) && rho2 > 0.0f && (b.kind == TextureKind::Texture2D || b.kind == TextureKind::Texture2DArray)) {   // (along (u, v): of a 2D image or an array)
-      // (the longer axis of the footprint, Pmax, and the shorter, Pmin: N lookups along the longer one at the level of Pmax / N)
+    if (anisotropic(sampler) && rho2 > 0.0f) {
+      // (the longer axis of the footprint, Pmax, and the shorter, Pmin: N lookups along the longer one at the level of Pmax / N. The axis is the change of the coordinate the
+      // lookups take from pixel to pixel: (u, v) of a 2D image or an array (w, the layer, stays), (u, v, w) of a volume, and of a cube or a cube array the direction - a step
+      // along the change of direction is a step along the footprint on the face, as the lengths above are measured there)
       const float p_max = sqrt_of(rho2), p_min = sqrt_of(rho_x > rho_y ? rho_y : rho_x);
       float ratio = p_min > 0.0f ? p_max / p_min : static_cast<float>(sampler.max_anisotropy);
       if (!(ratio < static_cast<float>(sampler.max_anisotropy))) ratio = static_cast<float>(sampler.max_anisotropy);
@@ -446,8 +533,8 @@ class TextureSet final : public ITextureSet {
       if (n < 1) n = 1;
       aniso_count_[unit] = n;
       const bool along_x = rho_x >= rho_y;
-      aniso_du_[unit] = along_x ? right[0] - anchor[0] : below[0] - anchor[0];
-      aniso_dv_[unit] = along_x ? right[1] - anchor[1] : below[1] - anchor[1];
+      const bool layered = b.kind == TextureKind::Texture2DArray;
+      for (uint32_t k = 0; k < 3; ++k) aniso_step_[unit][k] = k == 2 && layered ? 0.0f : along_x ? right[k] - anchor[k] : below[k] - anchor[k];
       rho2 /= static_cast<float>(n) * static_cast<float>(n);
     }
     float lambda = 0.5f * mip_log2(rho2) + sampler.lod_bias;
@@ -457,6 +544,19 @@ class TextureSet final : public ITextureSet {
   }
   void clear_lod() const {
     for (uint32_t unit = 0; unit < kMaxTextureUnits; ++unit) lambda_[unit] = 0.0f, aniso_count_[unit] = 1;
+  }
+
+  // Residency feedback and the lookups' own minimum level of detail (kFeature2TileResidency): see ITextureSet.
+  void begin_feedback(float min_lod) const override {
+    feedback_ = true;
+    unmapped_ = false;
+    min_lod_clamp_ = min_lod == min_lod ? min_lod : kNoClamp;
+  }
+  bool end_feedback() const override {
+    const bool mapped = !unmapped_;
+    feedback_ = unmapped_ = false;
+    min_lod_clamp_ = kNoClamp;
+    return mapped;
   }
 
   Vec4 sample_volume(uint32_t unit, float u, float v, float w) const override {
@@ -471,7 +571,7 @@ class TextureSet final : public ITextureSet {
     if (!b) return {0, 0, 0, 1};
     if (b->kind != TextureKind::TextureCubeArray) return sample_volume(unit, x, y, z);
     if (recording_) return record(unit, x, y, z);
-    return lookup(*b, samplers_[unit], x, y, z, cube, lambda_[unit]);
+    return anisotropic_lookup(unit, *b, x, y, z, cube);
   }
 
   Vec4 sample(uint32_t unit, float u, float v) const override {
@@ -556,7 +656,9 @@ class TextureSet final : public ITextureSet {
       int64_t l = floor_to(unit_coordinate(w) + 0.5f);
       layer = static_cast<uint32_t>(l < 0 ? 0 : l >= b->layers ? b->layers - 1 : l);
     }
-    const float lambda = level_zero ? 0.0f : lambda_[unit];
+    float lambda = level_zero ? 0.0f : lambda_[unit];
+    if (lambda < min_lod_clamp_) lambda = min_lod_clamp_;   // (a lookup's own clamp: SampleCmp with a clamp)
+    sampler = at_lod(sampler, lambda);
     return filtered(*b, sampler, lambda, [&](uint32_t level) {
       const float value = compare_level(view_plane(*b, level, layer), sampler, u, v, reference);
       return Vec4{value, value, value, value};
@@ -576,15 +678,19 @@ class TextureSet final : public ITextureSet {
  private:
   const Bound* bound_for(uint32_t unit) const { return unit < kMaxTextureUnits && bound_[unit].image ? &bound_[unit] : nullptr; }
   // A lookup with the unit's level of detail - of an anisotropic filter (aniso_count_ above 1, set_lod): that many lookups spread evenly over the longer axis of the footprint, averaged.
-  Vec4 anisotropic_lookup(uint32_t unit, const Bound& b, float u, float v, float w) const {
+  // (u, v, w as lookup takes them: a cube's direction, with `cube` the cube of a cube array)
+  Vec4 anisotropic_lookup(uint32_t unit, const Bound& b, float u, float v, float w, float cube = 0.0f) const {
     const uint32_t n = aniso_count_[unit];
-    if (n <= 1) return lookup(b, samplers_[unit], u, v, w, 0.0f, lambda_[unit]);
+    if (n <= 1) return lookup(b, samplers_[unit], u, v, w, cube, lambda_[unit]);
+    const SamplerReduction reduction = samplers_[unit].reduction;
     Vec4 sum{0, 0, 0, 0};
+    const float* step = aniso_step_[unit];
     for (uint32_t k = 0; k < n; ++k) {
       const float t = (static_cast<float>(k) + 0.5f) / static_cast<float>(n) - 0.5f;
-      sum = sum + lookup(b, samplers_[unit], u + aniso_du_[unit] * t, v + aniso_dv_[unit] * t, w, 0.0f, lambda_[unit]);
+      const Vec4 one = lookup(b, samplers_[unit], u + step[0] * t, v + step[1] * t, w + step[2] * t, cube, lambda_[unit]);
+      sum = reduction == SamplerReduction::Weighted ? sum + one : k == 0 ? one : reduce(sum, one, reduction);   // (a minimum or maximum: of every lookup)
     }
-    return sum * (1.0f / static_cast<float>(n));
+    return reduction == SamplerReduction::Weighted ? sum * (1.0f / static_cast<float>(n)) : sum;
   }
   Vec4 record(uint32_t unit, float a, float b, float c) const {
     if (!recorded_[unit]) {
@@ -599,17 +705,21 @@ class TextureSet final : public ITextureSet {
     if (lambda > sampler.max_lod) lambda = sampler.max_lod;
     return lambda;
   }
-  // One layer of one level a lookup reads: its surface, and of a depth image (kFeature2DepthTextures) its depth and stencil planes there - the surface then only says the size.
+  // One layer of one level a lookup reads: its surface, and of a depth image (kFeature2DepthTextures) its depth and stencil planes there - the surface then only says the size. (The
+  // image, level and layer: for the residency feedback of a tiled image.)
   struct Plane {
     Surface surface;
     ArrayView<float> depth;
     ArrayView<uint8_t> stencil;
+    const SoftwareImage* image = nullptr;
+    uint32_t level = 0, layer = 0;
   };
   // Layer `layer` of the view's level `level` (of a volume's: its slice there), with the planes of a depth image.
   static Plane view_plane(const Bound& b, uint32_t level, uint32_t layer) {
     const uint32_t at_level = b.base_level + level, at_layer = b.kind == TextureKind::Texture3D ? layer : b.first_layer + layer;
     Plane p;
     p.surface = b.image->surface(at_level, at_layer);
+    p.image = b.image, p.level = at_level, p.layer = at_layer;
     if (b.image->format() == Format::D32Float) p.depth = b.image->depth_layer(at_layer, at_level), p.stencil = b.image->stencil_layer(at_layer, at_level);
     return p;
   }
@@ -657,12 +767,40 @@ class TextureSet final : public ITextureSet {
     }
     const uint32_t l0 = static_cast<uint32_t>(lambda), l1 = l0 + 1 < levels ? l0 + 1 : levels - 1;
     const float fraction = lambda - static_cast<float>(l0);
-    return at(l0) * (1.0f - fraction) + at(l1) * fraction;
+    if (sampler.reduction != SamplerReduction::Weighted && !(fraction > 0.0f)) return at(l0);   // (a level of weight 0 is not read by a minimum or maximum)
+    return mix_reduced(at(l0), at(l1), fraction, sampler.reduction);
   }
+  // Two values blended by `t` (the weight of b), or - a minimum or maximum reduction - the least or greatest of those whose weight is above 0, channel by channel.
+  static Vec4 reduce(const Vec4& a, const Vec4& b, SamplerReduction r) {
+    auto pick = [r](float x, float y) { return r == SamplerReduction::Minimum ? (y < x ? y : x) : (y > x ? y : x); };
+    return {pick(a.x, b.x), pick(a.y, b.y), pick(a.z, b.z), pick(a.w, b.w)};
+  }
+  static Vec4 mix_reduced(const Vec4& a, const Vec4& b, float t, SamplerReduction r) {
+    if (r == SamplerReduction::Weighted) return a * (1.0f - t) + b * t;
+    if (!(t > 0.0f)) return a;
+    if (!(t < 1.0f)) return b;
+    return reduce(a, b, r);
+  }
+  // The sampler as a lookup at level of detail `lambda` filters: its minification filter where lambda is above 0, its magnification filter elsewhere.
+  static SamplerDesc at_lod(const SamplerDesc& given, float lambda) {
+    SamplerDesc s = given;
+    if (s.separate_mag && !(lambda > 0.0f)) s.filter = s.mag_filter;
+    s.separate_mag = false;
+    return s;
+  }
+  static bool filters_differ(const SamplerDesc& s) { return s.separate_mag && s.mag_filter != s.filter && !s.unnormalized; }
   // A lookup in the view at a level of detail: (u, v) of a 2D image, and w the layer of an array, the depth of a volume, or with (u, v) the direction of a cube (whose number in a
   // cube array is `cube`).
-  static Vec4 lookup(const Bound& b, const SamplerDesc& given, float u, float v, float w, float cube, float lambda) {
-    SamplerDesc sampler = given;
+  Vec4 lookup(const Bound& b, const SamplerDesc& given, float u, float v, float w, float cube, float lambda) const {
+    if (lambda < min_lod_clamp_) lambda = min_lod_clamp_;   // (a lookup's own clamp: Direct3D's SampleClamp)
+    if (given.unnormalized && (b.kind == TextureKind::Texture2D || b.kind == TextureKind::Texture2DArray)) {
+      // (coordinates in texels of the view's first level, which every lookup reads)
+      const Extent2D e = b.image->level_extent(b.base_level);
+      u = unit_coordinate(u) / static_cast<float>(e.width ? e.width : 1);
+      v = unit_coordinate(v) / static_cast<float>(e.height ? e.height : 1);
+      lambda = 0.0f;
+    }
+    SamplerDesc sampler = at_lod(given, lambda);
     w = unit_coordinate(w);
     switch (b.kind) {
       case TextureKind::TextureCube: case TextureKind::TextureCubeArray: {
@@ -695,7 +833,7 @@ class TextureSet final : public ITextureSet {
           const int64_t z0 = floor_to(fz);
           const float tz = fz - static_cast<float>(z0);
           const Vec4 a = sample_level(view_plane(b, level, clamp_layer(z0)), sampler, u, v), c = sample_level(view_plane(b, level, clamp_layer(z0 + 1)), sampler, u, v);
-          return a * (1.0f - tz) + c * tz;
+          return mix_reduced(a, c, tz, sampler.reduction);
         });
       default:
         return filtered(b, sampler, lambda, [&](uint32_t level) { return sample_level(view_plane(b, level, 0), sampler, u, v); });
@@ -716,7 +854,7 @@ class TextureSet final : public ITextureSet {
     return true;
   }
   // One level's comparison: reference <op> each texel the sampler's filter reads (a texel outside an image with a border: the border colour's red), filtered by that filter.
-  static float compare_level(const Plane& texels, const SamplerDesc& sampler, float u, float v, float reference) {
+  float compare_level(const Plane& texels, const SamplerDesc& sampler, float u, float v, float reference) const {
     const int64_t w = texels.surface.width, h = texels.surface.height;
     if (!w || !h) return 0.0f;
     SamplerDesc plane = sampler;
@@ -733,7 +871,7 @@ class TextureSet final : public ITextureSet {
     return top * (1 - ty) + bottom * ty;
   }
 
-  static Vec4 sample_level(const Plane& texels, const SamplerDesc& sampler, float u, float v) {
+  Vec4 sample_level(const Plane& texels, const SamplerDesc& sampler, float u, float v) const {
     const Surface& surface = texels.surface;
     if (!surface.width || !surface.height) return {0, 0, 0, 0};
     const int64_t w = surface.width, h = surface.height;
@@ -746,20 +884,25 @@ class TextureSet final : public ITextureSet {
     const float tx = fx - static_cast<float>(x0), ty = fy - static_cast<float>(y0);
     const int64_t xs[2] = {index(x0, w, sampler.address_u), index(x0 + 1, w, sampler.address_u)};
     const int64_t ys[2] = {index(y0, h, sampler.address_v), index(y0 + 1, h, sampler.address_v)};
-    const Vec4 a = texel_or_border(texels, sampler, xs[0], ys[0]), b = texel_or_border(texels, sampler, xs[1], ys[0]), c = texel_or_border(texels, sampler, xs[0], ys[1]),
-               d = texel_or_border(texels, sampler, xs[1], ys[1]);
-    const Vec4 top = a * (1 - tx) + b * tx, bottom = c * (1 - tx) + d * tx;
-    return top * (1 - ty) + bottom * ty;
+    // (a texel of no weight - the point on a texel's middle row or column - is not read: what it holds counts for nothing, and the residency feedback of a tiled image reports the
+    // texels the filter takes)
+    const Vec4 none{0, 0, 0, 0};
+    const Vec4 a = texel_or_border(texels, sampler, xs[0], ys[0]), b = tx != 0 ? texel_or_border(texels, sampler, xs[1], ys[0]) : none,
+               c = ty != 0 ? texel_or_border(texels, sampler, xs[0], ys[1]) : none, d = tx != 0 && ty != 0 ? texel_or_border(texels, sampler, xs[1], ys[1]) : none;
+    // (a minimum or maximum: of the texels whose bilinear weight is above 0 - mix_reduced takes no part of weight 0, so the unread ones do not count)
+    const Vec4 top = mix_reduced(a, b, tx, sampler.reduction), bottom = mix_reduced(c, d, tx, sampler.reduction);
+    return mix_reduced(top, bottom, ty, sampler.reduction);
   }
   // (index() gives -1 for a texel outside an image whose sampler has a border there)
   static bool anisotropic(const SamplerDesc& s) { return s.max_anisotropy > 1 && s.filter == Filter::Linear; }
   static float sqrt_of(float v) { return v > 0.0f ? __builtin_sqrtf(v) : 0.0f; }
-  static Vec4 texel_or_border(const Plane& texels, const SamplerDesc& sampler, int64_t x, int64_t y) {
+  Vec4 texel_or_border(const Plane& texels, const SamplerDesc& sampler, int64_t x, int64_t y) const {
     if (x < 0 || y < 0) return sampler_border_value(sampler);
     return image_texel(texels, sampler.stencil, x, y);
   }
   // A texel of a colour image, or of the depth or stencil plane of a depth image (kFeature2DepthTextures): the depth as (depth, 0, 0, 1), the stencil as the integers (0, stencil, 0, 1).
-  static Vec4 image_texel(const Plane& texels, bool stencil, int64_t x, int64_t y) {
+  Vec4 image_texel(const Plane& texels, bool stencil, int64_t x, int64_t y) const {
+    if (feedback_ && texels.image && !texels.image->texel_mapped(texels.level, texels.layer, x, y)) unmapped_ = true;   // (a texel of an unmapped tile: it reads as zero)
     if (texels.surface.format != Format::D32Float) return texel(texels.surface, x, y);
     const uint64_t at = static_cast<uint64_t>(y) * texels.surface.width + static_cast<uint64_t>(x);
     if (stencil) {
@@ -817,8 +960,11 @@ class TextureSet final : public ITextureSet {
   mutable bool recorded_[kMaxTextureUnits] = {};
   mutable float record_[kMaxTextureUnits][3] = {};
   mutable float lambda_[kMaxTextureUnits] = {};
-  mutable uint32_t aniso_count_[kMaxTextureUnits] = {1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1};   // (the lookups of an anisotropic filter, and the axis they are spread over in u, v)
-  mutable float aniso_du_[kMaxTextureUnits] = {}, aniso_dv_[kMaxTextureUnits] = {};
+  mutable uint32_t aniso_count_[kMaxTextureUnits] = {1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1};   // (the lookups of an anisotropic filter, and the axis they are spread over in the
+  mutable float aniso_step_[kMaxTextureUnits][3] = {};                                                       // coordinate the lookups take: u, v and w)
+  static constexpr float kNoClamp = -1e30f;
+  mutable bool feedback_ = false, unmapped_ = false;   // (begin_feedback .. end_feedback: whether a texel read lay in an unmapped tile)
+  mutable float min_lod_clamp_ = kNoClamp;
 };
 
 // The storage images bound (bind_storage_image), as the shaders read and write them: a texel of the view is texel (x, y) of layer first_layer + z (of level `level`). A slot may instead
@@ -966,6 +1112,8 @@ struct ClipVertex {
   Vec4 varying[kMaxVaryings];
   uint32_t layer = 0;      // (SV_RenderTargetArrayIndex: a primitive goes to its first vertex's)
   uint32_t viewport = 0;   // (SV_ViewportArrayIndex: the same)
+  uint32_t shading_rate = 0;   // (SV_ShadingRate: the same)
+  Vec4 bary = {1, 0, 0, 0};    // (while a triangle is clipped: the weights of its three vertices at this one)
 };
 
 inline float lerp(float a, float b, float t) { return a + (b - a) * t; }
@@ -974,6 +1122,8 @@ ClipVertex mix(const ClipVertex& a, const ClipVertex& b, float t, uint32_t varyi
   ClipVertex r;
   r.layer = a.layer;
   r.viewport = a.viewport;
+  r.shading_rate = a.shading_rate;
+  r.bary = {lerp(a.bary.x, b.bary.x, t), lerp(a.bary.y, b.bary.y, t), lerp(a.bary.z, b.bary.z, t), 0};
   r.position = {lerp(a.position.x, b.position.x, t), lerp(a.position.y, b.position.y, t),
                 lerp(a.position.z, b.position.z, t), lerp(a.position.w, b.position.w, t)};
   for (uint32_t i = 0; i < varyings; ++i)
@@ -985,6 +1135,9 @@ ClipVertex mix(const ClipVertex& a, const ClipVertex& b, float t, uint32_t varyi
 struct ScreenVertex {
   float x, y, z, inv_w;
   Vec4 varying[kMaxVaryings];
+  // The barycentrics of the primitive's vertices at this one (a corner the clipping made is inside the primitive): perspective-correct ones, interpolated as the varyings are, and linear
+  // ones, interpolated linearly in the screen.
+  Vec4 bary = {1, 0, 0, 0}, bary_lin = {1, 0, 0, 0};
 };
 
 // What the draws and dispatches of a submit did, counted from its start: a query is the difference between what they were at its end and at its begin (so any number can be open,
@@ -1007,7 +1160,8 @@ struct DrawState {
   uint32_t level[kMaxColorTargets + 1] = {};   // (RenderPassBegin::level: the level of each target drawn into)
   Extent2D extent;                             // (the size of the pass: of those levels)
   mutable uint32_t layer = 0;
-  void select_layer(uint32_t l) const { layer = l; }
+  // (with view instancing the view's layer and viewport offsets are added, wrapping: set_view_instance)
+  void select_layer(uint32_t l) const { layer = l + view_layer; }
   // (the layer of target n the primitive goes to: its own first when the primitive's is beyond the target's)
   uint32_t layer_of(uint32_t n) const { return first_layer[n] + (layer < layer_count[n] ? layer : 0); }
   Surface target(uint32_t n) const {
@@ -1025,6 +1179,7 @@ struct DrawState {
   mutable Viewport viewport;
   mutable Rect2D scissor;
   void select_viewport(uint32_t index) const {
+    index += view_viewport;
     viewport = viewports[index < viewport_count ? index : 0];
     scissor = scissors[index < viewport_count && index < scissor_count ? index : 0];
   }
@@ -1034,6 +1189,19 @@ struct DrawState {
   uint8_t constants_storage[kMaxPushConstantBytes] = {};
   uint32_t primitive_id = 0;   // the primitive of the draw being rasterized (SV_PrimitiveID)
   uint32_t sample_count = 1;   // samples per pixel of the pass's images
+  // The rasterizer state of set_depth_bounds, set_sample_positions, set_view_instance and set_shading_rate (kept across passes; a submit starts with the defaults).
+  bool depth_bounds = false;
+  float depth_min = 0.0f, depth_max = 1.0f;
+  uint32_t custom_samples = 0, custom_pixels = 0;   // (pixels 0: the standard positions)
+  SamplePosition custom_positions[kMaxSamplePositions] = {};
+  uint32_t view_id = 0, view_viewport = 0, view_layer = 0;
+  uint32_t shading_rate = 0;
+  ShadingRateCombiner rate_combiner[2] = {ShadingRateCombiner::Passthrough, ShadingRateCombiner::Passthrough};
+  const SoftwareImage* rate_image = nullptr;
+  bool coarse_shading() const { return shading_rate != 0 || rate_combiner[0] != ShadingRateCombiner::Passthrough || rate_combiner[1] != ShadingRateCombiner::Passthrough || rate_image; }
+  // The vertices of the primitive being rasterized as the last stage before the rasterizer made them (barycentrics, GetAttributeAtVertex) and its first vertex's shading rate.
+  mutable const Vec4* primitive_varyings[3] = {};
+  mutable uint32_t primitive_rate = 0;
   QueryCounters* counters = nullptr;   // what the draws and dispatches of the submit did (for its queries; null outside a submit)
   // The stream output targets (BindStreamOutput): where each buffer's next record goes. `closed` is set once a primitive did not fit.
   struct StreamOutputTarget {
@@ -1277,7 +1445,7 @@ void write_fragment(const DrawState& s, int32_t x, int32_t y, float z, bool dept
 
 // Runs the pipeline's fragment shader; false if it discarded the pixel.
 bool run_fragment_shader(const DrawState& s, const Vec4* varying, const FragmentContext& given, Vec4* color) {
-  s.count(PipelineStatistic::PsInvocations);
+  if (!s.pipeline->desc().stand_in_fragment) s.count(PipelineStatistic::PsInvocations);   // (a stand-in for no pixel shader runs none as the API counts them)
   FragmentContext context = given;
   context.storage = s.storage;
   context.images = s.images;
@@ -1287,39 +1455,51 @@ bool run_fragment_shader(const DrawState& s, const Vec4* varying, const Fragment
 }
 
 // Where the samples of a pixel are, in sixteenths of a pixel from its centre (+y down): the standard patterns of Direct3D 10.
-struct SamplePosition {
-  int8_t x, y;
-};
+constexpr SamplePosition kSamples1[1] = {{0, 0}};
 constexpr SamplePosition kSamples2[2] = {{4, 4}, {-4, -4}};
 constexpr SamplePosition kSamples4[4] = {{-2, -6}, {6, -2}, {-6, 2}, {2, 6}};
 constexpr SamplePosition kSamples8[8] = {{1, -3}, {-1, 3}, {5, 1}, {-3, -5}, {-5, 5}, {-7, -1}, {3, 7}, {7, -7}};
-inline const SamplePosition* sample_positions(uint32_t count) { return count == 2 ? kSamples2 : count == 4 ? kSamples4 : kSamples8; }
+constexpr SamplePosition kSamples16[16] = {{1, 1}, {-1, -3}, {-3, 2}, {4, -1}, {-5, -2}, {2, 5}, {5, 3}, {3, -5}, {-2, 6}, {0, -7}, {-4, -6}, {-6, 4}, {-8, 0}, {7, -4}, {6, 7}, {-7, -8}};
+inline const SamplePosition* sample_positions(uint32_t count) { return count == 1 ? kSamples1 : count == 2 ? kSamples2 : count == 4 ? kSamples4 : count == 8 ? kSamples8 : kSamples16; }
+// The positions of the samples of pixel (x, y) in a pass: those set with set_sample_positions (for each pixel of a 2 x 2 quad, or one pattern for all) when they are for the pass's
+// sample count, else the standard ones.
+inline const SamplePosition* pixel_sample_positions(const DrawState& s, int32_t x, int32_t y) {
+  if (s.custom_pixels == 0 || s.custom_samples != s.sample_count) return sample_positions(s.sample_count);
+  if (s.custom_pixels == 1) return s.custom_positions;
+  return s.custom_positions + (static_cast<uint32_t>(y & 1) * 2 + static_cast<uint32_t>(x & 1)) * s.custom_samples;
+}
 
 // An edge is "top" or "left" when pixels exactly on it belong to the triangle.
 inline bool owns_edge(float dx, float dy) { return dy < 0 || (dy == 0 && dx > 0); }
 
 void raster_line(const DrawState& s, const ScreenVertex& v0, const ScreenVertex& v1, float bias, bool front);
 
+// Half of a quadrilateral line (LineMode::QuadrilateralWide / Narrow) given to raster_triangle: no culling, filled whatever the fill mode, not conservative, of the line's facing and depth bias.
+struct LineQuad {
+  float bias;
+  bool front;
+};
+
 // `outline` says which edges of the triangle are edges of the primitive (bit 0 a-b, bit 1 b-c, bit 2 c-a): what a wireframe fill draws.
-void raster_triangle(const DrawState& s, const ScreenVertex& a, const ScreenVertex& b, const ScreenVertex& c, uint8_t outline) {
+void raster_triangle(const DrawState& s, const ScreenVertex& a, const ScreenVertex& b, const ScreenVertex& c, uint8_t outline, const LineQuad* line = nullptr) {
   const GraphicsPipelineDesc& pd = s.pipeline->desc();
   float area = (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x);  // y down: > 0 is clockwise on screen
   if (area == 0) return;
   const bool clockwise = area > 0;
-  const bool front = (pd.front_face == FrontFace::Clockwise) == clockwise;
-  if (pd.cull_mode == CullMode::Back && !front) return;
-  if (pd.cull_mode == CullMode::Front && front) return;
+  const bool front = line ? line->front : (pd.front_face == FrontFace::Clockwise) == clockwise;
+  if (!line && pd.cull_mode == CullMode::Back && !front) return;
+  if (!line && pd.cull_mode == CullMode::Front && front) return;
 
   // The depth bias of the triangle: from the slope of its plane of window depths and its largest depth.
-  float bias = 0.0f;
-  if (pd.depth_bias.enabled()) {
+  float bias = line ? line->bias : 0.0f;
+  if (!line && pd.depth_bias.enabled()) {
     const float dzdx = ((b.z - a.z) * (c.y - a.y) - (c.z - a.z) * (b.y - a.y)) / area, dzdy = ((c.z - a.z) * (b.x - a.x) - (b.z - a.z) * (c.x - a.x)) / area;
     const float sx = dzdx < 0 ? -dzdx : dzdx, sy = dzdy < 0 ? -dzdy : dzdy;
     float max_z = a.z > b.z ? a.z : b.z;
     if (c.z > max_z) max_z = c.z;
     bias = depth_bias_value(pd.depth_bias, sx > sy ? sx : sy, max_z);
   }
-  if (pd.fill_mode == FillMode::Wireframe) {
+  if (!line && pd.fill_mode == FillMode::Wireframe) {
     if (outline & 1) raster_line(s, a, b, bias, front);
     if (outline & 2) raster_line(s, b, c, bias, front);
     if (outline & 4) raster_line(s, c, a, bias, front);
@@ -1382,20 +1562,235 @@ void raster_triangle(const DrawState& s, const ScreenVertex& a, const ScreenVert
                 (v0->varying[i].z * p0 + v1->varying[i].z * p1 + v2->varying[i].z * p2) * norm, (v0->varying[i].w * p0 + v1->varying[i].w * p1 + v2->varying[i].w * p2) * norm};
   };
   const bool lod_pass = s.pipeline->samples_textures() && s.textures.uses_lod();
+  // Conservative rasterization: a pixel is covered when its square and the triangle overlap. By the separating axis theorem that is when the square meets the triangle's bounding box
+  // and no edge has the whole square outside: an edge value is linear, so its largest over the square is the value at the centre plus half the sum of its gradient's magnitudes.
+  const bool conservative = pd.conservative && !line;
+  auto magnitude = [](float v) { return v < 0 ? -v : v; };
+  const float reach0 = 0.5f * (magnitude(e0dx) + magnitude(e0dy)), reach1 = 0.5f * (magnitude(e1dx) + magnitude(e1dy)), reach2 = 0.5f * (magnitude(e2dx) + magnitude(e2dy));
+  const uint32_t target_width = s.extent.width;
+  const uint32_t sample_count = s.sample_count;
+  // (programmable sample positions on a single-sample pass: the one sample, wherever it is, decides the pixel)
+  const bool custom_single = sample_count == 1 && s.custom_pixels != 0 && s.custom_samples == 1;
+  // The barycentrics of the primitive's vertices at a point: perspective-correct from the weights l0 .. l2 of the triangle (scaled by 1 / w as the varyings are), linear ones in the screen.
+  auto barycentrics_at = [&](float l0, float l1, float l2, Vec4* out) {
+    const float p0 = l0 * inv_area * v0->inv_w, p1 = l1 * inv_area * v1->inv_w, p2 = l2 * inv_area * v2->inv_w;
+    const float norm = 1.0f / (p0 + p1 + p2);
+    const float b0 = l0 * inv_area, b1 = l1 * inv_area, b2 = l2 * inv_area;
+    out[0] = {(v0->bary.x * p0 + v1->bary.x * p1 + v2->bary.x * p2) * norm, (v0->bary.y * p0 + v1->bary.y * p1 + v2->bary.y * p2) * norm, (v0->bary.z * p0 + v1->bary.z * p1 + v2->bary.z * p2) * norm, 0};
+    out[1] = {v0->bary_lin.x * b0 + v1->bary_lin.x * b1 + v2->bary_lin.x * b2, v0->bary_lin.y * b0 + v1->bary_lin.y * b1 + v2->bary_lin.y * b2, v0->bary_lin.z * b0 + v1->bary_lin.z * b1 + v2->bary_lin.z * b2, 0};
+  };
+  auto weights_at = [&](float qx, float qy, float* l) {
+    l[0] = -((qx - v1->x) * e0dy - (qy - v1->y) * e0dx), l[1] = -((qx - v2->x) * e1dy - (qy - v2->y) * e1dx), l[2] = -((qx - v0->x) * e2dy - (qy - v0->y) * e2dx);
+  };
+  auto weights_inside = [&](float a0, float a1, float a2) {
+    if (a0 < 0 || a1 < 0 || a2 < 0) return false;
+    return !((a0 == 0 && !own0) || (a1 == 0 && !own1) || (a2 == 0 && !own2));
+  };
+
+  // What the triangle covers of pixel (x, y): the samples (`covered`), the depth at each, and which of them pass the depth test. False when it covers none (or the depth bounds test
+  // leaves none).
+  struct Coverage {
+    uint32_t covered = 0, depth_pass = 0;
+    float sample_z[16];
+  };
+  auto cover = [&](int32_t x, int32_t y, Coverage* c) {
+    const float px = x + 0.5f, py = y + 0.5f;
+    float l[3];
+    weights_at(px, py, l);
+    const float l0 = l[0], l1 = l[1], l2 = l[2];
+    // Which samples the triangle covers, and the depth at each (a pixel with one sample per pixel is the centre; a multisampled pass without multisample covers all or none by the centre).
+    c->covered = 0;
+    if (conservative) {
+      const float fx = static_cast<float>(x), fy = static_cast<float>(y);
+      if (fx > fx1 || fx + 1.0f < fx0 || fy > fy1 || fy + 1.0f < fy0) return false;
+      if (l0 + reach0 < 0 || l1 + reach1 < 0 || l2 + reach2 < 0) return false;
+      c->covered = (1u << sample_count) - 1;   // (every sample of a touched pixel, at the plane's depth at the centre)
+      const float centre_z = (l0 * v0->z + l1 * v1->z + l2 * v2->z) * inv_area;
+      for (uint32_t k = 0; k < sample_count; ++k) c->sample_z[k] = centre_z;
+    } else if ((sample_count > 1 && pd.multisample) || custom_single) {
+      const SamplePosition* positions = pixel_sample_positions(s, x, y);
+      for (uint32_t k = 0; k < sample_count; ++k) {
+        const float sx = px + static_cast<float>(positions[k].x) * (1.0f / 16.0f), sy = py + static_cast<float>(positions[k].y) * (1.0f / 16.0f);
+        const float a0 = -((sx - v1->x) * e0dy - (sy - v1->y) * e0dx), a1 = -((sx - v2->x) * e1dy - (sy - v2->y) * e1dx), a2 = -((sx - v0->x) * e2dy - (sy - v0->y) * e2dx);
+        if (!weights_inside(a0, a1, a2)) continue;
+        c->covered |= 1u << k;
+        c->sample_z[k] = final_z((a0 * v0->z + a1 * v1->z + a2 * v2->z) * inv_area);
+      }
+      if (!c->covered) return false;
+    } else {
+      if (!weights_inside(l0, l1, l2)) return false;
+      c->covered = (1u << sample_count) - 1;
+      const float centre_z = final_z((l0 * v0->z + l1 * v1->z + l2 * v2->z) * inv_area);
+      for (uint32_t k = 0; k < sample_count; ++k) c->sample_z[k] = centre_z;
+    }
+    const uint64_t index = uint64_t{static_cast<uint32_t>(y)} * target_width + static_cast<uint32_t>(x);
+    if (s.depth_bounds && !depth.empty()) {
+      // (the depth bounds test: what the depth buffer holds at the sample, before this draw writes it, inside the bounds)
+      for (uint32_t k = 0; k < sample_count; ++k) {
+        const float stored = depth[index * sample_count + k];
+        if ((c->covered >> k & 1) && !(stored >= s.depth_min && stored <= s.depth_max)) c->covered &= ~(1u << k);
+      }
+      if (!c->covered) return false;
+    }
+    c->depth_pass = c->covered;   // (the samples that pass the depth test)
+    if (pd.depth_test && !depth.empty())
+      for (uint32_t k = 0; k < sample_count; ++k)
+        if ((c->covered >> k & 1) && !depth_passes(pd.depth_compare, c->sample_z[k], depth[index * sample_count + k])) c->depth_pass &= ~(1u << k);
+    return true;
+  };
+
+  // Runs the shader for a pixel - or with coarse shading a coarse pixel, `cw` x `ch` pixels from (bx, by) on the grid of such pixels from the target's origin - at its centre: the quad of
+  // its derivatives and level of detail is the 2 x 2 of those pixels it is in. False when the shader discarded it.
+  auto shade = [&](int32_t bx, int32_t by, uint32_t cw, uint32_t ch, uint32_t rate, Vec4* color) {
+    const float px = static_cast<float>(bx) + 0.5f * static_cast<float>(cw), py = static_cast<float>(by) + 0.5f * static_cast<float>(ch);
+    float l[3];
+    weights_at(px, py, l);
+    const float b0 = l[0] * inv_area, b1 = l[1] * inv_area, b2 = l[2] * inv_area;
+    const float z = final_z(b0 * v0->z + b1 * v1->z + b2 * v2->z);
+    // Perspective-correct varyings: weights scaled by 1/w.
+    Vec4 varying[kMaxVaryings];
+    varyings_at(px, py, varying);
+    // (the quad: which coarse pixel of it this is, and where its upper left one is)
+    const int32_t cx = bx / static_cast<int32_t>(cw), cy = by / static_cast<int32_t>(ch);
+    const float quad_x = static_cast<float>((cx & ~1) * static_cast<int32_t>(cw)) + 0.5f * static_cast<float>(cw), quad_y = static_cast<float>((cy & ~1) * static_cast<int32_t>(ch)) + 0.5f * static_cast<float>(ch);
+    const float step_x = static_cast<float>(cw), step_y = static_cast<float>(ch);
+    if (lod_pass) {
+      // The level of detail comes from the 2 x 2 quad the pixel is in: the shader is run for the quad's upper left, right and lower pixels with the lookups only recorded.
+      const float xs[3] = {quad_x, quad_x + step_x, quad_x};
+      const float ys[3] = {quad_y, quad_y, quad_y + step_y};
+      float coord[3][kMaxTextureUnits][3] = {};
+      bool have[3][kMaxTextureUnits] = {};
+      for (int k = 0; k < 3; ++k) {
+        Vec4 quad_varying[kMaxVaryings];
+        varyings_at(xs[k], ys[k], quad_varying);
+        Vec4 ignored[kMaxColorTargets];
+        FragmentContext quad_context;
+        quad_context.position = {xs[k], ys[k], z, 1.0f};
+        quad_context.front_facing = front;
+        quad_context.primitive_id = s.primitive_id;
+        quad_context.view_id = s.view_id;
+        quad_context.shading_rate = rate;
+        float ql[3];
+        weights_at(xs[k], ys[k], ql);
+        Vec4 qb[2];
+        barycentrics_at(ql[0], ql[1], ql[2], qb);
+        quad_context.barycentrics = qb[0], quad_context.barycentrics_linear = qb[1];
+        for (uint32_t n = 0; n < 3; ++n) quad_context.vertex_varyings[n] = s.primitive_varyings[n];
+        quad_context.helper = true;
+        s.textures.start_recording();
+        run_fragment_shader(s, quad_varying, quad_context, ignored);
+        s.textures.stop_recording();
+        for (uint32_t unit = 0; unit < kMaxTextureUnits; ++unit) have[k][unit] = s.textures.recorded(unit, coord[k][unit]);
+      }
+      s.textures.clear_lod();
+      for (uint32_t unit = 0; unit < kMaxTextureUnits; ++unit)
+        if (have[0][unit] && have[1][unit] && have[2][unit]) s.textures.set_lod(unit, coord[0][unit], coord[1][unit], coord[2][unit]);
+    }
+    FragmentContext context;
+    context.position = {px, py, z, b0 * v0->inv_w + b1 * v1->inv_w + b2 * v2->inv_w};
+    context.front_facing = front;
+    context.primitive_id = s.primitive_id;
+    context.view_id = s.view_id;
+    context.shading_rate = rate;
+    Vec4 bary[2];
+    barycentrics_at(l[0], l[1], l[2], bary);
+    context.barycentrics = bary[0], context.barycentrics_linear = bary[1];
+    for (uint32_t n = 0; n < 3; ++n) context.vertex_varyings[n] = s.primitive_varyings[n];
+    // (the corners of the pixel's quad for the derivatives: the varyings, and depth and 1 / w, of the plane of the triangle at the corner's centre; and its barycentrics)
+    struct Quad {
+      decltype(varyings_at)& varyings;
+      decltype(weights_at)& weights;
+      decltype(barycentrics_at)& barycentrics;
+      decltype(final_z)& depth;
+      float quad_x, quad_y, step_x, step_y, inv_area;
+      const ScreenVertex *v0, *v1, *v2;
+      void point(uint32_t corner, float* qx, float* qy) const {
+        *qx = quad_x + step_x * static_cast<float>(corner & 1), *qy = quad_y + step_y * static_cast<float>(corner >> 1);
+      }
+    } quad{varyings_at, weights_at, barycentrics_at, final_z, quad_x, quad_y, step_x, step_y, inv_area, v0, v1, v2};
+    context.quad_fn = [](const void* user, uint32_t corner, Vec4* out_varyings, Vec4* out_position) {
+      const Quad& q = *static_cast<const Quad*>(user);
+      float qx, qy, ql[3];
+      q.point(corner, &qx, &qy);
+      q.varyings(qx, qy, out_varyings);
+      q.weights(qx, qy, ql);
+      const float a0 = ql[0] * q.inv_area, a1 = ql[1] * q.inv_area, a2 = ql[2] * q.inv_area;
+      *out_position = {qx, qy, q.depth(a0 * q.v0->z + a1 * q.v1->z + a2 * q.v2->z), a0 * q.v0->inv_w + a1 * q.v1->inv_w + a2 * q.v2->inv_w};
+    };
+    context.quad_bary_fn = [](const void* user, uint32_t corner, Vec4* out_bary) {
+      const Quad& q = *static_cast<const Quad*>(user);
+      float qx, qy, ql[3];
+      q.point(corner, &qx, &qy);
+      q.weights(qx, qy, ql);
+      q.barycentrics(ql[0], ql[1], ql[2], out_bary);
+    };
+    context.quad_user = &quad;
+    context.quad_corner = static_cast<uint32_t>(cx & 1) | static_cast<uint32_t>(cy & 1) << 1;
+    return run_fragment_shader(s, varying, context, color);
+  };
+  // (alpha to coverage: the first round(alpha * samples) samples of the pixel keep what they covered)
+  auto alpha_coverage = [&](const Vec4* color, uint32_t covered) {
+    if (!(pd.alpha_to_coverage && pd.multisample && sample_count > 1)) return covered;
+    const float a = color[0].w;
+    uint32_t keep = !(a > 0.0f) ? 0 : a >= 1.0f ? sample_count : static_cast<uint32_t>(a * static_cast<float>(sample_count) + 0.5f);
+    if (keep > sample_count) keep = sample_count;
+    return covered & ((1u << keep) - 1);
+  };
+
+  if (s.coarse_shading()) {
+    // Coarse pixel shading: tile by tile of the shading-rate image's grid, the rate of the primitive in the tile (the rate set, combined with the primitive's, combined with the image's),
+    // then each coarse pixel of that size in the tile: the samples it covers in each of its pixels, one shader run at its centre if any of them can be drawn, and its colour to all.
+    const uint32_t base_rate = combine_shading_rate(s.rate_combiner[0], s.shading_rate, s.primitive_rate);
+    const int32_t tile = static_cast<int32_t>(kShadingRateTileSize);
+    for (int32_t ty = min_y - min_y % tile; ty < max_y; ty += tile) {
+      for (int32_t tx = min_x - min_x % tile; tx < max_x; tx += tile) {
+        uint32_t image_rate = 0;   // (no image, or a tile past its edge: 1x1)
+        if (s.rate_image) {
+          const Surface rates = s.rate_image->surface();
+          const uint32_t ix = static_cast<uint32_t>(tx / tile), iy = static_cast<uint32_t>(ty / tile);
+          if (ix < rates.width && iy < rates.height && !rates.floats.empty()) image_rate = __builtin_bit_cast(uint32_t, rates.floats[uint64_t{iy} * rates.width + ix].x) & 0xFF;
+        }
+        const uint32_t rate = sanitize_shading_rate(combine_shading_rate(s.rate_combiner[1], base_rate, image_rate), sample_count);
+        const uint32_t cw = shading_rate_x(rate), ch = shading_rate_y(rate);
+        for (int32_t by = ty; by < ty + tile && by < max_y; by += static_cast<int32_t>(ch)) {
+          if (by + static_cast<int32_t>(ch) <= min_y) continue;
+          for (int32_t bx = tx; bx < tx + tile && bx < max_x; bx += static_cast<int32_t>(cw)) {
+            if (bx + static_cast<int32_t>(cw) <= min_x) continue;
+            Coverage pixels[16];
+            bool any = false, any_pass = false;
+            for (uint32_t j = 0; j < ch; ++j)
+              for (uint32_t i = 0; i < cw; ++i) {
+                Coverage& c = pixels[j * cw + i];
+                const int32_t x = bx + static_cast<int32_t>(i), y = by + static_cast<int32_t>(j);
+                c.covered = c.depth_pass = 0;
+                if (x < min_x || x >= max_x || y < min_y || y >= max_y || !cover(x, y, &c)) continue;
+                any = true;
+                if (c.depth_pass) any_pass = true;
+              }
+            if (!any || (!any_pass && !stencil_on && !pd.fragment_stores)) continue;   // (as for one pixel below)
+            Vec4 color[kMaxColorTargets];
+            if (!shade(bx, by, cw, ch, rate, color)) continue;   // (a discard leaves the whole coarse pixel)
+            for (uint32_t j = 0; j < ch; ++j)
+              for (uint32_t i = 0; i < cw; ++i) {
+                const Coverage& c = pixels[j * cw + i];
+                const uint32_t covered = alpha_coverage(color, c.covered);
+                for (uint32_t k = 0; k < sample_count; ++k)
+                  if (covered >> k & 1) write_fragment(s, bx + static_cast<int32_t>(i), by + static_cast<int32_t>(j), c.sample_z[k], (c.depth_pass >> k & 1) != 0, color, k, front);
+              }
+          }
+        }
+      }
+    }
+    return;
+  }
 
   // Per row, the columns that can be inside: each edge value is linear in x, so it is solved for where it turns non-negative and the range is widened by two pixels, which covers the
   // rounding. The exact tests below still decide every pixel, so the picture is the one a full scan of the bounding box gives. (Far off-screen vertices make the solving imprecise: no trimming.)
-  // Conservative rasterization: a pixel is covered when its square and the triangle overlap. By the separating axis theorem that is when the square meets the triangle's bounding box
-  // and no edge has the whole square outside: an edge value is linear, so its largest over the square is the value at the centre plus half the sum of its gradient's magnitudes.
-  const bool conservative = pd.conservative;
-  auto magnitude = [](float v) { return v < 0 ? -v : v; };
-  const float reach0 = 0.5f * (magnitude(e0dx) + magnitude(e0dy)), reach1 = 0.5f * (magnitude(e1dx) + magnitude(e1dy)), reach2 = 0.5f * (magnitude(e2dx) + magnitude(e2dy));
   const bool trim = !conservative && fx0 > -1e5f && fx1 < 1e5f && fy0 > -1e5f && fy1 < 1e5f;
   struct EdgeLine {
     float vx, vy, dx, dy;
   };
   const EdgeLine edges[3] = {{v1->x, v1->y, e0dx, e0dy}, {v2->x, v2->y, e1dx, e1dy}, {v0->x, v0->y, e2dx, e2dy}};
-  const uint32_t target_width = s.extent.width;
 
   for (int32_t y = min_y; y < max_y; ++y) {
     int32_t row_begin = min_x, row_end = max_x;
@@ -1422,122 +1817,21 @@ void raster_triangle(const DrawState& s, const ScreenVertex& a, const ScreenVert
       if (empty || row_begin >= row_end) continue;
     }
     for (int32_t x = row_begin; x < row_end; ++x) {
-      const float px = x + 0.5f, py = y + 0.5f;
-      const float w0 = (px - v1->x) * e0dy - (py - v1->y) * e0dx;
-      const float w1 = (px - v2->x) * e1dy - (py - v2->y) * e1dx;
-      const float w2 = (px - v0->x) * e2dy - (py - v0->y) * e2dx;
-      // With y down and a positive area, an interior point has all three edge values <= 0 in this
-      // formulation, so flip the sign to get weights.
-      const float l0 = -w0, l1 = -w1, l2 = -w2;
-      const uint32_t sample_count = s.sample_count;
-      // Which samples the triangle covers, and the depth at each (a pixel with one sample per pixel is the centre; a multisampled pass without multisample covers all or none by the centre).
-      uint32_t covered = 0;
-      float sample_z[8];
-      auto weights_inside = [&](float a0, float a1, float a2) {
-        if (a0 < 0 || a1 < 0 || a2 < 0) return false;
-        return !((a0 == 0 && !own0) || (a1 == 0 && !own1) || (a2 == 0 && !own2));
-      };
-      if (conservative) {
-        const float fx = static_cast<float>(x), fy = static_cast<float>(y);
-        if (fx > fx1 || fx + 1.0f < fx0 || fy > fy1 || fy + 1.0f < fy0) continue;
-        if (l0 + reach0 < 0 || l1 + reach1 < 0 || l2 + reach2 < 0) continue;
-        covered = (1u << sample_count) - 1;   // (every sample of a touched pixel, at the plane's depth at the centre)
-        const float centre_z = (l0 * v0->z + l1 * v1->z + l2 * v2->z) * inv_area;
-        for (uint32_t k = 0; k < sample_count; ++k) sample_z[k] = centre_z;
-      } else if (sample_count > 1 && pd.multisample) {
-        const SamplePosition* positions = sample_positions(sample_count);
-        for (uint32_t k = 0; k < sample_count; ++k) {
-          const float sx = px + static_cast<float>(positions[k].x) * (1.0f / 16.0f), sy = py + static_cast<float>(positions[k].y) * (1.0f / 16.0f);
-          const float a0 = -((sx - v1->x) * e0dy - (sy - v1->y) * e0dx), a1 = -((sx - v2->x) * e1dy - (sy - v2->y) * e1dx), a2 = -((sx - v0->x) * e2dy - (sy - v0->y) * e2dx);
-          if (!weights_inside(a0, a1, a2)) continue;
-          covered |= 1u << k;
-          sample_z[k] = final_z((a0 * v0->z + a1 * v1->z + a2 * v2->z) * inv_area);
-        }
-        if (!covered) continue;
-      } else {
-        if (!weights_inside(l0, l1, l2)) continue;
-        covered = (1u << sample_count) - 1;
-        const float centre_z = final_z((l0 * v0->z + l1 * v1->z + l2 * v2->z) * inv_area);
-        for (uint32_t k = 0; k < sample_count; ++k) sample_z[k] = centre_z;
-      }
-      const float b0 = l0 * inv_area, b1 = l1 * inv_area, b2 = l2 * inv_area;
-
-      const uint64_t index = uint64_t{static_cast<uint32_t>(y)} * target_width + static_cast<uint32_t>(x);
-      const float z = final_z(b0 * v0->z + b1 * v1->z + b2 * v2->z);
-      uint32_t depth_pass = covered;   // (the samples that pass the depth test)
-      if (pd.depth_test && !depth.empty())
-        for (uint32_t k = 0; k < sample_count; ++k)
-          if ((covered >> k & 1) && !depth_passes(pd.depth_compare, sample_z[k], depth[index * sample_count + k])) depth_pass &= ~(1u << k);
-      if (!depth_pass && !stencil_on && !pd.fragment_stores) continue;   // (with a stencil test the depth result is needed after the shader; a shader that writes buffers runs whatever the depth test says)
-
-      // Perspective-correct varyings: weights scaled by 1/w.
-      const float p0 = b0 * v0->inv_w, p1 = b1 * v1->inv_w, p2 = b2 * v2->inv_w;
-      const float norm = 1.0f / (p0 + p1 + p2);
-      Vec4 varying[kMaxVaryings];
-      for (uint32_t i = 0; i < pd.varying_count; ++i) {
-        varying[i] = {(v0->varying[i].x * p0 + v1->varying[i].x * p1 + v2->varying[i].x * p2) * norm,
-                      (v0->varying[i].y * p0 + v1->varying[i].y * p1 + v2->varying[i].y * p2) * norm,
-                      (v0->varying[i].z * p0 + v1->varying[i].z * p1 + v2->varying[i].z * p2) * norm,
-                      (v0->varying[i].w * p0 + v1->varying[i].w * p1 + v2->varying[i].w * p2) * norm};
-      }
+      Coverage c;
+      if (!cover(x, y, &c)) continue;
+      if (!c.depth_pass && !stencil_on && !pd.fragment_stores) continue;   // (with a stencil test the depth result is needed after the shader; a shader that writes buffers runs whatever the depth test says)
       Vec4 color[kMaxColorTargets];
-      if (lod_pass) {
-        // The level of detail comes from the 2 x 2 quad the pixel is in: the shader is run for the quad's upper left, right and lower pixels with the lookups only recorded.
-        const int32_t qx = x & ~1, qy = y & ~1;
-        const float xs[3] = {static_cast<float>(qx) + 0.5f, static_cast<float>(qx) + 1.5f, static_cast<float>(qx) + 0.5f};
-        const float ys[3] = {static_cast<float>(qy) + 0.5f, static_cast<float>(qy) + 0.5f, static_cast<float>(qy) + 1.5f};
-        float coord[3][kMaxTextureUnits][3] = {};
-        bool have[3][kMaxTextureUnits] = {};
-        for (int k = 0; k < 3; ++k) {
-          Vec4 quad_varying[kMaxVaryings];
-          varyings_at(xs[k], ys[k], quad_varying);
-          Vec4 ignored[kMaxColorTargets];
-          FragmentContext quad_context;
-          quad_context.position = {xs[k], ys[k], z, 1.0f};
-          quad_context.front_facing = front;
-          quad_context.primitive_id = s.primitive_id;
-          quad_context.helper = true;
-          s.textures.start_recording();
-          run_fragment_shader(s, quad_varying, quad_context, ignored);
-          s.textures.stop_recording();
-          for (uint32_t unit = 0; unit < kMaxTextureUnits; ++unit) have[k][unit] = s.textures.recorded(unit, coord[k][unit]);
-        }
-        s.textures.clear_lod();
-        for (uint32_t unit = 0; unit < kMaxTextureUnits; ++unit)
-          if (have[0][unit] && have[1][unit] && have[2][unit]) s.textures.set_lod(unit, coord[0][unit], coord[1][unit], coord[2][unit]);
-      }
-      FragmentContext context;
-      context.position = {px, py, z, b0 * v0->inv_w + b1 * v1->inv_w + b2 * v2->inv_w};
-      context.front_facing = front;
-      context.primitive_id = s.primitive_id;
-      // (the corners of the pixel's quad for the derivatives: the varyings, and depth and 1 / w, of the plane of the triangle at the corner's centre)
-      auto quad_source = [&](uint32_t corner, Vec4* out_varyings, Vec4* out_position) {
-        const float qx = static_cast<float>(x & ~1) + 0.5f + static_cast<float>(corner & 1), qy = static_cast<float>(y & ~1) + 0.5f + static_cast<float>(corner >> 1);
-        varyings_at(qx, qy, out_varyings);
-        const float l0 = -((qx - v1->x) * e0dy - (qy - v1->y) * e0dx), l1 = -((qx - v2->x) * e1dy - (qy - v2->y) * e1dx), l2 = -((qx - v0->x) * e2dy - (qy - v0->y) * e2dx);
-        const float a0 = l0 * inv_area, a1 = l1 * inv_area, a2 = l2 * inv_area;
-        *out_position = {qx, qy, final_z(a0 * v0->z + a1 * v1->z + a2 * v2->z), a0 * v0->inv_w + a1 * v1->inv_w + a2 * v2->inv_w};
-      };
-      using QuadSource = decltype(quad_source);
-      context.quad_fn = [](const void* user, uint32_t corner, Vec4* out_varyings, Vec4* out_position) { (*static_cast<const QuadSource*>(user))(corner, out_varyings, out_position); };
-      context.quad_user = &quad_source;
-      context.quad_corner = static_cast<uint32_t>(x & 1) | static_cast<uint32_t>(y & 1) << 1;
-      if (!run_fragment_shader(s, varying, context, color)) continue;
-      if (pd.alpha_to_coverage && pd.multisample && sample_count > 1) {
-        // (the first round(alpha * samples) samples of the pixel keep what they covered)
-        const float a = color[0].w;
-        uint32_t keep = !(a > 0.0f) ? 0 : a >= 1.0f ? sample_count : static_cast<uint32_t>(a * static_cast<float>(sample_count) + 0.5f);
-        if (keep > sample_count) keep = sample_count;
-        covered &= (1u << keep) - 1;
-      }
+      if (!shade(x, y, 1, 1, 0, color)) continue;
+      const uint32_t covered = alpha_coverage(color, c.covered);
       for (uint32_t k = 0; k < sample_count; ++k)
-        if (covered >> k & 1) write_fragment(s, x, y, sample_z[k], (depth_pass >> k & 1) != 0, color, k, front);
+        if (covered >> k & 1) write_fragment(s, x, y, c.sample_z[k], (c.depth_pass >> k & 1) != 0, color, k, front);
     }
   }
 }
 
 // A screen-space point or line fragment: the same shader, depth, stencil and blend as a triangle's, from varyings interpolated perspective-correct along the line.
-void fragment_at(const DrawState& s, int32_t x, int32_t y, float z, float inv_w, const Vec4* varying, bool front = true) {
+void fragment_at(const DrawState& s, int32_t x, int32_t y, float z, float inv_w, const Vec4* varying, bool front = true, const Vec4& bary = {1, 0, 0, 0}, const Vec4& bary_lin = {1, 0, 0, 0},
+                 float coverage = 1.0f) {
   const GraphicsPipelineDesc& pd = s.pipeline->desc();
   {
     const float lo = s.viewport.min_depth < s.viewport.max_depth ? s.viewport.min_depth : s.viewport.max_depth, hi = s.viewport.min_depth < s.viewport.max_depth ? s.viewport.max_depth : s.viewport.min_depth;
@@ -1549,7 +1843,14 @@ void fragment_at(const DrawState& s, int32_t x, int32_t y, float z, float inv_w,
   const ArrayView<float> depth = s.depth_plane();
   const uint64_t index = uint64_t{static_cast<uint32_t>(y)} * s.extent.width + static_cast<uint32_t>(x);
   const uint32_t sample_count = s.sample_count;   // (a line or point covers every sample of its pixel)
-  uint32_t depth_pass = (1u << sample_count) - 1;
+  uint32_t covered = (1u << sample_count) - 1;
+  if (s.depth_bounds && !depth.empty())   // (the depth bounds test: of what the depth buffer holds, before the depth test)
+    for (uint32_t k = 0; k < sample_count; ++k) {
+      const float stored = depth[index * sample_count + k];
+      if (!(stored >= s.depth_min && stored <= s.depth_max)) covered &= ~(1u << k);
+    }
+  if (!covered) return;
+  uint32_t depth_pass = covered;
   if (pd.depth_test && !depth.empty())
     for (uint32_t k = 0; k < sample_count; ++k)
       if (!depth_passes(pd.depth_compare, z, depth[index * sample_count + k])) depth_pass &= ~(1u << k);
@@ -1558,9 +1859,15 @@ void fragment_at(const DrawState& s, int32_t x, int32_t y, float z, float inv_w,
   context.position = {static_cast<float>(x) + 0.5f, static_cast<float>(y) + 0.5f, z, inv_w};
   context.front_facing = front;
   context.primitive_id = s.primitive_id;
+  context.view_id = s.view_id;
+  context.barycentrics = bary;
+  context.barycentrics_linear = bary_lin;
+  for (uint32_t k = 0; k < 3; ++k) context.vertex_varyings[k] = s.primitive_varyings[k];
   Vec4 color[kMaxColorTargets];
   if (!run_fragment_shader(s, varying, context, color)) return;
-  for (uint32_t k = 0; k < sample_count; ++k) write_fragment(s, x, y, z, (depth_pass >> k & 1) != 0, color, k, front);
+  color[0].w *= coverage;   // (an alpha-antialiased line's part of the pixel, into the first target's alpha before blending)
+  for (uint32_t k = 0; k < sample_count; ++k)
+    if (covered >> k & 1) write_fragment(s, x, y, z, (depth_pass >> k & 1) != 0, color, k, front);
 }
 
 ScreenVertex to_screen(const DrawState& s, const ClipVertex& v, uint32_t varyings) {
@@ -1571,7 +1878,15 @@ ScreenVertex to_screen(const DrawState& s, const ClipVertex& v, uint32_t varying
   sv.z = s.viewport.min_depth + v.position.z * inv_w * (s.viewport.max_depth - s.viewport.min_depth);
   sv.inv_w = inv_w;
   for (uint32_t k = 0; k < varyings; ++k) sv.varying[k] = v.varying[k];
+  sv.bary = sv.bary_lin = v.bary;
   return sv;
+}
+
+// The screen-linear barycentrics of a point whose perspective-correct ones are `p`, from the clip-space w of the primitive's vertices: n_i = p_i w_i / sum p_j w_j.
+Vec4 linear_barycentrics(const Vec4& p, float w0, float w1, float w2) {
+  const float a = p.x * w0, b = p.y * w1, c = p.z * w2, sum = a + b + c;
+  if (!(sum > 1e-30f || sum < -1e-30f)) return p;
+  return {a / sum, b / sum, c / sum, 0};
 }
 
 // The clipper's statistics of a primitive of `count` vertices: it was given it (ClipperInvocations), and it came out of it unless it lies wholly outside one plane of the view volume
@@ -1598,6 +1913,8 @@ void draw_point(const DrawState& s, const ClipVertex& a) {
   const ScreenVertex v = to_screen(s, a, varyings);
   if (!(v.x > -1e6f && v.x < 1e6f && v.y > -1e6f && v.y < 1e6f)) return;
   const int32_t x = static_cast<int32_t>(v.x < 0 ? v.x - 1 : v.x), y = static_cast<int32_t>(v.y < 0 ? v.y - 1 : v.y);   // (floor, as far as the pixel it falls in goes)
+  for (const Vec4*& p : s.primitive_varyings) p = a.varying;   // (a point is its one vertex three times over)
+  s.primitive_rate = a.shading_rate;
   fragment_at(s, x, y, v.z, v.inv_w, v.varying);
 }
 
@@ -1614,8 +1931,11 @@ void draw_line(const DrawState& s, const ClipVertex& a, const ClipVertex& b) {
   s.select_layer(a.layer);
   s.select_viewport(a.viewport);
   ClipVertex p = a, q = b;
+  p.bary = {1, 0, 0, 0}, q.bary = {0, 1, 0, 0};
   const ClipVertex ends[2] = {a, b};
   count_clipped(s, ends, 2);
+  s.primitive_varyings[0] = a.varying, s.primitive_varyings[1] = s.primitive_varyings[2] = b.varying;
+  s.primitive_rate = a.shading_rate;
   for (uint32_t plane = 0; plane < clip_plane_count(s); ++plane) {
     const float dp = clip_distance(s, plane, p.position), dq = clip_distance(s, plane, q.position);
     if (dp < 0 && dq < 0) return;
@@ -1623,7 +1943,73 @@ void draw_line(const DrawState& s, const ClipVertex& a, const ClipVertex& b) {
     else if (dq < 0) q = mix(p, q, dp / (dp - dq), varyings);
   }
   if (!(p.position.w > 1e-9f) || !(q.position.w > 1e-9f)) return;
-  raster_line(s, to_screen(s, p, varyings), to_screen(s, q, varyings), 0.0f, true);
+  ScreenVertex sp = to_screen(s, p, varyings), sq = to_screen(s, q, varyings);
+  sp.bary_lin = linear_barycentrics(p.bary, a.position.w, b.position.w, 1.0f);
+  sq.bary_lin = linear_barycentrics(q.bary, a.position.w, b.position.w, 1.0f);
+  raster_line(s, sp, sq, 0.0f, true);
+}
+
+// A quadrilateral line (LineMode::QuadrilateralWide, Narrow): the rectangle `width` pixels wide whose middle line runs from v0 to v1, as two triangles (the samples, or the pixel centres,
+// it covers; its corners take the attributes of their end).
+void raster_quad_line(const DrawState& s, const ScreenVertex& v0, const ScreenVertex& v1, float width, float bias, bool front) {
+  const float dx = v1.x - v0.x, dy = v1.y - v0.y;
+  const float length = __builtin_sqrtf(dx * dx + dy * dy);
+  if (!(length > 0.0f)) return;   // (no area)
+  const float nx = -dy / length * (width * 0.5f), ny = dx / length * (width * 0.5f);
+  ScreenVertex a0 = v0, a1 = v0, b0 = v1, b1 = v1;
+  a0.x += nx, a0.y += ny, a1.x -= nx, a1.y -= ny;
+  b0.x += nx, b0.y += ny, b1.x -= nx, b1.y -= ny;
+  const LineQuad line{bias, front};
+  raster_triangle(s, a0, a1, b1, 0, &line);
+  raster_triangle(s, a0, b1, b0, 0, &line);
+}
+
+// An alpha-antialiased line (LineMode::AlphaAntialiased): the rectangle one pixel wide between v0 and v1 (its ends at the two points, not lengthened). Every pixel it touches is shaded
+// once, at its centre with the attributes of the nearest point of the line, and the first target's alpha is multiplied by the part of the pixel the rectangle covers (measured on
+// 8 x 8 points of the pixel).
+void raster_smooth_line(const DrawState& s, const ScreenVertex& v0, const ScreenVertex& v1, float bias, bool front) {
+  const uint32_t varyings = s.pipeline->desc().varying_count;
+  const float dx = v1.x - v0.x, dy = v1.y - v0.y;
+  const float length = __builtin_sqrtf(dx * dx + dy * dy);
+  if (!(length > 0.0f)) return;
+  const float ux = dx / length, uy = dy / length;   // (along the line; across it: (-uy, ux))
+  // (the pixels around the rectangle, within the scissor rectangle)
+  auto lo = [](float a, float b) { return a < b ? a : b; };
+  auto hi = [](float a, float b) { return a > b ? a : b; };
+  const float fx0 = lo(v0.x, v1.x) - 1.0f, fx1 = hi(v0.x, v1.x) + 1.0f, fy0 = lo(v0.y, v1.y) - 1.0f, fy1 = hi(v0.y, v1.y) + 1.0f;
+  const int64_t sx0 = s.scissor.x, sy0 = s.scissor.y, sx1 = sx0 + s.scissor.width, sy1 = sy0 + s.scissor.height;
+  auto clamp_floor = [](float v, int64_t a, int64_t b) {
+    if (!(v > static_cast<float>(a))) return a;
+    if (v >= static_cast<float>(b)) return b;
+    return static_cast<int64_t>(v);
+  };
+  const int64_t x_begin = clamp_floor(fx0, sx0, sx1), x_end = clamp_floor(fx1 + 1.0f, sx0, sx1), y_begin = clamp_floor(fy0, sy0, sy1), y_end = clamp_floor(fy1 + 1.0f, sy0, sy1);
+  constexpr uint32_t kGrid = 8;
+  for (int64_t y = y_begin; y < y_end; ++y) {
+    for (int64_t x = x_begin; x < x_end; ++x) {
+      uint32_t inside = 0;
+      for (uint32_t j = 0; j < kGrid; ++j)
+        for (uint32_t i = 0; i < kGrid; ++i) {
+          const float px = static_cast<float>(x) + (static_cast<float>(i) + 0.5f) / kGrid - v0.x, py = static_cast<float>(y) + (static_cast<float>(j) + 0.5f) / kGrid - v0.y;
+          const float along = px * ux + py * uy, across = -px * uy + py * ux;
+          if (along >= 0.0f && along <= length && across >= -0.5f && across <= 0.5f) ++inside;
+        }
+      if (!inside) continue;
+      const float cx = static_cast<float>(x) + 0.5f - v0.x, cy = static_cast<float>(y) + 0.5f - v0.y;
+      float t = (cx * ux + cy * uy) / length;
+      t = t < 0.0f ? 0.0f : t > 1.0f ? 1.0f : t;
+      const float p0 = (1.0f - t) * v0.inv_w, p1 = t * v1.inv_w;
+      const float norm = 1.0f / (p0 + p1);
+      Vec4 varying[kMaxVaryings];
+      for (uint32_t k = 0; k < varyings; ++k)
+        varying[k] = {(v0.varying[k].x * p0 + v1.varying[k].x * p1) * norm, (v0.varying[k].y * p0 + v1.varying[k].y * p1) * norm, (v0.varying[k].z * p0 + v1.varying[k].z * p1) * norm,
+                      (v0.varying[k].w * p0 + v1.varying[k].w * p1) * norm};
+      const Vec4 bary = {(v0.bary.x * p0 + v1.bary.x * p1) * norm, (v0.bary.y * p0 + v1.bary.y * p1) * norm, (v0.bary.z * p0 + v1.bary.z * p1) * norm, 0};
+      const Vec4 bary_lin = {v0.bary_lin.x * (1.0f - t) + v1.bary_lin.x * t, v0.bary_lin.y * (1.0f - t) + v1.bary_lin.y * t, v0.bary_lin.z * (1.0f - t) + v1.bary_lin.z * t, 0};
+      const float z = v0.z + (v1.z - v0.z) * t;
+      fragment_at(s, static_cast<int32_t>(x), static_cast<int32_t>(y), z + bias, p0 + p1, varying, front, bary, bary_lin, static_cast<float>(inside) / static_cast<float>(kGrid * kGrid));
+    }
+  }
 }
 
 // The pixels of a line between two window-space points, its depth biased by `bias`; `front` is what the fragments are (a wireframe triangle's facing).
@@ -1631,6 +2017,9 @@ void raster_line(const DrawState& s, const ScreenVertex& v0, const ScreenVertex&
   const uint32_t varyings = s.pipeline->desc().varying_count;
   const float limit = 1e6f;
   if (!(v0.x > -limit && v0.x < limit && v0.y > -limit && v0.y < limit && v1.x > -limit && v1.x < limit && v1.y > -limit && v1.y < limit)) return;
+  const LineMode mode = s.pipeline->desc().line_mode;
+  if (mode == LineMode::QuadrilateralWide || mode == LineMode::QuadrilateralNarrow) return raster_quad_line(s, v0, v1, mode == LineMode::QuadrilateralWide ? 1.4f : 1.0f, bias, front);
+  if (mode == LineMode::AlphaAntialiased) return raster_smooth_line(s, v0, v1, bias, front);
   const float dx = v1.x - v0.x, dy = v1.y - v0.y;
   const float length = (dx < 0 ? -dx : dx) > (dy < 0 ? -dy : dy) ? (dx < 0 ? -dx : dx) : (dy < 0 ? -dy : dy);
   // (the steps are clamped to the target: a line past it costs no more than the target's size)
@@ -1644,7 +2033,9 @@ void raster_line(const DrawState& s, const ScreenVertex& v0, const ScreenVertex&
     for (uint32_t k = 0; k < varyings; ++k)
       varying[k] = {(v0.varying[k].x * p0 + v1.varying[k].x * p1) * norm, (v0.varying[k].y * p0 + v1.varying[k].y * p1) * norm, (v0.varying[k].z * p0 + v1.varying[k].z * p1) * norm,
                     (v0.varying[k].w * p0 + v1.varying[k].w * p1) * norm};
-    fragment_at(s, static_cast<int32_t>(x < 0 ? x - 1 : x), static_cast<int32_t>(y < 0 ? y - 1 : y), z + bias, (1.0f - t) * v0.inv_w + t * v1.inv_w, varying, front);
+    const Vec4 bary = {(v0.bary.x * p0 + v1.bary.x * p1) * norm, (v0.bary.y * p0 + v1.bary.y * p1) * norm, (v0.bary.z * p0 + v1.bary.z * p1) * norm, 0};
+    const Vec4 bary_lin = {v0.bary_lin.x * (1.0f - t) + v1.bary_lin.x * t, v0.bary_lin.y * (1.0f - t) + v1.bary_lin.y * t, v0.bary_lin.z * (1.0f - t) + v1.bary_lin.z * t, 0};
+    fragment_at(s, static_cast<int32_t>(x < 0 ? x - 1 : x), static_cast<int32_t>(y < 0 ? y - 1 : y), z + bias, (1.0f - t) * v0.inv_w + t * v1.inv_w, varying, front, bary, bary_lin);
   }
 }
 
@@ -1661,6 +2052,9 @@ void draw_triangle(const DrawState& s, const ClipVertex& a, const ClipVertex& b,
     count_clipped(s, corners, 3);
   }
   polys[0][0] = a, polys[0][1] = b, polys[0][2] = c;
+  polys[0][0].bary = {1, 0, 0, 0}, polys[0][1].bary = {0, 1, 0, 0}, polys[0][2].bary = {0, 0, 1, 0};
+  s.primitive_varyings[0] = a.varying, s.primitive_varyings[1] = b.varying, s.primitive_varyings[2] = c.varying;
+  s.primitive_rate = a.shading_rate;
   uint32_t n = 3, current = 0;
   for (uint32_t plane = 0; plane < clip_plane_count(s); ++plane) {
     const ClipVertex* in = polys[current];
@@ -1690,6 +2084,8 @@ void draw_triangle(const DrawState& s, const ClipVertex& a, const ClipVertex& b,
     sv[i].z = s.viewport.min_depth + p.z * inv_w * (s.viewport.max_depth - s.viewport.min_depth);
     sv[i].inv_w = inv_w;
     for (uint32_t k = 0; k < varyings; ++k) sv[i].varying[k] = poly[i].varying[k];
+    sv[i].bary = poly[i].bary;
+    sv[i].bary_lin = linear_barycentrics(poly[i].bary, a.position.w, b.position.w, c.position.w);
   }
   // (the fan's inner edges are not edges of the polygon: a wireframe fill leaves them out)
   for (uint32_t i = 1; i + 1 < n; ++i) raster_triangle(s, sv[0], sv[i], sv[i + 1], static_cast<uint8_t>((i == 1 ? 1u : 0u) | 2u | (i + 2 == n ? 4u : 0u)));
@@ -1724,6 +2120,7 @@ ClipVertex run_vertex_shader(const SoftwarePipeline& pipeline, const VertexStrea
   for (uint32_t i = 0; i < kMaxVaryings; ++i) out.varying[i] = io.varying[i];
   out.layer = io.layer;         // (a vertex shader's SV_RenderTargetArrayIndex and SV_ViewportArrayIndex: kFeature2LayerFromAnyStage)
   out.viewport = io.viewport;
+  out.shading_rate = io.shading_rate;   // (and SV_ShadingRate)
   return out;
 }
 
@@ -1855,6 +2252,7 @@ void run_geometry_instance(const DrawState& s, const ShaderModuleDesc& md, const
     for (uint32_t k = 0; k < kMaxVaryings; ++k) c.varying[k] = output.vertex[i].varying[k];
     c.layer = output.vertex[i].layer;
     c.viewport = output.vertex[i].viewport;
+    c.shading_rate = output.vertex[i].shading_rate;
     return c;
   };
   uint32_t in_strip = 0;   // vertices of the strip so far
@@ -1872,6 +2270,7 @@ void run_geometry_instance(const DrawState& s, const ShaderModuleDesc& md, const
         ClipVertex first = clip(i - 1);
         first.layer = output.vertex[i - 2].layer;   // (the triangle's leading vertex in the strip's order names its layer and viewport)
         first.viewport = output.vertex[i - 2].viewport;
+        first.shading_rate = output.vertex[i - 2].shading_rate;
         draw_triangle(s, first, clip(i - 2), clip(i));
       }
       else draw_triangle(s, clip(i - 2), clip(i - 1), clip(i));
@@ -1889,6 +2288,7 @@ void run_geometry_shader(const DrawState& s, const SoftwareShaderModule& module,
     for (uint32_t i = 0; i < kMaxVaryings; ++i) input.varying[k][i] = v[k].varying[i];
   }
   input.primitive_id = s.primitive_id;
+  input.view_id = s.view_id;
   for (uint32_t instance = 0; instance < md.geometry_instances; ++instance) {
     input.instance_id = instance;
     run_geometry_instance(s, md, input);
@@ -1905,6 +2305,7 @@ void run_tessellation(allocators::IAllocator& allocator, const DrawState& s, Tes
   input.images = s.images;
   input.control_points = count;
   input.primitive_id = s.primitive_id;
+  input.view_id = s.view_id;
   for (uint32_t k = 0; k < count && k < kMaxPatchControlPoints; ++k) {
     input.position[k] = v[k].position;
     for (uint32_t i = 0; i < kMaxVaryings; ++i) input.varying[k][i] = v[k].varying[i];
@@ -1914,6 +2315,7 @@ void run_tessellation(allocators::IAllocator& allocator, const DrawState& s, Tes
   hd.hull_function(input, s.constants, &patch);
   patch.storage = s.storage;
   patch.images = s.images;
+  patch.view_id = s.view_id;
   if (!tessellator.tessellate(hd.tess_domain, hd.tess_partitioning, hd.tess_output, patch.outer, patch.inner)) return;
   const DomainShaderFn ds = domain.desc().domain_function;
   const bool triangles = hd.tess_domain == TessDomain::Triangle;
@@ -2211,6 +2613,34 @@ bool SoftwareDevice::submit(ICommandBuffer* commands) {
       case RecordedCommand::Type::EndRenderPass:
         in_pass = false;
         break;
+      case RecordedCommand::Type::CopySamples: {
+        // Every sample of each pixel of the region: the colour values (32-bit or wide), or a depth image's depth and stencil.
+        SoftwareImage* to = static_cast<SoftwareImage*>(cmd.image);
+        const SoftwareImage* from = static_cast<const SoftwareImage*>(cmd.image2);
+        if (in_pass || !to || !from || to == from || to->format() != from->format() || to->samples() != from->samples() || to->kind() != TextureKind::Texture2D || from->kind() != TextureKind::Texture2D) return false;
+        const Rect2D r = cmd.scissor;
+        const uint32_t n = from->samples(), fw = from->extent().width, fh = from->extent().height, tw = to->extent().width, th = to->extent().height;
+        if (r.x < 0 || r.y < 0 || static_cast<uint32_t>(r.x) > fw || r.width > fw - static_cast<uint32_t>(r.x) || static_cast<uint32_t>(r.y) > fh || r.height > fh - static_cast<uint32_t>(r.y) ||
+            cmd.count > tw || r.width > tw - cmd.count || cmd.first > th || r.height > th - cmd.first)
+          return false;
+        for (uint32_t row = 0; row < r.height; ++row) {
+          const uint64_t src = (uint64_t{static_cast<uint32_t>(r.y) + row} * fw + static_cast<uint32_t>(r.x)) * n, dst = (uint64_t{cmd.first + row} * tw + cmd.count) * n, count = uint64_t{r.width} * n;
+          // (the rows of each, as views: a row past what the image holds is refused, not read)
+          auto copy = [&](auto to_view, auto from_view) {
+            decltype(to_view) a;
+            decltype(from_view) b;
+            return to_view.try_subview(dst, count, &a) && from_view.try_subview(src, count, &b) && a.copy_from(b);
+          };
+          if (from->format() == Format::D32Float) {
+            if (!copy(to->depth(), from->depth())) return false;
+            if (!to->stencil().empty() && !from->stencil().empty() && !copy(to->stencil(), from->stencil())) return false;
+            continue;
+          }
+          const Surface out = to->surface(), in = from->surface();
+          if (!out.floats.empty() ? !copy(out.floats, in.floats) : !copy(out.pixels, in.pixels)) return false;
+        }
+        break;
+      }
       case RecordedCommand::Type::Resolve: {
         // The samples of each pixel averaged (to the nearest, per channel) into the single-sample image.
         SoftwareImage* to = static_cast<SoftwareImage*>(cmd.image);
@@ -2299,7 +2729,10 @@ bool SoftwareDevice::submit(ICommandBuffer* commands) {
         if (cmd.buffer) {
           ByteView whole = cmd.buffer->map(), part;
           const uint64_t start = cmd.offset == kStreamOutputAppend ? cmd.buffer->stream_output_filled() : cmd.offset;
-          if (start > whole.size() || !whole.try_subview(start, whole.size() - start, &part)) return false;
+          // (the writes stop at the binding's end: a primitive that does not fit before it closes the target, as one that does not fit in the buffer)
+          const uint64_t end = cmd.end == kStreamOutputNoEnd || cmd.end > whole.size() ? whole.size() : cmd.end;
+          if (start > whole.size()) return false;
+          if (!whole.try_subview(start, end > start ? end - start : 0, &part)) return false;
           stream_output[cmd.unit].view = part;
           stream_output[cmd.unit].buffer = cmd.buffer;
           stream_output[cmd.unit].base = start;
@@ -2457,6 +2890,46 @@ bool SoftwareDevice::submit(ICommandBuffer* commands) {
       case RecordedCommand::Type::SetPatchPoints:
         patch_points = cmd.count;
         break;
+      case RecordedCommand::Type::SetDepthBounds:
+        s.depth_bounds = cmd.count != 0;
+        s.depth_min = cmd.viewport.min_depth;
+        s.depth_max = cmd.viewport.max_depth;
+        break;
+      case RecordedCommand::Type::SetSamplePositions: {
+        // (pixels 0: the standard positions again; else 1 or 4 pixels of 1, 2, 4, 8 or 16 samples, at most 16 positions, each -8 .. 7)
+        if (cmd.first == 0) {
+          s.custom_pixels = s.custom_samples = 0;
+          break;
+        }
+        const uint32_t samples = cmd.count, pixels = cmd.first;
+        if ((pixels != 1 && pixels != 4) || (samples != 1 && samples != 2 && samples != 4 && samples != 8 && samples != 16) || samples * pixels > kMaxSamplePositions) return false;
+        ConstByteView bytes;
+        if (!pool.try_subview(cmd.constants_offset, uint64_t{samples} * pixels * 2, &bytes)) return false;
+        for (uint32_t k = 0; k < samples * pixels; ++k) {
+          const int8_t x = static_cast<int8_t>(bytes[2 * k]), y = static_cast<int8_t>(bytes[2 * k + 1]);
+          if (x < -8 || x > 7 || y < -8 || y > 7) return false;
+          s.custom_positions[k] = {x, y};
+        }
+        s.custom_samples = samples, s.custom_pixels = pixels;
+        break;
+      }
+      case RecordedCommand::Type::SetViewInstance:
+        s.view_id = cmd.count;
+        s.view_viewport = cmd.first;
+        s.view_layer = cmd.unit;
+        break;
+      case RecordedCommand::Type::SetShadingRate:
+        if (!valid_shading_rate(cmd.count) || (cmd.first & 0xFF) > static_cast<uint32_t>(ShadingRateCombiner::Sum) || (cmd.first >> 8) > static_cast<uint32_t>(ShadingRateCombiner::Sum)) return false;
+        s.shading_rate = cmd.count;
+        s.rate_combiner[0] = static_cast<ShadingRateCombiner>(cmd.first & 0xFF);
+        s.rate_combiner[1] = static_cast<ShadingRateCombiner>(cmd.first >> 8);
+        break;
+      case RecordedCommand::Type::SetShadingRateImage: {
+        const auto* image = static_cast<const SoftwareImage*>(cmd.image);
+        if (image && (image->format() != Format::R8Uint || image->samples() != 1)) return false;
+        s.rate_image = image;
+        break;
+      }
       case RecordedCommand::Type::SetScissor: {
         if (!in_pass) return false;
         const Extent2D e = s.extent;
@@ -2542,6 +3015,7 @@ bool SoftwareDevice::submit(ICommandBuffer* commands) {
           context.storage = s.storage;
           context.images = s.images;
           context.textures = &s.textures;
+          context.view_id = s.view_id;
           s.count(PipelineStatistic::VsInvocations);
           *out = run_vertex_shader(*s.pipeline, streams, static_cast<uint64_t>(v), cmd.first_instance, instance, s.constants, context);
           return true;

@@ -20,9 +20,10 @@
  *
  * Queries are the kernel's (BeginQuery / EndQuery write 64-bit counts into a kAllocQueryResult buffer, the query heap): occlusion and binary occlusion, pipeline statistics (and
  * PIPELINE_STATISTICS1, whose amplification and mesh shader counts are 0: there are no such stages), stream output statistics of each stream, and timestamps (nanoseconds,
- * GetTimestampFrequency says 10^9; on copy lists into COPY_QUEUE_TIMESTAMP heaps). Any number may be open at once (MAX_OPEN_QUERIES), of one type or several, across passes, clears,
+ * GetTimestampFrequency says 10^9; on copy lists into COPY_QUEUE_TIMESTAMP heaps). Any number may be open at once, of one type or several, across passes, clears,
  * copies and everything else of the list: the kernel's queries span its passes, and a query that goes on into the next chunk is begun again there with kQueryAccumulate, so the
- * chunks' counts add up. ResolveQueryData copies the results with CopyBuffer. BeginQuery, EndQuery and ResolveQueryData are not predicated (Direct3D 12 predicates draws,
+ * chunks' counts add up - when more than GROUP_QUERIES go on into a chunk, those of each kind share one device query there (a QueryFan: the kernel takes CHUNK_QUERIES in a stream),
+ * whose counts are added to each of them when the chunk has run; a query of a fan that ends, begins again or is resolved ends the chunk first. ResolveQueryData copies the results with CopyBuffer. BeginQuery, EndQuery and ResolveQueryData are not predicated (Direct3D 12 predicates draws,
  * dispatches, clears, copies, resolves and ExecuteIndirect): while predication is in force they go into a chunk of their own that is not.
  *
  * The kernel has no indirect draws, so ExecuteIndirect is made when the list is executed: the list keeps a copy of its state at the call, the argument buffer is read then (after
@@ -186,13 +187,71 @@ static void end_query_packet(CmdList *l, const struct OpenQuery *q) {
   UINT w[2] = {alloc_index(l, q->heap->alloc), q->index * qheap_stride(q->heap->desc.Type)};
   packet(l, OP_END_QUERY, w, 2);
 }
-/* The end of a chunk the open queries go on after (chunk_new, ExecuteIndirect): their part in it ends. The chunk has room (CHUNK_BYTES leaves it). */
+/* The end of a chunk the open queries go on after (chunk_new, ExecuteIndirect): their part in it ends - each one's own device query, and the groups'. The chunk has room
+ * (CHUNK_BYTES leaves it for an EndQuery of every device query it has). */
 static void queries_suspend(CmdList *l) {
-  for (UINT i = 0; i < l->nopen_q; ++i) end_query_packet(l, &l->open_q[i]);
+  Chunk *c = chunk_cur(l);
+  for (UINT i = 0; i < l->nopen_q; ++i)
+    if (!l->open_q[i].grouped) end_query_packet(l, &l->open_q[i]);
+  if (c && c->fans_open) {
+    for (UINT f = 0; f < c->nfans; ++f) {
+      UINT w[2] = {alloc_index(l, c->fan_scratch), c->fans[f].slot * QUERY_SCRATCH_STRIDE};
+      packet(l, OP_END_QUERY, w, 2);
+    }
+    c->fans_open = 0;
+  }
 }
-/* The start of the next chunk: they begin again, adding to what they counted. */
+/* The list's scratch allocation of the groups' results (one slot of QUERY_SCRATCH_STRIDE bytes for each device query a chunk may have); 0 when it cannot be made. */
+static UINT query_scratch(CmdList *l) {
+  if (l->query_scratch) return l->query_scratch;
+  KmtAllocDesc ad;
+  memset(&ad, 0, sizeof ad);
+  ad.flags = KA_QUERY;
+  ad.size = (UINT64)CHUNK_QUERIES * QUERY_SCRATCH_STRIDE;
+  if (!KMT_OK(kmt_create_allocation(l->d.dev->kdev, &ad, &l->query_scratch, NULL, NULL))) l->query_scratch = 0;
+  return l->query_scratch;
+}
+/* The start of the next chunk: they begin again, adding to what they counted. Up to GROUP_QUERIES each with a device query of its own; with more, those of each kind
+ * share one (a QueryFan of the chunk), whose count is added to each of them after the chunk ran (queue.inc: chunk_fan_out). */
 static void queries_resume(CmdList *l) {
-  for (UINT i = 0; i < l->nopen_q; ++i) begin_query_packet(l, &l->open_q[i], KQ_ACCUMULATE);
+  Chunk *c = chunk_cur(l);
+  for (UINT i = 0; i < l->nopen_q; ++i) l->open_q[i].grouped = 0;
+  if (l->nopen_q <= GROUP_QUERIES || !c || !query_scratch(l)) {
+    for (UINT i = 0; i < l->nopen_q; ++i) begin_query_packet(l, &l->open_q[i], KQ_ACCUMULATE);
+    return;
+  }
+  for (UINT i = 0; i < l->nopen_q; ++i) {
+    struct OpenQuery *q = &l->open_q[i];
+    if (q->grouped) continue;
+    /* (a fan for q's kind, with every open query of the kind) */
+    UINT n = 0;
+    for (UINT k = i; k < l->nopen_q; ++k) n += l->open_q[k].kind == q->kind;
+    QueryFan *grown = mem_grow(c->fans, (SIZE_T)(c->nfans + 1) * sizeof *grown);
+    FanMember *members = mem_alloc((SIZE_T)n * sizeof *members);
+    if (grown) c->fans = grown;
+    if (!grown || !members) {
+      mem_free(members);
+      for (UINT k = i; k < l->nopen_q; ++k)      /* (no memory: the rest each with their own) */
+        if (!l->open_q[k].grouped) begin_query_packet(l, &l->open_q[k], KQ_ACCUMULATE);
+      break;
+    }
+    QueryFan *f = &c->fans[c->nfans];
+    f->kind = q->kind, f->slot = c->nfans, f->members = members, f->nmembers = 0;
+    ++c->nfans;
+    for (UINT k = i; k < l->nopen_q; ++k) {
+      struct OpenQuery *m = &l->open_q[k];
+      if (m->kind != q->kind) continue;
+      m->grouped = 1;
+      f->members[f->nmembers].alloc = m->heap->alloc;
+      f->members[f->nmembers].offset = m->index * qheap_stride(m->heap->desc.Type);
+      ++f->nmembers;
+    }
+    c->fan_scratch = l->query_scratch;
+    c->fans_open = 1;
+    UINT w[3] = {alloc_index(l, l->query_scratch), f->slot * QUERY_SCRATCH_STRIDE, q->kind};
+    packet(l, OP_BEGIN_QUERY, w, 3);
+    c->queries += query_weight(q->kind);
+  }
 }
 static void queries_end_all(CmdList *l) {
   if (!l->nopen_q || !chunk_cur(l)) return;
@@ -201,19 +260,36 @@ static void queries_end_all(CmdList *l) {
 }
 /* Room in the chunk for a query of `weight` more device queries and its packets (a new chunk when there is none: the open queries take theirs again in it). 0 when there is none. */
 static int query_room(CmdList *l, UINT weight) {
-  ensure_room(l, 512 + MAX_OPEN_QUERIES * 16, MAX_OPEN_QUERIES + 4);
+  ensure_room(l, 512, 4);
   if (chunk_cur(l)->queries + weight > CHUNK_QUERIES) { end_pass(l); chunk_new(l); }
   return chunk_cur(l) && chunk_cur(l)->queries + weight <= CHUNK_QUERIES;
 }
+/* Whether a fan of the current chunk adds to the result at (alloc, offset) after the chunk ran. */
+static int fan_member(CmdList *l, UINT alloc, UINT offset) {
+  const Chunk *c = chunk_cur(l);
+  if (!c) return 0;
+  for (UINT f = 0; f < c->nfans; ++f)
+    for (UINT m = 0; m < c->fans[f].nmembers; ++m)
+      if (c->fans[f].members[m].alloc == alloc && c->fans[f].members[m].offset == offset) return 1;
+  return 0;
+}
 
 static void begin_query(CmdList *l, QHeap *h, UINT index, D3D12_QUERY_TYPE type, UINT kind) {
-  if (l->nopen_q == MAX_OPEN_QUERIES) return;      /* (more open at once than this library keeps: not begun, and its End finds nothing) */
   for (UINT i = 0; i < l->nopen_q; ++i)
     if (l->open_q[i].heap == h && l->open_q[i].index == index) return;      /* (begun already: an error the runtime leaves to the debug layer; it goes on as it was) */
+  if (l->nopen_q == l->cap_open_q) {
+    const UINT cap = l->cap_open_q ? l->cap_open_q * 2 : 16;
+    struct OpenQuery *n = mem_grow(l->open_q, (SIZE_T)cap * sizeof *n);
+    if (!n) return;      /* (no memory: not begun, and its End finds nothing) */
+    l->open_q = n;
+    l->cap_open_q = cap;
+  }
   const int split = unpredicated_begin(l);
+  /* (the place a fan of this chunk adds to after it ran: the query begins in a chunk after it, or the fan would add the last query's count to this one's) */
+  if (fan_member(l, h->alloc, index * qheap_stride(h->desc.Type))) { end_pass(l); chunk_new(l); }
   if (query_room(l, query_weight(kind))) {
     struct OpenQuery *q = &l->open_q[l->nopen_q];
-    q->heap = h, q->index = index, q->type = type, q->kind = kind;
+    q->heap = h, q->index = index, q->type = type, q->kind = kind, q->grouped = 0;
     begin_query_packet(l, q, 0);
     ++l->nopen_q;
   }
@@ -242,7 +318,7 @@ static void STDMETHODCALLTYPE list_EndQuery(CmdList *l, ID3D12QueryHeap *heap, D
     /* (the time it is run: begun and ended at once) */
     const int split = unpredicated_begin(l);
     if (query_room(l, 1)) {
-      const struct OpenQuery q = {h, index, type, 6};
+      const struct OpenQuery q = {h, index, type, 6, 0};
       begin_query_packet(l, &q, 0);
       end_query_packet(l, &q);
     }
@@ -253,8 +329,15 @@ static void STDMETHODCALLTYPE list_EndQuery(CmdList *l, ID3D12QueryHeap *heap, D
     if (l->open_q[i].heap != h || l->open_q[i].index != index || l->open_q[i].type != type) continue;
     const int split = unpredicated_begin(l);
     ensure_room(l, 64, 4);
-    end_query_packet(l, &l->open_q[i]);
-    l->open_q[i] = l->open_q[--l->nopen_q];
+    if (l->open_q[i].grouped) {
+      /* (counted in this chunk by its kind's fan: the chunk ends here, the fan adds its part after it ran, and the next chunk goes on without it) */
+      l->open_q[i] = l->open_q[--l->nopen_q];
+      end_pass(l);
+      chunk_new(l);
+    } else {
+      end_query_packet(l, &l->open_q[i]);
+      l->open_q[i] = l->open_q[--l->nopen_q];
+    }
     unpredicated_end(l, split);
     return;
   }
@@ -273,6 +356,10 @@ static void STDMETHODCALLTYPE list_ResolveQueryData(CmdList *l, ID3D12QueryHeap 
   if (offset > d->desc.Width || bytes > d->desc.Width - offset || offset > 0xFFFFFFFFu) return;
   const int split = unpredicated_begin(l);
   end_pass(l);
+  /* (a fan of this chunk adds to the results after the chunk ran: the copy goes into the next one) */
+  int fanned = 0;
+  for (UINT i = start; i < start + count && !fanned; ++i) fanned = fan_member(l, h->alloc, i * stride);
+  if (fanned) chunk_new(l);
   ensure_room(l, 256, 4);
   UINT w[5] = {alloc_index(l, d->alloc), (UINT)offset, alloc_index(l, h->alloc), start * stride, (UINT)bytes};
   packet(l, OP_COPY_BUFFER, w, 5);
@@ -326,6 +413,7 @@ typedef struct Indirect {
 } Indirect;
 
 static void indirect_free(struct Indirect *i) {
+  if (i->state) mem_free(i->state->open_q);      /* (its own copy of the open queries) */
   mem_free(i->state);
   mem_free(i);
 }
@@ -363,6 +451,16 @@ static void STDMETHODCALLTYPE list_ExecuteIndirect(CmdList *l, ID3D12CommandSign
   s->refs = NULL; s->nrefs = s->cap_refs = 0;
   s->log = NULL; s->nlog = s->cap_log = 0;
   s->bundle = 0; s->pass_open = 0; s->closed = 0;      /* (the open queries stay: the commands made from the call go on with them) */
+  s->open_q = NULL; s->cap_open_q = 0; s->nopen_q = 0;
+  s->query_scratch = 0;      /* (the list's: the expansion uses it, but does not own it) */
+  if (l->nopen_q) {
+    s->open_q = mem_alloc((SIZE_T)l->nopen_q * sizeof *s->open_q);
+    if (!s->open_q) { indirect_free(in); return; }
+    memcpy(s->open_q, l->open_q, (SIZE_T)l->nopen_q * sizeof *s->open_q);
+    s->cap_open_q = s->nopen_q = l->nopen_q;
+  }
+  if (l->nopen_q > GROUP_QUERIES) (void)query_scratch(l);      /* (the expansion groups them as the list does, with the list's scratch) */
+  s->query_scratch = l->query_scratch;
   in->sig = (CmdSig *)sig;
   in->args = (Resource *)args;
   in->count = (Resource *)count;
@@ -462,12 +560,17 @@ static void STDMETHODCALLTYPE list_ExecuteBundle(CmdList *l, ID3D12GraphicsComma
   CmdList *b = (CmdList *)bundle;
   if (!b || !b->bundle || !b->closed || l->bundle) return;
   keep(l, (IUnknown *)bundle);
+  /* (the view instance mask: a bundle starts with 0, not its caller's, and the caller has the bundle's last mask after it - its own if the bundle set none) */
+  const UINT caller_mask = l->view_mask;
+  int mask_set = 0;
+  l->view_mask = 0;
   for (UINT i = 0; i < b->nlog; ++i) {
     const LogEntry *e = &b->log[i];
     const UINT64 *a = e->a;
     switch (e->id) {
       case B_PSO: list_SetPipelineState(l, (ID3D12PipelineState *)(UINT_PTR)a[0]); break;
       case B_TOPOLOGY: list_IASetPrimitiveTopology(l, (D3D12_PRIMITIVE_TOPOLOGY)a[0]); break;
+      case B_STRIP_CUT: list_IASetIndexBufferStripCutValue(l, (D3D12_INDEX_BUFFER_STRIP_CUT_VALUE)a[0]); break;
       case B_STENCIL_REF: list_OMSetStencilRef(l, (UINT)a[0]); break;
       case B_STENCIL_REFS: list_OMSetFrontAndBackStencilRef(l, (UINT)a[0], (UINT)a[1]); break;
       case B_DEPTH_BIAS: {
@@ -521,9 +624,23 @@ static void STDMETHODCALLTYPE list_ExecuteBundle(CmdList *l, ID3D12GraphicsComma
       case B_INDIRECT:
         list_ExecuteIndirect(l, (ID3D12CommandSignature *)(UINT_PTR)a[0], (UINT)a[1], (ID3D12Resource *)(UINT_PTR)a[2], a[3], (ID3D12Resource *)(UINT_PTR)a[4], a[5]);
         break;
+      case B_DEPTH_BOUNDS: {
+        float f[2];
+        for (UINT c = 0; c < 2; ++c) { const UINT bits = (UINT)a[c]; memcpy(&f[c], &bits, 4); }
+        list_OMSetDepthBounds(l, f[0], f[1]);
+        break;
+      }
+      case B_VIEW_MASK: list_SetViewInstanceMask(l, (UINT)a[0]); mask_set = 1; break;
+      case B_SHADING_RATE: {
+        const D3D12_SHADING_RATE_COMBINER c[2] = {(D3D12_SHADING_RATE_COMBINER)a[1], (D3D12_SHADING_RATE_COMBINER)a[2]};
+        list_RSSetShadingRate(l, (D3D12_SHADING_RATE)a[0], c);
+        break;
+      }
+      case B_SHADING_RATE_IMAGE: list_RSSetShadingRateImage(l, (ID3D12Resource *)(UINT_PTR)a[0]); break;
       default: break;
     }
   }
+  if (!mask_set) l->view_mask = caller_mask;
 }
 
 /* ---- tiled resources ----------------------------------------------------------------------------------------------------------------------------------------------------- */
@@ -540,6 +657,10 @@ static HRESULT STDMETHODCALLTYPE dev_CreateReservedResource(Dev *This, const D3D
   return query_out((IUnknown *)r, riid, out);
 }
 
+/* GetResourceTiling: the numbering tile_layout gives (the kernel's). A buffer is one subresource of 64 KiB x 1 x 1 tiles; a texture has a subresource per level and slice (a
+ * volume's levels), the standard ones with their tiles in x, y and z and the first tile's number, the packed ones D3D12_PACKED_TILE with the rest zero - D3D12_PACKED_MIP_INFO
+ * says where the packed tiles of the first slice start (each slice's are that far into its tiles) and how many each slice has. The tile shape is the format's standard one
+ * (as drivers give it, even when every level is packed). `*count` in: how many subresource tilings fit from `first` on; out: how many were written. A resource that is not reserved has no tiles: zeros. */
 static void STDMETHODCALLTYPE dev_GetResourceTiling(Dev *This, ID3D12Resource *resource, UINT *total, D3D12_PACKED_MIP_INFO *packed, D3D12_TILE_SHAPE *shape, UINT *count, UINT first,
                                                     D3D12_SUBRESOURCE_TILING *tilings) {
   const Resource *r = (const Resource *)resource;
@@ -547,36 +668,38 @@ static void STDMETHODCALLTYPE dev_GetResourceTiling(Dev *This, ID3D12Resource *r
   TileLayout t;
   memset(&t, 0, sizeof t);
   if (reserved) tile_layout(&r->desc, &t);
-  const int buffer = !reserved || r->desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER;
   if (total) *total = t.total;
   if (packed) {
     memset(packed, 0, sizeof *packed);
-    if (!buffer) {
+    if (reserved && !t.buffer) {
       packed->NumStandardMips = (UINT8)t.standard;
       packed->NumPackedMips = (UINT8)(t.mips - t.standard);
-      packed->NumTilesForPackedMips = t.tail_tiles;
-      packed->StartTileIndexInOverallResource = t.tail_first;
+      packed->NumTilesForPackedMips = t.mips > t.standard ? t.tail_tiles : 0;
+      packed->StartTileIndexInOverallResource = t.mips > t.standard ? t.tail_first : 0;
     }
   }
   if (shape) {
     memset(shape, 0, sizeof *shape);
-    if (!buffer) { shape->WidthInTexels = t.tile_w; shape->HeightInTexels = t.tile_h; shape->DepthInTexels = 1; }
+    if (reserved && t.buffer) { shape->WidthInTexels = KTILE_BYTES; shape->HeightInTexels = 1; shape->DepthInTexels = 1; }
+    /* (the standard tile shape also when every level is packed: the documentation says zeros, the drivers - and vkd3d-proton's conformance test of them - give the shape) */
+    else if (reserved && t.tile_w) { shape->WidthInTexels = t.tile_w; shape->HeightInTexels = t.tile_h; shape->DepthInTexels = t.tile_d; }
   }
   if (count) {
+    const UINT subresources = reserved ? t.mips * t.slices : 0;
     const UINT room = *count;
-    UINT n = buffer || first >= t.mips ? 0 : t.mips - first;
+    UINT n = room == 0 || first >= subresources ? 0 : subresources - first;
     if (n > room) n = room;
     if (tilings)
       for (UINT i = 0; i < n; ++i) {
-        const UINT sub = first + i;
+        const UINT sub = first + i, level = sub % t.mips, slice = sub / t.mips;
         memset(&tilings[i], 0, sizeof tilings[i]);
-        if (sub < t.standard) {
-          tilings[i].WidthInTiles = t.across[sub];
-          tilings[i].HeightInTiles = (UINT16)t.down[sub];
-          tilings[i].DepthInTiles = 1;
-          tilings[i].StartTileIndexInOverallResource = t.first[sub];
+        if (level < t.standard) {
+          tilings[i].WidthInTiles = t.across[level];
+          tilings[i].HeightInTiles = (UINT16)t.down[level];
+          tilings[i].DepthInTiles = (UINT16)t.deep[level];
+          tilings[i].StartTileIndexInOverallResource = slice * t.per_slice + t.first[level];
         } else {
-          tilings[i].StartTileIndexInOverallResource = 0xFFFFFFFFu;      /* (packed: no tiles of its own) */
+          tilings[i].StartTileIndexInOverallResource = D3D12_PACKED_TILE;      /* (packed: the packed mip info says where) */
         }
       }
     *count = n;
@@ -593,39 +716,63 @@ static void tile_flush(Dev *dev, Resource *r, UINT64 first, HeapObj *heap, UINT6
   }
 }
 
-#define MAX_REGION_TILES 65536
+#define MAX_REGION_TILES (1u << 24)      /* (the tiles one call may name: past this, a call is refused) */
+#define OP_COPY_TILES 48                 /* the kernel's Op::CopyTiles: tiles' heap bytes to or from a buffer */
 
+/* The tiles a region covers (D3D12_TILE_REGION_SIZE: a box of tiles, or a run of NumTiles), 0 for an empty one. */
+static UINT64 region_size(const D3D12_TILE_REGION_SIZE *sz) { return sz->UseBox ? (UINT64)sz->Width * sz->Height * sz->Depth : sz->NumTiles; }
+
+/* The tiles of UpdateTileMappings' regions, in order (`*out`, mem_free it; (UINT)-1 for a coordinate outside the resource). NULL sizes: the whole resource for one region
+ * whose start is also NULL, one tile for each region otherwise; NULL starts: (0, 0, 0, 0). 0: no regions, or more tiles than MAX_REGION_TILES. */
+static UINT update_region_tiles(const TileLayout *layout, UINT regions, const D3D12_TILED_RESOURCE_COORDINATE *starts, const D3D12_TILE_REGION_SIZE *sizes, UINT **out) {
+  *out = NULL;
+  const D3D12_TILE_REGION_SIZE whole = {layout->total, FALSE, 0, 0, 0}, one = {1, FALSE, 0, 0, 0};
+  UINT64 count = 0;
+  for (UINT i = 0; i < regions; ++i) count += region_size(sizes ? &sizes[i] : !starts && regions == 1 ? &whole : &one);
+  if (count == 0 || count > MAX_REGION_TILES) return 0;
+  UINT *tiles = mem_alloc((SIZE_T)count * sizeof(UINT));
+  if (!tiles) return 0;
+  UINT n = 0;
+  for (UINT i = 0; i < regions; ++i) {
+    const D3D12_TILED_RESOURCE_COORDINATE c = starts ? starts[i] : (D3D12_TILED_RESOURCE_COORDINATE){0, 0, 0, 0};
+    n = region_tiles(layout, c, sizes ? sizes[i] : !starts && regions == 1 ? whole : one, tiles, n, (UINT)count);
+  }
+  *out = tiles;
+  return n;
+}
+
+/* UpdateTileMappings: the regions' tiles, in order, get the ranges' places, in order - a range of sequential heap tiles (NONE), one heap tile for all of its tiles
+ * (REUSE_SINGLE_TILE), nowhere (NULL) or their mappings left as they are (SKIP); NULL range flags are all NONE, NULL tile counts (one range) the regions' whole count, NULL heap
+ * starts 0. A later region over the same tiles wins. Mapped at once in the kernel (the queue runs what it was given before synchronously) and kept for CopyTileMappings. The
+ * runtime checks nothing here that Windows' does not (its debug layer's checks): a tile outside the resource or a range past the heap is left out. */
 static void STDMETHODCALLTYPE queue_UpdateTileMappings(void *This, ID3D12Resource *resource, UINT regions, const D3D12_TILED_RESOURCE_COORDINATE *starts, const D3D12_TILE_REGION_SIZE *sizes,
                                                        ID3D12Heap *heap, UINT ranges, const D3D12_TILE_RANGE_FLAGS *flags, const UINT *heap_starts, const UINT *counts, D3D12_TILE_MAPPING_FLAGS mapping) {
   Resource *r = (Resource *)resource;
   HeapObj *h = (HeapObj *)heap;
-  if (!r || !r->reserved) return;
+  (void)mapping;      /* (NO_HAZARD: a promise - the queue is synchronous anyway) */
+  if (!r || !r->reserved || !regions || !ranges || (!counts && ranges != 1)) return;
   TileLayout layout;
   tile_layout(&r->desc, &layout);
-  UINT *tiles = mem_alloc((SIZE_T)MAX_REGION_TILES * 4);
-  UINT n = 0;
+  UINT *tiles = NULL;
+  const UINT n = update_region_tiles(&layout, regions, starts, sizes, &tiles);
   if (!tiles) return;
-  for (UINT i = 0; i < (regions ? regions : 1) && n < MAX_REGION_TILES; ++i) {
-    const D3D12_TILED_RESOURCE_COORDINATE c = starts ? starts[i] : (D3D12_TILED_RESOURCE_COORDINATE){0, 0, 0, 0};
-    const D3D12_TILE_REGION_SIZE sz = sizes ? sizes[i] : (D3D12_TILE_REGION_SIZE){1, FALSE, 0, 0, 0};
-    n = region_tiles(&layout, c, sz, tiles, n, MAX_REGION_TILES);
-  }
   UINT pos = 0;
   UINT64 run_first = 0, run_heap = 0, run_len = 0;
   int run_unmap = 0;
-  for (UINT j = 0; j < (ranges ? ranges : 1) && pos < n; ++j) {
-    const UINT f = flags ? (UINT)flags[j] : 0;
-    const UINT c = counts ? counts[j] : (ranges ? 1 : n);
+  for (UINT j = 0; j < ranges && pos < n; ++j) {
+    const UINT f = flags ? (UINT)flags[j] : D3D12_TILE_RANGE_FLAG_NONE;
+    const UINT c = counts ? counts[j] : n;
     const UINT start = heap_starts ? heap_starts[j] : 0;
     for (UINT k = 0; k < c && pos < n; ++k, ++pos) {
       const UINT tile = tiles[pos];
-      if (tile >= layout.total || f == D3D12_TILE_RANGE_FLAG_SKIP) {
+      const int skip = tile >= layout.total || (f & D3D12_TILE_RANGE_FLAG_SKIP) || (!(f & D3D12_TILE_RANGE_FLAG_NULL) && !h);
+      if (skip) {
         if (run_len) { tile_flush(r->d.dev, r, run_first, run_unmap ? NULL : h, run_heap, run_len); run_len = 0; }
         continue;
       }
-      const int unmap = f == D3D12_TILE_RANGE_FLAG_NULL || !h;
-      const UINT64 heap_tile = f == D3D12_TILE_RANGE_FLAG_REUSE_SINGLE_TILE ? start : (UINT64)start + k;
-      const int joins = run_len && run_unmap == unmap && tile == run_first + run_len && (unmap || (f != D3D12_TILE_RANGE_FLAG_REUSE_SINGLE_TILE && heap_tile == run_heap + run_len));
+      const int unmap = (f & D3D12_TILE_RANGE_FLAG_NULL) != 0;
+      const UINT64 heap_tile = (f & D3D12_TILE_RANGE_FLAG_REUSE_SINGLE_TILE) ? start : (UINT64)start + k;
+      const int joins = run_len && run_unmap == unmap && tile == run_first + run_len && (unmap || (!(f & D3D12_TILE_RANGE_FLAG_REUSE_SINGLE_TILE) && heap_tile == run_heap + run_len));
       if (joins) { run_len++; continue; }
       if (run_len) tile_flush(r->d.dev, r, run_first, run_unmap ? NULL : h, run_heap, run_len);
       run_first = tile; run_heap = unmap ? 0 : heap_tile; run_len = 1; run_unmap = unmap;
@@ -635,92 +782,57 @@ static void STDMETHODCALLTYPE queue_UpdateTileMappings(void *This, ID3D12Resourc
   mem_free(tiles);
 }
 
+/* CopyTileMappings: the destination region's tiles get the source region's mappings, tile for tile (the source's read first: the regions may overlap). */
 static void STDMETHODCALLTYPE queue_CopyTileMappings(void *This, ID3D12Resource *dst, const D3D12_TILED_RESOURCE_COORDINATE *dst_start, ID3D12Resource *src,
                                                      const D3D12_TILED_RESOURCE_COORDINATE *src_start, const D3D12_TILE_REGION_SIZE *size, D3D12_TILE_MAPPING_FLAGS flags) {
   Resource *d = (Resource *)dst, *s = (Resource *)src;
+  (void)flags;
   if (!d || !s || !d->reserved || !s->reserved || !dst_start || !src_start || !size) return;
+  const UINT64 count = region_size(size);
+  if (count == 0 || count > MAX_REGION_TILES) return;
   TileLayout dl, sl;
   tile_layout(&d->desc, &dl);
   tile_layout(&s->desc, &sl);
-  UINT *a = mem_alloc((SIZE_T)MAX_REGION_TILES * 8);
-  if (!a) return;
-  UINT *b = a + MAX_REGION_TILES;
-  const UINT na = region_tiles(&dl, *dst_start, *size, a, 0, MAX_REGION_TILES), nb = region_tiles(&sl, *src_start, *size, b, 0, MAX_REGION_TILES);
-  /* (the source's mapping is read first: the regions may overlap) */
-  TileBind *copy = mem_alloc((SIZE_T)(na < nb ? na : nb) * sizeof(TileBind) + 8);
-  const UINT n = na < nb ? na : nb;
-  if (copy) {
+  UINT *a = mem_alloc((SIZE_T)count * 8);
+  TileBind *copy = mem_alloc((SIZE_T)count * sizeof(TileBind));
+  if (a && copy) {
+    UINT *b = a + count;
+    const UINT na = region_tiles(&dl, *dst_start, *size, a, 0, (UINT)count), nb = region_tiles(&sl, *src_start, *size, b, 0, (UINT)count);
+    const UINT n = na < nb ? na : nb;
     for (UINT k = 0; k < n; ++k) copy[k] = b[k] < s->tile_count ? s->tile_map[b[k]] : (TileBind){0, 0};
     for (UINT k = 0; k < n; ++k)
-      if (a[k] < d->tile_count) tile_flush(d->d.dev, d, a[k], copy[k].heap, copy[k].tile, 1);
-    mem_free(copy);
+      if (a[k] < d->tile_count && b[k] < s->tile_count) tile_flush(d->d.dev, d, a[k], copy[k].heap, copy[k].tile, 1);
   }
+  mem_free(copy);
   mem_free(a);
 }
 
-/* A rectangle of a level of a reserved texture to or from a buffer (rows `pitch` apart), the buffer's texels the format's - narrower than the kernel's pixels for R8 / R8G8 / R16 /
- * R16G16 (CopyBufferImage's NarrowLayout, which NARROW_* is). */
-static void emit_buffer_image(CmdList *l, UINT direction, const Resource *image, UINT level, UINT x, UINT y, UINT w, UINT h, const Resource *buffer, UINT64 offset, UINT pitch) {
-  UINT payload[12] = {direction, alloc_index(l, image->alloc), level, 0, x, y, w, h, alloc_index(l, buffer->alloc), (UINT)offset, pitch, image->fmt ? image->fmt->narrow : 0};
-  packet(l, OP_COPY_BUFFER_IMAGE, payload, payload[11] ? 12 : 11);
-}
-
+/* CopyTiles: the region's tiles, each the 64 KiB its heap holds for it (the elements in the tile's rows - the "swizzled" layout of this driver), to or from the buffer from
+ * `buffer_offset` on, one after the other (the kernel's CopyTiles: an unmapped tile reads as zeros, what is copied into one is dropped). Exactly one direction. */
 static void STDMETHODCALLTYPE list_CopyTiles(CmdList *l, ID3D12Resource *resource, const D3D12_TILED_RESOURCE_COORDINATE *start, const D3D12_TILE_REGION_SIZE *size, ID3D12Resource *buffer,
                                              UINT64 buffer_offset, D3D12_TILE_COPY_FLAGS flags) {
   Resource *r = (Resource *)resource, *b = (Resource *)buffer;
-  if (l->bundle || !r || !b || !r->reserved || !start || !size) return;
-  const int to_resource = (flags & D3D12_TILE_COPY_FLAG_LINEAR_BUFFER_TO_SWIZZLED_TILED_RESOURCE) != 0;
-  if (!to_resource && !(flags & D3D12_TILE_COPY_FLAG_SWIZZLED_TILED_RESOURCE_TO_LINEAR_BUFFER)) return;
+  if (l->bundle || !r || !b || !r->reserved || !start || !size || b->desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER || b->reserved) return;
+  const int to_resource = (flags & D3D12_TILE_COPY_FLAG_LINEAR_BUFFER_TO_SWIZZLED_TILED_RESOURCE) != 0, to_buffer = (flags & D3D12_TILE_COPY_FLAG_SWIZZLED_TILED_RESOURCE_TO_LINEAR_BUFFER) != 0;
+  if (to_resource == to_buffer) return;
+  const UINT64 count = region_size(size);
+  if (count == 0 || count > MAX_REGION_TILES || buffer_offset > b->desc.Width || count * KTILE_BYTES > b->desc.Width - buffer_offset || buffer_offset + count * KTILE_BYTES > 0xFFFFFFFFull) return;
   TileLayout layout;
   tile_layout(&r->desc, &layout);
-  UINT *tiles = mem_alloc((SIZE_T)MAX_REGION_TILES * 4);
+  UINT *tiles = mem_alloc((SIZE_T)count * sizeof(UINT));
   if (!tiles) return;
-  const UINT n = region_tiles(&layout, *start, *size, tiles, 0, MAX_REGION_TILES);
+  const UINT n = region_tiles(&layout, *start, *size, tiles, 0, (UINT)count);
   end_pass(l);
-  for (UINT k = 0; k < n; ++k) {
-    const UINT tile = tiles[k];
-    const UINT64 at = buffer_offset + (UINT64)k * KTILE_BYTES;
-    if (tile >= layout.total || at + KTILE_BYTES > b->desc.Width || at > 0xFFFFFFFFu) continue;
-    ensure_room(l, 2048, 4);
-    if (r->desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
-      UINT w[5];
-      if (to_resource) { w[0] = alloc_index(l, r->alloc); w[1] = tile * KTILE_BYTES; w[2] = alloc_index(l, b->alloc); w[3] = (UINT)at; }
-      else { w[0] = alloc_index(l, b->alloc); w[1] = (UINT)at; w[2] = alloc_index(l, r->alloc); w[3] = tile * KTILE_BYTES; }
-      w[4] = KTILE_BYTES;
-      packet(l, OP_COPY_BUFFER, w, 5);
-      continue;
+  /* (runs of tiles that follow each other in the numbering become one copy each) */
+  for (UINT k = 0; k < n;) {
+    UINT run = 1;
+    while (k + run < n && tiles[k] != (UINT)-1 && tiles[k + run] == tiles[k] + run) ++run;
+    if (tiles[k] != (UINT)-1) {
+      ensure_room(l, 64, 2);      /* (before the allocations are numbered in the chunk) */
+      UINT w[6] = {to_resource ? 0u : 1u, alloc_index(l, r->alloc), tiles[k], run, alloc_index(l, b->alloc), (UINT)(buffer_offset + (UINT64)k * KTILE_BYTES)};
+      packet(l, OP_COPY_TILES, w, 6);
     }
-    UINT level = 0;
-    while (level < layout.standard && tile >= layout.first[level] + layout.across[level] * layout.down[level]) ++level;
-    if (level < layout.standard) {
-      const UINT local = tile - layout.first[level], tx = local % layout.across[level], ty = local / layout.across[level];
-      const UINT lw = mip_extent((UINT)r->desc.Width, level), lh = mip_extent(r->desc.Height, level);
-      const UINT x = tx * layout.tile_w, y = ty * layout.tile_h;
-      emit_buffer_image(l, to_resource ? 0 : 1, r, level, x, y, lw - x < layout.tile_w ? lw - x : layout.tile_w, lh - y < layout.tile_h ? lh - y : layout.tile_h, b, at,
-                        layout.tile_w * layout.texel);
-    } else {
-      /* a tile of the packed levels: its 64 KiB of their texels, which run one level after the other, row by row (a row may go on in the next tile; a texel never does) */
-      const UINT64 low = (UINT64)(tile - layout.tail_first) * KTILE_BYTES, high = low + KTILE_BYTES;
-      UINT64 pos = 0;
-      for (UINT lv = layout.standard; lv < layout.mips && pos < high; ++lv) {
-        const UINT lw = mip_extent((UINT)r->desc.Width, lv), lh = mip_extent(r->desc.Height, lv);
-        const UINT64 row = (UINT64)lw * layout.texel;
-        if (pos + row * lh <= low) { pos += row * lh; continue; }
-        if (pos >= low && pos + row * lh <= high) {      /* (the whole level in this tile: one copy) */
-          ensure_room(l, 2048, 4);
-          emit_buffer_image(l, to_resource ? 0 : 1, r, lv, 0, 0, lw, lh, b, at + (pos - low), (UINT)row);
-          pos += row * lh;
-          continue;
-        }
-        for (UINT y = 0; y < lh && pos < high; ++y, pos += row) {
-          const UINT64 from = pos > low ? pos : low, to = pos + row < high ? pos + row : high;
-          if (from >= to) continue;
-          const UINT x = (UINT)((from - pos) / layout.texel), w = (UINT)((to - from) / layout.texel);
-          ensure_room(l, 2048, 4);
-          emit_buffer_image(l, to_resource ? 0 : 1, r, lv, x, y, w, 1, b, at + (from - low), (UINT)(to - from));
-        }
-      }
-    }
+    k += run;
   }
   mem_free(tiles);
 }
@@ -752,33 +864,76 @@ static void STDMETHODCALLTYPE list_SetPredication(CmdList *l, ID3D12Resource *bu
 
 /* ---- stream output ------------------------------------------------------------------------------------------------------------------------------------------------------- */
 
+/* A view's writes start at BufferLocation plus the filled size at BufferFilledSizeLocation when its draws run (the value then: read as the chunk is run, which the binding
+ * begins - so the copies that set it before are done), and stop at SizeInBytes after BufferLocation (the kernel's end of the binding: a primitive that does not fit is not
+ * written, nor any after it, and it counts as needed and not written in the stream output statistics). The filled size is the bytes after BufferLocation the draws reached:
+ * written after each chunk from the one that sent the binding on (list_apply_fills), so the copies of it in the list that come after the draws (in a chunk after them:
+ * so_copy_order) and the next binding read it. A view with no BufferFilledSizeLocation starts at BufferLocation. The views' SizeInBytes past the buffer's end is cut there. */
 static void STDMETHODCALLTYPE list_SOSetTargets(CmdList *l, UINT start, UINT count, const D3D12_STREAM_OUTPUT_BUFFER_VIEW *views) {
   if (l->bundle) return;
+  int filled_sizes = 0;
+  for (UINT i = 0; i < count && start + i < 4; ++i) filled_sizes |= views && views[i].BufferLocation && views[i].BufferFilledSizeLocation;
+  for (UINT i = 0; i < count && start + i < 4; ++i) {      /* (the bindings replaced: their draws end in this chunk) */
+    const UINT entry = l->so[start + i].alloc ? l->so[start + i].fill_entry : 0xFFFFFFFFu;
+    if (entry < l->nfills && l->fills[entry].retired_chunk == 0xFFFFFFFFu) l->fills[entry].retired_chunk = l->nchunks ? l->nchunks - 1 : 0;
+  }
+  if (filled_sizes && chunk_cur(l)) { end_pass(l); chunk_new(l); }      /* (the draws after it read the filled sizes as they are when their chunk runs) */
   for (UINT i = 0; i < count && start + i < 4; ++i) {
     SoTarget *t = &l->so[start + i];
     memset(t, 0, sizeof *t);
+    t->fill_entry = 0xFFFFFFFFu;
     if (!views || !views[i].BufferLocation) continue;
     UINT64 offset = 0;
     Resource *r = va_find(views[i].BufferLocation, &offset);
     if (!r) continue;
     t->alloc = r->alloc;
     t->offset = offset;
+    const UINT64 room = r->desc.Width > offset ? r->desc.Width - offset : 0;
+    t->size = views[i].SizeInBytes < room ? views[i].SizeInBytes & ~(UINT64)3 : room & ~(UINT64)3;
+    if (t->offset > 0xFFFFFFFFu || t->offset + t->size > 0xFFFFFFFFu) { memset(t, 0, sizeof *t); t->fill_entry = 0xFFFFFFFFu; continue; }
     UINT64 fill_offset = 0;
     t->fill = views[i].BufferFilledSizeLocation ? va_find(views[i].BufferFilledSizeLocation, &fill_offset) : NULL;
     t->fill_offset = fill_offset;
-    if (t->fill && l->nfills < 16) l->fills[l->nfills++] = *t;
+    t->sent_chunk = t->retired_chunk = 0xFFFFFFFFu;
+    if (t->fill && l->nfills < 16) {
+      t->fill_entry = l->nfills;
+      l->fills[l->nfills++] = *t;
+    }
   }
   l->so_dirty = 1;
 }
 
-/* The bytes of each target the list wrote, into the places the program named (after the list ran). */
-static void list_apply_fills(CmdList *l) {
+/* The bytes of each target the draws reached, into the places the program named: after chunk `chunk` ran, for each binding sent in it or before (the last of a buffer's). */
+static void list_apply_fills(CmdList *l, UINT chunk) {
   for (UINT i = 0; i < l->nfills; ++i) {
     const SoTarget *t = &l->fills[i];
+    if (t->sent_chunk == 0xFFFFFFFFu || t->sent_chunk > chunk || (t->retired_chunk != 0xFFFFFFFFu && chunk > t->retired_chunk)) continue;
+    int later = 0;      /* (a later binding of the buffer that was sent: the buffer's end is that one's) */
+    for (UINT k = i + 1; k < l->nfills && !later; ++k) later = l->fills[k].alloc == t->alloc && l->fills[k].sent_chunk <= chunk;
+    if (later) continue;
     UINT request[2] = {ESC_QUERY_STREAM_OUTPUT, t->alloc}, reply[2] = {0, 0};
     if (!KMT_OK(dev_escape(l->d.dev, request, 2, reply, 2))) continue;
     UINT64 filled = reply[0] | ((UINT64)reply[1] << 32);
     filled = filled > t->offset ? filled - t->offset : 0;
+    if (filled > t->size) filled = t->size;
     res_write(t->fill, t->fill_offset, &filled, 8);
   }
+}
+
+/* A copy in the list that reads a filled size the draws of this chunk write (after the chunk): it goes into the next chunk. One that writes the filled size of a bound
+ * target: the binding is sent again after it (in a chunk of its own), starting where the value says. */
+static void so_copy_order(CmdList *l, const ID3D12Resource *dst, const ID3D12Resource *src, int after) {
+  if (!after) {      /* (before the copy: one that reads a filled size of this chunk's draws goes into the next) */
+    const UINT current = l->nchunks ? l->nchunks - 1 : 0;
+    for (UINT i = 0; i < l->nfills; ++i)
+      if ((const ID3D12Resource *)l->fills[i].fill == src && l->fills[i].sent_chunk == current) { end_pass(l); chunk_new(l); break; }
+    return;
+  }
+  for (UINT s = 0; s < 4; ++s)      /* (after it: one that wrote a bound target's filled size ends the chunk, and the binding is sent again from the value) */
+    if (l->so[s].alloc && (const ID3D12Resource *)l->so[s].fill == dst) {
+      end_pass(l);
+      chunk_new(l);
+      l->so_dirty = 1;
+      break;
+    }
 }

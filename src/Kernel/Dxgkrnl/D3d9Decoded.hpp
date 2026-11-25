@@ -74,7 +74,9 @@ enum Opcode : uint16_t {
 
 enum RegType : uint8_t { kPatchOut = 21 /* a hull shader's patch constant output register (fork and join phases) */, kPatchIn = 22 /* a domain shader's patch constant input register */, kTemp = 0, kInput = 1, kConst = 2, kAddrTex = 3, kRastOut = 4, kAttrOut = 5, kTexCrdOut = 6, kColorOut = 8, kDepthOut = 9, kSampler = 10, kConstBool = 14,
                kSysValue = 20 /* (not in a token stream: a Shader Model 4 system value; number: kSysPosition ...) */ };
-enum SysValue : uint8_t { kSysPosition = 0, kSysFrontFacing, kSysPrimitiveId, kSysVertexId, kSysInstanceId, kSysDispatchThreadId, kSysGroupId, kSysGroupThreadId, kSysGroupIndex, kSysOutputControlPointId, kSysForkInstanceId, kSysJoinInstanceId, kSysDomainLocation, kSysGsInstanceId, kSysValueCount };
+enum SysValue : uint8_t { kSysPosition = 0, kSysFrontFacing, kSysPrimitiveId, kSysVertexId, kSysInstanceId, kSysDispatchThreadId, kSysGroupId, kSysGroupThreadId, kSysGroupIndex, kSysOutputControlPointId, kSysForkInstanceId, kSysJoinInstanceId, kSysDomainLocation, kSysGsInstanceId,
+                        // (Shader Model 6.1+, from the DXIL translator: SV_ViewID of every stage, a pixel shader's SV_Barycentrics - perspective-correct and noperspective - and SV_ShadingRate)
+                        kSysViewId, kSysBarycentrics, kSysBarycentricsLinear, kSysShadingRate, kSysHelperLane /* (IsHelperLane: all ones or zero) */, kSysValueCount };
 enum AtomicKind : uint8_t { kAtomicAdd = 0, kAtomicAnd, kAtomicOr, kAtomicXor, kAtomicIMax, kAtomicIMin, kAtomicUMax, kAtomicUMin, kAtomicExchange, kAtomicCompareExchange };
 enum Usage : uint8_t { kUsagePosition = 0, kUsageTexCoord = 5, kUsageColor = 10 };
 enum Modifier : uint8_t { kModNone, kModNeg, kModBias, kModBiasNeg, kModSign, kModSignNeg, kModComp, kModX2, kModX2Neg, kModDz, kModDw, kModAbs, kModAbsNeg, kModNot };
@@ -85,6 +87,7 @@ constexpr uint32_t kMaxTemps = 256, kMaxInputs = 16, kMaxOutputs = 16;
 constexpr uint32_t kMaxD3d9Temps = 32;   // r0 .. r31 of a Direct3D 9 token stream
 constexpr int8_t kSlotNone = -1, kSlotPosition = -2, kSlotLayer = -3;   // (kSlotLayer: a geometry shader's SV_RenderTargetArrayIndex output, a kRastOut register)
 constexpr int8_t kSlotViewport = -4;   // (SV_ViewportArrayIndex, the same way)
+constexpr int8_t kSlotShadingRate = -5;   // (SV_ShadingRate of a vertex or geometry shader, the same way)
 
 }  // namespace d3d9
 
@@ -102,6 +105,7 @@ struct D3d9Program::Instruction {
     uint16_t number = 0;
     uint8_t vertex = 0;        // a geometry, hull or domain shader's input: which vertex or control point (v[vertex][register])
     bool vertex_from_id = false;   // ... the one the hull shader's control point phase is making (vOutputControlPointID)
+    bool at_vertex = false;        // a pixel shader's input at vertex `vertex` of the primitive (GetAttributeAtVertex), not interpolated
     int8_t slot = kSlotNone;   // inputs: the attribute location / varying
     uint8_t swizzle[4] = {0, 1, 2, 3};
     uint8_t modifier = kModNone;
@@ -126,6 +130,12 @@ struct D3d9Program::Instruction {
   uint32_t stride = 0;
   uint8_t tex_swizzle[4] = {0, 1, 2, 3};   // texld: which texel component each result component takes
   int8_t texel_offset[2] = {0, 0};          // gather4: the static offset of the footprint, in texels (the extended opcode token's)
+  // The residency feedback forms of the texture lookups (Shader Model 5's tiled resources: sample_cl_s, ld_s, gather4_s, ...): the lookup reports into `status` (one component;
+  // mask 0: the status is not wanted) 1 when every texel it read was mapped, 0 when one was not (ITextureSet::begin_feedback / end_feedback), and `clamp` (when has_clamp) is the
+  // finest level of detail it may use (sample_cl_s, sample_b_cl_s, sample_d_cl_s, sample_c_cl_s).
+  bool feedback = false, has_clamp = false;
+  Dst status;
+  Src clamp;
   Dst dst;
   Src src[4];
   uint8_t src_count = 0;

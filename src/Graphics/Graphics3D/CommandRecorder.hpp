@@ -31,12 +31,18 @@ struct RecordedCommand {
     BeginRenderPass, BindPipeline, BindVertexBuffer, BindIndexBuffer, PushConstants, BindTexture, SetViewport, SetScissor,
     Draw, DrawIndexed, EndRenderPass, SetTopology, BeginQuery, EndQuery, BindComputePipeline, BindStorageBuffer, Dispatch, Resolve, SetPatchPoints, BindStreamOutput, BindStorageImage, BindStorageTexelBuffer,
     SetViewportAt, SetScissorAt,   // (viewport or scissor `unit` of `count`: set_viewports / set_scissors, one command for each)
+    // (set_depth_bounds: `count` the enable, viewport.min_depth / max_depth the bounds; set_sample_positions: `count` samples, `first` pixels, the positions as x, y bytes in the
+    // constants at constants_offset; set_view_instance: `count` the view, `first` the viewport offset, `unit` the layer offset; set_shading_rate: `count` the rate, `first` the
+    // combiners (primitive | image << 8); set_shading_rate_image: `image`)
+    SetDepthBounds, SetSamplePositions, SetViewInstance, SetShadingRate, SetShadingRateImage,
+    CopySamples,   // (copy_samples: `image` the destination, `image2` the source, `scissor` the region, `count` and `first` x and y)
   };
   Type type = Type::Draw;
   RenderPassBegin pass;
   const IPipeline* pipeline = nullptr;
   IBuffer* buffer = nullptr;
   uint64_t offset = 0;
+  uint64_t end = kStreamOutputNoEnd;   // (BindStreamOutput: where the writes stop)
   IndexType index_type = IndexType::Uint16;
   uint32_t constants_offset = 0, constants_size = 0;  // into CommandRecorder::constants()
   Viewport viewport;
@@ -186,6 +192,50 @@ class CommandRecorder : public ICommandBuffer {
     c.first_instance = first_instance;
     add(c);
   }
+  void set_depth_bounds(bool enable, float min, float max) override {
+    RecordedCommand c;
+    c.type = RecordedCommand::Type::SetDepthBounds;
+    c.count = enable ? 1 : 0;
+    c.viewport.min_depth = min;
+    c.viewport.max_depth = max;
+    add(c);
+  }
+  void set_sample_positions(uint32_t samples, uint32_t pixels, ArrayView<const SamplePosition> positions) override {
+    if (pixels != 0 && (uint64_t{samples} * pixels > kMaxSamplePositions || positions.size() < uint64_t{samples} * pixels)) {
+      ok_ = false;
+      return;
+    }
+    RecordedCommand c;
+    c.type = RecordedCommand::Type::SetSamplePositions;
+    c.count = samples;
+    c.first = pixels;
+    c.constants_offset = static_cast<uint32_t>(constants_.count());
+    c.constants_size = pixels ? samples * pixels * 2 : 0;
+    for (uint32_t i = 0; pixels && i < samples * pixels; ++i)
+      if (!constants_.push_back(static_cast<uint8_t>(positions[i].x)) || !constants_.push_back(static_cast<uint8_t>(positions[i].y))) ok_ = false;
+    add(c);
+  }
+  void set_view_instance(uint32_t view_id, uint32_t viewport_offset, uint32_t layer_offset) override {
+    RecordedCommand c;
+    c.type = RecordedCommand::Type::SetViewInstance;
+    c.count = view_id;
+    c.first = viewport_offset;
+    c.unit = layer_offset;
+    add(c);
+  }
+  void set_shading_rate(uint32_t rate, ShadingRateCombiner primitive, ShadingRateCombiner image) override {
+    RecordedCommand c;
+    c.type = RecordedCommand::Type::SetShadingRate;
+    c.count = rate;
+    c.first = static_cast<uint32_t>(primitive) | static_cast<uint32_t>(image) << 8;
+    add(c);
+  }
+  void set_shading_rate_image(IImage* image) override {
+    RecordedCommand c;
+    c.type = RecordedCommand::Type::SetShadingRateImage;
+    c.image = image;
+    add(c);
+  }
   void set_patch_control_points(uint32_t count) override {
     RecordedCommand c;
     c.type = RecordedCommand::Type::SetPatchPoints;
@@ -211,7 +261,16 @@ class CommandRecorder : public ICommandBuffer {
     c.image2 = source;
     add(c);
   }
-  void bind_stream_output(uint32_t slot, IBuffer* buffer, uint64_t offset) override {
+  void copy_samples(IImage* destination, IImage* source, const Rect2D& region, uint32_t x, uint32_t y) override {
+    RecordedCommand c;
+    c.type = RecordedCommand::Type::CopySamples;
+    c.image = destination;
+    c.image2 = source;
+    c.scissor = region;
+    c.count = x, c.first = y;
+    add(c);
+  }
+  void bind_stream_output(uint32_t slot, IBuffer* buffer, uint64_t offset, uint64_t end = kStreamOutputNoEnd) override {
     if (slot >= kMaxStreamOutputBuffers) {
       ok_ = false;
       return;
@@ -221,6 +280,7 @@ class CommandRecorder : public ICommandBuffer {
     c.unit = slot;
     c.buffer = buffer;
     c.offset = offset;
+    c.end = end;
     add(c);
   }
   void bind_compute_pipeline(const IPipeline* pipeline) override {
