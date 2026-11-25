@@ -362,6 +362,15 @@ struct Dev {
 #define DEV_FEATURE_RESOLVE_MODES (1u << 20)      /* graphics::kFeatureResolveModes: resolves of the least, greatest (and a depth image's mean) samples */
 #define DEV_FEATURE_VERTEX_FORMATS (1u << 29)     /* graphics::kFeatureVertexFormats: vertex elements other than 32-bit floats */
 /* graphics::DeviceFeature3 in KmtCaps.features3: DEV_FEATURE3_* (bit ranges as IGraphicsDevice.hpp DeviceFeature3 says) */
+#define DEV_FEATURE3_MULTISAMPLE_LOADS (1u << 0)         /* multisampled render targets read by shaders: Texture2DMS SRVs, Load with a sample, GetDimensions, GetSamplePosition */
+#define DEV_FEATURE3_MULTISAMPLE_ARRAYS (1u << 1)        /* ... multisampled arrays (DepthOrArraySize > 1): drawn into, resolved a slice at a time, Texture2DMSArray SRVs */
+#define DEV_FEATURE3_MULTISAMPLE_DEPTH_LOADS (1u << 2)   /* ... multisampled depth buffers read by shaders (their depth, a D24S8's stencil) */
+#define DEV_FEATURE3_INTERPOLATION_MODES (1u << 3)       /* noperspective and centroid inputs (nointerpolation needs nothing) */
+#define DEV_FEATURE3_SAMPLE_SHADING (1u << 4)            /* SV_SampleIndex and inputs at the sample: the shader runs for each sample; GetRenderTargetSampleCount / Position */
+#define DEV_FEATURE3_EVALUATE_ATTRIBUTES (1u << 5)       /* EvaluateAttributeAtSample / Snapped / Centroid */
+#define DEV_FEATURE3_COVERAGE (1u << 6)                  /* SV_Coverage in and out */
+#define DEV_FEATURE3_INNER_COVERAGE (1u << 7)            /* SV_InnerCoverage (with conservative rasterization: ConservativeRasterizationTier 3) */
+#define RESOLVE_SOURCE_LAYER 0x100u                      /* (the kernel's ResolveRegion mode bit kResolveSourceLayer: the source's layer in the next word) */
 /* graphics::DeviceFeature2 in KmtCaps.features2 */
 #define DEV_FEATURE2_STORAGE_IMAGES (1u << 0)            /* unordered access views of textures (KA_STORAGE_IMAGE), in compute shaders */
 #define DEV_FEATURE2_STORAGE_IMAGES_IN_DRAWS (1u << 1)   /* ... and in pixel shaders */

@@ -5844,6 +5844,258 @@ static void test_shader_query_gaps(void) {
   test_dynamic_class_index();
 }
 
+/* Multisampling in shaders: 4x textures of 16 x 16 that are render targets and shader resources, drawn with the fixtures' pixel shaders on vs_msaa, every sample read back through a
+ * Texture2DMS reader into the scene's target (pixel (x, y) is sample x mod 4 of texel (x / 4, y)); a multisampled array drawn a slice at a time and read through Texture2DMSArray, a
+ * slice resolved; a multisampled depth buffer read; SV_SampleIndex, EvaluateAttribute*, SV_Coverage; MULTISAMPLE_LOAD in the format support. */
+static const int kMsPos4[4][2] = {{-2, -6}, {6, -2}, {-6, 2}, {2, 6}};
+static int ms_in(float x0, float x1, int px, int k) {
+  const float sx = (float)px + 0.5f + (float)kMsPos4[k][0] / 16.0f;
+  return sx >= x0 && sx < x1;
+}
+static void ms_quad(VertexF *v, float x0, float y0, float x1, float y1, float r, float g, float b, float z) {
+  const float px[6] = {x0, x1, x0, x0, x1, x1}, py[6] = {y0, y0, y1, y1, y0, y1};
+  for (int i = 0; i < 6; ++i) v[i] = (VertexF){px[i] / 8 - 1, 1 - py[i] / 8, z, r, g, b, 1};
+}
+/* Draws six vertices with `ps` (on vs_msaa) into `rtv` (and `dsv`), 16 x 16, cleared to opaque black. */
+static void ms_draw11(ID3D11InputLayout *layout, ID3D11VertexShader *vs, ID3D11PixelShader *ps, ID3D11RenderTargetView *rtv, ID3D11DepthStencilView *dsv, ID3D11DepthStencilState *dss,
+                      const VertexF *v, UINT count) {
+  ID3D11Buffer *vb = make_buffer(D3D11_BIND_VERTEX_BUFFER, D3D11_USAGE_DEFAULT, 0, v, count * sizeof(VertexF));
+  const UINT stride = sizeof(VertexF), offset = 0;
+  const D3D11_VIEWPORT viewport = {0, 0, 16, 16, 0, 1};
+  const float black[4] = {0, 0, 0, 1};
+  ID3D11DeviceContext_OMSetRenderTargets(g_context, 1, &rtv, dsv);
+  ID3D11DeviceContext_ClearRenderTargetView(g_context, rtv, black);
+  if (dsv) ID3D11DeviceContext_ClearDepthStencilView(g_context, dsv, D3D11_CLEAR_DEPTH | D3D11_CLEAR_STENCIL, 1.0f, 0);
+  ID3D11DeviceContext_OMSetDepthStencilState(g_context, dss, 0);
+  ID3D11DeviceContext_RSSetViewports(g_context, 1, &viewport);
+  ID3D11DeviceContext_RSSetState(g_context, g_no_cull);
+  ID3D11DeviceContext_IASetInputLayout(g_context, layout);
+  ID3D11DeviceContext_IASetVertexBuffers(g_context, 0, 1, &vb, &stride, &offset);
+  ID3D11DeviceContext_IASetPrimitiveTopology(g_context, D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+  ID3D11DeviceContext_VSSetShader(g_context, vs, NULL, 0);
+  ID3D11DeviceContext_PSSetShader(g_context, ps, NULL, 0);
+  ID3D11DeviceContext_Draw(g_context, count, 0);
+  ID3D11DeviceContext_OMSetRenderTargets(g_context, 0, NULL, NULL);
+  ID3D11DeviceContext_OMSetDepthStencilState(g_context, NULL, 0);
+  if (vb) ID3D11Buffer_Release(vb);
+}
+/* Reads `view` with the reader `ps` over the whole scene target, into g_pixels. */
+static int ms_read11(ID3D11ShaderResourceView *view, ID3D11PixelShader *ps) {
+  begin(NULL);
+  clear(0, 0, 0);
+  const VertexF full[3] = {{-1, -1, 0.5f, 1, 1, 1, 1}, {3, -1, 0.5f, 1, 1, 1, 1}, {-1, 3, 0.5f, 1, 1, 1, 1}};
+  ID3D11Buffer *vb = make_buffer(D3D11_BIND_VERTEX_BUFFER, D3D11_USAGE_DEFAULT, 0, full, sizeof full);
+  bind_floats(vb);
+  ID3D11DeviceContext_PSSetShader(g_context, ps, NULL, 0);
+  ID3D11DeviceContext_PSSetShaderResources(g_context, 0, 1, &view);
+  ID3D11DeviceContext_Draw(g_context, 3, 0);
+  ID3D11ShaderResourceView *none = NULL;
+  ID3D11DeviceContext_PSSetShaderResources(g_context, 0, 1, &none);
+  const int ok = read_target();
+  if (vb) ID3D11Buffer_Release(vb);
+  return ok;
+}
+static UINT32 ms_px(int x, int y, int k) { return g_pixels[y * SIZE + x * 4 + k]; }
+
+static void test_msaa_shaders(void) {
+  UINT levels = 0, support = 0, depth_support = 0;
+  ID3D11Device_CheckMultisampleQualityLevels(g_device, DXGI_FORMAT_B8G8R8A8_UNORM, 4, &levels);
+  ID3D11Device_CheckFormatSupport(g_device, DXGI_FORMAT_B8G8R8A8_UNORM, &support);
+  ID3D11Device_CheckFormatSupport(g_device, DXGI_FORMAT_R24_UNORM_X8_TYPELESS, &depth_support);
+  printf("d3d11test: (msaa shaders: 4x %u, MULTISAMPLE_LOAD %d, depth views %d)\n", levels, !!(support & D3D11_FORMAT_SUPPORT_MULTISAMPLE_LOAD), !!(depth_support & D3D11_FORMAT_SUPPORT_MULTISAMPLE_LOAD));
+  if (!levels || !(support & D3D11_FORMAT_SUPPORT_MULTISAMPLE_LOAD)) {
+    D3D11_TEXTURE2D_DESC desc = {16, 16, 1, 1, DXGI_FORMAT_B8G8R8A8_UNORM, {4, 0}, D3D11_USAGE_DEFAULT, D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE, 0, 0};
+    ID3D11Texture2D *t = NULL;
+    check(!levels || (FAILED(ID3D11Device_CreateTexture2D(g_device, &desc, NULL, &t)) && !t), "msaa shaders: a multisampled texture read by shaders is refused where the format has no MULTISAMPLE_LOAD");
+    if (t) ID3D11Texture2D_Release(t);
+    return;
+  }
+  ID3D11VertexShader *vs = NULL;
+  ID3D11PixelShader *flat = NULL, *load = NULL, *info = NULL, *array_reader = NULL, *depth_reader = NULL, *sample_index = NULL, *eval = NULL, *omask = NULL;
+  ID3D11InputLayout *layout = NULL;
+  const D3D11_INPUT_ELEMENT_DESC floats[2] = {{"POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0, D3D11_INPUT_PER_VERTEX_DATA, 0},
+                                              {"COLOR", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 12, D3D11_INPUT_PER_VERTEX_DATA, 0}};
+  HRESULT hr = ID3D11Device_CreateVertexShader(g_device, dx_vs_msaa_dxbc, sizeof dx_vs_msaa_dxbc, NULL, &vs);
+  if (SUCCEEDED(hr)) hr = ID3D11Device_CreateInputLayout(g_device, floats, 2, dx_vs_msaa_dxbc, sizeof dx_vs_msaa_dxbc, &layout);
+  if (SUCCEEDED(hr)) hr = ID3D11Device_CreatePixelShader(g_device, dx_ps_flat_dxbc, sizeof dx_ps_flat_dxbc, NULL, &flat);
+  if (SUCCEEDED(hr)) hr = ID3D11Device_CreatePixelShader(g_device, dx_ps_ms_load_dxbc, sizeof dx_ps_ms_load_dxbc, NULL, &load);
+  if (SUCCEEDED(hr)) hr = ID3D11Device_CreatePixelShader(g_device, dx_ps_ms_info_dxbc, sizeof dx_ps_ms_info_dxbc, NULL, &info);
+  if (SUCCEEDED(hr)) hr = ID3D11Device_CreatePixelShader(g_device, dx_ps_ms_array_dxbc, sizeof dx_ps_ms_array_dxbc, NULL, &array_reader);
+  if (SUCCEEDED(hr)) hr = ID3D11Device_CreatePixelShader(g_device, dx_ps_ms_depth_dxbc, sizeof dx_ps_ms_depth_dxbc, NULL, &depth_reader);
+  if (SUCCEEDED(hr)) hr = ID3D11Device_CreatePixelShader(g_device, dx_ps_sample_index_dxbc, sizeof dx_ps_sample_index_dxbc, NULL, &sample_index);
+  if (SUCCEEDED(hr)) hr = ID3D11Device_CreatePixelShader(g_device, dx_ps_eval_dxbc, sizeof dx_ps_eval_dxbc, NULL, &eval);
+  if (SUCCEEDED(hr)) hr = ID3D11Device_CreatePixelShader(g_device, dx_ps_omask_dxbc, sizeof dx_ps_omask_dxbc, NULL, &omask);
+  check(SUCCEEDED(hr), "msaa shaders: the shaders (Texture2DMS and Texture2DMSArray readers, SV_SampleIndex, EvaluateAttribute*, SV_Coverage)");
+  D3D11_TEXTURE2D_DESC desc = {16, 16, 1, 1, DXGI_FORMAT_B8G8R8A8_UNORM, {4, 0}, D3D11_USAGE_DEFAULT, D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE, 0, 0};
+  ID3D11Texture2D *ms = NULL;
+  ID3D11RenderTargetView *rtv = NULL;
+  ID3D11ShaderResourceView *srv = NULL;
+  if (SUCCEEDED(hr)) hr = ID3D11Device_CreateTexture2D(g_device, &desc, NULL, &ms);
+  if (SUCCEEDED(hr)) hr = ID3D11Device_CreateRenderTargetView(g_device, (ID3D11Resource *)ms, NULL, &rtv);
+  if (SUCCEEDED(hr)) hr = ID3D11Device_CreateShaderResourceView(g_device, (ID3D11Resource *)ms, NULL, &srv);
+  D3D11_SHADER_RESOURCE_VIEW_DESC sd;
+  memset(&sd, 0, sizeof sd);
+  if (srv) ID3D11ShaderResourceView_GetDesc(srv, &sd);
+  check(SUCCEEDED(hr) && sd.ViewDimension == D3D11_SRV_DIMENSION_TEXTURE2DMS, "msaa shaders: a 4x texture, its render target view and its shader resource view (TEXTURE2DMS)");
+  if (FAILED(hr)) goto done;
+  {
+    VertexF v[6];
+    ms_quad(v, 4.3f, 0, 12.6f, 16, 1, 0, 0, 0.5f);
+    ms_draw11(layout, vs, flat, rtv, NULL, NULL, v, 6);
+    int right = 0;
+    check(ms_read11(srv, load), "msaa shaders: the samples read back");
+    for (int x = 0; x < 16; ++x)
+      for (int k = 0; k < 4; ++k) right += ms_px(x, 7, k) == (ms_in(4.3f, 12.6f, x, k) ? 0xFFFF0000u : 0xFF000000u);
+    printf("d3d11test: (msaa shaders: %d of 64 samples as drawn)\n", right);
+    check(right == 64, "msaa shaders: Texture2DMS Load gives every sample as the rasterizer covered it");
+    check(ms_read11(srv, info), "msaa shaders: GetDimensions / GetSamplePosition drawn");
+    int ok = 1;
+    for (int k = 0; k < 4; ++k) {
+      const UINT32 p = g_pixels[3 * SIZE + k];
+      ok &= red(p) == 16 && green(p) == 16 && blue(p) == 64 + kMsPos4[k][0] + 8 && (int)(p >> 24) == kMsPos4[k][1] + 8;
+    }
+    check(ok, "msaa shaders: GetDimensions (16 x 16, 4 samples) and the standard sample positions");
+  }
+  {
+    VertexF v[6];
+    ms_quad(v, 0, 0, 16, 16, 1, 1, 1, 0.5f);
+    ms_draw11(layout, vs, sample_index, rtv, NULL, NULL, v, 6);
+    int ok = ms_read11(srv, load);
+    for (int k = 0; k < 4; ++k) {
+      const UINT32 q = ms_px(5, 6, k);
+      const int want = (k + 1) * 64 - (k == 3);
+      ok &= red(q) + 1 >= want && red(q) <= want + 1 && green(q) == kMsPos4[k][0] + 8 && blue(q) == 16 << k;
+    }
+    check(ok, "msaa shaders: SV_SampleIndex runs the shader for each sample (at the sample, with its own coverage bit)");
+    ms_draw11(layout, vs, omask, rtv, NULL, NULL, v, 6);
+    ok = ms_read11(srv, load);
+    for (int x = 0; x < 16; ++x)
+      for (int k = 0; k < 4; ++k) ok &= ms_px(x, 3, k) == ((x >> k & 1) ? 0xFFFFFFFFu : 0xFF000000u);
+    check(ok, "msaa shaders: SV_Coverage as an output keeps the samples of the mask");
+    VertexF g[6];
+    const float px[6] = {0, 16, 0, 0, 16, 16}, py[6] = {0, 0, 16, 16, 0, 16};
+    for (int i = 0; i < 6; ++i) g[i] = (VertexF){px[i] / 8 - 1, 1 - py[i] / 8, 0.5f, px[i] / 64, py[i] / 64, 0, 1};
+    ms_draw11(layout, vs, eval, rtv, NULL, NULL, g, 6);
+    ok = ms_read11(srv, load);
+    for (int y = 8; y < 12; ++y)
+      for (int x = 0; x < 16; ++x) {
+        const UINT32 q = ms_px(x, y, 0);
+        const int s = y % 4;
+        ok &= red(q) + 1 >= kMsPos4[s][0] + 8 && red(q) <= kMsPos4[s][0] + 9 && green(q) + 1 >= kMsPos4[s][1] + 8 && green(q) <= kMsPos4[s][1] + 9 && blue(q) + 1 >= (x & 15) && blue(q) <= (x & 15) + 1;
+        /* (the centroid of a covered pixel: the centre, or on a GPU a covered sample - GL and Vulkan allow any point of the covered part) */
+        int centroid_ok = (int)(q >> 24) >= 7 && (int)(q >> 24) <= 9;
+        for (int j = 0; j < 4; ++j) centroid_ok |= (int)(q >> 24) == kMsPos4[j][0] + 8;
+        ok &= centroid_ok;
+      }
+    check(ok, "msaa shaders: EvaluateAttributeAtSample, Snapped and Centroid");
+  }
+  {
+    /* a multisampled array: slice 0 red on the left, slice 1 green on the right, a TEXTURE2DMSARRAY render target view of each slice */
+    D3D11_TEXTURE2D_DESC ad = desc;
+    ad.ArraySize = 2;
+    ID3D11Texture2D *array = NULL;
+    ID3D11RenderTargetView *slices[2] = {NULL, NULL};
+    ID3D11ShaderResourceView *aview = NULL;
+    hr = ID3D11Device_CreateTexture2D(g_device, &ad, NULL, &array);
+    for (int l = 0; l < 2 && SUCCEEDED(hr); ++l) {
+      D3D11_RENDER_TARGET_VIEW_DESC rd;
+      memset(&rd, 0, sizeof rd);
+      rd.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+      rd.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2DMSARRAY;
+      rd.Texture2DMSArray.FirstArraySlice = (UINT)l, rd.Texture2DMSArray.ArraySize = 1;
+      hr = ID3D11Device_CreateRenderTargetView(g_device, (ID3D11Resource *)array, &rd, &slices[l]);
+    }
+    if (SUCCEEDED(hr)) hr = ID3D11Device_CreateShaderResourceView(g_device, (ID3D11Resource *)array, NULL, &aview);
+    D3D11_SHADER_RESOURCE_VIEW_DESC avd;
+    memset(&avd, 0, sizeof avd);
+    if (aview) ID3D11ShaderResourceView_GetDesc(aview, &avd);
+    check(SUCCEEDED(hr) && avd.ViewDimension == D3D11_SRV_DIMENSION_TEXTURE2DMSARRAY && avd.Texture2DMSArray.ArraySize == 2, "msaa shaders: a multisampled array, views of its slices and of all of it");
+    if (SUCCEEDED(hr)) {
+      VertexF v[6];
+      ms_quad(v, 0, 0, 8, 16, 1, 0, 0, 0.5f);
+      ms_draw11(layout, vs, flat, slices[0], NULL, NULL, v, 6);
+      ms_quad(v, 8, 0, 16, 16, 0, 1, 0, 0.5f);
+      ms_draw11(layout, vs, flat, slices[1], NULL, NULL, v, 6);
+      const int read = ms_read11(aview, array_reader);
+      check(read && g_pixels[2 * SIZE + 4] == 0xFFFF0000u && g_pixels[2 * SIZE + 60] == 0xFF000000u && g_pixels[18 * SIZE + 4] == 0xFF000000u && g_pixels[18 * SIZE + 60] == 0xFF00FF00u &&
+            g_pixels[40 * SIZE] == 0x04101002u, "msaa shaders: Texture2DMSArray Load of each slice, and its GetDimensions");
+      /* slice 1 resolved into a texture of one sample */
+      D3D11_TEXTURE2D_DESC pd = {16, 16, 1, 1, DXGI_FORMAT_B8G8R8A8_UNORM, {1, 0}, D3D11_USAGE_DEFAULT, D3D11_BIND_SHADER_RESOURCE, 0, 0};
+      D3D11_TEXTURE2D_DESC sd2 = {16, 16, 1, 1, DXGI_FORMAT_B8G8R8A8_UNORM, {1, 0}, D3D11_USAGE_STAGING, 0, D3D11_CPU_ACCESS_READ, 0};
+      ID3D11Texture2D *plain = NULL, *staging = NULL;
+      UINT32 left = 0, right = 0;
+      if (SUCCEEDED(ID3D11Device_CreateTexture2D(g_device, &pd, NULL, &plain)) && SUCCEEDED(ID3D11Device_CreateTexture2D(g_device, &sd2, NULL, &staging))) {
+        ID3D11DeviceContext_ResolveSubresource(g_context, (ID3D11Resource *)plain, 0, (ID3D11Resource *)array, 1, DXGI_FORMAT_B8G8R8A8_UNORM);
+        ID3D11DeviceContext_CopyResource(g_context, (ID3D11Resource *)staging, (ID3D11Resource *)plain);
+        D3D11_MAPPED_SUBRESOURCE m;
+        if (SUCCEEDED(ID3D11DeviceContext_Map(g_context, (ID3D11Resource *)staging, 0, D3D11_MAP_READ, 0, &m)) && m.pData) {
+          left = ((const UINT32 *)((const BYTE *)m.pData + 4 * m.RowPitch))[3];
+          right = ((const UINT32 *)((const BYTE *)m.pData + 4 * m.RowPitch))[12];
+          ID3D11DeviceContext_Unmap(g_context, (ID3D11Resource *)staging, 0);
+        }
+      }
+      printf("d3d11test: (msaa shaders: slice 1 resolved: %08x %08x)\n", (unsigned)left, (unsigned)right);
+      check(left == 0xFF000000u && right == 0xFF00FF00u, "msaa shaders: ResolveSubresource of a slice of a multisampled array");
+      if (plain) ID3D11Texture2D_Release(plain);
+      if (staging) ID3D11Texture2D_Release(staging);
+    }
+    for (int l = 0; l < 2; ++l)
+      if (slices[l]) ID3D11RenderTargetView_Release(slices[l]);
+    if (aview) ID3D11ShaderResourceView_Release(aview);
+    if (array) ID3D11Texture2D_Release(array);
+  }
+  if (depth_support & D3D11_FORMAT_SUPPORT_MULTISAMPLE_LOAD) {
+    /* a multisampled depth buffer (R24G8_TYPELESS) drawn into at depth 0.25 from x = 4.3, read through its R24_UNORM_X8_TYPELESS view */
+    D3D11_TEXTURE2D_DESC dd = {16, 16, 1, 1, DXGI_FORMAT_R24G8_TYPELESS, {4, 0}, D3D11_USAGE_DEFAULT, D3D11_BIND_DEPTH_STENCIL | D3D11_BIND_SHADER_RESOURCE, 0, 0};
+    ID3D11Texture2D *depth = NULL;
+    ID3D11DepthStencilView *dsv = NULL;
+    ID3D11ShaderResourceView *dview = NULL;
+    ID3D11DepthStencilState *dss = NULL;
+    D3D11_DEPTH_STENCIL_VIEW_DESC dvd;
+    memset(&dvd, 0, sizeof dvd);
+    dvd.Format = DXGI_FORMAT_D24_UNORM_S8_UINT, dvd.ViewDimension = D3D11_DSV_DIMENSION_TEXTURE2DMS;
+    D3D11_SHADER_RESOURCE_VIEW_DESC svd;
+    memset(&svd, 0, sizeof svd);
+    svd.Format = DXGI_FORMAT_R24_UNORM_X8_TYPELESS, svd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2DMS;
+    D3D11_DEPTH_STENCIL_DESC dsd;
+    memset(&dsd, 0, sizeof dsd);
+    dsd.DepthEnable = TRUE, dsd.DepthWriteMask = D3D11_DEPTH_WRITE_MASK_ALL, dsd.DepthFunc = D3D11_COMPARISON_LESS;
+    int step = 0;
+    hr = ID3D11Device_CreateTexture2D(g_device, &dd, NULL, &depth);
+    if (SUCCEEDED(hr)) step = 1, hr = ID3D11Device_CreateDepthStencilView(g_device, (ID3D11Resource *)depth, &dvd, &dsv);
+    if (SUCCEEDED(hr)) step = 2, hr = ID3D11Device_CreateShaderResourceView(g_device, (ID3D11Resource *)depth, &svd, &dview);
+    if (SUCCEEDED(hr)) step = 3, hr = ID3D11Device_CreateDepthStencilState(g_device, &dsd, &dss);
+    if (FAILED(hr)) printf("d3d11test: (msaa shaders: the depth buffer's step %d: %08lx)\n", step, (unsigned long)hr);
+    check(SUCCEEDED(hr), "msaa shaders: a 4x depth buffer that is a shader resource, its depth and shader resource views");
+    if (SUCCEEDED(hr)) {
+      VertexF v[6];
+      ms_quad(v, 4.3f, 0, 16, 16, 1, 1, 1, 0.25f);
+      ms_draw11(layout, vs, flat, rtv, dsv, dss, v, 6);
+      int ok = ms_read11(dview, depth_reader);
+      for (int x = 3; x < 6; ++x)
+        for (int k = 0; k < 4; ++k) {
+          const int r = red(ms_px(x, 5, k)), want = ms_in(4.3f, 16, x, k) ? 64 : 255;
+          ok &= r + 1 >= want && r <= want + 1;
+        }
+      check(ok, "msaa shaders: the depth of each sample read through Texture2DMS<float>");
+    }
+    if (dss) ID3D11DepthStencilState_Release(dss);
+    if (dview) ID3D11ShaderResourceView_Release(dview);
+    if (dsv) ID3D11DepthStencilView_Release(dsv);
+    if (depth) ID3D11Texture2D_Release(depth);
+  }
+done:
+  if (srv) ID3D11ShaderResourceView_Release(srv);
+  if (rtv) ID3D11RenderTargetView_Release(rtv);
+  if (ms) ID3D11Texture2D_Release(ms);
+  ID3D11PixelShader *shaders[] = {flat, load, info, array_reader, depth_reader, sample_index, eval, omask};
+  for (UINT i = 0; i < sizeof shaders / sizeof shaders[0]; ++i)
+    if (shaders[i]) ID3D11PixelShader_Release(shaders[i]);
+  if (layout) ID3D11InputLayout_Release(layout);
+  if (vs) ID3D11VertexShader_Release(vs);
+  begin(NULL);
+}
+
 int main(void) {
   test_device();
   if (g_device && g_context) {
@@ -5882,6 +6134,7 @@ int main(void) {
       test_vertex_formats();
       test_class_linkage();
       test_shader_query_gaps();
+      test_msaa_shaders();
       test_creation_and_interop();
       test_render_to_levels();
       test_fixed_state();

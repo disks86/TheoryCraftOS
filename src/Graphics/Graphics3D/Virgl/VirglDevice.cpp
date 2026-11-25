@@ -847,6 +847,7 @@ class VirglShaderModule final : public IShaderModule {
     streams_ = desc.geometry_streams;
     output_topology_ = desc.geometry_output;
     sampler_constants_ = desc.sampler_constants;
+    tgsi_gl_ = desc.tgsi_gl;
     desc_ = desc;
     // A shader with storage images or typed views of buffers names their formats and views by marks (IMGFMT<k> and the others of TgsiBindings): the host's shader is made for what a
     // dispatch or draw binds (variant), not now. A copy with a stream output declaration (a pipeline's) cannot be: the variants are made without one.
@@ -901,6 +902,7 @@ class VirglShaderModule final : public IShaderModule {
   const char* tgsi() const { return tgsi_; }   // (the text the kernel keeps for the module's life)
   bool has_images() const { return has_images_; }
   bool sampler_constants() const { return sampler_constants_; }   // (ShaderModuleDesc::sampler_constants)
+  bool tgsi_gl() const { return tgsi_gl_; }   // (ShaderModuleDesc::tgsi_gl: a GL text, whose flat varyings take the last vertex)
   const TgsiBindings& bindings() const { return desc_.tgsi_bindings; }
   // What a variant of the shader is made for: the format of what is bound to each IMAGE[k] (VIRGL_FORMAT_*), the first element and the count of the views of buffers there, and those of
   // the buffer views SVIEW[kTgsiTexelViewBase + k] (the elements the host's view starts before the view's first, and the view's count).
@@ -1033,6 +1035,7 @@ class VirglShaderModule final : public IShaderModule {
   mutable uint32_t next_variant_ = 0;
   bool has_images_ = false;
   bool sampler_constants_ = false;
+  bool tgsi_gl_ = false;
   ShaderModuleDesc desc_;
   uint32_t thread_group_[3] = {1, 1, 1};
   ShaderStage stage_;
@@ -1375,6 +1378,8 @@ class VirglPipeline final : public VirglPipelineBase {
     const uint32_t cull = desc.cull_mode == CullMode::None ? virgl::kFaceNone
                           : desc.cull_mode == CullMode::Back ? virgl::kFaceBack : virgl::kFaceFront;
     const bool front_ccw = desc.front_face == FrontFace::CounterClockwise;
+    // (a flat varying of the Direct3D layer's texts is the primitive's first vertex's - flatshade first -, of a GL text its last: GL's provoking vertex)
+    const bool gl_text = desc.fragment_shader && static_cast<const VirglShaderModule*>(desc.fragment_shader)->tgsi_gl();
     // (the winding is the same for both kinds of image: the viewport flip and Y_0_TOP, or neither, both put the picture's top row at the same place for the rasterizer)
     cmd[n++] = virgl::header(virgl::kCreateObject, virgl::kObjectRasterizer, 9);
     cmd[n++] = rasterizer_;
@@ -1383,7 +1388,7 @@ class VirglPipeline final : public VirglPipelineBase {
     // multisampled lines, which GL draws as rectangles of the line width on a multisampled target - on a target of one sample the host draws its own aliased line)
     const bool quad_lines = desc.line_mode == LineMode::QuadrilateralWide || desc.line_mode == LineMode::QuadrilateralNarrow;
     const bool offset = desc.depth_bias.enabled() && !desc.depth_bias.unorm_bits;   // (a normalised format's bias is the fragment shader's)
-    cmd[n++] = (desc.depth_clip ? 1u << 1 : 0u) /*depth clip*/ | (1u << 2) /*clip half z*/ | (desc.stream_output_count && desc.rasterized_stream < 0 ? 1u << 3 : 0u) /*rasterizer discard*/ | (cull << 8) |
+    cmd[n++] = (gl_text ? 0u : 1u << 4) /*flatshade first*/ | (desc.depth_clip ? 1u << 1 : 0u) /*depth clip*/ | (1u << 2) /*clip half z*/ | (desc.stream_output_count && desc.rasterized_stream < 0 ? 1u << 3 : 0u) /*rasterizer discard*/ | (cull << 8) |
                (fill << 10) | (fill << 12) /*fill front, back*/ | (1u << 14) /*scissor*/ | ((front_ccw ? 1u : 0u) << 15) | (offset ? (1u << 18) | (1u << 20) : 0u) /*offset line (a wireframe triangle's), tri*/ |
                (desc.multisample || quad_lines ? 1u << 25 : 0u) /*multisample*/ | (desc.line_mode == LineMode::AlphaAntialiased ? 1u << 26 : 0u) /*line smooth*/ |
                (1u << 29) /*half pixel center*/ | (1u << 30) /*bottom edge rule*/;

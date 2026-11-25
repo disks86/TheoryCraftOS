@@ -2220,6 +2220,7 @@ void TgsiEmitter::assemble(String* out) {
     if (sys_used_[kSysPrimitiveId]) add(*out, "DCL IN[18], PRIM_ID, CONSTANT\n");
     if (sys_used_[kSysSampleIndex]) add(*out, "DCL SV[0], SAMPLEID\n");
     if (sys_used_[kSysCoverage]) add(*out, "DCL SV[1], SAMPLEMASK\n");
+    if (sys_used_[kSysPosition] && p_.position_location() == graphics::kAtSample) add(*out, "DCL SV[2], SAMPLEPOS\n");
     add(*out, "DCL OUT[0], COLOR\n");
     for (uint32_t i = 1; i < p_.color_outputs_; ++i) {
       add(*out, "DCL OUT[");
@@ -2527,6 +2528,15 @@ NtStatus TgsiEmitter::run(String* out) {
     }
     if (k == kSysPosition) {
       line("MOV", &reg, &source);
+      if (p_.position_location() == graphics::kAtSample) {
+        // (SV_Position at the sample: the pixel's corner and the sample's place in it - a host may give the centre whatever the location, as GL's gl_FragCoord without sample
+        // shading by its own qualifier does)
+        const String xy = temp(kSys + k, ".xy"), xyxy = temp(kSys + k, ".xyxy");
+        String at = str();
+        add(at, "SV[2].xyxy");
+        line("FLR", &xy, &xyxy);
+        line("ADD", &xy, &xyxy, &at);
+      }
       continue;
     }
     line("MOV", &reg, &z);

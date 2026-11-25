@@ -1374,14 +1374,28 @@ static void STDMETHODCALLTYPE list_CopyResource(CmdList *l, ID3D12Resource *dst,
   }
 }
 /* The samples of a multisampled image into an ordinary one of the same format and size: a colour image's are averaged, a depth buffer's first sample is taken (the kernel's
- * ResolveRegion; it refuses formats or sizes that differ). */
+ * ResolveRegion; it refuses formats or sizes that differ). A slice of a multisampled array (the source subresource, DEV_FEATURE3_MULTISAMPLE_ARRAYS) or a destination
+ * subresource other than 0 goes through ResolveSubresourceRegion's ways. */
+static void STDMETHODCALLTYPE list_ResolveSubresourceRegion(CmdList *l, ID3D12Resource *dst, UINT dst_sub, UINT x, UINT y, ID3D12Resource *src, UINT src_sub, D3D12_RECT *rect,
+                                                            DXGI_FORMAT format, D3D12_RESOLVE_MODE mode);
 static void STDMETHODCALLTYPE list_ResolveSubresource(CmdList *l, ID3D12Resource *dst, UINT ds, ID3D12Resource *src, UINT ss, DXGI_FORMAT f) {
   Resource *d = (Resource *)dst, *s = (Resource *)src;
-  if (!d || !s || !d->alloc || !s->alloc || ds != 0 || ss != 0 || l->bundle) return;
+  if (!d || !s || !d->alloc || !s->alloc || l->bundle) return;
   if (s->desc.SampleDesc.Count < 2 || d->desc.SampleDesc.Count > 1) return;
+  const int depth = (s->desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL) != 0;
+  if (ds != 0 || ss != 0) {
+    if (!depth) list_ResolveSubresourceRegion(l, dst, ds, 0, 0, src, ss, NULL, f, D3D12_RESOLVE_MODE_AVERAGE);
+    else if (ds == 0 && ss < (s->layers ? s->layers : 1) && (l->d.dev->caps.features3 & DEV_FEATURE3_MULTISAMPLE_ARRAYS)) {      /* (a depth slice's sample 0) */
+      keep(l, (IUnknown *)dst), keep(l, (IUnknown *)src);
+      end_pass(l);
+      ensure_room(l, 64, 4);
+      UINT payload[4] = {alloc_index(l, d->alloc), alloc_index(l, s->alloc), 1 /* graphics::ResolveMode::Sample0 */ | RESOLVE_SOURCE_LAYER, ss};
+      packet(l, OP_RESOLVE_REGION, payload, 4);
+    }
+    return;
+  }
   end_pass(l);
   ensure_room(l, 64, 4);
-  const int depth = (s->desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL) != 0;
   UINT payload[3] = {alloc_index(l, d->alloc), alloc_index(l, s->alloc), 1 /* graphics::ResolveMode::Sample0 */};
   packet(l, OP_RESOLVE_REGION, payload, depth ? 3 : 2);
 }

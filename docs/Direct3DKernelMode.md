@@ -680,7 +680,7 @@ Direct3D 11's and 12's video interfaces run on the kernel's codecs, on the CPU, 
 - **Shaders**: SM2 / SM3 / SM4 / SM5.0 / SM5.1 vertex and pixel shaders (no geometry / tessellation / compute shaders, no 5.1 register spaces or arrays of resources). The pixel stage of Intel Gen9 is two fixed kernels, so a general pixel
   shader runs there only on the software, virgl (as unvalidated TGSI) and SVGA3D (unvalidated) paths. No loops, calls, predication, ps_1_x, constants above c7 (push constants are
   128 bytes), depth output, fog / point size, cube and volume samplers. Pipeline state is limited to what `IGraphicsDevice` offers (one colour target, 2 textures, alpha blend on/off, depth and stencil).
-- No group-shared memory or barriers (a compute shader that needs `sync` or `dcl_tgsm` is refused), no multisampled shader resources (`Texture2DMS`, `ld2dms`), no depth resolve, no alpha-to-coverage or sample mask, no per-sample shading, no centroid interpolation, no mipmapped / render-target / float cube, volume or array textures (`d3d11.dll` and `d3d9.dll` keep the first level of the ones a program makes with more), and of the colour formats only what "More colour formats" and "More texture formats" below list.
+- No group-shared memory or barriers (a compute shader that needs `sync` or `dcl_tgsm` is refused), (multisampled shader resources, per-sample shading, centroid interpolation and the sample mask are done since: "Multisampling in shaders"), no mipmapped / render-target / float cube, volume or array textures (`d3d11.dll` and `d3d9.dll` keep the first level of the ones a program makes with more), and of the colour formats only what "More colour formats" and "More texture formats" below list.
 - Sync objects cannot be shared between processes. No timeout detection and recovery (a hung device cannot be reset), no vblank / scan line, gamma, overlays or VidPN topology
   (multi-monitor); display mode listing and switching go straight to the GPU driver.
 - Video memory is accounted per adapter but there is no per-process budget or priority-based paging between processes.
@@ -777,9 +777,48 @@ flow control):
 
 ### Multisampled images as shader resources, and depth resolve
 
-A multisampled colour allocation may also be a texture (`kAllocRenderTarget | kAllocTexture`, 8-bit colour). A pixel shader reads it with `Texture2DMS`: `dcl_resource_texture2dms` (the unit's `TextureKind::Texture2DMS`, which a draw checks against the bound allocation having several samples), `ld_ms` (`ITextureSet::fetch_sample`) and `sampleinfo` (the count the texture was declared with, a constant); TGSI `2D_MSAA` `SVIEW` and `TXF` with the sample in the fourth component. **The host's samples are in another order than Direct3D's** (found by drawing edges through a pixel and seeing which samples they covered): its sample 1 is Direct3D's 3 and the other way round for 4x, so the TGSI for `ld_ms` flips the second bit of an odd index (2x and 8x are not remapped, nor checked). `ps_ms.hlsl` and a scene that reads (x + y) mod 4 of each pixel match the real GPU.
+A multisampled colour allocation may also be a texture (`kAllocRenderTarget | kAllocTexture`, 8-bit colour). A pixel shader reads it with `Texture2DMS`: `dcl_resource_texture2dms` (the unit's `TextureKind::Texture2DMS`, which a draw checks against the bound allocation having several samples), `ld_ms` (`ITextureSet::fetch_sample`) and `sampleinfo` (now the count bound: "Multisampling in shaders" below); TGSI `2D_MSAA` `SVIEW` and `TXF` with the sample in the fourth component. **The host's samples are in another order than Direct3D's** (found by drawing edges through a pixel and seeing which samples they covered): its sample 1 is Direct3D's 3 and the other way round for 4x, so the TGSI for `ld_ms` flips the second bit of an odd index (2x and 8x are not remapped, nor checked). `ps_ms.hlsl` and a scene that reads (x + y) mod 4 of each pixel match the real GPU.
 
 `ResolveRegion` takes an optional third word, a `graphics::ResolveMode` (0 average, 1 sample 0, 2 least, 3 greatest), and now also resolves a multisampled **depth** buffer into a single-sample one of the same size (`kFeatureDepthResolve`, with sample 0; the other modes, and the sample 0 of a colour image, `kFeatureResolveModes`: the CPU renderer only). virgl blits depth with the mask `PIPE_MASK_Z` (0x10 in virglrenderer's `p_defines.h`; 0x1 is a colour channel). The scenes read the resolved depth by drawing over it with the depth test; the first-sample one matches the real GPU, the least and greatest are refused there.
+
+### Multisampling in shaders (`graphics::DeviceFeature3` bits 0-7)
+
+The third word of a device's features (`DeviceInfo::features3`, `AdapterCaps::features3`, the user-mode `KmtCaps::features3` / `DEV_FEATURE3_*`, `TcosD3D12DeviceFeatures3`) has
+the multisampling of shaders in its bits 0-7: `kFeature3MultisampleLoads` (Texture2DMS units of multisampled colour images: `ld2dms`, `resinfo` - width, height, 0 or the
+layers, one level -, `sampleinfo` of the texture - the count bound, `ITextureSet::sample_count`, not the declared one - and `samplepos` of its standard pattern),
+`MultisampleArrays` (multisampled images of several layers - `ImageDesc::kind` `Texture2DArray`, `AllocationDesc::kind` too -: drawn into a layer at a time, Texture2DMSArray
+units of their layers - the view's, `texture_view_fits` takes the two multisampled kinds -, resolved a layer at a time: `ICommandBuffer::resolve_layer`, `ResolveRegion`'s mode
+bit `kResolveSourceLayer` 0x100 and a fourth word, the layer), `MultisampleDepthLoads` (a depth buffer of several samples that is a texture: its depth, or with
+`SamplerDesc::stencil` its stencil, through Texture2DMS units), `InterpolationModes` (`ShaderModuleDesc::interpolation`: each varying perspective-correct, noperspective or
+flat - the first vertex's - at the centre, the centroid of the covered samples or the sample; `position_location` for `SV_Position`), `SampleShading`
+(`ShaderModuleDesc::sample_shading`: the shader runs once for each covered sample, `FragmentContext::sample_index` and the sample's position, its own bit as the coverage; and
+`sampleinfo` / `samplepos` of the rasterizer: the pass's count and positions), `EvaluateAttributes` (`FragmentContext::evaluate`: an input at any point of the pixel, for
+`eval_sample_index`, `eval_centroid`, `eval_snapped` - the offset's low four bits signed, in sixteenths), `Coverage` (`FragmentContext::coverage` - with sample shading the
+sample's bit - and `coverage_out`, `ShaderModuleDesc::writes_coverage`: the samples a result reaches are ANDed with oMask) and `InnerCoverage` (`FragmentContext::inner_coverage`:
+the triangle covers the pixel's square, with conservative rasterization). A program needs the bits of what it declares (`D3d9Program::required_features3`: a Texture2DMS
+declaration, a centroid or noperspective input - a flat one needs nothing: a device without the modes interpolates it as before -, `SV_SampleIndex` or an input at the
+sample, `eval_*`, `vCoverage` / `oMask`, `vInnerCoverage`, `sampleinfo` / `samplepos` of the rasterizer), and the kernel refuses it (`kNotSupported`) on a device without them.
+
+The DXBC front end takes `dcl_input_ps` interpolation modes (1 constant, 2 linear, 3 centroid, 4 noperspective, 5 noperspective centroid, 6 sample, 7 noperspective sample),
+`dcl_input_ps_sgv ... sampleIndex` (name 10), `vCoverage` (operand 35), `vInnerCoverage` (42), `oMask` (15, one component), `samplepos` (110; fxc pads it with a zero word),
+`sampleinfo` (111) of a resource or of `rasterizer` (operand 14), `eval_snapped` / `eval_sample_index` / `eval_centroid` (203 - 205) and `dcl_resource_texture2dmsarray`
+(dimension 9). IR: `kSamplePos`, `kEvalSample`, `kEvalCentroid`, `kEvalSnapped` (0x1800 ..), `kTexSamples` with `control` 0 texture / 1 rasterizer and `vector` for the
+unsigned form, `kSysSampleIndex`, `kSysCoverage`, `kSysInnerCoverage`, the destination `kCoverageOut`. The DXIL translator writes the same for `textureLoad` of the multisampled
+kinds (3, 8), `getDimensions` (72, also of buffers: `bufinfo`), `texture2DMSGetSamplePosition` (75), `renderTargetGetSamplePosition` / `SampleCount` (76, 77), `evalSnapped` /
+`SampleIndex` / `Centroid` (87 - 89), `sampleIndex` (90: the private operand 0xF4), `coverage` (91), `innerCoverage` (92), an `SV_Coverage` output and the signature's
+interpolation modes. The CPU renderer does all of it (`SoftwareDevice.cpp` raster_triangle: `kinds_at`, `inputs_at`, `centroid_of` - the covered sample nearest the centre -,
+`inner_of`, a run per sample with `sample_shading`; lines and points take the flat and noperspective inputs from their vertices).
+
+TGSI (virgl; Venus through its TGSI front end): inputs declared `CONSTANT` / `LINEAR` / `PERSPECTIVE` with `CENTROID` / `SAMPLE`, `SV[0] SAMPLEID`, `SV[1] SAMPLEMASK`, an
+`OUT[] SAMPLEMASK` after the colours, `INTERP_SAMPLE` / `INTERP_CENTROID` / `INTERP_OFFSET`, `TXF` of `2D_ARRAY_MSAA` (the layer in z), `TXQS` for a texture declared without a
+count, and the standard positions worked out from nibbles in immediates (TGSI has no table to index). The pass's sample count is `CONST[kRasterizerRegister]` (the register after
+the samplers' comparisons, `kDeviceConstantRegisters` in all), which virgl and Venus fill with them (`ShaderModuleDesc::sampler_constants`); virgl's host numbers 4x samples
+otherwise (its 1 is Direct3D's 3), so `SAMPLEID`, the sample of `INTERP_SAMPLE` and `TXF`, and both coverage masks (bits 1 and 3) are turned around there when the count is 4.
+Venus (Vulkan's standard locations, `DeviceInfo::d3d_sample_order`) maps them to `SampleId`, `SampleMask`, `Flat` / `NoPerspective` / `Centroid` / `Sample` decorations,
+`InterpolateAt*` and `OpImageQuerySamples`; it offers bits 0-6 where the host has `sampleRateShading`, virgl bits 0-6 (arrays with the host's geometry shaders). Neither has inner
+coverage (no conservative rasterization on virgl; Venus does not ask for `fullyCoveredFragmentShaderInputVariable`). Conformance scenes (`Conformance.cpp`, "Multisampling in
+shaders"): 19 of DXBC and DXIL, the same on the host's Vulkan as on the CPU renderer. Not done: the positions of `samplepos` of the rasterizer follow the standard pattern on the
+GPUs even after `set_sample_positions` (neither GPU device offers programmable positions); multisampled images of the wide formats; unordered access to multisampled images.
 
 ### Several geometry-shader output streams, and stream output
 

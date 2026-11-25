@@ -91,7 +91,15 @@ renderer does; virgl as large as the host's `max_texture_2d_size`).
 
 ## What is not there
 
-- Below `d3d11.dll`, in the kernel: depth buffers of several samples read by shaders, a depth texture read while it is the bound (read-only) depth buffer, the CPU's access to
+- Multisampled textures (the kernel's DeviceFeature3, [Direct3DKernelMode.md](Direct3DKernelMode.md), "Multisampling in shaders"): render targets and depth textures of the
+  adapter's counts that are shader resources too (`TEXTURE2DMS` / `TEXTURE2DMSARRAY` views; the depth through `R24_UNORM_X8_TYPELESS` / `R32_FLOAT`, the stencil through
+  `X24_TYPELESS_G8_UINT`), arrays of them (`ArraySize` > 1: `TEXTURE2DMSARRAY` render target and depth views of their slices, `ResolveSubresource` of a slice into any
+  subresource of a texture of one sample), and `MULTISAMPLE_LOAD` in `CheckFormatSupport`, where the adapter reads samples (the CPU renderer, virgl, Venus; a multisampled
+  texture with `BIND_SHADER_RESOURCE` is `E_INVALIDARG` elsewhere, as on Windows for a format without the flag). Shaders: `Load` with a sample, `GetDimensions` with samples,
+  `GetSamplePosition`, `GetRenderTargetSampleCount` / `Position`, `centroid` / `noperspective` / `sample` / `nointerpolation` inputs, `SV_SampleIndex`, `EvaluateAttribute*`,
+  `SV_Coverage` in and out; `SV_InnerCoverage` on the CPU renderer. Not done: `ForcedSampleCount` (11_1), unordered access to multisampled textures, the CPU's access to their
+  samples, multisampled textures of 16-bit and wider formats.
+- Below `d3d11.dll`, in the kernel: a depth texture read while it is the bound (read-only) depth buffer, the CPU's access to
   the samples of a multisampled depth texture (it is copied whole, texture to texture); on virgl `SV_RenderTargetArrayIndex` and `SV_ViewportArrayIndex` from a vertex or domain shader
   (`D3D11_FEATURE_D3D11_OPTIONS3` says FALSE there; the CPU renderer has them), anisotropic filtering (virglrenderer 1.3.0 drops it: trilinear) and the `MINIMUM_` / `MAXIMUM_`
   filters (`MinMaxFiltering` is FALSE there and `CreateSamplerState` refuses them; the CPU renderer has them); on the GPUs other than virgl and the CPU renderer the blend factor

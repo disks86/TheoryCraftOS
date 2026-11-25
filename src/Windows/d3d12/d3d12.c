@@ -46,7 +46,11 @@
  *   - lines: aliased, alpha-antialiased and quadrilateral 1.4 / 1.0 wide on the CPU renderer; virgl's are the host's smooth and multisampled lines (its aliased line on a target
  *     of one sample); the other devices draw aliased lines and refuse narrow quadrilateral ones
  *   - a pass with a depth buffer and no render target draws into a colour image of the buffer's size that nothing reads (cmdlist.inc depth_companion): it costs that memory
- *   - multisampled images are render targets and depth buffers of the adapter's sample counts, drawn into and resolved (not read by shaders through this DLL)
+ *   - multisampled images are render targets and depth buffers of the adapter's sample counts, drawn into, resolved and read by shaders (TEXTURE2DMS / TEXTURE2DMSARRAY views
+ *     of colour targets and of depth buffers' depth and stencil, MULTISAMPLE_LOAD in the format support) where the kernel's device has DeviceFeature3 bits 0-2 (the CPU renderer,
+ *     virgl, Venus); arrays of them (DepthOrArraySize > 1) drawn into a slice at a time and resolved a slice at a time (ResolveSubresource / ResolveSubresourceRegion of a slice);
+ *     no unordered access to them, no CPU access to their samples, no 16-bit or wider multisampled formats (the kernel's multisampled images are 8-bit colour and depth), the least and
+ *     greatest of a slice other than 0 not on virgl and Venus
  *   - tiled resources (extras.inc, base.inc dev_tiled_tier): tier 4 on the CPU renderer, tier 1 on virgl (TGSI has no residency feedback or lookup clamp); no reserved depth
  *     buffers or multisampled textures (the kernel's have no backing for the tiles: no D3D12_FORMAT_SUPPORT2_TILED depth format, no tiled quality level), no status of buffer and UAV loads (ld_raw_s / ld_structured_s / ld_uav_typed_s: the kernel refuses
  *     the shader); heaps shared across adapters (DXGI_ERROR_UNSUPPORTED; shared handles of one adapter's resources and heaps, and of fences of any
@@ -55,8 +59,10 @@
  *     d3d12_types.h), the features reported at their "not supported" tier: ray tracing, mesh shaders, sampler feedback, work graphs, protected sessions, meta commands
  *     (D3D12_SAMPLER_DESC2, the strip cut of the command list and triangle fans are done: heaps.inc sampler_descriptor, cmdlist1.inc IASetIndexBufferStripCutValue); and on
  *     virgl (the CPU renderer has them: cmdlist1.inc) the depth bounds test, programmable sample positions, view instancing, variable-rate shading and barycentrics
- *   - of those: view instancing is tier 2 (draw-call looping; every stage runs for every view), no centroid or sample interpolation (EvaluateAttributeSnapped, per-sample
- *     shading) or SV_Coverage, and HighestShaderModel stays 5.1 (DXIL of 6.1 - 6.6 with SV_ViewID, SV_Barycentrics, GetAttributeAtVertex, SV_ShadingRate and IsHelperLane is
+ *   - of those: view instancing is tier 2 (draw-call looping; every stage runs for every view); centroid, noperspective and sample interpolation, per-sample shading
+ *     (SV_SampleIndex), EvaluateAttributeAtSample / Snapped / Centroid, SV_Coverage in and out and the rasterizer's sample count and positions are the kernel's (DeviceFeature3:
+ *     the CPU renderer, virgl and Venus); SV_InnerCoverage on the CPU renderer only, whose conservative rasterization stays tier 1 (tier 3 wants the post-snap degenerate triangles of
+ *     tier 2 drawn: the CPU renderer culls a triangle of no area), and HighestShaderModel stays 5.1 (DXIL of 6.1 - 6.6 with SV_ViewID, SV_Barycentrics, GetAttributeAtVertex, SV_ShadingRate and IsHelperLane is
  *     taken, but the wave operations of 6.0 are not translated)
  *   - vertex elements: every Direct3D 11 input-assembler format and instance step rates (pso.inc vertex_format) where the device reads them (the CPU renderer and virgl)
  *     (queries are occlusion, binary occlusion, pipeline statistics (and 1), stream output statistics and timestamps (also on copy queues), any number open at once;

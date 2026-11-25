@@ -337,6 +337,18 @@ static HRESULT STDMETHODCALLTYPE dev_CheckFeatureSupport(Dev *This, D3D12_FEATUR
       } else if (format_bytes(f->Format)) {
         f->Support1 = D3D12_FORMAT_SUPPORT1_IA_VERTEX_BUFFER;
       }
+      /* (multisampled: the formats D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS has a level of at some count - 32-bit ones the adapter draws into with several samples -, resolved
+       * where they are not integers, and read by shaders - Texture2DMS Load: MULTISAMPLE_LOAD - where the adapter has DEV_FEATURE3_MULTISAMPLE_LOADS (colour) or
+       * _DEPTH_LOADS (a depth buffer's views)) */
+      if (i && !i->planar && i->bytes == 4 && (This->caps.sample_counts & ~3u) && (i->kernel < KF_FIRST_EXTRA || (dev_format_caps(This, i->kernel) & KFC_MULTISAMPLE)) &&
+          (f->Support1 & (D3D12_FORMAT_SUPPORT1_RENDER_TARGET | D3D12_FORMAT_SUPPORT1_DEPTH_STENCIL))) {
+        f->Support1 |= D3D12_FORMAT_SUPPORT1_MULTISAMPLE_RENDERTARGET;
+        if (!i->depth && !format_integer(f->Format)) f->Support1 |= D3D12_FORMAT_SUPPORT1_MULTISAMPLE_RESOLVE;
+        if (!i->depth && (This->caps.features3 & DEV_FEATURE3_MULTISAMPLE_LOADS)) f->Support1 |= D3D12_FORMAT_SUPPORT1_MULTISAMPLE_LOAD;
+      }
+      if ((f->Format == DXGI_FORMAT_R32_TYPELESS || f->Format == DXGI_FORMAT_R24G8_TYPELESS || f->Format == DXGI_FORMAT_R24_UNORM_X8_TYPELESS || f->Format == DXGI_FORMAT_X24_TYPELESS_G8_UINT) &&
+          (This->caps.features3 & DEV_FEATURE3_MULTISAMPLE_DEPTH_LOADS) && (This->caps.sample_counts & ~3u))
+        f->Support1 |= D3D12_FORMAT_SUPPORT1_MULTISAMPLE_LOAD;      /* (a multisampled depth buffer's typeless resource and its views are read) */
       {      /* (a vertex element: the formats vertex_format knows, those beyond 32-bit floats on a device that reads them) */
         UINT vertex_bytes;
         const int vf = vertex_format(f->Format, &vertex_bytes);
@@ -389,8 +401,10 @@ static HRESULT STDMETHODCALLTYPE dev_CheckFeatureSupport(Dev *This, D3D12_FEATUR
         m->NumQualityLevels = m->SampleCount == 1 && format_tiled(format_info(m->Format)) ? 1 : 0;
         return S_OK;
       }
-      m->NumQualityLevels = m->SampleCount == 1 || (m->SampleCount < 32 && ((This->caps.sample_counts >> m->SampleCount) & 1) && format_info(m->Format) && format_info(m->Format)->bytes == 4 &&
-                                                                                                   (format_info(m->Format)->kernel < KF_FIRST_EXTRA || (dev_format_caps(This, format_info(m->Format)->kernel) & KFC_MULTISAMPLE))) ? 1 : 0;
+      /* (R24G8_TYPELESS, the family of a depth buffer read by shaders, has the levels of its depth format, as on Windows) */
+      const FormatInfo *mf = format_info(m->Format == DXGI_FORMAT_R24G8_TYPELESS ? DXGI_FORMAT_D24_UNORM_S8_UINT : m->Format);
+      m->NumQualityLevels = m->SampleCount == 1 || (m->SampleCount < 32 && ((This->caps.sample_counts >> m->SampleCount) & 1) && mf && mf->bytes == 4 &&
+                                                    (mf->kernel < KF_FIRST_EXTRA || (dev_format_caps(This, mf->kernel) & KFC_MULTISAMPLE))) ? 1 : 0;
       return S_OK;
     }
     case D3D12_FEATURE_FORMAT_INFO: {

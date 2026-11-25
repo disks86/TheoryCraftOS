@@ -1964,14 +1964,15 @@ static void STDMETHODCALLTYPE ctx_ResolveSubresource(Ctx *c, ID3D11Resource *to,
   (void)format;
   Dev *d = c->dev;
   Tex *tt = tex_of_resource(to), *tf = tex_of_resource(from);
-  if (!tt || !tf || to_sub != 0 || from_sub != 0 || tf->desc.SampleDesc.Count < 2 || tt->desc.SampleDesc.Count > 1 || tt->desc.Width != tf->desc.Width ||
-      tt->desc.Height != tf->desc.Height || tt->stored != tf->stored || predicated_out(d)) return;
+  /* (a slice of a multisampled array - its subresource is the slice: one level - into a subresource of a texture of one sample) */
+  if (!tt || !tf || from_sub >= tf->desc.ArraySize || tf->desc.SampleDesc.Count < 2 || tt->desc.SampleDesc.Count > 1 || tt->desc.Width != tf->desc.Width ||
+      tt->desc.Height != tf->desc.Height || tt->stored != tf->stored || to_sub >= tt->desc.MipLevels * (tt->kind == 1 ? 1 : tt->desc.ArraySize) || predicated_out(d)) return;
   LOCK(c);
   tex_before_write(d, tt);
   tex_before_read(d, tf);
   tex_sync(d, tt);
   ++tt->version;
-  ID3D12GraphicsCommandList_ResolveSubresource(d->list, tt->res, 0, tf->res, 0, tt->stored);      /* (the stored format: a typed view of it asked for is the same bytes) */
+  ID3D12GraphicsCommandList_ResolveSubresource(d->list, tt->res, to_sub, tf->res, from_sub, tt->stored);      /* (the stored format: a typed view of it asked for is the same bytes) */
   tt->used = tf->used = tt->written = d->epoch;
   d->recorded = 1;
   UNLOCK(c);
