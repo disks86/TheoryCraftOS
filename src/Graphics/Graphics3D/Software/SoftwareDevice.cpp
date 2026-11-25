@@ -1277,7 +1277,7 @@ void write_fragment(const DrawState& s, int32_t x, int32_t y, float z, bool dept
 
 // Runs the pipeline's fragment shader; false if it discarded the pixel.
 bool run_fragment_shader(const DrawState& s, const Vec4* varying, const FragmentContext& given, Vec4* color) {
-  s.count(PipelineStatistic::PsInvocations);
+  if (!s.pipeline->desc().stand_in_fragment) s.count(PipelineStatistic::PsInvocations);   // (a stand-in for no pixel shader runs none as the API counts them)
   FragmentContext context = given;
   context.storage = s.storage;
   context.images = s.images;
@@ -2299,7 +2299,10 @@ bool SoftwareDevice::submit(ICommandBuffer* commands) {
         if (cmd.buffer) {
           ByteView whole = cmd.buffer->map(), part;
           const uint64_t start = cmd.offset == kStreamOutputAppend ? cmd.buffer->stream_output_filled() : cmd.offset;
-          if (start > whole.size() || !whole.try_subview(start, whole.size() - start, &part)) return false;
+          // (the writes stop at the binding's end: a primitive that does not fit before it closes the target, as one that does not fit in the buffer)
+          const uint64_t end = cmd.end == kStreamOutputNoEnd || cmd.end > whole.size() ? whole.size() : cmd.end;
+          if (start > whole.size()) return false;
+          if (!whole.try_subview(start, end > start ? end - start : 0, &part)) return false;
           stream_output[cmd.unit].view = part;
           stream_output[cmd.unit].buffer = cmd.buffer;
           stream_output[cmd.unit].base = start;

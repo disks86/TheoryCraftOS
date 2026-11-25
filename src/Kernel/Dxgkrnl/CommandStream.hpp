@@ -66,8 +66,9 @@
 //                    nested or overlapping, inside passes and outside: each counts the draws and dispatches of every pass between its BeginQuery and its EndQuery (a clear, copy, resolve or
 //                    mipmap counts nothing). Two open queries do not write the same bytes, and every query begun is ended in the stream. A stream's queries take at most
 //                    kMaxOcclusionQueries device queries: kind 13 takes two, the others one)
-//   SetStreamOutput  slot, allocation_index (kNoAllocation: none), offset   (the buffer the pipeline's stream output declaration puts buffer `slot` in: a kAllocStreamOutput buffer, offset a multiple of 4 or kStreamOutputAppendOffset; anywhere,
-//                    the adapter's kFeatureStreamOutput)
+//   SetStreamOutput  slot, allocation_index (kNoAllocation: none), offset[, end]   (the buffer the pipeline's stream output declaration puts buffer `slot` in: a kAllocStreamOutput buffer, offset a multiple of 4 or kStreamOutputAppendOffset;
+//                    `end`, optional: the byte where its writes stop - a primitive that does not fit before it is not written, nor any after it, as at the buffer's end (Direct3D 12's SizeInBytes);
+//                    kStreamOutputNoEnd or left out: the buffer's end. Anywhere, the adapter's kFeatureStreamOutput)
 //   SetRootSignature root signature handle   (Direct3D 12 binding: forgets the root arguments; the draws and dispatches that follow bind textures, storage buffers and constants from them: see D3d12.hpp)
 //   SetDescriptorHeaps count (1 or 2), heap handles   (at most one of each type: views and samplers)
 //   SetRootConstants parameter, first value, count, values   (32-bit values into a root constants parameter)
@@ -218,6 +219,7 @@ constexpr uint32_t kNoAllocation = 0xFFFFFFFFu;
 enum class NarrowLayout : uint32_t { None = 0, R8 = 1, R8G8 = 2, R16 = 3, R16G16 = 4 };
 constexpr uint32_t narrow_pixel_bytes(NarrowLayout n) { return n == NarrowLayout::R8 ? 1 : n == NarrowLayout::R8G8 || n == NarrowLayout::R16 ? 2 : n == NarrowLayout::R16G16 ? 4 : 0; }
 constexpr uint32_t kStreamOutputAppendOffset = 0xFFFFFFFFu;   // SetStreamOutput's offset for "after what the last stream output into the buffer wrote"
+constexpr uint32_t kStreamOutputNoEnd = 0xFFFFFFFFu;          // SetStreamOutput's end for "the buffer's end"
 // (the longest packets: PushConstants - the byte count, then up to kMaxPushConstantBytes of constants - and a VideoProcess of every stream with both optional parts)
 constexpr uint32_t kMaxPacketWords = 1 + (1 + graphics::kMaxPushConstantBytes / 4 > kVideoProcessMaxWords ? 1 + graphics::kMaxPushConstantBytes / 4 : kVideoProcessMaxWords);
 constexpr uint64_t kMaxCommandBytes = 16 * 1024 * 1024;
@@ -342,6 +344,8 @@ class CommandWriter {
   // Stream output buffer `slot` (below kMaxStreamOutputBuffers) is the kAllocStreamOutput allocation, written from `offset` (a multiple of 4; the draws that follow append); kNoAllocation unbinds it.
   // (`offset` kStreamOutputAppendOffset: where the last stream output into the buffer ended)
   void set_stream_output(uint32_t slot, uint32_t allocation, uint32_t offset = 0) { packet(Op::SetStreamOutput, {slot, allocation, offset}); }
+  // (and the byte its writes stop at: `end`)
+  void set_stream_output(uint32_t slot, uint32_t allocation, uint32_t offset, uint32_t end) { packet(Op::SetStreamOutput, {slot, allocation, offset, end}); }
   void set_root_signature(Handle signature) { packet(Op::SetRootSignature, {signature}); }
   void set_descriptor_heaps(std::initializer_list<Handle> heaps) {
     ok_ &= bytes_.put32(static_cast<uint32_t>(Op::SetDescriptorHeaps) | ((2 + static_cast<uint32_t>(heaps.size())) << 16));

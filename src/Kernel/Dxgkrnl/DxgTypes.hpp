@@ -356,6 +356,8 @@ struct ShaderDesc {
 constexpr uint32_t kPipelineRasterTag = 0x31545352;     // 'RST1'
 constexpr uint32_t kPipelineRasterWords = 16;
 constexpr uint32_t kPipelineStepRateTag = 0x31505453;   // 'STP1'
+// The escape CreatePipeline's flags word: 1 depth test, 2 depth write, 4 alpha blend, 8 the fragment shader stands in for none (PipelineDesc::stand_in_fragment).
+constexpr uint32_t kPipelineFlagStandInFragment = 8;
 
 struct PipelineDesc {
   Handle vertex_shader = 0, fragment_shader = 0;
@@ -371,6 +373,7 @@ struct PipelineDesc {
   graphics::CullMode cull_mode = graphics::CullMode::Back;
   graphics::FrontFace front_face = graphics::FrontFace::CounterClockwise;
   bool depth_test = false, depth_write = false, alpha_blend = false;
+  bool stand_in_fragment = false;   // the fragment shader is the driver's stand-in for a pipeline without a pixel shader (kPipelineFlagStandInFragment): not counted as PsInvocations
   graphics::StencilState stencil;
   graphics::BlendState blend;                                  // needs the adapter's kFeatureBlendState (caps.features)
   graphics::CompareOp depth_compare = graphics::CompareOp::LessEqual;   // ... as does any comparison but LessEqual

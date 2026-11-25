@@ -1785,6 +1785,7 @@ NtStatus Kernel::escape(ProcessId pid, Handle device, ConstByteView request, Byt
       desc.depth_test = (flags & 1) != 0;
       desc.depth_write = (flags & 2) != 0;
       desc.alpha_blend = (flags & 4) != 0;
+      desc.stand_in_fragment = (flags & kPipelineFlagStandInFragment) != 0;
       desc.stencil.enable = enable != 0;
       desc.stencil.compare = static_cast<graphics::CompareOp>(compare);
       desc.stencil.fail_op = static_cast<graphics::StencilOp>(fail);

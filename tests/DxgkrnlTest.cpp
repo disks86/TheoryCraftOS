@@ -2280,9 +2280,9 @@ void test_dxbc() {
       compile_dxbc(allocator, a.build(), &st);
       CHECK(st == status::kNotSupported);
       DxbcAsm loop = dx_pixel_shader();
-      loop.ins(76, {dx_src(kOpTemp, 0)});   // switch
+      loop.ins(76, {dx_src(kOpTemp, 0)});   // switch (with no case and no endswitch: malformed - switches are taken, tests/DxbcFlowTest.cpp)
       compile_dxbc(allocator, loop.build(), &st);
-      CHECK(st == status::kNotSupported);
+      CHECK(st == status::kInvalidParameter);
       compile_dxbc(allocator, std::vector<uint8_t>(8, 0), &st);
       CHECK(st == status::kInvalidParameter);
       DxbcAsm vs_no_position(true);
@@ -5052,6 +5052,58 @@ void test_stream_output_extras() {
   CHECK(statistic(kWritten, 0) == 2 && statistic(kNeeded, 0) == 3 && statistic(kWritten, 1) == 3 && statistic(kNeeded, 1) == 3);
   CHECK(statistic(kNeeded, 2) == 0 && statistic(kNeeded, 3) == 0);   // (streams the shader does not write)
   {
+    // A binding's end (Direct3D 12's SizeInBytes): stream 0 in a large buffer stops after two records (64 bytes, and 8 of room that a record does not fit in) - the third is
+    // not written and the bytes after the end are as they were; the counts are those of a full buffer. An append binding keeps the end.
+    Handle wide0 = buffer(6 * 32), wide1 = buffer(6 * 16), counts = e.buffer(kAllocQueryResult, 64);
+    float marker[48];
+    for (float& m : marker) m = 7.0f;
+    CHECK(e.write(wide0, floats(marker, 48)));
+    auto bounded = [&](uint32_t offset, uint32_t end, uint32_t kind) {
+      CommandWriter w(e.allocator);
+      w.begin_pass(0, kNoAllocation, kPassClearColor, {0, 0, 0, 1}, 1, 0);
+      w.set_stream_output(0, 2, offset, end), w.set_stream_output(1, 3, 0);
+      w.bind_pipeline(pipe);
+      w.bind_vertex_buffer(1);
+      w.push_constants(floats(identity, 16));
+      w.begin_query(4, 0, kind);
+      w.draw(3);
+      w.end_query();
+      w.end_pass();
+      const NtStatus s = e.render(w, {target, vb, wide0, wide1, counts});
+      return s == status::kSuccess ? query_count(e, counts, 0) : ~uint64_t{0};
+    };
+    CHECK(bounded(0, 2 * 32 + 8, kWritten) == 2);
+    CHECK(bounded(0, 2 * 32 + 8, kNeeded) == 3);
+    float f[48];
+    CHECK(read_floats(wide0, 48, f));
+    CHECK(f[0] == -0.5f && f[8] == 0.5f && f[16] == 7.0f && f[23] == 7.0f && f[47] == 7.0f);   // (records 0 and 1; the third not written)
+    // (the end after the third record: all three; from an offset: the room is end - offset)
+    CHECK(bounded(0, 3 * 32, kWritten) == 3 && bounded(32, 3 * 32, kWritten) == 2 && bounded(32, 32, kWritten) == 0 && bounded(32, 32, kNeeded) == 3);
+    CHECK(bounded(0, kStreamOutputNoEnd, kWritten) == 3);
+    // (an end that is not a multiple of 4, past the buffer, or before the offset: refused)
+    CHECK(bounded(0, 66, kWritten) == ~uint64_t{0} && bounded(0, 6 * 32 + 4, kWritten) == ~uint64_t{0} && bounded(64, 32, kWritten) == ~uint64_t{0});
+    // (appending in a second pass goes on up to the same end: one more record fits after the first two of three)
+    {
+      CommandWriter w(e.allocator);
+      for (uint32_t round = 0; round < 2; ++round) {
+        w.begin_pass(0, kNoAllocation, kPassClearColor, {0, 0, 0, 1}, 1, 0);
+        w.set_stream_output(0, 2, round ? kStreamOutputAppendOffset : 0, 4 * 32), w.set_stream_output(1, 3, round ? kStreamOutputAppendOffset : 0);
+        w.bind_pipeline(pipe);
+        w.bind_vertex_buffer(1);
+        w.push_constants(floats(identity, 16));
+        if (round) w.begin_query(4, 0, kWritten);
+        w.draw(3);
+        if (round) w.end_query();
+        w.end_pass();
+      }
+      CHECK(e.render(w, {target, vb, wide0, wide1, counts}) == status::kSuccess);
+      CHECK(query_count(e, counts, 0) == 1);
+    }
+    e.kernel.destroy_allocation(kPid, wide0);
+    e.kernel.destroy_allocation(kPid, wide1);
+    e.kernel.destroy_allocation(kPid, counts);
+  }
+  {
     // All at once: the kernel's SoStatistics of both streams (written, needed), the separate counts, and the pipeline statistics of the geometry shader's draw, over two passes.
     Handle many = e.buffer(kAllocQueryResult, 512);
     CommandWriter w(e.allocator);
@@ -5086,6 +5138,36 @@ void test_stream_output_extras() {
     w.end_query();
     w.end_pass();
     CHECK(e.render(w, {target, vb, results}) == status::kInvalidParameter);
+  }
+
+  {
+    // A pipeline whose fragment shader stands in for none (kPipelineFlagStandInFragment, as d3d12.dll gives a pipeline without a pixel shader): its runs are no PSInvocations.
+    auto ps_runs = [&](bool stand_in) {
+      PipelineDesc pd;
+      pd.vertex_shader = vs, pd.fragment_shader = ps, pd.vertex_stride = 28, pd.attribute_count = 2, pd.varying_count = 3;
+      pd.attributes[0] = {0, graphics::VertexFormat::Float3, 0};
+      pd.attributes[1] = {1, graphics::VertexFormat::Float4, 12};
+      pd.cull_mode = graphics::CullMode::None;
+      pd.stand_in_fragment = stand_in;
+      Handle drawn = 0;
+      if (e.kernel.create_pipeline(kPid, e.dev, pd, &drawn) != status::kSuccess) return ~uint64_t{0};
+      Handle stats = e.buffer(kAllocQueryResult, 88);
+      CommandWriter w(e.allocator);
+      w.begin_pass(0, kNoAllocation, kPassClearColor, {0, 0, 0, 1}, 1, 0);
+      w.bind_pipeline(drawn);
+      w.bind_vertex_buffer(1);
+      w.push_constants(floats(identity, 16));
+      w.begin_query(2, 0, static_cast<uint32_t>(graphics::QueryKind::PipelineStatistics));
+      w.draw(3);
+      w.end_query();
+      w.end_pass();
+      const NtStatus s = e.render(w, {target, vb, stats});
+      const uint64_t runs = s == status::kSuccess && query_count(e, stats, 2) == 3 ? query_count(e, stats, 7) : ~uint64_t{0};   // (VSInvocations 3, then PSInvocations)
+      e.kernel.destroy_allocation(kPid, stats);
+      return runs;
+    };
+    const uint64_t counted = ps_runs(false), stood_in = ps_runs(true);
+    CHECK(counted != ~uint64_t{0} && counted > 0 && stood_in == 0);
   }
 
   // Timestamps never go back.
