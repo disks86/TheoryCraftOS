@@ -312,6 +312,7 @@ typedef struct KmtCaps {
   UINT features2;      /* graphics::DeviceFeature2 (DEV_FEATURE2_*) */
   /* What allocations of the formats numbered from format_first (64) may be, format_count of them (graphics::FormatCap bits; zeros from a kernel without the table) */
   UINT format_first, format_count, format_caps[64];
+  UINT features3;      /* graphics::DeviceFeature3 (DEV_FEATURE3_*; 0 from a kernel without it) */
 } KmtCaps;
 #define KMT_CAPS_ACCELERATED 1u
 #define KMT_CAPS_STENCIL 2u

@@ -131,6 +131,11 @@ EXPORT void WINAPI TcosD3D12DeviceFeatures(ID3D12Device *device, UINT *features,
   if (features) *features = dev ? dev->caps.features : 0;
   if (features2) *features2 = dev ? dev->caps.features2 : 0;
 }
+/* The third word of the kernel device's features (graphics::DeviceFeature3, DEV_FEATURE3_*). */
+EXPORT UINT WINAPI TcosD3D12DeviceFeatures3(ID3D12Device *device) {
+  const Dev *dev = (const Dev *)device;
+  return dev ? dev->caps.features3 : 0;
+}
 EXPORT void WINAPI TcosD3D12ResourceOptions(ID3D12Device *device, UINT flags) {
   Dev *dev = (Dev *)device;
   if (dev) dev->next_resource_flags = flags;

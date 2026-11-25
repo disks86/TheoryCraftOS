@@ -1328,6 +1328,12 @@ enum DeviceFeature2 : uint32_t {
   kFeature2TileResidency = 1u << 27,
 };
 // The features a sampler needs beyond the base ones (kFeature2SeparateFilters, ..; 0 for one every device takes).
+// The third word of features (DeviceInfo::features3), for what DeviceFeature2 has no room left for. Carried as AdapterCaps::features3 and the user-mode KmtCaps::features3
+// (DEV_FEATURE3_*, TcosD3D12DeviceFeatures3). Bits are taken in ranges so work on different parts does not collide: 0-7 multisampled reads and interpolation, 8-15 feature
+// levels 11_1 / 12_x (rasterizer ordered views, forced sample counts), 16-23 shader model 6 (wave operations), 24-31 the rest.
+enum DeviceFeature3 : uint32_t {
+};
+
 constexpr uint32_t sampler_features2(const SamplerDesc& s) {
   return (s.separate_mag && s.mag_filter != s.filter ? kFeature2SeparateFilters : 0u) | (s.reduction != SamplerReduction::Weighted ? kFeature2SamplerReductions : 0u) |
          (s.unnormalized ? kFeature2UnnormalizedCoordinates : 0u);
@@ -1345,6 +1351,7 @@ struct DeviceInfo {
   DeviceLimits limits;                      // vertex attributes, varyings, texture units, colour targets and vertex buffers the device takes
   bool blend_constant = false;              // with kFeatureBlendState: the BlendFactor Constant* factors and BlendState::constant
   uint32_t features2 = 0;                   // DeviceFeature2 bits
+  uint32_t features3 = 0;                   // DeviceFeature3 bits
   // A multisampled image's samples are numbered as Direct3D's standard pattern (Vulkan's standard sample locations). virgl's host numbers 4x samples otherwise,
   // and the Direct3D layer's TGSI turns the index around for it unless this is set.
   bool d3d_sample_order = false;

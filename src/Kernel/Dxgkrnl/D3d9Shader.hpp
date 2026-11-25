@@ -122,6 +122,7 @@ class D3d9Program {
   bool writes_viewport() const { return writes_viewport_; }
   // The graphics::DeviceFeature2 bits the program needs (storage images; the layer output).
   uint32_t required_features2() const;
+  uint32_t required_features3() const { return extra_features3_; }   // graphics::DeviceFeature3 bits the program needs
   // What the pixel shader declared texture unit `unit` to be (a DXBC dcl_resource; the others: 2D). Binding another kind to the unit makes a draw wrong, so the kernel refuses it.
   graphics::TextureKind texture_kind(uint32_t unit) const { return unit < graphics::kMaxTextureUnits ? texture_kind_[unit] : graphics::TextureKind::Texture2D; }
 
@@ -225,6 +226,7 @@ class D3d9Program {
   // The graphics::DeviceFeature2 bits of what the front end met besides (SV_Barycentrics and GetAttributeAtVertex: kFeature2Barycentrics; SV_ShadingRate read or written:
   // kFeature2ShadingRate; SV_ViewID needs none: without view instancing it is 0).
   uint32_t extra_features2_ = 0;
+  uint32_t extra_features3_ = 0;
   // The components of their output registers the layer and the viewport are in, and whether the viewport is in the layer's register (both integers packed into one).
   uint8_t layer_component_ = 0, viewport_component_ = 0;
   bool viewport_shares_layer_ = false;

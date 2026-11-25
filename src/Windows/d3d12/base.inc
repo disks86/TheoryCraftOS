@@ -361,6 +361,7 @@ struct Dev {
 #define DEV_FEATURE_DEPTH_RESOLVE (1u << 19)      /* graphics::kFeatureDepthResolve */
 #define DEV_FEATURE_RESOLVE_MODES (1u << 20)      /* graphics::kFeatureResolveModes: resolves of the least, greatest (and a depth image's mean) samples */
 #define DEV_FEATURE_VERTEX_FORMATS (1u << 29)     /* graphics::kFeatureVertexFormats: vertex elements other than 32-bit floats */
+/* graphics::DeviceFeature3 in KmtCaps.features3: DEV_FEATURE3_* (bit ranges as IGraphicsDevice.hpp DeviceFeature3 says) */
 /* graphics::DeviceFeature2 in KmtCaps.features2 */
 #define DEV_FEATURE2_STORAGE_IMAGES (1u << 0)            /* unordered access views of textures (KA_STORAGE_IMAGE), in compute shaders */
 #define DEV_FEATURE2_STORAGE_IMAGES_IN_DRAWS (1u << 1)   /* ... and in pixel shaders */

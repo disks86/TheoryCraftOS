@@ -2973,6 +2973,7 @@ Adapter::Adapter(allocators::IAllocator& allocator, graphics::IGraphicsDevice& d
   caps_.sample_counts = info.sample_counts;
   caps_.blend_constant = info.blend_constant;
   caps_.features2 = info.features2;
+  caps_.features3 = info.features3;
   for (uint32_t f = kFirstExtraFormat; f <= kLastExtraFormat; ++f) caps_.format_caps[f - kFirstExtraFormat] = vidmm_.format_caps(static_cast<Format>(f));
   caps_.device_kind = static_cast<uint32_t>(info.kind);
   // The vendor the name says (the names are those of the devices in src/Graphics/Graphics3D); the virtual GPUs have their hypervisor's.
@@ -3079,6 +3080,7 @@ NtStatus Adapter::create_shader(const ShaderDesc& desc, SharedPointer<ShaderObje
       if (program->stage() == graphics::ShaderStage::Fragment && program->color_output_count() > caps_.max_color_targets) return status::kNotSupported;
       if (program->required_features() & ~caps_.features) return status::kNotSupported;   // (system values, texel access: the device must have them)   // (more constants than this device is given)
       if (program->required_features2() & ~caps_.features2) return status::kNotSupported;   // (storage images, the layer output)
+      if (program->required_features3() & ~caps_.features3) return status::kNotSupported;
       // A GPU device (virgl) takes the shader as TGSI text; the others run it through the interpreter's native function. Both are given: each device uses what it understands.
       // A shader the text cannot say (see D3d9Tgsi.cpp) is still fine for the interpreter.
       const graphics::ShaderStage stage = program->stage();

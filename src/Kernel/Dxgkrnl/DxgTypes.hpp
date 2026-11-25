@@ -94,6 +94,9 @@ enum class Format : uint32_t { Unknown, A8R8G8B8, X8R8G8B8, A8B8G8R8, X8B8G8R8, 
                                Bc4Unorm, Bc4Snorm, Bc5Unorm, Bc5Snorm, Bc6hUfloat, Bc6hSfloat, Bc7Unorm, Bc7Srgb };
 // The last value of the first run of formats, and the first and last of the second (a format number from user mode is one of these).
 constexpr uint32_t kLastBaseFormat = static_cast<uint32_t>(Format::R32Float), kFirstExtraFormat = 64, kLastExtraFormat = static_cast<uint32_t>(Format::Bc7Srgb);
+// The words the user-mode caps block keeps for the extra formats' table (KmtCaps::format_caps): what follows it sits at a fixed place.
+constexpr uint32_t kCapsFormatWords = 64;
+static_assert(kLastExtraFormat - kFirstExtraFormat + 1 <= kCapsFormatWords, "the caps block's format table is full");
 constexpr bool is_known_format(uint32_t f) { return f <= kLastBaseFormat || (f >= kFirstExtraFormat && f <= kLastExtraFormat); }
 constexpr bool is_extra(Format f) { return static_cast<uint32_t>(f) >= kFirstExtraFormat; }
 constexpr bool is_packed32(Format f) { return f >= Format::R8Unorm && f <= Format::B4G4R4A4Unorm; }
@@ -337,6 +340,7 @@ struct AdapterCaps {
   uint32_t features2 = 0;            // graphics::DeviceFeature2 bits: storage images (in draws), layered render targets and depth buffers, the single-channel formats
   // What allocations of each format numbered from 64 may be (graphics::FormatCap bits: VidMm::format_caps), index format - kFirstExtraFormat.
   uint32_t format_caps[kLastExtraFormat - kFirstExtraFormat + 1] = {};
+  uint32_t features3 = 0;            // graphics::DeviceFeature3 bits
   char name[64] = {};
 };
 

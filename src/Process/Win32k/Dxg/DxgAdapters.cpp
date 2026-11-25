@@ -293,6 +293,9 @@ uint32_t query_adapter_info(Session& s, Call& call, uint64_t arg) {
       out.put32(dxgk::kFirstExtraFormat);
       out.put32(static_cast<uint32_t>(sizeof caps.format_caps / sizeof caps.format_caps[0]));
       for (uint32_t w : caps.format_caps) out.put32(w);
+      // (the table padded to its fixed size, then the third word of features: graphics::DeviceFeature3)
+      for (uint32_t i = sizeof caps.format_caps / sizeof caps.format_caps[0]; i < dxgk::kCapsFormatWords; ++i) out.put32(0);
+      out.put32(caps.features3);
       break;
     }
     case kQaiWddm12Caps: case kQaiWddm13Caps: case kQaiWddm20Caps: case kQaiDirectFlipSupport: case kQaiMultiPlaneOverlaySupport: case kQaiMultiPlaneOverlayHudSupport:
