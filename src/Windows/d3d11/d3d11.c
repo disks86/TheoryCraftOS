@@ -1348,7 +1348,8 @@ static HRESULT tex_make(Dev *d, const D3D11_TEXTURE2D_DESC *in, UINT slices, ID3
     const UINT refused_misc = D3D11_RESOURCE_MISC_SHARED | D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX | D3D11_RESOURCE_MISC_SHARED_NTHANDLE | D3D11_RESOURCE_MISC_GDI_COMPATIBLE |
                               D3D11_RESOURCE_MISC_GENERATE_MIPS | D3D11_RESOURCE_MISC_TEXTURECUBE;
     if (res || (slices && dev_tiled_tier(d) < D3D11_TILED_RESOURCES_TIER_3) || d->next_tex_kind == 2 || desc.Usage != D3D11_USAGE_DEFAULT || desc.CPUAccessFlags ||
-        (desc.MiscFlags & refused_misc) || desc.SampleDesc.Count != 1 || desc.SampleDesc.Quality || !tex_tiled_format(d, desc.Format))
+        (desc.MiscFlags & refused_misc) || desc.SampleDesc.Count != 1 || desc.SampleDesc.Quality || !tex_tiled_format(d, desc.Format) ||
+        ((desc.BindFlags & D3D11_BIND_DEPTH_STENCIL) && desc.Format != DXGI_FORMAT_D32_FLOAT && desc.Format != DXGI_FORMAT_R32_TYPELESS))      /* (tiled depth: D32 alone) */
       return E_INVALIDARG;
   }
   /* (shared through NT handles: with SHARED or SHARED_KEYEDMUTEX, in GPU memory) */

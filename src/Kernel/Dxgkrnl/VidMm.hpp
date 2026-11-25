@@ -257,6 +257,7 @@ class VidMm {
   bool upload(Allocation& a);
   bool upload_contents(Allocation& a);     // (upload without a reserved allocation's tiles and residency)
   void push_residency(Allocation& a);
+  bool move_depth_planes(Allocation& a, bool to_device);
   void settle_tiles(Allocation& a);
   void flush_heap_writers(Allocation& heap, const Allocation* except);
   void heap_changed(Allocation& heap, const Allocation* except);

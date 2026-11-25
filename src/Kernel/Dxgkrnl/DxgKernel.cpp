@@ -1519,7 +1519,7 @@ NtStatus Kernel::escape_d3d12(ProcessId pid, Handle device, uint32_t op, ByteRea
     case EscapeOp::SetMirror: {
       const Handle mirror = in.le32();
       const uint32_t mode = in.le32(), channels = in.le32(), count = in.le32();
-      if (!in.ok() || count > graphics::kMaxTextureLayers) return status::kInvalidParameter;
+      if (!in.ok() || count > graphics::kMaxTextureLayers * 16) return status::kInvalidParameter;   // (a mirror's subresources: its layers - at most kMaxTextureLayers - at each of its levels)
       List<Handle> sources(allocator_);
       List<uint32_t> subresources(allocator_);
       for (uint32_t i = 0; i < count; ++i)

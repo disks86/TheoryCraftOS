@@ -1106,6 +1106,26 @@ static void test_shader_stages(void) {
     if (vertices) ID3D11Buffer_Release(vertices);
     ID3D11GeometryShader_Release(gs);
   }
+  /* gs_loop: the same from loops that are not unrolled - its inputs v[r0.x][register], the vertex a temporary picks */
+  gs = NULL;
+  hr = ID3D11Device_CreateGeometryShader(g_device, dx_gs_loop_dxbc, sizeof dx_gs_loop_dxbc, NULL, &gs);
+  check(SUCCEEDED(hr) && gs, "CreateGeometryShader of a shader whose inputs a register indexes");
+  if (gs) {
+    ID3D11Buffer *vertices = triangle(0.5f, 1, 0, 0);
+    begin(NULL);
+    clear(0, 0, 0);
+    bind_floats(vertices);
+    ID3D11DeviceContext_PSSetShader(g_context, g_ps_color, NULL, 0);
+    ID3D11DeviceContext_GSSetShader(g_context, gs, NULL, 0);
+    ID3D11DeviceContext_Draw(g_context, 3, 0);
+    ID3D11DeviceContext_GSSetShader(g_context, NULL, NULL, 0);
+    read_target();
+    printf("d3d11test: geometry shader of indexed inputs: %08x %08x\n", (unsigned)pixel(32, 30), (unsigned)pixel(48, 54));
+    check(red(pixel(32, 30)) == 255 && blue(pixel(32, 30)) == 0 && blue(pixel(48, 54)) == 255 && red(pixel(48, 54)) == 0,
+          "a geometry shader that reads its inputs through v[r0.x][register]: the triangle and its copy");
+    if (vertices) ID3D11Buffer_Release(vertices);
+    ID3D11GeometryShader_Release(gs);
+  }
 
   hr = ID3D11Device_CreateHullShader(g_device, dx_hs_tri_cb_dxbc, sizeof dx_hs_tri_cb_dxbc, NULL, &hs);
   if (SUCCEEDED(hr)) hr = ID3D11Device_CreateDomainShader(g_device, dx_ds_shift_dxbc, sizeof dx_ds_shift_dxbc, NULL, &ds);
@@ -2736,6 +2756,27 @@ static void test_device5(void) {
   tf.OutFormatSupport2 = 0;
   ID3D11Device5_CheckFeatureSupport(d5, D3D11_FEATURE_FORMAT_SUPPORT2, &tf, sizeof tf);
   check(!(tf.OutFormatSupport2 & D3D11_FORMAT_SUPPORT2_TILED), "FORMAT_SUPPORT2: NV12 is not tiled");
+  /* (tiled depth buffers: D32_FLOAT - Direct3D 12's reserved depth buffers below -, not D16_UNORM, which this runtime keeps in D32 below, nor the formats with stencil) */
+  tf.InFormat = DXGI_FORMAT_D32_FLOAT, tf.OutFormatSupport2 = 0;
+  ID3D11Device5_CheckFeatureSupport(d5, D3D11_FEATURE_FORMAT_SUPPORT2, &tf, sizeof tf);
+  const int d32_tiled = (tf.OutFormatSupport2 & D3D11_FORMAT_SUPPORT2_TILED) != 0;
+  tf.InFormat = DXGI_FORMAT_D16_UNORM, tf.OutFormatSupport2 = 0;
+  ID3D11Device5_CheckFeatureSupport(d5, D3D11_FEATURE_FORMAT_SUPPORT2, &tf, sizeof tf);
+  const int d16_tiled = (tf.OutFormatSupport2 & D3D11_FORMAT_SUPPORT2_TILED) != 0;
+  tf.InFormat = DXGI_FORMAT_D24_UNORM_S8_UINT, tf.OutFormatSupport2 = 0;
+  ID3D11Device5_CheckFeatureSupport(d5, D3D11_FEATURE_FORMAT_SUPPORT2, &tf, sizeof tf);
+  check(d32_tiled && !d16_tiled && !(tf.OutFormatSupport2 & D3D11_FORMAT_SUPPORT2_TILED), "FORMAT_SUPPORT2: D32_FLOAT may be tiled, D16_UNORM and D24S8 not");
+  {
+    D3D11_TEXTURE2D_DESC td = {256, 128, 1, 1, DXGI_FORMAT_D32_FLOAT, {1, 0}, D3D11_USAGE_DEFAULT, D3D11_BIND_DEPTH_STENCIL, 0, D3D11_RESOURCE_MISC_TILED};
+    ID3D11Texture2D *tex = NULL;
+    const HRESULT made = ID3D11Device_CreateTexture2D(g_device, &td, NULL, &tex);
+    if (tex) ID3D11Texture2D_Release(tex);
+    td.Format = DXGI_FORMAT_D16_UNORM;
+    ID3D11Texture2D *refused = NULL;
+    const HRESULT d16 = ID3D11Device_CreateTexture2D(g_device, &td, NULL, &refused);
+    if (refused) ID3D11Texture2D_Release(refused);
+    check(SUCCEEDED(made) && tex && d16 == E_INVALIDARG && !refused, "a tiled D32_FLOAT depth texture is made, a tiled D16_UNORM one refused");
+  }
   D3D11_FEATURE_DATA_D3D11_OPTIONS5 o5;
   memset(&o5, 0xCC, sizeof o5);
   check(SUCCEEDED(ID3D11Device5_CheckFeatureSupport(d5, D3D11_FEATURE_D3D11_OPTIONS5, &o5, sizeof o5)) && (UINT)o5.SharedResourceTier <= D3D11_SHARED_RESOURCE_TIER_3,

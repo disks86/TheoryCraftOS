@@ -81,7 +81,7 @@ the vertex shader's end. `d3d11.dll` reads the sizes out of the shaders (`dcl_co
 `formats.inc` says how each texture format is kept. Every colour format of feature level 11_1 is kept as it is: Direct3D 12 below has each with its own channels and
 encoding (R8 / R8G8 / R16 / R16G16 in every kind, A8, R8G8B8A8 snorm and sint, R32G32 and R32G32B32, R11G11B10_FLOAT, R9G9B9E5, R10G10B10A2_UINT, B5G6R5, B5G5R5A1,
 B4G4R4A4, BC1 - BC7 with their sRGB forms; docs/Direct3DKernelMode.md "More texture formats"), so the CPU's bytes are the GPU's. D16 is kept in 32-bit float,
-D32_FLOAT_S8X24_UINT in D24S8 (with its stencil, 24 bits of depth). R24G8_TYPELESS and R32G8X24_TYPELESS not made for depth keep their bytes. A typeless R8 / R8G8 / R16 /
+D32_FLOAT_S8X24_UINT in Direct3D 12's D32_FLOAT_S8X24_UINT (a float depth plane, all 32 bits of it, and the stencil; it was D24S8 before gap pass 5). R24G8_TYPELESS and R32G8X24_TYPELESS not made for depth keep their bytes. A typeless R8 / R8G8 / R16 /
 R16G16 texture (R16_TYPELESS too when it is not a depth texture) stays typeless below and its views are of the view's own format (`view_format12`: Direct3D 12 shows it as every
 kind of its family through mirrors). `R1_UNORM` is a bit a pixel (rows of `(width + 7) / 8` bytes in initial data and `UpdateSubresource`, a box that starts on a byte), 1D and
 2D textures sampled and loaded as 0 and 1, no render target, unordered access, staging, dynamic or tiled one. `CheckFormatSupport`
@@ -113,10 +113,11 @@ renderer does; virgl as large as the host's `max_texture_2d_size`).
   no target at all draws only when its pixel shader declares unordered access views.
 - `CheckFormatSupport` of the formats kept wider (R16G16_FLOAT and the like) does not say `TYPED_UNORDERED_ACCESS_VIEW`, though typed views of buffers of them are made: the
   flag would say textures too.
-- From the interfaces after 11.1: tiled depth buffers and multisampled tiled textures (the kernel's depth and multisampled images have no system-memory backing the tiles could be
-  gathered into: no tiled depth format, no `D3D11_CHECK_MULTISAMPLE_QUALITY_LEVELS_TILED_RESOURCE` level), tiled cubes (`MISC_TEXTURECUBE` with `MISC_TILED` is refused), tiled
-  textures of narrow formats as unordered access views, the status of buffer and unordered access loads (`ld_raw_s`, `ld_structured_s`, `ld_uav_typed_s`: refused by the kernel),
-  residency feedback and clamps on virgl (tier 1 there: TGSI has neither); conservative
+- From the interfaces after 11.1: multisampled tiled textures (no device moves a multisampled image's samples to or from memory, so the kernel has no backing their tiles could
+  be gathered into: no `D3D11_CHECK_MULTISAMPLE_QUALITY_LEVELS_TILED_RESOURCE` level), tiled depth textures other than D32_FLOAT (`D3D11_FORMAT_SUPPORT2_TILED` of D32_FLOAT and
+  R32_TYPELESS only: this runtime keeps D16 in D32 below, whose tiles are not a 16-bit format's, and D24S8 / D32S8 have two planes), tiled cubes (`MISC_TEXTURECUBE` with
+  `MISC_TILED` is refused), tiled textures of narrow formats as unordered access views, residency feedback and clamps on virgl (tier 1 there: TGSI has neither; the status of
+  buffer and unordered access loads, `ld_raw_s`, `ld_structured_s`, `ld_uav_typed_s`, is reported on the CPU renderer); conservative
   rasterization on virgl, and tiers 2 and 3 (inner coverage, `SV_InnerCoverage`) anywhere; hardware content protection is a state only (protected content needs
   trusted hardware). `ID3D11InfoQueue` and `ID3D11Debug` (debug devices answer `DXGI_ERROR_SDK_COMPONENT_MISSING`, as Windows does without the SDK layers; the layered
   device exports answer the same), and a Direct3D 10 driver interface (`OpenAdapter10*`).

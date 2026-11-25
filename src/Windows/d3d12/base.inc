@@ -156,8 +156,7 @@ static UINT format_rows(const FormatInfo *fi, UINT h) { return fi && fi->compres
 static int format_packed_yuv_mips(DXGI_FORMAT f) { return f == DXGI_FORMAT_AYUV || f == DXGI_FORMAT_Y416; }
 /* Whether a texture of the format may be reserved (D3D12_FORMAT_SUPPORT2_TILED): a colour format the kernel keeps, of 1 to 16 bytes a texel, or a block-compressed one (8 or 16
  * bytes a block), not a video format (planar or packed YUV: Direct3D defines no tiles for those, and its format tables have "Tiled Resource" disallowed for every one of them),
- * not R32G32B32 (96 bits: no tile shape). Not the depth formats: the kernel's depth buffers are the device's alone (no backing a tile could be gathered into), so no reserved
- * depth buffer is offered - CreateReservedResource refuses them as a format without the support. */
+ * not R32G32B32 (96 bits: no tile shape). The depth formats: format_tiled_depth. */
 static int format_tiled(const FormatInfo *fi) {
   if (!fi || !fi->kernel || fi->depth || fi->planar || fi->pair || format_packed_yuv(fi->dxgi) || fi->narrow == NARROW_R1) return 0;      /* (R1_UNORM: no tiles of bits) */
   return fi->bytes == 1 || fi->bytes == 2 || fi->bytes == 4 || fi->bytes == 8 || fi->bytes == 16;
@@ -391,6 +390,7 @@ struct Dev {
 #define DEV_FEATURE2_BARYCENTRICS (1u << 28)             /* SV_Barycentrics and GetAttributeAtVertex in pixel shaders */
 #define DEV_FEATURE2_SAMPLE_COPIES (1u << 29)            /* a region of a multisampled image, every sample, into another (ResolveRegion's kResolveCopySamples): DECOMPRESS */
 #define SHADING_RATE_TILE 16                             /* graphics::kShadingRateTileSize: the pixels of a tile of the shading-rate image each way */
+#define DEV_FEATURE2_DEPTH_COPIES (1u << 24)             /* graphics::kFeature2DepthCopies: depth planes to and from memory, whole depth subresources copied */
 #define DEV_FEATURE2_TILE_RESIDENCY (1u << 27)           /* graphics::kFeature2TileResidency: residency feedback (CheckAccessFullyMapped) and lookup clamps - tiled resources tier 2 and up */
 #define DEV_FEATURE_TEXTURE_KINDS (1u << 8)              /* graphics::kFeatureTextureKinds: volumes, arrays, cubes */
 #define DEV_FEATURE2_SEPARATE_FILTERS (1u << 18)         /* graphics::kFeature2SeparateFilters: minification and magnification filters of their own (MIN_POINT_MAG_LINEAR ...) */
@@ -413,6 +413,12 @@ static UINT dev_max_texture(const Dev *d) {
  * (CheckAccessFullyMapped, Sample with a clamp: graphics::kFeature2TileResidency, the CPU renderer's) make tier 2; volumes (the kernel's texture kinds) tier 3; arrays whose
  * levels are packed - each slice has its own packed levels (VidMm ReservedLayout) - on a device with levels of arrays, tier 4. virgl's shaders are TGSI, which has no residency
  * feedback: tier 1 there. */
+/* Whether a depth format may be reserved: D32_FLOAT and D16_UNORM (the depth of one plane: the kernel's reserved depth buffers keep floats, or 16-bit codes in the heaps - tiles of
+ * 4- and 2-byte elements), on a device that moves depth planes to and from memory (DEV_FEATURE2_DEPTH_COPIES: what gathers the tiles into its image). Not the formats with stencil
+ * (D24_UNORM_S8_UINT and D32_FLOAT_S8X24_UINT have two planes: Direct3D makes tiling of them optional, and no tile layout of the second plane is given here). */
+static int format_tiled_depth(const Dev *d, const FormatInfo *fi) {
+  return fi && fi->depth && (fi->dxgi == DXGI_FORMAT_D32_FLOAT || fi->dxgi == DXGI_FORMAT_D16_UNORM) && (d->caps.features2 & DEV_FEATURE2_DEPTH_COPIES);
+}
 static D3D12_TILED_RESOURCES_TIER dev_tiled_tier(const Dev *d) {
   if (!(d->caps.features2 & DEV_FEATURE2_TILE_RESIDENCY)) return D3D12_TILED_RESOURCES_TIER_1;
   if (!(d->caps.features & DEV_FEATURE_TEXTURE_KINDS)) return D3D12_TILED_RESOURCES_TIER_2;
