@@ -351,7 +351,12 @@ NtStatus VidMm::create(const AllocationDesc& requested, SharedPointer<Allocation
     } else if (!(desc.flags & (kAllocTexture | kAllocRenderTarget | kAllocDepthStencil | kAllocPresent))) {
       return status::kInvalidParameter;
     }
-    if (depth_flag && (desc.flags & ~(kAllocDepthStencil | kAllocShared))) return status::kInvalidParameter;
+    // (a depth buffer, and one read as a texture too - kFeature2DepthTextures: shadow maps -, of one sample)
+    if (depth_flag && (desc.flags & ~(kAllocDepthStencil | kAllocShared | kAllocTexture))) return status::kInvalidParameter;
+    if (depth_flag && (desc.flags & kAllocTexture)) {
+      if (desc.samples != 1) return status::kInvalidParameter;
+      if (!(device_.info().features2 & graphics::kFeature2DepthTextures)) return status::kNotSupported;
+    }
     if (dxgk::is_wide(desc.format)) {
       if (desc.mip_levels != 1 || (desc.flags & kAllocPresent)) return status::kInvalidParameter;
       const uint32_t needed = dxgk::is_single_channel(desc.format) ? 0u : dxgk::is_float(desc.format) ? graphics::kFeatureFloatFormats : dxgk::is_integer(desc.format) ? graphics::kFeatureIntegerFormats : (desc.format == Format::A16B16G16R16Snorm || desc.format == Format::A2B10G10R10) ? graphics::kFeatureSnormFormats : graphics::kFeatureUnorm16Formats;
@@ -377,7 +382,7 @@ NtStatus VidMm::create(const AllocationDesc& requested, SharedPointer<Allocation
       // (a volume, array or cube: one level, sampled - and also drawn into or read and written as a storage image - or a depth buffer that is an array or a cube; of any colour format but
       // the block-compressed ones, which are sampled only; the wide ones the devices take as layers of Vec4s)
       const uint32_t colour_flags = kAllocTexture | kAllocShared | kAllocRenderTarget | kAllocStorageImage;
-      if (depth_flag ? (desc.flags & ~(kAllocDepthStencil | kAllocShared)) || desc.kind == graphics::TextureKind::Texture3D
+      if (depth_flag ? (desc.flags & ~(kAllocDepthStencil | kAllocShared | kAllocTexture)) || desc.kind == graphics::TextureKind::Texture3D
                      : (desc.flags & ~colour_flags) || !(desc.flags & kAllocTexture) || (compressed && (desc.flags & (kAllocRenderTarget | kAllocStorageImage))))
         return status::kInvalidParameter;
       if (desc.mip_levels != 1) return status::kInvalidParameter;
@@ -480,7 +485,7 @@ bool VidMm::create_device_object(Allocation& a) {
   id.samples = d.samples;
   if (a.is_depth()) {
     id.format = graphics::Format::D32Float;
-    id.usage = graphics::kImageDepthAttachment;
+    id.usage = graphics::kImageDepthAttachment | ((d.flags & kAllocTexture) ? graphics::kImageSampled : 0u);   // (read by shaders too)
     id.stencil = d.format == Format::D24S8;
     a.image_ = device_.create_image(id);
     return a.image_ != nullptr;

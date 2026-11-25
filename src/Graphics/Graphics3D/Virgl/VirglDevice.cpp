@@ -242,7 +242,7 @@ class VirglImage final : public IImage {
     // A sampled image is stored top row first, the way write_pixels() gives it and the sampler reads it, so it does not take the Y_0_TOP flip of the images that are only
     // drawn into (and shown).
     const bool sampled = (desc.usage & kImageSampled) != 0;
-    uint32_t bind = depth ? virgl::kBindDepthStencil : is_compressed_format(desc.format) ? virgl::kBindSamplerView : (virgl::kBindRenderTarget | virgl::kBindSamplerView);
+    uint32_t bind = depth ? virgl::kBindDepthStencil | (sampled ? virgl::kBindSamplerView : 0u) : is_compressed_format(desc.format) ? virgl::kBindSamplerView : (virgl::kBindRenderTarget | virgl::kBindSamplerView);
     if (desc.usage & kImagePresent) bind |= virgl::kBindScanout;
     // A volume has its slices as the depth; an array or a cube its layers as the array size (a cube: six).
     const uint32_t layers = layer_count();
@@ -266,13 +266,23 @@ class VirglImage final : public IImage {
       view_ = device.new_handle();
       // (the layers the view shows: all of an array's or a cube's; a volume's slices are not layers)
       const uint32_t last_layer = desc.kind == TextureKind::Texture2DArray || desc.kind == TextureKind::TextureCube ? layers - 1 : 0;
-      const uint32_t cmd[] = {virgl::header(virgl::kCreateObject, virgl::kObjectSamplerView, 6), view_, id_, color_format_, last_layer << 16, (desc.mip_levels - 1) << 8 /* first level | last level << 8 */, virgl::kSwizzleRgba};
+      // (a depth buffer read as a texture: its depth in red, 0, 0, 1 - Direct3D's R32_FLOAT / R24_UNORM_X8 views -; one with a stencil plane has a view of that too, the stencil
+      // in green as an integer - X24_TYPELESS_G8_UINT -, which the host reads with GL_STENCIL_INDEX texturing)
+      const uint32_t cmd[] = {virgl::header(virgl::kCreateObject, virgl::kObjectSamplerView, 6), view_, id_, depth ? depth_format : color_format_, last_layer << 16,
+                              (desc.mip_levels - 1) << 8 /* first level | last level << 8 */, depth ? virgl::kSwizzleDepth : virgl::kSwizzleRgba};
       ok_ = device.send_commands(cmd, 7);
+      if (ok_ && depth && desc.stencil) {
+        stencil_view_ = device.new_handle();
+        const uint32_t stencil_cmd[] = {virgl::header(virgl::kCreateObject, virgl::kObjectSamplerView, 6), stencil_view_, id_, virgl::kFormatX32S8X24Uint, last_layer << 16, 0, virgl::kSwizzleStencil};
+        ok_ = device.send_commands(stencil_cmd, 7);
+      }
     }
   }
   ~VirglImage() {
     hardware::VirtioGpu& gpu = device_.gpu();
     if (view_) device_.destroy_object(view_);
+    if (stencil_view_) device_.destroy_object(stencil_view_);
+    if (stand_in_) destroy(gpu.allocator(), stand_in_);
     for (const LayerSurface& s : surfaces_)
       if (s.handle) device_.destroy_object(s.handle);
     if (id_) {
@@ -323,6 +333,26 @@ class VirglImage final : public IImage {
     }
   }
   uint32_t view() const { return view_; }
+  // The view a unit reads: the stencil plane's of a depth buffer that has one (SamplerDesc::stencil), else the image's.
+  uint32_t view(bool stencil) const { return stencil && stencil_view_ ? stencil_view_ : view_; }
+  // A depth buffer read as a texture is kept the way textures are (row 0 first, no Y_0_TOP): a pass that draws into it with a colour target kept the other way (an image that is
+  // only drawn into and shown) would leave its rows the other way round too. Such a pass draws into this upright stand-in for the colour target instead, which is filled from the
+  // target first (unless the pass clears it) and copied into it after the pass; the host's blits turn the rows over between the two kinds of image. Made on first use, kept
+  // with the image; null if the host will not make it.
+  VirglImage* stand_in() {
+    if (stand_in_) return stand_in_;
+    ImageDesc d = desc_;
+    d.usage = kImageColorAttachment | kImageSampled;
+    VirglImage* made = make<VirglImage>(device_.gpu().allocator(), device_, d);
+    if (made && !made->valid()) {
+      destroy(device_.gpu().allocator(), made);
+      made = nullptr;
+    }
+    stand_in_ = made;
+    return stand_in_;
+  }
+  // A depth buffer read as a texture (kFeature2DepthTextures).
+  bool sampled_depth() const { return desc_.format == Format::D32Float && (desc_.usage & kImageSampled) != 0; }
   Extent2D extent() const override { return desc_.extent; }
   Format format() const override { return desc_.format; }
   uint32_t usage() const { return desc_.usage; }
@@ -506,6 +536,8 @@ class VirglImage final : public IImage {
   VirglDevice& device_;
   ImageDesc desc_;
   uint32_t id_ = 0, surface_ = 0, view_ = 0, color_format_ = 0;
+  uint32_t stencil_view_ = 0;          // a depth buffer read as a texture: the view of its stencil plane
+  VirglImage* stand_in_ = nullptr;     // (stand_in)
   uint64_t accounted_ = 0;   // what the GPU's video memory figure counts for this image
   ByteView backing_;
   bool ok_ = false;
@@ -521,6 +553,7 @@ class VirglShaderModule final : public IShaderModule {
     for (uint32_t k = 0; k < 3; ++k) thread_group_[k] = desc.thread_group[k];
     streams_ = desc.geometry_streams;
     output_topology_ = desc.geometry_output;
+    sampler_constants_ = desc.sampler_constants;
     desc_ = desc;
     // A shader with storage images names their formats IMGFMT<n> (ShaderModuleDesc::tgsi): the host's shader is made for the formats of the images a dispatch or draw binds
     // (variant), not now.
@@ -574,6 +607,7 @@ class VirglShaderModule final : public IShaderModule {
   uint32_t handle() const { return handle_; }
   const char* tgsi() const { return tgsi_; }   // (the text the kernel keeps for the module's life)
   bool has_images() const { return has_images_; }
+  bool sampler_constants() const { return sampler_constants_; }   // (ShaderModuleDesc::sampler_constants)
   // The host's shader for storage images of the formats `formats` (VIRGL_FORMAT_*, by slot): IMGFMT<n> made the name of slot n's format; made on first use and kept with the
   // module (kVariants of them; the oldest goes when there is no room). 0 when the host refuses it.
   uint32_t variant(VirglDevice& device, const uint32_t (&formats)[kMaxStorageImages]) const {
@@ -662,6 +696,7 @@ class VirglShaderModule final : public IShaderModule {
   mutable Variant variants_[kVariants];
   mutable uint32_t next_variant_ = 0;
   bool has_images_ = false;
+  bool sampler_constants_ = false;
   ShaderModuleDesc desc_;
   uint32_t thread_group_[3] = {1, 1, 1};
   ShaderStage stage_;
@@ -940,6 +975,12 @@ class VirglPipeline final : public VirglPipelineBase {
   bool stencil_enabled() const { return desc_.stencil.enable; }
   uint32_t vertex_shader() const { return vs_; }
   uint32_t fragment_shader() const { return fs_; }
+  // Whether a shader of the pipeline reads the bound samplers' comparisons from the constants (ShaderModuleDesc::sampler_constants).
+  bool sampler_constants() const {
+    for (const IShaderModule* m : {desc_.vertex_shader, desc_.fragment_shader, desc_.geometry_shader, desc_.hull_shader, desc_.domain_shader})
+      if (m && static_cast<const VirglShaderModule*>(m)->sampler_constants()) return true;
+    return false;
+  }
   // A fragment shader with storage images: the host's shader is the module's variant for the images bound at the draw.
   const VirglShaderModule* fragment_module() const { return static_cast<const VirglShaderModule*>(desc_.fragment_shader); }
   uint32_t geometry_shader() const { return gs_; }   // (0: none)
@@ -1075,7 +1116,7 @@ IImage* VirglDevice::create_image(const ImageDesc& desc) {
     // (a volume, array or cube: sampled - and drawn into, or a storage image, with kFeature2LayeredTargets / StorageImages -, 8-bit colour or a wide format (its layers staged as such:
     // write_layer_pixels_float), one level; or a depth buffer of layers, an array or a cube)
     const uint32_t layers = desc.kind == TextureKind::TextureCube ? 6 : desc.layers;
-    const bool depth_layers = desc.format == Format::D32Float && desc.usage == kImageDepthAttachment && desc.kind != TextureKind::Texture3D;
+    const bool depth_layers = desc.format == Format::D32Float && (desc.usage & ~kImageSampled) == kImageDepthAttachment && desc.kind != TextureKind::Texture3D;
     const bool colour = (desc.usage & kImageSampled) && !(desc.usage & ~(kImageSampled | kImageColorAttachment | kImageStorage)) &&
                         (desc.format == Format::B8G8R8A8Unorm || desc.format == Format::R8G8B8A8Unorm || is_wide_format(desc.format));
     if ((!colour && !depth_layers) || layers == 0 || layers > kMaxTextureLayers || desc.mip_levels != 1 || (desc.kind == TextureKind::TextureCube && desc.extent.width != desc.extent.height)) return nullptr;
@@ -1083,9 +1124,11 @@ IImage* VirglDevice::create_image(const ImageDesc& desc) {
   } else if (desc.layers != 1) {
     return nullptr;
   }
-  // A texture is not drawn into: the two kinds of image are stored in opposite row order (see VirglImage).
-  if ((desc.usage & kImageSampled) && (desc.usage & (kImageDepthAttachment | kImagePresent))) return nullptr;
-  if ((desc.usage & kImageSampled) && desc.format != Format::B8G8R8A8Unorm && desc.format != Format::B8G8R8A8Srgb && desc.format != Format::R8G8B8A8Unorm && desc.format != Format::R8G8B8A8Srgb && !is_wide_format(desc.format)) return nullptr;
+  // A texture is not shown: the two kinds of image are stored in opposite row order (see VirglImage). A depth buffer that is read as a texture is kept the way textures are, and
+  // a pass that draws into it with a colour target kept the other way draws into a stand-in for the target (VirglImage::stand_in).
+  if ((desc.usage & kImageSampled) && (desc.usage & kImagePresent)) return nullptr;
+  if ((desc.usage & kImageSampled) && (desc.usage & kImageDepthAttachment) && (desc.format != Format::D32Float || desc.samples != 1 || desc.mip_levels != 1 || (desc.usage & ~(kImageSampled | kImageDepthAttachment)))) return nullptr;
+  if ((desc.usage & kImageSampled) && desc.format != Format::D32Float && desc.format != Format::B8G8R8A8Unorm && desc.format != Format::B8G8R8A8Srgb && desc.format != Format::R8G8B8A8Unorm && desc.format != Format::R8G8B8A8Srgb && !is_wide_format(desc.format)) return nullptr;
   if (!desc.extent.width || !desc.extent.height || desc.format == Format::Undefined) return nullptr;
   if (desc.stencil && desc.format != Format::D32Float) return nullptr;
   VirglImage* image = make<VirglImage>(gpu_.allocator(), *this, desc);
@@ -1205,7 +1248,7 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
       stream.put(images[k] ? images[k]->id() : 0);
     }
   };
-  bool textures_dirty = false, compute_textures_dirty = false;
+  bool textures_dirty = false, compute_textures_dirty = false, compute_textures_changed = false;
   VirglBuffer* index_buffer = nullptr;
   uint64_t index_offset = 0;
   IndexType index_type = IndexType::Uint16;
@@ -1214,6 +1257,42 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
   uint32_t constants[kMaxPushConstantBytes / 4] = {};
   uint32_t constants_dwords = 0;
   bool constants_dirty = false;
+  // The constants a stage is given: the push constants and, for a pipeline whose shaders compare (ShaderModuleDesc::sampler_constants), the comparisons of the units' samplers
+  // after the most there may be (kSamplerCompareRegister) - sent again when the samplers bound change.
+  bool sampler_constants_dirty = false;
+  auto send_constants = [&](uint32_t shader, bool with_samplers) {
+    const uint32_t dwords = with_samplers ? (kSamplerCompareRegister + kMaxTextureUnits) * 4 : constants_dwords;
+    stream.command(virgl::kSetConstantBuffer, 0, 2 + dwords);
+    stream.put(shader);
+    stream.put(0);
+    for (uint32_t k = 0; k < dwords; ++k) {
+      if (k < constants_dwords) {
+        stream.put(constants[k]);
+      } else if (k < kSamplerCompareRegister * 4) {
+        stream.put(0);
+      } else {
+        const uint32_t unit = k / 4 - kSamplerCompareRegister;
+        float values[4];
+        sampler_compare_constant(samplers[unit].compare, samplers[unit].filter == Filter::Linear, values);
+        stream.putf(values[k % 4]);
+      }
+    }
+  };
+  // The colour targets of the pass that are drawn through their stand-ins (VirglImage::stand_in), and the stand-ins: copied into the targets when the pass ends.
+  VirglImage* stood_for[kMaxColorTargets] = {};
+  VirglImage* stand_ins[kMaxColorTargets] = {};
+  // A straight copy of a whole image into another of its size and format (the host turns the rows over between images kept in the two orders).
+  auto copy_image = [&](const VirglImage* from, const VirglImage* to) {
+    const Extent2D e = from->extent();
+    stream.command(virgl::kBlit, 0, 21);
+    stream.put(0xFu);   // (all four channels; nearest, no scissor)
+    stream.put(0);
+    stream.put(e.width | (e.height << 16));
+    stream.put(to->id()), stream.put(0), stream.put(to->blit_format());
+    stream.put(0), stream.put(0), stream.put(0), stream.put(e.width), stream.put(e.height), stream.put(1);
+    stream.put(from->id()), stream.put(0), stream.put(from->blit_format());
+    stream.put(0), stream.put(0), stream.put(0), stream.put(e.width), stream.put(e.height), stream.put(1);
+  };
   bool in_pass = false;
   PrimitiveTopology topology = PrimitiveTopology::TriangleList;
   const VirglComputePipeline* compute = nullptr;
@@ -1400,6 +1479,19 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
           target_count = n + 2;
         }
         for (uint32_t n = target_count - 1; n + 1 < kMaxColorTargets; ++n) extra_colors[n] = nullptr;
+        // (a depth buffer that is read as a texture keeps its rows the way textures do: colour targets kept the other way are drawn through stand-ins - VirglImage::stand_in -,
+        // filled from them first unless the pass clears them)
+        if (depth && depth->sampled_depth() && color->y0_top()) {
+          for (uint32_t n = 0; n < target_count; ++n) {
+            VirglImage*& target = n == 0 ? color : extra_colors[n - 1];
+            VirglImage* stand = target->stand_in();
+            if (!stand || !stand->surface()) return false;
+            if (!cmd.pass.clear_color) copy_image(target, stand);
+            stood_for[n] = target;
+            stand_ins[n] = stand;
+            target = stand;
+          }
+        }
         // (the surfaces of the layers the pass draws into: a layered one takes the primitives' gl_Layer)
         uint32_t surfaces[kMaxColorTargets + 1] = {};
         for (uint32_t n = 0; n <= kMaxColorTargets; ++n) {
@@ -1449,6 +1541,10 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
         if (queries.open != kMaxOcclusionQueries) return false;
         unset_stream_output();
         in_pass = false;
+        for (uint32_t n = 0; n < kMaxColorTargets; ++n) {   // (what was drawn through stand-ins goes into the targets)
+          if (stand_ins[n]) copy_image(stand_ins[n], stood_for[n]);
+          stand_ins[n] = stood_for[n] = nullptr;
+        }
         break;
       case RecordedCommand::Type::Resolve: {
         // A blit from the multisampled image to the plain one; one kept upright (an image that is only drawn into) is turned over.
@@ -1478,6 +1574,7 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
         stream.put(virgl::kShaderCompute);
         bound_compute_shader = compute->shader();   // (0 for a shader with images: its variant goes with the dispatch)
         compute_constants_dirty = constants_dwords != 0;
+        compute_textures_changed = true;   // (its comparisons, if it reads them, are sent with its first dispatch)
         break;
       }
       case RecordedCommand::Type::BindStreamOutput: {
@@ -1542,10 +1639,18 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
             uint32_t states[kMaxTextureUnits] = {};
             for (uint32_t unit = 0; unit < unit_count; ++unit)
               if (textures[unit] && !(states[unit] = sampler_state(samplers[unit]))) return false;
+            bool depth_views = false;   // (see the draws': the host's depth texture mode is set as a view is bound)
+            for (uint32_t unit = 0; unit < unit_count; ++unit) depth_views = depth_views || (textures[unit] && textures[unit]->sampled_depth());
+            if (depth_views) {
+              stream.command(virgl::kSetSamplerViews, 0, 2 + unit_count);
+              stream.put(virgl::kShaderCompute);
+              stream.put(0);
+              for (uint32_t unit = 0; unit < unit_count; ++unit) stream.put(0);
+            }
             stream.command(virgl::kSetSamplerViews, 0, 2 + unit_count);
             stream.put(virgl::kShaderCompute);
             stream.put(0);
-            for (uint32_t unit = 0; unit < unit_count; ++unit) stream.put(textures[unit] ? textures[unit]->view() : 0);
+            for (uint32_t unit = 0; unit < unit_count; ++unit) stream.put(textures[unit] ? textures[unit]->view(samplers[unit].stencil) : 0);
             stream.command(virgl::kBindSamplerStates, 0, 2 + unit_count);
             stream.put(virgl::kShaderCompute);
             stream.put(0);
@@ -1553,12 +1658,10 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
           }
           compute_textures_dirty = false;
         }
-        if (compute_constants_dirty) {
-          stream.command(virgl::kSetConstantBuffer, 0, 2 + constants_dwords);
-          stream.put(virgl::kShaderCompute);
-          stream.put(0);
-          for (uint32_t k = 0; k < constants_dwords; ++k) stream.put(constants[k]);
+        if (compute_constants_dirty || (compute->module()->sampler_constants() && compute_textures_changed)) {
+          send_constants(virgl::kShaderCompute, compute->module()->sampler_constants());
           compute_constants_dirty = false;
+          compute_textures_changed = false;
         }
         if (compute->module()->has_images()) {
           // (the host's shader for the formats of the images bound, and the images)
@@ -1668,6 +1771,7 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
         stream.put(pipeline->domain_shader());
         stream.put(virgl::kShaderTessEval);
         constants_dirty = constants_dwords != 0;  // constants belong to the program: resend
+        sampler_constants_dirty = true;
         break;
       }
       case RecordedCommand::Type::BindVertexBuffer:
@@ -1689,6 +1793,8 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
         samplers[cmd.unit] = cmd.sampler;
         textures_dirty = true;
         compute_textures_dirty = true;
+        sampler_constants_dirty = true;
+        compute_textures_changed = true;
         break;
       }
       case RecordedCommand::Type::PushConstants: {
@@ -1764,14 +1870,22 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
               if (!states[unit]) return false;
             }
             // (and to the geometry, control and evaluation stages the pipeline has: a texture read there, by the same numbers)
+            bool depth_views = false;   // (a depth buffer's plane is the host texture's mode, set as a view is bound: unbound first, so that binding the view again sets it)
+            for (uint32_t unit = 0; unit < unit_count; ++unit) depth_views = depth_views || textures[unit]->sampled_depth();
             for (const uint32_t stage : {virgl::kShaderVertex, virgl::kShaderFragment, virgl::kShaderGeometry, virgl::kShaderTessControl, virgl::kShaderTessEval}) {
               if ((stage == virgl::kShaderGeometry && !pipeline->geometry_shader()) || (stage == virgl::kShaderTessControl && !pipeline->hull_shader()) ||
                   (stage == virgl::kShaderTessEval && !pipeline->domain_shader()))
                 continue;
+              if (depth_views) {
+                stream.command(virgl::kSetSamplerViews, 0, 2 + unit_count);
+                stream.put(stage);
+                stream.put(0);
+                for (uint32_t unit = 0; unit < unit_count; ++unit) stream.put(0);
+              }
               stream.command(virgl::kSetSamplerViews, 0, 2 + unit_count);
               stream.put(stage);
               stream.put(0);
-              for (uint32_t unit = 0; unit < unit_count; ++unit) stream.put(textures[unit]->view());
+              for (uint32_t unit = 0; unit < unit_count; ++unit) stream.put(textures[unit]->view(samplers[unit].stencil));
               stream.command(virgl::kBindSamplerStates, 0, 2 + unit_count);
               stream.put(stage);
               stream.put(0);
@@ -1780,16 +1894,15 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
             textures_dirty = false;
           }
         }
-        if (constants_dirty) {
+        const bool with_samplers = pipeline->sampler_constants();
+        if (constants_dirty || (with_samplers && sampler_constants_dirty)) {
           // (the vertex and fragment shaders' stages, and those of the geometry, hull and domain shaders the pipeline has: shader types 2, 3 and 4)
           for (uint32_t shader = 0; shader < 5; ++shader) {
             if ((shader == 2 && !pipeline->geometry_shader()) || (shader == 3 && !pipeline->hull_shader()) || (shader == 4 && !pipeline->domain_shader())) continue;
-            stream.command(virgl::kSetConstantBuffer, 0, 2 + constants_dwords);
-            stream.put(shader);
-            stream.put(0);
-            for (uint32_t k = 0; k < constants_dwords; ++k) stream.put(constants[k]);
+            send_constants(shader, with_samplers);
           }
           constants_dirty = false;
+          if (with_samplers) sampler_constants_dirty = false;
         }
         if (const uint32_t bindings = pipeline->binding_count()) {
           stream.command(virgl::kSetVertexBuffers, 0, bindings * 3);

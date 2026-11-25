@@ -3300,6 +3300,255 @@ static void test_d3d11_3(void) {
   test_exports();
 }
 
+/* ---- depth textures, comparison samplers, texture and sampler pairs ------------------------------------------------------------------------------------------------------------ */
+
+static ID3D11SamplerState *shadow_sampler(D3D11_FILTER filter, D3D11_TEXTURE_ADDRESS_MODE address, D3D11_COMPARISON_FUNC func) {
+  D3D11_SAMPLER_DESC desc;
+  memset(&desc, 0, sizeof desc);
+  desc.Filter = filter;
+  desc.AddressU = desc.AddressV = desc.AddressW = address;
+  desc.ComparisonFunc = func;
+  desc.MaxLOD = D3D11_FLOAT32_MAX;
+  ID3D11SamplerState *sampler = NULL;
+  ID3D11Device_CreateSamplerState(g_device, &desc, &sampler);
+  return sampler;
+}
+/* Six vertices of a rectangle (x0, y0) .. (x1, y1) at depth z whose coordinate (vs.hlsl's: twice the colour's red and green) is 0, 0 at the target's top left and 1, 1 at its
+ * bottom right (u scaled by `su`, v moved by `dv`), the blue the reference. */
+static ID3D11Buffer *shadow_rect(float x0, float y0, float x1, float y1, float z, float su, float dv, float reference) {
+  const float corners[6][2] = {{x0, y1}, {x1, y1}, {x0, y0}, {x0, y0}, {x1, y1}, {x1, y0}};
+  VertexF v[6];
+  for (int i = 0; i < 6; ++i) {
+    const float x = corners[i][0], y = corners[i][1];
+    v[i] = (VertexF){x, y, z, (x + 1) / 4 * su, ((1 - y) / 2 + dv) / 2, reference, 1};
+  }
+  return make_buffer(D3D11_BIND_VERTEX_BUFFER, D3D11_USAGE_DEFAULT, 0, v, sizeof v);
+}
+static int near_value(int value, int want, int within) { return value >= want - within && value <= want + within; }
+/* Draws `vertices` (six) with `ps` reading the views and samplers given into the cleared target, and reads the target. */
+static int shadow_draw(ID3D11Buffer *vertices, ID3D11PixelShader *ps, UINT views, ID3D11ShaderResourceView *const *view, UINT samplers, ID3D11SamplerState *const *sampler) {
+  begin(NULL);
+  clear(0, 0, 0);
+  bind_floats(vertices);
+  ID3D11DeviceContext_PSSetShader(g_context, ps, NULL, 0);
+  ID3D11DeviceContext_PSSetShaderResources(g_context, 0, views, view);
+  if (samplers) ID3D11DeviceContext_PSSetSamplers(g_context, 0, samplers, sampler);
+  ID3D11DeviceContext_Draw(g_context, 6, 0);
+  ID3D11ShaderResourceView *none[4] = {NULL, NULL, NULL, NULL};
+  ID3D11DeviceContext_PSSetShaderResources(g_context, 0, 4, none);
+  return read_target();
+}
+
+/* A shadow map the way Direct3D 11 programs make one: an R32G8X24_TYPELESS texture bound as a depth buffer (D32_FLOAT_S8X24_UINT) and a shader resource, drawn into by a pass of
+ * depth alone - its top half at 0.25 with stencil 7 -, then its depth compared (two comparison sampler states and a point one on the one texture: ps_shadow), its stencil plane
+ * loaded (X32_TYPELESS_G8X24_UINT: ps_stencil_only), compared through a linear comparison filter (ps_shadow_pcf); R16 and R24G8 depth textures, a
+ * cube of depth, one texture with two samplers, the views Direct3D 11 refuses and the formats' support. */
+static void test_shadow_maps(void) {
+  UINT support = 0;
+  check(SUCCEEDED(ID3D11Device_CheckFormatSupport(g_device, DXGI_FORMAT_R24_UNORM_X8_TYPELESS, &support)) && (support & D3D11_FORMAT_SUPPORT_SHADER_SAMPLE_COMPARISON) &&
+            (support & D3D11_FORMAT_SUPPORT_SHADER_GATHER_COMPARISON),
+        "R24_UNORM_X8_TYPELESS: sampled with a comparison and gathered so");
+  check(SUCCEEDED(ID3D11Device_CheckFormatSupport(g_device, DXGI_FORMAT_X24_TYPELESS_G8_UINT, &support)) && (support & D3D11_FORMAT_SUPPORT_SHADER_LOAD) &&
+            !(support & D3D11_FORMAT_SUPPORT_SHADER_SAMPLE),
+        "X24_TYPELESS_G8_UINT: loaded, not sampled");
+  D3D11_TEXTURE2D_DESC td = {SIZE, SIZE, 1, 1, DXGI_FORMAT_R32G8X24_TYPELESS, {1, 0}, D3D11_USAGE_DEFAULT, D3D11_BIND_DEPTH_STENCIL | D3D11_BIND_SHADER_RESOURCE, 0, 0};
+  ID3D11Texture2D *texture = NULL;
+  HRESULT hr = ID3D11Device_CreateTexture2D(g_device, &td, NULL, &texture);
+  check(SUCCEEDED(hr), "a depth texture of 32-bit depth and stencil that is read too");
+  if (!texture) return;
+  D3D11_DEPTH_STENCIL_VIEW_DESC dv;
+  memset(&dv, 0, sizeof dv);
+  dv.Format = DXGI_FORMAT_D32_FLOAT_S8X24_UINT;
+  dv.ViewDimension = D3D11_DSV_DIMENSION_TEXTURE2D;
+  ID3D11DepthStencilView *dsv = NULL;
+  ID3D11Device_CreateDepthStencilView(g_device, (ID3D11Resource *)texture, &dv, &dsv);
+  D3D11_SHADER_RESOURCE_VIEW_DESC sv;
+  memset(&sv, 0, sizeof sv);
+  sv.Format = DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS;
+  sv.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+  sv.Texture2D.MipLevels = 1;
+  ID3D11ShaderResourceView *depth_view = NULL, *stencil_view = NULL, *wrong = NULL;
+  ID3D11Device_CreateShaderResourceView(g_device, (ID3D11Resource *)texture, &sv, &depth_view);
+  sv.Format = DXGI_FORMAT_X32_TYPELESS_G8X24_UINT;
+  ID3D11Device_CreateShaderResourceView(g_device, (ID3D11Resource *)texture, &sv, &stencil_view);
+  sv.Format = DXGI_FORMAT_R24_UNORM_X8_TYPELESS;
+  check(ID3D11Device_CreateShaderResourceView(g_device, (ID3D11Resource *)texture, &sv, &wrong) == E_INVALIDARG && !wrong &&
+            ID3D11Device_CreateShaderResourceView(g_device, (ID3D11Resource *)texture, NULL, &wrong) == E_INVALIDARG && !wrong,
+        "a depth texture's view of another depth format, or of no description: E_INVALIDARG");
+  ID3D11PixelShader *ps_shadow = NULL, *ps_stencil = NULL, *ps_pcf = NULL, *ps_pair = NULL, *ps_cube = NULL;
+  ID3D11Device_CreatePixelShader(g_device, dx_ps_shadow_dxbc, sizeof dx_ps_shadow_dxbc, NULL, &ps_shadow);
+  ID3D11Device_CreatePixelShader(g_device, dx_ps_stencil_only_dxbc, sizeof dx_ps_stencil_only_dxbc, NULL, &ps_stencil);
+  ID3D11Device_CreatePixelShader(g_device, dx_ps_shadow_pcf_dxbc, sizeof dx_ps_shadow_pcf_dxbc, NULL, &ps_pcf);
+  ID3D11Device_CreatePixelShader(g_device, dx_ps_pair_dxbc, sizeof dx_ps_pair_dxbc, NULL, &ps_pair);
+  ID3D11Device_CreatePixelShader(g_device, dx_ps_shadow_cube_dxbc, sizeof dx_ps_shadow_cube_dxbc, NULL, &ps_cube);
+  ID3D11SamplerState *less_equal = shadow_sampler(D3D11_FILTER_COMPARISON_MIN_MAG_MIP_POINT, D3D11_TEXTURE_ADDRESS_CLAMP, D3D11_COMPARISON_LESS_EQUAL);
+  ID3D11SamplerState *greater = shadow_sampler(D3D11_FILTER_COMPARISON_MIN_MAG_MIP_POINT, D3D11_TEXTURE_ADDRESS_CLAMP, D3D11_COMPARISON_GREATER);
+  ID3D11SamplerState *linear = shadow_sampler(D3D11_FILTER_COMPARISON_MIN_MAG_LINEAR_MIP_POINT, D3D11_TEXTURE_ADDRESS_CLAMP, D3D11_COMPARISON_LESS_EQUAL);
+  ID3D11SamplerState *point = point_sampler(), *wrap = shadow_sampler(D3D11_FILTER_MIN_MAG_MIP_POINT, D3D11_TEXTURE_ADDRESS_WRAP, D3D11_COMPARISON_NEVER);
+  D3D11_DEPTH_STENCIL_DESC ds;
+  memset(&ds, 0, sizeof ds);
+  ds.DepthEnable = TRUE;
+  ds.DepthWriteMask = D3D11_DEPTH_WRITE_MASK_ALL;
+  ds.DepthFunc = D3D11_COMPARISON_LESS;
+  ds.StencilEnable = TRUE;
+  ds.StencilReadMask = ds.StencilWriteMask = 0xFF;
+  ds.FrontFace.StencilFailOp = ds.FrontFace.StencilDepthFailOp = D3D11_STENCIL_OP_KEEP;
+  ds.FrontFace.StencilPassOp = D3D11_STENCIL_OP_REPLACE;
+  ds.FrontFace.StencilFunc = D3D11_COMPARISON_ALWAYS;
+  ds.BackFace = ds.FrontFace;
+  ID3D11DepthStencilState *stamp = NULL;
+  ID3D11Device_CreateDepthStencilState(g_device, &ds, &stamp);
+  ID3D11Buffer *top = shadow_rect(-1, 0, 1, 1, 0.25f, 1, 0, 0), *full = shadow_rect(-1, -1, 1, 1, 0.5f, 1, 0, 0.5f), *shifted = shadow_rect(-1, -1, 1, 1, 0.5f, 1, 0.25f / SIZE, 0.5f);
+  ID3D11Buffer *wide = shadow_rect(-1, -1, 1, 1, 0.5f, 2, 0, 0);
+  if (!dsv || !depth_view || !stencil_view || !ps_shadow || !ps_stencil || !ps_pcf || !ps_pair || !less_equal || !greater || !linear || !point || !wrap || !stamp || !top || !full ||
+      !shifted || !wide) {
+    check(0, "the views, shaders, samplers and states of the shadow maps");
+    return;
+  }
+  /* the depth pass: no render target */
+  begin(NULL);
+  ID3D11DeviceContext_OMSetRenderTargets(g_context, 0, NULL, dsv);
+  ID3D11DeviceContext_ClearDepthStencilView(g_context, dsv, D3D11_CLEAR_DEPTH | D3D11_CLEAR_STENCIL, 1.0f, 0);
+  ID3D11DeviceContext_OMSetDepthStencilState(g_context, stamp, 7);
+  bind_floats(top);
+  ID3D11DeviceContext_PSSetShader(g_context, g_ps_color, NULL, 0);
+  ID3D11DeviceContext_Draw(g_context, 6, 0);
+  ID3D11DeviceContext_OMSetDepthStencilState(g_context, NULL, 0);
+  ID3D11SamplerState *three[3] = {less_equal, greater, point};
+  if (shadow_draw(full, ps_shadow, 1, &depth_view, 3, three)) {
+    printf("d3d11test: shadow map compared %08x (top) %08x (bottom)\n", (unsigned)pixel(10, 10), (unsigned)pixel(50, 50));
+    check(red(pixel(10, 10)) == 0 && green(pixel(10, 10)) == 255 && near_value(blue(pixel(10, 10)), 64, 2) && red(pixel(50, 50)) == 255 && green(pixel(50, 50)) == 0 &&
+              blue(pixel(50, 50)) == 255,
+          "SampleCmpLevelZero with LESS_EQUAL and GREATER comparison samplers and a point sampler on one depth texture (three texture and sampler pairs)");
+  }
+  ID3D11ShaderResourceView *planes[2] = {NULL, stencil_view};
+  if (shadow_draw(full, ps_stencil, 2, planes, 0, NULL)) {
+    printf("d3d11test: shadow map stencil %08x %08x\n", (unsigned)pixel(10, 10), (unsigned)pixel(50, 50));
+    check(green(pixel(10, 10)) == 7 && green(pixel(50, 50)) == 0, "a depth texture's stencil plane (X32_TYPELESS_G8X24_UINT) loaded");
+  }
+  if (shadow_draw(full, ps_shadow, 1, &depth_view, 3, three))
+    check(red(pixel(10, 10)) == 0 && green(pixel(10, 10)) == 255 && red(pixel(50, 50)) == 255, "the depth (R32_FLOAT_X8X24_TYPELESS) compared again after the stencil was read");
+  if (shadow_draw(shifted, ps_pcf, 1, &depth_view, 1, &linear)) {
+    printf("d3d11test: shadow map filtered %08x (the edge)\n", (unsigned)pixel(20, 31));
+    check(near_value(red(pixel(20, 31)), 64, 6) && near_value(green(pixel(20, 31)), 64, 6) && near_value(blue(pixel(20, 31)), 128, 4) && (pixel(20, 10) & 0xFFFFFF) == 0 &&
+              (pixel(20, 50) & 0xFFFFFF) == 0xFFFFFF,
+          "SampleCmp and GatherCmpRed with a linear comparison filter blend across the edge");
+  }
+  /* while it is the depth buffer it is not a shader resource (it is taken out of the slots) */
+  begin(dsv);
+  ID3D11DeviceContext_PSSetShaderResources(g_context, 0, 1, &depth_view);
+  ID3D11ShaderResourceView *bound = NULL;
+  ID3D11DeviceContext_PSGetShaderResources(g_context, 0, 1, &bound);
+  check(bound == NULL, "a depth texture bound as the depth buffer is not also a shader resource");
+  if (bound) ID3D11ShaderResourceView_Release(bound);
+  ID3D11DeviceContext_OMSetRenderTargets(g_context, 1, &g_target_view, NULL);
+
+  /* R16_TYPELESS (D16_UNORM, R16_UNORM) and R24G8_TYPELESS (D24_UNORM_S8_UINT, R24_UNORM_X8_TYPELESS) depth textures, cleared and read */
+  const DXGI_FORMAT kinds[2][3] = {{DXGI_FORMAT_R16_TYPELESS, DXGI_FORMAT_D16_UNORM, DXGI_FORMAT_R16_UNORM}, {DXGI_FORMAT_R24G8_TYPELESS, DXGI_FORMAT_D24_UNORM_S8_UINT, DXGI_FORMAT_R24_UNORM_X8_TYPELESS}};
+  for (int k = 0; k < 2; ++k) {
+    ID3D11Texture2D *t = NULL;
+    ID3D11DepthStencilView *v = NULL;
+    ID3D11ShaderResourceView *s = NULL;
+    td.Format = kinds[k][0];
+    ID3D11Device_CreateTexture2D(g_device, &td, NULL, &t);
+    dv.Format = kinds[k][1];
+    sv.Format = kinds[k][2];
+    if (t) ID3D11Device_CreateDepthStencilView(g_device, (ID3D11Resource *)t, &dv, &v);
+    if (t) ID3D11Device_CreateShaderResourceView(g_device, (ID3D11Resource *)t, &sv, &s);
+    if (v && s) {
+      ID3D11DeviceContext_ClearDepthStencilView(g_context, v, D3D11_CLEAR_DEPTH, 0.25f, 0);
+      if (shadow_draw(full, ps_shadow, 1, &s, 3, three))
+        check(red(pixel(32, 32)) == 0 && green(pixel(32, 32)) == 255 && near_value(blue(pixel(32, 32)), 64, 2), k ? "an R24G8_TYPELESS depth texture compared" : "an R16_TYPELESS depth texture compared");
+    } else {
+      check(0, "a depth texture of 16 or 24 bits, its views");
+    }
+    if (s) ID3D11ShaderResourceView_Release(s);
+    if (v) ID3D11DepthStencilView_Release(v);
+    if (t) ID3D11Texture2D_Release(t);
+  }
+
+  /* One texture with two samplers - wrap and clamp - and a second texture with the second (ps_pair): the coordinate passes 1 on the right half. */
+  {
+    const UINT32 texels[4] = {0xFF200000u, 0xFF600000u, 0xFFA00000u, 0xFFE00000u}, one = 0xFF00C000u;
+    D3D11_TEXTURE2D_DESC rd = {4, 1, 1, 1, DXGI_FORMAT_B8G8R8A8_UNORM, {1, 0}, D3D11_USAGE_DEFAULT, D3D11_BIND_SHADER_RESOURCE, 0, 0};
+    D3D11_SUBRESOURCE_DATA rows = {texels, 16, 0}, single = {&one, 4, 0};
+    ID3D11Texture2D *ramp = NULL, *second = NULL;
+    ID3D11Device_CreateTexture2D(g_device, &rd, &rows, &ramp);
+    rd.Width = 1;
+    ID3D11Device_CreateTexture2D(g_device, &rd, &single, &second);
+    ID3D11ShaderResourceView *views[2] = {NULL, NULL};
+    if (ramp) ID3D11Device_CreateShaderResourceView(g_device, (ID3D11Resource *)ramp, NULL, &views[0]);
+    if (second) ID3D11Device_CreateShaderResourceView(g_device, (ID3D11Resource *)second, NULL, &views[1]);
+    ID3D11SamplerState *pair[2] = {wrap, point};
+    if (views[0] && views[1] && shadow_draw(wide, ps_pair, 2, views, 2, pair)) {
+      printf("d3d11test: one texture, two samplers %08x %08x\n", (unsigned)pixel(4, 10), (unsigned)pixel(36, 10));
+      check(red(pixel(4, 10)) == 0x20 && green(pixel(4, 10)) == 0x20 && blue(pixel(4, 10)) == 0xC0 && red(pixel(36, 10)) == 0x20 && green(pixel(36, 10)) == 0xE0 &&
+                blue(pixel(36, 10)) == 0xC0,
+            "one texture sampled with a wrapping and a clamping sampler, another with the clamping one");
+    }
+    for (int i = 0; i < 2; ++i) if (views[i]) ID3D11ShaderResourceView_Release(views[i]);
+    if (second) ID3D11Texture2D_Release(second);
+    if (ramp) ID3D11Texture2D_Release(ramp);
+  }
+
+  /* A cube of depth (a point light's shadow), on a device that draws into layers: faces cleared to 0.25 (+X), 0.75 (+Z) and 0.25 (+Y), compared with 0.5. */
+  {
+    D3D11_TEXTURE2D_DESC cd = {32, 32, 1, 6, DXGI_FORMAT_R32_TYPELESS, {1, 0}, D3D11_USAGE_DEFAULT, D3D11_BIND_DEPTH_STENCIL | D3D11_BIND_SHADER_RESOURCE, 0, D3D11_RESOURCE_MISC_TEXTURECUBE};
+    ID3D11Texture2D *cube = NULL;
+    hr = ID3D11Device_CreateTexture2D(g_device, &cd, NULL, &cube);
+    check(SUCCEEDED(hr) || hr == DXGI_ERROR_UNSUPPORTED, "a cube of depth that is read too (or not, on a device that does not draw into layers)");
+    if (cube && ps_cube) {
+      const float face_depth[6] = {0.25f, 1, 0.25f, 1, 0.75f, 1};
+      for (UINT face = 0; face < 6; ++face) {
+        D3D11_DEPTH_STENCIL_VIEW_DESC fv;
+        memset(&fv, 0, sizeof fv);
+        fv.Format = DXGI_FORMAT_D32_FLOAT;
+        fv.ViewDimension = D3D11_DSV_DIMENSION_TEXTURE2DARRAY;
+        fv.Texture2DArray.FirstArraySlice = face;
+        fv.Texture2DArray.ArraySize = 1;
+        ID3D11DepthStencilView *v = NULL;
+        ID3D11Device_CreateDepthStencilView(g_device, (ID3D11Resource *)cube, &fv, &v);
+        if (v) {
+          ID3D11DeviceContext_ClearDepthStencilView(g_context, v, D3D11_CLEAR_DEPTH, face_depth[face], 0);
+          ID3D11DepthStencilView_Release(v);
+        }
+      }
+      memset(&sv, 0, sizeof sv);
+      sv.Format = DXGI_FORMAT_R32_FLOAT;
+      sv.ViewDimension = D3D11_SRV_DIMENSION_TEXTURECUBE;
+      sv.TextureCube.MipLevels = 1;
+      ID3D11ShaderResourceView *cube_view = NULL;
+      ID3D11Device_CreateShaderResourceView(g_device, (ID3D11Resource *)cube, &sv, &cube_view);
+      if (cube_view && shadow_draw(full, ps_cube, 1, &cube_view, 1, &less_equal)) {
+        printf("d3d11test: a cube of depth %08x\n", (unsigned)pixel(32, 32));
+        check(red(pixel(32, 32)) == 0 && green(pixel(32, 32)) == 255 && blue(pixel(32, 32)) == 0, "SampleCmpLevelZero of a cube of depth: each face its own");
+      }
+      if (cube_view) ID3D11ShaderResourceView_Release(cube_view);
+    }
+    if (cube) ID3D11Texture2D_Release(cube);
+  }
+  ID3D11DeviceContext_ClearState(g_context);
+  ID3D11Buffer_Release(wide);
+  ID3D11Buffer_Release(shifted);
+  ID3D11Buffer_Release(full);
+  ID3D11Buffer_Release(top);
+  ID3D11DepthStencilState_Release(stamp);
+  ID3D11SamplerState_Release(wrap);
+  ID3D11SamplerState_Release(point);
+  ID3D11SamplerState_Release(linear);
+  ID3D11SamplerState_Release(greater);
+  ID3D11SamplerState_Release(less_equal);
+  if (ps_cube) ID3D11PixelShader_Release(ps_cube);
+  ID3D11PixelShader_Release(ps_pair);
+  ID3D11PixelShader_Release(ps_pcf);
+  ID3D11PixelShader_Release(ps_stencil);
+  ID3D11PixelShader_Release(ps_shadow);
+  ID3D11ShaderResourceView_Release(stencil_view);
+  ID3D11ShaderResourceView_Release(depth_view);
+  ID3D11DepthStencilView_Release(dsv);
+  ID3D11Texture2D_Release(texture);
+}
+
 int main(void) {
   test_device();
   if (g_device && g_context) {
@@ -3336,6 +3585,7 @@ int main(void) {
       test_pixel_texture_uavs();
       test_layered_target();
       test_plane_uavs();
+      test_shadow_maps();
       test_device5();
       test_d3d11_3();
     }

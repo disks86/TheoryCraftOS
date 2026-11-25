@@ -229,6 +229,30 @@ enum class MipFilter : uint8_t { None, Nearest, Linear };
 // What a coordinate outside 0..1 means: wrap around, or take the edge texel. With kFeatureAddressModes also: wrap around with every second copy mirrored, take the sampler's
 // border colour (a linear filter blends it in within half a texel of the edge), or mirror once about zero and then take the edge texel.
 enum class AddressMode : uint8_t { Repeat, ClampToEdge, MirrorRepeat, ClampToBorder, MirrorOnce };
+// A comparison (the depth and stencil tests, and a sampler's: SamplerDesc::compare), numbered as Gallium's PIPE_FUNC_* and as Direct3D's COMPARISON_FUNC minus one.
+enum class CompareOp : uint8_t { Never, Less, Equal, LessEqual, Greater, NotEqual, GreaterEqual, Always };
+// Whether `a` <op> `b` holds.
+constexpr bool compare_holds(CompareOp op, float a, float b) {
+  switch (op) {
+    case CompareOp::Never: return false;
+    case CompareOp::Less: return a < b;
+    case CompareOp::Equal: return a == b;
+    case CompareOp::LessEqual: return a <= b;
+    case CompareOp::Greater: return a > b;
+    case CompareOp::NotEqual: return a != b;
+    case CompareOp::GreaterEqual: return a >= b;
+    default: return true;
+  }
+}
+// Where a TGSI shader that compares finds the comparisons of the bound samplers (ShaderModuleDesc::sampler_constants): the register after the most constants a shader may have, one for each unit.
+constexpr uint32_t kSamplerCompareRegister = kMaxPushConstantBytes / 16;
+// The values of that register for a sampler (see ShaderModuleDesc::sampler_constants).
+inline void sampler_compare_constant(CompareOp op, bool linear, float out[4]) {
+  out[0] = compare_holds(op, 0.0f, 1.0f) ? 1.0f : 0.0f;
+  out[1] = compare_holds(op, 1.0f, 1.0f) ? 1.0f : 0.0f;
+  out[2] = compare_holds(op, 1.0f, 0.0f) ? 1.0f : 0.0f;
+  out[3] = linear ? 1.0f : 0.0f;
+}
 // The border colours a sampler can have (those of a Direct3D 12 static sampler).
 enum class BorderColor : uint8_t { TransparentBlack, OpaqueBlack, OpaqueWhite };
 constexpr Vec4 border_color_value(BorderColor b) { return b == BorderColor::OpaqueWhite ? Vec4{1, 1, 1, 1} : b == BorderColor::OpaqueBlack ? Vec4{0, 0, 0, 1} : Vec4{0, 0, 0, 0}; }
@@ -240,6 +264,13 @@ struct SamplerDesc {
   MipFilter mip_filter = MipFilter::None;
   float lod_bias = 0.0f;
   float min_lod = 0.0f, max_lod = 1000.0f;
+  // The comparison of a comparison lookup (Direct3D's SampleCmp, SampleCmpLevelZero, GatherCmp: ITextureSet::sample_compare): a texel passes (1) when reference <compare> texel holds, else 0; the
+  // passes of the footprint are then filtered as `filter` says (Nearest: the texel the point lies in, Linear: the four around it weighted bilinearly). Other lookups do not compare.
+  CompareOp compare = CompareOp::Never;
+  // The plane of a depth image (D32Float with ImageDesc::stencil) a unit reads (kFeature2DepthTextures): false the depth, as (depth, 0, 0, 1); true the stencil, as the integers (0, stencil, 0, 1)
+  // (Direct3D's X24_TYPELESS_G8_UINT / X32_TYPELESS_G8X24_UINT views, read with Load). Of the view, not the sampler: carried here so that every device's bind_texture takes it. A colour image
+  // ignores it.
+  bool stencil = false;
 };
 
 // The bound textures as a fragment shader sees them: sample(unit, u, v) gives the colour (0..1 per component, straight alpha) of the image bound to `unit` with the sampler
@@ -284,6 +315,33 @@ class ITextureSet {
   virtual Vec4 fetch(uint32_t unit, int32_t x, int32_t y, uint32_t level) const {
     (void)unit, (void)x, (void)y, (void)level;
     return {0, 0, 0, 0};
+  }
+  // A comparison lookup (SamplerDesc::compare): the passes of the texels around (u, v) - and w as sample_volume takes it: an array's layer, a cube's direction - against `reference`,
+  // filtered as the sampler of the unit filters (point or bilinear), from the level the derivatives pick (as sample() picks it; `level_zero`: level 0, SampleCmpLevelZero). 0..1.
+  // This default compares the texels the sample_lod / sample_volume lookups give at the middles of the footprint's texels, at level 0, by compare_op.
+  virtual float sample_compare(uint32_t unit, float u, float v, float w, float reference, bool level_zero) const {
+    (void)w, (void)level_zero;
+    uint32_t width = 0, height = 0, levels = 0;
+    if (!size(unit, 0, &width, &height, &levels) || !width || !height || !(u == u) || !(v == v)) return 0.0f;
+    const CompareOp op = compare_op(unit);
+    const float fw = static_cast<float>(width), fh = static_cast<float>(height);
+    auto floor_of = [](float f) {
+      const float limited = f < -1e6f ? -1e6f : f > 1e6f ? 1e6f : f;
+      const float t = static_cast<float>(static_cast<int64_t>(limited));
+      return t > limited ? t - 1.0f : t;
+    };
+    const float px = u * fw - 0.5f, py = v * fh - 0.5f, x = floor_of(px), y = floor_of(py), fx = px - x, fy = py - y;
+    float pass[2][2];
+    for (uint32_t row = 0; row < 2; ++row)
+      for (uint32_t col = 0; col < 2; ++col)
+        pass[row][col] = compare_holds(op, reference, sample_lod(unit, (x + static_cast<float>(col) + 0.5f) / fw, (y + static_cast<float>(row) + 0.5f) / fh, 0.0f).x) ? 1.0f : 0.0f;
+    const float top = pass[0][0] * (1.0f - fx) + pass[0][1] * fx, bottom = pass[1][0] * (1.0f - fx) + pass[1][1] * fx;
+    return top * (1.0f - fy) + bottom * fy;
+  }
+  // The comparison of the sampler bound to `unit` (GatherCmp compares each of the four texels it gathers by it).
+  virtual CompareOp compare_op(uint32_t unit) const {
+    (void)unit;
+    return CompareOp::LessEqual;
   }
   // The size of a level and the number of levels of the image bound to the unit (Direct3D 10 GetDimensions); false when nothing is bound.
   virtual bool size(uint32_t unit, uint32_t level, uint32_t* width, uint32_t* height, uint32_t* levels) const {
@@ -504,6 +562,9 @@ struct ShaderModuleDesc {
   // varyings as GENERIC[n] (fragment stage); push constants are CONST[0..7] (vec4 each).
   // Clip-space z is 0..1 and the first color output is the pixel.
   const char* tgsi = nullptr;
+  // The text reads the comparison of the sampler bound to each texture unit u it compares with (SampleCmp, GatherCmp) at CONST[kSamplerCompareRegister + u]: (1 if reference < texel passes,
+  // 1 if reference == texel passes, 1 if reference > texel passes, 1 for a linear filter, else 0 each) - the device puts them there from the bound SamplerDescs (sampler_compare_constant).
+  bool sampler_constants = false;
   // Direct3D 9 shader bytecode (vs_2_0 / ps_2_0 token stream) for the VMware SVGA3D device. A vertex shader writes clip space with +Y up (Direct3D's)
   // when it takes the c31 constant (1, -1, 1, 1) as a factor of the position; the device supplies it, so that Vulkan's +Y down comes out right.
   const uint32_t* d3d9_tokens = nullptr;
@@ -574,7 +635,6 @@ struct VertexAttribute {
 // The stencil test of a pipeline, one state for front and back faces: a fragment passes when (reference & compare_mask) <compare> (stored & compare_mask); what is written back
 // is (stored & ~write_mask) | (op result & write_mask), the op depending on whether the stencil test failed, the stencil test passed but the depth test failed, or both passed.
 // It needs a stencil plane in the render pass's depth image (ImageDesc::stencil). The test comes before the depth test; a fragment a shader discards changes nothing.
-enum class CompareOp : uint8_t { Never, Less, Equal, LessEqual, Greater, NotEqual, GreaterEqual, Always };
 enum class StencilOp : uint8_t { Keep, Zero, Replace, IncrementClamp, DecrementClamp, Invert, IncrementWrap, DecrementWrap };
 struct StencilState {
   bool enable = false;
@@ -820,6 +880,12 @@ enum DeviceFeature2 : uint32_t {
   kFeature2LayeredTargets = 1u << 2,        // colour and depth attachments that are arrays, volumes or cubes (one level), RenderPassBegin::first_layer / layer_count, ShaderIo::layer from geometry shaders
   kFeature2SingleChannelFormats = 1u << 3,  // Format::R32Uint, R32Sint, R32Float: render targets, textures and storage images (the integer ones with atomics)
   kFeature2ConservativeRaster = 1u << 4,    // GraphicsPipelineDesc::conservative: a triangle covers every pixel its area touches (Direct3D's conservative rasterization)
+  // Depth images that are textures too (kImageDepthAttachment | kImageSampled, one sample and one level, of any kind but a volume): sampled, compared (SamplerDesc::compare) and loaded, their
+  // depth or - SamplerDesc::stencil - their stencil plane. (A high bit: the bits between are left for the other features being added.)
+  kFeature2DepthTextures = 1u << 16,
+  // ... and the depth and the stencil plane of one of them read in one draw or dispatch (two units bound to it, one with SamplerDesc::stencil). A device without it (virgl: the host's
+  // texture reads one plane at a time, GL_DEPTH_STENCIL_TEXTURE_MODE) is not given such a draw: the kernel refuses it.
+  kFeature2DepthAndStencilPlanes = 1u << 17,
 };
 
 

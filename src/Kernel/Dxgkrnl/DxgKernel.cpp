@@ -1234,6 +1234,11 @@ NtStatus Kernel::write_descriptor(ProcessId pid, Handle heap, uint32_t index, co
       d.size = desc.size ? desc.size : alloc.desc().size - desc.offset;
     }
     d.allocation = a->allocation;
+    if (desc.stencil) {
+      // (a view of the stencil plane: of a depth buffer read as a texture that has one)
+      if (desc.kind != DescriptorKind::Srv || !alloc.is_depth() || alloc.desc().format != Format::D24S8) return status::kInvalidParameter;
+      d.stencil = true;
+    }
     if (desc.alternate) {
       // (an image's view only: the alternate is a 2D array of the same device, sampled)
       SharedPointer<AllocRec> alt = p->allocations.get(desc.alternate);
@@ -1422,6 +1427,17 @@ NtStatus Kernel::escape_d3d12(ProcessId pid, Handle device, uint32_t op, ByteRea
         if (d.kind == DescriptorKind::Srv && size_hi == 0xFFFFFFFFu) {
           d.alternate = size_lo;
           d.size = 0;
+        }
+        // (a sampler: the offset's low word is its comparison, a graphics::CompareOp - SampleCmp, GatherCmp -; the offset's high word of a texture's view says it is of a depth buffer's
+        // stencil plane; both nothing for the others, whose offsets are buffers')
+        if (d.kind == DescriptorKind::Sampler) {
+          if (off_lo > static_cast<uint32_t>(graphics::CompareOp::Always) || off_hi) return status::kInvalidParameter;
+          d.sampler.compare = static_cast<graphics::CompareOp>(off_lo);
+          d.offset = 0;
+        }
+        if (d.kind == DescriptorKind::Srv && off_hi == 1) {
+          d.stencil = true;
+          d.offset = off_lo;
         }
         // (a texture's unordered access view: the level, the first layer and the layer count)
         if (d.kind == DescriptorKind::UavTexture) {

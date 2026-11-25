@@ -105,6 +105,15 @@ constexpr bool decode_address_word(uint32_t word, graphics::AddressMode* mode, g
   *border = static_cast<graphics::BorderColor>(word >> 8);
   return true;
 }
+// The tenth word of BindTexture (and of a lowered root binding): the sampler's comparison (graphics::CompareOp, Never .. Always, in bits 0-3: SamplerDesc::compare) and, in bit 8, that the
+// unit reads the stencil plane of a depth buffer (SamplerDesc::stencil). Left out: no comparison (Never), the depth or colour. False for a word that is neither.
+constexpr uint32_t texture_view_word(const graphics::SamplerDesc& s) { return static_cast<uint32_t>(s.compare) | (s.stencil ? 0x100u : 0u); }
+constexpr bool decode_texture_view_word(uint32_t word, graphics::CompareOp* compare, bool* stencil) {
+  if ((word & ~0x10Fu) || (word & 0xF) > static_cast<uint32_t>(graphics::CompareOp::Always)) return false;
+  *compare = static_cast<graphics::CompareOp>(word & 0xF);
+  *stencil = (word & 0x100u) != 0;
+  return true;
+}
 // What a device without graphics::kFeatureAddressModes does with the other modes: the nearest of the two it has.
 constexpr graphics::AddressMode base_address_mode(graphics::AddressMode mode) {
   return mode == graphics::AddressMode::Repeat || mode == graphics::AddressMode::MirrorRepeat ? graphics::AddressMode::Repeat : graphics::AddressMode::ClampToEdge;
@@ -139,7 +148,8 @@ enum AllocationFlags : uint32_t {
   kAllocIndexBuffer = 1u << 1,
   kAllocTexture = 1u << 2,       // sampled by shaders
   kAllocRenderTarget = 1u << 3,  // drawn into
-  kAllocDepthStencil = 1u << 4,
+  kAllocDepthStencil = 1u << 4,  // a depth buffer (Format D32Float or D24S8); with kAllocTexture also read by shaders (the adapter's graphics::kFeature2DepthTextures: one sample, one level; its depth, or a D24S8's
+                                 // stencil - texture_view_word -, compared by SampleCmp)
   kAllocPresent = 1u << 5,       // may be put on the screen (a back buffer or the primary)
   kAllocStaging = 1u << 6,
   kAllocShared = 1u << 7,        // may be shared with other processes (Kernel::share_allocation)
@@ -182,7 +192,7 @@ struct AllocationDesc {
   uint32_t mip_levels = 1;           // textures only; more than one needs a texture that is not a render target
   uint64_t size = 0;                 // buffers: bytes
   graphics::TextureKind kind = graphics::TextureKind::Texture2D;   // textures: more than 2D needs the adapter's kFeatureTextureKinds and one mip level; flags kAllocTexture (kAllocShared too), with
-                                                                   // kAllocRenderTarget or kAllocStorageImage, or a depth buffer (kAllocDepthStencil alone; an array or a cube) - those need kFeature2LayeredTargets
+                                                                   // kAllocRenderTarget or kAllocStorageImage, or a depth buffer (kAllocDepthStencil, with kAllocTexture or not; an array or a cube) - those need kFeature2LayeredTargets
   uint32_t samples = 1;              // 2, 4 or 8 (the adapter's kFeatureMultisample and sample counts): a render target of an 8-bit colour format or a depth buffer, nothing else; it has no system-memory
                                      // backing, cannot be locked, copied, sampled or presented, and is turned into an ordinary image by the stream's ResolveRegion
   Handle heap = 0;                   // placed resource: the kAllocHeap allocation (of the same device) whose memory this allocation is, from heap_offset on; other placed allocations may overlap it

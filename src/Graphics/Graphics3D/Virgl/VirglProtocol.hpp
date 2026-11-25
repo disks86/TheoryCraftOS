@@ -72,6 +72,7 @@ constexpr uint32_t header(uint32_t command, uint32_t object, uint32_t length_dwo
 // Formats (VIRGL_FORMAT_*).
 constexpr uint32_t kFormatB8G8R8A8Unorm = 1;
 constexpr uint32_t kFormatZ32Float = 18;
+constexpr uint32_t kFormatX32S8X24Uint = 138;   // (the stencil plane of a Z32_FLOAT_S8X24_UINT image, read as a texture: VIRGL_FORMAT_X32_S8X24_UINT)
 constexpr uint32_t kFormatZ32FloatS8X24Uint = 126;   // (a depth image with a stencil plane; 19, the number the name Z24_UNORM_S8_UINT suggests, makes virglrenderer lose the context)
 constexpr uint32_t kFormatR8Unorm = 64;
 constexpr uint32_t kFormatR32Float = 28;
@@ -136,6 +137,9 @@ constexpr uint32_t kWrapRepeat = 0, kWrapClampToEdge = 2;
 constexpr uint32_t kFilterNearest = 0, kFilterLinear = 1;
 constexpr uint32_t kMipFilterNone = 2;
 constexpr uint32_t kSwizzleRgba = 0 | (1u << 3) | (2u << 6) | (3u << 9);
+// (PIPE_SWIZZLE_*: X 0, Y 1, Z 2, W 3, 0 4, 1 5) A depth view's: (depth, 0, 0, 1); a stencil view's (the stencil is the host's red): (0, stencil, 0, 1).
+constexpr uint32_t kSwizzleDepth = 0 | (4u << 3) | (4u << 6) | (5u << 9);
+constexpr uint32_t kSwizzleStencil = 4 | (0u << 3) | (4u << 6) | (5u << 9);
 constexpr uint32_t kFaceNone = 0, kFaceFront = 1, kFaceBack = 2;
 
 }  // namespace graphics::virgl

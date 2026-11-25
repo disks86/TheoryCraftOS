@@ -301,6 +301,18 @@ static HRESULT STDMETHODCALLTYPE dev_CheckFeatureSupport(Dev *This, D3D12_FEATUR
         f->Support1 = D3D12_FORMAT_SUPPORT1_IA_VERTEX_BUFFER;
       }
       if (f->Format == DXGI_FORMAT_R16_UINT || f->Format == DXGI_FORMAT_R32_UINT) f->Support1 |= D3D12_FORMAT_SUPPORT1_IA_INDEX_BUFFER;
+      /* (the views of depth buffers: their depth sampled, compared and gathered, their stencil loaded - on a device that reads depth buffers -; R32_FLOAT and R16_UNORM textures
+       * are compared too) */
+      if (This->caps.features2 & DEV_FEATURE2_DEPTH_TEXTURES) {
+        const UINT depth_reads = D3D12_FORMAT_SUPPORT1_TEXTURE2D | D3D12_FORMAT_SUPPORT1_TEXTURECUBE | D3D12_FORMAT_SUPPORT1_SHADER_LOAD | D3D12_FORMAT_SUPPORT1_SHADER_SAMPLE |
+                                 D3D12_FORMAT_SUPPORT1_SHADER_SAMPLE_COMPARISON | D3D12_FORMAT_SUPPORT1_SHADER_GATHER | D3D12_FORMAT_SUPPORT1_SHADER_GATHER_COMPARISON;
+        switch (f->Format) {
+          case DXGI_FORMAT_R24_UNORM_X8_TYPELESS: case DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS: f->Support1 = depth_reads; break;
+          case DXGI_FORMAT_X24_TYPELESS_G8_UINT: case DXGI_FORMAT_X32_TYPELESS_G8X24_UINT: f->Support1 = D3D12_FORMAT_SUPPORT1_TEXTURE2D | D3D12_FORMAT_SUPPORT1_SHADER_LOAD; break;
+          case DXGI_FORMAT_R32_FLOAT: case DXGI_FORMAT_R16_UNORM: f->Support1 |= D3D12_FORMAT_SUPPORT1_SHADER_SAMPLE_COMPARISON | D3D12_FORMAT_SUPPORT1_SHADER_GATHER_COMPARISON; break;
+          default: break;
+        }
+      }
       format_uav_support(This, f->Format, &f->Support1, &f->Support2);
       return S_OK;
     }
@@ -317,7 +329,7 @@ static HRESULT STDMETHODCALLTYPE dev_CheckFeatureSupport(Dev *This, D3D12_FEATUR
       /* (a format with depth and stencil has two planes; a format the device does not know is not one) */
       if (!format_info(f->Format) && !format_bytes(f->Format)) return E_INVALIDARG;
       const FormatInfo *fi = format_info(f->Format);
-      f->PlaneCount = f->Format == DXGI_FORMAT_D24_UNORM_S8_UINT ? 2 : fi && fi->planar ? (UINT8)format_planes(fi) : 1;
+      f->PlaneCount = f->Format == DXGI_FORMAT_D24_UNORM_S8_UINT || f->Format == DXGI_FORMAT_D32_FLOAT_S8X24_UINT ? 2 : fi && fi->planar ? (UINT8)format_planes(fi) : 1;
       return S_OK;
     }
     case D3D12_FEATURE_GPU_VIRTUAL_ADDRESS_SUPPORT: {

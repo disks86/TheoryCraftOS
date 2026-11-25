@@ -235,6 +235,7 @@ static void record_pending_clears(Dev *d) {
   for (UINT i = 0; i < d->clear_count; ++i) {
     const PendingClear *p = &d->clears[i];
     ID3D12GraphicsCommandList_ClearDepthStencilView(d->list, p->dsv->handle, (D3D12_CLEAR_FLAGS)p->flags, p->depth, p->stencil, 0, NULL);
+    p->dsv->tex->used = p->dsv->tex->written = d->epoch;      /* (the list uses the texture now: it is sent before the texture goes) */
     d->recorded = 1;
   }
 }
@@ -427,6 +428,27 @@ static BOOL tables_record(Dev *d, View *const *srvs, Sampler *const *samplers, c
           r.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
           r.Texture2D.MipLevels = 1;
           r.Texture2D.PlaneSlice = v->plane;
+        }
+        ID3D12Device_CreateShaderResourceView(d->d12, v->tex->res, &r, at);
+      } else if (v && v->tex->depth) {
+        /* (a depth texture: a view of its depth, or of its stencil plane - PlaneSlice 1 -, in the format the texture below has it in: d3d11.c depth_view_format) */
+        D3D12_SHADER_RESOURCE_VIEW_DESC r;
+        memset(&r, 0, sizeof r);
+        BOOL stencil = FALSE;
+        depth_view_format(v->tex->desc.Format, v->desc.srv.Format, &r.Format, &stencil);
+        r.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        if (v->tex->kind == 2) {
+          r.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
+          r.Texture2DArray.MipLevels = 1;
+          r.Texture2DArray.ArraySize = v->tex->desc.ArraySize;
+          r.Texture2DArray.PlaneSlice = stencil ? 1 : 0;
+        } else if (v->tex->kind == 3) {
+          r.ViewDimension = D3D12_SRV_DIMENSION_TEXTURECUBE;
+          r.TextureCube.MipLevels = 1;
+        } else {
+          r.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+          r.Texture2D.MipLevels = 1;
+          r.Texture2D.PlaneSlice = stencil ? 1 : 0;
         }
         ID3D12Device_CreateShaderResourceView(d->d12, v->tex->res, &r, at);
       } else if (v && (v->tex->fmt->flags & FMT_YUV)) {

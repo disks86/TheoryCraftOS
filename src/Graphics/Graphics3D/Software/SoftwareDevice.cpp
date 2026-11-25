@@ -262,6 +262,9 @@ class SoftwareImage final : public IImage {
     const uint64_t offset = level == 0 ? uint64_t{layer} * desc_.extent.width * desc_.extent.height : level_offset_[level];
     s.width = mip_extent(desc_.extent.width, level);
     s.height = mip_extent(desc_.extent.height, level);
+    s.pitch = s.width * desc_.samples;
+    s.format = desc_.format;
+    if (!depth_.empty()) return s;   // (a depth image: its planes are depth_layer / stencil_layer, the surface only says the size)
     if (!hdr_.empty()) s.floats = layer_count() == 1 ? hdr_ : hdr_.subview(uint64_t{layer} * desc_.extent.width * desc_.extent.height, uint64_t{desc_.extent.width} * desc_.extent.height);
     else s.pixels = color_.subview(offset, uint64_t{s.width} * s.height);
     s.pitch = s.width * desc_.samples;   // (a multisampled image: the samples of a pixel are neighbours, so the pixel x is at x * samples)
@@ -448,7 +451,7 @@ class TextureSet final : public ITextureSet {
     if (!image || level >= image->mip_levels()) return {0, 0, 0, 0};
     const Surface surface = image->surface(level);
     if (x < 0 || y < 0 || static_cast<uint32_t>(x) >= surface.width || static_cast<uint32_t>(y) >= surface.height) return {0, 0, 0, 0};
-    return texel(surface, x, y);
+    return image_texel(*image, 0, surface, samplers_[unit].stencil, x, y);
   }
 
   Vec4 sample_lod_volume(uint32_t unit, float u, float v, float w, float lod) const override {
@@ -463,7 +466,7 @@ class TextureSet final : public ITextureSet {
     if (image->kind() == TextureKind::TextureCube || level != 0 || z < 0 || static_cast<uint32_t>(z) >= image->layer_count()) return {0, 0, 0, 0};
     const Surface surface = image->surface(0, static_cast<uint32_t>(z));
     if (x < 0 || y < 0 || static_cast<uint32_t>(x) >= surface.width || static_cast<uint32_t>(y) >= surface.height) return {0, 0, 0, 0};
-    return texel(surface, x, y);
+    return image_texel(*image, static_cast<uint32_t>(z), surface, samplers_[unit].stencil, x, y);
   }
   Vec4 fetch_sample(uint32_t unit, int32_t x, int32_t y, uint32_t sample) const override {
     const SoftwareImage* image = image_for(unit);
@@ -478,6 +481,42 @@ class TextureSet final : public ITextureSet {
     const SoftwareImage* image = image_for(unit);
     *depth = image->kind() == TextureKind::Texture3D || image->kind() == TextureKind::Texture2DArray ? image->layer_count() : 1;
     return true;
+  }
+
+  CompareOp compare_op(uint32_t unit) const override { return unit < kMaxTextureUnits ? samplers_[unit].compare : CompareOp::Never; }
+
+  // SampleCmp / SampleCmpLevelZero: the comparison of each texel the filter would read with the reference, filtered as the texels would be (see SamplerDesc::compare). A 2D image or an
+  // array's layer (w rounded, as sample_volume takes it) or a cube's face (the direction's), at the level the derivatives give - or level 0 -, the levels blended as sample() blends them.
+  float sample_compare(uint32_t unit, float u, float v, float w, float reference, bool level_zero) const override {
+    const SoftwareImage* image = image_for(unit);
+    if (!image || image->kind() == TextureKind::Texture3D) return 0.0f;
+    if (recording_) {
+      if (image->kind() != TextureKind::TextureCube) (void)sample(unit, u, v);   // (the coordinates the derivatives are taken from)
+      return 0.0f;
+    }
+    SamplerDesc sampler = samplers_[unit];
+    uint32_t layer = 0;
+    if (image->kind() == TextureKind::TextureCube) {
+      uint32_t face = 0;
+      if (!cube_face(u, v, w, &face, &u, &v)) return compare_level(*image, 0, 0, sampler, 0.5f, 0.5f, reference);
+      layer = face;
+      sampler.address_u = sampler.address_v = AddressMode::ClampToEdge;   // (no filtering across faces)
+    } else if (image->kind() == TextureKind::Texture2DArray) {
+      int64_t l = floor_to(unit_coordinate(w) + 0.5f);
+      layer = static_cast<uint32_t>(l < 0 ? 0 : l >= image->layer_count() ? image->layer_count() - 1 : l);
+    }
+    const uint32_t levels = image->mip_levels();
+    float lambda = level_zero ? 0.0f : lambda_[unit];
+    if (sampler.mip_filter == MipFilter::None || levels < 2 || !(lambda > 0.0f)) return compare_level(*image, 0, layer, sampler, u, v, reference);
+    const float top = static_cast<float>(levels - 1);
+    if (lambda > top) lambda = top;
+    if (sampler.mip_filter == MipFilter::Nearest) {
+      uint32_t level = static_cast<uint32_t>(lambda + 0.5f);
+      return compare_level(*image, level > levels - 1 ? levels - 1 : level, layer, sampler, u, v, reference);
+    }
+    const uint32_t l0 = static_cast<uint32_t>(lambda), l1 = l0 + 1 < levels ? l0 + 1 : levels - 1;
+    const float fraction = lambda - static_cast<float>(l0);
+    return compare_level(*image, l0, layer, sampler, u, v, reference) * (1.0f - fraction) + compare_level(*image, l1, layer, sampler, u, v, reference) * fraction;
   }
 
   bool size(uint32_t unit, uint32_t level, uint32_t* width, uint32_t* height, uint32_t* levels) const override {
@@ -510,11 +549,43 @@ class TextureSet final : public ITextureSet {
 
   static Vec4 texel_at(const SoftwareImage& image, uint32_t layer, const SamplerDesc& sampler, float u, float v) { return sample_level(image, 0, sampler, u, v, layer); }
 
+  // The face of a cube a direction points at and the place on it (0..1 both ways): the usual table, as sample_volume has it. False for the zero direction.
+  static bool cube_face(float x, float y, float z, uint32_t* face, float* u, float* v) {
+    x = unit_coordinate(x), y = unit_coordinate(y), z = unit_coordinate(z);
+    const float ax = x < 0 ? -x : x, ay = y < 0 ? -y : y, az = z < 0 ? -z : z;
+    float major, sc, tc;
+    if (ax >= ay && ax >= az) *face = x >= 0 ? 0 : 1, major = ax, sc = x >= 0 ? -z : z, tc = -y;
+    else if (ay >= az) *face = y >= 0 ? 2 : 3, major = ay, sc = x, tc = y >= 0 ? z : -z;
+    else *face = z >= 0 ? 4 : 5, major = az, sc = z >= 0 ? x : -x, tc = -y;
+    if (!(major > 0.0f)) return false;
+    *u = (sc / major + 1.0f) * 0.5f;
+    *v = (tc / major + 1.0f) * 0.5f;
+    return true;
+  }
+  // One level's comparison: reference <op> each texel the sampler's filter reads (a texel outside an image with a border: the border colour's red), filtered by that filter.
+  static float compare_level(const SoftwareImage& image, uint32_t level, uint32_t layer, const SamplerDesc& sampler, float u, float v, float reference) {
+    const Surface surface = image.surface(level, layer);
+    const int64_t w = surface.width, h = surface.height;
+    if (!w || !h) return 0.0f;
+    SamplerDesc plane = sampler;
+    plane.stencil = false;   // (what is compared is the depth, or a colour image's red)
+    auto pass = [&](int64_t x, int64_t y) { return compare_holds(sampler.compare, reference, texel_or_border(image, layer, surface, plane, x, y).x) ? 1.0f : 0.0f; };
+    if (sampler.filter == Filter::Nearest)
+      return pass(index(floor_to(unit_coordinate(u) * static_cast<float>(w)), w, sampler.address_u), index(floor_to(unit_coordinate(v) * static_cast<float>(h)), h, sampler.address_v));
+    const float fx = unit_coordinate(u) * static_cast<float>(w) - 0.5f, fy = unit_coordinate(v) * static_cast<float>(h) - 0.5f;
+    const int64_t x0 = floor_to(fx), y0 = floor_to(fy);
+    const float tx = fx - static_cast<float>(x0), ty = fy - static_cast<float>(y0);
+    const int64_t xs[2] = {index(x0, w, sampler.address_u), index(x0 + 1, w, sampler.address_u)};
+    const int64_t ys[2] = {index(y0, h, sampler.address_v), index(y0 + 1, h, sampler.address_v)};
+    const float top = pass(xs[0], ys[0]) * (1 - tx) + pass(xs[1], ys[0]) * tx, bottom = pass(xs[0], ys[1]) * (1 - tx) + pass(xs[1], ys[1]) * tx;
+    return top * (1 - ty) + bottom * ty;
+  }
+
   static Vec4 sample_level(const SoftwareImage& image, uint32_t level, const SamplerDesc& sampler, float u, float v, uint32_t layer = 0) {
     const Surface surface = image.surface(level, layer);
     const int64_t w = surface.width, h = surface.height;
-    if (sampler.filter == Filter::Nearest) {
-      return texel_or_border(surface, sampler, index(floor_to(unit_coordinate(u) * static_cast<float>(w)), w, sampler.address_u), index(floor_to(unit_coordinate(v) * static_cast<float>(h)), h, sampler.address_v));
+    if (sampler.filter == Filter::Nearest || sampler.stencil) {   // (the stencil plane holds integers: never filtered)
+      return texel_or_border(image, layer, surface, sampler, index(floor_to(unit_coordinate(u) * static_cast<float>(w)), w, sampler.address_u), index(floor_to(unit_coordinate(v) * static_cast<float>(h)), h, sampler.address_v));
     }
     // Linear: the four texels around the point, whose centres are half a texel in.
     const float fx = unit_coordinate(u) * static_cast<float>(w) - 0.5f, fy = unit_coordinate(v) * static_cast<float>(h) - 0.5f;
@@ -522,15 +593,27 @@ class TextureSet final : public ITextureSet {
     const float tx = fx - static_cast<float>(x0), ty = fy - static_cast<float>(y0);
     const int64_t xs[2] = {index(x0, w, sampler.address_u), index(x0 + 1, w, sampler.address_u)};
     const int64_t ys[2] = {index(y0, h, sampler.address_v), index(y0 + 1, h, sampler.address_v)};
-    const Vec4 a = texel_or_border(surface, sampler, xs[0], ys[0]), b = texel_or_border(surface, sampler, xs[1], ys[0]), c = texel_or_border(surface, sampler, xs[0], ys[1]),
-               d = texel_or_border(surface, sampler, xs[1], ys[1]);
+    const Vec4 a = texel_or_border(image, layer, surface, sampler, xs[0], ys[0]), b = texel_or_border(image, layer, surface, sampler, xs[1], ys[0]),
+               c = texel_or_border(image, layer, surface, sampler, xs[0], ys[1]), d = texel_or_border(image, layer, surface, sampler, xs[1], ys[1]);
     const Vec4 top = a * (1 - tx) + b * tx, bottom = c * (1 - tx) + d * tx;
     return top * (1 - ty) + bottom * ty;
   }
   // (index() gives -1 for a texel outside an image whose sampler has a border there)
-  static Vec4 texel_or_border(const Surface& surface, const SamplerDesc& sampler, int64_t x, int64_t y) {
+  static Vec4 texel_or_border(const SoftwareImage& image, uint32_t layer, const Surface& surface, const SamplerDesc& sampler, int64_t x, int64_t y) {
     if (x < 0 || y < 0) return border_color_value(sampler.border);
-    return texel(surface, x, y);
+    return image_texel(image, layer, surface, sampler.stencil, x, y);
+  }
+  // A texel of a colour image, or of the depth or stencil plane of a depth image (kFeature2DepthTextures): the depth as (depth, 0, 0, 1), the stencil as the integers (0, stencil, 0, 1).
+  static Vec4 image_texel(const SoftwareImage& image, uint32_t layer, const Surface& surface, bool stencil, int64_t x, int64_t y) {
+    if (image.format() != Format::D32Float) return texel(surface, x, y);
+    const uint64_t at = static_cast<uint64_t>(y) * image.extent().width + static_cast<uint64_t>(x);
+    if (stencil) {
+      const ArrayView<uint8_t> plane = image.stencil_layer(layer);
+      const uint32_t value = at < plane.size() ? plane[at] : 0u;
+      return {__builtin_bit_cast(float, 0u), __builtin_bit_cast(float, value), __builtin_bit_cast(float, 0u), __builtin_bit_cast(float, 1u)};
+    }
+    const ArrayView<float> plane = image.depth_layer(layer);
+    return {at < plane.size() ? plane[at] : 0.0f, 0.0f, 0.0f, 1.0f};
   }
   const SoftwareImage* image_for(uint32_t unit) const { return unit < kMaxTextureUnits ? images_[unit] : nullptr; }
   // A coordinate a NaN or a very large value cannot turn into an index outside the image: both are brought into a range the integer conversion can take.
@@ -1942,7 +2025,7 @@ bool SoftwareDevice::submit(ICommandBuffer* commands) {
       }
       case RecordedCommand::Type::BindTexture: {
         const auto* image = static_cast<const SoftwareImage*>(cmd.image);
-        if (cmd.unit >= kMaxTextureUnits || !image || !(image->usage() & kImageSampled) || image->format() == Format::D32Float) return false;
+        if (cmd.unit >= kMaxTextureUnits || !image || !(image->usage() & kImageSampled)) return false;   // (a depth image too: kFeature2DepthTextures)
         s.textures.bind(cmd.unit, image, cmd.sampler);
         break;
       }

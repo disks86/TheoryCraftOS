@@ -304,7 +304,7 @@ void test_allocation_checks() {
       {image(kTexture, Format::Unknown, 4, 4), status::kInvalidParameter},
       {image(kTexture, Format::D32Float, 4, 4), status::kInvalidParameter},                                     // a depth format needs the depth flag
       {image(kAllocDepthStencil, Format::A8R8G8B8, 4, 4), status::kInvalidParameter},                           // and a colour format may not have it
-      {image(kAllocDepthStencil | kTexture, Format::D32Float, 4, 4), status::kInvalidParameter},
+      {image(kAllocDepthStencil | kTexture | kTarget, Format::D32Float, 4, 4), status::kInvalidParameter},       // (a depth buffer read as a texture is not a colour target)
       {image(kAllocStaging | kTarget, Format::A8R8G8B8, 4, 4), status::kInvalidParameter},
       {image(kTexture | kTarget, Format::A8R8G8B8, 4, 4, 2), status::kInvalidParameter},                         // a mipmapped texture is only sampled
       {image(kTexture, Format::A8R8G8B8, 4, 4, 4), status::kInvalidParameter},                                   // (4 x 4 has 3 levels)
@@ -4000,6 +4000,331 @@ void test_layered_pass_kernel() {
   CHECK(draw({0, 0, 0, 1}, kNoAllocation, 3) == status::kInvalidParameter);
   CHECK(draw({3, 1, 0, 1}, kNoAllocation, 3) == status::kInvalidParameter);
   CHECK(draw({0, 1, 0}, kNoAllocation, 3) == status::kInvalidParameter);
+}
+
+
+// Depth buffers read as textures (kFeature2DepthTextures) and texture and sampler pairs: a depth and stencil pass into a D24S8 buffer that is a texture too, then its depth compared
+// (SampleCmpLevelZero with two comparison samplers and sampled with a third: three pairs of t0), its stencil plane loaded, filtered comparisons, an array of depth, and one texture with two
+// samplers - on the CPU renderer, through the kernel's command stream.
+bool close_to(float a, float b);
+void test_depth_textures_kernel() {
+  // The pairs a shader's lookups make: t0 with s0, s1, s2 through units 0, 1, 2 (the first sampler keeps t0's own unit); ps_pair's t0 with s0 and s1, and t1 with s1.
+  {
+    HostAllocator allocator;
+    UniquePointer<D3d9Program> program;
+    const std::vector<uint8_t> shadow = read_blob("ps_shadow.dxbc"), pair = read_blob("ps_pair.dxbc");
+    CHECK(D3d9Program::compile_dxbc(allocator, ConstByteView(shadow.data(), shadow.size()), &program) == status::kSuccess);
+    if (program) {
+      CHECK(program->texture_unit_mask() == 7 && program->compare_units() == 3);
+      CHECK(program->texture_register(0) == 0 && program->sampler_register(0) == 0 && program->texture_register(1) == 0 && program->sampler_register(1) == 1 &&
+            program->texture_register(2) == 0 && program->sampler_register(2) == 2);
+      String text(allocator);
+      CHECK(program->emit_tgsi(&text) == status::kSuccess);   // (the comparisons from the constants after the program's own: ShaderModuleDesc::sampler_constants)
+      CHECK(text.view().find("DCL CONST[256..271]") != StringView::npos && text.view().find("CONST[257].zzzz") != StringView::npos);
+    }
+    UniquePointer<D3d9Program> pairs;
+    CHECK(D3d9Program::compile_dxbc(allocator, ConstByteView(pair.data(), pair.size()), &pairs) == status::kSuccess);
+    if (pairs) {
+      CHECK(pairs->texture_unit_mask() == 7 && pairs->compare_units() == 0);
+      CHECK(pairs->texture_register(0) == 0 && pairs->sampler_register(0) == 0 && pairs->texture_register(2) == 0 && pairs->sampler_register(2) == 1 &&
+            pairs->texture_register(1) == 1 && pairs->sampler_register(1) == 1);
+    }
+    // sample_c_lz with an offset in texels (the compilers in reach do not make one: assembled here) - r0 = t0.SampleCmpLevelZero(s0, v2.xy, v0.x, int2(2, -1)): the point moved by the
+    // offset over the base level's size reaches the texture set, with the reference and level zero.
+    struct CompareSpy final : graphics::ITextureSet {
+      mutable float u = -1, v = -1, reference = -1;
+      mutable bool level_zero = false;
+      graphics::Vec4 sample(uint32_t, float, float) const override { return {0, 0, 0, 1}; }
+      bool size(uint32_t, uint32_t level, uint32_t* width, uint32_t* height, uint32_t* levels) const override {
+        *width = 8, *height = 4, *levels = 1;
+        return level == 0;
+      }
+      float sample_compare(uint32_t, float u_, float v_, float, float r, bool zero) const override {
+        u = u_, v = v_, reference = r, level_zero = zero;
+        return 0.375f;
+      }
+    } spy;
+    DxbcAsm a = dx_pixel_shader();
+    a.version_major = 4;
+    a.constant_buffer = 0;
+    a.ins(88, {dx_resource(0)}, 3u << 11);   // dcl_resource_texture2d t0
+    Tokens sample = {71u | (1u << 31) | (12u << 24), 0x1u | (2u << 9) | (0xFu << 13)};   // (sample_c_lz, the extended token: sample controls, offsets 2, -1)
+    for (const Tokens& o : {dx_dst(kOpTemp, 0, 0xF), dx_src(kOpInput, 2), dx_resource(0, 0x00), dx_sampler(0), dx_scalar(kOpInput, 0, 0)}) sample.insert(sample.end(), o.begin(), o.end());
+    a.code.insert(a.code.end(), sample.begin(), sample.end());
+    a.ins(54, {dx_dst(kOpOut, 0, 0xF), dx_src(kOpTemp, 0)});
+    a.ins(62, {});
+    NtStatus st = 0;
+    UniquePointer<D3d9Program> offset = compile_dxbc(allocator, a.build(), &st);
+    CHECK(st == status::kSuccess && offset);
+    if (offset) {
+      graphics::Vec4 varyings[16] = {};
+      varyings[0] = {0.6f, 0, 0, 0};
+      varyings[2] = {0.5f, 0.5f, 0, 0};
+      graphics::Vec4 room[graphics::kMaxColorTargets] = {};
+      uint8_t constants[128] = {};
+      CHECK(offset->run_fragment_ex(varyings, graphics::FragmentContext(), constants, &spy, room));
+      CHECK(close_to(spy.u, 0.75f) && close_to(spy.v, 0.25f) && close_to(spy.reference, 0.6f) && spy.level_zero && close_to(room[0].x, 0.375f) && close_to(room[0].w, 0.375f));
+      String text(allocator);
+      CHECK(offset->emit_tgsi(&text) == status::kSuccess && text.view().find("TG4") != StringView::npos);
+    }
+  }
+  Env e;
+  Handle vs = 0, colour_ps = 0, shadow_ps = 0, stencil_ps = 0, pcf_ps = 0, pair_ps = 0, array_ps = 0;
+  auto blob_shader = [&](const char* name, graphics::ShaderStage stage, Handle* out) {
+    const std::vector<uint8_t> code = read_blob(name);
+    ShaderDesc sd;
+    sd.kind = ShaderKind::Dxbc, sd.stage = stage, sd.code = ConstByteView(code.data(), code.size());
+    return !code.empty() && e.kernel.create_shader(kPid, e.dev, sd, out) == status::kSuccess;
+  };
+  CHECK(blob_shader("vs.dxbc", graphics::ShaderStage::Vertex, &vs) && blob_shader("ps_color.dxbc", graphics::ShaderStage::Fragment, &colour_ps) &&
+        blob_shader("ps_shadow.dxbc", graphics::ShaderStage::Fragment, &shadow_ps) && blob_shader("ps_stencil.dxbc", graphics::ShaderStage::Fragment, &stencil_ps) &&
+        blob_shader("ps_shadow_pcf.dxbc", graphics::ShaderStage::Fragment, &pcf_ps) && blob_shader("ps_pair.dxbc", graphics::ShaderStage::Fragment, &pair_ps) &&
+        blob_shader("ps_shadow_array.dxbc", graphics::ShaderStage::Fragment, &array_ps));
+  auto pipeline = [&](Handle ps, uint32_t textures, bool depth, Handle* out) {
+    PipelineDesc pd;
+    pd.vertex_shader = vs, pd.fragment_shader = ps, pd.vertex_stride = 28, pd.attribute_count = 2, pd.varying_count = 3, pd.texture_count = textures;
+    pd.attributes[0] = {0, graphics::VertexFormat::Float3, 0};
+    pd.attributes[1] = {1, graphics::VertexFormat::Float4, 12};
+    pd.cull_mode = graphics::CullMode::None;
+    if (depth) {
+      pd.depth_test = pd.depth_write = true;
+      pd.depth_compare = graphics::CompareOp::Less;
+      pd.stencil.enable = true;
+      pd.stencil.pass_op = graphics::StencilOp::Replace;
+      pd.stencil.reference = 5;
+    }
+    return e.kernel.create_pipeline(kPid, e.dev, pd, out) == status::kSuccess;
+  };
+  Handle depth_pipe = 0, shadow_pipe = 0, stencil_pipe = 0, pcf_pipe = 0, pair_pipe = 0, array_pipe = 0;
+  CHECK(pipeline(colour_ps, 0, true, &depth_pipe) && pipeline(shadow_ps, 3, false, &shadow_pipe) && pipeline(stencil_ps, 2, false, &stencil_pipe) &&
+        pipeline(pcf_ps, 1, false, &pcf_pipe) && pipeline(pair_ps, 3, false, &pair_pipe) && pipeline(array_ps, 1, false, &array_pipe));
+  // (the buffer: a device without the feature has none)
+  AllocationDesc dd;
+  dd.flags = kAllocDepthStencil | kAllocTexture, dd.format = Format::D24S8, dd.width = dd.height = 64;
+  Handle depth = 0, target = e.alloc(kAllocRenderTarget, Format::A8R8G8B8, 64, 64);
+  CHECK(e.kernel.create_allocation(kPid, e.dev, dd, &depth) == status::kSuccess);
+  {
+    FakeScreen screen(8, 6);
+    graphics::SoftwareDevice inner(e.allocator, &screen);
+    SpyDevice limited(inner);
+    limited.feature2_mask = ~static_cast<uint32_t>(graphics::kFeature2DepthTextures);
+    Kernel k(e.allocator);
+    AdapterConfig c;
+    c.display = &screen;
+    CHECK(k.add_adapter(limited, c) == 0);
+    Handle a = 0, d = 0, h = 0;
+    CHECK(k.open_process(kPid) == status::kSuccess && k.open_adapter_from_index(kPid, 0, &a) == status::kSuccess && k.create_device(kPid, a, &d) == status::kSuccess);
+    CHECK(k.create_allocation(kPid, d, dd, &h) == status::kNotSupported && h == 0);
+    AllocationDesc multi = dd;
+    multi.samples = 4;
+    CHECK(e.kernel.create_allocation(kPid, e.dev, multi, &h) == status::kInvalidParameter && h == 0);   // (one sample)
+  }
+  // The depth pass: the top half of the buffer at depth 0.25 and stencil 5, the rest cleared to 1 and 0.
+  auto vert = [](float* p, float x, float y, float z, float u, float v, float reference) { p[0] = x, p[1] = y, p[2] = z, p[3] = u / 2, p[4] = v / 2, p[5] = reference, p[6] = 1; };
+  float top[6 * 7], quad[6 * 7];
+  const float corners[6][2] = {{-1, 1}, {1, 1}, {-1, 0}, {-1, 0}, {1, 1}, {1, 0}}, full[6][2] = {{-1, 1}, {1, 1}, {-1, -1}, {-1, -1}, {1, 1}, {1, -1}};
+  for (uint32_t i = 0; i < 6; ++i) {
+    vert(&top[i * 7], corners[i][0], corners[i][1], 0.25f, 0, 0, 0);
+    vert(&quad[i * 7], full[i][0], full[i][1], 0.5f, (full[i][0] + 1) / 2, (1 - full[i][1]) / 2, 0.5f);   // (uv 0, 0 at the top left; the reference 0.5)
+  }
+  const Handle top_vb = e.buffer(kAllocVertexBuffer, sizeof top), quad_vb = e.buffer(kAllocVertexBuffer, sizeof quad);
+  CHECK(e.write(top_vb, floats(top, 6 * 7)) && e.write(quad_vb, floats(quad, 6 * 7)));
+  const float identity[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+  {
+    CommandWriter w(e.allocator);
+    w.begin_pass(0, 1, kPassClearColor | kPassClearDepth | kPassClearStencil, {0, 0, 0, 1}, 1.0f, 0);
+    w.bind_pipeline(depth_pipe);
+    w.bind_vertex_buffer(2);
+    w.push_constants(floats(identity, 16));
+    w.draw(6);
+    w.end_pass();
+    CHECK(e.render(w, {target, depth, top_vb}) == status::kSuccess);
+  }
+  graphics::SamplerDesc less_equal, greater, plain, linear;
+  less_equal.compare = graphics::CompareOp::LessEqual;
+  greater.compare = graphics::CompareOp::Greater;
+  less_equal.address_u = less_equal.address_v = greater.address_u = greater.address_v = plain.address_u = plain.address_v = graphics::AddressMode::ClampToEdge;
+  linear = less_equal;
+  linear.filter = graphics::Filter::Linear;
+  graphics::SamplerDesc stencil_view = plain;
+  stencil_view.stencil = true;
+  // Reads it through `pipe` with the units bound as given (allocation 1 the depth buffer, 3 the second texture) into the target, and gives the target's pixel at (x, y) for each point.
+  auto read = [&](Handle pipe, std::initializer_list<std::pair<uint32_t, graphics::SamplerDesc>> units, Handle second, std::initializer_list<std::pair<uint32_t, uint32_t>> points,
+                  uint32_t* out, uint32_t on_second = ~0u) {
+    CommandWriter w(e.allocator);
+    w.begin_pass(0, kNoAllocation, kPassClearColor, {0, 0, 0, 0}, 1.0f, 0);
+    w.bind_pipeline(pipe);
+    w.bind_vertex_buffer(2);
+    w.push_constants(floats(identity, 16));
+    for (const auto& u : units) w.bind_texture(u.first, u.first == on_second ? 3 : 1, u.second);
+    w.draw(6);
+    w.end_pass();
+    const NtStatus st = second ? e.render(w, {target, depth, quad_vb, second}) : e.render(w, {target, depth, quad_vb});
+    if (st != status::kSuccess) printf("  depth textures: render %x\n", st);
+    uint32_t n = 0;
+    for (const auto& p : points) out[n++] = e.pixel(target, p.first, p.second);
+    return st;
+  };
+  auto red = [](uint32_t p) { return (p >> 16) & 0xFF; };
+  auto green = [](uint32_t p) { return (p >> 8) & 0xFF; };
+  auto blue = [](uint32_t p) { return p & 0xFF; };
+  uint32_t px[4] = {};
+  // The comparisons: 0.5 <= 0.25 fails above, 0.5 <= 1 passes below; greater the other way round; the plain sampler gives the depth.
+  CHECK(read(shadow_pipe, {{0, less_equal}, {1, greater}, {2, plain}}, 0, {{10, 10}, {50, 50}}, px) == status::kSuccess);
+  printf("  depth textures: compared %08x (top) %08x (bottom)\n", px[0], px[1]);
+  CHECK(red(px[0]) == 0 && green(px[0]) == 255 && blue(px[0]) >= 62 && blue(px[0]) <= 66);
+  CHECK(red(px[1]) == 255 && green(px[1]) == 0 && blue(px[1]) == 255);
+  // ... the same samplers the other way round on the units: the pairs are the units'
+  CHECK(read(shadow_pipe, {{0, greater}, {1, less_equal}, {2, plain}}, 0, {{10, 10}}, px) == status::kSuccess);
+  CHECK(red(px[0]) == 255 && green(px[0]) == 0);
+  // The stencil plane (5 above, 0 below) beside the depth.
+  CHECK(read(stencil_pipe, {{0, plain}, {1, stencil_view}}, 0, {{10, 10}, {50, 50}}, px) == status::kSuccess);
+  printf("  depth textures: stencil %08x (top) %08x (bottom)\n", px[0], px[1]);
+  CHECK(green(px[0]) == 5 && green(px[1]) == 0 && red(px[0]) >= 62 && red(px[0]) <= 66 && red(px[1]) == 255);
+  // A device whose textures read one plane at a time (no kFeature2DepthAndStencilPlanes: virgl) is not given a draw that reads both planes of one buffer: the draw is refused; one plane is fine.
+  {
+    FakeScreen screen(8, 6);
+    graphics::SoftwareDevice inner(e.allocator, &screen);
+    SpyDevice one_plane(inner);
+    one_plane.feature2_mask = ~static_cast<uint32_t>(graphics::kFeature2DepthAndStencilPlanes);
+    Kernel k(e.allocator);
+    AdapterConfig c;
+    c.display = &screen;
+    CHECK(k.add_adapter(one_plane, c) == 0);
+    Handle a = 0, d = 0, context = 0, kvs = 0, kps = 0, kpipe = 0, kdepth = 0, ktarget = 0, kvb = 0;
+    CHECK(k.open_process(kPid) == status::kSuccess && k.open_adapter_from_index(kPid, 0, &a) == status::kSuccess && k.create_device(kPid, a, &d) == status::kSuccess &&
+          k.create_context(kPid, d, ContextPriority::Normal, &context) == status::kSuccess);
+    const std::vector<uint8_t> vs_code = read_blob("vs.dxbc"), ps_code = read_blob("ps_stencil.dxbc");
+    ShaderDesc sd;
+    sd.kind = ShaderKind::Dxbc, sd.stage = graphics::ShaderStage::Vertex, sd.code = ConstByteView(vs_code.data(), vs_code.size());
+    CHECK(k.create_shader(kPid, d, sd, &kvs) == status::kSuccess);
+    sd.stage = graphics::ShaderStage::Fragment, sd.code = ConstByteView(ps_code.data(), ps_code.size());
+    CHECK(k.create_shader(kPid, d, sd, &kps) == status::kSuccess);
+    PipelineDesc pd;
+    pd.vertex_shader = kvs, pd.fragment_shader = kps, pd.vertex_stride = 28, pd.attribute_count = 2, pd.varying_count = 3, pd.texture_count = 2;
+    pd.attributes[0] = {0, graphics::VertexFormat::Float3, 0};
+    pd.attributes[1] = {1, graphics::VertexFormat::Float4, 12};
+    pd.cull_mode = graphics::CullMode::None;
+    CHECK(k.create_pipeline(kPid, d, pd, &kpipe) == status::kSuccess);
+    AllocationDesc td;
+    td.flags = kAllocRenderTarget, td.format = Format::A8R8G8B8, td.width = td.height = 64;
+    AllocationDesc vd;
+    vd.flags = kAllocVertexBuffer, vd.size = sizeof quad;
+    CHECK(k.create_allocation(kPid, d, dd, &kdepth) == status::kSuccess && k.create_allocation(kPid, d, td, &ktarget) == status::kSuccess &&
+          k.create_allocation(kPid, d, vd, &kvb) == status::kSuccess);
+    auto draw = [&](const graphics::SamplerDesc& first) {
+      CommandWriter w(e.allocator);
+      w.begin_pass(0, kNoAllocation, kPassClearColor, {0, 0, 0, 0}, 1.0f, 0);
+      w.bind_pipeline(kpipe);
+      w.bind_vertex_buffer(2);
+      w.push_constants(floats(identity, 16));
+      w.bind_texture(0, 1, first);
+      w.bind_texture(1, 1, stencil_view);
+      w.draw(6);
+      w.end_pass();
+      const Handle list[3] = {ktarget, kdepth, kvb};
+      return k.render(kPid, context, w.view(), ArrayView<const Handle>(list, 3));
+    };
+    CHECK(draw(plain) == status::kInvalidParameter);          // (the depth through unit 0, the stencil through unit 1)
+    CHECK(draw(stencil_view) == status::kSuccess);            // (the stencil through both)
+    // (a pipeline that has unit 0 but whose shader reads only unit 1: the depth bound at unit 0 is no matter - the device is given the stencil there too -, and the draw is made)
+    const std::vector<uint8_t> only_code = read_blob("ps_stencil_only.dxbc");
+    sd.code = ConstByteView(only_code.data(), only_code.size());
+    Handle only_ps = 0;
+    CHECK(k.create_shader(kPid, d, sd, &only_ps) == status::kSuccess);
+    pd.fragment_shader = only_ps;
+    CHECK(k.create_pipeline(kPid, d, pd, &kpipe) == status::kSuccess);
+    LockResult lr;
+    if (k.lock(kPid, kvb, kLockDiscard, 0, &lr) == status::kSuccess) {
+      ConstByteView src = floats(quad, 6 * 7);
+      lr.data.first(src.size()).copy_from(src);
+      k.unlock(kPid, kvb);
+    }
+    CHECK(draw(plain) == status::kSuccess);
+    LockResult read;
+    uint32_t top = 0;
+    if (k.lock(kPid, ktarget, kLockReadOnly, 0, &read) == status::kSuccess) {
+      ByteReader in(read.data);
+      in.skip(uint64_t{10} * read.pitch + 10 * 4);
+      top = in.le32();
+      k.unlock(kPid, ktarget);
+    }
+    CHECK((top >> 24) == 0xFF && ((top >> 8) & 0xFF) == 0);   // (drawn; the buffer's stencil is the 0 it starts with)
+  }
+  // (a colour image has no stencil plane)
+  {
+    const Handle colour = e.alloc(kAllocTexture, Format::A8R8G8B8, 4, 4);
+    CommandWriter w(e.allocator);
+    w.begin_pass(0, kNoAllocation, kPassClearColor, {0, 0, 0, 0}, 1.0f, 0);
+    w.bind_texture(1, 1, stencil_view);
+    w.end_pass();
+    CHECK(e.render(w, {target, colour}) == status::kInvalidParameter);
+  }
+  // Filtered, a quarter of a texel down: the pixels of row 31 take a quarter of row 32 (which passes) and three quarters of row 31 (which fails); far from the edge they do not
+  // blend. The offset lookup is the same two texels over; GatherCmp's four are two of each.
+  {
+    float shifted[6 * 7];
+    for (uint32_t i = 0; i < 6; ++i) vert(&shifted[i * 7], full[i][0], full[i][1], 0.5f, (full[i][0] + 1) / 2, (1 - full[i][1]) / 2 + 0.25f / 64, 0.5f);
+    CHECK(e.write(quad_vb, floats(shifted, 6 * 7)));
+    CHECK(read(pcf_pipe, {{0, linear}}, 0, {{20, 31}, {20, 10}, {20, 50}}, px) == status::kSuccess);
+    printf("  depth textures: filtered %08x (the edge) %08x %08x\n", px[0], px[1], px[2]);
+    CHECK(red(px[0]) >= 60 && red(px[0]) <= 68 && green(px[0]) >= 60 && green(px[0]) <= 68 && blue(px[0]) >= 125 && blue(px[0]) <= 130);
+    CHECK((px[1] & 0xFFFFFF) == 0 && (px[2] & 0xFFFFFF) == 0xFFFFFF);
+    CHECK(e.write(quad_vb, floats(quad, 6 * 7)));
+  }
+  // One texture with two samplers - wrap and clamp - and a second texture with the second: the coordinate goes past 1 on the right half.
+  {
+    const Handle ramp = e.alloc(kAllocTexture, Format::A8R8G8B8, 4, 1), second = e.alloc(kAllocTexture, Format::A8R8G8B8, 1, 1);
+    const uint32_t texels[4] = {0xFF200000u, 0xFF600000u, 0xFFA00000u, 0xFFE00000u}, one = 0xFF00C000u;
+    CHECK(e.write(ramp, ConstByteView(reinterpret_cast<const uint8_t*>(texels), sizeof texels)) && e.write(second, ConstByteView(reinterpret_cast<const uint8_t*>(&one), 4)));
+    float wide[6 * 7];
+    for (uint32_t i = 0; i < 6; ++i) vert(&wide[i * 7], full[i][0], full[i][1], 0.5f, full[i][0] + 1, (1 - full[i][1]) / 2, 0);   // (u 0 .. 2)
+    CHECK(e.write(quad_vb, floats(wide, 6 * 7)));
+    graphics::SamplerDesc wrap;
+    wrap.address_u = wrap.address_v = graphics::AddressMode::Repeat;
+    graphics::SamplerDesc clamp = plain;
+    CommandWriter w(e.allocator);
+    w.begin_pass(0, kNoAllocation, kPassClearColor, {0, 0, 0, 0}, 1.0f, 0);
+    w.bind_pipeline(pair_pipe);
+    w.bind_vertex_buffer(1);
+    w.push_constants(floats(identity, 16));
+    w.bind_texture(0, 2, wrap);
+    w.bind_texture(2, 2, clamp);   // (t0 with s1)
+    w.bind_texture(1, 3, clamp);
+    w.draw(6);
+    w.end_pass();
+    CHECK(e.render(w, {target, quad_vb, ramp, second}) == status::kSuccess);
+    const uint32_t left = e.pixel(target, 4, 10), right = e.pixel(target, 36, 10);   // (u 0.14: texel 0 both ways; u 1.14: texel 0 wrapped, texel 3 clamped)
+    printf("  texture and sampler pairs: %08x %08x\n", left, right);
+    CHECK(red(left) == 0x20 && green(left) == 0x20 && blue(left) == 0xC0 && red(right) == 0x20 && green(right) == 0xE0 && blue(right) == 0xC0);
+    CHECK(e.write(quad_vb, floats(quad, 6 * 7)));
+  }
+  // An array of depth: two slices, the first cleared to 0.75 and the second to 0.25, compared with 0.5 and the second loaded.
+  {
+    AllocationDesc ad;
+    ad.flags = kAllocDepthStencil | kAllocTexture, ad.format = Format::D32Float, ad.width = ad.height = 32, ad.kind = graphics::TextureKind::Texture2DArray, ad.layers = 2;
+    Handle layers = 0;
+    CHECK(e.kernel.create_allocation(kPid, e.dev, ad, &layers) == status::kSuccess);
+    const Handle small = e.alloc(kAllocRenderTarget, Format::A8R8G8B8, 32, 32);
+    for (uint32_t slice = 0; slice < 2; ++slice) {
+      CommandWriter w(e.allocator);
+      w.begin_pass_layers(0, {}, 1, kPassClearColor | kPassClearDepth, {0, 0, 0, 1}, slice == 0 ? 0.75f : 0.25f, 0, {0, 1, slice, 1});
+      w.end_pass();
+      CHECK(e.render(w, {small, layers}) == status::kSuccess);
+    }
+    CommandWriter w(e.allocator);
+    w.begin_pass(0, kNoAllocation, kPassClearColor, {0, 0, 0, 0}, 1.0f, 0);
+    w.bind_pipeline(array_pipe);
+    w.bind_vertex_buffer(2);
+    w.push_constants(floats(identity, 16));
+    w.bind_texture(0, 1, less_equal);
+    w.draw(6);
+    w.end_pass();
+    CHECK(e.render(w, {target, layers, quad_vb}) == status::kSuccess);
+    const uint32_t p = e.pixel(target, 20, 20);
+    printf("  depth textures: array %08x\n", p);
+    CHECK(red(p) == 255 && green(p) == 0 && blue(p) >= 62 && blue(p) <= 66);
+  }
 }
 
 void test_multisample() {
@@ -8639,6 +8964,7 @@ int main() {
   test_compute_kernel();
   test_storage_images_kernel();
   test_layered_pass_kernel();
+  test_depth_textures_kernel();
   test_multisample();
   test_geometry_kernel();
   test_formats();

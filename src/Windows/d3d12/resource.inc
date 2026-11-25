@@ -601,6 +601,8 @@ static HRESULT resource_make_from(Dev *dev, const D3D12_HEAP_PROPERTIES *props, 
     }
     if (desc->Format == DXGI_FORMAT_R32_TYPELESS && want_depth) fi = format_info(DXGI_FORMAT_D32_FLOAT);
     if (desc->Format == DXGI_FORMAT_R24G8_TYPELESS && want_depth) fi = format_info(DXGI_FORMAT_D24_UNORM_S8_UINT);
+    if (desc->Format == DXGI_FORMAT_R16_TYPELESS && want_depth) fi = format_info(DXGI_FORMAT_D16_UNORM);
+    if (desc->Format == DXGI_FORMAT_R32G8X24_TYPELESS && want_depth) fi = format_info(DXGI_FORMAT_D32_FLOAT_S8X24_UINT);
     if (!fi || !fi->kernel || !!fi->depth != want_depth) { hr = fi && fi->kernel ? E_INVALIDARG : DXGI_ERROR_UNSUPPORTED; goto fail; }
     if (fi->compressed && (desc->Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS))) { hr = E_INVALIDARG; goto fail; }      /* (sampled only) */
     if (desc->Width == 0 || desc->Height == 0 || desc->Width > KMAX_TEXTURE_DIMENSION || desc->Height > KMAX_TEXTURE_DIMENSION) { hr = E_INVALIDARG; goto fail; }
@@ -656,6 +658,9 @@ static HRESULT resource_make_from(Dev *dev, const D3D12_HEAP_PROPERTIES *props, 
     if (uav && (fi->depth || fi->kernel == KF_BGRA8_SRGB || fi->kernel == KF_RGBA8_SRGB || samples > 1)) { hr = E_INVALIDARG; goto fail; }
     if (uav && (!(dev->caps.features2 & DEV_FEATURE2_STORAGE_IMAGES) || r->kind == 3)) { hr = DXGI_ERROR_UNSUPPORTED; goto fail; }
     ad.flags = want_depth ? KA_DEPTH : (target ? (KA_RENDER_TARGET | KA_TEXTURE) : KA_TEXTURE);
+    /* (a depth buffer is a texture too - shader resource views of its depth, or of a D24S8's stencil: shadow maps - unless the program says it never will be, on a device that
+     * reads them; one of several samples is drawn into only) */
+    if (want_depth && !(desc->Flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE) && samples == 1 && (dev->caps.features2 & DEV_FEATURE2_DEPTH_TEXTURES)) ad.flags |= KA_TEXTURE;
     if (uav && !r->planes && !fi->narrow) ad.flags |= KA_STORAGE_IMAGE;
     if (reserved) {
       /* (the kernel's reserved textures: of the formats tiling is a support of (format_tiled: not the video formats, whose tiles Direct3D does not define, nor

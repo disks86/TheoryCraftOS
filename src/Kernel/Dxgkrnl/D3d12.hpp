@@ -121,6 +121,7 @@ struct DescriptorDesc {
   Handle alternate = 0;            // a texture's view: the image a shader that declares a 2D array reads instead of `allocation`, a 2D image (0: none)
   graphics::StorageImageView image;   // UavTexture: the level and the layers (an array's layers, a volume's slices)
   uint32_t view_format = 0;           // ... and the format of the view (a dxgk::Format; 0: the allocation's own - another for a wide one: storage_view_format)
+  bool stencil = false;               // Srv of a depth buffer with a stencil plane (D24S8): the view reads the stencil (X24_TYPELESS_G8_UINT), not the depth
 };
 
 struct Descriptor {
@@ -130,6 +131,7 @@ struct Descriptor {
   graphics::SamplerDesc sampler;
   graphics::StorageImageView image;   // UavTexture (its format the device's)
   uint32_t view_format = 0;           // ... the view's dxgk::Format (0: the allocation's)
+  bool stencil = false;               // Srv of a depth buffer: of its stencil plane (DescriptorDesc::stencil)
   // A view that is both a 2D image and an array of them (Direct3D's Texture2DArray view of one plane of a planar texture's slices: the slice's own image, and a mirror of the
   // slices, VidMm::set_mirror): the array, read by shaders that declare one.
   SharedPointer<Allocation> alternate;

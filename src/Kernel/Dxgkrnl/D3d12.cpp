@@ -121,11 +121,11 @@ NtStatus parse_blob(ConstByteView blob, RootSignatureDesc* out) {
     at.le32();   // (address w)
     const float bias = word_float(at.le32());
     at.le32();   // (anisotropy)
-    at.le32();   // (comparison)
+    const uint32_t comparison = at.le32();   // (D3D12_COMPARISON_FUNC: 1 never .. 8 always, 0 none)
     const uint32_t border = at.le32();   // (D3D12_STATIC_BORDER_COLOR: transparent black, opaque black, opaque white)
     const float min_lod = word_float(at.le32()), max_lod = word_float(at.le32());
     const uint32_t reg = at.le32(), space = at.le32(), visibility = at.le32();
-    if (!at.ok() || address_u < 1 || address_u > 5 || address_v < 1 || address_v > 5 || visibility > 5) return status::kInvalidParameter;
+    if (!at.ok() || address_u < 1 || address_u > 5 || address_v < 1 || address_v > 5 || visibility > 5 || comparison > 8) return status::kInvalidParameter;
     StaticSampler& s = out->samplers[i];
     // (the filter: bit 0 mip, bit 2 mag, bit 4 min; anisotropic filtering (0x55) and comparison filters are the linear ones)
     s.sampler.filter = (filter & 0x4) || filter == 0x55 || filter == 0xD5 ? graphics::Filter::Linear : graphics::Filter::Nearest;
@@ -136,6 +136,8 @@ NtStatus parse_blob(ConstByteView blob, RootSignatureDesc* out) {
     s.sampler.lod_bias = bias == bias && bias > -100.0f && bias < 100.0f ? bias : 0.0f;
     s.sampler.min_lod = min_lod == min_lod && min_lod > -100.0f && min_lod < 1000.0f ? min_lod : 0.0f;
     s.sampler.max_lod = max_lod == max_lod && max_lod > -100.0f && max_lod < 1000.0f ? max_lod : 1000.0f;
+    // (a comparison filter - the reduction bits 7-8 are 1 - compares by the function; the others do not compare: a SampleCmp with one gets nothing to pass)
+    if (((filter >> 7) & 3) == 1 && comparison >= 1) s.sampler.compare = static_cast<graphics::CompareOp>(comparison - 1);
     s.shader_register = reg;
     s.space = space;
     s.visibility = visibility;

@@ -1088,22 +1088,16 @@ void D3d9Program::execute(State& s, uint64_t begin, uint64_t end) const {
         break;
       }
       case kTexCompare: {
-        // sample_c: the footprint's four texels compared with the reference (passing where reference <= texel), then filtered bilinearly by the position inside it
+        // sample_c / sample_c_lz: the sampler's comparison of the reference with the texels around the coordinate, filtered (ITextureSet::sample_compare); control 1: level zero
         b = {{0, 0, 0, 0}};
         const uint32_t unit = ins.src[1].number;
-        uint32_t w = 0, h = 0, levels = 0;
-        if (s.textures && unit < graphics::kMaxTextureUnits && s.textures->size(unit, 0, &w, &h, &levels) && w && h) {
-          const float reference = fetch(ins.src[2], 0).f[0];
-          const float px = a.f[0] * static_cast<float>(w) - 0.5f, py = a.f[1] * static_cast<float>(h) - 0.5f;
-          const float x = floor_(px), y = floor_(py), fx = px - x, fy = py - y;
-          float pass[2][2];   // [row][column]
-          for (uint32_t row = 0; row < 2; ++row)
-            for (uint32_t col = 0; col < 2; ++col) {
-              const graphics::Vec4 t = s.textures->sample_lod(unit, (x + static_cast<float>(col) + 0.5f) / static_cast<float>(w), (y + static_cast<float>(row) + 0.5f) / static_cast<float>(h), 0.0f);
-              pass[row][col] = reference <= t.x ? 1.0f : 0.0f;
-            }
-          const float top = pass[0][0] * (1.0f - fx) + pass[0][1] * fx, bottom = pass[1][0] * (1.0f - fx) + pass[1][1] * fx;
-          const float value = top * (1.0f - fy) + bottom * fy;
+        if (s.textures && unit < graphics::kMaxTextureUnits) {
+          // (an offset moves the point by whole texels of the base level: the textures compared - depth buffers - have that one)
+          float u = a.f[0], v = a.f[1];
+          uint32_t w = 0, h = 0, levels = 0;
+          if ((ins.texel_offset[0] || ins.texel_offset[1]) && s.textures->size(unit, 0, &w, &h, &levels) && w && h)
+            u += static_cast<float>(ins.texel_offset[0]) / static_cast<float>(w), v += static_cast<float>(ins.texel_offset[1]) / static_cast<float>(h);
+          const float value = s.textures->sample_compare(unit, u, v, a.f[2], fetch(ins.src[2], 0).f[0], (ins.control & 1) != 0);
           b = {{value, value, value, value}};
         }
         store(ins.dst, b);
@@ -1176,7 +1170,7 @@ void D3d9Program::execute(State& s, uint64_t begin, uint64_t end) const {
               t = s.textures->sample_lod(unit, (tx + 0.5f) / fw, (ty + 0.5f) / fh, 0.0f);
             }
             const float texel[4] = {t.x, t.y, t.z, t.w};
-            b.f[k] = compare ? (reference <= t.x ? 1.0f : 0.0f) : texel[ins.control & 3];
+            b.f[k] = compare ? (graphics::compare_holds(s.textures->compare_op(unit), reference, t.x) ? 1.0f : 0.0f) : texel[ins.control & 3];
           }
         }
         store(ins.dst, b);

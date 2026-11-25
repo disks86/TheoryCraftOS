@@ -75,9 +75,16 @@ class ShaderObject {
   uint32_t tess_output_points() const { return tess_output_points_; }
   graphics::TessDomain tess_domain() const { return tess_domain_; }
   graphics::TextureKind texture_kind(uint32_t unit) const { return unit < graphics::kMaxTextureUnits ? texture_kinds_[unit] : graphics::TextureKind::Texture2D; }
+  // The texture register (t#) and the sampler register (s#) a DXBC shader reads through `unit` (D3d9Program::texture_register / sampler_register; the others: the unit's own).
+  uint32_t unit_texture(uint32_t unit) const { return unit < graphics::kMaxTextureUnits ? unit_texture_[unit] : unit; }
+  uint32_t unit_sampler(uint32_t unit) const { return unit < graphics::kMaxTextureUnits ? unit_sampler_[unit] : unit; }
 
  private:
   friend class Adapter;
+  static_assert(graphics::kMaxTextureUnits == 16, "the pairs list every unit");
+  uint8_t unit_texture_[graphics::kMaxTextureUnits] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15};
+  uint8_t unit_sampler_[graphics::kMaxTextureUnits] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15};
+  uint32_t sampled_mask_ = 0;   // (D3d9Program::sampled_units: the units whose sampler register is the shader's)
   allocators::IAllocator& allocator_;
   graphics::IGraphicsDevice& device_;
   graphics::IShaderModule* module_ = nullptr;
@@ -134,6 +141,7 @@ class PipelineObject {
   uint32_t thread_group(uint32_t axis) const { return axis < 3 ? thread_group_[axis] : 1; }
   uint32_t storage_mask() const { return storage_mask_; }
   uint32_t texture_mask() const { return texture_mask_; }   // a compute pipeline: the texture units its shader reads
+  uint32_t declared_units() const { return declared_units_; }   // the texture units the shaders of the pipeline declare (bit n: unit n), any pipeline
   bool writes_storage() const { return fragment_stores_ || vertex_stores_ || geometry_stores_ || tessellation_stores_; }   // a shader of the pipeline writes buffers
   bool has_per_instance() const { return per_instance_; }
   // Stream output: which buffers (bit n: buffer n) the pipeline's declaration writes to, and whether it has one.
@@ -141,6 +149,9 @@ class PipelineObject {
   bool has_stream_output() const { return stream_output_buffers_ != 0; }
   // The kind of texture the shaders declared for a unit (2D when they do not say: only a DXBC program does).
   graphics::TextureKind texture_kind(uint32_t unit) const { return unit < graphics::kMaxTextureUnits ? texture_kinds_[unit] : graphics::TextureKind::Texture2D; }
+  // The texture and sampler registers the shaders read through a unit (ShaderObject::unit_texture / unit_sampler, of the stage that reads it): what Direct3D 12's binding puts there.
+  uint32_t unit_texture(uint32_t unit) const { return unit < graphics::kMaxTextureUnits ? unit_texture_[unit] : unit; }
+  uint32_t unit_sampler(uint32_t unit) const { return unit < graphics::kMaxTextureUnits ? unit_sampler_[unit] : unit; }
   // The storage images the compute shader or the pixel shader declares (bit n: u<n>), with each one's dimension and the values it reads and writes: a dispatch or draw needs them bound.
   uint32_t image_mask() const { return image_mask_; }
   D3d9Program::ImageDim image_dim(uint32_t slot) const { return slot < graphics::kMaxStorageImages ? image_dims_[slot] : D3d9Program::ImageDim::None; }
@@ -165,7 +176,10 @@ class PipelineObject {
   bool fragment_stores_ = false, vertex_stores_ = false, geometry_stores_ = false, tessellation_stores_ = false;
   SharedPointer<ShaderObject> vertex_, fragment_;   // (kept alive for as long as the pipeline is)
   graphics::TextureKind texture_kinds_[graphics::kMaxTextureUnits] = {};
+  uint8_t unit_texture_[graphics::kMaxTextureUnits] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15};
+  uint8_t unit_sampler_[graphics::kMaxTextureUnits] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15};
   uint32_t texture_mask_ = 0;   // a compute pipeline: the units its shader reads, which a dispatch needs bound
+  uint32_t declared_units_ = 0;
   uint32_t vertex_slot_mask_ = 0, instance_slot_mask_ = 0, slot_strides_[graphics::kMaxVertexBuffers] = {};
   uint32_t stride_ = 0, attribute_count_ = 0, texture_count_ = 0, color_target_count_ = 1;
 };

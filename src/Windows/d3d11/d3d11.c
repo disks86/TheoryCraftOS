@@ -1258,6 +1258,7 @@ static HRESULT tex_make(Dev *d, const D3D11_TEXTURE2D_DESC *in, UINT slices, ID3
                               (UINT16)(slices ? slices : desc.ArraySize), (UINT16)t->kmips, t->stored, {desc.SampleDesc.Count, 0}, D3D12_TEXTURE_LAYOUT_UNKNOWN, D3D12_RESOURCE_FLAG_NONE};
     if ((desc.BindFlags & D3D11_BIND_RENDER_TARGET) && !shadowed) rd.Flags |= D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
     if (t->depth) rd.Flags |= D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
+    if (t->depth && !(desc.BindFlags & D3D11_BIND_SHADER_RESOURCE)) rd.Flags |= D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE;      /* (not read by shaders: kept as a depth buffer alone) */
     if (desc.BindFlags & D3D11_BIND_UNORDERED_ACCESS) rd.Flags |= D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;      /* (the kernel's storage images) */
     /* (a keyed mutex that orders its use between devices: free, with key 0, as DXGI makes one; shared with the texture's NT handle, or - a legacy share - with a
      * global share handle of its own, which the texture's description carries) */
@@ -1657,6 +1658,43 @@ static HRESULT srv_of_buffer(Dev *d, Buf *b, const D3D11_SHADER_RESOURCE_VIEW_DE
   return give(v, (void **)out);
 }
 
+/* A shader resource view of a depth texture (made R16_TYPELESS, R24G8_TYPELESS, R32_TYPELESS or R32G8X24_TYPELESS with D3D11_BIND_DEPTH_STENCIL | D3D11_BIND_SHADER_RESOURCE) is
+ * of one of its planes, named by the format as DXGI names them: the depth through R16_UNORM, R24_UNORM_X8_TYPELESS, R32_FLOAT, R32_FLOAT_X8X24_TYPELESS; the stencil through
+ * X24_TYPELESS_G8_UINT or X32_TYPELESS_G8X24_UINT. Whether `view` is such a format of a texture of `tex`, and the format of the view of the Direct3D 12 texture below (which
+ * keeps D16 in D32_FLOAT and D32S8 in D24_UNORM_S8_UINT) and whether it is of the stencil. */
+static BOOL depth_view_format(DXGI_FORMAT tex, DXGI_FORMAT view, DXGI_FORMAT *below, BOOL *stencil) {
+  DXGI_FORMAT f = DXGI_FORMAT_UNKNOWN;
+  BOOL s = FALSE;
+  switch (view) {
+    case DXGI_FORMAT_R16_UNORM: if (tex == DXGI_FORMAT_R16_TYPELESS) f = DXGI_FORMAT_R32_FLOAT; break;
+    case DXGI_FORMAT_R32_FLOAT: if (tex == DXGI_FORMAT_R32_TYPELESS) f = DXGI_FORMAT_R32_FLOAT; break;
+    case DXGI_FORMAT_R24_UNORM_X8_TYPELESS: if (tex == DXGI_FORMAT_R24G8_TYPELESS) f = DXGI_FORMAT_R24_UNORM_X8_TYPELESS; break;
+    case DXGI_FORMAT_X24_TYPELESS_G8_UINT: if (tex == DXGI_FORMAT_R24G8_TYPELESS) f = DXGI_FORMAT_X24_TYPELESS_G8_UINT, s = TRUE; break;
+    case DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS: if (tex == DXGI_FORMAT_R32G8X24_TYPELESS) f = DXGI_FORMAT_R24_UNORM_X8_TYPELESS; break;
+    case DXGI_FORMAT_X32_TYPELESS_G8X24_UINT: if (tex == DXGI_FORMAT_R32G8X24_TYPELESS) f = DXGI_FORMAT_X24_TYPELESS_G8_UINT, s = TRUE; break;
+    default: break;
+  }
+  if (f == DXGI_FORMAT_UNKNOWN) return FALSE;
+  if (below) *below = f;
+  if (stencil) *stencil = s;
+  return TRUE;
+}
+/* The dimension of a view of a depth texture: 2D (or 1D) of one that is not an array, an array of all the slices of an array - the kernel's arrays are images of all their
+ * layers -, a cube of a cube; its one level. */
+static BOOL depth_view_dimension(const Tex *t, const D3D11_SHADER_RESOURCE_VIEW_DESC *desc) {
+  switch (desc->ViewDimension) {
+    case D3D11_SRV_DIMENSION_TEXTURE1D: return t->kind == 0 && desc->Texture1D.MostDetailedMip == 0;
+    case D3D11_SRV_DIMENSION_TEXTURE2D: return t->kind == 0 && desc->Texture2D.MostDetailedMip == 0;
+    case D3D11_SRV_DIMENSION_TEXTURE1DARRAY:
+      return t->kind == 2 && desc->Texture1DArray.MostDetailedMip == 0 && desc->Texture1DArray.FirstArraySlice == 0 &&
+             (desc->Texture1DArray.ArraySize == (UINT)-1 || desc->Texture1DArray.ArraySize == t->desc.ArraySize);
+    case D3D11_SRV_DIMENSION_TEXTURE2DARRAY:
+      return t->kind == 2 && desc->Texture2DArray.MostDetailedMip == 0 && desc->Texture2DArray.FirstArraySlice == 0 &&
+             (desc->Texture2DArray.ArraySize == (UINT)-1 || desc->Texture2DArray.ArraySize == t->desc.ArraySize);
+    case D3D11_SRV_DIMENSION_TEXTURECUBE: return t->kind == 3 && desc->TextureCube.MostDetailedMip == 0;
+    default: return FALSE;
+  }
+}
 static HRESULT srv_create(Dev *d, ID3D11Resource *resource, const D3D11_SHADER_RESOURCE_VIEW_DESC *desc, INT plane_slice, ID3D11ShaderResourceView **out) {
   if (out) *out = NULL;
   Buf *b = buf_of_resource(resource);
@@ -1674,6 +1712,7 @@ static HRESULT srv_create(Dev *d, ID3D11Resource *resource, const D3D11_SHADER_R
       return E_INVALIDARG;
   } else if (plane_slice > 0) return E_INVALIDARG;      /* (a format of one plane) */
   if ((t->fmt->flags & FMT_YUV) && (!desc || !yuv_view_ok(t->desc.Format, desc->Format, FALSE))) return E_INVALIDARG;      /* (packed YUV: a view of its pixels' format) */
+  if (t->depth && (!desc || !depth_view_format(t->desc.Format, desc->Format, NULL, NULL) || !depth_view_dimension(t, desc))) return E_INVALIDARG;      /* (a depth texture: a view of a plane) */
   if (!out) return S_FALSE;
   View *v = child_new(sizeof *v, d, &srv_vtbl, g_srv_iids, srv_destroy);
   if (!v) return E_OUTOFMEMORY;
