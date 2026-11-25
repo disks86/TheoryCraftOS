@@ -433,8 +433,9 @@ class VirglImage final : public IImage {
       device_.destroy_object(free->handle);
       free->handle = 0;
     }
+    // (a multisampled one's target is the resource's - 2D or 2D array -, the samples go with the resource)
     const uint32_t target = v.kind == TextureKind::Texture3D ? virgl::kTargetTexture3d : v.kind == TextureKind::TextureCube ? virgl::kTargetTextureCube
-                            : v.kind == TextureKind::TextureCubeArray ? virgl::kTargetTextureCubeArray : v.kind == TextureKind::Texture2DArray ? virgl::kTargetTexture2dArray
+                            : v.kind == TextureKind::TextureCubeArray ? virgl::kTargetTextureCubeArray : v.kind == TextureKind::Texture2DArray || v.kind == TextureKind::Texture2DMSArray ? virgl::kTargetTexture2dArray
                                                                                                           : virgl::kTargetTexture2d;
     const uint32_t first_layer = v.kind == TextureKind::Texture3D ? 0 : v.first_layer, last_layer = v.kind == TextureKind::Texture3D ? 0 : v.first_layer + v.layer_count - 1;
     const uint32_t handle = device_.new_handle();
@@ -1799,12 +1800,20 @@ IImage* VirglDevice::create_image(const ImageDesc& desc) {
                                                (desc.format != Format::B8G8R8A8Unorm && desc.format != Format::B8G8R8A8Srgb && desc.format != Format::R8G8B8A8Unorm && desc.format != Format::R8G8B8A8Srgb && !is_packed32_format(desc.format))))
     return nullptr;
   if (desc.mip_levels != 1 && (desc.samples != 1 || (desc.usage & kImagePresent))) return nullptr;
-  if (desc.samples != 1) {
-    // (a multisampled image is an 8-bit colour image, which a shader may read with texel fetches, or a depth attachment alone: resolved)
+  const bool multisampled = desc.samples != 1;
+  if (multisampled) {
+    // (a multisampled image is an 8-bit colour image or a depth attachment, which a shader may read with texel fetches (kFeature3MultisampleLoads / MultisampleDepthLoads), resolved; a
+    // 2D image, or an array of them - kFeature3MultisampleArrays - drawn into a layer at a time)
     const bool depth = desc.format == Format::D32Float;
-    if ((desc.samples != 2 && desc.samples != 4) || desc.kind != TextureKind::Texture2D || (depth ? desc.usage != kImageDepthAttachment : (desc.usage & ~kImageSampled) != kImageColorAttachment) || (!depth && desc.format != Format::B8G8R8A8Unorm && desc.format != Format::R8G8B8A8Unorm)) return nullptr;
+    if ((desc.samples != 2 && desc.samples != 4) || (desc.kind != TextureKind::Texture2D && desc.kind != TextureKind::Texture2DArray) ||
+        (depth ? (desc.usage & ~kImageSampled) != kImageDepthAttachment : (desc.usage & ~kImageSampled) != kImageColorAttachment) || (!depth && desc.format != Format::B8G8R8A8Unorm && desc.format != Format::R8G8B8A8Unorm) ||
+        desc.layers == 0 || desc.layers > kMaxTextureLayers || (desc.kind == TextureKind::Texture2D && desc.layers != 1) ||
+        (desc.kind == TextureKind::Texture2DArray && !(info().features3 & kFeature3MultisampleArrays)))
+      return nullptr;
   }
-  if (desc.kind != TextureKind::Texture2D) {
+  if (multisampled) {
+    // (checked above)
+  } else if (desc.kind != TextureKind::Texture2D) {
     // (a volume, array, cube or cube array: sampled - and drawn into, or a storage image, with kFeature2LayeredTargets / StorageImages -, 8-bit colour or a wide format (its layers
     // staged as such: write_subresource_float), one level or with kFeature2MipmappedLayers several; or a depth buffer of layers, an array, a cube or a cube array - maybe sampled too)
     const bool depth_layers = desc.format == Format::D32Float && (desc.usage & ~kImageSampled) == kImageDepthAttachment && desc.kind != TextureKind::Texture3D;
@@ -1820,7 +1829,7 @@ IImage* VirglDevice::create_image(const ImageDesc& desc) {
   // kFeature2MipmappedLayers: its sampler views show the levels as a colour texture's do.)
   if ((desc.usage & kImageSampled) && (desc.usage & kImagePresent)) return nullptr;
   if ((desc.usage & kImageSampled) && (desc.usage & kImageDepthAttachment) &&
-      (desc.format != Format::D32Float || desc.samples != 1 || (desc.mip_levels != 1 && !all_levels) || (desc.usage & ~(kImageSampled | kImageDepthAttachment))))
+      (desc.format != Format::D32Float || (desc.mip_levels != 1 && !all_levels) || (desc.usage & ~(kImageSampled | kImageDepthAttachment))))
     return nullptr;
   if ((desc.usage & kImageSampled) && desc.format != Format::D32Float && desc.format != Format::B8G8R8A8Unorm && desc.format != Format::B8G8R8A8Srgb && desc.format != Format::R8G8B8A8Unorm && desc.format != Format::R8G8B8A8Srgb && !is_wide_format(desc.format) && !is_packed32_format(desc.format)) return nullptr;
   if (!desc.extent.width || !desc.extent.height || desc.format == Format::Undefined) return nullptr;
@@ -2097,8 +2106,9 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
   // The constants a stage is given: the push constants and, for a pipeline whose shaders compare (ShaderModuleDesc::sampler_constants), the comparisons of the units' samplers
   // after the most there may be (kSamplerCompareRegister) - sent again when the samplers bound change.
   bool sampler_constants_dirty = false;
+  uint32_t pass_samples = 1;   // (the samples of the pass's targets: CONST[kRasterizerRegister] of a text that reads them)
   auto send_constants = [&](uint32_t shader, bool with_samplers) {
-    const uint32_t dwords = with_samplers ? (kSamplerCompareRegister + kMaxTextureUnits) * 4 : constants_dwords;
+    const uint32_t dwords = with_samplers ? kDeviceConstantRegisters * 4 : constants_dwords;
     stream.command(virgl::kSetConstantBuffer, 0, 2 + dwords);
     stream.put(shader);
     stream.put(0);
@@ -2107,6 +2117,8 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
         stream.put(constants[k]);
       } else if (k < kSamplerCompareRegister * 4) {
         stream.put(0);
+      } else if (k >= kRasterizerRegister * 4) {
+        stream.put(k == kRasterizerRegister * 4 ? pass_samples : 0u);   // (the pass's samples per pixel, an unsigned integer)
       } else {
         const uint32_t unit = k / 4 - kSamplerCompareRegister;
         float values[4];
@@ -2410,6 +2422,8 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
         if (in_pass || !cmd.pass.color) return false;
         color = static_cast<VirglImage*>(cmd.pass.color);
         depth = static_cast<VirglImage*>(cmd.pass.depth);
+        if (color->samples() != pass_samples) sampler_constants_dirty = true;   // (the samples a text reads with the comparisons)
+        pass_samples = color->samples();
         if (!color->surface() || color->format() == Format::D32Float) return false;
         if (depth && (depth->format() != Format::D32Float || !depth->surface())) return false;
         // (the pass is the size of the targets' levels: all of one size)
@@ -2510,10 +2524,13 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
         // A blit from the multisampled image to the plain one; one kept upright (an image that is only drawn into) is turned over.
         VirglImage* to = static_cast<VirglImage*>(cmd.image);
         const VirglImage* from = static_cast<const VirglImage*>(cmd.image2);
-        if (in_pass || !to || !from || to->samples() != 1 || from->samples() < 2 || to->extent().width != from->extent().width || to->extent().height != from->extent().height) return false;
+        if (in_pass || !to || !from || to->samples() != 1 || from->samples() < 2 || to->extent().width != from->extent().width || to->extent().height != from->extent().height ||
+            cmd.first >= from->layer_count())
+          return false;
         const Extent2D e = from->extent();
         const bool depth = to->format() == Format::D32Float;
         const ResolveMode mode = static_cast<ResolveMode>(cmd.count);
+        if (cmd.first != 0 && (mode == ResolveMode::Min || mode == ResolveMode::Max)) return false;   // (the passes of texel fetches read layer 0)
         if (!depth && (mode == ResolveMode::Min || mode == ResolveMode::Max)) {
           // (the least or greatest samples of a colour image - kFeature2ColorResolveModes: the host's blit only averages - drawn, and the state it took set again by
           // the next pass and draw)
@@ -2536,7 +2553,7 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
         stream.put(to->id()), stream.put(0), stream.put(to->blit_format());
         stream.put(0), stream.put(flip ? e.height : 0), stream.put(0), stream.put(e.width), stream.put(flip ? static_cast<uint32_t>(-static_cast<int32_t>(e.height)) : e.height), stream.put(1);
         stream.put(from->id()), stream.put(0), stream.put(from->blit_format());
-        stream.put(0), stream.put(0), stream.put(0), stream.put(e.width), stream.put(e.height), stream.put(1);
+        stream.put(0), stream.put(0), stream.put(cmd.first), stream.put(e.width), stream.put(e.height), stream.put(1);   // (the source's layer: resolve_layer)
         if (!resume_queries()) return false;
         break;
       }

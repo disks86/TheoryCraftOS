@@ -2437,6 +2437,15 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
     if (total) program->constant_registers_ = constant_base + total;
     program->color_outputs_ = color_outputs;
   }
+  // (a pixel shader that reads SV_SampleIndex or SV_Coverage, writes SV_Coverage or evaluates an input at a sample works with samples by number: its TGSI text turns Direct3D's numbers
+  // into the host's by the pass's count, which the device's constants have)
+  if (pixel) {
+    for (const Instr& ins : program->code_.view()) {
+      bool by_number = ins.dst.type == kCoverageOut || ins.op == kEvalSample;
+      for (uint32_t k = 0; k < ins.src_count; ++k) by_number = by_number || (ins.src[k].type == kSysValue && (ins.src[k].number == kSysSampleIndex || ins.src[k].number == kSysCoverage));
+      if (by_number) program->reads_rasterizer_ = true;
+    }
+  }
   if (compute && (!thread_group_declared || program->code_.count() == 0)) return status::kInvalidParameter;
   if (compute && program->needs_group() && program->thread_group_[0] * program->thread_group_[1] * program->thread_group_[2] > graphics::kMaxBarrierThreads) return status::kNotSupported;   // (a thread that waits keeps registers of its own)
   if (geometry && (!geometry_input_declared || !geometry_output_declared || program->geometry_max_vertices_ == 0)) return status::kInvalidParameter;

@@ -58,7 +58,7 @@ enum Capability : uint32_t {
   CapStorageImageMultisample = 27, CapClipDistance = 32, CapImageCubeArray = 34, CapSampleRateShading = 35, CapSampled1D = 43, CapImage1D = 44,
   CapSampledCubeArray = 45, CapSampledBuffer = 46, CapImageBuffer = 47, CapStorageImageExtendedFormats = 49, CapImageQuery = 50, CapDerivativeControl = 51,
   CapTransformFeedback = 53, CapGeometryStreams = 54, CapStorageImageReadWithoutFormat = 55, CapStorageImageWriteWithoutFormat = 56, CapMultiViewport = 57,
-  CapShaderLayer = 69, CapShaderViewportIndex = 70, CapDrawParameters = 4427, CapDemoteToHelperInvocation = 5379,
+  CapInterpolationFunction = 52, CapShaderLayer = 69, CapShaderViewportIndex = 70, CapDrawParameters = 4427, CapDemoteToHelperInvocation = 5379,
 };
 
 enum StorageClass : uint32_t {
@@ -100,7 +100,7 @@ enum Semantics : uint32_t {
 enum Glsl : uint32_t {
   GlslRoundEven = 2, GlslTrunc = 3, GlslFAbs = 4, GlslSAbs = 5, GlslFSign = 6, GlslSSign = 7, GlslFloor = 8, GlslCeil = 9, GlslFract = 10, GlslSin = 13,
   GlslCos = 14, GlslPow = 26, GlslExp2 = 29, GlslLog2 = 30, GlslSqrt = 31, GlslInverseSqrt = 32, GlslUMin = 38, GlslSMin = 39, GlslUMax = 41, GlslSMax = 42,
-  GlslFClamp = 43, GlslFma = 50, GlslCross = 68, GlslNMin = 79, GlslNMax = 80,
+  GlslFClamp = 43, GlslFma = 50, GlslCross = 68, GlslInterpolateAtCentroid = 76, GlslInterpolateAtSample = 77, GlslInterpolateAtOffset = 78, GlslNMin = 79, GlslNMax = 80,
 };
 
 // The image formats of OpTypeImage.

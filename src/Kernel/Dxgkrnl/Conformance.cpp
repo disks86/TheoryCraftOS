@@ -60,6 +60,7 @@ class Rig {
   const char* where() const { return where_; }
   bool has(uint32_t feature) const { return (caps_.features & feature) == feature; }
   bool has2(uint32_t feature) const { return (caps_.features2 & feature) == feature; }
+  bool has3(uint32_t feature) const { return (caps_.features3 & feature) == feature; }
 
   bool step(const char* name, NtStatus s) {
     if (s != status::kSuccess && status_ == status::kSuccess) status_ = s, where_ = name;
@@ -2616,6 +2617,224 @@ void scene_multisample_resource(Rig& rig, ArrayView<uint32_t> out) {
   rig.read(target, out);
 }
 
+// --- Multisampling in shaders (graphics::DeviceFeature3) -----------------------------------------------------------------------------------------------------------------
+// Each draws into a 4x multisampled target of 8 x 32 pixels that is a texture too (or reads one), then shows every sample of it: picture pixel (x, y) is sample x mod 4 of texel
+// (x / 4, y) (ps_ms_load). The pixel shaders are the tests/data/dxbc fixtures of the same names; vs_msaa takes the position as given and its w from the colour's alpha.
+constexpr uint32_t kMsWidth = kSize / 4;
+
+// (a rectangle of two triangles from (x0, y0) to (x1, y1) in pixels of a target `w` x kSize, one colour, depth z)
+void ms_rect(Vertex* v, float x0, float y0, float x1, float y1, float w, float r, float g, float b, float z = 0.5f) {
+  auto at = [&](float px, float py) { return Vertex{px / w * 2 - 1, 1 - py / kSize * 2, z, r, g, b, 1}; };
+  v[0] = at(x0, y0), v[1] = at(x1, y0), v[2] = at(x0, y1);
+  v[3] = at(x0, y1), v[4] = at(x1, y0), v[5] = at(x1, y1);
+}
+// The whole of a kMsWidth x kSize target whose colours are the pixel's own x and y over 64 (what ps_sample_input and ps_eval read).
+void ms_coordinates(Vertex* v) {
+  auto at = [](float px, float py) { return Vertex{px / kMsWidth * 2 - 1, 1 - py / kSize * 2, 0.5f, px / 64, py / 64, 0, 1}; };
+  v[0] = at(0, 0), v[1] = at(kMsWidth, 0), v[2] = at(0, kSize);
+  v[3] = at(0, kSize), v[4] = at(kMsWidth, 0), v[5] = at(kMsWidth, kSize);
+}
+bool ms_has(Rig& rig, uint32_t features3) {
+  if (rig.has(graphics::kFeatureMultisample | graphics::kFeatureTexelAccess | graphics::kFeatureSystemInputs) && rig.has3(features3 | graphics::kFeature3MultisampleLoads)) return true;
+  rig.step("multisampled reads", status::kNotSupported);
+  return false;
+}
+// Draws `count` vertices with the pixel shader `ps` (on vs_msaa: varyings position and colour) into a 4x multisampled target (and a depth buffer of its samples with `depth`), then shows
+// its samples through `reader` (ps_ms_load, or another Texture2DMS reader of the same layout).
+void ms_scene(Rig& rig, ArrayView<uint32_t> out, const uint8_t* ps, uint32_t ps_size, const Vertex* v, uint32_t count, uint32_t features3, const uint8_t* reader = nullptr, uint32_t reader_size = 0,
+              bool depth_buffer = false) {
+  namespace b = conformance_blobs;
+  if (!ms_has(rig, features3)) return;
+  if (!reader) reader = b::k_ps_ms_load, reader_size = sizeof b::k_ps_ms_load;
+  AllocationDesc md;
+  md.flags = kAllocRenderTarget | kAllocTexture, md.format = Format::A8R8G8B8, md.width = kMsWidth, md.height = kSize, md.samples = 4;
+  AllocationDesc dd = md;
+  dd.flags = kAllocDepthStencil | kAllocTexture, dd.format = Format::D32Float;
+  const Handle ms = rig.create(md), depth = depth_buffer ? rig.create(dd) : 0;
+  const Handle vb = rig.buffer(kAllocVertexBuffer, bytes_of(v, uint64_t{count} * sizeof(Vertex)));
+  Handle vs = rig.vertex_shader(bytes_of(b::k_vs_msaa, sizeof b::k_vs_msaa)), p = rig.pixel_shader(bytes_of(ps, ps_size));
+  PipelineDesc pd = colour_pipeline_desc(vs, p);
+  pd.varying_count = 2;
+  pd.multisample = true;
+  pd.depth_test = pd.depth_write = depth_buffer;
+  const Handle pipe = rig.pipeline(pd);
+  CommandWriter w(rig.allocator());
+  w.begin_pass(0, depth_buffer ? 2u : kNoAllocation, kPassClearColor | (depth_buffer ? kPassClearDepth : 0u), {0, 0, 0, 1}, 1.0f, 0);
+  w.bind_pipeline(pipe);
+  w.bind_vertex_buffer(1);
+  w.draw(count);
+  w.end_pass();
+  if (depth_buffer) rig.render(w, {ms, vb, depth});
+  else rig.render(w, {ms, vb});
+  // (the samples: of the depth buffer when there is one)
+  const Vertex quad[6] = {{-1, -1, 0.5f, 1, 1, 1, 1}, {1, -1, 0.5f, 1, 1, 1, 1}, {-1, 1, 0.5f, 1, 1, 1, 1}, {-1, 1, 0.5f, 1, 1, 1, 1}, {1, -1, 0.5f, 1, 1, 1, 1}, {1, 1, 0.5f, 1, 1, 1, 1}};
+  const Handle show = dxbc_pipeline(rig, b::k_vs, sizeof b::k_vs, reader, reader_size, 1);
+  const Handle target = rig.image(kAllocRenderTarget, Format::A8R8G8B8, kSize, kSize), qvb = rig.buffer(kAllocVertexBuffer, bytes_of(quad, sizeof quad));
+  CommandWriter w2(rig.allocator());
+  begin(w2, 0, kNoAllocation, {0, 0, 0, 1});
+  w2.bind_pipeline(show);
+  w2.bind_vertex_buffer(1);
+  w2.push_constants(bytes_of(kIdentity, sizeof kIdentity));
+  w2.bind_texture(0, 2, graphics::SamplerDesc());
+  w2.draw(6);
+  w2.end_pass();
+  rig.render(w2, {target, qvb, depth_buffer ? depth : ms});
+  rig.read(target, out);
+}
+
+// GetDimensions and GetSamplePosition of a Texture2DMS (a red rectangle with edges off the grid drawn first, so that the samples differ too): the reader shows them.
+void ms_info_scene(Rig& rig, ArrayView<uint32_t> out, const uint8_t* reader, uint32_t reader_size) {
+  Vertex v[6];
+  ms_rect(v, 1.3f, 4.6f, 6.4f, 27.3f, kMsWidth, 1, 0, 0);
+  ms_scene(rig, out, conformance_blobs::k_ps_flat, sizeof conformance_blobs::k_ps_flat, v, 6, 0, reader, reader_size);
+}
+void scene_ms_info(Rig& rig, ArrayView<uint32_t> out) { ms_info_scene(rig, out, conformance_blobs::k_ps_ms_info, sizeof conformance_blobs::k_ps_ms_info); }
+void scene_ms_info_dxil(Rig& rig, ArrayView<uint32_t> out) { ms_info_scene(rig, out, conformance_blobs::k_dxil_ps_ms_info, sizeof conformance_blobs::k_dxil_ps_ms_info); }
+void scene_ms_load_dxil(Rig& rig, ArrayView<uint32_t> out) {
+  Vertex v[6];
+  ms_rect(v, 1.3f, 4.6f, 6.4f, 27.3f, kMsWidth, 0, 1, 0);
+  ms_scene(rig, out, conformance_blobs::k_ps_flat, sizeof conformance_blobs::k_ps_flat, v, 6, 0, conformance_blobs::k_dxil_ps_ms_load, sizeof conformance_blobs::k_dxil_ps_ms_load);
+}
+// The rasterizer's sample count and positions (GetRenderTargetSampleCount / GetRenderTargetSamplePosition), drawn into every sample.
+void rt_info_scene(Rig& rig, ArrayView<uint32_t> out, const uint8_t* ps, uint32_t ps_size) {
+  Vertex v[6];
+  ms_rect(v, 0, 0, kMsWidth, kSize, kMsWidth, 1, 1, 1);
+  ms_scene(rig, out, ps, ps_size, v, 6, graphics::kFeature3SampleShading);
+}
+void scene_rt_info(Rig& rig, ArrayView<uint32_t> out) { rt_info_scene(rig, out, conformance_blobs::k_ps_rt_info, sizeof conformance_blobs::k_ps_rt_info); }
+void scene_rt_info_dxil(Rig& rig, ArrayView<uint32_t> out) { rt_info_scene(rig, out, conformance_blobs::k_dxil_ps_rt_info, sizeof conformance_blobs::k_dxil_ps_rt_info); }
+// A multisampled array: layer 0 red on its left half, layer 1 green on its right, drawn a layer at a time, read through Texture2DMSArray (rows 0 - 15 layer 0, 16 - 31 layer 1).
+void scene_ms_array(Rig& rig, ArrayView<uint32_t> out) {
+  namespace b = conformance_blobs;
+  if (!ms_has(rig, graphics::kFeature3MultisampleArrays) || !rig.has2(graphics::kFeature2LayeredTargets)) return void(rig.step("multisampled arrays", status::kNotSupported));
+  AllocationDesc md;
+  md.flags = kAllocRenderTarget | kAllocTexture, md.format = Format::A8R8G8B8, md.width = kMsWidth, md.height = kSize / 2, md.samples = 4;
+  md.kind = graphics::TextureKind::Texture2DArray, md.layers = 2;
+  const Handle array = rig.create(md);
+  Vertex v[12];
+  auto at = [](float px, float py, float r, float g) { return Vertex{px / kMsWidth * 2 - 1, 1 - py / (kSize / 2) * 2, 0.5f, r, g, 0, 1}; };
+  const float x0[2] = {0.6f, 3.7f}, x1[2] = {4.4f, 7.9f}, r[2] = {1, 0}, g[2] = {0, 1};
+  for (uint32_t l = 0; l < 2; ++l) {
+    Vertex* q = v + 6 * l;
+    q[0] = at(x0[l], 1.3f, r[l], g[l]), q[1] = at(x1[l], 1.3f, r[l], g[l]), q[2] = at(x0[l], 14.6f, r[l], g[l]);
+    q[3] = at(x0[l], 14.6f, r[l], g[l]), q[4] = at(x1[l], 1.3f, r[l], g[l]), q[5] = at(x1[l], 14.6f, r[l], g[l]);
+  }
+  const Handle vb = rig.buffer(kAllocVertexBuffer, bytes_of(v, sizeof v));
+  Handle vs = rig.vertex_shader(bytes_of(b::k_vs_msaa, sizeof b::k_vs_msaa)), p = rig.pixel_shader(bytes_of(b::k_ps_flat, sizeof b::k_ps_flat));
+  PipelineDesc pd = colour_pipeline_desc(vs, p);
+  pd.varying_count = 2;
+  pd.multisample = true;
+  const Handle pipe = rig.pipeline(pd);
+  CommandWriter w(rig.allocator());
+  for (uint32_t l = 0; l < 2; ++l) {
+    w.begin_pass_layers(0, {}, kNoAllocation, kPassClearColor, {0, 0, 0, 1}, 1.0f, 0, {l, 1, 0, 1});
+    w.bind_pipeline(pipe);
+    w.bind_vertex_buffer(1, 6 * l * sizeof(Vertex));
+    w.draw(6);
+    w.end_pass();
+  }
+  rig.render(w, {array, vb});
+  const Vertex quad[6] = {{-1, -1, 0.5f, 1, 1, 1, 1}, {1, -1, 0.5f, 1, 1, 1, 1}, {-1, 1, 0.5f, 1, 1, 1, 1}, {-1, 1, 0.5f, 1, 1, 1, 1}, {1, -1, 0.5f, 1, 1, 1, 1}, {1, 1, 0.5f, 1, 1, 1, 1}};
+  const Handle show = dxbc_pipeline(rig, b::k_vs, sizeof b::k_vs, b::k_ps_ms_array, sizeof b::k_ps_ms_array, 1);
+  const Handle target = rig.image(kAllocRenderTarget, Format::A8R8G8B8, kSize, kSize), qvb = rig.buffer(kAllocVertexBuffer, bytes_of(quad, sizeof quad));
+  CommandWriter w2(rig.allocator());
+  begin(w2, 0, kNoAllocation, {0, 0, 0, 1});
+  w2.bind_pipeline(show);
+  w2.bind_vertex_buffer(1);
+  w2.push_constants(bytes_of(kIdentity, sizeof kIdentity));
+  w2.bind_texture(0, 2, graphics::SamplerDesc());
+  w2.draw(6);
+  w2.end_pass();
+  rig.render(w2, {target, qvb, array});
+  rig.read(target, out);
+}
+// A multisampled depth buffer read by a shader: a rectangle at depth 0.25 with edges off the grid, the rest 1 (ps_ms_depth: the depth in red).
+void scene_ms_depth(Rig& rig, ArrayView<uint32_t> out) {
+  Vertex v[6];
+  ms_rect(v, 1.3f, 4.6f, 6.4f, 27.3f, kMsWidth, 1, 1, 1, 0.25f);
+  ms_scene(rig, out, conformance_blobs::k_ps_flat, sizeof conformance_blobs::k_ps_flat, v, 6, graphics::kFeature3MultisampleDepthLoads, conformance_blobs::k_ps_ms_depth,
+           sizeof conformance_blobs::k_ps_ms_depth, true);
+}
+// Centroid interpolation: a triangle whose red is the weight of its vertex at the top (zero along its lower edge, which runs through the samples of a row): red where the input reads
+// below zero - at the centre it does in the partly covered pixels below the edge, at the centroid never.
+void centroid_scene(Rig& rig, ArrayView<uint32_t> out, const uint8_t* ps, uint32_t ps_size) {
+  auto at = [](float px, float py, float r) { return Vertex{px / kMsWidth * 2 - 1, 1 - py / kSize * 2, 0.5f, r, 0, 0, 1}; };
+  const Vertex v[3] = {at(-2, 24.37f, 0), at(10, 24.37f, 0), at(4, -6, 1)};
+  ms_scene(rig, out, ps, ps_size, v, 3, graphics::kFeature3InterpolationModes);
+}
+void scene_centroid(Rig& rig, ArrayView<uint32_t> out) { centroid_scene(rig, out, conformance_blobs::k_ps_centroid, sizeof conformance_blobs::k_ps_centroid); }
+void scene_centroid_dxil(Rig& rig, ArrayView<uint32_t> out) { centroid_scene(rig, out, conformance_blobs::k_dxil_ps_centroid, sizeof conformance_blobs::k_dxil_ps_centroid); }
+// noperspective and flat inputs, on one sample: a triangle whose vertices' w are 1, 4 and 4 (red: the noperspective red against a linear function of the pixel's x; green: the
+// noperspective green), then a second with nointerpolation colours (the first vertex's everywhere).
+void interpolation_scene(Rig& rig, ArrayView<uint32_t> out, const uint8_t* noperspective, uint32_t noperspective_size, const uint8_t* flat, uint32_t flat_size) {
+  namespace b = conformance_blobs;
+  if (!rig.has(graphics::kFeatureSystemInputs) || !rig.has3(graphics::kFeature3InterpolationModes)) return void(rig.step("interpolation modes", status::kNotSupported));
+  const Vertex v[6] = {{-1, -1, 0.5f, -1, 0, 0, 1}, {1, -1, 0.5f, 1, 1, 0, 4}, {-1, 1, 0.5f, -1, 0.5f, 0, 4},
+                       {1, 1, 0.5f, 0, 0, 1, 1}, {-1, 1, 0.5f, 1, 1, 0, 1}, {1, -1, 0.5f, 0, 1, 1, 1}};
+  const Handle vb = rig.buffer(kAllocVertexBuffer, bytes_of(v, sizeof v));
+  Handle vs = rig.vertex_shader(bytes_of(b::k_vs_msaa, sizeof b::k_vs_msaa));
+  Handle p0 = rig.pixel_shader(bytes_of(noperspective, noperspective_size)), p1 = rig.pixel_shader(bytes_of(flat, flat_size));
+  PipelineDesc pd = colour_pipeline_desc(vs, p0);
+  pd.varying_count = 2;
+  const Handle first = rig.pipeline(pd);
+  pd.fragment_shader = p1;
+  const Handle second = rig.pipeline(pd);
+  const Handle target = rig.image(kAllocRenderTarget, Format::A8R8G8B8, kSize, kSize);
+  CommandWriter w(rig.allocator());
+  begin(w, 0, kNoAllocation, {0, 0, 0, 1});
+  w.bind_pipeline(first);
+  w.bind_vertex_buffer(1);
+  w.draw(3);
+  w.bind_pipeline(second);
+  w.draw(3, 3);
+  w.end_pass();
+  rig.render(w, {target, vb});
+  rig.read(target, out);
+}
+void scene_interpolation(Rig& rig, ArrayView<uint32_t> out) {
+  interpolation_scene(rig, out, conformance_blobs::k_ps_noperspective, sizeof conformance_blobs::k_ps_noperspective, conformance_blobs::k_ps_flat, sizeof conformance_blobs::k_ps_flat);
+}
+void scene_interpolation_dxil(Rig& rig, ArrayView<uint32_t> out) {
+  interpolation_scene(rig, out, conformance_blobs::k_dxil_ps_noperspective, sizeof conformance_blobs::k_dxil_ps_noperspective, conformance_blobs::k_dxil_ps_flat, sizeof conformance_blobs::k_dxil_ps_flat);
+}
+// A shader run for each sample: SV_SampleIndex, the position at the sample and SV_Coverage's own bit (ps_sample_index), over the whole target.
+void sample_index_scene(Rig& rig, ArrayView<uint32_t> out, const uint8_t* ps, uint32_t ps_size) {
+  Vertex v[6];
+  ms_rect(v, 0, 0, kMsWidth, kSize, kMsWidth, 1, 1, 1);
+  ms_scene(rig, out, ps, ps_size, v, 6, graphics::kFeature3SampleShading | graphics::kFeature3Coverage);
+}
+void scene_sample_index(Rig& rig, ArrayView<uint32_t> out) { sample_index_scene(rig, out, conformance_blobs::k_ps_sample_index, sizeof conformance_blobs::k_ps_sample_index); }
+void scene_sample_index_dxil(Rig& rig, ArrayView<uint32_t> out) { sample_index_scene(rig, out, conformance_blobs::k_dxil_ps_sample_index, sizeof conformance_blobs::k_dxil_ps_sample_index); }
+// An input at the sample (its red and green the pixel's x and y over 64: their fractions say where each sample is).
+void scene_sample_input(Rig& rig, ArrayView<uint32_t> out) {
+  Vertex v[6];
+  ms_coordinates(v);
+  ms_scene(rig, out, conformance_blobs::k_ps_sample_input, sizeof conformance_blobs::k_ps_sample_input, v, 6, graphics::kFeature3SampleShading);
+}
+// EvaluateAttributeAtSample / Snapped / Centroid of the same input.
+void evaluate_scene(Rig& rig, ArrayView<uint32_t> out, const uint8_t* ps, uint32_t ps_size) {
+  Vertex v[6];
+  ms_coordinates(v);
+  ms_scene(rig, out, ps, ps_size, v, 6, graphics::kFeature3EvaluateAttributes);
+}
+void scene_evaluate(Rig& rig, ArrayView<uint32_t> out) { evaluate_scene(rig, out, conformance_blobs::k_ps_eval, sizeof conformance_blobs::k_ps_eval); }
+void scene_evaluate_dxil(Rig& rig, ArrayView<uint32_t> out) { evaluate_scene(rig, out, conformance_blobs::k_dxil_ps_eval, sizeof conformance_blobs::k_dxil_ps_eval); }
+// SV_Coverage as an input (a rectangle and a triangle with edges off the grid: the count of each pixel's covered samples and the mask) and as an output (white to the samples of the mask x mod 16).
+void scene_coverage_in(Rig& rig, ArrayView<uint32_t> out) {
+  Vertex v[9];
+  ms_rect(v, 1.3f, 2.6f, 6.4f, 13.3f, kMsWidth, 1, 1, 1);
+  auto at = [](float px, float py) { return Vertex{px / kMsWidth * 2 - 1, 1 - py / kSize * 2, 0.5f, 1, 1, 1, 1}; };
+  v[6] = at(0.4f, 17.2f), v[7] = at(7.7f, 21.9f), v[8] = at(2.1f, 30.6f);
+  ms_scene(rig, out, conformance_blobs::k_ps_coverage, sizeof conformance_blobs::k_ps_coverage, v, 9, graphics::kFeature3Coverage);
+}
+void coverage_out_scene(Rig& rig, ArrayView<uint32_t> out, const uint8_t* ps, uint32_t ps_size) {
+  Vertex v[6];
+  ms_rect(v, 0, 0, kMsWidth, kSize, kMsWidth, 1, 1, 1);
+  ms_scene(rig, out, ps, ps_size, v, 6, graphics::kFeature3Coverage);
+}
+void scene_coverage_out(Rig& rig, ArrayView<uint32_t> out) { coverage_out_scene(rig, out, conformance_blobs::k_ps_omask, sizeof conformance_blobs::k_ps_omask); }
+void scene_coverage_out_dxil(Rig& rig, ArrayView<uint32_t> out) { coverage_out_scene(rig, out, conformance_blobs::k_dxil_ps_omask, sizeof conformance_blobs::k_dxil_ps_omask); }
+
 // Depth resolve: two rectangles with edges off the pixel grid (the near one at depth 0.3, the far one at 0.7, behind it where they overlap) are drawn into a 4x multisampled depth buffer, which
 // is resolved (sample 0, or the least or greatest of the samples) into a plain one; then the plain depth buffer is read by drawing over it with the depth test: a quad at depth 0.5 that
 // shows green where the stored depth is greater (0.7 and the cleared 1), and one at 0.85 over it that shows blue where it is the cleared 1, so the picture says which of the three depths each pixel
@@ -3510,6 +3729,25 @@ const Entry kScenes[] = {
     {"Direct3D 12 depth resolve, least sample", scene_depth_resolve_min},
     {"Direct3D 12 depth resolve, greatest sample", scene_depth_resolve_max},
     {"Direct3D 10 multisampled image as a shader resource (DXBC)", scene_multisample_resource},
+    {"Direct3D 11 Texture2DMS GetDimensions, GetSamplePosition (DXBC)", scene_ms_info},
+    {"Direct3D 12 Texture2DMS GetDimensions, GetSamplePosition (DXIL)", scene_ms_info_dxil},
+    {"Direct3D 12 Texture2DMS Load (DXIL)", scene_ms_load_dxil},
+    {"Direct3D 11 rasterizer sample count and positions (DXBC)", scene_rt_info},
+    {"Direct3D 12 rasterizer sample count and positions (DXIL)", scene_rt_info_dxil},
+    {"Direct3D 11 Texture2DMSArray Load (DXBC)", scene_ms_array},
+    {"Direct3D 11 multisampled depth buffer as a shader resource (DXBC)", scene_ms_depth},
+    {"Direct3D 11 centroid interpolation (DXBC)", scene_centroid},
+    {"Direct3D 12 centroid interpolation (DXIL)", scene_centroid_dxil},
+    {"Direct3D 11 noperspective and nointerpolation inputs (DXBC)", scene_interpolation},
+    {"Direct3D 12 noperspective and nointerpolation inputs (DXIL)", scene_interpolation_dxil},
+    {"Direct3D 11 SV_SampleIndex, per-sample shading (DXBC)", scene_sample_index},
+    {"Direct3D 12 SV_SampleIndex, per-sample shading (DXIL)", scene_sample_index_dxil},
+    {"Direct3D 11 inputs at the sample (DXBC)", scene_sample_input},
+    {"Direct3D 11 EvaluateAttributeAtSample, Snapped, Centroid (DXBC)", scene_evaluate},
+    {"Direct3D 12 EvaluateAttributeAtSample, Snapped, Centroid (DXIL)", scene_evaluate_dxil},
+    {"Direct3D 11 SV_Coverage input (DXBC)", scene_coverage_in},
+    {"Direct3D 11 SV_Coverage output (DXBC)", scene_coverage_out},
+    {"Direct3D 12 SV_Coverage output (DXIL)", scene_coverage_out_dxil},
     {"Direct3D 11 compute shader and unordered access views (DXBC)", scene_compute},
     {"Direct3D 11 group-shared memory and barriers (DXBC)", scene_compute_shared},
     {"Direct3D 10 independent blend per render target (DXBC)", scene_independent_blend},

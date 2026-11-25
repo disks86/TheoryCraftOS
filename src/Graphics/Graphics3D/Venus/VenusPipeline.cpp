@@ -427,7 +427,7 @@ bool VenusPipeline::make(Variant& v) {
   for (uint32_t s = 0; s < count && ok; ++s) {
     const VenusShaderModule& m = *modules[s];
     tgsi::CompileOptions o;
-    o.constant_rows = kSamplerCompareRegister + kMaxTextureUnits;
+    o.constant_rows = kDeviceConstantRegisters;
     o.stage_slot = s;
     for (uint32_t u = 0; u < tgsi::kMaxUnits; ++u) o.sview_type[u] = static_cast<tgsi::ValueType>(v.key.unit_type[u]);
     for (uint32_t k = 0; k < tgsi::kMaxTexelViews; ++k) o.sview_type[tgsi::kMaxUnits + k] = static_cast<tgsi::ValueType>(v.key.texel_type[s][k]);

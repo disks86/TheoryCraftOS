@@ -169,6 +169,7 @@ class Compiler {
   uint32_t raw(const Operand& o);         // the register's four words (no swizzle or modifiers)
   uint32_t src(const Instruction& ins, uint32_t n, Ty t);
   uint32_t swizzled(const Operand& o);
+  bool interpolate(const Instruction& ins);
   uint32_t scalar(const Instruction& ins, uint32_t n, Ty t) { return extract(scalar_of(t), src(ins, n, t), 0); }
   void write(const Instruction& ins, uint32_t value, Ty t);   // the destination under its mask (value: a vec4 of type t)
   void write_bits(const Operand& d, uint32_t bits);           // value: a uvec4
@@ -265,7 +266,7 @@ class Compiler {
 bool is_texture_op(Op op) {
   switch (op) {
     case Op::Tex: case Op::Txp: case Op::Txb: case Op::Txd: case Op::Txl: case Op::Txl2: case Op::Txb2: case Op::Tex2: case Op::Txf: case Op::Txq:
-    case Op::Tg4: case Op::Lodq:
+    case Op::Tg4: case Op::Lodq: case Op::Txqs:
       return true;
     default: return false;
   }
@@ -1069,6 +1070,33 @@ uint32_t Compiler::raw(const Operand& o) {
   }
 }
 
+// INTERP_CENTROID / INTERP_SAMPLE / INTERP_OFFSET of a fragment shader's float input: GLSL.std.450's InterpolateAtCentroid / AtSample / AtOffset of its variable, swizzled as the
+// operand says (the sample an integer, the offset two floats in pixels).
+bool Compiler::interpolate(const Instruction& ins) {
+  if (p_.stage != Stage::Fragment || ins.src_count < 1 || ins.dst_count != 1) return fail("an interpolation outside the fragment stage");
+  const Operand& o = ins.src[0];
+  if (o.file != File::In || o.index.indirect || o.index.value < 0 || o.index.value >= static_cast<int32_t>(kMaxIn) || o.negate || o.absolute) return fail("an interpolation of what is not an input");
+  const Io& io = in_[o.index.value];
+  if (io.kind != IoKind::Generic || io.type != f4_ || !io.var || io.per_vertex) return fail("an interpolation of an input that is not a float varying");
+  b_.capability(CapInterpolationFunction);
+  uint32_t v = 0;
+  if (ins.op == Op::InterpCentroid) {
+    v = ext(f4_, GlslInterpolateAtCentroid, {io.var});
+  } else if (ins.op == Op::InterpSample) {
+    v = ext(f4_, GlslInterpolateAtSample, {io.var, scalar(ins, 1, Ty::I)});
+  } else {
+    const uint32_t offset = src(ins, 1, Ty::F);
+    const uint32_t sel[4] = {0, 1, 0, 0};
+    v = ext(f4_, GlslInterpolateAtOffset, {io.var, shuffle(f2_, offset, offset, sel, 2)});
+  }
+  if (!(o.swizzle[0] == 0 && o.swizzle[1] == 1 && o.swizzle[2] == 2 && o.swizzle[3] == 3)) {
+    const uint32_t sel[4] = {o.swizzle[0], o.swizzle[1], o.swizzle[2], o.swizzle[3]};
+    v = shuffle(f4_, v, v, sel, 4);
+  }
+  write(ins, v, Ty::F);
+  return ok_;
+}
+
 uint32_t Compiler::swizzled(const Operand& o) {
   const uint32_t v = raw(o);
   if (o.swizzle[0] == 0 && o.swizzle[1] == 1 && o.swizzle[2] == 2 && o.swizzle[3] == 3) return v;
@@ -1593,7 +1621,7 @@ bool Compiler::texture(const Instruction& ins) {
   TargetShape s;
   if (!shape_of(target, &s)) return fail("a texture instruction without a target");
   if (s.shadow) return fail("shadow targets (the producers compare in the shader)");
-  if (sview_var_[unit] == 0 && op != Op::Txf && op != Op::Txq) {
+  if (sview_var_[unit] == 0 && op != Op::Txf && op != Op::Txq && op != Op::Txqs) {
     if (!sampled_image(unit, target)) return false;   // (declares the view)
   } else if (sview_var_[unit] == 0) {
     sview_target_[unit] = target;
@@ -1758,6 +1786,13 @@ bool Compiler::texture(const Instruction& ins) {
       words[1] = result;
       b_.op_list(Builder::kCode, OpImageGather, words, count);
       break;
+    }
+    case Op::Txqs: {   // (the samples per texel of a multisampled view: OpImageQuerySamples)
+      if (!s.ms) return fail("TXQS of a view that is not multisampled");
+      b_.capability(CapImageQuery);
+      const uint32_t samples = emit(OpImageQuerySamples, i_, {texture_image(unit)});
+      write(ins, splat(i4_, samples), Ty::I);
+      return ok_;
     }
     case Op::Lodq: {
       if (!fragment) return fail("LODQ outside the fragment stage");
@@ -2094,6 +2129,7 @@ bool Compiler::instruction(const Instruction& ins) {
   }
   resume();
   if (is_texture_op(ins.op)) return texture(ins);
+  if (ins.op == Op::InterpCentroid || ins.op == Op::InterpSample || ins.op == Op::InterpOffset) return interpolate(ins);
   if (is_memory_op(ins.op)) return memory(ins);
   if (is_double_op(ins.op)) return doubles(ins);
   return alu(ins);
