@@ -222,6 +222,10 @@ double tone(const std::vector<int16_t>& s, size_t from, size_t n, double freq) {
 // way tests/Win32kDxgTest.cpp builds it). tests/emulated_dx.sh builds it that way for dxgi.dll and d3d12.dll.
 #ifdef TCOS_EMU_DXG
 #include "Graphics/Graphics3D/Software/SoftwareDevice.hpp"
+#ifdef TCOS_EMU_VENUS
+#include "Graphics/Graphics3D/Venus/VenusDevice.hpp"
+#include "VenusHostVulkan.hpp"
+#endif
 #include "Kernel/Dxgkrnl/DxgKernel.hpp"
 #include "Hardware/GraphicsProcessingUnit/IGraphicsProcessingUnit.hpp"
 #include "Process/Win32k/Win32k.hpp"
@@ -398,7 +402,14 @@ int main(int argc, char** argv) {
 #ifdef TCOS_EMU_DXG
   if (getenv("TCOS_EMU_STREAM_TRACE")) dxgk::set_stream_trace(print_refused_stream);
   FakeScreen screen(640, 480);
+#ifdef TCOS_EMU_VENUS
+  // (the Venus device on the build host's Vulkan: tests/VenusHostVulkan.hpp)
+  if (!load_host_vulkan()) { printf("no host Vulkan loader\n"); return 2; }
+  graphics::VenusDevice device(a, screen);
+  if (!device.initialize()) { printf("no Vulkan 1.3 device on the host\n"); return 2; }
+#else
   graphics::SoftwareDevice device(a, &screen);
+#endif
 #ifdef TCOS_EMU_DMABUF
   graphics::LockedDevice shared_device(device);      // (the program's thread and the desktop's both draw on it)
   graphics::IGraphicsDevice& adapter_device = shared_device;

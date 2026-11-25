@@ -21,10 +21,10 @@
 // and the GL ones (src/WebGl/AccelConformance.cpp) against the CPU renderer in seconds, without QEMU. What runs in the guest differs only below the table (the
 // Venus protocol); tests/venus_qemu.sh checks that part. Skips (passes) when the host has no Vulkan 1.3 device.
 // VENUS_SCENE=<text>: only the scenes whose name contains it.
-#include <dlfcn.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "Graphics/BlockCompression.hpp"
 #include "Graphics/Graphics3D/Software/SoftwareDevice.hpp"
 #include "Graphics/Graphics3D/Venus/KernelVulkan.h"
 #include "Graphics/Graphics3D/Venus/VenusDevice.hpp"
@@ -33,54 +33,7 @@
 #include "Kernel/Dxgkrnl/DxgKernel.hpp"
 #include "WebGl/AccelConformance.hpp"
 
-// ---- the host's Vulkan as the kernel's table -----------------------------------------------------------------------------------------------------------
-namespace {
-void* g_loader = nullptr;
-PFN_vkGetInstanceProcAddr g_gipa = nullptr;
-VkInstance g_instance = nullptr;
-TcosKernelVulkan g_table;
-
-PFN_vkVoidFunction proc(const char* name) {
-  PFN_vkVoidFunction f = g_gipa(g_instance, name);
-  if (!f) {
-    fprintf(stderr, "the host's Vulkan has no %s\n", name);
-    abort();
-  }
-  return f;
-}
-
-// (functions looked up once the instance exists: every one of the table goes through these)
-#define TRAMPOLINE(name, ret, params, args)                                                     \
-  ret VKAPI_CALL t_##name params {                                                             \
-    static PFN_vk##name f = reinterpret_cast<PFN_vk##name>(proc("vk" #name));                  \
-    return f args;                                                                             \
-  }
-VkResult VKAPI_CALL t_CreateInstance(const VkInstanceCreateInfo* ci, const VkAllocationCallbacks* a, VkInstance* out) {
-  auto f = reinterpret_cast<PFN_vkCreateInstance>(g_gipa(nullptr, "vkCreateInstance"));
-  const VkResult r = f(ci, a, out);
-  if (r == VK_SUCCESS) g_instance = *out;
-  return r;
-}
-}  // namespace
-
-#include "VenusHostVulkan.inc"
-
-extern "C" {
-const TcosKernelVulkan* tcos_kernel_vulkan(void) { return &g_table; }
-bool tcos_kernel_vulkan_available(void) { return g_gipa != nullptr; }
-void* tcos_kvk_alloc(size_t bytes) { return calloc(1, bytes ? bytes : 1); }
-void tcos_kvk_free(void* p) { free(p); }
-void tcos_kvk_trace(const char* text) { printf("  %s\n", text); }
-}
-
-static bool load_host_vulkan() {
-  g_loader = dlopen("libvulkan.so.1", RTLD_NOW | RTLD_LOCAL);
-  if (!g_loader) return false;
-  g_gipa = reinterpret_cast<PFN_vkGetInstanceProcAddr>(dlsym(g_loader, "vkGetInstanceProcAddr"));
-  if (!g_gipa) return false;
-  fill_table(&g_table);
-  return true;
-}
+#include "VenusHostVulkan.hpp"
 
 // ---- the test --------------------------------------------------------------------------------------------------------------------------------------
 struct HostAllocator final : allocators::IAllocator {
@@ -192,6 +145,27 @@ int main() {
     if (pipe) device.destroy_pipeline(pipe);
     if (fs) device.destroy_shader_module(fs);
     if (vs) device.destroy_shader_module(vs);
+  }
+  // what format_caps says of each format is what create_image does (the kernel hands the caps to user mode as format support)
+  for (uint32_t fi = 64; fi < 128; ++fi) {
+    const graphics::Format f = static_cast<graphics::Format>(fi);
+    const uint32_t caps = device.format_caps(f);
+    if (!caps) continue;
+    struct Probe {
+      uint32_t cap, usage;
+      const char* what;
+    };
+    const Probe probes[] = {{graphics::kFormatSampled, graphics::kImageSampled, "texture"},
+                            {graphics::kFormatRenderTarget, graphics::kImageSampled | graphics::kImageColorAttachment, "render target"},
+                            {graphics::kFormatStorage, graphics::kImageSampled | graphics::kImageStorage, "storage image"}};
+    for (const Probe& pr : probes) {
+      if (!(caps & pr.cap)) continue;
+      graphics::ImageDesc d{{4, 4}, f, pr.usage};
+      if (graphics::is_compressed_format(f)) d.extent = {8, 8};
+      graphics::IImage* image = device.create_image(d);
+      if (!image) printf("FAILED format %u: the caps say %s, create_image refuses it\n", fi, pr.what), ++g_failed;
+      else device.destroy_image(image);
+    }
   }
   // the Direct3D layer's scenes
   {

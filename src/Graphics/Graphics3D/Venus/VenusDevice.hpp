@@ -115,6 +115,8 @@ class VenusDevice final : public IGraphicsDevice {
   // The format the host keeps an image of `format` in (VK_FORMAT_UNDEFINED: the device does not take it), and whether the CPU swaps R and B for it.
   VkFormat vk_format(Format format, bool storage, bool* swap_rb) const;
   bool format_supports(VkFormat f, VkFormatFeatureFlags features) const;
+  // Whether images of a 96-bit format are kept as 128-bit ones (the host has no optimal images of it).
+  bool widened_96(Format f) const;
   // Pipelines, descriptor sets (a new pool; the newest one, nullptr before the first)
   VkDescriptorPool descriptor_pool();
   VkDescriptorPool descriptor_pool_current();

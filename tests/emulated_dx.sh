@@ -17,7 +17,7 @@
 #
 # Runs a Windows test program on the CPU emulator with this OS's own system DLLs (src/Windows: dxgi.dll, d3d12.dll ...) AND the kernel's Direct3D: win32k with the
 # NtGdiDdDDI* services over a dxgk::Kernel with the software renderer for its one adapter. It is tests/emulated_windows.sh plus that kernel half.
-# Usage: tests/emulated_dx.sh [program.c ...]      (default: tests/windows/d3d12test.c)
+# Usage: [VENUS=1] tests/emulated_dx.sh [program.c ...]      (default: tests/windows/d3d12test.c)
 # Needs the UEFI cross toolchain (to build the DLLs) and mingw (x86_64-w64-mingw32-gcc) for the program. The host objects are cached in $TMPDIR/tcos-emudx/obj (delete the folder
 # after changing a header). Use a fresh $TMPDIR when the working copy moves: the DLL build keeps absolute paths.
 set -euo pipefail
@@ -35,17 +35,27 @@ sources=(tests/EmulationRun.cpp src/Emulation/*.cpp src/Process/*.cpp src/Crypto
          tests/KernelStubs.cpp src/Hardware/Keyboard/KeyCodes.cpp src/Process/Win32k/*.cpp src/Process/Win32k/Dxg/*.cpp src/Kernel/Dxgkrnl/*.cpp src/Graphics/VirtGpu/VirtGpuSession.cpp src/Hardware/VideoCodec/Dxva/*.cpp src/Hardware/VideoCodec/VideoProcess.cpp src/Hardware/VideoCodec/Software/*.cpp src/Hardware/VideoCodec/ColorConvert.cpp src/Hardware/VideoCodec/VideoFrameBuffer.cpp src/Hardware/VideoCodec/VideoTypes.cpp src/Math/FloatMath.cpp src/Graphics/Graphics3D/BuiltinShaders.cpp
          src/Graphics/Graphics3D/Software/*.cpp src/Graphics/Graphics2D/Software/*.cpp src/Hardware/GraphicsProcessingUnit/Font8x16.cpp)
 flags="-std=c++20 -O1 -pthread -I src -w -DTCOS_EMU_DXG"
+# VENUS=1: the kernel's Direct3D draws on the Venus device over the build host's own Vulkan (tests/VenusHostVulkan.hpp) instead of the CPU renderer - the device code the
+# guest runs on QEMU's virtio-gpu with Venus, without QEMU (objects of its own, in obj-venus)
+obj=obj runner=emurun
+if [ "${VENUS:-0}" = 1 ]; then
+  sources+=(src/Graphics/Graphics3D/Venus/TgsiText.cpp src/Graphics/Graphics3D/Venus/TgsiSpirv.cpp src/Graphics/Graphics3D/Venus/Spirv.cpp src/Graphics/Graphics3D/Venus/VenusContext.cpp
+            src/Graphics/Graphics3D/Venus/VenusDevice.cpp src/Graphics/Graphics3D/Venus/VenusPipeline.cpp src/Graphics/Graphics3D/Venus/VenusSubmit.cpp)
+  flags="$flags -DTCOS_EMU_VENUS -I tests"
+  obj=obj-venus runner=emurun-venus
+  mkdir -p "$work/$obj"
+fi
 objs=()
 jobs=()
 for f in "${sources[@]}"; do
-  o="$work/obj/$(echo "$f" | tr '/' '_').o"
+  o="$work/$obj/$(echo "$f" | tr '/' '_').o"
   objs+=("$o")
   if [ ! -f "$o" ] || [ "$f" -nt "$o" ] || [ -n "$(find src -name '*.hpp' -newer "$o" -print -quit)" ]; then jobs+=("$f"); fi
 done
 if [ ${#jobs[@]} -gt 0 ]; then
-  printf '%s\n' "${jobs[@]}" | xargs -P "$(nproc)" -I{} sh -c 'o="'"$work"'/obj/$(echo "{}" | tr / _).o"; g++ '"$flags"' -c "{}" -o "$o" || { rm -f "$o"; exit 255; }'
+  printf '%s\n' "${jobs[@]}" | xargs -P "$(nproc)" -I{} sh -c 'o="'"$work/$obj"'/$(echo "{}" | tr / _).o"; g++ '"$flags"' -c "{}" -o "$o" || { rm -f "$o"; exit 255; }'
 fi
-g++ -pthread "${objs[@]}" -o "$work/emurun"
+g++ -pthread "${objs[@]}" -o "$work/$runner" -ldl
 
 # The shaders the programs use, as C arrays (tests/data/dxbc is the kernel's own set of fixtures).
 python3 - "$work/dxfixtures.h" <<'PY'
@@ -65,7 +75,7 @@ for src in "${programs[@]}"; do
   name=$(basename "${src%.*}")
   x86_64-w64-mingw32-gcc -O1 -Wall -Wextra -Wno-unused-parameter -I "$work" -o "$work/$name.exe" "$src" -ld3d11 -ld3d9 -ldxgi -ld3d12 -luuid -ldxguid -luser32 -lgdi32
   echo "== $name"
-  "$work/emurun" "$work/$name.exe" "$work/sys32" | tee "$work/$name.out"
+  "$work/$runner" "$work/$name.exe" "$work/sys32" | tee "$work/$name.out"
   grep -q -e ", 0 failed" -e "all [0-9]* checks passed" "$work/$name.out" || fail=1
   grep -q "faulted=0" "$work/$name.out" || fail=1
 done

@@ -91,6 +91,7 @@ class VenusImage final : public IImage {
   bool stage_wide(ArrayView<const Vec4> pixels);
   bool unstage_wide(ArrayView<Vec4> out);
   bool transferable(uint32_t level, uint32_t layer, uint64_t count) const;
+  Format kept_format() const;
 
   struct View {
     TextureView v;
@@ -110,6 +111,7 @@ class VenusImage final : public IImage {
   VkImageAspectFlags aspect_ = VK_IMAGE_ASPECT_COLOR_BIT;
   uint32_t layers_ = 1;
   bool swap_rb_ = false;
+  bool widened_ = false;   // (a 96-bit format kept as 128 bits)
   uint64_t accounted_ = 0;
   List<View> views_;
   List<Target> targets_;

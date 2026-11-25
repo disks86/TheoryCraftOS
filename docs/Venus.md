@@ -79,6 +79,57 @@ What the backend does:
   semaphores), then the guest copies it into the Direct3D swapchain's image and presents that. So every surface kind works (Win32, Wayland, X11, headless) with one
   copy of each frame through guest memory.
 
+## The kernel's 3D device on Venus
+
+Everything in the kernel that draws goes through one `graphics::IGraphicsDevice` per GPU (the render node, `src/Graphics/RenderNode.hpp`): the Direct3D layer
+(`src/Kernel/Dxgkrnl`, so Direct3D 9 / 10 / 11 / 12 and DXGI), OpenGL and WebGL / WebGPU (`WebGlAccelerator`, the GL translator's TGSI), the desktop's 2D renderer and
+compositor, the windows of Wayland and X11 clients, and the Vulkan driver's Direct3D backend. On QEMU's virtio-gpu that device is now **`VenusDevice`**
+(`src/Graphics/Graphics3D/Venus`) when the device offers Venus, and `VirglDevice` (virglrenderer's OpenGL, TGSI) when it does not.
+
+* **The kernel's own Vulkan** (`KernelVulkan.h`, `KernelVulkan.c`, `KernelVulkanOs.cpp`): the driver's Venus backend, `vk_venus.inc`, compiled into the kernel without
+  presentation (`VN_NO_PRESENT`), over a render-node session of the kernel's own (`graphics::virtgpu::Session`, the same object `/dev/dri/renderD128` hands a program; its
+  ioctls take kernel pointers, its host blobs are where the kernel already maps the host-visible window). The kernel calls it through one table (`tcos_kernel_vulkan()`,
+  the list is `TCOS_KVK_PROCS`). `VenusContext` makes the instance, picks the first Vulkan 1.3 device with a graphics and compute queue, and enables what the host has of
+  Vulkan 1.0 - 1.3 and of transform feedback, conditional rendering, custom border colours, conservative rasterization, depth clip, 8-bit indices, line rasterization,
+  vertex attribute divisors, the provoking vertex, robustness2 (null descriptors), depth bias control and sample locations.
+* **Shaders**: TGSI is the language every hardware path of the kernel writes (the Direct3D layer's `D3d9Tgsi.cpp`, the GL translator, the built-in shaders), so the device
+  compiles TGSI to SPIR-V 1.5 (`TgsiText.*` reads it, `TgsiSpirv.*` with `Spirv.*` writes the module). Registers are untyped vec4s of 32-bit words bit-cast per opcode;
+  immediates keep their bits; comparisons give TGSI's ~0 / 0 or 1.0 / 0.0; structured control flow maps onto SPIR-V's; `KILL` is a demote (derivatives after it work).
+  One descriptor set: the constant buffer at binding 0, texture units as sampled images and samplers, and each stage's storage buffers, images and typed buffer views at
+  bindings of its own (the Direct3D layer numbers them per shader). The things virgl's GL host does by itself are told explicitly: `ShaderModuleDesc::tgsi_gl` (the GL
+  translator's images are GL's rows bottom first: DDY runs up, flat varyings take the last vertex) and `DeviceInfo::d3d_sample_order` (Vulkan's standard sample positions
+  are Direct3D's, so the Direct3D layer's TGSI does not turn 4x sample indexes around as it does for virgl).
+* **Pipelines** keep a variant per binding shape (`VenusVariantKey`: the value types of the bound textures and typed views - a SPIR-V sampled type must match the format -,
+  the storage images' formats, the attachments' formats and samples, the topology, the patch size). The Vulkan state is VirglDevice's semantics (`alpha_blend` is
+  SrcAlpha / InvSrcAlpha with alpha One / InvSrcAlpha, independent blend falls back to no blending, a depth write without a test passes everything, the hull's tessellator
+  settings rule the domain's, the tessellation domain origin is GL's lower left, all sixteen viewports are set with the ones past those given repeating the first).
+  A pipeline without multisampling on a multisampled target puts every sample at the pixel centre (VK_EXT_sample_locations): "all or nothing by its centre".
+  A normalised depth format's bias on the D32F buffer is a float bias of 1 / (2^n - 1) (VK_EXT_depth_bias_control).
+* **Resources**: buffers are host-visible coherent memory the kernel maps (IBuffer::map is that memory); images are device-local, optimal and always in the GENERAL layout;
+  CPU transfers go through a staging buffer, 0xAARRGGBB words or WidePixels' Vec4s, rows top first (Vulkan's own order: there are no flips anywhere). R8G8B8A8 images and
+  8-bit storage images are RGBA with red and blue turned around on the CPU, as on virgl.
+* **submit()** replays the `CommandRecorder` list (VirglDevice's refusals; nothing outlives a submit; a pass resets the pipeline) into a Vulkan command buffer, submits it
+  and waits for its fence, so it is as synchronous as the interface says. Each pass, dispatch and storing draw is fenced off by a full memory barrier (what GL gives virgl
+  implicitly). Constants go into a per-submit ring bound with a dynamic offset (4096 bytes of push block plus the samplers' comparison rows at 256 are more than any push
+  constant range); a submit that fills the ring or the descriptor pool is split. Queries are segmented per kind as on virgl (one query of a kind at a time), timestamps are
+  host ticks times `timestampPeriod`; stream output is transform feedback whose counter is seeded with the binding's offset, so appends across draws and pipelines work;
+  resolves are vkCmdResolveImage (through a scratch image and a blit when the formats differ), a rendering resolve from sample 0 for depth, and an internal TGSI pipeline
+  for the least or greatest sample.
+* **present()** copies the image into the virtio-gpu's 2D screen (`blit` + `present` of the display driver), one copy through guest memory per frame.
+* **Which device** (`RenderNode::build_venus`): with `TCOS_GPU_BACKEND=AUTO` (the default) the Venus device is used when it opens, draws the self-test picture and offers
+  every feature and limit that a virgl device on the same host would (a virgl device is made for the comparison and given back); the boot log says which and why.
+  `TCOS_GPU_BACKEND=VENUS` takes Venus whenever it works, `VIRGL` never. The scripts take `GPU_BACKEND=` (`tests/venus_qemu.sh`) or `GPU=venus` (`tests/d3d12_qemu.sh`).
+
+What stays on virgl: a virtio-gpu without the Venus capset (QEMU without `venus=on`, or a virglrenderer built without Venus) keeps `VirglDevice` for every path; with
+Venus nothing uses virgl any more (user-mode Vulkan programs use Venus directly through the driver's Venus backend, as before).
+
+Testing:
+* `tests/run_host_tests.sh TgsiSpirvTest`: every TGSI text of the built-in shaders, the GL conformance scenes and the Direct3D conformance scenes is read and compiled, and
+  each module passes `spirv-val --target-env vulkan1.3`; damaged texts are refused without reading out of bounds.
+* `tests/run_host_tests.sh VenusHostTest`: the Venus device on the **build host's** Vulkan (the table filled from the host's loader, `tests/VenusHostVulkan.inc` from
+  `tests/gen_venus_host_vulkan.py`) runs the Direct3D and GL conformance scenes against the CPU renderer, in seconds and without QEMU (`VENUS_SCENE=`, `VENUS_DUMP=1`).
+* `tests/venus_qemu.sh` and `GPU=venus tests/d3d12_qemu.sh <program>` run in the guest, where the boot's conformance runs on the device as well.
+
 ## Regenerating
 
 * The protocol: `scripts/gen-venus-protocol.sh <venus-protocol checkout>` (python with mako).

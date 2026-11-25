@@ -421,9 +421,10 @@ VkFormat VenusDevice::vk_format(Format f, bool storage, bool* swap_rb) const {
     case Format::R32G32Uint: return VK_FORMAT_R32G32_UINT;
     case Format::R32G32Sint: return VK_FORMAT_R32G32_SINT;
     case Format::R32G32Float: return VK_FORMAT_R32G32_SFLOAT;
-    case Format::R32G32B32Uint: return VK_FORMAT_R32G32B32_UINT;
-    case Format::R32G32B32Sint: return VK_FORMAT_R32G32B32_SINT;
-    case Format::R32G32B32Float: return VK_FORMAT_R32G32B32_SFLOAT;
+    // (96-bit images are often not offered as optimal images: they are kept as 128-bit ones then, the fourth component 1; widened_96())
+    case Format::R32G32B32Uint: return widened_96(f) ? VK_FORMAT_R32G32B32A32_UINT : VK_FORMAT_R32G32B32_UINT;
+    case Format::R32G32B32Sint: return widened_96(f) ? VK_FORMAT_R32G32B32A32_SINT : VK_FORMAT_R32G32B32_SINT;
+    case Format::R32G32B32Float: return widened_96(f) ? VK_FORMAT_R32G32B32A32_SFLOAT : VK_FORMAT_R32G32B32_SFLOAT;
     case Format::R11G11B10Float: return VK_FORMAT_B10G11R11_UFLOAT_PACK32;
     case Format::R9G9B9E5Float: return VK_FORMAT_E5B9G9R9_UFLOAT_PACK32;
     case Format::R10G10B10A2Uint: return VK_FORMAT_A2B10G10R10_UINT_PACK32;
@@ -437,6 +438,11 @@ VkFormat VenusDevice::vk_format(Format f, bool storage, bool* swap_rb) const {
     case Format::Bc7Srgb: return VK_FORMAT_BC7_SRGB_BLOCK;
     default: return VK_FORMAT_UNDEFINED;
   }
+}
+
+bool VenusDevice::widened_96(Format f) const {
+  const VkFormat own = f == Format::R32G32B32Uint ? VK_FORMAT_R32G32B32_UINT : f == Format::R32G32B32Sint ? VK_FORMAT_R32G32B32_SINT : VK_FORMAT_R32G32B32_SFLOAT;
+  return !format_supports(own, VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT | VK_FORMAT_FEATURE_TRANSFER_DST_BIT | VK_FORMAT_FEATURE_TRANSFER_SRC_BIT);
 }
 
 bool VenusDevice::format_supports(VkFormat f, VkFormatFeatureFlags features) const {
@@ -455,7 +461,8 @@ uint32_t VenusDevice::format_caps(Format format) const {
   if (is_compressed_format(format)) return kFormatSampled | kFormatFiltered | kFormatMipmaps | kFormatNative;
   uint32_t caps = kFormatSampled | kFormatMipmaps;
   if (!is_integer_format(format) && format_supports(f, VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT)) caps |= kFormatFiltered;
-  if (format != Format::A8Unorm && format != Format::R9G9B9E5Float && format_supports(f, VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT)) {
+  const bool rgb96 = format == Format::R32G32B32Uint || format == Format::R32G32B32Sint || format == Format::R32G32B32Float;
+  if (format != Format::A8Unorm && format != Format::R9G9B9E5Float && !(rgb96 && widened_96(format)) && format_supports(f, VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT)) {
     caps |= kFormatRenderTarget;
     if (!is_integer_format(format) && format_supports(f, VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BLEND_BIT)) caps |= kFormatBlendable;
   }
@@ -634,6 +641,7 @@ bool VenusImage::create() {
   if (d.format == Format::A8Unorm && (d.usage & kImageColorAttachment)) return false;
 
   format_ = device_.vk_format(d.format, storage, &swap_rb_);
+  widened_ = (d.format == Format::R32G32B32Uint || d.format == Format::R32G32B32Sint || d.format == Format::R32G32B32Float) && device_.widened_96(d.format);
   if (depth && d.stencil) format_ = VK_FORMAT_D32_SFLOAT_S8_UINT;
   if (format_ == VK_FORMAT_UNDEFINED) return false;
   aspect_ = depth ? (d.stencil ? VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT : VK_IMAGE_ASPECT_DEPTH_BIT) : VK_IMAGE_ASPECT_COLOR_BIT;
@@ -767,19 +775,32 @@ bool VenusImage::unstage(ArrayView<uint32_t> out) {
   return in.ok();
 }
 
+// The format the image's texels are in memory as (a widened 96-bit image's is the 128-bit one of its kind).
+Format VenusImage::kept_format() const {
+  if (!widened_) return desc_.format;
+  return desc_.format == Format::R32G32B32Uint ? Format::R32G32B32A32Uint : desc_.format == Format::R32G32B32Sint ? Format::R32G32B32A32Sint : Format::R32G32B32A32Float;
+}
+
 bool VenusImage::stage_wide(ArrayView<const Vec4> pixels) {
-  VenusMemory* s = device_.staging(pixels.size() * bytes_per_pixel(desc_.format));
+  const Format kept = kept_format();
+  VenusMemory* s = device_.staging(pixels.size() * bytes_per_pixel(kept));
   if (!s) return false;
   ByteWriter out{ByteView(s->map, s->size)};
-  for (const Vec4& c : pixels) encode_wide_pixel(desc_.format, c, out);
+  // (a widened image's fourth component is 1: the float one, or the integer one as bits)
+  const float one = kept == Format::R32G32B32A32Float ? 1.0f : __builtin_bit_cast(float, 1u);
+  for (const Vec4& c : pixels) encode_wide_pixel(kept, widened_ ? Vec4{c.x, c.y, c.z, one} : c, out);
   return out.ok();
 }
 
 bool VenusImage::unstage_wide(ArrayView<Vec4> out) {
-  VenusMemory* s = device_.staging(out.size() * bytes_per_pixel(desc_.format));
+  const Format kept = kept_format();
+  VenusMemory* s = device_.staging(out.size() * bytes_per_pixel(kept));
   if (!s) return false;
   ByteReader in{ConstByteView(s->map, s->size)};
-  for (Vec4& c : out) c = decode_wide_pixel(desc_.format, in);
+  for (Vec4& c : out) {
+    c = decode_wide_pixel(kept, in);
+    if (widened_) c = quantize_wide_pixel(desc_.format, c);   // (what a 96-bit image reads back: its own channels, the fourth as the format says)
+  }
   return in.ok();
 }
 
@@ -809,7 +830,7 @@ bool VenusImage::write_subresource_float(uint32_t level, uint32_t layer, ArrayVi
 
 bool VenusImage::read_subresource_float(uint32_t level, uint32_t layer, ArrayView<Vec4> out) {
   if (!transferable(level, layer, out.size()) || !is_wide_format(desc_.format)) return false;
-  if (!device_.staging(out.size() * bytes_per_pixel(desc_.format))) return false;
+  if (!device_.staging(out.size() * bytes_per_pixel(kept_format()))) return false;
   return copy(false, level, layer, mip_extent(desc_.extent.width, level)) && unstage_wide(out);
 }
 

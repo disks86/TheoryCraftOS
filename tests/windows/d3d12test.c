@@ -24,6 +24,7 @@
 #define INITGUID
 #include <windows.h>
 #include <stdio.h>
+#include <wchar.h>
 #include <string.h>
 #include <stdlib.h>
 #include <math.h>
@@ -38,6 +39,7 @@ static int checks, failed;
 #define CHECK_HR(x) do { HRESULT hr_ = (x); ++checks; if (FAILED(hr_)) { ++failed; printf("FAILED line %d: %s = %08lx\n", __LINE__, #x, (unsigned long)hr_); } } while (0)
 
 static int g_hardware;      /* the adapter is a GPU (not the CPU renderer) */
+static int g_layer_any;     /* the adapter takes a layer and a viewport from a vertex or domain shader: the CPU renderer and the Venus device (the host's Vulkan), not virgl */
 static const float kIdentity[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
 
 static ID3D12Resource *make_buffer(ID3D12Device *dev, D3D12_HEAP_TYPE type, UINT64 size, D3D12_RESOURCE_FLAGS flags, D3D12_RESOURCE_STATES state) {
@@ -71,6 +73,7 @@ static void test_dxgi(IDXGIAdapter1 **adapter_out) {
     printf("adapter: %ls (flags %x)\n", d.Description, (unsigned)d.Flags);
     printf("device: %s\n", (d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) ? "software (the CPU renderer)" : "hardware");
     g_hardware = !(d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE);
+    g_layer_any = !g_hardware || wcsstr(d.Description, L"Venus") != NULL;
     IDXGIOutput *output = NULL;
     CHECK_HR(IDXGIAdapter1_EnumOutputs(adapter, 0, &output));
     if (output) {
@@ -3639,7 +3642,7 @@ static void test_uav_format_support(ID3D12Device *dev) {
   f.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
   CHECK_HR(ID3D12Device_CheckFeatureSupport(dev, D3D12_FEATURE_FORMAT_SUPPORT, &f, sizeof f));
   CHECK(!o.TypedUAVLoadAdditionalFormats == !(f.Support1 & D3D12_FORMAT_SUPPORT1_BUFFER) &&
-        o.VPAndRTArrayIndexFromAnyShaderFeedingRasterizerSupportedWithoutGSEmulation == !g_hardware);   /* (the layer and viewport from a vertex shader: the CPU renderer) */
+        o.VPAndRTArrayIndexFromAnyShaderFeedingRasterizerSupportedWithoutGSEmulation == g_layer_any);   /* (the layer and viewport from a vertex shader: the CPU renderer, Venus) */
 }
 
 /* Compute shaders writing and reading a 2D array storage image, typed loads of R32_FLOAT, the atomics on R32_UINT / R32_SINT images of one, two and three dimensions, and
@@ -6273,8 +6276,8 @@ static void test_fixed_state(Scene *c) {
     D3D12_FEATURE_DATA_D3D12_OPTIONS o;
     memset(&o, 0, sizeof o);
     CHECK_HR(ID3D12Device_CheckFeatureSupport(c->dev, D3D12_FEATURE_D3D12_OPTIONS, &o, sizeof o));
-    /* (the CPU renderer takes the layer and viewport from a vertex shader; virglrenderer from a geometry shader only) */
-    CHECK(o.VPAndRTArrayIndexFromAnyShaderFeedingRasterizerSupportedWithoutGSEmulation == !g_hardware);
+    /* (the CPU renderer and the Venus device take the layer and viewport from a vertex shader; virglrenderer from a geometry shader only) */
+    CHECK(o.VPAndRTArrayIndexFromAnyShaderFeedingRasterizerSupportedWithoutGSEmulation == g_layer_any);
   }
   /* Logic operations: OutputMergerLogicOp, XOR into the target's bytes, and what is refused - blending and a logic operation at once, targets of independent blending with
    * different logic operations. */

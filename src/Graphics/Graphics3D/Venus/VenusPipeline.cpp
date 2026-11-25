@@ -328,6 +328,33 @@ tgsi::ValueType format_value_type(uint32_t vk_format) {
   }
 }
 
+// Whether the text has an atomic operation on IMAGE[k] (a line with ATOM and that register).
+bool has_image_atomics(StringView text, uint32_t k) {
+  char name[16] = "IMAGE[";
+  uint32_t n = 6;
+  char digits[4];
+  uint32_t d = 0;
+  do digits[d++] = static_cast<char>('0' + k % 10), k /= 10;
+  while (k && d < 4);
+  while (d) name[n++] = digits[--d];
+  name[n++] = ']';
+  const StringView reg(name, n);
+  uint64_t start = 0;
+  while (start < text.size()) {
+    uint64_t end = start;
+    while (end < text.size() && text[end] != '\n') ++end;
+    const StringView line = text.substr(start, end - start);
+    bool atom = false, uses = false;
+    for (uint64_t i = 0; i + 4 <= line.size(); ++i)
+      if (line.substr(i, 4) == StringView("ATOM")) atom = true;
+    for (uint64_t i = 0; i + reg.size() <= line.size(); ++i)
+      if (line.substr(i, reg.size()) == reg) uses = true;
+    if (atom && uses) return true;
+    start = end + 1;
+  }
+  return false;
+}
+
 // The register a stream output entry names (VirglDevice's rule: output 0 is the position as the shader wrote it, kept after the varyings for each stream).
 uint32_t stream_register(const StreamOutputEntry& e, uint32_t varyings) { return e.output == 0 ? varyings + 1 + e.stream : e.output; }
 
@@ -404,8 +431,13 @@ bool VenusPipeline::make(Variant& v) {
     o.stage_slot = s;
     for (uint32_t u = 0; u < tgsi::kMaxUnits; ++u) o.sview_type[u] = static_cast<tgsi::ValueType>(v.key.unit_type[u]);
     for (uint32_t k = 0; k < tgsi::kMaxTexelViews; ++k) o.sview_type[tgsi::kMaxUnits + k] = static_cast<tgsi::ValueType>(v.key.texel_type[s][k]);
+    // (an image nothing is bound to - at the pipeline's creation, or a slot left empty - is given a format its accesses take: R32_UINT where it has atomics, which
+    // only 32-bit integer images do; four floats otherwise)
+    tgsi::ImageFormat image_formats[tgsi::kMaxImages];
     for (uint32_t k = 0; k < tgsi::kMaxImages; ++k) {
-      o.image_format[k] = static_cast<tgsi::ImageFormat>(v.key.image_format[s][k]);
+      image_formats[k] = static_cast<tgsi::ImageFormat>(v.key.image_format[s][k]);
+      if (image_formats[k] == tgsi::ImageFormat::None) image_formats[k] = has_image_atomics(m.text(), k) ? tgsi::ImageFormat::R32Uint : tgsi::ImageFormat::R32G32B32A32Float;
+      o.image_format[k] = image_formats[k];
       o.image_type[k] = tgsi::ValueType::Float;
     }
     if (!compute_) {
@@ -454,7 +486,7 @@ bool VenusPipeline::make(Variant& v) {
     const tgsi::Program* program = &m.program();
     if (tgsi::has_marks(m.text())) {
       tgsi::MarkValues mv;
-      for (uint32_t k = 0; k < tgsi::kMarkImages; ++k) mv.image_format[k] = static_cast<tgsi::ImageFormat>(v.key.image_format[s][k]);
+      for (uint32_t k = 0; k < tgsi::kMarkImages; ++k) mv.image_format[k] = image_formats[k];
       for (uint32_t k = 0; k < tgsi::kMarkImages; ++k) mv.image_count[k] = 0x7FFFFFFF;   // (Vulkan's buffer views are exact: the shader's own bounds stay out of the way)
       for (uint32_t k = 0; k < tgsi::kMarkTexelViews; ++k) mv.texel_count[k] = 0x7FFFFFFF;
       ByteBuffer text(device_.allocator());
