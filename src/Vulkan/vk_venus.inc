@@ -762,8 +762,10 @@ static bool vn_physical_setup(VnPhysical *pd) {
   uint32_t k = 0;
   for (uint32_t i = 0; i < n; ++i)
     if (vn_extension_allowed(host[i].extensionName)) pd->extensions[k++] = host[i];
+#if !VN_NO_PRESENT
   copy_string(pd->extensions[k].extensionName, VK_MAX_EXTENSION_NAME_SIZE, VK_KHR_SWAPCHAIN_EXTENSION_NAME);
   pd->extensions[k++].specVersion = VK_KHR_SWAPCHAIN_SPEC_VERSION;
+#endif
   pd->extension_count = k;
   vk_free(host);
   return true;
@@ -1526,6 +1528,12 @@ static void VKAPI_CALL vn_vkGetPrivateData(VkDevice device, VkObjectType type, u
 /* ---- the forwarded commands (generated) ---------------------------------------------------------------------------------------------------------------- */
 #include "vn_commands.inc"
 
+#if VN_NO_PRESENT
+/* (built without presentation - the kernel's own Vulkan, src/Graphics/Graphics3D/Venus/KernelVulkan.c, shows its images itself: no instance or device ever has the
+ * Direct3D backend's objects, so there is nothing of them to destroy) */
+static void vn_hidden_destroy(VnInstance *inst) { (void)inst; }
+static void vn_present_device_destroy(VnDevice *dev) { (void)dev; }
+#else
 /* ---- presentation -------------------------------------------------------------------------------------------------------------------------------------- */
 /* A surface is the platform's (made by its vkCreate*SurfaceKHR, the same object for both backends). A swapchain of a Venus device has images of the host (made
  * like the program's own, with TRANSFER_SRC added) and, behind them, a swapchain of the Direct3D backend on the same surface, on a device of its own: at present
@@ -1932,6 +1940,8 @@ static VkResult VKAPI_CALL vn_vkQueuePresentKHR(VkQueue queue, const VkPresentIn
   }
   return result;
 }
+
+#endif /* VN_NO_PRESENT */
 
 /* ---- the entry points by name ---------------------------------------------------------------------------------------------------------------------------- */
 typedef struct VnProc {

@@ -666,6 +666,9 @@ add_executable(BOOTX64
   src/Graphics/Graphics3D/BuiltinShaders.cpp
   src/Graphics/Graphics3D/WebGlAccelerator.cpp
   src/Graphics/Graphics3D/Virgl/VirglDevice.cpp
+  src/Graphics/Graphics3D/Venus/KernelVulkan.c
+  src/Graphics/Graphics3D/Venus/KernelVulkanOs.cpp
+  src/Graphics/Graphics3D/Venus/VenusContext.cpp
   src/Graphics/Graphics3D/Svga/SvgaDevice.cpp
   src/Graphics/RenderNode.cpp
   src/Graphics/RenderNodeAccel.cpp
@@ -1385,8 +1388,11 @@ target_compile_options(BOOTX64 PRIVATE
   -Wall -Wextra -g ${TCOS_KERNEL_OPT_FLAG}
   $<$<COMPILE_LANGUAGE:CXX>:-fno-exceptions -fno-rtti -fno-threadsafe-statics>
 )
-# (the one C source: vulkan-1.dll's SPIR-V translator, which the 3D test's Vulkan path carries; it is the DLL's code as it is)
+# (the C sources: vulkan-1.dll's SPIR-V translator, which the 3D test's Vulkan path carries, and the Vulkan driver's Venus backend, the kernel's own Vulkan on
+# the host's driver (src/Graphics/Graphics3D/Venus/KernelVulkan.h); both are the driver's code as it is)
 set_source_files_properties(src/Desktop/CubeSpirvTranslator.c PROPERTIES COMPILE_OPTIONS "-std=gnu11;-Wno-unused-parameter;-Wno-unused-function;-Wno-sign-compare")
+set_source_files_properties(src/Graphics/Graphics3D/Venus/KernelVulkan.c PROPERTIES COMPILE_OPTIONS
+  "-std=gnu11;-Wno-unused-parameter;-Wno-unused-function;-Wno-sign-compare;-Wno-missing-field-initializers;-I${CMAKE_SOURCE_DIR}/src/Vulkan")
 # Keep frame pointers so gdb backtraces work.
 target_compile_options(BOOTX64 PRIVATE -fno-omit-frame-pointer)
 

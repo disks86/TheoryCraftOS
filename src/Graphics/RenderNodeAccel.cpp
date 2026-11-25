@@ -22,6 +22,9 @@
 #include <new>
 #include "Graphics/Graphics3D/BuiltinShaders.hpp"
 #include "Graphics/Graphics3D/IntelGen9/IntelRenderStack.hpp"
+#include "Graphics/Graphics3D/Venus/KernelVulkanOs.hpp"
+#include "Graphics/Graphics3D/Venus/VenusContext.hpp"
+#include "BootLog.hpp"
 #ifdef TCOS_AMD_VEGAM
 #include "Graphics/Graphics3D/Vega/VegaGraphicsDevice.hpp"
 #endif
@@ -36,6 +39,13 @@ void RenderNode::build_accelerated(hardware::VirtioGpu* virtio, hardware::Vmware
     if (!virtio->has_3d()) {
       reason_ = "virtio-gpu without virgl (start QEMU with virtio-gpu-gl and a gl display)";
     } else {
+      venus::set_kernel_vulkan_allocator(allocator);
+      if (tcos_kernel_vulkan_available()) {   // PROBE (temporary): the kernel's own Vulkan on the host's driver
+        venus::VenusContext probe;
+        bootlog::Entry e(bootlog::Level::Info, "Venus");
+        if (probe.open()) e.text("kernel Vulkan on ").text(probe.properties().deviceName).text(" (").text(probe.driver_name()).text("), Vulkan ").dec(VK_API_VERSION_MAJOR(probe.properties().apiVersion)).text(".").dec(VK_API_VERSION_MINOR(probe.properties().apiVersion));
+        else e.text("kernel Vulkan: the host's device did not open");
+      }
       VirglDevice* device = new (virgl_storage_) VirglDevice(*virtio);
       if (self_test(*device)) {
         gpu_device_ = device;
