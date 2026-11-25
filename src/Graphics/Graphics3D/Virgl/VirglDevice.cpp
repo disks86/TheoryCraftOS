@@ -1373,7 +1373,7 @@ class VirglPipeline final : public VirglPipelineBase {
 // and vertex elements it binds are the caller's to set again.
 bool extreme_resolve(VirglDevice& device, Stream& stream, VirglImage& to, VirglImage& from, bool greatest) {
   const uint32_t samples = from.samples();
-  const uint32_t view = from.fetch_view(), surface = to.surface(0, 1);
+  const uint32_t view = from.fetch_view(), surface = to.surface(0, 0, 1);
   if (samples < 2 || samples > 16 || !view || !surface) return false;
   // (the vertex shader: a triangle from (-1, -1) to (3, -1) and (-1, 3), from the vertex number alone - x is 4 * (id & 1) - 1, y 4 * ((id & 2) != 0) - 1)
   static const char kVertex[] =
@@ -2274,7 +2274,7 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
           pipeline = nullptr;
           textures_dirty = true;
           constants_dirty = constants_dwords != 0;
-          bound_fragment_shader = 0;
+          bound_shader[virgl::kShaderVertex] = bound_shader[virgl::kShaderFragment] = 0;   // (the resolve bound its own)
           break;
         }
         // (the host's blit averages colour and takes the first sample of depth: the other modes of a depth image are not made)

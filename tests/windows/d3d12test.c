@@ -5544,9 +5544,11 @@ static void fs_band(float *v, float y0, float y1, float zl, float zr, float r, f
   const int order[6] = {0, 1, 2, 2, 1, 3};
   for (int i = 0; i < 6; ++i) memcpy(v + 7 * i, corners[order[i]], 7 * sizeof(float));
 }
-/* (a step's stencil reference is both faces', unless own_back gives the back faces back_ref - OMSetFrontAndBackStencilRef -; with set_bias the list's depth bias is `bias`, its
- * clamp and slope - RSSetDepthBias - before the draw) */
-typedef struct FsStep { ID3D12PipelineState *pso; UINT first, count, stencil_ref; int own_back; UINT back_ref; int set_bias; float bias[3]; } FsStep;
+typedef struct FsStep { ID3D12PipelineState *pso; UINT first, count, stencil_ref; } FsStep;
+/* (more state of each step, where g_fs_more points at an array of them as long as the steps: own_back gives the back faces back_ref - OMSetFrontAndBackStencilRef - in place
+ * of the step's reference; with set_bias the list's depth bias is `bias`, its clamp and slope - RSSetDepthBias - before the draw) */
+typedef struct FsMore { int own_back; UINT back_ref; int set_bias; float bias[3]; } FsMore;
+static const FsMore *g_fs_more;
 /* Draws the steps into the target (cleared to `clear`) with a depth buffer of `depth_format` (UNKNOWN: none) cleared to 1 and stencil 0; the picture is read back into `out`. */
 static int fs_draw_viewports(Scene *c, DXGI_FORMAT depth_format, const float clear[4], const float *verts, UINT floats, const FsStep *steps, UINT n, UINT32 *out,
                              const D3D12_VIEWPORT *viewports, UINT viewport_count);
@@ -5605,15 +5607,16 @@ static int fs_draw_viewports(Scene *c, DXGI_FORMAT depth_format, const float cle
     for (UINT i = 0; i < n; ++i) {
       ID3D12GraphicsCommandList_SetPipelineState(list, steps[i].pso);
       ID3D12GraphicsCommandList_OMSetStencilRef(list, steps[i].stencil_ref);
-      if (steps[i].own_back) {
+      const FsMore *more = g_fs_more ? &g_fs_more[i] : NULL;
+      if (more && more->own_back) {
         ID3D12GraphicsCommandList8 *l8 = NULL;
         CHECK_HR(ID3D12GraphicsCommandList_QueryInterface(list, &IID_ID3D12GraphicsCommandList8, (void **)&l8));
-        if (l8) { ID3D12GraphicsCommandList8_OMSetFrontAndBackStencilRef(l8, steps[i].stencil_ref, steps[i].back_ref); ID3D12GraphicsCommandList8_Release(l8); }
+        if (l8) { ID3D12GraphicsCommandList8_OMSetFrontAndBackStencilRef(l8, steps[i].stencil_ref, more->back_ref); ID3D12GraphicsCommandList8_Release(l8); }
       }
-      if (steps[i].set_bias) {
+      if (more && more->set_bias) {
         ID3D12GraphicsCommandList9 *l9 = NULL;
         CHECK_HR(ID3D12GraphicsCommandList_QueryInterface(list, &IID_ID3D12GraphicsCommandList9, (void **)&l9));
-        if (l9) { ID3D12GraphicsCommandList9_RSSetDepthBias(l9, steps[i].bias[0], steps[i].bias[1], steps[i].bias[2]); ID3D12GraphicsCommandList9_Release(l9); }
+        if (l9) { ID3D12GraphicsCommandList9_RSSetDepthBias(l9, more->bias[0], more->bias[1], more->bias[2]); ID3D12GraphicsCommandList9_Release(l9); }
       }
       ID3D12GraphicsCommandList_DrawInstanced(list, steps[i].count, 1, steps[i].first, 0);
     }
@@ -5664,8 +5667,12 @@ static void test_stencil_refs_and_dynamic_bias(Scene *c) {
     ID3D12PipelineState *mark = fs_pso(c, &pd);
     z->FrontFace = z->BackFace = equal;
     ID3D12PipelineState *test = fs_pso(c, &pd);
-    const FsStep steps[3] = {{mark, 0, 6, 5, 1, 9}, {test, 6, 3, 9}, {test, 9, 3, 5}};
-    if (fs_draw(c, DXGI_FORMAT_D24_UNORM_S8_UINT, black, &v[0][0], 12 * 7, steps, 3, img)) {
+    const FsStep steps[3] = {{mark, 0, 6, 5}, {test, 6, 3, 9}, {test, 9, 3, 5}};
+    const FsMore more[3] = {{.own_back = 1, .back_ref = 9}, {.own_back = 0}, {.own_back = 0}};
+    g_fs_more = more;
+    const int drawn = fs_draw(c, DXGI_FORMAT_D24_UNORM_S8_UINT, black, &v[0][0], 12 * 7, steps, 3, img);
+    g_fs_more = NULL;
+    if (drawn) {
       printf("front and back stencil references: %08x %08x\n", (unsigned)img[32 * 64 + 8], (unsigned)img[32 * 64 + 56]);
       CHECK(FS_RGB(img[32 * 64 + 8]) == 0x00FF00 && FS_RGB(img[32 * 64 + 56]) == 0x0000FF && FS_RGB(img[2 * 64 + 32]) == 0);
     }
@@ -5692,8 +5699,12 @@ static void test_stencil_refs_and_dynamic_bias(Scene *c) {
     fs_band(v + 42, 1.0f, 0.0f, 0.5f, 0.5f, 0, 1, 0);
     fs_band(v + 84, 0.0f, -1.0f, 0.5f, 0.5f, 0, 0, 1);
     const float nan = sqrtf(-1.0f);
-    const FsStep steps[3] = {{base, 0, 6, 0}, {dynamic, 6, 6, 0, 0, 0, 1, {-8.0f, 0.0f, nan}}, {dynamic, 12, 6, 0, 0, 0, 1, {8.0f, 0.0f, 0.0f}}};
-    if (fs_draw(c, DXGI_FORMAT_D32_FLOAT, black, v, 18 * 7, steps, 3, img)) {
+    const FsStep steps[3] = {{base, 0, 6, 0}, {dynamic, 6, 6, 0}, {dynamic, 12, 6, 0}};
+    const FsMore more[3] = {{.set_bias = 0}, {.set_bias = 1, .bias = {-8.0f, 0.0f, nan}}, {.set_bias = 1, .bias = {8.0f, 0.0f, 0.0f}}};
+    g_fs_more = more;
+    const int drawn = fs_draw(c, DXGI_FORMAT_D32_FLOAT, black, v, 18 * 7, steps, 3, img);
+    g_fs_more = NULL;
+    if (drawn) {
       printf("dynamic depth bias: %08x %08x\n", (unsigned)img[16 * 64 + 32], (unsigned)img[48 * 64 + 32]);
       CHECK(FS_RGB(img[16 * 64 + 32]) == 0x00FF00 && FS_RGB(img[48 * 64 + 32]) == 0xFF0000);
     }
