@@ -1522,9 +1522,11 @@ bool TgsiEmitter::instruction(const Instr& ins) {
         break;
       }
       sampler_used_[unit] = true;
-      const uint8_t xyxy[4] = {0, 1, 0, 1}, xyzz[4] = {0, 1, 2, 2};
+      const uint8_t xyxy[4] = {0, 1, 0, 1}, xyzz[4] = {0, 1, 2, 2}, xyzw[4] = {0, 1, 2, 3};
       const bool flat = p_.texture_kind(unit) == graphics::TextureKind::Texture2D;
-      String coordinate = operand(ins.src[0], 0, 0, flat ? xyxy : xyzz, false);
+      // (a cube array's coordinate is the direction and the cube: all four)
+      const bool cube_array = p_.texture_kind(unit) == graphics::TextureKind::TextureCubeArray;
+      String coordinate = operand(ins.src[0], 0, 0, flat ? xyxy : cube_array ? xyzw : xyzz, false);
       String sampler = str();
       add(sampler, "SAMP[");
       add_uint(sampler, unit);

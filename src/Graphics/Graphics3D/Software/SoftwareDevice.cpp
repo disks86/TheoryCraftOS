@@ -270,6 +270,42 @@ class SoftwareImage final : public IImage {
     }
     return true;
   }
+  // The planes of a depth image (kFeature2DepthCopies): as the device keeps them, floats and bytes.
+  bool read_depth_subresource(uint32_t level, uint32_t layer, ArrayView<float> depth, ArrayView<uint8_t> stencil) override {
+    if (depth_.empty() || desc_.samples != 1 || !has(level, layer) || (!stencil.empty() && stencil_.empty())) return false;
+    const ArrayView<float> d = depth_layer(layer, level);
+    const ArrayView<uint8_t> s = stencil_layer(layer, level);
+    if (!depth.empty() && (depth.size() != d.size() || !depth.copy_from(d))) return false;
+    return stencil.empty() || (stencil.size() == s.size() && stencil.copy_from(s));
+  }
+  bool write_depth_subresource(uint32_t level, uint32_t layer, ArrayView<const float> depth, ArrayView<const uint8_t> stencil) override {
+    if (depth_.empty() || desc_.samples != 1 || !has(level, layer) || (!stencil.empty() && stencil_.empty())) return false;
+    const ArrayView<float> d = depth_layer(layer, level);
+    const ArrayView<uint8_t> s = stencil_layer(layer, level);
+    if ((!depth.empty() && depth.size() != d.size()) || (!stencil.empty() && stencil.size() != s.size())) return false;
+    for (uint64_t i = 0; i < depth.size(); ++i) {
+      const float v = depth[i];
+      d[i] = !(v == v) ? 0.0f : v < 0.0f ? 0.0f : v > 1.0f ? 1.0f : v;   // (a depth image keeps 0 .. 1)
+    }
+    return s.copy_from(stencil);
+  }
+  // A whole subresource of another image of this device: a depth image's planes, or a multisampled colour image's samples (and of any image of one sample, its texels).
+  bool copy_subresource(IImage& from, uint32_t level, uint32_t layer, uint32_t source_level, uint32_t source_layer, uint32_t planes) override {
+    SoftwareImage& source = static_cast<SoftwareImage&>(from);   // (the kernel copies between images of one device)
+    if (&source == this && level == source_level && layer == source_layer) return true;
+    if (source.desc_.format != desc_.format || source.desc_.samples != desc_.samples || source.desc_.stencil != desc_.stencil || !has(level, layer) ||
+        !source.has(source_level, source_layer) || level_pixels(level) != source.level_pixels(source_level) || level_extent(level).width != source.level_extent(source_level).width ||
+        planes == 0 || planes > 3)
+      return false;
+    if (!depth_.empty()) {
+      if ((planes & 2) && stencil_.empty()) return false;
+      if ((planes & 1) && !depth_layer(layer, level).copy_from(source.depth_layer(source_layer, source_level))) return false;
+      return !(planes & 2) || stencil_layer(layer, level).copy_from(source.stencil_layer(source_layer, source_level));
+    }
+    if (planes != 1) return false;
+    const Surface to = surface(level, layer), at = source.surface(source_level, source_layer);
+    return !hdr_.empty() ? to.floats.copy_from(at.floats) : to.pixels.copy_from(at.pixels);
+  }
   // Layer `layer` of level `level` (an empty surface for one the image does not have).
   Surface surface(uint32_t level = 0, uint32_t layer = 0) const {
     Surface s;
@@ -436,8 +472,10 @@ class TextureSet final : public ITextureSet {
     const float rho_x = dx[0] * dx[0] + dx[1] * dx[1] + dx[2] * dx[2], rho_y = dy[0] * dy[0] + dy[1] * dy[1] + dy[2] * dy[2];
     float rho2 = rho_x > rho_y ? rho_x : rho_y;   // (the square of rho: log2(rho) is half of log2(rho2))
     aniso_count_[unit] = 1;
-    if (anisotropic(sampler) && rho2 > 0.0f && (b.kind == TextureKind::Texture2D || b.kind == TextureKind::Texture2DArray)) {   // (along (u, v): of a 2D image or an array)
-      // (the longer axis of the footprint, Pmax, and the shorter, Pmin: N lookups along the longer one at the level of Pmax / N)
+    if (anisotropic(sampler) && rho2 > 0.0f) {
+      // (the longer axis of the footprint, Pmax, and the shorter, Pmin: N lookups along the longer one at the level of Pmax / N. The axis is the change of the coordinate the
+      // lookups take from pixel to pixel: (u, v) of a 2D image or an array (w, the layer, stays), (u, v, w) of a volume, and of a cube or a cube array the direction - a step
+      // along the change of direction is a step along the footprint on the face, as the lengths above are measured there)
       const float p_max = sqrt_of(rho2), p_min = sqrt_of(rho_x > rho_y ? rho_y : rho_x);
       float ratio = p_min > 0.0f ? p_max / p_min : static_cast<float>(sampler.max_anisotropy);
       if (!(ratio < static_cast<float>(sampler.max_anisotropy))) ratio = static_cast<float>(sampler.max_anisotropy);
@@ -446,8 +484,8 @@ class TextureSet final : public ITextureSet {
       if (n < 1) n = 1;
       aniso_count_[unit] = n;
       const bool along_x = rho_x >= rho_y;
-      aniso_du_[unit] = along_x ? right[0] - anchor[0] : below[0] - anchor[0];
-      aniso_dv_[unit] = along_x ? right[1] - anchor[1] : below[1] - anchor[1];
+      const bool layered = b.kind == TextureKind::Texture2DArray;
+      for (uint32_t k = 0; k < 3; ++k) aniso_step_[unit][k] = k == 2 && layered ? 0.0f : along_x ? right[k] - anchor[k] : below[k] - anchor[k];
       rho2 /= static_cast<float>(n) * static_cast<float>(n);
     }
     float lambda = 0.5f * mip_log2(rho2) + sampler.lod_bias;
@@ -471,7 +509,7 @@ class TextureSet final : public ITextureSet {
     if (!b) return {0, 0, 0, 1};
     if (b->kind != TextureKind::TextureCubeArray) return sample_volume(unit, x, y, z);
     if (recording_) return record(unit, x, y, z);
-    return lookup(*b, samplers_[unit], x, y, z, cube, lambda_[unit]);
+    return anisotropic_lookup(unit, *b, x, y, z, cube);
   }
 
   Vec4 sample(uint32_t unit, float u, float v) const override {
@@ -576,13 +614,15 @@ class TextureSet final : public ITextureSet {
  private:
   const Bound* bound_for(uint32_t unit) const { return unit < kMaxTextureUnits && bound_[unit].image ? &bound_[unit] : nullptr; }
   // A lookup with the unit's level of detail - of an anisotropic filter (aniso_count_ above 1, set_lod): that many lookups spread evenly over the longer axis of the footprint, averaged.
-  Vec4 anisotropic_lookup(uint32_t unit, const Bound& b, float u, float v, float w) const {
+  // (u, v, w as lookup takes them: a cube's direction, with `cube` the cube of a cube array)
+  Vec4 anisotropic_lookup(uint32_t unit, const Bound& b, float u, float v, float w, float cube = 0.0f) const {
     const uint32_t n = aniso_count_[unit];
-    if (n <= 1) return lookup(b, samplers_[unit], u, v, w, 0.0f, lambda_[unit]);
+    if (n <= 1) return lookup(b, samplers_[unit], u, v, w, cube, lambda_[unit]);
     Vec4 sum{0, 0, 0, 0};
+    const float* step = aniso_step_[unit];
     for (uint32_t k = 0; k < n; ++k) {
       const float t = (static_cast<float>(k) + 0.5f) / static_cast<float>(n) - 0.5f;
-      sum = sum + lookup(b, samplers_[unit], u + aniso_du_[unit] * t, v + aniso_dv_[unit] * t, w, 0.0f, lambda_[unit]);
+      sum = sum + lookup(b, samplers_[unit], u + step[0] * t, v + step[1] * t, w + step[2] * t, cube, lambda_[unit]);
     }
     return sum * (1.0f / static_cast<float>(n));
   }
@@ -817,8 +857,8 @@ class TextureSet final : public ITextureSet {
   mutable bool recorded_[kMaxTextureUnits] = {};
   mutable float record_[kMaxTextureUnits][3] = {};
   mutable float lambda_[kMaxTextureUnits] = {};
-  mutable uint32_t aniso_count_[kMaxTextureUnits] = {1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1};   // (the lookups of an anisotropic filter, and the axis they are spread over in u, v)
-  mutable float aniso_du_[kMaxTextureUnits] = {}, aniso_dv_[kMaxTextureUnits] = {};
+  mutable uint32_t aniso_count_[kMaxTextureUnits] = {1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1};   // (the lookups of an anisotropic filter, and the axis they are spread over in the
+  mutable float aniso_step_[kMaxTextureUnits][3] = {};                                                       // coordinate the lookups take: u, v and w)
 };
 
 // The storage images bound (bind_storage_image), as the shaders read and write them: a texel of the view is texel (x, y) of layer first_layer + z (of level `level`). A slot may instead

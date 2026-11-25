@@ -3789,6 +3789,84 @@ static void test_texture_uavs(Scene *c) {
   for (UINT i = 0; i < sizeof all / sizeof all[0]; ++i) ID3D12Resource_Release(all[i]);
 }
 
+/* Unordered access views of narrow volumes (formats the device keeps widened, written through a mirror of the view's slices): an R8_UNORM volume of 4 x 4 x 4 written whole, slice 1 of
+ * level 1 of an R16G16_UNORM volume of 8 x 8 x 4 (4 x 4 x 2 there) written by cs_uav_volume, and slice 0 of that level cleared through a view of it alone; the rest keeps what it had. */
+static UINT16 unorm16(float v) { return (UINT16)(v <= 0 ? 0 : v >= 1 ? 65535 : (UINT)(v * 65535.0f + 0.5f)); }
+static void test_narrow_volume_uavs(Scene *c) {
+  ID3D12Device *dev = c->dev;
+  const D3D12_RESOURCE_FLAGS uav = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+  D3D12_HEAP_PROPERTIES defaults = {D3D12_HEAP_TYPE_DEFAULT, D3D12_CPU_PAGE_PROPERTY_UNKNOWN, D3D12_MEMORY_POOL_UNKNOWN, 1, 1};
+  ID3D12Resource *bytes = uav_texture(dev, D3D12_RESOURCE_DIMENSION_TEXTURE3D, 4, 4, 4, DXGI_FORMAT_R8_UNORM, uav), *pairs = NULL;
+  const D3D12_RESOURCE_DESC pd = {D3D12_RESOURCE_DIMENSION_TEXTURE3D, 0, 8, 8, 4, 2, DXGI_FORMAT_R16G16_UNORM, {1, 0}, D3D12_TEXTURE_LAYOUT_UNKNOWN, uav};
+  CHECK_HR(ID3D12Device_CreateCommittedResource(dev, &defaults, D3D12_HEAP_FLAG_NONE, &pd, D3D12_RESOURCE_STATE_COMMON, NULL, &IID_ID3D12Resource, (void **)&pairs));
+  ID3D12RootSignature *rs4 = uav_signature(dev, 0, 4, 0);
+  ID3D12PipelineState *pso = rs4 ? compute_pso(dev, rs4, dx_cs_uav_volume_dxbc, sizeof dx_cs_uav_volume_dxbc) : NULL;
+  ID3D12DescriptorHeap *heap = view_heap(dev, 8, 1), *cpu = view_heap(dev, 8, 0);
+  if (!bytes || !pairs || !rs4 || !pso || !heap || !cpu) { CHECK(0); return; }
+  /* (level 1 of the pairs starts as all ones, level 0 as zeros) */
+  UINT16 start[4 * 4 * 2 * 2];
+  for (UINT i = 0; i < sizeof start / sizeof start[0]; ++i) start[i] = 0xFFFF;
+  texture_write(c, pairs, 1, start, 4);
+  D3D12_UNORDERED_ACCESS_VIEW_DESC u;
+  memset(&u, 0, sizeof u);
+  u.Format = DXGI_FORMAT_R8_UNORM;
+  u.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE3D;
+  u.Texture3D.WSize = (UINT)-1;
+  put_uav(dev, heap, cpu, 0, bytes, &u);
+  u.Format = DXGI_FORMAT_R16G16_UNORM;
+  u.Texture3D.MipSlice = 1, u.Texture3D.FirstWSlice = 1, u.Texture3D.WSize = 1;
+  put_uav(dev, heap, cpu, 1, pairs, &u);
+  put_uav(dev, heap, cpu, 2, NULL, NULL);
+  put_uav(dev, heap, cpu, 3, NULL, NULL);
+  u.Texture3D.FirstWSlice = 0;
+  put_uav(dev, heap, cpu, 4, pairs, &u);
+  ID3D12GraphicsCommandList *list = NULL;
+  CHECK_HR(ID3D12CommandAllocator_Reset(c->allocator));
+  CHECK_HR(ID3D12Device_CreateCommandList(dev, 0, D3D12_COMMAND_LIST_TYPE_DIRECT, c->allocator, pso, &IID_ID3D12GraphicsCommandList, (void **)&list));
+  if (!list) return;
+  ID3D12GraphicsCommandList_SetDescriptorHeaps(list, 1, &heap);
+  ID3D12GraphicsCommandList_SetComputeRootSignature(list, rs4);
+  ID3D12GraphicsCommandList_SetComputeRoot32BitConstants(list, 0, 16, kIdentity, 0);
+  ID3D12GraphicsCommandList_SetComputeRootDescriptorTable(list, 1, heap_gpu(dev, heap, 0));
+  ID3D12GraphicsCommandList_Dispatch(list, 1, 1, 1);
+  D3D12_RESOURCE_BARRIER b;
+  memset(&b, 0, sizeof b);
+  b.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+  b.UAV.pResource = pairs;
+  ID3D12GraphicsCommandList_ResourceBarrier(list, 1, &b);
+  const float clear[4] = {0.5f, 0.25f, 0, 0};
+  ID3D12GraphicsCommandList_ClearUnorderedAccessViewFloat(list, heap_gpu(dev, heap, 4), heap_cpu(dev, cpu, 4), pairs, clear, 0, NULL);
+  scene_run(c, list);
+  ID3D12GraphicsCommandList_Release(list);
+  BYTE got8[64];
+  int wrong = 0;
+  CHECK(texture_read(c, bytes, 0, got8, 1));
+  for (UINT i = 0; i < 64; ++i)
+    if (got8[i] != unorm8((float)i / 64.0f) && !wrong++) printf("  narrow volume: R8 texel %u %u, want %u\n", i, got8[i], unorm8((float)i / 64.0f));
+  CHECK(wrong == 0);
+  UINT16 got16[4 * 4 * 2 * 2], level0[8 * 8 * 4 * 2];
+  CHECK(texture_read(c, pairs, 1, got16, 4));
+  wrong = 0;
+  for (UINT z = 0; z < 2; ++z)
+    for (UINT i = 0; i < 16; ++i) {
+      const UINT16 *t = &got16[(z * 16 + i) * 2];
+      const UINT16 want[2] = {z == 0 ? unorm16(0.5f) : unorm16((float)(i % 4) / 4.0f), z == 0 ? unorm16(0.25f) : unorm16((float)(i / 4) / 4.0f)};
+      if ((t[0] != want[0] || t[1] != want[1]) && !wrong++) printf("  narrow volume: R16G16 level 1 slice %u texel %u %u %u, want %u %u\n", z, i, t[0], t[1], want[0], want[1]);
+    }
+  CHECK(wrong == 0);
+  CHECK(texture_read(c, pairs, 0, level0, 4));
+  wrong = 0;
+  for (UINT i = 0; i < sizeof level0 / sizeof level0[0]; ++i) wrong += level0[i] != 0;
+  printf("narrow volumes: R8 %u %u, R16G16 level 1 slice 1 texel 5 %u %u, level 0 %s\n", got8[1], got8[63], got16[(16 + 5) * 2], got16[(16 + 5) * 2 + 1], wrong ? "changed" : "as it was");
+  CHECK(wrong == 0);
+  ID3D12DescriptorHeap_Release(cpu);
+  ID3D12DescriptorHeap_Release(heap);
+  ID3D12PipelineState_Release(pso);
+  ID3D12RootSignature_Release(rs4);
+  ID3D12Resource_Release(pairs);
+  ID3D12Resource_Release(bytes);
+}
+
 /* A pixel shader writing storage images beside its render target (u1, u2): every pixel it shades marks its place, and an atomic counts them. */
 static void test_pixel_uavs(Scene *c) {
   ID3D12Device *dev = c->dev;
@@ -4984,6 +5062,392 @@ static UINT32 ml_texel(Scene *c, ID3D12Resource *tex, UINT sub, UINT x, UINT y, 
   if (!texture_read(c, tex, sub, texels, 4)) return 0xDEADDEADu;
   return texels[(z * h + y) * w + x];
 }
+
+/* ---- depth views of levels and layers, gathers of cube arrays, ResourceMinLODClamp ----------------------------------------------------------------------------------------- */
+
+/* A pipeline of vs_vol (the texture coordinate is the vertex colour: a direction, a layer, the cube in the alpha) and `ps` into the scene's target, on root signature `rs`. */
+static ID3D12PipelineState *view_pipeline(Scene *c, ID3D12RootSignature *rs, const void *ps, SIZE_T ps_size) {
+  D3D12_INPUT_ELEMENT_DESC layout[2] = {{"POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
+                                        {"COLOR", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 12, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0}};
+  D3D12_GRAPHICS_PIPELINE_STATE_DESC pd;
+  memset(&pd, 0, sizeof pd);
+  pd.pRootSignature = rs;
+  pd.VS.pShaderBytecode = dx_vs_vol_dxbc;
+  pd.VS.BytecodeLength = sizeof dx_vs_vol_dxbc;
+  pd.PS.pShaderBytecode = ps;
+  pd.PS.BytecodeLength = ps_size;
+  pd.SampleMask = 0xFFFFFFFFu;
+  pd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+  pd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+  pd.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+  pd.InputLayout.pInputElementDescs = layout;
+  pd.InputLayout.NumElements = 2;
+  pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+  pd.NumRenderTargets = 1;
+  pd.RTVFormats[0] = DXGI_FORMAT_B8G8R8A8_UNORM;
+  pd.SampleDesc.Count = 1;
+  ID3D12PipelineState *pso = NULL;
+  CHECK_HR(ID3D12Device_CreateGraphicsPipelineState(c->dev, &pd, &IID_ID3D12PipelineState, (void **)&pso));
+  return pso;
+}
+/* Draws the whole target with `pso` (on `rs`: shadow_signature's of one view table and the constants) reading the table at `table` of `heap`, every vertex colour (r, g, b, a); the pixel
+ * in the middle of the target. */
+static UINT32 view_draw(Scene *c, ID3D12PipelineState *pso, ID3D12RootSignature *rs, ID3D12DescriptorHeap *heap, D3D12_GPU_DESCRIPTOR_HANDLE table, float r, float g, float b, float a) {
+  const float corners[6][2] = {{-1, -1}, {1, -1}, {-1, 1}, {-1, 1}, {1, -1}, {1, 1}};
+  float v[6][7];
+  for (int i = 0; i < 6; ++i) v[i][0] = corners[i][0], v[i][1] = corners[i][1], v[i][2] = 0.5f, v[i][3] = r, v[i][4] = g, v[i][5] = b, v[i][6] = a;
+  ID3D12Resource *vb = make_buffer(c->dev, D3D12_HEAP_TYPE_UPLOAD, sizeof v, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ);
+  void *mapped = NULL;
+  if (!vb || FAILED(ID3D12Resource_Map(vb, 0, NULL, &mapped)) || !mapped) {
+    if (vb) ID3D12Resource_Release(vb);
+    return 0;
+  }
+  memcpy(mapped, v, sizeof v);
+  ID3D12Resource_Unmap(vb, 0, NULL);
+  const D3D12_VERTEX_BUFFER_VIEW vbv = {ID3D12Resource_GetGPUVirtualAddress(vb), sizeof v, 28};
+  const D3D12_VIEWPORT vp = {0, 0, 64, 64, 0, 1};
+  const D3D12_RECT sc = {0, 0, 64, 64};
+  const float black[4] = {0, 0, 0, 0};
+  ID3D12GraphicsCommandList *l = NULL;
+  UINT32 got = 0;
+  CHECK_HR(ID3D12CommandAllocator_Reset(c->allocator));
+  CHECK_HR(ID3D12Device_CreateCommandList(c->dev, 0, D3D12_COMMAND_LIST_TYPE_DIRECT, c->allocator, pso, &IID_ID3D12GraphicsCommandList, (void **)&l));
+  if (l) {
+    ID3D12GraphicsCommandList_OMSetRenderTargets(l, 1, &c->rtv, FALSE, NULL);
+    ID3D12GraphicsCommandList_ClearRenderTargetView(l, c->rtv, black, 0, NULL);
+    ID3D12GraphicsCommandList_RSSetViewports(l, 1, &vp);
+    ID3D12GraphicsCommandList_RSSetScissorRects(l, 1, &sc);
+    ID3D12GraphicsCommandList_SetGraphicsRootSignature(l, rs);
+    ID3D12GraphicsCommandList_SetDescriptorHeaps(l, 1, &heap);
+    ID3D12GraphicsCommandList_SetGraphicsRootDescriptorTable(l, 0, table);
+    ID3D12GraphicsCommandList_SetGraphicsRoot32BitConstants(l, 1, 16, kIdentity, 0);
+    ID3D12GraphicsCommandList_IASetPrimitiveTopology(l, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    ID3D12GraphicsCommandList_IASetVertexBuffers(l, 0, 1, &vbv);
+    ID3D12GraphicsCommandList_DrawInstanced(l, 6, 1, 0, 0);
+    scene_read_target(c, l);
+    scene_run(c, l);
+    ID3D12GraphicsCommandList_Release(l);
+    const UINT32 *px = NULL;
+    if (SUCCEEDED(ID3D12Resource_Map(c->readback, 0, NULL, (void **)&px)) && px) {
+      got = px[32 * 64 + 32];
+      ID3D12Resource_Unmap(c->readback, 0, NULL);
+    }
+  }
+  ID3D12Resource_Release(vb);
+  return got;
+}
+static D3D12_STATIC_SAMPLER_DESC static_point(D3D12_FILTER filter, D3D12_COMPARISON_FUNC func) {
+  D3D12_STATIC_SAMPLER_DESC s;
+  memset(&s, 0, sizeof s);
+  s.Filter = filter;
+  s.AddressU = s.AddressV = s.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+  s.ComparisonFunc = func;
+  s.MaxLOD = 1000.0f;
+  return s;
+}
+
+/* Depth views of every level and layer: an R32_TYPELESS depth buffer of 16 x 16, 12 slices (two cubes) and two levels, each subresource (level m, slice l) cleared through a depth view
+ * of it alone to (1 + 12 m + l) / 32; then read through shader resource views of a level and some slices (an array view from level 1, a slice of level 0 as a 2D texture), of a cube and
+ * of a cube array from level 1 (Sample: the red is the depth), and compared by GatherCmp of the cube array (ps_gather_cmp_cubearray: 0.5 <= depth on each of the four). */
+static float depth_value(UINT level, UINT layer) { return (float)(1 + 12 * level + layer) / 32.0f; }
+static void test_depth_views(Scene *c) {
+  ID3D12Device *dev = c->dev;
+  D3D12_HEAP_PROPERTIES defaults = {D3D12_HEAP_TYPE_DEFAULT, D3D12_CPU_PAGE_PROPERTY_UNKNOWN, D3D12_MEMORY_POOL_UNKNOWN, 1, 1};
+  const D3D12_RESOURCE_DESC dd = {D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, 16, 16, 12, 2, DXGI_FORMAT_R32_TYPELESS, {1, 0}, D3D12_TEXTURE_LAYOUT_UNKNOWN, D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL};
+  ID3D12Resource *depth = NULL;
+  CHECK_HR(ID3D12Device_CreateCommittedResource(dev, &defaults, D3D12_HEAP_FLAG_NONE, &dd, D3D12_RESOURCE_STATE_DEPTH_WRITE, NULL, &IID_ID3D12Resource, (void **)&depth));
+  D3D12_DESCRIPTOR_HEAP_DESC dsv_desc = {D3D12_DESCRIPTOR_HEAP_TYPE_DSV, 24, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
+  ID3D12DescriptorHeap *dsv_heap = NULL, *heap = view_heap(dev, 8, 1);
+  CHECK_HR(ID3D12Device_CreateDescriptorHeap(dev, &dsv_desc, &IID_ID3D12DescriptorHeap, (void **)&dsv_heap));
+  const D3D12_STATIC_SAMPLER_DESC point = static_point(D3D12_FILTER_MIN_MAG_MIP_POINT, D3D12_COMPARISON_FUNC_NEVER);
+  const D3D12_STATIC_SAMPLER_DESC less_equal = static_point(D3D12_FILTER_COMPARISON_MIN_MAG_MIP_POINT, D3D12_COMPARISON_FUNC_LESS_EQUAL);
+  ID3D12RootSignature *rs = shadow_signature(dev, 1, 0, &point, 1), *rs_cmp = shadow_signature(dev, 1, 0, &less_equal, 1);
+  ID3D12PipelineState *array = rs ? view_pipeline(c, rs, dx_ps_texarray_dxbc, sizeof dx_ps_texarray_dxbc) : NULL;
+  ID3D12PipelineState *slice = rs ? view_pipeline(c, rs, dx_ps_texslice_dxbc, sizeof dx_ps_texslice_dxbc) : NULL;
+  ID3D12PipelineState *cube = rs ? view_pipeline(c, rs, dx_ps_texcube_dxbc, sizeof dx_ps_texcube_dxbc) : NULL;
+  ID3D12PipelineState *cubes = rs ? view_pipeline(c, rs, dx_ps_texcubearray_dxbc, sizeof dx_ps_texcubearray_dxbc) : NULL;
+  ID3D12PipelineState *gather = rs_cmp ? view_pipeline(c, rs_cmp, dx_ps_gather_cmp_cubearray_dxbc, sizeof dx_ps_gather_cmp_cubearray_dxbc) : NULL;
+  if (!depth || !dsv_heap || !heap || !rs || !rs_cmp || !array || !slice || !cube || !cubes || !gather) { CHECK(0); return; }
+  /* each subresource cleared through a depth view of it alone */
+  ID3D12GraphicsCommandList *list = NULL;
+  CHECK_HR(ID3D12CommandAllocator_Reset(c->allocator));
+  CHECK_HR(ID3D12Device_CreateCommandList(dev, 0, D3D12_COMMAND_LIST_TYPE_DIRECT, c->allocator, NULL, &IID_ID3D12GraphicsCommandList, (void **)&list));
+  if (!list) return;
+  const UINT dsv_step = ID3D12Device_GetDescriptorHandleIncrementSize(dev, D3D12_DESCRIPTOR_HEAP_TYPE_DSV);
+  const D3D12_CPU_DESCRIPTOR_HANDLE dsv0 = ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(dsv_heap);
+  for (UINT m = 0; m < 2; ++m)
+    for (UINT l = 0; l < 12; ++l) {
+      D3D12_DEPTH_STENCIL_VIEW_DESC dv;
+      memset(&dv, 0, sizeof dv);
+      dv.Format = DXGI_FORMAT_D32_FLOAT;
+      dv.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2DARRAY;
+      dv.Texture2DArray.MipSlice = m, dv.Texture2DArray.FirstArraySlice = l, dv.Texture2DArray.ArraySize = 1;
+      const D3D12_CPU_DESCRIPTOR_HANDLE at = {dsv0.ptr + (SIZE_T)(m * 12 + l) * dsv_step};
+      ID3D12Device_CreateDepthStencilView(dev, depth, &dv, at);
+      ID3D12GraphicsCommandList_ClearDepthStencilView(list, at, D3D12_CLEAR_FLAG_DEPTH, depth_value(m, l), 0, 0, NULL);
+    }
+  shadow_transition(list, depth, D3D12_RESOURCE_STATE_DEPTH_WRITE, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+  scene_run(c, list);
+  ID3D12GraphicsCommandList_Release(list);
+  const UINT step = ID3D12Device_GetDescriptorHandleIncrementSize(dev, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+  const D3D12_CPU_DESCRIPTOR_HANDLE srv0 = ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(heap);
+  D3D12_SHADER_RESOURCE_VIEW_DESC sv;
+  memset(&sv, 0, sizeof sv);
+  sv.Format = DXGI_FORMAT_R32_FLOAT;
+  sv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+  /* 0: an array view of slices 3 .. 6 of level 1; 1: slice 7 of level 0 (a one-slice array view, read by a shader that declares a 2D texture); 2: the first cube at level 0; 3: the cube
+   * array from level 1 */
+  sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
+  sv.Texture2DArray.MostDetailedMip = 1, sv.Texture2DArray.MipLevels = 1, sv.Texture2DArray.FirstArraySlice = 3, sv.Texture2DArray.ArraySize = 4;
+  ID3D12Device_CreateShaderResourceView(dev, depth, &sv, srv0);
+  sv.Texture2DArray.MostDetailedMip = 0, sv.Texture2DArray.MipLevels = (UINT)-1, sv.Texture2DArray.FirstArraySlice = 7, sv.Texture2DArray.ArraySize = 1;
+  ID3D12Device_CreateShaderResourceView(dev, depth, &sv, (D3D12_CPU_DESCRIPTOR_HANDLE){srv0.ptr + step});
+  memset(&sv.Texture2DArray, 0, sizeof sv.Texture2DArray);
+  sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURECUBE;
+  sv.TextureCube.MipLevels = 1;
+  ID3D12Device_CreateShaderResourceView(dev, depth, &sv, (D3D12_CPU_DESCRIPTOR_HANDLE){srv0.ptr + 2 * step});
+  memset(&sv.TextureCube, 0, sizeof sv.TextureCube);
+  sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURECUBEARRAY;
+  sv.TextureCubeArray.MostDetailedMip = 1, sv.TextureCubeArray.MipLevels = 1, sv.TextureCubeArray.NumCubes = 2;
+  ID3D12Device_CreateShaderResourceView(dev, depth, &sv, (D3D12_CPU_DESCRIPTOR_HANDLE){srv0.ptr + 3 * step});
+  const UINT32 a = view_draw(c, array, rs, heap, heap_gpu(dev, heap, 0), 0.5f, 0.5f, 2, 1);           /* (layer 2 of the view: slice 5) */
+  const UINT32 b = view_draw(c, slice, rs, heap, heap_gpu(dev, heap, 1), 0.5f, 0.5f, 0, 1);
+  const UINT32 cu = view_draw(c, cube, rs, heap, heap_gpu(dev, heap, 2), 0.1f, -1, 0.1f, 1);         /* (-Y: face 3) */
+  const UINT32 ca = view_draw(c, cubes, rs, heap, heap_gpu(dev, heap, 3), 0.55f, 0.55f, 1, 0.1f);    /* (+Z of cube 1: slice 10) */
+  printf("depth views: level 1 slice 5 %08x, level 0 slice 7 %08x, cube face 3 %08x, cube array level 1 slice 10 %08x\n", (unsigned)a, (unsigned)b, (unsigned)cu, (unsigned)ca);
+  CHECK(px_red(a) == unorm8(depth_value(1, 5)) && px_green(a) == 0 && px_blue(a) == 0);
+  CHECK(px_red(b) == unorm8(depth_value(0, 7)));
+  CHECK(px_red(cu) == unorm8(depth_value(0, 3)));
+  CHECK(px_red(ca) == unorm8(depth_value(1, 10)));
+  /* GatherCmp of the cube array from level 1, 0.5 <= depth: +Z of cube 1 (slice 10: 23 / 32) passes, +X of cube 0 (slice 0: 13 / 32) does not */
+  const UINT32 pass = view_draw(c, gather, rs_cmp, heap, heap_gpu(dev, heap, 3), 0.55f, 0.55f, 1, 0.1f), fail = view_draw(c, gather, rs_cmp, heap, heap_gpu(dev, heap, 3), 1, 0.55f, 0.55f, 0);
+  printf("depth views: GatherCmp of a cube array %08x (passes) %08x (fails)\n", (unsigned)pass, (unsigned)fail);
+  CHECK(pass == 0xFFFFFFFFu && fail == 0);
+  ID3D12PipelineState *all[] = {gather, cubes, cube, slice, array};
+  for (UINT i = 0; i < sizeof all / sizeof all[0]; ++i) ID3D12PipelineState_Release(all[i]);
+  ID3D12RootSignature_Release(rs_cmp);
+  ID3D12RootSignature_Release(rs);
+  ID3D12DescriptorHeap_Release(heap);
+  ID3D12DescriptorHeap_Release(dsv_heap);
+  ID3D12Resource_Release(depth);
+}
+
+/* ---- copies of depth buffers and multisampled images ---------------------------------------------------------------------------------------------------------------------- */
+
+/* A depth buffer of `format` (a typeless one, with ALLOW_DEPTH_STENCIL), 16 x 16, `layers` slices and `mips` levels, each subresource (level m, slice l) cleared through a depth view of it
+ * alone to depth_value(m, l) and the stencil 10 * m + l + 1. */
+static ID3D12Resource *cleared_depth(Scene *c, DXGI_FORMAT format, DXGI_FORMAT dsv_format, UINT layers, UINT mips, int stencil) {
+  ID3D12Device *dev = c->dev;
+  D3D12_HEAP_PROPERTIES defaults = {D3D12_HEAP_TYPE_DEFAULT, D3D12_CPU_PAGE_PROPERTY_UNKNOWN, D3D12_MEMORY_POOL_UNKNOWN, 1, 1};
+  const D3D12_RESOURCE_DESC dd = {D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, 16, 16, (UINT16)layers, (UINT16)mips, format, {1, 0}, D3D12_TEXTURE_LAYOUT_UNKNOWN, D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL};
+  ID3D12Resource *depth = NULL;
+  CHECK_HR(ID3D12Device_CreateCommittedResource(dev, &defaults, D3D12_HEAP_FLAG_NONE, &dd, D3D12_RESOURCE_STATE_DEPTH_WRITE, NULL, &IID_ID3D12Resource, (void **)&depth));
+  D3D12_DESCRIPTOR_HEAP_DESC dsv_desc = {D3D12_DESCRIPTOR_HEAP_TYPE_DSV, 16, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
+  ID3D12DescriptorHeap *dsv_heap = NULL;
+  CHECK_HR(ID3D12Device_CreateDescriptorHeap(dev, &dsv_desc, &IID_ID3D12DescriptorHeap, (void **)&dsv_heap));
+  ID3D12GraphicsCommandList *list = NULL;
+  CHECK_HR(ID3D12CommandAllocator_Reset(c->allocator));
+  CHECK_HR(ID3D12Device_CreateCommandList(dev, 0, D3D12_COMMAND_LIST_TYPE_DIRECT, c->allocator, NULL, &IID_ID3D12GraphicsCommandList, (void **)&list));
+  if (!depth || !dsv_heap || !list) {
+    CHECK(0);
+    if (list) ID3D12GraphicsCommandList_Release(list);
+    if (dsv_heap) ID3D12DescriptorHeap_Release(dsv_heap);
+    return depth;
+  }
+  const UINT dsv_step = ID3D12Device_GetDescriptorHandleIncrementSize(dev, D3D12_DESCRIPTOR_HEAP_TYPE_DSV);
+  const D3D12_CPU_DESCRIPTOR_HANDLE dsv0 = ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(dsv_heap);
+  for (UINT m = 0; m < mips; ++m)
+    for (UINT l = 0; l < layers; ++l) {
+      D3D12_DEPTH_STENCIL_VIEW_DESC dv;
+      memset(&dv, 0, sizeof dv);
+      dv.Format = dsv_format;
+      dv.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2DARRAY;
+      dv.Texture2DArray.MipSlice = m, dv.Texture2DArray.FirstArraySlice = l, dv.Texture2DArray.ArraySize = 1;
+      const D3D12_CPU_DESCRIPTOR_HANDLE at = {dsv0.ptr + (SIZE_T)(m * layers + l) * dsv_step};
+      ID3D12Device_CreateDepthStencilView(dev, depth, &dv, at);
+      ID3D12GraphicsCommandList_ClearDepthStencilView(list, at, D3D12_CLEAR_FLAG_DEPTH | (stencil ? D3D12_CLEAR_FLAG_STENCIL : 0), depth_value(m, l), (UINT8)(10 * m + l + 1), 0, NULL);
+    }
+  shadow_transition(list, depth, D3D12_RESOURCE_STATE_DEPTH_WRITE, D3D12_RESOURCE_STATE_COPY_SOURCE);
+  scene_run(c, list);
+  ID3D12GraphicsCommandList_Release(list);
+  ID3D12DescriptorHeap_Release(dsv_heap);
+  return depth;
+}
+static UINT32 unorm24(float v) { return (UINT32)((double)v * 16777215.0 + 0.5); }
+/* Runs one copy list made by `record` (a CopyResource or CopyTextureRegion of the two). */
+static void copy_run(Scene *c, ID3D12Resource *to, ID3D12Resource *from, const D3D12_TEXTURE_COPY_LOCATION *dst, const D3D12_TEXTURE_COPY_LOCATION *src, const D3D12_BOX *box) {
+  ID3D12GraphicsCommandList *list = NULL;
+  CHECK_HR(ID3D12CommandAllocator_Reset(c->allocator));
+  CHECK_HR(ID3D12Device_CreateCommandList(c->dev, 0, D3D12_COMMAND_LIST_TYPE_DIRECT, c->allocator, NULL, &IID_ID3D12GraphicsCommandList, (void **)&list));
+  if (!list) return;
+  if (dst) ID3D12GraphicsCommandList_CopyTextureRegion(list, dst, 0, 0, 0, src, box);
+  else ID3D12GraphicsCommandList_CopyResource(list, to, from);
+  scene_run(c, list);
+  ID3D12GraphicsCommandList_Release(list);
+}
+
+/* Copies of depth buffers: their footprints (a D24S8 buffer's two planes, the depth as 32-bit words and the stencil as bytes), each plane of a subresource into a buffer and back
+ * (CopyTextureRegion), a whole buffer into another (CopyResource), one plane of a subresource into another's (the other plane keeps what it had), the floats of a D32 buffer and the
+ * 16-bit codes of a D16 one; a copy of part of a subresource is not made; and multisampled images copied whole (CopyResource), then resolved. */
+static void test_depth_copies(Scene *c) {
+  ID3D12Device *dev = c->dev;
+  /* (the footprints of a D24S8 buffer of two levels and two slices: eight subresources, plane 0 four bytes a texel, plane 1 one) */
+  const D3D12_RESOURCE_DESC dd = {D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, 16, 16, 2, 2, DXGI_FORMAT_R24G8_TYPELESS, {1, 0}, D3D12_TEXTURE_LAYOUT_UNKNOWN, D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL};
+  D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp[8];
+  UINT rows[8];
+  UINT64 row_bytes[8], total = 0;
+  ID3D12Device_GetCopyableFootprints(dev, &dd, 0, 8, 0, fp, rows, row_bytes, &total);
+  printf("depth copies: footprints plane 0 %u (%u bytes a row), plane 1 %u (%u bytes a row), %u bytes in all\n", (unsigned)fp[0].Footprint.Format, (unsigned)row_bytes[0],
+         (unsigned)fp[4].Footprint.Format, (unsigned)row_bytes[4], (unsigned)total);
+  CHECK(fp[0].Footprint.Format == DXGI_FORMAT_R32_TYPELESS && row_bytes[0] == 64 && fp[1].Footprint.Width == 8 && fp[4].Footprint.Format == DXGI_FORMAT_R8_TYPELESS && row_bytes[4] == 16 &&
+        rows[4] == 16 && fp[4].Offset > fp[3].Offset);
+  D3D12_FEATURE_DATA_FORMAT_INFO info = {DXGI_FORMAT_R24G8_TYPELESS, 0};
+  CHECK(SUCCEEDED(ID3D12Device_CheckFeatureSupport(dev, D3D12_FEATURE_FORMAT_INFO, &info, sizeof info)) && info.PlaneCount == 2);
+  ID3D12Resource *a = cleared_depth(c, DXGI_FORMAT_R24G8_TYPELESS, DXGI_FORMAT_D24_UNORM_S8_UINT, 2, 2, 1);
+  ID3D12Resource *b = cleared_depth(c, DXGI_FORMAT_R24G8_TYPELESS, DXGI_FORMAT_D24_UNORM_S8_UINT, 2, 2, 1);
+  if (!a || !b) return;
+  /* each plane of level 1 slice 1 (subresource 3; its stencil 7) */
+  static UINT32 words[16 * 16];
+  static BYTE bytes[16 * 16];
+  int wrong = 0;
+  CHECK(texture_read(c, a, 3, words, 4) && texture_read(c, a, 7, bytes, 1));
+  for (UINT i = 0; i < 64; ++i) wrong += words[i] != unorm24(depth_value(1, 1)) || bytes[i] != 12;
+  printf("depth copies: level 1 slice 1 depth %06x (want %06x) stencil %u\n", (unsigned)words[0], (unsigned)unorm24(depth_value(1, 1)), bytes[0]);
+  CHECK(wrong == 0);
+  /* a gradient into the depth of level 0 slice 0 of b; its stencil stays */
+  for (UINT i = 0; i < 256; ++i) words[i] = i * 65793u;      /* (0 .. 0xFFFFFF over the texels) */
+  texture_write(c, b, 0, words, 4);
+  static UINT32 back[16 * 16];
+  CHECK(texture_read(c, b, 0, back, 4) && texture_read(c, b, 4, bytes, 1));
+  wrong = 0;
+  for (UINT i = 0; i < 256; ++i) wrong += back[i] != words[i] || bytes[i] != 1;
+  printf("depth copies: written depth %06x %06x, the stencil %u\n", (unsigned)back[1], (unsigned)back[255], bytes[0]);
+  CHECK(wrong == 0);
+  /* CopyResource a -> b: every plane of every subresource */
+  copy_run(c, b, a, NULL, NULL, NULL);
+  CHECK(texture_read(c, b, 0, back, 4) && texture_read(c, b, 6, bytes, 1));
+  wrong = 0;
+  for (UINT i = 0; i < 256; ++i) wrong += back[i] != unorm24(depth_value(0, 0)) || bytes[i] != 2;
+  printf("depth copies: CopyResource %06x, stencil of level 0 slice 1 %u\n", (unsigned)back[0], bytes[0]);
+  CHECK(wrong == 0);
+  /* the stencil plane of level 0 slice 1 of a into a fresh buffer's (subresource 6 of both); its depth stays as it was cleared */
+  ID3D12Resource *fresh = cleared_depth(c, DXGI_FORMAT_R24G8_TYPELESS, DXGI_FORMAT_D24_UNORM_S8_UINT, 2, 2, 0);
+  if (fresh) {
+    D3D12_TEXTURE_COPY_LOCATION to, from;
+    memset(&to, 0, sizeof to);
+    memset(&from, 0, sizeof from);
+    to.pResource = fresh, to.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, to.SubresourceIndex = 6;
+    from.pResource = a, from.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, from.SubresourceIndex = 6;
+    copy_run(c, NULL, NULL, &to, &from, NULL);
+    /* (part of a subresource is not copied: the box of half of level 0 slice 0's depth) */
+    const D3D12_BOX half = {0, 0, 0, 8, 16, 1};
+    to.SubresourceIndex = from.SubresourceIndex = 0;
+    copy_run(c, NULL, NULL, &to, &from, &half);
+    CHECK(texture_read(c, fresh, 6, bytes, 1) && texture_read(c, fresh, 2, words, 4) && texture_read(c, fresh, 0, back, 4));
+    printf("depth copies: the stencil plane alone %u, the depth there %06x, after a part copy %06x\n", bytes[0], (unsigned)words[0], (unsigned)back[0]);
+    CHECK(bytes[0] == 2 && bytes[255] == 2 && words[0] == unorm24(depth_value(0, 1)) && back[0] == unorm24(depth_value(0, 0)) && back[100] == unorm24(depth_value(0, 0)));
+    ID3D12Resource_Release(fresh);
+  }
+  ID3D12Resource_Release(b);
+  ID3D12Resource_Release(a);
+  /* a D32 buffer's floats and a D16 buffer's codes */
+  ID3D12Resource *f32 = cleared_depth(c, DXGI_FORMAT_R32_TYPELESS, DXGI_FORMAT_D32_FLOAT, 1, 1, 0), *u16 = cleared_depth(c, DXGI_FORMAT_R16_TYPELESS, DXGI_FORMAT_D16_UNORM, 1, 1, 0);
+  if (f32 && u16) {
+    float floats[256];
+    UINT16 codes[256];
+    CHECK(texture_read(c, f32, 0, floats, 4) && texture_read(c, u16, 0, codes, 2));
+    printf("depth copies: D32 %g, D16 %u\n", floats[0], codes[0]);
+    CHECK(floats[0] == depth_value(0, 0) && floats[255] == depth_value(0, 0) && codes[0] == unorm16(depth_value(0, 0)));
+  }
+  if (f32) ID3D12Resource_Release(f32);
+  if (u16) ID3D12Resource_Release(u16);
+
+  /* multisampled images: a 4x render target cleared to green copied whole into another, which is then resolved */
+  D3D12_HEAP_PROPERTIES defaults = {D3D12_HEAP_TYPE_DEFAULT, D3D12_CPU_PAGE_PROPERTY_UNKNOWN, D3D12_MEMORY_POOL_UNKNOWN, 1, 1};
+  D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS q = {DXGI_FORMAT_B8G8R8A8_UNORM, 4, D3D12_MULTISAMPLE_QUALITY_LEVELS_FLAG_NONE, 0};
+  if (FAILED(ID3D12Device_CheckFeatureSupport(dev, D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS, &q, sizeof q)) || !q.NumQualityLevels) return;
+  const D3D12_RESOURCE_DESC md = {D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, 16, 16, 1, 1, DXGI_FORMAT_B8G8R8A8_UNORM, {4, 0}, D3D12_TEXTURE_LAYOUT_UNKNOWN, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET};
+  const D3D12_RESOURCE_DESC pd = {D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, 16, 16, 1, 1, DXGI_FORMAT_B8G8R8A8_UNORM, {1, 0}, D3D12_TEXTURE_LAYOUT_UNKNOWN, D3D12_RESOURCE_FLAG_NONE};
+  ID3D12Resource *ms_a = NULL, *ms_b = NULL, *plain = NULL;
+  CHECK_HR(ID3D12Device_CreateCommittedResource(dev, &defaults, D3D12_HEAP_FLAG_NONE, &md, D3D12_RESOURCE_STATE_RENDER_TARGET, NULL, &IID_ID3D12Resource, (void **)&ms_a));
+  CHECK_HR(ID3D12Device_CreateCommittedResource(dev, &defaults, D3D12_HEAP_FLAG_NONE, &md, D3D12_RESOURCE_STATE_RENDER_TARGET, NULL, &IID_ID3D12Resource, (void **)&ms_b));
+  CHECK_HR(ID3D12Device_CreateCommittedResource(dev, &defaults, D3D12_HEAP_FLAG_NONE, &pd, D3D12_RESOURCE_STATE_COMMON, NULL, &IID_ID3D12Resource, (void **)&plain));
+  D3D12_DESCRIPTOR_HEAP_DESC rtv_desc = {D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 2, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
+  ID3D12DescriptorHeap *rtv_heap = NULL;
+  CHECK_HR(ID3D12Device_CreateDescriptorHeap(dev, &rtv_desc, &IID_ID3D12DescriptorHeap, (void **)&rtv_heap));
+  ID3D12GraphicsCommandList *list = NULL;
+  CHECK_HR(ID3D12CommandAllocator_Reset(c->allocator));
+  CHECK_HR(ID3D12Device_CreateCommandList(dev, 0, D3D12_COMMAND_LIST_TYPE_DIRECT, c->allocator, NULL, &IID_ID3D12GraphicsCommandList, (void **)&list));
+  if (ms_a && ms_b && plain && rtv_heap && list) {
+    const D3D12_CPU_DESCRIPTOR_HANDLE rtv = ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(rtv_heap), rtv_b = {rtv.ptr + ID3D12Device_GetDescriptorHandleIncrementSize(dev, D3D12_DESCRIPTOR_HEAP_TYPE_RTV)};
+    ID3D12Device_CreateRenderTargetView(dev, ms_a, NULL, rtv);
+    ID3D12Device_CreateRenderTargetView(dev, ms_b, NULL, rtv_b);
+    const float green[4] = {0, 1, 0, 1}, red[4] = {1, 0, 0, 1};
+    ID3D12GraphicsCommandList_ClearRenderTargetView(list, rtv, green, 0, NULL);
+    ID3D12GraphicsCommandList_ClearRenderTargetView(list, rtv_b, red, 0, NULL);
+    ID3D12GraphicsCommandList_CopyResource(list, ms_b, ms_a);
+    ID3D12GraphicsCommandList_ResolveSubresource(list, plain, 0, ms_b, 0, DXGI_FORMAT_B8G8R8A8_UNORM);
+    scene_run(c, list);
+    UINT32 resolved[256];
+    CHECK(texture_read(c, plain, 0, resolved, 4));
+    printf("depth copies: a multisampled image copied whole, resolved %08x\n", (unsigned)resolved[0]);
+    CHECK(resolved[0] == 0xFF00FF00u && resolved[255] == 0xFF00FF00u);
+  } else {
+    CHECK(0);
+  }
+  if (list) ID3D12GraphicsCommandList_Release(list);
+  if (rtv_heap) ID3D12DescriptorHeap_Release(rtv_heap);
+  if (plain) ID3D12Resource_Release(plain);
+  if (ms_b) ID3D12Resource_Release(ms_b);
+  if (ms_a) ID3D12Resource_Release(ms_a);
+}
+
+/* ResourceMinLODClamp: a texture of 16 x 16 and three levels, each one grey (255, 128, 0), sampled where the coordinates do not change (level 0 of the view): with no clamp level 0,
+ * with a clamp of 1 level 1; the clamp counts the resource's levels, so a view from level 1 with a clamp of 2 reads level 2 (its second) and one of 0.5 its first; a clamp past a
+ * view's last level reads that level; a clamp of 1.5 with a linear mip filter blends levels 1 and 2. */
+static void test_min_lod_clamp(Scene *c) {
+  ID3D12Device *dev = c->dev;
+  D3D12_HEAP_PROPERTIES defaults = {D3D12_HEAP_TYPE_DEFAULT, D3D12_CPU_PAGE_PROPERTY_UNKNOWN, D3D12_MEMORY_POOL_UNKNOWN, 1, 1};
+  const D3D12_RESOURCE_DESC td = {D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, 16, 16, 1, 3, DXGI_FORMAT_B8G8R8A8_UNORM, {1, 0}, D3D12_TEXTURE_LAYOUT_UNKNOWN, D3D12_RESOURCE_FLAG_NONE};
+  ID3D12Resource *tex = NULL;
+  CHECK_HR(ID3D12Device_CreateCommittedResource(dev, &defaults, D3D12_HEAP_FLAG_NONE, &td, D3D12_RESOURCE_STATE_COMMON, NULL, &IID_ID3D12Resource, (void **)&tex));
+  ID3D12DescriptorHeap *heap = view_heap(dev, 8, 1);
+  const D3D12_STATIC_SAMPLER_DESC point = static_point(D3D12_FILTER_MIN_MAG_MIP_POINT, D3D12_COMPARISON_FUNC_NEVER), linear = static_point(D3D12_FILTER_MIN_MAG_MIP_LINEAR, D3D12_COMPARISON_FUNC_NEVER);
+  ID3D12RootSignature *rs = shadow_signature(dev, 1, 0, &point, 1), *rs_linear = shadow_signature(dev, 1, 0, &linear, 1);
+  ID3D12PipelineState *pso = rs ? view_pipeline(c, rs, dx_ps_texslice_dxbc, sizeof dx_ps_texslice_dxbc) : NULL;
+  ID3D12PipelineState *pso_linear = rs_linear ? view_pipeline(c, rs_linear, dx_ps_texslice_dxbc, sizeof dx_ps_texslice_dxbc) : NULL;
+  if (!tex || !heap || !rs || !rs_linear || !pso || !pso_linear) { CHECK(0); return; }
+  static UINT32 texels[16 * 16];
+  const BYTE shades[3] = {255, 128, 0};
+  for (UINT m = 0; m < 3; ++m) {
+    for (UINT i = 0; i < 256; ++i) texels[i] = 0xFF000000u | shades[m] * 0x010101u;
+    texture_write(c, tex, m, texels, 4);
+  }
+  const UINT step = ID3D12Device_GetDescriptorHandleIncrementSize(dev, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+  const D3D12_CPU_DESCRIPTOR_HANDLE srv0 = ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(heap);
+  /* the views: most detailed level, levels, clamp, the linear sampler, the grey */
+  static const struct { UINT first, levels; float clamp; int linear; BYTE want; } cases[] = {
+      {0, (UINT)-1, 0.0f, 0, 255}, {0, (UINT)-1, 1.0f, 0, 128}, {1, (UINT)-1, 2.0f, 0, 0}, {1, (UINT)-1, 0.5f, 0, 128}, {0, 2, 7.0f, 0, 128}, {0, (UINT)-1, 1.5f, 1, 64}};
+  for (UINT i = 0; i < sizeof cases / sizeof cases[0]; ++i) {
+    D3D12_SHADER_RESOURCE_VIEW_DESC sv;
+    memset(&sv, 0, sizeof sv);
+    sv.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    sv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    sv.Texture2D.MostDetailedMip = cases[i].first, sv.Texture2D.MipLevels = cases[i].levels, sv.Texture2D.ResourceMinLODClamp = cases[i].clamp;
+    ID3D12Device_CreateShaderResourceView(dev, tex, &sv, (D3D12_CPU_DESCRIPTOR_HANDLE){srv0.ptr + i * step});
+    const UINT32 got = cases[i].linear ? view_draw(c, pso_linear, rs_linear, heap, heap_gpu(dev, heap, i), 0.5f, 0.5f, 0, 1) : view_draw(c, pso, rs, heap, heap_gpu(dev, heap, i), 0.5f, 0.5f, 0, 1);
+    printf("ResourceMinLODClamp %g of a view from level %u: %08x (want grey %u)\n", cases[i].clamp, cases[i].first, (unsigned)got, cases[i].want);
+    CHECK(shadow_near((UINT)px_red(got), cases[i].want, cases[i].linear ? 3 : 0) && px_green(got) == px_red(got));
+  }
+  ID3D12PipelineState_Release(pso_linear);
+  ID3D12PipelineState_Release(pso);
+  ID3D12RootSignature_Release(rs_linear);
+  ID3D12RootSignature_Release(rs);
+  ID3D12DescriptorHeap_Release(heap);
+  ID3D12Resource_Release(tex);
+}
+
 /* A draw of the whole target with vs_vol (its texture coordinate is the vertex colour: (u, v, w) and alpha `a` everywhere) and `ps`, sampling `tex` through `view` (point
  * filtering, the levels by the nearest); the colour of the target's middle. 0xDEADDEAD when the draw could not be made. */
 static UINT32 ml_draw(Scene *c, const void *ps, SIZE_T ps_bytes, ID3D12Resource *tex, const D3D12_SHADER_RESOURCE_VIEW_DESC *view, float u, float v, float w, float a) {
@@ -6339,6 +6803,7 @@ static void test_extras(ID3D12Device *dev, ID3D12CommandQueue *queue, ID3D12Fenc
   test_cpu_planar(&c);
   test_packed_yuv(&c);
   test_texture_uavs(&c);
+  test_narrow_volume_uavs(&c);
   test_typed_buffers(&c);
   test_counters(&c);
   test_uav_only_draws(&c);
@@ -6346,6 +6811,9 @@ static void test_extras(ID3D12Device *dev, ID3D12CommandQueue *queue, ID3D12Fenc
   test_layers(&c);
   test_plane_uavs(&c);
   test_shadow_maps(&c);
+  test_depth_views(&c);
+  test_depth_copies(&c);
+  test_min_lod_clamp(&c);
   test_mip_layers(&c);
   test_formats(&c);
 }

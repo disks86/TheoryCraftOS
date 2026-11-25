@@ -1488,13 +1488,17 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
         if (resource.components == 2)
           for (uint32_t k = 0; k < 4; ++k) ins.tex_swizzle[k] = resource.swizzle[k];
       } else if (gather_op) {
-        // The component to gather is the resource operand's single selected one (gather4_c always compares the red); the footprint may be offset in texels (a register, or the extended opcode token's
-        // constant) on 2D textures and arrays; the comparison (reference <= texel) is of the texels one by one. A volume has no gather.
+        // The component to gather is the one the sampler operand selects (fxc's and Wine's `s0.z` of GatherBlue: a four-component sampler of select_1) through the resource operand's
+        // swizzle - or the resource operand's first when the sampler has no components, as the DXIL translator writes it (gather4_c always compares the red); the footprint may be offset in texels (a register, or the extended opcode token's
+        // constant) on 2D textures and arrays; the comparison (reference <= texel) is of the texels one by one. A volume has no gather; a cube and a cube array (the cube in the
+        // coordinate's w) have no offsets (Direct3D's gather4_po and offsets are of 2D resources).
         const graphics::TextureKind kind = program->texture_kind_[unit];
         const bool compare = opcode == 126 || opcode == 128, programmable = opcode == 127 || opcode == 128, offset_static = sample_offset[0] || sample_offset[1];
-        if ((kind != graphics::TextureKind::Texture2D && kind != graphics::TextureKind::Texture2DArray && kind != graphics::TextureKind::TextureCube) || resource.components != 2) return status::kNotSupported;
-        if ((programmable || offset_static) && kind == graphics::TextureKind::TextureCube) return status::kNotSupported;
-        ins.control = static_cast<uint8_t>((compare ? 0 : resource.swizzle[0]) | (compare ? 4 : 0) | (programmable ? 8 : 0) | (offset_static ? 16 : 0));
+        const bool cube_kind = kind == graphics::TextureKind::TextureCube || kind == graphics::TextureKind::TextureCubeArray;
+        if ((kind != graphics::TextureKind::Texture2D && kind != graphics::TextureKind::Texture2DArray && !cube_kind) || resource.components != 2) return status::kNotSupported;
+        if ((programmable || offset_static) && cube_kind) return status::kNotSupported;
+        const uint8_t channel = resource.swizzle[sampler.components == 2 ? sampler.swizzle[0] & 3 : 0];
+        ins.control = static_cast<uint8_t>((compare ? 0 : channel) | (compare ? 4 : 0) | (programmable ? 8 : 0) | (offset_static ? 16 : 0));
         if (compare) program->compare_units_ |= 1u << unit;
         uint32_t next = 2;
         if (programmable) {

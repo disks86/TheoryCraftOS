@@ -1204,12 +1204,16 @@ class Adapter::StreamRunner {
   NtStatus copy_region(ByteReader& p) {
     const uint32_t di = p.le32(), dx = p.le32(), dy = p.le32(), si = p.le32(), sx = p.le32(), sy = p.le32(), w = p.le32(), h = p.le32();
     // (optionally: the destination's level and first layer, the source's, and the number of layers - a volume's slices - from them)
-    uint32_t dst_level = 0, dst_layer = 0, src_level = 0, src_layer = 0, layers = 1;
+    uint32_t dst_level = 0, dst_layer = 0, src_level = 0, src_layer = 0, layers = 1, planes = 0;
     if (p.ok() && !p.at_end()) dst_level = p.le32(), dst_layer = p.le32(), src_level = p.le32(), src_layer = p.le32(), layers = p.le32();
-    if (!exact(p) || in_pass_ || w == 0 || h == 0 || layers == 0) return kBad;
+    if (p.ok() && !p.at_end()) planes = p.le32();   // (and after them the planes of a depth buffer)
+    if (!exact(p) || in_pass_ || w == 0 || h == 0 || layers == 0 || planes > 3) return kBad;
     Allocation* dst = alloc(di);
     Allocation* src = alloc(si);
-    if (!dst || !src || !dst->is_image() || !src->is_image() || dst->is_depth() || src->is_depth() || !use(dst, state::kCopyDest) || !use(src, state::kCopySource)) return kBad;
+    if (!dst || !src || !dst->is_image() || !src->is_image() || dst->is_depth() != src->is_depth() || !use(dst, state::kCopyDest) || !use(src, state::kCopySource)) return kBad;
+    if (dst->is_depth() || dst->desc().samples != 1 || src->desc().samples != 1)
+      return copy_device_subresources(dst, dst_level, dst_layer, src, src_level, src_layer, layers, w, h, dx, dy, sx, sy, planes);
+    if (planes) return kBad;   // (planes are a depth buffer's)
     // (formats whose pixels - or blocks - are the same bytes: one format, or two of one size and kind - what Direct3D's copies between the formats of one typeless group are)
     const Format df = dst->desc().format, sf = src->desc().format;
     if (df != sf && (is_compressed(df) != is_compressed(sf) || image_row_bytes(df, 4) != image_row_bytes(sf, 4))) return kBad;
@@ -1232,6 +1236,113 @@ class Adapter::StreamRunner {
     unbind_textures_of(dst);
     return s;
   }
+
+  // CopyRegion of depth buffers and multisampled images, whose contents the device alone keeps (kFeature2DepthCopies): whole subresources - the rectangle is all of the destination's level
+  // at 0, 0, and the source's level is that size - between images of one format and sample count, `layers` layers from each first one, the planes of a depth buffer asked for (0: all
+  // it has).
+  NtStatus copy_device_subresources(Allocation* dst, uint32_t dst_level, uint32_t dst_layer, Allocation* src, uint32_t src_level, uint32_t src_layer, uint32_t layers, uint32_t w, uint32_t h,
+                                    uint32_t dx, uint32_t dy, uint32_t sx, uint32_t sy, uint32_t planes) {
+    if (!(adapter_.caps_.features2 & graphics::kFeature2DepthCopies)) return kBad;
+    const AllocationDesc &dd = dst->desc(), &sd = src->desc();
+    if (dd.format != sd.format || dd.samples != sd.samples || dst->is_staging() || src->is_staging() || dst_level >= dst->mip_levels() || src_level >= src->mip_levels()) return kBad;
+    const uint32_t width = graphics::mip_extent(dd.width, dst_level), height = graphics::mip_extent(dd.height, dst_level);
+    if (dx || dy || sx || sy || w != width || h != height || graphics::mip_extent(sd.width, src_level) != width || graphics::mip_extent(sd.height, src_level) != height) return kBad;
+    if (dst_layer >= dst->level_layers(dst_level) || layers > dst->level_layers(dst_level) - dst_layer || src_layer >= src->level_layers(src_level) || layers > src->level_layers(src_level) - src_layer)
+      return kBad;
+    // (the planes: a depth buffer's depth, and the stencil of one that has it; a colour image's one)
+    const bool stencil = dd.format == Format::D24S8;
+    if (planes == 0) planes = dst->is_depth() && stencil ? 3u : 1u;
+    if ((planes & 2) && !stencil) return kBad;
+    if (!dst->is_depth() && planes != 1) return kBad;
+    if (dst == src && dst_level == src_level && dst_layer < src_layer + layers && src_layer < dst_layer + layers && dst_layer != src_layer) return kBad;   // (overlapping layers of one level)
+    if (!exec_) return status::kSuccess;
+    NtStatus s = flush();
+    if (s == status::kSuccess) s = resident(*dst);
+    if (s == status::kSuccess) s = resident(*src);
+    if (s != status::kSuccess) return s;
+    for (uint32_t k = 0; k < layers; ++k)
+      if (!dst->image()->copy_subresource(*src->image(), dst_level, dst_layer + k, src_level, src_layer + k, planes)) return status::kInvalidDeviceState;
+    mm_.note_gpu_write(*dst);
+    unbind_textures_of(dst);
+    return status::kSuccess;
+  }
+
+  // CopyBufferImage of a depth buffer of one sample (kFeature2DepthCopies): a rectangle of a level's layer, one plane - the depth as floats or 16- / 24-bit codes, or the stencil as bytes
+  // (`layout`) -, rows `pitch` bytes apart in the buffer from `boff`. Into the image the rest of the plane, and the other plane, keep what they had.
+  NtStatus copy_depth_buffer_image(uint32_t direction, Allocation* image, uint32_t level, uint32_t layer, uint32_t x, uint32_t y, uint32_t w, uint32_t h, Allocation* buffer, uint32_t boff,
+                                   uint32_t pitch, NarrowLayout layout) {
+    if (!(adapter_.caps_.features2 & graphics::kFeature2DepthCopies) || !is_depth_layout(layout)) return kBad;
+    const bool stencil_plane = layout == NarrowLayout::Stencil8;
+    if (stencil_plane && image->desc().format != Format::D24S8) return kBad;
+    if (level >= image->mip_levels() || layer >= image->level_layers(level)) return kBad;
+    const uint32_t level_w = graphics::mip_extent(image->desc().width, level), level_h = graphics::mip_extent(image->desc().height, level);
+    if (uint64_t{x} + w > level_w || uint64_t{y} + h > level_h) return kBad;
+    const uint32_t texel = narrow_pixel_bytes(layout);
+    if (pitch < uint64_t{w} * texel || uint64_t{boff} + uint64_t{pitch} * (h - 1) + uint64_t{w} * texel > buffer->desc().size) return kBad;
+    if (!exec_) return status::kSuccess;
+    NtStatus s = flush();
+    if (s == status::kSuccess) s = resident(*image);
+    if (s != status::kSuccess) return s;
+    if (!mm_.read_back(*buffer)) return status::kInvalidDeviceState;
+    // (the whole plane of the subresource: read, changed in the rectangle - or copied out of it -, written back)
+    const uint64_t count = uint64_t{level_w} * level_h;
+    PlaneScratch scratch(adapter_.allocator_, stencil_plane ? 0 : count, stencil_plane ? count : 0);
+    if (scratch.depth.size() + scratch.stencil.size() != count) return status::kNoMemory;
+    graphics::IImage* device_image = image->image();
+    if (!device_image->read_depth_subresource(level, layer, scratch.depth, scratch.stencil)) return status::kInvalidDeviceState;
+    const bool to_image = direction == 0;
+    ByteView bytes = buffer->writable_backing();
+    for (uint32_t row = 0; row < h; ++row) {
+      ByteView line;
+      if (!bytes.try_subview(uint64_t{boff} + uint64_t{pitch} * row, uint64_t{w} * texel, &line)) return status::kInvalidDeviceState;
+      for (uint32_t i = 0; i < w; ++i) {
+        const uint64_t at = uint64_t{y + row} * level_w + x + i;
+        ByteView cell = line.subview(uint64_t{i} * texel, texel);
+        if (stencil_plane) {
+          if (to_image) scratch.stencil[at] = cell[0];
+          else cell[0] = scratch.stencil[at];
+          continue;
+        }
+        if (to_image) {
+          ByteReader in{ConstByteView(cell)};
+          const uint32_t code = layout == NarrowLayout::DepthUnorm16 ? in.le16() : in.le32();
+          scratch.depth[at] = layout == NarrowLayout::DepthFloat32 ? bits_float(code)
+                              : layout == NarrowLayout::DepthUnorm16 ? static_cast<float>(code) / 65535.0f : static_cast<float>(static_cast<double>(code & 0xFFFFFFu) / 16777215.0);
+        } else {
+          ByteWriter out{cell};
+          const float d = scratch.depth[at];
+          const float v = !(d == d) ? 0.0f : d < 0.0f ? 0.0f : d > 1.0f ? 1.0f : d;
+          if (layout == NarrowLayout::DepthFloat32) out.le32(__builtin_bit_cast(uint32_t, d));
+          else if (layout == NarrowLayout::DepthUnorm16) out.le16(static_cast<uint16_t>(v * 65535.0f + 0.5f));
+          else out.le32(static_cast<uint32_t>(static_cast<double>(v) * 16777215.0 + 0.5));   // (the high byte 0)
+        }
+      }
+    }
+    if (to_image) {
+      if (!device_image->write_depth_subresource(level, layer, scratch.depth, scratch.stencil)) return status::kInvalidDeviceState;
+      mm_.note_gpu_write(*image);
+      unbind_textures_of(image);
+    } else {
+      mm_.note_cpu_write(*buffer);
+    }
+    return status::kSuccess;
+  }
+  // The planes of a depth subresource while a copy works on them (one of the two, the other empty), given back when it goes.
+  struct PlaneScratch {
+    PlaneScratch(allocators::IAllocator& a, uint64_t depth_count, uint64_t stencil_count) : allocator(a) {
+      if (depth_count) depth = allocate_view<float>(a, depth_count);
+      if (stencil_count) stencil = allocate_view<uint8_t>(a, stencil_count);
+    }
+    ~PlaneScratch() {
+      release_view(allocator, depth);
+      release_view(allocator, stencil);
+    }
+    PlaneScratch(const PlaneScratch&) = delete;
+    PlaneScratch& operator=(const PlaneScratch&) = delete;
+    allocators::IAllocator& allocator;
+    ArrayView<float> depth;
+    ArrayView<uint8_t> stencil;
+  };
 
   // A plain buffer (not a heap, a reserved buffer or a query result): what CopyBuffer and CopyBufferImage move bytes of.
   // (the results of queries can be a source: Direct3D 12's ResolveQueryData)
@@ -1262,12 +1373,15 @@ class Adapter::StreamRunner {
   NtStatus copy_buffer_image(ByteReader& p) {
     const uint32_t direction = p.le32(), ii = p.le32(), level = p.le32(), layer = p.le32(), x = p.le32(), y = p.le32(), w = p.le32(), h = p.le32(), bi = p.le32(), boff = p.le32(), pitch = p.le32();
     const uint32_t narrow_word = p.at_end() ? 0 : p.le32();      // (the optional twelfth word)
-    if (!exact(p) || in_pass_ || direction > 1 || w == 0 || h == 0 || narrow_word > static_cast<uint32_t>(NarrowLayout::R16G16)) return kBad;
+    if (!exact(p) || in_pass_ || direction > 1 || w == 0 || h == 0 || narrow_word > static_cast<uint32_t>(NarrowLayout::Stencil8)) return kBad;
     const NarrowLayout narrow = static_cast<NarrowLayout>(narrow_word);
     Allocation* image = alloc(ii);
     Allocation* buffer = alloc(bi);
-    if (!image || !image->is_image() || image->is_depth() || image->desc().samples != 1 || !copyable_buffer(buffer)) return kBad;
+    if (!image || !image->is_image() || image->desc().samples != 1 || !copyable_buffer(buffer)) return kBad;
     if (!use(image, direction == 0 ? state::kCopyDest : state::kCopySource) || !use(buffer, direction == 0 ? state::kCopySource : state::kCopyDest)) return kBad;
+    // (a depth buffer: a plane in one of the depth layouts, by the device; the depth layouts are a depth buffer's)
+    if (image->is_depth()) return copy_depth_buffer_image(direction, image, level, layer, x, y, w, h, buffer, boff, pitch, narrow);
+    if (is_depth_layout(narrow)) return kBad;
     // (a layer of a level: an array's slice or a volume's slice at that level)
     if (level >= image->mip_levels() || layer >= image->level_layers(level)) return kBad;
     const uint32_t level_w = graphics::mip_extent(image->desc().width, level);
@@ -2375,6 +2489,18 @@ class Adapter::StreamRunner {
     return exact(p) ? status::kSuccess : kBad;
   }
 
+  // A view's clamp of the levels of detail (Direct3D's ResourceMinLODClamp; d3d11's SetResourceMinLOD goes the same way): `clamp` counts the image's levels, the lookups count the view's
+  // from `base_level`, so the least level of detail of the sampler is raised to clamp - base_level, after the sampler's own MinLOD and MaxLOD (Direct3D clamps the level the sampler
+  // gives, then takes the greater of it and the clamp: a MaxLOD below the clamp is raised with it). A sampler without levels (a MaxLOD of 0: no mip filter) then reads the clamp's
+  // level, the nearest one; a clamp past the view's last level reads its last.
+  static void clamp_view_lod(graphics::SamplerDesc* sampler, float clamp, uint32_t base_level) {
+    const float relative = clamp - static_cast<float>(base_level);
+    if (!(relative > 0.0f)) return;
+    if (sampler->min_lod < relative) sampler->min_lod = relative;
+    if (sampler->max_lod < relative) sampler->max_lod = relative;
+    if (sampler->mip_filter == graphics::MipFilter::None) sampler->mip_filter = graphics::MipFilter::Nearest;
+  }
+
   // What a draw or dispatch binds from the root arguments: b0 (the first constant buffer: root constants, a root constant buffer view or a table's first view) as the push constants, the shader
   // resource views of tables as the texture units t<n> (with the sampler s<n> of a table or a static sampler, else s0, else the defaults), the unordered access views as storage slots u<n>.
   NtStatus apply_root_arguments(bool compute) {
@@ -2471,6 +2597,7 @@ class Adapter::StreamRunner {
                 Allocation* image = view_image(d, reads ? reads->texture_kind(unit) : graphics::TextureKind::Texture2D);
                 graphics::SamplerDesc sampler = sampler_for(reads ? reads->unit_sampler(unit) : unit);
                 sampler.stencil = d.stencil;   // (the view's plane of a depth buffer)
+                clamp_view_lod(&sampler, d.min_lod_clamp, d.view.base_level);
                 NtStatus s = refresh_mirror(image, false);
                 if (s == status::kSuccess) s = lower_texture(unit, image, sampler, image == d.allocation.get() ? d.view : graphics::TextureView());
                 if (s != status::kSuccess) return s;

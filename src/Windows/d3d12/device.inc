@@ -385,9 +385,9 @@ static HRESULT STDMETHODCALLTYPE dev_CheckFeatureSupport(Dev *This, D3D12_FEATUR
       D3D12_FEATURE_DATA_FORMAT_INFO *f = data;
       if (size != sizeof *f) return E_INVALIDARG;
       /* (a format with depth and stencil has two planes; a format the device does not know is not one) */
-      if (!format_info(f->Format) && !format_bytes(f->Format)) return E_INVALIDARG;
+      if (!format_info(f->Format) && !format_bytes(f->Format) && depth_format_planes(f->Format) == 1) return E_INVALIDARG;
       const FormatInfo *fi = format_info(f->Format);
-      f->PlaneCount = f->Format == DXGI_FORMAT_D24_UNORM_S8_UINT || f->Format == DXGI_FORMAT_D32_FLOAT_S8X24_UINT ? 2 : fi && fi->planar ? (UINT8)format_planes(fi) : 1;
+      f->PlaneCount = depth_format_planes(f->Format) == 2 ? 2 : fi && fi->planar ? (UINT8)format_planes(fi) : 1;
       return S_OK;
     }
     case D3D12_FEATURE_GPU_VIRTUAL_ADDRESS_SUPPORT: {

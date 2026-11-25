@@ -1181,7 +1181,8 @@ void D3d9Program::execute(State& s, uint64_t begin, uint64_t end) const {
               default: d[0] = -sn, d[1] = -tn, d[2] = -1; break;
             }
           };
-          if (kind == graphics::TextureKind::TextureCube) project(a.f[0], a.f[1], a.f[2], &face, &u, &v);
+          const bool cube = kind == graphics::TextureKind::TextureCube || kind == graphics::TextureKind::TextureCubeArray;   // (a cube array's cube: the coordinate's w)
+          if (cube) project(a.f[0], a.f[1], a.f[2], &face, &u, &v);
           // (an offset moves the footprint by whole texels: a register's x and y as integers, or the instruction's own)
           float offset_x = static_cast<float>(ins.texel_offset[0]), offset_y = static_cast<float>(ins.texel_offset[1]);
           uint32_t next = 2;
@@ -1196,7 +1197,7 @@ void D3d9Program::execute(State& s, uint64_t begin, uint64_t end) const {
           for (uint32_t k = 0; k < 4; ++k) {
             float tx = xs[k], ty = ys[k];
             graphics::Vec4 t;
-            if (kind == graphics::TextureKind::TextureCube) {
+            if (cube) {
               // (a tap off the face is on the neighbour that the extended plane leads to: the texel that direction names there, as on the hardware)
               int tap_face = face;
               float d[3];
@@ -1208,7 +1209,7 @@ void D3d9Program::execute(State& s, uint64_t begin, uint64_t end) const {
               }
               tx = tx < 0 ? 0 : tx > fw - 1 ? fw - 1 : tx, ty = ty < 0 ? 0 : ty > fh - 1 ? fh - 1 : ty;
               direction(tap_face, 2.0f * (tx + 0.5f) / fw - 1.0f, 2.0f * (ty + 0.5f) / fh - 1.0f, d);
-              t = s.textures->sample_lod_volume(unit, d[0], d[1], d[2], 0.0f);
+              t = kind == graphics::TextureKind::TextureCubeArray ? s.textures->sample_lod_cube_array(unit, d[0], d[1], d[2], a.f[3], 0.0f) : s.textures->sample_lod_volume(unit, d[0], d[1], d[2], 0.0f);
             } else if (kind == graphics::TextureKind::Texture2DArray) {
               t = s.textures->sample_lod_volume(unit, (tx + 0.5f) / fw, (ty + 0.5f) / fh, a.f[2], 0.0f);
             } else {

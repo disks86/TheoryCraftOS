@@ -2376,10 +2376,10 @@ bool Translator::texture_gather(const Instruction& ins, bool compare) {
   const Val r = new_aggregate(ins.result);
   uint32_t scratch = 0;
   if (r.kind == VK::None || !alloc_reg(pos_, &scratch)) return false;
-  const uint32_t kind = res_[0][srv.b].kind;   // (a cube takes a direction, an array the layer in the third component)
-  if (kind != 2 && kind != 5 && kind != 7) return error(status::kNotSupported);
-  if ((offset[0] || offset[1]) && kind == 5) return error(status::kNotSupported);
-  if (!pack(ins.args + 3, kind == 2 ? 2 : 3, scratch, false)) return false;
+  const uint32_t kind = res_[0][srv.b].kind;   // (a cube takes a direction, an array the layer in the third component, a cube array the direction and the cube)
+  if (kind != 2 && kind != 5 && kind != 7 && kind != 9) return error(status::kNotSupported);
+  if ((offset[0] || offset[1]) && (kind == 5 || kind == 9)) return error(status::kNotSupported);
+  if (!pack(ins.args + 3, kind == 2 ? 2 : kind == 9 ? 4 : 3, scratch, false)) return false;
   Val reference;
   if (compare) reference = use(ins.args[10]);
   const bool has_offset = offset[0] || offset[1];
@@ -3176,8 +3176,8 @@ NtStatus Translator::run(uint32_t program_kind, ConstByteView isg1, ConstByteVie
       else word(161u | (3u << 24)), word((7u << 12) | (1u << 20)), word(r.lower);
       continue;
     }
-    // (the kind: 2 texture 2D, 4 texture 3D, 5 cube, 7 2D array)
-    const uint32_t dimension = r.kind == 2 ? 3 : r.kind == 4 ? 5 : r.kind == 5 ? 6 : r.kind == 7 ? 8 : 0;
+    // (the kind: 2 texture 2D, 4 texture 3D, 5 cube, 7 2D array, 9 cube array - SM5's dimensions 3, 5, 6, 8 and 10)
+    const uint32_t dimension = r.kind == 2 ? 3 : r.kind == 4 ? 5 : r.kind == 5 ? 6 : r.kind == 7 ? 8 : r.kind == 9 ? 10 : 0;
     const uint32_t elements = r.size != 0xFFFFFFFFu && r.size >= 1 && r.size <= 8 ? r.size : 1;   // (an array: every element is declared)
     if (!dimension || r.lower >= graphics::kMaxTextureUnits || elements > graphics::kMaxTextureUnits - r.lower) return status::kNotSupported;
     for (uint32_t e = 0; e < elements; ++e)

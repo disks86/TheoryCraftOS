@@ -923,9 +923,12 @@ NtStatus VidMm::set_mirror(Allocation& mirror, ArrayView<const SharedPointer<All
   }
   const AllocationDesc& m = mirror.desc_;
   const uint32_t channel = mirror_channel_bytes(m.format);
-  const bool array = m.kind == graphics::TextureKind::Texture2DArray;
+  // (a mirror of several sources is an array, each layer a source, or a volume, each slice a source - a subresource of one: a volume's slices at a level, which an unordered
+  // access view of a narrow volume writes; its level 0's slices are one after the other as an array's layers are)
+  const bool volume = m.kind == graphics::TextureKind::Texture3D;
+  const bool array = m.kind == graphics::TextureKind::Texture2DArray || volume;
   if (!mirror.is_image() || mirror.is_mirror() || mirror.placed() || mirror.reserved_ || !(m.flags & kAllocTexture) || m.mip_levels != 1 || m.samples != 1 || channel == 0 ||
-      (!array && m.kind != graphics::TextureKind::Texture2D) || sources.size() != (array ? m.layers : 1u))
+      (!array && m.kind != graphics::TextureKind::Texture2D) || sources.size() != (array ? m.layers : 1u) || (volume && subresources.empty()))
     return status::kInvalidParameter;
   // (a mirror that writes back is a render target or a storage image - an array of them gives each layer to its source; one channel at least goes back)
   if ((mode & kMirrorWriteBack) && (!(m.flags & (kAllocRenderTarget | kAllocStorageImage)) || channels == 0)) return status::kInvalidParameter;

@@ -317,13 +317,16 @@ static UINT res_mirror(Resource *r, UINT plane, UINT first, UINT count, int arra
   return alloc;
 }
 
-/* A mirror of layers first .. first + count - 1 of level `level` of a narrow texture that is not planar (its one image's subresources: an array's slices, a level of a 2D texture),
- * each source the subresource it shows (the kernel's SetMirror with subresource words, on a device with levels of every image - DEV_FEATURE2_MIPMAPPED_LAYERS). Made the first time,
- * then the same one; 0 when the kernel cannot make it. */
+/* A mirror of layers first .. first + count - 1 of level `level` of a narrow texture that is not planar (its one image's subresources: an array's slices, a level of a 2D texture, a
+ * volume's slices at the level - the mirror then a volume of one level, of those slices), each source the subresource it shows (the kernel's SetMirror with subresource words, on a
+ * device with levels of every image - DEV_FEATURE2_MIPMAPPED_LAYERS). Made the first time, then the same one; 0 when the kernel cannot make it. */
 static UINT narrow_mirror(Resource *r, UINT level, UINT first, UINT count, int array, UINT mode, UINT channels) {
-  if (r->planes || !r->fmt || r->kind == 1 || level >= r->mips || count == 0 || count > 128 || first >= r->layers || count > r->layers - first || (!array && count != 1) ||
+  const int volume = r->kind == 1;
+  const UINT layers = volume ? mip_extent(r->layers, level) : r->layers;      /* (a volume's level has half the slices of the one above it) */
+  if (r->planes || !r->fmt || level >= r->mips || count == 0 || count > 128 || first >= layers || count > layers - first || (!array && !volume && count != 1) ||
       !(r->d.dev->caps.features2 & DEV_FEATURE2_MIPMAPPED_LAYERS))
     return 0;
+  if (volume) array = 0;      /* (the volume's own kind, not an array) */
   EnterCriticalSection(&g_lock);
   for (UINT i = 0; i < r->mirror_count; ++i) {
     const Mirror *m = &r->mirrors[i];
@@ -343,8 +346,8 @@ static UINT narrow_mirror(Resource *r, UINT level, UINT first, UINT count, int a
     md.format = r->fmt->kernel;
     md.width = mip_extent(format_kw(r->fmt, (UINT)r->desc.Width), level), md.height = mip_extent(r->desc.Height, level);
     md.mips = md.samples = 1;
-    md.kind = array ? 2 : 0;
-    md.layers = array ? count : 1;
+    md.kind = volume ? 1 : array ? 2 : 0;
+    md.layers = volume || array ? count : 1;
     if (KMT_OK(kmt_create_allocation(r->d.dev->kdev, &md, &alloc, NULL, NULL))) {
       UINT request[5 + 2 * 128];
       request[0] = ESC_SET_MIRROR;
@@ -393,12 +396,14 @@ static void get_footprints(const D3D12_RESOURCE_DESC *d, UINT first, UINT count,
   const UINT depth_or_array = d->DepthOrArraySize ? d->DepthOrArraySize : 1;
   const FormatInfo *base_fi = format_info(d->Format);
   const UINT bytes = format_bytes(d->Format);
-  /* (a planar format: the subresources of plane 1 follow those of plane 0, each plane a footprint of its own format and size) */
-  const UINT plane_subs = base_fi && base_fi->planar ? mips * depth_or_array : 0;      /* (the subresources of a plane) */
+  /* (a planar format: the subresources of plane 1 follow those of plane 0, each plane a footprint of its own format and size; so do a depth format's with stencil, the depth as 32
+   * bits and the stencil as bytes: depth_plane_format) */
+  const int depth_planes = depth_format_planes(d->Format) == 2;
+  const UINT plane_subs = (base_fi && base_fi->planar) || depth_planes ? mips * depth_or_array : 0;      /* (the subresources of a plane) */
   for (UINT i = 0; i < count; ++i) {
     const UINT sub = first + i;
     const UINT plane = plane_subs ? sub / plane_subs : 0;
-    const FormatInfo *fi = plane_format(base_fi, plane);
+    const FormatInfo *fi = depth_planes ? depth_plane_format(d->Format, plane) : plane_format(base_fi, plane);
     const UINT level = sub % mips;
     UINT w = mip_extent((UINT)d->Width, level), h = mip_extent(d->Height, level);
     plane_extent(base_fi, plane, &w, &h);
@@ -959,7 +964,7 @@ static D3D12_RESOURCE_ALLOCATION_INFO *STDMETHODCALLTYPE dev_GetResourceAllocati
       D3D12_RESOURCE_DESC d = descs[i];
       const UINT mips = d.MipLevels ? d.MipLevels : mip_count_for((UINT)d.Width, d.Height);
       const FormatInfo *dfi = format_info(d.Format);
-      const UINT subs = mips * (d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D ? 1 : (d.DepthOrArraySize ? d.DepthOrArraySize : 1)) * (dfi && dfi->planar ? format_planes(dfi) : 1);
+      const UINT subs = mips * (d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D ? 1 : (d.DepthOrArraySize ? d.DepthOrArraySize : 1)) * (dfi && dfi->planar ? format_planes(dfi) : depth_format_planes(d.Format));
       get_footprints(&d, 0, subs, 0, NULL, NULL, NULL, &n);
       /* (what the kernel keeps of it: a narrow format's and a plane's pixels are widened, so a placed one needs more of its heap than its footprints) */
       const UINT64 kernel = texture_kernel_bytes(&d);
@@ -979,8 +984,10 @@ static void STDMETHODCALLTYPE dev_GetCopyableFootprints(Dev *This, const D3D12_R
 
 /* ---- ID3D12Resource ----------------------------------------------------------------------------------------------------------------------------------------------------------- */
 
+/* (a depth buffer with stencil has two planes: the stencil's subresources follow the depth's, as Direct3D 12 numbers them) */
 static UINT res_subresources(const Resource *r) {
-  return r->desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER ? 1 : r->mips * (r->kind == 1 ? 1 : r->layers) * (r->planes ? r->planes : 1);
+  const UINT planes = r->planes ? r->planes : r->fmt && r->fmt->depth ? depth_format_planes(r->desc.Format) : 1;
+  return r->desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER ? 1 : r->mips * (r->kind == 1 ? 1 : r->layers) * planes;
 }
 static UINT res_subresources_of(const Resource *r) { return res_subresources(r); }
 static HRESULT res_texture_copy(Resource *r, UINT sub, const D3D12_BOX *box, BYTE *mem, UINT row_pitch, UINT slice_pitch, int write);

@@ -442,6 +442,22 @@ static void texture_uav_descriptor(Dev *d, const View *v, D3D12_CPU_DESCRIPTOR_H
 
 /* The Direct3D 12 view of a shader resource view of a texture (not a planar or packed YUV one): the dimension the program's names, its levels and layers within those Direct3D 12 below
  * keeps (Tex.kmips: a device without levels of layered images keeps level 0 of them), a one-dimensional view as a two-dimensional one. FALSE when the view shows nothing kept. */
+/* Makes the Direct3D 12 view `r` of texture t at `at` with t's SetResourceMinLOD clamp as its ResourceMinLODClamp (the most detailed level its lookups take, in the texture's levels;
+ * the kernel raises the sampler's MinLOD to it, counted from the view's first level). */
+static void srv_create12(Dev *d, Tex *t, D3D12_SHADER_RESOURCE_VIEW_DESC *r, D3D12_CPU_DESCRIPTOR_HANDLE at) {
+  const FLOAT clamp = t->min_lod;
+  switch (r->ViewDimension) {
+    case D3D12_SRV_DIMENSION_TEXTURE1D: r->Texture1D.ResourceMinLODClamp = clamp; break;
+    case D3D12_SRV_DIMENSION_TEXTURE1DARRAY: r->Texture1DArray.ResourceMinLODClamp = clamp; break;
+    case D3D12_SRV_DIMENSION_TEXTURE2D: r->Texture2D.ResourceMinLODClamp = clamp; break;
+    case D3D12_SRV_DIMENSION_TEXTURE2DARRAY: r->Texture2DArray.ResourceMinLODClamp = clamp; break;
+    case D3D12_SRV_DIMENSION_TEXTURE3D: r->Texture3D.ResourceMinLODClamp = clamp; break;
+    case D3D12_SRV_DIMENSION_TEXTURECUBE: r->TextureCube.ResourceMinLODClamp = clamp; break;
+    case D3D12_SRV_DIMENSION_TEXTURECUBEARRAY: r->TextureCubeArray.ResourceMinLODClamp = clamp; break;
+    default: break;      /* (multisampled views have one level) */
+  }
+  ID3D12Device_CreateShaderResourceView(d->d12, t->res, r, at);
+}
 static BOOL srv_desc12(const View *v, D3D12_SHADER_RESOURCE_VIEW_DESC *r) {
   const Tex *t = v->tex;
   UINT first_level = 0, levels = 0, first = 0, count = 0;
@@ -496,13 +512,12 @@ static BOOL srv_desc12(const View *v, D3D12_SHADER_RESOURCE_VIEW_DESC *r) {
  * table the same as the last one is used again. */
 static BOOL tables_record(Dev *d, View *const *srvs, Sampler *const *samplers, const BYTE *kinds, View *const *uavs, UINT uav_mask, BOOL cache, UINT view_count) {
   UINT view_ids[SRV_SLOTS], sampler_ids[TEXTURE_SLOTS], uav_ids[UAV_SLOTS];
-  FLOAT min_lods[TEXTURE_SLOTS];
-  for (UINT i = 0; i < view_count; ++i)
+  FLOAT min_lods[SRV_SLOTS];
+  for (UINT i = 0; i < view_count; ++i) {
     view_ids[i] = srvs[i] ? srvs[i]->c.id : kinds[i] == KIND_BUFFER ? d->blank_buffer->c.id : (kinds[i] >= 1 && kinds[i] <= 5 && d->blank_kind[kinds[i]] ? d->blank_kind[kinds[i]] : d->blank)->c.id;
-  for (UINT i = 0; i < TEXTURE_SLOTS; ++i) {
-    sampler_ids[i] = samplers[i] ? samplers[i]->s.c.id : 0;
-    min_lods[i] = srvs[i] && srvs[i]->tex ? srvs[i]->tex->min_lod : 0.0f;      /* (the clamp goes into the sampler) */
+    min_lods[i] = srvs[i] && srvs[i]->tex ? srvs[i]->tex->min_lod : 0.0f;      /* (SetResourceMinLOD: the view's ResourceMinLODClamp) */
   }
+  for (UINT i = 0; i < TEXTURE_SLOTS; ++i) sampler_ids[i] = samplers[i] ? samplers[i]->s.c.id : 0;
   /* (an append or counter view whose count was set since: its counter is written now, in order with what the list did before; the table is made again) */
   for (UINT i = 0; i < UAV_SLOTS; ++i)
     if ((uav_mask >> i & 1) && uavs[i] && uavs[i]->counter_buf && uavs[i]->counter_dirty) cache = FALSE;
@@ -511,7 +526,8 @@ static BOOL tables_record(Dev *d, View *const *srvs, Sampler *const *samplers, c
   const UINT step_samplers = ID3D12Device_GetDescriptorHandleIncrementSize(d->d12, D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER);
   const D3D12_CPU_DESCRIPTOR_HANDLE view_start = ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(d->view_heap);
   const D3D12_GPU_DESCRIPTOR_HANDLE view_gpu = ID3D12DescriptorHeap_GetGPUDescriptorHandleForHeapStart(d->view_heap);
-  if (!cache || !d->tables_valid || d->table_view_count != view_count || memcmp(view_ids, d->table_view_ids, view_count * sizeof view_ids[0]) != 0) {
+  if (!cache || !d->tables_valid || d->table_view_count != view_count || memcmp(view_ids, d->table_view_ids, view_count * sizeof view_ids[0]) != 0 ||
+      memcmp(min_lods, d->table_min_lods, view_count * sizeof min_lods[0]) != 0) {
     D3D12_CPU_DESCRIPTOR_HANDLE at = view_start;
     at.ptr += (SIZE_T)d->view_used * step_views;
     d->table_views = view_gpu.ptr + (UINT64)d->view_used * step_views;
@@ -542,26 +558,18 @@ static BOOL tables_record(Dev *d, View *const *srvs, Sampler *const *samplers, c
         }
         ID3D12Device_CreateShaderResourceView(d->d12, v->tex->res, &r, at);
       } else if (v && v->tex->depth) {
-        /* (a depth texture: a view of its depth, or of its stencil plane - PlaneSlice 1 -, in the format the texture below has it in: d3d11.c depth_view_format) */
+        /* (a depth texture: a view of its depth, or of its stencil plane - PlaneSlice 1 -, in the format the texture below has it in (d3d11.c depth_view_format), of the view's levels
+         * and layers) */
         D3D12_SHADER_RESOURCE_VIEW_DESC r;
-        memset(&r, 0, sizeof r);
         BOOL stencil = FALSE;
-        depth_view_format(v->tex->desc.Format, v->desc.srv.Format, &r.Format, &stencil);
-        r.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-        if (v->tex->kind == 2) {
-          r.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
-          r.Texture2DArray.MipLevels = 1;
-          r.Texture2DArray.ArraySize = v->tex->desc.ArraySize;
-          r.Texture2DArray.PlaneSlice = stencil ? 1 : 0;
-        } else if (v->tex->kind == 3) {
-          r.ViewDimension = D3D12_SRV_DIMENSION_TEXTURECUBE;
-          r.TextureCube.MipLevels = 1;
+        if (srv_desc12(v, &r)) {
+          depth_view_format(v->tex->desc.Format, v->desc.srv.Format, &r.Format, &stencil);
+          if (r.ViewDimension == D3D12_SRV_DIMENSION_TEXTURE2D) r.Texture2D.PlaneSlice = stencil ? 1 : 0;
+          if (r.ViewDimension == D3D12_SRV_DIMENSION_TEXTURE2DARRAY) r.Texture2DArray.PlaneSlice = stencil ? 1 : 0;
+          srv_create12(d, v->tex, &r, at);
         } else {
-          r.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
-          r.Texture2D.MipLevels = 1;
-          r.Texture2D.PlaneSlice = stencil ? 1 : 0;
+          ID3D12Device_CreateShaderResourceView(d->d12, NULL, NULL, at);
         }
-        ID3D12Device_CreateShaderResourceView(d->d12, v->tex->res, &r, at);
       } else if (v && (v->tex->fmt->flags & FMT_YUV)) {
         /* (a packed YUV texture: through a view of its pixels' format; of an array, its slices - each an image of its own below, a shader that declares an array
          * reading a mirror of them -, of a texture of levels, the view's levels) */
@@ -583,11 +591,11 @@ static BOOL tables_record(Dev *d, View *const *srvs, Sampler *const *samplers, c
           r.Texture2D.MostDetailedMip = array ? v->desc.srv.Texture2DArray.MostDetailedMip : v->desc.srv.Texture2D.MostDetailedMip;
           r.Texture2D.MipLevels = array ? v->desc.srv.Texture2DArray.MipLevels : v->desc.srv.Texture2D.MipLevels;
         }
-        ID3D12Device_CreateShaderResourceView(d->d12, v->tex->res, &r, at);
+        srv_create12(d, v->tex, &r, at);
       } else if (v) {
         /* (the view's levels and layers, of the dimension it names: Direct3D 12 below gives the shader what the view shows - levels it does not keep are not there, Tex.kmips) */
         D3D12_SHADER_RESOURCE_VIEW_DESC r;
-        if (srv_desc12(v, &r)) ID3D12Device_CreateShaderResourceView(d->d12, v->tex->res, &r, at);
+        if (srv_desc12(v, &r)) srv_create12(d, v->tex, &r, at);
         else ID3D12Device_CreateShaderResourceView(d->d12, v->tex->res, NULL, at);
       } else {
         Tex *t = kinds[i] >= 1 && kinds[i] <= 5 && d->blank_kind[kinds[i]] ? d->blank_kind[kinds[i]] : d->blank;
@@ -597,6 +605,7 @@ static BOOL tables_record(Dev *d, View *const *srvs, Sampler *const *samplers, c
     }
     d->view_used += view_count;
     memcpy(d->table_view_ids, view_ids, view_count * sizeof view_ids[0]);
+    memcpy(d->table_min_lods, min_lods, view_count * sizeof min_lods[0]);
     d->table_view_count = view_count;
   }
   if (!cache || !d->tables_valid || memcmp(uav_ids, d->table_uav_ids, sizeof uav_ids) != 0) {
@@ -615,7 +624,7 @@ static BOOL tables_record(Dev *d, View *const *srvs, Sampler *const *samplers, c
     d->view_used += UAV_SLOTS;
     memcpy(d->table_uav_ids, uav_ids, sizeof uav_ids);
   }
-  if (!cache || !d->tables_valid || memcmp(sampler_ids, d->table_sampler_ids, sizeof sampler_ids) != 0 || memcmp(min_lods, d->table_min_lods, sizeof min_lods) != 0) {
+  if (!cache || !d->tables_valid || memcmp(sampler_ids, d->table_sampler_ids, sizeof sampler_ids) != 0) {
     static const D3D11_SAMPLER_DESC fallback = {D3D11_FILTER_MIN_MAG_MIP_LINEAR, D3D11_TEXTURE_ADDRESS_CLAMP, D3D11_TEXTURE_ADDRESS_CLAMP, D3D11_TEXTURE_ADDRESS_CLAMP, 0.0f, 1,
                                                 D3D11_COMPARISON_NEVER, {0, 0, 0, 0}, 0.0f, 3.402823466e+38f};
     D3D12_CPU_DESCRIPTOR_HANDLE at = ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(d->sampler_heap);
@@ -623,16 +632,12 @@ static BOOL tables_record(Dev *d, View *const *srvs, Sampler *const *samplers, c
     at.ptr += (SIZE_T)d->sampler_used * step_samplers;
     d->table_samplers = gpu.ptr + (UINT64)d->sampler_used * step_samplers;
     for (UINT i = 0; i < TEXTURE_SLOTS; ++i) {
-      D3D11_SAMPLER_DESC desc = samplers[i] ? samplers[i]->desc : fallback;
-      /* (SetResourceMinLOD: the texture is not sampled at a level below its clamp) */
-      if (srvs[i] && srvs[i]->tex && srvs[i]->tex->min_lod > desc.MinLOD) desc.MinLOD = srvs[i]->tex->min_lod;
-      if (desc.MaxLOD < desc.MinLOD) desc.MaxLOD = desc.MinLOD;
+      const D3D11_SAMPLER_DESC desc = samplers[i] ? samplers[i]->desc : fallback;
       ID3D12Device_CreateSampler(d->d12, (const D3D12_SAMPLER_DESC *)&desc, at);      /* (the two structures are the same) */
       at.ptr += step_samplers;
     }
     d->sampler_used += TEXTURE_SLOTS;
     memcpy(d->table_sampler_ids, sampler_ids, sizeof sampler_ids);
-    memcpy(d->table_min_lods, min_lods, sizeof min_lods);
   }
   d->tables_valid = cache;
   return TRUE;
@@ -1552,7 +1557,7 @@ static HRESULT STDMETHODCALLTYPE ctx_Map(Ctx *c, ID3D11Resource *resource, UINT 
       out->RowPitch = out->DepthPitch = b->desc.ByteWidth;
     }
   } else if (t) {
-    if (sub >= tex_subresources(t) || t->depth || t->mapped[sub]) hr = E_INVALIDARG;
+    if (sub >= tex_subresources(t) || (t->depth && t->desc.Usage != D3D11_USAGE_STAGING) || t->mapped[sub]) hr = E_INVALIDARG;      /* (a depth texture the CPU maps is a staging one) */
     else {
       const UINT level = sub % t->desc.MipLevels, w = mip_size(t->desc.Width, level), h = mip_size(t->desc.Height, level), slices = tex_slices(t, sub);
       const SIZE_T slice_bytes = (SIZE_T)tex_pitch(t, w) * tex_rows(t, h);
@@ -1631,7 +1636,7 @@ static void STDMETHODCALLTYPE ctx_UpdateSubresource(Ctx *c, ID3D11Resource *reso
 static void tex_copy_slow(Dev *d, Tex *to, UINT to_sub, UINT x, UINT y, Tex *from, UINT from_sub, const D3D11_BOX *box) {
   /* (a volume: each slice of the box - all of the level's without one - into the slice of the other volume at the same place; a volume and another kind are not copied, nor
    * compressed textures) */
-  if (to->bpp != from->bpp || to->depth || from->depth || (to->kind == 1) != (from->kind == 1) || to->block || from->block) return;
+  if (to->bpp != from->bpp || (to->kind == 1) != (from->kind == 1) || to->block || from->block) return;      /* (a depth texture's texels are the program's: tex_depth_rows) */
   const UINT level = from_sub % from->desc.MipLevels, w = mip_size(from->desc.Width, level), h = mip_size(from->desc.Height, level);
   const UINT to_level = to_sub % to->desc.MipLevels, to_w = mip_size(to->desc.Width, to_level), to_h = mip_size(to->desc.Height, to_level);
   const UINT x0 = box ? box->left : 0, y0 = box ? box->top : 0, x1 = box ? box->right : w, y1 = box ? box->bottom : h;
@@ -1648,6 +1653,10 @@ static BOOL tex_simple(const Tex *t) { return t->desc.MipLevels == 1 && t->desc.
 /* Whether Direct3D 12 below copies between the two itself: plain 2D textures of one level and format, or - on a device that keeps every level (dev_all_levels) - textures of the same kind
  * of dimension whose texels (or blocks) are as many bytes, not depth buffers or shadowed targets (whose views hold what they drew: tex_sync first). */
 static BOOL tex_copies12(Dev *d, const Tex *to, const Tex *from) {
+  /* (two depth textures kept in one format below: Direct3D 12 copies their planes; a depth texture and a colour one go through the program's texels, tex_copy_slow) */
+  if (to->depth || from->depth)
+    return to->depth && from->depth && tex_depth_stencil_below(to) == tex_depth_stencil_below(from) && to->desc.SampleDesc.Count == from->desc.SampleDesc.Count &&
+           (to->kind == 1) == (from->kind == 1);
   if (tex_simple(to) && tex_simple(from) && to->stored == from->stored) return TRUE;
   return dev_all_levels(d) && !to->depth && !from->depth && !to->shadowed && !from->shadowed && to->stored_bpp == from->stored_bpp && to->block == from->block &&
          (to->kind == 1) == (from->kind == 1) && !to->planar && !from->planar;
@@ -1667,6 +1676,16 @@ static void STDMETHODCALLTYPE ctx_CopySubresourceRegion(Ctx *c, ID3D11Resource *
     /* (planar textures: a slice into a slice of one of the same format, both planes) */
     if (tt->planar && tf->planar && to_sub < tex_subresources(tt) && from_sub < tex_subresources(tf)) tex_planar_copy(d, tt, to_sub, x, y, tf, from_sub, box);
   } else if (tt && tf && to_sub < tex_subresources(tt) && from_sub < tex_subresources(tf)) {
+    /* (a depth or multisampled texture is copied whole: no box but one of the whole subresource, to (0, 0, 0), into a subresource of the same size - else nothing is copied, as the
+     * debug layer's error leaves it) */
+    if (tt->depth || tf->depth || tt->desc.SampleDesc.Count > 1 || tf->desc.SampleDesc.Count > 1) {
+      const UINT fl = from_sub % tf->desc.MipLevels, tl = to_sub % tt->desc.MipLevels, fw = mip_size(tf->desc.Width, fl), fh = mip_size(tf->desc.Height, fl);
+      if (x || y || z || fw != mip_size(tt->desc.Width, tl) || fh != mip_size(tt->desc.Height, tl) ||
+          (box && (box->left || box->top || box->front || box->right != fw || box->bottom != fh || box->back != 1))) {
+        UNLOCK(c);
+        return;
+      }
+    }
     tex_sync(d, tf);
     tex_sync(d, tt);
     ++tt->version;
@@ -1687,6 +1706,12 @@ static void STDMETHODCALLTYPE ctx_CopySubresourceRegion(Ctx *c, ID3D11Resource *
       D3D12_BOX region;
       if (box) { region.left = box->left; region.top = box->top; region.front = tf->kind == 1 ? box->front : 0; region.right = box->right; region.bottom = box->bottom; region.back = tf->kind == 1 ? box->back : 1; }
       ID3D12GraphicsCommandList_CopyTextureRegion(d->list, &dst, x, y, tt->kind == 1 ? z : 0, &src, box ? &region : NULL);
+      if (tt->depth && tex_depth_stencil_below(tt)) {
+        /* (and the stencil: Direct3D 12 copies a plane at a time, the stencil's subresources after the depth's) */
+        dst.SubresourceIndex += tt->kmips * (tt->kind == 1 ? 1 : tt->desc.ArraySize);
+        src.SubresourceIndex += tf->kmips * (tf->kind == 1 ? 1 : tf->desc.ArraySize);
+        ID3D12GraphicsCommandList_CopyTextureRegion(d->list, &dst, 0, 0, 0, &src, box ? &region : NULL);
+      }
       tt->used = tf->used = tt->written = d->epoch;
       d->recorded = 1;
     } else tex_copy_slow(d, tt, to_sub, x, y, tf, from_sub, box);
@@ -1959,7 +1984,9 @@ static void STDMETHODCALLTYPE ctx_ClearState(Ctx *c) {
   UNLOCK(c);
 }
 
-/* SetResourceMinLOD: the most detailed level a texture is sampled at (its samplers' MinLOD is raised to it). Buffers have no levels. */
+/* SetResourceMinLOD: the most detailed level a texture is sampled at, in its levels (the ResourceMinLODClamp of every Direct3D 12 view of it the draws make: a view whose
+ * MostDetailedMip is above 0 counts it from the texture's level 0 all the same; a clamp past a view's last level reads that level). Buffers have no levels; a value below 0 or
+ * one that is not a number is not taken. */
 static void STDMETHODCALLTYPE ctx_SetResourceMinLOD(Ctx *c, ID3D11Resource *resource, FLOAT lod) {
   if (c->deferred) { deferred_record(c, &(RecArgs){.op = REC_MIN_LOD, .obj = {resource}, .f = {lod}}); return; }
   Tex *t = tex_of_resource(resource);

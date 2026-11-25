@@ -1265,6 +1265,9 @@ NtStatus Kernel::write_descriptor(ProcessId pid, Handle heap, uint32_t index, co
       // (the texture view's plane of a depth buffer - the escape's texel-format word, which a texture's view has no other use for: 1 the stencil plane; DescriptorDesc::stencil)
       if (desc.texel_format > 1) return status::kInvalidParameter;
       if (desc.texel_format == 1) stencil = true;
+      // (the most detailed level the view's lookups take - Direct3D's ResourceMinLODClamp: 0 or more, of the image's levels, a level past the view's last reading its last)
+      if (!(desc.min_lod_clamp >= 0.0f && desc.min_lod_clamp <= 1000.0f)) return status::kInvalidParameter;
+      d.min_lod_clamp = desc.min_lod_clamp;
     }
     d.allocation = a->allocation;
     if (stencil) {
@@ -1483,6 +1486,7 @@ NtStatus Kernel::escape_d3d12(ProcessId pid, Handle device, uint32_t op, ByteRea
           d.texel_format = bias;
           d.counter = min_lod;
           d.counter_offset = max_lod;
+          if (d.kind == DescriptorKind::Srv) d.min_lod_clamp = bits_float(min_lod);   // (a texture's view: its min_lod word is the clamp; a buffer's is 0)
           d.sampler.lod_bias = d.sampler.min_lod = 0.0f;
           d.sampler.max_lod = 1000.0f;
         }

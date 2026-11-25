@@ -28,6 +28,9 @@
  *                      TcosD3D12PipelineOptions), and goes into a ring of upload memory - so a constant buffer may change between draws freely.
  *   textures           a Direct3D 12 texture in a default heap. The CPU reaches it through copies (UpdateSubresource, Map of a dynamic or staging
  *                      texture: a copy in memory, sent or fetched). Formats the kernel has no image of are kept wider (formats.inc).
+ *   depth textures     a Direct3D 12 depth buffer (also a staging texture of a typed depth format): views of any of its levels and layers, copies of whole subresources
+ *                      (both planes; a part of one copies nothing), its texels mapped and written as the format's through Direct3D 12's planes (tex_depth_rows).
+ *                      SetResourceMinLOD is the ResourceMinLODClamp of the views made of the texture.
  *   vertex layouts     the kernel takes 32-bit floats only: a layout with R8G8B8A8 / B8G8R8A8 colours gets its vertex buffers converted (a second
  *                      buffer, made again when the first changes).
  *   states             a Direct3D 12 pipeline state for each combination of shaders, layout, blend, depth and rasterizer state that is drawn with,
@@ -414,7 +417,7 @@ struct Dev {
   Buf *blank_uav;                          /* ... and a buffer for an unordered access slot a shader declares with nothing bound (what it writes there is lost to the program) */
   UINT64 table_uavs;                       /* the GPU handle of the unordered access table the last draw used, and what was in it */
   UINT table_uav_ids[UAV_SLOTS];
-  FLOAT table_min_lods[TEXTURE_SLOTS];     /* ... and the textures' SetResourceMinLOD clamps the sampler table was made with */
+  FLOAT table_min_lods[SRV_SLOTS];         /* ... and the textures' SetResourceMinLOD clamps the view table was made with (each view's ResourceMinLODClamp below) */
   UINT epoch;                              /* counts the command lists */
   int recorded;                            /* the list has something in it */
   UINT dirty;                              /* what the next draw has to set again (DIRTY_*) */
@@ -968,11 +971,149 @@ static void tex_planar_copy(Dev *d, Tex *to, UINT to_slice, UINT x, UINT y, Tex 
   d->recorded = 1;
 }
 
+/* ---- the texels of depth textures ------------------------------------------------------------------------------------------------------------------------------------- */
+
+/* A depth texture (made for depth, or a staging texture of a depth format) keeps its texels in a Direct3D 12 depth buffer below (D32_FLOAT, which holds D16 too, or
+ * D24_UNORM_S8_UINT, which holds D32S8 too: formats.inc), whose planes - the depth, and the stencil of D24S8 - Direct3D 12 copies to and from footprints of their own (the depth as
+ * a float of D32_FLOAT or a 24-bit code in the low bits of a word of D24S8, the stencil as bytes). A whole subresource goes through them as the program's texels: D32_FLOAT /
+ * R32_TYPELESS a float, D16_UNORM / R16_TYPELESS a 16-bit code, D24_UNORM_S8_UINT / R24G8_TYPELESS the 24-bit code with the stencil in the high byte, D32_FLOAT_S8X24_UINT /
+ * R32G8X24_TYPELESS a float and then the stencil in the next byte (three zero bytes after it). The 24-bit depth of a D32S8 texture is the precision it keeps here. */
+static UINT depth_texel_bytes(DXGI_FORMAT f) {
+  switch (f) {
+    case DXGI_FORMAT_D16_UNORM: case DXGI_FORMAT_R16_TYPELESS: return 2;
+    case DXGI_FORMAT_D32_FLOAT_S8X24_UINT: case DXGI_FORMAT_R32G8X24_TYPELESS: return 8;
+    default: return 4;
+  }
+}
+/* Whether the depth buffer below has a stencil plane (D24_UNORM_S8_UINT, or R24G8_TYPELESS made for depth); else it is a buffer of float depth (D32_FLOAT, R32_TYPELESS). */
+static BOOL tex_depth_stencil_below(const Tex *t) { return t->stored == DXGI_FORMAT_D24_UNORM_S8_UINT || t->stored == DXGI_FORMAT_R24G8_TYPELESS; }
+static UINT32 depth_unorm(FLOAT v, UINT bits) {
+  const double top = (double)((1u << bits) - 1);
+  if (!(v > 0.0f)) return 0;
+  if (v >= 1.0f) return (UINT32)top;
+  return (UINT32)((double)v * top + 0.5);
+}
+/* `write`: rows (`pitch` bytes apart) of the program's texels into the subresource, else the subresource into them. */
+static HRESULT tex_depth_rows(Dev *d, Tex *t, UINT sub, BYTE *rows, UINT pitch, BOOL write) {
+  const UINT level = sub % t->desc.MipLevels, w = mip_size(t->desc.Width, level), h = mip_size(t->desc.Height, level);
+  const UINT bytes = depth_texel_bytes(t->desc.Format);
+  UINT d12 = 0;
+  if (!tex_d12_sub(t, sub, &d12)) {      /* (a level the kernel does not keep) */
+    if (!write)
+      for (UINT y = 0; y < h; ++y) memset(rows + (SIZE_T)y * pitch, 0, (SIZE_T)w * bytes);
+    return S_OK;
+  }
+  if (t->desc.SampleDesc.Count > 1) return E_INVALIDARG;      /* (the texels of a multisampled buffer are its samples, which are not copied to memory) */
+  const BOOL stencil = tex_depth_stencil_below(t), float_depth = !stencil;
+  const UINT planes = stencil ? 2 : 1, per_plane = t->kmips * (t->kind == 1 ? 1 : t->desc.ArraySize);
+  const UINT plane_pitch[2] = {(w * 4 + 255u) & ~255u, (w + 255u) & ~255u};
+  const UINT64 plane_at[2] = {0, ((UINT64)plane_pitch[0] * h + 511u) & ~(UINT64)511u};
+  const UINT64 total = planes == 2 ? plane_at[1] + (UINT64)plane_pitch[1] * h : (UINT64)plane_pitch[0] * h;
+  BYTE *memory = NULL;
+  UINT64 size = 0;
+  ID3D12Resource *buffer = NULL;
+  tex_sync(d, t);
+  if (write) {
+    settle(d, t->sampled);
+    if (!retire_room(d, total)) flush(d);
+    buffer = take_upload(d, total, &memory, &size);
+    if (!buffer) return E_OUTOFMEMORY;
+    for (UINT y = 0; y < h; ++y)
+      for (UINT x = 0; x < w; ++x) {
+        const BYTE *in = rows + (SIZE_T)y * pitch + (SIZE_T)x * bytes;
+        UINT32 word = 0, low = 0;
+        BYTE s = 0;
+        FLOAT f = 0.0f;
+        memcpy(&low, in, bytes < 4 ? bytes : 4);
+        switch (t->desc.Format) {
+          case DXGI_FORMAT_D16_UNORM: case DXGI_FORMAT_R16_TYPELESS: f = (FLOAT)(low & 0xFFFFu) / 65535.0f; break;
+          case DXGI_FORMAT_D24_UNORM_S8_UINT: case DXGI_FORMAT_R24G8_TYPELESS: word = low & 0xFFFFFFu, s = (BYTE)(low >> 24); break;
+          case DXGI_FORMAT_D32_FLOAT_S8X24_UINT: case DXGI_FORMAT_R32G8X24_TYPELESS: memcpy(&f, in, 4); word = depth_unorm(f, 24); s = in[4]; break;
+          default: memcpy(&f, in, 4); break;
+        }
+        if (float_depth) memcpy(memory + (SIZE_T)y * plane_pitch[0] + (SIZE_T)x * 4, &f, 4);
+        else memcpy(memory + (SIZE_T)y * plane_pitch[0] + (SIZE_T)x * 4, &word, 4);
+        if (stencil) memory[plane_at[1] + (SIZE_T)y * plane_pitch[1] + x] = s;
+      }
+    ID3D12Resource_Unmap(buffer, 0, NULL);
+  } else {
+    buffer = make_buffer(d, D3D12_HEAP_TYPE_READBACK, total);
+    if (!buffer) return E_OUTOFMEMORY;
+  }
+  for (UINT plane = 0; plane < planes; ++plane) {
+    D3D12_TEXTURE_COPY_LOCATION image, rows12;
+    memset(&image, 0, sizeof image);
+    memset(&rows12, 0, sizeof rows12);
+    image.pResource = t->res;
+    image.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    image.SubresourceIndex = d12 + plane * per_plane;
+    rows12.pResource = buffer;
+    rows12.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    rows12.PlacedFootprint.Offset = plane_at[plane];
+    rows12.PlacedFootprint.Footprint.Format = plane ? DXGI_FORMAT_R8_TYPELESS : DXGI_FORMAT_R32_TYPELESS;
+    rows12.PlacedFootprint.Footprint.Width = w;
+    rows12.PlacedFootprint.Footprint.Height = h;
+    rows12.PlacedFootprint.Footprint.Depth = 1;
+    rows12.PlacedFootprint.Footprint.RowPitch = plane_pitch[plane];
+    if (write) ID3D12GraphicsCommandList_CopyTextureRegion(d->list, &image, 0, 0, 0, &rows12, NULL);
+    else ID3D12GraphicsCommandList_CopyTextureRegion(d->list, &rows12, 0, 0, 0, &image, NULL);
+  }
+  d->recorded = 1;
+  if (write) {
+    ++t->version;
+    t->used = t->written = d->epoch;
+    retire(d, buffer, NULL, size);      /* (kept until the list has run, then a spare) */
+    return S_OK;
+  }
+  flush(d);
+  HRESULT hr = ID3D12Resource_Map(buffer, 0, NULL, (void **)&memory);
+  if (SUCCEEDED(hr) && memory) {
+    for (UINT y = 0; y < h; ++y)
+      for (UINT x = 0; x < w; ++x) {
+        BYTE *out = rows + (SIZE_T)y * pitch + (SIZE_T)x * bytes;
+        UINT32 word = 0;
+        memcpy(&word, memory + (SIZE_T)y * plane_pitch[0] + (SIZE_T)x * 4, 4);
+        const BYTE s = stencil ? memory[plane_at[1] + (SIZE_T)y * plane_pitch[1] + x] : 0;
+        FLOAT f = 0.0f;
+        if (float_depth) memcpy(&f, &word, 4);
+        else f = (FLOAT)((double)(word & 0xFFFFFFu) / 16777215.0);
+        switch (t->desc.Format) {
+          case DXGI_FORMAT_D16_UNORM: case DXGI_FORMAT_R16_TYPELESS: {
+            const UINT16 code = (UINT16)depth_unorm(f, 16);
+            memcpy(out, &code, 2);
+            break;
+          }
+          case DXGI_FORMAT_D24_UNORM_S8_UINT: case DXGI_FORMAT_R24G8_TYPELESS: {
+            const UINT32 packed = (word & 0xFFFFFFu) | (UINT32)s << 24;
+            memcpy(out, &packed, 4);
+            break;
+          }
+          case DXGI_FORMAT_D32_FLOAT_S8X24_UINT: case DXGI_FORMAT_R32G8X24_TYPELESS:
+            memcpy(out, &f, 4);
+            out[4] = s, out[5] = out[6] = out[7] = 0;
+            break;
+          default: memcpy(out, &f, 4); break;
+        }
+      }
+    ID3D12Resource_Unmap(buffer, 0, NULL);
+  } else if (SUCCEEDED(hr)) {
+    hr = E_FAIL;
+  }
+  ID3D12Resource_Release(buffer);
+  return hr;
+}
+
 /* `raw`: the rows are in the stored format (GenerateMips), not the program's. */
 static HRESULT tex_write_rows(Dev *d, Tex *t, UINT sub, UINT x, UINT y, UINT z, UINT w, UINT h, const BYTE *rows, UINT pitch, BOOL raw);
 static HRESULT tex_write(Dev *d, Tex *t, UINT sub, UINT x, UINT y, UINT z, UINT w, UINT h, const BYTE *rows, UINT pitch) { return tex_write_rows(d, t, sub, x, y, z, w, h, rows, pitch, FALSE); }
 static HRESULT tex_write_rows(Dev *d, Tex *t, UINT sub, UINT x, UINT y, UINT z, UINT w, UINT h, const BYTE *rows, UINT pitch, BOOL raw) {
-  if (t->depth || w == 0 || h == 0) return E_INVALIDARG;
+  if (w == 0 || h == 0) return E_INVALIDARG;
+  if (t->depth) {
+    /* (a depth texture's subresource is written whole: Direct3D 12 below copies a depth buffer's planes whole) */
+    const UINT level = sub % t->desc.MipLevels;
+    if (raw || x || y || z || w != mip_size(t->desc.Width, level) || h != mip_size(t->desc.Height, level)) return E_INVALIDARG;
+    return tex_depth_rows(d, t, sub, (BYTE *)rows, pitch, TRUE);
+  }
   if (t->planar) return tex_planar_write(d, t, sub, x, y, w, h, rows, pitch);      /* (both planes of the slice: `rows` has the chroma after the luma) */
   if (format_pairs(t->desc.Format) && ((x & 1) || ((w & 1) && x + w != t->desc.Width))) return E_INVALIDARG;      /* (YUY2, Y210, Y216: whole pairs of pixels) */
   tex_sync(d, t);      /* (what views drew into it goes in first: this write comes after) */
@@ -1020,7 +1161,7 @@ static HRESULT tex_read_rows(Dev *d, Tex *t, UINT sub, UINT z, BYTE *rows, BOOL 
 static HRESULT tex_read(Dev *d, Tex *t, UINT sub, UINT z, BYTE *rows) { return tex_read_rows(d, t, sub, z, rows, FALSE); }
 /* `raw`: rows of `w * stored_bpp` bytes in the stored format. */
 static HRESULT tex_read_rows(Dev *d, Tex *t, UINT sub, UINT z, BYTE *rows, BOOL raw) {
-  if (t->depth) return E_INVALIDARG;
+  if (t->depth) return raw || z ? E_INVALIDARG : tex_depth_rows(d, t, sub, rows, tex_pitch(t, mip_size(t->desc.Width, sub % t->desc.MipLevels)), FALSE);
   if (t->planar) return tex_planar_read(d, t, sub, rows, tex_pitch(t, t->desc.Width));
   tex_sync(d, t);
   const UINT level = sub % t->desc.MipLevels, w = mip_size(t->desc.Width, level), h = mip_size(t->desc.Height, level);
@@ -1224,7 +1365,7 @@ static HRESULT tex_make(Dev *d, const D3D11_TEXTURE2D_DESC *in, UINT slices, ID3
   const BOOL shadowed = !res && !planar && !yuv && (desc.BindFlags & D3D11_BIND_RENDER_TARGET) && desc.SampleDesc.Count == 1 &&
                         ((desc.MipLevels != 1 && !all_levels) || (layered && !dev_layered_targets(d)));
   /* (a format that cannot be had for that use: refused as such, before what the kernel cannot do) */
-  if (!tex_format_for(desc.Format, desc.BindFlags) && !(res && tex_format(desc.Format))) { tex_refused(&desc, "the format, for that use"); return E_INVALIDARG; }
+  if (!tex_format_use(desc.Format, desc.BindFlags, desc.Usage) && !(res && tex_format(desc.Format))) { tex_refused(&desc, "the format, for that use"); return E_INVALIDARG; }
   /* (a depth buffer of several slices: an array or a cube - a volume is not one -, on a device below that draws into layers) */
   if (layered && !planar && (desc.BindFlags & D3D11_BIND_DEPTH_STENCIL)) {
     if (slices) return E_INVALIDARG;
@@ -1257,7 +1398,7 @@ static HRESULT tex_make(Dev *d, const D3D11_TEXTURE2D_DESC *in, UINT slices, ID3
   t->slices = slices ? slices : 1;
   t->kmips = layered && !all_levels && !res ? 1 : desc.MipLevels;      /* (the kernel's volumes, arrays and cubes have one level on a device without them: the program's others are dropped) */
   t->planar = planar ? made_format->bpp : 0;
-  t->fmt = tex_format_for(desc.Format, desc.BindFlags);
+  t->fmt = tex_format_use(desc.Format, desc.BindFlags, desc.Usage);
   if (!t->fmt) { tex_refused(&desc, "the format, for that use"); dx_Release(OBJ(t)); return E_INVALIDARG; }
   t->stored = t->fmt->stored;
   t->bpp = t->fmt->bpp;
@@ -1344,7 +1485,7 @@ static HRESULT STDMETHODCALLTYPE dev_CreateTexture2D(Dev *d, const D3D11_TEXTURE
   Tex *t = NULL;
   EnterCriticalSection(&d->lock);
   HRESULT hr = tex_make(d, desc, 0, NULL, &t);
-  if (SUCCEEDED(hr) && initial && !t->depth) hr = tex_initial(d, t, initial);
+  if (SUCCEEDED(hr) && initial) hr = tex_initial(d, t, initial);
   LeaveCriticalSection(&d->lock);
   if (FAILED(hr)) { if (t) dx_Release(OBJ(t)); return hr; }
   return give(t, (void **)out);
@@ -1364,7 +1505,7 @@ static HRESULT STDMETHODCALLTYPE dev_CreateTexture3D(Dev *d, const D3D11_TEXTURE
     t->c.o.iids = g_tex3_iids;
     t->desc3 = *desc;
     t->desc3.MipLevels = t->desc.MipLevels;
-    if (initial && !t->depth) hr = tex_initial(d, t, initial);
+    if (initial) hr = tex_initial(d, t, initial);
   }
   LeaveCriticalSection(&d->lock);
   if (FAILED(hr)) { if (t) dx_Release(OBJ(t)); return hr; }
@@ -1391,7 +1532,7 @@ static HRESULT STDMETHODCALLTYPE dev_CreateTexture1D(Dev *d, const D3D11_TEXTURE
     t->one_d = TRUE;
     t->desc1 = *desc;
     t->desc1.MipLevels = t->desc.MipLevels;
-    if (initial && !t->depth) hr = tex_initial(d, t, initial);
+    if (initial) hr = tex_initial(d, t, initial);
   }
   LeaveCriticalSection(&d->lock);
   if (FAILED(hr)) { if (t) dx_Release(OBJ(t)); return hr; }
@@ -1763,19 +1904,14 @@ static BOOL depth_view_format(DXGI_FORMAT tex, DXGI_FORMAT view, DXGI_FORMAT *be
   if (stencil) *stencil = s;
   return TRUE;
 }
-/* The dimension of a view of a depth texture: 2D (or 1D) of one that is not an array, an array of all the slices of an array - the kernel's arrays are images of all their
- * layers -, a cube of a cube; its one level. */
+/* The dimension of a view of a depth texture: 1D, 2D, an array of them, a cube or a cube array, of any of its levels and layers (srv_range checks them as for any texture); not a
+ * volume (no depth texture is one) or multisampled (the textures below that shaders read have one sample). */
 static BOOL depth_view_dimension(const Tex *t, const D3D11_SHADER_RESOURCE_VIEW_DESC *desc) {
+  (void)t;
   switch (desc->ViewDimension) {
-    case D3D11_SRV_DIMENSION_TEXTURE1D: return t->kind == 0 && desc->Texture1D.MostDetailedMip == 0;
-    case D3D11_SRV_DIMENSION_TEXTURE2D: return t->kind == 0 && desc->Texture2D.MostDetailedMip == 0;
-    case D3D11_SRV_DIMENSION_TEXTURE1DARRAY:
-      return t->kind == 2 && desc->Texture1DArray.MostDetailedMip == 0 && desc->Texture1DArray.FirstArraySlice == 0 &&
-             (desc->Texture1DArray.ArraySize == (UINT)-1 || desc->Texture1DArray.ArraySize == t->desc.ArraySize);
-    case D3D11_SRV_DIMENSION_TEXTURE2DARRAY:
-      return t->kind == 2 && desc->Texture2DArray.MostDetailedMip == 0 && desc->Texture2DArray.FirstArraySlice == 0 &&
-             (desc->Texture2DArray.ArraySize == (UINT)-1 || desc->Texture2DArray.ArraySize == t->desc.ArraySize);
-    case D3D11_SRV_DIMENSION_TEXTURECUBE: return t->kind == 3 && desc->TextureCube.MostDetailedMip == 0;
+    case D3D11_SRV_DIMENSION_TEXTURE1D: case D3D11_SRV_DIMENSION_TEXTURE2D: case D3D11_SRV_DIMENSION_TEXTURE1DARRAY: case D3D11_SRV_DIMENSION_TEXTURE2DARRAY:
+    case D3D11_SRV_DIMENSION_TEXTURECUBE: case D3D11_SRV_DIMENSION_TEXTURECUBEARRAY:
+      return TRUE;
     default: return FALSE;
   }
 }

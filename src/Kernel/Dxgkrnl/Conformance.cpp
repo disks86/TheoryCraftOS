@@ -3219,6 +3219,28 @@ void cube_array(Rig& rig, ArrayView<uint32_t> out, bool lod) {
 void scene_cube_array(Rig& rig, ArrayView<uint32_t> out) { cube_array(rig, out, false); }
 void scene_cube_array_level(Rig& rig, ArrayView<uint32_t> out) { cube_array(rig, out, true); }
 
+// gather4 of a cube array of two cubes, 4 x 4 (ps_gather_cubearray, or `dxil`: dxil_ps_gather_cubearray): the red and the blue of the four texels of the footprint on the six faces of
+// cube 1 (alpha 0.1) in the top half and of cube 0 in the bottom half, the footprint well inside each face.
+void gather_cube_array(Rig& rig, ArrayView<uint32_t> out, bool dxil) {
+  if (!rig.has2(graphics::kFeature2MipmappedLayers)) return void(rig.step("cube arrays", status::kNotSupported));
+  namespace b = conformance_blobs;
+  Handle texture = leveled_texture(rig, graphics::TextureKind::TextureCubeArray, 12, 4, 1);
+  Vertex v[72];
+  for (uint32_t half = 0; half < 2; ++half)
+    for (uint32_t face = 0; face < 6; ++face) {
+      const float x0 = static_cast<float>(1 + (face % 3) * 10), y0 = static_cast<float>(half * 16 + face / 3 * 8);
+      quad_pixels_alpha(v + 6 * (half * 6 + face), x0, y0, x0 + 10, y0 + 8, half == 0 ? 0.1f : 0.0f, [face](float u, float vv) {
+        const float a = 0.21f + 0.58f * u, c = 0.21f + 0.58f * vv, axis = face % 2 ? 0.0f : 1.0f;   // (the direction is the coordinate * 2 - 1: within -0.58 .. 0.58 of the face)
+        return face < 2 ? graphics::Vec3{axis, c, a} : face < 4 ? graphics::Vec3{a, axis, c} : graphics::Vec3{a, c, axis};
+      });
+    }
+  const ViewDraw dxbc[1] = {{b::k_ps_gather_cubearray, sizeof b::k_ps_gather_cubearray, 0, 12, 0, 0, 0, 0}};
+  const ViewDraw bitcode[1] = {{b::k_dxil_ps_gather_cubearray, sizeof b::k_dxil_ps_gather_cubearray, 0, 12, 0, 0, 0, 0}};
+  draw_views(rig, out, texture, v, 12, dxil ? bitcode : dxbc, 1);
+}
+void scene_gather_cube_array(Rig& rig, ArrayView<uint32_t> out) { gather_cube_array(rig, out, false); }
+void scene_dxil_gather_cube_array(Rig& rig, ArrayView<uint32_t> out) { gather_cube_array(rig, out, true); }
+
 // A volume of 8 x 8 x 4, three levels: level 1 (two slices) by SampleLevel 1 (ps_tex3d_lod), one slice across the top half and the depth running down the bottom half.
 void scene_volume_levels(Rig& rig, ArrayView<uint32_t> out) {
   if (!rig.has2(graphics::kFeature2MipmappedLayers)) return void(rig.step("levels of volumes", status::kNotSupported));
@@ -3429,6 +3451,8 @@ const Entry kScenes[] = {
     {"Direct3D 11 unordered access to levels of a cube's faces", scene_storage_cube_levels},
     {"Direct3D 11 cube array (DXBC)", scene_cube_array},
     {"Direct3D 11 SampleLevel of a cube array (DXBC)", scene_cube_array_level},
+    {"Direct3D 11 gather of a cube array (DXBC)", scene_gather_cube_array},
+    {"Direct3D 12 gather of a cube array (DXIL)", scene_dxil_gather_cube_array},
     {"Direct3D 10 depth bias, float format", scene_depth_bias},
     {"Direct3D 10 depth bias, normalised formats", scene_depth_bias_unorm},
     {"Direct3D 10 two-sided stencil", scene_stencil_two_sided},

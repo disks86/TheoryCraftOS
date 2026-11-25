@@ -151,6 +151,17 @@ static const TexFormat *tex_format_for(DXGI_FORMAT format, UINT bind) {
   if ((bind & D3D11_BIND_RENDER_TARGET) && !(f->flags & FMT_TARGET)) return NULL;
   return f;
 }
+/* The format of a texture of `format` made for `bind` and `usage`: tex_format_for's, and a staging texture of a typed depth format (D32_FLOAT, D24_UNORM_S8_UINT, D16_UNORM,
+ * D32_FLOAT_S8X24_UINT) is a depth texture too - its texels a program maps, kept in a depth buffer below that copies take to and from depth textures. */
+static const TexFormat *tex_format_use(DXGI_FORMAT format, UINT bind, D3D11_USAGE usage) {
+  const TexFormat *f = tex_format_for(format, bind);
+  if (f || usage != D3D11_USAGE_STAGING || bind) return f;
+  f = tex_format(format);
+  return f && (f->flags & FMT_DEPTH) && format != DXGI_FORMAT_R32_TYPELESS && format != DXGI_FORMAT_R16_TYPELESS && format != DXGI_FORMAT_R24G8_TYPELESS &&
+                 format != DXGI_FORMAT_R32G8X24_TYPELESS
+             ? f
+             : NULL;
+}
 /* The write mask of a render target of a format of fewer channels than it is kept with (D3D12_COLOR_WRITE_ENABLE_*: the channels it has). */
 static UINT8 tex_format_mask(const TexFormat *f) {
   if (!f || (!f->channels && f->packed != PACK_R11G11B10 && f->packed != PACK_565)) return 0xF;

@@ -52,6 +52,10 @@
 //   CopyRegion       dst_index, dst_x, dst_y, src_index, src_x, src_y, width, height   (colour images of one format, or of two whose pixels - or blocks - are as many bytes; also staging memory)
 //                    [, dst_level, dst_layer, src_level, src_layer, layer_count]   (between subresources: the rectangle of layer_count layers - a volume's slices - from those of the
 //                    levels; levels other than 0 of a layered image, and block-compressed images - whole blocks, as CopyBufferImage -, need the adapter's kFeature2MipmappedLayers)
+//                    [, planes]   (bit 0 the depth, bit 1 the stencil, of a copy between depth buffers; 0: every plane the buffers have)
+//                    (depth buffers and multisampled images - images whose contents the system has no memory of - are copied by the device, the adapter's kFeature2DepthCopies: whole
+//                    subresources (the rectangle all of a level that is the same size in both, at 0, 0) between two of one format and sample count, the planes of a depth buffer
+//                    asked for)
 //   GenerateMipmaps  allocation_index   (every level from level 0 by the box filter; with kFeature2MipmappedLayers also of an array's or a cube's layers, a volume - 2 x 2 x 2 - and the wide formats; not
 //                    of block-compressed or integer textures)
 //   BeginQuery       allocation_index, offset [, kind]   (kind, bits 0-7: a graphics::QueryKind, 0 occlusion count if left out, 1 occlusion predicate, 2 IA vertices, 3 IA primitives, 4 VS invocations,
@@ -84,6 +88,9 @@
 //                    [, narrow]   (a NarrowLayout: the buffer's pixels are narrower than the image's - one or two 8-bit channels of an A8B8G8R8 / X8B8G8R8 image, or one or two 16-bit channels of an
 //                    A16B16G16R16 one: copied into the image they become (r, g or 0, 0, maximum), out of it the first channels are taken. What a runtime keeps R8 / R8G8 / R16 / R16G16 textures and
 //                    the planes of NV12 / P010 in, as the kernel has no narrower formats)
+//                    (a depth buffer of one sample takes one of the depth layouts instead - and needs one -, the adapter's kFeature2DepthCopies: the buffer holds its depth as 32-bit floats,
+//                    16-bit or 24-bit normalised integers (the 24 bits in the low bits of a word whose high byte is 0, and is not read), or the stencil of a D24S8 buffer as bytes; copied
+//                    into the buffer a depth is rounded to the nearest code, into the image a code becomes the float it stands for)
 //   DecodeFrame      decoder handle, buffer_index, picture_offset, picture_bytes, matrix_offset, matrix_bytes, slices_offset, slices_bytes, bitstream_index, bitstream_offset, bitstream_bytes,
 //                    luma_index, chroma_index, status_index, status_offset, output_keyed, key_count, then key_count allocation indices
 //                    [, kDecodeConversion, output format (hardware::VpFormat), output colour space, decode colour space, output plane0_index, plane1_index (kNoAllocation for
@@ -214,9 +221,13 @@ inline bool is_adjacency(Topology t) { return t == Topology::LineListAdjacency |
 inline uint32_t patch_points(Topology t) { return static_cast<uint32_t>(t) - kPatchListBase; }
 
 constexpr uint32_t kNoAllocation = 0xFFFFFFFFu;
-// CopyBufferImage's last word: how a buffer's pixels are narrower than the image's.
-enum class NarrowLayout : uint32_t { None = 0, R8 = 1, R8G8 = 2, R16 = 3, R16G16 = 4 };
-constexpr uint32_t narrow_pixel_bytes(NarrowLayout n) { return n == NarrowLayout::R8 ? 1 : n == NarrowLayout::R8G8 || n == NarrowLayout::R16 ? 2 : n == NarrowLayout::R16G16 ? 4 : 0; }
+// CopyBufferImage's last word: how a buffer's pixels are narrower than the image's - or, of a depth buffer, which plane the buffer holds and how (DepthFloat32 .. Stencil8).
+enum class NarrowLayout : uint32_t { None = 0, R8 = 1, R8G8 = 2, R16 = 3, R16G16 = 4, DepthFloat32 = 5, DepthUnorm16 = 6, DepthUnorm24 = 7, Stencil8 = 8 };
+constexpr bool is_depth_layout(NarrowLayout n) { return n == NarrowLayout::DepthFloat32 || n == NarrowLayout::DepthUnorm16 || n == NarrowLayout::DepthUnorm24 || n == NarrowLayout::Stencil8; }
+constexpr uint32_t narrow_pixel_bytes(NarrowLayout n) {
+  return n == NarrowLayout::R8 || n == NarrowLayout::Stencil8 ? 1 : n == NarrowLayout::R8G8 || n == NarrowLayout::R16 || n == NarrowLayout::DepthUnorm16 ? 2
+         : n == NarrowLayout::R16G16 || n == NarrowLayout::DepthFloat32 || n == NarrowLayout::DepthUnorm24 ? 4 : 0;
+}
 constexpr uint32_t kStreamOutputAppendOffset = 0xFFFFFFFFu;   // SetStreamOutput's offset for "after what the last stream output into the buffer wrote"
 // (the longest packets: PushConstants - the byte count, then up to kMaxPushConstantBytes of constants - and a VideoProcess of every stream with both optional parts)
 constexpr uint32_t kMaxPacketWords = 1 + (1 + graphics::kMaxPushConstantBytes / 4 > kVideoProcessMaxWords ? 1 + graphics::kMaxPushConstantBytes / 4 : kVideoProcessMaxWords);
@@ -329,6 +340,12 @@ class CommandWriter {
   void copy_subresource_region(uint32_t dst, uint32_t dst_level, uint32_t dst_layer, uint32_t dst_x, uint32_t dst_y, uint32_t src, uint32_t src_level, uint32_t src_layer, uint32_t src_x,
                                uint32_t src_y, uint32_t width, uint32_t height, uint32_t layer_count = 1) {
     packet(Op::CopyRegion, {dst, dst_x, dst_y, src, src_x, src_y, width, height, dst_level, dst_layer, src_level, src_layer, layer_count});
+  }
+  // A whole subresource (`layer_count` layers) of a depth buffer or a multisampled image into another (kFeature2DepthCopies): the planes of a depth buffer (bit 0 the depth, bit 1 the stencil;
+  // 0 every one), the size of the destination's level.
+  void copy_whole_subresources(uint32_t dst, uint32_t dst_level, uint32_t dst_layer, uint32_t src, uint32_t src_level, uint32_t src_layer, uint32_t width, uint32_t height, uint32_t layer_count = 1,
+                               uint32_t planes = 0) {
+    packet(Op::CopyRegion, {dst, 0, 0, src, 0, 0, width, height, dst_level, dst_layer, src_level, src_layer, layer_count, planes});
   }
   void generate_mipmaps(uint32_t allocation) { packet(Op::GenerateMipmaps, {allocation}); }
   // `kind`: the kind word (0, the occlusion count, when it is left out: the packet then has two words)

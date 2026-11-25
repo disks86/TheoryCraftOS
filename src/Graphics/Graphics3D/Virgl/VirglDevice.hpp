@@ -45,6 +45,8 @@ class VirglDevice final : public IGraphicsDevice {
             (gpu_.virgl_has_compute() ? kFeature2MipmappedLayers : 0u) |   // (levels of every image and views of them need the host's texture views: GL 4.3, as compute)
             // (the least and greatest samples of a colour image: a pass of texel fetches, extreme_resolve)
             kFeature2ColorResolveModes |
+            // (the planes of depth images by transfers, whole subresources of depth and multisampled images by blits)
+            kFeature2DepthCopies |
             // (polygon modes, polygon offset, depth clamp, two-sided stencil, logic operations and border colours are GL 3.3 core, anisotropic filtering GL 4.6 / an extension every
             // desktop GL host has; dual-source blending when the host blends one target so)
             kFeature2RasterizerState | kFeature2LogicOps | kFeature2SamplerState | (gpu_.virgl_max_dual_source_targets() >= 1 ? kFeature2DualSourceBlend : 0u) |

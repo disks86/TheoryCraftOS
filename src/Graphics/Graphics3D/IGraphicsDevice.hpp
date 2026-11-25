@@ -257,6 +257,24 @@ class IImage {
     if (level != 0) return false;
     return layer_count() > 1 || layer != 0 ? read_layer_pixels_float(layer, out) : read_pixels_float(out);
   }
+  // The planes of a depth image of one sample (kFeature2DepthCopies): the depth of level `level`'s layer `layer` as floats, and the stencil of an image that has one (ImageDesc::stencil)
+  // as bytes, mip_extent() of the extent each, rows top to bottom; an empty view leaves its plane alone. False for a level or layer the image does not have, a plane it has not, a
+  // wrong size, an image that is not a depth image, or a device that cannot (the default).
+  virtual bool read_depth_subresource(uint32_t level, uint32_t layer, ArrayView<float> depth, ArrayView<uint8_t> stencil) {
+    (void)level, (void)layer, (void)depth, (void)stencil;
+    return false;
+  }
+  virtual bool write_depth_subresource(uint32_t level, uint32_t layer, ArrayView<const float> depth, ArrayView<const uint8_t> stencil) {
+    (void)level, (void)layer, (void)depth, (void)stencil;
+    return false;
+  }
+  // Copies the whole of level `source_level`'s layer `source_layer` of `source` into level `level`'s layer `layer` of this image, on the device (kFeature2DepthCopies): images of one
+  // format and sample count whose subresources are the same size - depth images (`planes`: bit 0 the depth, bit 1 the stencil, which both must have) and multisampled colour images
+  // (bit 0: the colour), every sample. False for anything else, or a device that cannot (the default).
+  virtual bool copy_subresource(IImage& source, uint32_t level, uint32_t layer, uint32_t source_level, uint32_t source_layer, uint32_t planes) {
+    (void)source, (void)level, (void)layer, (void)source_level, (void)source_layer, (void)planes;
+    return false;
+  }
   // Makes every level above 0 from level 0 by the 2 x 2 box filter of mip_box_downsample, each from the one before it (with kFeature2MipmappedLayers: every layer of an array or a
   // cube its own chain, a volume's levels by the 2 x 2 x 2 box of its slices). False when the image has one level or cannot.
   virtual bool generate_mipmaps() { return false; }
@@ -1154,6 +1172,10 @@ enum DeviceFeature2 : uint32_t {
   kFeature2SamplerState = 1u << 11,         // SamplerDesc::max_anisotropy and custom_border / border_rgba
   kFeature2Viewports = 1u << 12,            // ICommandBuffer::set_viewports / set_scissors and ShaderIo::viewport from geometry shaders
   kFeature2LayerFromAnyStage = 1u << 13,    // ShaderIo::layer and ShaderIo::viewport written by vertex and domain shaders (Direct3D 11.3's VPAndRTArrayIndexFromAnyShaderFeedingRasterizer)
+  // The contents of the images the system keeps no memory of: IImage::read_depth_subresource / write_depth_subresource (a depth image's depth and stencil planes) and
+  // IImage::copy_subresource (a whole subresource of a depth image or of a multisampled image into another of the same format, size and samples, on the device). (Bit 24: a high bit,
+  // the ones between are left for the other features being added.)
+  kFeature2DepthCopies = 1u << 24,
 };
 constexpr uint32_t kMaxViewports = 16;
 

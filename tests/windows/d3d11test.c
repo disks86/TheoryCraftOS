@@ -4603,6 +4603,77 @@ static UINT32 sample_quad(ID3D11ShaderResourceView *view, const D3D11_SAMPLER_DE
 }
 static int grey_near(UINT32 p, int value) { return red(p) >= value - 2 && red(p) <= value + 2 && green(p) == red(p) && blue(p) == red(p); }
 
+/* Draws a quad over the target with vs_vol (the texture coordinate is the vertex colour) from (u0, v0, w) at the top left to (u1, v1, w) at the bottom right, sampling `view` with
+ * `sd` through `ps_code`; the pixel in the middle. */
+static UINT32 sample_quad_vol(ID3D11ShaderResourceView *view, const D3D11_SAMPLER_DESC *sd, const BYTE *ps_code, SIZE_T ps_size, float u0, float v0, float u1, float v1, float w) {
+  const VertexF v[6] = {{-1, 1, 0.5f, u0, v0, w, 1}, {1, 1, 0.5f, u1, v0, w, 1}, {-1, -1, 0.5f, u0, v1, w, 1}, {-1, -1, 0.5f, u0, v1, w, 1}, {1, 1, 0.5f, u1, v0, w, 1}, {1, -1, 0.5f, u1, v1, w, 1}};
+  ID3D11Buffer *vb = make_buffer(D3D11_BIND_VERTEX_BUFFER, D3D11_USAGE_DEFAULT, 0, v, sizeof v);
+  ID3D11VertexShader *vs = NULL;
+  ID3D11PixelShader *ps = NULL;
+  ID3D11Device_CreateVertexShader(g_device, dx_vs_vol_dxbc, sizeof dx_vs_vol_dxbc, NULL, &vs);
+  ID3D11Device_CreatePixelShader(g_device, ps_code, ps_size, NULL, &ps);
+  ID3D11SamplerState *sampler = NULL;
+  ID3D11Device_CreateSamplerState(g_device, sd, &sampler);
+  UINT32 result = 0;
+  if (vb && vs && ps && sampler && view) {
+    begin(NULL);
+    clear(0, 0, 0);
+    ID3D11DeviceContext_VSSetShader(g_context, vs, NULL, 0);
+    ID3D11DeviceContext_PSSetShader(g_context, ps, NULL, 0);
+    ID3D11DeviceContext_PSSetShaderResources(g_context, 0, 1, &view);
+    ID3D11DeviceContext_PSSetSamplers(g_context, 0, 1, &sampler);
+    bind_floats(vb);
+    ID3D11DeviceContext_Draw(g_context, 6, 0);
+    read_target();
+    result = pixel(32, 32);
+    ID3D11ShaderResourceView *none = NULL;
+    ID3D11DeviceContext_PSSetShaderResources(g_context, 0, 1, &none);
+  }
+  if (sampler) ID3D11SamplerState_Release(sampler);
+  if (ps) ID3D11PixelShader_Release(ps);
+  if (vs) ID3D11VertexShader_Release(vs);
+  if (vb) ID3D11Buffer_Release(vb);
+  return result;
+}
+/* The trilinear (sd as it is), anisotropy 2 and anisotropy 4 lookups of a volume (256 x 64 x 4, its three levels each one grey of `shades`) and of a cube (faces 256 x 256, the same
+ * levels), each with four texels a pixel across and one down: the volume's slice in the middle, the cube's +Z face from (-1, -0.25) to (1, 0.25). */
+static void sample_aniso_kinds(D3D11_SAMPLER_DESC *sd, const BYTE *shades, UINT32 volume[3], UINT32 cube[3]) {
+  volume[0] = volume[1] = volume[2] = cube[0] = cube[1] = cube[2] = 0;
+  const D3D11_FILTER filter = sd->Filter;
+  D3D11_SUBRESOURCE_DATA initial[3 * 6];
+  /* (every subresource of a level points at one run of texels of its grey: the levels are at most 256 x 256) */
+  static UINT32 runs[3][256 * 256];
+  for (UINT l = 0; l < 3; ++l)
+    for (UINT i = 0; i < 256 * 256; ++i) runs[l][i] = 0xFF000000u | shades[l] * 0x010101u;
+  D3D11_TEXTURE3D_DESC vd = {256, 64, 4, 3, DXGI_FORMAT_B8G8R8A8_UNORM, D3D11_USAGE_DEFAULT, D3D11_BIND_SHADER_RESOURCE, 0, 0};
+  for (UINT l = 0; l < 3; ++l) initial[l].pSysMem = runs[l], initial[l].SysMemPitch = (256 >> l) * 4, initial[l].SysMemSlicePitch = (256 >> l) * (64 >> l) * 4;
+  ID3D11Texture3D *v3 = NULL;
+  ID3D11ShaderResourceView *view = NULL;
+  if (SUCCEEDED(ID3D11Device_CreateTexture3D(g_device, &vd, initial, &v3))) ID3D11Device_CreateShaderResourceView(g_device, (ID3D11Resource *)v3, NULL, &view);
+  for (UINT k = 0; k < 3 && view; ++k) {
+    sd->Filter = k == 0 ? filter : D3D11_FILTER_ANISOTROPIC;
+    sd->MaxAnisotropy = k == 0 ? 1 : 2 * k;
+    volume[k] = sample_quad_vol(view, sd, dx_ps_tex3d_dxbc, sizeof dx_ps_tex3d_dxbc, 0, 0, 1, 1, 0.5f);
+  }
+  if (view) ID3D11ShaderResourceView_Release(view);
+  if (v3) ID3D11Texture3D_Release(v3);
+  view = NULL;
+  D3D11_TEXTURE2D_DESC cd = {256, 256, 3, 6, DXGI_FORMAT_B8G8R8A8_UNORM, {1, 0}, D3D11_USAGE_DEFAULT, D3D11_BIND_SHADER_RESOURCE, 0, D3D11_RESOURCE_MISC_TEXTURECUBE};
+  for (UINT f = 0; f < 6; ++f)
+    for (UINT l = 0; l < 3; ++l) initial[f * 3 + l].pSysMem = runs[l], initial[f * 3 + l].SysMemPitch = (256 >> l) * 4, initial[f * 3 + l].SysMemSlicePitch = 0;
+  ID3D11Texture2D *c2 = NULL;
+  if (SUCCEEDED(ID3D11Device_CreateTexture2D(g_device, &cd, initial, &c2))) ID3D11Device_CreateShaderResourceView(g_device, (ID3D11Resource *)c2, NULL, &view);
+  for (UINT k = 0; k < 3 && view; ++k) {
+    sd->Filter = k == 0 ? filter : D3D11_FILTER_ANISOTROPIC;
+    sd->MaxAnisotropy = k == 0 ? 1 : 2 * k;
+    cube[k] = sample_quad_vol(view, sd, dx_ps_texcube_dxbc, sizeof dx_ps_texcube_dxbc, -1, -0.25f, 1, 0.25f, 1);
+  }
+  if (view) ID3D11ShaderResourceView_Release(view);
+  if (c2) ID3D11Texture2D_Release(c2);
+  sd->Filter = filter;
+  sd->MaxAnisotropy = 1;
+}
+
 /* Several viewports (RSSetViewports of two, RSGetViewports): a geometry shader sends triangle n to viewport n; and what OPTIONS3 says of the layer and viewport from a vertex shader. */
 static void test_viewports(int software) {
   ID3D11GeometryShader *gs = NULL;
@@ -4711,6 +4782,180 @@ static void test_sampler_state(void) {
     if (view) ID3D11ShaderResourceView_Release(view);
     if (tex) ID3D11Texture2D_Release(tex);
   }
+  /* The same footprint on a volume (256 x 64 x 4, a slice in the middle) and on the +Z face of a cube (256 x 256, a quarter of its height over the target): the levels 255, 128, 0 */
+  {
+    const BYTE shades[3] = {255, 128, 0};
+    sd.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
+    sd.MaxAnisotropy = 1;
+    UINT32 volume[3], cube[3];
+    sample_aniso_kinds(&sd, shades, volume, cube);
+    printf("d3d11test: volume trilinear %08x, anisotropy 2 %08x, 4 %08x; cube %08x %08x %08x\n", (unsigned)volume[0], (unsigned)volume[1], (unsigned)volume[2], (unsigned)cube[0],
+           (unsigned)cube[1], (unsigned)cube[2]);
+    check(grey_near(volume[0], 0) && grey_near(cube[0], 0), "a volume and a cube four times narrower than high: trilinear filtering reads the level of the longer axis");
+    if (software)
+      check(grey_near(volume[1], 128) && grey_near(volume[2], 255) && grey_near(cube[1], 128) && grey_near(cube[2], 255),
+            "D3D11_FILTER_ANISOTROPIC of a volume and a cube: MaxAnisotropy lookups along the longer axis, at the level of the shorter");
+    else
+      check(red(volume[2]) >= red(volume[0]) && red(cube[2]) >= red(cube[0]), "D3D11_FILTER_ANISOTROPIC of a volume and a cube: no blurrier than trilinear filtering");
+  }
+}
+
+/* ---- depth views of levels and layers, copies of depth textures, SetResourceMinLOD ------------------------------------------------------------------------------------------ */
+
+static float depth11(UINT level, UINT layer) { return (float)(1 + 4 * level + layer) / 16.0f; }
+static UINT32 unorm24_11(float v) { return (UINT32)((double)v * 16777215.0 + 0.5); }
+/* A D24S8 depth texture (R24G8_TYPELESS, read by shaders too) of 16 x 16, two slices and two levels, each subresource cleared through a depth view of it to depth11(level, slice) and
+ * the stencil 10 * level + slice + 1. */
+static ID3D11Texture2D *cleared_depth11(DXGI_FORMAT format, DXGI_FORMAT dsv_format) {
+  D3D11_TEXTURE2D_DESC desc = {16, 16, 2, 2, format, {1, 0}, D3D11_USAGE_DEFAULT, D3D11_BIND_DEPTH_STENCIL | D3D11_BIND_SHADER_RESOURCE, 0, 0};
+  ID3D11Texture2D *t = NULL;
+  if (FAILED(ID3D11Device_CreateTexture2D(g_device, &desc, NULL, &t)) || !t) return NULL;
+  for (UINT m = 0; m < 2; ++m)
+    for (UINT l = 0; l < 2; ++l) {
+      D3D11_DEPTH_STENCIL_VIEW_DESC dv;
+      memset(&dv, 0, sizeof dv);
+      dv.Format = dsv_format;
+      dv.ViewDimension = D3D11_DSV_DIMENSION_TEXTURE2DARRAY;
+      dv.Texture2DArray.MipSlice = m, dv.Texture2DArray.FirstArraySlice = l, dv.Texture2DArray.ArraySize = 1;
+      ID3D11DepthStencilView *view = NULL;
+      if (SUCCEEDED(ID3D11Device_CreateDepthStencilView(g_device, (ID3D11Resource *)t, &dv, &view)) && view) {
+        ID3D11DeviceContext_ClearDepthStencilView(g_context, view, D3D11_CLEAR_DEPTH | D3D11_CLEAR_STENCIL, depth11(m, l), (UINT8)(10 * m + l + 1));
+        ID3D11DepthStencilView_Release(view);
+      }
+    }
+  return t;
+}
+/* A staging texture of 16 x 16, two slices and two levels. */
+static ID3D11Texture2D *staging11(DXGI_FORMAT format, UINT access) {
+  D3D11_TEXTURE2D_DESC desc = {16, 16, 2, 2, format, {1, 0}, D3D11_USAGE_STAGING, 0, access, 0};
+  ID3D11Texture2D *t = NULL;
+  return SUCCEEDED(ID3D11Device_CreateTexture2D(g_device, &desc, NULL, &t)) ? t : NULL;
+}
+
+/* Depth views of any level and slice: a slice of level 1 (an array view of one slice), sampled; copies of depth textures - into a staging texture of the typed format and of the
+ * typeless one (CopyResource; mapped: the 24-bit depth with the stencil above it), from a staging texture into a depth texture, a subresource into a subresource
+ * (CopySubresourceRegion: both planes), a part of one (not copied); and SetResourceMinLOD (the most detailed level of the texture, whatever level a view starts at). */
+static void test_depth_textures_11(void) {
+  ID3D11Texture2D *depth = cleared_depth11(DXGI_FORMAT_R24G8_TYPELESS, DXGI_FORMAT_D24_UNORM_S8_UINT);
+  check(depth != NULL, "a D24S8 depth texture of two slices and two levels that shaders read");
+  if (!depth) return;
+  /* the view of slice 1 of level 1, sampled by a shader that declares an array */
+  ID3D11VertexShader *vs = NULL;
+  ID3D11PixelShader *ps = NULL;
+  ID3D11SamplerState *sampler = point_sampler();
+  ID3D11Device_CreateVertexShader(g_device, dx_vs_vol_dxbc, sizeof dx_vs_vol_dxbc, NULL, &vs);
+  ID3D11Device_CreatePixelShader(g_device, dx_ps_texarray_dxbc, sizeof dx_ps_texarray_dxbc, NULL, &ps);
+  D3D11_SHADER_RESOURCE_VIEW_DESC sv;
+  memset(&sv, 0, sizeof sv);
+  sv.Format = DXGI_FORMAT_R24_UNORM_X8_TYPELESS;
+  sv.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2DARRAY;
+  sv.Texture2DArray.MostDetailedMip = 1, sv.Texture2DArray.MipLevels = 1, sv.Texture2DArray.FirstArraySlice = 1, sv.Texture2DArray.ArraySize = 1;
+  ID3D11ShaderResourceView *view = NULL;
+  const HRESULT hr = ID3D11Device_CreateShaderResourceView(g_device, (ID3D11Resource *)depth, &sv, &view);
+  check(SUCCEEDED(hr) && view, "a shader resource view of a slice of a level of a depth texture");
+  if (view && vs && ps && sampler) {
+    const UINT32 got = draw_lookup(vs, ps, view, sampler, 0.5f, 0.5f, 0);
+    printf("d3d11test: depth view of level 1 slice 1 %08x (want red %u)\n", (unsigned)got, (unsigned)(depth11(1, 1) * 255.0f + 0.5f));
+    check(red(got) == (int)(depth11(1, 1) * 255.0f + 0.5f), "the depth of level 1 slice 1 through a view of it");
+  }
+  if (view) ID3D11ShaderResourceView_Release(view);
+  if (ps) ID3D11PixelShader_Release(ps);
+  if (vs) ID3D11VertexShader_Release(vs);
+  if (sampler) ID3D11SamplerState_Release(sampler);
+  /* copies into staging textures, the typed depth format and the typeless one, mapped */
+  ID3D11Texture2D *typed = staging11(DXGI_FORMAT_D24_UNORM_S8_UINT, D3D11_CPU_ACCESS_READ | D3D11_CPU_ACCESS_WRITE), *raw = staging11(DXGI_FORMAT_R24G8_TYPELESS, D3D11_CPU_ACCESS_READ);
+  check(typed && raw, "staging textures of D24_UNORM_S8_UINT and R24G8_TYPELESS");
+  if (typed && raw) {
+    ID3D11DeviceContext_CopyResource(g_context, (ID3D11Resource *)typed, (ID3D11Resource *)depth);
+    ID3D11DeviceContext_CopyResource(g_context, (ID3D11Resource *)raw, (ID3D11Resource *)depth);
+    int wrong = 0;
+    for (UINT sub = 0; sub < 4; ++sub) {
+      const UINT m = sub % 2, l = sub / 2, w = 16 >> m;
+      const UINT32 want = unorm24_11(depth11(m, l)) | (10u * m + l + 1) << 24;
+      ID3D11Texture2D *both[2] = {typed, raw};
+      for (int k = 0; k < 2; ++k) {
+        D3D11_MAPPED_SUBRESOURCE mapped;
+        if (FAILED(ID3D11DeviceContext_Map(g_context, (ID3D11Resource *)both[k], sub, D3D11_MAP_READ, 0, &mapped)) || !mapped.pData) { ++wrong; continue; }
+        const UINT32 *texels = mapped.pData;
+        if (texels[0] != want || texels[(w - 1) * mapped.RowPitch / 4 + w - 1] != want) {
+          if (!wrong) printf("  d3d11test: depth copy subresource %u (%s) %08x, want %08x\n", sub, k ? "typeless" : "typed", (unsigned)texels[0], (unsigned)want);
+          ++wrong;
+        }
+        ID3D11DeviceContext_Unmap(g_context, (ID3D11Resource *)both[k], sub);
+      }
+    }
+    check(wrong == 0, "CopyResource of a depth texture into staging textures: the 24-bit depth and the stencil of every subresource");
+    /* a staging texture written and copied into a depth texture, then out again */
+    D3D11_MAPPED_SUBRESOURCE mapped;
+    if (SUCCEEDED(ID3D11DeviceContext_Map(g_context, (ID3D11Resource *)typed, 0, D3D11_MAP_WRITE, 0, &mapped)) && mapped.pData) {
+      for (UINT y = 0; y < 16; ++y)
+        for (UINT x = 0; x < 16; ++x) ((UINT32 *)((BYTE *)mapped.pData + y * mapped.RowPitch))[x] = (y * 16 + x) * 65793u | (x + y) << 24;
+      ID3D11DeviceContext_Unmap(g_context, (ID3D11Resource *)typed, 0);
+    }
+    ID3D11Texture2D *other = cleared_depth11(DXGI_FORMAT_R24G8_TYPELESS, DXGI_FORMAT_D24_UNORM_S8_UINT);
+    if (other) {
+      ID3D11DeviceContext_CopySubresourceRegion(g_context, (ID3D11Resource *)other, 0, 0, 0, 0, (ID3D11Resource *)typed, 0, NULL);
+      /* (a part of a subresource of a depth texture is not copied) */
+      const D3D11_BOX half = {0, 0, 0, 8, 16, 1};
+      ID3D11DeviceContext_CopySubresourceRegion(g_context, (ID3D11Resource *)other, 2, 0, 0, 0, (ID3D11Resource *)typed, 0, &half);
+      ID3D11DeviceContext_CopyResource(g_context, (ID3D11Resource *)raw, (ID3D11Resource *)other);
+      int bad = 0;
+      if (SUCCEEDED(ID3D11DeviceContext_Map(g_context, (ID3D11Resource *)raw, 0, D3D11_MAP_READ, 0, &mapped)) && mapped.pData) {
+        for (UINT y = 0; y < 16; ++y)
+          for (UINT x = 0; x < 16; ++x) bad += ((const UINT32 *)((const BYTE *)mapped.pData + y * mapped.RowPitch))[x] != ((y * 16 + x) * 65793u | (x + y) << 24);
+        ID3D11DeviceContext_Unmap(g_context, (ID3D11Resource *)raw, 0);
+      } else {
+        ++bad;
+      }
+      UINT32 kept = 0;
+      if (SUCCEEDED(ID3D11DeviceContext_Map(g_context, (ID3D11Resource *)raw, 2, D3D11_MAP_READ, 0, &mapped)) && mapped.pData) {
+        kept = *(const UINT32 *)mapped.pData;
+        ID3D11DeviceContext_Unmap(g_context, (ID3D11Resource *)raw, 2);
+      }
+      printf("d3d11test: a depth texture written from a staging one: %u texels wrong; slice 1 after a part copy %08x\n", bad, (unsigned)kept);
+      check(bad == 0, "CopySubresourceRegion from a staging texture into a depth texture: the depth and the stencil");
+      check(kept == (unorm24_11(depth11(0, 1)) | 2u << 24), "CopySubresourceRegion of part of a depth texture's subresource copies nothing");
+      ID3D11Texture2D_Release(other);
+    }
+  }
+  if (raw) ID3D11Texture2D_Release(raw);
+  if (typed) ID3D11Texture2D_Release(typed);
+  ID3D11Texture2D_Release(depth);
+
+  /* SetResourceMinLOD: levels 255, 128, 0 of a texture drawn at its size (level 0 of the view) */
+  const BYTE shades[3] = {255, 128, 0};
+  ID3D11Texture2D *tex = NULL;
+  ID3D11ShaderResourceView *whole = grey_levels(64, 64, 3, shades, &tex), *from1 = NULL;
+  if (tex) {
+    D3D11_SHADER_RESOURCE_VIEW_DESC v1;
+    memset(&v1, 0, sizeof v1);
+    v1.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    v1.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+    v1.Texture2D.MostDetailedMip = 1, v1.Texture2D.MipLevels = (UINT)-1;
+    ID3D11Device_CreateShaderResourceView(g_device, (ID3D11Resource *)tex, &v1, &from1);
+  }
+  D3D11_SAMPLER_DESC sd;
+  memset(&sd, 0, sizeof sd);
+  sd.Filter = D3D11_FILTER_MIN_MAG_MIP_POINT;
+  sd.AddressU = sd.AddressV = sd.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
+  sd.MaxLOD = 3.402823466e+38f;
+  if (whole && from1) {
+    const UINT32 none = sample_quad(whole, &sd, 0, 0, 1, 1);
+    ID3D11DeviceContext_SetResourceMinLOD(g_context, (ID3D11Resource *)tex, 1.0f);
+    const FLOAT got_lod = ID3D11DeviceContext_GetResourceMinLOD(g_context, (ID3D11Resource *)tex);
+    const UINT32 one = sample_quad(whole, &sd, 0, 0, 1, 1), view_one = sample_quad(from1, &sd, 0, 0, 1, 1);
+    ID3D11DeviceContext_SetResourceMinLOD(g_context, (ID3D11Resource *)tex, 2.0f);
+    const UINT32 view_two = sample_quad(from1, &sd, 0, 0, 1, 1);
+    ID3D11DeviceContext_SetResourceMinLOD(g_context, (ID3D11Resource *)tex, 0.0f);
+    const UINT32 back = sample_quad(whole, &sd, 0, 0, 1, 1);
+    printf("d3d11test: SetResourceMinLOD none %08x, 1 %08x (got %g), a view from level 1 with 1 %08x and 2 %08x, 0 again %08x\n", (unsigned)none, (unsigned)one, got_lod, (unsigned)view_one,
+           (unsigned)view_two, (unsigned)back);
+    check(grey_near(none, 255) && grey_near(one, 128) && got_lod == 1.0f && grey_near(back, 255), "SetResourceMinLOD 1: level 1 is the most detailed sampled; GetResourceMinLOD");
+    check(grey_near(view_one, 128) && grey_near(view_two, 0), "SetResourceMinLOD counts the texture's levels: a view from level 1 reads its first, then (2) its second");
+  }
+  if (from1) ID3D11ShaderResourceView_Release(from1);
+  if (whole) ID3D11ShaderResourceView_Release(whole);
+  if (tex) ID3D11Texture2D_Release(tex);
 }
 
 /* ---- vertex formats and instance step rates ------------------------------------------------------------------------------------------------------------------------------ */
@@ -5068,6 +5313,7 @@ int main(void) {
       test_render_to_levels();
       test_fixed_state();
       test_sampler_state();
+      test_depth_textures_11();
       test_texture_uavs();
       test_pixel_texture_uavs();
       test_layered_target();

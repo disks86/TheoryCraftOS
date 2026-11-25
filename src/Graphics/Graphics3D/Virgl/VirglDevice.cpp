@@ -280,7 +280,7 @@ class VirglBuffer final : public IBuffer {
 
 class VirglImage final : public IImage {
  public:
-  VirglImage(VirglDevice& device, const ImageDesc& desc) : device_(device), desc_(desc) {
+  VirglImage(VirglDevice& device, const ImageDesc& desc) : device_(device), desc_(desc), surfaces_(device.gpu().allocator()) {
     hardware::VirtioGpu& gpu = device.gpu();
     id_ = gpu.allocate_resource_id();
     const bool depth = desc.format == Format::D32Float;
@@ -374,7 +374,7 @@ class VirglImage final : public IImage {
     if (stencil_view_) device_.destroy_object(stencil_view_);
     if (stand_in_) destroy(gpu.allocator(), stand_in_);
     if (fetch_view_) device_.destroy_object(fetch_view_);
-    for (const LayerSurface& s : surfaces_)
+    for (const LayerSurface& s : surfaces_.view())
       if (s.handle) device_.destroy_object(s.handle);
     for (const View& v : views_)
       if (v.handle) device_.destroy_object(v.handle);
@@ -393,18 +393,19 @@ class VirglImage final : public IImage {
   // The host's surface of layers first .. first + count - 1 of level `level` (a layered one draws into the layer gl_Layer names, from the first), made on first use (the oldest of a full
   // cache is let go of first; never one the pass being recorded uses); 0 if the host refuses it.
   uint32_t surface(uint32_t level, uint32_t first, uint32_t count) {
-    for (const LayerSurface& s : surfaces_)
+    for (const LayerSurface& s : surfaces_.view())
       if (s.handle && s.level == level && s.first == first && s.count == count) return s.handle;
     if (count == 0 || level >= desc_.mip_levels || first >= level_layers(level) || count > level_layers(level) - first) return 0;
-    LayerSurface* free = nullptr;
-    for (LayerSurface& s : surfaces_)
-      if (!s.handle) { free = &s; break; }
-    if (!free) return 0;
+    // (kept as long as the image: a submit may name any number of them - every level of every face of a cube array drawn into or cleared one at a time -, and a surface the
+    // commands being encoded name may not go before they are sent)
     const uint32_t handle = device_.new_handle();
     const uint32_t fmt = desc_.format == Format::D32Float ? (desc_.stencil ? virgl::kFormatZ32FloatS8X24Uint : virgl::kFormatZ32Float) : color_format_;
     const uint32_t cmd[] = {virgl::header(virgl::kCreateObject, virgl::kObjectSurface, 5), handle, id_, fmt, level, first | ((first + count - 1) << 16)};
     if (!device_.send_commands(cmd, 6)) return 0;
-    *free = LayerSurface{level, first, count, handle};
+    if (!surfaces_.push_back(LayerSurface{level, first, count, handle})) {
+      device_.destroy_object(handle);
+      return 0;
+    }
     return handle;
   }
   // The layers of level `level` (a volume's slices there).
@@ -559,6 +560,69 @@ class VirglImage final : public IImage {
     ByteReader in{ConstByteView(backing_)};
     for (uint64_t i = 0; i < count; ++i) out[i] = decode_wide_pixel(desc_.format, in);
     return in.ok();
+  }
+  // The planes of a depth image of one sample (kFeature2DepthCopies), through the backing (room for level 0 of a layer: 4 bytes a texel, or with a stencil plane 8 - the host's
+  // Z32_FLOAT_S8X24_UINT transfers a float, then a word with the stencil in its low byte). The host turns the rows of an image kept the other way round, as for colour images.
+  bool depth_transfer(uint32_t level, uint32_t layer, bool to_host) {
+    const uint32_t width = mip_extent(desc_.extent.width, level), height = mip_extent(desc_.extent.height, level);
+    TransferHost3d transfer{header(to_host ? kCmdTransferToHost3d : kCmdTransferFromHost3d), {0, 0, layer, width, height, 1}, 0, id_, level, width * (desc_.stencil ? 8u : 4u), 0};
+    return device_.gpu().command(as_bytes(transfer), /*fence=*/!to_host);
+  }
+  bool depth_planes_ok(uint32_t level, uint32_t layer, uint64_t depth, uint64_t stencil) {
+    const uint64_t count = uint64_t{mip_extent(desc_.extent.width, level)} * mip_extent(desc_.extent.height, level);
+    return desc_.format == Format::D32Float && desc_.samples == 1 && level < desc_.mip_levels && layer < level_layers(level) && (depth == 0 || depth == count) &&
+           (stencil == 0 || (stencil == count && desc_.stencil)) && ensure_backing(uint64_t{desc_.extent.width} * desc_.extent.height * (desc_.stencil ? 2u : 1u));
+  }
+  bool read_depth_subresource(uint32_t level, uint32_t layer, ArrayView<float> depth, ArrayView<uint8_t> stencil) override {
+    if (!depth_planes_ok(level, layer, depth.size(), stencil.size()) || !depth_transfer(level, layer, false)) return false;
+    ByteReader in{ConstByteView(backing_)};
+    const uint64_t count = depth.empty() ? stencil.size() : depth.size();
+    for (uint64_t i = 0; i < count; ++i) {
+      const float d = __builtin_bit_cast(float, in.le32());
+      const uint32_t s = desc_.stencil ? in.le32() : 0u;
+      if (!depth.empty()) depth[i] = d;
+      if (!stencil.empty()) stencil[i] = static_cast<uint8_t>(s & 0xFF);
+    }
+    return in.ok();
+  }
+  bool write_depth_subresource(uint32_t level, uint32_t layer, ArrayView<const float> depth, ArrayView<const uint8_t> stencil) override {
+    if (!depth_planes_ok(level, layer, depth.size(), stencil.size()) || (depth.empty() && stencil.empty())) return false;
+    // (one plane of two: the other as the host has it, read first)
+    if (desc_.stencil && (depth.empty() || stencil.empty()) && !depth_transfer(level, layer, false)) return false;
+    const uint64_t count = depth.empty() ? stencil.size() : depth.size();
+    const uint32_t texel = desc_.stencil ? 8u : 4u;
+    for (uint64_t i = 0; i < count; ++i) {
+      ByteView at;
+      if (!backing_.try_subview(i * texel, texel, &at)) return false;
+      if (!depth.empty()) {
+        const float v = depth[i];
+        ByteWriter out{at.subview(0, 4)};
+        out.le32(__builtin_bit_cast(uint32_t, !(v == v) ? 0.0f : v < 0.0f ? 0.0f : v > 1.0f ? 1.0f : v));   // (a depth image keeps 0 .. 1)
+        if (!out.ok()) return false;
+      }
+      if (!stencil.empty()) {
+        ByteWriter out{at.subview(4, 4)};
+        out.le32(stencil[i]);
+        if (!out.ok()) return false;
+      }
+    }
+    return depth_transfer(level, layer, true);
+  }
+  // A whole subresource of another image (kFeature2DepthCopies: depth and multisampled images, which have no memory here): a blit of it, of the planes asked for, turning the rows over
+  // between images kept in the two orders (multisampled images are both kept the way GL keeps them).
+  bool copy_subresource(IImage& source_image, uint32_t level, uint32_t layer, uint32_t source_level, uint32_t source_layer, uint32_t planes) override {
+    VirglImage& from = static_cast<VirglImage&>(source_image);   // (the kernel copies between images of one device)
+    const bool depth = desc_.format == Format::D32Float;
+    const uint32_t width = mip_extent(desc_.extent.width, level), height = mip_extent(desc_.extent.height, level);
+    if (from.desc_.format != desc_.format || from.desc_.samples != desc_.samples || from.desc_.stencil != desc_.stencil || level >= desc_.mip_levels || layer >= level_layers(level) ||
+        source_level >= from.desc_.mip_levels || source_layer >= from.level_layers(source_level) || mip_extent(from.desc_.extent.width, source_level) != width ||
+        mip_extent(from.desc_.extent.height, source_level) != height || planes == 0 || planes > 3 || (!depth && planes != 1) || ((planes & 2) && !desc_.stencil))
+      return false;
+    const uint32_t mask = depth ? ((planes & 1) ? 0x10u : 0u) | ((planes & 2) ? 0x20u : 0u) : 0xFu;
+    const bool flip = desc_.samples == 1 && y0_top() != from.y0_top();
+    const uint32_t cmd[22] = {virgl::header(virgl::kBlit, 0, 21), mask, 0, width | (height << 16), id_, level, blit_format(), 0, flip ? height : 0u, layer, width,
+                              flip ? static_cast<uint32_t>(-static_cast<int32_t>(height)) : height, 1, from.id_, source_level, from.blit_format(), 0, 0, source_layer, width, height, 1};
+    return device_.send_commands(cmd, 22);
   }
   // A level above 0 of a mipmapped texture: staged at the start of the backing (which has room for level 0, the largest), from where the host copies it into the level.
   bool write_mip_pixels(uint32_t level, ArrayView<const uint32_t> pixels) override {
@@ -749,8 +813,6 @@ class VirglImage final : public IImage {
   struct LayerSurface {
     uint32_t level = 0, first = 0, count = 0, handle = 0;
   };
-  static constexpr uint32_t kLayerSurfaces = 16;   // (the levels and layer ranges render target views name: a few per image)
-  LayerSurface surfaces_[kLayerSurfaces];
   struct View {
     TextureView v;
     bool stencil = false;   // (of a depth buffer's stencil plane)
@@ -763,6 +825,7 @@ class VirglImage final : public IImage {
   bool swap_rb_ = false;
   VirglDevice& device_;
   ImageDesc desc_;
+  List<LayerSurface> surfaces_;   // (the levels and layer ranges render target and depth views name)
   uint32_t id_ = 0, surface_ = 0, view_ = 0, color_format_ = 0;
   uint32_t stencil_view_ = 0;          // a depth buffer read as a texture: the view of its stencil plane
   VirglImage* stand_in_ = nullptr;     // (stand_in)

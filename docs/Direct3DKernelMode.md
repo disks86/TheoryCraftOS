@@ -254,7 +254,9 @@ range of levels are the host's texture views) every image of one sample may have
   backing, after the GPU's contents are read back (a level 0 drawn into); block-compressed and integer images are refused.
 - **Storage images** of any level of a layered image (`BindUavImage`'s layers are the level's).
 - **Mirrors of subresources**: `SetMirror`'s optional words name the subresource (level | layer << 16) each layer of the mirror shows - what d3d12.dll makes a narrow texture's
-  unordered access view of a level, or of layers of an array, of (`narrow_mirror`: an R8 / R8G8 / R16 / R16G16 view of the widened image, whose channels go back).
+  unordered access view of a level, or of layers of an array, of (`narrow_mirror`: an R8 / R8G8 / R16 / R16G16 view of the widened image, whose channels go back). A mirror may
+  be a volume of one level too, each of its slices a source's subresource (subresource words required): what an unordered access view of slices of a level of a narrow volume
+  writes through (`RWTexture3D` of an R8 / R16G16 ... volume).
 - **The DLLs**: d3d12.dll makes resources of any levels and kinds (cube arrays: `TcosD3D12ResourceOptions(TCOS_RESOURCE_CUBE)` of a multiple of six; a plain Direct3D 12
   program's arrays of six or twelve are cubes and cube arrays through their views), honours a shader resource view's `MostDetailedMip` / `MipLevels` and slices
   (`srv_view`), render target and depth stencil views' `MipSlice` (the level and its size into the pass; a depth-only pass's companion target is of the level's size),
@@ -269,11 +271,37 @@ range of levels are the host's texture views) every image of one sample may have
 
 ## Depth buffers read as textures, comparisons, texture and sampler pairs
 
-A depth buffer is a texture too when it is made `kAllocDepthStencil | kAllocTexture` (one sample, one level; a 2D image, an array or a cube - not a volume): the adapter's
+A depth buffer is a texture too when it is made `kAllocDepthStencil | kAllocTexture` (one sample; one level, or any on a device with `kFeature2MipmappedLayers`; a 2D image, an array, a cube or a cube array - not a volume): the adapter's
 `graphics::kFeature2DepthTextures` (bit 16 of `DeviceInfo::features2`; the CPU renderer and virgl), `kNotSupported` without it. Its device image is `kImageDepthAttachment |
 kImageSampled`. A unit bound to it reads the depth as (depth, 0, 0, 1) - every depth is a float here, so a D16 or D24 buffer's is not rounded to its bits -, or, with
-`SamplerDesc::stencil`, the stencil plane of a D24S8 buffer as the integers (0, stencil, 0, 1) (Direct3D's X24_TYPELESS_G8_UINT view, read with `Load`). Drawing into it while a unit
-reads it is refused (as for any target).
+`SamplerDesc::stencil`, the stencil plane of a D24S8 buffer as the integers (0, stencil, 0, 1) (Direct3D's X24_TYPELESS_G8_UINT view, read with `Load`). A unit's view of it
+(`BindTexture`'s view words, a descriptor's view) is of any of its levels and layers, of another kind than the image's as for colour textures (a slice of an array as a 2D texture,
+six layers as a cube, an array of whole cubes as a cube array): the CPU renderer reads the view's level and layer planes, virgl's sampler views show those levels and layers of the
+host's depth texture. Drawing into a level and layer of it while a unit reads that one is refused (as for any target); other levels and layers of it may be read meanwhile.
+
+**Copies** (`kFeature2DepthCopies`: the CPU renderer and virgl). The system keeps no memory of a depth buffer or of a multisampled image, so the device copies them:
+`IImage::copy_subresource` copies a whole subresource into another image of the same format, sample count and size there (a depth buffer's planes asked for), and
+`IImage::read_depth_subresource` / `write_depth_subresource` give the CPU a depth buffer's depth plane as floats and its stencil plane as bytes. `CopyRegion` of two depth buffers or two
+multisampled images is such a copy of whole subresources (the rectangle all of the destination's level at 0, 0; anything else is refused), with an optional fourteenth word, the planes
+(bit 0 the depth, bit 1 the stencil; 0 every plane the buffers have). `CopyBufferImage` of a depth buffer needs one of the depth layouts in its twelfth word - `NarrowLayout::DepthFloat32`
+(5: the depth as 32-bit floats), `DepthUnorm16` (6: 16-bit codes), `DepthUnorm24` (7: 24-bit codes in the low bits of a word whose high byte is 0) or `Stencil8` (8: a D24S8 buffer's stencil as
+bytes) - and copies a rectangle of a level's layer of that plane into the buffer or out of it (the rest of the plane and the other plane keep what they had); into the buffer a depth is
+rounded to the nearest code, into the image a code becomes the float it stands for. On virgl the planes go through transfers of the host's Z32_FLOAT / Z32_FLOAT_S8X24_UINT resource
+(a float, then a word with the stencil in its low byte), the subresource copies are blits of the planes asked for (masks Z and S; the rows turned over between images kept in the two
+orders - a multisampled image never is). Direct3D 12's rules come first in d3d12.dll: a depth buffer or a multisampled image is copied whole, a subresource of a D24S8 / D32S8 buffer is
+of one plane (the stencil's subresources after the depth's, `D3D12_FEATURE_FORMAT_INFO`'s `PlaneCount` 2 also for the typeless forms; the footprints of the depth plane are
+`R32_TYPELESS` words and of the stencil plane `R8_TYPELESS` bytes), and a copy against the rules is not made (the debug layer's error on Windows).
+
+**The least level of detail of a view** (Direct3D 12's `ResourceMinLODClamp`, Direct3D 11's `SetResourceMinLOD`): a texture descriptor's `min_lod` word (`EscapeOp::WriteDescriptors`; a
+float, 0 none, at most 1000) is the most detailed level its lookups take, counted in the image's levels. At each draw the binding raises the sampler's `min_lod` to the clamp less the
+view's first level (and its `max_lod` with it: Direct3D clamps the sampler's level first, then takes the greater of it and the clamp), and gives a sampler without levels the nearest
+level; a clamp past the view's last level reads that last level. Loads are not clamped. Every device has it (it is the sampler's state).
+
+**Gathers of cube arrays.** gather4 and gather4_c (Gather, GatherRed / Green / Blue / Alpha, GatherCmp*) of a `TextureCubeArray` take the direction and the cube from the coordinate's
+four components (no offsets: Direct3D has none for cubes): the CPU renderer looks the taps up on the face of the cube the direction names (`sample_lod_cube_array`, as a cube's with
+the neighbouring face for a tap off the face), TGSI's `TG4` has the coordinate's four components on `CUBEARRAY` (DXIL's cube arrays are SM5's resource dimension 10 now, their
+`textureGather` the same). The component a gather takes is the one the four-component sampler operand selects (fxc's and Wine's `s0.z` of GatherBlue), through the resource operand's
+swizzle (the DXIL translator writes it on the resource, with a sampler of no components).
 
 **Comparisons.** `SamplerDesc::compare` (a `graphics::CompareOp`, never .. always; Never when the sampler does not compare) is what `sample_c` / `sample_c_lz` (SampleCmp,
 SampleCmpLevelZero) and `gather4_c` / `gather4_po_c` (GatherCmp) compare with: a texel passes when reference <op> texel. `ITextureSet::sample_compare` filters the passes as the
@@ -282,8 +310,8 @@ cubes (the face the direction points at, no filtering across faces); a static te
 the four texels by `ITextureSet::compare_op`. Any texture whose red is the depth can be compared (R32_FLOAT and R16_UNORM textures too). The TGSI text compares by hand - a TG4 of
 the red channels, the passes, the weights from the place in the footprint (on a cube from the face's place, worked out from the direction) -, reading each unit's comparison from the
 constants: `CONST[kSamplerCompareRegister + unit]` (register 256, after the most a program may have) holds (less passes, equal passes, greater passes, linear filter) as 1 or 0
-(`graphics::sampler_compare_constant`), which virgl puts after the push constants for a pipeline whose modules say `ShaderModuleDesc::sampler_constants`. The level is the base
-one there (textures that are compared - depth buffers - have one).
+(`graphics::sampler_compare_constant`), which virgl puts after the push constants for a pipeline whose modules say `ShaderModuleDesc::sampler_constants`. The level is the view's
+first one there (SampleCmpLevelZero's; a SampleCmp of a mipmapped texture compares that level on virgl).
 
 **In the stream and the descriptors.** `BindTexture` takes an optional tenth word, `texture_view_word()` of DxgTypes.hpp: the comparison in bits 0-3 and the stencil plane in bit 8
 (refused for an image that is not a D24S8 depth buffer). Direct3D 12's descriptors (`EscapeOp::WriteDescriptors`): a sampler's offset low word is its comparison (`CompareOp`, 0
@@ -929,7 +957,9 @@ kernel's pipelines, samplers and streams. `graphics::DeviceFeature2` bits say wh
   snorm and 10-bit targets are written as without one). `D3D11_FEATURE_DATA_D3D11_OPTIONS::OutputMergerLogicOp` and D3D12's say it. d3d11's `CreateBlendState1` refuses a
   logic operation with blending or with `IndependentBlendEnable` (the runtime's rules, which Wine's `test_logic_op` checks); d3d12 one whose targets differ in it.
 - **`kFeature2SamplerState`** (`SamplerDesc::max_anisotropy`, `custom_border` / `border_rgba`): anisotropic filtering by the reference method of
-  `EXT_texture_filter_anisotropic` (`N = min(ceil(Pmax / Pmin), MaxAnisotropy)` lookups along the longer axis of the footprint at the level of `Pmax / N`); border colours of any
+  `EXT_texture_filter_anisotropic` (`N = min(ceil(Pmax / Pmin), MaxAnisotropy)` lookups along the longer axis of the footprint at the level of `Pmax / N`; the CPU renderer's axis is
+  the change of the coordinate its lookups take - (u, v) of a 2D texture or an array, (u, v, w) of a volume, the direction of a cube or a cube array, whose footprint is measured on the
+  face); border colours of any
   value (an integer texture's as its integers' bits: Direct3D 12's static `OPAQUE_BLACK_UINT` / `OPAQUE_WHITE_UINT`). The stream's `BindTexture` (its 15th to 20th words, after the view word and
   the view) and the descriptor escape's sampler entries (`kDescriptorSamplerExtras` in the kind word; six words after the entry, the comparison staying in the offset's low word)
   carry them; a device without the bit draws a descriptor's sampler without anisotropy and with the nearest of the three
@@ -961,11 +991,10 @@ real virglrenderer 1.3.0); `test_rasterizer_state` (the refusals, a device witho
 on the CPU renderer).
 
 Not done, in the order a program is likely to meet them: views of a typeless R8 / R8G8 / R16 / R16G16 texture in a format of another kind than unorm (the texture is kept widened; its other views are not made); `R1_UNORM` (no format here); a depth buffer read
-by shaders while it is also the pass's (read-only) depth buffer, depth buffers of several samples or levels read as textures, SampleCmp of the levels of a mipmapped colour texture on virgl
-(the base level is compared), a vertex and a pixel shader that read one unit as different texture and sampler pairs; unordered access to the slices of a narrow (R8 / R8G8 /
-R16 / R16G16) volume (its mirror would be a volume); copies of depth buffers (the kernel keeps no memory of them: `CopyRegion` refuses them);
-a Direct3D 12 view's `ResourceMinLODClamp` (the sampler's `MinLOD` and d3d11's `SetResourceMinLOD` are applied); gather of a cube array; the layer and viewport from a vertex or domain shader on virgl,
-anisotropic filtering on virgl (virglrenderer 1.3.0 drops it), antialiased lines (`AntialiasedLineEnable`, `MultisampleEnable`'s line modes: lines are one pixel wide and aliased),
+by shaders while it is also the pass's (read-only) depth buffer, depth buffers of several samples read as textures, SampleCmp of the levels of a mipmapped texture on virgl
+(the view's first level is compared), a vertex and a pixel shader that read one unit as different texture and sampler pairs; CPU access to the samples of a multisampled image
+(`read_depth_subresource` and the depth layouts are of one sample; multisampled images are copied whole, image to image, only); the layer and viewport from a vertex or domain shader on virgl,
+anisotropic filtering on virgl (virglrenderer 1.3.0 drops it; the CPU renderer filters 2D textures, arrays, cubes, cube arrays and volumes anisotropically), antialiased lines (`AntialiasedLineEnable`, `MultisampleEnable`'s line modes: lines are one pixel wide and aliased),
 separate minification and magnification filters (`MIN_POINT_MAG_LINEAR` and the like: a linear one makes both linear), `D3D12_SAMPLER_DESC2` (`CreateSampler2`,
 non-normalized coordinates); more than four unordered access buffers; heaps and textures shared across adapters (`D3D12_HEAP_FLAG_SHARED_CROSS_ADAPTER`: `DXGI_ERROR_UNSUPPORTED`,
 `CrossAdapterRowMajorTextureSupported` FALSE: an allocation is of one adapter's memory manager, and sharing one needs a backing both adapters' memory managers keep coherent

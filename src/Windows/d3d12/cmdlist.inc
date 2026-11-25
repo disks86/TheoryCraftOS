@@ -1098,9 +1098,20 @@ static UINT sub_target(const Resource *r, UINT sub, UINT *level, UINT *layer, co
     *fi = plane_format(r->fmt, sub / r->layers);
     return r->plane_alloc[sub];      /* (plane * layers + slice: the subresource index itself) */
   }
-  sub_split(r, sub, level, layer);
-  *fi = r->fmt;
+  /* (a depth buffer's plane: its subresources after the depth's are the stencil's, whose footprints are bytes) */
+  const UINT per_plane = r->mips * (r->kind == 1 ? 1 : r->layers);
+  const int depth = r->fmt && r->fmt->depth;
+  sub_split(r, depth ? sub % per_plane : sub, level, layer);
+  *fi = depth ? depth_plane_format(r->desc.Format, sub / per_plane) : r->fmt;
   return r->alloc;
+}
+/* The plane a subresource of a depth buffer is of (0 the depth, 1 the stencil); 0 for the other textures' (planar textures are allocations of a plane each). */
+static UINT sub_depth_plane(const Resource *r, UINT sub) { return r->fmt && r->fmt->depth && !r->planes ? sub / (r->mips * (r->kind == 1 ? 1 : r->layers)) : 0; }
+/* Whether the kernel keeps no memory of the texture's contents - a depth buffer, a multisampled image -, which Direct3D 12 copies only as whole subresources: a copy of one has
+ * no box or one of the whole subresource, and goes to (0, 0, 0) (the debug layer's error on Windows otherwise; the copy is not made). */
+static int whole_copies_only(const Resource *r) { return (r->fmt && r->fmt->depth) || r->desc.SampleDesc.Count > 1; }
+static int whole_box(const D3D12_BOX *box, UINT w, UINT h, UINT d) {
+  return !box || (box->left == 0 && box->top == 0 && box->front == 0 && box->right == w && box->bottom == h && box->back == d);
 }
 /* A CopyBufferImage packet: with the narrow layout of the texture's format as its twelfth word when it has one. */
 static void copy_buffer_image_packet(CmdList *l, UINT direction, UINT image, UINT level, UINT layer, UINT x, UINT y, UINT w, UINT h, UINT buffer, UINT offset, UINT pitch,
@@ -1109,9 +1120,55 @@ static void copy_buffer_image_packet(CmdList *l, UINT direction, UINT image, UIN
   packet(l, OP_COPY_BUFFER_IMAGE, payload, fi && fi->narrow ? 12 : 11);
 }
 
+/* CopyTextureRegion of a depth buffer's plane, or of a multisampled image (whole_copies_only): between a subresource and a footprint (not of a multisampled image), the plane in the
+ * kernel's depth layout of the resource's format (depth_layout), or between two subresources of one format, sample count and size, the same plane of each. */
+static void copy_whole_region(CmdList *l, const D3D12_TEXTURE_COPY_LOCATION *dst, UINT x, UINT y, UINT z, const D3D12_TEXTURE_COPY_LOCATION *src, const D3D12_BOX *box) {
+  Resource *d = (Resource *)dst->pResource, *s = (Resource *)src->pResource;
+  if (x || y || z) return;
+  if (l->pending_clear) flush_pending_clear(l);      /* (a depth clear recorded before comes first) */
+  if (dst->Type == D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX && src->Type == D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX) {
+    UINT dl, dy, sl, sy;
+    const FormatInfo *dfi = NULL, *sfi = NULL;
+    const UINT di = sub_target(d, dst->SubresourceIndex, &dl, &dy, &dfi), si = sub_target(s, src->SubresourceIndex, &sl, &sy, &sfi);
+    if (!di || !si || !whole_copies_only(d) || !whole_copies_only(s) || !d->fmt || !s->fmt || d->fmt->kernel != s->fmt->kernel || !d->fmt->depth != !s->fmt->depth ||
+        d->desc.SampleDesc.Count != s->desc.SampleDesc.Count || d->kind == 1 || s->kind == 1)
+      return;
+    const UINT plane = sub_depth_plane(s, src->SubresourceIndex);
+    const UINT w = mip_extent((UINT)s->desc.Width, sl), h = mip_extent(s->desc.Height, sl);
+    if (plane != sub_depth_plane(d, dst->SubresourceIndex) || w != mip_extent((UINT)d->desc.Width, dl) || h != mip_extent(d->desc.Height, dl) || !whole_box(box, w, h, 1)) return;
+    end_pass(l);
+    ensure_room(l, 256, 4);
+    UINT payload[14] = {alloc_index(l, di), 0, 0, alloc_index(l, si), 0, 0, w, h, dl, dy, sl, sy, 1, d->fmt->depth ? 1u << plane : 0u};
+    packet(l, OP_COPY_REGION, payload, 14);
+    return;
+  }
+  const int to_texture = dst->Type == D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+  const D3D12_TEXTURE_COPY_LOCATION *texture = to_texture ? dst : src, *footprint = to_texture ? src : dst;
+  Resource *t = (Resource *)texture->pResource, *b = (Resource *)footprint->pResource;
+  if (footprint->Type != D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT || t->desc.SampleDesc.Count > 1 || !t->fmt || !t->fmt->depth || b->desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER) return;
+  UINT level, layer;
+  const FormatInfo *fi = NULL;
+  const UINT image = sub_target(t, texture->SubresourceIndex, &level, &layer, &fi);
+  const D3D12_SUBRESOURCE_FOOTPRINT *fp = &footprint->PlacedFootprint.Footprint;
+  const UINT w = mip_extent((UINT)t->desc.Width, level), h = mip_extent(t->desc.Height, level);
+  /* (the whole subresource: the footprint of its size - into the texture the box, if any, is of the whole footprint -, a pitch it fits in) */
+  if (!image || !fi || fp->Width != w || fp->Height != h || fp->Depth != 1 || !whole_box(box, w, h, 1) || fp->RowPitch < (UINT64)w * fi->bytes) return;
+  if (footprint->PlacedFootprint.Offset > 0xFFFFFFFFu || footprint->PlacedFootprint.Offset + (UINT64)fp->RowPitch * (h - 1) + (UINT64)w * fi->bytes > b->desc.Width) return;
+  end_pass(l);
+  ensure_room(l, 256, 4);
+  UINT payload[12] = {to_texture ? 0u : 1u, alloc_index(l, image), level, layer, 0, 0, w, h, alloc_index(l, b->alloc), (UINT)footprint->PlacedFootprint.Offset, fp->RowPitch,
+                      depth_layout(t->desc.Format, sub_depth_plane(t, texture->SubresourceIndex))};
+  packet(l, OP_COPY_BUFFER_IMAGE, payload, 12);
+}
+
 static void STDMETHODCALLTYPE list_CopyTextureRegion(CmdList *l, const D3D12_TEXTURE_COPY_LOCATION *dst, UINT x, UINT y, UINT z, const D3D12_TEXTURE_COPY_LOCATION *src, const D3D12_BOX *box) {
   Resource *d = (Resource *)dst->pResource, *s = (Resource *)src->pResource;
   if (!d || !s) return;
+  /* (depth buffers and multisampled images: whole subresources) */
+  if ((dst->Type == D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX && whole_copies_only(d)) || (src->Type == D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX && whole_copies_only(s))) {
+    copy_whole_region(l, dst, x, y, z, src, box);
+    return;
+  }
   end_pass(l);
   ensure_room(l, 1024, 8);
   if (dst->Type == D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX && src->Type == D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT) {
@@ -1180,7 +1237,12 @@ static void STDMETHODCALLTYPE list_CopyResource(CmdList *l, ID3D12Resource *dst,
       packet(l, OP_COPY_REGION, payload, 8);
     }
   } else if (d->fmt && s->fmt && !d->planes && !s->planes && d->mips == s->mips && d->kind == s->kind && d->layers == s->layers) {
-    /* (every level with all its layers - a volume's level its slices there; a 2D image of one level is the one packet of eight words every device takes) */
+    /* (every level with all its layers - a volume's level its slices there; a 2D image of one level is the one packet of eight words every device takes. Depth buffers - both planes - and
+     * multisampled images, which the device copies, of one format, sample count and size) */
+    if ((whole_copies_only(d) || whole_copies_only(s)) && (d->fmt->kernel != s->fmt->kernel || !d->fmt->depth != !s->fmt->depth || d->desc.SampleDesc.Count != s->desc.SampleDesc.Count ||
+                                                         d->desc.Width != s->desc.Width || d->desc.Height != s->desc.Height))
+      return;
+    if (l->pending_clear) flush_pending_clear(l);      /* (a depth clear recorded before comes first) */
     end_pass(l);
     for (UINT level = 0; level < s->mips; ++level) {
       ensure_room(l, 256, 4);

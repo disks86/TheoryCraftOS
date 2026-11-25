@@ -32,8 +32,13 @@
  *   - fixed state the device lacks is refused (pso.inc): depth bias, depth clip, wireframe, two-sided stencil, dual-source blending, logic ops, anisotropy, custom border
  *     colours and several viewports need the kernel's RasterizerState, DualSourceBlend, LogicOps, SamplerState and Viewports features (the CPU renderer and virgl;
  *     virglrenderer 1.3.0 drops anisotropy, and virgl refuses a layer or viewport chosen in a vertex or domain shader)
- *   - texture formats: every colour format and BC1-BC7 (base.inc g_formats) on the CPU renderer and virgl, except R1_UNORM; R8 and R16 unorm are kept widened;
- *     depth buffers are sampled at level 0 only and are not copied; ResourceMinLODClamp is ignored; no gather from cube arrays
+ *   - texture formats: every colour format and BC1-BC7 (base.inc g_formats) on the CPU renderer and virgl, except R1_UNORM; R8 and R16 unorm are kept widened (unordered
+ *     access to them, volumes' slices too, goes through mirrors that give the view's channels back)
+ *   - depth buffers: shader resource views of any levels and layers (heaps.inc depth_srv), copied as whole subresources a plane at a time (the stencil's subresources after the
+ *     depth's, footprints of R32_TYPELESS words and R8_TYPELESS bytes: cmdlist.inc copy_whole_region), as multisampled images are; not read by shaders while they are the pass's
+ *     depth buffer, not of several samples when read by shaders, the samples of a multisampled one not copied to buffers (Direct3D 12 has no such copy)
+ *   - ResourceMinLODClamp (a view's least level of detail, in the resource's levels) raises the sampler's MinLOD in the kernel; SampleCmp of a mipmapped texture compares the view's
+ *     first level on virgl
  *   - a pass with a depth buffer and no render target draws into a colour image of the buffer's size that nothing reads (cmdlist.inc depth_companion): it costs that memory
  *   - multisampled images are render targets and depth buffers of the adapter's sample counts, drawn into and resolved (not read by shaders through this DLL)
  *   - tiled resources at tier 1 only, heaps shared across adapters (DXGI_ERROR_UNSUPPORTED; shared handles of one adapter's resources and heaps, and of fences of any

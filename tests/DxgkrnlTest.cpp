@@ -10127,6 +10127,12 @@ void test_mipmapped_layers() {
   CHECK(draw(cube_array_lod_pipe, cubes, 0.55f, 0.5f, 1.0f, 0.1f, View(), levels_sampler) == status::kSuccess && e.pixel(target, 3, 3) == colour(1, 10));
   CHECK(draw(cube_array_pipe, cubes, 0.55f, 0.5f, 1.0f, 0.9f) == status::kSuccess && e.pixel(target, 3, 3) == colour(0, 10));   // (the cube clamped)
   CHECK(draw(cube_array_pipe, cubes, 0.5f, 1.0f, 0.5f, 0.0f) == status::kSuccess && e.pixel(target, 3, 3) == colour(0, 2));    // (+Y of cube 0)
+  // gather4 of a cube array (ps_gather_cubearray: red, red, blue, blue of the footprint, which is all of one layer's colour): +Z of cube 1, then -X of cube 0 (layer 1).
+  const Handle gather_cubes_pipe = pipeline(b::k_ps_gather_cubearray, sizeof b::k_ps_gather_cubearray);
+  auto gathered = [&](uint32_t c) { return (c & 0xFF) << 24 | ((c >> 16) & 0xFF) << 16 | ((c >> 16) & 0xFF) << 8 | (c & 0xFF); };
+  CHECK(draw(gather_cubes_pipe, cubes, 0.55f, 0.5f, 1.0f, 0.1f) == status::kSuccess && e.pixel(target, 3, 3) == gathered(colour(0, 10)));
+  printf("  levels: gather of a cube array %08x (want %08x)\n", static_cast<unsigned>(e.pixel(target, 3, 3)), static_cast<unsigned>(gathered(colour(0, 10))));
+  CHECK(draw(gather_cubes_pipe, cubes, 0.0f, 0.45f, 0.55f, 0.0f) == status::kSuccess && e.pixel(target, 3, 3) == gathered(colour(0, 1)));
   // ... and twelve layers of an array as one, a cube array as an array, a cube of a cube array.
   View all;
   all.given = true;
@@ -10414,6 +10420,97 @@ void test_mipmapped_layers() {
   (void)array;
 }
 
+// Depth buffers and multisampled images, which the device keeps, copied by it (graphics::kFeature2DepthCopies): each plane of a D24S8 buffer into a buffer in the depth layouts
+// (CopyBufferImage's words 5 .. 8) and a rectangle of a D32 buffer's depth from one, whole subresources and one plane of them (CopyRegion and its planes word), a multisampled image
+// copied whole and resolved; and what is refused - part of a subresource, a colour layout for a depth buffer, a depth layout for a colour image, a stencil plane where there is none.
+void test_depth_copies() {
+  Env e;
+  const Handle target = e.alloc(kTarget, Format::A8R8G8B8, 8, 8);
+  const Handle depth = e.alloc(kAllocDepthStencil, Format::D24S8, 8, 8), other = e.alloc(kAllocDepthStencil, Format::D24S8, 8, 8), d32 = e.alloc(kAllocDepthStencil, Format::D32Float, 8, 8);
+  const Handle buf = e.buffer(kAllocVertexBuffer, 1024);
+  // (the depth buffers cleared: `depth` to 0.25 and stencil 7, `other` to 1 and 0, `d32` to 0.5)
+  auto clear_depth = [&](Handle d, float value, uint32_t stencil) {
+    CommandWriter w(e.allocator);
+    w.begin_pass(0, 1, kPassClearColor | kPassClearDepth | kPassClearStencil, {0, 0, 0, 1}, value, stencil);
+    w.end_pass();
+    CHECK(e.render(w, {target, d}) == status::kSuccess);
+  };
+  clear_depth(depth, 0.25f, 7), clear_depth(other, 1.0f, 0), clear_depth(d32, 0.5f, 0);
+  auto word_at = [&](uint64_t offset) {
+    LockResult r;
+    uint32_t v = 0xDEADDEADu;
+    if (e.kernel.lock(kPid, buf, kLockReadOnly, 0, &r) != status::kSuccess) return v;
+    ByteReader in(r.data);
+    in.skip(offset);
+    v = in.le32();
+    e.kernel.unlock(kPid, buf);
+    return v;
+  };
+  // Each plane into the buffer: the depth as 24-bit codes (rows of 32 bytes), the stencil as bytes (rows of 8, from 512).
+  {
+    CommandWriter w(e.allocator);
+    w.copy_buffer_image_narrow(1, 0, 0, 0, 0, 0, 8, 8, 1, 0, 32, NarrowLayout::DepthUnorm24);
+    w.copy_buffer_image_narrow(1, 0, 0, 0, 0, 0, 8, 8, 1, 512, 8, NarrowLayout::Stencil8);
+    CHECK(e.render(w, {depth, buf}) == status::kSuccess);
+  }
+  const uint32_t code = static_cast<uint32_t>(0.25 * 16777215.0 + 0.5);
+  CHECK(word_at(0) == code && word_at(7 * 32 + 28) == code && word_at(512) == 0x07070707u && word_at(512 + 60) == 0x07070707u);
+  // A rectangle of floats into the left half of the D32 buffer, then all of it out as 16-bit codes.
+  {
+    float quarter[16];
+    for (float& f : quarter) f = 0.75f;
+    CHECK(e.write(buf, floats(quarter, 16)));
+    CommandWriter w(e.allocator);
+    w.copy_buffer_image_narrow(0, 0, 0, 0, 0, 0, 4, 4, 1, 0, 16, NarrowLayout::DepthFloat32);
+    w.copy_buffer_image_narrow(1, 0, 0, 0, 0, 0, 8, 8, 1, 256, 16, NarrowLayout::DepthUnorm16);
+    CHECK(e.render(w, {d32, buf}) == status::kSuccess);
+    const uint32_t first = word_at(256), right = word_at(256 + 12), below = word_at(256 + 7 * 16);
+    printf("  depth copies: 16-bit codes %08x %08x %08x\n", static_cast<unsigned>(first), static_cast<unsigned>(right), static_cast<unsigned>(below));
+    CHECK(first == 0xBFFFBFFFu && right == 0x80008000u && below == 0x80008000u);   // (0.75: 49151, 0.5: 32768)
+  }
+  // The stencil plane of `depth` into `other` (its depth stays 1), then both planes of `other` into `depth`.
+  {
+    CommandWriter w(e.allocator);
+    w.copy_whole_subresources(1, 0, 0, 0, 0, 0, 8, 8, 1, 2);
+    w.copy_buffer_image_narrow(1, 1, 0, 0, 0, 0, 8, 8, 2, 0, 32, NarrowLayout::DepthUnorm24);
+    w.copy_buffer_image_narrow(1, 1, 0, 0, 0, 0, 8, 8, 2, 512, 8, NarrowLayout::Stencil8);
+    CHECK(e.render(w, {depth, other, buf}) == status::kSuccess);
+    CHECK(word_at(0) == 0xFFFFFFu && word_at(512) == 0x07070707u);
+    CommandWriter all(e.allocator);
+    all.copy_whole_subresources(0, 0, 0, 1, 0, 0, 8, 8);
+    all.copy_buffer_image_narrow(1, 0, 0, 0, 0, 0, 8, 8, 2, 0, 32, NarrowLayout::DepthUnorm24);
+    CHECK(e.render(all, {depth, other, buf}) == status::kSuccess);
+    CHECK(word_at(0) == 0xFFFFFFu);
+  }
+  // What is refused.
+  auto refused = [&](auto record, std::initializer_list<Handle> list) {
+    CommandWriter w(e.allocator);
+    record(w);
+    return e.render(w, list) == status::kInvalidParameter;
+  };
+  CHECK(refused([](CommandWriter& w) { w.copy_subresource_region(1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 4, 8); }, {depth, other}));   // (part of a subresource)
+  CHECK(refused([](CommandWriter& w) { w.copy_whole_subresources(1, 0, 0, 0, 0, 0, 8, 8, 1, 2); }, {d32, d32}));   // (no stencil; and one subresource into itself)
+  CHECK(refused([](CommandWriter& w) { w.copy_whole_subresources(1, 0, 0, 0, 0, 0, 8, 8); }, {depth, d32}));   // (formats that differ)
+  CHECK(refused([](CommandWriter& w) { w.copy_buffer_image_narrow(1, 0, 0, 0, 0, 0, 8, 8, 1, 0, 32, NarrowLayout::R8); }, {depth, buf}));
+  CHECK(refused([](CommandWriter& w) { w.copy_image_to_buffer(0, 0, 0, 0, 0, 8, 8, 1, 0, 32); }, {depth, buf}));
+  CHECK(refused([](CommandWriter& w) { w.copy_buffer_image_narrow(1, 0, 0, 0, 0, 0, 8, 8, 1, 0, 32, NarrowLayout::DepthFloat32); }, {target, buf}));
+  CHECK(refused([](CommandWriter& w) { w.copy_buffer_image_narrow(1, 0, 0, 0, 0, 0, 8, 8, 1, 0, 8, NarrowLayout::Stencil8); }, {d32, buf}));
+  CHECK(refused([](CommandWriter& w) { w.copy_whole_subresources(1, 0, 0, 0, 0, 0, 8, 8, 1, 1); }, {target, e.alloc(kTarget, Format::A8R8G8B8, 8, 8)}));   // (planes of colour images)
+  // A multisampled image copied whole into another, then resolved.
+  AllocationDesc md;
+  md.flags = kAllocRenderTarget, md.format = Format::A8R8G8B8, md.width = md.height = 8, md.samples = 4;
+  Handle ms_a = 0, ms_b = 0;
+  CHECK(e.kernel.create_allocation(kPid, e.dev, md, &ms_a) == status::kSuccess && e.kernel.create_allocation(kPid, e.dev, md, &ms_b) == status::kSuccess);
+  CHECK(e.clear(ms_a, {0, 1, 0, 1}) == status::kSuccess && e.clear(ms_b, {1, 0, 0, 1}) == status::kSuccess);
+  {
+    CommandWriter w(e.allocator);
+    w.copy_whole_subresources(1, 0, 0, 0, 0, 0, 8, 8);
+    w.resolve_region(2, 1);
+    CHECK(e.render(w, {ms_a, ms_b, target}) == status::kSuccess);
+    CHECK(e.pixel(target, 0, 0) == 0xFF00FF00u && e.pixel(target, 7, 7) == 0xFF00FF00u);
+  }
+}
+
 int main() {
   test_handle_table();
   test_adapters_and_processes();
@@ -10484,6 +10581,7 @@ int main() {
   test_occlusion_queries();
   test_texture_kinds();
   test_mipmapped_layers();
+  test_depth_copies();
   test_independent_blend();
   test_blend_constant();
   test_conservative_raster();

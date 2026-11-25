@@ -149,6 +149,30 @@ static const FormatInfo *format_info(DXGI_FORMAT f) {
 }
 /* The planes of a planar format (0 for another). */
 static UINT format_planes(const FormatInfo *fi) { return !fi || !fi->planar ? 0 : fi->planar == PLANAR_V208 || fi->planar == PLANAR_V408 ? 3 : 2; }
+/* The planes of a depth format, as Direct3D 12 counts them in subresource indices and footprints: 2 of the formats with stencil (plane 0 the depth, 1 the stencil), 1 of the others. */
+static UINT depth_format_planes(DXGI_FORMAT f) {
+  return f == DXGI_FORMAT_D24_UNORM_S8_UINT || f == DXGI_FORMAT_R24G8_TYPELESS || f == DXGI_FORMAT_D32_FLOAT_S8X24_UINT || f == DXGI_FORMAT_R32G8X24_TYPELESS ? 2 : 1;
+}
+/* The footprint format of plane `plane` of a depth format with stencil (GetCopyableFootprints, CopyTextureRegion): the depth as 32 bits (R32_TYPELESS: a float of D32_FLOAT_S8X24_UINT,
+ * the 24-bit normalised depth of D24_UNORM_S8_UINT in the low bits of a word whose high byte is 0), the stencil as bytes (R8_TYPELESS). The formats of one plane are their own. */
+static const FormatInfo *depth_plane_format(DXGI_FORMAT f, UINT plane) {
+  if (depth_format_planes(f) == 1) return format_info(f);
+  return format_info(plane ? DXGI_FORMAT_R8_TYPELESS : DXGI_FORMAT_R32_TYPELESS);
+}
+/* The kernel's CopyBufferImage layout of a plane of a depth buffer (its NarrowLayout DepthFloat32 5, DepthUnorm16 6, DepthUnorm24 7, Stencil8 8): of the resource's format as the program
+ * named it - D32_FLOAT and D32_FLOAT_S8X24_UINT floats, D16_UNORM 16-bit and D24_UNORM_S8_UINT 24-bit codes, the stencil bytes. */
+#define DEPTH_LAYOUT_FLOAT32 5u
+#define DEPTH_LAYOUT_UNORM16 6u
+#define DEPTH_LAYOUT_UNORM24 7u
+#define DEPTH_LAYOUT_STENCIL8 8u
+static UINT depth_layout(DXGI_FORMAT f, UINT plane) {
+  if (plane) return DEPTH_LAYOUT_STENCIL8;
+  switch (f) {
+    case DXGI_FORMAT_D16_UNORM: case DXGI_FORMAT_R16_TYPELESS: return DEPTH_LAYOUT_UNORM16;
+    case DXGI_FORMAT_D24_UNORM_S8_UINT: case DXGI_FORMAT_R24G8_TYPELESS: return DEPTH_LAYOUT_UNORM24;
+    default: return DEPTH_LAYOUT_FLOAT32;
+  }
+}
 /* The size of plane `plane` of a level `*w` x `*h` of a planar format: the chroma of NV12 / P010 / P016 half both ways, of P208 half as wide, of V208 half as high. */
 static void plane_extent(const FormatInfo *fi, UINT plane, UINT *w, UINT *h) {
   if (!fi || !fi->planar || plane == 0 || fi->planar == PLANAR_V408) return;
