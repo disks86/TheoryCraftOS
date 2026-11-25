@@ -452,7 +452,8 @@ NtStatus VidMm::create(const AllocationDesc& requested, SharedPointer<Allocation
     // (a depth buffer, and one read as a texture too - kFeature2DepthTextures: shadow maps -, of one sample)
     if (depth_flag && (desc.flags & ~(kAllocDepthStencil | kAllocShared | kAllocTexture))) return status::kInvalidParameter;
     if (depth_flag && (desc.flags & kAllocTexture)) {
-      if (desc.samples != 1) return status::kInvalidParameter;
+      // (one of several samples: read through Texture2DMS units - kFeature3MultisampleDepthLoads)
+      if (desc.samples != 1 && !(device_.info().features3 & graphics::kFeature3MultisampleDepthLoads)) return status::kNotSupported;
       if (!(device_.info().features2 & graphics::kFeature2DepthTextures)) return status::kNotSupported;
     }
     if (dxgk::is_wide(desc.format)) {
@@ -474,12 +475,16 @@ NtStatus VidMm::create(const AllocationDesc& requested, SharedPointer<Allocation
       if (!plain && !(desc.flags & kAllocStaging) && !levels_anywhere) return status::kNotSupported;
     }
     if (desc.samples != 1) {
-      // (a multisampled target: the device keeps the samples, the system keeps nothing)
+      // (a multisampled target: the device keeps the samples, the system keeps nothing. A colour target is a texture too where the device reads its samples - kFeature3MultisampleLoads;
+      // a depth buffer with kFeature3MultisampleDepthLoads, above -; an array of them of up to kMaxTextureLayers layers on a device with kFeature3MultisampleArrays)
       const graphics::DeviceInfo info = device_.info();
       if (!(info.features & graphics::kFeatureMultisample) || desc.samples >= 32 || !(info.sample_counts >> desc.samples & 1)) return status::kNotSupported;
-      if ((depth_flag ? (desc.flags & ~kAllocShared) != kAllocDepthStencil : (desc.flags & ~(kAllocTexture | kAllocShared)) != kAllocRenderTarget) || desc.mip_levels != 1 || desc.kind != graphics::TextureKind::Texture2D || desc.layers != 1 || dxgk::is_wide(desc.format))
+      if ((depth_flag ? (desc.flags & ~(kAllocShared | kAllocTexture)) != kAllocDepthStencil : (desc.flags & ~(kAllocTexture | kAllocShared)) != kAllocRenderTarget) || desc.mip_levels != 1 ||
+          (desc.kind != graphics::TextureKind::Texture2D && desc.kind != graphics::TextureKind::Texture2DArray) || desc.layers == 0 || desc.layers > graphics::kMaxTextureLayers ||
+          (desc.kind == graphics::TextureKind::Texture2D && desc.layers != 1) || dxgk::is_wide(desc.format))
         return status::kInvalidParameter;
-      device_bytes = uint64_t{desc.width} * desc.height * desc.samples * (depth_flag ? (desc.format == Format::D24S8 ? 5 : 4) : 4);
+      if (desc.kind == graphics::TextureKind::Texture2DArray && (!(info.features3 & graphics::kFeature3MultisampleArrays) || !(info.features2 & graphics::kFeature2LayeredTargets))) return status::kNotSupported;
+      device_bytes = uint64_t{desc.width} * desc.height * desc.samples * desc.layers * (depth_flag ? (desc.format == Format::D24S8 ? 5 : 4) : 4);
       goto sized;
     }
     if (desc.kind != graphics::TextureKind::Texture2D) {

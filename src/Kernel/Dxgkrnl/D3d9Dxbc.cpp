@@ -61,15 +61,23 @@ bool resource_kind(uint32_t dimension, graphics::TextureKind* kind) {
     case 5: *kind = graphics::TextureKind::Texture3D; return true;
     case 6: *kind = graphics::TextureKind::TextureCube; return true;
     case 8: *kind = graphics::TextureKind::Texture2DArray; return true;
+    case 9: *kind = graphics::TextureKind::Texture2DMSArray; return true;   // (dcl_resource_texture2dmsarray: the sample count in the token too)
     case 10: *kind = graphics::TextureKind::TextureCubeArray; return true;
     default: return false;
   }
 }
 
+// What a device needs for a texture unit of a multisampled kind (graphics::DeviceFeature3).
+constexpr uint32_t multisample_features(graphics::TextureKind kind) {
+  return graphics::kFeature3MultisampleLoads | (kind == graphics::TextureKind::Texture2DMSArray ? graphics::kFeature3MultisampleArrays : 0u);
+}
+
 enum OperandType : uint32_t { kOpOutputControlPointId = 22, kOpForkInstanceId = 23, kOpJoinInstanceId = 24, kOpInputControlPoint = 25, kOpInputPatchConstant = 27, kOpDomainPoint = 28, kOpUav = 30, kOpThreadId = 32, kOpThreadGroupId = 33, kOpThreadIdInGroup = 34, kOpThreadIdFlat = 36, kOpGsInstanceId = 37, kOpInputPrimitiveId = 11, kOpTgsm = 31, kOpTemp = 0, kOpInput = 1, kOpOutput = 2, kOpImmediate = 4, kOpSampler = 6, kOpResource = 7, kOpConstantBuffer = 8, kOpImmediateConstantBuffer = 9, kOpNull = 13,
                              // (operand types no DXBC shader has, which the DXIL translator writes for what Shader Model 6.1+ added: dx.op.viewID, and SV_Barycentrics - a system value with no
                              // register - perspective-correct and noperspective; select_1 of a component)
-                             kOpViewIdPrivate = 0xF0, kOpBarycentricsPrivate = 0xF1, kOpBarycentricsLinearPrivate = 0xF2, kOpHelperLanePrivate = 0xF3 /* IsHelperLane */ };
+                             kOpViewIdPrivate = 0xF0, kOpBarycentricsPrivate = 0xF1, kOpBarycentricsLinearPrivate = 0xF2, kOpHelperLanePrivate = 0xF3 /* IsHelperLane */, kOpSampleIndexPrivate = 0xF4 /* SV_SampleIndex */,
+                             // (a pixel shader's multisampling: the rasterizer of samplepos / sampleinfo, oMask, vCoverage, vInnerCoverage)
+                             kOpRasterizer = 14, kOpOutputCoverage = 15, kOpInputCoverage = 35, kOpInnerCoverage = 42 };
 
 // Where a program made from DXBC keeps what it has no register for: its literals, and the immediate constant buffer (declared in the program) as constants of its own.
 constexpr uint16_t kLiteralBase = 0x4000, kImmediateBufferBase = 0x6000;
@@ -771,6 +779,7 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
   if (program_type == 5 && major != 5) return status::kNotSupported;
   if (!((major == 4 && minor <= 1) || (major == 5 && minor <= 1))) return status::kNotSupported;
   const bool v51 = major == 5 && minor == 1;   // (constant buffers, textures and samplers are ranges with a space: cb[ID][index][element], t[ID][index])
+  const bool major_at_least_41 = major == 5 || (major == 4 && minor >= 1);   // (samplepos, sampleinfo, the eval_* of 5.0: of 4.1 and later)
   int32_t cb_register[8], texture_register[8], sampler_register[8];   // by range ID: the register the range starts at, or -1
   for (int32_t& r : cb_register) r = -1;
   for (int32_t& r : texture_register) r = -1;
@@ -966,6 +975,19 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
         s->type = kSysValue, s->number = kSysViewId;
         program->uses_system_values_ = true;
         return status::kSuccess;
+      case kOpSampleIndexPrivate:   // (SV_SampleIndex of a pixel shader from the DXIL translator, which has no input register for it: the shader runs for each sample)
+        if (!pixel || o.dims != 0) return status::kNotSupported;
+        s->type = kSysValue, s->number = kSysSampleIndex;
+        program->uses_system_values_ = true;
+        program->sample_shading_ = true;
+        program->extra_features3_ |= graphics::kFeature3SampleShading;
+        return status::kSuccess;
+      case kOpInputCoverage: case kOpInnerCoverage:   // (vCoverage, vInnerCoverage: a pixel shader's)
+        if (!pixel || o.dims != 0) return status::kNotSupported;
+        s->type = kSysValue, s->number = o.type == kOpInputCoverage ? kSysCoverage : kSysInnerCoverage;
+        program->uses_system_values_ = true;
+        program->extra_features3_ |= o.type == kOpInputCoverage ? graphics::kFeature3Coverage : graphics::kFeature3InnerCoverage;
+        return status::kSuccess;
       case kOpHelperLanePrivate:   // (IsHelperLane: a pixel shader's)
         if (vertex || geometry || patch_stage || compute || o.dims != 0) return status::kNotSupported;
         s->type = kSysValue, s->number = kSysHelperLane;
@@ -1075,11 +1097,18 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
   uint32_t color_outputs = 1;   // (SV_Target0 .. n-1 of a pixel shader)
   auto to_dst = [&](const Operand& o, Instr::Dst* d) -> NtStatus {
     d->mask = o.mask;
-    if (o.components != 2) return status::kInvalidParameter;
+    if (o.type == kOpOutputCoverage && o.components == 1) d->mask = 1;   // (oMask: one component)
+    else if (o.components != 2) return status::kInvalidParameter;
     switch (o.type) {
       case kOpTemp:
         if (o.dims != 1 || o.index[0] >= kMaxTemps) return status::kNotSupported;
         d->type = kTemp, d->number = static_cast<uint16_t>(o.index[0]);
+        return status::kSuccess;
+      case kOpOutputCoverage:   // (oMask: the samples a pixel shader's result reaches)
+        if (!pixel || o.dims != 0) return status::kNotSupported;
+        d->type = kCoverageOut, d->number = 0;
+        program->writes_coverage_ = true;
+        program->extra_features3_ |= graphics::kFeature3Coverage;
         return status::kSuccess;
       case kOpOutput: {
         if (o.dims != 1 || o.index[0] >= kRegisters) return status::kNotSupported;
@@ -1563,6 +1592,7 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
           program->texture_unit_mask_ |= 1u << o.index[1];
           program->texture_kind_[o.index[1]] = kind;
           program->texture_samples_[o.index[1]] = static_cast<uint8_t>((token >> 16) & 0x7F);
+          if (graphics::is_multisampled_kind(kind)) program->extra_features3_ |= multisample_features(kind);
           continue;
         }
         if (o.type != kOpResource || o.dims != 1 || !resource_kind((token >> 11) & 0x1F, &kind) || o.index[0] >= graphics::kMaxTextureUnits) return status::kNotSupported;   // two units
@@ -1570,6 +1600,7 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
         program->texture_unit_mask_ |= 1u << o.index[0];
         program->texture_kind_[o.index[0]] = kind;
         program->texture_samples_[o.index[0]] = static_cast<uint8_t>((token >> 16) & 0x7F);
+        if (graphics::is_multisampled_kind(kind)) program->extra_features3_ |= multisample_features(kind);
         continue;
       }
       case kDclInput4: case kDclInputPs4: case kDclOutput4: case kDclInputSiv4: case kDclInputPsSiv4: case kDclOutputSiv4: case kDclInputSgv4: case kDclInputPsSgv4: case kDclOutputSgv4: {
@@ -1614,14 +1645,47 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
         }
         if (hull && opcode == kDclOutput4 && o.type == kOpOutput && (phase == 2 || phase == 3)) continue;   // (a patch constant register)
         if (compute && opcode == kDclInput4 && (o.type == kOpThreadId || o.type == kOpThreadGroupId || o.type == kOpThreadIdInGroup || o.type == kOpThreadIdFlat)) continue;
+        if (pixel && opcode == kDclInput4 && (o.type == kOpInputCoverage || o.type == kOpInnerCoverage) && o.dims == 0) {   // (vCoverage, vInnerCoverage)
+          program->uses_system_values_ = true;
+          program->extra_features3_ |= o.type == kOpInputCoverage ? graphics::kFeature3Coverage : graphics::kFeature3InnerCoverage;
+          continue;
+        }
+        if (pixel && opcode == kDclOutput4 && o.type == kOpOutputCoverage && o.dims == 0) {   // (oMask)
+          program->writes_coverage_ = true;
+          program->extra_features3_ |= graphics::kFeature3Coverage;
+          continue;
+        }
         if ((o.type != kOpInput && o.type != kOpOutput) || o.dims != 1 || o.index[0] >= kRegisters) return status::kNotSupported;   // (depth and the like)
+        // How a pixel shader's input is interpolated (D3D10_SB_INTERPOLATION_MODE in the declaration: 1 constant, 2 linear, 3 linear centroid, 4 linear noperspective, 5 linear
+        // noperspective centroid, 6 linear sample, 7 linear noperspective sample; 0 is the _sgv / _siv forms' undefined): the varying's, or the position's location.
+        uint8_t interpolation = 0;
+        if (pixel && o.type == kOpInput && (opcode == kDclInputPs4 || opcode == kDclInputPsSiv4 || opcode == kDclInputPsSgv4)) {
+          const uint32_t mode = (token >> 11) & 0xF;
+          if (mode > 7) return status::kInvalidParameter;
+          const graphics::InterpolationKind kind = mode == 1 ? graphics::kInterpolateFlat : mode == 4 || mode == 5 || mode == 7 ? graphics::kInterpolateNoPerspective : graphics::kInterpolatePerspective;
+          const graphics::InterpolationLocation at = mode == 3 || mode == 5 ? graphics::kAtCentroid : mode == 6 || mode == 7 ? graphics::kAtSample : graphics::kAtCentre;
+          interpolation = graphics::interpolation_word(kind, at);
+          // (what a device needs: a sample location runs the shader for each sample; the centroid and noperspective - of an input, not of the position, which is always linear - need
+          // the interpolation modes. A flat input does not: a device without them interpolates it as it always did, which only an integer varying that differs between the vertices tells)
+          if (at == graphics::kAtSample) program->sample_shading_ = true, program->extra_features3_ |= graphics::kFeature3SampleShading;
+          if (at == graphics::kAtCentroid || (opcode == kDclInputPs4 && kind == graphics::kInterpolateNoPerspective)) program->extra_features3_ |= graphics::kFeature3InterpolationModes;
+          if (opcode == kDclInputPs4 && in_slot[o.index[0]] >= 0 && static_cast<uint32_t>(in_slot[o.index[0]]) < graphics::kMaxVaryings) program->interpolation_[in_slot[o.index[0]]] = interpolation;
+        }
         // An input that is a system value says which in its declaration (a name after the operand); the rest take their meaning from the signature.
         if (o.type == kOpInput && (opcode == kDclInputSgv4 || opcode == kDclInputSiv4 || opcode == kDclInputPsSgv4 || opcode == kDclInputPsSiv4)) {
           const uint32_t name = p.le32() & 0xFFFF;
           if (!p.ok()) return status::kInvalidParameter;
           int sys = -1;
-          if (!vertex && name == 1) sys = kSysPosition;            // SV_Position
-          else if (!vertex && name == 9) sys = kSysFrontFacing;    // SV_IsFrontFace
+          if (!vertex && name == 1) {                              // SV_Position (at the centroid or the sample its interpolation mode says)
+            sys = kSysPosition;
+            if (pixel) program->position_location_ = graphics::interpolation_location(interpolation);
+          } else if (pixel && name == 10) {                        // SV_SampleIndex: the shader runs for each sample
+            sys = kSysSampleIndex;
+            program->sample_shading_ = true;
+            program->extra_features3_ |= graphics::kFeature3SampleShading;
+          }
+          if (sys >= 0) {
+          } else if (!vertex && name == 9) sys = kSysFrontFacing;    // SV_IsFrontFace
           else if (!vertex && name == 7) sys = kSysPrimitiveId;    // SV_PrimitiveID
           else if (!vertex && name == 24) sys = kSysShadingRate, program->extra_features2_ |= graphics::kFeature2ShadingRate;   // SV_ShadingRate
           else if (vertex && name == 6) sys = kSysVertexId;        // SV_VertexID
@@ -1976,13 +2040,61 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
       }
       if (!p.at_end()) return status::kInvalidParameter;
       continue;
-    } else if (opcode == 45 || opcode == 46 || opcode == 72 || opcode == 61 || opcode == 111) {
+    } else if (opcode == 203 || opcode == 204 || opcode == 205) {
+      // eval_snapped (dst, input, offset), eval_sample_index (dst, input, sample), eval_centroid (dst, input): a pixel shader's input taken at another point of the pixel (Shader
+      // Model 5's EvaluateAttributeSnapped / AtSample / AtCentroid). The input is a v# register of an interpolated varying.
+      if (!pixel || major < 5) return status::kNotSupported;
+      Operand d, input, where;
+      if ((s = read_operand(p, &d)) != status::kSuccess || (s = read_operand(p, &input)) != status::kSuccess) return s;
+      if (opcode != 205 && (s = read_operand(p, &where)) != status::kSuccess) return s;
+      if (input.type != kOpInput || input.dims != 1 || input.index[0] >= kRegisters || in_slot[input.index[0]] < 0 || in_sys[input.index[0]] >= 0) return status::kNotSupported;
+      ins.op = opcode == 203 ? kEvalSnapped : opcode == 204 ? kEvalSample : kEvalCentroid;
+      if ((s = to_dst(d, &ins.dst)) != status::kSuccess || (s = to_src(input, &ins.src[0])) != status::kSuccess) return s;
+      ins.src_count = 1;
+      if (opcode != 205) {
+        if ((s = to_src(where, &ins.src[1])) != status::kSuccess) return s;
+        ins.src_count = 2;
+      }
+      program->uses_system_values_ = true;
+      program->extra_features3_ |= graphics::kFeature3EvaluateAttributes;
+      if (!p.at_end()) return status::kInvalidParameter;
+      if ((s = emit(ins)) != status::kSuccess) return s;
+      continue;
+    } else if (opcode == 45 || opcode == 46 || opcode == 72 || opcode == 61 || opcode == 111 || opcode == 110) {
       // ld (dst, integer address, resource), sample_l (dst, coordinate, resource, sampler, level), resinfo (dst, level, resource): Shader Model 4 texture access beyond sample.
+      // ld2dms (dst, address, resource, sample), sampleinfo (dst, resource or rasterizer), samplepos (dst, resource or rasterizer, sample): Shader Model 4.1's multisampled reads.
       // (in any stage: none of them takes a derivative)
       Operand d, address, resource, sampler, lod;
       if ((s = read_operand(p, &d)) != status::kSuccess) return s;
-      if (opcode != 111 && (s = read_operand(p, &address)) != status::kSuccess) return s;   // (sampleinfo has no address)
+      if (opcode != 111 && opcode != 110 && (s = read_operand(p, &address)) != status::kSuccess) return s;   // (sampleinfo has no address)
       if ((s = read_operand(p, &resource)) != status::kSuccess) return s;
+      if (opcode == 110) {   // (samplepos: the sample after the resource, and then a word of padding the compiler writes: zero)
+        if ((s = read_operand(p, &address)) != status::kSuccess) return s;
+        while (!p.at_end())
+          if (p.le32() != 0 || !p.ok()) return status::kInvalidParameter;
+      }
+      if ((opcode == 110 || opcode == 111) && !major_at_least_41) return status::kInvalidParameter;   // (Shader Model 4.1 instructions)
+      if ((opcode == 110 || opcode == 111) && resource.type == kOpRasterizer) {
+        // Of the rasterizer: the pass's sample count, or the position of one of its samples (Direct3D's GetRenderTargetSampleCount / GetRenderTargetSamplePosition), in a pixel shader
+        if (!pixel || resource.dims != 0) return status::kNotSupported;
+        ins.op = opcode == 111 ? kTexSamples : kSamplePos;
+        ins.control = 1;
+        ins.vector = opcode == 111 && ((token >> 11) & 1) != 0;   // (sampleinfo_uint)
+        if ((s = to_dst(d, &ins.dst)) != status::kSuccess) return s;
+        ins.src_count = 0;
+        if (opcode == 110) {
+          if ((s = to_src(address, &ins.src[0])) != status::kSuccess) return s;
+          ins.src_count = 1;
+        }
+        if (resource.components == 2)
+          for (uint32_t k = 0; k < 4; ++k) ins.tex_swizzle[k] = resource.swizzle[k];
+        program->uses_system_values_ = true;
+        program->reads_rasterizer_ = true;
+        program->extra_features3_ |= graphics::kFeature3SampleShading;
+        if (!p.at_end()) return status::kInvalidParameter;
+        if ((s = emit(ins)) != status::kSuccess) return s;
+        continue;
+      }
       if (opcode == 72 && ((s = read_operand(p, &sampler)) != status::kSuccess || (s = read_operand(p, &lod)) != status::kSuccess)) return s;
       if (opcode == 46 && (s = read_operand(p, &lod)) != status::kSuccess) return s;   // (ld_ms: the sample)
       if (opcode == 61 && resource.type == kOpUav) {
@@ -2030,17 +2142,27 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
         if ((s = sampler_number(sampler, &sampler_reg)) != status::kSuccess || (s = pair_unit(unit, sampler_reg, &unit)) != status::kSuccess) return s;
       }
       if (opcode == 45 && (program->texture_kind_[unit] == graphics::TextureKind::TextureCube || program->texture_kind_[unit] == graphics::TextureKind::TextureCubeArray)) return status::kNotSupported;   // (a cube has no Load)
-      const bool multisampled = program->texture_kind_[unit] == graphics::TextureKind::Texture2DMS;
-      if ((opcode == 46 || opcode == 111) != multisampled && (opcode == 46 || opcode == 111 || opcode == 45 || opcode == 72)) return status::kNotSupported;   // (ld_ms and sampleinfo go with a multisampled texture, and ld and sample_l do not)
-      ins.op = opcode == 45 ? kTexFetch : opcode == 46 ? kTexFetchMs : opcode == 111 ? kTexSamples : opcode == 72 ? kTexLod : kTexSize;
-      if (opcode == 111) {
-        // sampleinfo: the sample count the texture was declared with, as a constant (an unsigned result when the instruction says so)
-        ins.control = static_cast<uint8_t>(program->texture_samples_[unit]);
-        ins.tex_swizzle[0] = ((token >> 11) & 1) ? 1 : 0;
+      const bool multisampled = graphics::is_multisampled_kind(program->texture_kind_[unit]);
+      if ((opcode == 46 || opcode == 111 || opcode == 110) != multisampled && (opcode == 46 || opcode == 111 || opcode == 110 || opcode == 45 || opcode == 72)) return status::kNotSupported;   // (ld_ms, sampleinfo and samplepos go with a multisampled texture, and ld and sample_l do not)
+      ins.op = opcode == 45 ? kTexFetch : opcode == 46 ? kTexFetchMs : opcode == 111 ? kTexSamples : opcode == 110 ? kSamplePos : opcode == 72 ? kTexLod : kTexSize;
+      if (opcode == 111 || opcode == 110) {
+        // sampleinfo: the sample count of the texture bound (an unsigned result when the instruction says so; `stride` the count it was declared with, 0 when it declared none);
+        // samplepos: the position of a sample of its standard pattern
+        ins.control = 0;
+        ins.stride = program->texture_samples_[unit];
+        ins.vector = opcode == 111 && ((token >> 11) & 1) != 0;
         s = to_dst(d, &ins.dst);
         if (s != status::kSuccess) return s;
-        ins.src[0].type = kSampler, ins.src[0].number = static_cast<uint16_t>(unit);
         ins.src_count = 0;
+        if (opcode == 110) {
+          if ((s = to_src(address, &ins.src[0])) != status::kSuccess) return s;
+          ins.src[1].type = kSampler, ins.src[1].number = static_cast<uint16_t>(unit);
+          ins.src_count = 2;
+        } else {
+          ins.src[0].type = kSampler, ins.src[0].number = static_cast<uint16_t>(unit);
+        }
+        if (resource.components == 2)
+          for (uint32_t k = 0; k < 4; ++k) ins.tex_swizzle[k] = resource.swizzle[k];
         program->uses_textures_ = true;
         program->uses_texel_access_ = true;
         if (!p.at_end()) return status::kInvalidParameter;

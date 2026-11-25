@@ -1614,9 +1614,14 @@ bool TgsiEmitter::instruction(const Instr& ins) {
       // (the count the shader declared the texture with: a constant)
       t = begin_result(ins, true, &direct);
       const String w = temp(kWork);
-      float v[4];
-      for (float& f : v) f = ins.tex_swizzle[0] ? __builtin_bit_cast(float, static_cast<uint32_t>(ins.control)) : static_cast<float>(ins.control);
-      const String value = imm_text(v, ".xxxx");
+      if (ins.control != 0 || ins.stride == 0) {
+        unsupported_ = true;
+        break;
+      }
+      float v[4] = {ins.vector ? __builtin_bit_cast(float, ins.stride) : static_cast<float>(ins.stride), 0.0f, 0.0f, 0.0f};
+      float picked[4];
+      for (uint32_t c = 0; c < 4; ++c) picked[c] = v[ins.tex_swizzle[c] & 3];
+      const String value = imm_text(picked, "");
       line("MOV", &w, &value);
       break;
     }

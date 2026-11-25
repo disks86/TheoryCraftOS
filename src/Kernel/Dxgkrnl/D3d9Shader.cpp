@@ -94,6 +94,9 @@ struct D3d9Program::State {
   bool geometry_cut[graphics::kMaxGeometryStreams] = {};   // a cut came after the last emit to the stream
   uint32_t stream_vertices[graphics::kMaxGeometryStreams] = {};   // vertices emitted to each stream
   Q sys[kSysValueCount] = {};
+  Q coverage_out = {{0, 0, 0, 0}};   // a pixel shader's SV_Coverage output (oMask: the integer in x), and whether it wrote it
+  bool coverage_written = false;
+  float eval_dx = 0, eval_dy = 0;    // (a run for a neighbour of the quad: where its pixel is from the one whose context it has, for the evaluations of inputs)
   bool killed = false;
   bool at_barrier = false;     // the run stopped at a barrier ...
   uint64_t barrier_pc = 0;     // ... and goes on from this instruction
@@ -609,6 +612,7 @@ void D3d9Program::execute(State& s, uint64_t begin, uint64_t end) const {
       case kAttrOut:
       case kTexCrdOut: target = d.slot == kSlotPosition ? &s.pos : d.slot >= 0 ? &s.var[d.slot] : nullptr; break;
       case kColorOut: target = d.slot >= 0 && d.slot < static_cast<int8_t>(graphics::kMaxColorTargets) ? &s.color[d.slot] : nullptr; break;
+      case kCoverageOut: target = &s.coverage_out, s.coverage_written = true; break;
       default: break;
     }
     if (!target) return;
@@ -657,6 +661,7 @@ void D3d9Program::execute(State& s, uint64_t begin, uint64_t end) const {
       other.no_stores = true;
       for (uint32_t n = 0; n < kSysValueCount; ++n) other.sys[n] = s.sys[n];
       other.sys[kSysPosition] = {{position.x, position.y, position.z, position.w}};
+      other.eval_dx = s.eval_dx + position.x - s.sys[kSysPosition].f[0], other.eval_dy = s.eval_dy + position.y - s.sys[kSysPosition].f[1];
       if (f->quad_bary_fn) {   // (the corner's barycentrics)
         graphics::Vec4 bary[2] = {};
         f->quad_bary_fn(f->quad_user, corner[k], bary);
@@ -1055,16 +1060,64 @@ void D3d9Program::execute(State& s, uint64_t begin, uint64_t end) const {
         const uint32_t unit = ins.src[1].number;
         if (s.textures) {
           const Q sample = fetch(ins.src[2], 0);
-          const graphics::Vec4 t = s.textures->fetch_sample(unit, __builtin_bit_cast(int32_t, a.f[0]), __builtin_bit_cast(int32_t, a.f[1]), bits_of(sample.f[0]));
+          // (a Texture2DMSArray's layer in the third component of the address)
+          const bool array = unit < graphics::kMaxTextureUnits && texture_kind_[unit] == graphics::TextureKind::Texture2DMSArray;
+          const graphics::Vec4 t = s.textures->fetch_sample(unit, __builtin_bit_cast(int32_t, a.f[0]), __builtin_bit_cast(int32_t, a.f[1]), array ? bits_of(a.f[2]) : 0u, bits_of(sample.f[0]));
           const float texel[4] = {t.x, t.y, t.z, t.w};
           b = {{texel[ins.tex_swizzle[0]], texel[ins.tex_swizzle[1]], texel[ins.tex_swizzle[2]], texel[ins.tex_swizzle[3]]}};
         }
         store(ins.dst, b);
         break;
       }
-      case kTexSamples:
-        store(ins.dst, splat(ins.tex_swizzle[0] ? from_bits(ins.control) : static_cast<float>(ins.control)));
+      case kTexSamples: {
+        // sampleinfo: (count, 0, 0, 0) of the texture bound to the unit or of the rasterizer, swizzled as the operand says
+        const uint32_t count = ins.control == 1 ? (s.fragment ? s.fragment->sample_count : 1u) : s.textures ? s.textures->sample_count(ins.src[0].number) : 0u;
+        const float values[4] = {ins.vector ? from_bits(count) : static_cast<float>(count), 0.0f, 0.0f, 0.0f};
+        store(ins.dst, Q{{values[ins.tex_swizzle[0] & 3], values[ins.tex_swizzle[1] & 3], values[ins.tex_swizzle[2] & 3], values[ins.tex_swizzle[3] & 3]}});
         break;
+      }
+      case kSamplePos: {
+        // samplepos: where sample `index` is in the pixel, in pixels from its centre - of the texture's standard pattern, or of the pass's (its own positions, when set) -, 0 past the count
+        const uint32_t index = bits_of(a.f[0]);
+        uint32_t count = 0;
+        const graphics::SamplePosition* positions = nullptr;
+        if (ins.control == 1) {
+          if (s.fragment) count = s.fragment->sample_count, positions = s.fragment->sample_positions;
+        } else if (s.textures) {
+          count = s.textures->sample_count(ins.src[1].number);
+          positions = graphics::standard_sample_positions(count);
+        }
+        float values[4] = {0, 0, 0, 0};
+        if (positions && index < count) values[0] = static_cast<float>(positions[index].x) * (1.0f / 16.0f), values[1] = static_cast<float>(positions[index].y) * (1.0f / 16.0f);
+        store(ins.dst, Q{{values[ins.tex_swizzle[0] & 3], values[ins.tex_swizzle[1] & 3], values[ins.tex_swizzle[2] & 3], values[ins.tex_swizzle[3] & 3]}});
+        break;
+      }
+      case kEvalSample: case kEvalCentroid: case kEvalSnapped: {
+        // An input at another point of the pixel: at a sample, the centroid of the covered samples, or an offset from the centre (sixteenths of a pixel, four bits each way)
+        Q v = a;
+        const graphics::FragmentContext* f = s.fragment;
+        if (f && f->evaluate) {
+          float x = f->centre_x + s.eval_dx, y = f->centre_y + s.eval_dy;
+          if (ins.op == kEvalSample) {
+            const uint32_t index = bits_of(fetch(ins.src[1], 0).f[0]);
+            if (f->sample_positions && index < f->sample_count) x += static_cast<float>(f->sample_positions[index].x) * (1.0f / 16.0f), y += static_cast<float>(f->sample_positions[index].y) * (1.0f / 16.0f);
+          } else if (ins.op == kEvalCentroid) {
+            x += f->centroid_x, y += f->centroid_y;
+          } else {
+            const Q offset = fetch(ins.src[1], 0);
+            auto four_bits = [](uint32_t v) { return static_cast<float>(static_cast<int32_t>((v & 0xF) ^ 0x8) - 8) * (1.0f / 16.0f); };   // (the low four bits, signed)
+            x += four_bits(bits_of(offset.f[0])), y += four_bits(bits_of(offset.f[1]));
+          }
+          graphics::Vec4 at[graphics::kMaxVaryings] = {};
+          f->evaluate(f->evaluate_user, x, y, at);
+          const graphics::Vec4* own = s.varyings;
+          s.varyings = at;
+          v = fetch(ins.src[0], 0);
+          s.varyings = own;
+        }
+        store(ins.dst, v);
+        break;
+      }
       case kTexFetch: case kTexLod: case kTexSize: {
         b = {{0, 0, 0, 0}};
         const uint32_t unit = ins.src[1].number;
@@ -1083,7 +1136,7 @@ void D3d9Program::execute(State& s, uint64_t begin, uint64_t end) const {
           } else {
             uint32_t w = 0, h = 0, d = 1, levels = 0;
             if (s.textures->size_volume(unit, bits_of(a.f[0]), &w, &h, &d, &levels) && bits_of(a.f[0]) < levels) {
-              if (kind == graphics::TextureKind::TextureCube || flat) d = 0;   // (what resinfo leaves in the third component for the kinds with no depth)
+              if (kind == graphics::TextureKind::TextureCube || kind == graphics::TextureKind::Texture2DMS || flat) d = 0;   // (what resinfo leaves in the third component for the kinds with no depth)
               const uint32_t mode = ins.control;
               t = mode == 2 ? graphics::Vec4{from_bits(w), from_bits(h), from_bits(d), from_bits(levels)}
                             : mode == 1 ? graphics::Vec4{1.0f / static_cast<float>(w), 1.0f / static_cast<float>(h), d ? 1.0f / static_cast<float>(d) : 0.0f, 1.0f / static_cast<float>(levels)}
@@ -1339,12 +1392,16 @@ bool D3d9Program::run_fragment_ex(const graphics::Vec4* varyings, const graphics
   s.sys[kSysHelperLane].f[0] = from_bits(context.helper ? 0xFFFFFFFFu : 0u);
   s.sys[kSysBarycentrics] = {{context.barycentrics.x, context.barycentrics.y, context.barycentrics.z, 0.0f}};
   s.sys[kSysBarycentricsLinear] = {{context.barycentrics_linear.x, context.barycentrics_linear.y, context.barycentrics_linear.z, 0.0f}};
+  s.sys[kSysSampleIndex].f[0] = from_bits(context.sample_index);
+  s.sys[kSysCoverage].f[0] = from_bits(context.coverage);
+  s.sys[kSysInnerCoverage].f[0] = from_bits(context.inner_coverage ? 1u : 0u);
   s.fragment = &context;
   s.storage = context.storage;
   s.images = context.images;
   s.no_stores = context.helper;
   execute(s);
   if (s.killed) return false;
+  if (s.coverage_written && context.coverage_out && !context.helper) *context.coverage_out = bits_of(s.coverage_out.f[0]);
   for (uint32_t n = 0; n < color_outputs_; ++n) color[n] = {s.color[n].f[0], s.color[n].f[1], s.color[n].f[2], s.color[n].f[3]};
   return true;
 }
@@ -1641,6 +1698,13 @@ NtStatus D3d9Binding::bind(UniquePointer<D3d9Program> program, graphics::ShaderM
   slot_ = static_cast<int32_t>(slot);
   kind_ = program->stage() == graphics::ShaderStage::Vertex ? 0 : program->uses_textures() ? 2 : 1;
   desc->stage = program->stage();
+  if (program->stage() == graphics::ShaderStage::Fragment) {
+    // (how its inputs are interpolated, whether it runs for each sample and writes SV_Coverage: graphics::ShaderModuleDesc)
+    for (uint32_t i = 0; i < graphics::kMaxVaryings; ++i) desc->interpolation[i] = program->interpolation(i);
+    desc->position_location = program->position_location();
+    desc->sample_shading = program->sample_shading();
+    desc->writes_coverage = program->writes_coverage();
+  }
   if (kind_ == 0) desc->vertex_function = decltype(kTrampolines)::vertex[slot];
   else if (kind_ == 1) desc->fragment_function = decltype(kTrampolines)::fragment[slot];
   else desc->textured_fragment_function = decltype(kTrampolines)::textured[slot];

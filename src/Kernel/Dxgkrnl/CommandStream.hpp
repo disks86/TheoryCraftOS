@@ -88,6 +88,7 @@
 //   ResolveRegion    destination_index, source_index   (outside a pass: the samples of a multisampled colour render target averaged into an ordinary image of the same format and size, the adapter's kFeatureMultisample)
 //                    [, mode]: a graphics::ResolveMode; or kResolveCopySamples and then x, y, width, height of the source's region and x, y in the destination: every sample of the region
 //                    copied into an image of the same format and samples (kFeature2SampleCopies; Direct3D 12's DECOMPRESS into another resource, depth and stencil too)
+//                    [, mode | kResolveSourceLayer, layer]: the resolve of that layer of a multisampled array (kFeature3MultisampleArrays)
 //   CopyBuffer       dst_index, dst_offset, src_index, src_offset, bytes   (outside a pass: between two buffer allocations (not heaps; a reserved buffer is read and written as the whole it appears to be; the source may be a kAllocQueryResult buffer: the results of the queries ended before); the ranges lie in the buffers, a copy inside one buffer must not overlap)
 //   CopyBufferImage  direction (0 buffer to image, 1 image to buffer), image_index, level, layer, x, y, width, height, buffer_index, buffer_offset, row_pitch   (outside a pass: a rectangle of one level of a colour image
 //                    (any kind: `layer` is the array slice or volume depth, 0 for a 2D image) and rows of the buffer, `row_pitch` bytes apart from `buffer_offset` on (at least width * the bytes of a pixel); a multisampled or depth image is refused)
@@ -227,6 +228,8 @@ enum class Op : uint16_t {
 };
 constexpr uint32_t kMaxViewInstances = 4;   // D3D12_MAX_VIEW_INSTANCE_COUNT
 constexpr uint32_t kResolveCopySamples = 16;   // ResolveRegion's mode word for a copy of samples (past the graphics::ResolveMode values)
+// ResolveRegion's mode word with this bit: one more word follows, the layer of the multisampled source that is resolved (an array of them: graphics::kFeature3MultisampleArrays).
+constexpr uint32_t kResolveSourceLayer = 1u << 8;
 constexpr uint32_t kVideoProcessStreamWords = 15;
 constexpr uint32_t kVideoProcessExtension = 0x31585056;   // 'VPX1': VideoProcess's optional part follows
 constexpr uint32_t kVideoProcessStreamExtWords = 25;
@@ -484,6 +487,8 @@ class CommandWriter {
     if (mode == 0) packet(Op::ResolveRegion, {destination, source});
     else packet(Op::ResolveRegion, {destination, source, mode});
   }
+  // A layer of a multisampled array (kResolveSourceLayer).
+  void resolve_region_layer(uint32_t destination, uint32_t source, uint32_t mode, uint32_t source_layer) { packet(Op::ResolveRegion, {destination, source, mode | kResolveSourceLayer, source_layer}); }
   void copy_samples(uint32_t destination, uint32_t source, const graphics::Rect2D& region, uint32_t x, uint32_t y) {
     packet(Op::ResolveRegion, {destination, source, kResolveCopySamples, static_cast<uint32_t>(region.x), static_cast<uint32_t>(region.y), region.width, region.height, x, y});
   }
