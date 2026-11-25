@@ -120,7 +120,7 @@ The kernel-mode driver is the D3DKMT layer, which Direct3D 9, 10, 11 and 12 all 
   Only the software device has them so far:
   - `kFeatureBlendState`: `GraphicsPipelineDesc::blend` (factors, ops and write mask for the colour and the alpha on their own, `custom` selects it over `alpha_blend`) and
     `depth_compare` (any of the eight comparisons).
-  - `kFeatureTexelAccess`: `ITextureSet::fetch` (Load), `sample_lod` (SampleLevel), `size` (GetDimensions); DXBC `ld`, `sample_l`, `resinfo`. For the images of `kFeatureTextureKinds` (one level) there are `fetch_volume` (x, y and the slice or layer; a cube has no Load), `sample_lod_volume` and `size_volume` (the depth or layer count next to the width and height); TGSI `TXF` / `TXL` / `TXQ` with the `3D`, `2D_ARRAY` and `CUBE` targets. All three kinds match the real GPU.
+  - `kFeatureTexelAccess`: `ITextureSet::fetch` (Load), `sample_lod` (SampleLevel), `size` (GetDimensions); DXBC `ld`, `sample_l`, `resinfo`. For the images of `kFeatureTextureKinds` there are `fetch_volume` (x, y and the slice or layer; a cube has no Load), `sample_lod_volume` and `size_volume` (the depth or layer count next to the width and height; with `kFeature2MipmappedLayers` at any level: a volume's depth at that level), and for cube arrays `sample_cube_array` / `sample_lod_cube_array` (a direction and the cube; `size_volume`'s depth the number of cubes); TGSI `TXF` / `TXL` / `TXQ` with the `3D`, `2D_ARRAY`, `CUBE` and `CUBEARRAY` targets (`TXL2` for a cube array: the level in the second source). All the kinds match the real GPU.
   - `kFeatureSystemInputs`: `VertexShaderFnEx` / `FragmentShaderFnEx` carry `SV_VertexID`, `SV_InstanceID`, `SV_Position` (pixel centre, depth, 1/w), `SV_IsFrontFace` and
     `SV_PrimitiveID`; the DXBC front end reads them from the declarations (`dcl_input_sgv` / `siv`), and a program that uses them needs the feature.
   - `kFeatureInstancing`: `draw(..., instance_count, first_instance)` and `VertexAttribute::per_instance` (the element numbered by the instance, in the same buffer at the same stride);
@@ -187,6 +187,8 @@ overwrite it with its stale copy, so none is made.
 
 ## Volume, array and cube textures
 
+(What follows was written for one level; see "Levels of every image" below for what `kFeature2MipmappedLayers` adds: levels of all of these, cube arrays, views, passes into a level.)
+
 An allocation has a `kind` (`graphics::TextureKind`: `Texture2D`, `Texture3D`, `Texture2DArray`, `TextureCube`) and `layers` (the depth of a volume, the size of an array, 6 for a cube whose
 width equals its height, at most `kMaxTextureLayers` = 256). They are sampled-only (`kAllocTexture`, optionally `kAllocShared`), one mip level, 8-bit colour, and need the adapter's
 `kFeatureTextureKinds` (`kNotSupported` otherwise); the lock shows all layers one after the other (`pitch` per row, `pitch * height` per layer). A DXBC pixel shader declares the kind with
@@ -199,14 +201,56 @@ pass on virglrenderer; pixel centres on exact texel boundaries are avoided in th
 `d3d12.dll` makes a `TEXTURE3D` resource a volume and a 2D one of `DepthOrArraySize` > 1 an array; a cube only when the runtime above says the next resource is one
 (`TcosD3D12ResourceOptions(device, TCOS_RESOURCE_CUBE)`, src/Windows/tcosdx.h: six square layers), since Direct3D 12 tells a cube from an array of six only by its views and
 the kernel's allocation has to know when it is made. `d3d11.dll` (`D3D11_RESOURCE_MISC_TEXTURECUBE`) and `d3d9.dll` (`CreateCubeTexture`) say it; a plain Direct3D 12
-program's cube is an array. The same header's `TcosD3D12StageConstantBases` places the geometry, hull and domain shaders' constant buffers in the block of constants.
+program's cube is an array - which a TEXTURECUBE or TEXTURECUBEARRAY view now shows as one (below). The same header's `TcosD3D12StageConstantBases` places the geometry, hull and domain shaders' constant buffers in the block of constants.
+
+## Levels of every image (kFeature2MipmappedLayers)
+
+On an adapter with `kFeature2MipmappedLayers` (features2 bit 10; the CPU renderer, and virgl when the host's GLSL is 4.30 or later - its sampler views of another target or of a
+range of levels are the host's texture views) every image of one sample may have levels: arrays, cubes and volumes (a volume's level `l` has `max(1, layers >> l)` slices:
+`graphics::level_layer_count`, `Allocation::level_layers`), render targets and depth buffers, storage images, the wide formats, staging memory. And:
+
+- **Cube arrays**: `TextureKind::TextureCubeArray` (5), `layers` a multiple of six (cube n is layers 6n .. 6n + 5), square. DXBC `dcl_resource_texturecubearray` (dimension
+  10, SM 4.1): `sample` takes (x, y, z, cube), `sample_l` the same and the level (TGSI `TXL2`), `resinfo` the number of cubes; it has no `ld` and no gather here. A storage image
+  of a cube or a cube array is an array of its faces to the shaders (virgl makes such an image a `2D_ARRAY` resource with sampler views of the cube target).
+- **The memory**: the backing has the levels one after the other, each level its layers (`Allocation::level_range` / `subresource_range` / `subresource_bytes`); a lock of level `l`
+  is all its layers. VidMm uploads and reads back each layer of each level (`IImage::write_subresource` / `read_subresource` and the `_float` forms; on a device without the
+  feature the defaults take what the older forms take).
+- **Views** (`BindTexture`'s four optional words: first level, count of levels, first layer, count of layers - a count of 0 to the last; a Direct3D 12 texture descriptor carries
+  them in its offset words: level, count, layer, count, 16 bits each): the unit sees those levels and layers as the whole image (`ITextureSet` lookups, `GetDimensions` and `Load`
+  are of the view), of the kind the shader declares - `graphics::texture_view_fits`: a slice of an array as a 2D texture, six layers of an array as a cube and a multiple of six
+  as a cube array, a cube or a cube array as an array, a 2D image as an array of one; a volume's view has all its slices. The stream runner checks the view against each
+  pipeline's declared kinds at the draw or dispatch (`fit_textures`) and binds the unit again with the declared kind when it differs (`ICommandBuffer::bind_texture_view`). The
+  sampler's minimum and maximum LOD count from the view's first level, as Direct3D's do.
+- **Passes into a level**: `BeginPass` with `kPassLevels` (flag 16) ends with the level of each colour target and of the depth buffer; every target's level is of one size, the
+  pass's, and the layers of `kPassLayers` are that level's (a volume's level has fewer slices). A unit may sample levels or layers of a target the pass does not draw into
+  (render into level n while sampling level n - 1 of the same texture); one whose view shows what the pass draws into is refused, as before. Software device:
+  `RenderPassBegin::level`; virgl: surfaces of (level, first layer, count).
+- **Copies**: `CopyRegion`'s five optional words (destination level and layer, source level and layer, number of layers - a volume's slices) copy between any subresources of
+  images whose pixels (or 4 x 4 blocks: block-compressed images, whole blocks as `CopyBufferImage` takes them) are as many bytes; `CopyBufferImage` takes any layer of any level.
+  On the CPU, from the backings (the GPU's newer contents read back first).
+- **GenerateMipmaps** of arrays and cubes (each layer its own chain), volumes (2 x 2 x 2 boxes of the slices above) and the wide formats (by their values); on the CPU from the
+  backing, after the GPU's contents are read back (a level 0 drawn into); block-compressed and integer images are refused.
+- **Storage images** of any level of a layered image (`BindUavImage`'s layers are the level's).
+- **Mirrors of subresources**: `SetMirror`'s optional words name the subresource (level | layer << 16) each layer of the mirror shows - what d3d12.dll makes a narrow texture's
+  unordered access view of a level, or of layers of an array, of (`narrow_mirror`: an R8 / R8G8 / R16 / R16G16 view of the widened image, whose channels go back).
+- **The DLLs**: d3d12.dll makes resources of any levels and kinds (cube arrays: `TcosD3D12ResourceOptions(TCOS_RESOURCE_CUBE)` of a multiple of six; a plain Direct3D 12
+  program's arrays of six or twelve are cubes and cube arrays through their views), honours a shader resource view's `MostDetailedMip` / `MipLevels` and slices
+  (`srv_view`), render target and depth stencil views' `MipSlice` (the level and its size into the pass; a depth-only pass's companion target is of the level's size),
+  unordered access views of a level of arrays, volumes and cubes, `CopyTextureRegion` between any subresources and `CopyResource` of every level and layer; packed YUV
+  arrays of levels are one array of the kernel's (the video processor reads their slices by way of a copy), Y416 has levels. d3d11.dll (`dev_all_levels`) keeps every
+  level of every texture, draws into render targets and depth buffers of levels directly (no rtshadow.inc targets), makes cube arrays, turns its views into Direct3D 12's
+  (`srv_desc12`), generates the levels of a view's levels and layers (a volume's by 2 x 2 x 2) and copies any subresources through Direct3D 12.
+- **Tests**: `DxgkrnlTest` `test_mipmapped_layers` (allocations and their memory, sampling at levels, views of every kind, cube arrays, derivatives on arrays, passes into levels,
+  copies, GenerateMipmaps, storage images of cubes and levels, mirrors of subresources, what a device without the feature refuses); the conformance scenes of levels, views,
+  passes into levels, cube arrays and unordered access to a cube's faces match the CPU renderer on the real virglrenderer; `d3d12test` `test_mip_layers` and `d3d11test`
+  `test_mip_layers` through the DLLs.
 
 ## Block-compressed textures
 
 `Format::Bc1`, `Bc2`, `Bc3` and their sRGB forms (BC1 = DXT1 with its one-bit alpha, BC2 = DXT3, BC3 = DXT5) are allocation formats of sampled textures only (`kAllocTexture`,
-optionally `kAllocShared`, or staging memory; one sample): plain textures with mip levels, or volumes, arrays and cubes of one level. The backing is rows of 4 x 4 blocks of 8 or 16
+optionally `kAllocShared`, or staging memory; one sample): plain textures with mip levels, or volumes, arrays and cubes (of levels too, with `kFeature2MipmappedLayers`). The backing is rows of 4 x 4 blocks of 8 or 16
 bytes (`image_row_bytes` / `image_rows` / `image_level_bytes` in DxgTypes.hpp; a lock's pitch is a row of blocks), and `CopyBufferImage` copies whole blocks: the rectangle starts on a
-block and ends on one or at the level's edge, the buffer's rows are rows of blocks. `CopyRegion` and `GenerateMipmaps` refuse them. A device with `kFeatureCompressedFormats` samples
+block and ends on one or at the level's edge, the buffer's rows are rows of blocks. `GenerateMipmaps` refuses them; `CopyRegion` copies whole blocks between their subresources with `kFeature2MipmappedLayers` (refused without). A device with `kFeatureCompressedFormats` samples
 them as they are: VidMm gives it the blocks with `IImage::write_compressed` (virgl: the host's `DXT1_RGBA` 106, `DXT3_RGBA` 107, `DXT5_RGBA` 108 and the `SRGBA` forms 110 - 112 of
 virglrenderer's `virgl_hw.h`, bound as sampler views only, each level and layer transferred with a stride of a row of blocks); for the others (the CPU renderer) the device image is
 B8G8R8A8 and VidMm decodes the blocks when it uploads them (`Graphics/BlockCompression.hpp`, the decoding the Direct3D 10 specification gives; `BlockCompressionTest` checks it
@@ -230,7 +274,7 @@ The conformance run on virglrenderer is the only check of the TGSI path against 
 
 ### Storage images (unordered access views of textures)
 
-A `kAllocStorageImage` texture (with `kAllocTexture`, optionally `kAllocRenderTarget`; a colour format that is not sRGB or block-compressed, one sample, not a cube; the adapter's
+A `kAllocStorageImage` texture (with `kAllocTexture`, optionally `kAllocRenderTarget`; a colour format that is not sRGB or block-compressed, one sample; a cube or a cube array, whose faces are an array to the shaders, only with `kFeature2MipmappedLayers`; the adapter's
 `kFeature2StorageImages`, a second word of device features `DeviceInfo::features2` / `AdapterCaps::features2`) is read and written texel by texel by compute shaders, and by pixel
 shaders in passes (`kFeature2StorageImagesInDraws`). A stream binds a level and a run of layers of one to storage slot u<n> with `BindUavImage slot, allocation, level,
 first_layer, layer_count [, view format]` (op 37; slots below `kMaxStorageImages` = 8, a register being a buffer or an image by the shader's declaration); Direct3D 12 binds
@@ -253,14 +297,14 @@ image after the dispatch or draw (VidMm reads layered and mipmapped storage imag
 
 ### Layered render targets (SV_RenderTargetArrayIndex)
 
-Arrays, cubes and volumes (one level) may be render targets, and arrays and cubes depth buffers, on an adapter with `kFeature2LayeredTargets`. `BeginPass` with
+Arrays, cubes and volumes may be render targets, and arrays and cubes depth buffers, on an adapter with `kFeature2LayeredTargets` (of several levels, and drawn into at a level - `kPassLevels` -, with `kFeature2MipmappedLayers`). `BeginPass` with
 `kPassLayers` (flag 8) ends with a first layer and a count for each colour target and then the depth buffer (`RenderPassBegin::first_layer` / `layer_count`): a clear
 clears those layers, and a primitive goes to the layer its geometry shader's `SV_RenderTargetArrayIndex` names (the leading vertex's: `ShaderIo::layer`), the target's first
 when that is past its count. Only a geometry shader writes it (`VPAndRTArrayIndexFromAnyShaderFeedingRasterizerSupportedWithoutGSEmulation` is FALSE); `SV_ViewportArrayIndex`
 is not taken (one viewport). DXBC: the output's `render_target_array_index` (OSGN names up to 31 characters now) and `vPrim` in geometry shaders. virgl: `DCL OUT[n], LAYER`
 (after the stream positions), `vPrim` as the input `DCL IN[n], PRIM_ID` (the host makes a geometry shader's PRIMID system value the output `gl_PrimitiveID`, its input `gl_PrimitiveIDIn`), and surfaces of a layer range (`first | last << 16`); layered resources never take Y_0_TOP (the host refuses it on anything but 2D). d3d12.dll:
 render target and depth views of `TEXTURE2DARRAY` / `TEXTURE1DARRAY` / `TEXTURE3D` slices (`SoftDesc::slice` / `stride`), planar views of several slices through an array
-mirror that writes back. d3d11.dll: arrays, cubes and volumes of one level are drawn into directly (the render target shadows of rtshadow.inc stay for textures with levels).
+mirror that writes back. d3d11.dll: arrays, cubes and volumes are drawn into directly, of any level on an adapter with `kFeature2MipmappedLayers` (the render target shadows of rtshadow.inc stay for textures with levels on the others).
 
 ## Multisampling
 
@@ -290,7 +334,7 @@ level is 1.50 or later.
 
 `A8R8G8B8Srgb` / `A8B8G8R8Srgb` (`DXGI_FORMAT_*_UNORM_SRGB`), `A16B16G16R16` (four 16-bit normalised channels) and `A32B32G32R32Uint` (four unsigned integers) are allocation formats, each behind a
 feature of the adapter (`kFeatureSrgbFormats`, `kFeatureUnorm16Formats`, `kFeatureIntegerFormats`; `kNotSupported` without it, except for staging memory). They are render targets and textures, not
-presentable, and the 16-bit and integer ones (like the floats) have one level and no multisampling; an sRGB image may have mip levels (the chain is made from the stored codes, not from linear values) and
+presentable, and the 16-bit and integer ones (like the floats) have no multisampling, and one level but on an adapter with `kFeature2MipmappedLayers`; an sRGB image may have mip levels (the chain is made from the stored codes, not from linear values) and
 may be multisampled (a resolve averages linear values). **sRGB:** a texture is decoded to linear values when it is read (before filtering), a render target takes linear values from the shader,
 blends on linear values and stores the encoded result (a clear colour is linear too); alpha is linear. The CPU renderer builds the decode table without a maths library and encodes by searching
 it. **16-bit:** the CPU renderer keeps Vec4s rounded to 1/65535 (clamped to 0..1); the memory manager converts the backing to and from them. **Integer:** the Vec4s hold the integers as float bits - a pixel
@@ -415,8 +459,7 @@ Direct3D 11's and 12's video interfaces run on the kernel's codecs, on the CPU, 
   P016 (12-bit 4:2:0 and monochrome; 12 bits in the top of each word). `VideoDecoderDesc::surface_format` (hardware::DxvaSurfaceFormat; 0 and 1 are NV12 and P010 as
   the `ten_bit` word was) names it; the packed ones are one image of their views' pixels (AYUV and YUY2 A8B8G8R8, Y410 A2B10G10R10, Y416 / Y210 / Y216 A16B16G16R16;
   the 4:2:2 ones half as wide, a pixel a pair), into which `DecodeFrame` copies the rows the decoder packed. d3d12.dll has the packed formats (views of their pixels'
-  format only, render targets of AYUV only, mip levels of AYUV - DXGI's tables give them to AYUV and Y416; Y416's are `DXGI_ERROR_UNSUPPORTED`, the kernel's 16-bit images
-  having one level -, arrays one allocation a slice, committed, placed - `planar_layout` -, shared or in a CPU-visible custom heap as a planar texture's planes are; a render
+  format only, render targets of AYUV only, mip levels of AYUV and Y416 - DXGI's tables give them to those two; Y416's need `kFeature2MipmappedLayers`, as do arrays of levels, which are one array allocation -, arrays of one level one allocation a slice, committed, placed - `planar_layout` -, shared or in a CPU-visible custom heap as a planar texture's planes are; a render
   target view of a slice, a Texture2DArray view of several slices through an array mirror) and Direct3D 12's planar P208 / V208 / V408 (two or three planes); the processor reads and
   writes AYUV, Y410, Y416, YUY2, Y210, Y216 and P208 (4:2:2 chroma sited as the colour space says, horizontally).
 - d3d12.dll: `ID3D12VideoDevice` .. 3, decoders and heaps (a heap is the kernel's decoder), processors, the VIDEO_DECODE / VIDEO_PROCESS queues and lists, decode
@@ -651,8 +694,9 @@ has its method, `scripts/gen-dx-vtables.py` names the latest interface of each o
   `D3DBLEND_BOTHSRCALPHA`) pass theirs on.
 
 Not done, in the order a program is likely to meet them: texture formats of fewer than four channels, packed floats and block compression beyond BC1 - BC3 (above); a depth buffer read as a texture (shadow maps: virgl keeps textures and attachments in opposite row order, and the
-kernel refuses the combination); rendering into a mip level; unordered access to cubes, to mipmapped arrays and volumes (the kernel keeps one level of them), to narrow
-arrays or narrow textures with levels, to typed buffers; `CopyResource` of arrays, volumes and textures with levels; depth bias
+kernel refuses the combination); unordered access to typed buffers, and to the slices of a narrow (R8 / R8G8 / R16 / R16G16) volume (its mirror would be a volume); copies of
+depth buffers (the kernel keeps no memory of them: `CopyRegion` refuses them); a Direct3D 12 view's `ResourceMinLODClamp` (the sampler's `MinLOD` and d3d11's
+`SetResourceMinLOD` are applied); gather of a cube array; depth bias
 and back-face stencil state; dual-source blending (`SRC1_*` factors: the pipeline is refused with `DXGI_ERROR_UNSUPPORTED`); several viewports; more than four unordered
 access buffers; pipeline statistics queries from the DLL; shared resources across adapters (`D3D12_HEAP_FLAG_SHARED_CROSS_ADAPTER`,
 `D3D12_FENCE_FLAG_SHARED_CROSS_ADAPTER`: `DXGI_ERROR_UNSUPPORTED`); the blend factor on Vega and the other fixed backends; ray tracing,

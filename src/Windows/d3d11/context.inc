@@ -259,7 +259,7 @@ static Tex *slot_blank(const Dev *d, const Ctx *c, UINT i) {
   const Shader *stages[5] = {c->ps, c->vs, c->gs, c->hs, c->ds};
   for (UINT k = 0; k < 5; ++k) {
     const UINT kind = stages[k] ? stages[k]->tex_kind[i] : 0xFF;
-    if (kind >= 1 && kind <= 3 && d->blank_kind[kind]) return d->blank_kind[kind];
+    if (kind >= 1 && kind <= 5 && d->blank_kind[kind]) return d->blank_kind[kind];
   }
   return d->blank;
 }
@@ -383,13 +383,64 @@ static void texture_uav_descriptor(Dev *d, const View *v, D3D12_CPU_DESCRIPTOR_H
   ID3D12Device_CreateUnorderedAccessView(d->d12, t->res, NULL, &x, at);
 }
 
+/* The Direct3D 12 view of a shader resource view of a texture (not a planar or packed YUV one): the dimension the program's names, its levels and layers within those Direct3D 12 below
+ * keeps (Tex.kmips: a device without levels of layered images keeps level 0 of them), a one-dimensional view as a two-dimensional one. FALSE when the view shows nothing kept. */
+static BOOL srv_desc12(const View *v, D3D12_SHADER_RESOURCE_VIEW_DESC *r) {
+  const Tex *t = v->tex;
+  UINT first_level = 0, levels = 0, first = 0, count = 0;
+  if (!srv_range(t, &v->desc.srv, &first_level, &levels, &first, &count)) return FALSE;
+  if (first_level >= t->kmips) return FALSE;
+  if (levels > t->kmips - first_level) levels = t->kmips - first_level;
+  memset(r, 0, sizeof *r);
+  r->Format = t->stored;
+  r->Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+  switch (v->desc.srv.ViewDimension) {
+    case D3D11_SRV_DIMENSION_TEXTURE1D: case D3D11_SRV_DIMENSION_TEXTURE2D:
+      if (t->kind == 0) {
+        r->ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        r->Texture2D.MostDetailedMip = first_level, r->Texture2D.MipLevels = levels;
+        return TRUE;
+      }
+      /* (a slice of an array as a 2D texture: Direct3D 12's 2D array view of one slice, which a shader that declares a 2D texture reads) */
+      r->ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
+      r->Texture2DArray.MostDetailedMip = first_level, r->Texture2DArray.MipLevels = levels, r->Texture2DArray.FirstArraySlice = first, r->Texture2DArray.ArraySize = 1;
+      return TRUE;
+    case D3D11_SRV_DIMENSION_TEXTURE1DARRAY: case D3D11_SRV_DIMENSION_TEXTURE2DARRAY:
+      r->ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
+      r->Texture2DArray.MostDetailedMip = first_level, r->Texture2DArray.MipLevels = levels, r->Texture2DArray.FirstArraySlice = first, r->Texture2DArray.ArraySize = count;
+      return TRUE;
+    case D3D11_SRV_DIMENSION_TEXTURE2DMS: r->ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DMS; return TRUE;
+    case D3D11_SRV_DIMENSION_TEXTURE2DMSARRAY:
+      r->ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DMSARRAY;
+      r->Texture2DMSArray.FirstArraySlice = first, r->Texture2DMSArray.ArraySize = count;
+      return TRUE;
+    case D3D11_SRV_DIMENSION_TEXTURE3D:
+      r->ViewDimension = D3D12_SRV_DIMENSION_TEXTURE3D;
+      r->Texture3D.MostDetailedMip = first_level, r->Texture3D.MipLevels = levels;
+      return TRUE;
+    case D3D11_SRV_DIMENSION_TEXTURECUBE:
+      r->ViewDimension = D3D12_SRV_DIMENSION_TEXTURECUBE;
+      r->TextureCube.MostDetailedMip = first_level, r->TextureCube.MipLevels = levels;
+      if (first == 0) return TRUE;
+      /* (the first cube of a cube array is the cube view; another is a cube array view of one) */
+      r->ViewDimension = D3D12_SRV_DIMENSION_TEXTURECUBEARRAY;
+      r->TextureCubeArray.MostDetailedMip = first_level, r->TextureCubeArray.MipLevels = levels, r->TextureCubeArray.First2DArrayFace = first, r->TextureCubeArray.NumCubes = 1;
+      return TRUE;
+    case D3D11_SRV_DIMENSION_TEXTURECUBEARRAY:
+      r->ViewDimension = D3D12_SRV_DIMENSION_TEXTURECUBEARRAY;
+      r->TextureCubeArray.MostDetailedMip = first_level, r->TextureCubeArray.MipLevels = levels, r->TextureCubeArray.First2DArrayFace = first, r->TextureCubeArray.NumCubes = count / 6;
+      return TRUE;
+    default: return FALSE;
+  }
+}
+
 /* The tables of a draw or a dispatch: shader resources t0 .. t7 (`kinds`: what the shaders declare there, for what fills an empty slot), samplers s0 .. s7, and the
  * unordered access views u0 .. u7 the shaders declare (`uav_mask`). The handles go into Dev.table_*. `cache`: a table the same as the last one is used again. */
 static BOOL tables_record(Dev *d, View *const *srvs, Sampler *const *samplers, const BYTE *kinds, View *const *uavs, UINT uav_mask, BOOL cache) {
   UINT view_ids[TEXTURE_SLOTS], sampler_ids[TEXTURE_SLOTS], uav_ids[UAV_SLOTS];
   FLOAT min_lods[TEXTURE_SLOTS];
   for (UINT i = 0; i < TEXTURE_SLOTS; ++i) {
-    view_ids[i] = srvs[i] ? srvs[i]->c.id : kinds[i] == KIND_BUFFER ? d->blank_buffer->c.id : (kinds[i] >= 1 && kinds[i] <= 3 && d->blank_kind[kinds[i]] ? d->blank_kind[kinds[i]] : d->blank)->c.id;
+    view_ids[i] = srvs[i] ? srvs[i]->c.id : kinds[i] == KIND_BUFFER ? d->blank_buffer->c.id : (kinds[i] >= 1 && kinds[i] <= 5 && d->blank_kind[kinds[i]] ? d->blank_kind[kinds[i]] : d->blank)->c.id;
     sampler_ids[i] = samplers[i] ? samplers[i]->s.c.id : 0;
     min_lods[i] = srvs[i] && srvs[i]->tex ? srvs[i]->tex->min_lod : 0.0f;      /* (the clamp goes into the sampler) */
   }
@@ -449,8 +500,13 @@ static BOOL tables_record(Dev *d, View *const *srvs, Sampler *const *samplers, c
           r.Texture2D.MipLevels = array ? v->desc.srv.Texture2DArray.MipLevels : v->desc.srv.Texture2D.MipLevels;
         }
         ID3D12Device_CreateShaderResourceView(d->d12, v->tex->res, &r, at);
+      } else if (v) {
+        /* (the view's levels and layers, of the dimension it names: Direct3D 12 below gives the shader what the view shows - levels it does not keep are not there, Tex.kmips) */
+        D3D12_SHADER_RESOURCE_VIEW_DESC r;
+        if (srv_desc12(v, &r)) ID3D12Device_CreateShaderResourceView(d->d12, v->tex->res, &r, at);
+        else ID3D12Device_CreateShaderResourceView(d->d12, v->tex->res, NULL, at);
       } else {
-        Tex *t = v ? v->tex : kinds[i] >= 1 && kinds[i] <= 3 && d->blank_kind[kinds[i]] ? d->blank_kind[kinds[i]] : d->blank;
+        Tex *t = kinds[i] >= 1 && kinds[i] <= 5 && d->blank_kind[kinds[i]] ? d->blank_kind[kinds[i]] : d->blank;
         ID3D12Device_CreateShaderResourceView(d->d12, t->res, NULL, at);
       }
       at.ptr += step_views;
@@ -1488,10 +1544,16 @@ static void tex_copy_slow(Dev *d, Tex *to, UINT to_sub, UINT x, UINT y, Tex *fro
   mem_free(pixels);
 }
 static BOOL tex_simple(const Tex *t) { return t->desc.MipLevels == 1 && t->desc.ArraySize == 1 && t->kind == 0 && !t->depth; }
+/* Whether Direct3D 12 below copies between the two itself: plain 2D textures of one level and format, or - on a device that keeps every level (dev_all_levels) - textures of the same kind
+ * of dimension whose texels (or blocks) are as many bytes, not depth buffers or shadowed targets (whose views hold what they drew: tex_sync first). */
+static BOOL tex_copies12(Dev *d, const Tex *to, const Tex *from) {
+  if (tex_simple(to) && tex_simple(from) && to->stored == from->stored) return TRUE;
+  return dev_all_levels(d) && !to->depth && !from->depth && !to->shadowed && !from->shadowed && to->stored_bpp == from->stored_bpp && to->block == from->block &&
+         (to->kind == 1) == (from->kind == 1) && !to->planar && !from->planar;
+}
 
 static void STDMETHODCALLTYPE ctx_CopySubresourceRegion(Ctx *c, ID3D11Resource *to, UINT to_sub, UINT x, UINT y, UINT z, ID3D11Resource *from, UINT from_sub, const D3D11_BOX *box) {
   if (c->deferred) { deferred_record(c, &(RecArgs){.op = REC_COPY_REGION, .obj = {to, from}, .u = {to_sub, x, y, z, from_sub}, .box = box}); return; }
-  (void)z;
   Dev *d = c->dev;
   Buf *bt = buf_of_resource(to), *bf = buf_of_resource(from);
   Tex *tt = tex_of_resource(to), *tf = tex_of_resource(from);
@@ -1507,7 +1569,8 @@ static void STDMETHODCALLTYPE ctx_CopySubresourceRegion(Ctx *c, ID3D11Resource *
     tex_sync(d, tf);
     tex_sync(d, tt);
     ++tt->version;
-    if (tex_simple(tt) && tex_simple(tf) && tt->stored == tf->stored && tt != tf) {
+    UINT to12 = 0, from12 = 0;
+    if (tex_copies12(d, tt, tf) && (tt != tf || to_sub != from_sub) && tex_d12_sub(tt, to_sub, &to12) && tex_d12_sub(tf, from_sub, &from12)) {
       tex_before_write(d, tt);
       tex_before_read(d, tf);
       D3D12_TEXTURE_COPY_LOCATION dst, src;
@@ -1515,11 +1578,14 @@ static void STDMETHODCALLTYPE ctx_CopySubresourceRegion(Ctx *c, ID3D11Resource *
       memset(&src, 0, sizeof src);
       dst.pResource = tt->res;
       dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+      dst.SubresourceIndex = to12;
       src.pResource = tf->res;
       src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+      src.SubresourceIndex = from12;
+      /* (a box of a level of a layer; of a volume's level its slices from front, into the slice z on) */
       D3D12_BOX region;
-      if (box) { region.left = box->left; region.top = box->top; region.front = 0; region.right = box->right; region.bottom = box->bottom; region.back = 1; }
-      ID3D12GraphicsCommandList_CopyTextureRegion(d->list, &dst, x, y, 0, &src, box ? &region : NULL);
+      if (box) { region.left = box->left; region.top = box->top; region.front = tf->kind == 1 ? box->front : 0; region.right = box->right; region.bottom = box->bottom; region.back = tf->kind == 1 ? box->back : 1; }
+      ID3D12GraphicsCommandList_CopyTextureRegion(d->list, &dst, x, y, tt->kind == 1 ? z : 0, &src, box ? &region : NULL);
       tt->used = tf->used = tt->written = d->epoch;
       d->recorded = 1;
     } else tex_copy_slow(d, tt, to_sub, x, y, tf, from_sub, box);
@@ -1550,7 +1616,8 @@ static void STDMETHODCALLTYPE ctx_CopyResource(Ctx *c, ID3D11Resource *to, ID3D1
     tex_sync(d, tf);
     tex_sync(d, tt);
     ++tt->version;
-    if (tex_simple(tt) && tex_simple(tf) && tt->stored == tf->stored) {
+    if (tex_copies12(d, tt, tf) && tt->kind == tf->kind && tt->kmips == tf->kmips && tt->desc.ArraySize == tf->desc.ArraySize && tt->slices == tf->slices) {
+      /* (every level of every layer: Direct3D 12 below copies them all) */
       tex_before_write(d, tt);
       tex_before_read(d, tf);
       ID3D12GraphicsCommandList_CopyResource(d->list, tt->res, tf->res);

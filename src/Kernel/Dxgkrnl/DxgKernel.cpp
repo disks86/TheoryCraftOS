@@ -1213,8 +1213,8 @@ NtStatus Kernel::write_descriptor(ProcessId pid, Handle heap, uint32_t index, co
       // (a level of the image and layers it has; the image a storage image)
       const graphics::StorageImageView& v = desc.image;
       graphics::Format view = graphics::Format::Undefined;
-      if (!alloc.is_image() || !(alloc.desc().flags & kAllocStorageImage) || v.level >= alloc.mip_levels() || v.layer_count == 0 || v.first_layer >= alloc.layers() ||
-          v.layer_count > alloc.layers() - v.first_layer || desc.view_format > static_cast<uint32_t>(Format::R32Float) ||
+      if (!alloc.is_image() || !(alloc.desc().flags & kAllocStorageImage) || v.level >= alloc.mip_levels() || v.layer_count == 0 || v.first_layer >= alloc.level_layers(v.level) ||
+          v.layer_count > alloc.level_layers(v.level) - v.first_layer || desc.view_format > static_cast<uint32_t>(Format::R32Float) ||
           !storage_view_format(alloc.desc().format, static_cast<Format>(desc.view_format), &view))
         return status::kInvalidParameter;
       d.allocation = a->allocation;
@@ -1232,6 +1232,18 @@ NtStatus Kernel::write_descriptor(ProcessId pid, Handle heap, uint32_t index, co
       if (desc.offset > alloc.desc().size || desc.offset % 4 || desc.size > alloc.desc().size - desc.offset || desc.size % 4) return status::kInvalidParameter;
       d.offset = desc.offset;
       d.size = desc.size ? desc.size : alloc.desc().size - desc.offset;
+    } else {
+      // (a texture's view: its levels and layers from the offset words, each a level or layer the image has; a volume's all its slices)
+      graphics::TextureView v;
+      v.base_level = static_cast<uint32_t>(desc.offset & 0xFFFF), v.level_count = static_cast<uint32_t>(desc.offset >> 16 & 0xFFFF);
+      v.first_layer = static_cast<uint32_t>(desc.offset >> 32 & 0xFFFF), v.layer_count = static_cast<uint32_t>(desc.offset >> 48);
+      if (v.level_count == 0 && v.base_level < alloc.mip_levels()) v.level_count = alloc.mip_levels() - v.base_level;
+      if (v.layer_count == 0 && v.first_layer < alloc.layers()) v.layer_count = alloc.layers() - v.first_layer;
+      if (v.base_level >= alloc.mip_levels() || v.level_count > alloc.mip_levels() - v.base_level || v.first_layer >= alloc.layers() || v.layer_count > alloc.layers() - v.first_layer ||
+          (alloc.texture_kind() == graphics::TextureKind::Texture3D && v.layer_count != alloc.layers()))
+        return status::kInvalidParameter;
+      v.kind = alloc.texture_kind();
+      d.view = v;
     }
     d.allocation = a->allocation;
     if (desc.alternate) {
@@ -1279,7 +1291,7 @@ NtStatus Kernel::update_tile_mappings(ProcessId pid, Handle reserved, uint32_t f
   return r->allocation->manager().map_tiles(*r->allocation, first_tile, heap_allocation, heap_offset, tile_count);
 }
 
-NtStatus Kernel::set_mirror(ProcessId pid, Handle mirror, uint32_t mode, uint32_t channels, ArrayView<const Handle> sources) {
+NtStatus Kernel::set_mirror(ProcessId pid, Handle mirror, uint32_t mode, uint32_t channels, ArrayView<const Handle> sources, ArrayView<const uint32_t> subresources) {
   kernel::ScopedMutex g(lock_);
   Process* p = find_process(pid);
   SharedPointer<AllocRec> m = p ? p->allocations.get(mirror) : SharedPointer<AllocRec>();
@@ -1291,7 +1303,7 @@ NtStatus Kernel::set_mirror(ProcessId pid, Handle mirror, uint32_t mode, uint32_
     if (!s || s->device != m->device) return status::kInvalidHandle;
     if (!found.push_back(s->allocation)) return status::kNoMemory;
   }
-  return m->allocation->manager().set_mirror(*m->allocation, ArrayView<const SharedPointer<Allocation>>(found.view().data(), found.count()), mode, channels);
+  return m->allocation->manager().set_mirror(*m->allocation, ArrayView<const SharedPointer<Allocation>>(found.view().data(), found.count()), mode, channels, subresources);
 }
 
 // --- Video decoders -----------------------------------------------------------------------------------------------------------------------------------------------------
@@ -1455,10 +1467,16 @@ NtStatus Kernel::escape_d3d12(ProcessId pid, Handle device, uint32_t op, ByteRea
       const uint32_t mode = in.le32(), channels = in.le32(), count = in.le32();
       if (!in.ok() || count > graphics::kMaxTextureLayers) return status::kInvalidParameter;
       List<Handle> sources(allocator_);
+      List<uint32_t> subresources(allocator_);
       for (uint32_t i = 0; i < count; ++i)
         if (!sources.push_back(in.le32())) return status::kNoMemory;
+      // (optionally the subresource of each source)
+      if (in.ok() && !in.at_end())
+        for (uint32_t i = 0; i < count; ++i)
+          if (!subresources.push_back(in.le32())) return status::kNoMemory;
       if (!in.ok() || !in.at_end()) return status::kInvalidParameter;
-      return set_mirror(pid, mirror, mode, channels, ArrayView<const Handle>(sources.view().data(), sources.count()));
+      return set_mirror(pid, mirror, mode, channels, ArrayView<const Handle>(sources.view().data(), sources.count()),
+                        ArrayView<const uint32_t>(subresources.view().data(), subresources.count()));
     }
     case EscapeOp::QueryStreamOutput: {
       const Handle allocation = in.le32();

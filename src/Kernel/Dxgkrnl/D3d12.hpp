@@ -121,6 +121,9 @@ struct DescriptorDesc {
   Handle alternate = 0;            // a texture's view: the image a shader that declares a 2D array reads instead of `allocation`, a 2D image (0: none)
   graphics::StorageImageView image;   // UavTexture: the level and the layers (an array's layers, a volume's slices)
   uint32_t view_format = 0;           // ... and the format of the view (a dxgk::Format; 0: the allocation's own - another for a wide one: storage_view_format)
+  // A texture's view (Srv of an image; graphics::kFeature2MipmappedLayers): its levels and layers (counts of 0: to the last), the kind the shader declares. The escape carries it in the
+  // offset words: the first level in bits 0-15, the count of levels 16-31, the first layer 32-47, the count of layers 48-63.
+  graphics::TextureView view;
 };
 
 struct Descriptor {
@@ -130,6 +133,7 @@ struct Descriptor {
   graphics::SamplerDesc sampler;
   graphics::StorageImageView image;   // UavTexture (its format the device's)
   uint32_t view_format = 0;           // ... the view's dxgk::Format (0: the allocation's)
+  graphics::TextureView view;         // Srv of an image: its levels and layers (counts of 0: to the last)
   // A view that is both a 2D image and an array of them (Direct3D's Texture2DArray view of one plane of a planar texture's slices: the slice's own image, and a mirror of the
   // slices, VidMm::set_mirror): the array, read by shaders that declare one.
   SharedPointer<Allocation> alternate;

@@ -244,29 +244,38 @@ class VirglImage final : public IImage {
     const bool sampled = (desc.usage & kImageSampled) != 0;
     uint32_t bind = depth ? virgl::kBindDepthStencil : is_compressed_format(desc.format) ? virgl::kBindSamplerView : (virgl::kBindRenderTarget | virgl::kBindSamplerView);
     if (desc.usage & kImagePresent) bind |= virgl::kBindScanout;
-    // A volume has its slices as the depth; an array or a cube its layers as the array size (a cube: six).
+    // A volume has its slices as the depth; an array, a cube or a cube array its layers as the array size (a cube: six). A cube that is a storage image is an array on the host -
+    // the image units take a 2D array of its faces, which a texture of the cube target is not - and is sampled as a cube through a view of that target.
     const uint32_t layers = layer_count();
-    const uint32_t target = desc.kind == TextureKind::Texture3D ? virgl::kTargetTexture3d : desc.kind == TextureKind::TextureCube ? virgl::kTargetTextureCube
+    const bool cube = desc.kind == TextureKind::TextureCube || desc.kind == TextureKind::TextureCubeArray;
+    const uint32_t target = desc.kind == TextureKind::Texture3D ? virgl::kTargetTexture3d
+                            : cube && (desc.usage & kImageStorage) ? virgl::kTargetTexture2dArray
+                            : desc.kind == TextureKind::TextureCube ? virgl::kTargetTextureCube
+                            : desc.kind == TextureKind::TextureCubeArray ? virgl::kTargetTextureCubeArray
                             : desc.kind == TextureKind::Texture2DArray ? virgl::kTargetTexture2dArray : virgl::kTargetTexture2d;
+    resource_target_ = target;
     ResourceCreate3d create{header(kCmdResourceCreate3d), id_, target,
                             depth ? depth_format : color_format_, bind,
                             desc.extent.width, desc.extent.height, desc.kind == TextureKind::Texture3D ? layers : 1u, desc.kind == TextureKind::Texture3D || desc.kind == TextureKind::Texture2D ? 1u : layers, desc.mip_levels - 1 /* last level */, desc.samples > 1 ? desc.samples : 0u,
                             sampled || desc.kind != TextureKind::Texture2D ? 0u : kResourceFlagY0Top, 0};   // (the host takes the flag on 2D images alone: a layered depth buffer is kept the GL way)
     CtxResource ctx{header(kCmdCtxAttachResource), id_, 0};
     ok_ = gpu.command(as_bytes(create)) && gpu.command(as_bytes(ctx));
-    accounted_ = uint64_t{desc.extent.width} * desc.extent.height * layer_count() * desc.samples * (depth ? 4u : bytes_per_pixel(desc.format));
+    accounted_ = 0;   // (every level of every layer)
+    for (uint32_t level = 0; level < desc.mip_levels; ++level)
+      accounted_ += uint64_t{mip_extent(desc.extent.width, level)} * mip_extent(desc.extent.height, level) * level_layers(level) * desc.samples * (depth ? 4u : bytes_per_pixel(desc.format));
     gpu.add_resource_bytes(accounted_);
     // The surface (a render-target view of the resource) is what the framebuffer state refers to.
     if (ok_ && (desc.usage & (kImageColorAttachment | kImageDepthAttachment))) {
-      surface_ = surface(0, 1);
+      surface_ = surface(0, 0, 1);
       ok_ = surface_ != 0;
     }
     // The sampler view is what a texture unit is bound to: the whole resource, all of its levels, components in order.
     if (ok_ && sampled) {
       view_ = device.new_handle();
-      // (the layers the view shows: all of an array's or a cube's; a volume's slices are not layers)
-      const uint32_t last_layer = desc.kind == TextureKind::Texture2DArray || desc.kind == TextureKind::TextureCube ? layers - 1 : 0;
-      const uint32_t cmd[] = {virgl::header(virgl::kCreateObject, virgl::kObjectSamplerView, 6), view_, id_, color_format_, last_layer << 16, (desc.mip_levels - 1) << 8 /* first level | last level << 8 */, virgl::kSwizzleRgba};
+      // (the layers the view shows: all of an array's or a cube's; a volume's slices are not layers. A storage cube's view is of the cube target, its resource an array)
+      const uint32_t last_layer = desc.kind == TextureKind::Texture2DArray || cube ? layers - 1 : 0;
+      const uint32_t view_target = cube && (desc.usage & kImageStorage) ? (desc.kind == TextureKind::TextureCube ? virgl::kTargetTextureCube : virgl::kTargetTextureCubeArray) : 0;
+      const uint32_t cmd[] = {virgl::header(virgl::kCreateObject, virgl::kObjectSamplerView, 6), view_, id_, color_format_ | view_target << 24, last_layer << 16, (desc.mip_levels - 1) << 8 /* first level | last level << 8 */, virgl::kSwizzleRgba};
       ok_ = device.send_commands(cmd, 7);
     }
   }
@@ -275,6 +284,8 @@ class VirglImage final : public IImage {
     if (view_) device_.destroy_object(view_);
     for (const LayerSurface& s : surfaces_)
       if (s.handle) device_.destroy_object(s.handle);
+    for (const View& v : views_)
+      if (v.handle) device_.destroy_object(v.handle);
     if (id_) {
       CtxResource detach{header(kCmdCtxDetachResource), id_, 0};
       ResourceUnref unref{header(kCmdResourceUnref), id_, 0};
@@ -287,19 +298,55 @@ class VirglImage final : public IImage {
   bool valid() const { return ok_; }
   uint32_t id() const { return id_; }
   uint32_t surface() const { return surface_; }
-  // The host's surface of layers first .. first + count - 1 (a layered one draws into the layer gl_Layer names, from the first), made on first use; 0 if the host refuses it.
-  uint32_t surface(uint32_t first, uint32_t count) {
+  // The host's surface of layers first .. first + count - 1 of level `level` (a layered one draws into the layer gl_Layer names, from the first), made on first use (the oldest of a full
+  // cache is let go of first; never one the pass being recorded uses); 0 if the host refuses it.
+  uint32_t surface(uint32_t level, uint32_t first, uint32_t count) {
     for (const LayerSurface& s : surfaces_)
-      if (s.handle && s.first == first && s.count == count) return s.handle;
+      if (s.handle && s.level == level && s.first == first && s.count == count) return s.handle;
+    if (count == 0 || level >= desc_.mip_levels || first >= level_layers(level) || count > level_layers(level) - first) return 0;
     LayerSurface* free = nullptr;
     for (LayerSurface& s : surfaces_)
       if (!s.handle) { free = &s; break; }
-    if (!free || count == 0 || first + count > layer_count()) return 0;
+    if (!free) return 0;
     const uint32_t handle = device_.new_handle();
     const uint32_t fmt = desc_.format == Format::D32Float ? (desc_.stencil ? virgl::kFormatZ32FloatS8X24Uint : virgl::kFormatZ32Float) : color_format_;
-    const uint32_t cmd[] = {virgl::header(virgl::kCreateObject, virgl::kObjectSurface, 5), handle, id_, fmt, 0 /* level */, first | ((first + count - 1) << 16)};
+    const uint32_t cmd[] = {virgl::header(virgl::kCreateObject, virgl::kObjectSurface, 5), handle, id_, fmt, level, first | ((first + count - 1) << 16)};
     if (!device_.send_commands(cmd, 6)) return 0;
-    *free = LayerSurface{first, count, handle};
+    *free = LayerSurface{level, first, count, handle};
+    return handle;
+  }
+  // The layers of level `level` (a volume's slices there).
+  uint32_t level_layers(uint32_t level) const { return level_layer_count(desc_.kind, desc_.layers, level); }
+  TextureKind kind() const { return desc_.kind; }
+  // The host's sampler view of a TextureView (kFeature2MipmappedLayers: texture_view_fits, the counts made whole), made on first use: levels base .. base + count - 1, layers (a
+  // volume: all its slices, as the host counts them none) first .. first + count - 1, of the view's target - a texture view of the resource on the host when it is another than
+  // the resource's, or a part of it. 0 if it cannot be made.
+  uint32_t view(const TextureView& requested) {
+    TextureView v = requested;
+    if (v.level_count == 0 && v.base_level < desc_.mip_levels) v.level_count = desc_.mip_levels - v.base_level;
+    if (v.layer_count == 0 && v.first_layer < layer_count()) v.layer_count = layer_count() - v.first_layer;
+    if (!view_ || !texture_view_fits(desc_.kind, layer_count(), desc_.mip_levels, v)) return 0;
+    if (v.kind == desc_.kind && v.base_level == 0 && v.level_count == desc_.mip_levels && v.first_layer == 0 && v.layer_count == layer_count()) return view_;   // (the whole of it)
+    for (const View& c : views_)
+      if (c.handle && c.v.kind == v.kind && c.v.base_level == v.base_level && c.v.level_count == v.level_count && c.v.first_layer == v.first_layer && c.v.layer_count == v.layer_count)
+        return c.handle;
+    View* free = nullptr;
+    for (View& c : views_)
+      if (!c.handle) { free = &c; break; }
+    if (!free) {   // (a full cache: the first goes; the commands recorded so far that name it ran when the view was made again - the host keeps an object a binding uses)
+      free = &views_[next_evicted_view_++ % kViews];
+      device_.destroy_object(free->handle);
+      free->handle = 0;
+    }
+    const uint32_t target = v.kind == TextureKind::Texture3D ? virgl::kTargetTexture3d : v.kind == TextureKind::TextureCube ? virgl::kTargetTextureCube
+                            : v.kind == TextureKind::TextureCubeArray ? virgl::kTargetTextureCubeArray : v.kind == TextureKind::Texture2DArray ? virgl::kTargetTexture2dArray
+                                                                                                          : virgl::kTargetTexture2d;
+    const uint32_t first_layer = v.kind == TextureKind::Texture3D ? 0 : v.first_layer, last_layer = v.kind == TextureKind::Texture3D ? 0 : v.first_layer + v.layer_count - 1;
+    const uint32_t handle = device_.new_handle();
+    const uint32_t cmd[] = {virgl::header(virgl::kCreateObject, virgl::kObjectSamplerView, 6), handle, id_, color_format_ | target << 24, first_layer | last_layer << 16,
+                            v.base_level | (v.base_level + v.level_count - 1) << 8, virgl::kSwizzleRgba};
+    if (!device_.send_commands(cmd, 7)) return 0;
+    *free = View{v, handle};
     return handle;
   }
   // The format a storage image is bound with (and what its shaders' IMGFMT<n> is): the image's own, or the view's of the same pixel size.
@@ -331,8 +378,64 @@ class VirglImage final : public IImage {
   uint32_t blit_format() const { return desc_.format == Format::D32Float ? (desc_.stencil ? virgl::kFormatZ32FloatS8X24Uint : virgl::kFormatZ32Float) : color_format_; }   // (what a blit calls the image's format)
   uint32_t color_format() const { return color_format_; }
   bool stencil() const { return desc_.stencil; }
-  uint32_t layer_count() const override { return desc_.kind == TextureKind::Texture2D ? 1 : desc_.kind == TextureKind::TextureCube ? 6 : desc_.layers; }
+  uint32_t layer_count() const override { return image_layer_count(desc_.kind, desc_.layers); }
   uint32_t mip_levels() const override { return desc_.mip_levels; }
+  // Layer `layer` of level `level` of any image of one sample (a volume's slice there), staged at the start of the backing (which has room for level 0 of a layer, the largest): the
+  // transfer's box is the level's size at depth `layer`, its stride a row of the level. Level 0 of a 2D image goes the way write_pixels takes it (an image only drawn into and shown
+  // is kept top row first).
+  bool write_subresource(uint32_t level, uint32_t layer, ArrayView<const uint32_t> pixels) override {
+    if (level == 0 && layer == 0 && layer_count() == 1) return write_pixels(pixels);
+    const uint32_t width = mip_extent(desc_.extent.width, level), height = mip_extent(desc_.extent.height, level);
+    const uint64_t count = uint64_t{width} * height;
+    if (desc_.samples != 1 || desc_.format == Format::D32Float || is_wide_format(desc_.format) || is_compressed_format(desc_.format) || level >= desc_.mip_levels ||
+        layer >= level_layers(level) || pixels.size() != count || !ensure_backing(uint64_t{desc_.extent.width} * desc_.extent.height))
+      return false;
+    const ArrayView<uint32_t> staged = backing_.cast<uint32_t>();
+    for (uint64_t i = 0; i < count; ++i) staged[i] = pixels[i];
+    swap_words(staged.first(count));
+    TransferHost3d transfer{header(kCmdTransferToHost3d), {0, 0, layer, width, height, 1}, 0, id_, level, width * 4, 0};
+    return device_.gpu().command(as_bytes(transfer), /*fence=*/false);
+  }
+  bool read_subresource(uint32_t level, uint32_t layer, ArrayView<uint32_t> out) override {
+    if (level == 0 && layer == 0 && layer_count() == 1) return read_pixels(out);
+    const uint32_t width = mip_extent(desc_.extent.width, level), height = mip_extent(desc_.extent.height, level);
+    const uint64_t count = uint64_t{width} * height;
+    if (desc_.samples != 1 || desc_.format == Format::D32Float || is_wide_format(desc_.format) || is_compressed_format(desc_.format) || level >= desc_.mip_levels ||
+        layer >= level_layers(level) || out.size() < count || !ensure_backing(uint64_t{desc_.extent.width} * desc_.extent.height))
+      return false;
+    TransferHost3d transfer{header(kCmdTransferFromHost3d), {0, 0, layer, width, height, 1}, 0, id_, level, width * 4, 0};
+    if (!device_.gpu().command(as_bytes(transfer))) return false;
+    const ArrayView<uint32_t> pixels = backing_.cast<uint32_t>();
+    for (uint64_t i = 0; i < count; ++i) out[i] = pixels[i];
+    swap_words(out.first(count));
+    return true;
+  }
+  bool write_subresource_float(uint32_t level, uint32_t layer, ArrayView<const Vec4> pixels) override {
+    if (level == 0 && layer == 0 && layer_count() == 1) return write_pixels_float(pixels);
+    const uint32_t width = mip_extent(desc_.extent.width, level), height = mip_extent(desc_.extent.height, level);
+    const uint64_t count = uint64_t{width} * height;
+    if (!is_wide_format(desc_.format) || desc_.samples != 1 || level >= desc_.mip_levels || layer >= level_layers(level) || pixels.size() != count ||
+        !ensure_backing(uint64_t{desc_.extent.width} * desc_.extent.height))
+      return false;
+    ByteWriter out{backing_};
+    for (const Vec4& c : pixels) encode_wide_pixel(desc_.format, c, out);
+    if (!out.ok()) return false;
+    TransferHost3d transfer{header(kCmdTransferToHost3d), {0, 0, layer, width, height, 1}, 0, id_, level, width * bytes_per_pixel(desc_.format), 0};
+    return device_.gpu().command(as_bytes(transfer), /*fence=*/false);
+  }
+  bool read_subresource_float(uint32_t level, uint32_t layer, ArrayView<Vec4> out) override {
+    if (level == 0 && layer == 0 && layer_count() == 1) return read_pixels_float(out);
+    const uint32_t width = mip_extent(desc_.extent.width, level), height = mip_extent(desc_.extent.height, level);
+    const uint64_t count = uint64_t{width} * height;
+    if (!is_wide_format(desc_.format) || desc_.samples != 1 || level >= desc_.mip_levels || layer >= level_layers(level) || out.size() < count ||
+        !ensure_backing(uint64_t{desc_.extent.width} * desc_.extent.height))
+      return false;
+    TransferHost3d transfer{header(kCmdTransferFromHost3d), {0, 0, layer, width, height, 1}, 0, id_, level, width * bytes_per_pixel(desc_.format), 0};
+    if (!device_.gpu().command(as_bytes(transfer))) return false;
+    ByteReader in{ConstByteView(backing_)};
+    for (uint64_t i = 0; i < count; ++i) out[i] = decode_wide_pixel(desc_.format, in);
+    return in.ok();
+  }
   // A level above 0 of a mipmapped texture: staged at the start of the backing (which has room for level 0, the largest), from where the host copies it into the level.
   bool write_mip_pixels(uint32_t level, ArrayView<const uint32_t> pixels) override {
     if (level == 0) return write_pixels(pixels);
@@ -348,7 +451,7 @@ class VirglImage final : public IImage {
   // The blocks of a level of a layer (a slice, a face; 0 for a plain texture) of a block-compressed image: staged at the start of the backing (room for level 0 of a layer, as
   // 32-bit pixels, which is more than its blocks), the transfer's stride a row of blocks, its box in pixels.
   bool write_compressed(uint32_t level, uint32_t layer, ConstByteView blocks) override {
-    if (!is_compressed_format(desc_.format) || level >= desc_.mip_levels || layer >= layer_count()) return false;
+    if (!is_compressed_format(desc_.format) || level >= desc_.mip_levels || layer >= level_layers(level)) return false;
     const uint32_t width = mip_extent(desc_.extent.width, level), height = mip_extent(desc_.extent.height, level);
     if (blocks.size() != compressed_image_bytes(desc_.format, width, height) || !ensure_backing(uint64_t{desc_.extent.width} * desc_.extent.height)) return false;
     ByteView staged;
@@ -498,10 +601,18 @@ class VirglImage final : public IImage {
     for (uint32_t& w : words) w = swap_word(w);
   }
   struct LayerSurface {
-    uint32_t first = 0, count = 0, handle = 0;
+    uint32_t level = 0, first = 0, count = 0, handle = 0;
   };
-  static constexpr uint32_t kLayerSurfaces = 8;   // (the layer ranges render target views name: a few per image)
+  static constexpr uint32_t kLayerSurfaces = 16;   // (the levels and layer ranges render target views name: a few per image)
   LayerSurface surfaces_[kLayerSurfaces];
+  struct View {
+    TextureView v;
+    uint32_t handle = 0;
+  };
+  static constexpr uint32_t kViews = 16;   // (the views shader resource views name: a few per image)
+  View views_[kViews];
+  uint32_t next_evicted_view_ = 0;
+  uint32_t resource_target_ = 0;
   bool swap_rb_ = false;
   VirglDevice& device_;
   ImageDesc desc_;
@@ -1044,13 +1155,17 @@ IBuffer* VirglDevice::create_buffer(uint64_t size, uint32_t usage) {
 void VirglDevice::destroy_buffer(IBuffer* buffer) { destroy(gpu_.allocator(), static_cast<VirglBuffer*>(buffer)); }
 
 IImage* VirglDevice::create_image(const ImageDesc& desc) {
-  // (mipmaps: a plain texture of 8-bit colour that is only sampled, as the kernel's own; its levels are written one by one)
+  // (mipmaps: a plain texture of 8-bit colour that is only sampled, as the kernel's own; with kFeature2MipmappedLayers any image of one sample - arrays, volumes, cubes, cube arrays,
+  // targets, depth buffers, storage images, the wide formats -; its levels are written one by one)
   if (desc.mip_levels == 0 || desc.mip_levels > mip_level_limit(desc.extent)) return nullptr;
+  const bool all_levels = (info().features2 & kFeature2MipmappedLayers) != 0;
+  const uint32_t layers = image_layer_count(desc.kind, desc.layers);
+  const bool cube = desc.kind == TextureKind::TextureCube || desc.kind == TextureKind::TextureCubeArray;
+  if (desc.kind == TextureKind::Texture2DMS || (desc.kind == TextureKind::TextureCubeArray && (!all_levels || layers % 6 != 0))) return nullptr;
   if (is_compressed_format(desc.format)) {
-    // (block-compressed: sampled only, of any kind, plain textures with levels; filled with write_compressed)
-    const uint32_t layers = desc.kind == TextureKind::TextureCube ? 6 : desc.layers;
-    if (desc.usage != kImageSampled || desc.samples != 1 || layers == 0 || layers > kMaxTextureLayers || (desc.kind != TextureKind::Texture2D && desc.mip_levels != 1) ||
-        (desc.kind == TextureKind::Texture2D && desc.layers != 1) || (desc.kind == TextureKind::TextureCube && desc.extent.width != desc.extent.height))
+    // (block-compressed: sampled only, of any kind, plain textures with levels - and the others too with kFeature2MipmappedLayers; filled with write_compressed)
+    if (desc.usage != kImageSampled || desc.samples != 1 || layers == 0 || layers > kMaxTextureLayers || (desc.kind != TextureKind::Texture2D && desc.mip_levels != 1 && !all_levels) ||
+        (desc.kind == TextureKind::Texture2D && desc.layers != 1) || (cube && desc.extent.width != desc.extent.height))
       return nullptr;
     VirglImage* image = make<VirglImage>(gpu_.allocator(), *this, desc);
     if (image && !image->valid()) {
@@ -1059,26 +1174,27 @@ IImage* VirglDevice::create_image(const ImageDesc& desc) {
     }
     return image;
   }
-  // (a storage image: sampled too, one sample, not a cube - the host's image units take it as it is kept, row 0 first)
-  if ((desc.usage & kImageStorage) && (!(desc.usage & kImageSampled) || desc.samples != 1 || desc.kind == TextureKind::TextureCube || desc.format == Format::D32Float || is_srgb_format(desc.format) ||
+  // (a storage image: sampled too, one sample, not a cube - but with kFeature2MipmappedLayers a cube too, kept as an array of its faces; the host's image units take it as it is kept,
+  // row 0 first)
+  if ((desc.usage & kImageStorage) && (!(desc.usage & kImageSampled) || desc.samples != 1 || (cube && !all_levels) || desc.format == Format::D32Float || is_srgb_format(desc.format) ||
                                        !(info().features2 & kFeature2StorageImages)))
     return nullptr;
-  if (desc.mip_levels != 1 && ((desc.usage & ~kImageStorage) != kImageSampled || desc.kind != TextureKind::Texture2D || desc.samples != 1 || desc.layers != 1 ||
-                               (desc.format != Format::B8G8R8A8Unorm && desc.format != Format::B8G8R8A8Srgb && desc.format != Format::R8G8B8A8Unorm && desc.format != Format::R8G8B8A8Srgb)))
+  if (desc.mip_levels != 1 && !all_levels && ((desc.usage & ~kImageStorage) != kImageSampled || desc.kind != TextureKind::Texture2D || desc.samples != 1 || desc.layers != 1 ||
+                                               (desc.format != Format::B8G8R8A8Unorm && desc.format != Format::B8G8R8A8Srgb && desc.format != Format::R8G8B8A8Unorm && desc.format != Format::R8G8B8A8Srgb)))
     return nullptr;
+  if (desc.mip_levels != 1 && (desc.samples != 1 || (desc.usage & kImagePresent))) return nullptr;
   if (desc.samples != 1) {
     // (a multisampled image is an 8-bit colour image, which a shader may read with texel fetches, or a depth attachment alone: resolved)
     const bool depth = desc.format == Format::D32Float;
     if ((desc.samples != 2 && desc.samples != 4) || desc.kind != TextureKind::Texture2D || (depth ? desc.usage != kImageDepthAttachment : (desc.usage & ~kImageSampled) != kImageColorAttachment) || (!depth && desc.format != Format::B8G8R8A8Unorm && desc.format != Format::R8G8B8A8Unorm)) return nullptr;
   }
   if (desc.kind != TextureKind::Texture2D) {
-    // (a volume, array or cube: sampled - and drawn into, or a storage image, with kFeature2LayeredTargets / StorageImages -, 8-bit colour or a wide format (its layers staged as such:
-    // write_layer_pixels_float), one level; or a depth buffer of layers, an array or a cube)
-    const uint32_t layers = desc.kind == TextureKind::TextureCube ? 6 : desc.layers;
+    // (a volume, array, cube or cube array: sampled - and drawn into, or a storage image, with kFeature2LayeredTargets / StorageImages -, 8-bit colour or a wide format (its layers
+    // staged as such: write_subresource_float), one level or with kFeature2MipmappedLayers several; or a depth buffer of layers, an array, a cube or a cube array)
     const bool depth_layers = desc.format == Format::D32Float && desc.usage == kImageDepthAttachment && desc.kind != TextureKind::Texture3D;
     const bool colour = (desc.usage & kImageSampled) && !(desc.usage & ~(kImageSampled | kImageColorAttachment | kImageStorage)) &&
                         (desc.format == Format::B8G8R8A8Unorm || desc.format == Format::R8G8B8A8Unorm || is_wide_format(desc.format));
-    if ((!colour && !depth_layers) || layers == 0 || layers > kMaxTextureLayers || desc.mip_levels != 1 || (desc.kind == TextureKind::TextureCube && desc.extent.width != desc.extent.height)) return nullptr;
+    if ((!colour && !depth_layers) || layers == 0 || layers > kMaxTextureLayers || (desc.mip_levels != 1 && !all_levels) || (cube && desc.extent.width != desc.extent.height)) return nullptr;
     if ((depth_layers || (desc.usage & kImageColorAttachment)) && !(info().features2 & kFeature2LayeredTargets)) return nullptr;
   } else if (desc.layers != 1) {
     return nullptr;
@@ -1179,6 +1295,21 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
   uint64_t vertex_offsets[kMaxVertexBuffers] = {};
   const VirglImage* textures[kMaxTextureUnits] = {};
   SamplerDesc samplers[kMaxTextureUnits];
+  // The host's sampler view each unit is bound to (the image's own, or one of a view: bind_texture_view), and the levels and layers it shows (whole: all of them).
+  uint32_t texture_views[kMaxTextureUnits] = {};
+  TextureView texture_ranges[kMaxTextureUnits];
+  // The open pass's targets and the level and layers of each it draws into (kMaxColorTargets: the depth buffer): a unit may sample other levels or layers of them.
+  const VirglImage* pass_target[kMaxColorTargets + 1] = {};
+  uint32_t pass_level[kMaxColorTargets + 1] = {}, pass_first[kMaxColorTargets + 1] = {}, pass_count[kMaxColorTargets + 1] = {};
+  auto drawn_into = [&](uint32_t unit) {
+    for (uint32_t n = 0; n <= kMaxColorTargets; ++n) {
+      if (!pass_target[n] || pass_target[n] != textures[unit]) continue;
+      const TextureView& v = texture_ranges[unit];
+      if (pass_level[n] < v.base_level || pass_level[n] >= v.base_level + v.level_count) continue;
+      if (textures[unit]->kind() == TextureKind::Texture3D || (pass_first[n] < v.first_layer + v.layer_count && v.first_layer < pass_first[n] + pass_count[n])) return true;
+    }
+    return false;
+  };
   // The storage images bound (bind_storage_image), and the host's shaders bound for them (the variants of modules that have images).
   VirglImage* images[kMaxStorageImages] = {};
   StorageImageView image_views[kMaxStorageImages];
@@ -1381,7 +1512,11 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
         depth = static_cast<VirglImage*>(cmd.pass.depth);
         if (!color->surface() || color->format() == Format::D32Float) return false;
         if (depth && (depth->format() != Format::D32Float || !depth->surface())) return false;
-        const Extent2D e = color->extent();
+        // (the pass is the size of the targets' levels: all of one size)
+        if (cmd.pass.level[0] >= color->mip_levels() || (depth && cmd.pass.level[kMaxColorTargets] >= depth->mip_levels())) return false;
+        const Extent2D e = {mip_extent(color->extent().width, cmd.pass.level[0]), mip_extent(color->extent().height, cmd.pass.level[0])};
+        auto sized = [&](const VirglImage* image, uint32_t level) { return level < image->mip_levels() && mip_extent(image->extent().width, level) == e.width && mip_extent(image->extent().height, level) == e.height; };
+        if (depth && !sized(depth, cmd.pass.level[kMaxColorTargets])) return false;
         target_count = 1;
         for (uint32_t n = 0; n + 1 < kMaxColorTargets; ++n) {
           extra_colors[n] = static_cast<VirglImage*>(cmd.pass.extra_colors[n]);
@@ -1392,8 +1527,7 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
           }
           VirglImage* extra = extra_colors[n];
           // (one set of window-space conventions for the whole framebuffer)
-          if (!extra->surface() || extra->format() == Format::D32Float || extra == color || extra == depth || extra->y0_top() != color->y0_top() ||
-              extra->extent().width != e.width || extra->extent().height != e.height)
+          if (!extra->surface() || extra->format() == Format::D32Float || extra == color || extra == depth || extra->y0_top() != color->y0_top() || !sized(extra, cmd.pass.level[n + 1]))
             return false;
           for (uint32_t k = 0; k < n; ++k)
             if (extra_colors[k] == extra) return false;
@@ -1402,11 +1536,15 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
         for (uint32_t n = target_count - 1; n + 1 < kMaxColorTargets; ++n) extra_colors[n] = nullptr;
         // (the surfaces of the layers the pass draws into: a layered one takes the primitives' gl_Layer)
         uint32_t surfaces[kMaxColorTargets + 1] = {};
+        for (const VirglImage*& t : pass_target) t = nullptr;
         for (uint32_t n = 0; n <= kMaxColorTargets; ++n) {
           VirglImage* image = n == kMaxColorTargets ? depth : n == 0 ? color : n < target_count ? extra_colors[n - 1] : nullptr;
           if (!image) continue;
-          surfaces[n] = cmd.pass.first_layer[n] == 0 && cmd.pass.layer_count[n] == 1 ? image->surface() : image->surface(cmd.pass.first_layer[n], cmd.pass.layer_count[n]);
+          surfaces[n] = cmd.pass.level[n] == 0 && cmd.pass.first_layer[n] == 0 && cmd.pass.layer_count[n] == 1 ? image->surface()
+                                                                                                                 : image->surface(cmd.pass.level[n], cmd.pass.first_layer[n], cmd.pass.layer_count[n]);
           if (!surfaces[n]) return false;
+          pass_target[n] = image;
+          pass_level[n] = cmd.pass.level[n], pass_first[n] = cmd.pass.first_layer[n], pass_count[n] = cmd.pass.layer_count[n];
         }
         stream.command(virgl::kSetFramebufferState, 0, 2 + target_count);
         stream.put(target_count);
@@ -1449,6 +1587,7 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
         if (queries.open != kMaxOcclusionQueries) return false;
         unset_stream_output();
         in_pass = false;
+        for (const VirglImage*& t : pass_target) t = nullptr;
         break;
       case RecordedCommand::Type::Resolve: {
         // A blit from the multisampled image to the plain one; one kept upright (an image that is only drawn into) is turned over.
@@ -1503,7 +1642,8 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
         if (cmd.unit >= kMaxStorageImages) return false;
         VirglImage* image = static_cast<VirglImage*>(cmd.image);
         const StorageImageView& v = cmd.storage_view;
-        if (image && (!(image->usage() & kImageStorage) || v.level >= image->mip_levels() || v.layer_count == 0 || v.first_layer + v.layer_count > image->layer_count() ||
+        if (image && (!(image->usage() & kImageStorage) || v.level >= image->mip_levels() || v.layer_count == 0 || v.first_layer >= image->level_layers(v.level) ||
+                      v.layer_count > image->level_layers(v.level) - v.first_layer ||
                       !storage_view_compatible(image->format(), v.format)))
           return false;
         images[cmd.unit] = image;
@@ -1545,7 +1685,7 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
             stream.command(virgl::kSetSamplerViews, 0, 2 + unit_count);
             stream.put(virgl::kShaderCompute);
             stream.put(0);
-            for (uint32_t unit = 0; unit < unit_count; ++unit) stream.put(textures[unit] ? textures[unit]->view() : 0);
+            for (uint32_t unit = 0; unit < unit_count; ++unit) stream.put(textures[unit] ? texture_views[unit] : 0);
             stream.command(virgl::kBindSamplerStates, 0, 2 + unit_count);
             stream.put(virgl::kShaderCompute);
             stream.put(0);
@@ -1683,9 +1823,21 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
         index_type = cmd.index_type;
         break;
       case RecordedCommand::Type::BindTexture: {
-        const VirglImage* image = static_cast<const VirglImage*>(cmd.image);
+        VirglImage* image = static_cast<VirglImage*>(cmd.image);
         if (cmd.unit >= kMaxTextureUnits || !image || !image->view()) return false;   // (only an image created with kImageSampled has a view)
+        // (a view of its levels and layers and of the kind the shader declares, or the whole of it)
+        TextureView range{image->kind(), 0, image->mip_levels(), 0, image->layer_count()};
+        uint32_t handle = image->view();
+        if (cmd.has_view) {
+          range = cmd.texture_view;
+          if (range.level_count == 0 && range.base_level < image->mip_levels()) range.level_count = image->mip_levels() - range.base_level;
+          if (range.layer_count == 0 && range.first_layer < image->layer_count()) range.layer_count = image->layer_count() - range.first_layer;
+          handle = image->view(cmd.texture_view);
+          if (!handle) return false;
+        }
         textures[cmd.unit] = image;
+        texture_views[cmd.unit] = handle;
+        texture_ranges[cmd.unit] = range;
         samplers[cmd.unit] = cmd.sampler;
         textures_dirty = true;
         compute_textures_dirty = true;
@@ -1752,10 +1904,7 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
         }
         if (const uint32_t unit_count = pipeline->desc().texture_count) {
           for (uint32_t unit = 0; unit < unit_count; ++unit)
-            if (!textures[unit] || textures[unit] == color || textures[unit] == depth) return false;   // unbound, or the image being drawn into
-          for (uint32_t unit = 0; unit < unit_count; ++unit)
-            for (const VirglImage* extra : extra_colors)
-              if (textures[unit] == extra) return false;
+            if (!textures[unit] || drawn_into(unit)) return false;   // unbound, or a view of what is being drawn into (other levels and layers of it may be sampled)
           if (textures_dirty) {
             // (to the vertex and the pixel stage alike: a vertex shader may read the units too, numbered as the pipeline's)
             uint32_t states[kMaxTextureUnits];
@@ -1771,7 +1920,7 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
               stream.command(virgl::kSetSamplerViews, 0, 2 + unit_count);
               stream.put(stage);
               stream.put(0);
-              for (uint32_t unit = 0; unit < unit_count; ++unit) stream.put(textures[unit]->view());
+              for (uint32_t unit = 0; unit < unit_count; ++unit) stream.put(texture_views[unit]);
               stream.command(virgl::kBindSamplerStates, 0, 2 + unit_count);
               stream.put(stage);
               stream.put(0);

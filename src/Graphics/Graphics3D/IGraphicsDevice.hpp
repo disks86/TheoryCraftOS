@@ -111,8 +111,41 @@ enum ImageUsage : uint32_t {
 // +X, -X, +Y, -Y, +Z, -Z (`layers` is ignored). All but Texture2D have one mip level and kImageSampled, and (with kFeature2LayeredTargets) may be colour or depth attachments too,
 // a pass drawing into a run of their layers (RenderPassBegin::first_layer), or storage images (kImageStorage, not a cube); they are filled and read layer by layer (write_layer_pixels /
 // read_layer_pixels, or the _float forms for the wide formats), each layer a 2D image of `extent`.
-enum class TextureKind : uint8_t { Texture2D, Texture3D, Texture2DArray, TextureCube, Texture2DMS };   // (Texture2DMS: only what a shader declares for a unit - a multisampled colour image, whose ImageDesc::kind is Texture2D, is bound to it)
+// TextureCubeArray (kFeature2MipmappedLayers) has `layers` layers, a multiple of six: cube n is layers 6n .. 6n + 5, each in the order of a cube's faces.
+enum class TextureKind : uint8_t { Texture2D, Texture3D, Texture2DArray, TextureCube, Texture2DMS, TextureCubeArray };   // (Texture2DMS: only what a shader declares for a unit - a multisampled colour image, whose ImageDesc::kind is Texture2D, is bound to it)
 constexpr uint32_t kMaxTextureLayers = 256;
+// The layers of an image of `kind` made with `layers` (ImageDesc::layers): 1 for a 2D image, 6 for a cube, `layers` for the others.
+constexpr uint32_t image_layer_count(TextureKind kind, uint32_t layers) { return kind == TextureKind::Texture2D || kind == TextureKind::Texture2DMS ? 1 : kind == TextureKind::TextureCube ? 6 : layers; }
+// ... and of its level `level` (kFeature2MipmappedLayers): a volume's levels are half as deep each (at least one slice), an array's and a cube's levels have all the layers.
+constexpr uint32_t level_layer_count(TextureKind kind, uint32_t layers, uint32_t level) {
+  if (kind != TextureKind::Texture3D) return image_layer_count(kind, layers);
+  const uint32_t d = level >= 32 ? 0 : layers >> level;
+  return d ? d : 1;
+}
+// A view of an image a texture unit is bound with (ICommandBuffer::bind_texture_view, kFeature2MipmappedLayers): the levels base_level .. base_level + level_count - 1 seen as levels
+// 0 .. level_count - 1 (Direct3D's MostDetailedMip and MipLevels), the layers first_layer .. first_layer + layer_count - 1 (FirstArraySlice and ArraySize; a cube array's in faces,
+// 6 a cube), and the kind the shader declared: an array may be seen as a 2D image (one layer), a cube (six layers) or a cube array (a multiple of six), a cube or a cube array as
+// an array or a cube, a 2D image as an array of one. A count of 0 is "to the last".
+struct TextureView {
+  TextureKind kind = TextureKind::Texture2D;
+  uint32_t base_level = 0, level_count = 0;
+  uint32_t first_layer = 0, layer_count = 0;
+};
+// Whether an image of `kind` (made with `layers` and `levels`) may be seen as `view` (with its counts made whole: none 0, all inside the image).
+constexpr bool texture_view_fits(TextureKind kind, uint32_t layers, uint32_t levels, const TextureView& view) {
+  const uint32_t have = image_layer_count(kind, layers);
+  if (view.level_count == 0 || view.base_level >= levels || view.level_count > levels - view.base_level) return false;
+  if (view.layer_count == 0 || view.first_layer >= have || view.layer_count > have - view.first_layer) return false;
+  const bool layered_2d = kind == TextureKind::Texture2DArray || kind == TextureKind::TextureCube || kind == TextureKind::TextureCubeArray;
+  switch (view.kind) {
+    case TextureKind::Texture2D: return kind == TextureKind::Texture2D || (layered_2d && view.layer_count == 1);
+    case TextureKind::Texture2DArray: return kind == TextureKind::Texture2D || layered_2d;
+    case TextureKind::TextureCube: return layered_2d && view.layer_count == 6;
+    case TextureKind::TextureCubeArray: return layered_2d && view.layer_count % 6 == 0;
+    case TextureKind::Texture3D: return kind == TextureKind::Texture3D && view.first_layer == 0 && view.layer_count == have;
+    default: return false;
+  }
+}
 
 struct ImageDesc {
   Extent2D extent;
@@ -122,6 +155,9 @@ struct ImageDesc {
   bool stencil = false;
   // The levels of a sampled colour image (Mipmaps.hpp): level 0 is `extent`, each next is half as large each way. More than one needs kImageSampled and no other usage on
   // the Intel Gen9 device; devices that cannot refuse the image. A level is filled by write_mip_pixels, or all of them from level 0 by generate_mipmaps.
+  // With kFeature2MipmappedLayers any image of one sample may have levels: arrays, cubes, cube arrays and volumes (the levels of a volume half as deep each, level_layer_count),
+  // colour and depth attachments (a pass draws into a level: RenderPassBegin::level), storage images, the wide formats. Its levels are filled and read with write_subresource and
+  // read_subresource (or the _float forms).
   uint32_t mip_levels = 1;
   TextureKind kind = TextureKind::Texture2D;
   uint32_t layers = 1;
@@ -201,7 +237,27 @@ class IImage {
     (void)level, (void)layer, (void)blocks;
     return false;
   }
-  // Makes every level above 0 from level 0 by the 2 x 2 box filter of mip_box_downsample, each from the one before it. False when the image has one level or cannot.
+  // Level `level` of layer `layer` of any image of one sample (kFeature2MipmappedLayers; a volume's level has level_layer_count slices, each a layer here): mip_extent() of the
+  // extent, rows top to bottom, 0xAARRGGBB for the 8-bit formats; the _float forms for the wide ones. False for a level or layer the image does not have, a wrong size, a
+  // format of the other kind, or a device that cannot. Without the feature the defaults take what the forms above take (level 0 of a layer, a level of a 2D image).
+  virtual bool write_subresource(uint32_t level, uint32_t layer, ArrayView<const uint32_t> pixels) {
+    if (level == 0) return layer_count() > 1 || layer != 0 ? write_layer_pixels(layer, pixels) : write_pixels(pixels);
+    return layer == 0 && layer_count() == 1 && write_mip_pixels(level, pixels);
+  }
+  virtual bool read_subresource(uint32_t level, uint32_t layer, ArrayView<uint32_t> out) {
+    if (level == 0) return layer_count() > 1 || layer != 0 ? read_layer_pixels(layer, out) : read_pixels(out);
+    return layer == 0 && layer_count() == 1 && read_mip_pixels(level, out);
+  }
+  virtual bool write_subresource_float(uint32_t level, uint32_t layer, ArrayView<const Vec4> pixels) {
+    if (level != 0) return false;
+    return layer_count() > 1 || layer != 0 ? write_layer_pixels_float(layer, pixels) : write_pixels_float(pixels);
+  }
+  virtual bool read_subresource_float(uint32_t level, uint32_t layer, ArrayView<Vec4> out) {
+    if (level != 0) return false;
+    return layer_count() > 1 || layer != 0 ? read_layer_pixels_float(layer, out) : read_pixels_float(out);
+  }
+  // Makes every level above 0 from level 0 by the 2 x 2 box filter of mip_box_downsample, each from the one before it (with kFeature2MipmappedLayers: every layer of an array or a
+  // cube its own chain, a volume's levels by the 2 x 2 x 2 box of its slices). False when the image has one level or cannot.
   virtual bool generate_mipmaps() { return false; }
 
  protected:
@@ -261,6 +317,18 @@ class ITextureSet {
   virtual Vec4 sample_lod_volume(uint32_t unit, float u, float v, float w, float lod) const {
     (void)lod;
     return sample_volume(unit, u, v, w);
+  }
+  // (with kFeature2MipmappedLayers these take the levels of a layered image too: the lod picks and blends them as for a 2D image, a Load reads level `level`'s layer or slice z, and
+  // GetDimensions gives the level's size - a volume's depth at that level - and the view's level count)
+  // A cube array (TextureCubeArray, kFeature2MipmappedLayers): (x, y, z) a direction as for a cube, `cube` which cube of the array (rounded to the nearest, clamped); the level of
+  // detail as sample_volume takes it, or `lod`. size_volume gives the number of cubes as the depth.
+  virtual Vec4 sample_cube_array(uint32_t unit, float x, float y, float z, float cube) const {
+    (void)cube;
+    return sample_volume(unit, x, y, z);
+  }
+  virtual Vec4 sample_lod_cube_array(uint32_t unit, float x, float y, float z, float cube, float lod) const {
+    (void)cube;
+    return sample_lod_volume(unit, x, y, z, lod);
   }
   virtual Vec4 fetch_volume(uint32_t unit, int32_t x, int32_t y, int32_t z, uint32_t level) const {
     return z == 0 ? fetch(unit, x, y, level) : Vec4{0, 0, 0, 0};
@@ -692,6 +760,9 @@ struct RenderPassBegin {
   // layer_count[n]). A clear clears those layers. A 2D image has layer 0 alone.
   uint32_t first_layer[kMaxColorTargets + 1] = {};
   uint32_t layer_count[kMaxColorTargets + 1] = {1, 1, 1, 1, 1, 1, 1, 1, 1};
+  // The level of each target drawn into (kFeature2MipmappedLayers; the same numbering): all the targets' levels are of one size, and the pass is that size. The layers above are
+  // the layers of that level (a volume's level has level_layer_count slices).
+  uint32_t level[kMaxColorTargets + 1] = {};
 };
 
 class ICommandBuffer {
@@ -709,6 +780,12 @@ class ICommandBuffer {
   virtual void push_constants(const void* data, uint32_t size) = 0;
   // Binds a sampled image (created with kImageSampled) to a texture unit with a sampler, for the draws that follow. A render pass may not draw into an image it samples.
   virtual void bind_texture(uint32_t unit, IImage* image, const SamplerDesc& sampler) = 0;
+  // The same through a view (kFeature2MipmappedLayers: texture_view_fits): the shader sees the view's levels and layers as the whole image, of the view's kind. A pass may draw into
+  // levels or layers of an image a unit samples outside its view. A device without the feature binds the whole image.
+  virtual void bind_texture_view(uint32_t unit, IImage* image, const SamplerDesc& sampler, const TextureView& view) {
+    (void)view;
+    bind_texture(unit, image, sampler);
+  }
   // Defaults to the whole render target.
   virtual void set_viewport(const Viewport& viewport) = 0;
   virtual void set_scissor(const Rect2D& scissor) = 0;
@@ -815,6 +892,10 @@ enum DeviceFeature2 : uint32_t {
   kFeature2StorageImagesInDraws = 1u << 1,  // ... also bound inside passes and read and written by pixel shaders (FragmentContext::images): they run for every fragment the rasterizer makes
   kFeature2LayeredTargets = 1u << 2,        // colour and depth attachments that are arrays, volumes or cubes (one level), RenderPassBegin::first_layer / layer_count, ShaderIo::layer from geometry shaders
   kFeature2SingleChannelFormats = 1u << 3,  // Format::R32Uint, R32Sint, R32Float: render targets, textures and storage images (the integer ones with atomics)
+  // Images of several levels of every kind and usage (ImageDesc::mip_levels: arrays, cubes, volumes, targets, depth, storage and wide images), cube arrays (TextureKind::TextureCubeArray),
+  // IImage::write_subresource / read_subresource, texture views (ICommandBuffer::bind_texture_view), passes that draw into a level (RenderPassBegin::level), storage images of a cube's
+  // faces (as an array) and of any level of a layered image (StorageImageView::level).
+  kFeature2MipmappedLayers = 1u << 10,
 };
 
 

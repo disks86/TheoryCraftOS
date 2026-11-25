@@ -49,7 +49,7 @@ enum DxbcOp : uint32_t {
   kEmit4 = 19, kCut4 = 9, kDclOutputTopology4 = 92, kDclInputPrimitive4 = 93, kDclMaxOutputVertices4 = 94, kDclGsInstanceCount4 = 206, kDclThreadGroup4 = 155, kDclResourceRaw4 = 161, kDclResourceStructured4 = 162, kDclUavRaw4 = 157, kDclUavStructured4 = 158, kLdRaw4 = 165, kStoreRaw4 = 166, kLdStructured4 = 167, kStoreStructured4 = 168, kSync4 = 190, kDclTgsmRaw4 = 159, kDclTgsmStructured4 = 160, kDclUavTyped4 = 156, kLdUavTyped4 = 163, kStoreUavTyped4 = 164,
   kDclOutput4 = 101, kDclOutputSgv4 = 102, kDclOutputSiv4 = 103, kDclTemps4 = 104, kDclIndexableTemp4 = 105, kDclGlobalFlags4 = 106,
 };
-// The texture a dcl_resource declares (D3D10_SB_RESOURCE_DIMENSION: 2 texture1d, 3 texture2d, 5 texture3d, 6 texturecube, 7 texture1darray, 8 texture2darray); the others
+// The texture a dcl_resource declares (D3D10_SB_RESOURCE_DIMENSION: 2 texture1d, 3 texture2d, 5 texture3d, 6 texturecube, 7 texture1darray, 8 texture2darray, 10 texturecubearray); the others
 // are not taken. A one-dimensional texture is a two-dimensional one a texel high (and an array of them an array of those): the accesses to it are rewritten (one_d_fix).
 bool resource_kind(uint32_t dimension, graphics::TextureKind* kind) {
   switch (dimension) {
@@ -60,6 +60,7 @@ bool resource_kind(uint32_t dimension, graphics::TextureKind* kind) {
     case 5: *kind = graphics::TextureKind::Texture3D; return true;
     case 6: *kind = graphics::TextureKind::TextureCube; return true;
     case 8: *kind = graphics::TextureKind::Texture2DArray; return true;
+    case 10: *kind = graphics::TextureKind::TextureCubeArray; return true;
     default: return false;
   }
 }
@@ -1121,7 +1122,7 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
         return status::kNotSupported;
       }
       if (resource.type != kOpResource || unit >= graphics::kMaxTextureUnits || (opcode == 72 && sampler.type != kOpSampler)) return status::kNotSupported;
-      if (opcode == 45 && program->texture_kind_[unit] == graphics::TextureKind::TextureCube) return status::kNotSupported;   // (a cube has no Load)
+      if (opcode == 45 && (program->texture_kind_[unit] == graphics::TextureKind::TextureCube || program->texture_kind_[unit] == graphics::TextureKind::TextureCubeArray)) return status::kNotSupported;   // (a cube has no Load)
       const bool multisampled = program->texture_kind_[unit] == graphics::TextureKind::Texture2DMS;
       if ((opcode == 46 || opcode == 111) != multisampled && (opcode == 46 || opcode == 111 || opcode == 45 || opcode == 72)) return status::kNotSupported;   // (ld_ms and sampleinfo go with a multisampled texture, and ld and sample_l do not)
       ins.op = opcode == 45 ? kTexFetch : opcode == 46 ? kTexFetchMs : opcode == 111 ? kTexSamples : opcode == 72 ? kTexLod : kTexSize;

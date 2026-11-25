@@ -115,7 +115,7 @@ constexpr uint32_t kQueryTimestamp = 2, kQueryPrimitivesGenerated = 5, kQueryPri
 constexpr uint32_t kQueryPipelineStatistics = 10;  // PIPE_QUERY_PIPELINE_STATISTICS (the enum of virglrenderer's p_defines.h: occlusion counter 0, predicate 1, timestamp 2, disjoint 3, time elapsed 4, primitives generated 5, emitted 6, SO statistics 7, SO overflow 8, GPU finished 9, pipeline statistics 10): the statistic is the query index, in the upper half of the word (PIPE_STAT_QUERY_*: IA_VERTICES 0, IA_PRIMITIVES 1, VS_INVOCATIONS 2, PS_INVOCATIONS 7)
 constexpr uint32_t kQueryStateDone = 1;         // virgl_host_query_state::query_state once the host wrote the result (state, size, 64-bit result: 16 bytes)
 constexpr uint32_t kTargetBuffer = 0;
-constexpr uint32_t kTargetTexture2d = 2, kTargetTexture3d = 3, kTargetTextureCube = 4, kTargetTexture2dArray = 7;   // (PIPE_TEXTURE_*)
+constexpr uint32_t kTargetTexture2d = 2, kTargetTexture3d = 3, kTargetTextureCube = 4, kTargetTexture2dArray = 7, kTargetTextureCubeArray = 8;   // (PIPE_TEXTURE_*; a sampler view's target is bits 24-31 of its format word, 0 the resource's own)
 constexpr uint32_t kShaderTessControl = 3, kShaderTessEval = 4;   // (PIPE_SHADER_TESS_CTRL, TESS_EVAL)
 constexpr uint32_t kPrimPatches = 14;   // (PIPE_PRIM_PATCHES; the draw command then has two more words, the control points of a patch and the draw id)
 constexpr uint32_t kShaderGeometry = 2;   // (PIPE_SHADER_GEOMETRY)

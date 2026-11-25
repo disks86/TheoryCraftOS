@@ -261,7 +261,7 @@ struct Dev {
   LONG removed;
   UINT null_target;        /* a 1 x 1 render target: the pass of a draw that has no target (stream output only) */
   /* The colour targets of passes that have a depth buffer and no render target (cmdlist.inc depth_companion): one for each depth buffer drawn into that way, until it is destroyed. */
-  struct Companion { UINT depth, color; } *companions;
+  struct Companion { UINT depth, color, width, height; } *companions;      /* (one for each size of a level of the depth buffer a pass drew into) */
   UINT companion_count, companion_capacity;
   SRWLOCK companion_lock;
   struct SharedShader *shared;      /* the kernel's shaders the pipelines have, each once (pso.inc) */
@@ -287,6 +287,8 @@ struct Dev {
 #define DEV_FEATURE2_STORAGE_IMAGES_IN_DRAWS (1u << 1)   /* ... and in pixel shaders */
 #define DEV_FEATURE2_LAYERED_TARGETS (1u << 2)           /* render targets and depth buffers of several slices, SV_RenderTargetArrayIndex */
 #define DEV_FEATURE2_SINGLE_CHANNEL (1u << 3)            /* R32_UINT, R32_SINT, R32_FLOAT */
+#define DEV_FEATURE2_MIPMAPPED_LAYERS (1u << 10)         /* graphics::kFeature2MipmappedLayers: levels of arrays, cubes, volumes, targets, depth buffers and the wide formats, cube arrays,
+                                                          * shader resource views of levels and layers, render targets and depth views of a level */
 
 static const GUID *const g_device_iids[] = {&IID_ID3D12Object, &IID_ID3D12Device, &IID_ID3D12Device1, &IID_ID3D12Device2, &IID_ID3D12Device3, &IID_ID3D12Device4,
                                             &IID_ID3D12Device5, &IID_ID3D12Device6, &IID_ID3D12Device7, &IID_ID3D12Device8, &IID_ID3D12Device9, &IID_ID3D12Device10, NULL};

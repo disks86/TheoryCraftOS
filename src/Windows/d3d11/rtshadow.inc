@@ -219,41 +219,51 @@ static void STDMETHODCALLTYPE ctx_GenerateMips(Ctx *c, ID3D11ShaderResourceView 
   /* (a texture that is a render target and a shader resource, made with D3D11_RESOURCE_MISC_GENERATE_MIPS) */
   if (!(t->desc.MiscFlags & D3D11_RESOURCE_MISC_GENERATE_MIPS) || (t->desc.BindFlags & (D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE)) !=
       (D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE) || t->kmips < 2 || predicated_out(c->dev))
-    return;      /* (the levels of a volume, an array or a cube beyond the first are not kept: there is nothing to make) */
+    return;      /* (a device below without levels of layered images keeps one of a volume, an array or a cube: there is nothing to make) */
   FLOAT probe[4];
   BYTE zero[16] = {0};
   if (!texel_decode(t->stored, zero, probe)) return;
+  /* (the view's levels and layers: each level after its first from the one above it - a volume's by 2 x 2 x 2 texels of the two slices above, a level of an odd number of slices
+   * keeping its last -, every layer the view shows; levels Direct3D 12 below does not keep are not made) */
+  UINT first_level = 0, levels = 0, first = 0, count = 0;
+  if (!srv_range(t, &v->desc.srv, &first_level, &levels, &first, &count) || first_level >= t->kmips) return;
+  const UINT last = first_level + levels - 1 < t->kmips - 1 ? first_level + levels - 1 : t->kmips - 1;
+  if (last <= first_level) return;
   Dev *d = c->dev;
   LOCK(c);
-  const UINT bpp = t->stored_bpp;
-  for (UINT layer = 0; layer < t->desc.ArraySize; ++layer) {
-    UINT w = t->desc.Width, h = t->desc.Height;
-    BYTE *above = mem_alloc((SIZE_T)w * h * bpp);
-    if (!above || FAILED(tex_read_rows(d, t, layer * t->desc.MipLevels, 0, above, TRUE))) { mem_free(above); break; }
-    for (UINT level = 1; level < t->kmips; ++level) {
-      const UINT nw = w > 1 ? w / 2 : 1, nh = h > 1 ? h / 2 : 1;
-      BYTE *below = mem_alloc((SIZE_T)nw * nh * bpp);
+  const UINT bpp = t->stored_bpp, volume = t->kind == 1;
+  for (UINT layer = first; layer < first + (volume ? 1 : count); ++layer) {
+    UINT w = mip_size(t->desc.Width, first_level), h = mip_size(t->desc.Height, first_level), depth = volume ? mip_size(t->slices, first_level) : 1;
+    BYTE *above = mem_alloc((SIZE_T)w * h * depth * bpp);
+    if (!above) break;
+    HRESULT hr = S_OK;
+    for (UINT z = 0; SUCCEEDED(hr) && z < depth; ++z) hr = tex_read_rows(d, t, first_level + layer * t->desc.MipLevels, z, above + (SIZE_T)z * w * h * bpp, TRUE);
+    if (FAILED(hr)) { mem_free(above); break; }
+    for (UINT level = first_level + 1; level <= last; ++level) {
+      const UINT nw = w > 1 ? w / 2 : 1, nh = h > 1 ? h / 2 : 1, nd = volume ? (depth > 1 ? depth / 2 : 1) : 1;
+      BYTE *below = mem_alloc((SIZE_T)nw * nh * nd * bpp);
       if (!below) break;
-      for (UINT y = 0; y < nh; ++y)
-        for (UINT x = 0; x < nw; ++x) {
-          FLOAT sum[4] = {0, 0, 0, 0}, texel[4];
-          UINT n = 0;
-          for (UINT dy = 0; dy < 2; ++dy)
-            for (UINT dx = 0; dx < 2; ++dx) {
-              const UINT sx = 2 * x + dx, sy = 2 * y + dy;
-              if (sx >= w || sy >= h) continue;
-              texel_decode(t->stored, above + ((SIZE_T)sy * w + sx) * bpp, texel);
-              for (UINT k = 0; k < 4; ++k) sum[k] += texel[k];
-              ++n;
-            }
-          for (UINT k = 0; k < 4; ++k) sum[k] /= (FLOAT)n;
-          texel_encode(t->stored, sum, below + ((SIZE_T)y * nw + x) * bpp);
-        }
-      tex_write_rows(d, t, level + layer * t->desc.MipLevels, 0, 0, 0, nw, nh, below, nw * bpp, TRUE);
+      for (UINT z = 0; z < nd; ++z)
+        for (UINT y = 0; y < nh; ++y)
+          for (UINT x = 0; x < nw; ++x) {
+            FLOAT sum[4] = {0, 0, 0, 0}, texel[4];
+            UINT n = 0;
+            for (UINT dz = 0; dz < (volume ? 2u : 1u); ++dz)
+              for (UINT dy = 0; dy < 2; ++dy)
+                for (UINT dx = 0; dx < 2; ++dx) {
+                  const UINT sx = 2 * x + dx, sy = 2 * y + dy, sz = volume ? 2 * z + dz : 0;
+                  if (sx >= w || sy >= h || sz >= depth) continue;
+                  texel_decode(t->stored, above + (((SIZE_T)sz * h + sy) * w + sx) * bpp, texel);
+                  for (UINT k = 0; k < 4; ++k) sum[k] += texel[k];
+                  ++n;
+                }
+            for (UINT k = 0; k < 4; ++k) sum[k] /= (FLOAT)n;
+            texel_encode(t->stored, sum, below + (((SIZE_T)z * nh + y) * nw + x) * bpp);
+          }
+      for (UINT z = 0; z < nd; ++z) tex_write_rows(d, t, level + layer * t->desc.MipLevels, 0, 0, z, nw, nh, below + (SIZE_T)z * nw * nh * bpp, nw * bpp, TRUE);
       mem_free(above);
       above = below;
-      w = nw;
-      h = nh;
+      w = nw, h = nh, depth = nd;
     }
     mem_free(above);
   }

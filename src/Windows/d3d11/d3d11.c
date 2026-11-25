@@ -140,9 +140,10 @@ struct Buf {
 struct Tex {
   Child c;
   D3D11_TEXTURE2D_DESC desc;   /* (a volume: its width, height and levels, with one layer; its depth is `slices`) */
-  UINT kind;                   /* the kernel's TextureKind: 0 2D, 1 3D (a volume), 2 2D array, 3 cube */
+  UINT kind;                   /* the kernel's TextureKind: 0 2D, 1 3D (a volume), 2 2D array, 3 cube, 5 cube array (several cubes) */
   UINT slices;                 /* a volume's depth (1 for the others) */
-  UINT kmips;                  /* the levels the Direct3D 12 texture has: the kernel keeps one of a volume, an array or a cube, whose other levels are dropped */
+  UINT kmips;                  /* the levels the Direct3D 12 texture has: all of them, or - below a device without levels of layered images (dev_all_levels) - one of a volume,
+                                * an array or a cube, whose other levels are dropped */
   D3D11_TEXTURE3D_DESC desc3;  /* a volume: as the program made it */
   D3D11_TEXTURE1D_DESC desc1;  /* a one-dimensional texture (`one_d`): as the program made it; kept as a 2D texture (or array) a texel high */
   BOOL one_d;
@@ -361,6 +362,7 @@ struct Dev {
   UINT flags;
   ID3D12Device *d12;
   int layered_targets;         /* Direct3D 12 below draws into arrays, cubes and volumes (render target and depth views of several slices): 0 not asked yet, 1 yes, 2 no */
+  int all_levels;              /* Direct3D 12 below keeps every level of every texture (arrays, cubes, volumes, targets and depth buffers of levels, cube arrays): 0 not asked, 1 yes, 2 no */
   UINT next_tex_kind;                      /* what tex_make makes next, for the description a share carries: 0 as its arguments say, 2 one-dimensional (dev_CreateTexture1D) */
   ID3D12CommandQueue *queue;
   ID3D12CommandAllocator *allocator;
@@ -383,7 +385,7 @@ struct Dev {
   UINT table_view_ids[TEXTURE_SLOTS], table_sampler_ids[TEXTURE_SLOTS];      /* ... and what was in them */
   int tables_valid;
   Tex *blank;                              /* a white pixel: what a texture slot with nothing bound samples */
-  Tex *blank_kind[4];                      /* ... a white volume, array and cube (by Tex.kind, made when a shader that declares one has nothing bound to it) */
+  Tex *blank_kind[6];                      /* ... a white volume, array, cube and cube array (by Tex.kind, made when a shader that declares one has nothing bound to it) */
   Buf *blank_buffer;                       /* ... and a buffer of zeros, for a buffer slot (t<n> or u<n>) a shader reads with nothing bound (what it reads beyond it is zero too) */
   Buf *blank_uav;                          /* ... and a buffer for an unordered access slot a shader declares with nothing bound (what it writes there is lost to the program) */
   UINT64 table_uavs;                       /* the GPU handle of the unordered access table the last draw used, and what was in it */
@@ -748,6 +750,21 @@ static BOOL dev_layered_targets(Dev *d) {
   return d->layered_targets == 1;
 }
 
+/* Whether Direct3D 12 below keeps the levels of every texture - an array, a cube, a volume, a render target or a depth buffer of several levels, cube arrays - and draws into
+ * any of them (the kernel's kFeature2MipmappedLayers): asked once, with a small array of levels it is given to make. Without it a volume's, an array's and a cube's other
+ * levels are dropped (Tex.kmips), and a render target of levels is drawn into through targets of its own (rtshadow.inc). */
+static BOOL dev_all_levels(Dev *d) {
+  if (!d->all_levels) {
+    const D3D12_HEAP_PROPERTIES props = {D3D12_HEAP_TYPE_DEFAULT, D3D12_CPU_PAGE_PROPERTY_UNKNOWN, D3D12_MEMORY_POOL_UNKNOWN, 1, 1};
+    const D3D12_RESOURCE_DESC rd = {D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, 4, 4, 2, 2, DXGI_FORMAT_R8G8B8A8_UNORM, {1, 0}, D3D12_TEXTURE_LAYOUT_UNKNOWN, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET};
+    ID3D12Resource *probe = NULL;
+    const HRESULT hr = ID3D12Device_CreateCommittedResource(d->d12, &props, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_COMMON, NULL, &IID_ID3D12Resource, (void **)&probe);
+    d->all_levels = SUCCEEDED(hr) && probe ? 1 : 2;
+    if (probe) ID3D12Resource_Release(probe);
+  }
+  return d->all_levels == 1;
+}
+
 static UINT tex_subresources(const Tex *t) { return t->desc.MipLevels * t->desc.ArraySize; }
 static UINT mip_size(UINT size, UINT level) { size >>= level; return size ? size : 1; }
 /* The subresource of the Direct3D 12 texture that subresource `sub` of the program's is; FALSE for a level the kernel does not keep (see Tex.kmips). */
@@ -1092,8 +1109,9 @@ static HRESULT tex_make(Dev *d, const D3D11_TEXTURE2D_DESC *in, UINT slices, ID3
     if (slices || (!mips_ok && desc.MipLevels != 1 && !(desc.MipLevels == 0 && chain == 1)) || desc.SampleDesc.Count != 1 || desc.SampleDesc.Quality ||
         (desc.MiscFlags & D3D11_RESOURCE_MISC_TEXTURECUBE) || (bind & D3D11_BIND_DEPTH_STENCIL) || (format_pairs(desc.Format) && (desc.Width & 1)))
       return E_INVALIDARG;
-    /* (levels of a render target, and of an array: the kernel draws into images of one level, and its images of several layers have one - Direct3D 12 below refuses those) */
-    if ((desc.MipLevels != 1 && chain > 1) && ((bind & D3D11_BIND_RENDER_TARGET) || desc.ArraySize > 1)) {
+    /* (levels of a render target, and of an array: below a device without levels of every image the kernel draws into images of one level, and its images of several layers
+     * have one - Direct3D 12 below refuses those) */
+    if ((desc.MipLevels != 1 && chain > 1) && ((bind & D3D11_BIND_RENDER_TARGET) || desc.ArraySize > 1) && !dev_all_levels(d)) {
       tex_refused(&desc, "a packed YUV texture of mip levels drawn into, or an array of them");
       return DXGI_ERROR_UNSUPPORTED;
     }
@@ -1128,13 +1146,14 @@ static HRESULT tex_make(Dev *d, const D3D11_TEXTURE2D_DESC *in, UINT slices, ID3
   if (desc.Width > 4096 || desc.Height > 4096 || slices > 256) { tex_refused(&desc, "larger than 4096 (or a volume deeper than 256)"); return E_INVALIDARG; }
   const BOOL cube = (desc.MiscFlags & D3D11_RESOURCE_MISC_TEXTURECUBE) != 0;
   if (cube && (desc.ArraySize % 6 || desc.Width != desc.Height)) return E_INVALIDARG;
-  if (cube && desc.ArraySize != 6) { tex_refused(&desc, "an array of cubes"); return DXGI_ERROR_UNSUPPORTED; }
+  const BOOL all_levels = !res && dev_all_levels(d);
+  if (cube && desc.ArraySize != 6 && !all_levels) { tex_refused(&desc, "an array of cubes"); return DXGI_ERROR_UNSUPPORTED; }
   if (desc.ArraySize > 256) { tex_refused(&desc, "an array of more than 256"); return E_INVALIDARG; }
   const BOOL layered = cube || slices || desc.ArraySize > 1;
-  /* (a render target of levels - or of layers, on a device below that does not draw into them -: the kernel draws into images of one level, so the texture is drawn
-   * into through targets of its own) */
+  /* (a render target of levels on a device below that keeps one level of a target - or of layers, on one that does not draw into them -: the kernel draws into images of one
+   * level there, so the texture is drawn into through targets of its own) */
   const BOOL shadowed = !res && !planar && !yuv && (desc.BindFlags & D3D11_BIND_RENDER_TARGET) && desc.SampleDesc.Count == 1 &&
-                        (desc.MipLevels != 1 || (layered && !dev_layered_targets(d)));
+                        ((desc.MipLevels != 1 && !all_levels) || (layered && !dev_layered_targets(d)));
   /* (a format that cannot be had for that use: refused as such, before what the kernel cannot do) */
   if (!tex_format_for(desc.Format, desc.BindFlags) && !(res && tex_format(desc.Format))) { tex_refused(&desc, "the format, for that use"); return E_INVALIDARG; }
   /* (a depth buffer of several slices: an array or a cube - a volume is not one -, on a device below that draws into layers) */
@@ -1155,19 +1174,19 @@ static HRESULT tex_make(Dev *d, const D3D11_TEXTURE2D_DESC *in, UINT slices, ID3
   UINT largest = desc.Width > desc.Height ? desc.Width : desc.Height;
   if (slices > largest) largest = slices;
   for (UINT size = largest; size > 1; size >>= 1) ++full;
-  /* (a render target has one level here: the kernel draws into those only) */
-  if ((target && !shadowed) || desc.SampleDesc.Count > 1) desc.MipLevels = 1;
+  /* (a render target has one level here on a device below that draws into those only; a multisampled one has one) */
+  if ((target && !shadowed && !all_levels) || desc.SampleDesc.Count > 1) desc.MipLevels = 1;
   else if (desc.MipLevels == 0 || desc.MipLevels > full) desc.MipLevels = full;
-  if ((desc.BindFlags & D3D11_BIND_DEPTH_STENCIL) && desc.MipLevels != 1) desc.MipLevels = 1;      /* (a depth buffer: one level) */
+  if ((desc.BindFlags & D3D11_BIND_DEPTH_STENCIL) && desc.MipLevels != 1 && !all_levels) desc.MipLevels = 1;      /* (a depth buffer: one level, there) */
   Tex *t = child_new(sizeof *t, d, &tex_vtbl, g_tex_iids, tex_destroy);
   if (!t) return E_OUTOFMEMORY;
   tex_dxgi_init(t);
   t->desc = desc;
-  t->kind = slices ? 1 : cube ? 3 : desc.ArraySize > 1 && !planar ? 2 : 0;      /* (a planar array: each slice an image of its own below) */
+  t->kind = slices ? 1 : cube ? (desc.ArraySize == 6 ? 3 : 5) : desc.ArraySize > 1 && !planar ? 2 : 0;      /* (a planar array: each slice an image of its own below) */
   t->shadowed = shadowed;
   t->version = 1;
   t->slices = slices ? slices : 1;
-  t->kmips = layered ? 1 : desc.MipLevels;      /* (the kernel's volumes, arrays and cubes have one level: the program's others are dropped) */
+  t->kmips = layered && !all_levels && !res ? 1 : desc.MipLevels;      /* (the kernel's volumes, arrays and cubes have one level on a device without them: the program's others are dropped) */
   t->planar = planar ? made_format->bpp : 0;
   t->fmt = tex_format_for(desc.Format, desc.BindFlags);
   if (!t->fmt) { tex_refused(&desc, "the format, for that use"); dx_Release(OBJ(t)); return E_INVALIDARG; }
@@ -1416,7 +1435,7 @@ static HRESULT rtv_create(Dev *d, ID3D11Resource *resource, const D3D11_RENDER_T
     if (plane_slice > 0) return E_INVALIDARG;      /* (a format of one plane) */
     if ((t->fmt->flags & FMT_YUV) && (!desc || !yuv_view_ok(t->desc.Format, desc->Format, TRUE))) return E_INVALIDARG;      /* (AYUV: as R8G8B8A8) */
     if (desc && !rtv_subresource(t, desc, &level, &layer)) return E_INVALIDARG;
-    if (!t->shadowed && level) return E_INVALIDARG;
+    if (!t->shadowed && level >= t->kmips) return E_INVALIDARG;      /* (a level Direct3D 12 below keeps: all of them, on a device that has levels of every image) */
     /* (an array, cube or volume the kernel keeps layered takes any layer; a packed YUV array's slices are images of their own below: a view may be of any of them) */
     if (!t->shadowed && layer && t->kind == 0 && !(t->fmt->flags & FMT_YUV)) return E_INVALIDARG;
   }
@@ -1466,17 +1485,19 @@ static HRESULT rtv_create(Dev *d, ID3D11Resource *resource, const D3D11_RENDER_T
     D3D12_RENDER_TARGET_VIEW_DESC r;
     memset(&r, 0, sizeof r);
     r.Format = t->stored;
-    UINT first = 0, count = t->kind == 1 ? t->slices : t->desc.ArraySize;
+    UINT first = 0, count = t->kind == 1 ? mip_size(t->slices, level) : t->desc.ArraySize;      /* (a volume's level: half the slices of the one above) */
     if (desc && desc->ViewDimension == D3D11_RTV_DIMENSION_TEXTURE2DARRAY) first = desc->Texture2DArray.FirstArraySlice, count = desc->Texture2DArray.ArraySize;
     if (desc && desc->ViewDimension == D3D11_RTV_DIMENSION_TEXTURE1DARRAY) first = desc->Texture1DArray.FirstArraySlice, count = desc->Texture1DArray.ArraySize;
     if (desc && desc->ViewDimension == D3D11_RTV_DIMENSION_TEXTURE3D) first = desc->Texture3D.FirstWSlice, count = desc->Texture3D.WSize;
     if (desc && (desc->ViewDimension == D3D11_RTV_DIMENSION_TEXTURE2D || desc->ViewDimension == D3D11_RTV_DIMENSION_TEXTURE1D)) count = 1;
     if (t->kind == 1) {
       r.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE3D;
+      r.Texture3D.MipSlice = level;
       r.Texture3D.FirstWSlice = first;
       r.Texture3D.WSize = count;
     } else {
       r.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2DARRAY;
+      r.Texture2DArray.MipSlice = level;
       r.Texture2DArray.FirstArraySlice = first;
       r.Texture2DArray.ArraySize = count;
     }
@@ -1498,12 +1519,22 @@ static HRESULT rtv_create(Dev *d, ID3D11Resource *resource, const D3D11_RENDER_T
     memset(&r, 0, sizeof r);
     r.Format = desc->Format;
     r.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
+    r.Texture2D.MipSlice = level;
     if (t->desc.ArraySize > 1) {
       r.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2DARRAY;
+      r.Texture2DArray.MipSlice = level;
       r.Texture2DArray.FirstArraySlice = layer;
       r.Texture2DArray.ArraySize = 1;
     }
     v->array_slice = layer;
+    ID3D12Device_CreateRenderTargetView(d->d12, t->res, &r, v->handle);
+  } else if (level) {
+    /* (a level of a 2D texture Direct3D 12 below draws into) */
+    D3D12_RENDER_TARGET_VIEW_DESC r;
+    memset(&r, 0, sizeof r);
+    r.Format = t->stored;
+    r.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
+    r.Texture2D.MipSlice = level;
     ID3D12Device_CreateRenderTargetView(d->d12, t->res, &r, v->handle);
   } else ID3D12Device_CreateRenderTargetView(d->d12, t->res, NULL, v->handle);
   return give(v, (void **)out);
@@ -1528,17 +1559,31 @@ static HRESULT STDMETHODCALLTYPE dev_CreateDepthStencilView(Dev *d, ID3D11Resour
   v->handle = ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(d->dsv_heap);
   v->handle.ptr += (SIZE_T)v->slot * ID3D12Device_GetDescriptorHandleIncrementSize(d->d12, D3D12_DESCRIPTOR_HEAP_TYPE_DSV);
   if (t->desc.SampleDesc.Count > 1) v->desc.dsv.ViewDimension = D3D11_DSV_DIMENSION_TEXTURE2DMS;
-  if (t->kind == 2 || t->kind == 3) {
+  /* (the level it draws into: one Direct3D 12 below keeps) */
+  const UINT level = !desc ? 0 : desc->ViewDimension == D3D11_DSV_DIMENSION_TEXTURE2D ? desc->Texture2D.MipSlice : desc->ViewDimension == D3D11_DSV_DIMENSION_TEXTURE2DARRAY ? desc->Texture2DArray.MipSlice
+                     : desc->ViewDimension == D3D11_DSV_DIMENSION_TEXTURE1D ? desc->Texture1D.MipSlice : desc->ViewDimension == D3D11_DSV_DIMENSION_TEXTURE1DARRAY ? desc->Texture1DArray.MipSlice : 0;
+  if (level >= t->kmips) { dx_Release(OBJ(v)); return E_INVALIDARG; }
+  if (t->kind == 2 || t->kind == 3 || t->kind == 5) {
     /* (an array or a cube: a view of the slices the description names - all of them without one) */
     D3D12_DEPTH_STENCIL_VIEW_DESC x;
     memset(&x, 0, sizeof x);
     x.Format = t->stored;
     x.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2DARRAY;
+    x.Texture2DArray.MipSlice = level;
     x.Texture2DArray.ArraySize = t->desc.ArraySize;
     if (desc && desc->ViewDimension == D3D11_DSV_DIMENSION_TEXTURE2DARRAY) x.Texture2DArray.FirstArraySlice = desc->Texture2DArray.FirstArraySlice, x.Texture2DArray.ArraySize = desc->Texture2DArray.ArraySize;
     if (desc && desc->ViewDimension == D3D11_DSV_DIMENSION_TEXTURE1DARRAY) x.Texture2DArray.FirstArraySlice = desc->Texture1DArray.FirstArraySlice, x.Texture2DArray.ArraySize = desc->Texture1DArray.ArraySize;
     if (desc && (desc->ViewDimension == D3D11_DSV_DIMENSION_TEXTURE2D || desc->ViewDimension == D3D11_DSV_DIMENSION_TEXTURE1D)) x.Texture2DArray.ArraySize = 1;
     if (!desc) { v->desc.dsv.ViewDimension = D3D11_DSV_DIMENSION_TEXTURE2DARRAY; v->desc.dsv.Texture2DArray.ArraySize = t->desc.ArraySize; }
+    ID3D12Device_CreateDepthStencilView(d->d12, t->res, &x, v->handle);
+    return give(v, (void **)out);
+  }
+  if (level) {
+    D3D12_DEPTH_STENCIL_VIEW_DESC x;
+    memset(&x, 0, sizeof x);
+    x.Format = t->stored;
+    x.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2D;
+    x.Texture2D.MipSlice = level;
     ID3D12Device_CreateDepthStencilView(d->d12, t->res, &x, v->handle);
     return give(v, (void **)out);
   }
@@ -1581,6 +1626,47 @@ static HRESULT srv_of_buffer(Dev *d, Buf *b, const D3D11_SHADER_RESOURCE_VIEW_DE
   return give(v, (void **)out);
 }
 
+/* The levels and layers a shader resource view of a texture names (D3D11_SHADER_RESOURCE_VIEW_DESC): its first level and count (-1: to the last), and for the views of layers the first
+ * and count (a TEXTURE1D / TEXTURE2D view: the first layer alone; a cube's six faces, a cube array's six for each cube from First2DArrayFace). FALSE for levels or layers the texture
+ * does not have, or a dimension it cannot be seen as (a cube view of a texture not made a cube, a volume as anything but a volume, ...). */
+static BOOL srv_range(const Tex *t, const D3D11_SHADER_RESOURCE_VIEW_DESC *desc, UINT *first_level, UINT *levels, UINT *first, UINT *count) {
+  UINT l0 = 0, n = (UINT)-1, f = 0, c = 1;
+  const BOOL cube = t->kind == 3 || t->kind == 5;
+  switch (desc->ViewDimension) {
+    case D3D11_SRV_DIMENSION_TEXTURE1D: if (!t->one_d || t->kind == 1 || cube) return FALSE; l0 = desc->Texture1D.MostDetailedMip, n = desc->Texture1D.MipLevels; break;
+    case D3D11_SRV_DIMENSION_TEXTURE1DARRAY:
+      if (!t->one_d || t->kind == 1 || cube) return FALSE;
+      l0 = desc->Texture1DArray.MostDetailedMip, n = desc->Texture1DArray.MipLevels, f = desc->Texture1DArray.FirstArraySlice, c = desc->Texture1DArray.ArraySize;
+      break;
+    case D3D11_SRV_DIMENSION_TEXTURE2D: if (t->one_d || t->kind == 1 || t->desc.SampleDesc.Count > 1) return FALSE; l0 = desc->Texture2D.MostDetailedMip, n = desc->Texture2D.MipLevels; break;
+    case D3D11_SRV_DIMENSION_TEXTURE2DARRAY:
+      if (t->one_d || t->kind == 1 || t->desc.SampleDesc.Count > 1) return FALSE;
+      l0 = desc->Texture2DArray.MostDetailedMip, n = desc->Texture2DArray.MipLevels, f = desc->Texture2DArray.FirstArraySlice, c = desc->Texture2DArray.ArraySize;
+      break;
+    case D3D11_SRV_DIMENSION_TEXTURE2DMS: if (t->desc.SampleDesc.Count < 2) return FALSE; n = 1; break;
+    case D3D11_SRV_DIMENSION_TEXTURE2DMSARRAY: if (t->desc.SampleDesc.Count < 2) return FALSE; n = 1, f = desc->Texture2DMSArray.FirstArraySlice, c = desc->Texture2DMSArray.ArraySize; break;
+    case D3D11_SRV_DIMENSION_TEXTURE3D: if (t->kind != 1) return FALSE; l0 = desc->Texture3D.MostDetailedMip, n = desc->Texture3D.MipLevels; break;
+    case D3D11_SRV_DIMENSION_TEXTURECUBE: if (!cube) return FALSE; l0 = desc->TextureCube.MostDetailedMip, n = desc->TextureCube.MipLevels, c = 6; break;
+    case D3D11_SRV_DIMENSION_TEXTURECUBEARRAY:
+      if (!cube) return FALSE;
+      l0 = desc->TextureCubeArray.MostDetailedMip, n = desc->TextureCubeArray.MipLevels, f = desc->TextureCubeArray.First2DArrayFace;
+      c = desc->TextureCubeArray.NumCubes == (UINT)-1 ? (UINT)-1 : desc->TextureCubeArray.NumCubes > 0xFFFFFFFFu / 6 ? 0 : desc->TextureCubeArray.NumCubes * 6;
+      break;
+    default: return FALSE;
+  }
+  if (l0 >= t->desc.MipLevels) return FALSE;
+  if (n == (UINT)-1) n = t->desc.MipLevels - l0;
+  if (n == 0 || n > t->desc.MipLevels - l0) return FALSE;
+  const UINT layers = t->kind == 1 ? 1 : t->desc.ArraySize;
+  if (c == (UINT)-1) c = f < layers ? layers - f : 0;
+  if (c == 0 || f >= layers || c > layers - f) return FALSE;
+  *first_level = l0, *levels = n, *first = f, *count = c;
+  return TRUE;
+}
+static BOOL srv_view_ok(const Tex *t, const D3D11_SHADER_RESOURCE_VIEW_DESC *desc) {
+  UINT a, b, c, e;
+  return srv_range(t, desc, &a, &b, &c, &e);
+}
 static HRESULT srv_create(Dev *d, ID3D11Resource *resource, const D3D11_SHADER_RESOURCE_VIEW_DESC *desc, INT plane_slice, ID3D11ShaderResourceView **out) {
   if (out) *out = NULL;
   Buf *b = buf_of_resource(resource);
@@ -1598,6 +1684,7 @@ static HRESULT srv_create(Dev *d, ID3D11Resource *resource, const D3D11_SHADER_R
       return E_INVALIDARG;
   } else if (plane_slice > 0) return E_INVALIDARG;      /* (a format of one plane) */
   if ((t->fmt->flags & FMT_YUV) && (!desc || !yuv_view_ok(t->desc.Format, desc->Format, FALSE))) return E_INVALIDARG;      /* (packed YUV: a view of its pixels' format) */
+  if (desc && !t->planar && !srv_view_ok(t, desc)) return E_INVALIDARG;      /* (levels and layers the texture has, of a dimension it can be seen as) */
   if (!out) return S_FALSE;
   View *v = child_new(sizeof *v, d, &srv_vtbl, g_srv_iids, srv_destroy);
   if (!v) return E_OUTOFMEMORY;
@@ -1622,6 +1709,7 @@ static HRESULT srv_create(Dev *d, ID3D11Resource *resource, const D3D11_SHADER_R
       case 1: v->desc.srv.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE3D; v->desc.srv.Texture3D.MipLevels = t->desc.MipLevels; break;
       case 2: v->desc.srv.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2DARRAY; v->desc.srv.Texture2DArray.MipLevels = t->desc.MipLevels; v->desc.srv.Texture2DArray.ArraySize = t->desc.ArraySize; break;
       case 3: v->desc.srv.ViewDimension = D3D11_SRV_DIMENSION_TEXTURECUBE; v->desc.srv.TextureCube.MipLevels = t->desc.MipLevels; break;
+      case 5: v->desc.srv.ViewDimension = D3D11_SRV_DIMENSION_TEXTURECUBEARRAY; v->desc.srv.TextureCubeArray.MipLevels = t->desc.MipLevels; v->desc.srv.TextureCubeArray.NumCubes = t->desc.ArraySize / 6; break;
       default: v->desc.srv.ViewDimension = t->desc.SampleDesc.Count > 1 ? D3D11_SRV_DIMENSION_TEXTURE2DMS : D3D11_SRV_DIMENSION_TEXTURE2D; v->desc.srv.Texture2D.MipLevels = t->desc.MipLevels; break;
     }
   }
@@ -1751,7 +1839,7 @@ static void shader_constants(Shader *s) {
         if (k < w + length && ((operand >> 20) & 3) == 1) {      /* (one immediate index: SM 4 / 5.0) */
           memcpy(&slot, code + 4 * k, 4);
           if (op >= 156 && op <= 158) { if (slot < UAV_SLOTS) s->uav_mask |= 1u << slot; }
-          else if (slot < TEXTURE_SLOTS) s->tex_kind[slot] = op != 88 || dimension == 1 ? KIND_BUFFER : dimension == 5 ? 1 : (dimension == 8 || dimension == 7) ? 2 : dimension == 6 ? 3 : 0;
+          else if (slot < TEXTURE_SLOTS) s->tex_kind[slot] = op != 88 || dimension == 1 ? KIND_BUFFER : dimension == 5 ? 1 : (dimension == 8 || dimension == 7) ? 2 : dimension == 6 ? 3 : dimension == 10 ? 5 : 0;
         }
       }
       if (op == 155 /* dcl_thread_group x, y, z */ && length >= 4) for (UINT k = 0; k < 3; ++k) memcpy(&s->group[k], code + 4 * (w + 1 + k), 4);

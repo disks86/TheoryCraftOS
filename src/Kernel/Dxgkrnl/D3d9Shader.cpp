@@ -978,7 +978,10 @@ void D3d9Program::execute(State& s, uint64_t begin, uint64_t end) const {
           u *= inv, v *= inv;
         }
         if (s.textures) {
-          const graphics::Vec4 t = (unit >= graphics::kMaxTextureUnits || texture_kind_[unit] == graphics::TextureKind::Texture2D) ? s.textures->sample(unit, u, v) : s.textures->sample_volume(unit, u, v, ins.control & 1 ? a.f[2] * (a.f[3] == 0 ? 0.0f : 1.0f / a.f[3]) : a.f[2]);
+          const graphics::TextureKind kind = unit < graphics::kMaxTextureUnits ? texture_kind_[unit] : graphics::TextureKind::Texture2D;
+          const graphics::Vec4 t = kind == graphics::TextureKind::Texture2D ? s.textures->sample(unit, u, v)
+                                   : kind == graphics::TextureKind::TextureCubeArray ? s.textures->sample_cube_array(unit, a.f[0], a.f[1], a.f[2], a.f[3])   // (a direction and the cube)
+                                                                                     : s.textures->sample_volume(unit, u, v, ins.control & 1 ? a.f[2] * (a.f[3] == 0 ? 0.0f : 1.0f / a.f[3]) : a.f[2]);
           const float texel[4] = {t.x, t.y, t.z, t.w};
           b = {{texel[ins.tex_swizzle[0]], texel[ins.tex_swizzle[1]], texel[ins.tex_swizzle[2]], texel[ins.tex_swizzle[3]]}};
         }
@@ -1012,7 +1015,9 @@ void D3d9Program::execute(State& s, uint64_t begin, uint64_t end) const {
                      : s.textures->fetch_volume(unit, __builtin_bit_cast(int32_t, a.f[0]), __builtin_bit_cast(int32_t, a.f[1]), __builtin_bit_cast(int32_t, a.f[2]), bits_of(a.f[3]));
           } else if (ins.op == kTexLod) {
             const Q lod = fetch(ins.src[2], 0);
-            t = flat ? s.textures->sample_lod(unit, a.f[0], a.f[1], lod.f[0]) : s.textures->sample_lod_volume(unit, a.f[0], a.f[1], a.f[2], lod.f[0]);
+            t = flat ? s.textures->sample_lod(unit, a.f[0], a.f[1], lod.f[0])
+                : kind == graphics::TextureKind::TextureCubeArray ? s.textures->sample_lod_cube_array(unit, a.f[0], a.f[1], a.f[2], a.f[3], lod.f[0])
+                                                                   : s.textures->sample_lod_volume(unit, a.f[0], a.f[1], a.f[2], lod.f[0]);
           } else {
             uint32_t w = 0, h = 0, d = 1, levels = 0;
             if (s.textures->size_volume(unit, bits_of(a.f[0]), &w, &h, &d, &levels) && bits_of(a.f[0]) < levels) {

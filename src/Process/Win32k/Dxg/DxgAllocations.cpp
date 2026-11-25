@@ -73,7 +73,7 @@ uint32_t parse_private_data(const ByteBuffer& data, Session& s, dxgk::Handle dev
   desc->mip_levels = word(data, kAwMips);
   desc->size = uint64_t{word(data, kAwSizeLo)} | uint64_t{word(data, kAwSizeHi)} << 32;
   const uint32_t kind = word(data, kAwKind);
-  if (kind > static_cast<uint32_t>(graphics::TextureKind::Texture2DMS)) return kStatusInvalidParameter;
+  if (kind > static_cast<uint32_t>(graphics::TextureKind::TextureCubeArray)) return kStatusInvalidParameter;
   desc->kind = static_cast<graphics::TextureKind>(kind);
   desc->samples = word(data, kAwSamples);
   desc->layers = word(data, kAwLayers);

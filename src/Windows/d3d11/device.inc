@@ -118,7 +118,8 @@ static HRESULT dev_check_format(Dev *d, DXGI_FORMAT format, UINT *support) {
      * target: AYUV; no unordered access is drawn) */
     *support = D3D11_FORMAT_SUPPORT_TEXTURE2D | D3D11_FORMAT_SUPPORT_SHADER_LOAD | D3D11_FORMAT_SUPPORT_SHADER_SAMPLE | D3D11_FORMAT_SUPPORT_CPU_LOCKABLE |
                D3D11_FORMAT_SUPPORT_DECODER_OUTPUT | D3D11_FORMAT_SUPPORT_VIDEO_PROCESSOR_INPUT;
-    if (format == DXGI_FORMAT_AYUV) *support |= D3D11_FORMAT_SUPPORT_MIP;      /* (Y416's levels: Direct3D 12 below has none - the kernel's 16-bit images have one) */
+    /* (Y416's levels: Direct3D 12 below has them where it keeps the levels of every image - dev_all_levels; the kernel's 16-bit images have one elsewhere) */
+    if (format == DXGI_FORMAT_AYUV || (format == DXGI_FORMAT_Y416 && dev_all_levels(d))) *support |= D3D11_FORMAT_SUPPORT_MIP;
     if (format == DXGI_FORMAT_AYUV) *support |= D3D11_FORMAT_SUPPORT_RENDER_TARGET | D3D11_FORMAT_SUPPORT_VIDEO_PROCESSOR_OUTPUT;
     return S_OK;
   }
@@ -364,7 +365,7 @@ static void dev_destroy(DxObj *o) {
   video_shutdown(d);
   if (d->ctx) { ctx_release_all(d->ctx); mem_free(d->ctx); }
   if (d->blank) dx_Release(OBJ(d->blank));
-  for (UINT k = 0; k < 4; ++k) if (d->blank_kind[k]) dx_Release(OBJ(d->blank_kind[k]));
+  for (UINT k = 0; k < 6; ++k) if (d->blank_kind[k]) dx_Release(OBJ(d->blank_kind[k]));
   if (d->blank_buffer) dx_Release(OBJ(d->blank_buffer));
   if (d->blank_uav) dx_Release(OBJ(d->blank_uav));
   for (UINT i = 0; i < d->pipeline_count; ++i) if (d->pipelines[i].state) ID3D12PipelineState_Release(d->pipelines[i].state);
@@ -481,11 +482,12 @@ static HRESULT dev_start(Dev *d) {
   InterlockedDecrement(&d->o.ref);      /* (the device's own texture does not hold the device) */
   hr = tex_write(d, d->blank, 0, 0, 0, 0, 1, 1, white, 4);
   if (FAILED(hr)) return hr;
-  /* (and a white volume, array and cube: what a slot a shader declares as one samples when nothing is bound; an adapter without them gets none, and the 2D one) */
-  for (UINT kind = 1; kind <= 3; ++kind) {
+  /* (and a white volume, array, cube and cube array: what a slot a shader declares as one samples when nothing is bound; an adapter without them gets none, and the 2D one) */
+  for (UINT kind = 1; kind <= 5; ++kind) {
+    if (kind == 4) continue;      /* (the kernel's TextureKind 4 is a multisampled texture's, which a shader reads only with a texture bound) */
     D3D11_TEXTURE2D_DESC layered = blank;
-    layered.ArraySize = kind == 3 ? 6 : kind == 2 ? 2 : 1;
-    if (kind == 3) layered.MiscFlags = D3D11_RESOURCE_MISC_TEXTURECUBE;
+    layered.ArraySize = kind == 5 ? 12 : kind == 3 ? 6 : kind == 2 ? 2 : 1;
+    if (kind == 3 || kind == 5) layered.MiscFlags = D3D11_RESOURCE_MISC_TEXTURECUBE;
     Tex *t = NULL;
     if (FAILED(tex_make(d, &layered, kind == 1 ? 1 : 0, NULL, &t))) continue;
     InterlockedDecrement(&d->o.ref);

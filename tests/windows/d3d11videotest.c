@@ -1179,7 +1179,7 @@ static void test_packed_yuv(void) {
     HRESULT hr = ID3D11Device_CheckFormatSupport(g_device, f, &support);
     checkf(hr == S_OK && (support & D3D11_FORMAT_SUPPORT_TEXTURE2D) && (support & D3D11_FORMAT_SUPPORT_SHADER_SAMPLE) && (support & D3D11_FORMAT_SUPPORT_DECODER_OUTPUT) &&
                (support & D3D11_FORMAT_SUPPORT_VIDEO_PROCESSOR_INPUT) && !!(support & D3D11_FORMAT_SUPPORT_RENDER_TARGET) == formats[i].target &&
-               !!(support & D3D11_FORMAT_SUPPORT_VIDEO_PROCESSOR_OUTPUT) == formats[i].target && !!(support & D3D11_FORMAT_SUPPORT_MIP) == (f == DXGI_FORMAT_AYUV),
+               !!(support & D3D11_FORMAT_SUPPORT_VIDEO_PROCESSOR_OUTPUT) == formats[i].target && !!(support & D3D11_FORMAT_SUPPORT_MIP) == (f == DXGI_FORMAT_AYUV || f == DXGI_FORMAT_Y416),
            "CheckFormatSupport(%s): a 2D texture, sampled, a decoder's output, the processor's input%s", name, formats[i].target ? " and output, a render target" : "");
     /* made with its contents, read back byte for byte */
     BYTE rows[16 * 8 * 8], back[16 * 8 * 8];
@@ -1260,7 +1260,7 @@ static void test_packed_yuv(void) {
   HRESULT hr = S_OK;
   ID3D11Texture2D *odd = texture(15, 8, 1, DXGI_FORMAT_YUY2, D3D11_USAGE_DEFAULT, D3D11_BIND_SHADER_RESOURCE, 0, NULL, &hr);
   check(!odd && hr == E_INVALIDARG, "a YUY2 texture of odd width: E_INVALIDARG");
-  /* levels: AYUV's (and Y416's, which Direct3D 12 below has not: the kernel's 16-bit images have one level), none of the others' (DXGI's tables) */
+  /* levels: AYUV's and Y416's (the kernel keeps levels of its 16-bit images: kFeature2MipmappedLayers), none of the others' (DXGI's tables) */
   D3D11_TEXTURE2D_DESC mips = {16, 16, 2, 1, DXGI_FORMAT_AYUV, {1, 0}, D3D11_USAGE_DEFAULT, D3D11_BIND_SHADER_RESOURCE, 0, 0};
   ID3D11Texture2D *m = NULL;
   {
@@ -1291,10 +1291,12 @@ static void test_packed_yuv(void) {
   mips.Format = DXGI_FORMAT_YUY2;
   check(ID3D11Device_CreateTexture2D(g_device, &mips, NULL, &m) == E_INVALIDARG && !m, "a YUY2 texture of two levels: E_INVALIDARG");
   mips.Format = DXGI_FORMAT_Y416;
-  check(ID3D11Device_CreateTexture2D(g_device, &mips, NULL, &m) == DXGI_ERROR_UNSUPPORTED && !m, "a Y416 texture of two levels: DXGI_ERROR_UNSUPPORTED (no 16-bit levels below)");
+  check(SUCCEEDED(ID3D11Device_CreateTexture2D(g_device, &mips, NULL, &m)) && m, "a Y416 texture of two levels");
+  if (m) { ID3D11Texture2D_Release(m); m = NULL; }
   mips.Format = DXGI_FORMAT_AYUV;
   mips.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
-  check(ID3D11Device_CreateTexture2D(g_device, &mips, NULL, &m) == DXGI_ERROR_UNSUPPORTED && !m, "an AYUV render target of two levels: DXGI_ERROR_UNSUPPORTED");
+  check(SUCCEEDED(ID3D11Device_CreateTexture2D(g_device, &mips, NULL, &m)) && m, "an AYUV render target of two levels (drawn into at a level below)");
+  if (m) { ID3D11Texture2D_Release(m); m = NULL; }
   if (m) ID3D11Texture2D_Release(m);
   UINT support = 0;
   check(ID3D11Device_CheckFormatSupport(g_device, DXGI_FORMAT_P208, &support) == E_FAIL && !support, "CheckFormatSupport(P208): not a Direct3D 11 format, E_FAIL");

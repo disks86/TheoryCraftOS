@@ -68,16 +68,22 @@ class Allocation {
   bool can_be_resident() const { return !is_staging() && !is_query_result() && !is_constant_buffer() && !is_heap(); }
   bool resident() const { return image_ != nullptr || buffer_ != nullptr; }
   uint32_t mip_levels() const { return desc_.mip_levels; }
-  // The 2D images of the allocation (1 for a plain texture); they follow each other in the backing, each width * height pixels.
-  uint32_t layers() const { return desc_.kind == graphics::TextureKind::Texture2D ? 1 : desc_.layers; }
+  // The 2D images of level 0 of the allocation (1 for a plain texture, 6 a cube); they follow each other in the backing, each width * height pixels.
+  uint32_t layers() const { return graphics::image_layer_count(desc_.kind, desc_.layers); }
+  // ... and of level `level` (a volume's levels are half as deep each).
+  uint32_t level_layers(uint32_t level) const { return graphics::level_layer_count(desc_.kind, desc_.layers, level); }
   graphics::TextureKind texture_kind() const { return desc_.kind; }
   uint32_t pitch() const { return is_image() ? desc_.width * pixel_bytes(desc_.format) : 0; }
 
   // The system-memory backing (empty for depth images). Little-endian words in desc().format's layout; the levels of a mipmapped texture follow each other.
   ConstByteView backing() const { return cpu_; }
   ByteView writable_backing() { return cpu_; }
-  // Where level `level` starts in the backing and how many bytes it has; false for a level the allocation does not have.
+  // Where level `level` starts in the backing and how many bytes it has (all its layers, one after the other); false for a level the allocation does not have.
+  // The backing holds the levels one after the other, each level its layers (a volume's level: its slices there) one after the other.
   bool level_range(uint32_t level, uint64_t* offset, uint64_t* bytes) const;
+  // The same for one layer of a level (a subresource), and the bytes one layer of a level has (image_level_bytes of its size).
+  bool subresource_range(uint32_t level, uint32_t layer, uint64_t* offset, uint64_t* bytes) const;
+  uint64_t subresource_bytes(uint32_t level) const;
 
   // A stream output buffer: how far the last stream output into it got (an offset in the buffer).
   uint64_t stream_output_filled() const { return buffer_ ? buffer_->stream_output_filled() : so_filled_; }
@@ -123,6 +129,7 @@ class Allocation {
   uint64_t version_ = 0;
   struct MirrorSource {
     SharedPointer<Allocation> source;
+    uint32_t level = 0, layer = 0;  // the subresource of the source the mirror's layer shows (level 0 of a 2D image)
     uint64_t seen = ~uint64_t{0};   // the source's version the mirror's layer was copied from (none yet)
   };
   List<MirrorSource> mirror_sources_;   // a mirror: its layers' sources, in order
@@ -180,7 +187,9 @@ class VidMm {
   // gives the `channels` the GPU drew into the mirror back to its one source once the pass that drew is over (a render target of that integer view). The kernel's devices
   // have no views of other formats or of several images, so a mirror is a copy: command streams bring it up to date (refresh_mirror) before it is sampled or drawn into.
   // An empty `sources` makes it an ordinary image again. kInvalidParameter for images that cannot be mirrored so.
-  NtStatus set_mirror(Allocation& mirror, ArrayView<const SharedPointer<Allocation>> sources, uint32_t mode, uint32_t channels);
+  // `subresources` (with graphics::kFeature2MipmappedLayers; empty: level 0 of each 2D source) names the subresource of each source the layer shows: its level in the low 16 bits,
+  // its layer (a volume's slice at that level) in the high 16 - a level and layer of an array, a cube or a volume, or a level of a 2D texture, of the mirror's size.
+  NtStatus set_mirror(Allocation& mirror, ArrayView<const SharedPointer<Allocation>> sources, uint32_t mode, uint32_t channels, ArrayView<const uint32_t> subresources = ArrayView<const uint32_t>());
   // Whether bringing the mirror up to date needs a source's contents back from the GPU (the GPU must have run what was recorded first: refresh_mirror then reads them).
   bool mirror_needs_read_back(const Allocation& mirror) const;
   // Copies the sources that changed since their last copy into the mirror. A source whose newest contents are still on the GPU is read back when `may_read_back`, else left as

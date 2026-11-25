@@ -75,7 +75,9 @@ class IWaitHook {
 //   WriteDescriptors        heap, count, then per descriptor 14 words: index, kind (a DescriptorKind: 0 clear, 1 SRV, 2 UAV, 3 CBV, 4 sampler, 5 UAV of a texture), allocation handle, offset (lo, hi),
 //                           size (lo, hi), and the sampler: filter, address_u, address_v, mip_filter, lod_bias (float), min_lod, max_lod. A UAV of a texture has its level in the offset's low word,
 //                           its first layer in the high word, its layer count in the size's low word and the format of the view in the high word (a Format: 0 the allocation's own,
-//                           another wide format of the same pixel size for a wide allocation); its sampler words are zeros
+//                           another wide format of the same pixel size for a wide allocation); its sampler words are zeros. A shader resource view of a texture has its view in the
+//                           offset words (graphics::kFeature2MipmappedLayers): the first level in bits 0-15 and the count of levels in 16-31 of the low word, the first layer and the count
+//                           of layers likewise in the high word (counts of 0: to the last; all zeros: the whole texture)
 //   CopyDescriptors         destination heap, destination index, source heap, source index, count
 //   UpdateTileMappings      reserved allocation, first tile, heap (0: unmap), heap offset (lo, hi), tile count
 //   QueryStreamOutput       allocation handle (a stream output buffer)                                                                 reply: how far stream output got in it (an offset, lo, hi)
@@ -86,7 +88,8 @@ enum class EscapeOp : uint32_t {
   // Video decoding: CreateVideoDecoder (profile, width, height, surfaces, surface_format -> handle), DestroyVideoDecoder (handle), QueryVideoDecodeSupport (profile,
   // surface_format, width, height -> 1 or 0); surface_format is VideoDecoderDesc's (0 NV12 and 1 P010, as the ten_bit word that was there before)
   CreateVideoDecoder = 15, DestroyVideoDecoder = 16, QueryVideoDecodeSupport = 17,
-  // SetMirror (mirror, mode, channels, count, count source allocations): VidMm::set_mirror - the mirror shows the sources (count 0: no longer a mirror)
+  // SetMirror (mirror, mode, channels, count, count source allocations [, count subresources: level | layer << 16]): VidMm::set_mirror - the mirror shows the sources (count 0: no
+  // longer a mirror), each a subresource of it when the words follow (graphics::kFeature2MipmappedLayers), else level 0 of a 2D one
   SetMirror = 18,
 };
 
@@ -244,7 +247,7 @@ class Kernel {
   // Reserved buffers (kAllocReserved): `tile_count` tiles of 64 KiB from `first_tile` go to `heap_offset` (a multiple of 64 KiB) of the heap on; heap 0 unmaps them.
   NtStatus update_tile_mappings(ProcessId pid, Handle reserved, uint32_t first_tile, Handle heap, uint64_t heap_offset, uint32_t tile_count);
   // Mirrors (VidMm::set_mirror): `mirror` shows the allocations `sources`, all of one device, with the kMirror* `mode` (a write-back one gives `channels` back).
-  NtStatus set_mirror(ProcessId pid, Handle mirror, uint32_t mode, uint32_t channels, ArrayView<const Handle> sources);
+  NtStatus set_mirror(ProcessId pid, Handle mirror, uint32_t mode, uint32_t channels, ArrayView<const Handle> sources, ArrayView<const uint32_t> subresources = ArrayView<const uint32_t>());
   // Video decoders (DxgTypes.hpp VideoDecoderDesc; decoding is the stream's DecodeFrame). kNotSupported for a profile, format or size the decoders do not take - what
   // video_decode_supported says beforehand.
   NtStatus create_video_decoder(ProcessId pid, Handle device, const VideoDecoderDesc& desc, Handle* decoder);

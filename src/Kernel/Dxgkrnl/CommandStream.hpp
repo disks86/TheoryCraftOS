@@ -27,18 +27,26 @@
 //                    [with kPassLayers in the flags, last: for each colour target and then the depth buffer its first layer and its layer count - 2 * (targets + 1) words (the adapter's
 //                    kFeature2LayeredTargets: targets that are arrays, volumes or cubes; a primitive goes to the layer its SV_RenderTargetArrayIndex names, the first when that is past
 //                    the target's count; a 2D image's is layer 0 of 1, and the depth pair of a pass without one is 0, 1)]
+//                    [with kPassLevels in the flags, after those: the level of each colour target and then of the depth buffer - targets + 1 words (the adapter's kFeature2MipmappedLayers: the pass
+//                    draws into that level of each, all of one size, the pass's; the layers above are the level's layers - a volume's level has fewer slices -; 0 for the depth of a pass without one)]
 //   EndPass
 //   BindPipeline     pipeline handle
 //   BindVertexBuffer allocation_index, offset
 //   BindIndexBuffer  allocation_index, index_type (0: 16 bit, 1: 32 bit), offset
 //   PushConstants    byte_count (a multiple of 16, at most the adapter's max_push_constant_bytes: 128 for most, 4096 for the CPU renderer and virgl), then the bytes padded to a whole word
 //   BindTexture      unit, allocation_index, filter, address_u, address_v (address_word() of DxgTypes.hpp: the mode, and the border colour in address_u), mip_filter, lod_bias, min_lod, max_lod (floats)
+//                    [, base_level, level_count, first_layer, layer_count]   (a view, the adapter's kFeature2MipmappedLayers: the unit shows those levels and layers - a count of 0: to the last -,
+//                    a volume all its slices; its kind is the one the shader declares: graphics::texture_view_fits says which an image may have - an array's slice as a 2D texture, six
+//                    layers of an array as a cube, a cube or a cube array as an array, ...; a pass may sample levels and layers of its targets it does not draw into)
 //   SetViewport      x, y, width, height, min_depth, max_depth (floats)
 //   SetScissor       x, y, width, height (x and y signed)
 //   Draw             vertex_count, first_vertex
 //   DrawIndexed      index_count, first_index, vertex_offset (signed)
-//   CopyRegion       dst_index, dst_x, dst_y, src_index, src_x, src_y, width, height   (colour images of one format; also staging memory)
-//   GenerateMipmaps  allocation_index
+//   CopyRegion       dst_index, dst_x, dst_y, src_index, src_x, src_y, width, height   (colour images of one format, or of two whose pixels - or blocks - are as many bytes; also staging memory)
+//                    [, dst_level, dst_layer, src_level, src_layer, layer_count]   (between subresources: the rectangle of layer_count layers - a volume's slices - from those of the
+//                    levels; levels other than 0 of a layered image, and block-compressed images - whole blocks, as CopyBufferImage -, need the adapter's kFeature2MipmappedLayers)
+//   GenerateMipmaps  allocation_index   (every level from level 0 by the box filter; with kFeature2MipmappedLayers also of an array's or a cube's layers, a volume - 2 x 2 x 2 - and the wide formats; not
+//                    of block-compressed or integer textures)
 //   BeginQuery       allocation_index, offset [, kind]   (kind: a graphics::QueryKind, 0 occlusion count if left out, 1 occlusion predicate, 2 IA vertices, 3 IA primitives, 4 VS invocations, 5 PS invocations, 6 timestamp (kFeatureTimestampQueries; ns, read when the query ends),
 //                    7 / 8 stream output primitives written / needed (both kFeatureStatisticsQueries and kFeatureStreamOutput; bits 8-9 of the kind word say which output stream); the others need kFeatureStatisticsQueries. An occlusion query, the adapter's kFeatureOcclusionQueries: inside a pass; the allocation is a kAllocQueryResult buffer and `offset` a multiple of 8
 //                    with 8 bytes room. One query is open at a time and it ends before the pass does; at most kMaxOcclusionQueries per stream)
@@ -186,7 +194,7 @@ constexpr uint32_t kStreamOutputAppendOffset = 0xFFFFFFFFu;   // SetStreamOutput
 constexpr uint32_t kMaxPacketWords = 1 + (1 + graphics::kMaxPushConstantBytes / 4 > kVideoProcessMaxWords ? 1 + graphics::kMaxPushConstantBytes / 4 : kVideoProcessMaxWords);
 constexpr uint64_t kMaxCommandBytes = 16 * 1024 * 1024;
 
-enum BeginPassFlags : uint32_t { kPassClearColor = 1u << 0, kPassClearDepth = 1u << 1, kPassClearStencil = 1u << 2, kPassLayers = 1u << 3 };
+enum BeginPassFlags : uint32_t { kPassClearColor = 1u << 0, kPassClearDepth = 1u << 1, kPassClearStencil = 1u << 2, kPassLayers = 1u << 3, kPassLevels = 1u << 4 };
 
 inline uint32_t float_bits(float f) { return __builtin_bit_cast(uint32_t, f); }
 inline float bits_float(uint32_t w) { return __builtin_bit_cast(float, w); }
@@ -219,6 +227,17 @@ class CommandWriter {
     for (uint32_t w : extra) ok_ &= bytes_.put32(w);
     for (uint32_t w : layers) ok_ &= bytes_.put32(w);
   }
+  // A pass that draws into levels of its targets (kPassLevels, and kPassLayers when `layers` is not empty): `levels` has the level of each colour target and then of the depth buffer.
+  void begin_pass_levels(uint32_t color, std::initializer_list<uint32_t> extra, uint32_t depth, uint32_t flags, graphics::Vec4 clear_color, float clear_depth, uint32_t clear_stencil,
+                         std::initializer_list<uint32_t> layers, std::initializer_list<uint32_t> levels) {
+    ok_ &= bytes_.put32(static_cast<uint32_t>(Op::BeginPass) | ((10 + static_cast<uint32_t>(extra.size() + layers.size() + levels.size())) << 16));
+    for (uint32_t w : {color, depth, flags | kPassLevels | (layers.size() ? kPassLayers : 0u), float_bits(clear_color.x), float_bits(clear_color.y), float_bits(clear_color.z), float_bits(clear_color.w),
+                       float_bits(clear_depth), clear_stencil})
+      ok_ &= bytes_.put32(w);
+    for (uint32_t w : extra) ok_ &= bytes_.put32(w);
+    for (uint32_t w : layers) ok_ &= bytes_.put32(w);
+    for (uint32_t w : levels) ok_ &= bytes_.put32(w);
+  }
   void end_pass() { packet(Op::EndPass, {}); }
   void bind_pipeline(Handle pipeline) { packet(Op::BindPipeline, {pipeline}); }
   void bind_vertex_buffer(uint32_t allocation, uint32_t offset = 0) { packet(Op::BindVertexBuffer, {allocation, offset}); }
@@ -234,6 +253,11 @@ class CommandWriter {
     packet(Op::BindTexture, {unit, allocation, static_cast<uint32_t>(s.filter), address_word(s.address_u, s.border), address_word(s.address_v), static_cast<uint32_t>(s.mip_filter),
                              float_bits(s.lod_bias), float_bits(s.min_lod), float_bits(s.max_lod)});
   }
+  // The same through a view (kFeature2MipmappedLayers): levels base_level .., layers first_layer .. (counts of 0: to the last).
+  void bind_texture_view(uint32_t unit, uint32_t allocation, const graphics::SamplerDesc& s, uint32_t base_level, uint32_t level_count, uint32_t first_layer, uint32_t layer_count) {
+    packet(Op::BindTexture, {unit, allocation, static_cast<uint32_t>(s.filter), address_word(s.address_u, s.border), address_word(s.address_v), static_cast<uint32_t>(s.mip_filter),
+                             float_bits(s.lod_bias), float_bits(s.min_lod), float_bits(s.max_lod), base_level, level_count, first_layer, layer_count});
+  }
   void set_viewport(const graphics::Viewport& v) { packet(Op::SetViewport, {float_bits(v.x), float_bits(v.y), float_bits(v.width), float_bits(v.height), float_bits(v.min_depth), float_bits(v.max_depth)}); }
   void set_scissor(const graphics::Rect2D& r) { packet(Op::SetScissor, {static_cast<uint32_t>(r.x), static_cast<uint32_t>(r.y), r.width, r.height}); }
   void set_topology(Topology topology) { packet(Op::SetTopology, {static_cast<uint32_t>(topology)}); }
@@ -246,6 +270,10 @@ class CommandWriter {
   void draw_indexed(uint32_t index_count, uint32_t first_index = 0, int32_t vertex_offset = 0) { packet(Op::DrawIndexed, {index_count, first_index, static_cast<uint32_t>(vertex_offset)}); }
   void copy_region(uint32_t dst, uint32_t dst_x, uint32_t dst_y, uint32_t src, uint32_t src_x, uint32_t src_y, uint32_t width, uint32_t height) {
     packet(Op::CopyRegion, {dst, dst_x, dst_y, src, src_x, src_y, width, height});
+  }
+  void copy_subresource_region(uint32_t dst, uint32_t dst_level, uint32_t dst_layer, uint32_t dst_x, uint32_t dst_y, uint32_t src, uint32_t src_level, uint32_t src_layer, uint32_t src_x,
+                               uint32_t src_y, uint32_t width, uint32_t height, uint32_t layer_count = 1) {
+    packet(Op::CopyRegion, {dst, dst_x, dst_y, src, src_x, src_y, width, height, dst_level, dst_layer, src_level, src_layer, layer_count});
   }
   void generate_mipmaps(uint32_t allocation) { packet(Op::GenerateMipmaps, {allocation}); }
   // `kind`: a graphics::QueryKind (0, the occlusion count, when it is left out: the packet then has two words)

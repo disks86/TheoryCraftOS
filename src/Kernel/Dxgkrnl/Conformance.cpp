@@ -59,6 +59,7 @@ class Rig {
   NtStatus status() const { return status_; }
   const char* where() const { return where_; }
   bool has(uint32_t feature) const { return (caps_.features & feature) == feature; }
+  bool has2(uint32_t feature) const { return (caps_.features2 & feature) == feature; }
 
   bool step(const char* name, NtStatus s) {
     if (s != status::kSuccess && status_ == status::kSuccess) status_ = s, where_ = name;
@@ -119,6 +120,14 @@ class Rig {
     const bool copied = lock.data.copy_from(contents);
     kernel_.unlock(kProcess, a);
     step("write", copied ? status::kSuccess : status::kInvalidParameter);
+  }
+  // The contents of level `level` (all its layers, one after the other).
+  void write_level(Handle a, uint32_t level, ConstByteView contents) {
+    LockResult lock;
+    if (!step("lock (level)", ok() ? kernel_.lock(kProcess, a, kLockDiscard, level, &lock) : status_)) return;
+    const bool copied = lock.data.copy_from(contents);
+    kernel_.unlock(kProcess, a);
+    step("write (level)", copied ? status::kSuccess : status::kInvalidParameter);
   }
   // Reads a kSize x kSize image.
   void read(Handle a, ArrayView<uint32_t> out) {
@@ -2778,6 +2787,225 @@ void scene_dxil_tess_stores(Rig& rig, ArrayView<uint32_t> out) {
   for (uint32_t& pixel : out) pixel ^= (pa != 1 ? 0x00FF0000u : 0) | ((po & 0xFFFFFFFFu) != 12 ? 0x0000FF00u : 0) | ((su & 0xFFFFFFFFu) != 4000 ? 0x000000FFu : 0) | (po >> 32 ? 0x01000000u : 0);
 }
 
+
+// --- Levels of layered images (kFeature2MipmappedLayers) ---------------------------------------------------------------------------------------------------------------------
+
+// A layered texture of `layers` layers (a volume's slices), w x w, `levels` levels: each level and layer its own colour with a gradient across it (as layered_texture's), written level by level.
+Handle leveled_texture(Rig& rig, graphics::TextureKind kind, uint32_t layers, uint32_t w, uint32_t levels, uint32_t flags = kAllocTexture) {
+  AllocationDesc d;
+  d.flags = flags, d.format = Format::A8R8G8B8, d.width = d.height = w, d.kind = kind, d.layers = layers, d.mip_levels = levels;
+  Handle texture = rig.create(d);
+  for (uint32_t level = 0; level < levels; ++level) {
+    const uint32_t lw = graphics::mip_extent(w, level), count = graphics::level_layer_count(kind, layers, level);
+    ByteBuffer bytes(rig.allocator());
+    for (uint32_t layer = 0; layer < count; ++layer)
+      for (uint32_t y = 0; y < lw; ++y)
+        for (uint32_t x = 0; x < lw; ++x) {
+          // (the layer picks the hue, the level the brightness of blue; red rises to the right, green falls downwards)
+          const uint32_t red = 60 + 190 * x / lw, green = 230 - 180 * y / lw, hue = (layer * 0x35u) & 0xFF, blue = (level * 0x50u + 0x20u) & 0xFF;
+          bytes.put32(0xFF000000u | ((red ^ hue) & 0xFF) << 16 | (green & 0xFF) << 8 | (blue ^ (hue >> 1)));
+        }
+    rig.write_level(texture, level, bytes.view());
+  }
+  return texture;
+}
+
+// A quad over the pixels [x0, x1) x [y0, y1) as quad_pixels', with the vertex alpha `a` (a cube array's cube: a * 10).
+template <typename Coord>
+void quad_pixels_alpha(Vertex* v, float x0, float y0, float x1, float y1, float a, Coord coord) {
+  quad_pixels(v, x0, y0, x1, y1, coord);
+  for (uint32_t k = 0; k < 6; ++k) v[k].a = a;
+}
+
+// One draw of `quads` quads of `vertices` with a pixel shader, a texture seen through a view (counts of 0: to the last) and a sampler that reads the nearest level, into `target`.
+struct ViewDraw {
+  const uint8_t* ps;
+  uint32_t ps_size;
+  uint32_t first_quad, quads;
+  uint32_t base_level, level_count, first_layer, layer_count;
+};
+void draw_views(Rig& rig, ArrayView<uint32_t> out, Handle texture, const Vertex* vertices, uint32_t quads, const ViewDraw* draws, uint32_t draw_count) {
+  namespace b = conformance_blobs;
+  Handle target = rig.image(kAllocRenderTarget, Format::A8R8G8B8, kSize, kSize);
+  Handle vb = rig.buffer(kAllocVertexBuffer, bytes_of(vertices, sizeof(Vertex) * 6 * quads));
+  graphics::SamplerDesc sampler;
+  sampler.filter = graphics::Filter::Nearest;
+  sampler.mip_filter = graphics::MipFilter::Nearest;
+  sampler.address_u = sampler.address_v = graphics::AddressMode::ClampToEdge;
+  Handle pipes[8] = {};
+  for (uint32_t i = 0; i < draw_count && i < 8; ++i) pipes[i] = dxbc_pipeline(rig, b::k_vs_vol, sizeof b::k_vs_vol, draws[i].ps, draws[i].ps_size, 1);
+  CommandWriter w(rig.allocator());
+  begin(w, 0, kNoAllocation, {0, 0, 0, 1});
+  w.bind_vertex_buffer(1);
+  for (uint32_t i = 0; i < draw_count && i < 8; ++i) {
+    w.bind_pipeline(pipes[i]);
+    w.push_constants(bytes_of(kIdentity, sizeof kIdentity));
+    w.bind_texture_view(0, 2, sampler, draws[i].base_level, draws[i].level_count, draws[i].first_layer, draws[i].layer_count);
+    w.draw(6 * draws[i].quads, 6 * draws[i].first_quad);
+  }
+  w.end_pass();
+  rig.render(w, {target, vb, texture});
+  rig.read(target, out);
+}
+
+// An array of three layers of 8 x 8 and four levels: SampleLevel 1 of each layer (ps_texarray_lod), and level 2 by a view from level 1 (Sample of its first level, ps_texarray), in bands.
+void scene_array_levels(Rig& rig, ArrayView<uint32_t> out) {
+  if (!rig.has2(graphics::kFeature2MipmappedLayers)) return void(rig.step("levels of arrays", status::kNotSupported));
+  namespace b = conformance_blobs;
+  Handle texture = leveled_texture(rig, graphics::TextureKind::Texture2DArray, 3, 8, 4);
+  Vertex v[36];
+  for (uint32_t i = 0; i < 3; ++i) {
+    quad_pixels(v + 6 * i, static_cast<float>(i * 10) + 1.2f, 0, static_cast<float>(i * 10) + 10.8f, 15.6f, [i](float u, float vv) { return graphics::Vec3{u, vv, static_cast<float>(i)}; });
+    quad_pixels(v + 18 + 6 * i, static_cast<float>(i * 10) + 1.2f, 16.4f, static_cast<float>(i * 10) + 10.8f, 32, [i](float u, float vv) { return graphics::Vec3{u, vv, static_cast<float>(i)}; });
+  }
+  const ViewDraw draws[2] = {{b::k_ps_texarray_lod, sizeof b::k_ps_texarray_lod, 0, 3, 0, 0, 0, 0}, {b::k_ps_texarray, sizeof b::k_ps_texarray, 3, 3, 1, 1, 0, 0}};
+  draw_views(rig, out, texture, v, 6, draws, 2);
+}
+
+// Views of another kind: a slice of a mipmapped array as a 2D texture (ps_texslice; level 1 by the view), its layers 1 .. as an array (the layer coordinate counts from the view's first),
+// and six layers of an eight-layer array as a cube (ps_texcube).
+void scene_texture_views(Rig& rig, ArrayView<uint32_t> out) {
+  if (!rig.has2(graphics::kFeature2MipmappedLayers)) return void(rig.step("texture views", status::kNotSupported));
+  namespace b = conformance_blobs;
+  Handle texture = leveled_texture(rig, graphics::TextureKind::Texture2DArray, 8, 8, 2);
+  Vertex v[6 * 9];
+  quad_pixels(v, 1.2f, 1.2f, 15.6f, 15.6f, [](float u, float vv) { return graphics::Vec3{u, vv, 0}; });   // (slice 2, level 1)
+  quad_pixels(v + 6, 16.4f, 1.2f, 30.8f, 15.6f, [](float u, float vv) { return graphics::Vec3{u, vv, 1}; });   // (layers from 1: layer 2)
+  for (uint32_t face = 0; face < 6; ++face) {   // (layers 2 .. 7 as the faces of a cube)
+    const float x0 = static_cast<float>(1 + (face % 3) * 10), y0 = static_cast<float>(16 + face / 3 * 8);
+    quad_pixels(v + 6 * (2 + face), x0, y0, x0 + 10, y0 + 8, [face](float u, float vv) {
+      const float a = -0.8f + 1.6f * u, c = -0.8f + 1.6f * vv, axis = face % 2 ? -1.0f : 1.0f;
+      return face < 2 ? graphics::Vec3{axis, c, a} : face < 4 ? graphics::Vec3{a, axis, c} : graphics::Vec3{a, c, axis};
+    });
+  }
+  const ViewDraw draws[3] = {{b::k_ps_texslice, sizeof b::k_ps_texslice, 0, 1, 1, 1, 2, 1}, {b::k_ps_texarray, sizeof b::k_ps_texarray, 1, 1, 0, 0, 1, 0},
+                             {b::k_ps_texcube, sizeof b::k_ps_texcube, 2, 6, 0, 1, 2, 6}};
+  draw_views(rig, out, texture, v, 8, draws, 3);
+}
+
+// A cube array of two cubes, 4 x 4, two levels: the six faces of cube 1 (alpha 0.1: ps_texcubearray takes the cube from it) in the top half, and those of cube 0 in the bottom half;
+// or (`lod`) the same at level 1 (ps_texcubearray_lod).
+void cube_array(Rig& rig, ArrayView<uint32_t> out, bool lod) {
+  if (!rig.has2(graphics::kFeature2MipmappedLayers)) return void(rig.step("cube arrays", status::kNotSupported));
+  namespace b = conformance_blobs;
+  Handle texture = leveled_texture(rig, graphics::TextureKind::TextureCubeArray, 12, 4, 2);
+  Vertex v[72];
+  for (uint32_t half = 0; half < 2; ++half)
+    for (uint32_t face = 0; face < 6; ++face) {
+      const float x0 = static_cast<float>(1 + (face % 3) * 10), y0 = static_cast<float>(half * 16 + face / 3 * 8);
+      // (ps_texcubearray's direction is the coordinate * 2 - 1)
+      quad_pixels_alpha(v + 6 * (half * 6 + face), x0, y0, x0 + 10, y0 + 8, half == 0 ? 0.1f : 0.0f, [face](float u, float vv) {
+        const float a = 0.13f + 0.8f * u, c = 0.13f + 0.8f * vv, axis = face % 2 ? 0.0f : 1.0f;   // (no pixel centre on a texel boundary)
+        return face < 2 ? graphics::Vec3{axis, c, a} : face < 4 ? graphics::Vec3{a, axis, c} : graphics::Vec3{a, c, axis};
+      });
+    }
+  const ViewDraw sample[1] = {{b::k_ps_texcubearray, sizeof b::k_ps_texcubearray, 0, 12, 0, 0, 0, 0}}, level[1] = {{b::k_ps_texcubearray_lod, sizeof b::k_ps_texcubearray_lod, 0, 12, 0, 0, 0, 0}};
+  if (lod) draw_views(rig, out, texture, v, 12, level, 1);
+  else draw_views(rig, out, texture, v, 12, sample, 1);
+}
+void scene_cube_array(Rig& rig, ArrayView<uint32_t> out) { cube_array(rig, out, false); }
+void scene_cube_array_level(Rig& rig, ArrayView<uint32_t> out) { cube_array(rig, out, true); }
+
+// A volume of 8 x 8 x 4, three levels: level 1 (two slices) by SampleLevel 1 (ps_tex3d_lod), one slice across the top half and the depth running down the bottom half.
+void scene_volume_levels(Rig& rig, ArrayView<uint32_t> out) {
+  if (!rig.has2(graphics::kFeature2MipmappedLayers)) return void(rig.step("levels of volumes", status::kNotSupported));
+  namespace b = conformance_blobs;
+  Handle texture = leveled_texture(rig, graphics::TextureKind::Texture3D, 4, 8, 3);
+  Vertex v[12];
+  quad_pixels(v, 0, 0, 32, 16, [](float u, float vv) { return graphics::Vec3{u, vv, 0.7f}; });
+  quad_pixels(v + 6, 0, 16, 32, 32, [](float u, float vv) { return graphics::Vec3{u, 0.3f, vv * 0.9f + 0.05f}; });
+  const ViewDraw draws[1] = {{b::k_ps_tex3d_lod, sizeof b::k_ps_tex3d_lod, 0, 2, 0, 0, 0, 0}};
+  draw_views(rig, out, texture, v, 2, draws, 1);
+}
+
+// Drawing into levels: a render target array of 16 x 16, two layers, three levels. Layer 1 of level 1 is cleared to a colour, level 2 of layer 0 gets a triangle (and its other half the
+// clear colour), level 1 of layer 0 is drawn from level 0 of the same image (a view of level 0 alone, sampled while level 1 is the target); then the levels are shown by SampleLevel.
+void scene_draw_into_levels(Rig& rig, ArrayView<uint32_t> out) {
+  if (!rig.has2(graphics::kFeature2MipmappedLayers | graphics::kFeature2LayeredTargets)) return void(rig.step("drawing into levels", status::kNotSupported));
+  namespace b = conformance_blobs;
+  Handle texture = leveled_texture(rig, graphics::TextureKind::Texture2DArray, 2, 16, 3, kAllocTexture | kAllocRenderTarget);
+  Handle flat = d3d9_pipeline(rig, false, false);
+  Handle copy = dxbc_pipeline(rig, b::k_vs_vol, sizeof b::k_vs_vol, b::k_ps_texslice, sizeof b::k_ps_texslice, 1);
+  Vertex tri[3] = {{-1, -1, 0.5f, 1, 0.5f, 0, 1}, {1, -1, 0.5f, 0, 0.5f, 1, 1}, {-1, 1, 0.5f, 0.2f, 1, 0.2f, 1}};
+  Vertex full[6];
+  quad_pixels(full, 0, 0, 32, 32, [](float u, float vv) { return graphics::Vec3{u, 1.0f - vv, 0}; });   // (the whole target, the texture turned over)
+  Handle tvb = rig.buffer(kAllocVertexBuffer, bytes_of(tri, sizeof tri)), fvb = rig.buffer(kAllocVertexBuffer, bytes_of(full, sizeof full));
+  graphics::SamplerDesc nearest;
+  nearest.filter = graphics::Filter::Nearest;
+  nearest.address_u = nearest.address_v = graphics::AddressMode::ClampToEdge;
+  CommandWriter w(rig.allocator());
+  w.begin_pass_levels(0, {}, kNoAllocation, kPassClearColor, {0.8f, 0.1f, 0.6f, 1}, 1, 0, {1, 1, 0, 1}, {1, 0});
+  w.end_pass();
+  w.begin_pass_levels(0, {}, kNoAllocation, kPassClearColor, {0.1f, 0.3f, 0.9f, 1}, 1, 0, {0, 1, 0, 1}, {2, 0});
+  w.bind_pipeline(flat);
+  w.bind_vertex_buffer(1);
+  w.push_constants(bytes_of(kIdentity, sizeof kIdentity));
+  w.draw(3);
+  w.end_pass();
+  w.begin_pass_levels(0, {}, kNoAllocation, 0, {0, 0, 0, 0}, 1, 0, {0, 1, 0, 1}, {1, 0});
+  w.bind_pipeline(copy);
+  w.bind_vertex_buffer(2);
+  w.push_constants(bytes_of(kIdentity, sizeof kIdentity));
+  w.bind_texture_view(0, 0, nearest, 0, 1, 0, 1);
+  w.draw(6);
+  w.end_pass();
+  rig.render(w, {texture, tvb, fvb});
+  // (shown: level 1 of each layer and level 2 of layer 0, in bands)
+  Vertex v[18];
+  for (uint32_t i = 0; i < 2; ++i)
+    quad_pixels(v + 6 * i, static_cast<float>(i * 10) + 1.2f, 0, static_cast<float>(i * 10) + 10.8f, 32, [i](float u, float vv) { return graphics::Vec3{u, vv, static_cast<float>(i)}; });
+  quad_pixels(v + 12, 21.2f, 0, 30.8f, 32, [](float u, float vv) { return graphics::Vec3{u, vv, 0}; });
+  const ViewDraw draws[2] = {{b::k_ps_texarray_lod, sizeof b::k_ps_texarray_lod, 0, 2, 0, 0, 0, 0}, {b::k_ps_texarray_lod, sizeof b::k_ps_texarray_lod, 2, 1, 1, 0, 0, 0}};
+  draw_views(rig, out, texture, v, 3, draws, 2);
+}
+
+// Load and GetDimensions of level 1 of an array of 8 x 8, three layers, three levels (ps_texelarray_level): texels of each layer in the top half, the level's size, the layers and the
+// levels (each / 16) in the bottom half - of the whole and of a view from level 1 and layer 1.
+void scene_array_level_texels(Rig& rig, ArrayView<uint32_t> out) {
+  if (!rig.has2(graphics::kFeature2MipmappedLayers) || !rig.has(graphics::kFeatureTexelAccess)) return void(rig.step("texels of levels", status::kNotSupported));
+  namespace b = conformance_blobs;
+  Handle texture = leveled_texture(rig, graphics::TextureKind::Texture2DArray, 3, 8, 3);
+  Vertex v[30];
+  for (uint32_t i = 0; i < 3; ++i)
+    quad_pixels_alpha(v + 6 * i, static_cast<float>(i * 10) + 1.2f, 0, static_cast<float>(i * 10) + 10.8f, 15.6f, 1.0f, [i](float u, float vv) { return graphics::Vec3{u, vv, static_cast<float>(i)}; });
+  quad_pixels_alpha(v + 18, 0, 16.4f, 15.6f, 32, 0.0f, [](float u, float vv) { return graphics::Vec3{u, vv, 0}; });
+  quad_pixels_alpha(v + 24, 16.4f, 16.4f, 32, 32, 0.0f, [](float u, float vv) { return graphics::Vec3{u, vv, 0}; });
+  const ViewDraw draws[2] = {{b::k_ps_texelarray_level, sizeof b::k_ps_texelarray_level, 0, 4, 0, 0, 0, 0}, {b::k_ps_texelarray_level, sizeof b::k_ps_texelarray_level, 4, 1, 1, 0, 1, 0}};
+  draw_views(rig, out, texture, v, 5, draws, 2);
+}
+
+// Storage images of levels of a cube: a compute shader (cs_uav_array: (x / 8, y / 8, layer / layers, 1)) writes level 1 of the six faces of an 8 x 8 cube as an array of six, and
+// level 0 of faces 2 .. 3; the cube is then sampled through a view of level 1 (top half: the six faces) and of level 0 (bottom half).
+void scene_storage_cube_levels(Rig& rig, ArrayView<uint32_t> out) {
+  if (!rig.has2(graphics::kFeature2MipmappedLayers | graphics::kFeature2StorageImages) || !rig.has(graphics::kFeatureCompute)) return void(rig.step("storage images of cubes", status::kNotSupported));
+  namespace b = conformance_blobs;
+  Handle cs = rig.shader("create_shader (compute)", ShaderKind::Dxbc, graphics::ShaderStage::Compute, bytes_of(b::k_cs_uav_array, sizeof b::k_cs_uav_array));
+  PipelineDesc pd;
+  pd.compute_shader = cs;
+  Handle fill = rig.pipeline(pd);
+  AllocationDesc d;
+  d.flags = kAllocTexture | kAllocStorageImage, d.format = Format::A8B8G8R8, d.width = d.height = 8, d.kind = graphics::TextureKind::TextureCube, d.layers = 6, d.mip_levels = 2;
+  Handle cube = rig.create(d);
+  CommandWriter w(rig.allocator());
+  w.bind_pipeline(fill);
+  w.bind_uav_image(0, 0, 1, 0, 6);
+  w.dispatch(1, 1, 6);
+  w.bind_uav_image(0, 0, 0, 2, 2);
+  w.dispatch(1, 1, 2);
+  rig.render(w, {cube});
+  Vertex v[72];
+  for (uint32_t half = 0; half < 2; ++half)
+    for (uint32_t face = 0; face < 6; ++face) {
+      const float x0 = static_cast<float>(1 + (face % 3) * 10), y0 = static_cast<float>(half * 16 + face / 3 * 8);
+      quad_pixels(v + 6 * (half * 6 + face), x0, y0, x0 + 10, y0 + 8, [face](float u, float vv) {
+        const float a = -0.8f + 1.6f * u, c = -0.8f + 1.6f * vv, axis = face % 2 ? -1.0f : 1.0f;
+        return face < 2 ? graphics::Vec3{axis, c, a} : face < 4 ? graphics::Vec3{a, axis, c} : graphics::Vec3{a, c, axis};
+      });
+    }
+  const ViewDraw draws[2] = {{b::k_ps_texcube, sizeof b::k_ps_texcube, 0, 6, 1, 1, 0, 0}, {b::k_ps_texcube, sizeof b::k_ps_texcube, 6, 6, 0, 1, 0, 0}};
+  draw_views(rig, out, cube, v, 12, draws, 2);
+}
+
 const Entry kScenes[] = {
     {"Direct3D 9 vertex colours", scene_vertex_colours},
     {"Direct3D 9 Shader Model 3", scene_sm3},
@@ -2880,6 +3108,14 @@ const Entry kScenes[] = {
     {"Direct3D 10 Load, SampleLevel, GetDimensions of a 3D image (DXBC)", scene_texel_3d},
     {"Direct3D 10 Load, SampleLevel, GetDimensions of an image array (DXBC)", scene_texel_array},
     {"Direct3D 10 SampleLevel, GetDimensions of a cube map (DXBC)", scene_texel_cube},
+    {"Direct3D 11 levels of an array of textures (DXBC)", scene_array_levels},
+    {"Direct3D 11 texture views of levels, layers and another kind", scene_texture_views},
+    {"Direct3D 11 levels of a 3D texture (DXBC)", scene_volume_levels},
+    {"Direct3D 11 drawing into levels of an array", scene_draw_into_levels},
+    {"Direct3D 11 texels and sizes at a level of an array (DXBC)", scene_array_level_texels},
+    {"Direct3D 11 unordered access to levels of a cube's faces", scene_storage_cube_levels},
+    {"Direct3D 11 cube array (DXBC)", scene_cube_array},
+    {"Direct3D 11 SampleLevel of a cube array (DXBC)", scene_cube_array_level},
 };
 
 bool channels_close(uint32_t a, uint32_t b) {

@@ -68,13 +68,13 @@ namespace {
 constexpr uint64_t kMaxQueryResultBytes = 1 << 20;
 constexpr uint32_t kKnownFlags = kAllocVertexBuffer | kAllocIndexBuffer | kAllocTexture | kAllocRenderTarget | kAllocDepthStencil | kAllocPresent | kAllocStaging | kAllocShared | kAllocQueryResult | kAllocUnorderedAccess | kAllocStreamOutput | kAllocConstantBuffer | kAllocTrackState | kAllocHeap | kAllocReserved | kAllocStorageImage;
 
-// The bytes of all levels of a w x h image of format `f` (pixels, or blocks of a compressed format); false if the description's levels are not possible. (w and h are at most
-// kMaxTextureDimension, so nothing overflows.)
-bool image_bytes(uint32_t w, uint32_t h, uint32_t levels, Format f, uint64_t* total) {
+// The bytes of all levels and layers of an image of the description (pixels, or blocks of a compressed format; a volume's levels have fewer slices). (The width and height are at most
+// kMaxTextureDimension, the layers at most kMaxTextureLayers, so nothing overflows.)
+uint64_t image_bytes(const AllocationDesc& d) {
   uint64_t sum = 0;
-  for (uint32_t l = 0; l < levels; ++l) sum += image_level_bytes(f, graphics::mip_extent(w, l), graphics::mip_extent(h, l));
-  *total = sum;
-  return true;
+  for (uint32_t l = 0; l < d.mip_levels; ++l)
+    sum += image_level_bytes(d.format, graphics::mip_extent(d.width, l), graphics::mip_extent(d.height, l)) * graphics::level_layer_count(d.kind, d.layers, l);
+  return sum;
 }
 // The device's format of a compressed one.
 graphics::Format compressed_format_of(Format f) {
@@ -102,15 +102,23 @@ bool Allocation::level_range(uint32_t level, uint64_t* offset, uint64_t* bytes) 
     return true;
   }
   if (level >= desc_.mip_levels) return false;
-  if (desc_.kind != graphics::TextureKind::Texture2D) {   // (one level: all the layers)
-    *offset = 0;
-    *bytes = image_level_bytes(desc_.format, desc_.width, desc_.height) * layers();
-    return true;
-  }
+  // (the levels one after the other, each with all its layers: a volume's level its slices there)
   uint64_t start = 0;
-  for (uint32_t l = 0; l < level; ++l) start += image_level_bytes(desc_.format, graphics::mip_extent(desc_.width, l), graphics::mip_extent(desc_.height, l));
+  for (uint32_t l = 0; l < level; ++l) start += subresource_bytes(l) * level_layers(l);
   *offset = start;
-  *bytes = image_level_bytes(desc_.format, graphics::mip_extent(desc_.width, level), graphics::mip_extent(desc_.height, level));
+  *bytes = subresource_bytes(level) * level_layers(level);
+  return true;
+}
+
+uint64_t Allocation::subresource_bytes(uint32_t level) const {
+  return is_image() ? image_level_bytes(desc_.format, graphics::mip_extent(desc_.width, level), graphics::mip_extent(desc_.height, level)) : 0;
+}
+
+bool Allocation::subresource_range(uint32_t level, uint32_t layer, uint64_t* offset, uint64_t* bytes) const {
+  uint64_t start = 0, all = 0;
+  if (!is_image() || !level_range(level, &start, &all) || layer >= level_layers(level)) return false;
+  *bytes = subresource_bytes(level);
+  *offset = start + uint64_t{layer} * *bytes;
   return true;
 }
 
@@ -295,12 +303,15 @@ NtStatus VidMm::create(const AllocationDesc& requested, SharedPointer<Allocation
   if (track_state && (requested.initial_state & ~kStateMask)) return status::kInvalidParameter;
   if (desc.flags == 0 || (desc.flags & ~kKnownFlags)) return status::kInvalidParameter;
   const bool buffer = (desc.flags & (kAllocVertexBuffer | kAllocIndexBuffer | kAllocQueryResult | kAllocUnorderedAccess | kAllocStreamOutput | kAllocConstantBuffer | kAllocHeap)) != 0;
-  // (a storage image: a sampled colour texture of one sample that is not sRGB, block-compressed or a cube, on a device with them)
+  // (a storage image: a sampled colour texture of one sample that is not sRGB or block-compressed, on a device with them; a cube's - or a cube array's - faces are an array to its
+  // shaders on a device with kFeature2MipmappedLayers)
+  const bool levels_anywhere = (device_.info().features2 & graphics::kFeature2MipmappedLayers) != 0;
+  const bool cube_kind = desc.kind == graphics::TextureKind::TextureCube || desc.kind == graphics::TextureKind::TextureCubeArray;
   if ((desc.flags & kAllocStorageImage) &&
       (buffer || !(desc.flags & kAllocTexture) || (desc.flags & ~(kAllocStorageImage | kAllocTexture | kAllocRenderTarget | kAllocShared)) || !dxgk::is_color(desc.format) || dxgk::is_srgb(desc.format) ||
-       desc.samples != 1 || desc.kind == graphics::TextureKind::TextureCube))
+       desc.samples != 1))
     return status::kInvalidParameter;
-  if ((desc.flags & kAllocStorageImage) && !(device_.info().features2 & graphics::kFeature2StorageImages)) return status::kNotSupported;
+  if ((desc.flags & kAllocStorageImage) && (!(device_.info().features2 & graphics::kFeature2StorageImages) || (cube_kind && !levels_anywhere))) return status::kNotSupported;
   if (dxgk::is_single_channel(desc.format) && !(desc.flags & kAllocStaging) && !(device_.info().features2 & graphics::kFeature2SingleChannelFormats)) return status::kNotSupported;
   if ((desc.flags & kAllocHeap) && ((desc.flags & ~kAllocShared) != kAllocHeap || heap || requested.heap)) return status::kInvalidParameter;      // (a heap may be shared: D3D12_HEAP_FLAG_SHARED)
   if ((desc.flags & kAllocUnorderedAccess) && !(device_.info().features & graphics::kFeatureCompute)) return status::kNotSupported;
@@ -341,7 +352,9 @@ NtStatus VidMm::create(const AllocationDesc& requested, SharedPointer<Allocation
     }
     if (depth_flag && (desc.flags & ~(kAllocDepthStencil | kAllocShared))) return status::kInvalidParameter;
     if (dxgk::is_wide(desc.format)) {
-      if (desc.mip_levels != 1 || (desc.flags & kAllocPresent)) return status::kInvalidParameter;
+      // (the wide formats: not presented; of several levels on a device with kFeature2MipmappedLayers)
+      if (desc.flags & kAllocPresent) return status::kInvalidParameter;
+      if (desc.mip_levels != 1 && !(desc.flags & kAllocStaging) && !levels_anywhere) return status::kNotSupported;
       const uint32_t needed = dxgk::is_single_channel(desc.format) ? 0u : dxgk::is_float(desc.format) ? graphics::kFeatureFloatFormats : dxgk::is_integer(desc.format) ? graphics::kFeatureIntegerFormats : (desc.format == Format::A16B16G16R16Snorm || desc.format == Format::A2B10G10R10) ? graphics::kFeatureSnormFormats : graphics::kFeatureUnorm16Formats;
       if (!(desc.flags & kAllocStaging) && (device_.info().features & needed) != needed) return status::kNotSupported;
     }
@@ -349,9 +362,13 @@ NtStatus VidMm::create(const AllocationDesc& requested, SharedPointer<Allocation
       if (desc.flags & kAllocPresent) return status::kInvalidParameter;
       if (!(desc.flags & kAllocStaging) && !(device_.info().features & graphics::kFeatureSrgbFormats)) return status::kNotSupported;
     }
-    if (desc.mip_levels > 1 && (desc.flags & ~(kAllocTexture | kAllocShared | kAllocStorageImage))) return status::kInvalidParameter;
-    uint64_t total = 0;
-    image_bytes(desc.width, desc.height, desc.mip_levels, desc.format, &total);
+    // (several levels: of a sampled 2D texture (maybe a storage image) or staging memory on any device; of a render target, a depth buffer, or a volume, an array or a cube, on a device
+    // with kFeature2MipmappedLayers)
+    if (desc.mip_levels > 1) {
+      if (desc.flags & kAllocPresent) return status::kInvalidParameter;
+      const bool plain = !(desc.flags & ~(kAllocTexture | kAllocShared | kAllocStorageImage)) && desc.kind == graphics::TextureKind::Texture2D;
+      if (!plain && !(desc.flags & kAllocStaging) && !levels_anywhere) return status::kNotSupported;
+    }
     if (desc.samples != 1) {
       // (a multisampled target: the device keeps the samples, the system keeps nothing)
       const graphics::DeviceInfo info = device_.info();
@@ -362,22 +379,30 @@ NtStatus VidMm::create(const AllocationDesc& requested, SharedPointer<Allocation
       goto sized;
     }
     if (desc.kind != graphics::TextureKind::Texture2D) {
-      // (a volume, array or cube: one level, sampled - and also drawn into or read and written as a storage image - or a depth buffer that is an array or a cube; of any colour format but
-      // the block-compressed ones, which are sampled only; the wide ones the devices take as layers of Vec4s)
+      // (a volume, array, cube or cube array: sampled - and also drawn into or read and written as a storage image - or a depth buffer that is an array, a cube or a cube array, or
+      // staging memory; of any colour format but the block-compressed ones, which are sampled only; the wide ones the devices take as layers of Vec4s)
       const uint32_t colour_flags = kAllocTexture | kAllocShared | kAllocRenderTarget | kAllocStorageImage;
-      if (depth_flag ? (desc.flags & ~(kAllocDepthStencil | kAllocShared)) || desc.kind == graphics::TextureKind::Texture3D
-                     : (desc.flags & ~colour_flags) || !(desc.flags & kAllocTexture) || (compressed && (desc.flags & (kAllocRenderTarget | kAllocStorageImage))))
+      const bool staging = (desc.flags & kAllocStaging) != 0;
+      if (desc.kind == graphics::TextureKind::Texture2DMS || static_cast<uint32_t>(desc.kind) > static_cast<uint32_t>(graphics::TextureKind::TextureCubeArray)) return status::kInvalidParameter;
+      if (staging ? depth_flag
+          : depth_flag ? (desc.flags & ~(kAllocDepthStencil | kAllocShared)) || desc.kind == graphics::TextureKind::Texture3D
+                       : (desc.flags & ~colour_flags) || !(desc.flags & kAllocTexture) || (compressed && (desc.flags & (kAllocRenderTarget | kAllocStorageImage))))
         return status::kInvalidParameter;
-      if (desc.mip_levels != 1) return status::kInvalidParameter;
-      if (desc.layers == 0 || desc.layers > graphics::kMaxTextureLayers || (desc.kind == graphics::TextureKind::TextureCube && (desc.layers != 6 || desc.width != desc.height))) return status::kInvalidParameter;
-      if (!(device_.info().features & graphics::kFeatureTextureKinds)) return status::kNotSupported;
+      if (desc.layers == 0 || desc.layers > graphics::kMaxTextureLayers || (desc.kind == graphics::TextureKind::TextureCube && desc.layers != 6) ||
+          (desc.kind == graphics::TextureKind::TextureCubeArray && desc.layers % 6 != 0) || (cube_kind && desc.width != desc.height))
+        return status::kInvalidParameter;
+      if (!staging && !(device_.info().features & graphics::kFeatureTextureKinds)) return status::kNotSupported;
+      if (!staging && desc.kind == graphics::TextureKind::TextureCubeArray && !levels_anywhere) return status::kNotSupported;
       if ((desc.flags & (kAllocRenderTarget | kAllocDepthStencil)) && !(device_.info().features2 & graphics::kFeature2LayeredTargets)) return status::kNotSupported;
-      total *= desc.layers;
     } else if (desc.layers != 1) {
       return status::kInvalidParameter;
     }
+    const uint64_t total = image_bytes(desc);
     if (depth_flag) {
-      device_bytes = uint64_t{desc.width} * desc.height * (desc.format == Format::D24S8 ? 5 : 4) * (desc.kind == graphics::TextureKind::Texture2D ? 1 : desc.layers);
+      // (no backing: the device keeps it, every level and layer)
+      AllocationDesc pixels = desc;
+      pixels.format = Format::A8R8G8B8;
+      device_bytes = image_bytes(pixels) / 4 * (desc.format == Format::D24S8 ? 5 : 4);
     } else {
       cpu_bytes = total;
       device_bytes = desc.flags & kAllocStaging ? 0 : total;
@@ -485,7 +510,7 @@ bool VidMm::create_device_object(Allocation& a) {
   if (d.flags & kAllocTexture) id.usage |= graphics::kImageSampled;
   if (d.flags & kAllocStorageImage) id.usage |= graphics::kImageStorage;
   // (uploading the backing needs kImageSampled on some devices: a render target gets it too, and does without if the device refuses the combination)
-  if (d.mip_levels == 1 && id.usage != graphics::kImageSampled) {
+  if ((d.mip_levels == 1 || (device_.info().features2 & graphics::kFeature2MipmappedLayers)) && id.usage != graphics::kImageSampled) {
     graphics::ImageDesc with_sampled = id;
     with_sampled.usage |= graphics::kImageSampled;
     a.image_ = device_.create_image(with_sampled);
@@ -567,67 +592,48 @@ bool VidMm::upload(Allocation& a) {
     a.device_stale_ = false;   // (nothing to upload: the contents of a depth buffer start undefined)
     return true;
   }
+  // (every layer of every level, a 2D image of its own: IImage::write_subresource, or the _float form for the wide formats)
   const Format f = a.desc_.format;
-  if (dxgk::is_wide(f)) {
-    // (each layer of an array as Vec4s of its own; a plain image is one layer)
-    ArrayView<graphics::Vec4> pixels;
-    scratch_.clear();
-    if (!scratch_.put_zeros(uint64_t{a.desc_.width} * a.desc_.height * sizeof(graphics::Vec4)) || !scratch_.writable_view().try_cast<graphics::Vec4>(&pixels)) return false;
-    ByteReader in(ConstByteView(a.cpu_));
-    const graphics::Format device_format = wide_format_of(f);
-    const bool layered = a.desc_.kind != graphics::TextureKind::Texture2D;
-    for (uint32_t layer = 0; layer < a.layers(); ++layer) {
-      for (graphics::Vec4& c : pixels) c = graphics::decode_wide_pixel(device_format, in);
-      if (!in.ok()) return false;
-      const ArrayView<const graphics::Vec4> layer_pixels(pixels.data(), pixels.size());
-      if (!(layered ? a.image_->write_layer_pixels_float(layer, layer_pixels) : a.image_->write_pixels_float(layer_pixels)) && a.cpu_written_) return false;
-    }
-    a.device_stale_ = false;
-    return true;
-  }
   if (dxgk::is_compressed(f)) {
     if (!upload_compressed(a)) return false;
     a.device_stale_ = false;
     return true;
   }
-  const bool convert = !is_plain_bgra(f);
-  if (a.desc_.kind != graphics::TextureKind::Texture2D) {
-    const uint64_t layer_bytes = uint64_t{a.desc_.width} * a.desc_.height * 4;
-    for (uint32_t layer = 0; layer < a.layers(); ++layer) {
-      ArrayView<uint32_t> source;
-      if (!as_words(a.cpu_.subview(layer_bytes * layer, layer_bytes), &source)) return false;
-      ArrayView<const uint32_t> pixels(source.data(), source.size());
-      if (convert) {
-        scratch_.clear();
-        if (!scratch_.put_zeros(layer_bytes)) return false;
-        ArrayView<uint32_t> converted;
-        if (!as_words(scratch_.writable_view(), &converted)) return false;
-        for (uint64_t i = 0; i < converted.size(); ++i) converted[i] = to_logical(f, source[i]);
-        pixels = ArrayView<const uint32_t>(converted.data(), converted.size());
-      }
-      if (!a.image_->write_layer_pixels(layer, pixels) && a.cpu_written_) return false;
-    }
-    a.device_stale_ = false;
-    return true;
-  }
+  const bool wide = dxgk::is_wide(f), convert = !is_plain_bgra(f);
+  const graphics::Format device_format = wide ? wide_format_of(f) : graphics::Format::Undefined;
   for (uint32_t level = 0; level < a.desc_.mip_levels; ++level) {
-    uint64_t offset = 0, bytes = 0;
-    if (!a.level_range(level, &offset, &bytes)) return false;
-    ArrayView<uint32_t> source;
-    if (!as_words(a.cpu_.subview(offset, bytes), &source)) return false;
-    ArrayView<const uint32_t> pixels(source.data(), source.size());
-    if (convert) {
-      scratch_.clear();
-      if (!scratch_.put_zeros(bytes)) return false;
-      ArrayView<uint32_t> converted;
-      if (!as_words(scratch_.writable_view(), &converted)) return false;
-      for (uint64_t i = 0; i < converted.size(); ++i) converted[i] = to_logical(f, source[i]);
-      pixels = ArrayView<const uint32_t>(converted.data(), converted.size());
-    }
-    if (!(level == 0 ? a.image_->write_pixels(pixels) : a.image_->write_mip_pixels(level, pixels))) {
+    const uint64_t pixels = uint64_t{graphics::mip_extent(a.desc_.width, level)} * graphics::mip_extent(a.desc_.height, level);
+    for (uint32_t layer = 0; layer < a.level_layers(level); ++layer) {
+      uint64_t offset = 0, bytes = 0;
+      if (!a.subresource_range(level, layer, &offset, &bytes)) return false;
+      ConstByteView range;
+      if (!ConstByteView(a.cpu_).try_subview(offset, bytes, &range)) return false;
+      bool ok;
+      if (wide) {
+        ArrayView<graphics::Vec4> values;
+        scratch_.clear();
+        if (!scratch_.put_zeros(pixels * sizeof(graphics::Vec4)) || !scratch_.writable_view().try_cast<graphics::Vec4>(&values)) return false;
+        ByteReader in(range);
+        for (graphics::Vec4& c : values) c = graphics::decode_wide_pixel(device_format, in);
+        if (!in.ok()) return false;
+        ok = a.image_->write_subresource_float(level, layer, ArrayView<const graphics::Vec4>(values.data(), values.size()));
+      } else {
+        ArrayView<uint32_t> source;
+        if (!as_words(a.cpu_.subview(offset, bytes), &source)) return false;
+        ArrayView<const uint32_t> words(source.data(), source.size());
+        if (convert) {
+          scratch_.clear();
+          if (!scratch_.put_zeros(bytes)) return false;
+          ArrayView<uint32_t> converted;
+          if (!as_words(scratch_.writable_view(), &converted)) return false;
+          for (uint64_t i = 0; i < converted.size(); ++i) converted[i] = to_logical(f, source[i]);
+          words = ArrayView<const uint32_t>(converted.data(), converted.size());
+        }
+        ok = a.image_->write_subresource(level, layer, words);
+      }
       // A device that only draws into a colour target (virgl keeps targets and textures in opposite row order) takes no pixels for it; that costs nothing while the backing is still
       // the zeros it was made with, which is what a target holds until something draws into it.
-      if (a.cpu_written_) return false;
+      if (!ok && a.cpu_written_) return false;
     }
   }
   a.device_stale_ = false;
@@ -639,30 +645,25 @@ bool VidMm::upload(Allocation& a) {
 bool VidMm::upload_compressed(Allocation& a) {
   const graphics::Format blocks_format = compressed_format_of(a.desc_.format);
   const bool native = (device_.info().features & graphics::kFeatureCompressedFormats) != 0;
-  const bool layered = a.desc_.kind != graphics::TextureKind::Texture2D;
-  const uint32_t parts = layered ? a.layers() : a.desc_.mip_levels;
-  const uint64_t layer_bytes = image_level_bytes(a.desc_.format, a.desc_.width, a.desc_.height);
-  for (uint32_t part = 0; part < parts; ++part) {
-    const uint32_t level = layered ? 0 : part, layer = layered ? part : 0;
-    uint64_t offset = 0, bytes = 0;
-    if (!a.level_range(level, &offset, &bytes)) return false;
-    if (layered) offset += layer_bytes * layer, bytes = layer_bytes;
-    ConstByteView blocks;
-    if (!ConstByteView(a.cpu_).try_subview(offset, bytes, &blocks)) return false;
-    const uint32_t w = graphics::mip_extent(a.desc_.width, level), h = graphics::mip_extent(a.desc_.height, level);
-    bool ok;
-    if (native) {
-      // (a volume's slices are the layers of the backing here; the device takes each slice as a layer of the transfer)
-      ok = a.image_->write_compressed(level, layer, blocks);
-    } else {
-      scratch_.clear();
-      ArrayView<uint32_t> pixels;
-      if (!scratch_.put_zeros(uint64_t{w} * h * 4) || !as_words(scratch_.writable_view(), &pixels) || !graphics::decode_blocks(blocks_format, blocks, w, h, pixels)) return false;
-      const ArrayView<const uint32_t> decoded(pixels.data(), pixels.size());
-      ok = layered ? a.image_->write_layer_pixels(layer, decoded) : level == 0 ? a.image_->write_pixels(decoded) : a.image_->write_mip_pixels(level, decoded);
+  for (uint32_t level = 0; level < a.desc_.mip_levels; ++level)
+    for (uint32_t layer = 0; layer < a.level_layers(level); ++layer) {
+      uint64_t offset = 0, bytes = 0;
+      if (!a.subresource_range(level, layer, &offset, &bytes)) return false;
+      ConstByteView blocks;
+      if (!ConstByteView(a.cpu_).try_subview(offset, bytes, &blocks)) return false;
+      const uint32_t w = graphics::mip_extent(a.desc_.width, level), h = graphics::mip_extent(a.desc_.height, level);
+      bool ok;
+      if (native) {
+        // (a volume's slices are the layers of the backing here; the device takes each slice as a layer of the transfer)
+        ok = a.image_->write_compressed(level, layer, blocks);
+      } else {
+        scratch_.clear();
+        ArrayView<uint32_t> pixels;
+        if (!scratch_.put_zeros(uint64_t{w} * h * 4) || !as_words(scratch_.writable_view(), &pixels) || !graphics::decode_blocks(blocks_format, blocks, w, h, pixels)) return false;
+        ok = a.image_->write_subresource(level, layer, ArrayView<const uint32_t>(pixels.data(), pixels.size()));
+      }
+      if (!ok && a.cpu_written_) return false;
     }
-    if (!ok && a.cpu_written_) return false;
-  }
   return true;
 }
 
@@ -688,47 +689,39 @@ bool VidMm::read_back(Allocation& a) {
     a.gpu_newer_ = false;
     return true;
   }
+  // (every layer of every level - on a device without kFeature2MipmappedLayers, the levels above 0 of a storage image only, the only ones its shaders could have written)
   const Format f = a.desc_.format;
-  const bool layered = a.desc_.kind != graphics::TextureKind::Texture2D;   // (a layered render target or storage image: each layer)
-  const uint64_t pixel_count = uint64_t{a.desc_.width} * a.desc_.height;
-  if (dxgk::is_wide(f)) {
-    ArrayView<graphics::Vec4> pixels;
-    scratch_.clear();
-    if (!scratch_.put_zeros(pixel_count * sizeof(graphics::Vec4)) || !scratch_.writable_view().try_cast<graphics::Vec4>(&pixels)) return false;
-    const graphics::Format device_format = wide_format_of(f);
-    const uint64_t layer_bytes = pixel_count * pixel_bytes(f);
-    for (uint32_t layer = 0; layer < a.layers(); ++layer) {
-      if (!(layered ? a.image_->read_layer_pixels_float(layer, pixels) : a.image_->read_pixels_float(pixels))) return false;
-      ByteView to;
-      if (!a.cpu_.try_subview(layer * layer_bytes, layer_bytes, &to)) return false;
-      ByteWriter out(to);
-      for (const graphics::Vec4& c : pixels) graphics::encode_wide_pixel(device_format, c, out);
-      if (!out.ok()) return false;
-    }
-    a.gpu_newer_ = false;
-    return true;
-  }
-  // (the 8-bit images: each layer of a layered one, level 0 of a plain one - and its other levels when shaders may have written them as a storage image)
-  const uint32_t parts = layered ? a.layers() : (a.desc_.flags & kAllocStorageImage) ? a.desc_.mip_levels : 1;
-  for (uint32_t part = 0; part < parts; ++part) {
-    uint64_t offset = 0, bytes = 0;
-    if (layered) {
-      offset = part * pixel_count * 4, bytes = pixel_count * 4;
-    } else if (!a.level_range(part, &offset, &bytes)) {
-      return false;
-    }
-    ArrayView<uint32_t> backing;
-    ByteView range;
-    if (!a.cpu_.try_subview(offset, bytes, &range) || !as_words(range, &backing)) return false;
-    auto read = [&](ArrayView<uint32_t> out) { return layered ? a.image_->read_layer_pixels(part, out) : part == 0 ? a.image_->read_pixels(out) : a.image_->read_mip_pixels(part, out); };
-    if (is_plain_bgra(f)) {
-      if (!read(backing)) return false;
-    } else {
+  const bool wide = dxgk::is_wide(f);
+  const graphics::Format device_format = wide ? wide_format_of(f) : graphics::Format::Undefined;
+  const bool all_levels = (device_.info().features2 & graphics::kFeature2MipmappedLayers) || (a.desc_.flags & kAllocStorageImage);
+  const uint32_t levels = all_levels ? a.desc_.mip_levels : 1;
+  for (uint32_t level = 0; level < levels; ++level) {
+    const uint64_t pixels = uint64_t{graphics::mip_extent(a.desc_.width, level)} * graphics::mip_extent(a.desc_.height, level);
+    for (uint32_t layer = 0; layer < a.level_layers(level); ++layer) {
+      uint64_t offset = 0, bytes = 0;
+      ByteView range;
+      if (!a.subresource_range(level, layer, &offset, &bytes) || !a.cpu_.try_subview(offset, bytes, &range)) return false;
+      if (wide) {
+        ArrayView<graphics::Vec4> values;
+        scratch_.clear();
+        if (!scratch_.put_zeros(pixels * sizeof(graphics::Vec4)) || !scratch_.writable_view().try_cast<graphics::Vec4>(&values)) return false;
+        if (!a.image_->read_subresource_float(level, layer, values)) return false;
+        ByteWriter out(range);
+        for (const graphics::Vec4& c : values) graphics::encode_wide_pixel(device_format, c, out);
+        if (!out.ok()) return false;
+        continue;
+      }
+      ArrayView<uint32_t> backing;
+      if (!as_words(range, &backing)) return false;
+      if (is_plain_bgra(f)) {
+        if (!a.image_->read_subresource(level, layer, backing)) return false;
+        continue;
+      }
       scratch_.clear();
       if (!scratch_.put_zeros(backing.size() * 4)) return false;
       ArrayView<uint32_t> logical;
       if (!as_words(scratch_.writable_view(), &logical)) return false;
-      if (!read(logical)) return false;
+      if (!a.image_->read_subresource(level, layer, logical)) return false;
       for (uint64_t i = 0; i < backing.size(); ++i) backing[i] = from_logical(f, logical[i]);
     }
   }
@@ -781,7 +774,7 @@ void set_integer_alpha(ByteView pixel, uint32_t channel) {
 }
 }  // namespace
 
-NtStatus VidMm::set_mirror(Allocation& mirror, ArrayView<const SharedPointer<Allocation>> sources, uint32_t mode, uint32_t channels) {
+NtStatus VidMm::set_mirror(Allocation& mirror, ArrayView<const SharedPointer<Allocation>> sources, uint32_t mode, uint32_t channels, ArrayView<const uint32_t> subresources) {
   if (mode & ~(kMirrorInteger | kMirrorWriteBack) || channels > 0xF) return status::kInvalidParameter;
   if (sources.empty()) {
     mirror.mirror_sources_.clear();
@@ -796,16 +789,22 @@ NtStatus VidMm::set_mirror(Allocation& mirror, ArrayView<const SharedPointer<All
     return status::kInvalidParameter;
   // (a mirror that writes back is a render target or a storage image - an array of them gives each layer to its source; one channel at least goes back)
   if ((mode & kMirrorWriteBack) && (!(m.flags & (kAllocRenderTarget | kAllocStorageImage)) || channels == 0)) return status::kInvalidParameter;
-  for (const SharedPointer<Allocation>& source : sources) {
+  // (each source's subresource: level 0 of a 2D image, or - kFeature2MipmappedLayers - a level and layer of any image of one sample, of the mirror's size)
+  if (!subresources.empty() && (subresources.size() != sources.size() || !(device_.info().features2 & graphics::kFeature2MipmappedLayers))) return status::kInvalidParameter;
+  for (uint64_t i = 0; i < sources.size(); ++i) {
+    const SharedPointer<Allocation>& source = sources[i];
     if (!source || &source->manager() != this || source.get() == &mirror || !source->is_image() || source->is_mirror()) return status::kInvalidParameter;
     const AllocationDesc& d = source->desc_;
-    if (d.kind != graphics::TextureKind::Texture2D || d.mip_levels != 1 || d.samples != 1 || d.width != m.width || d.height != m.height || mirror_channel_bytes(d.format) != channel)
+    const uint32_t level = subresources.empty() ? 0 : subresources[i] & 0xFFFF, layer = subresources.empty() ? 0 : subresources[i] >> 16;
+    if (subresources.empty() ? (d.kind != graphics::TextureKind::Texture2D || d.mip_levels != 1) : (level >= d.mip_levels || layer >= source->level_layers(level))) return status::kInvalidParameter;
+    if (d.samples != 1 || graphics::mip_extent(d.width, level) != m.width || graphics::mip_extent(d.height, level) != m.height || mirror_channel_bytes(d.format) != channel)
       return status::kInvalidParameter;
   }
   List<Allocation::MirrorSource> made(allocator_);
-  for (const SharedPointer<Allocation>& source : sources) {
+  for (uint64_t i = 0; i < sources.size(); ++i) {
     Allocation::MirrorSource ms;
-    ms.source = source;
+    ms.source = sources[i];
+    if (!subresources.empty()) ms.level = subresources[i] & 0xFFFF, ms.layer = subresources[i] >> 16;
     if (!made.push_back(util::move(ms))) return status::kNoMemory;
   }
   mirror.mirror_sources_.clear();
@@ -843,7 +842,9 @@ bool VidMm::refresh_mirror(Allocation& mirror, bool may_read_back, bool* stale) 
     }
     ByteView to;
     ConstByteView from;
-    if (!mirror.cpu_.try_subview(layer * layer_bytes, layer_bytes, &to) || !ConstByteView(source.cpu_).try_subview(0, layer_bytes, &from) || !to.copy_from(from)) return false;
+    uint64_t at = 0, bytes = 0;
+    if (!source.subresource_range(ms.level, ms.layer, &at, &bytes) || bytes != layer_bytes) return false;
+    if (!mirror.cpu_.try_subview(layer * layer_bytes, layer_bytes, &to) || !ConstByteView(source.cpu_).try_subview(at, layer_bytes, &from) || !to.copy_from(from)) return false;
     if (mirror.mirror_mode_ & kMirrorInteger)
       for (uint64_t at = 0; at < layer_bytes; at += pixel) set_integer_alpha(to.subview(at, pixel), channel);
     ms.seen = source.version_;
@@ -863,7 +864,9 @@ bool VidMm::write_back_mirror(Allocation& mirror) {
     if (!read_back(source)) return false;
     ByteView to;
     ConstByteView from;
-    if (!source.cpu_.try_subview(0, bytes, &to) || !ConstByteView(mirror.cpu_).try_subview(layer * bytes, bytes, &from)) return false;
+    uint64_t at = 0, sub_bytes = 0;
+    if (!source.subresource_range(mirror.mirror_sources_[layer].level, mirror.mirror_sources_[layer].layer, &at, &sub_bytes) || sub_bytes != bytes) return false;
+    if (!source.cpu_.try_subview(at, bytes, &to) || !ConstByteView(mirror.cpu_).try_subview(layer * bytes, bytes, &from)) return false;
     for (uint64_t at = 0; at < bytes; at += pixel)
       for (uint32_t c = 0; c < 4; ++c)
         if ((mirror.mirror_channels_ >> c & 1) && !to.subview(at + c * channel, channel).copy_from(from.subview(at + c * channel, channel))) return false;
