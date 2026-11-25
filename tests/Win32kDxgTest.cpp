@@ -728,10 +728,14 @@ void test_allocations() {
   w.put32(kD + 24, lay::kAllocPrivateBytes);
   write_private(w, kE, good, 2);
   CHECK(w.call(WN::NtGdiDdDDICreateAllocation, kC) == kInvalidParameter);               // version
-  AllocSpec bad_format = good;
-  bad_format.format = 99;
-  write_private(w, kE, bad_format);
-  CHECK(w.call(WN::NtGdiDdDDICreateAllocation, kC) == kInvalidParameter);
+  // (a format number past the last one dxgk::Format has, and one in the gap between its two runs: neither is a format)
+  for (const uint32_t format : {dxgk::kLastExtraFormat + 1, dxgk::kLastBaseFormat + 1}) {
+    static_assert(!dxgk::is_known_format(dxgk::kLastExtraFormat + 1) && !dxgk::is_known_format(dxgk::kLastBaseFormat + 1), "not formats");
+    AllocSpec bad_format = good;
+    bad_format.format = format;
+    write_private(w, kE, bad_format);
+    CHECK(w.call(WN::NtGdiDdDDICreateAllocation, kC) == kInvalidParameter);
+  }
   AllocSpec bad_kind = good;
   bad_kind.kind = 9;
   write_private(w, kE, bad_kind);
