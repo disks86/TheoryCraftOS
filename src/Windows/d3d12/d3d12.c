@@ -29,23 +29,21 @@
  * renderer takes 16, 16, 16, 8 and 8; virgl (a GPU through virglrenderer) 16, 14 or 15, 16, 8 and 8, which is feature level 11_0 here; the other GPU backends what their
  * encoders were made for (feature level 9_x, so D3D12CreateDevice with the usual minimum of 11_0 is refused on them). tests/d3d12_qemu.sh runs the test program on virgl.
  * Whatever the device:
- *   - four unordered access buffers and four buffer SRVs, no 1D textures, mip chains and arrays only on sampled textures (a render target or depth buffer has one level and
- *     one layer, and a depth buffer cannot be sampled), no texture UAVs, buffer SRVs only on buffers made with unordered access, texture formats of four channels only
- *     (base.inc g_formats: no one- or two-channel, packed-float or block-compressed formats), depth bias and a back-face stencil state are not applied (the blend factor is: the CPU renderer and virgl),
- *     one viewport and scissor
+ *   - fixed state the device lacks is refused (pso.inc): depth bias, depth clip, wireframe, two-sided stencil, dual-source blending, logic ops, anisotropy, custom border
+ *     colours and several viewports need the kernel's RasterizerState, DualSourceBlend, LogicOps, SamplerState and Viewports features (the CPU renderer and virgl;
+ *     virglrenderer 1.3.0 drops anisotropy, and virgl refuses a layer or viewport chosen in a vertex or domain shader)
+ *   - texture formats: every colour format and BC1-BC7 (base.inc g_formats) on the CPU renderer and virgl, except R1_UNORM; R8 and R16 unorm are kept widened;
+ *     depth buffers are sampled at level 0 only and are not copied; ResourceMinLODClamp is ignored; no gather from cube arrays
  *   - a pass with a depth buffer and no render target draws into a colour image of the buffer's size that nothing reads (cmdlist.inc depth_companion): it costs that memory
- *   - sampler border colours are the three of a static sampler (another colour is the nearest of them); a device with wrap and clamp alone uses the nearer of those
  *   - multisampled images are render targets and depth buffers of the adapter's sample counts, drawn into and resolved (not read by shaders through this DLL)
- *   - tiled depth/multisampled/array resources, heaps shared across adapters (DXGI_ERROR_UNSUPPORTED; shared handles of
- *     one adapter's resources and heaps, and of fences of any adapter, are made: device.inc),
- *     resource state validation (barriers are accepted and not looked at, except aliasing), the debug layer, dual-source blending, unordered access to textures
+ *   - tiled resources at tier 1 only, heaps shared across adapters (DXGI_ERROR_UNSUPPORTED; shared handles of one adapter's resources and heaps, and of fences of any
+ *     adapter, are made: device.inc), resource state validation (barriers are accepted and not looked at, except aliasing), the debug layer
  *   - of the later interfaces (ID3D12Device1 .. 14, ID3D12GraphicsCommandList1 .. 10: device1.inc, cmdlist1.inc, library.inc, rootsig.inc; what mingw lacks of them is in
  *     d3d12_types.h), the features reported at their "not supported" tier: ray tracing, mesh shaders, variable-rate shading, view instancing, depth bounds, sample
- *     positions, sampler feedback, work graphs, protected sessions, meta commands, a depth bias and strip cut set by the command list
- *   - vertex elements: 32-bit floats on every device; bytes, 16-bit numbers, half floats and 32-bit integers (pso.inc vertex_format) where the device reads them (the CPU
- *     renderer and virgl)
- *     (queries are occlusion, binary occlusion, pipeline statistics (and 1), stream output statistics and timestamps (also on copy queues), several open at once;
- *     ExecuteIndirect is made when the list is executed; bundles replay their calls: extras.inc)
+ *     positions, sampler feedback, work graphs, protected sessions, meta commands, D3D12_SAMPLER_DESC2, a strip cut set by the command list (OPTIONS15)
+ *   - vertex elements: every Direct3D 11 input-assembler format and instance step rates (pso.inc vertex_format) where the device reads them (the CPU renderer and virgl)
+ *     (queries are occlusion, binary occlusion, pipeline statistics (and 1), stream output statistics and timestamps (also on copy queues), several open at once, at
+ *     most 64 per list; the size of a stream output buffer view is not looked at; ExecuteIndirect is made when the list is executed; bundles replay their calls: extras.inc)
  *   - Shader Model 6.x features beyond what the kernel's DXIL translator reads (it reads vertex, pixel, geometry, hull, domain and compute shaders; see Dxg.md)
  * Built freestanding over kernel32.dll, gdi32.dll and dxgi.dll's interfaces with the OS's mingw compiler. */
 #define INITGUID
