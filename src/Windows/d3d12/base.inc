@@ -287,6 +287,8 @@ struct Dev {
 #define DEV_FEATURE2_STORAGE_IMAGES_IN_DRAWS (1u << 1)   /* ... and in pixel shaders */
 #define DEV_FEATURE2_LAYERED_TARGETS (1u << 2)           /* render targets and depth buffers of several slices, SV_RenderTargetArrayIndex */
 #define DEV_FEATURE2_SINGLE_CHANNEL (1u << 3)            /* R32_UINT, R32_SINT, R32_FLOAT */
+#define DEV_FEATURE2_CONSERVATIVE_RASTER (1u << 4)       /* conservative rasterization (the CreatePipeline cull word's KCULL_CONSERVATIVE) */
+#define KCULL_CONSERVATIVE 0x100u
 
 static const GUID *const g_device_iids[] = {&IID_ID3D12Object, &IID_ID3D12Device, &IID_ID3D12Device1, &IID_ID3D12Device2, &IID_ID3D12Device3, &IID_ID3D12Device4,
                                             &IID_ID3D12Device5, &IID_ID3D12Device6, &IID_ID3D12Device7, &IID_ID3D12Device8, &IID_ID3D12Device9, &IID_ID3D12Device10, NULL};

@@ -1000,7 +1000,12 @@ void raster_triangle(const DrawState& s, const ScreenVertex& a, const ScreenVert
 
   // Per row, the columns that can be inside: each edge value is linear in x, so it is solved for where it turns non-negative and the range is widened by two pixels, which covers the
   // rounding. The exact tests below still decide every pixel, so the picture is the one a full scan of the bounding box gives. (Far off-screen vertices make the solving imprecise: no trimming.)
-  const bool trim = fx0 > -1e5f && fx1 < 1e5f && fy0 > -1e5f && fy1 < 1e5f;
+  // Conservative rasterization: a pixel is covered when its square and the triangle overlap. By the separating axis theorem that is when the square meets the triangle's bounding box
+  // and no edge has the whole square outside: an edge value is linear, so its largest over the square is the value at the centre plus half the sum of its gradient's magnitudes.
+  const bool conservative = pd.conservative;
+  auto magnitude = [](float v) { return v < 0 ? -v : v; };
+  const float reach0 = 0.5f * (magnitude(e0dx) + magnitude(e0dy)), reach1 = 0.5f * (magnitude(e1dx) + magnitude(e1dy)), reach2 = 0.5f * (magnitude(e2dx) + magnitude(e2dy));
+  const bool trim = !conservative && fx0 > -1e5f && fx1 < 1e5f && fy0 > -1e5f && fy1 < 1e5f;
   struct EdgeLine {
     float vx, vy, dx, dy;
   };
@@ -1047,7 +1052,14 @@ void raster_triangle(const DrawState& s, const ScreenVertex& a, const ScreenVert
         if (a0 < 0 || a1 < 0 || a2 < 0) return false;
         return !((a0 == 0 && !own0) || (a1 == 0 && !own1) || (a2 == 0 && !own2));
       };
-      if (sample_count > 1 && pd.multisample) {
+      if (conservative) {
+        const float fx = static_cast<float>(x), fy = static_cast<float>(y);
+        if (fx > fx1 || fx + 1.0f < fx0 || fy > fy1 || fy + 1.0f < fy0) continue;
+        if (l0 + reach0 < 0 || l1 + reach1 < 0 || l2 + reach2 < 0) continue;
+        covered = (1u << sample_count) - 1;   // (every sample of a touched pixel, at the plane's depth at the centre)
+        const float centre_z = (l0 * v0->z + l1 * v1->z + l2 * v2->z) * inv_area;
+        for (uint32_t k = 0; k < sample_count; ++k) sample_z[k] = centre_z;
+      } else if (sample_count > 1 && pd.multisample) {
         const SamplePosition* positions = sample_positions(sample_count);
         for (uint32_t k = 0; k < sample_count; ++k) {
           const float sx = px + static_cast<float>(positions[k].x) * (1.0f / 16.0f), sy = py + static_cast<float>(positions[k].y) * (1.0f / 16.0f);

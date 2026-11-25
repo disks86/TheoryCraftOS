@@ -254,6 +254,79 @@ EXPORT HRESULT WINAPI D3D11CoreCreateDevice(IDXGIFactory *factory, IDXGIAdapter 
   return S_OK;
 }
 
+/* ---- the other exports of d3d11.dll ---------------------------------------------------------------------------------------------------------------------------- */
+
+/* D3D11CreateDeviceForD3D12: what d3d11on12 makes the Direct3D 11 device of a Direct3D 12 device with. Its 32-bit export takes 36 bytes of arguments (d3d11.dll's
+ * D3D11CreateDeviceForD3D12@36): D3D11On12CreateDevice's arguments without the feature level out-parameter, which is what it is here - the device on the program's
+ * Direct3D 12 device and its first queue, its level asked for with GetFeatureLevel. */
+EXPORT HRESULT WINAPI D3D11CreateDeviceForD3D12(IUnknown *device12, UINT flags, const D3D_FEATURE_LEVEL *levels, UINT level_count, IUnknown *const *queues, UINT queue_count,
+                                                UINT node_mask, ID3D11Device **device, ID3D11DeviceContext **context) {
+  return D3D11On12CreateDevice(device12, flags, levels, level_count, queues, queue_count, node_mask, device, context, NULL);
+}
+
+/* The layered device: how the SDK layers (d3d11sdklayers.dll, the debug layer) put themselves between the program and the core device. D3D11CoreRegisterLayers
+ * registers the layers' entry points, D3D11CoreGetLayeredDeviceSize answers the memory a device with them needs, D3D11CoreCreateLayeredDevice makes one. No SDK layer
+ * is part of this system - a debug device is DXGI_ERROR_SDK_COMPONENT_MISSING, as on Windows without the Graphics Tools -, so there is no layer to register or build a
+ * device of: the calls answer what Windows answers when the SDK component is missing (and the size of a layered device is none). Open gap: the layers themselves. */
+EXPORT HRESULT WINAPI D3D11CoreRegisterLayers(const void *layers, DWORD count) {
+  if (!layers && count) return E_INVALIDARG;
+  return DXGI_ERROR_SDK_COMPONENT_MISSING;
+}
+EXPORT SIZE_T WINAPI D3D11CoreGetLayeredDeviceSize(const void *layers, DWORD count) { (void)layers; (void)count; return 0; }
+EXPORT HRESULT WINAPI D3D11CoreCreateLayeredDevice(const void *layers, DWORD count, const void *args, REFIID riid, void **device) {
+  (void)args; (void)riid;
+  if (device) *device = NULL;
+  if ((!layers && count) || !device) return E_INVALIDARG;
+  return DXGI_ERROR_SDK_COMPONENT_MISSING;
+}
+
+/* D3DPerformance_*: ID3DUserDefinedAnnotation's methods as functions, on the annotation interface of a context (any interface of the context is taken: the annotation is
+ * asked for with QueryInterface). No graphics debugger is attached to this runtime, so as on Windows without one an event's nesting is -1, a marker goes nowhere and the
+ * status is FALSE; no context answers the same. */
+static ID3DUserDefinedAnnotation *perf_annotation(IUnknown *object) {
+  ID3DUserDefinedAnnotation *a = NULL;
+  if (!object || FAILED(IUnknown_QueryInterface(object, &IID_ID3DUserDefinedAnnotation, (void **)&a))) return NULL;
+  return a;
+}
+EXPORT INT WINAPI D3DPerformance_BeginEvent(IUnknown *object, LPCWSTR name) {
+  ID3DUserDefinedAnnotation *a = perf_annotation(object);
+  if (!a) return -1;
+  const INT r = ID3DUserDefinedAnnotation_BeginEvent(a, name);
+  ID3DUserDefinedAnnotation_Release(a);
+  return r;
+}
+EXPORT INT WINAPI D3DPerformance_EndEvent(IUnknown *object) {
+  ID3DUserDefinedAnnotation *a = perf_annotation(object);
+  if (!a) return -1;
+  const INT r = ID3DUserDefinedAnnotation_EndEvent(a);
+  ID3DUserDefinedAnnotation_Release(a);
+  return r;
+}
+EXPORT void WINAPI D3DPerformance_SetMarker(IUnknown *object, LPCWSTR name) {
+  ID3DUserDefinedAnnotation *a = perf_annotation(object);
+  if (!a) return;
+  ID3DUserDefinedAnnotation_SetMarker(a, name);
+  ID3DUserDefinedAnnotation_Release(a);
+}
+EXPORT BOOL WINAPI D3DPerformance_GetStatus(IUnknown *object) {
+  ID3DUserDefinedAnnotation *a = perf_annotation(object);
+  if (!a) return FALSE;
+  const BOOL r = ID3DUserDefinedAnnotation_GetStatus(a);
+  ID3DUserDefinedAnnotation_Release(a);
+  return r;
+}
+
+/* EnableFeatureLevelUpgrade: the application-compatibility switch that lets a program written for Direct3D 10 get the device's full level. From the call on, a device of
+ * the process that would be made at level 10_0 or 10_1 is made at 11_0, the level the adapter has (dev_create_on). */
+EXPORT void WINAPI EnableFeatureLevelUpgrade(void) { InterlockedExchange(&g_feature_level_upgrade, 1); }
+
+/* OpenAdapter10 / OpenAdapter10_2: the Direct3D 10 user-mode driver entry points (D3D10DDIARG_OPENADAPTER). In Windows' d3d11.dll they are the level 9 mapping layer
+ * (once d3d10level9.dll), a Direct3D 10/11 driver built on the adapter's Direct3D 9 user-mode driver. This system has no WDDM user-mode drivers: Direct3D reaches the
+ * kernel's dxgkrnl through d3d12.dll's escapes, and no adapter has a Direct3D 9 driver to map onto. With nothing to open, the call fails as a driver does that cannot open
+ * the adapter: DXGI_ERROR_UNSUPPORTED (no adapter object or function table is handed out). Open gap: a DDI-level driver. */
+EXPORT HRESULT WINAPI OpenAdapter10(void *open_data) { return open_data ? DXGI_ERROR_UNSUPPORTED : E_INVALIDARG; }
+EXPORT HRESULT WINAPI OpenAdapter10_2(void *open_data) { return open_data ? DXGI_ERROR_UNSUPPORTED : E_INVALIDARG; }
+
 /* ---- the Windows Runtime's face -------------------------------------------------------------------------------------------------------------------------------- */
 
 DEFINE_GUID(IID_TcosIInspectable, 0xaf86e2e0, 0xb12d, 0x4c6a, 0x9c, 0x5a, 0xd7, 0xaa, 0x65, 0x10, 0x1e, 0x90);
@@ -327,7 +400,7 @@ static HRESULT winrt_class_name(WinRtObj *o, void **name) {
   *name = NULL;
   HMODULE combase = LoadLibraryW(L"combase.dll");
   CreateString create = combase ? (CreateString)(void (*)(void))GetProcAddress(combase, "WindowsCreateString") : NULL;
-  if (!create) return E_NOTIMPL;
+  if (!create) return HRESULT_FROM_WIN32(GetLastError());      /* (combase.dll, which HSTRINGs are of, could not be had: why not) */
   const WCHAR *text = o->surface ? surface_name : device_name;
   return create(text, (UINT32)wlen(text), name);
 }

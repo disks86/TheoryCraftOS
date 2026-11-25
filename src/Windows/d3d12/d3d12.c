@@ -58,6 +58,7 @@
 #include "video_types.h"
 #include <dxgi1_6.h>
 #include "../tcosdx.h"
+#include "../tcos_swizzle.h"
 
 #undef DECLSPEC_IMPORT
 #define DECLSPEC_IMPORT

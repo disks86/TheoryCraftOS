@@ -2163,15 +2163,18 @@ static void test_device5(void) {
   check(ID3D11Device5_CreateDeferredContext2(d5, 1, (ID3D11DeviceContext2 **)&c3) == E_INVALIDARG, "CreateDeferredContext2 refuses flags (none are defined)");
   check(ID3D11Device5_GetDeviceRemovedReason(d5) == S_OK, "GetDeviceRemovedReason: S_OK on a device that is there");
 
-  /* the *1 texture: the layout is the driver's (UNDEFINED); ROW_MAJOR and the standard swizzle need what the device does not have */
+  /* the *1 texture: the layout is the driver's (UNDEFINED); ROW_MAJOR is for a texture of one level and one slice, which this one is not (test_d3d11_3 has the layouts) */
   D3D11_TEXTURE2D_DESC1 td = {8, 8, 1, 1, DXGI_FORMAT_R8G8B8A8_UNORM, {1, 0}, D3D11_USAGE_DEFAULT, D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS, 0, 0,
                           D3D11_TEXTURE_LAYOUT_UNDEFINED};
   ID3D11Texture2D1 *t1 = NULL, *bad = NULL;
   check(SUCCEEDED(ID3D11Device5_CreateTexture2D1(d5, &td, NULL, &t1)) && t1, "CreateTexture2D1 with the UNDEFINED layout");
   td.TextureLayout = D3D11_TEXTURE_LAYOUT_ROW_MAJOR;
-  check(ID3D11Device5_CreateTexture2D1(d5, &td, NULL, &bad) == E_INVALIDARG && !bad, "CreateTexture2D1 refuses ROW_MAJOR (no MapOnDefaultTextures)");
-  td.TextureLayout = D3D11_TEXTURE_LAYOUT_64K_STANDARD_SWIZZLE;
-  check(ID3D11Device5_CreateTexture2D1(d5, &td, NULL, &bad) == E_INVALIDARG && !bad, "CreateTexture2D1 refuses 64K_STANDARD_SWIZZLE (no StandardSwizzle)");
+  td.MipLevels = 2;
+  check(ID3D11Device5_CreateTexture2D1(d5, &td, NULL, &bad) == E_INVALIDARG && !bad, "CreateTexture2D1 refuses ROW_MAJOR of two levels");
+  td.MipLevels = 1;
+  td.TextureLayout = (D3D11_TEXTURE_LAYOUT)3;
+  check(ID3D11Device5_CreateTexture2D1(d5, &td, NULL, &bad) == E_INVALIDARG && !bad, "CreateTexture2D1 refuses an unknown layout");
+  td.TextureLayout = D3D11_TEXTURE_LAYOUT_UNDEFINED;
   if (t1) {
     D3D11_TEXTURE2D_DESC1 got;
     memset(&got, 0xCC, sizeof got);
@@ -2241,12 +2244,13 @@ static void test_device5(void) {
     }
     ID3D11Buffer_Release(raw);
   }
-  /* no tiled resources: a tiled buffer and a tile pool are refused, and the tile calls refuse what they get */
-  D3D11_BUFFER_DESC tiled = {65536, D3D11_USAGE_DEFAULT, D3D11_BIND_SHADER_RESOURCE, 0, D3D11_RESOURCE_MISC_TILED, 0};
+  /* the tile calls refuse resources that are not tiled (test_d3d11_3 has tiled ones) */
+  D3D11_BUFFER_DESC tiled = {65536, D3D11_USAGE_DEFAULT, D3D11_BIND_CONSTANT_BUFFER, 0, D3D11_RESOURCE_MISC_TILED, 0};
   ID3D11Buffer *none = NULL;
-  check(ID3D11Device5_CreateBuffer(d5, &tiled, NULL, &none) == E_INVALIDARG && !none, "CreateBuffer refuses D3D11_RESOURCE_MISC_TILED (TiledResourcesTier NOT_SUPPORTED)");
+  check(ID3D11Device5_CreateBuffer(d5, &tiled, NULL, &none) == E_INVALIDARG && !none, "CreateBuffer refuses a tiled constant buffer");
+  tiled.BindFlags = D3D11_BIND_SHADER_RESOURCE;
   tiled.MiscFlags = D3D11_RESOURCE_MISC_TILE_POOL;
-  check(ID3D11Device5_CreateBuffer(d5, &tiled, NULL, &none) == E_INVALIDARG && !none, "CreateBuffer refuses D3D11_RESOURCE_MISC_TILE_POOL");
+  check(ID3D11Device5_CreateBuffer(d5, &tiled, NULL, &none) == E_INVALIDARG && !none, "CreateBuffer refuses a tile pool bound to something");
   check(ID3D11DeviceContext4_UpdateTileMappings(c4, (ID3D11Resource *)g_target, 0, NULL, NULL, NULL, 0, NULL, NULL, NULL, 0) == E_INVALIDARG,
         "UpdateTileMappings of a resource that is not tiled: E_INVALIDARG");
   check(ID3D11DeviceContext4_ResizeTilePool(c4, g_matrix, 65536) == E_INVALIDARG, "ResizeTilePool of a buffer that is not a tile pool: E_INVALIDARG");
@@ -2266,7 +2270,10 @@ static void test_device5(void) {
         "CheckMultisampleQualityLevels1 without flags: as CheckMultisampleQualityLevels");
   check(ID3D11Device5_CheckMultisampleQualityLevels1(d5, DXGI_FORMAT_R8G8B8A8_UNORM, 1, 2, &levels) == E_INVALIDARG, "CheckMultisampleQualityLevels1 refuses unknown flags");
 
-  /* RasterizerState2: conservative rasterization is refused (no tier) */
+  /* RasterizerState2: conservative rasterization where the device has a tier for it (test_d3d11_3 draws with it) */
+  D3D11_FEATURE_DATA_D3D11_OPTIONS2 tiers;
+  memset(&tiers, 0, sizeof tiers);
+  ID3D11Device5_CheckFeatureSupport(d5, D3D11_FEATURE_D3D11_OPTIONS2, &tiers, sizeof tiers);
   D3D11_RASTERIZER_DESC2 r2 = {D3D11_FILL_SOLID, D3D11_CULL_NONE, FALSE, 0, 0, 0, TRUE, FALSE, FALSE, FALSE, 0, D3D11_CONSERVATIVE_RASTERIZATION_MODE_OFF};
   ID3D11RasterizerState2 *rs2 = NULL, *rs_bad = NULL;
   check(SUCCEEDED(ID3D11Device5_CreateRasterizerState2(d5, &r2, &rs2)) && rs2, "CreateRasterizerState2, conservative rasterization off");
@@ -2278,7 +2285,21 @@ static void test_device5(void) {
     ID3D11RasterizerState2_Release(rs2);
   }
   r2.ConservativeRaster = D3D11_CONSERVATIVE_RASTERIZATION_MODE_ON;
-  check(ID3D11Device5_CreateRasterizerState2(d5, &r2, &rs_bad) == E_INVALIDARG && !rs_bad, "CreateRasterizerState2 refuses conservative rasterization");
+  if (tiers.ConservativeRasterizationTier == D3D11_CONSERVATIVE_RASTERIZATION_NOT_SUPPORTED) {
+    check(ID3D11Device5_CreateRasterizerState2(d5, &r2, &rs_bad) == E_INVALIDARG && !rs_bad, "CreateRasterizerState2 refuses conservative rasterization (no tier)");
+  } else {
+    check(SUCCEEDED(ID3D11Device5_CreateRasterizerState2(d5, &r2, &rs_bad)) && rs_bad, "CreateRasterizerState2, conservative rasterization on");
+    if (rs_bad) {
+      D3D11_RASTERIZER_DESC2 back;
+      memset(&back, 0xCC, sizeof back);
+      ID3D11RasterizerState2_GetDesc2(rs_bad, &back);
+      check(back.ConservativeRaster == D3D11_CONSERVATIVE_RASTERIZATION_MODE_ON, "RasterizerState2::GetDesc2 gives conservative rasterization back");
+      ID3D11RasterizerState2_Release(rs_bad);
+    }
+  }
+  r2.ConservativeRaster = (D3D11_CONSERVATIVE_RASTERIZATION_MODE)2;
+  rs_bad = NULL;
+  check(ID3D11Device5_CreateRasterizerState2(d5, &r2, &rs_bad) == E_INVALIDARG && !rs_bad, "CreateRasterizerState2 refuses an unknown conservative mode");
   /* Query1 keeps its context type */
   D3D11_QUERY_DESC1 qd = {D3D11_QUERY_EVENT, 0, D3D11_CONTEXT_TYPE_COMPUTE};
   ID3D11Query1 *q1 = NULL;
@@ -2306,8 +2327,19 @@ static void test_device5(void) {
         o.MapNoOverwriteOnDynamicConstantBuffer && !o.OutputMergerLogicOp && !o.ExtendedDoublesShaderInstructions, "D3D11_FEATURE_D3D11_OPTIONS");
   D3D11_FEATURE_DATA_D3D11_OPTIONS2 o2;
   memset(&o2, 0xCC, sizeof o2);
-  check(SUCCEEDED(ID3D11Device5_CheckFeatureSupport(d5, D3D11_FEATURE_D3D11_OPTIONS2, &o2, sizeof o2)) && o2.TiledResourcesTier == D3D11_TILED_RESOURCES_NOT_SUPPORTED &&
-        o2.ConservativeRasterizationTier == D3D11_CONSERVATIVE_RASTERIZATION_NOT_SUPPORTED && !o2.MapOnDefaultTextures && !o2.StandardSwizzle, "D3D11_FEATURE_D3D11_OPTIONS2");
+  check(SUCCEEDED(ID3D11Device5_CheckFeatureSupport(d5, D3D11_FEATURE_D3D11_OPTIONS2, &o2, sizeof o2)) && o2.TiledResourcesTier == D3D11_TILED_RESOURCES_TIER_1 &&
+        o2.ConservativeRasterizationTier <= D3D11_CONSERVATIVE_RASTERIZATION_TIER_1 && o2.MapOnDefaultTextures && o2.StandardSwizzle, "D3D11_FEATURE_D3D11_OPTIONS2");
+  D3D11_FEATURE_DATA_D3D11_OPTIONS1 o1;
+  memset(&o1, 0xCC, sizeof o1);
+  check(SUCCEEDED(ID3D11Device5_CheckFeatureSupport(d5, D3D11_FEATURE_D3D11_OPTIONS1, &o1, sizeof o1)) && o1.TiledResourcesTier == D3D11_TILED_RESOURCES_TIER_1 &&
+        !o1.MinMaxFiltering && !o1.MapOnDefaultBuffers, "D3D11_FEATURE_D3D11_OPTIONS1: tiled resources tier 1");
+  D3D11_FEATURE_DATA_FORMAT_SUPPORT2 tf = {DXGI_FORMAT_R8G8B8A8_UNORM, 0};
+  check(SUCCEEDED(ID3D11Device5_CheckFeatureSupport(d5, D3D11_FEATURE_FORMAT_SUPPORT2, &tf, sizeof tf)) && (tf.OutFormatSupport2 & D3D11_FORMAT_SUPPORT2_TILED),
+        "FORMAT_SUPPORT2: R8G8B8A8_UNORM may be tiled");
+  tf.InFormat = DXGI_FORMAT_NV12;
+  tf.OutFormatSupport2 = 0;
+  ID3D11Device5_CheckFeatureSupport(d5, D3D11_FEATURE_FORMAT_SUPPORT2, &tf, sizeof tf);
+  check(!(tf.OutFormatSupport2 & D3D11_FORMAT_SUPPORT2_TILED), "FORMAT_SUPPORT2: NV12 is not tiled");
   D3D11_FEATURE_DATA_D3D11_OPTIONS5 o5;
   memset(&o5, 0xCC, sizeof o5);
   check(SUCCEEDED(ID3D11Device5_CheckFeatureSupport(d5, D3D11_FEATURE_D3D11_OPTIONS5, &o5, sizeof o5)) && (UINT)o5.SharedResourceTier <= D3D11_SHARED_RESOURCE_TIER_3,
@@ -2774,6 +2806,500 @@ static void test_render_to_levels(void) {
   ID3D11Texture2D_Release(texture);
 }
 
+/* Direct3D 11.2 - 11.3 features: tiled resources (tier 1), CPU access to default textures and their layouts, conservative rasterization; the other exports of d3d11.dll and
+ * IDXGIDevice::CreateSurface. */
+static UINT pdep32(UINT v, UINT mask) {
+  UINT out = 0;
+  for (UINT bit = 1; mask; bit <<= 1) {
+    const UINT lowest = mask & (0u - mask);
+    if (v & bit) out |= lowest;
+    mask &= mask - 1;
+  }
+  return out;
+}
+/* A 2D texture's first level (w x h, 4 bytes a texel), by way of a staging texture. */
+static int read_texture(ID3D11Texture2D *texture, UINT w, UINT h, UINT32 *out) {
+  D3D11_TEXTURE2D_DESC desc;
+  ID3D11Texture2D_GetDesc(texture, &desc);
+  desc.MipLevels = 1;
+  desc.Usage = D3D11_USAGE_STAGING;
+  desc.BindFlags = 0;
+  desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+  desc.MiscFlags = 0;
+  ID3D11Texture2D *staging = NULL;
+  if (FAILED(ID3D11Device_CreateTexture2D(g_device, &desc, NULL, &staging)) || !staging) return 0;
+  ID3D11DeviceContext_CopySubresourceRegion(g_context, (ID3D11Resource *)staging, 0, 0, 0, 0, (ID3D11Resource *)texture, 0, NULL);
+  D3D11_MAPPED_SUBRESOURCE mapped;
+  int ok = SUCCEEDED(ID3D11DeviceContext_Map(g_context, (ID3D11Resource *)staging, 0, D3D11_MAP_READ, 0, &mapped)) && mapped.pData;
+  if (ok) {
+    for (UINT y = 0; y < h; ++y) memcpy(out + (size_t)y * w, (const BYTE *)mapped.pData + (size_t)y * mapped.RowPitch, (size_t)w * 4);
+    ID3D11DeviceContext_Unmap(g_context, (ID3D11Resource *)staging, 0);
+  }
+  ID3D11Texture2D_Release(staging);
+  return ok;
+}
+
+static void test_tiled_resources(ID3D11Device5 *d5, ID3D11DeviceContext4 *c4) {
+  const UINT TILE = 65536;
+  /* a tile pool of two tiles; its size is a whole number of tiles */
+  D3D11_BUFFER_DESC pd = {2 * TILE, D3D11_USAGE_DEFAULT, 0, 0, D3D11_RESOURCE_MISC_TILE_POOL, 0};
+  ID3D11Buffer *pool = NULL, *bad = NULL;
+  check(SUCCEEDED(ID3D11Device5_CreateBuffer(d5, &pd, NULL, &pool)) && pool, "CreateBuffer: a tile pool of two tiles");
+  pd.ByteWidth = TILE + 4;
+  check(ID3D11Device5_CreateBuffer(d5, &pd, NULL, &bad) == E_INVALIDARG && !bad, "CreateBuffer refuses a tile pool that is not whole tiles");
+  pd.ByteWidth = TILE;
+  pd.MiscFlags = D3D11_RESOURCE_MISC_TILE_POOL | D3D11_RESOURCE_MISC_TILED;
+  check(ID3D11Device5_CreateBuffer(d5, &pd, NULL, &bad) == E_INVALIDARG && !bad, "CreateBuffer refuses TILED with TILE_POOL");
+  if (!pool) return;
+  check(ID3D11DeviceContext4_ResizeTilePool(c4, pool, TILE + 1) == E_INVALIDARG, "ResizeTilePool refuses a size that is not whole tiles");
+
+  /* a tiled buffer of three tiles: unmapped tiles read as zero; tiles 1 and 2 on one tile of the pool (REUSE_SINGLE_TILE) */
+  D3D11_BUFFER_DESC bd = {3 * TILE, D3D11_USAGE_DEFAULT, D3D11_BIND_SHADER_RESOURCE, 0, D3D11_RESOURCE_MISC_TILED, 0};
+  ID3D11Buffer *tb = NULL;
+  BYTE *bytes = malloc(4 * TILE), *back = malloc(4 * TILE);
+  D3D11_SUBRESOURCE_DATA initial = {bytes, 0, 0};
+  check(ID3D11Device5_CreateBuffer(d5, &bd, &initial, &bad) == E_INVALIDARG && !bad, "CreateBuffer refuses a tiled buffer with initial data");
+  check(SUCCEEDED(ID3D11Device5_CreateBuffer(d5, &bd, NULL, &tb)) && tb, "CreateBuffer: a tiled buffer of three tiles");
+  if (tb && bytes && back) {
+    UINT total = 0, subs = 4;
+    D3D11_PACKED_MIP_DESC packed;
+    D3D11_TILE_SHAPE shape;
+    ID3D11Device5_GetResourceTiling(d5, (ID3D11Resource *)tb, &total, &packed, &shape, &subs, 0, NULL);
+    check(total == 3 && subs == 0, "GetResourceTiling of the tiled buffer: three tiles");
+    memset(back, 0xEE, 3 * TILE);
+    check(read_buffer(tb, back, 3 * TILE) && back[0] == 0 && back[3 * TILE - 1] == 0, "a tiled buffer with nothing mapped reads as zeros");
+    /* (tile 0 on pool tile 1; tiles 1 and 2 on pool tile 0) */
+    const D3D11_TILED_RESOURCE_COORDINATE starts[2] = {{0, 0, 0, 0}, {1, 0, 0, 0}};
+    const D3D11_TILE_REGION_SIZE sizes[2] = {{1, FALSE, 0, 0, 0}, {2, FALSE, 0, 0, 0}};
+    const UINT flags[2] = {0, D3D11_TILE_RANGE_REUSE_SINGLE_TILE}, pool_starts[2] = {1, 0}, counts[2] = {1, 2};
+    check(SUCCEEDED(ID3D11DeviceContext4_UpdateTileMappings(c4, (ID3D11Resource *)tb, 2, starts, sizes, pool, 2, flags, pool_starts, counts, 0)), "UpdateTileMappings of a tiled buffer");
+    const UINT too_many[2] = {1, 3};
+    check(ID3D11DeviceContext4_UpdateTileMappings(c4, (ID3D11Resource *)tb, 2, starts, sizes, pool, 2, flags, pool_starts, too_many, 0) == E_INVALIDARG,
+          "UpdateTileMappings refuses ranges of more tiles than the regions have");
+    const UINT beyond[2] = {2, 0};
+    check(ID3D11DeviceContext4_UpdateTileMappings(c4, (ID3D11Resource *)tb, 2, starts, sizes, pool, 2, flags, beyond, counts, 0) == E_INVALIDARG,
+          "UpdateTileMappings refuses a range beyond the pool");
+    for (UINT i = 0; i < 2 * TILE; ++i) bytes[i] = (BYTE)(i * 7 + (i >> 16) * 3);
+    const D3D11_BOX first_two = {0, 0, 0, 2 * TILE, 1, 1};
+    ID3D11DeviceContext_UpdateSubresource(g_context, (ID3D11Resource *)tb, 0, &first_two, bytes, 0, 0);
+    memset(back, 0xEE, 3 * TILE);
+    check(read_buffer(tb, back, 3 * TILE) && memcmp(back, bytes, 2 * TILE) == 0, "the mapped tiles of a tiled buffer hold what was written");    check(memcmp(back + 2 * TILE, bytes + TILE, TILE) == 0, "two tiles on one tile of the pool: the third shows what the second was given");
+    /* CopyTileMappings: tile 2 takes tile 0's place in the pool */
+    const D3D11_TILED_RESOURCE_COORDINATE t2 = {2, 0, 0, 0}, t0 = {0, 0, 0, 0};
+    const D3D11_TILE_REGION_SIZE one = {1, FALSE, 0, 0, 0};
+    check(SUCCEEDED(ID3D11DeviceContext4_CopyTileMappings(c4, (ID3D11Resource *)tb, &t2, (ID3D11Resource *)tb, &t0, &one, 0)), "CopyTileMappings");
+    read_buffer(tb, back, 3 * TILE);
+    check(memcmp(back + 2 * TILE, bytes, TILE) == 0, "after CopyTileMappings the third tile shows the first's");
+    /* unmapping (a NULL range): zeros again */
+    const UINT null_flag = D3D11_TILE_RANGE_NULL;
+    check(SUCCEEDED(ID3D11DeviceContext4_UpdateTileMappings(c4, (ID3D11Resource *)tb, 1, &t0, &one, NULL, 1, &null_flag, NULL, NULL, 0)), "UpdateTileMappings: a NULL range");
+    read_buffer(tb, back, 3 * TILE);
+    check(back[0] == 0 && back[TILE - 1] == 0 && memcmp(back + TILE, bytes + TILE, TILE) == 0, "an unmapped tile reads as zero; the others keep theirs");
+    /* UpdateTiles and CopyTiles: what one puts in, the other gives back */
+    for (UINT i = 0; i < TILE; ++i) bytes[i] = (BYTE)(255 - (i % 251));
+    ID3D11DeviceContext4_UpdateTiles(c4, (ID3D11Resource *)tb, &t2, &one, bytes, 0);
+    ID3D11Buffer *linear = make_buffer(0, D3D11_USAGE_DEFAULT, 0, NULL, 2 * TILE);
+    if (linear) {
+      ID3D11DeviceContext4_CopyTiles(c4, (ID3D11Resource *)tb, &t2, &one, linear, TILE, D3D11_TILE_COPY_SWIZZLED_TILED_RESOURCE_TO_LINEAR_BUFFER);
+      read_buffer(linear, back, 2 * TILE);
+      check(memcmp(back + TILE, bytes, TILE) == 0, "UpdateTiles, then CopyTiles into a buffer gives the tile back");
+      ID3D11Buffer_Release(linear);
+    }
+    /* ResizeTilePool grows the pool (its description too) */
+    check(SUCCEEDED(ID3D11DeviceContext4_ResizeTilePool(c4, pool, 4 * TILE)), "ResizeTilePool to four tiles");
+    D3D11_BUFFER_DESC got;
+    ID3D11Buffer_GetDesc(pool, &got);
+    check(got.ByteWidth == 4 * TILE, "the pool's description has its new size");
+    ID3D11Buffer_Release(tb);
+  }
+
+  /* a tiled texture: 256 x 256 RGBA8 is four tiles of 128 x 128 */
+  D3D11_TEXTURE2D_DESC td = {256, 256, 1, 1, DXGI_FORMAT_R8G8B8A8_UNORM, {1, 0}, D3D11_USAGE_DEFAULT, D3D11_BIND_SHADER_RESOURCE, 0, D3D11_RESOURCE_MISC_TILED};
+  ID3D11Texture2D *tt = NULL, *tbad = NULL;
+  check(SUCCEEDED(ID3D11Device5_CreateTexture2D(d5, &td, NULL, &tt)) && tt, "CreateTexture2D: a tiled texture");
+  td.Format = DXGI_FORMAT_NV12;
+  check(ID3D11Device5_CreateTexture2D(d5, &td, NULL, &tbad) == E_INVALIDARG && !tbad, "CreateTexture2D refuses a tiled NV12 texture");
+  td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+  td.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+  check(ID3D11Device5_CreateTexture2D(d5, &td, NULL, &tbad) == E_INVALIDARG && !tbad, "CreateTexture2D refuses a tiled texture the CPU reads");
+  D3D11_TEXTURE3D_DESC vd = {32, 32, 32, 1, DXGI_FORMAT_R8G8B8A8_UNORM, D3D11_USAGE_DEFAULT, D3D11_BIND_SHADER_RESOURCE, 0, D3D11_RESOURCE_MISC_TILED};
+  ID3D11Texture3D *vbad = NULL;
+  check(ID3D11Device5_CreateTexture3D(d5, &vd, NULL, &vbad) == E_INVALIDARG && !vbad, "CreateTexture3D refuses a tiled volume (tier 3)");
+  UINT32 *texels = malloc(256 * 256 * 4), *seen = malloc(256 * 256 * 4);
+  if (tt && texels && seen) {
+    UINT total = 0, subs = 1;
+    D3D11_PACKED_MIP_DESC packed;
+    D3D11_TILE_SHAPE shape;
+    D3D11_SUBRESOURCE_TILING tiling;
+    memset(&tiling, 0, sizeof tiling);
+    ID3D11Device5_GetResourceTiling(d5, (ID3D11Resource *)tt, &total, &packed, &shape, &subs, 0, &tiling);
+    check(total == 4 && subs == 1 && shape.WidthInTexels == 128 && shape.HeightInTexels == 128 && tiling.WidthInTiles == 2 && tiling.HeightInTiles == 2 &&
+          tiling.StartTileIndexInOverallResource == 0 && packed.NumStandardMips == 1,
+          "GetResourceTiling of the tiled texture: 2 x 2 tiles of 128 x 128 texels");
+    const D3D11_TILED_RESOURCE_COORDINATE origin = {0, 0, 0, 0};
+    const D3D11_TILE_REGION_SIZE all = {4, FALSE, 0, 0, 0};
+    const UINT count = 4;
+    check(SUCCEEDED(ID3D11DeviceContext4_UpdateTileMappings(c4, (ID3D11Resource *)tt, 1, &origin, &all, pool, 1, NULL, NULL, &count, 0)),
+          "UpdateTileMappings: the texture's four tiles on the pool's");
+    for (UINT y = 0; y < 256; ++y)
+      for (UINT x = 0; x < 256; ++x) texels[y * 256 + x] = 0xFF000000u | (x << 8) | y | ((x ^ y) << 16);
+    ID3D11DeviceContext_UpdateSubresource(g_context, (ID3D11Resource *)tt, 0, NULL, texels, 256 * 4, 0);
+    check(read_texture(tt, 256, 256, seen) && memcmp(seen, texels, 256 * 256 * 4) == 0, "a tiled texture holds what UpdateSubresource wrote");
+    /* the second tile (the upper right one) unmapped by a box region: its texels read as zero */
+    const D3D11_TILED_RESOURCE_COORDINATE upper_right = {1, 0, 0, 0};
+    const D3D11_TILE_REGION_SIZE box = {1, TRUE, 1, 1, 1};
+    const UINT null_flag = D3D11_TILE_RANGE_NULL;
+    check(SUCCEEDED(ID3D11DeviceContext4_UpdateTileMappings(c4, (ID3D11Resource *)tt, 1, &upper_right, &box, NULL, 1, &null_flag, NULL, NULL, 0)), "UpdateTileMappings of a box region");
+    read_texture(tt, 256, 256, seen);
+    check(seen[10 * 256 + 200] == 0 && seen[10 * 256 + 10] == texels[10 * 256 + 10] && seen[200 * 256 + 200] == texels[200 * 256 + 200],
+          "the unmapped tile reads as zero, the others keep their texels");
+    /* CopyTiles out of the lower left tile and UpdateTiles into the lower right: the texels move with it */
+    BYTE *tile = malloc(TILE);
+    ID3D11Buffer *linear = make_buffer(0, D3D11_USAGE_DEFAULT, 0, NULL, TILE);
+    if (tile && linear) {
+      const D3D11_TILED_RESOURCE_COORDINATE lower_left = {0, 1, 0, 0}, lower_right = {1, 1, 0, 0};
+      const D3D11_TILE_REGION_SIZE one = {1, FALSE, 0, 0, 0};
+      ID3D11DeviceContext4_CopyTiles(c4, (ID3D11Resource *)tt, &lower_left, &one, linear, 0, D3D11_TILE_COPY_SWIZZLED_TILED_RESOURCE_TO_LINEAR_BUFFER);
+      check(read_buffer(linear, tile, TILE), "CopyTiles of a texture's tile into a buffer");
+      ID3D11DeviceContext4_UpdateTiles(c4, (ID3D11Resource *)tt, &lower_right, &one, tile, 0);
+      read_texture(tt, 256, 256, seen);
+      check(seen[200 * 256 + 200] == texels[200 * 256 + 72] && seen[255 * 256 + 128] == texels[255 * 256], "UpdateTiles of those bytes puts the lower left tile's texels on the lower right");
+      /* through a buffer of the GPU's memory too */
+      D3D11_BUFFER_DESC gd = {TILE, D3D11_USAGE_DEFAULT, D3D11_BIND_UNORDERED_ACCESS, 0, D3D11_RESOURCE_MISC_BUFFER_ALLOW_RAW_VIEWS, 0};
+      ID3D11Buffer *gpu = NULL;
+      ID3D11Device5_CreateBuffer(d5, &gd, NULL, &gpu);
+      if (gpu) {
+        ID3D11DeviceContext4_CopyTiles(c4, (ID3D11Resource *)tt, &lower_left, &one, gpu, 0, D3D11_TILE_COPY_SWIZZLED_TILED_RESOURCE_TO_LINEAR_BUFFER);
+        BYTE *again = malloc(TILE);
+        check(again && read_buffer(gpu, again, TILE) && memcmp(again, tile, TILE) == 0, "CopyTiles into a buffer of the GPU's memory: the same bytes");
+        free(again);
+        ID3D11Buffer_Release(gpu);
+      }
+    }
+    if (linear) ID3D11Buffer_Release(linear);
+    free(tile);
+    /* a deferred context records the tile calls; they run when its list is executed */
+    ID3D11DeviceContext *deferred = NULL;
+    ID3D11Device5_CreateDeferredContext(d5, 0, &deferred);
+    ID3D11DeviceContext2 *deferred2 = NULL;
+    if (deferred) ID3D11DeviceContext_QueryInterface(deferred, &IID_ID3D11DeviceContext2, (void **)&deferred2);
+    if (deferred2) {
+      const D3D11_TILED_RESOURCE_COORDINATE upper_left = {0, 0, 0, 0};
+      const D3D11_TILE_REGION_SIZE one = {1, FALSE, 0, 0, 0};
+      check(SUCCEEDED(ID3D11DeviceContext2_UpdateTileMappings(deferred2, (ID3D11Resource *)tt, 1, &upper_left, &one, NULL, 1, &null_flag, NULL, NULL, 0)),
+            "a deferred context records UpdateTileMappings");
+      check(ID3D11DeviceContext2_ResizeTilePool(deferred2, pool, 3) == E_INVALIDARG, "a deferred context checks ResizeTilePool as it records");
+      read_texture(tt, 256, 256, seen);
+      check(seen[10 * 256 + 10] == texels[10 * 256 + 10], "nothing recorded runs before the list is executed");
+      ID3D11CommandList *list = NULL;
+      if (SUCCEEDED(ID3D11DeviceContext2_FinishCommandList(deferred2, FALSE, &list)) && list) {
+        ID3D11DeviceContext_ExecuteCommandList(g_context, list, FALSE);
+        ID3D11CommandList_Release(list);
+      }
+      read_texture(tt, 256, 256, seen);
+      check(seen[10 * 256 + 10] == 0 && seen[200 * 256 + 10] == texels[200 * 256 + 10], "the recorded UpdateTileMappings ran with the list");
+      ID3D11DeviceContext2_Release(deferred2);
+    }
+    if (deferred) ID3D11DeviceContext_Release(deferred);
+    /* a texture of levels: the small ones are packed */
+    D3D11_TEXTURE2D_DESC md = {256, 256, 0, 1, DXGI_FORMAT_R8G8B8A8_UNORM, {1, 0}, D3D11_USAGE_DEFAULT, D3D11_BIND_SHADER_RESOURCE, 0, D3D11_RESOURCE_MISC_TILED};
+    ID3D11Texture2D *mips = NULL;
+    if (SUCCEEDED(ID3D11Device5_CreateTexture2D(d5, &md, NULL, &mips)) && mips) {
+      UINT mtotal = 0, msubs = 9;
+      D3D11_PACKED_MIP_DESC mpacked;
+      ID3D11Device5_GetResourceTiling(d5, (ID3D11Resource *)mips, &mtotal, &mpacked, NULL, &msubs, 0, NULL);
+      check(msubs == 9 && mpacked.NumStandardMips == 2 && mpacked.NumPackedMips == 7 && mtotal == 4 + 1 + mpacked.NumTilesForPackedMips,
+            "GetResourceTiling of a tiled texture of levels: two standard levels, seven packed");
+      ID3D11Texture2D_Release(mips);
+    } else {
+      check(0, "CreateTexture2D: a tiled texture of levels");
+    }
+    ID3D11Texture2D_Release(tt);
+  }
+  free(texels);
+  free(seen);
+  free(bytes);
+  free(back);
+  ID3D11Buffer_Release(pool);
+}
+
+static void test_default_texture_access(ID3D11Device5 *d5) {
+  /* the driver's layout: Map with no pointer, then WriteToSubresource / ReadFromSubresource */
+  D3D11_TEXTURE2D_DESC td = {16, 16, 1, 1, DXGI_FORMAT_R8G8B8A8_UNORM, {1, 0}, D3D11_USAGE_DEFAULT, D3D11_BIND_SHADER_RESOURCE, D3D11_CPU_ACCESS_READ | D3D11_CPU_ACCESS_WRITE, 0};
+  ID3D11Texture2D *t = NULL, *bad = NULL;
+  check(SUCCEEDED(ID3D11Device5_CreateTexture2D(d5, &td, NULL, &t)) && t, "CreateTexture2D: a default texture the CPU reads and writes");
+  td.BindFlags = D3D11_BIND_DEPTH_STENCIL;
+  td.Format = DXGI_FORMAT_D32_FLOAT;
+  check(ID3D11Device5_CreateTexture2D(d5, &td, NULL, &bad) == E_INVALIDARG && !bad, "CreateTexture2D refuses a depth buffer the CPU reaches");
+  UINT32 texels[16 * 16], seen[16 * 16];
+  for (UINT i = 0; i < 256; ++i) texels[i] = 0xFF000000u | (i * 0x010203u);
+  if (t) {
+    D3D11_MAPPED_SUBRESOURCE mapped;
+    check(ID3D11DeviceContext_Map(g_context, (ID3D11Resource *)t, 0, D3D11_MAP_WRITE, 0, &mapped) == E_INVALIDARG, "Map of a texture of the driver's layout with a pointer: E_INVALIDARG");
+    check(ID3D11DeviceContext_Map(g_context, (ID3D11Resource *)t, 0, D3D11_MAP_WRITE_DISCARD, 0, NULL) == E_INVALIDARG, "Map WRITE_DISCARD of a default texture: E_INVALIDARG");
+    check(SUCCEEDED(ID3D11DeviceContext_Map(g_context, (ID3D11Resource *)t, 0, D3D11_MAP_READ_WRITE, 0, NULL)), "Map with no pointer");
+    ID3D11Device5_WriteToSubresource(d5, (ID3D11Resource *)t, 0, NULL, texels, 16 * 4, 0);
+    const UINT32 square[4] = {0xFF0000FFu, 0xFF00FF00u, 0xFFFF0000u, 0xFFFFFFFFu};
+    const D3D11_BOX box = {4, 5, 0, 6, 7, 1};
+    ID3D11Device5_WriteToSubresource(d5, (ID3D11Resource *)t, 0, &box, square, 8, 0);
+    memset(seen, 0, sizeof seen);
+    ID3D11Device5_ReadFromSubresource(d5, seen, 16 * 4, 0, (ID3D11Resource *)t, 0, NULL);
+    UINT32 expect[16 * 16];
+    memcpy(expect, texels, sizeof expect);
+    expect[5 * 16 + 4] = square[0], expect[5 * 16 + 5] = square[1], expect[6 * 16 + 4] = square[2], expect[6 * 16 + 5] = square[3];
+    check(memcmp(seen, expect, sizeof seen) == 0, "WriteToSubresource of the whole and of a box, ReadFromSubresource gives them back");
+    UINT32 part[2] = {0, 0};
+    const D3D11_BOX row = {5, 6, 0, 7, 7, 1};
+    ID3D11Device5_ReadFromSubresource(d5, part, 8, 0, (ID3D11Resource *)t, 0, &row);
+    check(part[0] == square[3] && part[1] == texels[6 * 16 + 6], "ReadFromSubresource of a box");
+    ID3D11DeviceContext_Unmap(g_context, (ID3D11Resource *)t, 0);
+    memset(seen, 0, sizeof seen);
+    check(read_texture(t, 16, 16, seen) && memcmp(seen, expect, sizeof seen) == 0, "the GPU's copy of it has the texels written");
+    /* not mapped: the calls do nothing */
+    ID3D11Device5_WriteToSubresource(d5, (ID3D11Resource *)t, 0, NULL, texels, 16 * 4, 0);
+    read_texture(t, 16, 16, seen);
+    check(seen[5 * 16 + 4] == square[0], "WriteToSubresource of a subresource that is not mapped does nothing");
+    ID3D11Texture2D_Release(t);
+  }
+
+  /* ROW_MAJOR: Map hands out the rows */
+  D3D11_TEXTURE2D_DESC1 rd = {16, 16, 1, 1, DXGI_FORMAT_R8G8B8A8_UNORM, {1, 0}, D3D11_USAGE_DEFAULT, D3D11_BIND_SHADER_RESOURCE, D3D11_CPU_ACCESS_READ | D3D11_CPU_ACCESS_WRITE, 0,
+                          D3D11_TEXTURE_LAYOUT_ROW_MAJOR};
+  ID3D11Texture2D1 *rm = NULL;
+  check(SUCCEEDED(ID3D11Device5_CreateTexture2D1(d5, &rd, NULL, &rm)) && rm, "CreateTexture2D1: ROW_MAJOR");
+  if (rm) {
+    D3D11_TEXTURE2D_DESC1 got;
+    ID3D11Texture2D1_GetDesc1(rm, &got);
+    check(got.TextureLayout == D3D11_TEXTURE_LAYOUT_ROW_MAJOR, "Texture2D1::GetDesc1 gives ROW_MAJOR back");
+    D3D11_MAPPED_SUBRESOURCE mapped;
+    check(ID3D11DeviceContext_Map(g_context, (ID3D11Resource *)rm, 0, D3D11_MAP_WRITE, 0, NULL) == E_INVALIDARG, "Map of ROW_MAJOR without a pointer: E_INVALIDARG");
+    if (SUCCEEDED(ID3D11DeviceContext_Map(g_context, (ID3D11Resource *)rm, 0, D3D11_MAP_WRITE, 0, &mapped)) && mapped.pData) {
+      check(mapped.RowPitch >= 64, "Map of ROW_MAJOR: a row pitch");
+      for (UINT y = 0; y < 16; ++y) memcpy((BYTE *)mapped.pData + (size_t)y * mapped.RowPitch, texels + y * 16, 64);
+      ID3D11DeviceContext_Unmap(g_context, (ID3D11Resource *)rm, 0);
+      check(read_texture((ID3D11Texture2D *)rm, 16, 16, seen) && memcmp(seen, texels, sizeof seen) == 0, "the rows written through Map of ROW_MAJOR are the texture's");
+    } else {
+      check(0, "Map of ROW_MAJOR");
+    }
+    ID3D11Texture2D1_Release(rm);
+  }
+
+  /* 64K_STANDARD_SWIZZLE: Map hands out Direct3D's standard swizzle (2D 32-bit: x bytes 0xAA8F, y 0x5570; 3D 32-bit: x 0x920F, y 0x4930, z 0x24C0) */
+  D3D11_TEXTURE2D_DESC1 sd = rd;
+  sd.TextureLayout = D3D11_TEXTURE_LAYOUT_64K_STANDARD_SWIZZLE;
+  ID3D11Texture2D1 *sw = NULL;
+  check(SUCCEEDED(ID3D11Device5_CreateTexture2D1(d5, &sd, NULL, &sw)) && sw, "CreateTexture2D1: 64K_STANDARD_SWIZZLE");
+  if (sw) {
+    ID3D11DeviceContext_UpdateSubresource(g_context, (ID3D11Resource *)sw, 0, NULL, texels, 64, 0);
+    D3D11_MAPPED_SUBRESOURCE mapped;
+    if (SUCCEEDED(ID3D11DeviceContext_Map(g_context, (ID3D11Resource *)sw, 0, D3D11_MAP_READ_WRITE, 0, &mapped)) && mapped.pData) {
+      const BYTE *base = mapped.pData;
+      int same = 1;
+      for (UINT y = 0; y < 16; ++y)
+        for (UINT x = 0; x < 16; ++x) {
+          UINT32 v;
+          memcpy(&v, base + (pdep32(x * 4, 0xAA8Fu) | pdep32(y, 0x5570u)), 4);
+          if (v != texels[y * 16 + x]) same = 0;
+        }
+      check(same && mapped.RowPitch == 65536, "Map of 64K_STANDARD_SWIZZLE: the texels in the standard swizzle, a tile a row");
+      const UINT32 marker = 0xFF123456u;
+      memcpy((BYTE *)mapped.pData + (pdep32(7 * 4, 0xAA8Fu) | pdep32(9, 0x5570u)), &marker, 4);
+      ID3D11DeviceContext_Unmap(g_context, (ID3D11Resource *)sw, 0);
+      check(read_texture((ID3D11Texture2D *)sw, 16, 16, seen) && seen[9 * 16 + 7] == marker && seen[9 * 16 + 8] == texels[9 * 16 + 8], "a texel written in the swizzle is the texture's");
+    } else {
+      check(0, "Map of 64K_STANDARD_SWIZZLE");
+    }
+    ID3D11Texture2D1_Release(sw);
+  }
+  D3D11_TEXTURE3D_DESC1 vd = {4, 4, 4, 1, DXGI_FORMAT_R8G8B8A8_UNORM, D3D11_USAGE_DEFAULT, D3D11_BIND_SHADER_RESOURCE, D3D11_CPU_ACCESS_READ, 0, D3D11_TEXTURE_LAYOUT_64K_STANDARD_SWIZZLE};
+  UINT32 volume[64];
+  for (UINT i = 0; i < 64; ++i) volume[i] = 0xFF000000u | (i * 0x030507u);
+  D3D11_SUBRESOURCE_DATA vinit = {volume, 16, 64};
+  ID3D11Texture3D1 *vol = NULL;
+  check(SUCCEEDED(ID3D11Device5_CreateTexture3D1(d5, &vd, &vinit, &vol)) && vol, "CreateTexture3D1: a volume of 64K_STANDARD_SWIZZLE");
+  if (vol) {
+    D3D11_MAPPED_SUBRESOURCE mapped;
+    if (SUCCEEDED(ID3D11DeviceContext_Map(g_context, (ID3D11Resource *)vol, 0, D3D11_MAP_READ, 0, &mapped)) && mapped.pData) {
+      int same = 1;
+      for (UINT z = 0; z < 4; ++z)
+        for (UINT y = 0; y < 4; ++y)
+          for (UINT x = 0; x < 4; ++x) {
+            UINT32 v;
+            memcpy(&v, (const BYTE *)mapped.pData + (pdep32(x * 4, 0x920Fu) | pdep32(y, 0x4930u) | pdep32(z, 0x24C0u)), 4);
+            if (v != volume[z * 16 + y * 4 + x]) same = 0;
+          }
+      check(same && mapped.RowPitch == 65536 && mapped.DepthPitch == 65536, "Map of a swizzled volume: the 3D standard swizzle");
+      ID3D11DeviceContext_Unmap(g_context, (ID3D11Resource *)vol, 0);
+    } else {
+      check(0, "Map of a swizzled volume");
+    }
+    ID3D11Texture3D1_Release(vol);
+  }
+}
+
+/* Conservative rasterization: a sliver holding no pixel centre draws nothing, and conservatively every pixel it touches. */
+static void test_conservative(ID3D11Device5 *d5) {
+  D3D11_FEATURE_DATA_D3D11_OPTIONS2 o2;
+  memset(&o2, 0, sizeof o2);
+  ID3D11Device5_CheckFeatureSupport(d5, D3D11_FEATURE_D3D11_OPTIONS2, &o2, sizeof o2);
+  if (o2.ConservativeRasterizationTier == D3D11_CONSERVATIVE_RASTERIZATION_NOT_SUPPORTED) {
+    printf("d3d11test: (no conservative rasterization on this adapter)\n");
+    return;
+  }
+  /* (pixels (2.1, 2.1), (5.9, 2.1), (2.1, 2.4) of the 64 x 64 target) */
+#define NX(px) ((px) / 32.0f - 1.0f)
+#define NY(py) (1.0f - (py) / 32.0f)
+  const VertexF v[3] = {{NX(2.1f), NY(2.1f), 0.5f, 0, 1, 0, 1}, {NX(5.9f), NY(2.1f), 0.5f, 0, 1, 0, 1}, {NX(2.1f), NY(2.4f), 0.5f, 0, 1, 0, 1}};
+#undef NX
+#undef NY
+  ID3D11Buffer *vertices = make_buffer(D3D11_BIND_VERTEX_BUFFER, D3D11_USAGE_DEFAULT, 0, v, sizeof v);
+  const D3D11_RASTERIZER_DESC2 r2 = {D3D11_FILL_SOLID, D3D11_CULL_NONE, FALSE, 0, 0, 0, TRUE, FALSE, FALSE, FALSE, 0, D3D11_CONSERVATIVE_RASTERIZATION_MODE_ON};
+  ID3D11RasterizerState2 *conservative = NULL;
+  ID3D11Device5_CreateRasterizerState2(d5, &r2, &conservative);
+  if (!vertices || !conservative) { check(0, "a sliver and a conservative rasterizer state"); if (vertices) ID3D11Buffer_Release(vertices); return; }
+  begin(NULL);
+  clear(0, 0, 0);
+  bind_floats(vertices);
+  ID3D11DeviceContext_PSSetShader(g_context, g_ps_color, NULL, 0);
+  ID3D11DeviceContext_Draw(g_context, 3, 0);
+  read_target();
+  int lit = 0;
+  for (int i = 0; i < SIZE * SIZE; ++i) lit += (g_pixels[i] & 0xFFFFFF) != 0;
+  check(lit == 0, "a sliver between the pixel centres draws nothing");
+  ID3D11DeviceContext_RSSetState(g_context, (ID3D11RasterizerState *)conservative);
+  ID3D11DeviceContext_Draw(g_context, 3, 0);
+  read_target();
+  lit = 0;
+  for (int i = 0; i < SIZE * SIZE; ++i) lit += (g_pixels[i] & 0xFFFFFF) != 0;
+  check(lit == 4 && green(pixel(2, 2)) == 255 && green(pixel(5, 2)) == 255, "conservatively, every pixel the sliver touches");
+  ID3D11DeviceContext_RSSetState(g_context, g_no_cull);
+  ID3D11RasterizerState2_Release(conservative);
+  ID3D11Buffer_Release(vertices);
+}
+
+/* The exports of d3d11.dll beyond the device creators, and IDXGIDevice::CreateSurface. */
+static void test_exports(void) {
+  HMODULE d3d11 = GetModuleHandleA("d3d11.dll");
+  typedef INT(WINAPI * BeginEvent)(IUnknown *, LPCWSTR);
+  typedef INT(WINAPI * EndEvent)(IUnknown *);
+  typedef BOOL(WINAPI * GetStatus)(IUnknown *);
+  typedef void(WINAPI * SetMarker)(IUnknown *, LPCWSTR);
+  typedef HRESULT(WINAPI * OpenAdapter)(void *);
+  typedef HRESULT(WINAPI * RegisterLayers)(const void *, DWORD);
+  typedef SIZE_T(WINAPI * LayeredSize)(const void *, DWORD);
+  typedef HRESULT(WINAPI * CreateLayered)(const void *, DWORD, const void *, REFIID, void **);
+  typedef HRESULT(WINAPI * ForD3D12)(IUnknown *, UINT, const D3D_FEATURE_LEVEL *, UINT, IUnknown *const *, UINT, UINT, ID3D11Device **, ID3D11DeviceContext **);
+  BeginEvent begin_event = (BeginEvent)(void (*)(void))GetProcAddress(d3d11, "D3DPerformance_BeginEvent");
+  EndEvent end_event = (EndEvent)(void (*)(void))GetProcAddress(d3d11, "D3DPerformance_EndEvent");
+  GetStatus get_status = (GetStatus)(void (*)(void))GetProcAddress(d3d11, "D3DPerformance_GetStatus");
+  SetMarker set_marker = (SetMarker)(void (*)(void))GetProcAddress(d3d11, "D3DPerformance_SetMarker");
+  check(begin_event && end_event && get_status && set_marker, "d3d11.dll exports D3DPerformance_*");
+  if (begin_event && end_event && get_status && set_marker) {
+    check(begin_event((IUnknown *)g_context, L"frame") == -1 && end_event((IUnknown *)g_context) == -1 && !get_status((IUnknown *)g_context),
+          "D3DPerformance_*: no graphics debugger attached (-1, FALSE)");
+    set_marker((IUnknown *)g_context, L"marker");
+    check(begin_event(NULL, L"x") == -1 && !get_status(NULL), "D3DPerformance_* without a context");
+  }
+  OpenAdapter open10 = (OpenAdapter)(void (*)(void))GetProcAddress(d3d11, "OpenAdapter10"), open10_2 = (OpenAdapter)(void (*)(void))GetProcAddress(d3d11, "OpenAdapter10_2");
+  BYTE open_data[64];
+  memset(open_data, 0, sizeof open_data);
+  check(open10 && open10_2 && open10(NULL) == E_INVALIDARG && open10(open_data) == DXGI_ERROR_UNSUPPORTED && open10_2(open_data) == DXGI_ERROR_UNSUPPORTED,
+        "OpenAdapter10 / 10_2: no Direct3D 9 driver to map onto (DXGI_ERROR_UNSUPPORTED)");
+  RegisterLayers register_layers = (RegisterLayers)(void (*)(void))GetProcAddress(d3d11, "D3D11CoreRegisterLayers");
+  LayeredSize layered_size = (LayeredSize)(void (*)(void))GetProcAddress(d3d11, "D3D11CoreGetLayeredDeviceSize");
+  CreateLayered create_layered = (CreateLayered)(void (*)(void))GetProcAddress(d3d11, "D3D11CoreCreateLayeredDevice");
+  void *layered = (void *)1;
+  check(register_layers && layered_size && create_layered && register_layers(open_data, 1) == DXGI_ERROR_SDK_COMPONENT_MISSING && layered_size(open_data, 1) == 0 &&
+        create_layered(open_data, 1, NULL, &IID_ID3D11Device, &layered) == DXGI_ERROR_SDK_COMPONENT_MISSING && !layered,
+        "the layered device exports: no SDK layers (DXGI_ERROR_SDK_COMPONENT_MISSING)");
+  ForD3D12 for_d3d12 = (ForD3D12)(void (*)(void))GetProcAddress(d3d11, "D3D11CreateDeviceForD3D12");
+  ID3D12Device *d12 = NULL;
+  ID3D12CommandQueue *queue = NULL;
+  if (for_d3d12 && SUCCEEDED(D3D12CreateDevice(NULL, D3D_FEATURE_LEVEL_11_0, &IID_ID3D12Device, (void **)&d12)) && d12) {
+    const D3D12_COMMAND_QUEUE_DESC qd = {D3D12_COMMAND_LIST_TYPE_DIRECT, 0, D3D12_COMMAND_QUEUE_FLAG_NONE, 0};
+    ID3D12Device_CreateCommandQueue(d12, &qd, &IID_ID3D12CommandQueue, (void **)&queue);
+    ID3D11Device *dev = NULL;
+    ID3D11DeviceContext *ctx = NULL;
+    check(queue && SUCCEEDED(for_d3d12((IUnknown *)d12, 0, NULL, 0, (IUnknown **)&queue, 1, 0, &dev, &ctx)) && dev && ctx, "D3D11CreateDeviceForD3D12: a device on Direct3D 12's");
+    ID3D11On12Device *on12 = NULL;
+    if (dev) {
+      check(SUCCEEDED(ID3D11Device_QueryInterface(dev, &IID_ID3D11On12Device, (void **)&on12)) && on12, "... which is an ID3D11On12Device");
+      if (on12) ID3D11On12Device_Release(on12);
+      ID3D11Device_Release(dev);
+    }
+    if (ctx) ID3D11DeviceContext_Release(ctx);
+    check(for_d3d12((IUnknown *)d12, 0, NULL, 0, NULL, 0, 0, &dev, NULL) == E_INVALIDARG, "D3D11CreateDeviceForD3D12 refuses no queue");
+    if (queue) ID3D12CommandQueue_Release(queue);
+    ID3D12Device_Release(d12);
+  } else {
+    check(for_d3d12 != NULL, "d3d11.dll exports D3D11CreateDeviceForD3D12");
+  }
+  /* IDXGIDevice::CreateSurface: textures as DXGI surfaces */
+  IDXGIDevice *dxgi = NULL;
+  ID3D11Device_QueryInterface(g_device, &IID_IDXGIDevice, (void **)&dxgi);
+  if (dxgi) {
+    const DXGI_SURFACE_DESC sd = {32, 16, DXGI_FORMAT_R8G8B8A8_UNORM, {1, 0}};
+    IDXGISurface *surfaces[2] = {NULL, NULL};
+    check(SUCCEEDED(IDXGIDevice_CreateSurface(dxgi, &sd, 2, DXGI_USAGE_SHADER_INPUT | DXGI_USAGE_RENDER_TARGET_OUTPUT, NULL, surfaces)) && surfaces[0] && surfaces[1] &&
+          surfaces[0] != surfaces[1], "IDXGIDevice::CreateSurface: two surfaces");
+    for (int i = 0; i < 2; ++i)
+      if (surfaces[i]) {
+        DXGI_SURFACE_DESC got;
+        ID3D11Texture2D *texture = NULL;
+        IDXGISurface_GetDesc(surfaces[i], &got);
+        check(got.Width == 32 && got.Height == 16 && got.Format == DXGI_FORMAT_R8G8B8A8_UNORM && SUCCEEDED(IDXGISurface_QueryInterface(surfaces[i], &IID_ID3D11Texture2D, (void **)&texture)) &&
+              texture, "a surface of CreateSurface: its description, and a texture");
+        if (texture) {
+          D3D11_TEXTURE2D_DESC td;
+          ID3D11Texture2D_GetDesc(texture, &td);
+          check(td.Usage == D3D11_USAGE_DEFAULT && td.BindFlags == (D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET) && td.MipLevels == 1 && td.ArraySize == 1,
+                "the surface's texture: default usage, bound as the usage said");
+          ID3D11Texture2D_Release(texture);
+        }
+        IDXGISurface_Release(surfaces[i]);
+      }
+    IDXGISurface *one = NULL;
+    check(SUCCEEDED(IDXGIDevice_CreateSurface(dxgi, &sd, 1, DXGI_CPU_ACCESS_READ_WRITE, NULL, &one)) && one, "CreateSurface of a surface the CPU reads and writes (staging)");
+    if (one) IDXGISurface_Release(one);
+    one = NULL;
+    check(IDXGIDevice_CreateSurface(dxgi, &sd, 0, DXGI_USAGE_SHADER_INPUT, NULL, &one) == E_INVALIDARG && !one, "CreateSurface refuses a count of 0");
+    IDXGIDevice_Release(dxgi);
+  }
+}
+
+/* EnableFeatureLevelUpgrade (last: it changes every device made after it): a device asked for at level 10_0 is made at 11_0. */
+static void test_feature_level_upgrade(void) {
+  typedef void(WINAPI * Enable)(void);
+  Enable enable = (Enable)(void (*)(void))GetProcAddress(GetModuleHandleA("d3d11.dll"), "EnableFeatureLevelUpgrade");
+  const D3D_FEATURE_LEVEL ten = D3D_FEATURE_LEVEL_10_0;
+  ID3D11Device *dev = NULL;
+  D3D_FEATURE_LEVEL got = 0;
+  check(SUCCEEDED(D3D11CreateDevice(NULL, D3D_DRIVER_TYPE_HARDWARE, NULL, 0, &ten, 1, D3D11_SDK_VERSION, &dev, &got, NULL)) && got == D3D_FEATURE_LEVEL_10_0,
+        "a device asked for at 10_0 is made at 10_0");
+  if (dev) ID3D11Device_Release(dev);
+  if (!enable) { check(0, "d3d11.dll exports EnableFeatureLevelUpgrade"); return; }
+  enable();
+  dev = NULL;
+  check(SUCCEEDED(D3D11CreateDevice(NULL, D3D_DRIVER_TYPE_HARDWARE, NULL, 0, &ten, 1, D3D11_SDK_VERSION, &dev, &got, NULL)) && got == D3D_FEATURE_LEVEL_11_0 && dev &&
+        ID3D11Device_GetFeatureLevel(dev) == D3D_FEATURE_LEVEL_11_0, "after EnableFeatureLevelUpgrade it is made at 11_0");
+  if (dev) ID3D11Device_Release(dev);
+}
+
+static void test_d3d11_3(void) {
+  ID3D11Device5 *d5 = NULL;
+  ID3D11DeviceContext4 *c4 = NULL;
+  ID3D11Device_QueryInterface(g_device, &IID_ID3D11Device5, (void **)&d5);
+  ID3D11DeviceContext_QueryInterface(g_context, &IID_ID3D11DeviceContext4, (void **)&c4);
+  if (d5 && c4) {
+    test_tiled_resources(d5, c4);
+    test_default_texture_access(d5);
+    test_conservative(d5);
+  }
+  if (d5) ID3D11Device5_Release(d5);
+  if (c4) ID3D11DeviceContext4_Release(c4);
+  test_exports();
+}
+
 int main(void) {
   test_device();
   if (g_device && g_context) {
@@ -2811,10 +3337,12 @@ int main(void) {
       test_layered_target();
       test_plane_uavs();
       test_device5();
+      test_d3d11_3();
     }
     ID3D11DeviceContext_ClearState(g_context);
     ID3D11DeviceContext_Flush(g_context);
     test_swap_chain();
+    test_feature_level_upgrade();
   }
   if (g_failed == 0) printf("d3d11test: all %d checks passed\n", g_passed);
   else printf("d3d11test: %d of %d checks FAILED\n", g_failed, g_passed + g_failed);

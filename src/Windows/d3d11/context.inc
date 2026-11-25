@@ -60,6 +60,7 @@ static ID3D12PipelineState *pipeline_get(Dev *d, Ctx *c) {
   key.depth = c->depth ? c->depth->desc : g_default_depth;
   key.raster = c->raster ? c->raster->desc : g_default_raster;
   key.raster.ScissorEnable = 0;      /* (not the pipeline's: the scissor rectangle is set with the viewport) */
+  key.conservative = c->raster ? (UINT)c->raster->desc2.ConservativeRaster : 0u;
   key.targets = c->rtv_count;
   key.has_depth = c->dsv != NULL;
   key.samples = 1;
@@ -77,7 +78,7 @@ static ID3D12PipelineState *pipeline_get(Dev *d, Ctx *c) {
     Pipeline *p = &d->pipelines[i];
     if (p->vs == key.vs && p->ps == key.ps && p->gs == key.gs && p->hs == key.hs && p->ds == key.ds && p->layout == key.layout && p->targets == key.targets && p->has_depth == key.has_depth && p->samples == key.samples &&
         memcmp(p->formats, key.formats, sizeof key.formats) == 0 && p->depth_format == key.depth_format &&
-        memcmp(&p->blend, &key.blend, sizeof key.blend) == 0 && memcmp(&p->depth, &key.depth, sizeof key.depth) == 0 && memcmp(&p->raster, &key.raster, sizeof key.raster) == 0) {
+        memcmp(&p->blend, &key.blend, sizeof key.blend) == 0 && memcmp(&p->depth, &key.depth, sizeof key.depth) == 0 && memcmp(&p->raster, &key.raster, sizeof key.raster) == 0 && p->conservative == key.conservative) {
       p->last_used = ++d->pipeline_clock;
       return p->state;
     }
@@ -133,6 +134,7 @@ static ID3D12PipelineState *pipeline_get(Dev *d, Ctx *c) {
   pd.RasterizerState.DepthBiasClamp = key.raster.DepthBiasClamp;
   pd.RasterizerState.SlopeScaledDepthBias = key.raster.SlopeScaledDepthBias;
   pd.RasterizerState.DepthClipEnable = key.raster.DepthClipEnable;
+  pd.RasterizerState.ConservativeRaster = key.conservative ? D3D12_CONSERVATIVE_RASTERIZATION_MODE_ON : D3D12_CONSERVATIVE_RASTERIZATION_MODE_OFF;
   pd.DepthStencilState.DepthEnable = key.depth.DepthEnable;
   pd.DepthStencilState.DepthWriteMask = (D3D12_DEPTH_WRITE_MASK)key.depth.DepthWriteMask;
   pd.DepthStencilState.DepthFunc = (D3D12_COMPARISON_FUNC)key.depth.DepthFunc;
@@ -1385,9 +1387,16 @@ static HRESULT STDMETHODCALLTYPE ctx_Map(Ctx *c, ID3D11Resource *resource, UINT 
   (void)flags;
   Dev *d = c->dev;
   if (out) memset(out, 0, sizeof *out);
-  if (!out || type < D3D11_MAP_READ || type > D3D11_MAP_WRITE_NO_OVERWRITE) return E_INVALIDARG;
   Buf *b = buf_of_resource(resource);
   Tex *t = tex_of_resource(resource);
+  /* (a default texture the CPU reaches: layout.inc) */
+  if (t && t->desc.Usage == D3D11_USAGE_DEFAULT && t->desc.CPUAccessFlags) {
+    LOCK(c);
+    const HRESULT hr = tex_map_default(d, t, sub, type, out);
+    UNLOCK(c);
+    return hr;
+  }
+  if (!out || type < D3D11_MAP_READ || type > D3D11_MAP_WRITE_NO_OVERWRITE) return E_INVALIDARG;
   HRESULT hr = S_OK;
   LOCK(c);
   if (b) {
@@ -1424,6 +1433,12 @@ static void STDMETHODCALLTYPE ctx_Unmap(Ctx *c, ID3D11Resource *resource, UINT s
   if (c->deferred) { deferred_unmap(c, resource, sub); return; }
   Buf *b = buf_of_resource(resource);
   Tex *t = tex_of_resource(resource);
+  if (t && t->desc.Usage == D3D11_USAGE_DEFAULT && t->desc.CPUAccessFlags) {
+    LOCK(c);
+    tex_unmap_default(c->dev, t, sub);
+    UNLOCK(c);
+    return;
+  }
   LOCK(c);
   if (b) {
     ++b->version;

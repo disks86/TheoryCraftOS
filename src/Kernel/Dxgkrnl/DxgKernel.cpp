@@ -1664,10 +1664,11 @@ NtStatus Kernel::escape(ProcessId pid, Handle device, ConstByteView request, Byt
           }
         }
       }
-      if (!in.ok() || !in.at_end() || cull > 2 || front > 1 || compare > 7 || fail > 7 || depth_fail > 7 || pass > 7 || compare_mask > 255 || write_mask > 255 || reference > 255 || enable > 1)
+      if (!in.ok() || !in.at_end() || (cull & ~kCullConservative) > 2 || front > 1 || compare > 7 || fail > 7 || depth_fail > 7 || pass > 7 || compare_mask > 255 || write_mask > 255 || reference > 255 || enable > 1)
         return status::kInvalidParameter;
       if (reply.size() < 4) return status::kBufferTooSmall;
-      desc.cull_mode = static_cast<graphics::CullMode>(cull);
+      desc.cull_mode = static_cast<graphics::CullMode>(cull & ~kCullConservative);
+      desc.conservative = (cull & kCullConservative) != 0;
       desc.front_face = static_cast<graphics::FrontFace>(front);
       desc.depth_test = (flags & 1) != 0;
       desc.depth_write = (flags & 2) != 0;

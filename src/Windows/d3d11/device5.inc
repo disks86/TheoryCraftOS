@@ -24,8 +24,7 @@
  * - The *1 textures, views, rasterizer state and query (Device3): the descriptions with a plane slice, a texture layout, conservative rasterization and a context
  *   type. The formats here have one plane, textures have the driver's layout, and conservative rasterization is not there (CheckFeatureSupport says so), so the
  *   creators take what that leaves and refuse the rest with E_INVALIDARG, as Windows does on such a device.
- * - Tiled resources (Device2 / Context2 tile calls): the device has none (TiledResourcesTier NOT_SUPPORTED), so no resource is tiled and no buffer is a tile pool;
- *   the calls refuse what they are given, as on hardware without them.
+ * - Tiled resources (Device2 / Context2 tile calls): tiled.inc (TiledResourcesTier 1, over Direct3D 12's reserved resources).
  * - Device-removed events (Device4): the events are set when Direct3D 12 below loses the device. */
 
 /* ---- fences ------------------------------------------------------------------------------------------------------------------------------------------------- */
@@ -140,31 +139,6 @@ static void STDMETHODCALLTYPE ctx_SetMarkerInt(Ctx *c, const WCHAR *label, int d
 static void STDMETHODCALLTYPE ctx_BeginEventInt(Ctx *c, const WCHAR *label, int data) { (void)c; (void)label; (void)data; }
 static void STDMETHODCALLTYPE ctx_EndEvent(Ctx *c) { (void)c; }
 
-/* Tiled resources: none can be made here (TiledResourcesTier NOT_SUPPORTED: CreateBuffer and CreateTexture2D refuse D3D11_RESOURCE_MISC_TILED and TILE_POOL), so
- * every resource given is not tiled and every buffer not a tile pool - what the runtime refuses. */
-static HRESULT STDMETHODCALLTYPE ctx_UpdateTileMappings(Ctx *c, ID3D11Resource *resource, UINT regions, const D3D11_TILED_RESOURCE_COORDINATE *starts,
-                                                        const D3D11_TILE_REGION_SIZE *sizes, ID3D11Buffer *pool, UINT ranges, const UINT *range_flags,
-                                                        const UINT *pool_starts, const UINT *range_counts, UINT flags) {
-  (void)c; (void)resource; (void)regions; (void)starts; (void)sizes; (void)pool; (void)ranges; (void)range_flags; (void)pool_starts; (void)range_counts; (void)flags;
-  return E_INVALIDARG;
-}
-static HRESULT STDMETHODCALLTYPE ctx_CopyTileMappings(Ctx *c, ID3D11Resource *dst, const D3D11_TILED_RESOURCE_COORDINATE *dst_start, ID3D11Resource *src,
-                                                      const D3D11_TILED_RESOURCE_COORDINATE *src_start, const D3D11_TILE_REGION_SIZE *size, UINT flags) {
-  (void)c; (void)dst; (void)dst_start; (void)src; (void)src_start; (void)size; (void)flags;
-  return E_INVALIDARG;
-}
-static void STDMETHODCALLTYPE ctx_CopyTiles(Ctx *c, ID3D11Resource *resource, const D3D11_TILED_RESOURCE_COORDINATE *start, const D3D11_TILE_REGION_SIZE *size,
-                                            ID3D11Buffer *buffer, UINT64 offset, UINT flags) {
-  (void)c; (void)resource; (void)start; (void)size; (void)buffer; (void)offset; (void)flags;      /* (no tiled resource: the call is invalid and does nothing) */
-}
-static void STDMETHODCALLTYPE ctx_UpdateTiles(Ctx *c, ID3D11Resource *dst, const D3D11_TILED_RESOURCE_COORDINATE *start, const D3D11_TILE_REGION_SIZE *size,
-                                              const void *data, UINT flags) {
-  (void)c; (void)dst; (void)start; (void)size; (void)data; (void)flags;      /* (no tiled resource: the call is invalid and does nothing) */
-}
-static HRESULT STDMETHODCALLTYPE ctx_ResizeTilePool(Ctx *c, ID3D11Buffer *pool, UINT64 size) { (void)c; (void)pool; (void)size; return E_INVALIDARG; }
-/* (an ordering between uses of resources that alias tiles: the queue runs every command in order, so there is nothing to order) */
-static void STDMETHODCALLTYPE ctx_TiledResourceBarrier(Ctx *c, ID3D11DeviceChild *before, ID3D11DeviceChild *after) { (void)c; (void)before; (void)after; }
-
 /* ---- ID3D11Device2 ------------------------------------------------------------------------------------------------------------------------------------------ */
 
 static void STDMETHODCALLTYPE dev_GetImmediateContext2(Dev *d, ID3D11DeviceContext2 **out) { dev_GetImmediateContext(d, (ID3D11DeviceContext **)out); }
@@ -172,16 +146,13 @@ static void STDMETHODCALLTYPE dev_GetImmediateContext3(Dev *d, ID3D11DeviceConte
 static HRESULT STDMETHODCALLTYPE dev_CreateDeferredContext2(Dev *d, UINT flags, ID3D11DeviceContext2 **out) { return dev_CreateDeferredContext(d, flags, (ID3D11DeviceContext **)out); }
 static HRESULT STDMETHODCALLTYPE dev_CreateDeferredContext3(Dev *d, UINT flags, ID3D11DeviceContext3 **out) { return dev_CreateDeferredContext(d, flags, (ID3D11DeviceContext **)out); }
 
-/* A resource that is not tiled has no tiles: the counts are 0 and the descriptions empty. */
+/* (tiled.inc) */
 static void STDMETHODCALLTYPE dev_GetResourceTiling(Dev *d, ID3D11Resource *resource, UINT *tile_count, D3D11_PACKED_MIP_DESC *mip_desc, D3D11_TILE_SHAPE *tile_shape,
                                                     UINT *subresource_count, UINT first_subresource, D3D11_SUBRESOURCE_TILING *tilings) {
-  (void)d; (void)resource; (void)first_subresource; (void)tilings;
-  if (tile_count) *tile_count = 0;
-  if (mip_desc) memset(mip_desc, 0, sizeof *mip_desc);
-  if (tile_shape) memset(tile_shape, 0, sizeof *tile_shape);
-  if (subresource_count) *subresource_count = 0;
+  tiled_resource_tiling(d, resource, tile_count, mip_desc, tile_shape, subresource_count, first_subresource, tilings);
 }
-/* D3D11_CHECK_MULTISAMPLE_QUALITY_LEVELS_TILED_RESOURCE asks about tiled resources, which have no quality levels here. */
+/* D3D11_CHECK_MULTISAMPLE_QUALITY_LEVELS_TILED_RESOURCE asks about tiled resources, which are never multisampled here (Direct3D 12's reserved textures are of one sample):
+ * no quality levels. */
 static HRESULT STDMETHODCALLTYPE dev_CheckMultisampleQualityLevels1(Dev *d, DXGI_FORMAT format, UINT samples, UINT flags, UINT *levels) {
   if (!levels) return E_INVALIDARG;
   *levels = 0;
@@ -192,50 +163,50 @@ static HRESULT STDMETHODCALLTYPE dev_CheckMultisampleQualityLevels1(Dev *d, DXGI
 
 /* ---- ID3D11Device3 ------------------------------------------------------------------------------------------------------------------------------------------ */
 
-/* D3D11_TEXTURE_LAYOUT_ROW_MAJOR and 64K_STANDARD_SWIZZLE need MapOnDefaultTextures and StandardSwizzle, which the device does not have. */
+/* The *1 textures: D3D11_TEXTURE_LAYOUT (layout.inc says what each is and which descriptions it takes); the texture is made as CreateTexture2D / 3D makes it. */
 static HRESULT STDMETHODCALLTYPE dev_CreateTexture2D1(Dev *d, const D3D11_TEXTURE2D_DESC1 *desc, const D3D11_SUBRESOURCE_DATA *initial, ID3D11Texture2D1 **out) {
   if (out) *out = NULL;
-  if (!desc || desc->TextureLayout != D3D11_TEXTURE_LAYOUT_UNDEFINED) return E_INVALIDARG;
+  if (!desc) return E_INVALIDARG;
   const D3D11_TEXTURE2D_DESC plain = {desc->Width, desc->Height, desc->MipLevels, desc->ArraySize, desc->Format, desc->SampleDesc, desc->Usage, desc->BindFlags,
                                       desc->CPUAccessFlags, desc->MiscFlags};
-  return dev_CreateTexture2D(d, &plain, initial, (ID3D11Texture2D **)out);
+  if (!layout_valid(desc->TextureLayout, FALSE, &plain)) return E_INVALIDARG;
+  const HRESULT hr = dev_CreateTexture2D(d, &plain, initial, (ID3D11Texture2D **)out);
+  if (SUCCEEDED(hr) && out && *out) ((Tex *)*out)->layout = desc->TextureLayout;
+  return hr;
 }
 static HRESULT STDMETHODCALLTYPE dev_CreateTexture3D1(Dev *d, const D3D11_TEXTURE3D_DESC1 *desc, const D3D11_SUBRESOURCE_DATA *initial, ID3D11Texture3D1 **out) {
   if (out) *out = NULL;
-  if (!desc || desc->TextureLayout != D3D11_TEXTURE_LAYOUT_UNDEFINED) return E_INVALIDARG;
+  if (!desc) return E_INVALIDARG;
   const D3D11_TEXTURE3D_DESC plain = {desc->Width, desc->Height, desc->Depth, desc->MipLevels, desc->Format, desc->Usage, desc->BindFlags, desc->CPUAccessFlags, desc->MiscFlags};
-  return dev_CreateTexture3D(d, &plain, initial, (ID3D11Texture3D **)out);
+  const D3D11_TEXTURE2D_DESC as2d = {desc->Width, desc->Height, desc->MipLevels, 1, desc->Format, {1, 0}, desc->Usage, desc->BindFlags, desc->CPUAccessFlags, desc->MiscFlags};
+  if (!layout_valid(desc->TextureLayout, TRUE, &as2d)) return E_INVALIDARG;
+  const HRESULT hr = dev_CreateTexture3D(d, &plain, initial, (ID3D11Texture3D **)out);
+  if (SUCCEEDED(hr) && out && *out) ((Tex *)*out)->layout = desc->TextureLayout;
+  return hr;
 }
 static void STDMETHODCALLTYPE tex_GetDesc1(Tex *t, D3D11_TEXTURE2D_DESC1 *desc) {
   if (!desc) return;
   const D3D11_TEXTURE2D_DESC *s = &t->desc;
   const D3D11_TEXTURE2D_DESC1 d1 = {s->Width, s->Height, s->MipLevels, s->ArraySize, s->Format, s->SampleDesc, s->Usage, s->BindFlags, s->CPUAccessFlags, s->MiscFlags,
-                                    D3D11_TEXTURE_LAYOUT_UNDEFINED};
+                                    (D3D11_TEXTURE_LAYOUT)t->layout};
   *desc = d1;
 }
 static void STDMETHODCALLTYPE tex3_GetDesc1(Tex *t, D3D11_TEXTURE3D_DESC1 *desc) {
   if (!desc) return;
   const D3D11_TEXTURE3D_DESC *s = &t->desc3;
   const D3D11_TEXTURE3D_DESC1 d1 = {s->Width, s->Height, s->Depth, s->MipLevels, s->Format, s->Usage, s->BindFlags, s->CPUAccessFlags, s->MiscFlags,
-                                    D3D11_TEXTURE_LAYOUT_UNDEFINED};
+                                    (D3D11_TEXTURE_LAYOUT)t->layout};
   *desc = d1;
 }
 
-/* D3D11_CONSERVATIVE_RASTERIZATION_MODE_ON needs a ConservativeRasterizationTier the device does not have. */
+/* D3D11_CONSERVATIVE_RASTERIZATION_MODE_ON needs a ConservativeRasterizationTier: without one it is an invalid description, as on Windows. */
 static HRESULT STDMETHODCALLTYPE dev_CreateRasterizerState2(Dev *d, const D3D11_RASTERIZER_DESC2 *desc, ID3D11RasterizerState2 **out) {
   if (out) *out = NULL;
-  if (!desc || desc->ConservativeRaster != D3D11_CONSERVATIVE_RASTERIZATION_MODE_OFF) return E_INVALIDARG;
-  const D3D11_RASTERIZER_DESC1 d1 = {desc->FillMode, desc->CullMode, desc->FrontCounterClockwise, desc->DepthBias, desc->DepthBiasClamp, desc->SlopeScaledDepthBias,
-                                     desc->DepthClipEnable, desc->ScissorEnable, desc->MultisampleEnable, desc->AntialiasedLineEnable, desc->ForcedSampleCount};
-  return dev_CreateRasterizerState1(d, &d1, (ID3D11RasterizerState1 **)out);
+  if (!desc || (UINT)desc->ConservativeRaster > (UINT)D3D11_CONSERVATIVE_RASTERIZATION_MODE_ON) return E_INVALIDARG;
+  if (desc->ConservativeRaster == D3D11_CONSERVATIVE_RASTERIZATION_MODE_ON && dev_conservative_tier(d) == D3D11_CONSERVATIVE_RASTERIZATION_NOT_SUPPORTED) return E_INVALIDARG;
+  return raster_make(d, desc, out);
 }
-static void STDMETHODCALLTYPE raster_GetDesc2(Raster *s, D3D11_RASTERIZER_DESC2 *desc) {
-  if (!desc) return;
-  const D3D11_RASTERIZER_DESC1 *k = &s->desc1;
-  const D3D11_RASTERIZER_DESC2 d2 = {k->FillMode, k->CullMode, k->FrontCounterClockwise, k->DepthBias, k->DepthBiasClamp, k->SlopeScaledDepthBias, k->DepthClipEnable,
-                                     k->ScissorEnable, k->MultisampleEnable, k->AntialiasedLineEnable, k->ForcedSampleCount, D3D11_CONSERVATIVE_RASTERIZATION_MODE_OFF};
-  *desc = d2;
-}
+static void STDMETHODCALLTYPE raster_GetDesc2(Raster *s, D3D11_RASTERIZER_DESC2 *desc) { if (desc) *desc = s->desc2; }
 
 static HRESULT STDMETHODCALLTYPE dev_CreateQuery1(Dev *d, const D3D11_QUERY_DESC1 *desc, ID3D11Query1 **out) {
   if (out) *out = NULL;
@@ -432,14 +403,16 @@ static HRESULT STDMETHODCALLTYPE dev_CreateUnorderedAccessView1(Dev *d, ID3D11Re
   return uav_create(d, resource, desc ? &plain : NULL, desc ? plane : -1, (ID3D11UnorderedAccessView **)out);
 }
 
-/* WriteToSubresource and ReadFromSubresource reach a default-usage texture the CPU has mapped (Map with no D3D11_MAPPED_SUBRESOURCE), which needs
- * MapOnDefaultTextures: the device does not have it, so no texture can be made with CPU access and default usage, and no resource is one these calls take. The call
- * is invalid; nothing is written or read. */
+/* WriteToSubresource and ReadFromSubresource: layout.inc. */
 static void STDMETHODCALLTYPE dev_WriteToSubresource(Dev *d, ID3D11Resource *dst, UINT sub, const D3D11_BOX *box, const void *data, UINT row_pitch, UINT depth_pitch) {
-  (void)d; (void)dst; (void)sub; (void)box; (void)data; (void)row_pitch; (void)depth_pitch;
+  EnterCriticalSection(&d->lock);
+  tex_cpu_copy(d, tex_of_resource(dst), sub, box, (BYTE *)(UINT_PTR)data, row_pitch, depth_pitch, TRUE);      /* (only read from: one helper takes both directions) */
+  LeaveCriticalSection(&d->lock);
 }
 static void STDMETHODCALLTYPE dev_ReadFromSubresource(Dev *d, void *data, UINT row_pitch, UINT depth_pitch, ID3D11Resource *src, UINT sub, const D3D11_BOX *box) {
-  (void)d; (void)data; (void)row_pitch; (void)depth_pitch; (void)src; (void)sub; (void)box;
+  EnterCriticalSection(&d->lock);
+  tex_cpu_copy(d, tex_of_resource(src), sub, box, data, row_pitch, depth_pitch, FALSE);
+  LeaveCriticalSection(&d->lock);
 }
 
 /* ---- ID3D11Device4: device-removed events --------------------------------------------------------------------------------------------------------------- */

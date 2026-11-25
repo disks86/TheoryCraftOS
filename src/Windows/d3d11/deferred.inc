@@ -311,6 +311,7 @@ static void command_run(Ctx *c, const Command *m) {
     }
     case REC_CLEAR_VIEW: ctx_ClearView(c, (ID3D11View *)m->obj[0], m->f, m->rects, m->rect_count); break;
     case REC_DISCARD: break;      /* (what a discard leaves is undefined: the contents stay) */
+    case REC_TILE_MAPPINGS: case REC_COPY_TILE_MAPPINGS: case REC_COPY_TILES: case REC_UPDATE_TILES: case REC_RESIZE_TILE_POOL: case REC_TILED_BARRIER: tile_command_run(c, m); break;
   }
 }
 /* The commands of a list on the immediate context, each under its bindings. */

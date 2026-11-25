@@ -619,6 +619,13 @@ static HRESULT STDMETHODCALLTYPE dev_CreateGraphicsPipelineState(Dev *This, cons
     const HRESULT bh = blend_state_check(This, &desc->BlendState, desc->NumRenderTargets, &p->blend_constant);
     if (FAILED(bh)) { dx_Release(OBJ(p)); return bh; }
   }
+  /* (conservative rasterization: on a device with the kernel's kFeature2ConservativeRaster - the CPU renderer -, tier 1; elsewhere the tier is NOT_SUPPORTED and asking for it is
+   * an invalid description, as on Windows) */
+  if ((UINT)desc->RasterizerState.ConservativeRaster > (UINT)D3D12_CONSERVATIVE_RASTERIZATION_MODE_ON ||
+      (desc->RasterizerState.ConservativeRaster == D3D12_CONSERVATIVE_RASTERIZATION_MODE_ON && !(This->caps.features2 & DEV_FEATURE2_CONSERVATIVE_RASTER))) {
+    dx_Release(OBJ(p));
+    return E_INVALIDARG;
+  }
   p->raster = desc->RasterizerState;
   p->depth = desc->DepthStencilState;
   p->render_targets = desc->NumRenderTargets;
@@ -834,7 +841,8 @@ static UINT pso_pipeline_locked(Pso *p, const UINT strides[8], UINT stencil_ref,
   r[w++] = p->attr_count;
   r[w++] = p->varyings;
   r[w++] = p->textures;
-  r[w++] = p->raster.CullMode == D3D12_CULL_MODE_NONE ? 0 : p->raster.CullMode == D3D12_CULL_MODE_BACK ? 1 : 2;
+  r[w++] = (p->raster.CullMode == D3D12_CULL_MODE_NONE ? 0 : p->raster.CullMode == D3D12_CULL_MODE_BACK ? 1 : 2) |
+           (p->raster.ConservativeRaster == D3D12_CONSERVATIVE_RASTERIZATION_MODE_ON ? KCULL_CONSERVATIVE : 0u);      /* (the kernel's kCullConservative) */
   r[w++] = p->raster.FrontCounterClockwise ? 0 : 1;
   r[w++] = (p->depth.DepthEnable ? 1u : 0u) | (p->depth.DepthWriteMask == D3D12_DEPTH_WRITE_MASK_ALL ? 2u : 0u) | (rt->BlendEnable ? 4u : 0u);
   for (UINT i = 0; i < 4; ++i) {

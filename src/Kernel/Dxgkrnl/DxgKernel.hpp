@@ -56,7 +56,7 @@ class IWaitHook {
 // The private driver data of D3DKMTEscape, all little-endian 32-bit words (the user-mode driver and the kernel agree on it; the kernel checks everything):
 //   request:  op, then the operation's words        reply (to the buffer given): the words listed
 //   CreateShader     kind (| constant base << 8, Dxbc only), stage, code_bytes, code (padded to a word)   reply: handle
-//   CreatePipeline   vertex_shader, fragment_shader, vertex_stride, attribute_count, varying_count, texture_count, cull, front_face, flags (1 depth test, 2 depth write,
+//   CreatePipeline   vertex_shader, fragment_shader, vertex_stride, attribute_count, varying_count, texture_count, cull (| kCullConservative), front_face, flags (1 depth test, 2 depth write,
 //                    4 blend), then per attribute (4 of them): location, format, offset; then stencil: enable, compare, fail_op, depth_fail_op, pass_op, masks (compare,
 //                    write, reference: one word each)                                                                                       reply: handle
 //                    (optionally, after that: depth_compare, blend custom, enable, source colour, destination colour, source alpha, destination alpha factors, colour op, alpha op,
@@ -80,6 +80,9 @@ class IWaitHook {
 //   UpdateTileMappings      reserved allocation, first tile, heap (0: unmap), heap offset (lo, hi), tile count
 //   QueryStreamOutput       allocation handle (a stream output buffer)                                                                 reply: how far stream output got in it (an offset, lo, hi)
 //   QuerySync               sync object handle                                                                                        reply: the value (lo, hi) - a fence's counter (D3D12's GetCompletedValue), a semaphore's count
+// The CreatePipeline cull word: the CullMode (0 none, 1 back, 2 front), with this bit for conservative rasterization (PipelineDesc::conservative).
+constexpr uint32_t kCullConservative = 0x100;
+
 enum class EscapeOp : uint32_t {
   CreateShader = 1, CreatePipeline = 2, DestroyShader = 3, DestroyPipeline = 4, CreateComputePipeline = 5,
   CreateRootSignature = 6, DestroyRootSignature = 7, CreateDescriptorHeap = 8, DestroyDescriptorHeap = 9, WriteDescriptors = 10, CopyDescriptors = 11, UpdateTileMappings = 12, QuerySync = 13, QueryStreamOutput = 14,

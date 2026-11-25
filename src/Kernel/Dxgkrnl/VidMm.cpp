@@ -253,6 +253,18 @@ void image_from_heap(const AllocationDesc& d, ByteView image, ConstByteView heap
     else to.subview(3 * sample, sample).fill(0xFF);
   }
 }
+// Whether a run of a reserved texture's pixels differs from the texels the heap holds for it (what heap_from_image would write).
+bool image_differs_from_heap(const AllocationDesc& d, ConstByteView image, ConstByteView heap, uint32_t texels) {
+  if (!d.tile_narrow) return !image.equals(heap);
+  const NarrowLayout narrow = static_cast<NarrowLayout>(d.tile_narrow);
+  const uint32_t sample = narrow == NarrowLayout::R16 || narrow == NarrowLayout::R16G16 ? 2 : 1, pixel = 4 * sample, texel = narrow_pixel_bytes(narrow);
+  for (uint32_t i = 0; i < texels; ++i) {
+    ConstByteView from, to;
+    if (!image.try_subview(uint64_t{i} * pixel, texel, &from) || !heap.try_subview(uint64_t{i} * texel, texel, &to)) return true;
+    if (!from.equals(to)) return true;
+  }
+  return false;
+}
 void heap_from_image(const AllocationDesc& d, ByteView heap, ConstByteView image, uint32_t texels) {
   if (!d.tile_narrow) {
     heap.copy_from(image);
@@ -518,10 +530,29 @@ void VidMm::gather_tiles(Allocation& a) {
   }
 }
 
+// The tiles the device changed go back to their heaps. Only those: tiles that alias one place of a heap (Direct3D's REUSE_SINGLE_TILE, CopyTileMappings, two resources on
+// one heap) are each the heap's bytes as gather_tiles left them, so an unchanged one must not put the old bytes back over a changed one. The changed tiles are found first,
+// against the heaps as they are before any is written.
 void VidMm::scatter_tiles(Allocation& a) {
   for (uint64_t i = 0; i < a.tiles_.count(); ++i) {
-    const Allocation::TileBinding& b = a.tiles_[i];
+    Allocation::TileBinding& b = a.tiles_[i];
+    b.changed = false;
     if (!b.heap) continue;
+    if (a.is_image()) {
+      for_tile_runs(a, i, a.cpu_, [&](ByteView image, uint64_t at, uint32_t texels) {
+        ConstByteView held;
+        if (!b.heap->backing().try_subview(b.offset + at, uint64_t{texels} * tile_texel_bytes(a.desc_), &held) || image_differs_from_heap(a.desc_, ConstByteView(image), held, texels))
+          b.changed = true;
+      });
+    } else {
+      ConstByteView tile, held;
+      b.changed = !ConstByteView(a.cpu_).try_subview(i * kTileBytes, kTileBytes, &tile) || !b.heap->backing().try_subview(b.offset, kTileBytes, &held) || !tile.equals(held);
+    }
+  }
+  for (uint64_t i = 0; i < a.tiles_.count(); ++i) {
+    Allocation::TileBinding& b = a.tiles_[i];
+    if (!b.heap || !b.changed) continue;
+    b.changed = false;
     ByteView from, to;
     if (a.is_image()) {
       for_tile_runs(a, i, a.cpu_, [&](ByteView image, uint64_t at, uint32_t texels) {

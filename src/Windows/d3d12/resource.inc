@@ -76,6 +76,10 @@ struct Resource {
   UINT *plane_alloc;
   Mirror *mirrors;             /* ... and the mirrors its views have needed (g_lock) */
   UINT mirror_count;
+  /* A CPU-visible texture of D3D12_TEXTURE_LAYOUT_64KB_STANDARD_SWIZZLE: Map with a pointer hands out each subresource in the standard swizzle (src/Windows/tcos_swizzle.h),
+   * a copy made from the image at the first Map and put back at each Unmap that wrote (by subresource, with its Map count; g_lock) */
+  BYTE **swizzled;
+  LONG *swizzle_maps;
 };
 
 static Resource *g_cpu_resources;
@@ -218,6 +222,7 @@ static UINT region_tiles(const TileLayout *t, D3D12_TILED_RESOURCE_COORDINATE c,
 }
 
 static void depth_companion_drop(Dev *dev, UINT depth);      /* (cmdlist.inc) */
+static UINT res_subresources_of(const Resource *r);
 static void resource_destroy(DxObj *o) {
   Resource *r = (Resource *)o;
   if (r->alloc && (r->desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL)) depth_companion_drop(r->d.dev, r->alloc);
@@ -236,6 +241,11 @@ static void resource_destroy(DxObj *o) {
   if (r->alloc) kmt_destroy_allocation(r->d.dev->kdev, r->alloc);
   mem_free(r->shadow);
   mem_free(r->tile_map);
+  if (r->swizzled) {
+    for (UINT i = 0; i < res_subresources_of(r); ++i) mem_free(r->swizzled[i]);
+    mem_free(r->swizzled);
+    mem_free(r->swizzle_maps);
+  }
   if (r->heap) dx_Release(OBJ(r->heap));
   dobj_child_destroy(o);
 }
@@ -545,7 +555,18 @@ static HRESULT resource_make_from(Dev *dev, const D3D12_HEAP_PROPERTIES *props, 
   ad.samples = samples;
   /* (mode: 0 an ordinary resource, 2 a reserved one, which has the 64 KiB layouts) */
   const int reserved = mode == 2;
-  if (!reserved && desc->Layout != D3D12_TEXTURE_LAYOUT_UNKNOWN && desc->Layout != D3D12_TEXTURE_LAYOUT_ROW_MAJOR) return E_INVALIDARG;
+  /* (the 64 KiB layouts: UNDEFINED_SWIZZLE is a reserved resource's; STANDARD_SWIZZLE a 2D or 3D texture of one sample, not a depth buffer, a video format or R32G32B32, of
+   * elements of 1 to 16 bytes - the kernel's image is what draws and copies use; a CPU-visible one is mapped in that layout: res_Map) */
+  if (!reserved && desc->Layout != D3D12_TEXTURE_LAYOUT_UNKNOWN && desc->Layout != D3D12_TEXTURE_LAYOUT_ROW_MAJOR && desc->Layout != D3D12_TEXTURE_LAYOUT_64KB_STANDARD_SWIZZLE)
+    return E_INVALIDARG;
+  if (desc->Layout == D3D12_TEXTURE_LAYOUT_64KB_STANDARD_SWIZZLE && !reserved) {
+    const FormatInfo *sf = format_info(desc->Format);
+    const UINT bpe = sf ? sf->bytes : 0;
+    if ((desc->Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D && desc->Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE3D) || desc->SampleDesc.Count > 1 ||
+        (desc->Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL) || !sf || sf->planar || sf->pair || format_packed_yuv(desc->Format) || sf->depth ||
+        (bpe != 1 && bpe != 2 && bpe != 4 && bpe != 8 && bpe != 16))
+      return E_INVALIDARG;
+  }
   const int cube = (dev->next_resource_flags & TCOS_RESOURCE_CUBE) != 0;
   const int global_share = (dev->next_resource_flags & TCOS_RESOURCE_GLOBAL_SHARE) != 0;
   dev->next_resource_flags = 0;      /* (the options were for this resource) */
@@ -573,7 +594,7 @@ static HRESULT resource_make_from(Dev *dev, const D3D12_HEAP_PROPERTIES *props, 
     /* (a texture the CPU sees: only in a custom heap - an upload or readback heap holds buffers - with the driver's layout, not a depth buffer or multisampled, and
      * reached with WriteToSubresource / ReadFromSubresource) */
     if (cpu) {
-      if (props->Type != D3D12_HEAP_TYPE_CUSTOM || desc->Layout != D3D12_TEXTURE_LAYOUT_UNKNOWN || samples > 1 || reserved ||
+      if (props->Type != D3D12_HEAP_TYPE_CUSTOM || (desc->Layout != D3D12_TEXTURE_LAYOUT_UNKNOWN && desc->Layout != D3D12_TEXTURE_LAYOUT_64KB_STANDARD_SWIZZLE) || samples > 1 || reserved ||
           (desc->Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL)) { hr = E_INVALIDARG; goto fail; }
       r->cpu_texture = 1;
       r->cpu_upload = r->cpu_readback = 0;      /* (no shadow: the image itself is written and read) */
@@ -865,11 +886,63 @@ static void STDMETHODCALLTYPE dev_GetCopyableFootprints(Dev *This, const D3D12_R
 static UINT res_subresources(const Resource *r) {
   return r->desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER ? 1 : r->mips * (r->kind == 1 ? 1 : r->layers) * (r->planes ? r->planes : 1);
 }
+static UINT res_subresources_of(const Resource *r) { return res_subresources(r); }
+static HRESULT res_texture_copy(Resource *r, UINT sub, const D3D12_BOX *box, BYTE *mem, UINT row_pitch, UINT slice_pitch, int write);
+/* A subresource of a standard-swizzle texture between its swizzled copy and the image (`to_image`), through rows of the format's texels. */
+static HRESULT res_swizzle_sync(Resource *r, UINT sub, int to_image) {
+  const FormatInfo *fi = r->fmt;
+  const UINT level = sub % r->mips, w = mip_extent((UINT)r->desc.Width, level), h = mip_extent(r->desc.Height, level), d = r->kind == 1 ? mip_extent(r->layers, level) : 1;
+  const UINT ew = fi->compressed ? (w + 3) / 4 : w, eh = fi->compressed ? (h + 3) / 4 : h;
+  TcosSwizzle s;
+  if (!tcos_swizzle_init(&s, fi->bytes, r->kind == 1)) return E_INVALIDARG;
+  const SIZE_T bytes = tcos_swizzle_bytes(&s, ew, eh, d), pitch = (SIZE_T)format_row_bytes(fi, w), slice = pitch * format_rows(fi, h);
+  if (!bytes || slice > 0xFFFFFFFFu) return E_OUTOFMEMORY;
+  BYTE *linear = mem_alloc(slice * d);
+  if (!linear) return E_OUTOFMEMORY;
+  HRESULT hr = S_OK;
+  if (!to_image) hr = res_texture_copy(r, sub, NULL, linear, (UINT)pitch, (UINT)slice, 0);
+  if (SUCCEEDED(hr) && !tcos_swizzle_copy(&s, r->swizzled[sub], bytes, ew, eh, d, 0, 0, 0, ew, eh, d, linear, pitch, slice, !to_image)) hr = E_FAIL;
+  if (SUCCEEDED(hr) && to_image) hr = res_texture_copy(r, sub, NULL, linear, (UINT)pitch, (UINT)slice, 1);
+  mem_free(linear);
+  return hr;
+}
 static HRESULT STDMETHODCALLTYPE res_Map(Resource *This, UINT sub, const D3D12_RANGE *read, void **data) {
   if (This->cpu_texture) {
-    /* (a texture of the driver's layout has no address the program could use: Map with no pointer only says it will be written and read with Write/ReadFromSubresource) */
+    /* (a texture of the driver's layout has no address the program could use: Map with no pointer only says it will be written and read with Write/ReadFromSubresource. One
+     * of the standard swizzle is mapped in that layout) */
     if (data) *data = NULL;
-    if (data || sub >= res_subresources(This)) return E_INVALIDARG;
+    if (sub >= res_subresources(This)) return E_INVALIDARG;
+    if (data && This->desc.Layout == D3D12_TEXTURE_LAYOUT_64KB_STANDARD_SWIZZLE) {
+      HRESULT hr = S_OK;
+      EnterCriticalSection(&g_lock);
+      const UINT subs = res_subresources(This);
+      if (!This->swizzled) {
+        This->swizzled = mem_alloc(sizeof(BYTE *) * subs);
+        This->swizzle_maps = mem_alloc(sizeof(LONG) * subs);
+        if (This->swizzled) memset(This->swizzled, 0, sizeof(BYTE *) * subs);
+        if (This->swizzle_maps) memset(This->swizzle_maps, 0, sizeof(LONG) * subs);
+      }
+      if (!This->swizzled || !This->swizzle_maps) hr = E_OUTOFMEMORY;
+      else if (!This->swizzled[sub]) {
+        const FormatInfo *fi = This->fmt;
+        const UINT level = sub % This->mips, w = mip_extent((UINT)This->desc.Width, level), h = mip_extent(This->desc.Height, level);
+        const UINT d = This->kind == 1 ? mip_extent(This->layers, level) : 1;
+        TcosSwizzle s;
+        const SIZE_T bytes = fi && tcos_swizzle_init(&s, fi->bytes, This->kind == 1) ? tcos_swizzle_bytes(&s, fi->compressed ? (w + 3) / 4 : w, fi->compressed ? (h + 3) / 4 : h, d) : 0;
+        This->swizzled[sub] = bytes ? mem_alloc(bytes) : NULL;
+        if (!This->swizzled[sub]) hr = E_OUTOFMEMORY;
+        else {
+          memset(This->swizzled[sub], 0, bytes);
+          hr = res_swizzle_sync(This, sub, 0);
+          if (FAILED(hr)) { mem_free(This->swizzled[sub]); This->swizzled[sub] = NULL; }
+        }
+      }
+      if (SUCCEEDED(hr)) { This->swizzle_maps[sub]++; *data = This->swizzled[sub]; }
+      LeaveCriticalSection(&g_lock);
+      if (SUCCEEDED(hr)) InterlockedIncrement(&This->map_count);
+      return hr;
+    }
+    if (data) return E_INVALIDARG;
     InterlockedIncrement(&This->map_count);
     return S_OK;
   }
@@ -881,6 +954,13 @@ static HRESULT STDMETHODCALLTYPE res_Map(Resource *This, UINT sub, const D3D12_R
   return S_OK;
 }
 static void STDMETHODCALLTYPE res_Unmap(Resource *This, UINT sub, const D3D12_RANGE *written) {
+  if (This->cpu_texture && This->swizzled && sub < res_subresources(This) && This->swizzled[sub]) {
+    /* (a swizzled copy: put back unless the program says it wrote nothing - an empty range -; let go with the last Map) */
+    EnterCriticalSection(&g_lock);
+    if (!written || written->Begin < written->End) res_swizzle_sync(This, sub, 1);
+    if (This->swizzle_maps[sub] > 0 && --This->swizzle_maps[sub] == 0) { mem_free(This->swizzled[sub]); This->swizzled[sub] = NULL; }
+    LeaveCriticalSection(&g_lock);
+  }
   if (This->map_count > 0) InterlockedDecrement(&This->map_count);
   if (!This->cpu_texture) This->dirty = 1;
 }

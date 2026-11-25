@@ -4230,6 +4230,54 @@ static void test_cpu_texture(ID3D12Device *dev, ID3D12CommandQueue *queue, ID3D1
     ID3D12Resource_Release(buffer);
   }
   ID3D12Resource_Release(tex);
+
+  /* the 64 KiB standard swizzle (StandardSwizzle64KBSupported): a CPU-visible texture of that layout is mapped in it - 2D 32-bit: x bytes 0xAA8F, y 0x5570 */
+  D3D12_FEATURE_DATA_D3D12_OPTIONS options;
+  memset(&options, 0, sizeof options);
+  CHECK_HR(ID3D12Device_CheckFeatureSupport(dev, D3D12_FEATURE_D3D12_OPTIONS, &options, sizeof options));
+  CHECK(options.StandardSwizzle64KBSupported && options.TiledResourcesTier == D3D12_TILED_RESOURCES_TIER_1 &&
+        options.ConservativeRasterizationTier <= D3D12_CONSERVATIVE_RASTERIZATION_TIER_1);
+  D3D12_RESOURCE_DESC sd = {D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, 16, 16, 1, 1, DXGI_FORMAT_R8G8B8A8_UNORM, {1, 0}, D3D12_TEXTURE_LAYOUT_64KB_STANDARD_SWIZZLE, D3D12_RESOURCE_FLAG_NONE};
+  ID3D12Resource *sw = NULL;
+  CHECK_HR(ID3D12Device_CreateCommittedResource(dev, &hp, D3D12_HEAP_FLAG_NONE, &sd, D3D12_RESOURCE_STATE_COMMON, NULL, &IID_ID3D12Resource, (void **)&sw));
+  sd.Format = DXGI_FORMAT_D32_FLOAT;
+  sd.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
+  D3D12_HEAP_PROPERTIES dp = {D3D12_HEAP_TYPE_DEFAULT, D3D12_CPU_PAGE_PROPERTY_UNKNOWN, D3D12_MEMORY_POOL_UNKNOWN, 1, 1};
+  bad = NULL;
+  CHECK(ID3D12Device_CreateCommittedResource(dev, &dp, D3D12_HEAP_FLAG_NONE, &sd, D3D12_RESOURCE_STATE_DEPTH_WRITE, NULL, &IID_ID3D12Resource, (void **)&bad) == E_INVALIDARG && !bad);
+  sd.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+  sd.Flags = D3D12_RESOURCE_FLAG_NONE;
+  sd.Layout = D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE;      /* (a reserved resource's) */
+  CHECK(ID3D12Device_CreateCommittedResource(dev, &dp, D3D12_HEAP_FLAG_NONE, &sd, D3D12_RESOURCE_STATE_COMMON, NULL, &IID_ID3D12Resource, (void **)&bad) == E_INVALIDARG && !bad);
+  if (sw) {
+    UINT32 texels[16][16], seen[16][16];
+    for (int y = 0; y < 16; ++y)
+      for (int x = 0; x < 16; ++x) texels[y][x] = 0xFF000000u | (UINT32)(y * 0x10203 + x * 0x30201);
+    CHECK_HR(ID3D12Resource_WriteToSubresource(sw, 0, NULL, texels, sizeof texels[0], sizeof texels));
+    BYTE *mapped = NULL;
+    CHECK_HR(ID3D12Resource_Map(sw, 0, NULL, (void **)&mapped));
+    if (mapped) {
+      int same = 1;
+      for (UINT y = 0; y < 16; ++y)
+        for (UINT x = 0; x < 16; ++x) {
+          UINT off = 0, xb = x * 4, bit = 0;
+          for (UINT m = 0xAA8Fu, b = 1; m; b <<= 1) { const UINT low = m & (0u - m); if (xb & b) off |= low; m &= m - 1; }
+          for (UINT m = 0x5570u, b = 1; m; b <<= 1) { const UINT low = m & (0u - m); if (y & b) off |= low; m &= m - 1; }
+          (void)bit;
+          UINT32 v;
+          memcpy(&v, mapped + off, 4);
+          same &= v == texels[y][x];
+        }
+      CHECK(same);
+      const UINT32 marker = 0xFF0A0B0Cu;
+      memcpy(mapped, &marker, 4);      /* (texel 0, 0 is at offset 0) */
+      ID3D12Resource_Unmap(sw, 0, NULL);
+      memset(seen, 0, sizeof seen);
+      CHECK_HR(ID3D12Resource_ReadFromSubresource(sw, seen, sizeof seen[0], sizeof seen, 0, NULL));
+      CHECK(seen[0][0] == marker && seen[0][1] == texels[0][1] && seen[15][15] == texels[15][15]);
+    }
+    ID3D12Resource_Release(sw);
+  }
 }
 
 static void test_later(ID3D12Device *dev, ID3D12CommandQueue *queue, ID3D12Fence *fence, UINT64 *fence_value) {

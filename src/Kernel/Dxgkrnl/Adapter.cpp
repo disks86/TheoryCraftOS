@@ -2474,6 +2474,7 @@ NtStatus Adapter::create_pipeline(const PipelineDesc& d, const SharedPointer<Sha
   if (d.independent_blend && !(caps_.features & graphics::kFeatureIndependentBlend)) return status::kNotSupported;
   if ((d.multisample || d.alpha_to_coverage) && !(caps_.features & graphics::kFeatureMultisample)) return status::kNotSupported;
   if (d.alpha_to_coverage && !d.multisample) return status::kInvalidParameter;
+  if (d.conservative && !(caps_.features2 & graphics::kFeature2ConservativeRaster)) return status::kNotSupported;
   if (hull || domain) {
     if (!hull || !domain || hull->stage() != graphics::ShaderStage::Hull || domain->stage() != graphics::ShaderStage::Domain || hull->tess_output_points() != domain->tess_input_points() || hull->tess_domain() != domain->tess_domain()) return status::kInvalidParameter;
     if (!(caps_.features & graphics::kFeatureTessellation)) return status::kNotSupported;
@@ -2527,6 +2528,7 @@ NtStatus Adapter::create_pipeline(const PipelineDesc& d, const SharedPointer<Sha
   pd.blend = bs;
   pd.independent_blend = d.independent_blend;
   pd.multisample = d.multisample;
+  pd.conservative = d.conservative;
   pd.alpha_to_coverage = d.alpha_to_coverage;
   pd.stream_output_count = d.stream_output_count;
   for (uint32_t e = 0; e < d.stream_output_count; ++e) pd.stream_output[e] = d.stream_output[e];

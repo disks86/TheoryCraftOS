@@ -94,6 +94,21 @@ static void dev_uav_support(Dev *d, DXGI_FORMAT format, UINT *support1, UINT *su
 }
 
 static HRESULT dev_check_format(Dev *d, DXGI_FORMAT format, UINT *support);
+/* The tiers of Direct3D 12 below, as Direct3D 11's (the enumerations have the same numbers): tiled resources (tier 1 at most - tiled.inc makes tier 1's resources), and
+ * conservative rasterization (tier 1 on the CPU renderer, none on virgl). */
+static D3D11_TILED_RESOURCES_TIER dev_tiled_tier(Dev *d) {
+  D3D12_FEATURE_DATA_D3D12_OPTIONS o;
+  memset(&o, 0, sizeof o);
+  if (FAILED(ID3D12Device_CheckFeatureSupport(d->d12, D3D12_FEATURE_D3D12_OPTIONS, &o, sizeof o)) || o.TiledResourcesTier == D3D12_TILED_RESOURCES_TIER_NOT_SUPPORTED)
+    return D3D11_TILED_RESOURCES_NOT_SUPPORTED;
+  return D3D11_TILED_RESOURCES_TIER_1;
+}
+static D3D11_CONSERVATIVE_RASTERIZATION_TIER dev_conservative_tier(Dev *d) {
+  D3D12_FEATURE_DATA_D3D12_OPTIONS o;
+  memset(&o, 0, sizeof o);
+  if (FAILED(ID3D12Device_CheckFeatureSupport(d->d12, D3D12_FEATURE_D3D12_OPTIONS, &o, sizeof o))) return D3D11_CONSERVATIVE_RASTERIZATION_NOT_SUPPORTED;
+  return (D3D11_CONSERVATIVE_RASTERIZATION_TIER)o.ConservativeRasterizationTier;
+}
 static HRESULT STDMETHODCALLTYPE dev_CheckFormatSupport(Dev *d, DXGI_FORMAT format, UINT *support) {
   const HRESULT hr = dev_check_format(d, format, support);
   if (SUCCEEDED(hr) && support && *support) dev_uav_support(d, format, support, NULL);
@@ -179,13 +194,14 @@ static HRESULT STDMETHODCALLTYPE dev_CheckFeatureSupport(Dev *d, D3D11_FEATURE f
       return dev_CheckFormatSupport(d, f->InFormat, &f->OutFormatSupport);
     }
     case D3D11_FEATURE_FORMAT_SUPPORT2: {
-      /* (unordered access to textures: typed loads and stores, the atomics of R32_UINT and R32_SINT; no tiled or shareable-only formats) */
+      /* (unordered access to textures: typed loads and stores, the atomics of R32_UINT and R32_SINT; tiled textures; no shareable-only formats) */
       FEATURE_SIZE(D3D11_FEATURE_DATA_FORMAT_SUPPORT2);
       D3D11_FEATURE_DATA_FORMAT_SUPPORT2 *f = data;
       UINT first = 0;
       f->OutFormatSupport2 = 0;
       const HRESULT hr = dev_CheckFormatSupport(d, f->InFormat, &first);
       if (SUCCEEDED(hr)) dev_uav_support(d, f->InFormat, NULL, &f->OutFormatSupport2);
+      if (SUCCEEDED(hr) && tex_tiled_format(d, f->InFormat)) f->OutFormatSupport2 |= D3D11_FORMAT_SUPPORT2_TILED;      /* (tiled.inc) */
       return hr;
     }
     case D3D11_FEATURE_D3D11_OPTIONS: {
@@ -206,7 +222,13 @@ static HRESULT STDMETHODCALLTYPE dev_CheckFeatureSupport(Dev *d, D3D11_FEATURE f
     }
     case D3D11_FEATURE_SHADER_MIN_PRECISION_SUPPORT: FEATURE_SIZE(D3D11_FEATURE_DATA_SHADER_MIN_PRECISION_SUPPORT); break;      /* (every stage computes in 32 bits) */
     case D3D11_FEATURE_D3D9_SHADOW_SUPPORT: FEATURE_SIZE(D3D11_FEATURE_DATA_D3D9_SHADOW_SUPPORT); break;
-    case D3D11_FEATURE_D3D11_OPTIONS1: FEATURE_SIZE(D3D11_FEATURE_DATA_D3D11_OPTIONS1); break;      /* (TiledResourcesTier NOT_SUPPORTED is 0) */
+    case D3D11_FEATURE_D3D11_OPTIONS1: {
+      /* (tiled resources: tier 1, over Direct3D 12's reserved resources - tiled.inc; no min/max filtering, ClearView of depth formats or Map of default buffers) */
+      FEATURE_SIZE(D3D11_FEATURE_DATA_D3D11_OPTIONS1);
+      memset(data, 0, size);
+      ((D3D11_FEATURE_DATA_D3D11_OPTIONS1 *)data)->TiledResourcesTier = dev_tiled_tier(d);
+      return S_OK;
+    }
     case D3D11_FEATURE_D3D9_SIMPLE_INSTANCING_SUPPORT: {
       FEATURE_SIZE(D3D11_FEATURE_DATA_D3D9_SIMPLE_INSTANCING_SUPPORT);
       ((D3D11_FEATURE_DATA_D3D9_SIMPLE_INSTANCING_SUPPORT *)data)->SimpleInstancingSupported = TRUE;
@@ -221,7 +243,20 @@ static HRESULT STDMETHODCALLTYPE dev_CheckFeatureSupport(Dev *d, D3D11_FEATURE f
       o->SimpleInstancingSupported = TRUE;
       return S_OK;
     }
-    case D3D11_FEATURE_D3D11_OPTIONS2: FEATURE_SIZE(D3D11_FEATURE_DATA_D3D11_OPTIONS2); break;
+    case D3D11_FEATURE_D3D11_OPTIONS2: {
+      /* (conservative rasterization: Direct3D 12's tier below; tiled resources tier 1; textures of default usage the CPU maps, in the row-major and the standard swizzle
+       * layouts too - layout.inc; the memory is the CPU's where Direct3D 12 says the adapter is UMA) */
+      FEATURE_SIZE(D3D11_FEATURE_DATA_D3D11_OPTIONS2);
+      D3D11_FEATURE_DATA_D3D11_OPTIONS2 *o = data;
+      memset(o, 0, size);
+      o->ConservativeRasterizationTier = dev_conservative_tier(d);
+      o->TiledResourcesTier = dev_tiled_tier(d);
+      o->MapOnDefaultTextures = TRUE;
+      o->StandardSwizzle = TRUE;
+      D3D12_FEATURE_DATA_ARCHITECTURE arch = {0, FALSE, FALSE, FALSE};
+      if (SUCCEEDED(ID3D12Device_CheckFeatureSupport(d->d12, D3D12_FEATURE_ARCHITECTURE, &arch, sizeof arch))) o->UnifiedMemoryArchitecture = arch.UMA;
+      return S_OK;
+    }
     case D3D11_FEATURE_D3D11_OPTIONS3: FEATURE_SIZE(D3D11_FEATURE_DATA_D3D11_OPTIONS3); break;
     case D3D11_FEATURE_GPU_VIRTUAL_ADDRESS_SUPPORT: {
       /* (Direct3D 12's answer: the same address space) */
@@ -272,10 +307,45 @@ static HRESULT STDMETHODCALLTYPE dxgi_GetAdapter(IDXGIDevice1 *p, IDXGIAdapter *
   IDXGIAdapter_AddRef(*out);
   return S_OK;
 }
+/* IDXGIDevice::CreateSurface: `count` 2D textures of one level and one layer, each handed out as its IDXGISurface. DXGI_USAGE says what they are bound as
+ * (DXGI_USAGE_RENDER_TARGET_OUTPUT a render target, SHADER_INPUT a shader resource, UNORDERED_ACCESS unordered access) and its CPU access field the usage: none
+ * default, DYNAMIC dynamic (written), READ_WRITE and SCRATCH staging (read and written). A DXGI_SHARED_RESOURCE with a handle opens that shared surface instead (one).
+ * What Direct3D 11 refuses of the description is refused (E_INVALIDARG); on a failure none is kept. */
+static HRESULT STDMETHODCALLTYPE dev_OpenSharedResource(Dev *d, HANDLE handle, REFIID riid, void **out);      /* (interop.inc) */
 static HRESULT STDMETHODCALLTYPE dxgi_CreateSurface(IDXGIDevice1 *p, const DXGI_SURFACE_DESC *desc, UINT count, DXGI_USAGE usage, const DXGI_SHARED_RESOURCE *shared, IDXGISurface **out) {
-  (void)p; (void)desc; (void)count; (void)usage; (void)shared;
-  if (out) *out = NULL;
-  return E_NOTIMPL;
+  Dev *d = dev_of_dxgi(p);
+  if (!out || !desc || !count) return E_INVALIDARG;
+  for (UINT i = 0; i < count; ++i) out[i] = NULL;
+  if (shared && shared->Handle) {
+    if (count != 1) return E_INVALIDARG;
+    return dev_OpenSharedResource(d, shared->Handle, &IID_IDXGISurface, (void **)&out[0]);
+  }
+  const UINT known = DXGI_CPU_ACCESS_FIELD | DXGI_USAGE_SHADER_INPUT | DXGI_USAGE_RENDER_TARGET_OUTPUT | DXGI_USAGE_BACK_BUFFER | DXGI_USAGE_SHARED | DXGI_USAGE_READ_ONLY |
+                     DXGI_USAGE_DISCARD_ON_PRESENT | DXGI_USAGE_UNORDERED_ACCESS;
+  if (usage & ~(DXGI_USAGE)known) return E_INVALIDARG;
+  D3D11_TEXTURE2D_DESC t = {desc->Width, desc->Height, 1, 1, desc->Format, desc->SampleDesc, D3D11_USAGE_DEFAULT, 0, 0, 0};
+  switch (usage & DXGI_CPU_ACCESS_FIELD) {
+    case DXGI_CPU_ACCESS_NONE: break;
+    case DXGI_CPU_ACCESS_DYNAMIC: t.Usage = D3D11_USAGE_DYNAMIC; t.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE; break;
+    case DXGI_CPU_ACCESS_READ_WRITE: case DXGI_CPU_ACCESS_SCRATCH: t.Usage = D3D11_USAGE_STAGING; t.CPUAccessFlags = D3D11_CPU_ACCESS_READ | D3D11_CPU_ACCESS_WRITE; break;
+    default: return E_INVALIDARG;
+  }
+  if (usage & DXGI_USAGE_RENDER_TARGET_OUTPUT) t.BindFlags |= D3D11_BIND_RENDER_TARGET;
+  if (usage & DXGI_USAGE_SHADER_INPUT) t.BindFlags |= D3D11_BIND_SHADER_RESOURCE;
+  if (usage & DXGI_USAGE_UNORDERED_ACCESS) t.BindFlags |= D3D11_BIND_UNORDERED_ACCESS;
+  HRESULT hr = S_OK;
+  for (UINT i = 0; SUCCEEDED(hr) && i < count; ++i) {
+    ID3D11Texture2D *texture = NULL;
+    hr = dev_CreateTexture2D(d, &t, NULL, &texture);
+    if (SUCCEEDED(hr)) {
+      hr = ID3D11Texture2D_QueryInterface(texture, &IID_IDXGISurface, (void **)&out[i]);
+      ID3D11Texture2D_Release(texture);
+    }
+  }
+  if (FAILED(hr))
+    for (UINT i = 0; i < count; ++i)
+      if (out[i]) { IDXGISurface_Release(out[i]); out[i] = NULL; }
+  return hr;
 }
 static HRESULT STDMETHODCALLTYPE dxgi_QueryResourceResidency(IDXGIDevice1 *p, IUnknown *const *resources, DXGI_RESIDENCY *status, UINT count) {
   (void)p; (void)resources;
@@ -510,6 +580,7 @@ static HRESULT dev_start(Dev *d) {
   return S_OK;
 }
 
+static volatile LONG g_feature_level_upgrade;      /* EnableFeatureLevelUpgrade (interop.inc) was called */
 static HRESULT dev_create_on(IDXGIAdapter *adapter, UINT flags, const D3D_FEATURE_LEVEL *levels, UINT level_count, ID3D12Device *d12, ID3D12CommandQueue *queue, Dev **out) {
   *out = NULL;
   D3D_FEATURE_LEVEL level = D3D_FEATURE_LEVEL_11_0;
@@ -519,6 +590,8 @@ static HRESULT dev_create_on(IDXGIAdapter *adapter, UINT flags, const D3D_FEATUR
     if (i == level_count) return DXGI_ERROR_UNSUPPORTED;
     level = levels[i];
   }
+  /* (EnableFeatureLevelUpgrade: a level 10 device is made at the adapter's level) */
+  if (g_feature_level_upgrade && (level == D3D_FEATURE_LEVEL_10_0 || level == D3D_FEATURE_LEVEL_10_1)) level = D3D_FEATURE_LEVEL_11_0;
   Dev *d = mem_alloc(sizeof *d);
   if (!d) return E_OUTOFMEMORY;
   dx_init(&d->o, &dev_vtbl, g_dev_iids, dev_destroy);

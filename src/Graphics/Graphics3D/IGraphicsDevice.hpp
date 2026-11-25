@@ -649,6 +649,10 @@ struct GraphicsPipelineDesc {
   // kFeatureClipDistances: which clip distances the last stage before the rasterizer writes (TGSI: CLIPDIST[0] .x .. .w are 0 .. 3, CLIPDIST[1] 4 .. 7) cut the primitives:
   // bit i, distance i (what is below zero is cut away).
   uint8_t clip_distances = 0;
+  // kFeature2ConservativeRaster: a triangle covers every pixel (and every sample of it) whose square its area overlaps, not only those whose centre or samples it contains - Direct3D's
+  // conservative rasterization, tier 1 (the attributes and depth are those of the triangle's plane at the pixel's centre, extrapolated where the centre is outside; degenerate triangles are
+  // culled). Lines and points are drawn as without it.
+  bool conservative = false;
 };
 
 class IPipeline {
@@ -815,6 +819,7 @@ enum DeviceFeature2 : uint32_t {
   kFeature2StorageImagesInDraws = 1u << 1,  // ... also bound inside passes and read and written by pixel shaders (FragmentContext::images): they run for every fragment the rasterizer makes
   kFeature2LayeredTargets = 1u << 2,        // colour and depth attachments that are arrays, volumes or cubes (one level), RenderPassBegin::first_layer / layer_count, ShaderIo::layer from geometry shaders
   kFeature2SingleChannelFormats = 1u << 3,  // Format::R32Uint, R32Sint, R32Float: render targets, textures and storage images (the integer ones with atomics)
+  kFeature2ConservativeRaster = 1u << 4,    // GraphicsPipelineDesc::conservative: a triangle covers every pixel its area touches (Direct3D's conservative rasterization)
 };
 
 

@@ -60,6 +60,7 @@
 #include <dxgi1_3.h>
 #include <dxgi1_2.h>
 #include "../tcosdx.h"
+#include "../tcos_swizzle.h"
 
 #pragma GCC diagnostic ignored "-Wunused-function"
 #pragma GCC diagnostic ignored "-Wincompatible-pointer-types"
@@ -135,6 +136,11 @@ struct Buf {
   UINT64 so_end;
   ID3D12Resource *so_fill;
   BYTE *so_fill_data;
+  /* Tiled resources (tiled.inc): a tile pool (D3D11_RESOURCE_MISC_TILE_POOL) has `tile_pool`, the heaps of Direct3D 12 its tiles are in; a tiled buffer
+   * (D3D11_RESOURCE_MISC_TILED: `tiled`, `res` a reserved buffer of the GPU's memory) has the pool its tiles are mapped into (a reference; NULL: none yet). */
+  struct TilePool *tile_pool;
+  int tiled;
+  struct Buf *mapped_pool;
 };
 
 struct Tex {
@@ -172,6 +178,14 @@ struct Tex {
    * of its own (subresource plane * ArraySize + slice); here, as in Direct3D 11, a subresource is a slice with both planes: the CPU sees the luma rows and after them
    * the rows of U, V pairs, at the same pitch (tex_rows counts both). */
   UINT planar;
+  /* A tiled texture (D3D11_RESOURCE_MISC_TILED, tiled.inc): `res` is a reserved texture of Direct3D 12, kept in the program's format (`own_fmt`, the texels as they are:
+   * Direct3D's tiles are of the format's texels), and the tile pool its tiles are mapped into (a reference; NULL: none yet). */
+  int tiled;
+  struct Buf *mapped_pool;
+  struct TexFormat *own_fmt;
+  /* CPU access to a texture of default usage (MapOnDefaultTextures, layout.inc): its D3D11_TEXTURE_LAYOUT. UNDEFINED is mapped with no pointer and reached with
+   * WriteToSubresource / ReadFromSubresource; ROW_MAJOR is mapped as a staging texture is; 64K_STANDARD_SWIZZLE hands out its texels in Direct3D's standard swizzle. */
+  UINT layout;
 };
 
 /* A render target, depth-stencil, shader resource or unordered access view: the texture (or buffer), and the descriptor of the first two. A view of a buffer names
@@ -237,7 +251,7 @@ typedef struct Layout {
 typedef struct StateObj { Child c; struct StateObj *next; UINT kind; } StateObj;
 typedef struct Blend { StateObj s; D3D11_BLEND_DESC1 desc1; D3D11_BLEND_DESC desc; } Blend;
 typedef struct Depth { StateObj s; D3D11_DEPTH_STENCIL_DESC desc; } Depth;
-typedef struct Raster { StateObj s; D3D11_RASTERIZER_DESC1 desc1; D3D11_RASTERIZER_DESC desc; } Raster;
+typedef struct Raster { StateObj s; D3D11_RASTERIZER_DESC2 desc2; D3D11_RASTERIZER_DESC1 desc1; D3D11_RASTERIZER_DESC desc; } Raster;      /* (found by desc2) */
 typedef struct Sampler { StateObj s; D3D11_SAMPLER_DESC desc; } Sampler;
 #define STATE_BLEND 0u
 #define STATE_DEPTH 1u
@@ -263,6 +277,7 @@ typedef struct Pipeline {
   D3D11_BLEND_DESC blend;
   D3D11_DEPTH_STENCIL_DESC depth;
   D3D11_RASTERIZER_DESC raster;
+  UINT conservative;                  /* the rasterizer state's D3D11_CONSERVATIVE_RASTERIZATION_MODE */
   UINT targets, has_depth;
   UINT samples;                       /* the targets' sample count */
   DXGI_FORMAT formats[8], depth_format;      /* (a pipeline is made for its targets' formats) */
@@ -620,11 +635,17 @@ static ID3D12Resource *make_buffer(Dev *d, D3D12_HEAP_TYPE heap, UINT64 bytes) {
 
 /* ---- buffers ----------------------------------------------------------------------------------------------------------------------------------------- */
 
+static HRESULT buf_tiled_make(Dev *d, Buf *b);      /* (tiled.inc) */
+static void tile_pool_free(struct TilePool *p);
+static BOOL tex_tiled_format(Dev *d, DXGI_FORMAT format);
+
 static void buf_destroy(DxObj *o) {
   Buf *b = (Buf *)o;
   Dev *d = b->c.dev;
   if (b->converted) { const Spare s = {b->converted, NULL, b->converted_bytes, 0}; if (b->converted_used == d->epoch) retire(d, s.res, NULL, s.bytes); else spare_keep(d, s); }
   if (b->so_fill) { settle(d, b->used); ID3D12Resource_Release(b->so_fill); }
+  unhold(b->mapped_pool);
+  if (b->tile_pool) tile_pool_free(b->tile_pool);
   if (b->res) {
     const Spare s = {b->res, b->mapped ? b->data : NULL, b->bytes, b->gpu ? -1 : b->uav};
     if (b->used == d->epoch) retire_of(d, s.res, s.data, s.bytes, s.uav); else spare_keep(d, s);
@@ -685,7 +706,17 @@ static BOOL buffer_desc_valid(const D3D11_BUFFER_DESC *desc, const D3D11_SUBRESO
   const UINT known_bind = D3D11_BIND_VERTEX_BUFFER | D3D11_BIND_INDEX_BUFFER | D3D11_BIND_CONSTANT_BUFFER | D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_STREAM_OUTPUT |
                           D3D11_BIND_UNORDERED_ACCESS;
   if (desc->ByteWidth == 0 || desc->ByteWidth > (256u << 20) || (bind & ~known_bind)) return FALSE;
-  if (misc & (D3D11_RESOURCE_MISC_TILED | D3D11_RESOURCE_MISC_TILE_POOL)) return FALSE;      /* (TiledResourcesTier NOT_SUPPORTED) */
+  /* (tiled buffers and tile pools - TiledResourcesTier 1: of default usage without CPU access, not shared; a tile pool is bound to nothing, a whole number of 64 KiB tiles; a
+   * tiled buffer is not a constant buffer - its constants could not be read here, where constant buffers are the CPU's memory - and has no initial data) */
+  if (misc & (D3D11_RESOURCE_MISC_TILED | D3D11_RESOURCE_MISC_TILE_POOL)) {
+    const UINT refused_misc = D3D11_RESOURCE_MISC_SHARED | D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX | D3D11_RESOURCE_MISC_SHARED_NTHANDLE | D3D11_RESOURCE_MISC_GDI_COMPATIBLE |
+                              D3D11_RESOURCE_MISC_GENERATE_MIPS;
+    if (((misc & D3D11_RESOURCE_MISC_TILED) && (misc & D3D11_RESOURCE_MISC_TILE_POOL)) || desc->Usage != D3D11_USAGE_DEFAULT || desc->CPUAccessFlags || (misc & refused_misc) ||
+        (initial && initial->pSysMem))
+      return FALSE;
+    if ((misc & D3D11_RESOURCE_MISC_TILE_POOL) && (bind || misc != D3D11_RESOURCE_MISC_TILE_POOL || desc->ByteWidth % D3D11_2_TILED_RESOURCE_TILE_SIZE_IN_BYTES)) return FALSE;
+    if ((misc & D3D11_RESOURCE_MISC_TILED) && (bind & D3D11_BIND_CONSTANT_BUFFER)) return FALSE;
+  }
   if (desc->Usage > D3D11_USAGE_STAGING || (desc->CPUAccessFlags & ~(UINT)(D3D11_CPU_ACCESS_READ | D3D11_CPU_ACCESS_WRITE))) return FALSE;
   switch (desc->Usage) {
     case D3D11_USAGE_DEFAULT: if (desc->CPUAccessFlags) return FALSE; break;
@@ -712,6 +743,13 @@ static HRESULT STDMETHODCALLTYPE dev_CreateBuffer(Dev *d, const D3D11_BUFFER_DES
   if (!b) return E_OUTOFMEMORY;
   b->desc = *desc;
   b->version = 1;
+  if (desc->MiscFlags & (D3D11_RESOURCE_MISC_TILED | D3D11_RESOURCE_MISC_TILE_POOL)) {
+    EnterCriticalSection(&d->lock);
+    const HRESULT hr = buf_tiled_make(d, b);      /* (tiled.inc) */
+    LeaveCriticalSection(&d->lock);
+    if (FAILED(hr)) { dx_Release(OBJ(b)); return hr; }
+    return give(b, (void **)out);
+  }
   if (desc->Usage == D3D11_USAGE_DEFAULT && (desc->BindFlags & (D3D11_BIND_UNORDERED_ACCESS | D3D11_BIND_STREAM_OUTPUT))) {
     /* (the GPU writes it: a buffer of its memory, which unordered access views and stream output may name) */
     b->gpu = 1;
@@ -1004,6 +1042,8 @@ static void tex_destroy(DxObj *o) {
   mem_free(t->mapped);
   if (t->res) ID3D12Resource_Release(t->res);
   if (t->keyed_mutex) kmt_destroy_keyed_mutex(t->keyed_mutex);      /* (held: abandoned, as Windows has it) */
+  unhold(t->mapped_pool);
+  mem_free(t->own_fmt);
   child_destroy(o);
 }
 static void STDMETHODCALLTYPE tex_GetType(Tex *t, D3D11_RESOURCE_DIMENSION *type) { (void)t; if (type) *type = D3D11_RESOURCE_DIMENSION_TEXTURE2D; }
@@ -1107,7 +1147,17 @@ static HRESULT tex_make(Dev *d, const D3D11_TEXTURE2D_DESC *in, UINT slices, ID3
         (bind & D3D11_BIND_DEPTH_STENCIL) || ((desc.Usage == D3D11_USAGE_DYNAMIC || desc.Usage == D3D11_USAGE_STAGING) && desc.ArraySize != 1))
       return E_INVALIDARG;
   }
-  if (desc.MiscFlags & (D3D11_RESOURCE_MISC_TILED | D3D11_RESOURCE_MISC_TILE_POOL)) return E_INVALIDARG;      /* (TiledResourcesTier NOT_SUPPORTED) */
+  /* (tiled: Direct3D 12's reserved textures below, TiledResourcesTier 1 - 2D textures of default usage without CPU access, not shared, multisampled, a cube or GDI
+   * compatible, of a format with D3D11_FORMAT_SUPPORT2_TILED; a volume needs tier 3, and a 1D texture is never tiled. A tile pool is a buffer) */
+  const BOOL tiled = (desc.MiscFlags & D3D11_RESOURCE_MISC_TILED) != 0;
+  if (desc.MiscFlags & D3D11_RESOURCE_MISC_TILE_POOL) return E_INVALIDARG;
+  if (tiled) {
+    const UINT refused_misc = D3D11_RESOURCE_MISC_SHARED | D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX | D3D11_RESOURCE_MISC_SHARED_NTHANDLE | D3D11_RESOURCE_MISC_GDI_COMPATIBLE |
+                              D3D11_RESOURCE_MISC_GENERATE_MIPS | D3D11_RESOURCE_MISC_TEXTURECUBE;
+    if (res || slices || d->next_tex_kind == 2 || desc.Usage != D3D11_USAGE_DEFAULT || desc.CPUAccessFlags || (desc.MiscFlags & refused_misc) || desc.SampleDesc.Count != 1 ||
+        desc.SampleDesc.Quality || !tex_tiled_format(d, desc.Format))
+      return E_INVALIDARG;
+  }
   /* (shared through NT handles: with SHARED or SHARED_KEYEDMUTEX, in GPU memory) */
   const BOOL nt_shared = !res && (desc.MiscFlags & D3D11_RESOURCE_MISC_SHARED_NTHANDLE) != 0;
   if (nt_shared && (!(desc.MiscFlags & (D3D11_RESOURCE_MISC_SHARED | D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX)) || desc.Usage != D3D11_USAGE_DEFAULT || desc.CPUAccessFlags))
@@ -1118,8 +1168,13 @@ static HRESULT tex_make(Dev *d, const D3D11_TEXTURE2D_DESC *in, UINT slices, ID3
   const UINT made_kind = d->next_tex_kind;
   d->next_tex_kind = 0;
   if ((desc.MiscFlags & D3D11_RESOURCE_MISC_GENERATE_MIPS) && (bind & (D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE)) != (D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE)) return E_INVALIDARG;
+  /* (a default texture with CPU access - MapOnDefaultTextures: read and written by the CPU, not a depth buffer, multisampled, shared or tiled) */
+  const UINT cpu_default_refused = D3D11_RESOURCE_MISC_SHARED | D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX | D3D11_RESOURCE_MISC_SHARED_NTHANDLE | D3D11_RESOURCE_MISC_TILED;
   if (desc.Usage > D3D11_USAGE_STAGING || (desc.Usage == D3D11_USAGE_STAGING && bind) || (desc.Usage == D3D11_USAGE_DYNAMIC && (desc.CPUAccessFlags != D3D11_CPU_ACCESS_WRITE || (bind & ~(UINT)D3D11_BIND_SHADER_RESOURCE))) ||
-      ((desc.Usage == D3D11_USAGE_DEFAULT || desc.Usage == D3D11_USAGE_IMMUTABLE) && desc.CPUAccessFlags))
+      (desc.Usage == D3D11_USAGE_IMMUTABLE && desc.CPUAccessFlags) ||
+      (desc.Usage == D3D11_USAGE_DEFAULT && desc.CPUAccessFlags &&
+       ((desc.CPUAccessFlags & ~(UINT)(D3D11_CPU_ACCESS_READ | D3D11_CPU_ACCESS_WRITE)) || (bind & D3D11_BIND_DEPTH_STENCIL) || desc.SampleDesc.Count > 1 || (desc.MiscFlags & cpu_default_refused) ||
+        planar || yuv)))
     return E_INVALIDARG;
   /* (a typed depth format is not read by shaders: a typeless one is made for that) */
   if ((bind & D3D11_BIND_SHADER_RESOURCE) && (desc.Format == DXGI_FORMAT_D16_UNORM || desc.Format == DXGI_FORMAT_D24_UNORM_S8_UINT || desc.Format == DXGI_FORMAT_D32_FLOAT ||
@@ -1176,6 +1231,21 @@ static HRESULT tex_make(Dev *d, const D3D11_TEXTURE2D_DESC *in, UINT slices, ID3
   t->stored_bpp = t->fmt->stored_bpp;
   t->depth = (t->fmt->flags & FMT_DEPTH) != 0;
   t->block = (t->fmt->flags & FMT_BLOCK) ? t->bpp : 0;
+  if (tiled) {
+    /* (kept as the program's texels: the tiles are the format's) */
+    TexFormat *own = mem_alloc(sizeof *own);
+    if (!own) { dx_Release(OBJ(t)); return E_OUTOFMEMORY; }
+    *own = *t->fmt;
+    own->stored = desc.Format;
+    own->stored_bpp = own->bpp;
+    own->channels = own->size = own->stored_size = own->alpha_only = 0;
+    own->packed = PACK_NONE;
+    t->own_fmt = own;
+    t->fmt = own;
+    t->stored = desc.Format;
+    t->stored_bpp = own->bpp;
+    t->tiled = 1;
+  }
   t->shadow = mem_alloc(sizeof(BYTE *) * tex_subresources(t));
   t->mapped = mem_alloc(sizeof(D3D11_MAP) * tex_subresources(t));
   if (!t->shadow || !t->mapped) { dx_Release(OBJ(t)); return E_OUTOFMEMORY; }
@@ -1204,8 +1274,14 @@ static HRESULT tex_make(Dev *d, const D3D11_TEXTURE2D_DESC *in, UINT slices, ID3
       tex_share_blob(&t->desc, slices ? 1 : made_kind == 2 ? 2 : 0, slices, mutex_global, blob);
       TcosD3D12ShareExtra(d->d12, blob, sizeof blob);
     }
-    const HRESULT hr = ID3D12Device_CreateCommittedResource(d->d12, &props, nt_shared ? D3D12_HEAP_FLAG_SHARED : D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_COMMON, NULL,
-                                                            &IID_ID3D12Resource, (void **)&t->res);
+    HRESULT hr;
+    if (tiled) {
+      rd.Layout = D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE;
+      hr = ID3D12Device_CreateReservedResource(d->d12, &rd, D3D12_RESOURCE_STATE_COMMON, NULL, &IID_ID3D12Resource, (void **)&t->res);
+    } else {
+      hr = ID3D12Device_CreateCommittedResource(d->d12, &props, nt_shared ? D3D12_HEAP_FLAG_SHARED : D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_COMMON, NULL,
+                                                &IID_ID3D12Resource, (void **)&t->res);
+    }
     if (FAILED(hr) || !t->res) { tex_refused(&desc, "Direct3D 12 below refused it"); dx_Release(OBJ(t)); return FAILED(hr) ? hr : E_FAIL; }
     if (global_shared) t->global_share = TcosD3D12GlobalShare(t->res);
   }
@@ -2143,14 +2219,24 @@ static HRESULT STDMETHODCALLTYPE dev_CreateDepthStencilState(Dev *d, const D3D11
   return S_OK;
 }
 /* CreateRasterizerState1: ForcedSampleCount is a feature of level 11_1; at 11_0 it must be 0. */
+static HRESULT raster_make(Dev *d, const D3D11_RASTERIZER_DESC2 *desc, ID3D11RasterizerState2 **out);
 static HRESULT STDMETHODCALLTYPE dev_CreateRasterizerState1(Dev *d, const D3D11_RASTERIZER_DESC1 *desc, ID3D11RasterizerState1 **out) {
+  if (out) *out = NULL;
+  if (!desc) return E_INVALIDARG;
+  const D3D11_RASTERIZER_DESC2 d2 = {desc->FillMode, desc->CullMode, desc->FrontCounterClockwise, desc->DepthBias, desc->DepthBiasClamp, desc->SlopeScaledDepthBias, desc->DepthClipEnable,
+                                     desc->ScissorEnable, desc->MultisampleEnable, desc->AntialiasedLineEnable, desc->ForcedSampleCount, D3D11_CONSERVATIVE_RASTERIZATION_MODE_OFF};
+  return raster_make(d, &d2, (ID3D11RasterizerState2 **)out);
+}
+/* A rasterizer state of a D3D11_RASTERIZER_DESC2 (CreateRasterizerState, 1 and 2 come here). */
+static HRESULT raster_make(Dev *d, const D3D11_RASTERIZER_DESC2 *desc, ID3D11RasterizerState2 **out) {
   extern const ID3D11RasterizerState2Vtbl raster_vtbl;
   static const GUID *const iids[] = {&IID_ID3D11DeviceChild, &IID_ID3D11RasterizerState, &IID_ID3D11RasterizerState1, &IID_ID3D11RasterizerState2, NULL};
   if (out) *out = NULL;
   if (!desc) return E_INVALIDARG;
   if (desc->FillMode < D3D11_FILL_WIREFRAME || desc->FillMode > D3D11_FILL_SOLID || desc->CullMode < D3D11_CULL_NONE || desc->CullMode > D3D11_CULL_BACK || desc->ForcedSampleCount)
     return E_INVALIDARG;
-  D3D11_RASTERIZER_DESC1 key = *desc;
+  if ((UINT)desc->ConservativeRaster > (UINT)D3D11_CONSERVATIVE_RASTERIZATION_MODE_ON) return E_INVALIDARG;
+  D3D11_RASTERIZER_DESC2 key = *desc;
   key.FrontCounterClockwise = !!key.FrontCounterClockwise;
   key.DepthClipEnable = !!key.DepthClipEnable;
   key.ScissorEnable = !!key.ScissorEnable;
@@ -2158,16 +2244,19 @@ static HRESULT STDMETHODCALLTYPE dev_CreateRasterizerState1(Dev *d, const D3D11_
   key.AntialiasedLineEnable = !!key.AntialiasedLineEnable;
   if (!out) return S_FALSE;
   EnterCriticalSection(&d->lock);
-  Raster *s = (Raster *)state_obj_find(d, STATE_RASTER, offsetof(Raster, desc1), &key, sizeof key);
+  Raster *s = (Raster *)state_obj_find(d, STATE_RASTER, offsetof(Raster, desc2), &key, sizeof key);
   if (!s && (s = state_obj_new(d, sizeof *s, STATE_RASTER, &raster_vtbl, iids)) != NULL) {
-    s->desc1 = key;
+    s->desc2 = key;
+    const D3D11_RASTERIZER_DESC1 one = {key.FillMode, key.CullMode, key.FrontCounterClockwise, key.DepthBias, key.DepthBiasClamp, key.SlopeScaledDepthBias, key.DepthClipEnable,
+                                        key.ScissorEnable, key.MultisampleEnable, key.AntialiasedLineEnable, key.ForcedSampleCount};
+    s->desc1 = one;
     const D3D11_RASTERIZER_DESC plain = {key.FillMode, key.CullMode, key.FrontCounterClockwise, key.DepthBias, key.DepthBiasClamp, key.SlopeScaledDepthBias, key.DepthClipEnable,
                                          key.ScissorEnable, key.MultisampleEnable, key.AntialiasedLineEnable};
     s->desc = plain;
   }
   LeaveCriticalSection(&d->lock);
   if (!s) return E_OUTOFMEMORY;
-  *out = (ID3D11RasterizerState1 *)s;
+  *out = (ID3D11RasterizerState2 *)s;
   return S_OK;
 }
 static HRESULT STDMETHODCALLTYPE dev_CreateRasterizerState(Dev *d, const D3D11_RASTERIZER_DESC *desc, ID3D11RasterizerState **out) {
@@ -2210,7 +2299,8 @@ enum {
   REC_DRAW, REC_DRAW_INDEXED, REC_DRAW_INSTANCED, REC_DRAW_INDEXED_INSTANCED, REC_DRAW_AUTO, REC_DRAW_INDIRECT, REC_DRAW_INDEXED_INDIRECT, REC_DISPATCH,
   REC_DISPATCH_INDIRECT, REC_CLEAR_RTV, REC_CLEAR_DSV, REC_CLEAR_UAV_UINT, REC_CLEAR_UAV_FLOAT, REC_COPY_REGION, REC_COPY_RESOURCE, REC_UPDATE,
   REC_COPY_STRUCTURE_COUNT, REC_RESOLVE, REC_GENERATE_MIPS, REC_BEGIN, REC_END, REC_SO_TARGETS, REC_UAV_COUNTS, REC_MIN_LOD, REC_MAPPED, REC_CLEAR_VIEW,
-  REC_DISCARD
+  REC_DISCARD,
+  REC_TILE_MAPPINGS, REC_COPY_TILE_MAPPINGS, REC_COPY_TILES, REC_UPDATE_TILES, REC_RESIZE_TILE_POOL, REC_TILED_BARRIER      /* (tiled.inc) */
 };
 typedef struct Command {
   UINT op;
@@ -2243,11 +2333,16 @@ static void deferred_update(Ctx *c, ID3D11Resource *resource, UINT sub, const D3
 static HRESULT deferred_map(Ctx *c, ID3D11Resource *resource, UINT sub, D3D11_MAP type, D3D11_MAPPED_SUBRESOURCE *out);
 static void deferred_unmap(Ctx *c, ID3D11Resource *resource, UINT sub);
 static void STDMETHODCALLTYPE ctx_ClearView(Ctx *c, ID3D11View *view, const FLOAT colour[4], const D3D11_RECT *rects, UINT count);
+static void tile_command_run(Ctx *c, const Command *m);      /* (tiled.inc) */
+static HRESULT tex_map_default(Dev *d, Tex *t, UINT sub, D3D11_MAP type, D3D11_MAPPED_SUBRESOURCE *out);      /* (layout.inc) */
+static void tex_unmap_default(Dev *d, Tex *t, UINT sub);
 
 #include "query.inc"
 #include "context.inc"
 #include "deferred.inc"
 #include "context1.inc"
+#include "tiled.inc"
+#include "layout.inc"
 #include "rtshadow.inc"
 static const ID3D11On12Device1Vtbl g_on12_vtbl;
 #include "device.inc"

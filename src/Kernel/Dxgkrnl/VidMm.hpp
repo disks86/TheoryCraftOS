@@ -107,6 +107,7 @@ class Allocation {
   struct TileBinding {
     SharedPointer<Allocation> heap;
     uint64_t offset = 0;
+    bool changed = false;              // (scatter_tiles: the tile's bytes differ from what its heap holds)
   };
   List<TileBinding> tiles_;            // a reserved buffer: where each of its tiles is (a null heap: nowhere)
   bool reserved_ = false;

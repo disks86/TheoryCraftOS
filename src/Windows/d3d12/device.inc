@@ -240,10 +240,13 @@ static HRESULT STDMETHODCALLTYPE dev_CheckFeatureSupport(Dev *This, D3D12_FEATUR
       if (size != sizeof *o) return E_INVALIDARG;
       memset(o, 0, sizeof *o);
       o->ResourceBindingTier = D3D12_RESOURCE_BINDING_TIER_1;
-      o->ConservativeRasterizationTier = D3D12_CONSERVATIVE_RASTERIZATION_TIER_NOT_SUPPORTED;
+      /* (the CPU renderer covers every pixel a triangle's area touches - within tier 1's half-pixel uncertainty, degenerate triangles culled, no inner coverage -; virgl's
+       * pipe state has no conservative mode) */
+      o->ConservativeRasterizationTier = (This->caps.features2 & DEV_FEATURE2_CONSERVATIVE_RASTER) ? D3D12_CONSERVATIVE_RASTERIZATION_TIER_1 : D3D12_CONSERVATIVE_RASTERIZATION_TIER_NOT_SUPPORTED;
       o->TiledResourcesTier = D3D12_TILED_RESOURCES_TIER_1;
       o->ResourceHeapTier = D3D12_RESOURCE_HEAP_TIER_2;
       o->CrossNodeSharingTier = D3D12_CROSS_NODE_SHARING_TIER_NOT_SUPPORTED;
+      o->StandardSwizzle64KBSupported = TRUE;      /* (resource.inc: CPU-visible textures of the standard swizzle are mapped in it) */
       return S_OK;
     }
     case D3D12_FEATURE_ARCHITECTURE: {

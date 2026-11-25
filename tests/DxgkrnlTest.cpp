@@ -1120,14 +1120,22 @@ void test_escape() {
   CHECK(call(req) == status::kSuccess);
   const Handle fs = handle_of_reply();
   // The pipeline of the coloured shaders, spelled out as the user-mode driver would.
-  auto pipeline_request = [&](ByteBuffer& b, Handle v, Handle f) {
+  auto pipeline_request = [&](ByteBuffer& b, Handle v, Handle f, uint32_t cull = 0 /*none*/) {
     b.clear();
     b.put32(static_cast<uint32_t>(EscapeOp::CreatePipeline));
-    for (uint32_t w : {v, f, 28u, 2u, 1u, 0u, 0u /*cull none*/, 0u, 0u}) b.put32(w);
+    for (uint32_t w : {v, f, 28u, 2u, 1u, 0u, cull, 0u, 0u}) b.put32(w);
     const uint32_t attributes[4][3] = {{0, 2, 0}, {1, 3, 12}, {0, 0, 0}, {0, 0, 0}};
     for (const auto& a : attributes) for (uint32_t w : a) b.put32(w);
     for (uint32_t w : {0u, 7u, 0u, 0u, 0u, 255u, 255u, 0u}) b.put32(w);
   };
+  // (the cull word's kCullConservative bit: conservative rasterization; other high bits are refused)
+  pipeline_request(req, vs, fs, kCullConservative | 1);
+  CHECK(call(req) == status::kSuccess);
+  CHECK(e.kernel.destroy_pipeline(kPid, handle_of_reply()) == status::kSuccess);
+  pipeline_request(req, vs, fs, 0x200);
+  CHECK(call(req) == status::kInvalidParameter);
+  pipeline_request(req, vs, fs, kCullConservative | 3);
+  CHECK(call(req) == status::kInvalidParameter);
   pipeline_request(req, vs, fs);
   CHECK(call(req) == status::kSuccess);
   const Handle pipe = handle_of_reply();
@@ -3583,6 +3591,70 @@ void test_blend_constant() {
   CHECK(e.kernel.open_adapter_from_index(kPid, 0, &first) == status::kSuccess && e.kernel.query_adapter_caps(kPid, first, &full) == status::kSuccess && full.blend_constant);
 }
 
+// Conservative rasterization (kFeature2ConservativeRaster, the CreatePipeline cull word's kCullConservative): a sliver that holds no pixel centre draws nothing without it and every pixel
+// its area touches with it; a device without the feature refuses the pipeline.
+void test_conservative_raster() {
+  Env e;
+  auto make = [](Kernel& kernel, Handle dev, bool conservative, Handle* out) {
+    Handle vs = 0, fs = 0;
+    CHECK(kernel.create_shader(kPid, dev, {ShaderKind::ColoredVertex, graphics::ShaderStage::Vertex, {}}, &vs) == status::kSuccess);
+    CHECK(kernel.create_shader(kPid, dev, {ShaderKind::ColoredFragment, graphics::ShaderStage::Fragment, {}}, &fs) == status::kSuccess);
+    graphics::GraphicsPipelineDesc gd;
+    graphics::describe_colored_pipeline(&gd);
+    PipelineDesc pd;
+    pd.vertex_shader = vs, pd.fragment_shader = fs, pd.vertex_stride = gd.vertex_stride, pd.attribute_count = 2, pd.varying_count = 1;
+    pd.attributes[0] = gd.attributes[0], pd.attributes[1] = gd.attributes[1];
+    pd.cull_mode = graphics::CullMode::None;
+    pd.conservative = conservative;
+    return kernel.create_pipeline(kPid, dev, pd, out);
+  };
+  Handle plain = 0, conservative = 0;
+  CHECK(make(e.kernel, e.dev, false, &plain) == status::kSuccess && make(e.kernel, e.dev, true, &conservative) == status::kSuccess);
+  // (pixels (2.1, 2.1), (5.9, 2.1), (2.1, 2.4) of a 16 x 16 target: x = px / 8 - 1, y = 1 - py / 8)
+  auto ndc_x = [](float px) { return px / 8.0f - 1.0f; };
+  auto ndc_y = [](float py) { return 1.0f - py / 8.0f; };
+  const float v[21] = {ndc_x(2.1f), ndc_y(2.1f), 0.5f, 0, 1, 0, 1, ndc_x(5.9f), ndc_y(2.1f), 0.5f, 0, 1, 0, 1, ndc_x(2.1f), ndc_y(2.4f), 0.5f, 0, 1, 0, 1};
+  Handle rt = e.alloc(kTarget, Format::A8R8G8B8, 16, 16), vb = e.buffer(kAllocVertexBuffer, 3 * 28);
+  CHECK(e.write(vb, floats(v, 21)));
+  const float identity[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+  auto draw = [&](Handle pipe) {
+    CommandWriter w(e.allocator);
+    w.begin_pass(0, kNoAllocation, kPassClearColor, {0, 0, 0, 1}, 1, 0);
+    w.bind_pipeline(pipe);
+    w.bind_vertex_buffer(1);
+    w.push_constants(floats(identity, 16));
+    w.set_viewport({0, 0, 16, 16, 0, 1});
+    w.set_scissor({0, 0, 16, 16});
+    w.draw(3);
+    w.end_pass();
+    CHECK(w.ok() && e.render(w, {rt, vb}) == status::kSuccess);
+  };
+  draw(plain);
+  uint32_t lit = 0;
+  for (uint32_t y = 0; y < 16; ++y)
+    for (uint32_t x = 0; x < 16; ++x) lit += e.pixel(rt, x, y) != 0xFF000000 ? 1 : 0;
+  CHECK(lit == 0);
+  draw(conservative);
+  const uint32_t row = e.pixel(rt, 2, 2) == 0xFF00FF00 ? 2 : 13;   // (the row of pixel y 2: counted from the top or, as the target's rows are kept, from the bottom)
+  for (uint32_t x = 2; x <= 5; ++x) CHECK(e.pixel(rt, x, row) == 0xFF00FF00);
+  lit = 0;
+  for (uint32_t y = 0; y < 16; ++y)
+    for (uint32_t x = 0; x < 16; ++x) lit += e.pixel(rt, x, y) != 0xFF000000 ? 1 : 0;
+  CHECK(lit == 4);
+  FakeScreen screen(8, 6);
+  graphics::SoftwareDevice software(e.allocator, &screen);
+  SpyDevice limited(software);
+  limited.feature2_mask = ~graphics::kFeature2ConservativeRaster;
+  Kernel kernel(e.allocator);
+  AdapterConfig c;
+  c.display = &screen;
+  kernel.add_adapter(limited, c);
+  Handle adapter = 0, dev = 0, pipe = 0;
+  CHECK(kernel.open_process(kPid) == status::kSuccess && kernel.open_adapter_from_index(kPid, 0, &adapter) == status::kSuccess && kernel.create_device(kPid, adapter, &dev) == status::kSuccess);
+  CHECK(make(kernel, dev, true, &pipe) == status::kNotSupported);
+  CHECK(make(kernel, dev, false, &pipe) == status::kSuccess);
+}
+
 // A compute shader written token by token (the HLSL compiler at hand has no ByteAddressBuffer methods): ld_raw, store_raw and an immediate atomic on a raw buffer.
 void test_compute() {
   HostAllocator allocator;
@@ -5446,6 +5518,13 @@ void test_d3d12_reserved_texture() {
       first += c == 0xFF112233u, second += c == 0xFF445566u || c == mark, black += (c & 0xFFFFFF) == 0;
     }
   CHECK(first == 1 && second == 1 && black == 2);
+  // Two tiles on one place of the heap (Direct3D's REUSE_SINGLE_TILE): a write through the first is what the second shows - the unchanged alias does not put the old texels back.
+  CHECK(e.kernel.update_tile_mappings(kPid, r, 1, heap, 2 * kTileBytes, 1) == status::kSuccess);
+  const uint32_t alias_mark = 0xFF0A0B0Cu;
+  CHECK(e.kernel.lock(kPid, r, 0, 0, &lock) == status::kSuccess);
+  ByteWriter(lock.data.subview((82u * 256 + 210) * 4, 4)).le32(alias_mark);      // (tile 1, its texel 82, 82)
+  e.kernel.unlock(kPid, r);
+  CHECK(e.pixel(q, 82, 82) == alias_mark && e.pixel(r, 210, 210) == alias_mark && e.pixel(r, 210, 82) == alias_mark);
 }
 
 
@@ -8555,6 +8634,7 @@ int main() {
   test_texture_kinds();
   test_independent_blend();
   test_blend_constant();
+  test_conservative_raster();
   test_compute();
   test_compute_kernel();
   test_storage_images_kernel();

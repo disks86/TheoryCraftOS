@@ -336,6 +336,7 @@ struct PipelineDesc {
   int32_t rasterized_stream = 0;
   bool alpha_to_coverage = false;    // with multisample: the first target's alpha says how many samples a pixel's colour reaches (see graphics::GraphicsPipelineDesc::alpha_to_coverage)
   uint32_t color_target_count = 1;   // the colour outputs the pixel shader fills (SV_Target0 ..); more than one needs the adapter's kFeatureMultipleTargets, and a pass with that many targets
+  bool conservative = false;         // needs kFeature2ConservativeRaster: conservative rasterization (see graphics::GraphicsPipelineDesc::conservative)
 };
 
 // --- Presenting -----------------------------------------------------------------------
