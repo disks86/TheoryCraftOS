@@ -255,7 +255,7 @@ static HRESULT STDMETHODCALLTYPE dev_CheckFeatureSupport(Dev *This, D3D12_FEATUR
       /* (the CPU renderer covers every pixel a triangle's area touches - within tier 1's half-pixel uncertainty, degenerate triangles culled, no inner coverage -; virgl's
        * pipe state has no conservative mode) */
       o->ConservativeRasterizationTier = (This->caps.features2 & DEV_FEATURE2_CONSERVATIVE_RASTER) ? D3D12_CONSERVATIVE_RASTERIZATION_TIER_1 : D3D12_CONSERVATIVE_RASTERIZATION_TIER_NOT_SUPPORTED;
-      o->TiledResourcesTier = D3D12_TILED_RESOURCES_TIER_1;
+      o->TiledResourcesTier = dev_tiled_tier(This);      /* (base.inc: 4 on the CPU renderer, 1 on virgl) */
       o->ResourceHeapTier = D3D12_RESOURCE_HEAP_TIER_2;
       o->CrossNodeSharingTier = D3D12_CROSS_NODE_SHARING_TIER_NOT_SUPPORTED;
       o->StandardSwizzle64KBSupported = TRUE;      /* (resource.inc: CPU-visible textures of the standard swizzle are mapped in it) */
@@ -376,7 +376,14 @@ static HRESULT STDMETHODCALLTYPE dev_CheckFeatureSupport(Dev *This, D3D12_FEATUR
     case D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS: {
       D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS *m = data;
       if (size != sizeof *m) return E_INVALIDARG;
-      /* (one quality level - the standard sample pattern - for the counts the adapter has, on the formats a render target or depth buffer can have) */
+      /* (one quality level - the standard sample pattern - for the counts the adapter has, on the formats a render target or depth buffer can have; asked with
+       * D3D12_MULTISAMPLE_QUALITY_LEVELS_FLAG_TILED_RESOURCE, for reserved textures: one sample of a tiled format - the kernel's multisampled images have no backing its tiles
+       * could be gathered into, so there are no multisampled reserved textures) */
+      if (m->Flags & ~D3D12_MULTISAMPLE_QUALITY_LEVELS_FLAG_TILED_RESOURCE) return E_INVALIDARG;
+      if (m->Flags & D3D12_MULTISAMPLE_QUALITY_LEVELS_FLAG_TILED_RESOURCE) {
+        m->NumQualityLevels = m->SampleCount == 1 && format_tiled(format_info(m->Format)) ? 1 : 0;
+        return S_OK;
+      }
       m->NumQualityLevels = m->SampleCount == 1 || (m->SampleCount < 32 && ((This->caps.sample_counts >> m->SampleCount) & 1) && format_info(m->Format) && format_info(m->Format)->bytes == 4 &&
                                                                                                    (format_info(m->Format)->kernel < KF_FIRST_EXTRA || (dev_format_caps(This, format_info(m->Format)->kernel) & KFC_MULTISAMPLE))) ? 1 : 0;
       return S_OK;

@@ -95,14 +95,15 @@ static void dev_uav_support(Dev *d, DXGI_FORMAT format, UINT *support1, UINT *su
 }
 
 static HRESULT dev_check_format(Dev *d, DXGI_FORMAT format, UINT *support);
-/* The tiers of Direct3D 12 below, as Direct3D 11's (the enumerations have the same numbers): tiled resources (tier 1 at most - tiled.inc makes tier 1's resources), and
- * conservative rasterization (tier 1 on the CPU renderer, none on virgl). */
+/* The tiers of Direct3D 12 below, as Direct3D 11's (the enumerations have the same numbers): tiled resources - Direct3D 12's tier, its tier 4 (arrays with packed levels) Direct3D
+ * 11's tier 3, the highest it has (tiled.inc keeps to tier 3's rules: no array of more than one slice with packed levels): 3 on the CPU renderer, 1 on virgl -, and conservative
+ * rasterization (tier 1 on the CPU renderer, none on virgl). */
 static D3D11_TILED_RESOURCES_TIER dev_tiled_tier(Dev *d) {
   D3D12_FEATURE_DATA_D3D12_OPTIONS o;
   memset(&o, 0, sizeof o);
   if (FAILED(ID3D12Device_CheckFeatureSupport(d->d12, D3D12_FEATURE_D3D12_OPTIONS, &o, sizeof o)) || o.TiledResourcesTier == D3D12_TILED_RESOURCES_TIER_NOT_SUPPORTED)
     return D3D11_TILED_RESOURCES_NOT_SUPPORTED;
-  return D3D11_TILED_RESOURCES_TIER_1;
+  return o.TiledResourcesTier >= D3D12_TILED_RESOURCES_TIER_3 ? D3D11_TILED_RESOURCES_TIER_3 : (D3D11_TILED_RESOURCES_TIER)o.TiledResourcesTier;
 }
 static D3D11_CONSERVATIVE_RASTERIZATION_TIER dev_conservative_tier(Dev *d) {
   D3D12_FEATURE_DATA_D3D12_OPTIONS o;

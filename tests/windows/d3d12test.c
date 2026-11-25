@@ -1367,7 +1367,7 @@ static void test_tiled(Scene *c) {
   ID3D12Device *dev = c->dev;
   D3D12_FEATURE_DATA_D3D12_OPTIONS opts;
   CHECK_HR(ID3D12Device_CheckFeatureSupport(dev, D3D12_FEATURE_D3D12_OPTIONS, &opts, sizeof opts));
-  CHECK(opts.TiledResourcesTier == D3D12_TILED_RESOURCES_TIER_1);
+  CHECK(opts.TiledResourcesTier == (g_hardware ? D3D12_TILED_RESOURCES_TIER_1 : D3D12_TILED_RESOURCES_TIER_4));      /* (test_tiled_tiers) */
   D3D12_HEAP_DESC hd;
   memset(&hd, 0, sizeof hd);
   hd.SizeInBytes = 2 * 65536;
@@ -3083,9 +3083,9 @@ static void test_tiled_formats(Scene *c) {
     else CHECK(packed.NumPackedMips == 1 && packed.NumStandardMips == 0 && total == packed.NumTilesForPackedMips && total >= 1);
     ID3D12Resource_Release(r);
   }
-  /* not tiled: the video formats (DXGI's tables), block-compressed and depth formats */
+  /* not tiled: the video formats (DXGI's tables) and depth formats (block-compressed ones are: test_tiled_tiers) */
   static const DXGI_FORMAT untiled[] = {DXGI_FORMAT_NV12, DXGI_FORMAT_P010, DXGI_FORMAT_P016, DXGI_FORMAT_AYUV, DXGI_FORMAT_Y410, DXGI_FORMAT_Y416, DXGI_FORMAT_YUY2,
-                                        DXGI_FORMAT_Y210, DXGI_FORMAT_Y216, DXGI_FORMAT_BC1_UNORM, DXGI_FORMAT_D32_FLOAT};
+                                        DXGI_FORMAT_Y210, DXGI_FORMAT_Y216, DXGI_FORMAT_D32_FLOAT};
   for (UINT i = 0; i < sizeof untiled / sizeof untiled[0]; ++i) {
     CHECK(!(format_support2(dev, untiled[i]) & D3D12_FORMAT_SUPPORT2_TILED));
     D3D12_RESOURCE_DESC td = {D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, 256, 256, 1, 1, untiled[i], {1, 0}, D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE,
@@ -6773,6 +6773,366 @@ static void test_fixed_state(Scene *c) {
   }
 }
 
+/* ---- tiled resources beyond tier 1 ------------------------------------------------------------------------------------------------------------------------------------ */
+
+/* The tiles of `r` from coordinate `at` on (a run of `count` in the numbering) to heap tiles `heap_tile` on, or nowhere (NULL heap). */
+static void tt_map(Scene *c, ID3D12Resource *r, D3D12_TILED_RESOURCE_COORDINATE at, UINT count, ID3D12Heap *heap, UINT heap_tile) {
+  D3D12_TILE_REGION_SIZE size = {count, FALSE, 0, 0, 0};
+  D3D12_TILE_RANGE_FLAGS flags = heap ? D3D12_TILE_RANGE_FLAG_NONE : D3D12_TILE_RANGE_FLAG_NULL;
+  ID3D12CommandQueue_UpdateTileMappings(c->queue, r, 1, &at, &size, heap, 1, &flags, &heap_tile, &count, D3D12_TILE_MAPPING_FLAG_NONE);
+}
+/* CopyTiles of a region between `r` and `buffer` from byte `offset`. */
+static void tt_copy(Scene *c, ID3D12Resource *r, D3D12_TILED_RESOURCE_COORDINATE at, D3D12_TILE_REGION_SIZE size, ID3D12Resource *buffer, UINT64 offset, D3D12_TILE_COPY_FLAGS flags) {
+  ID3D12GraphicsCommandList *list = NULL;
+  CHECK_HR(ID3D12CommandAllocator_Reset(c->allocator));
+  CHECK_HR(ID3D12Device_CreateCommandList(c->dev, 0, D3D12_COMMAND_LIST_TYPE_DIRECT, c->allocator, NULL, &IID_ID3D12GraphicsCommandList, (void **)&list));
+  if (!list) return;
+  ID3D12GraphicsCommandList_CopyTiles(list, r, &at, &size, buffer, offset, flags);
+  scene_run(c, list);
+  ID3D12GraphicsCommandList_Release(list);
+}
+static ID3D12Resource *tt_reserved(ID3D12Device *dev, D3D12_RESOURCE_DIMENSION dim, UINT w, UINT h, UINT depth, UINT mips, DXGI_FORMAT f, D3D12_RESOURCE_FLAGS flags, HRESULT *hr_out) {
+  D3D12_RESOURCE_DESC td = {dim, 0, w, h, (UINT16)depth, (UINT16)mips, f, {1, 0}, D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE, flags};
+  ID3D12Resource *r = NULL;
+  const HRESULT hr = ID3D12Device_CreateReservedResource(dev, &td, D3D12_RESOURCE_STATE_COMMON, NULL, &IID_ID3D12Resource, (void **)&r);
+  if (hr_out) *hr_out = hr;
+  return SUCCEEDED(hr) ? r : NULL;
+}
+/* Whether a pipeline of vs_vol and `ps` can be made (the residency feedback shaders: not on a device that has tier 1 only). */
+static int tt_pipeline_made(Scene *c, const void *ps, SIZE_T ps_bytes) {
+  D3D12_INPUT_ELEMENT_DESC layout[2] = {{"POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
+                                        {"COLOR", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 12, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0}};
+  D3D12_DESCRIPTOR_RANGE range = {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0, 0, D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND};
+  D3D12_ROOT_PARAMETER params[2];
+  memset(params, 0, sizeof params);
+  params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+  params[0].Constants.Num32BitValues = 16;
+  params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+  params[1].DescriptorTable.NumDescriptorRanges = 1;
+  params[1].DescriptorTable.pDescriptorRanges = &range;
+  D3D12_STATIC_SAMPLER_DESC ss;
+  memset(&ss, 0, sizeof ss);
+  ss.Filter = D3D12_FILTER_MIN_MAG_MIP_POINT;
+  ss.AddressU = ss.AddressV = ss.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+  ss.MaxLOD = 1000.0f;
+  D3D12_ROOT_SIGNATURE_DESC rsd = {2, params, 1, &ss, D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT};
+  ID3DBlob *blob = NULL, *error = NULL;
+  ID3D12RootSignature *rs = NULL;
+  CHECK_HR(D3D12SerializeRootSignature(&rsd, D3D_ROOT_SIGNATURE_VERSION_1_0, &blob, &error));
+  if (blob) CHECK_HR(ID3D12Device_CreateRootSignature(c->dev, 0, ID3D10Blob_GetBufferPointer(blob), ID3D10Blob_GetBufferSize(blob), &IID_ID3D12RootSignature, (void **)&rs));
+  if (blob) ID3D10Blob_Release(blob);
+  if (!rs) return -1;
+  D3D12_GRAPHICS_PIPELINE_STATE_DESC pd;
+  memset(&pd, 0, sizeof pd);
+  pd.pRootSignature = rs;
+  pd.VS.pShaderBytecode = dx_vs_vol_dxbc;
+  pd.VS.BytecodeLength = sizeof dx_vs_vol_dxbc;
+  pd.PS.pShaderBytecode = ps;
+  pd.PS.BytecodeLength = ps_bytes;
+  pd.SampleMask = 0xFFFFFFFFu;
+  pd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+  pd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+  pd.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+  pd.InputLayout.pInputElementDescs = layout;
+  pd.InputLayout.NumElements = 2;
+  pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+  pd.NumRenderTargets = 1;
+  pd.RTVFormats[0] = DXGI_FORMAT_B8G8R8A8_UNORM;
+  pd.SampleDesc.Count = 1;
+  ID3D12PipelineState *pso = NULL;
+  const HRESULT hr = ID3D12Device_CreateGraphicsPipelineState(c->dev, &pd, &IID_ID3D12PipelineState, (void **)&pso);
+  if (pso) ID3D12PipelineState_Release(pso);
+  ID3D12RootSignature_Release(rs);
+  return SUCCEEDED(hr) && pso;
+}
+
+/* The tier per device (4 on the CPU renderer: residency feedback, volumes, arrays with packed levels; 1 on virgl, whose TGSI shaders have no residency feedback) and what each
+ * allows: 2D textures with tiles mapped and not (an unmapped tile reads as zero: through copies and through shaders, whose residency feedback says so), a render target whose
+ * unmapped tiles drop what is drawn, volumes, arrays whose slices each have packed levels, block-compressed tiles, the lookups' own clamp; the exact tilings of each. */
+static void test_tiled_tiers(Scene *c) {
+  ID3D12Device *dev = c->dev;
+  D3D12_FEATURE_DATA_D3D12_OPTIONS opts;
+  memset(&opts, 0, sizeof opts);
+  CHECK_HR(ID3D12Device_CheckFeatureSupport(dev, D3D12_FEATURE_D3D12_OPTIONS, &opts, sizeof opts));
+  const D3D12_TILED_RESOURCES_TIER tier = opts.TiledResourcesTier;
+  printf("tiled resources tier %d\n", (int)tier);
+  CHECK(tier == (g_hardware ? D3D12_TILED_RESOURCES_TIER_1 : D3D12_TILED_RESOURCES_TIER_4));
+  /* (tiled formats: block-compressed ones too, not depth; no multisampled reserved textures) */
+  CHECK(format_support2(dev, DXGI_FORMAT_BC1_UNORM) & D3D12_FORMAT_SUPPORT2_TILED);
+  CHECK(format_support2(dev, DXGI_FORMAT_BC7_UNORM) & D3D12_FORMAT_SUPPORT2_TILED);
+  CHECK(!(format_support2(dev, DXGI_FORMAT_D32_FLOAT) & D3D12_FORMAT_SUPPORT2_TILED) && !(format_support2(dev, DXGI_FORMAT_R32G32B32_FLOAT) & D3D12_FORMAT_SUPPORT2_TILED));
+  D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS ms = {DXGI_FORMAT_R8G8B8A8_UNORM, 4, D3D12_MULTISAMPLE_QUALITY_LEVELS_FLAG_TILED_RESOURCE, 7};
+  CHECK_HR(ID3D12Device_CheckFeatureSupport(dev, D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS, &ms, sizeof ms));
+  CHECK(ms.NumQualityLevels == 0);
+  ms.SampleCount = 1;
+  CHECK_HR(ID3D12Device_CheckFeatureSupport(dev, D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS, &ms, sizeof ms));
+  CHECK(ms.NumQualityLevels == 1);
+  HRESULT hr = S_OK;
+  ID3D12Resource *refused = tt_reserved(dev, D3D12_RESOURCE_DIMENSION_TEXTURE1D, 256, 1, 1, 1, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_FLAG_NONE, &hr);
+  CHECK(hr == E_INVALIDARG && !refused);      /* (no tiled 1D textures) */
+  {
+    /* (the layout must be the 64 KiB undefined swizzle) */
+    D3D12_RESOURCE_DESC td = {D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, 256, 256, 1, 1, DXGI_FORMAT_R8G8B8A8_UNORM, {1, 0}, D3D12_TEXTURE_LAYOUT_UNKNOWN, D3D12_RESOURCE_FLAG_NONE};
+    CHECK(ID3D12Device_CreateReservedResource(dev, &td, D3D12_RESOURCE_STATE_COMMON, NULL, &IID_ID3D12Resource, (void **)&refused) == E_INVALIDARG && !refused);
+  }
+  {
+    /* a buffer: one subresource of 64 KiB x 1 x 1 tiles */
+    D3D12_RESOURCE_DESC bd = {D3D12_RESOURCE_DIMENSION_BUFFER, 0, 3 * 65536, 1, 1, 1, DXGI_FORMAT_UNKNOWN, {1, 0}, D3D12_TEXTURE_LAYOUT_ROW_MAJOR, D3D12_RESOURCE_FLAG_NONE};
+    ID3D12Resource *b = NULL;
+    CHECK_HR(ID3D12Device_CreateReservedResource(dev, &bd, D3D12_RESOURCE_STATE_COMMON, NULL, &IID_ID3D12Resource, (void **)&b));
+    if (b) {
+      UINT total = 0, n = 4;
+      D3D12_PACKED_MIP_INFO packed;
+      D3D12_TILE_SHAPE shape;
+      D3D12_SUBRESOURCE_TILING st[4];
+      ID3D12Device_GetResourceTiling(dev, b, &total, &packed, &shape, &n, 0, st);
+      CHECK(total == 3 && n == 1 && st[0].WidthInTiles == 3 && st[0].HeightInTiles == 1 && st[0].DepthInTiles == 1 && st[0].StartTileIndexInOverallResource == 0);
+      CHECK(shape.WidthInTexels == 65536 && shape.HeightInTexels == 1 && shape.DepthInTexels == 1 && packed.NumPackedMips == 0 && packed.NumStandardMips == 0);
+      ID3D12Resource_Release(b);
+    }
+  }
+  D3D12_HEAP_DESC hd;
+  memset(&hd, 0, sizeof hd);
+  hd.SizeInBytes = 16 * 65536;
+  hd.Properties.Type = D3D12_HEAP_TYPE_DEFAULT;
+  hd.Properties.CreationNodeMask = hd.Properties.VisibleNodeMask = 1;
+  hd.Alignment = 65536;
+  ID3D12Heap *heap = NULL;
+  CHECK_HR(ID3D12Device_CreateHeap(dev, &hd, &IID_ID3D12Heap, (void **)&heap));
+  ID3D12Resource *upload = make_buffer(dev, D3D12_HEAP_TYPE_UPLOAD, 4 * 65536, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ);
+  ID3D12Resource *down = make_buffer(dev, D3D12_HEAP_TYPE_READBACK, 4 * 65536, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);
+  if (!heap || !upload || !down) { CHECK(0); goto done; }
+  {
+    /* --- 2D, 256 x 256 B8G8R8A8: tiles 0 and 3 mapped and filled through CopyTiles with red; tiles 1 and 2 nowhere */
+    ID3D12Resource *t = tt_reserved(dev, D3D12_RESOURCE_DIMENSION_TEXTURE2D, 256, 256, 1, 1, DXGI_FORMAT_B8G8R8A8_UNORM, D3D12_RESOURCE_FLAG_NONE, NULL);
+    CHECK(t != NULL);
+    if (t) {
+      UINT32 *p = NULL;
+      CHECK_HR(ID3D12Resource_Map(upload, 0, NULL, (void **)&p));
+      if (p) { for (UINT i = 0; i < 65536 / 4; ++i) p[i] = 0xFFFF0000u; ID3D12Resource_Unmap(upload, 0, NULL); }
+      tt_map(c, t, (D3D12_TILED_RESOURCE_COORDINATE){0, 0, 0, 0}, 1, heap, 0);
+      tt_map(c, t, (D3D12_TILED_RESOURCE_COORDINATE){1, 1, 0, 0}, 1, heap, 1);
+      const D3D12_TILE_REGION_SIZE one = {1, FALSE, 0, 0, 0};
+      tt_copy(c, t, (D3D12_TILED_RESOURCE_COORDINATE){0, 0, 0, 0}, one, upload, 0, D3D12_TILE_COPY_FLAG_LINEAR_BUFFER_TO_SWIZZLED_TILED_RESOURCE);
+      tt_copy(c, t, (D3D12_TILED_RESOURCE_COORDINATE){1, 1, 0, 0}, one, upload, 0, D3D12_TILE_COPY_FLAG_LINEAR_BUFFER_TO_SWIZZLED_TILED_RESOURCE);
+      static UINT32 texels[256 * 256];
+      CHECK(texture_read(c, t, 0, texels, 4));
+      CHECK(texels[10 * 256 + 10] == 0xFFFF0000u && texels[200 * 256 + 200] == 0xFFFF0000u && texels[10 * 256 + 200] == 0 && texels[200 * 256 + 10] == 0);
+      if (tier >= D3D12_TILED_RESOURCES_TIER_2) {
+        /* (ps_tiled: red from Sample, Load and GatherRed; green, blue and alpha their CheckAccessFullyMapped) */
+        const UINT32 in_mapped = ml_draw(c, dx_ps_tiled_dxbc, sizeof dx_ps_tiled_dxbc, t, NULL, 0.25f, 0.25f, 0, 1);
+        const UINT32 in_unmapped = ml_draw(c, dx_ps_tiled_dxbc, sizeof dx_ps_tiled_dxbc, t, NULL, 0.75f, 0.25f, 0, 1);
+        const UINT32 other = ml_draw(c, dx_ps_tiled_dxbc, sizeof dx_ps_tiled_dxbc, t, NULL, 0.75f, 0.75f, 0, 1);
+        printf("residency feedback: mapped %08x, unmapped %08x, the other mapped tile %08x\n", in_mapped, in_unmapped, other);
+        CHECK(in_mapped == 0xFFFFFFFFu && in_unmapped == 0 && other == 0xFFFFFFFFu);
+        /* the gather's footprint across the edge of tiles 0 and 1 (texels 127 and 128): one of them unmapped, so only the gather reports it */
+        const UINT32 edge = ml_draw(c, dx_ps_tiled_dxbc, sizeof dx_ps_tiled_dxbc, t, NULL, 127.75f / 256, 0.25f, 0, 1);
+        printf("residency feedback at a tile's edge: %08x\n", edge);
+        CHECK((edge & 0xFF0000FFu) == 0xFF000000u && (edge & 0xFF00) == 0xFF00);
+      } else {
+        /* (tier 1: the shaders of residency feedback and clamps are refused - a plain lookup's pipeline is made) */
+        CHECK(tt_pipeline_made(c, dx_ps_tex3d_dxbc, sizeof dx_ps_tex3d_dxbc) == 1);
+        CHECK(tt_pipeline_made(c, dx_ps_tiled_dxbc, sizeof dx_ps_tiled_dxbc) == 0 && tt_pipeline_made(c, dx_ps_tiled_clamp_dxbc, sizeof dx_ps_tiled_clamp_dxbc) == 0);
+      }
+      /* (remapped: tile 0 nowhere now - it reads as zero -, its old place keeps its texels for the next mapping of it) */
+      tt_map(c, t, (D3D12_TILED_RESOURCE_COORDINATE){0, 0, 0, 0}, 1, NULL, 0);
+      CHECK(texture_read(c, t, 0, texels, 4) && texels[10 * 256 + 10] == 0);
+      tt_map(c, t, (D3D12_TILED_RESOURCE_COORDINATE){1, 0, 0, 0}, 1, heap, 0);
+      CHECK(texture_read(c, t, 0, texels, 4) && texels[10 * 256 + 200] == 0xFFFF0000u && texels[10 * 256 + 10] == 0);
+      ID3D12Resource_Release(t);
+    }
+  }
+  {
+    /* --- a render target of 256 x 256, tile 0 mapped: a clear reaches tile 0 of the heap; tile 1's texels are dropped (CopyTiles out: zeros) */
+    ID3D12Resource *t = tt_reserved(dev, D3D12_RESOURCE_DIMENSION_TEXTURE2D, 256, 256, 1, 1, DXGI_FORMAT_B8G8R8A8_UNORM, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, NULL);
+    CHECK(t != NULL);
+    ID3D12DescriptorHeap *rtvs = NULL;
+    D3D12_DESCRIPTOR_HEAP_DESC dh = {D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
+    CHECK_HR(ID3D12Device_CreateDescriptorHeap(dev, &dh, &IID_ID3D12DescriptorHeap, (void **)&rtvs));
+    if (t && rtvs) {
+      tt_map(c, t, (D3D12_TILED_RESOURCE_COORDINATE){0, 0, 0, 0}, 1, heap, 4);
+      const D3D12_CPU_DESCRIPTOR_HANDLE rtv = ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(rtvs);
+      ID3D12Device_CreateRenderTargetView(dev, t, NULL, rtv);
+      ID3D12GraphicsCommandList *list = NULL;
+      CHECK_HR(ID3D12CommandAllocator_Reset(c->allocator));
+      CHECK_HR(ID3D12Device_CreateCommandList(dev, 0, D3D12_COMMAND_LIST_TYPE_DIRECT, c->allocator, NULL, &IID_ID3D12GraphicsCommandList, (void **)&list));
+      if (list) {
+        D3D12_RESOURCE_BARRIER b;
+        memset(&b, 0, sizeof b);
+        b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        b.Transition.pResource = t;
+        b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        b.Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+        b.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
+        ID3D12GraphicsCommandList_ResourceBarrier(list, 1, &b);
+        const float green[4] = {0, 1, 0, 1};
+        ID3D12GraphicsCommandList_ClearRenderTargetView(list, rtv, green, 0, NULL);
+        b.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+        b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+        ID3D12GraphicsCommandList_ResourceBarrier(list, 1, &b);
+        D3D12_TILED_RESOURCE_COORDINATE at = {0, 0, 0, 0};
+        D3D12_TILE_REGION_SIZE two = {2, FALSE, 0, 0, 0};
+        ID3D12GraphicsCommandList_CopyTiles(list, t, &at, &two, down, 0, D3D12_TILE_COPY_FLAG_SWIZZLED_TILED_RESOURCE_TO_LINEAR_BUFFER);
+        scene_run(c, list);
+        ID3D12GraphicsCommandList_Release(list);
+        const UINT32 *q = NULL;
+        CHECK_HR(ID3D12Resource_Map(down, 0, NULL, (void **)&q));
+        int green_tile = q != NULL, empty_tile = q != NULL;
+        for (UINT i = 0; q && i < 65536 / 4; ++i) green_tile &= q[i] == 0xFF00FF00u, empty_tile &= q[65536 / 4 + i] == 0;
+        if (q) ID3D12Resource_Unmap(down, 0, NULL);
+        printf("tiled render target: the mapped tile %s, the unmapped one %s\n", green_tile ? "cleared" : "wrong", empty_tile ? "empty" : "written");
+        CHECK(green_tile && empty_tile);
+      }
+    }
+    if (rtvs) ID3D12DescriptorHeap_Release(rtvs);
+    if (t) ID3D12Resource_Release(t);
+  }
+  {
+    /* --- a volume (tier 3): 64 x 32 x 16 B8G8R8A8 is two 32 x 32 x 16 tiles; mapped whole by a region of no start and no size, then tile 1 unmapped by a box */
+    ID3D12Resource *v = tt_reserved(dev, D3D12_RESOURCE_DIMENSION_TEXTURE3D, 64, 32, 16, 1, DXGI_FORMAT_B8G8R8A8_UNORM, D3D12_RESOURCE_FLAG_NONE, &hr);
+    if (tier < D3D12_TILED_RESOURCES_TIER_3) {
+      CHECK(hr == E_INVALIDARG && !v);
+    } else {
+      CHECK(v != NULL);
+      if (v) {
+        UINT total = 0, n = 1;
+        D3D12_PACKED_MIP_INFO packed;
+        D3D12_TILE_SHAPE shape;
+        D3D12_SUBRESOURCE_TILING st;
+        ID3D12Device_GetResourceTiling(dev, v, &total, &packed, &shape, &n, 0, &st);
+        CHECK(total == 2 && shape.WidthInTexels == 32 && shape.HeightInTexels == 32 && shape.DepthInTexels == 16 && st.WidthInTiles == 2 && st.HeightInTiles == 1 && st.DepthInTiles == 1);
+        UINT start = 6;
+        D3D12_TILE_RANGE_FLAGS none = D3D12_TILE_RANGE_FLAG_NONE;
+        ID3D12CommandQueue_UpdateTileMappings(c->queue, v, 1, NULL, NULL, heap, 1, &none, &start, NULL, D3D12_TILE_MAPPING_FLAG_NONE);
+        ml_fill(c, v);
+        CHECK(ml_texel(c, v, 0, 5, 5, 3) == ml_colour(0, 3) && ml_texel(c, v, 0, 40, 5, 9) == ml_colour(0, 9));
+        D3D12_TILED_RESOURCE_COORDINATE at = {1, 0, 0, 0};
+        D3D12_TILE_REGION_SIZE box = {1, TRUE, 1, 1, 1};
+        D3D12_TILE_RANGE_FLAGS null_range = D3D12_TILE_RANGE_FLAG_NULL;
+        UINT one = 1;
+        ID3D12CommandQueue_UpdateTileMappings(c->queue, v, 1, &at, &box, NULL, 1, &null_range, NULL, &one, D3D12_TILE_MAPPING_FLAG_NONE);
+        CHECK(ml_texel(c, v, 0, 5, 5, 3) == ml_colour(0, 3) && ml_texel(c, v, 0, 40, 5, 9) == 0);
+        /* (the shader: slice 3 of tile 0 mapped, tile 1 not) */
+        const UINT32 a = ml_draw(c, dx_ps_tiled_3d_dxbc, sizeof dx_ps_tiled_3d_dxbc, v, NULL, 0.1f, 0.5f, 3.5f / 16, 1);
+        const UINT32 b = ml_draw(c, dx_ps_tiled_3d_dxbc, sizeof dx_ps_tiled_3d_dxbc, v, NULL, 0.9f, 0.5f, 3.5f / 16, 1);
+        printf("tiled volume: %08x mapped, %08x not\n", a, b);
+        CHECK(a == ml_colour(0, 3) && b == 0);
+        ID3D12Resource_Release(v);
+      }
+    }
+  }
+  {
+    /* --- an array of 3 slices of 128 x 128, 8 levels: level 0 is a tile, levels 1 .. 7 packed - one tile for each slice (tier 4) */
+    ID3D12Resource *a = tt_reserved(dev, D3D12_RESOURCE_DIMENSION_TEXTURE2D, 128, 128, 3, 8, DXGI_FORMAT_B8G8R8A8_UNORM, D3D12_RESOURCE_FLAG_NONE, &hr);
+    if (tier < D3D12_TILED_RESOURCES_TIER_4) {
+      CHECK(hr == E_INVALIDARG && !a);
+    } else {
+      CHECK(a != NULL);
+      if (a) {
+        UINT total = 0, n = 24;
+        D3D12_PACKED_MIP_INFO packed;
+        D3D12_TILE_SHAPE shape;
+        D3D12_SUBRESOURCE_TILING st[24];
+        ID3D12Device_GetResourceTiling(dev, a, &total, &packed, &shape, &n, 0, st);
+        printf("tiled array: %u tiles, %u standard + %u packed levels, %u packed tiles from %u\n", total, packed.NumStandardMips, packed.NumPackedMips, packed.NumTilesForPackedMips,
+               packed.StartTileIndexInOverallResource);
+        CHECK(total == 6 && n == 24 && packed.NumStandardMips == 1 && packed.NumPackedMips == 7 && packed.NumTilesForPackedMips == 1 && packed.StartTileIndexInOverallResource == 1);
+        CHECK(st[0].StartTileIndexInOverallResource == 0 && st[8].StartTileIndexInOverallResource == 2 && st[16].StartTileIndexInOverallResource == 4 && st[9].StartTileIndexInOverallResource == 0xFFFFFFFFu);
+        n = 2;
+        ID3D12Device_GetResourceTiling(dev, a, NULL, NULL, NULL, &n, 23, st);      /* (from subresource 23: one is left) */
+        CHECK(n == 1 && st[0].StartTileIndexInOverallResource == 0xFFFFFFFFu && st[0].WidthInTiles == 0);
+        /* slice 0 whole (tiles 0, 1), slice 2's packed levels (tile 5); slice 1 and slice 2's level 0 nowhere */
+        tt_map(c, a, (D3D12_TILED_RESOURCE_COORDINATE){0, 0, 0, 0}, 2, heap, 8);
+        tt_map(c, a, (D3D12_TILED_RESOURCE_COORDINATE){0, 0, 0, 2 * 8 + 3}, 1, heap, 10);
+        ml_fill(c, a);
+        CHECK(ml_texel(c, a, 0, 3, 3, 0) == ml_colour(0, 0) && ml_texel(c, a, 4, 1, 1, 0) == ml_colour(4, 0) && ml_texel(c, a, 8, 3, 3, 0) == 0 && ml_texel(c, a, 16, 3, 3, 0) == 0 &&
+              ml_texel(c, a, 16 + 3, 1, 1, 0) == ml_colour(3, 2));
+        const UINT32 mapped = ml_draw(c, dx_ps_tiled_array_dxbc, sizeof dx_ps_tiled_array_dxbc, a, NULL, 0.5f, 0.5f, 2.0f / 4, 3.0f / 8);
+        const UINT32 unmapped = ml_draw(c, dx_ps_tiled_array_dxbc, sizeof dx_ps_tiled_array_dxbc, a, NULL, 0.5f, 0.5f, 1.0f / 4, 0);
+        printf("tiled array: slice 2 level 3 %08x, slice 1 level 0 %08x\n", mapped, unmapped);
+        CHECK(mapped == ml_colour(3, 2) && unmapped == 0);
+        ID3D12Resource_Release(a);
+      }
+    }
+    /* (an array whose levels are all at least a tile is any tier's) */
+    ID3D12Resource *whole = tt_reserved(dev, D3D12_RESOURCE_DIMENSION_TEXTURE2D, 256, 256, 2, 2, DXGI_FORMAT_B8G8R8A8_UNORM, D3D12_RESOURCE_FLAG_NONE, NULL);
+    CHECK(whole != NULL);
+    if (whole) ID3D12Resource_Release(whole);
+  }
+  {
+    /* --- BC1: 1024 x 512, 3 levels - 512 x 256 texels a tile (128 x 64 blocks): 2 x 2 tiles and 1, the third level packed; a tile through CopyTiles and back */
+    ID3D12Resource *bc = tt_reserved(dev, D3D12_RESOURCE_DIMENSION_TEXTURE2D, 1024, 512, 1, 3, DXGI_FORMAT_BC1_UNORM, D3D12_RESOURCE_FLAG_NONE, NULL);
+    CHECK(bc != NULL);
+    if (bc) {
+      UINT total = 0, n = 3;
+      D3D12_PACKED_MIP_INFO packed;
+      D3D12_TILE_SHAPE shape;
+      D3D12_SUBRESOURCE_TILING st[3];
+      ID3D12Device_GetResourceTiling(dev, bc, &total, &packed, &shape, &n, 0, st);
+      CHECK(total == 6 && shape.WidthInTexels == 512 && shape.HeightInTexels == 256 && st[0].WidthInTiles == 2 && st[0].HeightInTiles == 2 && st[1].StartTileIndexInOverallResource == 4 &&
+            packed.NumStandardMips == 2 && packed.NumPackedMips == 1 && packed.StartTileIndexInOverallResource == 5);
+      tt_map(c, bc, (D3D12_TILED_RESOURCE_COORDINATE){0, 0, 0, 0}, 1, heap, 12);
+      BYTE *p = NULL;
+      CHECK_HR(ID3D12Resource_Map(upload, 0, NULL, (void **)&p));
+      if (p) { for (UINT i = 0; i < 2 * 65536; ++i) p[i] = (BYTE)(i * 7 + 3); ID3D12Resource_Unmap(upload, 0, NULL); }
+      const D3D12_TILE_REGION_SIZE two = {2, FALSE, 0, 0, 0};
+      tt_copy(c, bc, (D3D12_TILED_RESOURCE_COORDINATE){0, 0, 0, 0}, two, upload, 0, D3D12_TILE_COPY_FLAG_LINEAR_BUFFER_TO_SWIZZLED_TILED_RESOURCE);
+      tt_copy(c, bc, (D3D12_TILED_RESOURCE_COORDINATE){0, 0, 0, 0}, two, down, 0, D3D12_TILE_COPY_FLAG_SWIZZLED_TILED_RESOURCE_TO_LINEAR_BUFFER);
+      const BYTE *q = NULL;
+      CHECK_HR(ID3D12Resource_Map(down, 0, NULL, (void **)&q));
+      int same = q != NULL, empty = q != NULL;
+      for (UINT i = 0; q && i < 65536; ++i) same &= q[i] == (BYTE)(i * 7 + 3), empty &= q[65536 + i] == 0;
+      if (q) ID3D12Resource_Unmap(down, 0, NULL);
+      CHECK(same && empty);
+      /* (the blocks of the tile are the level's first 128 x 64 blocks: block (1, 0) of level 0 is the tile's bytes 8 .. 15) */
+      static BYTE level0[256 * 128 * 8];
+      CHECK(sub_copy(c, bc, 0, level0, 1));
+      CHECK(level0[8] == (BYTE)(8 * 7 + 3) && level0[256 * 8 + 3] == (BYTE)((128 * 8 + 3) * 7 + 3) && level0[128 * 8] == 0 && level0[256 * 8 * 64] == 0);
+      ID3D12Resource_Release(bc);
+    }
+  }
+  {
+    /* --- 64KB_STANDARD_SWIZZLE: a 128 x 128 B8G8R8A8 tile whose words are their own byte offsets in it; texel (x, y) is at Direct3D's swizzle of x bytes 0xAA8F, y 0x5570 */
+    D3D12_RESOURCE_DESC sd = {D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, 128, 128, 1, 1, DXGI_FORMAT_B8G8R8A8_UNORM, {1, 0}, D3D12_TEXTURE_LAYOUT_64KB_STANDARD_SWIZZLE,
+                              D3D12_RESOURCE_FLAG_NONE};
+    ID3D12Resource *sw = NULL;
+    CHECK_HR(ID3D12Device_CreateReservedResource(dev, &sd, D3D12_RESOURCE_STATE_COMMON, NULL, &IID_ID3D12Resource, (void **)&sw));
+    if (sw) {
+      tt_map(c, sw, (D3D12_TILED_RESOURCE_COORDINATE){0, 0, 0, 0}, 1, heap, 13);
+      UINT32 *p = NULL;
+      CHECK_HR(ID3D12Resource_Map(upload, 0, NULL, (void **)&p));
+      if (p) { for (UINT i = 0; i < 65536 / 4; ++i) p[i] = i * 4; ID3D12Resource_Unmap(upload, 0, NULL); }
+      const D3D12_TILE_REGION_SIZE one = {1, FALSE, 0, 0, 0};
+      tt_copy(c, sw, (D3D12_TILED_RESOURCE_COORDINATE){0, 0, 0, 0}, one, upload, 0, D3D12_TILE_COPY_FLAG_LINEAR_BUFFER_TO_SWIZZLED_TILED_RESOURCE);
+      static UINT32 texels[128 * 128];
+      int same = texture_read(c, sw, 0, texels, 4);
+      for (UINT y = 0; same && y < 128; ++y)
+        for (UINT x = 0; x < 128; ++x) {
+          UINT off = 0;
+          for (UINT m = 0xAA8Fu, b = 1, v = x * 4; m; b <<= 1) { const UINT low = m & (0u - m); if (v & b) off |= low; m &= m - 1; }
+          for (UINT m = 0x5570u, b = 1; m; b <<= 1) { const UINT low = m & (0u - m); if (y & b) off |= low; m &= m - 1; }
+          same &= texels[y * 128 + x] == off;
+        }
+      printf("reserved texture of the standard swizzle: %s\n", same ? "texels where the swizzle puts them" : "wrong");
+      CHECK(same);
+      ID3D12Resource_Release(sw);
+    }
+  }
+  {
+    /* --- a lookup's own clamp (Sample with a clamp: sample_cl_s): four levels of 8 x 8, the clamp of 2 gives level 2 */
+    ID3D12Resource *m = ml_texture(dev, D3D12_RESOURCE_DIMENSION_TEXTURE2D, 8, 8, 1, 4, DXGI_FORMAT_B8G8R8A8_UNORM, D3D12_RESOURCE_FLAG_NONE);
+    if (m) {
+      ml_fill(c, m);
+      if (tier >= D3D12_TILED_RESOURCES_TIER_2) CHECK(ml_draw(c, dx_ps_tiled_clamp_dxbc, sizeof dx_ps_tiled_clamp_dxbc, m, NULL, 0.5f, 0.5f, 0, 1) == ml_colour(2, 0));
+      ID3D12Resource_Release(m);
+    }
+  }
+done:
+  if (down) ID3D12Resource_Release(down);
+  if (upload) ID3D12Resource_Release(upload);
+  if (heap) ID3D12Heap_Release(heap);
+}
+
 static void test_extras(ID3D12Device *dev, ID3D12CommandQueue *queue, ID3D12Fence *fence, UINT64 *fence_value) {
   Scene c;
   memset(&c, 0, sizeof c);
@@ -6816,6 +7176,7 @@ static void test_extras(ID3D12Device *dev, ID3D12CommandQueue *queue, ID3D12Fenc
   test_min_lod_clamp(&c);
   test_mip_layers(&c);
   test_formats(&c);
+  test_tiled_tiers(&c);
 }
 
 /* ---- the interfaces after ID3D12Device and ID3D12GraphicsCommandList ---------------------------------------------------------------------------------------------------- */
@@ -7419,7 +7780,7 @@ static void test_cpu_texture(ID3D12Device *dev, ID3D12CommandQueue *queue, ID3D1
   D3D12_FEATURE_DATA_D3D12_OPTIONS options;
   memset(&options, 0, sizeof options);
   CHECK_HR(ID3D12Device_CheckFeatureSupport(dev, D3D12_FEATURE_D3D12_OPTIONS, &options, sizeof options));
-  CHECK(options.StandardSwizzle64KBSupported && options.TiledResourcesTier == D3D12_TILED_RESOURCES_TIER_1 &&
+  CHECK(options.StandardSwizzle64KBSupported && options.TiledResourcesTier == (g_hardware ? D3D12_TILED_RESOURCES_TIER_1 : D3D12_TILED_RESOURCES_TIER_4) &&
         options.ConservativeRasterizationTier <= D3D12_CONSERVATIVE_RASTERIZATION_TIER_1);
   D3D12_RESOURCE_DESC sd = {D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, 16, 16, 1, 1, DXGI_FORMAT_R8G8B8A8_UNORM, {1, 0}, D3D12_TEXTURE_LAYOUT_64KB_STANDARD_SWIZZLE, D3D12_RESOURCE_FLAG_NONE};
   ID3D12Resource *sw = NULL;

@@ -29,6 +29,7 @@
 // ld / sample_l / sample_b / sample_c / sample_d, derivatives, resinfo, relative addressing, constant buffers other than cb0, indexable temps, geometry / hull / domain / compute
 // shaders, SV_Position, vertex or instance id as an input, depth output.
 #include "Kernel/Dxgkrnl/D3d9Decoded.hpp"
+#include "Utility/ByteBuffer.hpp"
 #include "Utility/ByteStream.hpp"
 #include "Utility/Move.hpp"
 
@@ -748,12 +749,33 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
     return status::kNotSupported;
   };
 
+  // The residency feedback forms of the lookups (Shader Model 5 for tiled resources: the ones that end in _s, D3DWDDM1_3_SB_OPCODE_*_FEEDBACK) and the instruction they are a form of:
+  // gather4_s 0xDB, gather4_c_s 0xDC, gather4_po_s 0xDD, gather4_po_c_s 0xDE, ld_s 0xDF, ld2dms_s 0xE0, ld_uav_typed_s 0xE1, ld_raw_s 0xE2, ld_structured_s 0xE3, sample_l_s 0xE4,
+  // sample_c_lz_s 0xE5, sample_cl_s 0xE6, sample_b_cl_s 0xE7, sample_d_cl_s 0xE8, sample_c_cl_s 0xE9. Their operands are the form's with the status destination after the first and,
+  // for the _cl_ ones, the clamp (the finest level of detail) last. `operands`: how many the plain form has after its destination.
+  struct FeedbackForm {
+    uint32_t base, operands;
+    bool clamp;
+  };
+  auto feedback_form = [](uint32_t op, FeedbackForm* f) {
+    static const FeedbackForm kForms[] = {{109, 3, false}, {126, 4, false}, {127, 4, false}, {128, 5, false}, {45, 2, false}, {46, 3, false}, {163, 2, false}, {165, 2, false},
+                                          {167, 3, false}, {72, 4, false}, {71, 4, false}, {69, 3, true}, {74, 4, true}, {73, 5, true}, {70, 4, true}};
+    if (op < 0xDB || op > 0xE9) return false;
+    *f = kForms[op - 0xDB];
+    return true;
+  };
+  bool feedback_unchecked = false;   // (a feedback form was decoded into something that is not a lookup of a texture: refused)
+
   // --- the instructions
   while (!in.at_end()) {
+    if (feedback_unchecked) return status::kNotSupported;   // (a status of a buffer or storage image load: those reads have no residency feedback here)
     if (returned) return status::kNotSupported;   // (code after a ret)
     const uint32_t token = in.le32();
     uint32_t words = (token >> 24) & 0x7F;
-    const uint32_t opcode = token & 0x7FF;
+    const uint32_t raw_opcode = token & 0x7FF;
+    FeedbackForm form;
+    const bool feedback = feedback_form(raw_opcode, &form);
+    const uint32_t opcode = feedback ? form.base : raw_opcode;
     if (!in.ok()) return status::kInvalidParameter;
     if (opcode == kCustomData4) {
       // The length is the next word. Class 3 is the immediate constant buffer (vec4s, indexed by icb[i]); the other classes (comments, debug information) matter to nothing here.
@@ -793,7 +815,45 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
       }
     }
     NtStatus s = status::kSuccess;
+    // (a feedback form: its status and clamp are taken out, and the plain form's operands are decoded as the plain form is)
+    ByteBuffer plain_operands(allocator);
+    Operand feedback_status, feedback_clamp;
+    if (feedback) {
+      ByteReader q(p.rest());
+      Operand o;
+      if ((s = read_operand(q, &o)) != status::kSuccess) return s;
+      const uint64_t after_dst = q.position();
+      if ((s = read_operand(q, &feedback_status)) != status::kSuccess) return s;
+      const uint64_t after_status = q.position();
+      for (uint32_t k = 0; k < form.operands; ++k)
+        if ((s = read_operand(q, &o)) != status::kSuccess) return s;
+      const uint64_t after_operands = q.position();
+      if (form.clamp && (s = read_operand(q, &feedback_clamp)) != status::kSuccess) return s;
+      // (what is left is padding the compiler writes after these instructions' operands: zeros)
+      for (ByteReader pad(q.rest()); !pad.at_end();)
+        if (pad.le32() != 0 || !pad.ok()) return status::kInvalidParameter;
+      const ConstByteView rest = p.rest();
+      if (!plain_operands.append(rest.first(after_dst)) || !plain_operands.append(rest.subview(after_status, after_operands - after_status))) return status::kNoMemory;
+      p = ByteReader(plain_operands.view());
+      if (feedback_status.type != kOpNull && (feedback_status.type != kOpTemp || feedback_status.components != 2)) return status::kNotSupported;
+      feedback_unchecked = true;
+    }
     switch (opcode) {
+      case 0xEA: {
+        // check_access_fully_mapped dst, status: all ones when the status says every texel the lookup read was mapped (the status is 1 then, 0 if not)
+        Operand d, a;
+        if ((s = read_operand(p, &d)) != status::kSuccess || (s = read_operand(p, &a)) != status::kSuccess) return s;
+        if (!p.at_end()) return status::kInvalidParameter;
+        Instr m;
+        m.op = kINe;
+        if ((s = to_dst(d, &m.dst)) != status::kSuccess || (s = to_src(a, &m.src[0])) != status::kSuccess) return s;
+        Operand zero;
+        zero.type = kOpImmediate, zero.components = 2;
+        if ((s = to_src(zero, &m.src[1])) != status::kSuccess) return s;
+        m.src_count = 2;
+        if ((s = emit(m)) != status::kSuccess) return s;
+        continue;
+      }
       case kDclGlobalFlags4: case kNop4: continue;
       case kDclSampler4: {
         // dcl_sampler s#, mode (5.1: s[ID][lower:upper], space - the range's register); the mode (default, comparison, mono) changes nothing here: the sampler bound says how it compares
@@ -1109,6 +1169,15 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
     }
 
     Instr ins;
+    if (feedback) {
+      ins.feedback = true;
+      ins.status.mask = 0;
+      if (feedback_status.type != kOpNull && (s = to_dst(feedback_status, &ins.status)) != status::kSuccess) return s;
+      if (form.clamp) {
+        if ((s = to_src(feedback_clamp, &ins.clamp)) != status::kSuccess) return s;
+        ins.has_clamp = true;
+      }
+    }
     if (opcode == kRet4) {
       if (hull) {
         // (a phase ends; a program with no more phases is done)
@@ -1577,6 +1646,13 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
       ins.src_count = alu->sources;
     }
     if (!p.at_end()) return status::kInvalidParameter;
+    if (ins.feedback) {
+      // (the lookups of textures report residency; a load of a buffer or a storage image with a status is refused at the next instruction)
+      const bool lookup = ins.op == kTexLd || ins.op == kTexFetch || ins.op == kTexFetchMs || ins.op == kTexLod || ins.op == kTexGrad || ins.op == kTexBias || ins.op == kTexCompare ||
+                          ins.op == kTexGather;
+      if (lookup) feedback_unchecked = false;
+      program->uses_feedback_ = true;
+    }
     if (ins.op >= kTexFetch && ins.op <= kTexCompare && ins.op != kTexSamples && ins.op != kTexFetchMs && ins.src[1].type == kSampler && ins.src[1].number < 32 &&
         (one_d_units >> ins.src[1].number & 1)) {
       s = one_d_fix(ins);
@@ -1586,6 +1662,7 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
     s = emit(ins);
     if (s != status::kSuccess) return s;
   }
+  if (feedback_unchecked) return status::kNotSupported;
   if (open_ifs.count() || loops.count()) return status::kInvalidParameter;
   {
     uint32_t total = 0;

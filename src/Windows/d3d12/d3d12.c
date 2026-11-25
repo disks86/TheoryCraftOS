@@ -41,7 +41,9 @@
  *     first level on virgl
  *   - a pass with a depth buffer and no render target draws into a colour image of the buffer's size that nothing reads (cmdlist.inc depth_companion): it costs that memory
  *   - multisampled images are render targets and depth buffers of the adapter's sample counts, drawn into and resolved (not read by shaders through this DLL)
- *   - tiled resources at tier 1 only, heaps shared across adapters (DXGI_ERROR_UNSUPPORTED; shared handles of one adapter's resources and heaps, and of fences of any
+ *   - tiled resources (extras.inc, base.inc dev_tiled_tier): tier 4 on the CPU renderer, tier 1 on virgl (TGSI has no residency feedback or lookup clamp); no reserved depth
+ *     buffers or multisampled textures (the kernel's have no backing for the tiles: no D3D12_FORMAT_SUPPORT2_TILED depth format, no tiled quality level), no status of buffer and UAV loads (ld_raw_s / ld_structured_s / ld_uav_typed_s: the kernel refuses
+ *     the shader); heaps shared across adapters (DXGI_ERROR_UNSUPPORTED; shared handles of one adapter's resources and heaps, and of fences of any
  *     adapter, are made: device.inc), resource state validation (barriers are accepted and not looked at, except aliasing), the debug layer
  *   - of the later interfaces (ID3D12Device1 .. 14, ID3D12GraphicsCommandList1 .. 10: device1.inc, cmdlist1.inc, library.inc, rootsig.inc; what mingw lacks of them is in
  *     d3d12_types.h), the features reported at their "not supported" tier: ray tracing, mesh shaders, sampler feedback, work graphs, protected sessions, meta commands,

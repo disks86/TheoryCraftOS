@@ -93,6 +93,9 @@
 //                    (a depth buffer of one sample takes one of the depth layouts instead - and needs one -, the adapter's kFeature2DepthCopies: the buffer holds its depth as 32-bit floats,
 //                    16-bit or 24-bit normalised integers (the 24 bits in the low bits of a word whose high byte is 0, and is not read), or the stencil of a D24S8 buffer as bytes; copied
 //                    into the buffer a depth is rounded to the nearest code, into the image a code becomes the float it stands for)
+//   CopyTiles        direction (0 buffer to tiles, 1 tiles to buffer), reserved_index, first_tile, tile_count, buffer_index, buffer_offset   (outside a pass: tiles first_tile ..
+//                    first_tile + tile_count - 1 of a reserved buffer or texture (VidMm ReservedLayout's numbering) as the 64 KiB each holds in its heap, one after the other in the buffer from
+//                    buffer_offset on - Direct3D's CopyTiles. A tile mapped nowhere reads as zeros and drops what is written to it; a plain buffer, not a heap or a reserved one)
 //   DecodeFrame      decoder handle, buffer_index, picture_offset, picture_bytes, matrix_offset, matrix_bytes, slices_offset, slices_bytes, bitstream_index, bitstream_offset, bitstream_bytes,
 //                    luma_index, chroma_index, status_index, status_offset, output_keyed, key_count, then key_count allocation indices
 //                    [, kDecodeConversion, output format (hardware::VpFormat), output colour space, decode colour space, output plane0_index, plane1_index (kNoAllocation for
@@ -215,6 +218,7 @@ enum class Op : uint16_t {
   SetSamplePositions = 57,
   SetViewInstance = 58,
   SetShadingRate = 59,
+  CopyTiles = 48,    // (numbered apart from the ones other work is adding)
 };
 constexpr uint32_t kMaxViewInstances = 4;   // D3D12_MAX_VIEW_INSTANCE_COUNT
 constexpr uint32_t kResolveCopySamples = 16;   // ResolveRegion's mode word for a copy of samples (past the graphics::ResolveMode values)
@@ -416,6 +420,9 @@ class CommandWriter {
   void copy_buffer_image_narrow(uint32_t direction, uint32_t image, uint32_t level, uint32_t layer, uint32_t x, uint32_t y, uint32_t width, uint32_t height, uint32_t buffer, uint32_t offset,
                                 uint32_t row_pitch, NarrowLayout narrow) {
     packet(Op::CopyBufferImage, {direction, image, level, layer, x, y, width, height, buffer, offset, row_pitch, static_cast<uint32_t>(narrow)});
+  }
+  void copy_tiles(uint32_t direction, uint32_t reserved, uint32_t first_tile, uint32_t tile_count, uint32_t buffer, uint32_t offset) {
+    packet(Op::CopyTiles, {direction, reserved, first_tile, tile_count, buffer, offset});
   }
   void bind_uav(uint32_t slot, uint32_t allocation, uint32_t offset, uint32_t size) { packet(Op::BindUav, {slot, allocation, offset, size}); }
   void bind_uav_image(uint32_t slot, uint32_t allocation, uint32_t level = 0, uint32_t first_layer = 0, uint32_t layer_count = 1, Format view = Format::Unknown) {

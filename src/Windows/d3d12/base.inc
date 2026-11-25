@@ -48,6 +48,7 @@ enum {
 enum { KFC_SAMPLED = 1, KFC_FILTERED = 2, KFC_RENDER_TARGET = 4, KFC_BLENDABLE = 8, KFC_STORAGE = 16, KFC_MIPMAPS = 32, KFC_MULTISAMPLE = 64, KFC_NATIVE = 128 };
 #define KMAX_TEXTURE_DIMENSION 4096      /* (the video surfaces' limit; textures: the adapter's KmtCaps::max_texture_dimension, up to 16384) */
 #define KTILE_BYTES 65536
+#define KTILE_STANDARD_SWIZZLE (1u << 8)   /* AllocationDesc::tile_narrow: Direct3D's standard swizzle inside the tiles (the kernel's kTileStandardSwizzle) */
 
 typedef struct FormatInfo {
   DXGI_FORMAT dxgi;
@@ -135,10 +136,12 @@ static int packed_yuv_view_ok(DXGI_FORMAT res, DXGI_FORMAT view, int render_targ
 static UINT format_rows(const FormatInfo *fi, UINT h) { return fi && fi->compressed ? (h + 3) / 4 : h; }
 /* The packed YUV formats that may have mip levels (DXGI's format tables: AYUV and Y416; Y410, YUY2, Y210 and Y216 have "Mipmap" disallowed). */
 static int format_packed_yuv_mips(DXGI_FORMAT f) { return f == DXGI_FORMAT_AYUV || f == DXGI_FORMAT_Y416; }
-/* Whether a texture of the format may be reserved (D3D12_FORMAT_SUPPORT2_TILED): a colour format the kernel keeps, of 1 to 16 bytes a texel, not block-compressed, not a video
- * format (planar or packed YUV: Direct3D defines no tiles for those, and its format tables have "Tiled Resource" disallowed for every one of them). */
+/* Whether a texture of the format may be reserved (D3D12_FORMAT_SUPPORT2_TILED): a colour format the kernel keeps, of 1 to 16 bytes a texel, or a block-compressed one (8 or 16
+ * bytes a block), not a video format (planar or packed YUV: Direct3D defines no tiles for those, and its format tables have "Tiled Resource" disallowed for every one of them),
+ * not R32G32B32 (96 bits: no tile shape). Not the depth formats: the kernel's depth buffers are the device's alone (no backing a tile could be gathered into), so no reserved
+ * depth buffer is offered - CreateReservedResource refuses them as a format without the support. */
 static int format_tiled(const FormatInfo *fi) {
-  if (!fi || !fi->kernel || fi->depth || fi->compressed || fi->planar || fi->pair || format_packed_yuv(fi->dxgi)) return 0;
+  if (!fi || !fi->kernel || fi->depth || fi->planar || fi->pair || format_packed_yuv(fi->dxgi)) return 0;
   return fi->bytes == 1 || fi->bytes == 2 || fi->bytes == 4 || fi->bytes == 8 || fi->bytes == 16;
 }
 
@@ -366,6 +369,8 @@ struct Dev {
 #define DEV_FEATURE2_BARYCENTRICS (1u << 28)             /* SV_Barycentrics and GetAttributeAtVertex in pixel shaders */
 #define DEV_FEATURE2_SAMPLE_COPIES (1u << 29)            /* a region of a multisampled image, every sample, into another (ResolveRegion's kResolveCopySamples): DECOMPRESS */
 #define SHADING_RATE_TILE 16                             /* graphics::kShadingRateTileSize: the pixels of a tile of the shading-rate image each way */
+#define DEV_FEATURE2_TILE_RESIDENCY (1u << 27)           /* graphics::kFeature2TileResidency: residency feedback (CheckAccessFullyMapped) and lookup clamps - tiled resources tier 2 and up */
+#define DEV_FEATURE_TEXTURE_KINDS (1u << 8)              /* graphics::kFeatureTextureKinds: volumes, arrays, cubes */
 /* What allocations of a kernel format numbered from KF_FIRST_EXTRA may be on the device's adapter (KFC_* bits; 0 for any other format, or from a kernel that has no table) */
 static UINT dev_format_caps(const Dev *d, UINT kf) {
   const KmtCaps *c = &d->caps;
@@ -376,6 +381,17 @@ static UINT dev_format_caps(const Dev *d, UINT kf) {
 static UINT dev_max_texture(const Dev *d) {
   const UINT m = d->caps.max_texture_dimension;
   return m < 4096 ? 4096 : m > 16384 ? 16384 : m;
+}
+/* The tiled resources tier of the device (D3D12_FEATURE_D3D12_OPTIONS): every adapter has the kernel's reserved buffers and 2D textures, arrays and cubes (tier 1; what an
+ * unmapped tile holds is read as zero and writes to it are dropped everywhere, since the kernel gathers and scatters the tiles); residency feedback and the lookups' own clamp
+ * (CheckAccessFullyMapped, Sample with a clamp: graphics::kFeature2TileResidency, the CPU renderer's) make tier 2; volumes (the kernel's texture kinds) tier 3; arrays whose
+ * levels are packed - each slice has its own packed levels (VidMm ReservedLayout) - on a device with levels of arrays, tier 4. virgl's shaders are TGSI, which has no residency
+ * feedback: tier 1 there. */
+static D3D12_TILED_RESOURCES_TIER dev_tiled_tier(const Dev *d) {
+  if (!(d->caps.features2 & DEV_FEATURE2_TILE_RESIDENCY)) return D3D12_TILED_RESOURCES_TIER_1;
+  if (!(d->caps.features & DEV_FEATURE_TEXTURE_KINDS)) return D3D12_TILED_RESOURCES_TIER_2;
+  if (!(d->caps.features2 & DEV_FEATURE2_MIPMAPPED_LAYERS)) return D3D12_TILED_RESOURCES_TIER_3;
+  return D3D12_TILED_RESOURCES_TIER_4;
 }
 
 static const GUID *const g_device_iids[] = {&IID_ID3D12Object, &IID_ID3D12Device, &IID_ID3D12Device1, &IID_ID3D12Device2, &IID_ID3D12Device3, &IID_ID3D12Device4,

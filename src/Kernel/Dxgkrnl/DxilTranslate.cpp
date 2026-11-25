@@ -71,6 +71,7 @@ enum DxOp : uint32_t {
   kLoadInput = 4, kStoreOutput = 5, kFAbs = 6, kSaturate = 7, kCos = 12, kSin = 13, kExp = 21, kFrc = 22, kLog = 23, kSqrt = 24, kRsqrt = 25, kRoundNe = 26, kRoundNi = 27, kRoundPi = 28, kRoundZ = 29,
   kFMax = 35, kFMin = 36, kIMax = 37, kIMin = 38, kUMax = 39, kUMin = 40, kIMul = 41, kUMul = 42, kFMad = 46, kIMad = 48, kUMad = 49, kDot2 = 54, kDot3 = 55, kDot4 = 56, kCreateHandle = 57,
   kCBufferLoadLegacy = 59, kCalculateLod = 81, kSample = 60, kSampleBias = 61, kSampleLevel = 62, kSampleGrad = 63, kSampleCmp = 64, kSampleCmpLevelZero = 65, kTextureGather = 73, kTextureGatherCmp = 74, kTextureLoad = 66, kBufferLoad = 68, kBufferStore = 69, kAtomicBinOp = 78, kBarrier = 80, kDiscard = 82,
+  kCheckAccessFullyMapped = 71,
   kDerivCoarseX = 83, kDerivCoarseY = 84, kDerivFineX = 85, kDerivFineY = 86, kFma = 47, kMakeDouble = 101, kSplitDouble = 102, kThreadId = 93, kGroupId = 94, kThreadIdInGroup = 95, kFlattenedThreadIdInGroup = 96,
   kAttributeAtVertex = 137, kViewId = 138, kIsHelperLane = 221,
 };
@@ -311,6 +312,11 @@ class Translator {
   List<int32_t> last_use_;
   List<uint32_t> alias_of_;
   List<uint8_t> unsupported_;     // a value that is refused if anything uses it (the dummy loads dxc writes are not used)
+  List<uint8_t> status_wanted_{allocator_};   // by value: a lookup's ResRet whose fifth element - the residency status (tiled resources) - is read
+  // The residency feedback forms of the lookups (D3d9Dxbc.cpp's FeedbackForm): their status destination (the aggregate's status register, or null) and whether a clamp argument
+  // (the finest level of detail) was given.
+  void status_dst(const Val& r);
+  bool given(uint32_t id) const;
   List<uint8_t> marks_;
   List<uint8_t> visited_marks_{allocator_};
   Slot slots_[kSlots];
@@ -523,7 +529,22 @@ Val Translator::new_aggregate(uint32_t id) {
   Val v;
   v.kind = VK::Agg;
   if (!alloc_reg(last_use_of(id), &v.a)) v.kind = VK::None;
+  // (a lookup whose residency status is read: a register of its own for it, as long-lived as the values; c is that register + 1)
+  uint32_t status_reg = 0;
+  if (v.kind != VK::None && id < status_wanted_.count() && status_wanted_[id]) {
+    if (!alloc_reg(last_use_of(id), &status_reg)) v.kind = VK::None;
+    else v.c = status_reg + 1;
+  }
   return v;
+}
+
+void Translator::status_dst(const Val& r) {
+  if (r.c) dst_temp(r.c - 1, 1);
+  else put(13u << 12);   // (null)
+}
+bool Translator::given(uint32_t id) const {
+  const Constant* c = constant(id);
+  return !(c && c->kind == ConstantKind::Undef);
 }
 
 // --- the walk ----------------------------------------------------------------------------------------------------------------------------------------------------
@@ -584,6 +605,7 @@ bool Translator::analyze(const Instruction& ins) {
     case Op::ExtractValue:
       note_use(ins.operands[0], at);
       if (ins.result < alias_of_.count()) alias_of_[ins.result] = ins.operands[0];
+      if (ins.index == 4 && ins.operands[0] < status_wanted_.count()) status_wanted_[ins.operands[0]] = 1;   // (a lookup's residency status)
       return true;
     case Op::Call: {
       for (uint32_t k = 0; k < ins.arg_count; ++k) note_use(ins.args[k], at);
@@ -1127,8 +1149,10 @@ bool Translator::translate_one(const Instruction& ins) {
       Val v;
       const bool double_result = m_.is_float(ins.type) && m_.types[ins.type].width == 64;
       if (agg.kind == VK::Agg) {
-        if (ins.index >= 4) return error(status::kNotSupported);   // (the status word of a sample)
-        v.kind = VK::Temp, v.a = agg.a, v.b = agg.b + ins.index;
+        if (ins.index > 4 || (ins.index == 4 && !agg.c)) return error(status::kNotSupported);
+        // (the status word of a lookup: its own register, which the feedback form wrote)
+        if (ins.index == 4) v.kind = VK::Temp, v.a = agg.c - 1, v.b = 0;
+        else v.kind = VK::Temp, v.a = agg.a, v.b = agg.b + ins.index;
       } else if (agg.kind == VK::CbAgg && (half_type(ins.type) || m_.is_int(ins.type, 16))) {
         // sixteen-bit elements are packed two to a word of the register: the half the index names, shifted down and masked (a half then widened)
         if (ins.index >= 8) return error(status::kNotSupported);
@@ -2261,13 +2285,20 @@ bool Translator::sample(const Instruction& ins, bool level) {
   uint32_t lod_arg = 0;
   Val lod;
   if (level) lod = use(ins.args[10]), lod_arg = 1;
-  const uint32_t at = begin(level ? 72 : 69);
+  // (Sample's clamp - the finest level of detail - or a read status: the feedback forms sample_cl_s / sample_l_s; no clamp given is -FLT_MAX, none)
+  const bool clamp = !level && given(ins.args[10]), feedback = clamp || r.c;
+  Val clamp_value;
+  if (clamp) clamp_value = use(ins.args[10]);
+  else clamp_value.kind = VK::Imm, clamp_value.a = 0xFF7FFFFFu;
+  const uint32_t at = begin(feedback ? (level ? 0xE4 : 0xE6) : (level ? 72 : 69));
   dst_temp(r.a, 0xF);
+  if (feedback) status_dst(r);
   put(2u | (1u << 2) | (0xE4u << 4) | (1u << 20));   // the coordinate register, xyzw
   put(scratch);
   src_resource(t_reg);
   src_sampler(s_reg);
   if (lod_arg) src(lod);
+  if (feedback && !level) src(clamp_value);
   finish(at);
   return define(ins.result, r);
 }
@@ -2286,13 +2317,20 @@ bool Translator::sample_compare(const Instruction& ins, bool level_zero) {
   if (r.kind == VK::None || !alloc_reg(pos_, &scratch)) return false;
   if (!pack(ins.args + 3, 2, scratch, false)) return false;
   const Val reference = use(ins.args[10]);
-  const uint32_t at = begin(level_zero ? 71 : 70);
+  // (SampleCmp's clamp or a read status: sample_c_cl_s / sample_c_lz_s)
+  const bool clamp = !level_zero && ins.arg_count > 11 && given(ins.args[11]), feedback = clamp || r.c;
+  Val clamp_value;
+  if (clamp) clamp_value = use(ins.args[11]);
+  else clamp_value.kind = VK::Imm, clamp_value.a = 0xFF7FFFFFu;
+  const uint32_t at = begin(feedback ? (level_zero ? 0xE5 : 0xE9) : (level_zero ? 71 : 70));
   dst_temp(r.a, 0xF);
+  if (feedback) status_dst(r);
   put(2u | (1u << 2) | (0xE4u << 4) | (1u << 20));
   put(scratch);
   src_resource(srv.c);
   src_sampler(smp.c);
   src(reference);
+  if (feedback && !level_zero) src(clamp_value);
   finish(at);
   return define(ins.result, r);
 }
@@ -2343,8 +2381,15 @@ bool Translator::sample_bias_grad(const Instruction& ins, bool gradients) {
   } else {
     bias = use(ins.args[10]);
   }
-  const uint32_t at = begin(gradients ? 73 : 74);
+  // (the clamp - SampleBias's twelfth argument, SampleGrad's seventeenth - or a read status: sample_b_cl_s / sample_d_cl_s)
+  const uint32_t clamp_arg = gradients ? 16 : 11;
+  const bool clamp = ins.arg_count > clamp_arg && given(ins.args[clamp_arg]), feedback = clamp || r.c;
+  Val clamp_value;
+  if (clamp) clamp_value = use(ins.args[clamp_arg]);
+  else clamp_value.kind = VK::Imm, clamp_value.a = 0xFF7FFFFFu;
+  const uint32_t at = begin(feedback ? (gradients ? 0xE8 : 0xE7) : (gradients ? 73 : 74));
   dst_temp(r.a, 0xF);
+  if (feedback) status_dst(r);
   put(2u | (1u << 2) | (0xE4u << 4) | (1u << 20));
   put(scratch);
   src_resource(srv.c);
@@ -2355,6 +2400,7 @@ bool Translator::sample_bias_grad(const Instruction& ins, bool gradients) {
   } else {
     src(bias);
   }
+  if (feedback) src(clamp_value);
   finish(at);
   return define(ins.result, r);
 }
@@ -2387,9 +2433,11 @@ bool Translator::texture_gather(const Instruction& ins, bool compare) {
   Val reference;
   if (compare) reference = use(ins.args[10]);
   const bool has_offset = offset[0] || offset[1];
-  const uint32_t at = begin(compare ? 126 : 109, has_offset ? 1u << 31 : 0u);
+  // (a read status: gather4_s / gather4_c_s)
+  const uint32_t at = begin(r.c ? (compare ? 0xDC : 0xDB) : (compare ? 126 : 109), has_offset ? 1u << 31 : 0u);
   if (has_offset) put(1u | ((static_cast<uint32_t>(offset[0]) & 0xFu) << 9) | ((static_cast<uint32_t>(offset[1]) & 0xFu) << 13));
   dst_temp(r.a, 0xF);
+  if (r.c) status_dst(r);
   put(2u | (1u << 2) | (0xE4u << 4) | (1u << 20));
   put(scratch);
   put(2u | (1u << 2) | ((compare ? 0u : static_cast<uint32_t>(channel)) * 0x55u << 4) | (7u << 12) | (1u << 20)), put(srv.c);
@@ -2419,8 +2467,9 @@ bool Translator::texture_load(const Instruction& ins) {
     src(mip);
     finish(at);
   }
-  const uint32_t at = begin(45);
+  const uint32_t at = begin(r.c ? 0xDF : 45);   // (a read status: ld_s)
   dst_temp(r.a, 0xF);
+  if (r.c) status_dst(r);
   put(2u | (1u << 2) | (0xE4u << 4) | (1u << 20));
   put(scratch);
   src_resource(srv.c);
@@ -2866,6 +2915,18 @@ bool Translator::dx_call(const Instruction& ins) {
       }
       return true;
     }
+    case kCheckAccessFullyMapped: {
+      // check_access_fully_mapped: all ones when the status says every texel the lookup read was mapped
+      if (ins.arg_count < 2) return error(status::kInvalidParameter);
+      const Val st = use(ins.args[1]);
+      const Val r = new_scalar(ins.result, true);
+      if (r.kind == VK::None) return false;
+      const uint32_t at = begin(0xEA);
+      dst_scalar(r);
+      src(st);
+      finish(at);
+      return define(ins.result, r);
+    }
     case kDiscard: {
       if (ins.arg_count < 2) return error(status::kInvalidParameter);
       const Val cond = use(ins.args[1]);
@@ -3023,7 +3084,8 @@ NtStatus Translator::run(uint32_t program_kind, ConstByteView isg1, ConstByteVie
       else if ((c->kind == ConstantKind::Null || c->kind == ConstantKind::Undef) && (m_.is_float(type) ? m_.types[type].width == 64 : m_.is_int(type, 64))) v.kind = VK::Imm, v.wide = true;
       else if (c->kind == ConstantKind::Null || c->kind == ConstantKind::Undef) v.kind = VK::Imm, v.a = 0;
     }
-    if (!vals_.push_back(v) || !last_use_.push_back(-1) || !alias_of_.push_back(kNone) || !unsupported_.push_back(0) || !ptr_ok_.push_back(0)) return status::kNoMemory;
+    if (!vals_.push_back(v) || !last_use_.push_back(-1) || !alias_of_.push_back(kNone) || !unsupported_.push_back(0) || !ptr_ok_.push_back(0) || !status_wanted_.push_back(0))
+      return status::kNoMemory;
   }
   // loops: the last block that jumps back to each block; where each value is defined
   for (uint32_t i = 0; i < f_.block_count; ++i)

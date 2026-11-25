@@ -234,6 +234,7 @@ typedef struct Shader {
   UINT group[3];                          /* a compute shader's threads in a group (dcl_thread_group) */
   UINT gs_instances;                      /* a geometry shader's instances (dcl_gs_instance_count; 0: one) */
   UINT program_type;                      /* the shader's stage by its version token (D3D10_SB_TOKENIZED_PROGRAM_TYPE: 0 pixel, 1 vertex, 2 geometry, 3 hull, 4 domain, 5 compute) */
+  int feedback;                           /* it has tiled resources tier 2's instructions: the _s lookups (0xDB .. 0xE9) or check_access_fully_mapped (0xEA) */
   UINT out_vertices;                      /* the vertices of a primitive a geometry shader puts out (dcl_output_topology: 1, 2 or 3; 0 not declared) */
   /* CreateGeometryShaderWithStreamOutput: what is captured, the strides of the buffers and the stream that is drawn (D3D11_SO_NO_RASTERIZED_STREAM: none). The
    * shader may be a vertex or domain shader's code, which captures what that stage puts out (there is then no geometry stage: `so_only`). */
@@ -653,6 +654,8 @@ static ID3D12Resource *make_buffer(Dev *d, D3D12_HEAP_TYPE heap, UINT64 bytes) {
 static HRESULT buf_tiled_make(Dev *d, Buf *b);      /* (tiled.inc) */
 static void tile_pool_free(struct TilePool *p);
 static BOOL tex_tiled_format(Dev *d, DXGI_FORMAT format);
+static BOOL tiled_texture_check(Dev *d, ID3D12Resource *res, const D3D12_RESOURCE_DESC *rd);
+static D3D11_TILED_RESOURCES_TIER dev_tiled_tier(Dev *d);      /* (device.inc) */
 
 static void buf_destroy(DxObj *o) {
   Buf *b = (Buf *)o;
@@ -1316,15 +1319,16 @@ static HRESULT tex_make(Dev *d, const D3D11_TEXTURE2D_DESC *in, UINT slices, ID3
         (bind & D3D11_BIND_DEPTH_STENCIL) || ((desc.Usage == D3D11_USAGE_DYNAMIC || desc.Usage == D3D11_USAGE_STAGING) && desc.ArraySize != 1))
       return E_INVALIDARG;
   }
-  /* (tiled: Direct3D 12's reserved textures below, TiledResourcesTier 1 - 2D textures of default usage without CPU access, not shared, multisampled, a cube or GDI
-   * compatible, of a format with D3D11_FORMAT_SUPPORT2_TILED; a volume needs tier 3, and a 1D texture is never tiled. A tile pool is a buffer) */
+  /* (tiled: Direct3D 12's reserved textures below - 2D textures and arrays (tier 1), volumes (tier 3), of default usage without CPU access, not shared, multisampled, a cube or
+   * GDI compatible, of a format with D3D11_FORMAT_SUPPORT2_TILED; a 1D texture is never tiled. An array of more than one slice has no packed levels (tiers 2 and 3: every level
+   * at least a tile; tier 1: every level whole tiles), which tiled_texture_check sees once the resource is made. A tile pool is a buffer) */
   const BOOL tiled = (desc.MiscFlags & D3D11_RESOURCE_MISC_TILED) != 0;
   if (desc.MiscFlags & D3D11_RESOURCE_MISC_TILE_POOL) return E_INVALIDARG;
   if (tiled) {
     const UINT refused_misc = D3D11_RESOURCE_MISC_SHARED | D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX | D3D11_RESOURCE_MISC_SHARED_NTHANDLE | D3D11_RESOURCE_MISC_GDI_COMPATIBLE |
                               D3D11_RESOURCE_MISC_GENERATE_MIPS | D3D11_RESOURCE_MISC_TEXTURECUBE;
-    if (res || slices || d->next_tex_kind == 2 || desc.Usage != D3D11_USAGE_DEFAULT || desc.CPUAccessFlags || (desc.MiscFlags & refused_misc) || desc.SampleDesc.Count != 1 ||
-        desc.SampleDesc.Quality || !tex_tiled_format(d, desc.Format))
+    if (res || (slices && dev_tiled_tier(d) < D3D11_TILED_RESOURCES_TIER_3) || d->next_tex_kind == 2 || desc.Usage != D3D11_USAGE_DEFAULT || desc.CPUAccessFlags ||
+        (desc.MiscFlags & refused_misc) || desc.SampleDesc.Count != 1 || desc.SampleDesc.Quality || !tex_tiled_format(d, desc.Format))
       return E_INVALIDARG;
   }
   /* (shared through NT handles: with SHARED or SHARED_KEYEDMUTEX, in GPU memory) */
@@ -1453,6 +1457,7 @@ static HRESULT tex_make(Dev *d, const D3D11_TEXTURE2D_DESC *in, UINT slices, ID3
     if (tiled) {
       rd.Layout = D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE;
       hr = ID3D12Device_CreateReservedResource(d->d12, &rd, D3D12_RESOURCE_STATE_COMMON, NULL, &IID_ID3D12Resource, (void **)&t->res);
+      if (SUCCEEDED(hr) && t->res && !tiled_texture_check(d, t->res, &rd)) { tex_refused(&desc, "a tiled array with packed levels (Direct3D 11 has no tier 4)"); dx_Release(OBJ(t)); return E_INVALIDARG; }
     } else {
       hr = ID3D12Device_CreateCommittedResource(d->d12, &props, nt_shared ? D3D12_HEAP_FLAG_SHARED : D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_COMMON, NULL,
                                                 &IID_ID3D12Resource, (void **)&t->res);
@@ -2129,6 +2134,7 @@ static void shader_constants(Shader *s) {
       memcpy(&token, code + 4 * w, 4);
       const UINT op = token & 0x7FF;
       length = (token >> 24) & 0x7F;
+      if (op >= 0xDB && op <= 0xEA) s->feedback = 1;
       if (op == 53 /* customdata */) { if (w + 1 >= words) return; memcpy(&length, code + 4 * (w + 1), 4); }
       if (length == 0 || length > words - w) return;
       /* dcl_resource (the dimension in the token), dcl_resource_raw / _structured, dcl_uav_typed / _raw / _structured: the operand, then its register */
@@ -2181,6 +2187,8 @@ static HRESULT shader_make(Dev *d, const void *code, SIZE_T bytes, const void *v
   memset(s->tex_kind, 0xFF, sizeof s->tex_kind);
   shader_constants(s);
   if (s->registers * 16 > CONSTANT_BLOCK) { dx_Release(OBJ(s)); return E_INVALIDARG; }
+  /* (a shader of tiled resources tier 2's instructions on a device of a lower tier: E_INVALIDARG, as Windows' runtime refuses it) */
+  if (s->feedback && dev_tiled_tier(d) < D3D11_TILED_RESOURCES_TIER_2) { dx_Release(OBJ(s)); return E_INVALIDARG; }
   const HRESULT hr = shader_link(s, linkage);
   if (FAILED(hr)) { dx_Release(OBJ(s)); return hr; }
   return give(s, out);

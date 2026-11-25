@@ -5988,7 +5988,7 @@ void test_d3d12_reserved_texture() {
   Handle edge = 0;
   CHECK(create(kAllocTexture | kAllocReserved, 200, 256, 0, 0, &edge) == status::kSuccess);      // (any size: its edge tiles partly used)
   CHECK(e.kernel.update_tile_mappings(kPid, edge, 0, heap, 0, 4) == status::kSuccess && e.kernel.update_tile_mappings(kPid, edge, 4, heap, 0, 1) == status::kInvalidParameter);
-  CHECK(create(kAllocTexture | kAllocRenderTarget | kAllocReserved, 256, 256, 0, 0, &none) == status::kInvalidParameter && create(kAllocTexture | kAllocReserved, 256, 256, heap, 0, &none) == status::kInvalidParameter);
+  CHECK(create(kAllocTexture | kAllocPresent | kAllocReserved, 256, 256, 0, 0, &none) == status::kInvalidParameter && create(kAllocTexture | kAllocReserved, 256, 256, heap, 0, &none) == status::kInvalidParameter);
   CHECK(e.kernel.update_tile_mappings(kPid, r, 0, heap, 0, 1) == status::kSuccess && e.kernel.update_tile_mappings(kPid, r, 3, heap, 2 * kTileBytes, 1) == status::kSuccess);
   CHECK(e.kernel.update_tile_mappings(kPid, r, 4, heap, 0, 1) == status::kInvalidParameter && e.kernel.update_tile_mappings(kPid, r, 0, heap, 3 * kTileBytes, 2) == status::kInvalidParameter);
   CHECK(e.fill(p, 0xFF112233u) && e.fill(q, 0xFF445566u));
@@ -6034,6 +6034,184 @@ void test_d3d12_reserved_texture() {
   CHECK(e.pixel(q, 82, 82) == alias_mark && e.pixel(r, 210, 210) == alias_mark && e.pixel(r, 210, 82) == alias_mark);
 }
 
+// Reserved textures beyond tier 1 (VidMm ReservedLayout): the tile numbering of arrays, volumes and block-compressed formats; render targets whose unmapped tiles drop what is drawn;
+// CopyTiles; residency feedback (sample_cl_s, ld_s, gather4_s and check_access_fully_mapped: ps_tiled) and a lookup's own clamp (ps_tiled_clamp) on the CPU renderer.
+void test_reserved_tiers() {
+  // --- the numbering
+  {
+    AllocationDesc d;
+    d.flags = kAllocTexture, d.format = Format::A8B8G8R8, d.width = d.height = 256, d.mip_levels = 9, d.kind = graphics::TextureKind::Texture2DArray, d.layers = 3;
+    ReservedLayout l;
+    CHECK(reserved_layout(d, &l));
+    // (256 x 256: 2 x 2 tiles and 1; the seven levels from 64 x 64 down packed, 21844 bytes: one tile per slice)
+    CHECK(l.standard == 2 && l.columns[0] == 2 && l.rows[0] == 2 && l.first[1] == 4 && l.packed_first == 5 && l.packed_tiles == 1 && l.per_slice == 6 && l.total == 18 && l.slices == 3);
+    d.kind = graphics::TextureKind::Texture3D, d.layers = 32, d.width = d.height = 64, d.mip_levels = 7;
+    CHECK(reserved_layout(d, &l));
+    // (a volume of 4-byte texels: 32 x 32 x 16 tiles; 64 x 64 x 32 is 2 x 2 x 2 of them, 32 x 32 x 16 one, the rest packed: 2341 texels)
+    CHECK(l.volume && l.shape.width == 32 && l.shape.height == 32 && l.shape.depth == 16 && l.standard == 2 && l.columns[0] == 2 && l.deep[0] == 2 && l.first[1] == 8 &&
+          l.packed_bytes == 2341 * 4 && l.packed_tiles == 1 && l.total == 10 && l.slices == 1);
+    d.kind = graphics::TextureKind::Texture2D, d.layers = 1, d.format = Format::Bc1, d.width = 1024, d.height = 512, d.mip_levels = 3;
+    CHECK(reserved_layout(d, &l));
+    // (BC1 blocks of 8 bytes: 128 x 64 blocks, 512 x 256 texels a tile; 1024 x 512 is 2 x 2, 512 x 256 one, 256 x 128 packed: 64 x 32 blocks)
+    CHECK(l.block == 4 && l.shape.width == 128 && l.shape.height == 64 && l.standard == 2 && l.first[1] == 4 && l.packed_bytes == 64 * 32 * 8 && l.total == 6);
+    d.format = Format::A8B8G8R8, d.width = 300, d.height = 200, d.mip_levels = 1, d.tile_narrow = static_cast<uint32_t>(NarrowLayout::R8);
+    CHECK(reserved_layout(d, &l));
+    CHECK(l.element_bytes == 1 && l.image_bytes == 4 && l.shape.width == 256 && l.standard == 0 && l.packed_bytes == 300 * 200 && l.total == 1);   // (smaller than a tile: all packed)
+  }
+  Env e;
+  AllocationDesc hd;
+  hd.flags = kAllocHeap, hd.size = 8 * kTileBytes;
+  Handle heap = 0;
+  CHECK(e.kernel.create_allocation(kPid, e.dev, hd, &heap) == status::kSuccess);
+  auto reserved = [&](uint32_t flags, Format f, uint32_t w, uint32_t h, uint32_t mips, graphics::TextureKind kind, uint32_t layers, uint32_t samples = 1) {
+    AllocationDesc d;
+    d.flags = flags | kAllocReserved, d.format = f, d.width = w, d.height = h, d.mip_levels = mips, d.kind = kind, d.layers = layers, d.samples = samples;
+    Handle h_out = 0;
+    return e.kernel.create_allocation(kPid, e.dev, d, &h_out) == status::kSuccess ? h_out : 0;
+  };
+  // (what may be reserved: not a multisampled target or a depth buffer)
+  CHECK(!reserved(kAllocTexture | kAllocRenderTarget, Format::A8R8G8B8, 256, 256, 1, graphics::TextureKind::Texture2D, 1, 4));
+  CHECK(reserved(kAllocTexture | kAllocRenderTarget, Format::A8R8G8B8, 256, 256, 1, graphics::TextureKind::Texture2DArray, 2) != 0);
+  CHECK(reserved(kAllocTexture | kAllocStorageImage, Format::A8R8G8B8, 256, 256, 1, graphics::TextureKind::Texture3D, 16) != 0);
+  CHECK(!reserved(kAllocTexture | kAllocRenderTarget, Format::Bc1, 256, 256, 1, graphics::TextureKind::Texture2D, 1));   // (block-compressed: sampled only)
+
+  // --- a volume: tile 1 (texels 32 .. 63 across, 0 .. 31 down, slices 0 .. 15) from a buffer by CopyTiles, read back through the volume's backing and by CopyTiles again
+  {
+    const Handle volume = reserved(kAllocTexture, Format::A8R8G8B8, 64, 64, 1, graphics::TextureKind::Texture3D, 32);
+    CHECK(volume != 0);
+    CHECK(e.kernel.update_tile_mappings(kPid, volume, 1, heap, 2 * kTileBytes, 1) == status::kSuccess);
+    std::vector<uint32_t> tile(kTileBytes / 4);
+    for (uint32_t i = 0; i < tile.size(); ++i) tile[i] = 0xFF000000u | i;   // (texel x, y, z of the tile: (z * 32 + y) * 32 + x)
+    const Handle up = e.buffer(kAllocVertexBuffer, 2 * kTileBytes), down = e.buffer(kAllocVertexBuffer, 2 * kTileBytes);
+    CHECK(e.write(up, ConstByteView(reinterpret_cast<const uint8_t*>(tile.data()), kTileBytes)));
+    CommandWriter w(e.allocator);
+    w.copy_tiles(0, 0, 1, 1, 1, 0);
+    w.copy_tiles(1, 0, 0, 2, 2, 0);   // (tiles 0 - unmapped: zeros - and 1 back out)
+    CHECK(e.render(w, {volume, up, down}) == status::kSuccess);
+    LockResult lock;
+    CHECK(e.kernel.lock(kPid, volume, kLockReadOnly, 0, &lock) == status::kSuccess);
+    auto texel = [&](uint32_t x, uint32_t y, uint32_t z) {
+      ConstByteView v;
+      return ConstByteView(lock.data).try_subview(((uint64_t{z} * 64 + y) * 64 + x) * 4, 4, &v) ? ByteReader(v).le32() : 0xDEADu;
+    };
+    CHECK(texel(40, 5, 3) == (0xFF000000u | ((3u * 32 + 5) * 32 + 8)) && texel(63, 31, 15) == (0xFF000000u | ((15u * 32 + 31) * 32 + 31)));
+    CHECK(texel(5, 5, 3) == 0 && texel(40, 40, 3) == 0 && texel(40, 5, 16) == 0);   // (other tiles: unmapped, zero)
+    e.kernel.unlock(kPid, volume);
+    CHECK(e.kernel.lock(kPid, down, kLockReadOnly, 0, &lock) == status::kSuccess);
+    bool zeros = true, same = true;
+    for (uint32_t i = 0; i < kTileBytes / 4; ++i) {
+      zeros = zeros && ByteReader(ConstByteView(lock.data).subview(uint64_t{i} * 4, 4)).le32() == 0;
+      same = same && ByteReader(ConstByteView(lock.data).subview(kTileBytes + uint64_t{i} * 4, 4)).le32() == tile[i];
+    }
+    e.kernel.unlock(kPid, down);
+    CHECK(zeros && same);
+  }
+
+  // --- a render target of four tiles, tile 0 mapped: a clear reaches the heap there and nowhere else; what lies in the unmapped tiles reads as zero afterwards
+  {
+    const Handle target = reserved(kAllocTexture | kAllocRenderTarget, Format::A8R8G8B8, 256, 256, 1, graphics::TextureKind::Texture2D, 1);
+    CHECK(target != 0);
+    CHECK(e.kernel.update_tile_mappings(kPid, target, 0, heap, 4 * kTileBytes, 1) == status::kSuccess);
+    CommandWriter w(e.allocator);
+    w.begin_pass(0, kNoAllocation, kPassClearColor, {0.0f, 1.0f, 0.0f, 1.0f}, 1, 0);
+    w.end_pass();
+    CHECK(e.render(w, {target}) == status::kSuccess);
+    CHECK(e.pixel(target, 10, 10) == 0xFF00FF00u && e.pixel(target, 127, 127) == 0xFF00FF00u && e.pixel(target, 200, 10) == 0 && e.pixel(target, 10, 200) == 0);
+    // (the heap holds it: a second reserved texture with its tile 3 there shows it)
+    const Handle other = reserved(kAllocTexture, Format::A8R8G8B8, 256, 256, 1, graphics::TextureKind::Texture2D, 1);
+    CHECK(e.kernel.update_tile_mappings(kPid, other, 3, heap, 4 * kTileBytes, 1) == status::kSuccess);
+    CHECK(e.pixel(other, 130, 130) == 0xFF00FF00u && e.pixel(other, 10, 10) == 0);
+    // (moved to another place of the heap: tile 0 shows what is there - nothing written yet -, the old place keeps the clear)
+    CHECK(e.kernel.update_tile_mappings(kPid, target, 0, heap, 5 * kTileBytes, 1) == status::kSuccess);
+    CHECK(e.pixel(target, 10, 10) == 0 && e.pixel(other, 130, 130) == 0xFF00FF00u);
+  }
+
+  // --- residency feedback: a 256 x 256 texture with tiles 0 and 3 mapped (red 0x80 in both), drawn over an 8 x 8 target at uv (x + 0.5) / 8, (y + 0.5) / 8
+  const std::vector<uint8_t> ps_blob = read_blob("ps_tiled.dxbc"), clamp_blob = read_blob("ps_tiled_clamp.dxbc");
+  CHECK(!ps_blob.empty() && !clamp_blob.empty());
+  auto dxbc_ps = [&](const std::vector<uint8_t>& blob) {
+    Handle h = 0;
+    ShaderDesc d;
+    d.kind = ShaderKind::Dxbc, d.stage = graphics::ShaderStage::Fragment, d.code = view_of(blob);
+    CHECK(e.kernel.create_shader(kPid, e.dev, d, &h) == status::kSuccess);
+    return h;
+  };
+  Asm vs(true, 2, 0);   // mov oPos, v0 ; mov oT0, v1   (the uv)
+  vs.dcl(0, 0, kRegInput, 0).dcl(5, 0, kRegInput, 1);
+  vs.op(kOpMov, {Asm::dst(kRegRastOut, 0), Asm::src(kRegInput, 0)});
+  vs.op(kOpMov, {Asm::dst(kRegTexOut, 0), Asm::src(kRegInput, 1)});
+  vs.end();
+  const Handle vsh = d3d9_shader(e, vs);
+  auto pipeline = [&](Handle ps) {
+    PipelineDesc pd;
+    pd.vertex_shader = vsh, pd.fragment_shader = ps, pd.vertex_stride = 20, pd.attribute_count = 2, pd.varying_count = 3, pd.texture_count = 1;
+    pd.attributes[0] = {0, graphics::VertexFormat::Float3, 0};
+    pd.attributes[1] = {1, graphics::VertexFormat::Float2, 12};
+    pd.cull_mode = graphics::CullMode::None;
+    Handle pipe = 0;
+    CHECK(e.kernel.create_pipeline(kPid, e.dev, pd, &pipe) == status::kSuccess);
+    return pipe;
+  };
+  const Handle rt = e.alloc(kTarget, Format::A8R8G8B8, 8, 8), vb = e.buffer(kAllocVertexBuffer, 64);
+  const float tri[15] = {-1, -1, 0.5f, 0, 1, 3, -1, 0.5f, 2, 1, -1, 3, 0.5f, 0, -1};
+  CHECK(e.write(vb, floats(tri, 15)));
+  auto draw = [&](Handle pipe, Handle texture, const graphics::SamplerDesc& sampler) {
+    CommandWriter w(e.allocator);
+    w.begin_pass(0, kNoAllocation, kPassClearColor, {0, 0, 0, 0}, 1, 0);
+    w.bind_pipeline(pipe);
+    w.bind_vertex_buffer(1);
+    w.bind_texture(0, 2, sampler);
+    w.draw(3);
+    w.end_pass();
+    CHECK(e.render(w, {rt, vb, texture}) == status::kSuccess);
+  };
+  {
+    const Handle texture = reserved(kAllocTexture, Format::A8R8G8B8, 256, 256, 1, graphics::TextureKind::Texture2D, 1);
+    CHECK(texture != 0);
+    CHECK(e.kernel.update_tile_mappings(kPid, texture, 0, heap, 6 * kTileBytes, 1) == status::kSuccess && e.kernel.update_tile_mappings(kPid, texture, 3, heap, 7 * kTileBytes, 1) == status::kSuccess);
+    std::vector<uint32_t> red(kTileBytes / 4, 0xFF800000u);
+    const Handle up = e.buffer(kAllocVertexBuffer, kTileBytes);
+    CHECK(e.write(up, ConstByteView(reinterpret_cast<const uint8_t*>(red.data()), kTileBytes)));
+    CommandWriter w(e.allocator);
+    w.copy_tiles(0, 0, 0, 1, 1, 0);
+    w.copy_tiles(0, 0, 3, 1, 1, 0);
+    CHECK(e.render(w, {texture, up}) == status::kSuccess);
+    draw(pipeline(dxbc_ps(ps_blob)), texture, graphics::SamplerDesc());
+    unsigned mapped = 0, unmapped = 0;
+    for (uint32_t y = 0; y < 8; ++y)
+      for (uint32_t x = 0; x < 8; ++x) {
+        const uint32_t c = e.pixel(rt, x, y);
+        const bool in_mapped = (x < 4) == (y < 4);   // (tiles 0 and 3)
+        if (in_mapped) mapped += close8(c >> 16 & 0xFF, 0x80, 2) && (c & 0xFFFF) == 0xFFFF && (c >> 24) == 0xFF;
+        else unmapped += c == 0;   // (nothing read was mapped: zeros and three statuses of 0)
+      }
+    printf("residency feedback: %u of 32 mapped pixels, %u of 32 unmapped right\n", mapped, unmapped);
+    CHECK(mapped == 32 && unmapped == 32);
+  }
+  // --- a lookup's own clamp: four levels of 32 x 32 down, each one colour; sampled at magnification, the clamp of 2 gives level 2
+  {
+    const Handle texture = e.alloc(kTexture, Format::A8R8G8B8, 32, 32, 4);
+    const uint32_t colours[4] = {0xFF102030u, 0xFF405060u, 0xFF708090u, 0xFFA0B0C0u};
+    for (uint32_t level = 0; level < 4; ++level) {
+      const uint32_t n = 32u >> level;
+      std::vector<uint32_t> pixels(n * n, colours[level]);
+      CHECK(e.write(texture, ConstByteView(reinterpret_cast<const uint8_t*>(pixels.data()), pixels.size() * 4), kLockDiscard, level));
+    }
+    graphics::SamplerDesc sampler;
+    sampler.mip_filter = graphics::MipFilter::Nearest;
+    draw(pipeline(dxbc_ps(clamp_blob)), texture, sampler);
+    CHECK(e.pixel(rt, 3, 3) == colours[2] && e.pixel(rt, 6, 1) == colours[2]);
+  }
+  // (a device without kFeature2TileResidency refuses these shaders: the TGSI text has no residency feedback)
+  {
+    HostAllocator allocator;
+    NtStatus st = 0;
+    UniquePointer<D3d9Program> program = compile_dxbc(allocator, ps_blob, &st);
+    CHECK(program && st == status::kSuccess && program->uses_feedback() && (program->required_features2() & graphics::kFeature2TileResidency));
+    String text(allocator);
+    CHECK(program && program->emit_tgsi(&text) == status::kNotSupported);
+  }
+}
 
 // Typed views of buffers (BindTexelBuffer, Buffer<> and RWBuffer<>) on the CPU renderer: a compute shader reads R8G8B8A8_UNORM and R16G16_FLOAT views of t2 and t9, writes and reads
 // back an R16G16B16A16_FLOAT view of u5 and adds to an R32_UINT view of u1 atomically; the same through descriptors of a root signature's table; and what is refused.
@@ -6995,6 +7173,55 @@ void test_dxil() {
     return st == status::kSuccess && *program;
   };
   DxilTextures textures;
+  // Residency feedback and the lookups' clamps (tiled resources tier 2): dxc's DXIL of ps_tiled / ps_tiled_clamp (dxil_ps_tiled*.hlsl) does what fxc's DXBC does, with textures whose
+  // lookups report texels at u above one half unmapped and show the clamp they were given.
+  {
+    struct FeedbackTextures final : graphics::ITextureSet {
+      mutable bool on = false, unmapped = false;
+      mutable float clamp = -1e30f;
+      void note(float u) const {
+        if (on && u > 0.5f) unmapped = true;
+      }
+      float shown() const { return clamp > -1e29f ? clamp : 0.25f; }
+      graphics::Vec4 sample(uint32_t, float u, float v) const override { return note(u), graphics::Vec4{u, v, shown(), 1.0f}; }
+      graphics::Vec4 sample_lod(uint32_t, float u, float v, float lod) const override { return note(u), graphics::Vec4{u * 0.5f, v * 0.5f, (lod > clamp ? lod : clamp) * 0.125f, 0.5f}; }
+      graphics::Vec4 fetch(uint32_t, int32_t x, int32_t y, uint32_t level) const override {
+        return note(static_cast<float>(x) / 8.0f), graphics::Vec4{x * 0.0625f, y * 0.125f, static_cast<float>(level) * 0.25f, 0.75f};
+      }
+      bool size(uint32_t, uint32_t level, uint32_t* width, uint32_t* height, uint32_t* levels) const override {
+        *width = 8u >> level, *height = 8u >> level, *levels = 3;
+        return level < 3;
+      }
+      void begin_feedback(float min_lod) const override { on = true, unmapped = false, clamp = min_lod; }
+      bool end_feedback() const override {
+        const bool mapped = !unmapped;
+        on = unmapped = false, clamp = -1e30f;
+        return mapped;
+      }
+    } feedback_textures;
+    const char* const pairs[2][2] = {{"ps_tiled.dxbc", "dxil_ps_tiled.dxil"}, {"ps_tiled_clamp.dxbc", "dxil_ps_tiled_clamp.dxil"}};
+    unsigned unmapped_seen = 0, mapped_seen = 0;
+    for (const auto& pair : pairs) {
+      UniquePointer<D3d9Program> reference, translated;
+      CHECK(load(pair[0], &reference) && load(pair[1], &translated));
+      if (!reference || !translated) continue;
+      CHECK(reference->uses_feedback() && translated->uses_feedback());
+      for (uint32_t n = 0; n < 100; ++n) {
+        graphics::Vec4 varyings[16] = {};
+        varyings[2] = {random(0, 1), random(0, 1), 0, 0};
+        graphics::FragmentContext context;
+        context.position = {random(0, 32), random(0, 32), random(0, 1), 1};
+        graphics::Vec4 a_room[graphics::kMaxColorTargets] = {}, b_room[graphics::kMaxColorTargets] = {};
+        uint8_t constants[128] = {};
+        CHECK(reference->run_fragment_ex(varyings, context, constants, &feedback_textures, a_room) && translated->run_fragment_ex(varyings, context, constants, &feedback_textures, b_room));
+        const bool same = close_to(a_room[0].x, b_room[0].x) && close_to(a_room[0].y, b_room[0].y) && close_to(a_room[0].z, b_room[0].z) && close_to(a_room[0].w, b_room[0].w);
+        if (!same && n < 3) printf("  %s #%u: %g %g %g %g vs %g %g %g %g\n", pair[1], n, a_room[0].x, a_room[0].y, a_room[0].z, a_room[0].w, b_room[0].x, b_room[0].y, b_room[0].z, b_room[0].w);
+        CHECK(same);
+        if (&pair == &pairs[0]) (a_room[0].w == 1.0f ? mapped_seen : unmapped_seen) += 1;
+      }
+    }
+    CHECK(mapped_seen > 10 && unmapped_seen > 10);   // (both outcomes of the status were seen)
+  }
   // The pixel shaders: the same varyings, the same colour (and the same pixel killed).
   for (const char* name : {"dxil_ps_math", "dxil_ps_tex", "dxil_ps_flow", "dxil_ps_loop", "dxil_ps_loop2"}) {
     UniquePointer<D3d9Program> reference, translated;
@@ -7898,8 +8125,9 @@ void test_d3d12_reserved() {
   image.tile_narrow = static_cast<uint32_t>(NarrowLayout::R8);
   CHECK(e.kernel.create_allocation(kPid, e.dev, image, &none) == status::kInvalidParameter);      // (a narrow layout of an image that is not A8B8G8R8)
   image.tile_narrow = 0;
-  image.flags = kAllocTexture | kAllocRenderTarget | kAllocReserved;
-  CHECK(e.kernel.create_allocation(kPid, e.dev, image, &none) == status::kInvalidParameter);      // (a reserved texture is sampled only)
+  image.flags = kAllocDepthStencil | kAllocTexture | kAllocReserved, image.format = Format::D32Float;
+  CHECK(e.kernel.create_allocation(kPid, e.dev, image, &none) == status::kInvalidParameter);      // (no reserved depth buffer: its contents are the device's alone)
+  image.format = Format::A8R8G8B8;
   AllocationDesc narrow_buffer;
   narrow_buffer.flags = kAllocVertexBuffer, narrow_buffer.size = kTileBytes, narrow_buffer.tile_narrow = 1;
   CHECK(e.kernel.create_allocation(kPid, e.dev, narrow_buffer, &none) == status::kInvalidParameter);      // (a narrow layout is of reserved textures)
@@ -11084,6 +11312,7 @@ int main() {
   test_mirrors();
   test_d3d12_reserved();
   test_d3d12_reserved_texture();
+  test_reserved_tiers();
   test_dxil();
   test_compute_shared();
   test_geometry_extras();

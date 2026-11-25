@@ -167,8 +167,25 @@ struct ImageDesc {
   uint32_t samples = 1;
 };
 
+// Which parts of a tiled image are backed by memory (the memory manager's reserved textures, Direct3D's tiled resources; IImage::set_residency, kFeature2TileResidency): the image is
+// cut into tiles of tile_width x tile_height texels (and tile_depth slices of a volume) in each of its first standard_levels levels; the coarser levels are one unit per slice.
+// The bytes of mapped: one per unit (non-zero: mapped) for each slice - an array's or a cube's layer; a volume has one -: its standard levels' tiles in x, then y, then z order, level
+// after level, and then one byte for its coarser levels when it has any.
+struct ImageResidency {
+  uint32_t tile_width = 0, tile_height = 0, tile_depth = 1;
+  uint32_t standard_levels = 0;
+  uint32_t slices = 1;
+  ConstByteView mapped;
+};
+
 class IImage {
  public:
+  // Tiled images: what set_residency says is mapped decides what the shaders' residency feedback (ITextureSet::begin_feedback / end_feedback) reports for the texels a lookup reads.
+  // The image copies r. False when the device has no residency (the default) or r does not fit the image.
+  virtual bool set_residency(const ImageResidency& r) {
+    (void)r;
+    return false;
+  }
   virtual Extent2D extent() const = 0;
   virtual Format format() const = 0;
   // Copies a color image to `out` (extent.width * extent.height values, 0xAARRGGBB).
@@ -366,6 +383,12 @@ inline Vec4 sampler_border_value(const SamplerDesc& s) { return s.custom_border 
 class ITextureSet {
  public:
   virtual Vec4 sample(uint32_t unit, float u, float v) const = 0;
+  // Residency feedback and a lookup's own minimum level of detail (kFeature2TileResidency; Direct3D's Sample with a status and a clamp, CheckAccessFullyMapped): begin_feedback before
+  // the lookups of one instruction sets the finest level of detail they may use (in the view's levels, as the sampler's min_lod; -1e30 for none) and starts counting the texels
+  // they read that lie in unmapped parts of a tiled image (IImage::set_residency); end_feedback after them gives whether there were none and ends both. An image with no residency
+  // is mapped everywhere. A device without the feature keeps these defaults (no clamp, nothing unmapped): its kernel refuses the shaders that would need them.
+  virtual void begin_feedback(float min_lod) const { (void)min_lod; }
+  virtual bool end_feedback() const { return true; }
   // The lookup in a texture of any kind (kFeatureTextureKinds): the coordinate is (u, v) and a third value `w` that means, by the kind of the image bound to the unit: Texture3D
   // the depth coordinate (0..1 over the slices; the slices are blended by a linear filter, and w is clamped), Texture2DArray the layer (rounded to the nearest, clamped),
   // TextureCube the z of a direction (u, v, w) = (x, y, z) that picks the face and the point on it, with no filtering across faces. A 2D image ignores w.
@@ -1270,6 +1293,9 @@ enum DeviceFeature2 : uint32_t {
   kFeature2ShadingRate = 1u << 31,          // coarse pixel shading: ICommandBuffer::set_shading_rate / set_shading_rate_image, ShaderIo::shading_rate, FragmentContext::shading_rate (VariableShadingRateTier 2)
   kFeature2Barycentrics = 1u << 28,         // FragmentContext::barycentrics / barycentrics_linear / vertex_varyings (SV_Barycentrics, GetAttributeAtVertex)
   kFeature2SampleCopies = 1u << 29,         // ICommandBuffer::copy_samples: a region of a multisampled image, every sample, into another of its format and samples (D3D12_RESOLVE_MODE_DECOMPRESS)
+  // Residency feedback of tiled images (IImage::set_residency; Direct3D's tiled resources tier 2): a lookup reports whether every texel it read was mapped (ITextureSet::begin_feedback /
+  // end_feedback), and lookups take a per-lookup minimum level of detail (Direct3D's SampleClamp). (A high bit, apart from the ones other work is adding.)
+  kFeature2TileResidency = 1u << 27,
 };
 constexpr uint32_t kMaxViewports = 16;
 

@@ -467,6 +467,7 @@ class Adapter::StreamRunner {
       case Op::ResourceBarrier: return resource_barrier(p);
       case Op::CopyBuffer: return copy_buffer(p);
       case Op::CopyBufferImage: return copy_buffer_image(p);
+      case Op::CopyTiles: return copy_tiles(p);
       case Op::DecodeFrame: return decode_frame(p);
       case Op::VideoProcess: return video_process_packet(p);
       case Op::EstimateMotion: return estimate_motion_packet(p);
@@ -1494,6 +1495,24 @@ class Adapter::StreamRunner {
     if (!dst->writable_backing().try_subview(doff, bytes, &to) || !src->backing().try_subview(soff, bytes, &from)) return status::kInvalidDeviceState;
     to.copy_from(from);
     mm_.note_cpu_write(*dst);
+    return status::kSuccess;
+  }
+
+  // CopyTiles: the tiles' heap bytes to or from a plain buffer (VidMm::copy_tiles).
+  NtStatus copy_tiles(ByteReader& p) {
+    const uint32_t direction = p.le32(), ri = p.le32(), first = p.le32(), count = p.le32(), bi = p.le32(), offset = p.le32();
+    if (!exact(p) || in_pass_ || direction > 1 || count == 0) return kBad;
+    Allocation* reserved = alloc(ri);
+    Allocation* buffer = alloc(bi);
+    if (!reserved || !reserved->reserved() || !copyable_buffer(buffer) || buffer->reserved()) return kBad;
+    if (!use(reserved, direction == 0 ? state::kCopyDest : state::kCopySource) || !use(buffer, direction == 0 ? state::kCopySource : state::kCopyDest)) return kBad;
+    if (first > reserved->tile_count() || count > reserved->tile_count() - first || uint64_t{count} * kTileBytes > buffer->desc().size || offset > buffer->desc().size - uint64_t{count} * kTileBytes)
+      return kBad;
+    if (!exec_) return status::kSuccess;
+    NtStatus s = flush();
+    if (s != status::kSuccess) return s;
+    if (!mm_.copy_tiles(*reserved, first, count, *buffer, offset, direction == 1)) return status::kInvalidDeviceState;
+    if (direction == 0) unbind_textures_of(reserved);
     return status::kSuccess;
   }
 
