@@ -193,6 +193,11 @@ bool VenusContext::open() {
   caps_.robust_buffer_access2 = enabled(VK_EXT_ROBUSTNESS_2_EXTENSION_NAME) && robust2.robustBufferAccess2;
   caps_.robust_image_access2 = enabled(VK_EXT_ROBUSTNESS_2_EXTENSION_NAME) && robust2.robustImageAccess2;
   caps_.depth_bias_float = enabled(VK_EXT_DEPTH_BIAS_CONTROL_EXTENSION_NAME) && bias.depthBiasControl && bias.floatRepresentation && bias.depthBiasExact;
+  caps_.depth_bounds = f.depthBounds;
+  caps_.sampler_minmax = v12.samplerFilterMinmax;
+  caps_.max_line_width = f.wideLines ? properties_.limits.lineWidthRange[1] : 1.0f;
+  caps_.smooth_lines = caps_.line_rasterization && lines.smoothLines;
+  caps_.rectangular_lines = caps_.line_rasterization && lines.rectangularLines;
 
   // The driver's name (for the boot log and GL_RENDERER).
   auto driver = vk_struct<VkPhysicalDeviceDriverProperties>(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES);

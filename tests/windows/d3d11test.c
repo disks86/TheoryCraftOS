@@ -4862,7 +4862,7 @@ static void test_viewports(int layer_any_stage) {
   if (gs) ID3D11GeometryShader_Release(gs);
 }
 
-static void test_fixed_state_gaps(int software);
+static void test_fixed_state_gaps(int software, int min_max);
 static void test_sampler_state(void) {
   IDXGIDevice *dxgi = NULL;
   IDXGIAdapter *adapter = NULL;
@@ -4880,8 +4880,10 @@ static void test_sampler_state(void) {
   if (dxgi) IDXGIDevice_Release(dxgi);
   const int software = (ad.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) != 0;
   /* (the CPU renderer and the Venus device - the host's Vulkan - take the layer and viewport from a vertex shader; virgl does not) */
-  test_viewports(software || wcsstr(ad.Description, L"Venus") != NULL);
-  test_fixed_state_gaps(software);
+  const int venus = wcsstr(ad.Description, L"Venus") != NULL;
+  test_viewports(software || venus);
+  /* (MinMaxFiltering: the CPU renderer, and Venus where the host's Vulkan has samplerFilterMinmax - every desktop driver -; not virgl) */
+  test_fixed_state_gaps(software, software || venus);
   D3D11_SAMPLER_DESC sd;
   memset(&sd, 0, sizeof sd);
   sd.Filter = D3D11_FILTER_MIN_MAG_MIP_POINT;
@@ -5120,7 +5122,7 @@ static void test_depth_textures_11(void) {
  * minification and magnification filters of their own (a 2 x 2 texture over the target is magnified: MIN_LINEAR_MAG_POINT is the point filter's texels, MIN_POINT_MAG_LINEAR a
  * blend), MINIMUM / MAXIMUM filters where MinMaxFiltering, the line modes (MultisampleEnable's quadrilateral lines 1.4 pixels wide, AntialiasedLineEnable's coverage in alpha),
  * an R16_TYPELESS texture seen as R16_FLOAT, R1_UNORM textures. */
-static void test_fixed_state_gaps(int software) {
+static void test_fixed_state_gaps(int software, int min_max) {
   /* strip cuts: a strip of six vertices cut after the third, drawn with 16-bit and 32-bit indices; the middle below the two triangles stays black */
   {
     const VertexF v[6] = {{-0.9f, 0.9f, 0.5f, 1, 0, 0, 1}, {-0.1f, 0.9f, 0.5f, 1, 0, 0, 1}, {-0.5f, 0.3f, 0.5f, 1, 0, 0, 1},
@@ -5169,7 +5171,7 @@ static void test_fixed_state_gaps(int software) {
     D3D11_FEATURE_DATA_D3D11_OPTIONS1 o1;
     memset(&o1, 0, sizeof o1);
     ID3D11Device_CheckFeatureSupport(g_device, D3D11_FEATURE_D3D11_OPTIONS1, &o1, sizeof o1);
-    check(o1.MinMaxFiltering == software, "MinMaxFiltering on the CPU renderer");
+    check(o1.MinMaxFiltering == min_max, "MinMaxFiltering on the CPU renderer and Venus");
     sd.Filter = D3D11_FILTER_MAXIMUM_MIN_MAG_LINEAR_MIP_POINT;
     ID3D11SamplerState *state = NULL;
     const HRESULT hr = ID3D11Device_CreateSamplerState(g_device, &sd, &state);

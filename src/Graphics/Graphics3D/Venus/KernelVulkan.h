@@ -51,7 +51,7 @@ extern "C" {
   X(CreateQueryPool) X(DestroyQueryPool) X(GetQueryPoolResults) X(ResetQueryPool)                                                                                \
   X(CmdBeginRendering) X(CmdEndRendering) X(CmdBindPipeline) X(CmdBindVertexBuffers) X(CmdBindVertexBuffers2) X(CmdBindIndexBuffer) X(CmdBindDescriptorSets)  \
   X(CmdPushConstants) X(CmdDraw) X(CmdDrawIndexed) X(CmdDrawIndirect) X(CmdDrawIndexedIndirect) X(CmdDispatch) X(CmdDispatchIndirect) X(CmdSetViewport)          \
-  X(CmdSetScissor) X(CmdSetStencilReference) X(CmdSetStencilCompareMask) X(CmdSetStencilWriteMask) X(CmdSetBlendConstants) X(CmdSetDepthBias) X(CmdSetLineWidth) \
+  X(CmdSetScissor) X(CmdSetDepthBounds) X(CmdSetDepthBoundsTestEnable) X(CmdSetStencilReference) X(CmdSetStencilCompareMask) X(CmdSetStencilWriteMask) X(CmdSetBlendConstants) X(CmdSetDepthBias) X(CmdSetLineWidth) \
   X(CmdSetCullMode) X(CmdSetFrontFace) X(CmdSetPrimitiveTopology) X(CmdSetPrimitiveRestartEnable) X(CmdPipelineBarrier) X(CmdPipelineBarrier2)                 \
   X(CmdCopyBuffer) X(CmdCopyImage) X(CmdCopyBufferToImage) X(CmdCopyImageToBuffer) X(CmdBlitImage) X(CmdResolveImage) X(CmdClearColorImage)                    \
   X(CmdClearDepthStencilImage) X(CmdClearAttachments) X(CmdFillBuffer) X(CmdUpdateBuffer) X(CmdBeginQuery) X(CmdEndQuery) X(CmdResetQueryPool)                  \

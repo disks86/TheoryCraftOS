@@ -70,6 +70,17 @@ static bool load_host_vulkan() {
   g_gipa = reinterpret_cast<PFN_vkGetInstanceProcAddr>(dlsym(g_loader, "vkGetInstanceProcAddr"));
   if (!g_gipa) return false;
   fill_table(&g_table);
+  // (an instance of the host's loader kept to the end, with its devices enumerated: the loader unloads the drivers when the last instance goes, and a driver's
+  // one-time allocations - RADV's, made under pthread_once - are then reported by LeakSanitizer as leaks of an unknown module; kept loaded they stay reachable)
+  static VkInstance keep = nullptr;
+  auto create = reinterpret_cast<PFN_vkCreateInstance>(g_gipa(nullptr, "vkCreateInstance"));
+  VkApplicationInfo app = {VK_STRUCTURE_TYPE_APPLICATION_INFO, nullptr, "VenusHostTest", 1, nullptr, 0, VK_API_VERSION_1_3};
+  VkInstanceCreateInfo ci = {VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO, nullptr, 0, &app, 0, nullptr, 0, nullptr};
+  if (create && create(&ci, nullptr, &keep) == VK_SUCCESS) {
+    auto enumerate = reinterpret_cast<PFN_vkEnumeratePhysicalDevices>(g_gipa(keep, "vkEnumeratePhysicalDevices"));
+    uint32_t count = 0;
+    if (enumerate) (void)enumerate(keep, &count, nullptr);
+  }
   return true;
 }
 

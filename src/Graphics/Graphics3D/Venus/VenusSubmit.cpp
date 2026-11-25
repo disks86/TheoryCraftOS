@@ -216,7 +216,7 @@ struct BoundTexel {
 class Replay {
  public:
   Replay(VenusDevice& device, VenusCommands& commands)
-      : d_(device), vk_(device.vk()), rec_(commands), views_(device.allocator()), pipelines_(device.allocator()), segments_(device.allocator()) {
+      : d_(device), vk_(device.vk()), rec_(commands), views_(device.allocator()), pipelines_(device.allocator()), segments_(device.allocator()), so_draws_(device.allocator()) {
     for (int32_t& c : current_) c = -1;
   }
   bool run();
@@ -241,6 +241,10 @@ class Replay {
   bool end_query(const RecordedCommand& c);
   void segments_close();
   void segments_open();
+  void segment_close(uint32_t category);
+  void segment_open(uint32_t category, bool no_fragment);
+  void set_depth_bounds_state();
+  bool copy_samples(const RecordedCommand& c);
   bool read_queries();
   bool resolve(const RecordedCommand& c);
   // stream output
@@ -286,6 +290,9 @@ class Replay {
   Viewport viewports_[kMaxViewports];
   Rect2D scissors_[kMaxViewports];
   uint32_t viewport_count_ = 1, scissor_count_ = 1;
+  // the depth bounds test (kFeature2DepthBounds; dynamic state, set before a draw when it changed or the command buffer is new)
+  bool depth_bounds_ = false, depth_bounds_dirty_ = true;
+  float depth_min_ = 0, depth_max_ = 1;
   // what the replay made
   struct MadeView {
     VkBufferView view;
@@ -305,6 +312,7 @@ class Replay {
   };
   struct Segment {
     uint32_t category = 0, index = 0;
+    bool no_fragment = false;   // (a statistics segment around a draw whose pixel shader stands in for none: its fragment shader runs are not counted)
     uint64_t open[kMaxOcclusionQueries / 64] = {};
   };
   UserQuery queries_[kMaxOcclusionQueries];
@@ -315,17 +323,34 @@ class Replay {
   int32_t current_[kCategories];
   uint32_t used_[VenusDevice::kPoolKinds] = {};
   bool any_queries_ = false;
-  // Stream output: the targets bound, each binding a counter of its own the replay starts at the binding's offset and the GPU leaves where it got to.
+  // Stream output. Each binding (a Fill) starts at its offset; each draw that writes it reads a counter slot and leaves where it got to in a new one, so that the start
+  // of every draw is known afterwards. (A host that finds a primitive too big for the room left sets the counter to the binding's end - RADV does -, where Direct3D
+  // keeps it after the last primitive written: the read-back works Direct3D's out from the draw's start and its primitives' size.)
   struct Target {
     VenusBuffer* buffer = nullptr;
-    uint32_t counter = 0;
+    uint32_t counter = 0;                // (the slot with where the next draw starts)
+    uint32_t fill = 0;
+    uint64_t end = kStreamOutputNoEnd;   // (where the writes stop: the binding's end, or the buffer's)
   } so_[kMaxStreamOutputBuffers];
   struct Fill {
     VenusBuffer* buffer = nullptr;
-    uint32_t counter = 0;
+    uint32_t start_slot = 0;
+    uint64_t limit = 0;                  // (the binding's end within the buffer)
   };
-  Fill fills_[VenusDevice::kStreamOutputCounters];
+  struct SoDraw {
+    uint32_t fill = 0, read = 0, write = 0;
+    uint32_t primitive_bytes = 0;        // (what one primitive of the draw takes in this buffer: 0 when not known)
+  };
+  static constexpr uint32_t kMaxFills = 256;   // (bindings of stream output buffers a submit makes)
+  Fill fills_[kMaxFills];
   uint32_t fill_count_ = 0;
+  List<SoDraw> so_draws_;
+  uint32_t slots_used_ = 0;
+  bool new_slot(uint32_t* slot) {
+    if (slots_used_ >= VenusDevice::kStreamOutputCounters) return false;
+    *slot = slots_used_++;
+    return true;
+  }
   bool so_active_ = false;
   uint32_t so_used_ = 0;
   VkBuffer so_counter_buffers_[kMaxStreamOutputBuffers] = {};
@@ -771,13 +796,19 @@ bool Replay::draw(const RecordedCommand& c, bool indexed) {
     const VkDeviceSize offset = vb.offset & 0xFFFFFFFFu;
     vk_.CmdBindVertexBuffers(cb_, b, 1, &buffer, &offset);
   }
+  if (depth_bounds_dirty_) set_depth_bounds_state();
   if (desc.stream_output_count && !begin_stream_output(p)) return false;
+  // (a fragment shader that stands in for no pixel shader: Vulkan counts its runs, Direct3D none - the draw gets a statistics segment of its own whose PsInvocations
+  // are left out)
+  const bool stand_in = desc.stand_in_fragment && current_[kCatStatistics] >= 0;
+  if (stand_in) segment_close(kCatStatistics), segment_open(kCatStatistics, true);
   if (indexed) {
     vk_.CmdBindIndexBuffer(cb_, index_->buffer(), index_offset_, index_type_ == IndexType::Uint32 ? VK_INDEX_TYPE_UINT32 : VK_INDEX_TYPE_UINT16);
     vk_.CmdDrawIndexed(cb_, c.count, c.instance_count, c.first, c.vertex_offset, c.first_instance);
   } else {
     vk_.CmdDraw(cb_, c.count, c.instance_count, c.first, c.first_instance);
   }
+  if (stand_in) segment_close(kCatStatistics), segment_open(kCatStatistics, false);
   end_stream_output();
   // (what a storing draw wrote is there for the next draw: the rendering is ended for a barrier and resumed)
   if (desc.fragment_stores || desc.vertex_stores || desc.geometry_stores || desc.tessellation_stores) {
@@ -820,6 +851,7 @@ bool Replay::flush_midway() {
   cb_ = d_.begin_main();
   if (!cb_) return false;
   bound_pipeline_ = nullptr;
+  depth_bounds_dirty_ = true;
   if (resume) resume_rendering();
   else segments_open();
   return true;
@@ -827,33 +859,38 @@ bool Replay::flush_midway() {
 
 // ---- queries --------------------------------------------------------------------------------------------------------------------------------------
 void Replay::segments_close() {
-  for (uint32_t cat = 0; cat < kCategories; ++cat) {
-    if (current_[cat] < 0) continue;
-    const Segment& seg = segments_[static_cast<uint64_t>(current_[cat])];
-    if (cat == kCatOcclusion) vk_.CmdEndQuery(cb_, d_.query_pool(VenusDevice::kPoolOcclusion), seg.index);
-    else if (cat == kCatStatistics) vk_.CmdEndQuery(cb_, d_.query_pool(VenusDevice::kPoolStatistics), seg.index);
-    else vk_.CmdEndQueryIndexedEXT(cb_, d_.query_pool(VenusDevice::kPoolStreams), seg.index, cat - kCatStream0);
-    current_[cat] = -1;
-  }
+  for (uint32_t cat = 0; cat < kCategories; ++cat) segment_close(cat);
+}
+
+void Replay::segment_close(uint32_t cat) {
+  if (current_[cat] < 0) return;
+  const Segment& seg = segments_[static_cast<uint64_t>(current_[cat])];
+  if (cat == kCatOcclusion) vk_.CmdEndQuery(cb_, d_.query_pool(VenusDevice::kPoolOcclusion), seg.index);
+  else if (cat == kCatStatistics) vk_.CmdEndQuery(cb_, d_.query_pool(VenusDevice::kPoolStatistics), seg.index);
+  else vk_.CmdEndQueryIndexedEXT(cb_, d_.query_pool(VenusDevice::kPoolStreams), seg.index, cat - kCatStream0);
+  current_[cat] = -1;
 }
 
 void Replay::segments_open() {
-  for (uint32_t cat = 0; cat < kCategories; ++cat) {
-    Segment seg;
-    seg.category = cat;
-    bool any = false;
-    for (uint32_t q = 0; q < kMaxOcclusionQueries; ++q)
-      if ((open_[q / 64] >> (q % 64) & 1) && category_of(queries_[q].kind, queries_[q].stream) == cat) seg.open[q / 64] |= uint64_t{1} << (q % 64), any = true;
-    if (!any) continue;
-    const VenusDevice::QueryPoolKind kind = cat == kCatOcclusion ? VenusDevice::kPoolOcclusion : cat == kCatStatistics ? VenusDevice::kPoolStatistics : VenusDevice::kPoolStreams;
-    VkQueryPool pool = d_.query_pool(kind);
-    if (!pool || used_[kind] >= VenusDevice::kQuerySegments) continue;   // (refused at the query's begin; or out of segments: the rest is not counted)
-    seg.index = used_[kind]++;
-    if (!segments_.push_back(seg)) continue;
-    current_[cat] = static_cast<int32_t>(segments_.count() - 1);
-    if (cat == kCatStream0 + 0 || cat > kCatStream0) vk_.CmdBeginQueryIndexedEXT(cb_, pool, seg.index, 0, cat - kCatStream0);
-    else vk_.CmdBeginQuery(cb_, pool, seg.index, cat == kCatOcclusion && d_.context().caps().occlusion_query_precise ? VK_QUERY_CONTROL_PRECISE_BIT : 0);
-  }
+  for (uint32_t cat = 0; cat < kCategories; ++cat) segment_open(cat, false);
+}
+
+void Replay::segment_open(uint32_t cat, bool no_fragment) {
+  Segment seg;
+  seg.category = cat;
+  seg.no_fragment = no_fragment;
+  bool any = false;
+  for (uint32_t q = 0; q < kMaxOcclusionQueries; ++q)
+    if ((open_[q / 64] >> (q % 64) & 1) && category_of(queries_[q].kind, queries_[q].stream) == cat) seg.open[q / 64] |= uint64_t{1} << (q % 64), any = true;
+  if (!any) return;
+  const VenusDevice::QueryPoolKind kind = cat == kCatOcclusion ? VenusDevice::kPoolOcclusion : cat == kCatStatistics ? VenusDevice::kPoolStatistics : VenusDevice::kPoolStreams;
+  VkQueryPool pool = d_.query_pool(kind);
+  if (!pool || used_[kind] >= VenusDevice::kQuerySegments) return;   // (refused at the query's begin; or out of segments: the rest is not counted)
+  seg.index = used_[kind]++;
+  if (!segments_.push_back(seg)) return;
+  current_[cat] = static_cast<int32_t>(segments_.count() - 1);
+  if (cat == kCatStream0 + 0 || cat > kCatStream0) vk_.CmdBeginQueryIndexedEXT(cb_, pool, seg.index, 0, cat - kCatStream0);
+  else vk_.CmdBeginQuery(cb_, pool, seg.index, cat == kCatOcclusion && d_.context().caps().occlusion_query_precise ? VK_QUERY_CONTROL_PRECISE_BIT : 0);
 }
 
 bool Replay::begin_query(const RecordedCommand& c) {
@@ -941,7 +978,9 @@ bool Replay::read_queries() {
         if (cat == kCatOcclusion) {
           values[0] += results[VenusDevice::kPoolOcclusion][seg.index];
         } else if (cat == kCatStatistics) {
-          for (uint32_t k = 0; k < kPipelineStatisticCount; ++k) values[k] += results[VenusDevice::kPoolStatistics][uint64_t{seg.index} * kPipelineStatisticCount + k];
+          for (uint32_t k = 0; k < kPipelineStatisticCount; ++k)
+            if (!(seg.no_fragment && k == static_cast<uint32_t>(PipelineStatistic::PsInvocations)))
+              values[k] += results[VenusDevice::kPoolStatistics][uint64_t{seg.index} * kPipelineStatisticCount + k];
         } else {
           values[0] += results[VenusDevice::kPoolStreams][uint64_t{seg.index} * 2 + (q.kind == QueryKind::SoPrimitivesWritten ? 0 : 1)];
         }
@@ -1064,6 +1103,11 @@ bool Replay::resolve(const RecordedCommand& c) {
         vk_.CmdSetViewport(cb_, 0, count, vps);
         vk_.CmdSetScissor(cb_, 0, count, scs);
         vk_.CmdSetStencilReference(cb_, VK_STENCIL_FACE_FRONT_AND_BACK, 0);
+        if (d_.context().caps().depth_bounds) {   // (the pipeline's dynamic state: the test off for the resolve, the user's set again before the next draw)
+          vk_.CmdSetDepthBoundsTestEnable(cb_, VK_FALSE);
+          vk_.CmdSetDepthBounds(cb_, 0.0f, 1.0f);
+          depth_bounds_dirty_ = true;
+        }
         vk_.CmdDraw(cb_, 3, 1, 0, 0);
         vk_.CmdEndRendering(cb_);
       }
@@ -1076,6 +1120,40 @@ bool Replay::resolve(const RecordedCommand& c) {
   barrier();
   segments_open();
   return ok;
+}
+
+// ---- the depth bounds test and copies of samples ---------------------------------------------------------------------------------------------------------
+void Replay::set_depth_bounds_state() {
+  depth_bounds_dirty_ = false;
+  if (!d_.context().caps().depth_bounds) return;
+  // (Vulkan tests the bounds only where there is a depth buffer, as Direct3D does)
+  vk_.CmdSetDepthBoundsTestEnable(cb_, depth_bounds_ ? VK_TRUE : VK_FALSE);
+  vk_.CmdSetDepthBounds(cb_, depth_min_, depth_max_);
+}
+
+// A region of a multisampled image, every sample of each pixel (a depth image's depth and stencil), to (x, y) of another of the same format and samples, outside a
+// pass (kFeature2SampleCopies: Direct3D 12's D3D12_RESOLVE_MODE_DECOMPRESS).
+bool Replay::copy_samples(const RecordedCommand& c) {
+  VenusImage* dst = static_cast<VenusImage*>(c.image);
+  VenusImage* src = static_cast<VenusImage*>(c.image2);
+  if (in_pass_ || !dst || !src || dst == src || dst->format() != src->format() || dst->desc().samples != src->desc().samples || src->desc().samples < 2 ||
+      dst->desc().stencil != src->desc().stencil)
+    return false;
+  const Rect2D& r = c.scissor;
+  const Extent2D se = src->extent(), de = dst->extent();
+  if (r.x < 0 || r.y < 0 || r.width == 0 || r.height == 0 || uint64_t{static_cast<uint32_t>(r.x)} + r.width > se.width ||
+      uint64_t{static_cast<uint32_t>(r.y)} + r.height > se.height || uint64_t{c.count} + r.width > de.width || uint64_t{c.first} + r.height > de.height)
+    return false;
+  barrier();
+  VkImageCopy region{};
+  region.srcSubresource = {src->aspect(), 0, 0, 1};
+  region.srcOffset = {r.x, r.y, 0};
+  region.dstSubresource = {dst->aspect(), 0, 0, 1};
+  region.dstOffset = {static_cast<int32_t>(c.count), static_cast<int32_t>(c.first), 0};
+  region.extent = {r.width, r.height, 1};
+  vk_.CmdCopyImage(cb_, src->image(), VK_IMAGE_LAYOUT_GENERAL, dst->image(), VK_IMAGE_LAYOUT_GENERAL, 1, &region);
+  barrier();
+  return true;
 }
 
 // ---- stream output -------------------------------------------------------------------------------------------------------------------------------
@@ -1091,7 +1169,7 @@ bool Replay::bind_stream_output(const RecordedCommand& c) {
     return true;
   }
   if (!d_.context().caps().transform_feedback) return false;
-  if (c.offset == kStreamOutputAppend && t.buffer == b) return true;   // (it goes on)
+  if (c.offset == kStreamOutputAppend && t.buffer == b && t.end == c.end) return true;   // (it goes on)
   uint64_t start = c.offset;
   if (c.offset == kStreamOutputAppend) {
     for (uint32_t i = 0; i < fill_count_; ++i)
@@ -1099,17 +1177,31 @@ bool Replay::bind_stream_output(const RecordedCommand& c) {
     start = b->stream_output_filled();
     if (start == kStreamOutputAppend) return false;
   }
-  if (start > b->size() || fill_count_ >= VenusDevice::kStreamOutputCounters) return false;
+  const uint64_t limit = c.end < b->size() ? c.end : b->size();
+  uint32_t slot = 0;
+  if (start > b->size() || start > 0xFFFFFFFFu || fill_count_ >= kMaxFills || !new_slot(&slot)) return false;
   VenusMemory* counters = d_.stream_output_counters();
   if (!counters) return false;
-  t.buffer = b;
-  t.counter = fill_count_;
   ArrayView<uint32_t> words;
   if (!ByteView(counters->map, counters->size).try_cast<uint32_t>(&words)) return false;
-  words[t.counter] = static_cast<uint32_t>(start);   // (the counter is where writing goes on: Vulkan's counter is a byte offset into the binding, which is the whole buffer)
-  fills_[fill_count_++] = {b, t.counter};
+  words[slot] = static_cast<uint32_t>(start);   // (Vulkan's counter is a byte offset into the binding, which starts at the buffer's start)
+  t.buffer = b;
+  t.counter = slot;
+  t.fill = fill_count_;
+  t.end = c.end;
+  fills_[fill_count_++] = {b, slot, limit};
   return true;
 }
+
+namespace {
+// The vertices of one primitive the pipeline's stream output writes: its geometry shader's output primitive (points, line strips, triangle strips).
+uint32_t output_vertices(const VenusPipeline& p) {
+  const VenusShaderModule* gs = static_cast<const VenusShaderModule*>(p.desc().geometry_shader);
+  if (!gs) return 0;
+  const uint32_t out = gs->program().get(tgsi::Property::GsOutputPrimitive);
+  return out == 0 ? 1u : out == 1 || out == 3 ? 2u : 3u;
+}
+}  // namespace
 
 bool Replay::begin_stream_output(VenusPipeline& p) {
   if (!rendering_) return false;
@@ -1120,43 +1212,66 @@ bool Replay::begin_stream_output(VenusPipeline& p) {
   uint32_t used = 0;   // (the slots up to the last bound one; an unbound slot below it is bound to the counters' buffer with no room)
   for (uint32_t s = 0; s < kMaxStreamOutputBuffers; ++s)
     if (so_[s].buffer) used = s + 1;
-  (void)p;
   if (!used) return true;   // (nothing bound: nothing is written)
+  const uint32_t vertices = output_vertices(p);
   for (uint32_t s = 0; s < used; ++s) {
     if (so_[s].buffer) {
-      buffers[s] = so_[s].buffer->buffer(), offsets[s] = 0, sizes[s] = so_[s].buffer->size();
+      // (the binding is the buffer up to the bound end and one byte more: records are whole words, so none ends in that byte, and a host that takes a record
+      // ending exactly at the binding's end for one that does not fit - RADV seems to - writes it; the buffer has the room, VenusDevice::create_buffer)
+      const Fill& f = fills_[so_[s].fill];
+      uint32_t write = 0;
+      if (!new_slot(&write)) return false;
+      if (!so_draws_.push_back({so_[s].fill, so_[s].counter, write, vertices * p.desc().stream_output_stride[s]})) return false;
+      buffers[s] = so_[s].buffer->buffer(), offsets[s] = 0, sizes[s] = f.limit < so_[s].buffer->room() ? f.limit + 1 : f.limit;
+      if (sizes[s] == 0) return false;   // (Vulkan takes no empty binding)
       counter_buffers[s] = counters->buffer, counter_offsets[s] = uint64_t{so_[s].counter} * 4;
+      so_counter_offsets_[s] = uint64_t{write} * 4;
+      so_[s].counter = write;
     } else {
       buffers[s] = counters->buffer, offsets[s] = counters->size - 4, sizes[s] = 4;
       counter_buffers[s] = nullptr, counter_offsets[s] = 0;
+      so_counter_offsets_[s] = 0;
     }
+    so_counter_buffers_[s] = counter_buffers[s];
   }
   vk_.CmdBindTransformFeedbackBuffersEXT(cb_, 0, used, buffers, offsets, sizes);
-  vk_.CmdBeginTransformFeedbackEXT(cb_, 0, used, counter_buffers, counter_offsets);
+  vk_.CmdBeginTransformFeedbackEXT(cb_, 0, used, counter_buffers, counter_offsets);   // (from the slots with each binding's start ...)
   so_active_ = true;
   so_used_ = used;
-  for (uint32_t s = 0; s < used; ++s) so_counter_buffers_[s] = counter_buffers[s], so_counter_offsets_[s] = counter_offsets[s];
   return true;
 }
 
 void Replay::end_stream_output() {
   if (!so_active_) return;
-  vk_.CmdEndTransformFeedbackEXT(cb_, 0, so_used_, so_counter_buffers_, so_counter_offsets_);
+  vk_.CmdEndTransformFeedbackEXT(cb_, 0, so_used_, so_counter_buffers_, so_counter_offsets_);   // (... into new ones)
   so_active_ = false;
 }
 
+// After the fence: where each buffer's last binding got to, Direct3D's way - after the last whole primitive written, which on a host that moved the counter to the
+// binding's end when a primitive did not fit is the draw's start and the primitives that fitted there (the host writes them in order until one does not).
 void Replay::stream_output_results() {
   VenusMemory* counters = fill_count_ ? d_.stream_output_counters() : nullptr;
   if (!counters) return;
   ArrayView<uint32_t> words;
   if (!ByteView(counters->map, counters->size).try_cast<uint32_t>(&words)) return;
-  // (the last binding of each buffer says how far it got)
   for (uint32_t i = 0; i < fill_count_; ++i) {
     bool later = false;
     for (uint32_t j = i + 1; j < fill_count_; ++j) later = later || fills_[j].buffer == fills_[i].buffer;
     if (later) continue;
-    const uint64_t end = words[fills_[i].counter];
-    fills_[i].buffer->set_stream_output_filled(end <= fills_[i].buffer->size() ? end : kStreamOutputAppend);
+    const uint64_t limit = fills_[i].limit;
+    uint64_t at = words[fills_[i].start_slot];
+    bool full = false;
+    for (const SoDraw& d : so_draws_) {
+      if (d.fill != i || full) continue;
+      const uint64_t got = words[d.write];
+      if (got <= limit && got % 4 == 0 && got >= at) {
+        at = got;
+      } else {   // (a primitive did not fit: nothing more is written to this binding, by the host or by Direct3D)
+        full = true;
+        if (d.primitive_bytes && at <= limit) at += (limit - at) / d.primitive_bytes * d.primitive_bytes;
+      }
+    }
+    fills_[i].buffer->set_stream_output_filled(at <= fills_[i].buffer->size() ? at : kStreamOutputAppend);
   }
 }
 
@@ -1293,6 +1408,20 @@ bool Replay::run() {
       case RecordedCommand::Type::EndQuery: ok = end_query(c); break;
       case RecordedCommand::Type::BindStreamOutput: ok = bind_stream_output(c); break;
       case RecordedCommand::Type::Resolve: ok = resolve(c); break;
+      case RecordedCommand::Type::SetDepthBounds:
+        if (!d_.context().caps().depth_bounds) {
+          ok = false;
+          break;
+        }
+        depth_bounds_ = c.count != 0, depth_min_ = c.viewport.min_depth, depth_max_ = c.viewport.max_depth;
+        depth_bounds_dirty_ = true;
+        break;
+      case RecordedCommand::Type::CopySamples: ok = copy_samples(c); break;
+      // (not offered - DeviceInfo has no kFeature2SamplePositions, kFeature2ViewInstancing or kFeature2ShadingRate -: the kernel sends none; a stray one fails the submit)
+      case RecordedCommand::Type::SetSamplePositions:
+      case RecordedCommand::Type::SetViewInstance:
+      case RecordedCommand::Type::SetShadingRate:
+      case RecordedCommand::Type::SetShadingRateImage: ok = false; break;
     }
     if (!ok) break;
   }

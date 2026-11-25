@@ -691,11 +691,21 @@ bool VenusPipeline::make_graphics(Variant& v, const VkPipelineShaderStageCreateI
     provoke.pNext = rs_next;
     rs_next = &provoke;
   }
+  VkPipelineRasterizationLineStateCreateInfoEXT line_state = vk_struct<VkPipelineRasterizationLineStateCreateInfoEXT>(VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_LINE_STATE_CREATE_INFO_EXT);
+  if (d.line_mode != LineMode::Aliased) {
+    // (kFeature2LineModes: Direct3D's alpha-antialiased lines are smooth lines - the coverage goes into the alpha -, its quadrilateral lines rectangles 1.4 or 1.0 pixels wide)
+    const VenusCaps& c = ctx.caps();
+    if (!c.smooth_lines || !c.rectangular_lines || c.max_line_width < 1.4f) return false;
+    line_state.lineRasterizationMode = d.line_mode == LineMode::AlphaAntialiased ? VK_LINE_RASTERIZATION_MODE_RECTANGULAR_SMOOTH_EXT : VK_LINE_RASTERIZATION_MODE_RECTANGULAR_EXT;
+    rs.lineWidth = d.line_mode == LineMode::QuadrilateralWide ? 1.4f : 1.0f;
+    line_state.pNext = rs_next;
+    rs_next = &line_state;
+  }
   rs.pNext = rs_next;
   // multisampling
   VkPipelineMultisampleStateCreateInfo ms = vk_struct<VkPipelineMultisampleStateCreateInfo>(VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO);
   ms.rasterizationSamples = static_cast<VkSampleCountFlagBits>(v.key.samples ? v.key.samples : 1);
-  ms.alphaToCoverageEnable = d.alpha_to_coverage && d.multisample ? VK_TRUE : VK_FALSE;
+  ms.alphaToCoverageEnable = d.alpha_to_coverage && d.multisample && d.line_mode != LineMode::AlphaAntialiased ? VK_TRUE : VK_FALSE;   // (smooth lines take none)
   // (without multisampling a pixel is all or nothing by its centre: every sample of a multisampled target is put there)
   VkSampleLocationEXT centres[16];
   for (VkSampleLocationEXT& c : centres) c = {0.5f, 0.5f};
@@ -759,9 +769,11 @@ bool VenusPipeline::make_graphics(Variant& v, const VkPipelineShaderStageCreateI
   }
   __builtin_memcpy(cb.blendConstants, d.blend.constant, sizeof(cb.blendConstants));
   // the state set per draw
-  const VkDynamicState dynamic[] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR, VK_DYNAMIC_STATE_STENCIL_REFERENCE};
+  // (the depth bounds test - kFeature2DepthBounds - is the command buffer's state, not the pipeline's)
+  const VkDynamicState dynamic[] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR, VK_DYNAMIC_STATE_STENCIL_REFERENCE, VK_DYNAMIC_STATE_DEPTH_BOUNDS,
+                                    VK_DYNAMIC_STATE_DEPTH_BOUNDS_TEST_ENABLE};
   VkPipelineDynamicStateCreateInfo dyn = vk_struct<VkPipelineDynamicStateCreateInfo>(VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO);
-  dyn.dynamicStateCount = sizeof(dynamic) / sizeof(dynamic[0]), dyn.pDynamicStates = dynamic;
+  dyn.dynamicStateCount = ctx.caps().depth_bounds ? 5u : 3u, dyn.pDynamicStates = dynamic;
   // the attachments' formats (dynamic rendering)
   VkFormat colors[kMaxColorTargets];
   uint32_t color_count = 0;

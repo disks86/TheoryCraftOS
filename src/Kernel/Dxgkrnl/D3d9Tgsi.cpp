@@ -124,7 +124,7 @@ class TgsiEmitter {
   // Whether add_float's text (twelve fraction digits) reads back as exactly `f`. A float it cannot write so - a small one such as 1e-30, which would read as 0, a
   // negative zero, a NaN or a large one - goes in an immediate of UINT32 bits instead (the registers are untyped: its users see the same bits).
   static bool decimal_exact(float f) {
-    if (!(f == f) || f > 1e9f || f < -1e9f || __builtin_signbit(f) && f == 0) return false;
+    if (!(f == f) || f > 1e9f || f < -1e9f || (__builtin_signbit(f) && f == 0)) return false;
     double d = static_cast<double>(f), sign = 1;
     if (d < 0) d = -d, sign = -1;
     uint64_t ip = static_cast<uint64_t>(d);

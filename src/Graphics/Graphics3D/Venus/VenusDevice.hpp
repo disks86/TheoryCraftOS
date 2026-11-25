@@ -138,7 +138,7 @@ class VenusDevice final : public IGraphicsDevice {
   VenusMemory& constants_ring() { return constants_; }
   // The query pools (made on first use; every submit resets the ones it uses): occlusion, pipeline statistics (all eleven), transform feedback streams,
   // timestamps. kQuerySegments segments of each a submit.
-  static constexpr uint32_t kQuerySegments = 4096, kTimestamps = 512, kStreamOutputCounters = 256;
+  static constexpr uint32_t kQuerySegments = 4096, kTimestamps = 512, kStreamOutputCounters = 4096;   // (counter slots: one per binding and one per draw that writes it)
   enum QueryPoolKind : uint32_t { kPoolOcclusion, kPoolStatistics, kPoolStreams, kPoolTimestamps, kPoolKinds };
   VkQueryPool query_pool(QueryPoolKind kind);
   // The counters of stream output bindings (host-visible: the replay writes each binding's start, the GPU where it got to).

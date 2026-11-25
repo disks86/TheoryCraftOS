@@ -158,6 +158,12 @@ DeviceInfo VenusDevice::info() const {
   if (c.multi_viewport) i.features2 |= kFeature2Viewports;
   if (c.shader_output_layer && c.shader_output_viewport_index) i.features2 |= kFeature2LayerFromAnyStage;
   if (c.conservative_rasterization) i.features2 |= kFeature2ConservativeRaster;
+  // (gap pass 4: the planes of depth images and whole subresources by copies, a magnification filter of its own, min / max reductions, Direct3D's line modes -
+  // smooth lines for the alpha-antialiased ones, rectangular lines of 1.4 and 1.0 pixels for the quadrilateral ones -, the depth bounds test, copies of samples)
+  i.features2 |= kFeature2DepthCopies | kFeature2SeparateFilters | kFeature2SampleCopies;
+  if (c.sampler_minmax) i.features2 |= kFeature2SamplerReductions;
+  if (c.smooth_lines && c.rectangular_lines && c.max_line_width >= 1.4f) i.features2 |= kFeature2LineModes;
+  if (c.depth_bounds) i.features2 |= kFeature2DepthBounds;
   i.sample_counts = sample_counts_ & ((1u << 2) | (1u << 4) | (1u << 8));
   if (i.sample_counts) i.features |= kFeatureMultisample | kFeatureDepthResolve, i.features2 |= kFeature2ColorResolveModes;
   i.d3d_sample_order = true;   // (Vulkan's standard sample locations are Direct3D's)
@@ -503,7 +509,8 @@ VkSamplerAddressMode address_mode(AddressMode m) {
 bool same_sampler(const SamplerDesc& a, const SamplerDesc& b) {
   return a.filter == b.filter && a.address_u == b.address_u && a.address_v == b.address_v && a.border == b.border && a.mip_filter == b.mip_filter &&
          __builtin_memcmp(&a.lod_bias, &b.lod_bias, 4) == 0 && __builtin_memcmp(&a.min_lod, &b.min_lod, 4) == 0 && __builtin_memcmp(&a.max_lod, &b.max_lod, 4) == 0 &&
-         a.max_anisotropy == b.max_anisotropy && a.custom_border == b.custom_border && __builtin_memcmp(a.border_rgba, b.border_rgba, 16) == 0;
+         a.max_anisotropy == b.max_anisotropy && a.custom_border == b.custom_border && __builtin_memcmp(a.border_rgba, b.border_rgba, 16) == 0 &&
+         magnification_filter(a) == magnification_filter(b) && a.reduction == b.reduction && a.unnormalized == b.unnormalized;
 }
 float clamp_lod(float v, float lo, float hi) { return !(v >= lo) ? lo : v > hi ? hi : v; }
 }  // namespace
@@ -513,9 +520,12 @@ float clamp_lod(float v, float lo, float hi) { return !(v >= lo) ? lo : v > hi ?
 VkSampler VenusDevice::sampler_for(const SamplerDesc& d, bool integer) {
   for (const CachedSampler& c : samplers_)
     if (c.integer == integer && same_sampler(c.desc, d)) return c.sampler;
+  // (coordinates in texels are not offered: Vulkan's unnormalized samplers take no levels, borders or offsets; reductions need the host's samplerFilterMinmax)
+  if (d.unnormalized || (d.reduction != SamplerReduction::Weighted && !ctx_.caps().sampler_minmax)) return nullptr;
   VkSamplerCreateInfo si = vk_struct<VkSamplerCreateInfo>(VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO);
   const bool linear = d.filter == Filter::Linear && !integer;
-  si.magFilter = si.minFilter = linear ? VK_FILTER_LINEAR : VK_FILTER_NEAREST;
+  si.minFilter = linear ? VK_FILTER_LINEAR : VK_FILTER_NEAREST;
+  si.magFilter = magnification_filter(d) == Filter::Linear && !integer ? VK_FILTER_LINEAR : VK_FILTER_NEAREST;   // (kFeature2SeparateFilters)
   si.mipmapMode = d.mip_filter == MipFilter::Linear && !integer ? VK_SAMPLER_MIPMAP_MODE_LINEAR : VK_SAMPLER_MIPMAP_MODE_NEAREST;
   si.addressModeU = address_mode(d.address_u);
   si.addressModeV = address_mode(d.address_v);
@@ -533,6 +543,11 @@ VkSampler VenusDevice::sampler_for(const SamplerDesc& d, bool integer) {
     const float most = ctx_.caps().max_anisotropy < 16 ? ctx_.caps().max_anisotropy : 16;
     si.maxAnisotropy = d.max_anisotropy > most ? most : d.max_anisotropy;
   }
+  VkSamplerReductionModeCreateInfo reduction = vk_struct<VkSamplerReductionModeCreateInfo>(VK_STRUCTURE_TYPE_SAMPLER_REDUCTION_MODE_CREATE_INFO);
+  if (d.reduction != SamplerReduction::Weighted) {   // (kFeature2SamplerReductions: the least or greatest of the texels the filter reads)
+    reduction.reductionMode = d.reduction == SamplerReduction::Minimum ? VK_SAMPLER_REDUCTION_MODE_MIN : VK_SAMPLER_REDUCTION_MODE_MAX;
+    si.pNext = &reduction;
+  }
   VkSamplerCustomBorderColorCreateInfoEXT custom = vk_struct<VkSamplerCustomBorderColorCreateInfoEXT>(VK_STRUCTURE_TYPE_SAMPLER_CUSTOM_BORDER_COLOR_CREATE_INFO_EXT);
   const bool border = d.address_u == AddressMode::ClampToBorder || d.address_v == AddressMode::ClampToBorder;
   if (border) {
@@ -540,6 +555,7 @@ VkSampler VenusDevice::sampler_for(const SamplerDesc& d, bool integer) {
       si.borderColor = integer ? VK_BORDER_COLOR_INT_CUSTOM_EXT : VK_BORDER_COLOR_FLOAT_CUSTOM_EXT;
       __builtin_memcpy(custom.customBorderColor.uint32, d.border_rgba, 16);   // (the 32-bit patterns as given: integer textures see the integer bits)
       custom.format = VK_FORMAT_UNDEFINED;
+      custom.pNext = si.pNext;
       si.pNext = &custom;
     } else {
       const BorderColor b = d.border;
@@ -562,7 +578,6 @@ VkSampler VenusDevice::sampler_for(const SamplerDesc& d, bool integer) {
 // ---- buffers -----------------------------------------------------------------------------------------------------------------------------------------
 IBuffer* VenusDevice::create_buffer(uint64_t size, uint32_t usage) {
   if (size == 0 || size > 0x7FFFFFFFu) return nullptr;
-  (void)usage;
   VkBufferUsageFlags u = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT |
                          VK_BUFFER_USAGE_UNIFORM_TEXEL_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_TEXEL_BUFFER_BIT | VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT;
   if (ctx_.caps().transform_feedback) u |= VK_BUFFER_USAGE_TRANSFORM_FEEDBACK_BUFFER_BIT_EXT | VK_BUFFER_USAGE_TRANSFORM_FEEDBACK_COUNTER_BUFFER_BIT_EXT;
@@ -570,7 +585,9 @@ IBuffer* VenusDevice::create_buffer(uint64_t size, uint32_t usage) {
   void* memory = allocator_.allocate_aligned(sizeof(VenusBuffer), alignof(VenusBuffer));
   if (!memory) return nullptr;
   VenusBuffer* b = new (memory) VenusBuffer(*this, size);
-  if (!make_memory(size, u, &b->memory_)) {
+  // (a stream output buffer has a word more than it shows: a binding to its very end is bound one byte longer, Replay::begin_stream_output)
+  const uint64_t room = (usage & kBufferStreamOutput) ? size + 4 : size;
+  if (!make_memory(room, u, &b->memory_)) {
     b->~VenusBuffer();
     allocator_.deallocate(memory);
     return nullptr;
@@ -914,6 +931,110 @@ bool VenusImage::write_compressed(uint32_t level, uint32_t layer, ConstByteView 
   VenusMemory* s = device_.staging(blocks.size());
   if (!s || !ByteView(s->map, blocks.size()).copy_from(blocks)) return false;
   return copy(true, level, layer, (width + 3) & ~3u);
+}
+
+// ---- the planes of depth images and whole subresources (kFeature2DepthCopies) ----------------------------------------------------------------------
+namespace {
+// What came before (the host's writes included) is done and visible to the copies that follow.
+void barrier_before_copies(const TcosKernelVulkan& vk, VkCommandBuffer cb) {
+  VkMemoryBarrier2 mb = vk_struct<VkMemoryBarrier2>(VK_STRUCTURE_TYPE_MEMORY_BARRIER_2);
+  mb.srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_2_HOST_BIT, mb.srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT | VK_ACCESS_2_HOST_WRITE_BIT;
+  mb.dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, mb.dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT;
+  VkDependencyInfo di = vk_struct<VkDependencyInfo>(VK_STRUCTURE_TYPE_DEPENDENCY_INFO);
+  di.memoryBarrierCount = 1, di.pMemoryBarriers = &mb;
+  vk.CmdPipelineBarrier2(cb, &di);
+}
+}  // namespace
+
+bool VenusImage::depth_planes_ok(uint32_t level, uint32_t layer, uint64_t depth, uint64_t stencil) const {
+  if (desc_.format != Format::D32Float || desc_.samples != 1 || level >= desc_.mip_levels || layer >= level_layers(level)) return false;
+  const uint64_t count = uint64_t{mip_extent(desc_.extent.width, level)} * mip_extent(desc_.extent.height, level);
+  return (depth == 0 || depth == count) && (stencil == 0 || (stencil == count && desc_.stencil)) && (depth != 0 || stencil != 0);
+}
+
+bool VenusImage::copy_planes(bool to_image, uint32_t level, uint32_t layer, bool depth, bool stencil, uint64_t stencil_offset) {
+  const uint32_t width = mip_extent(desc_.extent.width, level), height = mip_extent(desc_.extent.height, level);
+  VenusMemory* staging = device_.staging(0);
+  if (!staging) return false;
+  VkBufferImageCopy regions[2] = {};
+  uint32_t n = 0;
+  for (uint32_t plane = 0; plane < 2; ++plane) {
+    if (plane == 0 ? !depth : !stencil) continue;
+    VkBufferImageCopy& r = regions[n++];
+    r.bufferOffset = plane == 0 ? 0 : stencil_offset;   // (rows tightly packed: 4 bytes a texel of depth, 1 of stencil)
+    r.imageSubresource = {static_cast<VkImageAspectFlags>(plane == 0 ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_STENCIL_BIT), level, layer, 1};
+    r.imageExtent = {width, height, 1};
+  }
+  const TcosKernelVulkan& vk = device_.vk();
+  VkImage image = image_;
+  VkBuffer buffer = staging->buffer;
+  return device_.run_once([&](VkCommandBuffer cb) {
+    barrier_before_copies(vk, cb);
+    if (to_image) vk.CmdCopyBufferToImage(cb, buffer, image, VK_IMAGE_LAYOUT_GENERAL, n, regions);
+    else vk.CmdCopyImageToBuffer(cb, image, VK_IMAGE_LAYOUT_GENERAL, buffer, n, regions);
+  });
+}
+
+bool VenusImage::read_depth_subresource(uint32_t level, uint32_t layer, ArrayView<float> depth, ArrayView<uint8_t> stencil) {
+  if (!depth_planes_ok(level, layer, depth.size(), stencil.size())) return false;
+  kernel::ScopedMutex staged(device_.staging_lock());
+  const uint64_t count = depth.empty() ? stencil.size() : depth.size();
+  const uint64_t stencil_offset = (count * 4 + 3) & ~uint64_t{3};   // (a stencil region's offset is a multiple of 4)
+  VenusMemory* s = device_.staging(stencil_offset + count);
+  if (!s || !copy_planes(false, level, layer, !depth.empty(), !stencil.empty(), stencil_offset)) return false;
+  ByteReader in{ConstByteView(s->map, s->size)};
+  for (float& d : depth) d = __builtin_bit_cast(float, in.le32());
+  if (!stencil.empty()) {
+    ConstByteView plane;
+    if (!ConstByteView(s->map, s->size).try_subview(stencil_offset, count, &plane)) return false;
+    ByteView(stencil.data(), stencil.size()).copy_from(plane);
+  }
+  return in.ok();
+}
+
+bool VenusImage::write_depth_subresource(uint32_t level, uint32_t layer, ArrayView<const float> depth, ArrayView<const uint8_t> stencil) {
+  if (!depth_planes_ok(level, layer, depth.size(), stencil.size())) return false;
+  kernel::ScopedMutex staged(device_.staging_lock());
+  const uint64_t count = depth.empty() ? stencil.size() : depth.size();
+  const uint64_t stencil_offset = (count * 4 + 3) & ~uint64_t{3};
+  VenusMemory* s = device_.staging(stencil_offset + count);
+  if (!s) return false;
+  ByteWriter out{ByteView(s->map, s->size)};
+  for (const float v : depth) out.le32(__builtin_bit_cast(uint32_t, !(v == v) ? 0.0f : v < 0.0f ? 0.0f : v > 1.0f ? 1.0f : v));   // (a depth image keeps 0 .. 1)
+  if (!out.ok()) return false;
+  if (!stencil.empty()) {
+    ByteView plane;
+    if (!ByteView(s->map, s->size).try_subview(stencil_offset, count, &plane) || !plane.copy_from(ConstByteView(stencil.data(), stencil.size()))) return false;
+  }
+  // (one plane of two: Vulkan copies each aspect by itself, so the other keeps what it had)
+  return copy_planes(true, level, layer, !depth.empty(), !stencil.empty(), stencil_offset);
+}
+
+// A whole subresource of another image of this device: the same format, samples and size (the planes asked for of a depth image; a volume's layer is a slice).
+bool VenusImage::copy_subresource(IImage& source_image, uint32_t level, uint32_t layer, uint32_t source_level, uint32_t source_layer, uint32_t planes) {
+  VenusImage& from = static_cast<VenusImage&>(source_image);   // (the kernel copies between images of one device)
+  const bool depth = desc_.format == Format::D32Float;
+  const uint32_t width = mip_extent(desc_.extent.width, level), height = mip_extent(desc_.extent.height, level);
+  if (from.desc_.format != desc_.format || from.desc_.samples != desc_.samples || from.desc_.stencil != desc_.stencil || from.desc_.kind != desc_.kind ||
+      level >= desc_.mip_levels || layer >= level_layers(level) || source_level >= from.desc_.mip_levels || source_layer >= from.level_layers(source_level) ||
+      mip_extent(from.desc_.extent.width, source_level) != width || mip_extent(from.desc_.extent.height, source_level) != height || planes == 0 || planes > 3 ||
+      (!depth && planes != 1) || ((planes & 2) && !desc_.stencil) || (&from == this && level == source_level && layer == source_layer))
+    return false;
+  const VkImageAspectFlags depth_aspect = VK_IMAGE_ASPECT_DEPTH_BIT, stencil_aspect = VK_IMAGE_ASPECT_STENCIL_BIT, color_aspect = VK_IMAGE_ASPECT_COLOR_BIT;
+  const VkImageAspectFlags aspect = depth ? ((planes & 1) ? depth_aspect : 0u) | ((planes & 2) ? stencil_aspect : 0u) : color_aspect;
+  const bool volume = desc_.kind == TextureKind::Texture3D;
+  VkImageCopy region{};
+  region.srcSubresource = {aspect, source_level, volume ? 0u : source_layer, 1};
+  region.srcOffset = {0, 0, volume ? static_cast<int32_t>(source_layer) : 0};
+  region.dstSubresource = {aspect, level, volume ? 0u : layer, 1};
+  region.dstOffset = {0, 0, volume ? static_cast<int32_t>(layer) : 0};
+  region.extent = {width, height, 1};
+  const TcosKernelVulkan& vk = device_.vk();
+  VkImage src = from.image_, dst = image_;
+  return device_.run_once([&](VkCommandBuffer cb) {
+    barrier_before_copies(vk, cb);
+    vk.CmdCopyImage(cb, src, VK_IMAGE_LAYOUT_GENERAL, dst, VK_IMAGE_LAYOUT_GENERAL, 1, &region);
+  });
 }
 
 // Every level above 0 from the one before it, by linear blits (Vulkan's box filter for a halving): every layer its own chain, a volume's levels from its slices.

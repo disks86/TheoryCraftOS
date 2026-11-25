@@ -36,6 +36,7 @@ class VenusBuffer final : public IBuffer {
   void unmap() override {}   // (host-coherent memory: the GPU sees what was written)
   bool read_back() override { return true; }   // (submit waits for the GPU and makes its writes visible to the host)
   VkBuffer buffer() const { return memory_.buffer; }
+  uint64_t room() const { return memory_.size; }   // (the memory behind it: a stream output buffer's is a word more than size())
 
  private:
   friend class VenusDevice;
@@ -71,6 +72,9 @@ class VenusImage final : public IImage {
   bool write_subresource_float(uint32_t level, uint32_t layer, ArrayView<const Vec4> pixels) override;
   bool read_subresource_float(uint32_t level, uint32_t layer, ArrayView<Vec4> out) override;
   bool generate_mipmaps() override;
+  bool read_depth_subresource(uint32_t level, uint32_t layer, ArrayView<float> depth, ArrayView<uint8_t> stencil) override;
+  bool write_depth_subresource(uint32_t level, uint32_t layer, ArrayView<const float> depth, ArrayView<const uint8_t> stencil) override;
+  bool copy_subresource(IImage& source, uint32_t level, uint32_t layer, uint32_t source_level, uint32_t source_layer, uint32_t planes) override;
 
   const ImageDesc& desc() const { return desc_; }
   VkImage image() const { return image_; }
@@ -91,6 +95,9 @@ class VenusImage final : public IImage {
   bool stage_wide(ArrayView<const Vec4> pixels);
   bool unstage_wide(ArrayView<Vec4> out);
   bool transferable(uint32_t level, uint32_t layer, uint64_t count) const;
+  // The planes of a depth image between the image and the staging buffer: the depth as 32-bit floats from offset 0, the stencil bytes from `stencil_offset`.
+  bool depth_planes_ok(uint32_t level, uint32_t layer, uint64_t depth, uint64_t stencil) const;
+  bool copy_planes(bool to_image, uint32_t level, uint32_t layer, bool depth, bool stencil, uint64_t stencil_offset);
   Format kept_format() const;
 
   struct View {

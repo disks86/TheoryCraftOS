@@ -91,6 +91,8 @@ namespace { TRAMPOLINE(CmdDispatch, void, (VkCommandBuffer commandBuffer, uint32
 namespace { TRAMPOLINE(CmdDispatchIndirect, void, (VkCommandBuffer commandBuffer, VkBuffer buffer, VkDeviceSize offset), (commandBuffer, buffer, offset)) }
 namespace { TRAMPOLINE(CmdSetViewport, void, (VkCommandBuffer commandBuffer, uint32_t firstViewport, uint32_t viewportCount, const VkViewport* pViewports), (commandBuffer, firstViewport, viewportCount, pViewports)) }
 namespace { TRAMPOLINE(CmdSetScissor, void, (VkCommandBuffer commandBuffer, uint32_t firstScissor, uint32_t scissorCount, const VkRect2D* pScissors), (commandBuffer, firstScissor, scissorCount, pScissors)) }
+namespace { TRAMPOLINE(CmdSetDepthBounds, void, (VkCommandBuffer commandBuffer, float minDepthBounds, float maxDepthBounds), (commandBuffer, minDepthBounds, maxDepthBounds)) }
+namespace { TRAMPOLINE(CmdSetDepthBoundsTestEnable, void, (VkCommandBuffer commandBuffer, VkBool32 depthBoundsTestEnable), (commandBuffer, depthBoundsTestEnable)) }
 namespace { TRAMPOLINE(CmdSetStencilReference, void, (VkCommandBuffer commandBuffer, VkStencilFaceFlags faceMask, uint32_t reference), (commandBuffer, faceMask, reference)) }
 namespace { TRAMPOLINE(CmdSetStencilCompareMask, void, (VkCommandBuffer commandBuffer, VkStencilFaceFlags faceMask, uint32_t compareMask), (commandBuffer, faceMask, compareMask)) }
 namespace { TRAMPOLINE(CmdSetStencilWriteMask, void, (VkCommandBuffer commandBuffer, VkStencilFaceFlags faceMask, uint32_t writeMask), (commandBuffer, faceMask, writeMask)) }
@@ -221,6 +223,8 @@ static void fill_table(TcosKernelVulkan* t) {
   t->CmdDispatchIndirect = t_CmdDispatchIndirect;
   t->CmdSetViewport = t_CmdSetViewport;
   t->CmdSetScissor = t_CmdSetScissor;
+  t->CmdSetDepthBounds = t_CmdSetDepthBounds;
+  t->CmdSetDepthBoundsTestEnable = t_CmdSetDepthBoundsTestEnable;
   t->CmdSetStencilReference = t_CmdSetStencilReference;
   t->CmdSetStencilCompareMask = t_CmdSetStencilCompareMask;
   t->CmdSetStencilWriteMask = t_CmdSetStencilWriteMask;

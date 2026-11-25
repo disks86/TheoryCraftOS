@@ -115,6 +115,12 @@ compositor, the windows of Wayland and X11 clients, and the Vulkan driver's Dire
   host ticks times `timestampPeriod`; stream output is transform feedback whose counter is seeded with the binding's offset, so appends across draws and pipelines work;
   resolves are vkCmdResolveImage (through a scratch image and a blit when the formats differ), a rendering resolve from sample 0 for depth, and an internal TGSI pipeline
   for the least or greatest sample.
+* **Gap pass 4** (Direct3D's later state): the planes of depth images and whole subresources of depth and multisampled images (`kFeature2DepthCopies`: copies of
+  each aspect through the staging buffer, `vkCmdCopyImage`), copies of samples (`kFeature2SampleCopies`), a magnification filter of its own
+  (`kFeature2SeparateFilters`), min / max reductions (`kFeature2SamplerReductions`, samplerFilterMinmax), Direct3D's line modes (`kFeature2LineModes`:
+  VK_EXT_line_rasterization's smooth lines for alpha-antialiased ones, rectangular lines 1.4 and 1.0 pixels wide for the quadrilateral ones), the depth bounds test
+  (`kFeature2DepthBounds`, dynamic state), a stream output binding's end (the transform feedback binding's size), and pipeline statistics that leave out a
+  stand-in pixel shader (`stand_in_fragment`: the draw has a statistics segment of its own whose PsInvocations are not added).
 * **present()** copies the image into the virtio-gpu's 2D screen (`blit` + `present` of the display driver), one copy through guest memory per frame.
 * **Which device** (`RenderNode::build_venus`): with `TCOS_GPU_BACKEND=AUTO` (the default) the Venus device is used when it opens, draws the self-test picture and offers
   every feature and limit that a virgl device on the same host would (a virgl device is made for the comparison and given back) and the host has every extension the
@@ -192,7 +198,13 @@ Gaps of the kernel's Venus device:
   image exported as a dma-buf).
 * Images are always in the GENERAL layout (no compression a driver keeps for attachment layouts); barriers are full memory barriers at every pass, dispatch and storing
   draw, not the narrow ones Vulkan allows.
-* As on virgl: depth resolves to the least or greatest sample are not offered (`kFeatureResolveModes`).
+* As on virgl: depth resolves to the least or greatest sample are not offered (`kFeatureResolveModes`), nor coordinates in texels
+  (`kFeature2UnnormalizedCoordinates`: Vulkan's unnormalized samplers take no levels, borders or offsets, which Direct3D's do).
+* Not offered yet, though the host's Vulkan has them (each needs the TGSI text to carry something it does not say, or more state through the replay): programmable
+  sample positions (`kFeature2SamplePositions`, VK_EXT_sample_locations' dynamic locations and the depth buffer's own), view instancing (`kFeature2ViewInstancing`,
+  SV_ViewID / multiview), coarse shading (`kFeature2ShadingRate`, VK_KHR_fragment_shading_rate), barycentrics (`kFeature2Barycentrics`,
+  VK_KHR_fragment_shader_barycentric) and residency feedback (`kFeature2TileResidency`, sparse residency). The device does not offer them, so the Direct3D layer
+  reports the lower tiers, and a command for one of them fails the submit.
 * What the host's Vulkan lacks is not offered (each feature follows `VenusCaps`); a host without `VK_EXT_sample_locations` refuses pipelines that turn multisampling off on
   a multisampled target, one without `VK_EXT_depth_bias_control`'s float representation the depth bias of normalised depth formats, one without
   `VK_EXT_provoking_vertex` the GL translator's flat varyings. AUTO keeps virgl on such a host (`parity_gaps`); `TCOS_GPU_BACKEND=VENUS` takes Venus anyway.
