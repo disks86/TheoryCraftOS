@@ -128,19 +128,19 @@ class SoftwareBuffer final : public IBuffer {
 
 class SoftwareImage final : public IImage {
  public:
+  // The storage holds every level one after the other, and in each level its layers (a volume's level: its slices) one after the other, each width * height * samples values (a
+  // multisampled image keeps its samples one after the other for each pixel).
   SoftwareImage(allocators::IAllocator& allocator, const ImageDesc& desc) : allocator_(allocator), desc_(desc) {
-    const uint64_t count = uint64_t{desc.extent.width} * desc.extent.height * desc.samples;   // (a multisampled image keeps its samples one after the other for each pixel)
-    uint64_t total = count * layer_count();   // (layers: one level each)
-    // The levels of a mipmapped image follow level 0 in the same storage, each as tight rows.
-    for (uint32_t level = 1; level < desc.mip_levels && level < kMaxMipLevels; ++level) {
+    uint64_t total = 0;
+    for (uint32_t level = 0; level < desc.mip_levels && level < kMaxMipLevels; ++level) {
       level_offset_[level] = total;
-      total += uint64_t{mip_extent(desc.extent.width, level)} * mip_extent(desc.extent.height, level);
+      total += level_pixels(level) * level_layers(level);
     }
     if (desc.format == Format::D32Float) {
-      depth_ = allocate_view<float>(allocator, count * layer_count());   // (a layered depth image: its layers one after the other)
-      if (desc.stencil) stencil_ = allocate_view<uint8_t>(allocator, count * layer_count());
+      depth_ = allocate_view<float>(allocator, total);
+      if (desc.stencil) stencil_ = allocate_view<uint8_t>(allocator, total);
     } else if (is_wide_format(desc.format)) {
-      if (desc.mip_levels == 1) hdr_ = allocate_view<Vec4>(allocator, count * layer_count());   // (an array: its layers one after the other)
+      hdr_ = allocate_view<Vec4>(allocator, total);
     } else if (desc.format != Format::Undefined) {
       color_ = allocate_view<uint32_t>(allocator, total);
     }
@@ -158,67 +158,66 @@ class SoftwareImage final : public IImage {
   bool valid() const { return (!color_.empty() || !hdr_.empty() || !depth_.empty()) && (!desc_.stencil || !stencil_.empty()); }
   uint32_t mip_levels() const override { return desc_.mip_levels; }
   uint32_t samples() const { return desc_.samples; }
-  ArrayView<uint32_t> all_samples() const { return color_; }
-  uint32_t layer_count() const override { return desc_.kind == TextureKind::Texture2D ? 1 : desc_.kind == TextureKind::TextureCube ? 6 : desc_.layers; }
+  // (the values of level 0: every sample of every pixel of its layers)
+  ArrayView<uint32_t> all_samples() const { return color_.empty() ? color_ : color_.first(level_pixels(0) * level_layers(0)); }
+  uint32_t layer_count() const override { return image_layer_count(desc_.kind, desc_.layers); }
+  // The layers of level `level` (a volume's slices at that level).
+  uint32_t level_layers(uint32_t level) const { return level_layer_count(desc_.kind, desc_.layers, level); }
+  bool has(uint32_t level, uint32_t layer) const { return level < desc_.mip_levels && layer < level_layers(level); }
+  Extent2D level_extent(uint32_t level) const { return {mip_extent(desc_.extent.width, level), mip_extent(desc_.extent.height, level)}; }
   TextureKind kind() const { return desc_.kind; }
-  bool write_layer_pixels(uint32_t layer, ArrayView<const uint32_t> pixels) override {
-    if (color_.empty() || layer >= layer_count() || desc_.mip_levels != 1) return false;
-    const Surface s = surface(0, layer);
+
+  // --- what the memory manager fills and reads
+  bool write_subresource(uint32_t level, uint32_t layer, ArrayView<const uint32_t> pixels) override {
+    if (color_.empty() || desc_.samples != 1 || !has(level, layer)) return false;
+    const Surface s = surface(level, layer);
     if (pixels.size() != uint64_t{s.width} * s.height) return false;
     for (uint64_t i = 0; i < pixels.size(); ++i) s.pixels[i] = s.encode(pixels[i]);
     return true;
   }
-  bool write_layer_pixels_float(uint32_t layer, ArrayView<const Vec4> pixels) override {
-    if (hdr_.empty() || desc_.kind == TextureKind::Texture2D || layer >= layer_count()) return false;
-    const uint64_t count = uint64_t{desc_.extent.width} * desc_.extent.height;
-    if (pixels.size() != count) return false;
-    const ArrayView<Vec4> to = hdr_.subview(layer * count, count);
-    for (uint64_t i = 0; i < count; ++i) to[i] = store_float(pixels[i]);
-    return true;
-  }
-  bool read_layer_pixels_float(uint32_t layer, ArrayView<Vec4> out) override {
-    if (hdr_.empty() || layer >= layer_count()) return false;
-    const uint64_t count = uint64_t{desc_.extent.width} * desc_.extent.height;
-    if (out.size() < count) return false;
-    return out.first(count).copy_from(ArrayView<const Vec4>(hdr_.subview(layer * count, count).data(), count));
-  }
-  bool read_mip_pixels(uint32_t level, ArrayView<uint32_t> out) override {
-    if (color_.empty() || level >= desc_.mip_levels || desc_.samples != 1) return false;
-    const Surface s = surface(level);
+  bool read_subresource(uint32_t level, uint32_t layer, ArrayView<uint32_t> out) override {
+    if (color_.empty() || desc_.samples != 1 || !has(level, layer)) return false;
+    const Surface s = surface(level, layer);
     const uint64_t count = uint64_t{s.width} * s.height;
     if (out.size() < count) return false;
     for (uint64_t i = 0; i < count; ++i) out[i] = s.decode(s.pixels[i]);
     return true;
   }
-  bool read_layer_pixels(uint32_t layer, ArrayView<uint32_t> out) override {
-    if (color_.empty() || layer >= layer_count() || desc_.mip_levels != 1) return false;
-    const Surface s = surface(0, layer);
-    if (out.size() < uint64_t{s.width} * s.height) return false;
-    for (uint64_t i = 0; i < uint64_t{s.width} * s.height; ++i) out[i] = s.decode(s.pixels[i]);
+  bool write_subresource_float(uint32_t level, uint32_t layer, ArrayView<const Vec4> pixels) override {
+    if (hdr_.empty() || !has(level, layer)) return false;
+    const Surface s = surface(level, layer);
+    if (pixels.size() != uint64_t{s.width} * s.height) return false;
+    for (uint64_t i = 0; i < pixels.size(); ++i) s.floats[i] = store_float(pixels[i]);
     return true;
   }
+  bool read_subresource_float(uint32_t level, uint32_t layer, ArrayView<Vec4> out) override {
+    if (hdr_.empty() || !has(level, layer)) return false;
+    const Surface s = surface(level, layer);
+    const uint64_t count = uint64_t{s.width} * s.height;
+    if (out.size() < count) return false;
+    for (uint64_t i = 0; i < count; ++i) out[i] = s.floats[i];
+    return true;
+  }
+  bool write_layer_pixels(uint32_t layer, ArrayView<const uint32_t> pixels) override { return write_subresource(0, layer, pixels); }
+  bool read_layer_pixels(uint32_t layer, ArrayView<uint32_t> out) override { return read_subresource(0, layer, out); }
+  bool write_layer_pixels_float(uint32_t layer, ArrayView<const Vec4> pixels) override { return desc_.kind != TextureKind::Texture2D && write_subresource_float(0, layer, pixels); }
+  bool read_layer_pixels_float(uint32_t layer, ArrayView<Vec4> out) override { return read_subresource_float(0, layer, out); }
+  bool write_mip_pixels(uint32_t level, ArrayView<const uint32_t> pixels) override { return write_subresource(level, 0, pixels); }
+  bool read_mip_pixels(uint32_t level, ArrayView<uint32_t> out) override { return read_subresource(level, 0, out); }
   Extent2D extent() const override { return desc_.extent; }
   Format format() const override { return desc_.format; }
   uint32_t usage() const { return desc_.usage; }
   bool read_pixels(ArrayView<uint32_t> out) override {
-    const uint64_t count = uint64_t{desc_.extent.width} * desc_.extent.height;
+    const uint64_t count = level_pixels(0);
     if (color_.empty() || out.size() < count || desc_.samples > 1) return false;   // (a multisampled image is resolved first)
-    Surface s = surface();
-    if (s.format != Format::R8G8B8A8Unorm && s.format != Format::R8G8B8A8Srgb) return out.copy_from(ArrayView<const uint32_t>(color_.data(), count));   // (stored as it is read: one copy)
+    const Surface s = surface();
+    if (s.format != Format::R8G8B8A8Unorm && s.format != Format::R8G8B8A8Srgb) return out.first(count).copy_from(ArrayView<const uint32_t>(color_.data(), count));   // (stored as it is read: one copy)
     for (uint64_t i = 0; i < count; ++i) out[i] = s.decode(color_[i]);
     return true;
   }
-  bool write_pixels(ArrayView<const uint32_t> pixels) override { return desc_.samples == 1 && write_mip_pixels(0, pixels); }
-  bool read_pixels_float(ArrayView<Vec4> out) override {
-    if (hdr_.empty() || layer_count() != 1 || out.size() < hdr_.size()) return false;
-    for (uint64_t i = 0; i < hdr_.size(); ++i) out[i] = hdr_[i];
-    return true;
-  }
-  bool write_pixels_float(ArrayView<const Vec4> pixels) override {
-    if (hdr_.empty() || layer_count() != 1 || pixels.size() != hdr_.size()) return false;
-    for (uint64_t i = 0; i < hdr_.size(); ++i) hdr_[i] = store_float(pixels[i]);
-    return true;
-  }
+  bool write_pixels(ArrayView<const uint32_t> pixels) override { return write_subresource(0, 0, pixels); }
+  bool read_pixels_float(ArrayView<Vec4> out) override { return layer_count() == 1 && read_subresource_float(0, 0, out); }
+  bool write_pixels_float(ArrayView<const Vec4> pixels) override { return layer_count() == 1 && write_subresource_float(0, 0, pixels); }
   // What a pixel of this image keeps of a colour (WidePixels.hpp).
   Vec4 store_float(Vec4 c) const { return quantize_wide_pixel(desc_.format, c); }
   bool write_rect(const Rect2D& area, ArrayView<const uint32_t> pixels, uint32_t pitch) override {
@@ -231,68 +230,79 @@ class SoftwareImage final : public IImage {
       for (uint32_t i = 0; i < area.width; ++i) s.pixels[uint64_t{static_cast<uint32_t>(area.y) + j} * s.pitch + static_cast<uint32_t>(area.x) + i] = s.encode(pixels[uint64_t{j} * pitch + i]);
     return true;
   }
-  bool write_mip_pixels(uint32_t level, ArrayView<const uint32_t> pixels) override {
-    if (color_.empty() || level >= desc_.mip_levels) return false;
-    const Surface s = surface(level);
-    const uint64_t count = uint64_t{s.width} * s.height;
-    if (pixels.size() != count) return false;
-    for (uint64_t i = 0; i < count; ++i) s.pixels[i] = s.encode(pixels[i]);
-    return true;
-  }
+  // Each level from the one before it: a 2 x 2 box of the same layer (an array's, a cube's), or of a volume the 2 x 2 x 2 box of the two slices at twice the slice's depth (the last
+  // repeated where the level before has an odd number). 8-bit colours average their codes to the nearest (an sRGB image's chain is of its stored codes), wide ones their values
+  // (kept as the format keeps them).
   bool generate_mipmaps() override {
-    if (color_.empty() || desc_.mip_levels < 2) return false;
-    // (the box filter is applied to 0xAARRGGBB values, so the stored order is undone and redone around it)
+    if ((color_.empty() && hdr_.empty()) || desc_.mip_levels < 2 || desc_.samples != 1) return false;
+    const bool volume = desc_.kind == TextureKind::Texture3D;
+    const uint32_t taps = volume ? 8 : 4;
     for (uint32_t level = 1; level < desc_.mip_levels; ++level) {
-      const Surface src = surface(level - 1), dst = surface(level);
-      for (uint64_t i = 0; i < uint64_t{dst.width} * dst.height; ++i) {
-        const uint32_t y = static_cast<uint32_t>(i / dst.width), x = static_cast<uint32_t>(i % dst.width);
-        const uint32_t y0 = 2 * y < src.height ? 2 * y : src.height - 1, y1 = 2 * y + 1 < src.height ? 2 * y + 1 : src.height - 1;
-        const uint32_t x0 = 2 * x < src.width ? 2 * x : src.width - 1, x1 = 2 * x + 1 < src.width ? 2 * x + 1 : src.width - 1;
-        const uint32_t block[4] = {src.decode(src.pixels[uint64_t{y0} * src.width + x0]), src.decode(src.pixels[uint64_t{y0} * src.width + x1]),
-                                   src.decode(src.pixels[uint64_t{y1} * src.width + x0]), src.decode(src.pixels[uint64_t{y1} * src.width + x1])};
-        uint32_t averaged = 0;
-        mip_box_downsample(ArrayView<const uint32_t>(block, 4), 2, 2, ArrayView<uint32_t>(&averaged, 1), 1, 1);
-        dst.pixels[i] = dst.encode(averaged);
+      const uint32_t below = level_layers(level - 1);
+      for (uint32_t layer = 0; layer < level_layers(level); ++layer) {
+        const uint32_t z0 = volume ? (2 * layer < below ? 2 * layer : below - 1) : layer, z1 = volume ? (2 * layer + 1 < below ? 2 * layer + 1 : below - 1) : layer;
+        const Surface a = surface(level - 1, z0), b = surface(level - 1, z1), dst = surface(level, layer);
+        for (uint32_t y = 0; y < dst.height; ++y)
+          for (uint32_t x = 0; x < dst.width; ++x) {
+            const uint32_t y0 = 2 * y < a.height ? 2 * y : a.height - 1, y1 = 2 * y + 1 < a.height ? 2 * y + 1 : a.height - 1;
+            const uint32_t x0 = 2 * x < a.width ? 2 * x : a.width - 1, x1 = 2 * x + 1 < a.width ? 2 * x + 1 : a.width - 1;
+            const uint64_t at[4] = {uint64_t{y0} * a.width + x0, uint64_t{y0} * a.width + x1, uint64_t{y1} * a.width + x0, uint64_t{y1} * a.width + x1};
+            if (!hdr_.empty()) {
+              Vec4 sum = {0, 0, 0, 0};
+              for (uint64_t i : at) {
+                sum = sum + a.floats[i];
+                if (volume) sum = sum + b.floats[i];
+              }
+              dst.floats[uint64_t{y} * dst.width + x] = store_float(sum * (1.0f / static_cast<float>(taps)));
+              continue;
+            }
+            uint32_t sum[4] = {};
+            for (uint64_t i : at)
+              for (uint32_t c = 0; c < 4; ++c) {
+                sum[c] += (a.decode(a.pixels[i]) >> (8 * c)) & 0xFF;
+                if (volume) sum[c] += (b.decode(b.pixels[i]) >> (8 * c)) & 0xFF;
+              }
+            uint32_t averaged = 0;
+            for (uint32_t c = 0; c < 4; ++c) averaged |= ((sum[c] + taps / 2) / taps) << (8 * c);
+            dst.pixels[uint64_t{y} * dst.width + x] = dst.encode(averaged);
+          }
       }
     }
     return true;
   }
+  // Layer `layer` of level `level` (an empty surface for one the image does not have).
   Surface surface(uint32_t level = 0, uint32_t layer = 0) const {
     Surface s;
-    const uint64_t offset = level == 0 ? uint64_t{layer} * desc_.extent.width * desc_.extent.height : level_offset_[level];
+    s.format = desc_.format;
+    if (!has(level, layer)) return s;
+    const uint64_t count = level_pixels(level), offset = level_offset_[level] + uint64_t{layer} * count;
     s.width = mip_extent(desc_.extent.width, level);
     s.height = mip_extent(desc_.extent.height, level);
-    s.pitch = s.width * desc_.samples;
-    s.format = desc_.format;
-    if (!depth_.empty()) return s;   // (a depth image: its planes are depth_layer / stencil_layer, the surface only says the size)
-    if (!hdr_.empty()) s.floats = layer_count() == 1 ? hdr_ : hdr_.subview(uint64_t{layer} * desc_.extent.width * desc_.extent.height, uint64_t{desc_.extent.width} * desc_.extent.height);
-    else s.pixels = color_.subview(offset, uint64_t{s.width} * s.height);
+    if (!hdr_.empty()) s.floats = hdr_.subview(offset, count);
+    else if (!color_.empty()) s.pixels = color_.subview(offset, count);
     s.pitch = s.width * desc_.samples;   // (a multisampled image: the samples of a pixel are neighbours, so the pixel x is at x * samples)
-    s.format = desc_.format;
     return s;
   }
   ArrayView<float> depth() const { return depth_; }
   ArrayView<uint8_t> stencil() const { return stencil_; }
-  // The depth and stencil planes of one layer of a layered depth image (all its samples; empty for a layer it does not have).
-  ArrayView<float> depth_layer(uint32_t layer) const {
-    const uint64_t count = uint64_t{desc_.extent.width} * desc_.extent.height * desc_.samples;
-    return layer < layer_count() && !depth_.empty() ? depth_.subview(layer * count, count) : ArrayView<float>();
+  // The depth and stencil planes of one layer of a level of a depth image (all its samples; empty for a level or layer it does not have).
+  ArrayView<float> depth_layer(uint32_t layer, uint32_t level = 0) const {
+    return has(level, layer) && !depth_.empty() ? depth_.subview(level_offset_[level] + uint64_t{layer} * level_pixels(level), level_pixels(level)) : ArrayView<float>();
   }
-  ArrayView<uint8_t> stencil_layer(uint32_t layer) const {
-    const uint64_t count = uint64_t{desc_.extent.width} * desc_.extent.height * desc_.samples;
-    return layer < layer_count() && !stencil_.empty() ? stencil_.subview(layer * count, count) : ArrayView<uint8_t>();
+  ArrayView<uint8_t> stencil_layer(uint32_t layer, uint32_t level = 0) const {
+    return has(level, layer) && !stencil_.empty() ? stencil_.subview(level_offset_[level] + uint64_t{layer} * level_pixels(level), level_pixels(level)) : ArrayView<uint8_t>();
   }
 
  private:
+  uint64_t level_pixels(uint32_t level) const { return uint64_t{mip_extent(desc_.extent.width, level)} * mip_extent(desc_.extent.height, level) * desc_.samples; }
   allocators::IAllocator& allocator_;
   ImageDesc desc_;
   ArrayView<uint32_t> color_;
   ArrayView<Vec4> hdr_;   // the pixels of a float format
   ArrayView<float> depth_;
   ArrayView<uint8_t> stencil_;
-  uint64_t level_offset_[kMaxMipLevels] = {};   // (in pixels, from the start of level 0)
+  uint64_t level_offset_[kMaxMipLevels] = {};   // (in values, from the start of the storage)
 };
-
 class SoftwareShaderModule final : public IShaderModule {
  public:
   explicit SoftwareShaderModule(const ShaderModuleDesc& desc) : desc_(desc) {}
@@ -340,40 +350,90 @@ class SoftwarePipeline final : public IPipeline {
   FragmentShaderFnEx fragment_ex_;
 };
 
-// The textures bound for the draws being made, and the sampling itself (see SamplerDesc for what the coordinates mean).
+// The textures bound for the draws being made, and the sampling itself (see SamplerDesc for what the coordinates mean). A unit sees its image through a view (bind_texture_view): the
+// view's levels are the unit's levels 0 .., its layers the unit's layers, and its kind the kind the lookups take.
 class TextureSet final : public ITextureSet {
  public:
+  struct Bound {
+    const SoftwareImage* image = nullptr;
+    TextureKind kind = TextureKind::Texture2D;
+    uint32_t base_level = 0, levels = 1, first_layer = 0, layers = 1;
+  };
   void bind(uint32_t unit, const SoftwareImage* image, const SamplerDesc& sampler) {
-    images_[unit] = image;
+    Bound b;
+    b.image = image;
+    if (image) b.kind = image->kind(), b.levels = image->mip_levels(), b.layers = image->layer_count();
+    bound_[unit] = b;
     samplers_[unit] = sampler;
   }
-  const SoftwareImage* image(uint32_t unit) const { return unit < kMaxTextureUnits ? images_[unit] : nullptr; }
+  // The same through a view; false (and nothing bound) for a view the image cannot have.
+  bool bind_view(uint32_t unit, const SoftwareImage* image, const SamplerDesc& sampler, const TextureView& requested) {
+    TextureView view = requested;
+    if (view.level_count == 0 && view.base_level < image->mip_levels()) view.level_count = image->mip_levels() - view.base_level;
+    if (view.layer_count == 0 && view.first_layer < image->layer_count()) view.layer_count = image->layer_count() - view.first_layer;
+    if (!texture_view_fits(image->kind(), image->layer_count(), image->mip_levels(), view)) {
+      bound_[unit] = Bound();
+      return false;
+    }
+    Bound b;
+    b.image = image;
+    b.kind = view.kind;
+    b.base_level = view.base_level, b.levels = view.level_count;
+    b.first_layer = view.first_layer, b.layers = view.layer_count;
+    bound_[unit] = b;
+    samplers_[unit] = sampler;
+    return true;
+  }
+  const SoftwareImage* image(uint32_t unit) const { return unit < kMaxTextureUnits ? bound_[unit].image : nullptr; }
+  // Whether the view of `unit` shows any of the layers first .. first + count - 1 of level `level` of `image` (a pass that draws there may not sample it).
+  bool overlaps(uint32_t unit, const SoftwareImage* image, uint32_t level, uint32_t first, uint32_t count) const {
+    const Bound& b = bound_[unit];
+    if (!b.image || b.image != image || level < b.base_level || level >= b.base_level + b.levels) return false;
+    if (b.kind == TextureKind::Texture3D) return true;
+    return first < b.first_layer + b.layers && b.first_layer < first + count;
+  }
 
   // Whether any bound unit reads mip levels: only then does a pixel need its quad's derivatives.
   bool uses_lod() const {
     for (uint32_t unit = 0; unit < kMaxTextureUnits; ++unit)
-      if (images_[unit] && images_[unit]->mip_levels() > 1 && samplers_[unit].mip_filter != MipFilter::None) return true;
+      if (bound_[unit].image && bound_[unit].levels > 1 && samplers_[unit].mip_filter != MipFilter::None) return true;
     return false;
   }
-  // For the derivative passes: the next lookups record their first coordinate pair per unit and answer black.
+  // For the derivative passes: the next lookups record their first coordinates per unit and answer black.
   void start_recording() const {
     recording_ = true;
     for (uint32_t unit = 0; unit < kMaxTextureUnits; ++unit) recorded_[unit] = false;
   }
   void stop_recording() const { recording_ = false; }
-  bool recorded(uint32_t unit, float* u, float* v) const {
+  bool recorded(uint32_t unit, float* coord) const {
     if (unit >= kMaxTextureUnits || !recorded_[unit]) return false;
-    *u = record_u_[unit];
-    *v = record_v_[unit];
+    for (int k = 0; k < 3; ++k) coord[k] = record_[unit][k];
     return true;
   }
-  // The level of detail the pixel's lookups of `unit` use, from the coordinates recorded at the quad's anchor and at its right and lower neighbours.
-  void set_lod(uint32_t unit, const float anchor[2], const float right[2], const float below[2]) const {
-    if (unit >= kMaxTextureUnits || !images_[unit]) return;
+  // The level of detail the pixel's lookups of `unit` use, from the coordinates recorded at the quad's anchor and at its right and lower neighbours: (u, v) of a 2D image or an array, (u, v, w)
+  // of a volume, the direction of a cube (the points on the face the anchor's direction picks).
+  void set_lod(uint32_t unit, const float anchor[3], const float right[3], const float below[3]) const {
+    if (unit >= kMaxTextureUnits || !bound_[unit].image) return;
+    const Bound& b = bound_[unit];
     const SamplerDesc& sampler = samplers_[unit];
-    const float w = static_cast<float>(images_[unit]->extent().width), h = static_cast<float>(images_[unit]->extent().height);
-    const float dudx = (right[0] - anchor[0]) * w, dvdx = (right[1] - anchor[1]) * h, dudy = (below[0] - anchor[0]) * w, dvdy = (below[1] - anchor[1]) * h;
-    const float rho_x = dudx * dudx + dvdx * dvdx, rho_y = dudy * dudy + dvdy * dvdy;
+    const Extent2D e = b.image->level_extent(b.base_level);
+    const float w = static_cast<float>(e.width), h = static_cast<float>(e.height);
+    float dx[3] = {}, dy[3] = {};
+    if (b.kind == TextureKind::TextureCube || b.kind == TextureKind::TextureCubeArray) {
+      const uint32_t face = cube_face_of(anchor[0], anchor[1], anchor[2]);
+      float s0, t0, s1, t1, s2, t2;
+      cube_on_face(face, anchor[0], anchor[1], anchor[2], &s0, &t0);
+      cube_on_face(face, right[0], right[1], right[2], &s1, &t1);
+      cube_on_face(face, below[0], below[1], below[2], &s2, &t2);
+      dx[0] = (s1 - s0) * w, dx[1] = (t1 - t0) * h, dy[0] = (s2 - s0) * w, dy[1] = (t2 - t0) * h;
+    } else {
+      dx[0] = (right[0] - anchor[0]) * w, dx[1] = (right[1] - anchor[1]) * h, dy[0] = (below[0] - anchor[0]) * w, dy[1] = (below[1] - anchor[1]) * h;
+      if (b.kind == TextureKind::Texture3D) {
+        const float d = static_cast<float>(b.image->level_layers(b.base_level));
+        dx[2] = (right[2] - anchor[2]) * d, dy[2] = (below[2] - anchor[2]) * d;
+      }
+    }
+    const float rho_x = dx[0] * dx[0] + dx[1] * dx[1] + dx[2] * dx[2], rho_y = dy[0] * dy[0] + dy[1] * dy[1] + dy[2] * dy[2];
     const float rho2 = rho_x > rho_y ? rho_x : rho_y;   // (the square of rho: log2(rho) is half of log2(rho2))
     float lambda = 0.5f * mip_log2(rho2) + sampler.lod_bias;
     if (lambda < sampler.min_lod) lambda = sampler.min_lod;
@@ -385,91 +445,67 @@ class TextureSet final : public ITextureSet {
   }
 
   Vec4 sample_volume(uint32_t unit, float u, float v, float w) const override {
-    const SoftwareImage* image = image_for(unit);
-    if (!image) return {0, 0, 0, 1};
-    if (image->kind() == TextureKind::Texture2D) return sample(unit, u, v);
-    if (recording_) return {0, 0, 0, 1};
-    SamplerDesc sampler = samplers_[unit];
-    const uint32_t layers = image->layer_count();
-    w = unit_coordinate(w);
-    if (image->kind() == TextureKind::TextureCube) {
-      // The face is the axis the direction is longest along; the point on it is the other two components over that one (the usual table: +X looks along -z with t down -y, ...).
-      const float ax = u < 0 ? -u : u, ay = v < 0 ? -v : v, az = w < 0 ? -w : w;
-      float major, sc, tc;
-      uint32_t face;
-      if (ax >= ay && ax >= az) face = u >= 0 ? 0 : 1, major = ax, sc = u >= 0 ? -w : w, tc = -v;
-      else if (ay >= az) face = v >= 0 ? 2 : 3, major = ay, sc = u, tc = v >= 0 ? w : -w;
-      else face = w >= 0 ? 4 : 5, major = az, sc = w >= 0 ? u : -u, tc = -v;
-      if (!(major > 0.0f)) return texel_at(*image, 0, sampler, 0.5f, 0.5f);
-      sampler.address_u = sampler.address_v = AddressMode::ClampToEdge;
-      return texel_at(*image, face, sampler, (sc / major + 1.0f) * 0.5f, (tc / major + 1.0f) * 0.5f);
-    }
-    const float depth = static_cast<float>(layers);
-    if (image->kind() == TextureKind::Texture2DArray) {
-      int64_t layer = floor_to(w + 0.5f);
-      layer = layer < 0 ? 0 : layer >= layers ? layers - 1 : layer;
-      return texel_at(*image, static_cast<uint32_t>(layer), sampler, u, v);
-    }
-    // A volume: the slice the point lies in, or the two around it blended.
-    auto clamp_layer = [&](int64_t i) { return static_cast<uint32_t>(i < 0 ? 0 : i >= layers ? layers - 1 : i); };
-    if (sampler.filter == Filter::Nearest) return texel_at(*image, clamp_layer(floor_to(w * depth)), sampler, u, v);
-    const float fz = w * depth - 0.5f;
-    const int64_t z0 = floor_to(fz);
-    const float tz = fz - static_cast<float>(z0);
-    const Vec4 a = texel_at(*image, clamp_layer(z0), sampler, u, v), b = texel_at(*image, clamp_layer(z0 + 1), sampler, u, v);
-    return a * (1.0f - tz) + b * tz;
+    const Bound* b = bound_for(unit);
+    if (!b) return {0, 0, 0, 1};
+    if (b->kind == TextureKind::Texture2D) return sample(unit, u, v);
+    if (recording_) return record(unit, u, v, w);
+    return lookup(*b, samplers_[unit], u, v, w, 0.0f, lambda_[unit]);
+  }
+  Vec4 sample_cube_array(uint32_t unit, float x, float y, float z, float cube) const override {
+    const Bound* b = bound_for(unit);
+    if (!b) return {0, 0, 0, 1};
+    if (b->kind != TextureKind::TextureCubeArray) return sample_volume(unit, x, y, z);
+    if (recording_) return record(unit, x, y, z);
+    return lookup(*b, samplers_[unit], x, y, z, cube, lambda_[unit]);
   }
 
   Vec4 sample(uint32_t unit, float u, float v) const override {
-    const SoftwareImage* image = image_for(unit);
-    if (!image) return {0, 0, 0, 1};
-    if (recording_) {
-      if (!recorded_[unit]) {
-        recorded_[unit] = true;
-        record_u_[unit] = u;
-        record_v_[unit] = v;
-      }
-      return {0, 0, 0, 1};
-    }
-    return sample_with_lambda(*image, samplers_[unit], u, v, lambda_[unit]);
+    const Bound* b = bound_for(unit);
+    if (!b) return {0, 0, 0, 1};
+    if (recording_) return record(unit, u, v, 0.0f);
+    return lookup(*b, samplers_[unit], u, v, 0.0f, 0.0f, lambda_[unit]);
   }
 
   // An explicit level of detail: clamped as the derivatives' would be.
   Vec4 sample_lod(uint32_t unit, float u, float v, float lod) const override {
-    const SoftwareImage* image = image_for(unit);
-    if (!image) return {0, 0, 0, 1};
+    const Bound* b = bound_for(unit);
+    if (!b) return {0, 0, 0, 1};
     if (recording_) return sample(unit, u, v);
-    const SamplerDesc& sampler = samplers_[unit];
-    float lambda = lod == lod ? lod : 0.0f;
-    if (lambda < sampler.min_lod) lambda = sampler.min_lod;
-    if (lambda > sampler.max_lod) lambda = sampler.max_lod;
-    return sample_with_lambda(*image, sampler, u, v, lambda);
+    return lookup(*b, samplers_[unit], u, v, 0.0f, 0.0f, clamp_lod(samplers_[unit], lod));
+  }
+  Vec4 sample_lod_volume(uint32_t unit, float u, float v, float w, float lod) const override {
+    const Bound* b = bound_for(unit);
+    if (!b) return {0, 0, 0, 1};
+    if (b->kind == TextureKind::Texture2D) return sample_lod(unit, u, v, lod);
+    if (recording_) return record(unit, u, v, w);
+    return lookup(*b, samplers_[unit], u, v, w, 0.0f, clamp_lod(samplers_[unit], lod));
+  }
+  Vec4 sample_lod_cube_array(uint32_t unit, float x, float y, float z, float cube, float lod) const override {
+    const Bound* b = bound_for(unit);
+    if (!b) return {0, 0, 0, 1};
+    if (b->kind != TextureKind::TextureCubeArray) return sample_lod_volume(unit, x, y, z, lod);
+    if (recording_) return record(unit, x, y, z);
+    return lookup(*b, samplers_[unit], x, y, z, cube, clamp_lod(samplers_[unit], lod));
   }
 
   Vec4 fetch(uint32_t unit, int32_t x, int32_t y, uint32_t level) const override {
-    const SoftwareImage* image = image_for(unit);
-    if (!image || level >= image->mip_levels()) return {0, 0, 0, 0};
-    const Surface surface = image->surface(level);
-    if (x < 0 || y < 0 || static_cast<uint32_t>(x) >= surface.width || static_cast<uint32_t>(y) >= surface.height) return {0, 0, 0, 0};
-    return image_texel(*image, 0, surface, samplers_[unit].stencil, x, y);
-  }
-
-  Vec4 sample_lod_volume(uint32_t unit, float u, float v, float w, float lod) const override {
-    const SoftwareImage* image = image_for(unit);
-    if (image && image->kind() == TextureKind::Texture2D) return sample_lod(unit, u, v, lod);
-    return sample_volume(unit, u, v, w);
+    const Bound* b = bound_for(unit);
+    if (!b || level >= b->levels) return {0, 0, 0, 0};
+    const Plane plane = view_plane(*b, level, 0);
+    if (x < 0 || y < 0 || static_cast<uint32_t>(x) >= plane.surface.width || static_cast<uint32_t>(y) >= plane.surface.height) return {0, 0, 0, 0};
+    return image_texel(plane, samplers_[unit].stencil, x, y);
   }
   Vec4 fetch_volume(uint32_t unit, int32_t x, int32_t y, int32_t z, uint32_t level) const override {
-    const SoftwareImage* image = image_for(unit);
-    if (!image) return {0, 0, 0, 0};
-    if (image->kind() == TextureKind::Texture2D) return z == 0 ? fetch(unit, x, y, level) : Vec4{0, 0, 0, 0};
-    if (image->kind() == TextureKind::TextureCube || level != 0 || z < 0 || static_cast<uint32_t>(z) >= image->layer_count()) return {0, 0, 0, 0};
-    const Surface surface = image->surface(0, static_cast<uint32_t>(z));
-    if (x < 0 || y < 0 || static_cast<uint32_t>(x) >= surface.width || static_cast<uint32_t>(y) >= surface.height) return {0, 0, 0, 0};
-    return image_texel(*image, static_cast<uint32_t>(z), surface, samplers_[unit].stencil, x, y);
+    const Bound* b = bound_for(unit);
+    if (!b) return {0, 0, 0, 0};
+    if (b->kind == TextureKind::Texture2D) return z == 0 ? fetch(unit, x, y, level) : Vec4{0, 0, 0, 0};
+    if (b->kind == TextureKind::TextureCube || b->kind == TextureKind::TextureCubeArray || level >= b->levels || z < 0 || static_cast<uint32_t>(z) >= view_depth(*b, level)) return {0, 0, 0, 0};
+    const Plane plane = view_plane(*b, level, static_cast<uint32_t>(z));
+    if (x < 0 || y < 0 || static_cast<uint32_t>(x) >= plane.surface.width || static_cast<uint32_t>(y) >= plane.surface.height) return {0, 0, 0, 0};
+    return image_texel(plane, samplers_[unit].stencil, x, y);
   }
   Vec4 fetch_sample(uint32_t unit, int32_t x, int32_t y, uint32_t sample) const override {
-    const SoftwareImage* image = image_for(unit);
+    const SoftwareImage* image = this->image(unit);
     if (!image || image->samples() < 2 || sample >= image->samples()) return {0, 0, 0, 0};
     const Surface surface = image->surface();
     if (x < 0 || y < 0 || static_cast<uint32_t>(x) >= surface.width || static_cast<uint32_t>(y) >= surface.height) return {0, 0, 0, 0};
@@ -478,8 +514,8 @@ class TextureSet final : public ITextureSet {
   }
   bool size_volume(uint32_t unit, uint32_t level, uint32_t* width, uint32_t* height, uint32_t* depth, uint32_t* levels) const override {
     if (!size(unit, level, width, height, levels)) return false;
-    const SoftwareImage* image = image_for(unit);
-    *depth = image->kind() == TextureKind::Texture3D || image->kind() == TextureKind::Texture2DArray ? image->layer_count() : 1;
+    const Bound& b = bound_[unit];
+    *depth = b.kind == TextureKind::Texture3D ? (level < b.levels ? view_depth(b, level) : 0) : b.kind == TextureKind::Texture2DArray ? b.layers : b.kind == TextureKind::TextureCubeArray ? b.layers / 6 : 1;
     return true;
   }
 
@@ -488,66 +524,157 @@ class TextureSet final : public ITextureSet {
   // SampleCmp / SampleCmpLevelZero: the comparison of each texel the filter would read with the reference, filtered as the texels would be (see SamplerDesc::compare). A 2D image or an
   // array's layer (w rounded, as sample_volume takes it) or a cube's face (the direction's), at the level the derivatives give - or level 0 -, the levels blended as sample() blends them.
   float sample_compare(uint32_t unit, float u, float v, float w, float reference, bool level_zero) const override {
-    const SoftwareImage* image = image_for(unit);
-    if (!image || image->kind() == TextureKind::Texture3D) return 0.0f;
+    const Bound* b = bound_for(unit);
+    if (!b || b->kind == TextureKind::Texture3D || b->kind == TextureKind::TextureCubeArray) return 0.0f;
     if (recording_) {
-      if (image->kind() != TextureKind::TextureCube) (void)sample(unit, u, v);   // (the coordinates the derivatives are taken from)
+      if (b->kind != TextureKind::TextureCube) (void)sample(unit, u, v);   // (the coordinates the derivatives are taken from)
       return 0.0f;
     }
     SamplerDesc sampler = samplers_[unit];
     uint32_t layer = 0;
-    if (image->kind() == TextureKind::TextureCube) {
+    if (b->kind == TextureKind::TextureCube) {
       uint32_t face = 0;
-      if (!cube_face(u, v, w, &face, &u, &v)) return compare_level(*image, 0, 0, sampler, 0.5f, 0.5f, reference);
+      if (!cube_face(u, v, w, &face, &u, &v)) return compare_level(view_plane(*b, 0, 0), sampler, 0.5f, 0.5f, reference);
       layer = face;
       sampler.address_u = sampler.address_v = AddressMode::ClampToEdge;   // (no filtering across faces)
-    } else if (image->kind() == TextureKind::Texture2DArray) {
+    } else if (b->kind == TextureKind::Texture2DArray) {
       int64_t l = floor_to(unit_coordinate(w) + 0.5f);
-      layer = static_cast<uint32_t>(l < 0 ? 0 : l >= image->layer_count() ? image->layer_count() - 1 : l);
+      layer = static_cast<uint32_t>(l < 0 ? 0 : l >= b->layers ? b->layers - 1 : l);
     }
-    const uint32_t levels = image->mip_levels();
-    float lambda = level_zero ? 0.0f : lambda_[unit];
-    if (sampler.mip_filter == MipFilter::None || levels < 2 || !(lambda > 0.0f)) return compare_level(*image, 0, layer, sampler, u, v, reference);
-    const float top = static_cast<float>(levels - 1);
-    if (lambda > top) lambda = top;
-    if (sampler.mip_filter == MipFilter::Nearest) {
-      uint32_t level = static_cast<uint32_t>(lambda + 0.5f);
-      return compare_level(*image, level > levels - 1 ? levels - 1 : level, layer, sampler, u, v, reference);
-    }
-    const uint32_t l0 = static_cast<uint32_t>(lambda), l1 = l0 + 1 < levels ? l0 + 1 : levels - 1;
-    const float fraction = lambda - static_cast<float>(l0);
-    return compare_level(*image, l0, layer, sampler, u, v, reference) * (1.0f - fraction) + compare_level(*image, l1, layer, sampler, u, v, reference) * fraction;
+    const float lambda = level_zero ? 0.0f : lambda_[unit];
+    return filtered(*b, sampler, lambda, [&](uint32_t level) {
+      const float value = compare_level(view_plane(*b, level, layer), sampler, u, v, reference);
+      return Vec4{value, value, value, value};
+    }).x;
   }
 
   bool size(uint32_t unit, uint32_t level, uint32_t* width, uint32_t* height, uint32_t* levels) const override {
-    const SoftwareImage* image = image_for(unit);
-    if (!image) return false;
-    *width = mip_extent(image->extent().width, level);
-    *height = mip_extent(image->extent().height, level);
-    *levels = image->mip_levels();
+    const Bound* b = bound_for(unit);
+    if (!b) return false;
+    const uint32_t at = level < kMaxMipLevels ? b->base_level + level : kMaxMipLevels;
+    *width = mip_extent(b->image->extent().width, at);
+    *height = mip_extent(b->image->extent().height, at);
+    *levels = b->levels;
     return true;
   }
 
  private:
-  static Vec4 sample_with_lambda(const SoftwareImage& image_ref, const SamplerDesc& sampler, float u, float v, float lambda) {
-    const SoftwareImage* image = &image_ref;
-    const uint32_t levels = image->mip_levels();
-    if (sampler.mip_filter == MipFilter::None || levels < 2) return sample_level(*image, 0, sampler, u, v);
+  const Bound* bound_for(uint32_t unit) const { return unit < kMaxTextureUnits && bound_[unit].image ? &bound_[unit] : nullptr; }
+  Vec4 record(uint32_t unit, float a, float b, float c) const {
+    if (!recorded_[unit]) {
+      recorded_[unit] = true;
+      record_[unit][0] = a, record_[unit][1] = b, record_[unit][2] = c;
+    }
+    return {0, 0, 0, 1};
+  }
+  static float clamp_lod(const SamplerDesc& sampler, float lod) {
+    float lambda = lod == lod ? lod : 0.0f;
+    if (lambda < sampler.min_lod) lambda = sampler.min_lod;
+    if (lambda > sampler.max_lod) lambda = sampler.max_lod;
+    return lambda;
+  }
+  // One layer of one level a lookup reads: its surface, and of a depth image (kFeature2DepthTextures) its depth and stencil planes there - the surface then only says the size.
+  struct Plane {
+    Surface surface;
+    ArrayView<float> depth;
+    ArrayView<uint8_t> stencil;
+  };
+  // Layer `layer` of the view's level `level` (of a volume's: its slice there), with the planes of a depth image.
+  static Plane view_plane(const Bound& b, uint32_t level, uint32_t layer) {
+    const uint32_t at_level = b.base_level + level, at_layer = b.kind == TextureKind::Texture3D ? layer : b.first_layer + layer;
+    Plane p;
+    p.surface = b.image->surface(at_level, at_layer);
+    if (b.image->format() == Format::D32Float) p.depth = b.image->depth_layer(at_layer, at_level), p.stencil = b.image->stencil_layer(at_layer, at_level);
+    return p;
+  }
+  // The layers of the view at its level `level`: a volume's slices there, the view's layers for the others.
+  static uint32_t view_depth(const Bound& b, uint32_t level) { return b.kind == TextureKind::Texture3D ? b.image->level_layers(b.base_level + level) : b.layers; }
+
+  // The face of a cube a direction picks: the axis it is longest along (+X, -X, +Y, -Y, +Z, -Z).
+  static uint32_t cube_face_of(float x, float y, float z) {
+    const float ax = x < 0 ? -x : x, ay = y < 0 ? -y : y, az = z < 0 ? -z : z;
+    if (ax >= ay && ax >= az) return x >= 0 ? 0 : 1;
+    if (ay >= az) return y >= 0 ? 2 : 3;
+    return z >= 0 ? 4 : 5;
+  }
+  // Where a direction meets the plane of face `face`, 0 .. 1 across the face (the usual table: +X looks along -z with t down -y, ...); false when it does not point at that plane.
+  static bool cube_on_face(uint32_t face, float x, float y, float z, float* s, float* t) {
+    float major, sc, tc;
+    switch (face) {
+      case 0: major = x, sc = -z, tc = -y; break;
+      case 1: major = -x, sc = z, tc = -y; break;
+      case 2: major = y, sc = x, tc = z; break;
+      case 3: major = -y, sc = x, tc = -z; break;
+      case 4: major = z, sc = x, tc = -y; break;
+      default: major = -z, sc = -x, tc = -y; break;
+    }
+    if (!(major > 0.0f)) {
+      *s = *t = 0.5f;
+      return false;
+    }
+    *s = (unit_coordinate(sc / major) + 1.0f) * 0.5f;
+    *t = (unit_coordinate(tc / major) + 1.0f) * 0.5f;
+    return true;
+  }
+  // The levels of the view filtered as SamplerDesc says: `at(level)` is the lookup in one of them.
+  template <typename At>
+  static Vec4 filtered(const Bound& b, const SamplerDesc& sampler, float lambda, At at) {
+    const uint32_t levels = b.levels;
+    if (sampler.mip_filter == MipFilter::None || levels < 2) return at(0u);
     const float top = static_cast<float>(levels - 1);
     if (lambda > top) lambda = top;
-    if (!(lambda > 0.0f)) return sample_level(*image, 0, sampler, u, v);   // (magnification)
+    if (!(lambda > 0.0f)) return at(0u);   // (magnification)
     if (sampler.mip_filter == MipFilter::Nearest) {
       uint32_t level = static_cast<uint32_t>(lambda + 0.5f);
       if (level > levels - 1) level = levels - 1;
-      return sample_level(*image, level, sampler, u, v);
+      return at(level);
     }
     const uint32_t l0 = static_cast<uint32_t>(lambda), l1 = l0 + 1 < levels ? l0 + 1 : levels - 1;
     const float fraction = lambda - static_cast<float>(l0);
-    const Vec4 a = sample_level(*image, l0, sampler, u, v), b = sample_level(*image, l1, sampler, u, v);
-    return a * (1.0f - fraction) + b * fraction;
+    return at(l0) * (1.0f - fraction) + at(l1) * fraction;
   }
-
-  static Vec4 texel_at(const SoftwareImage& image, uint32_t layer, const SamplerDesc& sampler, float u, float v) { return sample_level(image, 0, sampler, u, v, layer); }
+  // A lookup in the view at a level of detail: (u, v) of a 2D image, and w the layer of an array, the depth of a volume, or with (u, v) the direction of a cube (whose number in a
+  // cube array is `cube`).
+  static Vec4 lookup(const Bound& b, const SamplerDesc& given, float u, float v, float w, float cube, float lambda) {
+    SamplerDesc sampler = given;
+    w = unit_coordinate(w);
+    switch (b.kind) {
+      case TextureKind::TextureCube: case TextureKind::TextureCubeArray: {
+        uint32_t layer = 0;
+        if (b.kind == TextureKind::TextureCubeArray) {
+          const uint32_t cubes = b.layers / 6;
+          int64_t n = floor_to(unit_coordinate(cube) + 0.5f);
+          n = n < 0 ? 0 : n >= cubes ? cubes - 1 : n;
+          layer = static_cast<uint32_t>(n) * 6;
+        }
+        const uint32_t face = cube_face_of(unit_coordinate(u), unit_coordinate(v), w);
+        float s, t;
+        if (!cube_on_face(face, unit_coordinate(u), unit_coordinate(v), w, &s, &t)) return sample_level(view_plane(b, 0, layer), sampler, 0.5f, 0.5f);
+        sampler.address_u = sampler.address_v = AddressMode::ClampToEdge;
+        return filtered(b, sampler, lambda, [&](uint32_t level) { return sample_level(view_plane(b, level, layer + face), sampler, s, t); });
+      }
+      case TextureKind::Texture2DArray: {
+        int64_t layer = floor_to(w + 0.5f);
+        layer = layer < 0 ? 0 : layer >= b.layers ? b.layers - 1 : layer;
+        return filtered(b, sampler, lambda, [&](uint32_t level) { return sample_level(view_plane(b, level, static_cast<uint32_t>(layer)), sampler, u, v); });
+      }
+      case TextureKind::Texture3D:
+        // A volume: the slice the point lies in, or the two around it blended, of each level.
+        return filtered(b, sampler, lambda, [&](uint32_t level) {
+          const uint32_t layers = view_depth(b, level);
+          const float depth = static_cast<float>(layers);
+          auto clamp_layer = [&](int64_t i) { return static_cast<uint32_t>(i < 0 ? 0 : i >= layers ? layers - 1 : i); };
+          if (sampler.filter == Filter::Nearest) return sample_level(view_plane(b, level, clamp_layer(floor_to(w * depth))), sampler, u, v);
+          const float fz = w * depth - 0.5f;
+          const int64_t z0 = floor_to(fz);
+          const float tz = fz - static_cast<float>(z0);
+          const Vec4 a = sample_level(view_plane(b, level, clamp_layer(z0)), sampler, u, v), c = sample_level(view_plane(b, level, clamp_layer(z0 + 1)), sampler, u, v);
+          return a * (1.0f - tz) + c * tz;
+        });
+      default:
+        return filtered(b, sampler, lambda, [&](uint32_t level) { return sample_level(view_plane(b, level, 0), sampler, u, v); });
+    }
+  }
 
   // The face of a cube a direction points at and the place on it (0..1 both ways): the usual table, as sample_volume has it. False for the zero direction.
   static bool cube_face(float x, float y, float z, uint32_t* face, float* u, float* v) {
@@ -563,13 +690,12 @@ class TextureSet final : public ITextureSet {
     return true;
   }
   // One level's comparison: reference <op> each texel the sampler's filter reads (a texel outside an image with a border: the border colour's red), filtered by that filter.
-  static float compare_level(const SoftwareImage& image, uint32_t level, uint32_t layer, const SamplerDesc& sampler, float u, float v, float reference) {
-    const Surface surface = image.surface(level, layer);
-    const int64_t w = surface.width, h = surface.height;
+  static float compare_level(const Plane& texels, const SamplerDesc& sampler, float u, float v, float reference) {
+    const int64_t w = texels.surface.width, h = texels.surface.height;
     if (!w || !h) return 0.0f;
     SamplerDesc plane = sampler;
     plane.stencil = false;   // (what is compared is the depth, or a colour image's red)
-    auto pass = [&](int64_t x, int64_t y) { return compare_holds(sampler.compare, reference, texel_or_border(image, layer, surface, plane, x, y).x) ? 1.0f : 0.0f; };
+    auto pass = [&](int64_t x, int64_t y) { return compare_holds(sampler.compare, reference, texel_or_border(texels, plane, x, y).x) ? 1.0f : 0.0f; };
     if (sampler.filter == Filter::Nearest)
       return pass(index(floor_to(unit_coordinate(u) * static_cast<float>(w)), w, sampler.address_u), index(floor_to(unit_coordinate(v) * static_cast<float>(h)), h, sampler.address_v));
     const float fx = unit_coordinate(u) * static_cast<float>(w) - 0.5f, fy = unit_coordinate(v) * static_cast<float>(h) - 0.5f;
@@ -581,11 +707,12 @@ class TextureSet final : public ITextureSet {
     return top * (1 - ty) + bottom * ty;
   }
 
-  static Vec4 sample_level(const SoftwareImage& image, uint32_t level, const SamplerDesc& sampler, float u, float v, uint32_t layer = 0) {
-    const Surface surface = image.surface(level, layer);
+  static Vec4 sample_level(const Plane& texels, const SamplerDesc& sampler, float u, float v) {
+    const Surface& surface = texels.surface;
+    if (!surface.width || !surface.height) return {0, 0, 0, 0};
     const int64_t w = surface.width, h = surface.height;
     if (sampler.filter == Filter::Nearest || sampler.stencil) {   // (the stencil plane holds integers: never filtered)
-      return texel_or_border(image, layer, surface, sampler, index(floor_to(unit_coordinate(u) * static_cast<float>(w)), w, sampler.address_u), index(floor_to(unit_coordinate(v) * static_cast<float>(h)), h, sampler.address_v));
+      return texel_or_border(texels, sampler, index(floor_to(unit_coordinate(u) * static_cast<float>(w)), w, sampler.address_u), index(floor_to(unit_coordinate(v) * static_cast<float>(h)), h, sampler.address_v));
     }
     // Linear: the four texels around the point, whose centres are half a texel in.
     const float fx = unit_coordinate(u) * static_cast<float>(w) - 0.5f, fy = unit_coordinate(v) * static_cast<float>(h) - 0.5f;
@@ -593,29 +720,26 @@ class TextureSet final : public ITextureSet {
     const float tx = fx - static_cast<float>(x0), ty = fy - static_cast<float>(y0);
     const int64_t xs[2] = {index(x0, w, sampler.address_u), index(x0 + 1, w, sampler.address_u)};
     const int64_t ys[2] = {index(y0, h, sampler.address_v), index(y0 + 1, h, sampler.address_v)};
-    const Vec4 a = texel_or_border(image, layer, surface, sampler, xs[0], ys[0]), b = texel_or_border(image, layer, surface, sampler, xs[1], ys[0]),
-               c = texel_or_border(image, layer, surface, sampler, xs[0], ys[1]), d = texel_or_border(image, layer, surface, sampler, xs[1], ys[1]);
+    const Vec4 a = texel_or_border(texels, sampler, xs[0], ys[0]), b = texel_or_border(texels, sampler, xs[1], ys[0]), c = texel_or_border(texels, sampler, xs[0], ys[1]),
+               d = texel_or_border(texels, sampler, xs[1], ys[1]);
     const Vec4 top = a * (1 - tx) + b * tx, bottom = c * (1 - tx) + d * tx;
     return top * (1 - ty) + bottom * ty;
   }
   // (index() gives -1 for a texel outside an image whose sampler has a border there)
-  static Vec4 texel_or_border(const SoftwareImage& image, uint32_t layer, const Surface& surface, const SamplerDesc& sampler, int64_t x, int64_t y) {
+  static Vec4 texel_or_border(const Plane& texels, const SamplerDesc& sampler, int64_t x, int64_t y) {
     if (x < 0 || y < 0) return border_color_value(sampler.border);
-    return image_texel(image, layer, surface, sampler.stencil, x, y);
+    return image_texel(texels, sampler.stencil, x, y);
   }
   // A texel of a colour image, or of the depth or stencil plane of a depth image (kFeature2DepthTextures): the depth as (depth, 0, 0, 1), the stencil as the integers (0, stencil, 0, 1).
-  static Vec4 image_texel(const SoftwareImage& image, uint32_t layer, const Surface& surface, bool stencil, int64_t x, int64_t y) {
-    if (image.format() != Format::D32Float) return texel(surface, x, y);
-    const uint64_t at = static_cast<uint64_t>(y) * image.extent().width + static_cast<uint64_t>(x);
+  static Vec4 image_texel(const Plane& texels, bool stencil, int64_t x, int64_t y) {
+    if (texels.surface.format != Format::D32Float) return texel(texels.surface, x, y);
+    const uint64_t at = static_cast<uint64_t>(y) * texels.surface.width + static_cast<uint64_t>(x);
     if (stencil) {
-      const ArrayView<uint8_t> plane = image.stencil_layer(layer);
-      const uint32_t value = at < plane.size() ? plane[at] : 0u;
+      const uint32_t value = at < texels.stencil.size() ? texels.stencil[at] : 0u;
       return {__builtin_bit_cast(float, 0u), __builtin_bit_cast(float, value), __builtin_bit_cast(float, 0u), __builtin_bit_cast(float, 1u)};
     }
-    const ArrayView<float> plane = image.depth_layer(layer);
-    return {at < plane.size() ? plane[at] : 0.0f, 0.0f, 0.0f, 1.0f};
+    return {at < texels.depth.size() ? texels.depth[at] : 0.0f, 0.0f, 0.0f, 1.0f};
   }
-  const SoftwareImage* image_for(uint32_t unit) const { return unit < kMaxTextureUnits ? images_[unit] : nullptr; }
   // A coordinate a NaN or a very large value cannot turn into an index outside the image: both are brought into a range the integer conversion can take.
   static float unit_coordinate(float c) {
     if (!(c == c)) return 0.0f;
@@ -653,12 +777,12 @@ class TextureSet final : public ITextureSet {
     return {static_cast<float>((argb >> 16) & 0xFF) * k, static_cast<float>((argb >> 8) & 0xFF) * k, static_cast<float>(argb & 0xFF) * k, static_cast<float>(argb >> 24) * k};
   }
 
-  const SoftwareImage* images_[kMaxTextureUnits] = {};
+  Bound bound_[kMaxTextureUnits];
   SamplerDesc samplers_[kMaxTextureUnits];
   // The state of the pixel being shaded (the shader sees this set through a const reference).
   mutable bool recording_ = false;
   mutable bool recorded_[kMaxTextureUnits] = {};
-  mutable float record_u_[kMaxTextureUnits] = {}, record_v_[kMaxTextureUnits] = {};
+  mutable float record_[kMaxTextureUnits][3] = {};
   mutable float lambda_[kMaxTextureUnits] = {};
 };
 
@@ -790,7 +914,7 @@ class StorageImageSet final : public IStorageImages {
   bool texel_surface(uint32_t slot, uint32_t x, uint32_t y, uint32_t z, Surface* out) const {
     if (slot >= kMaxImageSlots || !images_[slot]) return false;
     const StorageImageView& view = views_[slot];
-    if (z >= view.layer_count || view.level >= images_[slot]->mip_levels() || view.first_layer + z >= images_[slot]->layer_count()) return false;
+    if (z >= view.layer_count || view.level >= images_[slot]->mip_levels() || view.first_layer + z >= images_[slot]->level_layers(view.level)) return false;
     *out = images_[slot]->surface(view.level, view.first_layer + z);
     return x < out->width && y < out->height;
   }
@@ -835,16 +959,18 @@ struct DrawState {
   // The layers of the targets the pass draws into (RenderPassBegin::first_layer / layer_count; kMaxColorTargets: the depth image) and the one the primitive being drawn goes to.
   uint32_t first_layer[kMaxColorTargets + 1] = {};
   uint32_t layer_count[kMaxColorTargets + 1] = {1, 1, 1, 1, 1, 1, 1, 1, 1};
+  uint32_t level[kMaxColorTargets + 1] = {};   // (RenderPassBegin::level: the level of each target drawn into)
+  Extent2D extent;                             // (the size of the pass: of those levels)
   mutable uint32_t layer = 0;
   void select_layer(uint32_t l) const { layer = l; }
   // (the layer of target n the primitive goes to: its own first when the primitive's is beyond the target's)
   uint32_t layer_of(uint32_t n) const { return first_layer[n] + (layer < layer_count[n] ? layer : 0); }
   Surface target(uint32_t n) const {
     const SoftwareImage* image = n == 0 ? color : extra_colors[n - 1];
-    return image->surface(0, layer_of(n));
+    return image->surface(level[n], layer_of(n));
   }
-  ArrayView<float> depth_plane() const { return depth ? depth->depth_layer(layer_of(kMaxColorTargets)) : ArrayView<float>(); }
-  ArrayView<uint8_t> stencil_plane() const { return depth ? depth->stencil_layer(layer_of(kMaxColorTargets)) : ArrayView<uint8_t>(); }
+  ArrayView<float> depth_plane() const { return depth ? depth->depth_layer(layer_of(kMaxColorTargets), level[kMaxColorTargets]) : ArrayView<float>(); }
+  ArrayView<uint8_t> stencil_plane() const { return depth ? depth->stencil_layer(layer_of(kMaxColorTargets), level[kMaxColorTargets]) : ArrayView<uint8_t>(); }
   const StorageImageSet* images = nullptr;   // the storage images bound
   Viewport viewport;
   Rect2D scissor;  // already clamped to the target
@@ -994,7 +1120,7 @@ void write_fragment(const DrawState& s, int32_t x, int32_t y, float z, bool dept
   const ArrayView<uint8_t> stencil = s.stencil_plane();
   const bool stencil_on = pd.stencil.enable && !stencil.empty();
   const uint32_t samples = s.sample_count;
-  const uint64_t index = (uint64_t{static_cast<uint32_t>(y)} * s.color->extent().width + static_cast<uint32_t>(x)) * samples + sample;   // (the sample's place in the depth and stencil planes)
+  const uint64_t index = (uint64_t{static_cast<uint32_t>(y)} * s.extent.width + static_cast<uint32_t>(x)) * samples + sample;   // (the sample's place in the depth and stencil planes)
   if (stencil_on) {
     // The stencil test comes first, then the depth test; each outcome has its own op (a fragment the shader discarded changed nothing).
     const StencilState& st = pd.stencil;
@@ -1134,7 +1260,7 @@ void raster_triangle(const DrawState& s, const ScreenVertex& a, const ScreenVert
     float vx, vy, dx, dy;
   };
   const EdgeLine edges[3] = {{v1->x, v1->y, e0dx, e0dy}, {v2->x, v2->y, e1dx, e1dy}, {v0->x, v0->y, e2dx, e2dy}};
-  const uint32_t target_width = s.color->extent().width;
+  const uint32_t target_width = s.extent.width;
 
   for (int32_t y = min_y; y < max_y; ++y) {
     int32_t row_begin = min_x, row_end = max_x;
@@ -1225,7 +1351,7 @@ void raster_triangle(const DrawState& s, const ScreenVertex& a, const ScreenVert
         const int32_t qx = x & ~1, qy = y & ~1;
         const float xs[3] = {static_cast<float>(qx) + 0.5f, static_cast<float>(qx) + 1.5f, static_cast<float>(qx) + 0.5f};
         const float ys[3] = {static_cast<float>(qy) + 0.5f, static_cast<float>(qy) + 0.5f, static_cast<float>(qy) + 1.5f};
-        float coord[3][kMaxTextureUnits][2] = {};
+        float coord[3][kMaxTextureUnits][3] = {};
         bool have[3][kMaxTextureUnits] = {};
         for (int k = 0; k < 3; ++k) {
           Vec4 quad_varying[kMaxVaryings];
@@ -1239,7 +1365,7 @@ void raster_triangle(const DrawState& s, const ScreenVertex& a, const ScreenVert
           s.textures.start_recording();
           run_fragment_shader(s, quad_varying, quad_context, ignored);
           s.textures.stop_recording();
-          for (uint32_t unit = 0; unit < kMaxTextureUnits; ++unit) have[k][unit] = s.textures.recorded(unit, &coord[k][unit][0], &coord[k][unit][1]);
+          for (uint32_t unit = 0; unit < kMaxTextureUnits; ++unit) have[k][unit] = s.textures.recorded(unit, coord[k][unit]);
         }
         s.textures.clear_lod();
         for (uint32_t unit = 0; unit < kMaxTextureUnits; ++unit)
@@ -1282,7 +1408,7 @@ void fragment_at(const DrawState& s, int32_t x, int32_t y, float z, float inv_w,
   if (x < s.scissor.x || y < s.scissor.y || x >= static_cast<int64_t>(s.scissor.x) + s.scissor.width || y >= static_cast<int64_t>(s.scissor.y) + s.scissor.height) return;
   if (x < 0 || y < 0 || static_cast<uint32_t>(x) >= target.width || static_cast<uint32_t>(y) >= target.height) return;
   const ArrayView<float> depth = s.depth_plane();
-  const uint64_t index = uint64_t{static_cast<uint32_t>(y)} * s.color->extent().width + static_cast<uint32_t>(x);
+  const uint64_t index = uint64_t{static_cast<uint32_t>(y)} * s.extent.width + static_cast<uint32_t>(x);
   const uint32_t sample_count = s.sample_count;   // (a line or point covers every sample of its pixel)
   uint32_t depth_pass = (1u << sample_count) - 1;
   if (pd.depth_test && !depth.empty())
@@ -1649,8 +1775,8 @@ void SoftwareDevice::destroy_buffer(IBuffer* buffer) { destroy(allocator_, stati
 
 IImage* SoftwareDevice::create_image(const ImageDesc& desc) {
   if (!desc.extent.width || !desc.extent.height || desc.format == Format::Undefined) return nullptr;
-  // Levels need a colour image to sample, and no more than the extent has.
-  if (desc.mip_levels == 0 || desc.mip_levels > mip_level_limit(desc.extent) || desc.mip_levels > kMaxMipLevels || (desc.mip_levels > 1 && (desc.format == Format::D32Float || !(desc.usage & kImageSampled)))) return nullptr;
+  // (any image of one sample may have levels, as many as the extent has: kFeature2MipmappedLayers)
+  if (desc.mip_levels == 0 || desc.mip_levels > mip_level_limit(desc.extent) || desc.mip_levels > kMaxMipLevels) return nullptr;
   if (desc.samples != 1) {
     // (a multisampled image is an 8-bit colour or a depth attachment, alone, of one level)
     const bool depth = desc.format == Format::D32Float;
@@ -1658,17 +1784,17 @@ IImage* SoftwareDevice::create_image(const ImageDesc& desc) {
         (depth ? desc.usage != kImageDepthAttachment : (desc.usage & ~kImageSampled) != kImageColorAttachment))
       return nullptr;
   }
-  // (a storage image: a sampled colour image of one sample that is not sRGB or block-compressed, and not a cube)
-  if ((desc.usage & kImageStorage) && (!(desc.usage & kImageSampled) || desc.samples != 1 || desc.format == Format::D32Float || is_srgb_format(desc.format) || is_compressed_format(desc.format) ||
-                                       desc.kind == TextureKind::TextureCube))
+  // (a storage image: a sampled colour image of one sample that is not sRGB or block-compressed; a cube's or a cube array's faces are an array of them to its shaders)
+  if ((desc.usage & kImageStorage) && (!(desc.usage & kImageSampled) || desc.samples != 1 || desc.format == Format::D32Float || is_srgb_format(desc.format) || is_compressed_format(desc.format)))
     return nullptr;
   if (desc.kind != TextureKind::Texture2D) {
-    // (layered images: one level, sampled, and also drawn into (colour or depth) or read and written as storage images)
-    const uint32_t layers = desc.kind == TextureKind::TextureCube ? 6 : desc.layers;
+    // (layered images: sampled, and also drawn into (colour or depth) or read and written as storage images; a cube is six square layers, a cube array six times its cubes)
+    const uint32_t layers = image_layer_count(desc.kind, desc.layers);
     const bool depth = desc.format == Format::D32Float;
+    const bool cube = desc.kind == TextureKind::TextureCube || desc.kind == TextureKind::TextureCubeArray;
     if (!(desc.usage & (depth ? kImageDepthAttachment : kImageSampled)) || (desc.usage & ~(depth ? kImageDepthAttachment | kImageSampled : kImageSampled | kImageColorAttachment | kImageStorage)) ||
-        desc.mip_levels != 1 || layers == 0 || layers > kMaxTextureLayers || (depth && desc.kind == TextureKind::Texture3D) || desc.samples != 1 ||
-        (desc.kind == TextureKind::TextureCube && desc.extent.width != desc.extent.height))
+        layers == 0 || layers > kMaxTextureLayers || (depth && desc.kind == TextureKind::Texture3D) || desc.samples != 1 || desc.kind == TextureKind::Texture2DMS ||
+        (cube && desc.extent.width != desc.extent.height) || (desc.kind == TextureKind::TextureCubeArray && layers % 6 != 0))
       return nullptr;
   } else if (desc.layers != 1) {
     return nullptr;
@@ -1812,53 +1938,47 @@ bool SoftwareDevice::submit(ICommandBuffer* commands) {
         if (s.depth && s.depth->format() != Format::D32Float) return false;
         s.sample_count = s.color->samples();
         if (s.depth && s.depth->samples() != s.sample_count) return false;
-        const Extent2D e = s.color->extent();
-        if (s.depth && (s.depth->extent().width != e.width || s.depth->extent().height != e.height)) return false;
+        // (every target's level is of one size: the pass's)
+        for (uint32_t n = 0; n <= kMaxColorTargets; ++n) s.level[n] = cmd.pass.level[n];
+        if (s.level[0] >= s.color->mip_levels() || (s.depth && s.level[kMaxColorTargets] >= s.depth->mip_levels())) return false;
+        const Extent2D e = s.color->level_extent(s.level[0]);
+        s.extent = e;
+        if (s.depth && (s.depth->level_extent(s.level[kMaxColorTargets]).width != e.width || s.depth->level_extent(s.level[kMaxColorTargets]).height != e.height)) return false;
         for (SoftwareImage*& extra : s.extra_colors) extra = nullptr;
         for (uint32_t n = 0; n + 1 < kMaxColorTargets && cmd.pass.extra_colors[n]; ++n) {
           SoftwareImage* image = static_cast<SoftwareImage*>(cmd.pass.extra_colors[n]);
           if (!(image->usage() & kImageColorAttachment) || image->format() == Format::D32Float || image == s.color || image == s.depth) return false;
-          if (image->extent().width != e.width || image->extent().height != e.height || image->samples() != s.sample_count) return false;
+          if (s.level[n + 1] >= image->mip_levels() || image->level_extent(s.level[n + 1]).width != e.width || image->level_extent(s.level[n + 1]).height != e.height || image->samples() != s.sample_count) return false;
           for (uint32_t k = 0; k < n; ++k)
             if (s.extra_colors[k] == image) return false;
           s.extra_colors[n] = image;
         }
-        // (the layers of each target: within the image; a 2D image has layer 0 alone)
+        // (the layers of each target: within its level; a 2D image has layer 0 alone)
         s.layer = 0;
         for (uint32_t n = 0; n <= kMaxColorTargets; ++n) {
           const SoftwareImage* image = n == kMaxColorTargets ? s.depth : n == 0 ? s.color : s.extra_colors[n - 1];
           s.first_layer[n] = cmd.pass.first_layer[n];
           s.layer_count[n] = cmd.pass.layer_count[n];
-          if (image && (s.layer_count[n] == 0 || s.first_layer[n] >= image->layer_count() || s.layer_count[n] > image->layer_count() - s.first_layer[n])) return false;
+          if (image && (s.layer_count[n] == 0 || s.first_layer[n] >= image->level_layers(s.level[n]) || s.layer_count[n] > image->level_layers(s.level[n]) - s.first_layer[n])) return false;
         }
         if (cmd.pass.clear_color) {
           for (uint32_t n = 0; n < kMaxColorTargets; ++n) {
             const SoftwareImage* image = n == 0 ? s.color : s.extra_colors[n - 1];
             if (!image) break;
-            if (image->layer_count() > 1) {
-              // (a layered target: the pass's layers of it)
-              for (uint32_t l = 0; l < s.layer_count[n]; ++l) {
-                const Surface surface = image->surface(0, s.first_layer[n] + l);
-                if (!surface.floats.empty()) {
-                  for (Vec4& c : surface.floats) c = image->store_float(cmd.pass.clear_color_value);
-                } else {
-                  surface.pixels.fill(surface.encode(is_srgb_format(surface.format) ? pack_srgb(cmd.pass.clear_color_value) : pack_color(cmd.pass.clear_color_value)));
-                }
+            // (the pass's layers of the target's level; every sample of every pixel)
+            for (uint32_t l = 0; l < s.layer_count[n]; ++l) {
+              const Surface surface = image->surface(s.level[n], s.first_layer[n] + l);
+              if (!surface.floats.empty()) {
+                for (Vec4& c : surface.floats) c = image->store_float(cmd.pass.clear_color_value);
+              } else {
+                surface.pixels.fill(surface.encode(is_srgb_format(surface.format) ? pack_srgb(cmd.pass.clear_color_value) : pack_color(cmd.pass.clear_color_value)));
               }
-              continue;
             }
-            const Surface surface = image->surface();
-            if (!surface.floats.empty()) {
-              for (Vec4& c : surface.floats) c = image->store_float(cmd.pass.clear_color_value);
-              continue;
-            }
-            const uint32_t v = surface.encode(is_srgb_format(surface.format) ? pack_srgb(cmd.pass.clear_color_value) : pack_color(cmd.pass.clear_color_value));
-            image->all_samples().fill(v);   // (every sample of every pixel; the rows of a plain image are tight)
           }
         }
         for (uint32_t l = 0; s.depth && l < s.layer_count[kMaxColorTargets]; ++l) {
-          if (cmd.pass.clear_depth) s.depth->depth_layer(s.first_layer[kMaxColorTargets] + l).fill(cmd.pass.clear_depth_value);
-          if (cmd.pass.clear_stencil) s.depth->stencil_layer(s.first_layer[kMaxColorTargets] + l).fill(cmd.pass.clear_stencil_value);
+          if (cmd.pass.clear_depth) s.depth->depth_layer(s.first_layer[kMaxColorTargets] + l, s.level[kMaxColorTargets]).fill(cmd.pass.clear_depth_value);
+          if (cmd.pass.clear_stencil) s.depth->stencil_layer(s.first_layer[kMaxColorTargets] + l, s.level[kMaxColorTargets]).fill(cmd.pass.clear_stencil_value);
         }
         s.viewport = {0, 0, static_cast<float>(e.width), static_cast<float>(e.height), 0, 1};
         s.scissor = {0, 0, e.width, e.height};
@@ -1970,8 +2090,8 @@ bool SoftwareDevice::submit(ICommandBuffer* commands) {
         SoftwareImage* image = static_cast<SoftwareImage*>(cmd.image);
         const StorageImageView& view = cmd.storage_view;
         if (cmd.unit >= kMaxStorageImages) return false;
-        if (image && (!(image->usage() & kImageStorage) || view.level >= image->mip_levels() || view.layer_count == 0 || view.first_layer >= image->layer_count() ||
-                      view.layer_count > image->layer_count() - view.first_layer || !storage_view_compatible(image->format(), view.format)))
+        if (image && (!(image->usage() & kImageStorage) || view.level >= image->mip_levels() || view.layer_count == 0 || view.first_layer >= image->level_layers(view.level) ||
+                      view.layer_count > image->level_layers(view.level) - view.first_layer || !storage_view_compatible(image->format(), view.format)))
           return false;
         images.bind(cmd.unit, image, view);
         break;
@@ -2085,7 +2205,11 @@ bool SoftwareDevice::submit(ICommandBuffer* commands) {
       case RecordedCommand::Type::BindTexture: {
         const auto* image = static_cast<const SoftwareImage*>(cmd.image);
         if (cmd.unit >= kMaxTextureUnits || !image || !(image->usage() & kImageSampled)) return false;   // (a depth image too: kFeature2DepthTextures)
-        s.textures.bind(cmd.unit, image, cmd.sampler);
+        if (cmd.has_view) {
+          if (!s.textures.bind_view(cmd.unit, image, cmd.sampler, cmd.texture_view)) return false;
+        } else {
+          s.textures.bind(cmd.unit, image, cmd.sampler);
+        }
         break;
       }
       case RecordedCommand::Type::SetViewport:
@@ -2099,7 +2223,7 @@ bool SoftwareDevice::submit(ICommandBuffer* commands) {
         break;
       case RecordedCommand::Type::SetScissor: {
         if (!in_pass) return false;
-        const Extent2D e = s.color->extent();
+        const Extent2D e = s.extent;
         const int64_t x0 = cmd.scissor.x > 0 ? cmd.scissor.x : 0, y0 = cmd.scissor.y > 0 ? cmd.scissor.y : 0;
         int64_t x1 = int64_t{cmd.scissor.x} + cmd.scissor.width, y1 = int64_t{cmd.scissor.y} + cmd.scissor.height;
         if (x1 > e.width) x1 = e.width;
@@ -2116,11 +2240,13 @@ bool SoftwareDevice::submit(ICommandBuffer* commands) {
         const GraphicsPipelineDesc& pd = s.pipeline->desc();
         if (pd.stencil.enable && (!s.depth || s.depth->stencil().empty())) return false;   // (a stencil test with no stencil plane to test)
         // Every texture the pipeline samples is bound, and none of them is the image being drawn into.
+        // (a unit may show other levels or layers of a target than those the pass draws into)
         for (uint32_t unit = 0; unit < pd.texture_count; ++unit) {
-          const SoftwareImage* bound = s.textures.image(unit);
-          if (!bound || bound == s.color || bound == s.depth) return false;
-          for (const SoftwareImage* extra : s.extra_colors)
-            if (bound == extra) return false;
+          if (!s.textures.image(unit)) return false;
+          for (uint32_t n = 0; n <= kMaxColorTargets; ++n) {
+            const SoftwareImage* target = n == kMaxColorTargets ? s.depth : n == 0 ? s.color : s.extra_colors[n - 1];
+            if (target && s.textures.overlaps(unit, target, s.level[n], s.first_layer[n], s.layer_count[n])) return false;
+          }
         }
         if (pd.color_target_count == 0 || pd.color_target_count > kMaxColorTargets || (pd.color_target_count > 1 && !s.extra_colors[pd.color_target_count - 2])) return false;
         // (the vertex buffers the attributes read: each one bound, and the vertices of the draw inside it)

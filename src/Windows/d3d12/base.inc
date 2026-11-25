@@ -263,7 +263,7 @@ struct Dev {
   LONG removed;
   UINT null_target;        /* a 1 x 1 render target: the pass of a draw that has no target (stream output only) */
   /* The colour targets of passes that have a depth buffer and no render target (cmdlist.inc depth_companion): one for each depth buffer drawn into that way, until it is destroyed. */
-  struct Companion { UINT depth, color; } *companions;
+  struct Companion { UINT depth, color, width, height; } *companions;      /* (one for each size of a level of the depth buffer a pass drew into) */
   UINT companion_count, companion_capacity;
   /* The colour targets of passes with no render target and no depth buffer (draws that write unordered access views only: cmdlist.inc uav_only_target), of the sizes and sample
    * counts asked for; kept until the device is destroyed (lists recorded with one may still be executed). */
@@ -299,6 +299,8 @@ struct Dev {
 #define DEV_FEATURE2_DEPTH_TEXTURES (1u << 16)           /* depth buffers read by shaders (KA_DEPTH | KA_TEXTURE): their depth, a D24S8's stencil, SampleCmp */
 #define DEV_FEATURE2_TEXEL_BUFFERS (1u << 5)             /* typed views of buffers (Buffer<>, RWBuffer<>): the kernel's BindTexelBuffer, a descriptor's element format */
 #define DEV_FEATURE2_STORAGE_ALL_STAGES (1u << 6)        /* storage images and typed views of buffers in vertex, geometry, hull and domain shaders too */
+#define DEV_FEATURE2_MIPMAPPED_LAYERS (1u << 10)         /* graphics::kFeature2MipmappedLayers: levels of arrays, cubes, volumes, targets, depth buffers and the wide formats, cube arrays,
+                                                          * shader resource views of levels and layers, render targets and depth views of a level */
 
 static const GUID *const g_device_iids[] = {&IID_ID3D12Object, &IID_ID3D12Device, &IID_ID3D12Device1, &IID_ID3D12Device2, &IID_ID3D12Device3, &IID_ID3D12Device4,
                                             &IID_ID3D12Device5, &IID_ID3D12Device6, &IID_ID3D12Device7, &IID_ID3D12Device8, &IID_ID3D12Device9, &IID_ID3D12Device10, NULL};

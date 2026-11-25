@@ -289,12 +289,13 @@ static HRESULT STDMETHODCALLTYPE dev_CheckFeatureSupport(Dev *This, D3D12_FEATUR
         f->Support1 = D3D12_FORMAT_SUPPORT1_TEXTURE2D | D3D12_FORMAT_SUPPORT1_SHADER_LOAD | D3D12_FORMAT_SUPPORT1_SHADER_SAMPLE | D3D12_FORMAT_SUPPORT1_DECODER_OUTPUT |
                       D3D12_FORMAT_SUPPORT1_VIDEO_PROCESSOR_OUTPUT | D3D12_FORMAT_SUPPORT1_VIDEO_PROCESSOR_INPUT;
         if (f->Format == DXGI_FORMAT_AYUV) f->Support1 |= D3D12_FORMAT_SUPPORT1_RENDER_TARGET;
-        /* (AYUV has mip levels; Y416 would - DXGI's tables give it them -, but the kernel's 16-bit images have one level; the others have none in DXGI's tables) */
-        if (format_packed_yuv_mips(f->Format) && kernel_format_levels(i->kernel)) f->Support1 |= D3D12_FORMAT_SUPPORT1_MIP;
+        /* (AYUV and Y416 have mip levels - Y416's where the kernel has levels of its 16-bit images; the others have none in DXGI's tables) */
+        if (format_packed_yuv_mips(f->Format) && device_format_levels(This, i->kernel)) f->Support1 |= D3D12_FORMAT_SUPPORT1_MIP;
       } else if (i) {
         f->Support1 = D3D12_FORMAT_SUPPORT1_TEXTURE2D;
-        /* (levels: the kernel's 8-bit and block-compressed images have them, its wider ones - 16 and 32-bit channels, 10-bit, integer - and depth buffers one) */
-        if (!i->depth && kernel_format_levels(i->kernel)) f->Support1 |= D3D12_FORMAT_SUPPORT1_MIP;
+        /* (levels: the kernel's 8-bit and block-compressed images have them; its wider ones - 16 and 32-bit channels, 10-bit, integer - and depth buffers on a device with levels of
+         * every image, DEV_FEATURE2_MIPMAPPED_LAYERS) */
+        if (device_format_levels(This, i->kernel) && (!i->depth || (This->caps.features2 & DEV_FEATURE2_MIPMAPPED_LAYERS))) f->Support1 |= D3D12_FORMAT_SUPPORT1_MIP;
         if (format_tiled(i)) f->Support2 |= D3D12_FORMAT_SUPPORT2_TILED;      /* (the kernel's reserved textures: tile_layout) */
         if (i->depth) f->Support1 |= D3D12_FORMAT_SUPPORT1_DEPTH_STENCIL;
         else if (format_integer(f->Format)) f->Support1 |= D3D12_FORMAT_SUPPORT1_SHADER_LOAD | D3D12_FORMAT_SUPPORT1_RENDER_TARGET;      /* (integers: loaded, not filtered or blended) */

@@ -50,6 +50,9 @@ struct RecordedCommand {
   SamplerDesc sampler;
   StorageImageView storage_view;   // BindStorageImage (the slot in `unit`, the image in `image`)
   TexelBufferView texel_view;      // BindStorageTexelBuffer (the slot in `unit`, the buffer in `buffer`)
+  // BindTexture through a view (bind_texture_view): `has_view` and the view (a plain bind_texture sees the whole image as its own kind)
+  bool has_view = false;
+  TextureView texture_view;
 };
 
 class CommandRecorder : public ICommandBuffer {
@@ -115,6 +118,20 @@ class CommandRecorder : public ICommandBuffer {
     c.unit = unit;
     c.image = image;
     c.sampler = sampler;
+    add(c);
+  }
+  void bind_texture_view(uint32_t unit, IImage* image, const SamplerDesc& sampler, const TextureView& view) override {
+    if (unit >= kMaxTextureUnits || !image) {
+      ok_ = false;
+      return;
+    }
+    RecordedCommand c;
+    c.type = RecordedCommand::Type::BindTexture;
+    c.unit = unit;
+    c.image = image;
+    c.sampler = sampler;
+    c.has_view = true;
+    c.texture_view = view;
     add(c);
   }
   void set_viewport(const Viewport& viewport) override {

@@ -43,6 +43,7 @@ const char* dimension_name(graphics::TextureKind kind) {
     case graphics::TextureKind::Texture3D: return "3D";
     case graphics::TextureKind::Texture2DArray: return "2D_ARRAY";
     case graphics::TextureKind::TextureCube: return "CUBE";
+    case graphics::TextureKind::TextureCubeArray: return "CUBEARRAY";   // (tgsi_strings.c spells it so; "CUBE_ARRAY" is read as CUBE and the rest refused)
     case graphics::TextureKind::Texture2DMS: return "2D_MSAA";
     default: return "2D";
   }
@@ -1642,6 +1643,17 @@ bool TgsiEmitter::instruction(const Instr& ins) {
       if (op == kTexFetch) {   // ld: integer x y (and z, the slice or layer) in the first components, the level in the last
         const String coordinate = operand(ins.src[0], 0, 0, nullptr, false);
         line("TXF", &texel, &coordinate, &sampler, &dim);
+      } else if (op == kTexLod && kind == graphics::TextureKind::TextureCubeArray) {   // sample_l of a cube array: the direction and the cube take all four components, the level goes in TXL2's second source
+        const String coordinate = operand(ins.src[0], 0, 0, nullptr, false), level = operand(ins.src[2], 0, 1, nullptr, true);
+        const String lod = temp(kWork3, ".x"), lod_source = temp(kWork3, ".xxxx");
+        const String direction = temp(kWork2);
+        String target = str();
+        add(target, sampler.view());
+        add(target, ", ");
+        add(target, dim.view());
+        line("MOV", &direction, &coordinate);
+        line("MOV", &lod, &level);
+        line("TXL2", &texel, &direction, &lod_source, &target);
       } else if (op == kTexLod) {   // sample_l: the coordinate, and the level next to it
         const uint8_t xyxy[4] = {0, 1, 0, 1}, xyzz[4] = {0, 1, 2, 2};
         const bool flat = kind == graphics::TextureKind::Texture2D;

@@ -992,7 +992,7 @@ static void test_texture_kinds(void) {
     check((blank & 0xFFFFFFu) == 0xFFFFFFu, "a cube slot with nothing bound samples white");
     desc.ArraySize = 12;
     ID3D11Texture2D *array_of_cubes = NULL;
-    check(ID3D11Device_CreateTexture2D(g_device, &desc, NULL, &array_of_cubes) == DXGI_ERROR_UNSUPPORTED && !array_of_cubes, "an array of cubes is refused (not there)");
+    check(SUCCEEDED(ID3D11Device_CreateTexture2D(g_device, &desc, NULL, &array_of_cubes)) && array_of_cubes, "an array of cubes (two of them, all their levels; test_mip_layers samples one)");
     if (array_of_cubes) ID3D11Texture2D_Release(array_of_cubes);
   }
 
@@ -2928,6 +2928,335 @@ static void test_plane_uavs(void) {
   ID3D11Texture2D_Release(tex);
 }
 
+/* ---- levels of arrays, cubes and volumes ---------------------------------------------------------------------------------------------------------------------------------- */
+
+/* The colour (B8G8R8A8 as a 0xAARRGGBB word) of layer `layer` (a cube array's face 6 * cube + face, a volume's slice) of level `level`. */
+static UINT32 ml_colour(UINT level, UINT layer) { return 0xFF000000u | (0x20u + level * 0x40u) << 16 | (0x10u + layer * 0x10u) << 8 | 0x33u; }
+/* A B8G8R8A8 texture of `layers` layers (cube: MISC_TEXTURECUBE) and `levels` levels, each subresource its colour from the initial data. */
+static ID3D11Texture2D *ml_texture(UINT size, UINT layers, UINT levels, UINT bind, UINT misc) {
+  static UINT32 store[64][64 * 64];
+  D3D11_SUBRESOURCE_DATA initial[64];
+  if (layers * levels > 64 || size > 64) return NULL;
+  for (UINT layer = 0; layer < layers; ++layer)
+    for (UINT level = 0; level < levels; ++level) {
+      const UINT w = size >> level ? size >> level : 1, sub = level + layer * levels;
+      for (UINT i = 0; i < w * w; ++i) store[sub][i] = ml_colour(level, layer);
+      initial[sub].pSysMem = store[sub];
+      initial[sub].SysMemPitch = w * 4;
+      initial[sub].SysMemSlicePitch = 0;
+    }
+  D3D11_TEXTURE2D_DESC desc = {size, size, levels, layers, DXGI_FORMAT_B8G8R8A8_UNORM, {1, 0}, D3D11_USAGE_DEFAULT, bind, 0, misc};
+  ID3D11Texture2D *t = NULL;
+  ID3D11Device_CreateTexture2D(g_device, &desc, initial, &t);
+  return t;
+}
+/* The middle pixel of a draw of the middle triangle with vs_vol and `ps` (texture coordinate (x, y, z) from the vertex colour, alpha `a`) sampling `view`. */
+static UINT32 ml_lookup(ID3D11VertexShader *vs, ID3D11PixelShader *ps, ID3D11ShaderResourceView *view, ID3D11SamplerState *sampler, float x, float y, float z, float a) {
+  const VertexF v[3] = {{-0.8f, -0.8f, 0.5f, x, y, z, a}, {0.8f, -0.8f, 0.5f, x, y, z, a}, {0.0f, 0.8f, 0.5f, x, y, z, a}};
+  ID3D11Buffer *vertices = make_buffer(D3D11_BIND_VERTEX_BUFFER, D3D11_USAGE_DEFAULT, 0, v, sizeof v);
+  begin(NULL);
+  clear(0, 0, 0);
+  bind_floats(vertices);
+  ID3D11DeviceContext_VSSetShader(g_context, vs, NULL, 0);
+  ID3D11DeviceContext_PSSetShader(g_context, ps, NULL, 0);
+  ID3D11DeviceContext_PSSetShaderResources(g_context, 0, 1, &view);
+  ID3D11DeviceContext_PSSetSamplers(g_context, 0, 1, &sampler);
+  ID3D11DeviceContext_Draw(g_context, 3, 0);
+  ID3D11ShaderResourceView *none = NULL;
+  ID3D11DeviceContext_PSSetShaderResources(g_context, 0, 1, &none);
+  const UINT32 got = read_target() ? pixel(32, 40) : 0;
+  if (vertices) ID3D11Buffer_Release(vertices);
+  return got;
+}
+/* Texel (x, y) of slice z of level `level` of a B8G8R8A8 volume, by way of a staging volume. */
+static UINT32 ml_volume_texel(ID3D11Texture3D *volume, UINT size, UINT depth, UINT levels, UINT level, UINT x, UINT y, UINT z) {
+  D3D11_TEXTURE3D_DESC sd = {size, size, depth, levels, DXGI_FORMAT_B8G8R8A8_UNORM, D3D11_USAGE_STAGING, 0, D3D11_CPU_ACCESS_READ, 0};
+  ID3D11Texture3D *staging = NULL;
+  UINT32 texel = 0xDEADBEEFu;
+  if (FAILED(ID3D11Device_CreateTexture3D(g_device, &sd, NULL, &staging))) return texel;
+  ID3D11DeviceContext_CopyResource(g_context, (ID3D11Resource *)staging, (ID3D11Resource *)volume);
+  D3D11_MAPPED_SUBRESOURCE mapped;
+  if (SUCCEEDED(ID3D11DeviceContext_Map(g_context, (ID3D11Resource *)staging, level, D3D11_MAP_READ, 0, &mapped))) {
+    memcpy(&texel, (const BYTE *)mapped.pData + (SIZE_T)z * mapped.DepthPitch + (SIZE_T)y * mapped.RowPitch + x * 4, 4);
+    ID3D11DeviceContext_Unmap(g_context, (ID3D11Resource *)staging, level);
+  }
+  ID3D11Texture3D_Release(staging);
+  return texel;
+}
+
+static void test_mip_layers(void) {
+  ID3D11VertexShader *vs = NULL;
+  ID3D11PixelShader *ps_array = NULL, *ps_array_lod = NULL, *ps_cubes = NULL, *ps_cubes_lod = NULL, *ps_volume_lod = NULL, *ps_cube = NULL;
+  ID3D11SamplerState *sampler = point_sampler();
+  HRESULT hr = ID3D11Device_CreateVertexShader(g_device, dx_vs_vol_dxbc, sizeof dx_vs_vol_dxbc, NULL, &vs);
+  if (SUCCEEDED(hr)) hr = ID3D11Device_CreatePixelShader(g_device, dx_ps_texarray_dxbc, sizeof dx_ps_texarray_dxbc, NULL, &ps_array);
+  if (SUCCEEDED(hr)) hr = ID3D11Device_CreatePixelShader(g_device, dx_ps_texarray_lod_dxbc, sizeof dx_ps_texarray_lod_dxbc, NULL, &ps_array_lod);
+  if (SUCCEEDED(hr)) hr = ID3D11Device_CreatePixelShader(g_device, dx_ps_texcubearray_dxbc, sizeof dx_ps_texcubearray_dxbc, NULL, &ps_cubes);
+  if (SUCCEEDED(hr)) hr = ID3D11Device_CreatePixelShader(g_device, dx_ps_texcubearray_lod_dxbc, sizeof dx_ps_texcubearray_lod_dxbc, NULL, &ps_cubes_lod);
+  if (SUCCEEDED(hr)) hr = ID3D11Device_CreatePixelShader(g_device, dx_ps_tex3d_lod_dxbc, sizeof dx_ps_tex3d_lod_dxbc, NULL, &ps_volume_lod);
+  if (SUCCEEDED(hr)) hr = ID3D11Device_CreatePixelShader(g_device, dx_ps_texcube_dxbc, sizeof dx_ps_texcube_dxbc, NULL, &ps_cube);
+  check(SUCCEEDED(hr) && sampler, "levels and layers: shaders of arrays, cube arrays (SM 4.1) and volumes, at a level");
+  if (FAILED(hr) || !sampler) goto done;
+
+  /* An array of three layers of 8 x 8 with all four levels kept: SampleLevel 1, and views from level 1 and layer 1 (the view's layer 0 is layer 1, its level 0 level 1) */
+  {
+    ID3D11Texture2D *array = ml_texture(8, 3, 4, D3D11_BIND_SHADER_RESOURCE, 0);
+    D3D11_TEXTURE2D_DESC got;
+    memset(&got, 0, sizeof got);
+    if (array) ID3D11Texture2D_GetDesc(array, &got);
+    check(array && got.MipLevels == 4 && got.ArraySize == 3, "an array of three layers with its four levels");
+    if (array) {
+      ID3D11ShaderResourceView *whole = NULL, *part = NULL;
+      ID3D11Device_CreateShaderResourceView(g_device, (ID3D11Resource *)array, NULL, &whole);
+      D3D11_SHADER_RESOURCE_VIEW_DESC sv;
+      memset(&sv, 0, sizeof sv);
+      sv.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+      sv.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2DARRAY;
+      sv.Texture2DArray.MostDetailedMip = 1;
+      sv.Texture2DArray.MipLevels = (UINT)-1;
+      sv.Texture2DArray.FirstArraySlice = 1;
+      sv.Texture2DArray.ArraySize = 2;
+      ID3D11Device_CreateShaderResourceView(g_device, (ID3D11Resource *)array, &sv, &part);
+      sv.Texture2DArray.MostDetailedMip = 4;
+      ID3D11ShaderResourceView *bad = NULL;
+      check(whole && part && ID3D11Device_CreateShaderResourceView(g_device, (ID3D11Resource *)array, &sv, &bad) == E_INVALIDARG && !bad, "views of the array: all of it, from level 1 and layer 1, none of a level it lacks");
+      if (whole && part) {
+        check(ml_lookup(vs, ps_array_lod, whole, sampler, 0.5f, 0.5f, 2.0f, 1) == ml_colour(1, 2), "SampleLevel 1 of layer 2 of an array");
+        check(ml_lookup(vs, ps_array, part, sampler, 0.5f, 0.5f, 0.0f, 1) == ml_colour(1, 1), "a view from level 1 and layer 1: its level 0 of its layer 0");
+        check(ml_lookup(vs, ps_array_lod, part, sampler, 0.5f, 0.5f, 1.0f, 1) == ml_colour(2, 2), "... and its level 1 of its layer 1");
+        /* UpdateSubresource of level 2 of layer 0, sampled */
+        UINT32 white[4] = {0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu};
+        ID3D11DeviceContext_UpdateSubresource(g_context, (ID3D11Resource *)array, 2, NULL, white, 8, 0);
+        sv.Texture2DArray.MostDetailedMip = 2, sv.Texture2DArray.FirstArraySlice = 0, sv.Texture2DArray.ArraySize = 1;
+        ID3D11ShaderResourceView *level2 = NULL;
+        ID3D11Device_CreateShaderResourceView(g_device, (ID3D11Resource *)array, &sv, &level2);
+        check(level2 && ml_lookup(vs, ps_array, level2, sampler, 0.5f, 0.5f, 0.0f, 1) == 0xFFFFFFFFu, "UpdateSubresource of a level of a layer, sampled through a view of it");
+        if (level2) ID3D11ShaderResourceView_Release(level2);
+        /* CopySubresourceRegion of level 1 of layer 2 into a plain texture; CopyResource of every level and layer */
+        check(subresource_texel(array, 1 + 2 * 4, 4, 4) == ml_colour(1, 2), "CopySubresourceRegion of level 1 of layer 2");
+        ID3D11Texture2D *copy = ml_texture(8, 3, 4, D3D11_BIND_SHADER_RESOURCE, 0);
+        if (copy) {
+          UINT32 black[64];
+          for (int i = 0; i < 64; ++i) black[i] = 0xFF000000u;
+          for (UINT sub = 0; sub < 12; ++sub) ID3D11DeviceContext_UpdateSubresource(g_context, (ID3D11Resource *)copy, sub, NULL, black, 32, 0);
+          ID3D11DeviceContext_CopyResource(g_context, (ID3D11Resource *)copy, (ID3D11Resource *)array);
+          int same = 1;
+          for (UINT layer = 0; layer < 3; ++layer)
+            for (UINT level = 1; level < 4; ++level) same &= subresource_texel(copy, level + layer * 4, 8 >> level, 8 >> level) == (level == 2 && layer == 0 ? 0xFFFFFFFFu : ml_colour(level, layer));
+          check(same, "CopyResource of an array: every level of every layer");
+          ID3D11Texture2D_Release(copy);
+        }
+      }
+      if (whole) ID3D11ShaderResourceView_Release(whole);
+      if (part) ID3D11ShaderResourceView_Release(part);
+      ID3D11Texture2D_Release(array);
+    }
+  }
+
+  /* A cube array of two cubes (12 faces) with two levels: cube 1's +Z face, and its level 1; a cube view of the second cube */
+  {
+    ID3D11Texture2D *cubes = ml_texture(4, 12, 2, D3D11_BIND_SHADER_RESOURCE, D3D11_RESOURCE_MISC_TEXTURECUBE);
+    ID3D11ShaderResourceView *view = NULL, *second = NULL;
+    if (cubes) ID3D11Device_CreateShaderResourceView(g_device, (ID3D11Resource *)cubes, NULL, &view);
+    D3D11_SHADER_RESOURCE_VIEW_DESC got;
+    memset(&got, 0, sizeof got);
+    if (view) ID3D11ShaderResourceView_GetDesc(view, &got);
+    check(cubes && view && got.ViewDimension == D3D11_SRV_DIMENSION_TEXTURECUBEARRAY && got.TextureCubeArray.NumCubes == 2, "an array of two cubes and its TEXTURECUBEARRAY view");
+    if (view) {
+      check(ml_lookup(vs, ps_cubes, view, sampler, 0.55f, 0.57f, 1.0f, 0.1f) == ml_colour(0, 10), "a cube array sampled: +Z of cube 1");
+      check(ml_lookup(vs, ps_cubes_lod, view, sampler, 0.55f, 0.57f, 1.0f, 0.1f) == ml_colour(1, 10), "... SampleLevel 1 of it");
+      D3D11_SHADER_RESOURCE_VIEW_DESC sv;
+      memset(&sv, 0, sizeof sv);
+      sv.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+      sv.ViewDimension = D3D11_SRV_DIMENSION_TEXTURECUBE;
+      sv.TextureCube.MipLevels = (UINT)-1;
+      ID3D11Device_CreateShaderResourceView(g_device, (ID3D11Resource *)cubes, &sv, &second);
+      check(second && ml_lookup(vs, ps_cube, second, sampler, 0.1f, 0.15f, 1.0f, 1) == ml_colour(0, 4), "a cube view of a cube array: its first cube");
+      ID3D11ShaderResourceView_Release(view);
+    }
+    if (second) ID3D11ShaderResourceView_Release(second);
+    if (cubes) ID3D11Texture2D_Release(cubes);
+  }
+
+  /* A volume of 4 x 4 x 4 with its three levels (level 1 two slices deep); then GenerateMips of a volume of levels (2 x 2 x 2 boxes) */
+  {
+    static UINT32 l0[64], l1[8], l2[1];
+    for (int i = 0; i < 64; ++i) l0[i] = ml_colour(0, i / 16);
+    for (int i = 0; i < 8; ++i) l1[i] = ml_colour(1, i / 4);
+    l2[0] = ml_colour(2, 0);
+    const D3D11_SUBRESOURCE_DATA initial[3] = {{l0, 16, 64}, {l1, 8, 16}, {l2, 4, 4}};
+    D3D11_TEXTURE3D_DESC desc = {4, 4, 4, 3, DXGI_FORMAT_B8G8R8A8_UNORM, D3D11_USAGE_DEFAULT, D3D11_BIND_SHADER_RESOURCE, 0, 0};
+    ID3D11Texture3D *volume = NULL;
+    ID3D11ShaderResourceView *view = NULL;
+    hr = ID3D11Device_CreateTexture3D(g_device, &desc, initial, &volume);
+    D3D11_TEXTURE3D_DESC got;
+    memset(&got, 0, sizeof got);
+    if (volume) { ID3D11Texture3D_GetDesc(volume, &got); ID3D11Device_CreateShaderResourceView(g_device, (ID3D11Resource *)volume, NULL, &view); }
+    check(SUCCEEDED(hr) && view && got.MipLevels == 3, "a volume with its three levels");
+    if (view) {
+      check(ml_lookup(vs, ps_volume_lod, view, sampler, 0.5f, 0.5f, 0.75f, 1) == ml_colour(1, 1), "SampleLevel 1 of a volume: the second of its two slices there");
+      ID3D11ShaderResourceView_Release(view);
+    }
+    if (volume) ID3D11Texture3D_Release(volume);
+    /* (slices 0 and 1 blue, 2 and 3 black: level 1's first slice blue, its second black; level 2 the average) */
+    for (int i = 0; i < 64; ++i) l0[i] = i < 32 ? 0xFF0000FFu : 0xFF000000u;
+    D3D11_TEXTURE3D_DESC made = {4, 4, 4, 3, DXGI_FORMAT_B8G8R8A8_UNORM, D3D11_USAGE_DEFAULT, D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET, 0, D3D11_RESOURCE_MISC_GENERATE_MIPS};
+    ID3D11Texture3D *chain = NULL;
+    ID3D11ShaderResourceView *chain_view = NULL;
+    ID3D11Device_CreateTexture3D(g_device, &made, NULL, &chain);
+    if (chain) {
+      ID3D11DeviceContext_UpdateSubresource(g_context, (ID3D11Resource *)chain, 0, NULL, l0, 16, 64);
+      ID3D11Device_CreateShaderResourceView(g_device, (ID3D11Resource *)chain, NULL, &chain_view);
+    }
+    if (chain_view) ID3D11DeviceContext_GenerateMips(g_context, chain_view);
+    const UINT32 a = chain ? ml_volume_texel(chain, 4, 4, 3, 1, 0, 0, 0) : 0, b = chain ? ml_volume_texel(chain, 4, 4, 3, 1, 1, 1, 1) : 0, c = chain ? ml_volume_texel(chain, 4, 4, 3, 2, 0, 0, 0) : 0;
+    if (!(a == 0xFF0000FFu && b == 0xFF000000u && (c == 0xFF000080u || c == 0xFF00007Fu))) printf("d3d11test: (a volume's levels: %08x %08x %08x)\n", (unsigned)a, (unsigned)b, (unsigned)c);
+    check(chain_view && a == 0xFF0000FFu && b == 0xFF000000u && (c == 0xFF000080u || c == 0xFF00007Fu), "GenerateMips of a volume: 2 x 2 x 2 boxes, level after level");
+    if (chain_view) ID3D11ShaderResourceView_Release(chain_view);
+    if (chain) ID3D11Texture3D_Release(chain);
+  }
+
+  /* Render targets and depth buffers of levels drawn into directly: a clear of layer 1 of level 1 of an array, a draw into level 2 of layer 0 with a depth buffer of its level */
+  {
+    ID3D11Texture2D *targets = ml_texture(32, 2, 3, D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE, 0);
+    D3D11_TEXTURE2D_DESC dd = {16, 16, 2, 1, DXGI_FORMAT_D32_FLOAT, {1, 0}, D3D11_USAGE_DEFAULT, D3D11_BIND_DEPTH_STENCIL, 0, 0};
+    ID3D11Texture2D *depth = NULL;
+    ID3D11Device_CreateTexture2D(g_device, &dd, NULL, &depth);
+    D3D11_TEXTURE2D_DESC got;
+    memset(&got, 0, sizeof got);
+    if (depth) ID3D11Texture2D_GetDesc(depth, &got);
+    check(targets && depth && got.MipLevels == 2, "a render target array of levels, a depth buffer of two levels");
+    if (targets && depth) {
+      D3D11_RENDER_TARGET_VIEW_DESC rd;
+      memset(&rd, 0, sizeof rd);
+      rd.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+      rd.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2DARRAY;
+      rd.Texture2DArray.MipSlice = 1;
+      rd.Texture2DArray.FirstArraySlice = 1;
+      rd.Texture2DArray.ArraySize = 1;
+      ID3D11RenderTargetView *layer1 = NULL, *level2 = NULL;
+      ID3D11Device_CreateRenderTargetView(g_device, (ID3D11Resource *)targets, &rd, &layer1);
+      rd.Texture2DArray.MipSlice = 2;
+      rd.Texture2DArray.FirstArraySlice = 0;
+      ID3D11Device_CreateRenderTargetView(g_device, (ID3D11Resource *)targets, &rd, &level2);
+      D3D11_DEPTH_STENCIL_VIEW_DESC dv;
+      memset(&dv, 0, sizeof dv);
+      dv.Format = DXGI_FORMAT_D32_FLOAT;
+      dv.ViewDimension = D3D11_DSV_DIMENSION_TEXTURE2D;
+      dv.Texture2D.MipSlice = 1;
+      ID3D11DepthStencilView *dsv = NULL;
+      ID3D11Device_CreateDepthStencilView(g_device, (ID3D11Resource *)depth, &dv, &dsv);
+      check(layer1 && level2 && dsv, "views of a level of a layer to draw into, and of level 1 of the depth buffer");
+      if (layer1 && level2 && dsv) {
+        const float red[4] = {1, 0, 0, 1}, black[4] = {0, 0, 0, 1};
+        ID3D11DeviceContext_ClearRenderTargetView(g_context, layer1, red);
+        check(subresource_texel(targets, 1 + 1 * 3, 16, 16) == 0xFFFF0000u && subresource_texel(targets, 1, 16, 16) == ml_colour(1, 0) && subresource_texel(targets, 0 + 1 * 3, 32, 32) == ml_colour(0, 1),
+              "a clear of layer 1 of level 1: that subresource alone");
+        ID3D11DeviceContext_ClearRenderTargetView(g_context, level2, black);
+        ID3D11DeviceContext_ClearDepthStencilView(g_context, dsv, D3D11_CLEAR_DEPTH, 1.0f, 0);
+        const VertexF tri[3] = {{-0.8f, -0.8f, 0.5f, 0, 1, 0, 1}, {0.8f, -0.8f, 0.5f, 0, 1, 0, 1}, {0.0f, 0.8f, 0.5f, 0, 1, 0, 1}};
+        ID3D11Buffer *vertices = make_buffer(D3D11_BIND_VERTEX_BUFFER, D3D11_USAGE_DEFAULT, 0, tri, sizeof tri);
+        D3D11_VIEWPORT vp = {0, 0, 8, 8, 0, 1};
+        begin(NULL);
+        ID3D11DeviceContext_OMSetRenderTargets(g_context, 1, &level2, dsv);
+        ID3D11DeviceContext_RSSetViewports(g_context, 1, &vp);
+        bind_floats(vertices);
+        ID3D11DeviceContext_PSSetShader(g_context, g_ps_color, NULL, 0);
+        ID3D11DeviceContext_Draw(g_context, 3, 0);
+        begin(NULL);
+        D3D11_TEXTURE2D_DESC sd = {8, 8, 1, 1, DXGI_FORMAT_B8G8R8A8_UNORM, {1, 0}, D3D11_USAGE_STAGING, 0, D3D11_CPU_ACCESS_READ, 0};
+        ID3D11Texture2D *staging = NULL;
+        UINT32 middle = 0, corner = 0;
+        if (SUCCEEDED(ID3D11Device_CreateTexture2D(g_device, &sd, NULL, &staging))) {
+          ID3D11DeviceContext_CopySubresourceRegion(g_context, (ID3D11Resource *)staging, 0, 0, 0, 0, (ID3D11Resource *)targets, 2, NULL);
+          D3D11_MAPPED_SUBRESOURCE mapped;
+          if (SUCCEEDED(ID3D11DeviceContext_Map(g_context, (ID3D11Resource *)staging, 0, D3D11_MAP_READ, 0, &mapped))) {
+            memcpy(&middle, (const BYTE *)mapped.pData + 4 * mapped.RowPitch + 4 * 4, 4);
+            memcpy(&corner, mapped.pData, 4);
+            ID3D11DeviceContext_Unmap(g_context, (ID3D11Resource *)staging, 0);
+          }
+          ID3D11Texture2D_Release(staging);
+        }
+        if (!(middle == 0xFF00FF00u && corner == 0xFF000000u)) printf("d3d11test: (level 2 drawn: middle %08x, corner %08x)\n", (unsigned)middle, (unsigned)corner);
+        check(middle == 0xFF00FF00u && corner == 0xFF000000u && subresource_texel(targets, 2 + 1 * 3, 8, 8) == ml_colour(2, 1), "a draw into level 2 of layer 0 with a depth buffer's level 1");
+        if (vertices) ID3D11Buffer_Release(vertices);
+      }
+      if (dsv) ID3D11DepthStencilView_Release(dsv);
+      if (level2) ID3D11RenderTargetView_Release(level2);
+      if (layer1) ID3D11RenderTargetView_Release(layer1);
+    }
+    if (depth) ID3D11Texture2D_Release(depth);
+    if (targets) ID3D11Texture2D_Release(targets);
+  }
+
+  /* GenerateMips of an array: each layer its own chain, only the view's layers */
+  {
+    ID3D11Texture2D *array = ml_texture(4, 2, 3, D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE, D3D11_RESOURCE_MISC_GENERATE_MIPS);
+    ID3D11ShaderResourceView *layer1 = NULL;
+    if (array) {
+      UINT32 grey[16];
+      for (int i = 0; i < 16; ++i) grey[i] = 0xFF404040u;
+      ID3D11DeviceContext_UpdateSubresource(g_context, (ID3D11Resource *)array, 0 + 1 * 3, NULL, grey, 16, 0);
+      ID3D11DeviceContext_UpdateSubresource(g_context, (ID3D11Resource *)array, 0, NULL, grey, 16, 0);
+      D3D11_SHADER_RESOURCE_VIEW_DESC sv;
+      memset(&sv, 0, sizeof sv);
+      sv.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+      sv.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2DARRAY;
+      sv.Texture2DArray.MipLevels = (UINT)-1;
+      sv.Texture2DArray.FirstArraySlice = 1;
+      sv.Texture2DArray.ArraySize = 1;
+      ID3D11Device_CreateShaderResourceView(g_device, (ID3D11Resource *)array, &sv, &layer1);
+    }
+    if (layer1) ID3D11DeviceContext_GenerateMips(g_context, layer1);
+    check(layer1 && subresource_texel(array, 2 + 1 * 3, 1, 1) == 0xFF404040u && subresource_texel(array, 2, 1, 1) == ml_colour(2, 0), "GenerateMips of a view of layer 1 of an array: that layer's levels alone");
+    if (layer1) ID3D11ShaderResourceView_Release(layer1);
+    if (array) ID3D11Texture2D_Release(array);
+  }
+
+  /* Unordered access to the faces of level 1 of a cube (a TEXTURE2DARRAY view of its six faces; cs_uav_array writes (x / 8, y / 8, face / 6, 1)) */
+  {
+    D3D11_TEXTURE2D_DESC cd = {16, 16, 2, 6, DXGI_FORMAT_R8G8B8A8_UNORM, {1, 0}, D3D11_USAGE_DEFAULT, D3D11_BIND_UNORDERED_ACCESS | D3D11_BIND_SHADER_RESOURCE, 0, D3D11_RESOURCE_MISC_TEXTURECUBE};
+    ID3D11Texture2D *cube = NULL;
+    ID3D11Device_CreateTexture2D(g_device, &cd, NULL, &cube);
+    ID3D11ComputeShader *fill = NULL;
+    ID3D11Device_CreateComputeShader(g_device, dx_cs_uav_array_dxbc, sizeof dx_cs_uav_array_dxbc, NULL, &fill);
+    ID3D11UnorderedAccessView *faces = NULL;
+    D3D11_UNORDERED_ACCESS_VIEW_DESC u;
+    memset(&u, 0, sizeof u);
+    u.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    u.ViewDimension = D3D11_UAV_DIMENSION_TEXTURE2DARRAY;
+    u.Texture2DArray.MipSlice = 1;
+    u.Texture2DArray.ArraySize = 6;
+    if (cube) ID3D11Device_CreateUnorderedAccessView(g_device, (ID3D11Resource *)cube, &u, &faces);
+    check(cube && fill && faces, "a cube with unordered access, a view of the faces of its level 1");
+    if (cube && fill && faces) {
+      ID3D11DeviceContext_CSSetShader(g_context, fill, NULL, 0);
+      ID3D11DeviceContext_CSSetUnorderedAccessViews(g_context, 0, 1, &faces, NULL);
+      ID3D11DeviceContext_Dispatch(g_context, 1, 1, 6);
+      ID3D11UnorderedAccessView *none = NULL;
+      ID3D11DeviceContext_CSSetUnorderedAccessViews(g_context, 0, 1, &none, NULL);
+      /* (R8G8B8A8 as a word: 0xAABBGGRR; texel (0, 0) of face 3 at level 1 is (0, 0, 0.5, 1), of face 0 (0, 0, 0, 1); level 0 is as it was) */
+      const UINT32 face3 = subresource_texel(cube, 1 + 3 * 2, 8, 8), face0 = subresource_texel(cube, 1 + 0 * 2, 8, 8), level0 = subresource_texel(cube, 0 + 3 * 2, 16, 16);
+      const int half_ok = face3 == 0xFF800000u || face3 == 0xFF7F0000u;      /* (0.5 as a byte: a GPU may round it down) */
+      if (!half_ok || face0 != 0xFF000000u || level0 != 0) printf("d3d11test: (the cube's faces: %08x %08x, level 0 %08x)\n", (unsigned)face3, (unsigned)face0, (unsigned)level0);
+      check(half_ok && face0 == 0xFF000000u && level0 == 0, "the faces of level 1 of a cube written by a compute shader");
+    }
+    if (faces) ID3D11UnorderedAccessView_Release(faces);
+    if (fill) ID3D11ComputeShader_Release(fill);
+    if (cube) ID3D11Texture2D_Release(cube);
+  }
+done:
+  if (sampler) ID3D11SamplerState_Release(sampler);
+  if (ps_array) ID3D11PixelShader_Release(ps_array);
+  if (ps_array_lod) ID3D11PixelShader_Release(ps_array_lod);
+  if (ps_cubes) ID3D11PixelShader_Release(ps_cubes);
+  if (ps_cubes_lod) ID3D11PixelShader_Release(ps_cubes_lod);
+  if (ps_volume_lod) ID3D11PixelShader_Release(ps_volume_lod);
+  if (ps_cube) ID3D11PixelShader_Release(ps_cube);
+  if (vs) ID3D11VertexShader_Release(vs);
+  begin(NULL);
+}
+
 static void test_render_to_levels(void) {
   D3D11_TEXTURE2D_DESC desc = {8, 8, 0, 1, DXGI_FORMAT_R8G8B8A8_UNORM, {1, 0}, D3D11_USAGE_DEFAULT, D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE, 0,
                                D3D11_RESOURCE_MISC_GENERATE_MIPS};
@@ -3782,6 +4111,7 @@ int main(void) {
       test_three_planes(0);
       test_three_planes(1);
       test_texture_kinds();
+      test_mip_layers();
       test_shader_stages();
       test_compressed();
       test_compute();

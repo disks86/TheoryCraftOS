@@ -17,6 +17,7 @@
  */
 
 #include "Kernel/Dxgkrnl/Adapter.hpp"
+#include "Graphics/WidePixels.hpp"
 #include "Utility/ByteBuffer.hpp"
 #include "Graphics/Graphics3D/BuiltinShaders.hpp"
 #include "Graphics/Graphics3D/Mipmaps.hpp"
@@ -43,31 +44,91 @@ constexpr int32_t kMaxScissor = 1 << 16;
 
 bool finite_within(float v, float limit) { return v == v && v >= -limit && v <= limit; }
 
-// The backing of an allocation is allocated 16-byte aligned, so it is a whole number of aligned words (false would mean a bug in VidMm).
-bool as_words(ByteView bytes, ArrayView<uint32_t>* out) { return bytes.try_cast<uint32_t>(out); }
-
 // The device takes shader text as a `const char*`. The bytes are the shader's own copy, NUL terminated by the caller, and char has no alignment requirement.
 const char* text_pointer(ByteView text) { return reinterpret_cast<const char*>(text.data()); }
 
 
-// Copies a w x h block of pixels between the system-memory backings of two allocations of one format (they may be the same allocation, the blocks overlapping).
-// The GPU's newer contents are read back first, and the destination's device object is marked stale. The caller has checked the rectangles.
-NtStatus copy_region_cpu(VidMm& mm, Allocation& dst, uint32_t dx, uint32_t dy, Allocation& src, uint32_t sx, uint32_t sy, uint32_t w, uint32_t h) {
+// Copies a w x h block of pixels (of a block-compressed format: of whole blocks, x, y, w and h in pixels) of `layers` layers between the system-memory backings of two allocations whose
+// pixels are as many bytes: from layer src_layer .. of level src_level to dst_layer .. of dst_level (they may be the same allocation, the blocks overlapping). The GPU's newer contents are read
+// back first, and the destination's device object is marked stale. The caller has checked the rectangles.
+NtStatus copy_subresources_cpu(VidMm& mm, Allocation& dst, uint32_t dst_level, uint32_t dst_layer, uint32_t dx, uint32_t dy, Allocation& src, uint32_t src_level, uint32_t src_layer, uint32_t sx,
+                               uint32_t sy, uint32_t w, uint32_t h, uint32_t layers) {
   if (!mm.read_back(src) || !mm.read_back(dst)) return status::kInvalidDeviceState;
-  const uint32_t bpp = pixel_bytes(dst.desc().format);   // (the formats are equal)
-  const uint64_t row_bytes = uint64_t{w} * bpp;
-  const bool bottom_up = &dst == &src && dy > sy;   // (overlapping rows: copy the ones that would be overwritten last)
-  for (uint32_t i = 0; i < h; ++i) {
-    const uint32_t y = bottom_up ? h - 1 - i : i;
-    ByteView to;
-    ConstByteView from;
-    if (!dst.writable_backing().try_subview((uint64_t{dy + y} * dst.desc().width + dx) * bpp, row_bytes, &to) ||
-        !src.backing().try_subview((uint64_t{sy + y} * src.desc().width + sx) * bpp, row_bytes, &from))
-      return status::kInvalidParameter;
-    to.copy_from(from);
+  const Format f = src.desc().format;
+  const uint32_t unit = is_compressed(f) ? 4 : 1;
+  const uint64_t row_bytes = image_row_bytes(f, w), dst_pitch = image_row_bytes(f, graphics::mip_extent(dst.desc().width, dst_level)),
+                 src_pitch = image_row_bytes(f, graphics::mip_extent(src.desc().width, src_level));
+  const uint32_t rows = image_rows(f, h);
+  const bool same = &dst == &src && dst_level == src_level;
+  const bool layers_down = same && dst_layer > src_layer;                 // (overlapping layers: the ones that would be overwritten first are copied last)
+  for (uint32_t k = 0; k < layers; ++k) {
+    const uint32_t layer = layers_down ? layers - 1 - k : k;
+    uint64_t dst_at = 0, src_at = 0, bytes = 0;
+    if (!dst.subresource_range(dst_level, dst_layer + layer, &dst_at, &bytes) || !src.subresource_range(src_level, src_layer + layer, &src_at, &bytes)) return status::kInvalidParameter;
+    const bool bottom_up = same && dst_layer == src_layer && dy > sy;       // (overlapping rows: copy the ones that would be overwritten last)
+    for (uint32_t i = 0; i < rows; ++i) {
+      const uint32_t row = bottom_up ? rows - 1 - i : i;
+      ByteView to;
+      ConstByteView from;
+      if (!dst.writable_backing().try_subview(dst_at + uint64_t{dy / unit + row} * dst_pitch + image_row_bytes(f, dx), row_bytes, &to) ||
+          !src.backing().try_subview(src_at + uint64_t{sy / unit + row} * src_pitch + image_row_bytes(f, sx), row_bytes, &from))
+        return status::kInvalidParameter;
+      to.copy_from(from);
+    }
   }
   mm.note_cpu_write(dst);
   return status::kSuccess;
+}
+NtStatus copy_region_cpu(VidMm& mm, Allocation& dst, uint32_t dx, uint32_t dy, Allocation& src, uint32_t sx, uint32_t sy, uint32_t w, uint32_t h) {
+  return copy_subresources_cpu(mm, dst, 0, 0, dx, dy, src, 0, 0, sx, sy, w, h, 1);
+}
+
+// GenerateMipmaps on the backing: every level of every layer from the level before it by the box filter (graphics::mip_box_downsample's: each channel the mean of the 2 x 2 texels at
+// twice the place, rounded to the nearest; a volume's 2 x 2 x 2 of the two slices at twice the slice), the 8-bit formats by their codes (an sRGB image's chain is of its stored codes), the
+// wide ones by their values. The caller has read the GPU's contents back.
+bool generate_levels_cpu(Allocation& a) {
+  const AllocationDesc& d = a.desc();
+  const bool wide = is_wide(d.format), volume = d.kind == graphics::TextureKind::Texture3D;
+  const graphics::Format wide_format = device_wide_format(d.format);
+  const uint32_t bpp = pixel_bytes(d.format), taps = volume ? 8 : 4;
+  for (uint32_t level = 1; level < d.mip_levels; ++level) {
+    const uint32_t sw = graphics::mip_extent(d.width, level - 1), sh = graphics::mip_extent(d.height, level - 1);
+    const uint32_t dw = graphics::mip_extent(d.width, level), dh = graphics::mip_extent(d.height, level);
+    const uint32_t below = a.level_layers(level - 1);
+    for (uint32_t layer = 0; layer < a.level_layers(level); ++layer) {
+      const uint32_t z0 = volume ? (2 * layer < below ? 2 * layer : below - 1) : layer, z1 = volume ? (2 * layer + 1 < below ? 2 * layer + 1 : below - 1) : layer;
+      uint64_t to_at = 0, from_a = 0, from_b = 0, bytes = 0;
+      if (!a.subresource_range(level, layer, &to_at, &bytes) || !a.subresource_range(level - 1, z0, &from_a, &bytes) || !a.subresource_range(level - 1, z1, &from_b, &bytes)) return false;
+      for (uint32_t y = 0; y < dh; ++y)
+        for (uint32_t x = 0; x < dw; ++x) {
+          const uint32_t y0 = 2 * y < sh ? 2 * y : sh - 1, y1 = 2 * y + 1 < sh ? 2 * y + 1 : sh - 1, x0 = 2 * x < sw ? 2 * x : sw - 1, x1 = 2 * x + 1 < sw ? 2 * x + 1 : sw - 1;
+          const uint64_t at[4] = {uint64_t{y0} * sw + x0, uint64_t{y0} * sw + x1, uint64_t{y1} * sw + x0, uint64_t{y1} * sw + x1};
+          ByteView out;
+          if (!a.writable_backing().try_subview(to_at + (uint64_t{y} * dw + x) * bpp, bpp, &out)) return false;
+          if (wide) {
+            graphics::Vec4 sum = {0, 0, 0, 0};
+            for (uint32_t k = 0; k < taps; ++k) {
+              ConstByteView texel;
+              if (!a.backing().try_subview((k < 4 ? from_a : from_b) + at[k % 4] * bpp, bpp, &texel)) return false;
+              ByteReader in(texel);
+              sum = sum + graphics::decode_wide_pixel(wide_format, in);
+            }
+            ByteWriter w(out);
+            graphics::encode_wide_pixel(wide_format, sum * (1.0f / static_cast<float>(taps)), w);
+            if (!w.ok()) return false;
+            continue;
+          }
+          uint32_t sum[4] = {};
+          for (uint32_t k = 0; k < taps; ++k) {
+            ConstByteView texel;
+            if (!a.backing().try_subview((k < 4 ? from_a : from_b) + at[k % 4] * bpp, bpp, &texel)) return false;
+            for (uint32_t c = 0; c < 4; ++c) sum[c] += texel[c];
+          }
+          for (uint32_t c = 0; c < 4; ++c) out[c] = static_cast<uint8_t>((sum[c] + taps / 2) / taps);
+        }
+    }
+  }
+  return true;
 }
 
 }  // namespace
@@ -220,6 +281,51 @@ class Adapter::StreamRunner {
     for (uint32_t u = 0; u < graphics::kMaxTextureUnits; ++u)
       if (texture_bound_[u] && texture_alloc_[u] == a) texture_bound_[u] = false;
   }
+  // Whether unit `u`'s view shows layers first .. first + count - 1 of level `level` of `a` (a pass that draws there may not sample them; one that draws into other levels or layers may).
+  bool unit_sees(uint32_t u, const Allocation* a, uint32_t level, uint32_t first, uint32_t count) const {
+    if (!texture_bound_[u] || texture_alloc_[u] != a) return false;
+    const graphics::TextureView& v = texture_view_[u];
+    if (level < v.base_level || level >= v.base_level + v.level_count) return false;
+    if (a->texture_kind() == graphics::TextureKind::Texture3D) return true;
+    return first < v.first_layer + v.layer_count && v.first_layer < first + count;
+  }
+  void unbind_textures_drawn(const Allocation* a, uint32_t level, uint32_t first, uint32_t count) {
+    for (uint32_t u = 0; u < graphics::kMaxTextureUnits; ++u)
+      if (unit_sees(u, a, level, first, count)) texture_bound_[u] = false;
+  }
+  // Whether the open pass draws where unit `u`'s view of its image would show (bind_texture refuses such a view).
+  bool drawn_in_pass(uint32_t u) const {
+    for (uint32_t n = 0; n <= graphics::kMaxColorTargets; ++n) {
+      const Allocation* t = n == graphics::kMaxColorTargets ? pass_depth_ : n == 0 ? pass_color_ : n < pass_target_count_ ? pass_extra_[n - 1] : nullptr;
+      if (t && unit_sees(u, t, pass_level_[n], pass_first_layer_[n], pass_layer_count_[n])) return true;
+    }
+    return false;
+  }
+  // The textures a pipeline's shaders read (`mask`: bit u for unit u): bound, and through a view of the kind the shader declared (texture_view_fits; a multisampled image to a Texture2DMS
+  // unit only). Replaying, a unit whose device binding is of another kind is bound again with the declared one.
+  NtStatus fit_textures(const PipelineObject& p, uint32_t mask) {
+    const bool views = (adapter_.caps_.features2 & graphics::kFeature2MipmappedLayers) != 0;
+    for (uint32_t u = 0; u < graphics::kMaxTextureUnits; ++u) {
+      if (!(mask >> u & 1)) continue;
+      if (!texture_bound_[u]) return refuse(__LINE__);
+      const Allocation* a = texture_alloc_[u];
+      const graphics::TextureKind declared = p.texture_kind(u);
+      graphics::TextureView view = texture_view_[u];
+      if (a->desc().samples > 1) {
+        if (declared != graphics::TextureKind::Texture2DMS) return refuse(__LINE__);
+        continue;
+      }
+      view.kind = declared;
+      // (unbound, or a volume where the shader reads a 2D texture, ...)
+      if (views ? !graphics::texture_view_fits(a->texture_kind(), a->layers(), a->mip_levels(), view) : a->texture_kind() != declared) return refuse(__LINE__);
+      if (!exec_ || !views || device_view_kind_[u] == declared) continue;
+      const NtStatus s = ensure_cb();
+      if (s != status::kSuccess) return s;
+      cb_->bind_texture_view(u, a->image(), texture_sampler_[u], view);
+      device_view_kind_[u] = declared;
+    }
+    return status::kSuccess;
+  }
 
   NtStatus packet(Op op, ByteReader& p) {
     switch (op) {
@@ -322,10 +428,12 @@ class Adapter::StreamRunner {
     // Further colour targets, one word each (the adapter's kFeatureMultipleTargets), and with kPassLayers the first layer and count of each target and of the depth buffer after them.
     Allocation* extras[graphics::kMaxColorTargets - 1] = {};
     uint32_t extra_count = 0;
-    const bool layered = (flags & kPassLayers) != 0;
+    // (with kPassLevels the level of each colour target and of the depth buffer after that: kFeature2MipmappedLayers)
+    const bool layered = (flags & kPassLayers) != 0, leveled = (flags & kPassLevels) != 0;
     const uint64_t rest = p.ok() ? p.remaining() / 4 : 0;
-    if (layered && (rest < 4 || (rest - 4) % 3)) return kBad;
-    const uint64_t extra_words = layered ? (rest - 4) / 3 : rest;
+    const uint64_t per_extra = 1 + (layered ? 2 : 0) + (leveled ? 1 : 0), fixed = (layered ? 4 : 0) + (leveled ? 2 : 0);
+    if (rest < fixed || (rest - fixed) % per_extra) return kBad;
+    const uint64_t extra_words = (rest - fixed) / per_extra;
     while (extra_count < extra_words && !p.at_end() && p.ok() && extra_count < adapter_.caps_.max_color_targets - 1) {
       extras[extra_count] = alloc(p.le32());
       if (!extras[extra_count]) return kBad;
@@ -338,6 +446,12 @@ class Adapter::StreamRunner {
       first_layer[graphics::kMaxColorTargets] = p.le32(), layer_count[graphics::kMaxColorTargets] = p.le32();
       if (!(adapter_.caps_.features2 & graphics::kFeature2LayeredTargets)) return kBad;
     }
+    uint32_t level[graphics::kMaxColorTargets + 1] = {};
+    if (leveled) {
+      for (uint32_t n = 0; n <= extra_count; ++n) level[n] = p.le32();
+      level[graphics::kMaxColorTargets] = p.le32();
+      if (!(adapter_.caps_.features2 & graphics::kFeature2MipmappedLayers)) return kBad;
+    }
     if (!exact(p) || in_pass_) return kBad;
     if (extra_count && !(adapter_.caps_.features & graphics::kFeatureMultipleTargets)) return kBad;
     Allocation* color = alloc(color_index);
@@ -345,19 +459,24 @@ class Adapter::StreamRunner {
     if (!color || !color->is_image() || !(color->desc().flags & kAllocRenderTarget) || !use(color, state::kRenderTarget)) return kBad;
     if (depth_index != kNoAllocation && (!depth || !depth->is_image() || !(depth->desc().flags & kAllocDepthStencil))) return kBad;
     if (depth && !use(depth, state::kDepthWrite)) return kBad;
-    if (depth && (depth->desc().width != color->desc().width || depth->desc().height != color->desc().height || depth->desc().samples != color->desc().samples)) return kBad;
+    // (every target's level - each a level it has - is of one size: the pass's)
+    if (level[0] >= color->mip_levels() || (depth && level[graphics::kMaxColorTargets] >= depth->mip_levels())) return kBad;
+    const uint32_t pass_w = graphics::mip_extent(color->desc().width, level[0]), pass_h = graphics::mip_extent(color->desc().height, level[0]);
+    auto sized = [&](const Allocation* t, uint32_t l) { return graphics::mip_extent(t->desc().width, l) == pass_w && graphics::mip_extent(t->desc().height, l) == pass_h; };
+    if (depth && (!sized(depth, level[graphics::kMaxColorTargets]) || depth->desc().samples != color->desc().samples)) return kBad;
     for (uint32_t n = 0; n < extra_count; ++n) {
       const Allocation* e = extras[n];
       if (!e->is_image() || !(e->desc().flags & kAllocRenderTarget) || e == color || e == depth || !use(extras[n], state::kRenderTarget)) return kBad;
-      if (e->desc().width != color->desc().width || e->desc().height != color->desc().height || e->desc().format != color->desc().format || e->desc().samples != color->desc().samples) return kBad;
+      if (level[n + 1] >= e->mip_levels() || !sized(e, level[n + 1]) || e->desc().format != color->desc().format || e->desc().samples != color->desc().samples) return kBad;
       for (uint32_t k = 0; k < n; ++k)
         if (extras[k] == e) return kBad;
     }
-    if (flags & ~(kPassClearColor | kPassClearDepth | kPassClearStencil | kPassLayers)) return kBad;
-    // (the layers of each target are layers it has: a plain image's are layer 0 of 1, and so are those of the depth buffer of a pass without one)
+    if (flags & ~(kPassClearColor | kPassClearDepth | kPassClearStencil | kPassLayers | kPassLevels)) return kBad;
+    // (the layers of each target are layers its level has: a plain image's are layer 0 of 1, and so are those of the depth buffer of a pass without one)
     for (uint32_t n = 0; n <= graphics::kMaxColorTargets; ++n) {
       const Allocation* t = n == graphics::kMaxColorTargets ? depth : n == 0 ? color : n <= extra_count ? extras[n - 1] : nullptr;
-      const uint32_t layers = t ? t->layers() : 1;
+      const uint32_t layers = t ? t->level_layers(level[n]) : 1;
+      if (!t && level[n] != 0) return kBad;
       if (layer_count[n] == 0 || first_layer[n] >= layers || layer_count[n] > layers - first_layer[n]) return kBad;
     }
     // (the clear colour of an integer target is four integers as float bits: any bit pattern)
@@ -367,9 +486,11 @@ class Adapter::StreamRunner {
     // into an image does): no draw of the pass can sample through it, since a draw needs its units bound (draw) and a target cannot be bound during the pass
     // (bind_texture). Refusing the stream instead refused ordinary render-to-texture in one command list - sample A, draw into B, then sample B, draw into A -
     // and made the layers above send a list before every such pass.
-    unbind_textures_of(color);
-    if (depth) unbind_textures_of(depth);
-    for (uint32_t n = 0; n < extra_count; ++n) unbind_textures_of(extras[n]);
+    // (a unit that shows only other levels or layers of a target than those the pass draws into stays: render into a level while sampling the one above it)
+    unbind_textures_drawn(color, level[0], first_layer[0], layer_count[0]);
+    if (depth) unbind_textures_drawn(depth, level[graphics::kMaxColorTargets], first_layer[graphics::kMaxColorTargets], layer_count[graphics::kMaxColorTargets]);
+    for (uint32_t n = 0; n < extra_count; ++n) unbind_textures_drawn(extras[n], level[n + 1], first_layer[n + 1], layer_count[n + 1]);
+    for (uint32_t n = 0; n <= graphics::kMaxColorTargets; ++n) pass_level_[n] = level[n], pass_first_layer_[n] = first_layer[n], pass_layer_count_[n] = layer_count[n];
     in_pass_ = true;
     pass_color_ = color;
     pass_depth_ = depth;
@@ -397,7 +518,7 @@ class Adapter::StreamRunner {
     pass.clear_stencil = (flags & kPassClearStencil) != 0;
     pass.clear_stencil_value = static_cast<uint8_t>(clear_stencil);
     for (uint32_t n = 0; n < extra_count; ++n) pass.extra_colors[n] = extras[n]->image();
-    for (uint32_t n = 0; n <= graphics::kMaxColorTargets; ++n) pass.first_layer[n] = first_layer[n], pass.layer_count[n] = layer_count[n];
+    for (uint32_t n = 0; n <= graphics::kMaxColorTargets; ++n) pass.first_layer[n] = first_layer[n], pass.layer_count[n] = layer_count[n], pass.level[n] = level[n];
     cb_->begin_render_pass(pass);
     mm_.note_gpu_write(*color);
     for (uint32_t n = 0; n < extra_count; ++n) mm_.note_gpu_write(*extras[n]);
@@ -526,9 +647,7 @@ class Adapter::StreamRunner {
     if (uint64_t{x} * y * z * per_group > graphics::kMaxDispatchThreads) return kBad;
     for (uint32_t slot = 0; slot < graphics::kMaxStorageBuffers; ++slot)
       if (compute_->storage_mask().test(slot) && !uav_bound_[slot]) return kBad;
-    for (uint32_t u = 0; u < graphics::kMaxTextureUnits; ++u)   // (the textures the shader reads: bound, and of the kind it declared)
-      if ((compute_->texture_mask() >> u & 1) && (!texture_bound_[u] || (texture_alloc_[u]->desc().samples > 1 ? graphics::TextureKind::Texture2DMS : texture_alloc_[u]->texture_kind()) != compute_->texture_kind(u)))
-        return kBad;
+    if (const NtStatus fitted = fit_textures(*compute_, compute_->texture_mask())) return fitted;   // (the textures the shader reads: bound, and of the kind it declared)
     if (!images_fit(*compute_)) return refuse(__LINE__);   // (the storage images it declares: bound, and of what it declared)
     if (both_planes(compute_->texture_mask())) return refuse(__LINE__);   // (a depth buffer's two planes at once)
     if (x == 0 || y == 0 || z == 0 || !exec_) return status::kSuccess;
@@ -593,7 +712,11 @@ class Adapter::StreamRunner {
   NtStatus bind_texture(ByteReader& p) {
     const uint32_t unit = p.le32(), index = p.le32(), filter = p.le32(), au = p.le32(), av = p.le32(), mip = p.le32();
     const float bias = bits_float(p.le32()), min_lod = bits_float(p.le32()), max_lod = bits_float(p.le32());
-    const uint32_t view = p.remaining() >= 4 ? p.le32() : 0;   // (the optional tenth word: texture_view_word)
+    const uint32_t view = p.ok() && !p.at_end() ? p.le32() : 0;   // (the optional tenth word: texture_view_word)
+    // (optionally after it the view: the first level and the count of levels, the first layer and the count of layers, a count of 0 to the last; kFeature2MipmappedLayers)
+    const bool has_view = p.ok() && !p.at_end();
+    uint32_t base_level = 0, level_count = 0, first_layer = 0, layer_count = 0;
+    if (has_view) base_level = p.le32(), level_count = p.le32(), first_layer = p.le32(), layer_count = p.le32();
     graphics::AddressMode mode_u, mode_v;
     graphics::BorderColor border, no_border;
     graphics::CompareOp compare = graphics::CompareOp::Never;
@@ -605,12 +728,22 @@ class Adapter::StreamRunner {
     if (!finite_within(bias, 100.0f) || !finite_within(min_lod, 100.0f) || !finite_within(max_lod, 1000.0f)) return refuse(__LINE__);
     Allocation* a = alloc(index);
     if (!a || !a->is_image() || !(a->desc().flags & kAllocTexture) || a->is_staging() || !use(a, state::kPixelShaderResource | state::kNonPixelShaderResource)) return refuse(__LINE__);
-    if (in_pass_ && (a == pass_color_ || a == pass_depth_ || is_extra_target(pass_extra_, pass_target_count_ - 1, a))) return refuse(__LINE__);
     if (stencil && !(a->is_depth() && a->desc().format == Format::D24S8)) return refuse(__LINE__);   // (the stencil plane of a depth buffer that has one)
+    // (the view: levels and layers the image has - all of them without one, or on a device that has no views)
+    const bool views = (adapter_.caps_.features2 & graphics::kFeature2MipmappedLayers) != 0;
+    if (level_count == 0 && base_level < a->mip_levels()) level_count = a->mip_levels() - base_level;
+    if (layer_count == 0 && first_layer < a->layers()) layer_count = a->layers() - first_layer;
+    if (base_level >= a->mip_levels() || level_count > a->mip_levels() - base_level || first_layer >= a->layers() || layer_count > a->layers() - first_layer) return refuse(__LINE__);
+    if (a->texture_kind() == graphics::TextureKind::Texture3D && (first_layer != 0 || layer_count != a->layers())) return refuse(__LINE__);   // (a volume's view has all its slices)
+    if (!views && (base_level != 0 || level_count != a->mip_levels() || first_layer != 0 || layer_count != a->layers())) return refuse(__LINE__);
     texture_bound_[unit] = true;
     texture_alloc_[unit] = a;
     texture_stencil_[unit] = stencil;
-    if (!exec_) return status::kSuccess;
+    texture_view_[unit] = graphics::TextureView{a->texture_kind(), base_level, level_count, first_layer, layer_count};
+    if (in_pass_ && drawn_in_pass(unit)) {   // (a pass may not sample what it draws into; other levels and layers of its targets it may)
+      texture_bound_[unit] = false;
+      return refuse(__LINE__);
+    }
     graphics::SamplerDesc sampler;
     sampler.filter = static_cast<graphics::Filter>(filter);
     sampler.address_u = mode_u;
@@ -622,12 +755,32 @@ class Adapter::StreamRunner {
     sampler.max_lod = max_lod;
     sampler.compare = compare;
     sampler.stencil = stencil;
+    texture_sampler_[unit] = sampler;
+    if (!exec_) return status::kSuccess;
     NtStatus s = resident(*a);
     if (s == status::kSuccess) s = ensure_cb();
     if (s != status::kSuccess) return s;
-    cb_->bind_texture(unit, a->image(), sampler);
-    texture_sampler_[unit] = sampler;
+    if (views) {
+      // (the image's own kind; a draw or dispatch binds it again of the kind its shader declares when that is another: fit_textures)
+      graphics::TextureView whole = texture_view_[unit];
+      if (a->desc().samples > 1) cb_->bind_texture(unit, a->image(), sampler);
+      else cb_->bind_texture_view(unit, a->image(), sampler, whole);
+      device_view_kind_[unit] = a->texture_kind();
+    } else {
+      cb_->bind_texture(unit, a->image(), sampler);
+    }
     return status::kSuccess;
+  }
+  // Binds unit `u`'s image again on the device with `sampler`: through its view, of the kind the device's binding has, on a device with views (kFeature2MipmappedLayers).
+  void rebind_unit(uint32_t u, const graphics::SamplerDesc& sampler) {
+    const Allocation* a = texture_alloc_[u];
+    if ((adapter_.caps_.features2 & graphics::kFeature2MipmappedLayers) && a->desc().samples <= 1) {
+      graphics::TextureView view = texture_view_[u];
+      view.kind = device_view_kind_[u];
+      cb_->bind_texture_view(u, a->image(), sampler, view);
+    } else {
+      cb_->bind_texture(u, a->image(), sampler);
+    }
   }
   // On a device whose textures read one plane at a time (no kFeature2DepthAndStencilPlanes), a unit the pipeline has but its shaders do not read that shows the other plane of a
   // depth buffer a read unit shows is made to show the read one (the device's texture takes the plane of the views bound to it).
@@ -639,7 +792,7 @@ class Adapter::StreamRunner {
         if (!(declared >> v & 1) || !texture_bound_[v] || texture_alloc_[v] != texture_alloc_[u] || texture_stencil_[v] == texture_stencil_[u]) continue;
         graphics::SamplerDesc sampler = texture_sampler_[u];
         sampler.stencil = texture_stencil_[v];
-        cb_->bind_texture(u, texture_alloc_[u]->image(), sampler);
+        rebind_unit(u, sampler);
         texture_stencil_[u] = sampler.stencil;
         texture_sampler_[u] = sampler;
         break;
@@ -701,8 +854,7 @@ class Adapter::StreamRunner {
         if ((pipeline_->stream_output_buffers() >> b & 1) && !so_bound_[b]) return refuse(__LINE__);
     if (is_adjacency(topology_) && !pipeline_->has_geometry()) return refuse(__LINE__);   // (only a geometry shader takes the neighbours)
     if (pipeline_->has_tessellation() && (patch_points(topology_) != pipeline_->tess_input_points() || pipeline_->has_geometry())) return refuse(__LINE__);
-    for (uint32_t u = 0; u < pipeline_->texture_count(); ++u)
-      if (!texture_bound_[u] || (texture_alloc_[u]->desc().samples > 1 ? graphics::TextureKind::Texture2DMS : texture_alloc_[u]->texture_kind()) != pipeline_->texture_kind(u)) return refuse(__LINE__);   // (unbound, or a volume where the shader reads a 2D texture, ...)
+    if (const NtStatus fitted = fit_textures(*pipeline_, pipeline_->texture_count() >= 32 ? ~0u : (1u << pipeline_->texture_count()) - 1)) return fitted;   // (bound, and of the kinds the shaders declare)
     if (both_planes(pipeline_->declared_units())) return refuse(__LINE__);   // (a depth buffer's two planes at once, read by the shaders)
     if (pipeline_->color_target_count() > pass_target_count_) return refuse(__LINE__);
     for (uint32_t slot = 0; slot < graphics::kMaxStorageBuffers; ++slot)
@@ -887,15 +1039,32 @@ class Adapter::StreamRunner {
 
   NtStatus copy_region(ByteReader& p) {
     const uint32_t di = p.le32(), dx = p.le32(), dy = p.le32(), si = p.le32(), sx = p.le32(), sy = p.le32(), w = p.le32(), h = p.le32();
-    if (!exact(p) || in_pass_ || w == 0 || h == 0) return kBad;
+    // (optionally: the destination's level and first layer, the source's, and the number of layers - a volume's slices - from them)
+    uint32_t dst_level = 0, dst_layer = 0, src_level = 0, src_layer = 0, layers = 1;
+    if (p.ok() && !p.at_end()) dst_level = p.le32(), dst_layer = p.le32(), src_level = p.le32(), src_layer = p.le32(), layers = p.le32();
+    if (!exact(p) || in_pass_ || w == 0 || h == 0 || layers == 0) return kBad;
     Allocation* dst = alloc(di);
     Allocation* src = alloc(si);
     if (!dst || !src || !dst->is_image() || !src->is_image() || dst->is_depth() || src->is_depth() || !use(dst, state::kCopyDest) || !use(src, state::kCopySource)) return kBad;
-    if (dst->desc().format != src->desc().format || dst->mip_levels() != 1 || src->mip_levels() != 1 || dst->desc().samples != 1 || src->desc().samples != 1 || is_compressed(dst->desc().format)) return kBad;
-    if (uint64_t{dx} + w > dst->desc().width || uint64_t{dy} + h > dst->desc().height || uint64_t{sx} + w > src->desc().width || uint64_t{sy} + h > src->desc().height) return kBad;
+    // (formats whose pixels - or blocks - are the same bytes: one format, or two of one size and kind - what Direct3D's copies between the formats of one typeless group are)
+    const Format df = dst->desc().format, sf = src->desc().format;
+    if (df != sf && (is_compressed(df) != is_compressed(sf) || image_row_bytes(df, 4) != image_row_bytes(sf, 4))) return kBad;
+    if (dst->desc().samples != 1 || src->desc().samples != 1) return kBad;
+    if (dst_level >= dst->mip_levels() || src_level >= src->mip_levels()) return kBad;
+    const uint32_t dw = graphics::mip_extent(dst->desc().width, dst_level), dh = graphics::mip_extent(dst->desc().height, dst_level);
+    const uint32_t sw = graphics::mip_extent(src->desc().width, src_level), sh = graphics::mip_extent(src->desc().height, src_level);
+    if (uint64_t{dx} + w > dw || uint64_t{dy} + h > dh || uint64_t{sx} + w > sw || uint64_t{sy} + h > sh) return kBad;
+    if (dst_layer >= dst->level_layers(dst_level) || layers > dst->level_layers(dst_level) - dst_layer || src_layer >= src->level_layers(src_level) || layers > src->level_layers(src_level) - src_layer) return kBad;
+    if (is_compressed(sf)) {   // (whole blocks: the rectangle starts on a block and ends on one or at the level's edge, in both)
+      auto blocks = [](uint32_t x, uint32_t span, uint32_t edge) { return x % 4 == 0 && ((x + span) % 4 == 0 || x + span == edge); };
+      if (!blocks(dx, w, dw) || !blocks(dy, h, dh) || !blocks(sx, w, sw) || !blocks(sy, h, sh)) return kBad;
+    }
+    const bool plain = dst_level == 0 && src_level == 0 && dst_layer == 0 && src_layer == 0 && layers == 1 && dst->mip_levels() == 1 && src->mip_levels() == 1 && !is_compressed(sf) &&
+                       dst->layers() == 1 && src->layers() == 1;
+    if (!plain && !(adapter_.caps_.features2 & graphics::kFeature2MipmappedLayers) && (is_compressed(sf) || dst->mip_levels() != 1 || src->mip_levels() != 1)) return kBad;
     if (!exec_) return status::kSuccess;
     NtStatus s = flush();
-    if (s == status::kSuccess) s = copy_region_cpu(mm_, *dst, dx, dy, *src, sx, sy, w, h);
+    if (s == status::kSuccess) s = copy_subresources_cpu(mm_, *dst, dst_level, dst_layer, dx, dy, *src, src_level, src_layer, sx, sy, w, h, layers);
     unbind_textures_of(dst);
     return s;
   }
@@ -935,10 +1104,10 @@ class Adapter::StreamRunner {
     Allocation* buffer = alloc(bi);
     if (!image || !image->is_image() || image->is_depth() || image->desc().samples != 1 || !copyable_buffer(buffer)) return kBad;
     if (!use(image, direction == 0 ? state::kCopyDest : state::kCopySource) || !use(buffer, direction == 0 ? state::kCopySource : state::kCopyDest)) return kBad;
-    const bool plain = image->desc().kind == graphics::TextureKind::Texture2D;
-    if (level >= image->mip_levels() || layer >= image->layers() || (!plain && level != 0)) return kBad;
-    const uint32_t level_w = plain ? graphics::mip_extent(image->desc().width, level) : image->desc().width;
-    const uint32_t level_h = plain ? graphics::mip_extent(image->desc().height, level) : image->desc().height;
+    // (a layer of a level: an array's slice or a volume's slice at that level)
+    if (level >= image->mip_levels() || layer >= image->level_layers(level)) return kBad;
+    const uint32_t level_w = graphics::mip_extent(image->desc().width, level);
+    const uint32_t level_h = graphics::mip_extent(image->desc().height, level);
     // (a block-compressed image is copied in whole blocks: the rectangle starts on a block and ends on one or at the level's edge; its rows are rows of blocks)
     const Format format = image->desc().format;
     const uint32_t unit = is_compressed(format) ? 4 : 1;
@@ -954,14 +1123,13 @@ class Adapter::StreamRunner {
     if (pitch < buffer_row_bytes) return kBad;
     if (uint64_t{boff} + uint64_t{pitch} * (rows - 1) + buffer_row_bytes > buffer->desc().size) return kBad;
     uint64_t level_offset = 0, level_bytes = 0;
-    if (!image->level_range(level, &level_offset, &level_bytes)) return kBad;
+    if (!image->subresource_range(level, layer, &level_offset, &level_bytes)) return kBad;
     if (!exec_) return status::kSuccess;
     NtStatus s = flush();
     if (s != status::kSuccess) return s;
     if (!mm_.read_back(*image) || !mm_.read_back(*buffer)) return status::kInvalidDeviceState;
-    const uint64_t layer_bytes = image_level_bytes(format, level_w, level_h);
     for (uint32_t row = 0; row < rows; ++row) {
-      const uint64_t image_at = level_offset + layer_bytes * layer + uint64_t{first_row + row} * level_row_bytes + x_bytes;
+      const uint64_t image_at = level_offset + uint64_t{first_row + row} * level_row_bytes + x_bytes;
       const uint64_t buffer_at = uint64_t{boff} + uint64_t{pitch} * row;
       ByteView to;
       ConstByteView from;
@@ -1653,24 +1821,18 @@ class Adapter::StreamRunner {
     return status::kSuccess;
   }
 
+  // Every level of the texture from level 0 (every layer of an array or a cube its own chain, a volume's levels from the two slices above each), on the CPU from the backing: the GPU's
+  // contents are read back first (a target drawn into). Not of a block-compressed or integer texture (their levels are not made by filtering: Direct3D's GenerateMips refuses them).
   NtStatus generate_mipmaps(ByteReader& p) {
     const uint32_t index = p.le32();
     if (!exact(p) || in_pass_) return kBad;
     Allocation* a = alloc(index);
-    if (!a || !a->is_image() || !(a->desc().flags & kAllocTexture) || a->mip_levels() < 2 || is_compressed(a->desc().format)) return kBad;
+    if (!a || !a->is_image() || !(a->desc().flags & kAllocTexture) || a->mip_levels() < 2 || is_compressed(a->desc().format) || is_integer(a->desc().format) || a->desc().samples != 1) return kBad;
+    if (!(adapter_.caps_.features2 & graphics::kFeature2MipmappedLayers) && (a->layers() != 1 || is_wide(a->desc().format))) return kBad;
     if (!exec_) return status::kSuccess;
     NtStatus s = flush();
     if (s != status::kSuccess) return s;
-    for (uint32_t level = 1; level < a->mip_levels(); ++level) {
-      uint64_t from_offset = 0, from_bytes = 0, to_offset = 0, to_bytes = 0;
-      ArrayView<uint32_t> from, to;
-      if (!a->level_range(level - 1, &from_offset, &from_bytes) || !a->level_range(level, &to_offset, &to_bytes) || !as_words(a->writable_backing().subview(from_offset, from_bytes), &from) ||
-          !as_words(a->writable_backing().subview(to_offset, to_bytes), &to))
-        return status::kInvalidDeviceState;
-      // (the box filter averages each byte of a pixel on its own, so the order of the channels does not matter)
-      graphics::mip_box_downsample(ArrayView<const uint32_t>(from.data(), from.size()), graphics::mip_extent(a->desc().width, level - 1), graphics::mip_extent(a->desc().height, level - 1), to,
-                                   graphics::mip_extent(a->desc().width, level), graphics::mip_extent(a->desc().height, level));
-    }
+    if (!mm_.read_back(*a) || !generate_levels_cpu(*a)) return status::kInvalidDeviceState;
     mm_.note_cpu_write(*a);
     unbind_textures_of(a);
     return status::kSuccess;
@@ -1929,7 +2091,7 @@ class Adapter::StreamRunner {
     }
     Allocation* a = alloc(index);
     graphics::Format view = graphics::Format::Undefined;
-    if (!a || !a->is_image() || !(a->desc().flags & kAllocStorageImage) || level >= a->mip_levels() || count == 0 || first >= a->layers() || count > a->layers() - first ||
+    if (!a || !a->is_image() || !(a->desc().flags & kAllocStorageImage) || level >= a->mip_levels() || count == 0 || first >= a->level_layers(level) || count > a->level_layers(level) - first ||
         view_format > static_cast<uint32_t>(Format::R32Float) || !storage_view_format(a->desc().format, static_cast<Format>(view_format), &view) || !use(a, state::kUnorderedAccess))
       return refuse(__LINE__);
     image_bound_[slot] = true;
@@ -2139,14 +2301,14 @@ class Adapter::StreamRunner {
             } else if (range.type == RangeType::Srv && d.kind == DescriptorKind::Srv) {
               if (reg >= adapter_.caps_.max_texture_units) return refuse(__LINE__);
               // (t<reg> goes to every unit the shaders read it through - its own, and those of its pairs with other samplers -, each with the sampler of its pair; a unit a
-              // pair of another texture has is that pair's)
+              // pair of another texture has is that pair's. Each shows the descriptor's levels and layers, and its plane of a depth buffer)
               for (uint32_t unit = 0; unit < adapter_.caps_.max_texture_units; ++unit) {
                 if ((reads ? reads->unit_texture(unit) : unit) != reg) continue;
                 Allocation* image = view_image(d, reads ? reads->texture_kind(unit) : graphics::TextureKind::Texture2D);
                 graphics::SamplerDesc sampler = sampler_for(reads ? reads->unit_sampler(unit) : unit);
                 sampler.stencil = d.stencil;   // (the view's plane of a depth buffer)
                 NtStatus s = refresh_mirror(image, false);
-                if (s == status::kSuccess) s = lower_texture(unit, image, sampler);
+                if (s == status::kSuccess) s = lower_texture(unit, image, sampler, image == d.allocation.get() ? d.view : graphics::TextureView());
                 if (s != status::kSuccess) return s;
               }
             } else if (range.type == RangeType::Uav && d.kind == DescriptorKind::Uav) {
@@ -2199,13 +2361,16 @@ class Adapter::StreamRunner {
     return status::kSuccess;
   }
 
-  NtStatus lower_texture(uint32_t unit, Allocation* a, const graphics::SamplerDesc& sampler) {
+  NtStatus lower_texture(uint32_t unit, Allocation* a, const graphics::SamplerDesc& sampler, const graphics::TextureView& view) {
     uint32_t index = 0;
     if (!a || !index_of(a, &index)) return refuse(__LINE__);   // (the allocation is in the list or the draw is refused)
     ByteBuffer packet(adapter_.allocator_);
     for (uint32_t w : {unit, index, static_cast<uint32_t>(sampler.filter), address_word(sampler.address_u, sampler.border), address_word(sampler.address_v), static_cast<uint32_t>(sampler.mip_filter),
                        __builtin_bit_cast(uint32_t, sampler.lod_bias), __builtin_bit_cast(uint32_t, sampler.min_lod), __builtin_bit_cast(uint32_t, sampler.max_lod), texture_view_word(sampler)})
       packet.put32(w);
+    // (the descriptor's view: its levels and layers, on a device that has views)
+    if (adapter_.caps_.features2 & graphics::kFeature2MipmappedLayers)
+      for (uint32_t w : {view.base_level, view.level_count, view.first_layer, view.layer_count}) packet.put32(w);
     ByteReader reader(packet.view());
     return bind_texture(reader);
   }
@@ -2294,7 +2459,6 @@ class Adapter::StreamRunner {
   bool texture_bound_[graphics::kMaxTextureUnits] = {};
   const Allocation* texture_alloc_[graphics::kMaxTextureUnits] = {};
   bool texture_stencil_[graphics::kMaxTextureUnits] = {};   // (the unit reads a depth buffer's stencil plane)
-  graphics::SamplerDesc texture_sampler_[graphics::kMaxTextureUnits];   // (what the device was given for the unit)
   // Whether the units `used` (bit n: unit n) read both planes of one depth buffer, which a device without kFeature2DepthAndStencilPlanes cannot do in one draw or dispatch.
   bool both_planes(uint32_t used) const {
     if (adapter_.caps_.features2 & graphics::kFeature2DepthAndStencilPlanes) return false;
@@ -2305,6 +2469,11 @@ class Adapter::StreamRunner {
     }
     return false;
   }
+  graphics::TextureView texture_view_[graphics::kMaxTextureUnits];        // the levels and layers each unit shows (BindTexture's view, counts made whole)
+  graphics::SamplerDesc texture_sampler_[graphics::kMaxTextureUnits];   // (what the device was given for the unit)
+  graphics::TextureKind device_view_kind_[graphics::kMaxTextureUnits] = {};   // the kind the device's binding of the unit has (kFeature2MipmappedLayers)
+  // The open pass's level and layers of each target (kMaxColorTargets: the depth buffer).
+  uint32_t pass_level_[graphics::kMaxColorTargets + 1] = {}, pass_first_layer_[graphics::kMaxColorTargets + 1] = {}, pass_layer_count_[graphics::kMaxColorTargets + 1] = {};
 };
 
 // --- The adapter ----------------------------------------------------------------------------------------------------------------------------------------------------

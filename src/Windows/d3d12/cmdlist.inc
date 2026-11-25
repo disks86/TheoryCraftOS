@@ -142,16 +142,16 @@ struct CmdList {
   float blend_factor[4];       /* OMSetBlendFactor (0, 0, 0, 0 when the list is reset) */
   UINT rtv[8];                 /* the kernel's allocations of the colour targets */
   UINT rtv_count;
-  UINT rtv_layers[8][2];       /* ... the first layer and the count of each (an array's slices, a volume's depth slices: 0, 1 for a 2D view) */
+  UINT rtv_layers[8][3];       /* ... the first layer and the count of each (an array's slices, a volume's depth slices: 0, 1 for a 2D view), and the level */
   UINT dsv;
-  UINT dsv_layers[2];          /* ... and of the depth buffer */
+  UINT dsv_layers[3];          /* ... and of the depth buffer */
   int pass_open;
   UINT uav_only_samples, uav_only_width, uav_only_height;      /* the pass open is on a target of the device's for draws with no target (ensure_pass): its samples and size (0: not such a pass) */
   int pending_clear;           /* a depth/stencil clear waiting for a pass */
   UINT pending_width, pending_height, pending_samples;      /* (the buffer's size: for its companion, if no pass takes the clear) */
   UINT dsv_width, dsv_height, dsv_samples;                  /* the size of the depth buffer in `dsv` */
   UINT pending_alloc, pending_flags;
-  UINT pending_layers[2];      /* (the cleared view's first layer and count: the pass that takes the clear draws into those) */
+  UINT pending_layers[3];      /* (the cleared view's first layer, count and level: the pass that takes the clear draws into those) */
   float pending_depth;
   UINT pending_stencil;
   /* what the chunk being recorded has already sent */
@@ -364,9 +364,10 @@ static void STDMETHODCALLTYPE list_ClearState(CmdList *This, ID3D12PipelineState
 /* The RTV/DSV a handle names. */
 static SoftDesc *view_at(D3D12_CPU_DESCRIPTOR_HANDLE h) { return desc_at(h); }
 
-/* `layers`: the first layer and the count of each colour target and then of the depth buffer (NULL: layer 0 of each); a pass of layers says them (kPassLayers). */
-static void begin_pass_packet_layers(CmdList *l, UINT color_alloc, UINT depth_alloc, UINT flags, const float color[4], float depth, UINT stencil, const UINT (*layers)[2], const UINT *depth_layers) {
-  UINT w[9 + 7 + 18];
+/* `layers`: the first layer, the count and the level of each colour target and then of the depth buffer (NULL: layer 0 of level 0 of each); a pass of layers says them (kPassLayers),
+ * one of levels says those (kPassLevels). */
+static void begin_pass_packet_layers(CmdList *l, UINT color_alloc, UINT depth_alloc, UINT flags, const float color[4], float depth, UINT stencil, const UINT (*layers)[3], const UINT *depth_layers) {
+  UINT w[9 + 7 + 18 + 9];
   UINT n = 0;
   w[n++] = alloc_index(l, color_alloc);
   w[n++] = depth_alloc ? alloc_index(l, depth_alloc) : 0xFFFFFFFFu;
@@ -390,6 +391,15 @@ static void begin_pass_packet_layers(CmdList *l, UINT color_alloc, UINT depth_al
     w[n++] = depth_layers && depth_alloc ? depth_layers[0] : 0;
     w[n++] = depth_layers && depth_alloc && depth_layers[1] ? depth_layers[1] : 1;
   }
+  int leveled = 0;
+  for (UINT i = 0; layers && i < targets; ++i) leveled |= layers[i][2] != 0;
+  if (depth_layers && depth_alloc) leveled |= depth_layers[2] != 0;
+  if (leveled) {
+    /* (kPassLevels: the level of each colour target and of the depth buffer) */
+    w[2] |= 16u;
+    for (UINT i = 0; i < targets; ++i) w[n++] = layers ? layers[i][2] : 0;
+    w[n++] = depth_layers && depth_alloc ? depth_layers[2] : 0;
+  }
   packet(l, OP_BEGIN_PASS, w, n);
 }
 static void begin_pass_packet(CmdList *l, UINT color_alloc, UINT depth_alloc, UINT flags, const float color[4], float depth, UINT stencil) {
@@ -404,7 +414,7 @@ static UINT depth_companion(Dev *dev, UINT depth, UINT width, UINT height, UINT 
   if (!depth || !width || !height) return 0;
   AcquireSRWLockExclusive(&dev->companion_lock);
   for (UINT i = 0; i < dev->companion_count; ++i)
-    if (dev->companions[i].depth == depth) { color = dev->companions[i].color; break; }
+    if (dev->companions[i].depth == depth && dev->companions[i].width == width && dev->companions[i].height == height) { color = dev->companions[i].color; break; }
   if (!color) {
     if (dev->companion_count == dev->companion_capacity) {
       const UINT capacity = dev->companion_capacity ? dev->companion_capacity * 2 : 8;
@@ -427,6 +437,8 @@ static UINT depth_companion(Dev *dev, UINT depth, UINT width, UINT height, UINT 
       ad.samples = samples ? samples : 1;
       if (KMT_OK(kmt_create_allocation(dev->kdev, &ad, &color, NULL, NULL)) && color) {
         dev->companions[dev->companion_count].depth = depth;
+        dev->companions[dev->companion_count].width = width;
+        dev->companions[dev->companion_count].height = height;
         dev->companions[dev->companion_count++].color = color;
       } else {
         color = 0;
@@ -438,16 +450,19 @@ static UINT depth_companion(Dev *dev, UINT depth, UINT width, UINT height, UINT 
 }
 /* (the depth buffer is being destroyed) */
 static void depth_companion_drop(Dev *dev, UINT depth) {
-  UINT color = 0;
-  AcquireSRWLockExclusive(&dev->companion_lock);
-  for (UINT i = 0; i < dev->companion_count; ++i) {
-    if (dev->companions[i].depth != depth) continue;
-    color = dev->companions[i].color;
-    dev->companions[i] = dev->companions[--dev->companion_count];
-    break;
+  for (;;) {      /* (every level's companion of it) */
+    UINT color = 0;
+    AcquireSRWLockExclusive(&dev->companion_lock);
+    for (UINT i = 0; i < dev->companion_count; ++i) {
+      if (dev->companions[i].depth != depth) continue;
+      color = dev->companions[i].color;
+      dev->companions[i] = dev->companions[--dev->companion_count];
+      break;
+    }
+    ReleaseSRWLockExclusive(&dev->companion_lock);
+    if (!color) return;
+    kmt_destroy_allocation(dev->kdev, color);
   }
-  ReleaseSRWLockExclusive(&dev->companion_lock);
-  if (color) kmt_destroy_allocation(dev->kdev, color);
 }
 
 /* The colour target of a pass with no render target and no depth buffer (a draw that writes unordered access views only: Direct3D's UAV-only rendering, ForcedSampleCount): the
@@ -511,7 +526,7 @@ static int ensure_pass(CmdList *l) {
   static const float zero[4] = {0, 0, 0, 0};
   if (l->pass_open) return 1;
   UINT color = l->rtv_count ? l->rtv[0] : 0, depth = l->dsv;
-  if (l->pending_clear && (l->pending_alloc != depth || l->pending_layers[0] != l->dsv_layers[0] || l->pending_layers[1] != l->dsv_layers[1])) flush_pending_clear(l);
+  if (l->pending_clear && (l->pending_alloc != depth || l->pending_layers[0] != l->dsv_layers[0] || l->pending_layers[1] != l->dsv_layers[1] || l->pending_layers[2] != l->dsv_layers[2])) flush_pending_clear(l);
   const int companion = !color && depth && !(l->pso && l->pso->so_entries);
   if (companion) color = depth_companion(l->d.dev, depth, l->dsv_width, l->dsv_height, l->dsv_samples);
   if (!color && l->pso && l->pso->so_entries) {
@@ -561,7 +576,7 @@ static int ensure_pass(CmdList *l) {
     l->rtv_count = saved;
   } else {
     /* (the layers of the list's targets; a target of the device's own - stream output with none - is a 2D image) */
-    begin_pass_packet_layers(l, color, depth, flags, zero, depth_value, stencil, l->rtv_count && color == l->rtv[0] ? (const UINT(*)[2])l->rtv_layers : NULL,
+    begin_pass_packet_layers(l, color, depth, flags, zero, depth_value, stencil, l->rtv_count && color == l->rtv[0] ? (const UINT(*)[3])l->rtv_layers : NULL,
                              depth && depth == l->dsv ? l->dsv_layers : NULL);
   }
   l->pass_open = 1;
@@ -890,15 +905,16 @@ static void STDMETHODCALLTYPE list_OMSetRenderTargets(CmdList *l, UINT count, co
     const int rtv = d && d->kind == DK_RTV;
     l->rtv_layers[l->rtv_count][0] = rtv ? d->slice : 0;
     l->rtv_layers[l->rtv_count][1] = rtv && d->stride ? d->stride : 1;
+    l->rtv_layers[l->rtv_count][2] = rtv ? d->mip : 0;
     l->rtv[l->rtv_count++] = rtv ? d->alloc : 0;
   }
   l->dsv = 0;
-  l->dsv_layers[0] = 0, l->dsv_layers[1] = 1;
+  l->dsv_layers[0] = 0, l->dsv_layers[1] = 1, l->dsv_layers[2] = 0;
   if (dsv && dsv->ptr) {
     const SoftDesc *d = view_at(*dsv);
     if (d && d->kind == DK_DSV) {
       l->dsv = d->alloc;
-      l->dsv_layers[0] = d->slice, l->dsv_layers[1] = d->stride ? d->stride : 1;
+      l->dsv_layers[0] = d->slice, l->dsv_layers[1] = d->stride ? d->stride : 1, l->dsv_layers[2] = d->mip;
       l->dsv_width = (UINT)d->size;
       l->dsv_height = (UINT)(d->size >> 32);
       l->dsv_samples = (UINT)d->offset;
@@ -994,7 +1010,7 @@ static void STDMETHODCALLTYPE list_ClearRenderTargetView(CmdList *l, D3D12_CPU_D
       memcpy(&integers[c], &u, 4);
     }
   }
-  const UINT layers[1][2] = {{d->slice, d->stride ? d->stride : 1}};      /* (the view's layers) */
+  const UINT layers[1][3] = {{d->slice, d->stride ? d->stride : 1, d->mip}};      /* (the view's layers of its level) */
   begin_pass_packet_layers(l, d->alloc, 0, 1 /* clear colour */, integer ? integers : mask == 0xF ? color : narrow, 1.0f, 0, layers, NULL);
   l->rtv_count = saved;
   packet(l, OP_END_PASS, NULL, 0);
@@ -1003,11 +1019,11 @@ static void STDMETHODCALLTYPE list_ClearDepthStencilView(CmdList *l, D3D12_CPU_D
   const SoftDesc *d = view_at(dsv);
   if (!d || d->kind != DK_DSV || !d->alloc) return;
   if (l->pass_open && l->dsv == d->alloc) end_pass(l);
-  if (l->pending_clear && (l->pending_alloc != d->alloc || l->pending_layers[0] != d->slice || l->pending_layers[1] != (d->stride ? d->stride : 1))) flush_pending_clear(l);
+  if (l->pending_clear && (l->pending_alloc != d->alloc || l->pending_layers[0] != d->slice || l->pending_layers[1] != (d->stride ? d->stride : 1) || l->pending_layers[2] != d->mip)) flush_pending_clear(l);
   /* (kept until the next pass that uses the buffer, which clears as it begins; a pass of its own if none does: flush_pending_clear) */
   l->pending_clear = 1;
   l->pending_alloc = d->alloc;
-  l->pending_layers[0] = d->slice, l->pending_layers[1] = d->stride ? d->stride : 1;
+  l->pending_layers[0] = d->slice, l->pending_layers[1] = d->stride ? d->stride : 1, l->pending_layers[2] = d->mip;
   l->pending_width = (UINT)d->size;
   l->pending_height = (UINT)(d->size >> 32);
   l->pending_samples = (UINT)d->offset;
@@ -1096,18 +1112,24 @@ static void STDMETHODCALLTYPE list_CopyTextureRegion(CmdList *l, const D3D12_TEX
       UINT image_layer = s->kind == 1 ? front + k : layer;
       copy_buffer_image_packet(l, 1, alloc_index(l, image), level, image_layer, format_kx(fi, left), top, format_kw(fi, w), h, alloc_index(l, d->alloc), (UINT)offset, fp->RowPitch, fi);
     }
-  } else if (dst->Type == D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX && src->Type == D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX && d->mips == 1 && s->mips == 1 && d->kind == 0 && s->kind == 0) {
-    /* (2D images of one level: a planar texture's plane of a slice is one) */
+  } else if (dst->Type == D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX && src->Type == D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX) {
+    /* (a subresource into a subresource: a level of a layer - a volume's level, its slices from front - into a level of a layer at (x, y, z); a planar texture's plane of a slice
+     * is a 2D allocation of one level) */
     UINT dl, dy, sl, sy;
     const FormatInfo *dfi = NULL, *sfi = NULL;
     const UINT di = sub_target(d, dst->SubresourceIndex, &dl, &dy, &dfi), si = sub_target(s, src->SubresourceIndex, &sl, &sy, &sfi);
     if (!di || !si) return;
-    UINT sw = (UINT)s->desc.Width, sh = s->desc.Height;
-    if (s->planes) plane_extent(s->fmt, src->SubresourceIndex / s->layers, &sw, &sh);
-    const UINT w = box ? box->right - box->left : sw, h = box ? box->bottom - box->top : sh;
+    UINT sw = mip_extent((UINT)s->desc.Width, sl), sh = mip_extent(s->desc.Height, sl);
+    if (s->planes) { sw = (UINT)s->desc.Width, sh = s->desc.Height; plane_extent(s->fmt, src->SubresourceIndex / s->layers, &sw, &sh); }
+    const UINT sd = s->kind == 1 ? mip_extent(s->layers, sl) : 1;
+    const UINT left = box ? box->left : 0, top = box ? box->top : 0, front = box ? box->front : 0;
+    const UINT w = box ? box->right - box->left : sw, h = box ? box->bottom - box->top : sh, depth = box ? box->back - box->front : sd;
+    if (!w || !h || !depth) return;
+    const UINT dst_layer = d->kind == 1 ? z : dy, src_layer = s->kind == 1 ? front : sy;
     /* (a packed 4:2:2 format's columns are pairs in the kernel's image) */
-    UINT payload[8] = {alloc_index(l, di), format_kx(dfi, x), y, alloc_index(l, si), format_kx(sfi, box ? box->left : 0), box ? box->top : 0, format_kw(sfi, w), h};
-    packet(l, OP_COPY_REGION, payload, 8);
+    UINT payload[13] = {alloc_index(l, di), format_kx(dfi, x), y, alloc_index(l, si), format_kx(sfi, left), top, format_kw(sfi, w), h, dl, dst_layer, sl, src_layer, depth};
+    const int plain = dl == 0 && sl == 0 && dst_layer == 0 && src_layer == 0 && depth == 1 && !s->planes ? (s->mips == 1 && d->mips == 1 && s->kind == 0 && d->kind == 0) : s->planes && d->planes;
+    packet(l, OP_COPY_REGION, payload, plain ? 8 : 13);
   }
 }
 
@@ -1126,11 +1148,16 @@ static void STDMETHODCALLTYPE list_CopyResource(CmdList *l, ID3D12Resource *dst,
       UINT payload[8] = {alloc_index(l, d->plane_alloc[i]), 0, 0, alloc_index(l, s->plane_alloc[i]), 0, 0, w, h};
       packet(l, OP_COPY_REGION, payload, 8);
     }
-  } else if (d->mips == 1 && s->mips == 1 && d->kind == 0 && s->kind == 0 && d->fmt && s->fmt && !d->planes && !s->planes) {
+  } else if (d->fmt && s->fmt && !d->planes && !s->planes && d->mips == s->mips && d->kind == s->kind && d->layers == s->layers) {
+    /* (every level with all its layers - a volume's level its slices there; a 2D image of one level is the one packet of eight words every device takes) */
     end_pass(l);
-    ensure_room(l, 256, 4);
-    UINT payload[8] = {alloc_index(l, d->alloc), 0, 0, alloc_index(l, s->alloc), 0, 0, format_kw(s->fmt, (UINT)s->desc.Width), s->desc.Height};
-    packet(l, OP_COPY_REGION, payload, 8);
+    for (UINT level = 0; level < s->mips; ++level) {
+      ensure_room(l, 256, 4);
+      const UINT layers = s->kind == 1 ? mip_extent(s->layers, level) : s->kind == 0 ? 1 : s->layers;
+      UINT payload[13] = {alloc_index(l, d->alloc), 0, 0, alloc_index(l, s->alloc), 0, 0, format_kw(s->fmt, mip_extent((UINT)s->desc.Width, level)), mip_extent(s->desc.Height, level),
+                          level, 0, level, 0, layers};
+      packet(l, OP_COPY_REGION, payload, s->mips == 1 && s->kind == 0 ? 8 : 13);
+    }
   }
 }
 /* The samples of a multisampled image into an ordinary one of the same format and size: a colour image's are averaged, a depth buffer's first sample is taken (the kernel's

@@ -306,7 +306,6 @@ void test_allocation_checks() {
       {image(kAllocDepthStencil, Format::A8R8G8B8, 4, 4), status::kInvalidParameter},                           // and a colour format may not have it
       {image(kAllocDepthStencil | kTexture | kTarget, Format::D32Float, 4, 4), status::kInvalidParameter},       // (a depth buffer read as a texture is not a colour target)
       {image(kAllocStaging | kTarget, Format::A8R8G8B8, 4, 4), status::kInvalidParameter},
-      {image(kTexture | kTarget, Format::A8R8G8B8, 4, 4, 2), status::kInvalidParameter},                         // a mipmapped texture is only sampled
       {image(kTexture, Format::A8R8G8B8, 4, 4, 4), status::kInvalidParameter},                                   // (4 x 4 has 3 levels)
       {image(kTexture, Format::A8R8G8B8, 4, 4, 0), status::kInvalidParameter},
       {image(kAllocPresent | kAllocStaging, Format::A8R8G8B8, 4, 4), status::kInvalidParameter},
@@ -555,7 +554,7 @@ void test_texture_copy_mips() {
   CHECK(e.render(w3, {rt, tex_rt, vb}) == status::kSuccess && e.pixel(rt, 4, 4) == 0xFF0000FF);
 
   // CopyRegion: a 2 x 2 block from (1, 1) of a ramp to (0, 0), then an overlapping copy within one image.
-  Handle src = e.alloc(kTexture, Format::A8R8G8B8, 4, 4), dst = e.alloc(kTexture, Format::A8R8G8B8, 4, 4), other_format = e.alloc(kTexture, Format::X8R8G8B8, 4, 4);
+  Handle src = e.alloc(kTexture, Format::A8R8G8B8, 4, 4), dst = e.alloc(kTexture, Format::A8R8G8B8, 4, 4), other_format = e.alloc(kTexture, Format::A16B16G16R16F, 4, 4);
   uint32_t ramp[16];
   for (uint32_t i = 0; i < 16; ++i) ramp[i] = 0xFF000000 | i;
   CHECK(e.write(src, ConstByteView(reinterpret_cast<const uint8_t*>(ramp), sizeof(ramp))));
@@ -572,7 +571,11 @@ void test_texture_copy_mips() {
   CHECK(e.render(bad, {dst, src}) == status::kInvalidParameter);   // past the edge
   CommandWriter bad2(e.allocator);
   bad2.copy_region(0, 0, 0, 1, 0, 0, 2, 2);
-  CHECK(e.render(bad2, {dst, other_format}) == status::kInvalidParameter);   // formats differ
+  CHECK(e.render(bad2, {dst, other_format}) == status::kInvalidParameter);   // formats of other sizes
+  CommandWriter same_size(e.allocator);
+  same_size.copy_region(0, 0, 0, 1, 1, 1, 2, 2);
+  const Handle opaque = e.alloc(kTexture, Format::X8R8G8B8, 4, 4);
+  CHECK(e.render(same_size, {opaque, src}) == status::kSuccess && (e.pixel(opaque, 0, 0) & 0xFFFFFF) == (e.pixel(src, 1, 1) & 0xFFFFFF));   // (pixels of one size: the bytes)
 
   // Mipmaps: level 0 all one colour, so are the others once generated; and each level is lockable on its own.
   Handle mip = e.alloc(kTexture, Format::A8R8G8B8, 4, 4, 3);
@@ -3435,11 +3438,11 @@ void test_texture_kinds() {
   CHECK(create(TextureKind::Texture2DArray, 257, 4, 4) == status::kInvalidParameter);
   CHECK(create(TextureKind::TextureCube, 5, 4, 4) == status::kInvalidParameter);
   CHECK(create(TextureKind::TextureCube, 6, 4, 8) == status::kInvalidParameter);
-  CHECK(create(TextureKind::TextureCube, 6, 4, 4, kAllocTexture | kAllocStorageImage) == status::kInvalidParameter);
+  CHECK(create(TextureKind::TextureCube, 6, 4, 4, kAllocTexture | kAllocStorageImage) == status::kSuccess);   // (its faces an array to shaders: kFeature2MipmappedLayers)
   CHECK(create(TextureKind::Texture2DArray, 2, 4, 4, kAllocStorageImage) == status::kInvalidParameter);
   CHECK(create(TextureKind::Texture2DArray, 2, 4, 4, kAllocTexture | kAllocStorageImage, Format::A8R8G8B8Srgb) == status::kInvalidParameter);
-  CHECK(create(TextureKind::Texture3D, 4, 4, 4, kAllocTexture, Format::A8R8G8B8, 2) == status::kInvalidParameter);
-  CHECK(create(TextureKind::Texture3D, 4, 4, 4, kAllocStaging) == status::kInvalidParameter);
+  CHECK(create(TextureKind::Texture3D, 4, 4, 4, kAllocTexture, Format::A8R8G8B8, 2) == status::kSuccess);   // (levels and staging: kFeature2MipmappedLayers, test_mipmapped_layers)
+  CHECK(create(TextureKind::Texture3D, 4, 4, 4, kAllocStaging) == status::kSuccess);
   CHECK(create(TextureKind::Texture2D, 2, 4, 4) == status::kInvalidParameter);
   // The lock shows all the layers, one after the other.
   AllocationDesc d;
@@ -4509,9 +4512,9 @@ void test_formats() {
   };
   const Format all[] = {Format::A8R8G8B8Srgb, Format::A8B8G8R8Srgb, Format::A16B16G16R16, Format::A32B32G32R32Uint};
   for (Format f : all) CHECK(create(kAllocRenderTarget | kAllocTexture, f) == status::kSuccess && create(kAllocStaging, f) == status::kSuccess);
-  // Not presentable; the wide ones have one level and cannot be multisampled; an sRGB image may.
+  // Not presentable; the wide ones cannot be multisampled (levels they may have on a device with kFeature2MipmappedLayers); an sRGB image may.
   for (Format f : all) CHECK(create(kAllocRenderTarget | kAllocPresent, f) == status::kInvalidParameter);
-  CHECK(create(kAllocTexture, Format::A16B16G16R16, 8, 8, 2) == status::kInvalidParameter && create(kAllocTexture, Format::A32B32G32R32Uint, 8, 8, 2) == status::kInvalidParameter);
+  CHECK(create(kAllocTexture, Format::A16B16G16R16, 8, 8, 2) == status::kSuccess && create(kAllocTexture, Format::A32B32G32R32Uint, 8, 8, 2) == status::kSuccess);   // (levels: kFeature2MipmappedLayers)
   CHECK(create(kAllocTexture, Format::A8R8G8B8Srgb, 8, 8, 2) == status::kSuccess);
   CHECK(create(kAllocRenderTarget, Format::A16B16G16R16, 8, 8, 1, 4) == status::kInvalidParameter && create(kAllocRenderTarget, Format::A32B32G32R32Uint, 8, 8, 1, 4) == status::kInvalidParameter);
   // A device without the features refuses them (staging memory is only memory, and is fine).
@@ -9200,6 +9203,500 @@ void test_dxbc_system_values() {
 
 }  // namespace
 
+// Levels of every image (graphics::kFeature2MipmappedLayers, the CPU renderer): arrays, volumes, cubes and cube arrays of several levels, sampled at a level (SampleLevel, Load,
+// derivatives), through views of levels and layers and of another kind (a slice as a 2D texture, an array as a cube or a cube array), drawn into at a level (kPassLevels, also
+// while a view of another level of the target is sampled), copied between subresources (CopyRegion's subresource words, CopyBufferImage), their levels made (GenerateMipmaps of
+// arrays, volumes and wide formats), storage images of a cube's faces and of a level of an array, a texture descriptor's view; and what a device without the feature refuses.
+void test_mipmapped_layers() {
+  Env e;
+  using graphics::TextureKind;
+  auto create = [&](Kernel& kernel, Handle dev, TextureKind kind, uint32_t layers, uint32_t w, uint32_t h, uint32_t mips, uint32_t flags = kAllocTexture, Format f = Format::A8R8G8B8,
+                    Handle* out = nullptr) {
+    AllocationDesc d;
+    d.flags = flags, d.format = f, d.width = w, d.height = h, d.kind = kind, d.layers = layers, d.mip_levels = mips;
+    Handle h_ = 0;
+    const NtStatus s = kernel.create_allocation(kPid, dev, d, &h_);
+    if (out) *out = h_;
+    return s;
+  };
+  auto make = [&](TextureKind kind, uint32_t layers, uint32_t w, uint32_t h, uint32_t mips, uint32_t flags = kAllocTexture, Format f = Format::A8R8G8B8) {
+    Handle out = 0;
+    CHECK(create(e.kernel, e.dev, kind, layers, w, h, mips, flags, f, &out) == status::kSuccess);
+    return out;
+  };
+  // (the colour of layer k of level l of a test texture)
+  auto colour = [](uint32_t level, uint32_t layer) { return 0xFF000000u | (0x20u + level * 0x40u) << 16 | (0x10u + layer * 0x20u) << 8 | 0x33u; };
+  // Every layer of every level its colour (`levels` levels, `layers_at(level)` layers each, `size(level)` pixels a layer).
+  auto fill_levels = [&](Handle a, uint32_t levels, uint32_t w, uint32_t h, auto layers_at) {
+    for (uint32_t l = 0; l < levels; ++l) {
+      LockResult r;
+      CHECK(e.kernel.lock(kPid, a, kLockDiscard, l, &r) == status::kSuccess);
+      ArrayView<uint32_t> words;
+      CHECK(r.data.try_cast<uint32_t>(&words));
+      const uint64_t layer_pixels = uint64_t{graphics::mip_extent(w, l)} * graphics::mip_extent(h, l);
+      CHECK(words.size() == layer_pixels * layers_at(l));
+      for (uint32_t k = 0; k < layers_at(l); ++k) words.subview(k * layer_pixels, layer_pixels).fill(colour(l, k));
+      e.kernel.unlock(kPid, a);
+    }
+  };
+  // The word at (x, y) of layer `layer` of level `level`.
+  auto texel = [&](Handle a, uint32_t level, uint32_t layer, uint32_t x, uint32_t y) {
+    // (a level's layers follow each other, each pitch * the level's height bytes)
+    AllocationInfo about;
+    LockResult r;
+    if (e.kernel.query_allocation(kPid, a, &about) != status::kSuccess || e.kernel.lock(kPid, a, kLockReadOnly, level, &r) != status::kSuccess) return 0xDEADDEADu;
+    ByteReader at(r.data);
+    at.skip((uint64_t{layer} * graphics::mip_extent(about.desc.height, level) + y) * r.pitch + uint64_t{x} * 4);
+    const uint32_t v = at.le32();
+    e.kernel.unlock(kPid, a);
+    return at.ok() ? v : 0xDEADDEADu;
+  };
+
+  // --- What can be made, and its memory: a level of a layered image has all its layers, a volume's level half the slices.
+  const Handle array = make(TextureKind::Texture2DArray, 3, 8, 8, 4);
+  LockResult lock;
+  CHECK(e.kernel.lock(kPid, array, kLockReadOnly, 1, &lock) == status::kSuccess && lock.data.size() == 4 * 4 * 4 * 3 && lock.pitch == 16);
+  e.kernel.unlock(kPid, array);
+  CHECK(e.kernel.lock(kPid, array, kLockReadOnly, 3, &lock) == status::kSuccess && lock.data.size() == 1 * 1 * 4 * 3);
+  e.kernel.unlock(kPid, array);
+  const Handle volume = make(TextureKind::Texture3D, 4, 8, 8, 4);
+  const uint64_t volume_bytes[4] = {8 * 8 * 4 * 4, 4 * 4 * 4 * 2, 2 * 2 * 4 * 1, 1 * 1 * 4 * 1};
+  for (uint32_t l = 0; l < 4; ++l) {
+    CHECK(e.kernel.lock(kPid, volume, kLockReadOnly, l, &lock) == status::kSuccess && lock.data.size() == volume_bytes[l]);
+    e.kernel.unlock(kPid, volume);
+  }
+  AllocationInfo info;
+  CHECK(e.kernel.query_allocation(kPid, volume, &info) == status::kSuccess && info.bytes == volume_bytes[0] + volume_bytes[1] + volume_bytes[2] + volume_bytes[3]);
+  Handle h = 0;
+  CHECK(create(e.kernel, e.dev, TextureKind::TextureCubeArray, 12, 4, 4, 3) == status::kSuccess);
+  CHECK(create(e.kernel, e.dev, TextureKind::TextureCubeArray, 13, 4, 4, 1) == status::kInvalidParameter);   // (six layers a cube)
+  CHECK(create(e.kernel, e.dev, TextureKind::TextureCubeArray, 12, 4, 8, 1) == status::kInvalidParameter);   // (square)
+  CHECK(create(e.kernel, e.dev, TextureKind::TextureCube, 6, 4, 4, 3, kAllocTexture | kAllocStorageImage) == status::kSuccess);
+  CHECK(create(e.kernel, e.dev, TextureKind::Texture2DArray, 2, 8, 8, 3, kAllocTexture | kAllocRenderTarget) == status::kSuccess);
+  CHECK(create(e.kernel, e.dev, TextureKind::Texture2DArray, 2, 8, 8, 2, kAllocDepthStencil, Format::D24S8) == status::kSuccess);
+  CHECK(create(e.kernel, e.dev, TextureKind::Texture2D, 1, 8, 8, 4, kAllocDepthStencil, Format::D32Float) == status::kSuccess);
+  CHECK(create(e.kernel, e.dev, TextureKind::Texture2DArray, 2, 8, 8, 2, kAllocTexture | kAllocRenderTarget, Format::A16B16G16R16F) == status::kSuccess);
+  CHECK(create(e.kernel, e.dev, TextureKind::Texture3D, 2, 8, 8, 2, kAllocStaging) == status::kSuccess);
+  CHECK(create(e.kernel, e.dev, TextureKind::Texture2DArray, 2, 8, 8, 5, kAllocTexture) == status::kInvalidParameter);   // (8 x 8 has four levels)
+  CHECK(create(e.kernel, e.dev, TextureKind::Texture2DArray, 2, 8, 8, 2, kAllocTexture | kAllocPresent) == status::kInvalidParameter);
+  // A device without the feature: arrays, volumes and cubes of one level, targets and depth buffers of one, wide formats of one, no cube arrays (a 2D texture's levels and staging
+  // memory are fine).
+  {
+    FakeScreen screen(8, 6);
+    graphics::SoftwareDevice software(e.allocator, &screen);
+    SpyDevice limited(software);
+    limited.feature2_mask = ~static_cast<uint32_t>(graphics::kFeature2MipmappedLayers);
+    Kernel kernel(e.allocator);
+    AdapterConfig c;
+    c.display = &screen;
+    kernel.add_adapter(limited, c);
+    Handle adapter = 0, dev = 0, ctx = 0;
+    CHECK(kernel.open_process(kPid) == status::kSuccess && kernel.open_adapter_from_index(kPid, 0, &adapter) == status::kSuccess && kernel.create_device(kPid, adapter, &dev) == status::kSuccess);
+    CHECK(kernel.create_context(kPid, dev, ContextPriority::Normal, &ctx) == status::kSuccess);
+    CHECK(create(kernel, dev, TextureKind::Texture2DArray, 3, 8, 8, 2) == status::kNotSupported);
+    CHECK(create(kernel, dev, TextureKind::Texture3D, 4, 8, 8, 2) == status::kNotSupported);
+    CHECK(create(kernel, dev, TextureKind::TextureCubeArray, 12, 4, 4, 1) == status::kNotSupported);
+    CHECK(create(kernel, dev, TextureKind::TextureCube, 6, 4, 4, 1, kAllocTexture | kAllocStorageImage) == status::kNotSupported);
+    CHECK(create(kernel, dev, TextureKind::Texture2D, 1, 8, 8, 2, kAllocTexture | kAllocRenderTarget) == status::kNotSupported);
+    CHECK(create(kernel, dev, TextureKind::Texture2D, 1, 8, 8, 2, kAllocDepthStencil, Format::D32Float) == status::kNotSupported);
+    CHECK(create(kernel, dev, TextureKind::Texture2D, 1, 8, 8, 2, kAllocTexture, Format::A16B16G16R16F) == status::kNotSupported);
+    CHECK(create(kernel, dev, TextureKind::Texture2D, 1, 8, 8, 2) == status::kSuccess);
+    CHECK(create(kernel, dev, TextureKind::Texture2DArray, 3, 8, 8, 2, kAllocStaging) == status::kSuccess);
+    // (and the stream's views and levels)
+    Handle tex = 0, target = 0;
+    CHECK(create(kernel, dev, TextureKind::Texture2D, 1, 8, 8, 2, kAllocTexture, Format::A8R8G8B8, &tex) == status::kSuccess);
+    CHECK(create(kernel, dev, TextureKind::Texture2D, 1, 8, 8, 1, kAllocRenderTarget, Format::A8R8G8B8, &target) == status::kSuccess);
+    std::vector<Handle> list = {target, tex};
+    CommandWriter w(e.allocator);
+    w.bind_texture_view(0, 1, graphics::SamplerDesc(), 1, 0, 0, 0);
+    CHECK(kernel.render(kPid, ctx, w.view(), ArrayView<const Handle>(list.data(), list.size())) == status::kInvalidParameter);
+    CommandWriter whole(e.allocator);
+    whole.bind_texture_view(0, 1, graphics::SamplerDesc(), 0, 0, 0, 0);   // (a view of all of it is the texture)
+    CHECK(kernel.render(kPid, ctx, whole.view(), ArrayView<const Handle>(list.data(), list.size())) == status::kSuccess);
+    CommandWriter levels(e.allocator);
+    levels.begin_pass_levels(0, {}, kNoAllocation, kPassClearColor, {0, 0, 0, 1}, 1, 0, {}, {0, 0});
+    levels.end_pass();
+    CHECK(kernel.render(kPid, ctx, levels.view(), ArrayView<const Handle>(list.data(), list.size())) == status::kInvalidParameter);
+  }
+
+  // --- Sampling: vs_vol's texture coordinate is the vertex colour, the same over the whole target.
+  namespace b = conformance_blobs;
+  auto pipeline = [&](const uint8_t* ps, uint32_t ps_size) {
+    Handle vs = 0, fs = 0, pipe = 0;
+    ShaderDesc sv, sp;
+    sv.kind = sp.kind = ShaderKind::Dxbc;
+    sv.stage = graphics::ShaderStage::Vertex, sp.stage = graphics::ShaderStage::Fragment;
+    sv.code = ConstByteView(b::k_vs_vol, sizeof b::k_vs_vol), sp.code = ConstByteView(ps, ps_size);
+    CHECK(e.kernel.create_shader(kPid, e.dev, sv, &vs) == status::kSuccess && e.kernel.create_shader(kPid, e.dev, sp, &fs) == status::kSuccess);
+    PipelineDesc pd;
+    pd.vertex_shader = vs, pd.fragment_shader = fs, pd.vertex_stride = 28, pd.attribute_count = 2, pd.varying_count = 3, pd.texture_count = 1;
+    pd.attributes[0] = {0, graphics::VertexFormat::Float3, 0};
+    pd.attributes[1] = {1, graphics::VertexFormat::Float4, 12};
+    pd.cull_mode = graphics::CullMode::None;
+    CHECK(e.kernel.create_pipeline(kPid, e.dev, pd, &pipe) == status::kSuccess);
+    return pipe;
+  };
+  const Handle lod_pipe = pipeline(b::k_ps_texarray_lod, sizeof b::k_ps_texarray_lod), array_pipe = pipeline(b::k_ps_texarray, sizeof b::k_ps_texarray);
+  const Handle level_pipe = pipeline(b::k_ps_texelarray_level, sizeof b::k_ps_texelarray_level), slice_pipe = pipeline(b::k_ps_texslice, sizeof b::k_ps_texslice);
+  const Handle cube_pipe = pipeline(b::k_ps_texcube, sizeof b::k_ps_texcube), cube_array_pipe = pipeline(b::k_ps_texcubearray, sizeof b::k_ps_texcubearray);
+  const Handle cube_array_lod_pipe = pipeline(b::k_ps_texcubearray_lod, sizeof b::k_ps_texcubearray_lod), volume_lod_pipe = pipeline(b::k_ps_tex3d_lod, sizeof b::k_ps_tex3d_lod);
+  const Handle target = e.alloc(kTarget, Format::A8R8G8B8, 8, 8), vb = e.buffer(kAllocVertexBuffer, 3 * 28);
+  const float identity[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+  struct View {
+    uint32_t base_level = 0, level_count = 0, first_layer = 0, layer_count = 0;
+    bool given = false;
+  };
+  // Draws the big triangle with texture coordinate (u, v, w) and alpha `a` through `pipe` with `texture` (seen through `view` when given); the status of the stream.
+  auto draw = [&](Handle pipe, Handle texture, float u, float v, float w, float a, View view = View(), graphics::SamplerDesc sampler = graphics::SamplerDesc()) {
+    const float vertices[21] = {-1, -1, 0.5f, u, v, w, a, 3, -1, 0.5f, u, v, w, a, -1, 3, 0.5f, u, v, w, a};
+    CHECK(e.write(vb, floats(vertices, 21)));
+    CommandWriter cw(e.allocator);
+    cw.begin_pass(0, kNoAllocation, kPassClearColor, {0, 0, 0, 1}, 1, 0);
+    cw.bind_pipeline(pipe);
+    cw.bind_vertex_buffer(1);
+    cw.push_constants(floats(identity, 16));
+    if (view.given) cw.bind_texture_view(0, 2, sampler, view.base_level, view.level_count, view.first_layer, view.layer_count);
+    else cw.bind_texture(0, 2, sampler);
+    cw.draw(3);
+    cw.end_pass();
+    return e.render(cw, {target, vb, texture});
+  };
+  // (a sampler that reads the levels: SampleLevel's level is the nearest)
+  graphics::SamplerDesc levels_sampler;
+  levels_sampler.mip_filter = graphics::MipFilter::Nearest;
+  // An array of three layers of 4 x 4, three levels: SampleLevel 1 reads level 1 of the layer the coordinate names, Load and GetDimensions of level 1.
+  const Handle small = make(TextureKind::Texture2DArray, 3, 4, 4, 3);
+  fill_levels(small, 3, 4, 4, [](uint32_t) { return 3u; });
+  CHECK(draw(lod_pipe, small, 0.5f, 0.5f, 2.0f, 1, View(), levels_sampler) == status::kSuccess && e.pixel(target, 3, 3) == colour(1, 2));
+  CHECK(draw(lod_pipe, small, 0.5f, 0.5f, 2.0f, 1) == status::kSuccess && e.pixel(target, 3, 3) == colour(0, 2));   // (a sampler without levels reads level 0)
+  CHECK(draw(level_pipe, small, 0.5f, 0.5f, 1.0f, 1) == status::kSuccess && e.pixel(target, 3, 3) == colour(1, 1));
+  CHECK(draw(level_pipe, small, 0.5f, 0.5f, 1.0f, 0) == status::kSuccess && e.pixel(target, 3, 3) == 0x30202030u);   // (2 x 2, 3 layers, 3 levels: each / 16)
+  // Views: from level 1 and layer 1, level 0 of the view is level 1 and its layer 0 layer 1 (and its sizes are those); its levels are two.
+  View from_one;
+  from_one.given = true, from_one.base_level = 1, from_one.first_layer = 1;
+  CHECK(draw(array_pipe, small, 0.5f, 0.5f, 0.0f, 1, from_one) == status::kSuccess && e.pixel(target, 3, 3) == colour(1, 1));
+  CHECK(draw(lod_pipe, small, 0.5f, 0.5f, 1.0f, 1, from_one, levels_sampler) == status::kSuccess && e.pixel(target, 3, 3) == colour(2, 2));
+  CHECK(draw(level_pipe, small, 0.5f, 0.5f, 0.0f, 0, from_one) == status::kSuccess && e.pixel(target, 3, 3) == 0x20101020u);   // (1 x 1, 2 layers, 2 levels)
+  View one_level = from_one;
+  one_level.level_count = 1, one_level.layer_count = 1;
+  CHECK(draw(lod_pipe, small, 0.5f, 0.5f, 5.0f, 1, one_level, levels_sampler) == status::kSuccess && e.pixel(target, 3, 3) == colour(1, 1));   // (the lod and the layer clamped to the view)
+  // A slice of the array as a 2D texture (a view of one layer); without the view the array is not one.
+  View slice;
+  slice.given = true, slice.first_layer = 2, slice.layer_count = 1;
+  CHECK(draw(slice_pipe, small, 0.5f, 0.5f, 0, 1, slice) == status::kSuccess && e.pixel(target, 3, 3) == colour(0, 2));
+  CHECK(draw(slice_pipe, small, 0.5f, 0.5f, 0, 1) == status::kInvalidParameter);
+  View two;
+  two.given = true, two.layer_count = 2;
+  CHECK(draw(slice_pipe, small, 0.5f, 0.5f, 0, 1, two) == status::kInvalidParameter);   // (two layers are not a 2D texture)
+  // Views the image does not have.
+  View past;
+  past.given = true, past.base_level = 3;
+  CHECK(draw(array_pipe, small, 0.5f, 0.5f, 0, 1, past) == status::kInvalidParameter);
+  past.base_level = 1, past.level_count = 3;
+  CHECK(draw(array_pipe, small, 0.5f, 0.5f, 0, 1, past) == status::kInvalidParameter);
+  past.level_count = 0, past.first_layer = 3;
+  CHECK(draw(array_pipe, small, 0.5f, 0.5f, 0, 1, past) == status::kInvalidParameter);
+  // Six layers of an array seen as a cube: (0.1, 0.1, 1) is on +Z, the fifth face.
+  const Handle six = make(TextureKind::Texture2DArray, 8, 4, 4, 1);
+  fill_levels(six, 1, 4, 4, [](uint32_t) { return 8u; });
+  View cube_view;
+  cube_view.given = true, cube_view.first_layer = 2, cube_view.layer_count = 6;
+  CHECK(draw(cube_pipe, six, 0.1f, 0.1f, 1.0f, 1, cube_view) == status::kSuccess && e.pixel(target, 3, 3) == colour(0, 2 + 4));
+  CHECK(draw(cube_pipe, six, 0.1f, 0.1f, 1.0f, 1) == status::kInvalidParameter);   // (eight layers are not a cube)
+  // A cube array of two cubes, two levels: (0.55, 0.5, 1) * 2 - 1 points at +Z, alpha 0.1 names cube 1: layer 10; and the same through SampleLevel 1.
+  const Handle cubes = make(TextureKind::TextureCubeArray, 12, 4, 4, 2);
+  fill_levels(cubes, 2, 4, 4, [](uint32_t) { return 12u; });
+  CHECK(draw(cube_array_pipe, cubes, 0.55f, 0.5f, 1.0f, 0.1f) == status::kSuccess && e.pixel(target, 3, 3) == colour(0, 10));
+  CHECK(draw(cube_array_lod_pipe, cubes, 0.55f, 0.5f, 1.0f, 0.1f, View(), levels_sampler) == status::kSuccess && e.pixel(target, 3, 3) == colour(1, 10));
+  CHECK(draw(cube_array_pipe, cubes, 0.55f, 0.5f, 1.0f, 0.9f) == status::kSuccess && e.pixel(target, 3, 3) == colour(0, 10));   // (the cube clamped)
+  CHECK(draw(cube_array_pipe, cubes, 0.5f, 1.0f, 0.5f, 0.0f) == status::kSuccess && e.pixel(target, 3, 3) == colour(0, 2));    // (+Y of cube 0)
+  // ... and twelve layers of an array as one, a cube array as an array, a cube of a cube array.
+  View all;
+  all.given = true;
+  const Handle twelve = make(TextureKind::Texture2DArray, 12, 4, 4, 1);
+  fill_levels(twelve, 1, 4, 4, [](uint32_t) { return 12u; });
+  CHECK(draw(cube_array_pipe, twelve, 0.55f, 0.5f, 1.0f, 0.1f, all) == status::kSuccess && e.pixel(target, 3, 3) == colour(0, 10));
+  CHECK(draw(array_pipe, cubes, 0.5f, 0.5f, 7.0f, 1, all) == status::kSuccess && e.pixel(target, 3, 3) == colour(0, 7));
+  View second_cube;
+  second_cube.given = true, second_cube.first_layer = 6, second_cube.layer_count = 6;
+  CHECK(draw(cube_pipe, cubes, 0.1f, 0.1f, 1.0f, 1, second_cube) == status::kSuccess && e.pixel(target, 3, 3) == colour(0, 10));
+  // A volume of 4 x 4 x 4, three levels: level 1 has two slices, (0.5, 0.5, 0.75) is in the second.
+  const Handle box = make(TextureKind::Texture3D, 4, 4, 4, 3);
+  fill_levels(box, 3, 4, 4, [](uint32_t l) { return l == 0 ? 4u : l == 1 ? 2u : 1u; });
+  CHECK(draw(volume_lod_pipe, box, 0.5f, 0.5f, 0.75f, 1, View(), levels_sampler) == status::kSuccess && e.pixel(target, 3, 3) == colour(1, 1));
+  CHECK(draw(volume_lod_pipe, box, 0.5f, 0.5f, 0.25f, 1, View(), levels_sampler) == status::kSuccess && e.pixel(target, 3, 3) == colour(1, 0));
+  View volume_view;
+  volume_view.given = true, volume_view.base_level = 1;
+  CHECK(draw(volume_lod_pipe, box, 0.5f, 0.5f, 0.25f, 1, volume_view, levels_sampler) == status::kSuccess && e.pixel(target, 3, 3) == colour(2, 0));
+  volume_view.first_layer = 1, volume_view.layer_count = 1;
+  CHECK(draw(volume_lod_pipe, box, 0.5f, 0.5f, 0.25f, 1, volume_view) == status::kInvalidParameter);   // (a volume's view has all its slices)
+  // Derivatives: a 16 x 16 array whose coordinates run over the 8 x 8 target twice as fast as its texels - two texels a pixel, level 1 by the nearest level.
+  {
+    const Handle big = make(TextureKind::Texture2DArray, 2, 16, 16, 5);
+    fill_levels(big, 5, 16, 16, [](uint32_t) { return 2u; });
+    const float vertices[21] = {-1, -1, 0.5f, 0, 0, 1, 1, 3, -1, 0.5f, 2, 0, 1, 1, -1, 3, 0.5f, 0, 2, 1, 1};
+    CHECK(e.write(vb, floats(vertices, 21)));
+    graphics::SamplerDesc mipmapped;
+    mipmapped.mip_filter = graphics::MipFilter::Nearest;
+    CommandWriter cw(e.allocator);
+    cw.begin_pass(0, kNoAllocation, kPassClearColor, {0, 0, 0, 1}, 1, 0);
+    cw.bind_pipeline(array_pipe);
+    cw.bind_vertex_buffer(1);
+    cw.push_constants(floats(identity, 16));
+    cw.bind_texture(0, 2, mipmapped);
+    cw.draw(3);
+    cw.end_pass();
+    CHECK(e.render(cw, {target, vb, big}) == status::kSuccess && e.pixel(target, 2, 2) == colour(1, 1) && e.pixel(target, 5, 6) == colour(1, 1));
+  }
+
+  // --- Drawing into a level: a clear of layer 1 of level 1, then a triangle into level 2 of layer 0; nothing else changes.
+  const Handle rt = make(TextureKind::Texture2DArray, 2, 8, 8, 3, kAllocTexture | kAllocRenderTarget);
+  fill_levels(rt, 3, 8, 8, [](uint32_t) { return 2u; });
+  {
+    CommandWriter cw(e.allocator);
+    cw.begin_pass_levels(0, {}, kNoAllocation, kPassClearColor, {1, 0, 0, 1}, 1, 0, {1, 1, 0, 1}, {1, 0});
+    cw.end_pass();
+    CHECK(e.render(cw, {rt}) == status::kSuccess);
+    CHECK(texel(rt, 1, 1, 3, 3) == 0xFFFF0000u && texel(rt, 1, 0, 3, 3) == colour(1, 0) && texel(rt, 0, 1, 3, 3) == colour(0, 1) && texel(rt, 2, 1, 0, 0) == colour(2, 1));
+    const Handle colored = make_colored_pipeline(e);
+    CHECK(write_triangle(e, vb, 0, 0, 1));
+    CommandWriter dw(e.allocator);
+    dw.begin_pass_levels(0, {}, kNoAllocation, 0, {0, 0, 0, 0}, 1, 0, {}, {2, 0});
+    dw.bind_pipeline(colored);
+    dw.bind_vertex_buffer(1);
+    dw.push_constants(floats(identity, 16));
+    dw.draw(3);
+    dw.end_pass();
+    CHECK(e.render(dw, {rt, vb}) == status::kSuccess);
+    CHECK(texel(rt, 2, 0, 1, 1) == 0xFF0000FFu && texel(rt, 2, 1, 1, 1) == colour(2, 1) && texel(rt, 1, 0, 0, 0) == colour(1, 0));
+    // (a level the target does not have; a depth buffer of another size at its level)
+    CommandWriter bad(e.allocator);
+    bad.begin_pass_levels(0, {}, kNoAllocation, kPassClearColor, {0, 0, 0, 0}, 1, 0, {}, {3, 0});
+    bad.end_pass();
+    CHECK(e.render(bad, {rt}) == status::kInvalidParameter);
+    const Handle depth = make(TextureKind::Texture2D, 1, 8, 8, 2, kAllocDepthStencil, Format::D32Float);
+    CommandWriter sized(e.allocator);
+    sized.begin_pass_levels(0, {}, 1, kPassClearColor | kPassClearDepth, {0, 0, 0, 0}, 1, 0, {}, {1, 1});
+    sized.end_pass();
+    CHECK(e.render(sized, {rt, depth}) == status::kSuccess);
+    CommandWriter unsized(e.allocator);
+    unsized.begin_pass_levels(0, {}, 1, kPassClearColor | kPassClearDepth, {0, 0, 0, 0}, 1, 0, {}, {1, 0});
+    unsized.end_pass();
+    CHECK(e.render(unsized, {rt, depth}) == status::kInvalidParameter);
+    // (layers of a level of a volume: level 1 of four slices has two)
+    const Handle vrt = make(TextureKind::Texture3D, 4, 8, 8, 2, kAllocTexture | kAllocRenderTarget);
+    CommandWriter vw(e.allocator);
+    vw.begin_pass_levels(0, {}, kNoAllocation, kPassClearColor, {0, 1, 0, 1}, 1, 0, {1, 1, 0, 1}, {1, 0});
+    vw.end_pass();
+    CHECK(e.render(vw, {vrt}) == status::kSuccess && texel(vrt, 1, 1, 0, 0) == 0xFF00FF00u && texel(vrt, 1, 0, 0, 0) == 0);
+    CommandWriter vbad(e.allocator);
+    vbad.begin_pass_levels(0, {}, kNoAllocation, kPassClearColor, {0, 1, 0, 1}, 1, 0, {2, 1, 0, 1}, {1, 0});
+    vbad.end_pass();
+    CHECK(e.render(vbad, {vrt}) == status::kInvalidParameter);
+  }
+  // Drawing into level 1 while sampling level 0 of the same texture: a view of level 0 alone may be bound in the pass; one that shows level 1 may not.
+  {
+    const Handle chain = make(TextureKind::Texture2D, 1, 8, 8, 2, kAllocTexture | kAllocRenderTarget);
+    fill_levels(chain, 2, 8, 8, [](uint32_t) { return 1u; });
+    const float vertices[21] = {-1, -1, 0.5f, 0.5f, 0.5f, 0, 1, 3, -1, 0.5f, 0.5f, 0.5f, 0, 1, -1, 3, 0.5f, 0.5f, 0.5f, 0, 1};
+    CHECK(e.write(vb, floats(vertices, 21)));
+    auto down = [&](uint32_t level_count) {
+      CommandWriter cw(e.allocator);
+      cw.begin_pass_levels(0, {}, kNoAllocation, 0, {0, 0, 0, 0}, 1, 0, {}, {1, 0});
+      cw.bind_pipeline(slice_pipe);
+      cw.bind_vertex_buffer(1);
+      cw.push_constants(floats(identity, 16));
+      cw.bind_texture_view(0, 0, graphics::SamplerDesc(), 0, level_count, 0, 0);
+      cw.draw(3);
+      cw.end_pass();
+      return e.render(cw, {chain, vb});
+    };
+    CHECK(down(1) == status::kSuccess && texel(chain, 1, 0, 2, 2) == colour(0, 0));
+    CHECK(down(2) == status::kInvalidParameter);
+  }
+
+  // --- Copies between subresources: level 1 of layer 2 of the small array into a 2D texture at (1, 1); a whole level of three layers into another array; slices of a volume's level.
+  {
+    const Handle flat = e.alloc(kTexture, Format::A8R8G8B8, 4, 4);
+    CHECK(e.fill(flat, 0xFF000000u));
+    CommandWriter cw(e.allocator);
+    cw.copy_subresource_region(0, 0, 0, 1, 1, 1, 1, 2, 0, 0, 2, 2);
+    CHECK(e.render(cw, {flat, small}) == status::kSuccess && e.pixel(flat, 1, 1) == colour(1, 2) && e.pixel(flat, 2, 2) == colour(1, 2) && e.pixel(flat, 0, 0) == 0xFF000000u &&
+          e.pixel(flat, 3, 3) == 0xFF000000u);
+    const Handle other = make(TextureKind::Texture2DArray, 3, 4, 4, 3);
+    CommandWriter whole(e.allocator);
+    for (uint32_t l = 0; l < 3; ++l) whole.copy_subresource_region(0, l, 0, 0, 0, 1, l, 0, 0, 0, graphics::mip_extent(4, l), graphics::mip_extent(4, l), 3);
+    CHECK(e.render(whole, {other, small}) == status::kSuccess);
+    bool same = true;
+    for (uint32_t l = 0; l < 3; ++l)
+      for (uint32_t k = 0; k < 3; ++k) same &= texel(other, l, k, 0, 0) == colour(l, k);
+    CHECK(same);
+    const Handle box2 = make(TextureKind::Texture3D, 4, 4, 4, 3);
+    CommandWriter slices(e.allocator);
+    slices.copy_subresource_region(0, 1, 0, 0, 0, 1, 1, 1, 0, 0, 2, 2, 1);   // (slice 1 of level 1 into slice 0)
+    CHECK(e.render(slices, {box2, box}) == status::kSuccess && texel(box2, 1, 0, 1, 1) == colour(1, 1) && texel(box2, 1, 1, 1, 1) == 0);
+    // (past a level's layers, past its size, a level it does not have)
+    CommandWriter bad(e.allocator);
+    bad.copy_subresource_region(0, 1, 2, 0, 0, 1, 1, 1, 0, 0, 2, 2, 1);
+    CHECK(e.render(bad, {box2, box}) == status::kInvalidParameter);
+    CommandWriter bad2(e.allocator);
+    bad2.copy_subresource_region(0, 1, 0, 1, 0, 1, 1, 0, 0, 0, 2, 2, 1);
+    CHECK(e.render(bad2, {box2, box}) == status::kInvalidParameter);
+    CommandWriter bad3(e.allocator);
+    bad3.copy_subresource_region(0, 3, 0, 0, 0, 1, 0, 0, 0, 0, 1, 1, 1);
+    CHECK(e.render(bad3, {box2, box}) == status::kInvalidParameter);
+    // Block-compressed: whole blocks of a level (8 x 8: level 1 is one block).
+    const Handle bc_a = make(TextureKind::Texture2DArray, 2, 8, 8, 2, kAllocTexture, Format::Bc1), bc_b = make(TextureKind::Texture2DArray, 2, 8, 8, 2, kAllocTexture, Format::Bc1);
+    uint8_t blocks[2 * 8];
+    for (uint32_t i = 0; i < sizeof blocks; ++i) blocks[i] = static_cast<uint8_t>(0x40 + i);
+    CHECK(e.write(bc_a, ConstByteView(blocks, sizeof blocks), kLockDiscard, 1));
+    CommandWriter bc(e.allocator);
+    bc.copy_subresource_region(0, 1, 0, 0, 0, 1, 1, 1, 0, 0, 4, 4, 1);
+    CHECK(e.render(bc, {bc_b, bc_a}) == status::kSuccess);
+    CHECK(e.kernel.lock(kPid, bc_b, kLockReadOnly, 1, &lock) == status::kSuccess && lock.data.size() == 16 && lock.data[0] == 0x48 && lock.data[7] == 0x4F && lock.data[8] == 0);
+    e.kernel.unlock(kPid, bc_b);
+    CommandWriter bc_bad(e.allocator);
+    bc_bad.copy_subresource_region(0, 0, 0, 2, 0, 1, 0, 0, 0, 0, 4, 4, 1);   // (not on a block)
+    CHECK(e.render(bc_bad, {bc_b, bc_a}) == status::kInvalidParameter);
+    // CopyBufferImage into a layer of a level: row 1 of level 1 of layer 1 of the small array.
+    const Handle buffer = e.buffer(kAllocVertexBuffer, 64);
+    const uint32_t row[2] = {0xFF123456u, 0xFF654321u};
+    CHECK(e.write(buffer, ConstByteView(reinterpret_cast<const uint8_t*>(row), sizeof row), kLockDiscard));
+    CommandWriter up(e.allocator);
+    up.copy_buffer_to_image(0, 1, 1, 0, 1, 2, 1, 1, 0, 8);
+    CHECK(e.render(up, {small, buffer}) == status::kSuccess && texel(small, 1, 1, 0, 1) == 0xFF123456u && texel(small, 1, 1, 1, 1) == 0xFF654321u && texel(small, 1, 1, 0, 0) == colour(1, 1));
+    CommandWriter up_bad(e.allocator);
+    up_bad.copy_buffer_to_image(0, 1, 2, 0, 0, 1, 1, 1, 0, 8);   // (level 1 of a four-slice volume has two)
+    CHECK(e.render(up_bad, {box, buffer}) == status::kInvalidParameter);
+  }
+
+  // --- GenerateMipmaps: each layer of an array its own chain; a volume's levels by 2 x 2 x 2; a wide format's by its values.
+  {
+    const Handle layers = make(TextureKind::Texture2DArray, 2, 4, 4, 3);
+    LockResult r;
+    CHECK(e.kernel.lock(kPid, layers, kLockDiscard, 0, &r) == status::kSuccess);
+    ArrayView<uint32_t> words;
+    CHECK(r.data.try_cast<uint32_t>(&words));
+    for (uint32_t i = 0; i < 16; ++i) words[i] = (i % 2) ? 0xFF0000FFu : 0xFF000000u, words[16 + i] = 0xFF404040u;   // (layer 0: blue every other column)
+    e.kernel.unlock(kPid, layers);
+    CommandWriter g(e.allocator);
+    g.generate_mipmaps(0);
+    CHECK(e.render(g, {layers}) == status::kSuccess);
+    CHECK(texel(layers, 1, 0, 1, 1) == 0xFF000080u && texel(layers, 2, 0, 0, 0) == 0xFF000080u && texel(layers, 2, 1, 0, 0) == 0xFF404040u);
+    const Handle vol = make(TextureKind::Texture3D, 4, 4, 4, 3);
+    CHECK(e.kernel.lock(kPid, vol, kLockDiscard, 0, &r) == status::kSuccess && r.data.try_cast<uint32_t>(&words));
+    for (uint32_t i = 0; i < 64; ++i) words[i] = i < 32 ? 0xFF0000FFu : 0xFF000000u;   // (slices 0 and 1 blue, 2 and 3 black)
+    e.kernel.unlock(kPid, vol);
+    CommandWriter gv(e.allocator);
+    gv.generate_mipmaps(0);
+    CHECK(e.render(gv, {vol}) == status::kSuccess && texel(vol, 1, 0, 0, 0) == 0xFF0000FFu && texel(vol, 1, 1, 0, 0) == 0xFF000000u && texel(vol, 2, 0, 0, 0) == 0xFF000080u);
+    const Handle wide = make(TextureKind::Texture2DArray, 2, 4, 4, 2, kAllocTexture, Format::A32B32G32R32F);
+    CHECK(e.kernel.lock(kPid, wide, kLockDiscard, 0, &r) == status::kSuccess);
+    ArrayView<float> values;
+    CHECK(r.data.try_cast<float>(&values));
+    for (uint32_t i = 0; i < 32; ++i) values[4 * i] = i < 16 ? static_cast<float>(i % 2) * 3.0f : 0.25f, values[4 * i + 1] = 0, values[4 * i + 2] = 0, values[4 * i + 3] = 1;
+    e.kernel.unlock(kPid, wide);
+    CommandWriter gw(e.allocator);
+    gw.generate_mipmaps(0);
+    CHECK(e.render(gw, {wide}) == status::kSuccess);
+    CHECK(e.kernel.lock(kPid, wide, kLockReadOnly, 1, &r) == status::kSuccess && r.data.try_cast<float>(&values) && values.size() == 2 * 2 * 2 * 4 && values[0] == 1.5f &&
+          values[16] == 0.25f && values[19] == 1.0f);
+    e.kernel.unlock(kPid, wide);
+    const Handle integers = make(TextureKind::Texture2DArray, 2, 4, 4, 2, kAllocTexture, Format::A32B32G32R32Uint);
+    CommandWriter gi(e.allocator);
+    gi.generate_mipmaps(0);
+    CHECK(e.render(gi, {integers}) == status::kInvalidParameter);   // (integers are not filtered)
+    // A level drawn into, then the chain made from it: the GPU's level 0 comes back first.
+    const Handle drawn = make(TextureKind::Texture2D, 1, 4, 4, 3, kAllocTexture | kAllocRenderTarget);
+    CommandWriter dg(e.allocator);
+    dg.begin_pass(0, kNoAllocation, kPassClearColor, {0, 1, 0, 1}, 1, 0);
+    dg.end_pass();
+    dg.generate_mipmaps(0);
+    CHECK(e.render(dg, {drawn}) == status::kSuccess && texel(drawn, 2, 0, 0, 0) == 0xFF00FF00u);
+  }
+
+  // --- Storage images: the six faces of a cube at its level 1, as an array of six (cs_uav_array writes (x / 8, y / 8, layer / layers, 1)); a level of an array.
+  {
+    const std::vector<uint8_t> code = read_blob("cs_uav_array.dxbc");
+    ShaderDesc sd;
+    sd.kind = ShaderKind::Dxbc, sd.stage = graphics::ShaderStage::Compute, sd.code = ConstByteView(code.data(), code.size());
+    Handle cs = 0, fill = 0;
+    CHECK(!code.empty() && e.kernel.create_shader(kPid, e.dev, sd, &cs) == status::kSuccess);
+    PipelineDesc pd;
+    pd.compute_shader = cs;
+    CHECK(e.kernel.create_pipeline(kPid, e.dev, pd, &fill) == status::kSuccess);
+    const Handle cube = make(TextureKind::TextureCube, 6, 16, 16, 2, kAllocTexture | kAllocStorageImage, Format::A8B8G8R8);
+    CommandWriter cw(e.allocator);
+    cw.bind_pipeline(fill);
+    cw.bind_uav_image(0, 0, 1, 0, 6);
+    cw.dispatch(1, 1, 6);
+    CHECK(e.render(cw, {cube}) == status::kSuccess);
+    // (A8B8G8R8: 0xAABBGGRR; texel (4, 0) of face 3 is (0.5, 0, 0.5, 1))
+    CHECK(texel(cube, 1, 3, 4, 0) == 0xFF800080u && texel(cube, 1, 5, 0, 0) == 0xFFD50000u && texel(cube, 0, 3, 4, 0) == 0);
+    const Handle levels = make(TextureKind::Texture2DArray, 2, 16, 16, 3, kAllocTexture | kAllocStorageImage, Format::A8B8G8R8);
+    CommandWriter lw(e.allocator);
+    lw.bind_pipeline(fill);
+    lw.bind_uav_image(0, 0, 2, 1, 1);
+    lw.dispatch(1, 1, 1);
+    CHECK(e.render(lw, {levels}) == status::kSuccess && texel(levels, 2, 1, 2, 0) == 0xFF000040u && texel(levels, 2, 0, 2, 0) == 0);
+    CommandWriter past(e.allocator);
+    past.bind_pipeline(fill);
+    past.bind_uav_image(0, 0, 3, 0, 1);
+    past.dispatch(1, 1, 1);
+    CHECK(e.render(past, {levels}) == status::kInvalidParameter);
+  }
+
+  // --- Mirrors of subresources: a 4 x 4 mirror of level 1 of layer 1 of an 8 x 8 array that writes the red back (what a narrow array's unordered access view of a level is made of);
+  // the compute shader writes every channel of the mirror, the array's level 1 of layer 1 gets the red alone, the rest stays.
+  {
+    const std::vector<uint8_t> code = read_blob("cs_uav_array.dxbc");
+    ShaderDesc sd;
+    sd.kind = ShaderKind::Dxbc, sd.stage = graphics::ShaderStage::Compute, sd.code = ConstByteView(code.data(), code.size());
+    Handle cs = 0, fill = 0;
+    CHECK(!code.empty() && e.kernel.create_shader(kPid, e.dev, sd, &cs) == status::kSuccess);
+    PipelineDesc pd;
+    pd.compute_shader = cs;
+    CHECK(e.kernel.create_pipeline(kPid, e.dev, pd, &fill) == status::kSuccess);
+    const Handle source = make(TextureKind::Texture2DArray, 2, 8, 8, 2, kAllocTexture, Format::A8B8G8R8);
+    const Handle mirror = make(TextureKind::Texture2D, 1, 4, 4, 1, kAllocTexture | kAllocStorageImage, Format::A8B8G8R8);
+    fill_levels(source, 2, 8, 8, [](uint32_t) { return 2u; });
+    const Handle sources[1] = {source};
+    const uint32_t level1_layer1[1] = {1 | 1u << 16}, past[1] = {2 | 1u << 16}, wrong_size[1] = {0 | 1u << 16};
+    CHECK(e.kernel.set_mirror(kPid, mirror, kMirrorWriteBack, 1, ArrayView<const Handle>(sources, 1), ArrayView<const uint32_t>(past, 1)) == status::kInvalidParameter);
+    CHECK(e.kernel.set_mirror(kPid, mirror, kMirrorWriteBack, 1, ArrayView<const Handle>(sources, 1), ArrayView<const uint32_t>(wrong_size, 1)) == status::kInvalidParameter);
+    CHECK(e.kernel.set_mirror(kPid, mirror, kMirrorWriteBack, 1, ArrayView<const Handle>(sources, 1)) == status::kInvalidParameter);   // (level 0 of an array: not without the words)
+    CHECK(e.kernel.set_mirror(kPid, mirror, kMirrorWriteBack, 1, ArrayView<const Handle>(sources, 1), ArrayView<const uint32_t>(level1_layer1, 1)) == status::kSuccess);
+    CommandWriter cw(e.allocator);
+    cw.bind_pipeline(fill);
+    cw.bind_uav_image(0, 0);
+    cw.dispatch(1, 1, 1);
+    CHECK(e.render(cw, {mirror, source}) == status::kSuccess);
+    // (A8B8G8R8: 0xAABBGGRR; the shader's red at (2, 0) of the 4 x 4 is 2 / 8: 0x40, the colour's green and blue stay)
+    const uint32_t before = colour(1, 1);
+    CHECK(texel(source, 1, 1, 2, 0) == ((before & 0xFFFFFF00u) | 0x40u) && texel(source, 1, 0, 2, 0) == colour(1, 0) && texel(source, 0, 1, 2, 0) == colour(0, 1));
+  }
+
+  // --- A texture's descriptor carries its view (the offset words: first level, count of levels, first layer, count of layers).
+  {
+    Handle views = 0;
+    CHECK(e.kernel.create_descriptor_heap(kPid, e.dev, DescriptorHeapType::CbvSrvUav, 4, &views) == status::kSuccess);
+    DescriptorDesc srv;
+    srv.kind = DescriptorKind::Srv, srv.allocation = small;
+    srv.offset = 1 | (uint64_t{1} << 16) | (uint64_t{2} << 32) | (uint64_t{1} << 48);
+    CHECK(e.kernel.write_descriptor(kPid, views, 0, srv) == status::kSuccess);
+    srv.offset = 0;
+    CHECK(e.kernel.write_descriptor(kPid, views, 1, srv) == status::kSuccess);   // (all of it)
+    srv.offset = 3;
+    CHECK(e.kernel.write_descriptor(kPid, views, 2, srv) == status::kInvalidParameter);   // (a level it does not have)
+    srv.offset = uint64_t{2} << 32 | uint64_t{2} << 48;
+    CHECK(e.kernel.write_descriptor(kPid, views, 2, srv) == status::kInvalidParameter);   // (layers 2 and 3 of three)
+    srv.allocation = box, srv.offset = uint64_t{1} << 48;
+    CHECK(e.kernel.write_descriptor(kPid, views, 2, srv) == status::kInvalidParameter);   // (one slice of a volume)
+  }
+  (void)h;
+  (void)array;
+}
+
 int main() {
   test_handle_table();
   test_adapters_and_processes();
@@ -9264,6 +9761,7 @@ int main() {
   test_conformance();
   test_occlusion_queries();
   test_texture_kinds();
+  test_mipmapped_layers();
   test_independent_blend();
   test_blend_constant();
   test_conservative_raster();

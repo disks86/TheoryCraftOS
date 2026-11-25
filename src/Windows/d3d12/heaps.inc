@@ -53,14 +53,18 @@ typedef struct SoftDesc {
   UINT64 offset, size;     /* buffer views. A texture's view of planes (DK_SRV): `size` is its array mirror (alternate | SRV_ALTERNATE: the kernel's Descriptor::alternate), and
                             * `offset` has SRV_MIRRORS when it or the alternate is a mirror the kernel brings up to date (res_mirror) */
   UINT format;
-  UINT mip;
+  UINT mip;                /* the level of a render target, depth stencil or unordered access view; a texture's shader resource view: its first level */
   UINT sampler[4];         /* filter | address_u << 8 | address_v << 16 | mip_filter << 24, lod bias, min lod, max lod (floats as bits). A view of a buffer (DK_SRV_BUFFER, DK_UAV): 0, then
-                            * the element format of a typed view (0: raw or structured), and an unordered access view's counter - the kernel's allocation and the word's offset (0: none) */
+                            * the element format of a typed view (0: raw or structured), and an unordered access view's counter - the kernel's allocation and the word's offset (0: none).
+                            * A texture's shader resource view (DK_SRV): 0, then its plane of a depth buffer (SRV_STENCIL: the stencil), 0, 0 */
   UINT dimension;
-  UINT slice;
+  UINT slice;              /* the first layer of a view of layers */
   UINT stride;             /* buffer unordered access views: the bytes of an element (ClearUnorderedAccessView* rectangles count elements); render target, depth stencil and
-                            * texture unordered access views: how many layers from `slice` (an array's slices, a volume's depth slices) */
-  UINT pad;                /* a texture's unordered access view through a mirror: the plane and the first slice it is of (plane | first << 8), what a clear writes */
+                            * texture unordered access views: how many layers from `slice` (an array's slices, a volume's depth slices at the level); a texture's shader resource
+                            * view: how many levels from `mip` (0: to the last) */
+  UINT pad;                /* a texture's unordered access view through a mirror: the plane and the first slice it is of, and the level of a narrow texture (plane | first << 8 |
+                            * level << 16), what a clear writes; a texture's
+                            * shader resource view: how many layers from `slice` (0: to the last; a cube's six, a cube array's six for each cube) */
 } SoftDesc;
 typedef char soft_desc_size_check[sizeof(SoftDesc) == DESCRIPTOR_STRIDE ? 1 : -1];
 
@@ -135,7 +139,7 @@ static void desc_write(D3D12_CPU_DESCRIPTOR_HANDLE handle, const SoftDesc *d) {
 
 #define SRV_ALTERNATE ((UINT64)0xFFFFFFFFu << 32)      /* (the size word's high half that says the low half is an alternate: the kernel's WriteDescriptors) */
 #define SRV_MIRRORS 1u
-#define SRV_STENCIL 1u      /* (DK_SRV's `pad`: the view is of a depth buffer's stencil plane - the offset's high word 1 in the kernel's WriteDescriptors) */
+#define SRV_STENCIL 1u      /* (DK_SRV's sampler[1]: the view is of a depth buffer's stencil plane - the lod-bias word 1 in the kernel's WriteDescriptors) */
 /* The allocation a view of a planar texture (NV12, P010, P016) names: its plane (the PlaneSlice; a view format of one channel is plane 0, of two plane 1) of its first slice
  * (a view of several slices gives the shaders that declare an array a mirror of them as well: plane_srv). Any other texture: its allocation. */
 static UINT view_alloc(const Resource *r, DXGI_FORMAT view_format, UINT plane, UINT slice) {
@@ -169,13 +173,53 @@ static void plane_srv(Resource *r, DXGI_FORMAT format, UINT plane, UINT first, U
   d->size = alternate ? SRV_ALTERNATE | alternate : 0;
 }
 
+static int view_layers_at(const Resource *r, UINT level, UINT first, UINT size, UINT *out_first, UINT *out_count);
+static int view_layers(const Resource *r, UINT first, UINT size, UINT *out_first, UINT *out_count) { return view_layers_at(r, 0, first, size, out_first, out_count); }
+
+/* The levels and layers a texture's shader resource view shows (SoftDesc mip / stride, slice / pad; the kernel's Descriptor::view): MostDetailedMip and MipLevels (-1: to the last), the
+ * array slices of an array view (a TEXTURE2D / TEXTURE1D view: the first slice alone), a cube's six faces from the first, a cube array's six for each cube from First2DArrayFace.
+ * 0 for levels or layers the resource does not have. */
+static int srv_view(const Resource *r, const D3D12_SHADER_RESOURCE_VIEW_DESC *desc, SoftDesc *d) {
+  d->mip = 0, d->stride = 0, d->slice = 0, d->pad = 0;
+  if (!desc) return 1;
+  UINT first_level = 0, levels = 0xFFFFFFFFu, first = 0, count = 0xFFFFFFFFu;
+  switch (desc->ViewDimension) {
+    case D3D12_SRV_DIMENSION_TEXTURE1D: first_level = desc->Texture1D.MostDetailedMip, levels = desc->Texture1D.MipLevels, count = 1; break;
+    case D3D12_SRV_DIMENSION_TEXTURE1DARRAY:
+      first_level = desc->Texture1DArray.MostDetailedMip, levels = desc->Texture1DArray.MipLevels, first = desc->Texture1DArray.FirstArraySlice, count = desc->Texture1DArray.ArraySize;
+      break;
+    case D3D12_SRV_DIMENSION_TEXTURE2D: first_level = desc->Texture2D.MostDetailedMip, levels = desc->Texture2D.MipLevels, count = 1; break;
+    case D3D12_SRV_DIMENSION_TEXTURE2DARRAY:
+      first_level = desc->Texture2DArray.MostDetailedMip, levels = desc->Texture2DArray.MipLevels, first = desc->Texture2DArray.FirstArraySlice, count = desc->Texture2DArray.ArraySize;
+      break;
+    case D3D12_SRV_DIMENSION_TEXTURE2DMS: count = 1; break;
+    case D3D12_SRV_DIMENSION_TEXTURE2DMSARRAY: first = desc->Texture2DMSArray.FirstArraySlice, count = desc->Texture2DMSArray.ArraySize; break;
+    case D3D12_SRV_DIMENSION_TEXTURE3D: first_level = desc->Texture3D.MostDetailedMip, levels = desc->Texture3D.MipLevels; break;
+    case D3D12_SRV_DIMENSION_TEXTURECUBE: first_level = desc->TextureCube.MostDetailedMip, levels = desc->TextureCube.MipLevels, count = 6; break;
+    case D3D12_SRV_DIMENSION_TEXTURECUBEARRAY:
+      first_level = desc->TextureCubeArray.MostDetailedMip, levels = desc->TextureCubeArray.MipLevels, first = desc->TextureCubeArray.First2DArrayFace;
+      count = desc->TextureCubeArray.NumCubes > 0xFFFFFFFFu / 6 ? 0 : desc->TextureCubeArray.NumCubes * 6;
+      break;
+    default: return 1;      /* (UNKNOWN: the whole of it) */
+  }
+  if (first_level >= r->mips || (levels != 0xFFFFFFFFu && (levels == 0 || levels > r->mips - first_level))) return 0;
+  const UINT layers = r->kind == 0 || r->kind == 1 ? 1 : r->layers;
+  if (count == 0xFFFFFFFFu) count = first < layers ? layers - first : 0;
+  if (r->kind != 1 && (count == 0 || first >= layers || count > layers - first)) return 0;
+  /* (the kernel's counts: 0 for "to the last") */
+  d->mip = first_level;
+  d->stride = levels == 0xFFFFFFFFu || levels == r->mips - first_level ? 0 : levels;
+  d->slice = r->kind == 1 ? 0 : first;
+  d->pad = r->kind == 1 || first + count == layers ? (first == 0 ? 0 : layers - first) : count;
+  return 1;
+}
+
 /* A shader resource view of a depth buffer (one made without D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE, on a device that reads them: the kernel's KA_DEPTH | KA_TEXTURE). Its
  * format names the plane, as DXGI's are: the depth of D32_FLOAT / R32_TYPELESS through R32_FLOAT, of D16_UNORM / R16_TYPELESS through R16_UNORM, of D24_UNORM_S8_UINT /
  * R24G8_TYPELESS through R24_UNORM_X8_TYPELESS (PlaneSlice 0) and of D32_FLOAT_S8X24_UINT / R32G8X24_TYPELESS through R32_FLOAT_X8X24_TYPELESS; the stencil through
  * X24_TYPELESS_G8_UINT / X32_TYPELESS_G8X24_UINT (PlaneSlice 1), read as integers in green. The depth reads as (depth, 0, 0, 1) - every depth is a float in the kernel, so
  * a D16 or D24 buffer's is not rounded to its bits. A 2D view, or a 2D array or cube view of a depth buffer of several slices; one level (a depth buffer has one). Any other
  * format, a typed depth format, or a buffer that cannot be read is a null view (the debug layer's error on Windows). */
-static int view_layers(const Resource *r, UINT first, UINT size, UINT *out_first, UINT *out_count);
 static void depth_srv(const Resource *r, const D3D12_SHADER_RESOURCE_VIEW_DESC *desc, SoftDesc *d) {
   d->kind = 0;
   if (!desc || r->desc.SampleDesc.Count > 1) return;
@@ -209,7 +253,8 @@ static void depth_srv(const Resource *r, const D3D12_SHADER_RESOURCE_VIEW_DESC *
   if (plane != (UINT)stencil || mip != 0 || (levels != 1 && levels != 0xFFFFFFFFu)) return;
   d->kind = DK_SRV;
   d->alloc = r->alloc;
-  d->pad = stencil ? SRV_STENCIL : 0;
+  if (!srv_view(r, desc, d)) { d->kind = 0; return; }      /* (its levels and layers: all of them) */
+  d->sampler[1] = stencil ? SRV_STENCIL : 0;
 }
 
 static void STDMETHODCALLTYPE dev_CreateConstantBufferView(Dev *This, const D3D12_CONSTANT_BUFFER_VIEW_DESC *desc, D3D12_CPU_DESCRIPTOR_HANDLE handle) {
@@ -258,6 +303,7 @@ static void STDMETHODCALLTYPE dev_CreateShaderResourceView(Dev *This, ID3D12Reso
       d.kind = DK_SRV;
       /* (a packed YUV texture is seen through a view of its pixels' format only) */
       if (format_packed_yuv(r->desc.Format) && (!desc || !packed_yuv_view_ok(r->desc.Format, desc->Format, 0))) d.kind = 0;
+      if (!r->planes && !srv_view(r, desc, &d)) d.kind = 0;      /* (the levels and layers it shows) */
       if (r->planes) {
         if (desc && desc->ViewDimension == D3D12_SRV_DIMENSION_TEXTURE2DARRAY)
           plane_srv(r, desc->Format, desc->Texture2DArray.PlaneSlice, desc->Texture2DArray.FirstArraySlice, desc->Texture2DArray.ArraySize, 1, &d);
@@ -271,10 +317,10 @@ static void STDMETHODCALLTYPE dev_CreateShaderResourceView(Dev *This, ID3D12Reso
   desc_write(handle, &d);
 }
 
-/* The layers a view of several slices names: `first` and `size` of an array view (an array of 1D textures is an array of rows), of a volume's FirstWSlice / WSize (-1: to the
- * end of the level - a volume has one here), within the resource's layers; 0 when they are not. */
-static int view_layers(const Resource *r, UINT first, UINT size, UINT *out_first, UINT *out_count) {
-  const UINT layers = r->kind == 0 ? 1 : r->layers;
+/* The layers a view of several slices names: `first` and `size` of an array view (an array of 1D textures is an array of rows), of a volume's FirstWSlice / WSize at level `level`
+ * (-1: to the end of the level - a volume's level has half the slices of the one above it), within the resource's layers; 0 when they are not. */
+static int view_layers_at(const Resource *r, UINT level, UINT first, UINT size, UINT *out_first, UINT *out_count) {
+  const UINT layers = r->kind == 0 ? 1 : r->kind == 1 ? mip_extent(r->layers, level) : r->layers;
   if (size == 0xFFFFFFFFu) size = first < layers ? layers - first : 0;
   if (size == 0 || first >= layers || size > layers - first) return 0;
   *out_first = first;
@@ -294,7 +340,7 @@ static void texture_uav(Dev *dev, Resource *r, const D3D12_UNORDERED_ACCESS_VIEW
   UINT mip = 0, first = 0, count = 1, plane = 0;
   const D3D12_UAV_DIMENSION dim = desc ? desc->ViewDimension : r->desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D ? D3D12_UAV_DIMENSION_TEXTURE3D
                                   : r->desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D ? (r->kind == 2 ? D3D12_UAV_DIMENSION_TEXTURE1DARRAY : D3D12_UAV_DIMENSION_TEXTURE1D)
-                                  : r->kind == 2 || r->kind == 3 ? D3D12_UAV_DIMENSION_TEXTURE2DARRAY : D3D12_UAV_DIMENSION_TEXTURE2D;
+                                  : r->kind == 2 || r->kind == 3 || r->kind == 5 ? D3D12_UAV_DIMENSION_TEXTURE2DARRAY : D3D12_UAV_DIMENSION_TEXTURE2D;
   int ok = 1;
   switch (dim) {
     case D3D12_UAV_DIMENSION_TEXTURE1D: mip = desc ? desc->Texture1D.MipSlice : 0; ok = r->kind == 0; break;
@@ -318,7 +364,7 @@ static void texture_uav(Dev *dev, Resource *r, const D3D12_UNORDERED_ACCESS_VIEW
       break;
     case D3D12_UAV_DIMENSION_TEXTURE3D:
       mip = desc ? desc->Texture3D.MipSlice : 0;
-      ok = r->kind == 1 && (!desc || view_layers(r, desc->Texture3D.FirstWSlice, desc->Texture3D.WSize, &first, &count));
+      ok = r->kind == 1 && (!desc || view_layers_at(r, mip, desc->Texture3D.FirstWSlice, desc->Texture3D.WSize, &first, &count));
       if (!desc) count = r->layers;
       break;
     default: ok = 0; break;
@@ -342,14 +388,20 @@ static void texture_uav(Dev *dev, Resource *r, const D3D12_UNORDERED_ACCESS_VIEW
       if (r->planes && r->planes == 2) plane = vf->narrow == NARROW_R8G8 || vf->narrow == NARROW_R16G16 ? 1 : 0;
       channels = format_write_mask(format);
     }
-    if (!r->planes && (r->kind != 0 || r->mips != 1)) return;      /* (a narrow texture's mirror is of its one image: not an array's slices, not a level) */
+    /* (a narrow texture's mirror is of its one image, or - on a device with levels of every image - of the view's level and layers of it: narrow_mirror; not of a volume's slices, which a
+     * mirror - an array - cannot be the kind of) */
+    const int levels_mirror = !r->planes && (r->kind != 0 || r->mips != 1);
+    if (levels_mirror && r->kind == 1) return;
     if (r->planes ? plane >= r->planes : plane != 0) return;
     const UINT source = r->planes ? (first < r->layers ? r->plane_alloc[plane * r->layers + first] : 0) : r->alloc;
-    d->alloc = res_mirror(r, plane, first, count, count > 1, (integer ? MIRROR_INTEGER : 0) | MIRROR_WRITE_BACK | MIRROR_UAV, channels);
+    const UINT mirror_mode = (integer ? MIRROR_INTEGER : 0) | MIRROR_WRITE_BACK | MIRROR_UAV;
+    d->alloc = levels_mirror ? narrow_mirror(r, mip, first, count, dim == D3D12_UAV_DIMENSION_TEXTURE2DARRAY || dim == D3D12_UAV_DIMENSION_TEXTURE1DARRAY, mirror_mode, channels)
+                             : res_mirror(r, plane, first, count, count > 1, mirror_mode, channels);
     if (!d->alloc || !source) return;
     d->offset = SRV_MIRRORS;
-    d->pad = plane | first << 8;
-    d->slice = 0;      /* (the mirror's layers are the view's) */
+    d->pad = plane | (first & 0xFF) << 8 | mip << 16;      /* (what a clear writes: the plane, or the narrow texture's level, and the first slice) */
+    d->slice = 0;      /* (the mirror's layers are the view's, of its one level) */
+    d->mip = 0;
     const UINT narrow = !vf ? 0 : vf->narrow == NARROW_R8 ? 1 : vf->narrow == NARROW_R8G8 ? 2 : vf->narrow == NARROW_R16 ? 3 : vf->narrow == NARROW_R16G16 ? 4 : 0;
     d->size = (UINT64)source | ((UINT64)(integer ? (channels == 1 ? (r->fmt->planar == PLANAR_16 ? 3u : 1u) : (r->fmt->planar == PLANAR_16 ? 4u : 2u)) : narrow) << 32);
     d->kind = DK_UAV_TEXTURE;
@@ -420,9 +472,11 @@ static void STDMETHODCALLTYPE dev_CreateRenderTargetView(Dev *This, ID3D12Resour
     }
     if (desc && desc->ViewDimension == D3D12_RTV_DIMENSION_TEXTURE3D) {
       d.mip = desc->Texture3D.MipSlice;
-      if (!view_layers(r, desc->Texture3D.FirstWSlice, desc->Texture3D.WSize, &d.slice, &d.stride)) d.kind = 0;
+      if (!view_layers_at(r, d.mip, desc->Texture3D.FirstWSlice, desc->Texture3D.WSize, &d.slice, &d.stride)) d.kind = 0;
     }
     if (!desc && r->kind != 0) d.stride = r->layers;      /* (no description: all of it) */
+    /* (a level the resource has, on a device that draws into levels; a volume's slices of it) */
+    if (d.mip >= r->mips || (d.mip && !(This->caps.features2 & DEV_FEATURE2_MIPMAPPED_LAYERS))) d.kind = 0;
     if (format_packed_yuv(r->desc.Format) && (!desc || !packed_yuv_view_ok(r->desc.Format, desc->Format, 1))) d.kind = 0;
     if (r->planes) {
       UINT plane = 0, slice = 0, count = 1, channels = 0;
@@ -461,11 +515,17 @@ static void STDMETHODCALLTYPE dev_CreateDepthStencilView(Dev *This, ID3D12Resour
     d.kind = DK_DSV;
     d.alloc = r->alloc;
     d.format = desc ? desc->Format : r->desc.Format;
-    /* (the size of the buffer, for the colour target a pass with this view alone is given: cmdlist.inc depth_companion) */
-    d.size = (UINT64)(UINT)r->desc.Width | ((UINT64)r->desc.Height << 32);
+    /* (the level it draws into - MipSlice, on a device that draws into levels -, and the size of that level, for the colour target a pass with this view alone is given: cmdlist.inc
+     * depth_companion) */
+    if (desc && desc->ViewDimension == D3D12_DSV_DIMENSION_TEXTURE1D) d.mip = desc->Texture1D.MipSlice;
+    if (desc && desc->ViewDimension == D3D12_DSV_DIMENSION_TEXTURE1DARRAY) d.mip = desc->Texture1DArray.MipSlice;
+    if (desc && desc->ViewDimension == D3D12_DSV_DIMENSION_TEXTURE2D) d.mip = desc->Texture2D.MipSlice;
+    if (desc && desc->ViewDimension == D3D12_DSV_DIMENSION_TEXTURE2DARRAY) d.mip = desc->Texture2DArray.MipSlice;
+    if (d.mip >= r->mips || (d.mip && !(This->caps.features2 & DEV_FEATURE2_MIPMAPPED_LAYERS))) d.kind = 0;
+    d.size = (UINT64)mip_extent((UINT)r->desc.Width, d.mip) | ((UINT64)mip_extent(r->desc.Height, d.mip) << 32);
     d.offset = r->desc.SampleDesc.Count ? r->desc.SampleDesc.Count : 1;
     /* (the layers of an array (or cube) it draws into) */
-    d.stride = desc ? 1 : r->kind == 2 || r->kind == 3 ? r->layers : 1;
+    d.stride = desc ? 1 : r->kind == 2 || r->kind == 3 || r->kind == 5 ? r->layers : 1;
     if (desc && desc->ViewDimension == D3D12_DSV_DIMENSION_TEXTURE2DARRAY && !view_layers(r, desc->Texture2DArray.FirstArraySlice, desc->Texture2DArray.ArraySize, &d.slice, &d.stride)) d.kind = 0;
     if (desc && desc->ViewDimension == D3D12_DSV_DIMENSION_TEXTURE1DARRAY && !view_layers(r, desc->Texture1DArray.FirstArraySlice, desc->Texture1DArray.ArraySize, &d.slice, &d.stride)) d.kind = 0;
   }
@@ -570,8 +630,14 @@ static void dheap_sync(DescHeap *h) {
       request[w++] = first + i;
       request[w++] = kind;
       request[w++] = d->alloc;
-      request[w++] = (UINT)d->offset;
-      request[w++] = (UINT)(d->offset >> 32) | (d->kind == DK_SRV && (d->pad & SRV_STENCIL) ? 1u : 0u);      /* (a sampler's offset: its comparison; a view's high word: the stencil plane) */
+      if (d->kind == DK_SRV) {
+        /* (a texture's view: its first level and count of levels, its first layer and count of layers - the kernel's Descriptor::view; SRV_MIRRORS is this DLL's own) */
+        request[w++] = (d->mip & 0xFFFF) | (d->stride << 16);
+        request[w++] = (d->slice & 0xFFFF) | (d->pad << 16);
+      } else {
+        request[w++] = (UINT)d->offset;
+        request[w++] = (UINT)(d->offset >> 32);
+      }
       request[w++] = (UINT)d->size;
       request[w++] = (UINT)(d->size >> 32);
       request[w++] = d->sampler[0] & 0xFF;

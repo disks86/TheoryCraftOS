@@ -127,6 +127,9 @@ struct DescriptorDesc {
   uint32_t texel_format = 0;
   Handle counter = 0;
   uint64_t counter_offset = 0;
+  // A texture's view (Srv of an image; graphics::kFeature2MipmappedLayers): its levels and layers (counts of 0: to the last), the kind the shader declares. The escape carries it in the
+  // offset words: the first level in bits 0-15, the count of levels 16-31, the first layer 32-47, the count of layers 48-63.
+  graphics::TextureView view;
 };
 
 struct Descriptor {
@@ -140,6 +143,7 @@ struct Descriptor {
   uint32_t texel_format = 0;          // a typed view of a buffer: its elements' graphics::TexelFormat (0: raw or structured)
   SharedPointer<Allocation> counter;  // an unordered access view of a buffer: its counter's buffer (none: no counter) ...
   uint64_t counter_offset = 0;        // ... and the word's offset
+  graphics::TextureView view;         // Srv of an image: its levels and layers (counts of 0: to the last)
   // A view that is both a 2D image and an array of them (Direct3D's Texture2DArray view of one plane of a planar texture's slices: the slice's own image, and a mirror of the
   // slices, VidMm::set_mirror): the array, read by shaders that declare one.
   SharedPointer<Allocation> alternate;

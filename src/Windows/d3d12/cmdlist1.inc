@@ -330,8 +330,8 @@ static void uav_clear_texture(CmdList *l, const SoftDesc *d, Resource *r, const 
   const UINT narrow = (UINT)(d->size >> 32);
   static const DXGI_FORMAT narrow_formats[5] = {DXGI_FORMAT_UNKNOWN, DXGI_FORMAT_R8_TYPELESS, DXGI_FORMAT_R8G8_TYPELESS, DXGI_FORMAT_R16_TYPELESS, DXGI_FORMAT_R16G16_TYPELESS};
   const FormatInfo *copy_format = narrow && narrow < 5 ? format_info(narrow_formats[narrow]) : NULL;
-  const UINT plane = mirrored ? (d->pad & 0xFF) : 0, first = mirrored ? d->pad >> 8 : d->slice;
-  UINT width = mip_extent(format_kw(r->fmt, (UINT)r->desc.Width), d->mip), height = mip_extent(r->desc.Height, d->mip);
+  const UINT plane = mirrored ? (d->pad & 0xFF) : 0, first = mirrored ? (d->pad >> 8) & 0xFF : d->slice, level = mirrored ? d->pad >> 16 : d->mip;
+  UINT width = mip_extent(format_kw(r->fmt, (UINT)r->desc.Width), level), height = mip_extent(r->desc.Height, level);
   if (r->planes) {
     UINT w = (UINT)r->desc.Width, h = r->desc.Height;
     plane_extent(r->fmt, plane, &w, &h);
@@ -364,7 +364,8 @@ static void uav_clear_texture(CmdList *l, const SoftDesc *d, Resource *r, const 
       const UINT image = r->planes ? (first + layer < r->layers ? r->plane_alloc[plane * r->layers + first + layer] : 0) : mirrored ? r->alloc : (UINT)d->size;
       if (!image) continue;
       ensure_room(l, 256, 4);
-      copy_buffer_image_packet(l, 0, alloc_index(l, image), mirrored ? 0 : d->mip, r->planes || mirrored ? 0 : first + layer, x0, y0, x1 - x0, y1 - y0, alloc_index(l, fill->alloc), 0, (UINT)pitch, copy_format);
+      /* (a plane's slice has one level; a narrow texture's level of its layer - what its mirror, of that level and those layers, shows) */
+      copy_buffer_image_packet(l, 0, alloc_index(l, image), r->planes ? 0 : level, r->planes ? 0 : first + layer, x0, y0, x1 - x0, y1 - y0, alloc_index(l, fill->alloc), 0, (UINT)pitch, copy_format);
     }
   }
 }
