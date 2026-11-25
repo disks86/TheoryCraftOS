@@ -145,6 +145,8 @@ compositor, the windows of Wayland and X11 clients, and the Vulkan driver's Dire
     into an R8_UINT attachment of the host's texel size before each rendering that reads it (`VenusDevice::rate_attachment`, one image for the largest target). Offered
     only where the host's coarse pixels reach 4x4: Direct3D's tier 2 reports AdditionalShadingRatesSupported, which RADV (coarse pixels up to 2x2) cannot give, and
     there is no feature bit yet that would let d3d12.dll say otherwise. VenusHostTest turns it on (`offer_for_tests`) to check the rest of it with rates up to 2x2.
+  Results after gap pass 5 (RADV RX 9070 XT): emulator `VENUS=1` and QEMU Venus d3d12test 6245/0, d3d11test 530/530, d3d9test 166/166; QEMU virgl unchanged
+  (5821/0, 520, 166); VenusHostTest 122 Direct3D scenes the same (the coordinates-in-texels scene is no longer refused) and the shading-rate checks; TgsiSpirvTest 450/0.
 * **present()** copies the image into the virtio-gpu's 2D screen (`blit` + `present` of the display driver), one copy through guest memory per frame.
 * **Which device** (`RenderNode::build_venus`): with `TCOS_GPU_BACKEND=AUTO` (the default) the Venus device is used when it opens, draws the self-test picture and offers
   every feature and limit that a virgl device on the same host would (a virgl device is made for the comparison and given back) and the host has every extension the
