@@ -207,9 +207,10 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
   if (program_type == 5 && major != 5) return status::kNotSupported;
   if (!((major == 4 && minor <= 1) || (major == 5 && minor <= 1))) return status::kNotSupported;
   const bool v51 = major == 5 && minor == 1;   // (constant buffers, textures and samplers are ranges with a space: cb[ID][index][element], t[ID][index])
-  int32_t cb_register[8], texture_register[8];   // by range ID: the register the range starts at, or -1
+  int32_t cb_register[8], texture_register[8], sampler_register[8];   // by range ID: the register the range starts at, or -1
   for (int32_t& r : cb_register) r = -1;
   for (int32_t& r : texture_register) r = -1;
+  for (int32_t& r : sampler_register) r = -1;
   uint32_t cb_size[kMaxConstantBuffers] = {};    // by slot (b#): the size declared, in vec4s; 0: not declared
   uint32_t immediate_buffer_size = 0;            // vec4s of the declared immediate constant buffer
   // The register of cb<slot>[0] in the program's constant block: the declared buffers one after the other in slot order.
@@ -647,6 +648,53 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
     return emit(ins);
   };
 
+  // Texture and sampler pairs: the sampler register an s# operand names (5.1: s[range][index], the range's register), and the texture unit a lookup of texture t<texture> with
+  // sampler s<sampler> goes through - t<texture>'s own unit, with the sampler of the first lookup of it (most textures are read with one sampler, often s0 for all), and for each
+  // other sampler a unit of that pair's own, the first no t# is declared at (the declarations come before the code), so that the units a pipeline has stay few. kNotSupported
+  // when the units run out.
+  auto sampler_number = [&](const Operand& sampler, uint32_t* number) -> NtStatus {
+    if (sampler.type != kOpSampler) return status::kNotSupported;
+    if (v51) {
+      if (sampler.dims != 2 || sampler.index[0] >= 8 || sampler_register[sampler.index[0]] < 0 || sampler.index[1] != static_cast<uint32_t>(sampler_register[sampler.index[0]])) return status::kNotSupported;
+      *number = sampler.index[1];
+    } else {
+      if (sampler.dims != 1) return status::kNotSupported;
+      *number = sampler.index[0];
+    }
+    return *number < graphics::kMaxTextureUnits ? status::kSuccess : status::kNotSupported;
+  };
+  uint32_t paired_textures = 0;   // (bit n: t<n>'s own unit has the sampler of its first lookup)
+  auto pair_unit = [&](uint32_t texture, uint32_t sampler, uint32_t* unit) -> NtStatus {
+    if (texture >= graphics::kMaxTextureUnits || sampler >= graphics::kMaxTextureUnits) return status::kNotSupported;
+    if (!(paired_textures >> texture & 1) && program->unit_texture_[texture] == texture) {
+      paired_textures |= 1u << texture;
+      program->unit_sampler_[texture] = static_cast<uint8_t>(sampler);
+    }
+    if (program->unit_texture_[texture] == texture && program->unit_sampler_[texture] == sampler) {
+      *unit = texture;
+      program->sampled_units_ |= 1u << texture;
+      return status::kSuccess;
+    }
+    for (uint32_t u = 0; u < graphics::kMaxTextureUnits; ++u)
+      if (u != program->unit_texture_[u] && program->unit_texture_[u] == texture && program->unit_sampler_[u] == sampler) {
+        *unit = u;
+        return status::kSuccess;
+      }
+    for (uint32_t u = 0; u < graphics::kMaxTextureUnits; ++u) {
+      if (program->texture_unit_mask_ >> u & 1) continue;
+      program->texture_unit_mask_ |= 1u << u;
+      program->sampled_units_ |= 1u << u;
+      program->unit_texture_[u] = static_cast<uint8_t>(texture);
+      program->unit_sampler_[u] = static_cast<uint8_t>(sampler);
+      program->texture_kind_[u] = program->texture_kind_[texture];
+      program->texture_samples_[u] = program->texture_samples_[texture];
+      if (one_d_units >> texture & 1) one_d_units |= 1u << u;
+      *unit = u;
+      return status::kSuccess;
+    }
+    return status::kNotSupported;
+  };
+
   // --- the instructions
   while (!in.at_end()) {
     if (returned) return status::kNotSupported;   // (code after a ret)
@@ -677,7 +725,7 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
     ConstByteView body = in.take(uint64_t{words - 1} * 4);
     if (!in.ok()) return status::kInvalidParameter;
     ByteReader p(body);
-    // Extended opcode tokens: sample offsets are taken by gather4 only (and are zero for the rest); the others (resource dimension, return type) change nothing.
+    // Extended opcode tokens: sample offsets are taken by gather4 and sample_c / sample_c_lz only (and are zero for the rest); the others (resource dimension, return type) change nothing.
     int32_t sample_offset[3] = {0, 0, 0};
     for (uint32_t ext = token; (ext >> 31) != 0;) {
       ext = p.le32();
@@ -687,13 +735,25 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
           const int32_t value = static_cast<int32_t>((ext >> (9 + 4 * k)) & 0xF);
           sample_offset[k] = value >= 8 ? value - 16 : value;
         }
-        const bool gather = opcode == 109 || opcode == 126;
-        if ((sample_offset[0] || sample_offset[1] || sample_offset[2]) && (!gather || sample_offset[2])) return status::kNotSupported;
+        const bool gather = opcode == 109 || opcode == 126, compare = opcode == 70 || opcode == 71;   // (and sample_c / sample_c_lz: a shadow map's taps)
+        if ((sample_offset[0] || sample_offset[1] || sample_offset[2]) && (!(gather || compare) || sample_offset[2])) return status::kNotSupported;
       }
     }
     NtStatus s = status::kSuccess;
     switch (opcode) {
-      case kDclGlobalFlags4: case kDclSampler4: case kNop4: continue;
+      case kDclGlobalFlags4: case kNop4: continue;
+      case kDclSampler4: {
+        // dcl_sampler s#, mode (5.1: s[ID][lower:upper], space - the range's register); the mode (default, comparison, mono) changes nothing here: the sampler bound says how it compares
+        if (!v51) continue;
+        Operand o;
+        s = read_operand(p, &o);
+        if (s != status::kSuccess) return s;
+        const uint32_t space = p.le32();
+        if (!p.ok() || o.type != kOpSampler || o.dims != 3) return status::kInvalidParameter;
+        if (o.index[0] >= 8 || o.index[1] != o.index[2] || o.index[1] >= graphics::kMaxTextureUnits || space != 0) return status::kNotSupported;
+        sampler_register[o.index[0]] = static_cast<int32_t>(o.index[1]);
+        continue;
+      }
       case kDclTemps4: {
         const uint32_t n = p.le32();
         if (!p.ok() || n > kMaxTemps) return status::kNotSupported;
@@ -1121,6 +1181,10 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
         return status::kNotSupported;
       }
       if (resource.type != kOpResource || unit >= graphics::kMaxTextureUnits || (opcode == 72 && sampler.type != kOpSampler)) return status::kNotSupported;
+      if (opcode == 72) {   // (sample_l: the unit of the texture and sampler pair)
+        uint32_t sampler_reg = 0;
+        if ((s = sampler_number(sampler, &sampler_reg)) != status::kSuccess || (s = pair_unit(unit, sampler_reg, &unit)) != status::kSuccess) return s;
+      }
       if (opcode == 45 && program->texture_kind_[unit] == graphics::TextureKind::TextureCube) return status::kNotSupported;   // (a cube has no Load)
       const bool multisampled = program->texture_kind_[unit] == graphics::TextureKind::Texture2DMS;
       if ((opcode == 46 || opcode == 111) != multisampled && (opcode == 46 || opcode == 111 || opcode == 45 || opcode == 72)) return status::kNotSupported;   // (ld_ms and sampleinfo go with a multisampled texture, and ld and sample_l do not)
@@ -1279,8 +1343,18 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
         return status::kNotSupported;
       }
       if (resource.type != kOpResource || unit >= graphics::kMaxTextureUnits || sampler.type != kOpSampler) return status::kNotSupported;
+      {
+        // (the unit of the texture and sampler pair: a texture sampled with two samplers is read through two units)
+        uint32_t sampler_reg = 0;
+        if ((s = sampler_number(sampler, &sampler_reg)) != status::kSuccess || (s = pair_unit(unit, sampler_reg, &unit)) != status::kSuccess) return s;
+      }
       Operand extra[2];
-      if ((opcode == 108 || opcode == 70 || opcode == 71) && program->texture_kind_[unit] != graphics::TextureKind::Texture2D) return status::kNotSupported;
+      if (opcode == 108 && program->texture_kind_[unit] != graphics::TextureKind::Texture2D) return status::kNotSupported;
+      // (sample_c / sample_c_lz: of a 2D texture, an array of them (a one-dimensional texture or array is one of those) or a cube; with an offset in texels on all but a cube)
+      if ((opcode == 70 || opcode == 71) && program->texture_kind_[unit] != graphics::TextureKind::Texture2D && program->texture_kind_[unit] != graphics::TextureKind::Texture2DArray &&
+          program->texture_kind_[unit] != graphics::TextureKind::TextureCube)
+        return status::kNotSupported;
+      if ((opcode == 70 || opcode == 71) && (sample_offset[0] || sample_offset[1]) && program->texture_kind_[unit] == graphics::TextureKind::TextureCube) return status::kNotSupported;
       if (opcode == 70 || opcode == 71 || opcode == 126 || opcode == 128) {   // sample_c, gather4_c: the reference value
         if ((s = read_operand(p, &extra[0])) != status::kSuccess) return s;
       }
@@ -1309,6 +1383,9 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
         s = to_src(extra[0], &ins.src[2]);
         if (s != status::kSuccess) return s;
         ins.src_count = 3;
+        ins.control = opcode == 71 ? 1 : 0;   // (sample_c_lz: level zero)
+        ins.texel_offset[0] = static_cast<int8_t>(sample_offset[0]), ins.texel_offset[1] = static_cast<int8_t>(sample_offset[1]);
+        program->compare_units_ |= 1u << unit;
         if (resource.components == 2)
           for (uint32_t k = 0; k < 4; ++k) ins.tex_swizzle[k] = resource.swizzle[k];
         program->uses_system_values_ = true;   // (the required-features path: the function with the texture set)
@@ -1324,6 +1401,7 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
         if ((kind != graphics::TextureKind::Texture2D && kind != graphics::TextureKind::Texture2DArray && kind != graphics::TextureKind::TextureCube) || resource.components != 2) return status::kNotSupported;
         if ((programmable || offset_static) && kind == graphics::TextureKind::TextureCube) return status::kNotSupported;
         ins.control = static_cast<uint8_t>((compare ? 0 : resource.swizzle[0]) | (compare ? 4 : 0) | (programmable ? 8 : 0) | (offset_static ? 16 : 0));
+        if (compare) program->compare_units_ |= 1u << unit;
         uint32_t next = 2;
         if (programmable) {
           s = to_src(gather_offset, &ins.src[next++]);

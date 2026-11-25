@@ -33,7 +33,7 @@ class SoftwareDevice final : public IGraphicsDevice {
       : allocator_(allocator), display_(display) {}
 
   DeviceInfo info() const override { return {"software rasterizer", DeviceKind::Software, false, kMaxPushConstantBytes, kFeatureBlendState | kFeatureVertexFormats | kFeatureAddressModes | kFeatureTexelAccess | kFeatureSystemInputs | kFeatureInstancing | kFeatureLines | kFeatureMultipleTargets | kFeatureFloatFormats | kFeatureOcclusionQueries | kFeatureStatisticsQueries | kFeatureTimestampQueries | kFeatureDepthResolve | kFeatureResolveModes | kFeatureStreamOutput | kFeatureTextureKinds | kFeatureIndependentBlend | kFeatureCompute | kFeatureMultisample | kFeatureGeometryShaders | kFeatureSrgbFormats | kFeatureUnorm16Formats | kFeatureIntegerFormats | kFeatureSnormFormats | kFeatureTessellation | kFeatureStorageInDraws | kFeatureFragmentStores | kFeatureVertexStores | kFeatureGeometryStores | kFeatureTessellationStores, (1u << 2) | (1u << 4) | (1u << 8),
-            DeviceLimits{kMaxVertexAttributes, kMaxVaryings, kMaxTextureUnits, kMaxColorTargets, kMaxVertexBuffers}, true, kFeature2StorageImages | kFeature2StorageImagesInDraws | kFeature2LayeredTargets | kFeature2SingleChannelFormats}; }   // (the CPU renderer takes all the capacity)
+            DeviceLimits{kMaxVertexAttributes, kMaxVaryings, kMaxTextureUnits, kMaxColorTargets, kMaxVertexBuffers}, true, kFeature2StorageImages | kFeature2StorageImagesInDraws | kFeature2LayeredTargets | kFeature2SingleChannelFormats | kFeature2DepthTextures | kFeature2DepthAndStencilPlanes}; }   // (the CPU renderer takes all the capacity)
 
   IBuffer* create_buffer(uint64_t size, uint32_t usage) override;
   void destroy_buffer(IBuffer* buffer) override;

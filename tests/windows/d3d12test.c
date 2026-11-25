@@ -3604,6 +3604,518 @@ static void test_plane_uavs(Scene *c) {
   ID3D12Resource_Release(tex);
 }
 
+/* ---- depth buffers read as textures, comparison samplers, texture and sampler pairs ------------------------------------------------------------------------------------------- */
+
+/* A pipeline of vs.hlsl and `ps` on `rs` (the scene's vertex layout), drawing into the scene's target (`colour`) or into a depth and stencil buffer of `dsv_format` alone, which
+ * the depth pass tests (less), writes and stamps with the stencil reference. */
+static ID3D12PipelineState *shadow_pipeline(Scene *c, ID3D12RootSignature *rs, const void *ps, SIZE_T ps_size, int colour, DXGI_FORMAT dsv_format) {
+  D3D12_INPUT_ELEMENT_DESC layout[2] = {{"POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
+                                        {"COLOR", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 12, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0}};
+  D3D12_GRAPHICS_PIPELINE_STATE_DESC pd;
+  memset(&pd, 0, sizeof pd);
+  pd.pRootSignature = rs;
+  pd.VS.pShaderBytecode = dx_vs_dxbc;
+  pd.VS.BytecodeLength = sizeof dx_vs_dxbc;
+  pd.PS.pShaderBytecode = ps;
+  pd.PS.BytecodeLength = ps_size;
+  pd.SampleMask = 0xFFFFFFFFu;
+  pd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+  pd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+  pd.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+  if (dsv_format != DXGI_FORMAT_UNKNOWN) {
+    pd.DepthStencilState.DepthEnable = TRUE;
+    pd.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
+    pd.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_LESS;
+    if (dsv_format == DXGI_FORMAT_D24_UNORM_S8_UINT) {
+      pd.DepthStencilState.StencilEnable = TRUE;
+      pd.DepthStencilState.StencilReadMask = pd.DepthStencilState.StencilWriteMask = 0xFF;
+      const D3D12_DEPTH_STENCILOP_DESC stamp = {D3D12_STENCIL_OP_KEEP, D3D12_STENCIL_OP_KEEP, D3D12_STENCIL_OP_REPLACE, D3D12_COMPARISON_FUNC_ALWAYS};
+      pd.DepthStencilState.FrontFace = pd.DepthStencilState.BackFace = stamp;
+    }
+    pd.DSVFormat = dsv_format;
+  }
+  pd.InputLayout.pInputElementDescs = layout;
+  pd.InputLayout.NumElements = 2;
+  pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+  pd.NumRenderTargets = colour ? 1 : 0;
+  if (colour) pd.RTVFormats[0] = DXGI_FORMAT_B8G8R8A8_UNORM;
+  pd.SampleDesc.Count = 1;
+  ID3D12PipelineState *pso = NULL;
+  CHECK_HR(ID3D12Device_CreateGraphicsPipelineState(c->dev, &pd, &IID_ID3D12PipelineState, (void **)&pso));
+  return pso;
+}
+
+/* A root signature of a table of `views` shader resource views (t0 ..), a table of `samplers` samplers (s0 ..; none: 0), the static samplers given (after them), and the 16
+ * constants of the vertex shader's matrix (the last parameter). */
+static ID3D12RootSignature *shadow_signature(ID3D12Device *dev, UINT views, UINT samplers, const D3D12_STATIC_SAMPLER_DESC *statics, UINT static_count) {
+  D3D12_DESCRIPTOR_RANGE ranges[2] = {{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, views, 0, 0, 0}, {D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER, samplers, 0, 0, 0}};
+  D3D12_ROOT_PARAMETER params[3];
+  memset(params, 0, sizeof params);
+  UINT n = 0;
+  params[n].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+  params[n].DescriptorTable.NumDescriptorRanges = 1;
+  params[n++].DescriptorTable.pDescriptorRanges = &ranges[0];
+  if (samplers) {
+    params[n].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    params[n].DescriptorTable.NumDescriptorRanges = 1;
+    params[n++].DescriptorTable.pDescriptorRanges = &ranges[1];
+  }
+  params[n].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+  params[n++].Constants.Num32BitValues = 16;
+  D3D12_ROOT_SIGNATURE_DESC rsd = {n, params, static_count, statics, D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT};
+  ID3DBlob *blob = NULL, *error = NULL;
+  CHECK_HR(D3D12SerializeRootSignature(&rsd, D3D_ROOT_SIGNATURE_VERSION_1_0, &blob, &error));
+  ID3D12RootSignature *rs = NULL;
+  if (blob) CHECK_HR(ID3D12Device_CreateRootSignature(dev, 0, ID3D10Blob_GetBufferPointer(blob), ID3D10Blob_GetBufferSize(blob), &IID_ID3D12RootSignature, (void **)&rs));
+  if (blob) ID3D10Blob_Release(blob);
+  if (error) ID3D10Blob_Release(error);
+  return rs;
+}
+
+static D3D12_SAMPLER_DESC shadow_sampler(D3D12_FILTER filter, D3D12_TEXTURE_ADDRESS_MODE address, D3D12_COMPARISON_FUNC func) {
+  D3D12_SAMPLER_DESC s;
+  memset(&s, 0, sizeof s);
+  s.Filter = filter;
+  s.AddressU = s.AddressV = s.AddressW = address;
+  s.ComparisonFunc = func;
+  s.MaxLOD = 1000.0f;
+  return s;
+}
+
+/* Six vertices of a rectangle from (x0, y0) to (x1, y1) in clip space at depth z, coloured so that vs.hlsl's coordinate is (u, v) = 0, 0 at the top left to 1, 1 at the bottom right
+ * of the target (plus `dv`), the colour's blue `reference`. */
+static void shadow_rect(float (*v)[7], float x0, float y0, float x1, float y1, float z, float dv, float reference) {
+  const float corners[6][2] = {{x0, y1}, {x1, y1}, {x0, y0}, {x0, y0}, {x1, y1}, {x1, y0}};
+  for (int i = 0; i < 6; ++i) {
+    const float x = corners[i][0], y = corners[i][1];
+    v[i][0] = x, v[i][1] = y, v[i][2] = z;
+    v[i][3] = (x + 1) / 4, v[i][4] = ((1 - y) / 2 + dv) / 2, v[i][5] = reference, v[i][6] = 1;
+  }
+}
+
+static int shadow_near(UINT value, UINT want, UINT within) { return value + within >= want && value <= want + within; }
+
+static void shadow_transition(ID3D12GraphicsCommandList *list, ID3D12Resource *r, D3D12_RESOURCE_STATES before, D3D12_RESOURCE_STATES after) {
+  D3D12_RESOURCE_BARRIER b;
+  memset(&b, 0, sizeof b);
+  b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+  b.Transition.pResource = r;
+  b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+  b.Transition.StateBefore = before;
+  b.Transition.StateAfter = after;
+  ID3D12GraphicsCommandList_ResourceBarrier(list, 1, &b);
+}
+
+/* A shadow map, the way Direct3D 12 programs make one: a D24S8 buffer (R24G8_TYPELESS) drawn into by a depth-only pass - its top half at depth 0.25 and stencil 5, the rest
+ * cleared to 1 and 0 -, then read by shaders: compared by two comparison samplers of a table and sampled by a static one (three texture and sampler pairs of t0: ps_shadow), its
+ * stencil plane loaded (ps_stencil_only), and then compared after the stencil was read (a GPU's texture may keep one plane's mode), compared through a linear comparison sampler (SampleCmp, GatherCmp: ps_shadow_pcf). Then a pass that draws into a swap chain's back
+ * buffer - an image kept for showing - with a depth buffer that is a texture, read afterwards (the rows of the two must not come out the other way round), an array of depth, one
+ * texture with two samplers, and the formats. */
+static void test_shadow_maps(Scene *c) {
+  ID3D12Device *dev = c->dev;
+  D3D12_HEAP_PROPERTIES defaults = {D3D12_HEAP_TYPE_DEFAULT, D3D12_CPU_PAGE_PROPERTY_UNKNOWN, D3D12_MEMORY_POOL_UNKNOWN, 1, 1};
+  /* (what the formats say: the views of depth buffers sampled, compared and gathered, their stencil loaded) */
+  const UINT32 x8 = format_support1(dev, DXGI_FORMAT_R24_UNORM_X8_TYPELESS), g8 = format_support1(dev, DXGI_FORMAT_X24_TYPELESS_G8_UINT), r32 = format_support1(dev, DXGI_FORMAT_R32_FLOAT);
+  CHECK((x8 & D3D12_FORMAT_SUPPORT1_SHADER_SAMPLE_COMPARISON) && (x8 & D3D12_FORMAT_SUPPORT1_SHADER_GATHER_COMPARISON) && (x8 & D3D12_FORMAT_SUPPORT1_SHADER_LOAD));
+  CHECK((g8 & D3D12_FORMAT_SUPPORT1_SHADER_LOAD) && !(g8 & D3D12_FORMAT_SUPPORT1_SHADER_SAMPLE) && (r32 & D3D12_FORMAT_SUPPORT1_SHADER_SAMPLE_COMPARISON));
+  CHECK(format_support1(dev, DXGI_FORMAT_D16_UNORM) & D3D12_FORMAT_SUPPORT1_DEPTH_STENCIL);
+  D3D12_RESOURCE_DESC dd = {D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, 64, 64, 1, 1, DXGI_FORMAT_R24G8_TYPELESS, {1, 0}, D3D12_TEXTURE_LAYOUT_UNKNOWN, D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL};
+  ID3D12Resource *depth = NULL;
+  CHECK_HR(ID3D12Device_CreateCommittedResource(dev, &defaults, D3D12_HEAP_FLAG_NONE, &dd, D3D12_RESOURCE_STATE_DEPTH_WRITE, NULL, &IID_ID3D12Resource, (void **)&depth));
+  D3D12_DESCRIPTOR_HEAP_DESC dsv_desc = {D3D12_DESCRIPTOR_HEAP_TYPE_DSV, 2, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
+  D3D12_DESCRIPTOR_HEAP_DESC srv_desc = {D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 8, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
+  D3D12_DESCRIPTOR_HEAP_DESC smp_desc = {D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER, 8, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
+  ID3D12DescriptorHeap *dsv_heap = NULL, *srv_heap = NULL, *smp_heap = NULL;
+  CHECK_HR(ID3D12Device_CreateDescriptorHeap(dev, &dsv_desc, &IID_ID3D12DescriptorHeap, (void **)&dsv_heap));
+  CHECK_HR(ID3D12Device_CreateDescriptorHeap(dev, &srv_desc, &IID_ID3D12DescriptorHeap, (void **)&srv_heap));
+  CHECK_HR(ID3D12Device_CreateDescriptorHeap(dev, &smp_desc, &IID_ID3D12DescriptorHeap, (void **)&smp_heap));
+  ID3D12Resource *vb = make_buffer(dev, D3D12_HEAP_TYPE_UPLOAD, 4096, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ);
+  if (!depth || !dsv_heap || !srv_heap || !smp_heap || !vb) { CHECK(0); return; }
+  const UINT view_step = ID3D12Device_GetDescriptorHandleIncrementSize(dev, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+  const UINT sampler_step = ID3D12Device_GetDescriptorHandleIncrementSize(dev, D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER);
+  const D3D12_CPU_DESCRIPTOR_HANDLE dsv = ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(dsv_heap);
+  const D3D12_CPU_DESCRIPTOR_HANDLE srv0 = ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(srv_heap), smp0 = ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(smp_heap);
+  const D3D12_GPU_DESCRIPTOR_HANDLE srv_gpu = ID3D12DescriptorHeap_GetGPUDescriptorHandleForHeapStart(srv_heap), smp_gpu = ID3D12DescriptorHeap_GetGPUDescriptorHandleForHeapStart(smp_heap);
+  D3D12_DEPTH_STENCIL_VIEW_DESC dv;
+  memset(&dv, 0, sizeof dv);
+  dv.Format = DXGI_FORMAT_D24_UNORM_S8_UINT;
+  dv.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2D;
+  ID3D12Device_CreateDepthStencilView(dev, depth, &dv, dsv);
+  /* (t0 the depth, t1 the stencil, t2 a depth view of a wrong format: a null view) */
+  D3D12_SHADER_RESOURCE_VIEW_DESC sv;
+  memset(&sv, 0, sizeof sv);
+  sv.Format = DXGI_FORMAT_R24_UNORM_X8_TYPELESS;
+  sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+  sv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+  sv.Texture2D.MipLevels = 1;
+  ID3D12Device_CreateShaderResourceView(dev, depth, &sv, srv0);
+  sv.Format = DXGI_FORMAT_X24_TYPELESS_G8_UINT;
+  sv.Texture2D.PlaneSlice = 1;
+  ID3D12Device_CreateShaderResourceView(dev, depth, &sv, (D3D12_CPU_DESCRIPTOR_HANDLE){srv0.ptr + view_step});
+  D3D12_SAMPLER_DESC less_equal = shadow_sampler(D3D12_FILTER_COMPARISON_MIN_MAG_MIP_POINT, D3D12_TEXTURE_ADDRESS_MODE_CLAMP, D3D12_COMPARISON_FUNC_LESS_EQUAL);
+  D3D12_SAMPLER_DESC greater = shadow_sampler(D3D12_FILTER_COMPARISON_MIN_MAG_MIP_POINT, D3D12_TEXTURE_ADDRESS_MODE_CLAMP, D3D12_COMPARISON_FUNC_GREATER);
+  ID3D12Device_CreateSampler(dev, &less_equal, smp0);
+  ID3D12Device_CreateSampler(dev, &greater, (D3D12_CPU_DESCRIPTOR_HANDLE){smp0.ptr + sampler_step});
+  D3D12_STATIC_SAMPLER_DESC plain;
+  memset(&plain, 0, sizeof plain);
+  plain.Filter = D3D12_FILTER_MIN_MAG_MIP_POINT;
+  plain.AddressU = plain.AddressV = plain.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+  plain.MaxLOD = 1000.0f;
+  plain.ShaderRegister = 2;
+  D3D12_STATIC_SAMPLER_DESC pcf = plain;
+  pcf.Filter = D3D12_FILTER_COMPARISON_MIN_MAG_LINEAR_MIP_POINT;
+  pcf.ComparisonFunc = D3D12_COMPARISON_FUNC_LESS_EQUAL;
+  pcf.ShaderRegister = 0;
+  ID3D12RootSignature *rs_shadow = shadow_signature(dev, 1, 2, &plain, 1), *rs_stencil = shadow_signature(dev, 2, 0, NULL, 0), *rs_pcf = shadow_signature(dev, 1, 0, &pcf, 1);
+  ID3D12PipelineState *depth_pso = shadow_pipeline(c, c->rs, dx_ps_color_dxbc, sizeof dx_ps_color_dxbc, 0, DXGI_FORMAT_D24_UNORM_S8_UINT);
+  ID3D12PipelineState *shadow_pso = rs_shadow ? shadow_pipeline(c, rs_shadow, dx_ps_shadow_dxbc, sizeof dx_ps_shadow_dxbc, 1, DXGI_FORMAT_UNKNOWN) : NULL;
+  ID3D12PipelineState *stencil_pso = rs_stencil ? shadow_pipeline(c, rs_stencil, dx_ps_stencil_only_dxbc, sizeof dx_ps_stencil_only_dxbc, 1, DXGI_FORMAT_UNKNOWN) : NULL;
+  ID3D12PipelineState *pcf_pso = rs_pcf ? shadow_pipeline(c, rs_pcf, dx_ps_shadow_pcf_dxbc, sizeof dx_ps_shadow_pcf_dxbc, 1, DXGI_FORMAT_UNKNOWN) : NULL;
+  if (!depth_pso || !shadow_pso || !stencil_pso || !pcf_pso) { CHECK(0); return; }
+  /* the vertices: the top half at 0.25 (0), the whole target with the reference 0.5 (6), the same a quarter of a texel down (12) */
+  float verts[18][7];
+  shadow_rect(&verts[0], -1, 0, 1, 1, 0.25f, 0, 0);
+  shadow_rect(&verts[6], -1, -1, 1, 1, 0.5f, 0, 0.5f);
+  shadow_rect(&verts[12], -1, -1, 1, 1, 0.5f, 0.25f / 64, 0.5f);
+  void *mapped = NULL;
+  CHECK_HR(ID3D12Resource_Map(vb, 0, NULL, &mapped));
+  if (mapped) memcpy(mapped, verts, sizeof verts);
+  ID3D12Resource_Unmap(vb, 0, NULL);
+  const D3D12_VERTEX_BUFFER_VIEW vbv = {ID3D12Resource_GetGPUVirtualAddress(vb), sizeof verts, 28};
+  const D3D12_VIEWPORT vp = {0, 0, 64, 64, 0, 1};
+  const D3D12_RECT sc = {0, 0, 64, 64};
+  const float black[4] = {0, 0, 0, 0};
+  ID3D12DescriptorHeap *heaps[2] = {srv_heap, smp_heap};
+  /* Draws the full target (first vertex `first`) with `pso` on `rs` reading the depth buffer and gives the pixels at the points. */
+#define SHADOW_READ(pso_, rs_, samplers_, first_, out_, ...)                                                                              \
+  do {                                                                                                                                     \
+    ID3D12GraphicsCommandList *l_ = NULL;                                                                                                  \
+    CHECK_HR(ID3D12CommandAllocator_Reset(c->allocator));                                                                                  \
+    CHECK_HR(ID3D12Device_CreateCommandList(dev, 0, D3D12_COMMAND_LIST_TYPE_DIRECT, c->allocator, pso_, &IID_ID3D12GraphicsCommandList, (void **)&l_)); \
+    if (!l_) break;                                                                                                                        \
+    ID3D12GraphicsCommandList_OMSetRenderTargets(l_, 1, &c->rtv, FALSE, NULL);                                                            \
+    ID3D12GraphicsCommandList_ClearRenderTargetView(l_, c->rtv, black, 0, NULL);                                                           \
+    ID3D12GraphicsCommandList_RSSetViewports(l_, 1, &vp);                                                                                 \
+    ID3D12GraphicsCommandList_RSSetScissorRects(l_, 1, &sc);                                                                              \
+    ID3D12GraphicsCommandList_SetGraphicsRootSignature(l_, rs_);                                                                           \
+    ID3D12GraphicsCommandList_SetDescriptorHeaps(l_, 2, heaps);                                                                            \
+    ID3D12GraphicsCommandList_SetGraphicsRootDescriptorTable(l_, 0, srv_gpu);                                                              \
+    if (samplers_) ID3D12GraphicsCommandList_SetGraphicsRootDescriptorTable(l_, 1, smp_gpu);                                              \
+    ID3D12GraphicsCommandList_SetGraphicsRoot32BitConstants(l_, (samplers_) ? 2 : 1, 16, kIdentity, 0);                                   \
+    ID3D12GraphicsCommandList_IASetPrimitiveTopology(l_, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);                                             \
+    ID3D12GraphicsCommandList_IASetVertexBuffers(l_, 0, 1, &vbv);                                                                         \
+    ID3D12GraphicsCommandList_DrawInstanced(l_, 6, 1, first_, 0);                                                                         \
+    scene_read_target(c, l_);                                                                                                              \
+    scene_run(c, l_);                                                                                                                      \
+    ID3D12GraphicsCommandList_Release(l_);                                                                                                 \
+    const UINT32 *px_ = NULL;                                                                                                              \
+    const int at_[][2] = {__VA_ARGS__};                                                                                                    \
+    if (SUCCEEDED(ID3D12Resource_Map(c->readback, 0, NULL, (void **)&px_)) && px_) {                                                       \
+      for (UINT k_ = 0; k_ < sizeof at_ / sizeof at_[0]; ++k_) (out_)[k_] = px_[at_[k_][1] * 64 + at_[k_][0]];                             \
+      ID3D12Resource_Unmap(c->readback, 0, NULL);                                                                                          \
+    }                                                                                                                                      \
+  } while (0)
+  /* the depth pass */
+  ID3D12GraphicsCommandList *list = NULL;
+  CHECK_HR(ID3D12CommandAllocator_Reset(c->allocator));
+  CHECK_HR(ID3D12Device_CreateCommandList(dev, 0, D3D12_COMMAND_LIST_TYPE_DIRECT, c->allocator, depth_pso, &IID_ID3D12GraphicsCommandList, (void **)&list));
+  if (!list) { CHECK(0); return; }
+  ID3D12GraphicsCommandList_OMSetRenderTargets(list, 0, NULL, FALSE, &dsv);
+  ID3D12GraphicsCommandList_ClearDepthStencilView(list, dsv, D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL, 1.0f, 0, 0, NULL);
+  ID3D12GraphicsCommandList_RSSetViewports(list, 1, &vp);
+  ID3D12GraphicsCommandList_RSSetScissorRects(list, 1, &sc);
+  ID3D12GraphicsCommandList_SetGraphicsRootSignature(list, c->rs);
+  ID3D12GraphicsCommandList_SetGraphicsRoot32BitConstants(list, 0, 16, kIdentity, 0);
+  ID3D12GraphicsCommandList_OMSetStencilRef(list, 5);
+  ID3D12GraphicsCommandList_IASetPrimitiveTopology(list, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+  ID3D12GraphicsCommandList_IASetVertexBuffers(list, 0, 1, &vbv);
+  ID3D12GraphicsCommandList_DrawInstanced(list, 6, 1, 0, 0);
+  shadow_transition(list, depth, D3D12_RESOURCE_STATE_DEPTH_WRITE, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+  scene_run(c, list);
+  ID3D12GraphicsCommandList_Release(list);
+  UINT32 px[4] = {0};
+  /* compared with 0.5: less-or-equal fails above (0.25) and passes below (1), greater the other way; the static sampler gives the depth */
+  SHADOW_READ(shadow_pso, rs_shadow, 1, 6, px, {10, 10}, {50, 50});
+  printf("shadow maps: compared %08x (top) %08x (bottom)\n", (unsigned)px[0], (unsigned)px[1]);
+  CHECK(px_red(px[0]) == 0 && px_green(px[0]) == 255 && shadow_near((UINT)px_blue(px[0]), 64, 2));
+  CHECK(px_red(px[1]) == 255 && px_green(px[1]) == 0 && px_blue(px[1]) == 255);
+  /* the stencil plane (a draw that reads it alone: a GPU's texture may read one plane at a time) */
+  SHADOW_READ(stencil_pso, rs_stencil, 0, 6, px, {10, 10}, {50, 50});
+  printf("shadow maps: stencil %08x (top) %08x (bottom)\n", (unsigned)px[0], (unsigned)px[1]);
+  CHECK(px_green(px[0]) == 5 && px_green(px[1]) == 0);
+  /* the depth again after the stencil (the host's texture is put back to its depth) */
+  SHADOW_READ(shadow_pso, rs_shadow, 1, 6, px, {10, 10}, {50, 50});
+  CHECK(px_red(px[0]) == 0 && px_green(px[0]) == 255 && px_red(px[1]) == 255 && px_blue(px[1]) == 255);
+  /* filtered: a quarter of a texel down, row 31 takes a quarter of row 32 (which passes); GatherCmp gives two of each there */
+  SHADOW_READ(pcf_pso, rs_pcf, 0, 12, px, {20, 31}, {20, 10}, {20, 50});
+  printf("shadow maps: filtered %08x (the edge) %08x %08x\n", (unsigned)px[0], (unsigned)px[1], (unsigned)px[2]);
+  CHECK(shadow_near((UINT)px_red(px[0]), 64, 6) && shadow_near((UINT)px_green(px[0]), 64, 6) && shadow_near((UINT)px_blue(px[0]), 128, 4));
+  CHECK((px[1] & 0xFFFFFF) == 0 && (px[2] & 0xFFFFFF) == 0xFFFFFF);
+
+  /* A pass into a swap chain's back buffer (kept for showing) with the depth buffer, a texture, drawing its top half near: then the depth read and the back buffer copied out. */
+  IDXGIFactory4 *factory = NULL;
+  CHECK_HR(CreateDXGIFactory2(0, &IID_IDXGIFactory4, (void **)&factory));
+  IDXGISwapChain1 *chain = NULL;
+  ID3D12Resource *back = NULL;
+  if (factory) {
+    DXGI_SWAP_CHAIN_DESC1 sd;
+    memset(&sd, 0, sizeof sd);
+    sd.Width = 64;
+    sd.Height = 64;
+    sd.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    sd.SampleDesc.Count = 1;
+    sd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+    sd.BufferCount = 2;
+    sd.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+    CHECK_HR(IDXGIFactory4_CreateSwapChainForComposition(factory, (IUnknown *)c->queue, &sd, NULL, &chain));
+    if (chain) CHECK_HR(IDXGISwapChain1_GetBuffer(chain, 0, &IID_ID3D12Resource, (void **)&back));
+  }
+  ID3D12PipelineState *front_pso = shadow_pipeline(c, c->rs, dx_ps_color_dxbc, sizeof dx_ps_color_dxbc, 1, DXGI_FORMAT_D24_UNORM_S8_UINT);
+  if (back && front_pso) {
+    D3D12_DESCRIPTOR_HEAP_DESC rtv_desc = {D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
+    ID3D12DescriptorHeap *rtv_heap = NULL;
+    CHECK_HR(ID3D12Device_CreateDescriptorHeap(dev, &rtv_desc, &IID_ID3D12DescriptorHeap, (void **)&rtv_heap));
+    const D3D12_CPU_DESCRIPTOR_HANDLE rtv = rtv_heap ? ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(rtv_heap) : (D3D12_CPU_DESCRIPTOR_HANDLE){0};
+    if (rtv_heap) ID3D12Device_CreateRenderTargetView(dev, back, NULL, rtv);
+    /* (the bottom half near this time: 0.25 below, 1 above) */
+    float bottom[6][7];
+    shadow_rect(bottom, -1, -1, 1, 0, 0.25f, 0, 0);
+    CHECK_HR(ID3D12Resource_Map(vb, 0, NULL, &mapped));
+    if (mapped) memcpy((BYTE *)mapped + sizeof verts, bottom, sizeof bottom);
+    ID3D12Resource_Unmap(vb, 0, NULL);
+    const float grey[4] = {0.25f, 0.25f, 0.25f, 1};
+    CHECK_HR(ID3D12CommandAllocator_Reset(c->allocator));
+    CHECK_HR(ID3D12Device_CreateCommandList(dev, 0, D3D12_COMMAND_LIST_TYPE_DIRECT, c->allocator, front_pso, &IID_ID3D12GraphicsCommandList, (void **)&list));
+    if (list && rtv_heap) {
+      shadow_transition(list, depth, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_DEPTH_WRITE);
+      shadow_transition(list, back, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_RENDER_TARGET);
+      ID3D12GraphicsCommandList_OMSetRenderTargets(list, 1, &rtv, FALSE, &dsv);
+      ID3D12GraphicsCommandList_ClearRenderTargetView(list, rtv, grey, 0, NULL);
+      ID3D12GraphicsCommandList_ClearDepthStencilView(list, dsv, D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL, 1.0f, 0, 0, NULL);
+      ID3D12GraphicsCommandList_RSSetViewports(list, 1, &vp);
+      ID3D12GraphicsCommandList_RSSetScissorRects(list, 1, &sc);
+      ID3D12GraphicsCommandList_SetGraphicsRootSignature(list, c->rs);
+      ID3D12GraphicsCommandList_SetGraphicsRoot32BitConstants(list, 0, 16, kIdentity, 0);
+      ID3D12GraphicsCommandList_OMSetStencilRef(list, 9);
+      ID3D12GraphicsCommandList_IASetPrimitiveTopology(list, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+      ID3D12GraphicsCommandList_IASetVertexBuffers(list, 0, 1, &vbv);
+      ID3D12GraphicsCommandList_DrawInstanced(list, 6, 1, 18, 0);
+      shadow_transition(list, depth, D3D12_RESOURCE_STATE_DEPTH_WRITE, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+      shadow_transition(list, back, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
+      D3D12_TEXTURE_COPY_LOCATION to, from;
+      memset(&to, 0, sizeof to);
+      memset(&from, 0, sizeof from);
+      to.pResource = c->readback;
+      to.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+      to.PlacedFootprint.Footprint.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+      to.PlacedFootprint.Footprint.Width = to.PlacedFootprint.Footprint.Height = 64;
+      to.PlacedFootprint.Footprint.Depth = 1;
+      to.PlacedFootprint.Footprint.RowPitch = 256;
+      from.pResource = back;
+      from.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+      ID3D12GraphicsCommandList_CopyTextureRegion(list, &to, 0, 0, 0, &from, NULL);
+      shadow_transition(list, back, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_PRESENT);
+      scene_run(c, list);
+      const UINT32 *pixels = NULL;
+      if (SUCCEEDED(ID3D12Resource_Map(c->readback, 0, NULL, (void **)&pixels)) && pixels) {
+        /* (the back buffer: the grey clear above, the vertex colour below - red and green the coordinate's halves, (0.39, 0.39, 0) at (50, 50)) */
+        printf("shadow maps: back buffer %08x (top) %08x (bottom)\n", (unsigned)pixels[10 * 64 + 10], (unsigned)pixels[50 * 64 + 50]);
+        CHECK(shadow_near((UINT)px_red(pixels[10 * 64 + 10]), 64, 2) && shadow_near((UINT)px_blue(pixels[10 * 64 + 10]), 64, 2));
+        CHECK(shadow_near((UINT)px_red(pixels[50 * 64 + 50]), 0x65, 3) && shadow_near((UINT)px_green(pixels[50 * 64 + 50]), 0x65, 3) && px_blue(pixels[50 * 64 + 50]) == 0);
+        ID3D12Resource_Unmap(c->readback, 0, NULL);
+      }
+      ID3D12GraphicsCommandList_Release(list);
+      list = NULL;
+      SHADOW_READ(shadow_pso, rs_shadow, 1, 6, px, {10, 10}, {50, 50});
+      printf("shadow maps: drawn with a back buffer %08x (top) %08x (bottom)\n", (unsigned)px[0], (unsigned)px[1]);
+      CHECK(px_red(px[0]) == 255 && px_green(px[0]) == 0 && px_blue(px[0]) == 255);
+      CHECK(px_red(px[1]) == 0 && px_green(px[1]) == 255 && shadow_near((UINT)px_blue(px[1]), 64, 2));
+      SHADOW_READ(stencil_pso, rs_stencil, 0, 6, px, {10, 10}, {50, 50});
+      CHECK(px_green(px[0]) == 0 && px_green(px[1]) == 9);
+    }
+    if (rtv_heap) ID3D12DescriptorHeap_Release(rtv_heap);
+  }
+  if (front_pso) ID3D12PipelineState_Release(front_pso);
+  if (back) ID3D12Resource_Release(back);
+  if (chain) IDXGISwapChain1_Release(chain);
+  if (factory) IDXGIFactory4_Release(factory);
+
+  /* D16 (R16_TYPELESS: an R16_UNORM view) and D32 with stencil (R32G8X24_TYPELESS: an R32_FLOAT_X8X24_TYPELESS view) depth buffers, cleared to 0.25 and compared */
+  {
+    const DXGI_FORMAT made[2][3] = {{DXGI_FORMAT_R16_TYPELESS, DXGI_FORMAT_D16_UNORM, DXGI_FORMAT_R16_UNORM},
+                                    {DXGI_FORMAT_R32G8X24_TYPELESS, DXGI_FORMAT_D32_FLOAT_S8X24_UINT, DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS}};
+    for (int k = 0; k < 2; ++k) {
+      D3D12_RESOURCE_DESC kd = dd;
+      kd.Format = made[k][0];
+      ID3D12Resource *other = NULL;
+      CHECK_HR(ID3D12Device_CreateCommittedResource(dev, &defaults, D3D12_HEAP_FLAG_NONE, &kd, D3D12_RESOURCE_STATE_DEPTH_WRITE, NULL, &IID_ID3D12Resource, (void **)&other));
+      if (!other) continue;
+      D3D12_DEPTH_STENCIL_VIEW_DESC ov = dv;
+      ov.Format = made[k][1];
+      const D3D12_CPU_DESCRIPTOR_HANDLE at = {dsv.ptr + ID3D12Device_GetDescriptorHandleIncrementSize(dev, D3D12_DESCRIPTOR_HEAP_TYPE_DSV)};
+      ID3D12Device_CreateDepthStencilView(dev, other, &ov, at);
+      CHECK_HR(ID3D12CommandAllocator_Reset(c->allocator));
+      CHECK_HR(ID3D12Device_CreateCommandList(dev, 0, D3D12_COMMAND_LIST_TYPE_DIRECT, c->allocator, NULL, &IID_ID3D12GraphicsCommandList, (void **)&list));
+      if (list) {
+        ID3D12GraphicsCommandList_ClearDepthStencilView(list, at, D3D12_CLEAR_FLAG_DEPTH, 0.25f, 0, 0, NULL);
+        shadow_transition(list, other, D3D12_RESOURCE_STATE_DEPTH_WRITE, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+        scene_run(c, list);
+        ID3D12GraphicsCommandList_Release(list);
+        list = NULL;
+      }
+      D3D12_SHADER_RESOURCE_VIEW_DESC kv = sv;
+      kv.Format = made[k][2];
+      kv.Texture2D.PlaneSlice = 0;
+      ID3D12Device_CreateShaderResourceView(dev, other, &kv, srv0);
+      SHADOW_READ(shadow_pso, rs_shadow, 1, 6, px, {32, 32});
+      printf("shadow maps: %s %08x\n", k ? "D32S8" : "D16", (unsigned)px[0]);
+      CHECK(px_red(px[0]) == 0 && px_green(px[0]) == 255 && shadow_near((UINT)px_blue(px[0]), 64, 2));
+      ID3D12Resource_Release(other);
+    }
+  }
+
+  /* One texture with two samplers - wrap and clamp - and a second texture with the second (ps_pair): two units for t0. */
+  {
+    D3D12_RESOURCE_DESC td = {D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, 4, 1, 1, 1, DXGI_FORMAT_B8G8R8A8_UNORM, {1, 0}, D3D12_TEXTURE_LAYOUT_UNKNOWN, D3D12_RESOURCE_FLAG_NONE};
+    ID3D12Resource *ramp = NULL, *second = NULL;
+    CHECK_HR(ID3D12Device_CreateCommittedResource(dev, &defaults, D3D12_HEAP_FLAG_NONE, &td, D3D12_RESOURCE_STATE_COPY_DEST, NULL, &IID_ID3D12Resource, (void **)&ramp));
+    td.Width = 1;
+    CHECK_HR(ID3D12Device_CreateCommittedResource(dev, &defaults, D3D12_HEAP_FLAG_NONE, &td, D3D12_RESOURCE_STATE_COPY_DEST, NULL, &IID_ID3D12Resource, (void **)&second));
+    ID3D12Resource *upload = make_buffer(dev, D3D12_HEAP_TYPE_UPLOAD, 1024, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ);
+    D3D12_SAMPLER_DESC wrap = shadow_sampler(D3D12_FILTER_MIN_MAG_MIP_POINT, D3D12_TEXTURE_ADDRESS_MODE_WRAP, D3D12_COMPARISON_FUNC_NEVER);
+    D3D12_SAMPLER_DESC clamp = shadow_sampler(D3D12_FILTER_MIN_MAG_MIP_POINT, D3D12_TEXTURE_ADDRESS_MODE_CLAMP, D3D12_COMPARISON_FUNC_NEVER);
+    ID3D12RootSignature *rs_pair = shadow_signature(dev, 2, 2, NULL, 0);
+    ID3D12PipelineState *pair_pso = rs_pair ? shadow_pipeline(c, rs_pair, dx_ps_pair_dxbc, sizeof dx_ps_pair_dxbc, 1, DXGI_FORMAT_UNKNOWN) : NULL;
+    BYTE *up = NULL;
+    if (ramp && second && upload && pair_pso && SUCCEEDED(ID3D12Resource_Map(upload, 0, NULL, (void **)&up)) && up) {
+      const UINT32 texels[4] = {0xFF200000u, 0xFF600000u, 0xFFA00000u, 0xFFE00000u}, one = 0xFF00C000u;
+      memcpy(up, texels, sizeof texels);
+      memcpy(up + 512, &one, 4);
+      ID3D12Resource_Unmap(upload, 0, NULL);
+      CHECK_HR(ID3D12CommandAllocator_Reset(c->allocator));
+      CHECK_HR(ID3D12Device_CreateCommandList(dev, 0, D3D12_COMMAND_LIST_TYPE_DIRECT, c->allocator, NULL, &IID_ID3D12GraphicsCommandList, (void **)&list));
+      for (int i = 0; list && i < 2; ++i) {
+        D3D12_TEXTURE_COPY_LOCATION to, from;
+        memset(&to, 0, sizeof to);
+        memset(&from, 0, sizeof from);
+        to.pResource = i ? second : ramp;
+        to.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        from.pResource = upload;
+        from.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+        from.PlacedFootprint.Offset = i ? 512 : 0;
+        from.PlacedFootprint.Footprint.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+        from.PlacedFootprint.Footprint.Width = i ? 1 : 4;
+        from.PlacedFootprint.Footprint.Height = from.PlacedFootprint.Footprint.Depth = 1;
+        from.PlacedFootprint.Footprint.RowPitch = 256;
+        ID3D12GraphicsCommandList_CopyTextureRegion(list, &to, 0, 0, 0, &from, NULL);
+        shadow_transition(list, i ? second : ramp, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+      }
+      if (list) {
+        scene_run(c, list);
+        ID3D12GraphicsCommandList_Release(list);
+        list = NULL;
+      }
+      sv.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+      sv.Texture2D.PlaneSlice = 0;
+      ID3D12Device_CreateShaderResourceView(dev, ramp, &sv, srv0);
+      ID3D12Device_CreateShaderResourceView(dev, second, &sv, (D3D12_CPU_DESCRIPTOR_HANDLE){srv0.ptr + view_step});
+      ID3D12Device_CreateSampler(dev, &wrap, smp0);
+      ID3D12Device_CreateSampler(dev, &clamp, (D3D12_CPU_DESCRIPTOR_HANDLE){smp0.ptr + sampler_step});
+      /* (u 0 .. 2 across the target: the wide rectangle's coordinate is twice the other's) */
+      float wide[6][7];
+      shadow_rect(wide, -1, -1, 1, 1, 0.5f, 0, 0);
+      for (int i = 0; i < 6; ++i) wide[i][3] *= 2;
+      CHECK_HR(ID3D12Resource_Map(vb, 0, NULL, &mapped));
+      if (mapped) memcpy((BYTE *)mapped + sizeof verts, wide, sizeof wide);
+      ID3D12Resource_Unmap(vb, 0, NULL);
+      SHADOW_READ(pair_pso, rs_pair, 1, 18, px, {4, 10}, {36, 10});
+      printf("shadow maps: one texture, two samplers %08x %08x\n", (unsigned)px[0], (unsigned)px[1]);
+      CHECK(px_red(px[0]) == 0x20 && px_green(px[0]) == 0x20 && px_blue(px[0]) == 0xC0);
+      CHECK(px_red(px[1]) == 0x20 && px_green(px[1]) == 0xE0 && px_blue(px[1]) == 0xC0);
+    } else {
+      CHECK(0);
+    }
+    if (pair_pso) ID3D12PipelineState_Release(pair_pso);
+    if (rs_pair) ID3D12RootSignature_Release(rs_pair);
+    if (upload) ID3D12Resource_Release(upload);
+    if (second) ID3D12Resource_Release(second);
+    if (ramp) ID3D12Resource_Release(ramp);
+  }
+
+  /* An array of depth (on a device that draws into layers): two slices of 32 x 32, cleared to 0.75 and 0.25, compared with 0.5 and the second loaded. */
+  D3D12_FEATURE_DATA_D3D12_OPTIONS opts;
+  memset(&opts, 0, sizeof opts);
+  D3D12_RESOURCE_DESC ad = {D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, 32, 32, 2, 1, DXGI_FORMAT_R32_TYPELESS, {1, 0}, D3D12_TEXTURE_LAYOUT_UNKNOWN, D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL};
+  ID3D12Resource *layers = NULL;
+  const HRESULT made = ID3D12Device_CreateCommittedResource(dev, &defaults, D3D12_HEAP_FLAG_NONE, &ad, D3D12_RESOURCE_STATE_DEPTH_WRITE, NULL, &IID_ID3D12Resource, (void **)&layers);
+  CHECK(made == S_OK || made == DXGI_ERROR_UNSUPPORTED);
+  ID3D12RootSignature *rs_array = layers ? shadow_signature(dev, 1, 2, NULL, 0) : NULL;
+  ID3D12PipelineState *array_pso = rs_array ? shadow_pipeline(c, rs_array, dx_ps_shadow_array_dxbc, sizeof dx_ps_shadow_array_dxbc, 1, DXGI_FORMAT_UNKNOWN) : NULL;
+  if (layers && array_pso) {
+    CHECK_HR(ID3D12CommandAllocator_Reset(c->allocator));
+    CHECK_HR(ID3D12Device_CreateCommandList(dev, 0, D3D12_COMMAND_LIST_TYPE_DIRECT, c->allocator, NULL, &IID_ID3D12GraphicsCommandList, (void **)&list));
+    for (UINT slice = 0; list && slice < 2; ++slice) {
+      D3D12_DEPTH_STENCIL_VIEW_DESC av;
+      memset(&av, 0, sizeof av);
+      av.Format = DXGI_FORMAT_D32_FLOAT;
+      av.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2DARRAY;
+      av.Texture2DArray.FirstArraySlice = slice;
+      av.Texture2DArray.ArraySize = 1;
+      const D3D12_CPU_DESCRIPTOR_HANDLE at = {dsv.ptr + ID3D12Device_GetDescriptorHandleIncrementSize(dev, D3D12_DESCRIPTOR_HEAP_TYPE_DSV)};
+      ID3D12Device_CreateDepthStencilView(dev, layers, &av, at);
+      ID3D12GraphicsCommandList_ClearDepthStencilView(list, at, D3D12_CLEAR_FLAG_DEPTH, slice ? 0.25f : 0.75f, 0, 0, NULL);
+      if (slice == 0) {
+        /* (the clear of one slice is carried out before the view is written again) */
+        scene_run(c, list);
+        ID3D12GraphicsCommandList_Release(list);
+        list = NULL;
+        CHECK_HR(ID3D12CommandAllocator_Reset(c->allocator));
+        CHECK_HR(ID3D12Device_CreateCommandList(dev, 0, D3D12_COMMAND_LIST_TYPE_DIRECT, c->allocator, NULL, &IID_ID3D12GraphicsCommandList, (void **)&list));
+      }
+    }
+    if (list) {
+      shadow_transition(list, layers, D3D12_RESOURCE_STATE_DEPTH_WRITE, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+      scene_run(c, list);
+      ID3D12GraphicsCommandList_Release(list);
+      list = NULL;
+    }
+    memset(&sv, 0, sizeof sv);
+    sv.Format = DXGI_FORMAT_R32_FLOAT;
+    sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
+    sv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    sv.Texture2DArray.MipLevels = 1;
+    sv.Texture2DArray.ArraySize = 2;
+    ID3D12Device_CreateShaderResourceView(dev, layers, &sv, srv0);
+    ID3D12Device_CreateSampler(dev, &less_equal, smp0);
+    SHADOW_READ(array_pso, rs_array, 1, 6, px, {20, 20});
+    printf("shadow maps: an array of depth %08x\n", (unsigned)px[0]);
+    CHECK(px_red(px[0]) == 255 && px_green(px[0]) == 0 && shadow_near((UINT)px_blue(px[0]), 64, 2));
+  } else {
+    printf("shadow maps: no arrays of depth here\n");
+  }
+  if (array_pso) ID3D12PipelineState_Release(array_pso);
+  if (rs_array) ID3D12RootSignature_Release(rs_array);
+  if (layers) ID3D12Resource_Release(layers);
+  /* (a depth buffer the program says is never read has no shader resource views: its view is a null one) */
+  dd.Flags |= D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE;
+  ID3D12Resource *denied = NULL;
+  CHECK_HR(ID3D12Device_CreateCommittedResource(dev, &defaults, D3D12_HEAP_FLAG_NONE, &dd, D3D12_RESOURCE_STATE_DEPTH_WRITE, NULL, &IID_ID3D12Resource, (void **)&denied));
+  if (denied) ID3D12Resource_Release(denied);
+#undef SHADOW_READ
+  ID3D12PipelineState_Release(pcf_pso);
+  ID3D12PipelineState_Release(stencil_pso);
+  ID3D12PipelineState_Release(shadow_pso);
+  ID3D12PipelineState_Release(depth_pso);
+  ID3D12RootSignature_Release(rs_pcf);
+  ID3D12RootSignature_Release(rs_stencil);
+  ID3D12RootSignature_Release(rs_shadow);
+  ID3D12Resource_Release(vb);
+  ID3D12DescriptorHeap_Release(smp_heap);
+  ID3D12DescriptorHeap_Release(srv_heap);
+  ID3D12DescriptorHeap_Release(dsv_heap);
+  ID3D12Resource_Release(depth);
+}
+
 static void test_extras(ID3D12Device *dev, ID3D12CommandQueue *queue, ID3D12Fence *fence, UINT64 *fence_value) {
   Scene c;
   memset(&c, 0, sizeof c);
@@ -3632,6 +4144,7 @@ static void test_extras(ID3D12Device *dev, ID3D12CommandQueue *queue, ID3D12Fenc
   test_pixel_uavs(&c);
   test_layers(&c);
   test_plane_uavs(&c);
+  test_shadow_maps(&c);
 }
 
 /* ---- the interfaces after ID3D12Device and ID3D12GraphicsCommandList ---------------------------------------------------------------------------------------------------- */

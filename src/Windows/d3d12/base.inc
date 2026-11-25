@@ -66,6 +66,8 @@ static const FormatInfo g_formats[] = {
     {DXGI_FORMAT_R8G8B8A8_UINT, KF_RGBA8UINT, 4, 0}, {DXGI_FORMAT_B8G8R8A8_UNORM, KF_A8R8G8B8, 4, 0}, {DXGI_FORMAT_B8G8R8X8_UNORM, KF_X8R8G8B8, 4, 0},
     {DXGI_FORMAT_B8G8R8A8_TYPELESS, KF_A8R8G8B8, 4, 0}, {DXGI_FORMAT_B8G8R8A8_UNORM_SRGB, KF_BGRA8_SRGB, 4, 0}, {DXGI_FORMAT_B8G8R8X8_TYPELESS, KF_X8R8G8B8, 4, 0},
     {DXGI_FORMAT_D32_FLOAT, KF_D32F, 4, 1}, {DXGI_FORMAT_D24_UNORM_S8_UINT, KF_D24S8, 4, 1},
+    /* (D16 in 32-bit float depth, D32 with 8 bits of stencil in the depth and stencil buffer of D24S8 - the kernel keeps every depth as a float -) */
+    {DXGI_FORMAT_D16_UNORM, KF_D32F, 2, 1}, {DXGI_FORMAT_D32_FLOAT_S8X24_UINT, KF_D24S8, 8, 1},
     {DXGI_FORMAT_R32_TYPELESS, KF_R32F, 4, 0}, {DXGI_FORMAT_R32_FLOAT, KF_R32F, 4, 0}, {DXGI_FORMAT_R32_UINT, KF_R32UINT, 4, 0}, {DXGI_FORMAT_R32_SINT, KF_R32SINT, 4, 0},
     {DXGI_FORMAT_BC1_TYPELESS, KF_BC1, 8, 0, 1}, {DXGI_FORMAT_BC1_UNORM, KF_BC1, 8, 0, 1}, {DXGI_FORMAT_BC1_UNORM_SRGB, KF_BC1_SRGB, 8, 0, 1},
     {DXGI_FORMAT_BC2_TYPELESS, KF_BC2, 16, 0, 1}, {DXGI_FORMAT_BC2_UNORM, KF_BC2, 16, 0, 1}, {DXGI_FORMAT_BC2_UNORM_SRGB, KF_BC2_SRGB, 16, 0, 1},
@@ -287,6 +289,7 @@ struct Dev {
 #define DEV_FEATURE2_STORAGE_IMAGES_IN_DRAWS (1u << 1)   /* ... and in pixel shaders */
 #define DEV_FEATURE2_LAYERED_TARGETS (1u << 2)           /* render targets and depth buffers of several slices, SV_RenderTargetArrayIndex */
 #define DEV_FEATURE2_SINGLE_CHANNEL (1u << 3)            /* R32_UINT, R32_SINT, R32_FLOAT */
+#define DEV_FEATURE2_DEPTH_TEXTURES (1u << 16)           /* depth buffers read by shaders (KA_DEPTH | KA_TEXTURE): their depth, a D24S8's stencil, SampleCmp */
 
 static const GUID *const g_device_iids[] = {&IID_ID3D12Object, &IID_ID3D12Device, &IID_ID3D12Device1, &IID_ID3D12Device2, &IID_ID3D12Device3, &IID_ID3D12Device4,
                                             &IID_ID3D12Device5, &IID_ID3D12Device6, &IID_ID3D12Device7, &IID_ID3D12Device8, &IID_ID3D12Device9, &IID_ID3D12Device10, NULL};

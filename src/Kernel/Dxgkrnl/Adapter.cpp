@@ -529,9 +529,11 @@ class Adapter::StreamRunner {
       if ((compute_->texture_mask() >> u & 1) && (!texture_bound_[u] || (texture_alloc_[u]->desc().samples > 1 ? graphics::TextureKind::Texture2DMS : texture_alloc_[u]->texture_kind()) != compute_->texture_kind(u)))
         return kBad;
     if (!images_fit(*compute_)) return refuse(__LINE__);   // (the storage images it declares: bound, and of what it declared)
+    if (both_planes(compute_->texture_mask())) return refuse(__LINE__);   // (a depth buffer's two planes at once)
     if (x == 0 || y == 0 || z == 0 || !exec_) return status::kSuccess;
     const NtStatus s = ensure_cb();
     if (s != status::kSuccess) return s;
+    align_planes(compute_->texture_mask(), graphics::kMaxTextureUnits);
     cb_->dispatch(x, y, z);
     for (uint32_t slot = 0; slot < graphics::kMaxStorageBuffers; ++slot)
       if (uav_bound_[slot] && slot < graphics::kMaxUavBuffers) mm_.note_gpu_write(*uav_alloc_[slot]);
@@ -590,16 +592,23 @@ class Adapter::StreamRunner {
   NtStatus bind_texture(ByteReader& p) {
     const uint32_t unit = p.le32(), index = p.le32(), filter = p.le32(), au = p.le32(), av = p.le32(), mip = p.le32();
     const float bias = bits_float(p.le32()), min_lod = bits_float(p.le32()), max_lod = bits_float(p.le32());
+    const uint32_t view = p.remaining() >= 4 ? p.le32() : 0;   // (the optional tenth word: texture_view_word)
     graphics::AddressMode mode_u, mode_v;
     graphics::BorderColor border, no_border;
-    if (!exact(p) || unit >= adapter_.caps_.max_texture_units || filter > 1 || !decode_address_word(au, &mode_u, &border) || !decode_address_word(av, &mode_v, &no_border) || mip > 2) return refuse(__LINE__);
+    graphics::CompareOp compare = graphics::CompareOp::Never;
+    bool stencil = false;
+    if (!exact(p) || unit >= adapter_.caps_.max_texture_units || filter > 1 || !decode_address_word(au, &mode_u, &border) || !decode_address_word(av, &mode_v, &no_border) || mip > 2 ||
+        !decode_texture_view_word(view, &compare, &stencil))
+      return refuse(__LINE__);
     if (!(adapter_.caps_.features & graphics::kFeatureAddressModes)) mode_u = base_address_mode(mode_u), mode_v = base_address_mode(mode_v);   // (the device has wrap and clamp alone)
     if (!finite_within(bias, 100.0f) || !finite_within(min_lod, 100.0f) || !finite_within(max_lod, 1000.0f)) return refuse(__LINE__);
     Allocation* a = alloc(index);
     if (!a || !a->is_image() || !(a->desc().flags & kAllocTexture) || a->is_staging() || !use(a, state::kPixelShaderResource | state::kNonPixelShaderResource)) return refuse(__LINE__);
     if (in_pass_ && (a == pass_color_ || a == pass_depth_ || is_extra_target(pass_extra_, pass_target_count_ - 1, a))) return refuse(__LINE__);
+    if (stencil && !(a->is_depth() && a->desc().format == Format::D24S8)) return refuse(__LINE__);   // (the stencil plane of a depth buffer that has one)
     texture_bound_[unit] = true;
     texture_alloc_[unit] = a;
+    texture_stencil_[unit] = stencil;
     if (!exec_) return status::kSuccess;
     graphics::SamplerDesc sampler;
     sampler.filter = static_cast<graphics::Filter>(filter);
@@ -610,11 +619,31 @@ class Adapter::StreamRunner {
     sampler.lod_bias = bias;
     sampler.min_lod = min_lod;
     sampler.max_lod = max_lod;
+    sampler.compare = compare;
+    sampler.stencil = stencil;
     NtStatus s = resident(*a);
     if (s == status::kSuccess) s = ensure_cb();
     if (s != status::kSuccess) return s;
     cb_->bind_texture(unit, a->image(), sampler);
+    texture_sampler_[unit] = sampler;
     return status::kSuccess;
+  }
+  // On a device whose textures read one plane at a time (no kFeature2DepthAndStencilPlanes), a unit the pipeline has but its shaders do not read that shows the other plane of a
+  // depth buffer a read unit shows is made to show the read one (the device's texture takes the plane of the views bound to it).
+  void align_planes(uint32_t declared, uint32_t units) {
+    if (adapter_.caps_.features2 & graphics::kFeature2DepthAndStencilPlanes) return;
+    for (uint32_t u = 0; u < units && u < graphics::kMaxTextureUnits; ++u) {
+      if ((declared >> u & 1) || !texture_bound_[u] || !texture_alloc_[u]->is_depth()) continue;
+      for (uint32_t v = 0; v < graphics::kMaxTextureUnits; ++v) {
+        if (!(declared >> v & 1) || !texture_bound_[v] || texture_alloc_[v] != texture_alloc_[u] || texture_stencil_[v] == texture_stencil_[u]) continue;
+        graphics::SamplerDesc sampler = texture_sampler_[u];
+        sampler.stencil = texture_stencil_[v];
+        cb_->bind_texture(u, texture_alloc_[u]->image(), sampler);
+        texture_stencil_[u] = sampler.stencil;
+        texture_sampler_[u] = sampler;
+        break;
+      }
+    }
   }
 
   NtStatus set_viewport(ByteReader& p) {
@@ -673,6 +702,7 @@ class Adapter::StreamRunner {
     if (pipeline_->has_tessellation() && (patch_points(topology_) != pipeline_->tess_input_points() || pipeline_->has_geometry())) return refuse(__LINE__);
     for (uint32_t u = 0; u < pipeline_->texture_count(); ++u)
       if (!texture_bound_[u] || (texture_alloc_[u]->desc().samples > 1 ? graphics::TextureKind::Texture2DMS : texture_alloc_[u]->texture_kind()) != pipeline_->texture_kind(u)) return refuse(__LINE__);   // (unbound, or a volume where the shader reads a 2D texture, ...)
+    if (both_planes(pipeline_->declared_units())) return refuse(__LINE__);   // (a depth buffer's two planes at once, read by the shaders)
     if (pipeline_->color_target_count() > pass_target_count_) return refuse(__LINE__);
     for (uint32_t slot = 0; slot < graphics::kMaxStorageBuffers; ++slot)
       if ((pipeline_->storage_mask() >> slot & 1) && !uav_bound_[slot]) return refuse(__LINE__);   // (a buffer the shaders read must be bound)
@@ -730,6 +760,7 @@ class Adapter::StreamRunner {
     }
     const NtStatus s = ensure_cb();
     if (s != status::kSuccess) return s;
+    align_planes(pipeline_->declared_units(), pipeline_->texture_count());
     if (topology_ == Topology::TriangleStrip || topology_ == Topology::TriangleFan || topology_ == Topology::LineStrip) {
       const NtStatus expanded = draw_expanded(indexed, count, first, vertex_offset, instance_count, first_instance);
       if (expanded == status::kSuccess) note_storage_written();
@@ -2050,11 +2081,18 @@ class Adapter::StreamRunner {
               if (s != status::kSuccess) return s;
             } else if (range.type == RangeType::Srv && d.kind == DescriptorKind::Srv) {
               if (reg >= adapter_.caps_.max_texture_units) return refuse(__LINE__);
+              // (t<reg> goes to every unit the shaders read it through - its own, and those of its pairs with other samplers -, each with the sampler of its pair; a unit a
+              // pair of another texture has is that pair's)
               const PipelineObject* reads = compute ? compute_ : pipeline_;
-              Allocation* image = view_image(d, reads && reg < graphics::kMaxTextureUnits ? reads->texture_kind(reg) : graphics::TextureKind::Texture2D);
-              NtStatus s = refresh_mirror(image, false);
-              if (s == status::kSuccess) s = lower_texture(reg, image, sampler_for(reg));
-              if (s != status::kSuccess) return s;
+              for (uint32_t unit = 0; unit < adapter_.caps_.max_texture_units; ++unit) {
+                if ((reads ? reads->unit_texture(unit) : unit) != reg) continue;
+                Allocation* image = view_image(d, reads ? reads->texture_kind(unit) : graphics::TextureKind::Texture2D);
+                graphics::SamplerDesc sampler = sampler_for(reads ? reads->unit_sampler(unit) : unit);
+                sampler.stencil = d.stencil;   // (the view's plane of a depth buffer)
+                NtStatus s = refresh_mirror(image, false);
+                if (s == status::kSuccess) s = lower_texture(unit, image, sampler);
+                if (s != status::kSuccess) return s;
+              }
             } else if (range.type == RangeType::Uav && d.kind == DescriptorKind::Uav) {
               if (reg >= graphics::kMaxUavBuffers) return refuse(__LINE__);
               const NtStatus s = lower_uav(reg, d.allocation.get(), d.offset, d.size);
@@ -2100,7 +2138,7 @@ class Adapter::StreamRunner {
     if (!a || !index_of(a, &index)) return refuse(__LINE__);   // (the allocation is in the list or the draw is refused)
     ByteBuffer packet(adapter_.allocator_);
     for (uint32_t w : {unit, index, static_cast<uint32_t>(sampler.filter), address_word(sampler.address_u, sampler.border), address_word(sampler.address_v), static_cast<uint32_t>(sampler.mip_filter),
-                       __builtin_bit_cast(uint32_t, sampler.lod_bias), __builtin_bit_cast(uint32_t, sampler.min_lod), __builtin_bit_cast(uint32_t, sampler.max_lod)})
+                       __builtin_bit_cast(uint32_t, sampler.lod_bias), __builtin_bit_cast(uint32_t, sampler.min_lod), __builtin_bit_cast(uint32_t, sampler.max_lod), texture_view_word(sampler)})
       packet.put32(w);
     ByteReader reader(packet.view());
     return bind_texture(reader);
@@ -2187,6 +2225,18 @@ class Adapter::StreamRunner {
   List<graphics::IBuffer*> transient_;   // index buffers made for expanded draws, destroyed when the commands have run
   bool texture_bound_[graphics::kMaxTextureUnits] = {};
   const Allocation* texture_alloc_[graphics::kMaxTextureUnits] = {};
+  bool texture_stencil_[graphics::kMaxTextureUnits] = {};   // (the unit reads a depth buffer's stencil plane)
+  graphics::SamplerDesc texture_sampler_[graphics::kMaxTextureUnits];   // (what the device was given for the unit)
+  // Whether the units `used` (bit n: unit n) read both planes of one depth buffer, which a device without kFeature2DepthAndStencilPlanes cannot do in one draw or dispatch.
+  bool both_planes(uint32_t used) const {
+    if (adapter_.caps_.features2 & graphics::kFeature2DepthAndStencilPlanes) return false;
+    for (uint32_t u = 0; u < graphics::kMaxTextureUnits; ++u) {
+      if (!(used >> u & 1) || !texture_bound_[u] || !texture_alloc_[u]->is_depth()) continue;
+      for (uint32_t v = u + 1; v < graphics::kMaxTextureUnits; ++v)
+        if ((used >> v & 1) && texture_bound_[v] && texture_alloc_[v] == texture_alloc_[u] && texture_stencil_[v] != texture_stencil_[u]) return true;
+    }
+    return false;
+  }
 };
 
 // --- The adapter ----------------------------------------------------------------------------------------------------------------------------------------------------
@@ -2323,6 +2373,7 @@ NtStatus Adapter::create_shader(const ShaderDesc& desc, SharedPointer<ShaderObje
       const NtStatus t = program->emit_tgsi(&text, caps_.max_varyings);
       if (t == status::kNoMemory) return t;
       if (t == status::kSuccess) {
+        md.sampler_constants = program->compare_units() != 0;   // (its comparisons read the bound samplers' from the constants)
         shader->text_ = allocate_view<uint8_t>(allocator_, text.size() + 1);
         if (shader->text_.empty()) return status::kNoMemory;
         for (uint64_t i = 0; i < text.size(); ++i) shader->text_[i] = static_cast<uint8_t>(text[i]);
@@ -2374,8 +2425,13 @@ NtStatus Adapter::create_shader(const ShaderDesc& desc, SharedPointer<ShaderObje
           md.qpu_flip_y = true;
         }
       }
-      for (uint32_t u = 0; u < graphics::kMaxTextureUnits; ++u) shader->texture_kinds_[u] = program->texture_kind(u);
+      for (uint32_t u = 0; u < graphics::kMaxTextureUnits; ++u) {
+        shader->texture_kinds_[u] = program->texture_kind(u);
+        shader->unit_texture_[u] = static_cast<uint8_t>(program->texture_register(u));
+        shader->unit_sampler_[u] = static_cast<uint8_t>(program->sampler_register(u));
+      }
       shader->texture_mask_ = program->texture_unit_mask();
+      shader->sampled_mask_ = program->sampled_units();
       shader->knows_textures_ = desc.kind == ShaderKind::Dxbc;   // (Direct3D 9 bytecode does not say all of them: its pipelines keep the count they are given)
       for (uint32_t k = 0; k < 3; ++k) shader->thread_group_[k] = program->thread_group(k);
       shader->geometry_input_ = program->geometry_input();
@@ -2417,7 +2473,12 @@ NtStatus Adapter::create_compute_pipeline(const SharedPointer<ShaderObject>& sha
   for (uint32_t k = 0; k < 3; ++k) pipeline->thread_group_[k] = shader->thread_group_[k];
   pipeline->storage_mask_ = shader->storage_mask_;
   pipeline->texture_mask_ = shader->texture_mask_;
-  for (uint32_t u = 0; u < graphics::kMaxTextureUnits; ++u) pipeline->texture_kinds_[u] = shader->texture_kind(u);
+  pipeline->declared_units_ = shader->texture_mask_;
+  for (uint32_t u = 0; u < graphics::kMaxTextureUnits; ++u) {
+    pipeline->texture_kinds_[u] = shader->texture_kind(u);
+    pipeline->unit_texture_[u] = shader->unit_texture_[u];
+    pipeline->unit_sampler_[u] = shader->unit_sampler_[u];
+  }
   pipeline->image_mask_ = shader->image_mask_;
   for (uint32_t u = 0; u < graphics::kMaxStorageImages; ++u) pipeline->image_dims_[u] = shader->image_dims_[u], pipeline->image_returns_[u] = shader->image_returns_[u];
   pipeline->vertex_ = shader;   // (kept alive for as long as the pipeline is)
@@ -2436,10 +2497,15 @@ NtStatus Adapter::create_pipeline(const PipelineDesc& d, const SharedPointer<Sha
   // for shaders that sample none of them, or fewer), and a device takes no units for a pixel shader that samples nothing.
   uint32_t texture_count = d.texture_count;
   if (vertex->knows_textures_ && fragment->knows_textures_) {
-    uint32_t used = 0;
-    for (uint32_t u = 0; u < graphics::kMaxTextureUnits; ++u)
+    uint32_t used = 0, paired = 0;
+    for (uint32_t u = 0; u < graphics::kMaxTextureUnits; ++u) {
       if (((vertex->texture_mask_ | fragment->texture_mask_) >> u) & 1) used = u + 1;
+      // (a unit of a texture and sampler pair of their own is the pipeline's whatever the description counts: the binding fills it from the texture and sampler registers)
+      if ((vertex->texture_mask_ >> u & 1) && vertex->unit_texture_[u] != u) paired = u + 1;
+      if ((fragment->texture_mask_ >> u & 1) && fragment->unit_texture_[u] != u) paired = u + 1;
+    }
     if (used < texture_count) texture_count = used;
+    if (paired > texture_count) texture_count = paired;
   }
   uint32_t vertex_slots = 0, instance_slots = 0;
   for (uint32_t i = 0; i < d.attribute_count; ++i) {
@@ -2559,13 +2625,21 @@ NtStatus Adapter::create_pipeline(const PipelineDesc& d, const SharedPointer<Sha
   for (uint32_t i = 0; i < d.attribute_count; ++i) pipeline->per_instance_ = pipeline->per_instance_ || d.attributes[i].per_instance;
   pipeline->attribute_count_ = d.attribute_count;
   pipeline->texture_count_ = texture_count;
-  // (a unit has the kind the stage that reads it declared; a vertex and a pixel shader that read one unit as two kinds do not go together)
+  // (a unit has the kind the stage that reads it declared, and the texture and sampler pair it reads; a vertex and a pixel shader that read one unit as two kinds, or as two
+  // pairs - each takes the units of its own pairs from the last down -, do not go together)
   for (uint32_t u = 0; u < graphics::kMaxTextureUnits; ++u) {
     const bool in_vertex = (vertex->texture_mask_ >> u) & 1, in_fragment = (fragment->texture_mask_ >> u) & 1;
     if (in_vertex && in_fragment && vertex->texture_kind(u) != fragment->texture_kind(u)) return status::kNotSupported;
+    if (in_vertex && in_fragment && vertex->unit_texture_[u] != fragment->unit_texture_[u]) return status::kNotSupported;
+    const bool vertex_samples = (vertex->sampled_mask_ >> u) & 1, fragment_samples = (fragment->sampled_mask_ >> u) & 1;
+    if (vertex_samples && fragment_samples && vertex->unit_sampler_[u] != fragment->unit_sampler_[u]) return status::kNotSupported;
     pipeline->texture_kinds_[u] = in_vertex ? vertex->texture_kind(u) : fragment->texture_kind(u);
+    const ShaderObject& reader = in_vertex ? *vertex : *fragment;
+    pipeline->unit_texture_[u] = reader.unit_texture_[u];
+    pipeline->unit_sampler_[u] = vertex_samples ? vertex->unit_sampler_[u] : fragment_samples ? fragment->unit_sampler_[u] : reader.unit_sampler_[u];
   }
   pipeline->color_target_count_ = d.color_target_count;
+  pipeline->declared_units_ = vertex->texture_mask_ | fragment->texture_mask_ | (geometry ? geometry->texture_mask_ : 0u) | (hull ? hull->texture_mask_ : 0u) | (domain ? domain->texture_mask_ : 0u);
   pipeline->fragment_stores_ = fragment->fragment_stores_;
   pipeline->image_mask_ = fragment->image_mask_;
   for (uint32_t u = 0; u < graphics::kMaxStorageImages; ++u) pipeline->image_dims_[u] = fragment->image_dims_[u], pipeline->image_returns_[u] = fragment->image_returns_[u];

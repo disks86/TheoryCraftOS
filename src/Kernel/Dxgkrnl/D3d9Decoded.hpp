@@ -49,7 +49,8 @@ enum Opcode : uint16_t {
   // result goes to the destination's pair k - or, for the comparisons and the conversions to a 32-bit value, to its component k). The instructions to kDoubleLast read doubles.
   kDAdd, kDMul, kDDiv, kDFma, kDRcp, kDMin, kDMax, kDMov, kDMovc, kDEq, kDGe, kDLt, kDNe, kDToF, kDToI, kDToU, kFToD, kIToD, kUToD,
   kDoubleFirst = kDAdd, kDoubleLast = kDToU,
-    // (kTexCompare: sample_c / sample_c_lz, src[2] the reference: the comparison of the four texels of the footprint, filtered bilinearly; passes where reference <= texel)
+    // (kTexCompare: sample_c / sample_c_lz, src[2] the reference: the sampler's comparison of the reference with the texels of the footprint, filtered as it filters (ITextureSet::sample_compare); control 1: sample_c_lz, level zero.
+    //  A 2D texture, an array (the coordinate's z the layer) or a cube (the direction))
     // (kTexQueryLod: the lod instruction, x the level clamped to the texture's, y not)
     // (kTexFetchMs: ld_ms, src[2] the sample; kTexGather: gather4, src[0] the coordinate, src[1] the unit, control the component (0..3) of the four texels returned; kTexSamples: sampleinfo, a constant: control the count, tex_swizzle[0] 1 for an unsigned result)
   // Storage buffers (compute shaders, Shader Model 5): kBufLoad (dst; src[0] the byte address or the structure index, src[1] the byte offset in the structure; tex_swizzle picks the loaded

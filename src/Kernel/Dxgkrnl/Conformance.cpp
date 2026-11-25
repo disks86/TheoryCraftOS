@@ -349,12 +349,14 @@ Handle checker(Rig& rig) {
 }
 
 // A quad of two triangles whose colour is (u / 2, v / 2, 1, 1), which vs.dxbc turns into the texture coordinate (u, v).
-void textured_quad(Rig& rig, Handle pipe, Handle texture, Handle target, graphics::Filter filter, ArrayView<uint32_t> out) {
+// (`compare`: the sampler's comparison, for the shaders that compare)
+void textured_quad(Rig& rig, Handle pipe, Handle texture, Handle target, graphics::Filter filter, ArrayView<uint32_t> out, graphics::CompareOp compare = graphics::CompareOp::Never) {
   auto vert = [](float x, float y, float u, float v) { return Vertex{x, y, 0.5f, u / 2, v / 2, 1, 1}; };
   const Vertex v[6] = {vert(-0.9f, -0.9f, 0, 0), vert(0.9f, -0.9f, 1, 0), vert(-0.9f, 0.9f, 0, 1), vert(-0.9f, 0.9f, 0, 1), vert(0.9f, -0.9f, 1, 0), vert(0.9f, 0.9f, 1, 1)};
   Handle vb = rig.buffer(kAllocVertexBuffer, bytes_of(v, sizeof v));
   graphics::SamplerDesc sampler;
   sampler.filter = filter;
+  sampler.compare = compare;
   sampler.address_u = sampler.address_v = graphics::AddressMode::ClampToEdge;
   CommandWriter w(rig.allocator());
   begin(w, 0, kNoAllocation, {0, 0, 0, 1});
@@ -461,7 +463,7 @@ void scene_dxil_compare(Rig& rig, ArrayView<uint32_t> out) {
   for (uint32_t i = 0; i < 16; ++i) texels[i] = 0xFF000000u | ((26 + (i % 4) * 68) << 16);
   Handle texture = rig.image(kAllocTexture, Format::A8R8G8B8, 4, 4);
   rig.write(texture, bytes_of(texels, sizeof texels));
-  textured_quad(rig, pipe, texture, target, graphics::Filter::Linear, out);
+  textured_quad(rig, pipe, texture, target, graphics::Filter::Linear, out, graphics::CompareOp::LessEqual);
 }
 
 // Double precision (dxil_ps_double_show.hlsl): arithmetic, a select, a loop-carried sum, fma and conversions on doubles, shown as colours.
@@ -2622,7 +2624,7 @@ void scene_dxil_gather_compare(Rig& rig, ArrayView<uint32_t> out) {
   for (uint32_t i = 0; i < 16; ++i) texels[i] = 0xFF000000u | ((26 + (i % 4) * 68) << 16);
   Handle texture = rig.image(kAllocTexture, Format::A8R8G8B8, 4, 4);
   rig.write(texture, bytes_of(texels, sizeof texels));
-  textured_quad(rig, pipe, texture, target, graphics::Filter::Linear, out);
+  textured_quad(rig, pipe, texture, target, graphics::Filter::Linear, out, graphics::CompareOp::LessEqual);
 }
 
 // gather4_po (gather_po.dxbc, assembled by the host test): the footprint moved by an offset worked out from the colour in a register - a -4 .. 4 texel shift of a 4 x 4 ramp, clamped.

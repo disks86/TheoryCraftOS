@@ -114,6 +114,7 @@ static void desc_write(D3D12_CPU_DESCRIPTOR_HANDLE handle, const SoftDesc *d) {
 
 #define SRV_ALTERNATE ((UINT64)0xFFFFFFFFu << 32)      /* (the size word's high half that says the low half is an alternate: the kernel's WriteDescriptors) */
 #define SRV_MIRRORS 1u
+#define SRV_STENCIL 1u      /* (DK_SRV's `pad`: the view is of a depth buffer's stencil plane - the offset's high word 1 in the kernel's WriteDescriptors) */
 /* The allocation a view of a planar texture (NV12, P010, P016) names: its plane (the PlaneSlice; a view format of one channel is plane 0, of two plane 1) of its first slice
  * (a view of several slices gives the shaders that declare an array a mirror of them as well: plane_srv). Any other texture: its allocation. */
 static UINT view_alloc(const Resource *r, DXGI_FORMAT view_format, UINT plane, UINT slice) {
@@ -145,6 +146,49 @@ static void plane_srv(Resource *r, DXGI_FORMAT format, UINT plane, UINT first, U
   if (!d->alloc) { d->kind = 0; return; }
   d->offset = integer || alternate ? SRV_MIRRORS : 0;
   d->size = alternate ? SRV_ALTERNATE | alternate : 0;
+}
+
+/* A shader resource view of a depth buffer (one made without D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE, on a device that reads them: the kernel's KA_DEPTH | KA_TEXTURE). Its
+ * format names the plane, as DXGI's are: the depth of D32_FLOAT / R32_TYPELESS through R32_FLOAT, of D16_UNORM / R16_TYPELESS through R16_UNORM, of D24_UNORM_S8_UINT /
+ * R24G8_TYPELESS through R24_UNORM_X8_TYPELESS (PlaneSlice 0) and of D32_FLOAT_S8X24_UINT / R32G8X24_TYPELESS through R32_FLOAT_X8X24_TYPELESS; the stencil through
+ * X24_TYPELESS_G8_UINT / X32_TYPELESS_G8X24_UINT (PlaneSlice 1), read as integers in green. The depth reads as (depth, 0, 0, 1) - every depth is a float in the kernel, so
+ * a D16 or D24 buffer's is not rounded to its bits. A 2D view, or a 2D array or cube view of a depth buffer of several slices; one level (a depth buffer has one). Any other
+ * format, a typed depth format, or a buffer that cannot be read is a null view (the debug layer's error on Windows). */
+static int view_layers(const Resource *r, UINT first, UINT size, UINT *out_first, UINT *out_count);
+static void depth_srv(const Resource *r, const D3D12_SHADER_RESOURCE_VIEW_DESC *desc, SoftDesc *d) {
+  d->kind = 0;
+  if (!desc || r->desc.SampleDesc.Count > 1) return;
+  const DXGI_FORMAT res = r->desc.Format;
+  const int d32 = res == DXGI_FORMAT_D32_FLOAT || res == DXGI_FORMAT_R32_TYPELESS, d16 = res == DXGI_FORMAT_D16_UNORM || res == DXGI_FORMAT_R16_TYPELESS;
+  const int d24s8 = res == DXGI_FORMAT_D24_UNORM_S8_UINT || res == DXGI_FORMAT_R24G8_TYPELESS, d32s8 = res == DXGI_FORMAT_D32_FLOAT_S8X24_UINT || res == DXGI_FORMAT_R32G8X24_TYPELESS;
+  int stencil = 0;
+  switch (desc->Format) {
+    case DXGI_FORMAT_R32_FLOAT: if (!d32) return; break;
+    case DXGI_FORMAT_R16_UNORM: if (!d16) return; break;
+    case DXGI_FORMAT_R24_UNORM_X8_TYPELESS: if (!d24s8) return; break;
+    case DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS: if (!d32s8) return; break;
+    case DXGI_FORMAT_X24_TYPELESS_G8_UINT: if (!d24s8) return; stencil = 1; break;
+    case DXGI_FORMAT_X32_TYPELESS_G8X24_UINT: if (!d32s8) return; stencil = 1; break;
+    default: return;
+  }
+  UINT plane = 0, mip = 0, levels = 1;
+  switch (desc->ViewDimension) {
+    case D3D12_SRV_DIMENSION_TEXTURE2D: plane = desc->Texture2D.PlaneSlice; mip = desc->Texture2D.MostDetailedMip; levels = desc->Texture2D.MipLevels; if (r->kind != 0) return; break;
+    case D3D12_SRV_DIMENSION_TEXTURE1D: mip = desc->Texture1D.MostDetailedMip; levels = desc->Texture1D.MipLevels; if (r->kind != 0) return; break;
+    case D3D12_SRV_DIMENSION_TEXTURE2DARRAY: {
+      plane = desc->Texture2DArray.PlaneSlice; mip = desc->Texture2DArray.MostDetailedMip; levels = desc->Texture2DArray.MipLevels;
+      UINT first = 0, count = 0;
+      if (r->kind != 2 || !view_layers(r, desc->Texture2DArray.FirstArraySlice, desc->Texture2DArray.ArraySize, &first, &count) || first != 0 || count != r->layers) return;      /* (all of an array: the kernel's array image) */
+      break;
+    }
+    case D3D12_SRV_DIMENSION_TEXTURECUBE: mip = desc->TextureCube.MostDetailedMip; levels = desc->TextureCube.MipLevels; if (r->kind != 3) return; break;
+    default: return;
+  }
+  /* (the plane the format names: 1 the stencil's) */
+  if (plane != (UINT)stencil || mip != 0 || (levels != 1 && levels != 0xFFFFFFFFu)) return;
+  d->kind = DK_SRV;
+  d->alloc = r->alloc;
+  d->pad = stencil ? SRV_STENCIL : 0;
 }
 
 static void STDMETHODCALLTYPE dev_CreateConstantBufferView(Dev *This, const D3D12_CONSTANT_BUFFER_VIEW_DESC *desc, D3D12_CPU_DESCRIPTOR_HANDLE handle) {
@@ -180,6 +224,8 @@ static void STDMETHODCALLTYPE dev_CreateShaderResourceView(Dev *This, ID3D12Reso
       d.kind = DK_SRV_BUFFER;
       d.offset = first * stride;
       d.size = count * stride;
+    } else if (r->fmt && r->fmt->depth) {
+      depth_srv(r, desc, &d);
     } else {
       d.kind = DK_SRV;
       /* (a packed YUV texture is seen through a view of its pixels' format only) */
@@ -407,12 +453,19 @@ static UINT sampler_words(UINT filter, UINT au, UINT av, const float *border, fl
   return linear | (a[0] << 8) | (a[1] << 16) | (mip << 24);
 }
 
+/* The comparison a sampler's lookups (SampleCmp, GatherCmp) make, as the kernel has it (graphics::CompareOp: never 0 .. always 7): a comparison filter's function (D3D12_COMPARISON_FUNC
+ * 1 .. 8), else none - never passes. */
+static UINT sampler_comparison(UINT filter, UINT func) {
+  if (((filter >> 7) & 3u) != 1u || func < D3D12_COMPARISON_FUNC_NEVER || func > D3D12_COMPARISON_FUNC_ALWAYS) return 0;
+  return func - D3D12_COMPARISON_FUNC_NEVER;
+}
 static void STDMETHODCALLTYPE dev_CreateSampler(Dev *This, const D3D12_SAMPLER_DESC *desc, D3D12_CPU_DESCRIPTOR_HANDLE handle) {
   SoftDesc d;
   memset(&d, 0, sizeof d);
   if (desc) {
     d.kind = DK_SAMPLER;
     d.sampler[0] = sampler_words(desc->Filter, desc->AddressU, desc->AddressV, desc->BorderColor, desc->MipLODBias, desc->MinLOD, desc->MaxLOD, &d.sampler[1]);
+    d.offset = sampler_comparison(desc->Filter, desc->ComparisonFunc);
   }
   desc_write(handle, &d);
 }
@@ -478,7 +531,7 @@ static void dheap_sync(DescHeap *h) {
       request[w++] = kind;
       request[w++] = d->alloc;
       request[w++] = (UINT)d->offset;
-      request[w++] = (UINT)(d->offset >> 32);
+      request[w++] = (UINT)(d->offset >> 32) | (d->kind == DK_SRV && (d->pad & SRV_STENCIL) ? 1u : 0u);      /* (a sampler's offset: its comparison; a view's high word: the stencil plane) */
       request[w++] = (UINT)d->size;
       request[w++] = (UINT)(d->size >> 32);
       request[w++] = d->sampler[0] & 0xFF;

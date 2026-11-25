@@ -133,6 +133,16 @@ class D3d9Program {
   uint32_t color_output_count() const { return color_outputs_; }
   // The texture units the shader declares (bit n: unit n) - the device must have them (DeviceLimits::texture_units).
   uint32_t texture_unit_mask() const { return texture_unit_mask_; }
+  // A DXBC program reads texture t<n> with sampler s<m> through a unit of its own for each pair it uses: unit n for t<n> with the sampler of its first lookup (and for the lookups that
+  // take no sampler: ld, resinfo, sampleinfo), and for each other sampler of t<n> the first unit no t# of the shader is declared at (texture_unit_mask has them too, texture_kind is t<n>'s).
+  // What the kernel binds to unit u is texture register texture_register(u) with the sampler of sampler_register(u); the others' units are their own pairs (u, u).
+  uint32_t texture_register(uint32_t unit) const { return unit < graphics::kMaxTextureUnits ? unit_texture_[unit] : unit; }
+  uint32_t sampler_register(uint32_t unit) const { return unit < graphics::kMaxTextureUnits ? unit_sampler_[unit] : unit; }
+  // The units a comparison lookup reads (sample_c, sample_c_lz, gather4_c, gather4_po_c; bit n: unit n): their TGSI text reads the sampler's comparison from the constants
+  // (ShaderModuleDesc::sampler_constants).
+  uint32_t compare_units() const { return compare_units_; }
+  // The units a lookup with a sampler reads (bit n: unit n): their sampler_register is the shader's; the others' (units only loaded from, or not read) is no matter.
+  uint32_t sampled_units() const { return sampled_units_; }
   // A DXBC vertex shader: the vertex inputs it declares (v0 .. v<n-1>) - the device must have that many (DeviceLimits::vertex_attributes).
   uint32_t attributes_used() const { return attributes_used_; }
   // The same with the system values (D3d9Binding hands these to the device beside the others).
@@ -205,6 +215,11 @@ class D3d9Program {
   bool writes_layer_ = false;
   graphics::TextureKind texture_kind_[graphics::kMaxTextureUnits] = {};
   uint8_t texture_samples_[graphics::kMaxTextureUnits] = {};   // the sample count a multisampled texture was declared with
+  static_assert(graphics::kMaxTextureUnits == 16, "the pairs below list every unit");
+  uint8_t unit_texture_[graphics::kMaxTextureUnits] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15};   // (texture_register / sampler_register)
+  uint8_t unit_sampler_[graphics::kMaxTextureUnits] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15};
+  uint32_t compare_units_ = 0;   // (compare_units)
+  uint32_t sampled_units_ = 0;   // (sampled_units)
   bool uses_system_values_ = false, uses_texel_access_ = false, uses_graphics_storage_ = false, uses_fragment_stores_ = false, uses_vertex_stores_ = false, uses_geometry_stores_ = false, uses_tessellation_stores_ = false;
   uint32_t color_outputs_ = 1;
   uint32_t constant_registers_ = kPushConstantRegisters;

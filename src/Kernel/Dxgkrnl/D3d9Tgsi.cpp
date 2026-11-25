@@ -69,7 +69,8 @@ class TgsiEmitter {
   const uint32_t kGsPosition = kColorExtra + graphics::kMaxColorTargets - 1;   // a geometry shader's input positions, up to six vertices, turned back to Direct3D's +Y up
   const uint32_t kPatchBase = kGsPosition + 6;   // a hull shader's patch constant registers (shadows of the tessellation factors)
   const uint32_t kLayer = kPatchBase + graphics::kMaxPatchRegisters;   // a geometry shader's SV_RenderTargetArrayIndex (the integer in x)
-  const uint32_t kTempCount = kLayer + 1;
+  const uint32_t kCompare = kLayer + 1, kCompare2 = kLayer + 2;   // the comparison lookups' own (kTexCompare: a cube's face, the passes)
+  const uint32_t kTempCount = kLayer + 3;
   uint32_t color_register(uint32_t target) const { return target == 0 ? kColor : kColorExtra + target - 1; }
   // The first output after the position and the varyings: the position as the shader wrote it (one a stream), or a hull shader's tessellation factors. (With the device's four
   // varyings of old it was OUT[5]; virgl's stream output declaration names the same register: VirglShaderModule.)
@@ -246,6 +247,25 @@ class TgsiEmitter {
       line(name, &target, &a);
     }
   }
+  // The passes (1 or 0, per component) of the comparison of `reference` (a source of one replicated component) with the four texels in `texels`, into `out` (which may be `texels`): the
+  // comparison the sampler bound to `unit` has, from the constants the device keeps (ShaderModuleDesc::sampler_constants: whether less, equal and greater pass).
+  void compare_passes(const String& out, const String& texels, const String& reference, uint32_t unit) {
+    String params = str();
+    add(params, "CONST[");
+    add_uint(params, graphics::kSamplerCompareRegister + unit);
+    add(params, "]");
+    String less = str(), equal = str(), greater = str();
+    add(less, params.view()), add(less, ".xxxx");
+    add(equal, params.view()), add(equal, ".yyyy");
+    add(greater, params.view()), add(greater, ".zzzz");
+    const String test = temp(kCompare2), sum = temp(kCompare);
+    line("SLT", &test, &reference, &texels);
+    line("MUL", &sum, &test, &less);
+    line("SEQ", &test, &reference, &texels);
+    line("MAD", &sum, &test, &equal, &sum);
+    line("SLT", &test, &texels, &reference);
+    line("MAD", &out, &test, &greater, &sum);
+  }
   // The first component of a source as a value UIF can test: the source itself (non-zero), or, for `is_zero`, a mask that is non-zero when the source is zero.
   String zero_test(const Instr::Src& src, bool is_zero) {
     String a = operand(src, 0, 0, nullptr, true);
@@ -291,6 +311,7 @@ class TgsiEmitter {
   uint32_t current_cp_ = 0;   // a hull shader: the output control point the copy of the control point phase being written makes
   uint32_t max_attribute_ = 0;
   bool sampler_used_[graphics::kMaxTextureUnits] = {};
+  bool compare_used_ = false;   // (the sampler comparisons are read from the constants: their registers are declared)
   uint32_t varyings_;
 };
 
@@ -1230,49 +1251,124 @@ bool TgsiEmitter::instruction(const Instr& ins) {
       break;
     }
     case kTexCompare: {
-      // sample_c as the comparison of a gather, filtered by hand (a depth texture and a comparison sampler are not needed: any texture whose red channel is the depth works)
+      // sample_c / sample_c_lz as the comparison of a gather of the red channels, filtered by hand: any texture whose red channel is the depth works (a depth texture's is), and the
+      // comparison is the bound sampler's, from the constants (compare_passes). The weights are the fractions of the point in the footprint (of the place on the cube's face it
+      // points at); a point filter weighs the texel it lies in alone. The level is the base one (the textures compared - depth buffers - have one).
       t = begin_result(ins, true, &direct);
       const uint32_t unit = ins.src[1].number;
       if (unit >= graphics::kMaxTextureUnits) {
         unsupported_ = true;
         break;
       }
+      const graphics::TextureKind kind = p_.texture_kind(unit);
+      const bool cube = kind == graphics::TextureKind::TextureCube, flat = kind == graphics::TextureKind::Texture2D;
+      if (!flat && !cube && kind != graphics::TextureKind::Texture2DArray) {
+        unsupported_ = true;
+        break;
+      }
       sampler_used_[unit] = true;
+      compare_used_ = true;
       String sampler = str();
       add(sampler, "SAMP[");
       add_uint(sampler, unit);
       add(sampler, "], ");
-      add(sampler, dimension_name(p_.texture_kind(unit)));
-      const uint8_t xyxy[4] = {0, 1, 0, 1};
-      const String coordinate = operand(ins.src[0], 0, 0, xyxy, false), reference = operand(ins.src[2], 0, 1, nullptr, true);
+      add(sampler, dimension_name(kind));
+      String gather_sampler = str();
+      add(gather_sampler, sampler.view());
+      if (ins.texel_offset[0] || ins.texel_offset[1]) {
+        const bool saved = force_integer_;
+        force_integer_ = true;
+        add(gather_sampler, ", IMM[");
+        add_uint(gather_sampler, imm4_bits(static_cast<uint32_t>(static_cast<int32_t>(ins.texel_offset[0])), static_cast<uint32_t>(static_cast<int32_t>(ins.texel_offset[1])), 0, 0));
+        add(gather_sampler, "].xyz");
+        force_integer_ = saved;
+      }
+      const uint8_t xyzz[4] = {0, 1, 2, 2};
+      const String coordinate = operand(ins.src[0], 0, 0, flat ? nullptr : xyzz, false), reference = operand(ins.src[2], 0, 1, nullptr, true);
       const String g = temp(kWork2), g_x = temp(kWork2, ".xxxx"), g_y = temp(kWork2, ".yyyy"), g_z = temp(kWork2, ".zzzz"), g_w = temp(kWork2, ".wwww");
-      const String f = temp(kWork3), f_x = temp(kWork3, ".xxxx"), f_y = temp(kWork3, ".yyyy"), f_z = temp(kWork3, ".zzzz"), f_w = temp(kWork3, ".wwww"), f_xy = temp(kWork3, ".xy");
-      String component = str();
-      add(component, "IMM[");
-      add_uint(component, imm4_bits(0, 0, 0, 0));
-      add(component, "].xxxx");
-      line("TG4", &g, &coordinate, &component, &sampler);
-      line("SGE", &g, &g, &reference);
+      String red = str();
+      add(red, "IMM[");
+      add_uint(red, imm4_bits(0, 0, 0, 0));
+      add(red, "].xxxx");
+      line("TG4", &g, &coordinate, &red, &gather_sampler);
+      // (the place in texels: the coordinate's - or the face's - times the base level's size, less half a texel)
+      const String f = temp(kWork3), f_xy = temp(kWork3, ".xy"), f_src = temp(kWork3, ".xyxy"), f_x = temp(kWork3, ".xxxx"), f_y = temp(kWork3, ".yyyy"), f_z = temp(kWork3, ".zzzz"),
+                   f_w = temp(kWork3, ".wwww");
       const String level = zero();
-      String size_target = str();
-      add(size_target, temp(kWork3).view());
       String queried = str();
       add(queried, level.view());
       add(queried, ", ");
       add(queried, sampler.view());
       line("TXQ", &f, &queried);
       line("U2F", &f, &f);
-      const String coordinate_xy = operand(ins.src[0], 0, 0, xyxy, false), half = splat(0.5f), negative_half = negate(half);
-      const String f_src = temp(kWork3, ".xyxy");   // (a source takes all four swizzle letters)
-      line("MUL", &f_xy, &coordinate_xy, &f_src);
+      String place = str();
+      if (cube) {
+        // (the face: the largest of |x|, |y|, |z| - x first, then y, as the software device chooses -, and the place on it: (sc / major + 1) / 2, (tc / major + 1) / 2 with the
+        // usual table: +-X sc = -+z tc = -y, +-Y sc = x tc = +-z, +-Z sc = +-x tc = -y)
+        const String c = operand(ins.src[0], 0, 0, xyzz, false);
+        const String e_x = temp(kCompare, ".x"), e_y = temp(kCompare, ".y"), e_z = temp(kCompare, ".z"), e_w = temp(kCompare, ".w");
+        const String e_xxxx = temp(kCompare, ".xxxx"), e_yyyy = temp(kCompare, ".yyyy"), e_zzzz = temp(kCompare, ".zzzz"), e_wwww = temp(kCompare, ".wwww");
+        const String h = temp(kCompare2), h_x = temp(kCompare2, ".x"), h_z = temp(kCompare2, ".z"), h_w = temp(kCompare2, ".w");
+        const String h_xxxx = temp(kCompare2, ".xxxx"), h_zzzz = temp(kCompare2, ".zzzz"), h_wwww = temp(kCompare2, ".wwww");
+        const String hx_src = temp(kCompare2, ".xxxx"), hy_src = temp(kCompare2, ".yyyy"), hz_src = temp(kCompare2, ".zzzz");
+        const String a = absolute(c), one = splat(1.0f), half = splat(0.5f), zero_s = zero(), two = splat(2.0f), minus_one = splat(-1.0f);
+        line("MOV", &h, &a);                                      // h = |x|, |y|, |z|
+        line("SGE", &e_x, &hx_src, &hy_src);
+        line("SGE", &e_y, &hx_src, &hz_src);
+        line("MUL", &e_x, &e_xxxx, &e_yyyy);                      // e.x: the X face
+        line("SGE", &e_y, &hy_src, &hz_src);
+        const String not_x = negate(e_xxxx);
+        line("MAD", &e_y, &e_yyyy, &not_x, &e_yyyy);              // e.y: the Y face (and not X)
+        line("ADD", &e_z, &one, &not_x);
+        const String not_y = negate(e_yyyy);
+        line("ADD", &e_z, &e_zzzz, &not_y);                       // e.z: the Z face
+        line("MUL", &e_w, &e_xxxx, &hx_src);
+        line("MAD", &e_w, &e_yyyy, &hy_src, &e_wwww);
+        line("MAD", &e_w, &e_zzzz, &hz_src, &e_wwww);             // e.w: the major axis
+        line("SGE", &h, &c, &zero_s);                             // (the signs of x, y, z as +1 / -1)
+        line("MAD", &h, &h, &two, &minus_one);
+        const String cx = component(ins.src[0], 0, 0), cy = component(ins.src[0], 1, 0), cz = component(ins.src[0], 2, 0);
+        // sc = X: -sign(x) z; Y: x; Z: sign(z) x (into h.w; h.x, sign(x), is used once)
+        const String neg_hx = negate(hx_src);
+        line("MUL", &h_w, &neg_hx, &cz);
+        line("MUL", &h_w, &h_wwww, &e_xxxx);
+        line("MAD", &h_w, &e_yyyy, &cx, &h_wwww);
+        line("MUL", &h_x, &hz_src, &cx);
+        line("MAD", &h_w, &e_zzzz, &h_xxxx, &h_wwww);
+        // tc = X: -y; Y: sign(y) z; Z: -y (into h.z)
+        line("MUL", &h_z, &hy_src, &cz);
+        line("MUL", &h_z, &h_zzzz, &e_yyyy);
+        line("ADD", &h_x, &e_xxxx, &e_zzzz);
+        const String neg_cy = negate(cy);
+        line("MAD", &h_z, &h_xxxx, &neg_cy, &h_zzzz);
+        line("RCP", &e_w, &e_wwww);
+        const String sc_tc = temp(kCompare2, ".wzww"), h_xy = temp(kCompare2, ".xy"), h_src = temp(kCompare2, ".xyxy");
+        line("MUL", &h_xy, &sc_tc, &e_wwww);
+        line("MAD", &h_xy, &h_src, &half, &half);                 // h.xy: the place on the face
+        add(place, h_src.view());
+      } else {
+        const uint8_t xyxy[4] = {0, 1, 0, 1};
+        add(place, operand(ins.src[0], 0, 0, xyxy, false).view());
+      }
+      const String negative_half = negate(splat(0.5f));
+      line("MUL", &f_xy, &place, &f_src);
       line("ADD", &f_xy, &f_src, &negative_half);
       line("FRC", &f_xy, &f_src);
+      // (a point filter: the texel the point is in - the second of a pair when the fraction is a half or more)
+      String linear = str();
+      add(linear, "CONST[");
+      add_uint(linear, graphics::kSamplerCompareRegister + unit);
+      add(linear, "].wwww");
+      const String step = temp(kWork3, ".zw"), half = splat(0.5f), step_src = temp(kWork3, ".zwzw");
+      line("SGE", &step, &f_src, &half);
+      line("LRP", &f_xy, &linear, &f_src, &step_src);
+      compare_passes(g, g, reference, unit);
       const String top = temp(kWork3, ".z"), bottom = temp(kWork3, ".w");
       line("LRP", &top, &f_x, &g_z, &g_w);
       line("LRP", &bottom, &f_x, &g_y, &g_x);
       const String result = temp(kWork);
-      (void)f_z, (void)f_w, (void)size_target;
       line("LRP", &result, &f_y, &f_w, &f_z);
+      (void)f;
       break;
     }
     case kTexGather: {
@@ -1333,10 +1429,11 @@ bool TgsiEmitter::instruction(const Instr& ins) {
       add_uint(component, imm4_bits(ins.control & 3, ins.control & 3, ins.control & 3, ins.control & 3));
       add(component, "].xxxx");
       if (compare) {
-        // (gather4_c: the comparison reference <= texel of each of the four texels, made here as the sampler is not a comparison one)
+        // (gather4_c: the bound sampler's comparison of the reference with each of the four texels, made here as the sampler is not a comparison one: compare_passes)
         const String texels = temp(kWork3), reference = operand(ins.src[(ins.control & 8) ? 3 : 2], 0, 1, nullptr, true);
         line("TG4", &texels, &coordinate, &component, &sampler);
-        line("SGE", &t, &texels, &reference);
+        compare_used_ = true;
+        compare_passes(t, texels, reference, unit);
         break;
       }
       line("TG4", &t, &coordinate, &component, &sampler);
@@ -1747,6 +1844,13 @@ void TgsiEmitter::assemble(String* out) {
   add(*out, "DCL CONST[0..");
   add_uint(*out, p_.constant_registers_ - 1);
   add(*out, "]\n");
+  if (compare_used_) {   // (the comparisons of the samplers bound, one register for each unit: ShaderModuleDesc::sampler_constants)
+    add(*out, "DCL CONST[");
+    add_uint(*out, graphics::kSamplerCompareRegister);
+    add(*out, "..");
+    add_uint(*out, graphics::kSamplerCompareRegister + graphics::kMaxTextureUnits - 1);
+    add(*out, "]\n");
+  }
   if (addr_used_) add(*out, "DCL ADDR[0]\n");
   add(*out, "DCL TEMP[0..");
   add_uint(*out, kTempCount - 1);
