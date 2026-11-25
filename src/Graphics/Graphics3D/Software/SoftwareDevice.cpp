@@ -393,10 +393,10 @@ class TextureSet final : public ITextureSet {
     return first < b.first_layer + b.layers && b.first_layer < first + count;
   }
 
-  // Whether any bound unit reads mip levels: only then does a pixel need its quad's derivatives.
+  // Whether any bound unit reads mip levels or filters anisotropically: only then does a pixel need its quad's derivatives.
   bool uses_lod() const {
     for (uint32_t unit = 0; unit < kMaxTextureUnits; ++unit)
-      if (bound_[unit].image && bound_[unit].levels > 1 && samplers_[unit].mip_filter != MipFilter::None) return true;
+      if (bound_[unit].image && ((bound_[unit].levels > 1 && samplers_[unit].mip_filter != MipFilter::None) || anisotropic(samplers_[unit]))) return true;
     return false;
   }
   // For the derivative passes: the next lookups record their first coordinates per unit and answer black.
@@ -434,14 +434,29 @@ class TextureSet final : public ITextureSet {
       }
     }
     const float rho_x = dx[0] * dx[0] + dx[1] * dx[1] + dx[2] * dx[2], rho_y = dy[0] * dy[0] + dy[1] * dy[1] + dy[2] * dy[2];
-    const float rho2 = rho_x > rho_y ? rho_x : rho_y;   // (the square of rho: log2(rho) is half of log2(rho2))
+    float rho2 = rho_x > rho_y ? rho_x : rho_y;   // (the square of rho: log2(rho) is half of log2(rho2))
+    aniso_count_[unit] = 1;
+    if (anisotropic(sampler) && rho2 > 0.0f && (b.kind == TextureKind::Texture2D || b.kind == TextureKind::Texture2DArray)) {   // (along (u, v): of a 2D image or an array)
+      // (the longer axis of the footprint, Pmax, and the shorter, Pmin: N lookups along the longer one at the level of Pmax / N)
+      const float p_max = sqrt_of(rho2), p_min = sqrt_of(rho_x > rho_y ? rho_y : rho_x);
+      float ratio = p_min > 0.0f ? p_max / p_min : static_cast<float>(sampler.max_anisotropy);
+      if (!(ratio < static_cast<float>(sampler.max_anisotropy))) ratio = static_cast<float>(sampler.max_anisotropy);
+      uint32_t n = static_cast<uint32_t>(ratio);
+      if (static_cast<float>(n) < ratio) ++n;   // (ceil)
+      if (n < 1) n = 1;
+      aniso_count_[unit] = n;
+      const bool along_x = rho_x >= rho_y;
+      aniso_du_[unit] = along_x ? right[0] - anchor[0] : below[0] - anchor[0];
+      aniso_dv_[unit] = along_x ? right[1] - anchor[1] : below[1] - anchor[1];
+      rho2 /= static_cast<float>(n) * static_cast<float>(n);
+    }
     float lambda = 0.5f * mip_log2(rho2) + sampler.lod_bias;
     if (lambda < sampler.min_lod) lambda = sampler.min_lod;
     if (lambda > sampler.max_lod) lambda = sampler.max_lod;
     lambda_[unit] = lambda == lambda ? lambda : 0.0f;
   }
   void clear_lod() const {
-    for (uint32_t unit = 0; unit < kMaxTextureUnits; ++unit) lambda_[unit] = 0.0f;
+    for (uint32_t unit = 0; unit < kMaxTextureUnits; ++unit) lambda_[unit] = 0.0f, aniso_count_[unit] = 1;
   }
 
   Vec4 sample_volume(uint32_t unit, float u, float v, float w) const override {
@@ -449,7 +464,7 @@ class TextureSet final : public ITextureSet {
     if (!b) return {0, 0, 0, 1};
     if (b->kind == TextureKind::Texture2D) return sample(unit, u, v);
     if (recording_) return record(unit, u, v, w);
-    return lookup(*b, samplers_[unit], u, v, w, 0.0f, lambda_[unit]);
+    return anisotropic_lookup(unit, *b, u, v, w);
   }
   Vec4 sample_cube_array(uint32_t unit, float x, float y, float z, float cube) const override {
     const Bound* b = bound_for(unit);
@@ -463,7 +478,7 @@ class TextureSet final : public ITextureSet {
     const Bound* b = bound_for(unit);
     if (!b) return {0, 0, 0, 1};
     if (recording_) return record(unit, u, v, 0.0f);
-    return lookup(*b, samplers_[unit], u, v, 0.0f, 0.0f, lambda_[unit]);
+    return anisotropic_lookup(unit, *b, u, v, 0.0f);
   }
 
   // An explicit level of detail: clamped as the derivatives' would be.
@@ -560,6 +575,17 @@ class TextureSet final : public ITextureSet {
 
  private:
   const Bound* bound_for(uint32_t unit) const { return unit < kMaxTextureUnits && bound_[unit].image ? &bound_[unit] : nullptr; }
+  // A lookup with the unit's level of detail - of an anisotropic filter (aniso_count_ above 1, set_lod): that many lookups spread evenly over the longer axis of the footprint, averaged.
+  Vec4 anisotropic_lookup(uint32_t unit, const Bound& b, float u, float v, float w) const {
+    const uint32_t n = aniso_count_[unit];
+    if (n <= 1) return lookup(b, samplers_[unit], u, v, w, 0.0f, lambda_[unit]);
+    Vec4 sum{0, 0, 0, 0};
+    for (uint32_t k = 0; k < n; ++k) {
+      const float t = (static_cast<float>(k) + 0.5f) / static_cast<float>(n) - 0.5f;
+      sum = sum + lookup(b, samplers_[unit], u + aniso_du_[unit] * t, v + aniso_dv_[unit] * t, w, 0.0f, lambda_[unit]);
+    }
+    return sum * (1.0f / static_cast<float>(n));
+  }
   Vec4 record(uint32_t unit, float a, float b, float c) const {
     if (!recorded_[unit]) {
       recorded_[unit] = true;
@@ -726,8 +752,10 @@ class TextureSet final : public ITextureSet {
     return top * (1 - ty) + bottom * ty;
   }
   // (index() gives -1 for a texel outside an image whose sampler has a border there)
+  static bool anisotropic(const SamplerDesc& s) { return s.max_anisotropy > 1 && s.filter == Filter::Linear; }
+  static float sqrt_of(float v) { return v > 0.0f ? __builtin_sqrtf(v) : 0.0f; }
   static Vec4 texel_or_border(const Plane& texels, const SamplerDesc& sampler, int64_t x, int64_t y) {
-    if (x < 0 || y < 0) return border_color_value(sampler.border);
+    if (x < 0 || y < 0) return sampler_border_value(sampler);
     return image_texel(texels, sampler.stencil, x, y);
   }
   // A texel of a colour image, or of the depth or stencil plane of a depth image (kFeature2DepthTextures): the depth as (depth, 0, 0, 1), the stencil as the integers (0, stencil, 0, 1).
@@ -789,6 +817,8 @@ class TextureSet final : public ITextureSet {
   mutable bool recorded_[kMaxTextureUnits] = {};
   mutable float record_[kMaxTextureUnits][3] = {};
   mutable float lambda_[kMaxTextureUnits] = {};
+  mutable uint32_t aniso_count_[kMaxTextureUnits] = {1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1};   // (the lookups of an anisotropic filter, and the axis they are spread over in u, v)
+  mutable float aniso_du_[kMaxTextureUnits] = {}, aniso_dv_[kMaxTextureUnits] = {};
 };
 
 // The storage images bound (bind_storage_image), as the shaders read and write them: a texel of the view is texel (x, y) of layer first_layer + z (of level `level`). A slot may instead
@@ -934,7 +964,8 @@ class StorageImageSet final : public IStorageImages {
 struct ClipVertex {
   Vec4 position;
   Vec4 varying[kMaxVaryings];
-  uint32_t layer = 0;   // (SV_RenderTargetArrayIndex: a primitive goes to its first vertex's)
+  uint32_t layer = 0;      // (SV_RenderTargetArrayIndex: a primitive goes to its first vertex's)
+  uint32_t viewport = 0;   // (SV_ViewportArrayIndex: the same)
 };
 
 inline float lerp(float a, float b, float t) { return a + (b - a) * t; }
@@ -942,6 +973,7 @@ inline float lerp(float a, float b, float t) { return a + (b - a) * t; }
 ClipVertex mix(const ClipVertex& a, const ClipVertex& b, float t, uint32_t varyings) {
   ClipVertex r;
   r.layer = a.layer;
+  r.viewport = a.viewport;
   r.position = {lerp(a.position.x, b.position.x, t), lerp(a.position.y, b.position.y, t),
                 lerp(a.position.z, b.position.z, t), lerp(a.position.w, b.position.w, t)};
   for (uint32_t i = 0; i < varyings; ++i)
@@ -977,8 +1009,17 @@ struct DrawState {
   ArrayView<float> depth_plane() const { return depth ? depth->depth_layer(layer_of(kMaxColorTargets), level[kMaxColorTargets]) : ArrayView<float>(); }
   ArrayView<uint8_t> stencil_plane() const { return depth ? depth->stencil_layer(layer_of(kMaxColorTargets), level[kMaxColorTargets]) : ArrayView<uint8_t>(); }
   const StorageImageSet* images = nullptr;   // the storage images bound
-  Viewport viewport;
-  Rect2D scissor;  // already clamped to the target
+  // The viewports and scissor rectangles set (the scissors clamped to the target), and those of the primitive being drawn: the ones its SV_ViewportArrayIndex names, the first when that is
+  // past the ones set.
+  Viewport viewports[kMaxViewports];
+  Rect2D scissors[kMaxViewports];
+  uint32_t viewport_count = 1, scissor_count = 1;
+  mutable Viewport viewport;
+  mutable Rect2D scissor;
+  void select_viewport(uint32_t index) const {
+    viewport = viewports[index < viewport_count ? index : 0];
+    scissor = scissors[index < viewport_count && index < scissor_count ? index : 0];
+  }
   TextureSet textures;
   const uint8_t* constants = nullptr;
   const ByteView* storage = nullptr;   // the storage buffers the shaders of a draw can read
@@ -1048,8 +1089,9 @@ bool depth_passes(CompareOp op, float z, float stored) {
   return false;
 }
 
-// One factor of the blend equation for one channel (0 red .. 3 alpha) of the colour `s` and the destination `d`; `k` is the state's constant colour.
-float blend_factor(BlendFactor f, const float s[4], const float d[4], const float k[4], uint32_t channel) {
+// One factor of the blend equation for one channel (0 red .. 3 alpha) of the colour `s` and the destination `d`; `k` is the state's constant colour, `s1` the shader's second
+// output (dual-source blending).
+float blend_factor(BlendFactor f, const float s[4], const float s1[4], const float d[4], const float k[4], uint32_t channel) {
   switch (f) {
     case BlendFactor::Zero: return 0.0f;
     case BlendFactor::One: return 1.0f;
@@ -1066,19 +1108,25 @@ float blend_factor(BlendFactor f, const float s[4], const float d[4], const floa
     case BlendFactor::InvConstantColor: return 1.0f - k[channel];
     case BlendFactor::ConstantAlpha: return k[3];
     case BlendFactor::InvConstantAlpha: return 1.0f - k[3];
+    case BlendFactor::Src1Color: return s1[channel];
+    case BlendFactor::InvSrc1Color: return 1.0f - s1[channel];
+    case BlendFactor::Src1Alpha: return s1[3];
+    case BlendFactor::InvSrc1Alpha: return 1.0f - s1[3];
   }
   return 0.0f;
 }
 
 // The pixel after blending `source` into `destination` (both 0xAARRGGBB) by the pipeline's blend state, only the channels of its write mask changed.
-uint32_t blend_pixel(const BlendState& b, uint32_t source, uint32_t destination) {
+uint32_t blend_pixel(const BlendState& b, uint32_t source, uint32_t destination, Vec4 source1) {
   const Vec4 sv = unpack_color(source), dv = unpack_color(destination);
   const float s[4] = {sv.x, sv.y, sv.z, sv.w}, d[4] = {dv.x, dv.y, dv.z, dv.w};
+  auto unit = [](float v) { return v < 0.0f ? 0.0f : v > 1.0f ? 1.0f : v; };   // (a normalised target's factors are in 0..1)
+  const float s1[4] = {unit(source1.x), unit(source1.y), unit(source1.z), unit(source1.w)};
   float out[4];
   for (uint32_t c = 0; c < 4; ++c) {
     const bool alpha = c == 3;
     const BlendOp op = alpha ? b.alpha_op : b.color_op;
-    const float sf = blend_factor(alpha ? b.src_alpha : b.src_color, s, d, b.constant, c), df = blend_factor(alpha ? b.dst_alpha : b.dst_color, s, d, b.constant, c);
+    const float sf = blend_factor(alpha ? b.src_alpha : b.src_color, s, s1, d, b.constant, c), df = blend_factor(alpha ? b.dst_alpha : b.dst_color, s, s1, d, b.constant, c);
     if (!b.enable) out[c] = s[c];
     else if (op == BlendOp::Add) out[c] = s[c] * sf + d[c] * df;
     else if (op == BlendOp::Subtract) out[c] = s[c] * sf - d[c] * df;
@@ -1096,8 +1144,9 @@ uint32_t blend_pixel(const BlendState& b, uint32_t source, uint32_t destination)
 }
 
 // The same for a float target: no clamping anywhere, and `destination` is returned with only the write mask's channels changed.
-Vec4 blend_float(const BlendState& b, bool over, Vec4 source, Vec4 destination) {
+Vec4 blend_float(const BlendState& b, bool over, Vec4 source, Vec4 destination, Vec4 source1 = {}) {
   const float s[4] = {source.x, source.y, source.z, source.w}, d[4] = {destination.x, destination.y, destination.z, destination.w};
+  const float s1[4] = {source1.x, source1.y, source1.z, source1.w};
   float out[4];
   for (uint32_t c = 0; c < 4; ++c) {
     if (!b.custom) {   // (the pipeline's plain source-over, or no blending)
@@ -1106,7 +1155,7 @@ Vec4 blend_float(const BlendState& b, bool over, Vec4 source, Vec4 destination) 
     }
     const bool alpha = c == 3;
     const BlendOp op = alpha ? b.alpha_op : b.color_op;
-    const float sf = blend_factor(alpha ? b.src_alpha : b.src_color, s, d, b.constant, c), df = blend_factor(alpha ? b.dst_alpha : b.dst_color, s, d, b.constant, c);
+    const float sf = blend_factor(alpha ? b.src_alpha : b.src_color, s, s1, d, b.constant, c), df = blend_factor(alpha ? b.dst_alpha : b.dst_color, s, s1, d, b.constant, c);
     if (!b.enable) out[c] = s[c];
     else if (op == BlendOp::Add) out[c] = s[c] * sf + d[c] * df;
     else if (op == BlendOp::Subtract) out[c] = s[c] * sf - d[c] * df;
@@ -1118,8 +1167,25 @@ Vec4 blend_float(const BlendState& b, bool over, Vec4 source, Vec4 destination) 
   return {(mask & 1) ? out[0] : d[0], (mask & 2) ? out[1] : d[1], (mask & 4) ? out[2] : d[2], (mask & 8) ? out[3] : d[3]};
 }
 
-// Stencil test, depth write, blend and store of a shaded fragment of the pixel (x, y); depth_ok is the depth test's verdict.
-void write_fragment(const DrawState& s, int32_t x, int32_t y, float z, bool depth_ok, const Vec4* colors, uint32_t sample = 0) {
+// A logic operation on one channel of a wide target: its bits (an integer format's value, a normalised one's quantized number), back as the channel's value.
+float logic_channel(LogicOp op, Format format, float source, float destination) {
+  const uint32_t bits = format == Format::R8G8B8A8Uint ? 8 : (format == Format::R16G16B16A16Uint || format == Format::R16G16B16A16Sint) ? 16 : 32;
+  if (is_integer_format(format)) {
+    const uint32_t mask = bits == 32 ? ~0u : (1u << bits) - 1u;
+    uint32_t r = apply_logic_op(op, __builtin_bit_cast(uint32_t, source), __builtin_bit_cast(uint32_t, destination)) & mask;
+    if ((format == Format::R16G16B16A16Sint) && (r & 0x8000u)) r |= 0xFFFF0000u;   // (a signed channel keeps its sign)
+    return __builtin_bit_cast(float, r);
+  }
+  if (format == Format::R16G16B16A16Unorm) {
+    auto q = [](float v) { return static_cast<uint32_t>((v < 0.0f ? 0.0f : v > 1.0f ? 1.0f : v) * 65535.0f + 0.5f); };
+    return static_cast<float>(apply_logic_op(op, q(source), q(destination)) & 0xFFFFu) * (1.0f / 65535.0f);
+  }
+  return source;   // (a float target: as if there were no logic operation)
+}
+
+// Stencil test, depth write, blend and store of a shaded fragment of the pixel (x, y); depth_ok is the depth test's verdict, `front` whether the primitive is a front face (the stencil
+// state of back faces is the pipeline's back_stencil when it has one).
+void write_fragment(const DrawState& s, int32_t x, int32_t y, float z, bool depth_ok, const Vec4* colors, uint32_t sample = 0, bool front = true) {
   const GraphicsPipelineDesc& pd = s.pipeline->desc();
   const ArrayView<float> depth = s.depth_plane();
   const ArrayView<uint8_t> stencil = s.stencil_plane();
@@ -1128,10 +1194,11 @@ void write_fragment(const DrawState& s, int32_t x, int32_t y, float z, bool dept
   const uint64_t index = (uint64_t{static_cast<uint32_t>(y)} * s.extent.width + static_cast<uint32_t>(x)) * samples + sample;   // (the sample's place in the depth and stencil planes)
   if (stencil_on) {
     // The stencil test comes first, then the depth test; each outcome has its own op (a fragment the shader discarded changed nothing).
-    const StencilState& st = pd.stencil;
+    const StencilState& st = !front && pd.separate_back_stencil ? pd.back_stencil : pd.stencil;
+    const uint8_t reference = st.reference;   // (a back face's own with separate_back_stencil)
     const uint8_t stored = stencil[index];
-    auto write = [&](StencilOp op) { stencil[index] = static_cast<uint8_t>((stored & ~st.write_mask) | (stencil_apply(op, stored, st.reference) & st.write_mask)); };
-    if (!stencil_compare(st.compare, st.reference & st.compare_mask, stored & st.compare_mask)) { write(st.fail_op); return; }
+    auto write = [&](StencilOp op) { stencil[index] = static_cast<uint8_t>((stored & ~st.write_mask) | (stencil_apply(op, stored, reference) & st.write_mask)); };
+    if (!stencil_compare(st.compare, reference & st.compare_mask, stored & st.compare_mask)) { write(st.fail_op); return; }
     if (!depth_ok) { write(st.depth_fail_op); return; }
     write(st.pass_op);
   } else if (!depth_ok) {
@@ -1146,9 +1213,18 @@ void write_fragment(const DrawState& s, int32_t x, int32_t y, float z, bool dept
     const bool own = pd.independent_blend && n > 0;
     const BlendState& blend = own ? pd.target_blend[n - 1] : pd.blend;
     const bool over = !own && !blend.custom && pd.alpha_blend;
+    const uint8_t logic_mask = blend.custom ? blend.write_mask : 0xF;
     if (!surface.floats.empty()) {
       Vec4* pixel = surface.float_row(static_cast<uint32_t>(y)) + x;
-      *pixel = image->store_float(blend_float(blend, over, colors[n], *pixel));
+      if (pd.logic_op_enable) {
+        // (the channels of the shader's colour as the target keeps them, then combined with what is there)
+        const Vec4 source = image->store_float(colors[n]), stored = *pixel;
+        const Format f = surface.format;
+        *pixel = image->store_float({(logic_mask & 1) ? logic_channel(pd.logic_op, f, source.x, stored.x) : stored.x, (logic_mask & 2) ? logic_channel(pd.logic_op, f, source.y, stored.y) : stored.y,
+                                     (logic_mask & 4) ? logic_channel(pd.logic_op, f, source.z, stored.z) : stored.z, (logic_mask & 8) ? logic_channel(pd.logic_op, f, source.w, stored.w) : stored.w});
+        continue;
+      }
+      *pixel = image->store_float(blend_float(blend, over, colors[n], *pixel, colors[1]));
       continue;
     }
     uint32_t* pixel = surface.row(static_cast<uint32_t>(y)) + uint64_t{static_cast<uint32_t>(x)} * samples + sample;
@@ -1157,12 +1233,33 @@ void write_fragment(const DrawState& s, int32_t x, int32_t y, float z, bool dept
       const uint32_t stored = surface.decode(*pixel);
       const float* table = srgb_to_linear_table();
       const Vec4 destination = {table[(stored >> 16) & 0xFF], table[(stored >> 8) & 0xFF], table[stored & 0xFF], static_cast<float>(stored >> 24) * (1.0f / 255.0f)};
-      Vec4 linear = blend_float(blend, over, colors[n], destination);
+      Vec4 linear = pd.logic_op_enable ? colors[n] : blend_float(blend, over, colors[n], destination, colors[1]);   // (an sRGB target: no logic operation)
+      if (pd.logic_op_enable) {
+        const uint32_t keep = pack_srgb(linear);
+        uint32_t mask = 0;
+        if (logic_mask & 1) mask |= 0x00FF0000u;
+        if (logic_mask & 2) mask |= 0x0000FF00u;
+        if (logic_mask & 4) mask |= 0x000000FFu;
+        if (logic_mask & 8) mask |= 0xFF000000u;
+        *pixel = surface.encode((stored & ~mask) | (keep & mask));
+        continue;
+      }
       *pixel = surface.encode(pack_srgb(linear));
       continue;
     }
     uint32_t out = pack_color(colors[n]);
-    if (blend.custom) out = blend_pixel(blend, out, surface.decode(*pixel));
+    if (pd.logic_op_enable) {
+      // (the bytes of the target: each channel's 8 bits)
+      const uint32_t stored = surface.decode(*pixel);
+      uint32_t mask = 0;
+      if (logic_mask & 1) mask |= 0x00FF0000u;
+      if (logic_mask & 2) mask |= 0x0000FF00u;
+      if (logic_mask & 4) mask |= 0x000000FFu;
+      if (logic_mask & 8) mask |= 0xFF000000u;
+      *pixel = surface.encode((stored & ~mask) | (apply_logic_op(pd.logic_op, out, stored) & mask));
+      continue;
+    }
+    if (blend.custom) out = blend_pixel(blend, out, surface.decode(*pixel), colors[1]);
     else if (over) out = blend_over(out, surface.decode(*pixel));
     *pixel = surface.encode(out);
   }
@@ -1192,16 +1289,40 @@ inline const SamplePosition* sample_positions(uint32_t count) { return count == 
 // An edge is "top" or "left" when pixels exactly on it belong to the triangle.
 inline bool owns_edge(float dx, float dy) { return dy < 0 || (dy == 0 && dx > 0); }
 
-void raster_triangle(const DrawState& s, const ScreenVertex& a, const ScreenVertex& b, const ScreenVertex& c,
-                     bool front_facing_pass) {
+void raster_line(const DrawState& s, const ScreenVertex& v0, const ScreenVertex& v1, float bias, bool front);
+
+// `outline` says which edges of the triangle are edges of the primitive (bit 0 a-b, bit 1 b-c, bit 2 c-a): what a wireframe fill draws.
+void raster_triangle(const DrawState& s, const ScreenVertex& a, const ScreenVertex& b, const ScreenVertex& c, uint8_t outline) {
   const GraphicsPipelineDesc& pd = s.pipeline->desc();
-  (void)front_facing_pass;
   float area = (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x);  // y down: > 0 is clockwise on screen
   if (area == 0) return;
   const bool clockwise = area > 0;
   const bool front = (pd.front_face == FrontFace::Clockwise) == clockwise;
   if (pd.cull_mode == CullMode::Back && !front) return;
   if (pd.cull_mode == CullMode::Front && front) return;
+
+  // The depth bias of the triangle: from the slope of its plane of window depths and its largest depth.
+  float bias = 0.0f;
+  if (pd.depth_bias.enabled()) {
+    const float dzdx = ((b.z - a.z) * (c.y - a.y) - (c.z - a.z) * (b.y - a.y)) / area, dzdy = ((c.z - a.z) * (b.x - a.x) - (b.z - a.z) * (c.x - a.x)) / area;
+    const float sx = dzdx < 0 ? -dzdx : dzdx, sy = dzdy < 0 ? -dzdy : dzdy;
+    float max_z = a.z > b.z ? a.z : b.z;
+    if (c.z > max_z) max_z = c.z;
+    bias = depth_bias_value(pd.depth_bias, sx > sy ? sx : sy, max_z);
+  }
+  if (pd.fill_mode == FillMode::Wireframe) {
+    if (outline & 1) raster_line(s, a, b, bias, front);
+    if (outline & 2) raster_line(s, b, c, bias, front);
+    if (outline & 4) raster_line(s, c, a, bias, front);
+    return;
+  }
+  const float depth_lo = s.viewport.min_depth < s.viewport.max_depth ? s.viewport.min_depth : s.viewport.max_depth;
+  const float depth_hi = s.viewport.min_depth < s.viewport.max_depth ? s.viewport.max_depth : s.viewport.min_depth;
+  // (a fragment's depth: the plane's, biased, within the viewport's range)
+  auto final_z = [&](float z) {
+    z += bias;
+    return z < depth_lo ? depth_lo : z > depth_hi ? depth_hi : z;
+  };
 
   // Work with a positive area so inside tests are "edge >= 0".
   const ScreenVertex* v0 = &a;
@@ -1321,19 +1442,19 @@ void raster_triangle(const DrawState& s, const ScreenVertex& a, const ScreenVert
           const float a0 = -((sx - v1->x) * e0dy - (sy - v1->y) * e0dx), a1 = -((sx - v2->x) * e1dy - (sy - v2->y) * e1dx), a2 = -((sx - v0->x) * e2dy - (sy - v0->y) * e2dx);
           if (!weights_inside(a0, a1, a2)) continue;
           covered |= 1u << k;
-          sample_z[k] = (a0 * v0->z + a1 * v1->z + a2 * v2->z) * inv_area;
+          sample_z[k] = final_z((a0 * v0->z + a1 * v1->z + a2 * v2->z) * inv_area);
         }
         if (!covered) continue;
       } else {
         if (!weights_inside(l0, l1, l2)) continue;
         covered = (1u << sample_count) - 1;
-        const float centre_z = (l0 * v0->z + l1 * v1->z + l2 * v2->z) * inv_area;
+        const float centre_z = final_z((l0 * v0->z + l1 * v1->z + l2 * v2->z) * inv_area);
         for (uint32_t k = 0; k < sample_count; ++k) sample_z[k] = centre_z;
       }
       const float b0 = l0 * inv_area, b1 = l1 * inv_area, b2 = l2 * inv_area;
 
       const uint64_t index = uint64_t{static_cast<uint32_t>(y)} * target_width + static_cast<uint32_t>(x);
-      const float z = b0 * v0->z + b1 * v1->z + b2 * v2->z;
+      const float z = final_z(b0 * v0->z + b1 * v1->z + b2 * v2->z);
       uint32_t depth_pass = covered;   // (the samples that pass the depth test)
       if (pd.depth_test && !depth.empty())
         for (uint32_t k = 0; k < sample_count; ++k)
@@ -1386,7 +1507,7 @@ void raster_triangle(const DrawState& s, const ScreenVertex& a, const ScreenVert
         varyings_at(qx, qy, out_varyings);
         const float l0 = -((qx - v1->x) * e0dy - (qy - v1->y) * e0dx), l1 = -((qx - v2->x) * e1dy - (qy - v2->y) * e1dx), l2 = -((qx - v0->x) * e2dy - (qy - v0->y) * e2dx);
         const float a0 = l0 * inv_area, a1 = l1 * inv_area, a2 = l2 * inv_area;
-        *out_position = {qx, qy, a0 * v0->z + a1 * v1->z + a2 * v2->z, a0 * v0->inv_w + a1 * v1->inv_w + a2 * v2->inv_w};
+        *out_position = {qx, qy, final_z(a0 * v0->z + a1 * v1->z + a2 * v2->z), a0 * v0->inv_w + a1 * v1->inv_w + a2 * v2->inv_w};
       };
       using QuadSource = decltype(quad_source);
       context.quad_fn = [](const void* user, uint32_t corner, Vec4* out_varyings, Vec4* out_position) { (*static_cast<const QuadSource*>(user))(corner, out_varyings, out_position); };
@@ -1401,14 +1522,18 @@ void raster_triangle(const DrawState& s, const ScreenVertex& a, const ScreenVert
         covered &= (1u << keep) - 1;
       }
       for (uint32_t k = 0; k < sample_count; ++k)
-        if (covered >> k & 1) write_fragment(s, x, y, sample_z[k], (depth_pass >> k & 1) != 0, color, k);
+        if (covered >> k & 1) write_fragment(s, x, y, sample_z[k], (depth_pass >> k & 1) != 0, color, k, front);
     }
   }
 }
 
 // A screen-space point or line fragment: the same shader, depth, stencil and blend as a triangle's, from varyings interpolated perspective-correct along the line.
-void fragment_at(const DrawState& s, int32_t x, int32_t y, float z, float inv_w, const Vec4* varying) {
+void fragment_at(const DrawState& s, int32_t x, int32_t y, float z, float inv_w, const Vec4* varying, bool front = true) {
   const GraphicsPipelineDesc& pd = s.pipeline->desc();
+  {
+    const float lo = s.viewport.min_depth < s.viewport.max_depth ? s.viewport.min_depth : s.viewport.max_depth, hi = s.viewport.min_depth < s.viewport.max_depth ? s.viewport.max_depth : s.viewport.min_depth;
+    z = z < lo ? lo : z > hi ? hi : z;   // (the viewport's depth range)
+  }
   const Surface target = s.target(0);
   if (x < s.scissor.x || y < s.scissor.y || x >= static_cast<int64_t>(s.scissor.x) + s.scissor.width || y >= static_cast<int64_t>(s.scissor.y) + s.scissor.height) return;
   if (x < 0 || y < 0 || static_cast<uint32_t>(x) >= target.width || static_cast<uint32_t>(y) >= target.height) return;
@@ -1422,11 +1547,11 @@ void fragment_at(const DrawState& s, int32_t x, int32_t y, float z, float inv_w,
   if (!depth_pass && !(pd.stencil.enable && !s.stencil_plane().empty())) return;
   FragmentContext context;
   context.position = {static_cast<float>(x) + 0.5f, static_cast<float>(y) + 0.5f, z, inv_w};
-  context.front_facing = true;
+  context.front_facing = front;
   context.primitive_id = s.primitive_id;
   Vec4 color[kMaxColorTargets];
   if (!run_fragment_shader(s, varying, context, color)) return;
-  for (uint32_t k = 0; k < sample_count; ++k) write_fragment(s, x, y, z, (depth_pass >> k & 1) != 0, color, k);
+  for (uint32_t k = 0; k < sample_count; ++k) write_fragment(s, x, y, z, (depth_pass >> k & 1) != 0, color, k, front);
 }
 
 ScreenVertex to_screen(const DrawState& s, const ClipVertex& v, uint32_t varyings) {
@@ -1444,7 +1569,9 @@ ScreenVertex to_screen(const DrawState& s, const ClipVertex& v, uint32_t varying
 void draw_point(const DrawState& s, const ClipVertex& a) {
   const uint32_t varyings = s.pipeline->desc().varying_count;
   s.select_layer(a.layer);
-  if (a.position.z < 0 || !(a.position.w > 1e-9f)) return;
+  s.select_viewport(a.viewport);
+  if (!(a.position.w > 1e-9f)) return;
+  if (s.pipeline->desc().depth_clip && (a.position.z < 0 || a.position.z > a.position.w)) return;   // (outside the near or far plane)
   const ScreenVertex v = to_screen(s, a, varyings);
   if (!(v.x > -1e6f && v.x < 1e6f && v.y > -1e6f && v.y < 1e6f)) return;
   const int32_t x = static_cast<int32_t>(v.x < 0 ? v.x - 1 : v.x), y = static_cast<int32_t>(v.y < 0 ? v.y - 1 : v.y);   // (floor, as far as the pixel it falls in goes)
@@ -1452,15 +1579,31 @@ void draw_point(const DrawState& s, const ClipVertex& a) {
 }
 
 // A line one pixel wide: a step per pixel along the longer axis, the other coordinate and the varyings interpolated (perspective-correct) along it.
+// The planes a primitive is clipped against: with depth clipping the near (z >= 0) and far (z <= w) planes, without it only w >= a little above 0 (what the division by w needs).
+uint32_t clip_plane_count(const DrawState& s) { return s.pipeline->desc().depth_clip ? 2 : 1; }
+float clip_distance(const DrawState& s, uint32_t plane, const Vec4& p) {
+  if (!s.pipeline->desc().depth_clip) return p.w - 1e-6f;
+  return plane == 0 ? p.z : p.w - p.z;
+}
+
 void draw_line(const DrawState& s, const ClipVertex& a, const ClipVertex& b) {
   const uint32_t varyings = s.pipeline->desc().varying_count;
   s.select_layer(a.layer);
+  s.select_viewport(a.viewport);
   ClipVertex p = a, q = b;
-  if (p.position.z < 0 && q.position.z < 0) return;
-  if (p.position.z < 0) p = mix(p, q, p.position.z / (p.position.z - q.position.z), varyings);   // (the near plane)
-  else if (q.position.z < 0) q = mix(p, q, p.position.z / (p.position.z - q.position.z), varyings);
+  for (uint32_t plane = 0; plane < clip_plane_count(s); ++plane) {
+    const float dp = clip_distance(s, plane, p.position), dq = clip_distance(s, plane, q.position);
+    if (dp < 0 && dq < 0) return;
+    if (dp < 0) p = mix(p, q, dp / (dp - dq), varyings);
+    else if (dq < 0) q = mix(p, q, dp / (dp - dq), varyings);
+  }
   if (!(p.position.w > 1e-9f) || !(q.position.w > 1e-9f)) return;
-  const ScreenVertex v0 = to_screen(s, p, varyings), v1 = to_screen(s, q, varyings);
+  raster_line(s, to_screen(s, p, varyings), to_screen(s, q, varyings), 0.0f, true);
+}
+
+// The pixels of a line between two window-space points, its depth biased by `bias`; `front` is what the fragments are (a wireframe triangle's facing).
+void raster_line(const DrawState& s, const ScreenVertex& v0, const ScreenVertex& v1, float bias, bool front) {
+  const uint32_t varyings = s.pipeline->desc().varying_count;
   const float limit = 1e6f;
   if (!(v0.x > -limit && v0.x < limit && v0.y > -limit && v0.y < limit && v1.x > -limit && v1.x < limit && v1.y > -limit && v1.y < limit)) return;
   const float dx = v1.x - v0.x, dy = v1.y - v0.y;
@@ -1476,31 +1619,39 @@ void draw_line(const DrawState& s, const ClipVertex& a, const ClipVertex& b) {
     for (uint32_t k = 0; k < varyings; ++k)
       varying[k] = {(v0.varying[k].x * p0 + v1.varying[k].x * p1) * norm, (v0.varying[k].y * p0 + v1.varying[k].y * p1) * norm, (v0.varying[k].z * p0 + v1.varying[k].z * p1) * norm,
                     (v0.varying[k].w * p0 + v1.varying[k].w * p1) * norm};
-    fragment_at(s, static_cast<int32_t>(x < 0 ? x - 1 : x), static_cast<int32_t>(y < 0 ? y - 1 : y), z, (1.0f - t) * v0.inv_w + t * v1.inv_w, varying);
+    fragment_at(s, static_cast<int32_t>(x < 0 ? x - 1 : x), static_cast<int32_t>(y < 0 ? y - 1 : y), z + bias, (1.0f - t) * v0.inv_w + t * v1.inv_w, varying, front);
   }
 }
 
-// Clips a clip-space triangle against the near plane (z >= 0), divides by w and
-// rasterizes the 1 or 2 triangles that remain.
+// Clips a clip-space triangle against the planes of clip_distance (the near and far planes, or w > 0 without depth clipping), divides by w and rasterizes the polygon that
+// remains as a fan of triangles.
 void draw_triangle(const DrawState& s, const ClipVertex& a, const ClipVertex& b, const ClipVertex& c) {
   const uint32_t varyings = s.pipeline->desc().varying_count;
   s.select_layer(a.layer);
-  ClipVertex in[3] = {a, b, c};
-  ClipVertex poly[4];
-  uint32_t n = 0;
-  for (uint32_t i = 0; i < 3; ++i) {
-    const ClipVertex& cur = in[i];
-    const ClipVertex& next = in[(i + 1) % 3];
-    const bool cur_in = cur.position.z >= 0, next_in = next.position.z >= 0;
-    if (cur_in) poly[n++] = cur;
-    if (cur_in != next_in) {
-      const float t = cur.position.z / (cur.position.z - next.position.z);
-      poly[n++] = mix(cur, next, t, varyings);
+  s.select_viewport(a.viewport);
+  constexpr uint32_t kMaxPolygon = 6;   // (a triangle cut by two planes has at most five corners)
+  ClipVertex polys[2][kMaxPolygon];
+  polys[0][0] = a, polys[0][1] = b, polys[0][2] = c;
+  uint32_t n = 3, current = 0;
+  for (uint32_t plane = 0; plane < clip_plane_count(s); ++plane) {
+    const ClipVertex* in = polys[current];
+    ClipVertex* out = polys[current ^ 1];
+    uint32_t m = 0;
+    for (uint32_t i = 0; i < n; ++i) {
+      const ClipVertex& cur = in[i];
+      const ClipVertex& next = in[(i + 1) % n];
+      const float dc = clip_distance(s, plane, cur.position), dn = clip_distance(s, plane, next.position);
+      const bool cur_in = dc >= 0, next_in = dn >= 0;
+      if (cur_in && m < kMaxPolygon) out[m++] = cur;
+      if (cur_in != next_in && m < kMaxPolygon) out[m++] = mix(cur, next, dc / (dc - dn), varyings);
     }
+    n = m;
+    current ^= 1;
+    if (n < 3) return;
   }
-  if (n < 3) return;
+  const ClipVertex* poly = polys[current];
 
-  ScreenVertex sv[4];
+  ScreenVertex sv[kMaxPolygon];
   for (uint32_t i = 0; i < n; ++i) {
     const Vec4& p = poly[i].position;
     if (!(p.w > 1e-9f)) return;  // behind the eye even after clipping: nothing sensible to draw
@@ -1511,7 +1662,8 @@ void draw_triangle(const DrawState& s, const ClipVertex& a, const ClipVertex& b,
     sv[i].inv_w = inv_w;
     for (uint32_t k = 0; k < varyings; ++k) sv[i].varying[k] = poly[i].varying[k];
   }
-  for (uint32_t i = 1; i + 1 < n; ++i) raster_triangle(s, sv[0], sv[i], sv[i + 1], true);
+  // (the fan's inner edges are not edges of the polygon: a wireframe fill leaves them out)
+  for (uint32_t i = 1; i + 1 < n; ++i) raster_triangle(s, sv[0], sv[i], sv[i + 1], static_cast<uint8_t>((i == 1 ? 1u : 0u) | 2u | (i + 2 == n ? 4u : 0u)));
 }
 
 // The vertex buffers a draw reads: what is bound to each slot and where the data starts.
@@ -1540,6 +1692,8 @@ ClipVertex run_vertex_shader(const SoftwarePipeline& pipeline, const VertexStrea
   ClipVertex out;
   out.position = io.position;
   for (uint32_t i = 0; i < kMaxVaryings; ++i) out.varying[i] = io.varying[i];
+  out.layer = io.layer;         // (a vertex shader's SV_RenderTargetArrayIndex and SV_ViewportArrayIndex: kFeature2LayerFromAnyStage)
+  out.viewport = io.viewport;
   return out;
 }
 
@@ -1654,6 +1808,7 @@ void run_geometry_instance(const DrawState& s, const ShaderModuleDesc& md, const
     c.position = output.vertex[i].position;
     for (uint32_t k = 0; k < kMaxVaryings; ++k) c.varying[k] = output.vertex[i].varying[k];
     c.layer = output.vertex[i].layer;
+    c.viewport = output.vertex[i].viewport;
     return c;
   };
   uint32_t in_strip = 0;   // vertices of the strip so far
@@ -1669,7 +1824,8 @@ void run_geometry_instance(const DrawState& s, const ShaderModuleDesc& md, const
       const bool odd = (in_strip - 3) & 1;
       if (odd) {
         ClipVertex first = clip(i - 1);
-        first.layer = output.vertex[i - 2].layer;   // (the triangle's leading vertex in the strip's order names its layer)
+        first.layer = output.vertex[i - 2].layer;   // (the triangle's leading vertex in the strip's order names its layer and viewport)
+        first.viewport = output.vertex[i - 2].viewport;
         draw_triangle(s, first, clip(i - 2), clip(i));
       }
       else draw_triangle(s, clip(i - 2), clip(i - 1), clip(i));
@@ -1739,6 +1895,8 @@ void run_tessellation(allocators::IAllocator& allocator, const DrawState& s, Tes
     ClipVertex c;
     c.position = io.position;
     for (uint32_t k = 0; k < kMaxVaryings; ++k) c.varying[k] = io.varying[k];
+    c.layer = io.layer;
+    c.viewport = io.viewport;
     if (once) kept[index] = c, have[index] = 1;
     return c;
   };
@@ -1992,8 +2150,9 @@ bool SoftwareDevice::submit(ICommandBuffer* commands) {
           if (cmd.pass.clear_depth) s.depth->depth_layer(s.first_layer[kMaxColorTargets] + l, s.level[kMaxColorTargets]).fill(cmd.pass.clear_depth_value);
           if (cmd.pass.clear_stencil) s.depth->stencil_layer(s.first_layer[kMaxColorTargets] + l, s.level[kMaxColorTargets]).fill(cmd.pass.clear_stencil_value);
         }
-        s.viewport = {0, 0, static_cast<float>(e.width), static_cast<float>(e.height), 0, 1};
-        s.scissor = {0, 0, e.width, e.height};
+        s.viewport = s.viewports[0] = {0, 0, static_cast<float>(e.width), static_cast<float>(e.height), 0, 1};
+        s.scissor = s.scissors[0] = {0, 0, e.width, e.height};
+        s.viewport_count = s.scissor_count = 1;
         s.pipeline = nullptr;
         in_pass = true;
         break;
@@ -2225,7 +2384,14 @@ bool SoftwareDevice::submit(ICommandBuffer* commands) {
         break;
       }
       case RecordedCommand::Type::SetViewport:
-        s.viewport = cmd.viewport;
+        s.viewport = s.viewports[0] = cmd.viewport;
+        s.viewport_count = 1;
+        break;
+      case RecordedCommand::Type::SetViewportAt:
+        if (cmd.unit >= kMaxViewports || cmd.count == 0 || cmd.count > kMaxViewports) return false;
+        s.viewports[cmd.unit] = cmd.viewport;
+        s.viewport_count = cmd.count;
+        if (cmd.unit == 0) s.viewport = cmd.viewport;
         break;
       case RecordedCommand::Type::SetTopology:
         topology = cmd.topology;
@@ -2240,8 +2406,21 @@ bool SoftwareDevice::submit(ICommandBuffer* commands) {
         int64_t x1 = int64_t{cmd.scissor.x} + cmd.scissor.width, y1 = int64_t{cmd.scissor.y} + cmd.scissor.height;
         if (x1 > e.width) x1 = e.width;
         if (y1 > e.height) y1 = e.height;
-        s.scissor = {static_cast<int32_t>(x0), static_cast<int32_t>(y0), x1 > x0 ? static_cast<uint32_t>(x1 - x0) : 0,
-                     y1 > y0 ? static_cast<uint32_t>(y1 - y0) : 0};
+        s.scissor = s.scissors[0] = {static_cast<int32_t>(x0), static_cast<int32_t>(y0), x1 > x0 ? static_cast<uint32_t>(x1 - x0) : 0,
+                                     y1 > y0 ? static_cast<uint32_t>(y1 - y0) : 0};
+        s.scissor_count = 1;
+        break;
+      }
+      case RecordedCommand::Type::SetScissorAt: {
+        if (!in_pass || cmd.unit >= kMaxViewports || cmd.count == 0 || cmd.count > kMaxViewports) return false;
+        const Extent2D e = s.color->extent();
+        const int64_t x0 = cmd.scissor.x > 0 ? cmd.scissor.x : 0, y0 = cmd.scissor.y > 0 ? cmd.scissor.y : 0;
+        int64_t x1 = int64_t{cmd.scissor.x} + cmd.scissor.width, y1 = int64_t{cmd.scissor.y} + cmd.scissor.height;
+        if (x1 > e.width) x1 = e.width;
+        if (y1 > e.height) y1 = e.height;
+        s.scissors[cmd.unit] = {static_cast<int32_t>(x0), static_cast<int32_t>(y0), x1 > x0 ? static_cast<uint32_t>(x1 - x0) : 0, y1 > y0 ? static_cast<uint32_t>(y1 - y0) : 0};
+        s.scissor_count = cmd.count;
+        if (cmd.unit == 0) s.scissor = s.scissors[0];
         break;
       }
       case RecordedCommand::Type::Draw:

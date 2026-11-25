@@ -489,15 +489,29 @@ static void uav_clear_list(CmdList *l, D3D12_CPU_DESCRIPTOR_HANDLE cpu, ID3D12Re
 
 /* ---- ID3D12GraphicsCommandList8 .. 10 ------------------------------------------------------------------------------------------------------------------------------- */
 
-/* OMSetFrontAndBackStencilRef: one reference for both faces here (IndependentFrontAndBackStencilRefMaskSupported is FALSE, OPTIONS14: a program gives the two the same
- * value), so the front one is the list's stencil reference. */
+/* OMSetFrontAndBackStencilRef: a reference for front faces and one for back faces (the kernel pipeline's back_stencil reference: IndependentFrontAndBackStencilRefMaskSupported,
+ * OPTIONS14, where the device has DEV_FEATURE2_RASTERIZER_STATE). On a device without it the two are one: the front one is used (a program gives them the same value there,
+ * as the option says). */
 static void STDMETHODCALLTYPE list_OMSetFrontAndBackStencilRef(CmdList *l, UINT front, UINT back) {
-  (void)back;
-  list_OMSetStencilRef(l, front);
+  BUNDLE_LOG(l, B_STENCIL_REFS, front, back);
+  l->stencil_ref = front;
+  l->stencil_ref_back = (l->d.dev->caps.features2 & DEV_FEATURE2_RASTERIZER_STATE) ? back : front;
 }
-/* RSSetDepthBias / IASetIndexBufferStripCutValue: the state of a pipeline made with D3D12_PIPELINE_STATE_FLAG_DYNAMIC_DEPTH_BIAS / _DYNAMIC_INDEX_BUFFER_STRIP_CUT, which
- * this device refuses (DynamicDepthBiasSupported, DynamicIndexBufferStripCutSupported are FALSE, OPTIONS16 / 15): calls a program may not make here, left out. */
-static void STDMETHODCALLTYPE list_RSSetDepthBias(CmdList *l, FLOAT bias, FLOAT clamp, FLOAT slope) { (void)l; (void)bias; (void)clamp; (void)slope; }
+/* RSSetDepthBias: the depth bias of the pipelines made with D3D12_PIPELINE_STATE_FLAG_DYNAMIC_DEPTH_BIAS (DynamicDepthBiasSupported, OPTIONS16, where the device has
+ * DEV_FEATURE2_RASTERIZER_STATE; the others' is their rasterizer state's). The kernel's pipeline has its bias as state, so a draw takes a pipeline of these values (pso_pipeline).
+ * NaN is no bias. */
+static void STDMETHODCALLTYPE list_RSSetDepthBias(CmdList *l, FLOAT bias, FLOAT clamp, FLOAT slope) {
+  {
+    UINT bits[3];
+    memcpy(&bits[0], &bias, 4), memcpy(&bits[1], &clamp, 4), memcpy(&bits[2], &slope, 4);
+    BUNDLE_LOG(l, B_DEPTH_BIAS, bits[0], bits[1], bits[2]);
+  }
+  l->depth_bias[0] = bias == bias ? bias : 0.0f;
+  l->depth_bias[1] = clamp == clamp ? clamp : 0.0f;
+  l->depth_bias[2] = slope == slope ? slope : 0.0f;
+}
+/* IASetIndexBufferStripCutValue: the state of a pipeline made with D3D12_PIPELINE_STATE_FLAG_DYNAMIC_INDEX_BUFFER_STRIP_CUT, which this device refuses
+ * (DynamicIndexBufferStripCutSupported is FALSE, OPTIONS15): a call a program may not make here, left out. */
 static void STDMETHODCALLTYPE list_IASetIndexBufferStripCutValue(CmdList *l, D3D12_INDEX_BUFFER_STRIP_CUT_VALUE value) { (void)l; (void)value; }
 /* SetProgram / DispatchGraph: work graphs (WorkGraphsTier is NOT_SUPPORTED, OPTIONS21: no program can be made to set) - left out. */
 static void STDMETHODCALLTYPE list_SetProgram(CmdList *l, const D3D12_SET_PROGRAM_DESC *desc) { (void)l; (void)desc; }

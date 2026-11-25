@@ -30,6 +30,7 @@ struct RecordedCommand {
   enum class Type : uint8_t {
     BeginRenderPass, BindPipeline, BindVertexBuffer, BindIndexBuffer, PushConstants, BindTexture, SetViewport, SetScissor,
     Draw, DrawIndexed, EndRenderPass, SetTopology, BeginQuery, EndQuery, BindComputePipeline, BindStorageBuffer, Dispatch, Resolve, SetPatchPoints, BindStreamOutput, BindStorageImage, BindStorageTexelBuffer,
+    SetViewportAt, SetScissorAt,   // (viewport or scissor `unit` of `count`: set_viewports / set_scissors, one command for each)
   };
   Type type = Type::Draw;
   RenderPassBegin pass;
@@ -145,6 +146,26 @@ class CommandRecorder : public ICommandBuffer {
     c.type = RecordedCommand::Type::SetScissor;
     c.scissor = scissor;
     add(c);
+  }
+  void set_viewports(ArrayView<const Viewport> viewports) override {
+    for (uint32_t i = 0; i < viewports.size() && i < kMaxViewports; ++i) {
+      RecordedCommand c;
+      c.type = RecordedCommand::Type::SetViewportAt;
+      c.viewport = viewports[i];
+      c.unit = i;
+      c.count = static_cast<uint32_t>(viewports.size() < kMaxViewports ? viewports.size() : kMaxViewports);
+      add(c);
+    }
+  }
+  void set_scissors(ArrayView<const Rect2D> scissors) override {
+    for (uint32_t i = 0; i < scissors.size() && i < kMaxViewports; ++i) {
+      RecordedCommand c;
+      c.type = RecordedCommand::Type::SetScissorAt;
+      c.scissor = scissors[i];
+      c.unit = i;
+      c.count = static_cast<uint32_t>(scissors.size() < kMaxViewports ? scissors.size() : kMaxViewports);
+      add(c);
+    }
   }
   void draw(uint32_t vertex_count, uint32_t first_vertex, uint32_t instance_count, uint32_t first_instance) override {
     RecordedCommand c;

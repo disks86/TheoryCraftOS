@@ -134,12 +134,13 @@ static HRESULT STDMETHODCALLTYPE plib_LoadPipeline(Plib *l, const WCHAR *name, c
   D3D12_GRAPHICS_PIPELINE_STATE_DESC g;
   D3D12_COMPUTE_PIPELINE_STATE_DESC c;
   BOOL compute;
+  PsoExtras x;
   ID3D12RootSignature *made;
   if (out) *out = NULL;
-  HRESULT hr = stream_parse(l->d.dev, stream, &g, &c, &compute, &made);
+  HRESULT hr = stream_parse(l->d.dev, stream, &g, &c, &compute, &x, &made);
   if (FAILED(hr)) return hr;
-  hr = plib_check(l, name, compute ? 1 : 0, compute ? desc_hash_compute(&c) : desc_hash_graphics(&g));
-  if (SUCCEEDED(hr)) hr = compute ? dev_CreateComputePipelineState(l->d.dev, &c, riid, out) : dev_CreateGraphicsPipelineState(l->d.dev, &g, riid, out);
+  hr = plib_check(l, name, compute ? 1 : 0, compute ? desc_hash_compute(&c) : desc_hash_graphics_x(&g, &x));
+  if (SUCCEEDED(hr)) hr = compute ? dev_CreateComputePipelineState(l->d.dev, &c, riid, out) : pso_create_graphics(l->d.dev, &g, &x, riid, out);
   if (made) ID3D12RootSignature_Release(made);
   return hr;
 }

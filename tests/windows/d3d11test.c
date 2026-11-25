@@ -2598,7 +2598,7 @@ static void test_device5(void) {
   D3D11_FEATURE_DATA_D3D11_OPTIONS o;
   memset(&o, 0xCC, sizeof o);
   check(SUCCEEDED(ID3D11Device5_CheckFeatureSupport(d5, D3D11_FEATURE_D3D11_OPTIONS, &o, sizeof o)) && o.ClearView && o.ConstantBufferOffsetting &&
-        o.MapNoOverwriteOnDynamicConstantBuffer && !o.OutputMergerLogicOp && !o.ExtendedDoublesShaderInstructions, "D3D11_FEATURE_D3D11_OPTIONS");
+        o.MapNoOverwriteOnDynamicConstantBuffer && o.OutputMergerLogicOp && !o.ExtendedDoublesShaderInstructions, "D3D11_FEATURE_D3D11_OPTIONS");
   D3D11_FEATURE_DATA_D3D11_OPTIONS2 o2;
   memset(&o2, 0xCC, sizeof o2);
   check(SUCCEEDED(ID3D11Device5_CheckFeatureSupport(d5, D3D11_FEATURE_D3D11_OPTIONS2, &o2, sizeof o2)) && o2.TiledResourcesTier == D3D11_TILED_RESOURCES_TIER_1 &&
@@ -4152,6 +4152,446 @@ static void test_shadow_maps(void) {
   ID3D11Texture2D_Release(texture);
 }
 
+/* ---- the rasterizer, depth-stencil and blend state of Direct3D 10 / 11.1 -------------------------------------------------------------------------------------------------- */
+
+/* A quad over rows y0 .. y1 of clip space (+1 is the top), its depth running from zl to zr across, of one colour. */
+static ID3D11Buffer *band(float y0, float y1, float zl, float zr, float r, float g, float b) {
+  const VertexF v[6] = {{-1, y0, zl, r, g, b, 1}, {1, y0, zr, r, g, b, 1}, {-1, y1, zl, r, g, b, 1}, {-1, y1, zl, r, g, b, 1}, {1, y0, zr, r, g, b, 1}, {1, y1, zr, r, g, b, 1}};
+  return make_buffer(D3D11_BIND_VERTEX_BUFFER, D3D11_USAGE_DEFAULT, 0, v, sizeof v);
+}
+static ID3D11RasterizerState *raster_state(D3D11_FILL_MODE fill, INT bias, float slope, float clamp, BOOL clip) {
+  D3D11_RASTERIZER_DESC d = {fill, D3D11_CULL_NONE, FALSE, bias, clamp, slope, clip, FALSE, FALSE, FALSE};
+  ID3D11RasterizerState *r = NULL;
+  ID3D11Device_CreateRasterizerState(g_device, &d, &r);
+  return r;
+}
+static ID3D11DepthStencilState *depth_state(D3D11_COMPARISON_FUNC func, BOOL write) {
+  D3D11_DEPTH_STENCIL_DESC d;
+  memset(&d, 0, sizeof d);
+  d.DepthEnable = TRUE;
+  d.DepthWriteMask = write ? D3D11_DEPTH_WRITE_MASK_ALL : D3D11_DEPTH_WRITE_MASK_ZERO;
+  d.DepthFunc = func;
+  ID3D11DepthStencilState *s = NULL;
+  ID3D11Device_CreateDepthStencilState(g_device, &d, &s);
+  return s;
+}
+
+static void test_fixed_state(void) {
+  ID3D11DeviceContext_PSSetShader(g_context, g_ps_color, NULL, 0);
+  /* Depth bias in the unit of each depth format: a quad at 0.125, then the same 2e-6 nearer with DepthBias 1 - in D32_FLOAT's unit at 0.125 (2^-26) it is still in front
+   * (green), in D24's (1 / (2^24 - 1)) too, in D16's (1 / 65535) behind (stays red); DepthBias 100 of D24 is behind as well. */
+  {
+    const DXGI_FORMAT formats[4] = {DXGI_FORMAT_D32_FLOAT, DXGI_FORMAT_D24_UNORM_S8_UINT, DXGI_FORMAT_D16_UNORM, DXGI_FORMAT_D24_UNORM_S8_UINT};
+    const INT biases[4] = {1, 1, 1, 100};
+    const UINT32 expected[4] = {0xFF00FF00u, 0xFF00FF00u, 0xFFFF0000u, 0xFFFF0000u};
+    ID3D11Buffer *base = band(1, -1, 0.125f, 0.125f, 1, 0, 0), *nearer = band(1, -1, 0.125f - 2e-6f, 0.125f - 2e-6f, 0, 1, 0);
+    ID3D11DepthStencilState *write = depth_state(D3D11_COMPARISON_LESS, TRUE), *test = depth_state(D3D11_COMPARISON_LESS, FALSE);
+    for (int k = 0; k < 4; ++k) {
+      D3D11_TEXTURE2D_DESC desc = {SIZE, SIZE, 1, 1, formats[k], {1, 0}, D3D11_USAGE_DEFAULT, D3D11_BIND_DEPTH_STENCIL, 0, 0};
+      ID3D11Texture2D *depth = NULL;
+      ID3D11DepthStencilView *view = NULL;
+      ID3D11RasterizerState *biased = raster_state(D3D11_FILL_SOLID, biases[k], 0, 0, TRUE);
+      if (SUCCEEDED(ID3D11Device_CreateTexture2D(g_device, &desc, NULL, &depth))) ID3D11Device_CreateDepthStencilView(g_device, (ID3D11Resource *)depth, NULL, &view);
+      if (view && biased && base && nearer && write && test) {
+        begin(view);
+        clear(0, 0, 0);
+        ID3D11DeviceContext_ClearDepthStencilView(g_context, view, D3D11_CLEAR_DEPTH, 1.0f, 0);
+        ID3D11DeviceContext_PSSetShader(g_context, g_ps_color, NULL, 0);
+        ID3D11DeviceContext_OMSetDepthStencilState(g_context, write, 0);
+        bind_floats(base);
+        ID3D11DeviceContext_Draw(g_context, 6, 0);
+        ID3D11DeviceContext_OMSetDepthStencilState(g_context, test, 0);
+        ID3D11DeviceContext_RSSetState(g_context, biased);
+        bind_floats(nearer);
+        ID3D11DeviceContext_Draw(g_context, 6, 0);
+        read_target();
+        printf("d3d11test: depth bias %d of format %u: %08x\n", biases[k], (unsigned)formats[k], (unsigned)pixel(32, 32));
+      }
+      check(view && pixel(32, 32) == expected[k] && pixel(3, 60) == expected[k], k == 0 ? "DepthBias in D32_FLOAT's unit, 2^(e - 23)" : k == 2 ? "DepthBias in D16_UNORM's unit, 1 / 65535" :
+                                                                               k == 1 ? "DepthBias in D24_UNORM_S8_UINT's unit, 1 / (2^24 - 1)" : "100 units of D24");
+      if (biased) ID3D11RasterizerState_Release(biased);
+      if (view) ID3D11DepthStencilView_Release(view);
+      if (depth) ID3D11Texture2D_Release(depth);
+    }
+    /* SlopeScaledDepthBias and DepthBiasClamp: a sloped quad, again 0.001 behind with a slope of -1 (in front: blue), and held to -0.0005 by the clamp (behind: red) */
+    D3D11_TEXTURE2D_DESC desc = {SIZE, SIZE, 1, 1, DXGI_FORMAT_D32_FLOAT, {1, 0}, D3D11_USAGE_DEFAULT, D3D11_BIND_DEPTH_STENCIL, 0, 0};
+    ID3D11Texture2D *depth = NULL;
+    ID3D11DepthStencilView *view = NULL;
+    if (SUCCEEDED(ID3D11Device_CreateTexture2D(g_device, &desc, NULL, &depth))) ID3D11Device_CreateDepthStencilView(g_device, (ID3D11Resource *)depth, NULL, &view);
+    ID3D11Buffer *slope_base = band(1, -1, 0.3f, 0.7f, 1, 0, 0), *behind = band(1, -1, 0.301f, 0.701f, 0, 0, 1);
+    ID3D11RasterizerState *slope = raster_state(D3D11_FILL_SOLID, 0, -1.0f, 0, TRUE), *clamped = raster_state(D3D11_FILL_SOLID, 0, -1.0f, -0.0005f, TRUE);
+    UINT32 got[2] = {0, 0};
+    for (int k = 0; k < 2 && view && slope && clamped && slope_base && behind; ++k) {
+      begin(view);
+      clear(0, 0, 0);
+      ID3D11DeviceContext_ClearDepthStencilView(g_context, view, D3D11_CLEAR_DEPTH, 1.0f, 0);
+      ID3D11DeviceContext_PSSetShader(g_context, g_ps_color, NULL, 0);
+      ID3D11DeviceContext_OMSetDepthStencilState(g_context, write, 0);
+      bind_floats(slope_base);
+      ID3D11DeviceContext_Draw(g_context, 6, 0);
+      ID3D11DeviceContext_OMSetDepthStencilState(g_context, test, 0);
+      ID3D11DeviceContext_RSSetState(g_context, k == 0 ? slope : clamped);
+      bind_floats(behind);
+      ID3D11DeviceContext_Draw(g_context, 6, 0);
+      read_target();
+      got[k] = pixel(32, 32);
+    }
+    check(got[0] == 0xFF0000FFu && got[1] == 0xFFFF0000u, "SlopeScaledDepthBias moves a sloped quad forward, DepthBiasClamp holds it back");
+    if (slope) ID3D11RasterizerState_Release(slope);
+    if (clamped) ID3D11RasterizerState_Release(clamped);
+    if (slope_base) ID3D11Buffer_Release(slope_base);
+    if (behind) ID3D11Buffer_Release(behind);
+    /* DepthClipEnable FALSE: a quad behind the far plane (z 1.5) is drawn with its depth held to 1 (LESS_EQUAL against 1); with it TRUE it is cut away */
+    ID3D11Buffer *far_quad = band(1, -1, 1.5f, 1.5f, 1, 1, 0);
+    ID3D11DepthStencilState *less_equal = depth_state(D3D11_COMPARISON_LESS_EQUAL, FALSE);
+    ID3D11RasterizerState *no_clip = raster_state(D3D11_FILL_SOLID, 0, 0, 0, FALSE);
+    UINT32 clip_got[2] = {1, 1};
+    for (int k = 0; k < 2 && view && far_quad && less_equal && no_clip; ++k) {
+      begin(view);
+      clear(0, 0, 0);
+      ID3D11DeviceContext_ClearDepthStencilView(g_context, view, D3D11_CLEAR_DEPTH, 1.0f, 0);
+      ID3D11DeviceContext_PSSetShader(g_context, g_ps_color, NULL, 0);
+      ID3D11DeviceContext_OMSetDepthStencilState(g_context, less_equal, 0);
+      if (k == 1) ID3D11DeviceContext_RSSetState(g_context, no_clip);
+      bind_floats(far_quad);
+      ID3D11DeviceContext_Draw(g_context, 6, 0);
+      read_target();
+      clip_got[k] = pixel(32, 32);
+    }
+    check(clip_got[0] == 0xFF000000u && clip_got[1] == 0xFFFFFF00u, "DepthClipEnable: clipped at the far plane, or drawn with the depth clamped");
+    if (far_quad) ID3D11Buffer_Release(far_quad);
+    if (less_equal) ID3D11DepthStencilState_Release(less_equal);
+    if (no_clip) ID3D11RasterizerState_Release(no_clip);
+    if (view) ID3D11DepthStencilView_Release(view);
+    if (depth) ID3D11Texture2D_Release(depth);
+    if (base) ID3D11Buffer_Release(base);
+    if (nearer) ID3D11Buffer_Release(nearer);
+    if (write) ID3D11DepthStencilState_Release(write);
+    if (test) ID3D11DepthStencilState_Release(test);
+  }
+  /* D3D11_FILL_WIREFRAME: the triangle's edges, its inside black */
+  {
+    ID3D11Buffer *tri = triangle(0.5f, 1, 1, 1);
+    ID3D11RasterizerState *wire = raster_state(D3D11_FILL_WIREFRAME, 0, 0, 0, TRUE);
+    begin(NULL);
+    clear(0, 0, 0);
+    ID3D11DeviceContext_PSSetShader(g_context, g_ps_color, NULL, 0);
+    ID3D11DeviceContext_RSSetState(g_context, wire);
+    bind_floats(tri);
+    ID3D11DeviceContext_Draw(g_context, 3, 0);
+    read_target();
+    int lit = 0;
+    for (int i = 0; i < SIZE * SIZE; ++i) lit += (g_pixels[i] & 0xFFFFFF) != 0;
+    check(wire && lit > 100 && lit < 300 && pixel(32, 40) == 0xFF000000u && pixel(32, 57) == 0xFFFFFFFFu, "D3D11_FILL_WIREFRAME draws a triangle's edges");
+    if (wire) ID3D11RasterizerState_Release(wire);
+    if (tri) ID3D11Buffer_Release(tri);
+  }
+  /* Two-sided stencil: the back faces' own operations (D3D11_DEPTH_STENCIL_DESC::BackFace) */
+  {
+    D3D11_TEXTURE2D_DESC desc = {SIZE, SIZE, 1, 1, DXGI_FORMAT_D24_UNORM_S8_UINT, {1, 0}, D3D11_USAGE_DEFAULT, D3D11_BIND_DEPTH_STENCIL, 0, 0};
+    ID3D11Texture2D *depth = NULL;
+    ID3D11DepthStencilView *view = NULL;
+    if (SUCCEEDED(ID3D11Device_CreateTexture2D(g_device, &desc, NULL, &depth))) ID3D11Device_CreateDepthStencilView(g_device, (ID3D11Resource *)depth, NULL, &view);
+    /* (the left triangle faces away - counter-clockwise on the screen -, the right one faces the viewer; a green quad facing the viewer, a white one facing away) */
+    const VertexF v[12] = {{-0.9f, 0.8f, 0.5f, 1, 0, 0, 1}, {-0.9f, -0.8f, 0.5f, 1, 0, 0, 1}, {-0.1f, 0.0f, 0.5f, 1, 0, 0, 1},
+                           {0.1f, 0.0f, 0.5f, 1, 1, 0, 1}, {0.9f, 0.8f, 0.5f, 1, 1, 0, 1}, {0.9f, -0.8f, 0.5f, 1, 1, 0, 1},
+                           {-1, 1, 0.5f, 0, 1, 0, 1}, {3, 1, 0.5f, 0, 1, 0, 1}, {-1, -3, 0.5f, 0, 1, 0, 1},
+                           {-1, 1, 0.5f, 1, 1, 1, 1}, {-1, -3, 0.5f, 1, 1, 1, 1}, {3, 1, 0.5f, 1, 1, 1, 1}};
+    ID3D11Buffer *vb = make_buffer(D3D11_BIND_VERTEX_BUFFER, D3D11_USAGE_DEFAULT, 0, v, sizeof v);
+    D3D11_DEPTH_STENCIL_DESC d;
+    memset(&d, 0, sizeof d);
+    d.DepthFunc = D3D11_COMPARISON_ALWAYS;
+    d.StencilEnable = TRUE;
+    d.StencilReadMask = d.StencilWriteMask = 0xFF;
+    const D3D11_DEPTH_STENCILOP_DESC replace = {D3D11_STENCIL_OP_KEEP, D3D11_STENCIL_OP_KEEP, D3D11_STENCIL_OP_REPLACE, D3D11_COMPARISON_ALWAYS};
+    const D3D11_DEPTH_STENCILOP_DESC invert = {D3D11_STENCIL_OP_KEEP, D3D11_STENCIL_OP_KEEP, D3D11_STENCIL_OP_INVERT, D3D11_COMPARISON_ALWAYS};
+    const D3D11_DEPTH_STENCILOP_DESC equal = {D3D11_STENCIL_OP_KEEP, D3D11_STENCIL_OP_KEEP, D3D11_STENCIL_OP_KEEP, D3D11_COMPARISON_EQUAL};
+    const D3D11_DEPTH_STENCILOP_DESC never = {D3D11_STENCIL_OP_KEEP, D3D11_STENCIL_OP_KEEP, D3D11_STENCIL_OP_KEEP, D3D11_COMPARISON_NEVER};
+    ID3D11DepthStencilState *mark = NULL, *front_test = NULL, *back_test = NULL;
+    d.FrontFace = replace, d.BackFace = invert;
+    ID3D11Device_CreateDepthStencilState(g_device, &d, &mark);
+    d.FrontFace = d.BackFace = equal;
+    ID3D11Device_CreateDepthStencilState(g_device, &d, &front_test);
+    d.FrontFace = never, d.BackFace = equal;
+    ID3D11Device_CreateDepthStencilState(g_device, &d, &back_test);
+    if (view && vb && mark && front_test && back_test) {
+      begin(view);
+      clear(0, 0, 0);
+      ID3D11DeviceContext_ClearDepthStencilView(g_context, view, D3D11_CLEAR_DEPTH | D3D11_CLEAR_STENCIL, 1.0f, 0);
+      ID3D11DeviceContext_PSSetShader(g_context, g_ps_color, NULL, 0);
+      bind_floats(vb);
+      ID3D11DeviceContext_OMSetDepthStencilState(g_context, mark, 1);
+      ID3D11DeviceContext_Draw(g_context, 6, 0);
+      ID3D11DeviceContext_OMSetDepthStencilState(g_context, front_test, 1);
+      ID3D11DeviceContext_Draw(g_context, 3, 6);
+      ID3D11DeviceContext_OMSetDepthStencilState(g_context, back_test, 0xFF);
+      ID3D11DeviceContext_Draw(g_context, 3, 9);
+      read_target();
+    }
+    check(view && pixel(8, 32) == 0xFFFFFFFFu && pixel(56, 32) == 0xFF00FF00u && pixel(32, 2) == 0xFF000000u, "the back faces' stencil operations and comparison");
+    ID3D11DepthStencilState *states[3] = {mark, front_test, back_test};
+    for (int i = 0; i < 3; ++i) if (states[i]) ID3D11DepthStencilState_Release(states[i]);
+    if (vb) ID3D11Buffer_Release(vb);
+    if (view) ID3D11DepthStencilView_Release(view);
+    if (depth) ID3D11Texture2D_Release(depth);
+  }
+  /* Dual-source blending (D3D11_BLEND_SRC1_COLOR, INV_SRC1_ALPHA) with ps_mrt's two outputs, into one target */
+  {
+    ID3D11PixelShader *mrt = NULL;
+    ID3D11Device_CreatePixelShader(g_device, dx_ps_mrt_dxbc, sizeof dx_ps_mrt_dxbc, NULL, &mrt);
+    D3D11_BLEND_DESC bd;
+    memset(&bd, 0, sizeof bd);
+    D3D11_RENDER_TARGET_BLEND_DESC *t = &bd.RenderTarget[0];
+    t->BlendEnable = TRUE;
+    t->SrcBlend = D3D11_BLEND_ONE, t->DestBlend = D3D11_BLEND_SRC1_COLOR, t->BlendOp = D3D11_BLEND_OP_ADD;
+    t->SrcBlendAlpha = D3D11_BLEND_ONE, t->DestBlendAlpha = D3D11_BLEND_INV_SRC1_ALPHA, t->BlendOpAlpha = D3D11_BLEND_OP_ADD;
+    t->RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
+    ID3D11BlendState *dual = NULL;
+    ID3D11Device_CreateBlendState(g_device, &bd, &dual);
+    ID3D11Buffer *tri = triangle(0.5f, 0.6f, 0.2f, 0.1f);
+    begin(NULL);
+    clear(0.5f, 0.5f, 0.5f);
+    ID3D11DeviceContext_PSSetShader(g_context, mrt, NULL, 0);
+    ID3D11DeviceContext_OMSetBlendState(g_context, dual, NULL, 0xFFFFFFFFu);
+    bind_floats(tri);
+    ID3D11DeviceContext_Draw(g_context, 3, 0);
+    read_target();
+    const UINT32 p = pixel(32, 40);
+    printf("d3d11test: dual-source blending %08x\n", (unsigned)p);
+    check(mrt && dual && red(p) >= 165 && red(p) <= 167 && green(p) >= 76 && green(p) <= 77 && blue(p) >= 101 && blue(p) <= 103, "dual-source blending: SV_Target1 as the destination's factor");
+    ID3D11DeviceContext_OMSetBlendState(g_context, NULL, NULL, 0xFFFFFFFFu);
+    if (dual) ID3D11BlendState_Release(dual);
+    if (mrt) ID3D11PixelShader_Release(mrt);
+    if (tri) ID3D11Buffer_Release(tri);
+  }
+  /* Logic operations (Wine's test_logic_op): OutputMergerLogicOp, CreateBlendState1's rules, and every operation on an R8G8B8A8_UINT target cleared to (0, 255, 0, 255)
+   * that a shader writes (0, 0, 255, 255) into */
+  {
+    D3D11_FEATURE_DATA_D3D11_OPTIONS o;
+    memset(&o, 0, sizeof o);
+    check(SUCCEEDED(ID3D11Device_CheckFeatureSupport(g_device, D3D11_FEATURE_D3D11_OPTIONS, &o, sizeof o)) && o.OutputMergerLogicOp, "D3D11_FEATURE_D3D11_OPTIONS: OutputMergerLogicOp");
+    ID3D11Device1 *device1 = NULL;
+    ID3D11Device_QueryInterface(g_device, &IID_ID3D11Device1, (void **)&device1);
+    D3D11_BLEND_DESC1 bd;
+    memset(&bd, 0, sizeof bd);
+    bd.IndependentBlendEnable = TRUE;
+    bd.RenderTarget[0].LogicOpEnable = TRUE;
+    bd.RenderTarget[0].LogicOp = D3D11_LOGIC_OP_CLEAR;
+    bd.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
+    bd.RenderTarget[1] = bd.RenderTarget[0];
+    bd.RenderTarget[1].SrcBlendAlpha = D3D11_BLEND_ZERO;
+    ID3D11BlendState1 *state = NULL;
+    HRESULT hr = device1 ? ID3D11Device1_CreateBlendState1(device1, &bd, &state) : E_FAIL;
+    check(hr == E_INVALIDARG && !state, "CreateBlendState1: logic operations with IndependentBlendEnable are E_INVALIDARG");
+    bd.IndependentBlendEnable = FALSE;
+    bd.RenderTarget[0].BlendEnable = TRUE;
+    hr = device1 ? ID3D11Device1_CreateBlendState1(device1, &bd, &state) : E_FAIL;
+    check(hr == E_INVALIDARG && !state, "CreateBlendState1: blending and a logic operation at once is E_INVALIDARG");
+    bd.RenderTarget[0].BlendEnable = FALSE;
+    static const struct { D3D11_LOGIC_OP op; UINT32 colour; } tests[] = {
+        {D3D11_LOGIC_OP_CLEAR, 0x00000000}, {D3D11_LOGIC_OP_NOR, 0x000000ff}, {D3D11_LOGIC_OP_AND_INVERTED, 0x0000ff00}, {D3D11_LOGIC_OP_COPY_INVERTED, 0x0000ffff},
+        {D3D11_LOGIC_OP_AND_REVERSE, 0x00ff0000}, {D3D11_LOGIC_OP_INVERT, 0x00ff00ff}, {D3D11_LOGIC_OP_XOR, 0x00ffff00}, {D3D11_LOGIC_OP_NAND, 0x00ffffff},
+        {D3D11_LOGIC_OP_AND, 0xff000000}, {D3D11_LOGIC_OP_EQUIV, 0xff0000ff}, {D3D11_LOGIC_OP_NOOP, 0xff00ff00}, {D3D11_LOGIC_OP_OR_INVERTED, 0xff00ffff},
+        {D3D11_LOGIC_OP_COPY, 0xffff0000}, {D3D11_LOGIC_OP_OR_REVERSE, 0xffff00ff}, {D3D11_LOGIC_OP_OR, 0xffffff00}, {D3D11_LOGIC_OP_SET, 0xffffffff}};
+    ID3D11Texture2D *target = texture2d(SIZE, SIZE, 1, DXGI_FORMAT_R8G8B8A8_UINT, D3D11_BIND_RENDER_TARGET);
+    ID3D11RenderTargetView *rtv = NULL;
+    if (target) ID3D11Device_CreateRenderTargetView(g_device, (ID3D11Resource *)target, NULL, &rtv);
+    ID3D11PixelShader *ps = NULL;
+    ID3D11Device_CreatePixelShader(g_device, dx_ps_int_write_dxbc, sizeof dx_ps_int_write_dxbc, NULL, &ps);
+    const VertexF quad[6] = {{-1, -1, 0.5f, 0, 0, 1, 1}, {-1, 1, 0.5f, 0, 0, 1, 1}, {1, -1, 0.5f, 0, 0, 1, 1}, {1, -1, 0.5f, 0, 0, 1, 1}, {-1, 1, 0.5f, 0, 0, 1, 1}, {1, 1, 0.5f, 0, 0, 1, 1}};
+    ID3D11Buffer *vb = make_buffer(D3D11_BIND_VERTEX_BUFFER, D3D11_USAGE_DEFAULT, 0, quad, sizeof quad);
+    int good = 0;
+    static UINT32 texels[SIZE * SIZE];
+    for (UINT i = 0; device1 && rtv && ps && vb && i < sizeof tests / sizeof tests[0]; ++i) {
+      bd.RenderTarget[0].LogicOp = tests[i].op;
+      state = NULL;
+      if (FAILED(ID3D11Device1_CreateBlendState1(device1, &bd, &state)) || !state) continue;
+      begin(NULL);
+      ID3D11DeviceContext_OMSetRenderTargets(g_context, 1, &rtv, NULL);
+      const float clear_colour[4] = {0, 255, 0, 255};
+      ID3D11DeviceContext_ClearRenderTargetView(g_context, rtv, clear_colour);
+      ID3D11DeviceContext_OMSetBlendState(g_context, (ID3D11BlendState *)state, NULL, 0xFFFFFFFFu);
+      ID3D11DeviceContext_PSSetShader(g_context, ps, NULL, 0);
+      bind_floats(vb);
+      ID3D11DeviceContext_Draw(g_context, 6, 0);
+      ID3D11BlendState1_Release(state);
+      if (texture2d_read(target, 0, texels, 4) && texels[32 * SIZE + 32] == tests[i].colour && texels[5 * SIZE + 60] == tests[i].colour) ++good;
+      else printf("d3d11test: logic op %u gave %08x, not %08x\n", (unsigned)tests[i].op, (unsigned)texels[32 * SIZE + 32], (unsigned)tests[i].colour);
+    }
+    check(good == 16, "the sixteen logic operations on an R8G8B8A8_UINT target");
+    ID3D11DeviceContext_OMSetBlendState(g_context, NULL, NULL, 0xFFFFFFFFu);
+    ID3D11DeviceContext_OMSetRenderTargets(g_context, 1, &g_target_view, NULL);
+    if (vb) ID3D11Buffer_Release(vb);
+    if (ps) ID3D11PixelShader_Release(ps);
+    if (rtv) ID3D11RenderTargetView_Release(rtv);
+    if (target) ID3D11Texture2D_Release(target);
+    if (device1) ID3D11Device1_Release(device1);
+  }
+  ID3D11DeviceContext_RSSetState(g_context, g_no_cull);
+  ID3D11DeviceContext_OMSetDepthStencilState(g_context, NULL, 0);
+}
+
+/* ---- sampler state: border colours of any value, fractional levels of detail, anisotropic filtering ------------------------------------------------------------------------ */
+
+/* A texture of `levels` levels, each one grey (shades[level] in every channel, opaque), w x h at level 0. */
+static ID3D11ShaderResourceView *grey_levels(UINT w, UINT h, UINT levels, const BYTE *shades, ID3D11Texture2D **out) {
+  static UINT32 texels[256 * 64];
+  D3D11_SUBRESOURCE_DATA initial[8];
+  UINT32 *at = texels;
+  for (UINT l = 0; l < levels && l < 8; ++l) {
+    const UINT lw = w >> l ? w >> l : 1, lh = h >> l ? h >> l : 1;
+    for (UINT i = 0; i < lw * lh; ++i) at[i] = 0xFF000000u | shades[l] * 0x010101u;
+    initial[l].pSysMem = at, initial[l].SysMemPitch = lw * 4, initial[l].SysMemSlicePitch = 0;
+    at += lw * lh;
+  }
+  D3D11_TEXTURE2D_DESC desc = {w, h, levels, 1, DXGI_FORMAT_B8G8R8A8_UNORM, {1, 0}, D3D11_USAGE_DEFAULT, D3D11_BIND_SHADER_RESOURCE, 0, 0};
+  ID3D11Texture2D *t = NULL;
+  ID3D11ShaderResourceView *view = NULL;
+  if (SUCCEEDED(ID3D11Device_CreateTexture2D(g_device, &desc, initial, &t))) ID3D11Device_CreateShaderResourceView(g_device, (ID3D11Resource *)t, NULL, &view);
+  *out = t;
+  return view;
+}
+/* Draws a quad over the whole target with texture coordinates (0, 0) .. (su, sv) - vs.dxbc's coordinate is twice the colour - sampling with `sampler` through ps_show; the
+ * pixel in the middle. */
+static UINT32 sample_quad(ID3D11ShaderResourceView *view, const D3D11_SAMPLER_DESC *sd, float u0, float v0, float u1, float v1) {
+  const VertexF v[6] = {{-1, 1, 0.5f, u0 / 2, v0 / 2, 1, 1}, {1, 1, 0.5f, u1 / 2, v0 / 2, 1, 1}, {-1, -1, 0.5f, u0 / 2, v1 / 2, 1, 1},
+                        {-1, -1, 0.5f, u0 / 2, v1 / 2, 1, 1}, {1, 1, 0.5f, u1 / 2, v0 / 2, 1, 1}, {1, -1, 0.5f, u1 / 2, v1 / 2, 1, 1}};
+  ID3D11Buffer *vb = make_buffer(D3D11_BIND_VERTEX_BUFFER, D3D11_USAGE_DEFAULT, 0, v, sizeof v);
+  ID3D11PixelShader *show = NULL;
+  ID3D11Device_CreatePixelShader(g_device, dx_ps_show_dxbc, sizeof dx_ps_show_dxbc, NULL, &show);
+  ID3D11SamplerState *sampler = NULL;
+  ID3D11Device_CreateSamplerState(g_device, sd, &sampler);
+  UINT32 result = 0;
+  if (vb && show && sampler && view) {
+    begin(NULL);
+    clear(0, 0, 0);
+    ID3D11DeviceContext_PSSetShader(g_context, show, NULL, 0);
+    ID3D11DeviceContext_PSSetShaderResources(g_context, 0, 1, &view);
+    ID3D11DeviceContext_PSSetSamplers(g_context, 0, 1, &sampler);
+    bind_floats(vb);
+    ID3D11DeviceContext_Draw(g_context, 6, 0);
+    read_target();
+    result = pixel(32, 32);
+    ID3D11ShaderResourceView *none = NULL;
+    ID3D11DeviceContext_PSSetShaderResources(g_context, 0, 1, &none);
+  }
+  if (sampler) ID3D11SamplerState_Release(sampler);
+  if (show) ID3D11PixelShader_Release(show);
+  if (vb) ID3D11Buffer_Release(vb);
+  return result;
+}
+static int grey_near(UINT32 p, int value) { return red(p) >= value - 2 && red(p) <= value + 2 && green(p) == red(p) && blue(p) == red(p); }
+
+/* Several viewports (RSSetViewports of two, RSGetViewports): a geometry shader sends triangle n to viewport n; and what OPTIONS3 says of the layer and viewport from a vertex shader. */
+static void test_viewports(int software) {
+  ID3D11GeometryShader *gs = NULL;
+  ID3D11Device_CreateGeometryShader(g_device, dx_gs_viewport_dxbc, sizeof dx_gs_viewport_dxbc, NULL, &gs);
+  const VertexF v[9] = {{-1, -1, 0.5f, 1, 0, 0, 1}, {-1, 3, 0.5f, 1, 0, 0, 1}, {3, -1, 0.5f, 1, 0, 0, 1},
+                        {-1, -1, 0.5f, 0, 1, 0, 1}, {-1, 3, 0.5f, 0, 1, 0, 1}, {3, -1, 0.5f, 0, 1, 0, 1},
+                        {-0.4f, -0.4f, 0.5f, 0, 0, 1, 1}, {0.0f, 0.4f, 0.5f, 0, 0, 1, 1}, {0.4f, -0.4f, 0.5f, 0, 0, 1, 1}};
+  ID3D11Buffer *vb = make_buffer(D3D11_BIND_VERTEX_BUFFER, D3D11_USAGE_DEFAULT, 0, v, sizeof v);
+  begin(NULL);
+  clear(0, 0, 0);
+  const D3D11_VIEWPORT halves[2] = {{0, 0, SIZE / 2, SIZE, 0, 1}, {SIZE / 2, 0, SIZE / 2, SIZE, 0, 1}};
+  ID3D11DeviceContext_RSSetViewports(g_context, 2, halves);
+  D3D11_VIEWPORT back[3];
+  UINT count = 0;
+  ID3D11DeviceContext_RSGetViewports(g_context, &count, NULL);
+  check(count == 2, "RSGetViewports: two viewports bound");
+  ID3D11DeviceContext_PSSetShader(g_context, g_ps_color, NULL, 0);
+  ID3D11DeviceContext_GSSetShader(g_context, gs, NULL, 0);
+  bind_floats(vb);
+  ID3D11DeviceContext_Draw(g_context, 9, 0);
+  ID3D11DeviceContext_GSSetShader(g_context, NULL, NULL, 0);
+  read_target();
+  printf("d3d11test: viewports %08x %08x %08x\n", (unsigned)pixel(4, 4), (unsigned)pixel(60, 4), (unsigned)pixel(16, 32));
+  check(gs && vb && pixel(4, 4) == 0xFFFF0000u && pixel(60, 60) == 0xFF00FF00u && pixel(16, 32) == 0xFF0000FFu,
+        "SV_ViewportArrayIndex: each triangle in its viewport, an index past the ones set in the first");
+  count = 3;
+  ID3D11DeviceContext_RSGetViewports(g_context, &count, back);
+  check(back[1].TopLeftX == SIZE / 2 && back[2].Width == 0, "RSGetViewports gives them back, zeros after");
+  D3D11_FEATURE_DATA_D3D11_OPTIONS3 o3;
+  memset(&o3, 0xCC, sizeof o3);
+  check(SUCCEEDED(ID3D11Device_CheckFeatureSupport(g_device, D3D11_FEATURE_D3D11_OPTIONS3, &o3, sizeof o3)) && o3.VPAndRTArrayIndexFromAnyShaderFeedingRasterizer == software,
+        "D3D11_FEATURE_D3D11_OPTIONS3: the layer and viewport from a vertex shader on the CPU renderer");
+  if (vb) ID3D11Buffer_Release(vb);
+  if (gs) ID3D11GeometryShader_Release(gs);
+}
+
+static void test_sampler_state(void) {
+  IDXGIDevice *dxgi = NULL;
+  IDXGIAdapter *adapter = NULL;
+  DXGI_ADAPTER_DESC1 ad;
+  memset(&ad, 0, sizeof ad);
+  ID3D11Device_QueryInterface(g_device, &IID_IDXGIDevice, (void **)&dxgi);
+  if (dxgi && SUCCEEDED(IDXGIDevice_GetAdapter(dxgi, &adapter)) && adapter) {
+    IDXGIAdapter1 *a1 = NULL;
+    if (SUCCEEDED(IDXGIAdapter_QueryInterface(adapter, &IID_IDXGIAdapter1, (void **)&a1)) && a1) {
+      IDXGIAdapter1_GetDesc1(a1, &ad);
+      IDXGIAdapter1_Release(a1);
+    }
+    IDXGIAdapter_Release(adapter);
+  }
+  if (dxgi) IDXGIDevice_Release(dxgi);
+  const int software = (ad.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) != 0;
+  test_viewports(software);
+  D3D11_SAMPLER_DESC sd;
+  memset(&sd, 0, sizeof sd);
+  sd.Filter = D3D11_FILTER_MIN_MAG_MIP_POINT;
+  sd.AddressU = sd.AddressV = sd.AddressW = D3D11_TEXTURE_ADDRESS_BORDER;
+  sd.ComparisonFunc = D3D11_COMPARISON_NEVER;
+  sd.MaxLOD = 3.402823466e+38f;
+  /* D3D11_TEXTURE_ADDRESS_BORDER with a BorderColor of any value */
+  const BYTE white[3] = {255, 0, 255};
+  ID3D11Texture2D *tex = NULL;
+  ID3D11ShaderResourceView *view = grey_levels(2, 2, 1, white, &tex);
+  sd.BorderColor[0] = 0.2f, sd.BorderColor[1] = 0.4f, sd.BorderColor[2] = 0.6f, sd.BorderColor[3] = 1.0f;
+  const UINT32 border = sample_quad(view, &sd, 2.0f, 2.0f, 3.0f, 3.0f), inside = sample_quad(view, &sd, 0, 0, 1, 1);
+  printf("d3d11test: border colour %08x, inside %08x\n", (unsigned)border, (unsigned)inside);
+  check(border == 0xFF336699u && inside == 0xFFFFFFFFu, "D3D11_TEXTURE_ADDRESS_BORDER with the BorderColor (0.2, 0.4, 0.6, 1)");
+  if (view) ID3D11ShaderResourceView_Release(view);
+  if (tex) ID3D11Texture2D_Release(tex);
+  /* Fractional levels of detail, levels of one grey each (255, 0, 255): MaxLOD 0.3 of a texture drawn minified (lambda 2): 0.7 of level 0 and 0.3 of level 1, 178.5; MinLOD 0.3
+   * of one drawn at its size (lambda 0); MipLODBias 0.3 the same (a step of 1 / 16 would make them 191) */
+  {
+    const BYTE shades[3] = {255, 0, 255};
+    view = grey_levels(64, 64, 3, shades, &tex);
+    sd.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
+    sd.AddressU = sd.AddressV = sd.AddressW = D3D11_TEXTURE_ADDRESS_WRAP;
+    sd.MaxLOD = 0.3f;
+    const UINT32 max_lod = sample_quad(view, &sd, 0, 0, 4, 4);
+    sd.MaxLOD = 3.402823466e+38f, sd.MinLOD = 0.3f;
+    const UINT32 min_lod = sample_quad(view, &sd, 0, 0, 1, 1);
+    sd.MinLOD = 0, sd.MipLODBias = 0.3f;
+    const UINT32 bias = sample_quad(view, &sd, 0, 0, 1, 1);
+    printf("d3d11test: MaxLOD 0.3 %08x, MinLOD 0.3 %08x, MipLODBias 0.3 %08x\n", (unsigned)max_lod, (unsigned)min_lod, (unsigned)bias);
+    check(grey_near(max_lod, 178) && grey_near(min_lod, 178) && grey_near(bias, 178), "MaxLOD, MinLOD and MipLODBias of 0.3 as they are");
+    sd.MipLODBias = 0;
+    if (view) ID3D11ShaderResourceView_Release(view);
+    if (tex) ID3D11Texture2D_Release(tex);
+  }
+  /* Anisotropic filtering: a 256 x 64 texture over the 64 x 64 target, four texels a pixel across and one down (levels 255, 128, 0): trilinear filtering reads level 2
+   * (lambda 2, black); D3D11_FILTER_ANISOTROPIC of 2 takes two lookups at lambda 1 (128) and of 4 four at lambda 0 (white) */
+  {
+    const BYTE shades[3] = {255, 128, 0};
+    view = grey_levels(256, 64, 3, shades, &tex);
+    sd.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
+    const UINT32 trilinear = sample_quad(view, &sd, 0, 0, 1, 1);
+    sd.Filter = D3D11_FILTER_ANISOTROPIC;
+    sd.MaxAnisotropy = 2;
+    const UINT32 two = sample_quad(view, &sd, 0, 0, 1, 1);
+    sd.MaxAnisotropy = 4;
+    const UINT32 four = sample_quad(view, &sd, 0, 0, 1, 1);
+    printf("d3d11test: trilinear %08x, anisotropy 2 %08x, 4 %08x (%s)\n", (unsigned)trilinear, (unsigned)two, (unsigned)four, software ? "the CPU renderer" : "hardware");
+    check(grey_near(trilinear, 0), "a texture four times narrower than it is high: trilinear filtering reads the level of the longer axis");
+    /* (the CPU renderer filters as EXT_texture_filter_anisotropic's reference; how a GPU does is its own - virglrenderer 1.3.0 leaves the anisotropy of its sampler objects out) */
+    if (software) check(grey_near(two, 128) && grey_near(four, 255), "D3D11_FILTER_ANISOTROPIC: MaxAnisotropy lookups along the longer axis, at the level of the shorter");
+    else check(red(two) >= red(trilinear) && red(four) >= red(two), "D3D11_FILTER_ANISOTROPIC: no blurrier than trilinear filtering");
+    if (view) ID3D11ShaderResourceView_Release(view);
+    if (tex) ID3D11Texture2D_Release(tex);
+  }
+}
+
 int main(void) {
   test_device();
   if (g_device && g_context) {
@@ -4188,6 +4628,8 @@ int main(void) {
       test_formats();
       test_creation_and_interop();
       test_render_to_levels();
+      test_fixed_state();
+      test_sampler_state();
       test_texture_uavs();
       test_pixel_texture_uavs();
       test_layered_target();

@@ -84,6 +84,7 @@ struct D3d9Program::State {
   const ByteView* storage = nullptr;   // the storage buffers: a compute shader's, or those a draw's shaders can read (kMaxStorageBuffers views)
   const graphics::IStorageImages* images = nullptr;   // the storage images (compute and pixel shaders)
   Q layer = {{0, 0, 0, 0}};             // a geometry shader's SV_RenderTargetArrayIndex output (the integer in x)
+  Q viewport = {{0, 0, 0, 0}};          // ... and its SV_ViewportArrayIndex (of a vertex or domain shader too)
   const graphics::GeometryInputData* geometry_in = nullptr;
   const graphics::HullInputData* hull_in = nullptr;        // a hull shader's input control points
   const graphics::HullOutputData* patch_in = nullptr;      // a domain shader's patch (control points and constants)
@@ -137,6 +138,14 @@ int8_t semantic_slot(uint32_t usage, uint32_t index) {
 
 }  // namespace
 
+uint32_t D3d9Program::layer_out(const float* layer, const float* viewport) const {
+  (void)viewport;
+  return __builtin_bit_cast(uint32_t, layer[layer_component_ & 3]);
+}
+uint32_t D3d9Program::viewport_out(const float* layer, const float* viewport) const {
+  return __builtin_bit_cast(uint32_t, (viewport_shares_layer_ ? layer : viewport)[viewport_component_ & 3]);
+}
+
 uint32_t D3d9Program::required_features2() const {
   const bool images = image_mask_.any();
   uint32_t needed = images ? graphics::kFeature2StorageImages : 0u;
@@ -145,6 +154,8 @@ uint32_t D3d9Program::required_features2() const {
   for (ImageDim d : image_dim_)
     if (d == ImageDim::Buffer) needed |= graphics::kFeature2TexelBuffers;
   if (writes_layer_) needed |= graphics::kFeature2LayeredTargets;
+  if (writes_viewport_) needed |= graphics::kFeature2Viewports;
+  if (layer_before_geometry_) needed |= graphics::kFeature2LayerFromAnyStage;
   return needed;
 }
 
@@ -584,7 +595,7 @@ void D3d9Program::execute(State& s, uint64_t begin, uint64_t end) const {
       case kTemp: target = &s.r[d.number]; break;
       case kAddrTex: target = &s.a0; break;
       case kPatchOut: target = d.number < graphics::kMaxPatchRegisters ? &s.patch_out[d.number] : nullptr; break;
-      case kRastOut: target = d.slot == kSlotLayer ? &s.layer : &s.pos; break;
+      case kRastOut: target = d.slot == kSlotLayer ? &s.layer : d.slot == kSlotViewport ? &s.viewport : &s.pos; break;
       case kAttrOut:
       case kTexCrdOut: target = d.slot == kSlotPosition ? &s.pos : d.slot >= 0 ? &s.var[d.slot] : nullptr; break;
       case kColorOut: target = d.slot >= 0 && d.slot < static_cast<int8_t>(graphics::kMaxColorTargets) ? &s.color[d.slot] : nullptr; break;
@@ -733,7 +744,8 @@ void D3d9Program::execute(State& s, uint64_t begin, uint64_t end) const {
         graphics::ShaderIo& v = out->vertex[out->count];
         v.position = {s.pos.f[0], -s.pos.f[1], s.pos.f[2], s.pos.f[3]};
         for (uint32_t i = 0; i < graphics::kMaxVaryings; ++i) v.varying[i] = {s.var[i].f[0], s.var[i].f[1], s.var[i].f[2], s.var[i].f[3]};
-        v.layer = bits_of(s.layer.f[0]);
+        v.layer = layer_out(s.layer.f, s.viewport.f);
+        v.viewport = viewport_out(s.layer.f, s.viewport.f);
         const uint32_t stream = ins.control < graphics::kMaxGeometryStreams ? ins.control : 0;
         out->restart[out->count] = s.geometry_cut[stream];
         out->stream[out->count] = static_cast<uint8_t>(stream);
@@ -1272,6 +1284,8 @@ void D3d9Program::run_vertex_ex(const graphics::Vec4* attributes, const uint8_t*
   execute(s);
   out->position = {s.pos.f[0], -s.pos.f[1], s.pos.f[2], s.pos.f[3]};   // (Direct3D's +Y up to the device's +Y down)
   for (uint32_t i = 0; i < graphics::kMaxVaryings; ++i) out->varying[i] = {s.var[i].f[0], s.var[i].f[1], s.var[i].f[2], s.var[i].f[3]};
+  out->layer = layer_out(s.layer.f, s.viewport.f);         // (SV_RenderTargetArrayIndex and SV_ViewportArrayIndex of a vertex shader: 0 when it writes neither)
+  out->viewport = viewport_out(s.layer.f, s.viewport.f);
 }
 
 bool D3d9Program::run_fragment(const graphics::Vec4* varyings, const uint8_t* constants, const graphics::ITextureSet* textures, graphics::Vec4* color) const {
@@ -1335,6 +1349,8 @@ void D3d9Program::run_domain(const graphics::HullOutputData& patch, float u, flo
   execute(s);
   out->position = {s.pos.f[0], -s.pos.f[1], s.pos.f[2], s.pos.f[3]};
   for (uint32_t i = 0; i < graphics::kMaxVaryings; ++i) out->varying[i] = {s.var[i].f[0], s.var[i].f[1], s.var[i].f[2], s.var[i].f[3]};
+  out->layer = layer_out(s.layer.f, s.viewport.f);
+  out->viewport = viewport_out(s.layer.f, s.viewport.f);
 }
 
 void D3d9Program::run_geometry(const graphics::GeometryInputData& input, const uint8_t* constants, graphics::GeometryOutputData* output) const {

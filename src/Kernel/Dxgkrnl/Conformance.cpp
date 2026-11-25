@@ -976,6 +976,315 @@ void scene_instancing(Rig& rig, ArrayView<uint32_t> out) {
   rig.read(target, out);
 }
 
+// --- The rasterizer, depth-stencil and blend state of Direct3D 10 and 11 (kFeature2RasterizerState, kFeature2DualSourceBlend, kFeature2LogicOps) -------------------------------
+
+// A quad over the band y0 .. y1 of the picture (clip space), its depth running from z_left to z_right across, of one colour: two triangles.
+void band_quad(Vertex* v, float y0, float y1, float z_left, float z_right, float r, float g, float b) {
+  const Vertex corners[4] = {{-1, y0, z_left, r, g, b, 1}, {1, y0, z_right, r, g, b, 1}, {-1, y1, z_left, r, g, b, 1}, {1, y1, z_right, r, g, b, 1}};
+  v[0] = corners[0], v[1] = corners[1], v[2] = corners[2], v[3] = corners[2], v[4] = corners[1], v[5] = corners[3];
+}
+
+// Depth bias of a float depth format (r = 2^(e - 23)). Four bands: each is first drawn red with its depth written, then again with Less and a bias. Band 0 at z 0.5 with DepthBias -8
+// (toward the viewer: green), band 1 the same with +8 (behind: stays red); bands 2 and 3 run from z 0.3 to 0.7 across and are drawn again 0.001 behind with SlopeScaledDepthBias -1
+// (a bias of 0.4 / 32 per pixel toward the viewer: blue), band 3 with DepthBiasClamp -0.0005 (the bias held to 0.0005: stays red).
+void scene_depth_bias(Rig& rig, ArrayView<uint32_t> out) {
+  if (!rig.has(graphics::kFeatureBlendState) || !(rig.caps().features2 & graphics::kFeature2RasterizerState)) return void(rig.step("depth bias", status::kNotSupported));
+  Vertex v[48];
+  band_quad(&v[0], -1.0f, -0.5f, 0.5f, 0.5f, 1, 0, 0), band_quad(&v[6], -0.5f, 0.0f, 0.5f, 0.5f, 1, 0, 0), band_quad(&v[12], 0.0f, 0.5f, 0.3f, 0.7f, 1, 0, 0), band_quad(&v[18], 0.5f, 1.0f, 0.3f, 0.7f, 1, 0, 0);
+  band_quad(&v[24], -1.0f, -0.5f, 0.5f, 0.5f, 0, 1, 0), band_quad(&v[30], -0.5f, 0.0f, 0.5f, 0.5f, 0, 1, 0), band_quad(&v[36], 0.0f, 0.5f, 0.301f, 0.701f, 0, 0, 1), band_quad(&v[42], 0.5f, 1.0f, 0.301f, 0.701f, 0, 0, 1);
+  Handle vs = rig.vertex_shader(bytes_of(kVertexTokens, sizeof kVertexTokens), ShaderKind::D3d9Bytecode);
+  Handle ps = rig.pixel_shader(bytes_of(kPixelTokens, sizeof kPixelTokens), ShaderKind::D3d9Bytecode);
+  PipelineDesc base = colour_pipeline_desc(vs, ps);
+  base.depth_test = base.depth_write = true;
+  base.depth_compare = graphics::CompareOp::Less;
+  PipelineDesc toward = base, away = base, slope = base, clamped = base;
+  toward.depth_write = away.depth_write = slope.depth_write = clamped.depth_write = false;
+  toward.depth_bias.constant = -8, away.depth_bias.constant = 8;
+  slope.depth_bias.slope = -1.0f;
+  clamped.depth_bias.slope = -1.0f, clamped.depth_bias.clamp = -0.0005f;
+  Handle pipes[5] = {rig.pipeline(base), rig.pipeline(toward), rig.pipeline(away), rig.pipeline(slope), rig.pipeline(clamped)};
+  Handle target = rig.image(kAllocRenderTarget, Format::A8R8G8B8, kSize, kSize);
+  Handle depth = rig.image(kAllocDepthStencil, Format::D32Float, kSize, kSize);
+  Handle vb = rig.buffer(kAllocVertexBuffer, bytes_of(v, sizeof v));
+  CommandWriter w(rig.allocator());
+  begin(w, 0, 1, {0, 0, 0, 1});
+  w.bind_vertex_buffer(2);
+  w.push_constants(bytes_of(kIdentity, sizeof kIdentity));
+  w.bind_pipeline(pipes[0]);
+  w.draw(24, 0);
+  for (uint32_t band = 0; band < 4; ++band) {
+    w.bind_pipeline(pipes[1 + band]);
+    w.draw(6, 24 + 6 * band);
+  }
+  w.end_pass();
+  rig.render(w, {target, depth, vb});
+  rig.read(target, out);
+}
+
+// Depth bias of normalised formats (r = 1 / (2^n - 1)), which the GPU's float depth buffer does not count in. Every band is first drawn red at z 0.125 (bands 0 - 3) or running
+// 0.3 .. 0.7 (band 4 - the bottom quarter is bands 4 and 5 side by side... drawn as one band here), then 2e-6 nearer (bands 0 - 3) or 0.001 behind (band 4) with Less and a bias:
+// band 0 DepthBias 1 in 16-bit units (1.5e-5 behind: stays red), band 1 the same in float units (1.5e-8: green), band 2 DepthBias 1 in 24-bit units (6e-8: green), band 3 DepthBias
+// 100 in 24-bit units (6e-6: stays red), band 4 SlopeScaledDepthBias -1 in 16-bit units (blue).
+void scene_depth_bias_unorm(Rig& rig, ArrayView<uint32_t> out) {
+  if (!rig.has(graphics::kFeatureBlendState) || !(rig.caps().features2 & graphics::kFeature2RasterizerState)) return void(rig.step("depth bias", status::kNotSupported));
+  Vertex v[60];
+  const float y[6] = {-1.0f, -0.6f, -0.2f, 0.2f, 0.6f, 1.0f};
+  for (uint32_t band = 0; band < 4; ++band) {
+    band_quad(&v[6 * band], y[band], y[band + 1], 0.125f, 0.125f, 1, 0, 0);
+    band_quad(&v[30 + 6 * band], y[band], y[band + 1], 0.125f - 2e-6f, 0.125f - 2e-6f, 0, 1, 0);
+  }
+  band_quad(&v[24], y[4], y[5], 0.3f, 0.7f, 1, 0, 0);
+  band_quad(&v[54], y[4], y[5], 0.301f, 0.701f, 0, 0, 1);
+  Handle vs = rig.vertex_shader(bytes_of(kVertexTokens, sizeof kVertexTokens), ShaderKind::D3d9Bytecode);
+  Handle ps = rig.pixel_shader(bytes_of(kPixelTokens, sizeof kPixelTokens), ShaderKind::D3d9Bytecode);
+  PipelineDesc base = colour_pipeline_desc(vs, ps);
+  base.depth_test = base.depth_write = true;
+  base.depth_compare = graphics::CompareOp::Less;
+  PipelineDesc biased[5] = {base, base, base, base, base};
+  for (PipelineDesc& b : biased) b.depth_write = false;
+  biased[0].depth_bias.constant = 1, biased[0].depth_bias.unorm_bits = 16;
+  biased[1].depth_bias.constant = 1;
+  biased[2].depth_bias.constant = 1, biased[2].depth_bias.unorm_bits = 24;
+  biased[3].depth_bias.constant = 100, biased[3].depth_bias.unorm_bits = 24;
+  biased[4].depth_bias.slope = -1.0f, biased[4].depth_bias.unorm_bits = 16;
+  Handle first = rig.pipeline(base);
+  Handle pipes[5];
+  for (uint32_t i = 0; i < 5; ++i) pipes[i] = rig.pipeline(biased[i]);
+  Handle target = rig.image(kAllocRenderTarget, Format::A8R8G8B8, kSize, kSize);
+  Handle depth = rig.image(kAllocDepthStencil, Format::D32Float, kSize, kSize);
+  Handle vb = rig.buffer(kAllocVertexBuffer, bytes_of(v, sizeof v));
+  CommandWriter w(rig.allocator());
+  begin(w, 0, 1, {0, 0, 0, 1});
+  w.bind_vertex_buffer(2);
+  w.push_constants(bytes_of(kIdentity, sizeof kIdentity));
+  w.bind_pipeline(first);
+  w.draw(30, 0);
+  for (uint32_t band = 0; band < 5; ++band) {
+    w.bind_pipeline(pipes[band]);
+    w.draw(6, 30 + 6 * band);
+  }
+  w.end_pass();
+  rig.render(w, {target, depth, vb});
+  rig.read(target, out);
+}
+
+// The back faces' own stencil state: a back-facing triangle (left, red) inverts the stencil through the write mask 0x0F, a front-facing one (right, yellow) replaces it with 1; then
+// a front-facing quad over everything draws green where the stencil is 1, and a back-facing one, whose front faces would never pass, white where it is 0x0F.
+void scene_stencil_two_sided(Rig& rig, ArrayView<uint32_t> out) {
+  if (!(rig.caps().features2 & graphics::kFeature2RasterizerState) || !rig.caps().stencil) return void(rig.step("two-sided stencil", status::kNotSupported));
+  // (the vertex shader has +y up, the front is counter-clockwise on the screen: the first triangle faces away, the second toward the viewer; the green quad faces the viewer, the
+  // white one away)
+  const Vertex v[12] = {{-0.9f, -0.8f, 0.5f, 1, 0, 0, 1}, {-0.9f, 0.8f, 0.5f, 1, 0, 0, 1}, {-0.1f, 0.0f, 0.5f, 1, 0, 0, 1},
+                        {0.1f, 0.0f, 0.5f, 1, 1, 0, 1}, {0.9f, -0.8f, 0.5f, 1, 1, 0, 1}, {0.9f, 0.8f, 0.5f, 1, 1, 0, 1},
+                        {-1, -1, 0.5f, 0, 1, 0, 1}, {-1, 3, 0.5f, 0, 1, 0, 1}, {3, -1, 0.5f, 0, 1, 0, 1},
+                        {-1, -1, 0.5f, 1, 1, 1, 1}, {-1, 3, 0.5f, 1, 1, 1, 1}, {3, -1, 0.5f, 1, 1, 1, 1}};
+  Handle vs = rig.vertex_shader(bytes_of(kVertexTokens, sizeof kVertexTokens), ShaderKind::D3d9Bytecode);
+  Handle ps = rig.pixel_shader(bytes_of(kPixelTokens, sizeof kPixelTokens), ShaderKind::D3d9Bytecode);
+  PipelineDesc mark = colour_pipeline_desc(vs, ps);
+  mark.stencil.enable = true, mark.stencil.reference = 1;
+  mark.stencil.compare = graphics::CompareOp::Always, mark.stencil.pass_op = graphics::StencilOp::Replace;
+  mark.separate_back_stencil = true, mark.back_stencil.reference = 1;
+  mark.back_stencil.compare = graphics::CompareOp::Always, mark.back_stencil.pass_op = graphics::StencilOp::Invert, mark.back_stencil.write_mask = 0x0F;
+  PipelineDesc front_test = colour_pipeline_desc(vs, ps), back_test = front_test;
+  front_test.stencil.enable = true, front_test.stencil.reference = 1, front_test.stencil.compare = graphics::CompareOp::Equal;
+  back_test.stencil.enable = true, back_test.stencil.reference = 0x0F, back_test.stencil.compare = graphics::CompareOp::Never;
+  back_test.separate_back_stencil = true, back_test.back_stencil.compare = graphics::CompareOp::Equal, back_test.back_stencil.reference = 0x0F;
+  Handle pipes[3] = {rig.pipeline(mark), rig.pipeline(front_test), rig.pipeline(back_test)};
+  Handle target = rig.image(kAllocRenderTarget, Format::A8R8G8B8, kSize, kSize);
+  Handle depth = rig.image(kAllocDepthStencil, Format::D24S8, kSize, kSize);
+  Handle vb = rig.buffer(kAllocVertexBuffer, bytes_of(v, sizeof v));
+  CommandWriter w(rig.allocator());
+  begin(w, 0, 1, {0, 0, 0, 1});
+  w.bind_vertex_buffer(2);
+  w.push_constants(bytes_of(kIdentity, sizeof kIdentity));
+  for (uint32_t i = 0; i < 3; ++i) {
+    w.bind_pipeline(pipes[i]);
+    w.draw(i == 0 ? 6 : 3, i == 0 ? 0 : 3 + 3 * i);
+  }
+  w.end_pass();
+  rig.render(w, {target, depth, vb});
+  rig.read(target, out);
+}
+
+// Wireframe: a front-facing and a back-facing triangle drawn as their edges (no culling), and a third with back faces culled, which is back-facing and so not drawn at all.
+void scene_wireframe(Rig& rig, ArrayView<uint32_t> out) {
+  if (!(rig.caps().features2 & graphics::kFeature2RasterizerState)) return void(rig.step("wireframe", status::kNotSupported));
+  const Vertex v[9] = {{-0.83f, -0.77f, 0.5f, 1, 0, 0, 1}, {-0.79f, 0.71f, 0.5f, 1, 0, 0, 1}, {-0.13f, 0.07f, 0.5f, 1, 0, 0, 1},
+                       {0.11f, -0.09f, 0.5f, 0, 1, 0, 1}, {0.83f, 0.73f, 0.5f, 0, 1, 0, 1}, {0.77f, -0.81f, 0.5f, 0, 1, 0, 1},
+                       {-0.5f, 0.2f, 0.5f, 0, 0, 1, 1}, {0.0f, 0.8f, 0.5f, 0, 0, 1, 1}, {0.5f, 0.2f, 0.5f, 0, 0, 1, 1}};
+  Handle vs = rig.vertex_shader(bytes_of(kVertexTokens, sizeof kVertexTokens), ShaderKind::D3d9Bytecode);
+  Handle ps = rig.pixel_shader(bytes_of(kPixelTokens, sizeof kPixelTokens), ShaderKind::D3d9Bytecode);
+  PipelineDesc lines = colour_pipeline_desc(vs, ps), culled = lines;
+  lines.fill_mode = culled.fill_mode = graphics::FillMode::Wireframe;
+  culled.cull_mode = graphics::CullMode::Back;
+  Handle pipes[2] = {rig.pipeline(lines), rig.pipeline(culled)};
+  Handle target = rig.image(kAllocRenderTarget, Format::A8R8G8B8, kSize, kSize);
+  Handle vb = rig.buffer(kAllocVertexBuffer, bytes_of(v, sizeof v));
+  CommandWriter w(rig.allocator());
+  begin(w, 0, kNoAllocation, {0, 0, 0, 1});
+  w.bind_vertex_buffer(1);
+  w.push_constants(bytes_of(kIdentity, sizeof kIdentity));
+  w.bind_pipeline(pipes[0]);
+  w.draw(6, 0);
+  w.bind_pipeline(pipes[1]);
+  w.draw(3, 6);
+  w.end_pass();
+  rig.render(w, {target, vb});
+  rig.read(target, out);
+}
+
+// Depth clipping: four triangles whose depth runs past the far plane (top: 0.5 .. 1.5) or the near one (bottom: 0.5 .. -0.5) toward their lower corner. Those on the left are clipped
+// there; those on the right are not, their depth clamped to 1 and 0 instead (drawn with LessEqual against a buffer of 1: all of them shows).
+void scene_depth_clip(Rig& rig, ArrayView<uint32_t> out) {
+  if (!rig.has(graphics::kFeatureBlendState) || !(rig.caps().features2 & graphics::kFeature2RasterizerState)) return void(rig.step("depth clip", status::kNotSupported));
+  const Vertex v[12] = {{-0.95f, -0.95f, 0.5f, 1, 0, 0, 1}, {-0.05f, -0.95f, 0.5f, 1, 0, 0, 1}, {-0.5f, -0.05f, 1.5f, 1, 0, 0, 1},
+                        {-0.95f, 0.05f, 0.5f, 0, 0, 1, 1}, {-0.05f, 0.05f, 0.5f, 0, 0, 1, 1}, {-0.5f, 0.95f, -0.5f, 0, 0, 1, 1},
+                        {0.05f, -0.95f, 0.5f, 0, 1, 0, 1}, {0.95f, -0.95f, 0.5f, 0, 1, 0, 1}, {0.5f, -0.05f, 1.5f, 0, 1, 0, 1},
+                        {0.05f, 0.05f, 0.5f, 1, 1, 0, 1}, {0.95f, 0.05f, 0.5f, 1, 1, 0, 1}, {0.5f, 0.95f, -0.5f, 1, 1, 0, 1}};
+  Handle vs = rig.vertex_shader(bytes_of(kVertexTokens, sizeof kVertexTokens), ShaderKind::D3d9Bytecode);
+  Handle ps = rig.pixel_shader(bytes_of(kPixelTokens, sizeof kPixelTokens), ShaderKind::D3d9Bytecode);
+  PipelineDesc clipped = colour_pipeline_desc(vs, ps), clamped = clipped;
+  clipped.depth_test = clamped.depth_test = true;
+  clamped.depth_clip = false;
+  Handle pipes[2] = {rig.pipeline(clipped), rig.pipeline(clamped)};
+  Handle target = rig.image(kAllocRenderTarget, Format::A8R8G8B8, kSize, kSize);
+  Handle depth = rig.image(kAllocDepthStencil, Format::D32Float, kSize, kSize);
+  Handle vb = rig.buffer(kAllocVertexBuffer, bytes_of(v, sizeof v));
+  CommandWriter w(rig.allocator());
+  begin(w, 0, 1, {0, 0, 0, 1});
+  w.bind_vertex_buffer(2);
+  w.push_constants(bytes_of(kIdentity, sizeof kIdentity));
+  w.bind_pipeline(pipes[0]);
+  w.draw(6, 0);
+  w.bind_pipeline(pipes[1]);
+  w.draw(6, 6);
+  w.end_pass();
+  rig.render(w, {target, depth, vb});
+  rig.read(target, out);
+}
+
+// Dual-source blending (ps_mrt.dxbc writes the colour to SV_Target0 and it with red and blue swapped to SV_Target1): into one target of grey 0.5, colour = source + destination *
+// the second source's colour, alpha = the source's.
+void scene_dual_source_blend(Rig& rig, ArrayView<uint32_t> out) {
+  if (!rig.has(graphics::kFeatureBlendState) || !(rig.caps().features2 & graphics::kFeature2DualSourceBlend)) return void(rig.step("dual-source blending", status::kNotSupported));
+  namespace b = conformance_blobs;
+  const Vertex v[3] = {{-0.9f, -0.9f, 0.5f, 0.6f, 0.2f, 0.1f, 1}, {0.9f, -0.9f, 0.5f, 0.6f, 0.2f, 0.1f, 1}, {0.0f, 0.9f, 0.5f, 0.6f, 0.2f, 0.1f, 1}};
+  Handle vs = rig.vertex_shader(bytes_of(b::k_vs, sizeof b::k_vs));
+  Handle ps = rig.pixel_shader(bytes_of(b::k_ps_mrt, sizeof b::k_ps_mrt));
+  PipelineDesc pd = colour_pipeline_desc(vs, ps);
+  pd.varying_count = 3;
+  pd.blend.custom = pd.blend.enable = true;
+  pd.blend.src_color = graphics::BlendFactor::One, pd.blend.dst_color = graphics::BlendFactor::Src1Color;
+  pd.blend.src_alpha = graphics::BlendFactor::One, pd.blend.dst_alpha = graphics::BlendFactor::InvSrc1Alpha;
+  Handle pipe = rig.pipeline(pd);
+  Handle target = rig.image(kAllocRenderTarget, Format::A8R8G8B8, kSize, kSize);
+  Handle vb = rig.buffer(kAllocVertexBuffer, bytes_of(v, sizeof v));
+  CommandWriter w(rig.allocator());
+  begin(w, 0, kNoAllocation, {0.5f, 0.5f, 0.5f, 1});
+  w.bind_pipeline(pipe);
+  w.bind_vertex_buffer(1);
+  w.push_constants(bytes_of(kIdentity, sizeof kIdentity));
+  w.draw(3);
+  w.end_pass();
+  rig.render(w, {target, vb});
+  rig.read(target, out);
+}
+
+// Logic operations on an 8-bit target cleared to (0.2, 0.4, 0.6, 1): a triangle of (1, 0.4, 0) XORed in, then one of (0.2, 1, 0.8) with OR_INVERTED (~source | destination)
+// over the right half, and a triangle whose write mask keeps green and alpha with SET.
+void scene_logic_ops(Rig& rig, ArrayView<uint32_t> out) {
+  if (!(rig.caps().features2 & graphics::kFeature2LogicOps)) return void(rig.step("logic operations", status::kNotSupported));
+  const Vertex v[9] = {{-0.9f, -0.9f, 0.5f, 1, 0.4f, 0, 1}, {0.7f, -0.9f, 0.5f, 1, 0.4f, 0, 1}, {-0.9f, 0.7f, 0.5f, 1, 0.4f, 0, 1},
+                       {0.0f, -0.9f, 0.5f, 0.2f, 1, 0.8f, 1}, {0.9f, -0.9f, 0.5f, 0.2f, 1, 0.8f, 1}, {0.9f, 0.9f, 0.5f, 0.2f, 1, 0.8f, 1},
+                       {-0.9f, 0.2f, 0.5f, 0, 0, 0, 0}, {0.2f, 0.9f, 0.5f, 0, 0, 0, 0}, {-0.9f, 0.9f, 0.5f, 0, 0, 0, 0}};
+  Handle vs = rig.vertex_shader(bytes_of(kVertexTokens, sizeof kVertexTokens), ShaderKind::D3d9Bytecode);
+  Handle ps = rig.pixel_shader(bytes_of(kPixelTokens, sizeof kPixelTokens), ShaderKind::D3d9Bytecode);
+  PipelineDesc xor_op = colour_pipeline_desc(vs, ps), or_inverted = xor_op, set = xor_op;
+  xor_op.logic_op_enable = or_inverted.logic_op_enable = set.logic_op_enable = true;
+  xor_op.logic_op = graphics::LogicOp::Xor, or_inverted.logic_op = graphics::LogicOp::OrInverted, set.logic_op = graphics::LogicOp::Set;
+  set.blend.custom = true, set.blend.write_mask = 0x2 | 0x8;
+  Handle pipes[3] = {rig.pipeline(xor_op), rig.pipeline(or_inverted), rig.pipeline(set)};
+  Handle target = rig.image(kAllocRenderTarget, Format::A8R8G8B8, kSize, kSize);
+  Handle vb = rig.buffer(kAllocVertexBuffer, bytes_of(v, sizeof v));
+  CommandWriter w(rig.allocator());
+  begin(w, 0, kNoAllocation, {0.2f, 0.4f, 0.6f, 1});
+  w.bind_vertex_buffer(1);
+  w.push_constants(bytes_of(kIdentity, sizeof kIdentity));
+  for (uint32_t i = 0; i < 3; ++i) {
+    w.bind_pipeline(pipes[i]);
+    w.draw(3, 3 * i);
+  }
+  w.end_pass();
+  rig.render(w, {target, vb});
+  rig.read(target, out);
+}
+
+// Border colours of any value (kFeature2SamplerState): the checker texture over a quad whose coordinates run from -0.5 to 1.5 (ps_show.dxbc), clamped to a border of (0.2, 0.4, 0.6) -
+// point filtered on the left, linear on the right (where the edge texels blend into the border).
+void scene_border_colour(Rig& rig, ArrayView<uint32_t> out) {
+  if (!(rig.caps().features & graphics::kFeatureAddressModes) || !(rig.caps().features2 & graphics::kFeature2SamplerState)) return void(rig.step("border colours", status::kNotSupported));
+  namespace b = conformance_blobs;
+  Handle pipe = dxbc_pipeline(rig, b::k_vs, sizeof b::k_vs, b::k_ps_show, sizeof b::k_ps_show, 1);
+  Handle target = rig.image(kAllocRenderTarget, Format::A8R8G8B8, kSize, kSize);
+  Handle texture = checker(rig);
+  // (vs.dxbc makes the texture coordinate twice the colour's red and green)
+  auto vert = [](float x, float y, float u, float v) { return Vertex{x, y, 0.5f, u / 2, v / 2, 1, 1}; };
+  const Vertex v[12] = {vert(-1, -1, -0.5f, -0.5f), vert(0, -1, 1.5f, -0.5f), vert(-1, 1, -0.5f, 1.5f), vert(-1, 1, -0.5f, 1.5f), vert(0, -1, 1.5f, -0.5f), vert(0, 1, 1.5f, 1.5f),
+                        vert(0, -1, -0.5f, -0.5f), vert(1, -1, 1.5f, -0.5f), vert(0, 1, -0.5f, 1.5f), vert(0, 1, -0.5f, 1.5f), vert(1, -1, 1.5f, -0.5f), vert(1, 1, 1.5f, 1.5f)};
+  Handle vb = rig.buffer(kAllocVertexBuffer, bytes_of(v, sizeof v));
+  graphics::SamplerDesc sampler;
+  sampler.address_u = sampler.address_v = graphics::AddressMode::ClampToBorder;
+  sampler.custom_border = true;
+  sampler.border_rgba[0] = 0.2f, sampler.border_rgba[1] = 0.4f, sampler.border_rgba[2] = 0.6f, sampler.border_rgba[3] = 1.0f;
+  graphics::SamplerDesc linear = sampler;
+  linear.filter = graphics::Filter::Linear;
+  CommandWriter w(rig.allocator());
+  begin(w, 0, kNoAllocation, {0, 0, 0, 1});
+  w.bind_pipeline(pipe);
+  w.bind_vertex_buffer(1);
+  w.push_constants(bytes_of(kIdentity, sizeof kIdentity));
+  w.bind_texture(0, 2, sampler);
+  w.draw(6, 0);
+  w.bind_texture(0, 2, linear);
+  w.draw(6, 6);
+  w.end_pass();
+  rig.render(w, {target, vb, texture});
+  rig.read(target, out);
+}
+
+// Several viewports and scissor rectangles, picked by a geometry shader's SV_ViewportArrayIndex (gs_viewport.dxbc: triangle n goes to viewport n): three triangles over the whole
+// picture - red into viewport 0 (the left half, its scissor rectangle the upper part of it), green into viewport 1 (the right half), and blue, whose index 2 is past the two set,
+// into viewport 0 again (in the middle of it, over the red).
+void scene_viewports(Rig& rig, ArrayView<uint32_t> out) {
+  if (!rig.has(graphics::kFeatureGeometryShaders) || !(rig.caps().features2 & graphics::kFeature2Viewports)) return void(rig.step("several viewports", status::kNotSupported));
+  namespace b = conformance_blobs;
+  const Vertex v[9] = {{-1, -1, 0.5f, 1, 0, 0, 1}, {3, -1, 0.5f, 1, 0, 0, 1}, {-1, 3, 0.5f, 1, 0, 0, 1},
+                       {-1, -1, 0.5f, 0, 1, 0, 1}, {3, -1, 0.5f, 0, 1, 0, 1}, {-1, 3, 0.5f, 0, 1, 0, 1},
+                       {-0.4f, -0.4f, 0.5f, 0, 0, 1, 1}, {0.4f, -0.4f, 0.5f, 0, 0, 1, 1}, {0.0f, 0.4f, 0.5f, 0, 0, 1, 1}};
+  Handle vs = rig.vertex_shader(bytes_of(b::k_vs, sizeof b::k_vs));
+  Handle ps = rig.pixel_shader(bytes_of(b::k_ps_color, sizeof b::k_ps_color));
+  Handle gs = rig.shader("create_shader (geometry)", ShaderKind::Dxbc, graphics::ShaderStage::Geometry, bytes_of(b::k_gs_viewport, sizeof b::k_gs_viewport));
+  PipelineDesc pd = colour_pipeline_desc(vs, ps);
+  pd.varying_count = 3;
+  pd.geometry_shader = gs;
+  Handle pipe = rig.pipeline(pd);
+  Handle target = rig.image(kAllocRenderTarget, Format::A8R8G8B8, kSize, kSize);
+  Handle vb = rig.buffer(kAllocVertexBuffer, bytes_of(v, sizeof v));
+  const graphics::Viewport viewports[2] = {{0, 0, 16, 32, 0, 1}, {16, 0, 16, 32, 0, 1}};
+  const graphics::Rect2D scissors[2] = {{0, 0, 16, 20}, {0, 0, 32, 32}};
+  CommandWriter w(rig.allocator());
+  begin(w, 0, kNoAllocation, {0, 0, 0, 1});
+  w.bind_pipeline(pipe);
+  w.bind_vertex_buffer(1);
+  w.push_constants(bytes_of(kIdentity, sizeof kIdentity));
+  w.set_viewports(ArrayView<const graphics::Viewport>(viewports, 2));
+  w.set_scissors(ArrayView<const graphics::Rect2D>(scissors, 2));
+  w.draw(9);
+  w.end_pass();
+  rig.render(w, {target, vb});
+  rig.read(target, out);
+}
+
 struct Entry {
   const char* name;
   Scene run;
@@ -3120,6 +3429,15 @@ const Entry kScenes[] = {
     {"Direct3D 11 unordered access to levels of a cube's faces", scene_storage_cube_levels},
     {"Direct3D 11 cube array (DXBC)", scene_cube_array},
     {"Direct3D 11 SampleLevel of a cube array (DXBC)", scene_cube_array_level},
+    {"Direct3D 10 depth bias, float format", scene_depth_bias},
+    {"Direct3D 10 depth bias, normalised formats", scene_depth_bias_unorm},
+    {"Direct3D 10 two-sided stencil", scene_stencil_two_sided},
+    {"Direct3D 10 wireframe", scene_wireframe, true},
+    {"Direct3D 10 depth clip and clamp", scene_depth_clip},
+    {"Direct3D 10 dual-source blending (DXBC)", scene_dual_source_blend},
+    {"Direct3D 11.1 logic operations", scene_logic_ops},
+    {"Direct3D 10 border colours (DXBC)", scene_border_colour},
+    {"Direct3D 10 several viewports and SV_ViewportArrayIndex (DXBC)", scene_viewports},
 };
 
 bool channels_close(uint32_t a, uint32_t b) {

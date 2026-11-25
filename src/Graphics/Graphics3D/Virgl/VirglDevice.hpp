@@ -33,7 +33,7 @@ class VirglDevice final : public IGraphicsDevice {
   ~VirglDevice();
 
   // The formats numbered from 64: what the host's sampler and render masks say of each one's host format (virgl_caps_v1), and what the image units take (no 96-bit, shared-exponent,
-  // 5:6:5 / 5:5:5:1 / 4:4:4:4 or alpha-only images in GLSL); levels for the packed 32-bit ones (the wide images here have one); the block-compressed ones as blocks.
+  // 5:6:5 / 5:5:5:1 / 4:4:4:4 or alpha-only images in GLSL); levels for the packed 32-bit ones, and for every one with kFeature2MipmappedLayers; the block-compressed ones as blocks.
   uint32_t format_caps(Format f) const override;
   uint32_t max_image_dimension() const override;
   DeviceInfo info() const override {
@@ -44,7 +44,12 @@ class VirglDevice final : public IGraphicsDevice {
             (gpu_.virgl_has_compute() ? kFeature2StorageImages | kFeature2StorageImagesInDraws | kFeature2TexelBuffers | kFeature2StorageImagesAllStages : 0u) | (gpu_.virgl_has_geometry() ? kFeature2LayeredTargets : 0u) | kFeature2SingleChannelFormats | kFeature2DepthTextures |
             (gpu_.virgl_has_compute() ? kFeature2MipmappedLayers : 0u) |   // (levels of every image and views of them need the host's texture views: GL 4.3, as compute)
             // (the least and greatest samples of a colour image: a pass of texel fetches, extreme_resolve)
-            kFeature2ColorResolveModes};
+            kFeature2ColorResolveModes |
+            // (polygon modes, polygon offset, depth clamp, two-sided stencil, logic operations and border colours are GL 3.3 core, anisotropic filtering GL 4.6 / an extension every
+            // desktop GL host has; dual-source blending when the host blends one target so)
+            kFeature2RasterizerState | kFeature2LogicOps | kFeature2SamplerState | (gpu_.virgl_max_dual_source_targets() >= 1 ? kFeature2DualSourceBlend : 0u) |
+            // (sixteen viewports, which geometry shaders pick with gl_ViewportIndex; a vertex or evaluation shader's layer and viewport the host does not take from virgl's shaders)
+            (gpu_.virgl_has_geometry() && gpu_.virgl_max_viewports() >= kMaxViewports ? kFeature2Viewports : 0u)};
   }
   // What the host's GL has (GL 3.3, which the TGSI it is given needs, at least): 16 texture units in each stage (GL_MAX_TEXTURE_IMAGE_UNITS, GL_MAX_VERTEX_TEXTURE_IMAGE_UNITS), 16
   // vertex attributes (GL_MAX_VERTEX_ATTRIBS); varyings: the vertex shader's outputs are 16 vectors in GL 4 (GL_MAX_VERTEX_OUTPUT_COMPONENTS 64), 15 in GL 3.3 (GL_MAX_VARYING_COMPONENTS
@@ -100,11 +105,12 @@ class VirglDevice final : public IGraphicsDevice {
   hardware::VirtioGpu& gpu_;
   uint32_t next_handle_ = 1;  // object handles share one namespace per context
   uint64_t all_used_until_ = 0;   // the last work of a submit that used too many buffers to note each one (see in_flight)
-  // The host's sampler state objects, by what they are: filter (bit 0), the two address modes (3 bits each), the border colour (2 bits), the mip filter (2 bits), and the
-  // level-of-detail bias and limits in sixteenths.
+  // The host's sampler state objects, by what they are: filter (bit 0), the two address modes (3 bits each), the border colour (2 bits), the mip filter (2 bits), the anisotropy
+  // (bits 16 ..), the level-of-detail bias and limits (as they are given, within the host's range) and the border colour's channels.
   struct SamplerState {
     uint32_t bits = 0;
-    int32_t bias = 0, min_lod = 0, max_lod = 0;
+    float bias = 0, min_lod = 0, max_lod = 0;
+    uint32_t border[4] = {};   // (the colour's bits)
     uint32_t handle = 0;
   };
   static constexpr uint32_t kSamplerStates = 256;

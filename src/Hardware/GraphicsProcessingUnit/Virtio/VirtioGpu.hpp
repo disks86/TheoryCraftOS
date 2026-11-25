@@ -96,6 +96,9 @@ class VirtioGpu : public FramebufferGpu, public IMonitorSource {
   bool virgl_format_sampled(uint32_t format) const { return has_3d_ && format < 512 && ((virgl_sampler_mask_[format / 32] >> (format % 32)) & 1); }
   bool virgl_format_renderable(uint32_t format) const { return has_3d_ && format < 512 && ((virgl_render_mask_[format / 32] >> (format % 32)) & 1); }
   uint32_t virgl_max_texture_2d() const { return has_3d_ ? virgl_max_texture_2d_ : 0; }
+  // The colour targets the host blends with two sources (dual-source blending; 0: none), and how many viewports a draw has (GL_MAX_VIEWPORTS; 0 when it did not say).
+  uint32_t virgl_max_dual_source_targets() const { return has_3d_ ? virgl_max_dual_source_ : 0; }
+  uint32_t virgl_max_viewports() const { return has_3d_ ? virgl_max_viewports_ : 0; }
   // Geometry shaders are core in OpenGL 3.2 / GLSL 1.50.
   // Tessellation is core in OpenGL 4.0 / GLSL 4.00.
   bool virgl_has_tessellation() const { return has_3d_ && virgl_glsl_level_ >= 400; }
@@ -275,7 +278,7 @@ class VirtioGpu : public FramebufferGpu, public IMonitorSource {
   void read_capsets();
 
   bool has_3d_ = false;
-  uint32_t virgl_bset_ = 0, virgl_glsl_level_ = 0, virgl_max_samples_ = 0, virgl_max_texture_2d_ = 0;
+  uint32_t virgl_bset_ = 0, virgl_glsl_level_ = 0, virgl_max_samples_ = 0, virgl_max_texture_2d_ = 0, virgl_max_dual_source_ = 0, virgl_max_viewports_ = 0;
   uint32_t virgl_sampler_mask_[16] = {}, virgl_render_mask_[16] = {};
   uint32_t next_resource_ = 1;
   uint64_t resource_bytes_ = 0;   // live 3D resources, see add_resource_bytes()

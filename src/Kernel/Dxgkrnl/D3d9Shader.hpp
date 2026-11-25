@@ -117,8 +117,9 @@ class D3d9Program {
   ImageReturn image_return(uint32_t slot) const { return slot < graphics::kMaxImageSlots ? image_return_[slot] : ImageReturn::Float; }
   const ImageMask& image_mask() const { return image_mask_; }   // (slot n: a storage image or a typed view of a buffer)
   bool writes_images() const { return writes_images_; }         // (a u# image is declared: the shader may write it)
-  // A geometry shader that writes SV_RenderTargetArrayIndex (ShaderIo::layer).
+  // A geometry shader that writes SV_RenderTargetArrayIndex (ShaderIo::layer) or SV_ViewportArrayIndex (ShaderIo::viewport) - or a vertex or domain shader that does (layer_before_geometry).
   bool writes_layer() const { return writes_layer_; }
+  bool writes_viewport() const { return writes_viewport_; }
   // The graphics::DeviceFeature2 bits the program needs (storage images; the layer output).
   uint32_t required_features2() const;
   // What the pixel shader declared texture unit `unit` to be (a DXBC dcl_resource; the others: 2D). Binding another kind to the unit makes a draw wrong, so the kernel refuses it.
@@ -217,7 +218,12 @@ class D3d9Program {
   ImageReturn image_return_[graphics::kMaxImageSlots] = {};
   ImageMask image_mask_;
   bool writes_images_ = false;
-  bool writes_layer_ = false;
+  bool writes_layer_ = false, writes_viewport_ = false, layer_before_geometry_ = false;
+  // The components of their output registers the layer and the viewport are in, and whether the viewport is in the layer's register (both integers packed into one).
+  uint8_t layer_component_ = 0, viewport_component_ = 0;
+  bool viewport_shares_layer_ = false;
+  uint32_t layer_out(const float* layer, const float* viewport) const;   // (the layer of the registers' values; and the viewport: viewport_out)
+  uint32_t viewport_out(const float* layer, const float* viewport) const;
   graphics::TextureKind texture_kind_[graphics::kMaxTextureUnits] = {};
   uint8_t texture_samples_[graphics::kMaxTextureUnits] = {};   // the sample count a multisampled texture was declared with
   static_assert(graphics::kMaxTextureUnits == 16, "the pairs below list every unit");

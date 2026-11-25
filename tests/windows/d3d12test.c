@@ -3257,7 +3257,8 @@ static void test_uav_format_support(ID3D12Device *dev) {
   CHECK_HR(ID3D12Device_CheckFeatureSupport(dev, D3D12_FEATURE_D3D12_OPTIONS, &o, sizeof o));
   f.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
   CHECK_HR(ID3D12Device_CheckFeatureSupport(dev, D3D12_FEATURE_FORMAT_SUPPORT, &f, sizeof f));
-  CHECK(!o.TypedUAVLoadAdditionalFormats == !(f.Support1 & D3D12_FORMAT_SUPPORT1_BUFFER) && !o.VPAndRTArrayIndexFromAnyShaderFeedingRasterizerSupportedWithoutGSEmulation);
+  CHECK(!o.TypedUAVLoadAdditionalFormats == !(f.Support1 & D3D12_FORMAT_SUPPORT1_BUFFER) &&
+        o.VPAndRTArrayIndexFromAnyShaderFeedingRasterizerSupportedWithoutGSEmulation == !g_hardware);   /* (the layer and viewport from a vertex shader: the CPU renderer) */
 }
 
 /* Compute shaders writing and reading a 2D array storage image, typed loads of R32_FLOAT, the atomics on R32_UINT / R32_SINT images of one, two and three dimensions, and
@@ -5507,6 +5508,415 @@ static void test_formats(Scene *c) {
   ID3D12RootSignature_Release(rs);
 }
 
+/* ---- the rasterizer, depth-stencil and blend state: depth bias, depth clip, wireframe, two-sided stencil, dual-source blending, logic operations ---------------------------- */
+
+/* The scene's pipeline description (scene_make's), for the caller to change. */
+static void fs_desc(Scene *c, D3D12_GRAPHICS_PIPELINE_STATE_DESC *pd, D3D12_INPUT_ELEMENT_DESC layout[2]) {
+  const D3D12_INPUT_ELEMENT_DESC l[2] = {{"POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
+                                         {"COLOR", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 12, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0}};
+  layout[0] = l[0], layout[1] = l[1];
+  memset(pd, 0, sizeof *pd);
+  pd->pRootSignature = c->rs;
+  pd->VS.pShaderBytecode = dx_vs_dxbc;
+  pd->VS.BytecodeLength = sizeof dx_vs_dxbc;
+  pd->PS.pShaderBytecode = dx_ps_color_dxbc;
+  pd->PS.BytecodeLength = sizeof dx_ps_color_dxbc;
+  pd->SampleMask = 0xFFFFFFFFu;
+  pd->RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+  pd->RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+  pd->RasterizerState.DepthClipEnable = TRUE;
+  pd->BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+  pd->InputLayout.pInputElementDescs = layout;
+  pd->InputLayout.NumElements = 2;
+  pd->PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+  pd->NumRenderTargets = 1;
+  pd->RTVFormats[0] = DXGI_FORMAT_B8G8R8A8_UNORM;
+  pd->SampleDesc.Count = 1;
+}
+static ID3D12PipelineState *fs_pso(Scene *c, const D3D12_GRAPHICS_PIPELINE_STATE_DESC *pd) {
+  ID3D12PipelineState *pso = NULL;
+  CHECK_HR(ID3D12Device_CreateGraphicsPipelineState(c->dev, pd, &IID_ID3D12PipelineState, (void **)&pso));
+  return pso;
+}
+/* A band of the 64 x 64 target: rows y0 .. y1 of clip space (+1 is the top row), its depth running from z_left to z_right, one colour; six vertices of seven floats. */
+static void fs_band(float *v, float y0, float y1, float zl, float zr, float r, float g, float b) {
+  const float corners[4][7] = {{-1, y0, zl, r, g, b, 1}, {1, y0, zr, r, g, b, 1}, {-1, y1, zl, r, g, b, 1}, {1, y1, zr, r, g, b, 1}};
+  const int order[6] = {0, 1, 2, 2, 1, 3};
+  for (int i = 0; i < 6; ++i) memcpy(v + 7 * i, corners[order[i]], 7 * sizeof(float));
+}
+/* (a step's stencil reference is both faces', unless own_back gives the back faces back_ref - OMSetFrontAndBackStencilRef -; with set_bias the list's depth bias is `bias`, its
+ * clamp and slope - RSSetDepthBias - before the draw) */
+typedef struct FsStep { ID3D12PipelineState *pso; UINT first, count, stencil_ref; int own_back; UINT back_ref; int set_bias; float bias[3]; } FsStep;
+/* Draws the steps into the target (cleared to `clear`) with a depth buffer of `depth_format` (UNKNOWN: none) cleared to 1 and stencil 0; the picture is read back into `out`. */
+static int fs_draw_viewports(Scene *c, DXGI_FORMAT depth_format, const float clear[4], const float *verts, UINT floats, const FsStep *steps, UINT n, UINT32 *out,
+                             const D3D12_VIEWPORT *viewports, UINT viewport_count);
+static int fs_draw(Scene *c, DXGI_FORMAT depth_format, const float clear[4], const float *verts, UINT floats, const FsStep *steps, UINT n, UINT32 *out) {
+  return fs_draw_viewports(c, depth_format, clear, verts, floats, steps, n, out, NULL, 0);
+}
+/* (with viewports of its own: `viewport_count` of them, and as many scissor rectangles of the whole target) */
+static int fs_draw_viewports(Scene *c, DXGI_FORMAT depth_format, const float clear[4], const float *verts, UINT floats, const FsStep *steps, UINT n, UINT32 *out,
+                             const D3D12_VIEWPORT *viewports, UINT viewport_count) {
+  ID3D12Device *dev = c->dev;
+  ID3D12Resource *vb = make_buffer(dev, D3D12_HEAP_TYPE_UPLOAD, (UINT64)floats * 4 + 256, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ);
+  ID3D12Resource *depth = NULL;
+  ID3D12DescriptorHeap *dsv_heap = NULL;
+  D3D12_CPU_DESCRIPTOR_HANDLE dsv = {0};
+  int ok = vb != NULL;
+  if (ok) {
+    void *mapped = NULL;
+    CHECK_HR(ID3D12Resource_Map(vb, 0, NULL, &mapped));
+    if (mapped) memcpy(mapped, verts, (SIZE_T)floats * 4);
+    ID3D12Resource_Unmap(vb, 0, NULL);
+  }
+  if (ok && depth_format != DXGI_FORMAT_UNKNOWN) {
+    D3D12_HEAP_PROPERTIES defaults = {D3D12_HEAP_TYPE_DEFAULT, D3D12_CPU_PAGE_PROPERTY_UNKNOWN, D3D12_MEMORY_POOL_UNKNOWN, 1, 1};
+    D3D12_RESOURCE_DESC dd = {D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, 64, 64, 1, 1, depth_format, {1, 0}, D3D12_TEXTURE_LAYOUT_UNKNOWN, D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL};
+    D3D12_DESCRIPTOR_HEAP_DESC hd = {D3D12_DESCRIPTOR_HEAP_TYPE_DSV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
+    CHECK_HR(ID3D12Device_CreateCommittedResource(dev, &defaults, D3D12_HEAP_FLAG_NONE, &dd, D3D12_RESOURCE_STATE_DEPTH_WRITE, NULL, &IID_ID3D12Resource, (void **)&depth));
+    CHECK_HR(ID3D12Device_CreateDescriptorHeap(dev, &hd, &IID_ID3D12DescriptorHeap, (void **)&dsv_heap));
+    ok = depth && dsv_heap;
+    if (ok) {
+      dsv = ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(dsv_heap);
+      ID3D12Device_CreateDepthStencilView(dev, depth, NULL, dsv);
+    }
+  }
+  ID3D12GraphicsCommandList *list = NULL;
+  if (ok) {
+    CHECK_HR(ID3D12CommandAllocator_Reset(c->allocator));
+    CHECK_HR(ID3D12Device_CreateCommandList(dev, 0, D3D12_COMMAND_LIST_TYPE_DIRECT, c->allocator, NULL, &IID_ID3D12GraphicsCommandList, (void **)&list));
+    ok = list != NULL;
+  }
+  for (UINT i = 0; ok && i < n; ++i) ok = steps[i].pso != NULL;
+  if (ok) {
+    D3D12_VIEWPORT vp = {0, 0, 64, 64, 0, 1};
+    D3D12_RECT sc = {0, 0, 64, 64};
+    ID3D12GraphicsCommandList_OMSetRenderTargets(list, 1, &c->rtv, FALSE, depth ? &dsv : NULL);
+    ID3D12GraphicsCommandList_ClearRenderTargetView(list, c->rtv, clear, 0, NULL);
+    if (depth) ID3D12GraphicsCommandList_ClearDepthStencilView(list, dsv, D3D12_CLEAR_FLAG_DEPTH | (depth_format == DXGI_FORMAT_D24_UNORM_S8_UINT ? D3D12_CLEAR_FLAG_STENCIL : 0), 1.0f, 0, 0, NULL);
+    const D3D12_RECT all[16] = {{0, 0, 64, 64}, {0, 0, 64, 64}, {0, 0, 64, 64}, {0, 0, 64, 64}, {0, 0, 64, 64}, {0, 0, 64, 64}, {0, 0, 64, 64}, {0, 0, 64, 64},
+                                {0, 0, 64, 64}, {0, 0, 64, 64}, {0, 0, 64, 64}, {0, 0, 64, 64}, {0, 0, 64, 64}, {0, 0, 64, 64}, {0, 0, 64, 64}, {0, 0, 64, 64}};
+    ID3D12GraphicsCommandList_RSSetViewports(list, viewports ? viewport_count : 1, viewports ? viewports : &vp);
+    ID3D12GraphicsCommandList_RSSetScissorRects(list, viewports ? viewport_count : 1, viewports ? all : &sc);
+    D3D12_VERTEX_BUFFER_VIEW vbv = {ID3D12Resource_GetGPUVirtualAddress(vb), floats * 4, 28};
+    ID3D12GraphicsCommandList_SetGraphicsRootSignature(list, c->rs);
+    ID3D12GraphicsCommandList_SetGraphicsRoot32BitConstants(list, 0, 16, kIdentity, 0);
+    ID3D12GraphicsCommandList_IASetPrimitiveTopology(list, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    ID3D12GraphicsCommandList_IASetVertexBuffers(list, 0, 1, &vbv);
+    for (UINT i = 0; i < n; ++i) {
+      ID3D12GraphicsCommandList_SetPipelineState(list, steps[i].pso);
+      ID3D12GraphicsCommandList_OMSetStencilRef(list, steps[i].stencil_ref);
+      if (steps[i].own_back) {
+        ID3D12GraphicsCommandList8 *l8 = NULL;
+        CHECK_HR(ID3D12GraphicsCommandList_QueryInterface(list, &IID_ID3D12GraphicsCommandList8, (void **)&l8));
+        if (l8) { ID3D12GraphicsCommandList8_OMSetFrontAndBackStencilRef(l8, steps[i].stencil_ref, steps[i].back_ref); ID3D12GraphicsCommandList8_Release(l8); }
+      }
+      if (steps[i].set_bias) {
+        ID3D12GraphicsCommandList9 *l9 = NULL;
+        CHECK_HR(ID3D12GraphicsCommandList_QueryInterface(list, &IID_ID3D12GraphicsCommandList9, (void **)&l9));
+        if (l9) { ID3D12GraphicsCommandList9_RSSetDepthBias(l9, steps[i].bias[0], steps[i].bias[1], steps[i].bias[2]); ID3D12GraphicsCommandList9_Release(l9); }
+      }
+      ID3D12GraphicsCommandList_DrawInstanced(list, steps[i].count, 1, steps[i].first, 0);
+    }
+    scene_read_target(c, list);
+    scene_run(c, list);
+    const UINT32 *px = NULL;
+    ok = SUCCEEDED(ID3D12Resource_Map(c->readback, 0, NULL, (void **)&px)) && px;
+    if (ok) {
+      memcpy(out, px, 64 * 64 * 4);
+      ID3D12Resource_Unmap(c->readback, 0, NULL);
+    }
+  }
+  if (list) ID3D12GraphicsCommandList_Release(list);
+  if (dsv_heap) ID3D12DescriptorHeap_Release(dsv_heap);
+  if (depth) ID3D12Resource_Release(depth);
+  if (vb) ID3D12Resource_Release(vb);
+  return ok;
+}
+#define FS_RGB(p) ((p) & 0xFFFFFFu)
+
+/* The back faces' own stencil reference (OMSetFrontAndBackStencilRef) and the depth bias of the command list (RSSetDepthBias with D3D12_PIPELINE_STATE_FLAG_DYNAMIC_DEPTH_BIAS),
+ * where OPTIONS14 / OPTIONS16 say the device has them; refused where they say it has not. */
+static void test_stencil_refs_and_dynamic_bias(Scene *c) {
+  static UINT32 img[64 * 64];
+  const float black[4] = {0, 0, 0, 1};
+  D3D12_GRAPHICS_PIPELINE_STATE_DESC pd;
+  D3D12_INPUT_ELEMENT_DESC layout[2];
+  D3D12_FEATURE_DATA_D3D12_OPTIONS14 o14;
+  D3D12_FEATURE_DATA_D3D12_OPTIONS16 o16;
+  CHECK_HR(ID3D12Device_CheckFeatureSupport(c->dev, D3D12_FEATURE_D3D12_OPTIONS14, &o14, sizeof o14));
+  CHECK_HR(ID3D12Device_CheckFeatureSupport(c->dev, D3D12_FEATURE_D3D12_OPTIONS16, &o16, sizeof o16));
+  if (!g_hardware) CHECK(o14.IndependentFrontAndBackStencilRefMaskSupported && o16.DynamicDepthBiasSupported);
+  /* (D24_UNORM_S8_UINT: the left triangle faces away, the right one the viewer; both REPLACE with the references 9 (back) and 5 (front); then quads facing the viewer test
+   * EQUAL 9 - green, on the left - and EQUAL 5 - blue, on the right) */
+  if (o14.IndependentFrontAndBackStencilRefMaskSupported) {
+    const float v[12][7] = {{-0.9f, 0.8f, 0.5f, 1, 0, 0, 1}, {-0.9f, -0.8f, 0.5f, 1, 0, 0, 1}, {-0.1f, 0.0f, 0.5f, 1, 0, 0, 1},
+                            {0.1f, 0.0f, 0.5f, 1, 1, 0, 1}, {0.9f, 0.8f, 0.5f, 1, 1, 0, 1}, {0.9f, -0.8f, 0.5f, 1, 1, 0, 1},
+                            {-1, 1, 0.5f, 0, 1, 0, 1}, {3, 1, 0.5f, 0, 1, 0, 1}, {-1, -3, 0.5f, 0, 1, 0, 1},
+                            {-1, 1, 0.5f, 0, 0, 1, 1}, {3, 1, 0.5f, 0, 0, 1, 1}, {-1, -3, 0.5f, 0, 0, 1, 1}};
+    fs_desc(c, &pd, layout);
+    pd.DSVFormat = DXGI_FORMAT_D24_UNORM_S8_UINT;
+    D3D12_DEPTH_STENCIL_DESC *z = &pd.DepthStencilState;
+    z->StencilEnable = TRUE;
+    z->StencilReadMask = z->StencilWriteMask = 0xFF;
+    const D3D12_DEPTH_STENCILOP_DESC replace = {D3D12_STENCIL_OP_KEEP, D3D12_STENCIL_OP_KEEP, D3D12_STENCIL_OP_REPLACE, D3D12_COMPARISON_FUNC_ALWAYS};
+    const D3D12_DEPTH_STENCILOP_DESC equal = {D3D12_STENCIL_OP_KEEP, D3D12_STENCIL_OP_KEEP, D3D12_STENCIL_OP_KEEP, D3D12_COMPARISON_FUNC_EQUAL};
+    z->FrontFace = z->BackFace = replace;
+    ID3D12PipelineState *mark = fs_pso(c, &pd);
+    z->FrontFace = z->BackFace = equal;
+    ID3D12PipelineState *test = fs_pso(c, &pd);
+    const FsStep steps[3] = {{mark, 0, 6, 5, 1, 9}, {test, 6, 3, 9}, {test, 9, 3, 5}};
+    if (fs_draw(c, DXGI_FORMAT_D24_UNORM_S8_UINT, black, &v[0][0], 12 * 7, steps, 3, img)) {
+      printf("front and back stencil references: %08x %08x\n", (unsigned)img[32 * 64 + 8], (unsigned)img[32 * 64 + 56]);
+      CHECK(FS_RGB(img[32 * 64 + 8]) == 0x00FF00 && FS_RGB(img[32 * 64 + 56]) == 0x0000FF && FS_RGB(img[2 * 64 + 32]) == 0);
+    }
+    if (mark) ID3D12PipelineState_Release(mark);
+    if (test) ID3D12PipelineState_Release(test);
+  }
+  /* (D32_FLOAT: a band drawn red at 0.5, then with the dynamic bias of the list - the pipeline's own DepthBias of 8 not used - green with -8 units (in front) and blue with +8
+   * (behind: stays red), a NaN slope counting as none) */
+  fs_desc(c, &pd, layout);
+  pd.DSVFormat = DXGI_FORMAT_D32_FLOAT;
+  pd.DepthStencilState.DepthEnable = TRUE;
+  pd.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
+  pd.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_LESS;
+  ID3D12PipelineState *base = fs_pso(c, &pd);
+  pd.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ZERO;
+  pd.RasterizerState.DepthBias = 8;
+  pd.Flags = D3D12_PIPELINE_STATE_FLAG_DYNAMIC_DEPTH_BIAS;
+  ID3D12PipelineState *dynamic = NULL;
+  const HRESULT hr = ID3D12Device_CreateGraphicsPipelineState(c->dev, &pd, &IID_ID3D12PipelineState, (void **)&dynamic);
+  CHECK(o16.DynamicDepthBiasSupported ? SUCCEEDED(hr) && dynamic : hr == E_INVALIDARG && !dynamic);
+  if (dynamic && base) {
+    float v[18 * 7];
+    fs_band(v, 1.0f, -1.0f, 0.5f, 0.5f, 1, 0, 0);
+    fs_band(v + 42, 1.0f, 0.0f, 0.5f, 0.5f, 0, 1, 0);
+    fs_band(v + 84, 0.0f, -1.0f, 0.5f, 0.5f, 0, 0, 1);
+    const float nan = sqrtf(-1.0f);
+    const FsStep steps[3] = {{base, 0, 6, 0}, {dynamic, 6, 6, 0, 0, 0, 1, {-8.0f, 0.0f, nan}}, {dynamic, 12, 6, 0, 0, 0, 1, {8.0f, 0.0f, 0.0f}}};
+    if (fs_draw(c, DXGI_FORMAT_D32_FLOAT, black, v, 18 * 7, steps, 3, img)) {
+      printf("dynamic depth bias: %08x %08x\n", (unsigned)img[16 * 64 + 32], (unsigned)img[48 * 64 + 32]);
+      CHECK(FS_RGB(img[16 * 64 + 32]) == 0x00FF00 && FS_RGB(img[48 * 64 + 32]) == 0xFF0000);
+    }
+  }
+  if (dynamic) ID3D12PipelineState_Release(dynamic);
+  if (base) ID3D12PipelineState_Release(base);
+}
+
+static void test_fixed_state(Scene *c) {
+  static UINT32 img[64 * 64];
+  const float black[4] = {0, 0, 0, 1}, grey[4] = {0.5f, 0.5f, 0.5f, 1};
+  D3D12_GRAPHICS_PIPELINE_STATE_DESC pd;
+  D3D12_INPUT_ELEMENT_DESC layout[2];
+  ID3D12PipelineState *bad = NULL;
+
+  /* Depth bias of D32_FLOAT (2^(e - 23) a unit): four bands drawn red with their depth, then again with LESS: -8 units (green), +8 (stays red), a slope of -1 over a band
+   * 0.001 behind (blue), the same held to 0.0005 by the clamp (stays red). */
+  {
+    float v[48 * 7];
+    fs_band(v + 0 * 42, 1.0f, 0.5f, 0.5f, 0.5f, 1, 0, 0), fs_band(v + 1 * 42, 0.5f, 0.0f, 0.5f, 0.5f, 1, 0, 0), fs_band(v + 2 * 42, 0.0f, -0.5f, 0.3f, 0.7f, 1, 0, 0);
+    fs_band(v + 3 * 42, -0.5f, -1.0f, 0.3f, 0.7f, 1, 0, 0), fs_band(v + 4 * 42, 1.0f, 0.5f, 0.5f, 0.5f, 0, 1, 0), fs_band(v + 5 * 42, 0.5f, 0.0f, 0.5f, 0.5f, 0, 1, 0);
+    fs_band(v + 6 * 42, 0.0f, -0.5f, 0.301f, 0.701f, 0, 0, 1), fs_band(v + 7 * 42, -0.5f, -1.0f, 0.301f, 0.701f, 0, 0, 1);
+    fs_desc(c, &pd, layout);
+    pd.DSVFormat = DXGI_FORMAT_D32_FLOAT;
+    pd.DepthStencilState.DepthEnable = TRUE;
+    pd.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
+    pd.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_LESS;
+    ID3D12PipelineState *base = fs_pso(c, &pd);
+    pd.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ZERO;
+    pd.RasterizerState.DepthBias = -8;
+    ID3D12PipelineState *toward = fs_pso(c, &pd);
+    pd.RasterizerState.DepthBias = 8;
+    ID3D12PipelineState *away = fs_pso(c, &pd);
+    pd.RasterizerState.DepthBias = 0;
+    pd.RasterizerState.SlopeScaledDepthBias = -1.0f;
+    ID3D12PipelineState *slope = fs_pso(c, &pd);
+    pd.RasterizerState.DepthBiasClamp = -0.0005f;
+    ID3D12PipelineState *clamped = fs_pso(c, &pd);
+    const FsStep steps[5] = {{base, 0, 24, 0}, {toward, 24, 6, 0}, {away, 30, 6, 0}, {slope, 36, 6, 0}, {clamped, 42, 6, 0}};
+    if (fs_draw(c, DXGI_FORMAT_D32_FLOAT, black, v, 48 * 7, steps, 5, img)) {
+      printf("depth bias: %08x %08x %08x %08x\n", (unsigned)img[8 * 64 + 32], (unsigned)img[24 * 64 + 32], (unsigned)img[40 * 64 + 32], (unsigned)img[56 * 64 + 32]);
+      for (int x = 2; x < 64; x += 30)
+        CHECK(FS_RGB(img[8 * 64 + x]) == 0x00FF00 && FS_RGB(img[24 * 64 + x]) == 0xFF0000 && FS_RGB(img[40 * 64 + x]) == 0x0000FF && FS_RGB(img[56 * 64 + x]) == 0xFF0000);
+    }
+    ID3D12PipelineState *list[5] = {base, toward, away, slope, clamped};
+    for (int i = 0; i < 5; ++i) if (list[i]) ID3D12PipelineState_Release(list[i]);
+  }
+  /* The normalised format's unit, 1 / (2^24 - 1) (D3D12 here has no D16): a band at 0.125, then 2e-6 nearer with DepthBias 1 (6e-8: in front, green); DepthBias 100
+   * (6e-6) is behind it (stays red) - in the float unit at 0.125 (1.5e-8) it would be in front. */
+  {
+    const DXGI_FORMAT formats[2] = {DXGI_FORMAT_D24_UNORM_S8_UINT, DXGI_FORMAT_D24_UNORM_S8_UINT};
+    const INT biases[2] = {1, 100};
+    const UINT32 expected[2] = {0x00FF00, 0xFF0000};
+    for (int k = 0; k < 2; ++k) {
+      float v[12 * 7];
+      fs_band(v, 1.0f, -1.0f, 0.125f, 0.125f, 1, 0, 0);
+      fs_band(v + 42, 1.0f, -1.0f, 0.125f - 2e-6f, 0.125f - 2e-6f, 0, 1, 0);
+      fs_desc(c, &pd, layout);
+      pd.DSVFormat = formats[k];
+      pd.DepthStencilState.DepthEnable = TRUE;
+      pd.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
+      pd.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_LESS;
+      ID3D12PipelineState *base = fs_pso(c, &pd);
+      pd.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ZERO;
+      pd.RasterizerState.DepthBias = biases[k];
+      ID3D12PipelineState *biased = fs_pso(c, &pd);
+      const FsStep steps[2] = {{base, 0, 6, 0}, {biased, 6, 6, 0}};
+      if (fs_draw(c, formats[k], black, v, 12 * 7, steps, 2, img)) {
+        printf("depth bias of format %u, %d units: %08x\n", (unsigned)formats[k], biases[k], (unsigned)img[32 * 64 + 32]);
+        CHECK(FS_RGB(img[32 * 64 + 32]) == expected[k] && FS_RGB(img[4 * 64 + 60]) == expected[k]);
+      }
+      if (base) ID3D12PipelineState_Release(base);
+      if (biased) ID3D12PipelineState_Release(biased);
+    }
+  }
+  /* DepthClipEnable: a triangle whose depth runs from 0.5 at its top edge to 1.5 at its lower corner is cut at depth 1 (half way down) with it, and drawn whole - its depth
+   * held to 1 - without it (LESS_EQUAL against a buffer of 1). */
+  {
+    const float v[6][7] = {{-0.9f, 0.9f, 0.5f, 1, 0, 0, 1}, {-0.1f, 0.9f, 0.5f, 1, 0, 0, 1}, {-0.5f, -0.9f, 1.5f, 1, 0, 0, 1},
+                           {0.1f, 0.9f, 0.5f, 0, 1, 0, 1}, {0.9f, 0.9f, 0.5f, 0, 1, 0, 1}, {0.5f, -0.9f, 1.5f, 0, 1, 0, 1}};
+    fs_desc(c, &pd, layout);
+    pd.DSVFormat = DXGI_FORMAT_D32_FLOAT;
+    pd.DepthStencilState.DepthEnable = TRUE;
+    pd.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ZERO;
+    pd.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_LESS_EQUAL;
+    ID3D12PipelineState *clip = fs_pso(c, &pd);
+    pd.RasterizerState.DepthClipEnable = FALSE;
+    ID3D12PipelineState *clamp = fs_pso(c, &pd);
+    const FsStep steps[2] = {{clip, 0, 3, 0}, {clamp, 3, 3, 0}};
+    if (fs_draw(c, DXGI_FORMAT_D32_FLOAT, black, &v[0][0], 6 * 7, steps, 2, img)) {
+      /* (the lower corners are at row 61; the cut at row 32) */
+      CHECK(FS_RGB(img[10 * 64 + 16]) == 0xFF0000 && FS_RGB(img[50 * 64 + 16]) == 0 && FS_RGB(img[10 * 64 + 48]) == 0x00FF00 && FS_RGB(img[50 * 64 + 48]) == 0x00FF00);
+    }
+    if (clip) ID3D12PipelineState_Release(clip);
+    if (clamp) ID3D12PipelineState_Release(clamp);
+  }
+  /* Wireframe: the scene's triangle as its three edges (its inside stays black), and a fill mode that is none. */
+  {
+    const float v[3][7] = {{-0.8f, -0.8f, 0.5f, 1, 0, 0, 1}, {0.8f, -0.8f, 0.5f, 0, 1, 0, 1}, {0.0f, 0.8f, 0.5f, 0, 0, 1, 1}};
+    fs_desc(c, &pd, layout);
+    pd.RasterizerState.FillMode = D3D12_FILL_MODE_WIREFRAME;
+    ID3D12PipelineState *wire = fs_pso(c, &pd);
+    const FsStep steps[1] = {{wire, 0, 3, 0}};
+    if (fs_draw(c, DXGI_FORMAT_UNKNOWN, black, &v[0][0], 3 * 7, steps, 1, img)) {
+      int lit = 0;
+      for (int i = 0; i < 64 * 64; ++i) lit += FS_RGB(img[i]) != 0;
+      printf("wireframe: %d pixels\n", lit);
+      CHECK(lit > 100 && lit < 300 && FS_RGB(img[40 * 64 + 32]) == 0 && FS_RGB(img[57 * 64 + 32]) != 0);
+    }
+    if (wire) ID3D12PipelineState_Release(wire);
+    pd.RasterizerState.FillMode = (D3D12_FILL_MODE)1;
+    CHECK(ID3D12Device_CreateGraphicsPipelineState(c->dev, &pd, &IID_ID3D12PipelineState, (void **)&bad) == E_INVALIDARG && !bad);
+  }
+  /* Two-sided stencil (D24_UNORM_S8_UINT): the left triangle faces away and inverts the stencil, the right one faces the viewer and replaces it with the reference 1;
+   * then a quad facing the viewer draws green where the stencil is 1, and one facing away, whose front faces never pass, white where it is ~0 (0xFF). */
+  {
+    const float v[12][7] = {{-0.9f, 0.8f, 0.5f, 1, 0, 0, 1}, {-0.9f, -0.8f, 0.5f, 1, 0, 0, 1}, {-0.1f, 0.0f, 0.5f, 1, 0, 0, 1},
+                            {0.1f, 0.0f, 0.5f, 1, 1, 0, 1}, {0.9f, 0.8f, 0.5f, 1, 1, 0, 1}, {0.9f, -0.8f, 0.5f, 1, 1, 0, 1},
+                            {-1, 1, 0.5f, 0, 1, 0, 1}, {3, 1, 0.5f, 0, 1, 0, 1}, {-1, -3, 0.5f, 0, 1, 0, 1},
+                            {-1, 1, 0.5f, 1, 1, 1, 1}, {-1, -3, 0.5f, 1, 1, 1, 1}, {3, 1, 0.5f, 1, 1, 1, 1}};
+    fs_desc(c, &pd, layout);
+    pd.DSVFormat = DXGI_FORMAT_D24_UNORM_S8_UINT;
+    D3D12_DEPTH_STENCIL_DESC *z = &pd.DepthStencilState;
+    z->StencilEnable = TRUE;
+    z->StencilReadMask = z->StencilWriteMask = 0xFF;
+    const D3D12_DEPTH_STENCILOP_DESC replace = {D3D12_STENCIL_OP_KEEP, D3D12_STENCIL_OP_KEEP, D3D12_STENCIL_OP_REPLACE, D3D12_COMPARISON_FUNC_ALWAYS};
+    const D3D12_DEPTH_STENCILOP_DESC invert = {D3D12_STENCIL_OP_KEEP, D3D12_STENCIL_OP_KEEP, D3D12_STENCIL_OP_INVERT, D3D12_COMPARISON_FUNC_ALWAYS};
+    const D3D12_DEPTH_STENCILOP_DESC equal = {D3D12_STENCIL_OP_KEEP, D3D12_STENCIL_OP_KEEP, D3D12_STENCIL_OP_KEEP, D3D12_COMPARISON_FUNC_EQUAL};
+    const D3D12_DEPTH_STENCILOP_DESC never = {D3D12_STENCIL_OP_KEEP, D3D12_STENCIL_OP_KEEP, D3D12_STENCIL_OP_KEEP, D3D12_COMPARISON_FUNC_NEVER};
+    z->FrontFace = replace, z->BackFace = invert;
+    ID3D12PipelineState *mark = fs_pso(c, &pd);
+    z->FrontFace = z->BackFace = equal;
+    ID3D12PipelineState *front_test = fs_pso(c, &pd);
+    z->FrontFace = never, z->BackFace = equal;
+    ID3D12PipelineState *back_test = fs_pso(c, &pd);
+    const FsStep steps[3] = {{mark, 0, 6, 1}, {front_test, 6, 3, 1}, {back_test, 9, 3, 0xFF}};
+    if (fs_draw(c, DXGI_FORMAT_D24_UNORM_S8_UINT, black, &v[0][0], 12 * 7, steps, 3, img)) {
+      printf("two-sided stencil: %08x %08x\n", (unsigned)img[32 * 64 + 8], (unsigned)img[32 * 64 + 56]);
+      CHECK(FS_RGB(img[32 * 64 + 8]) == 0xFFFFFF && FS_RGB(img[32 * 64 + 56]) == 0x00FF00 && FS_RGB(img[2 * 64 + 32]) == 0);
+    }
+    ID3D12PipelineState *list[3] = {mark, front_test, back_test};
+    for (int i = 0; i < 3; ++i) if (list[i]) ID3D12PipelineState_Release(list[i]);
+  }
+  /* Dual-source blending: ps_mrt writes the colour and it with red and blue swapped; colour = source + destination * the second source, alpha the source's. Into two
+   * targets the SRC1 factors are refused. */
+  {
+    const float v[3][7] = {{-1, -1, 0.5f, 0.6f, 0.2f, 0.1f, 1}, {3, -1, 0.5f, 0.6f, 0.2f, 0.1f, 1}, {-1, 3, 0.5f, 0.6f, 0.2f, 0.1f, 1}};
+    fs_desc(c, &pd, layout);
+    pd.PS.pShaderBytecode = dx_ps_mrt_dxbc;
+    pd.PS.BytecodeLength = sizeof dx_ps_mrt_dxbc;
+    D3D12_RENDER_TARGET_BLEND_DESC *b = &pd.BlendState.RenderTarget[0];
+    b->BlendEnable = TRUE;
+    b->SrcBlend = D3D12_BLEND_ONE, b->DestBlend = D3D12_BLEND_SRC1_COLOR, b->BlendOp = D3D12_BLEND_OP_ADD;
+    b->SrcBlendAlpha = D3D12_BLEND_ONE, b->DestBlendAlpha = D3D12_BLEND_INV_SRC1_ALPHA, b->BlendOpAlpha = D3D12_BLEND_OP_ADD;
+    ID3D12PipelineState *dual = fs_pso(c, &pd);
+    const FsStep steps[1] = {{dual, 0, 3, 0}};
+    if (fs_draw(c, DXGI_FORMAT_UNKNOWN, grey, &v[0][0], 3 * 7, steps, 1, img)) {
+      const UINT32 p = img[32 * 64 + 32];
+      printf("dual-source blending: %08x\n", (unsigned)p);
+      /* (0.6, 0.2, 0.1) + 0.5 * (0.1, 0.2, 0.6) = (0.65, 0.3, 0.4) */
+      CHECK(((p >> 16) & 0xFF) >= 165 && ((p >> 16) & 0xFF) <= 167 && ((p >> 8) & 0xFF) >= 76 && ((p >> 8) & 0xFF) <= 77 && (p & 0xFF) >= 101 && (p & 0xFF) <= 103);
+    }
+    if (dual) ID3D12PipelineState_Release(dual);
+    pd.NumRenderTargets = 2;
+    pd.RTVFormats[1] = DXGI_FORMAT_B8G8R8A8_UNORM;
+    CHECK(ID3D12Device_CreateGraphicsPipelineState(c->dev, &pd, &IID_ID3D12PipelineState, (void **)&bad) == E_INVALIDARG && !bad);
+  }
+  /* Sixteen viewports: a geometry shader sends triangle n to viewport n (SV_ViewportArrayIndex) - red into the left half, green into the right one, and blue, whose 2 is past the
+   * two set, into the first again (over the red, in its middle) */
+  {
+    const float v[9][7] = {{-1, -1, 0.5f, 1, 0, 0, 1}, {-1, 3, 0.5f, 1, 0, 0, 1}, {3, -1, 0.5f, 1, 0, 0, 1},
+                           {-1, -1, 0.5f, 0, 1, 0, 1}, {-1, 3, 0.5f, 0, 1, 0, 1}, {3, -1, 0.5f, 0, 1, 0, 1},
+                           {-0.4f, -0.4f, 0.5f, 0, 0, 1, 1}, {0.0f, 0.4f, 0.5f, 0, 0, 1, 1}, {0.4f, -0.4f, 0.5f, 0, 0, 1, 1}};
+    fs_desc(c, &pd, layout);
+    pd.GS.pShaderBytecode = dx_gs_viewport_dxbc;
+    pd.GS.BytecodeLength = sizeof dx_gs_viewport_dxbc;
+    ID3D12PipelineState *gs = fs_pso(c, &pd);
+    const FsStep steps[1] = {{gs, 0, 9, 0}};
+    const D3D12_VIEWPORT halves[2] = {{0, 0, 32, 64, 0, 1}, {32, 0, 32, 64, 0, 1}};
+    if (fs_draw_viewports(c, DXGI_FORMAT_UNKNOWN, black, &v[0][0], 9 * 7, steps, 1, img, halves, 2)) {
+      printf("viewports: %08x %08x %08x\n", (unsigned)img[4 * 64 + 4], (unsigned)img[4 * 64 + 60], (unsigned)img[32 * 64 + 16]);
+      CHECK(FS_RGB(img[4 * 64 + 4]) == 0xFF0000 && FS_RGB(img[60 * 64 + 60]) == 0x00FF00 && FS_RGB(img[4 * 64 + 60]) == 0x00FF00 && FS_RGB(img[32 * 64 + 16]) == 0x0000FF);
+    }
+    if (gs) ID3D12PipelineState_Release(gs);
+    D3D12_FEATURE_DATA_D3D12_OPTIONS o;
+    memset(&o, 0, sizeof o);
+    CHECK_HR(ID3D12Device_CheckFeatureSupport(c->dev, D3D12_FEATURE_D3D12_OPTIONS, &o, sizeof o));
+    /* (the CPU renderer takes the layer and viewport from a vertex shader; virglrenderer from a geometry shader only) */
+    CHECK(o.VPAndRTArrayIndexFromAnyShaderFeedingRasterizerSupportedWithoutGSEmulation == !g_hardware);
+  }
+  /* Logic operations: OutputMergerLogicOp, XOR into the target's bytes, and what is refused - blending and a logic operation at once, targets of independent blending with
+   * different logic operations. */
+  {
+    D3D12_FEATURE_DATA_D3D12_OPTIONS o;
+    memset(&o, 0, sizeof o);
+    CHECK_HR(ID3D12Device_CheckFeatureSupport(c->dev, D3D12_FEATURE_D3D12_OPTIONS, &o, sizeof o));
+    CHECK(o.OutputMergerLogicOp);
+    const float v[3][7] = {{-1, -1, 0.5f, 1, 0.4f, 0, 1}, {3, -1, 0.5f, 1, 0.4f, 0, 1}, {-1, 3, 0.5f, 1, 0.4f, 0, 1}};
+    const float clear[4] = {0.2f, 0.4f, 0.6f, 1};
+    fs_desc(c, &pd, layout);
+    D3D12_RENDER_TARGET_BLEND_DESC *b = &pd.BlendState.RenderTarget[0];
+    b->LogicOpEnable = TRUE;
+    b->LogicOp = D3D12_LOGIC_OP_XOR;
+    ID3D12PipelineState *x = fs_pso(c, &pd);
+    const FsStep steps[1] = {{x, 0, 3, 0}};
+    if (fs_draw(c, DXGI_FORMAT_UNKNOWN, clear, &v[0][0], 3 * 7, steps, 1, img)) {
+      printf("logic op: %08x\n", (unsigned)img[32 * 64 + 32]);
+      CHECK(img[32 * 64 + 32] == 0x00CC0099u);      /* (33 66 99 ff xor ff 66 00 ff, as B8G8R8A8: alpha 0, red cc, green 00, blue 99) */
+    }
+    if (x) ID3D12PipelineState_Release(x);
+    b->BlendEnable = TRUE;
+    b->SrcBlend = D3D12_BLEND_ONE, b->DestBlend = D3D12_BLEND_ZERO, b->BlendOp = D3D12_BLEND_OP_ADD;
+    b->SrcBlendAlpha = D3D12_BLEND_ONE, b->DestBlendAlpha = D3D12_BLEND_ZERO, b->BlendOpAlpha = D3D12_BLEND_OP_ADD;
+    CHECK(ID3D12Device_CreateGraphicsPipelineState(c->dev, &pd, &IID_ID3D12PipelineState, (void **)&bad) == E_INVALIDARG && !bad);
+    b->BlendEnable = FALSE;
+    pd.BlendState.IndependentBlendEnable = TRUE;
+    pd.NumRenderTargets = 2;
+    pd.RTVFormats[1] = DXGI_FORMAT_B8G8R8A8_UNORM;
+    pd.BlendState.RenderTarget[1].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+    CHECK(ID3D12Device_CreateGraphicsPipelineState(c->dev, &pd, &IID_ID3D12PipelineState, (void **)&bad) == E_INVALIDARG && !bad);
+  }
+}
+
 static void test_extras(ID3D12Device *dev, ID3D12CommandQueue *queue, ID3D12Fence *fence, UINT64 *fence_value) {
   Scene c;
   memset(&c, 0, sizeof c);
@@ -5527,6 +5937,8 @@ static void test_extras(ID3D12Device *dev, ID3D12CommandQueue *queue, ID3D12Fenc
   test_multisample(&c);
   test_limits(&c);
   test_blend_factor(&c);
+  test_fixed_state(&c);
+  test_stencil_refs_and_dynamic_bias(&c);
   test_planar(&c);
   test_tiled_formats(&c);
   test_cpu_planar(&c);
@@ -6487,6 +6899,8 @@ static void test_agility_streams(ID3D12Device *dev) {
   r2.DepthBias = 2.4f;
   r2.DepthClipEnable = TRUE;
   r2.LineRasterizationMode = D3D12_LINE_RASTERIZATION_MODE_ALIASED;
+  D3D12_FEATURE_DATA_D3D12_OPTIONS14 o14;      /* (front and back masks of their own: where the device has them) */
+  CHECK_HR(ID3D12Device_CheckFeatureSupport(dev, D3D12_FEATURE_D3D12_OPTIONS14, &o14, sizeof o14));
   D3D12_DEPTH_STENCIL_DESC2 ds2;
   memset(&ds2, 0, sizeof ds2);
   ds2.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
@@ -6506,7 +6920,7 @@ static void test_agility_streams(ID3D12Device *dev) {
     HRESULT want = S_OK;
     if (variant == 1) { r.LineRasterizationMode = D3D12_LINE_RASTERIZATION_MODE_QUADRILATERAL_NARROW; want = E_INVALIDARG; }      /* (NarrowQuadrilateralLinesSupported FALSE) */
     if (variant == 2) { r.LineRasterizationMode = (D3D12_LINE_RASTERIZATION_MODE)7; want = E_INVALIDARG; }
-    if (variant == 3) { d.StencilEnable = TRUE; d.BackFace.StencilReadMask = 0x0F; want = E_INVALIDARG; }      /* (IndependentFrontAndBackStencilRefMaskSupported FALSE) */
+    if (variant == 3) { d.StencilEnable = TRUE; d.BackFace.StencilReadMask = 0x0F; want = o14.IndependentFrontAndBackStencilRefMaskSupported ? S_OK : E_INVALIDARG; }      /* (OPTIONS14) */
     if (variant == 4) { d.BackFace.StencilReadMask = 0x0F; }      /* (masks that differ with the stencil test off) */
     if (variant == 5) { d.DepthBoundsTestEnable = TRUE; want = E_INVALIDARG; }
     if (variant == 7) r.LineRasterizationMode = D3D12_LINE_RASTERIZATION_MODE_QUADRILATERAL_WIDE;
@@ -6545,7 +6959,7 @@ static void test_agility_streams(ID3D12Device *dev) {
     CHECK(hr == want && (SUCCEEDED(hr) ? pso != NULL : pso == NULL));
     if (pso) ID3D12PipelineState_Release(pso);
   }
-  /* a subobject type of a later SDK than this one knows (PSDB), and the dynamic depth bias and strip cut, which this device has not (OPTIONS16 / 15) */
+  /* a subobject type of a later SDK than this one knows (PSDB), and the dynamic depth bias of a compute pipeline */
   memset(&s, 0, sizeof s);
   stream_add(&s, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SERIALIZED_ROOT_SIGNATURE, &csr, sizeof csr, sizeof(void *));
   stream_add(&s, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CS, &cs, sizeof cs, sizeof(void *));
@@ -6553,9 +6967,7 @@ static void test_agility_streams(ID3D12Device *dev) {
   const UINT junk_psdb[4] = {0};
   stream_add(&s, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PSDB, junk_psdb, sizeof junk_psdb, sizeof(void *));
   CHECK(stream_make(dev2, &s, &pso) == E_INVALIDARG && !pso);
-  D3D12_FEATURE_DATA_D3D12_OPTIONS16 o16;
-  CHECK_HR(ID3D12Device_CheckFeatureSupport(dev, D3D12_FEATURE_D3D12_OPTIONS16, &o16, sizeof o16));
-  CHECK(!o16.DynamicDepthBiasSupported);
+  /* (a compute pipeline has no depth bias to be dynamic: the flag is refused on it either way) */
   const D3D12_PIPELINE_STATE_FLAGS dynamic = D3D12_PIPELINE_STATE_FLAG_DYNAMIC_DEPTH_BIAS;
   stream_add(&with_flags, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_FLAGS, &dynamic, 4, 4);
   CHECK(stream_make(dev2, &with_flags, &pso) == E_INVALIDARG && !pso);

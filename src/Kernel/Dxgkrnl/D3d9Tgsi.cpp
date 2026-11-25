@@ -71,7 +71,8 @@ class TgsiEmitter {
   const uint32_t kPatchBase = kGsPosition + 6;   // a hull shader's patch constant registers (shadows of the tessellation factors)
   const uint32_t kLayer = kPatchBase + graphics::kMaxPatchRegisters;   // a geometry shader's SV_RenderTargetArrayIndex (the integer in x)
   const uint32_t kCompare = kLayer + 1, kCompare2 = kLayer + 2;   // the comparison lookups' own (kTexCompare: a cube's face, the passes)
-  const uint32_t kTempCount = kLayer + 3;
+  const uint32_t kViewportIndex = kLayer + 3;                       // ... and a geometry shader's SV_ViewportArrayIndex
+  const uint32_t kTempCount = kLayer + 4;
   uint32_t color_register(uint32_t target) const { return target == 0 ? kColor : kColorExtra + target - 1; }
   // The first output after the position and the varyings: the position as the shader wrote it (one a stream), or a hull shader's tessellation factors. (With the device's four
   // varyings of old it was OUT[5]; virgl's stream output declaration names the same register: VirglShaderModule.)
@@ -540,7 +541,9 @@ String TgsiEmitter::operand(const Instr::Src& s, uint32_t offset, uint32_t slot,
 String TgsiEmitter::destination(const Instr::Dst& d) {
   switch (d.type) {
     case kTemp: return temp(d.number, "");
-    case kRastOut: return temp(d.slot == kSlotLayer ? kLayer : kPosition, "");
+    case kRastOut:
+      if ((d.slot == kSlotLayer || d.slot == kSlotViewport) && !geometry_) unsupported_ = true;   // (virglrenderer takes a vertex or evaluation shader's layer and viewport from no TGSI it is given)
+      return temp(d.slot == kSlotLayer ? kLayer : d.slot == kSlotViewport ? kViewportIndex : kPosition, "");
     case kAttrOut:
     case kTexCrdOut:
       if (d.slot == kSlotPosition) return temp(kPosition, "");
@@ -959,8 +962,18 @@ bool TgsiEmitter::instruction(const Instr& ins) {
         add(layer, "OUT[");
         add_uint(layer, extra() + p_.geometry_streams());
         add(layer, "].x");
-        const String value = temp(kLayer, ".xxxx");
+        static const char* const kSplat[4] = {".xxxx", ".yyyy", ".zzzz", ".wwww"};
+        const String value = temp(kLayer, kSplat[p_.layer_component_ & 3]);
         line("MOV", &layer, &value);
+      }
+      if (p_.writes_viewport_) {   // (the viewport, an integer: the output after the layer's; from the layer's register when the two are packed into one)
+        static const char* const kSplat[4] = {".xxxx", ".yyyy", ".zzzz", ".wwww"};
+        String index = str();
+        add(index, "OUT[");
+        add_uint(index, extra() + p_.geometry_streams() + (p_.writes_layer_ ? 1 : 0));
+        add(index, "].x");
+        const String value = temp(p_.viewport_shares_layer_ ? kLayer : kViewportIndex, kSplat[p_.viewport_component_ & 3]);
+        line("MOV", &index, &value);
       }
       line("EMIT", &stream);
       return true;
@@ -1834,6 +1847,11 @@ void TgsiEmitter::assemble(String* out) {
       add(*out, "DCL OUT[");
       add_uint(*out, extra() + p_.geometry_streams());
       add(*out, "], LAYER\n");
+    }
+    if (p_.writes_viewport_) {   // (SV_ViewportArrayIndex: the host's viewport index output)
+      add(*out, "DCL OUT[");
+      add_uint(*out, extra() + p_.geometry_streams() + (p_.writes_layer_ ? 1 : 0));
+      add(*out, "], VIEWPORT_INDEX\n");
     }
   }
   if (hull_ || domain_) {

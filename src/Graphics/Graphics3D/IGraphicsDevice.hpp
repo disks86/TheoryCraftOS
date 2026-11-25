@@ -313,6 +313,12 @@ inline void sampler_compare_constant(CompareOp op, bool linear, float out[4]) {
 // The border colours a sampler can have (those of a Direct3D 12 static sampler).
 enum class BorderColor : uint8_t { TransparentBlack, OpaqueBlack, OpaqueWhite };
 constexpr Vec4 border_color_value(BorderColor b) { return b == BorderColor::OpaqueWhite ? Vec4{1, 1, 1, 1} : b == BorderColor::OpaqueBlack ? Vec4{0, 0, 0, 1} : Vec4{0, 0, 0, 0}; }
+// Anisotropic filtering (kFeature2SamplerState, max_anisotropy above 1, with a Linear filter): from the same derivatives, the footprint of the pixel in the texture has a longer axis
+// Pmax and a shorter Pmin (the lengths of the two derivative vectors, in texels of level 0); N = min(ceil(Pmax / Pmin), max_anisotropy) lookups are taken along the longer one, evenly spaced
+// over its length, at the level of detail log2(Pmax / N) (with lod_bias and the clamps), and averaged - the reference method of EXT_texture_filter_anisotropic. An explicit level (SampleLevel)
+// takes one lookup.
+// A border colour of any value (kFeature2SamplerState: custom_border): border_rgba, the channels as the texture keeps them (an integer texture's as the bits of its integers), in place of
+// `border`.
 struct SamplerDesc {
   Filter filter = Filter::Nearest;
   AddressMode address_u = AddressMode::Repeat;
@@ -328,7 +334,13 @@ struct SamplerDesc {
   // (Direct3D's X24_TYPELESS_G8_UINT / X32_TYPELESS_G8X24_UINT views, read with Load). Of the view, not the sampler: carried here so that every device's bind_texture takes it. A colour image
   // ignores it.
   bool stencil = false;
+  uint8_t max_anisotropy = 1;   // 1 .. kMaxAnisotropy
+  bool custom_border = false;
+  float border_rgba[4] = {0, 0, 0, 0};
 };
+constexpr uint32_t kMaxAnisotropy = 16;
+// The colour a sampler gives outside the image (AddressMode::ClampToBorder).
+inline Vec4 sampler_border_value(const SamplerDesc& s) { return s.custom_border ? Vec4{s.border_rgba[0], s.border_rgba[1], s.border_rgba[2], s.border_rgba[3]} : border_color_value(s.border); }
 
 // The bound textures as a fragment shader sees them: sample(unit, u, v) gives the colour (0..1 per component, straight alpha) of the image bound to `unit` with the sampler
 // it was bound with. A unit with nothing bound gives opaque black (a draw that uses a pipeline's textures without binding them is refused at submit, so a shader only
@@ -427,8 +439,12 @@ class ITextureSet {
 struct ShaderIo {
   Vec4 position;  // clip space (vertex stage only)
   Vec4 varying[kMaxVaryings];
-  // The layer of the pass's targets the primitive goes to (SV_RenderTargetArrayIndex, kFeature2LayeredTargets): written by a geometry shader; the primitive takes its first vertex's.
+  // The layer of the pass's targets the primitive goes to (SV_RenderTargetArrayIndex, kFeature2LayeredTargets): written by a geometry shader - or, with kFeature2LayerFromAnyStage, by the
+  // vertex or domain shader that feeds the rasterizer -; the primitive takes its first vertex's.
   uint32_t layer = 0;
+  // The viewport and scissor rectangle the primitive is drawn with (SV_ViewportArrayIndex, kFeature2Viewports; from the same stages): its first vertex's, 0 when that is not below the
+  // number set (ICommandBuffer::set_viewports).
+  uint32_t viewport = 0;
 };
 
 // --- Storage images (DeviceInfo::features2 kFeature2StorageImages) -----------
@@ -765,10 +781,13 @@ struct StencilState {
 // Blending (kFeatureBlendState): result = source * source_factor (op) destination * destination_factor, for the colour and the alpha on their own, then only the channels
 // of write_mask (bit 0 red .. bit 3 alpha) are stored. Min / Max ignore the factors. With `custom` false the pipeline's alpha_blend decides (source over destination).
 // The Constant factors (DeviceInfo::blend_constant) are the state's `constant` colour (each channel its own) or its alpha (every channel), and one minus those.
+// The Src1 factors (kFeature2DualSourceBlend: Direct3D's dual-source blending) are the fragment shader's second colour output (SV_Target1) - its colour or its alpha, and one
+// minus those - for blending into colour target 0; a pipeline with them draws into one colour target (color_target_count 1) and its fragment shader writes two outputs.
 enum class BlendFactor : uint8_t { Zero, One, SrcColor, InvSrcColor, SrcAlpha, InvSrcAlpha, DstColor, InvDstColor, DstAlpha, InvDstAlpha, SrcAlphaSaturate,
-                                   ConstantColor, InvConstantColor, ConstantAlpha, InvConstantAlpha };
-constexpr uint32_t kBlendFactorCount = 15;
-constexpr bool is_constant_blend_factor(BlendFactor f) { return f >= BlendFactor::ConstantColor; }
+                                   ConstantColor, InvConstantColor, ConstantAlpha, InvConstantAlpha, Src1Color, InvSrc1Color, Src1Alpha, InvSrc1Alpha };
+constexpr uint32_t kBlendFactorCount = 19;
+constexpr bool is_constant_blend_factor(BlendFactor f) { return f >= BlendFactor::ConstantColor && f <= BlendFactor::InvConstantAlpha; }
+constexpr bool is_dual_source_blend_factor(BlendFactor f) { return f >= BlendFactor::Src1Color && f <= BlendFactor::InvSrc1Alpha; }
 enum class BlendOp : uint8_t { Add, Subtract, ReverseSubtract, Min, Max };
 struct BlendState {
   bool custom = false;
@@ -778,7 +797,68 @@ struct BlendState {
   uint8_t write_mask = 0xF;
   float constant[4] = {0, 0, 0, 0};   // red, green, blue, alpha: the colour of the Constant factors
   bool uses_constant() const { return enable && (is_constant_blend_factor(src_color) || is_constant_blend_factor(dst_color) || is_constant_blend_factor(src_alpha) || is_constant_blend_factor(dst_alpha)); }
+  bool uses_dual_source() const {
+    return enable && (is_dual_source_blend_factor(src_color) || is_dual_source_blend_factor(dst_color) || is_dual_source_blend_factor(src_alpha) || is_dual_source_blend_factor(dst_alpha));
+  }
 };
+
+// Logic operations (kFeature2LogicOps) in place of blending: what is stored is op(source, destination) on the bits of the target's channels (the shader's colour converted to the
+// target's format first; Direct3D defines them for UINT targets, and for the normalised 8-bit ones they work on the stored bytes as OpenGL's do). A float or sRGB target is written as
+// if there were none. Numbered as D3D11_LOGIC_OP / D3D12_LOGIC_OP.
+enum class LogicOp : uint8_t { Clear, Set, Copy, CopyInverted, Noop, Invert, And, Nand, Or, Nor, Xor, Equiv, AndReverse, AndInverted, OrReverse, OrInverted };
+constexpr uint32_t kLogicOpCount = 16;
+constexpr uint32_t apply_logic_op(LogicOp op, uint32_t s, uint32_t d) {
+  switch (op) {
+    case LogicOp::Clear: return 0;
+    case LogicOp::Set: return ~0u;
+    case LogicOp::Copy: return s;
+    case LogicOp::CopyInverted: return ~s;
+    case LogicOp::Noop: return d;
+    case LogicOp::Invert: return ~d;
+    case LogicOp::And: return s & d;
+    case LogicOp::Nand: return ~(s & d);
+    case LogicOp::Or: return s | d;
+    case LogicOp::Nor: return ~(s | d);
+    case LogicOp::Xor: return s ^ d;
+    case LogicOp::Equiv: return ~(s ^ d);
+    case LogicOp::AndReverse: return s & ~d;
+    case LogicOp::AndInverted: return ~s & d;
+    case LogicOp::OrReverse: return s | ~d;
+    case LogicOp::OrInverted: return ~s | d;
+  }
+  return s;
+}
+
+// How triangles are filled (kFeature2RasterizerState): Wireframe draws the edges of each triangle that is not culled as lines (an edge the clipping or a strip's split made inside a
+// polygon is not drawn), with the triangle's depth and depth bias.
+enum class FillMode : uint8_t { Solid, Wireframe };
+
+// Depth bias (kFeature2RasterizerState), as Direct3D 10+ defines it: what is added to the depth of every fragment of a triangle is
+//   bias = constant * r + slope * max(|dz/dx|, |dz/dy|)   (the slope of the triangle's window-space depth, per pixel)
+// limited by `clamp` (above 0: at most clamp; below 0: at least clamp; 0: no limit). r is the depth format's unit: 1 / (2^unorm_bits - 1) for a normalised format of that many bits (16
+// or 24), and for a float format (unorm_bits 0) 2^(e - 23), e the exponent of the largest depth of the triangle's vertices. The biased depth is clamped to the viewport's depth range.
+// Lines and points are not biased (as OpenGL's polygon offset leaves them).
+struct DepthBias {
+  float constant = 0.0f;   // (Direct3D 10/11's integer DepthBias, Direct3D 12's RASTERIZER1/2 float one)
+  float slope = 0.0f, clamp = 0.0f;
+  uint8_t unorm_bits = 0;   // 0 (float), 16 or 24
+  bool enabled() const { return constant != 0.0f || slope != 0.0f; }
+};
+// The unit r of a depth bias for a triangle whose largest window depth is `max_z`.
+inline float depth_bias_unit(const DepthBias& b, float max_z) {
+  if (b.unorm_bits) return 1.0f / static_cast<float>((1u << b.unorm_bits) - 1u);
+  const uint32_t bits = __builtin_bit_cast(uint32_t, max_z < 0 ? -max_z : max_z);
+  const int32_t exponent = static_cast<int32_t>((bits >> 23) & 0xFF) - 127;
+  if (exponent - 23 < -126) return 0.0f;   // (zero or a denormal: a unit too small to be a float)
+  return __builtin_bit_cast(float, static_cast<uint32_t>(exponent - 23 + 127) << 23);
+}
+// The bias of a triangle of that slope and largest depth.
+inline float depth_bias_value(const DepthBias& b, float max_slope, float max_z) {
+  float bias = b.constant * depth_bias_unit(b, max_z) + b.slope * max_slope;
+  if (b.clamp > 0.0f && bias > b.clamp) bias = b.clamp;
+  if (b.clamp < 0.0f && bias < b.clamp) bias = b.clamp;
+  return bias == bias ? bias : 0.0f;
+}
 
 enum class CullMode : uint8_t { None, Back, Front };
 enum class FrontFace : uint8_t { CounterClockwise, Clockwise };  // as seen on screen
@@ -832,6 +912,17 @@ struct GraphicsPipelineDesc {
   // conservative rasterization, tier 1 (the attributes and depth are those of the triangle's plane at the pixel's centre, extrapolated where the centre is outside; degenerate triangles are
   // culled). Lines and points are drawn as without it.
   bool conservative = false;
+  // kFeature2RasterizerState: how triangles are filled, the depth bias, whether primitives are clipped against the near and far planes (0 <= z <= w) - without it they are not, and
+  // every fragment's depth is clamped to the viewport's range instead -, and the stencil state of back faces (with separate_back_stencil: back_stencil's compare, ops, masks
+  // and reference; `enable` is always stencil's; lines and points are front faces). Without it these have their defaults.
+  FillMode fill_mode = FillMode::Solid;
+  DepthBias depth_bias;
+  bool depth_clip = true;
+  bool separate_back_stencil = false;
+  StencilState back_stencil;
+  // kFeature2LogicOps: a logic operation in place of blending, for every colour target (the blend state is then not used).
+  bool logic_op_enable = false;
+  LogicOp logic_op = LogicOp::Noop;
 };
 
 class IPipeline {
@@ -904,6 +995,13 @@ class ICommandBuffer {
   // Defaults to the whole render target.
   virtual void set_viewport(const Viewport& viewport) = 0;
   virtual void set_scissor(const Rect2D& scissor) = 0;
+  // Several viewports and scissor rectangles (kFeature2Viewports: 1 .. kMaxViewports; a primitive is drawn with those its ShaderIo::viewport names). set_viewport and set_scissor set one.
+  virtual void set_viewports(ArrayView<const Viewport> viewports) {
+    if (!viewports.empty()) set_viewport(viewports[0]);
+  }
+  virtual void set_scissors(ArrayView<const Rect2D> scissors) {
+    if (!scissors.empty()) set_scissor(scissors[0]);
+  }
   // Several instances (kFeatureInstancing): the draw is made instance_count times with instance numbers first_instance ..; a device without it draws once.
   virtual void draw(uint32_t vertex_count, uint32_t first_vertex = 0, uint32_t instance_count = 1, uint32_t first_instance = 0) = 0;
   virtual void draw_indexed(uint32_t index_count, uint32_t first_index = 0, int32_t vertex_offset = 0, uint32_t instance_count = 1, uint32_t first_instance = 0) = 0;
@@ -1024,7 +1122,14 @@ enum DeviceFeature2 : uint32_t {
   // faces (as an array) and of any level of a layered image (StorageImageView::level).
   kFeature2MipmappedLayers = 1u << 10,
   kFeature2ColorResolveModes = 1u << 14,    // resolve_image of a colour image with ResolveMode::Min / Max (what kFeatureResolveModes has, without the depth modes)
+  kFeature2RasterizerState = 1u << 7,       // GraphicsPipelineDesc::fill_mode, depth_bias, depth_clip, separate_back_stencil / back_stencil
+  kFeature2DualSourceBlend = 1u << 8,       // the BlendFactor Src1* factors
+  kFeature2LogicOps = 1u << 9,              // GraphicsPipelineDesc::logic_op_enable / logic_op
+  kFeature2SamplerState = 1u << 11,         // SamplerDesc::max_anisotropy and custom_border / border_rgba
+  kFeature2Viewports = 1u << 12,            // ICommandBuffer::set_viewports / set_scissors and ShaderIo::viewport from geometry shaders
+  kFeature2LayerFromAnyStage = 1u << 13,    // ShaderIo::layer and ShaderIo::viewport written by vertex and domain shaders (Direct3D 11.3's VPAndRTArrayIndexFromAnyShaderFeedingRasterizer)
 };
+constexpr uint32_t kMaxViewports = 16;
 
 
 struct DeviceInfo {

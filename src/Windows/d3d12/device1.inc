@@ -357,7 +357,8 @@ static void STDMETHODCALLTYPE dev_CreateSamplerFeedbackUnorderedAccessView(Dev *
 /* A stream is subobjects one after the other, each its type (a UINT) and then its contents at their alignment, the whole aligned to a pointer
  * (CD3DX12_PIPELINE_STATE_STREAM_SUBOBJECT). It is made into a graphics or a compute pipeline description. */
 
-/* A float depth bias (RASTERIZER1 / 2) as the integer of D3D12_RASTERIZER_DESC: the nearest, within an INT. */
+/* A float depth bias (RASTERIZER1 / 2) as the integer of D3D12_RASTERIZER_DESC: the nearest, within an INT (what the description says; the pipeline draws with the float itself,
+ * PsoExtras). */
 static INT depth_bias_int(FLOAT bias) {
   if (!(bias == bias)) return 0;
   if (bias >= 2147483520.0f) return 0x7FFFFFFF;
@@ -369,18 +370,20 @@ static const D3D12_BLEND_DESC g_default_blend12 = {FALSE, FALSE, {{FALSE, FALSE,
 /* The stream as a graphics or a compute description (`*is_compute`); the descriptions point into the stream. A SERIALIZED_ROOT_SIGNATURE subobject is made into a root
  * signature of `dev`'s, returned in `*made` (NULL when there is none), which the caller releases once the pipeline is made (the pipeline holds its own reference).
  *
- * The subobjects of the later Agility SDKs map to the state the kernel's pipelines have:
- *   - DEPTH_STENCIL2: front and back faces with their own stencil masks. IndependentFrontAndBackStencilRefMaskSupported is FALSE (OPTIONS14), so masks that differ
- *     with the stencil test on are E_INVALIDARG, as Direct3D 12 refuses them on such a device; the masks go to the pipeline's one pair.
- *   - RASTERIZER1 / RASTERIZER2: the depth bias as a float. The pipeline's bias is D3D12_RASTERIZER_DESC's integer, so it is rounded to the nearest; the clamp and the
+ * The subobjects of the later Agility SDKs map to the state the kernel's pipelines have (what the description cannot say goes in `*x`, PsoExtras):
+ *   - DEPTH_STENCIL2: front and back faces with their own stencil masks - the kernel pipeline's back_stencil masks, where the device has DEV_FEATURE2_RASTERIZER_STATE
+ *     (IndependentFrontAndBackStencilRefMaskSupported, OPTIONS14); on a device without it masks that differ with the stencil test on are E_INVALIDARG, as Direct3D 12
+ *     refuses them on such a device.
+ *   - RASTERIZER1 / RASTERIZER2: the depth bias as a float, which the kernel pipeline's bias is (D3D12_RASTERIZER_DESC::DepthBias has it rounded); the clamp and the
  *     slope go as they are. RASTERIZER2's line mode is the pair of MultisampleEnable / AntialiasedLineEnable it replaces (aliased, alpha-antialiased, wide quadrilateral);
  *     narrow quadrilateral lines are E_INVALIDARG (NarrowQuadrilateralLinesSupported is FALSE, OPTIONS19).
  *   - one subobject of each kind: DEPTH_STENCIL, DEPTH_STENCIL1 and DEPTH_STENCIL2 are one kind, the three rasterizers another, ROOT_SIGNATURE and SERIALIZED_ROOT_SIGNATURE
  *     a third; a second of a kind is E_INVALIDARG.
  *   - PSDB and the subobject types after it: E_INVALIDARG (a type this runtime does not know). */
 static HRESULT stream_parse(Dev *dev, const D3D12_PIPELINE_STATE_STREAM_DESC *stream, D3D12_GRAPHICS_PIPELINE_STATE_DESC *gp, D3D12_COMPUTE_PIPELINE_STATE_DESC *cp, BOOL *is_compute,
-                            ID3D12RootSignature **made) {
+                            PsoExtras *x, ID3D12RootSignature **made) {
   *made = NULL;
+  memset(x, 0, sizeof *x);
   if (!stream || !stream->pPipelineStateSubobjectStream || stream->SizeInBytes < sizeof(UINT)) return E_INVALIDARG;
   D3D12_GRAPHICS_PIPELINE_STATE_DESC g;
   D3D12_COMPUTE_PIPELINE_STATE_DESC c;
@@ -506,8 +509,12 @@ static HRESULT stream_parse(Dev *dev, const D3D12_PIPELINE_STATE_STREAM_DESC *st
         D3D12_DEPTH_STENCIL_DESC2 d2;
         memcpy(&d2, p, inner);
         if (d2.DepthBoundsTestEnable) STREAM_FAIL(E_INVALIDARG);      /* (DepthBoundsTestSupported is FALSE) */
-        if (d2.StencilEnable && (d2.FrontFace.StencilReadMask != d2.BackFace.StencilReadMask || d2.FrontFace.StencilWriteMask != d2.BackFace.StencilWriteMask))
-          STREAM_FAIL(E_INVALIDARG);      /* (IndependentFrontAndBackStencilRefMaskSupported is FALSE) */
+        if (d2.StencilEnable && (d2.FrontFace.StencilReadMask != d2.BackFace.StencilReadMask || d2.FrontFace.StencilWriteMask != d2.BackFace.StencilWriteMask) &&
+            !(dev->caps.features2 & DEV_FEATURE2_RASTERIZER_STATE))
+          STREAM_FAIL(E_INVALIDARG);      /* (IndependentFrontAndBackStencilRefMaskSupported is FALSE there) */
+        x->has_back_masks = 1;
+        x->back_read_mask = d2.BackFace.StencilReadMask;
+        x->back_write_mask = d2.BackFace.StencilWriteMask;
         g.DepthStencilState.DepthEnable = d2.DepthEnable;
         g.DepthStencilState.DepthWriteMask = d2.DepthWriteMask;
         g.DepthStencilState.DepthFunc = d2.DepthFunc;
@@ -530,6 +537,8 @@ static HRESULT stream_parse(Dev *dev, const D3D12_PIPELINE_STATE_STREAM_DESC *st
         D3D12_RASTERIZER_DESC *r = &g.RasterizerState;
         r->FillMode = r1.FillMode; r->CullMode = r1.CullMode; r->FrontCounterClockwise = r1.FrontCounterClockwise;
         r->DepthBias = depth_bias_int(r1.DepthBias); r->DepthBiasClamp = r1.DepthBiasClamp; r->SlopeScaledDepthBias = r1.SlopeScaledDepthBias;
+        x->has_bias = 1;
+        x->depth_bias = r1.DepthBias;
         r->DepthClipEnable = r1.DepthClipEnable; r->MultisampleEnable = r1.MultisampleEnable; r->AntialiasedLineEnable = r1.AntialiasedLineEnable;
         r->ForcedSampleCount = r1.ForcedSampleCount; r->ConservativeRaster = r1.ConservativeRaster;
         break;
@@ -542,6 +551,8 @@ static HRESULT stream_parse(Dev *dev, const D3D12_PIPELINE_STATE_STREAM_DESC *st
         D3D12_RASTERIZER_DESC *r = &g.RasterizerState;
         r->FillMode = r2.FillMode; r->CullMode = r2.CullMode; r->FrontCounterClockwise = r2.FrontCounterClockwise;
         r->DepthBias = depth_bias_int(r2.DepthBias); r->DepthBiasClamp = r2.DepthBiasClamp; r->SlopeScaledDepthBias = r2.SlopeScaledDepthBias;
+        x->has_bias = 1;
+        x->depth_bias = r2.DepthBias;
         r->DepthClipEnable = r2.DepthClipEnable;
         r->MultisampleEnable = r2.LineRasterizationMode == D3D12_LINE_RASTERIZATION_MODE_QUADRILATERAL_WIDE;
         r->AntialiasedLineEnable = r2.LineRasterizationMode == D3D12_LINE_RASTERIZATION_MODE_ALPHA_ANTIALIASED;
@@ -574,10 +585,11 @@ static HRESULT pipeline_stream(Dev *This, const D3D12_PIPELINE_STATE_STREAM_DESC
   D3D12_GRAPHICS_PIPELINE_STATE_DESC g;
   D3D12_COMPUTE_PIPELINE_STATE_DESC c;
   BOOL compute;
+  PsoExtras x;
   ID3D12RootSignature *made;
-  const HRESULT hr = stream_parse(This, stream, &g, &c, &compute, &made);
+  const HRESULT hr = stream_parse(This, stream, &g, &c, &compute, &x, &made);
   if (FAILED(hr)) return hr;
-  const HRESULT created = compute ? dev_CreateComputePipelineState(This, &c, riid, out) : dev_CreateGraphicsPipelineState(This, &g, riid, out);
+  const HRESULT created = compute ? dev_CreateComputePipelineState(This, &c, riid, out) : pso_create_graphics(This, &g, &x, riid, out);
   if (made) ID3D12RootSignature_Release(made);
   return created;
 }

@@ -79,7 +79,7 @@ typedef struct CmdAlloc {
 typedef struct CmdList CmdList;
 enum { B_PSO = 1, B_TOPOLOGY, B_STENCIL_REF, B_INDEX_BUFFER, B_VERTEX_BUFFERS, B_HEAPS, B_GRAPHICS_SIGNATURE, B_COMPUTE_SIGNATURE, B_GRAPHICS_CONSTANTS, B_COMPUTE_CONSTANTS,
        B_GRAPHICS_CBV, B_GRAPHICS_SRV, B_GRAPHICS_UAV, B_COMPUTE_CBV, B_COMPUTE_SRV, B_COMPUTE_UAV, B_GRAPHICS_TABLE, B_COMPUTE_TABLE, B_DRAW, B_DRAW_INDEXED, B_DISPATCH, B_INDIRECT,
-       B_BLEND_FACTOR };
+       B_BLEND_FACTOR, B_STENCIL_REFS, B_DEPTH_BIAS };
 static void bundle_log(CmdList *l, UINT id, const UINT64 a[6], const UINT *data, UINT ndata);
 #define BUNDLE_LOG(l, id, ...) do { if ((l)->bundle) { UINT64 a_[6] = {__VA_ARGS__}; bundle_log((l), (id), a_, NULL, 0); return; } } while (0)
 #define BUNDLE_LOG_DATA(l, id, data, n, ...) do { if ((l)->bundle) { UINT64 a_[6] = {__VA_ARGS__}; bundle_log((l), (id), a_, (data), (n)); return; } } while (0)
@@ -135,10 +135,12 @@ struct CmdList {
   struct { UINT alloc, stride; UINT64 offset, size; } vb[8];      /* the vertex buffers (input slots) */
   UINT ib_alloc, ib_format;
   UINT64 ib_offset;
-  D3D12_VIEWPORT viewport;
-  D3D12_RECT scissor;
+  D3D12_VIEWPORT viewports[16];      /* (D3D12_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE; the kernel's device takes them all with DEV_FEATURE2_VIEWPORTS, else the first) */
+  D3D12_RECT scissors[16];
+  UINT viewport_count, scissor_count;
   int have_viewport, have_scissor;
-  UINT stencil_ref;
+  UINT stencil_ref, stencil_ref_back;      /* OMSetStencilRef (both), OMSetFrontAndBackStencilRef (each its own) */
+  float depth_bias[3];         /* RSSetDepthBias: the bias, its clamp and the slope - what a pipeline made with D3D12_PIPELINE_STATE_FLAG_DYNAMIC_DEPTH_BIAS draws with (0 when reset) */
   float blend_factor[4];       /* OMSetBlendFactor (0, 0, 0, 0 when the list is reset) */
   UINT rtv[8];                 /* the kernel's allocations of the colour targets */
   UINT rtv_count;
@@ -546,7 +548,7 @@ static int ensure_pass(CmdList *l) {
   int uav_only = 0;
   if (!color && !depth && l->pso && !l->pso->compute) {
     /* no target at all: a draw that writes unordered access views only, over the viewport (with the pipeline's samples: ForcedSampleCount) */
-    const float right = l->have_viewport ? l->viewport.TopLeftX + l->viewport.Width : 0.0f, bottom = l->have_viewport ? l->viewport.TopLeftY + l->viewport.Height : 0.0f;
+    const float right = l->have_viewport ? l->viewports[0].TopLeftX + l->viewports[0].Width : 0.0f, bottom = l->have_viewport ? l->viewports[0].TopLeftY + l->viewports[0].Height : 0.0f;
     const UINT width = right >= 1.0f && right <= 16384.0f ? (UINT)(right + 0.999f) : 0, height = bottom >= 1.0f && bottom <= 16384.0f ? (UINT)(bottom + 0.999f) : 0;
     color = uav_only_target(l->d.dev, width, height, l->pso->samples);
     uav_only = color != 0;
@@ -724,14 +726,14 @@ static int prepare_draw(CmdList *l, int indexed) {
     UINT strides[8] = {0};
     for (UINT slot = 0; slot < 8; ++slot)
       if (l->pso->slots_used >> slot & 1) strides[slot] = l->vb[slot].stride;
-    const UINT pipeline = pso_pipeline(l->pso, strides, l->stencil_ref, l->blend_factor);
+    const UINT pipeline = pso_pipeline(l->pso, strides, l->stencil_ref, l->stencil_ref_back, l->depth_bias, l->blend_factor);
     if (pipeline && list_bind_pipeline(l, l->pso, pipeline)) packet(l, OP_BIND_PIPELINE, &pipeline, 1);
     send_binding(l, &l->gfx, 1);
     l->dirty_heaps = 0;
   }
   if (l->pass_open && l->uav_only_samples && !l->rtv_count && !l->dsv) {
     /* (a pass on the device's target for draws with no target: another for a pipeline of other samples, or a viewport past it) */
-    const float right = l->have_viewport ? l->viewport.TopLeftX + l->viewport.Width : 0.0f, bottom = l->have_viewport ? l->viewport.TopLeftY + l->viewport.Height : 0.0f;
+    const float right = l->have_viewport ? l->viewports[0].TopLeftX + l->viewports[0].Width : 0.0f, bottom = l->have_viewport ? l->viewports[0].TopLeftY + l->viewports[0].Height : 0.0f;
     if (l->pso->samples != l->uav_only_samples || right > (float)l->uav_only_width || bottom > (float)l->uav_only_height) end_pass(l);
   }
   if (!ensure_pass(l)) return 0;
@@ -742,7 +744,7 @@ static int prepare_draw(CmdList *l, int indexed) {
   UINT strides[8] = {0};
   for (UINT slot = 0; slot < 8; ++slot)
     if (l->pso->slots_used >> slot & 1) strides[slot] = l->vb[slot].stride;
-  const UINT pipeline = pso_pipeline(l->pso, strides, l->stencil_ref, l->blend_factor);
+  const UINT pipeline = pso_pipeline(l->pso, strides, l->stencil_ref, l->stencil_ref_back, l->depth_bias, l->blend_factor);
   if (!pipeline) return 0;
   if (!list_bind_pipeline(l, l->pso, pipeline)) return 0;
   if (pipeline != l->sent_pipeline) {
@@ -780,15 +782,28 @@ static int prepare_draw(CmdList *l, int indexed) {
     l->sent_ib_offset = l->ib_offset;
     l->sent_ib_format = l->ib_format;
   }
+  const UINT several = (l->d.dev->caps.features2 & DEV_FEATURE2_VIEWPORTS) ? 16u : 1u;
   if (l->have_viewport && !l->sent_viewport) {
-    UINT w[6] = {bits_of(l->viewport.TopLeftX), bits_of(l->viewport.TopLeftY), bits_of(l->viewport.Width), bits_of(l->viewport.Height), bits_of(l->viewport.MinDepth), bits_of(l->viewport.MaxDepth)};
-    packet(l, OP_SET_VIEWPORT, w, 6);
+    UINT w[6 * 16];
+    const UINT n = l->viewport_count < several ? l->viewport_count : several;
+    for (UINT i = 0; i < n; ++i) {
+      const D3D12_VIEWPORT *v = &l->viewports[i];
+      const UINT words[6] = {bits_of(v->TopLeftX), bits_of(v->TopLeftY), bits_of(v->Width), bits_of(v->Height), bits_of(v->MinDepth), bits_of(v->MaxDepth)};
+      memcpy(w + 6 * i, words, sizeof words);
+    }
+    packet(l, OP_SET_VIEWPORT, w, 6 * n);
     l->sent_viewport = 1;
   }
   if (l->have_scissor && !l->sent_scissor) {
-    LONG width = l->scissor.right - l->scissor.left, height = l->scissor.bottom - l->scissor.top;
-    UINT w[4] = {(UINT)l->scissor.left, (UINT)l->scissor.top, width > 0 ? (UINT)width : 0, height > 0 ? (UINT)height : 0};
-    packet(l, OP_SET_SCISSOR, w, 4);
+    UINT w[4 * 16];
+    const UINT n = l->scissor_count < several ? l->scissor_count : several;
+    for (UINT i = 0; i < n; ++i) {
+      const D3D12_RECT *r = &l->scissors[i];
+      const LONG width = r->right - r->left, height = r->bottom - r->top;
+      const UINT words[4] = {(UINT)r->left, (UINT)r->top, width > 0 ? (UINT)width : 0, height > 0 ? (UINT)height : 0};
+      memcpy(w + 4 * i, words, sizeof words);
+    }
+    packet(l, OP_SET_SCISSOR, w, 4 * n);
     l->sent_scissor = 1;
   }
   return 1;
@@ -840,15 +855,21 @@ static void STDMETHODCALLTYPE list_SetPipelineState(CmdList *l, ID3D12PipelineSt
   keep(l, (IUnknown *)p);
 }
 static void STDMETHODCALLTYPE list_IASetPrimitiveTopology(CmdList *l, D3D12_PRIMITIVE_TOPOLOGY t) { BUNDLE_LOG(l, B_TOPOLOGY, t); l->topology = t; }
+/* (up to D3D12_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE: a primitive is drawn with the pair its SV_ViewportArrayIndex names; more than that is the debug layer's error,
+ * and the first sixteen are taken) */
 static void STDMETHODCALLTYPE list_RSSetViewports(CmdList *l, UINT n, const D3D12_VIEWPORT *v) {
   if (!n || !v) return;
-  l->viewport = v[0];
+  if (n > 16) n = 16;
+  memcpy(l->viewports, v, (SIZE_T)n * sizeof *v);
+  l->viewport_count = n;
   l->have_viewport = 1;
   l->sent_viewport = 0;
 }
 static void STDMETHODCALLTYPE list_RSSetScissorRects(CmdList *l, UINT n, const D3D12_RECT *r) {
   if (!n || !r) return;
-  l->scissor = r[0];
+  if (n > 16) n = 16;
+  memcpy(l->scissors, r, (SIZE_T)n * sizeof *r);
+  l->scissor_count = n;
   l->have_scissor = 1;
   l->sent_scissor = 0;
 }
@@ -861,7 +882,7 @@ static void STDMETHODCALLTYPE list_OMSetBlendFactor(CmdList *l, const FLOAT fact
   BUNDLE_LOG(l, B_BLEND_FACTOR, bits[0], bits[1], bits[2], bits[3]);
   memcpy(l->blend_factor, f, sizeof l->blend_factor);
 }
-static void STDMETHODCALLTYPE list_OMSetStencilRef(CmdList *l, UINT ref) { BUNDLE_LOG(l, B_STENCIL_REF, ref); l->stencil_ref = ref; }
+static void STDMETHODCALLTYPE list_OMSetStencilRef(CmdList *l, UINT ref) { BUNDLE_LOG(l, B_STENCIL_REF, ref); l->stencil_ref = l->stencil_ref_back = ref; }
 static void STDMETHODCALLTYPE list_IASetIndexBuffer(CmdList *l, const D3D12_INDEX_BUFFER_VIEW *view) { BUNDLE_LOG(l, B_INDEX_BUFFER, view ? view->BufferLocation : 0, view ? view->SizeInBytes : 0, view ? view->Format : 0);
   if (!view || !view->BufferLocation) { l->ib_alloc = 0; return; }
   UINT64 offset = 0;

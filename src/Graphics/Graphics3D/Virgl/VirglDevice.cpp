@@ -24,6 +24,7 @@
 #include "Graphics/Graphics3D/Virgl/VirglProtocol.hpp"
 #include "Utility/AllocatedView.hpp"
 #include "Utility/ByteStream.hpp"
+#include "Utility/ByteBuffer.hpp"
 
 namespace graphics {
 
@@ -56,6 +57,7 @@ void destroy(allocators::IAllocator& allocator, T* object) {
 }
 
 static_assert(sizeof virgl::kBlendFactors / sizeof virgl::kBlendFactors[0] == kBlendFactorCount, "a Gallium factor for every BlendFactor");
+static_assert(sizeof virgl::kLogicOps / sizeof virgl::kLogicOps[0] == kLogicOpCount, "a Gallium logic operation for every LogicOp");
 
 uint32_t float_bits(float f) {
   uint32_t u;
@@ -965,6 +967,89 @@ uint32_t virgl_vertex_format(VertexFormat format) {
   return kFirst[static_cast<uint32_t>(vertex_format_type(format))] + vertex_format_components(format) - 1;
 }
 
+// --- Depth bias of a normalised depth format --------------------------------------------------------------------------------------------------------------------------------------
+// The host's depth buffers are 32-bit floats (Z32F_S8X24), and its polygon offset counts in a float buffer's unit, 2^(e - 23) for the largest depth e of the triangle - which is
+// Direct3D's unit for a float format. A 16- or 24-bit format's unit is a fixed step, 1 / (2^n - 1): the constant part of such a bias cannot be had from the polygon offset, so the
+// pipeline's fragment shader gets the whole bias added to the fragment's depth. The text of that shader: the bias is worked out at the start (the slope from the derivatives of the
+// window depth, while every fragment of the quad still runs), and the depth is written wherever the shader ends.
+// (a C string's bytes, and bytes ending in a NUL as the C string they hold: char and uint8_t have the same size and alignment, and either view lives as long as what it views)
+ConstByteView text_view(const char* text) { return ConstByteView(reinterpret_cast<const uint8_t*>(text), string_length(text)); }
+const char* text_chars(ConstByteView bytes) { return reinterpret_cast<const char*>(bytes.data()); }
+bool text_starts(ConstByteView text, uint64_t at, const char* what) {
+  for (uint64_t k = 0; what[k]; ++k)
+    if (at + k >= text.size() || text[at + k] != static_cast<uint8_t>(what[k])) return false;
+  return true;
+}
+int64_t text_find(ConstByteView text, const char* what, uint64_t from = 0) {
+  for (uint64_t at = from; at < text.size(); ++at)
+    if (text_starts(text, at, what)) return static_cast<int64_t>(at);
+  return -1;
+}
+bool put_text(ByteBuffer& out, const char* what) { return out.append(text_view(what)); }
+bool put_number(ByteBuffer& out, uint32_t v) {
+  char digits[11];
+  uint32_t n = 0;
+  do {
+    digits[n++] = static_cast<char>('0' + v % 10);
+    v /= 10;
+  } while (v && n < sizeof digits);
+  bool ok = true;
+  while (n) ok = ok && out.put8(static_cast<uint8_t>(digits[--n]));
+  return ok;
+}
+bool depth_bias_fragment_text(ConstByteView text, const DepthBias& bias, ByteBuffer& out) {
+  // (the shader's colour outputs come first: the depth is the next output; the temporary after the shader's own; the immediates are numbered in order)
+  uint32_t outputs = 0, immediates = 0, temps = 0;
+  for (int64_t at = text_find(text, "DCL OUT["); at >= 0; at = text_find(text, "DCL OUT[", static_cast<uint64_t>(at) + 1)) ++outputs;
+  for (uint64_t at = 0; at < text.size(); ++at)
+    if ((at == 0 || text[at - 1] == '\n') && text_starts(text, at, "IMM[")) ++immediates;
+  const int64_t temp_at = text_find(text, "DCL TEMP[0..");
+  if (temp_at < 0 || outputs == 0) return false;
+  for (uint64_t at = static_cast<uint64_t>(temp_at) + 12; at < text.size() && text[at] >= '0' && text[at] <= '9' && temps < 100000; ++at) temps = temps * 10 + (text[at] - '0');
+  const uint32_t temp = temps + 1;
+  const bool has_position = text_find(text, "DCL IN[16], POSITION") >= 0;
+  const int64_t const_at = text_find(text, "DCL CONST[");
+  // (the first instruction: a line of the body, "  <n>: ...")
+  int64_t first = -1;
+  for (uint64_t at = 0; at < text.size() && first < 0; ++at) {
+    if (at != 0 && text[at - 1] != '\n') continue;
+    uint64_t k = at;
+    while (k < text.size() && text[k] == ' ') ++k;
+    const uint64_t digits = k;
+    while (k < text.size() && text[k] >= '0' && text[k] <= '9') ++k;
+    if (k > digits && k < text.size() && text[k] == ':') first = static_cast<int64_t>(at);
+  }
+  if (const_at < 0 || first < 0 || const_at > first) return false;
+  auto reg = [&](const char* before, uint32_t number, const char* after) { return put_text(out, before) && put_number(out, number) && put_text(out, after); };
+  bool ok = out.append(text.first(static_cast<uint64_t>(const_at)));
+  if (!has_position) ok = ok && put_text(out, "DCL IN[16], POSITION, LINEAR\n");
+  ok = ok && reg("DCL OUT[", outputs, "], POSITION\n") && reg("DCL TEMP[", temp, "]\n");
+  ok = ok && out.append(text.subview(static_cast<uint64_t>(const_at), static_cast<uint64_t>(first - const_at)));
+  const float constant = static_cast<float>(bias.constant) * depth_bias_unit(bias, 0.0f);
+  ok = ok && reg("IMM[", immediates, "] UINT32 {") && put_number(out, float_bits(constant)) && put_text(out, ", ") && put_number(out, float_bits(bias.slope)) && put_text(out, ", ") &&
+       put_number(out, float_bits(bias.clamp)) && put_text(out, ", 0}\n");
+  // bias = clamp(constant + slope * max(|ddx z|, |ddy z|)) in TEMP[t].x
+  ok = ok && reg("  DDX TEMP[", temp, "].x, IN[16].zzzz\n") && reg("  DDY TEMP[", temp, "].y, IN[16].zzzz\n");
+  ok = ok && reg("  MAX TEMP[", temp, "].x, |TEMP[") && reg("", temp, "].xxxx|, |TEMP[") && reg("", temp, "].yyyy|\n");
+  ok = ok && reg("  MAD TEMP[", temp, "].x, TEMP[") && reg("", temp, "].xxxx, IMM[") && reg("", immediates, "].yyyy, IMM[") && reg("", immediates, "].xxxx\n");
+  if (bias.clamp != 0.0f) ok = ok && reg(bias.clamp > 0.0f ? "  MIN TEMP[" : "  MAX TEMP[", temp, "].x, TEMP[") && reg("", temp, "].xxxx, IMM[") && reg("", immediates, "].zzzz\n");
+  // (the depth, wherever the shader ends: before every RET and the END)
+  auto write_depth = [&]() {
+    return reg("  ADD TEMP[", temp, "].y, IN[16].zzzz, TEMP[") && reg("", temp, "].xxxx\n") && reg("  MOV_SAT OUT[", outputs, "].z, TEMP[") && reg("", temp, "].yyyy\n");
+  };
+  uint64_t at = static_cast<uint64_t>(first);
+  while (ok && at < text.size()) {
+    uint64_t end = at;
+    while (end < text.size() && text[end] != '\n') ++end;
+    if (end < text.size()) ++end;
+    const ConstByteView line_text = text.subview(at, end - at);
+    if (text_find(line_text, ": RET") >= 0 || text_find(line_text, ": END") >= 0) ok = ok && write_depth();
+    ok = ok && out.append(line_text);
+    at = end;
+  }
+  return ok && out.put8(0);
+}
+
 class VirglPipelineBase : public IPipeline {
  public:
   bool compute() const { return compute_; }
@@ -1102,6 +1187,19 @@ class VirglPipeline final : public VirglPipelineBase {
         ds_ = module.handle();
       }
     }
+    // A depth bias of a normalised format: the fragment shader writes the biased depth (above).
+    if (desc.depth_bias.enabled() && desc.depth_bias.unorm_bits) {
+      const auto* fragment = static_cast<const VirglShaderModule*>(desc.fragment_shader);
+      if (!fragment->tgsi() || fragment->has_images()) return;   // (a shader made for the images of each draw has no one text to add it to: not made)
+      ByteBuffer text(device.gpu().allocator());
+      if (!depth_bias_fragment_text(text_view(fragment->tgsi()), desc.depth_bias, text)) return;
+      ShaderModuleDesc variant;
+      variant.stage = ShaderStage::Fragment;
+      variant.tgsi = text_chars(text.view());
+      VirglShaderModule module(device, variant);
+      if (!module.valid()) return;
+      fs_ = own_fs_ = module.handle();
+    }
     blend_ = device.new_handle();
     dsa_ = device.new_handle();
     rasterizer_ = device.new_handle();
@@ -1130,28 +1228,34 @@ class VirglPipeline final : public VirglPipelineBase {
     }
     cmd[n++] = virgl::header(virgl::kCreateObject, virgl::kObjectBlend, 11);
     cmd[n++] = blend_;
-    cmd[n++] = (desc.independent_blend ? 1u : 0u) | (desc.alpha_to_coverage && desc.multisample ? 1u << 3 : 0u);  // s0: independent blend enable, alpha to coverage (no logic op, dither...)
-    cmd[n++] = 0;  // s1
+    // s0: independent blend enable, logic op enable, alpha to coverage (no dither...); s1: the logic op
+    cmd[n++] = (desc.independent_blend ? 1u : 0u) | (desc.logic_op_enable ? 1u << 1 : 0u) | (desc.alpha_to_coverage && desc.multisample ? 1u << 3 : 0u);
+    cmd[n++] = desc.logic_op_enable ? virgl::kLogicOps[static_cast<uint32_t>(desc.logic_op) & 0xF] : 0u;
     cmd[n++] = blend_rt;
     for (uint32_t i = 1; i < 8; ++i) cmd[n++] = desc.independent_blend && i < kMaxColorTargets ? (desc.target_blend[i - 1].custom ? render_target_blend(desc.target_blend[i - 1]) : 0xFu << 27) : 0u;
 
-    // Depth and stencil (the same stencil state for both faces).
+    // Depth and stencil: the front faces' stencil state, and the back faces' (the same unless the pipeline has one of their own: the host then tests the faces apart).
     const uint32_t depth_func = desc.depth_test ? static_cast<uint32_t>(desc.depth_compare) : virgl::kFuncAlways;   // (CompareOp is numbered as PIPE_FUNC)
     const bool depth_on = desc.depth_test || desc.depth_write;
     const StencilState& st = desc.stencil;
-    const uint32_t stencil_state = !st.enable ? 0u
-                                              : 1u | (static_cast<uint32_t>(st.compare) << 1) | (virgl::kStencilOps[static_cast<uint32_t>(st.fail_op)] << 4) |
-                                                    (virgl::kStencilOps[static_cast<uint32_t>(st.pass_op)] << 7) | (virgl::kStencilOps[static_cast<uint32_t>(st.depth_fail_op)] << 10) |
-                                                    (uint32_t{st.compare_mask} << 13) | (uint32_t{st.write_mask} << 21);
+    auto stencil_word = [&](const StencilState& face) {
+      return !st.enable ? 0u
+                        : 1u | (static_cast<uint32_t>(face.compare) << 1) | (virgl::kStencilOps[static_cast<uint32_t>(face.fail_op)] << 4) |
+                              (virgl::kStencilOps[static_cast<uint32_t>(face.pass_op)] << 7) | (virgl::kStencilOps[static_cast<uint32_t>(face.depth_fail_op)] << 10) |
+                              (uint32_t{face.compare_mask} << 13) | (uint32_t{face.write_mask} << 21);
+    };
     stencil_reference_ = st.enable ? st.reference : 0;
+    stencil_back_reference_ = st.enable ? (desc.separate_back_stencil ? desc.back_stencil.reference : st.reference) : 0;
     cmd[n++] = virgl::header(virgl::kCreateObject, virgl::kObjectDsa, 5);
     cmd[n++] = dsa_;
     cmd[n++] = (depth_on ? 1u : 0u) | ((desc.depth_write ? 1u : 0u) << 1) | (depth_func << 2);
-    cmd[n++] = stencil_state;
-    cmd[n++] = stencil_state;
+    cmd[n++] = stencil_word(st);
+    cmd[n++] = stencil_word(desc.separate_back_stencil ? desc.back_stencil : st);
     cmd[n++] = 0;   // alpha reference
 
-    // Rasterizer: depth clip with a 0..1 clip volume (Vulkan), scissor on, GL pixel conventions.
+    // Rasterizer: depth clip (or clamp) with a 0..1 clip volume (Vulkan), scissor on, GL pixel conventions; the fill mode, and the depth bias as polygon offset (GL's unit of a float
+    // depth buffer - what the host's is, Z32F_S8X24 - is Direct3D's for a float format; for a normalised one the device has the constant part in units of that format's step:
+    // offset_bias_units).
     // Y_0_TOP images make window space match Vulkan's, which flips what GL calls counter-clockwise.
     const uint32_t cull = desc.cull_mode == CullMode::None ? virgl::kFaceNone
                           : desc.cull_mode == CullMode::Back ? virgl::kFaceBack : virgl::kFaceFront;
@@ -1159,15 +1263,18 @@ class VirglPipeline final : public VirglPipelineBase {
     // (the winding is the same for both kinds of image: the viewport flip and Y_0_TOP, or neither, both put the picture's top row at the same place for the rasterizer)
     cmd[n++] = virgl::header(virgl::kCreateObject, virgl::kObjectRasterizer, 9);
     cmd[n++] = rasterizer_;
-    cmd[n++] = (1u << 1) /*depth clip*/ | (1u << 2) /*clip half z*/ | (desc.stream_output_count && desc.rasterized_stream < 0 ? 1u << 3 : 0u) /*rasterizer discard*/ | (cull << 8) | (1u << 14) /*scissor*/ |
-               ((front_ccw ? 1u : 0u) << 15) | (desc.multisample ? 1u << 25 : 0u) /*multisample*/ | (1u << 29) /*half pixel center*/ | (1u << 30) /*bottom edge rule*/;
+    const uint32_t fill = desc.fill_mode == FillMode::Wireframe ? virgl::kPolygonLine : virgl::kPolygonFill;
+    const bool offset = desc.depth_bias.enabled() && !desc.depth_bias.unorm_bits;   // (a normalised format's bias is the fragment shader's)
+    cmd[n++] = (desc.depth_clip ? 1u << 1 : 0u) /*depth clip*/ | (1u << 2) /*clip half z*/ | (desc.stream_output_count && desc.rasterized_stream < 0 ? 1u << 3 : 0u) /*rasterizer discard*/ | (cull << 8) |
+               (fill << 10) | (fill << 12) /*fill front, back*/ | (1u << 14) /*scissor*/ | ((front_ccw ? 1u : 0u) << 15) | (offset ? (1u << 18) | (1u << 20) : 0u) /*offset line (a wireframe triangle's), tri*/ |
+               (desc.multisample ? 1u << 25 : 0u) /*multisample*/ | (1u << 29) /*half pixel center*/ | (1u << 30) /*bottom edge rule*/;
     cmd[n++] = float_bits(1.0f);  // point size
     cmd[n++] = 0;                 // sprite coord enable
     cmd[n++] = uint32_t{desc.clip_distances} << 24;   // line stipple, clip planes (the clip distances enabled)
     cmd[n++] = float_bits(1.0f);  // line width
-    cmd[n++] = 0;
-    cmd[n++] = 0;
-    cmd[n++] = 0;
+    cmd[n++] = float_bits(offset ? static_cast<float>(desc.depth_bias.constant) : 0.0f);   // offset units
+    cmd[n++] = float_bits(offset ? desc.depth_bias.slope : 0.0f);                                                         // offset scale
+    cmd[n++] = float_bits(offset ? desc.depth_bias.clamp : 0.0f);                                                         // offset clamp
 
     // Vertex elements. Element n is the vertex shader's input n on the host, so they are laid out by location (a location nothing feeds repeats the first attribute: the
     // shader does not read it). The host keeps the instance divisor with a buffer binding, so every vertex buffer slot in use gets a binding for its per-vertex attributes and
@@ -1197,6 +1304,7 @@ class VirglPipeline final : public VirglPipelineBase {
     ok_ = n <= sizeof cmd / sizeof cmd[0] && device.send_commands(cmd, n);
   }
   ~VirglPipeline() {
+    if (own_fs_) device_.destroy_object(own_fs_);
     device_.destroy_object(blend_);
     device_.destroy_object(dsa_);
     device_.destroy_object(rasterizer_);
@@ -1212,6 +1320,7 @@ class VirglPipeline final : public VirglPipelineBase {
   uint32_t binding_count() const { return binding_count_; }
   uint32_t binding_slot(uint32_t binding) const { return bindings_[binding] / 2; }
   uint8_t stencil_reference() const { return stencil_reference_; }
+  uint8_t stencil_back_reference() const { return stencil_back_reference_; }   // (the second DSA stencil state's)
   bool uses_blend_constant() const {
     if (!desc_.blend.custom) return false;
     if (desc_.blend.uses_constant()) return true;
@@ -1250,8 +1359,9 @@ class VirglPipeline final : public VirglPipelineBase {
   uint32_t vs_, fs_, gs_, hs_, ds_;
   uint32_t so_buffers_ = 0, capture_vertices_ = 0;
   uint8_t so_stream_of_buffer_[kMaxStreamOutputBuffers] = {};
-  uint8_t stencil_reference_ = 0;
+  uint8_t stencil_reference_ = 0, stencil_back_reference_ = 0;
   uint32_t blend_ = 0, dsa_ = 0, rasterizer_ = 0, elements_ = 0;
+  uint32_t own_fs_ = 0;   // (a fragment shader of the pipeline's own: the depth bias of a normalised format)
   uint8_t bindings_[kMaxVertexBuffers * 2] = {};   // slot * 2 + per_instance of each host vertex buffer binding
   uint32_t binding_count_ = 0;
   bool ok_ = false;
@@ -1454,19 +1564,22 @@ uint32_t VirglDevice::sampler_state(const SamplerDesc& sampler) {
   const uint32_t u = static_cast<uint32_t>(sampler.address_u), v = static_cast<uint32_t>(sampler.address_v), border = static_cast<uint32_t>(sampler.border), mip = static_cast<uint32_t>(sampler.mip_filter);
   if (u > 4 || v > 4 || border > 2 || mip > 2) return 0;
   const bool bordered = sampler.address_u == AddressMode::ClampToBorder || sampler.address_v == AddressMode::ClampToBorder;
-  // The states are kept by what they are. The levels of detail only matter with mipmaps and are kept in sixteenths, the range the host's levels can have.
-  auto sixteenths = [](float lod, float low, float high) { return static_cast<int32_t>((lod != lod ? 0.0f : lod < low ? low : lod > high ? high : lod) * 16.0f); };
+  // The states are kept by what they are. The levels of detail only matter with mipmaps; they are taken as they are, within the range the host's levels can have.
+  auto within = [](float lod, float low, float high) { return lod != lod ? 0.0f : lod < low ? low : lod > high ? high : lod; };
+  const uint32_t anisotropy = sampler.filter == Filter::Linear && sampler.max_anisotropy > 1 ? (sampler.max_anisotropy > kMaxAnisotropy ? kMaxAnisotropy : sampler.max_anisotropy) : 0u;
   SamplerState wanted;
-  wanted.bits = (sampler.filter == Filter::Linear ? 1u : 0u) | (u << 1) | (v << 4) | ((bordered ? border : 0u) << 7) | (mip << 9);
+  wanted.bits = (sampler.filter == Filter::Linear ? 1u : 0u) | (u << 1) | (v << 4) | ((bordered && !sampler.custom_border ? border : 0u) << 7) | (mip << 9) | (anisotropy << 16);
   if (sampler.mip_filter != MipFilter::None) {
-    wanted.bias = sixteenths(sampler.lod_bias, -16.0f, 16.0f);
-    wanted.min_lod = sixteenths(sampler.min_lod, 0.0f, 16.0f);
-    wanted.max_lod = sixteenths(sampler.max_lod, 0.0f, 16.0f);
+    wanted.bias = within(sampler.lod_bias, -16.0f, 16.0f);
+    wanted.min_lod = within(sampler.min_lod, 0.0f, 16.0f);
+    wanted.max_lod = within(sampler.max_lod, 0.0f, 16.0f);
   }
+  const Vec4 color = bordered ? sampler_border_value(sampler) : Vec4{0, 0, 0, 0};
+  wanted.border[0] = float_bits(color.x), wanted.border[1] = float_bits(color.y), wanted.border[2] = float_bits(color.z), wanted.border[3] = float_bits(color.w);
   uint32_t similar = 0;
   for (uint32_t i = 0; i < sampler_state_count_; ++i) {
     const SamplerState& have = sampler_states_[i];
-    if (have.bits != wanted.bits) continue;
+    if (have.bits != wanted.bits || __builtin_memcmp(have.border, wanted.border, sizeof have.border) != 0) continue;
     if (have.bias == wanted.bias && have.min_lod == wanted.min_lod && have.max_lod == wanted.max_lod) return have.handle;
     similar = have.handle;
   }
@@ -1474,10 +1587,12 @@ uint32_t VirglDevice::sampler_state(const SamplerDesc& sampler) {
   if (sampler_state_count_ == kSamplerStates) return similar ? similar : sampler_states_[0].handle;
   const uint32_t handle = new_handle();
   const uint32_t filter = sampler.filter == Filter::Linear ? virgl::kFilterLinear : virgl::kFilterNearest;
-  const uint32_t s0 = kWrap[u] | (kWrap[v] << 3) | (virgl::kWrapClampToEdge << 6) /* r: the slices of a volume are clamped */ | (filter << 9) | (kMip[mip] << 11) | (filter << 13) | (1u << 19) /* seamless cube maps: Direct3D always filters across the edges of a cube */;
-  const Vec4 color = border_color_value(sampler.border);
-  const uint32_t cmd[] = {virgl::header(virgl::kCreateObject, virgl::kObjectSamplerState, 9), handle, s0, float_bits(static_cast<float>(wanted.bias) / 16.0f), float_bits(static_cast<float>(wanted.min_lod) / 16.0f),
-                          float_bits(sampler.mip_filter != MipFilter::None ? static_cast<float>(wanted.max_lod) / 16.0f : 0.0f), float_bits(color.x), float_bits(color.y), float_bits(color.z), float_bits(color.w)};
+  // (S0: the wrap modes, filters, seamless cube maps - Direct3D always filters across the edges of a cube -, and the anisotropy in bits 20 - 24; the border colour's bits as they
+  // are: the host sets it with glSamplerParameterIuiv, so an integer texture's border is its integers and a float one's its floats)
+  const uint32_t s0 = kWrap[u] | (kWrap[v] << 3) | (virgl::kWrapClampToEdge << 6) /* r: the slices of a volume are clamped */ | (filter << 9) | (kMip[mip] << 11) | (filter << 13) | (1u << 19) |
+                      ((anisotropy & 0x1F) << 20);
+  const uint32_t cmd[] = {virgl::header(virgl::kCreateObject, virgl::kObjectSamplerState, 9), handle, s0, float_bits(wanted.bias), float_bits(wanted.min_lod),
+                          float_bits(sampler.mip_filter != MipFilter::None ? wanted.max_lod : 0.0f), wanted.border[0], wanted.border[1], wanted.border[2], wanted.border[3]};
   if (!send_commands(cmd, 10)) return 0;
   wanted.handle = handle;
   sampler_states_[sampler_state_count_++] = wanted;
@@ -1717,8 +1832,12 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
   VirglBuffer* index_buffer = nullptr;
   uint64_t index_offset = 0;
   IndexType index_type = IndexType::Uint16;
-  Viewport viewport;
-  Rect2D scissor;
+  // (the viewports and scissor rectangles set: with kFeature2Viewports all of the host's sixteen are set, those past the ones given to the first - a primitive whose SV_ViewportArrayIndex
+  // is past them is drawn with the first, as on the CPU renderer)
+  Viewport viewports[kMaxViewports];
+  Rect2D scissors[kMaxViewports];
+  uint32_t viewport_count = 1, scissor_count = 1;
+  const uint32_t host_viewports = (info().features2 & kFeature2Viewports) ? kMaxViewports : 1u;
   uint32_t constants[kMaxPushConstantBytes / 4] = {};
   uint32_t constants_dwords = 0;
   bool constants_dirty = false;
@@ -2001,24 +2120,38 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
     return true;
   };
   auto emit_viewport = [&]() {
-    if (!stream.command(virgl::kSetViewportState, 0, 7)) return;
+    if (!stream.command(virgl::kSetViewportState, 0, 1 + 6 * host_viewports)) return;
     stream.put(0);
-    stream.putf(viewport.width * 0.5f);
-    stream.putf((color && !color->y0_top() ? 1.0f : -1.0f) * viewport.height * 0.5f);  // GL's +Y is up: flip to Vulkan's +Y down (an upright image has its row 0 at window y 0 already)
-    stream.putf(viewport.max_depth - viewport.min_depth);
-    stream.putf(viewport.x + viewport.width * 0.5f);
-    stream.putf(viewport.y + viewport.height * 0.5f);
-    stream.putf(viewport.min_depth);
+    for (uint32_t i = 0; i < host_viewports; ++i) {
+      const Viewport& viewport = viewports[i < viewport_count ? i : 0];
+      stream.putf(viewport.width * 0.5f);
+      stream.putf((color && !color->y0_top() ? 1.0f : -1.0f) * viewport.height * 0.5f);  // GL's +Y is up: flip to Vulkan's +Y down (an upright image has its row 0 at window y 0 already)
+      stream.putf(viewport.max_depth - viewport.min_depth);
+      stream.putf(viewport.x + viewport.width * 0.5f);
+      stream.putf(viewport.y + viewport.height * 0.5f);
+      stream.putf(viewport.min_depth);
+    }
   };
   auto emit_scissor = [&]() {
-    if (!stream.command(virgl::kSetScissorState, 0, 3)) return;
+    if (!stream.command(virgl::kSetScissorState, 0, 1 + 2 * host_viewports)) return;
     stream.put(0);
     // Scissor rectangles are counted from the bottom of the target in virgl (GL's window space), while Vulkan's - and ours - count from the top.
     const uint32_t height = color ? color->extent().height : 0;
     const bool upright = color && !color->y0_top();
-    const uint32_t y0 = upright ? scissor.y : height - (scissor.y + scissor.height), y1 = upright ? scissor.y + scissor.height : height - scissor.y;
-    stream.put(scissor.x | (y0 << 16));
-    stream.put((scissor.x + scissor.width) | (y1 << 16));
+    for (uint32_t i = 0; i < host_viewports; ++i) {
+      const Rect2D& scissor = scissors[i < scissor_count && i < viewport_count ? i : 0];
+      const uint32_t y0 = upright ? scissor.y : height - (scissor.y + scissor.height), y1 = upright ? scissor.y + scissor.height : height - scissor.y;
+      stream.put(scissor.x | (y0 << 16));
+      stream.put((scissor.x + scissor.width) | (y1 << 16));
+    }
+  };
+  auto clamped_scissor = [&](const Rect2D& r) {
+    const Extent2D e = color->extent();
+    const int64_t x0 = r.x > 0 ? r.x : 0, y0 = r.y > 0 ? r.y : 0;
+    int64_t x1 = int64_t{r.x} + r.width, y1 = int64_t{r.y} + r.height;
+    if (x1 > e.width) x1 = e.width;
+    if (y1 > e.height) y1 = e.height;
+    return Rect2D{static_cast<int32_t>(x0), static_cast<int32_t>(y0), x1 > x0 ? static_cast<uint32_t>(x1 - x0) : 0, y1 > y0 ? static_cast<uint32_t>(y1 - y0) : 0};
   };
 
   for (uint64_t i = 0; i < recorder.commands().count(); ++i) {
@@ -2081,8 +2214,9 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
         stream.put(target_count);
         stream.put(surfaces[kMaxColorTargets]);
         for (uint32_t n = 0; n < target_count; ++n) stream.put(surfaces[n]);
-        viewport = {0, 0, static_cast<float>(e.width), static_cast<float>(e.height), 0, 1};
-        scissor = {0, 0, e.width, e.height};
+        viewports[0] = {0, 0, static_cast<float>(e.width), static_cast<float>(e.height), 0, 1};
+        scissors[0] = {0, 0, e.width, e.height};
+        viewport_count = scissor_count = 1;
         emit_viewport();
         emit_scissor();
         uint32_t buffers = 0;
@@ -2338,7 +2472,7 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
         }
         if (pipeline->stencil_enabled()) {
           stream.command(virgl::kSetStencilRef, 0, 1);
-          stream.put(pipeline->stencil_reference() | (uint32_t{pipeline->stencil_reference()} << 8));
+          stream.put(pipeline->stencil_reference() | (uint32_t{pipeline->stencil_back_reference()} << 8));
         }
         stream.command(virgl::kBindObject, virgl::kObjectVertexElements, 1);
         stream.put(pipeline->elements());
@@ -2413,19 +2547,32 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
         break;
       }
       case RecordedCommand::Type::SetViewport:
-        viewport = cmd.viewport;
+        viewports[0] = cmd.viewport;
+        viewport_count = 1;
         emit_viewport();
+        emit_scissor();   // (the scissors past the first follow the viewports' count)
+        break;
+      case RecordedCommand::Type::SetViewportAt:
+        if (cmd.unit >= kMaxViewports || cmd.count == 0 || cmd.count > kMaxViewports || (cmd.count > 1 && host_viewports < kMaxViewports)) return false;
+        viewports[cmd.unit] = cmd.viewport;
+        viewport_count = cmd.count;
+        if (cmd.unit + 1 == cmd.count) {   // (the last of them: the host gets them all at once)
+          emit_viewport();
+          emit_scissor();
+        }
         break;
       case RecordedCommand::Type::SetScissor: {
         if (!in_pass) return false;
-        const Extent2D e = color->extent();
-        const int64_t x0 = cmd.scissor.x > 0 ? cmd.scissor.x : 0, y0 = cmd.scissor.y > 0 ? cmd.scissor.y : 0;
-        int64_t x1 = int64_t{cmd.scissor.x} + cmd.scissor.width, y1 = int64_t{cmd.scissor.y} + cmd.scissor.height;
-        if (x1 > e.width) x1 = e.width;
-        if (y1 > e.height) y1 = e.height;
-        scissor = {static_cast<int32_t>(x0), static_cast<int32_t>(y0), x1 > x0 ? static_cast<uint32_t>(x1 - x0) : 0,
-                   y1 > y0 ? static_cast<uint32_t>(y1 - y0) : 0};
+        scissors[0] = clamped_scissor(cmd.scissor);
+        scissor_count = 1;
         emit_scissor();
+        break;
+      }
+      case RecordedCommand::Type::SetScissorAt: {
+        if (!in_pass || cmd.unit >= kMaxViewports || cmd.count == 0 || cmd.count > kMaxViewports || (cmd.count > 1 && host_viewports < kMaxViewports)) return false;
+        scissors[cmd.unit] = clamped_scissor(cmd.scissor);
+        scissor_count = cmd.count;
+        if (cmd.unit + 1 == cmd.count) emit_scissor();
         break;
       }
       case RecordedCommand::Type::Draw:

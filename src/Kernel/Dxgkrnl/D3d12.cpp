@@ -122,7 +122,7 @@ NtStatus parse_blob(ConstByteView blob, RootSignatureDesc* out) {
     const uint32_t filter = at.le32(), address_u = at.le32(), address_v = at.le32();
     at.le32();   // (address w)
     const float bias = word_float(at.le32());
-    at.le32();   // (anisotropy)
+    const uint32_t anisotropy = at.le32();
     const uint32_t comparison = at.le32();   // (D3D12_COMPARISON_FUNC: 1 never .. 8 always, 0 none)
     const uint32_t border = at.le32();   // (D3D12_STATIC_BORDER_COLOR: transparent black, opaque black, opaque white; 1.2 also opaque black and white of integers)
     const float min_lod = word_float(at.le32()), max_lod = word_float(at.le32());
@@ -132,14 +132,22 @@ NtStatus parse_blob(ConstByteView blob, RootSignatureDesc* out) {
     // (an integer border colour goes with its flag and the flag with it; no device takes coordinates in texels - the device reports
     // NonNormalizedCoordinateSamplersSupported FALSE - so such a sampler is a root signature this adapter cannot have)
     if ((sampler_flags & ~3u) || (sampler_flags & 2u) || ((border >= 3) != ((sampler_flags & 1u) != 0))) return status::kInvalidParameter;
+    if ((filter == 0x55 || filter == 0xD5) && (anisotropy < 1 || anisotropy > graphics::kMaxAnisotropy)) return status::kInvalidParameter;   // (D3D12_MAX_MAXANISOTROPY)
     StaticSampler& s = out->samplers[i];
     // (the filter: bit 0 mip, bit 2 mag, bit 4 min; anisotropic filtering (0x55) and comparison filters are the linear ones)
     s.sampler.filter = (filter & 0x4) || filter == 0x55 || filter == 0xD5 ? graphics::Filter::Linear : graphics::Filter::Nearest;
     s.sampler.mip_filter = filter & 0x1 ? graphics::MipFilter::Linear : graphics::MipFilter::Nearest;
     s.sampler.address_u = address_of(address_u);
     s.sampler.address_v = address_of(address_v);
-    // (the integer opaque black and white are (0, 0, 0, 1) and (1, 1, 1, 1) as integers: the same values as the float ones, which is what a lookup returns)
     s.sampler.border = border == 1 || border == 3 ? graphics::BorderColor::OpaqueBlack : border == 2 || border == 4 ? graphics::BorderColor::OpaqueWhite : graphics::BorderColor::TransparentBlack;
+    if (border == 3 || border == 4) {
+      // (the integer colours: an integer texture's channels are the bits of its integers - 0 and 1, not the floats)
+      s.sampler.custom_border = true;
+      const uint32_t value = border == 4 ? 1u : 0u;
+      s.sampler.border_rgba[0] = s.sampler.border_rgba[1] = s.sampler.border_rgba[2] = __builtin_bit_cast(float, value);
+      s.sampler.border_rgba[3] = __builtin_bit_cast(float, 1u);
+    }
+    if (filter == 0x55 || filter == 0xD5) s.sampler.max_anisotropy = static_cast<uint8_t>(anisotropy);   // (the anisotropic filters, plain and comparing)
     s.sampler.lod_bias = bias == bias && bias > -100.0f && bias < 100.0f ? bias : 0.0f;
     s.sampler.min_lod = min_lod == min_lod && min_lod > -100.0f && min_lod < 1000.0f ? min_lod : 0.0f;
     s.sampler.max_lod = max_lod == max_lod && max_lod > -100.0f && max_lod < 1000.0f ? max_lod : 1000.0f;

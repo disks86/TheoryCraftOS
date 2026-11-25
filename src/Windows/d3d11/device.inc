@@ -242,6 +242,7 @@ static HRESULT STDMETHODCALLTYPE dev_CheckFeatureSupport(Dev *d, D3D11_FEATURE f
       o->ConstantBufferOffsetting = TRUE;
       o->MapNoOverwriteOnDynamicConstantBuffer = TRUE;
       o->MapNoOverwriteOnDynamicBufferSRV = TRUE;
+      o->OutputMergerLogicOp = dev_logic_ops(d);      /* (Direct3D 12's: the kernel's logic operations) */
       return S_OK;      /* (ConstantBufferPartialUpdate no: UpdateSubresource of a constant buffer writes it whole) */
     }
     case D3D11_FEATURE_ARCHITECTURE_INFO: FEATURE_SIZE(D3D11_FEATURE_DATA_ARCHITECTURE_INFO); break;      /* (not a tile-based deferred renderer) */
@@ -287,7 +288,16 @@ static HRESULT STDMETHODCALLTYPE dev_CheckFeatureSupport(Dev *d, D3D11_FEATURE f
       if (SUCCEEDED(ID3D12Device_CheckFeatureSupport(d->d12, D3D12_FEATURE_ARCHITECTURE, &arch, sizeof arch))) o->UnifiedMemoryArchitecture = arch.UMA;
       return S_OK;
     }
-    case D3D11_FEATURE_D3D11_OPTIONS3: FEATURE_SIZE(D3D11_FEATURE_DATA_D3D11_OPTIONS3); break;
+    case D3D11_FEATURE_D3D11_OPTIONS3: {
+      /* (Direct3D 12's: a vertex or domain shader's SV_RenderTargetArrayIndex and SV_ViewportArrayIndex reach the rasterizer on the devices that take them) */
+      FEATURE_SIZE(D3D11_FEATURE_DATA_D3D11_OPTIONS3);
+      D3D12_FEATURE_DATA_D3D12_OPTIONS o12;
+      memset(&o12, 0, sizeof o12);
+      const HRESULT hr = ID3D12Device_CheckFeatureSupport(d->d12, D3D12_FEATURE_D3D12_OPTIONS, &o12, sizeof o12);
+      if (FAILED(hr)) return hr;
+      ((D3D11_FEATURE_DATA_D3D11_OPTIONS3 *)data)->VPAndRTArrayIndexFromAnyShaderFeedingRasterizer = o12.VPAndRTArrayIndexFromAnyShaderFeedingRasterizerSupportedWithoutGSEmulation;
+      return S_OK;
+    }
     case D3D11_FEATURE_GPU_VIRTUAL_ADDRESS_SUPPORT: {
       /* (Direct3D 12's answer: the same address space) */
       FEATURE_SIZE(D3D11_FEATURE_DATA_GPU_VIRTUAL_ADDRESS_SUPPORT);

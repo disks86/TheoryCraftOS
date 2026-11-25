@@ -207,6 +207,8 @@ typedef struct Pipeline {
   DWORD vs, ps;                  /* the shaders' numbers (Child.id); 0: the fixed-function vertex shader */
   DWORD sets;                    /* ... which has so many sets of texture coordinates in its vertices */
   DWORD cull, z, zwrite, zfunc, blend, src, dst, op, separate, src_alpha, dst_alpha, op_alpha, write, stencil, sfail, szfail, spass, sfunc, smask, swrite;
+  DWORD wireframe, bias, slope;   /* D3DRS_FILLMODE, D3DRS_DEPTHBIAS (in the depth buffer's units) and D3DRS_SLOPESCALEDEPTHBIAS (float bits) */
+  DWORD twosided, ccw_fail, ccw_zfail, ccw_pass, ccw_func;   /* D3DRS_TWOSIDEDSTENCILMODE and the counter-clockwise faces' operations */
   ID3D12PipelineState *state;
   UINT last_used;
 } Pipeline;
@@ -239,7 +241,7 @@ struct Dev {
   UINT view_used, sampler_used;
   UINT64 table_views, table_samplers;
   UINT table_ids[TEXTURE_SLOTS];
-  DWORD table_sampler_states[TEXTURE_SLOTS][4];
+  DWORD table_sampler_states[TEXTURE_SLOTS][8];
   UINT table_count;
   int tables_valid;
   Tex *blank;                    /* a white pixel: what a stage with no texture samples */

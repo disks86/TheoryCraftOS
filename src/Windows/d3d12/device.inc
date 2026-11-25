@@ -259,6 +259,9 @@ static HRESULT STDMETHODCALLTYPE dev_CheckFeatureSupport(Dev *This, D3D12_FEATUR
       o->ResourceHeapTier = D3D12_RESOURCE_HEAP_TIER_2;
       o->CrossNodeSharingTier = D3D12_CROSS_NODE_SHARING_TIER_NOT_SUPPORTED;
       o->StandardSwizzle64KBSupported = TRUE;      /* (resource.inc: CPU-visible textures of the standard swizzle are mapped in it) */
+      o->OutputMergerLogicOp = (This->caps.features2 & DEV_FEATURE2_LOGIC_OPS) ? TRUE : FALSE;
+      /* (the CPU renderer takes the layer and viewport from a vertex or domain shader itself; no geometry shader is put in for it) */
+      o->VPAndRTArrayIndexFromAnyShaderFeedingRasterizerSupportedWithoutGSEmulation = (This->caps.features2 & DEV_FEATURE2_LAYER_ANY_STAGE) ? TRUE : FALSE;
       return S_OK;
     }
     case D3D12_FEATURE_ARCHITECTURE: {
@@ -528,12 +531,19 @@ static HRESULT STDMETHODCALLTYPE dev_CheckFeatureSupport(Dev *This, D3D12_FEATUR
       return S_OK;
     }
     case D3D12_FEATURE_D3D12_OPTIONS13: { FEATURE(D3D12_FEATURE_DATA_D3D12_OPTIONS13, o); memset(o, 0, sizeof *o); return S_OK; }
-    case D3D12_FEATURE_D3D12_OPTIONS14: { FEATURE(D3D12_FEATURE_DATA_D3D12_OPTIONS14, o); memset(o, 0, sizeof *o); return S_OK; }
+    case D3D12_FEATURE_D3D12_OPTIONS14: {
+      /* (the back faces' own stencil reference and masks - OMSetFrontAndBackStencilRef, DEPTH_STENCIL2 - are the kernel pipeline's back stencil state, which the rasterizer state has) */
+      FEATURE(D3D12_FEATURE_DATA_D3D12_OPTIONS14, o);
+      memset(o, 0, sizeof *o);
+      o->IndependentFrontAndBackStencilRefMaskSupported = (This->caps.features2 & DEV_FEATURE2_RASTERIZER_STATE) ? TRUE : FALSE;
+      return S_OK;
+    }
     case D3D12_FEATURE_D3D12_OPTIONS15: { FEATURE(D3D12_FEATURE_DATA_D3D12_OPTIONS15, o); memset(o, 0, sizeof *o); return S_OK; }
     case D3D12_FEATURE_D3D12_OPTIONS16: {
-      /* (no depth bias set by the command list - RSSetDepthBias: the pipeline's bias is the rasterizer state's; GPU upload heaps: resource.inc heap_cpu_access) */
+      /* (a depth bias set by the command list - RSSetDepthBias, D3D12_PIPELINE_STATE_FLAG_DYNAMIC_DEPTH_BIAS: kernel pipelines of each bias - where the device has the rasterizer
+       * state; GPU upload heaps: resource.inc heap_cpu_access) */
       FEATURE(D3D12_FEATURE_DATA_D3D12_OPTIONS16, o);
-      o->DynamicDepthBiasSupported = FALSE;
+      o->DynamicDepthBiasSupported = (This->caps.features2 & DEV_FEATURE2_RASTERIZER_STATE) ? TRUE : FALSE;
       o->GPUUploadHeapSupported = TRUE;
       return S_OK;
     }

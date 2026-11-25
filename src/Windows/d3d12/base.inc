@@ -326,6 +326,12 @@ struct Dev {
 #define DEV_FEATURE2_MIPMAPPED_LAYERS (1u << 10)         /* graphics::kFeature2MipmappedLayers: levels of arrays, cubes, volumes, targets, depth buffers and the wide formats, cube arrays,
                                                           * shader resource views of levels and layers, render targets and depth views of a level */
 #define DEV_FEATURE2_COLOR_RESOLVE_MODES (1u << 14)      /* graphics::kFeature2ColorResolveModes: resolves of a colour image's least and greatest samples */
+#define DEV_FEATURE2_RASTERIZER_STATE (1u << 7)          /* fill mode, depth bias, depth clip, back faces' stencil (graphics::kFeature2RasterizerState) */
+#define DEV_FEATURE2_DUAL_SOURCE (1u << 8)               /* the SRC1 blend factors */
+#define DEV_FEATURE2_LOGIC_OPS (1u << 9)                 /* LogicOpEnable */
+#define DEV_FEATURE2_SAMPLER_STATE (1u << 11)            /* anisotropy, border colours of any value */
+#define DEV_FEATURE2_VIEWPORTS (1u << 12)                /* sixteen viewports and scissor rectangles, SV_ViewportArrayIndex from geometry shaders */
+#define DEV_FEATURE2_LAYER_ANY_STAGE (1u << 13)          /* SV_RenderTargetArrayIndex and SV_ViewportArrayIndex from vertex and domain shaders */
 /* What allocations of a kernel format numbered from KF_FIRST_EXTRA may be on the device's adapter (KFC_* bits; 0 for any other format, or from a kernel that has no table) */
 static UINT dev_format_caps(const Dev *d, UINT kf) {
   const KmtCaps *c = &d->caps;

@@ -235,6 +235,23 @@ static ID3D12PipelineState *pipeline_get(Dev *d, const Shader *vs, const Shader 
   key.sfunc = op_of(rs[D3DRS_STENCILFUNC], 1, 8, D3DCMP_ALWAYS);
   key.smask = rs[D3DRS_STENCILMASK] & 0xFF;
   key.swrite = rs[D3DRS_STENCILWRITEMASK] & 0xFF;
+  /* (two-sided stencil: the counter-clockwise faces - the back ones here - have operations of their own) */
+  key.twosided = key.stencil && rs[D3DRS_TWOSIDEDSTENCILMODE] != 0;
+  key.ccw_fail = key.twosided ? op_of(rs[D3DRS_CCW_STENCILFAIL], 1, 8, D3DSTENCILOP_KEEP) : key.sfail;
+  key.ccw_zfail = key.twosided ? op_of(rs[D3DRS_CCW_STENCILZFAIL], 1, 8, D3DSTENCILOP_KEEP) : key.szfail;
+  key.ccw_pass = key.twosided ? op_of(rs[D3DRS_CCW_STENCILPASS], 1, 8, D3DSTENCILOP_KEEP) : key.spass;
+  key.ccw_func = key.twosided ? op_of(rs[D3DRS_CCW_STENCILFUNC], 1, 8, D3DCMP_ALWAYS) : key.sfunc;
+  /* (wireframe; D3DFILL_POINT is drawn solid: Direct3D 12 below has no point fill) */
+  key.wireframe = rs[D3DRS_FILLMODE] == D3DFILL_WIREFRAME;
+  /* The depth bias: Direct3D 9's is a depth (offset = bias + slope scale * slope); Direct3D 12's counts the depth buffer's units, which for the D24 buffer here is 1 / (2^24 - 1). */
+  if (d->depth) {
+    float bias, slope;
+    memcpy(&bias, &rs[D3DRS_DEPTHBIAS], 4);
+    memcpy(&slope, &rs[D3DRS_SLOPESCALEDEPTHBIAS], 4);
+    const double units = bias == bias ? (double)bias * 16777215.0 : 0.0;
+    key.bias = (DWORD)(INT)(units > 2147483647.0 ? 2147483647.0 : units < -2147483648.0 ? -2147483648.0 : (units < 0 ? units - 0.5 : units + 0.5));
+    key.slope = slope == slope ? rs[D3DRS_SLOPESCALEDEPTHBIAS] : 0;
+  }
   Pipeline *oldest = &d->pipelines[0];
   for (UINT i = 0; i < d->pipeline_count; ++i) {
     Pipeline *p = &d->pipelines[i];
@@ -279,7 +296,9 @@ static ID3D12PipelineState *pipeline_get(Dev *d, const Shader *vs, const Shader 
   blend->BlendOpAlpha = (D3D12_BLEND_OP)key.op_alpha;
   blend->LogicOp = D3D12_LOGIC_OP_NOOP;
   blend->RenderTargetWriteMask = (UINT8)key.write;
-  pd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+  pd.RasterizerState.FillMode = key.wireframe ? D3D12_FILL_MODE_WIREFRAME : D3D12_FILL_MODE_SOLID;
+  pd.RasterizerState.DepthBias = (INT)key.bias;
+  memcpy(&pd.RasterizerState.SlopeScaledDepthBias, &key.slope, 4);
   /* Direct3D 9 names the winding that is culled; the front of a triangle is the clockwise side here. */
   pd.RasterizerState.CullMode = key.cull == D3DCULL_CW ? D3D12_CULL_MODE_FRONT : key.cull == D3DCULL_CCW ? D3D12_CULL_MODE_BACK : D3D12_CULL_MODE_NONE;
   pd.RasterizerState.DepthClipEnable = TRUE;
@@ -293,7 +312,10 @@ static ID3D12PipelineState *pipeline_get(Dev *d, const Shader *vs, const Shader 
   pd.DepthStencilState.FrontFace.StencilDepthFailOp = (D3D12_STENCIL_OP)key.szfail;
   pd.DepthStencilState.FrontFace.StencilPassOp = (D3D12_STENCIL_OP)key.spass;
   pd.DepthStencilState.FrontFace.StencilFunc = (D3D12_COMPARISON_FUNC)key.sfunc;
-  pd.DepthStencilState.BackFace = pd.DepthStencilState.FrontFace;
+  pd.DepthStencilState.BackFace.StencilFailOp = (D3D12_STENCIL_OP)key.ccw_fail;
+  pd.DepthStencilState.BackFace.StencilDepthFailOp = (D3D12_STENCIL_OP)key.ccw_zfail;
+  pd.DepthStencilState.BackFace.StencilPassOp = (D3D12_STENCIL_OP)key.ccw_pass;
+  pd.DepthStencilState.BackFace.StencilFunc = (D3D12_COMPARISON_FUNC)key.ccw_func;
   pd.InputLayout.pInputElementDescs = vs ? inputs : layout;
   pd.InputLayout.NumElements = vs ? vs->input_count : 3 + TEXTURE_SETS;
   pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
@@ -598,7 +620,7 @@ static void tables_of(Dev *d, UINT slots, const Shader *ps) {
   const State *s = &d->state;
   UINT ids[TEXTURE_SLOTS];
   Tex *textures[TEXTURE_SLOTS];
-  DWORD samplers[TEXTURE_SLOTS][4];
+  DWORD samplers[TEXTURE_SLOTS][8];      /* (address modes, magnification, minification and mip filters, anisotropy, border colour, LOD bias, largest level) */
   if (d->table_count != slots) d->tables_valid = 0;
   d->table_count = slots;
   for (UINT i = 0; i < slots; ++i) {
@@ -608,6 +630,10 @@ static void tables_of(Dev *d, UINT slots, const Shader *ps) {
     samplers[i][1] = s->sampler[i][D3DSAMP_MAGFILTER];
     samplers[i][2] = s->sampler[i][D3DSAMP_MINFILTER];
     samplers[i][3] = s->sampler[i][D3DSAMP_MIPFILTER];
+    samplers[i][4] = s->sampler[i][D3DSAMP_MAXANISOTROPY];
+    samplers[i][5] = s->sampler[i][D3DSAMP_BORDERCOLOR];
+    samplers[i][6] = s->sampler[i][D3DSAMP_MIPMAPLODBIAS];
+    samplers[i][7] = s->sampler[i][D3DSAMP_MAXMIPLEVEL];
   }
   const UINT step_views = ID3D12Device_GetDescriptorHandleIncrementSize(d->d12, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
   const UINT step_samplers = ID3D12Device_GetDescriptorHandleIncrementSize(d->d12, D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER);
@@ -633,11 +659,23 @@ static void tables_of(Dev *d, UINT slots, const Shader *ps) {
       memset(&desc, 0, sizeof desc);
       /* (D3D12_FILTER: bit 4 a linear minification, bit 2 a linear magnification, bit 0 a linear step between levels) */
       desc.Filter = (D3D12_FILTER)((samplers[i][2] >= D3DTEXF_LINEAR ? 0x10 : 0) | (samplers[i][1] >= D3DTEXF_LINEAR ? 0x4 : 0) | (samplers[i][3] >= D3DTEXF_LINEAR ? 0x1 : 0));
+      /* (an anisotropic minification filter with D3DSAMP_MAXANISOTROPY above 1: Direct3D 12's anisotropic filter, linear between the levels when there are levels) */
+      const DWORD anisotropy = samplers[i][4] < 1 ? 1 : samplers[i][4] > 16 ? 16 : samplers[i][4];
+      if (samplers[i][2] == D3DTEXF_ANISOTROPIC && anisotropy > 1) desc.Filter = D3D12_FILTER_ANISOTROPIC;
       desc.AddressU = (D3D12_TEXTURE_ADDRESS_MODE)op_of(samplers[i][0] & 0xFF, 1, 5, D3DTADDRESS_WRAP);      /* (the same numbers) */
       desc.AddressV = (D3D12_TEXTURE_ADDRESS_MODE)op_of(samplers[i][0] >> 8, 1, 5, D3DTADDRESS_WRAP);
       desc.AddressW = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
-      desc.MaxAnisotropy = 1;
+      desc.MaxAnisotropy = desc.Filter == D3D12_FILTER_ANISOTROPIC ? anisotropy : 1;
       desc.ComparisonFunc = D3D12_COMPARISON_FUNC_NEVER;
+      /* (D3DSAMP_BORDERCOLOR is a D3DCOLOR: alpha, red, green, blue from the top byte down) */
+      const DWORD border = samplers[i][5];
+      desc.BorderColor[0] = (float)((border >> 16) & 0xFF) / 255.0f, desc.BorderColor[1] = (float)((border >> 8) & 0xFF) / 255.0f;
+      desc.BorderColor[2] = (float)(border & 0xFF) / 255.0f, desc.BorderColor[3] = (float)(border >> 24) / 255.0f;
+      /* (D3DSAMP_MIPMAPLODBIAS is a float; D3DSAMP_MAXMIPLEVEL the most detailed level the sampler reads, which is a least level of detail) */
+      float bias;
+      memcpy(&bias, &samplers[i][6], 4);
+      desc.MipLODBias = bias == bias ? bias : 0.0f;
+      desc.MinLOD = samplers[i][3] == D3DTEXF_NONE ? 0.0f : (float)(samplers[i][7] > 15 ? 15 : samplers[i][7]);
       desc.MaxLOD = samplers[i][3] == D3DTEXF_NONE ? 0.0f : 1000.0f;
       ID3D12Device_CreateSampler(d->d12, &desc, at);
       at.ptr += step_samplers;

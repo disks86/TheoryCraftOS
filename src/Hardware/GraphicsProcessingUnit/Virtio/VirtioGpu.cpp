@@ -529,8 +529,12 @@ bool VirtioGpu::setup_3d() {
           in.skip(2 * 64);
           virgl_bset_ = in.le32();
           virgl_glsl_level_ = in.le32();
-          in.skip(4 * 4);   // (max_texture_array_layers, max_streamout_buffers, max_dual_source_render_targets, max_render_targets)
+          in.skip(2 * 4);   // (max_texture_array_layers, max_streamout_buffers)
+          virgl_max_dual_source_ = in.le32();
+          in.skip(4);       // (max_render_targets)
           virgl_max_samples_ = in.le32();
+          in.skip(3 * 4);   // (prim_mask, max_tbo_size, max_uniform_blocks)
+          virgl_max_viewports_ = in.le32();
           if (version == 2) {
             ByteReader v2{ConstByteView(caps.data, sizeof(caps.data))};
             v2.skip(484);
@@ -538,7 +542,7 @@ bool VirtioGpu::setup_3d() {
             if (!v2.ok()) virgl_max_texture_2d_ = 0;
           }
           if (!in.ok()) {
-            virgl_bset_ = virgl_glsl_level_ = virgl_max_samples_ = virgl_max_texture_2d_ = 0;
+            virgl_bset_ = virgl_glsl_level_ = virgl_max_samples_ = virgl_max_texture_2d_ = virgl_max_dual_source_ = virgl_max_viewports_ = 0;
             for (uint32_t& w : virgl_sampler_mask_) w = 0;
             for (uint32_t& w : virgl_render_mask_) w = 0;
           }

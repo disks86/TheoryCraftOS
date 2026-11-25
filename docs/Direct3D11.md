@@ -88,8 +88,11 @@ renderer does; virgl as large as the host's `max_texture_2d_size`).
 ## What is not there
 
 - Below `d3d11.dll`, in the kernel: depth buffers of several samples, or levels past the first, read by shaders, a depth texture read while it is the bound (read-only) depth
-  buffer, a view of part of a depth array, a stencil view of a cube; dynamic shader linkage; `R1_UNORM` (not a format here: `CheckFormatSupport` answers none); `SV_ViewportArrayIndex` (several
-  viewports: the first is drawn with), and `SV_RenderTargetArrayIndex` from a vertex or domain shader; dual-source blend factors (`D3D11_BLEND_SRC1_*`: the pipeline is refused), the blend factor on GPUs other than virgl, wireframe, depth bias, the back face's stencil operations, anisotropy, border colours.
+  buffer, a view of part of a depth array, a stencil view of a cube; dynamic shader linkage; `R1_UNORM` (not a format here: `CheckFormatSupport` answers none); on virgl
+  `SV_RenderTargetArrayIndex` and `SV_ViewportArrayIndex` from a vertex or domain shader (`D3D11_FEATURE_D3D11_OPTIONS3` says FALSE there; the CPU renderer has them) and anisotropic
+  filtering (virglrenderer 1.3.0 drops it: trilinear); on the GPUs other than virgl and the CPU renderer the blend factor and the fixed state of Direct3D 10 / 11
+  ([Direct3DKernelMode.md](Direct3DKernelMode.md), "The fixed state of Direct3D 10 and 11"); `AntialiasedLineEnable` and the multisampled line modes (lines are aliased and
+  one pixel wide); separate minification and magnification filters (a linear one of the two makes both linear).
 - A vertex and a pixel shader that read one texture unit as different texture and sampler pairs (each stage numbers the units of its own extra pairs) do not go together in a
   pipeline (`E_INVALIDARG` at the draw's pipeline); SampleCmp of a mipmapped colour texture compares the base level on the GPU.
 - One query of the kernel's is open at a time: a draw is measured for one kind (above).

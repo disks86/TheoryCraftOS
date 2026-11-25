@@ -41,8 +41,12 @@
 //                    those levels and layers - a count of 0: to the last -, a volume all its slices; its kind is the one the shader declares: graphics::texture_view_fits says which an
 //                    image may have - an array's slice as a 2D texture, six layers of an array as a cube, a cube or a cube array as an array, ...; a pass may sample levels and layers of
 //                    its targets it does not draw into)
-//   SetViewport      x, y, width, height, min_depth, max_depth (floats)
-//   SetScissor       x, y, width, height (x and y signed)
+//                    [, max_anisotropy (1 .. 16), custom border (0 or 1), the border colour's r, g, b, a (bits)]   (after the view - the 15th to 20th words, so a packet that has them has
+//                    the view word and the view too, 0 0 0 0 for all of the image -: the adapter's kFeature2SamplerState, graphics::SamplerDesc's anisotropy and border colour of any
+//                    value; without the part the sampler has neither). A packet has 9, 10, 14 or 20 words.
+//   SetViewport      x, y, width, height, min_depth, max_depth (floats) [, the same for viewports 1 ..]   (more than one - up to graphics::kMaxViewports - needs the adapter's kFeature2Viewports:
+//                    a primitive is drawn with the viewport and scissor rectangle its SV_ViewportArrayIndex names, the first when that is past the ones set)
+//   SetScissor       x, y, width, height (x and y signed) [, the same for rectangles 1 ..]
 //   Draw             vertex_count, first_vertex
 //   DrawIndexed      index_count, first_index, vertex_offset (signed)
 //   CopyRegion       dst_index, dst_x, dst_y, src_index, src_x, src_y, width, height   (colour images of one format, or of two whose pixels - or blocks - are as many bytes; also staging memory)
@@ -259,16 +263,42 @@ class CommandWriter {
     ok_ &= bytes_.put_zeros(uint64_t{words} * 4 - data.size());
   }
   void bind_texture(uint32_t unit, uint32_t allocation, const graphics::SamplerDesc& s) {
+    if (sampler_extras(s)) {
+      bind_texture_view(unit, allocation, s, 0, 0, 0, 0);   // (the sampler's extra words come after the view's: all of the image)
+      return;
+    }
     packet(Op::BindTexture, {unit, allocation, static_cast<uint32_t>(s.filter), address_word(s.address_u, s.border), address_word(s.address_v), static_cast<uint32_t>(s.mip_filter),
                              float_bits(s.lod_bias), float_bits(s.min_lod), float_bits(s.max_lod), texture_view_word(s)});
   }
-  // The same through a view (kFeature2MipmappedLayers): levels base_level .., layers first_layer .. (counts of 0: to the last).
+  // The same through a view (kFeature2MipmappedLayers): levels base_level .., layers first_layer .. (counts of 0: to the last). With the sampler's anisotropy or border colour of
+  // its own (kFeature2SamplerState) the six words of those follow.
   void bind_texture_view(uint32_t unit, uint32_t allocation, const graphics::SamplerDesc& s, uint32_t base_level, uint32_t level_count, uint32_t first_layer, uint32_t layer_count) {
+    if (sampler_extras(s)) {
+      packet(Op::BindTexture, {unit, allocation, static_cast<uint32_t>(s.filter), address_word(s.address_u, s.border), address_word(s.address_v), static_cast<uint32_t>(s.mip_filter),
+                               float_bits(s.lod_bias), float_bits(s.min_lod), float_bits(s.max_lod), texture_view_word(s), base_level, level_count, first_layer, layer_count,
+                               s.max_anisotropy, s.custom_border ? 1u : 0u, float_bits(s.border_rgba[0]), float_bits(s.border_rgba[1]), float_bits(s.border_rgba[2]),
+                               float_bits(s.border_rgba[3])});
+      return;
+    }
     packet(Op::BindTexture, {unit, allocation, static_cast<uint32_t>(s.filter), address_word(s.address_u, s.border), address_word(s.address_v), static_cast<uint32_t>(s.mip_filter),
                              float_bits(s.lod_bias), float_bits(s.min_lod), float_bits(s.max_lod), texture_view_word(s), base_level, level_count, first_layer, layer_count});
   }
+  static constexpr bool sampler_extras(const graphics::SamplerDesc& s) { return s.max_anisotropy > 1 || s.custom_border; }
   void set_viewport(const graphics::Viewport& v) { packet(Op::SetViewport, {float_bits(v.x), float_bits(v.y), float_bits(v.width), float_bits(v.height), float_bits(v.min_depth), float_bits(v.max_depth)}); }
   void set_scissor(const graphics::Rect2D& r) { packet(Op::SetScissor, {static_cast<uint32_t>(r.x), static_cast<uint32_t>(r.y), r.width, r.height}); }
+  // Several viewports and scissor rectangles (kFeature2Viewports): 1 .. graphics::kMaxViewports of them.
+  void set_viewports(ArrayView<const graphics::Viewport> list) {
+    ok_ &= list.size() >= 1 && list.size() <= graphics::kMaxViewports;
+    ok_ &= bytes_.put32(static_cast<uint32_t>(Op::SetViewport) | ((1 + 6 * static_cast<uint32_t>(list.size())) << 16));
+    for (const graphics::Viewport& v : list)
+      for (uint32_t w : {float_bits(v.x), float_bits(v.y), float_bits(v.width), float_bits(v.height), float_bits(v.min_depth), float_bits(v.max_depth)}) ok_ &= bytes_.put32(w);
+  }
+  void set_scissors(ArrayView<const graphics::Rect2D> list) {
+    ok_ &= list.size() >= 1 && list.size() <= graphics::kMaxViewports;
+    ok_ &= bytes_.put32(static_cast<uint32_t>(Op::SetScissor) | ((1 + 4 * static_cast<uint32_t>(list.size())) << 16));
+    for (const graphics::Rect2D& r : list)
+      for (uint32_t w : {static_cast<uint32_t>(r.x), static_cast<uint32_t>(r.y), r.width, r.height}) ok_ &= bytes_.put32(w);
+  }
   void set_topology(Topology topology) { packet(Op::SetTopology, {static_cast<uint32_t>(topology)}); }
   void draw(uint32_t vertex_count, uint32_t first_vertex = 0) { packet(Op::Draw, {vertex_count, first_vertex}); }
   // Several instances (the adapter's kFeatureInstancing): the draw is made instance_count times, numbered from first_instance; per-instance attributes step with them.

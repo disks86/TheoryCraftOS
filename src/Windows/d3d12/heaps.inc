@@ -25,6 +25,7 @@
 #define DESCRIPTOR_STRIDE 64
 
 enum { DK_NONE, DK_SRV, DK_SRV_BUFFER, DK_UAV, DK_CBV, DK_SAMPLER, DK_RTV, DK_DSV, DK_UAV_TEXTURE };
+#define DESCRIPTOR_SAMPLER_EXTRAS (1u << 16)      /* the escape WriteDescriptors' kind word: six more words of a sampler follow (dxgk::kDescriptorSamplerExtras) */
 
 /* Whether a format is one of the kernel's element formats of typed views of buffers (graphics::TexelFormat, which numbers them as DXGI does): 1 for a view that is read, 2 for one
  * that can also be an unordered access view (stored), 0 for none - typeless, sRGB, depth, block-compressed and video formats. */
@@ -56,7 +57,9 @@ typedef struct SoftDesc {
   UINT mip;                /* the level of a render target, depth stencil or unordered access view; a texture's shader resource view: its first level */
   UINT sampler[4];         /* filter | address_u << 8 | address_v << 16 | mip_filter << 24, lod bias, min lod, max lod (floats as bits). A view of a buffer (DK_SRV_BUFFER, DK_UAV): 0, then
                             * the element format of a typed view (0: raw or structured), and an unordered access view's counter - the kernel's allocation and the word's offset (0: none).
-                            * A texture's shader resource view (DK_SRV): 0, then its plane of a depth buffer (SRV_STENCIL: the stencil), 0, 0 */
+                            * A texture's shader resource view (DK_SRV): 0, then its plane of a depth buffer (SRV_STENCIL: the stencil), 0, 0.
+                            * A sampler (DK_SAMPLER) keeps its comparison in `offset` (sampler_comparison: the kernel's Descriptor offset low word), its anisotropy in `format` (1: none),
+                            * in `pad` 1 when it has a border colour of its own (an address mode BORDER) and that colour's bits in `size` (red, green << 32), `slice` (blue) and `stride` (alpha) */
   UINT dimension;
   UINT slice;              /* the first layer of a view of layers */
   UINT stride;             /* buffer unordered access views: the bytes of an element (ClearUnorderedAccessView* rectangles count elements); render target, depth stencil and
@@ -566,6 +569,17 @@ static void STDMETHODCALLTYPE dev_CreateSampler(Dev *This, const D3D12_SAMPLER_D
     d.kind = DK_SAMPLER;
     d.sampler[0] = sampler_words(desc->Filter, desc->AddressU, desc->AddressV, desc->BorderColor, desc->MipLODBias, desc->MinLOD, desc->MaxLOD, &d.sampler[1]);
     d.offset = sampler_comparison(desc->Filter, desc->ComparisonFunc);
+    /* (the anisotropic filters' MaxAnisotropy, 1 .. 16; the border colour as it is: the kernel's sampler has any colour on the devices with kFeature2SamplerState, the nearest
+     * of black, opaque black and white - sampler_words' - on the others) */
+    const UINT anisotropic = desc->Filter == D3D12_FILTER_ANISOTROPIC || desc->Filter == D3D12_FILTER_COMPARISON_ANISOTROPIC || desc->Filter == D3D12_FILTER_MINIMUM_ANISOTROPIC ||
+                             desc->Filter == D3D12_FILTER_MAXIMUM_ANISOTROPIC;
+    d.format = anisotropic ? (desc->MaxAnisotropy < 1 ? 1 : desc->MaxAnisotropy > 16 ? 16 : desc->MaxAnisotropy) : 1;
+    if (desc->AddressU == D3D12_TEXTURE_ADDRESS_MODE_BORDER || desc->AddressV == D3D12_TEXTURE_ADDRESS_MODE_BORDER || desc->AddressW == D3D12_TEXTURE_ADDRESS_MODE_BORDER) {
+      d.pad = 1;
+      d.size = (UINT64)bits_of(desc->BorderColor[0]) | (UINT64)bits_of(desc->BorderColor[1]) << 32;
+      d.slice = bits_of(desc->BorderColor[2]);
+      d.stride = bits_of(desc->BorderColor[3]);
+    }
   }
   desc_write(handle, &d);
 }
@@ -602,7 +616,8 @@ static void dheap_sync(DescHeap *h) {
   const UINT count = h->desc.NumDescriptors;
   for (UINT first = 0; first < count; first += 1000) {
     const UINT n = count - first < 1000 ? count - first : 1000;
-    UINT *request = mem_alloc((SIZE_T)(3 + n * 14) * 4);
+    UINT *request = mem_alloc((SIZE_T)(3 + n * 20) * 4);      /* (an entry is 14 words, a sampler with its extras 20) */
+    UINT starts[1000];
     if (!request) return;
     UINT w = 0;
     request[w++] = ESC_WRITE_DESCRIPTORS;
@@ -610,6 +625,7 @@ static void dheap_sync(DescHeap *h) {
     request[w++] = n;
     for (UINT i = 0; i < n; ++i) {
       const SoftDesc *d = &h->descs[first + i];
+      starts[i] = w;
       UINT kind = 0;
       switch (d->kind) {
         case DK_SRV: case DK_SRV_BUFFER: kind = 1; break;
@@ -627,19 +643,21 @@ static void dheap_sync(DescHeap *h) {
         w += 13;
         continue;
       }
+      /* (a sampler with anisotropy or a border colour: the kernel's extended entry, kDescriptorSamplerExtras, with six more words) */
+      const int extras = d->kind == DK_SAMPLER && (d->format > 1 || d->pad);
       request[w++] = first + i;
-      request[w++] = kind;
-      request[w++] = d->alloc;
+      request[w++] = kind | (extras ? DESCRIPTOR_SAMPLER_EXTRAS : 0u);
+      request[w++] = d->kind == DK_SAMPLER ? 0 : d->alloc;
       if (d->kind == DK_SRV) {
         /* (a texture's view: its first level and count of levels, its first layer and count of layers - the kernel's Descriptor::view; SRV_MIRRORS is this DLL's own) */
         request[w++] = (d->mip & 0xFFFF) | (d->stride << 16);
         request[w++] = (d->slice & 0xFFFF) | (d->pad << 16);
       } else {
-        request[w++] = (UINT)d->offset;
+        request[w++] = (UINT)d->offset;      /* (a sampler's: its comparison) */
         request[w++] = (UINT)(d->offset >> 32);
       }
-      request[w++] = (UINT)d->size;
-      request[w++] = (UINT)(d->size >> 32);
+      request[w++] = d->kind == DK_SAMPLER ? 0 : (UINT)d->size;
+      request[w++] = d->kind == DK_SAMPLER ? 0 : (UINT)(d->size >> 32);
       request[w++] = d->sampler[0] & 0xFF;
       request[w++] = ((d->sampler[0] >> 8) & 0xF) | (((d->sampler[0] >> 12) & 0xF) << 8);      /* (the mode, and the border colour above it) */
       request[w++] = (d->sampler[0] >> 16) & 0xFF;
@@ -647,16 +665,25 @@ static void dheap_sync(DescHeap *h) {
       request[w++] = d->sampler[1];
       request[w++] = d->sampler[2];
       request[w++] = d->sampler[3];
+      if (extras) {
+        request[w++] = d->format > 1 ? d->format : 1;
+        request[w++] = d->pad ? 1 : 0;
+        request[w++] = (UINT)d->size;      /* (the border colour's red, green, blue, alpha) */
+        request[w++] = (UINT)(d->size >> 32);
+        request[w++] = d->slice;
+        request[w++] = d->stride;
+      }
     }
     NTSTATUS st = dev_escape(h->d.dev, request, w, NULL, 0);
     if (!KMT_OK(st)) {
       /* (a descriptor of a resource that is gone, or one the kernel does not take: the others still go, one by one) */
       for (UINT i = 0; i < n; ++i) {
-        UINT one[17];
+        UINT one[23];
+        const UINT words = (i + 1 < n ? starts[i + 1] : w) - starts[i];
         memcpy(one, request, 3 * 4);
         one[2] = 1;
-        memcpy(one + 3, request + 3 + i * 14, 14 * 4);
-        dev_escape(h->d.dev, one, 17, NULL, 0);
+        memcpy(one + 3, request + starts[i], (SIZE_T)words * 4);
+        dev_escape(h->d.dev, one, 3 + words, NULL, 0);
       }
     }
     mem_free(request);

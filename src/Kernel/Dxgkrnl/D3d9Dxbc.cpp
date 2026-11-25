@@ -91,6 +91,7 @@ struct SigElement {
   uint32_t index = 0;
   uint32_t reg = 0;
   uint32_t stream = 0;   // (OSG5: the output stream the element belongs to)
+  uint8_t mask = 0;      // (the components of the register it is in)
 };
 
 bool names_equal(const char* a, const char* b) {
@@ -117,7 +118,7 @@ bool read_signature(ConstByteView chunk, uint32_t element_size, SigElement* out,
     const uint32_t name_at = e.le32(), index = e.le32();
     e.le32();
     e.le32();
-    const uint32_t reg = e.le32();
+    const uint32_t reg = e.le32(), masks = e.le32();
     if (!e.ok() || name_at >= chunk.size()) return false;
     SigElement& s = out[i];
     uint32_t k = 0;
@@ -131,6 +132,7 @@ bool read_signature(ConstByteView chunk, uint32_t element_size, SigElement* out,
     s.index = index;
     s.reg = reg;
     s.stream = stream;
+    s.mask = static_cast<uint8_t>(masks & 0xF);
   }
   *count = n;
   return true;
@@ -261,12 +263,23 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
     if (osgn.empty() || !read_signature(osgn, osgn_size, elements, &count, osgn_streams)) return status::kInvalidParameter;
     int8_t first_stream[kRegisters];
     for (int8_t& s : first_stream) s = -1;
+    int32_t layer_register = -1, viewport_register = -1;
     for (uint32_t i = 0; i < count; ++i) {
       if (elements[i].reg >= kRegisters || elements[i].stream >= graphics::kMaxGeometryStreams) continue;
-      // (SV_RenderTargetArrayIndex: the layer of the targets the primitive goes to, which a geometry shader writes)
+      // (SV_RenderTargetArrayIndex: the layer of the targets the primitive goes to, which a geometry shader writes - or a vertex or domain shader -; SV_ViewportArrayIndex its viewport)
       const bool layer = names_equal(elements[i].name, "SV_RENDERTARGETARRAYINDEX") && elements[i].index == 0;
-      merge_slot(&stream_slot[elements[i].stream][elements[i].reg], layer ? kSlotLayer : signature_slot(elements[i], true));
+      const bool viewport = names_equal(elements[i].name, "SV_VIEWPORTARRAYINDEX") && elements[i].index == 0;
+      merge_slot(&stream_slot[elements[i].stream][elements[i].reg], layer ? kSlotLayer : viewport ? kSlotViewport : signature_slot(elements[i], true));
+      // (the component each is in: the compiler packs the two integers into one register, o3.x and o3.y, when it can - that register is then the layer's, and the viewport is read
+      // from its component of it)
+      const uint8_t component = elements[i].mask & 1 ? 0 : elements[i].mask & 2 ? 1 : elements[i].mask & 4 ? 2 : elements[i].mask & 8 ? 3 : 0;
+      if (layer) layer_register = static_cast<int32_t>(elements[i].reg), program->layer_component_ = component;
+      if (viewport) viewport_register = static_cast<int32_t>(elements[i].reg), program->viewport_component_ = component;
       if (first_stream[elements[i].reg] < 0) first_stream[elements[i].reg] = static_cast<int8_t>(elements[i].stream);
+    }
+    if (layer_register >= 0 && layer_register == viewport_register) {
+      program->viewport_shares_layer_ = true;
+      for (auto& slots : stream_slot) slots[layer_register] = kSlotLayer;
     }
     for (uint32_t r = 0; r < kRegisters; ++r)   // (a register of several streams: the first stream's until the instructions say which)
       if (first_stream[r] >= 0) out_slot[r] = stream_slot[first_stream[r]][r];
@@ -472,12 +485,15 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
         }
         const int8_t slot = out_slot[o.index[0]];
         if (slot == kSlotNone) return status::kNotSupported;
-        if (slot == kSlotLayer) {
-          // (the layer from a geometry shader alone: a vertex or domain shader writing it is Direct3D 11.3's VPAndRTArrayIndexFromAnyShaderFeedingRasterizer, which is not offered)
-          if (!geometry) return status::kNotSupported;
-          d->type = kRastOut, d->slot = kSlotLayer;
+        if (slot == kSlotLayer || slot == kSlotViewport) {
+          // (from a geometry shader; from a vertex or domain shader it is Direct3D 11.3's VPAndRTArrayIndexFromAnyShaderFeedingRasterizer: kFeature2LayerFromAnyStage. A hull shader's
+          // outputs do not reach the rasterizer)
+          if (!geometry && !vertex && !(patch_stage && !hull)) return status::kNotSupported;
+          d->type = kRastOut, d->slot = slot;
           d->number = static_cast<uint16_t>(o.index[0]);
-          program->writes_layer_ = true;
+          (slot == kSlotLayer ? program->writes_layer_ : program->writes_viewport_) = true;
+          if (slot == kSlotLayer && program->viewport_shares_layer_) program->writes_viewport_ = true;
+          if (!geometry) program->layer_before_geometry_ = true;
           return status::kSuccess;
         }
         if (slot == kSlotPosition) d->type = kRastOut, d->slot = kSlotPosition;
@@ -1554,7 +1570,7 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
           const int8_t slot = stream_slot[stream_after][ins.dst.number];
           if (slot == kSlotNone) continue;   // (a register the stream has no element for: left as the first meaning had it)
           ins.dst.slot = slot;
-          ins.dst.type = slot == kSlotPosition || slot == kSlotLayer ? kRastOut : kAttrOut;
+          ins.dst.type = slot == kSlotPosition || slot == kSlotLayer || slot == kSlotViewport ? kRastOut : kAttrOut;
         }
       }
     }
