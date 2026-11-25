@@ -231,6 +231,7 @@ typedef struct Shader {
   UINT group[3];                          /* a compute shader's threads in a group (dcl_thread_group) */
   UINT gs_instances;                      /* a geometry shader's instances (dcl_gs_instance_count; 0: one) */
   UINT program_type;                      /* the shader's stage by its version token (D3D10_SB_TOKENIZED_PROGRAM_TYPE: 0 pixel, 1 vertex, 2 geometry, 3 hull, 4 domain, 5 compute) */
+  int feedback;                           /* it has tiled resources tier 2's instructions: the _s lookups (0xDB .. 0xE9) or check_access_fully_mapped (0xEA) */
   UINT out_vertices;                      /* the vertices of a primitive a geometry shader puts out (dcl_output_topology: 1, 2 or 3; 0 not declared) */
   /* CreateGeometryShaderWithStreamOutput: what is captured, the strides of the buffers and the stream that is drawn (D3D11_SO_NO_RASTERIZED_STREAM: none). The
    * shader may be a vertex or domain shader's code, which captures what that stage puts out (there is then no geometry stage: `so_only`). */
@@ -1997,6 +1998,7 @@ static void shader_constants(Shader *s) {
       memcpy(&token, code + 4 * w, 4);
       const UINT op = token & 0x7FF;
       length = (token >> 24) & 0x7F;
+      if (op >= 0xDB && op <= 0xEA) s->feedback = 1;
       if (op == 53 /* customdata */) { if (w + 1 >= words) return; memcpy(&length, code + 4 * (w + 1), 4); }
       if (length == 0 || length > words - w) return;
       /* dcl_resource (the dimension in the token), dcl_resource_raw / _structured, dcl_uav_typed / _raw / _structured: the operand, then its register */
@@ -2049,6 +2051,8 @@ static HRESULT shader_make(Dev *d, const void *code, SIZE_T bytes, const void *v
   memset(s->tex_kind, 0xFF, sizeof s->tex_kind);
   shader_constants(s);
   if (s->registers * 16 > CONSTANT_BLOCK) { dx_Release(OBJ(s)); return E_INVALIDARG; }
+  /* (a shader of tiled resources tier 2's instructions on a device of a lower tier: E_INVALIDARG, as Windows' runtime refuses it) */
+  if (s->feedback && dev_tiled_tier(d) < D3D11_TILED_RESOURCES_TIER_2) { dx_Release(OBJ(s)); return E_INVALIDARG; }
   const HRESULT hr = shader_link(s, linkage);
   if (FAILED(hr)) { dx_Release(OBJ(s)); return hr; }
   return give(s, out);
