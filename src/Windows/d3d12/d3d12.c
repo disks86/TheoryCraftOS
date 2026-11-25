@@ -26,8 +26,12 @@
  *
  * What Direct3D 12 has that this does not (the device says so with DXGI_ERROR_UNSUPPORTED, E_NOTIMPL or by ignoring the call, as the part's file says). The counts of vertex inputs,
  * interpolants, texture units, render targets and vertex buffers are the adapter's (DeviceInfo::limits of the kernel's graphics device, read with the UMDRIVERPRIVATE query): the CPU
- * renderer takes 16, 16, 16, 8 and 8; virgl (a GPU through virglrenderer) 16, 14 or 15, 16, 8 and 8, which is feature level 11_0 here; the other GPU backends what their
- * encoders were made for (feature level 9_x, so D3D12CreateDevice with the usual minimum of 11_0 is refused on them). tests/d3d12_qemu.sh runs the test program on virgl.
+ * renderer takes 16, 16, 16, 8 and 8; virgl (a GPU through virglrenderer) 16, 14 or 15, 16, 8 and 8; the other GPU backends what their encoders were made for (feature level
+ * 9_x, so D3D12CreateDevice with the usual minimum of 11_0 is refused on them). tests/d3d12_qemu.sh runs the test program on virgl.
+ * Feature levels (device.inc dev_feature_level): 11_1 on the CPU renderer (logic operations, UAVs in every stage, target-independent rasterization with ForcedSampleCount up to
+ * 16), 11_0 on virgl and Venus (no forced sample count). None above 11_1: 12_0 needs resource binding tier 2 - the kernel binds 16 texture units and samplers a stage - and
+ * Shader Model 6.0's wave operations; 12_1 adds conservative rasterization tier 1 and rasterizer ordered views, which the CPU renderer (and Venus the views) have and OPTIONS
+ * reports on their own.
  * Whatever the device:
  *   - fixed state the device lacks is refused (pso.inc): depth bias, depth clip, wireframe, two-sided stencil, dual-source blending, logic ops, anisotropy, custom border
  *     colours and several viewports need the kernel's RasterizerState, DualSourceBlend, LogicOps, SamplerState and Viewports features (the CPU renderer and virgl;
@@ -181,7 +185,13 @@ EXPORT void WINAPI TcosD3D12BeginQueryKind(ID3D12GraphicsCommandList *list, ID3D
 EXPORT HRESULT WINAPI D3D12CreateDevice(IUnknown *adapter, D3D_FEATURE_LEVEL minimum, REFIID riid, void **out) {
   LUID luid = {0, 0};
   NTSTATUS st = 0;
-  if (minimum > D3D_FEATURE_LEVEL_11_0 && minimum != 0) return DXGI_ERROR_UNSUPPORTED;      /* (the levels above 11_0 need features the kernel's pipelines do not have) */
+  /* (a value that names no feature level is not one; a level the adapter lacks - device.inc dev_feature_level: 11_1 on the CPU renderer, 11_0 on virgl and Venus, nothing above
+   * 11_1 anywhere - is refused below as the adapter not supporting it) */
+  switch ((UINT)minimum) {
+    case 0: case D3D_FEATURE_LEVEL_1_0_CORE: case D3D_FEATURE_LEVEL_9_1: case D3D_FEATURE_LEVEL_9_2: case D3D_FEATURE_LEVEL_9_3: case D3D_FEATURE_LEVEL_10_0: case D3D_FEATURE_LEVEL_10_1:
+    case D3D_FEATURE_LEVEL_11_0: case D3D_FEATURE_LEVEL_11_1: case D3D_FEATURE_LEVEL_12_0: case D3D_FEATURE_LEVEL_12_1: case D3D_FEATURE_LEVEL_12_2: break;
+    default: return E_INVALIDARG;
+  }
   if (adapter) {
     IDXGIAdapter *a = NULL;
     DXGI_ADAPTER_DESC desc;
@@ -197,14 +207,17 @@ EXPORT HRESULT WINAPI D3D12CreateDevice(IUnknown *adapter, D3D_FEATURE_LEVEL min
     luid = list[0].luid;
     for (UINT i = 0; i < n; ++i) kmt_close_adapter(list[i].handle);
   }
-  if (!out) return S_FALSE;      /* (the question "could a device be made?") */
-  *out = NULL;
+  if (out) *out = NULL;
   Dev *d = dev_create(luid, &st);
   if (!d) return KMT_OK(st) ? E_OUTOFMEMORY : DXGI_ERROR_UNSUPPORTED;
-  /* (a program that asks for a feature level the adapter's limits do not allow gets what Direct3D 12 says: the adapter does not support it) */
+  /* (a program that asks for a feature level the adapter does not have gets what Direct3D 12 says: the adapter does not support it) */
   if (minimum != 0 && dev_feature_level(d) < minimum) {
     dx_Release(OBJ(d));
     return DXGI_ERROR_UNSUPPORTED;
+  }
+  if (!out) {      /* (the question "could a device be made?") */
+    dx_Release(OBJ(d));
+    return S_FALSE;
   }
   return query_out((IUnknown *)d, riid, out);
 }

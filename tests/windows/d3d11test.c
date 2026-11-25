@@ -119,12 +119,15 @@ static ID3D11Buffer *triangle(float z, float r, float g, float b) {
 static void test_device(void) {
   D3D_FEATURE_LEVEL level = 0;
   const D3D_FEATURE_LEVEL wanted[2] = {D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0};
-  check(D3D11CreateDevice(NULL, D3D_DRIVER_TYPE_HARDWARE, NULL, 0, wanted, 2, D3D11_SDK_VERSION, NULL, &level, NULL) == S_FALSE && level == D3D_FEATURE_LEVEL_11_0,
+  /* (11_1 where the adapter has it - the CPU renderer -, else 11_0: test_feature_level_11_1) */
+  check(D3D11CreateDevice(NULL, D3D_DRIVER_TYPE_HARDWARE, NULL, 0, wanted, 2, D3D11_SDK_VERSION, NULL, &level, NULL) == S_FALSE &&
+            (level == D3D_FEATURE_LEVEL_11_0 || level == D3D_FEATURE_LEVEL_11_1),
         "D3D11CreateDevice with nothing asked for says which level there would be");
+  const D3D_FEATURE_LEVEL would = level;
   const HRESULT made = D3D11CreateDevice(NULL, D3D_DRIVER_TYPE_HARDWARE, NULL, 0, wanted, 2, D3D11_SDK_VERSION, &g_device, &level, &g_context);
-  check(made == S_OK && g_device && g_context && level == D3D_FEATURE_LEVEL_11_0, "D3D11CreateDevice: a device and its context, feature level 11.0");
+  check(made == S_OK && g_device && g_context && level == would, "D3D11CreateDevice: a device and its context, at that feature level");
   if (!g_device || !g_context) return;
-  check(ID3D11Device_GetFeatureLevel(g_device) == D3D_FEATURE_LEVEL_11_0 && ID3D11DeviceContext_GetType(g_context) == D3D11_DEVICE_CONTEXT_IMMEDIATE, "the level and the context's type");
+  check(ID3D11Device_GetFeatureLevel(g_device) == would && ID3D11DeviceContext_GetType(g_context) == D3D11_DEVICE_CONTEXT_IMMEDIATE, "the level and the context's type");
   ID3D11DeviceContext *again = NULL;
   ID3D11Device_GetImmediateContext(g_device, &again);
   check(again == g_context, "GetImmediateContext is the same context");
@@ -2180,6 +2183,276 @@ static void test_d3d11_1(void) {
   }
   if (matrices) ID3D11Buffer_Release(matrices);
   ID3D11Buffer_Release(vertices);
+  ID3D11DeviceContext1_Release(context1);
+  ID3D11Device1_Release(device1);
+}
+
+/* ---- feature level 11_1 and the levels above it -------------------------------------------------------------------------------------------------------------------- */
+
+/* The adapter the device is on: the CPU renderer (feature level 11_1 here), Venus (the host's Vulkan: rasterizer ordered views) or virgl. */
+static void adapter_kind(int *software, int *venus) {
+  *software = *venus = 0;
+  IDXGIDevice *dxgi = NULL;
+  if (FAILED(ID3D11Device_QueryInterface(g_device, &IID_IDXGIDevice, (void **)&dxgi)) || !dxgi) return;
+  IDXGIAdapter *adapter = NULL;
+  if (SUCCEEDED(IDXGIDevice_GetAdapter(dxgi, &adapter)) && adapter) {
+    IDXGIAdapter1 *a1 = NULL;
+    DXGI_ADAPTER_DESC1 ad;
+    memset(&ad, 0, sizeof ad);
+    if (SUCCEEDED(IDXGIAdapter_QueryInterface(adapter, &IID_IDXGIAdapter1, (void **)&a1)) && a1) {
+      IDXGIAdapter1_GetDesc1(a1, &ad);
+      IDXGIAdapter1_Release(a1);
+    }
+    *software = (ad.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) != 0;
+    *venus = wcsstr(ad.Description, L"Venus") != NULL;
+    IDXGIAdapter_Release(adapter);
+  }
+  IDXGIDevice_Release(dxgi);
+}
+/* A triangle in a corner of pixel (px, py) of a 16 x 16 viewport: (px, py), (px + 0.45, py), (px, py + 0.45) - none of the pixel's standard 1, 2, 4 or 8 sample positions
+ * is in it, the sixteen-sample pattern's (-4, -6) is. */
+static void corner_vertices(VertexF *v, float px, float py) {
+  const float xs[3] = {px, px + 0.45f, px}, ys[3] = {py, py, py + 0.45f};
+  for (UINT k = 0; k < 3; ++k) {
+    const VertexF one = {xs[k] / 8 - 1, 1 - ys[k] / 8, 0.5f, 1, 1, 1, 1};
+    v[k] = one;
+  }
+}
+/* Feature level 11_1 (on the CPU renderer; 11_0 elsewhere): the levels D3D11CreateDevice makes, D3D11_FEATURE_D3D11_OPTIONS and OPTIONS2, ForcedSampleCount (UAV-only rendering
+ * with 16 samples), the 64 unordered access slots and unordered access views in a vertex shader, rasterizer ordered views (where the adapter has them), parts of constant buffers
+ * (UpdateSubresource1) and overlapping copies within a subresource (CopySubresourceRegion1). */
+static void test_feature_level_11_1(void) {
+  int software = 0, venus = 0;
+  adapter_kind(&software, &venus);
+  const D3D_FEATURE_LEVEL top = software ? D3D_FEATURE_LEVEL_11_1 : D3D_FEATURE_LEVEL_11_0;
+  const int at_11_1 = ID3D11Device_GetFeatureLevel(g_device) >= D3D_FEATURE_LEVEL_11_1;
+  check(ID3D11Device_GetFeatureLevel(g_device) == top, "the device asked for at 11_1 and 11_0 is at the adapter's level (11_1 on the CPU renderer, 11_0 on virgl and Venus)");
+
+  /* (creation: the first level asked for that the adapter has; 12_x are above every adapter here; a value that is no level is E_INVALIDARG; no levels: 11_0 down, never 11_1) */
+  {
+    D3D_FEATURE_LEVEL got = 0;
+    const D3D_FEATURE_LEVEL high[3] = {D3D_FEATURE_LEVEL_12_1, D3D_FEATURE_LEVEL_12_0, D3D_FEATURE_LEVEL_11_1};
+    const HRESULT hr = D3D11CreateDevice(NULL, D3D_DRIVER_TYPE_HARDWARE, NULL, 0, high, 3, D3D11_SDK_VERSION, NULL, &got, NULL);
+    check(software ? hr == S_FALSE && got == D3D_FEATURE_LEVEL_11_1 : hr == DXGI_ERROR_UNSUPPORTED, "D3D11CreateDevice of 12_1, 12_0 and 11_1: 11_1 where the adapter has it");
+    const D3D_FEATURE_LEVEL twelve[2] = {D3D_FEATURE_LEVEL_12_1, D3D_FEATURE_LEVEL_11_0};
+    got = 0;
+    check(D3D11CreateDevice(NULL, D3D_DRIVER_TYPE_HARDWARE, NULL, 0, twelve, 2, D3D11_SDK_VERSION, NULL, &got, NULL) == S_FALSE && got == D3D_FEATURE_LEVEL_11_0, "12_1 or 11_0: 11_0");
+    const D3D_FEATURE_LEVEL bogus[2] = {(D3D_FEATURE_LEVEL)0xb200, D3D_FEATURE_LEVEL_11_0};
+    check(D3D11CreateDevice(NULL, D3D_DRIVER_TYPE_HARDWARE, NULL, 0, bogus, 2, D3D11_SDK_VERSION, NULL, &got, NULL) == E_INVALIDARG, "a value that names no feature level: E_INVALIDARG");
+    got = 0;
+    check(D3D11CreateDevice(NULL, D3D_DRIVER_TYPE_HARDWARE, NULL, 0, NULL, 0, D3D11_SDK_VERSION, NULL, &got, NULL) == S_FALSE && got == D3D_FEATURE_LEVEL_11_0,
+          "no levels asked for: 11_0 (Windows' list has no 11_1)");
+  }
+
+  /* (OPTIONS: everything but msad4 and doubles at 11_1; the forced sample count below it is not there. OPTIONS2: rasterizer ordered views on the CPU renderer and Venus) */
+  D3D11_FEATURE_DATA_D3D11_OPTIONS o;
+  memset(&o, 0, sizeof o);
+  check(SUCCEEDED(ID3D11Device_CheckFeatureSupport(g_device, D3D11_FEATURE_D3D11_OPTIONS, &o, sizeof o)), "D3D11_FEATURE_D3D11_OPTIONS");
+  check(o.DiscardAPIsSeenByDriver && o.FlagsForUpdateAndCopySeenByDriver && o.ClearView && o.CopyWithOverlap && o.ConstantBufferPartialUpdate && o.ConstantBufferOffsetting &&
+            o.MapNoOverwriteOnDynamicConstantBuffer && o.MapNoOverwriteOnDynamicBufferSRV && o.ExtendedResourceSharing,
+        "Direct3D 11.1's options: Discard, copy and update flags, ClearView, overlapping copies, constant buffer parts and windows, NO_OVERWRITE maps, extended sharing");
+  check(o.UAVOnlyRenderingForcedSampleCount == at_11_1 && o.MultisampleRTVWithForcedSampleCountOne == at_11_1 && (!at_11_1 || o.OutputMergerLogicOp),
+        "the forced sample count and logic operations from feature level 11_1");
+  D3D11_FEATURE_DATA_D3D11_OPTIONS2 o2;
+  memset(&o2, 0, sizeof o2);
+  check(SUCCEEDED(ID3D11Device_CheckFeatureSupport(g_device, D3D11_FEATURE_D3D11_OPTIONS2, &o2, sizeof o2)) && o2.ROVsSupported == (software || venus),
+        "ROVsSupported: the CPU renderer and Venus");
+  printf("d3d11test: feature level %#x, ROVs %d, typed UAV loads of the additional formats %d\n", (unsigned)ID3D11Device_GetFeatureLevel(g_device), (int)o2.ROVsSupported,
+         (int)o2.TypedUAVLoadAdditionalFormats);
+
+  /* ForcedSampleCount: 0, 1, 2, 4, 8 and 16 at 11_1, none below */
+  ID3D11Device1 *device1 = NULL;
+  ID3D11DeviceContext1 *context1 = NULL;
+  ID3D11Device_QueryInterface(g_device, &IID_ID3D11Device1, (void **)&device1);
+  ID3D11DeviceContext_QueryInterface(g_context, &IID_ID3D11DeviceContext1, (void **)&context1);
+  if (!device1 || !context1) { check(0, "ID3D11Device1 and ID3D11DeviceContext1"); return; }
+  D3D11_RASTERIZER_DESC1 rd = {D3D11_FILL_SOLID, D3D11_CULL_NONE, FALSE, 0, 0, 0, TRUE, FALSE, FALSE, FALSE, 16};
+  ID3D11RasterizerState1 *forced = NULL, *bad = NULL;
+  const HRESULT forced_made = ID3D11Device1_CreateRasterizerState1(device1, &rd, &forced);
+  check(at_11_1 ? SUCCEEDED(forced_made) && forced : forced_made == E_INVALIDARG && !forced, "CreateRasterizerState1 with ForcedSampleCount 16: at feature level 11_1");
+  rd.ForcedSampleCount = 3;
+  check(ID3D11Device1_CreateRasterizerState1(device1, &rd, &bad) == E_INVALIDARG && !bad, "ForcedSampleCount 3: E_INVALIDARG");
+
+  /* UAV-only rendering with 16 samples: corner triangles of pixels 2 and 5 of a 16 x 16 viewport without and with the forced count - pixel 5 alone is shaded */
+  if (forced) {
+    ID3D11Buffer *hits = make_buffer(D3D11_BIND_UNORDERED_ACCESS, D3D11_USAGE_DEFAULT, 0, NULL, 256 * 4);
+    ID3D11UnorderedAccessView *view = buffer_uav(hits, DXGI_FORMAT_R32_UINT, 0, 256, 0);
+    ID3D11PixelShader *ps = NULL;
+    ID3D11Device_CreatePixelShader(g_device, dx_ps_uav_only_dxbc, sizeof dx_ps_uav_only_dxbc, NULL, &ps);
+    VertexF v[6];
+    corner_vertices(v, 2, 0);
+    corner_vertices(v + 3, 5, 0);
+    ID3D11Buffer *vertices = make_buffer(D3D11_BIND_VERTEX_BUFFER, D3D11_USAGE_DEFAULT, 0, v, sizeof v);
+    if (hits && view && ps && vertices) {
+      const UINT zero[4] = {0, 0, 0, 0};
+      ID3D11DeviceContext_ClearUnorderedAccessViewUint(g_context, view, zero);
+      begin(NULL);
+      D3D11_VIEWPORT viewport = {0, 0, 16, 16, 0, 1};
+      ID3D11DeviceContext_OMSetRenderTargetsAndUnorderedAccessViews(g_context, 0, NULL, NULL, 0, 1, &view, NULL);
+      ID3D11DeviceContext_RSSetViewports(g_context, 1, &viewport);
+      ID3D11DeviceContext_PSSetShader(g_context, ps, NULL, 0);
+      bind_floats(vertices);
+      ID3D11DeviceContext_Draw(g_context, 3, 0);
+      ID3D11DeviceContext_RSSetState(g_context, (ID3D11RasterizerState *)forced);
+      ID3D11DeviceContext_Draw(g_context, 3, 3);
+      UINT h[256];
+      int ok = read_buffer(hits, h, sizeof h), wrong = 0;
+      for (UINT i = 0; ok && i < 256; ++i)
+        if (h[i] != (i == 5) && !wrong++) printf("d3d11test: (forced sample count: element %u = %u)\n", i, h[i]);
+      check(ok && wrong == 0, "UAV-only rendering with ForcedSampleCount 16: a pixel the triangle covers only at one of the sixteen samples is shaded once");
+      ID3D11UnorderedAccessView *none = NULL;
+      ID3D11DeviceContext_OMSetRenderTargetsAndUnorderedAccessViews(g_context, 1, &g_target_view, NULL, 1, 1, &none, NULL);
+      ID3D11DeviceContext_RSSetState(g_context, g_no_cull);
+    } else {
+      check(0, "the UAV-only scene of the forced sample count");
+    }
+    if (vertices) ID3D11Buffer_Release(vertices);
+    if (ps) ID3D11PixelShader_Release(ps);
+    if (view) ID3D11UnorderedAccessView_Release(view);
+    if (hits) ID3D11Buffer_Release(hits);
+    ID3D11RasterizerState1_Release(forced);
+  }
+
+  /* the 64 slots: u40 and u63 of a compute shader (refused at 11_0, as is a vertex shader with unordered access views) */
+  {
+    ID3D11ComputeShader *cs = NULL;
+    const HRESULT cs_made = ID3D11Device_CreateComputeShader(g_device, dx_cs_uav63_dxbc, sizeof dx_cs_uav63_dxbc, NULL, &cs);
+    ID3D11VertexShader *vs = NULL;
+    const HRESULT vs_made = ID3D11Device_CreateVertexShader(g_device, dx_vs_uav_dxbc, sizeof dx_vs_uav_dxbc, NULL, &vs);
+    check(at_11_1 ? SUCCEEDED(cs_made) && SUCCEEDED(vs_made) : cs_made == E_INVALIDARG && vs_made == E_INVALIDARG,
+          "a shader of u63, and a vertex shader with unordered access views: from feature level 11_1");
+    if (cs) {
+      ID3D11Buffer *high_slots = make_buffer(D3D11_BIND_UNORDERED_ACCESS, D3D11_USAGE_DEFAULT, 0, NULL, 16), *mid_slots = make_buffer(D3D11_BIND_UNORDERED_ACCESS, D3D11_USAGE_DEFAULT, 0, NULL, 16);
+      ID3D11UnorderedAccessView *fv = buffer_uav(high_slots, DXGI_FORMAT_R32_UINT, 0, 4, 0), *mv = buffer_uav(mid_slots, DXGI_FORMAT_R32_UINT, 0, 4, 0);
+      UINT a[4] = {0}, b[4] = {0};
+      if (fv && mv) {
+        ID3D11DeviceContext_CSSetShader(g_context, cs, NULL, 0);
+        ID3D11DeviceContext_CSSetUnorderedAccessViews(g_context, 63, 1, &fv, NULL);
+        ID3D11DeviceContext_CSSetUnorderedAccessViews(g_context, 40, 1, &mv, NULL);
+        ID3D11UnorderedAccessView *got = NULL;
+        ID3D11DeviceContext_CSGetUnorderedAccessViews(g_context, 63, 1, &got);
+        check(got == fv, "CSGetUnorderedAccessViews of u63");
+        if (got) ID3D11UnorderedAccessView_Release(got);
+        ID3D11DeviceContext_Dispatch(g_context, 1, 1, 1);
+        read_buffer(high_slots, a, sizeof a);
+        read_buffer(mid_slots, b, sizeof b);
+        ID3D11UnorderedAccessView *none[1] = {NULL};
+        ID3D11DeviceContext_CSSetUnorderedAccessViews(g_context, 63, 1, none, NULL);
+        ID3D11DeviceContext_CSSetUnorderedAccessViews(g_context, 40, 1, none, NULL);
+        ID3D11DeviceContext_CSSetShader(g_context, NULL, NULL, 0);
+      }
+      check(a[0] == 0x63 && a[3] == 0x66 && b[0] == 0x40 && b[3] == 0x43, "a compute shader writes u40 and u63");
+      if (fv) ID3D11UnorderedAccessView_Release(fv);
+      if (mv) ID3D11UnorderedAccessView_Release(mv);
+      if (high_slots) ID3D11Buffer_Release(high_slots);
+      if (mid_slots) ID3D11Buffer_Release(mid_slots);
+      ID3D11ComputeShader_Release(cs);
+    }
+    if (vs) ID3D11VertexShader_Release(vs);
+  }
+
+  /* rasterizer ordered views: three triangles over a 4 x 4 viewport, each putting SV_PrimitiveID + 1 into the pixel's word after the earlier ones' (u1 a texture, u2 a buffer) */
+  {
+    ID3D11PixelShader *ps = NULL;
+    const HRESULT made = ID3D11Device_CreatePixelShader(g_device, dx_ps_rov_dxbc, sizeof dx_ps_rov_dxbc, NULL, &ps);
+    check(o2.ROVsSupported ? SUCCEEDED(made) && ps : made == E_INVALIDARG && !ps, "a pixel shader of rasterizer ordered views: where the device has them");
+    if (ps) {
+      D3D11_TEXTURE2D_DESC td = {4, 4, 1, 1, DXGI_FORMAT_R32_UINT, {1, 0}, D3D11_USAGE_DEFAULT, D3D11_BIND_UNORDERED_ACCESS, 0, 0};
+      ID3D11Texture2D *order = NULL;
+      ID3D11Device_CreateTexture2D(g_device, &td, NULL, &order);
+      ID3D11UnorderedAccessView *views[2] = {NULL, NULL};
+      if (order) ID3D11Device_CreateUnorderedAccessView(g_device, (ID3D11Resource *)order, NULL, &views[0]);
+      D3D11_BUFFER_DESC bd = {64, D3D11_USAGE_DEFAULT, D3D11_BIND_UNORDERED_ACCESS, 0, D3D11_RESOURCE_MISC_BUFFER_ALLOW_RAW_VIEWS, 0};
+      ID3D11Buffer *words = NULL;
+      ID3D11Device_CreateBuffer(g_device, &bd, NULL, &words);
+      views[1] = buffer_uav(words, DXGI_FORMAT_R32_TYPELESS, 0, 16, D3D11_BUFFER_UAV_FLAG_RAW);
+      const VertexF v[9] = {{-1, -1, 0.5f, 1, 1, 1, 1}, {3, -1, 0.5f, 1, 1, 1, 1}, {-1, 3, 0.5f, 1, 1, 1, 1}, {-1, -1, 0.5f, 1, 1, 1, 1}, {3, -1, 0.5f, 1, 1, 1, 1},
+                            {-1, 3, 0.5f, 1, 1, 1, 1}, {-1, -1, 0.5f, 1, 1, 1, 1}, {3, -1, 0.5f, 1, 1, 1, 1}, {-1, 3, 0.5f, 1, 1, 1, 1}};
+      ID3D11Buffer *vertices = make_buffer(D3D11_BIND_VERTEX_BUFFER, D3D11_USAGE_DEFAULT, 0, v, sizeof v);
+      UINT got[16] = {0}, in_buffer[16] = {0};
+      if (views[0] && views[1] && vertices) {
+        const UINT zero[4] = {0, 0, 0, 0};
+        ID3D11DeviceContext_ClearUnorderedAccessViewUint(g_context, views[0], zero);
+        ID3D11DeviceContext_ClearUnorderedAccessViewUint(g_context, views[1], zero);
+        begin(NULL);
+        D3D11_VIEWPORT viewport = {0, 0, 4, 4, 0, 1};
+        ID3D11DeviceContext_OMSetRenderTargetsAndUnorderedAccessViews(g_context, 1, &g_target_view, NULL, 1, 2, views, NULL);
+        ID3D11DeviceContext_RSSetViewports(g_context, 1, &viewport);
+        ID3D11DeviceContext_PSSetShader(g_context, ps, NULL, 0);
+        bind_floats(vertices);
+        ID3D11DeviceContext_Draw(g_context, 9, 0);
+        ID3D11UnorderedAccessView *none[2] = {NULL, NULL};
+        ID3D11DeviceContext_OMSetRenderTargetsAndUnorderedAccessViews(g_context, 1, &g_target_view, NULL, 1, 2, none, NULL);
+        ID3D11DeviceContext_PSSetShader(g_context, NULL, NULL, 0);
+        read_buffer(words, in_buffer, sizeof in_buffer);
+        D3D11_TEXTURE2D_DESC sd = td;
+        sd.Usage = D3D11_USAGE_STAGING, sd.BindFlags = 0, sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+        ID3D11Texture2D *staging = NULL;
+        ID3D11Device_CreateTexture2D(g_device, &sd, NULL, &staging);
+        D3D11_MAPPED_SUBRESOURCE mapped;
+        if (staging) {
+          ID3D11DeviceContext_CopyResource(g_context, (ID3D11Resource *)staging, (ID3D11Resource *)order);
+          if (SUCCEEDED(ID3D11DeviceContext_Map(g_context, (ID3D11Resource *)staging, 0, D3D11_MAP_READ, 0, &mapped)) && mapped.pData) {
+            for (UINT y = 0; y < 4; ++y) memcpy(got + 4 * y, (const BYTE *)mapped.pData + (SIZE_T)y * mapped.RowPitch, 16);
+            ID3D11DeviceContext_Unmap(g_context, (ID3D11Resource *)staging, 0);
+          }
+          ID3D11Texture2D_Release(staging);
+        }
+      }
+      int wrong = 0;
+      for (UINT i = 0; i < 16; ++i)
+        if ((got[i] != 0x123 || in_buffer[i] != 0x123) && !wrong++) printf("d3d11test: (rasterizer ordered view: pixel %u texture %#x buffer %#x)\n", i, got[i], in_buffer[i]);
+      check(wrong == 0, "rasterizer ordered views: each primitive's accesses at a pixel after the earlier ones' (0x123 everywhere)");
+      if (vertices) ID3D11Buffer_Release(vertices);
+      for (UINT k = 0; k < 2; ++k) if (views[k]) ID3D11UnorderedAccessView_Release(views[k]);
+      if (words) ID3D11Buffer_Release(words);
+      if (order) ID3D11Texture2D_Release(order);
+      ID3D11PixelShader_Release(ps);
+    }
+  }
+
+  /* parts of a constant buffer (UpdateSubresource1 with a box of whole constants; one that is not is dropped), and an overlapping copy within one texture */
+  {
+    BYTE initial[64];
+    for (UINT i = 0; i < 64; ++i) initial[i] = (BYTE)i;
+    ID3D11Buffer *cb = make_buffer(D3D11_BIND_CONSTANT_BUFFER, D3D11_USAGE_DEFAULT, 0, initial, 64);
+    BYTE part[16], back[64];
+    memset(part, 0xAB, sizeof part);
+    const D3D11_BOX whole_constant = {16, 0, 0, 32, 1, 1}, ragged = {36, 0, 0, 40, 1, 1};
+    if (cb) {
+      ID3D11DeviceContext1_UpdateSubresource1(context1, (ID3D11Resource *)cb, 0, &whole_constant, part, 0, 0, 0);
+      ID3D11DeviceContext1_UpdateSubresource1(context1, (ID3D11Resource *)cb, 0, &ragged, part, 0, 0, 0);
+    }
+    int ok = cb && read_buffer(cb, back, sizeof back);
+    for (UINT i = 0; ok && i < 64; ++i) ok = back[i] == (i >= 16 && i < 32 ? 0xAB : i);
+    check(ok, "UpdateSubresource1 of a constant buffer: a box of whole constants is written, one that is not is dropped");
+    if (cb) ID3D11Buffer_Release(cb);
+    UINT32 row[8];
+    for (UINT i = 0; i < 8; ++i) row[i] = 0xFF000000u | i;
+    D3D11_TEXTURE2D_DESC td = {8, 1, 1, 1, DXGI_FORMAT_R8G8B8A8_UNORM, {1, 0}, D3D11_USAGE_DEFAULT, D3D11_BIND_SHADER_RESOURCE, 0, 0};
+    D3D11_SUBRESOURCE_DATA data = {row, sizeof row, 0};
+    ID3D11Texture2D *t = NULL, *staging = NULL;
+    ID3D11Device_CreateTexture2D(g_device, &td, &data, &t);
+    td.Usage = D3D11_USAGE_STAGING, td.BindFlags = 0, td.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    ID3D11Device_CreateTexture2D(g_device, &td, NULL, &staging);
+    UINT32 out[8] = {0};
+    if (t && staging) {
+      const D3D11_BOX box = {0, 0, 0, 6, 1, 1};
+      ID3D11DeviceContext1_CopySubresourceRegion1(context1, (ID3D11Resource *)t, 0, 2, 0, 0, (ID3D11Resource *)t, 0, &box, 0);
+      ID3D11DeviceContext_CopyResource(g_context, (ID3D11Resource *)staging, (ID3D11Resource *)t);
+      D3D11_MAPPED_SUBRESOURCE mapped;
+      if (SUCCEEDED(ID3D11DeviceContext_Map(g_context, (ID3D11Resource *)staging, 0, D3D11_MAP_READ, 0, &mapped)) && mapped.pData) {
+        memcpy(out, mapped.pData, sizeof out);
+        ID3D11DeviceContext_Unmap(g_context, (ID3D11Resource *)staging, 0);
+      }
+    }
+    int same = 1;
+    static const UINT want[8] = {0, 1, 0, 1, 2, 3, 4, 5};
+    for (UINT i = 0; i < 8; ++i) same = same && out[i] == (0xFF000000u | want[i]);
+    check(same, "CopySubresourceRegion1 within one subresource, the regions overlapping: what was there is copied (CopyWithOverlap)");
+    if (t) ID3D11Texture2D_Release(t);
+    if (staging) ID3D11Texture2D_Release(staging);
+  }
   ID3D11DeviceContext1_Release(context1);
   ID3D11Device1_Release(device1);
 }
@@ -5877,6 +6150,7 @@ int main(void) {
       test_min_lod();
       test_deferred();
       test_d3d11_1();
+      test_feature_level_11_1();
       test_texture1d();
       test_formats();
       test_vertex_formats();

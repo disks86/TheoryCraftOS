@@ -1835,7 +1835,8 @@ IImage* VirglDevice::create_image(const ImageDesc& desc) {
 void VirglDevice::destroy_image(IImage* image) { destroy(gpu_.allocator(), static_cast<VirglImage*>(image)); }
 
 IShaderModule* VirglDevice::create_shader_module(const ShaderModuleDesc& desc) {
-  if (!desc.tgsi) return nullptr;
+  // (no rasterizer ordered views: TGSI and the pipe state have no fragment interlock - kFeature3RasterizerOrderedViews is not offered)
+  if (!desc.tgsi || desc.rasterizer_ordered) return nullptr;
   VirglShaderModule* m = make<VirglShaderModule>(gpu_.allocator(), *this, desc);
   if (m && !m->valid()) {
     destroy(gpu_.allocator(), m);
@@ -1851,7 +1852,8 @@ void VirglDevice::destroy_shader_module(IShaderModule* module) {
 }
 
 IPipeline* VirglDevice::create_graphics_pipeline(const GraphicsPipelineDesc& desc) {
-  if (desc.texture_count > kMaxTextureUnits || desc.fragment_shader == nullptr) return nullptr;
+  // (no forced sample count: the pipe state rasterizes with the samples of the framebuffer - kFeature3ForcedSampleCount is not offered)
+  if (desc.texture_count > kMaxTextureUnits || desc.fragment_shader == nullptr || desc.forced_samples) return nullptr;
   if (!desc.vertex_shader || !desc.fragment_shader || desc.attribute_count > limits().vertex_attributes ||
       desc.varying_count > limits().varyings)
     return nullptr;

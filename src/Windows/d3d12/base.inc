@@ -362,6 +362,12 @@ struct Dev {
 #define DEV_FEATURE_RESOLVE_MODES (1u << 20)      /* graphics::kFeatureResolveModes: resolves of the least, greatest (and a depth image's mean) samples */
 #define DEV_FEATURE_VERTEX_FORMATS (1u << 29)     /* graphics::kFeatureVertexFormats: vertex elements other than 32-bit floats */
 /* graphics::DeviceFeature3 in KmtCaps.features3: DEV_FEATURE3_* (bit ranges as IGraphicsDevice.hpp DeviceFeature3 says) */
+#define DEV_FEATURE3_FORCED_SAMPLE_COUNT (1u << 8)       /* graphics::kFeature3ForcedSampleCount: ForcedSampleCount 1 .. 16 (the CreatePipeline part 'FSC1'), target-independent rasterization */
+#define DEV_FEATURE3_ROVS (1u << 9)                      /* graphics::kFeature3RasterizerOrderedViews: rasterizer ordered views in pixel shaders */
+#define DEV_FEATURE_VERTEX_STORES (1u << 25)             /* graphics::kFeatureVertexStores: vertex shaders write unordered access views */
+#define DEV_FEATURE_GEOMETRY_STORES (1u << 26)           /* graphics::kFeatureGeometryStores */
+#define DEV_FEATURE_TESSELLATION_STORES (1u << 27)       /* graphics::kFeatureTessellationStores: hull and domain shaders */
+#define DEV_FEATURE_FRAGMENT_STORES (1u << 24)           /* graphics::kFeatureFragmentStores */
 /* graphics::DeviceFeature2 in KmtCaps.features2 */
 #define DEV_FEATURE2_STORAGE_IMAGES (1u << 0)            /* unordered access views of textures (KA_STORAGE_IMAGE), in compute shaders */
 #define DEV_FEATURE2_STORAGE_IMAGES_IN_DRAWS (1u << 1)   /* ... and in pixel shaders */

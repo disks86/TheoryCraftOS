@@ -64,6 +64,7 @@ struct SigElement {
 struct Resource {
   uint32_t id = 0, space = 0, lower = 0, size = 0, kind = 0, bytes = 0, stride = 0;
   bool present = false;
+  bool rasterizer_ordered = false;   // (an unordered access view's isROV, operand 9 of its metadata: the dcl_uav_* token's rasterizer-ordered bit)
 };
 
 // Dxil opcodes (DxilConstants.h OpCode).
@@ -2969,6 +2970,10 @@ NtStatus Translator::read_metadata() {
         if (meta_int(operand_of(tags, k), &tag) && tag == 1 && meta_int(operand_of(tags, k + 1), &value)) r.stride = static_cast<uint32_t>(value);
       }
       r.present = true, r.id = static_cast<uint32_t>(id), r.lower = static_cast<uint32_t>(lower), r.size = static_cast<uint32_t>(size);
+      if (cls == 1) {
+        uint64_t rov = 0;
+        r.rasterizer_ordered = meta_int(operand_of(node, 9), &rov) && rov != 0;
+      }
       if (cls == 2) r.bytes = static_cast<uint32_t>(extra);
       else r.kind = static_cast<uint32_t>(extra);
     }
@@ -3243,13 +3248,15 @@ NtStatus Translator::run(uint32_t program_kind, ConstByteView isg1, ConstByteVie
       else return status::kNotSupported;
     }
   } else if (pixel || vertex || geometry || domain) {
-    // (a pixel, vertex, geometry or domain shader's unordered access views: buffers it writes)
+    // (a pixel, vertex, geometry or domain shader's unordered access views: buffers it writes; a pixel shader's may be rasterizer ordered)
     for (uint32_t i = 0; i < kMaxResources; ++i) {
       const Resource& r = res_[1][i];
       if (!r.present) continue;
       if (r.lower >= graphics::kMaxUavBuffers) return status::kNotSupported;
-      if (r.kind == 12) word(158u | (4u << 24)), word((30u << 12) | (1u << 20)), word(r.lower), word(r.stride);
-      else if (r.kind == 11) word(157u | (3u << 24)), word((30u << 12) | (1u << 20)), word(r.lower);
+      if (r.rasterizer_ordered && !pixel) return status::kInvalidParameter;
+      const uint32_t ordered = r.rasterizer_ordered ? 1u << 17 : 0u;
+      if (r.kind == 12) word(158u | ordered | (4u << 24)), word((30u << 12) | (1u << 20)), word(r.lower), word(r.stride);
+      else if (r.kind == 11) word(157u | ordered | (3u << 24)), word((30u << 12) | (1u << 20)), word(r.lower);
       else return status::kNotSupported;
     }
   } else {

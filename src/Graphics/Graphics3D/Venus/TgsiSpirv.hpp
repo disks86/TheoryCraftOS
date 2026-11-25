@@ -104,6 +104,9 @@ struct CompileOptions {
   bool ddy_up = false;
   // The device has shaderOutputLayer / shaderOutputViewportIndex (a layer or viewport from a vertex or domain shader).
   bool output_layer_any_stage = false;
+  // A fragment shader whose storage accesses are rasterizer ordered: its whole body runs in a pixel interlock (SPV_EXT_fragment_shader_interlock, PixelInterlockOrderedEXT),
+  // OpBeginInvocationInterlockEXT first in main and OpEndInvocationInterlockEXT before each of its returns.
+  bool pixel_interlock = false;
 };
 
 struct CompileResult {

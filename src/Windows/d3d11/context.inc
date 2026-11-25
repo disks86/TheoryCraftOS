@@ -82,6 +82,7 @@ static ID3D12PipelineState *pipeline_get(Dev *d, Ctx *c) {
   key.raster = c->raster ? c->raster->desc : g_default_raster;
   key.raster.ScissorEnable = 0;      /* (not the pipeline's: the scissor rectangle is set with the viewport) */
   key.conservative = c->raster ? (UINT)c->raster->desc2.ConservativeRaster : 0u;
+  key.forced = c->raster ? c->raster->desc2.ForcedSampleCount : 0u;
   key.targets = c->rtv_count;
   key.has_depth = c->dsv != NULL;
   key.samples = 1;
@@ -99,7 +100,8 @@ static ID3D12PipelineState *pipeline_get(Dev *d, Ctx *c) {
     Pipeline *p = &d->pipelines[i];
     if (p->vs == key.vs && p->ps == key.ps && p->gs == key.gs && p->hs == key.hs && p->ds == key.ds && p->layout == key.layout && p->targets == key.targets && p->has_depth == key.has_depth && p->samples == key.samples &&
         memcmp(p->formats, key.formats, sizeof key.formats) == 0 && p->depth_format == key.depth_format &&
-        memcmp(&p->blend, &key.blend, sizeof key.blend) == 0 && memcmp(&p->depth, &key.depth, sizeof key.depth) == 0 && memcmp(&p->raster, &key.raster, sizeof key.raster) == 0 && p->logic_op == key.logic_op && p->conservative == key.conservative) {
+        memcmp(&p->blend, &key.blend, sizeof key.blend) == 0 && memcmp(&p->depth, &key.depth, sizeof key.depth) == 0 && memcmp(&p->raster, &key.raster, sizeof key.raster) == 0 && p->logic_op == key.logic_op && p->conservative == key.conservative &&
+        p->forced == key.forced) {
       p->last_used = ++d->pipeline_clock;
       return p->state;
     }
@@ -160,6 +162,7 @@ static ID3D12PipelineState *pipeline_get(Dev *d, Ctx *c) {
   pd.RasterizerState.MultisampleEnable = key.raster.MultisampleEnable;
   pd.RasterizerState.AntialiasedLineEnable = key.raster.AntialiasedLineEnable;
   pd.RasterizerState.ConservativeRaster = key.conservative ? D3D12_CONSERVATIVE_RASTERIZATION_MODE_ON : D3D12_CONSERVATIVE_RASTERIZATION_MODE_OFF;
+  pd.RasterizerState.ForcedSampleCount = key.forced;      /* (Direct3D 12's pipeline checks it: above 1 no multisampled target, no depth or stencil test) */
   pd.DepthStencilState.DepthEnable = key.depth.DepthEnable;
   pd.DepthStencilState.DepthWriteMask = (D3D12_DEPTH_WRITE_MASK)key.depth.DepthWriteMask;
   pd.DepthStencilState.DepthFunc = (D3D12_COMPARISON_FUNC)key.depth.DepthFunc;
@@ -523,10 +526,18 @@ static BOOL srv_desc12(const View *v, D3D12_SHADER_RESOURCE_VIEW_DESC *r) {
   }
 }
 
+/* The root signature of a draw or dispatch: of the narrow or wide table of shader resources (TEXTURE_SLOTS or SRV_SLOTS), and of the narrow or wide one of unordered access views
+ * (UAV_TABLE_NARROW, or UAV_SLOTS where a shader declares one above u7). */
+static UINT uav_table_count(UINT64 uav_mask) { return (uav_mask >> UAV_TABLE_NARROW) ? UAV_SLOTS : UAV_TABLE_NARROW; }
+static ID3D12RootSignature *root_for(Dev *d, UINT view_count, UINT uav_count) {
+  if (uav_count == UAV_SLOTS) return d->root_uavs[view_count == SRV_SLOTS];
+  return view_count == SRV_SLOTS ? d->root_wide : d->root;
+}
 /* The tables of a draw or a dispatch: shader resources t0 .. t<view_count - 1> (TEXTURE_SLOTS, or SRV_SLOTS for the wide root signature; `kinds`: what the shaders declare
- * there, for what fills an empty slot), samplers s0 .. s7, and the unordered access views u0 .. u7 the shaders declare (`uav_mask`). The handles go into Dev.table_*. `cache`: a
- * table the same as the last one is used again. */
-static BOOL tables_record(Dev *d, View *const *srvs, Sampler *const *samplers, const BYTE *kinds, View *const *uavs, UINT uav_mask, BOOL cache, UINT view_count) {
+ * there, for what fills an empty slot), samplers s0 .. s7, and the unordered access views u0 .. u<uav_count - 1> (UAV_TABLE_NARROW or UAV_SLOTS: uav_table_count) of which the
+ * shaders declare `uav_mask`. The handles go into Dev.table_*. `cache`: a table the same as the last one is used again. */
+static BOOL tables_record(Dev *d, View *const *srvs, Sampler *const *samplers, const BYTE *kinds, View *const *uavs, UINT64 uav_mask, BOOL cache, UINT view_count) {
+  const UINT uav_count = uav_table_count(uav_mask);
   UINT view_ids[SRV_SLOTS], sampler_ids[TEXTURE_SLOTS], uav_ids[UAV_SLOTS];
   FLOAT min_lods[SRV_SLOTS];
   for (UINT i = 0; i < view_count; ++i) {
@@ -535,9 +546,9 @@ static BOOL tables_record(Dev *d, View *const *srvs, Sampler *const *samplers, c
   }
   for (UINT i = 0; i < TEXTURE_SLOTS; ++i) sampler_ids[i] = samplers[i] ? samplers[i]->s.c.id : 0;
   /* (an append or counter view whose count was set since: its counter is written now, in order with what the list did before; the table is made again) */
-  for (UINT i = 0; i < UAV_SLOTS; ++i)
+  for (UINT i = 0; i < uav_count; ++i)
     if ((uav_mask >> i & 1) && uavs[i] && uavs[i]->counter_buf && uavs[i]->counter_dirty) cache = FALSE;
-  for (UINT i = 0; i < UAV_SLOTS; ++i) uav_ids[i] = !(uav_mask >> i & 1) ? 0 : uavs[i] ? uavs[i]->c.id : d->blank_uav->c.id;
+  for (UINT i = 0; i < uav_count; ++i) uav_ids[i] = !(uav_mask >> i & 1) ? 0 : uavs[i] ? uavs[i]->c.id : d->blank_uav->c.id;
   const UINT step_views = ID3D12Device_GetDescriptorHandleIncrementSize(d->d12, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
   const UINT step_samplers = ID3D12Device_GetDescriptorHandleIncrementSize(d->d12, D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER);
   const D3D12_CPU_DESCRIPTOR_HANDLE view_start = ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(d->view_heap);
@@ -624,11 +635,11 @@ static BOOL tables_record(Dev *d, View *const *srvs, Sampler *const *samplers, c
     memcpy(d->table_min_lods, min_lods, view_count * sizeof min_lods[0]);
     d->table_view_count = view_count;
   }
-  if (!cache || !d->tables_valid || memcmp(uav_ids, d->table_uav_ids, sizeof uav_ids) != 0) {
+  if (!cache || !d->tables_valid || d->table_uav_count != uav_count || memcmp(uav_ids, d->table_uav_ids, uav_count * sizeof uav_ids[0]) != 0) {
     D3D12_CPU_DESCRIPTOR_HANDLE at = view_start;
     at.ptr += (SIZE_T)d->view_used * step_views;
     d->table_uavs = view_gpu.ptr + (UINT64)d->view_used * step_views;
-    for (UINT i = 0; i < UAV_SLOTS; ++i) {
+    for (UINT i = 0; i < uav_count; ++i) {
       View *v = !(uav_mask >> i & 1) ? NULL : uavs[i] ? uavs[i] : NULL;
       View blank = {.buf = d->blank_uav, .offset = 0, .size = d->blank_uav->desc.ByteWidth};
       if (v && v->buf) { if (!buffer_descriptor(d, v, TRUE, at)) return FALSE; }
@@ -637,8 +648,9 @@ static BOOL tables_record(Dev *d, View *const *srvs, Sampler *const *samplers, c
       else ID3D12Device_CreateUnorderedAccessView(d->d12, NULL, NULL, NULL, at);      /* (not declared) */
       at.ptr += step_views;
     }
-    d->view_used += UAV_SLOTS;
-    memcpy(d->table_uav_ids, uav_ids, sizeof uav_ids);
+    d->view_used += uav_count;
+    memcpy(d->table_uav_ids, uav_ids, uav_count * sizeof uav_ids[0]);
+    d->table_uav_count = uav_count;
   }
   if (!cache || !d->tables_valid || memcmp(sampler_ids, d->table_sampler_ids, sizeof sampler_ids) != 0) {
     static const D3D11_SAMPLER_DESC fallback = {D3D11_FILTER_MIN_MAG_MIP_LINEAR, D3D11_TEXTURE_ADDRESS_CLAMP, D3D11_TEXTURE_ADDRESS_CLAMP, D3D11_TEXTURE_ADDRESS_CLAMP, 0.0f, 1,
@@ -659,7 +671,7 @@ static BOOL tables_record(Dev *d, View *const *srvs, Sampler *const *samplers, c
   return TRUE;
 }
 /* What the tables name is used by the list: read (shader resources), and written (unordered access views, and the counters of append and counter views). */
-static void tables_mark_used(Dev *d, View *const *srvs, View *const *uavs, UINT uav_mask) {
+static void tables_mark_used(Dev *d, View *const *srvs, View *const *uavs, UINT64 uav_mask) {
   for (UINT i = 0; i < SRV_SLOTS; ++i) {
     if (!srvs[i]) continue;
     if (srvs[i]->tex) srvs[i]->tex->used = srvs[i]->tex->sampled = d->epoch;
@@ -682,7 +694,7 @@ static void tables_mark_used(Dev *d, View *const *srvs, View *const *uavs, UINT 
 }
 /* Before a draw or dispatch records anything: the textures its unordered access views write are brought up to date (what their render target views drew) and, if the list
  * samples them, the list is sent first (the kernel keeps a texture bound the way a list first uses it). */
-static void uav_textures_before(Dev *d, View *const *uavs, UINT uav_mask) {
+static void uav_textures_before(Dev *d, View *const *uavs, UINT64 uav_mask) {
   for (UINT i = 0; i < UAV_SLOTS; ++i) {
     if (!(uav_mask >> i & 1) || !uavs[i] || !uavs[i]->tex) continue;
     tex_sync(d, uavs[i]->tex);
@@ -792,7 +804,8 @@ static BOOL draw_prepare(Ctx *c, BOOL indexed) {
   const BOOL streams = c->gs && c->gs->so;
   /* (d3d12.dll gives a pass without a colour target one: of the depth buffer's size, of the viewport's when the draw writes unordered access views only, a tiny one for stream
    * output alone) */
-  const BOOL uav_only = c->rtv_count == 0 && !c->dsv && c->ps && c->ps->uav_mask;
+  const BOOL uav_only = c->rtv_count == 0 && !c->dsv && ((c->ps && c->ps->uav_mask) || (c->vs && c->vs->uav_mask) || (c->gs && c->gs->uav_mask) || (c->hs && c->hs->uav_mask) ||
+                                                        (c->ds && c->ds->uav_mask));      /* (UAV-only rendering: the shaders of any stage write unordered access views) */
   if (!c->vs || (c->rtv_count == 0 && !c->dsv && !streams && !uav_only) || (indexed && !c->ib)) return FALSE;
   if (!c->hs != !c->ds) return FALSE;      /* (tessellation needs both) */
 
@@ -820,7 +833,7 @@ static BOOL draw_prepare(Ctx *c, BOOL indexed) {
   /* (... nor be sampled after the list has drawn into it, cleared it or copied into it: the draw would see the texture as it was before the list) */
   for (UINT i = 0; i < view_count; ++i) if (slot_view(c, i) && slot_view(c, i)->tex) tex_before_read(d, slot_view(c, i)->tex);
   {
-    UINT uav_mask = 0;
+    UINT64 uav_mask = 0;
     const Shader *writers[5] = {c->vs, c->ps, c->gs, c->hs, c->ds};
     for (UINT k = 0; k < 5; ++k) if (writers[k]) uav_mask |= writers[k]->uav_mask;
     uav_textures_before(d, c->ps_uav, uav_mask);
@@ -830,7 +843,12 @@ static BOOL draw_prepare(Ctx *c, BOOL indexed) {
   if (!pipeline) return FALSE;
 
   ID3D12GraphicsCommandList *list = d->list;
-  ID3D12RootSignature *root = view_count == SRV_SLOTS ? d->root_wide : d->root;
+  UINT64 stage_uavs = 0;
+  {
+    const Shader *writers[5] = {c->vs, c->ps, c->gs, c->hs, c->ds};
+    for (UINT k = 0; k < 5; ++k) if (writers[k]) stage_uavs |= writers[k]->uav_mask;
+  }
+  ID3D12RootSignature *root = root_for(d, view_count, uav_table_count(stage_uavs));
   if (d->bound_root != root) d->dirty |= DIRTY_ROOT;
   if (d->dirty & DIRTY_ROOT) {
     ID3D12DescriptorHeap *heaps[2] = {d->view_heap, d->sampler_heap};
@@ -909,7 +927,7 @@ static BOOL draw_prepare(Ctx *c, BOOL indexed) {
   }
   for (UINT i = view_count; i < SRV_SLOTS; ++i) srvs[i] = NULL;
   for (UINT i = 0; i < TEXTURE_SLOTS; ++i) samplers_of[i] = slot_sampler(c, i);
-  UINT uav_mask = 0;
+  UINT64 uav_mask = 0;
   const Shader *graphics_stages[5] = {c->vs, c->ps, c->gs, c->hs, c->ds};
   for (UINT k = 0; k < 5; ++k) if (graphics_stages[k]) uav_mask |= graphics_stages[k]->uav_mask;
   if (!tables_record(d, srvs, samplers_of, kinds, c->ps_uav, uav_mask, TRUE, view_count)) return FALSE;
@@ -1157,6 +1175,15 @@ static void STDMETHODCALLTYPE ctx_OMGetRenderTargets(Ctx *c, UINT count, ID3D11R
   get_range((void **)c->rtv, 8, 0, count, (void **)views);
   get_shader(c->dsv, (void **)depth, NULL, NULL);
 }
+/* A deferred context's hidden counts of the append and counter views being bound: records of eight views each, the counts set when the list runs (deferred.inc REC_UAV_COUNTS). */
+static void uav_counts_record(Ctx *c, ID3D11UnorderedAccessView *const *views, const UINT *counts, UINT count) {
+  for (UINT first = 0; first < count; first += 8) {
+    const UINT n = count - first < 8 ? count - first : 8;
+    RecArgs a = {.op = REC_UAV_COUNTS, .u = {n}, .data = counts + first, .bytes = 4 * n};
+    for (UINT i = 0; i < n; ++i) a.obj[i] = views[first + i];
+    deferred_record(c, &a);
+  }
+}
 /* Render targets and the pixel shader's unordered access views, which share the slots: u<n> for n from `uav_start` (at or after the last target) on, the other
  * unordered access slots left empty. D3D11_KEEP_RENDER_TARGETS_AND_DEPTH_STENCIL and D3D11_KEEP_UNORDERED_ACCESS_VIEWS keep what is bound. */
 static void STDMETHODCALLTYPE ctx_OMSetRenderTargetsAndUnorderedAccessViews(Ctx *c, UINT rtv_count, ID3D11RenderTargetView *const *rtvs, ID3D11DepthStencilView *depth,
@@ -1166,13 +1193,11 @@ static void STDMETHODCALLTYPE ctx_OMSetRenderTargetsAndUnorderedAccessViews(Ctx 
     ctx_OMSetRenderTargets(c, rtv_count, rtvs, depth);
   }
   if (uav_count == D3D11_KEEP_UNORDERED_ACCESS_VIEWS) return;
-  if (uav_start > UAV_SLOTS || uav_count > UAV_SLOTS - uav_start || (rtv_count != D3D11_KEEP_RENDER_TARGETS_AND_DEPTH_STENCIL && uav_count && uav_start < rtv_count)) return;
-  if (c->deferred && counts && uavs) {
-    RecArgs a = {.op = REC_UAV_COUNTS, .u = {uav_count}, .data = counts, .bytes = 4 * uav_count};
-    for (UINT i = 0; i < uav_count; ++i) a.obj[i] = uavs[i];
-    deferred_record(c, &a);
-    counts = NULL;
-  }
+  /* (the slots of the device's feature level: u0 .. u63 from 11_1, u0 .. u7 below - dev_uav_slots) */
+  const UINT slots = dev_uav_slots(c->dev);
+  if (uav_start > slots || uav_count > slots - uav_start || (rtv_count != D3D11_KEEP_RENDER_TARGETS_AND_DEPTH_STENCIL && uav_count && uav_start < rtv_count)) return;
+  if (c->deferred && counts && uavs) uav_counts_record(c, uavs, counts, uav_count);
+  if (c->deferred) counts = NULL;
   for (UINT slot = 0; slot < UAV_SLOTS; ++slot) {
     View *v = slot >= uav_start && slot < uav_start + uav_count && uavs ? (View *)uavs[slot - uav_start] : NULL;
     if (v) {
@@ -1363,13 +1388,10 @@ static void STDMETHODCALLTYPE ctx_CSSetSamplers(Ctx *c, UINT start, UINT count, 
 static void STDMETHODCALLTYPE ctx_CSGetSamplers(Ctx *c, UINT start, UINT count, ID3D11SamplerState **samplers) { get_range((void **)c->cs_sampler, TEXTURE_SLOTS, start, count, (void **)samplers); }
 /* Unordered access views of the compute shader; `counts`: the hidden count of each append or counter view (-1: kept as it is). */
 static void STDMETHODCALLTYPE ctx_CSSetUnorderedAccessViews(Ctx *c, UINT start, UINT count, ID3D11UnorderedAccessView *const *views, const UINT *counts) {
-  if (c->deferred && counts && views) {
-    /* (the counts are set when the list runs) */
-    RecArgs a = {.op = REC_UAV_COUNTS, .u = {count < 8 ? count : 8}, .data = counts, .bytes = 4 * (count < 8 ? count : 8)};
-    for (UINT i = 0; i < count && i < 8; ++i) a.obj[i] = views[i];
-    deferred_record(c, &a);
-    counts = NULL;
-  }
+  const UINT slots = dev_uav_slots(c->dev);
+  if (start > slots || count > slots - start) return;      /* (past the device's slots: the runtime drops the call) */
+  if (c->deferred && counts && views) uav_counts_record(c, views, counts, count);      /* (the counts are set when the list runs) */
+  if (c->deferred) counts = NULL;
   for (UINT i = 0; i < count && start + i < UAV_SLOTS; ++i) {
     View *v = views ? (View *)views[i] : NULL;
     if (v) {
@@ -1401,7 +1423,7 @@ static BOOL compute_prepare(Ctx *c) {
   if (!*pipeline) {
     D3D12_COMPUTE_PIPELINE_STATE_DESC pd;
     memset(&pd, 0, sizeof pd);
-    pd.pRootSignature = cs->wide ? d->root_wide : d->root;
+    pd.pRootSignature = root_for(d, view_count, uav_table_count(cs->uav_mask));
     pd.CS.pShaderBytecode = cs_code;
     pd.CS.BytecodeLength = cs_bytes;
     if (FAILED(ID3D12Device_CreateComputePipelineState(d->d12, &pd, &IID_ID3D12PipelineState, (void **)pipeline)) || !*pipeline) {
@@ -1413,7 +1435,7 @@ static BOOL compute_prepare(Ctx *c) {
   }
   ID3D12GraphicsCommandList *list = d->list;
   ID3D12DescriptorHeap *heaps[2] = {d->view_heap, d->sampler_heap};
-  ID3D12GraphicsCommandList_SetComputeRootSignature(list, cs->wide ? d->root_wide : d->root);
+  ID3D12GraphicsCommandList_SetComputeRootSignature(list, root_for(d, view_count, uav_table_count(cs->uav_mask)));
   ID3D12GraphicsCommandList_SetDescriptorHeaps(list, 2, heaps);
   ID3D12GraphicsCommandList_SetPipelineState(list, *pipeline);
   const Shader *const stages[1] = {cs};
@@ -1635,7 +1657,9 @@ static void STDMETHODCALLTYPE ctx_UpdateSubresource(Ctx *c, ID3D11Resource *reso
   LOCK(c);
   if (b && sub == 0) {
     const UINT left = box ? box->left : 0, right = box ? box->right : b->desc.ByteWidth;
-    if (left < right && right <= b->desc.ByteWidth && !(b->desc.BindFlags & D3D11_BIND_CONSTANT_BUFFER && box)) {      /* (a constant buffer is written whole) */
+    /* (a part of a constant buffer - ConstantBufferPartialUpdate - begins and ends on a 16-byte constant, else the runtime drops the call) */
+    const BOOL constant_part_ok = !(b->desc.BindFlags & D3D11_BIND_CONSTANT_BUFFER) || !box || (left % 16 == 0 && (right % 16 == 0 || right == b->desc.ByteWidth));
+    if (left < right && right <= b->desc.ByteWidth && constant_part_ok) {
       if (b->gpu) buf_gpu_write(c->dev, b, left, data, right - left);
       else {
         if (b->used == c->dev->epoch && !buf_rename(c->dev, b, left != 0 || right != b->desc.ByteWidth)) settle(c->dev, b->used);
@@ -1661,17 +1685,20 @@ static void STDMETHODCALLTYPE ctx_UpdateSubresource(Ctx *c, ID3D11Resource *reso
 static void tex_copy_slow(Dev *d, Tex *to, UINT to_sub, UINT x, UINT y, Tex *from, UINT from_sub, const D3D11_BOX *box) {
   /* (a volume: each slice of the box - all of the level's without one - into the slice of the other volume at the same place; a volume and another kind are not copied, nor
    * compressed textures) */
-  if (to->bpp != from->bpp || (to->kind == 1) != (from->kind == 1) || to->block || from->block) return;      /* (a depth texture's texels are the program's: tex_depth_rows) */
+  /* (block-compressed ones a block at a time - of the same block size, the box on whole blocks but at the level's edges, the place on a block -; a whole slice is read before
+   * any of it is written, so a copy within one subresource whose regions overlap - D3D11_FEATURE_DATA_D3D11_OPTIONS's CopyWithOverlap - copies what was there) */
+  if (to->bpp != from->bpp || (to->kind == 1) != (from->kind == 1) || to->block != from->block) return;      /* (a depth texture's texels are the program's: tex_depth_rows) */
   const UINT level = from_sub % from->desc.MipLevels, w = mip_size(from->desc.Width, level), h = mip_size(from->desc.Height, level);
   const UINT to_level = to_sub % to->desc.MipLevels, to_w = mip_size(to->desc.Width, to_level), to_h = mip_size(to->desc.Height, to_level);
   const UINT x0 = box ? box->left : 0, y0 = box ? box->top : 0, x1 = box ? box->right : w, y1 = box ? box->bottom : h;
   const UINT depth = tex_slices(from, from_sub), to_depth = tex_slices(to, to_sub), z0 = box ? box->front : 0, z1 = box ? box->back : depth;
   if (x0 >= x1 || y0 >= y1 || x1 > w || y1 > h || x > to_w || y > to_h || x1 - x0 > to_w - x || y1 - y0 > to_h - y) return;
   if (z0 >= z1 || z1 > depth || z1 - z0 > to_depth) return;
-  BYTE *pixels = mem_alloc((SIZE_T)w * h * from->bpp);
+  if (from->block && (((x0 | y0 | x | y) & 3) || ((x1 & 3) && x1 != w) || ((y1 & 3) && y1 != h))) return;
+  const SIZE_T pitch = tex_pitch(from, w), offset = from->block ? (SIZE_T)(y0 / 4) * pitch + (SIZE_T)(x0 / 4) * from->block : (SIZE_T)y0 * pitch + (SIZE_T)x0 * from->bpp;
+  BYTE *pixels = mem_alloc(pitch * tex_rows(from, h));
   for (UINT z = z0; pixels && z < z1; ++z)
-    if (SUCCEEDED(tex_read(d, from, from_sub, z, pixels)))
-      tex_write(d, to, to_sub, x, y, z - z0, x1 - x0, y1 - y0, pixels + ((SIZE_T)y0 * w + x0) * from->bpp, w * from->bpp);
+    if (SUCCEEDED(tex_read(d, from, from_sub, z, pixels))) tex_write(d, to, to_sub, x, y, z - z0, x1 - x0, y1 - y0, pixels + offset, (UINT)pitch);
   mem_free(pixels);
 }
 static BOOL tex_simple(const Tex *t) { return t->desc.MipLevels == 1 && t->desc.ArraySize == 1 && t->kind == 0 && !t->depth; }

@@ -1728,7 +1728,7 @@ NtStatus Kernel::escape(ProcessId pid, Handle device, ConstByteView request, Byt
                           for (graphics::BlendState& t : desc.target_blend) t.constant[c] = constant[c];
                         }
                         // (and, after that, tagged parts in any order, each at most once: a tag, the count of the words that follow, the words)
-                        bool seen_raster = false, seen_step_rates = false, seen_lines = false;
+                        bool seen_raster = false, seen_step_rates = false, seen_lines = false, seen_forced = false;
                         while (!in.at_end()) {
                           const uint32_t tag = in.le32(), words = in.le32();
                           if (!in.ok()) return status::kInvalidParameter;
@@ -1738,6 +1738,14 @@ NtStatus Kernel::escape(ProcessId pid, Handle device, ConstByteView request, Byt
                             if (seen_lines || words != kPipelineLineWords || !in.ok() || mode > static_cast<uint32_t>(graphics::LineMode::QuadrilateralNarrow)) return status::kInvalidParameter;
                             seen_lines = true;
                             desc.line_mode = static_cast<graphics::LineMode>(mode);
+                            continue;
+                          }
+                          if (tag == kPipelineForcedSamplesTag) {
+                            // kPipelineForcedSamplesTag: the forced sample count (0 not forced, else 1, 2, 4, 8 or 16)
+                            const uint32_t count = in.le32();
+                            if (seen_forced || words != kPipelineForcedSamplesWords || !in.ok() || count > 16 || (count & (count - 1)) != 0) return status::kInvalidParameter;
+                            seen_forced = true;
+                            desc.forced_samples = count;
                             continue;
                           }
                           if (tag == kPipelineStepRateTag) {

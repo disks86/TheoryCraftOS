@@ -50,7 +50,7 @@ enum Op : uint16_t {
   OpEmitStreamVertex = 220, OpEndStreamPrimitive = 221, OpControlBarrier = 224, OpMemoryBarrier = 225, OpAtomicExchange = 229, OpAtomicCompareExchange = 230,
   OpAtomicIAdd = 234, OpAtomicSMin = 236, OpAtomicUMin = 237, OpAtomicSMax = 238, OpAtomicUMax = 239, OpAtomicAnd = 240, OpAtomicOr = 241, OpAtomicXor = 242,
   OpLoopMerge = 246, OpSelectionMerge = 247, OpLabel = 248, OpBranch = 249, OpBranchConditional = 250, OpReturn = 253, OpUnreachable = 255,
-  OpDemoteToHelperInvocation = 5380,
+  OpBeginInvocationInterlockEXT = 5364, OpEndInvocationInterlockEXT = 5365, OpDemoteToHelperInvocation = 5380,
 };
 
 enum Capability : uint32_t {
@@ -58,7 +58,7 @@ enum Capability : uint32_t {
   CapStorageImageMultisample = 27, CapClipDistance = 32, CapImageCubeArray = 34, CapSampleRateShading = 35, CapSampled1D = 43, CapImage1D = 44,
   CapSampledCubeArray = 45, CapSampledBuffer = 46, CapImageBuffer = 47, CapStorageImageExtendedFormats = 49, CapImageQuery = 50, CapDerivativeControl = 51,
   CapTransformFeedback = 53, CapGeometryStreams = 54, CapStorageImageReadWithoutFormat = 55, CapStorageImageWriteWithoutFormat = 56, CapMultiViewport = 57,
-  CapShaderLayer = 69, CapShaderViewportIndex = 70, CapDrawParameters = 4427, CapDemoteToHelperInvocation = 5379,
+  CapShaderLayer = 69, CapShaderViewportIndex = 70, CapDrawParameters = 4427, CapFragmentShaderPixelInterlockEXT = 5378, CapDemoteToHelperInvocation = 5379,
 };
 
 enum StorageClass : uint32_t {
@@ -84,7 +84,7 @@ enum ExecutionMode : uint32_t {
   ModeInvocations = 0, ModeSpacingEqual = 1, ModeSpacingFractionalEven = 2, ModeSpacingFractionalOdd = 3, ModeVertexOrderCw = 4, ModeVertexOrderCcw = 5,
   ModeOriginUpperLeft = 7, ModeEarlyFragmentTests = 9, ModePointMode = 10, ModeXfb = 11, ModeDepthReplacing = 12, ModeLocalSize = 17, ModeInputPoints = 19,
   ModeInputLines = 20, ModeInputLinesAdjacency = 21, ModeTriangles = 22, ModeInputTrianglesAdjacency = 23, ModeQuads = 24, ModeIsolines = 25,
-  ModeOutputVertices = 26, ModeOutputPoints = 27, ModeOutputLineStrip = 28, ModeOutputTriangleStrip = 29,
+  ModeOutputVertices = 26, ModeOutputPoints = 27, ModeOutputLineStrip = 28, ModeOutputTriangleStrip = 29, ModePixelInterlockOrderedEXT = 5366,
 };
 
 enum Dim : uint32_t { Dim1D = 0, Dim2D = 1, Dim3D = 2, DimCube = 3, DimBuffer = 5 };

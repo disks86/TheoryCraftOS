@@ -52,6 +52,7 @@ struct VenusCaps {
   bool depth_bounds = false;             // depthBounds (Direct3D 12's depth bounds test)
   bool sampler_minmax = false;           // samplerFilterMinmax (Direct3D's MINIMUM_* / MAXIMUM_* filters)
   bool smooth_lines = false, rectangular_lines = false;   // VK_EXT_line_rasterization's smooth and rectangular lines (Direct3D's line modes)
+  bool pixel_interlock = false;          // VK_EXT_fragment_shader_interlock's fragmentShaderPixelInterlock (Direct3D's rasterizer ordered views)
   float max_line_width = 1;              // (with wideLines; Direct3D's wide quadrilateral lines are 1.4 pixels)
   bool shader_float64 = false;
   bool geometry_shader = false, tessellation_shader = false, dual_src_blend = false, logic_op = false, sampler_anisotropy = false;

@@ -3096,6 +3096,7 @@ NtStatus Adapter::create_shader(const ShaderDesc& desc, SharedPointer<ShaderObje
         md.tgsi = text_pointer(shader->text_);
       }
       md.stage = stage;
+      md.rasterizer_ordered = (program->required_features3() & graphics::kFeature3RasterizerOrderedViews) != 0;   // (its UAVs are rasterizer ordered: the device orders them)
       // The devices without a shader compiler: SVGA3D takes the (rewritten) Direct3D 9 tokens, Intel Gen9 runs a vertex function and one of two fixed pixel kernels.
       if (stage != graphics::ShaderStage::Compute && stage != graphics::ShaderStage::Geometry && stage != graphics::ShaderStage::Hull && stage != graphics::ShaderStage::Domain) {
         List<uint32_t> svga(allocator_);
@@ -3272,6 +3273,10 @@ NtStatus Adapter::create_pipeline(const PipelineDesc& d, const SharedPointer<Sha
   if (d.alpha_to_coverage && !d.multisample) return status::kInvalidParameter;
   if (d.conservative && !(caps_.features2 & graphics::kFeature2ConservativeRaster)) return status::kNotSupported;
   if (d.line_mode != graphics::LineMode::Aliased && !(caps_.features2 & graphics::kFeature2LineModes)) return status::kNotSupported;
+  // (a forced sample count: 1, 2, 4, 8 or 16 on a device that has them; above 1 without depth, stencil, per-sample coverage or alpha to coverage - Direct3D's target-independent rasterization)
+  if (d.forced_samples > 16 || (d.forced_samples & (d.forced_samples - 1)) != 0) return status::kInvalidParameter;
+  if (d.forced_samples && !(caps_.features3 & graphics::kFeature3ForcedSampleCount)) return status::kNotSupported;
+  if (d.forced_samples > 1 && (d.depth_test || d.depth_write || st.enable || d.multisample || d.alpha_to_coverage)) return status::kInvalidParameter;
   if (hull || domain) {
     if (!hull || !domain || hull->stage() != graphics::ShaderStage::Hull || domain->stage() != graphics::ShaderStage::Domain || hull->tess_output_points() != domain->tess_input_points() || hull->tess_domain() != domain->tess_domain()) return status::kInvalidParameter;
     if (!(caps_.features & graphics::kFeatureTessellation)) return status::kNotSupported;
@@ -3327,6 +3332,7 @@ NtStatus Adapter::create_pipeline(const PipelineDesc& d, const SharedPointer<Sha
   pd.independent_blend = d.independent_blend;
   pd.multisample = d.multisample;
   pd.conservative = d.conservative;
+  pd.forced_samples = d.forced_samples;
   pd.alpha_to_coverage = d.alpha_to_coverage;
   pd.stream_output_count = d.stream_output_count;
   for (uint32_t e = 0; e < d.stream_output_count; ++e) pd.stream_output[e] = d.stream_output[e];

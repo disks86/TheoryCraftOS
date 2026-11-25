@@ -226,6 +226,7 @@ class Compiler {
   bool ok_ = true;
   uint32_t line_ = 0;
   bool terminated_ = false;
+  bool interlock_ = false;   // (the body is in a pixel interlock: CompileOptions::pixel_interlock)
 
   // types
   uint32_t f_ = 0, u_ = 0, i_ = 0, bool_ = 0, d_ = 0, f2_ = 0, f3_ = 0, f4_ = 0, u2_ = 0, u3_ = 0, u4_ = 0, i2_ = 0, i3_ = 0, i4_ = 0, b4_ = 0, glsl_ = 0;
@@ -2031,6 +2032,7 @@ bool Compiler::control(const Instruction& ins) {
       if (ins.op == Op::End && constructs_.count()) return fail("END inside an IF or a loop");
       resume();
       finish_outputs();
+      if (interlock_) emit_void(OpEndInvocationInterlockEXT, {});   // (the pixel interlock ends with the invocation: CompileOptions::pixel_interlock)
       emit_void(OpReturn, {});
       terminated_ = true;
       return ok_;
@@ -2166,6 +2168,12 @@ bool Compiler::run() {
   const uint32_t main = b_.id();
   b_.op(Builder::kFunctionVariables, OpFunction, {b_.t_void(), main, 0, b_.t_function_void()});
   b_.op(Builder::kFunctionVariables, OpLabel, {b_.id()});
+  // (rasterizer ordered views: the whole body in the pixel interlock, which keeps the fragments of a pixel in primitive order)
+  interlock_ = o_.pixel_interlock;
+  if (interlock_) {
+    if (p_.stage != Stage::Fragment) return fail("a pixel interlock outside the fragment stage");
+    emit_void(OpBeginInvocationInterlockEXT, {});
+  }
   for (const Instruction& ins : p_.instructions) {
     if (!instruction(ins)) return false;
     if (!ok_) return false;
@@ -2199,6 +2207,11 @@ bool Compiler::run() {
       b_.op(Builder::kModes, OpExecutionMode, {main, ModeOriginUpperLeft});
       if (writes_depth_) b_.op(Builder::kModes, OpExecutionMode, {main, ModeDepthReplacing});
       if (p_.has(Property::FsEarlyDepthStencil) && p_.get(Property::FsEarlyDepthStencil)) b_.op(Builder::kModes, OpExecutionMode, {main, ModeEarlyFragmentTests});
+      if (interlock_) {
+        b_.op(Builder::kModes, OpExecutionMode, {main, ModePixelInterlockOrderedEXT});
+        b_.capability(CapFragmentShaderPixelInterlockEXT);
+        b_.extension("SPV_EXT_fragment_shader_interlock");
+      }
       break;
     case Stage::Geometry: {
       const uint32_t in = p_.get(Property::GsInputPrimitive);
