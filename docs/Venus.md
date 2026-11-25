@@ -117,11 +117,21 @@ compositor, the windows of Wayland and X11 clients, and the Vulkan driver's Dire
   for the least or greatest sample.
 * **present()** copies the image into the virtio-gpu's 2D screen (`blit` + `present` of the display driver), one copy through guest memory per frame.
 * **Which device** (`RenderNode::build_venus`): with `TCOS_GPU_BACKEND=AUTO` (the default) the Venus device is used when it opens, draws the self-test picture and offers
-  every feature and limit that a virgl device on the same host would (a virgl device is made for the comparison and given back); the boot log says which and why.
+  every feature and limit that a virgl device on the same host would (a virgl device is made for the comparison and given back) and the host has every extension the
+  device needs to do those features as virgl does (`VenusDevice::parity_gaps`: robustness2 null descriptors, the last-vertex provoking mode, depth bias control's float
+  representation, sample locations for every offered sample count, custom border colours, vertex attribute divisors including zero, depth clamp); the boot log says
+  which and why ("chosen (it does everything virgl does here)", or "virgl kept (Venus lacks features ... / ..., extensions ...)").
   `TCOS_GPU_BACKEND=VENUS` takes Venus whenever it works, `VIRGL` never. The scripts take `GPU_BACKEND=` (`tests/venus_qemu.sh`) or `GPU=venus` (`tests/d3d12_qemu.sh`).
 
-What stays on virgl: a virtio-gpu without the Venus capset (QEMU without `venus=on`, or a virglrenderer built without Venus) keeps `VirglDevice` for every path; with
-Venus nothing uses virgl any more (user-mode Vulkan programs use Venus directly through the driver's Venus backend, as before).
+What stays on virgl, and why:
+
+* **Everything, on a virtio-gpu without the Venus capset** (QEMU without `venus=on`, or a virglrenderer built without Venus): `VirglDevice` is the only 3D device there.
+* **Everything, when AUTO finds Venus short of virgl** on that host (a missing feature, limit or one of the extensions above; the boot log names it), or with
+  `TCOS_GPU_BACKEND=VIRGL`.
+* With Venus chosen, no path draws through virgl: Direct3D 9 - 12, OpenGL, WebGL / WebGPU, the desktop and compositor, Wayland and X11 windows and the Vulkan driver's
+  Direct3D backend all use `VenusDevice`, and user-mode Vulkan programs use Venus directly through the driver's Venus backend, as before. Two things remain of the virgl
+  side: the AUTO comparison makes a `VirglDevice` for a moment (no context, nothing drawn) to read its `info()`, and the screen is still the virtio-gpu's 2D scanout
+  resource that `present()` copies into (2D virtio-gpu commands, not virgl).
 
 Testing:
 * `tests/run_host_tests.sh TgsiSpirvTest`: every TGSI text of the built-in shaders, the GL conformance scenes and the Direct3D conformance scenes is read and compiled, and
@@ -129,6 +139,11 @@ Testing:
 * `tests/run_host_tests.sh VenusHostTest`: the Venus device on the **build host's** Vulkan (the table filled from the host's loader, `tests/VenusHostVulkan.inc` from
   `tests/gen_venus_host_vulkan.py`) runs the Direct3D and GL conformance scenes against the CPU renderer, in seconds and without QEMU (`VENUS_SCENE=`, `VENUS_DUMP=1`).
 * `tests/venus_qemu.sh` and `GPU=venus tests/d3d12_qemu.sh <program>` run in the guest, where the boot's conformance runs on the device as well.
+  (`GPU_BACKEND=AUTO` tests the choice; `GPU=virgl` the same programs on virgl.)
+* Results (QEMU 11.1, virglrenderer 1.3, host RADV on an RX 9070 XT): on the Venus device d3d12test 4816/0, d3d11test 465/465, d3d9test 166/166, d3dsharetest
+  across processes 594/0, opengltest 51/0, vulkantest 2520/0, venustest 133/0, the Linux vulkantest 143/0, and the desktop draws; on virgl with the same tree
+  d3d12test 4831/0, d3d11test 462/462, d3d9test 166/166, opengltest 51/0 (the counts differ where a test checks what only one device offers). The emulator with
+  `VENUS=1 tests/emulated_dx.sh` runs the Direct3D video, encode and sharing tests on the device: all pass.
 
 ## Regenerating
 
@@ -142,8 +157,9 @@ Testing:
   command buffers, waits, compute through a template, images, timestamps, private data, the proc-address rules); run it through a short symlink to the checkout.
 * `tests/run_host_tests.sh LinuxRenderNodeTest`: the render node and the session over a pretend device.
 * `VENUS=off` runs the same machine without Venus (the Direct3D backend), `LINUX=1` a Linux program (`tests/linux/<program>.c` over `libvulkan.a`).
-* Results (QEMU 11.1, virglrenderer 1.3, host RADV on an RX 9070 XT and a Ryzen 7800X3D's iGPU): `venustest` 133/0, `vulkantest` (Windows) 2520/0 on Venus and
-  2520/0 with Venus off, the Linux `vulkantest` 143/0 on Venus; `LinuxRenderNodeTest` 5813/0.
+* Results (QEMU 11.1, virglrenderer 1.3, host RADV on an RX 9070 XT and a Ryzen 7800X3D's iGPU): `venustest` 133/0, `vulkantest` (Windows) 2520/0 on Venus,
+  the Linux `vulkantest` 143/0 on Venus; `LinuxRenderNodeTest` 5813/0. With Venus off `vulkantest` is 2520/6 since the Direct3D gap-pass merges (the `cs_add`
+  dispatch's submit fails on the virgl and the software adapter alike; it was 2520/0 before them and is not a Venus matter).
 * The host's log (virglrenderer's `vkr: ...` lines, which name a command the host could not decode) is QEMU's standard error: `$TMPDIR/tcos-venus-qemu/qemu-err.txt`.
 
 Host facts learned on the way: `vkGetDeviceQueue2` must carry `VkDeviceQueueTimelineInfoMESA` with a ring index of its own (1 .. 63) or the host stops the
@@ -167,3 +183,16 @@ allocations itself.
   for their reply (Mesa sends many of them without waiting); presentation copies each frame through guest memory instead of handing the host's image to the display.
 * The application's allocation callbacks are not used (as in the Direct3D backend).
 * The host's memory window limits host-visible memory that is mapped at once (QEMU's `hostmem`).
+
+Gaps of the kernel's Venus device:
+
+* Every submit waits for its fence, and every creation call (images, pipelines, descriptor sets) is a round trip to the host: correct and simple, not fast. A pipeline's
+  first draw with a new binding shape compiles a variant on the host.
+* present() copies the frame through guest memory into the virtio-gpu's 2D screen; the host's image is not scanned out directly (a blob scanout would need the host
+  image exported as a dma-buf).
+* Images are always in the GENERAL layout (no compression a driver keeps for attachment layouts); barriers are full memory barriers at every pass, dispatch and storing
+  draw, not the narrow ones Vulkan allows.
+* As on virgl: depth resolves to the least or greatest sample are not offered (`kFeatureResolveModes`).
+* What the host's Vulkan lacks is not offered (each feature follows `VenusCaps`); a host without `VK_EXT_sample_locations` refuses pipelines that turn multisampling off on
+  a multisampled target, one without `VK_EXT_depth_bias_control`'s float representation the depth bias of normalised depth formats, one without
+  `VK_EXT_provoking_vertex` the GL translator's flat varyings. AUTO keeps virgl on such a host (`parity_gaps`); `TCOS_GPU_BACKEND=VENUS` takes Venus anyway.

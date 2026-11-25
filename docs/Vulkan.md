@@ -103,6 +103,9 @@ What differs between GPUs is what the adapter reports, and the driver exposes ex
 * A pipeline the adapter cannot run is refused when it is created (`VK_ERROR_FEATURE_NOT_PRESENT`, with the reason written to the debugger when `VULKAN_1_DEBUG` is set), never
   when it is drawn with.
 
+On QEMU's virtio-gpu with Venus a program normally uses the driver's Venus backend (the host's Vulkan, docs/Venus.md); the Direct3D backend below then runs on the
+kernel's Venus device (`TCOS_VULKAN_BACKEND=dxg`), and on virgl when the device has no Venus.
+
 ## How a program's calls become work
 
 * **Shaders**: SPIR-V is translated to Shader Model 4.0 DXBC (`spirv.inc`: structured control flow, phi nodes, inlined functions, std140 uniform blocks, sampled images, derivatives,

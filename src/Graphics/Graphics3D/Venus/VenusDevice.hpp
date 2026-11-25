@@ -95,6 +95,19 @@ class VenusDevice final : public IGraphicsDevice {
   bool submit(ICommandBuffer* commands) override;
   bool present(IImage* image) override;
 
+  // What this host's Vulkan device lacks for the device to behave as virgl does, beyond what info() shows (features it reports but would refuse, or approximate,
+  // in some of their uses): bits of ParityGap, 0 when nothing. RenderNode's AUTO choice keeps virgl while any is set.
+  enum ParityGap : uint32_t {
+    kGapNullDescriptor = 1u << 0,     // robustness2 nullDescriptor: unbound units, buffers and images read zero
+    kGapProvokingLast = 1u << 1,      // VK_EXT_provoking_vertex last-vertex mode: GL's flat varyings
+    kGapDepthBiasFloat = 1u << 2,     // VK_EXT_depth_bias_control's float representation: Direct3D's bias of normalised depth formats
+    kGapSampleLocations = 1u << 3,    // VK_EXT_sample_locations for every offered sample count: rasterization without multisampling on multisampled targets
+    kGapCustomBorder = 1u << 4,       // VK_EXT_custom_border_color: border colours other than the three built-in ones
+    kGapDivisor = 1u << 5,            // VK_EXT_vertex_attribute_divisor with zero divisors: instance step rates
+    kGapDepthClamp = 1u << 6,         // depthClamp: pipelines without depth clipping
+  };
+  uint32_t parity_gaps() const;
+
   // ---- for the device's objects ----
   VenusContext& context() { return ctx_; }
   const TcosKernelVulkan& vk() const { return ctx_.vk(); }
@@ -110,8 +123,10 @@ class VenusDevice final : public IGraphicsDevice {
     record(once_);
     return end_once();
   }
-  // The staging buffer, at least `size` bytes (it grows; the old one goes). nullptr when memory ran out.
+  // The staging buffer, at least `size` bytes (it grows; the old one goes). nullptr when memory ran out. Only with staging_lock() held, from filling it to reading
+  // it back: images are written and read, and frames presented, from several threads, and each of them stages through this one buffer.
   VenusMemory* staging(uint64_t size);
+  kernel::Mutex& staging_lock() { return staging_lock_; }   // (taken before the queue's lock, never while holding it)
   // The format the host keeps an image of `format` in (VK_FORMAT_UNDEFINED: the device does not take it), and whether the CPU swaps R and B for it.
   VkFormat vk_format(Format format, bool storage, bool* swap_rb) const;
   bool format_supports(VkFormat f, VkFormatFeatureFlags features) const;
@@ -185,6 +200,7 @@ class VenusDevice final : public IGraphicsDevice {
   uint32_t uniform_alignment_ = 256;
   uint32_t max_image_dimension_ = 4096;
   uint32_t sample_counts_ = 0;
+  kernel::Mutex staging_lock_;        // staging_ and what is in it
   kernel::Mutex queue_lock_;          // the queue and the two command buffers (images are written from several threads)
   bool clock_interrupted_ = false;
   bool initialized_ = false;

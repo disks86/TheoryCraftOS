@@ -25,6 +25,7 @@
 #define INITGUID
 #include <windows.h>
 #include <stdio.h>
+#include <wchar.h>
 #include <string.h>
 #include <math.h>
 #include <d3d11.h>
@@ -4604,7 +4605,7 @@ static UINT32 sample_quad(ID3D11ShaderResourceView *view, const D3D11_SAMPLER_DE
 static int grey_near(UINT32 p, int value) { return red(p) >= value - 2 && red(p) <= value + 2 && green(p) == red(p) && blue(p) == red(p); }
 
 /* Several viewports (RSSetViewports of two, RSGetViewports): a geometry shader sends triangle n to viewport n; and what OPTIONS3 says of the layer and viewport from a vertex shader. */
-static void test_viewports(int software) {
+static void test_viewports(int layer_any_stage) {
   ID3D11GeometryShader *gs = NULL;
   ID3D11Device_CreateGeometryShader(g_device, dx_gs_viewport_dxbc, sizeof dx_gs_viewport_dxbc, NULL, &gs);
   const VertexF v[9] = {{-1, -1, 0.5f, 1, 0, 0, 1}, {-1, 3, 0.5f, 1, 0, 0, 1}, {3, -1, 0.5f, 1, 0, 0, 1},
@@ -4633,8 +4634,8 @@ static void test_viewports(int software) {
   check(back[1].TopLeftX == SIZE / 2 && back[2].Width == 0, "RSGetViewports gives them back, zeros after");
   D3D11_FEATURE_DATA_D3D11_OPTIONS3 o3;
   memset(&o3, 0xCC, sizeof o3);
-  check(SUCCEEDED(ID3D11Device_CheckFeatureSupport(g_device, D3D11_FEATURE_D3D11_OPTIONS3, &o3, sizeof o3)) && o3.VPAndRTArrayIndexFromAnyShaderFeedingRasterizer == software,
-        "D3D11_FEATURE_D3D11_OPTIONS3: the layer and viewport from a vertex shader on the CPU renderer");
+  check(SUCCEEDED(ID3D11Device_CheckFeatureSupport(g_device, D3D11_FEATURE_D3D11_OPTIONS3, &o3, sizeof o3)) && o3.VPAndRTArrayIndexFromAnyShaderFeedingRasterizer == layer_any_stage,
+        "D3D11_FEATURE_D3D11_OPTIONS3: the layer and viewport from a vertex shader on the CPU renderer and Venus");
   if (vb) ID3D11Buffer_Release(vb);
   if (gs) ID3D11GeometryShader_Release(gs);
 }
@@ -4655,7 +4656,8 @@ static void test_sampler_state(void) {
   }
   if (dxgi) IDXGIDevice_Release(dxgi);
   const int software = (ad.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) != 0;
-  test_viewports(software);
+  /* (the CPU renderer and the Venus device - the host's Vulkan - take the layer and viewport from a vertex shader; virgl does not) */
+  test_viewports(software || wcsstr(ad.Description, L"Venus") != NULL);
   D3D11_SAMPLER_DESC sd;
   memset(&sd, 0, sizeof sd);
   sd.Filter = D3D11_FILTER_MIN_MAG_MIP_POINT;

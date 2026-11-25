@@ -153,9 +153,12 @@ void RenderNode::build_venus(hardware::VirtioGpu& virtio, allocators::IAllocator
                         have.limits.varyings >= want.limits.varyings && have.limits.color_targets >= want.limits.color_targets &&
                         have.limits.vertex_buffers >= want.limits.vertex_buffers && have.limits.control_varyings >= want.limits.control_varyings &&
                         (want.sample_counts & ~have.sample_counts) == 0 && have.max_push_constant_bytes >= want.max_push_constant_bytes;
-    use = !missing && !missing2 && limits;
+    const uint32_t gaps = device->parity_gaps();   // (host extensions the device needs to do those features as virgl does)
+    use = !missing && !missing2 && limits && !gaps;
     if (use) e.text(": chosen (it does everything virgl does here)");
-    else e.text(": virgl kept (Venus lacks features ").hex(missing).text(" / ").hex(missing2).text(limits ? "" : ", limits").text("; TCOS_GPU_BACKEND=VENUS forces it)");
+    else
+      e.text(": virgl kept (Venus lacks features ").hex(missing).text(" / ").hex(missing2).text(limits ? "" : ", limits").text(", extensions ").hex(gaps)
+          .text("; TCOS_GPU_BACKEND=VENUS forces it)");
 #endif
   }
   if (!use) {

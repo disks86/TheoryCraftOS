@@ -1686,17 +1686,28 @@ void test_d3d9_tgsi() {
       c.op(kOpMov, {Asm::dst(kRegAttrOut, 0), Asm::src(kRegConst, 1) | (1u << 13)});
       c.end();
       CHECK(f.check(c, "vs_1_1 a0") == status::kSuccess);
-      // A def constant read as an operand and a large one that the text cannot say.
+      // A def constant read as an operand, and ones a decimal with twelve fraction digits cannot say exactly (a large one, a tiny one that would read as 0, a
+      // negative zero): those go in UINT32 immediates of their bits.
       Asm d(false, 2, 0);
       d.def(9, 0.125f, -3.5f, 100.0f, 0.0078125f);
       d.op(4, {Asm::dst(kRegColorOut, 0), Asm::src(kRegInput, 0), Asm::src(kRegConst, 9), Asm::src(kRegConst, 0)});
       d.end();
       CHECK(f.check(d, "def") == status::kSuccess);
       Asm big(false, 2, 0);
-      big.def(9, 1e20f, 0, 0, 0);
+      big.def(9, 1e20f, 1e-30f, -0.0f, 0.1f);
       big.op(kOpMov, {Asm::dst(kRegColorOut, 0), Asm::src(kRegConst, 9)});
       big.end();
-      CHECK(f.check(big, "big def") == status::kNotSupported);
+      CHECK(f.check(big, "big def") == status::kSuccess);
+      {
+        UniquePointer<D3d9Program> program;
+        CHECK(D3d9Program::compile(allocator, big.bytes(), &program) == status::kSuccess);
+        String text(allocator);
+        CHECK(program && program->emit_tgsi(&text) == status::kSuccess);
+        const std::string t(text.data(), text.size());
+        char want[96];
+        snprintf(want, sizeof want, "UINT32 {%u, %u, %u, %u}", __builtin_bit_cast(uint32_t, 1e20f), __builtin_bit_cast(uint32_t, 1e-30f), __builtin_bit_cast(uint32_t, -0.0f), __builtin_bit_cast(uint32_t, 0.1f));
+        CHECK(t.find(want) != std::string::npos);
+      }
     }
     printf("  tgsi control flow and friends: %u compared, %u mismatched\n", f.compared, f.mismatched);
     CHECK(f.mismatched == 0 && f.compared >= 30);

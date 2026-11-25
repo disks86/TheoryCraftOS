@@ -139,8 +139,9 @@ the one copy of the state in `libEGL.so.1`.
 
 ## The 3D hardware
 
-When the machine has a GPU whose 3D engine takes TGSI (virgl in QEMU; `webgl::IAccelerator`, installed by `main.cpp` as `graphics::WebGlAccelerator` over the
-system's graphics device), a context draws its window's default framebuffer there, the same way WebGL canvases do (`src/WebGl/GlAccel.cpp`, `TgsiTranslator.cpp`). Each
+When the machine has a GPU whose 3D engine takes TGSI (in QEMU the Venus device - the host's Vulkan, which compiles the TGSI to SPIR-V, docs/Venus.md - or virgl
+without Venus; `webgl::IAccelerator`, installed by `main.cpp` as `graphics::WebGlAccelerator` over the system's graphics device), a context draws its window's default
+framebuffer there, the same way WebGL canvases do (`src/WebGl/GlAccel.cpp`, `TgsiTranslator.cpp`). Each
 draw is offered to the device and runs on the CPU rasterizer when the device cannot do it; the choice is per draw and never changes the result, only where the work runs.
 
 - The program's shaders become TGSI once (`translate_to_tgsi`, with the device's `AccelLimits`: virgl takes 256 constant rows, 16 attributes, 14 varyings and 16

@@ -115,6 +115,20 @@ bool VenusDevice::initialize() {
 
 // ---- what the device does ----------------------------------------------------------------------------------------------------------------------------
 // What this device implements, where the host's device has it.
+uint32_t VenusDevice::parity_gaps() const {
+  const VenusCaps& c = ctx_.caps();
+  uint32_t gaps = 0;
+  for (uint32_t n = 2; n <= 8; n *= 2)   // (info()'s sample counts are bit n for n samples; VkSampleCountFlagBits is the value n)
+    if ((sample_counts_ >> n & 1) && !(c.sample_location_counts & n)) gaps |= kGapSampleLocations;
+  if (!c.null_descriptor) gaps |= kGapNullDescriptor;
+  if (!c.provoking_vertex_last) gaps |= kGapProvokingLast;
+  if (!c.depth_bias_float) gaps |= kGapDepthBiasFloat;
+  if (!c.custom_border_color) gaps |= kGapCustomBorder;
+  if (!c.vertex_attribute_divisor || !c.vertex_attribute_zero_divisor) gaps |= kGapDivisor;
+  if (!c.depth_clamp) gaps |= kGapDepthClamp;
+  return gaps;
+}
+
 DeviceInfo VenusDevice::info() const {
   DeviceInfo i{};
   i.name = "Venus (virtio-gpu)", i.kind = DeviceKind::VirtualGpu, i.accelerated = true;
@@ -810,12 +824,14 @@ bool VenusImage::transferable(uint32_t level, uint32_t layer, uint64_t count) co
 }
 
 bool VenusImage::write_subresource(uint32_t level, uint32_t layer, ArrayView<const uint32_t> pixels) {
+  kernel::ScopedMutex staged(device_.staging_lock());   // (the staging buffer is the device's: one transfer at a time)
   if (!transferable(level, layer, pixels.size()) || is_wide_format(desc_.format)) return false;
   const uint32_t width = mip_extent(desc_.extent.width, level);
   return stage(pixels) != 0 && copy(true, level, layer, width);
 }
 
 bool VenusImage::read_subresource(uint32_t level, uint32_t layer, ArrayView<uint32_t> out) {
+  kernel::ScopedMutex staged(device_.staging_lock());   // (the staging buffer is the device's: one transfer at a time)
   if (!transferable(level, layer, out.size()) || is_wide_format(desc_.format) || is_compressed_format(desc_.format) || desc_.format == Format::D32Float) return false;
   const uint32_t width = mip_extent(desc_.extent.width, level);
   const uint32_t texel = is_packed32_format(desc_.format) ? bytes_per_pixel(desc_.format) : 4u;
@@ -824,11 +840,13 @@ bool VenusImage::read_subresource(uint32_t level, uint32_t layer, ArrayView<uint
 }
 
 bool VenusImage::write_subresource_float(uint32_t level, uint32_t layer, ArrayView<const Vec4> pixels) {
+  kernel::ScopedMutex staged(device_.staging_lock());   // (the staging buffer is the device's: one transfer at a time)
   if (!transferable(level, layer, pixels.size()) || !is_wide_format(desc_.format)) return false;
   return stage_wide(pixels) && copy(true, level, layer, mip_extent(desc_.extent.width, level));
 }
 
 bool VenusImage::read_subresource_float(uint32_t level, uint32_t layer, ArrayView<Vec4> out) {
+  kernel::ScopedMutex staged(device_.staging_lock());   // (the staging buffer is the device's: one transfer at a time)
   if (!transferable(level, layer, out.size()) || !is_wide_format(desc_.format)) return false;
   if (!device_.staging(out.size() * bytes_per_pixel(kept_format()))) return false;
   return copy(false, level, layer, mip_extent(desc_.extent.width, level)) && unstage_wide(out);
@@ -848,6 +866,7 @@ bool VenusImage::write_mip_pixels(uint32_t level, ArrayView<const uint32_t> pixe
 bool VenusImage::read_mip_pixels(uint32_t level, ArrayView<uint32_t> out) { return desc_.kind == TextureKind::Texture2D && read_subresource(level, 0, out); }
 
 bool VenusImage::write_rect(const Rect2D& area, ArrayView<const uint32_t> pixels, uint32_t pitch) {
+  kernel::ScopedMutex staged(device_.staging_lock());   // (the staging buffer is the device's: one transfer at a time)
   if (area.width == 0 || area.height == 0 || area.x < 0 || area.y < 0 || pitch < area.width || desc_.samples != 1) return false;
   if (static_cast<uint64_t>(area.x) + area.width > desc_.extent.width || static_cast<uint64_t>(area.y) + area.height > desc_.extent.height) return false;
   if (is_wide_format(desc_.format) || is_compressed_format(desc_.format) || desc_.format == Format::D32Float) return false;
@@ -888,6 +907,7 @@ bool VenusImage::write_rect(const Rect2D& area, ArrayView<const uint32_t> pixels
 }
 
 bool VenusImage::write_compressed(uint32_t level, uint32_t layer, ConstByteView blocks) {
+  kernel::ScopedMutex staged(device_.staging_lock());   // (the staging buffer is the device's: one transfer at a time)
   if (!is_compressed_format(desc_.format) || level >= desc_.mip_levels || layer >= level_layers(level)) return false;
   const uint32_t width = mip_extent(desc_.extent.width, level), height = mip_extent(desc_.extent.height, level);
   if (blocks.size() != compressed_image_bytes(desc_.format, width, height)) return false;
@@ -1024,6 +1044,7 @@ bool VenusDevice::present(IImage* image) {
   if (!(v->desc().usage & kImagePresent)) return false;
   const Extent2D e = v->extent();
   const uint64_t count = uint64_t{e.width} * e.height;
+  kernel::ScopedMutex staged(staging_lock_);   // (the frame goes through the staging buffer, which image transfers on other threads use too)
   VenusMemory* s = staging(count * 4);
   if (!s) return false;
   if (!v->copy(false, 0, 0, e.width)) return false;

@@ -121,6 +121,18 @@ class TgsiEmitter {
     }
     add(s, StringView(digits, 12));
   }
+  // Whether add_float's text (twelve fraction digits) reads back as exactly `f`. A float it cannot write so - a small one such as 1e-30, which would read as 0, a
+  // negative zero, a NaN or a large one - goes in an immediate of UINT32 bits instead (the registers are untyped: its users see the same bits).
+  static bool decimal_exact(float f) {
+    if (!(f == f) || f > 1e9f || f < -1e9f || __builtin_signbit(f) && f == 0) return false;
+    double d = static_cast<double>(f), sign = 1;
+    if (d < 0) d = -d, sign = -1;
+    uint64_t ip = static_cast<uint64_t>(d);
+    uint64_t fd = static_cast<uint64_t>((d - static_cast<double>(ip)) * 1e12 + 0.5);
+    if (fd >= 1000000000000ull) fd -= 1000000000000ull, ++ip;
+    const float back = static_cast<float>(sign * (static_cast<double>(ip) + static_cast<double>(fd) / 1e12));
+    return __builtin_bit_cast(uint32_t, back) == __builtin_bit_cast(uint32_t, f);
+  }
   String temp(uint32_t index, const char* swizzle = ".xyzw") {
     String s = str();
     add(s, "TEMP[");
@@ -2030,6 +2042,7 @@ void TgsiEmitter::assemble(String* out) {
     for (uint32_t k = 0; k < 4; ++k) {
       const uint32_t exponent = (imms_[i].bits[k] >> 23) & 0xFF, mantissa = imms_[i].bits[k] & 0x7FFFFF;
       integer = integer || (exponent == 0 && mantissa != 0) || (p_.major_ >= 4 && exponent >= 0x9C);   // (a Shader Model 4 literal is typeless: one too large to write as a decimal is an integer, 0xFF000000 and the like)
+      integer = integer || !decimal_exact(__builtin_bit_cast(float, imms_[i].bits[k]));   // (and any other the decimal text would change)
     }
     add(*out, integer ? "] UINT32 {" : "] FLT32 {");
     for (uint32_t k = 0; k < 4; ++k) {
