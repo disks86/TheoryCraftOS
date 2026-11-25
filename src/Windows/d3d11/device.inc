@@ -379,6 +379,8 @@ static void dev_destroy(DxObj *o) {
   if (d->sig_draw_indexed) ID3D12CommandSignature_Release(d->sig_draw_indexed);
   if (d->sig_dispatch) ID3D12CommandSignature_Release(d->sig_dispatch);
   if (d->measure_heap) ID3D12QueryHeap_Release(d->measure_heap);
+  if (d->measure_stats_heap) ID3D12QueryHeap_Release(d->measure_stats_heap);
+  if (d->measure_so_heap) ID3D12QueryHeap_Release(d->measure_so_heap);
   if (d->measure_readback) ID3D12Resource_Release(d->measure_readback);
   mem_free(d->measures);
   if (d->root) ID3D12RootSignature_Release(d->root);
@@ -450,14 +452,19 @@ static HRESULT dev_start(Dev *d) {
     hr = ID3D12Device_CreateCommandSignature(d->d12, &sd, NULL, &IID_ID3D12CommandSignature, (void **)sigs[k]);
     if (FAILED(hr)) return hr;
   }
-  /* (what the kernel measures for the queries: one slot of the heap a draw) */
-  const D3D12_QUERY_HEAP_DESC measure_desc = {D3D12_QUERY_HEAP_TYPE_OCCLUSION, MEASURES, 0};
-  if (SUCCEEDED(ID3D12Device_CreateQueryHeap(d->d12, &measure_desc, &IID_ID3D12QueryHeap, (void **)&d->measure_heap))) {
-    d->measure_readback = make_buffer(d, D3D12_HEAP_TYPE_READBACK, (UINT64)MEASURES * 8);
+  /* (what the kernel measures for the queries: a slot of each heap a measurement; an adapter without the kernel's queries, or without its statistics, has not got the heaps,
+   * and the queries that need them are not made) */
+  const D3D12_QUERY_HEAP_DESC measure_desc = {D3D12_QUERY_HEAP_TYPE_OCCLUSION, MEASURES, 0}, stats_desc = {D3D12_QUERY_HEAP_TYPE_PIPELINE_STATISTICS, MEASURES, 0},
+                              so_desc = {D3D12_QUERY_HEAP_TYPE_SO_STATISTICS, 4 * MEASURES, 0};
+  if (FAILED(ID3D12Device_CreateQueryHeap(d->d12, &measure_desc, &IID_ID3D12QueryHeap, (void **)&d->measure_heap))) d->measure_heap = NULL;
+  if (FAILED(ID3D12Device_CreateQueryHeap(d->d12, &stats_desc, &IID_ID3D12QueryHeap, (void **)&d->measure_stats_heap))) d->measure_stats_heap = NULL;
+  if (FAILED(ID3D12Device_CreateQueryHeap(d->d12, &so_desc, &IID_ID3D12QueryHeap, (void **)&d->measure_so_heap))) d->measure_so_heap = NULL;
+  if (d->measure_heap || d->measure_stats_heap || d->measure_so_heap) {
+    d->measure_readback = make_buffer(d, D3D12_HEAP_TYPE_READBACK, MEASURE_READBACK_BYTES);
     d->measures = mem_alloc(sizeof(Measure) * MEASURES);
     if (!d->measure_readback || !d->measures) return E_OUTOFMEMORY;
     memset(d->measures, 0, sizeof(Measure) * MEASURES);
-  } else d->measure_heap = NULL;      /* (an adapter without occlusion queries: the queries that need the kernel's measurements are not made) */
+  }
   hr = make_heap(d, D3D12_DESCRIPTOR_HEAP_TYPE_RTV, RTV_SLOTS, FALSE, &d->rtv_heap);
   if (SUCCEEDED(hr)) hr = make_heap(d, D3D12_DESCRIPTOR_HEAP_TYPE_DSV, DSV_SLOTS, FALSE, &d->dsv_heap);
   if (SUCCEEDED(hr)) hr = make_heap(d, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, VIEW_HEAP, TRUE, &d->view_heap);

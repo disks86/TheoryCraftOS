@@ -1593,6 +1593,126 @@ static void test_stream_output(void) {
   ID3D11GeometryShader_Release(so);
 }
 
+/* Queries of every kind active at once, nested and begun again, over clears and several draws: each gets exact counts (the kernel measures a draw for all of them at once);
+ * the stream output overflow predicate of all streams decides predication. */
+static void test_simultaneous_queries(void) {
+  const D3D11_SO_DECLARATION_ENTRY entries[2] = {{0, "SV_POSITION", 0, 0, 4, 0}, {0, "COLOR", 0, 0, 4, 0}};
+  const UINT stride = 32;
+  ID3D11GeometryShader *so = NULL;
+  ID3D11Device_CreateGeometryShaderWithStreamOutput(g_device, dx_vs_dxbc, sizeof dx_vs_dxbc, entries, 2, &stride, 1, 0, NULL, &so);
+  D3D11_BUFFER_DESC desc = {2 * 3 * 32, D3D11_USAGE_DEFAULT, D3D11_BIND_STREAM_OUTPUT | D3D11_BIND_VERTEX_BUFFER, 0, 0, 0};      /* (room for two triangles) */
+  ID3D11Buffer *target = NULL;
+  ID3D11Device_CreateBuffer(g_device, &desc, NULL, &target);
+  const D3D11_QUERY_DESC occlusion_desc = {D3D11_QUERY_OCCLUSION, 0}, stats_desc = {D3D11_QUERY_PIPELINE_STATISTICS, 0}, so_desc = {D3D11_QUERY_SO_STATISTICS_STREAM0, 0},
+                         so_all_desc = {D3D11_QUERY_SO_STATISTICS, 0}, predicate_desc = {D3D11_QUERY_OCCLUSION_PREDICATE, D3D11_QUERY_MISC_PREDICATEHINT},
+                         overflow_desc = {D3D11_QUERY_SO_OVERFLOW_PREDICATE, 0}, overflow1_desc = {D3D11_QUERY_SO_OVERFLOW_PREDICATE_STREAM1, 0};
+  ID3D11Query *occlusion = NULL, *inner = NULL, *again = NULL, *stats = NULL, *so_stats = NULL, *so_all = NULL;
+  ID3D11Predicate *visible = NULL, *overflow = NULL, *overflow1 = NULL;
+  ID3D11Device_CreateQuery(g_device, &occlusion_desc, &occlusion);
+  ID3D11Device_CreateQuery(g_device, &occlusion_desc, &inner);
+  ID3D11Device_CreateQuery(g_device, &occlusion_desc, &again);
+  ID3D11Device_CreateQuery(g_device, &stats_desc, &stats);
+  ID3D11Device_CreateQuery(g_device, &so_desc, &so_stats);
+  ID3D11Device_CreateQuery(g_device, &so_all_desc, &so_all);
+  ID3D11Device_CreatePredicate(g_device, &predicate_desc, &visible);
+  ID3D11Device_CreatePredicate(g_device, &overflow_desc, &overflow);
+  ID3D11Device_CreatePredicate(g_device, &overflow1_desc, &overflow1);
+  ID3D11Query *hinted = NULL;
+  const D3D11_QUERY_DESC hint_desc = {D3D11_QUERY_OCCLUSION, D3D11_QUERY_MISC_PREDICATEHINT};
+  check(so && target && occlusion && inner && again && stats && so_stats && so_all && visible && overflow && overflow1 &&
+        ID3D11Device_CreateQuery(g_device, &hint_desc, &hinted) == E_INVALIDARG && !hinted,
+        "queries of every kind (and the predicate hint only on a predicate)");
+  if (!so || !target || !occlusion || !inner || !again || !stats || !so_stats || !so_all || !visible || !overflow || !overflow1) return;
+  const VertexF v[3] = {{-0.8f, -0.8f, 0.5f, 1, 0, 0, 1}, {0.8f, -0.8f, 0.5f, 0, 1, 0, 1}, {0.0f, 0.8f, 0.5f, 0, 0, 1, 1}};
+  ID3D11Buffer *vertices = make_buffer(D3D11_BIND_VERTEX_BUFFER, D3D11_USAGE_DEFAULT, 0, v, sizeof v);
+  begin(NULL);
+  clear(0, 0, 0);
+  bind_floats(vertices);
+  set_matrix(1, 1, 0, 0);
+  ID3D11DeviceContext_PSSetShader(g_context, g_ps_color, NULL, 0);
+  /* the samples of one draw */
+  ID3D11DeviceContext_Begin(g_context, (ID3D11Asynchronous *)occlusion);
+  ID3D11DeviceContext_Draw(g_context, 3, 0);
+  ID3D11DeviceContext_End(g_context, (ID3D11Asynchronous *)occlusion);
+  const UINT64 one = query_result(occlusion);
+
+  /* Round 0: no stream output (the stream output statistics are 0, nothing overflows); over a clear. Round 1: a vertex shader's stream output into room for two triangles. */
+  ID3D11Asynchronous *all[7] = {(ID3D11Asynchronous *)occlusion, (ID3D11Asynchronous *)stats, (ID3D11Asynchronous *)so_stats, (ID3D11Asynchronous *)so_all,
+                                (ID3D11Asynchronous *)visible, (ID3D11Asynchronous *)overflow, (ID3D11Asynchronous *)overflow1};
+  UINT offset = 0;
+  for (int round = 0; round < 2; ++round) {
+    if (round == 1) {
+      ID3D11DeviceContext_GSSetShader(g_context, so, NULL, 0);
+      ID3D11DeviceContext_SOSetTargets(g_context, 1, &target, &offset);
+    }
+    for (int i = 0; i < 7; ++i) ID3D11DeviceContext_Begin(g_context, all[i]);
+    ID3D11DeviceContext_Begin(g_context, (ID3D11Asynchronous *)again);
+    ID3D11DeviceContext_Draw(g_context, 3, 0);
+    ID3D11DeviceContext_Begin(g_context, (ID3D11Asynchronous *)again);      /* (begun again: it counts from here) */
+    if (round == 0) clear(0, 0, 0);
+    ID3D11DeviceContext_Begin(g_context, (ID3D11Asynchronous *)inner);
+    ID3D11DeviceContext_Draw(g_context, 3, 0);
+    ID3D11DeviceContext_End(g_context, (ID3D11Asynchronous *)inner);
+    ID3D11DeviceContext_Draw(g_context, 3, 0);      /* (with stream output: the third triangle does not fit) */
+    ID3D11DeviceContext_End(g_context, (ID3D11Asynchronous *)again);
+    for (int i = 6; i >= 0; --i) ID3D11DeviceContext_End(g_context, all[i]);
+    D3D11_QUERY_DATA_PIPELINE_STATISTICS ps;
+    D3D11_QUERY_DATA_SO_STATISTICS st0 = {99, 99}, sta = {99, 99};
+    BOOL seen = FALSE, over = FALSE, over1 = TRUE;
+    memset(&ps, 0xFF, sizeof ps);
+    while (ID3D11DeviceContext_GetData(g_context, (ID3D11Asynchronous *)stats, &ps, sizeof ps, 0) == S_FALSE) {}
+    while (ID3D11DeviceContext_GetData(g_context, (ID3D11Asynchronous *)so_stats, &st0, sizeof st0, 0) == S_FALSE) {}
+    while (ID3D11DeviceContext_GetData(g_context, (ID3D11Asynchronous *)so_all, &sta, sizeof sta, 0) == S_FALSE) {}
+    while (ID3D11DeviceContext_GetData(g_context, (ID3D11Asynchronous *)visible, &seen, sizeof seen, 0) == S_FALSE) {}
+    while (ID3D11DeviceContext_GetData(g_context, (ID3D11Asynchronous *)overflow, &over, sizeof over, 0) == S_FALSE) {}
+    while (ID3D11DeviceContext_GetData(g_context, (ID3D11Asynchronous *)overflow1, &over1, sizeof over1, 0) == S_FALSE) {}
+    const UINT64 samples = query_result(occlusion), nested = query_result(inner), restarted = query_result(again);
+    printf("d3d11test: (all at once, round %d: one draw %u samples; %u, nested %u, again %u; IA %u/%u VS %u C %u/%u PS %u HS %u DS %u CS %u; stream 0 %u/%u, all %u/%u; visible %d overflow %d %d)\n",
+           round, (unsigned)one, (unsigned)samples, (unsigned)nested, (unsigned)restarted, (unsigned)ps.IAVertices, (unsigned)ps.IAPrimitives, (unsigned)ps.VSInvocations,
+           (unsigned)ps.CInvocations, (unsigned)ps.CPrimitives, (unsigned)ps.PSInvocations, (unsigned)ps.HSInvocations, (unsigned)ps.DSInvocations, (unsigned)ps.CSInvocations,
+           (unsigned)st0.NumPrimitivesWritten, (unsigned)st0.PrimitivesStorageNeeded, (unsigned)sta.NumPrimitivesWritten, (unsigned)sta.PrimitivesStorageNeeded, seen, over, over1);
+    check(one > 600 && samples == 3 * one && nested == one && restarted == 2 * one,
+          round ? "... with stream output too" : "occlusion queries active together, nested and begun again (over a clear) each count their draws");
+    check(ps.IAVertices == 9 && ps.IAPrimitives == 3 && ps.VSInvocations == 9 && ps.CInvocations == 3 && ps.CPrimitives == 3 && ps.PSInvocations == 3 * one &&
+          ps.HSInvocations == 0 && ps.DSInvocations == 0 && ps.CSInvocations == 0, "... with a pipeline statistics query: every count exact");
+    if (round == 0)
+      check(st0.NumPrimitivesWritten == 0 && st0.PrimitivesStorageNeeded == 0 && sta.NumPrimitivesWritten == 0 && sta.PrimitivesStorageNeeded == 0 && seen == TRUE && over == FALSE &&
+            over1 == FALSE, "... and stream output statistics of none (no stream output), the occlusion predicate true, the overflow predicates false");
+    else
+      check(st0.NumPrimitivesWritten == 2 && st0.PrimitivesStorageNeeded == 3 && sta.NumPrimitivesWritten == 2 && sta.PrimitivesStorageNeeded == 3 && seen == TRUE && over == TRUE &&
+            over1 == FALSE, "... and stream output statistics of stream 0 and of all streams (two written of three), overflow of all streams true and of stream 1 false");
+  }
+
+  /* predication by the overflow predicate: left out while it is TRUE (the value given), done when FALSE is given */
+  ID3D11DeviceContext_SOSetTargets(g_context, 0, NULL, NULL);
+  ID3D11DeviceContext_GSSetShader(g_context, NULL, NULL, 0);
+  clear(0, 0, 0);
+  ID3D11DeviceContext_SetPredication(g_context, overflow, TRUE);
+  clear(1, 0, 0);
+  ID3D11DeviceContext_Draw(g_context, 3, 0);
+  ID3D11DeviceContext_SetPredication(g_context, NULL, FALSE);
+  read_target();
+  check(pixel(1, 1) == 0xFF000000u && pixel(32, 32) == 0xFF000000u, "SetPredication with an overflow predicate that is true: the clear and the draw are left out");
+  ID3D11DeviceContext_SetPredication(g_context, overflow, FALSE);
+  clear(1, 0, 0);
+  ID3D11DeviceContext_SetPredication(g_context, overflow1, TRUE);      /* (stream 1 did not overflow: done) */
+  ID3D11DeviceContext_Draw(g_context, 3, 0);
+  ID3D11DeviceContext_SetPredication(g_context, NULL, FALSE);
+  read_target();
+  check(pixel(1, 1) == 0xFFFF0000u && (pixel(32, 32) & 0xFFFFFF) != 0xFF0000u, "... and done when the value given is not the predicate's");
+  /* a predicate's data: a BOOL; another size is refused */
+  UINT64 wide = 0;
+  check(ID3D11DeviceContext_GetData(g_context, (ID3D11Asynchronous *)overflow, &wide, sizeof wide, 0) == E_INVALIDARG &&
+        ID3D11Asynchronous_GetDataSize((ID3D11Asynchronous *)overflow) == sizeof(BOOL), "GetData of a predicate takes a BOOL");
+
+  ID3D11Buffer_Release(vertices);
+  for (int i = 0; i < 7; ++i) IUnknown_Release((IUnknown *)all[i]);
+  ID3D11Query_Release(inner);
+  ID3D11Query_Release(again);
+  ID3D11Buffer_Release(target);
+  ID3D11GeometryShader_Release(so);
+}
+
 static void test_indirect_draws(void) {
   const UINT draw[4] = {3, 1, 0, 0}, indexed[5] = {3, 1, 0, 0, 0};
   const UINT16 indices[3] = {0, 1, 2};
@@ -2972,6 +3092,7 @@ int main(void) {
       test_compute();
       test_pixel_uav_and_queries();
       test_stream_output();
+      test_simultaneous_queries();
       test_indirect_draws();
       test_min_lod();
       test_deferred();

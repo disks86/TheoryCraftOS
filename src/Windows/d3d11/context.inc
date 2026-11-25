@@ -570,33 +570,6 @@ static void so_collect(Dev *d) {
   }
   d->so_written_count = 0;
 }
-/* The bytes the targets of a stream hold (what the bound geometry shader's declaration sends to it). */
-static UINT64 so_filled(Ctx *c, UINT stream) {
-  UINT64 total = 0;
-  if (!c->gs || !c->gs->so) return 0;
-  for (UINT slot = 0; slot < 4; ++slot) {
-    if (!c->so_buf[slot]) continue;
-    for (UINT i = 0; i < c->gs->so_count; ++i)
-      if (c->gs->so[i].OutputSlot == slot && c->gs->so[i].Stream == stream) { total += c->so_buf[slot]->so_end; break; }
-  }
-  return total;
-}
-/* The bytes a primitive of a stream takes in its targets: the strides of its buffers times the vertices of a primitive (the geometry shader's, else the draw's). */
-static UINT64 so_primitive_bytes(Ctx *c, UINT stream) {
-  if (!c->gs || !c->gs->so) return 0;
-  UINT64 stride = 0;
-  for (UINT slot = 0; slot < 4; ++slot) {
-    if (!c->so_buf[slot]) continue;
-    for (UINT i = 0; i < c->gs->so_count; ++i)
-      if (c->gs->so[i].OutputSlot == slot && c->gs->so[i].Stream == stream) { stride += c->gs->so_strides[slot]; break; }
-  }
-  UINT vertices = c->gs->so_only ? 0 : c->gs->out_vertices;
-  if (!vertices) {
-    const D3D11_PRIMITIVE_TOPOLOGY t = c->topology;
-    vertices = t == D3D11_PRIMITIVE_TOPOLOGY_POINTLIST ? 1 : (t == D3D11_PRIMITIVE_TOPOLOGY_LINELIST || t == D3D11_PRIMITIVE_TOPOLOGY_LINESTRIP) ? 2 : 3;
-  }
-  return stride * vertices;
-}
 /* Before what reads where a target's records end: the list that writes them is sent. */
 static void so_settle(Dev *d, const Buf *b) { if (b->so_fill && b->written == d->epoch) flush(d); }
 
@@ -1062,16 +1035,16 @@ static void STDMETHODCALLTYPE ctx_RSGetScissorRects(Ctx *c, UINT *count, D3D11_R
   }
 }
 
-/* A draw: left out while predicated, measured for the active queries, counted for the pipeline statistics. */
+/* A draw: left out while predicated, measured for the active queries. */
 static void draw_any(Ctx *c, BOOL indexed, UINT count, UINT instances, UINT start, INT base_vertex, UINT start_instance) {
   Dev *d = c->dev;
   LOCK(c);
-  if (!count || !instances || predicated_out(d) || !draw_prepare(c, indexed)) { UNLOCK(c); return; }
-  const BOOL measured = measure_begin(d);
+  if (!count || !instances || predicated_out(d)) { UNLOCK(c); return; }
+  measure_room(d);
+  if (!draw_prepare(c, indexed)) { UNLOCK(c); return; }
+  measure_draw(d);
   if (indexed) ID3D12GraphicsCommandList_DrawIndexedInstanced(d->list, count, instances, start, base_vertex, start_instance);
   else ID3D12GraphicsCommandList_DrawInstanced(d->list, count, instances, start, start_instance);
-  measure_end(d, measured);
-  query_count_draw(c, count, instances);
   UNLOCK(c);
 }
 static void STDMETHODCALLTYPE ctx_Draw(Ctx *c, UINT count, UINT start) {
@@ -1084,16 +1057,6 @@ static void STDMETHODCALLTYPE ctx_DrawIndexedInstanced(Ctx *c, UINT count, UINT 
   if (c->deferred) { deferred_record(c, &(RecArgs){.op = REC_DRAW_INDEXED_INSTANCED, .u = {count, instances, start, (UINT)base_vertex, start_instance}}); return; }
   draw_any(c, TRUE, count, instances, start, base_vertex, start_instance);
 }
-/* The arguments of an indirect draw or dispatch, read on the CPU (for the pipeline statistics, when a query counts them): FALSE when they cannot be had. */
-static BOOL indirect_args(Dev *d, Buf *b, UINT offset, UINT bytes, UINT *out) {
-  if (b->gpu) return SUCCEEDED(buf_gpu_read(d, b, offset, bytes, out));
-  memcpy(out, b->data + offset, bytes);
-  return TRUE;
-}
-static BOOL stats_active(const Dev *d) {
-  for (UINT i = 0; i < d->active_count; ++i) if (d->active[i]->desc.Query == D3D11_QUERY_PIPELINE_STATISTICS) return TRUE;
-  return FALSE;
-}
 /* A draw whose arguments are in a buffer (made with D3D11_RESOURCE_MISC_DRAWINDIRECT_ARGS): the vertex count, instances, first vertex and first instance (and for an
  * indexed one the index count, instances, first index, base vertex and first instance), as the GPU finds them when the list runs. */
 static void draw_indirect(Ctx *c, BOOL indexed, ID3D11Buffer *buffer, UINT offset) {
@@ -1102,14 +1065,12 @@ static void draw_indirect(Ctx *c, BOOL indexed, ID3D11Buffer *buffer, UINT offse
   const UINT bytes = indexed ? 20 : 16;
   if (!b || !(b->desc.MiscFlags & D3D11_RESOURCE_MISC_DRAWINDIRECT_ARGS) || offset % 4 || offset > b->desc.ByteWidth || b->desc.ByteWidth - offset < bytes) return;
   LOCK(c);
-  UINT args[5] = {0};
-  const BOOL counted = stats_active(d) && indirect_args(d, b, offset, bytes, args);
-  if (predicated_out(d) || !draw_prepare(c, indexed)) { UNLOCK(c); return; }
-  const BOOL measured = measure_begin(d);
+  if (predicated_out(d)) { UNLOCK(c); return; }
+  measure_room(d);
+  if (!draw_prepare(c, indexed)) { UNLOCK(c); return; }
+  measure_draw(d);
   ID3D12GraphicsCommandList_ExecuteIndirect(d->list, indexed ? d->sig_draw_indexed : d->sig_draw, 1, b->res, offset, NULL, 0);
-  measure_end(d, measured);
   b->used = d->epoch;
-  if (counted) query_count_draw(c, args[0], args[1]);
   UNLOCK(c);
 }
 static void STDMETHODCALLTYPE ctx_DrawInstancedIndirect(Ctx *c, ID3D11Buffer *buffer, UINT offset) {
@@ -1122,12 +1083,11 @@ static void STDMETHODCALLTYPE ctx_DispatchIndirect(Ctx *c, ID3D11Buffer *buffer,
   Buf *b = (Buf *)buffer;
   if (!b || !(b->desc.MiscFlags & D3D11_RESOURCE_MISC_DRAWINDIRECT_ARGS) || offset % 4 || offset > b->desc.ByteWidth || b->desc.ByteWidth - offset < 12) return;
   LOCK(c);
-  UINT args[3] = {0};
-  const BOOL counted = stats_active(d) && indirect_args(d, b, offset, 12, args);
+  if (!predicated_out(d)) measure_room(d);
   if (!predicated_out(d) && compute_prepare(c)) {
+    measure_draw(d);
     ID3D12GraphicsCommandList_ExecuteIndirect(d->list, d->sig_dispatch, 1, b->res, offset, NULL, 0);
     b->used = d->epoch;
-    if (counted) query_count_dispatch(c, args[0], args[1], args[2]);
   }
   UNLOCK(c);
 }
@@ -1260,10 +1220,11 @@ static BOOL compute_prepare(Ctx *c) {
 static void STDMETHODCALLTYPE ctx_Dispatch(Ctx *c, UINT x, UINT y, UINT z) {
   if (c->deferred) { deferred_record(c, &(RecArgs){.op = REC_DISPATCH, .u = {x, y, z}}); return; }
   LOCK(c);
+  if (!predicated_out(c->dev)) measure_room(c->dev);
   if (!predicated_out(c->dev) && x && y && z && x <= D3D11_CS_DISPATCH_MAX_THREAD_GROUPS_PER_DIMENSION && y <= D3D11_CS_DISPATCH_MAX_THREAD_GROUPS_PER_DIMENSION &&
       z <= D3D11_CS_DISPATCH_MAX_THREAD_GROUPS_PER_DIMENSION && compute_prepare(c)) {
+    measure_draw(c->dev);
     ID3D12GraphicsCommandList_Dispatch(c->dev->list, x, y, z);
-    query_count_dispatch(c, x, y, z);
   }
   UNLOCK(c);
 }

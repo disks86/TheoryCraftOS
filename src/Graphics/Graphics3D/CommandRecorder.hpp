@@ -233,20 +233,40 @@ class CommandRecorder : public ICommandBuffer {
     c.count = static_cast<uint32_t>(kind) | (stream & 3) << 8;
     add(c);
   }
+  // (EndQuery: `count` 1 and the slot in `unit`, or `count` 0 for the most recent query still open)
   void end_occlusion_query() override {
     RecordedCommand c;
     c.type = RecordedCommand::Type::EndQuery;
     add(c);
   }
-  bool occlusion_result(uint32_t slot, uint64_t* samples) const override {
-    if (slot >= kMaxOcclusionQueries || !result_done_[slot]) return false;
-    *samples = results_[slot];
+  void end_query(uint32_t slot) override {
+    if (slot >= kMaxOcclusionQueries) {
+      ok_ = false;
+      return;
+    }
+    RecordedCommand c;
+    c.type = RecordedCommand::Type::EndQuery;
+    c.unit = slot;
+    c.count = 1;
+    add(c);
+  }
+  bool occlusion_result(uint32_t slot, uint64_t* samples) const override { return query_value(slot, 0, samples); }
+  bool query_value(uint32_t slot, uint32_t index, uint64_t* value) const override {
+    if (slot >= kMaxOcclusionQueries || index >= kMaxQueryValues || !result_done_[slot]) return false;
+    *value = results_[slot][index];
     return true;
   }
-  // For the device that ran the commands: what the query of `slot` counted.
+  // For the device that ran the commands: what the query of `slot` counted (value 0; the others 0 too).
   void set_occlusion_result(uint32_t slot, uint64_t samples) {
     if (slot >= kMaxOcclusionQueries) return;
-    results_[slot] = samples;
+    for (uint64_t& v : results_[slot]) v = 0;
+    results_[slot][0] = samples;
+    result_done_[slot] = true;
+  }
+  // ... or all its values (at most kMaxQueryValues; the rest 0).
+  void set_query_values(uint32_t slot, ArrayView<const uint64_t> values) {
+    if (slot >= kMaxOcclusionQueries) return;
+    for (uint32_t i = 0; i < kMaxQueryValues; ++i) results_[slot][i] = i < values.size() ? values[i] : 0;
     result_done_[slot] = true;
   }
   bool end() override { return ok_; }
@@ -261,7 +281,7 @@ class CommandRecorder : public ICommandBuffer {
 
   List<RecordedCommand> commands_;
   List<uint8_t> constants_;
-  uint64_t results_[kMaxOcclusionQueries] = {};
+  uint64_t results_[kMaxOcclusionQueries][kMaxQueryValues] = {};
   bool result_done_[kMaxOcclusionQueries] = {};
   bool ok_ = true;
 };

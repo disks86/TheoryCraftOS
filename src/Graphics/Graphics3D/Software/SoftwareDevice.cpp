@@ -702,6 +702,14 @@ struct ScreenVertex {
   Vec4 varying[kMaxVaryings];
 };
 
+// What the draws and dispatches of a submit did, counted from its start: a query is the difference between what they were at its end and at its begin (so any number can be open,
+// nested or not, inside passes or outside).
+struct QueryCounters {
+  uint64_t samples = 0;                                 // fragments (samples) that passed the stencil and depth tests
+  uint64_t statistics[kPipelineStatisticCount] = {};   // PipelineStatistic
+  uint64_t so[2 * kMaxGeometryStreams] = {};           // for each stream the primitives written (2 * stream) and needed (2 * stream + 1)
+};
+
 // Everything one draw call needs.
 struct DrawState {
   const SoftwarePipeline* pipeline = nullptr;
@@ -730,8 +738,7 @@ struct DrawState {
   uint8_t constants_storage[kMaxPushConstantBytes] = {};
   uint32_t primitive_id = 0;   // the primitive of the draw being rasterized (SV_PrimitiveID)
   uint32_t sample_count = 1;   // samples per pixel of the pass's images
-  uint64_t* samples = nullptr; // the open occlusion query's count: one more for every fragment that passes the stencil and depth tests
-  uint64_t* ps_invocations = nullptr;   // one more for every run of the fragment shader (a statistics query)
+  QueryCounters* counters = nullptr;   // what the draws and dispatches of the submit did (for its queries; null outside a submit)
   // The stream output targets (BindStreamOutput): where each buffer's next record goes. `closed` is set once a primitive did not fit.
   struct StreamOutputTarget {
     ByteView view;
@@ -741,7 +748,9 @@ struct DrawState {
     uint64_t base = 0;           // (the offset the view starts at)
   };
   StreamOutputTarget* stream_output = nullptr;   // kMaxStreamOutputBuffers of them (null outside a submit)
-  uint64_t* so_counts = nullptr;   // an open stream output statistics query: for each stream the primitives written (2 * stream) and needed (2 * stream + 1)
+  void count(PipelineStatistic statistic, uint64_t n = 1) const {
+    if (counters) counters->statistics[static_cast<uint32_t>(statistic)] += n;
+  }
 };
 
 float read_float(ConstByteView bytes, uint64_t offset) {
@@ -882,7 +891,7 @@ void write_fragment(const DrawState& s, int32_t x, int32_t y, float z, bool dept
   } else if (!depth_ok) {
     return;
   }
-  if (s.samples) ++*s.samples;
+  if (s.counters) ++s.counters->samples;
   for (uint32_t n = 0; n < pd.color_target_count && n < kMaxColorTargets; ++n) {
     const SoftwareImage* image = n == 0 ? s.color : s.extra_colors[n - 1];
     if (!image) break;
@@ -916,7 +925,7 @@ void write_fragment(const DrawState& s, int32_t x, int32_t y, float z, bool dept
 
 // Runs the pipeline's fragment shader; false if it discarded the pixel.
 bool run_fragment_shader(const DrawState& s, const Vec4* varying, const FragmentContext& given, Vec4* color) {
-  if (s.ps_invocations) ++*s.ps_invocations;
+  s.count(PipelineStatistic::PsInvocations);
   FragmentContext context = given;
   context.storage = s.storage;
   context.images = s.images;
@@ -1173,9 +1182,23 @@ ScreenVertex to_screen(const DrawState& s, const ClipVertex& v, uint32_t varying
   return sv;
 }
 
+// The clipper's statistics of a primitive of `count` vertices: it was given it (ClipperInvocations), and it came out of it unless it lies wholly outside one plane of the view volume
+// (-w <= x <= w, -w <= y <= w, 0 <= z <= w), which is all a clipper throws away.
+void count_clipped(const DrawState& s, const ClipVertex* v, uint32_t count) {
+  if (!s.counters) return;
+  s.count(PipelineStatistic::ClipperInvocations);
+  uint32_t outside = 0x3F;   // (the planes every vertex is outside of)
+  for (uint32_t k = 0; k < count; ++k) {
+    const Vec4& p = v[k].position;
+    outside &= (p.x < -p.w ? 1u : 0u) | (p.x > p.w ? 2u : 0u) | (p.y < -p.w ? 4u : 0u) | (p.y > p.w ? 8u : 0u) | (p.z < 0 ? 16u : 0u) | (p.z > p.w ? 32u : 0u);
+  }
+  if (!outside) s.count(PipelineStatistic::ClipperPrimitives);
+}
+
 // One pixel for a point (the pixel its position falls in).
 void draw_point(const DrawState& s, const ClipVertex& a) {
   const uint32_t varyings = s.pipeline->desc().varying_count;
+  count_clipped(s, &a, 1);
   s.select_layer(a.layer);
   if (a.position.z < 0 || !(a.position.w > 1e-9f)) return;
   const ScreenVertex v = to_screen(s, a, varyings);
@@ -1189,6 +1212,8 @@ void draw_line(const DrawState& s, const ClipVertex& a, const ClipVertex& b) {
   const uint32_t varyings = s.pipeline->desc().varying_count;
   s.select_layer(a.layer);
   ClipVertex p = a, q = b;
+  const ClipVertex ends[2] = {a, b};
+  count_clipped(s, ends, 2);
   if (p.position.z < 0 && q.position.z < 0) return;
   if (p.position.z < 0) p = mix(p, q, p.position.z / (p.position.z - q.position.z), varyings);   // (the near plane)
   else if (q.position.z < 0) q = mix(p, q, p.position.z / (p.position.z - q.position.z), varyings);
@@ -1219,6 +1244,7 @@ void draw_triangle(const DrawState& s, const ClipVertex& a, const ClipVertex& b,
   const uint32_t varyings = s.pipeline->desc().varying_count;
   s.select_layer(a.layer);
   ClipVertex in[3] = {a, b, c};
+  count_clipped(s, in, 3);
   ClipVertex poly[4];
   uint32_t n = 0;
   for (uint32_t i = 0; i < 3; ++i) {
@@ -1285,7 +1311,7 @@ ClipVertex run_vertex_shader(const SoftwarePipeline& pipeline, const VertexStrea
 // in every one of them is dropped and closes them. False if it was not written.
 bool store_stream_output_primitive(const DrawState& s, uint32_t stream, uint32_t used_buffers, const ClipVertex* vertex, uint32_t count) {
   const GraphicsPipelineDesc& pd = s.pipeline->desc();
-  if (s.so_counts) ++s.so_counts[2 * stream + 1];
+  if (s.counters) ++s.counters->so[2 * stream + 1];
   if (!used_buffers) return false;
   bool overflow = false;
   for (uint32_t b = 0; b < kMaxStreamOutputBuffers; ++b)
@@ -1295,7 +1321,7 @@ bool store_stream_output_primitive(const DrawState& s, uint32_t stream, uint32_t
       if (used_buffers >> b & 1) s.stream_output[b].closed = true;
     return false;
   }
-  if (s.so_counts) ++s.so_counts[2 * stream];
+  if (s.counters) ++s.counters->so[2 * stream];
   for (uint32_t k = 0; k < count; ++k) {
     for (uint32_t b = 0; b < kMaxStreamOutputBuffers; ++b) {
       if (!(used_buffers >> b & 1)) continue;
@@ -1332,7 +1358,7 @@ void capture_stream_output(const DrawState& s, const ShaderModuleDesc& md, const
   const uint32_t need = topology == GeometryTopology::PointList ? 1 : topology == GeometryTopology::LineStrip ? 2 : 3;
   for (uint32_t stream = 0; stream < md.geometry_streams && stream < kMaxGeometryStreams; ++stream) {
     const uint32_t used_buffers = stream_output_buffers_of(pd, stream);   // (bit n: buffer n gets this stream)
-    if (!used_buffers && !s.so_counts) continue;
+    if (!used_buffers && !s.counters) continue;
     uint32_t strip[kMaxGeometryVertices];
     uint32_t strip_length = 0;   // the vertices of this stream's strip so far (all of them for a list of points)
     for (uint32_t i = 0; i < output.count; ++i) {
@@ -1375,10 +1401,26 @@ void capture_stream_output_primitive(const DrawState& s, const ClipVertex* verte
   store_stream_output_primitive(s, 0, stream_output_buffers_of(pd, 0), vertex, count);
 }
 
+// The primitives a geometry shader's output makes, on all its streams (several streams are lists of points; one is strips or points).
+uint64_t geometry_primitives(const ShaderModuleDesc& md, const GeometryOutputData& output) {
+  const GeometryTopology topology = md.geometry_streams > 1 ? GeometryTopology::PointList : md.geometry_output;
+  if (topology == GeometryTopology::PointList) return output.count;
+  const uint32_t need = topology == GeometryTopology::LineStrip ? 2 : 3;
+  uint64_t primitives = 0;
+  uint32_t strip = 0;
+  for (uint32_t i = 0; i < output.count; ++i) {
+    if (output.restart[i]) strip = 0;
+    if (++strip >= need) ++primitives;
+  }
+  return primitives;
+}
+
 void run_geometry_instance(const DrawState& s, const ShaderModuleDesc& md, const GeometryInputData& input) {
   GeometryOutputData output;
   md.geometry_function(input, s.constants, &output);
   if (output.count > md.geometry_max_vertices) output.count = md.geometry_max_vertices;
+  s.count(PipelineStatistic::GsInvocations);
+  s.count(PipelineStatistic::GsPrimitives, geometry_primitives(md, output));
   capture_stream_output(s, md, output);
   // (with stream output only the stream that is rasterized is drawn, if any)
   const int32_t drawn_stream = s.pipeline->desc().stream_output_count ? s.pipeline->desc().rasterized_stream : 0;
@@ -1440,6 +1482,7 @@ void run_tessellation(allocators::IAllocator& allocator, const DrawState& s, Tes
     for (uint32_t i = 0; i < kMaxVaryings; ++i) input.varying[k][i] = v[k].varying[i];
   }
   HullOutputData patch;
+  s.count(PipelineStatistic::HsInvocations);
   hd.hull_function(input, s.constants, &patch);
   patch.storage = s.storage;
   if (!tessellator.tessellate(hd.tess_domain, hd.tess_partitioning, hd.tess_output, patch.outer, patch.inner)) return;
@@ -1466,6 +1509,7 @@ void run_tessellation(allocators::IAllocator& allocator, const DrawState& s, Tes
     if (once && have[index]) return kept[index];
     const Tessellator::Point p = points[index];
     ShaderIo io;
+    s.count(PipelineStatistic::DsInvocations);
     ds(patch, p.u, p.v, triangles ? 1.0f - p.u - p.v : 0.0f, s.constants, &io);
     ClipVertex c;
     c.position = io.position;
@@ -1644,13 +1688,16 @@ bool SoftwareDevice::submit(ICommandBuffer* commands) {
   StorageImageSet images;
   s.images = &images;
   DrawState::StreamOutputTarget stream_output[kMaxStreamOutputBuffers];
-  uint64_t query_samples = 0;
-  uint32_t query_slot = 0;
-  QueryKind query_kind = QueryKind::Occlusion;
-  uint32_t query_stream = 0;
-  uint64_t so_counts[2 * kMaxGeometryStreams] = {};
-  uint64_t stat_ia_vertices = 0, stat_ia_primitives = 0, stat_vs = 0, stat_ps = 0;   // (what the draws since the query began did)
-  bool query_open = false;
+  // The queries: what the commands so far did, and each open query's slot, kind and what the counts were when it began.
+  QueryCounters counters;
+  s.counters = &counters;
+  struct OpenQuery {
+    uint32_t slot;
+    QueryKind kind;
+    uint32_t stream;
+    QueryCounters at_begin;
+  };
+  List<OpenQuery> open_queries(allocator_);
   IBuffer* vertex_buffers[kMaxVertexBuffers] = {};
   uint64_t vertex_offsets[kMaxVertexBuffers] = {};
   IBuffer* index_buffer = nullptr;
@@ -1729,7 +1776,6 @@ bool SoftwareDevice::submit(ICommandBuffer* commands) {
         break;
       }
       case RecordedCommand::Type::EndRenderPass:
-        if (query_open) return false;
         in_pass = false;
         break;
       case RecordedCommand::Type::Resolve: {
@@ -1851,6 +1897,7 @@ bool SoftwareDevice::submit(ICommandBuffer* commands) {
         if (gx > kMaxDispatchGroups || gy > kMaxDispatchGroups || gz > kMaxDispatchGroups) return false;
         const uint64_t threads_per_group = uint64_t{compute->group(0)} * compute->group(1) * compute->group(2);
         if (uint64_t{gx} * gy * gz * threads_per_group > kMaxDispatchThreads) return false;
+        s.count(PipelineStatistic::CsInvocations, uint64_t{gx} * gy * gz * threads_per_group);
         ComputeContext context;
         for (uint32_t k = 0; k < kMaxStorageBuffers; ++k) context.buffers[k] = storage[k];
         context.textures = &s.textures;   // (bound outside the passes as well)
@@ -1875,41 +1922,48 @@ bool SoftwareDevice::submit(ICommandBuffer* commands) {
             }
         break;
       }
-      case RecordedCommand::Type::BeginQuery:
-        if (!in_pass || query_open) return false;
-        if ((cmd.count & 0xFF) > static_cast<uint32_t>(QueryKind::TimestampDisjoint)) return false;
-        query_open = true;
-        query_slot = cmd.unit;
-        query_kind = static_cast<QueryKind>(cmd.count & 0xFF);
-        query_stream = cmd.count >> 8 & 3;
-        query_samples = stat_ia_vertices = stat_ia_primitives = stat_vs = stat_ps = 0;
-        for (uint64_t& n : so_counts) n = 0;
-        s.samples = &query_samples;
-        s.ps_invocations = &stat_ps;
-        s.so_counts = so_counts;
+      case RecordedCommand::Type::BeginQuery: {
+        const uint32_t kind = cmd.count & 0xFF;
+        if (kind > static_cast<uint32_t>(QueryKind::PipelineStatistics) || cmd.unit >= kMaxOcclusionQueries) return false;
+        for (const OpenQuery& q : open_queries.view())
+          if (q.slot == cmd.unit) return false;   // (a slot is begun once)
+        if (!open_queries.push_back({cmd.unit, static_cast<QueryKind>(kind), cmd.count >> 8 & 3, counters})) return false;
         break;
-      case RecordedCommand::Type::EndQuery:
-        if (!query_open) return false;
-        query_open = false;
-        s.samples = nullptr;
-        s.ps_invocations = nullptr;
-        s.so_counts = nullptr;
-        if (query_kind == QueryKind::Timestamp) {
-          recorder.set_occlusion_result(query_slot, clock_ ? clock_(clock_context_) : (counted_ns_ += 1000));
-          break;
+      }
+      case RecordedCommand::Type::EndQuery: {
+        // (the query of the slot named, or the one begun last)
+        uint64_t at = open_queries.count();
+        for (uint64_t k = 0; k < open_queries.count(); ++k)
+          if (cmd.count == 0 || open_queries[k].slot == cmd.unit) at = k;
+        if (at == open_queries.count()) return false;
+        const OpenQuery q = open_queries[at];
+        if (!open_queries.remove_at(at)) return false;
+        const QueryCounters& b = q.at_begin;
+        auto statistic = [&](PipelineStatistic which) { return counters.statistics[static_cast<uint32_t>(which)] - b.statistics[static_cast<uint32_t>(which)]; };
+        switch (q.kind) {
+          case QueryKind::Timestamp: recorder.set_occlusion_result(q.slot, clock_ ? clock_(clock_context_) : (counted_ns_ += 1000)); break;
+          case QueryKind::TimestampFrequency: recorder.set_occlusion_result(q.slot, 1000000000u); break;
+          case QueryKind::TimestampDisjoint:
+            recorder.set_occlusion_result(q.slot, interrupted ? 1u : 0u);
+            disjoint_asked = true;
+            break;
+          case QueryKind::SoPrimitivesWritten: recorder.set_occlusion_result(q.slot, counters.so[2 * q.stream] - b.so[2 * q.stream]); break;
+          case QueryKind::SoPrimitivesNeeded: recorder.set_occlusion_result(q.slot, counters.so[2 * q.stream + 1] - b.so[2 * q.stream + 1]); break;
+          case QueryKind::Occlusion: recorder.set_occlusion_result(q.slot, counters.samples - b.samples); break;
+          case QueryKind::OcclusionPredicate: recorder.set_occlusion_result(q.slot, counters.samples != b.samples ? 1u : 0u); break;
+          case QueryKind::IaVertices: recorder.set_occlusion_result(q.slot, statistic(PipelineStatistic::IaVertices)); break;
+          case QueryKind::IaPrimitives: recorder.set_occlusion_result(q.slot, statistic(PipelineStatistic::IaPrimitives)); break;
+          case QueryKind::VsInvocations: recorder.set_occlusion_result(q.slot, statistic(PipelineStatistic::VsInvocations)); break;
+          case QueryKind::PsInvocations: recorder.set_occlusion_result(q.slot, statistic(PipelineStatistic::PsInvocations)); break;
+          case QueryKind::PipelineStatistics: {
+            uint64_t values[kPipelineStatisticCount];
+            for (uint32_t k = 0; k < kPipelineStatisticCount; ++k) values[k] = counters.statistics[k] - b.statistics[k];
+            recorder.set_query_values(q.slot, ArrayView<const uint64_t>(values));
+            break;
+          }
         }
-        if (query_kind == QueryKind::TimestampFrequency || query_kind == QueryKind::TimestampDisjoint) {
-          recorder.set_occlusion_result(query_slot, query_kind == QueryKind::TimestampFrequency ? 1000000000u : interrupted ? 1u : 0u);
-          disjoint_asked = disjoint_asked || query_kind == QueryKind::TimestampDisjoint;
-          break;
-        }
-        if (query_kind == QueryKind::SoPrimitivesWritten || query_kind == QueryKind::SoPrimitivesNeeded) {
-          recorder.set_occlusion_result(query_slot, so_counts[2 * query_stream + (query_kind == QueryKind::SoPrimitivesNeeded ? 1 : 0)]);
-          break;
-        }
-        recorder.set_occlusion_result(query_slot, query_kind == QueryKind::Occlusion ? query_samples : query_kind == QueryKind::OcclusionPredicate ? (query_samples ? 1u : 0u) : query_kind == QueryKind::IaVertices ? stat_ia_vertices
-                                                                                                                              : query_kind == QueryKind::IaPrimitives ? stat_ia_primitives : query_kind == QueryKind::VsInvocations ? stat_vs : stat_ps);
         break;
+      }
       case RecordedCommand::Type::BindPipeline:
         s.pipeline = static_cast<const SoftwarePipeline*>(cmd.pipeline);
         break;
@@ -2013,7 +2067,7 @@ bool SoftwareDevice::submit(ICommandBuffer* commands) {
           context.instance_id = cmd.first_instance + instance;
           context.storage = s.storage;
           context.textures = &s.textures;
-          ++stat_vs;
+          s.count(PipelineStatistic::VsInvocations);
           *out = run_vertex_shader(*s.pipeline, streams, static_cast<uint64_t>(v), cmd.first_instance, instance, s.constants, context);
           return true;
         };
@@ -2034,8 +2088,8 @@ bool SoftwareDevice::submit(ICommandBuffer* commands) {
           const GeometryPrimitive taken = geometry->desc().geometry_input;
           if (taken != (per_primitive == 6 ? GeometryPrimitive::TriangleAdjacency : per_primitive == 4 ? GeometryPrimitive::LineAdjacency : per_primitive == 3 ? GeometryPrimitive::Triangle : per_primitive == 2 ? GeometryPrimitive::Line : GeometryPrimitive::Point)) return false;
         }
-        stat_ia_vertices += uint64_t{cmd.count} * instances;
-        stat_ia_primitives += uint64_t{cmd.count / per_primitive} * instances;
+        s.count(PipelineStatistic::IaVertices, uint64_t{cmd.count} * instances);
+        s.count(PipelineStatistic::IaPrimitives, uint64_t{cmd.count / per_primitive} * instances);
         // (the tessellator's room is taken once for the draw)
         TessellatorHolder tessellator(allocator_, patches);
         if (patches && !tessellator.valid()) return false;
@@ -2066,7 +2120,7 @@ bool SoftwareDevice::submit(ICommandBuffer* commands) {
   }
   for (DrawState::StreamOutputTarget& target : stream_output) remember_filled(target);
   if (disjoint_asked) clock_interrupted_ = false;
-  return !in_pass;
+  return !in_pass && open_queries.count() == 0;
 }
 
 bool SoftwareDevice::present(IImage* image) {

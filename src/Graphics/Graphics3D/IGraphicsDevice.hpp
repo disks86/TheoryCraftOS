@@ -673,7 +673,12 @@ enum class IndexType : uint8_t { Uint16, Uint32 };
 
 // What the vertices of a draw make (set_primitive_topology, DeviceFeature kFeatureLines for anything but triangles). Lines and points are one pixel wide.
 enum class ResolveMode : uint8_t { Average, Sample0, Min, Max };
-enum class QueryKind : uint8_t { Occlusion, OcclusionPredicate, IaVertices, IaPrimitives, VsInvocations, PsInvocations, Timestamp, SoPrimitivesWritten, SoPrimitivesNeeded, TimestampFrequency, TimestampDisjoint };
+enum class QueryKind : uint8_t { Occlusion, OcclusionPredicate, IaVertices, IaPrimitives, VsInvocations, PsInvocations, Timestamp, SoPrimitivesWritten, SoPrimitivesNeeded, TimestampFrequency, TimestampDisjoint,
+                                 PipelineStatistics };
+// The values of a PipelineStatistics query (ICommandBuffer::query_value), in Direct3D's order (D3D11_QUERY_DATA_PIPELINE_STATISTICS, Gallium's pipe_query_data_pipeline_statistics).
+enum class PipelineStatistic : uint8_t { IaVertices, IaPrimitives, VsInvocations, GsInvocations, GsPrimitives, ClipperInvocations, ClipperPrimitives, PsInvocations, HsInvocations, DsInvocations, CsInvocations };
+constexpr uint32_t kPipelineStatisticCount = 11;
+constexpr uint32_t kMaxQueryValues = kPipelineStatisticCount;   // (the most values one query has)
 enum class PrimitiveTopology : uint8_t { TriangleList, LineList, PointList, PatchList, LineListAdjacency, TriangleListAdjacency };   // (the adjacency lists need a geometry shader that takes them)   // (PatchList: kFeatureTessellation, with set_patch_control_points)
 
 struct Viewport {
@@ -681,8 +686,8 @@ struct Viewport {
   float min_depth = 0, max_depth = 1;
 };
 
-// The occlusion queries one command buffer can hold (kFeatureOcclusionQueries): slots 0 .. kMaxOcclusionQueries - 1.
-constexpr uint32_t kMaxOcclusionQueries = 64;
+// The queries one command buffer can hold (kFeatureOcclusionQueries): slots 0 .. kMaxOcclusionQueries - 1.
+constexpr uint32_t kMaxOcclusionQueries = 256;
 
 struct RenderPassBegin {
   IImage* color = nullptr;
@@ -750,27 +755,39 @@ class ICommandBuffer {
   // Storage images (kFeature2StorageImages; inside a pass kFeature2StorageImagesInDraws, for pixel shaders): makes `view` of `image` (a kImageStorage image; nullptr unbinds) slot
   // 0 .. kMaxStorageImages - 1 for the dispatches and draws that follow. What the shaders write is in the image after the submit. A device without the feature ignores it.
   virtual void bind_storage_image(uint32_t slot, IImage* image, const StorageImageView& view) { (void)slot, (void)image, (void)view; }
-  // Occlusion queries (kFeatureOcclusionQueries), inside a render pass: from begin to end, the fragments that pass the stencil and depth tests (and that the shader did not
-  // discard) are counted - one per pixel, however many targets the pipeline writes and whatever the blending or write masks do. `slot` (below kMaxOcclusionQueries) names the result; one query is open at a time and
-  // it ends before the pass does. A device without the feature ignores both.
+  // Queries (kFeatureOcclusionQueries). Occlusion counts, from begin to end, the fragments that pass the stencil and depth tests (and that the shader did not discard) - one per sample, however
+  // many targets the pipeline writes and whatever the blending or write masks do. `slot` (below kMaxOcclusionQueries, each used once in a command buffer) names the result. Any number of queries
+  // may be open at once, of one kind or of several, nested or overlapping, begun and ended inside or outside render passes (what the draws and dispatches between begin and end did counts, and
+  // nothing else: clears, copies, resolves and mipmaps do not); every query begun is ended before end(). A device without the feature ignores them.
   virtual void begin_occlusion_query(uint32_t slot) { (void)slot; }
-  // The other queries (kFeatureStatisticsQueries), begun and ended the same way and read with occlusion_result: OcclusionPredicate is 1 if any fragment passed, else 0; IaVertices the vertices
+  // The other queries (kFeatureStatisticsQueries), read with query_value: OcclusionPredicate is 1 if any fragment passed, else 0; IaVertices the vertices
   // the draws between begin and end took (a draw of n vertices and i instances: n * i), IaPrimitives the primitives they assembled (a patch is a primitive), VsInvocations the vertex shader
   // runs (a device may run it fewer times than there are vertices, by reusing results) and PsInvocations the fragment shader runs (a device may shade more pixels than it writes).
   // Timestamp (kFeatureTimestampQueries): the time the query ends, in nanoseconds of a clock that never goes back (the software rasterizer's is a count that goes up by 1000 for each timestamp, unless the
   // kernel gives it a clock). TimestampFrequency (kFeatureTimestampQueries) is the ticks a second of the timestamps (1000000000: they are nanoseconds) and TimestampDisjoint 1 if the clock was
   // interrupted (a frequency change, a reset) while the query was open, else 0: a device that cannot tell says 0. Neither needs a draw. SoPrimitivesWritten / SoPrimitivesNeeded (kFeatureStatisticsQueries with kFeatureStreamOutput), of the output stream `stream`: the primitives the draws between begin and
-  // end wrote to stream output buffers, and those the geometry shader made for that stream, whether or not they fit.
+  // end wrote to stream output buffers, and those the geometry shader made for that stream, whether or not they fit. PipelineStatistics has kPipelineStatisticCount values (PipelineStatistic):
+  // the vertices and primitives assembled, the vertex shader runs, the geometry shader runs (once for each primitive and instance it takes) and the primitives it made (on every stream), the
+  // primitives given to the clipper and those that came out of it (not wholly outside the view volume), the fragment shader runs, the hull shader runs (one a patch), the domain shader runs and
+  // the compute shader threads the dispatches ran.
   virtual void begin_query(uint32_t slot, QueryKind kind, uint32_t stream = 0) {
     (void)stream;
     if (kind == QueryKind::Occlusion) begin_occlusion_query(slot);
   }
+  // Ends the query most recently begun that is still open.
   virtual void end_occlusion_query() {}
+  // Ends the open query of `slot`.
+  virtual void end_query(uint32_t slot) {
+    (void)slot;
+    end_occlusion_query();
+  }
   // After submit(): the count of a query that was begun and ended (false for a slot that was not).
   virtual bool occlusion_result(uint32_t slot, uint64_t* samples) const {
     (void)slot, (void)samples;
     return false;
   }
+  // After submit(): value `index` of a query's result (index 0 is occlusion_result; a PipelineStatistics query has kPipelineStatisticCount). False for a slot not begun and ended, or past its values.
+  virtual bool query_value(uint32_t slot, uint32_t index, uint64_t* value) const { return index == 0 && occlusion_result(slot, value); }
   // False if recording failed (out of memory, or a command used a resource wrongly).
   virtual bool end() = 0;
 

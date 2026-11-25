@@ -73,7 +73,7 @@ UINT WINAPI TcosD3D12GlobalShare(struct ID3D12Resource *resource);
 HRESULT WINAPI TcosD3D12OpenShared(struct ID3D12Device *device, HANDLE handle, int global, REFIID riid, void **out);
 /* Begins a query of one of the kernel's kinds (graphics::QueryKind, docs/Direct3DKernelMode.md "More queries": 0 occlusion count, 1 occlusion predicate, 5 pixel
  * shader invocations, 8 | stream << 8 stream output primitives needed, ...) in slot `index` of an occlusion query heap; ID3D12GraphicsCommandList::EndQuery with
- * D3D12_QUERY_TYPE_OCCLUSION ends it, and ResolveQueryData gives its 64-bit result. One query is open at a time. */
+ * D3D12_QUERY_TYPE_OCCLUSION ends it, and ResolveQueryData gives its 64-bit result. Kinds of one 64-bit value only (0 .. 10); it may be open with any other queries. */
 struct ID3D12GraphicsCommandList;
 struct ID3D12QueryHeap;
 void WINAPI TcosD3D12BeginQueryKind(struct ID3D12GraphicsCommandList *list, struct ID3D12QueryHeap *heap, UINT index, UINT kind);

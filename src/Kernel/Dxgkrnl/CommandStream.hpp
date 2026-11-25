@@ -39,9 +39,18 @@
 //   DrawIndexed      index_count, first_index, vertex_offset (signed)
 //   CopyRegion       dst_index, dst_x, dst_y, src_index, src_x, src_y, width, height   (colour images of one format; also staging memory)
 //   GenerateMipmaps  allocation_index
-//   BeginQuery       allocation_index, offset [, kind]   (kind: a graphics::QueryKind, 0 occlusion count if left out, 1 occlusion predicate, 2 IA vertices, 3 IA primitives, 4 VS invocations, 5 PS invocations, 6 timestamp (kFeatureTimestampQueries; ns, read when the query ends),
-//                    7 / 8 stream output primitives written / needed (both kFeatureStatisticsQueries and kFeatureStreamOutput; bits 8-9 of the kind word say which output stream); the others need kFeatureStatisticsQueries. An occlusion query, the adapter's kFeatureOcclusionQueries: inside a pass; the allocation is a kAllocQueryResult buffer and `offset` a multiple of 8
-//                    with 8 bytes room. One query is open at a time and it ends before the pass does; at most kMaxOcclusionQueries per stream)
+//   BeginQuery       allocation_index, offset [, kind]   (kind, bits 0-7: a graphics::QueryKind, 0 occlusion count if left out, 1 occlusion predicate, 2 IA vertices, 3 IA primitives, 4 VS invocations,
+//                    5 PS invocations, 6 timestamp (kFeatureTimestampQueries; ns, read when the query ends), 7 / 8 stream output primitives written / needed (both kFeatureStatisticsQueries and
+//                    kFeatureStreamOutput; bits 8-9 of the kind word say which output stream), 9 timestamp frequency, 10 timestamp disjoint (kFeatureTimestampQueries), 11 pipeline statistics
+//                    (D3D11_QUERY_DATA_PIPELINE_STATISTICS / D3D12_QUERY_DATA_PIPELINE_STATISTICS: eleven 64-bit values, graphics::PipelineStatistic), 12 kQueryKindPipelineStatistics1
+//                    (D3D12_QUERY_DATA_PIPELINE_STATISTICS1: the eleven and the amplification and mesh shader invocations and mesh primitives, 0: there are no such stages), 13
+//                    kQueryKindSoStatistics (D3D12_QUERY_DATA_SO_STATISTICS of the output stream in bits 8-9: the primitives written, then those needed; like 7 and 8); the others need
+//                    kFeatureStatisticsQueries. Bit 16, kQueryAccumulate: the counts are added to what the place holds (a predicate or the disjoint flag: 1 if either is not 0) instead of
+//                    replacing it - a query that goes on from an earlier stream (not for 6 and 9). Every query needs the adapter's kFeatureOcclusionQueries; the allocation is a
+//                    kAllocQueryResult buffer and `offset` a multiple of 8 with room for the result (8 bytes a value). Any number of queries may be open at once, of one kind or of several,
+//                    nested or overlapping, inside passes and outside: each counts the draws and dispatches of every pass between its BeginQuery and its EndQuery (a clear, copy, resolve or
+//                    mipmap counts nothing). Two open queries do not write the same bytes, and every query begun is ended in the stream. A stream's queries take at most
+//                    kMaxOcclusionQueries device queries: kind 13 takes two, the others one)
 //   SetStreamOutput  slot, allocation_index (kNoAllocation: none), offset   (the buffer the pipeline's stream output declaration puts buffer `slot` in: a kAllocStreamOutput buffer, offset a multiple of 4 or kStreamOutputAppendOffset; anywhere,
 //                    the adapter's kFeatureStreamOutput)
 //   SetRootSignature root signature handle   (Direct3D 12 binding: forgets the root arguments; the draws and dispatches that follow bind textures, storage buffers and constants from them: see D3d12.hpp)
@@ -109,13 +118,19 @@
 //                    allocation, a level it has and layers it has (an array's layers, a volume's slices); the view's Format, 0 (or left out) the allocation's
 //                    own, another wide format of the same pixel size for a wide allocation. Outside a pass, and in one with the adapter's kFeature2StorageImagesInDraws;
 //                    kAllocationIndex kNoAllocation: none. What the shaders write is in the image after the dispatch or the draw)
-//   EndQuery         (the count of fragments that passed the depth and stencil tests since BeginQuery is written there - a little-endian 64-bit number - once the stream has run)
+//   EndQuery         [allocation_index, offset]   (ends the open query that writes there - with no words, the one begun last that is still open -; what it counted since its BeginQuery (for an
+//                    occlusion query the fragments that passed the depth and stencil tests: a little-endian 64-bit number a value) is written there once the stream has run)
 #pragma once
 #include "Kernel/Dxgkrnl/DxgTypes.hpp"
 #include <initializer_list>
 #include "Utility/ByteBuffer.hpp"
 
 namespace dxgk {
+
+// BeginQuery's kind word: bits 0-7 a graphics::QueryKind or one of these kinds of the kernel's own, bits 8-9 the output stream (stream output kinds), bit 16 kQueryAccumulate.
+constexpr uint32_t kQueryKindPipelineStatistics1 = 12;   // D3D12_QUERY_DATA_PIPELINE_STATISTICS1 (14 values)
+constexpr uint32_t kQueryKindSoStatistics = 13;          // D3D12_QUERY_DATA_SO_STATISTICS (2 values: written, needed)
+constexpr uint32_t kQueryAccumulate = 1u << 16;
 
 enum class Op : uint16_t {
   BeginPass = 1,
@@ -249,12 +264,14 @@ class CommandWriter {
     packet(Op::CopyRegion, {dst, dst_x, dst_y, src, src_x, src_y, width, height});
   }
   void generate_mipmaps(uint32_t allocation) { packet(Op::GenerateMipmaps, {allocation}); }
-  // `kind`: a graphics::QueryKind (0, the occlusion count, when it is left out: the packet then has two words)
+  // `kind`: the kind word (0, the occlusion count, when it is left out: the packet then has two words)
   void begin_query(uint32_t allocation, uint32_t offset = 0, uint32_t kind = 0) {
     if (kind == 0) packet(Op::BeginQuery, {allocation, offset});
     else packet(Op::BeginQuery, {allocation, offset, kind});
   }
+  // Ends the query begun last that is still open, or the open one that writes at `offset` of `allocation`.
   void end_query() { packet(Op::EndQuery, {}); }
+  void end_query(uint32_t allocation, uint32_t offset) { packet(Op::EndQuery, {allocation, offset}); }
   // Stream output buffer `slot` (below kMaxStreamOutputBuffers) is the kAllocStreamOutput allocation, written from `offset` (a multiple of 4; the draws that follow append); kNoAllocation unbinds it.
   // (`offset` kStreamOutputAppendOffset: where the last stream output into the buffer ended)
   void set_stream_output(uint32_t slot, uint32_t allocation, uint32_t offset = 0) { packet(Op::SetStreamOutput, {slot, allocation, offset}); }

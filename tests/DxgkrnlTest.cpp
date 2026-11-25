@@ -3360,17 +3360,30 @@ void test_occlusion_queries() {
     build(c);
     return c.ok() && e.render(c, {rt, rt2, ds, vb, far_vb, results}) == status::kInvalidParameter;
   };
-  CHECK(refused([&](CommandWriter& c) { c.begin_query(5, 0); }));                                                  // outside a pass
+  CHECK(refused([&](CommandWriter& c) { c.begin_query(5, 0); }));                                                  // never ended
+  CHECK(refused([&](CommandWriter& c) { c.begin_pass(0, kNoAllocation, 0, {}, 1, 0); c.begin_query(5, 0); c.end_pass(); }));   // still open at the end of the stream
   CHECK(refused([&](CommandWriter& c) { c.begin_pass(0, kNoAllocation, 0, {}, 1, 0); c.end_query(); c.end_pass(); }));       // never begun
-  CHECK(refused([&](CommandWriter& c) { c.begin_pass(0, kNoAllocation, 0, {}, 1, 0); c.begin_query(5, 0); c.end_pass(); }));   // still open at the end of the pass
-  CHECK(refused([&](CommandWriter& c) { c.begin_pass(0, kNoAllocation, 0, {}, 1, 0); c.begin_query(5, 0); c.begin_query(5, 8); c.end_query(); c.end_pass(); }));   // two at once
+  CHECK(refused([&](CommandWriter& c) { c.begin_query(5, 0); c.end_query(); c.end_query(); }));                           // ended twice
+  CHECK(refused([&](CommandWriter& c) { c.begin_query(5, 0); c.end_query(5, 8); c.end_query(); }));                      // ending a place no query writes
+  CHECK(refused([&](CommandWriter& c) { c.begin_query(5, 0); c.end_query(4, 0); c.end_query(); }));                      // ... of another allocation
+  CHECK(refused([&](CommandWriter& c) { c.begin_query(5, 0); c.end_query(9, 0); c.end_query(); }));                      // ... of none
+  CHECK(refused([&](CommandWriter& c) { c.begin_query(5, 8); c.begin_query(5, 8); c.end_query(); c.end_query(); }));     // two open queries writing one place
+  CHECK(refused([&](CommandWriter& c) { c.begin_query(5, 0, 11); c.begin_query(5, 40, 0); c.end_query(); c.end_query(); }));   // ... or overlapping (88 bytes from 0)
+  CHECK(refused([&](CommandWriter& c) { c.begin_query(5, 0, 1u << 8); c.end_query(); }));                               // a stream for a kind without one
+  CHECK(refused([&](CommandWriter& c) { c.begin_query(5, 0, 1u << 12); c.end_query(); }));                              // bits the kind word does not have
+  CHECK(refused([&](CommandWriter& c) { c.begin_query(5, 0, 14); c.end_query(); }));                                    // no such kind
+  CHECK(refused([&](CommandWriter& c) { c.begin_query(5, 0, 6 | kQueryAccumulate); c.end_query(); }));                  // a time is not added up
+  CHECK(refused([&](CommandWriter& c) { c.begin_query(5, 0, 9 | kQueryAccumulate); c.end_query(); }));
+  CHECK(refused([&](CommandWriter& c) { c.begin_query(5, 0, 11); c.end_query(); }));                                    // 88 bytes do not fit in 64
+  CHECK(refused([&](CommandWriter& c) { c.begin_query(5, 0, kQueryKindPipelineStatistics1); c.end_query(); }));
+  CHECK(refused([&](CommandWriter& c) { c.begin_query(5, 56, kQueryKindSoStatistics); c.end_query(); }));               // 16 bytes at 56 do not either
   CHECK(refused([&](CommandWriter& c) { c.begin_pass(0, kNoAllocation, 0, {}, 1, 0); c.begin_query(5, 4); c.end_query(); c.end_pass(); }));       // not a multiple of 8
   CHECK(refused([&](CommandWriter& c) { c.begin_pass(0, kNoAllocation, 0, {}, 1, 0); c.begin_query(5, 64); c.end_query(); c.end_pass(); }));      // past the end
   CHECK(refused([&](CommandWriter& c) { c.begin_pass(0, kNoAllocation, 0, {}, 1, 0); c.begin_query(5, 0xFFFFFFF8u); c.end_query(); c.end_pass(); }));
   CHECK(refused([&](CommandWriter& c) { c.begin_pass(0, kNoAllocation, 0, {}, 1, 0); c.begin_query(3, 0); c.end_query(); c.end_pass(); }));       // a vertex buffer
   CHECK(refused([&](CommandWriter& c) { c.begin_pass(0, kNoAllocation, 0, {}, 1, 0); c.begin_query(0, 0); c.end_query(); c.end_pass(); }));       // an image
   CHECK(refused([&](CommandWriter& c) { c.begin_pass(0, kNoAllocation, 0, {}, 1, 0); c.begin_query(9, 0); c.end_query(); c.end_pass(); }));       // no such allocation
-  // The limit: 64 queries are fine, a 65th is not.
+  // The limit: kMaxOcclusionQueries queries are fine, one more is not.
   {
     CommandWriter c(e.allocator);
     c.begin_pass(0, kNoAllocation, 0, {}, 1, 0);
@@ -3382,6 +3395,97 @@ void test_occlusion_queries() {
     for (uint32_t i = 0; i <= graphics::kMaxOcclusionQueries; ++i) c2.begin_query(5, 56), c2.end_query();
     c2.end_pass();
     CHECK(c2.ok() && e.render(c2, {rt, rt2, ds, vb, far_vb, results}) == status::kInvalidParameter);
+  }
+  // Several queries open at once, nested, across passes and a flush, ended by name or the last one open, and added to an earlier stream's.
+  {
+    AllocationDesc sd;
+    sd.flags = kAllocQueryResult, sd.size = 1024;
+    Handle stats = 0;
+    CHECK(e.kernel.create_allocation(kPid, e.dev, sd, &stats) == status::kSuccess);
+    const uint32_t kStatistics = static_cast<uint32_t>(graphics::QueryKind::PipelineStatistics), kPixels = static_cast<uint32_t>(graphics::QueryKind::PsInvocations);
+    const uint32_t kPredicate = static_cast<uint32_t>(graphics::QueryKind::OcclusionPredicate);
+    CommandWriter c(e.allocator);
+    c.begin_query(5, 0);                    // A: the samples of everything
+    c.begin_query(5, 8, kStatistics);       // B: 8 .. 96
+    c.begin_query(5, 96, kPixels);          // D
+    c.begin_query(5, 120, kPredicate);      // F: anything passed
+    c.begin_pass(0, 2, kPassClearColor | kPassClearDepth, {0, 0, 0, 1}, 1, 0);
+    c.bind_pipeline(pipe);
+    c.push_constants(floats(identity, 16));
+    c.bind_vertex_buffer(3);
+    c.draw(3);                              // 256
+    c.begin_query(5, 104);                  // C: the far triangle (fails the depth test)
+    c.begin_query(5, 112, kPredicate);      // E: the same, as a predicate
+    c.bind_vertex_buffer(4);
+    c.draw(3);
+    c.end_query(5, 104);
+    c.end_query();                          // (E: the last open)
+    c.end_pass();
+    c.copy_region(1, 0, 0, 0, 0, 0, 16, 16);   // (runs what came before: the open queries go on in the next command buffer)
+    c.begin_pass(1, 2, kPassClearColor | kPassClearDepth, {0, 0, 0, 1}, 1, 0);
+    c.bind_pipeline(pipe);
+    c.push_constants(floats(identity, 16));
+    c.bind_vertex_buffer(3);
+    c.set_scissor({0, 0, 8, 16});
+    c.draw(3);                              // 128
+    c.end_pass();
+    c.end_query(5, 8);
+    c.end_query(5, 96);
+    c.end_query(5, 120);
+    c.end_query();                          // (A)
+    CHECK(c.ok() && e.render(c, {rt, rt2, ds, vb, far_vb, stats}) == status::kSuccess);
+    CHECK(query_count(e, stats, 0) == 384 && query_count(e, stats, 13) == 0 && query_count(e, stats, 14) == 0 && query_count(e, stats, 15) == 1);
+    // (B: three draws of a triangle, each given to the clipper and not outside the view; no other stage)
+    const uint64_t pixels = query_count(e, stats, 12);
+    CHECK(pixels >= 384);
+    const uint64_t expect[11] = {9, 3, 9, 0, 0, 3, 3, pixels, 0, 0, 0};
+    for (uint32_t k = 0; k < 11; ++k) CHECK(query_count(e, stats, 1 + k) == expect[k]);
+
+    // Added to what the places hold: the samples of another full triangle, and a predicate that now passes.
+    CommandWriter more(e.allocator);
+    more.begin_query(5, 0, kQueryAccumulate);
+    more.begin_query(5, 112, kPredicate | kQueryAccumulate);
+    more.begin_query(5, 8, kStatistics | kQueryAccumulate);
+    more.begin_pass(0, 2, kPassClearColor | kPassClearDepth, {0, 0, 0, 1}, 1, 0);
+    more.bind_pipeline(pipe);
+    more.push_constants(floats(identity, 16));
+    more.bind_vertex_buffer(3);
+    more.draw(3);
+    more.end_pass();
+    more.end_query();
+    more.end_query();
+    more.end_query();
+    CHECK(more.ok() && e.render(more, {rt, rt2, ds, vb, far_vb, stats}) == status::kSuccess);
+    CHECK(query_count(e, stats, 0) == 640 && query_count(e, stats, 14) == 1 && query_count(e, stats, 1) == 12 && query_count(e, stats, 2) == 4);
+
+    // A strip is drawn as a list, but counted as Direct3D counts it: a quad of four vertices is four vertices, two primitives, four vertex shader runs. The kernel's own kinds:
+    // PipelineStatistics1 (the eleven values and three zeros).
+    Handle quad = e.buffer(kAllocVertexBuffer, 4 * 28);
+    const float q[28] = {-1, -1, 0.5f, 1, 0, 0, 1, 1, -1, 0.5f, 1, 0, 0, 1, -1, 1, 0.5f, 1, 0, 0, 1, 1, 1, 0.5f, 1, 0, 0, 1};
+    CHECK(e.write(quad, floats(q, 28)));
+    CommandWriter strip(e.allocator);
+    strip.begin_query(5, 200, kStatistics);
+    strip.begin_query(5, 304, kQueryKindPipelineStatistics1);
+    strip.begin_query(5, 416, static_cast<uint32_t>(graphics::QueryKind::IaVertices));
+    strip.begin_query(5, 424, static_cast<uint32_t>(graphics::QueryKind::VsInvocations));
+    strip.begin_query(5, 432);
+    strip.begin_pass(0, 2, kPassClearColor | kPassClearDepth, {0, 0, 0, 1}, 1, 0);
+    strip.bind_pipeline(pipe);
+    strip.push_constants(floats(identity, 16));
+    strip.bind_vertex_buffer(3);
+    strip.set_topology(Topology::TriangleStrip);
+    strip.draw(4);
+    strip.end_pass();
+    for (uint32_t k = 0; k < 5; ++k) strip.end_query();
+    CHECK(strip.ok() && e.render(strip, {rt, rt2, ds, quad, far_vb, stats}) == status::kSuccess);
+    CHECK(query_count(e, stats, 54) == 256);   // (the quad covers the target)
+    CHECK(query_count(e, stats, 52) == 4 && query_count(e, stats, 53) == 4);
+    const uint64_t strip_expect[11] = {4, 2, 4, 0, 0, 2, 2, query_count(e, stats, 25 + 7), 0, 0, 0};
+    for (uint32_t k = 0; k < 11; ++k) CHECK(query_count(e, stats, 25 + k) == strip_expect[k] && query_count(e, stats, 304 / 8 + k) == strip_expect[k]);
+    for (uint32_t k = 11; k < 14; ++k) CHECK(query_count(e, stats, 304 / 8 + k) == 0);
+    CHECK(strip_expect[7] >= 256);
+    e.kernel.destroy_allocation(kPid, quad);
+    e.kernel.destroy_allocation(kPid, stats);
   }
   // (a query buffer cannot be bound as a vertex buffer, whatever its size)
   CommandWriter bound(e.allocator);
@@ -4546,6 +4650,33 @@ void test_stream_output_extras() {
   CHECK(statistic(kWritten, 0) == 2 && statistic(kNeeded, 0) == 3 && statistic(kWritten, 1) == 3 && statistic(kNeeded, 1) == 3);
   CHECK(statistic(kNeeded, 2) == 0 && statistic(kNeeded, 3) == 0);   // (streams the shader does not write)
   {
+    // All at once: the kernel's SoStatistics of both streams (written, needed), the separate counts, and the pipeline statistics of the geometry shader's draw, over two passes.
+    Handle many = e.buffer(kAllocQueryResult, 512);
+    CommandWriter w(e.allocator);
+    w.begin_query(4, 0, kQueryKindSoStatistics);
+    w.begin_query(4, 16, kQueryKindSoStatistics | 1u << 8);
+    w.begin_query(4, 32, kWritten);
+    w.begin_query(4, 40, kNeeded);
+    w.begin_query(4, 48, static_cast<uint32_t>(graphics::QueryKind::PipelineStatistics));
+    for (uint32_t round = 0; round < 2; ++round) {
+      w.begin_pass(0, kNoAllocation, kPassClearColor, {0, 0, 0, 1}, 1, 0);
+      w.set_stream_output(0, 2, 0), w.set_stream_output(1, 3, 0);
+      w.bind_pipeline(pipe);
+      w.bind_vertex_buffer(1);
+      w.push_constants(floats(identity, 16));
+      w.draw(3);
+      w.end_pass();
+    }
+    for (uint32_t k = 0; k < 5; ++k) w.end_query();
+    CHECK(e.render(w, {target, vb, small0, full1, many}) == status::kSuccess);
+    CHECK(query_count(e, many, 0) == 4 && query_count(e, many, 1) == 6 && query_count(e, many, 2) == 6 && query_count(e, many, 3) == 6);
+    CHECK(query_count(e, many, 4) == 4 && query_count(e, many, 5) == 6);
+    // (two draws of one triangle: one geometry shader run each, which makes three points on each stream; nothing is rasterized)
+    const uint64_t expect[11] = {6, 2, 6, 2, 12, 0, 0, 0, 0, 0, 0};
+    for (uint32_t k = 0; k < 11; ++k) CHECK(query_count(e, many, 6 + k) == expect[k]);
+    e.kernel.destroy_allocation(kPid, many);
+  }
+  {
     // (a stream that does not exist, and a statistic of a stream other than the first for a kind that has one)
     CommandWriter w(e.allocator);
     w.begin_pass(0, kNoAllocation, kPassClearColor, {0, 0, 0, 1}, 1, 0);
@@ -4667,6 +4798,23 @@ void test_stream_output_extras() {
     CHECK(e.render(w, {target, vb, ds_out, vs_count}) == status::kSuccess);
     const uint64_t triangles = query_count(e, vs_count, 0);
     CHECK(triangles >= 4 && triangles <= 64);
+    // (the pipeline statistics of the patch: one hull shader run, a domain shader run for each point the tessellator made - at least the triangles' corners are shared -, three vertices)
+    Handle tess_stats = e.buffer(kAllocQueryResult, 88);
+    CommandWriter t(e.allocator);
+    t.begin_pass(0, kNoAllocation, kPassClearColor, {0, 0, 0, 1}, 1, 0);
+    t.set_stream_output(0, 2);
+    t.bind_pipeline(ds_pipe);
+    t.bind_vertex_buffer(1);
+    t.push_constants(floats(identity, 16));
+    t.set_topology(patch_list(3));
+    t.begin_query(3, 0, static_cast<uint32_t>(graphics::QueryKind::PipelineStatistics));
+    t.draw(3);
+    t.end_query();
+    t.end_pass();
+    CHECK(e.render(t, {target, vb, ds_out, tess_stats}) == status::kSuccess);
+    CHECK(query_count(e, tess_stats, 0) == 3 && query_count(e, tess_stats, 1) == 1 && query_count(e, tess_stats, 2) == 3 && query_count(e, tess_stats, 8) == 1);
+    CHECK(query_count(e, tess_stats, 9) >= 3 && query_count(e, tess_stats, 9) <= triangles * 3 && query_count(e, tess_stats, 3) == 0 && query_count(e, tess_stats, 5) == 0);
+    e.kernel.destroy_allocation(kPid, tess_stats);
     float f[64 * 12];
     CHECK(read_floats(ds_out, 64 * 12, f));
     for (uint64_t i = 0; i < triangles * 3; ++i) CHECK(f[4 * i + 3] == 1.0f && f[4 * i] >= -1.0f && f[4 * i] <= 1.0f && f[4 * i + 1] >= -1.0f && f[4 * i + 1] <= 1.0f);

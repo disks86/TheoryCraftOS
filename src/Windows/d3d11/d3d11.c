@@ -82,7 +82,7 @@ __asm__(".text\n.globl ___chkstk_ms\n___chkstk_ms:\n ret\n");
 #define PIPELINES 96u
 #define VERTEX_SLOTS 8u
 #define ACTIVE_QUERIES 32u            /* queries begun and not ended at once */
-#define MEASURES 2048u                /* the kernel's measurements one list holds (one a draw) */
+#define MEASURES 2048u                /* the kernel's measurements one list holds (query.inc: one a run of draws for the same active queries) */
 #define UAV_SLOTS 8u                  /* u0 .. u7: of the compute shader, and of the pixel shader beside its render targets (D3D11_PS_CS_UAV_REGISTER_COUNT) */
 #define KIND_BUFFER 0xFEu             /* Shader.tex_kind: t<n> is a raw or structured buffer */
 
@@ -243,8 +243,8 @@ typedef struct Sampler { StateObj s; D3D11_SAMPLER_DESC desc; } Sampler;
 #define STATE_DEPTH 1u
 #define STATE_RASTER 2u
 #define STATE_SAMPLER 3u
-/* A query or predicate (query.inc). What the kernel measures for it (the samples that passed, the pixel shader's invocations, the stream output's primitives) is
- * added up as each list runs; the pipeline statistics this library counts itself are added at each draw. */
+/* A query or predicate (query.inc). What the kernel measures for it (the samples that passed, the pipeline statistics, the stream output primitives written and needed of each
+ * stream) is added up as each list runs. */
 typedef struct Query {
   Child c;
   D3D11_QUERY_DESC desc;
@@ -254,7 +254,6 @@ typedef struct Query {
   UINT64 samples;
   D3D11_QUERY_DATA_PIPELINE_STATISTICS stats;
   UINT64 so_written[4], so_needed[4];
-  UINT64 so_filled_at_begin[4];               /* the bytes the stream output targets of each stream held at Begin (what was written is the growth) */
 } Query;
 
 typedef struct Pipeline {
@@ -394,14 +393,15 @@ struct Dev {
   UINT dirty;                              /* what the next draw has to set again (DIRTY_*) */
   Pipeline pipelines[PIPELINES];
   UINT pipeline_count, pipeline_clock;
-  /* the queries (query.inc): those begun and not ended; the kernel's measurements of the list's draws (one query of the kernel's at a time), into slots of
-   * `measure_heap`, read back through `measure_readback` once the list ran, and the queries each is for (references) */
+  /* the queries (query.inc): those begun and not ended; the kernel's measurements of the list's draws, into slots of the heaps of samples, pipeline statistics and
+   * stream output statistics (NULL: the adapter has none), read back through `measure_readback` once the list ran, and the queries each is for (references) */
   struct Query *active[ACTIVE_QUERIES];
   UINT active_count;
-  ID3D12QueryHeap *measure_heap;
+  ID3D12QueryHeap *measure_heap, *measure_stats_heap, *measure_so_heap;
   ID3D12Resource *measure_readback;
   struct Measure *measures;                /* MEASURES of them */
   UINT measure_count;
+  BOOL measure_open;                       /* the last of them is open (its queries begun on the list) */
   Buf *so_written[16];                     /* the stream output buffers the list has bound (references): where their records end is read when it has run */
   UINT so_written_count;
   PendingClear clears[8];                  /* depth clears a draw has not followed yet (Direct3D 12 here does them when the next pass begins) */

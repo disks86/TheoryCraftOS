@@ -1003,9 +1003,6 @@ static void test_queries(Scene *c) {
   CHECK_HR(ID3D12Device_CreateQueryHeap(dev, &qd, &IID_ID3D12QueryHeap, (void **)&occlusion));
   qd.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
   CHECK_HR(ID3D12Device_CreateQueryHeap(dev, &qd, &IID_ID3D12QueryHeap, (void **)&timestamps));
-  qd.Type = D3D12_QUERY_HEAP_TYPE_PIPELINE_STATISTICS;
-  ID3D12QueryHeap *stats = NULL;
-  CHECK(ID3D12Device_CreateQueryHeap(dev, &qd, &IID_ID3D12QueryHeap, (void **)&stats) == DXGI_ERROR_UNSUPPORTED && stats == NULL);
   ID3D12Resource *results = make_buffer(dev, D3D12_HEAP_TYPE_READBACK, 256, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);
   ID3D12GraphicsCommandList *list = NULL;
   CHECK_HR(ID3D12Device_CreateCommandList(dev, 0, D3D12_COMMAND_LIST_TYPE_DIRECT, c->allocator, c->pso, &IID_ID3D12GraphicsCommandList, (void **)&list));
@@ -1042,6 +1039,237 @@ static void test_queries(Scene *c) {
   ID3D12Resource_Release(results);
   ID3D12QueryHeap_Release(occlusion);
   ID3D12QueryHeap_Release(timestamps);
+}
+
+/* Every query type: several open at once and nested, across a clear and a copy, ended in any order; what the runtime ignores; ResolveQueryData of each type. */
+static void test_query_types(Scene *c) {
+  ID3D12Device *dev = c->dev;
+  ID3D12QueryHeap *occlusion = NULL, *stats = NULL, *stats1 = NULL, *so = NULL, *timestamps = NULL, *none = NULL;
+  D3D12_QUERY_HEAP_DESC qd = {D3D12_QUERY_HEAP_TYPE_OCCLUSION, 4, 0};
+  CHECK_HR(ID3D12Device_CreateQueryHeap(dev, &qd, &IID_ID3D12QueryHeap, (void **)&occlusion));
+  qd.Type = D3D12_QUERY_HEAP_TYPE_PIPELINE_STATISTICS;
+  CHECK_HR(ID3D12Device_CreateQueryHeap(dev, &qd, &IID_ID3D12QueryHeap, (void **)&stats));
+  qd.Type = D3D12_QUERY_HEAP_TYPE_PIPELINE_STATISTICS1;
+  CHECK_HR(ID3D12Device_CreateQueryHeap(dev, &qd, &IID_ID3D12QueryHeap, (void **)&stats1));
+  qd.Type = D3D12_QUERY_HEAP_TYPE_SO_STATISTICS;
+  CHECK_HR(ID3D12Device_CreateQueryHeap(dev, &qd, &IID_ID3D12QueryHeap, (void **)&so));
+  qd.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
+  CHECK_HR(ID3D12Device_CreateQueryHeap(dev, &qd, &IID_ID3D12QueryHeap, (void **)&timestamps));
+  qd.Type = (D3D12_QUERY_HEAP_TYPE)99;
+  CHECK(ID3D12Device_CreateQueryHeap(dev, &qd, &IID_ID3D12QueryHeap, (void **)&none) == E_INVALIDARG && !none);
+  qd.Type = D3D12_QUERY_HEAP_TYPE_OCCLUSION, qd.Count = 0;
+  CHECK(ID3D12Device_CreateQueryHeap(dev, &qd, &IID_ID3D12QueryHeap, (void **)&none) == E_INVALIDARG && !none);
+  qd.Type = D3D12_QUERY_HEAP_TYPE_COPY_QUEUE_TIMESTAMP, qd.Count = 2;
+  CHECK_HR(ID3D12Device_CreateQueryHeap(dev, &qd, &IID_ID3D12QueryHeap, (void **)&none));
+  D3D12_FEATURE_DATA_D3D12_OPTIONS3 o3;
+  D3D12_FEATURE_DATA_D3D12_OPTIONS9 o9;
+  CHECK_HR(ID3D12Device_CheckFeatureSupport(dev, D3D12_FEATURE_D3D12_OPTIONS3, &o3, sizeof o3));
+  CHECK_HR(ID3D12Device_CheckFeatureSupport(dev, D3D12_FEATURE_D3D12_OPTIONS9, &o9, sizeof o9));
+  CHECK(o3.CopyQueueTimestampQueriesSupported && !o9.MeshShaderPipelineStatsSupported);
+  ID3D12Resource *results = make_buffer(dev, D3D12_HEAP_TYPE_READBACK, 2048, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);
+  ID3D12Resource *scratch = make_buffer(dev, D3D12_HEAP_TYPE_DEFAULT, 256, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);
+  ID3D12GraphicsCommandList *list = NULL;
+  CHECK_HR(ID3D12Device_CreateCommandList(dev, 0, D3D12_COMMAND_LIST_TYPE_DIRECT, c->allocator, c->pso, &IID_ID3D12GraphicsCommandList, (void **)&list));
+  if (!occlusion || !stats || !stats1 || !so || !timestamps || !results || !scratch || !list) { CHECK(0); return; }
+  const float black[4] = {0, 0, 0, 1};
+  scene_begin(c, list, 1);
+  scene_state(c, list, ID3D12Resource_GetGPUVirtualAddress(c->vb));
+  ID3D12GraphicsCommandList_BeginQuery(list, occlusion, D3D12_QUERY_TYPE_OCCLUSION, 0);              /* the samples of all three draws */
+  ID3D12GraphicsCommandList_BeginQuery(list, stats, D3D12_QUERY_TYPE_PIPELINE_STATISTICS, 0);
+  ID3D12GraphicsCommandList_BeginQuery(list, stats1, D3D12_QUERY_TYPE_PIPELINE_STATISTICS1, 0);
+  ID3D12GraphicsCommandList_BeginQuery(list, occlusion, D3D12_QUERY_TYPE_BINARY_OCCLUSION, 1);
+  /* what the runtime ignores: a timestamp begun, a type the heap does not hold, a query begun twice, past the heap */
+  ID3D12GraphicsCommandList_BeginQuery(list, timestamps, D3D12_QUERY_TYPE_TIMESTAMP, 2);
+  ID3D12GraphicsCommandList_BeginQuery(list, stats, D3D12_QUERY_TYPE_OCCLUSION, 1);
+  ID3D12GraphicsCommandList_BeginQuery(list, occlusion, D3D12_QUERY_TYPE_OCCLUSION, 0);
+  ID3D12GraphicsCommandList_BeginQuery(list, occlusion, D3D12_QUERY_TYPE_OCCLUSION, 4);
+  ID3D12GraphicsCommandList_DrawInstanced(list, 3, 1, 0, 0);
+  ID3D12GraphicsCommandList_ClearRenderTargetView(list, c->rtv, black, 0, NULL);                         /* (a clear counts nothing) */
+  ID3D12GraphicsCommandList_BeginQuery(list, occlusion, D3D12_QUERY_TYPE_OCCLUSION, 2);              /* nested: the second draw alone */
+  ID3D12GraphicsCommandList_DrawInstanced(list, 3, 1, 0, 0);
+  ID3D12GraphicsCommandList_EndQuery(list, occlusion, D3D12_QUERY_TYPE_BINARY_OCCLUSION, 2);          /* (the wrong type: ignored) */
+  ID3D12GraphicsCommandList_EndQuery(list, occlusion, D3D12_QUERY_TYPE_OCCLUSION, 2);
+  ID3D12GraphicsCommandList_CopyBufferRegion(list, scratch, 0, c->vb, 0, 64);                           /* (nor a copy) */
+  ID3D12GraphicsCommandList_DrawInstanced(list, 3, 1, 0, 0);
+  ID3D12GraphicsCommandList_EndQuery(list, occlusion, D3D12_QUERY_TYPE_BINARY_OCCLUSION, 1);
+  ID3D12GraphicsCommandList_EndQuery(list, stats1, D3D12_QUERY_TYPE_PIPELINE_STATISTICS1, 0);
+  ID3D12GraphicsCommandList_EndQuery(list, occlusion, D3D12_QUERY_TYPE_OCCLUSION, 0);
+  ID3D12GraphicsCommandList_EndQuery(list, stats, D3D12_QUERY_TYPE_PIPELINE_STATISTICS, 0);
+  ID3D12GraphicsCommandList_EndQuery(list, occlusion, D3D12_QUERY_TYPE_OCCLUSION, 3);                 /* (never begun: nothing) */
+  ID3D12GraphicsCommandList_EndQuery(list, timestamps, D3D12_QUERY_TYPE_TIMESTAMP, 0);
+  ID3D12GraphicsCommandList_ResolveQueryData(list, occlusion, D3D12_QUERY_TYPE_OCCLUSION, 0, 1, results, 0);
+  ID3D12GraphicsCommandList_ResolveQueryData(list, occlusion, D3D12_QUERY_TYPE_BINARY_OCCLUSION, 1, 1, results, 8);
+  ID3D12GraphicsCommandList_ResolveQueryData(list, occlusion, D3D12_QUERY_TYPE_OCCLUSION, 2, 1, results, 16);
+  ID3D12GraphicsCommandList_ResolveQueryData(list, timestamps, D3D12_QUERY_TYPE_TIMESTAMP, 0, 1, results, 24);
+  ID3D12GraphicsCommandList_ResolveQueryData(list, stats, D3D12_QUERY_TYPE_PIPELINE_STATISTICS, 0, 1, results, 64);
+  ID3D12GraphicsCommandList_ResolveQueryData(list, stats1, D3D12_QUERY_TYPE_PIPELINE_STATISTICS1, 0, 1, results, 256);
+  /* what the runtime ignores: an offset not a multiple of 8, a type that is not the heap's, past the heap, past the buffer */
+  ID3D12GraphicsCommandList_ResolveQueryData(list, stats, D3D12_QUERY_TYPE_PIPELINE_STATISTICS, 0, 1, results, 1028);
+  ID3D12GraphicsCommandList_ResolveQueryData(list, occlusion, D3D12_QUERY_TYPE_TIMESTAMP, 0, 1, results, 1200);
+  ID3D12GraphicsCommandList_ResolveQueryData(list, occlusion, D3D12_QUERY_TYPE_OCCLUSION, 3, 2, results, 1300);
+  ID3D12GraphicsCommandList_ResolveQueryData(list, stats1, D3D12_QUERY_TYPE_PIPELINE_STATISTICS1, 0, 1, results, 2000);
+  scene_run(c, list);
+  const UINT64 *r = NULL;
+  CHECK_HR(ID3D12Resource_Map(results, 0, NULL, (void **)&r));
+  if (r) {
+    const D3D12_QUERY_DATA_PIPELINE_STATISTICS *ps = (const D3D12_QUERY_DATA_PIPELINE_STATISTICS *)(r + 8);
+    const D3D12_QUERY_DATA_PIPELINE_STATISTICS1 *ps1 = (const D3D12_QUERY_DATA_PIPELINE_STATISTICS1 *)(r + 32);
+    printf("query types: occlusion %llu, binary %llu, nested %llu, timestamp %llu\n", (unsigned long long)r[0], (unsigned long long)r[1], (unsigned long long)r[2], (unsigned long long)r[3]);
+    printf("query types: statistics IA %llu/%llu VS %llu GS %llu/%llu C %llu/%llu PS %llu HS %llu DS %llu CS %llu\n", (unsigned long long)ps->IAVertices, (unsigned long long)ps->IAPrimitives,
+           (unsigned long long)ps->VSInvocations, (unsigned long long)ps->GSInvocations, (unsigned long long)ps->GSPrimitives, (unsigned long long)ps->CInvocations,
+           (unsigned long long)ps->CPrimitives, (unsigned long long)ps->PSInvocations, (unsigned long long)ps->HSInvocations, (unsigned long long)ps->DSInvocations,
+           (unsigned long long)ps->CSInvocations);
+    CHECK(r[2] > 600 && r[2] < 2000 && r[0] == 3 * r[2] && r[1] == 1 && r[3] != 0);
+    CHECK(ps->IAVertices == 9 && ps->IAPrimitives == 3 && ps->VSInvocations == 9 && ps->GSInvocations == 0 && ps->GSPrimitives == 0);
+    CHECK(ps->CInvocations == 3 && ps->CPrimitives == 3 && ps->PSInvocations >= r[0] && ps->HSInvocations == 0 && ps->DSInvocations == 0 && ps->CSInvocations == 0);
+    CHECK(ps1->IAVertices == 9 && ps1->IAPrimitives == 3 && ps1->VSInvocations == 9 && ps1->CInvocations == 3 && ps1->CPrimitives == 3 && ps1->PSInvocations == ps->PSInvocations);
+    CHECK(ps1->ASInvocations == 0 && ps1->MSInvocations == 0 && ps1->MSPrimitives == 0 && ps1->HSInvocations == 0 && ps1->CSInvocations == 0);
+    int untouched = 1;
+    for (UINT i = 1024 / 8; i < 2048 / 8; ++i) untouched = untouched && r[i] == 0;
+    CHECK(untouched);
+    ID3D12Resource_Unmap(results, 0, NULL);
+  }
+
+  /* Stream output statistics of stream 0 (the vertex shader's COLOR captured): three triangles of 48 bytes each, into 128 bytes: two written, three needed. Stream 1 has none.
+   * The query goes on past the end of the list's chunk of a predicated draw. */
+  D3D12_SO_DECLARATION_ENTRY entry = {0, "COLOR", 0, 0, 4, 0};
+  UINT stride = 16;
+  D3D12_INPUT_ELEMENT_DESC layout[2] = {{"POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
+                                        {"COLOR", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 12, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0}};
+  D3D12_GRAPHICS_PIPELINE_STATE_DESC pd;
+  memset(&pd, 0, sizeof pd);
+  pd.pRootSignature = c->rs;
+  pd.VS.pShaderBytecode = dx_vs_dxbc;
+  pd.VS.BytecodeLength = sizeof dx_vs_dxbc;
+  pd.StreamOutput.pSODeclaration = &entry;
+  pd.StreamOutput.NumEntries = 1;
+  pd.StreamOutput.pBufferStrides = &stride;
+  pd.StreamOutput.NumStrides = 1;
+  pd.StreamOutput.RasterizedStream = D3D12_SO_NO_RASTERIZED_STREAM;
+  pd.SampleMask = 0xFFFFFFFFu;
+  pd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+  pd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+  pd.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+  pd.InputLayout.pInputElementDescs = layout;
+  pd.InputLayout.NumElements = 2;
+  pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+  pd.SampleDesc.Count = 1;
+  ID3D12PipelineState *pso = NULL;
+  CHECK_HR(ID3D12Device_CreateGraphicsPipelineState(dev, &pd, &IID_ID3D12PipelineState, (void **)&pso));
+  ID3D12Resource *target = make_buffer(dev, D3D12_HEAP_TYPE_DEFAULT, 128, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_STREAM_OUT);
+  ID3D12Resource *never = make_buffer(dev, D3D12_HEAP_TYPE_UPLOAD, 256, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ);
+  if (!pso || !target || !never) { CHECK(0); return; }
+  UINT64 *zero = NULL;
+  CHECK_HR(ID3D12Resource_Map(never, 0, NULL, (void **)&zero));
+  if (zero) { memset(zero, 0, 256); ID3D12Resource_Unmap(never, 0, NULL); }
+  CHECK_HR(ID3D12GraphicsCommandList_Reset(list, c->allocator, pso));
+  D3D12_STREAM_OUTPUT_BUFFER_VIEW view = {ID3D12Resource_GetGPUVirtualAddress(target), 128, 0};
+  D3D12_VIEWPORT vp = {0, 0, 64, 64, 0, 1};
+  D3D12_VERTEX_BUFFER_VIEW vbv = {ID3D12Resource_GetGPUVirtualAddress(c->vb), 256, 28};
+  ID3D12GraphicsCommandList_SetGraphicsRootSignature(list, c->rs);
+  ID3D12GraphicsCommandList_SetGraphicsRoot32BitConstants(list, 0, 16, kIdentity, 0);
+  ID3D12GraphicsCommandList_RSSetViewports(list, 1, &vp);
+  ID3D12GraphicsCommandList_IASetPrimitiveTopology(list, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+  ID3D12GraphicsCommandList_IASetVertexBuffers(list, 0, 1, &vbv);
+  ID3D12GraphicsCommandList_SOSetTargets(list, 0, 1, &view);
+  ID3D12GraphicsCommandList_BeginQuery(list, so, D3D12_QUERY_TYPE_SO_STATISTICS_STREAM0, 0);
+  ID3D12GraphicsCommandList_BeginQuery(list, so, D3D12_QUERY_TYPE_SO_STATISTICS_STREAM1, 1);
+  ID3D12GraphicsCommandList_BeginQuery(list, stats, D3D12_QUERY_TYPE_PIPELINE_STATISTICS, 1);
+  ID3D12GraphicsCommandList_BeginQuery(list, occlusion, D3D12_QUERY_TYPE_OCCLUSION, 3);
+  ID3D12GraphicsCommandList_DrawInstanced(list, 3, 1, 0, 0);
+  ID3D12GraphicsCommandList_DrawInstanced(list, 3, 1, 0, 0);
+  /* predicated: a draw that is left out (the value is zero), with the queries' End and their resolve in that stretch, which are not predicated */
+  ID3D12GraphicsCommandList_SetPredication(list, never, 0, D3D12_PREDICATION_OP_EQUAL_ZERO);
+  ID3D12GraphicsCommandList_DrawInstanced(list, 3, 1, 0, 0);
+  ID3D12GraphicsCommandList_SetPredication(list, never, 3, D3D12_PREDICATION_OP_NOT_EQUAL_ZERO);      /* (not a multiple of 8: ignored, the predicate stays) */
+  ID3D12GraphicsCommandList_DrawInstanced(list, 3, 1, 0, 0);
+  ID3D12GraphicsCommandList_EndQuery(list, occlusion, D3D12_QUERY_TYPE_OCCLUSION, 3);
+  ID3D12GraphicsCommandList_ResolveQueryData(list, occlusion, D3D12_QUERY_TYPE_OCCLUSION, 3, 1, results, 512);
+  ID3D12GraphicsCommandList_EndQuery(list, timestamps, D3D12_QUERY_TYPE_TIMESTAMP, 1);
+  ID3D12GraphicsCommandList_ResolveQueryData(list, timestamps, D3D12_QUERY_TYPE_TIMESTAMP, 1, 1, results, 520);
+  ID3D12GraphicsCommandList_SetPredication(list, NULL, 0, D3D12_PREDICATION_OP_EQUAL_ZERO);
+  ID3D12GraphicsCommandList_DrawInstanced(list, 3, 1, 0, 0);
+  ID3D12GraphicsCommandList_EndQuery(list, so, D3D12_QUERY_TYPE_SO_STATISTICS_STREAM0, 0);
+  ID3D12GraphicsCommandList_EndQuery(list, so, D3D12_QUERY_TYPE_SO_STATISTICS_STREAM1, 1);
+  ID3D12GraphicsCommandList_EndQuery(list, stats, D3D12_QUERY_TYPE_PIPELINE_STATISTICS, 1);
+  ID3D12GraphicsCommandList_ResolveQueryData(list, so, D3D12_QUERY_TYPE_SO_STATISTICS_STREAM0, 0, 2, results, 528);
+  ID3D12GraphicsCommandList_ResolveQueryData(list, stats, D3D12_QUERY_TYPE_PIPELINE_STATISTICS, 1, 1, results, 560);
+  scene_run(c, list);
+  CHECK_HR(ID3D12Resource_Map(results, 0, NULL, (void **)&r));
+  if (r) {
+    const D3D12_QUERY_DATA_SO_STATISTICS *s0 = (const D3D12_QUERY_DATA_SO_STATISTICS *)(r + 66), *s1 = s0 + 1;
+    const D3D12_QUERY_DATA_PIPELINE_STATISTICS *ps = (const D3D12_QUERY_DATA_PIPELINE_STATISTICS *)(r + 70);
+    printf("query types: stream 0 %llu written %llu needed, stream 1 %llu %llu, IA %llu, C %llu, PS %llu, samples %llu, time %llu\n", (unsigned long long)s0->NumPrimitivesWritten,
+           (unsigned long long)s0->PrimitivesStorageNeeded, (unsigned long long)s1->NumPrimitivesWritten, (unsigned long long)s1->PrimitivesStorageNeeded,
+           (unsigned long long)ps->IAVertices, (unsigned long long)ps->CInvocations, (unsigned long long)ps->PSInvocations, (unsigned long long)r[64], (unsigned long long)r[65]);
+    CHECK(s0->NumPrimitivesWritten == 2 && s0->PrimitivesStorageNeeded == 3 && s1->NumPrimitivesWritten == 0 && s1->PrimitivesStorageNeeded == 0);
+    CHECK(ps->IAVertices == 9 && ps->IAPrimitives == 3 && ps->VSInvocations == 9 && ps->CInvocations == 0 && ps->PSInvocations == 0);      /* (nothing is rasterized) */
+    CHECK(r[64] == 0 && r[65] != 0);
+    ID3D12Resource_Unmap(results, 0, NULL);
+  }
+  ID3D12GraphicsCommandList_Release(list);
+  ID3D12PipelineState_Release(pso);
+  ID3D12Resource_Release(target);
+  ID3D12Resource_Release(never);
+  ID3D12Resource_Release(results);
+  ID3D12Resource_Release(scratch);
+  ID3D12QueryHeap_Release(occlusion);
+  ID3D12QueryHeap_Release(stats);
+  ID3D12QueryHeap_Release(stats1);
+  ID3D12QueryHeap_Release(so);
+  ID3D12QueryHeap_Release(timestamps);
+  if (none) ID3D12QueryHeap_Release(none);
+}
+
+/* Timestamps on a copy list go into COPY_QUEUE_TIMESTAMP heaps (and nowhere else); a copy list runs no other query. */
+static void test_copy_queue_timestamps(Scene *c) {
+  ID3D12Device *dev = c->dev;
+  D3D12_COMMAND_QUEUE_DESC qdesc = {D3D12_COMMAND_LIST_TYPE_COPY, 0, D3D12_COMMAND_QUEUE_FLAG_NONE, 0};
+  ID3D12CommandQueue *queue = NULL;
+  ID3D12CommandAllocator *allocator = NULL;
+  ID3D12GraphicsCommandList *list = NULL;
+  ID3D12QueryHeap *copy_heap = NULL, *heap = NULL, *occlusion = NULL;
+  D3D12_QUERY_HEAP_DESC qd = {D3D12_QUERY_HEAP_TYPE_COPY_QUEUE_TIMESTAMP, 2, 0};
+  CHECK_HR(ID3D12Device_CreateQueryHeap(dev, &qd, &IID_ID3D12QueryHeap, (void **)&copy_heap));
+  qd.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
+  CHECK_HR(ID3D12Device_CreateQueryHeap(dev, &qd, &IID_ID3D12QueryHeap, (void **)&heap));
+  qd.Type = D3D12_QUERY_HEAP_TYPE_OCCLUSION;
+  CHECK_HR(ID3D12Device_CreateQueryHeap(dev, &qd, &IID_ID3D12QueryHeap, (void **)&occlusion));
+  CHECK_HR(ID3D12Device_CreateCommandQueue(dev, &qdesc, &IID_ID3D12CommandQueue, (void **)&queue));
+  CHECK_HR(ID3D12Device_CreateCommandAllocator(dev, D3D12_COMMAND_LIST_TYPE_COPY, &IID_ID3D12CommandAllocator, (void **)&allocator));
+  CHECK_HR(ID3D12Device_CreateCommandList(dev, 0, D3D12_COMMAND_LIST_TYPE_COPY, allocator, NULL, &IID_ID3D12GraphicsCommandList, (void **)&list));
+  ID3D12Resource *results = make_buffer(dev, D3D12_HEAP_TYPE_READBACK, 64, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);
+  if (!copy_heap || !heap || !occlusion || !queue || !allocator || !list || !results) { CHECK(0); return; }
+  ID3D12GraphicsCommandList_EndQuery(list, copy_heap, D3D12_QUERY_TYPE_TIMESTAMP, 0);
+  ID3D12GraphicsCommandList_EndQuery(list, heap, D3D12_QUERY_TYPE_TIMESTAMP, 0);                  /* (not on a copy list: ignored) */
+  ID3D12GraphicsCommandList_BeginQuery(list, occlusion, D3D12_QUERY_TYPE_OCCLUSION, 0);           /* (nor this) */
+  ID3D12GraphicsCommandList_EndQuery(list, occlusion, D3D12_QUERY_TYPE_OCCLUSION, 0);
+  ID3D12GraphicsCommandList_EndQuery(list, copy_heap, D3D12_QUERY_TYPE_TIMESTAMP, 1);
+  ID3D12GraphicsCommandList_ResolveQueryData(list, copy_heap, D3D12_QUERY_TYPE_TIMESTAMP, 0, 2, results, 0);
+  ID3D12GraphicsCommandList_ResolveQueryData(list, heap, D3D12_QUERY_TYPE_TIMESTAMP, 0, 1, results, 16);
+  ID3D12GraphicsCommandList_ResolveQueryData(list, occlusion, D3D12_QUERY_TYPE_OCCLUSION, 0, 1, results, 24);
+  CHECK_HR(ID3D12GraphicsCommandList_Close(list));
+  ID3D12CommandList *lists[1] = {(ID3D12CommandList *)list};
+  ID3D12CommandQueue_ExecuteCommandLists(queue, 1, lists);
+  ID3D12Fence *fence = NULL;
+  CHECK_HR(ID3D12Device_CreateFence(dev, 0, D3D12_FENCE_FLAG_NONE, &IID_ID3D12Fence, (void **)&fence));
+  UINT64 value = 0;
+  if (fence) wait_fence(queue, fence, &value);
+  const UINT64 *r = NULL;
+  CHECK_HR(ID3D12Resource_Map(results, 0, NULL, (void **)&r));
+  if (r) {
+    printf("copy queue timestamps: %llu %llu (%llu %llu)\n", (unsigned long long)r[0], (unsigned long long)r[1], (unsigned long long)r[2], (unsigned long long)r[3]);
+    CHECK(r[0] != 0 && r[1] >= r[0] && r[2] == 0 && r[3] == 0);
+    ID3D12Resource_Unmap(results, 0, NULL);
+  }
+  if (fence) ID3D12Fence_Release(fence);
+  ID3D12Resource_Release(results);
+  ID3D12GraphicsCommandList_Release(list);
+  ID3D12CommandAllocator_Release(allocator);
+  ID3D12CommandQueue_Release(queue);
+  ID3D12QueryHeap_Release(copy_heap);
+  ID3D12QueryHeap_Release(heap);
+  ID3D12QueryHeap_Release(occlusion);
 }
 
 static void test_indirect(Scene *c) {
@@ -3766,6 +3994,8 @@ static void test_extras(ID3D12Device *dev, ID3D12CommandQueue *queue, ID3D12Fenc
   c.fence_value = fence_value;
   if (!scene_make(&c)) { CHECK(0); return; }
   test_queries(&c);
+  test_query_types(&c);
+  test_copy_queue_timestamps(&c);
   test_indirect(&c);
   test_bundle(&c);
   test_tiled(&c);

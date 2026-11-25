@@ -19,20 +19,27 @@
 /* Part of d3d11.c: queries, predicates, predication and counters.
  *
  * The queue runs each command list before it returns, and End sends what was recorded, so a query is answered at its End: an event is done, a timestamp is the
- * time then (QueryPerformanceCounter, whose frequency TIMESTAMP_DISJOINT gives). What the GPU knows is measured by the kernel for each draw: the samples that
- * passed (occlusion queries and predicates), the pixel shader's invocations, the stream output primitives a stream needed. The kernel has one query open at a
- * time, so a draw is measured for one of them - the samples first, then the stream output, then the pixel shader's invocations - when queries of more than
- * one kind are active. The other pipeline statistics are counted here from the draws and dispatches (docs/Direct3D11.md says which and how). */
+ * time then (QueryPerformanceCounter, whose frequency TIMESTAMP_DISJOINT gives). What the GPU counts is measured by the kernel, with Direct3D 12 queries of
+ * d3d12.dll: a measurement is open over a run of draws and dispatches while the queries that are active stay the same (Begin, End and the end of the list close
+ * it), and it has a query for every kind the active queries need, all open at once - the samples that passed (occlusion queries and predicates), the pipeline
+ * statistics, and the stream output statistics (primitives written and needed) of each stream a stream output query is of. What a measurement counted is added to
+ * each query it was for. */
 
-/* A draw the kernel measured: what it counted (MEASURE_*), and the queries the count goes to (references). */
-#define MEASURE_SAMPLES 0u
-#define MEASURE_PIXELS 1u
-#define MEASURE_STREAM 2u      /* + the stream */
+/* A measurement: the kinds it has (MEASURE_*: the samples, the pipeline statistics, the stream output statistics of stream n), and the queries its counts go to
+ * (references). Its queries are slot `index` of the samples and statistics heaps, and slots 4 * index .. 4 * index + 3 of the stream output one. */
+#define MEASURE_SAMPLES 1u
+#define MEASURE_STATS 2u
+#define MEASURE_STREAM(n) (4u << (n))
 typedef struct Measure {
   UINT what;
   UINT count;
-  Query *queries[8];
+  Query *queries[ACTIVE_QUERIES];
 } Measure;
+/* Where the results of slot i are in the read-back buffer (measures_resolve). */
+#define MEASURE_SAMPLES_AT(i) ((UINT64)(i) * 8)
+#define MEASURE_STATS_AT(i) ((UINT64)MEASURES * 8 + (UINT64)(i) * sizeof(D3D11_QUERY_DATA_PIPELINE_STATISTICS))
+#define MEASURE_STREAM_AT(i, n) ((UINT64)MEASURES * (8 + sizeof(D3D11_QUERY_DATA_PIPELINE_STATISTICS)) + ((UINT64)(i) * 4 + (n)) * 16)
+#define MEASURE_READBACK_BYTES ((UINT64)MEASURES * (8 + sizeof(D3D11_QUERY_DATA_PIPELINE_STATISTICS) + 4 * 16))
 
 /* (the queries of a stream come in pairs, statistics then overflow predicate: SO_STATISTICS_STREAM0 8, SO_OVERFLOW_PREDICATE_STREAM0 9, SO_STATISTICS_STREAM1 10 ...) */
 static BOOL query_of_one_stream(D3D11_QUERY q) { return q >= D3D11_QUERY_SO_STATISTICS_STREAM0 && q <= D3D11_QUERY_SO_OVERFLOW_PREDICATE_STREAM3; }
@@ -59,14 +66,19 @@ static UINT query_stream(D3D11_QUERY q) {
   if (query_of_one_stream(q)) return (q - D3D11_QUERY_SO_STATISTICS_STREAM0) / 2;
   return 5;
 }
-/* What the kernel measures for a query (MEASURE_*); ~0u for one it measures nothing for. */
+/* What the kernel measures for a query (MEASURE_* bits); 0 for one it measures nothing for. */
 static UINT query_measures(D3D11_QUERY q) {
   if (q == D3D11_QUERY_OCCLUSION || q == D3D11_QUERY_OCCLUSION_PREDICATE) return MEASURE_SAMPLES;
-  if (q == D3D11_QUERY_PIPELINE_STATISTICS) return MEASURE_PIXELS;
+  if (q == D3D11_QUERY_PIPELINE_STATISTICS) return MEASURE_STATS;
   const UINT stream = query_stream(q);
-  if (stream < 4) return MEASURE_STREAM + stream;
-  if (stream == 4) return MEASURE_STREAM;      /* (all streams: stream 0 is measured - the one stream of a program that has one) */
-  return ~0u;
+  if (stream < 4) return MEASURE_STREAM(stream);
+  if (stream == 4) return MEASURE_STREAM(0) | MEASURE_STREAM(1) | MEASURE_STREAM(2) | MEASURE_STREAM(3);      /* (all streams) */
+  return 0;
+}
+/* Whether the device has the heaps a query's measurements need (an adapter without the kernel's queries, or without its statistics, has not). */
+static BOOL query_measurable(const Dev *d, D3D11_QUERY q) {
+  const UINT m = query_measures(q);
+  return (!(m & MEASURE_SAMPLES) || d->measure_heap) && (!(m & MEASURE_STATS) || d->measure_stats_heap) && (!(m & ~(MEASURE_SAMPLES | MEASURE_STATS)) || d->measure_so_heap);
 }
 
 static void query_destroy(DxObj *o) { child_destroy(o); }
@@ -76,8 +88,8 @@ static HRESULT query_make(Dev *d, const D3D11_QUERY_DESC *desc, BOOL predicate, 
   if (!desc || (desc->MiscFlags & ~(UINT)D3D11_QUERY_MISC_PREDICATEHINT) || query_data_size(desc->Query) == 0) return E_INVALIDARG;
   if (predicate && !query_is_predicate(desc->Query)) return E_INVALIDARG;
   if ((desc->MiscFlags & D3D11_QUERY_MISC_PREDICATEHINT) && !query_is_predicate(desc->Query)) return E_INVALIDARG;
-  /* (what the kernel measures needs its occlusion queries: an adapter without them has none of these) */
-  if (query_measures(desc->Query) != ~0u && !d->measure_heap) return DXGI_ERROR_UNSUPPORTED;
+  /* (what the kernel measures needs its queries: an adapter without them has none of these) */
+  if (!query_measurable(d, desc->Query)) return DXGI_ERROR_UNSUPPORTED;
   if (!out) return S_FALSE;
   const BOOL is_predicate = query_is_predicate(desc->Query);
   /* (a predicate is a query with no methods of its own: the same table, ID3D11Query1's, serves it) */
@@ -121,24 +133,53 @@ static HRESULT STDMETHODCALLTYPE dev_CreateCounter(Dev *d, const D3D11_COUNTER_D
 
 /* ---- what the kernel measures ---------------------------------------------------------------------------------------------------------------------------- */
 
+static void measure_close(Dev *d);
 /* After the list's last command: the results of its measurements into memory the CPU reads. */
 static void measures_resolve(Dev *d) {
+  measure_close(d);
   if (!d->measure_count) return;
-  ID3D12GraphicsCommandList_ResolveQueryData(d->list, d->measure_heap, D3D12_QUERY_TYPE_OCCLUSION, 0, d->measure_count, d->measure_readback, 0);
+  if (d->measure_heap) ID3D12GraphicsCommandList_ResolveQueryData(d->list, d->measure_heap, D3D12_QUERY_TYPE_OCCLUSION, 0, d->measure_count, d->measure_readback, MEASURE_SAMPLES_AT(0));
+  if (d->measure_stats_heap)
+    ID3D12GraphicsCommandList_ResolveQueryData(d->list, d->measure_stats_heap, D3D12_QUERY_TYPE_PIPELINE_STATISTICS, 0, d->measure_count, d->measure_readback, MEASURE_STATS_AT(0));
+  if (d->measure_so_heap)
+    for (UINT n = 0; n < 4; ++n) {
+      /* (each stream's slots are every fourth one: resolved one by one where their measurement has them) */
+      for (UINT i = 0; i < d->measure_count; ++i)
+        if (d->measures[i].what & MEASURE_STREAM(n))
+          ID3D12GraphicsCommandList_ResolveQueryData(d->list, d->measure_so_heap, (D3D12_QUERY_TYPE)(D3D12_QUERY_TYPE_SO_STATISTICS_STREAM0 + n), 4 * i + n, 1, d->measure_readback,
+                                                    MEASURE_STREAM_AT(i, n));
+    }
 }
 /* After the list ran: each measurement added to its queries. */
 static void measures_collect(Dev *d) {
   if (!d->measure_count) return;
-  const UINT64 *values = NULL;
+  const BYTE *values = NULL;
   if (FAILED(ID3D12Resource_Map(d->measure_readback, 0, NULL, (void **)&values))) values = NULL;
   for (UINT i = 0; i < d->measure_count; ++i) {
     Measure *m = &d->measures[i];
-    const UINT64 v = values ? values[i] : 0;
+    UINT64 samples = 0;
+    D3D11_QUERY_DATA_PIPELINE_STATISTICS stats;
+    D3D12_QUERY_DATA_SO_STATISTICS so[4];
+    memset(&stats, 0, sizeof stats);
+    memset(so, 0, sizeof so);
+    if (values) {
+      if (m->what & MEASURE_SAMPLES) memcpy(&samples, values + MEASURE_SAMPLES_AT(i), 8);
+      if (m->what & MEASURE_STATS) memcpy(&stats, values + MEASURE_STATS_AT(i), sizeof stats);      /* (D3D12_QUERY_DATA_PIPELINE_STATISTICS has the same fields) */
+      for (UINT n = 0; n < 4; ++n)
+        if (m->what & MEASURE_STREAM(n)) memcpy(&so[n], values + MEASURE_STREAM_AT(i, n), sizeof so[n]);
+    }
     for (UINT k = 0; k < m->count; ++k) {
       Query *q = m->queries[k];
-      if (m->what == MEASURE_SAMPLES) q->samples += v;
-      else if (m->what == MEASURE_PIXELS) q->stats.PSInvocations += v;
-      else q->so_needed[m->what - MEASURE_STREAM] += v;
+      const UINT wants = query_measures(q->desc.Query) & m->what;
+      if (wants & MEASURE_SAMPLES) q->samples += samples;
+      if (wants & MEASURE_STATS) {
+        D3D11_QUERY_DATA_PIPELINE_STATISTICS *s = &q->stats;
+        s->IAVertices += stats.IAVertices, s->IAPrimitives += stats.IAPrimitives, s->VSInvocations += stats.VSInvocations;
+        s->GSInvocations += stats.GSInvocations, s->GSPrimitives += stats.GSPrimitives, s->CInvocations += stats.CInvocations, s->CPrimitives += stats.CPrimitives;
+        s->PSInvocations += stats.PSInvocations, s->HSInvocations += stats.HSInvocations, s->DSInvocations += stats.DSInvocations, s->CSInvocations += stats.CSInvocations;
+      }
+      for (UINT n = 0; n < 4; ++n)
+        if (wants & MEASURE_STREAM(n)) { q->so_written[n] += so[n].NumPrimitivesWritten; q->so_needed[n] += so[n].PrimitivesStorageNeeded; }
       unhold(q);
     }
     m->count = 0;
@@ -147,83 +188,40 @@ static void measures_collect(Dev *d) {
   d->measure_count = 0;
 }
 
-/* Before a draw: the kernel is asked to measure it for the active queries (one kind). Returns whether a measurement was begun (measure_end ends it). */
-static BOOL measure_begin(Dev *d) {
-  if (!d->active_count || !d->measure_heap) return FALSE;
-  /* (the samples first, then a stream, then the pixels) */
-  BOOL samples = FALSE, pixels = FALSE;
-  UINT stream = ~0u;
-  for (UINT i = 0; i < d->active_count; ++i) {
-    const UINT m = query_measures(d->active[i]->desc.Query);
-    if (m == MEASURE_SAMPLES) samples = TRUE;
-    else if (m == MEASURE_PIXELS) pixels = TRUE;
-    else if (m != ~0u && stream == ~0u) stream = m;
-  }
-  const UINT what = samples ? MEASURE_SAMPLES : stream != ~0u ? stream : pixels ? MEASURE_PIXELS : ~0u;
-  if (what == ~0u) return FALSE;
-  if (d->measure_count == MEASURES) flush(d);
-  Measure *m = &d->measures[d->measure_count];
+/* Ends the measurement that is open (Begin and End of a query change what one is for; the list's end ends it too). */
+static void measure_close(Dev *d) {
+  if (!d->measure_open) return;
+  d->measure_open = FALSE;
+  const UINT i = d->measure_count - 1;
+  const UINT what = d->measures[i].what;
+  if (what & MEASURE_SAMPLES) ID3D12GraphicsCommandList_EndQuery(d->list, d->measure_heap, D3D12_QUERY_TYPE_OCCLUSION, i);
+  if (what & MEASURE_STATS) ID3D12GraphicsCommandList_EndQuery(d->list, d->measure_stats_heap, D3D12_QUERY_TYPE_PIPELINE_STATISTICS, i);
+  for (UINT n = 0; n < 4; ++n)
+    if (what & MEASURE_STREAM(n)) ID3D12GraphicsCommandList_EndQuery(d->list, d->measure_so_heap, (D3D12_QUERY_TYPE)(D3D12_QUERY_TYPE_SO_STATISTICS_STREAM0 + n), 4 * i + n);
+}
+/* Before a draw or a dispatch is prepared: room for a measurement (the list is sent when its measurements are all used; not after the draw's state is recorded on it). */
+static void measure_room(Dev *d) {
+  if (!d->measure_open && d->active_count && d->measure_count == MEASURES) flush(d);
+}
+/* Before a draw or a dispatch: a measurement for the active queries is open (one that is open already goes on). */
+static void measure_draw(Dev *d) {
+  if (d->measure_open || !d->active_count) return;
+  UINT what = 0;
+  for (UINT i = 0; i < d->active_count; ++i) what |= query_measures(d->active[i]->desc.Query);
+  if (!what || d->measure_count == MEASURES) return;      /* (measure_room left room: only a draw that cannot be measured comes here) */
+  const UINT i = d->measure_count;
+  Measure *m = &d->measures[i];
   m->what = what;
   m->count = 0;
-  for (UINT i = 0; i < d->active_count && m->count < 8; ++i)
-    if (query_measures(d->active[i]->desc.Query) == what) { hold(d->active[i]); m->queries[m->count++] = d->active[i]; }
-  /* the kernel's kinds: 0 the samples, 5 the pixel shader's invocations, 8 | stream << 8 the stream output's primitives needed */
-  const UINT kind = what == MEASURE_SAMPLES ? 0u : what == MEASURE_PIXELS ? 5u : 8u | ((what - MEASURE_STREAM) << 8);
-  TcosD3D12BeginQueryKind(d->list, d->measure_heap, d->measure_count, kind);
-  ++d->measure_count;
-  return TRUE;
-}
-static void measure_end(Dev *d, BOOL begun) {
-  if (begun) ID3D12GraphicsCommandList_EndQuery(d->list, d->measure_heap, D3D12_QUERY_TYPE_OCCLUSION, d->measure_count - 1);
-}
-
-/* ---- what this library counts ------------------------------------------------------------------------------------------------------------------------------- */
-
-/* The primitives `vertices` vertices of a topology make. */
-static UINT64 topology_primitives(D3D11_PRIMITIVE_TOPOLOGY t, UINT64 vertices) {
-  switch (t) {
-    case D3D11_PRIMITIVE_TOPOLOGY_POINTLIST: return vertices;
-    case D3D11_PRIMITIVE_TOPOLOGY_LINELIST: return vertices / 2;
-    case D3D11_PRIMITIVE_TOPOLOGY_LINESTRIP: return vertices >= 2 ? vertices - 1 : 0;
-    case D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST: return vertices / 3;
-    case D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP: return vertices >= 3 ? vertices - 2 : 0;
-    case D3D11_PRIMITIVE_TOPOLOGY_LINELIST_ADJ: return vertices / 4;
-    case D3D11_PRIMITIVE_TOPOLOGY_LINESTRIP_ADJ: return vertices >= 4 ? vertices - 3 : 0;
-    case D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST_ADJ: return vertices / 6;
-    case D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP_ADJ: return vertices >= 6 ? (vertices - 4) / 2 : 0;
-    default:
-      if (t >= D3D11_PRIMITIVE_TOPOLOGY_1_CONTROL_POINT_PATCHLIST && t <= D3D11_PRIMITIVE_TOPOLOGY_32_CONTROL_POINT_PATCHLIST)
-        return vertices / (UINT64)(t - D3D11_PRIMITIVE_TOPOLOGY_1_CONTROL_POINT_PATCHLIST + 1);
-      return 0;
-  }
-}
-
-/* The pipeline statistics of a draw of `vertices` vertices (indices) `instances` times: the input assembler's vertices and primitives, the vertex shader's
- * invocations (once for every vertex read, as the kernel's renderer runs it), the hull shader's (a patch each), the geometry shader's (a primitive each, by its
- * instances), and with neither geometry nor tessellation the primitives the rasterizer is given (C invocations; C primitives the same: clipping is not counted
- * apart). Of a draw with tessellation the domain shader's invocations, and the primitives that come out of the tessellator or a geometry shader, are not known
- * here: they are not added. */
-static void query_count_draw(Ctx *c, UINT vertices, UINT instances) {
-  Dev *d = c->dev;
-  if (!d->active_count) return;
-  const UINT64 v = (UINT64)vertices * instances, p = topology_primitives(c->topology, vertices) * instances;
-  for (UINT i = 0; i < d->active_count; ++i) {
-    Query *q = d->active[i];
-    if (q->desc.Query != D3D11_QUERY_PIPELINE_STATISTICS) continue;
-    D3D11_QUERY_DATA_PIPELINE_STATISTICS *s = &q->stats;
-    s->IAVertices += v;
-    s->IAPrimitives += p;
-    s->VSInvocations += v;
-    if (c->hs) s->HSInvocations += p;
-    if (c->gs && !c->hs) s->GSInvocations += p * (c->gs->gs_instances ? c->gs->gs_instances : 1);
-    if (!c->gs && !c->hs) { s->CInvocations += p; s->CPrimitives += p; }
-  }
-}
-static void query_count_dispatch(Ctx *c, UINT x, UINT y, UINT z) {
-  Dev *d = c->dev;
-  const UINT64 threads = (UINT64)x * y * z * c->cs->group[0] * c->cs->group[1] * c->cs->group[2];
-  for (UINT i = 0; i < d->active_count; ++i)
-    if (d->active[i]->desc.Query == D3D11_QUERY_PIPELINE_STATISTICS) d->active[i]->stats.CSInvocations += threads;
+  for (UINT k = 0; k < d->active_count; ++k)
+    if (query_measures(d->active[k]->desc.Query)) { hold(d->active[k]); m->queries[m->count++] = d->active[k]; }
+  if (what & MEASURE_SAMPLES) ID3D12GraphicsCommandList_BeginQuery(d->list, d->measure_heap, D3D12_QUERY_TYPE_OCCLUSION, i);
+  if (what & MEASURE_STATS) ID3D12GraphicsCommandList_BeginQuery(d->list, d->measure_stats_heap, D3D12_QUERY_TYPE_PIPELINE_STATISTICS, i);
+  for (UINT n = 0; n < 4; ++n)
+    if (what & MEASURE_STREAM(n)) ID3D12GraphicsCommandList_BeginQuery(d->list, d->measure_so_heap, (D3D12_QUERY_TYPE)(D3D12_QUERY_TYPE_SO_STATISTICS_STREAM0 + n), 4 * i + n);
+  d->measure_count = i + 1;
+  d->measure_open = TRUE;
+  d->recorded = 1;
 }
 
 /* ---- the context's methods ------------------------------------------------------------------------------------------------------------------------------ */
@@ -242,8 +240,6 @@ static void query_deactivate(Dev *d, Query *q) {
       return;
     }
 }
-static UINT64 so_filled(Ctx *c, UINT stream);
-static UINT64 so_primitive_bytes(Ctx *c, UINT stream);
 static void STDMETHODCALLTYPE ctx_Begin(Ctx *c, ID3D11Asynchronous *async) {
   if (c->deferred) { deferred_record(c, &(RecArgs){.op = REC_BEGIN, .obj = {async}}); return; }
   Query *q = query_of(async);
@@ -252,6 +248,16 @@ static void STDMETHODCALLTYPE ctx_Begin(Ctx *c, ID3D11Asynchronous *async) {
   EnterCriticalSection(&d->lock);
   /* (begun again: counting starts over) */
   if (!q->active && d->active_count == ACTIVE_QUERIES) { LeaveCriticalSection(&d->lock); return; }
+  if (query_measures(q->desc.Query)) {
+    /* (the draws from here on are measured for it too: a new measurement. Begun again while active, it starts over: what the measurements so far counted for it is not
+     * added - they are for the queries they were made for, and it is taken out of them) */
+    measure_close(d);
+    for (UINT i = 0; i < d->measure_count; ++i) {
+      Measure *m = &d->measures[i];
+      for (UINT k = 0; k < m->count; ++k)
+        if (m->queries[k] == q) { m->queries[k] = m->queries[--m->count]; unhold(q); --k; }
+    }
+  }
   if (!q->active) { hold(q); d->active[d->active_count++] = q; q->active = TRUE; }
   q->begun = TRUE;
   q->ended = FALSE;
@@ -259,8 +265,6 @@ static void STDMETHODCALLTYPE ctx_Begin(Ctx *c, ID3D11Asynchronous *async) {
   memset(&q->stats, 0, sizeof q->stats);
   memset(q->so_written, 0, sizeof q->so_written);
   memset(q->so_needed, 0, sizeof q->so_needed);
-  if (query_stream(q->desc.Query) <= 4)
-    for (UINT s = 0; s < 4; ++s) q->so_filled_at_begin[s] = so_filled(c, s);
   q->start = query_now();
   LeaveCriticalSection(&d->lock);
 }
@@ -272,16 +276,9 @@ static void STDMETHODCALLTYPE ctx_End(Ctx *c, ID3D11Asynchronous *async) {
   if (q->desc.Query != D3D11_QUERY_EVENT && q->desc.Query != D3D11_QUERY_TIMESTAMP && !q->active) return;      /* (an End without a Begin) */
   EnterCriticalSection(&d->lock);
   hold(q);
+  if (query_measures(q->desc.Query)) measure_close(d);      /* (the draws after this are not its) */
   query_deactivate(d, q);
   flush(d);      /* (what came before is done, and what the kernel measured for it is in) */
-  if (query_stream(q->desc.Query) <= 4)
-    for (UINT s = 0; s < 4; ++s) {
-      /* (the primitives written: the growth of what the stream's targets hold, a primitive being the stride of a vertex times the vertices of one) */
-      const UINT64 filled = so_filled(c, s), grown = filled > q->so_filled_at_begin[s] ? filled - q->so_filled_at_begin[s] : 0;
-      const UINT64 per = so_primitive_bytes(c, s);
-      q->so_written[s] = per ? grown / per : 0;
-      if (q->so_needed[s] < q->so_written[s]) q->so_needed[s] = q->so_written[s];
-    }
   q->stop = query_now();
   q->begun = FALSE;
   q->ended = TRUE;
