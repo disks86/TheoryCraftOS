@@ -53,7 +53,7 @@ struct RecordedCommand {
   PrimitiveTopology topology = PrimitiveTopology::TriangleList;   // SetTopology
   uint32_t unit = 0;       // BindTexture; the slot of BeginQuery; the slot of BindVertexBuffer
   IImage* image = nullptr;
-  IImage* image2 = nullptr;   // Resolve: the source (image is the destination)
+  IImage* image2 = nullptr;   // Resolve: the source (image is the destination; `first` the source's layer)
   SamplerDesc sampler;
   StorageImageView storage_view;   // BindStorageImage (the slot in `unit`, the image in `image`)
   TexelBufferView texel_view;      // BindStorageTexelBuffer (the slot in `unit`, the buffer in `buffer`)
@@ -253,10 +253,12 @@ class CommandRecorder : public ICommandBuffer {
     c.type = RecordedCommand::Type::EndRenderPass;
     add(c);
   }
-  void resolve_image(IImage* destination, IImage* source, ResolveMode mode) override {
+  void resolve_image(IImage* destination, IImage* source, ResolveMode mode) override { resolve_layer(destination, source, 0, mode); }
+  void resolve_layer(IImage* destination, IImage* source, uint32_t source_layer, ResolveMode mode) override {
     RecordedCommand c;
     c.type = RecordedCommand::Type::Resolve;
     c.count = static_cast<uint32_t>(mode);
+    c.first = source_layer;   // (the source's layer)
     c.image = destination;
     c.image2 = source;
     add(c);

@@ -57,7 +57,9 @@ enum class Op : uint8_t {
   // address
   Arl, Arr, Uarl,
   // textures
-  Tex, Txp, Txb, Txd, Txl, Txl2, Txb2, Tex2, Txf, Txq, Tg4, Lodq,
+  Tex, Txp, Txb, Txd, Txl, Txl2, Txb2, Tex2, Txf, Txq, Tg4, Lodq, Txqs,
+  // a fragment shader's inputs at another point of the pixel (INTERP_CENTROID / INTERP_SAMPLE / INTERP_OFFSET: the input register, then the sample or the offset)
+  InterpCentroid, InterpSample, InterpOffset,
   // memory
   Load, Store, Resq, AtomUadd, AtomAnd, AtomOr, AtomXor, AtomImax, AtomImin, AtomUmax, AtomUmin, AtomXchg, AtomCas,
   // control

@@ -113,7 +113,10 @@ enum ImageUsage : uint32_t {
 // a pass drawing into a run of their layers (RenderPassBegin::first_layer), or storage images (kImageStorage, not a cube); they are filled and read layer by layer (write_layer_pixels /
 // read_layer_pixels, or the _float forms for the wide formats), each layer a 2D image of `extent`.
 // TextureCubeArray (kFeature2MipmappedLayers) has `layers` layers, a multiple of six: cube n is layers 6n .. 6n + 5, each in the order of a cube's faces.
-enum class TextureKind : uint8_t { Texture2D, Texture3D, Texture2DArray, TextureCube, Texture2DMS, TextureCubeArray };   // (Texture2DMS: only what a shader declares for a unit - a multisampled colour image, whose ImageDesc::kind is Texture2D, is bound to it)
+// Texture2DMS and Texture2DMSArray are only what a shader declares for a unit (and the kind of a view of one): a multisampled image, whose ImageDesc::kind is Texture2D - or
+// Texture2DArray for one of several layers (kFeature3MultisampleArrays) -, is bound to it.
+enum class TextureKind : uint8_t { Texture2D, Texture3D, Texture2DArray, TextureCube, Texture2DMS, TextureCubeArray, Texture2DMSArray };
+constexpr bool is_multisampled_kind(TextureKind kind) { return kind == TextureKind::Texture2DMS || kind == TextureKind::Texture2DMSArray; }
 constexpr uint32_t kMaxTextureLayers = 256;
 // The layers of an image of `kind` made with `layers` (ImageDesc::layers): 1 for a 2D image, 6 for a cube, `layers` for the others.
 constexpr uint32_t image_layer_count(TextureKind kind, uint32_t layers) { return kind == TextureKind::Texture2D || kind == TextureKind::Texture2DMS ? 1 : kind == TextureKind::TextureCube ? 6 : layers; }
@@ -144,6 +147,9 @@ constexpr bool texture_view_fits(TextureKind kind, uint32_t layers, uint32_t lev
     case TextureKind::TextureCube: return layered_2d && view.layer_count == 6;
     case TextureKind::TextureCubeArray: return layered_2d && view.layer_count % 6 == 0;
     case TextureKind::Texture3D: return kind == TextureKind::Texture3D && view.first_layer == 0 && view.layer_count == have;
+    // (the views of a multisampled image, which has one level: a layer of it, or a run of its layers - kFeature3MultisampleArrays)
+    case TextureKind::Texture2DMS: return (kind == TextureKind::Texture2D || kind == TextureKind::Texture2DArray) && view.layer_count == 1 && levels == 1;
+    case TextureKind::Texture2DMSArray: return (kind == TextureKind::Texture2D || kind == TextureKind::Texture2DArray) && levels == 1;
     default: return false;
   }
 }
@@ -338,6 +344,10 @@ constexpr bool compare_holds(CompareOp op, float a, float b) {
 }
 // Where a TGSI shader that compares finds the comparisons of the bound samplers (ShaderModuleDesc::sampler_constants): the register after the most constants a shader may have, one for each unit.
 constexpr uint32_t kSamplerCompareRegister = kMaxPushConstantBytes / 16;
+// ... and after those, the pass's samples per pixel (x, an unsigned integer's bits) for a text that reads the rasterizer's sample count (Direct3D's GetRenderTargetSampleCount /
+// GetRenderTargetSamplePosition): the device fills it with the others (ShaderModuleDesc::sampler_constants).
+constexpr uint32_t kRasterizerRegister = kSamplerCompareRegister + kMaxTextureUnits;
+constexpr uint32_t kDeviceConstantRegisters = kRasterizerRegister + 1;   // (the registers of the block the device fills, from 0)
 // The values of that register for a sampler (see ShaderModuleDesc::sampler_constants).
 inline void sampler_compare_constant(CompareOp op, bool linear, float out[4]) {
   out[0] = compare_holds(op, 0.0f, 1.0f) ? 1.0f : 0.0f;
@@ -435,10 +445,16 @@ class ITextureSet {
     *depth = 1;
     return size(unit, level, width, height, levels);
   }
-  // One sample of a multisampled colour image (Texture2DMS Load): x and y are texel numbers, `sample` the sample; outside the image or the samples it is transparent black.
-  virtual Vec4 fetch_sample(uint32_t unit, int32_t x, int32_t y, uint32_t sample) const {
-    (void)unit, (void)x, (void)y, (void)sample;
+  // One sample of a multisampled image (Texture2DMS / Texture2DMSArray Load): x and y are texel numbers, `layer` the layer of the view (0 for a Texture2DMS unit), `sample` the sample;
+  // outside the image, its layers or its samples it is transparent black. A depth image's (kFeature3MultisampleDepthLoads) is (depth, 0, 0, 1), or its stencil as an integer in green.
+  virtual Vec4 fetch_sample(uint32_t unit, int32_t x, int32_t y, uint32_t layer, uint32_t sample) const {
+    (void)unit, (void)x, (void)y, (void)layer, (void)sample;
     return {0, 0, 0, 0};
+  }
+  // The samples per pixel of the image bound to `unit` (0 for none bound; 1 for an image of one sample).
+  virtual uint32_t sample_count(uint32_t unit) const {
+    (void)unit;
+    return 0;
   }
   // --- kFeatureTexelAccess (DeviceInfo::features); a device without it leaves these at their defaults.
   // The lookup at an explicit level of detail (lambda: 0 is the base level), as sample() takes it from the derivatives.
@@ -572,6 +588,30 @@ struct VertexContext {
   uint32_t instance_id = 0;
   uint32_t view_id = 0;       // SV_ViewID (kFeature2ViewInstancing: ICommandBuffer::set_view_instance; 0 without)
 };
+// Where a sample of a pixel is (kFeature2SamplePositions): sixteenths of a pixel from its centre, -8 .. 7 each way (+y down), as D3D12_SAMPLE_POSITION.
+struct SamplePosition {
+  int8_t x = 0, y = 0;
+};
+// The standard positions of the samples of a pixel (Direct3D 10.1's patterns of 1, 2, 4, 8 and 16 samples, Vulkan's standard sample locations), in the order Direct3D numbers them.
+constexpr SamplePosition kStandardSamples1[1] = {{0, 0}};
+constexpr SamplePosition kStandardSamples2[2] = {{4, 4}, {-4, -4}};
+constexpr SamplePosition kStandardSamples4[4] = {{-2, -6}, {6, -2}, {-6, 2}, {2, 6}};
+constexpr SamplePosition kStandardSamples8[8] = {{1, -3}, {-1, 3}, {5, 1}, {-3, -5}, {-5, 5}, {-7, -1}, {3, 7}, {7, -7}};
+constexpr SamplePosition kStandardSamples16[16] = {{1, 1}, {-1, -3}, {-3, 2}, {4, -1}, {-5, -2}, {2, 5}, {5, 3}, {3, -5}, {-2, 6}, {0, -7}, {-4, -6}, {-6, 4}, {-8, 0}, {7, -4}, {6, 7}, {-7, -8}};
+// The standard pattern of `count` samples (1, 2, 4, 8 or 16; nullptr for another count).
+constexpr const SamplePosition* standard_sample_positions(uint32_t count) {
+  return count == 1 ? kStandardSamples1 : count == 2 ? kStandardSamples2 : count == 4 ? kStandardSamples4 : count == 8 ? kStandardSamples8 : count == 16 ? kStandardSamples16 : nullptr;
+}
+
+// How a fragment shader's input is interpolated (ShaderModuleDesc::interpolation, kFeature3InterpolationModes): the kind (bits 0-1) and where in the pixel (bits 2-3). Direct3D's modes:
+// linear is Perspective, linear noperspective NoPerspective, constant (nointerpolation) Flat - the value of the primitive's first vertex -, and each of the first two may be at the centroid
+// of the covered samples or (kFeature3SampleShading) at the sample being shaded.
+enum InterpolationKind : uint8_t { kInterpolatePerspective = 0, kInterpolateNoPerspective = 1, kInterpolateFlat = 2 };
+enum InterpolationLocation : uint8_t { kAtCentre = 0, kAtCentroid = 1, kAtSample = 2 };
+constexpr uint8_t interpolation_word(InterpolationKind kind, InterpolationLocation at) { return static_cast<uint8_t>(kind | at << 2); }
+constexpr InterpolationKind interpolation_kind(uint8_t word) { return static_cast<InterpolationKind>(word & 3); }
+constexpr InterpolationLocation interpolation_location(uint8_t word) { return static_cast<InterpolationLocation>((word >> 2) & 3); }
+
 struct FragmentContext {
   const IStorageImages* images = nullptr;   // ... as for the vertex shader
   const ByteView* storage = nullptr;   // ... as for the vertex shader
@@ -602,6 +642,24 @@ struct FragmentContext {
   QuadCoveredFn quad_covered_fn = nullptr;
   const void* quad_user = nullptr;
   uint32_t quad_corner = 0;
+  // Multisampling (kFeature3*). The pass's samples per pixel and where they are in this pixel (the standard ones, or those of set_sample_positions); `sample_index` the sample this run
+  // shades (ShaderModuleDesc::sample_shading; 0 otherwise); `coverage` the samples the primitive covers in the pixel (SV_Coverage: with sample shading only the run's own) and
+  // `inner_coverage` whether it covers all of the pixel's square (SV_InnerCoverage). `centre` is the pixel's centre (the position may be at a sample or the centroid), `centroid`
+  // where the shader's centroid inputs were taken, as offsets from the centre in pixels.
+  uint32_t sample_count = 1;
+  uint32_t sample_index = 0;
+  const SamplePosition* sample_positions = kStandardSamples1;
+  uint32_t coverage = 1;
+  bool inner_coverage = false;
+  float centre_x = 0, centre_y = 0;
+  float centroid_x = 0, centroid_y = 0;
+  // The inputs at any point of the pixel's plane (kFeature3EvaluateAttributes: EvaluateAttributeAtSample / AtCentroid / Snapped): every varying, each by its interpolation kind (a
+  // flat one is its vertex's wherever), at (x, y) in the target's pixels. Null where the device gives none.
+  using EvaluateFn = void (*)(const void* user, float x, float y, Vec4* varyings);
+  EvaluateFn evaluate = nullptr;
+  const void* evaluate_user = nullptr;
+  // Where a shader that writes SV_Coverage (ShaderModuleDesc::writes_coverage) puts its mask: the samples its result reaches are only those of the coverage that are set in it.
+  uint32_t* coverage_out = nullptr;
 };
 using VertexShaderFnEx = void (*)(const Vec4* attributes, const uint8_t* constants, const VertexContext& context, ShaderIo* out);
 using FragmentShaderFnEx = bool (*)(const Vec4* varyings, const FragmentContext& context, const uint8_t* constants, const ITextureSet& textures, Vec4* color);
@@ -799,6 +857,13 @@ struct ShaderModuleDesc {
   // With a ColoredFragment / TexturedFragment eu_program: which of the vertex shader's varyings the kernel reads (the colour, or the texture coordinate in its first two components).
   // A vertex shader with a vertex_function (and no eu_program) is run on the CPU by that device.
   uint8_t eu_varying = 0;
+  // A fragment shader's inputs (kFeature3*): how each varying is interpolated (interpolation_word; 0, perspective-correct at the centre, for all of them by default) and the position
+  // (SV_Position: the location only, it is always linear), whether the shader runs once for each covered sample (kFeature3SampleShading: it reads SV_SampleIndex or an input at
+  // the sample), and whether it writes SV_Coverage (kFeature3Coverage: FragmentContext::coverage_out).
+  uint8_t interpolation[kMaxVaryings] = {};
+  uint8_t position_location = kAtCentre;
+  bool sample_shading = false;
+  bool writes_coverage = false;
 };
 
 class IShaderModule {
@@ -1056,10 +1121,6 @@ struct Viewport {
   float min_depth = 0, max_depth = 1;
 };
 
-// Where a sample of a pixel is (kFeature2SamplePositions): sixteenths of a pixel from its centre, -8 .. 7 each way (+y down), as D3D12_SAMPLE_POSITION.
-struct SamplePosition {
-  int8_t x = 0, y = 0;
-};
 constexpr uint32_t kMaxSamplePositions = 16;   // (the most a set_sample_positions call carries: samples x pixels)
 
 // Coarse pixel shading (kFeature2ShadingRate). A rate is D3D12_SHADING_RATE: (x axis << 2) | y axis, an axis 0 for 1 pixel, 1 for 2, 2 for 4 (0x0 1x1, 0x1 1x2, 0x4 2x1, 0x5 2x2,
@@ -1190,6 +1251,10 @@ class ICommandBuffer {
   // the sample 0 of a depth image are kFeatureResolveModes.
   virtual void resolve_image(IImage* destination, IImage* source, ResolveMode mode = ResolveMode::Average) {
     (void)destination, (void)source, (void)mode;
+  }
+  // The same of layer `source_layer` of a multisampled image of several layers (kFeature3MultisampleArrays) into the single-sample image; layer 0 is resolve_image.
+  virtual void resolve_layer(IImage* destination, IImage* source, uint32_t source_layer, ResolveMode mode = ResolveMode::Average) {
+    if (source_layer == 0) resolve_image(destination, source, mode);
   }
   // Copies `region` of a multisampled image - every sample of each pixel, a depth image's depth and stencil - to (x, y) of another of the same format, sample count and kind (kFeature2SampleCopies),
   // outside a render pass; both regions inside their images, the two images not the same.
@@ -1342,6 +1407,20 @@ enum DeviceFeature2 : uint32_t {
 // (DEV_FEATURE3_*, TcosD3D12DeviceFeatures3). Bits are taken in ranges so work on different parts does not collide: 0-7 multisampled reads and interpolation, 8-15 feature
 // levels 11_1 / 12_x (rasterizer ordered views, forced sample counts), 16-23 shader model 6 (wave operations), 24-31 the rest.
 enum DeviceFeature3 : uint32_t {
+  // Multisampled images read by shaders (bits 0-7): texture units of kind Texture2DMS bound to a multisampled colour image (kImageColorAttachment | kImageSampled) - ITextureSet::fetch_sample,
+  // sample_count, size of its one level -, Direct3D's Load with a sample index, GetDimensions and GetSamplePosition of a Texture2DMS.
+  kFeature3MultisampleLoads = 1u << 0,
+  kFeature3MultisampleArrays = 1u << 1,         // ... multisampled images of several layers (ImageDesc::kind Texture2DArray): drawn into a layer or several, resolved a layer at a time, and read through Texture2DMSArray units
+  kFeature3MultisampleDepthLoads = 1u << 2,     // ... multisampled depth images that are textures too (kImageDepthAttachment | kImageSampled): their depth - or stencil, SamplerDesc::stencil - samples through Texture2DMS units
+  // How a fragment shader's inputs are interpolated besides the plain perspective-correct value at the pixel's centre (ShaderModuleDesc::interpolation): noperspective and flat ones
+  // (which every device that has this takes), and at the centroid of the samples the primitive covers.
+  kFeature3InterpolationModes = 1u << 3,
+  // A fragment shader run once for each sample the primitive covers (ShaderModuleDesc::sample_shading: SV_SampleIndex, inputs interpolated at the sample) with FragmentContext::sample_index,
+  // the sample's position and its bit of the coverage; and the rasterizer's sample count and positions read by shaders (Direct3D's GetRenderTargetSampleCount / GetRenderTargetSamplePosition).
+  kFeature3SampleShading = 1u << 4,
+  kFeature3EvaluateAttributes = 1u << 5,        // FragmentContext::evaluate: an input at a sample, the centroid or an offset from the centre (EvaluateAttributeAtSample / AtCentroid / Snapped)
+  kFeature3Coverage = 1u << 6,                  // SV_Coverage: FragmentContext::coverage read, and the samples a fragment reaches limited by the shader's mask (ShaderModuleDesc::writes_coverage)
+  kFeature3InnerCoverage = 1u << 7,             // SV_InnerCoverage: FragmentContext::inner_coverage, whether the primitive covers the whole pixel (with conservative rasterization)
   // GraphicsPipelineDesc::forced_samples (Direct3D 11.1's target-independent rasterization, D3D11_RASTERIZER_DESC1 / D3D12_RASTERIZER_DESC ForcedSampleCount): triangles are
   // rasterized with 1, 2, 4, 8 or 16 samples a pixel whatever the samples of the pass's images - a pixel of a single-sample pass (no target, or single-sample targets) is shaded
   // and written once when the triangle covers any of the forced count's standard sample positions; with a count of 1 on a multisampled pass the pixel's centre decides for all

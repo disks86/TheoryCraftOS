@@ -49,15 +49,18 @@ static void STDMETHODCALLTYPE dev_GetImmediateContext(Dev *d, ID3D11DeviceContex
 }
 /* The quality levels of a multisampled target of `format` with `samples` samples: what Direct3D 12 below says for the format the texture is stored in (one, the
  * standard pattern, for the counts the adapter draws with; 0 for the others). */
-static UINT dev_ms_levels(Dev *d, DXGI_FORMAT format, UINT samples) {
+static UINT dev_ms_levels_for(Dev *d, DXGI_FORMAT format, UINT samples, UINT bind) {
   if (samples == 1) return 1;
-  const TexFormat *f = tex_format_for(format, D3D11_BIND_RENDER_TARGET);
+  /* (a typeless format of a depth family made a depth texture - R24G8_TYPELESS, R32_TYPELESS - is the depth format's, not the colour one's it could also be) */
+  const TexFormat *f = (bind & D3D11_BIND_DEPTH_STENCIL) ? tex_format_for(format, D3D11_BIND_DEPTH_STENCIL) : NULL;
+  if (!f) f = tex_format_for(format, D3D11_BIND_RENDER_TARGET);
   if (!f) f = tex_format_for(format, D3D11_BIND_DEPTH_STENCIL);
   if (!f) return 0;
   D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS q = {f->stored, samples, D3D12_MULTISAMPLE_QUALITY_LEVELS_FLAG_NONE, 0};
   if (FAILED(ID3D12Device_CheckFeatureSupport(d->d12, D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS, &q, sizeof q))) return 0;
   return q.NumQualityLevels;
 }
+static UINT dev_ms_levels(Dev *d, DXGI_FORMAT format, UINT samples) { return dev_ms_levels_for(d, format, samples, 0); }
 /* Whether a format's channels are integers (sampled with Load only, not blended). */
 static BOOL format_is_integer(DXGI_FORMAT f) {
   switch (f) {
@@ -212,8 +215,15 @@ static HRESULT dev_check_format(Dev *d, DXGI_FORMAT format, UINT *support) {
   if (format == DXGI_FORMAT_R32_FLOAT || format == DXGI_FORMAT_R32G32_FLOAT || format == DXGI_FORMAT_R32G32B32_FLOAT || format == DXGI_FORMAT_R32G32B32A32_FLOAT)
     *support |= D3D11_FORMAT_SUPPORT_SO_BUFFER;
   if (format == DXGI_FORMAT_R16_UINT || format == DXGI_FORMAT_R32_UINT) *support |= D3D11_FORMAT_SUPPORT_IA_INDEX_BUFFER;
-  if ((*support & (D3D11_FORMAT_SUPPORT_RENDER_TARGET | D3D11_FORMAT_SUPPORT_DEPTH_STENCIL)) && dev_ms_levels(d, format, 4))
-    *support |= D3D11_FORMAT_SUPPORT_MULTISAMPLE_RENDERTARGET | D3D11_FORMAT_SUPPORT_MULTISAMPLE_RESOLVE;      /* (drawn into and resolved, not read by shaders) */
+  if ((*support & (D3D11_FORMAT_SUPPORT_RENDER_TARGET | D3D11_FORMAT_SUPPORT_DEPTH_STENCIL)) && dev_ms_levels(d, format, 4)) {
+    /* (drawn into and resolved; read by shaders - Texture2DMS Load - where the adapter reads samples: graphics::DeviceFeature3 bit 0 of colour images, bit 2 of depth buffers, whose
+     * views' formats say so) */
+    *support |= D3D11_FORMAT_SUPPORT_MULTISAMPLE_RENDERTARGET | D3D11_FORMAT_SUPPORT_MULTISAMPLE_RESOLVE;
+    if ((*support & D3D11_FORMAT_SUPPORT_RENDER_TARGET) && (TcosD3D12DeviceFeatures3(d->d12) & 1u)) *support |= D3D11_FORMAT_SUPPORT_MULTISAMPLE_LOAD;
+  }
+  if ((format == DXGI_FORMAT_R24_UNORM_X8_TYPELESS || format == DXGI_FORMAT_X24_TYPELESS_G8_UINT || format == DXGI_FORMAT_R32_FLOAT) && dev_ms_levels(d, DXGI_FORMAT_D24_UNORM_S8_UINT, 4) &&
+      (TcosD3D12DeviceFeatures3(d->d12) & (1u << 2)))
+    *support |= D3D11_FORMAT_SUPPORT_MULTISAMPLE_LOAD;      /* (a multisampled depth buffer's views) */
   return *support ? S_OK : E_FAIL;
 }
 static HRESULT STDMETHODCALLTYPE dev_CheckMultisampleQualityLevels(Dev *d, DXGI_FORMAT format, UINT samples, UINT *levels) {

@@ -51,7 +51,13 @@ class VirglDevice final : public IGraphicsDevice {
             // desktop GL host has; dual-source blending when the host blends one target so)
             kFeature2RasterizerState | kFeature2LogicOps | kFeature2SamplerState | kFeature2SeparateFilters | kFeature2LineModes | (gpu_.virgl_max_dual_source_targets() >= 1 ? kFeature2DualSourceBlend : 0u) |
             // (sixteen viewports, which geometry shaders pick with gl_ViewportIndex; a vertex or evaluation shader's layer and viewport the host does not take from virgl's shaders)
-            (gpu_.virgl_has_geometry() && gpu_.virgl_max_viewports() >= kMaxViewports ? kFeature2Viewports : 0u)};
+            (gpu_.virgl_has_geometry() && gpu_.virgl_max_viewports() >= kMaxViewports ? kFeature2Viewports : 0u),
+            // (multisampled images read by shaders - texelFetch of sampler2DMS / sampler2DMSArray, depth ones too, GL 3.2 -, arrays of them drawn into a layer at a time; and the
+            // per-sample shading, interpolateAt* and gl_SampleMask(In) of GL 4.0, which the TGSI's SAMPLEID, SAMPLEMASK, INTERP_* and CENTROID / SAMPLE inputs become. No inner
+            // coverage: virgl has no conservative rasterization)
+            (gpu_.virgl_max_samples() >= 2 ? kFeature3MultisampleLoads | kFeature3MultisampleDepthLoads | kFeature3InterpolationModes | kFeature3SampleShading | kFeature3EvaluateAttributes |
+                                                 kFeature3Coverage | (gpu_.virgl_has_geometry() ? kFeature3MultisampleArrays : 0u)
+                                           : kFeature3InterpolationModes)};
   }
   // What the host's GL has (GL 3.3, which the TGSI it is given needs, at least): 16 texture units in each stage (GL_MAX_TEXTURE_IMAGE_UNITS, GL_MAX_VERTEX_TEXTURE_IMAGE_UNITS), 16
   // vertex attributes (GL_MAX_VERTEX_ATTRIBS); varyings: the vertex shader's outputs are 16 vectors in GL 4 (GL_MAX_VERTEX_OUTPUT_COMPONENTS 64), 15 in GL 3.3 (GL_MAX_VARYING_COMPONENTS

@@ -128,6 +128,15 @@ class D3d9Program {
   uint32_t required_features3() const { return extra_features3_; }   // graphics::DeviceFeature3 bits the program needs
   // What the pixel shader declared texture unit `unit` to be (a DXBC dcl_resource; the others: 2D). Binding another kind to the unit makes a draw wrong, so the kernel refuses it.
   graphics::TextureKind texture_kind(uint32_t unit) const { return unit < graphics::kMaxTextureUnits ? texture_kind_[unit] : graphics::TextureKind::Texture2D; }
+  // A pixel shader's inputs (graphics::ShaderModuleDesc::interpolation): how the varying of slot `slot` is interpolated (graphics::interpolation_word) and where the position is taken;
+  // whether it runs for each sample (SV_SampleIndex, or an input at the sample) and writes SV_Coverage.
+  uint8_t interpolation(uint32_t slot) const { return slot < graphics::kMaxVaryings ? interpolation_[slot] : 0; }
+  uint8_t position_location() const { return position_location_; }
+  bool sample_shading() const { return sample_shading_; }
+  bool writes_coverage() const { return writes_coverage_; }
+  // Whether it reads the rasterizer's sample count or positions (sampleinfo / samplepos of rasterizer): a TGSI text then reads the count from the device's constants
+  // (graphics::ShaderModuleDesc::sampler_constants, CONST[kRasterizerRegister]).
+  bool reads_rasterizer() const { return reads_rasterizer_; }
 
   // What a device must have for the program to run as written (graphics::DeviceFeature bits): a program that reads system values needs kFeatureSystemInputs (without it they read as
   // zero), one that fetches texels, samples at a level or asks the size of a texture kFeatureTexelAccess.
@@ -243,6 +252,9 @@ class D3d9Program {
   uint32_t viewport_out(const float* layer, const float* viewport) const;
   graphics::TextureKind texture_kind_[graphics::kMaxTextureUnits] = {};
   uint8_t texture_samples_[graphics::kMaxTextureUnits] = {};   // the sample count a multisampled texture was declared with
+  uint8_t interpolation_[graphics::kMaxVaryings] = {};   // (interpolation, position_location, sample_shading, writes_coverage, reads_rasterizer)
+  uint8_t position_location_ = 0;
+  bool sample_shading_ = false, writes_coverage_ = false, reads_rasterizer_ = false;
   static_assert(graphics::kMaxTextureUnits == 16, "the pairs below list every unit");
   uint8_t unit_texture_[graphics::kMaxTextureUnits] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15};   // (texture_register / sampler_register)
   uint8_t unit_sampler_[graphics::kMaxTextureUnits] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15};

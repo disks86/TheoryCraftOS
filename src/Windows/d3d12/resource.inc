@@ -721,11 +721,13 @@ static HRESULT resource_make_from(Dev *dev, const D3D12_HEAP_PROPERTIES *props, 
   ad.mips = 1;
   ad.samples = 1;
   ad.layers = 1;
-  /* (a multisampled image: a render target or depth buffer of two dimensions and one level, with a sample count the adapter has; drawn into and resolved) */
+  /* (a multisampled image: a render target or depth buffer of two dimensions and one level, with a sample count the adapter has; drawn into, resolved and - DEV_FEATURE3_MULTISAMPLE_LOADS,
+   * _DEPTH_LOADS - read by shaders; an array of them where the adapter has DEV_FEATURE3_MULTISAMPLE_ARRAYS) */
   const UINT samples = desc->SampleDesc.Count > 1 ? desc->SampleDesc.Count : 1;
-  if (samples > 1 && (samples >= 32 || !((dev->caps.sample_counts >> samples) & 1) || desc->Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || desc->DepthOrArraySize > 1 || desc->MipLevels > 1 || mode == 2 ||
+  if (samples > 1 && (samples >= 32 || !((dev->caps.sample_counts >> samples) & 1) || desc->Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || desc->MipLevels > 1 || mode == 2 ||
                       !(desc->Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL))))
     return samples < 32 && ((dev->caps.sample_counts >> samples) & 1) ? E_INVALIDARG : DXGI_ERROR_UNSUPPORTED;
+  if (samples > 1 && desc->DepthOrArraySize > 1 && !(dev->caps.features3 & DEV_FEATURE3_MULTISAMPLE_ARRAYS)) return DXGI_ERROR_UNSUPPORTED;
   ad.samples = samples;
   /* (mode: 0 an ordinary resource, 2 a reserved one, which has the 64 KiB layouts) */
   const int reserved = mode == 2;
@@ -867,7 +869,9 @@ static HRESULT resource_make_from(Dev *dev, const D3D12_HEAP_PROPERTIES *props, 
     ad.flags = want_depth ? KA_DEPTH : (target ? (KA_RENDER_TARGET | KA_TEXTURE) : KA_TEXTURE);
     /* (a depth buffer is a texture too - shader resource views of its depth, or of a D24S8's stencil: shadow maps - unless the program says it never will be, on a device that
      * reads them; one of several samples is drawn into only) */
-    if (want_depth && !(desc->Flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE) && samples == 1 && (dev->caps.features2 & DEV_FEATURE2_DEPTH_TEXTURES)) ad.flags |= KA_TEXTURE;
+    if (want_depth && !(desc->Flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE) && (dev->caps.features2 & DEV_FEATURE2_DEPTH_TEXTURES) &&
+        (samples == 1 || (dev->caps.features3 & DEV_FEATURE3_MULTISAMPLE_DEPTH_LOADS)))
+      ad.flags |= KA_TEXTURE;
     if (uav && !r->planes && !fi->narrow) ad.flags |= KA_STORAGE_IMAGE;
     if (reserved) {
       /* (the kernel's reserved textures (VidMm ReservedLayout, tile_layout): of the formats tiling is a support of (format_tiled: not the video formats, whose tiles Direct3D

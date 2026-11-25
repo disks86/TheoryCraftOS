@@ -444,6 +444,7 @@ bool Replay::begin_pass(const RenderPassBegin& p) {
     if (p.layer_count[t] > layers_) layers_ = p.layer_count[t];
   if (depth && p.layer_count[kMaxColorTargets] > layers_) layers_ = p.layer_count[kMaxColorTargets];
   in_pass_ = true;
+  constants_dirty_ = true;   // (the pass's samples are in the constant block)
   pipeline_ = nullptr;   // (every pass binds its pipeline, as on virgl)
   bound_pipeline_ = nullptr;
   viewports_[0] = {0, 0, static_cast<float>(e.width), static_cast<float>(e.height), 0, 1};
@@ -533,11 +534,12 @@ void Replay::end_pass() {
   barrier();
 }
 
-// The constant block of the next draw or dispatch, in this submit's ring (the push constants, zero up to row 256, then the bound samplers' comparisons).
+// The constant block of the next draw or dispatch, in this submit's ring (the push constants, zero up to row 256, then the bound samplers' comparisons and the pass's samples per pixel:
+// kRasterizerRegister).
 uint32_t Replay::constants_offset(bool* ok) {
   *ok = true;
   if (!constants_dirty_) return constants_at_;
-  constexpr uint32_t kBlock = (kSamplerCompareRegister + kMaxTextureUnits) * 16;
+  constexpr uint32_t kBlock = kDeviceConstantRegisters * 16;
   const uint32_t align = d_.uniform_alignment();
   const uint32_t at = (ring_used_ + align - 1) / align * align;
   VenusMemory& ring = d_.constants_ring();
@@ -553,6 +555,9 @@ uint32_t Replay::constants_offset(bool* ok) {
     sampler_compare_constant(textures_[u].image ? textures_[u].sampler.compare : CompareOp::Never, textures_[u].image && textures_[u].sampler.filter == Filter::Linear, row);
     (void)block.subview(uint64_t{kSamplerCompareRegister + u} * 16, 16).copy_from(ConstByteView(reinterpret_cast<const uint8_t*>(row), 16));   // (four floats' bytes)
   }
+  const uint32_t samples = in_pass_ && targets_[0] ? targets_[0]->desc().samples : 1u;
+  const uint32_t raster_row[4] = {samples, 0, 0, 0};
+  (void)block.subview(uint64_t{kRasterizerRegister} * 16, 16).copy_from(ConstByteView(reinterpret_cast<const uint8_t*>(raster_row), 16));   // (an unsigned integer's bits)
   constants_at_ = at;
   ring_used_ = at + kBlock;
   constants_dirty_ = false;
@@ -633,7 +638,7 @@ bool Replay::bind_resources(VenusPipeline& p, VenusPipeline::Variant& v, VkPipel
   const bool null_ok = d_.context().caps().null_descriptor;
   {
     write(tgsi::kBindingConstants, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC);
-    buffer_infos[n - 1] = {d_.constants_ring().buffer, 0, (kSamplerCompareRegister + kMaxTextureUnits) * 16};
+    buffer_infos[n - 1] = {d_.constants_ring().buffer, 0, kDeviceConstantRegisters * 16};
   }
   // texture units: draws bind units 0 .. texture_count - 1 and every one must be bound; a dispatch the units up to the highest bound (the others null)
   for (uint32_t u = 0; u < tgsi::kMaxUnits; ++u) {
@@ -1008,8 +1013,9 @@ bool Replay::resolve(const RecordedCommand& c) {
   VenusImage* dst = static_cast<VenusImage*>(c.image);
   VenusImage* src = static_cast<VenusImage*>(c.image2);
   const ResolveMode mode = static_cast<ResolveMode>(c.count);
+  const uint32_t layer = c.first;   // (the source's layer: resolve_layer)
   if (in_pass_ || !dst || !src || dst->desc().samples != 1 || src->desc().samples < 2 || dst->extent().width != src->extent().width ||
-      dst->extent().height != src->extent().height)
+      dst->extent().height != src->extent().height || layer >= src->layer_count())
     return false;
   const bool depth = src->format() == Format::D32Float;
   if (depth != (dst->format() == Format::D32Float)) return false;
@@ -1022,7 +1028,7 @@ bool Replay::resolve(const RecordedCommand& c) {
     if (!(dst->desc().usage & kImageDepthAttachment)) ok = false;
     VkRenderingAttachmentInfo dz = vk_struct<VkRenderingAttachmentInfo>(VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO);
     if (ok) {
-      dz.imageView = src->target_view(0, 0, 1);
+      dz.imageView = src->target_view(0, layer, 1);
       dz.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
       dz.resolveMode = VK_RESOLVE_MODE_SAMPLE_ZERO_BIT;
       dz.resolveImageView = dst->target_view(0, 0, 1);
@@ -1047,7 +1053,7 @@ bool Replay::resolve(const RecordedCommand& c) {
     }
   } else if (mode == ResolveMode::Average) {
     VkImageResolve r{};
-    r.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    r.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, layer, 1};
     r.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
     r.extent = {e.width, e.height, 1};
     if (src->vk_format() == dst->vk_format()) {
@@ -1066,8 +1072,8 @@ bool Replay::resolve(const RecordedCommand& c) {
       }
     }
   } else {
-    // the least or greatest sample: a full-screen draw into the destination
-    VenusPipeline* rp = (dst->desc().usage & kImageColorAttachment) ? d_.extreme_resolve_pipeline(dst->vk_format(), src->desc().samples, mode == ResolveMode::Max) : nullptr;
+    // the least or greatest sample: a full-screen draw into the destination (of layer 0: the draw's texture is the whole image)
+    VenusPipeline* rp = (dst->desc().usage & kImageColorAttachment) && layer == 0 ? d_.extreme_resolve_pipeline(dst->vk_format(), src->desc().samples, mode == ResolveMode::Max) : nullptr;
     VenusVariantKey key;
     key.unit_type[0] = static_cast<uint8_t>(value_of(src->format()));
     key.color_format[0] = dst->vk_format();

@@ -1757,11 +1757,13 @@ class SpyDevice final : public graphics::IGraphicsDevice {
   uint32_t limit = 0;   // 0: the inner device's push constant limit
   uint32_t feature_mask = 0xFFFFFFFFu;   // the features the device lets through
   uint32_t feature2_mask = 0xFFFFFFFFu;  // ... and of the second word
+  uint32_t feature3_mask = 0xFFFFFFFFu;  // ... and of the third
   bool no_blend_constant = false;        // the device says it has no constant blend factors
   graphics::DeviceInfo info() const override {
     graphics::DeviceInfo i = inner_.info();
     i.features &= feature_mask;
     i.features2 &= feature2_mask;
+    i.features3 &= feature3_mask;
     if (no_blend_constant) i.blend_constant = false;
     if (limit) i.max_push_constant_bytes = limit;
     return i;
@@ -4239,7 +4241,9 @@ void test_depth_textures_kernel() {
     CHECK(k.create_allocation(kPid, d, dd, &h) == status::kNotSupported && h == 0);
     AllocationDesc multi = dd;
     multi.samples = 4;
-    CHECK(e.kernel.create_allocation(kPid, e.dev, multi, &h) == status::kInvalidParameter && h == 0);   // (one sample)
+    CHECK(k.create_allocation(kPid, d, multi, &h) == status::kNotSupported && h == 0);   // (nor of several samples)
+    CHECK(e.kernel.create_allocation(kPid, e.dev, multi, &h) == status::kSuccess && h != 0);   // (several samples: read through Texture2DMS units, kFeature3MultisampleDepthLoads)
+    CHECK(e.kernel.destroy_allocation(kPid, h) == status::kSuccess);
   }
   // The depth pass: the top half of the buffer at depth 0.25 and stencil 5, the rest cleared to 1 and 0.
   auto vert = [](float* p, float x, float y, float z, float u, float v, float reference) { p[0] = x, p[1] = y, p[2] = z, p[3] = u / 2, p[4] = v / 2, p[5] = reference, p[6] = 1; };
@@ -4463,8 +4467,8 @@ void test_multisample() {
   CHECK(create(kAllocRenderTarget, Format::A8R8G8B8, 8) == status::kSuccess && create(kAllocDepthStencil, Format::D32Float, 4) == status::kSuccess);
   CHECK(create(kAllocRenderTarget, Format::A8R8G8B8, 3) == status::kNotSupported && create(kAllocRenderTarget, Format::A8R8G8B8, 16) == status::kNotSupported);
   CHECK(create(kAllocRenderTarget, Format::A8R8G8B8, 64) == status::kNotSupported);
-  // Render targets (that may be read by a shader, as a multisampled texture) and depth buffers only, one level, 8-bit colour.
-  CHECK(create(kAllocRenderTarget | kAllocTexture, Format::A8R8G8B8, 4) == status::kSuccess && create(kAllocDepthStencil | kAllocTexture, Format::D32Float, 4) == status::kInvalidParameter);
+  // Render targets and depth buffers only (both may be read by a shader, as a multisampled texture: kFeature3MultisampleLoads / MultisampleDepthLoads), one level, 8-bit colour.
+  CHECK(create(kAllocRenderTarget | kAllocTexture, Format::A8R8G8B8, 4) == status::kSuccess && create(kAllocDepthStencil | kAllocTexture, Format::D32Float, 4) == status::kSuccess);
   CHECK(create(kAllocTexture, Format::A8R8G8B8, 4) == status::kInvalidParameter);
   CHECK(create(kAllocRenderTarget | kAllocPresent, Format::A8R8G8B8, 4) == status::kInvalidParameter);
   CHECK(create(kAllocStaging, Format::A8R8G8B8, 4) == status::kInvalidParameter);
@@ -11609,6 +11613,385 @@ void test_barycentrics_kernel() {
   CHECK(kernel.create_shader(kPid, dev, sd, &ps) == status::kNotSupported);
 }
 
+// Multisampling in shaders (graphics::DeviceFeature3 bits 0-7) on the CPU renderer, DXBC and DXIL: samples of multisampled colour images, arrays and depth buffers read through
+// Texture2DMS units (Load, GetDimensions, GetSamplePosition), the rasterizer's count and positions, centroid, noperspective and flat inputs, shaders run for each sample
+// (SV_SampleIndex, inputs at the sample), EvaluateAttribute*, SV_Coverage in and out and SV_InnerCoverage; and the refusals of a device without them.
+void test_msaa_shaders_kernel() {
+  Env e;
+  auto shader = [&](Kernel& k, Handle device, const char* name, graphics::ShaderStage stage, Handle* out) {
+    const std::vector<uint8_t> code = read_blob(name);
+    ShaderDesc sd;
+    sd.kind = ShaderKind::Dxbc, sd.stage = stage, sd.code = ConstByteView(code.data(), code.size());
+    if (code.empty()) return status::kNotFound;
+    return k.create_shader(kPid, device, sd, out);
+  };
+  // (every fixture is a program the kernel takes)
+  for (const char* name : {"vs_msaa.dxbc", "ps_ms_load.dxbc", "ps_ms_info.dxbc", "ps_ms_array.dxbc", "ps_ms_depth.dxbc", "ps_ms_stencil.dxbc", "ps_centre.dxbc", "ps_centroid.dxbc",
+                           "ps_noperspective.dxbc", "ps_perspective.dxbc", "ps_flat.dxbc", "ps_sample_index.dxbc", "ps_sample_input.dxbc", "ps_eval.dxbc", "ps_coverage.dxbc", "ps_omask.dxbc",
+                           "ps_rt_info.dxbc", "ps_inner.dxbc", "dxil_ps_ms_load.dxil", "dxil_ps_ms_info.dxil", "dxil_ps_ms_array.dxil", "dxil_ps_ms_depth.dxil", "dxil_ps_centroid.dxil",
+                           "dxil_ps_noperspective.dxil", "dxil_ps_flat.dxil", "dxil_ps_sample_index.dxil", "dxil_ps_sample_input.dxil", "dxil_ps_eval.dxil", "dxil_ps_coverage.dxil",
+                           "dxil_ps_omask.dxil", "dxil_ps_rt_info.dxil", "dxil_ps_inner.dxil"}) {
+    const std::vector<uint8_t> code = read_blob(name);
+    UniquePointer<D3d9Program> program;
+    const NtStatus st = D3d9Program::compile_dxbc(e.allocator, ConstByteView(code.data(), code.size()), &program);
+    if (st != status::kSuccess) printf("  msaa fixture %s: %x\n", name, static_cast<unsigned>(st));
+    CHECK(st == status::kSuccess);
+  }
+  Handle vs = 0;
+  CHECK(shader(e.kernel, e.dev, "vs_msaa.dxbc", graphics::ShaderStage::Vertex, &vs) == status::kSuccess);
+  // A pipeline of vs_msaa and the pixel shader `name` (textures: units it reads), with coverage per sample.
+  auto pipeline = [&](const char* name, uint32_t textures, bool conservative = false) {
+    Handle ps = 0, out = 0;
+    CHECK(shader(e.kernel, e.dev, name, graphics::ShaderStage::Fragment, &ps) == status::kSuccess);
+    PipelineDesc pd;
+    pd.vertex_shader = vs, pd.fragment_shader = ps, pd.vertex_stride = 28, pd.attribute_count = 2, pd.varying_count = 2, pd.texture_count = textures;
+    pd.attributes[0] = {0, graphics::VertexFormat::Float3, 0};
+    pd.attributes[1] = {1, graphics::VertexFormat::Float4, 12};
+    pd.cull_mode = graphics::CullMode::None;
+    pd.multisample = true;
+    pd.conservative = conservative;
+    CHECK(e.kernel.create_pipeline(kPid, e.dev, pd, &out) == status::kSuccess);
+    return out;
+  };
+  struct V {
+    float x, y, z, r, g, b, w;
+  };
+  // (a point of the target in pixels (y down) as a vertex: of a target `size` pixels wide and high)
+  auto at = [](float px, float py, float size, float r, float g, float b, float w = 1, float z = 0.5f) { return V{px / size * 2 - 1, 1 - py / size * 2, z, r, g, b, w}; };
+  const Handle vb = e.buffer(kAllocVertexBuffer, 64 * sizeof(V));
+  auto draw = [&](Handle pipe, Handle target, const V* v, uint32_t count, Handle depth = 0, uint32_t first_layer = 0, uint32_t layers = 0) {
+    if (!e.write(vb, ConstByteView(reinterpret_cast<const uint8_t*>(v), uint64_t{count} * sizeof(V)))) return status::kInvalidParameter;
+    CommandWriter w(e.allocator);
+    const uint32_t flags = kPassClearColor | (depth ? kPassClearDepth : 0u);
+    if (layers) w.begin_pass_layers(0, {}, depth ? 2u : kNoAllocation, flags, {0, 0, 0, 1}, 1.0f, 0, {first_layer, layers, depth ? first_layer : 0u, depth ? layers : 1u});
+    else w.begin_pass(0, depth ? 2u : kNoAllocation, flags, {0, 0, 0, 1}, 1.0f, 0);
+    w.bind_pipeline(pipe);
+    w.bind_vertex_buffer(1);
+    w.draw(count);
+    w.end_pass();
+    return e.render(w, {target, vb, depth ? depth : target});
+  };
+  // A rectangle of quads from (x0, y0) to (x1, y1) pixels.
+  auto rect = [&](V* v, float x0, float y0, float x1, float y1, float size, float r, float g, float b, float z = 0.5f) {
+    v[0] = at(x0, y0, size, r, g, b, 1, z), v[1] = at(x1, y0, size, r, g, b, 1, z), v[2] = at(x0, y1, size, r, g, b, 1, z);
+    v[3] = at(x0, y1, size, r, g, b, 1, z), v[4] = at(x1, y0, size, r, g, b, 1, z), v[5] = at(x1, y1, size, r, g, b, 1, z);
+  };
+  // Reads the samples of a 16 x 16 multisampled image of four samples through `reader` (a Texture2DMS reader: pixel (x, y) of the 64 x `rows` result is sample x mod 4 of (x / 4, y)).
+  const Handle readout = e.alloc(kTarget, Format::A8R8G8B8, 64, 48);
+  auto read_samples = [&](Handle reader, Handle image, uint32_t rows = 16) {
+    V full[3] = {at(0, 0, 64, 1, 1, 1), at(128, 0, 64, 1, 1, 1), at(0, 128, 64, 1, 1, 1)};
+    if (!e.write(vb, ConstByteView(reinterpret_cast<const uint8_t*>(full), sizeof full))) return status::kInvalidParameter;
+    CommandWriter w(e.allocator);
+    w.begin_pass(0, kNoAllocation, kPassClearColor, {0, 0, 0, 0}, 1.0f, 0);
+    w.bind_pipeline(reader);
+    w.bind_vertex_buffer(1);
+    w.bind_texture(0, 2, graphics::SamplerDesc());
+    w.draw(3);
+    w.end_pass();
+    (void)rows;
+    return e.render(w, {readout, vb, image});
+  };
+  auto sample_of = [&](uint32_t x, uint32_t y, uint32_t k) { return e.pixel(readout, x * 4 + k, y); };
+  const graphics::SamplePosition* four = graphics::standard_sample_positions(4);
+  auto covered_by = [&](float x0, float x1, uint32_t px, uint32_t k) {   // (sample k of pixel column px inside x0 .. x1)
+    const float sx = static_cast<float>(px) + 0.5f + static_cast<float>(four[k].x) / 16.0f;
+    return sx >= x0 && sx < x1;
+  };
+
+  AllocationDesc md;
+  md.flags = kAllocRenderTarget | kAllocTexture, md.format = Format::A8R8G8B8, md.width = md.height = 16, md.samples = 4;
+  Handle ms = 0;
+  CHECK(e.kernel.create_allocation(kPid, e.dev, md, &ms) == status::kSuccess);
+  const Handle ms_load = pipeline("ps_ms_load.dxbc", 1), ms_info = pipeline("ps_ms_info.dxbc", 1);
+  const Handle colour = pipeline("ps_flat.dxbc", 0);
+  // Every sample: a red rectangle from x = 4.3 to 12.6 over the whole height.
+  {
+    V v[6];
+    rect(v, 4.3f, 0, 12.6f, 16, 16, 1, 0, 0);
+    CHECK(draw(colour, ms, v, 6) == status::kSuccess);
+    CHECK(read_samples(ms_load, ms) == status::kSuccess);
+    uint32_t right = 0, wrong = 0;
+    for (uint32_t x = 0; x < 16; ++x)
+      for (uint32_t k = 0; k < 4; ++k) {
+        const uint32_t want = covered_by(4.3f, 12.6f, x, k) ? 0xFFFF0000u : 0xFF000000u;
+        (sample_of(x, 7, k) == want ? right : wrong) += 1;
+      }
+    printf("  msaa: %u samples as drawn, %u not (pixel 4: %08x %08x %08x %08x)\n", right, wrong, sample_of(4, 7, 0), sample_of(4, 7, 1), sample_of(4, 7, 2), sample_of(4, 7, 3));
+    CHECK(wrong == 0 && right == 64);
+    // GetDimensions and GetSamplePosition
+    CHECK(read_samples(ms_info, ms) == status::kSuccess);
+    bool info = true;
+    for (uint32_t k = 0; k < 4; ++k) {
+      const uint32_t p = e.pixel(readout, k, 3);   // (readout x = k: GetSamplePosition(k))
+      info = info && ((p >> 16) & 0xFF) == 16 && ((p >> 8) & 0xFF) == 16 && (p & 0xFF) == 4 * 16 + static_cast<uint32_t>(four[k].x + 8) && (p >> 24) == static_cast<uint32_t>(four[k].y + 8);
+    }
+    CHECK(info);
+  }
+  // The rasterizer's count and positions, drawn into the multisampled image (every sample the same: the pixel's)
+  {
+    const Handle rt_info = pipeline("ps_rt_info.dxbc", 0);
+    V v[6];
+    rect(v, 0, 0, 16, 16, 16, 1, 1, 1);
+    CHECK(draw(rt_info, ms, v, 6) == status::kSuccess && read_samples(ms_load, ms) == status::kSuccess);
+    bool ok = true;
+    for (uint32_t x = 0; x < 8; ++x) {
+      const uint32_t p = sample_of(x, 2, 1);
+      ok = ok && ((p >> 16) & 0xFF) == 64 && ((p >> 8) & 0xFF) == static_cast<uint32_t>(four[x % 4].x + 8) && (p & 0xFF) == static_cast<uint32_t>(four[x % 4].y + 8);
+    }
+    CHECK(ok);
+  }
+  // A multisampled array: layer 0 red on the left half, layer 1 green on the right, read through Texture2DMSArray (and its GetDimensions); then layer 1 resolved.
+  {
+    AllocationDesc ad = md;
+    ad.kind = graphics::TextureKind::Texture2DArray, ad.layers = 2;
+    Handle array = 0;
+    CHECK(e.kernel.create_allocation(kPid, e.dev, ad, &array) == status::kSuccess);
+    V v[6];
+    rect(v, 0, 0, 8, 16, 16, 1, 0, 0);
+    CHECK(draw(colour, array, v, 6, 0, 0, 1) == status::kSuccess);
+    rect(v, 8, 0, 16, 16, 16, 0, 1, 0);
+    CHECK(draw(colour, array, v, 6, 0, 1, 1) == status::kSuccess);
+    const Handle ms_array = pipeline("ps_ms_array.dxbc", 1);
+    CHECK(read_samples(ms_array, array) == status::kSuccess);
+    const uint32_t info = e.pixel(readout, 0, 40);
+    printf("  msaa array: %08x %08x %08x %08x, dimensions %08x\n", e.pixel(readout, 4, 2), e.pixel(readout, 60, 2), e.pixel(readout, 4, 18), e.pixel(readout, 60, 18), info);
+    CHECK(e.pixel(readout, 4, 2) == 0xFFFF0000u && e.pixel(readout, 60, 2) == 0xFF000000u && e.pixel(readout, 4, 18) == 0xFF000000u && e.pixel(readout, 60, 18) == 0xFF00FF00u);
+    CHECK(info == 0x04101002u);   // (16 wide, 16 high, 2 layers, 4 samples)
+    const Handle plain = e.alloc(kTarget, Format::A8R8G8B8, 16, 16);
+    CommandWriter w(e.allocator);
+    w.resolve_region_layer(0, 1, 0, 1);
+    CHECK(e.render(w, {plain, array}) == status::kSuccess);
+    CHECK(e.pixel(plain, 12, 4) == 0xFF00FF00u && e.pixel(plain, 3, 4) == 0xFF000000u);
+    CommandWriter bad(e.allocator);
+    bad.resolve_region_layer(0, 1, 0, 2);   // (no layer 2)
+    CHECK(e.render(bad, {plain, array}) == status::kInvalidParameter);
+  }
+  // A multisampled depth buffer read by a shader: a rectangle at depth 0.25 from x = 4.3, the rest cleared to 1.
+  {
+    AllocationDesc dd;
+    dd.flags = kAllocDepthStencil | kAllocTexture, dd.format = Format::D32Float, dd.width = dd.height = 16, dd.samples = 4;
+    Handle depth = 0;
+    CHECK(e.kernel.create_allocation(kPid, e.dev, dd, &depth) == status::kSuccess);
+    Handle ps = 0, with_depth = 0;
+    CHECK(shader(e.kernel, e.dev, "ps_flat.dxbc", graphics::ShaderStage::Fragment, &ps) == status::kSuccess);
+    PipelineDesc pd;
+    pd.vertex_shader = vs, pd.fragment_shader = ps, pd.vertex_stride = 28, pd.attribute_count = 2, pd.varying_count = 2;
+    pd.attributes[0] = {0, graphics::VertexFormat::Float3, 0};
+    pd.attributes[1] = {1, graphics::VertexFormat::Float4, 12};
+    pd.cull_mode = graphics::CullMode::None;
+    pd.multisample = true, pd.depth_test = pd.depth_write = true;
+    CHECK(e.kernel.create_pipeline(kPid, e.dev, pd, &with_depth) == status::kSuccess);
+    V v[6];
+    rect(v, 4.3f, 0, 16, 16, 16, 1, 1, 1, 0.25f);
+    CHECK(draw(with_depth, ms, v, 6, depth) == status::kSuccess);
+    const Handle ms_depth = pipeline("ps_ms_depth.dxbc", 1);
+    CHECK(read_samples(ms_depth, depth) == status::kSuccess);
+    bool ok = true;
+    for (uint32_t x = 3; x < 6; ++x)
+      for (uint32_t k = 0; k < 4; ++k) ok = ok && ((sample_of(x, 5, k) >> 16) & 0xFF) == (covered_by(4.3f, 16, x, k) ? 64u : 255u);
+    CHECK(ok);
+  }
+  // Centroid: a triangle whose red is the weight of its vertex at the top - zero along its lower edge, below zero beyond. At the centre, partly covered pixels below that edge read red
+  // below zero; at the centroid none does.
+  {
+    V t[3] = {at(-4, 12.37f, 16, 0, 0, 0), at(20, 12.37f, 16, 0, 0, 0), at(8, -10, 16, 1, 0, 0)};
+    {
+      // (a rectangle's lower edge through the row's lower samples, at 12.37: sample 0 of row 12 - at 12.125 - is inside, the others are not; its upper edge at 3.4 keeps samples 2 and 3 of row 3)
+      V r6[6];
+      rect(r6, 0, 3.4f, 16, 12.37f, 16, 1, 1, 1);
+      CHECK(draw(colour, ms, r6, 6) == status::kSuccess && read_samples(ms_load, ms) == status::kSuccess);
+      CHECK(sample_of(5, 3, 0) == 0xFF000000u && sample_of(5, 3, 1) == 0xFF000000u && sample_of(5, 3, 2) == 0xFFFFFFFFu && sample_of(5, 3, 3) == 0xFFFFFFFFu);
+      CHECK(sample_of(5, 12, 0) == 0xFFFFFFFFu && sample_of(5, 12, 1) == 0xFF000000u && sample_of(5, 12, 2) == 0xFF000000u && sample_of(5, 12, 3) == 0xFF000000u);
+    }
+    auto reds = [&](const char* name) {
+      CHECK(draw(pipeline(name, 0), ms, t, 3) == status::kSuccess && read_samples(ms_load, ms) == status::kSuccess);
+      uint32_t n = 0, lit = 0;
+      for (uint32_t y = 0; y < 16; ++y)
+        for (uint32_t x = 0; x < 64; ++x) {
+          const uint32_t p = e.pixel(readout, x, y);
+          n += ((p >> 16) & 0xFF) == 255;
+          lit += (p & 0xFFFFFF) != 0;
+        }
+      printf("  msaa %s: %u of %u covered samples below zero\n", name, n, lit);
+      return n;
+    };
+    CHECK(reds("ps_centre.dxbc") >= 16 && reds("ps_centroid.dxbc") == 0 && reds("dxil_ps_centroid.dxil") == 0);
+  }
+  // noperspective (the vertices' w 1 and 4): linear in the screen, as the pixel's own x; the perspective-correct value is not.
+  {
+    const Handle plain = e.alloc(kTarget, Format::A8R8G8B8, 64, 64);
+    V t[3] = {{-1, -1, 0.5f, -1, 0, 0, 1}, {1, -1, 0.5f, 1, 0, 0, 4}, {-1, 1, 0.5f, -1, 0, 0, 4}};
+    auto worst = [&](const char* name) {
+      Handle ps = 0, pipe = 0;
+      CHECK(shader(e.kernel, e.dev, name, graphics::ShaderStage::Fragment, &ps) == status::kSuccess);
+      PipelineDesc pd;
+      pd.vertex_shader = vs, pd.fragment_shader = ps, pd.vertex_stride = 28, pd.attribute_count = 2, pd.varying_count = 2;
+      pd.attributes[0] = {0, graphics::VertexFormat::Float3, 0};
+      pd.attributes[1] = {1, graphics::VertexFormat::Float4, 12};
+      pd.cull_mode = graphics::CullMode::None;
+      CHECK(e.kernel.create_pipeline(kPid, e.dev, pd, &pipe) == status::kSuccess);
+      CHECK(draw(pipe, plain, t, 3) == status::kSuccess);
+      uint32_t most = 0;
+      for (uint32_t y = 0; y < 64; ++y)
+        for (uint32_t x = 0; x + 2 < y; ++x) {
+          const uint32_t r = (e.pixel(plain, x, y) >> 16) & 0xFF;
+          if (r > most) most = r;
+        }
+      return most;
+    };
+    const uint32_t linear = worst("ps_noperspective.dxbc"), dxil = worst("dxil_ps_noperspective.dxil"), perspective = worst("ps_perspective.dxbc");
+    printf("  noperspective: worst %u (DXIL %u), perspective-correct %u\n", linear, dxil, perspective);
+    CHECK(linear <= 2 && dxil <= 2 && perspective >= 64);
+    // nointerpolation: the first vertex's colour all over (the vertices red, green and blue)
+    V f[3] = {{-1, -1, 0.5f, 1, 0, 0, 1}, {1, -1, 0.5f, 0, 1, 0, 1}, {-1, 1, 0.5f, 0, 0, 1, 1}};
+    for (const char* name : {"ps_flat.dxbc", "dxil_ps_flat.dxil"}) {
+      Handle ps = 0, pipe = 0;
+      CHECK(shader(e.kernel, e.dev, name, graphics::ShaderStage::Fragment, &ps) == status::kSuccess);
+      PipelineDesc pd;
+      pd.vertex_shader = vs, pd.fragment_shader = ps, pd.vertex_stride = 28, pd.attribute_count = 2, pd.varying_count = 2;
+      pd.attributes[0] = {0, graphics::VertexFormat::Float3, 0};
+      pd.attributes[1] = {1, graphics::VertexFormat::Float4, 12};
+      pd.cull_mode = graphics::CullMode::None;
+      CHECK(e.kernel.create_pipeline(kPid, e.dev, pd, &pipe) == status::kSuccess);
+      CHECK(draw(pipe, plain, f, 3) == status::kSuccess);
+      CHECK(e.pixel(plain, 3, 60) == 0xFFFF0000u && e.pixel(plain, 20, 40) == 0xFFFF0000u && e.pixel(plain, 1, 10) == 0xFFFF0000u && e.pixel(plain, 50, 10) == 0xFF000000u);
+    }
+  }
+  // Shaders run for each sample: SV_SampleIndex (and the position at the sample, SV_Coverage's own bit), and an input at the sample (red and green the screen's x and y over 16).
+  {
+    V v[6];
+    rect(v, 0, 0, 16, 16, 16, 1, 1, 1);
+    for (const char* name : {"ps_sample_index.dxbc", "dxil_ps_sample_index.dxil"}) {
+      CHECK(draw(pipeline(name, 0), ms, v, 6) == status::kSuccess && read_samples(ms_load, ms) == status::kSuccess);
+      bool ok = true;
+      for (uint32_t k = 0; k < 4; ++k) {
+        const uint32_t p = sample_of(5, 6, k);
+        const uint32_t r = (p >> 16) & 0xFF, g = (p >> 8) & 0xFF, b = p & 0xFF;
+        ok = ok && close8(r, (k + 1) * 64 - (k == 3 ? 1 : 0), 1) && g == static_cast<uint32_t>(four[k].x + 8) && b == (16u << k);
+        if (!ok) printf("  sample index %s: sample %u %08x\n", name, k, p);
+      }
+      CHECK(ok);
+    }
+    V g[6];
+    // (the colour: x / 16 and y / 16 of the screen at each vertex, so the fractions of r * 16 * 4 ... ps_sample_input takes x * 64: a 64-wide screen's; drawn into a 16 x 16 image the
+    // colours are x / 64 and y / 64 at the corners (0, 0) .. (16, 16) as a 64-wide screen would have them, i.e. the pixel's own coordinates over 64)
+    g[0] = at(0, 0, 16, 0, 0, 0), g[1] = at(16, 0, 16, 16.0f / 64, 0, 0), g[2] = at(0, 16, 16, 0, 16.0f / 64, 0);
+    g[3] = at(0, 16, 16, 0, 16.0f / 64, 0), g[4] = at(16, 0, 16, 16.0f / 64, 0, 0), g[5] = at(16, 16, 16, 16.0f / 64, 16.0f / 64, 0);
+    for (const char* name : {"ps_sample_input.dxbc", "dxil_ps_sample_input.dxil"}) {
+      CHECK(draw(pipeline(name, 0), ms, g, 6) == status::kSuccess && read_samples(ms_load, ms) == status::kSuccess);
+      bool ok = true;
+      for (uint32_t k = 0; k < 4; ++k) {
+        const uint32_t p = sample_of(6, 9, k);
+        ok = ok && close8((p >> 16) & 0xFF, static_cast<uint32_t>(four[k].x + 8), 1) && close8((p >> 8) & 0xFF, static_cast<uint32_t>(four[k].y + 8), 1);
+        if (!ok) printf("  sample input %s: sample %u %08x\n", name, k, p);
+      }
+      CHECK(ok);
+    }
+    // EvaluateAttributeAtSample (sample y mod 4), Snapped (x mod 16 - 8 sixteenths) and Centroid (the centre: every sample covered)
+    for (const char* name : {"ps_eval.dxbc", "dxil_ps_eval.dxil"}) {
+      CHECK(draw(pipeline(name, 0), ms, g, 6) == status::kSuccess && read_samples(ms_load, ms) == status::kSuccess);
+      bool ok = true;
+      for (uint32_t y = 0; y < 4; ++y)
+        for (uint32_t x = 0; x < 16; ++x) {
+          const uint32_t p = sample_of(x, y, 0);
+          ok = ok && close8((p >> 16) & 0xFF, static_cast<uint32_t>(four[y].x + 8), 1) && close8((p >> 8) & 0xFF, static_cast<uint32_t>(four[y].y + 8), 1) &&
+               close8(p & 0xFF, x & 15, 1) && close8(p >> 24, 8, 1);
+          if (!ok) {
+            printf("  evaluate %s: pixel (%u, %u) %08x\n", name, x, y, p);
+            y = 4;
+            break;
+          }
+        }
+      CHECK(ok);
+    }
+  }
+  // SV_Coverage in (the rectangle from x = 4.3 to 12.6: 4 samples inside, 3 at pixel 4, 1 at 12) and out (white to the samples of the mask x mod 16).
+  {
+    V v[6];
+    rect(v, 4.3f, 0, 12.6f, 16, 16, 1, 1, 1);
+    for (const char* name : {"ps_coverage.dxbc", "dxil_ps_coverage.dxil"}) {
+      CHECK(draw(pipeline(name, 0), ms, v, 6) == status::kSuccess && read_samples(ms_load, ms) == status::kSuccess);
+      bool ok = true;
+      for (uint32_t x = 3; x < 14; ++x) {
+        if (x >= 7 && x <= 9) continue;   // (the rectangle's diagonal crosses row 8 at 8.45: each of its triangles covers part of those pixels, and SV_Coverage is the triangle's)
+        uint32_t mask = 0;
+        for (uint32_t k = 0; k < 4; ++k) mask |= covered_by(4.3f, 12.6f, x, k) ? 1u << k : 0u;
+        for (uint32_t k = 0; k < 4; ++k) {
+          if (!(mask >> k & 1)) continue;
+          const uint32_t p = sample_of(x, 8, k);
+          const bool right = close8((p >> 16) & 0xFF, (static_cast<uint32_t>(__builtin_popcount(mask)) * 255 + 2) / 4, 1) && ((p >> 8) & 0xFF) == mask * 16;
+          if (!right && ok) printf("  coverage %s: pixel %u sample %u %08x (mask %x)\n", name, x, k, p, mask);
+          ok = ok && right;
+        }
+      }
+      CHECK(ok);
+    }
+    rect(v, 0, 0, 16, 16, 16, 1, 1, 1);
+    for (const char* name : {"ps_omask.dxbc", "dxil_ps_omask.dxil"}) {
+      CHECK(draw(pipeline(name, 0), ms, v, 6) == status::kSuccess && read_samples(ms_load, ms) == status::kSuccess);
+      bool ok = true;
+      for (uint32_t x = 0; x < 16; ++x)
+        for (uint32_t k = 0; k < 4; ++k) ok = ok && sample_of(x, 3, k) == ((x >> k & 1) ? 0xFFFFFFFFu : 0xFF000000u);
+      CHECK(ok);
+    }
+  }
+  // SV_InnerCoverage with conservative rasterization: whole pixels green, the edge's red.
+  {
+    const Handle plain = e.alloc(kTarget, Format::A8R8G8B8, 16, 16);
+    V t[3] = {at(2.3f, 2.2f, 16, 1, 1, 1), at(14.6f, 2.2f, 16, 1, 1, 1), at(2.3f, 14.7f, 16, 1, 1, 1)};
+    for (const char* name : {"ps_inner.dxbc", "dxil_ps_inner.dxil"}) {
+      CHECK(draw(pipeline(name, 0, true), plain, t, 3) == status::kSuccess);
+      CHECK(e.pixel(plain, 5, 5) == 0xFF00FF00u && e.pixel(plain, 2, 5) == 0xFFFF0000u && e.pixel(plain, 5, 2) == 0xFFFF0000u && e.pixel(plain, 0, 0) == 0xFF000000u);
+    }
+  }
+  // DXIL's Texture2DMS reads: the same samples as the DXBC shader's.
+  {
+    V v[6];
+    rect(v, 4.3f, 0, 12.6f, 16, 16, 1, 0, 0);
+    CHECK(draw(colour, ms, v, 6) == status::kSuccess);
+    CHECK(read_samples(ms_load, ms) == status::kSuccess);
+    uint32_t dxbc[64];
+    for (uint32_t x = 0; x < 64; ++x) dxbc[x] = e.pixel(readout, x, 7);
+    CHECK(read_samples(pipeline("dxil_ps_ms_load.dxil", 1), ms) == status::kSuccess);
+    bool same = true;
+    for (uint32_t x = 0; x < 64; ++x) same = same && e.pixel(readout, x, 7) == dxbc[x];
+    CHECK(same);
+    CHECK(read_samples(pipeline("dxil_ps_ms_info.dxil", 1), ms) == status::kSuccess);
+    const uint32_t p = e.pixel(readout, 1, 3);
+    CHECK(((p >> 16) & 0xFF) == 16 && (p & 0xFF) == 4 * 16 + static_cast<uint32_t>(four[1].x + 8) && (p >> 24) == static_cast<uint32_t>(four[1].y + 8));
+    const Handle rt_info = pipeline("dxil_ps_rt_info.dxil", 0);
+    rect(v, 0, 0, 16, 16, 16, 1, 1, 1);
+    CHECK(draw(rt_info, ms, v, 6) == status::kSuccess && read_samples(ms_load, ms) == status::kSuccess);
+    const uint32_t q = sample_of(2, 2, 0);
+    CHECK(((q >> 16) & 0xFF) == 64 && ((q >> 8) & 0xFF) == static_cast<uint32_t>(four[2].x + 8));
+  }
+
+  // A device without them refuses the shaders and the images.
+  FakeScreen screen(8, 6);
+  graphics::SoftwareDevice software(e.allocator, &screen);
+  SpyDevice limited(software);
+  limited.feature3_mask = 0;
+  Kernel kernel(e.allocator);
+  AdapterConfig c;
+  c.display = &screen;
+  kernel.add_adapter(limited, c);
+  Handle adapter = 0, dev = 0, refused = 0;
+  CHECK(kernel.open_process(kPid) == status::kSuccess && kernel.open_adapter_from_index(kPid, 0, &adapter) == status::kSuccess && kernel.create_device(kPid, adapter, &dev) == status::kSuccess);
+  for (const char* name : {"ps_ms_load.dxbc", "ps_ms_array.dxbc", "ps_centroid.dxbc", "ps_noperspective.dxbc", "ps_sample_index.dxbc", "ps_sample_input.dxbc", "ps_eval.dxbc",
+                           "ps_coverage.dxbc", "ps_omask.dxbc", "ps_rt_info.dxbc", "ps_inner.dxbc", "dxil_ps_ms_load.dxil", "dxil_ps_eval.dxil", "dxil_ps_coverage.dxil"}) {
+    const NtStatus st = shader(kernel, dev, name, graphics::ShaderStage::Fragment, &refused);
+    if (st != status::kNotSupported) printf("  msaa: %s on a device without the features: %x\n", name, static_cast<unsigned>(st));
+    CHECK(st == status::kNotSupported);
+  }
+  CHECK(shader(kernel, dev, "ps_flat.dxbc", graphics::ShaderStage::Fragment, &refused) == status::kSuccess);   // (flat inputs need nothing)
+  AllocationDesc dd;
+  dd.flags = kAllocDepthStencil | kAllocTexture, dd.format = Format::D32Float, dd.width = dd.height = 16, dd.samples = 4;
+  CHECK(kernel.create_allocation(kPid, dev, dd, &refused) == status::kNotSupported);
+  AllocationDesc ad = md;
+  ad.kind = graphics::TextureKind::Texture2DArray, ad.layers = 2;
+  CHECK(kernel.create_allocation(kPid, dev, ad, &refused) == status::kNotSupported);
+}
+
 int main() {
   test_handle_table();
   test_adapters_and_processes();
@@ -11703,6 +12086,7 @@ int main() {
   test_shading_rate_kernel();
   test_dxil_sm61_values();
   test_barycentrics_kernel();
+  test_msaa_shaders_kernel();
   if (g_failed) {
     printf("%d check(s) failed\n", g_failed);
     return 1;

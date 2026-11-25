@@ -230,8 +230,11 @@ static int srv_view(const Resource *r, const D3D12_SHADER_RESOURCE_VIEW_DESC *de
       first_level = desc->Texture2DArray.MostDetailedMip, levels = desc->Texture2DArray.MipLevels, first = desc->Texture2DArray.FirstArraySlice, count = desc->Texture2DArray.ArraySize;
       clamp = desc->Texture2DArray.ResourceMinLODClamp;
       break;
-    case D3D12_SRV_DIMENSION_TEXTURE2DMS: count = 1; break;
-    case D3D12_SRV_DIMENSION_TEXTURE2DMSARRAY: first = desc->Texture2DMSArray.FirstArraySlice, count = desc->Texture2DMSArray.ArraySize; break;
+    case D3D12_SRV_DIMENSION_TEXTURE2DMS: if (r->desc.SampleDesc.Count < 2) return 0; count = 1; break;      /* (of a multisampled resource only, and it of these only) */
+    case D3D12_SRV_DIMENSION_TEXTURE2DMSARRAY:
+      if (r->desc.SampleDesc.Count < 2) return 0;
+      first = desc->Texture2DMSArray.FirstArraySlice, count = desc->Texture2DMSArray.ArraySize;
+      break;
     case D3D12_SRV_DIMENSION_TEXTURE3D: first_level = desc->Texture3D.MostDetailedMip, levels = desc->Texture3D.MipLevels, clamp = desc->Texture3D.ResourceMinLODClamp; break;
     case D3D12_SRV_DIMENSION_TEXTURECUBE:
       first_level = desc->TextureCube.MostDetailedMip, levels = desc->TextureCube.MipLevels, count = 6, clamp = desc->TextureCube.ResourceMinLODClamp;
@@ -243,6 +246,7 @@ static int srv_view(const Resource *r, const D3D12_SHADER_RESOURCE_VIEW_DESC *de
       break;
     default: return 1;      /* (UNKNOWN: the whole of it) */
   }
+  if (r->desc.SampleDesc.Count > 1 && desc->ViewDimension != D3D12_SRV_DIMENSION_TEXTURE2DMS && desc->ViewDimension != D3D12_SRV_DIMENSION_TEXTURE2DMSARRAY) return 0;
   /* (ResourceMinLODClamp: the most detailed level a lookup takes, counted in the resource's levels - not the view's -, which the kernel raises the sampler's MinLOD to (the
    * descriptor's min_lod word); below 0 or not a number is no clamp, as the debug layer's error leaves it on Windows, and a clamp past the view's last level reads its last) */
   if (clamp > 0.0f) d->sampler[2] = bits_of(clamp > 1000.0f ? 1000.0f : clamp);
@@ -267,7 +271,8 @@ static int srv_view(const Resource *r, const D3D12_SHADER_RESOURCE_VIEW_DESC *de
  * as (a volume, multisampled) or a buffer that cannot be read is a null view (the debug layer's error on Windows). */
 static void depth_srv(const Resource *r, const D3D12_SHADER_RESOURCE_VIEW_DESC *desc, SoftDesc *d) {
   d->kind = 0;
-  if (!desc || r->desc.SampleDesc.Count > 1) return;
+  if (!desc) return;
+  const int multisampled = r->desc.SampleDesc.Count > 1;      /* (its samples, through Texture2DMS / Texture2DMSArray views: KA_TEXTURE only where the adapter reads them) */
   const DXGI_FORMAT res = r->desc.Format;
   const int d32 = res == DXGI_FORMAT_D32_FLOAT || res == DXGI_FORMAT_R32_TYPELESS, d16 = res == DXGI_FORMAT_D16_UNORM || res == DXGI_FORMAT_R16_TYPELESS;
   const int d24s8 = res == DXGI_FORMAT_D24_UNORM_S8_UINT || res == DXGI_FORMAT_R24G8_TYPELESS, d32s8 = res == DXGI_FORMAT_D32_FLOAT_S8X24_UINT || res == DXGI_FORMAT_R32G8X24_TYPELESS;
@@ -288,8 +293,11 @@ static void depth_srv(const Resource *r, const D3D12_SHADER_RESOURCE_VIEW_DESC *
     case D3D12_SRV_DIMENSION_TEXTURE2DARRAY: plane = desc->Texture2DArray.PlaneSlice; break;
     case D3D12_SRV_DIMENSION_TEXTURE1D: case D3D12_SRV_DIMENSION_TEXTURE1DARRAY: break;
     case D3D12_SRV_DIMENSION_TEXTURECUBE: case D3D12_SRV_DIMENSION_TEXTURECUBEARRAY: if (!cube) return; break;
+    case D3D12_SRV_DIMENSION_TEXTURE2DMS: case D3D12_SRV_DIMENSION_TEXTURE2DMSARRAY: plane = (UINT)stencil; break;      /* (no plane slice: the format names it) */
     default: return;
   }
+  const int ms_view = desc->ViewDimension == D3D12_SRV_DIMENSION_TEXTURE2DMS || desc->ViewDimension == D3D12_SRV_DIMENSION_TEXTURE2DMSARRAY;
+  if (multisampled != ms_view) return;
   /* (the plane the format names: 1 the stencil's) */
   if (plane != (UINT)stencil || r->kind == 1) return;
   d->kind = DK_SRV;
@@ -542,6 +550,9 @@ static void STDMETHODCALLTYPE dev_CreateRenderTargetView(Dev *This, ID3D12Resour
       d.mip = desc->Texture2DArray.MipSlice;
       if (!view_layers(r, desc->Texture2DArray.FirstArraySlice, desc->Texture2DArray.ArraySize, &d.slice, &d.stride)) d.kind = 0;
     }
+    if (desc && desc->ViewDimension == D3D12_RTV_DIMENSION_TEXTURE2DMSARRAY && !view_layers(r, desc->Texture2DMSArray.FirstArraySlice, desc->Texture2DMSArray.ArraySize, &d.slice, &d.stride))
+      d.kind = 0;      /* (layers of a multisampled array) */
+    if (desc && (desc->ViewDimension == D3D12_RTV_DIMENSION_TEXTURE2DMS || desc->ViewDimension == D3D12_RTV_DIMENSION_TEXTURE2DMSARRAY) && r->desc.SampleDesc.Count < 2) d.kind = 0;
     if (desc && desc->ViewDimension == D3D12_RTV_DIMENSION_TEXTURE1DARRAY) {
       d.mip = desc->Texture1DArray.MipSlice;
       if (!view_layers(r, desc->Texture1DArray.FirstArraySlice, desc->Texture1DArray.ArraySize, &d.slice, &d.stride)) d.kind = 0;
@@ -617,6 +628,8 @@ static void STDMETHODCALLTYPE dev_CreateDepthStencilView(Dev *This, ID3D12Resour
     d.stride = desc ? 1 : r->kind == 2 || r->kind == 3 || r->kind == 5 ? r->layers : 1;
     if (desc && desc->ViewDimension == D3D12_DSV_DIMENSION_TEXTURE2DARRAY && !view_layers(r, desc->Texture2DArray.FirstArraySlice, desc->Texture2DArray.ArraySize, &d.slice, &d.stride)) d.kind = 0;
     if (desc && desc->ViewDimension == D3D12_DSV_DIMENSION_TEXTURE1DARRAY && !view_layers(r, desc->Texture1DArray.FirstArraySlice, desc->Texture1DArray.ArraySize, &d.slice, &d.stride)) d.kind = 0;
+    if (desc && desc->ViewDimension == D3D12_DSV_DIMENSION_TEXTURE2DMSARRAY && !view_layers(r, desc->Texture2DMSArray.FirstArraySlice, desc->Texture2DMSArray.ArraySize, &d.slice, &d.stride)) d.kind = 0;
+    if (desc && (desc->ViewDimension == D3D12_DSV_DIMENSION_TEXTURE2DMS || desc->ViewDimension == D3D12_DSV_DIMENSION_TEXTURE2DMSARRAY) && r->desc.SampleDesc.Count < 2) d.kind = 0;
   }
   desc_write(handle, &d);
 }

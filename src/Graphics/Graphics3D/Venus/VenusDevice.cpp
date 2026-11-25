@@ -169,6 +169,12 @@ DeviceInfo VenusDevice::info() const {
   i.sample_counts = sample_counts_ & ((1u << 2) | (1u << 4) | (1u << 8));
   if (i.sample_counts) i.features |= kFeatureMultisample | kFeatureDepthResolve, i.features2 |= kFeature2ColorResolveModes;
   i.d3d_sample_order = true;   // (Vulkan's standard sample locations are Direct3D's)
+  // (multisampled images read by shaders - OpImageFetch with a sample, depth ones too, arrays of them -, Flat / NoPerspective / Centroid / Sample inputs, SampleId, the
+  // InterpolateAt* of GLSL.std.450 and SampleMask in and out: every Vulkan device with sampleRateShading, as RADV has it; inner coverage would need
+  // VK_EXT_conservative_rasterization's fullyCoveredFragmentShaderInputVariable, which the device does not ask for)
+  i.features3 = kFeature3InterpolationModes;
+  if (i.sample_counts && c.sample_rate_shading)
+    i.features3 |= kFeature3MultisampleLoads | kFeature3MultisampleArrays | kFeature3MultisampleDepthLoads | kFeature3SampleShading | kFeature3EvaluateAttributes | kFeature3Coverage;
   i.limits.texture_units = kMaxTextureUnits;
   i.limits.vertex_attributes = kMaxVertexAttributes;
   i.limits.varyings = 15;            // (as virgl's: the Direct3D layer's text keeps one more output, the position as written, after them)
@@ -649,7 +655,7 @@ bool VenusImage::create() {
   if (d.extent.width == 0 || d.extent.height == 0 || d.format == Format::Undefined) return false;
   if (d.extent.width > device_.max_image_dimension() || d.extent.height > device_.max_image_dimension()) return false;
   if (d.mip_levels == 0 || d.mip_levels > mip_level_limit(d.extent)) return false;
-  if (d.kind == TextureKind::Texture2DMS) return false;
+  if (is_multisampled_kind(d.kind)) return false;
   if (d.kind == TextureKind::TextureCubeArray && (d.layers == 0 || d.layers % 6 != 0)) return false;
   if (d.kind != TextureKind::Texture2D && (d.layers == 0 || d.layers > kMaxTextureLayers)) return false;
   if (d.kind == TextureKind::Texture2D && d.layers != 1) return false;
@@ -665,12 +671,15 @@ bool VenusImage::create() {
   if (compressed && (d.usage != kImageSampled || d.samples != 1)) return false;
   if (storage && (!(d.usage & kImageSampled) || d.samples != 1 || depth || is_srgb_format(d.format))) return false;
   if (d.samples != 1) {
-    if (!(device_.info().sample_counts & (1u << d.samples)) || d.kind != TextureKind::Texture2D || d.mip_levels != 1 || (d.usage & (kImagePresent | kImageStorage))) return false;
-    if (depth ? (d.usage & ~(kImageDepthAttachment)) != 0
+    // (an image of several samples: 2D, or an array of them - kFeature3MultisampleArrays -, a colour or depth attachment, which shaders may fetch samples of - kFeature3MultisampleLoads /
+    // MultisampleDepthLoads)
+    if (!(device_.info().sample_counts & (1u << d.samples)) || (d.kind != TextureKind::Texture2D && d.kind != TextureKind::Texture2DArray) || d.mip_levels != 1 || (d.usage & (kImagePresent | kImageStorage))) return false;
+    if (d.kind == TextureKind::Texture2DArray && !(device_.info().features3 & kFeature3MultisampleArrays)) return false;
+    if (depth ? (d.usage & ~(kImageDepthAttachment | kImageSampled)) != 0
               : (!(d.usage & kImageColorAttachment) || (d.usage & ~(kImageColorAttachment | kImageSampled)) || is_integer_format(d.format) || is_compressed_format(d.format)))
       return false;
   }
-  if ((d.usage & kImageSampled) && depth && (d.samples != 1 || (d.usage & ~(kImageSampled | kImageDepthAttachment)))) return false;
+  if ((d.usage & kImageSampled) && depth && (d.usage & ~(kImageSampled | kImageDepthAttachment))) return false;
   if (d.format == Format::A8Unorm && (d.usage & kImageColorAttachment)) return false;
 
   format_ = device_.vk_format(d.format, storage, &swap_rb_);
@@ -1076,7 +1085,7 @@ VkImageView VenusImage::sampled_view(const TextureView& v, bool stencil) {
   ci.image = image_;
   switch (v.kind) {
     case TextureKind::Texture3D: ci.viewType = VK_IMAGE_VIEW_TYPE_3D; break;
-    case TextureKind::Texture2DArray: ci.viewType = VK_IMAGE_VIEW_TYPE_2D_ARRAY; break;
+    case TextureKind::Texture2DArray: case TextureKind::Texture2DMSArray: ci.viewType = VK_IMAGE_VIEW_TYPE_2D_ARRAY; break;
     case TextureKind::TextureCube: ci.viewType = VK_IMAGE_VIEW_TYPE_CUBE; break;
     case TextureKind::TextureCubeArray: ci.viewType = VK_IMAGE_VIEW_TYPE_CUBE_ARRAY; break;
     default: ci.viewType = VK_IMAGE_VIEW_TYPE_2D; break;

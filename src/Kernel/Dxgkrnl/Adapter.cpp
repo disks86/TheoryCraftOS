@@ -409,7 +409,22 @@ class Adapter::StreamRunner {
       const graphics::TextureKind declared = p.texture_kind(u);
       graphics::TextureView view = texture_view_[u];
       if (a->desc().samples > 1) {
-        if (declared != graphics::TextureKind::Texture2DMS) return refuse(__LINE__);
+        // (a multisampled image to a Texture2DMS or Texture2DMSArray unit: its view of one layer or of several - kFeature3MultisampleArrays -, a depth buffer's samples with
+        // kFeature3MultisampleDepthLoads)
+        const uint32_t features3 = adapter_.caps_.features3;
+        if (!graphics::is_multisampled_kind(declared) || !(features3 & graphics::kFeature3MultisampleLoads)) return refuse(__LINE__);
+        if (a->is_depth() && !(features3 & graphics::kFeature3MultisampleDepthLoads)) return refuse(__LINE__);
+        view.kind = declared;
+        if (!graphics::texture_view_fits(a->texture_kind(), a->layers(), 1, view)) return refuse(__LINE__);
+        if (!(features3 & graphics::kFeature3MultisampleArrays)) {
+          if (a->layers() != 1) return refuse(__LINE__);
+          continue;   // (bound whole)
+        }
+        if (!exec_ || device_view_kind_[u] == declared) continue;
+        const NtStatus s = ensure_cb();
+        if (s != status::kSuccess) return s;
+        cb_->bind_texture_view(u, a->image(), texture_sampler_[u], view);
+        device_view_kind_[u] = declared;
         continue;
       }
       view.kind = declared;
@@ -697,15 +712,18 @@ class Adapter::StreamRunner {
   // adapter's kFeatureResolveModes, its least, greatest or mean). The mode is an optional third word (a graphics::ResolveMode, 0 average when it is left out).
   NtStatus resolve(ByteReader& p) {
     const uint32_t to_index = p.le32(), from_index = p.le32();
-    uint32_t mode = 0;
+    uint32_t mode = 0, layer = 0;
     if (!p.at_end()) mode = p.le32();
     if (mode == kResolveCopySamples) return copy_samples(p, to_index, from_index);
+    const bool layered = (mode & kResolveSourceLayer) != 0;   // (a layer of a multisampled array)
+    if (layered) mode &= ~kResolveSourceLayer, layer = p.le32();
     if (!exact(p) || in_pass_ || !(adapter_.caps_.features & graphics::kFeatureMultisample) || mode > static_cast<uint32_t>(graphics::ResolveMode::Max)) return kBad;
+    if (layered && !(adapter_.caps_.features3 & graphics::kFeature3MultisampleArrays)) return kBad;
     Allocation* to = alloc(to_index);
     Allocation* from = alloc(from_index);
     if (!to || !from || !to->is_image() || !from->is_image() || to->is_staging() || to == from || to->is_depth() != from->is_depth() || !use(to, state::kResolveDest) || !use(from, state::kResolveSource)) return kBad;
     const bool depth = to->is_depth();
-    if (from->desc().samples < 2 || to->desc().samples != 1 || to->mip_levels() != 1 || to->layers() != 1) return kBad;
+    if (from->desc().samples < 2 || to->desc().samples != 1 || to->mip_levels() != 1 || to->layers() != 1 || layer >= from->layers()) return kBad;
     if (to->desc().format != from->desc().format || to->desc().width != from->desc().width || to->desc().height != from->desc().height) return kBad;
     if (!(from->desc().flags & (depth ? kAllocDepthStencil : kAllocRenderTarget))) return kBad;
     // (which modes the adapter has: the average of a colour image, the first sample of a depth image, all of them with kFeatureResolveModes)
@@ -720,7 +738,8 @@ class Adapter::StreamRunner {
     if (s == status::kSuccess) s = resident(*from);
     if (s == status::kSuccess) s = ensure_cb();
     if (s != status::kSuccess) return s;
-    cb_->resolve_image(to->image(), from->image(), static_cast<graphics::ResolveMode>(mode));
+    if (layered) cb_->resolve_layer(to->image(), from->image(), layer, static_cast<graphics::ResolveMode>(mode));
+    else cb_->resolve_image(to->image(), from->image(), static_cast<graphics::ResolveMode>(mode));
     mm_.note_gpu_write(*to);
     return status::kSuccess;
   }
@@ -940,7 +959,7 @@ class Adapter::StreamRunner {
     if (views) {
       // (the image's own kind; a draw or dispatch binds it again of the kind its shader declares when that is another: fit_textures)
       graphics::TextureView whole = texture_view_[unit];
-      if (a->desc().samples > 1) cb_->bind_texture(unit, a->image(), sampler);
+      if (a->desc().samples > 1) cb_->bind_texture(unit, a->image(), sampler);   // (through a view of a multisampled kind when a draw reads it: fit_textures)
       else cb_->bind_texture_view(unit, a->image(), sampler, whole);
       device_view_kind_[unit] = a->texture_kind();
     } else {
@@ -951,7 +970,8 @@ class Adapter::StreamRunner {
   // Binds unit `u`'s image again on the device with `sampler`: through its view, of the kind the device's binding has, on a device with views (kFeature2MipmappedLayers).
   void rebind_unit(uint32_t u, const graphics::SamplerDesc& sampler) {
     const Allocation* a = texture_alloc_[u];
-    if ((adapter_.caps_.features2 & graphics::kFeature2MipmappedLayers) && a->desc().samples <= 1) {
+    const bool multisampled_view = a->desc().samples > 1 && graphics::is_multisampled_kind(device_view_kind_[u]);   // (a view fit_textures made)
+    if ((adapter_.caps_.features2 & graphics::kFeature2MipmappedLayers) && (a->desc().samples <= 1 || multisampled_view)) {
       graphics::TextureView view = texture_view_[u];
       view.kind = device_view_kind_[u];
       cb_->bind_texture_view(u, a->image(), sampler, view);
@@ -3088,7 +3108,7 @@ NtStatus Adapter::create_shader(const ShaderDesc& desc, SharedPointer<ShaderObje
       const NtStatus t = program->emit_tgsi(&text, caps_.max_varyings, &md.tgsi_bindings, caps_.d3d_sample_order);
       if (t == status::kNoMemory) return t;
       if (t == status::kSuccess) {
-        md.sampler_constants = program->compare_units() != 0;   // (its comparisons read the bound samplers' from the constants)
+        md.sampler_constants = program->compare_units() != 0 || program->reads_rasterizer();   // (its comparisons read the bound samplers' from the constants, and the rasterizer's samples)
         shader->text_ = allocate_view<uint8_t>(allocator_, text.size() + 1);
         if (shader->text_.empty()) return status::kNoMemory;
         for (uint64_t i = 0; i < text.size(); ++i) shader->text_[i] = static_cast<uint8_t>(text[i]);

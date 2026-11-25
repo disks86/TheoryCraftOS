@@ -67,7 +67,7 @@ struct SigElement {
 struct Resource {
   uint32_t id = 0, space = 0, lower = 0, size = 0, kind = 0, bytes = 0, stride = 0;
   uint32_t element = 0;   // a typed view's component type (DXIL ComponentType: 4 I32, 5 U32, 9 F32, 13 / 14 SNorm / UNorm F32 ...; 0: none said)
-  uint32_t samples = 0;   // a multisampled texture's sample count
+  uint32_t samples = 0;   // a Texture2DMS / Texture2DMSArray's declared sample count (0: none said)
   bool counter = false;   // an unordered access view with a hidden counter (IncrementCounter / DecrementCounter, append / consume)
   bool present = false;
   bool rasterizer_ordered = false;   // (an unordered access view's isROV, operand 9 of its metadata: the dcl_uav_* token's rasterizer-ordered bit)
@@ -92,7 +92,7 @@ uint32_t return_type_word(uint32_t element) {
 // The operand tokens of a shader resource view (t#, .xyzw) and of an unordered access view (u#: as a destination with a mask, or as a source .xyzw); defined with the buffer accesses.
 uint32_t srv_token();
 uint32_t uav_token(uint32_t mask, bool destination);
-// The SM5 resource dimension of a texture or typed buffer kind (0: none of those): 1 buffer, 2 1D, 3 2D, 4 2DMS, 5 3D, 6 cube, 7 1D array, 8 2D array, 10 cube array.
+// The SM5 resource dimension of a texture or typed buffer kind (0: none of those): 1 buffer, 2 1D, 3 2D, 4 2DMS, 5 3D, 6 cube, 7 1D array, 8 2D array, 9 2DMS array, 10 cube array.
 uint32_t sm5_dimension(uint32_t kind) {
   switch (kind) {
     case kKindTypedBuffer: return 1;
@@ -103,6 +103,7 @@ uint32_t sm5_dimension(uint32_t kind) {
     case kKindCube: return 6;
     case kKind1DArray: return 7;
     case kKind2DArray: return 8;
+    case kKind2DMSArray: return 9;
     case kKindCubeArray: return 10;
     default: return 0;
   }
@@ -121,6 +122,9 @@ enum DxOp : uint32_t {
   kWaveIsFirstLane = 110, kWaveGetLaneIndex = 111, kWaveGetLaneCount = 112, kWaveAnyTrue = 113, kWaveAllTrue = 114, kWaveActiveAllEqual = 115, kWaveActiveBallot = 116,
   kWaveReadLaneAt = 117, kWaveReadLaneFirst = 118, kWaveActiveOp = 119, kWaveActiveBit = 120, kWavePrefixOp = 121, kQuadReadLaneAt = 122, kQuadOp = 123, kWaveAllBitCount = 135,
   kWavePrefixBitCount = 136, kWaveMatch = 165, kWaveMultiPrefixOp = 166, kWaveMultiPrefixBitCount = 167, kQuadVote = 222,
+  // multisampling: the sample positions of a Texture2DMS and of the render target, its sample count, the evaluations of an input, SV_SampleIndex, SV_Coverage, SV_InnerCoverage
+  kTexture2DMSGetSamplePosition = 75, kRenderTargetGetSamplePosition = 76, kRenderTargetGetSampleCount = 77, kEvalSnapped = 87, kEvalSampleIndex = 88, kEvalCentroid = 89,
+  kSampleIndex = 90, kCoverage = 91, kInnerCoverage = 92,
 };
 // The private opcodes D3d9Dxbc.cpp reads for them: 0x700 + the operation's place in D3d9Decoded.hpp's list (kWaveIsFirstLane ..), its control (WaveType | WaveOp << 4) in bits 11 - 18.
 enum WaveSub : uint32_t {
@@ -132,7 +136,10 @@ enum WaveTypeCode : uint32_t { kWtF32 = 0, kWtI32, kWtU32, kWtF64, kWtI64, kWtU6
 enum WaveOpCode : uint32_t { kWoSum = 0, kWoProduct, kWoMin, kWoMax, kWoAnd, kWoOr, kWoXor };
 // (the operand types D3d9Dxbc.cpp takes for what DXBC has no register of: SV_ViewID, SV_Barycentrics perspective-correct and noperspective, IsHelperLane)
 constexpr uint32_t kOperandViewId = 0xF0, kOperandBarycentrics = 0xF1, kOperandBarycentricsLinear = 0xF2, kOperandHelperLane = 0xF3;
+constexpr uint32_t kOperandSampleIndex = 0xF4;   // (SV_SampleIndex, which DXIL has no input register for either)
+constexpr uint32_t kOperandRasterizer = 14, kOperandOutputCoverage = 15, kOperandCoverage = 35, kOperandInnerCoverage = 42;   // (DXBC's rasterizer, oMask, vCoverage, vInnerCoverage)
 constexpr uint32_t kSysvalBarycentrics = 23, kSysvalShadingRate = 24;   // (D3D_NAME_BARYCENTRICS, D3D_NAME_SHADINGRATE in a signature)
+constexpr uint32_t kSysvalSampleIndex = 10, kSysvalCoverage = 66, kSysvalInnerCoverage = 70;   // (D3D_NAME_SAMPLE_INDEX, D3D_NAME_COVERAGE, D3D_NAME_INNER_COVERAGE: no register)
 
 class Translator {
  public:
@@ -2570,8 +2577,9 @@ bool Translator::texture_load(const Instruction& ins) {
   Val srv;
   if (ins.arg_count >= 9 && use(ins.args[1]).kind == VK::Handle && use(ins.args[1]).a == 1) return typed_uav_load(ins, ins.args + 3, 3);   // (a RWTexture: ld_uav_typed)
   if (ins.arg_count < 9 || !resource_of(ins.args[1], 0, &srv)) return error(status::kNotSupported);
-  if (res_[0][srv.b].kind == kKind2DMS) {
-    // (a multisampled texture: ld_ms of the coordinate and the sample, which mipLevelOrSampleCount is)
+  const uint32_t kind = res_[0][srv.b].kind;
+  if (kind == kKind2DMS || kind == kKind2DMSArray) {
+    // (a multisampled texture: ld_ms of the coordinate - x y, and the layer of an array - and the sample, which mipLevelOrSampleCount is)
     for (uint32_t k = 6; k < 9; ++k) {
       uint64_t v = 0;
       const Constant* c = constant(ins.args[k]);
@@ -2580,8 +2588,8 @@ bool Translator::texture_load(const Instruction& ins) {
     const Val r = new_aggregate(ins.result);
     uint32_t scratch = 0;
     if (r.kind == VK::None || r.c || !alloc_reg(pos_, &scratch)) return r.c ? error(status::kNotSupported) : false;
-    const uint32_t ids[2] = {ins.args[3], ins.args[4]};
-    if (!pack(ids, 2, scratch, true)) return false;
+    const uint32_t ids[3] = {ins.args[3], ins.args[4], ins.args[5]};
+    if (!pack(ids, kind == kKind2DMSArray ? 3 : 2, scratch, true)) return false;
     const Val sample = use(ins.args[2]);
     const uint32_t at = begin(46);   // ld_ms dst, address, t#, sample
     dst_temp(r.a, 0xF);
@@ -2655,8 +2663,9 @@ bool Translator::typed_uav_store(const Instruction& ins, const uint32_t* coords,
   return status_ == status::kSuccess;
 }
 
-// GetDimensions: the size of a buffer view (bufinfo: elements of a typed view, structures of a structured one, bytes of a raw one) or of a texture at a level (resinfo_uint: width,
-// height, depth or layers, levels; of a multisampled texture the sample count in the last place, sampleinfo_uint).
+// GetDimensions (%dx.types.Dimensions: four integers): the size of a buffer view (bufinfo: elements of a typed view, structures of a structured one - and their stride in the
+// second place -, bytes of a raw one) or of a texture at a level (resinfo_uint: width, height, depth or layers, levels; of a multisampled texture or array, whose one level is 0,
+// the sample count in the last place, sampleinfo_uint).
 bool Translator::get_dimensions(const Instruction& ins) {
   if (ins.arg_count < 3) return error(status::kNotSupported);
   const Val h = use(ins.args[1]);
@@ -2673,18 +2682,25 @@ bool Translator::get_dimensions(const Instruction& ins) {
     dst_temp(out.a, 1);
     resource();
     finish(at);
+    if (r.kind == kKindStructuredBuffer) {   // (mov dst.y, the structure's size)
+      const uint32_t m = begin(54);
+      dst_temp(out.a, 2);
+      put(0x4001u), put(r.stride);
+      finish(m);
+    }
     return define(ins.result, out);
   }
-  if (h.a == 1 && (r.kind == kKind2DMS || r.kind == kKind2DMSArray)) return error(status::kNotSupported);
-  const Val level = use(ins.args[2]);
+  const bool multisampled = r.kind == kKind2DMS || r.kind == kKind2DMSArray;
+  if (h.a == 1 && multisampled) return error(status::kNotSupported);   // (DXIL has no multisampled unordered access views)
   {
     const uint32_t at = begin(61, 2u << 11);   // resinfo_uint dst.xyzw, level, t# / u#
     dst_temp(out.a, 0xF);
-    src(level);
+    if (multisampled) put(0x4001u), put(0);   // (a multisampled texture's one level: the operand is undefined there)
+    else src(use(ins.args[2]));
     resource();
     finish(at);
   }
-  if (r.kind == kKind2DMS) {
+  if (multisampled) {
     const uint32_t at = begin(111, 1u << 11);   // sampleinfo_uint dst.w, t#
     dst_temp(out.a, 8);
     put(2u | (1u << 2) | (0x00u << 4) | (7u << 12) | (1u << 20)), put(h.c);   // (.xxxx: the count in whichever component the destination takes)
@@ -3133,6 +3149,12 @@ bool Translator::dx_call(const Instruction& ins) {
       uint64_t id = 0, row = 0, col = 0;
       if (ins.arg_count < 4 || !constant_int(ins.args[1], &id) || !constant_int(ins.args[2], &row) || !constant_int(ins.args[3], &col) || id >= input_count_) return error(status::kNotSupported);
       const SigElement& e = inputs_[id];
+      if (e.sysval == kSysvalSampleIndex || e.sysval == kSysvalCoverage || e.sysval == kSysvalInnerCoverage) {   // (a pixel shader's SV_SampleIndex, SV_Coverage, SV_InnerCoverage)
+        if (kind_ != 0 || row != 0 || col != 0) return error(status::kNotSupported);
+        Val v;
+        v.kind = VK::Sys, v.a = e.sysval == kSysvalSampleIndex ? kOperandSampleIndex : e.sysval == kSysvalCoverage ? kOperandCoverage : kOperandInnerCoverage, v.b = 0;
+        return define(ins.result, v);
+      }
       if (e.sysval == kSysvalBarycentrics) {
         // (a pixel shader's SV_Barycentrics: no register; noperspective by its interpolation mode - 4, 5 and 7 are DXIL's noperspective ones)
         if (kind_ != 0 || row != 0 || col > 2) return error(status::kNotSupported);
@@ -3165,6 +3187,15 @@ bool Translator::dx_call(const Instruction& ins) {
       uint64_t id = 0, row = 0, col = 0;
       if (ins.arg_count < 5 || !constant_int(ins.args[1], &id) || !constant_int(ins.args[2], &row) || !constant_int(ins.args[3], &col) || id >= output_count_) return error(status::kNotSupported);
       const SigElement& e = outputs_[id];
+      if (e.sysval == kSysvalCoverage) {   // (a pixel shader's SV_Coverage: mov oMask, value)
+        if (kind_ != 0 || row != 0 || col != 0) return error(status::kNotSupported);
+        const Val v = use(ins.args[4]);
+        const uint32_t at = begin(54);
+        put(1u | (kOperandOutputCoverage << 12));
+        src(v);
+        finish(at);
+        return true;
+      }
       uint32_t first = 0;
       while (first < 4 && !(e.mask >> first & 1)) ++first;
       const uint32_t reg = e.reg + static_cast<uint32_t>(row), comp = first + static_cast<uint32_t>(col);
@@ -3426,6 +3457,71 @@ bool Translator::dx_call(const Instruction& ins) {
       }
       return true;
     }
+    case kTexture2DMSGetSamplePosition: case kRenderTargetGetSamplePosition: {
+      // samplepos dst.xy, t# (of its standard pattern) or the rasterizer, sample: {x, y} in pixels from the centre
+      Val srv;
+      const bool texture = opcode == kTexture2DMSGetSamplePosition;
+      if (kind_ != 0 && !texture) return error(status::kNotSupported);
+      if (ins.arg_count < (texture ? 3u : 2u) || (texture && !resource_of(ins.args[1], 0, &srv))) return error(status::kNotSupported);
+      if (texture && res_[0][srv.b].kind != 3 && res_[0][srv.b].kind != 8) return error(status::kNotSupported);
+      const Val index = use(ins.args[texture ? 2 : 1]);
+      const Val r = new_aggregate(ins.result);
+      if (r.kind == VK::None) return false;
+      const uint32_t at = begin(110);
+      dst_temp(r.a, 0x3);
+      if (texture) src_resource(srv.c);
+      else put(2u | (1u << 2) | (0xE4u << 4) | (kOperandRasterizer << 12));
+      src(index);
+      finish(at);
+      return define(ins.result, r);
+    }
+    case kRenderTargetGetSampleCount: {   // (sampleinfo_uint dst, rasterizer.x)
+      if (kind_ != 0) return error(status::kNotSupported);
+      const Val r = new_scalar(ins.result);
+      if (r.kind == VK::None) return false;
+      const uint32_t at = begin(111u | (1u << 11));
+      dst_scalar(r);
+      put(2u | (2u << 2) | (kOperandRasterizer << 12));
+      finish(at);
+      return define(ins.result, r);
+    }
+    case kEvalSnapped: case kEvalSampleIndex: case kEvalCentroid: {
+      // eval_snapped / eval_sample_index / eval_centroid dst, v[register].component[, offset or sample]: an input at another point of the pixel
+      uint64_t id = 0, row = 0, col = 0;
+      const uint32_t want = opcode == kEvalSnapped ? 6 : opcode == kEvalSampleIndex ? 5 : 4;
+      if (kind_ != 0 || ins.arg_count < want || !constant_int(ins.args[1], &id) || !constant_int(ins.args[2], &row) || !constant_int(ins.args[3], &col) || id >= input_count_)
+        return error(status::kNotSupported);
+      const SigElement& e = inputs_[id];
+      if (e.sysval != 0 || !float32(ins.type)) return error(status::kNotSupported);
+      uint32_t first = 0;
+      while (first < 4 && !(e.mask >> first & 1)) ++first;
+      Val input;
+      input.kind = VK::Input, input.a = e.reg + static_cast<uint32_t>(row), input.b = first + static_cast<uint32_t>(col);
+      if (input.b >= 4 || input.a >= 16) return error(status::kInvalidParameter);
+      uint32_t offset = 0;
+      if (opcode == kEvalSnapped) {
+        if (!alloc_reg(pos_, &offset)) return false;
+        const uint32_t ids[2] = {ins.args[4], ins.args[5]};
+        if (!pack(ids, 2, offset, true)) return false;
+      }
+      Val sample;
+      if (opcode == kEvalSampleIndex) sample = use(ins.args[4]);
+      const Val r = new_scalar(ins.result);
+      if (r.kind == VK::None) return false;
+      const uint32_t at = begin(opcode == kEvalSnapped ? 203 : opcode == kEvalSampleIndex ? 204 : 205);
+      dst_scalar(r);
+      src(input);
+      if (opcode == kEvalSnapped) put(2u | (1u << 2) | (0xE4u << 4) | (1u << 20)), put(offset);
+      else if (opcode == kEvalSampleIndex) src(sample);
+      finish(at);
+      return define(ins.result, r);
+    }
+    case kSampleIndex: case kCoverage: case kInnerCoverage: {   // (a pixel shader's SV_SampleIndex, SV_Coverage, SV_InnerCoverage)
+      if (kind_ != 0) return error(status::kNotSupported);
+      Val v;
+      v.kind = VK::Sys, v.a = opcode == kSampleIndex ? kOperandSampleIndex : opcode == kCoverage ? kOperandCoverage : kOperandInnerCoverage, v.b = 0;
+      return define(ins.result, v);
+    }
     case kCheckAccessFullyMapped: {
       // check_access_fully_mapped: all ones when the status says every texel the lookup read was mapped
       if (ins.arg_count < 2) return error(status::kInvalidParameter);
@@ -3493,9 +3589,9 @@ NtStatus Translator::read_metadata() {
           else if (m_.is_int(el)) r.element = st->signed_name ? 4 : 5;
         }
       }
-      // (a shader resource view's sample count, operand 7; an unordered access view's counter, operand 8)
+      // (a shader resource view's sample count, operand 7 - of a Texture2DMS / Texture2DMSArray; the declaration refuses more than 32 -; an unordered access view's counter, operand 8)
       uint64_t samples = 0, counter = 0;
-      if (cls == 0 && meta_int(operand_of(node, 7), &samples)) r.samples = static_cast<uint32_t>(samples);
+      if (cls == 0 && meta_int(operand_of(node, 7), &samples) && samples < 128) r.samples = static_cast<uint32_t>(samples);
       if (cls == 1 && meta_int(operand_of(node, 8), &counter)) r.counter = counter != 0;
       r.present = true, r.id = static_cast<uint32_t>(id), r.lower = static_cast<uint32_t>(lower), r.size = static_cast<uint32_t>(size);
       if (cls == 1) {
@@ -3585,7 +3681,9 @@ NtStatus Translator::read_signature(ConstByteView chunk, SigElement* out, uint32
     out[i].component_type = e.le32();
     out[i].reg = e.le32();
     out[i].mask = e.u8();
-    if (out[i].reg >= 16 && !(out[i].sysval == kSysvalBarycentrics && out[i].reg == 0xFFFFFFFFu)) return status::kNotSupported;   // (SV_Barycentrics has no register)
+    // (SV_Barycentrics, SV_SampleIndex, SV_Coverage and SV_InnerCoverage have no register)
+    const bool unpacked = out[i].sysval == kSysvalBarycentrics || out[i].sysval == kSysvalSampleIndex || out[i].sysval == kSysvalCoverage || out[i].sysval == kSysvalInnerCoverage;
+    if (out[i].reg >= 16 && !(unpacked && out[i].reg == 0xFFFFFFFFu)) return status::kNotSupported;
   }
   *count = n;
   return status::kSuccess;
@@ -3678,7 +3776,7 @@ NtStatus Translator::run(uint32_t program_kind, ConstByteView isg1, ConstByteVie
       return true;
     }
     const uint32_t dimension = sm5_dimension(r.kind);
-    if (!dimension || dimension == 4 || dimension == 6 || dimension == 10 || r.counter || r.lower >= graphics::kMaxStorageImages) return false;
+    if (!dimension || dimension == 4 || dimension == 6 || dimension == 9 || dimension == 10 || r.counter || r.lower >= graphics::kMaxStorageImages) return false;
     word(156u | ordered | (dimension << 11) | (4u << 24)), word((30u << 12) | (1u << 20)), word(r.lower), word(return_type_word(r.element));
     return true;
   };
@@ -3814,8 +3912,8 @@ NtStatus Translator::run(uint32_t program_kind, ConstByteView isg1, ConstByteVie
       else word(161u | (3u << 24)), word((7u << 12) | (1u << 20)), word(r.lower);
       continue;
     }
-    // (a texture of any kind but a multisampled array - SM5's dimensions, sm5_dimension -, a multisampled one with its sample count; a typed view of a buffer, Buffer<>: the
-    // read-only image slot after the u# ones; the return type is the view's component type)
+    // (a texture of any kind - SM5's dimensions, sm5_dimension -, a multisampled one or a multisampled array with its declared sample count, 0 when the shader said none; a typed
+    // view of a buffer, Buffer<>: the read-only image slot after the u# ones; the return type is the view's component type)
     const uint32_t dimension = sm5_dimension(r.kind);
     if (dimension == 1) {
       if (r.lower >= graphics::kMaxTexelBufferViews || (r.size != 1 && r.size != 0xFFFFFFFFu && r.size != 0)) return status::kNotSupported;
@@ -3823,8 +3921,8 @@ NtStatus Translator::run(uint32_t program_kind, ConstByteView isg1, ConstByteVie
       continue;
     }
     const uint32_t elements = r.size != 0xFFFFFFFFu && r.size >= 1 && r.size <= 8 ? r.size : 1;   // (an array: every element is declared)
-    if (!dimension || r.lower >= graphics::kMaxTextureUnits || elements > graphics::kMaxTextureUnits - r.lower || (dimension == 4 && (r.samples < 1 || r.samples > 32))) return status::kNotSupported;
-    const uint32_t samples = dimension == 4 ? r.samples << 16 : 0;
+    if (!dimension || r.lower >= graphics::kMaxTextureUnits || elements > graphics::kMaxTextureUnits - r.lower || ((dimension == 4 || dimension == 9) && r.samples > 32)) return status::kNotSupported;
+    const uint32_t samples = dimension == 4 || dimension == 9 ? r.samples << 16 : 0;
     for (uint32_t e = 0; e < elements; ++e)
       word(88u | (dimension << 11) | samples | (4u << 24)), word(2u | (1u << 2) | (0xE4u << 4) | (7u << 12) | (1u << 20)), word(r.lower + e), word(return_type_word(r.element));
   }
@@ -3848,9 +3946,9 @@ NtStatus Translator::run(uint32_t program_kind, ConstByteView isg1, ConstByteVie
       else return status::kNotSupported;
     } else {
       if (e.sysval == 0) word(98u | (e.interp << 11) | (3u << 24)), word(operand), word(e.reg);
-      else if (e.sysval == 1) word(100u | (4u << 11) | (4u << 24)), word(operand), word(e.reg), word(1);
+      else if (e.sysval == 1) word(100u | ((e.interp == 5 || e.interp == 7 ? e.interp : 4u) << 11) | (4u << 24)), word(operand), word(e.reg), word(1);   // (linear noperspective, at the centroid or the sample its mode says)
       else if (e.sysval == 7 || e.sysval == 9 || e.sysval == kSysvalShadingRate) word(99u | (1u << 11) | (4u << 24)), word(operand), word(e.reg), word(e.sysval);
-      else if (e.sysval == kSysvalBarycentrics) continue;   // (no register: the loads name it)
+      else if (e.sysval == kSysvalBarycentrics || e.sysval == kSysvalSampleIndex || e.sysval == kSysvalCoverage || e.sysval == kSysvalInnerCoverage) continue;   // (no register: the loads name it)
       else return status::kNotSupported;
     }
   }
@@ -3858,6 +3956,7 @@ NtStatus Translator::run(uint32_t program_kind, ConstByteView isg1, ConstByteVie
     const SigElement& e = outputs_[i];
     const uint32_t operand = 2u | ((e.mask & 0xF) << 4) | (2u << 12) | (1u << 20);
     if (e.sysval == 0 || (pixel && e.sysval == 64)) word(101u | (3u << 24)), word(operand), word(e.reg);
+    else if (pixel && e.sysval == kSysvalCoverage) word(101u | (2u << 24)), word(1u | (kOperandOutputCoverage << 12));   // (oMask)
     else if ((vertex || geometry || domain) && e.sysval == 1) word(103u | (4u << 24)), word(operand), word(e.reg), word(1);
     else if ((vertex || geometry) && e.sysval == kSysvalShadingRate) word(103u | (4u << 24)), word(operand), word(e.reg), word(kSysvalShadingRate);   // (SV_ShadingRate)
     else return status::kNotSupported;

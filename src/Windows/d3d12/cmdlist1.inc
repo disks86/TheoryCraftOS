@@ -157,7 +157,9 @@ static void STDMETHODCALLTYPE list_ResolveSubresourceRegion(CmdList *l, ID3D12Re
   if (mode == D3D12_RESOLVE_MODE_DECOMPRESS) { resolve_decompress(l, dst, dst_sub, x, y, src, src_sub, rect); return; }
   if (mode != D3D12_RESOLVE_MODE_AVERAGE && mode != D3D12_RESOLVE_MODE_MIN && mode != D3D12_RESOLVE_MODE_MAX) return;
   if (s->desc.SampleDesc.Count < 2 || d->desc.SampleDesc.Count > 1 || d->planes || d->desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D) return;
-  if (src_sub >= res_subresources(s) || dst_sub >= res_subresources(d)) return;      /* (a multisampled texture has one subresource here) */
+  if (src_sub >= res_subresources(s) || dst_sub >= res_subresources(d)) return;      /* (a multisampled texture has a subresource for each slice: one level) */
+  const UINT src_layer = src_sub % (s->layers ? s->layers : 1);      /* (and the depth plane's before the stencil's: a layer of either is the same allocation's) */
+  if (src_layer && !(l->d.dev->caps.features3 & DEV_FEATURE3_MULTISAMPLE_ARRAYS)) return;
   const UINT kmode = mode == D3D12_RESOLVE_MODE_AVERAGE ? 0 : mode == D3D12_RESOLVE_MODE_MIN ? 2 : 3;
   const int depth = (s->desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL) != 0;
   /* (a mode the adapter does not have - a colour image's least or greatest samples, any of a depth image's three - is a call this device does not take: the kernel's
@@ -185,6 +187,7 @@ static void STDMETHODCALLTYPE list_ResolveSubresourceRegion(CmdList *l, ID3D12Re
     D3D12_RESOURCE_DESC td = s->desc;
     td.SampleDesc.Count = 1;
     td.SampleDesc.Quality = 0;
+    td.DepthOrArraySize = 1;      /* (one slice of a multisampled array is resolved)  */
     td.Flags &= ~(D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
     const D3D12_HEAP_PROPERTIES props = {D3D12_HEAP_TYPE_DEFAULT, D3D12_CPU_PAGE_PROPERTY_UNKNOWN, D3D12_MEMORY_POOL_UNKNOWN, 1, 1};
     if (FAILED(resource_make(l->d.dev, &props, D3D12_HEAP_FLAG_NONE, &td, NULL, 0, 0, &temp))) return;
@@ -196,8 +199,8 @@ static void STDMETHODCALLTYPE list_ResolveSubresourceRegion(CmdList *l, ID3D12Re
   Resource *t = (Resource *)target;
   end_pass(l);
   ensure_room(l, 64, 4);
-  UINT payload[3] = {alloc_index(l, t->alloc), alloc_index(l, s->alloc), kmode};
-  packet(l, OP_RESOLVE_REGION, payload, 3);
+  UINT payload[4] = {alloc_index(l, t->alloc), alloc_index(l, s->alloc), kmode | (src_layer ? RESOLVE_SOURCE_LAYER : 0u), src_layer};
+  packet(l, OP_RESOLVE_REGION, payload, src_layer ? 4 : 3);
   if (direct) return;
   const D3D12_BOX box = {(UINT)r.left, (UINT)r.top, 0, (UINT)r.right, (UINT)r.bottom, 1};
   D3D12_TEXTURE_COPY_LOCATION from = {target, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, {.SubresourceIndex = 0}};

@@ -52,7 +52,9 @@ enum Opcode : uint16_t {
     // (kTexCompare: sample_c / sample_c_lz, src[2] the reference: the sampler's comparison of the reference with the texels of the footprint, filtered as it filters (ITextureSet::sample_compare); control 1: sample_c_lz, level zero.
     //  A 2D texture, an array (the coordinate's z the layer) or a cube (the direction))
     // (kTexQueryLod: the lod instruction, x the level clamped to the texture's, y not)
-    // (kTexFetchMs: ld_ms, src[2] the sample; kTexGather: gather4, src[0] the coordinate, src[1] the unit, control the component (0..3) of the four texels returned; kTexSamples: sampleinfo, a constant: control the count, tex_swizzle[0] 1 for an unsigned result)
+    // (kTexFetchMs: ld_ms, src[0] the integer x y (and z, the layer of a Texture2DMSArray), src[2] the sample; kTexGather: gather4, src[0] the coordinate, src[1] the unit, control the
+    //  component (0..3) of the four texels returned; kTexSamples: sampleinfo, (count, 0, 0, 0) swizzled by tex_swizzle - control 0: of the texture of unit src[0].number (`stride` the count
+    //  it was declared with, 0 for none), 1: of the rasterizer -, `vector` set for an unsigned result)
   // Storage buffers (compute shaders, Shader Model 5): kBufLoad (dst; src[0] the byte address or the structure index, src[1] the byte offset in the structure; tex_swizzle picks the loaded
   // words), kBufStore (dst.mask: how many words; src[2] the value), kBufAtomic / kBufImmAtomic (src[0] the address, src[1] the operand; the second also writes the old value to dst). The
   // buffer is `uav`; `stride` is 0 for a raw buffer (byte address) and the structure size for a structured one; an atomic's kind is `control` (AtomicKind).
@@ -69,6 +71,11 @@ enum Opcode : uint16_t {
   // Geometry shaders: emit appends the output registers' vertex to the strip, cut ends the strip.
   kGsEmit = 0x1500, kGsCut,
   kBarrier = 0x1600,   // sync_g..: the thread waits until every thread of its group is here (a group runner switches threads there)
+  // Multisampling (Shader Model 4.1 / 5): kSamplePos (samplepos: dst; src[0] the sample index; control 0: of the texture of unit src[1].number - its standard pattern -, 1: of the
+  // rasterizer - the pass's positions -; (x, y, 0, 0) in pixels from the centre, swizzled by tex_swizzle, (0, 0, 0, 0) for an index past the count). The evaluations of a pixel shader's input
+  // src[0] (an input register: its varying, swizzle and modifier) at a point of the pixel: kEvalSample at the sample src[1] names, kEvalCentroid at the centroid, kEvalSnapped at the
+  // offset src[1] gives (integers x y, sixteenths of a pixel from the centre, -8 .. 7: the low four bits, signed).
+  kSamplePos = 0x1800, kEvalSample, kEvalCentroid, kEvalSnapped,
   kLoopBegin = 0x1200, kLoopEnd, kBreak0, kBreakNz, kBreakZ, kContinue0, kContinueNz, kContinueZ,
   // Wave operations (Shader Model 6, from the DXIL translator: D3d9Dxbc.cpp's private opcodes kDxbcWaveFirst ..). They read the lanes of the wave that are at the same instruction (see
   // WaveRunner in D3d9Shader.cpp): the active lanes, which are those lanes but a pixel shader's helpers, and for the quad operations the helpers too. `stride` is the site: the DXIL
@@ -89,11 +96,13 @@ enum Opcode : uint16_t {
 enum WaveType : uint8_t { kWaveF32 = 0, kWaveI32, kWaveU32, kWaveF64, kWaveI64, kWaveU64 };
 enum WaveOp : uint8_t { kWaveSum = 0, kWaveProduct, kWaveMin, kWaveMax, kWaveAnd, kWaveOr, kWaveXor };
 
-enum RegType : uint8_t { kPatchOut = 21 /* a hull shader's patch constant output register (fork and join phases) */, kPatchIn = 22 /* a domain shader's patch constant input register */, kTemp = 0, kInput = 1, kConst = 2, kAddrTex = 3, kRastOut = 4, kAttrOut = 5, kTexCrdOut = 6, kColorOut = 8, kDepthOut = 9, kSampler = 10, kConstBool = 14,
+enum RegType : uint8_t { kPatchOut = 21 /* a hull shader's patch constant output register (fork and join phases) */, kPatchIn = 22 /* a domain shader's patch constant input register */, kTemp = 0, kInput = 1, kConst = 2, kAddrTex = 3, kRastOut = 4, kAttrOut = 5, kTexCrdOut = 6, kColorOut = 8, kDepthOut = 9, kSampler = 10, kConstBool = 14, kCoverageOut = 23 /* (a pixel shader's SV_Coverage output, oMask: the integer in x) */,
                kSysValue = 20 /* (not in a token stream: a Shader Model 4 system value; number: kSysPosition ...) */ };
 enum SysValue : uint8_t { kSysPosition = 0, kSysFrontFacing, kSysPrimitiveId, kSysVertexId, kSysInstanceId, kSysDispatchThreadId, kSysGroupId, kSysGroupThreadId, kSysGroupIndex, kSysOutputControlPointId, kSysForkInstanceId, kSysJoinInstanceId, kSysDomainLocation, kSysGsInstanceId,
                         // (Shader Model 6.1+, from the DXIL translator: SV_ViewID of every stage, a pixel shader's SV_Barycentrics - perspective-correct and noperspective - and SV_ShadingRate)
-                        kSysViewId, kSysBarycentrics, kSysBarycentricsLinear, kSysShadingRate, kSysHelperLane /* (IsHelperLane: all ones or zero) */, kSysValueCount };
+                        kSysViewId, kSysBarycentrics, kSysBarycentricsLinear, kSysShadingRate, kSysHelperLane /* (IsHelperLane: all ones or zero) */,
+                        // (a pixel shader's SV_SampleIndex - it then runs for each sample -, SV_Coverage and SV_InnerCoverage: integers)
+                        kSysSampleIndex, kSysCoverage, kSysInnerCoverage, kSysValueCount };
 enum AtomicKind : uint8_t { kAtomicAdd = 0, kAtomicAnd, kAtomicOr, kAtomicXor, kAtomicIMax, kAtomicIMin, kAtomicUMax, kAtomicUMin, kAtomicExchange, kAtomicCompareExchange };
 enum Usage : uint8_t { kUsagePosition = 0, kUsageTexCoord = 5, kUsageColor = 10 };
 enum Modifier : uint8_t { kModNone, kModNeg, kModBias, kModBiasNeg, kModSign, kModSignNeg, kModComp, kModX2, kModX2Neg, kModDz, kModDw, kModAbs, kModAbsNeg, kModNot };

@@ -8660,6 +8660,518 @@ static void test_fixed_state_gaps(Scene *c) {
   test_r1_unorm(c);
 }
 
+/* ---- multisampling in shaders ----------------------------------------------------------------------------------------------------------------------------------------------
+ * A 4x multisampled target of 16 x 16 (B8G8R8A8, a texture too) drawn with the fixtures' pixel shaders on vs_msaa (the position as given, w from the colour's alpha), then every sample
+ * read back through a Texture2DMS reader into the scene's 64 x 64 target: pixel (x, y) is sample x mod 4 of texel (x / 4, y). */
+typedef struct MsRig {
+  ID3D12RootSignature *rs;      /* 16 constants, then a table of one SRV (t0), a static point sampler */
+  ID3D12DescriptorHeap *heap, *rtv, *dsv;
+  ID3D12Resource *vb;
+  UINT32 px[64 * 64];           /* the last picture read */
+} MsRig;
+static const D3D12_HEAP_PROPERTIES kMsDefault = {D3D12_HEAP_TYPE_DEFAULT, D3D12_CPU_PAGE_PROPERTY_UNKNOWN, D3D12_MEMORY_POOL_UNKNOWN, 1, 1};
+static int ms_rig_make(Scene *c, MsRig *m) {
+  memset(m, 0, sizeof *m);
+  D3D12_DESCRIPTOR_RANGE range = {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0, 0, D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND};
+  D3D12_ROOT_PARAMETER params[2];
+  memset(params, 0, sizeof params);
+  params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+  params[0].Constants.Num32BitValues = 16;
+  params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+  params[1].DescriptorTable.NumDescriptorRanges = 1;
+  params[1].DescriptorTable.pDescriptorRanges = &range;
+  const D3D12_STATIC_SAMPLER_DESC ss = static_point(D3D12_FILTER_MIN_MAG_MIP_POINT, D3D12_COMPARISON_FUNC_NEVER);
+  D3D12_ROOT_SIGNATURE_DESC rsd = {2, params, 1, &ss, D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT};
+  ID3DBlob *blob = NULL, *error = NULL;
+  CHECK_HR(D3D12SerializeRootSignature(&rsd, D3D_ROOT_SIGNATURE_VERSION_1_0, &blob, &error));
+  if (blob) CHECK_HR(ID3D12Device_CreateRootSignature(c->dev, 0, ID3D10Blob_GetBufferPointer(blob), ID3D10Blob_GetBufferSize(blob), &IID_ID3D12RootSignature, (void **)&m->rs));
+  if (blob) ID3D10Blob_Release(blob);
+  m->heap = view_heap(c->dev, 1, 1);
+  D3D12_DESCRIPTOR_HEAP_DESC hd = {D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
+  CHECK_HR(ID3D12Device_CreateDescriptorHeap(c->dev, &hd, &IID_ID3D12DescriptorHeap, (void **)&m->rtv));
+  hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_DSV;
+  CHECK_HR(ID3D12Device_CreateDescriptorHeap(c->dev, &hd, &IID_ID3D12DescriptorHeap, (void **)&m->dsv));
+  m->vb = make_buffer(c->dev, D3D12_HEAP_TYPE_UPLOAD, 4096, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ);
+  return m->rs && m->heap && m->rtv && m->dsv && m->vb;
+}
+static void ms_rig_free(MsRig *m) {
+  if (m->rs) ID3D12RootSignature_Release(m->rs);
+  if (m->heap) ID3D12DescriptorHeap_Release(m->heap);
+  if (m->rtv) ID3D12DescriptorHeap_Release(m->rtv);
+  if (m->dsv) ID3D12DescriptorHeap_Release(m->dsv);
+  if (m->vb) ID3D12Resource_Release(m->vb);
+}
+/* A pipeline of `vs` and `ps` (POSITION and COLOR in), `samples` per pixel into a B8G8R8A8 target, with a depth buffer of `dsv` (UNKNOWN: none; depth test and write, the stencil
+ * replaced by the reference where it passes) and conservative rasterization with `conservative`. NULL when the device refuses it. */
+static ID3D12PipelineState *ms_pso(Scene *c, MsRig *m, const void *vs, SIZE_T vs_size, const void *ps, SIZE_T ps_size, UINT samples, DXGI_FORMAT dsv, int conservative, HRESULT *hr_out) {
+  D3D12_INPUT_ELEMENT_DESC layout[2] = {{"POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
+                                        {"COLOR", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 12, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0}};
+  D3D12_GRAPHICS_PIPELINE_STATE_DESC pd;
+  memset(&pd, 0, sizeof pd);
+  pd.pRootSignature = m->rs;
+  pd.VS.pShaderBytecode = vs, pd.VS.BytecodeLength = vs_size;
+  pd.PS.pShaderBytecode = ps, pd.PS.BytecodeLength = ps_size;
+  pd.SampleMask = 0xFFFFFFFFu;
+  pd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+  pd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+  pd.RasterizerState.MultisampleEnable = samples > 1;
+  pd.RasterizerState.DepthClipEnable = TRUE;
+  pd.RasterizerState.ConservativeRaster = conservative ? D3D12_CONSERVATIVE_RASTERIZATION_MODE_ON : D3D12_CONSERVATIVE_RASTERIZATION_MODE_OFF;
+  pd.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+  pd.InputLayout.pInputElementDescs = layout, pd.InputLayout.NumElements = 2;
+  pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+  pd.NumRenderTargets = 1;
+  pd.RTVFormats[0] = DXGI_FORMAT_B8G8R8A8_UNORM;
+  pd.SampleDesc.Count = samples;
+  if (dsv != DXGI_FORMAT_UNKNOWN) {
+    pd.DSVFormat = dsv;
+    pd.DepthStencilState.DepthEnable = TRUE;
+    pd.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
+    pd.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_LESS;
+    if (dsv == DXGI_FORMAT_D24_UNORM_S8_UINT) {
+      pd.DepthStencilState.StencilEnable = TRUE;
+      pd.DepthStencilState.StencilReadMask = pd.DepthStencilState.StencilWriteMask = 0xFF;
+      pd.DepthStencilState.FrontFace.StencilFunc = pd.DepthStencilState.BackFace.StencilFunc = D3D12_COMPARISON_FUNC_ALWAYS;
+      pd.DepthStencilState.FrontFace.StencilPassOp = pd.DepthStencilState.BackFace.StencilPassOp = D3D12_STENCIL_OP_REPLACE;
+      pd.DepthStencilState.FrontFace.StencilFailOp = pd.DepthStencilState.BackFace.StencilFailOp = D3D12_STENCIL_OP_KEEP;
+      pd.DepthStencilState.FrontFace.StencilDepthFailOp = pd.DepthStencilState.BackFace.StencilDepthFailOp = D3D12_STENCIL_OP_KEEP;
+    }
+  }
+  ID3D12PipelineState *pso = NULL;
+  const HRESULT hr = ID3D12Device_CreateGraphicsPipelineState(c->dev, &pd, &IID_ID3D12PipelineState, (void **)&pso);
+  if (hr_out) *hr_out = hr;
+  return SUCCEEDED(hr) ? pso : NULL;
+}
+static ID3D12Resource *ms_texture(Scene *c, DXGI_FORMAT format, UINT w, UINT h, UINT layers, UINT samples, D3D12_RESOURCE_FLAGS flags) {
+  const D3D12_RESOURCE_DESC td = {D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, w, h, (UINT16)layers, 1, format, {samples, 0}, D3D12_TEXTURE_LAYOUT_UNKNOWN, flags};
+  ID3D12Resource *r = NULL;
+  if (FAILED(ID3D12Device_CreateCommittedResource(c->dev, &kMsDefault, D3D12_HEAP_FLAG_NONE, &td, D3D12_RESOURCE_STATE_COMMON, NULL, &IID_ID3D12Resource, (void **)&r))) return NULL;
+  return r;
+}
+/* Draws `count` vertices (x, y, z, r, g, b, w) with `pso` into `target` (`slice` of it through a TEXTURE2DMSARRAY view when `slice` >= 0, else its whole TEXTURE2DMS / 2D view) of
+ * w x h, cleared to opaque black, and `depth` (`dsv_format`: its view's; cleared to 1 and stencil `stencil_ref`'s reference 0) when given. */
+static void ms_draw(Scene *c, MsRig *m, ID3D12PipelineState *pso, ID3D12Resource *target, int slice, ID3D12Resource *depth, DXGI_FORMAT dsv_format, const float (*v)[7], UINT count,
+                    UINT w, UINT h, UINT stencil_ref) {
+  if (!pso || !target || count * 28 > 4096) { CHECK(0); return; }
+  void *mapped = NULL;
+  CHECK_HR(ID3D12Resource_Map(m->vb, 0, NULL, &mapped));
+  if (mapped) memcpy(mapped, v, count * 28);
+  ID3D12Resource_Unmap(m->vb, 0, NULL);
+  const D3D12_CPU_DESCRIPTOR_HANDLE rtv = ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(m->rtv), dsv = ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(m->dsv);
+  if (slice >= 0) {
+    D3D12_RENDER_TARGET_VIEW_DESC r;
+    memset(&r, 0, sizeof r);
+    r.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    r.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2DMSARRAY;
+    r.Texture2DMSArray.FirstArraySlice = (UINT)slice, r.Texture2DMSArray.ArraySize = 1;
+    ID3D12Device_CreateRenderTargetView(c->dev, target, &r, rtv);
+  } else {
+    ID3D12Device_CreateRenderTargetView(c->dev, target, NULL, rtv);
+  }
+  if (depth) {
+    D3D12_DEPTH_STENCIL_VIEW_DESC d;
+    memset(&d, 0, sizeof d);
+    d.Format = dsv_format;
+    d.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2DMS;
+    ID3D12Device_CreateDepthStencilView(c->dev, depth, &d, dsv);
+  }
+  const float black[4] = {0, 0, 0, 1};
+  const D3D12_VIEWPORT vp = {0, 0, (FLOAT)w, (FLOAT)h, 0, 1};
+  const D3D12_RECT sc = {0, 0, (LONG)w, (LONG)h};
+  const D3D12_VERTEX_BUFFER_VIEW vbv = {ID3D12Resource_GetGPUVirtualAddress(m->vb), 4096, 28};
+  ID3D12GraphicsCommandList *l = NULL;
+  CHECK_HR(ID3D12CommandAllocator_Reset(c->allocator));
+  CHECK_HR(ID3D12Device_CreateCommandList(c->dev, 0, D3D12_COMMAND_LIST_TYPE_DIRECT, c->allocator, pso, &IID_ID3D12GraphicsCommandList, (void **)&l));
+  if (!l) return;
+  ID3D12GraphicsCommandList_OMSetRenderTargets(l, 1, &rtv, FALSE, depth ? &dsv : NULL);
+  ID3D12GraphicsCommandList_ClearRenderTargetView(l, rtv, black, 0, NULL);
+  if (depth) ID3D12GraphicsCommandList_ClearDepthStencilView(l, dsv, D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL, 1.0f, 0, 0, NULL);
+  ID3D12GraphicsCommandList_RSSetViewports(l, 1, &vp);
+  ID3D12GraphicsCommandList_RSSetScissorRects(l, 1, &sc);
+  ID3D12GraphicsCommandList_SetGraphicsRootSignature(l, m->rs);
+  ID3D12GraphicsCommandList_SetGraphicsRoot32BitConstants(l, 0, 16, kIdentity, 0);
+  {   /* (every parameter of the root signature set: the table a null view, which these pixel shaders do not read) */
+    D3D12_SHADER_RESOURCE_VIEW_DESC none;
+    memset(&none, 0, sizeof none);
+    none.Format = DXGI_FORMAT_B8G8R8A8_UNORM, none.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D, none.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    none.Texture2D.MipLevels = 1;
+    ID3D12Device_CreateShaderResourceView(c->dev, NULL, &none, ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(m->heap));
+    ID3D12GraphicsCommandList_SetDescriptorHeaps(l, 1, &m->heap);
+    ID3D12GraphicsCommandList_SetGraphicsRootDescriptorTable(l, 1, ID3D12DescriptorHeap_GetGPUDescriptorHandleForHeapStart(m->heap));
+  }
+  ID3D12GraphicsCommandList_OMSetStencilRef(l, stencil_ref);
+  ID3D12GraphicsCommandList_IASetPrimitiveTopology(l, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+  ID3D12GraphicsCommandList_IASetVertexBuffers(l, 0, 1, &vbv);
+  ID3D12GraphicsCommandList_DrawInstanced(l, count, 1, 0, 0);
+  scene_run(c, l);
+  ID3D12GraphicsCommandList_Release(l);
+}
+/* Reads `texture` through the view `view` with the reader pixel shader `ps` (a full-screen triangle into the scene's 64 x 64 target) into m->px. */
+static void ms_read(Scene *c, MsRig *m, ID3D12Resource *texture, const D3D12_SHADER_RESOURCE_VIEW_DESC *view, const void *ps, SIZE_T ps_size) {
+  ID3D12PipelineState *pso = ms_pso(c, m, dx_vs_vol_dxbc, sizeof dx_vs_vol_dxbc, ps, ps_size, 1, DXGI_FORMAT_UNKNOWN, 0, NULL);
+  memset(m->px, 0, sizeof m->px);
+  if (!pso) { CHECK(0); return; }
+  ID3D12Device_CreateShaderResourceView(c->dev, texture, view, ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(m->heap));
+  const float v[3][7] = {{-1, -1, 0.5f, 1, 1, 1, 1}, {3, -1, 0.5f, 1, 1, 1, 1}, {-1, 3, 0.5f, 1, 1, 1, 1}};
+  void *mapped = NULL;
+  CHECK_HR(ID3D12Resource_Map(m->vb, 0, NULL, &mapped));
+  if (mapped) memcpy(mapped, v, sizeof v);
+  ID3D12Resource_Unmap(m->vb, 0, NULL);
+  const D3D12_VERTEX_BUFFER_VIEW vbv = {ID3D12Resource_GetGPUVirtualAddress(m->vb), 4096, 28};
+  ID3D12GraphicsCommandList *l = NULL;
+  CHECK_HR(ID3D12CommandAllocator_Reset(c->allocator));
+  CHECK_HR(ID3D12Device_CreateCommandList(c->dev, 0, D3D12_COMMAND_LIST_TYPE_DIRECT, c->allocator, pso, &IID_ID3D12GraphicsCommandList, (void **)&l));
+  if (l) {
+    scene_begin(c, l, 1);
+    ID3D12GraphicsCommandList_SetGraphicsRootSignature(l, m->rs);
+    ID3D12GraphicsCommandList_SetDescriptorHeaps(l, 1, &m->heap);
+    ID3D12GraphicsCommandList_SetGraphicsRoot32BitConstants(l, 0, 16, kIdentity, 0);
+    ID3D12GraphicsCommandList_SetGraphicsRootDescriptorTable(l, 1, ID3D12DescriptorHeap_GetGPUDescriptorHandleForHeapStart(m->heap));
+    ID3D12GraphicsCommandList_IASetPrimitiveTopology(l, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    ID3D12GraphicsCommandList_IASetVertexBuffers(l, 0, 1, &vbv);
+    ID3D12GraphicsCommandList_DrawInstanced(l, 3, 1, 0, 0);
+    scene_read_target(c, l);
+    scene_run(c, l);
+    ID3D12GraphicsCommandList_Release(l);
+    const UINT32 *pixels = NULL;
+    if (SUCCEEDED(ID3D12Resource_Map(c->readback, 0, NULL, (void **)&pixels)) && pixels) {
+      memcpy(m->px, pixels, sizeof m->px);
+      ID3D12Resource_Unmap(c->readback, 0, NULL);
+    }
+  }
+  ID3D12PipelineState_Release(pso);
+}
+static UINT32 ms_sample(const MsRig *m, UINT x, UINT y, UINT k) { return m->px[y * 64 + x * 4 + k]; }
+/* (vertices of a rectangle of two triangles from (x0, y0) to (x1, y1) in pixels of a w x h target, one colour, depth z) */
+static void ms_rect(float (*v)[7], float x0, float y0, float x1, float y1, float w, float h, float r, float g, float b, float z) {
+  const float px[6] = {x0, x1, x0, x0, x1, x1}, py[6] = {y0, y0, y1, y1, y0, y1};
+  for (int i = 0; i < 6; ++i) {
+    v[i][0] = px[i] / w * 2 - 1, v[i][1] = 1 - py[i] / h * 2, v[i][2] = z;
+    v[i][3] = r, v[i][4] = g, v[i][5] = b, v[i][6] = 1;
+  }
+}
+/* Direct3D's standard positions of four samples, in sixteenths of a pixel from the centre (+y down). */
+static const int kMs4[4][2] = {{-2, -6}, {6, -2}, {-6, 2}, {2, 6}};
+static int ms_covered(float x0, float x1, UINT px, UINT k) {
+  const float sx = (float)px + 0.5f + (float)kMs4[k][0] / 16.0f;
+  return sx >= x0 && sx < x1;
+}
+
+static void test_msaa_shaders(Scene *c) {
+  D3D12_FEATURE_DATA_FORMAT_SUPPORT fs = {DXGI_FORMAT_B8G8R8A8_UNORM, D3D12_FORMAT_SUPPORT1_NONE, D3D12_FORMAT_SUPPORT2_NONE};
+  CHECK_HR(ID3D12Device_CheckFeatureSupport(c->dev, D3D12_FEATURE_FORMAT_SUPPORT, &fs, sizeof fs));
+  D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS levels = {DXGI_FORMAT_B8G8R8A8_UNORM, 4, D3D12_MULTISAMPLE_QUALITY_LEVELS_FLAG_NONE, 0};
+  CHECK_HR(ID3D12Device_CheckFeatureSupport(c->dev, D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS, &levels, sizeof levels));
+  const int loads = (fs.Support1 & D3D12_FORMAT_SUPPORT1_MULTISAMPLE_LOAD) != 0;
+  printf("msaa shaders: 4x %s, MULTISAMPLE_LOAD %d, MULTISAMPLE_RENDERTARGET %d\n", levels.NumQualityLevels ? "yes" : "no", loads, (fs.Support1 & D3D12_FORMAT_SUPPORT1_MULTISAMPLE_RENDERTARGET) != 0);
+  CHECK(!!(fs.Support1 & D3D12_FORMAT_SUPPORT1_MULTISAMPLE_RENDERTARGET) == !!levels.NumQualityLevels);
+  if (!levels.NumQualityLevels || !loads) return;
+  D3D12_FEATURE_DATA_FORMAT_SUPPORT fd = {DXGI_FORMAT_R24G8_TYPELESS, D3D12_FORMAT_SUPPORT1_NONE, D3D12_FORMAT_SUPPORT2_NONE};
+  CHECK_HR(ID3D12Device_CheckFeatureSupport(c->dev, D3D12_FEATURE_FORMAT_SUPPORT, &fd, sizeof fd));
+  MsRig m;
+  if (!ms_rig_make(c, &m)) { CHECK(0); ms_rig_free(&m); return; }
+  ID3D12Resource *ms = ms_texture(c, DXGI_FORMAT_B8G8R8A8_UNORM, 16, 16, 1, 4, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
+  CHECK(ms != NULL);
+  D3D12_SHADER_RESOURCE_VIEW_DESC srv;
+  memset(&srv, 0, sizeof srv);
+  srv.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+  srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DMS;
+  srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+  float v[12][7];
+  ID3D12PipelineState *flat = ms_pso(c, &m, dx_vs_msaa_dxbc, sizeof dx_vs_msaa_dxbc, dx_ps_flat_dxbc, sizeof dx_ps_flat_dxbc, 4, DXGI_FORMAT_UNKNOWN, 0, NULL);
+  CHECK(flat != NULL);
+  /* every sample: a red rectangle from x = 4.3 to 12.6 over the whole height, read through Texture2DMS Load (DXBC and DXIL readers) */
+  ms_rect(v, 4.3f, 0, 12.6f, 16, 16, 16, 1, 0, 0, 0.5f);
+  ms_draw(c, &m, flat, ms, -1, NULL, DXGI_FORMAT_UNKNOWN, v, 6, 16, 16, 0);
+  for (int dxil = 0; dxil < 2; ++dxil) {
+    ms_read(c, &m, ms, &srv, dxil ? dx_dxil_ps_ms_load_dxil : dx_ps_ms_load_dxbc, dxil ? sizeof dx_dxil_ps_ms_load_dxil : sizeof dx_ps_ms_load_dxbc);
+    UINT right = 0;
+    for (UINT x = 0; x < 16; ++x)
+      for (UINT k = 0; k < 4; ++k) right += ms_sample(&m, x, 7, k) == (ms_covered(4.3f, 12.6f, x, k) ? 0xFFFF0000u : 0xFF000000u);
+    printf("msaa shaders: Texture2DMS Load (%s): %u of 64 samples as drawn (pixel 4: %08x %08x %08x %08x)\n", dxil ? "DXIL" : "DXBC", right, (unsigned)ms_sample(&m, 4, 7, 0),
+           (unsigned)ms_sample(&m, 4, 7, 1), (unsigned)ms_sample(&m, 4, 7, 2), (unsigned)ms_sample(&m, 4, 7, 3));
+    CHECK(right == 64);
+  }
+  /* GetDimensions and GetSamplePosition of the Texture2DMS (red the width, green the height, blue count * 16 + x + 8, alpha y + 8 of sample x mod 4) */
+  for (int dxil = 0; dxil < 2; ++dxil) {
+    ms_read(c, &m, ms, &srv, dxil ? dx_dxil_ps_ms_info_dxil : dx_ps_ms_info_dxbc, dxil ? sizeof dx_dxil_ps_ms_info_dxil : sizeof dx_ps_ms_info_dxbc);
+    int ok = 1;
+    for (UINT k = 0; k < 4; ++k) {
+      const UINT32 p = m.px[3 * 64 + k];
+      ok &= ((p >> 16) & 0xFF) == 16 && ((p >> 8) & 0xFF) == 16 && (p & 0xFF) == 64u + (UINT)(kMs4[k][0] + 8) && (p >> 24) == (UINT)(kMs4[k][1] + 8);
+    }
+    printf("msaa shaders: GetDimensions / GetSamplePosition (%s): %08x %08x\n", dxil ? "DXIL" : "DXBC", (unsigned)m.px[3 * 64], (unsigned)m.px[3 * 64 + 1]);
+    CHECK(ok);
+  }
+  /* the rasterizer's count and positions (GetRenderTargetSampleCount / Position), drawn into every sample */
+  for (int dxil = 0; dxil < 2; ++dxil) {
+    ID3D12PipelineState *p = ms_pso(c, &m, dx_vs_msaa_dxbc, sizeof dx_vs_msaa_dxbc, dxil ? dx_dxil_ps_rt_info_dxil : dx_ps_rt_info_dxbc,
+                                    dxil ? sizeof dx_dxil_ps_rt_info_dxil : sizeof dx_ps_rt_info_dxbc, 4, DXGI_FORMAT_UNKNOWN, 0, NULL);
+    CHECK(p != NULL);
+    ms_rect(v, 0, 0, 16, 16, 16, 16, 1, 1, 1, 0.5f);
+    ms_draw(c, &m, p, ms, -1, NULL, DXGI_FORMAT_UNKNOWN, v, 6, 16, 16, 0);
+    ms_read(c, &m, ms, &srv, dx_ps_ms_load_dxbc, sizeof dx_ps_ms_load_dxbc);
+    int ok = 1;
+    for (UINT x = 0; x < 8; ++x) {
+      const UINT32 q = ms_sample(&m, x, 2, 1);
+      ok &= ((q >> 16) & 0xFF) == 64 && ((q >> 8) & 0xFF) == (UINT)(kMs4[x % 4][0] + 8) && (q & 0xFF) == (UINT)(kMs4[x % 4][1] + 8);
+    }
+    printf("msaa shaders: the rasterizer's samples (%s): %08x %08x\n", dxil ? "DXIL" : "DXBC", (unsigned)ms_sample(&m, 0, 2, 1), (unsigned)ms_sample(&m, 1, 2, 1));
+    CHECK(ok);
+    if (p) ID3D12PipelineState_Release(p);
+  }
+  /* SV_SampleIndex (the shader runs for each sample: red (index + 1) / 4, green the position's fraction at the sample, blue SV_Coverage's own bit) */
+  for (int dxil = 0; dxil < 2; ++dxil) {
+    ID3D12PipelineState *p = ms_pso(c, &m, dx_vs_msaa_dxbc, sizeof dx_vs_msaa_dxbc, dxil ? dx_dxil_ps_sample_index_dxil : dx_ps_sample_index_dxbc,
+                                    dxil ? sizeof dx_dxil_ps_sample_index_dxil : sizeof dx_ps_sample_index_dxbc, 4, DXGI_FORMAT_UNKNOWN, 0, NULL);
+    CHECK(p != NULL);
+    ms_rect(v, 0, 0, 16, 16, 16, 16, 1, 1, 1, 0.5f);
+    ms_draw(c, &m, p, ms, -1, NULL, DXGI_FORMAT_UNKNOWN, v, 6, 16, 16, 0);
+    ms_read(c, &m, ms, &srv, dx_ps_ms_load_dxbc, sizeof dx_ps_ms_load_dxbc);
+    int ok = 1;
+    for (UINT k = 0; k < 4; ++k) {
+      const UINT32 q = ms_sample(&m, 5, 6, k);
+      const UINT r = (q >> 16) & 0xFF, want = (k + 1) * 64 - (k == 3);
+      ok &= r + 1 >= want && r <= want + 1 && ((q >> 8) & 0xFF) == (UINT)(kMs4[k][0] + 8) && (q & 0xFF) == 16u << k;
+    }
+    printf("msaa shaders: SV_SampleIndex (%s): %08x %08x %08x %08x\n", dxil ? "DXIL" : "DXBC", (unsigned)ms_sample(&m, 5, 6, 0), (unsigned)ms_sample(&m, 5, 6, 1),
+           (unsigned)ms_sample(&m, 5, 6, 2), (unsigned)ms_sample(&m, 5, 6, 3));
+    CHECK(ok);
+    if (p) ID3D12PipelineState_Release(p);
+  }
+  /* an input at the sample, and EvaluateAttributeAtSample / Snapped / Centroid: the colour's red and green are the pixel's x and y over 64 */
+  {
+    float g[6][7];
+    const float px[6] = {0, 16, 0, 0, 16, 16}, py[6] = {0, 0, 16, 16, 0, 16};
+    for (int i = 0; i < 6; ++i) g[i][0] = px[i] / 8 - 1, g[i][1] = 1 - py[i] / 8, g[i][2] = 0.5f, g[i][3] = px[i] / 64, g[i][4] = py[i] / 64, g[i][5] = 0, g[i][6] = 1;
+    for (int which = 0; which < 4; ++which) {
+      const int dxil = which & 1, evaluate = which >= 2;
+      const void *code = evaluate ? (dxil ? (const void *)dx_dxil_ps_eval_dxil : dx_ps_eval_dxbc) : (dxil ? (const void *)dx_dxil_ps_sample_input_dxil : dx_ps_sample_input_dxbc);
+      const SIZE_T size = evaluate ? (dxil ? sizeof dx_dxil_ps_eval_dxil : sizeof dx_ps_eval_dxbc) : (dxil ? sizeof dx_dxil_ps_sample_input_dxil : sizeof dx_ps_sample_input_dxbc);
+      ID3D12PipelineState *p = ms_pso(c, &m, dx_vs_msaa_dxbc, sizeof dx_vs_msaa_dxbc, code, size, 4, DXGI_FORMAT_UNKNOWN, 0, NULL);
+      CHECK(p != NULL);
+      ms_draw(c, &m, p, ms, -1, NULL, DXGI_FORMAT_UNKNOWN, g, 6, 16, 16, 0);
+      ms_read(c, &m, ms, &srv, dx_ps_ms_load_dxbc, sizeof dx_ps_ms_load_dxbc);
+      int ok = 1;
+      for (UINT y = 0; y < 4 && ok; ++y)
+        for (UINT x = 0; x < 16 && ok; ++x)
+          for (UINT k = 0; k < 4 && ok; ++k) {
+            const UINT32 q = ms_sample(&m, x, y + 8, k);
+            const UINT r = (q >> 16) & 0xFF, gg = (q >> 8) & 0xFF, b = q & 0xFF, a = q >> 24;
+            /* (at the sample: sample k's position; evaluated: sample y mod 4's, the offset x mod 16 - 8 and the centre) */
+            const UINT s = evaluate ? (y + 8) % 4 : k;
+            const UINT wr = (UINT)(kMs4[s][0] + 8), wg = (UINT)(kMs4[s][1] + 8);
+            ok &= r + 1 >= wr && r <= wr + 1 && gg + 1 >= wg && gg <= wg + 1;
+            /* (the centroid of a pixel the triangle covers: its centre on the CPU renderer; a GPU may take a covered sample there - GL and Vulkan say any point of the pixel's
+             * covered part -: one of the samples' x) */
+            int centroid_ok = a + 1 >= 8 && a <= 9;
+            for (UINT j = 0; j < 4; ++j) centroid_ok |= a == (UINT)(kMs4[j][0] + 8);
+            if (evaluate) ok &= b + 1 >= (x & 15) && b <= (x & 15) + 1 && centroid_ok;
+            if (!ok) printf("msaa shaders: %s (%s) pixel (%u, %u) sample %u: %08x\n", evaluate ? "evaluations" : "inputs at the sample", dxil ? "DXIL" : "DXBC", x, y + 8, k, (unsigned)q);
+          }
+      printf("msaa shaders: %s (%s): %s\n", evaluate ? "EvaluateAttribute*" : "inputs at the sample", dxil ? "DXIL" : "DXBC", ok ? "where they should be" : "wrong");
+      CHECK(ok);
+      if (p) ID3D12PipelineState_Release(p);
+    }
+  }
+  /* SV_Coverage in (the rectangle from 4.3 to 12.6: the count of each pixel's covered samples, the mask) and out (white to the samples of the mask x mod 16) */
+  for (int which = 0; which < 3; ++which) {
+    const void *code = which == 0 ? dx_ps_coverage_dxbc : which == 1 ? dx_ps_omask_dxbc : (const void *)dx_dxil_ps_omask_dxil;
+    const SIZE_T size = which == 0 ? sizeof dx_ps_coverage_dxbc : which == 1 ? sizeof dx_ps_omask_dxbc : sizeof dx_dxil_ps_omask_dxil;
+    ID3D12PipelineState *p = ms_pso(c, &m, dx_vs_msaa_dxbc, sizeof dx_vs_msaa_dxbc, code, size, 4, DXGI_FORMAT_UNKNOWN, 0, NULL);
+    CHECK(p != NULL);
+    if (which == 0) ms_rect(v, 4.3f, 0, 12.6f, 16, 16, 16, 1, 1, 1, 0.5f);
+    else ms_rect(v, 0, 0, 16, 16, 16, 16, 1, 1, 1, 0.5f);
+    ms_draw(c, &m, p, ms, -1, NULL, DXGI_FORMAT_UNKNOWN, v, 6, 16, 16, 0);
+    ms_read(c, &m, ms, &srv, dx_ps_ms_load_dxbc, sizeof dx_ps_ms_load_dxbc);
+    int ok = 1;
+    for (UINT x = 0; x < 16; ++x) {
+      UINT mask = 0, n = 0;
+      for (UINT k = 0; k < 4; ++k) mask |= ms_covered(4.3f, 12.6f, x, k) ? 1u << k : 0u;
+      for (UINT k = 0; k < 4; ++k) n += mask >> k & 1;
+      for (UINT k = 0; k < 4; ++k) {
+        const UINT32 q = ms_sample(&m, x, 3, k);
+        if (which == 0) {
+          if ((x >= 10 && x <= 11) || !(mask >> k & 1)) continue;   /* (the rectangle's diagonal crosses row 3 at 10.8: each of its triangles has its own coverage there) */
+          const UINT r = (q >> 16) & 0xFF, want = (n * 255 + 2) / 4;
+          ok &= r + 1 >= want && r <= want + 1 && ((q >> 8) & 0xFF) == mask * 16;
+        } else {
+          ok &= q == ((x >> k & 1) ? 0xFFFFFFFFu : 0xFF000000u);
+        }
+      }
+    }
+    printf("msaa shaders: SV_Coverage %s: %s (pixel 4: %08x %08x)\n", which == 0 ? "in" : which == 1 ? "out (DXBC)" : "out (DXIL)", ok ? "right" : "wrong", (unsigned)ms_sample(&m, 4, 3, 0),
+           (unsigned)ms_sample(&m, 4, 3, 1));
+    CHECK(ok);
+    if (p) ID3D12PipelineState_Release(p);
+  }
+  /* centroid: a triangle whose red is the weight of its vertex at the top; its lower edge through the samples of row 12. At the centre the partly covered pixels of row 12 read it
+   * below zero (red), at the centroid none does */
+  for (int which = 0; which < 3; ++which) {
+    const void *code = which == 0 ? dx_ps_centre_dxbc : which == 1 ? dx_ps_centroid_dxbc : (const void *)dx_dxil_ps_centroid_dxil;
+    const SIZE_T size = which == 0 ? sizeof dx_ps_centre_dxbc : which == 1 ? sizeof dx_ps_centroid_dxbc : sizeof dx_dxil_ps_centroid_dxil;
+    ID3D12PipelineState *p = ms_pso(c, &m, dx_vs_msaa_dxbc, sizeof dx_vs_msaa_dxbc, code, size, 4, DXGI_FORMAT_UNKNOWN, 0, NULL);
+    CHECK(p != NULL);
+    const float t[3][7] = {{-1.5f, 1 - 12.37f / 8, 0.5f, 0, 0, 0, 1}, {1.5f, 1 - 12.37f / 8, 0.5f, 0, 0, 0, 1}, {0, 2.25f, 0.5f, 1, 0, 0, 1}};
+    ms_draw(c, &m, p, ms, -1, NULL, DXGI_FORMAT_UNKNOWN, t, 3, 16, 16, 0);
+    ms_read(c, &m, ms, &srv, dx_ps_ms_load_dxbc, sizeof dx_ps_ms_load_dxbc);
+    UINT red = 0, lit = 0;
+    for (UINT i = 0; i < 64 * 16; ++i) red += ((m.px[i] >> 16) & 0xFF) == 0xFF, lit += (m.px[i] & 0xFFFFFF) != 0;
+    printf("msaa shaders: %s: %u of %u covered samples below zero\n", which == 0 ? "centre" : which == 1 ? "centroid (DXBC)" : "centroid (DXIL)", red, lit);
+    CHECK(lit > 600 && (which == 0 ? red >= 16 : red == 0));
+    if (p) ID3D12PipelineState_Release(p);
+  }
+  /* a multisampled array: slice 0 red on its left half, slice 1 green on its right, drawn through TEXTURE2DMSARRAY views of one slice; read through a Texture2DMSArray view
+   * (GetDimensions from row 32: 16, 16, 2 slices, 4 samples); then slice 1 resolved */
+  {
+    ID3D12Resource *array = ms_texture(c, DXGI_FORMAT_B8G8R8A8_UNORM, 16, 16, 2, 4, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
+    CHECK(array != NULL);
+    if (array) {
+      ms_rect(v, 0, 0, 8, 16, 16, 16, 1, 0, 0, 0.5f);
+      ms_draw(c, &m, flat, array, 0, NULL, DXGI_FORMAT_UNKNOWN, v, 6, 16, 16, 0);
+      ms_rect(v, 8, 0, 16, 16, 16, 16, 0, 1, 0, 0.5f);
+      ms_draw(c, &m, flat, array, 1, NULL, DXGI_FORMAT_UNKNOWN, v, 6, 16, 16, 0);
+      D3D12_SHADER_RESOURCE_VIEW_DESC as = srv;
+      as.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DMSARRAY;
+      as.Texture2DMSArray.FirstArraySlice = 0, as.Texture2DMSArray.ArraySize = 2;
+      ms_read(c, &m, array, &as, dx_ps_ms_array_dxbc, sizeof dx_ps_ms_array_dxbc);
+      printf("msaa shaders: Texture2DMSArray: %08x %08x %08x %08x, dimensions %08x\n", (unsigned)m.px[2 * 64 + 4], (unsigned)m.px[2 * 64 + 60], (unsigned)m.px[18 * 64 + 4],
+             (unsigned)m.px[18 * 64 + 60], (unsigned)m.px[40 * 64]);
+      CHECK(m.px[2 * 64 + 4] == 0xFFFF0000u && m.px[2 * 64 + 60] == 0xFF000000u && m.px[18 * 64 + 4] == 0xFF000000u && m.px[18 * 64 + 60] == 0xFF00FF00u);
+      CHECK(m.px[40 * 64] == 0x04101002u);
+      /* (a view of slice 1 alone, as Texture2DMS: the green) */
+      D3D12_SHADER_RESOURCE_VIEW_DESC one = as;
+      one.Texture2DMSArray.FirstArraySlice = 1, one.Texture2DMSArray.ArraySize = 1;
+      ms_read(c, &m, array, &one, dx_ps_ms_array_dxbc, sizeof dx_ps_ms_array_dxbc);
+      CHECK(m.px[2 * 64 + 60] == 0xFF00FF00u && m.px[2 * 64 + 4] == 0xFF000000u);
+      /* ResolveSubresource of subresource 1 (slice 1) into the scene's target's... a 16 x 16 texture */
+      ID3D12Resource *plain = ms_texture(c, DXGI_FORMAT_B8G8R8A8_UNORM, 16, 16, 1, 1, D3D12_RESOURCE_FLAG_NONE);
+      ID3D12GraphicsCommandList *l = NULL;
+      CHECK_HR(ID3D12CommandAllocator_Reset(c->allocator));
+      CHECK_HR(ID3D12Device_CreateCommandList(c->dev, 0, D3D12_COMMAND_LIST_TYPE_DIRECT, c->allocator, NULL, &IID_ID3D12GraphicsCommandList, (void **)&l));
+      if (l && plain) {
+        ID3D12GraphicsCommandList_ResolveSubresource(l, plain, 0, array, 1, DXGI_FORMAT_B8G8R8A8_UNORM);
+        D3D12_TEXTURE_COPY_LOCATION to, from;
+        memset(&to, 0, sizeof to);
+        memset(&from, 0, sizeof from);
+        to.pResource = c->readback, to.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+        to.PlacedFootprint.Footprint.Format = DXGI_FORMAT_B8G8R8A8_UNORM, to.PlacedFootprint.Footprint.Width = 16, to.PlacedFootprint.Footprint.Height = 16;
+        to.PlacedFootprint.Footprint.Depth = 1, to.PlacedFootprint.Footprint.RowPitch = 256;
+        from.pResource = plain, from.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        ID3D12GraphicsCommandList_CopyTextureRegion(l, &to, 0, 0, 0, &from, NULL);
+        scene_run(c, l);
+        const UINT32 *pixels = NULL;
+        if (SUCCEEDED(ID3D12Resource_Map(c->readback, 0, NULL, (void **)&pixels)) && pixels) {
+          printf("msaa shaders: slice 1 resolved: %08x %08x\n", (unsigned)pixels[4 * 64 + 3], (unsigned)pixels[4 * 64 + 12]);
+          CHECK(pixels[4 * 64 + 12] == 0xFF00FF00u && pixels[4 * 64 + 3] == 0xFF000000u);
+          ID3D12Resource_Unmap(c->readback, 0, NULL);
+        }
+      }
+      if (l) ID3D12GraphicsCommandList_Release(l);
+      if (plain) ID3D12Resource_Release(plain);
+      ID3D12Resource_Release(array);
+    }
+  }
+  /* a multisampled depth buffer read by shaders: R32_TYPELESS (D32_FLOAT), a rectangle at depth 0.25 from x = 4.3, the rest cleared to 1 (the depth in red); and an R24G8_TYPELESS
+   * one's stencil (X24_TYPELESS_G8_UINT: the reference 5 where it was drawn) */
+  for (int stencil = 0; stencil < 2; ++stencil) {
+    const DXGI_FORMAT resource = stencil ? DXGI_FORMAT_R24G8_TYPELESS : DXGI_FORMAT_R32_TYPELESS, dsv = stencil ? DXGI_FORMAT_D24_UNORM_S8_UINT : DXGI_FORMAT_D32_FLOAT;
+    ID3D12Resource *depth = ms_texture(c, resource, 16, 16, 1, 4, D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL);
+    ID3D12PipelineState *p = ms_pso(c, &m, dx_vs_msaa_dxbc, sizeof dx_vs_msaa_dxbc, dx_ps_flat_dxbc, sizeof dx_ps_flat_dxbc, 4, dsv, 0, NULL);
+    CHECK(depth != NULL && p != NULL);
+    if (depth && p) {
+      ms_rect(v, 4.3f, 0, 16, 16, 16, 16, 1, 1, 1, 0.25f);
+      ms_draw(c, &m, p, ms, -1, depth, dsv, v, 6, 16, 16, 5);
+      D3D12_SHADER_RESOURCE_VIEW_DESC ds = srv;
+      ds.Format = stencil ? DXGI_FORMAT_X24_TYPELESS_G8_UINT : DXGI_FORMAT_R32_FLOAT;
+      ms_read(c, &m, depth, &ds, stencil ? dx_ps_ms_stencil_dxbc : dx_ps_ms_depth_dxbc, stencil ? sizeof dx_ps_ms_stencil_dxbc : sizeof dx_ps_ms_depth_dxbc);
+      int ok = 1;
+      for (UINT x = 3; x < 6; ++x)
+        for (UINT k = 0; k < 4; ++k) {
+          const UINT32 q = ms_sample(&m, x, 5, k);
+          ok &= stencil ? ((q >> 8) & 0xFF) == (ms_covered(4.3f, 16, x, k) ? 5u : 0u) : ((q >> 16) & 0xFF) == (ms_covered(4.3f, 16, x, k) ? 64u : 255u);
+        }
+      printf("msaa shaders: multisampled %s read: %s (pixel 4: %08x %08x %08x %08x)\n", stencil ? "stencil" : "depth", ok ? "as drawn" : "wrong", (unsigned)ms_sample(&m, 4, 5, 0),
+             (unsigned)ms_sample(&m, 4, 5, 1), (unsigned)ms_sample(&m, 4, 5, 2), (unsigned)ms_sample(&m, 4, 5, 3));
+      CHECK(ok);
+    }
+    if (p) ID3D12PipelineState_Release(p);
+    if (depth) ID3D12Resource_Release(depth);
+  }
+  CHECK(!!(fd.Support1 & D3D12_FORMAT_SUPPORT1_MULTISAMPLE_LOAD));      /* (the depth format's views are read) */
+  /* noperspective (the vertices' w 1, 4 and 4: the input is linear in the screen - its red the pixel's own x -, the perspective-correct one is not) and nointerpolation (the first
+   * vertex's colour everywhere), one sample */
+  {
+    const float t[3][7] = {{-1, -1, 0.5f, -1, 0, 0, 1}, {1, -1, 0.5f, 1, 0, 0, 4}, {-1, 1, 0.5f, -1, 0, 0, 4}};
+    const float f[3][7] = {{-1, -1, 0.5f, 1, 0, 0, 1}, {1, -1, 0.5f, 0, 1, 0, 1}, {-1, 1, 0.5f, 0, 0, 1, 1}};
+    for (int which = 0; which < 5; ++which) {
+      const void *code = which == 0 ? dx_ps_noperspective_dxbc : which == 1 ? (const void *)dx_dxil_ps_noperspective_dxil : which == 2 ? dx_ps_perspective_dxbc : which == 3 ? dx_ps_flat_dxbc : (const void *)dx_dxil_ps_flat_dxil;
+      const SIZE_T size = which == 0 ? sizeof dx_ps_noperspective_dxbc : which == 1 ? sizeof dx_dxil_ps_noperspective_dxil : which == 2 ? sizeof dx_ps_perspective_dxbc : which == 3 ? sizeof dx_ps_flat_dxbc : sizeof dx_dxil_ps_flat_dxil;
+      ID3D12PipelineState *p = ms_pso(c, &m, dx_vs_msaa_dxbc, sizeof dx_vs_msaa_dxbc, code, size, 1, DXGI_FORMAT_UNKNOWN, 0, NULL);
+      CHECK(p != NULL);
+      if (!p) continue;
+      ms_draw(c, &m, p, c->target, -1, NULL, DXGI_FORMAT_UNKNOWN, which >= 3 ? f : t, 3, 64, 64, 0);
+      ID3D12GraphicsCommandList *l = NULL;
+      CHECK_HR(ID3D12CommandAllocator_Reset(c->allocator));
+      CHECK_HR(ID3D12Device_CreateCommandList(c->dev, 0, D3D12_COMMAND_LIST_TYPE_DIRECT, c->allocator, NULL, &IID_ID3D12GraphicsCommandList, (void **)&l));
+      if (l) {
+        scene_read_target(c, l);
+        scene_run(c, l);
+        ID3D12GraphicsCommandList_Release(l);
+      }
+      const UINT32 *pixels = NULL;
+      if (SUCCEEDED(ID3D12Resource_Map(c->readback, 0, NULL, (void **)&pixels)) && pixels) {
+        if (which < 3) {
+          UINT worst = 0;
+          for (UINT y = 0; y < 64; ++y)
+            for (UINT x = 0; x + 2 < y; ++x)
+              if (((pixels[y * 64 + x] >> 16) & 0xFF) > worst) worst = (pixels[y * 64 + x] >> 16) & 0xFF;
+          printf("msaa shaders: %s: worst %u\n", which == 0 ? "noperspective (DXBC)" : which == 1 ? "noperspective (DXIL)" : "perspective-correct", worst);
+          CHECK(which == 2 ? worst >= 64 : worst <= 2);
+        } else {
+          CHECK(pixels[60 * 64 + 3] == 0xFFFF0000u && pixels[40 * 64 + 20] == 0xFFFF0000u && pixels[10 * 64 + 1] == 0xFFFF0000u && pixels[10 * 64 + 50] == 0xFF000000u);
+        }
+        ID3D12Resource_Unmap(c->readback, 0, NULL);
+      }
+      ID3D12PipelineState_Release(p);
+    }
+  }
+  /* SV_InnerCoverage with conservative rasterization (ConservativeRasterizationTier: the CPU renderer's tier 1 - its inner coverage is read, though tier 3 also wants degenerate
+   * triangles drawn -): whole pixels green, the edge's red */
+  {
+    D3D12_FEATURE_DATA_D3D12_OPTIONS o;
+    memset(&o, 0, sizeof o);
+    CHECK_HR(ID3D12Device_CheckFeatureSupport(c->dev, D3D12_FEATURE_D3D12_OPTIONS, &o, sizeof o));
+    HRESULT hr = S_OK;
+    ID3D12PipelineState *p = o.ConservativeRasterizationTier ? ms_pso(c, &m, dx_vs_msaa_dxbc, sizeof dx_vs_msaa_dxbc, dx_ps_inner_dxbc, sizeof dx_ps_inner_dxbc, 1, DXGI_FORMAT_UNKNOWN, 1, &hr) : NULL;
+    if (p) {
+      const float t[3][7] = {{2.3f / 32 - 1, 1 - 2.2f / 32, 0.5f, 1, 1, 1, 1}, {14.6f / 32 - 1, 1 - 2.2f / 32, 0.5f, 1, 1, 1, 1}, {2.3f / 32 - 1, 1 - 14.7f / 32, 0.5f, 1, 1, 1, 1}};
+      ms_draw(c, &m, p, c->target, -1, NULL, DXGI_FORMAT_UNKNOWN, t, 3, 64, 64, 0);
+      ID3D12GraphicsCommandList *l = NULL;
+      CHECK_HR(ID3D12CommandAllocator_Reset(c->allocator));
+      CHECK_HR(ID3D12Device_CreateCommandList(c->dev, 0, D3D12_COMMAND_LIST_TYPE_DIRECT, c->allocator, NULL, &IID_ID3D12GraphicsCommandList, (void **)&l));
+      if (l) {
+        scene_read_target(c, l);
+        scene_run(c, l);
+        ID3D12GraphicsCommandList_Release(l);
+      }
+      const UINT32 *pixels = NULL;
+      if (SUCCEEDED(ID3D12Resource_Map(c->readback, 0, NULL, (void **)&pixels)) && pixels) {
+        printf("msaa shaders: SV_InnerCoverage: %08x %08x %08x %08x\n", (unsigned)pixels[5 * 64 + 5], (unsigned)pixels[5 * 64 + 2], (unsigned)pixels[2 * 64 + 5], (unsigned)pixels[0]);
+        CHECK(pixels[5 * 64 + 5] == 0xFF00FF00u && pixels[5 * 64 + 2] == 0xFFFF0000u && pixels[2 * 64 + 5] == 0xFFFF0000u && pixels[0] == 0xFF000000u);
+        ID3D12Resource_Unmap(c->readback, 0, NULL);
+      }
+      ID3D12PipelineState_Release(p);
+    } else {
+      printf("msaa shaders: SV_InnerCoverage: conservative tier %d, pipeline %08lx\n", (int)o.ConservativeRasterizationTier, (unsigned long)hr);
+      CHECK(!o.ConservativeRasterizationTier || FAILED(hr));
+    }
+  }
+  if (flat) ID3D12PipelineState_Release(flat);
+  if (ms) ID3D12Resource_Release(ms);
+  ms_rig_free(&m);
+}
+
 static void test_extras(ID3D12Device *dev, ID3D12CommandQueue *queue, ID3D12Fence *fence, UINT64 *fence_value) {
   Scene c;
   memset(&c, 0, sizeof c);
@@ -8708,6 +9220,7 @@ static void test_extras(ID3D12Device *dev, ID3D12CommandQueue *queue, ID3D12Fenc
   test_tiled_tiers(&c);
   test_fixed_state_gaps(&c);
   test_shader_query_gaps(&c);
+  test_msaa_shaders(&c);
 }
 
 /* ---- the interfaces after ID3D12Device and ID3D12GraphicsCommandList ---------------------------------------------------------------------------------------------------- */

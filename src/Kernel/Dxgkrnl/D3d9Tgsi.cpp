@@ -45,6 +45,7 @@ const char* dimension_name(graphics::TextureKind kind) {
     case graphics::TextureKind::TextureCube: return "CUBE";
     case graphics::TextureKind::TextureCubeArray: return "CUBEARRAY";   // (tgsi_strings.c spells it so; "CUBE_ARRAY" is read as CUBE and the rest refused)
     case graphics::TextureKind::Texture2DMS: return "2D_MSAA";
+    case graphics::TextureKind::Texture2DMSArray: return "2D_ARRAY_MSAA";
     default: return "2D";
   }
 }
@@ -73,7 +74,9 @@ class TgsiEmitter {
   const uint32_t kLayer = kPatchBase + graphics::kMaxPatchRegisters;   // a geometry shader's SV_RenderTargetArrayIndex (the integer in x)
   const uint32_t kCompare = kLayer + 1, kCompare2 = kLayer + 2;   // the comparison lookups' own (kTexCompare: a cube's face, the passes)
   const uint32_t kViewportIndex = kLayer + 3;                       // ... and a geometry shader's SV_ViewportArrayIndex
-  const uint32_t kTempCount = kLayer + 4;
+  const uint32_t kCoverageMask = kLayer + 4;                        // a pixel shader's SV_Coverage output (oMask: the integer in x)
+  const uint32_t kMs = kLayer + 5, kMs2 = kLayer + 6;               // the multisampled reads' own (sample positions, the host's numbering of samples)
+  const uint32_t kTempCount = kLayer + 7;
   uint32_t color_register(uint32_t target) const { return target == 0 ? kColor : kColorExtra + target - 1; }
   // The first output after the position and the varyings: the position as the shader wrote it (one a stream), or a hull shader's tessellation factors. (With the device's four
   // varyings of old it was OUT[5]; virgl's stream output declaration names the same register: VirglShaderModule.)
@@ -367,7 +370,122 @@ class TgsiEmitter {
   uint32_t max_attribute_ = 0;
   bool sampler_used_[graphics::kMaxTextureUnits] = {};
   bool compare_used_ = false;   // (the sampler comparisons are read from the constants: their registers are declared)
+  bool raster_used_ = false;    // (the pass's sample count is read from the device's constants: CONST[kRasterizerRegister])
+  bool coverage_written_ = false;   // (a pixel shader's SV_Coverage output: OUT[] SAMPLEMASK after the colours)
   uint32_t varyings_;
+
+  // --- multisampling
+  // An unsigned immediate, in all four components (.xxxx: a scalar source).
+  String uimm(uint32_t v) {
+    force_integer_ = true;
+    String t = str();
+    add(t, "IMM[");
+    add_uint(t, imm4_bits(v, v, v, v));
+    add(t, "].xxxx");
+    return t;
+  }
+  String uimm4(uint32_t x, uint32_t y, uint32_t z, uint32_t w) {
+    force_integer_ = true;
+    String t = str();
+    add(t, "IMM[");
+    add_uint(t, imm4_bits(x, y, z, w));
+    add(t, "]");
+    return t;
+  }
+  // The pass's samples per pixel, an unsigned integer in all four components (the device writes it with the samplers' comparisons: ShaderModuleDesc::sampler_constants).
+  String raster_count() {
+    raster_used_ = true;
+    String t = str();
+    add(t, "CONST[");
+    add_uint(t, graphics::kRasterizerRegister);
+    add(t, "].xxxx");
+    return t;
+  }
+  // A sample's number between Direct3D's and the host's (an involution: the same both ways) - the host's sample 1 is Direct3D's sample 3 of four and the other way round, unless the
+  // device numbers them as Direct3D does (DeviceInfo::d3d_sample_order). `index` (.x) is turned in place when `count` (.xxxx) is 4.
+  void host_sample_index(const String& index_x, const String& index_xxxx, const String& count_xxxx) {
+    if (d3d_sample_order_) return;
+    const String four = temp(kMs2, ".x"), four_x = temp(kMs2, ".xxxx"), flip = temp(kMs2, ".y"), flip_y = temp(kMs2, ".yyyy"), one = uimm(1), four_imm = uimm(4);
+    line("USEQ", &four, &count_xxxx, &four_imm);
+    line("AND", &flip, &index_xxxx, &one);
+    line("SHL", &flip, &flip_y, &one);
+    line("AND", &flip, &flip_y, &four_x);
+    line("XOR", &index_x, &index_xxxx, &flip_y);
+  }
+  // A coverage mask between Direct3D's numbering of the samples and the host's: bits 1 and 3 swapped when `count` is 4 (as host_sample_index).
+  void host_sample_mask(const String& mask_x, const String& mask_xxxx, const String& count_xxxx) {
+    if (d3d_sample_order_) return;
+    const String four = temp(kMs2, ".x"), four_x = temp(kMs2, ".xxxx"), keep = temp(kMs2, ".y"), keep_y = temp(kMs2, ".yyyy"), up = temp(kMs2, ".z"), up_z = temp(kMs2, ".zzzz");
+    const String down = temp(kMs2, ".w"), down_w = temp(kMs2, ".wwww");
+    const String four_imm = uimm(4), keep_bits = uimm(~0xAu), two = uimm(2), eight = uimm(8);
+    line("USEQ", &four, &count_xxxx, &four_imm);
+    line("AND", &keep, &mask_xxxx, &keep_bits);
+    line("AND", &up, &mask_xxxx, &two);
+    line("SHL", &up, &up_z, &two);
+    line("AND", &down, &mask_xxxx, &eight);
+    line("USHR", &down, &down_w, &two);
+    line("OR", &keep, &keep_y, &up_z);
+    line("OR", &keep, &keep_y, &down_w);
+    line("UCMP", &mask_x, &four_x, &keep_y, &mask_xxxx);
+  }
+  // Where sample `index` (.xxxx, Direct3D's number) of the standard pattern of `count` (.xxxx) samples is: x and y in pixels from the centre into `out_xy`, (0, 0) for an index past
+  // the count. The positions are four bits each (sixteenths plus 8) in two words a coordinate, the words of the count picked by comparisons: TGSI has no table to index.
+  void sample_position(const String& out_xy, const String& index_xxxx, const String& count_xxxx) {
+    const String table = temp(kMs), test = temp(kMs2, ".x"), test_x = temp(kMs2, ".xxxx");
+    auto words = [&](uint32_t count) {
+      uint32_t w[4] = {0, 0, 0, 0};   // (x of 0 .. 7, x of 8 .. 15, y of 0 .. 7, y of 8 .. 15)
+      const graphics::SamplePosition* at = graphics::standard_sample_positions(count);
+      for (uint32_t k = 0; k < count; ++k) {
+        w[k >> 3] |= (static_cast<uint32_t>(at[k].x + 8) & 0xF) << (4 * (k & 7));
+        w[2 + (k >> 3)] |= (static_cast<uint32_t>(at[k].y + 8) & 0xF) << (4 * (k & 7));
+      }
+      return uimm4(w[0], w[1], w[2], w[3]);
+    };
+    const String sixteen = words(16);
+    line("MOV", &table, &sixteen);
+    for (uint32_t count : {8u, 4u, 2u, 1u}) {
+      const String c = uimm(count), w = words(count);
+      line("USEQ", &test, &count_xxxx, &c);
+      line("UCMP", &table, &test_x, &w, &table);
+    }
+    // (the word of the index's half, its four bits, less 8, in sixteenths; zero past the count)
+    const String high = temp(kMs2, ".y"), high_y = temp(kMs2, ".yyyy"), shift = temp(kMs2, ".z"), shift_z = temp(kMs2, ".zzzz"), valid = temp(kMs2, ".w"), valid_w = temp(kMs2, ".wwww");
+    const String eight = uimm(8), seven = uimm(7), two = uimm(2), fifteen = uimm(15);
+    line("USGE", &high, &index_xxxx, &eight);
+    line("AND", &shift, &index_xxxx, &seven);
+    line("SHL", &shift, &shift_z, &two);
+    line("USLT", &valid, &index_xxxx, &count_xxxx);
+    const String tx = temp(kMs, ".x"), ty = temp(kMs, ".y"), tz = temp(kMs, ".z"), tw = temp(kMs, ".w");
+    const String tx_x = temp(kMs, ".xxxx"), ty_y = temp(kMs, ".yyyy"), tz_z = temp(kMs, ".zzzz"), tw_w = temp(kMs, ".wwww");
+    line("UCMP", &tx, &high_y, &ty_y, &tx_x);
+    line("UCMP", &ty, &high_y, &tw_w, &tz_z);
+    line("USHR", &tx, &tx_x, &shift_z);
+    line("USHR", &ty, &ty_y, &shift_z);
+    const String xy = temp(kMs, ".xy"), xyxy = temp(kMs, ".xyxy"), fifteen_xy = uimm(15);
+    line("AND", &xy, &xyxy, &fifteen_xy);
+    const String minus_eight = uimm(static_cast<uint32_t>(-8));
+    line("UADD", &xy, &xyxy, &minus_eight);
+    line("I2F", &xy, &xyxy);
+    const String sixteenth = splat(1.0f / 16.0f);
+    line("MUL", &xy, &xyxy, &sixteenth);
+    const String nothing = zero();
+    line("UCMP", &out_xy, &valid_w, &xyxy, &nothing);
+    (void)fifteen;
+  }
+  // The sample count of the texture of `unit` (TXQS, or the count the shader declared it with) into `out_x`.
+  void texture_samples(const String& out_x, uint32_t unit, const char* dim) {
+    if (p_.texture_samples_[unit]) {
+      const String n = uimm(p_.texture_samples_[unit]);
+      line("MOV", &out_x, &n);
+      return;
+    }
+    String sampler = str(), target = str();
+    add(sampler, "SAMP[");
+    add_uint(sampler, unit);
+    add(sampler, "]");
+    add(target, dim);
+    line("TXQS", &out_x, &sampler, &target);
+  }
 };
 
 String TgsiEmitter::operand(const Instr::Src& s, uint32_t offset, uint32_t slot, const uint8_t* perm, bool scalar) {
@@ -461,6 +579,12 @@ String TgsiEmitter::operand(const Instr::Src& s, uint32_t offset, uint32_t slot,
       }
       if (s.number == kSysDomainLocation && !domain_) {
         unsupported_ = true;
+        break;
+      }
+      if ((s.number == kSysSampleIndex || s.number == kSysCoverage) && !vertex_ && !geometry_ && !hull_ && !domain_ && !compute_) {
+        add(base, "TEMP[");
+        add_uint(base, kSys + s.number);
+        add(base, "]");
         break;
       }
       if (s.number >= kSysViewId || (geometry_ ? s.number != kSysGsInstanceId && s.number != kSysPrimitiveId : s.number == kSysGsInstanceId) || (compute_ || hull_ || domain_ ? s.number < kSysDispatchThreadId : vertex_ ? s.number != kSysVertexId && s.number != kSysInstanceId : s.number == kSysVertexId || s.number == kSysInstanceId || s.number >= kSysDispatchThreadId)) {
@@ -577,6 +701,9 @@ String TgsiEmitter::destination(const Instr::Dst& d) {
       if (d.slot >= 0 && d.slot < static_cast<int8_t>(graphics::kMaxVaryings)) return temp(kVarying + static_cast<uint32_t>(d.slot), "");
       break;
     case kColorOut: return temp(color_register(d.slot >= 0 ? static_cast<uint32_t>(d.slot) : 0), "");
+    case kCoverageOut:
+      if (vertex_ || geometry_ || hull_ || domain_ || compute_) break;
+      return temp(kCoverageMask, "");
     case kPatchOut:
       if (d.number < graphics::kMaxPatchRegisters) return temp(kPatchBase + d.number, "");
       break;
@@ -1613,11 +1740,105 @@ bool TgsiEmitter::instruction(const Instr& ins) {
     case kTexSamples: {
       // (the count the shader declared the texture with: a constant)
       t = begin_result(ins, true, &direct);
+      // (count, 0, 0, 0) of the texture - TXQS, or the count it was declared with - or of the rasterizer, as an unsigned integer or a float, swizzled as the operand says
+      const String w = temp(kWork), count = temp(kMs, ".x"), count_xxxx = temp(kMs, ".xxxx");
+      if (ins.control == 1) {
+        if (vertex_ || geometry_ || hull_ || domain_ || compute_) {
+          unsupported_ = true;
+          break;
+        }
+        const String n = raster_count();
+        line("MOV", &count, &n);
+      } else {
+        const uint32_t unit = ins.src[0].number;
+        if (unit >= graphics::kMaxTextureUnits) {
+          unsupported_ = true;
+          break;
+        }
+        sampler_used_[unit] = true;
+        texture_samples(count, unit, dimension_name(p_.texture_kind(unit)));
+      }
+      const String rest = temp(kMs, ".yzw"), none = uimm(0);
+      line("MOV", &rest, &none);
+      if (!ins.vector) {
+        const String all = temp(kMs);
+        line("U2F", &all, &all);
+      }
+      String picked = temp(kMs, ".");
+      for (uint32_t c = 0; c < 4; ++c) add(picked, StringView(&"xyzw"[ins.tex_swizzle[c] & 3], 1));
+      line("MOV", &w, &picked);
+      (void)count_xxxx;
+      break;
+    }
+    case kSamplePos: {
+      // samplepos: where a sample of the texture's standard pattern (its count by TXQS) or of the pass's is, (x, y, 0, 0) in pixels from the centre, swizzled as the operand says
+      t = begin_result(ins, true, &direct);
+      const String count = temp(kWork3, ".x"), count_xxxx = temp(kWork3, ".xxxx"), index = temp(kWork3, ".y"), index_yyyy = temp(kWork3, ".yyyy");
+      if (ins.control == 1) {
+        if (vertex_ || geometry_ || hull_ || domain_ || compute_) {
+          unsupported_ = true;
+          break;
+        }
+        const String n = raster_count();
+        line("MOV", &count, &n);
+      } else {
+        const uint32_t unit = ins.src[1].number;
+        if (unit >= graphics::kMaxTextureUnits) {
+          unsupported_ = true;
+          break;
+        }
+        sampler_used_[unit] = true;
+        texture_samples(count, unit, dimension_name(p_.texture_kind(unit)));
+      }
+      const String which = operand(ins.src[0], 0, 0, nullptr, true);
+      line("MOV", &index, &which);
+      const String at = temp(kWork2, ".xy"), rest = temp(kWork2, ".zw"), none = zero();
+      sample_position(at, index_yyyy, count_xxxx);
+      line("MOV", &rest, &none);
       const String w = temp(kWork);
-      float v[4];
-      for (float& f : v) f = ins.tex_swizzle[0] ? __builtin_bit_cast(float, static_cast<uint32_t>(ins.control)) : static_cast<float>(ins.control);
-      const String value = imm_text(v, ".xxxx");
-      line("MOV", &w, &value);
+      String picked = temp(kWork2, ".");
+      for (uint32_t c = 0; c < 4; ++c) add(picked, StringView(&"xyzw"[ins.tex_swizzle[c] & 3], 1));
+      line("MOV", &w, &picked);
+      break;
+    }
+    case kEvalSample: case kEvalCentroid: case kEvalSnapped: {
+      // An input at another point of the pixel: INTERP_SAMPLE (the sample in the host's numbering), INTERP_CENTROID, INTERP_OFFSET (sixteenths of a pixel: four signed bits each way)
+      t = begin_result(ins, true, &direct);
+      const Instr::Src& input = ins.src[0];
+      if (vertex_ || geometry_ || hull_ || domain_ || compute_ || input.type != kInput || input.slot < 0 || input.slot >= 16 || input.at_vertex) {
+        unsupported_ = true;
+        break;
+      }
+      in_used_[input.slot] = true;
+      String in = str();
+      add(in, "IN[");
+      add_uint(in, static_cast<uint32_t>(input.slot));
+      add(in, "]");
+      const String value = temp(kWork2);
+      if (op == kEvalCentroid) {
+        line("INTERP_CENTROID", &value, &in);
+      } else if (op == kEvalSample) {
+        const String index = temp(kWork3, ".x"), index_xxxx = temp(kWork3, ".xxxx"), which = operand(ins.src[1], 0, 1, nullptr, true), count = raster_count();
+        line("MOV", &index, &which);
+        host_sample_index(index, index_xxxx, count);
+        line("INTERP_SAMPLE", &value, &in, &index_xxxx);
+      } else {
+        // (the offset's x and y: the low four bits, sign-extended - shifted up to the top and back -, in sixteenths)
+        const uint8_t xyxy[4] = {0, 1, 0, 1};
+        const String offset = operand(ins.src[1], 0, 1, xyxy, false), xy = temp(kWork3, ".xy"), xyxy_t = temp(kWork3, ".xyxy");
+        const String up = uimm(28), sixteenth = splat(1.0f / 16.0f);
+        line("MOV", &xy, &offset);
+        line("SHL", &xy, &xyxy_t, &up);
+        line("ISHR", &xy, &xyxy_t, &up);
+        line("I2F", &xy, &xyxy_t);
+        line("MUL", &xy, &xyxy_t, &sixteenth);
+        line("INTERP_OFFSET", &value, &in, &xyxy_t);
+      }
+      // (then the operand's swizzle and modifier, as for any source)
+      Instr::Src picked = input;
+      picked.type = kTemp, picked.number = static_cast<uint16_t>(kWork2), picked.slot = kSlotNone;
+      const String result = operand(picked, 0, 0, nullptr, false), w = temp(kWork);
+      line("MOV", &w, &result);
       break;
     }
     case kTexFetchMs: {
@@ -1635,14 +1856,20 @@ bool TgsiEmitter::instruction(const Instr& ins) {
       add_uint(sampler, unit);
       add(sampler, "]");
       String dim = str();
-      add(dim, "2D_MSAA");
+      const bool array = p_.texture_kind(unit) == graphics::TextureKind::Texture2DMSArray;   // (the layer in z)
+      add(dim, array ? "2D_ARRAY_MSAA" : "2D_MSAA");
       const String texel = temp(kWork2);
-      const uint8_t xyxy[4] = {0, 1, 0, 1};
-      const String coordinate = operand(ins.src[0], 0, 0, xyxy, false), sample = operand(ins.src[2], 0, 1, nullptr, true);
-      const String xy = temp(kWork3, ".xy"), sw = temp(kWork3, ".w"), packed = temp(kWork3);
+      const uint8_t xyxy[4] = {0, 1, 0, 1}, xyzz[4] = {0, 1, 2, 2};
+      const String coordinate = operand(ins.src[0], 0, 0, array ? xyzz : xyxy, false), sample = operand(ins.src[2], 0, 1, nullptr, true);
+      const String xy = temp(kWork3, array ? ".xyz" : ".xy"), sw = temp(kWork3, ".w"), packed = temp(kWork3);
       line("MOV", &xy, &coordinate);
       line("MOV", &sw, &sample);
-      if (p_.texture_samples_[unit] == 4 && !d3d_sample_order_) {
+      if (p_.texture_samples_[unit] == 0 && !d3d_sample_order_) {
+        // (a texture declared without a count: the host's numbering of the samples by the count bound - TXQS)
+        const String count = temp(kMs, ".x"), count_xxxx = temp(kMs, ".xxxx"), swx = temp(kWork3, ".wwww");
+        texture_samples(count, unit, array ? "2D_ARRAY_MSAA" : "2D_MSAA");
+        host_sample_index(sw, swx, count_xxxx);
+      } else if (p_.texture_samples_[unit] == 4 && !d3d_sample_order_) {
         // (the host's sample 1 is Direct3D's sample 3 and the other way round - found by drawing edges through a pixel and seeing which samples they covered: an index of 1 or 3 has its
         // second bit flipped: index ^ ((index & 1) << 1))
         const String one = splat(1.0f), t = temp(kWork2, ".w"), tx = temp(kWork2, ".wwww"), swx = temp(kWork3, ".wwww");
@@ -1707,9 +1934,13 @@ bool TgsiEmitter::instruction(const Instr& ins) {
       } else {   // resinfo: width, height, (depth), levels of the level named by the source
         const String level = operand(ins.src[0], 0, 0, nullptr, true);
         line("TXQ", &texel, &level, &sampler, &dim);
-        if (kind == graphics::TextureKind::Texture2D || kind == graphics::TextureKind::TextureCube) {   // (no depth: resinfo leaves zero)
+        if (kind == graphics::TextureKind::Texture2D || kind == graphics::TextureKind::TextureCube || kind == graphics::TextureKind::Texture2DMS) {   // (no depth: resinfo leaves zero)
           const String tz = temp(kWork2, ".z"), z0 = zero();
           line("MOV", &tz, &z0);
+        }
+        if (graphics::is_multisampled_kind(kind)) {   // (one level)
+          const String tw = temp(kWork2, ".w"), one = uimm(1);
+          line("MOV", &tw, &one);
         }
         if (ins.control != 2) {   // floats (0) or reciprocals (1)
           line("U2F", &texel, &texel);
@@ -1965,17 +2196,31 @@ void TgsiEmitter::assemble(String* out) {
     add_uint(*out, varyings_);
     add(*out, "]\n");
   } else {
+    // (each input interpolated as the shader declared it - graphics::ShaderModuleDesc::interpolation -: perspective-correct, noperspective or flat, at the centre, the centroid or
+    // the sample)
+    auto location = [&](uint8_t at) { return at == graphics::kAtCentroid ? ", CENTROID" : at == graphics::kAtSample ? ", SAMPLE" : ""; };
     for (uint32_t i = 0; i < 16; ++i) {
       if (!in_used_[i]) continue;
+      const uint8_t word = p_.interpolation(i);
+      const graphics::InterpolationKind kind = graphics::interpolation_kind(word);
       add(*out, "DCL IN[");
       add_uint(*out, i);
       add(*out, "], GENERIC[");
       add_uint(*out, i);
-      add(*out, "], PERSPECTIVE\n");
+      add(*out, kind == graphics::kInterpolateFlat ? "], CONSTANT" : kind == graphics::kInterpolateNoPerspective ? "], LINEAR" : "], PERSPECTIVE");
+      if (kind != graphics::kInterpolateFlat) add(*out, location(graphics::interpolation_location(word)));
+      add(*out, "\n");
     }
-    if (sys_used_[kSysPosition]) add(*out, "DCL IN[16], POSITION, LINEAR\n");
+    if (sys_used_[kSysPosition]) {
+      add(*out, "DCL IN[16], POSITION, LINEAR");
+      add(*out, location(p_.position_location()));
+      add(*out, "\n");
+    }
     if (sys_used_[kSysFrontFacing]) add(*out, "DCL IN[17], FACE, CONSTANT\n");
     if (sys_used_[kSysPrimitiveId]) add(*out, "DCL IN[18], PRIM_ID, CONSTANT\n");
+    if (sys_used_[kSysSampleIndex]) add(*out, "DCL SV[0], SAMPLEID\n");
+    if (sys_used_[kSysCoverage]) add(*out, "DCL SV[1], SAMPLEMASK\n");
+    if (sys_used_[kSysPosition] && p_.position_location() == graphics::kAtSample) add(*out, "DCL SV[2], SAMPLEPOS\n");
     add(*out, "DCL OUT[0], COLOR\n");
     for (uint32_t i = 1; i < p_.color_outputs_; ++i) {
       add(*out, "DCL OUT[");
@@ -1983,6 +2228,11 @@ void TgsiEmitter::assemble(String* out) {
       add(*out, "], COLOR[");
       add_uint(*out, i);
       add(*out, "]\n");
+    }
+    if (coverage_written_) {   // (SV_Coverage: after the colours)
+      add(*out, "DCL OUT[");
+      add_uint(*out, p_.color_outputs_);
+      add(*out, "], SAMPLEMASK\n");
     }
   }
   // The samplers and views the program reads, in whichever stage it is (a vertex or compute shader reads textures too)
@@ -2031,6 +2281,11 @@ void TgsiEmitter::assemble(String* out) {
     add_uint(*out, graphics::kSamplerCompareRegister);
     add(*out, "..");
     add_uint(*out, graphics::kSamplerCompareRegister + graphics::kMaxTextureUnits - 1);
+    add(*out, "]\n");
+  }
+  if (raster_used_) {   // (the pass's sample count, after them)
+    add(*out, "DCL CONST[");
+    add_uint(*out, graphics::kRasterizerRegister);
     add(*out, "]\n");
   }
   if (addr_used_) add(*out, "DCL ADDR[0]\n");
@@ -2098,6 +2353,16 @@ if (vertex_ || domain_) {
       add(o, "]");
       const String c = temp(color_register(i));
       line("MOV", &o, &c);
+    }
+    if (p_.writes_coverage()) {   // (SV_Coverage in the host's numbering of the samples)
+      coverage_written_ = true;
+      const String m = temp(kCoverageMask, ".x"), mx = temp(kCoverageMask, ".xxxx"), count = raster_count();
+      host_sample_mask(m, mx, count);
+      String o = str();
+      add(o, "OUT[");
+      add_uint(o, p_.color_outputs_);
+      add(o, "].x");
+      line("MOV", &o, &mx);
     }
   }
 }
@@ -2242,6 +2507,17 @@ NtStatus TgsiEmitter::run(String* out) {
       }
       continue;
     }
+    if (k == kSysSampleIndex || k == kSysCoverage) {
+      // (SV_SampleIndex and SV_Coverage of a pixel shader: the host's SAMPLEID and SAMPLEMASK, in Direct3D's numbering of the samples)
+      line("MOV", &reg, &z);
+      String source = str();
+      add(source, k == kSysSampleIndex ? "SV[0].xxxx" : "SV[1].xxxx");
+      line("MOV", &reg_x, &source);
+      const String reg_xxxx = temp(kSys + k, ".xxxx"), count = raster_count();
+      if (k == kSysSampleIndex) host_sample_index(reg_x, reg_xxxx, count);
+      else host_sample_mask(reg_x, reg_xxxx, count);
+      continue;
+    }
     String source = str();
     if (vertex_) {
       add(source, k == kSysVertexId ? "SV[0].xxxx" : "SV[1].xxxx");
@@ -2252,6 +2528,15 @@ NtStatus TgsiEmitter::run(String* out) {
     }
     if (k == kSysPosition) {
       line("MOV", &reg, &source);
+      if (p_.position_location() == graphics::kAtSample) {
+        // (SV_Position at the sample: the pixel's corner and the sample's place in it - a host may give the centre whatever the location, as GL's gl_FragCoord without sample
+        // shading by its own qualifier does)
+        const String xy = temp(kSys + k, ".xy"), xyxy = temp(kSys + k, ".xyxy");
+        String at = str();
+        add(at, "SV[2].xyxy");
+        line("FLR", &xy, &xyxy);
+        line("ADD", &xy, &xyxy, &at);
+      }
       continue;
     }
     line("MOV", &reg, &z);
@@ -2269,6 +2554,10 @@ NtStatus TgsiEmitter::run(String* out) {
     for (uint32_t i = 0; i < p_.color_outputs_; ++i) {
       const String c = temp(color_register(i));
       line("MOV", &c, &z);
+    }
+    if (p_.writes_coverage()) {   // (SV_Coverage starts as every sample)
+      const String m = temp(kCoverageMask), all = uimm(~0u);
+      line("MOV", &m, &all);
     }
   }
 

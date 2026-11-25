@@ -1318,6 +1318,7 @@ static int tex_share_read(const BYTE *in, UINT size, D3D11_TEXTURE2D_DESC *t, UI
 /* A texture object around `res` (a reference is taken), or around a new Direct3D 12 texture when it is NULL. `slices`: 0 for a 2D texture, array or cube, else the
  * depth of a volume (`in` then has one layer). */
 static UINT dev_ms_levels(Dev *d, DXGI_FORMAT format, UINT samples);
+static UINT dev_ms_levels_for(Dev *d, DXGI_FORMAT format, UINT samples, UINT bind);
 static HRESULT tex_make(Dev *d, const D3D11_TEXTURE2D_DESC *in, UINT slices, ID3D12Resource *res, Tex **out) {
   D3D11_TEXTURE2D_DESC desc = *in;
   *out = NULL;
@@ -1417,12 +1418,21 @@ static HRESULT tex_make(Dev *d, const D3D11_TEXTURE2D_DESC *in, UINT slices, ID3
     if (!dev_layered_targets(d)) { tex_refused(&desc, cube ? "a cube to draw into" : "an array to draw into"); return DXGI_ERROR_UNSUPPORTED; }
   }
   const BOOL target = (desc.BindFlags & (D3D11_BIND_RENDER_TARGET | D3D11_BIND_DEPTH_STENCIL)) != 0;
-  /* (a multisampled texture: a render target or depth buffer of one level and one layer, drawn into and resolved; the adapter says which counts it has) */
+  /* (a multisampled texture: a render target or depth buffer of one level, drawn into, resolved and - where the adapter reads samples (graphics::DeviceFeature3: its colour images'
+   * bit 0, its depth buffers' bit 2) - read by shaders; an array of them where it has bit 1. The adapter says which counts it has) */
   if (desc.SampleDesc.Count == 0) return E_INVALIDARG;
-  if (desc.SampleDesc.Count > 1 && (!target || desc.ArraySize != 1 || desc.CPUAccessFlags || desc.Usage != D3D11_USAGE_DEFAULT)) { tex_refused(&desc, "multisampled"); return E_INVALIDARG; }
+  if (desc.SampleDesc.Count > 1 && (!target || desc.CPUAccessFlags || desc.Usage != D3D11_USAGE_DEFAULT)) { tex_refused(&desc, "multisampled"); return E_INVALIDARG; }
+  if (desc.SampleDesc.Count > 1) {
+    const UINT features3 = TcosD3D12DeviceFeatures3(d->d12);
+    if (desc.ArraySize != 1 && !(features3 & (1u << 1))) { tex_refused(&desc, "a multisampled array"); return E_INVALIDARG; }
+    if ((desc.BindFlags & D3D11_BIND_SHADER_RESOURCE) && !(features3 & ((desc.BindFlags & D3D11_BIND_DEPTH_STENCIL) ? 1u << 2 : 1u << 0))) {
+      tex_refused(&desc, "a multisampled texture read by shaders");
+      return E_INVALIDARG;
+    }
+  }
   /* (a sample count the adapter has, and a quality below the levels it has for it) */
   if (!res && (desc.SampleDesc.Count > 1 || desc.SampleDesc.Quality)) {
-    const UINT levels = dev_ms_levels(d, desc.Format, desc.SampleDesc.Count);
+    const UINT levels = dev_ms_levels_for(d, desc.Format, desc.SampleDesc.Count, desc.BindFlags);
     if (!levels || desc.SampleDesc.Quality >= levels) return E_INVALIDARG;
   }
   UINT full = 1;
@@ -1789,6 +1799,19 @@ static HRESULT rtv_create(Dev *d, ID3D11Resource *resource, const D3D11_RENDER_T
     LeaveCriticalSection(&d->lock);
     if (FAILED(hr)) { dx_Release(OBJ(v)); return hr; }
     ID3D12Device_CreateRenderTargetView(d->d12, v->scratch, NULL, v->handle);
+  } else if (t->kind != 0 && t->desc.SampleDesc.Count > 1) {
+    /* (a multisampled array: a view of the slices the description names - TEXTURE2DMSARRAY's, TEXTURE2DMS's first - or all of them) */
+    D3D12_RENDER_TARGET_VIEW_DESC r;
+    memset(&r, 0, sizeof r);
+    r.Format = view_format12(t, desc ? desc->Format : DXGI_FORMAT_UNKNOWN);
+    r.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2DMSARRAY;
+    r.Texture2DMSArray.FirstArraySlice = 0, r.Texture2DMSArray.ArraySize = t->desc.ArraySize;
+    if (desc && desc->ViewDimension == D3D11_RTV_DIMENSION_TEXTURE2DMSARRAY) r.Texture2DMSArray.FirstArraySlice = desc->Texture2DMSArray.FirstArraySlice, r.Texture2DMSArray.ArraySize = desc->Texture2DMSArray.ArraySize;
+    else if (desc && desc->ViewDimension == D3D11_RTV_DIMENSION_TEXTURE2DMS) r.Texture2DMSArray.ArraySize = 1;
+    else if (desc) { dx_Release(OBJ(v)); return E_INVALIDARG; }      /* (a multisampled texture's views are multisampled) */
+    if (!desc) { v->desc.rtv.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2DMSARRAY; v->desc.rtv.Texture2DMSArray.ArraySize = t->desc.ArraySize; }
+    v->array_slice = r.Texture2DMSArray.FirstArraySlice;
+    ID3D12Device_CreateRenderTargetView(d->d12, t->res, &r, v->handle);
   } else if (t->kind != 0 && !(t->fmt->flags & FMT_YUV)) {
     /* (an array, a cube or a volume Direct3D 12 below draws into: a view of the layers the description names - all of them without one) */
     D3D12_RENDER_TARGET_VIEW_DESC r;
@@ -1874,6 +1897,20 @@ static HRESULT STDMETHODCALLTYPE dev_CreateDepthStencilView(Dev *d, ID3D11Resour
   else { v->desc.dsv.Format = t->desc.Format; v->desc.dsv.ViewDimension = t->one_d ? D3D11_DSV_DIMENSION_TEXTURE1D : D3D11_DSV_DIMENSION_TEXTURE2D; }
   v->handle = ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(d->dsv_heap);
   v->handle.ptr += (SIZE_T)v->slot * ID3D12Device_GetDescriptorHandleIncrementSize(d->d12, D3D12_DESCRIPTOR_HEAP_TYPE_DSV);
+  if (t->desc.SampleDesc.Count > 1 && t->kind != 0) {
+    /* (a multisampled array: the slices of a TEXTURE2DMSARRAY view, a TEXTURE2DMS view's first, or all of them) */
+    D3D12_DEPTH_STENCIL_VIEW_DESC x;
+    memset(&x, 0, sizeof x);
+    x.Format = t->stored;
+    x.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2DMSARRAY;
+    x.Texture2DMSArray.ArraySize = t->desc.ArraySize;
+    if (desc && desc->ViewDimension == D3D11_DSV_DIMENSION_TEXTURE2DMSARRAY) x.Texture2DMSArray.FirstArraySlice = desc->Texture2DMSArray.FirstArraySlice, x.Texture2DMSArray.ArraySize = desc->Texture2DMSArray.ArraySize;
+    else if (desc && desc->ViewDimension == D3D11_DSV_DIMENSION_TEXTURE2DMS) x.Texture2DMSArray.ArraySize = 1;
+    else if (desc) { dx_Release(OBJ(v)); return E_INVALIDARG; }
+    if (!desc) { v->desc.dsv.ViewDimension = D3D11_DSV_DIMENSION_TEXTURE2DMSARRAY; v->desc.dsv.Texture2DMSArray.ArraySize = t->desc.ArraySize; }
+    ID3D12Device_CreateDepthStencilView(d->d12, t->res, &x, v->handle);
+    return give(v, (void **)out);
+  }
   if (t->desc.SampleDesc.Count > 1) v->desc.dsv.ViewDimension = D3D11_DSV_DIMENSION_TEXTURE2DMS;
   /* (the level it draws into: one Direct3D 12 below keeps) */
   const UINT level = !desc ? 0 : desc->ViewDimension == D3D11_DSV_DIMENSION_TEXTURE2D ? desc->Texture2D.MipSlice : desc->ViewDimension == D3D11_DSV_DIMENSION_TEXTURE2DARRAY ? desc->Texture2DArray.MipSlice
@@ -1965,12 +2002,13 @@ static BOOL depth_view_format(DXGI_FORMAT tex, DXGI_FORMAT view, DXGI_FORMAT *be
   return TRUE;
 }
 /* The dimension of a view of a depth texture: 1D, 2D, an array of them, a cube or a cube array, of any of its levels and layers (srv_range checks them as for any texture); not a
- * volume (no depth texture is one) or multisampled (the textures below that shaders read have one sample). */
+ * volume (no depth texture is one); a multisampled one's TEXTURE2DMS / TEXTURE2DMSARRAY views of its samples. */
 static BOOL depth_view_dimension(const Tex *t, const D3D11_SHADER_RESOURCE_VIEW_DESC *desc) {
   (void)t;
   switch (desc->ViewDimension) {
     case D3D11_SRV_DIMENSION_TEXTURE1D: case D3D11_SRV_DIMENSION_TEXTURE2D: case D3D11_SRV_DIMENSION_TEXTURE1DARRAY: case D3D11_SRV_DIMENSION_TEXTURE2DARRAY:
     case D3D11_SRV_DIMENSION_TEXTURECUBE: case D3D11_SRV_DIMENSION_TEXTURECUBEARRAY:
+    case D3D11_SRV_DIMENSION_TEXTURE2DMS: case D3D11_SRV_DIMENSION_TEXTURE2DMSARRAY:      /* (a multisampled one's samples: srv_range takes these of it alone) */
       return TRUE;
     default: return FALSE;
   }
@@ -2061,6 +2099,11 @@ static HRESULT srv_create(Dev *d, ID3D11Resource *resource, const D3D11_SHADER_R
       case 3: v->desc.srv.ViewDimension = D3D11_SRV_DIMENSION_TEXTURECUBE; v->desc.srv.TextureCube.MipLevels = t->desc.MipLevels; break;
       case 5: v->desc.srv.ViewDimension = D3D11_SRV_DIMENSION_TEXTURECUBEARRAY; v->desc.srv.TextureCubeArray.MipLevels = t->desc.MipLevels; v->desc.srv.TextureCubeArray.NumCubes = t->desc.ArraySize / 6; break;
       default: v->desc.srv.ViewDimension = t->desc.SampleDesc.Count > 1 ? D3D11_SRV_DIMENSION_TEXTURE2DMS : D3D11_SRV_DIMENSION_TEXTURE2D; v->desc.srv.Texture2D.MipLevels = t->desc.MipLevels; break;
+    }
+    if (t->desc.SampleDesc.Count > 1 && t->kind == 2) {   /* (a multisampled array, all of it) */
+      memset(&v->desc.srv.Texture2DMSArray, 0, sizeof v->desc.srv.Texture2DMSArray);
+      v->desc.srv.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2DMSARRAY;
+      v->desc.srv.Texture2DMSArray.ArraySize = t->desc.ArraySize;
     }
   }
   return give(v, (void **)out);
