@@ -526,6 +526,15 @@ String TgsiEmitter::operand(const Instr::Src& s, uint32_t offset, uint32_t slot,
   add(plain, base.view());
   add(plain, swz.view());
   const bool negate_result = s.modifier == kModNeg || s.modifier == kModAbsNeg || s.modifier == kModBiasNeg || s.modifier == kModSignNeg || s.modifier == kModX2Neg;
+  if (force_integer_ && (s.modifier == kModNeg || s.modifier == kModAbs || s.modifier == kModAbsNeg)) {
+    // (an integer instruction's negated or absolute source - iadd r0, -r1, l(31) -: INEG / IABS into a scratch register, not TGSI's '-' and '|..|', which virglrenderer 1.3.0
+    // applies as float negation - the sign bit flipped, 0 becoming 0x80000000)
+    String scratch = temp(kScratch + (slot & 3));
+    if (s.modifier == kModAbs || s.modifier == kModAbsNeg) line("IABS", &scratch, &plain);
+    if (s.modifier == kModNeg) line("INEG", &scratch, &plain);
+    if (s.modifier == kModAbsNeg) line("INEG", &scratch, &scratch);
+    return scratch;
+  }
   switch (s.modifier) {
     case kModNone: return plain;
     case kModNeg: return negate(plain);
@@ -931,18 +940,22 @@ bool TgsiEmitter::instruction(const Instr& ins) {
       break;
     }
     case kFirstBitHi: case kFirstBitSHi: {
-      // (TGSI's UMSB / IMSB count from the bottom, as GLSL's findMSB; Direct3D's from the top: 31 minus it, all ones staying all ones)
+      // (Direct3D counts from the top: the lowest set bit of the reversed bits - LSB of BREV, all ones for none -, of a negative number's complement for firstbit_shi; TGSI's
+      // UMSB / IMSB count from the bottom)
       t = begin_result(ins, true, &direct);
-      const String a = operand(ins.src[0], 0, 0, nullptr, false), w2 = temp(kWork2), w3 = temp(kWork3), z = zero();
-      String top = str();
-      add(top, "IMM[");
-      add_uint(top, imm4_bits(31, 31, 31, 31));
-      add(top, "]");
-      line(op == kFirstBitHi ? "UMSB" : "IMSB", &w2, &a);
-      line("INEG", &w3, &w2);
-      line("UADD", &w3, &w3, &top);
-      line("ISLT", &t, &w2, &z);
-      line("UCMP", &t, &t, &w2, &w3);
+      const String a = operand(ins.src[0], 0, 0, nullptr, false), w2 = temp(kWork2);
+      if (op == kFirstBitSHi) {
+        String sign = str();
+        add(sign, "IMM[");
+        add_uint(sign, imm4_bits(31, 31, 31, 31));
+        add(sign, "]");
+        line("ISHR", &w2, &a, &sign);   // (all ones for a negative number)
+        line("XOR", &w2, &w2, &a);
+        line("BREV", &w2, &w2);
+      } else {
+        line("BREV", &w2, &a);
+      }
+      line("LSB", &t, &w2);
       break;
     }
     case kUBfe: case kIBfe: case kBfi: {

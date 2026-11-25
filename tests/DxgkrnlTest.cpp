@@ -6182,7 +6182,7 @@ void test_d3d12_reserved_texture() {
 
 // Reserved textures beyond tier 1 (VidMm ReservedLayout): the tile numbering of arrays, volumes and block-compressed formats; render targets whose unmapped tiles drop what is drawn;
 // CopyTiles; residency feedback (sample_cl_s, ld_s, gather4_s and check_access_fully_mapped: ps_tiled) and a lookup's own clamp (ps_tiled_clamp) on the CPU renderer.
-// Shader Model 5's bit operations (cs_bits: countbits, firstbit_hi / _lo / _shi, ubfe, ibfe, bfi, bfrev) become TGSI's POPC, UMSB / IMSB, LSB, UBFE, IBFE, BFI, BREV (d3d12test
+// Shader Model 5's bit operations (cs_bits: countbits, firstbit_hi / _lo / _shi, ubfe, ibfe, bfi, bfrev) become TGSI's POPC, LSB, UBFE, IBFE, BFI, BREV (d3d12test
 // checks what they compute against the HLSL on every device); a geometry shader whose inputs a register indexes (gs_loop: v[r0.x][register]) compiles, its inputs gathered by movc.
 void test_bits_and_indexed_inputs() {
   HostAllocator allocator;
@@ -6194,7 +6194,7 @@ void test_bits_and_indexed_inputs() {
   if (bits) {
     String text(allocator);
     CHECK(bits->emit_tgsi(&text) == status::kSuccess);
-    for (const char* op : {"POPC", "UMSB", "IMSB", "LSB", "UBFE", "IBFE", "BFI", "BREV"})
+    for (const char* op : {"POPC", "LSB", "UBFE", "IBFE", "BFI", "BREV"})
       if (text.view().find(op) == StringView::npos) {
         printf("  bit operations: no %s in the TGSI\n", op);
         CHECK(false);

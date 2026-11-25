@@ -758,8 +758,9 @@ flow control):
   device runs them; an index outside the primitive reads the first vertex (Direct3D leaves it undefined). (gap pass 5; `tests/data/dxbc/gs_loop.hlsl`.)
 - Shader Model 5's bit operations: `countbits` (134), `firstbit_hi` / `firstbit_lo` / `firstbit_shi` (135 - 137), `ubfe` / `ibfe` (138, 139), `bfi` (140), `bfrev` (141) are IR
   ops `kCountBits` .. `kBfrev` (Direct3D's definitions: the widths' and offsets' low five bits, a field ending at bit 31, the first bit counted from the top, all ones for none); the
-  TGSI emitter writes `POPC`, `UMSB` / `IMSB` (turned to count from the top), `LSB`, `UBFE`, `IBFE`, `BFI` (the width taken as at most 32 - offset, which GLSL leaves undefined
-  beyond), `BREV`; Venus's TGSI to SPIR-V `OpBitCount`, `FindILsb` / `FindUMsb` / `FindSMsb`, `OpBitFieldUExtract` / `SExtract` / `Insert` (a component at a time: SPIR-V's offset
+  TGSI emitter writes `POPC`, `LSB` of `BREV` for firstbit_hi / _shi (counted from the top), `LSB`, `UBFE`, `IBFE`, `BFI` (the width taken as at most 32 - offset, which GLSL leaves undefined
+  beyond), `BREV` - and an integer instruction's negated or absolute source as `INEG` / `IABS` into a scratch register (virglrenderer 1.3.0 applies TGSI's `-` of an integer
+  source as a float negation: `iadd r0, -r1, l(31)`, which fxc makes of 31 - firstbit_hi, gave 0x80000000 + 31 for 0); Venus's TGSI to SPIR-V `OpBitCount`, `FindILsb` / `FindUMsb` / `FindSMsb`, `OpBitFieldUExtract` / `SExtract` / `Insert` (a component at a time: SPIR-V's offset
   and count are scalars), `OpBitReverse`; the DXIL translator takes dx.op `Bfrev` (30) .. `FirstbitSHi` (34), `Ibfe` / `Ubfe` / `Bfi` (51 - 53). Microsoft's compiler makes
   `ubfe` and `bfi` of shifts and masks and of integer multiplies by powers of two (`tests/data/dxbc/cs_bits.hlsl`).
 - Fixed on the way: a geometry shader's `dcl_input v[N][r]` before its `dcl_inputprimitive` (the order Microsoft's compiler writes) was refused.
