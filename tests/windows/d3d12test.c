@@ -32,6 +32,7 @@
 #include <dxgi1_6.h>
 #include "../../src/Windows/d3d12/d3d12_types.h"      /* (what the later Agility SDKs add: root signature 1.2, Device11 .. 14, List8 .. 10) */
 #include "dxfixtures.h"
+#include "wave_model.h"      /* (what the wave-operation fixtures give: test_wave_ops) */
 #include "vertex_formats.h"
 
 static int checks, failed;
@@ -4132,6 +4133,130 @@ static void test_typed_buffers(Scene *c) {
   ID3D12Resource_Release(colours);
 }
 
+/* What a Shader Model 6.0 compute shader has besides the wave operations, which the DXIL translator takes as the DXBC front end does (dxil_cs_typed): typed views of a texture
+ * and a buffer (loads, stores, atomics, compare-exchange), a Buffer<>, GetDimensions of each kind, compare-exchange on raw and structured buffers, a hidden counter,
+ * atomics on group-shared memory. The DXIL and the DXBC (Microsoft's compiler) of the same HLSL run on resources made the same way; everything they write must agree. */
+typedef struct DxilResources {
+  ID3D12Resource *img, *tb, *raw, *counted, *o, *words, *counter, *counter_value, *view, *tex;
+} DxilResources;
+static int dxil_resources_run(Scene *c, ID3D12RootSignature *rs, const void *code, SIZE_T size, UINT32 out[8 * 16 + 32 + 16 + 16 + 8 * 2 * 4 + 8 * 3 + 1]) {
+  ID3D12Device *dev = c->dev;
+  const D3D12_RESOURCE_FLAGS uav = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+  DxilResources r;
+  memset(&r, 0, sizeof r);
+  r.img = uav_texture(dev, D3D12_RESOURCE_DIMENSION_TEXTURE2D, 8, 2, 1, DXGI_FORMAT_R32G32B32A32_FLOAT, uav);
+  r.words = uav_texture(dev, D3D12_RESOURCE_DIMENSION_TEXTURE2D, 8, 3, 1, DXGI_FORMAT_R32_UINT, uav);
+  r.tb = make_buffer(dev, D3D12_HEAP_TYPE_DEFAULT, 128, uav, D3D12_RESOURCE_STATE_COMMON);
+  r.raw = make_buffer(dev, D3D12_HEAP_TYPE_DEFAULT, 64, uav, D3D12_RESOURCE_STATE_COMMON);
+  r.counted = make_buffer(dev, D3D12_HEAP_TYPE_DEFAULT, 64, uav, D3D12_RESOURCE_STATE_COMMON);
+  r.o = make_buffer(dev, D3D12_HEAP_TYPE_DEFAULT, 8 * 16 * 4, uav, D3D12_RESOURCE_STATE_COMMON);
+  r.counter = make_buffer(dev, D3D12_HEAP_TYPE_DEFAULT, 16, uav, D3D12_RESOURCE_STATE_COMMON);
+  r.counter_value = make_buffer(dev, D3D12_HEAP_TYPE_DEFAULT, 4, uav, D3D12_RESOURCE_STATE_COMMON);
+  r.view = make_buffer(dev, D3D12_HEAP_TYPE_DEFAULT, 16 * 16, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COMMON);
+  {
+    D3D12_HEAP_PROPERTIES defaults = {D3D12_HEAP_TYPE_DEFAULT, D3D12_CPU_PAGE_PROPERTY_UNKNOWN, D3D12_MEMORY_POOL_UNKNOWN, 1, 1};
+    D3D12_RESOURCE_DESC td = {D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, 4, 4, 1, 2, DXGI_FORMAT_R32G32B32A32_FLOAT, {1, 0}, D3D12_TEXTURE_LAYOUT_UNKNOWN, D3D12_RESOURCE_FLAG_NONE};
+    CHECK_HR(ID3D12Device_CreateCommittedResource(dev, &defaults, D3D12_HEAP_FLAG_NONE, &td, D3D12_RESOURCE_STATE_COMMON, NULL, &IID_ID3D12Resource, (void **)&r.tex));
+  }
+  ID3D12DescriptorHeap *heap = view_heap(dev, 9, 1);
+  ID3D12PipelineState *pso = compute_pso(dev, rs, code, size);
+  int ok = r.img && r.words && r.tb && r.raw && r.counted && r.o && r.counter && r.counter_value && r.view && r.tex && heap && pso;
+  if (ok) {
+    /* (the same contents for both programs) */
+    float texels[8 * 2 * 4], mips[16 * 4 + 4 * 4], views[16 * 4];
+    UINT32 words[8 * 3], tb[32], raw[16], counted[16], o[8 * 16], zero = 0;
+    for (UINT k = 0; k < 8 * 2 * 4; ++k) texels[k] = (float)k * 0.5f;
+    for (UINT k = 0; k < 16 * 4 + 4 * 4; ++k) mips[k] = (float)k + 0.25f;
+    for (UINT k = 0; k < 16 * 4; ++k) views[k] = (float)k * 1.5f - 3.0f;
+    for (UINT k = 0; k < 8 * 3; ++k) words[k] = k * 3 + 1;
+    for (UINT k = 0; k < 32; ++k) tb[k] = k * 11 + 20;
+    for (UINT k = 0; k < 16; ++k) raw[k] = 100 + k, counted[k] = 50 + k;
+    for (UINT k = 0; k < 8 * 16; ++k) o[k] = 0xDEADBEEFu;
+    tb[1] = 24;      /* (thread 3's compare value: the exchange happens there) */
+    raw[1] = 105;    /* (thread 5's) */
+    counted[2] = 52; /* (thread 2's) */
+    texture_write(c, r.img, 0, texels, 16);
+    texture_write(c, r.words, 0, words, 4);
+    texture_write(c, r.tex, 0, mips, 16);
+    texture_write(c, r.tex, 1, mips + 16 * 4, 16);
+    buffer_upload(c, r.tb, 0, tb, sizeof tb);
+    buffer_upload(c, r.raw, 0, raw, sizeof raw);
+    buffer_upload(c, r.counted, 0, counted, sizeof counted);
+    buffer_upload(c, r.o, 0, o, sizeof o);
+    buffer_upload(c, r.view, 0, views, sizeof views);
+    buffer_upload(c, r.counter_value, 0, &zero, 4);
+    /* (t0 Buffer<float4>, t1 the texture, u0 .. u6 as the HLSL says) */
+    buffer_srv(dev, heap, 0, r.view, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 16, 0, D3D12_BUFFER_SRV_FLAG_NONE);
+    D3D12_SHADER_RESOURCE_VIEW_DESC sd;
+    memset(&sd, 0, sizeof sd);
+    sd.Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
+    sd.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    sd.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    sd.Texture2D.MipLevels = 2;
+    ID3D12Device_CreateShaderResourceView(dev, r.tex, &sd, heap_cpu(dev, heap, 1));
+    D3D12_UNORDERED_ACCESS_VIEW_DESC ud;
+    memset(&ud, 0, sizeof ud);
+    ud.Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
+    ud.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+    put_uav(dev, heap, NULL, 2, r.img, &ud);
+    buffer_uav(dev, heap, NULL, 3, r.tb, NULL, 0, DXGI_FORMAT_R32_UINT, 0, 32, 0, D3D12_BUFFER_UAV_FLAG_NONE);
+    buffer_uav(dev, heap, NULL, 4, r.raw, NULL, 0, DXGI_FORMAT_R32_TYPELESS, 0, 16, 0, D3D12_BUFFER_UAV_FLAG_RAW);
+    buffer_uav(dev, heap, NULL, 5, r.counted, NULL, 0, DXGI_FORMAT_UNKNOWN, 0, 16, 4, D3D12_BUFFER_UAV_FLAG_NONE);
+    buffer_uav(dev, heap, NULL, 6, r.o, NULL, 0, DXGI_FORMAT_UNKNOWN, 0, 8 * 16, 4, D3D12_BUFFER_UAV_FLAG_NONE);
+    ud.Format = DXGI_FORMAT_R32_UINT;
+    put_uav(dev, heap, NULL, 7, r.words, &ud);
+    buffer_uav(dev, heap, NULL, 8, r.counter, r.counter_value, 0, DXGI_FORMAT_UNKNOWN, 0, 4, 4, D3D12_BUFFER_UAV_FLAG_NONE);
+    ID3D12GraphicsCommandList *list = NULL;
+    CHECK_HR(ID3D12CommandAllocator_Reset(c->allocator));
+    CHECK_HR(ID3D12Device_CreateCommandList(dev, 0, D3D12_COMMAND_LIST_TYPE_DIRECT, c->allocator, pso, &IID_ID3D12GraphicsCommandList, (void **)&list));
+    if (list) {
+      ID3D12GraphicsCommandList_SetDescriptorHeaps(list, 1, &heap);
+      ID3D12GraphicsCommandList_SetComputeRootSignature(list, rs);
+      ID3D12GraphicsCommandList_SetComputeRoot32BitConstants(list, 0, 16, kIdentity, 0);      /* (the signature's constants: set, as a dispatch needs every parameter) */
+      ID3D12GraphicsCommandList_SetComputeRootDescriptorTable(list, 1, heap_gpu(dev, heap, 0));
+      ID3D12GraphicsCommandList_Dispatch(list, 1, 1, 1);
+      scene_run(c, list);
+      ID3D12GraphicsCommandList_Release(list);
+    }
+    /* (what it wrote: o, tb, raw, counted, img, words, the counter) */
+    UINT32 *at = out;
+    ok = buffer_download(c, r.o, 0, at, 8 * 16 * 4) && buffer_download(c, r.tb, 0, at + 128, 128) && buffer_download(c, r.raw, 0, at + 160, 64) &&
+         buffer_download(c, r.counted, 0, at + 176, 64) && texture_read(c, r.img, 0, at + 192, 16) && texture_read(c, r.words, 0, at + 256, 4) &&
+         buffer_download(c, r.counter_value, 0, at + 280, 4);
+  }
+  ID3D12Resource **all = &r.img;
+  for (UINT k = 0; k < sizeof r / sizeof r.img; ++k)
+    if (all[k]) ID3D12Resource_Release(all[k]);
+  if (heap) ID3D12DescriptorHeap_Release(heap);
+  if (pso) ID3D12PipelineState_Release(pso);
+  return ok;
+}
+static void test_dxil_resources(Scene *c) {
+  const D3D12_DESCRIPTOR_RANGE_TYPE types[2] = {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, D3D12_DESCRIPTOR_RANGE_TYPE_UAV};
+  const UINT regs[2] = {0, 0}, sizes[2] = {2, 7};
+  D3D12_FEATURE_DATA_FORMAT_SUPPORT f = {DXGI_FORMAT_R32G32B32A32_FLOAT, D3D12_FORMAT_SUPPORT1_NONE, D3D12_FORMAT_SUPPORT2_NONE};
+  CHECK_HR(ID3D12Device_CheckFeatureSupport(c->dev, D3D12_FEATURE_FORMAT_SUPPORT, &f, sizeof f));
+  if (!(f.Support1 & D3D12_FORMAT_SUPPORT1_BUFFER)) { printf("dxil resources: no typed buffers on this adapter\n"); return; }
+  ID3D12RootSignature *rs = ranges_signature(c->dev, 2, types, regs, sizes, 0);
+  if (!rs) { CHECK(0); return; }
+  static UINT32 dxbc[8 * 16 + 32 + 16 + 16 + 8 * 2 * 4 + 8 * 3 + 1], dxil[8 * 16 + 32 + 16 + 16 + 8 * 2 * 4 + 8 * 3 + 1];
+  const int a = dxil_resources_run(c, rs, dx_dxil_cs_typed_dxbc, sizeof dx_dxil_cs_typed_dxbc, dxbc);
+  const int b = dxil_resources_run(c, rs, dx_dxil_cs_typed_dxil, sizeof dx_dxil_cs_typed_dxil, dxil);
+  CHECK(a && b);
+  if (a && b) {
+    int same = 0, bad = 0;
+    for (UINT k = 0; k < sizeof dxbc / sizeof dxbc[0]; ++k) {
+      if (dxbc[k] == dxil[k]) { ++same; continue; }
+      if (bad++ < 8) printf("dxil resources: word %u: DXIL %08x, DXBC %08x\n", k, (unsigned)dxil[k], (unsigned)dxbc[k]);
+    }
+    CHECK(bad == 0);
+    CHECK(dxbc[0] == 20 + 3 && dxbc[280] == 8 && dxbc[11] == 8 + 2 * 256 && dxbc[14] == 4 + 4 * 256 + 2 * 65536);   /* (it ran: tb[0] + 3, eight increments, the sizes) */
+    printf("dxil resources: %d words the same of %u (tb[0] + 3 %u, counter %u, image %x, texture %x)\n", same, (unsigned)(sizeof dxbc / sizeof dxbc[0]), (unsigned)dxbc[0],
+           (unsigned)dxbc[280], (unsigned)dxbc[11], (unsigned)dxbc[14]);
+  }
+  ID3D12RootSignature_Release(rs);
+}
+
 /* Append, consume and counter views with their counters in a buffer of their own (cs_append: imm_atomic_alloc / imm_atomic_consume, bufinfo), a structured view of u60 and a raw one of
  * t100: the counters start where an upload put them and the counts the shader left are copied out (CopyBufferRegion of the counter resource). */
 static void test_counters(Scene *c) {
@@ -8208,6 +8333,7 @@ static void test_extras(ID3D12Device *dev, ID3D12CommandQueue *queue, ID3D12Fenc
   test_texture_uavs(&c);
   test_narrow_volume_uavs(&c);
   test_typed_buffers(&c);
+  test_dxil_resources(&c);
   test_counters(&c);
   test_uav_only_draws(&c);
   test_pixel_uavs(&c);
@@ -10160,6 +10286,177 @@ static void test_barycentrics(Scene *c, const D3D12_FEATURE_DATA_D3D12_OPTIONS3 
   if (attr) ID3D12PipelineState_Release(attr);
 }
 
+/* Shader Model 6 wave operations (DXIL fixtures dxil_cs_wave*, dxil_ps_wave): what the device says (HighestShaderModel, OPTIONS1) and, where it has them, what they give -
+ * every operation and type overload in compute shaders with divergent branches, a loop the lanes leave at different rounds, an early return and a barrier, and in a pixel
+ * shader whose quads have helpers (uncovered and discarded pixels) - against wave_model.h, which works the results out from the CPU renderer's lane model (WaveLaneCountMin 4,
+ * Max 32). A device without them (virgl) refuses the shaders. */
+static int wave_dispatch(ID3D12Device *dev, ID3D12CommandQueue *queue, ID3D12Fence *fence, UINT64 *fence_value, ID3D12RootSignature *rs, const void *code, SIZE_T size,
+                         UINT words, UINT32 *out) {
+  D3D12_COMPUTE_PIPELINE_STATE_DESC cd;
+  memset(&cd, 0, sizeof cd);
+  cd.pRootSignature = rs;
+  cd.CS.pShaderBytecode = code;
+  cd.CS.BytecodeLength = size;
+  ID3D12PipelineState *pso = NULL;
+  if (FAILED(ID3D12Device_CreateComputePipelineState(dev, &cd, &IID_ID3D12PipelineState, (void **)&pso)) || !pso) return 0;
+  ID3D12Resource *up = make_buffer(dev, D3D12_HEAP_TYPE_UPLOAD, words * 4, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ);
+  ID3D12Resource *uav = make_buffer(dev, D3D12_HEAP_TYPE_DEFAULT, words * 4, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_DEST);
+  ID3D12Resource *back = make_buffer(dev, D3D12_HEAP_TYPE_READBACK, words * 4, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);
+  int ok = 0;
+  if (up && uav && back) {
+    UINT32 *p = NULL;
+    CHECK_HR(ID3D12Resource_Map(up, 0, NULL, (void **)&p));
+    for (UINT k = 0; p && k < words; ++k) p[k] = WAVE_UNWRITTEN;
+    ID3D12Resource_Unmap(up, 0, NULL);
+    ID3D12CommandAllocator *allocator = NULL;
+    ID3D12GraphicsCommandList *list = NULL;
+    CHECK_HR(ID3D12Device_CreateCommandAllocator(dev, D3D12_COMMAND_LIST_TYPE_DIRECT, &IID_ID3D12CommandAllocator, (void **)&allocator));
+    if (allocator) CHECK_HR(ID3D12Device_CreateCommandList(dev, 0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator, pso, &IID_ID3D12GraphicsCommandList, (void **)&list));
+    if (list) {
+      ID3D12GraphicsCommandList_CopyBufferRegion(list, uav, 0, up, 0, words * 4);
+      D3D12_RESOURCE_BARRIER b;
+      memset(&b, 0, sizeof b);
+      b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+      b.Transition.pResource = uav;
+      b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+      b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+      b.Transition.StateAfter = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+      ID3D12GraphicsCommandList_ResourceBarrier(list, 1, &b);
+      ID3D12GraphicsCommandList_SetComputeRootSignature(list, rs);
+      ID3D12GraphicsCommandList_SetComputeRootUnorderedAccessView(list, 0, ID3D12Resource_GetGPUVirtualAddress(uav));
+      ID3D12GraphicsCommandList_Dispatch(list, 1, 1, 1);
+      b.Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+      b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+      ID3D12GraphicsCommandList_ResourceBarrier(list, 1, &b);
+      ID3D12GraphicsCommandList_CopyBufferRegion(list, back, 0, uav, 0, words * 4);
+      CHECK_HR(ID3D12GraphicsCommandList_Close(list));
+      ID3D12CommandList *lists[1] = {(ID3D12CommandList *)list};
+      ID3D12CommandQueue_ExecuteCommandLists(queue, 1, lists);
+      wait_fence(queue, fence, fence_value);
+      const UINT32 *q = NULL;
+      CHECK_HR(ID3D12Resource_Map(back, 0, NULL, (void **)&q));
+      if (q) {
+        memcpy(out, q, words * 4);
+        ok = 1;
+        ID3D12Resource_Unmap(back, 0, NULL);
+      }
+      ID3D12GraphicsCommandList_Release(list);
+    }
+    if (allocator) ID3D12CommandAllocator_Release(allocator);
+  }
+  if (up) ID3D12Resource_Release(up);
+  if (uav) ID3D12Resource_Release(uav);
+  if (back) ID3D12Resource_Release(back);
+  ID3D12PipelineState_Release(pso);
+  return ok;
+}
+
+static void wave_check(const char *name, const UINT32 *got, const UINT32 *want, UINT words, UINT per_thread) {
+  /* (one check a thread: every word of it as the model says) */
+  int bad = 0;
+  for (UINT t = 0; t < words / per_thread; ++t) {
+    int same = 1;
+    for (UINT k = t * per_thread; k < (t + 1) * per_thread; ++k) {
+      if (got[k] == want[k]) continue;
+      same = 0;
+      if (bad++ < 8) printf("%s: thread %u word %u: %08x, wanted %08x\n", name, k / per_thread, k % per_thread, (unsigned)got[k], (unsigned)want[k]);
+    }
+    CHECK(same);
+  }
+}
+
+static void test_wave_ops(ID3D12Device *dev, ID3D12CommandQueue *queue, ID3D12Fence *fence, UINT64 *fence_value) {
+  D3D12_FEATURE_DATA_SHADER_MODEL sm = {D3D_SHADER_MODEL_6_7};
+  CHECK_HR(ID3D12Device_CheckFeatureSupport(dev, D3D12_FEATURE_SHADER_MODEL, &sm, sizeof sm));
+  D3D12_FEATURE_DATA_SHADER_MODEL low = {(D3D_SHADER_MODEL)0x50};
+  CHECK(ID3D12Device_CheckFeatureSupport(dev, D3D12_FEATURE_SHADER_MODEL, &low, sizeof low) == E_INVALIDARG);
+  D3D12_FEATURE_DATA_SHADER_MODEL exact = {D3D_SHADER_MODEL_5_1};
+  CHECK(SUCCEEDED(ID3D12Device_CheckFeatureSupport(dev, D3D12_FEATURE_SHADER_MODEL, &exact, sizeof exact)) && exact.HighestShaderModel == D3D_SHADER_MODEL_5_1);
+  D3D12_FEATURE_DATA_D3D12_OPTIONS1 o1;
+  memset(&o1, 0xCC, sizeof o1);
+  CHECK_HR(ID3D12Device_CheckFeatureSupport(dev, D3D12_FEATURE_D3D12_OPTIONS1, &o1, sizeof o1));
+  printf("wave operations: shader model %x, WaveOps %d, lanes %u - %u, total %u, Int64ShaderOps %d\n", (unsigned)sm.HighestShaderModel, o1.WaveOps, o1.WaveLaneCountMin,
+         o1.WaveLaneCountMax, o1.TotalLaneCount, o1.Int64ShaderOps);
+  if (o1.WaveOps) {
+    CHECK(sm.HighestShaderModel >= D3D_SHADER_MODEL_6_0 && o1.WaveLaneCountMin == 4 && o1.WaveLaneCountMax == WAVE_LANES && o1.TotalLaneCount >= o1.WaveLaneCountMax && o1.Int64ShaderOps);
+    D3D12_FEATURE_DATA_SHADER_MODEL six = {D3D_SHADER_MODEL_6_0};
+    CHECK(SUCCEEDED(ID3D12Device_CheckFeatureSupport(dev, D3D12_FEATURE_SHADER_MODEL, &six, sizeof six)) && six.HighestShaderModel == D3D_SHADER_MODEL_6_0);
+  } else {
+    CHECK(sm.HighestShaderModel == D3D_SHADER_MODEL_5_1 && o1.WaveLaneCountMin == 0 && o1.WaveLaneCountMax == 0 && !o1.Int64ShaderOps);
+  }
+  D3D12_ROOT_PARAMETER param;
+  memset(&param, 0, sizeof param);
+  param.ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+  D3D12_ROOT_SIGNATURE_DESC rsd = {1, &param, 0, NULL, D3D12_ROOT_SIGNATURE_FLAG_NONE};
+  ID3DBlob *blob = NULL, *error = NULL;
+  CHECK_HR(D3D12SerializeRootSignature(&rsd, D3D_ROOT_SIGNATURE_VERSION_1_0, &blob, &error));
+  ID3D12RootSignature *rs = NULL;
+  if (blob) CHECK_HR(ID3D12Device_CreateRootSignature(dev, 0, ID3D10Blob_GetBufferPointer(blob), ID3D10Blob_GetBufferSize(blob), &IID_ID3D12RootSignature, (void **)&rs));
+  if (blob) ID3D10Blob_Release(blob);
+  if (!rs) return;
+  static UINT32 got[WAVE_CS_THREADS * WAVE_CS_WORDS + WAVE_TYPES_THREADS * WAVE_TYPES_WORDS], want[WAVE_CS_THREADS * WAVE_CS_WORDS + WAVE_TYPES_THREADS * WAVE_TYPES_WORDS];
+  struct {
+    const char *name;
+    const void *code;
+    SIZE_T size;
+    UINT threads, words;
+    void (*model)(uint32_t *);
+  } cases[] = {
+      {"dxil_cs_wave", dx_dxil_cs_wave_dxil, sizeof dx_dxil_cs_wave_dxil, WAVE_CS_THREADS, WAVE_CS_WORDS, wave_model_cs},
+      {"dxil_cs_wave_types", dx_dxil_cs_wave_types_dxil, sizeof dx_dxil_cs_wave_types_dxil, WAVE_TYPES_THREADS, WAVE_TYPES_WORDS, wave_model_cs_types},
+      {"dxil_cs_wave16", dx_dxil_cs_wave16_dxil, sizeof dx_dxil_cs_wave16_dxil, WAVE16_THREADS, WAVE16_WORDS, wave_model_cs16},
+      {"dxil_cs_wave_match", dx_dxil_cs_wave_match_dxil, sizeof dx_dxil_cs_wave_match_dxil, WAVE_MATCH_THREADS, WAVE_MATCH_WORDS, wave_model_cs_match},
+  };
+  for (UINT c = 0; c < sizeof cases / sizeof cases[0]; ++c) {
+    const UINT words = cases[c].threads * cases[c].words;
+    const int ran = wave_dispatch(dev, queue, fence, fence_value, rs, cases[c].code, cases[c].size, words, got);
+    CHECK(ran == (o1.WaveOps ? 1 : 0));      /* (the 16-bit one needs Native16BitShaderOps too: the CPU renderer's DXIL translator has them) */
+    if (!ran) continue;
+    cases[c].model(want);
+    wave_check(cases[c].name, got, want, words, cases[c].words);
+  }
+  ID3D12RootSignature_Release(rs);
+}
+
+/* The pixel shader on a primitive whose right edge cuts quads in two (pixels x <= 32 covered), drawn over the scene's target. */
+static void test_wave_pixels(Scene *c) {
+  D3D12_FEATURE_DATA_D3D12_OPTIONS1 o1;
+  memset(&o1, 0, sizeof o1);
+  CHECK_HR(ID3D12Device_CheckFeatureSupport(c->dev, D3D12_FEATURE_D3D12_OPTIONS1, &o1, sizeof o1));
+  D3D12_GRAPHICS_PIPELINE_STATE_DESC pd;
+  D3D12_INPUT_ELEMENT_DESC layout[2];
+  fs_desc(c, &pd, layout);
+  pd.PS.pShaderBytecode = dx_dxil_ps_wave_dxil;
+  pd.PS.BytecodeLength = sizeof dx_dxil_ps_wave_dxil;
+  ID3D12PipelineState *pso = NULL;
+  const HRESULT hr = ID3D12Device_CreateGraphicsPipelineState(c->dev, &pd, &IID_ID3D12PipelineState, (void **)&pso);
+  if (!o1.WaveOps) {
+    CHECK(FAILED(hr) && !pso);      /* (a shader the device does not run) */
+    return;
+  }
+  CHECK_HR(hr);
+  if (!pso) return;
+  const float edge = 33.0f / 32.0f - 1.0f;
+  const float tri[3][7] = {{edge, -3, 0.5f, 1, 1, 1, 1}, {edge, 5, 0.5f, 1, 1, 1, 1}, {-7, 1, 0.5f, 1, 1, 1, 1}};
+  /* (pixels: corners of whole quads - one with a discarded corner -, the two covered corners of quads the edge cuts, a discarded pixel) */
+  const int at[][2] = {{8, 8}, {9, 8}, {8, 9}, {9, 9}, {10, 10}, {11, 10}, {10, 11}, {11, 9}, {32, 20}, {32, 21}, {31, 31}, {33, 20}};
+  scene_draw_with(c, pso, tri, sizeof tri, 28, 3, 0, 0);
+  for (UINT k = 0; k < sizeof at / sizeof at[0]; ++k) {
+    const UINT32 x = (UINT32)at[k][0], y = (UINT32)at[k][1];
+    const UINT32 p = scene_pixel(c, (int)x, (int)y);
+    UINT32 want = 0xFF000000u;      /* (the target's clear colour: a discarded pixel, a pixel the primitive does not cover) */
+    const int discards = (x & 3) == 3 && (y & 3) == 3;
+    if (x <= 32 && !discards) {
+      UINT32 rgba[4];
+      wave_model_ps(x & ~1u, y & ~1u, x == 32 ? 0x5u : 0xFu, (x & 1) | (y & 1) << 1, rgba);
+      want = rgba[3] << 24 | rgba[0] << 16 | rgba[1] << 8 | rgba[2];
+    }
+    CHECK(p == want);
+    if (p != want) printf("wave pixels: (%u, %u) %08x, wanted %08x\n", (unsigned)x, (unsigned)y, (unsigned)p, (unsigned)want);
+  }
+  ID3D12PipelineState_Release(pso);
+}
+
 static void test_raster_features(ID3D12Device *dev, ID3D12CommandQueue *queue, ID3D12Fence *fence, UINT64 *fence_value) {
   Scene c;
   memset(&c, 0, sizeof c);
@@ -10177,6 +10474,7 @@ static void test_raster_features(ID3D12Device *dev, ID3D12CommandQueue *queue, I
   test_view_instancing(&c, &o3);
   test_shading_rate(&c, &o6);
   test_barycentrics(&c, &o3);
+  test_wave_pixels(&c);
 }
 
 static void test_later(ID3D12Device *dev, ID3D12CommandQueue *queue, ID3D12Fence *fence, UINT64 *fence_value) {
@@ -10190,6 +10488,7 @@ static void test_later(ID3D12Device *dev, ID3D12CommandQueue *queue, ID3D12Fence
   test_cpu_texture(dev, queue, fence, fence_value);
   test_agility(dev, queue, fence, fence_value);
   test_raster_features(dev, queue, fence, fence_value);
+  test_wave_ops(dev, queue, fence, fence_value);
 }
 
 int main(void) {

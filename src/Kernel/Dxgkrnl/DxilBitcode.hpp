@@ -55,6 +55,8 @@ struct Type {
   uint32_t count = 0;       // Struct: elements; Array / Vector: length; Function: parameters
   uint32_t first = 0;       // Struct / Function: the index of the first element or parameter type in Module::type_refs; Array / Vector / Pointer: the element type
   uint32_t result = 0;      // Function: the return type
+  bool signed_name = false; // Struct: its name says its element is a signed integer ("class.RWTexture2D<int>", "<vector<int, 2> >", "int64_t", not "unsigned int" / "uint"): the
+                            // only place a typed resource's integers say their sign (LLVM's integers have none, and dxc's element type tag is not reliable)
 };
 
 // A constant: an integer (Int, up to 64 bits), a float (the bits of a float), undef/null, or an aggregate (elements in value numbers).
@@ -66,7 +68,10 @@ struct Constant {
 };
 
 enum class Op : uint8_t {
-  Binop, Cast, Cmp, Select, Call, Br, CondBr, Ret, Phi, ExtractValue, Load, Store, Alloca, Gep, Unreachable, Switch, Other
+  Binop, Cast, Cmp, Select, Call, Br, CondBr, Ret, Phi, ExtractValue, Load, Store, Alloca, Gep, Unreachable, Switch,
+  AtomicRmw,   // atomicrmw: operands pointer, value; code the operation (LLVM's encoding: 0 xchg, 1 add, 2 sub, 3 and, 4 nand, 5 or, 6 xor, 7 max, 8 min, 9 umax, 10 umin)
+  CmpXchg,     // cmpxchg: operands pointer, compare, new value; the result is {the old value, i1 whether it was equal} (`type` that struct, when the module has it)
+  Other
 };
 
 constexpr uint32_t kMaxCallArguments = 20;

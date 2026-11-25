@@ -56,8 +56,10 @@
  *     (D3D12_SAMPLER_DESC2, the strip cut of the command list and triangle fans are done: heaps.inc sampler_descriptor, cmdlist1.inc IASetIndexBufferStripCutValue); and on
  *     virgl (the CPU renderer has them: cmdlist1.inc) the depth bounds test, programmable sample positions, view instancing, variable-rate shading and barycentrics
  *   - of those: view instancing is tier 2 (draw-call looping; every stage runs for every view), no centroid or sample interpolation (EvaluateAttributeSnapped, per-sample
- *     shading) or SV_Coverage, and HighestShaderModel stays 5.1 (DXIL of 6.1 - 6.6 with SV_ViewID, SV_Barycentrics, GetAttributeAtVertex, SV_ShadingRate and IsHelperLane is
- *     taken, but the wave operations of 6.0 are not translated)
+ *     shading) or SV_Coverage
+ *   - HighestShaderModel (device.inc): 6.1 on the CPU renderer, whose lane model runs Shader Model 6.0's wave and quad operations (and 6.5's WaveMatch / WaveMultiPrefix*,
+ *     6.7's QuadAny / QuadAll): OPTIONS1 WaveOps, WaveLaneCountMin 4 (a pixel shader's wave is its quad), Max 32 (a compute shader's), Int64ShaderOps; 5.1 on virgl and Venus,
+ *     whose TGSI has no wave operations (the shaders are refused there); not 6.2, whose fp32 denormal modes the interpreter does not keep
  *   - vertex elements: every Direct3D 11 input-assembler format and instance step rates (pso.inc vertex_format) where the device reads them (the CPU renderer and virgl)
  *     (queries are occlusion, binary occlusion, pipeline statistics (and 1), stream output statistics and timestamps (also on copy queues), any number open at once;
  *     stream output views stop at SizeInBytes and start after the filled size they hold when their draws run; ExecuteIndirect is made when the list is executed;

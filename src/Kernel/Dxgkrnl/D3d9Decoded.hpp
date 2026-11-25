@@ -70,7 +70,24 @@ enum Opcode : uint16_t {
   kGsEmit = 0x1500, kGsCut,
   kBarrier = 0x1600,   // sync_g..: the thread waits until every thread of its group is here (a group runner switches threads there)
   kLoopBegin = 0x1200, kLoopEnd, kBreak0, kBreakNz, kBreakZ, kContinue0, kContinueNz, kContinueZ,
+  // Wave operations (Shader Model 6, from the DXIL translator: D3d9Dxbc.cpp's private opcodes kDxbcWaveFirst ..). They read the lanes of the wave that are at the same instruction (see
+  // WaveRunner in D3d9Shader.cpp): the active lanes, which are those lanes but a pixel shader's helpers, and for the quad operations the helpers too. `stride` is the site: the DXIL
+  // instruction the operation came from (copies of one instruction - a return block the translator puts in each branch - are the same operation). A component of the result is made
+  // from the same component of the sources (a 64-bit value: the pair 2k, 2k + 1); a condition is a source's x, true when not zero; a lane mask (ballot, match) is the result's x y z w,
+  // lanes 0 - 31 in x. `control` of the typed ones: (WaveOp << 4) | WaveType.
+  //   kWaveIsFirstLane (all ones in the first active lane), kWaveLaneIndex, kWaveLaneCount (the wave's lanes), kWaveAnyTrue / kWaveAllTrue (src[0] the condition; all ones or zero),
+  //   kWaveBallot (the active lanes whose condition holds), kWaveAllEqual (all ones when every active lane has the value), kWaveReadLaneAt (src[1] the lane), kWaveReadFirst (the first
+  //   active lane's value), kWaveActive / kWavePrefix (the reduction over the active lanes / over those before this one: control's WaveOp), kWaveCountBits / kWavePrefixCountBits (the
+  //   active lanes / those before this one whose condition holds), kQuadReadLaneAt (src[1] the lane of the quad, 0 - 3), kQuadReadAcross (control: the lane of the quad it is
+  //   exclusive-or'd with: 1 across X, 2 across Y, 3 the diagonal), kWaveMatch (the active lanes with this lane's value), kWaveMultiPrefix / kWaveMultiPrefixCountBits (as kWavePrefix /
+  //   kWavePrefixCountBits over the lanes before this one that are in the mask src[1] - x y z w as kWaveBallot's), kQuadAny / kQuadAll (over the lanes of the quad).
+  kWaveIsFirstLane = 0x1800, kWaveLaneIndex, kWaveLaneCount, kWaveAnyTrue, kWaveAllTrue, kWaveBallot, kWaveAllEqual, kWaveReadLaneAt, kWaveReadFirst, kWaveActive, kWavePrefix,
+  kWaveCountBits, kWavePrefixCountBits, kQuadReadLaneAt, kQuadReadAcross, kWaveMatch, kWaveMultiPrefix, kWaveMultiPrefixCountBits, kQuadAny, kQuadAll,
+  kWaveFirst = kWaveIsFirstLane, kWaveLast = kQuadAll,
 };
+// The value type (low four bits of `control`) and the operation (high four) of a typed wave operation.
+enum WaveType : uint8_t { kWaveF32 = 0, kWaveI32, kWaveU32, kWaveF64, kWaveI64, kWaveU64 };
+enum WaveOp : uint8_t { kWaveSum = 0, kWaveProduct, kWaveMin, kWaveMax, kWaveAnd, kWaveOr, kWaveXor };
 
 enum RegType : uint8_t { kPatchOut = 21 /* a hull shader's patch constant output register (fork and join phases) */, kPatchIn = 22 /* a domain shader's patch constant input register */, kTemp = 0, kInput = 1, kConst = 2, kAddrTex = 3, kRastOut = 4, kAttrOut = 5, kTexCrdOut = 6, kColorOut = 8, kDepthOut = 9, kSampler = 10, kConstBool = 14,
                kSysValue = 20 /* (not in a token stream: a Shader Model 4 system value; number: kSysPosition ...) */ };
@@ -140,6 +157,9 @@ struct D3d9Program::Instruction {
   Src src[4];
   uint8_t src_count = 0;
   uint32_t target = 0;   // if: where to go when the condition fails; else: where to go to leave the branch
+  // The copies the DXIL translator makes of a block that ends the program (one in each branch that returns, D3d9Dxbc.cpp kDxbcTailBegin): `tail` is the block's number + 1 (0: not
+  // in one) and `tail_at` the instruction's place in the copy, so the lane model (WaveRunner) sees one instruction wherever its copies are.
+  uint32_t tail = 0, tail_at = 0;
 };
 
 }  // namespace dxgk

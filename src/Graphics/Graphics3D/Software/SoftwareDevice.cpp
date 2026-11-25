@@ -1697,17 +1697,30 @@ void raster_triangle(const DrawState& s, const ScreenVertex& a, const ScreenVert
     context.barycentrics = bary[0], context.barycentrics_linear = bary[1];
     for (uint32_t n = 0; n < 3; ++n) context.vertex_varyings[n] = s.primitive_varyings[n];
     // (the corners of the pixel's quad for the derivatives: the varyings, and depth and 1 / w, of the plane of the triangle at the corner's centre; and its barycentrics)
+    // (and whether the primitive covers a corner - a sample of one of its pixels, inside the draw's bounds -: the quad's lanes that are helpers for the wave operations)
+    auto corner_covered = [&](uint32_t corner) {
+      const int32_t qx0 = (cx & ~1) * static_cast<int32_t>(cw) + static_cast<int32_t>(corner & 1) * static_cast<int32_t>(cw);
+      const int32_t qy0 = (cy & ~1) * static_cast<int32_t>(ch) + static_cast<int32_t>(corner >> 1) * static_cast<int32_t>(ch);
+      for (uint32_t j = 0; j < ch; ++j)
+        for (uint32_t i = 0; i < cw; ++i) {
+          const int32_t x = qx0 + static_cast<int32_t>(i), y = qy0 + static_cast<int32_t>(j);
+          Coverage c;
+          if (x >= min_x && x < max_x && y >= min_y && y < max_y && cover(x, y, &c)) return true;
+        }
+      return false;
+    };
     struct Quad {
       decltype(varyings_at)& varyings;
       decltype(weights_at)& weights;
       decltype(barycentrics_at)& barycentrics;
       decltype(final_z)& depth;
+      decltype(corner_covered)& covered;
       float quad_x, quad_y, step_x, step_y, inv_area;
       const ScreenVertex *v0, *v1, *v2;
       void point(uint32_t corner, float* qx, float* qy) const {
         *qx = quad_x + step_x * static_cast<float>(corner & 1), *qy = quad_y + step_y * static_cast<float>(corner >> 1);
       }
-    } quad{varyings_at, weights_at, barycentrics_at, final_z, quad_x, quad_y, step_x, step_y, inv_area, v0, v1, v2};
+    } quad{varyings_at, weights_at, barycentrics_at, final_z, corner_covered, quad_x, quad_y, step_x, step_y, inv_area, v0, v1, v2};
     context.quad_fn = [](const void* user, uint32_t corner, Vec4* out_varyings, Vec4* out_position) {
       const Quad& q = *static_cast<const Quad*>(user);
       float qx, qy, ql[3];
@@ -1724,6 +1737,7 @@ void raster_triangle(const DrawState& s, const ScreenVertex& a, const ScreenVert
       q.weights(qx, qy, ql);
       q.barycentrics(ql[0], ql[1], ql[2], out_bary);
     };
+    context.quad_covered_fn = [](const void* user, uint32_t corner) { return static_cast<const Quad*>(user)->covered(corner); };
     context.quad_user = &quad;
     context.quad_corner = static_cast<uint32_t>(cx & 1) | static_cast<uint32_t>(cy & 1) << 1;
     return run_fragment_shader(s, varying, context, color);

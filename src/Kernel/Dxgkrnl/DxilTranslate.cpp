@@ -24,10 +24,13 @@
 // constants and constant buffer elements are used where they are, as operands. Branches are made structured again (if / else / endif) from the acyclic control flow dxc writes for if
 // statements; a phi is a register the arms write before they join.
 //
-// Taken: float and 32-bit integer arithmetic, comparisons, select, casts, the math functions of the interpreter (abs, saturate, sin, cos, exp, log, frc, sqrt, rsqrt, rounding, min, max,
-// mad, dot products), loadInput / storeOutput, constant buffer loads, createHandle with sample / sample_l / texture load, discard, if / else with phi. Not taken (kNotSupported): loops,
-// switches, memory (alloca / load / store / GEP), 16 and 64-bit arithmetic, derivatives, gather, resource arrays with non-constant indices, geometry / hull / domain stages, wave
-// operations. A bitcode that is not well formed is kInvalidParameter.
+// Taken: float, double, 16-, 32- and 64-bit integer arithmetic, comparisons, select, casts, the math functions of the interpreter, loadInput / storeOutput, constant buffer loads,
+// createHandle with the lookups of textures (sample, sample_l / _b / _d / _c, load, gather, the level of detail), buffers (raw, structured and typed) and typed unordered access
+// views (loads, stores, atomics, compare-exchange, GetDimensions, the hidden counter), group-shared memory (loads, stores, atomicrmw, cmpxchg), discard, structured if / else /
+// loops / switches from the CFG with phis, early returns, geometry / hull / domain stages, the Shader Model 6.1 - 6.6 values (SV_ViewID, SV_Barycentrics, GetAttributeAtVertex,
+// SV_ShadingRate, IsHelperLane) and the wave operations of 6.0, 6.5 and 6.7 (Translator::wave: private opcodes D3d9Dxbc.cpp reads; the lane model is D3d9Shader.cpp's
+// WaveRunner). Not taken (kNotSupported): alloca / memory other than group-shared, resource arrays with non-constant indices but small texture arrays, mesh / amplification /
+// library targets, and what the DXBC front end has no instruction for either (countbits, firstbit, bfrev, msad, the bit fields, EvaluateAttribute*, SV_Coverage).
 #include "Kernel/Dxgkrnl/D3d9Shader.hpp"
 #include "Kernel/Dxgkrnl/DxilBitcode.hpp"
 #include "Utility/ByteStream.hpp"
@@ -63,8 +66,46 @@ struct SigElement {
 
 struct Resource {
   uint32_t id = 0, space = 0, lower = 0, size = 0, kind = 0, bytes = 0, stride = 0;
+  uint32_t element = 0;   // a typed view's component type (DXIL ComponentType: 4 I32, 5 U32, 9 F32, 13 / 14 SNorm / UNorm F32 ...; 0: none said)
+  uint32_t samples = 0;   // a multisampled texture's sample count
+  bool counter = false;   // an unordered access view with a hidden counter (IncrementCounter / DecrementCounter, append / consume)
   bool present = false;
 };
+
+// DXIL's resource kinds (DxilConstants.h ResourceKind).
+enum ResourceKind : uint32_t { kKind1D = 1, kKind2D = 2, kKind2DMS = 3, kKind3D = 4, kKindCube = 5, kKind1DArray = 6, kKind2DArray = 7, kKind2DMSArray = 8, kKindCubeArray = 9,
+                               kKindTypedBuffer = 10, kKindRawBuffer = 11, kKindStructuredBuffer = 12 };
+bool buffer_kind(uint32_t kind) { return kind == kKindTypedBuffer || kind == kKindRawBuffer || kind == kKindStructuredBuffer; }
+// The declaration's return type word (D3D10_SB_RESOURCE_RETURN_TYPE in each component's four bits: 1 unorm, 2 snorm, 3 sint, 4 uint, 5 float) of a typed view's component type.
+uint32_t return_type_word(uint32_t element) {
+  uint32_t t = 5;
+  switch (element) {
+    case 1: case 2: case 4: t = 3; break;     // (I1, I16, I32)
+    case 3: case 5: t = 4; break;             // (U16, U32)
+    case 11: case 13: t = 2; break;           // (SNormF16, SNormF32)
+    case 12: case 14: t = 1; break;           // (UNormF16, UNormF32)
+    default: t = 5; break;
+  }
+  return t * 0x1111u;
+}
+// The operand tokens of a shader resource view (t#, .xyzw) and of an unordered access view (u#: as a destination with a mask, or as a source .xyzw); defined with the buffer accesses.
+uint32_t srv_token();
+uint32_t uav_token(uint32_t mask, bool destination);
+// The SM5 resource dimension of a texture or typed buffer kind (0: none of those): 1 buffer, 2 1D, 3 2D, 4 2DMS, 5 3D, 6 cube, 7 1D array, 8 2D array, 10 cube array.
+uint32_t sm5_dimension(uint32_t kind) {
+  switch (kind) {
+    case kKindTypedBuffer: return 1;
+    case kKind1D: return 2;
+    case kKind2D: return 3;
+    case kKind2DMS: return 4;
+    case kKind3D: return 5;
+    case kKindCube: return 6;
+    case kKind1DArray: return 7;
+    case kKind2DArray: return 8;
+    case kKindCubeArray: return 10;
+    default: return 0;
+  }
+}
 
 // Dxil opcodes (DxilConstants.h OpCode).
 enum DxOp : uint32_t {
@@ -73,8 +114,21 @@ enum DxOp : uint32_t {
   kCBufferLoadLegacy = 59, kCalculateLod = 81, kSample = 60, kSampleBias = 61, kSampleLevel = 62, kSampleGrad = 63, kSampleCmp = 64, kSampleCmpLevelZero = 65, kTextureGather = 73, kTextureGatherCmp = 74, kTextureLoad = 66, kBufferLoad = 68, kBufferStore = 69, kAtomicBinOp = 78, kBarrier = 80, kDiscard = 82,
   kCheckAccessFullyMapped = 71,
   kDerivCoarseX = 83, kDerivCoarseY = 84, kDerivFineX = 85, kDerivFineY = 86, kFma = 47, kMakeDouble = 101, kSplitDouble = 102, kThreadId = 93, kGroupId = 94, kThreadIdInGroup = 95, kFlattenedThreadIdInGroup = 96,
-  kAttributeAtVertex = 137, kViewId = 138, kIsHelperLane = 221,
+  kAttributeAtVertex = 137, kViewId = 138, kIsHelperLane = 221, kLegacyF32ToF16 = 130, kLegacyF16ToF32 = 131, kRawBufferLoad = 139, kRawBufferStore = 140,
+  kTextureStore = 67, kBufferUpdateCounter = 70, kGetDimensions = 72, kAtomicCompareExchange = 79,
+  // the wave operations (Shader Model 6.0, and 6.5's match and multi-prefix, 6.7's quad vote)
+  kWaveIsFirstLane = 110, kWaveGetLaneIndex = 111, kWaveGetLaneCount = 112, kWaveAnyTrue = 113, kWaveAllTrue = 114, kWaveActiveAllEqual = 115, kWaveActiveBallot = 116,
+  kWaveReadLaneAt = 117, kWaveReadLaneFirst = 118, kWaveActiveOp = 119, kWaveActiveBit = 120, kWavePrefixOp = 121, kQuadReadLaneAt = 122, kQuadOp = 123, kWaveAllBitCount = 135,
+  kWavePrefixBitCount = 136, kWaveMatch = 165, kWaveMultiPrefixOp = 166, kWaveMultiPrefixBitCount = 167, kQuadVote = 222,
 };
+// The private opcodes D3d9Dxbc.cpp reads for them: 0x700 + the operation's place in D3d9Decoded.hpp's list (kWaveIsFirstLane ..), its control (WaveType | WaveOp << 4) in bits 11 - 18.
+enum WaveSub : uint32_t {
+  kSubIsFirstLane = 0, kSubLaneIndex, kSubLaneCount, kSubAnyTrue, kSubAllTrue, kSubBallot, kSubAllEqual, kSubReadLaneAt, kSubReadFirst, kSubActive, kSubPrefix, kSubCountBits,
+  kSubPrefixCountBits, kSubQuadReadLaneAt, kSubQuadReadAcross, kSubMatch, kSubMultiPrefix, kSubMultiPrefixCountBits, kSubQuadAny, kSubQuadAll,
+};
+constexpr uint32_t kDxbcWaveFirst = 0x700, kDxbcTailBegin = 0x7F0, kDxbcTailEnd = 0x7F1;
+enum WaveTypeCode : uint32_t { kWtF32 = 0, kWtI32, kWtU32, kWtF64, kWtI64, kWtU64 };
+enum WaveOpCode : uint32_t { kWoSum = 0, kWoProduct, kWoMin, kWoMax, kWoAnd, kWoOr, kWoXor };
 // (the operand types D3d9Dxbc.cpp takes for what DXBC has no register of: SV_ViewID, SV_Barycentrics perspective-correct and noperspective, IsHelperLane)
 constexpr uint32_t kOperandViewId = 0xF0, kOperandBarycentrics = 0xF1, kOperandBarycentricsLinear = 0xF2, kOperandHelperLane = 0xF3;
 constexpr uint32_t kSysvalBarycentrics = 23, kSysvalShadingRate = 24;   // (D3D_NAME_BARYCENTRICS, D3D_NAME_SHADINGRATE in a signature)
@@ -169,6 +223,7 @@ class Translator {
   bool i64_binop(const Instruction& ins, const Val& a, const Val& b);
   bool i64_compare(const Instruction& ins, const Val& a, const Val& b);
   bool i64_cast(const Instruction& ins, const Val& a);
+  bool i64_min_max(const Instruction& ins, const Val& a, const Val& b, bool is_signed, bool max);
   Val scratch_word();
   Val scratch_wide() {
     Val v;
@@ -208,6 +263,9 @@ class Translator {
   }
   Val use(uint32_t id) {
     if (id >= vals_.count() || vals_[id].kind == VK::None) {
+#ifdef DXIL_TRACE
+      fprintf(stderr, "dxil: value %u used before it is defined (event %d)\n", id, pos_);
+#endif
       error(status::kInvalidParameter);   // (used before it is defined)
       return Val();
     }
@@ -224,6 +282,7 @@ class Translator {
   bool returns_directly(uint32_t block) const;   // ... or one that jumps to one
   uint32_t loop_exit_of(uint32_t header, uint32_t latch) const;
   bool inline_return(uint32_t block, uint32_t pred);
+  bool return_block(uint32_t block);
   bool analyze(const Instruction& ins);
   bool translate(const Instruction& ins);
   bool phi_moves(uint32_t pred, uint32_t target);
@@ -301,6 +360,13 @@ class Translator {
   bool buffer_store(const Instruction& ins);
   bool atomic(const Instruction& ins);
   bool thread_value(const Instruction& ins, uint32_t type, bool dimension);
+  bool wave(const Instruction& ins, uint32_t opcode);
+  bool shared_atomic(const Instruction& ins);
+  Val shared_address(const Val& ptr);
+  bool typed_uav_load(const Instruction& ins, const uint32_t* coords, uint32_t count);
+  bool typed_uav_store(const Instruction& ins, const uint32_t* coords, uint32_t count, const uint32_t* values);
+  bool get_dimensions(const Instruction& ins);
+  bool atomic_compare_exchange(const Instruction& ins);
   bool pack(const uint32_t* ids, uint32_t count, uint32_t reg, bool integer);
   bool resource_of(uint32_t handle_id, uint32_t expected_class, Val* out);
 
@@ -554,7 +620,7 @@ bool Translator::alias_cast(const Instruction& ins) const {
   if (m_.is_int(ins.type, 64)) return false;                    // (a widening: the high word is made)
   if (m_.is_int(from, 64)) return ins.code == 0 && !m_.is_int(ins.type, 1);   // (a truncation takes the low word)
   switch (ins.code) {
-    case 11: return !(m_.types[from].kind == TypeKind::Half) && !(m_.types[ins.type].kind == TypeKind::Half);   // bitcast (a half is a value here and its bits are in an integer: converted)
+    case 11: return !half_type(from) && !half_type(ins.type);   // bitcast (a half is a value here and its bits are in an integer: converted)
     case 0: return !m_.is_int(ins.type, 1) && !m_.is_int(ins.type, 16);   // trunc (to a boolean is not an alias: the low bit; to 16 bits it is wrapped)
     case 1: return !m_.is_int(from, 1);                     // zext from a narrow integer (a boolean becomes 0 or 1)
     case 2: return m_.is_int(from, 1) && m_.is_int(ins.type, 32);   // sext of a boolean: the mask already is all ones
@@ -640,6 +706,11 @@ bool Translator::analyze(const Instruction& ins) {
         return true;
       }
       return error(status::kNotSupported);
+    case Op::AtomicRmw: case Op::CmpXchg:   // (atomics on group-shared memory)
+      if (!is_shared_pointer(ins.operands[0])) return error(status::kNotSupported);
+      note_use(ins.operands[0], at), note_use(ins.operands[1], at);
+      if (ins.op == Op::CmpXchg) note_use(ins.operands[2], at);
+      return true;
     case Op::Alloca:
       if (ins.result < unsupported_.count()) unsupported_[ins.result] = 1;
       return true;
@@ -805,6 +876,18 @@ uint32_t Translator::loop_exit_of(uint32_t header, uint32_t latch) const {
 // A jump to a block that ends the function, from inside a loop: the moves into its phis, then the block itself, return included.
 bool Translator::inline_return(uint32_t b, uint32_t pred) {
   if (!phi_moves(pred, b)) return false;
+  return return_block(b);
+}
+
+// A block that ends the function, written where the walk is (its phis' moves made): its instructions and a ret.
+bool Translator::return_block(uint32_t b) {
+  // (the copy is marked - kDxbcTailBegin / kDxbcTailEnd -: the lane model of the wave operations takes the copies of the block for one)
+  {
+    const uint32_t at = begin(kDxbcTailBegin);
+    put(0x4001u);
+    put(b);
+    finish(at);
+  }
   const Block& blk = block_at(b);
   for (uint32_t i = 0; i + 1 < blk.count; ++i) {
     const Instruction& ins = instruction_at(blk.first + i);
@@ -818,6 +901,7 @@ bool Translator::inline_return(uint32_t b, uint32_t pred) {
   } else {
     finish(begin(62));   // ret
   }
+  finish(begin(kDxbcTailEnd));
   ++pos_;
   return true;
 }
@@ -915,6 +999,7 @@ bool Translator::region(uint32_t start, uint32_t stop, uint32_t pred) {
         if (done) return true;
         continue;
       }
+      if (target == stop && is_return_block(target)) return phi_moves(b, target);   // (the arm of an if that joins at the block that ends the function: the caller goes on there)
       if (is_return_block(target)) return inline_return(target, b);   // a jump to a block that ends the function (numbered anywhere)
       if (loop_i >= 0 && target > top().latch) {   // a break
         if (top().exit != kNone && top().exit != target) return error(status::kNotSupported);
@@ -934,6 +1019,20 @@ bool Translator::region(uint32_t start, uint32_t stop, uint32_t pred) {
     if (t.op != Op::CondBr) return error(status::kNotSupported);
     const uint32_t tb = t.blocks[0], fb = t.blocks[1];
     if (tb == fb) return error(status::kNotSupported);
+    // An if whose one way is the block that ends the function and whose other way is a block that jumps there (dxc's `if (c) { ... }` at the end of a program): that block is
+    // the join - the arm, then the block once - rather than a copy of it in each way (a return in the middle of a compute shader is no TGSI, and the copies are wave operations
+    // the lane model must take for one).
+    if (loop_i < 0 && is_return_block(tb) != is_return_block(fb)) {
+      const uint32_t ends = is_return_block(tb) ? tb : fb, arm = ends == tb ? fb : tb;
+      if (arm > b && ends > arm && !is_return_block(arm) && returns_directly(arm) && terminator(arm).blocks[0] == ends && (stop == kNone || ends <= stop)) {
+        if (!phi_moves(b, ends)) return false;   // (the way past the arm: the arm's own moves come after, in it)
+        condition(t.operands[0], arm == tb);
+        if (!region(arm, ends, b)) return false;
+        end_if();
+        if (ends == stop) return true;
+        return return_block(ends);   // (marked as the copies of it are: the lane model takes every place the block is written for one)
+      }
+    }
     const bool t_leaves = returns_directly(tb) && !(loop_i >= 0 && tb == top().exit), f_leaves = returns_directly(fb) && !(loop_i >= 0 && fb == top().exit);
     if (t_leaves != f_leaves || (t_leaves && is_return_block(tb) != is_return_block(fb))) {   // one way returns (a block that ends the function, or jumps to one, wherever it is numbered): the other is what follows
       const bool t_returns = t_leaves && f_leaves ? is_return_block(tb) : t_leaves;
@@ -1190,6 +1289,7 @@ bool Translator::translate_one(const Instruction& ins) {
       if (!is_shared_pointer(ins.operands[0])) return true;   // (a load nothing uses)
       return shared_access(ins, ins.op == Op::Store);
     }
+    case Op::AtomicRmw: case Op::CmpXchg: return shared_atomic(ins);
     case Op::Alloca: return true;   // (refused only if something uses the result)
     default: return error(status::kNotSupported);
   }
@@ -1563,6 +1663,22 @@ bool Translator::i64_compare(const Instruction& ins, const Val& a, const Val& b)
   } else {
     word_op1(54, r, t);
   }
+  return define(ins.result, r);
+}
+
+// The lesser or greater of two 64-bit integers (dx.op imin / imax / umin / umax .i64): a < b as i64_compare makes it, then each word selected.
+bool Translator::i64_min_max(const Instruction& ins, const Val& a, const Val& b, bool is_signed, bool max) {
+  const Val alo = low_word(a), ahi = high_word(a), blo = low_word(b), bhi = high_word(b);
+  const Val r = new_wide(ins.result);
+  Val equal = scratch_word(), t = scratch_word(), low_less = scratch_word(), high_less = scratch_word();
+  if (r.kind == VK::None || equal.kind == VK::None || t.kind == VK::None || low_less.kind == VK::None || high_less.kind == VK::None) return false;
+  word_op(79, low_less, alo, blo);
+  word_op(is_signed ? 34 : 79, high_less, ahi, bhi);
+  word_op(32, equal, ahi, bhi);
+  word_op(1, t, equal, low_less);
+  word_op(60, t, t, high_less);   // (a < b: all ones)
+  word_select(low_word(r), t, max ? blo : alo, max ? alo : blo);
+  word_select(high_word(r), t, max ? bhi : ahi, max ? ahi : bhi);
   return define(ins.result, r);
 }
 
@@ -2007,6 +2123,8 @@ bool Translator::unary(const Instruction& ins, uint32_t dxbc_opcode, uint32_t so
 }
 
 bool Translator::binary(const Instruction& ins, uint32_t dxbc_opcode, uint32_t first_arg) {
+  if (m_.is_int(ins.type, 64) && (dxbc_opcode == 36 || dxbc_opcode == 37 || dxbc_opcode == 83 || dxbc_opcode == 84))   // (imax / imin / umax / umin of 64-bit integers)
+    return i64_min_max(ins, use(ins.args[first_arg]), use(ins.args[first_arg + 1]), dxbc_opcode == 36 || dxbc_opcode == 37, dxbc_opcode == 36 || dxbc_opcode == 83);
   if (!float32(ins.type) && !m_.is_int(ins.type, 32)) return error(status::kNotSupported);   // (doubles and the narrow types)
   const Val a = use(ins.args[first_arg]), b = use(ins.args[first_arg + 1]);
   const Val r = new_scalar(ins.result);
@@ -2449,7 +2567,30 @@ bool Translator::texture_gather(const Instruction& ins, bool compare) {
 
 bool Translator::texture_load(const Instruction& ins) {
   Val srv;
+  if (ins.arg_count >= 9 && use(ins.args[1]).kind == VK::Handle && use(ins.args[1]).a == 1) return typed_uav_load(ins, ins.args + 3, 3);   // (a RWTexture: ld_uav_typed)
   if (ins.arg_count < 9 || !resource_of(ins.args[1], 0, &srv)) return error(status::kNotSupported);
+  if (res_[0][srv.b].kind == kKind2DMS) {
+    // (a multisampled texture: ld_ms of the coordinate and the sample, which mipLevelOrSampleCount is)
+    for (uint32_t k = 6; k < 9; ++k) {
+      uint64_t v = 0;
+      const Constant* c = constant(ins.args[k]);
+      if (!c || (c->kind != ConstantKind::Undef && !(constant_int(ins.args[k], &v) && v == 0))) return error(status::kNotSupported);
+    }
+    const Val r = new_aggregate(ins.result);
+    uint32_t scratch = 0;
+    if (r.kind == VK::None || r.c || !alloc_reg(pos_, &scratch)) return r.c ? error(status::kNotSupported) : false;
+    const uint32_t ids[2] = {ins.args[3], ins.args[4]};
+    if (!pack(ids, 2, scratch, true)) return false;
+    const Val sample = use(ins.args[2]);
+    const uint32_t at = begin(46);   // ld_ms dst, address, t#, sample
+    dst_temp(r.a, 0xF);
+    put(2u | (1u << 2) | (0xE4u << 4) | (1u << 20));
+    put(scratch);
+    src_resource(srv.c);
+    src(sample);
+    finish(at);
+    return define(ins.result, r);
+  }
   for (uint32_t k = 6; k < 9; ++k) {
     uint64_t v = 0;
     const Constant* c = constant(ins.args[k]);
@@ -2477,6 +2618,235 @@ bool Translator::texture_load(const Instruction& ins) {
   return define(ins.result, r);
 }
 
+// A typed unordered access view (RWTexture*, RWBuffer): ld_uav_typed of the coordinate (the `count` values at `coords`) into the ResRet's register.
+bool Translator::typed_uav_load(const Instruction& ins, const uint32_t* coords, uint32_t count) {
+  Val h;
+  if (!resource_of(ins.args[1], 1, &h)) return false;
+  const Resource& r = res_[1][h.b];
+  if (buffer_kind(r.kind) && r.kind != kKindTypedBuffer) return error(status::kNotSupported);
+  const Val out = new_aggregate(ins.result);
+  uint32_t scratch = 0;
+  if (out.kind == VK::None || out.c || !alloc_reg(pos_, &scratch)) return out.c ? error(status::kNotSupported) : false;
+  if (!pack(coords, count, scratch, true)) return false;
+  const uint32_t at = begin(163);   // ld_uav_typed dst, address, u#
+  dst_temp(out.a, 0xF);
+  put(2u | (1u << 2) | (0xE4u << 4) | (1u << 20));
+  put(scratch);
+  put(uav_token(0, false)), put(h.c);
+  finish(at);
+  return define(ins.result, out);
+}
+
+// ... and store_uav_typed of the four values at `values` (a typed store writes every component: dxc repeats the value for the ones the view does not have).
+bool Translator::typed_uav_store(const Instruction& ins, const uint32_t* coords, uint32_t count, const uint32_t* values) {
+  Val h;
+  if (!resource_of(ins.args[1], 1, &h)) return false;
+  const Resource& r = res_[1][h.b];
+  if (buffer_kind(r.kind) && r.kind != kKindTypedBuffer) return error(status::kNotSupported);
+  uint32_t address = 0, value = 0;
+  if (!alloc_reg(pos_, &address) || !alloc_reg(pos_, &value)) return false;
+  if (!pack(coords, count, address, true) || !pack(values, 4, value, false)) return false;
+  const uint32_t at = begin(164);   // store_uav_typed u#.xyzw, address, value
+  put(uav_token(0xF, true)), put(h.c);
+  put(2u | (1u << 2) | (0xE4u << 4) | (1u << 20)), put(address);
+  put(2u | (1u << 2) | (0xE4u << 4) | (1u << 20)), put(value);
+  finish(at);
+  return status_ == status::kSuccess;
+}
+
+// GetDimensions: the size of a buffer view (bufinfo: elements of a typed view, structures of a structured one, bytes of a raw one) or of a texture at a level (resinfo_uint: width,
+// height, depth or layers, levels; of a multisampled texture the sample count in the last place, sampleinfo_uint).
+bool Translator::get_dimensions(const Instruction& ins) {
+  if (ins.arg_count < 3) return error(status::kNotSupported);
+  const Val h = use(ins.args[1]);
+  if (h.kind != VK::Handle || (h.a != 0 && h.a != 1) || h.b >= kMaxResources || !res_[h.a][h.b].present) return error(status::kNotSupported);
+  const Resource& r = res_[h.a][h.b];
+  const Val out = new_aggregate(ins.result);
+  if (out.kind == VK::None) return false;
+  auto resource = [&] {
+    if (h.a == 0) put(srv_token()), put(h.c);
+    else put(uav_token(0, false)), put(h.c);
+  };
+  if (buffer_kind(r.kind)) {
+    const uint32_t at = begin(121);   // bufinfo dst.x, t# / u#
+    dst_temp(out.a, 1);
+    resource();
+    finish(at);
+    return define(ins.result, out);
+  }
+  if (h.a == 1 && (r.kind == kKind2DMS || r.kind == kKind2DMSArray)) return error(status::kNotSupported);
+  const Val level = use(ins.args[2]);
+  {
+    const uint32_t at = begin(61, 2u << 11);   // resinfo_uint dst.xyzw, level, t# / u#
+    dst_temp(out.a, 0xF);
+    src(level);
+    resource();
+    finish(at);
+  }
+  if (r.kind == kKind2DMS) {
+    const uint32_t at = begin(111, 1u << 11);   // sampleinfo_uint dst.w, t#
+    dst_temp(out.a, 8);
+    put(2u | (1u << 2) | (0x00u << 4) | (7u << 12) | (1u << 20)), put(h.c);   // (.xxxx: the count in whichever component the destination takes)
+    finish(at);
+  }
+  return define(ins.result, out);
+}
+
+// AtomicCompareExchange: imm_atomic_cmp_exch of a raw or structured buffer (the byte address; the structure and the byte in it) or a typed view (the coordinate).
+bool Translator::atomic_compare_exchange(const Instruction& ins) {
+  Val h;
+  if (ins.arg_count < 7 || !resource_of(ins.args[1], 1, &h)) return error(status::kNotSupported);
+  const Resource& r = res_[1][h.b];
+  const bool structured = r.kind == kKindStructuredBuffer, raw = r.kind == kKindRawBuffer;
+  if (!m_.is_int(ins.type, 32)) return error(status::kNotSupported);   // (64-bit atomics are 6.6's)
+  const Val compare = use(ins.args[5]), value = use(ins.args[6]);
+  const Val out = new_scalar(ins.result);
+  uint32_t address = 0;
+  if (out.kind == VK::None || !alloc_reg(pos_, &address)) return false;
+  if (!pack(&ins.args[2], raw ? 1 : structured ? 2 : 3, address, true)) return false;
+  const uint32_t at = begin(185);   // imm_atomic_cmp_exch dst, u#, address, compare, value
+  dst_scalar(out);
+  put((30u << 12) | (1u << 20)), put(h.c);
+  put(2u | (1u << 2) | (0xE4u << 4) | (1u << 20)), put(address);
+  src(compare), src(value);
+  finish(at);
+  return define(ins.result, out);
+}
+
+// The wave operations: one private instruction each (see kDxbcWaveFirst), whose last operand is the site - the DXIL instruction's number, which copies of it share. Halves are done
+// as the floats they are kept in (the result rounded after: narrow_result), 16-bit integers in their 32 bits (signed ones sign-extended for a minimum or maximum, the result wrapped).
+bool Translator::wave(const Instruction& ins, uint32_t opcode) {
+  const uint32_t site = static_cast<uint32_t>(&ins - m_.instructions.view().data());
+  // (the type of the value operated on: the first argument after the opcode's, or none)
+  const uint32_t value_ty = ins.arg_count > 1 ? value_type(ins.args[1]) : 0;
+  auto type_code = [&](bool is_signed, uint32_t* code) {
+    if (m_.is_float(value_ty)) {
+      const uint32_t width = m_.types[value_ty].width;
+      if (width == 64) *code = kWtF64;
+      else if (width == 32 || width == 16) *code = kWtF32;
+      else return false;
+      return true;
+    }
+    if (m_.is_int(value_ty, 64)) *code = is_signed ? kWtI64 : kWtU64;
+    else if (m_.is_int(value_ty, 32) || m_.is_int(value_ty, 16) || m_.is_int(value_ty, 1)) *code = is_signed ? kWtI32 : kWtU32;
+    else return false;
+    return true;
+  };
+  auto constant_arg = [&](uint32_t k, uint64_t* out) { return ins.arg_count > k && constant_int(ins.args[k], out); };
+  const bool narrow_int = m_.is_int(value_ty, 16);
+  uint32_t sub = 0, type = 0, op = 0, sources = 0;
+  bool mask_result = false, aggregate = false, sign_extend = false, wrap = false;
+  uint64_t c1 = 0, c2 = 0;
+  switch (opcode) {
+    case kWaveIsFirstLane: sub = kSubIsFirstLane, mask_result = true; break;
+    case kWaveGetLaneIndex: sub = kSubLaneIndex; break;
+    case kWaveGetLaneCount: sub = kSubLaneCount; break;
+    case kWaveAnyTrue: sub = kSubAnyTrue, sources = 1, mask_result = true; break;
+    case kWaveAllTrue: sub = kSubAllTrue, sources = 1, mask_result = true; break;
+    case kWaveActiveBallot: sub = kSubBallot, sources = 1, aggregate = true; break;
+    case kWaveAllBitCount: sub = kSubCountBits, sources = 1; break;
+    case kWavePrefixBitCount: sub = kSubPrefixCountBits, sources = 1; break;
+    case kQuadVote:
+      if (!constant_arg(2, &c1) || c1 > 1) return error(status::kNotSupported);
+      sub = c1 ? kSubQuadAll : kSubQuadAny, sources = 1, mask_result = true;
+      break;
+    case kWaveActiveAllEqual:
+      if (!type_code(false, &type)) return error(status::kNotSupported);
+      sub = kSubAllEqual, sources = 1, mask_result = true;
+      break;
+    case kWaveReadLaneAt: case kQuadReadLaneAt:
+      if (!type_code(false, &type)) return error(status::kNotSupported);
+      sub = opcode == kWaveReadLaneAt ? kSubReadLaneAt : kSubQuadReadLaneAt, sources = 2;
+      break;
+    case kWaveReadLaneFirst:
+      if (!type_code(false, &type)) return error(status::kNotSupported);
+      sub = kSubReadFirst, sources = 1;
+      break;
+    case kQuadOp:
+      if (!type_code(false, &type) || !constant_arg(2, &c1) || c1 > 2) return error(status::kNotSupported);
+      sub = kSubQuadReadAcross, sources = 1, op = static_cast<uint32_t>(c1) + 1;   // (across X: lane ^ 1, Y: ^ 2, the diagonal: ^ 3)
+      break;
+    case kWaveActiveOp: case kWavePrefixOp:
+      // (op: 0 sum, 1 product, 2 min, 3 max; sop: 0 signed, 1 unsigned)
+      if (!constant_arg(2, &c1) || !constant_arg(3, &c2) || c1 > 3 || c2 > 1 || (opcode == kWavePrefixOp && c1 > 1)) return error(status::kNotSupported);
+      if (!type_code(c2 == 0, &type)) return error(status::kNotSupported);
+      sub = opcode == kWaveActiveOp ? kSubActive : kSubPrefix, sources = 1, op = static_cast<uint32_t>(c1);
+      sign_extend = narrow_int && c2 == 0 && (c1 == 2 || c1 == 3);
+      wrap = narrow_int;
+      break;
+    case kWaveActiveBit:
+      // (op: 0 and, 1 or, 2 xor)
+      if (!constant_arg(2, &c1) || c1 > 2 || !type_code(false, &type)) return error(status::kNotSupported);
+      sub = kSubActive, sources = 1, op = kWoAnd + static_cast<uint32_t>(c1);
+      break;
+    case kWaveMatch:
+      if (!type_code(false, &type)) return error(status::kNotSupported);
+      sub = kSubMatch, sources = 1, aggregate = true;
+      break;
+    case kWaveMultiPrefixOp: {
+      // (value, the mask's four words, op: 0 sum, 1 and, 2 or, 3 xor, 4 product; sop)
+      if (!constant_arg(6, &c1) || !constant_arg(7, &c2) || c1 > 4 || c2 > 1) return error(status::kNotSupported);
+      if (!type_code(c2 == 0, &type)) return error(status::kNotSupported);
+      static constexpr uint32_t kOps[5] = {kWoSum, kWoAnd, kWoOr, kWoXor, kWoProduct};
+      sub = kSubMultiPrefix, sources = 2, op = kOps[c1];
+      wrap = narrow_int;
+      break;
+    }
+    case kWaveMultiPrefixBitCount: sub = kSubMultiPrefixCountBits, sources = 2; break;
+    default: return error(status::kNotSupported);
+  }
+  if (ins.arg_count < 1 + (sources ? 1 : 0)) return error(status::kInvalidParameter);
+  Val value = sources ? use(ins.args[1]) : Val();
+  if (sign_extend) {
+    value = sign_extended_copy(value);
+    if (value.kind == VK::None) return false;
+  }
+  // The second source: the lane (read lane at, quad read lane at) or the mask of the multi-prefix operations, its four words packed into a register.
+  Val second;
+  if (sources == 2) {
+    if (opcode == kWaveMultiPrefixOp || opcode == kWaveMultiPrefixBitCount) {
+      const uint32_t first = opcode == kWaveMultiPrefixOp ? 2 : 2;
+      if (ins.arg_count < first + 4) return error(status::kInvalidParameter);
+      uint32_t reg = 0;
+      if (!alloc_reg(pos_, &reg)) return false;
+      if (!pack(&ins.args[first], 4, reg, true)) return false;
+      second.kind = VK::Agg, second.a = reg;
+    } else {
+      second = use(ins.args[2]);
+    }
+  }
+  Val r;
+  if (aggregate) {
+    r = new_aggregate(ins.result);
+  } else if (type == kWtF64 || type == kWtI64 || type == kWtU64) {
+    r = (opcode == kWaveActiveAllEqual) ? new_scalar(ins.result, true) : new_wide(ins.result);
+  } else {
+    r = new_scalar(ins.result, mask_result);
+  }
+  if (r.kind == VK::None) return false;
+  const uint32_t at = begin(kDxbcWaveFirst + sub, (type | op << 4) << 11);
+  if (aggregate) dst_temp(r.a, 0xF);
+  else dst_scalar(r);
+  if (sources) src(value);
+  if (sources == 2) {
+    if (second.kind == VK::Agg) {   // (the packed mask: x y z w)
+      put(2u | (1u << 2) | (0xE4u << 4) | (1u << 20));
+      put(second.a);
+    } else {
+      src(second);
+    }
+  }
+  put(0x4001u);   // (the site: a 32-bit immediate)
+  put(site);
+  finish(at);
+  if (wrap && r.kind == VK::Temp && !r.wide) {
+    Val mask;
+    mask.kind = VK::Imm, mask.a = 0xFFFFu;
+    word_op(1, r, r, mask);
+  }
+  return define(ins.result, r);
+}
+
 bool Translator::thread_value(const Instruction& ins, uint32_t type, bool dimension) {
   uint64_t axis = 0;
   if (dimension && (ins.arg_count < 2 || !constant_int(ins.args[1], &axis) || axis > 2)) return error(status::kNotSupported);
@@ -2499,6 +2869,20 @@ bool Translator::buffer_load(const Instruction& ins) {
   if (!resource_of(ins.args[1], use(ins.args[1]).a == 0 ? 0 : 1, &h)) return false;
   const bool view = h.a == 0;   // (a shader resource view: t# in place of u#)
   const Resource& r = res_[h.a][h.b];
+  if (r.kind == kKindTypedBuffer) {
+    // (a typed view of a buffer: ld of the element of a Buffer<>, ld_uav_typed of a RWBuffer<>)
+    if (!view) return typed_uav_load(ins, ins.args + 2, 1);
+    const Val index = use(ins.args[2]);
+    const Val out = new_aggregate(ins.result);
+    if (out.kind == VK::None) return false;
+    if (out.c) return error(status::kNotSupported);
+    const uint32_t at = begin(45);   // ld dst, index.xxxx, t#
+    dst_temp(out.a, 0xF);
+    src(index);
+    src_resource(h.c);
+    finish(at);
+    return define(ins.result, out);
+  }
   const bool structured = r.kind == 12;
   if (!structured && r.kind != 11) return error(status::kNotSupported);
   const Val index = use(ins.args[2]);
@@ -2527,6 +2911,7 @@ bool Translator::buffer_store(const Instruction& ins) {
   uint64_t mask = 0;
   if (ins.arg_count < 9 || !resource_of(ins.args[1], 1, &h) || !constant_int(ins.args[8], &mask)) return error(status::kNotSupported);
   const Resource& r = res_[1][h.b];
+  if (r.kind == kKindTypedBuffer) return typed_uav_store(ins, ins.args + 2, 1, ins.args + 4);   // (a RWBuffer<>: store_uav_typed)
   const bool structured = r.kind == 12;
   if (!structured && r.kind != 11) return error(status::kNotSupported);
   mask &= 0xF;
@@ -2572,14 +2957,26 @@ bool Translator::atomic(const Instruction& ins) {
   if (ins.arg_count < 7 || !resource_of(ins.args[1], 1, &h) || !constant_int(ins.args[2], &op)) return error(status::kNotSupported);
   const Resource& r = res_[1][h.b];
   const bool structured = r.kind == 12;
-  if (!structured && r.kind != 11) return error(status::kNotSupported);
   static const uint32_t kImm[] = {180, 181, 182, 183, 187, 186, 189, 188, 184};   // add, and, or, xor, imin, imax, umin, umax, exchange
-  if (op >= sizeof kImm / sizeof kImm[0]) return error(status::kNotSupported);
+  if (op >= sizeof kImm / sizeof kImm[0] || !m_.is_int(ins.type, 32)) return error(status::kNotSupported);
   const Val c0 = use(ins.args[3]), value = use(ins.args[6]);
   const Val r_out = new_scalar(ins.result);
   if (r_out.kind == VK::None) return false;
   uint32_t scratch = 0;
   if (!alloc_reg(pos_, &scratch)) return false;
+  if (!structured && r.kind != 11) {
+    // (a typed view of a texture or a buffer: the coordinate)
+    if (buffer_kind(r.kind) && r.kind != kKindTypedBuffer) return error(status::kNotSupported);
+    if (!pack(&ins.args[3], 3, scratch, true)) return false;
+    const uint32_t at = begin(kImm[op]);
+    dst_scalar(r_out);
+    put((30u << 12) | (1u << 20)), put(h.c);
+    put(2u | (1u << 2) | (0xE4u << 4) | (1u << 20));
+    put(scratch);
+    src(value);
+    finish(at);
+    return define(ins.result, r_out);
+  }
   {
     const uint32_t at = begin(54);   // the address: the index in x (and the offset in y of a structured buffer)
     dst_temp(scratch, 1);
@@ -2615,6 +3012,72 @@ bool Translator::shared_pointer(uint32_t id, Val* out) {
   }
   *out = use(id);
   return out->kind == VK::Ptr;
+}
+
+// atomicrmw / cmpxchg on a word of group-shared memory (InterlockedAdd .. on groupshared): imm_atomic_* g#, the byte address. A cmpxchg's result is {the old value, whether it
+// was the compare value}: a register with the old value in x and the flag (a mask) in y.
+bool Translator::shared_atomic(const Instruction& ins) {
+  Val ptr;
+  if (!shared_pointer(ins.operands[0], &ptr)) return error(status::kInvalidParameter);
+  const bool exchange = ins.op == Op::CmpXchg;
+  const uint32_t value_ty = value_type(ins.operands[1]);
+  if (!m_.is_int(value_ty, 32)) return error(status::kNotSupported);
+  // (LLVM's operations: 0 xchg, 1 add, 2 sub, 3 and, 4 nand, 5 or, 6 xor, 7 max, 8 min, 9 umax, 10 umin; sub is an add of the negated value, nand has no DXBC form)
+  static constexpr uint32_t kImm[11] = {184, 180, 180, 181, 0, 182, 183, 186, 187, 188, 189};
+  if (!exchange && (ins.code > 10 || !kImm[ins.code])) return error(status::kNotSupported);
+  Val address = shared_address(ptr);
+  if (address.kind == VK::None) return false;
+  Val out;
+  if (exchange) {
+    out.kind = VK::Agg;
+    if (!alloc_reg(last_use_of(ins.result), &out.a)) return false;
+  } else {
+    out = new_scalar(ins.result);
+    if (out.kind == VK::None) return false;
+  }
+  Val value = use(ins.operands[exchange ? 2 : 1]);
+  if (!exchange && ins.code == 2) {   // (sub: add the two's complement)
+    Val negated = scratch_word();
+    if (negated.kind == VK::None) return false;
+    word_op1(40, negated, value);
+    value = negated;
+  }
+  Val old;
+  old.kind = VK::Temp, old.a = out.a, old.b = exchange ? 0 : out.b;
+  const uint32_t at = begin(exchange ? 185 : kImm[ins.code]);
+  dst_scalar(old);
+  put((31u << 12) | (1u << 20)), put(ptr.a);
+  src(address);
+  if (exchange) src(use(ins.operands[1]));
+  src(value);
+  finish(at);
+  if (exchange) {   // (the flag: the old value was the compare value)
+    Val flag;
+    flag.kind = VK::Temp, flag.a = out.a, flag.b = 1;
+    word_op(32, flag, old, use(ins.operands[1]));
+  }
+  return define(ins.result, out);
+}
+
+// The byte address of a group-shared pointer (4 * its index): a literal, or a register it is worked out in.
+Val Translator::shared_address(const Val& ptr) {
+  Val address;
+  const Constant* c = constant(ptr.c);
+  if (c && (c->kind == ConstantKind::Int || c->kind == ConstantKind::Null)) {
+    address.kind = VK::Imm, address.a = static_cast<uint32_t>((c->kind == ConstantKind::Null ? 0 : c->bits) * 4);
+    return address;
+  }
+  uint32_t reg = 0, comp = 0;
+  if (!alloc_scalar(pos_, &reg, &comp)) return Val();
+  address.kind = VK::Temp, address.a = reg, address.b = comp;
+  const Val index = use(ptr.c);
+  Val two;
+  two.kind = VK::Imm, two.a = 2;
+  const uint32_t at = begin(41);   // ishl address, index, 2
+  dst_scalar(address);
+  src(index), src(two);
+  finish(at);
+  return address;
 }
 
 bool Translator::shared_access(const Instruction& ins, bool store) {
@@ -2733,6 +3196,10 @@ bool Translator::dx_call(const Instruction& ins) {
       v.kind = VK::Sys, v.a = kOperandViewId, v.b = 0;
       return define(ins.result, v);
     }
+    case kWaveIsFirstLane: case kWaveGetLaneIndex: case kWaveGetLaneCount: case kWaveAnyTrue: case kWaveAllTrue: case kWaveActiveAllEqual: case kWaveActiveBallot: case kWaveReadLaneAt:
+    case kWaveReadLaneFirst: case kWaveActiveOp: case kWaveActiveBit: case kWavePrefixOp: case kQuadReadLaneAt: case kQuadOp: case kWaveAllBitCount: case kWavePrefixBitCount:
+    case kWaveMatch: case kWaveMultiPrefixOp: case kWaveMultiPrefixBitCount: case kQuadVote:
+      return wave(ins, static_cast<uint32_t>(opcode));
     case kIsHelperLane: {   // (a pixel shader's: whether this run is for a neighbour's sake; the other stages have no helpers: 0)
       Val v;
       v.kind = VK::Sys, v.a = kOperandHelperLane, v.b = 0;
@@ -2785,6 +3252,14 @@ bool Translator::dx_call(const Instruction& ins) {
       Val agg;
       agg.kind = VK::Agg, agg.a = d.a, agg.b = d.b;
       return define(ins.result, agg);
+    }
+    case kLegacyF32ToF16: case kLegacyF16ToF32: {   // (f32tof16 / f16tof32: the half in the low 16 bits of a 32-bit integer, and back)
+      if (ins.arg_count < 2) return error(status::kNotSupported);
+      const Val a = use(ins.args[1]);
+      const Val r = new_scalar(ins.result);
+      if (r.kind == VK::None) return false;
+      word_op1(opcode == kLegacyF32ToF16 ? 130 : 131, r, a);
+      return define(ins.result, r);
     }
     case kFAbs: return unary(ins, 54, 1, 2);
     case kSaturate: return unary(ins, 54, 1, 0, true);
@@ -2842,6 +3317,28 @@ bool Translator::dx_call(const Instruction& ins) {
     case kSampleLevel: return with_array(ins, [&] { return sample(ins, true); });
     case kSampleBias: case kSampleGrad: return with_array(ins, [&] { return sample_bias_grad(ins, opcode == kSampleGrad); });
     case kTextureLoad: return with_array(ins, [&] { return texture_load(ins); });
+    case kTextureStore:   // (TextureStore: handle, the coordinate's three, the four values, the mask)
+      if (ins.arg_count < 9) return error(status::kNotSupported);
+      return typed_uav_store(ins, ins.args + 2, 3, ins.args + 5);
+    case kGetDimensions: return get_dimensions(ins);
+    case kAtomicCompareExchange: return atomic_compare_exchange(ins);
+    case kBufferUpdateCounter: {
+      // (IncrementCounter / DecrementCounter, Append / Consume: imm_atomic_alloc - the value before - or imm_atomic_consume - the value after - of the view's hidden counter)
+      Val h;
+      int64_t step = 0;
+      uint64_t raw_step = 0;
+      if (ins.arg_count < 3 || !resource_of(ins.args[1], 1, &h) || !constant_int(ins.args[2], &raw_step)) return error(status::kNotSupported);
+      step = static_cast<int8_t>(raw_step & 0xFF);
+      const Resource& r = res_[1][h.b];
+      if (r.kind != kKindStructuredBuffer || !r.counter || (step != 1 && step != -1)) return error(status::kNotSupported);
+      const Val out = new_scalar(ins.result);
+      if (out.kind == VK::None) return false;
+      const uint32_t at = begin(step > 0 ? 178 : 179);
+      dst_scalar(out);
+      put((30u << 12) | (1u << 20)), put(h.c);
+      finish(at);
+      return define(ins.result, out);
+    }
     case kTextureGather: return with_array(ins, [&] { return texture_gather(ins, false); });
     case kTextureGatherCmp: return with_array(ins, [&] { return texture_gather(ins, true); });
     case kCalculateLod: return calculate_lod(ins);
@@ -2852,6 +3349,19 @@ bool Translator::dx_call(const Instruction& ins) {
     case kFlattenedThreadIdInGroup: return thread_value(ins, 36, false);
     case kBufferLoad: return buffer_load(ins);
     case kBufferStore: return buffer_store(ins);
+    case kRawBufferLoad: case kRawBufferStore: {
+      // (Shader Model 6.2's loads and stores of raw and structured buffers: bufferLoad's and bufferStore's arguments, then a mask and the alignment - of 32-bit elements; the
+      // 16- and 64-bit ones, whose elements are not words, are not taken)
+      const uint32_t element = opcode == kRawBufferLoad ? 0 : ins.arg_count > 4 ? value_type(ins.args[4]) : 0;
+      if (opcode == kRawBufferStore ? !(float32(element) && !half_type(element)) && !m_.is_int(element, 32) : false) return error(status::kNotSupported);
+      if (opcode == kRawBufferLoad) {
+        const uint32_t ret = ins.type;   // (the ResRet: its first element's type)
+        const uint32_t first = ret < m_.types.count() && m_.types[ret].kind == TypeKind::Struct && m_.types[ret].first < m_.type_refs.count() ? m_.type_refs[m_.types[ret].first] : 0;
+        if (!(float32(first) && !half_type(first)) && !m_.is_int(first, 32)) return error(status::kNotSupported);
+        return buffer_load(ins);
+      }
+      return buffer_store(ins);
+    }
     case kAtomicBinOp: return atomic(ins);
     case kBarrier: {
       uint64_t mode = 0;
@@ -2962,12 +3472,30 @@ NtStatus Translator::read_metadata() {
       meta_int(operand_of(node, 6), &extra);
       if (id >= kMaxResources || space != 0) return status::kNotSupported;
       Resource& r = res_[cls][id];
-      // (a structured buffer's element size: the tag 1 of the node's tags, the last operand)
+      // (a structured buffer's element size: the tag 1 of the node's tags, the last operand; a typed view's component type: tag 0)
       const Meta* tags = operand_of(node, cls == 1 ? 10 : cls == 0 ? 8 : 99);
       for (uint32_t k = 0; tags && k + 1 < tags->count; k += 2) {
         uint64_t tag = 0, value = 0;
         if (meta_int(operand_of(tags, k), &tag) && tag == 1 && meta_int(operand_of(tags, k + 1), &value)) r.stride = static_cast<uint32_t>(value);
+        if (meta_int(operand_of(tags, k), &tag) && tag == 0 && meta_int(operand_of(tags, k + 1), &value)) r.element = static_cast<uint32_t>(value);
       }
+      // (a typed view's element: the struct the resource's variable points to holds one of it - a float, an integer whose sign the struct's name says, or a vector of
+      // them -; it decides the declaration's return type, element is then 9 (F32), 4 (I32) or 5 (U32))
+      if (const Meta* var = operand_of(node, 1); var && var->kind == MetaKind::Value && cls < 2) {
+        const Type* ptr = m_.type_at(value_type(var->value));
+        const Type* st = ptr && ptr->kind == TypeKind::Pointer ? m_.type_at(ptr->first) : nullptr;
+        if (st && st->kind == TypeKind::Struct && st->count >= 1 && st->first < m_.type_refs.count()) {
+          uint32_t el = m_.type_refs[st->first];
+          const Type* et = m_.type_at(el);
+          if (et && et->kind == TypeKind::Vector) el = et->first;
+          if (m_.is_float(el)) r.element = 9;
+          else if (m_.is_int(el)) r.element = st->signed_name ? 4 : 5;
+        }
+      }
+      // (a shader resource view's sample count, operand 7; an unordered access view's counter, operand 8)
+      uint64_t samples = 0, counter = 0;
+      if (cls == 0 && meta_int(operand_of(node, 7), &samples)) r.samples = static_cast<uint32_t>(samples);
+      if (cls == 1 && meta_int(operand_of(node, 8), &counter)) r.counter = counter != 0;
       r.present = true, r.id = static_cast<uint32_t>(id), r.lower = static_cast<uint32_t>(lower), r.size = static_cast<uint32_t>(size);
       if (cls == 2) r.bytes = static_cast<uint32_t>(extra);
       else r.kind = static_cast<uint32_t>(extra);
@@ -3133,6 +3661,20 @@ NtStatus Translator::run(uint32_t program_kind, ConstByteView isg1, ConstByteVie
   // --- the declarations and the program
   ByteBuffer decl(allocator_);
   auto word = [&](uint32_t w) { return decl.put32(w); };
+  // An unordered access view's declaration: a raw or structured buffer (u# below `buffer_slots`), or a typed view of a texture or a buffer (dcl_uav_typed: a storage image of the
+  // kernel, below kMaxStorageImages) of the dimensions the DXBC front end takes - not cubes or multisampled ones.
+  auto declare_uav = [&](const Resource& r, uint32_t buffer_slots) {
+    if (r.kind == kKindStructuredBuffer || r.kind == kKindRawBuffer) {
+      if (r.lower >= buffer_slots) return false;
+      if (r.kind == kKindStructuredBuffer) word(158u | (4u << 24)), word((30u << 12) | (1u << 20)), word(r.lower), word(r.stride);
+      else word(157u | (3u << 24)), word((30u << 12) | (1u << 20)), word(r.lower);
+      return true;
+    }
+    const uint32_t dimension = sm5_dimension(r.kind);
+    if (!dimension || dimension == 4 || dimension == 6 || dimension == 10 || r.counter || r.lower >= graphics::kMaxStorageImages) return false;
+    word(156u | (dimension << 11) | (4u << 24)), word((30u << 12) | (1u << 20)), word(r.lower), word(return_type_word(r.element));
+    return true;
+  };
   if (program_kind == 3) {
     // a phase of a hull shader: its declarations (the control point function: the inputs, the output control point number, the outputs; the patch constant function: the outputs), the
     // temporaries and the code
@@ -3154,11 +3696,7 @@ NtStatus Translator::run(uint32_t program_kind, ConstByteView isg1, ConstByteVie
       }
       for (uint32_t i = 0; i < kMaxResources; ++i) {   // (and the unordered access views of both)
         const Resource& r = res_[1][i];
-        if (!r.present) continue;
-        if (r.lower >= graphics::kMaxUavBuffers) return status::kNotSupported;
-        if (r.kind == 12) word(158u | (4u << 24)), word((30u << 12) | (1u << 20)), word(r.lower), word(r.stride);
-        else if (r.kind == 11) word(157u | (3u << 24)), word((30u << 12) | (1u << 20)), word(r.lower);
-        else return status::kNotSupported;
+        if (r.present && !declare_uav(r, graphics::kMaxUavBuffers)) return status::kNotSupported;
       }
       if (points_in < 1 || points_in > graphics::kMaxPatchControlPoints) return status::kNotSupported;
       for (uint32_t i = 0; i < input_count_; ++i) {
@@ -3236,21 +3774,13 @@ NtStatus Translator::run(uint32_t program_kind, ConstByteView isg1, ConstByteVie
       if (shared_used_[k]) word(159u | (4u << 24)), word((31u << 12) | (1u << 20)), word(k), word(shared_bytes_[k]);
     for (uint32_t i = 0; i < kMaxResources; ++i) {
       const Resource& r = res_[1][i];
-      if (!r.present) continue;
-      if (r.lower >= graphics::kMaxStorageBuffers) return status::kNotSupported;
-      if (r.kind == 12) word(158u | (4u << 24)), word((30u << 12) | (1u << 20)), word(r.lower), word(r.stride);
-      else if (r.kind == 11) word(157u | (3u << 24)), word((30u << 12) | (1u << 20)), word(r.lower);
-      else return status::kNotSupported;
+      if (r.present && !declare_uav(r, graphics::kMaxStorageBuffers)) return status::kNotSupported;
     }
   } else if (pixel || vertex || geometry || domain) {
     // (a pixel, vertex, geometry or domain shader's unordered access views: buffers it writes)
     for (uint32_t i = 0; i < kMaxResources; ++i) {
       const Resource& r = res_[1][i];
-      if (!r.present) continue;
-      if (r.lower >= graphics::kMaxUavBuffers) return status::kNotSupported;
-      if (r.kind == 12) word(158u | (4u << 24)), word((30u << 12) | (1u << 20)), word(r.lower), word(r.stride);
-      else if (r.kind == 11) word(157u | (3u << 24)), word((30u << 12) | (1u << 20)), word(r.lower);
-      else return status::kNotSupported;
+      if (r.present && !declare_uav(r, graphics::kMaxUavBuffers)) return status::kNotSupported;
     }
   } else {
     for (uint32_t i = 0; i < kMaxResources; ++i)
@@ -3276,12 +3806,19 @@ NtStatus Translator::run(uint32_t program_kind, ConstByteView isg1, ConstByteVie
       else word(161u | (3u << 24)), word((7u << 12) | (1u << 20)), word(r.lower);
       continue;
     }
-    // (the kind: 2 texture 2D, 4 texture 3D, 5 cube, 7 2D array, 9 cube array - SM5's dimensions 3, 5, 6, 8 and 10)
-    const uint32_t dimension = r.kind == 2 ? 3 : r.kind == 4 ? 5 : r.kind == 5 ? 6 : r.kind == 7 ? 8 : r.kind == 9 ? 10 : 0;
+    // (a texture of any kind but a multisampled array - SM5's dimensions, sm5_dimension -, a multisampled one with its sample count; a typed view of a buffer, Buffer<>: the
+    // read-only image slot after the u# ones; the return type is the view's component type)
+    const uint32_t dimension = sm5_dimension(r.kind);
+    if (dimension == 1) {
+      if (r.lower >= graphics::kMaxTexelBufferViews || (r.size != 1 && r.size != 0xFFFFFFFFu && r.size != 0)) return status::kNotSupported;
+      word(88u | (1u << 11) | (4u << 24)), word(2u | (1u << 2) | (0xE4u << 4) | (7u << 12) | (1u << 20)), word(r.lower), word(return_type_word(r.element));
+      continue;
+    }
     const uint32_t elements = r.size != 0xFFFFFFFFu && r.size >= 1 && r.size <= 8 ? r.size : 1;   // (an array: every element is declared)
-    if (!dimension || r.lower >= graphics::kMaxTextureUnits || elements > graphics::kMaxTextureUnits - r.lower) return status::kNotSupported;
+    if (!dimension || r.lower >= graphics::kMaxTextureUnits || elements > graphics::kMaxTextureUnits - r.lower || (dimension == 4 && (r.samples < 1 || r.samples > 32))) return status::kNotSupported;
+    const uint32_t samples = dimension == 4 ? r.samples << 16 : 0;
     for (uint32_t e = 0; e < elements; ++e)
-      word(88u | (dimension << 11) | (4u << 24)), word(2u | (1u << 2) | (0xE4u << 4) | (7u << 12) | (1u << 20)), word(r.lower + e), word(0x5555u);
+      word(88u | (dimension << 11) | samples | (4u << 24)), word(2u | (1u << 2) | (0xE4u << 4) | (7u << 12) | (1u << 20)), word(r.lower + e), word(return_type_word(r.element));
   }
   for (uint32_t i = 0; i < input_count_; ++i) {
     const SigElement& e = inputs_[i];

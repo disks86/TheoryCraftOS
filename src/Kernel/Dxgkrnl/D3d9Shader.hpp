@@ -100,7 +100,10 @@ class D3d9Program {
     for (uint32_t b : shared_bytes_) total += b;
     return total;
   }
-  bool needs_group() const { return uses_barrier_ || shared_total_bytes() != 0; }
+  // (a program with wave operations is run a group at a time too, a wave of its threads together; one with barriers or shared memory keeps the whole group's threads at once)
+  bool needs_group() const { return keeps_group() || uses_wave_; }
+  bool keeps_group() const { return uses_barrier_ || shared_total_bytes() != 0; }
+  bool uses_wave() const { return uses_wave_; }   // (Shader Model 6 wave or quad operations: the lanes of a wave are run together, see WaveRunner in D3d9Shader.cpp)
   void run_compute_group(const graphics::ComputeContext& context, const uint8_t* constants) const;
   uint32_t thread_group(uint32_t axis) const { return axis < 3 ? thread_group_[axis] : 1; }
   BufferKind storage_kind(uint32_t slot) const { return slot < graphics::kMaxStorageBuffers ? uav_kind_[slot] : BufferKind::None; }
@@ -192,6 +195,11 @@ class D3d9Program {
   friend class D3d9Writer;
   struct State;
   void execute(State& s, uint64_t begin = 0, uint64_t end = ~uint64_t{0}) const;
+  // The lane model of the wave operations (WaveRunner in D3d9Shader.cpp): the lanes of one wave run together until each has ended or stopped at a barrier, and the results of a wave
+  // operation for the lanes that are at it.
+  void run_wave(ArrayView<State* const> lanes) const;
+  static void wave_compute(const Instruction& ins, ArrayView<State* const> group);
+  bool run_fragment_wave(const graphics::Vec4* varyings, const graphics::FragmentContext& context, const uint8_t* constants, const graphics::ITextureSet* textures, graphics::Vec4* color) const;
 
   allocators::IAllocator& allocator_;
   graphics::ShaderStage stage_ = graphics::ShaderStage::Vertex;
@@ -217,6 +225,7 @@ class D3d9Program {
   uint32_t uav_stride_[graphics::kMaxStorageBuffers + graphics::kMaxSharedMemories] = {};
   uint32_t shared_bytes_[graphics::kMaxSharedMemories] = {};
   bool uses_barrier_ = false;
+  bool uses_wave_ = false;
   uint32_t texture_unit_mask_ = 0, attributes_used_ = 0;
   ImageDim image_dim_[graphics::kMaxImageSlots] = {};
   ImageReturn image_return_[graphics::kMaxImageSlots] = {};

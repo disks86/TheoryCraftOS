@@ -412,7 +412,12 @@ static HRESULT STDMETHODCALLTYPE dev_CheckFeatureSupport(Dev *This, D3D12_FEATUR
     case D3D12_FEATURE_SHADER_MODEL: {
       D3D12_FEATURE_DATA_SHADER_MODEL *s = data;
       if (size != sizeof *s) return E_INVALIDARG;
-      if (s->HighestShaderModel > D3D_SHADER_MODEL_5_1) s->HighestShaderModel = D3D_SHADER_MODEL_5_1;
+      /* (the highest model the kernel's DXIL translator takes everything of, on this device: 6.0's wave operations need its lane model - the CPU renderer's -, and 6.1 has only
+       * SV_ViewID - 0 without view instancing -, SV_Barycentrics and GetAttributeAtVertex - optional, OPTIONS3 - besides; 6.2 asks for fp32 denormals flushed or kept as the
+       * shader says, which the interpreter does not do. virgl's TGSI has no wave operations: 5.1 there) */
+      const D3D_SHADER_MODEL highest = (This->caps.features3 & DEV_FEATURE3_WAVE_OPS) ? D3D_SHADER_MODEL_6_1 : D3D_SHADER_MODEL_5_1;
+      if (s->HighestShaderModel < D3D_SHADER_MODEL_5_1) return E_INVALIDARG;
+      if (s->HighestShaderModel > highest) s->HighestShaderModel = highest;
       return S_OK;
     }
     case D3D12_FEATURE_ROOT_SIGNATURE: {
@@ -426,7 +431,17 @@ static HRESULT STDMETHODCALLTYPE dev_CheckFeatureSupport(Dev *This, D3D12_FEATUR
       D3D12_FEATURE_DATA_D3D12_OPTIONS1 *o = data;
       if (size != sizeof *o) return E_INVALIDARG;
       memset(o, 0, sizeof *o);
-      o->TotalLaneCount = 1;
+      /* (the wave operations where the kernel's device runs them - the CPU renderer's waves: a pixel shader's quad of 4 lanes, 32 lanes of a compute group -, one wave at a time;
+       * the 64-bit integer operations of the DXIL translator: arithmetic, shifts, comparisons, conversions, minimum and maximum, the wave operations) */
+      if (This->caps.features3 & DEV_FEATURE3_WAVE_OPS) {
+        o->WaveOps = TRUE;
+        o->WaveLaneCountMin = DEV_WAVE_LANES_MIN;
+        o->WaveLaneCountMax = DEV_WAVE_LANES_MAX;
+        o->TotalLaneCount = DEV_WAVE_LANES_MAX;
+        o->Int64ShaderOps = TRUE;
+      } else {
+        o->TotalLaneCount = 1;
+      }
       return S_OK;
     }
     case D3D12_FEATURE_COMMAND_QUEUE_PRIORITY: {

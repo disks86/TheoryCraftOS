@@ -343,7 +343,19 @@ class ModuleBuilder final : public BitstreamVisitor {
 
   // --- types
   bool type_record(uint32_t code, ArrayView<const uint64_t> ops) {
-    if (code == 1 || code == 19) return true;   // NUMENTRY, STRUCT_NAME
+    if (code == 1) return true;   // NUMENTRY
+    if (code == 19) {   // STRUCT_NAME [characters]: for the struct that follows, whether it names a signed integer element
+      bool has_int = false, has_unsigned = false;
+      for (uint64_t i = 0; i + 2 < ops.size(); ++i) {
+        if (ops[i] == 'i' && ops[i + 1] == 'n' && ops[i + 2] == 't') {
+          has_int = true;
+          if (i > 0 && ops[i - 1] == 'u') has_unsigned = true;   // (uint, min16uint, uint64_t)
+        }
+        if (i + 7 < ops.size() && ops[i] == 'u' && ops[i + 1] == 'n' && ops[i + 2] == 's' && ops[i + 3] == 'i' && ops[i + 4] == 'g' && ops[i + 5] == 'n' && ops[i + 6] == 'e' && ops[i + 7] == 'd') has_unsigned = true;
+      }
+      pending_signed_ = has_int && !has_unsigned;
+      return true;
+    }
     Type t;
     switch (code) {
       case 2: t.kind = TypeKind::Void; break;
@@ -367,6 +379,8 @@ class ModuleBuilder final : public BitstreamVisitor {
       case 18: case 20: {   // STRUCT_ANON / STRUCT_NAMED [packed, elements...]
         if (ops.size() < 1) return fail(status::kInvalidParameter);
         t.kind = TypeKind::Struct, t.count = static_cast<uint32_t>(ops.size() - 1), t.first = static_cast<uint32_t>(m_.type_refs.count());
+        t.signed_name = code == 20 && pending_signed_;
+        pending_signed_ = false;
         for (uint64_t i = 1; i < ops.size(); ++i)
           if (!m_.type_refs.push_back(static_cast<uint32_t>(ops[i]))) return fail(status::kNoMemory);
         break;
@@ -712,6 +726,28 @@ class ModuleBuilder final : public BitstreamVisitor {
         }
         return push_instruction(ins, true);
       }
+      case 38: {  // ATOMICRMW [pointer (and type), value, operation, volatile, ordering, synchronisation scope]
+        ins.op = Op::AtomicRmw;
+        if (!operand(ops, &at, &ins.operands[0], true) || !operand(ops, &at, &ins.operands[1], false) || at >= ops.size()) return fail(status::kInvalidParameter);
+        ins.code = static_cast<uint32_t>(ops[at]);
+        ins.type = type_of(ins.operands[1]);
+        return push_instruction(ins, true);
+      }
+      case 46: {  // CMPXCHG [pointer (and type), compare (and type), new value, volatile, success ordering, scope, failure ordering, weak]
+        ins.op = Op::CmpXchg;
+        if (!operand(ops, &at, &ins.operands[0], true) || !operand(ops, &at, &ins.operands[1], true) || !operand(ops, &at, &ins.operands[2], false)) return fail(status::kInvalidParameter);
+        // (the result is the struct {the value's type, i1}: the module's type table has it)
+        const uint32_t value_type = type_of(ins.operands[1]), flag = bool_type();
+        ins.type = value_type;
+        for (uint64_t i = 0; i < m_.types.count(); ++i) {
+          const Type& t = m_.types[i];
+          if (t.kind == TypeKind::Struct && t.count == 2 && t.first + 1 < m_.type_refs.count() && m_.type_refs[t.first] == value_type && m_.type_refs[t.first + 1] == flag) {
+            ins.type = static_cast<uint32_t>(i);
+            break;
+          }
+        }
+        return push_instruction(ins, true);
+      }
       case 44: {  // STORE [pointer, value, alignment, volatile]
         ins.op = Op::Store;
         if (!operand(ops, &at, &ins.operands[0], true) || !operand(ops, &at, &ins.operands[1], true)) return fail(status::kInvalidParameter);
@@ -725,6 +761,7 @@ class ModuleBuilder final : public BitstreamVisitor {
   List<uint32_t> stack_;
   NtStatus status_ = status::kSuccess;
   uint32_t current_type_ = 0;
+  bool pending_signed_ = false;   // (the last STRUCT_NAME said a signed integer)
   uint64_t next_body_ = 0, current_ = 0;
   uint32_t instruction_number_ = 0;
   bool block_open_ = false, module_values_set_ = false, module_done_ = false;

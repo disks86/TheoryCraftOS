@@ -73,6 +73,14 @@ enum OperandType : uint32_t { kOpOutputControlPointId = 22, kOpForkInstanceId = 
 
 // Where a program made from DXBC keeps what it has no register for: its literals, and the immediate constant buffer (declared in the program) as constants of its own.
 constexpr uint16_t kLiteralBase = 0x4000, kImmediateBufferBase = 0x6000;
+// Opcodes no DXBC shader has, which the DXIL translator writes for Shader Model 6's wave operations: kDxbcWaveFirst + (the IR op - kWaveFirst), control (bits 11 - 18) the IR's control,
+// then the destination, the sources and a 32-bit immediate, the site (see kWaveFirst in D3d9Decoded.hpp).
+constexpr uint32_t kDxbcWaveFirst = 0x700, kDxbcWaveLast = kDxbcWaveFirst + (kWaveLast - kWaveFirst);
+// ... and around each copy of a block that ends the program (a return block it puts in each branch that leaves): kDxbcTailBegin, a 32-bit immediate (the block's number), then the
+// copy's instructions, then kDxbcTailEnd. Neither is an instruction: they set Instruction::tail of those between.
+constexpr uint32_t kDxbcTailBegin = 0x7F0, kDxbcTailEnd = 0x7F1;
+// How many sources each takes (after the destination, before the site).
+constexpr uint8_t kWaveSources[kWaveLast - kWaveFirst + 1] = {0, 0, 0, 1, 1, 1, 1, 2, 1, 1, 1, 1, 1, 2, 1, 1, 2, 2, 1, 1};
 constexpr uint32_t kMaxImmediateBuffer = 512, kMaxConstantBuffers = 14;
 
 struct Operand {
@@ -1157,9 +1165,12 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
   };
   List<LoopFrame> loops(allocator);
   List<uint64_t> pending_exits(allocator), pending_continues(allocator);   // (loop depth << 32) | instruction index
+  uint32_t tail_block = 0, tail_start = 0;   // (kDxbcTailBegin: the block + 1 of the copy being read, and where its instructions began)
   auto emit = [&](Instr& ins) -> NtStatus {
     if (program->code_.count() >= kMaxInstructions) return status::kNotSupported;
     const uint32_t index = static_cast<uint32_t>(program->code_.count());
+    ins.tail = tail_block;
+    ins.tail_at = tail_block ? index - tail_start : 0;
     if (ins.op == kLoopBegin) {
       if (loops.count() >= kMaxNesting || !loops.push_back({index, static_cast<uint32_t>(open_ifs.count())})) return status::kNotSupported;
     } else if (ins.op == kLoopEnd) {
@@ -1398,8 +1409,8 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
   // --- the instructions
   while (!in.at_end()) {
     if (feedback_unchecked) return status::kNotSupported;   // (a status of a buffer or storage image load: those reads have no residency feedback here)
-    if (returned) return status::kNotSupported;   // (code after a ret)
     const uint32_t token = in.le32();
+    if (returned && (token & 0x7FF) != kDxbcTailEnd) return status::kNotSupported;   // (code after a ret; the end of the copy of a return block it ends may follow)
     uint32_t words = (token >> 24) & 0x7F;
     const uint32_t raw_opcode = token & 0x7FF;
     FeedbackForm form;
@@ -1477,6 +1488,49 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
       p = ByteReader(plain_operands.view());
       if (feedback_status.type != kOpNull && (feedback_status.type != kOpTemp || feedback_status.components != 2)) return status::kNotSupported;
       feedback_unchecked = true;
+    }
+    if (opcode == kDxbcTailBegin || opcode == kDxbcTailEnd) {
+      // (a copy of a return block begins or ends)
+      if (opcode == kDxbcTailEnd) {
+        if (!tail_block || !p.at_end()) return status::kInvalidParameter;
+        tail_block = 0;
+        continue;
+      }
+      Operand block;
+      if ((s = read_operand(p, &block)) != status::kSuccess) return s;
+      if (tail_block || !p.at_end() || block.type != kOpImmediate || block.components != 1 || __builtin_bit_cast(uint32_t, block.imm[0]) == ~0u) return status::kInvalidParameter;
+      tail_block = __builtin_bit_cast(uint32_t, block.imm[0]) + 1;
+      tail_start = static_cast<uint32_t>(program->code_.count());
+      continue;
+    }
+    if (opcode >= kDxbcWaveFirst && opcode <= kDxbcWaveLast) {
+      // (a wave operation: Shader Model 6's, from the DXIL translator)
+      Instr w;
+      w.op = static_cast<uint16_t>(kWaveFirst + (opcode - kDxbcWaveFirst));
+      w.control = static_cast<uint8_t>((token >> 11) & 0xFF);
+      Operand d, site;
+      if ((s = read_operand(p, &d)) != status::kSuccess || (s = to_dst(d, &w.dst)) != status::kSuccess) return s;
+      const uint8_t sources = kWaveSources[opcode - kDxbcWaveFirst];
+      for (uint32_t k = 0; k < sources; ++k) {
+        Operand o;
+        if ((s = read_operand(p, &o)) != status::kSuccess || (s = to_src(o, &w.src[k])) != status::kSuccess) return s;
+      }
+      w.src_count = sources;
+      if ((s = read_operand(p, &site)) != status::kSuccess) return s;
+      if (!p.at_end() || site.type != kOpImmediate || site.components != 1 || w.dst.type != kTemp) return status::kInvalidParameter;
+      w.stride = __builtin_bit_cast(uint32_t, site.imm[0]);
+      const uint8_t type = w.control & 0xF, operation = w.control >> 4;
+      const bool typed = w.op == kWaveAllEqual || w.op == kWaveReadLaneAt || w.op == kWaveReadFirst || w.op == kWaveActive || w.op == kWavePrefix || w.op == kQuadReadLaneAt ||
+                         w.op == kQuadReadAcross || w.op == kWaveMatch || w.op == kWaveMultiPrefix;
+      if (typed && type > kWaveU64) return status::kInvalidParameter;
+      if ((w.op == kWaveActive || w.op == kWavePrefix || w.op == kWaveMultiPrefix) && operation > kWaveXor) return status::kInvalidParameter;
+      if (w.op == kQuadReadAcross && (operation < 1 || operation > 3)) return status::kInvalidParameter;
+      const bool later = w.op == kWaveMatch || w.op == kWaveMultiPrefix || w.op == kWaveMultiPrefixCountBits || w.op == kQuadAny || w.op == kQuadAll;
+      program->extra_features3_ |= later ? graphics::kFeature3WaveMatch | graphics::kFeature3WaveOps : graphics::kFeature3WaveOps;
+      program->uses_wave_ = true;
+      if (pixel) program->uses_system_values_ = true;   // (the function with the FragmentContext: the quad)
+      if ((s = emit(w)) != status::kSuccess) return s;
+      continue;
     }
     switch (opcode) {
       case 0xEA: {
@@ -2307,7 +2361,7 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
     if (s != status::kSuccess) return s;
   }
   if (feedback_unchecked) return status::kNotSupported;
-  if (open_ifs.count() || loops.count()) return status::kInvalidParameter;
+  if (open_ifs.count() || loops.count() || tail_block) return status::kInvalidParameter;
   {
     uint32_t total = 0;
     for (uint32_t size : cb_size) total += size;
@@ -2316,7 +2370,7 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
     program->color_outputs_ = color_outputs;
   }
   if (compute && (!thread_group_declared || program->code_.count() == 0)) return status::kInvalidParameter;
-  if (compute && program->needs_group() && program->thread_group_[0] * program->thread_group_[1] * program->thread_group_[2] > graphics::kMaxBarrierThreads) return status::kNotSupported;   // (a thread that waits keeps registers of its own)
+  if (compute && program->keeps_group() && program->thread_group_[0] * program->thread_group_[1] * program->thread_group_[2] > graphics::kMaxBarrierThreads) return status::kNotSupported;   // (a thread that waits keeps registers of its own)
   if (geometry && (!geometry_input_declared || !geometry_output_declared || program->geometry_max_vertices_ == 0)) return status::kInvalidParameter;
   if (geometry) {
     program->geometry_streams_ = streams_declared ? streams_declared : 1;

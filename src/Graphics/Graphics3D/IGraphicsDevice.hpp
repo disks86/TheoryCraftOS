@@ -594,8 +594,12 @@ struct FragmentContext {
   // (With coarse shading the quad is one of coarse pixels.) `quad_bary_fn`, when there is one, gives the barycentrics of a corner: perspective-correct, then linear.
   using QuadFn = void (*)(const void* user, uint32_t corner, Vec4* varyings, Vec4* position);
   using QuadBaryFn = void (*)(const void* user, uint32_t corner, Vec4* barycentrics);
+  // `quad_covered_fn`, when there is one, says whether the primitive covers a corner (a sample of it, inside the scissor and the depth bounds): the lanes of the quad that are not
+  // covered are helpers for the wave operations (kFeature3WaveOps). Without it the other corners are helpers.
+  using QuadCoveredFn = bool (*)(const void* user, uint32_t corner);
   QuadFn quad_fn = nullptr;
   QuadBaryFn quad_bary_fn = nullptr;
+  QuadCoveredFn quad_covered_fn = nullptr;
   const void* quad_user = nullptr;
   uint32_t quad_corner = 0;
 };
@@ -1332,7 +1336,15 @@ enum DeviceFeature2 : uint32_t {
 // (DEV_FEATURE3_*, TcosD3D12DeviceFeatures3). Bits are taken in ranges so work on different parts does not collide: 0-7 multisampled reads and interpolation, 8-15 feature
 // levels 11_1 / 12_x (rasterizer ordered views, forced sample counts), 16-23 shader model 6 (wave operations), 24-31 the rest.
 enum DeviceFeature3 : uint32_t {
+  // Shader Model 6 wave operations (16-23). A wave is a group of lanes that run a shader's instructions together; a wave operation reads the other lanes of its wave that are at the
+  // same instruction (the active ones; a pixel shader's helper lanes - the uncovered pixels of its quad and the discarded ones - only for the quad operations). The CPU renderer's
+  // lane model is D3d9Shader.cpp's (WaveRunner): a pixel shader's wave is the 2 x 2 quad of its pixel (4 lanes), a compute shader's 32 lanes of its group in SV_GroupIndex order, the
+  // other stages' a wave of 4 lanes with the one invocation active.
+  kFeature3WaveOps = 1u << 16,           // Shader Model 6.0: WaveIsFirstLane .. WavePrefixCountBits, QuadReadLaneAt, QuadReadAcrossX / Y / Diagonal
+  kFeature3WaveMatch = 1u << 17,         // Shader Model 6.5: WaveMatch, WaveMultiPrefixSum / Product / BitAnd / BitOr / BitXor / CountBits; 6.7: QuadAny, QuadAll
 };
+// The sizes of the CPU renderer's waves (D3D12_FEATURE_DATA_D3D12_OPTIONS1 WaveLaneCountMin / Max): a pixel shader's quad, a compute shader's 32 lanes.
+constexpr uint32_t kWaveLanesPixel = 4, kWaveLanesCompute = 32, kWaveLanesOther = 4;
 
 constexpr uint32_t sampler_features2(const SamplerDesc& s) {
   return (s.separate_mag && s.mag_filter != s.filter ? kFeature2SeparateFilters : 0u) | (s.reduction != SamplerReduction::Weighted ? kFeature2SamplerReductions : 0u) |

@@ -102,6 +102,16 @@ struct D3d9Program::State {
   uint32_t derivative_depth = 0;
   uint64_t capture_at = ~uint64_t{0};
   Q captured = {{0, 0, 0, 0}};
+  // Wave operations (see WaveRunner below): the lane's number in its wave and the wave's size, and whether it is a helper (a pixel shader's uncovered or discarded pixel: not active
+  // for the wave operations, there for the quad's). In a run of the lanes of a wave together (wave_mode) a lane stops before each wave operation, derivative and loop end (wave_stop,
+  // at wave_pc, with the operation's sources in wave_in) and goes on from there (wave_resume) with the result in wave_out - or, for a derivative, the values of its quad in quad[].
+  bool wave_mode = false, wave_stop = false, wave_resume = false, wave_helper = false, wave_done = false;
+  uint32_t wave_lane = 0, wave_size = graphics::kWaveLanesOther;
+  uint64_t wave_pc = 0, wave_start = 0;
+  uint32_t wave_steps = 0;
+  Q wave_in[2] = {}, wave_out = {};
+  Q quad[4] = {};
+  uint8_t quad_have = 0;
 };
 
 D3d9Program::D3d9Program(allocators::IAllocator& allocator) : allocator_(allocator), code_(allocator), defs_(allocator), bools_(allocator) {}
@@ -635,6 +645,17 @@ void D3d9Program::execute(State& s, uint64_t begin, uint64_t end) const {
   // varyings (a pixel run for this, which hands back what the instruction read: s.capture_at). Zero without a quad.
   auto quad_difference = [&](const Q& a, uint64_t at, bool y_axis, bool coarse) {
     Q zero = {{0, 0, 0, 0}};
+    if (s.wave_mode) {
+      // (the lanes of the wave are run together: the quad's values at this instruction are in quad[], those of the lanes that are here; a pair without both is zero)
+      const uint32_t own = s.wave_lane & 3;
+      uint32_t c0, c1;
+      if (!y_axis) c0 = coarse ? 0 : (own & 2), c1 = c0 + 1;
+      else c0 = coarse ? 0 : (own & 1), c1 = c0 + 2;
+      if (!(s.quad_have >> c0 & 1) || !(s.quad_have >> c1 & 1)) return zero;
+      Q r = zero;
+      for (int i = 0; i < 4; ++i) r.f[i] = s.quad[c1].f[i] - s.quad[c0].f[i];
+      return r;
+    }
     const graphics::FragmentContext* f = s.fragment;
     if (!f || !f->quad_fn || s.derivative_depth >= 2) return zero;
     const uint32_t own = f->quad_corner & 3;
@@ -676,13 +697,38 @@ void D3d9Program::execute(State& s, uint64_t begin, uint64_t end) const {
 
   const uint64_t count = code_.count() < end ? code_.count() : end;
   uint32_t steps = 0;   // (a loop that never ends stops the program, not the machine)
+  uint32_t& counted = s.wave_mode ? s.wave_steps : steps;   // (a lane of a wave counts over all its runs: the program's steps, as one run of it would)
   for (uint64_t pc = begin; pc < count;) {
-    if (++steps > kMaxSteps) return;
+    if (++counted > kMaxSteps) return;
     const Instr& ins = code_[pc++];
     int_mode = ins.op >= kIntegerFirst && ins.op <= kIntegerLast;
     double_mode = ins.op >= kDoubleFirst && ins.op <= kDoubleLast;
     Q a = {{0, 0, 0, 0}}, b = a, c = a, r = a;
     if (ins.src_count > 0 && ins.op != kM4x4 && ins.op != kM4x3 && ins.op != kM3x4 && ins.op != kM3x3 && ins.op != kM3x2) a = fetch(ins.src[0], 0);
+    const bool wave_op = ins.op >= kWaveFirst && ins.op <= kWaveLast;
+    if (s.wave_mode && (wave_op || ins.op == kLoopEnd || ins.op == kDdx || ins.op == kDdy || ins.op == kDdxCoarse || ins.op == kDdyCoarse || ins.op == kTexBias || ins.op == kTexQueryLod)) {
+      // (the lanes of a wave run together: the lane stops here until the others that come here are here too - see WaveRunner)
+      if (s.wave_resume && s.wave_pc == pc - 1) {
+        s.wave_resume = false;
+      } else {
+        s.wave_in[0] = a;
+        s.wave_in[1] = ins.src_count > 1 && wave_op ? fetch(ins.src[1], 0) : Q{{0, 0, 0, 0}};
+        s.wave_stop = true;
+        s.wave_pc = pc - 1;
+        return;
+      }
+    }
+    if (wave_op) {
+      // (a run of one lane - a stage whose wave has the one invocation active, or a run for a neighbour's sake -: the wave is this lane)
+      if (!s.wave_mode) {
+        s.wave_in[0] = a;
+        s.wave_in[1] = ins.src_count > 1 ? fetch(ins.src[1], 0) : Q{{0, 0, 0, 0}};
+        State* one = &s;
+        wave_compute(ins, ArrayView<State* const>(&one, 1));
+      }
+      store(ins.dst, s.wave_out);
+      continue;
+    }
     // (a lookup with residency feedback or a clamp: the feedback covers the lookup's own texel reads - begun here, or for sample_b, whose level needs the neighbours' coordinates
     // first and so runs their programs, once those are in - and ends after it. Not in a neighbour's run: it only wants a coordinate)
     const bool feedback = ins.feedback && s.textures && s.derivative_depth == 0 && s.capture_at == ~uint64_t{0};
@@ -721,6 +767,13 @@ void D3d9Program::execute(State& s, uint64_t begin, uint64_t end) const {
       case kDiscardZ:
         if ((bits_of(a.f[0]) != 0) == (ins.op == kDiscardNz) && s.capture_at == ~uint64_t{0}) {   // (a pixel run for a derivative goes on: a helper invocation)
           s.killed = true;
+          if (s.wave_mode) {
+            // (a lane of a wave that is run together goes on as a helper: its quad's derivatives and quad operations still see it, the wave operations no longer do)
+            s.wave_helper = true;
+            s.no_stores = true;
+            s.sys[kSysHelperLane].f[0] = from_bits(0xFFFFFFFFu);
+            break;
+          }
           return;
         }
         break;
@@ -1301,6 +1354,275 @@ void D3d9Program::execute(State& s, uint64_t begin, uint64_t end) const {
   }
 }
 
+// --- Waves (WaveRunner) ------------------------------------------------------------------------------------------------------------------------------------------
+//
+// Shader Model 6's wave operations read the other lanes of the shader's wave. The interpreter runs one invocation at a time, so a program with them runs the lanes of a wave together:
+// each lane runs until it stops before a wave operation, a derivative or a loop's end (or ends, or reaches a barrier), and then the stopped lane with the lowest instruction goes on,
+// together with every lane stopped at the same instruction (for a wave operation: at the same site - the DXIL instruction it came from). The program's flow control is structured
+// (if / else / endif and loops whose back edge is their end), so the lowest stopped instruction is the next one a SIMD machine that runs the wave in step, with a mask of the lanes
+// that take each branch, would come to; and the lanes that leave a loop wait after it for those still in it, as a reconverging machine's do. A lane that ends, or returns early, is
+// inactive from then on. The lanes at the instruction are the ones it reads: the active lanes are those of them that are not helpers (a pixel shader's uncovered and discarded
+// pixels), and the quad operations and derivatives read the helpers too.
+//
+// The waves: a pixel shader's is the 2 x 2 quad of the pixel (lane = corner: x & 1 | (y & 1) << 1; each covered pixel runs the whole quad, its own lane writing, the others with no
+// stores), a compute shader's 32 threads of its group in SV_GroupIndex order (lane = index % 32), every other stage's a wave of kWaveLanesOther lanes with the one invocation active
+// (lane 0). The results do not depend on the order the lanes are run in or on the machine: every reduction is taken in lane order.
+
+namespace {
+
+bool lane_condition(const Q& q) { return bits_of(q.f[0]) != 0; }
+float mask_of(bool t) { return from_bits(t ? 0xFFFFFFFFu : 0u); }
+uint64_t pair_of(const Q& q, uint32_t k) { return uint64_t{bits_of(q.f[2 * k])} | uint64_t{bits_of(q.f[2 * k + 1])} << 32; }
+void set_pair(Q* q, uint32_t k, uint64_t v) {
+  q->f[2 * k] = from_bits(static_cast<uint32_t>(v));
+  q->f[2 * k + 1] = from_bits(static_cast<uint32_t>(v >> 32));
+}
+// (a minimum or maximum of floats as HLSL's: a NaN operand gives the other)
+float float_pick(float a, float b, bool max) {
+  if (a != a) return b;
+  if (b != b) return a;
+  return max ? (a > b ? a : b) : (a < b ? a : b);
+}
+double double_pick(double a, double b, bool max) {
+  if (a != a) return b;
+  if (b != b) return a;
+  return max ? (a > b ? a : b) : (a < b ? a : b);
+}
+// The identity of a reduction, and one step of it, on a 32-bit component's bits and on a 64-bit pair's.
+uint32_t identity32(uint8_t type, uint8_t op) {
+  switch (op) {
+    case kWaveSum: case kWaveOr: case kWaveXor: return 0;
+    case kWaveProduct: return type == kWaveF32 ? bits_of(1.0f) : 1u;
+    case kWaveAnd: return 0xFFFFFFFFu;
+    case kWaveMin: return type == kWaveF32 ? 0x7F800000u : type == kWaveI32 ? 0x7FFFFFFFu : 0xFFFFFFFFu;
+    default: return type == kWaveF32 ? 0xFF800000u : type == kWaveI32 ? 0x80000000u : 0u;   // (max)
+  }
+}
+uint32_t step32(uint8_t type, uint8_t op, uint32_t acc, uint32_t v) {
+  const float fa = from_bits(acc), fv = from_bits(v);
+  const int32_t ia = static_cast<int32_t>(acc), iv = static_cast<int32_t>(v);
+  switch (op) {
+    case kWaveSum: return type == kWaveF32 ? bits_of(fa + fv) : acc + v;
+    case kWaveProduct: return type == kWaveF32 ? bits_of(fa * fv) : acc * v;
+    case kWaveMin: return type == kWaveF32 ? bits_of(float_pick(fa, fv, false)) : type == kWaveI32 ? static_cast<uint32_t>(ia < iv ? ia : iv) : (acc < v ? acc : v);
+    case kWaveMax: return type == kWaveF32 ? bits_of(float_pick(fa, fv, true)) : type == kWaveI32 ? static_cast<uint32_t>(ia > iv ? ia : iv) : (acc > v ? acc : v);
+    case kWaveAnd: return acc & v;
+    case kWaveOr: return acc | v;
+    default: return acc ^ v;
+  }
+}
+uint64_t identity64(uint8_t type, uint8_t op) {
+  switch (op) {
+    case kWaveSum: case kWaveOr: case kWaveXor: return 0;
+    case kWaveProduct: return type == kWaveF64 ? __builtin_bit_cast(uint64_t, 1.0) : 1u;
+    case kWaveAnd: return ~uint64_t{0};
+    case kWaveMin: return type == kWaveF64 ? 0x7FF0000000000000ull : type == kWaveI64 ? 0x7FFFFFFFFFFFFFFFull : ~uint64_t{0};
+    default: return type == kWaveF64 ? 0xFFF0000000000000ull : type == kWaveI64 ? 0x8000000000000000ull : 0u;
+  }
+}
+uint64_t step64(uint8_t type, uint8_t op, uint64_t acc, uint64_t v) {
+  const double da = __builtin_bit_cast(double, acc), dv = __builtin_bit_cast(double, v);
+  const int64_t ia = static_cast<int64_t>(acc), iv = static_cast<int64_t>(v);
+  switch (op) {
+    case kWaveSum: return type == kWaveF64 ? __builtin_bit_cast(uint64_t, da + dv) : acc + v;
+    case kWaveProduct: return type == kWaveF64 ? __builtin_bit_cast(uint64_t, da * dv) : acc * v;
+    case kWaveMin: return type == kWaveF64 ? __builtin_bit_cast(uint64_t, double_pick(da, dv, false)) : type == kWaveI64 ? static_cast<uint64_t>(ia < iv ? ia : iv) : (acc < v ? acc : v);
+    case kWaveMax: return type == kWaveF64 ? __builtin_bit_cast(uint64_t, double_pick(da, dv, true)) : type == kWaveI64 ? static_cast<uint64_t>(ia > iv ? ia : iv) : (acc > v ? acc : v);
+    case kWaveAnd: return acc & v;
+    case kWaveOr: return acc | v;
+    default: return acc ^ v;
+  }
+}
+// Whether two lanes' values are equal: floats as floats (a NaN equals nothing; -0 equals 0), integers by their bits.
+bool equal32(uint8_t type, uint32_t a, uint32_t b) { return type == kWaveF32 ? from_bits(a) == from_bits(b) : a == b; }
+bool equal64(uint8_t type, uint64_t a, uint64_t b) { return type == kWaveF64 ? __builtin_bit_cast(double, a) == __builtin_bit_cast(double, b) : a == b; }
+
+constexpr uint32_t kMaxWaveLanes = 128;   // (a lane mask is four words)
+
+}  // namespace
+
+void D3d9Program::wave_compute(const Instruction& ins, ArrayView<State* const> group) {
+  const uint8_t type = ins.control & 0xF, op = ins.control >> 4;
+  const bool wide = type == kWaveF64 || type == kWaveI64 || type == kWaveU64;
+  // The active lanes: those of the group that are not helpers.
+  uint32_t active[4] = {};
+  const State* first_active = nullptr;
+  for (const State* l : group) {
+    if (l->wave_helper || l->wave_lane >= kMaxWaveLanes) continue;
+    active[l->wave_lane / 32] |= 1u << (l->wave_lane % 32);
+    if (!first_active || l->wave_lane < first_active->wave_lane) first_active = l;
+  }
+  auto lane_at = [&](uint32_t lane) -> const State* {   // (a lane of the group: one at this instruction, helper or not)
+    for (const State* l : group)
+      if (l->wave_lane == lane) return l;
+    return nullptr;
+  };
+  auto is_active = [&](uint32_t lane) { return lane < kMaxWaveLanes && (active[lane / 32] >> (lane % 32) & 1) != 0; };
+  // A reduction over the active lanes `take` says, in lane order, of component c (32-bit) or pair c (64-bit) of source 0: in x (a pair: x y).
+  auto reduce = [&](auto take, uint32_t c) {
+    Q r = {{0, 0, 0, 0}};
+    if (wide) {
+      uint64_t acc = identity64(type, op);
+      for (uint32_t lane = 0; lane < kMaxWaveLanes; ++lane)
+        if (is_active(lane) && take(lane)) acc = step64(type, op, acc, pair_of(lane_at(lane)->wave_in[0], c));
+      set_pair(&r, 0, acc);
+      return r;
+    }
+    uint32_t acc = identity32(type, op);
+    for (uint32_t lane = 0; lane < kMaxWaveLanes; ++lane)
+      if (is_active(lane) && take(lane)) acc = step32(type, op, acc, bits_of(lane_at(lane)->wave_in[0].f[c]));
+    r.f[0] = from_bits(acc);
+    return r;
+  };
+  // Each component (or pair) of the result made by `per` from that component (pair) of the sources.
+  auto per_component = [&](auto per) {
+    Q r = {{0, 0, 0, 0}};
+    if (wide) {
+      for (uint32_t k = 0; k < 2; ++k) set_pair(&r, k, pair_of(per(k), 0));
+    } else {
+      for (uint32_t c = 0; c < 4; ++c) r.f[c] = per(c).f[0];
+    }
+    return r;
+  };
+  auto count = [&](auto take) {
+    uint32_t n = 0;
+    for (const State* l : group)
+      if (is_active(l->wave_lane) && !l->wave_helper && lane_condition(l->wave_in[0]) && take(*l)) ++n;
+    return n;
+  };
+  auto in_mask = [](const Q& mask, uint32_t lane) { return lane < kMaxWaveLanes && (bits_of(mask.f[lane / 32]) >> (lane % 32) & 1) != 0; };
+  for (State* s : group) {
+    const uint32_t me = s->wave_lane;
+    Q r = {{0, 0, 0, 0}};
+    switch (ins.op) {
+      case kWaveIsFirstLane: r = splat(mask_of(first_active && first_active->wave_lane == me)); break;
+      case kWaveLaneIndex: r = splat(from_bits(me)); break;
+      case kWaveLaneCount: r = splat(from_bits(s->wave_size)); break;
+      case kWaveAnyTrue: case kWaveAllTrue: {
+        bool any = false, all = true;
+        for (const State* l : group) {
+          if (l->wave_helper) continue;
+          if (lane_condition(l->wave_in[0])) any = true;
+          else all = false;
+        }
+        r = splat(mask_of(ins.op == kWaveAnyTrue ? any : all));
+        break;
+      }
+      case kWaveBallot: case kWaveMatch: {
+        uint32_t bits[4] = {};
+        for (const State* l : group) {
+          if (!is_active(l->wave_lane)) continue;
+          bool take;
+          if (ins.op == kWaveBallot) take = lane_condition(l->wave_in[0]);
+          else take = wide ? pair_of(l->wave_in[0], 0) == pair_of(s->wave_in[0], 0) : bits_of(l->wave_in[0].f[0]) == bits_of(s->wave_in[0].f[0]);   // (match: by the bits)
+          if (take) bits[l->wave_lane / 32] |= 1u << (l->wave_lane % 32);
+        }
+        for (uint32_t k = 0; k < 4; ++k) r.f[k] = from_bits(bits[k]);
+        break;
+      }
+      case kWaveAllEqual: {
+        // (one word per component - per pair of a 64-bit value, in both of its components)
+        for (uint32_t c = 0; c < (wide ? 2u : 4u); ++c) {
+          bool same = true;
+          for (const State* l : group) {
+            if (!is_active(l->wave_lane) || !first_active) continue;
+            if (wide ? !equal64(type, pair_of(l->wave_in[0], c), pair_of(first_active->wave_in[0], c)) : !equal32(type, bits_of(l->wave_in[0].f[c]), bits_of(first_active->wave_in[0].f[c]))) same = false;
+          }
+          if (wide) r.f[2 * c] = r.f[2 * c + 1] = mask_of(same);
+          else r.f[c] = mask_of(same);
+        }
+        break;
+      }
+      case kWaveReadLaneAt: case kWaveReadFirst: case kQuadReadLaneAt: case kQuadReadAcross: {
+        const State* from = nullptr;
+        if (ins.op == kWaveReadFirst) from = first_active;
+        else if (ins.op == kWaveReadLaneAt) from = lane_at(bits_of(s->wave_in[1].f[0]));
+        else if (ins.op == kQuadReadLaneAt) from = lane_at((me & ~3u) | (bits_of(s->wave_in[1].f[0]) & 3u));
+        else from = lane_at(me ^ op);
+        if (from) r = from->wave_in[0];   // (a lane that is not here: zero)
+        break;
+      }
+      case kWaveActive: r = per_component([&](uint32_t c) { return reduce([](uint32_t) { return true; }, c); }); break;
+      case kWavePrefix: r = per_component([&](uint32_t c) { return reduce([&](uint32_t lane) { return lane < me; }, c); }); break;
+      case kWaveMultiPrefix: r = per_component([&](uint32_t c) { return reduce([&](uint32_t lane) { return lane < me && in_mask(s->wave_in[1], lane); }, c); }); break;
+      case kWaveCountBits: r = splat(from_bits(count([](const State&) { return true; }))); break;
+      case kWavePrefixCountBits: r = splat(from_bits(count([&](const State& l) { return l.wave_lane < me; }))); break;
+      case kWaveMultiPrefixCountBits: r = splat(from_bits(count([&](const State& l) { return l.wave_lane < me && in_mask(s->wave_in[1], l.wave_lane); }))); break;
+      case kQuadAny: case kQuadAll: {
+        bool any = false, all = true;
+        for (const State* l : group) {
+          if ((l->wave_lane >> 2) != (me >> 2)) continue;
+          if (lane_condition(l->wave_in[0])) any = true;
+          else all = false;
+        }
+        r = splat(mask_of(ins.op == kQuadAny ? any : all));
+        break;
+      }
+      default: break;
+    }
+    s->wave_out = r;
+  }
+}
+
+void D3d9Program::run_wave(ArrayView<State* const> lanes) const {
+  const uint64_t end = code_.count();
+  auto run = [&](State& s, uint64_t from) {
+    s.wave_stop = false;
+    s.at_barrier = false;
+    execute(s, from, end);
+    if (!s.wave_stop && !s.at_barrier) s.wave_done = true;
+  };
+  for (State* s : lanes) {
+    s->wave_mode = true;
+    s->wave_resume = false;
+    s->wave_done = false;
+    s->wave_steps = 0;
+    run(*s, s->wave_start);
+  }
+  // (a program that never ends stops after as many rounds as one run may take steps, as a lane's run does)
+  for (uint32_t round = 0; round < kMaxSteps; ++round) {
+    // The lowest stopped lane outside the copies of return blocks; when every stopped lane is in one, the one earliest in its copy: a lane in a copy runs nothing but the copy
+    // until it ends, so the others never meet it before, and the copies of one block are the same instructions (Instruction::tail).
+    const State* lowest = nullptr;
+    for (const State* s : lanes)
+      if (s->wave_stop && !code_[s->wave_pc].tail && (!lowest || s->wave_pc < lowest->wave_pc)) lowest = s;
+    const bool in_tail = !lowest;
+    if (in_tail)
+      for (const State* s : lanes)
+        if (s->wave_stop && (!lowest || code_[s->wave_pc].tail_at < code_[lowest->wave_pc].tail_at)) lowest = s;
+    if (!lowest) return;
+    const Instruction& at = code_[lowest->wave_pc];
+    const bool wave_op = at.op >= kWaveFirst && at.op <= kWaveLast;
+    // The group: the lanes stopped at the instruction (in a copy: at that instruction of any copy of the block).
+    State* group_memory[kMaxWaveLanes];
+    uint32_t n = 0;
+    for (State* s : lanes) {
+      if (!s->wave_stop || n == kMaxWaveLanes) continue;
+      const Instruction& other = code_[s->wave_pc];
+      if (in_tail ? (other.tail == at.tail && other.tail_at == at.tail_at) : s->wave_pc == lowest->wave_pc) group_memory[n++] = s;
+    }
+    const ArrayView<State* const> group(group_memory, n);
+    if (wave_op) {
+      wave_compute(at, group);
+    } else if (at.op != kLoopEnd) {
+      // (a derivative, or a lookup whose level comes from them: the values of the lanes of each quad that are here)
+      for (State* s : group) {
+        s->quad_have = 0;
+        for (const State* l : group)
+          if ((l->wave_lane >> 2) == (s->wave_lane >> 2)) {
+            s->quad[l->wave_lane & 3] = l->wave_in[0];
+            s->quad_have = static_cast<uint8_t>(s->quad_have | (1u << (l->wave_lane & 3)));
+          }
+      }
+    }
+    for (State* s : group) {
+      s->wave_resume = true;
+      run(*s, s->wave_pc);
+    }
+  }
+  for (State* s : lanes) s->wave_stop = false, s->wave_done = true;
+}
+
 void D3d9Program::run_vertex(const graphics::Vec4* attributes, const uint8_t* constants, graphics::ShaderIo* out) const { run_vertex_ex(attributes, constants, graphics::VertexContext(), out); }
 
 void D3d9Program::run_vertex_ex(const graphics::Vec4* attributes, const uint8_t* constants, const graphics::VertexContext& context, graphics::ShaderIo* out) const {
@@ -1327,6 +1649,7 @@ bool D3d9Program::run_fragment(const graphics::Vec4* varyings, const uint8_t* co
 
 bool D3d9Program::run_fragment_ex(const graphics::Vec4* varyings, const graphics::FragmentContext& context, const uint8_t* constants, const graphics::ITextureSet* textures,
                                   graphics::Vec4* color) const {
+  if (uses_wave_) return run_fragment_wave(varyings, context, constants, textures, color);
   State s = {};
   s.varyings = varyings;
   s.constants = constants;
@@ -1347,6 +1670,68 @@ bool D3d9Program::run_fragment_ex(const graphics::Vec4* varyings, const graphics
   if (s.killed) return false;
   for (uint32_t n = 0; n < color_outputs_; ++n) color[n] = {s.color[n].f[0], s.color[n].f[1], s.color[n].f[2], s.color[n].f[3]};
   return true;
+}
+
+// A pixel shader with wave operations: the four lanes of the pixel's quad run together (WaveRunner), the pixel's own writing, the others - at their corners' centres, extended
+// out of the primitive - writing nothing; the corners the primitive does not cover are helpers. Without the quad (points, lines) the pixel is the one lane of its wave.
+bool D3d9Program::run_fragment_wave(const graphics::Vec4* varyings, const graphics::FragmentContext& context, const uint8_t* constants, const graphics::ITextureSet* textures,
+                                    graphics::Vec4* color) const {
+  constexpr uint32_t kLanes = graphics::kWaveLanesPixel;
+  struct Memory {
+    State lane[kLanes];
+    graphics::Vec4 varyings[kLanes][graphics::kMaxVaryings];
+  };
+  ArrayView<Memory> memory = allocate_view<Memory>(allocator_, 1);
+  if (memory.empty()) return false;
+  Memory& m = *new (memory.data()) Memory();
+  const uint32_t own = context.quad_corner & 3;
+  State* lanes[kLanes];
+  uint32_t count = 0;
+  for (uint32_t k = 0; k < kLanes; ++k) {
+    if (k != own && !context.quad_fn) continue;
+    State& s = m.lane[k];
+    graphics::Vec4 position = context.position, bary = context.barycentrics, bary_linear = context.barycentrics_linear;
+    const graphics::Vec4* in = varyings;
+    bool helper = context.quad_covered_fn ? !context.quad_covered_fn(context.quad_user, k) : k != own;
+    if (k == own && !context.quad_covered_fn) helper = false;
+    if (k != own) {
+      context.quad_fn(context.quad_user, k, m.varyings[k], &position);
+      if (context.quad_bary_fn) {
+        graphics::Vec4 b[2] = {};
+        context.quad_bary_fn(context.quad_user, k, b);
+        bary = b[0], bary_linear = b[1];
+      }
+      in = m.varyings[k];
+    }
+    s.varyings = in;
+    s.constants = constants;
+    s.textures = textures;
+    s.sys[kSysPosition] = {{position.x, position.y, position.z, position.w}};
+    s.sys[kSysFrontFacing].f[0] = from_bits(context.front_facing ? 0xFFFFFFFFu : 0u);
+    s.sys[kSysPrimitiveId].f[0] = from_bits(context.primitive_id);
+    s.sys[kSysViewId].f[0] = from_bits(context.view_id);
+    s.sys[kSysShadingRate].f[0] = from_bits(context.shading_rate);
+    s.sys[kSysHelperLane].f[0] = from_bits((helper || (k == own && context.helper)) ? 0xFFFFFFFFu : 0u);
+    s.sys[kSysBarycentrics] = {{bary.x, bary.y, bary.z, 0.0f}};
+    s.sys[kSysBarycentricsLinear] = {{bary_linear.x, bary_linear.y, bary_linear.z, 0.0f}};
+    s.fragment = &context;
+    s.storage = context.storage;
+    s.images = context.images;
+    s.no_stores = k == own ? context.helper : true;
+    s.wave_lane = k;
+    s.wave_size = kLanes;
+    s.wave_helper = helper;
+    s.wave_start = 0;
+    lanes[count++] = &s;
+  }
+  run_wave(ArrayView<State* const>(lanes, count));
+  const State& s = m.lane[own];
+  const bool kept = !s.killed;
+  if (kept)
+    for (uint32_t n = 0; n < color_outputs_; ++n) color[n] = {s.color[n].f[0], s.color[n].f[1], s.color[n].f[2], s.color[n].f[3]};
+  m.~Memory();
+  release_view(allocator_, memory);
+  return kept;
 }
 
 void D3d9Program::run_hull(const graphics::HullInputData& input, const uint8_t* constants, graphics::HullOutputData* output) const {
@@ -1429,15 +1814,19 @@ void D3d9Program::run_compute(const graphics::ComputeContext& context, const uin
 }
 
 // A group of threads that share memory or wait for each other at barriers: every thread has its own registers and runs up to its next barrier (or its end); when all have stopped, they
-// all go on. Threads that have finished do not wait for the others.
+// all go on. Threads that have finished do not wait for the others. With wave operations the threads of each wave of the group (32 in SV_GroupIndex order) run together (run_wave):
+// a program that has no barriers and no shared memory a wave at a time, one that has them a wave after the other up to the barrier.
 void D3d9Program::run_compute_group(const graphics::ComputeContext& context, const uint8_t* constants) const {
   if (stage_ != graphics::ShaderStage::Compute) return;
   const uint32_t threads = thread_group_[0] * thread_group_[1] * thread_group_[2];
-  if (threads == 0 || threads > graphics::kMaxBarrierThreads) return;
+  if (threads == 0 || threads > graphics::kMaxThreadsPerGroup || (keeps_group() && threads > graphics::kMaxBarrierThreads)) return;
+  constexpr uint32_t kWave = graphics::kWaveLanesCompute;
+  // The threads whose registers are kept at once: the group's, or (waves only) one wave's.
+  const uint32_t kept = keeps_group() ? threads : (threads < kWave ? threads : kWave);
   // The memory: the registers of the threads, where each is to go on, which are done, and the group-shared memories.
-  State* states = static_cast<State*>(allocator_.allocate(sizeof(State) * threads));
-  ArrayView<uint64_t> resume = allocate_view<uint64_t>(allocator_, threads);
-  ArrayView<uint8_t> done = allocate_view<uint8_t>(allocator_, threads);
+  State* states = static_cast<State*>(allocator_.allocate(sizeof(State) * kept));
+  ArrayView<uint64_t> resume = allocate_view<uint64_t>(allocator_, kept);
+  ArrayView<uint8_t> done = allocate_view<uint8_t>(allocator_, kept);
   ArrayView<uint8_t> shared_memory[graphics::kMaxSharedMemories];
   graphics::ComputeContext group = context;
   bool ok = states && !resume.empty() && !done.empty();
@@ -1451,28 +1840,71 @@ void D3d9Program::run_compute_group(const graphics::ComputeContext& context, con
     }
   }
   uint32_t constructed = 0;
-  if (ok) {
-    for (; constructed < threads; ++constructed) {
-      State* s = new (&states[constructed]) State();
-      s->constants = constants;
-      s->compute = &group;
-      s->storage = group.buffers;
-      s->textures = group.textures;
-      s->images = group.images;
-      const uint32_t i = constructed;
-      const uint32_t tx = i % thread_group_[0], ty = (i / thread_group_[0]) % thread_group_[1], tz = i / (thread_group_[0] * thread_group_[1]);
-      const uint32_t id[3] = {tx, ty, tz};
-      for (uint32_t k = 0; k < 3; ++k) {
-        s->sys[kSysDispatchThreadId].f[k] = from_bits(context.group_id[k] * thread_group_[k] + id[k]);
-        s->sys[kSysGroupId].f[k] = from_bits(context.group_id[k]);
-        s->sys[kSysGroupThreadId].f[k] = from_bits(id[k]);
-      }
-      s->sys[kSysGroupIndex].f[0] = from_bits(i);
-      resume[i] = 0;
-      done[i] = 0;
+  // (the registers of thread i of the group in states[slot])
+  auto start_thread = [&](uint32_t slot, uint32_t i) {
+    State* s = &states[slot];
+    if (slot < constructed) s->~State();
+    new (s) State();
+    if (slot >= constructed) constructed = slot + 1;
+    s->constants = constants;
+    s->compute = &group;
+    s->storage = group.buffers;
+    s->textures = group.textures;
+    s->images = group.images;
+    const uint32_t tx = i % thread_group_[0], ty = (i / thread_group_[0]) % thread_group_[1], tz = i / (thread_group_[0] * thread_group_[1]);
+    const uint32_t id[3] = {tx, ty, tz};
+    for (uint32_t k = 0; k < 3; ++k) {
+      s->sys[kSysDispatchThreadId].f[k] = from_bits(context.group_id[k] * thread_group_[k] + id[k]);
+      s->sys[kSysGroupId].f[k] = from_bits(context.group_id[k]);
+      s->sys[kSysGroupThreadId].f[k] = from_bits(id[k]);
     }
+    s->sys[kSysGroupIndex].f[0] = from_bits(i);
+    s->wave_lane = i % kWave;
+    s->wave_size = kWave;
+    resume[slot] = 0;
+    done[slot] = 0;
+  };
+  if (ok && uses_wave_ && !keeps_group()) {
+    // (waves that never wait for each other: one at a time)
+    for (uint32_t first = 0; first < threads; first += kWave) {
+      const uint32_t n = threads - first < kWave ? threads - first : kWave;
+      State* lanes[kWave];
+      for (uint32_t k = 0; k < n; ++k) {
+        start_thread(k, first + k);
+        lanes[k] = &states[k];
+      }
+      run_wave(ArrayView<State* const>(lanes, n));
+    }
+  } else if (ok) {
+    for (uint32_t i = 0; i < threads; ++i) start_thread(i, i);
     uint32_t remaining = threads;
-    for (uint32_t phase = 0; remaining && phase < 100000; ++phase)
+    for (uint32_t phase = 0; remaining && phase < 100000; ++phase) {
+      if (uses_wave_) {
+        // (each wave runs together to the barrier, or its end)
+        for (uint32_t first = 0; first < threads; first += kWave) {
+          const uint32_t n = threads - first < kWave ? threads - first : kWave;
+          State* lanes[kWave];
+          uint32_t live = 0;
+          for (uint32_t k = 0; k < n; ++k) {
+            if (done[first + k]) continue;
+            states[first + k].wave_start = resume[first + k];
+            lanes[live++] = &states[first + k];
+          }
+          if (!live) continue;
+          run_wave(ArrayView<State* const>(lanes, live));
+          for (uint32_t k = 0; k < n; ++k) {
+            const uint32_t i = first + k;
+            if (done[i]) continue;
+            if (states[i].at_barrier) {
+              resume[i] = states[i].barrier_pc;
+            } else {
+              done[i] = 1;
+              --remaining;
+            }
+          }
+        }
+        continue;
+      }
       for (uint32_t i = 0; i < threads; ++i) {
         if (done[i]) continue;
         State& s = states[i];
@@ -1485,6 +1917,7 @@ void D3d9Program::run_compute_group(const graphics::ComputeContext& context, con
           --remaining;
         }
       }
+    }
   }
   for (uint32_t i = 0; i < constructed; ++i) states[i].~State();
   if (states) allocator_.deallocate(states);
