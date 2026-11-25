@@ -4989,6 +4989,83 @@ static ID3D11Texture2D *staging11(DXGI_FORMAT format, UINT access) {
   return SUCCEEDED(ID3D11Device_CreateTexture2D(g_device, &desc, NULL, &t)) ? t : NULL;
 }
 
+/* D32_FLOAT_S8X24_UINT keeps all 32 bits of its float depth: a depth texture cleared to 1/3 and one written from a staging texture with depths no 24-bit code holds, copied out
+ * again (typed and typeless staging textures), give the same floats back, and the stencil after them; a view of the depth (R32_FLOAT_X8X24_TYPELESS) is made. */
+static void test_d32s8_11(void) {
+  const float third = 1.0f / 3.0f;
+  D3D11_TEXTURE2D_DESC desc = {16, 16, 1, 1, DXGI_FORMAT_R32G8X24_TYPELESS, {1, 0}, D3D11_USAGE_DEFAULT, D3D11_BIND_DEPTH_STENCIL | D3D11_BIND_SHADER_RESOURCE, 0, 0};
+  ID3D11Texture2D *depth = NULL, *typed = NULL, *raw = NULL;
+  ID3D11Device_CreateTexture2D(g_device, &desc, NULL, &depth);
+  D3D11_TEXTURE2D_DESC sd = {16, 16, 1, 1, DXGI_FORMAT_D32_FLOAT_S8X24_UINT, {1, 0}, D3D11_USAGE_STAGING, 0, D3D11_CPU_ACCESS_READ | D3D11_CPU_ACCESS_WRITE, 0};
+  ID3D11Device_CreateTexture2D(g_device, &sd, NULL, &typed);
+  sd.Format = DXGI_FORMAT_R32G8X24_TYPELESS, sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+  ID3D11Device_CreateTexture2D(g_device, &sd, NULL, &raw);
+  check(depth && typed && raw, "D32S8 depth and staging textures");
+  if (depth && typed && raw) {
+    D3D11_DEPTH_STENCIL_VIEW_DESC dv;
+    memset(&dv, 0, sizeof dv);
+    dv.Format = DXGI_FORMAT_D32_FLOAT_S8X24_UINT;
+    dv.ViewDimension = D3D11_DSV_DIMENSION_TEXTURE2D;
+    ID3D11DepthStencilView *dsv = NULL;
+    ID3D11Device_CreateDepthStencilView(g_device, (ID3D11Resource *)depth, &dv, &dsv);
+    D3D11_SHADER_RESOURCE_VIEW_DESC sv;
+    memset(&sv, 0, sizeof sv);
+    sv.Format = DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS;
+    sv.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+    sv.Texture2D.MipLevels = 1;
+    ID3D11ShaderResourceView *srv = NULL, *stencil_srv = NULL;
+    check(SUCCEEDED(ID3D11Device_CreateShaderResourceView(g_device, (ID3D11Resource *)depth, &sv, &srv)) && srv, "an R32_FLOAT_X8X24_TYPELESS view of a D32S8 texture");
+    sv.Format = DXGI_FORMAT_X32_TYPELESS_G8X24_UINT;
+    check(SUCCEEDED(ID3D11Device_CreateShaderResourceView(g_device, (ID3D11Resource *)depth, &sv, &stencil_srv)) && stencil_srv, "an X32_TYPELESS_G8X24_UINT view of a D32S8 texture");
+    if (dsv) ID3D11DeviceContext_ClearDepthStencilView(g_context, dsv, D3D11_CLEAR_DEPTH | D3D11_CLEAR_STENCIL, third, 77);
+    ID3D11DeviceContext_CopyResource(g_context, (ID3D11Resource *)raw, (ID3D11Resource *)depth);
+    D3D11_MAPPED_SUBRESOURCE mapped;
+    float cleared = 0.0f;
+    BYTE cleared_stencil = 0;
+    if (SUCCEEDED(ID3D11DeviceContext_Map(g_context, (ID3D11Resource *)raw, 0, D3D11_MAP_READ, 0, &mapped)) && mapped.pData) {
+      const BYTE *texel = (const BYTE *)mapped.pData + 5 * mapped.RowPitch + 5 * 8;
+      memcpy(&cleared, texel, 4);
+      cleared_stencil = texel[4];
+      ID3D11DeviceContext_Unmap(g_context, (ID3D11Resource *)raw, 0);
+    }
+    printf("d3d11test: D32S8 cleared to 1/3: %.9g (%08x), stencil %u\n", cleared, (unsigned)*(const UINT32 *)&cleared, cleared_stencil);
+    check(memcmp(&cleared, &third, 4) == 0 && cleared_stencil == 77, "a D32S8 depth texture cleared to 1/3 keeps the float's 32 bits");
+    /* (depths of every bit: no 24-bit code holds them) */
+    if (SUCCEEDED(ID3D11DeviceContext_Map(g_context, (ID3D11Resource *)typed, 0, D3D11_MAP_WRITE, 0, &mapped)) && mapped.pData) {
+      for (UINT y = 0; y < 16; ++y)
+        for (UINT x = 0; x < 16; ++x) {
+          BYTE *texel = (BYTE *)mapped.pData + y * mapped.RowPitch + x * 8;
+          const float f = 0.1234567f + (float)(y * 16 + x) * 1e-7f;
+          memcpy(texel, &f, 4);
+          texel[4] = (BYTE)(x + y), texel[5] = texel[6] = texel[7] = 0;
+        }
+      ID3D11DeviceContext_Unmap(g_context, (ID3D11Resource *)typed, 0);
+    }
+    ID3D11DeviceContext_CopyResource(g_context, (ID3D11Resource *)depth, (ID3D11Resource *)typed);
+    ID3D11DeviceContext_CopyResource(g_context, (ID3D11Resource *)raw, (ID3D11Resource *)depth);
+    int bad = 0;
+    if (SUCCEEDED(ID3D11DeviceContext_Map(g_context, (ID3D11Resource *)raw, 0, D3D11_MAP_READ, 0, &mapped)) && mapped.pData) {
+      for (UINT y = 0; y < 16; ++y)
+        for (UINT x = 0; x < 16; ++x) {
+          const BYTE *texel = (const BYTE *)mapped.pData + y * mapped.RowPitch + x * 8;
+          const float f = 0.1234567f + (float)(y * 16 + x) * 1e-7f;
+          bad += memcmp(texel, &f, 4) != 0 || texel[4] != (BYTE)(x + y);
+        }
+      ID3D11DeviceContext_Unmap(g_context, (ID3D11Resource *)raw, 0);
+    } else {
+      ++bad;
+    }
+    printf("d3d11test: D32S8 written from a staging texture and copied out: %d texels wrong\n", bad);
+    check(bad == 0, "a D32S8 depth texture keeps 32-bit float depth through copies (and the stencil)");
+    if (srv) ID3D11ShaderResourceView_Release(srv);
+    if (stencil_srv) ID3D11ShaderResourceView_Release(stencil_srv);
+    if (dsv) ID3D11DepthStencilView_Release(dsv);
+  }
+  if (raw) ID3D11Texture2D_Release(raw);
+  if (typed) ID3D11Texture2D_Release(typed);
+  if (depth) ID3D11Texture2D_Release(depth);
+}
+
 /* Depth views of any level and slice: a slice of level 1 (an array view of one slice), sampled; copies of depth textures - into a staging texture of the typed format and of the
  * typeless one (CopyResource; mapped: the 24-bit depth with the stencil above it), from a staging texture into a depth texture, a subresource into a subresource
  * (CopySubresourceRegion: both planes), a part of one (not copied); and SetResourceMinLOD (the most detailed level of the texture, whatever level a view starts at). */
@@ -5301,6 +5378,60 @@ static void test_fixed_state_gaps(int software, int min_max) {
 
 /* ---- vertex formats and instance step rates ------------------------------------------------------------------------------------------------------------------------------ */
 
+
+/* An input slot with no buffer reads 0 (the components its format lacks 0, 0, 0, 1: R32G32_FLOAT colours are (0, 0, 0, 1)), also after a draw that had one there; a stride of 0
+ * gives every vertex the first element. vs_fmt shows COLOR * 0.5 + 0.5. */
+static void test_unbound_vertex_buffers_11(void) {
+  ID3D11VertexShader *vs = NULL;
+  ID3D11Device_CreateVertexShader(g_device, dx_vs_fmt_dxbc, sizeof dx_vs_fmt_dxbc, NULL, &vs);
+  const float big[9] = {-1, -1, 0.5f, -1, 3, 0.5f, 3, -1, 0.5f}, tints[12] = {-1, 1, -1, 1, 1, -1, -1, 1, 1, -1, -1, 1};
+  ID3D11Buffer *positions = make_buffer(D3D11_BIND_VERTEX_BUFFER, D3D11_USAGE_DEFAULT, 0, big, sizeof big);
+  ID3D11Buffer *colours = make_buffer(D3D11_BIND_VERTEX_BUFFER, D3D11_USAGE_DEFAULT, 0, tints, sizeof tints);
+  const D3D11_INPUT_ELEMENT_DESC four[3] = {{"POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0, D3D11_INPUT_PER_VERTEX_DATA, 0},
+                                            {"COLOR", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 3, 0, D3D11_INPUT_PER_VERTEX_DATA, 0},
+                                            {"OFFSET", 0, DXGI_FORMAT_R32G32_FLOAT, 6, 0, D3D11_INPUT_PER_INSTANCE_DATA, 1}};
+  D3D11_INPUT_ELEMENT_DESC two[3];
+  memcpy(two, four, sizeof two);
+  two[1].Format = DXGI_FORMAT_R32G32_FLOAT;
+  ID3D11InputLayout *layout4 = NULL, *layout2 = NULL;
+  if (vs) {
+    ID3D11Device_CreateInputLayout(g_device, four, 3, dx_vs_fmt_dxbc, sizeof dx_vs_fmt_dxbc, &layout4);
+    ID3D11Device_CreateInputLayout(g_device, two, 3, dx_vs_fmt_dxbc, sizeof dx_vs_fmt_dxbc, &layout2);
+  }
+  check(vs && positions && colours && layout4 && layout2, "the shader, buffers and layouts of unbound input slots");
+  if (vs && positions && colours && layout4 && layout2) {
+    const int grey0[4] = {128, 128, 128, 128}, grey1[4] = {128, 128, 128, 255}, green_[4] = {0, 255, 0, 255};
+    UINT32 got[3] = {0};
+    for (int k = 0; k < 3; ++k) {
+      begin(NULL);
+      clear(0, 0, 0);
+      /* (k 0: the colours at stride 16 - the vertices' own -, then slot 3 unbound and drawn again; 1: R32G32 colours, slot 3 never bound; 2: stride 0; OFFSET's slot 6 never bound) */
+      ID3D11Buffer *buffers[7] = {positions, NULL, NULL, k == 0 || k == 2 ? colours : NULL, NULL, NULL, NULL};
+      const UINT strides[7] = {12, 0, 0, k == 2 ? 0u : 16u, 0, 0, 8}, starts[7] = {0};
+      ID3D11DeviceContext_IASetInputLayout(g_context, k == 1 ? layout2 : layout4);
+      ID3D11DeviceContext_IASetVertexBuffers(g_context, 0, 7, buffers, strides, starts);
+      ID3D11DeviceContext_VSSetShader(g_context, vs, NULL, 0);
+      ID3D11DeviceContext_PSSetShader(g_context, g_ps_color, NULL, 0);
+      ID3D11DeviceContext_DrawInstanced(g_context, 3, 1, 0, 0);
+      if (k == 0) {
+        ID3D11Buffer *none = NULL;
+        const UINT zero = 0;
+        ID3D11DeviceContext_IASetVertexBuffers(g_context, 3, 1, &none, &zero, &zero);
+        ID3D11DeviceContext_DrawInstanced(g_context, 3, 1, 0, 0);
+      }
+      got[k] = read_target() ? pixel(32, 32) : 0;
+    }
+    printf("d3d11test: unbound input slots: %08x %08x, stride 0 %08x\n", (unsigned)got[0], (unsigned)got[1], (unsigned)got[2]);
+    check(colour_is(got[0], grey0), "an input slot unbound after a draw reads zeros (R32G32B32A32_FLOAT: 0, 0, 0, 0)");
+    check(colour_is(got[1], grey1), "an input slot never bound reads zeros, the components its format lacks 0, 0, 0, 1");
+    check(colour_is(got[2], green_), "a vertex buffer of stride 0 gives every vertex its first element");
+  }
+  if (layout4) ID3D11InputLayout_Release(layout4);
+  if (layout2) ID3D11InputLayout_Release(layout2);
+  if (colours) ID3D11Buffer_Release(colours);
+  if (positions) ID3D11Buffer_Release(positions);
+  if (vs) ID3D11VertexShader_Release(vs);
+}
 
 static void test_vertex_formats(void) {
   ID3D11VertexShader *shaders[3] = {NULL, NULL, NULL};
@@ -5880,6 +6011,7 @@ int main(void) {
       test_texture1d();
       test_formats();
       test_vertex_formats();
+      test_unbound_vertex_buffers_11();
       test_class_linkage();
       test_shader_query_gaps();
       test_creation_and_interop();
@@ -5887,6 +6019,7 @@ int main(void) {
       test_fixed_state();
       test_sampler_state();
       test_depth_textures_11();
+      test_d32s8_11();
       test_texture_uavs();
       test_pixel_texture_uavs();
       test_layered_target();

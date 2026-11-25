@@ -990,11 +990,11 @@ static void tex_planar_copy(Dev *d, Tex *to, UINT to_slice, UINT x, UINT y, Tex 
 
 /* ---- the texels of depth textures ------------------------------------------------------------------------------------------------------------------------------------- */
 
-/* A depth texture (made for depth, or a staging texture of a depth format) keeps its texels in a Direct3D 12 depth buffer below (D32_FLOAT, which holds D16 too, or
- * D24_UNORM_S8_UINT, which holds D32S8 too: formats.inc), whose planes - the depth, and the stencil of D24S8 - Direct3D 12 copies to and from footprints of their own (the depth as
- * a float of D32_FLOAT or a 24-bit code in the low bits of a word of D24S8, the stencil as bytes). A whole subresource goes through them as the program's texels: D32_FLOAT /
- * R32_TYPELESS a float, D16_UNORM / R16_TYPELESS a 16-bit code, D24_UNORM_S8_UINT / R24G8_TYPELESS the 24-bit code with the stencil in the high byte, D32_FLOAT_S8X24_UINT /
- * R32G8X24_TYPELESS a float and then the stencil in the next byte (three zero bytes after it). The 24-bit depth of a D32S8 texture is the precision it keeps here. */
+/* A depth texture (made for depth, or a staging texture of a depth format) keeps its texels in a Direct3D 12 depth buffer below (D32_FLOAT, which holds D16 too,
+ * D24_UNORM_S8_UINT or D32_FLOAT_S8X24_UINT: formats.inc), whose planes - the depth, and the stencil of D24S8 / D32S8 - Direct3D 12 copies to and from footprints of their own (the
+ * depth as a float of D32_FLOAT and D32S8 or a 24-bit code in the low bits of a word of D24S8, the stencil as bytes). A whole subresource goes through them as the program's texels:
+ * D32_FLOAT / R32_TYPELESS a float, D16_UNORM / R16_TYPELESS a 16-bit code, D24_UNORM_S8_UINT / R24G8_TYPELESS the 24-bit code with the stencil in the high byte,
+ * D32_FLOAT_S8X24_UINT / R32G8X24_TYPELESS a float (all 32 bits of it) and then the stencil in the next byte (three zero bytes after it). */
 static UINT depth_texel_bytes(DXGI_FORMAT f) {
   switch (f) {
     case DXGI_FORMAT_D16_UNORM: case DXGI_FORMAT_R16_TYPELESS: return 2;
@@ -1003,7 +1003,11 @@ static UINT depth_texel_bytes(DXGI_FORMAT f) {
   }
 }
 /* Whether the depth buffer below has a stencil plane (D24_UNORM_S8_UINT, or R24G8_TYPELESS made for depth); else it is a buffer of float depth (D32_FLOAT, R32_TYPELESS). */
-static BOOL tex_depth_stencil_below(const Tex *t) { return t->stored == DXGI_FORMAT_D24_UNORM_S8_UINT || t->stored == DXGI_FORMAT_R24G8_TYPELESS; }
+static BOOL tex_depth_stencil_below(const Tex *t) {
+  return t->stored == DXGI_FORMAT_D24_UNORM_S8_UINT || t->stored == DXGI_FORMAT_R24G8_TYPELESS || t->stored == DXGI_FORMAT_D32_FLOAT_S8X24_UINT || t->stored == DXGI_FORMAT_R32G8X24_TYPELESS;
+}
+/* ... and whether its depth plane is of floats (D32_FLOAT, D32_FLOAT_S8X24_UINT and their typeless forms), not 24-bit codes. */
+static BOOL tex_depth_float_below(const Tex *t) { return t->stored != DXGI_FORMAT_D24_UNORM_S8_UINT && t->stored != DXGI_FORMAT_R24G8_TYPELESS; }
 static UINT32 depth_unorm(FLOAT v, UINT bits) {
   const double top = (double)((1u << bits) - 1);
   if (!(v > 0.0f)) return 0;
@@ -1021,7 +1025,7 @@ static HRESULT tex_depth_rows(Dev *d, Tex *t, UINT sub, BYTE *rows, UINT pitch, 
     return S_OK;
   }
   if (t->desc.SampleDesc.Count > 1) return E_INVALIDARG;      /* (the texels of a multisampled buffer are its samples, which are not copied to memory) */
-  const BOOL stencil = tex_depth_stencil_below(t), float_depth = !stencil;
+  const BOOL stencil = tex_depth_stencil_below(t), float_depth = tex_depth_float_below(t);
   const UINT planes = stencil ? 2 : 1, per_plane = t->kmips * (t->kind == 1 ? 1 : t->desc.ArraySize);
   const UINT plane_pitch[2] = {(w * 4 + 255u) & ~255u, (w + 255u) & ~255u};
   const UINT64 plane_at[2] = {0, ((UINT64)plane_pitch[0] * h + 511u) & ~(UINT64)511u};
@@ -1045,7 +1049,7 @@ static HRESULT tex_depth_rows(Dev *d, Tex *t, UINT sub, BYTE *rows, UINT pitch, 
         switch (t->desc.Format) {
           case DXGI_FORMAT_D16_UNORM: case DXGI_FORMAT_R16_TYPELESS: f = (FLOAT)(low & 0xFFFFu) / 65535.0f; break;
           case DXGI_FORMAT_D24_UNORM_S8_UINT: case DXGI_FORMAT_R24G8_TYPELESS: word = low & 0xFFFFFFu, s = (BYTE)(low >> 24); break;
-          case DXGI_FORMAT_D32_FLOAT_S8X24_UINT: case DXGI_FORMAT_R32G8X24_TYPELESS: memcpy(&f, in, 4); word = depth_unorm(f, 24); s = in[4]; break;
+          case DXGI_FORMAT_D32_FLOAT_S8X24_UINT: case DXGI_FORMAT_R32G8X24_TYPELESS: memcpy(&f, in, 4); s = in[4]; break;
           default: memcpy(&f, in, 4); break;
         }
         if (float_depth) memcpy(memory + (SIZE_T)y * plane_pitch[0] + (SIZE_T)x * 4, &f, 4);
@@ -1921,7 +1925,7 @@ static HRESULT srv_of_buffer(Dev *d, Buf *b, const D3D11_SHADER_RESOURCE_VIEW_DE
 /* A shader resource view of a depth texture (made R16_TYPELESS, R24G8_TYPELESS, R32_TYPELESS or R32G8X24_TYPELESS with D3D11_BIND_DEPTH_STENCIL | D3D11_BIND_SHADER_RESOURCE) is
  * of one of its planes, named by the format as DXGI names them: the depth through R16_UNORM, R24_UNORM_X8_TYPELESS, R32_FLOAT, R32_FLOAT_X8X24_TYPELESS; the stencil through
  * X24_TYPELESS_G8_UINT or X32_TYPELESS_G8X24_UINT. Whether `view` is such a format of a texture of `tex`, and the format of the view of the Direct3D 12 texture below (which
- * keeps D16 in D32_FLOAT and D32S8 in D24_UNORM_S8_UINT) and whether it is of the stencil. */
+ * keeps D16 in D32_FLOAT) and whether it is of the stencil. */
 static BOOL depth_view_format(DXGI_FORMAT tex, DXGI_FORMAT view, DXGI_FORMAT *below, BOOL *stencil) {
   DXGI_FORMAT f = DXGI_FORMAT_UNKNOWN;
   BOOL s = FALSE;
@@ -1930,8 +1934,8 @@ static BOOL depth_view_format(DXGI_FORMAT tex, DXGI_FORMAT view, DXGI_FORMAT *be
     case DXGI_FORMAT_R32_FLOAT: if (tex == DXGI_FORMAT_R32_TYPELESS) f = DXGI_FORMAT_R32_FLOAT; break;
     case DXGI_FORMAT_R24_UNORM_X8_TYPELESS: if (tex == DXGI_FORMAT_R24G8_TYPELESS) f = DXGI_FORMAT_R24_UNORM_X8_TYPELESS; break;
     case DXGI_FORMAT_X24_TYPELESS_G8_UINT: if (tex == DXGI_FORMAT_R24G8_TYPELESS) f = DXGI_FORMAT_X24_TYPELESS_G8_UINT, s = TRUE; break;
-    case DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS: if (tex == DXGI_FORMAT_R32G8X24_TYPELESS) f = DXGI_FORMAT_R24_UNORM_X8_TYPELESS; break;
-    case DXGI_FORMAT_X32_TYPELESS_G8X24_UINT: if (tex == DXGI_FORMAT_R32G8X24_TYPELESS) f = DXGI_FORMAT_X24_TYPELESS_G8_UINT, s = TRUE; break;
+    case DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS: if (tex == DXGI_FORMAT_R32G8X24_TYPELESS) f = DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS; break;
+    case DXGI_FORMAT_X32_TYPELESS_G8X24_UINT: if (tex == DXGI_FORMAT_R32G8X24_TYPELESS) f = DXGI_FORMAT_X32_TYPELESS_G8X24_UINT, s = TRUE; break;
     default: break;
   }
   if (f == DXGI_FORMAT_UNKNOWN) return FALSE;
