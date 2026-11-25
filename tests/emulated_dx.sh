@@ -23,7 +23,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 work=${TMPDIR:-/tmp}/tcos-emudx
-export TCOS_EMU_SECONDS=${TCOS_EMU_SECONDS:-300}      # (the Direct3D suites run longer than the runner's 60 seconds)
+export TCOS_EMU_SECONDS=${TCOS_EMU_SECONDS:-900}      # (the Direct3D suites run longer than the runner's 60 seconds, and d3d11test nears 300 on a busy machine)
 mkdir -p "$work/sys32" "$work/obj"
 if [ ! -f "$work/build/build.ninja" ]; then
   cmake -S . -B "$work/build" -G Ninja -DCMAKE_TOOLCHAIN_FILE="$PWD/cmake/toolchain-x86_64-uefi.cmake" -DCMAKE_BUILD_TYPE=Debug > /dev/null
