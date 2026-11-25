@@ -5082,15 +5082,29 @@ static void test_d32s8_11(void) {
         }
       ID3D11DeviceContext_Unmap(g_context, (ID3D11Resource *)typed, 0);
     }
-    ID3D11DeviceContext_CopyResource(g_context, (ID3D11Resource *)depth, (ID3D11Resource *)typed);
-    ID3D11DeviceContext_CopyResource(g_context, (ID3D11Resource *)raw, (ID3D11Resource *)depth);
+    /* (through a depth buffer that shaders do not read - a D32_FLOAT_S8X24_UINT texture of BIND_DEPTH_STENCIL alone -, as the staging texture is one) */
+    D3D11_TEXTURE2D_DESC bd = desc;
+    bd.Format = DXGI_FORMAT_D32_FLOAT_S8X24_UINT, bd.BindFlags = D3D11_BIND_DEPTH_STENCIL;
+    ID3D11Texture2D *buffer = NULL;
+    ID3D11Device_CreateTexture2D(g_device, &bd, NULL, &buffer);
+    if (buffer) {
+      ID3D11DeviceContext_CopyResource(g_context, (ID3D11Resource *)buffer, (ID3D11Resource *)typed);
+      ID3D11DeviceContext_CopyResource(g_context, (ID3D11Resource *)raw, (ID3D11Resource *)buffer);
+      ID3D11Texture2D_Release(buffer);
+    }
     int bad = 0;
     if (SUCCEEDED(ID3D11DeviceContext_Map(g_context, (ID3D11Resource *)raw, 0, D3D11_MAP_READ, 0, &mapped)) && mapped.pData) {
       for (UINT y = 0; y < 16; ++y)
         for (UINT x = 0; x < 16; ++x) {
           const BYTE *texel = (const BYTE *)mapped.pData + y * mapped.RowPitch + x * 8;
           const float f = 0.1234567f + (float)(y * 16 + x) * 1e-7f;
-          bad += memcmp(texel, &f, 4) != 0 || texel[4] != (BYTE)(x + y);
+          const int wrong = memcmp(texel, &f, 4) != 0 || texel[4] != (BYTE)(x + y);
+          if (wrong && !bad) {
+            UINT32 got = 0, want = 0;
+            memcpy(&got, texel, 4), memcpy(&want, &f, 4);
+            printf("  d3d11test: D32S8 texel %u, %u: depth %08x stencil %u, want %08x %u\n", x, y, (unsigned)got, texel[4], (unsigned)want, (unsigned)(x + y));
+          }
+          bad += wrong;
         }
       ID3D11DeviceContext_Unmap(g_context, (ID3D11Resource *)raw, 0);
     } else {
