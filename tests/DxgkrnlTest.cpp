@@ -8075,6 +8075,245 @@ void test_alpha_to_coverage() {
   }
 }
 
+
+// --- Fixed state and formats of gap pass 4 -----------------------------------------------------------------------------------------------------------------------------------
+
+// The filter word (filter_word / decode_filter_word: the separate magnification filter, the reductions, coordinates in texels) and a D3D12_FILTER read as a sampler; SetTopology's
+// strip cut word; the line modes on the CPU renderer (a horizontal line between rows 7 and 8 of a 16 x 16 target: one row aliased, two as a quadrilateral 1.4 wide, one 1.0 wide,
+// and an alpha-antialiased diagonal whose pixels hold the part of them it covers in the alpha), the escape's 'LIN1' part and a device without the line modes; the R1 copies
+// (NarrowLayout::R1: bits into R8Unorm and A8B8G8R8 images and back); mirrors of the one- and two-channel families and of several levels.
+void test_fixed_state_gaps() {
+  {
+    graphics::SamplerDesc s;
+    s.filter = graphics::Filter::Nearest, s.separate_mag = true, s.mag_filter = graphics::Filter::Linear, s.reduction = graphics::SamplerReduction::Maximum, s.unnormalized = true;
+    graphics::SamplerDesc back;
+    CHECK(filter_word(s) == (0u | 2u | 4u | (2u << 4) | 0x100u) && decode_filter_word(filter_word(s), &back) && back.separate_mag && back.mag_filter == graphics::Filter::Linear &&
+          back.filter == graphics::Filter::Nearest && back.reduction == graphics::SamplerReduction::Maximum && back.unnormalized);
+    CHECK(decode_filter_word(1, &back) && back.filter == graphics::Filter::Linear && !back.separate_mag && back.mag_filter == graphics::Filter::Linear);
+    CHECK(!decode_filter_word(4, &back) && !decode_filter_word(3u << 4, &back) && !decode_filter_word(0x200, &back) && !decode_filter_word(0x8, &back));
+    CHECK(graphics::sampler_features2(s) == (graphics::kFeature2SeparateFilters | graphics::kFeature2SamplerReductions | graphics::kFeature2UnnormalizedCoordinates));
+    graphics::SamplerDesc d;
+    CHECK(d3d12_filter(0x10, &d) && d.filter == graphics::Filter::Linear && d.mag_filter == graphics::Filter::Nearest && d.separate_mag && d.mip_filter == graphics::MipFilter::Nearest);
+    CHECK(d3d12_filter(0x154, &d) && !d.separate_mag && d.filter == graphics::Filter::Linear && d.reduction == graphics::SamplerReduction::Minimum && d.mip_filter == graphics::MipFilter::Nearest);
+    CHECK(d3d12_filter(0x1D5, &d) && d.reduction == graphics::SamplerReduction::Maximum && d.mip_filter == graphics::MipFilter::Linear);
+    CHECK(!d3d12_filter(0x40, &d) && !d3d12_filter(0x2, &d) && !d3d12_filter(0x200, &d));
+    CHECK(is_strip_cut(StripCut::IndexMax, 2, 0xFFFF) && !is_strip_cut(StripCut::IndexMax, 4, 0xFFFF) && is_strip_cut(StripCut::Cut16, 4, 0xFFFF) && !is_strip_cut(StripCut::None, 2, 0xFFFF) &&
+          is_strip_cut(StripCut::Cut32, 4, 0xFFFFFFFFu) && !is_strip_cut(StripCut::Cut32, 2, 0xFFFF));
+  }
+  Env e;
+  AdapterCaps caps;
+  CHECK(e.kernel.query_adapter_caps(kPid, e.adapter, &caps) == status::kSuccess);
+  const uint32_t mine = graphics::kFeature2SeparateFilters | graphics::kFeature2SamplerReductions | graphics::kFeature2UnnormalizedCoordinates | graphics::kFeature2LineModes;
+  CHECK((caps.features2 & mine) == mine);
+  Handle rt = e.alloc(kTarget, Format::A8R8G8B8, 16, 16), vb = e.buffer(kAllocVertexBuffer, 256);
+  const float identity[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+  auto pipeline_for = [&](PipelineDesc pd) {
+    Handle vs = 0, fs = 0, pipe = 0;
+    CHECK(e.kernel.create_shader(kPid, e.dev, {ShaderKind::ColoredVertex, graphics::ShaderStage::Vertex, {}}, &vs) == status::kSuccess);
+    CHECK(e.kernel.create_shader(kPid, e.dev, {ShaderKind::ColoredFragment, graphics::ShaderStage::Fragment, {}}, &fs) == status::kSuccess);
+    graphics::GraphicsPipelineDesc d;
+    graphics::describe_colored_pipeline(&d);
+    pd.vertex_shader = vs, pd.fragment_shader = fs;
+    pd.vertex_stride = d.vertex_stride, pd.attribute_count = d.attribute_count, pd.varying_count = d.varying_count;
+    for (uint32_t i = 0; i < d.attribute_count; ++i) pd.attributes[i] = d.attributes[i];
+    pd.cull_mode = graphics::CullMode::None;
+    CHECK(e.kernel.create_pipeline(kPid, e.dev, pd, &pipe) == status::kSuccess);
+    return pipe;
+  };
+  auto picture = [&](Handle pipe, Topology topology) {
+    CommandWriter w(e.allocator);
+    w.begin_pass(0, kNoAllocation, kPassClearColor, {0, 0, 0, 1}, 1, 0);
+    w.bind_pipeline(pipe);
+    w.bind_vertex_buffer(1);
+    w.push_constants(floats(identity, 16));
+    w.set_topology(topology);
+    w.draw(2);
+    w.end_pass();
+    CHECK(e.render(w, {rt, vb}) == status::kSuccess);
+    std::vector<uint32_t> out;
+    for (uint32_t y = 0; y < 16; ++y)
+      for (uint32_t x = 0; x < 16; ++x) out.push_back(e.pixel(rt, x, y));
+    return out;
+  };
+  {
+    const float horizontal[14] = {-0.75f, 0, 0.5f, 1, 0, 0, 1, 0.75f, 0, 0.5f, 1, 0, 0, 1};
+    CHECK(e.write(vb, floats(horizontal, 14)));
+    uint32_t rows[3] = {0, 0, 0};
+    const graphics::LineMode modes[3] = {graphics::LineMode::Aliased, graphics::LineMode::QuadrilateralWide, graphics::LineMode::QuadrilateralNarrow};
+    for (int m = 0; m < 3; ++m) {
+      PipelineDesc pd;
+      pd.line_mode = modes[m];
+      const std::vector<uint32_t> img = picture(pipeline_for(pd), Topology::LineList);
+      for (uint32_t y = 0; y < 16 && img.size() == 256; ++y) rows[m] += (img[y * 16 + 8] & 0xFFFFFF) != 0;
+    }
+    printf("  line modes: aliased %u rows, quadrilateral 1.4 %u, 1.0 %u\n", rows[0], rows[1], rows[2]);
+    CHECK(rows[0] == 1 && rows[1] == 2 && rows[2] == 1);
+    // (an alpha-antialiased diagonal over black, blended with the source's alpha: partly covered pixels hold less than the full red, and every lit pixel is near the line)
+    const float diagonal[14] = {-0.7f, -0.6f, 0.5f, 1, 0, 0, 1, 0.7f, 0.5f, 0.5f, 1, 0, 0, 1};
+    CHECK(e.write(vb, floats(diagonal, 14)));
+    PipelineDesc smooth;
+    smooth.line_mode = graphics::LineMode::AlphaAntialiased;
+    smooth.blend.custom = smooth.blend.enable = true;
+    smooth.blend.src_color = graphics::BlendFactor::SrcAlpha, smooth.blend.dst_color = graphics::BlendFactor::InvSrcAlpha;
+    smooth.blend.src_alpha = graphics::BlendFactor::One, smooth.blend.dst_alpha = graphics::BlendFactor::Zero;
+    const std::vector<uint32_t> img = picture(pipeline_for(smooth), Topology::LineList);
+    uint32_t partial = 0, lit = 0;
+    for (uint32_t v : img) {
+      const uint32_t r = (v >> 16) & 0xFF;
+      lit += r != 0, partial += r != 0 && r < 250;
+    }
+    printf("  alpha-antialiased line: %u pixels, %u partly covered\n", lit, partial);
+    CHECK(lit >= 14 && partial >= 8 && img.size() == 256 && (img[0] & 0xFFFFFF) == 0 && (img[15] & 0xFFFFFF) == 0);
+  }
+  // (the escape's 'LIN1' part: a word of a known mode; twice, or a mode past the last, is refused)
+  {
+    Handle vs = 0, fs = 0;
+    CHECK(e.kernel.create_shader(kPid, e.dev, {ShaderKind::ColoredVertex, graphics::ShaderStage::Vertex, {}}, &vs) == status::kSuccess);
+    CHECK(e.kernel.create_shader(kPid, e.dev, {ShaderKind::ColoredFragment, graphics::ShaderStage::Fragment, {}}, &fs) == status::kSuccess);
+    auto request = [&](std::initializer_list<uint32_t> tail) {
+      ByteBuffer req(e.allocator);
+      req.put32(static_cast<uint32_t>(EscapeOp::CreatePipeline)), req.put32(vs), req.put32(fs), req.put32(28), req.put32(2), req.put32(1), req.put32(0);
+      req.put32(0), req.put32(0), req.put32(0);   // cull none, front face, flags
+      for (uint32_t w : {0u, 2u, 0u, 1u, 3u, 12u, 0u, 0u, 0u, 0u, 0u, 0u}) req.put32(w);
+      for (uint32_t w : {0u, 7u, 0u, 0u, 0u, 255u, 255u, 0u}) req.put32(w);   // stencil off
+      for (uint32_t w : {7u, 0u, 0u, 1u, 0u, 1u, 0u, 0u, 0u, 15u, 0u}) req.put32(w);   // depth compare Always, no blending, no per-instance attributes
+      for (uint32_t w : {1u, 0u}) req.put32(w);   // one target, no independent blend
+      for (int t = 0; t < 3; ++t)
+        for (uint32_t w : {0u, 0u, 1u, 0u, 1u, 0u, 0u, 0u, 15u}) req.put32(w);
+      for (uint32_t w : {0u, 0u, 0u, 0u}) req.put32(w);   // no multisample, no geometry, hull or domain shader
+      for (uint32_t w : {0u, 0u, 0u, 0u, 0u}) req.put32(w);   // no stream output, no more attributes, instance bits, slots, strides
+      req.put32(0);   // no more blends
+      for (uint32_t w : {0u, 0u, 0u, 0u}) req.put32(w);   // the constant blend colour
+      for (uint32_t w : tail) req.put32(w);
+      uint8_t reply[16];
+      uint32_t reply_bytes = 0;
+      return e.kernel.escape(kPid, e.dev, req.view(), ByteView(reply, sizeof reply), &reply_bytes);
+    };
+    const NtStatus plain = request({});
+    if (plain != status::kSuccess) printf("  'LIN1' base request: %x\n", static_cast<unsigned>(plain));
+    CHECK(plain == status::kSuccess);
+    CHECK(request({kPipelineLineTag, 1, 2}) == status::kSuccess);
+    CHECK(request({kPipelineLineTag, 1, 4}) == status::kInvalidParameter);
+    CHECK(request({kPipelineLineTag, 2, 1, 1}) == status::kInvalidParameter);
+    CHECK(request({kPipelineLineTag, 1, 1, kPipelineLineTag, 1, 1}) == status::kInvalidParameter);
+  }
+  // (a device without the line modes, the separate filters or the reductions refuses pipelines and bindings that need them)
+  {
+    FakeScreen screen2(8, 6);
+    graphics::SoftwareDevice inner(e.allocator, &screen2);
+    SpyDevice plain(inner);
+    plain.feature2_mask = ~mine;
+    Kernel limited(e.allocator);
+    AdapterConfig c2;
+    c2.display = &screen2;
+    CHECK(limited.add_adapter(plain, c2) == 0);
+    Handle a = 0, d = 0, vs = 0, fs = 0, pipe = 0;
+    CHECK(limited.open_process(kPid) == status::kSuccess && limited.open_adapter_from_index(kPid, 0, &a) == status::kSuccess && limited.create_device(kPid, a, &d) == status::kSuccess);
+    CHECK(limited.create_shader(kPid, d, {ShaderKind::ColoredVertex, graphics::ShaderStage::Vertex, {}}, &vs) == status::kSuccess);
+    CHECK(limited.create_shader(kPid, d, {ShaderKind::ColoredFragment, graphics::ShaderStage::Fragment, {}}, &fs) == status::kSuccess);
+    PipelineDesc pd;
+    graphics::GraphicsPipelineDesc gd;
+    graphics::describe_colored_pipeline(&gd);
+    pd.vertex_shader = vs, pd.fragment_shader = fs, pd.vertex_stride = gd.vertex_stride, pd.attribute_count = gd.attribute_count, pd.varying_count = gd.varying_count;
+    for (uint32_t i = 0; i < gd.attribute_count; ++i) pd.attributes[i] = gd.attributes[i];
+    pd.line_mode = graphics::LineMode::AlphaAntialiased;
+    CHECK(limited.create_pipeline(kPid, d, pd, &pipe) == status::kNotSupported);
+    pd.line_mode = graphics::LineMode::Aliased;
+    CHECK(limited.create_pipeline(kPid, d, pd, &pipe) == status::kSuccess);
+  }
+  // R1 copies: two rows of 12 pixels (2 bytes each, the low nibble of the second byte past the width) into an R8Unorm image and an A8B8G8R8 one, and back
+  {
+    Handle r8 = e.alloc(kTexture, Format::R8Unorm, 12, 2), wide = e.alloc(kTexture, Format::A8B8G8R8, 12, 2);
+    Handle bits = e.buffer(kAllocVertexBuffer, 64), back = e.buffer(kAllocVertexBuffer, 64);
+    std::vector<uint8_t> rows(64, 0);
+    rows[0] = 0xA5, rows[1] = 0xF3, rows[8] = 0x01, rows[9] = 0x80;
+    CHECK(e.write(bits, ConstByteView(rows.data(), rows.size())));
+    std::vector<uint8_t> zeros(64, 0x0F);
+    CHECK(e.write(back, ConstByteView(zeros.data(), zeros.size())));
+    for (int k = 0; k < 2; ++k) {
+      CommandWriter w(e.allocator);
+      w.copy_buffer_image_narrow(0, 0, 0, 0, 0, 0, 12, 2, 1, 0, 8, NarrowLayout::R1);
+      CHECK(e.render(w, {k ? wide : r8, bits}) == status::kSuccess);
+    }
+    LockResult lr;
+    if (e.kernel.lock(kPid, r8, kLockReadOnly, 0, &lr) == status::kSuccess) {
+      printf("  R1 into R8Unorm: %02x %02x %02x %02x, pitch %u\n", lr.data[0], lr.data[1], lr.data[2], lr.data[3], static_cast<unsigned>(lr.pitch));
+      // (0xA5: 1 0 1 0 0 1 0 1; 0xF3: 1 1 1 1; row 1: 0x01 - pixel 7 -, 0x80 - pixel 8)
+      CHECK(lr.data[0] == 0xFF && lr.data[1] == 0 && lr.data[2] == 0xFF && lr.data[5] == 0xFF && lr.data[8] == 0xFF && lr.data[11] == 0xFF);
+      CHECK(lr.data[lr.pitch + 7] == 0xFF && lr.data[lr.pitch + 8] == 0xFF && lr.data[lr.pitch + 6] == 0 && lr.data[lr.pitch + 9] == 0);
+      e.kernel.unlock(kPid, r8);
+    } else CHECK(0);
+    CHECK(e.pixel(wide, 0, 0) == 0xFF0000FFu && e.pixel(wide, 1, 0) == 0xFF000000u && e.pixel(wide, 8, 1) == 0xFF0000FFu);
+    {
+      CommandWriter w(e.allocator);
+      w.copy_buffer_image_narrow(1, 0, 0, 0, 0, 0, 12, 2, 1, 0, 8, NarrowLayout::R1);
+      CHECK(e.render(w, {r8, back}) == status::kSuccess);
+    }
+    auto byte_at = [&](uint32_t i) {
+      LockResult b;
+      uint8_t v = 0;
+      if (e.kernel.lock(kPid, back, kLockReadOnly, 0, &b) == status::kSuccess) {
+        v = b.data[i];
+        e.kernel.unlock(kPid, back);
+      }
+      return v;
+    };
+    // (the bits as they were; the four past the width in the second byte keep the buffer's 0xF)
+    CHECK(byte_at(0) == 0xA5 && byte_at(1) == 0xFF && byte_at(8) == 0x01 && byte_at(9) == 0x8F);
+    // (refused: an R1 copy of an image of another format, a pitch too short for the bits)
+    Handle r16 = e.alloc(kTexture, Format::R16Unorm, 12, 2);
+    CommandWriter w(e.allocator);
+    w.copy_buffer_image_narrow(0, 0, 0, 0, 0, 0, 12, 2, 1, 0, 8, NarrowLayout::R1);
+    CHECK(e.render(w, {r16, bits}) == status::kInvalidParameter);
+    CommandWriter w2(e.allocator);
+    w2.copy_buffer_image_narrow(0, 0, 0, 0, 0, 0, 12, 2, 1, 0, 1, NarrowLayout::R1);
+    CHECK(e.render(w2, {r8, bits}) == status::kInvalidParameter);
+  }
+  // Mirrors of the narrow families: an R8Unorm image shown as R8Uint (the bytes as they are, no alpha), written back; R16Unorm as R16Float; another family refused; a mirror of
+  // two levels of a texture of three, each of its levels the source's
+  {
+    VidMm& mm = e.kernel.adapter(0)->vidmm();
+    auto make = [&](uint32_t flags, Format f, uint32_t w, uint32_t h, uint32_t mips) {
+      AllocationDesc d;
+      d.flags = flags, d.format = f, d.width = w, d.height = h, d.mip_levels = mips;
+      SharedPointer<Allocation> a;
+      CHECK(mm.create(d, &a) == status::kSuccess);
+      return a;
+    };
+    SharedPointer<Allocation> r8 = make(kAllocTexture, Format::R8Unorm, 4, 2, 1), as_uint = make(kAllocTexture | kAllocRenderTarget, Format::R8Uint, 4, 2, 1);
+    SharedPointer<Allocation> r16 = make(kAllocTexture, Format::R16Unorm, 4, 2, 1), as_half = make(kAllocTexture, Format::R16Float, 4, 2, 1);
+    SharedPointer<Allocation> levels = make(kAllocTexture, Format::R8G8Unorm, 8, 4, 3), two = make(kAllocTexture, Format::R8G8Snorm, 4, 2, 2);
+    if (!r8 || !as_uint || !r16 || !as_half || !levels || !two) return;
+    ByteView b = r8->writable_backing();
+    for (uint64_t i = 0; i < b.size(); ++i) b[i] = static_cast<uint8_t>(200 + i);
+    mm.note_cpu_write(*r8);
+    const SharedPointer<Allocation> one[1] = {r8}, other[1] = {r16};
+    CHECK(mm.set_mirror(*as_uint, ArrayView<const SharedPointer<Allocation>>(other, 1), 0, 0) == status::kInvalidParameter);   // (R16 bytes for an R8 view)
+    CHECK(mm.set_mirror(*as_uint, ArrayView<const SharedPointer<Allocation>>(one, 1), kMirrorWriteBack, 1) == status::kSuccess);
+    CHECK(mm.refresh_mirror(*as_uint, true) && as_uint->backing().size() == 8 && as_uint->backing()[0] == 200 && as_uint->backing()[7] == 207);
+    ByteView drawn = as_uint->writable_backing();
+    drawn[3] = 9;
+    mm.note_cpu_write(*as_uint);
+    CHECK(mm.write_back_mirror(*as_uint) && r8->backing()[3] == 9 && r8->backing()[2] == 202);
+    ByteView h = r16->writable_backing();
+    for (uint64_t i = 0; i < h.size(); ++i) h[i] = static_cast<uint8_t>(i);
+    mm.note_cpu_write(*r16);
+    CHECK(mm.set_mirror(*as_half, ArrayView<const SharedPointer<Allocation>>(other, 1), 0, 0) == status::kSuccess && mm.refresh_mirror(*as_half, true) && as_half->backing()[15] == 15);
+    ByteView l = levels->writable_backing();
+    for (uint64_t i = 0; i < l.size(); ++i) l[i] = static_cast<uint8_t>(i);
+    mm.note_cpu_write(*levels);
+    const SharedPointer<Allocation> twice[2] = {levels, levels};
+    const uint32_t subresources[2] = {1, 2};      // (levels 1 and 2 of the source, layer 0: the mirror's levels 0 and 1)
+    CHECK(mm.set_mirror(*two, ArrayView<const SharedPointer<Allocation>>(twice, 1), 0, 0) == status::kInvalidParameter);   // (one source for two levels)
+    CHECK(mm.set_mirror(*two, ArrayView<const SharedPointer<Allocation>>(twice, 2), 0, 0) == status::kInvalidParameter);   // (levels need the subresources)
+    CHECK(mm.set_mirror(*two, ArrayView<const SharedPointer<Allocation>>(twice, 2), 0, 0, ArrayView<const uint32_t>(subresources, 2)) == status::kSuccess);
+    CHECK(mm.refresh_mirror(*two, true));
+    uint64_t at = 0, bytes = 0, src_at = 0, src_bytes = 0;
+    CHECK(two->subresource_range(1, 0, &at, &bytes) && levels->subresource_range(2, 0, &src_at, &src_bytes) && bytes == src_bytes && bytes == 2 * 1 * 2);
+    CHECK(two->backing()[0] == levels->backing()[64] && two->backing()[at] == levels->backing()[src_at] && two->backing()[at + 3] == levels->backing()[src_at + 3]);
+  }
+}
+
 void test_conformance() {
   test_half_floats();
   HostAllocator allocator;
@@ -8166,6 +8405,32 @@ void test_conformance() {
         // (the corners are the border's colour, (0.2, 0.4, 0.6) - point filtered on the left, linear on the right; the middle of each half is the checker)
         CHECK(px(1, 1) == 0x336699 && px(14, 30) == 0x336699 && px(17, 1) == 0x336699 && px(30, 30) == 0x336699);
         CHECK(px(8, 16) != 0x336699 && px(24, 16) != 0x336699 && px(8, 16) != 0);
+      }
+      if (!__builtin_strcmp(r.name, "Direct3D 10 separate minification and magnification filters (DXBC)")) {
+        // (the checker, magnified: blended between its texels on the left - colours other than its own -, its texels' own colours on the right)
+        uint32_t blends = 0, own = 0;
+        for (uint32_t y = 2; y < 30; ++y)
+          for (uint32_t x = 1; x < 15; ++x) blends += px(x, y) != 0xFFA020 && px(x, y) != 0x2060F0 && px(x, y) != 0xFFFFFF;
+        for (uint32_t y = 0; y < 32; ++y)
+          for (uint32_t x = 17; x < 32; ++x) own += px(x, y) == 0xFFA020 || px(x, y) == 0x2060F0 || px(x, y) == 0xFFFFFF;
+        CHECK(blends > 100 && own == 32 * 15);
+      }
+      if (!__builtin_strcmp(r.name, "Direct3D 11.1 minimum and maximum filters (DXBC)")) {
+        // (between texels of the two colours: their greatest channels (ff a0 f0) on the left, their least (20 60 20) on the right)
+        uint32_t greatest = 0, least = 0;
+        for (uint32_t i = 0; i < 32 * 32; ++i) greatest += (i % 32) < 16 && px(i % 32, i / 32) == 0xFFA0F0, least += (i % 32) >= 16 && px(i % 32, i / 32) == 0x206020;
+        CHECK(greatest > 50 && least > 50);
+      }
+      if (!__builtin_strcmp(r.name, "Direct3D 12 non-normalized sampler coordinates (DXBC)")) {
+        // (the right half - coordinates in texels - the same picture as the left)
+        uint32_t same = 0;
+        for (uint32_t y = 0; y < 32; ++y)
+          for (uint32_t x = 0; x < 16; ++x) same += px(x, y) == px(x + 16, y);
+        CHECK(same >= 32 * 16 - 32);
+      }
+      if (!__builtin_strcmp(r.name, "Direct3D 12 index buffer strip cut")) {
+        // (left: two triangles at the top, nothing below them; right: the strip reaches vertex 65535 at the bottom)
+        CHECK(px(4, 2) == 0xFF0000 && px(12, 2) == 0x00FF00 && px(8, 20) == 0 && px(24, 20) != 0);
       }
       if (!__builtin_strcmp(r.name, "Direct3D 10 several viewports and SV_ViewportArrayIndex (DXBC)")) {
         // (red in the left half above row 20 - its scissor rectangle -, green in the right half, blue in the middle of the left half; nothing in the left half below the scissor)
@@ -10481,6 +10746,7 @@ int main() {
   test_alpha_to_coverage();
   test_derivative_draw();
   test_conformance();
+  test_fixed_state_gaps();
   test_occlusion_queries();
   test_texture_kinds();
   test_mipmapped_layers();

@@ -32,15 +32,22 @@
  *   - fixed state the device lacks is refused (pso.inc): depth bias, depth clip, wireframe, two-sided stencil, dual-source blending, logic ops, anisotropy, custom border
  *     colours and several viewports need the kernel's RasterizerState, DualSourceBlend, LogicOps, SamplerState and Viewports features (the CPU renderer and virgl;
  *     virglrenderer 1.3.0 drops anisotropy, and virgl refuses a layer or viewport chosen in a vertex or domain shader)
- *   - texture formats: every colour format and BC1-BC7 (base.inc g_formats) on the CPU renderer and virgl, except R1_UNORM; R8 and R16 unorm are kept widened;
+ *   - texture formats: every colour format and BC1-BC7 (base.inc g_formats) on the CPU renderer and virgl, R1_UNORM sampled and loaded (no render target, unordered access,
+ *     volume, cube or CPU-visible memory: the format's support); R8 / R8G8 / R16 / R16G16 unorm and typeless as the kernel's own narrow images where the adapter has them for
+ *     the texture's use (widened elsewhere; a typeless one's views of the other kinds of its family are mirrors - not of a volume's slices nor of more than 256 subresources);
  *     depth buffers are sampled at level 0 only and are not copied; ResourceMinLODClamp is ignored; no gather from cube arrays
+ *   - samplers: the MINIMUM_ / MAXIMUM_ filters and coordinates in texels (D3D12_SAMPLER_FLAG_NON_NORMALIZED_COORDINATES) where the kernel's device has them (the CPU renderer;
+ *     a draw with one is refused on virgl); the separate minification and magnification filters on the CPU renderer and virgl (one filter, linear where either is, elsewhere)
+ *   - lines: aliased, alpha-antialiased and quadrilateral 1.4 / 1.0 wide on the CPU renderer; virgl's are the host's smooth and multisampled lines (its aliased line on a target
+ *     of one sample); the other devices draw aliased lines and refuse narrow quadrilateral ones
  *   - a pass with a depth buffer and no render target draws into a colour image of the buffer's size that nothing reads (cmdlist.inc depth_companion): it costs that memory
  *   - multisampled images are render targets and depth buffers of the adapter's sample counts, drawn into and resolved (not read by shaders through this DLL)
  *   - tiled resources at tier 1 only, heaps shared across adapters (DXGI_ERROR_UNSUPPORTED; shared handles of one adapter's resources and heaps, and of fences of any
  *     adapter, are made: device.inc), resource state validation (barriers are accepted and not looked at, except aliasing), the debug layer
  *   - of the later interfaces (ID3D12Device1 .. 14, ID3D12GraphicsCommandList1 .. 10: device1.inc, cmdlist1.inc, library.inc, rootsig.inc; what mingw lacks of them is in
  *     d3d12_types.h), the features reported at their "not supported" tier: ray tracing, mesh shaders, variable-rate shading, view instancing, depth bounds, sample
- *     positions, sampler feedback, work graphs, protected sessions, meta commands, D3D12_SAMPLER_DESC2, a strip cut set by the command list (OPTIONS15)
+ *     positions, sampler feedback, work graphs, protected sessions, meta commands (D3D12_SAMPLER_DESC2, the strip cut of the command list and triangle fans are done:
+ *     heaps.inc sampler_descriptor, cmdlist1.inc IASetIndexBufferStripCutValue)
  *   - vertex elements: every Direct3D 11 input-assembler format and instance step rates (pso.inc vertex_format) where the device reads them (the CPU renderer and virgl)
  *     (queries are occlusion, binary occlusion, pipeline statistics (and 1), stream output statistics and timestamps (also on copy queues), several open at once, at
  *     most 64 per list; the size of a stream output buffer view is not looked at; ExecuteIndirect is made when the list is executed; bundles replay their calls: extras.inc)
@@ -103,6 +110,11 @@ EXPORT void WINAPI TcosD3D12StageConstantBases(ID3D12Device *device, UINT geomet
   dev->next_stage_base[0] = geometry;
   dev->next_stage_base[1] = hull;
   dev->next_stage_base[2] = domain;
+}
+EXPORT void WINAPI TcosD3D12DeviceFeatures(ID3D12Device *device, UINT *features, UINT *features2) {
+  Dev *dev = (Dev *)device;
+  if (features) *features = dev ? dev->caps.features : 0;
+  if (features2) *features2 = dev ? dev->caps.features2 : 0;
 }
 EXPORT void WINAPI TcosD3D12ResourceOptions(ID3D12Device *device, UINT flags) {
   Dev *dev = (Dev *)device;

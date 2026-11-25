@@ -99,6 +99,9 @@ struct RootSignatureDesc {
 // Parses a serialized root signature (version 1.0 or 1.1), or a DXBC container with an RTS0 chunk. kInvalidParameter for anything that is not one, truncated or against the rules (too many
 // parameters or DWORDs, a table of both samplers and views, an unbounded range that is not the last, overlapping ranges).
 NtStatus parse_root_signature(ConstByteView blob, RootSignatureDesc* out);
+// A D3D12_FILTER as the sampler's filters, mip filter and reduction (the comparison and anisotropy are the caller's); false for a value that is not one (the anisotropic filters with a
+// point mip filter, 0x54 .. 0x1D4, are values: AnisoFilterWithPointMipSupported).
+bool d3d12_filter(uint32_t filter, graphics::SamplerDesc* s);
 
 class RootSignatureObject {
  public:

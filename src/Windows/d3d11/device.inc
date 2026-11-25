@@ -253,10 +253,16 @@ static HRESULT STDMETHODCALLTYPE dev_CheckFeatureSupport(Dev *d, D3D11_FEATURE f
     case D3D11_FEATURE_SHADER_MIN_PRECISION_SUPPORT: FEATURE_SIZE(D3D11_FEATURE_DATA_SHADER_MIN_PRECISION_SUPPORT); break;      /* (every stage computes in 32 bits) */
     case D3D11_FEATURE_D3D9_SHADOW_SUPPORT: FEATURE_SIZE(D3D11_FEATURE_DATA_D3D9_SHADOW_SUPPORT); break;
     case D3D11_FEATURE_D3D11_OPTIONS1: {
-      /* (tiled resources: tier 1, over Direct3D 12's reserved resources - tiled.inc; no min/max filtering, ClearView of depth formats or Map of default buffers) */
+      /* (tiled resources: tier 1, over Direct3D 12's reserved resources - tiled.inc; min/max filtering where the kernel's device has kFeature2SamplerReductions - the CPU renderer -;
+       * no ClearView of depth formats or Map of default buffers) */
       FEATURE_SIZE(D3D11_FEATURE_DATA_D3D11_OPTIONS1);
       memset(data, 0, size);
       ((D3D11_FEATURE_DATA_D3D11_OPTIONS1 *)data)->TiledResourcesTier = dev_tiled_tier(d);
+      {
+        UINT features2 = 0;
+        TcosD3D12DeviceFeatures(d->d12, NULL, &features2);
+        ((D3D11_FEATURE_DATA_D3D11_OPTIONS1 *)data)->MinMaxFiltering = (features2 & (1u << 25)) ? TRUE : FALSE;
+      }
       return S_OK;
     }
     case D3D11_FEATURE_D3D9_SIMPLE_INSTANCING_SUPPORT: {

@@ -77,5 +77,8 @@ HRESULT WINAPI TcosD3D12OpenShared(struct ID3D12Device *device, HANDLE handle, i
 struct ID3D12GraphicsCommandList;
 struct ID3D12QueryHeap;
 void WINAPI TcosD3D12BeginQueryKind(struct ID3D12GraphicsCommandList *list, struct ID3D12QueryHeap *heap, UINT index, UINT kind);
+/* The kernel's device features of the adapter the device is on (graphics::DeviceFeature and DeviceFeature2: KmtCaps features and features2), for what a runtime above has to answer
+ * that Direct3D 12 has no option for (Direct3D 11's MinMaxFiltering: kFeature2SamplerReductions). Either pointer may be NULL. */
+void WINAPI TcosD3D12DeviceFeatures(struct ID3D12Device *device, UINT *features, UINT *features2);
 
 #endif

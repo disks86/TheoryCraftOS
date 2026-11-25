@@ -80,7 +80,10 @@ the vertex shader's end. `d3d11.dll` reads the sizes out of the shaders (`dcl_co
 `formats.inc` says how each texture format is kept. Every colour format of feature level 11_1 is kept as it is: Direct3D 12 below has each with its own channels and
 encoding (R8 / R8G8 / R16 / R16G16 in every kind, A8, R8G8B8A8 snorm and sint, R32G32 and R32G32B32, R11G11B10_FLOAT, R9G9B9E5, R10G10B10A2_UINT, B5G6R5, B5G5R5A1,
 B4G4R4A4, BC1 - BC7 with their sRGB forms; docs/Direct3DKernelMode.md "More texture formats"), so the CPU's bytes are the GPU's. D16 is kept in 32-bit float,
-D32_FLOAT_S8X24_UINT in D24S8 (with its stencil, 24 bits of depth). R24G8_TYPELESS and R32G8X24_TYPELESS not made for depth keep their bytes. `CheckFormatSupport`
+D32_FLOAT_S8X24_UINT in D24S8 (with its stencil, 24 bits of depth). R24G8_TYPELESS and R32G8X24_TYPELESS not made for depth keep their bytes. A typeless R8 / R8G8 / R16 /
+R16G16 texture (R16_TYPELESS too when it is not a depth texture) stays typeless below and its views are of the view's own format (`view_format12`: Direct3D 12 shows it as every
+kind of its family through mirrors). `R1_UNORM` is a bit a pixel (rows of `(width + 7) / 8` bytes in initial data and `UpdateSubresource`, a box that starts on a byte), 1D and
+2D textures sampled and loaded as 0 and 1, no render target, unordered access, staging, dynamic or tiled one. `CheckFormatSupport`
 answers from the table, and for the formats whose textures depend on the adapter (`FMT_EXTRA`: the ones the kernel numbers from 64) from Direct3D 12's format support,
 which is what the adapter's device does with each (on virgl, the host's sampler and render masks). Textures are up to 16384 a side where the adapter has them (the CPU
 renderer does; virgl as large as the host's `max_texture_2d_size`).
@@ -88,11 +91,12 @@ renderer does; virgl as large as the host's `max_texture_2d_size`).
 ## What is not there
 
 - Below `d3d11.dll`, in the kernel: depth buffers of several samples, or levels past the first, read by shaders, a depth texture read while it is the bound (read-only) depth
-  buffer, a view of part of a depth array, a stencil view of a cube; `R1_UNORM` (not a format here: `CheckFormatSupport` answers none); on virgl
-  `SV_RenderTargetArrayIndex` and `SV_ViewportArrayIndex` from a vertex or domain shader (`D3D11_FEATURE_D3D11_OPTIONS3` says FALSE there; the CPU renderer has them) and anisotropic
-  filtering (virglrenderer 1.3.0 drops it: trilinear); on the GPUs other than virgl and the CPU renderer the blend factor and the fixed state of Direct3D 10 / 11
-  ([Direct3DKernelMode.md](Direct3DKernelMode.md), "The fixed state of Direct3D 10 and 11"); `AntialiasedLineEnable` and the multisampled line modes (lines are aliased and
-  one pixel wide); separate minification and magnification filters (a linear one of the two makes both linear).
+  buffer, a view of part of a depth array, a stencil view of a cube; on virgl `SV_RenderTargetArrayIndex` and `SV_ViewportArrayIndex` from a vertex or domain shader
+  (`D3D11_FEATURE_D3D11_OPTIONS3` says FALSE there; the CPU renderer has them), anisotropic filtering (virglrenderer 1.3.0 drops it: trilinear) and the `MINIMUM_` / `MAXIMUM_`
+  filters (`MinMaxFiltering` is FALSE there and `CreateSamplerState` refuses them; the CPU renderer has them); on the GPUs other than virgl and the CPU renderer the blend factor
+  and the fixed state of Direct3D 10 / 11 ([Direct3DKernelMode.md](Direct3DKernelMode.md), "The fixed state of Direct3D 10 and 11"), the separate minification and
+  magnification filters (a linear one of the two makes both linear there) and the line modes (aliased there). `AntialiasedLineEnable` and `MultisampleEnable` lines are
+  drawn as Direct3D 11 says on the CPU renderer; on virgl they are the host's smooth and multisampled lines (on a target of one sample the host's aliased line).
 - A vertex and a pixel shader that read one texture unit as different texture and sampler pairs (each stage numbers the units of its own extra pairs) do not go together in a
   pipeline (`E_INVALIDARG` at the draw's pipeline); SampleCmp of a mipmapped colour texture compares the base level on the GPU.
 - A pipeline without a pixel shader runs d3d12.dll's pass-through one, whose runs `PSInvocations` counts (Windows says 0).

@@ -219,6 +219,8 @@ struct Pso {
   UINT8 back_read_mask, back_write_mask;      /* the back faces' stencil masks (D3D12_DEPTH_STENCIL_DESC2's own; else the front's) */
   FLOAT depth_bias;            /* the constant depth bias: RASTERIZER1/2's float, else D3D12_RASTERIZER_DESC::DepthBias */
   int dynamic_bias;            /* D3D12_PIPELINE_STATE_FLAG_DYNAMIC_DEPTH_BIAS: the bias is the command list's (RSSetDepthBias), the kernel pipelines made for each value */
+  UINT line_mode;              /* how lines are drawn: D3D12_LINE_RASTERIZATION_MODE (aliased, alpha-antialiased, quadrilateral 1.4 and 1.0 wide), the kernel's graphics::LineMode */
+  UINT strip_cut;              /* IBStripCutValue (D3D12_INDEX_BUFFER_STRIP_CUT_VALUE: the kernel's StripCut), what a list setting the pipeline draws strips with */
   UINT render_targets;
   DXGI_FORMAT rtv_formats[8];
   UINT slots_used;             /* the vertex buffers (input slots) the layout reads, as a mask */
@@ -494,6 +496,8 @@ static HRESULT blend_state_check(const Dev *dev, const D3D12_BLEND_DESC *b, UINT
 typedef struct PsoExtras {
   int has_bias;
   FLOAT depth_bias;
+  int has_line_mode;           /* RASTERIZER2's LineRasterizationMode (D3D12_LINE_RASTERIZATION_MODE: also narrow quadrilateral lines, which the desc's two flags cannot say) */
+  UINT line_mode;
   int has_back_masks;
   UINT8 back_read_mask, back_write_mask;
 } PsoExtras;
@@ -501,6 +505,7 @@ typedef struct PsoExtras {
 static UINT64 desc_hash_graphics_x(const D3D12_GRAPHICS_PIPELINE_STATE_DESC *d, const PsoExtras *x) {
   UINT64 h = desc_hash_graphics(d);
   if (x && x->has_bias) h = pfnv(pfnv(h, "B", 1), &x->depth_bias, 4);
+  if (x && x->has_line_mode) h = pfnv(pfnv(h, "L", 1), &x->line_mode, 4);
   if (x && x->has_back_masks) {
     const UINT8 masks[2] = {x->back_read_mask, x->back_write_mask};
     h = pfnv(pfnv(h, "M", 1), masks, 2);
@@ -516,9 +521,9 @@ static HRESULT STDMETHODCALLTYPE dev_CreateGraphicsPipelineState(Dev *This, cons
 static HRESULT pso_create_graphics(Dev *This, const D3D12_GRAPHICS_PIPELINE_STATE_DESC *desc, const PsoExtras *x, REFIID riid, void **out) {
   extern const ID3D12PipelineStateVtbl pso_vtbl;
   if (!desc || !desc->pRootSignature || !desc->VS.pShaderBytecode) return E_INVALIDARG;
-  /* (a strip cut set by the command list: DynamicIndexBufferStripCutSupported is FALSE, OPTIONS15; a depth bias set by it - DynamicDepthBiasSupported, OPTIONS16 - where the device has
-   * the rasterizer state) */
-  if (desc->Flags & D3D12_PIPELINE_STATE_FLAG_DYNAMIC_INDEX_BUFFER_STRIP_CUT) return E_INVALIDARG;
+  /* (a strip cut set by the command list - DynamicIndexBufferStripCutSupported, OPTIONS15: every device, the kernel cutting the strips it expands -; a depth bias set by it -
+   * DynamicDepthBiasSupported, OPTIONS16 - where the device has the rasterizer state; IBStripCutValue one of the enumeration's) */
+  if ((UINT)desc->IBStripCutValue > (UINT)D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_0xFFFFFFFF) return E_INVALIDARG;
   if ((desc->Flags & D3D12_PIPELINE_STATE_FLAG_DYNAMIC_DEPTH_BIAS) && !(This->caps.features2 & DEV_FEATURE2_RASTERIZER_STATE)) return E_INVALIDARG;
   if (desc->SampleDesc.Count > 1 && (desc->SampleDesc.Count >= 32 || !((This->caps.sample_counts >> desc->SampleDesc.Count) & 1))) return DXGI_ERROR_UNSUPPORTED;
   if (desc->StreamOutput.NumEntries > 16 || desc->StreamOutput.NumStrides > 4) return DXGI_ERROR_UNSUPPORTED;
@@ -545,6 +550,19 @@ static HRESULT pso_create_graphics(Dev *This, const D3D12_GRAPHICS_PIPELINE_STAT
   p->back_write_mask = x && x->has_back_masks ? x->back_write_mask : desc->DepthStencilState.StencilWriteMask;
   p->depth_bias = x && x->has_bias ? x->depth_bias : (FLOAT)desc->RasterizerState.DepthBias;
   p->dynamic_bias = (desc->Flags & D3D12_PIPELINE_STATE_FLAG_DYNAMIC_DEPTH_BIAS) != 0;
+  p->strip_cut = (UINT)desc->IBStripCutValue;
+  /* (the line mode: RASTERIZER2's, or MultisampleEnable - quadrilateral lines, 1.4 pixels wide - before AntialiasedLineEnable - alpha-antialiased lines -, as Direct3D 10 to 12 choose.
+   * On a device without the kernel's line modes lines are aliased whatever the state says - its rasterizer has no other kind -; narrow quadrilateral lines need the line modes
+   * (NarrowQuadrilateralLinesSupported, OPTIONS19)) */
+  p->line_mode = x && x->has_line_mode ? x->line_mode
+                 : desc->RasterizerState.MultisampleEnable ? (UINT)D3D12_LINE_RASTERIZATION_MODE_QUADRILATERAL_WIDE
+                 : desc->RasterizerState.AntialiasedLineEnable ? (UINT)D3D12_LINE_RASTERIZATION_MODE_ALPHA_ANTIALIASED : (UINT)D3D12_LINE_RASTERIZATION_MODE_ALIASED;
+  if (p->line_mode > (UINT)D3D12_LINE_RASTERIZATION_MODE_QUADRILATERAL_NARROW ||
+      (p->line_mode == (UINT)D3D12_LINE_RASTERIZATION_MODE_QUADRILATERAL_NARROW && !(This->caps.features2 & DEV_FEATURE2_LINE_MODES))) {
+    dx_Release(OBJ(p));
+    return E_INVALIDARG;
+  }
+  if (!(This->caps.features2 & DEV_FEATURE2_LINE_MODES)) p->line_mode = 0;
   {
     const HRESULT rh = raster_state_check(This, &desc->RasterizerState, p->depth_bias, &desc->DepthStencilState, p->back_read_mask, p->back_write_mask, p->dynamic_bias);
     if (FAILED(rh)) { dx_Release(OBJ(p)); return rh; }
@@ -900,7 +918,8 @@ static UINT pso_pipeline_locked(Pso *p, const UINT strides[8], UINT stencil_ref,
   UINT rates = 0;      /* (the attributes up to the last per-instance one that does not step by 1: the kernel's step rates) */
   for (UINT i = 0; i < p->attr_count; ++i)
     if (p->attrs[i].per_instance && p->attrs[i].step_rate != 1) rates = i + 1;
-  if (p->attr_count > 4 || max_slot > 0 || more_blends || p->blend_constant || raster_part || rates) {
+  const UINT line_mode = p->line_mode;      /* (not aliased: the tagged part 'LIN1') */
+  if (p->attr_count > 4 || max_slot > 0 || more_blends || p->blend_constant || raster_part || rates || line_mode) {
     if (!p->so_entries) r[w++] = 0;
     const UINT extra = p->attr_count > 4 ? p->attr_count - 4 : 0;
     r[w++] = extra;
@@ -931,7 +950,7 @@ static UINT pso_pipeline_locked(Pso *p, const UINT strides[8], UINT stencil_ref,
       r[w++] = blend_op(b->BlendOpAlpha);
       r[w++] = b->RenderTargetWriteMask & format_write_mask(p->rtv_formats[4 + k]);
     }
-    if (p->blend_constant || raster_part || rates)
+    if (p->blend_constant || raster_part || rates || line_mode)
       for (UINT c = 0; c < 4; ++c) r[w++] = bits_of(factor[c]);      /* (the colour of the constant blend factors) */
     if (raster_part) {
       r[w++] = 0x31545352u;      /* 'RST1' (dxgk::kPipelineRasterTag), and its 16 words */
@@ -957,6 +976,11 @@ static UINT pso_pipeline_locked(Pso *p, const UINT strides[8], UINT stencil_ref,
       r[w++] = 0x31505453u;
       r[w++] = rates;
       for (UINT i = 0; i < rates; ++i) r[w++] = p->attrs[i].per_instance ? p->attrs[i].step_rate : 0;
+    }
+    if (line_mode) {      /* 'LIN1' (dxgk::kPipelineLineTag): the line mode - D3D12_LINE_RASTERIZATION_MODE and graphics::LineMode are numbered alike */
+      r[w++] = 0x314E494Cu;
+      r[w++] = 1;
+      r[w++] = line_mode;
     }
   }
   UINT reply[1] = {0};

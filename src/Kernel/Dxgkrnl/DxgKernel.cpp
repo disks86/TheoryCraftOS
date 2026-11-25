@@ -1453,14 +1453,13 @@ NtStatus Kernel::escape_d3d12(ProcessId pid, Handle device, uint32_t op, ByteRea
           d.sampler.custom_border = custom != 0;
         }
         graphics::BorderColor no_border;
-        if (!in.ok() || kind > static_cast<uint32_t>(DescriptorKind::UavTexture) || filter > 1 || !decode_address_word(au, &d.sampler.address_u, &d.sampler.border) ||
+        if (!in.ok() || kind > static_cast<uint32_t>(DescriptorKind::UavTexture) || !decode_filter_word(filter, &d.sampler) || !decode_address_word(au, &d.sampler.address_u, &d.sampler.border) ||
             !decode_address_word(av, &d.sampler.address_v, &no_border) || mip > 2)
           return status::kInvalidParameter;
         d.kind = static_cast<DescriptorKind>(kind);
         d.allocation = allocation;
         d.offset = off_lo | (uint64_t{off_hi} << 32);
         d.size = size_lo | (uint64_t{size_hi} << 32);
-        d.sampler.filter = static_cast<graphics::Filter>(filter);
         d.sampler.mip_filter = static_cast<graphics::MipFilter>(mip);
         d.sampler.lod_bias = bits_float(bias);
         d.sampler.min_lod = bits_float(min_lod);
@@ -1725,10 +1724,18 @@ NtStatus Kernel::escape(ProcessId pid, Handle device, ConstByteView request, Byt
                           for (graphics::BlendState& t : desc.target_blend) t.constant[c] = constant[c];
                         }
                         // (and, after that, tagged parts in any order, each at most once: a tag, the count of the words that follow, the words)
-                        bool seen_raster = false, seen_step_rates = false;
+                        bool seen_raster = false, seen_step_rates = false, seen_lines = false;
                         while (!in.at_end()) {
                           const uint32_t tag = in.le32(), words = in.le32();
                           if (!in.ok()) return status::kInvalidParameter;
+                          if (tag == kPipelineLineTag) {
+                            // kPipelineLineTag: how the lines are drawn (graphics::LineMode)
+                            const uint32_t mode = in.le32();
+                            if (seen_lines || words != kPipelineLineWords || !in.ok() || mode > static_cast<uint32_t>(graphics::LineMode::QuadrilateralNarrow)) return status::kInvalidParameter;
+                            seen_lines = true;
+                            desc.line_mode = static_cast<graphics::LineMode>(mode);
+                            continue;
+                          }
                           if (tag == kPipelineStepRateTag) {
                             // kPipelineStepRateTag: the step rates of the per-instance attributes, a word for each attribute from the first (a per-vertex one's is 0)
                             if (seen_step_rates || words > desc.attribute_count || words > graphics::kMaxVertexAttributes) return status::kInvalidParameter;

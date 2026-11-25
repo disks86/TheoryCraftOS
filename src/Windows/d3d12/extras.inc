@@ -468,6 +468,7 @@ static void STDMETHODCALLTYPE list_ExecuteBundle(CmdList *l, ID3D12GraphicsComma
     switch (e->id) {
       case B_PSO: list_SetPipelineState(l, (ID3D12PipelineState *)(UINT_PTR)a[0]); break;
       case B_TOPOLOGY: list_IASetPrimitiveTopology(l, (D3D12_PRIMITIVE_TOPOLOGY)a[0]); break;
+      case B_STRIP_CUT: list_IASetIndexBufferStripCutValue(l, (D3D12_INDEX_BUFFER_STRIP_CUT_VALUE)a[0]); break;
       case B_STENCIL_REF: list_OMSetStencilRef(l, (UINT)a[0]); break;
       case B_STENCIL_REFS: list_OMSetFrontAndBackStencilRef(l, (UINT)a[0], (UINT)a[1]); break;
       case B_DEPTH_BIAS: {

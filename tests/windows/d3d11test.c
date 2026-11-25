@@ -2727,7 +2727,7 @@ static void test_device5(void) {
   D3D11_FEATURE_DATA_D3D11_OPTIONS1 o1;
   memset(&o1, 0xCC, sizeof o1);
   check(SUCCEEDED(ID3D11Device5_CheckFeatureSupport(d5, D3D11_FEATURE_D3D11_OPTIONS1, &o1, sizeof o1)) && o1.TiledResourcesTier == D3D11_TILED_RESOURCES_TIER_1 &&
-        !o1.MinMaxFiltering && !o1.MapOnDefaultBuffers, "D3D11_FEATURE_D3D11_OPTIONS1: tiled resources tier 1");
+        !o1.MapOnDefaultBuffers, "D3D11_FEATURE_D3D11_OPTIONS1: tiled resources tier 1");
   D3D11_FEATURE_DATA_FORMAT_SUPPORT2 tf = {DXGI_FORMAT_R8G8B8A8_UNORM, 0};
   check(SUCCEEDED(ID3D11Device5_CheckFeatureSupport(d5, D3D11_FEATURE_FORMAT_SUPPORT2, &tf, sizeof tf)) && (tf.OutFormatSupport2 & D3D11_FORMAT_SUPPORT2_TILED),
         "FORMAT_SUPPORT2: R8G8B8A8_UNORM may be tiled");
@@ -4639,6 +4639,7 @@ static void test_viewports(int software) {
   if (gs) ID3D11GeometryShader_Release(gs);
 }
 
+static void test_fixed_state_gaps(int software);
 static void test_sampler_state(void) {
   IDXGIDevice *dxgi = NULL;
   IDXGIAdapter *adapter = NULL;
@@ -4656,6 +4657,7 @@ static void test_sampler_state(void) {
   if (dxgi) IDXGIDevice_Release(dxgi);
   const int software = (ad.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) != 0;
   test_viewports(software);
+  test_fixed_state_gaps(software);
   D3D11_SAMPLER_DESC sd;
   memset(&sd, 0, sizeof sd);
   sd.Filter = D3D11_FILTER_MIN_MAG_MIP_POINT;
@@ -4708,6 +4710,190 @@ static void test_sampler_state(void) {
     /* (the CPU renderer filters as EXT_texture_filter_anisotropic's reference; how a GPU does is its own - virglrenderer 1.3.0 leaves the anisotropy of its sampler objects out) */
     if (software) check(grey_near(two, 128) && grey_near(four, 255), "D3D11_FILTER_ANISOTROPIC: MaxAnisotropy lookups along the longer axis, at the level of the shorter");
     else check(red(two) >= red(trilinear) && red(four) >= red(two), "D3D11_FILTER_ANISOTROPIC: no blurrier than trilinear filtering");
+    if (view) ID3D11ShaderResourceView_Release(view);
+    if (tex) ID3D11Texture2D_Release(tex);
+  }
+}
+
+
+/* ---- strip cuts, separate filters and reductions, line modes, typeless narrow views, R1_UNORM -------------------------------------------------------------------------------- */
+
+/* Index buffer strip cuts (Direct3D 11 ends a strip at 0xFFFF of 16-bit and 0xFFFFFFFF of 32-bit indices: Direct3D 12's strip cut of the list, set with the index buffer), the
+ * minification and magnification filters of their own (a 2 x 2 texture over the target is magnified: MIN_LINEAR_MAG_POINT is the point filter's texels, MIN_POINT_MAG_LINEAR a
+ * blend), MINIMUM / MAXIMUM filters where MinMaxFiltering, the line modes (MultisampleEnable's quadrilateral lines 1.4 pixels wide, AntialiasedLineEnable's coverage in alpha),
+ * an R16_TYPELESS texture seen as R16_FLOAT, R1_UNORM textures. */
+static void test_fixed_state_gaps(int software) {
+  /* strip cuts: a strip of six vertices cut after the third, drawn with 16-bit and 32-bit indices; the middle below the two triangles stays black */
+  {
+    const VertexF v[6] = {{-0.9f, 0.9f, 0.5f, 1, 0, 0, 1}, {-0.1f, 0.9f, 0.5f, 1, 0, 0, 1}, {-0.5f, 0.3f, 0.5f, 1, 0, 0, 1},
+                          {0.1f, 0.9f, 0.5f, 0, 1, 0, 1}, {0.9f, 0.9f, 0.5f, 0, 1, 0, 1}, {0.5f, 0.3f, 0.5f, 0, 1, 0, 1}};
+    const UINT16 i16[7] = {0, 1, 2, 0xFFFF, 3, 4, 5};
+    const UINT32 i32[7] = {0, 1, 2, 0xFFFFFFFFu, 3, 4, 5};
+    ID3D11Buffer *vb = make_buffer(D3D11_BIND_VERTEX_BUFFER, D3D11_USAGE_DEFAULT, 0, v, sizeof v);
+    ID3D11Buffer *ib16 = make_buffer(D3D11_BIND_INDEX_BUFFER, D3D11_USAGE_DEFAULT, 0, i16, sizeof i16);
+    ID3D11Buffer *ib32 = make_buffer(D3D11_BIND_INDEX_BUFFER, D3D11_USAGE_DEFAULT, 0, i32, sizeof i32);
+    for (int wide = 0; wide < 2; ++wide) {
+      begin(NULL);
+      clear(0, 0, 0);
+      ID3D11DeviceContext_PSSetShader(g_context, g_ps_color, NULL, 0);
+      bind_floats(vb);
+      ID3D11DeviceContext_IASetIndexBuffer(g_context, wide ? ib32 : ib16, wide ? DXGI_FORMAT_R32_UINT : DXGI_FORMAT_R16_UINT, 0);
+      ID3D11DeviceContext_IASetPrimitiveTopology(g_context, D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+      ID3D11DeviceContext_DrawIndexed(g_context, 7, 0, 0);
+      read_target();
+      printf("d3d11test: strip cut (%s indices): %08x %08x %08x\n", wide ? "32-bit" : "16-bit", (unsigned)pixel(16, 8), (unsigned)pixel(48, 8), (unsigned)pixel(32, 40));
+      check(pixel(16, 8) == 0xFFFF0000u && pixel(48, 8) == 0xFF00FF00u && (pixel(32, 40) & 0xFFFFFF) == 0, "an index of all ones ends a strip");
+    }
+    if (vb) ID3D11Buffer_Release(vb);
+    if (ib16) ID3D11Buffer_Release(ib16);
+    if (ib32) ID3D11Buffer_Release(ib32);
+  }
+  /* separate filters on a 2 x 2 texture of black and white columns, magnified over the target: half way between the columns (the pixel at 31.5 of 64 is texel 0.98 of 2) */
+  {
+    UINT32 texels[4] = {0xFF000000u, 0xFFFFFFFFu, 0xFF000000u, 0xFFFFFFFFu};
+    D3D11_SUBRESOURCE_DATA initial = {texels, 8, 0};
+    D3D11_TEXTURE2D_DESC desc = {2, 2, 1, 1, DXGI_FORMAT_B8G8R8A8_UNORM, {1, 0}, D3D11_USAGE_DEFAULT, D3D11_BIND_SHADER_RESOURCE, 0, 0};
+    ID3D11Texture2D *tex = NULL;
+    ID3D11ShaderResourceView *view = NULL;
+    if (SUCCEEDED(ID3D11Device_CreateTexture2D(g_device, &desc, &initial, &tex))) ID3D11Device_CreateShaderResourceView(g_device, (ID3D11Resource *)tex, NULL, &view);
+    D3D11_SAMPLER_DESC sd;
+    memset(&sd, 0, sizeof sd);
+    sd.AddressU = sd.AddressV = sd.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
+    sd.ComparisonFunc = D3D11_COMPARISON_NEVER;
+    sd.MaxLOD = 3.402823466e+38f;
+    sd.Filter = D3D11_FILTER_MIN_POINT_MAG_LINEAR_MIP_POINT;
+    const UINT32 mag_linear = sample_quad(view, &sd, 0, 0, 1, 1);
+    sd.Filter = D3D11_FILTER_MIN_LINEAR_MAG_MIP_POINT;
+    const UINT32 mag_point = sample_quad(view, &sd, 0, 0, 1, 1);
+    printf("d3d11test: magnified, MIN_POINT_MAG_LINEAR %08x, MIN_LINEAR_MAG_POINT %08x\n", (unsigned)mag_linear, (unsigned)mag_point);
+    check(red(mag_linear) > 100 && red(mag_linear) < 155 && (red(mag_point) == 0 || red(mag_point) == 255), "a magnified texture takes the magnification filter");
+    /* (MINIMUM / MAXIMUM: CreateSamplerState takes them where MinMaxFiltering - the least and the greatest of the bilinear texels: black and white) */
+    D3D11_FEATURE_DATA_D3D11_OPTIONS1 o1;
+    memset(&o1, 0, sizeof o1);
+    ID3D11Device_CheckFeatureSupport(g_device, D3D11_FEATURE_D3D11_OPTIONS1, &o1, sizeof o1);
+    check(o1.MinMaxFiltering == software, "MinMaxFiltering on the CPU renderer");
+    sd.Filter = D3D11_FILTER_MAXIMUM_MIN_MAG_LINEAR_MIP_POINT;
+    ID3D11SamplerState *state = NULL;
+    const HRESULT hr = ID3D11Device_CreateSamplerState(g_device, &sd, &state);
+    check(o1.MinMaxFiltering ? SUCCEEDED(hr) && state : hr == E_INVALIDARG && !state, "MAXIMUM_ filters where MinMaxFiltering, E_INVALIDARG elsewhere");
+    if (state) ID3D11SamplerState_Release(state);
+    if (o1.MinMaxFiltering) {
+      const UINT32 greatest = sample_quad(view, &sd, 0, 0, 1, 1);
+      sd.Filter = D3D11_FILTER_MINIMUM_MIN_MAG_LINEAR_MIP_POINT;
+      const UINT32 least = sample_quad(view, &sd, 0, 0, 1, 1);
+      printf("d3d11test: MAXIMUM %08x, MINIMUM %08x\n", (unsigned)greatest, (unsigned)least);
+      check(red(greatest) == 255 && red(least) == 0, "MAXIMUM_ and MINIMUM_ filters: the greatest and least of the texels the filter weighs");
+    }
+    if (view) ID3D11ShaderResourceView_Release(view);
+    if (tex) ID3D11Texture2D_Release(tex);
+  }
+  /* line modes: a horizontal line between rows 31 and 32 */
+  {
+    const VertexF v[4] = {{-0.8f, 0.0f, 0.5f, 1, 0, 0, 1}, {0.8f, 0.0f, 0.5f, 1, 0, 0, 1}, {-0.8f, -0.6f, 0.5f, 1, 0, 0, 1}, {0.8f, 0.5f, 0.5f, 1, 0, 0, 1}};
+    ID3D11Buffer *vb = make_buffer(D3D11_BIND_VERTEX_BUFFER, D3D11_USAGE_DEFAULT, 0, v, sizeof v);
+    D3D11_RASTERIZER_DESC rd;
+    memset(&rd, 0, sizeof rd);
+    rd.FillMode = D3D11_FILL_SOLID;
+    rd.CullMode = D3D11_CULL_NONE;
+    rd.DepthClipEnable = TRUE;
+    ID3D11RasterizerState *aliased = NULL, *quad = NULL, *smooth = NULL;
+    ID3D11Device_CreateRasterizerState(g_device, &rd, &aliased);
+    rd.MultisampleEnable = TRUE;
+    ID3D11Device_CreateRasterizerState(g_device, &rd, &quad);
+    rd.MultisampleEnable = FALSE;
+    rd.AntialiasedLineEnable = TRUE;
+    ID3D11Device_CreateRasterizerState(g_device, &rd, &smooth);
+    D3D11_BLEND_DESC bd;
+    memset(&bd, 0, sizeof bd);
+    bd.RenderTarget[0].BlendEnable = TRUE;
+    bd.RenderTarget[0].SrcBlend = D3D11_BLEND_SRC_ALPHA, bd.RenderTarget[0].DestBlend = D3D11_BLEND_INV_SRC_ALPHA, bd.RenderTarget[0].BlendOp = D3D11_BLEND_OP_ADD;
+    bd.RenderTarget[0].SrcBlendAlpha = D3D11_BLEND_ONE, bd.RenderTarget[0].DestBlendAlpha = D3D11_BLEND_ZERO, bd.RenderTarget[0].BlendOpAlpha = D3D11_BLEND_OP_ADD;
+    bd.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
+    ID3D11BlendState *over = NULL;
+    ID3D11Device_CreateBlendState(g_device, &bd, &over);
+    int rows[2] = {0, 0};
+    ID3D11RasterizerState *states[2] = {aliased, quad};
+    for (int m = 0; m < 2 && vb; ++m) {
+      begin(NULL);
+      clear(0, 0, 0);
+      ID3D11DeviceContext_RSSetState(g_context, states[m]);
+      ID3D11DeviceContext_PSSetShader(g_context, g_ps_color, NULL, 0);
+      bind_floats(vb);
+      ID3D11DeviceContext_IASetPrimitiveTopology(g_context, D3D11_PRIMITIVE_TOPOLOGY_LINELIST);
+      ID3D11DeviceContext_Draw(g_context, 2, 0);
+      read_target();
+      for (int y = 0; y < SIZE; ++y) rows[m] += (pixel(32, y) & 0xFFFFFF) != 0;
+    }
+    printf("d3d11test: lines, aliased %d rows, MultisampleEnable %d\n", rows[0], rows[1]);
+    check(rows[0] == 1 && (software ? rows[1] == 2 : rows[1] >= 1), "MultisampleEnable lines: quadrilaterals 1.4 pixels wide");
+    int partial = 0;
+    if (vb && smooth && over) {
+      begin(NULL);
+      clear(0, 0, 0);
+      ID3D11DeviceContext_RSSetState(g_context, smooth);
+      ID3D11DeviceContext_OMSetBlendState(g_context, over, NULL, 0xFFFFFFFFu);
+      ID3D11DeviceContext_PSSetShader(g_context, g_ps_color, NULL, 0);
+      bind_floats(vb);
+      ID3D11DeviceContext_IASetPrimitiveTopology(g_context, D3D11_PRIMITIVE_TOPOLOGY_LINELIST);
+      ID3D11DeviceContext_Draw(g_context, 2, 2);
+      read_target();
+      for (int i = 0; i < SIZE * SIZE; ++i) partial += red(g_pixels[i]) > 0 && red(g_pixels[i]) < 250;
+    }
+    printf("d3d11test: alpha-antialiased line, %d pixels partly covered\n", partial);
+    check(partial > 10, "AntialiasedLineEnable: the coverage of each pixel in the alpha");
+    ID3D11RasterizerState *all[3] = {aliased, quad, smooth};
+    for (int i = 0; i < 3; ++i) if (all[i]) ID3D11RasterizerState_Release(all[i]);
+    if (over) ID3D11BlendState_Release(over);
+    if (vb) ID3D11Buffer_Release(vb);
+  }
+  /* R16_TYPELESS (not a depth texture) seen as R16_FLOAT: 0.5 in half float, sampled */
+  {
+    UINT16 halves[4] = {0x3800, 0x3800, 0x3800, 0x3800};
+    D3D11_SUBRESOURCE_DATA initial = {halves, 4, 0};
+    D3D11_TEXTURE2D_DESC desc = {2, 2, 1, 1, DXGI_FORMAT_R16_TYPELESS, {1, 0}, D3D11_USAGE_DEFAULT, D3D11_BIND_SHADER_RESOURCE, 0, 0};
+    ID3D11Texture2D *tex = NULL;
+    ID3D11ShaderResourceView *view = NULL;
+    const HRESULT hr = ID3D11Device_CreateTexture2D(g_device, &desc, &initial, &tex);
+    D3D11_SHADER_RESOURCE_VIEW_DESC vd;
+    memset(&vd, 0, sizeof vd);
+    vd.Format = DXGI_FORMAT_R16_FLOAT;
+    vd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+    vd.Texture2D.MipLevels = 1;
+    if (tex) ID3D11Device_CreateShaderResourceView(g_device, (ID3D11Resource *)tex, &vd, &view);
+    D3D11_SAMPLER_DESC sd;
+    memset(&sd, 0, sizeof sd);
+    sd.Filter = D3D11_FILTER_MIN_MAG_MIP_POINT;
+    sd.AddressU = sd.AddressV = sd.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
+    sd.MaxLOD = 3.402823466e+38f;
+    const UINT32 got = view ? sample_quad(view, &sd, 0, 0, 1, 1) : 0;
+    printf("d3d11test: R16_TYPELESS as R16_FLOAT %08x\n", (unsigned)got);
+    check(SUCCEEDED(hr) && view && red(got) >= 126 && red(got) <= 129 && green(got) == 0, "an R16_TYPELESS colour texture seen through an R16_FLOAT view");
+    if (view) ID3D11ShaderResourceView_Release(view);
+    if (tex) ID3D11Texture2D_Release(tex);
+  }
+  /* R1_UNORM: a 16 x 2 texture of bits (rows of two bytes, the first pixel the most significant bit), sampled - white where a bit is set -; no render target or CPU access */
+  {
+    UINT support = 0;
+    check(SUCCEEDED(ID3D11Device_CheckFormatSupport(g_device, DXGI_FORMAT_R1_UNORM, &support)) && (support & D3D11_FORMAT_SUPPORT_TEXTURE2D) && (support & D3D11_FORMAT_SUPPORT_SHADER_SAMPLE) &&
+          !(support & D3D11_FORMAT_SUPPORT_RENDER_TARGET), "R1_UNORM: 2D textures, sampled, no render target");
+    const BYTE bits[4] = {0xFF, 0x00, 0xFF, 0x00};      /* (the left eight pixels of each row set) */
+    D3D11_SUBRESOURCE_DATA initial = {bits, 2, 0};
+    D3D11_TEXTURE2D_DESC desc = {16, 2, 1, 1, DXGI_FORMAT_R1_UNORM, {1, 0}, D3D11_USAGE_DEFAULT, D3D11_BIND_SHADER_RESOURCE, 0, 0};
+    ID3D11Texture2D *tex = NULL, *bad = NULL;
+    ID3D11ShaderResourceView *view = NULL;
+    if (SUCCEEDED(ID3D11Device_CreateTexture2D(g_device, &desc, &initial, &tex))) ID3D11Device_CreateShaderResourceView(g_device, (ID3D11Resource *)tex, NULL, &view);
+    D3D11_SAMPLER_DESC sd;
+    memset(&sd, 0, sizeof sd);
+    sd.Filter = D3D11_FILTER_MIN_MAG_MIP_POINT;
+    sd.AddressU = sd.AddressV = sd.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
+    sd.MaxLOD = 3.402823466e+38f;
+    const UINT32 left = view ? sample_quad(view, &sd, 0, 0, 0.25f, 0.25f) : 0, right = view ? sample_quad(view, &sd, 0.75f, 0, 1, 1) : 0;
+    printf("d3d11test: R1_UNORM sampled %08x %08x\n", (unsigned)left, (unsigned)right);
+    check(view && red(left) == 255 && red(right) == 0, "R1_UNORM: its bits sampled as 1 and 0");
+    desc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
+    check(FAILED(ID3D11Device_CreateTexture2D(g_device, &desc, &initial, &bad)) && !bad, "R1_UNORM: no render target");
+    desc.BindFlags = 0, desc.Usage = D3D11_USAGE_STAGING, desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    check(FAILED(ID3D11Device_CreateTexture2D(g_device, &desc, NULL, &bad)) && !bad, "R1_UNORM: no staging texture");
     if (view) ID3D11ShaderResourceView_Release(view);
     if (tex) ID3D11Texture2D_Release(tex);
   }

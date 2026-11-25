@@ -34,7 +34,9 @@ typedef struct TileBind {
 enum { MIRROR_INTEGER = 1, MIRROR_WRITE_BACK = 2 };      /* (kMirrorInteger, kMirrorWriteBack) */
 /* (this DLL's own: the mirror is an unordered access view's - a storage image the shaders write, not a render target - of a plane, or of a narrow texture's one image) */
 enum { MIRROR_UAV = 4 };
-typedef struct Mirror { UINT alloc, plane, first, count, array, mode, channels, level; } Mirror;      /* (level: of a narrow texture's level mirror, narrow_mirror) */
+/* (level: of a narrow texture's level mirror, narrow_mirror; format and levels: a typed view's mirror of a typeless narrow texture kept natively, typed_mirror - its kernel format, 0 for
+ * the others, and its levels from `level`) */
+typedef struct Mirror { UINT alloc, plane, first, count, array, mode, channels, level, format, levels; } Mirror;
 
 typedef struct HeapObj {
   DObj d;
@@ -275,7 +277,7 @@ static UINT res_mirror(Resource *r, UINT plane, UINT first, UINT count, int arra
   EnterCriticalSection(&g_lock);
   for (UINT i = 0; i < r->mirror_count; ++i) {
     const Mirror *m = &r->mirrors[i];
-    if (m->plane == plane && m->first == first && m->count == count && m->array == (UINT)array && m->mode == mode && m->channels == channels) {
+    if (!m->format && m->plane == plane && m->first == first && m->count == count && m->array == (UINT)array && m->mode == mode && m->channels == channels) {
       const UINT found = m->alloc;
       LeaveCriticalSection(&g_lock);
       return found;
@@ -327,7 +329,7 @@ static UINT narrow_mirror(Resource *r, UINT level, UINT first, UINT count, int a
   EnterCriticalSection(&g_lock);
   for (UINT i = 0; i < r->mirror_count; ++i) {
     const Mirror *m = &r->mirrors[i];
-    if (m->level == level + 1 && m->first == first && m->count == count && m->array == (UINT)array && m->mode == mode && m->channels == channels) {
+    if (!m->format && m->level == level + 1 && m->first == first && m->count == count && m->array == (UINT)array && m->mode == mode && m->channels == channels) {
       const UINT found = m->alloc;
       LeaveCriticalSection(&g_lock);
       return found;
@@ -364,6 +366,70 @@ static UINT narrow_mirror(Resource *r, UINT level, UINT first, UINT count, int a
       alloc = 0;
     }
   }
+  LeaveCriticalSection(&g_lock);
+  return alloc;
+}
+
+/* A mirror in kernel format `kformat` of levels level .. level + levels - 1 and layers first .. first + count - 1 of a typeless narrow texture the kernel keeps as its own narrow
+ * image (format_native_narrow: R8, R8G8, R16, R16G16 TYPELESS): what a view of another kind is (R8_UINT, R16_FLOAT ...: the same bytes; the kernel's SetMirror of that family).
+ * A 2D image or a 2D array (`array`) - the kernel's images can be shown as cubes from an array of six -, not of a volume's slices. A mirror of the one level of a 2D texture of one
+ * level is made on any device; the others need the device's levels of every image (DEV_FEATURE2_MIPMAPPED_LAYERS: each subresource of the mirror names the one of the texture it
+ * shows). Made the first time, then the same one; 0 when the kernel cannot make it. */
+#define TYPED_MIRROR_MAX 256
+static UINT typed_mirror(Resource *r, UINT kformat, UINT level, UINT levels, UINT first, UINT count, int array, UINT mode, UINT channels) {
+  if (r->planes || !r->fmt || r->kind == 1 || !kformat || levels == 0 || level >= r->mips || levels > r->mips - level || count == 0 || first >= r->layers || count > r->layers - first ||
+      (!array && count != 1) || (UINT64)levels * count > TYPED_MIRROR_MAX)
+    return 0;
+  const int whole = r->kind == 0 && r->mips == 1 && !array;      /* (the texture's one image: no subresources named) */
+  if (!whole && !(r->d.dev->caps.features2 & DEV_FEATURE2_MIPMAPPED_LAYERS)) return 0;
+  EnterCriticalSection(&g_lock);
+  for (UINT i = 0; i < r->mirror_count; ++i) {
+    const Mirror *m = &r->mirrors[i];
+    if (m->format == kformat && m->level == level && m->levels == levels && m->first == first && m->count == count && m->array == (UINT)array && m->mode == mode && m->channels == channels) {
+      const UINT found = m->alloc;
+      LeaveCriticalSection(&g_lock);
+      return found;
+    }
+  }
+  UINT alloc = 0;
+  Mirror *grown = mem_grow(r->mirrors, sizeof(Mirror) * (r->mirror_count + 1));
+  UINT *request = mem_alloc((SIZE_T)(5 + 2 * TYPED_MIRROR_MAX) * 4);
+  if (grown && request) {
+    r->mirrors = grown;
+    KmtAllocDesc md;
+    memset(&md, 0, sizeof md);
+    md.flags = KA_TEXTURE | ((mode & MIRROR_UAV) ? KA_STORAGE_IMAGE : (mode & MIRROR_WRITE_BACK) ? KA_RENDER_TARGET : 0);
+    md.format = kformat;
+    md.width = mip_extent((UINT)r->desc.Width, level), md.height = mip_extent(r->desc.Height, level);
+    md.mips = levels;
+    md.samples = 1;
+    md.kind = array ? 2 : 0;
+    md.layers = array ? count : 1;
+    if (KMT_OK(kmt_create_allocation(r->d.dev->kdev, &md, &alloc, NULL, NULL))) {
+      const UINT n = levels * count;
+      UINT w = 0;
+      request[w++] = ESC_SET_MIRROR;
+      request[w++] = alloc;
+      request[w++] = mode & (MIRROR_INTEGER | MIRROR_WRITE_BACK);
+      request[w++] = channels;
+      request[w++] = n;
+      for (UINT i = 0; i < n; ++i) request[w++] = r->alloc;
+      /* (the subresource each of the mirror's shows, its levels first: the texture's level in the low half, its layer in the high one) */
+      if (!whole)
+        for (UINT l = 0; l < levels; ++l)
+          for (UINT k = 0; k < count; ++k) request[w++] = (level + l) | (first + k) << 16;
+      if (KMT_OK(dev_escape(r->d.dev, request, w, NULL, 0))) {
+        const Mirror m = {alloc, 0, first, count, (UINT)array, mode, channels, level, kformat, levels};
+        r->mirrors[r->mirror_count++] = m;
+      } else {
+        kmt_destroy_allocation(r->d.dev->kdev, alloc);
+        alloc = 0;
+      }
+    } else {
+      alloc = 0;
+    }
+  }
+  mem_free(request);
   LeaveCriticalSection(&g_lock);
   return alloc;
 }
@@ -679,7 +745,21 @@ static HRESULT resource_make_from(Dev *dev, const D3D12_HEAP_PROPERTIES *props, 
     if (desc->Format == DXGI_FORMAT_R16_TYPELESS && want_depth) fi = format_info(DXGI_FORMAT_D16_UNORM);
     if (desc->Format == DXGI_FORMAT_R32G8X24_TYPELESS && want_depth) fi = format_info(DXGI_FORMAT_D32_FLOAT_S8X24_UINT);
     if (!fi || !fi->kernel || !!fi->depth != want_depth) { hr = fi && fi->kernel ? E_INVALIDARG : DXGI_ERROR_UNSUPPORTED; goto fail; }
+    /* (R8, R8G8, R16, R16G16 - unorm or typeless - as the kernel's own narrow image where the adapter has it for what the texture is made for: sampled and filtered, drawn into and
+     * blended, unordered access, levels, samples; else widened into four channels as before) */
+    if (fi->narrow && !fi->planar) {
+      const FormatInfo *nf = native_narrow_entry(desc->Format);
+      const UINT kc = nf ? dev_format_caps(dev, nf->kernel) : 0;
+      const UINT need = KFC_SAMPLED | KFC_FILTERED | ((desc->Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET) ? KFC_RENDER_TARGET | KFC_BLENDABLE : 0u) |
+                        ((desc->Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) ? KFC_STORAGE : 0u) |
+                        (desc->MipLevels != 1 && mip_count_for((UINT)desc->Width, desc->Height) > 1 ? KFC_MIPMAPS : 0u) | (samples > 1 ? KFC_MULTISAMPLE : 0u);
+      if (nf && (kc & need) == need) fi = nf;
+    }
     if (fi->compressed && (desc->Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS))) { hr = E_INVALIDARG; goto fail; }      /* (sampled only) */
+    /* (R1_UNORM: a 1D or 2D texture - arrays too, levels -, sampled and loaded and copied, one sample; no render target, unordered access, volume, cube, tiles or CPU-visible memory: the
+     * format's support) */
+    if (fi->narrow == NARROW_R1 && ((desc->Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS | D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS)) ||
+                                    desc->Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D || samples > 1 || cube || reserved || cpu)) { hr = E_INVALIDARG; goto fail; }
     if (desc->Width == 0 || desc->Height == 0 || desc->Width > D3D12_REQ_TEXTURE2D_U_OR_V_DIMENSION || desc->Height > D3D12_REQ_TEXTURE2D_U_OR_V_DIMENSION) { hr = E_INVALIDARG; goto fail; }
     /* (larger than this adapter's textures, which Direct3D allows up to 16384: its devices have smaller ones) */
     if (desc->Width > dev_max_texture(dev) || desc->Height > dev_max_texture(dev)) { hr = DXGI_ERROR_UNSUPPORTED; goto fail; }
@@ -858,7 +938,7 @@ static HRESULT resource_make_from(Dev *dev, const D3D12_HEAP_PROPERTIES *props, 
   mem_free(plane_descs);
   if (!KMT_OK(st)) { hr = hr_from(st); goto fail; }
   /* (a narrow format's image starts as zeros in its channels and the maximum in the alpha the kernel keeps, as a copy into it would leave it) */
-  if (r->fmt && r->fmt->narrow && !source && !heap && !reserved) {
+  if (r->fmt && r->fmt->narrow && !format_native_narrow(r->fmt) && !source && !heap && !reserved) {      /* (widened into four channels: not the kernel's own R8 image of R1_UNORM) */
     const UINT count = r->planes ? r->planes * r->layers : 1;
     for (UINT i = 0; i < count; ++i) {
       UINT w = (UINT)desc->Width, h = desc->Height;

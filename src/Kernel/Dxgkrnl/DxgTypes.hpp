@@ -128,6 +128,22 @@ constexpr bool decode_address_word(uint32_t word, graphics::AddressMode* mode, g
   *border = static_cast<graphics::BorderColor>(word >> 8);
   return true;
 }
+// The third word of BindTexture (and a descriptor's filter word): the filter in bit 0 (graphics::Filter: 0 nearest, 1 linear - of minification and magnification, or of minification
+// alone with bit 1), bit 1 a magnification filter of its own (SamplerDesc::separate_mag, kFeature2SeparateFilters) in bit 2, the reduction in bits 4-5 (graphics::SamplerReduction:
+// 0 weighted, 1 minimum, 2 maximum; kFeature2SamplerReductions), bit 8 coordinates in texels (SamplerDesc::unnormalized, kFeature2UnnormalizedCoordinates). The words 0 and 1
+// are the plain filters every device has. False for a word that is none of these.
+constexpr uint32_t filter_word(const graphics::SamplerDesc& s) {
+  return static_cast<uint32_t>(s.filter) | (s.separate_mag ? 2u | (static_cast<uint32_t>(s.mag_filter) << 2) : 0u) | (static_cast<uint32_t>(s.reduction) << 4) | (s.unnormalized ? 0x100u : 0u);
+}
+constexpr bool decode_filter_word(uint32_t word, graphics::SamplerDesc* s) {
+  if ((word & ~0x137u) || ((word >> 4) & 3) > static_cast<uint32_t>(graphics::SamplerReduction::Maximum) || (!(word & 2u) && (word & 4u))) return false;
+  s->filter = static_cast<graphics::Filter>(word & 1u);
+  s->separate_mag = (word & 2u) != 0;
+  s->mag_filter = s->separate_mag ? static_cast<graphics::Filter>((word >> 2) & 1u) : s->filter;
+  s->reduction = static_cast<graphics::SamplerReduction>((word >> 4) & 3u);
+  s->unnormalized = (word & 0x100u) != 0;
+  return true;
+}
 // The tenth word of BindTexture (and of a lowered root binding): the sampler's comparison (graphics::CompareOp, Never .. Always, in bits 0-3: SamplerDesc::compare) and, in bit 8, that the
 // unit reads the stencil plane of a depth buffer (SamplerDesc::stencil). Left out: no comparison (Never), the depth or colour. False for a word that is neither.
 constexpr uint32_t texture_view_word(const graphics::SamplerDesc& s) { return static_cast<uint32_t>(s.compare) | (s.stencil ? 0x100u : 0u); }
@@ -356,6 +372,9 @@ struct ShaderDesc {
 constexpr uint32_t kPipelineRasterTag = 0x31545352;     // 'RST1'
 constexpr uint32_t kPipelineRasterWords = 16;
 constexpr uint32_t kPipelineStepRateTag = 0x31505453;   // 'STP1'
+// ... and how the pipeline's lines are drawn (graphics::LineMode: 0 aliased, 1 alpha-antialiased, 2 quadrilateral 1.4 pixels wide, 3 quadrilateral 1.0 wide), one word.
+constexpr uint32_t kPipelineLineTag = 0x314E494C;        // 'LIN1'
+constexpr uint32_t kPipelineLineWords = 1;
 
 struct PipelineDesc {
   Handle vertex_shader = 0, fragment_shader = 0;
@@ -398,6 +417,7 @@ struct PipelineDesc {
   // A logic operation for every target in place of blending (kFeature2LogicOps). The Src1 blend factors need kFeature2DualSourceBlend and one colour target.
   bool logic_op_enable = false;
   graphics::LogicOp logic_op = graphics::LogicOp::Noop;
+  graphics::LineMode line_mode = graphics::LineMode::Aliased;   // kFeature2LineModes for the others (the tagged part kPipelineLineTag)
 };
 
 // --- Presenting -----------------------------------------------------------------------

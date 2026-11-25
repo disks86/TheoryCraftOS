@@ -81,7 +81,7 @@ typedef struct CmdAlloc {
 typedef struct CmdList CmdList;
 enum { B_PSO = 1, B_TOPOLOGY, B_STENCIL_REF, B_INDEX_BUFFER, B_VERTEX_BUFFERS, B_HEAPS, B_GRAPHICS_SIGNATURE, B_COMPUTE_SIGNATURE, B_GRAPHICS_CONSTANTS, B_COMPUTE_CONSTANTS,
        B_GRAPHICS_CBV, B_GRAPHICS_SRV, B_GRAPHICS_UAV, B_COMPUTE_CBV, B_COMPUTE_SRV, B_COMPUTE_UAV, B_GRAPHICS_TABLE, B_COMPUTE_TABLE, B_DRAW, B_DRAW_INDEXED, B_DISPATCH, B_INDIRECT,
-       B_BLEND_FACTOR, B_STENCIL_REFS, B_DEPTH_BIAS };
+       B_BLEND_FACTOR, B_STENCIL_REFS, B_DEPTH_BIAS, B_STRIP_CUT };
 static void bundle_log(CmdList *l, UINT id, const UINT64 a[6], const UINT *data, UINT ndata);
 #define BUNDLE_LOG(l, id, ...) do { if ((l)->bundle) { UINT64 a_[6] = {__VA_ARGS__}; bundle_log((l), (id), a_, NULL, 0); return; } } while (0)
 #define BUNDLE_LOG_DATA(l, id, data, n, ...) do { if ((l)->bundle) { UINT64 a_[6] = {__VA_ARGS__}; bundle_log((l), (id), a_, (data), (n)); return; } } while (0)
@@ -136,6 +136,7 @@ struct CmdList {
   DescHeap *heaps_used[8];       /* every shader-visible heap the list set: their kernel copies are brought up to date when it is executed */
   UINT nheaps_used;
   D3D12_PRIMITIVE_TOPOLOGY topology;
+  UINT strip_cut;              /* D3D12_INDEX_BUFFER_STRIP_CUT_VALUE: the pipeline's IBStripCutValue, or IASetIndexBufferStripCutValue's (the kernel's SetTopology second word) */
   struct { UINT alloc, stride; UINT64 offset, size; } vb[8];      /* the vertex buffers (input slots) */
   UINT ib_alloc, ib_format;
   UINT64 ib_offset;
@@ -164,6 +165,7 @@ struct CmdList {
   int sent_valid;
   UINT sent_pipeline;
   UINT sent_topology;
+  UINT sent_strip_cut;
   UINT sent_vb_alloc[8], sent_ib_alloc;
   UINT64 sent_vb_offset[8], sent_ib_offset;
   UINT sent_ib_format;
@@ -680,6 +682,7 @@ static UINT topology_code(D3D12_PRIMITIVE_TOPOLOGY t) {
     case D3D_PRIMITIVE_TOPOLOGY_LINESTRIP: return 4;
     case D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST: return 0;
     case D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP: return 1;
+    case 6: return 2;      /* (D3D_PRIMITIVE_TOPOLOGY_TRIANGLEFAN, TriangleFanSupported - OPTIONS15: the kernel expands fans for every device) */
     case D3D_PRIMITIVE_TOPOLOGY_LINELIST_ADJ: return 0x100;
     case D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST_ADJ: return 0x101;
     default:
@@ -772,9 +775,12 @@ static int prepare_draw(CmdList *l, int indexed) {
   }
   l->so_dirty = 0;
   const UINT topology = topology_code(l->topology);
-  if (topology != l->sent_topology) {
-    packet(l, OP_SET_TOPOLOGY, &topology, 1);
+  if (topology != l->sent_topology || l->strip_cut != l->sent_strip_cut) {
+    /* (the topology and which index ends a strip: the kernel's StripCut numbers D3D12_INDEX_BUFFER_STRIP_CUT_VALUE's) */
+    const UINT w[2] = {topology, l->strip_cut};
+    packet(l, OP_SET_TOPOLOGY, w, 2);
     l->sent_topology = topology;
+    l->sent_strip_cut = l->strip_cut;
   }
   for (UINT slot = 0; slot < 8; ++slot) {
     if (!(l->pso->slots_used >> slot & 1) || !l->vb[slot].alloc) continue;
@@ -862,6 +868,8 @@ static void STDMETHODCALLTYPE list_Dispatch(CmdList *l, UINT x, UINT y, UINT z) 
 static void STDMETHODCALLTYPE list_SetPipelineState(CmdList *l, ID3D12PipelineState *p) { keep(l, (IUnknown *)p); BUNDLE_LOG(l, B_PSO, (UINT64)(UINT_PTR)p);
   l->pso = (Pso *)p;
   keep(l, (IUnknown *)p);
+  /* (a graphics pipeline brings its IBStripCutValue - also one made with D3D12_PIPELINE_STATE_FLAG_DYNAMIC_INDEX_BUFFER_STRIP_CUT: IASetIndexBufferStripCutValue changes it after) */
+  if (l->pso && !l->pso->compute) l->strip_cut = l->pso->strip_cut;
 }
 static void STDMETHODCALLTYPE list_IASetPrimitiveTopology(CmdList *l, D3D12_PRIMITIVE_TOPOLOGY t) { BUNDLE_LOG(l, B_TOPOLOGY, t); l->topology = t; }
 /* (up to D3D12_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE: a primitive is drawn with the pair its SV_ViewportArrayIndex names; more than that is the debug layer's error,
@@ -1123,6 +1131,7 @@ static void STDMETHODCALLTYPE list_CopyTextureRegion(CmdList *l, const D3D12_TEX
     if (!image) return;
     const UINT left = box ? box->left : 0, top = box ? box->top : 0, front = box ? box->front : 0;
     const UINT w = box ? box->right - box->left : fp->Width, h = box ? box->bottom - box->top : fp->Height, depth = box ? box->back - box->front : fp->Depth;
+    if (fi && fi->narrow == NARROW_R1 && (left % 8)) return;      /* (R1_UNORM: the footprint's box starts on a byte) */
     for (UINT k = 0; k < depth; ++k) {
       /* (a compressed format's rows are rows of blocks: the box is on whole blocks) */
       UINT64 offset = src->PlacedFootprint.Offset + (UINT64)(front + k) * fp->RowPitch * format_rows(fi, fp->Height) + (UINT64)format_rows(fi, top) * fp->RowPitch + format_row_bytes(fi, left);
@@ -1138,6 +1147,7 @@ static void STDMETHODCALLTYPE list_CopyTextureRegion(CmdList *l, const D3D12_TEX
     if (!image) return;
     const UINT left = box ? box->left : 0, top = box ? box->top : 0, front = box ? box->front : 0;
     const UINT w = box ? box->right - box->left : fp->Width, h = box ? box->bottom - box->top : fp->Height, depth = box ? box->back - box->front : fp->Depth;
+    if (fi && fi->narrow == NARROW_R1 && (x % 8)) return;      /* (R1_UNORM: the footprint's place starts on a byte) */
     for (UINT k = 0; k < depth; ++k) {
       UINT64 offset = dst->PlacedFootprint.Offset + (UINT64)(z + k) * fp->RowPitch * format_rows(fi, fp->Height) + (UINT64)format_rows(fi, y) * fp->RowPitch + format_row_bytes(fi, x);
       UINT image_layer = s->kind == 1 ? front + k : layer;

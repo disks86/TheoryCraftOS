@@ -512,9 +512,14 @@ static void STDMETHODCALLTYPE list_RSSetDepthBias(CmdList *l, FLOAT bias, FLOAT 
   l->depth_bias[1] = clamp == clamp ? clamp : 0.0f;
   l->depth_bias[2] = slope == slope ? slope : 0.0f;
 }
-/* IASetIndexBufferStripCutValue: the state of a pipeline made with D3D12_PIPELINE_STATE_FLAG_DYNAMIC_INDEX_BUFFER_STRIP_CUT, which this device refuses
- * (DynamicIndexBufferStripCutSupported is FALSE, OPTIONS15): a call a program may not make here, left out. */
-static void STDMETHODCALLTYPE list_IASetIndexBufferStripCutValue(CmdList *l, D3D12_INDEX_BUFFER_STRIP_CUT_VALUE value) { (void)l; (void)value; }
+/* IASetIndexBufferStripCutValue: which index ends a strip for the draws that follow, in place of the pipeline's IBStripCutValue (for a pipeline made with
+ * D3D12_PIPELINE_STATE_FLAG_DYNAMIC_INDEX_BUFFER_STRIP_CUT - DynamicIndexBufferStripCutSupported, OPTIONS15 -; SetPipelineState sets the pipeline's again). The kernel expands
+ * strips for every device, so every device takes it. A value that is not one of the enumeration's is an invalid call, left out. Recorded by bundles. */
+static void STDMETHODCALLTYPE list_IASetIndexBufferStripCutValue(CmdList *l, D3D12_INDEX_BUFFER_STRIP_CUT_VALUE value) {
+  if ((UINT)value > (UINT)D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_0xFFFFFFFF) return;
+  BUNDLE_LOG(l, B_STRIP_CUT, (UINT64)value);
+  l->strip_cut = (UINT)value;
+}
 /* SetProgram / DispatchGraph: work graphs (WorkGraphsTier is NOT_SUPPORTED, OPTIONS21: no program can be made to set) - left out. */
 static void STDMETHODCALLTYPE list_SetProgram(CmdList *l, const D3D12_SET_PROGRAM_DESC *desc) { (void)l; (void)desc; }
 static void STDMETHODCALLTYPE list_DispatchGraph(CmdList *l, const D3D12_DISPATCH_GRAPH_DESC *desc) { (void)l; (void)desc; }

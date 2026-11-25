@@ -63,7 +63,9 @@ typedef struct FormatInfo {
 } FormatInfo;
 /* The kernel's NarrowLayout (src/Kernel/Dxgkrnl/CommandStream.hpp): an image of four channels the program sees as one or two. Copied into it a pixel becomes (r, g or 0, 0,
  * the maximum), so an R8 / R8G8 / R16 / R16G16 view of it samples what Direct3D says it does; render targets of these formats write their channels only (pso.inc). */
-enum { NARROW_NONE, NARROW_R8, NARROW_R8G8, NARROW_R16, NARROW_R16G16 };
+/* NARROW_R1: R1_UNORM, a bit a pixel (the first of a row the most significant bit of its first byte), which the kernel keeps as bytes of 0 or 255 in red - its R8Unorm image, or
+ * widened into A8B8G8R8 - and its copies pack and unpack (NarrowLayout::R1); `bytes` is 1, a row's bytes are (width + 7) / 8 (format_row_bytes). */
+enum { NARROW_NONE, NARROW_R8, NARROW_R8G8, NARROW_R16, NARROW_R16G16, NARROW_R1 };
 enum { PLANAR_NONE, PLANAR_8, PLANAR_16, PLANAR_P208, PLANAR_V208, PLANAR_V408 };
 
 static const FormatInfo g_formats[] = {
@@ -108,9 +110,25 @@ static const FormatInfo g_formats[] = {
     {DXGI_FORMAT_YUY2, KF_A8B8G8R8, 4, 0, 0, 0, 0, 1}, {DXGI_FORMAT_Y210, KF_RGBA16, 8, 0, 0, 0, 0, 1}, {DXGI_FORMAT_Y216, KF_RGBA16, 8, 0, 0, 0, 0, 1},
     {DXGI_FORMAT_P208, KF_A8B8G8R8, 1, 0, 0, NARROW_R8, PLANAR_P208}, {DXGI_FORMAT_V208, KF_A8B8G8R8, 1, 0, 0, NARROW_R8, PLANAR_V208},
     {DXGI_FORMAT_V408, KF_A8B8G8R8, 1, 0, 0, NARROW_R8, PLANAR_V408},
+    {DXGI_FORMAT_R1_UNORM, KF_A8B8G8R8, 1, 0, 0, NARROW_R1},
 };
+/* The narrow formats as the kernel's own one- and two-channel images (its formats numbered from 64: R8Unorm, R8G8Unorm, R16Unorm, R16G16Unorm), for a texture of one where the
+ * adapter has that image for all the texture is made for (native_narrow_format): its texels are kept as they are, no widening. A typeless one's views of the other kinds (R8_UINT,
+ * R16_FLOAT ...) are mirrors of it in the view's own kernel format - the same bytes (heaps.inc typed_view_alloc). */
+static const FormatInfo g_native_narrow[] = {
+    {DXGI_FORMAT_R8_TYPELESS, KF_R8, 1, 0}, {DXGI_FORMAT_R8_UNORM, KF_R8, 1, 0}, {DXGI_FORMAT_R8G8_TYPELESS, KF_R8G8, 2, 0}, {DXGI_FORMAT_R8G8_UNORM, KF_R8G8, 2, 0},
+    {DXGI_FORMAT_R16_TYPELESS, KF_R16, 2, 0}, {DXGI_FORMAT_R16_UNORM, KF_R16, 2, 0}, {DXGI_FORMAT_R16G16_TYPELESS, KF_R16G16, 4, 0}, {DXGI_FORMAT_R16G16_UNORM, KF_R16G16, 4, 0},
+    {DXGI_FORMAT_R1_UNORM, KF_R8, 1, 0, 0, NARROW_R1},      /* (its bits as bytes of the kernel's R8Unorm image) */
+};
+static const FormatInfo *native_narrow_entry(DXGI_FORMAT f) {
+  for (UINT i = 0; i < sizeof g_native_narrow / sizeof g_native_narrow[0]; ++i)
+    if (g_native_narrow[i].dxgi == f) return &g_native_narrow[i];
+  return NULL;
+}
+static int format_native_narrow(const FormatInfo *fi) { return fi && fi >= g_native_narrow && fi < g_native_narrow + sizeof g_native_narrow / sizeof g_native_narrow[0]; }
 /* The bytes of a row of a level `w` pixels wide (of blocks for a compressed format), and the rows of a level `h` high. */
 static UINT64 format_row_bytes(const FormatInfo *fi, UINT w) {
+  if (fi && fi->narrow == NARROW_R1) return ((UINT64)w + 7) / 8;      /* (R1_UNORM: a bit a pixel) */
   return fi && fi->compressed ? (UINT64)((w + 3) / 4) * fi->bytes : fi && fi->pair ? (UINT64)((w + 1) / 2) * fi->bytes : (UINT64)w * (fi ? fi->bytes : 4);
 }
 /* A column and a width of a texture in pixels of the kernel's image (a packed 4:2:2 format's are pairs). */
@@ -138,7 +156,7 @@ static int format_packed_yuv_mips(DXGI_FORMAT f) { return f == DXGI_FORMAT_AYUV 
 /* Whether a texture of the format may be reserved (D3D12_FORMAT_SUPPORT2_TILED): a colour format the kernel keeps, of 1 to 16 bytes a texel, not block-compressed, not a video
  * format (planar or packed YUV: Direct3D defines no tiles for those, and its format tables have "Tiled Resource" disallowed for every one of them). */
 static int format_tiled(const FormatInfo *fi) {
-  if (!fi || !fi->kernel || fi->depth || fi->compressed || fi->planar || fi->pair || format_packed_yuv(fi->dxgi)) return 0;
+  if (!fi || !fi->kernel || fi->depth || fi->compressed || fi->planar || fi->pair || format_packed_yuv(fi->dxgi) || fi->narrow == NARROW_R1) return 0;      /* (R1_UNORM: no tiles of bits) */
   return fi->bytes == 1 || fi->bytes == 2 || fi->bytes == 4 || fi->bytes == 8 || fi->bytes == 16;
 }
 
@@ -335,6 +353,10 @@ struct Dev {
 #define DEV_FEATURE2_SAMPLER_STATE (1u << 11)            /* anisotropy, border colours of any value */
 #define DEV_FEATURE2_VIEWPORTS (1u << 12)                /* sixteen viewports and scissor rectangles, SV_ViewportArrayIndex from geometry shaders */
 #define DEV_FEATURE2_LAYER_ANY_STAGE (1u << 13)          /* SV_RenderTargetArrayIndex and SV_ViewportArrayIndex from vertex and domain shaders */
+#define DEV_FEATURE2_SEPARATE_FILTERS (1u << 24)         /* graphics::kFeature2SeparateFilters: minification and magnification filters of their own (MIN_POINT_MAG_LINEAR ...) */
+#define DEV_FEATURE2_SAMPLER_REDUCTIONS (1u << 25)       /* graphics::kFeature2SamplerReductions: the MINIMUM_ and MAXIMUM_ filters */
+#define DEV_FEATURE2_UNNORMALIZED_COORDINATES (1u << 26) /* graphics::kFeature2UnnormalizedCoordinates: samplers with D3D12_SAMPLER_FLAG_NON_NORMALIZED_COORDINATES */
+#define DEV_FEATURE2_LINE_MODES (1u << 27)               /* graphics::kFeature2LineModes: alpha-antialiased and quadrilateral lines (the CreatePipeline part 'LIN1') */
 /* What allocations of a kernel format numbered from KF_FIRST_EXTRA may be on the device's adapter (KFC_* bits; 0 for any other format, or from a kernel that has no table) */
 static UINT dev_format_caps(const Dev *d, UINT kf) {
   const KmtCaps *c = &d->caps;
