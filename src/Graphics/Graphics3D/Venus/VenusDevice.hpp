@@ -41,7 +41,7 @@
 #include "Utility/UniquePointer.hpp"
 
 namespace hardware {
-class VirtioGpu;
+class IGraphicsProcessingUnit;
 }
 
 namespace graphics {
@@ -66,7 +66,10 @@ struct VenusMemory {
 
 class VenusDevice final : public IGraphicsDevice {
  public:
-  VenusDevice(allocators::IAllocator& allocator, hardware::VirtioGpu& gpu);
+  // `screen` shows presented images (the virtio-gpu's own 2D screen); `account`, when given, is told of the memory the device's objects take and give back (the
+  // virtio-gpu's video memory figure), with `account_context`.
+  using MemoryAccount = void (*)(void* context, int64_t bytes);
+  VenusDevice(allocators::IAllocator& allocator, hardware::IGraphicsProcessingUnit& screen, MemoryAccount account = nullptr, void* account_context = nullptr);
   ~VenusDevice();
   VenusDevice(const VenusDevice&) = delete;
   VenusDevice& operator=(const VenusDevice&) = delete;
@@ -97,7 +100,6 @@ class VenusDevice final : public IGraphicsDevice {
   const TcosKernelVulkan& vk() const { return ctx_.vk(); }
   VkDevice device() const { return ctx_.device(); }
   allocators::IAllocator& allocator() { return allocator_; }
-  hardware::VirtioGpu& gpu() { return gpu_; }
   // Host-visible memory of `size` bytes as a buffer of `usage` (mapped; zeroed). False when the host is out of memory or the window is full.
   [[nodiscard]] bool make_memory(uint64_t size, VkBufferUsageFlags usage, VenusMemory* out);
   void free_memory(VenusMemory* m);
@@ -124,6 +126,11 @@ class VenusDevice final : public IGraphicsDevice {
   VkQueryPool query_pool(QueryPoolKind kind);
   // The counters of stream output bindings (host-visible: the replay writes each binding's start, the GPU where it got to).
   VenusMemory* stream_output_counters();
+  // The pipeline of a colour resolve to the least or greatest sample (a full-screen triangle whose fragment shader fetches every sample), for a target format and a
+  // sample count; made once each. nullptr when it cannot be made.
+  VenusPipeline* extreme_resolve_pipeline(VkFormat target, uint32_t samples, bool greatest);
+  // A single-sampled colour image of `format` and `extent` a resolve goes through when the destination's format differs (kept for the next).
+  VenusImage* resolve_scratch(Format format, Extent2D extent);
   bool clock_interrupted() const { return __atomic_load_n(&clock_interrupted_, __ATOMIC_ACQUIRE); }
   void clear_clock_interrupted() { __atomic_store_n(&clock_interrupted_, false, __ATOMIC_RELEASE); }
   // submit's command buffer: begun (the queue's lock taken), and submitted, waited for and reset (the lock let go). Also used to split a long submit.
@@ -134,6 +141,8 @@ class VenusDevice final : public IGraphicsDevice {
   uint32_t uniform_alignment() const { return uniform_alignment_; }
   VkSampler sampler_for(const SamplerDesc& s, bool integer_texture);
   void add_video_memory(int64_t bytes);
+  // A line of diagnostics (why a shader or a pipeline was refused): the kernel's log (tcos_kvk_trace).
+  static void trace(StringView what, uint32_t line, StringView message);
 
  private:
   friend class VenusCommands;
@@ -142,7 +151,9 @@ class VenusDevice final : public IGraphicsDevice {
   bool wait_fence(VkFence fence);
 
   allocators::IAllocator& allocator_;
-  hardware::VirtioGpu& gpu_;
+  hardware::IGraphicsProcessingUnit& screen_;
+  MemoryAccount account_;
+  void* account_context_;
   VenusContext ctx_;
   VkCommandPool pool_ = nullptr;
   VkCommandBuffer once_ = nullptr;     // run_once's command buffer
@@ -159,6 +170,16 @@ class VenusDevice final : public IGraphicsDevice {
     VkSampler sampler = nullptr;
   };
   List<CachedSampler> samplers_;
+  struct ResolvePipeline {
+    VkFormat target = VK_FORMAT_UNDEFINED;
+    uint32_t samples = 0;
+    bool greatest = false;
+    VenusShaderModule* vs = nullptr;
+    VenusShaderModule* fs = nullptr;
+    VenusPipeline* pipeline = nullptr;
+  };
+  List<ResolvePipeline> resolve_pipelines_;
+  VenusImage* resolve_scratch_ = nullptr;
   uint32_t uniform_alignment_ = 256;
   uint32_t max_image_dimension_ = 4096;
   uint32_t sample_counts_ = 0;

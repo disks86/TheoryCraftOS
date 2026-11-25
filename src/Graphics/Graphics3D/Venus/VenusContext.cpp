@@ -33,7 +33,7 @@ const char* const kWanted[] = {
     VK_EXT_TRANSFORM_FEEDBACK_EXTENSION_NAME,      VK_EXT_CONDITIONAL_RENDERING_EXTENSION_NAME, VK_EXT_CUSTOM_BORDER_COLOR_EXTENSION_NAME,
     VK_EXT_CONSERVATIVE_RASTERIZATION_EXTENSION_NAME, VK_EXT_DEPTH_CLIP_ENABLE_EXTENSION_NAME,   VK_EXT_INDEX_TYPE_UINT8_EXTENSION_NAME,
     VK_EXT_LINE_RASTERIZATION_EXTENSION_NAME,      VK_EXT_VERTEX_ATTRIBUTE_DIVISOR_EXTENSION_NAME, VK_EXT_PROVOKING_VERTEX_EXTENSION_NAME,
-    VK_EXT_ROBUSTNESS_2_EXTENSION_NAME,            VK_EXT_DEPTH_BIAS_CONTROL_EXTENSION_NAME,
+    VK_EXT_ROBUSTNESS_2_EXTENSION_NAME,            VK_EXT_DEPTH_BIAS_CONTROL_EXTENSION_NAME,       VK_EXT_SAMPLE_LOCATIONS_EXTENSION_NAME,
 };
 constexpr uint32_t kWantedCount = sizeof(kWanted) / sizeof(kWanted[0]);
 
@@ -196,10 +196,14 @@ bool VenusContext::open() {
 
   // The driver's name (for the boot log and GL_RENDERER).
   auto driver = vk_struct<VkPhysicalDeviceDriverProperties>(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES);
+  auto locations = vk_struct<VkPhysicalDeviceSampleLocationsPropertiesEXT>(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SAMPLE_LOCATIONS_PROPERTIES_EXT);
   auto p2 = vk_struct<VkPhysicalDeviceProperties2>(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2);
   p2.pNext = &driver;
+  if (enabled(VK_EXT_SAMPLE_LOCATIONS_EXTENSION_NAME)) driver.pNext = &locations;
   vk_->GetPhysicalDeviceProperties2(physical_, &p2);
   for (uint32_t i = 0; i + 1 < sizeof(driver_name_) && driver.driverName[i]; ++i) driver_name_[i] = driver.driverName[i];
+  caps_.sample_locations = enabled(VK_EXT_SAMPLE_LOCATIONS_EXTENSION_NAME);
+  caps_.sample_location_counts = caps_.sample_locations ? locations.sampleLocationSampleCounts : 0;
 
   const float priority = 1.0f;
   const VkDeviceQueueCreateInfo qci = {VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO, nullptr, 0, family_, 1, &priority};

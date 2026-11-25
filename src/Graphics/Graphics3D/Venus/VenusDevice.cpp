@@ -24,7 +24,7 @@
 #include "Graphics/Graphics3D/Mipmaps.hpp"
 #include "Graphics/Graphics3D/Venus/VenusObjects.hpp"
 #include "Graphics/WidePixels.hpp"
-#include "Hardware/GraphicsProcessingUnit/Virtio/VirtioGpu.hpp"
+#include "Hardware/GraphicsProcessingUnit/IGraphicsProcessingUnit.hpp"
 #include "Utility/ByteStream.hpp"
 
 namespace graphics {
@@ -34,11 +34,40 @@ constexpr uint64_t kConstantRingBytes = 8u << 20;   // (a submit's constant bloc
 constexpr uint64_t kStagingStart = 4u << 20;
 }  // namespace
 
-VenusDevice::VenusDevice(allocators::IAllocator& allocator, hardware::VirtioGpu& gpu) : allocator_(allocator), gpu_(gpu), pools_(allocator), samplers_(allocator) {}
+VenusDevice::VenusDevice(allocators::IAllocator& allocator, hardware::IGraphicsProcessingUnit& screen, MemoryAccount account, void* account_context)
+    : allocator_(allocator), screen_(screen), account_(account), account_context_(account_context), pools_(allocator), samplers_(allocator), resolve_pipelines_(allocator) {}
+
+void VenusDevice::trace(StringView what, uint32_t line, StringView message) {
+  char text[200];
+  uint32_t n = 0;
+  auto put = [&](StringView s) {
+    for (char ch : s)
+      if (n + 1 < sizeof(text)) text[n++] = ch;
+  };
+  put("venus device: "), put(what);
+  if (line) {
+    char digits[12];
+    uint32_t k = 0;
+    do digits[k++] = static_cast<char>('0' + line % 10), line /= 10;
+    while (line);
+    put(" (line ");
+    while (k) put(StringView(&digits[--k], 1));
+    put(")");
+  }
+  put(": "), put(message);
+  text[n] = 0;
+  tcos_kvk_trace(text);
+}
 
 VenusDevice::~VenusDevice() {
   if (!ctx_.opened()) return;
   vk().DeviceWaitIdle(device());
+  for (ResolvePipeline& r : resolve_pipelines_) {
+    destroy_pipeline(r.pipeline);
+    destroy_shader_module(r.fs);
+    destroy_shader_module(r.vs);
+  }
+  destroy_image(resolve_scratch_);
   for (CachedSampler& s : samplers_) vk().DestroySampler(device(), s.sampler, nullptr);
   for (VkDescriptorPool p : pools_) vk().DestroyDescriptorPool(device(), p, nullptr);
   for (VkQueryPool p : pools_by_kind_)
@@ -85,7 +114,7 @@ bool VenusDevice::initialize() {
 }
 
 // ---- what the device does ----------------------------------------------------------------------------------------------------------------------------
-// What this device implements, where the host's device has it. (Multisampling and resolves are not offered yet: docs/Venus.md.)
+// What this device implements, where the host's device has it.
 DeviceInfo VenusDevice::info() const {
   DeviceInfo i{};
   i.name = "Venus (virtio-gpu)", i.kind = DeviceKind::VirtualGpu, i.accelerated = true;
@@ -115,7 +144,9 @@ DeviceInfo VenusDevice::info() const {
   if (c.multi_viewport) i.features2 |= kFeature2Viewports;
   if (c.shader_output_layer && c.shader_output_viewport_index) i.features2 |= kFeature2LayerFromAnyStage;
   if (c.conservative_rasterization) i.features2 |= kFeature2ConservativeRaster;
-  i.sample_counts = 0;
+  i.sample_counts = sample_counts_ & ((1u << 2) | (1u << 4) | (1u << 8));
+  if (i.sample_counts) i.features |= kFeatureMultisample | kFeatureDepthResolve, i.features2 |= kFeature2ColorResolveModes;
+  i.d3d_sample_order = true;   // (Vulkan's standard sample locations are Direct3D's)
   i.limits.texture_units = kMaxTextureUnits;
   i.limits.vertex_attributes = kMaxVertexAttributes;
   i.limits.varyings = 15;            // (as virgl's: the Direct3D layer's text keeps one more output, the position as written, after them)
@@ -181,8 +212,7 @@ VenusMemory* VenusDevice::staging(uint64_t size) {
 }
 
 void VenusDevice::add_video_memory(int64_t bytes) {
-  if (bytes >= 0) gpu_.add_resource_bytes(static_cast<uint64_t>(bytes));
-  else gpu_.remove_resource_bytes(static_cast<uint64_t>(-bytes));
+  if (account_) account_(account_context_, bytes);
 }
 
 bool VenusDevice::lock_queue() {
@@ -274,6 +304,61 @@ VkQueryPool VenusDevice::query_pool(QueryPoolKind kind) {
 VenusMemory* VenusDevice::stream_output_counters() {
   if (!so_counters_.buffer && !make_memory(kStreamOutputCounters * 4, VK_BUFFER_USAGE_TRANSFORM_FEEDBACK_COUNTER_BUFFER_BIT_EXT, &so_counters_)) return nullptr;
   return &so_counters_;
+}
+
+// ---- resolves --------------------------------------------------------------------------------------------------------------------------------------
+VenusImage* VenusDevice::resolve_scratch(Format format, Extent2D extent) {
+  if (resolve_scratch_ && resolve_scratch_->format() == format && resolve_scratch_->extent().width == extent.width && resolve_scratch_->extent().height == extent.height)
+    return resolve_scratch_;
+  destroy_image(resolve_scratch_);
+  resolve_scratch_ = static_cast<VenusImage*>(create_image({extent, format, kImageColorAttachment}));
+  return resolve_scratch_;
+}
+
+VenusPipeline* VenusDevice::extreme_resolve_pipeline(VkFormat target, uint32_t samples, bool greatest) {
+  for (const ResolvePipeline& r : resolve_pipelines_)
+    if (r.target == target && r.samples == samples && r.greatest == greatest) return r.pipeline;
+  // (a triangle over the target from the vertex number: (-1, -1), (3, -1), (-1, 3); the fragment shader takes every sample at its pixel and keeps the least or greatest)
+  static const char kVs[] =
+      "VERT\nDCL SV[0], VERTEXID\nDCL OUT[0], POSITION\nDCL TEMP[0]\nIMM[0] UINT32 {1, 1, 0, 0}\nIMM[1] FLT32 {4.0, -1.0, 0.0, 1.0}\n"
+      "  0: AND TEMP[0].x, SV[0].xxxx, IMM[0].xxxx\n  1: USHR TEMP[0].y, SV[0].xxxx, IMM[0].yyyy\n  2: AND TEMP[0].y, TEMP[0].yyyy, IMM[0].xxxx\n"
+      "  3: U2F TEMP[0].xy, TEMP[0].xyyy\n  4: MAD OUT[0].xy, TEMP[0].xyyy, IMM[1].xxxx, IMM[1].yyyy\n  5: MOV OUT[0].zw, IMM[1].zzzw\n  6: END\n";
+  char fs[2048];
+  uint32_t n = 0;
+  auto put = [&](const char* t) {
+    for (; *t && n + 1 < sizeof(fs); ++t) fs[n++] = *t;
+  };
+  put("FRAG\nDCL IN[0], POSITION, LINEAR\nDCL OUT[0], COLOR\nDCL SAMP[0]\nDCL SVIEW[0], 2D_MSAA, FLOAT\nDCL TEMP[0..2]\n");
+  put("IMM[0] UINT32 {0, 1, 2, 3}\nIMM[1] UINT32 {4, 5, 6, 7}\n");
+  put("  F2I TEMP[0].xy, IN[0].xyyy\n  MOV TEMP[0].zw, IMM[0].xxxx\n  TXF TEMP[1], TEMP[0], SAMP[0], 2D_MSAA\n");
+  static const char* const kSample[8] = {"IMM[0].xxxx", "IMM[0].yyyy", "IMM[0].zzzz", "IMM[0].wwww", "IMM[1].xxxx", "IMM[1].yyyy", "IMM[1].zzzz", "IMM[1].wwww"};
+  for (uint32_t s = 1; s < samples && s < 8; ++s) {
+    put("  MOV TEMP[0].w, "), put(kSample[s]), put("\n  TXF TEMP[2], TEMP[0], SAMP[0], 2D_MSAA\n");
+    put(greatest ? "  MAX TEMP[1], TEMP[1], TEMP[2]\n" : "  MIN TEMP[1], TEMP[1], TEMP[2]\n");
+  }
+  put("  MOV OUT[0], TEMP[1]\n  END\n");
+  fs[n] = 0;
+  ShaderModuleDesc vd;
+  vd.stage = ShaderStage::Vertex, vd.tgsi = kVs;
+  ShaderModuleDesc fd;
+  fd.stage = ShaderStage::Fragment, fd.tgsi = fs;
+  ResolvePipeline r;
+  r.target = target, r.samples = samples, r.greatest = greatest;
+  r.vs = static_cast<VenusShaderModule*>(create_shader_module(vd));
+  r.fs = static_cast<VenusShaderModule*>(create_shader_module(fd));
+  if (r.vs && r.fs) {
+    GraphicsPipelineDesc pd;
+    pd.vertex_shader = r.vs, pd.fragment_shader = r.fs;
+    pd.texture_count = 1, pd.cull_mode = CullMode::None, pd.color_target_count = 1;
+    r.pipeline = static_cast<VenusPipeline*>(create_graphics_pipeline(pd));
+  }
+  if (!r.pipeline || !resolve_pipelines_.push_back(r)) {
+    destroy_pipeline(r.pipeline);
+    destroy_shader_module(r.fs);
+    destroy_shader_module(r.vs);
+    return nullptr;
+  }
+  return r.pipeline;
 }
 
 // ---- formats ---------------------------------------------------------------------------------------------------------------------------------------
@@ -541,7 +626,9 @@ bool VenusImage::create() {
   if (storage && (!(d.usage & kImageSampled) || d.samples != 1 || depth || is_srgb_format(d.format))) return false;
   if (d.samples != 1) {
     if (!(device_.info().sample_counts & (1u << d.samples)) || d.kind != TextureKind::Texture2D || d.mip_levels != 1 || (d.usage & (kImagePresent | kImageStorage))) return false;
-    if (depth ? (d.usage & ~(kImageDepthAttachment)) != 0 : !(d.usage & kImageColorAttachment)) return false;
+    if (depth ? (d.usage & ~(kImageDepthAttachment)) != 0
+              : (!(d.usage & kImageColorAttachment) || (d.usage & ~(kImageColorAttachment | kImageSampled)) || is_integer_format(d.format) || is_compressed_format(d.format)))
+      return false;
   }
   if ((d.usage & kImageSampled) && depth && (d.samples != 1 || (d.usage & ~(kImageSampled | kImageDepthAttachment)))) return false;
   if (d.format == Format::A8Unorm && (d.usage & kImageColorAttachment)) return false;
@@ -923,8 +1010,8 @@ bool VenusDevice::present(IImage* image) {
   if (!ByteView(s->map, count * 4).try_cast<uint32_t>(&words)) return false;
   if (v->swaps_rb())
     for (uint32_t& w : words) w = (w & 0xFF00FF00u) | ((w & 0xFF) << 16) | ((w >> 16) & 0xFF);
-  gpu_.blit(0, 0, e.width < gpu_.width() ? e.width : gpu_.width(), e.height < gpu_.height() ? e.height : gpu_.height(), words.data(), e.width);
-  gpu_.present();
+  screen_.blit(0, 0, e.width < screen_.width() ? e.width : screen_.width(), e.height < screen_.height() ? e.height : screen_.height(), words.data(), e.width);
+  screen_.present();
   return true;
 }
 

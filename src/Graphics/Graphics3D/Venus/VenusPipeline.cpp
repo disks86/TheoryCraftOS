@@ -19,7 +19,6 @@
 // The Venus device's shader modules and pipelines (VenusDevice.hpp): TGSI compiled to SPIR-V per variant, the Vulkan pipeline state of a GraphicsPipelineDesc,
 // the descriptor set layout of what the shaders use.
 #include <new>
-#include "BootLog.hpp"
 #include "Graphics/Graphics3D/Venus/VenusObjects.hpp"
 
 namespace graphics {
@@ -35,7 +34,7 @@ bool VenusShaderModule::create() {
   if (tgsi::has_marks(this->text())) return true;
   tgsi::ParseError error;
   if (!tgsi::parse(this->text(), &program_, &error)) {
-    bootlog::Entry(bootlog::Level::Warning, "Venus").text("TGSI refused (line ").dec(error.line).text("): ").text(error.message.view());
+    VenusDevice::trace("TGSI refused", error.line, error.message.view());
     return false;
   }
   return true;
@@ -308,11 +307,12 @@ VkLogicOp logic_op(LogicOp o) {
   return VK_LOGIC_OP_COPY;
 }
 
-VkStencilOpState stencil_state(const StencilState& s) {
+// (one face's state; whether the stencil test runs at all is the front state's `enable`, for both faces)
+VkStencilOpState stencil_state(const StencilState& s, bool enabled) {
   VkStencilOpState o{};
   o.failOp = stencil_op(s.fail_op), o.passOp = stencil_op(s.pass_op), o.depthFailOp = stencil_op(s.depth_fail_op);
-  o.compareOp = s.enable ? compare_op(s.compare) : VK_COMPARE_OP_ALWAYS;
-  o.compareMask = s.compare_mask, o.writeMask = s.enable ? s.write_mask : 0, o.reference = s.reference;
+  o.compareOp = enabled ? compare_op(s.compare) : VK_COMPARE_OP_ALWAYS;
+  o.compareMask = s.compare_mask, o.writeMask = enabled ? s.write_mask : 0, o.reference = s.reference;
   return o;
 }
 
@@ -460,7 +460,7 @@ bool VenusPipeline::make(Variant& v) {
       ByteBuffer text(device_.allocator());
       tgsi::ParseError pe;
       if (!tgsi::substitute_marks(m.text(), mv, &text) || !tgsi::parse(StringView(text.view()), &marked, &pe)) {
-        bootlog::Entry(bootlog::Level::Warning, "Venus").text("TGSI with marks refused (line ").dec(pe.line).text("): ").text(pe.message.view());
+        VenusDevice::trace("TGSI with marks refused", pe.line, pe.message.view());
         ok = false;
         break;
       }
@@ -468,7 +468,7 @@ bool VenusPipeline::make(Variant& v) {
     }
     tgsi::CompileResult r(device_.allocator());
     if (!tgsi::compile_spirv(*program, o, &r)) {
-      bootlog::Entry(bootlog::Level::Warning, "Venus").text("TGSI not compiled (line ").dec(r.line).text("): ").text(r.error.view());
+      VenusDevice::trace("TGSI not compiled", r.line, r.error.view());
       ok = false;
       break;
     }
@@ -663,15 +663,29 @@ bool VenusPipeline::make_graphics(Variant& v, const VkPipelineShaderStageCreateI
   // multisampling
   VkPipelineMultisampleStateCreateInfo ms = vk_struct<VkPipelineMultisampleStateCreateInfo>(VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO);
   ms.rasterizationSamples = static_cast<VkSampleCountFlagBits>(v.key.samples ? v.key.samples : 1);
-  ms.alphaToCoverageEnable = d.alpha_to_coverage ? VK_TRUE : VK_FALSE;
+  ms.alphaToCoverageEnable = d.alpha_to_coverage && d.multisample ? VK_TRUE : VK_FALSE;
+  // (without multisampling a pixel is all or nothing by its centre: every sample of a multisampled target is put there)
+  VkSampleLocationEXT centres[16];
+  for (VkSampleLocationEXT& c : centres) c = {0.5f, 0.5f};
+  VkPipelineSampleLocationsStateCreateInfoEXT locations = vk_struct<VkPipelineSampleLocationsStateCreateInfoEXT>(VK_STRUCTURE_TYPE_PIPELINE_SAMPLE_LOCATIONS_STATE_CREATE_INFO_EXT);
+  if (!d.multisample && ms.rasterizationSamples > 1) {
+    if (!(ctx.caps().sample_location_counts & ms.rasterizationSamples)) return false;
+    locations.sampleLocationsEnable = VK_TRUE;
+    locations.sampleLocationsInfo = vk_struct<VkSampleLocationsInfoEXT>(VK_STRUCTURE_TYPE_SAMPLE_LOCATIONS_INFO_EXT);
+    locations.sampleLocationsInfo.sampleLocationsPerPixel = ms.rasterizationSamples;
+    locations.sampleLocationsInfo.sampleLocationGridSize = {1, 1};
+    locations.sampleLocationsInfo.sampleLocationsCount = ms.rasterizationSamples;
+    locations.sampleLocationsInfo.pSampleLocations = centres;
+    ms.pNext = &locations;
+  }
   // depth and stencil (a depth write without a test passes everything: Vulkan writes depth only when it tests)
   VkPipelineDepthStencilStateCreateInfo ds = vk_struct<VkPipelineDepthStencilStateCreateInfo>(VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO);
   ds.depthTestEnable = d.depth_test || d.depth_write ? VK_TRUE : VK_FALSE;
   ds.depthWriteEnable = d.depth_write ? VK_TRUE : VK_FALSE;
   ds.depthCompareOp = !d.depth_test ? VK_COMPARE_OP_ALWAYS : compare_op(d.depth_compare);
   ds.stencilTestEnable = d.stencil.enable ? VK_TRUE : VK_FALSE;
-  ds.front = stencil_state(d.stencil);
-  ds.back = stencil_state(d.separate_back_stencil ? d.back_stencil : d.stencil);
+  ds.front = stencil_state(d.stencil, d.stencil.enable);
+  ds.back = stencil_state(d.separate_back_stencil ? d.back_stencil : d.stencil, d.stencil.enable);
   // blending (VirglDevice's rules): target 0 the pipeline's own state (blend.custom), else source over destination (alpha_blend: colour SrcAlpha / InvSrcAlpha, alpha
   // One / InvSrcAlpha), else none; with independent blending target n its own target_blend[n - 1] when that is custom, else none; without it every target as 0.
   VkPipelineColorBlendAttachmentState blends[kMaxColorTargets] = {};

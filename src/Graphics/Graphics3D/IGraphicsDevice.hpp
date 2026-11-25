@@ -1170,10 +1170,10 @@ struct DeviceInfo {
   uint32_t sample_counts = 0;               // kFeatureMultisample: bit n set: ImageDesc::samples = n is supported
   DeviceLimits limits;                      // vertex attributes, varyings, texture units, colour targets and vertex buffers the device takes
   bool blend_constant = false;              // with kFeatureBlendState: the BlendFactor Constant* factors and BlendState::constant
+  uint32_t features2 = 0;                   // DeviceFeature2 bits
   // A multisampled image's samples are numbered as Direct3D's standard pattern (Vulkan's standard sample locations). virgl's host numbers 4x samples otherwise,
   // and the Direct3D layer's TGSI turns the index around for it unless this is set.
   bool d3d_sample_order = false;
-  uint32_t features2 = 0;                   // DeviceFeature2 bits
 };
 
 class IGraphicsDevice {

@@ -242,6 +242,7 @@ class Replay {
   void segments_close();
   void segments_open();
   bool read_queries();
+  bool resolve(const RecordedCommand& c);
   // stream output
   bool bind_stream_output(const RecordedCommand& c);
   bool begin_stream_output(VenusPipeline& p);
@@ -434,12 +435,9 @@ bool Replay::begin_pass(const RenderPassBegin& p) {
     colors[t].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
     const Vec4 c = p.clear_color_value;
     const Format f = targets_[t]->format();
-    if (is_integer_format(f)) {   // (an integer target's clear colour is the values' integers, as the CPU renderer stores it)
+    if (is_integer_format(f)) {   // (an integer target's clear colour is the integers' bits in the floats, as integer values travel everywhere in this interface)
       const float in[4] = {c.x, c.y, c.z, c.w};
-      for (uint32_t k = 0; k < 4; ++k) {
-        if (is_signed_integer_format(f)) colors[t].clearValue.color.int32[k] = static_cast<int32_t>(in[k]);
-        else colors[t].clearValue.color.uint32[k] = in[k] > 0 ? static_cast<uint32_t>(in[k]) : 0;
-      }
+      __builtin_memcpy(colors[t].clearValue.color.uint32, in, sizeof in);
     } else {
       colors[t].clearValue.color.float32[0] = c.x, colors[t].clearValue.color.float32[1] = c.y;
       colors[t].clearValue.color.float32[2] = c.z, colors[t].clearValue.color.float32[3] = c.w;
@@ -626,11 +624,19 @@ bool Replay::bind_resources(VenusPipeline& p, VenusPipeline::Variant& v, VkPipel
       }
       continue;
     }
-    // (a texture the pass draws into is refused)
+    // (a view of levels and layers the pass draws into is refused; other levels or layers of a target may be read, as on virgl)
     if (in_pass_ && !p.compute()) {
+      const ImageDesc& id = t.image->desc();
+      const uint32_t first_level = t.has_view ? t.view.base_level : 0, levels = t.has_view ? t.view.level_count : id.mip_levels;
+      const uint32_t first_layer = t.has_view ? t.view.first_layer : 0, layers = t.has_view ? t.view.layer_count : t.image->layer_count();
+      auto drawn_into = [&](uint32_t level, uint32_t first, uint32_t count) {
+        if (level < first_level || level >= first_level + levels) return false;
+        if (id.kind == TextureKind::Texture3D) return true;   // (a volume's slices are one subresource of its level)
+        return first < first_layer + layers && first_layer < first + count;
+      };
       for (uint32_t k = 0; k < target_count_; ++k)
-        if (targets_[k] == t.image) return false;
-      if (depth_ == t.image) return false;
+        if (targets_[k] == t.image && drawn_into(pass_.level[k], pass_.first_layer[k], pass_.layer_count[k])) return false;
+      if (depth_ == t.image && drawn_into(pass_.level[kMaxColorTargets], pass_.first_layer[kMaxColorTargets], pass_.layer_count[kMaxColorTargets])) return false;
     }
     const bool stencil = t.sampler.stencil && t.image->desc().stencil;
     VkImageView view = t.has_view ? t.image->sampled_view(t.view, stencil) : t.image->whole_view(stencil);
@@ -956,6 +962,122 @@ bool Replay::read_queries() {
   return true;
 }
 
+// ---- resolves ------------------------------------------------------------------------------------------------------------------------------------------
+// VirglDevice's rules: outside a pass, a multisampled source and a single-sampled destination of one extent; colour to the average (or, with the resolve modes, the
+// least or greatest sample), depth (and stencil) from sample 0 only. Queries do not count what a resolve does.
+bool Replay::resolve(const RecordedCommand& c) {
+  VenusImage* dst = static_cast<VenusImage*>(c.image);
+  VenusImage* src = static_cast<VenusImage*>(c.image2);
+  const ResolveMode mode = static_cast<ResolveMode>(c.count);
+  if (in_pass_ || !dst || !src || dst->desc().samples != 1 || src->desc().samples < 2 || dst->extent().width != src->extent().width ||
+      dst->extent().height != src->extent().height)
+    return false;
+  const bool depth = src->format() == Format::D32Float;
+  if (depth != (dst->format() == Format::D32Float)) return false;
+  if (depth ? mode != ResolveMode::Sample0 : mode == ResolveMode::Sample0) return false;
+  const Extent2D e = dst->extent();
+  segments_close();
+  bool ok = true;
+  if (depth) {
+    // (a rendering with no draws whose end resolves the depth - and the stencil, when both have it - from sample 0)
+    if (!(dst->desc().usage & kImageDepthAttachment)) ok = false;
+    VkRenderingAttachmentInfo dz = vk_struct<VkRenderingAttachmentInfo>(VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO);
+    if (ok) {
+      dz.imageView = src->target_view(0, 0, 1);
+      dz.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+      dz.resolveMode = VK_RESOLVE_MODE_SAMPLE_ZERO_BIT;
+      dz.resolveImageView = dst->target_view(0, 0, 1);
+      dz.resolveImageLayout = VK_IMAGE_LAYOUT_GENERAL;
+      dz.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD, dz.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+      ok = dz.imageView && dz.resolveImageView;
+    }
+    if (ok) {
+      VkRenderingAttachmentInfo st = dz;
+      const bool stencil = src->desc().stencil && dst->desc().stencil;
+      if (!stencil) st.resolveMode = VK_RESOLVE_MODE_NONE, st.resolveImageView = nullptr;
+      VkRenderingInfo ri = vk_struct<VkRenderingInfo>(VK_STRUCTURE_TYPE_RENDERING_INFO);
+      ri.renderArea = {{0, 0}, {e.width, e.height}};
+      ri.layerCount = 1;
+      ri.pDepthAttachment = &dz;
+      ri.pStencilAttachment = src->desc().stencil ? &st : nullptr;
+      if (src->desc().stencil && !dst->desc().stencil) ok = false;   // (a stencil source into a depth-only destination: the formats of a rendering's resolve must match)
+      if (ok) {
+        vk_.CmdBeginRendering(cb_, &ri);
+        vk_.CmdEndRendering(cb_);
+      }
+    }
+  } else if (mode == ResolveMode::Average) {
+    VkImageResolve r{};
+    r.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    r.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    r.extent = {e.width, e.height, 1};
+    if (src->vk_format() == dst->vk_format()) {
+      vk_.CmdResolveImage(cb_, src->image(), VK_IMAGE_LAYOUT_GENERAL, dst->image(), VK_IMAGE_LAYOUT_GENERAL, 1, &r);
+    } else {
+      // (resolved into an image of the source's format, then blitted into the destination's: the blit converts, as GL's resolve blit does)
+      VenusImage* scratch = d_.resolve_scratch(src->format(), e);
+      if (!scratch) ok = false;
+      if (ok) {
+        vk_.CmdResolveImage(cb_, src->image(), VK_IMAGE_LAYOUT_GENERAL, scratch->image(), VK_IMAGE_LAYOUT_GENERAL, 1, &r);
+        barrier();
+        VkImageBlit b{};
+        b.srcSubresource = b.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        b.srcOffsets[1] = b.dstOffsets[1] = {static_cast<int32_t>(e.width), static_cast<int32_t>(e.height), 1};
+        vk_.CmdBlitImage(cb_, scratch->image(), VK_IMAGE_LAYOUT_GENERAL, dst->image(), VK_IMAGE_LAYOUT_GENERAL, 1, &b, VK_FILTER_NEAREST);
+      }
+    }
+  } else {
+    // the least or greatest sample: a full-screen draw into the destination
+    VenusPipeline* rp = (dst->desc().usage & kImageColorAttachment) ? d_.extreme_resolve_pipeline(dst->vk_format(), src->desc().samples, mode == ResolveMode::Max) : nullptr;
+    VenusVariantKey key;
+    key.unit_type[0] = static_cast<uint8_t>(value_of(src->format()));
+    key.color_format[0] = dst->vk_format();
+    key.topology = static_cast<uint32_t>(PrimitiveTopology::TriangleList);
+    VenusPipeline::Variant* v = rp ? rp->variant(key) : nullptr;
+    VkImageView target = v ? dst->target_view(0, 0, 1) : nullptr;
+    ok = target != nullptr;
+    if (ok) {
+      VkRenderingAttachmentInfo color = vk_struct<VkRenderingAttachmentInfo>(VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO);
+      color.imageView = target, color.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+      color.loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE, color.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+      VkRenderingInfo ri = vk_struct<VkRenderingInfo>(VK_STRUCTURE_TYPE_RENDERING_INFO);
+      ri.renderArea = {{0, 0}, {e.width, e.height}};
+      ri.layerCount = 1, ri.colorAttachmentCount = 1, ri.pColorAttachments = &color;
+      const BoundTexture saved = textures_[0];
+      textures_[0] = BoundTexture();
+      textures_[0].image = src;
+      const ConstByteView saved_constants = constants_;
+      constants_ = ConstByteView();
+      constants_dirty_ = true;
+      const uint32_t flushes = flushes_;
+      ok = bind_resources(*rp, *v, VK_PIPELINE_BIND_POINT_GRAPHICS);
+      if (ok && flushes != flushes_) ok = bind_resources(*rp, *v, VK_PIPELINE_BIND_POINT_GRAPHICS);
+      if (ok) {
+        vk_.CmdBeginRendering(cb_, &ri);
+        vk_.CmdBindPipeline(cb_, VK_PIPELINE_BIND_POINT_GRAPHICS, v->pipeline);
+        const VkViewport vp = {0, 0, static_cast<float>(e.width), static_cast<float>(e.height), 0, 1};
+        const VkRect2D sc = {{0, 0}, {e.width, e.height}};
+        const uint32_t count = d_.context().caps().multi_viewport ? kMaxViewports : 1;
+        VkViewport vps[kMaxViewports];
+        VkRect2D scs[kMaxViewports];
+        for (uint32_t i = 0; i < count; ++i) vps[i] = vp, scs[i] = sc;
+        vk_.CmdSetViewport(cb_, 0, count, vps);
+        vk_.CmdSetScissor(cb_, 0, count, scs);
+        vk_.CmdSetStencilReference(cb_, VK_STENCIL_FACE_FRONT_AND_BACK, 0);
+        vk_.CmdDraw(cb_, 3, 1, 0, 0);
+        vk_.CmdEndRendering(cb_);
+      }
+      textures_[0] = saved;
+      constants_ = saved_constants;
+      constants_dirty_ = true;
+      bound_pipeline_ = nullptr;
+    }
+  }
+  barrier();
+  segments_open();
+  return ok;
+}
+
 // ---- stream output -------------------------------------------------------------------------------------------------------------------------------
 // VirglDevice's rules: an append starts where the buffer's last stream output ended, which is not known for a buffer that is a target earlier in the same submit
 // (refused) or whose end is not known (refused); a slot bound again with the same buffer and an append goes on.
@@ -1170,8 +1292,7 @@ bool Replay::run() {
       case RecordedCommand::Type::BeginQuery: ok = begin_query(c); break;
       case RecordedCommand::Type::EndQuery: ok = end_query(c); break;
       case RecordedCommand::Type::BindStreamOutput: ok = bind_stream_output(c); break;
-      // (not offered by this device yet: DeviceInfo has no kFeatureMultisample, so the kernel does not record it)
-      case RecordedCommand::Type::Resolve: ok = false; break;
+      case RecordedCommand::Type::Resolve: ok = resolve(c); break;
     }
     if (!ok) break;
   }

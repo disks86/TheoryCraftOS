@@ -1268,7 +1268,13 @@ bool Compiler::alu(const Instruction& ins) {
     write_scalar(ins, emit(OpDot, f_, {shuffle(t, a, a, sel, n), shuffle(t, c, c, sel, n)}), Ty::F);
   };
   switch (op) {
-    case Op::Mov: write_bits(ins.dst[0], ins.saturate ? bitcast(u4_, ext(f4_, GlslFClamp, {src(ins, 0, Ty::F), fconst4(0), fconst4(1)})) : src(ins, 0, Ty::U)); return ok_;
+    case Op::Mov: {
+      // (bits as they are; a negated or absolute source is a float's, as TGSI's MOV is a float instruction)
+      const Operand& o = ins.src[0];
+      if (ins.saturate || o.negate || o.absolute) write(ins, src(ins, 0, Ty::F), Ty::F);
+      else write_bits(ins.dst[0], src(ins, 0, Ty::U));
+      return ok_;
+    }
     case Op::Add: bin(OpFAdd, Ty::F); return ok_;
     case Op::Sub: bin(OpFSub, Ty::F); return ok_;
     case Op::Mul: bin(OpFMul, Ty::F); return ok_;

@@ -126,7 +126,12 @@ void RenderNode::build_accelerated(hardware::VirtioGpu* virtio, hardware::Vmware
 void RenderNode::build_venus(hardware::VirtioGpu& virtio, allocators::IAllocator& allocator) {
   void* memory = allocator.allocate_aligned(sizeof(VenusDevice), alignof(VenusDevice));
   if (!memory) return;
-  VenusDevice* device = new (memory) VenusDevice(allocator, virtio);
+  auto account = [](void* context, int64_t bytes) {   // (the virtio-gpu's video memory figure: what DXGI and the task manager show)
+    hardware::VirtioGpu& gpu = *static_cast<hardware::VirtioGpu*>(context);
+    if (bytes >= 0) gpu.add_resource_bytes(static_cast<uint64_t>(bytes));
+    else gpu.remove_resource_bytes(static_cast<uint64_t>(-bytes));
+  };
+  VenusDevice* device = new (memory) VenusDevice(allocator, virtio, account, &virtio);
   bootlog::Entry e(bootlog::Level::Info, "GPU");
   bool use = false;
   if (!device->initialize()) {
