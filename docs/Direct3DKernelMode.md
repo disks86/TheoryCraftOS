@@ -389,8 +389,9 @@ image after the dispatch or draw (VidMm reads layered and mipmapped storage imag
 
 - **Slots.** `graphics::kMaxUavBuffers` = 64 (u0 .. u63, Direct3D 11.1's), `kMaxSrvBuffers` = 128 (t0 .. t127 of raw and structured buffers, storage slot `kMaxUavBuffers + n`),
   `kMaxStorageImages` = 64; `kMaxStorageBuffers` = 256 with the counters. Masks of these spaces are `graphics::SlotMask<N>` (the shaders' and pipelines' `storage_mask()` /
-  `image_mask()`). What a runtime offers is its feature level's: d3d11.dll and d3d12.dll are at 11_0 (eight UAVs, `ResourceBindingTier` 1), d3d11.dll's shader resources go to t127
-  (a second, wide root signature when a shader declares one above t7).
+  `image_mask()`). What a runtime offers is its feature level's: d3d11.dll and d3d12.dll are at 11_1 on the CPU renderer (64 UAVs in every stage) and 11_0 on virgl and Venus
+  (eight UAVs) - "Feature levels 11_1 and up" below -, `ResourceBindingTier` 1 everywhere; d3d11.dll's shader resources go to t127 and its unordered access views to u63 (wide
+  root signatures when a shader declares one above t7 or u7).
 - **Typed views of buffers** (`Buffer<>`, `RWBuffer<>`; `kFeature2TexelBuffers`, `graphics::TexelFormat` in `Graphics3D/TexelBuffer.hpp`: DXGI's numbers, with the decoding and
   encoding of each element). They are storage images of a buffer: u# ones in image slots 0 .. 63, t# ones (read only) in slots `kTexelBufferSlotBase + n` (64 .. 191,
   `kMaxImageSlots`); `bind_storage_texel_buffer` on the devices, op **`BindTexelBuffer` (38)** `slot, allocation, first_element, element_count, format` in the stream, and in
@@ -1237,3 +1238,41 @@ Where each stands, and what it would take:
 - **Intel Gen9**: the vertex stage runs on the CPU and the pixel stage is one of three fixed EU kernels. Programmable shaders need an EU compiler and a simulator that runs
   EU code; raising the limits without them would promise what cannot be drawn.
 - **Raspberry Pi V3D**: fixed programs and a small straight-line compiler; the device is not in the render nodes, so nothing reaches it.
+
+### Feature levels 11_1 and up
+
+What Microsoft's feature-level table asks for above 11_0, and where each is (`d3d12.dll` device.inc `dev_feature_level` decides the level; d3d11.dll takes Direct3D 12's):
+
+| level | needs | CPU renderer | virgl | Venus |
+| --- | --- | --- | --- | --- |
+| 11_1 | logic operations | yes | yes | yes (`logicOp`) |
+| 11_1 | UAVs in every stage, 64 slots | yes | yes | yes |
+| 11_1 | target-independent rasterization, UAV-only rendering with `ForcedSampleCount` up to 16 | yes (`kFeature3ForcedSampleCount`) | no (the pipe state rasterizes with the framebuffer's samples) | no (Vulkan rasterizes with the attachments' samples; RADV's `framebufferNoAttachmentsSampleCounts` stop at 8) |
+| 11_1 | constant buffer offsets and parts (d3d11.dll) | yes | yes | yes |
+| 12_0 | resource binding tier 2 (every view of the heap and 2048 samplers in a stage) | no | no | no |
+| 12_0 | tiled resources tier 2, min / max filtering | yes | no | min / max only |
+| 12_0 | typed UAV loads of the 18 formats | yes | yes | yes |
+| 12_0 | Shader Model 6.0 (wave operations) | no | no | no |
+| 12_1 | conservative rasterization tier 1 | yes | no | where the host has it |
+| 12_1 | rasterizer ordered views | yes | no (TGSI has no fragment interlock) | yes (`VK_EXT_fragment_shader_interlock`) |
+
+So the CPU renderer is at **11_1**, virgl and Venus at **11_0**; rasterizer ordered views are reported (`OPTIONS` `ROVsSupported`, D3D11 `OPTIONS2`) on the CPU renderer
+and Venus at their own levels. 12_0 needs the binding model of tier 2 - the kernel binds 16 texture units and samplers a stage (`graphics::kMaxTextureUnits`) and refuses a
+Shader Model 5.1 range of more than one register - and Shader Model 6.0's wave operations, which the DXIL translator does not have: no adapter claims it.
+
+- **Forced sample count** (`kFeature3ForcedSampleCount`, bit 8 of `DeviceFeature3`): `GraphicsPipelineDesc::forced_samples` 1, 2, 4, 8 or 16, the CreatePipeline tagged part
+  **`FSC1`** (`kPipelineForcedSamplesTag` 0x31435346, one word). Above 1 a triangle covers a pixel of a single-sample pass (no target, or single-sample targets) when it contains
+  any of the count's standard sample positions (those of `set_sample_positions` for that count), shaded and written once; it goes with no depth or stencil test or write,
+  multisample or alpha to coverage (the pipeline is refused). 1 on a multisampled pass is the centre's coverage for every sample (`MultisampleRTVWithForcedSampleCountOne`).
+  Lines and points are drawn as without it. d3d12.dll sends it for `ForcedSampleCount` (and its UAV-only target is then of one sample); without the feature it keeps 4, 8
+  or 16 for UAV-only draws through a target of that many samples.
+- **Rasterizer ordered views** (`kFeature3RasterizerOrderedViews`, bit 9): the DXBC `dcl_uav_*` token's bit 17 (`D3D11_SB_RASTERIZER_ORDERED_ACCESS`) - and a DXIL UAV's
+  `isROV`, which DxilTranslate.cpp turns into that bit - makes a pixel shader need it (`D3d9Program::required_features3`); `ShaderModuleDesc::rasterizer_ordered` tells
+  the device. The CPU renderer runs every fragment to its end in primitive order, so its accesses are ordered already. Venus compiles the shader with
+  `CompileOptions::pixel_interlock`: `PixelInterlockOrderedEXT`, `OpBeginInvocationInterlockEXT` first in `main`, `OpEndInvocationInterlockEXT` before each return
+  (`VenusCaps::pixel_interlock`, `fragmentShaderPixelInterlock`). virgl refuses such a module. The globally-coherent bit (16) asks for nothing more on any device.
+- **The viewport is a scissor**: the CPU renderer no longer draws pixels whose centres are outside the viewport when the scissor rectangle is larger (Direct3D 11 without
+  the scissor test), as Direct3D and Vulkan clip primitives to it.
+- Tests: d3d12test `test_feature_levels` (levels, OPTIONS, ROV ordering of three primitives - fixture `ps_rov` -, forced counts without a target, with a single-sample target
+  and 1 on 4x targets), d3d11test `test_feature_level_11_1` (creation, OPTIONS / OPTIONS2, UAV-only rendering with 16 samples, u40 and u63 - `cs_uav63` -, vertex shader
+  UAVs, ROVs, parts of constant buffers, overlapping copies), `Graphics3DExtensionsTest` `test_forced_samples`, `TgsiSpirvTest` (the interlock through spirv-val).

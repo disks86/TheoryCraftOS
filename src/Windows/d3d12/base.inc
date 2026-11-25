@@ -362,6 +362,12 @@ struct Dev {
 #define DEV_FEATURE_RESOLVE_MODES (1u << 20)      /* graphics::kFeatureResolveModes: resolves of the least, greatest (and a depth image's mean) samples */
 #define DEV_FEATURE_VERTEX_FORMATS (1u << 29)     /* graphics::kFeatureVertexFormats: vertex elements other than 32-bit floats */
 /* graphics::DeviceFeature3 in KmtCaps.features3: DEV_FEATURE3_* (bit ranges as IGraphicsDevice.hpp DeviceFeature3 says) */
+#define DEV_FEATURE3_FORCED_SAMPLE_COUNT (1u << 8)       /* graphics::kFeature3ForcedSampleCount: ForcedSampleCount 1 .. 16 (the CreatePipeline part 'FSC1'), target-independent rasterization */
+#define DEV_FEATURE3_ROVS (1u << 9)                      /* graphics::kFeature3RasterizerOrderedViews: rasterizer ordered views in pixel shaders */
+#define DEV_FEATURE_VERTEX_STORES (1u << 25)             /* graphics::kFeatureVertexStores: vertex shaders write unordered access views */
+#define DEV_FEATURE_GEOMETRY_STORES (1u << 26)           /* graphics::kFeatureGeometryStores */
+#define DEV_FEATURE_TESSELLATION_STORES (1u << 27)       /* graphics::kFeatureTessellationStores: hull and domain shaders */
+#define DEV_FEATURE_FRAGMENT_STORES (1u << 24)           /* graphics::kFeatureFragmentStores */
 #define DEV_FEATURE3_WAVE_OPS (1u << 16)      /* graphics::kFeature3WaveOps: Shader Model 6.0's wave and quad operations (the CPU renderer's lane model) */
 #define DEV_FEATURE3_WAVE_MATCH (1u << 17)    /* graphics::kFeature3WaveMatch: 6.5's WaveMatch and WaveMultiPrefix*, 6.7's QuadAny / QuadAll */
 #define DEV_WAVE_LANES_MIN 4u                 /* (graphics::kWaveLanesPixel: a pixel shader's wave is its quad) */

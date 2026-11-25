@@ -1182,6 +1182,27 @@ struct DrawState {
     index += view_viewport;
     viewport = viewports[index < viewport_count ? index : 0];
     scissor = scissors[index < viewport_count && index < scissor_count ? index : 0];
+    // The viewport is a scissor too: Direct3D and Vulkan clip primitives to it, so no pixel whose centre is outside it is drawn (a scissor rectangle larger than the viewport -
+    // Direct3D 11 without the scissor test - does not widen it).
+    auto centre_index = [](float v) -> int64_t {   // (the first pixel whose centre is at v or after it: ceil(v - 0.5))
+      const float t = v - 0.5f;
+      if (!(t > -1073741824.0f)) return -1073741824;
+      if (!(t < 1073741824.0f)) return 1073741824;
+      int64_t i = static_cast<int64_t>(t);
+      if (static_cast<float>(i) < t) ++i;
+      return i;
+    };
+    const float vx0 = viewport.width < 0 ? viewport.x + viewport.width : viewport.x, vx1 = viewport.width < 0 ? viewport.x : viewport.x + viewport.width;
+    const float vy0 = viewport.height < 0 ? viewport.y + viewport.height : viewport.y, vy1 = viewport.height < 0 ? viewport.y : viewport.y + viewport.height;
+    int64_t x0 = centre_index(vx0), x1 = centre_index(vx1), y0 = centre_index(vy0), y1 = centre_index(vy1);
+    const int64_t sx0 = scissor.x, sy0 = scissor.y, sx1 = sx0 + scissor.width, sy1 = sy0 + scissor.height;
+    if (x0 < sx0) x0 = sx0;
+    if (y0 < sy0) y0 = sy0;
+    if (x1 > sx1) x1 = sx1;
+    if (y1 > sy1) y1 = sy1;
+    if (x1 < x0) x1 = x0;
+    if (y1 < y0) y1 = y0;
+    scissor = {static_cast<int32_t>(x0), static_cast<int32_t>(y0), static_cast<uint32_t>(x1 - x0), static_cast<uint32_t>(y1 - y0)};
   }
   TextureSet textures;
   const uint8_t* constants = nullptr;
@@ -1571,6 +1592,9 @@ void raster_triangle(const DrawState& s, const ScreenVertex& a, const ScreenVert
   const uint32_t sample_count = s.sample_count;
   // (programmable sample positions on a single-sample pass: the one sample, wherever it is, decides the pixel)
   const bool custom_single = sample_count == 1 && s.custom_pixels != 0 && s.custom_samples == 1;
+  // A forced sample count (target-independent rasterization): above 1, the triangle covers the pixel - every sample of the pass's - when it contains any of the count's sample positions
+  // (the standard ones, or those set with set_sample_positions for that count); 1 is the centre's rule for all the pass's samples, as without multisample.
+  const uint32_t forced = line ? 0u : pd.forced_samples;
   // The barycentrics of the primitive's vertices at a point: perspective-correct from the weights l0 .. l2 of the triangle (scaled by 1 / w as the varyings are), linear ones in the screen.
   auto barycentrics_at = [&](float l0, float l1, float l2, Vec4* out) {
     const float p0 = l0 * inv_area * v0->inv_w, p1 = l1 * inv_area * v1->inv_w, p2 = l2 * inv_area * v2->inv_w;
@@ -1607,7 +1631,21 @@ void raster_triangle(const DrawState& s, const ScreenVertex& a, const ScreenVert
       c->covered = (1u << sample_count) - 1;   // (every sample of a touched pixel, at the plane's depth at the centre)
       const float centre_z = (l0 * v0->z + l1 * v1->z + l2 * v2->z) * inv_area;
       for (uint32_t k = 0; k < sample_count; ++k) c->sample_z[k] = centre_z;
-    } else if ((sample_count > 1 && pd.multisample) || custom_single) {
+    } else if (forced > 1) {
+      const SamplePosition* positions = s.custom_pixels != 0 && s.custom_samples == forced
+                                            ? s.custom_positions + (s.custom_pixels == 1 ? 0u : (static_cast<uint32_t>(y & 1) * 2 + static_cast<uint32_t>(x & 1)) * forced)
+                                            : sample_positions(forced);
+      bool any = false;
+      for (uint32_t k = 0; k < forced && !any; ++k) {
+        const float sx = px + static_cast<float>(positions[k].x) * (1.0f / 16.0f), sy = py + static_cast<float>(positions[k].y) * (1.0f / 16.0f);
+        const float a0 = -((sx - v1->x) * e0dy - (sy - v1->y) * e0dx), a1 = -((sx - v2->x) * e1dy - (sy - v2->y) * e1dx), a2 = -((sx - v0->x) * e2dy - (sy - v0->y) * e2dx);
+        any = weights_inside(a0, a1, a2);
+      }
+      if (!any) return false;
+      c->covered = (1u << sample_count) - 1;
+      const float centre_z = final_z((l0 * v0->z + l1 * v1->z + l2 * v2->z) * inv_area);   // (no depth test or write goes with it: the plane's depth at the centre)
+      for (uint32_t k = 0; k < sample_count; ++k) c->sample_z[k] = centre_z;
+    } else if ((sample_count > 1 && pd.multisample && forced != 1) || custom_single) {
       const SamplePosition* positions = pixel_sample_positions(s, x, y);
       for (uint32_t k = 0; k < sample_count; ++k) {
         const float sx = px + static_cast<float>(positions[k].x) * (1.0f / 16.0f), sy = py + static_cast<float>(positions[k].y) * (1.0f / 16.0f);
@@ -2443,6 +2481,7 @@ IImage* SoftwareDevice::create_image(const ImageDesc& desc) {
 void SoftwareDevice::destroy_image(IImage* image) { destroy(allocator_, static_cast<SoftwareImage*>(image)); }
 
 IShaderModule* SoftwareDevice::create_shader_module(const ShaderModuleDesc& desc) {
+  if (desc.rasterizer_ordered && desc.stage != ShaderStage::Fragment) return nullptr;   // (rasterizer ordered views are a pixel shader's; this device's are ordered: see info())
   if (desc.stage == ShaderStage::Hull || desc.stage == ShaderStage::Domain) {
     // (any domain, with up to the most control points)
     if (desc.stage == ShaderStage::Hull ? !desc.hull_function : !desc.domain_function) return nullptr;
@@ -2484,6 +2523,9 @@ IPipeline* SoftwareDevice::create_graphics_pipeline(const GraphicsPipelineDesc& 
   const auto* fs = static_cast<const SoftwareShaderModule*>(desc.fragment_shader);
   if (vs->stage() != ShaderStage::Vertex || fs->stage() != ShaderStage::Fragment) return nullptr;
   if (desc.geometry_shader && desc.geometry_shader->stage() != ShaderStage::Geometry) return nullptr;
+  // (a forced sample count: 1, 2, 4, 8 or 16, above 1 with no depth or stencil and no per-sample coverage)
+  if (desc.forced_samples > 16 || (desc.forced_samples & (desc.forced_samples - 1)) != 0) return nullptr;
+  if (desc.forced_samples > 1 && (desc.depth_test || desc.depth_write || desc.stencil.enable || desc.multisample || desc.alpha_to_coverage)) return nullptr;
   if (desc.stream_output_count) {
     // (stream output takes the outputs of the geometry shader, or the domain shader, or the vertex shader if there are neither; entries that name its streams, outputs and buffers, and buffers
     // that have only one stream)

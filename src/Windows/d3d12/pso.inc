@@ -230,6 +230,7 @@ struct Pso {
   int no_pixel_shader;          /* the description has none: the kernel's pipeline gets the null one, flagged so that it is not counted as PSInvocations */
   UINT so_entries, so_rasterized, so_strides[4];
   UINT samples;                /* of the targets it draws into (1: not multisampled) */
+  UINT forced_samples;         /* the kernel's forced sample count (the part 'FSC1', DEV_FEATURE3_FORCED_SAMPLE_COUNT): ForcedSampleCount; 0 not forced */
   UINT so_entry[16][2];        /* the words of the kernel's description of each captured output */
   PsoPipe pipes[MAX_PSO_PIPELINES];      /* the pipelines a draw may find (the latest ones) */
   UINT pipe_count;
@@ -599,10 +600,22 @@ static HRESULT pso_create_graphics(Dev *This, const D3D12_GRAPHICS_PIPELINE_STAT
   p->render_targets = desc->NumRenderTargets;
   p->samples = desc->SampleDesc.Count > 1 ? desc->SampleDesc.Count : 1;
   {
-    /* ForcedSampleCount (UAV-only rendering): 0 or 1 is not forced; 4, 8 or 16 rasterizes with that many samples a pixel, which goes only with no render target and no depth buffer
-     * (and a sample count of 1), and needs the count among the device's */
+    /* ForcedSampleCount: 0 is not forced. On a device with the kernel's forced sample count (DEV_FEATURE3_FORCED_SAMPLE_COUNT: target-independent rasterization) 1, 2, 4, 8 or 16 is
+     * the samples triangles are rasterized with: above 1 a pixel of single-sample targets (or of none - UAV-only rendering) is shaded once when the triangle covers any of them, which
+     * goes with a sample count of 1 and no depth or stencil test; 1 on multisampled targets is the pixel centre's coverage for all its samples (MultisampleRTVWithForcedSampleCountOne).
+     * Elsewhere 1 is not forced, and 4, 8 or 16 goes only with no render target and no depth buffer (UAV-only rendering through a target of that many samples the device must have) */
     const UINT forced = desc->RasterizerState.ForcedSampleCount;
-    if (forced > 1) {
+    if (This->caps.features3 & DEV_FEATURE3_FORCED_SAMPLE_COUNT) {
+      if (forced != 0 && forced != 1 && forced != 2 && forced != 4 && forced != 8 && forced != 16) {
+        dx_Release(OBJ(p));
+        return E_INVALIDARG;
+      }
+      if (forced > 1 && (desc->SampleDesc.Count > 1 || desc->DepthStencilState.DepthEnable || desc->DepthStencilState.StencilEnable)) {
+        dx_Release(OBJ(p));
+        return E_INVALIDARG;
+      }
+      p->forced_samples = forced;
+    } else if (forced > 1) {
       if ((forced != 4 && forced != 8 && forced != 16) || desc->NumRenderTargets || desc->DSVFormat != DXGI_FORMAT_UNKNOWN || desc->SampleDesc.Count > 1 ||
           !((This->caps.sample_counts >> forced) & 1)) {
         dx_Release(OBJ(p));
@@ -897,7 +910,8 @@ static UINT pso_pipeline_locked(Pso *p, const UINT strides[8], UINT stencil_ref,
   r[w++] = (p->raster.CullMode == D3D12_CULL_MODE_NONE ? 0 : p->raster.CullMode == D3D12_CULL_MODE_BACK ? 1 : 2) |
            (p->raster.ConservativeRaster == D3D12_CONSERVATIVE_RASTERIZATION_MODE_ON ? KCULL_CONSERVATIVE : 0u);      /* (the kernel's kCullConservative) */
   r[w++] = p->raster.FrontCounterClockwise ? 0 : 1;
-  r[w++] = (p->depth.DepthEnable ? 1u : 0u) | (p->depth.DepthWriteMask == D3D12_DEPTH_WRITE_MASK_ALL ? 2u : 0u) | (rt->BlendEnable ? 4u : 0u) |
+  /* (depth writes go with the depth test: DepthEnable FALSE neither tests nor writes, whatever DepthWriteMask says) */
+  r[w++] = (p->depth.DepthEnable ? 1u : 0u) | (p->depth.DepthEnable && p->depth.DepthWriteMask == D3D12_DEPTH_WRITE_MASK_ALL ? 2u : 0u) | (rt->BlendEnable ? 4u : 0u) |
            (p->no_pixel_shader ? 8u : 0u);      /* (8: dxgk::kPipelineFlagStandInFragment) */
   for (UINT i = 0; i < 4; ++i) {
     r[w++] = i < p->attr_count ? p->attrs[i].location : 0;
@@ -966,7 +980,8 @@ static UINT pso_pipeline_locked(Pso *p, const UINT strides[8], UINT stencil_ref,
   for (UINT i = 0; i < p->attr_count; ++i)
     if (p->attrs[i].per_instance && p->attrs[i].step_rate != 1) rates = i + 1;
   const UINT line_mode = p->line_mode;      /* (not aliased: the tagged part 'LIN1') */
-  if (p->attr_count > 4 || max_slot > 0 || more_blends || p->blend_constant || raster_part || rates || line_mode) {
+  const UINT forced = p->forced_samples;      /* (forced: the tagged part 'FSC1') */
+  if (p->attr_count > 4 || max_slot > 0 || more_blends || p->blend_constant || raster_part || rates || line_mode || forced) {
     if (!p->so_entries) r[w++] = 0;
     const UINT extra = p->attr_count > 4 ? p->attr_count - 4 : 0;
     r[w++] = extra;
@@ -997,7 +1012,7 @@ static UINT pso_pipeline_locked(Pso *p, const UINT strides[8], UINT stencil_ref,
       r[w++] = blend_op(b->BlendOpAlpha);
       r[w++] = b->RenderTargetWriteMask & format_write_mask(p->rtv_formats[4 + k]);
     }
-    if (p->blend_constant || raster_part || rates || line_mode)
+    if (p->blend_constant || raster_part || rates || line_mode || forced)
       for (UINT c = 0; c < 4; ++c) r[w++] = bits_of(factor[c]);      /* (the colour of the constant blend factors) */
     if (raster_part) {
       r[w++] = 0x31545352u;      /* 'RST1' (dxgk::kPipelineRasterTag), and its 16 words */
@@ -1028,6 +1043,11 @@ static UINT pso_pipeline_locked(Pso *p, const UINT strides[8], UINT stencil_ref,
       r[w++] = 0x314E494Cu;
       r[w++] = 1;
       r[w++] = line_mode;
+    }
+    if (forced) {      /* 'FSC1' (dxgk::kPipelineForcedSamplesTag): the forced sample count */
+      r[w++] = 0x31435346u;
+      r[w++] = 1;
+      r[w++] = forced;
     }
   }
   UINT reply[1] = {0};

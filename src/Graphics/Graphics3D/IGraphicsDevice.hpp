@@ -781,6 +781,8 @@ struct ShaderModuleDesc {
   // The text is the GL translator's (src/WebGl/TgsiTranslator.cpp): its images are GL's rows bottom first, so TGSI's DDY runs up them, and a flat varying takes the
   // primitive's last vertex (GL's provoking vertex). The Direct3D layer's texts run down and take the first. virgl's GL host does both by itself; a Vulkan device must be told.
   bool tgsi_gl = false;
+  // A fragment shader whose accesses to storage buffers and images are rasterizer ordered (kFeature3RasterizerOrderedViews; a device without it refuses the module).
+  bool rasterizer_ordered = false;
   TgsiBindings tgsi_bindings;   // (the storage the text names, and where the device binds it)
   // Direct3D 9 shader bytecode (vs_2_0 / ps_2_0 token stream) for the VMware SVGA3D device. A vertex shader writes clip space with +Y up (Direct3D's)
   // when it takes the c31 constant (1, -1, 1, 1) as a factor of the position; the device supplies it, so that Vulkan's +Y down comes out right.
@@ -1022,6 +1024,10 @@ struct GraphicsPipelineDesc {
   LogicOp logic_op = LogicOp::Noop;
   // How the pipeline's lines are drawn: a wireframe triangle's edges and the line topologies (LineMode).
   LineMode line_mode = LineMode::Aliased;
+  // kFeature3ForcedSampleCount: 0 (not forced), or the samples a pixel triangles are rasterized with - 1, 2, 4, 8 or 16 (see kFeature3ForcedSampleCount). A count above 1 goes only with
+  // passes of single-sample images and with no depth or stencil test or write, multisample and alpha_to_coverage off (Direct3D's rules for it); lines and points are drawn as without it
+  // (aliased lines cover all of a pixel or none of it; the quadrilateral ones are triangles and take it).
+  uint32_t forced_samples = 0;
 };
 
 class IPipeline {
@@ -1336,6 +1342,15 @@ enum DeviceFeature2 : uint32_t {
 // (DEV_FEATURE3_*, TcosD3D12DeviceFeatures3). Bits are taken in ranges so work on different parts does not collide: 0-7 multisampled reads and interpolation, 8-15 feature
 // levels 11_1 / 12_x (rasterizer ordered views, forced sample counts), 16-23 shader model 6 (wave operations), 24-31 the rest.
 enum DeviceFeature3 : uint32_t {
+  // GraphicsPipelineDesc::forced_samples (Direct3D 11.1's target-independent rasterization, D3D11_RASTERIZER_DESC1 / D3D12_RASTERIZER_DESC ForcedSampleCount): triangles are
+  // rasterized with 1, 2, 4, 8 or 16 samples a pixel whatever the samples of the pass's images - a pixel of a single-sample pass (no target, or single-sample targets) is shaded
+  // and written once when the triangle covers any of the forced count's standard sample positions; with a count of 1 on a multisampled pass the pixel's centre decides for all
+  // its samples. Feature level 11_1 needs it with 16.
+  kFeature3ForcedSampleCount = 1u << 8,
+  // ShaderModuleDesc::rasterizer_ordered (Direct3D's rasterizer ordered views, ROVs: the DXBC UAV declarations' rasterizer-ordered flag, RasterizerOrderedTexture2D and the
+  // others): the fragment shader's reads and writes of storage buffers and images, for the fragments of one pixel, happen in the order of the primitives of the draws - each
+  // fragment's accesses after all of an earlier primitive's at the same pixel, and nothing of a later one's between them.
+  kFeature3RasterizerOrderedViews = 1u << 9,
   // Shader Model 6 wave operations (16-23). A wave is a group of lanes that run a shader's instructions together; a wave operation reads the other lanes of its wave that are at the
   // same instruction (the active ones; a pixel shader's helper lanes - the uncovered pixels of its quad and the discarded ones - only for the quad operations). The CPU renderer's
   // lane model is D3d9Shader.cpp's (WaveRunner): a pixel shader's wave is the 2 x 2 quad of its pixel (4 lanes), a compute shader's 32 lanes of its group in SV_GroupIndex order, the

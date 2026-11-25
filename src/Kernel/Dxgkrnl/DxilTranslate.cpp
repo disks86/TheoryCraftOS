@@ -70,6 +70,7 @@ struct Resource {
   uint32_t samples = 0;   // a multisampled texture's sample count
   bool counter = false;   // an unordered access view with a hidden counter (IncrementCounter / DecrementCounter, append / consume)
   bool present = false;
+  bool rasterizer_ordered = false;   // (an unordered access view's isROV, operand 9 of its metadata: the dcl_uav_* token's rasterizer-ordered bit)
 };
 
 // DXIL's resource kinds (DxilConstants.h ResourceKind).
@@ -3497,6 +3498,10 @@ NtStatus Translator::read_metadata() {
       if (cls == 0 && meta_int(operand_of(node, 7), &samples)) r.samples = static_cast<uint32_t>(samples);
       if (cls == 1 && meta_int(operand_of(node, 8), &counter)) r.counter = counter != 0;
       r.present = true, r.id = static_cast<uint32_t>(id), r.lower = static_cast<uint32_t>(lower), r.size = static_cast<uint32_t>(size);
+      if (cls == 1) {
+        uint64_t rov = 0;
+        r.rasterizer_ordered = meta_int(operand_of(node, 9), &rov) && rov != 0;
+      }
       if (cls == 2) r.bytes = static_cast<uint32_t>(extra);
       else r.kind = static_cast<uint32_t>(extra);
     }
@@ -3663,16 +3668,18 @@ NtStatus Translator::run(uint32_t program_kind, ConstByteView isg1, ConstByteVie
   auto word = [&](uint32_t w) { return decl.put32(w); };
   // An unordered access view's declaration: a raw or structured buffer (u# below `buffer_slots`), or a typed view of a texture or a buffer (dcl_uav_typed: a storage image of the
   // kernel, below kMaxStorageImages) of the dimensions the DXBC front end takes - not cubes or multisampled ones.
+  // (bit 17 of the token: the view is rasterizer ordered - its isROV - which only a pixel shader's may be: the caller checks)
   auto declare_uav = [&](const Resource& r, uint32_t buffer_slots) {
+    const uint32_t ordered = r.rasterizer_ordered ? 1u << 17 : 0u;
     if (r.kind == kKindStructuredBuffer || r.kind == kKindRawBuffer) {
       if (r.lower >= buffer_slots) return false;
-      if (r.kind == kKindStructuredBuffer) word(158u | (4u << 24)), word((30u << 12) | (1u << 20)), word(r.lower), word(r.stride);
-      else word(157u | (3u << 24)), word((30u << 12) | (1u << 20)), word(r.lower);
+      if (r.kind == kKindStructuredBuffer) word(158u | ordered | (4u << 24)), word((30u << 12) | (1u << 20)), word(r.lower), word(r.stride);
+      else word(157u | ordered | (3u << 24)), word((30u << 12) | (1u << 20)), word(r.lower);
       return true;
     }
     const uint32_t dimension = sm5_dimension(r.kind);
     if (!dimension || dimension == 4 || dimension == 6 || dimension == 10 || r.counter || r.lower >= graphics::kMaxStorageImages) return false;
-    word(156u | (dimension << 11) | (4u << 24)), word((30u << 12) | (1u << 20)), word(r.lower), word(return_type_word(r.element));
+    word(156u | ordered | (dimension << 11) | (4u << 24)), word((30u << 12) | (1u << 20)), word(r.lower), word(return_type_word(r.element));
     return true;
   };
   if (program_kind == 3) {
@@ -3777,9 +3784,10 @@ NtStatus Translator::run(uint32_t program_kind, ConstByteView isg1, ConstByteVie
       if (r.present && !declare_uav(r, graphics::kMaxStorageBuffers)) return status::kNotSupported;
     }
   } else if (pixel || vertex || geometry || domain) {
-    // (a pixel, vertex, geometry or domain shader's unordered access views: buffers it writes)
+    // (a pixel, vertex, geometry or domain shader's unordered access views: buffers it writes; a pixel shader's may be rasterizer ordered)
     for (uint32_t i = 0; i < kMaxResources; ++i) {
       const Resource& r = res_[1][i];
+      if (r.present && r.rasterizer_ordered && !pixel) return status::kInvalidParameter;
       if (r.present && !declare_uav(r, graphics::kMaxUavBuffers)) return status::kNotSupported;
     }
   } else {

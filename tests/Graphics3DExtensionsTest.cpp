@@ -446,6 +446,96 @@ static void test_lines_and_points() {
   r.device.destroy_shader_module(fs);
 }
 
+// Target-independent rasterization (kFeature3ForcedSampleCount): a triangle in a corner of a pixel, (x, y) .. (x + 0.45, y) .. (x, y + 0.45), holds none of the standard 1, 2, 4
+// and 8 sample positions of the pixel and one of the sixteen (-4, -6): with forced_samples 16 the pixel is drawn, with the others it is not. Above 1 there is no depth test.
+// The viewport also limits what is drawn (a scissor of the whole target does not widen it). And the rasterizer ordered views the device has (its fragments run in order).
+static std::vector<float> corner(uint32_t px, uint32_t py) {
+  const float x = static_cast<float>(px), y = static_cast<float>(py), s = kSize / 2.0f;
+  // (this device's clip space has +y down: y = -1 is the target's first row)
+  return {x / s - 1, y / s - 1, 0.5f, (x + 0.45f) / s - 1, y / s - 1, 0.5f, x / s - 1, (y + 0.45f) / s - 1, 0.5f};
+}
+static void test_forced_samples() {
+  Rig r;
+  r.make_targets(false);
+  CHECK((r.device.info().features3 & (kFeature3ForcedSampleCount | kFeature3RasterizerOrderedViews)) == (kFeature3ForcedSampleCount | kFeature3RasterizerOrderedViews));
+  IShaderModule* vs = r.vertex(pass_vertex);
+  IShaderModule* fs = r.fragment(constant_color);
+  GraphicsPipelineDesc pd = position_only();
+  pd.vertex_shader = vs, pd.fragment_shader = fs;
+  const uint32_t counts[6] = {0, 1, 2, 4, 8, 16};
+  for (uint32_t k = 0; k < 6; ++k) {
+    pd.forced_samples = counts[k];
+    draw(r, pd, corner(3, 2), {1, 1, 1, 1}, {0, 0, 0, 1});
+    const std::vector<uint32_t> img = r.pixels();
+    uint32_t lit = 0;
+    for (uint32_t p : img) lit += (p & 0xFFFFFF) != 0;
+    CHECK(lit == (counts[k] == 16 ? 1u : 0u));
+    if (counts[k] == 16) CHECK((img[2 * kSize + 3] & 0xFFFFFF) == 0xFFFFFF);
+  }
+  // (refused: a count that is not a power of two up to 16, and one above 1 with a depth test or multisample)
+  pd.forced_samples = 3;
+  CHECK(r.device.create_graphics_pipeline(pd) == nullptr);
+  pd.forced_samples = 32;
+  CHECK(r.device.create_graphics_pipeline(pd) == nullptr);
+  pd.forced_samples = 16;
+  pd.depth_test = true;
+  CHECK(r.device.create_graphics_pipeline(pd) == nullptr);
+  pd.depth_test = false;
+  pd.multisample = true;
+  CHECK(r.device.create_graphics_pipeline(pd) == nullptr);
+  pd.multisample = false;
+  pd.forced_samples = 0;
+  // the viewport as a scissor: a triangle over the target with a 4 x 4 viewport at (2, 3) and the target's scissor draws those 16 pixels only
+  IPipeline* pipeline = r.device.create_graphics_pipeline(pd);
+  IBuffer* vb = r.buffer(cover(0.5f));
+  CHECK(pipeline && vb);
+  if (pipeline && vb) {
+    ICommandBuffer* cb = r.device.create_command_buffer();
+    cb->begin();
+    RenderPassBegin pass;
+    pass.color = r.color;
+    pass.clear_color = true;
+    pass.clear_color_value = {0, 0, 0, 1};
+    cb->begin_render_pass(pass);
+    cb->set_viewport({2, 3, 4, 4, 0, 1});
+    cb->set_scissor({0, 0, kSize, kSize});
+    cb->bind_pipeline(pipeline);
+    cb->bind_vertex_buffer(vb);
+    const Vec4 white = {1, 1, 1, 1};
+    cb->push_constants(&white, sizeof white);
+    cb->draw(3);
+    cb->end_render_pass();
+    CHECK(cb->end() && r.device.submit(cb));
+    r.device.destroy_command_buffer(cb);
+    const std::vector<uint32_t> img = r.pixels();
+    uint32_t lit = 0, inside = 0;
+    for (uint32_t y = 0; y < kSize; ++y)
+      for (uint32_t x = 0; x < kSize; ++x) {
+        const bool on = (img[y * kSize + x] & 0xFFFFFF) != 0;
+        lit += on;
+        inside += on && x >= 2 && x < 6 && y >= 3 && y < 7;
+      }
+    CHECK(lit == 16 && inside == 16);
+  }
+  if (vb) r.device.destroy_buffer(vb);
+  if (pipeline) r.device.destroy_pipeline(pipeline);
+  // (a rasterizer ordered fragment shader is taken, a vertex shader that says it is one is not)
+  ShaderModuleDesc ordered;
+  ordered.stage = ShaderStage::Fragment;
+  ordered.fragment_function = constant_color;
+  ordered.rasterizer_ordered = true;
+  IShaderModule* fo = r.device.create_shader_module(ordered);
+  CHECK(fo != nullptr);
+  if (fo) r.device.destroy_shader_module(fo);
+  ShaderModuleDesc wrong;
+  wrong.stage = ShaderStage::Vertex;
+  wrong.vertex_function = pass_vertex;
+  wrong.rasterizer_ordered = true;
+  CHECK(r.device.create_shader_module(wrong) == nullptr);
+  r.device.destroy_shader_module(vs);
+  r.device.destroy_shader_module(fs);
+}
+
 int main() {
   test_features();
   test_blend();
@@ -454,6 +544,7 @@ int main() {
   test_system_values();
   test_instancing();
   test_lines_and_points();
+  test_forced_samples();
   if (g_failed) {
     printf("%d check(s) failed\n", g_failed);
     return 1;

@@ -37,7 +37,9 @@
  *                      kept in a cache. Its strips are cut at the index buffer's largest index (Direct3D 12's strip cut of the list, set with the
  *                      index buffer at each indexed draw); its lines are those of MultisampleEnable / AntialiasedLineEnable (quadrilateral, alpha-antialiased).
  *   textures, samplers a table of 8 of each for all the stages (t0 .. t7, s0 .. s7; the sampler of t<n> is s<n>, as the kernel pairs them), and one of the
- *                      unordered access views (u0 .. u7).
+ *                      unordered access views (u0 .. u7; u0 .. u63 at feature level 11_1, when a shader declares one above u7).
+ *   feature levels     the first the program asks for that Direct3D 12 below has: 11_1 on the CPU renderer (64 UAVs in every stage, ForcedSampleCount), 11_0 on
+ *                      virgl and Venus; none above 11_1 (12_0 needs resource binding tier 2 and Shader Model 6.0: docs/Direct3DKernelMode.md).
  *   swap chains        dxgi.dll asks the device for its back buffers and their pixels (ITcosPresenter, src/Windows/tcosdx.h).
  *
  * The rest is in the other parts: compute, unordered access and buffer views, stream output and the draws whose counts are in buffers (context.inc); queries,
@@ -92,7 +94,9 @@ __asm__(".text\n.globl ___chkstk_ms\n___chkstk_ms:\n ret\n");
 #define VERTEX_SLOTS 8u
 #define ACTIVE_QUERIES 32u            /* queries begun and not ended at once */
 #define MEASURES 2048u                /* the kernel's measurements one list holds (query.inc: one a run of draws for the same active queries) */
-#define UAV_SLOTS 8u                  /* u0 .. u7: of the compute shader, and of the pixel shader beside its render targets (D3D11_PS_CS_UAV_REGISTER_COUNT) */
+#define UAV_SLOTS 64u                 /* u0 .. u63: of the compute shader, and of the graphics stages beside the render targets (D3D11_1_UAV_SLOT_COUNT; at feature level 11_0 u0 .. u7,
+                                       * D3D11_PS_CS_UAV_REGISTER_COUNT: dev_uav_slots) */
+#define UAV_TABLE_NARROW 8u           /* the unordered access table of the draws and dispatches whose shaders declare none above u7 (the wide table has UAV_SLOTS) */
 #define KIND_BUFFER 0xFEu             /* Shader.tex_kind: t<n> is a raw or structured buffer */
 
 typedef struct Dev Dev;
@@ -235,7 +239,9 @@ typedef struct Shader {
   UINT registers;                         /* ... and all of them together */
   BYTE tex_kind[SRV_SLOTS];               /* what each t<n> is declared as (Tex.kind, KIND_BUFFER; 0xFF: not declared) */
   BOOL wide;                              /* it declares a shader resource above t7: its draws and dispatches take the wide table (SRV_SLOTS) */
-  UINT uav_mask;                          /* the u<n> it declares */
+  UINT64 uav_mask;                        /* the u<n> it declares */
+  BOOL rov;                               /* one of them is a rasterizer ordered view (the dcl_uav_* token's D3D11_SB_RASTERIZER_ORDERED_ACCESS) */
+  BOOL uav_beyond;                        /* it declares one past u63 */
   UINT group[3];                          /* a compute shader's threads in a group (dcl_thread_group) */
   UINT gs_instances;                      /* a geometry shader's instances (dcl_gs_instance_count; 0: one) */
   UINT program_type;                      /* the shader's stage by its version token (D3D10_SB_TOKENIZED_PROGRAM_TYPE: 0 pixel, 1 vertex, 2 geometry, 3 hull, 4 domain, 5 compute) */
@@ -294,6 +300,7 @@ typedef struct Pipeline {
   D3D11_DEPTH_STENCIL_DESC depth;
   D3D11_RASTERIZER_DESC raster;
   UINT conservative;                  /* the rasterizer state's D3D11_CONSERVATIVE_RASTERIZATION_MODE */
+  UINT forced;                        /* ... and its ForcedSampleCount (Direct3D 11.1's target-independent rasterization) */
   UINT targets, has_depth;
   UINT samples;                       /* the targets' sample count */
   DXGI_FORMAT formats[8], depth_format;      /* (a pipeline is made for its targets' formats) */
@@ -400,6 +407,7 @@ struct Dev {
   ID3D12RootSignature *root;
   ID3D12RootSignature *bound_root;         /* the graphics root signature the list has now (draw_prepare: the narrow or the wide one) */
   ID3D12RootSignature *root_wide;          /* the same with a table of SRV_SLOTS shader resources: for the draws and dispatches whose shaders declare one above t7 */
+  ID3D12RootSignature *root_uavs[2];       /* root and root_wide with the unordered access table of UAV_SLOTS views: for those whose shaders declare one above u7 (feature level 11_1) */
   ID3D12CommandSignature *sig_draw, *sig_draw_indexed, *sig_dispatch;      /* the indirect draws and dispatches (ExecuteIndirect of one command) */
   ID3D12DescriptorHeap *rtv_heap, *dsv_heap, *view_heap, *sampler_heap;
   UINT rtv_free[RTV_SLOTS], rtv_free_count, dsv_free[DSV_SLOTS], dsv_free_count;
@@ -423,6 +431,7 @@ struct Dev {
   Buf *blank_uav;                          /* ... and a buffer for an unordered access slot a shader declares with nothing bound (what it writes there is lost to the program) */
   UINT64 table_uavs;                       /* the GPU handle of the unordered access table the last draw used, and what was in it */
   UINT table_uav_ids[UAV_SLOTS];
+  UINT table_uav_count;                    /* ... and how many views it has (UAV_TABLE_NARROW or UAV_SLOTS) */
   FLOAT table_min_lods[SRV_SLOTS];         /* ... and the textures' SetResourceMinLOD clamps the view table was made with (each view's ResourceMinLODClamp below) */
   UINT epoch;                              /* counts the command lists */
   int recorded;                            /* the list has something in it */
@@ -661,6 +670,22 @@ static void tile_pool_free(struct TilePool *p);
 static BOOL tex_tiled_format(Dev *d, DXGI_FORMAT format);
 static BOOL tiled_texture_check(Dev *d, ID3D12Resource *res, const D3D12_RESOURCE_DESC *rd);
 static D3D11_TILED_RESOURCES_TIER dev_tiled_tier(Dev *d);      /* (device.inc) */
+/* The unordered access slots of the device's feature level: u0 .. u63 from 11_1 on (D3D11_1_UAV_SLOT_COUNT), u0 .. u7 below (D3D11_PS_CS_UAV_REGISTER_COUNT). */
+static UINT dev_uav_slots(const Dev *d) { return d->level >= D3D_FEATURE_LEVEL_11_1 ? D3D11_1_UAV_SLOT_COUNT : D3D11_PS_CS_UAV_REGISTER_COUNT; }
+/* Whether Direct3D 12 below has rasterizer ordered views (D3D12_FEATURE_DATA_D3D12_OPTIONS.ROVsSupported, D3D11's OPTIONS2 ROVsSupported). */
+static BOOL dev_rovs(Dev *d) {
+  D3D12_FEATURE_DATA_D3D12_OPTIONS o;
+  memset(&o, 0, sizeof o);
+  return SUCCEEDED(ID3D12Device_CheckFeatureSupport(d->d12, D3D12_FEATURE_D3D12_OPTIONS, &o, sizeof o)) && o.ROVsSupported;
+}
+/* The highest feature level of Direct3D 12 below (11_1 on the CPU renderer, 11_0 on virgl and Venus: d3d12.dll device.inc dev_feature_level). */
+static D3D_FEATURE_LEVEL dev_adapter_level(Dev *d) {
+  static const D3D_FEATURE_LEVEL all[] = {D3D_FEATURE_LEVEL_12_1, D3D_FEATURE_LEVEL_12_0, D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_10_1,
+                                          D3D_FEATURE_LEVEL_10_0, D3D_FEATURE_LEVEL_9_3, D3D_FEATURE_LEVEL_9_2, D3D_FEATURE_LEVEL_9_1};
+  D3D12_FEATURE_DATA_FEATURE_LEVELS f = {sizeof all / sizeof all[0], all, (D3D_FEATURE_LEVEL)0};
+  if (FAILED(ID3D12Device_CheckFeatureSupport(d->d12, D3D12_FEATURE_FEATURE_LEVELS, &f, sizeof f))) return D3D_FEATURE_LEVEL_11_0;
+  return f.MaxSupportedFeatureLevel;
+}
 
 static void buf_destroy(DxObj *o) {
   Buf *b = (Buf *)o;
@@ -2175,7 +2200,11 @@ static void shader_constants(Shader *s) {
         const UINT k = w + ((operand >> 31) ? 3 : 2);
         if (k < w + length && ((operand >> 20) & 3) == 1) {      /* (one immediate index: SM 4 / 5.0) */
           memcpy(&slot, code + 4 * k, 4);
-          if (op >= 156 && op <= 158) { if (slot < UAV_SLOTS) s->uav_mask |= 1u << slot; }
+          if (op >= 156 && op <= 158) {
+            if (slot < UAV_SLOTS) s->uav_mask |= 1ull << slot;
+            else s->uav_beyond = TRUE;
+            if (token & (1u << 17)) s->rov = TRUE;      /* (D3D11_SB_RASTERIZER_ORDERED_ACCESS) */
+          }
           else if (slot < SRV_SLOTS) {
             s->tex_kind[slot] = op != 88 || dimension == 1 ? KIND_BUFFER : dimension == 5 ? 1 : (dimension == 8 || dimension == 7) ? 2 : dimension == 6 ? 3 : dimension == 10 ? 5 : 0;
             if (slot >= TEXTURE_SLOTS) s->wide = TRUE;
@@ -2219,6 +2248,11 @@ static HRESULT shader_make(Dev *d, const void *code, SIZE_T bytes, const void *v
   if (s->registers * 16 > CONSTANT_BLOCK) { dx_Release(OBJ(s)); return E_INVALIDARG; }
   /* (a shader of tiled resources tier 2's instructions on a device of a lower tier: E_INVALIDARG, as Windows' runtime refuses it) */
   if (s->feedback && dev_tiled_tier(d) < D3D11_TILED_RESOURCES_TIER_2) { dx_Release(OBJ(s)); return E_INVALIDARG; }
+  /* (unordered access views: in the vertex, geometry, hull and domain stages and past u7 from feature level 11_1 on, rasterizer ordered ones where the device has them -
+   * D3D11_FEATURE_D3D11_OPTIONS2's ROVsSupported -; else E_INVALIDARG, as the runtime checks shaders against the device) */
+  if (s->uav_mask && s->program_type != 0 && s->program_type != 5 && d->level < D3D_FEATURE_LEVEL_11_1) { dx_Release(OBJ(s)); return E_INVALIDARG; }
+  if (s->uav_beyond || (s->uav_mask >> dev_uav_slots(d))) { dx_Release(OBJ(s)); return E_INVALIDARG; }
+  if (s->rov && (s->program_type != 0 || !dev_rovs(d))) { dx_Release(OBJ(s)); return E_INVALIDARG; }
   const HRESULT hr = shader_link(s, linkage);
   if (FAILED(hr)) { dx_Release(OBJ(s)); return hr; }
   return give(s, out);
@@ -2571,7 +2605,8 @@ static HRESULT STDMETHODCALLTYPE dev_CreateDepthStencilState(Dev *d, const D3D11
   *out = (ID3D11DepthStencilState *)s;
   return S_OK;
 }
-/* CreateRasterizerState1: ForcedSampleCount is a feature of level 11_1; at 11_0 it must be 0. */
+/* CreateRasterizerState1: ForcedSampleCount (target-independent rasterization and UAV-only rendering with it) is a feature of level 11_1 - 0, 1, 2, 4, 8 or 16 there -; at the
+ * levels below it must be 0 (D3D11_FEATURE_DATA_D3D11_OPTIONS's UAVOnlyRenderingForcedSampleCount is FALSE on them). */
 static HRESULT raster_make(Dev *d, const D3D11_RASTERIZER_DESC2 *desc, ID3D11RasterizerState2 **out);
 static HRESULT STDMETHODCALLTYPE dev_CreateRasterizerState1(Dev *d, const D3D11_RASTERIZER_DESC1 *desc, ID3D11RasterizerState1 **out) {
   if (out) *out = NULL;
@@ -2586,8 +2621,9 @@ static HRESULT raster_make(Dev *d, const D3D11_RASTERIZER_DESC2 *desc, ID3D11Ras
   static const GUID *const iids[] = {&IID_ID3D11DeviceChild, &IID_ID3D11RasterizerState, &IID_ID3D11RasterizerState1, &IID_ID3D11RasterizerState2, NULL};
   if (out) *out = NULL;
   if (!desc) return E_INVALIDARG;
-  if (desc->FillMode < D3D11_FILL_WIREFRAME || desc->FillMode > D3D11_FILL_SOLID || desc->CullMode < D3D11_CULL_NONE || desc->CullMode > D3D11_CULL_BACK || desc->ForcedSampleCount)
-    return E_INVALIDARG;
+  if (desc->FillMode < D3D11_FILL_WIREFRAME || desc->FillMode > D3D11_FILL_SOLID || desc->CullMode < D3D11_CULL_NONE || desc->CullMode > D3D11_CULL_BACK) return E_INVALIDARG;
+  const UINT forced = desc->ForcedSampleCount;
+  if (forced && (d->level < D3D_FEATURE_LEVEL_11_1 || (forced != 1 && forced != 2 && forced != 4 && forced != 8 && forced != 16))) return E_INVALIDARG;
   if ((UINT)desc->ConservativeRaster > (UINT)D3D11_CONSERVATIVE_RASTERIZATION_MODE_ON) return E_INVALIDARG;
   D3D11_RASTERIZER_DESC2 key = *desc;
   key.FrontCounterClockwise = !!key.FrontCounterClockwise;

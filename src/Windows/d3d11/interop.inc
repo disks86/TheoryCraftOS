@@ -226,6 +226,14 @@ EXPORT HRESULT WINAPI D3D11On12CreateDevice(IUnknown *device12, UINT flags, cons
   ID3D12CommandQueue *queue = NULL;
   if (FAILED(IUnknown_QueryInterface(device12, &IID_ID3D12Device, (void **)&d12)) || !d12) return E_INVALIDARG;
   if (!queues[0] || FAILED(IUnknown_QueryInterface(queues[0], &IID_ID3D12CommandQueue, (void **)&queue)) || !queue) { ID3D12Device_Release(d12); return E_INVALIDARG; }
+  /* (no levels: the Direct3D 12 device's own - the highest it has) */
+  D3D_FEATURE_LEVEL own = D3D_FEATURE_LEVEL_11_0;
+  if (!levels || !level_count) {
+    static const D3D_FEATURE_LEVEL all[] = {D3D_FEATURE_LEVEL_12_1, D3D_FEATURE_LEVEL_12_0, D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0};
+    D3D12_FEATURE_DATA_FEATURE_LEVELS f = {sizeof all / sizeof all[0], all, (D3D_FEATURE_LEVEL)0};
+    if (SUCCEEDED(ID3D12Device_CheckFeatureSupport(d12, D3D12_FEATURE_FEATURE_LEVELS, &f, sizeof f))) own = f.MaxSupportedFeatureLevel;
+    levels = &own, level_count = 1;
+  }
   Dev *d = NULL;
   const HRESULT hr = dev_create_on(NULL, flags, levels, level_count, d12, queue, &d);
   ID3D12CommandQueue_Release(queue);

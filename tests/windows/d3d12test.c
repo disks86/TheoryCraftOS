@@ -40,6 +40,8 @@ static int checks, failed;
 #define CHECK_HR(x) do { HRESULT hr_ = (x); ++checks; if (FAILED(hr_)) { ++failed; printf("FAILED line %d: %s = %08lx\n", __LINE__, #x, (unsigned long)hr_); } } while (0)
 
 static int g_hardware;      /* the adapter is a GPU (not the CPU renderer) */
+static int g_venus;         /* ... the Venus device (host Vulkan) */
+static D3D_FEATURE_LEVEL g_level = D3D_FEATURE_LEVEL_11_0;      /* the adapter's feature level: 11_1 on the CPU renderer, 11_0 on virgl and Venus (test_feature_levels) */
 static int g_layer_any;     /* the adapter takes a layer and a viewport from a vertex or domain shader: the CPU renderer and the Venus device (the host's Vulkan), not virgl */
 static const float kIdentity[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
 
@@ -75,6 +77,8 @@ static void test_dxgi(IDXGIAdapter1 **adapter_out) {
     printf("device: %s\n", (d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) ? "software (the CPU renderer)" : "hardware");
     g_hardware = !(d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE);
     g_layer_any = !g_hardware || wcsstr(d.Description, L"Venus") != NULL;
+    g_venus = wcsstr(d.Description, L"Venus") != NULL;
+    g_level = g_hardware ? D3D_FEATURE_LEVEL_11_0 : D3D_FEATURE_LEVEL_11_1;
     IDXGIOutput *output = NULL;
     CHECK_HR(IDXGIAdapter1_EnumOutputs(adapter, 0, &output));
     if (output) {
@@ -4376,10 +4380,11 @@ static void test_uav_only_draws(Scene *c) {
   /* (refused: a forced count of 3, and a forced count with a render target) */
   pd.RasterizerState.ForcedSampleCount = 3;
   CHECK(ID3D12Device_CreateGraphicsPipelineState(dev, &pd, &IID_ID3D12PipelineState, (void **)&refused) == E_INVALIDARG && !refused);
+  /* (with a render target: target-independent rasterization, feature level 11_1's - test_feature_levels -; refused where the adapter has not got it) */
   pd.RasterizerState.ForcedSampleCount = 4;
   pd.NumRenderTargets = 1;
   pd.RTVFormats[0] = DXGI_FORMAT_B8G8R8A8_UNORM;
-  CHECK(ID3D12Device_CreateGraphicsPipelineState(dev, &pd, &IID_ID3D12PipelineState, (void **)&refused) == E_INVALIDARG && !refused);
+  if (g_level < D3D_FEATURE_LEVEL_11_1) CHECK(ID3D12Device_CreateGraphicsPipelineState(dev, &pd, &IID_ID3D12PipelineState, (void **)&refused) == E_INVALIDARG && !refused);
   /* (the vertex shader that writes u1 and u2, and the same pixel shader) */
   pd.RasterizerState.ForcedSampleCount = 0;
   pd.NumRenderTargets = 0;
@@ -4451,6 +4456,358 @@ static void test_uav_only_draws(Scene *c) {
   ID3D12Resource_Release(positions);
   ID3D12Resource_Release(seen);
   ID3D12Resource_Release(hits);
+}
+
+/* ---- feature levels above 11_0 ---------------------------------------------------------------------------------------------------------------------------------------- */
+
+/* A triangle in a corner of pixel (px, py) of a `size` x `size` viewport, in NDC with a white colour: (px, py), (px + 0.45, py), (px, py + 0.45). It holds none of the pixel's
+ * standard 1, 2, 4 or 8 sample positions, and the sixteen-sample pattern's (-4, -6) (sixteenths of a pixel from the centre). */
+static void corner_triangle(float *v, float px, float py, float size) {
+  const float xs[3] = {px, px + 0.45f, px}, ys[3] = {py, py, py + 0.45f};
+  for (UINT k = 0; k < 3; ++k) {
+    float *o = v + 7 * k;
+    o[0] = xs[k] / (size / 2) - 1, o[1] = 1 - ys[k] / (size / 2), o[2] = 0.5f, o[3] = 1, o[4] = 1, o[5] = 1, o[6] = 1;
+  }
+}
+static void big_triangle(float *v) {
+  static const float big[3][2] = {{-1, -1}, {3, -1}, {-1, 3}};
+  for (UINT k = 0; k < 3; ++k) {
+    float *o = v + 7 * k;
+    o[0] = big[k][0], o[1] = big[k][1], o[2] = 0.5f, o[3] = o[4] = o[5] = o[6] = 1;
+  }
+}
+/* Feature levels 11_1 and up: what the levels report, rasterizer ordered views (each primitive's accesses after the earlier ones' at a pixel), and target-independent rasterization
+ * (ForcedSampleCount 1 .. 16 with no target and with a single-sample render target; 1 on a multisampled one). */
+static void test_feature_levels(Scene *c) {
+  ID3D12Device *dev = c->dev;
+  D3D_FEATURE_LEVEL asked[4] = {D3D_FEATURE_LEVEL_12_1, D3D_FEATURE_LEVEL_12_0, D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0};
+  D3D12_FEATURE_DATA_FEATURE_LEVELS levels = {4, asked, (D3D_FEATURE_LEVEL)0};
+  CHECK_HR(ID3D12Device_CheckFeatureSupport(dev, D3D12_FEATURE_FEATURE_LEVELS, &levels, sizeof levels));
+  CHECK(levels.MaxSupportedFeatureLevel == g_level);
+  levels.NumFeatureLevels = 2;
+  CHECK(ID3D12Device_CheckFeatureSupport(dev, D3D12_FEATURE_FEATURE_LEVELS, &levels, sizeof levels) == E_INVALIDARG);      /* (12_1 and 12_0 alone: none of them) */
+  D3D12_FEATURE_DATA_D3D12_OPTIONS opts;
+  memset(&opts, 0, sizeof opts);
+  CHECK_HR(ID3D12Device_CheckFeatureSupport(dev, D3D12_FEATURE_D3D12_OPTIONS, &opts, sizeof opts));
+  const int rovs = !g_hardware || g_venus;      /* (the CPU renderer runs fragments in order; Venus has the host's pixel interlock; virgl has neither) */
+  CHECK(opts.ROVsSupported == rovs);
+  CHECK(opts.ResourceBindingTier == D3D12_RESOURCE_BINDING_TIER_1);      /* (tier 2 is 12_0's: dev_feature_level) */
+  if (g_level >= D3D_FEATURE_LEVEL_11_1) CHECK(opts.OutputMergerLogicOp);
+  D3D12_FEATURE_DATA_D3D12_OPTIONS19 o19;
+  memset(&o19, 0, sizeof o19);
+  if (SUCCEEDED(ID3D12Device_CheckFeatureSupport(dev, D3D12_FEATURE_D3D12_OPTIONS19, &o19, sizeof o19)) && g_level >= D3D_FEATURE_LEVEL_11_1) CHECK(o19.SupportedSampleCountsWithNoOutputs == 0x1F);
+  printf("feature level %#x, rasterizer ordered views %d\n", (unsigned)levels.MaxSupportedFeatureLevel, (int)opts.ROVsSupported);
+
+  const D3D12_RESOURCE_FLAGS uav = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+  D3D12_INPUT_ELEMENT_DESC layout[2] = {{"POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
+                                        {"COLOR", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 12, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0}};
+  ID3D12Resource *vb = make_buffer(dev, D3D12_HEAP_TYPE_UPLOAD, 1024, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ);
+  if (!vb) { CHECK(0); return; }
+  float *verts = NULL;
+  const UINT zero[4] = {0, 0, 0, 0};
+
+  /* Rasterizer ordered views: three triangles over a 4 x 4 viewport in one draw; each puts SV_PrimitiveID + 1 into the pixel's word after the earlier ones' (a RWTexture2D in u1, a
+   * byte address buffer in u2). 0x123 everywhere: the order of the primitives. A device without them refuses the pipeline. */
+  {
+    ID3D12Resource *order = uav_texture(dev, D3D12_RESOURCE_DIMENSION_TEXTURE2D, 4, 4, 1, DXGI_FORMAT_R32_UINT, uav);
+    ID3D12Resource *words = make_buffer(dev, D3D12_HEAP_TYPE_DEFAULT, 64, uav, D3D12_RESOURCE_STATE_COMMON);
+    ID3D12RootSignature *rs = uav_signature(dev, 1, 2, 1);
+    ID3D12DescriptorHeap *heap = view_heap(dev, 2, 1), *cpu = view_heap(dev, 2, 0);
+    if (!order || !words || !rs || !heap || !cpu) { CHECK(0); return; }
+    put_uav(dev, heap, cpu, 0, order, NULL);
+    buffer_uav(dev, heap, cpu, 1, words, NULL, 0, DXGI_FORMAT_R32_TYPELESS, 0, 16, 0, D3D12_BUFFER_UAV_FLAG_RAW);
+    const UINT none[16] = {0};
+    buffer_upload(c, words, 0, none, sizeof none);
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC pd;
+    memset(&pd, 0, sizeof pd);
+    pd.pRootSignature = rs;
+    pd.VS.pShaderBytecode = dx_vs_dxbc;
+    pd.VS.BytecodeLength = sizeof dx_vs_dxbc;
+    pd.PS.pShaderBytecode = dx_ps_rov_dxbc;
+    pd.PS.BytecodeLength = sizeof dx_ps_rov_dxbc;
+    pd.SampleMask = 0xFFFFFFFFu;
+    pd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+    pd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+    pd.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+    pd.InputLayout.pInputElementDescs = layout;
+    pd.InputLayout.NumElements = 2;
+    pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+    pd.NumRenderTargets = 1;
+    pd.RTVFormats[0] = DXGI_FORMAT_B8G8R8A8_UNORM;
+    pd.SampleDesc.Count = 1;
+    ID3D12PipelineState *pso = NULL;
+    const HRESULT made = ID3D12Device_CreateGraphicsPipelineState(dev, &pd, &IID_ID3D12PipelineState, (void **)&pso);
+    CHECK(rovs ? SUCCEEDED(made) && pso != NULL : FAILED(made) && pso == NULL);
+    if (pso) {
+      if (SUCCEEDED(ID3D12Resource_Map(vb, 0, NULL, (void **)&verts)) && verts) {
+        for (UINT t = 0; t < 3; ++t) big_triangle(verts + 21 * t);
+        ID3D12Resource_Unmap(vb, 0, NULL);
+      }
+      ID3D12GraphicsCommandList *list = NULL;
+      CHECK_HR(ID3D12CommandAllocator_Reset(c->allocator));
+      CHECK_HR(ID3D12Device_CreateCommandList(dev, 0, D3D12_COMMAND_LIST_TYPE_DIRECT, c->allocator, pso, &IID_ID3D12GraphicsCommandList, (void **)&list));
+      if (list) {
+        ID3D12GraphicsCommandList_SetDescriptorHeaps(list, 1, &heap);
+        ID3D12GraphicsCommandList_ClearUnorderedAccessViewUint(list, heap_gpu(dev, heap, 0), heap_cpu(dev, cpu, 0), order, zero, 0, NULL);
+        scene_begin(c, list, 1);
+        const D3D12_VIEWPORT vp = {0, 0, 4, 4, 0, 1};
+        const D3D12_RECT sc = {0, 0, 4, 4};
+        ID3D12GraphicsCommandList_RSSetViewports(list, 1, &vp);
+        ID3D12GraphicsCommandList_RSSetScissorRects(list, 1, &sc);
+        D3D12_VERTEX_BUFFER_VIEW vbv = {ID3D12Resource_GetGPUVirtualAddress(vb), 9 * 28, 28};
+        ID3D12GraphicsCommandList_SetGraphicsRootSignature(list, rs);
+        ID3D12GraphicsCommandList_SetGraphicsRoot32BitConstants(list, 0, 16, kIdentity, 0);
+        ID3D12GraphicsCommandList_SetGraphicsRootDescriptorTable(list, 1, heap_gpu(dev, heap, 0));
+        ID3D12GraphicsCommandList_IASetPrimitiveTopology(list, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        ID3D12GraphicsCommandList_IASetVertexBuffers(list, 0, 1, &vbv);
+        ID3D12GraphicsCommandList_DrawInstanced(list, 9, 1, 0, 0);
+        scene_run(c, list);
+        ID3D12GraphicsCommandList_Release(list);
+      }
+      UINT got[16] = {0}, in_buffer[16] = {0};
+      CHECK(texture_read(c, order, 0, got, 4) && buffer_download(c, words, 0, in_buffer, sizeof in_buffer));
+      int wrong = 0;
+      for (UINT i = 0; i < 16; ++i)
+        if ((got[i] != 0x123 || in_buffer[i] != 0x123) && !wrong++) printf("  rasterizer ordered view: pixel %u texture %#x buffer %#x, want 0x123\n", i, got[i], in_buffer[i]);
+      printf("rasterizer ordered views: %d of 16 pixels out of order\n", wrong);
+      CHECK(wrong == 0);
+      ID3D12PipelineState_Release(pso);
+    }
+    ID3D12DescriptorHeap_Release(cpu);
+    ID3D12DescriptorHeap_Release(heap);
+    ID3D12RootSignature_Release(rs);
+    ID3D12Resource_Release(words);
+    ID3D12Resource_Release(order);
+  }
+
+  /* Target-independent rasterization (feature level 11_1). No target: the corner triangle of pixel (k, 0) of a 16 x 16 viewport with ForcedSampleCount 0, 1, 2, 4, 8, 16 for
+   * k = 0 .. 5 - only the sixteen-sample pattern reaches into it, so pixel 5 alone is shaded (its element of the typed view counted once) -, and a triangle over the viewport with
+   * 16 samples: each pixel once more. */
+  if (g_level >= D3D_FEATURE_LEVEL_11_1) {
+    static const UINT counts[6] = {0, 1, 2, 4, 8, 16};
+    ID3D12Resource *hits = make_buffer(dev, D3D12_HEAP_TYPE_DEFAULT, 256 * 4, uav, D3D12_RESOURCE_STATE_COMMON);
+    const D3D12_DESCRIPTOR_RANGE_TYPE types[1] = {D3D12_DESCRIPTOR_RANGE_TYPE_UAV};
+    const UINT regs[1] = {0}, sizes[1] = {1};
+    ID3D12RootSignature *rs = ranges_signature(dev, 1, types, regs, sizes, 1);
+    ID3D12DescriptorHeap *heap = view_heap(dev, 1, 1), *cpu = view_heap(dev, 1, 0);
+    if (!hits || !rs || !heap || !cpu) { CHECK(0); return; }
+    buffer_uav(dev, heap, cpu, 0, hits, NULL, 0, DXGI_FORMAT_R32_UINT, 0, 256, 0, 0);
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC pd;
+    memset(&pd, 0, sizeof pd);
+    pd.pRootSignature = rs;
+    pd.VS.pShaderBytecode = dx_vs_dxbc;
+    pd.VS.BytecodeLength = sizeof dx_vs_dxbc;
+    pd.PS.pShaderBytecode = dx_ps_uav_only_dxbc;
+    pd.PS.BytecodeLength = sizeof dx_ps_uav_only_dxbc;
+    pd.SampleMask = 0xFFFFFFFFu;
+    pd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+    pd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+    pd.InputLayout.pInputElementDescs = layout;
+    pd.InputLayout.NumElements = 2;
+    pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+    pd.SampleDesc.Count = 1;
+    ID3D12PipelineState *psos[6] = {NULL};
+    for (UINT k = 0; k < 6; ++k) {
+      pd.RasterizerState.ForcedSampleCount = counts[k];
+      CHECK_HR(ID3D12Device_CreateGraphicsPipelineState(dev, &pd, &IID_ID3D12PipelineState, (void **)&psos[k]));
+    }
+    /* (refused: 32, and 16 with a depth test) */
+    ID3D12PipelineState *refused = NULL;
+    pd.RasterizerState.ForcedSampleCount = 32;
+    CHECK(ID3D12Device_CreateGraphicsPipelineState(dev, &pd, &IID_ID3D12PipelineState, (void **)&refused) == E_INVALIDARG && !refused);
+    pd.RasterizerState.ForcedSampleCount = 16;
+    pd.DepthStencilState.DepthEnable = TRUE;
+    pd.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
+    pd.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_LESS;
+    pd.DSVFormat = DXGI_FORMAT_D32_FLOAT;
+    CHECK(ID3D12Device_CreateGraphicsPipelineState(dev, &pd, &IID_ID3D12PipelineState, (void **)&refused) == E_INVALIDARG && !refused);
+    if (SUCCEEDED(ID3D12Resource_Map(vb, 0, NULL, (void **)&verts)) && verts) {
+      for (UINT k = 0; k < 6; ++k) corner_triangle(verts + 21 * k, (float)k, 0, 16);
+      big_triangle(verts + 21 * 6);
+      ID3D12Resource_Unmap(vb, 0, NULL);
+    }
+    ID3D12GraphicsCommandList *list = NULL;
+    CHECK_HR(ID3D12CommandAllocator_Reset(c->allocator));
+    CHECK_HR(ID3D12Device_CreateCommandList(dev, 0, D3D12_COMMAND_LIST_TYPE_DIRECT, c->allocator, psos[0], &IID_ID3D12GraphicsCommandList, (void **)&list));
+    if (list && psos[5]) {
+      ID3D12GraphicsCommandList_SetDescriptorHeaps(list, 1, &heap);
+      ID3D12GraphicsCommandList_ClearUnorderedAccessViewUint(list, heap_gpu(dev, heap, 0), heap_cpu(dev, cpu, 0), hits, zero, 0, NULL);
+      const D3D12_VIEWPORT vp = {0, 0, 16, 16, 0, 1};
+      const D3D12_RECT sc = {0, 0, 16, 16};
+      ID3D12GraphicsCommandList_OMSetRenderTargets(list, 0, NULL, FALSE, NULL);
+      ID3D12GraphicsCommandList_RSSetViewports(list, 1, &vp);
+      ID3D12GraphicsCommandList_RSSetScissorRects(list, 1, &sc);
+      D3D12_VERTEX_BUFFER_VIEW vbv = {ID3D12Resource_GetGPUVirtualAddress(vb), 21 * 4 * 7, 28};
+      ID3D12GraphicsCommandList_SetGraphicsRootSignature(list, rs);
+      ID3D12GraphicsCommandList_SetGraphicsRoot32BitConstants(list, 0, 16, kIdentity, 0);
+      ID3D12GraphicsCommandList_SetGraphicsRootDescriptorTable(list, 1, heap_gpu(dev, heap, 0));
+      ID3D12GraphicsCommandList_IASetPrimitiveTopology(list, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+      ID3D12GraphicsCommandList_IASetVertexBuffers(list, 0, 1, &vbv);
+      for (UINT k = 0; k < 6; ++k) {
+        ID3D12GraphicsCommandList_SetPipelineState(list, psos[k]);
+        ID3D12GraphicsCommandList_DrawInstanced(list, 3, 1, 3 * k, 0);
+      }
+      ID3D12GraphicsCommandList_SetPipelineState(list, psos[5]);
+      ID3D12GraphicsCommandList_DrawInstanced(list, 3, 1, 18, 0);
+      scene_run(c, list);
+    }
+    if (list) ID3D12GraphicsCommandList_Release(list);
+    UINT h[256] = {0};
+    CHECK(buffer_download(c, hits, 0, h, sizeof h));
+    int wrong = 0;
+    for (UINT i = 0; i < 256; ++i) {
+      const UINT want = 1 + (i == 5);
+      if (h[i] != want && !wrong++) printf("  forced sample count, no target: element %u = %u, want %u\n", i, h[i], want);
+    }
+    printf("forced sample counts without a target: %d elements wrong (pixel 5: %u)\n", wrong, h[5]);
+    CHECK(wrong == 0);
+    for (UINT k = 0; k < 6; ++k) if (psos[k]) ID3D12PipelineState_Release(psos[k]);
+    ID3D12DescriptorHeap_Release(cpu);
+    ID3D12DescriptorHeap_Release(heap);
+    ID3D12RootSignature_Release(rs);
+    ID3D12Resource_Release(hits);
+  }
+
+  /* A single-sample render target: the corner triangle of pixel (2k, 0) of the 64 x 64 target with ForcedSampleCount 0, 8 and 16 for k = 0, 1, 2 - pixel 4 alone is drawn -,
+   * and 4x multisampled targets with ForcedSampleCount 1: the corner triangle of (0, 0) with legs of 0.9 holds two of the pixel's four samples and not its centre (nothing drawn;
+   * half of the samples without the forced count), one of 1.2 holds the centre and two samples (all four with the forced count, half without). */
+  if (g_level >= D3D_FEATURE_LEVEL_11_1) {
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC pd;
+    memset(&pd, 0, sizeof pd);
+    pd.pRootSignature = c->rs;
+    pd.VS.pShaderBytecode = dx_vs_dxbc;
+    pd.VS.BytecodeLength = sizeof dx_vs_dxbc;
+    pd.PS.pShaderBytecode = dx_ps_color_dxbc;
+    pd.PS.BytecodeLength = sizeof dx_ps_color_dxbc;
+    pd.SampleMask = 0xFFFFFFFFu;
+    pd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+    pd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+    pd.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+    pd.InputLayout.pInputElementDescs = layout;
+    pd.InputLayout.NumElements = 2;
+    pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+    pd.NumRenderTargets = 1;
+    pd.RTVFormats[0] = DXGI_FORMAT_B8G8R8A8_UNORM;
+    pd.SampleDesc.Count = 1;
+    ID3D12PipelineState *psos[3] = {NULL}, *ms[2] = {NULL};
+    static const UINT counts[3] = {0, 8, 16};
+    for (UINT k = 0; k < 3; ++k) {
+      pd.RasterizerState.ForcedSampleCount = counts[k];
+      CHECK_HR(ID3D12Device_CreateGraphicsPipelineState(dev, &pd, &IID_ID3D12PipelineState, (void **)&psos[k]));
+    }
+    /* (16 with a multisampled target is refused; 1 is not) */
+    ID3D12PipelineState *refused = NULL;
+    pd.SampleDesc.Count = 4;
+    pd.RasterizerState.ForcedSampleCount = 16;
+    CHECK(ID3D12Device_CreateGraphicsPipelineState(dev, &pd, &IID_ID3D12PipelineState, (void **)&refused) == E_INVALIDARG && !refused);
+    pd.RasterizerState.MultisampleEnable = TRUE;
+    D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS q = {DXGI_FORMAT_B8G8R8A8_UNORM, 4, D3D12_MULTISAMPLE_QUALITY_LEVELS_FLAG_NONE, 0};
+    const int four = SUCCEEDED(ID3D12Device_CheckFeatureSupport(dev, D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS, &q, sizeof q)) && q.NumQualityLevels > 0;
+    for (UINT k = 0; four && k < 2; ++k) {
+      pd.RasterizerState.ForcedSampleCount = k;
+      CHECK_HR(ID3D12Device_CreateGraphicsPipelineState(dev, &pd, &IID_ID3D12PipelineState, (void **)&ms[k]));
+    }
+    if (SUCCEEDED(ID3D12Resource_Map(vb, 0, NULL, (void **)&verts)) && verts) {
+      for (UINT k = 0; k < 3; ++k) corner_triangle(verts + 21 * k, (float)(2 * k), 0, 64);
+      /* (the corners of pixel (0, 0) of a 4 x 4 target with legs of 0.9 and 1.2 pixels) */
+      const float legs[2] = {0.9f, 1.2f};
+      for (UINT t = 0; t < 2; ++t) {
+        const float xs[3] = {0, legs[t], 0}, ys[3] = {0, 0, legs[t]};
+        for (UINT k = 0; k < 3; ++k) {
+          float *o = verts + 21 * (3 + t) + 7 * k;
+          o[0] = xs[k] / 2 - 1, o[1] = 1 - ys[k] / 2, o[2] = 0.5f, o[3] = o[4] = o[5] = o[6] = 1;
+        }
+      }
+      ID3D12Resource_Unmap(vb, 0, NULL);
+    }
+    D3D12_VERTEX_BUFFER_VIEW vbv = {ID3D12Resource_GetGPUVirtualAddress(vb), 21 * 4 * 5, 28};
+    ID3D12GraphicsCommandList *list = NULL;
+    CHECK_HR(ID3D12CommandAllocator_Reset(c->allocator));
+    CHECK_HR(ID3D12Device_CreateCommandList(dev, 0, D3D12_COMMAND_LIST_TYPE_DIRECT, c->allocator, psos[0], &IID_ID3D12GraphicsCommandList, (void **)&list));
+    if (list && psos[2]) {
+      scene_begin(c, list, 1);
+      ID3D12GraphicsCommandList_SetGraphicsRootSignature(list, c->rs);
+      ID3D12GraphicsCommandList_SetGraphicsRoot32BitConstants(list, 0, 16, kIdentity, 0);
+      ID3D12GraphicsCommandList_IASetPrimitiveTopology(list, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+      ID3D12GraphicsCommandList_IASetVertexBuffers(list, 0, 1, &vbv);
+      for (UINT k = 0; k < 3; ++k) {
+        ID3D12GraphicsCommandList_SetPipelineState(list, psos[k]);
+        ID3D12GraphicsCommandList_DrawInstanced(list, 3, 1, 3 * k, 0);
+      }
+      scene_read_target(c, list);
+      scene_run(c, list);
+      const int a = scene_coloured(c, 0, 0, 1, 1), b = scene_coloured(c, 2, 0, 3, 1), d = scene_coloured(c, 4, 0, 5, 1), all = scene_coloured(c, 0, 0, 64, 64);
+      printf("forced sample counts on a render target: pixels %d %d %d, %d in all\n", a, b, d, all);
+      CHECK(a == 0 && b == 0 && d == 1 && all == 1);
+    }
+    if (list) ID3D12GraphicsCommandList_Release(list);
+    list = NULL;
+    /* (four 4 x 4 targets of four samples: each triangle without and with the forced count, each resolved and read) */
+    if (four && ms[0] && ms[1]) {
+      D3D12_HEAP_PROPERTIES defaults = {D3D12_HEAP_TYPE_DEFAULT, D3D12_CPU_PAGE_PROPERTY_UNKNOWN, D3D12_MEMORY_POOL_UNKNOWN, 1, 1};
+      D3D12_RESOURCE_DESC td = {D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, 4, 4, 1, 1, DXGI_FORMAT_B8G8R8A8_UNORM, {4, 0}, D3D12_TEXTURE_LAYOUT_UNKNOWN, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET};
+      ID3D12Resource *targets[4] = {NULL}, *plain = NULL;
+      D3D12_RESOURCE_DESC pdsc = td;
+      pdsc.SampleDesc.Count = 1;
+      CHECK_HR(ID3D12Device_CreateCommittedResource(dev, &defaults, D3D12_HEAP_FLAG_NONE, &pdsc, D3D12_RESOURCE_STATE_RESOLVE_DEST, NULL, &IID_ID3D12Resource, (void **)&plain));
+      D3D12_DESCRIPTOR_HEAP_DESC hd = {D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 4, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
+      ID3D12DescriptorHeap *rtvs = NULL;
+      CHECK_HR(ID3D12Device_CreateDescriptorHeap(dev, &hd, &IID_ID3D12DescriptorHeap, (void **)&rtvs));
+      const UINT step = ID3D12Device_GetDescriptorHandleIncrementSize(dev, D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+      for (UINT t = 0; rtvs && t < 4; ++t) {
+        CHECK_HR(ID3D12Device_CreateCommittedResource(dev, &defaults, D3D12_HEAP_FLAG_NONE, &td, D3D12_RESOURCE_STATE_RENDER_TARGET, NULL, &IID_ID3D12Resource, (void **)&targets[t]));
+        D3D12_CPU_DESCRIPTOR_HANDLE h = ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(rtvs);
+        h.ptr += (SIZE_T)t * step;
+        if (targets[t]) ID3D12Device_CreateRenderTargetView(dev, targets[t], NULL, h);
+      }
+      UINT results[4] = {0};
+      for (UINT t = 0; rtvs && plain && t < 4; ++t) {
+        /* (t: 0 the 0.9 corner without the forced count, 1 with it, 2 the 1.2 corner without, 3 with) */
+        const float black[4] = {0, 0, 0, 1};
+        if (!targets[t]) continue;
+        CHECK_HR(ID3D12CommandAllocator_Reset(c->allocator));
+        CHECK_HR(ID3D12Device_CreateCommandList(dev, 0, D3D12_COMMAND_LIST_TYPE_DIRECT, c->allocator, ms[t & 1], &IID_ID3D12GraphicsCommandList, (void **)&list));
+        if (!list) break;
+        D3D12_CPU_DESCRIPTOR_HANDLE h = ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(rtvs);
+        h.ptr += (SIZE_T)t * step;
+        const D3D12_VIEWPORT vp = {0, 0, 4, 4, 0, 1};
+        const D3D12_RECT sc = {0, 0, 4, 4};
+        ID3D12GraphicsCommandList_OMSetRenderTargets(list, 1, &h, FALSE, NULL);
+        ID3D12GraphicsCommandList_ClearRenderTargetView(list, h, black, 0, NULL);
+        ID3D12GraphicsCommandList_RSSetViewports(list, 1, &vp);
+        ID3D12GraphicsCommandList_RSSetScissorRects(list, 1, &sc);
+        ID3D12GraphicsCommandList_SetGraphicsRootSignature(list, c->rs);
+        ID3D12GraphicsCommandList_SetGraphicsRoot32BitConstants(list, 0, 16, kIdentity, 0);
+        ID3D12GraphicsCommandList_IASetPrimitiveTopology(list, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        ID3D12GraphicsCommandList_IASetVertexBuffers(list, 0, 1, &vbv);
+        ID3D12GraphicsCommandList_DrawInstanced(list, 3, 1, 9 + 3 * (t >> 1), 0);
+        D3D12_RESOURCE_BARRIER barrier;
+        memset(&barrier, 0, sizeof barrier);
+        barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        barrier.Transition.pResource = targets[t];
+        barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+        barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_RESOLVE_SOURCE;
+        ID3D12GraphicsCommandList_ResourceBarrier(list, 1, &barrier);
+        ID3D12GraphicsCommandList_ResolveSubresource(list, plain, 0, targets[t], 0, DXGI_FORMAT_B8G8R8A8_UNORM);
+        scene_run(c, list);
+        ID3D12GraphicsCommandList_Release(list);
+        list = NULL;
+        UINT texels[16] = {0};
+        CHECK(texture_read(c, plain, 0, texels, 4));
+        results[t] = texels[0] & 0xFF;      /* (blue of pixel (0, 0): the colour drawn is white) */
+      }
+      printf("forced sample count 1 on 4x targets: %u %u (0.9 corner), %u %u (1.2 corner)\n", results[0], results[1], results[2], results[3]);
+      /* (half of the samples, about 128; none; half; all) */
+      CHECK(results[0] > 100 && results[0] < 156 && results[1] == 0 && results[2] > 100 && results[2] < 156 && results[3] == 255);
+      for (UINT t = 0; t < 4; ++t) if (targets[t]) ID3D12Resource_Release(targets[t]);
+      if (rtvs) ID3D12DescriptorHeap_Release(rtvs);
+      if (plain) ID3D12Resource_Release(plain);
+    }
+    for (UINT k = 0; k < 3; ++k) if (psos[k]) ID3D12PipelineState_Release(psos[k]);
+    for (UINT k = 0; k < 2; ++k) if (ms[k]) ID3D12PipelineState_Release(ms[k]);
+  }
+  ID3D12Resource_Release(vb);
 }
 
 /* A geometry shader sending triangle n to layer n (SV_RenderTargetArrayIndex) of a render target and a depth buffer of three slices, a clear of a view of two of them, and
@@ -8338,6 +8695,7 @@ static void test_extras(ID3D12Device *dev, ID3D12CommandQueue *queue, ID3D12Fenc
   test_dxil_resources(&c);
   test_counters(&c);
   test_uav_only_draws(&c);
+  test_feature_levels(&c);
   test_pixel_uavs(&c);
   test_layers(&c);
   test_plane_uavs(&c);
@@ -10499,7 +10857,18 @@ int main(void) {
   ID3D12Device *dev = NULL;
   CHECK(D3D12CreateDevice((IUnknown *)adapter, D3D_FEATURE_LEVEL_11_0, &IID_ID3D12Device, NULL) == S_FALSE);
   CHECK_HR(D3D12CreateDevice((IUnknown *)adapter, D3D_FEATURE_LEVEL_11_0, &IID_ID3D12Device, (void **)&dev));
-  CHECK(D3D12CreateDevice(NULL, D3D_FEATURE_LEVEL_12_1, &IID_ID3D12Device, (void **)&dev) == DXGI_ERROR_UNSUPPORTED || dev != NULL);
+  {
+    /* (the levels above the adapter's are refused, the ones up to it made; a value that is no level is not one) */
+    ID3D12Device *other = NULL;
+    CHECK(D3D12CreateDevice((IUnknown *)adapter, D3D_FEATURE_LEVEL_12_1, &IID_ID3D12Device, (void **)&other) == DXGI_ERROR_UNSUPPORTED && !other);
+    CHECK(D3D12CreateDevice((IUnknown *)adapter, D3D_FEATURE_LEVEL_12_0, &IID_ID3D12Device, NULL) == DXGI_ERROR_UNSUPPORTED);
+    CHECK(D3D12CreateDevice((IUnknown *)adapter, D3D_FEATURE_LEVEL_11_1, &IID_ID3D12Device, NULL) == (g_level >= D3D_FEATURE_LEVEL_11_1 ? S_FALSE : DXGI_ERROR_UNSUPPORTED));
+    CHECK(D3D12CreateDevice((IUnknown *)adapter, (D3D_FEATURE_LEVEL)0xb200, &IID_ID3D12Device, NULL) == E_INVALIDARG);
+    if (g_level >= D3D_FEATURE_LEVEL_11_1) {
+      CHECK_HR(D3D12CreateDevice((IUnknown *)adapter, D3D_FEATURE_LEVEL_11_1, &IID_ID3D12Device, (void **)&other));
+      if (other) ID3D12Device_Release(other);
+    }
+  }
   if (!dev) {
     printf("d3d12test: no device\n");
     printf("d3d12test: %d checks, %d failed\n", checks, failed + 1);

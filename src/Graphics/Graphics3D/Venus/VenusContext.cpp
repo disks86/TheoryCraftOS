@@ -34,6 +34,7 @@ const char* const kWanted[] = {
     VK_EXT_CONSERVATIVE_RASTERIZATION_EXTENSION_NAME, VK_EXT_DEPTH_CLIP_ENABLE_EXTENSION_NAME,   VK_EXT_INDEX_TYPE_UINT8_EXTENSION_NAME,
     VK_EXT_LINE_RASTERIZATION_EXTENSION_NAME,      VK_EXT_VERTEX_ATTRIBUTE_DIVISOR_EXTENSION_NAME, VK_EXT_PROVOKING_VERTEX_EXTENSION_NAME,
     VK_EXT_ROBUSTNESS_2_EXTENSION_NAME,            VK_EXT_DEPTH_BIAS_CONTROL_EXTENSION_NAME,       VK_EXT_SAMPLE_LOCATIONS_EXTENSION_NAME,
+    VK_EXT_FRAGMENT_SHADER_INTERLOCK_EXTENSION_NAME,
 };
 constexpr uint32_t kWantedCount = sizeof(kWanted) / sizeof(kWanted[0]);
 
@@ -130,6 +131,7 @@ bool VenusContext::open() {
   auto provoking = vk_struct<VkPhysicalDeviceProvokingVertexFeaturesEXT>(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROVOKING_VERTEX_FEATURES_EXT);
   auto robust2 = vk_struct<VkPhysicalDeviceRobustness2FeaturesEXT>(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT);
   auto bias = vk_struct<VkPhysicalDeviceDepthBiasControlFeaturesEXT>(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_BIAS_CONTROL_FEATURES_EXT);
+  auto interlock = vk_struct<VkPhysicalDeviceFragmentShaderInterlockFeaturesEXT>(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADER_INTERLOCK_FEATURES_EXT);
   auto v13 = vk_struct<VkPhysicalDeviceVulkan13Features>(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES);
   auto v12 = vk_struct<VkPhysicalDeviceVulkan12Features>(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES);
   auto v11 = vk_struct<VkPhysicalDeviceVulkan11Features>(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES);
@@ -150,6 +152,7 @@ bool VenusContext::open() {
   link(provoking, enabled(VK_EXT_PROVOKING_VERTEX_EXTENSION_NAME));
   link(robust2, enabled(VK_EXT_ROBUSTNESS_2_EXTENSION_NAME));
   link(bias, enabled(VK_EXT_DEPTH_BIAS_CONTROL_EXTENSION_NAME));
+  link(interlock, enabled(VK_EXT_FRAGMENT_SHADER_INTERLOCK_EXTENSION_NAME));
   link(v13, true);
   link(v12, true);
   link(v11, true);
@@ -165,6 +168,7 @@ bool VenusContext::open() {
   provoking.transformFeedbackPreservesProvokingVertex = VK_FALSE;
   bias.leastRepresentableValueForceUnormRepresentation = VK_FALSE;
   lines.stippledRectangularLines = lines.stippledBresenhamLines = lines.stippledSmoothLines = VK_FALSE;
+  interlock.fragmentShaderShadingRateInterlock = VK_FALSE;
 
   const VkPhysicalDeviceFeatures& f = features.features;
   caps_.geometry_shader = f.geometryShader, caps_.tessellation_shader = f.tessellationShader, caps_.dual_src_blend = f.dualSrcBlend, caps_.logic_op = f.logicOp;
@@ -198,6 +202,7 @@ bool VenusContext::open() {
   caps_.max_line_width = f.wideLines ? properties_.limits.lineWidthRange[1] : 1.0f;
   caps_.smooth_lines = caps_.line_rasterization && lines.smoothLines;
   caps_.rectangular_lines = caps_.line_rasterization && lines.rectangularLines;
+  caps_.pixel_interlock = enabled(VK_EXT_FRAGMENT_SHADER_INTERLOCK_EXTENSION_NAME) && interlock.fragmentShaderPixelInterlock;
 
   // The driver's name (for the boot log and GL_RENDERER).
   auto driver = vk_struct<VkPhysicalDeviceDriverProperties>(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES);

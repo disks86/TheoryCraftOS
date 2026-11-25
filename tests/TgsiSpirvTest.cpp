@@ -325,6 +325,16 @@ static void test_hand_written() {
               "  6: TXD TEMP[1], IN[0], IN[0].yyyy, IN[0].zzzz, SAMP[3], 3D\n  7: LODQ TEMP[1].xy, IN[0].xyyy, SAMP[3], 3D\n  8: TXB TEMP[0], IN[0], SAMP[3], 3D\n"
               "  9: TXP TEMP[0], IN[0], SAMP[3], 3D\n 10: MOV OUT[0], TEMP[0]\n 11: MOV OUT[1], TEMP[1]\n 12: END\n",
               ot);
+  // (a rasterizer ordered view's pixel shader: its body in a pixel interlock, the end of it before each return - the RET in an IF too -; a vertex shader cannot have one)
+  graphics::tgsi::CompileOptions oi;
+  oi.pixel_interlock = true;
+  compile_one("pixel interlock",
+              "FRAG\nDCL IN[0], POSITION, LINEAR\nDCL OUT[0], COLOR\nDCL IMAGE[0], 2D, PIPE_FORMAT_R32_UINT, WR\nDCL BUFFER[0]\nDCL TEMP[0..1]\nIMM[0] UINT32 {16, 1, 0, 0}\n"
+              "  0: F2U TEMP[0].xy, IN[0].xyyy\n  1: LOAD TEMP[1].x, IMAGE[0], TEMP[0].xyyy, 2D, PIPE_FORMAT_R32_UINT\n  2: UMAD TEMP[1].x, TEMP[1].xxxx, IMM[0].xxxx, IMM[0].yyyy\n"
+              "  3: STORE IMAGE[0].x, TEMP[0].xyyy, TEMP[1].xxxx, 2D, PIPE_FORMAT_R32_UINT\n  4: UIF TEMP[1].xxxx\n  5: RET\n  6: ENDIF\n"
+              "  7: STORE BUFFER[0].x, IMM[0].zzzz, TEMP[1].xxxx\n  8: MOV OUT[0], IN[0]\n  9: END\n",
+              oi);
+  compile_one("pixel interlock in a vertex shader", "VERT\nDCL IN[0]\nDCL OUT[0], POSITION\n  0: MOV OUT[0], IN[0]\n  1: END\n", oi, false);
   compile_one("unknown opcode", "VERT\n  0: FROB TEMP[0], IN[0]\n  1: END\n", o, false);
   compile_one("no end", "VERT\nDCL TEMP[0]\n  0: MOV TEMP[0], TEMP[0]\n", o, false);
 }

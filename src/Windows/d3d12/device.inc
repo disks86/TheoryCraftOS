@@ -203,15 +203,29 @@ static D3D12_HEAP_PROPERTIES *STDMETHODCALLTYPE dev_GetCustomHeapProperties(Dev 
   return ret;
 }
 
-/* The feature level the adapter's limits (what the kernel's graphics device takes, DeviceInfo::limits) allow: 11_0 needs 16 vertex inputs, 16 interpolants, 16 texture units and 8 render targets,
- * 10_0 the same but fewer interpolants (the ones it needs are 16 as well), and below that 9_3 (4 render targets, 16 textures) or 9_1. */
+/* Unordered access views in every stage, 64 of them (graphics::kMaxUavBuffers and kMaxStorageImages: the kernel's slots u0 .. u63 in each stage): buffers written by vertex, hull,
+ * domain, geometry, pixel and compute shaders, and textures and typed views of buffers in all of them. */
+static BOOL dev_uavs_every_stage(const Dev *d) {
+  const UINT stores = DEV_FEATURE_COMPUTE | DEV_FEATURE_FRAGMENT_STORES | DEV_FEATURE_VERTEX_STORES | DEV_FEATURE_GEOMETRY_STORES | DEV_FEATURE_TESSELLATION_STORES;
+  const UINT images = DEV_FEATURE2_STORAGE_IMAGES | DEV_FEATURE2_STORAGE_IMAGES_IN_DRAWS | DEV_FEATURE2_STORAGE_ALL_STAGES | DEV_FEATURE2_TEXEL_BUFFERS;
+  return (d->caps.features & stores) == stores && (d->caps.features2 & images) == images;
+}
+/* The feature level of the adapter: the highest whose features (Microsoft's "Hardware Feature Levels" table) the kernel's graphics device has.
+ *   11_0  the adapter's limits (DeviceInfo::limits): sixteen vertex inputs and texture units, eight render targets. The level also names 32 interpolants; a GPU reached through
+ *         OpenGL has 14 or 15 for the shaders' own - GL_MAX_VARYING_COMPONENTS less the position - and a pipeline whose shaders pass more than the device takes is refused
+ *         when it is made. Below it 9_3 (4 render targets, 16 textures) or 9_1.
+ *   11_1  and logic operations, target-independent rasterization and UAV-only rendering with a ForcedSampleCount up to 16 (DEV_FEATURE3_FORCED_SAMPLE_COUNT), unordered access
+ *         views in every stage and 64 of them (dev_uavs_every_stage). (Constant buffer offsets and partial updates are the Direct3D 11.1 runtime's: d3d11.dll.)
+ *   12_0  and resource binding tier 2 (every shader resource view of the heap and 2048 samplers in a stage, through arrays shaders index), tiled resources tier 2, min / max
+ *         filtering, typed loads of the 18 formats and Shader Model 6.0. The kernel's pipelines bind 16 texture units and samplers a stage (graphics::kMaxTextureUnits; Shader
+ *         Model 5.1 ranges of more than one register are refused) and translate no wave operations: no adapter has the level, whatever else it has.
+ *   12_1  and conservative rasterization tier 1 and rasterizer ordered views - which the CPU renderer has (and Venus the views), reported by OPTIONS on their own. */
 static D3D_FEATURE_LEVEL dev_feature_level(const Dev *d) {
   const KmtCaps *c = &d->caps;
-  /* (11_0: sixteen vertex inputs and texture units, eight render targets. The level also names 32 interpolants; a GPU reached through OpenGL has 14 or 15 for the shaders'
-   * own - GL_MAX_VARYING_COMPONENTS less the position - and a pipeline whose shaders pass more than the device takes is refused when it is made) */
-  if (c->max_vertex_attributes >= 16 && c->max_varyings >= 14 && c->max_texture_units >= 16 && c->max_color_targets >= 8) return D3D_FEATURE_LEVEL_11_0;
-  if (c->max_texture_units >= 16 && c->max_color_targets >= 4 && c->max_varyings >= 8) return D3D_FEATURE_LEVEL_9_3;
-  return D3D_FEATURE_LEVEL_9_1;
+  if (!(c->max_vertex_attributes >= 16 && c->max_varyings >= 14 && c->max_texture_units >= 16 && c->max_color_targets >= 8))
+    return c->max_texture_units >= 16 && c->max_color_targets >= 4 && c->max_varyings >= 8 ? D3D_FEATURE_LEVEL_9_3 : D3D_FEATURE_LEVEL_9_1;
+  if (!(c->features2 & DEV_FEATURE2_LOGIC_OPS) || !(c->features3 & DEV_FEATURE3_FORCED_SAMPLE_COUNT) || !dev_uavs_every_stage(d)) return D3D_FEATURE_LEVEL_11_0;
+  return D3D_FEATURE_LEVEL_11_1;
 }
 
 /* Whether a format holds integers (no filtering, no blending). */
@@ -242,7 +256,7 @@ static void format_uav_support(const Dev *dev, DXGI_FORMAT format, D3D12_FORMAT_
            D3D12_FORMAT_SUPPORT2_UAV_ATOMIC_EXCHANGE | D3D12_FORMAT_SUPPORT2_UAV_ATOMIC_SIGNED_MIN_OR_MAX | D3D12_FORMAT_SUPPORT2_UAV_ATOMIC_UNSIGNED_MIN_OR_MAX;
 }
 
-/* What the device can do: Direct3D 12 on feature level 11_0 with the tiers at their lowest. The limits that are lower than the levels' (texture units, vertex attributes, ...) are
+/* What the device can do: Direct3D 12 at the adapter's feature level (dev_feature_level) with the tiers the kernel's device has. The limits that are lower than the levels' (texture units, vertex attributes, ...) are
  * those of the kernel's pipeline model: docs/win32k/Dxg.md and d3d12.c say which. */
 static HRESULT STDMETHODCALLTYPE dev_CheckFeatureSupport(Dev *This, D3D12_FEATURE feature, void *data, UINT size) {
   if (!data) return E_INVALIDARG;
@@ -251,6 +265,7 @@ static HRESULT STDMETHODCALLTYPE dev_CheckFeatureSupport(Dev *This, D3D12_FEATUR
       D3D12_FEATURE_DATA_D3D12_OPTIONS *o = data;
       if (size != sizeof *o) return E_INVALIDARG;
       memset(o, 0, sizeof *o);
+      /* (tier 1: the kernel's pipelines bind 16 texture units and samplers a stage - tier 2's full heap of views and 2048 samplers are not there: dev_feature_level) */
       o->ResourceBindingTier = D3D12_RESOURCE_BINDING_TIER_1;
       /* (typed loads of every format a typed unordered access view can have: the kernel's storage images and typed views of buffers read them all) */
       o->TypedUAVLoadAdditionalFormats = (This->caps.features2 & (DEV_FEATURE2_STORAGE_IMAGES | DEV_FEATURE2_TEXEL_BUFFERS)) == (DEV_FEATURE2_STORAGE_IMAGES | DEV_FEATURE2_TEXEL_BUFFERS);
@@ -264,6 +279,8 @@ static HRESULT STDMETHODCALLTYPE dev_CheckFeatureSupport(Dev *This, D3D12_FEATUR
       o->OutputMergerLogicOp = (This->caps.features2 & DEV_FEATURE2_LOGIC_OPS) ? TRUE : FALSE;
       /* (the CPU renderer takes the layer and viewport from a vertex or domain shader itself; no geometry shader is put in for it) */
       o->VPAndRTArrayIndexFromAnyShaderFeedingRasterizerSupportedWithoutGSEmulation = (This->caps.features2 & DEV_FEATURE2_LAYER_ANY_STAGE) ? TRUE : FALSE;
+      /* (rasterizer ordered views: the CPU renderer runs fragments in primitive order, Venus puts the pixel shader in a pixel interlock; virgl has neither) */
+      o->ROVsSupported = (This->caps.features3 & DEV_FEATURE3_ROVS) ? TRUE : FALSE;
       return S_OK;
     }
     case D3D12_FEATURE_ARCHITECTURE: {
@@ -628,7 +645,8 @@ static HRESULT STDMETHODCALLTYPE dev_CheckFeatureSupport(Dev *This, D3D12_FEATUR
       FEATURE(D3D12_FEATURE_DATA_D3D12_OPTIONS19, o);
       memset(o, 0, sizeof *o);
       o->MismatchingOutputDimensionsSupported = FALSE;
-      o->SupportedSampleCountsWithNoOutputs = 0x1 | (((This->caps.sample_counts >> 4) & 1) << 2) | (((This->caps.sample_counts >> 8) & 1) << 3) | (((This->caps.sample_counts >> 16) & 1) << 4);
+      o->SupportedSampleCountsWithNoOutputs = (This->caps.features3 & DEV_FEATURE3_FORCED_SAMPLE_COUNT) ? 0x1F      /* (the kernel's forced sample count: 1 .. 16 on a target of one sample) */
+                                              : 0x1 | (((This->caps.sample_counts >> 4) & 1) << 2) | (((This->caps.sample_counts >> 8) & 1) << 3) | (((This->caps.sample_counts >> 16) & 1) << 4);
       o->PointSamplingAddressesNeverRoundUp = This->software ? TRUE : FALSE;
       o->RasterizerDesc2Supported = TRUE;
       o->NarrowQuadrilateralLinesSupported = (This->caps.features2 & DEV_FEATURE2_LINE_MODES) ? TRUE : FALSE;

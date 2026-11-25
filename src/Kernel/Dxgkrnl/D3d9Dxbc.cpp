@@ -40,6 +40,8 @@ namespace {
 constexpr uint32_t kRegisters = 32;   // input and output registers v0 .. v31, o0 .. o31 (what Shader Model 4 and 5 have)
 constexpr uint32_t kMagic = 0x43425844, kShdr = 0x52444853, kShex = 0x58454853, kIsgn = 0x4E475349, kIsg1 = 0x31475349, kOsgn = 0x4E47534F, kOsg1 = 0x3147534F, kOsg5 = 0x3547534F;
 
+constexpr uint32_t kUavRasterizerOrdered = 1u << 17;   // (a dcl_uav_* token's D3D11_SB_RASTERIZER_ORDERED_ACCESS)
+
 enum DxbcOp : uint32_t {
   kAdd4 = 0, kBreak4 = 2, kBreakc4 = 3, kContinue4 = 7, kContinuec4 = 8, kEndloop4 = 22, kLoop4 = 48, kCall4 = 4, kCallc4 = 5, kDiscard4 = 13, kDiv4 = 14, kDp2_4 = 15, kDp3_4 = 16, kDp4_4 = 17, kElse4 = 18, kEndif4 = 21, kEq4 = 24, kExp4 = 25, kFrc4 = 26,
   kGe4 = 29, kIf4 = 31, kLog4 = 47, kLt4 = 49, kMad4 = 50, kMin4 = 51, kMax4 = 52, kCustomData4 = 53, kMov4 = 54, kMovc4 = 55, kMul4 = 56, kNe4 = 57, kNop4 = 58, kRet4 = 62,
@@ -1833,6 +1835,12 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
         else if (type == 3) ret = D3d9Program::ImageReturn::Sint;
         else if (type == 4) ret = D3d9Program::ImageReturn::Uint;
         else return status::kNotSupported;
+        // (D3D11_SB_RASTERIZER_ORDERED_ACCESS, bit 17: a rasterizer ordered view - a pixel shader's, on a device that orders them; bit 16, globally coherent, asks for what every
+        // device's storage already is)
+        if (token & kUavRasterizerOrdered) {
+          if (!pixel) return status::kInvalidParameter;
+          program->extra_features3_ |= graphics::kFeature3RasterizerOrderedViews;
+        }
         program->image_dim_[slot] = dim;
         program->image_return_[slot] = ret;
         program->image_mask_.set(slot);
@@ -1854,6 +1862,10 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
         const uint32_t slot = srv ? graphics::kMaxUavBuffers + o.index[0] : o.index[0];
         if (program->uav_kind_[slot] != D3d9Program::BufferKind::None || (!srv && program->image_mask_.test(slot))) return status::kNotSupported;
         if (structured_decl && (stride == 0 || stride > 2048 || stride % 4)) return status::kNotSupported;
+        if (!srv && (token & kUavRasterizerOrdered)) {   // (a rasterizer ordered buffer: RasterizerOrderedBuffer / ByteAddressBuffer / StructuredBuffer)
+          if (!pixel) return status::kInvalidParameter;
+          program->extra_features3_ |= graphics::kFeature3RasterizerOrderedViews;
+        }
         program->uav_kind_[slot] = structured_decl ? D3d9Program::BufferKind::Structured : D3d9Program::BufferKind::Raw;
         program->uav_stride_[slot] = stride;
         if (!compute) program->uses_graphics_storage_ = program->uses_system_values_ = true;

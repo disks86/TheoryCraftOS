@@ -41,6 +41,8 @@ bool VenusShaderModule::create() {
 }
 
 IShaderModule* VenusDevice::create_shader_module(const ShaderModuleDesc& desc) {
+  // (rasterizer ordered views: a pixel shader's, where the host has the pixel interlock)
+  if (desc.rasterizer_ordered && (desc.stage != ShaderStage::Fragment || !(info().features3 & kFeature3RasterizerOrderedViews))) return nullptr;
   void* memory = allocator_.allocate_aligned(sizeof(VenusShaderModule), alignof(VenusShaderModule));
   if (!memory) return nullptr;
   VenusShaderModule* m = new (memory) VenusShaderModule(allocator_, desc);
@@ -64,6 +66,8 @@ IPipeline* VenusDevice::create_graphics_pipeline(const GraphicsPipelineDesc& des
   // (VirglDevice's refusals: what the kernel checks against the device's limits again here)
   const DeviceLimits l = info().limits;
   if (desc.texture_count > kMaxTextureUnits || !desc.vertex_shader || !desc.fragment_shader || desc.attribute_count > kMaxVertexAttributes || desc.varying_count > l.varyings) return nullptr;
+  // (no forced sample count: Vulkan rasterizes with the attachments' samples, and the hosts' framebufferNoAttachmentsSampleCounts stop below 16 - kFeature3ForcedSampleCount is not offered)
+  if (desc.forced_samples) return nullptr;
   if (desc.vertex_shader->stage() != ShaderStage::Vertex || desc.fragment_shader->stage() != ShaderStage::Fragment) return nullptr;
   if (desc.geometry_shader && desc.geometry_shader->stage() != ShaderStage::Geometry) return nullptr;
   if (!desc.hull_shader != !desc.domain_shader) return nullptr;
@@ -481,6 +485,7 @@ bool VenusPipeline::make(Variant& v) {
       o.shared_bytes = m.desc().shared_memory_bytes;
     }
     o.ddy_up = m.desc().tgsi_gl;
+    o.pixel_interlock = m.desc().rasterizer_ordered;   // (a module with rasterizer ordered views: the device has the interlock, or it offers no kFeature3RasterizerOrderedViews)
     // The program: the module's, or (marks) its text read with the bound views' numbers.
     tgsi::Program marked(device_.allocator());
     const tgsi::Program* program = &m.program();

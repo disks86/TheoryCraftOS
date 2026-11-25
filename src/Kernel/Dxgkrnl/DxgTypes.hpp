@@ -396,6 +396,9 @@ constexpr uint32_t kPipelineStepRateTag = 0x31505453;   // 'STP1'
 // ... and how the pipeline's lines are drawn (graphics::LineMode: 0 aliased, 1 alpha-antialiased, 2 quadrilateral 1.4 pixels wide, 3 quadrilateral 1.0 wide), one word.
 constexpr uint32_t kPipelineLineTag = 0x314E494C;        // 'LIN1'
 constexpr uint32_t kPipelineLineWords = 1;
+// ... and the forced sample count (graphics::GraphicsPipelineDesc::forced_samples: 0, 1, 2, 4, 8 or 16; kFeature3ForcedSampleCount), one word.
+constexpr uint32_t kPipelineForcedSamplesTag = 0x31435346;   // 'FSC1'
+constexpr uint32_t kPipelineForcedSamplesWords = 1;
 // The escape CreatePipeline's flags word: 1 depth test, 2 depth write, 4 alpha blend, 8 the fragment shader stands in for none (PipelineDesc::stand_in_fragment).
 constexpr uint32_t kPipelineFlagStandInFragment = 8;
 
@@ -442,6 +445,7 @@ struct PipelineDesc {
   bool logic_op_enable = false;
   graphics::LogicOp logic_op = graphics::LogicOp::Noop;
   graphics::LineMode line_mode = graphics::LineMode::Aliased;   // kFeature2LineModes for the others (the tagged part kPipelineLineTag)
+  uint32_t forced_samples = 0;   // kFeature3ForcedSampleCount when not 0 (the tagged part kPipelineForcedSamplesTag; see graphics::GraphicsPipelineDesc::forced_samples)
 };
 
 // --- Presenting -----------------------------------------------------------------------

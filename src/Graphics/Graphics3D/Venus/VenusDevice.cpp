@@ -164,6 +164,8 @@ DeviceInfo VenusDevice::info() const {
   if (c.sampler_minmax) i.features2 |= kFeature2SamplerReductions;
   if (c.smooth_lines && c.rectangular_lines && c.max_line_width >= 1.4f) i.features2 |= kFeature2LineModes;
   if (c.depth_bounds) i.features2 |= kFeature2DepthBounds;
+  // (rasterizer ordered views: the fragment shader in a pixel interlock - its body between OpBeginInvocationInterlockEXT and OpEndInvocationInterlockEXT, PixelInterlockOrderedEXT)
+  if (c.pixel_interlock && c.fragment_stores_and_atomics) i.features3 |= kFeature3RasterizerOrderedViews;
   i.sample_counts = sample_counts_ & ((1u << 2) | (1u << 4) | (1u << 8));
   if (i.sample_counts) i.features |= kFeatureMultisample | kFeatureDepthResolve, i.features2 |= kFeature2ColorResolveModes;
   i.d3d_sample_order = true;   // (Vulkan's standard sample locations are Direct3D's)

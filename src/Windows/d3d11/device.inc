@@ -93,6 +93,20 @@ static void dev_uav_support(Dev *d, DXGI_FORMAT format, UINT *support1, UINT *su
                                D3D12_FORMAT_SUPPORT2_UAV_ATOMIC_EXCHANGE | D3D12_FORMAT_SUPPORT2_UAV_ATOMIC_SIGNED_MIN_OR_MAX | D3D12_FORMAT_SUPPORT2_UAV_ATOMIC_UNSIGNED_MIN_OR_MAX |
                                D3D12_FORMAT_SUPPORT2_UAV_TYPED_LOAD | D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE);
 }
+/* TypedUAVLoadAdditionalFormats: typed loads from unordered access views of every format of the list that feature levels 12_0 and up have (the three R32 formats are every
+ * level's) - true where all of them are (dev_uav_support: the formats kept as they are). */
+static BOOL dev_typed_uav_loads(Dev *d) {
+  static const DXGI_FORMAT formats[] = {DXGI_FORMAT_R32G32B32A32_FLOAT, DXGI_FORMAT_R32G32B32A32_UINT, DXGI_FORMAT_R32G32B32A32_SINT, DXGI_FORMAT_R16G16B16A16_FLOAT,
+                                        DXGI_FORMAT_R16G16B16A16_UINT, DXGI_FORMAT_R16G16B16A16_SINT, DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R8G8B8A8_UINT, DXGI_FORMAT_R8G8B8A8_SINT,
+                                        DXGI_FORMAT_R16_FLOAT, DXGI_FORMAT_R16_UINT, DXGI_FORMAT_R16_SINT, DXGI_FORMAT_R8_UNORM, DXGI_FORMAT_R8_UINT, DXGI_FORMAT_R8_SINT,
+                                        DXGI_FORMAT_R32_FLOAT, DXGI_FORMAT_R32_UINT, DXGI_FORMAT_R32_SINT};
+  for (UINT i = 0; i < sizeof formats / sizeof formats[0]; ++i) {
+    UINT support2 = 0;
+    dev_uav_support(d, formats[i], NULL, &support2);
+    if (!(support2 & D3D12_FORMAT_SUPPORT2_UAV_TYPED_LOAD)) return FALSE;
+  }
+  return TRUE;
+}
 
 static HRESULT dev_check_format(Dev *d, DXGI_FORMAT format, UINT *support);
 /* The tiers of Direct3D 12 below, as Direct3D 11's (the enumerations have the same numbers): tiled resources - Direct3D 12's tier, its tier 4 (arrays with packed levels) Direct3D
@@ -207,10 +221,10 @@ static HRESULT STDMETHODCALLTYPE dev_CheckMultisampleQualityLevels(Dev *d, DXGI_
   *levels = samples >= 1 && samples <= D3D11_MAX_MULTISAMPLE_SAMPLE_COUNT ? dev_ms_levels(d, format, samples) : 0;
   return S_OK;
 }
-/* What the device can do beyond its feature level. Every answer is what this runtime and the kernel below do: no driver command lists or concurrent creates (the runtime
- * records deferred contexts itself), no doubles, no tiled resources, conservative rasterization, rasterizer ordered views or typed unordered access loads, and no
- * CPU access to default-usage textures; ClearView, constant buffer windows (VSSetConstantBuffers1 ...) and NO_OVERWRITE maps of dynamic constant and shader resource
- * buffers are there. The structure must be the size of the feature's. */
+/* What the device can do beyond its feature level. Every answer is what this runtime and Direct3D 12 below do: no driver command lists or concurrent creates (the runtime
+ * records deferred contexts itself), no doubles; Direct3D 11.1's options (OPTIONS: ClearView, overlapping copies, constant buffer windows and parts, NO_OVERWRITE maps,
+ * Discard, forced sample counts from feature level 11_1); tiled resources, conservative rasterization, rasterizer ordered views and typed unordered access loads as Direct3D 12
+ * below has them. The structure must be the size of the feature's. */
 static HRESULT STDMETHODCALLTYPE dev_CheckFeatureSupport(Dev *d, D3D11_FEATURE feature, void *data, UINT size) {
   if (!data) return E_INVALIDARG;
 #define FEATURE_SIZE(type) do { if (size != sizeof(type)) return E_INVALIDARG; } while (0)
@@ -238,12 +252,19 @@ static HRESULT STDMETHODCALLTYPE dev_CheckFeatureSupport(Dev *d, D3D11_FEATURE f
       FEATURE_SIZE(D3D11_FEATURE_DATA_D3D11_OPTIONS);
       D3D11_FEATURE_DATA_D3D11_OPTIONS *o = data;
       memset(o, 0, size);
-      o->ClearView = TRUE;
-      o->ConstantBufferOffsetting = TRUE;
-      o->MapNoOverwriteOnDynamicConstantBuffer = TRUE;
+      /* (Discard*: what a discarded resource holds is undefined, keeping it is allowed; CopySubresourceRegion1's and UpdateSubresource1's flags are promises the copy keeps
+       * either way; ClearView; overlapping copies within a subresource, through memory - tex_copy_slow, buf_copy -; parts of constant buffers on whole constants; constant
+       * buffer windows of *SetConstantBuffers1; NO_OVERWRITE maps of dynamic constant buffers and of buffers read as shader resources; textures of any format, levels and
+       * slices shared - the NT and legacy handles of d3d12.dll) */
+      o->DiscardAPIsSeenByDriver = o->FlagsForUpdateAndCopySeenByDriver = TRUE;
+      o->ClearView = o->CopyWithOverlap = o->ConstantBufferPartialUpdate = o->ConstantBufferOffsetting = o->MapNoOverwriteOnDynamicConstantBuffer = TRUE;
       o->MapNoOverwriteOnDynamicBufferSRV = TRUE;
+      o->ExtendedResourceSharing = TRUE;
       o->OutputMergerLogicOp = dev_logic_ops(d);      /* (Direct3D 12's: the kernel's logic operations) */
-      return S_OK;      /* (ConstantBufferPartialUpdate no: UpdateSubresource of a constant buffer writes it whole) */
+      /* (ForcedSampleCount - UAV-only rendering with 1 .. 16 samples, a multisampled render target with 1 - from feature level 11_1 on, which needs the kernel's forced sample
+       * count: below it the rasterizer state takes none. No msad4 or doubles: D3D11_FEATURE_DOUBLES) */
+      o->UAVOnlyRenderingForcedSampleCount = o->MultisampleRTVWithForcedSampleCountOne = d->level >= D3D_FEATURE_LEVEL_11_1;
+      return S_OK;
     }
     case D3D11_FEATURE_ARCHITECTURE_INFO: FEATURE_SIZE(D3D11_FEATURE_DATA_ARCHITECTURE_INFO); break;      /* (not a tile-based deferred renderer) */
     case D3D11_FEATURE_D3D9_OPTIONS: {
@@ -287,6 +308,8 @@ static HRESULT STDMETHODCALLTYPE dev_CheckFeatureSupport(Dev *d, D3D11_FEATURE f
       D3D11_FEATURE_DATA_D3D11_OPTIONS2 *o = data;
       memset(o, 0, size);
       o->ConservativeRasterizationTier = dev_conservative_tier(d);
+      o->ROVsSupported = dev_rovs(d);      /* (rasterizer ordered views: Direct3D 12's - the CPU renderer and Venus) */
+      o->TypedUAVLoadAdditionalFormats = dev_typed_uav_loads(d);
       o->TiledResourcesTier = dev_tiled_tier(d);
       o->MapOnDefaultTextures = TRUE;
       o->StandardSwizzle = TRUE;
@@ -484,6 +507,7 @@ static void dev_destroy(DxObj *o) {
   if (d->blank_buffer) dx_Release(OBJ(d->blank_buffer));
   if (d->blank_uav) dx_Release(OBJ(d->blank_uav));
   if (d->root_wide) ID3D12RootSignature_Release(d->root_wide);
+  for (UINT k = 0; k < 2; ++k) if (d->root_uavs[k]) ID3D12RootSignature_Release(d->root_uavs[k]);
   for (UINT i = 0; i < d->pipeline_count; ++i) if (d->pipelines[i].state) ID3D12PipelineState_Release(d->pipelines[i].state);
   if (d->ring) ID3D12Resource_Release(d->ring);
   spares_release(d);
@@ -532,7 +556,7 @@ static HRESULT dev_start(Dev *d) {
 
   /* the one root signature: the block of constants (b0), the pixel shader's textures (t0 .. t7) and its samplers (s0 .. s7) */
   D3D12_DESCRIPTOR_RANGE views = {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, TEXTURE_SLOTS, 0, 0, 0}, samplers = {D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER, TEXTURE_SLOTS, 0, 0, 0};
-  D3D12_DESCRIPTOR_RANGE uavs = {D3D12_DESCRIPTOR_RANGE_TYPE_UAV, UAV_SLOTS, 0, 0, 0};
+  D3D12_DESCRIPTOR_RANGE uavs = {D3D12_DESCRIPTOR_RANGE_TYPE_UAV, UAV_TABLE_NARROW, 0, 0, 0};
   D3D12_ROOT_PARAMETER params[4];
   memset(params, 0, sizeof params);
   params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
@@ -566,6 +590,18 @@ static HRESULT dev_start(Dev *d) {
     hr = ID3D12Device_CreateRootSignature(d->d12, 0, ID3D10Blob_GetBufferPointer(blob), ID3D10Blob_GetBufferSize(blob), &IID_ID3D12RootSignature, (void **)&d->root_wide);
   if (blob) ID3D10Blob_Release(blob);
   if (FAILED(hr) || !d->root_wide) return FAILED(hr) ? hr : E_FAIL;
+  /* (and both with the table of UAV_SLOTS unordered access views: feature level 11_1's u0 .. u63) */
+  uavs.NumDescriptors = UAV_SLOTS;
+  for (UINT k = 0; k < 2; ++k) {
+    views.NumDescriptors = k ? SRV_SLOTS : TEXTURE_SLOTS;
+    blob = error = NULL;
+    hr = D3D12SerializeRootSignature(&rsd, D3D_ROOT_SIGNATURE_VERSION_1_0, &blob, &error);
+    if (error) ID3D10Blob_Release(error);
+    if (SUCCEEDED(hr) && blob)
+      hr = ID3D12Device_CreateRootSignature(d->d12, 0, ID3D10Blob_GetBufferPointer(blob), ID3D10Blob_GetBufferSize(blob), &IID_ID3D12RootSignature, (void **)&d->root_uavs[k]);
+    if (blob) ID3D10Blob_Release(blob);
+    if (FAILED(hr) || !d->root_uavs[k]) return FAILED(hr) ? hr : E_FAIL;
+  }
 
   /* (the indirect draws and dispatches: one command each, whose arguments are Direct3D 11's) */
   static const D3D12_INDIRECT_ARGUMENT_TYPE kinds[3] = {D3D12_INDIRECT_ARGUMENT_TYPE_DRAW, D3D12_INDIRECT_ARGUMENT_TYPE_DRAW_INDEXED, D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH};
@@ -645,17 +681,21 @@ static HRESULT dev_start(Dev *d) {
 }
 
 static volatile LONG g_feature_level_upgrade;      /* EnableFeatureLevelUpgrade (interop.inc) was called */
+/* Whether `level` names a feature level a Direct3D 11 device can be asked for (9_1 .. 12_1; 12_2 is named but is Direct3D 12's alone). */
+static BOOL d3d11_level_valid(D3D_FEATURE_LEVEL level) {
+  switch (level) {
+    case D3D_FEATURE_LEVEL_9_1: case D3D_FEATURE_LEVEL_9_2: case D3D_FEATURE_LEVEL_9_3: case D3D_FEATURE_LEVEL_10_0: case D3D_FEATURE_LEVEL_10_1: case D3D_FEATURE_LEVEL_11_0:
+    case D3D_FEATURE_LEVEL_11_1: case D3D_FEATURE_LEVEL_12_0: case D3D_FEATURE_LEVEL_12_1: case D3D_FEATURE_LEVEL_12_2: return TRUE;
+    default: return FALSE;
+  }
+}
 static HRESULT dev_create_on(IDXGIAdapter *adapter, UINT flags, const D3D_FEATURE_LEVEL *levels, UINT level_count, ID3D12Device *d12, ID3D12CommandQueue *queue, Dev **out) {
   *out = NULL;
-  D3D_FEATURE_LEVEL level = D3D_FEATURE_LEVEL_11_0;
-  if (levels && level_count) {      /* the first the program asks for that is not above what there is */
-    UINT i = 0;
-    while (i < level_count && levels[i] > D3D_FEATURE_LEVEL_11_0) ++i;
-    if (i == level_count) return DXGI_ERROR_UNSUPPORTED;
-    level = levels[i];
-  }
-  /* (EnableFeatureLevelUpgrade: a level 10 device is made at the adapter's level) */
-  if (g_feature_level_upgrade && (level == D3D_FEATURE_LEVEL_10_0 || level == D3D_FEATURE_LEVEL_10_1)) level = D3D_FEATURE_LEVEL_11_0;
+  /* (the levels asked for: the program's, or Windows' list without them - 11_0 down to 9_1, without 11_1 and the 12s, which must be asked for. A value that is no level is
+   * E_INVALIDARG) */
+  static const D3D_FEATURE_LEVEL defaults[] = {D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_10_1, D3D_FEATURE_LEVEL_10_0, D3D_FEATURE_LEVEL_9_3, D3D_FEATURE_LEVEL_9_2, D3D_FEATURE_LEVEL_9_1};
+  if (!levels || !level_count) levels = defaults, level_count = sizeof defaults / sizeof defaults[0];
+  for (UINT i = 0; i < level_count; ++i) if (!d3d11_level_valid(levels[i])) return E_INVALIDARG;
   Dev *d = mem_alloc(sizeof *d);
   if (!d) return E_OUTOFMEMORY;
   dx_init(&d->o, &dev_vtbl, g_dev_iids, dev_destroy);
@@ -663,7 +703,7 @@ static HRESULT dev_create_on(IDXGIAdapter *adapter, UINT flags, const D3D_FEATUR
   d->presenter.lpVtbl = &g_presenter_vtbl;
   d->video.lpVtbl = &vdev_vtbl;
   InitializeCriticalSection(&d->lock);
-  d->level = level;
+  d->level = D3D_FEATURE_LEVEL_11_0;      /* (until the adapter's is known: below) */
   d->flags = flags;
   if (d12) {
     ID3D12Device_AddRef(d12);
@@ -684,6 +724,15 @@ static HRESULT dev_create_on(IDXGIAdapter *adapter, UINT flags, const D3D_FEATUR
   }
   if (SUCCEEDED(hr)) hr = dev_start(d);
   if (FAILED(hr)) { dx_Release(OBJ(d)); return hr; }
+  /* (the device's level: the first the program asks for that the adapter has - Direct3D 12's feature level below, d3d12.dll's dev_feature_level) */
+  const D3D_FEATURE_LEVEL top = dev_adapter_level(d);
+  UINT i = 0;
+  while (i < level_count && levels[i] > top) ++i;
+  if (i == level_count) { dx_Release(OBJ(d)); return DXGI_ERROR_UNSUPPORTED; }
+  D3D_FEATURE_LEVEL level = levels[i];
+  /* (EnableFeatureLevelUpgrade: a level 10 device is made at 11_0) */
+  if (g_feature_level_upgrade && (level == D3D_FEATURE_LEVEL_10_0 || level == D3D_FEATURE_LEVEL_10_1)) level = D3D_FEATURE_LEVEL_11_0;
+  d->level = level;
   *out = d;
   return S_OK;
 }
