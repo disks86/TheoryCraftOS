@@ -64,10 +64,13 @@
 #define DL_MAX_INSTRUCTIONS 16384u
 #define DL_OUT_WORDS 65536u               /* the specialised program */
 #define DL_OUT_BYTES (DL_OUT_WORDS * 4u + 65536u)
-#define DL_DEPTH 8u                       /* calls inside bodies inside ... */
+#define DL_DEPTH 40u                      /* calls inside bodies inside ... (and subroutines of call / callc: 32 deep in Direct3D) */
 #define DL_TEMPS 256u                     /* the temporaries tracked (what the kernel's compiler has) */
 #define DL_FRAMES 64u
 #define DL_NONE 0xFFFFFFFFu
+#define DL_MAX_SLOT_INDEX 128u           /* t# / s# / u# / cb# numbers tracked */
+#define DL_MAX_DYNAMIC 3u                 /* indices left registers in one instruction */
+#define DL_MAX_BRANCHES 256u              /* the copies of such an instruction */
 
 typedef struct DlType {
   char name[DL_NAME];
@@ -106,9 +109,17 @@ typedef struct DlWork {
   uint32_t ins_at[DL_MAX_INSTRUCTIONS], ins_count;
   uint32_t main_end;                               /* the first body's label (or ins_count) */
   uint32_t body_first[DL_MAX_BODIES], body_end[DL_MAX_BODIES];
+  uint32_t sub_label[DL_MAX_BODIES], sub_first[DL_MAX_BODIES], sub_end[DL_MAX_BODIES], sub_count;   /* the subroutines of call / callc: label number, first instruction, end */
   uint32_t table_first[DL_MAX_TABLES], table_count[DL_MAX_TABLES], table_bodies[DL_MAX_TABLE_WORDS], table_words;
   uint32_t fp_array[DL_MAX_INTERFACES], fp_sites[DL_MAX_INTERFACES], fp_base[DL_MAX_INTERFACES], fp_declared[DL_MAX_INTERFACES];
   uint32_t temps, extra_base;
+  uint32_t max_depth;                              /* the deepest calls written (their flags' temporaries) */
+  uint32_t temps_at[8], temps_at_count;           /* where the counts of dcl_temps are in out */
+  /* the slots the program declares, by kind (constant buffers, textures, samplers, unordered access views): what an index left a register can name */
+  uint8_t declared[4][DL_MAX_SLOT_INDEX];
+  /* while an instruction with such indices is written once for each value they can have: the operand tokens (where in the words), the dimension and the index given */
+  const uint32_t *force_at[DL_MAX_DYNAMIC];
+  uint32_t force_dim[DL_MAX_DYNAMIC], force_value[DL_MAX_DYNAMIC], force_count;
   const DlInfo *info;
   const DlBinding *bind;
   uint32_t bind_count;
@@ -350,6 +361,7 @@ static void dl_track(DlWork *k, const uint32_t *ins, uint32_t length, const uint
     case DL_OP_ENDIF: case DL_OP_ENDSWITCH: case DL_OP_ENDLOOP: dl_pop(k); return;
     case DL_OP_SWITCH: dl_push(k, 1); return;
     case DL_OP_CASE: case DL_OP_DEFAULT: dl_restore(k); return;
+    case DL_OP_CALL: case DL_OP_CALLC: dl_forget_all(k); return;      /* (a subroutine may write any temporary) */
     case DL_OP_LOOP:
       if (loop_writes)
         for (uint32_t t = 0; t < DL_TEMPS; ++t) dl_forget(k, t, loop_writes[t]);
@@ -389,7 +401,21 @@ static void dl_track(DlWork *k, const uint32_t *ins, uint32_t length, const uint
       for (uint32_t c = 0; c < 4; ++c) values[c] = ins[src + 1 + c];
       have = 0xF;
     }
-    /* (copies between temporaries are not followed: fxc moves `this` straight into the registers it indexes with) */
+    if (type == DL_TYPE_TEMP && components == 2 && ((t >> 20) & 3) == 1 && ((t >> 22) & 7) == 0 && src + 1 < length && ins[src + 1] < DL_TEMPS) {
+      /* (a copy of a temporary: the components known there) */
+      const uint32_t from_temp = ins[src + 1];
+      uint32_t from_values[4];
+      for (uint32_t c = 0; c < 4; ++c) from_values[c] = k->value[from_temp][c];
+      const uint8_t from_known = k->known[from_temp];
+      for (uint32_t c = 0; c < 4; ++c) {
+        if (!(first_mask >> c & 1)) continue;
+        const uint32_t from = mode == 0 ? c : mode == 1 ? (bits >> (2 * c)) & 3 : bits & 3;
+        if (!(from_known >> from & 1)) continue;
+        k->value[first_dst][c] = from_values[from];
+        k->known[first_dst] |= (uint8_t)(1u << c);
+      }
+      return;
+    }
     if (have != 0xF) return;
     for (uint32_t c = 0; c < 4; ++c) {
       if (!(first_mask >> c & 1)) continue;
@@ -461,7 +487,9 @@ static void dl_write_operand(DlWork *k, const uint32_t *w, uint32_t end, uint32_
     /* a temporary's component known to be a constant, or `this` itself: the index is that constant */
     uint32_t constant = 0;
     int folded = 0;
-    if (rep != 4 && (s & 3) == 2 && ((s >> 20) & 3) == 1 && ((s >> 22) & 7) == 0 && !(s >> 31)) {
+    for (uint32_t f = 0; f < k->force_count; ++f)
+      if (k->force_at[f] == w + *at && k->force_dim[f] == i) constant = k->force_value[f] - imm, folded = 1;
+    if (!folded && rep != 4 && (s & 3) == 2 && ((s >> 20) & 3) == 1 && ((s >> 22) & 7) == 0 && !(s >> 31)) {
       const uint32_t c = dl_first_component(s), number = w[sub_at + 1];
       if (((s >> 12) & 0xFF) == DL_TYPE_TEMP && number < DL_TEMPS && (k->known[number] >> c & 1)) constant = k->value[number][c], folded = 1;
       else if (((s >> 12) & 0xFF) == DL_TYPE_THIS && self) constant = self[c], folded = 1;
@@ -519,7 +547,111 @@ static void dl_emit_set(DlWork *k, uint32_t temp, uint32_t c, uint32_t v) {
   dl_finish(k, start, NULL);
 }
 
-static void dl_write_range(DlWork *k, uint32_t first, uint32_t end, const uint32_t *self, uint32_t depth);
+static void dl_write_range(DlWork *k, uint32_t first, uint32_t end, const uint32_t *self, uint32_t depth, int sub);
+
+/* The count of a dcl_temps: written when the program is done (the program's own, the one for indices left registers, one for each depth of calls used). */
+static void dl_temps_count(DlWork *k) {
+  if (k->temps_at_count >= 8) { k->status = DL_UNSUPPORTED; return; }
+  k->temps_at[k->temps_at_count++] = k->out_count;
+  dl_out(k, 0);
+}
+
+/* ---- indices left registers ---------------------------------------------------------------------------------------------------------------------- */
+
+/* The kind of slot an operand type names when its first index is a slot number the kernel needs as a constant: 0 constant buffer (cb#[...]), 1 texture,
+ * 2 sampler, 3 unordered access view; -1 for the others (a relative index the kernel takes: the element of a constant buffer, the immediate buffer, ...). */
+static int dl_slot_kind(uint32_t type, uint32_t dims) {
+  if (type == 8 && dims == 2) return 0;
+  if (type == 7 && dims == 1) return 1;
+  if (type == 6 && dims == 1) return 2;
+  if (type == 30 && dims == 1) return 3;
+  return -1;
+}
+
+typedef struct DlDynamic {
+  const uint32_t *token;     /* the operand */
+  uint32_t kind;             /* dl_slot_kind */
+  uint32_t imm;              /* the index is imm + the register's component */
+  uint32_t temp, component;  /* (-1 temp: `this`, not possible here) */
+} DlDynamic;
+
+/* The operands of an instruction whose slot index is a register that is not known to hold a constant there (DL_MAX_DYNAMIC at most: more is DL_UNSUPPORTED). */
+static uint32_t dl_dynamic_operands(DlWork *k, const uint32_t *ins, uint32_t length, const uint32_t *self, DlDynamic *out) {
+  uint32_t n = 0, at = 1;
+  for (uint32_t ext = ins[0]; ext >> 31 && at < length;) ext = ins[at++];
+  while (at < length) {
+    const uint32_t words = dl_operand_length(ins, length, at, 0);
+    if (!words) return 0;
+    const uint32_t t = ins[at];
+    const int kind = dl_slot_kind((t >> 12) & 0xFF, (t >> 20) & 3);
+    const uint32_t rep = (t >> 22) & 7;
+    if (kind >= 0 && (rep == 2 || rep == 3)) {
+      uint32_t o = at + 1;
+      for (uint32_t ext = t; ext >> 31 && o < length;) ext = ins[o++];
+      const uint32_t imm = rep == 3 ? ins[o] : 0, sub_at = rep == 3 ? o + 1 : o;
+      const uint32_t sub = sub_at < length ? ins[sub_at] : 0;
+      int known = 0;
+      if (sub_at + 1 < length && (sub & 3) == 2 && ((sub >> 20) & 3) == 1 && ((sub >> 22) & 7) == 0 && !(sub >> 31)) {
+        const uint32_t c = dl_first_component(sub), number = ins[sub_at + 1], type = (sub >> 12) & 0xFF;
+        if (type == DL_TYPE_THIS && self) known = 1;
+        else if (type == DL_TYPE_TEMP && number < DL_TEMPS && (k->known[number] >> c & 1)) known = 1;
+        else if (type == DL_TYPE_TEMP && number < DL_TEMPS && dl_operand_length(ins, length, sub_at, 0) == 2) {
+          if (n >= DL_MAX_DYNAMIC) { k->status = DL_UNSUPPORTED; return 0; }
+          out[n].token = ins + at, out[n].kind = (uint32_t)kind, out[n].imm = imm, out[n].temp = number, out[n].component = c;
+          ++n;
+          known = 1;
+        }
+      }
+      if (!known) { k->status = DL_UNSUPPORTED; return 0; }      /* (an index the kernel cannot take and nothing here can make one) */
+    }
+    at += words;
+  }
+  return n;
+}
+
+/* The instruction (from the source words) written once for every combination of the values its dynamic slot indices can have (the slots the program
+ * declares), each inside `if` the copied registers are those values. The registers are copied first (rX.x, .y, .w: the instruction may write them); rX.z
+ * is the test. An index that names no declared slot leaves the instruction out (Direct3D says such an index is undefined). */
+static void dl_write_instruction(DlWork *k, const uint32_t *ins, uint32_t length, const uint32_t *self, const uint8_t *loop_writes);
+static void dl_write_branches(DlWork *k, const uint32_t *ins, uint32_t length, const uint32_t *self, const DlDynamic *d, uint32_t count, uint32_t level) {
+  static const uint32_t copy_component[DL_MAX_DYNAMIC] = {0, 1, 3};
+  const uint32_t x = k->extra_base;
+  if (level == count) {
+    dl_write_instruction(k, ins, length, self, NULL);
+    return;
+  }
+  for (uint32_t v = 0; v < DL_MAX_SLOT_INDEX && k->status == DL_OK; ++v) {
+    if (!k->declared[d[level].kind][v]) continue;
+    const uint32_t start = k->out_count;
+    dl_out(k, DL_OP_IEQ);
+    dl_out(k, dl_temp_mask(2));
+    dl_out(k, x);
+    dl_out(k, dl_temp_select(copy_component[level]));
+    dl_out(k, x);
+    dl_out(k, 0x00004001u);
+    dl_out(k, v - d[level].imm);
+    dl_finish(k, start, NULL);
+    dl_emit_test(k, DL_OP_IF, x, 2);
+    k->force_at[k->force_count] = d[level].token;
+    k->force_dim[k->force_count] = 0;
+    k->force_value[k->force_count] = v;
+    ++k->force_count;
+    dl_write_branches(k, ins, length, self, d, count, level + 1);
+    --k->force_count;
+    dl_emit0(k, DL_OP_ENDIF, NULL);
+  }
+}
+
+/* An instruction of the source written out (its operands through dl_write_operand). */
+static void dl_write_instruction(DlWork *k, const uint32_t *ins, uint32_t length, const uint32_t *self, const uint8_t *loop_writes) {
+  const uint32_t start = k->out_count;
+  uint32_t o = 1;
+  for (uint32_t ext = ins[0]; ext >> 31 && o < length;) ext = ins[o++];
+  for (uint32_t n = 0; n < o; ++n) dl_out(k, ins[n]);
+  while (o < length && k->status == DL_OK) dl_write_operand(k, ins, length, &o, self, 0);
+  dl_finish(k, start, loop_writes);
+}
+
 
 /* A call through slot `slot`, call site `site`: the body its instance calls, inlined. */
 static void dl_call_slot(DlWork *k, uint32_t fp, uint32_t slot, uint32_t site, uint32_t depth) {
@@ -535,7 +667,7 @@ static void dl_call_slot(DlWork *k, uint32_t fp, uint32_t slot, uint32_t site, u
   const uint32_t body = k->table_bodies[k->table_first[table] + site];
   if (body >= DL_MAX_BODIES || k->body_first[body] == DL_NONE) { k->status = DL_INVALID; return; }
   if (depth >= DL_DEPTH) { k->status = DL_UNSUPPORTED; return; }
-  dl_write_range(k, k->body_first[body], k->body_end[body], b->this_values, depth + 1);
+  dl_write_range(k, k->body_first[body], k->body_end[body], b->this_values, depth + 1, 0);
 }
 
 /* fcall fp#[index][site] */
@@ -570,7 +702,7 @@ static void dl_write_fcall(DlWork *k, const uint32_t *ins, uint32_t length, uint
     if (index < k->fp_array[fp]) dl_call_slot(k, fp, k->fp_base[fp] + index, site, depth);
     return;      /* (outside the array: undefined, nothing is called) */
   }
-  const uint32_t scratch = k->extra_base + depth;
+  const uint32_t scratch = k->extra_base + 1 + depth;
   {
     const uint32_t start = k->out_count;
     dl_out(k, DL_OP_MOV);
@@ -596,11 +728,40 @@ static void dl_write_fcall(DlWork *k, const uint32_t *ins, uint32_t length, uint
   }
 }
 
+/* call l# / callc_z / callc_nz c, l#: the subroutine inlined (inside if_z / if_nz c), with the `this` of the body it is called from. Direct3D has no
+ * recursion: calls deeper than DL_DEPTH can only be one (DL_INVALID). */
+static void dl_write_call(DlWork *k, const uint32_t *ins, uint32_t length, const uint32_t *self, uint32_t depth) {
+  uint32_t at = 1;
+  for (uint32_t ext = ins[0]; ext >> 31 && at < length;) ext = ins[at++];
+  const int conditional = (ins[0] & 0x7FF) == DL_OP_CALLC;
+  const uint32_t condition_at = at;
+  if (conditional) {
+    const uint32_t n = dl_operand_length(ins, length, at, 0);
+    if (!n) { k->status = DL_INVALID; return; }
+    at += n;
+  }
+  if (length < 2 || at != length - 2 || ins[at] != 0x0010A000u) { k->status = DL_INVALID; return; }
+  uint32_t sub = DL_NONE;
+  for (uint32_t n = 0; n < k->sub_count; ++n)
+    if (k->sub_label[n] == ins[at + 1]) sub = n;
+  if (sub == DL_NONE || depth + 1 >= DL_DEPTH) { k->status = DL_INVALID; return; }
+  if (conditional) {
+    const uint32_t start = k->out_count;
+    dl_out(k, DL_OP_IF | (ins[0] & (1u << 18)));
+    uint32_t o = condition_at;
+    dl_write_operand(k, ins, length, &o, self, 0);
+    dl_finish(k, start, NULL);
+  }
+  dl_write_range(k, k->sub_first[sub], k->sub_end[sub], self, depth + 1, 1);
+  if (conditional) dl_emit0(k, DL_OP_ENDIF, NULL);
+}
+
 /* The source instructions first .. end - 1: written out with their fcalls inlined. In a body (`self` given) a return leaves the body: the last one is
  * left out, the others break out of the loop the body is wrapped in (and of the loops and switches inside it, through the flag in rT.x). */
-static void dl_write_range(DlWork *k, uint32_t first, uint32_t end, const uint32_t *self, uint32_t depth) {
-  const int body = self != NULL;
-  const uint32_t flag_temp = k->extra_base + depth;      /* (x: returned) */
+static void dl_write_range(DlWork *k, uint32_t first, uint32_t end, const uint32_t *self, uint32_t depth, int sub) {
+  const int body = self != NULL || sub;      /* (a body or a subroutine: a return leaves it) */
+  const uint32_t flag_temp = k->extra_base + 1 + depth;      /* (x: returned) */
+  if (depth > k->max_depth) k->max_depth = depth;
   int wrap = 0, flag = 0;
   if (body) {
     int nest = 0;
@@ -622,14 +783,15 @@ static void dl_write_range(DlWork *k, uint32_t first, uint32_t end, const uint32
     if (!k->temps_declared && !dl_is_declaration(op)) {
       /* (a program without temporaries gets those of the calls before its first instruction) */
       dl_out(k, DL_OP_DCL_TEMPS | 2u << 24);
-      dl_out(k, k->extra_base + DL_DEPTH + 1);
+      dl_temps_count(k);
       k->temps_declared = 1;
     }
     if (op == DL_OP_FCALL) { dl_write_fcall(k, ins, length, depth); continue; }
+    if (op == DL_OP_CALL || op == DL_OP_CALLC) { dl_write_call(k, ins, length, self, depth); continue; }
     if (op == DL_OP_DCL_TEMPS) {
       if (length != 2) { k->status = DL_INVALID; return; }
       dl_out(k, ins[0]);
-      dl_out(k, k->extra_base + DL_DEPTH + 1);
+      dl_temps_count(k);
       continue;
     }
     if (dl_is_declaration(op)) {
@@ -664,12 +826,33 @@ static void dl_write_range(DlWork *k, uint32_t first, uint32_t end, const uint32
       }
       dl_range_writes(k, i + 1, close, loop_writes);
     }
-    const uint32_t start = k->out_count;
-    uint32_t o = 1;
-    for (uint32_t ext = ins[0]; ext >> 31 && o < length;) ext = ins[o++];
-    for (uint32_t n = 0; n < o; ++n) dl_out(k, ins[n]);
-    while (o < length && k->status == DL_OK) dl_write_operand(k, ins, length, &o, self, 0);
-    dl_finish(k, start, op == DL_OP_LOOP ? loop_writes : NULL);
+    DlDynamic dynamic[DL_MAX_DYNAMIC];
+    const uint32_t dynamic_count = dl_dynamic_operands(k, ins, length, self, dynamic);
+    if (k->status != DL_OK) return;
+    if (dynamic_count) {
+      /* (slot indices left registers: the instruction once for each slot they can name; flow control cannot be cut up so) */
+      const int flow = op == DL_OP_IF || op == DL_OP_BREAKC || op == DL_OP_RETC || op == DL_OP_CALLC || op == DL_OP_SWITCH || op == 8 /* continuec */ || op == 13 /* discard */;
+      uint32_t branches = 1;
+      for (uint32_t n = 0; n < dynamic_count; ++n) {
+        uint32_t slots = 0;
+        for (uint32_t v = 0; v < DL_MAX_SLOT_INDEX; ++v) slots += k->declared[dynamic[n].kind][v];
+        branches *= slots ? slots : 1;
+      }
+      if (flow || branches > DL_MAX_BRANCHES) { k->status = DL_UNSUPPORTED; return; }
+      static const uint32_t copy_component[DL_MAX_DYNAMIC] = {0, 1, 3};
+      for (uint32_t n = 0; n < dynamic_count; ++n) {
+        const uint32_t start = k->out_count;
+        dl_out(k, DL_OP_MOV);
+        dl_out(k, dl_temp_mask(copy_component[n]));
+        dl_out(k, k->extra_base);
+        dl_out(k, dl_temp_select(dynamic[n].component));
+        dl_out(k, dynamic[n].temp);
+        dl_finish(k, start, NULL);
+      }
+      dl_write_branches(k, ins, length, self, dynamic, dynamic_count, 0);
+      continue;
+    }
+    dl_write_instruction(k, ins, length, self, op == DL_OP_LOOP ? loop_writes : NULL);
     if (body) {
       if (op == DL_OP_LOOP || op == DL_OP_SWITCH) ++nest;
       if (op == DL_OP_ENDLOOP || op == DL_OP_ENDSWITCH) {
@@ -713,7 +896,10 @@ static int dl_specialise(const uint8_t *dxbc, size_t size, const DlInfo *info, c
   k->ins_count = 0;
   k->main_end = DL_NONE;
   k->temps = 0;
-  uint32_t open_body = DL_NONE;
+  k->sub_count = 0;
+  k->force_count = 0;
+  memset(k->declared, 0, sizeof k->declared);
+  uint32_t open_body = DL_NONE, open_sub = DL_NONE;
   for (uint32_t at = 0; at < k->words;) {
     const uint32_t length = dl_ins_length(k->w, k->words, at);
     if (!length) return DL_INVALID;
@@ -721,15 +907,24 @@ static int dl_specialise(const uint8_t *dxbc, size_t size, const DlInfo *info, c
     const uint32_t *ins = k->w + at;
     const uint32_t op = ins[0] & 0x7FF;
     if (op == DL_OP_LABEL) {
-      if (length != 3 || ((ins[1] >> 12) & 0xFF) != DL_TYPE_FUNCTION_BODY || ins[1] != 0x00111000u) {
-        if (length == 3 && ins[1] == 0x0010A000u) return DL_UNSUPPORTED;      /* (a subroutine of call / callc: the kernel has none) */
-        return DL_INVALID;
-      }
-      if (ins[2] >= DL_MAX_BODIES || k->body_first[ins[2]] != DL_NONE) return DL_INVALID;
+      if (length != 3 || (ins[1] != 0x00111000u && ins[1] != 0x0010A000u)) return DL_INVALID;
       if (open_body != DL_NONE) k->body_end[open_body] = k->ins_count;
+      if (open_sub != DL_NONE) k->sub_end[open_sub] = k->ins_count;
+      open_body = open_sub = DL_NONE;
       if (k->main_end == DL_NONE) k->main_end = k->ins_count;
-      open_body = ins[2];
-      k->body_first[open_body] = k->ins_count + 1;
+      if (ins[1] == 0x0010A000u) {
+        /* (a subroutine of call / callc, label l#: written out after the main program as it is, with its fcalls inlined; the kernel inlines the calls) */
+        if (k->sub_count >= DL_MAX_BODIES) return DL_UNSUPPORTED;
+        open_sub = k->sub_count++;
+        for (uint32_t n = 0; n < open_sub; ++n)
+          if (k->sub_label[n] == ins[2]) return DL_INVALID;      /* (a label twice) */
+        k->sub_label[open_sub] = ins[2];
+        k->sub_first[open_sub] = k->ins_count + 1;
+      } else {
+        if (ins[2] >= DL_MAX_BODIES || k->body_first[ins[2]] != DL_NONE) return DL_INVALID;
+        open_body = ins[2];
+        k->body_first[open_body] = k->ins_count + 1;
+      }
     } else if (op == DL_OP_DCL_FUNCTION_TABLE) {
       if (length < 3 || ins[1] >= DL_MAX_TABLES || k->table_count[ins[1]] || ins[2] != length - 3 || ins[2] == 0) return DL_INVALID;
       if (ins[2] > DL_MAX_TABLE_WORDS - k->table_words) return DL_UNSUPPORTED;
@@ -745,11 +940,19 @@ static int dl_specialise(const uint8_t *dxbc, size_t size, const DlInfo *info, c
     } else if (op == DL_OP_DCL_TEMPS) {
       if (length != 2) return DL_INVALID;
       k->temps = ins[1];
+    } else if (op == 89 || op == 88 || op == 161 || op == 162 || op == 90 || (op >= 156 && op <= 158)) {
+      /* dcl_constantbuffer / dcl_resource* / dcl_sampler / dcl_uav_*: the slot is the first index of the first operand */
+      if (length >= 3) {
+        const int kind = op == 89 ? 0 : op == 90 ? 2 : (op >= 156 && op <= 158) ? 3 : 1;
+        const uint32_t slot = ins[2];
+        if (slot < DL_MAX_SLOT_INDEX && (((ins[1] >> 22) & 7) == 0)) k->declared[kind][slot] = 1;
+      }
     }
     k->ins_at[k->ins_count++] = at;
     at += length;
   }
   if (open_body != DL_NONE) k->body_end[open_body] = k->ins_count;
+  if (open_sub != DL_NONE) k->sub_end[open_sub] = k->ins_count;
   if (k->main_end == DL_NONE) k->main_end = k->ins_count;
   /* the interfaces' slots: fp0's first, then fp1's ... */
   uint32_t slots = 0;
@@ -760,14 +963,17 @@ static int dl_specialise(const uint8_t *dxbc, size_t size, const DlInfo *info, c
     slots += k->fp_array[fp];
   }
   if (slots != info->slot_count) return DL_INVALID;
-  if (k->temps > DL_TEMPS - 4 - DL_DEPTH) return DL_UNSUPPORTED;      /* (the kernel keeps its last three temporaries for itself) */
+  if (k->temps > DL_TEMPS - 6 - DL_DEPTH) return DL_UNSUPPORTED;      /* (the kernel keeps its last three temporaries for itself) */
   k->extra_base = k->temps;
   /* the program: its version and length, then the main program with the calls inlined */
   dl_out(k, dl_le32(code));
   dl_out(k, 0);
   k->temps_declared = k->temps != 0;
-  dl_write_range(k, 0, k->main_end, NULL, 0);
+  k->max_depth = 0;
+  k->temps_at_count = 0;
+  dl_write_range(k, 0, k->main_end, NULL, 0, 0);
   if (k->status != DL_OK) return k->status;
+  for (uint32_t n = 0; n < k->temps_at_count; ++n) k->out[k->temps_at[n]] = k->extra_base + 2 + k->max_depth;
   k->out[1] = k->out_count;
   /* the container: the parts as they were but IFCE, and the new program */
   const uint32_t parts = dl_le32(dxbc + 28);

@@ -6778,6 +6778,412 @@ static void test_fixed_state(Scene *c) {
   }
 }
 
+/* ---- shader and query gaps: subroutines and switches, input layouts against the vertex shader, pipelines without a pixel shader, stream output views' sizes,
+ * any number of open queries ------------------------------------------------------------------------------------------------------------------------------------------------ */
+
+/* A pipeline of the scene's target with `vs` / `ps` (NULL: none) and `layout`; *hr what CreateGraphicsPipelineState said. */
+static ID3D12PipelineState *gap_pipeline(Scene *c, const void *vs, SIZE_T vs_bytes, const void *ps, SIZE_T ps_bytes, const D3D12_INPUT_ELEMENT_DESC *layout, UINT elements, HRESULT *hr) {
+  D3D12_GRAPHICS_PIPELINE_STATE_DESC pd;
+  memset(&pd, 0, sizeof pd);
+  pd.pRootSignature = c->rs;
+  pd.VS.pShaderBytecode = vs;
+  pd.VS.BytecodeLength = vs_bytes;
+  pd.PS.pShaderBytecode = ps;
+  pd.PS.BytecodeLength = ps ? ps_bytes : 0;
+  pd.SampleMask = 0xFFFFFFFFu;
+  pd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+  pd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+  pd.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+  pd.InputLayout.pInputElementDescs = layout;
+  pd.InputLayout.NumElements = elements;
+  pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+  pd.NumRenderTargets = 1;
+  pd.RTVFormats[0] = DXGI_FORMAT_B8G8R8A8_UNORM;
+  pd.SampleDesc.Count = 1;
+  ID3D12PipelineState *pso = NULL;
+  *hr = ID3D12Device_CreateGraphicsPipelineState(c->dev, &pd, &IID_ID3D12PipelineState, (void **)&pso);
+  return pso;
+}
+
+static const D3D12_INPUT_ELEMENT_DESC kGapLayout[2] = {{"POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
+                                                       {"COLOR", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 12, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0}};
+
+/* The scene's triangle drawn with `pso` and the eight root constants (cb0: int4 sel, float4 a of the fixtures); the pixel at (x, y), 0xAARRGGBB. */
+static UINT32 gap_draw(Scene *c, ID3D12PipelineState *pso, const UINT32 constants[8], int x, int y) {
+  ID3D12GraphicsCommandList *list = NULL;
+  UINT32 pixel = 0;
+  if (!pso) return 0;
+  CHECK_HR(ID3D12CommandAllocator_Reset(c->allocator));
+  CHECK_HR(ID3D12Device_CreateCommandList(c->dev, 0, D3D12_COMMAND_LIST_TYPE_DIRECT, c->allocator, pso, &IID_ID3D12GraphicsCommandList, (void **)&list));
+  if (!list) return 0;
+  D3D12_VERTEX_BUFFER_VIEW vbv = {ID3D12Resource_GetGPUVirtualAddress(c->vb), 256, 28};
+  scene_begin(c, list, 1);
+  ID3D12GraphicsCommandList_SetGraphicsRootSignature(list, c->rs);
+  ID3D12GraphicsCommandList_SetGraphicsRoot32BitConstants(list, 0, 8, constants, 0);
+  ID3D12GraphicsCommandList_IASetPrimitiveTopology(list, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+  ID3D12GraphicsCommandList_IASetVertexBuffers(list, 0, 1, &vbv);
+  ID3D12GraphicsCommandList_DrawInstanced(list, 3, 1, 0, 0);
+  scene_read_target(c, list);
+  scene_run(c, list);
+  const UINT32 *pixels = NULL;
+  if (SUCCEEDED(ID3D12Resource_Map(c->readback, 0, NULL, (void **)&pixels)) && pixels) {
+    pixel = pixels[y * 64 + x];
+    ID3D12Resource_Unmap(c->readback, 0, NULL);
+  }
+  ID3D12GraphicsCommandList_Release(list);
+  return pixel;
+}
+static void gap_constants(UINT32 out[8], int s0, int s1, int s2, int s3, float a0, float a1, float a2, float a3) {
+  const int s[4] = {s0, s1, s2, s3};
+  const float a[4] = {a0, a1, a2, a3};
+  memcpy(out, s, 16);
+  memcpy(out + 4, a, 16);
+}
+
+/* Subroutines (call / label / ret of [call] switches) and switches in pixel and vertex shaders made by Microsoft's compiler (tests/data/dxbc/ps_call_switch.hlsl,
+ * ps_switch.hlsl, vs_call_switch.hlsl): what the HLSL says. */
+static void test_subroutines(Scene *c) {
+  HRESULT hr = S_OK;
+  UINT32 k[8];
+  /* (the vertex shader: vs_call_switch, which reads no matrix from the root constants the pixel shaders take their selectors from) */
+  const D3D12_INPUT_ELEMENT_DESC position[1] = {{"POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0}};
+  ID3D12PipelineState *calls = gap_pipeline(c, dx_vs_call_switch_dxbc, sizeof dx_vs_call_switch_dxbc, dx_ps_call_switch_dxbc, sizeof dx_ps_call_switch_dxbc, position, 1, &hr);
+  CHECK_HR(hr);
+  /* sel (2, 1): case 2 adds a.z to z and, with a.w > 0.5, 1 to w; (0, 2): case 0 (x + 1), then case 1 (y: a.x added until past a.y: 0.75); (-1, 1) the default: 0.5 */
+  gap_constants(k, 2, 1, 0, 0, 0.25f, 0.6f, 0.5f, 0.75f);
+  UINT32 p = gap_draw(c, calls, k, 32, 40);
+  printf("subroutines: %08x", (unsigned)p);
+  CHECK(near_colour(p, 0, 0, 128));
+  gap_constants(k, 0, 2, 0, 0, 0.25f, 0.6f, 0.5f, 0.75f);
+  p = gap_draw(c, calls, k, 32, 40);
+  printf(" %08x", (unsigned)p);
+  CHECK(near_colour(p, 255, 191, 0));
+  gap_constants(k, -1, 1, 0, 0, 0.25f, 0.6f, 0.5f, 0.75f);
+  p = gap_draw(c, calls, k, 32, 40);
+  printf(" %08x", (unsigned)p);
+  CHECK(near_colour(p, 128, 128, 128));
+  ID3D12PipelineState *switches = gap_pipeline(c, dx_vs_call_switch_dxbc, sizeof dx_vs_call_switch_dxbc, dx_ps_switch_dxbc, sizeof dx_ps_switch_dxbc, position, 1, &hr);
+  CHECK_HR(hr);
+  /* (1, 1, 0, 7): a break inside an if of case 1 (y + 3), x + 0.25 after the switch, then the switch on 7 (z + 100); (4, 1): a return inside a case (9s) or w + 10 */
+  gap_constants(k, 1, 1, 0, 7, 0.75f, 0.25f, 0.75f, 0.75f);
+  p = gap_draw(c, switches, k, 32, 40);
+  printf(" | switches: %08x", (unsigned)p);
+  CHECK(near_colour(p, 64, 255, 255));
+  gap_constants(k, 4, 1, 0, 0, 0.75f, 0.25f, 0.75f, 0.75f);
+  p = gap_draw(c, switches, k, 32, 40);
+  printf(" %08x", (unsigned)p);
+  CHECK(near_colour(p, 255, 255, 255));
+  gap_constants(k, 4, 1, 0, 0, 0.75f, 0.25f, 0.25f, 0.75f);
+  p = gap_draw(c, switches, k, 32, 40);
+  printf(" %08x", (unsigned)p);
+  CHECK(near_colour(p, 64, 0, 0));
+  /* a vertex shader's: TEXCOORD0 red for case 0, blue for the default */
+  ID3D12PipelineState *vertex_calls = gap_pipeline(c, dx_vs_call_switch_dxbc, sizeof dx_vs_call_switch_dxbc, dx_ps_texcoord0_dxbc, sizeof dx_ps_texcoord0_dxbc, position, 1, &hr);
+  CHECK_HR(hr);
+  gap_constants(k, 0, 0, 0, 0, 0, 0, 0, 0);
+  p = gap_draw(c, vertex_calls, k, 32, 40);
+  printf(" | vertex %08x", (unsigned)p);
+  CHECK(near_colour(p, 255, 0, 0));
+  gap_constants(k, 5, 0, 0, 0, 0, 0, 0, 0);
+  p = gap_draw(c, vertex_calls, k, 32, 40);
+  printf(" %08x\n", (unsigned)p);
+  CHECK(near_colour(p, 0, 0, 255));
+  if (calls) ID3D12PipelineState_Release(calls);
+  if (switches) ID3D12PipelineState_Release(switches);
+  if (vertex_calls) ID3D12PipelineState_Release(vertex_calls);
+}
+
+/* The input layout against the vertex shader's input signature (tests/data/dxbc/vs_layout_sig.hlsl: POSITION, TEXCOORD3, BLENDINDICES read, COLOR declared and not read,
+ * SV_VertexID and SV_InstanceID): CreateGraphicsPipelineState says E_INVALIDARG for an input the shader reads that the layout has not, takes elements it has no input for. */
+static void test_layout_signature(Scene *c) {
+  HRESULT hr = S_OK;
+  const D3D12_INPUT_ELEMENT_DESC full[3] = {{"POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
+                                            {"TEXCOORD", 3, DXGI_FORMAT_R32G32_FLOAT, 0, 12, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
+                                            {"BLENDINDICES", 0, DXGI_FORMAT_R8G8B8A8_UINT, 0, 20, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0}};
+  ID3D12PipelineState *pso = gap_pipeline(c, dx_vs_layout_sig_dxbc, sizeof dx_vs_layout_sig_dxbc, dx_ps_texcoord0_dxbc, sizeof dx_ps_texcoord0_dxbc, full, 3, &hr);
+  CHECK(hr == S_OK && pso);
+  if (pso) {
+    UINT32 k[8] = {0};
+    const UINT32 p = gap_draw(c, pso, k, 32, 40);
+    printf("layout with what the shader reads: %08x\n", (unsigned)p);
+    CHECK((p & 0xFFFFFF) != 0);
+    ID3D12PipelineState_Release(pso);
+  }
+  pso = gap_pipeline(c, dx_vs_layout_sig_dxbc, sizeof dx_vs_layout_sig_dxbc, dx_ps_texcoord0_dxbc, sizeof dx_ps_texcoord0_dxbc, full, 2, &hr);
+  CHECK(hr == E_INVALIDARG && !pso);      /* (BLENDINDICES missing) */
+  D3D12_INPUT_ELEMENT_DESC wrong_index[3];
+  memcpy(wrong_index, full, sizeof full);
+  wrong_index[1].SemanticIndex = 2;
+  pso = gap_pipeline(c, dx_vs_layout_sig_dxbc, sizeof dx_vs_layout_sig_dxbc, dx_ps_texcoord0_dxbc, sizeof dx_ps_texcoord0_dxbc, wrong_index, 3, &hr);
+  CHECK(hr == E_INVALIDARG && !pso);      /* (TEXCOORD2 is not TEXCOORD3) */
+  /* more elements than the shader reads (the unread COLOR, NORMAL, one for a system value, one in input slot 20) and the names in other letter cases: taken */
+  const D3D12_INPUT_ELEMENT_DESC more[7] = {{"position", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
+                                            {"NORMAL", 0, DXGI_FORMAT_R32G32B32_FLOAT, 1, 0, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
+                                            {"TexCoord", 3, DXGI_FORMAT_R32G32_FLOAT, 0, D3D12_APPEND_ALIGNED_ELEMENT, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
+                                            {"BLENDINDICES", 0, DXGI_FORMAT_R8G8B8A8_UINT, 0, D3D12_APPEND_ALIGNED_ELEMENT, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
+                                            {"COLOR", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 2, 0, D3D12_INPUT_CLASSIFICATION_PER_INSTANCE_DATA, 1},
+                                            {"SV_VertexID", 0, DXGI_FORMAT_R32_UINT, 3, 0, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
+                                            {"WEIGHTS", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 20, 0, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0}};
+  pso = gap_pipeline(c, dx_vs_layout_sig_dxbc, sizeof dx_vs_layout_sig_dxbc, dx_ps_texcoord0_dxbc, sizeof dx_ps_texcoord0_dxbc, more, 7, &hr);
+  CHECK(hr == S_OK && pso);
+  /* (and it draws: TEXCOORD3 from the colour's red and green, z the bone index + the vertex number - 0 at the first vertex -, w the instance) */
+  if (pso) {
+    UINT32 k[8] = {0};
+    const UINT32 p = gap_draw(c, pso, k, 32, 40);
+    printf("layout with elements the shader does not read: %08x\n", (unsigned)p);
+    CHECK((p & 0xFFFFFF) != 0);
+    ID3D12PipelineState_Release(pso);
+  }
+  /* the elements' own checks: 33 elements, the same semantic twice, an offset off its alignment, a step rate for a per-vertex element */
+  D3D12_INPUT_ELEMENT_DESC many[33];
+  for (UINT i = 0; i < 33; ++i) {
+    D3D12_INPUT_ELEMENT_DESC e = {"TEXCOORD", i, DXGI_FORMAT_R32G32_FLOAT, 1, D3D12_APPEND_ALIGNED_ELEMENT, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0};
+    many[i] = e;
+  }
+  many[0] = full[0];
+  many[1].SemanticName = "BLENDINDICES", many[1].SemanticIndex = 0, many[1].Format = DXGI_FORMAT_R8G8B8A8_UINT;
+  pso = gap_pipeline(c, dx_vs_layout_sig_dxbc, sizeof dx_vs_layout_sig_dxbc, dx_ps_texcoord0_dxbc, sizeof dx_ps_texcoord0_dxbc, many, 32, &hr);
+  CHECK(hr == S_OK && pso);      /* (32: TEXCOORD2 .. 31 - TEXCOORD3 among them -, POSITION, BLENDINDICES) */
+  if (pso) ID3D12PipelineState_Release(pso);
+  pso = gap_pipeline(c, dx_vs_layout_sig_dxbc, sizeof dx_vs_layout_sig_dxbc, dx_ps_texcoord0_dxbc, sizeof dx_ps_texcoord0_dxbc, many, 33, &hr);
+  CHECK(hr == E_INVALIDARG && !pso);
+  D3D12_INPUT_ELEMENT_DESC twice[4];
+  memcpy(twice, full, sizeof full);
+  twice[3] = full[1];
+  twice[3].SemanticName = "texcoord";
+  twice[3].InputSlot = 1;
+  pso = gap_pipeline(c, dx_vs_layout_sig_dxbc, sizeof dx_vs_layout_sig_dxbc, dx_ps_texcoord0_dxbc, sizeof dx_ps_texcoord0_dxbc, twice, 4, &hr);
+  CHECK(hr == E_INVALIDARG && !pso);
+  /* (a per-vertex element's step rate is not looked at in Direct3D 12; a classification that is neither is wrong) */
+  D3D12_INPUT_ELEMENT_DESC odd[3];
+  memcpy(odd, full, sizeof full);
+  odd[2].InstanceDataStepRate = 1;
+  pso = gap_pipeline(c, dx_vs_layout_sig_dxbc, sizeof dx_vs_layout_sig_dxbc, dx_ps_texcoord0_dxbc, sizeof dx_ps_texcoord0_dxbc, odd, 3, &hr);
+  CHECK(hr == S_OK && pso);
+  if (pso) ID3D12PipelineState_Release(pso);
+  memcpy(odd, full, sizeof full);
+  odd[2].InputSlotClass = (D3D12_INPUT_CLASSIFICATION)2;
+  pso = gap_pipeline(c, dx_vs_layout_sig_dxbc, sizeof dx_vs_layout_sig_dxbc, dx_ps_texcoord0_dxbc, sizeof dx_ps_texcoord0_dxbc, odd, 3, &hr);
+  CHECK(hr == E_INVALIDARG && !pso);
+}
+
+/* A pipeline without a pixel shader that rasterizes: no PSInvocations (the kernel's stand-in pixel shader is not counted), the clipper's counts as with one. */
+static void test_no_pixel_shader_statistics(Scene *c) {
+  HRESULT hr = S_OK;
+  ID3D12PipelineState *none = gap_pipeline(c, dx_vs_dxbc, sizeof dx_vs_dxbc, NULL, 0, kGapLayout, 2, &hr);
+  CHECK_HR(hr);
+  D3D12_QUERY_HEAP_DESC qd = {D3D12_QUERY_HEAP_TYPE_PIPELINE_STATISTICS, 2, 0};
+  ID3D12QueryHeap *stats = NULL;
+  CHECK_HR(ID3D12Device_CreateQueryHeap(c->dev, &qd, &IID_ID3D12QueryHeap, (void **)&stats));
+  ID3D12Resource *results = make_buffer(c->dev, D3D12_HEAP_TYPE_READBACK, 256, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);
+  ID3D12GraphicsCommandList *list = NULL;
+  CHECK_HR(ID3D12CommandAllocator_Reset(c->allocator));
+  CHECK_HR(ID3D12Device_CreateCommandList(c->dev, 0, D3D12_COMMAND_LIST_TYPE_DIRECT, c->allocator, c->pso, &IID_ID3D12GraphicsCommandList, (void **)&list));
+  if (!none || !stats || !results || !list) { CHECK(0); return; }
+  scene_begin(c, list, 1);
+  scene_state(c, list, ID3D12Resource_GetGPUVirtualAddress(c->vb));
+  ID3D12GraphicsCommandList_BeginQuery(list, stats, D3D12_QUERY_TYPE_PIPELINE_STATISTICS, 0);
+  ID3D12GraphicsCommandList_DrawInstanced(list, 3, 1, 0, 0);      /* (with the pixel shader) */
+  ID3D12GraphicsCommandList_EndQuery(list, stats, D3D12_QUERY_TYPE_PIPELINE_STATISTICS, 0);
+  ID3D12GraphicsCommandList_SetPipelineState(list, none);
+  ID3D12GraphicsCommandList_BeginQuery(list, stats, D3D12_QUERY_TYPE_PIPELINE_STATISTICS, 1);
+  ID3D12GraphicsCommandList_DrawInstanced(list, 3, 1, 0, 0);      /* (without) */
+  ID3D12GraphicsCommandList_EndQuery(list, stats, D3D12_QUERY_TYPE_PIPELINE_STATISTICS, 1);
+  ID3D12GraphicsCommandList_ResolveQueryData(list, stats, D3D12_QUERY_TYPE_PIPELINE_STATISTICS, 0, 2, results, 0);
+  scene_run(c, list);
+  const D3D12_QUERY_DATA_PIPELINE_STATISTICS *s = NULL;
+  CHECK_HR(ID3D12Resource_Map(results, 0, NULL, (void **)&s));
+  if (s) {
+    printf("no pixel shader: PS invocations %llu (with one %llu), clipper %llu %llu, VS %llu\n", (unsigned long long)s[1].PSInvocations, (unsigned long long)s[0].PSInvocations,
+           (unsigned long long)s[1].CInvocations, (unsigned long long)s[1].CPrimitives, (unsigned long long)s[1].VSInvocations);
+    CHECK(s[0].PSInvocations > 600 && s[1].PSInvocations == 0);
+    CHECK(s[1].VSInvocations == 3 && s[1].IAPrimitives == 1 && s[1].CInvocations == s[0].CInvocations && s[1].CPrimitives == s[0].CPrimitives);
+    ID3D12Resource_Unmap(results, 0, NULL);
+  }
+  ID3D12GraphicsCommandList_Release(list);
+  ID3D12PipelineState_Release(none);
+  ID3D12QueryHeap_Release(stats);
+  ID3D12Resource_Release(results);
+}
+
+/* Stream output views: the writes stop at SizeInBytes (a triangle that does not fit is not written, nor any after it; the statistics count it as needed), they start
+ * after the filled size the view's BufferFilledSizeLocation holds when the draws run (what the list wrote there before them, or an earlier list's draws), and a copy of
+ * the filled size later in the list reads what the draws before it reached. */
+static void test_stream_output_sizes(Scene *c) {
+  ID3D12Device *dev = c->dev;
+  ID3D12Resource *target = make_buffer(dev, D3D12_HEAP_TYPE_DEFAULT, 256, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_STREAM_OUT);
+  ID3D12Resource *filled = make_buffer(dev, D3D12_HEAP_TYPE_DEFAULT, 16, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_STREAM_OUT);
+  ID3D12Resource *back = make_buffer(dev, D3D12_HEAP_TYPE_READBACK, 512, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);
+  D3D12_QUERY_HEAP_DESC qd = {D3D12_QUERY_HEAP_TYPE_SO_STATISTICS, 4, 0};
+  ID3D12QueryHeap *so = NULL;
+  CHECK_HR(ID3D12Device_CreateQueryHeap(dev, &qd, &IID_ID3D12QueryHeap, (void **)&so));
+  D3D12_SO_DECLARATION_ENTRY entry = {0, "COLOR", 0, 0, 4, 0};
+  UINT stride = 16;
+  D3D12_GRAPHICS_PIPELINE_STATE_DESC pd;
+  memset(&pd, 0, sizeof pd);
+  pd.pRootSignature = c->rs;
+  pd.VS.pShaderBytecode = dx_vs_dxbc;
+  pd.VS.BytecodeLength = sizeof dx_vs_dxbc;
+  pd.StreamOutput.pSODeclaration = &entry;
+  pd.StreamOutput.NumEntries = 1;
+  pd.StreamOutput.pBufferStrides = &stride;
+  pd.StreamOutput.NumStrides = 1;
+  pd.StreamOutput.RasterizedStream = D3D12_SO_NO_RASTERIZED_STREAM;
+  pd.SampleMask = 0xFFFFFFFFu;
+  pd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+  pd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+  pd.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+  pd.InputLayout.pInputElementDescs = kGapLayout;
+  pd.InputLayout.NumElements = 2;
+  pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+  pd.SampleDesc.Count = 1;
+  ID3D12PipelineState *pso = NULL;
+  CHECK_HR(ID3D12Device_CreateGraphicsPipelineState(dev, &pd, &IID_ID3D12PipelineState, (void **)&pso));
+  ID3D12GraphicsCommandList *list = NULL;
+  CHECK_HR(ID3D12CommandAllocator_Reset(c->allocator));
+  CHECK_HR(ID3D12Device_CreateCommandList(dev, 0, D3D12_COMMAND_LIST_TYPE_DIRECT, c->allocator, pso, &IID_ID3D12GraphicsCommandList, (void **)&list));
+  ID3D12GraphicsCommandList2 *list2 = NULL;
+  if (list) ID3D12GraphicsCommandList_QueryInterface(list, &IID_ID3D12GraphicsCommandList2, (void **)&list2);
+  if (!target || !filled || !back || !so || !pso || !list || !list2) { CHECK(0); return; }
+  const D3D12_GPU_VIRTUAL_ADDRESS base = ID3D12Resource_GetGPUVirtualAddress(target), fill = ID3D12Resource_GetGPUVirtualAddress(filled);
+  D3D12_VERTEX_BUFFER_VIEW vbv = {ID3D12Resource_GetGPUVirtualAddress(c->vb), 256, 28};
+  D3D12_VIEWPORT vp = {0, 0, 64, 64, 0, 1};
+  #define SO_STATE() do { ID3D12GraphicsCommandList_SetGraphicsRootSignature(list, c->rs); ID3D12GraphicsCommandList_SetGraphicsRoot32BitConstants(list, 0, 16, kIdentity, 0); \
+    ID3D12GraphicsCommandList_RSSetViewports(list, 1, &vp); ID3D12GraphicsCommandList_IASetPrimitiveTopology(list, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST); \
+    ID3D12GraphicsCommandList_IASetVertexBuffers(list, 0, 1, &vbv); } while (0)
+  D3D12_WRITEBUFFERIMMEDIATE_PARAMETER zero = {fill, 0};
+  /* 1: a view of 32 bytes - the triangle (48) does not fit: nothing written, 0 written and 1 needed, the filled size 0 */
+  SO_STATE();
+  ID3D12GraphicsCommandList2_WriteBufferImmediate(list2, 1, &zero, NULL);
+  D3D12_STREAM_OUTPUT_BUFFER_VIEW view = {base, 32, fill};
+  ID3D12GraphicsCommandList_SOSetTargets(list, 0, 1, &view);
+  ID3D12GraphicsCommandList_BeginQuery(list, so, D3D12_QUERY_TYPE_SO_STATISTICS_STREAM0, 0);
+  ID3D12GraphicsCommandList_DrawInstanced(list, 3, 1, 0, 0);
+  ID3D12GraphicsCommandList_EndQuery(list, so, D3D12_QUERY_TYPE_SO_STATISTICS_STREAM0, 0);
+  ID3D12GraphicsCommandList_CopyBufferRegion(list, back, 0, filled, 0, 8);      /* (the filled size after the draw, in the same list) */
+  /* 2: 96 bytes from the start again (the filled size set to 0 first): two of three triangles, the filled size 96 */
+  ID3D12GraphicsCommandList2_WriteBufferImmediate(list2, 1, &zero, NULL);
+  view.SizeInBytes = 96;
+  ID3D12GraphicsCommandList_SOSetTargets(list, 0, 1, &view);
+  ID3D12GraphicsCommandList_BeginQuery(list, so, D3D12_QUERY_TYPE_SO_STATISTICS_STREAM0, 1);
+  for (int k = 0; k < 3; ++k) ID3D12GraphicsCommandList_DrawInstanced(list, 3, 1, 0, 0);
+  ID3D12GraphicsCommandList_EndQuery(list, so, D3D12_QUERY_TYPE_SO_STATISTICS_STREAM0, 1);
+  ID3D12GraphicsCommandList_CopyBufferRegion(list, back, 8, filled, 0, 8);
+  ID3D12GraphicsCommandList_ResolveQueryData(list, so, D3D12_QUERY_TYPE_SO_STATISTICS_STREAM0, 0, 2, back, 64);
+  scene_run(c, list);
+  /* 3: another list, the view 160 bytes, its filled size left at 96: the draw goes after the two triangles (to 144) */
+  CHECK_HR(ID3D12CommandAllocator_Reset(c->allocator));
+  CHECK_HR(ID3D12GraphicsCommandList_Reset(list, c->allocator, pso));
+  SO_STATE();
+  view.SizeInBytes = 160;
+  ID3D12GraphicsCommandList_SOSetTargets(list, 0, 1, &view);
+  ID3D12GraphicsCommandList_DrawInstanced(list, 3, 1, 0, 0);
+  ID3D12GraphicsCommandList_CopyBufferRegion(list, back, 16, filled, 0, 8);
+  /* 4: the filled size written after SOSetTargets, before the draw (16): the draw starts there */
+  D3D12_WRITEBUFFERIMMEDIATE_PARAMETER sixteen = {fill, 16};
+  view.SizeInBytes = 256;
+  ID3D12GraphicsCommandList_SOSetTargets(list, 0, 1, &view);
+  ID3D12GraphicsCommandList2_WriteBufferImmediate(list2, 1, &sixteen, NULL);
+  ID3D12GraphicsCommandList_DrawInstanced(list, 3, 1, 0, 0);
+  ID3D12GraphicsCommandList_CopyBufferRegion(list, back, 24, filled, 0, 8);
+  ID3D12GraphicsCommandList_CopyBufferRegion(list, back, 256, target, 0, 256);
+  scene_run(c, list);
+  const BYTE *b = NULL;
+  CHECK_HR(ID3D12Resource_Map(back, 0, NULL, (void **)&b));
+  if (b) {
+    UINT64 sizes[4];
+    memcpy(sizes, b, 32);
+    const D3D12_QUERY_DATA_SO_STATISTICS *s = (const D3D12_QUERY_DATA_SO_STATISTICS *)(b + 64);
+    const float *f = (const float *)(b + 256);
+    printf("stream output sizes: filled %llu %llu %llu %llu, written/needed %llu/%llu %llu/%llu, at 16: %g %g %g %g, at 96: %g %g %g %g, at 144: %g\n",
+           (unsigned long long)sizes[0], (unsigned long long)sizes[1], (unsigned long long)sizes[2], (unsigned long long)sizes[3], (unsigned long long)s[0].NumPrimitivesWritten,
+           (unsigned long long)s[0].PrimitivesStorageNeeded, (unsigned long long)s[1].NumPrimitivesWritten, (unsigned long long)s[1].PrimitivesStorageNeeded, f[4], f[5], f[6], f[7],
+           f[24], f[25], f[26], f[27], f[36]);
+    CHECK(sizes[0] == 0 && sizes[1] == 96 && sizes[2] == 144 && sizes[3] == 64);
+    CHECK(s[0].NumPrimitivesWritten == 0 && s[0].PrimitivesStorageNeeded == 1 && s[1].NumPrimitivesWritten == 2 && s[1].PrimitivesStorageNeeded == 3);
+    /* (the colours of the vertices: red, green, blue; the fourth draw wrote them from 16 over the first triangle's, the third from 96) */
+    CHECK(f[4] == 1 && f[5] == 0 && f[6] == 0 && f[7] == 1 && f[8] == 0 && f[9] == 1 && f[12] == 0 && f[14] == 1);
+    CHECK(f[24] == 1 && f[25] == 0 && f[28] == 0 && f[29] == 1 && f[32] == 0 && f[34] == 1 && f[36] == 0 && f[39] == 0);
+    ID3D12Resource_Unmap(back, 0, NULL);
+  }
+  #undef SO_STATE
+  ID3D12GraphicsCommandList2_Release(list2);
+  ID3D12GraphicsCommandList_Release(list);
+  ID3D12PipelineState_Release(pso);
+  ID3D12QueryHeap_Release(so);
+  ID3D12Resource_Release(back);
+  ID3D12Resource_Release(filled);
+  ID3D12Resource_Release(target);
+}
+
+/* Any number of queries open at once in a list (here 300 occlusion queries and 40 of pipeline statistics, more than a chunk of the kernel's stream takes): each counts
+ * the draws between its BeginQuery and its EndQuery. */
+static void test_many_open_queries(Scene *c) {
+  enum { N = 300, S = 40 };
+  ID3D12Device *dev = c->dev;
+  D3D12_QUERY_HEAP_DESC qd = {D3D12_QUERY_HEAP_TYPE_OCCLUSION, N + 1, 0};
+  ID3D12QueryHeap *occlusion = NULL, *stats = NULL;
+  CHECK_HR(ID3D12Device_CreateQueryHeap(dev, &qd, &IID_ID3D12QueryHeap, (void **)&occlusion));
+  qd.Type = D3D12_QUERY_HEAP_TYPE_PIPELINE_STATISTICS, qd.Count = S;
+  CHECK_HR(ID3D12Device_CreateQueryHeap(dev, &qd, &IID_ID3D12QueryHeap, (void **)&stats));
+  ID3D12Resource *results = make_buffer(dev, D3D12_HEAP_TYPE_READBACK, (N + 1) * 8 + S * sizeof(D3D12_QUERY_DATA_PIPELINE_STATISTICS), D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);
+  ID3D12GraphicsCommandList *list = NULL;
+  CHECK_HR(ID3D12CommandAllocator_Reset(c->allocator));
+  CHECK_HR(ID3D12Device_CreateCommandList(dev, 0, D3D12_COMMAND_LIST_TYPE_DIRECT, c->allocator, c->pso, &IID_ID3D12GraphicsCommandList, (void **)&list));
+  if (!occlusion || !stats || !results || !list) { CHECK(0); return; }
+  scene_begin(c, list, 1);
+  scene_state(c, list, ID3D12Resource_GetGPUVirtualAddress(c->vb));
+  /* the samples of one draw: query N alone */
+  ID3D12GraphicsCommandList_BeginQuery(list, occlusion, D3D12_QUERY_TYPE_OCCLUSION, N);
+  ID3D12GraphicsCommandList_DrawInstanced(list, 3, 1, 0, 0);
+  ID3D12GraphicsCommandList_EndQuery(list, occlusion, D3D12_QUERY_TYPE_OCCLUSION, N);
+  /* draws 1, 2, 3 after queries 0 .. 99, 100 .. 199, 200 .. 299 (and the statistics 0 .. 39) began; queries 0 .. 149 end before draw 4, the rest after */
+  for (UINT q = 0; q < N; ++q) {
+    if (q == 200)
+      for (UINT k = 0; k < S; ++k) ID3D12GraphicsCommandList_BeginQuery(list, stats, D3D12_QUERY_TYPE_PIPELINE_STATISTICS, k);
+    ID3D12GraphicsCommandList_BeginQuery(list, occlusion, D3D12_QUERY_TYPE_OCCLUSION, q);
+    if (q % 100 == 99) ID3D12GraphicsCommandList_DrawInstanced(list, 3, 1, 0, 0);
+  }
+  for (UINT q = 0; q < 150; ++q) ID3D12GraphicsCommandList_EndQuery(list, occlusion, D3D12_QUERY_TYPE_OCCLUSION, q);
+  ID3D12GraphicsCommandList_DrawInstanced(list, 3, 1, 0, 0);
+  for (UINT q = N; q-- > 150;) ID3D12GraphicsCommandList_EndQuery(list, occlusion, D3D12_QUERY_TYPE_OCCLUSION, q);
+  for (UINT k = 0; k < S; ++k) ID3D12GraphicsCommandList_EndQuery(list, stats, D3D12_QUERY_TYPE_PIPELINE_STATISTICS, k);
+  ID3D12GraphicsCommandList_ResolveQueryData(list, occlusion, D3D12_QUERY_TYPE_OCCLUSION, 0, N + 1, results, 0);
+  ID3D12GraphicsCommandList_ResolveQueryData(list, stats, D3D12_QUERY_TYPE_PIPELINE_STATISTICS, 0, S, results, (N + 1) * 8);
+  scene_run(c, list);
+  const BYTE *r = NULL;
+  CHECK_HR(ID3D12Resource_Map(results, 0, NULL, (void **)&r));
+  if (r) {
+    const UINT64 *o = (const UINT64 *)r;
+    const UINT64 one = o[N];
+    int bad = 0;
+    for (UINT q = 0; q < N; ++q) {
+      const UINT64 want = (q < 100 ? 3 : q < 150 ? 2 : q < 200 ? 3 : 2) * one;
+      if (o[q] != want && bad++ < 4) printf("many open queries: query %u counted %llu, want %llu\n", q, (unsigned long long)o[q], (unsigned long long)want);
+    }
+    const D3D12_QUERY_DATA_PIPELINE_STATISTICS *s = (const D3D12_QUERY_DATA_PIPELINE_STATISTICS *)(r + (N + 1) * 8);
+    for (UINT k = 0; k < S; ++k)
+      if ((s[k].IAVertices != 6 || s[k].VSInvocations != 6 || s[k].PSInvocations != s[0].PSInvocations) && bad++ < 8)
+        printf("many open queries: statistics %u: IA %llu VS %llu PS %llu\n", k, (unsigned long long)s[k].IAVertices, (unsigned long long)s[k].VSInvocations, (unsigned long long)s[k].PSInvocations);
+    printf("many open queries: one draw %llu samples; first %llu, 120th %llu, 180th %llu, last %llu; statistics PS %llu\n", (unsigned long long)one, (unsigned long long)o[0],
+           (unsigned long long)o[120], (unsigned long long)o[180], (unsigned long long)o[N - 1], (unsigned long long)s[0].PSInvocations);
+    CHECK(one > 600 && bad == 0 && s[0].PSInvocations >= one * 2 && s[0].PSInvocations <= one * 3);      /* (a GPU may shade helper pixels too) */
+    ID3D12Resource_Unmap(results, 0, NULL);
+  }
+  ID3D12GraphicsCommandList_Release(list);
+  ID3D12QueryHeap_Release(occlusion);
+  ID3D12QueryHeap_Release(stats);
+  ID3D12Resource_Release(results);
+}
+
+static void test_shader_query_gaps(Scene *c) {
+  test_subroutines(c);
+  test_layout_signature(c);
+  test_no_pixel_shader_statistics(c);
+  test_stream_output_sizes(c);
+  test_many_open_queries(c);
+}
+
 /* ---- tiled resources beyond tier 1 ------------------------------------------------------------------------------------------------------------------------------------ */
 
 /* The tiles of `r` from coordinate `at` on (a run of `count` in the numbering) to heap tiles `heap_tile` on, or nowhere (NULL heap). */
@@ -7812,6 +8218,7 @@ static void test_extras(ID3D12Device *dev, ID3D12CommandQueue *queue, ID3D12Fenc
   test_formats(&c);
   test_tiled_tiers(&c);
   test_fixed_state_gaps(&c);
+  test_shader_query_gaps(&c);
 }
 
 /* ---- the interfaces after ID3D12Device and ID3D12GraphicsCommandList ---------------------------------------------------------------------------------------------------- */

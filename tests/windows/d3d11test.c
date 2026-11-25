@@ -5609,6 +5609,237 @@ done:
   if (linkage) ID3D11ClassLinkage_Release(linkage);
 }
 
+/* ---- shader and query gaps -------------------------------------------------------------------------------------------------------------------------------------------------- */
+
+/* CreateInputLayout checks the layout against the input signature of the shader given (tests/data/dxbc/vs_layout_sig.hlsl: POSITION, TEXCOORD3 and BLENDINDICES read,
+ * COLOR declared and never read, SV_VertexID and SV_InstanceID): E_INVALIDARG for an input it reads that the layout has not; elements it has no input for are fine. */
+static void test_input_layout_signature(void) {
+  const void *vs = dx_vs_layout_sig_dxbc;
+  const SIZE_T bytes = sizeof dx_vs_layout_sig_dxbc;
+  const D3D11_INPUT_ELEMENT_DESC full[3] = {{"POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0, D3D11_INPUT_PER_VERTEX_DATA, 0},
+                                            {"TEXCOORD", 3, DXGI_FORMAT_R32G32_FLOAT, 0, 12, D3D11_INPUT_PER_VERTEX_DATA, 0},
+                                            {"BLENDINDICES", 0, DXGI_FORMAT_R8G8B8A8_UINT, 0, 20, D3D11_INPUT_PER_VERTEX_DATA, 0}};
+  ID3D11InputLayout *l = NULL;
+  check(ID3D11Device_CreateInputLayout(g_device, full, 3, vs, bytes, &l) == S_OK && l, "CreateInputLayout: every input the shader reads, by semantic and index");
+  if (l) ID3D11InputLayout_Release(l), l = NULL;
+  check(ID3D11Device_CreateInputLayout(g_device, full, 3, vs, bytes, NULL) == S_FALSE, "... with no out pointer: S_FALSE (only checked)");
+  check(ID3D11Device_CreateInputLayout(g_device, full, 2, vs, bytes, &l) == E_INVALIDARG && !l, "... an input the shader reads left out: E_INVALIDARG");
+  D3D11_INPUT_ELEMENT_DESC changed[3];
+  memcpy(changed, full, sizeof full);
+  changed[1].SemanticIndex = 2;
+  check(ID3D11Device_CreateInputLayout(g_device, changed, 3, vs, bytes, &l) == E_INVALIDARG && !l, "... another semantic index: E_INVALIDARG");
+  memcpy(changed, full, sizeof full);
+  changed[0].SemanticName = "POSITIONS";
+  check(ID3D11Device_CreateInputLayout(g_device, changed, 3, vs, bytes, &l) == E_INVALIDARG && !l, "... another semantic name: E_INVALIDARG");
+  const D3D11_INPUT_ELEMENT_DESC more[7] = {{"position", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0, D3D11_INPUT_PER_VERTEX_DATA, 0},
+                                            {"NORMAL", 0, DXGI_FORMAT_R32G32B32_FLOAT, 1, 0, D3D11_INPUT_PER_VERTEX_DATA, 0},
+                                            {"TexCoord", 3, DXGI_FORMAT_R16G16_UNORM, 0, D3D11_APPEND_ALIGNED_ELEMENT, D3D11_INPUT_PER_VERTEX_DATA, 0},
+                                            {"BLENDINDICES", 0, DXGI_FORMAT_R32_FLOAT, 0, D3D11_APPEND_ALIGNED_ELEMENT, D3D11_INPUT_PER_VERTEX_DATA, 0},
+                                            {"COLOR", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 2, 0, D3D11_INPUT_PER_INSTANCE_DATA, 1},
+                                            {"SV_InstanceID", 0, DXGI_FORMAT_R32_UINT, 3, 0, D3D11_INPUT_PER_VERTEX_DATA, 0},
+                                            {"WEIGHTS", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 20, 0, D3D11_INPUT_PER_VERTEX_DATA, 0}};
+  check(ID3D11Device_CreateInputLayout(g_device, more, 7, vs, bytes, &l) == S_OK && l,
+        "... elements the shader has no input for (one in slot 20, one named like a system value), other letter cases, formats of another type and fewer components: S_OK");
+  if (l) ID3D11InputLayout_Release(l), l = NULL;
+  D3D11_INPUT_ELEMENT_DESC many[33];
+  for (UINT i = 0; i < 33; ++i) {
+    const D3D11_INPUT_ELEMENT_DESC e = {"TEXCOORD", i, DXGI_FORMAT_R32G32_FLOAT, 1, D3D11_APPEND_ALIGNED_ELEMENT, D3D11_INPUT_PER_VERTEX_DATA, 0};
+    many[i] = e;
+  }
+  many[0] = full[0];
+  many[1].SemanticName = "BLENDINDICES", many[1].SemanticIndex = 0, many[1].Format = DXGI_FORMAT_R8G8B8A8_UINT;
+  check(ID3D11Device_CreateInputLayout(g_device, many, 32, vs, bytes, &l) == S_OK && l, "... 32 elements (D3D11_IA_VERTEX_INPUT_STRUCTURE_ELEMENT_COUNT)");
+  if (l) ID3D11InputLayout_Release(l), l = NULL;
+  check(ID3D11Device_CreateInputLayout(g_device, many, 33, vs, bytes, &l) == E_INVALIDARG && !l, "... 33: E_INVALIDARG");
+  check(ID3D11Device_CreateInputLayout(g_device, full, 3, NULL, 0, &l) == E_INVALIDARG && !l, "... no shader: E_INVALIDARG");
+  const BYTE junk[64] = {'D', 'X', 'B', 'C'};
+  check(ID3D11Device_CreateInputLayout(g_device, full, 3, junk, sizeof junk, &l) == E_INVALIDARG && !l, "... a container with no input signature: E_INVALIDARG");
+  check(ID3D11Device_CreateInputLayout(g_device, NULL, 0, dx_ps_color_dxbc, sizeof dx_ps_color_dxbc, &l) == E_INVALIDARG && !l,
+        "... no elements for a shader that reads inputs: E_INVALIDARG");
+}
+
+/* Subroutines and switches of Microsoft's compiler (tests/data/dxbc/ps_call_switch.hlsl, ps_switch.hlsl, vs_call_switch.hlsl) drawn: what the HLSL says. */
+static UINT32 draw_selected(ID3D11VertexShader *vs, ID3D11PixelShader *ps, int s0, int s1, int s2, int s3, float a0, float a1, float a2, float a3) {
+  struct { int sel[4]; float a[4]; } k = {{s0, s1, s2, s3}, {a0, a1, a2, a3}};
+  ID3D11Buffer *constants = make_buffer(D3D11_BIND_CONSTANT_BUFFER, D3D11_USAGE_DEFAULT, 0, &k, sizeof k);
+  ID3D11Buffer *vertices = triangle(0.5f, 1, 1, 1);
+  begin(NULL);
+  clear(0, 0, 0);
+  bind_floats(vertices);
+  if (vs) {
+    ID3D11DeviceContext_VSSetShader(g_context, vs, NULL, 0);
+    ID3D11DeviceContext_VSSetConstantBuffers(g_context, 0, 1, &constants);
+  }
+  ID3D11DeviceContext_PSSetShader(g_context, ps, NULL, 0);
+  ID3D11DeviceContext_PSSetConstantBuffers(g_context, 0, 1, &constants);
+  ID3D11DeviceContext_Draw(g_context, 3, 0);
+  const UINT32 got = read_target() ? pixel(32, 40) : 0;
+  ID3D11DeviceContext_PSSetShader(g_context, NULL, NULL, 0);
+  if (constants) ID3D11Buffer_Release(constants);
+  if (vertices) ID3D11Buffer_Release(vertices);
+  return got;
+}
+static void test_subroutines_and_switches(void) {
+  ID3D11PixelShader *calls = NULL, *switches = NULL, *texcoord = NULL;
+  ID3D11VertexShader *vertex_calls = NULL;
+  ID3D11InputLayout *position = NULL;
+  ID3D11Device_CreatePixelShader(g_device, dx_ps_call_switch_dxbc, sizeof dx_ps_call_switch_dxbc, NULL, &calls);
+  ID3D11Device_CreatePixelShader(g_device, dx_ps_switch_dxbc, sizeof dx_ps_switch_dxbc, NULL, &switches);
+  ID3D11Device_CreatePixelShader(g_device, dx_ps_texcoord0_dxbc, sizeof dx_ps_texcoord0_dxbc, NULL, &texcoord);
+  ID3D11Device_CreateVertexShader(g_device, dx_vs_call_switch_dxbc, sizeof dx_vs_call_switch_dxbc, NULL, &vertex_calls);
+  const D3D11_INPUT_ELEMENT_DESC pos[1] = {{"POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0, D3D11_INPUT_PER_VERTEX_DATA, 0}};
+  ID3D11Device_CreateInputLayout(g_device, pos, 1, dx_vs_call_switch_dxbc, sizeof dx_vs_call_switch_dxbc, &position);
+  check(calls && switches && texcoord && vertex_calls && position, "shaders with subroutines (call / label / ret) and switches made");
+  if (calls && switches && texcoord && vertex_calls && position) {
+    UINT32 p = draw_selected(NULL, calls, 2, 1, 0, 0, 0.25f, 0.6f, 0.5f, 0.75f);
+    check(near_rgb(p, 0, 0, 128), "a [call] switch: case 2 as a subroutine that returns from inside an if");
+    p = draw_selected(NULL, calls, 0, 2, 0, 0, 0.25f, 0.6f, 0.5f, 0.75f);
+    check(near_rgb(p, 255, 191, 0), "... cases 0 and 1 in a loop (a loop with a break inside the subroutine)");
+    p = draw_selected(NULL, calls, -1, 1, 0, 0, 0.25f, 0.6f, 0.5f, 0.75f);
+    check(near_rgb(p, 128, 128, 128), "... the default");
+    p = draw_selected(NULL, switches, 1, 1, 0, 7, 0.75f, 0.25f, 0.75f, 0.75f);
+    check(near_rgb(p, 64, 255, 255), "a switch with a break inside an if of a case, then a switch of two cases");
+    p = draw_selected(NULL, switches, 4, 1, 0, 0, 0.75f, 0.25f, 0.75f, 0.75f);
+    check(near_rgb(p, 255, 255, 255), "... a return inside a case");
+    p = draw_selected(NULL, switches, 2, 1, 1, 0, 0.75f, 0.75f, 0.75f, 0.75f);
+    check(near_rgb(p, 64, 0, 255), "... a switch inside a case (its default)");
+    ID3D11DeviceContext_IASetInputLayout(g_context, position);
+    UINT32 v = 0;
+    {
+      struct { int sel[4]; float a[4]; } k = {{0, 0, 0, 0}, {0, 0, 0, 0}};
+      ID3D11Buffer *constants = make_buffer(D3D11_BIND_CONSTANT_BUFFER, D3D11_USAGE_DEFAULT, 0, &k, sizeof k);
+      ID3D11Buffer *vertices = triangle(0.5f, 1, 1, 1);
+      begin(NULL);
+      clear(0, 0, 0);
+      const UINT stride = sizeof(VertexF), offset = 0;
+      ID3D11DeviceContext_IASetInputLayout(g_context, position);
+      ID3D11DeviceContext_IASetVertexBuffers(g_context, 0, 1, &vertices, &stride, &offset);
+      ID3D11DeviceContext_VSSetShader(g_context, vertex_calls, NULL, 0);
+      ID3D11DeviceContext_VSSetConstantBuffers(g_context, 0, 1, &constants);
+      ID3D11DeviceContext_PSSetShader(g_context, texcoord, NULL, 0);
+      ID3D11DeviceContext_Draw(g_context, 3, 0);
+      v = read_target() ? pixel(32, 40) : 0;
+      k.sel[0] = 9;
+      ID3D11DeviceContext_UpdateSubresource(g_context, (ID3D11Resource *)constants, 0, NULL, &k, 0, 0);
+      clear(0, 0, 0);
+      ID3D11DeviceContext_Draw(g_context, 3, 0);
+      const UINT32 w = read_target() ? pixel(32, 40) : 0;
+      check(near_rgb(v, 255, 0, 0) && near_rgb(w, 0, 0, 255), "a vertex shader's [call] switch: case 0 and the default");
+      ID3D11DeviceContext_PSSetShader(g_context, NULL, NULL, 0);
+      if (constants) ID3D11Buffer_Release(constants);
+      if (vertices) ID3D11Buffer_Release(vertices);
+    }
+  }
+  if (calls) ID3D11PixelShader_Release(calls);
+  if (switches) ID3D11PixelShader_Release(switches);
+  if (texcoord) ID3D11PixelShader_Release(texcoord);
+  if (vertex_calls) ID3D11VertexShader_Release(vertex_calls);
+  if (position) ID3D11InputLayout_Release(position);
+}
+
+/* A draw with no pixel shader bound runs none: PSInvocations 0 (the device's stand-in is not counted), and the rest as with one. */
+static void test_no_pixel_shader_invocations(void) {
+  const D3D11_QUERY_DESC stats_desc = {D3D11_QUERY_PIPELINE_STATISTICS, 0};
+  ID3D11Query *with = NULL, *without = NULL;
+  ID3D11Device_CreateQuery(g_device, &stats_desc, &with);
+  ID3D11Device_CreateQuery(g_device, &stats_desc, &without);
+  ID3D11Buffer *vertices = triangle(0.5f, 1, 0, 0);
+  if (!with || !without || !vertices) { check(0, "queries for the draws without a pixel shader"); return; }
+  begin(NULL);
+  clear(0, 0, 0);
+  bind_floats(vertices);
+  ID3D11DeviceContext_PSSetShader(g_context, g_ps_color, NULL, 0);
+  ID3D11DeviceContext_Begin(g_context, (ID3D11Asynchronous *)with);
+  ID3D11DeviceContext_Draw(g_context, 3, 0);
+  ID3D11DeviceContext_End(g_context, (ID3D11Asynchronous *)with);
+  ID3D11DeviceContext_PSSetShader(g_context, NULL, NULL, 0);
+  ID3D11DeviceContext_Begin(g_context, (ID3D11Asynchronous *)without);
+  ID3D11DeviceContext_Draw(g_context, 3, 0);
+  ID3D11DeviceContext_End(g_context, (ID3D11Asynchronous *)without);
+  D3D11_QUERY_DATA_PIPELINE_STATISTICS a, b;
+  memset(&a, 0xFF, sizeof a);
+  memset(&b, 0xFF, sizeof b);
+  while (ID3D11DeviceContext_GetData(g_context, (ID3D11Asynchronous *)with, &a, sizeof a, 0) == S_FALSE) {}
+  while (ID3D11DeviceContext_GetData(g_context, (ID3D11Asynchronous *)without, &b, sizeof b, 0) == S_FALSE) {}
+  printf("d3d11test: (pixel shader invocations: %llu with one, %llu without; clipper %llu %llu)\n", (unsigned long long)a.PSInvocations, (unsigned long long)b.PSInvocations,
+         (unsigned long long)a.CInvocations, (unsigned long long)b.CInvocations);
+  check(a.PSInvocations > 600 && b.PSInvocations == 0 && b.VSInvocations == 3 && b.CInvocations == a.CInvocations && b.CPrimitives == a.CPrimitives,
+        "PSInvocations of a draw without a pixel shader: 0");
+  ID3D11Query_Release(with);
+  ID3D11Query_Release(without);
+  ID3D11Buffer_Release(vertices);
+}
+
+/* Dynamic linkage with a texture index the shader computes (tests/data/dxbc/ps_iface_dyn.hlsl: t[this.texture + pick]) through an interface array indexed by a register:
+ * the texture each instance and pick name. */
+static void test_dynamic_class_index(void) {
+  ID3D11ClassLinkage *linkage = NULL;
+  ID3D11VertexShader *vs = NULL;
+  ID3D11PixelShader *ps = NULL;
+  ID3D11ClassInstance *picker = NULL, *picker_b = NULL;
+  HRESULT hr = ID3D11Device_CreateClassLinkage(g_device, &linkage);
+  if (SUCCEEDED(hr)) hr = ID3D11Device_CreateVertexShader(g_device, dx_vs_vol_dxbc, sizeof dx_vs_vol_dxbc, NULL, &vs);
+  if (SUCCEEDED(hr)) hr = ID3D11Device_CreatePixelShader(g_device, dx_ps_iface_dyn_dxbc, sizeof dx_ps_iface_dyn_dxbc, linkage, &ps);
+  if (SUCCEEDED(hr)) hr = ID3D11ClassLinkage_GetClassInstance(linkage, "picker", 0, &picker);
+  if (SUCCEEDED(hr)) hr = ID3D11ClassLinkage_GetClassInstance(linkage, "picker_b", 0, &picker_b);
+  check(SUCCEEDED(hr) && picker && picker_b, "class linkage: a shader whose class indexes its textures with its own data");
+  ID3D11ShaderResourceView *views[4] = {NULL, NULL, NULL, NULL};
+  ID3D11Texture2D *textures[4] = {NULL, NULL, NULL, NULL};
+  ID3D11SamplerState *samplers[2] = {point_sampler(), point_sampler()};
+  const UINT32 texels[4] = {0xFF0000FFu, 0xFF00FF00u, 0xFFFF0000u, 0xFFFFFFFFu};      /* (R8G8B8A8: red, green, blue, white) */
+  for (UINT i = 0; i < 4; ++i) {
+    D3D11_TEXTURE2D_DESC td = {1, 1, 1, 1, DXGI_FORMAT_R8G8B8A8_UNORM, {1, 0}, D3D11_USAGE_DEFAULT, D3D11_BIND_SHADER_RESOURCE, 0, 0};
+    D3D11_SUBRESOURCE_DATA initial = {&texels[i], 4, 0};
+    if (SUCCEEDED(ID3D11Device_CreateTexture2D(g_device, &td, &initial, &textures[i]))) ID3D11Device_CreateShaderResourceView(g_device, (ID3D11Resource *)textures[i], NULL, &views[i]);
+  }
+  /* cb0: picker.pick, flat.colour; cb2 ($Globals): picker_b.pick */
+  UINT classes_data[2][4] = {{1, 0, 0, 0}, {0, 0, 0, 0}}, globals_data[4] = {1, 0, 0, 0}, params_data[4] = {0, 0, 0, 0};
+  ID3D11Buffer *classes = make_buffer(D3D11_BIND_CONSTANT_BUFFER, D3D11_USAGE_DEFAULT, 0, classes_data, sizeof classes_data);
+  ID3D11Buffer *params = make_buffer(D3D11_BIND_CONSTANT_BUFFER, D3D11_USAGE_DEFAULT, 0, params_data, sizeof params_data);
+  ID3D11Buffer *globals = make_buffer(D3D11_BIND_CONSTANT_BUFFER, D3D11_USAGE_DEFAULT, 0, globals_data, sizeof globals_data);
+  if (SUCCEEDED(hr) && views[3] && samplers[0] && samplers[1] && classes && params && globals) {
+    ID3D11DeviceContext_PSSetShaderResources(g_context, 0, 4, views);
+    ID3D11DeviceContext_PSSetSamplers(g_context, 0, 2, samplers);
+    ID3D11DeviceContext_PSSetConstantBuffers(g_context, 2, 1, &globals);
+    ID3D11ClassInstance *set[2] = {picker, picker_b};
+    const UINT32 a = draw_linked(vs, ps, set, 2, classes, params, 0);      /* picker: t[0 + 1] green */
+    const UINT32 b = draw_linked(vs, ps, set, 2, classes, params, 1);      /* picker_b: t[2 + 1] white */
+    classes_data[0][0] = 0;
+    globals_data[0] = 0;
+    ID3D11DeviceContext_UpdateSubresource(g_context, (ID3D11Resource *)classes, 0, NULL, classes_data, 0, 0);
+    ID3D11DeviceContext_UpdateSubresource(g_context, (ID3D11Resource *)globals, 0, NULL, globals_data, 0, 0);
+    const UINT32 c = draw_linked(vs, ps, set, 2, classes, params, 0);      /* t0 red */
+    const UINT32 d = draw_linked(vs, ps, set, 2, classes, params, 1);      /* t2 blue */
+    printf("d3d11test: (computed texture indices: %08x %08x %08x %08x)\n", (unsigned)a, (unsigned)b, (unsigned)c, (unsigned)d);
+    check(near_rgb(a, 0, 255, 0) && near_rgb(b, 255, 255, 255) && near_rgb(c, 255, 0, 0) && near_rgb(d, 0, 0, 255), "... the texture the instance's data names, through each slot of the array");
+    ID3D11ShaderResourceView *none[4] = {NULL, NULL, NULL, NULL};
+    ID3D11DeviceContext_PSSetShaderResources(g_context, 0, 4, none);
+    ID3D11DeviceContext_PSSetShader(g_context, NULL, NULL, 0);
+  } else {
+    check(0, "the textures, samplers and buffers of the computed texture index");
+  }
+  for (UINT i = 0; i < 4; ++i) {
+    if (views[i]) ID3D11ShaderResourceView_Release(views[i]);
+    if (textures[i]) ID3D11Texture2D_Release(textures[i]);
+  }
+  for (UINT i = 0; i < 2; ++i) if (samplers[i]) ID3D11SamplerState_Release(samplers[i]);
+  if (classes) ID3D11Buffer_Release(classes);
+  if (params) ID3D11Buffer_Release(params);
+  if (globals) ID3D11Buffer_Release(globals);
+  if (picker) ID3D11ClassInstance_Release(picker);
+  if (picker_b) ID3D11ClassInstance_Release(picker_b);
+  if (ps) ID3D11PixelShader_Release(ps);
+  if (vs) ID3D11VertexShader_Release(vs);
+  if (linkage) ID3D11ClassLinkage_Release(linkage);
+}
+
+static void test_shader_query_gaps(void) {
+  test_input_layout_signature();
+  test_subroutines_and_switches();
+  test_no_pixel_shader_invocations();
+  test_dynamic_class_index();
+}
+
 int main(void) {
   test_device();
   if (g_device && g_context) {
@@ -5646,6 +5877,7 @@ int main(void) {
       test_formats();
       test_vertex_formats();
       test_class_linkage();
+      test_shader_query_gaps();
       test_creation_and_interop();
       test_render_to_levels();
       test_fixed_state();

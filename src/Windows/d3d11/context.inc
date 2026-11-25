@@ -692,13 +692,16 @@ static void uav_textures_before(Dev *d, View *const *uavs, UINT uav_mask) {
 
 /* ---- stream output -------------------------------------------------------------------------------------------------------------------------------------- */
 
-/* The buffer d3d12.dll puts the bytes a stream output target holds into, after a list ran (an upload buffer: its memory is d3d12.dll's copy, which it writes). */
+/* The buffer d3d12.dll puts the bytes a stream output target holds into, after a list ran (an upload buffer: its memory is d3d12.dll's copy, which it writes). Each binding
+ * of a list has a slot of its own (SO_FILL_SLOTS of 16 bytes: the filled size, where the view began), its filled size 0: Direct3D 12 starts a view's writes after the
+ * filled size it has when the draws run, and the slot of an earlier binding of the list gets that binding's after its draws. */
+#define SO_FILL_SLOTS 64u
 static BOOL so_fill_buffer(Dev *d, Buf *b) {
   if (b->so_fill) return TRUE;
-  b->so_fill = make_buffer(d, D3D12_HEAP_TYPE_UPLOAD, 16);
+  b->so_fill = make_buffer(d, D3D12_HEAP_TYPE_UPLOAD, 16 * SO_FILL_SLOTS);
   if (!b->so_fill) return FALSE;
   if (FAILED(ID3D12Resource_Map(b->so_fill, 0, NULL, (void **)&b->so_fill_data)) || !b->so_fill_data) { ID3D12Resource_Release(b->so_fill); b->so_fill = NULL; return FALSE; }
-  memset(b->so_fill_data, 0, 16);
+  memset(b->so_fill_data, 0, 16 * SO_FILL_SLOTS);
   ID3D12Resource_Unmap(b->so_fill, 0, NULL);
   return TRUE;
 }
@@ -710,10 +713,13 @@ static void so_record(Dev *d, Ctx *c) {
     Buf *b = c->so_buf[slot];
     if (!b || !so_fill_buffer(d, b)) continue;
     const UINT64 at = b->so_end < b->desc.ByteWidth ? b->so_end : b->desc.ByteWidth;
+    b->so_slot = b->written == d->epoch && b->so_slot + 1 < SO_FILL_SLOTS ? b->so_slot + 1 : 0;      /* (SOSetTargets flushes before the slots run out) */
+    BYTE *fill = b->so_fill_data + 16 * b->so_slot;
     views[slot].BufferLocation = ID3D12Resource_GetGPUVirtualAddress(b->res) + at;
     views[slot].SizeInBytes = b->desc.ByteWidth - at;
-    views[slot].BufferFilledSizeLocation = ID3D12Resource_GetGPUVirtualAddress(b->so_fill);
-    memcpy(b->so_fill_data + 8, &at, 8);      /* (bytes 8 ..: where the view began, for so_collect) */
+    views[slot].BufferFilledSizeLocation = ID3D12Resource_GetGPUVirtualAddress(b->so_fill) + 16 * b->so_slot;
+    memset(fill, 0, 8);      /* (nothing written after the view's start yet) */
+    memcpy(fill + 8, &at, 8);      /* (bytes 8 ..: where the view began, for so_collect) */
     b->used = b->written = d->epoch;
     ++b->version;
     UINT k = 0;
@@ -728,8 +734,8 @@ static void so_collect(Dev *d) {
   for (UINT i = 0; i < d->so_written_count; ++i) {
     Buf *b = d->so_written[i];
     UINT64 filled = 0, began = 0;
-    memcpy(&filled, b->so_fill_data, 8);
-    memcpy(&began, b->so_fill_data + 8, 8);
+    memcpy(&filled, b->so_fill_data + 16 * b->so_slot, 8);      /* (the last binding of the list's) */
+    memcpy(&began, b->so_fill_data + 16 * b->so_slot + 8, 8);
     b->so_end = began + filled;
     unhold(b);
   }
@@ -765,6 +771,7 @@ static void STDMETHODCALLTYPE ctx_SOSetTargets(Ctx *c, UINT count, ID3D11Buffer 
     if (b && !(b->desc.BindFlags & D3D11_BIND_STREAM_OUTPUT)) b = NULL;
     if (b) {
       const UINT offset = offsets ? offsets[slot] : 0;
+      if (b->so_fill && b->written == d->epoch && b->so_slot + 1 >= SO_FILL_SLOTS) flush(d);      /* (the list has used every slot of its filled sizes) */
       if (offset == (UINT)-1) so_settle(d, b);      /* (-1: on from where its records end) */
       else b->so_end = offset;
       /* (a buffer written to is no input: its vertex, index and shader resource bindings are taken away) */

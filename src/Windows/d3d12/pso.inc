@@ -69,7 +69,7 @@ static const BYTE *dxbc_chunk(const BYTE *blob, SIZE_T size, UINT fourcc, UINT *
   return NULL;
 }
 
-typedef struct SigElement { char name[32]; UINT index, sysval, reg; } SigElement;
+typedef struct SigElement { char name[32]; UINT index, sysval, reg, read_mask; } SigElement;      /* (read_mask: the components the shader reads, of an input) */
 
 /* The elements of the input or output signature (ISGN / ISG1 or OSGN / OSG1). */
 static UINT dxbc_signature(const BYTE *blob, SIZE_T size, int output, SigElement *out, UINT capacity, int *found) {
@@ -94,6 +94,7 @@ static UINT dxbc_signature(const BYTE *blob, SIZE_T size, int output, SigElement
     el->index = rd32(e + 4);
     el->sysval = rd32(e + 8);
     el->reg = rd32(e + 16);
+    el->read_mask = e[21];
   }
   return n;
 }
@@ -226,6 +227,7 @@ struct Pso {
   UINT slots_used;             /* the vertex buffers (input slots) the layout reads, as a mask */
   DXGI_FORMAT dsv_format;
   D3D12_PRIMITIVE_TOPOLOGY_TYPE topology_type;
+  int no_pixel_shader;          /* the description has none: the kernel's pipeline gets the null one, flagged so that it is not counted as PSInvocations */
   UINT so_entries, so_rasterized, so_strides[4];
   UINT samples;                /* of the targets it draws into (1: not multisampled) */
   UINT so_entry[16][2];        /* the words of the kernel's description of each captured output */
@@ -444,6 +446,12 @@ static HRESULT make_shader(Dev *dev, const D3D12_SHADER_BYTECODE *code, UINT sta
  * sint16, half, uint32, sint32; 48 is B8G8R8A8_UNORM, 49 R10G10B10A2_UNORM, 50 R10G10B10A2_UINT, 51 R11G11B10_FLOAT and 52 B8G8R8X8_UNORM) and the bytes it takes in
  * the buffer; -1 for a format a vertex cannot have (Direct3D's IA_VERTEX_BUFFER formats are all here; B5G6R5, B5G5R5A1 and B4G4R4A4 are not among them). Formats other
  * than 32-bit floats need a device that reads them (DEV_FEATURE_VERTEX_FORMATS; the kernel refuses the pipeline on one that does not). */
+static int vertex_format(DXGI_FORMAT f, UINT *bytes);
+/* (the bytes of a vertex of the format for the input layout's checks: 0 for a format no vertex has) */
+static uint32_t layout_element_bytes(uint32_t format) {
+  UINT bytes = 0;
+  return vertex_format((DXGI_FORMAT)format, &bytes) >= 0 ? bytes : 0;
+}
 static int vertex_format(DXGI_FORMAT f, UINT *bytes) {
 #define VF(type, components, size) (*bytes = (size) * (components), (type) * 4 + (components) - 1)
   switch (f) {
@@ -610,7 +618,8 @@ static HRESULT pso_create_graphics(Dev *This, const D3D12_GRAPHICS_PIPELINE_STAT
   if (SUCCEEDED(hr)) {
     /* (a pipeline with no pixel shader - stream output without rasterizing - gets one that the kernel's pipeline needs and nothing uses) */
     D3D12_SHADER_BYTECODE null_ps = {g_null_pixel_shader, sizeof g_null_pixel_shader};
-    hr = make_shader(This, desc->PS.pShaderBytecode ? &desc->PS : &null_ps, 1, &p->shaders[1]);
+    p->no_pixel_shader = !desc->PS.pShaderBytecode || !desc->PS.BytecodeLength;
+    hr = make_shader(This, !p->no_pixel_shader ? &desc->PS : &null_ps, 1, &p->shaders[1]);
   }
   if (SUCCEEDED(hr)) hr = make_shader(This, &desc->GS, 3, &p->shaders[2]);
   if (SUCCEEDED(hr)) hr = make_shader(This, &desc->HS, 4, &p->shaders[3]);
@@ -619,33 +628,49 @@ static HRESULT pso_create_graphics(Dev *This, const D3D12_GRAPHICS_PIPELINE_STAT
   This->next_stage_base[0] = This->next_stage_base[1] = This->next_stage_base[2] = 0;
   if (FAILED(hr)) { dx_Release(OBJ(p)); return hr; }
   /* the vertex inputs: register numbers from the vertex shader's signature */
-  SigElement inputs[16], outputs[16];
+  SigElement inputs[DXL_MAX_SIGNATURE], outputs[16];
   int found = 0, found_out = 0;
-  const UINT n_in = dxbc_signature(desc->VS.pShaderBytecode, desc->VS.BytecodeLength, 0, inputs, 16, &found);
+  const UINT n_in = dxbc_signature(desc->VS.pShaderBytecode, desc->VS.BytecodeLength, 0, inputs, DXL_MAX_SIGNATURE, &found);
   const Dev *dev = This;
-  if (desc->InputLayout.NumElements > dev->caps.max_vertex_attributes || desc->InputLayout.NumElements > 16) { dx_Release(OBJ(p)); return DXGI_ERROR_UNSUPPORTED; }
+  /* The input layout, checked as the runtime checks it (src/Windows/dx_layout.h: its elements, and an element for every input the vertex shader reads): E_INVALIDARG.
+   * Elements the vertex shader has no input for are not read (and need nothing of the device). */
+  {
+    _Static_assert(sizeof(D3D12_INPUT_ELEMENT_DESC) == sizeof(DxlElement) && offsetof(D3D12_INPUT_ELEMENT_DESC, InstanceDataStepRate) == offsetof(DxlElement, step_rate), "the same layout");
+    const DxlElement *checked = (const DxlElement *)(const void *)desc->InputLayout.pInputElementDescs;      /* (the same seven fields: dx_layout.h) */
+    if (dxl_check_elements(checked, desc->InputLayout.NumElements, layout_element_bytes, DXL_RULES_D3D12) != DXL_OK ||
+        dxl_check_signature(checked, desc->InputLayout.NumElements, desc->VS.pShaderBytecode, desc->VS.BytecodeLength) != DXL_OK) {
+      dx_Release(OBJ(p));
+      return E_INVALIDARG;
+    }
+  }
   if (desc->NumRenderTargets > dev->caps.max_color_targets || desc->NumRenderTargets > 8) { dx_Release(OBJ(p)); return DXGI_ERROR_UNSUPPORTED; }
-  UINT appended[8] = {0};
+  UINT appended[DXL_MAX_SLOTS] = {0};
   for (UINT i = 0; i < desc->InputLayout.NumElements; ++i) {
     const D3D12_INPUT_ELEMENT_DESC *e = &desc->InputLayout.pInputElementDescs[i];
     UINT bytes = 0;
     const int format = vertex_format(e->Format, &bytes);
-    /* (a format no vertex has, or a classification that is neither: the description is wrong) */
-    if (format < 0 || (e->InputSlotClass != D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA && e->InputSlotClass != D3D12_INPUT_CLASSIFICATION_PER_INSTANCE_DATA)) { dx_Release(OBJ(p)); return E_INVALIDARG; }
+    /* (an appended element starts at the next multiple of its size, of four bytes at most - elements the shader does not read count too) */
+    const UINT unit = bytes >= 4 ? 4 : bytes ? bytes : 1;
+    const UINT offset = e->AlignedByteOffset == D3D12_APPEND_ALIGNED_ELEMENT ? (appended[e->InputSlot] + unit - 1) / unit * unit : e->AlignedByteOffset;
+    appended[e->InputSlot] = offset + bytes;
+    UINT location = 0xFFFFFFFFu;
+    for (UINT k = 0; k < n_in; ++k)
+      if (inputs[k].sysval == 0 && ieq(inputs[k].name, e->SemanticName) && inputs[k].index == e->SemanticIndex) {
+        location = (inputs[k].read_mask & 0xF) ? inputs[k].reg : 0xFFFFFFFEu;      /* (an input the shader declares and never reads: nothing to fetch) */
+        break;
+      }
+    if (location == 0xFFFFFFFEu || (location == 0xFFFFFFFFu && found)) continue;      /* (an element the vertex shader has no input for, or one it does not read) */
+    if (location == 0xFFFFFFFFu) location = i;      /* (a shader without a signature: the elements in order) */
+    if (p->attr_count >= dev->caps.max_vertex_attributes || p->attr_count >= 16) { dx_Release(OBJ(p)); return DXGI_ERROR_UNSUPPORTED; }
     if (e->InputSlot >= dev->caps.max_vertex_buffers || e->InputSlot >= 8 || (format > 3 && !(dev->caps.features & DEV_FEATURE_VERTEX_FORMATS))) { dx_Release(OBJ(p)); return DXGI_ERROR_UNSUPPORTED; }
     Attr *a = &p->attrs[p->attr_count++];
     a->format = (UINT)format;
     a->slot = e->InputSlot;
     a->per_instance = e->InputSlotClass == D3D12_INPUT_CLASSIFICATION_PER_INSTANCE_DATA;
     a->step_rate = a->per_instance ? e->InstanceDataStepRate : 0;      /* (0: every instance reads the draw's first; a per-vertex element's is not looked at) */
-    /* (an appended element starts at the next multiple of its size, of four bytes at most) */
-    const UINT unit = bytes >= 4 ? 4 : bytes ? bytes : 1;
-    a->offset = e->AlignedByteOffset == D3D12_APPEND_ALIGNED_ELEMENT ? (appended[e->InputSlot] + unit - 1) / unit * unit : e->AlignedByteOffset;
-    appended[e->InputSlot] = a->offset + bytes;
+    a->offset = offset;
     p->slots_used |= 1u << e->InputSlot;
-    a->location = i;
-    for (UINT k = 0; k < n_in; ++k)
-      if (ieq(inputs[k].name, e->SemanticName) && inputs[k].index == e->SemanticIndex) { a->location = inputs[k].reg; break; }
+    a->location = location;
     if (a->location >= dev->caps.max_vertex_attributes) { dx_Release(OBJ(p)); return DXGI_ERROR_UNSUPPORTED; }
   }
   /* the interpolants between the stages: the kernel counts the registers the vertex shader writes, its position included */
@@ -872,7 +897,8 @@ static UINT pso_pipeline_locked(Pso *p, const UINT strides[8], UINT stencil_ref,
   r[w++] = (p->raster.CullMode == D3D12_CULL_MODE_NONE ? 0 : p->raster.CullMode == D3D12_CULL_MODE_BACK ? 1 : 2) |
            (p->raster.ConservativeRaster == D3D12_CONSERVATIVE_RASTERIZATION_MODE_ON ? KCULL_CONSERVATIVE : 0u);      /* (the kernel's kCullConservative) */
   r[w++] = p->raster.FrontCounterClockwise ? 0 : 1;
-  r[w++] = (p->depth.DepthEnable ? 1u : 0u) | (p->depth.DepthWriteMask == D3D12_DEPTH_WRITE_MASK_ALL ? 2u : 0u) | (rt->BlendEnable ? 4u : 0u);
+  r[w++] = (p->depth.DepthEnable ? 1u : 0u) | (p->depth.DepthWriteMask == D3D12_DEPTH_WRITE_MASK_ALL ? 2u : 0u) | (rt->BlendEnable ? 4u : 0u) |
+           (p->no_pixel_shader ? 8u : 0u);      /* (8: dxgk::kPipelineFlagStandInFragment) */
   for (UINT i = 0; i < 4; ++i) {
     r[w++] = i < p->attr_count ? p->attrs[i].location : 0;
     r[w++] = i < p->attr_count ? p->attrs[i].format : 0;

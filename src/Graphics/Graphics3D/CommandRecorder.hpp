@@ -42,6 +42,7 @@ struct RecordedCommand {
   const IPipeline* pipeline = nullptr;
   IBuffer* buffer = nullptr;
   uint64_t offset = 0;
+  uint64_t end = kStreamOutputNoEnd;   // (BindStreamOutput: where the writes stop)
   IndexType index_type = IndexType::Uint16;
   uint32_t constants_offset = 0, constants_size = 0;  // into CommandRecorder::constants()
   Viewport viewport;
@@ -269,7 +270,7 @@ class CommandRecorder : public ICommandBuffer {
     c.count = x, c.first = y;
     add(c);
   }
-  void bind_stream_output(uint32_t slot, IBuffer* buffer, uint64_t offset) override {
+  void bind_stream_output(uint32_t slot, IBuffer* buffer, uint64_t offset, uint64_t end = kStreamOutputNoEnd) override {
     if (slot >= kMaxStreamOutputBuffers) {
       ok_ = false;
       return;
@@ -279,6 +280,7 @@ class CommandRecorder : public ICommandBuffer {
     c.unit = slot;
     c.buffer = buffer;
     c.offset = offset;
+    c.end = end;
     add(c);
   }
   void bind_compute_pipeline(const IPipeline* pipeline) override {

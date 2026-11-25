@@ -59,8 +59,12 @@
  *     shading) or SV_Coverage, and HighestShaderModel stays 5.1 (DXIL of 6.1 - 6.6 with SV_ViewID, SV_Barycentrics, GetAttributeAtVertex, SV_ShadingRate and IsHelperLane is
  *     taken, but the wave operations of 6.0 are not translated)
  *   - vertex elements: every Direct3D 11 input-assembler format and instance step rates (pso.inc vertex_format) where the device reads them (the CPU renderer and virgl)
- *     (queries are occlusion, binary occlusion, pipeline statistics (and 1), stream output statistics and timestamps (also on copy queues), several open at once, at
- *     most 64 per list; the size of a stream output buffer view is not looked at; ExecuteIndirect is made when the list is executed; bundles replay their calls: extras.inc)
+ *     (queries are occlusion, binary occlusion, pipeline statistics (and 1), stream output statistics and timestamps (also on copy queues), any number open at once;
+ *     stream output views stop at SizeInBytes and start after the filled size they hold when their draws run; ExecuteIndirect is made when the list is executed;
+ *     bundles replay their calls: extras.inc). A filled size is written after each chunk of the list's stream (a draw and a copy of it later in the same chunk are
+ *     put in two), not after each draw: a shader of a later draw of the chunk that reads it as a buffer sees the value before
+ *   - input layouts are checked against the vertex shader's input signature as the runtime does (src/Windows/dx_layout.h); an input the shader declares and never reads
+ *     is not looked for (not checked against Windows: kept lenient)
  *   - Shader Model 6.x features beyond what the kernel's DXIL translator reads (it reads vertex, pixel, geometry, hull, domain and compute shaders; see Dxg.md)
  * Built freestanding over kernel32.dll, gdi32.dll and dxgi.dll's interfaces with the OS's mingw compiler. */
 #define INITGUID
@@ -76,6 +80,7 @@
 #include <dxgi1_6.h>
 #include "../tcosdx.h"
 #include "../tcos_swizzle.h"
+#include "../dx_layout.h"
 
 #undef DECLSPEC_IMPORT
 #define DECLSPEC_IMPORT

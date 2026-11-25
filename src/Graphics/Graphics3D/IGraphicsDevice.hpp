@@ -616,6 +616,7 @@ constexpr uint32_t kMaxGeometryVertices = 64;   // the most a module's maximum m
 // vertices of every second one swapped as for drawing, a line strip as lines; a primitive that does not fit in a buffer is not written (nor is any after it).
 constexpr uint32_t kMaxGeometryStreams = 4, kMaxStreamOutputEntries = 16, kMaxStreamOutputBuffers = 4;
 constexpr uint64_t kStreamOutputAppend = ~uint64_t{0};   // bind_stream_output's offset for "where the buffer's last stream output ended"
+constexpr uint64_t kStreamOutputNoEnd = ~uint64_t{0};    // bind_stream_output's end for "the buffer's end"
 struct StreamOutputEntry {
   uint8_t stream = 0, output = 0, start_component = 0, component_count = 0, buffer = 0;
 };
@@ -963,6 +964,7 @@ struct GraphicsPipelineDesc {
   bool geometry_stores = false; // the geometry shader writes storage buffers (kFeatureGeometryStores)
   bool vertex_stores = false;    // the vertex shader writes storage buffers (kFeatureVertexStores)
   bool fragment_stores = false;  // the fragment shader writes storage buffers (kFeatureFragmentStores): it runs for every fragment the rasterizer makes, also those the depth test then fails
+  bool stand_in_fragment = false;  // the fragment shader stands in for none (the API's pipeline has no pixel shader): its runs are not counted as PsInvocations
   uint32_t texture_count = 0;  // texture units 0 .. n-1 the fragment shader samples (at most kMaxTextureUnits); every one must be bound before a draw
   CullMode cull_mode = CullMode::Back;
   FrontFace front_face = FrontFace::CounterClockwise;
@@ -1185,7 +1187,8 @@ class ICommandBuffer {
   // Stream output (kFeatureStreamOutput): makes `buffer` (kBufferStreamOutput) from `offset` the target of stream output buffer `slot` (a null buffer unbinds it); what the draws that follow
   // write goes after what is there already (a bind starts at its offset; with kStreamOutputAppend, where the last stream output into that buffer ended, IBuffer::stream_output_filled, which a
   // submit updates). Outside a render pass or in one.
-  virtual void bind_stream_output(uint32_t slot, IBuffer* buffer, uint64_t offset) { (void)slot, (void)buffer, (void)offset; }
+  // `end`: the byte of the buffer the writes stop at (a primitive that does not fit before it is not written, nor any after it: as at the buffer's end); kStreamOutputNoEnd the buffer's end.
+  virtual void bind_stream_output(uint32_t slot, IBuffer* buffer, uint64_t offset, uint64_t end = kStreamOutputNoEnd) { (void)slot, (void)buffer, (void)offset, (void)end; }
   virtual void bind_storage_buffer(uint32_t slot, IBuffer* buffer, uint64_t offset, uint64_t size) {
     (void)slot, (void)buffer, (void)offset, (void)size;
   }

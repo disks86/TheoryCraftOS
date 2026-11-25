@@ -159,6 +159,546 @@ void merge_slot(int8_t* at, int8_t slot) {
   else if (slot >= 0 && (*at < 0 || slot < *at)) *at = slot;
 }
 
+// The words of the DXBC operand at word `at` of `w` (no further than `end`); 0 when it does not fit there or is not one.
+uint32_t dxbc_operand_words(ArrayView<const uint32_t> w, uint32_t at, uint32_t end, uint32_t depth = 0) {
+  if (end > w.size() || at >= end || depth > 4) return 0;
+  const uint32_t t = w[at];
+  uint32_t p = at + 1;
+  for (uint32_t ext = t; ext >> 31;) {
+    if (p >= end) return 0;
+    ext = w[p++];
+  }
+  const uint32_t type = (t >> 12) & 0xFF, dims = (t >> 20) & 3, components = t & 3;
+  if (dims > 3 || components == 3) return 0;
+  for (uint32_t d = 0; d < dims; ++d) {
+    const uint32_t rep = (t >> (22 + 3 * d)) & 7;
+    if (rep == 0 || rep == 3) {
+      if (p >= end) return 0;
+      ++p;
+    } else if (rep == 1 || rep == 4) {
+      if (end - p < 2) return 0;
+      p += 2;
+    } else if (rep != 2) {
+      return 0;
+    }
+    if (rep >= 2) {
+      const uint32_t sub = dxbc_operand_words(w, p, end, depth + 1);
+      if (!sub) return 0;
+      p += sub;
+    }
+  }
+  if (type == 4 || type == 5) {   // (immediates: their values)
+    const uint32_t values = (components == 2 ? 4u : components == 1 ? 1u : 0u) * (type == 5 ? 2u : 1u);
+    if (end - p < values) return 0;
+    p += values;
+  }
+  return p - at;
+}
+
+// --- Subroutines and switches -------------------------------------------------------------------------------------------------------------------------------------
+//
+// A pass over the program's words before they are compiled: it gives back the same program with no subroutines, switches or conditional returns, made of the flow control
+// the instruction form has (if, loop, break, continue), so that every stage and every device (the interpreter, TGSI for virgl) runs them alike.
+//   - `call l#` is the subroutine inlined (its body, from `label l#` to the next label or the end); `callc_z / callc_nz c, l#` is that inside `if_z / if_nz c`. Direct3D
+//     has no recursion: a call deeper than kMaxCallDepth (32, Direct3D's subroutine nesting limit) can only be one, and is refused (kInvalidParameter).
+//   - A subroutine that returns before its end is wrapped in a loop that runs once, its returns breaks out of it; from inside a loop or a switch of its own the return sets
+//     the flag (rF.x) first, and each such loop and switch breaks on out when it ends with the flag set. The flag is cleared after the wrapper.
+//   - `retc_z / retc_nz c` of the main program is `if_z / if_nz c`, `ret`, `endif` (a return inside an if ends the program there).
+//   - A switch whose cases each end in a break at their top level (or a return or continue), with no other break of the switch, is a chain of if / else on the selector
+//     (copied first into a temporary of the switch, rS.x); the default case is the last else. Any other (a break inside an if of a case, breakc, a case that falls into the
+//     next) is a loop that runs once around one `if` per case, taken when the selector matched that case or one before it (falling through), or when no case matches for
+//     the default; its breaks are the loop's. A `continue` of a loop outside such a switch sets rF.y and breaks; after the switch it is continued (or broken on to the next
+//     such switch out).
+// The temporaries added: rF (F the number of temporaries the program declares) and one rS for each level of switches inside switches; every dcl_temps is made that many larger.
+// A program with none of these instructions is left as it is. A label of a function body (an interface's: fcall) is not this pass's: kNotSupported (d3d11.dll specialises
+// such shaders first).
+class Flattener {
+ public:
+  explicit Flattener(allocators::IAllocator& allocator, bool hull) : allocator_(allocator), w_(allocator), at_(allocator), labels_(allocator), out_(allocator), temps_at_(allocator), stack_(allocator), hull_(hull) {}
+
+  static constexpr uint32_t kMaxCallDepth = 32;
+  static constexpr uint64_t kMaxWords = 1u << 20;
+
+  // `words`: the program after its version and length. *changed false: there was nothing to do (out() is empty).
+  NtStatus run(ConstByteView words, bool* changed) {
+    *changed = false;
+    if (words.size() % 4) return status::kInvalidParameter;
+    ByteReader r(words);
+    if (!w_.reserve(words.size() / 4)) return status::kNoMemory;
+    while (!r.at_end()) {
+      const uint32_t v = r.le32();
+      if (!r.ok() || !w_.push_back(v)) return status::kNoMemory;
+    }
+    bool needed = false;
+    for (uint64_t at = 0; at < w_.count();) {
+      const uint32_t token = w_[at], op = token & 0x7FF;
+      uint64_t length = (token >> 24) & 0x7F;
+      if (op == kCustomData) {
+        if (w_.count() - at < 2) return status::kInvalidParameter;
+        length = w_[at + 1];
+      }
+      if (length == 0 || length > w_.count() - at) return status::kInvalidParameter;
+      if (!at_.push_back(static_cast<uint32_t>(at))) return status::kNoMemory;
+      if (op == kCall || op == kCallc || op == kLabel || op == kRetc || op == kSwitch) needed = true;
+      if (op == kDclTemps) {
+        if (length != 2) return status::kInvalidParameter;
+        if (w_[at + 1] > declared_) declared_ = w_[at + 1];
+      }
+      at += length;
+    }
+    if (!needed) return status::kSuccess;
+    if (declared_ > kMaxTemps) return status::kNotSupported;
+    // The subroutines: each from after its label to the next label (or the end); the main program up to the first.
+    main_end_ = static_cast<uint32_t>(at_.count());
+    for (uint32_t i = 0; i < at_.count(); ++i) {
+      if (op(i) != kLabel) continue;
+      if (length(i) != 3) return status::kInvalidParameter;
+      const uint32_t operand = w_[at_[i] + 1];
+      if (((operand >> 12) & 0xFF) == kTypeFunctionBody) return status::kNotSupported;   // (an interface's function body: the shader is not specialised)
+      if (operand != kLabelOperand) return status::kInvalidParameter;
+      const uint32_t number = w_[at_[i] + 2];
+      for (const Label& l : labels_.view())
+        if (l.number == number) return status::kInvalidParameter;
+      if (labels_.count()) labels_[labels_.count() - 1].end = i;
+      else main_end_ = i;
+      if (!labels_.push_back({number, i + 1, static_cast<uint32_t>(at_.count())})) return status::kNoMemory;
+    }
+    NtStatus s = emit_range(0, main_end_, false, 0);
+    if (s != status::kSuccess) return s;
+    if (stack_.count() != 0) return status::kInvalidParameter;   // (a construct left open)
+    // The temporaries the pass added.
+    if (extra_temps_) {
+      const uint64_t total = uint64_t{declared_} + extra_temps_;
+      if (total > kMaxTemps - 3) return status::kNotSupported;   // (the compiler keeps the last three for itself)
+      for (uint32_t at : temps_at_.view()) out_[at] = static_cast<uint32_t>(total);
+      if (!temps_at_.count() && (!out_.insert(0, kDclTemps | 2u << 24) || !out_.insert(1, static_cast<uint32_t>(total)))) return status::kNoMemory;
+    }
+    *changed = true;
+    return status::kSuccess;
+  }
+  const List<uint32_t>& out() const { return out_; }
+
+ private:
+  enum : uint32_t {
+    kBreak = 2, kBreakc = 3, kCall = 4, kCallc = 5, kCase = 6, kContinue = 7, kContinuec = 8, kDefault = 10, kElse = 18, kEndif = 21, kEndloop = 22, kEndswitch = 23, kIf = 31, kIeq = 32,
+    kLabel = 44, kLoop = 48, kCustomData = 53, kMov = 54, kOr = 60, kRet = 62, kRetc = 63, kSwitch = 76, kDclTemps = 104,
+  };
+  static constexpr uint32_t kTypeFunctionBody = 17, kLabelOperand = 0x0010A000u, kNonZero = 1u << 18;
+  enum class Kind : uint8_t { If, Loop, SwitchLoop, SwitchIf, Subroutine };
+  struct Construct {
+    Kind kind;
+    bool ret_inside = false;    // (a return of the subroutine set the flag inside it: it breaks on when it ends)
+    bool cont_inside = false;   // (a SwitchLoop a continue left: continued after it)
+    bool flag_set = false;      // (a Subroutine whose return set the flag)
+  };
+  struct Label {
+    uint32_t number, first, end;
+  };
+  struct Group {
+    uint32_t labels, body, end;   // (its case / default instructions from `labels` to `body`, its code to `end`)
+    bool has_default;
+  };
+
+  uint32_t op(uint32_t i) const { return w_[at_[i]] & 0x7FF; }
+  uint32_t length(uint32_t i) const {
+    const uint32_t token = w_[at_[i]];
+    return (token & 0x7FF) == kCustomData ? w_[at_[i] + 1] : (token >> 24) & 0x7F;
+  }
+  bool nonzero(uint32_t i) const { return (w_[at_[i]] & kNonZero) != 0; }
+  // The word of instruction i's first operand (after its extended opcode tokens), or ~0 when it has none.
+  uint32_t first_operand(uint32_t i) const {
+    const uint32_t end = at_[i] + length(i);
+    uint32_t k = at_[i] + 1;
+    for (uint32_t ext = w_[at_[i]]; (ext >> 31) && k < end;) ext = w_[k++];
+    return k < end ? k : ~0u;
+  }
+  // The words of the operand at word `k` (no further than `end`); 0 when it does not fit.
+  uint32_t operand_words(uint32_t k, uint32_t end) const { return dxbc_operand_words(w_.view(), k, end); }
+
+  bool put(uint32_t v) {
+    if (out_.count() >= kMaxWords) return false;
+    return out_.push_back(v);
+  }
+  NtStatus copy(uint32_t i) {
+    const uint32_t n = length(i);
+    for (uint32_t k = 0; k < n; ++k)
+      if (!put(w_[at_[i] + k])) return status::kNotSupported;
+    return status::kSuccess;
+  }
+  NtStatus emit0(uint32_t opcode) { return put(opcode | 1u << 24) ? status::kSuccess : status::kNotSupported; }
+  static uint32_t dst(uint32_t c) { return 0x00100002u | (1u << c) << 4; }   // rN.c as a destination
+  static uint32_t src(uint32_t c) { return 0x0010000Au | c << 4; }          // rN.c (select_1)
+  // if / breakc / continuec (z or nz) on rT.c
+  NtStatus emit_test(uint32_t opcode, bool nz, uint32_t temp, uint32_t c) {
+    return put(opcode | (nz ? kNonZero : 0) | 3u << 24) && put(src(c)) && put(temp) ? status::kSuccess : status::kNotSupported;
+  }
+  // if_z / if_nz with the condition operand of instruction i (its first: callc, retc)
+  NtStatus emit_if_of(uint32_t i) {
+    const uint32_t k = first_operand(i);
+    if (k == ~0u) return status::kInvalidParameter;
+    const uint32_t n = operand_words(k, at_[i] + length(i));
+    if (!n) return status::kInvalidParameter;
+    if (!put(kIf | (w_[at_[i]] & kNonZero) | (1u + n) << 24)) return status::kNotSupported;
+    for (uint32_t m = 0; m < n; ++m)
+      if (!put(w_[k + m])) return status::kNotSupported;
+    return status::kSuccess;
+  }
+  // mov rT.c, l(v)
+  NtStatus emit_set(uint32_t temp, uint32_t c, uint32_t v) {
+    return put(kMov | 5u << 24) && put(dst(c)) && put(temp) && put(0x00004001u) && put(v) ? status::kSuccess : status::kNotSupported;
+  }
+  // ieq rT.c, rA.a, l(v)
+  NtStatus emit_ieq(uint32_t temp, uint32_t c, uint32_t a_temp, uint32_t a, uint32_t v) {
+    return put(kIeq | 7u << 24) && put(dst(c)) && put(temp) && put(src(a)) && put(a_temp) && put(0x00004001u) && put(v) ? status::kSuccess : status::kNotSupported;
+  }
+  // or rT.c, rT.a, rT.b
+  NtStatus emit_or(uint32_t temp, uint32_t c, uint32_t a, uint32_t b) {
+    return put(kOr | 7u << 24) && put(dst(c)) && put(temp) && put(src(a)) && put(temp) && put(src(b)) && put(temp) ? status::kSuccess : status::kNotSupported;
+  }
+  uint32_t flag_temp() {
+    if (!extra_temps_) extra_temps_ = 1;
+    return declared_;
+  }
+
+  // The innermost construct of the stack that is not an If (and not a SwitchIf when `skip_switch_if`): its index, or -1.
+  int64_t innermost(bool skip_switch_if) const {
+    for (uint64_t k = stack_.count(); k > 0; --k) {
+      const Kind kind = stack_[k - 1].kind;
+      if (kind == Kind::If || (skip_switch_if && kind == Kind::SwitchIf)) continue;
+      return static_cast<int64_t>(k - 1);
+    }
+    return -1;
+  }
+  bool push(Kind kind) {
+    Construct c;
+    c.kind = kind;
+    return stack_.push_back(c);
+  }
+  bool pop(Kind kind, Construct* popped) {
+    if (!stack_.count() || stack_[stack_.count() - 1].kind != kind) return false;
+    *popped = stack_[stack_.count() - 1];
+    return stack_.remove_at(stack_.count() - 1);
+  }
+
+  // A return of the subroutine being written: out of its wrapper (through the flag from inside its loops and switches).
+  NtStatus emit_return() {
+    int64_t sub = -1;
+    for (uint64_t k = stack_.count(); k > 0; --k)
+      if (stack_[k - 1].kind == Kind::Subroutine) {
+        sub = static_cast<int64_t>(k - 1);
+        break;
+      }
+    if (sub < 0) return status::kInvalidParameter;
+    bool through = false;
+    for (uint64_t k = static_cast<uint64_t>(sub) + 1; k < stack_.count(); ++k)
+      if (stack_[k].kind == Kind::Loop || stack_[k].kind == Kind::SwitchLoop) through = stack_[k].ret_inside = true;
+    if (through) {
+      stack_[static_cast<uint64_t>(sub)].flag_set = true;
+      const NtStatus s = emit_set(flag_temp(), 0, ~0u);
+      if (s != status::kSuccess) return s;
+    }
+    return emit0(kBreak);
+  }
+
+  // After the endloop of a loop or of a switch's loop: on out for a return inside it, on to the loop of a continue inside it.
+  NtStatus after_loop(const Construct& c) {
+    NtStatus s = status::kSuccess;
+    if (c.ret_inside && (s = emit_test(kBreakc, true, flag_temp(), 0)) != status::kSuccess) return s;
+    if (c.kind != Kind::SwitchLoop || !c.cont_inside) return s;
+    const int64_t next = innermost(true);
+    if (next < 0 || stack_[static_cast<uint64_t>(next)].kind == Kind::Subroutine) return status::kInvalidParameter;   // (a continue outside any loop)
+    if (stack_[static_cast<uint64_t>(next)].kind == Kind::SwitchLoop) {
+      stack_[static_cast<uint64_t>(next)].cont_inside = true;
+      return emit_test(kBreakc, true, flag_temp(), 1);
+    }
+    if ((s = emit_test(kIf, true, flag_temp(), 1)) != status::kSuccess || (s = emit_set(flag_temp(), 1, 0)) != status::kSuccess || (s = emit0(kContinue)) != status::kSuccess) return s;
+    return emit0(kEndif);
+  }
+
+  const Label* label_of_call(uint32_t i) const {
+    uint32_t k = first_operand(i);
+    if (k == ~0u) return nullptr;
+    const uint32_t end = at_[i] + length(i);
+    if (op(i) == kCallc) {
+      const uint32_t n = operand_words(k, end);
+      if (!n) return nullptr;
+      k += n;
+    }
+    if (k + 2 != end || w_[k] != kLabelOperand) return nullptr;
+    for (const Label& l : labels_.view())
+      if (l.number == w_[k + 1]) return &l;
+    return nullptr;
+  }
+
+  NtStatus emit_subroutine(const Label& l, uint32_t depth) {
+    bool wrap = false;
+    for (uint32_t i = l.first; i < l.end; ++i)
+      if ((op(i) == kRet && i + 1 != l.end) || op(i) == kRetc) wrap = true;
+    NtStatus s = status::kSuccess;
+    if (wrap) {
+      if ((s = emit_set(flag_temp(), 0, 0)) != status::kSuccess || (s = emit0(kLoop)) != status::kSuccess) return s;
+      if (!push(Kind::Subroutine)) return status::kNoMemory;
+    }
+    const uint64_t open = stack_.count();
+    if ((s = emit_range(l.first, l.end, true, depth)) != status::kSuccess) return s;
+    if (stack_.count() != open) return status::kInvalidParameter;
+    if (wrap) {
+      Construct c;
+      if ((s = emit0(kBreak)) != status::kSuccess || (s = emit0(kEndloop)) != status::kSuccess) return s;
+      if (!pop(Kind::Subroutine, &c)) return status::kInvalidParameter;
+      if (c.flag_set && (s = emit_set(flag_temp(), 0, 0)) != status::kSuccess) return s;
+    }
+    return s;
+  }
+
+  // The switch at instruction i (to its endswitch, *close).
+  NtStatus emit_switch(uint32_t i, uint32_t end, uint32_t depth, bool in_sub, uint32_t* close) {
+    // its endswitch, and its cases (the labels at its own level)
+    uint32_t nest = 0, j = i + 1;
+    for (; j < end; ++j) {
+      if (op(j) == kSwitch) ++nest;
+      else if (op(j) == kEndswitch && nest-- == 0) break;
+    }
+    if (j >= end) return status::kInvalidParameter;
+    *close = j;
+    List<Group> groups(allocator_);
+    nest = 0;
+    for (uint32_t k = i + 1; k < j; ++k) {
+      const uint32_t o = op(k);
+      if (o == kSwitch) ++nest;
+      else if (o == kEndswitch) --nest;
+      if (nest || (o != kCase && o != kDefault)) continue;
+      if (groups.count() && groups[groups.count() - 1].body == k) {   // (labels one after the other: one case)
+        Group& g = groups[groups.count() - 1];
+        g.body = g.end = k + 1;
+        g.has_default = g.has_default || o == kDefault;
+        continue;
+      }
+      if (groups.count()) groups[groups.count() - 1].end = k;
+      if (!groups.push_back({k, k + 1, k + 1, o == kDefault})) return status::kNoMemory;
+    }
+    if (groups.count()) groups[groups.count() - 1].end = j;
+    if (!groups.count() || groups[0].labels != i + 1) return status::kInvalidParameter;   // (code before the first case)
+    uint32_t defaults = 0;
+    for (const Group& g : groups.view()) {
+      for (uint32_t k = g.labels; k < g.body; ++k) {
+        if (op(k) == kDefault) {
+          ++defaults;
+          continue;
+        }
+        const uint32_t operand = first_operand(k);
+        if (length(k) != 3 || operand == ~0u || w_[operand] != 0x00004001u) return status::kInvalidParameter;   // (case l(value))
+      }
+    }
+    if (defaults > 1) return status::kInvalidParameter;
+    // Can it be a chain of ifs: every break of the switch at the top level of a case and its last instruction, no case falling into the next?
+    bool chain = true;
+    for (uint64_t gi = 0; gi < groups.count() && chain; ++gi) {
+      const Group& g = groups[gi];
+      uint32_t loops = 0, ifs = 0;
+      for (uint32_t k = g.body; k < g.end && chain; ++k) {
+        const uint32_t o = op(k);
+        if (o == kLoop || o == kSwitch) ++loops;
+        else if (o == kEndloop || o == kEndswitch) --loops;
+        else if (o == kIf) ++ifs;
+        else if (o == kEndif) --ifs;
+        else if (loops == 0 && (o == kBreakc || (o == kBreak && (ifs != 0 || k + 1 != g.end)))) chain = false;
+      }
+      const uint32_t last = g.end > g.body ? op(g.end - 1) : kBreak;
+      if (gi + 1 < groups.count() && last != kBreak && last != kRet && last != kContinue) chain = false;   // (it falls into the next case)
+    }
+    const uint32_t temp_number = declared_ + 1 + switch_depth_;
+    if (++switch_depth_ + 1 > extra_temps_) extra_temps_ = switch_depth_ + 1;
+    (void)flag_temp();
+    NtStatus s = status::kSuccess;
+    // rS.x = the selector
+    {
+      const uint32_t k = first_operand(i);
+      if (k == ~0u) return status::kInvalidParameter;
+      const uint32_t n = operand_words(k, at_[i] + length(i));
+      if (!n || !put(kMov | (3u + n) << 24) || !put(dst(0)) || !put(temp_number)) return status::kInvalidParameter;
+      for (uint32_t m = 0; m < n; ++m)
+        if (!put(w_[k + m])) return status::kNotSupported;
+    }
+    // rS.y |= (the selector is one of the group's values); with `none` (the default's group) also when it is none of the switch's (rS.w)
+    auto match = [&](const Group& g, bool accumulate) -> NtStatus {
+      NtStatus r = status::kSuccess;
+      bool first = !accumulate;
+      for (uint32_t k = g.labels; k < g.body; ++k) {
+        if (op(k) == kDefault) {
+          if (chain) continue;   // (the chain's default is its last else)
+          r = emit_ieq(temp_number, first ? 1 : 2, temp_number, 3, 0);
+        } else {
+          r = emit_ieq(temp_number, first ? 1 : 2, temp_number, 0, w_[first_operand(k) + 1]);
+        }
+        if (r != status::kSuccess) return r;
+        if (!first && (r = emit_or(temp_number, 1, 1, 2)) != status::kSuccess) return r;
+        first = false;
+      }
+      return r;
+    };
+    auto body = [&](const Group& g) -> NtStatus {
+      const uint64_t open = stack_.count();
+      const NtStatus r = emit_range(g.body, g.end, in_sub, depth);
+      if (r == status::kSuccess && stack_.count() != open) return status::kInvalidParameter;
+      return r;
+    };
+    if (chain) {
+      if (!push(Kind::SwitchIf)) return status::kNoMemory;
+      uint32_t opened = 0;
+      const Group* fallback = nullptr;
+      for (const Group& g : groups.view()) {
+        if (g.has_default) {
+          fallback = &g;
+          continue;
+        }
+        if (opened && (s = emit0(kElse)) != status::kSuccess) return s;
+        if ((s = match(g, false)) != status::kSuccess || (s = emit_test(kIf, true, temp_number, 1)) != status::kSuccess || (s = body(g)) != status::kSuccess) return s;
+        ++opened;
+      }
+      if (fallback) {
+        if (opened && (s = emit0(kElse)) != status::kSuccess) return s;
+        if ((s = body(*fallback)) != status::kSuccess) return s;
+      }
+      for (uint32_t k = 0; k < opened; ++k)
+        if ((s = emit0(kEndif)) != status::kSuccess) return s;
+      Construct c;
+      if (!pop(Kind::SwitchIf, &c)) return status::kInvalidParameter;
+    } else {
+      if ((s = emit_set(flag_temp(), 1, 0)) != status::kSuccess) return s;
+      if (defaults) {
+        // rS.w: the selector is one of the cases
+        bool first = true;
+        for (const Group& g : groups.view())
+          for (uint32_t k = g.labels; k < g.body; ++k) {
+            if (op(k) == kDefault) continue;
+            if ((s = emit_ieq(temp_number, first ? 3 : 2, temp_number, 0, w_[first_operand(k) + 1])) != status::kSuccess) return s;
+            if (!first && (s = emit_or(temp_number, 3, 3, 2)) != status::kSuccess) return s;
+            first = false;
+          }
+        if (first && (s = emit_set(temp_number, 3, 0)) != status::kSuccess) return s;
+      }
+      if ((s = emit_set(temp_number, 1, 0)) != status::kSuccess || (s = emit0(kLoop)) != status::kSuccess) return s;
+      if (!push(Kind::SwitchLoop)) return status::kNoMemory;
+      for (const Group& g : groups.view()) {
+        if ((s = match(g, true)) != status::kSuccess || (s = emit_test(kIf, true, temp_number, 1)) != status::kSuccess) return s;
+        if (!push(Kind::If)) return status::kNoMemory;
+        if ((s = body(g)) != status::kSuccess) return s;
+        Construct c;
+        if (!pop(Kind::If, &c)) return status::kInvalidParameter;
+        if ((s = emit0(kEndif)) != status::kSuccess) return s;
+      }
+      Construct c;
+      if ((s = emit0(kBreak)) != status::kSuccess || (s = emit0(kEndloop)) != status::kSuccess) return s;
+      if (!pop(Kind::SwitchLoop, &c)) return status::kInvalidParameter;
+      if ((s = after_loop(c)) != status::kSuccess) return s;
+    }
+    --switch_depth_;
+    return status::kSuccess;
+  }
+
+  NtStatus emit_range(uint32_t first, uint32_t end, bool in_sub, uint32_t depth) {
+    NtStatus s = status::kSuccess;
+    for (uint32_t i = first; i < end; ++i) {
+      const uint32_t o = op(i);
+      Construct c;
+      switch (o) {
+        case kLabel: case kCase: case kDefault: case kEndswitch: return status::kInvalidParameter;   // (outside the switch they belong to)
+        case kCall: case kCallc: {
+          const Label* l = label_of_call(i);
+          if (!l) return status::kInvalidParameter;
+          if (depth + 1 > kMaxCallDepth) return status::kInvalidParameter;   // (recursion: Direct3D has none)
+          if (o == kCallc && (s = emit_if_of(i)) != status::kSuccess) return s;
+          if (o == kCallc && !push(Kind::If)) return status::kNoMemory;
+          const Label copy_of = *l;   // (labels_ does not change, but the reference is not kept across the recursion)
+          if ((s = emit_subroutine(copy_of, depth + 1)) != status::kSuccess) return s;
+          if (o == kCallc) {
+            if (!pop(Kind::If, &c)) return status::kInvalidParameter;
+            if ((s = emit0(kEndif)) != status::kSuccess) return s;
+          }
+          break;
+        }
+        case kRet:
+          if (!in_sub) s = copy(i);
+          else if (i + 1 != end) s = emit_return();   // (the last instruction of a subroutine: its end)
+          break;
+        case kRetc:
+          if (!in_sub && hull_) return status::kNotSupported;   // (a hull shader's ret ends its phase)
+          if ((s = emit_if_of(i)) != status::kSuccess) return s;
+          if (!push(Kind::If)) return status::kNoMemory;
+          s = in_sub ? emit_return() : emit0(kRet);
+          if (s != status::kSuccess) return s;
+          if (!pop(Kind::If, &c)) return status::kInvalidParameter;
+          s = emit0(kEndif);
+          break;
+        case kSwitch: {
+          uint32_t close = 0;
+          if ((s = emit_switch(i, end, depth, in_sub, &close)) != status::kSuccess) return s;
+          i = close;
+          break;
+        }
+        case kLoop:
+          if (!push(Kind::Loop)) return status::kNoMemory;
+          s = copy(i);
+          break;
+        case kEndloop:
+          if (!pop(Kind::Loop, &c)) return status::kInvalidParameter;
+          if ((s = copy(i)) == status::kSuccess) s = after_loop(c);
+          break;
+        case kIf:
+          if (!push(Kind::If)) return status::kNoMemory;
+          s = copy(i);
+          break;
+        case kEndif:
+          if (!pop(Kind::If, &c)) return status::kInvalidParameter;
+          s = copy(i);
+          break;
+        case kBreak: {
+          const int64_t k = innermost(false);
+          if (k < 0 || stack_[static_cast<uint64_t>(k)].kind == Kind::Subroutine) {
+            if (k < 0 && !in_sub) s = copy(i);   // (the compiler's own check: a break outside a loop)
+            else return status::kInvalidParameter;
+          } else if (stack_[static_cast<uint64_t>(k)].kind != Kind::SwitchIf) {
+            s = copy(i);   // (the case's last instruction: the chain ends there)
+          }
+          break;
+        }
+        case kContinue: case kContinuec: {
+          const int64_t k = innermost(true);
+          if (k >= 0 && stack_[static_cast<uint64_t>(k)].kind == Kind::SwitchLoop) {
+            // (a continue of the loop around the switch: rF.y, out of the switch's loop, continued after it)
+            stack_[static_cast<uint64_t>(k)].cont_inside = true;
+            if (o == kContinuec && (s = emit_if_of(i)) != status::kSuccess) return s;
+            if ((s = emit_set(flag_temp(), 1, ~0u)) != status::kSuccess || (s = emit0(kBreak)) != status::kSuccess) return s;
+            if (o == kContinuec) s = emit0(kEndif);
+          } else {
+            s = copy(i);
+          }
+          break;
+        }
+        case kDclTemps:
+          if ((s = copy(i)) == status::kSuccess && !temps_at_.push_back(static_cast<uint32_t>(out_.count() - 1))) return status::kNoMemory;
+          break;
+        default:
+          s = copy(i);
+          break;
+      }
+      if (s != status::kSuccess) return s;
+    }
+    return status::kSuccess;
+  }
+
+  allocators::IAllocator& allocator_;
+  List<uint32_t> w_;        // the program's words
+  List<uint32_t> at_;       // where each instruction begins
+  List<Label> labels_;
+  List<uint32_t> out_;
+  List<uint32_t> temps_at_;   // (the counts of dcl_temps in out_)
+  List<Construct> stack_;
+  uint32_t main_end_ = 0, declared_ = 0, extra_temps_ = 0, switch_depth_ = 0;
+  bool hull_ = false;
+};
+
 }  // namespace
 
 NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteView bytes, UniquePointer<D3d9Program>* out, uint32_t constant_base) {
@@ -206,10 +746,27 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
   }
   if (shader.size() < 8 || shader.size() % 4) return status::kInvalidParameter;
 
-  ByteReader in(shader);
-  const uint32_t version = in.le32(), length = in.le32();
+  ByteReader head_words(shader);
+  const uint32_t version = head_words.le32(), length = head_words.le32();
   const uint32_t program_type = version >> 16, major = (version >> 4) & 0xF, minor = version & 0xF;
   if (length != shader.size() / 4) return status::kInvalidParameter;
+  // Subroutines, switches and conditional returns made into the flow control below (Flattener); the program read is then the one it made.
+  ByteBuffer flattened(allocator);
+  {
+    Flattener flattener(allocator, program_type == 3);
+    bool changed = false;
+    const NtStatus st = flattener.run(shader.subview(8, shader.size() - 8), &changed);
+    if (st != status::kSuccess) return st;
+    if (changed) {
+      const List<uint32_t>& words = flattener.out();
+      if (!flattened.put32(version) || !flattened.put32(static_cast<uint32_t>(words.count() + 2))) return status::kNoMemory;
+      for (uint32_t w : words.view())
+        if (!flattened.put32(w)) return status::kNoMemory;
+      shader = flattened.view();
+    }
+  }
+  ByteReader in(shader);
+  in.skip(8);
   if (program_type != 0 && program_type != 1 && program_type != 2 && program_type != 3 && program_type != 4 && program_type != 5) return status::kNotSupported;   // pixel, vertex, geometry, hull, domain and compute shaders
   if (program_type == 5 && major != 5) return status::kNotSupported;
   if (!((major == 4 && minor <= 1) || (major == 5 && minor <= 1))) return status::kNotSupported;
@@ -235,6 +792,7 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
   bool tess_domain_declared = false, tess_output_declared = false;
   uint32_t factors_domain = 0;   // which domain the tessellation factors a hull shader writes are for (0: none yet)
   bool geometry_input_declared = false, geometry_output_declared = false;
+  uint32_t declared_input_vertices = 0;   // (the vertex count of a geometry shader's dcl_input v[N][register], 0 before one)
   uint32_t geometry_vertices = 0;   // the vertices of an input primitive
   bool thread_group_declared = false;
 
@@ -292,6 +850,20 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
     out_slot[0] = 0;
   }
 
+  // The temporaries' components a hull shader moved vOutputControlPointID into (mov rN.c, vOutputControlPointID) in the run of instructions without flow control being read,
+  // not written since: an input indexed by one is the control point being made (as vicp[vOutputControlPointID]).
+  struct CpIdMark {
+    uint32_t temp;
+    uint8_t component;
+  };
+  CpIdMark cp_id_marks[8];
+  uint32_t cp_id_mark_count = 0;
+  auto cp_id_marked = [&](uint32_t temp, uint8_t component) {
+    for (uint32_t k = 0; k < cp_id_mark_count; ++k)
+      if (cp_id_marks[k].temp == temp && cp_id_marks[k].component == component) return true;
+    return false;
+  };
+
   // --- operands
   auto read_operand = [&](ByteReader& p, Operand* o) -> NtStatus {
     const uint32_t t = p.le32();
@@ -331,10 +903,19 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
         const uint32_t temp = p.le32();
         if (!p.ok() || temp >= kMaxTemps) return status::kNotSupported;
         o->relative_temp = static_cast<uint16_t>(temp);
-      } else if (representation == 2 && i == 0 && o->dims == 2 && patch_stage && (o->type == kOpInput || o->type == kOpInputControlPoint)) {
-        // vicp[vOutputControlPointID][register]: the control point being made
+      } else if ((representation == 2 || representation == 3) && i == 0 && o->dims == 2 && patch_stage && (o->type == kOpInput || o->type == kOpInputControlPoint)) {
+        // vicp[vOutputControlPointID][register]: the control point being made - or vicp[rN.c + 0][register] with rN.c holding vOutputControlPointID (moved there in the same
+        // straight run of instructions, not written since: what the compiler makes of it in a subroutine)
+        const uint32_t offset = representation == 3 ? p.le32() : 0;
         const uint32_t sub = p.le32();
-        if (!p.ok() || ((sub >> 12) & 0xFF) != kOpOutputControlPointId || ((sub >> 20) & 3) != 0 || (sub >> 31)) return status::kNotSupported;
+        if (!p.ok() || (sub >> 31)) return status::kNotSupported;
+        if (((sub >> 12) & 0xFF) == kOpTemp && ((sub >> 20) & 3) == 1 && ((sub >> 22) & 7) == 0 && (sub & 3) == 2) {
+          const uint32_t temp = p.le32();
+          const uint8_t component = static_cast<uint8_t>(((sub >> 2) & 3) == 0 ? 0 : (sub >> 4) & 3);
+          if (!p.ok() || offset != 0 || !cp_id_marked(temp, component)) return status::kNotSupported;
+        } else if (((sub >> 12) & 0xFF) != kOpOutputControlPointId || ((sub >> 20) & 3) != 0 || offset != 0) {
+          return status::kNotSupported;
+        }
         o->vertex_from_id = true;
         o->index[0] = 0;
       } else {
@@ -568,6 +1149,7 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
   };
 
   List<uint32_t> open_ifs(allocator);
+  constexpr uint64_t kMaxNesting = 64;   // (loops in loops, ifs in ifs: Direct3D's limit of flow control nesting; switches and subroutines add loops and ifs of their own)
   bool returned = false;
   // Open loops: where each began, how many ifs were open then, and the breaks / continues waiting for their endloop.
   struct LoopFrame {
@@ -579,7 +1161,7 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
     if (program->code_.count() >= kMaxInstructions) return status::kNotSupported;
     const uint32_t index = static_cast<uint32_t>(program->code_.count());
     if (ins.op == kLoopBegin) {
-      if (loops.count() >= 8 || !loops.push_back({index, static_cast<uint32_t>(open_ifs.count())})) return status::kNotSupported;
+      if (loops.count() >= kMaxNesting || !loops.push_back({index, static_cast<uint32_t>(open_ifs.count())})) return status::kNotSupported;
     } else if (ins.op == kLoopEnd) {
       if (!loops.count() || loops[loops.count() - 1].ifs != open_ifs.count()) return status::kInvalidParameter;   // (an if that straddles the end)
       const LoopFrame frame = loops[loops.count() - 1];
@@ -603,7 +1185,7 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
       if (!loops.count() || !pending_continues.push_back((uint64_t{loops.count()} << 32) | index)) return status::kInvalidParameter;
     }
     if (ins.op == kIfNz || ins.op == kIfZ) {
-      if (open_ifs.count() >= 24 || !open_ifs.push_back(index)) return status::kNotSupported;
+      if (open_ifs.count() >= kMaxNesting || !open_ifs.push_back(index)) return status::kNotSupported;
     } else if (ins.op == kElse) {
       if (!open_ifs.count()) return status::kInvalidParameter;
       Instr& open = program->code_[open_ifs[open_ifs.count() - 1]];
@@ -766,6 +1348,53 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
   };
   bool feedback_unchecked = false;   // (a feedback form was decoded into something that is not a lookup of a texture: refused)
 
+  // What an instruction does to the marks of vOutputControlPointID (applied before the next one): flow control and declarations of phases clear them all, a mov of it into a
+  // temporary's component marks that, any other write to a temporary's components clears theirs.
+  CpIdMark cp_id_clears[16];
+  uint32_t cp_id_pending_clear = 0;
+  bool cp_id_clear_all = false, cp_id_pending_mark = false;
+  CpIdMark cp_id_new_mark = {0, 0};
+  auto note_cp_id_effects = [&](uint32_t token, ConstByteView body) {
+    const uint32_t opcode = token & 0x7FF;
+    const bool flow = opcode == kIf4 || opcode == kElse4 || opcode == kEndif4 || opcode == kLoop4 || opcode == kEndloop4 || opcode == kBreak4 || opcode == kBreakc4 || opcode == kContinue4 ||
+                      opcode == kContinuec4 || opcode == kRet4 || opcode == kHsControlPointPhase4 || opcode == kHsForkPhase4 || opcode == kHsJoinPhase4 || opcode == kCustomData4;
+    if (flow) {
+      cp_id_clear_all = true;
+      return;
+    }
+    // the operands (after the extended opcode tokens), the temporaries in mask mode among them: the destinations
+    ByteReader r(body);
+    uint32_t words[127];
+    uint32_t n = 0;
+    while (!r.at_end() && n < 127) words[n++] = r.le32();
+    const ArrayView<const uint32_t> view(words, n);
+    uint32_t at = 0;
+    for (uint32_t ext = token; (ext >> 31) && at < n;) ext = words[at++];
+    bool first = true;
+    while (at < n) {
+      const uint32_t length = dxbc_operand_words(view, at, n);
+      if (!length) {
+        cp_id_clear_all = true;   // (not understood: forget them all)
+        return;
+      }
+      const uint32_t t = words[at];
+      if (((t >> 12) & 0xFF) == kOpTemp && (t & 3) == 2 && ((t >> 2) & 3) == 0 && ((t >> 20) & 3) == 1 && ((t >> 22) & 7) == 0 && !(t >> 31) && at + 1 < n) {
+        const uint32_t mask = (t >> 4) & 0xF;
+        for (uint8_t c = 0; c < 4; ++c)
+          if ((mask >> c & 1) && cp_id_pending_clear < 16) cp_id_clears[cp_id_pending_clear++] = {words[at + 1], c};
+        if (first && opcode == kMov4 && !((token >> 13) & 1) && at + length < n && (mask == 1 || mask == 2 || mask == 4 || mask == 8)) {
+          const uint32_t source = words[at + length];
+          if (((source >> 12) & 0xFF) == kOpOutputControlPointId && ((source >> 20) & 3) == 0 && !(source >> 31)) {
+            cp_id_pending_mark = true;
+            cp_id_new_mark = {words[at + 1], static_cast<uint8_t>(mask == 1 ? 0 : mask == 2 ? 1 : mask == 4 ? 2 : 3)};
+          }
+        }
+      }
+      first = false;
+      at += length;
+    }
+  };
+
   // --- the instructions
   while (!in.at_end()) {
     if (feedback_unchecked) return status::kNotSupported;   // (a status of a buffer or storage image load: those reads have no residency feedback here)
@@ -799,6 +1428,17 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
     if (words < 1) return status::kInvalidParameter;
     ConstByteView body = in.take(uint64_t{words - 1} * 4);
     if (!in.ok()) return status::kInvalidParameter;
+    if (hull) {
+      // (the marks of vOutputControlPointID in temporaries: what the instruction before did to them - this one reads them as they are)
+      for (uint32_t k = 0; k < cp_id_pending_clear; ++k) {
+        for (uint32_t m = 0; m < cp_id_mark_count; ++m)
+          if (cp_id_marks[m].temp == cp_id_clears[k].temp && cp_id_marks[m].component == cp_id_clears[k].component) cp_id_marks[m] = cp_id_marks[--cp_id_mark_count];
+      }
+      if (cp_id_clear_all) cp_id_mark_count = 0;
+      if (cp_id_pending_mark && cp_id_mark_count < 8) cp_id_marks[cp_id_mark_count++] = cp_id_new_mark;
+      cp_id_pending_clear = 0, cp_id_clear_all = false, cp_id_pending_mark = false;
+      note_cp_id_effects(token, body);
+    }
     ByteReader p(body);
     // Extended opcode tokens: sample offsets are taken by gather4 and sample_c / sample_c_lz only (and are zero for the rest); the others (resource dimension, return type) change nothing.
     int32_t sample_offset[3] = {0, 0, 0};
@@ -939,7 +1579,10 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
         if (geometry && opcode == kDclInput4 && (o.type == kOpGsInstanceId || o.type == kOpInputPrimitiveId)) continue;   // (vGSInstanceID, vPrim)
         if (geometry && (opcode == kDclInput4 || opcode == kDclInputSiv4) && o.type == kOpInput) {
           // v[N][register] (and for the _siv form the system value after it): the signature says what the register is
-          if (o.dims != 2 || o.index[0] != geometry_vertices || o.index[1] >= kRegisters || in_slot[o.index[1]] == kSlotNone) return status::kNotSupported;
+          // (the vertex count is the input primitive's, which Microsoft's compiler may declare after the inputs: checked there, or here when it came first)
+          if (o.dims != 2 || o.index[0] == 0 || (geometry_input_declared && o.index[0] != geometry_vertices) || o.index[1] >= kRegisters || in_slot[o.index[1]] == kSlotNone) return status::kNotSupported;
+          if (declared_input_vertices && declared_input_vertices != o.index[0]) return status::kInvalidParameter;
+          declared_input_vertices = o.index[0];
           continue;
         }
         if (patch_stage && (opcode == kDclInput4 || opcode == kDclInputSiv4)) {
@@ -1048,6 +1691,7 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
         program->geometry_input_ = primitive == 1 ? graphics::GeometryPrimitive::Point : primitive == 2 ? graphics::GeometryPrimitive::Line : primitive == 3 ? graphics::GeometryPrimitive::Triangle
                                    : primitive == 6 ? graphics::GeometryPrimitive::LineAdjacency : graphics::GeometryPrimitive::TriangleAdjacency;
         geometry_vertices = primitive == 6 ? 4 : primitive == 7 ? 6 : primitive;
+        if (declared_input_vertices && declared_input_vertices != geometry_vertices) return status::kNotSupported;
         geometry_input_declared = true;
         continue;
       }

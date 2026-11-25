@@ -2146,6 +2146,7 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
   struct StreamOutputSlot {
     VirglBuffer* buffer = nullptr;
     uint64_t offset = 0;
+    uint64_t end = kStreamOutputNoEnd;   // (where the writes stop: the binding's end, or the buffer's)
   } so_slot[kMaxStreamOutputBuffers];
   uint32_t so_handles[kMaxStreamOutputBuffers] = {};
   uint32_t so_program[5] = {};   // (the shaders of the pipeline the transform feedback began with)
@@ -2329,11 +2330,12 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
         if (!so_slot[k].buffer) continue;
         // (a buffer that is full - an append after the records that filled it - takes nothing more; GL refuses a range of no bytes, so the target is its last 4 bytes, where no record of
         // more than 4 bytes fits: the primitives are needed and not written, as for a full buffer. Records of 4 bytes or less would be written there: refused.)
-        uint64_t offset = so_slot[k].offset, room = so_slot[k].buffer->size() - offset;
+        const uint64_t limit = so_slot[k].end == kStreamOutputNoEnd || so_slot[k].end > so_slot[k].buffer->size() ? so_slot[k].buffer->size() : so_slot[k].end;
+        uint64_t offset = so_slot[k].offset, room = limit > offset ? limit - offset : 0;
         if (room < 4) {
           const uint64_t record = uint64_t{pd.stream_output_stride[k]} * vertices;
-          if (record <= 4 || so_slot[k].buffer->size() < 4) return false;
-          offset = so_slot[k].buffer->size() - 4, room = 4;
+          if (record <= 4 || limit < 4) return false;
+          offset = limit - 4, room = 4;
         }
         so_handles[k] = new_handle();
         stream.command(virgl::kCreateObject, virgl::kObjectStreamoutTarget, 4);
@@ -2554,7 +2556,7 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
         if (cmd.unit >= kMaxStreamOutputBuffers) return false;
         VirglBuffer* target = static_cast<VirglBuffer*>(cmd.buffer);
         const bool append = cmd.offset == kStreamOutputAppend;
-        if (append && target && so_slot[cmd.unit].buffer == target) break;   // (it goes on where it is)
+        if (append && target && so_slot[cmd.unit].buffer == target && so_slot[cmd.unit].end == cmd.end) break;   // (it goes on where it is)
         uint64_t start = cmd.offset;
         if (append && target) {
           // (how far the buffer got in an earlier submit; one written in this one has no known end until the host has run it)
@@ -2565,7 +2567,7 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
         }
         if (target && start > target->size()) return false;
         end_stream_output();   // (the draws that follow start at this binding's beginning)
-        so_slot[cmd.unit] = {target, start};
+        so_slot[cmd.unit] = {target, start, cmd.end};
         use(target);
         break;
       }
@@ -2867,6 +2869,10 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
           stream.put(static_cast<uint32_t>(index_offset + uint64_t{cmd.first} * (index_type == IndexType::Uint16 ? 2 : 4)));
         }
         const bool patches = topology == PrimitiveTopology::PatchList;
+        // (a stand-in for no pixel shader: the host counts its runs, the API none - the pixel shader invocations' segment stops around the draw)
+        constexpr uint32_t kPsTarget = kTargetStatistic + static_cast<uint32_t>(PipelineStatistic::PsInvocations);
+        const bool pause_ps = pipeline->desc().stand_in_fragment && queries.active[kPsTarget] >= 0;
+        if (pause_ps) end_segment(kPsTarget);
         stream.command(virgl::kDrawVbo, 0, patches ? 14 : 12);
         stream.put(indexed ? 0 : cmd.first);
         stream.put(cmd.count);
@@ -2884,6 +2890,7 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
           stream.put(patch_points);
           stream.put(0);   // draw id
         }
+        if (pause_ps && queries.open_users[kPsTarget] && !begin_segment(kPsTarget)) return false;
         if (pipeline->desc().fragment_stores || pipeline->desc().vertex_stores || pipeline->desc().geometry_stores || pipeline->desc().tessellation_stores) {   // (what the shaders wrote is there for the next read, a transfer to the system included)
           stream.command(virgl::kMemoryBarrier, 0, 1);
           stream.put(0xFFFFFFFFu);

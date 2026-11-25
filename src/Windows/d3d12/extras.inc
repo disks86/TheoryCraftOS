@@ -20,9 +20,10 @@
  *
  * Queries are the kernel's (BeginQuery / EndQuery write 64-bit counts into a kAllocQueryResult buffer, the query heap): occlusion and binary occlusion, pipeline statistics (and
  * PIPELINE_STATISTICS1, whose amplification and mesh shader counts are 0: there are no such stages), stream output statistics of each stream, and timestamps (nanoseconds,
- * GetTimestampFrequency says 10^9; on copy lists into COPY_QUEUE_TIMESTAMP heaps). Any number may be open at once (MAX_OPEN_QUERIES), of one type or several, across passes, clears,
+ * GetTimestampFrequency says 10^9; on copy lists into COPY_QUEUE_TIMESTAMP heaps). Any number may be open at once, of one type or several, across passes, clears,
  * copies and everything else of the list: the kernel's queries span its passes, and a query that goes on into the next chunk is begun again there with kQueryAccumulate, so the
- * chunks' counts add up. ResolveQueryData copies the results with CopyBuffer. BeginQuery, EndQuery and ResolveQueryData are not predicated (Direct3D 12 predicates draws,
+ * chunks' counts add up - when more than GROUP_QUERIES go on into a chunk, those of each kind share one device query there (a QueryFan: the kernel takes CHUNK_QUERIES in a stream),
+ * whose counts are added to each of them when the chunk has run; a query of a fan that ends, begins again or is resolved ends the chunk first. ResolveQueryData copies the results with CopyBuffer. BeginQuery, EndQuery and ResolveQueryData are not predicated (Direct3D 12 predicates draws,
  * dispatches, clears, copies, resolves and ExecuteIndirect): while predication is in force they go into a chunk of their own that is not.
  *
  * The kernel has no indirect draws, so ExecuteIndirect is made when the list is executed: the list keeps a copy of its state at the call, the argument buffer is read then (after
@@ -186,13 +187,71 @@ static void end_query_packet(CmdList *l, const struct OpenQuery *q) {
   UINT w[2] = {alloc_index(l, q->heap->alloc), q->index * qheap_stride(q->heap->desc.Type)};
   packet(l, OP_END_QUERY, w, 2);
 }
-/* The end of a chunk the open queries go on after (chunk_new, ExecuteIndirect): their part in it ends. The chunk has room (CHUNK_BYTES leaves it). */
+/* The end of a chunk the open queries go on after (chunk_new, ExecuteIndirect): their part in it ends - each one's own device query, and the groups'. The chunk has room
+ * (CHUNK_BYTES leaves it for an EndQuery of every device query it has). */
 static void queries_suspend(CmdList *l) {
-  for (UINT i = 0; i < l->nopen_q; ++i) end_query_packet(l, &l->open_q[i]);
+  Chunk *c = chunk_cur(l);
+  for (UINT i = 0; i < l->nopen_q; ++i)
+    if (!l->open_q[i].grouped) end_query_packet(l, &l->open_q[i]);
+  if (c && c->fans_open) {
+    for (UINT f = 0; f < c->nfans; ++f) {
+      UINT w[2] = {alloc_index(l, c->fan_scratch), c->fans[f].slot * QUERY_SCRATCH_STRIDE};
+      packet(l, OP_END_QUERY, w, 2);
+    }
+    c->fans_open = 0;
+  }
 }
-/* The start of the next chunk: they begin again, adding to what they counted. */
+/* The list's scratch allocation of the groups' results (one slot of QUERY_SCRATCH_STRIDE bytes for each device query a chunk may have); 0 when it cannot be made. */
+static UINT query_scratch(CmdList *l) {
+  if (l->query_scratch) return l->query_scratch;
+  KmtAllocDesc ad;
+  memset(&ad, 0, sizeof ad);
+  ad.flags = KA_QUERY;
+  ad.size = (UINT64)CHUNK_QUERIES * QUERY_SCRATCH_STRIDE;
+  if (!KMT_OK(kmt_create_allocation(l->d.dev->kdev, &ad, &l->query_scratch, NULL, NULL))) l->query_scratch = 0;
+  return l->query_scratch;
+}
+/* The start of the next chunk: they begin again, adding to what they counted. Up to GROUP_QUERIES each with a device query of its own; with more, those of each kind
+ * share one (a QueryFan of the chunk), whose count is added to each of them after the chunk ran (queue.inc: chunk_fan_out). */
 static void queries_resume(CmdList *l) {
-  for (UINT i = 0; i < l->nopen_q; ++i) begin_query_packet(l, &l->open_q[i], KQ_ACCUMULATE);
+  Chunk *c = chunk_cur(l);
+  for (UINT i = 0; i < l->nopen_q; ++i) l->open_q[i].grouped = 0;
+  if (l->nopen_q <= GROUP_QUERIES || !c || !query_scratch(l)) {
+    for (UINT i = 0; i < l->nopen_q; ++i) begin_query_packet(l, &l->open_q[i], KQ_ACCUMULATE);
+    return;
+  }
+  for (UINT i = 0; i < l->nopen_q; ++i) {
+    struct OpenQuery *q = &l->open_q[i];
+    if (q->grouped) continue;
+    /* (a fan for q's kind, with every open query of the kind) */
+    UINT n = 0;
+    for (UINT k = i; k < l->nopen_q; ++k) n += l->open_q[k].kind == q->kind;
+    QueryFan *grown = mem_grow(c->fans, (SIZE_T)(c->nfans + 1) * sizeof *grown);
+    FanMember *members = mem_alloc((SIZE_T)n * sizeof *members);
+    if (grown) c->fans = grown;
+    if (!grown || !members) {
+      mem_free(members);
+      for (UINT k = i; k < l->nopen_q; ++k)      /* (no memory: the rest each with their own) */
+        if (!l->open_q[k].grouped) begin_query_packet(l, &l->open_q[k], KQ_ACCUMULATE);
+      break;
+    }
+    QueryFan *f = &c->fans[c->nfans];
+    f->kind = q->kind, f->slot = c->nfans, f->members = members, f->nmembers = 0;
+    ++c->nfans;
+    for (UINT k = i; k < l->nopen_q; ++k) {
+      struct OpenQuery *m = &l->open_q[k];
+      if (m->kind != q->kind) continue;
+      m->grouped = 1;
+      f->members[f->nmembers].alloc = m->heap->alloc;
+      f->members[f->nmembers].offset = m->index * qheap_stride(m->heap->desc.Type);
+      ++f->nmembers;
+    }
+    c->fan_scratch = l->query_scratch;
+    c->fans_open = 1;
+    UINT w[3] = {alloc_index(l, l->query_scratch), f->slot * QUERY_SCRATCH_STRIDE, q->kind};
+    packet(l, OP_BEGIN_QUERY, w, 3);
+    c->queries += query_weight(q->kind);
+  }
 }
 static void queries_end_all(CmdList *l) {
   if (!l->nopen_q || !chunk_cur(l)) return;
@@ -201,19 +260,36 @@ static void queries_end_all(CmdList *l) {
 }
 /* Room in the chunk for a query of `weight` more device queries and its packets (a new chunk when there is none: the open queries take theirs again in it). 0 when there is none. */
 static int query_room(CmdList *l, UINT weight) {
-  ensure_room(l, 512 + MAX_OPEN_QUERIES * 16, MAX_OPEN_QUERIES + 4);
+  ensure_room(l, 512, 4);
   if (chunk_cur(l)->queries + weight > CHUNK_QUERIES) { end_pass(l); chunk_new(l); }
   return chunk_cur(l) && chunk_cur(l)->queries + weight <= CHUNK_QUERIES;
 }
+/* Whether a fan of the current chunk adds to the result at (alloc, offset) after the chunk ran. */
+static int fan_member(CmdList *l, UINT alloc, UINT offset) {
+  const Chunk *c = chunk_cur(l);
+  if (!c) return 0;
+  for (UINT f = 0; f < c->nfans; ++f)
+    for (UINT m = 0; m < c->fans[f].nmembers; ++m)
+      if (c->fans[f].members[m].alloc == alloc && c->fans[f].members[m].offset == offset) return 1;
+  return 0;
+}
 
 static void begin_query(CmdList *l, QHeap *h, UINT index, D3D12_QUERY_TYPE type, UINT kind) {
-  if (l->nopen_q == MAX_OPEN_QUERIES) return;      /* (more open at once than this library keeps: not begun, and its End finds nothing) */
   for (UINT i = 0; i < l->nopen_q; ++i)
     if (l->open_q[i].heap == h && l->open_q[i].index == index) return;      /* (begun already: an error the runtime leaves to the debug layer; it goes on as it was) */
+  if (l->nopen_q == l->cap_open_q) {
+    const UINT cap = l->cap_open_q ? l->cap_open_q * 2 : 16;
+    struct OpenQuery *n = mem_grow(l->open_q, (SIZE_T)cap * sizeof *n);
+    if (!n) return;      /* (no memory: not begun, and its End finds nothing) */
+    l->open_q = n;
+    l->cap_open_q = cap;
+  }
   const int split = unpredicated_begin(l);
+  /* (the place a fan of this chunk adds to after it ran: the query begins in a chunk after it, or the fan would add the last query's count to this one's) */
+  if (fan_member(l, h->alloc, index * qheap_stride(h->desc.Type))) { end_pass(l); chunk_new(l); }
   if (query_room(l, query_weight(kind))) {
     struct OpenQuery *q = &l->open_q[l->nopen_q];
-    q->heap = h, q->index = index, q->type = type, q->kind = kind;
+    q->heap = h, q->index = index, q->type = type, q->kind = kind, q->grouped = 0;
     begin_query_packet(l, q, 0);
     ++l->nopen_q;
   }
@@ -242,7 +318,7 @@ static void STDMETHODCALLTYPE list_EndQuery(CmdList *l, ID3D12QueryHeap *heap, D
     /* (the time it is run: begun and ended at once) */
     const int split = unpredicated_begin(l);
     if (query_room(l, 1)) {
-      const struct OpenQuery q = {h, index, type, 6};
+      const struct OpenQuery q = {h, index, type, 6, 0};
       begin_query_packet(l, &q, 0);
       end_query_packet(l, &q);
     }
@@ -253,8 +329,15 @@ static void STDMETHODCALLTYPE list_EndQuery(CmdList *l, ID3D12QueryHeap *heap, D
     if (l->open_q[i].heap != h || l->open_q[i].index != index || l->open_q[i].type != type) continue;
     const int split = unpredicated_begin(l);
     ensure_room(l, 64, 4);
-    end_query_packet(l, &l->open_q[i]);
-    l->open_q[i] = l->open_q[--l->nopen_q];
+    if (l->open_q[i].grouped) {
+      /* (counted in this chunk by its kind's fan: the chunk ends here, the fan adds its part after it ran, and the next chunk goes on without it) */
+      l->open_q[i] = l->open_q[--l->nopen_q];
+      end_pass(l);
+      chunk_new(l);
+    } else {
+      end_query_packet(l, &l->open_q[i]);
+      l->open_q[i] = l->open_q[--l->nopen_q];
+    }
     unpredicated_end(l, split);
     return;
   }
@@ -273,6 +356,10 @@ static void STDMETHODCALLTYPE list_ResolveQueryData(CmdList *l, ID3D12QueryHeap 
   if (offset > d->desc.Width || bytes > d->desc.Width - offset || offset > 0xFFFFFFFFu) return;
   const int split = unpredicated_begin(l);
   end_pass(l);
+  /* (a fan of this chunk adds to the results after the chunk ran: the copy goes into the next one) */
+  int fanned = 0;
+  for (UINT i = start; i < start + count && !fanned; ++i) fanned = fan_member(l, h->alloc, i * stride);
+  if (fanned) chunk_new(l);
   ensure_room(l, 256, 4);
   UINT w[5] = {alloc_index(l, d->alloc), (UINT)offset, alloc_index(l, h->alloc), start * stride, (UINT)bytes};
   packet(l, OP_COPY_BUFFER, w, 5);
@@ -326,6 +413,7 @@ typedef struct Indirect {
 } Indirect;
 
 static void indirect_free(struct Indirect *i) {
+  if (i->state) mem_free(i->state->open_q);      /* (its own copy of the open queries) */
   mem_free(i->state);
   mem_free(i);
 }
@@ -363,6 +451,16 @@ static void STDMETHODCALLTYPE list_ExecuteIndirect(CmdList *l, ID3D12CommandSign
   s->refs = NULL; s->nrefs = s->cap_refs = 0;
   s->log = NULL; s->nlog = s->cap_log = 0;
   s->bundle = 0; s->pass_open = 0; s->closed = 0;      /* (the open queries stay: the commands made from the call go on with them) */
+  s->open_q = NULL; s->cap_open_q = 0; s->nopen_q = 0;
+  s->query_scratch = 0;      /* (the list's: the expansion uses it, but does not own it) */
+  if (l->nopen_q) {
+    s->open_q = mem_alloc((SIZE_T)l->nopen_q * sizeof *s->open_q);
+    if (!s->open_q) { indirect_free(in); return; }
+    memcpy(s->open_q, l->open_q, (SIZE_T)l->nopen_q * sizeof *s->open_q);
+    s->cap_open_q = s->nopen_q = l->nopen_q;
+  }
+  if (l->nopen_q > GROUP_QUERIES) (void)query_scratch(l);      /* (the expansion groups them as the list does, with the list's scratch) */
+  s->query_scratch = l->query_scratch;
   in->sig = (CmdSig *)sig;
   in->args = (Resource *)args;
   in->count = (Resource *)count;
@@ -766,33 +864,76 @@ static void STDMETHODCALLTYPE list_SetPredication(CmdList *l, ID3D12Resource *bu
 
 /* ---- stream output ------------------------------------------------------------------------------------------------------------------------------------------------------- */
 
+/* A view's writes start at BufferLocation plus the filled size at BufferFilledSizeLocation when its draws run (the value then: read as the chunk is run, which the binding
+ * begins - so the copies that set it before are done), and stop at SizeInBytes after BufferLocation (the kernel's end of the binding: a primitive that does not fit is not
+ * written, nor any after it, and it counts as needed and not written in the stream output statistics). The filled size is the bytes after BufferLocation the draws reached:
+ * written after each chunk from the one that sent the binding on (list_apply_fills), so the copies of it in the list that come after the draws (in a chunk after them:
+ * so_copy_order) and the next binding read it. A view with no BufferFilledSizeLocation starts at BufferLocation. The views' SizeInBytes past the buffer's end is cut there. */
 static void STDMETHODCALLTYPE list_SOSetTargets(CmdList *l, UINT start, UINT count, const D3D12_STREAM_OUTPUT_BUFFER_VIEW *views) {
   if (l->bundle) return;
+  int filled_sizes = 0;
+  for (UINT i = 0; i < count && start + i < 4; ++i) filled_sizes |= views && views[i].BufferLocation && views[i].BufferFilledSizeLocation;
+  for (UINT i = 0; i < count && start + i < 4; ++i) {      /* (the bindings replaced: their draws end in this chunk) */
+    const UINT entry = l->so[start + i].alloc ? l->so[start + i].fill_entry : 0xFFFFFFFFu;
+    if (entry < l->nfills && l->fills[entry].retired_chunk == 0xFFFFFFFFu) l->fills[entry].retired_chunk = l->nchunks ? l->nchunks - 1 : 0;
+  }
+  if (filled_sizes && chunk_cur(l)) { end_pass(l); chunk_new(l); }      /* (the draws after it read the filled sizes as they are when their chunk runs) */
   for (UINT i = 0; i < count && start + i < 4; ++i) {
     SoTarget *t = &l->so[start + i];
     memset(t, 0, sizeof *t);
+    t->fill_entry = 0xFFFFFFFFu;
     if (!views || !views[i].BufferLocation) continue;
     UINT64 offset = 0;
     Resource *r = va_find(views[i].BufferLocation, &offset);
     if (!r) continue;
     t->alloc = r->alloc;
     t->offset = offset;
+    const UINT64 room = r->desc.Width > offset ? r->desc.Width - offset : 0;
+    t->size = views[i].SizeInBytes < room ? views[i].SizeInBytes & ~(UINT64)3 : room & ~(UINT64)3;
+    if (t->offset > 0xFFFFFFFFu || t->offset + t->size > 0xFFFFFFFFu) { memset(t, 0, sizeof *t); t->fill_entry = 0xFFFFFFFFu; continue; }
     UINT64 fill_offset = 0;
     t->fill = views[i].BufferFilledSizeLocation ? va_find(views[i].BufferFilledSizeLocation, &fill_offset) : NULL;
     t->fill_offset = fill_offset;
-    if (t->fill && l->nfills < 16) l->fills[l->nfills++] = *t;
+    t->sent_chunk = t->retired_chunk = 0xFFFFFFFFu;
+    if (t->fill && l->nfills < 16) {
+      t->fill_entry = l->nfills;
+      l->fills[l->nfills++] = *t;
+    }
   }
   l->so_dirty = 1;
 }
 
-/* The bytes of each target the list wrote, into the places the program named (after the list ran). */
-static void list_apply_fills(CmdList *l) {
+/* The bytes of each target the draws reached, into the places the program named: after chunk `chunk` ran, for each binding sent in it or before (the last of a buffer's). */
+static void list_apply_fills(CmdList *l, UINT chunk) {
   for (UINT i = 0; i < l->nfills; ++i) {
     const SoTarget *t = &l->fills[i];
+    if (t->sent_chunk == 0xFFFFFFFFu || t->sent_chunk > chunk || (t->retired_chunk != 0xFFFFFFFFu && chunk > t->retired_chunk)) continue;
+    int later = 0;      /* (a later binding of the buffer that was sent: the buffer's end is that one's) */
+    for (UINT k = i + 1; k < l->nfills && !later; ++k) later = l->fills[k].alloc == t->alloc && l->fills[k].sent_chunk <= chunk;
+    if (later) continue;
     UINT request[2] = {ESC_QUERY_STREAM_OUTPUT, t->alloc}, reply[2] = {0, 0};
     if (!KMT_OK(dev_escape(l->d.dev, request, 2, reply, 2))) continue;
     UINT64 filled = reply[0] | ((UINT64)reply[1] << 32);
     filled = filled > t->offset ? filled - t->offset : 0;
+    if (filled > t->size) filled = t->size;
     res_write(t->fill, t->fill_offset, &filled, 8);
   }
+}
+
+/* A copy in the list that reads a filled size the draws of this chunk write (after the chunk): it goes into the next chunk. One that writes the filled size of a bound
+ * target: the binding is sent again after it (in a chunk of its own), starting where the value says. */
+static void so_copy_order(CmdList *l, const ID3D12Resource *dst, const ID3D12Resource *src, int after) {
+  if (!after) {      /* (before the copy: one that reads a filled size of this chunk's draws goes into the next) */
+    const UINT current = l->nchunks ? l->nchunks - 1 : 0;
+    for (UINT i = 0; i < l->nfills; ++i)
+      if ((const ID3D12Resource *)l->fills[i].fill == src && l->fills[i].sent_chunk == current) { end_pass(l); chunk_new(l); break; }
+    return;
+  }
+  for (UINT s = 0; s < 4; ++s)      /* (after it: one that wrote a bound target's filled size ends the chunk, and the binding is sent again from the value) */
+    if (l->so[s].alloc && (const ID3D12Resource *)l->so[s].fill == dst) {
+      end_pass(l);
+      chunk_new(l);
+      l->so_dirty = 1;
+      break;
+    }
 }

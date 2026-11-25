@@ -36,10 +36,28 @@
 #define ROOM_BYTES 4096
 #define ROOM_ALLOCS 160      /* (what a draw uses itself, and the resources its tables of descriptors reach: TABLE_ALLOCS a table) */
 #define TABLE_ALLOCS 32
-#define MAX_OPEN_QUERIES 64  /* queries open at once in a list */
+#define GROUP_QUERIES 32     /* more queries open than this at the start of a chunk: those of one kind are counted there by one device query (QueryFan) */
+#define QUERY_SCRATCH_STRIDE 128u   /* the bytes of a fan's result in the list's scratch allocation (the largest result: 112) */
 #define CHUNK_QUERIES 250    /* the device queries of a chunk (graphics::kMaxOcclusionQueries, 256, in the kernel) */
 
 struct Indirect;
+/* A binding of a stream output target in a chunk that starts where the target's filled size says (Direct3D 12 appends at BufferLocation + *BufferFilledSizeLocation): the
+ * chunk's offset word at byte `at` is made from the value when the chunk is run (queue.inc: run_chunk). */
+typedef struct SoPatch {
+  UINT at;
+  struct Resource *fill;
+  UINT64 fill_offset, offset, size;
+} SoPatch;
+
+/* A device query of a chunk that counts for many of the list's open queries of one kind (more than GROUP_QUERIES open when the chunk began): it is written to
+ * slot `slot` of the list's scratch allocation, and when the chunk has run its values are added to each member's result (queue.inc: chunk_fan_out). */
+typedef struct FanMember { UINT alloc, offset; } FanMember;
+typedef struct QueryFan {
+  UINT kind, slot;
+  FanMember *members;
+  UINT nmembers;
+} QueryFan;
+
 typedef struct Chunk {
   BYTE *bytes;
   UINT size;
@@ -50,6 +68,11 @@ typedef struct Chunk {
   int pred_op;
   UINT allocs[CHUNK_ALLOCS];
   UINT nalloc;
+  SoPatch *so_patches;         /* the stream output bindings whose start is read when the chunk is run */
+  UINT nso_patches;
+  QueryFan *fans;              /* the chunk's device queries for groups of open queries, and the list's scratch allocation they write */
+  UINT nfans, fan_scratch;
+  int fans_open;               /* (their device queries are begun in the chunk and not yet ended) */
 } Chunk;
 
 typedef struct RootArg {
@@ -64,9 +87,14 @@ typedef struct RootArg {
 typedef struct SoTarget {
   UINT alloc;
   UINT64 offset;
+  UINT64 size;                 /* SizeInBytes: the writes stop at offset + size */
   struct Resource *fill;       /* BufferFilledSizeLocation */
   UINT64 fill_offset;
+  UINT sent_chunk;             /* (a fill: the chunk its binding was first sent in, ~0 before; its filled size is written after that chunk and every later one ...) */
+  UINT retired_chunk;          /* (... up to this one, the last its draws can be in: SOSetTargets bound another; ~0 while it is bound) */
+  UINT fill_entry;             /* (a target: its entry in CmdList.fills, ~0 for none) */
 } SoTarget;
+
 
 typedef struct Binding {
   RootSig *rs;
@@ -116,10 +144,13 @@ struct CmdList {
   /* the kernel pipelines the recording binds, each once (its PSO keeps it until the list is reset: pso_use / pso_unuse) */
   struct BoundPipe { Pso *pso; UINT handle; } *bound;
   UINT nbound, cap_bound;
+  /* the queries open (extras.inc): each is begun again in every chunk it goes on into, adding to what the chunks before counted - or counted in a chunk by one device
+   * query for all of its kind (`grouped`) when many are open. Any number (the room is kept across resets); the scratch allocation of the groups' results. */
+  struct OpenQuery { struct QHeap *heap; UINT index; D3D12_QUERY_TYPE type; UINT kind; int grouped; } *open_q;
+  UINT cap_open_q;
+  UINT query_scratch;
   /* the state of the recording */
   Pso *pso;
-  /* the queries open (extras.inc): each is begun again in every chunk it goes on into, adding to what the chunks before counted */
-  struct OpenQuery { struct QHeap *heap; UINT index; D3D12_QUERY_TYPE type; UINT kind; } open_q[MAX_OPEN_QUERIES];
   UINT nopen_q;
   Resource *pred;              /* the predication in force */
   UINT64 pred_off;
@@ -230,7 +261,7 @@ static int chunk_new(CmdList *l) {
   }
   Chunk *c = mem_alloc(sizeof *c);
   if (!c) return 0;
-  c->bytes = mem_alloc(CHUNK_BYTES + 256 + MAX_OPEN_QUERIES * 12);      /* (room for the EndQuery of every open query) */
+  c->bytes = mem_alloc(CHUNK_BYTES + 256 + CHUNK_QUERIES * 12);      /* (room for the EndQuery of every device query of the chunk) */
   if (!c->bytes) { mem_free(c); return 0; }
   c->pred = l->pred;
   c->pred_off = l->pred_off;
@@ -315,6 +346,9 @@ static void indirect_free(struct Indirect *i);
 static void list_free_recording(CmdList *l) {
   for (UINT i = 0; i < l->nchunks; ++i) {
     if (l->chunks[i]->indirect) indirect_free(l->chunks[i]->indirect);
+    for (UINT f = 0; f < l->chunks[i]->nfans; ++f) mem_free(l->chunks[i]->fans[f].members);
+    mem_free(l->chunks[i]->fans);
+    mem_free(l->chunks[i]->so_patches);
     mem_free(l->chunks[i]->bytes);
     mem_free(l->chunks[i]);
   }
@@ -348,6 +382,8 @@ static void list_destroy(DxObj *o) {
   mem_free(l->temps);
   mem_free(l->bound);
   mem_free(l->log);
+  mem_free(l->open_q);
+  if (l->query_scratch) kmt_destroy_allocation(l->d.dev->kdev, l->query_scratch);
   dobj_child_destroy(o);
 }
 
@@ -786,10 +822,23 @@ static int prepare_draw(CmdList *l, int indexed) {
   for (UINT s = 0; s < 4; ++s) {
     const SoTarget *t = &l->so[s];
     if (t->alloc == l->sent_so_alloc[s] && !(t->alloc && l->so_dirty)) continue;
-    UINT w[3] = {s, t->alloc ? alloc_index(l, t->alloc) : 0xFFFFFFFFu, 0};
-    /* (the first time a bind is sent it starts at the view's offset; sent again after a new chunk it goes on from where the draws before ended) */
-    w[2] = !t->alloc ? 0 : l->so_started[s] && !l->so_dirty ? 0xFFFFFFFFu : (UINT)t->offset;
-    packet(l, OP_SET_STREAM_OUTPUT, w, 3);
+    UINT w[4] = {s, t->alloc ? alloc_index(l, t->alloc) : 0xFFFFFFFFu, 0, 0xFFFFFFFFu};
+    /* (the first time a bind is sent it starts at the view's offset - and after its filled size, read when the chunk is run -; sent again after a new chunk it goes on from
+     * where the draws before ended. The writes stop at the view's end, SizeInBytes after its offset.) */
+    const int fresh = !(l->so_started[s] && !l->so_dirty);
+    w[2] = !t->alloc ? 0 : fresh ? (UINT)t->offset : 0xFFFFFFFFu;
+    if (t->alloc) w[3] = (UINT)(t->offset + t->size);
+    Chunk *c = chunk_cur(l);
+    if (t->alloc && fresh && t->fill && c) {
+      SoPatch *grown = mem_grow(c->so_patches, (SIZE_T)(c->nso_patches + 1) * sizeof *grown);
+      if (grown) {
+        c->so_patches = grown;
+        const SoPatch p = {c->size + 12, t->fill, t->fill_offset, t->offset, t->size};      /* (the offset word: after the packet's header, the slot and the allocation) */
+        c->so_patches[c->nso_patches++] = p;
+      }
+    }
+    if (t->alloc && t->fill_entry < l->nfills && l->fills[t->fill_entry].sent_chunk == 0xFFFFFFFFu) l->fills[t->fill_entry].sent_chunk = l->nchunks - 1;
+    packet(l, OP_SET_STREAM_OUTPUT, w, t->alloc ? 4 : 3);
     l->sent_so_alloc[s] = t->alloc;
     l->so_started[s] = t->alloc != 0;
   }
@@ -1141,13 +1190,16 @@ static void STDMETHODCALLTYPE list_DiscardResource(CmdList *l, ID3D12Resource *r
 
 /* ---- copies ------------------------------------------------------------------------------------------------------------------------------------------------------------------- */
 
+static void so_copy_order(CmdList *l, const ID3D12Resource *dst, const ID3D12Resource *src, int after);
 static void STDMETHODCALLTYPE list_CopyBufferRegion(CmdList *l, ID3D12Resource *dst, UINT64 dst_offset, ID3D12Resource *src, UINT64 src_offset, UINT64 bytes) {
+  if (!l->bundle) so_copy_order(l, dst, src, 0);
   Resource *d = (Resource *)dst, *s = (Resource *)src;
   if (!d || !s || !bytes || dst_offset > 0xFFFFFFFFu || src_offset > 0xFFFFFFFFu || bytes > 0xFFFFFFFFu) return;
   end_pass(l);
   ensure_room(l, 256, 4);
   UINT w[5] = {alloc_index(l, d->alloc), (UINT)dst_offset, alloc_index(l, s->alloc), (UINT)src_offset, (UINT)bytes};
   packet(l, OP_COPY_BUFFER, w, 5);
+  if (!l->bundle) so_copy_order(l, dst, src, 1);
 }
 
 /* The mip level and layer a subresource index names. */

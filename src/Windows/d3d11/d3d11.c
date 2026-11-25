@@ -31,8 +31,8 @@
  *   depth textures     a Direct3D 12 depth buffer (also a staging texture of a typed depth format): views of any of its levels and layers, copies of whole subresources
  *                      (both planes; a part of one copies nothing), its texels mapped and written as the format's through Direct3D 12's planes (tex_depth_rows).
  *                      SetResourceMinLOD is the ResourceMinLODClamp of the views made of the texture.
- *   vertex layouts     the kernel takes 32-bit floats only: a layout with R8G8B8A8 / B8G8R8A8 colours gets its vertex buffers converted (a second
- *                      buffer, made again when the first changes).
+ *   vertex layouts     checked against the vertex shader's input signature as Windows checks them (src/Windows/dx_layout.h); a format the device does not read
+ *                      gets its slot's vertex buffer converted (a second buffer, made again when the first changes).
  *   states             a Direct3D 12 pipeline state for each combination of shaders, layout, blend, depth and rasterizer state that is drawn with,
  *                      kept in a cache. Its strips are cut at the index buffer's largest index (Direct3D 12's strip cut of the list, set with the
  *                      index buffer at each indexed draw); its lines are those of MultisampleEnable / AntialiasedLineEnable (quadrilateral, alpha-antialiased).
@@ -67,6 +67,7 @@
 #include "../tcosdx.h"
 #include "../tcos_swizzle.h"
 #include "dxbc_link.h"
+#include "../dx_layout.h"
 
 #pragma GCC diagnostic ignored "-Wunused-function"
 #pragma GCC diagnostic ignored "-Wincompatible-pointer-types"
@@ -143,6 +144,7 @@ struct Buf {
   UINT64 so_end;
   ID3D12Resource *so_fill;
   BYTE *so_fill_data;
+  UINT so_slot;                       /* (the slot of so_fill the last binding of the list has: so_record) */
   /* Tiled resources (tiled.inc): a tile pool (D3D11_RESOURCE_MISC_TILE_POOL) has `tile_pool`, the heaps of Direct3D 12 its tiles are in; a tiled buffer
    * (D3D11_RESOURCE_MISC_TILED: `tiled`, `res` a reserved buffer of the GPU's memory) has the pool its tiles are mapped into (a reference; NULL: none yet). */
   struct TilePool *tile_pool;
@@ -253,11 +255,11 @@ typedef struct Shader {
 typedef struct Layout {
   Child c;
   UINT count;
-  D3D12_INPUT_ELEMENT_DESC elements[16];  /* as the pipeline gets them (the formats and offsets after the conversion) */
-  char names[16][32];
-  UINT source_offset[16];
-  DXGI_FORMAT source_format[16];
-  UINT slot_converted[VERTEX_SLOTS];      /* the stride of the converted buffer of a slot, 0: used as it is */
+  D3D12_INPUT_ELEMENT_DESC elements[DXL_MAX_ELEMENTS];  /* as the pipeline gets them (the formats and offsets after the conversion) */
+  char names[DXL_MAX_ELEMENTS][64];
+  UINT source_offset[DXL_MAX_ELEMENTS];
+  DXGI_FORMAT source_format[DXL_MAX_ELEMENTS];
+  UINT slot_converted[DXL_MAX_SLOTS];      /* the stride of the converted buffer of a slot, 0: used as it is (slots from VERTEX_SLOTS on: elements no draw can read) */
 } Layout;
 
 /* The state objects. Direct3D 11 hands out the same object for the same description: a device keeps those it made in a list a kind (Dev.states, `next`), and the
@@ -2369,29 +2371,25 @@ static void element_decode(DXGI_FORMAT format, const BYTE *p, UINT32 out[4]) {
   if (!integer) memcpy(out, f, 16);
 }
 
+static uint32_t layout_element_bytes(uint32_t format) { return element_bytes((DXGI_FORMAT)format); }
+/* The layout is checked as Direct3D 11 checks it (src/Windows/dx_layout.h): the elements (at most 32, in slots 0 .. 31: an element in a slot past the ones a draw can
+ * bind here is kept, and a pipeline whose vertex shader reads it is refused), and against the input signature of the shader given - every input it reads must have an
+ * element of its semantic, the system values aside. E_INVALIDARG for any of that. */
 static HRESULT STDMETHODCALLTYPE dev_CreateInputLayout(Dev *d, const D3D11_INPUT_ELEMENT_DESC *elements, UINT count, const void *code, SIZE_T bytes, ID3D11InputLayout **out) {
-  (void)code; (void)bytes;
   if (out) *out = NULL;
-  if ((!elements && count) || count > 16) return E_INVALIDARG;
-  /* What Direct3D 11 refuses: an element with no semantic name, an input slot past the last, a format no vertex has, a classification that is neither, a per-vertex
-   * element with a step rate, elements of one slot that differ in classification or step rate, two elements with the same semantic, an offset that is not a
-   * multiple of the element's size or of 4 if that is smaller. */
+  _Static_assert(sizeof(D3D11_INPUT_ELEMENT_DESC) == sizeof(DxlElement) && offsetof(D3D11_INPUT_ELEMENT_DESC, InstanceDataStepRate) == offsetof(DxlElement, step_rate), "the same layout");
+  const DxlElement *checked = (const DxlElement *)(const void *)elements;      /* (the same seven fields: dx_layout.h) */
+  if (dxl_check_elements(checked, count, layout_element_bytes, DXL_RULES_D3D11) != DXL_OK) return E_INVALIDARG;
+  if (!code || dxl_check_signature(checked, count, code, bytes) != DXL_OK) return E_INVALIDARG;
   for (UINT i = 0; i < count; ++i) {
-    const D3D11_INPUT_ELEMENT_DESC *e = &elements[i];
-    const UINT size = element_bytes(e->Format), unit = size >= 4 ? 4 : size;
-    if (!e->SemanticName || e->InputSlot >= VERTEX_SLOTS || !size) return E_INVALIDARG;
-    if (e->InputSlotClass != D3D11_INPUT_PER_VERTEX_DATA && e->InputSlotClass != D3D11_INPUT_PER_INSTANCE_DATA) return E_INVALIDARG;
-    if (e->InputSlotClass == D3D11_INPUT_PER_VERTEX_DATA && e->InstanceDataStepRate != 0) return E_INVALIDARG;
-    if (e->AlignedByteOffset != D3D11_APPEND_ALIGNED_ELEMENT && e->AlignedByteOffset % unit) return E_INVALIDARG;
-    for (UINT k = 0; k < i; ++k) {
-      const D3D11_INPUT_ELEMENT_DESC *o = &elements[k];
-      if (o->InputSlot == e->InputSlot && (o->InputSlotClass != e->InputSlotClass || o->InstanceDataStepRate != e->InstanceDataStepRate)) return E_INVALIDARG;
-      if (o->SemanticIndex == e->SemanticIndex && !lstrcmpiA(o->SemanticName, e->SemanticName)) return E_INVALIDARG;
-    }
+    SIZE_T n = 0;
+    while (elements[i].SemanticName[n]) ++n;
+    if (n >= sizeof ((Layout *)0)->names[0]) return E_INVALIDARG;      /* (a semantic of 64 characters or more: no shader has one) */
   }
+  if (!out) return S_FALSE;      /* (only checked) */
   Layout *l = child_new(sizeof *l, d, &layout_vtbl, g_layout_iids, child_destroy);
   if (!l) return E_OUTOFMEMORY;
-  UINT next[VERTEX_SLOTS] = {0}, slot_needs[VERTEX_SLOTS] = {0};
+  UINT next[DXL_MAX_SLOTS] = {0}, slot_needs[DXL_MAX_SLOTS] = {0};
   l->count = count;
   for (UINT i = 0; i < count; ++i) {
     const UINT slot = elements[i].InputSlot, size = element_bytes(elements[i].Format), unit = size >= 4 ? 4 : size;
@@ -2411,7 +2409,7 @@ static HRESULT STDMETHODCALLTYPE dev_CreateInputLayout(Dev *d, const D3D11_INPUT
   }
   /* A slot with an element of a format the device does not read is repacked: its elements one after the other, each as four 32-bit floats or integers (element_decode,
    * vertex_source). */
-  for (UINT slot = 0; slot < VERTEX_SLOTS; ++slot) {
+  for (UINT slot = 0; slot < DXL_MAX_SLOTS; ++slot) {
     if (!slot_needs[slot]) continue;
     UINT offset = 0;
     for (UINT i = 0; i < count; ++i) {

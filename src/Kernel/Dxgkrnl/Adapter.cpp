@@ -758,6 +758,7 @@ class Adapter::StreamRunner {
 
   NtStatus set_stream_output(ByteReader& p) {
     const uint32_t slot = p.le32(), index = p.le32(), offset = p.le32();
+    const uint32_t end = p.at_end() ? kStreamOutputNoEnd : p.le32();   // (optional: where the writes stop)
     if (!exact(p) || !(adapter_.caps_.features & graphics::kFeatureStreamOutput) || slot >= graphics::kMaxStreamOutputBuffers) return kBad;
     if (index == kNoAllocation) {
       so_bound_[slot] = false;
@@ -771,13 +772,14 @@ class Adapter::StreamRunner {
     Allocation* a = alloc(index);
     const bool append = offset == kStreamOutputAppendOffset;
     if (!a || !(a->desc().flags & kAllocStreamOutput) || (!append && (offset % 4 || offset > a->desc().size)) || !use(a, state::kStreamOut)) return kBad;
+    if (end != kStreamOutputNoEnd && (end % 4 || end > a->desc().size || (!append && end < offset))) return kBad;
     so_bound_[slot] = true;
     so_alloc_[slot] = a;
     if (!exec_) return status::kSuccess;
     NtStatus s = resident(*a);
     if (s == status::kSuccess) s = ensure_cb();
     if (s != status::kSuccess) return s;
-    cb_->bind_stream_output(slot, a->buffer(), append ? graphics::kStreamOutputAppend : offset);
+    cb_->bind_stream_output(slot, a->buffer(), append ? graphics::kStreamOutputAppend : offset, end == kStreamOutputNoEnd ? graphics::kStreamOutputNoEnd : end);
     return status::kSuccess;
   }
 
@@ -3308,6 +3310,7 @@ NtStatus Adapter::create_pipeline(const PipelineDesc& d, const SharedPointer<Sha
   pd.varying_count = d.varying_count;
   pd.texture_count = texture_count;
   pd.fragment_stores = fragment->fragment_stores_ || fragment->image_mask_.any();   // (a pixel shader that writes images runs for every fragment too)
+  pd.stand_in_fragment = d.stand_in_fragment;
   pd.vertex_stores = vertex->vertex_stores_;
   pd.geometry_stores = geometry && geometry->geometry_stores_;
   pd.tessellation_stores = (hull && hull->tessellation_stores_) || (domain && domain->tessellation_stores_);

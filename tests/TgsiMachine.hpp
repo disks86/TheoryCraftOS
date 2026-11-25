@@ -140,7 +140,7 @@ class TgsiMachine {
         }
       }
       ++pc;
-      if (op == "END") break;
+      if (op == "END" || op == "RET") break;   // (RET: the text has no subroutines, so a return ends the program)
       if (op == "BARRIER") {
         if (!stop_at_barrier) continue;
         at_barrier = true;
