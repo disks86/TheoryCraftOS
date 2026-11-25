@@ -1332,6 +1332,12 @@ enum DeviceFeature2 : uint32_t {
 // (DEV_FEATURE3_*, TcosD3D12DeviceFeatures3). Bits are taken in ranges so work on different parts does not collide: 0-7 multisampled reads and interpolation, 8-15 feature
 // levels 11_1 / 12_x (rasterizer ordered views, forced sample counts), 16-23 shader model 6 (wave operations), 24-31 the rest.
 enum DeviceFeature3 : uint32_t {
+  // bind_vertex_buffer_slot(slot, nullptr) leaves the slot with no buffer, and the attributes a pipeline reads from it read 0 - the components their format lacks the usual
+  // 0, 0, 0, 1 (Direct3D's unbound input slot).
+  kFeature3NullVertexBuffers = 1u << 24,
+  // A vertex buffer slot of stride 0 (GraphicsPipelineDesc::vertex_stride / slot_strides): every vertex, or instance, reads the same element; its attributes lie within
+  // the first kMaxVertexStride bytes.
+  kFeature3ZeroStride = 1u << 25,
 };
 
 constexpr uint32_t sampler_features2(const SamplerDesc& s) {

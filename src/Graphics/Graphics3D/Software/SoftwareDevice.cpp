@@ -2971,15 +2971,15 @@ bool SoftwareDevice::submit(ICommandBuffer* commands) {
           }
         }
         if (pd.color_target_count == 0 || pd.color_target_count > kMaxColorTargets || (pd.color_target_count > 1 && !s.extra_colors[pd.color_target_count - 2])) return false;
-        // (the vertex buffers the attributes read: each one bound, and the vertices of the draw inside it)
+        // (the vertex buffers the attributes read, and the vertices of the draw inside them; a slot with no buffer reads zeros: kFeature3NullVertexBuffers - its view is empty,
+        // which read_vertex_attribute reads as 0, the components the format lacks 0, 0, 0, 1)
         VertexStreams streams;
         uint32_t slots_used = 0;
         for (uint32_t k = 0; k < pd.attribute_count; ++k) {
           const uint32_t slot = pd.attributes[k].slot;
-          if (slot >= kMaxVertexBuffers || !vertex_buffers[slot]) return false;
-          slots_used |= 1u << slot;
+          if (slot >= kMaxVertexBuffers) return false;
+          if (vertex_buffers[slot]) slots_used |= 1u << slot;
         }
-        if (slots_used == 0 && !vertex_buffers[0]) return false;
         for (uint32_t slot = 0; slot < kMaxVertexBuffers; ++slot)
           if (slots_used >> slot & 1) {
             streams.data[slot] = ConstByteView(vertex_buffers[slot]->map());
@@ -3007,7 +3007,8 @@ bool SoftwareDevice::submit(ICommandBuffer* commands) {
             if (!(slots_used >> slot & 1)) continue;
             const uint32_t stride = slot == 0 ? pd.vertex_stride : pd.slot_strides[slot];
             const uint64_t element = at.per_instance ? instance_element(at, cmd.first_instance, instance) : static_cast<uint64_t>(v);
-            if (streams.offset[slot] + (element + 1) * stride > streams.data[slot].size()) return false;
+            // (the attribute itself: at stride 0 every element is the first)
+            if (streams.offset[slot] + element * stride + at.offset + vertex_format_bytes(at.format) > streams.data[slot].size()) return false;
           }
           VertexContext context;
           context.vertex_id = static_cast<uint32_t>(v);

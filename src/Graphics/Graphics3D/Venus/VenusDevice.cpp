@@ -164,6 +164,9 @@ DeviceInfo VenusDevice::info() const {
   if (c.sampler_minmax) i.features2 |= kFeature2SamplerReductions;
   if (c.smooth_lines && c.rectangular_lines && c.max_line_width >= 1.4f) i.features2 |= kFeature2LineModes;
   if (c.depth_bounds) i.features2 |= kFeature2DepthBounds;
+  // (a slot with no buffer is VK_NULL_HANDLE, robustness2's null descriptor: its attributes read 0, 0, 0 and 0 or 1 as the format has; Vulkan takes bindings of stride 0)
+  if (c.null_descriptor) i.features3 |= kFeature3NullVertexBuffers;
+  i.features3 |= kFeature3ZeroStride;
   i.sample_counts = sample_counts_ & ((1u << 2) | (1u << 4) | (1u << 8));
   if (i.sample_counts) i.features |= kFeatureMultisample | kFeatureDepthResolve, i.features2 |= kFeature2ColorResolveModes;
   i.d3d_sample_order = true;   // (Vulkan's standard sample locations are Direct3D's)

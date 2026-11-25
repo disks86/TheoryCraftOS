@@ -51,7 +51,10 @@ class VirglDevice final : public IGraphicsDevice {
             // desktop GL host has; dual-source blending when the host blends one target so)
             kFeature2RasterizerState | kFeature2LogicOps | kFeature2SamplerState | kFeature2SeparateFilters | kFeature2LineModes | (gpu_.virgl_max_dual_source_targets() >= 1 ? kFeature2DualSourceBlend : 0u) |
             // (sixteen viewports, which geometry shaders pick with gl_ViewportIndex; a vertex or evaluation shader's layer and viewport the host does not take from virgl's shaders)
-            (gpu_.virgl_has_geometry() && gpu_.virgl_max_viewports() >= kMaxViewports ? kFeature2Viewports : 0u)};
+            (gpu_.virgl_has_geometry() && gpu_.virgl_max_viewports() >= kMaxViewports ? kFeature2Viewports : 0u),
+            // (a slot with no buffer reads a buffer of zeros of the device's at stride 0, and strides of 0 are the host's glBindVertexBuffer(s) ones: GL 4.3's vertex attribute
+            // bindings, which virglrenderer uses where the host has them - as it has compute -; its older glVertexAttribPointer path takes 0 as "tightly packed")
+            gpu_.virgl_has_compute() ? kFeature3NullVertexBuffers | kFeature3ZeroStride : 0u};
   }
   // What the host's GL has (GL 3.3, which the TGSI it is given needs, at least): 16 texture units in each stage (GL_MAX_TEXTURE_IMAGE_UNITS, GL_MAX_VERTEX_TEXTURE_IMAGE_UNITS), 16
   // vertex attributes (GL_MAX_VERTEX_ATTRIBS); varyings: the vertex shader's outputs are 16 vectors in GL 4 (GL_MAX_VERTEX_OUTPUT_COMPONENTS 64), 15 in GL 3.3 (GL_MAX_VARYING_COMPONENTS
@@ -101,6 +104,8 @@ class VirglDevice final : public IGraphicsDevice {
   bool destroy_object(uint32_t handle);
   // The host-side sampler state object for `sampler`, made on first use (0 if the host refuses it).
   uint32_t sampler_state(const SamplerDesc& sampler);
+  // A vertex buffer of zeros (kFeature3NullVertexBuffers: what a slot with no buffer reads, at stride 0), made on first use; nullptr if the host will not make one.
+  IBuffer* zero_vertex_buffer();
 
  private:
   bool clock_interrupted_ = false;   // (until a disjoint query has said so)
@@ -118,6 +123,7 @@ class VirglDevice final : public IGraphicsDevice {
   static constexpr uint32_t kSamplerStates = 256;
   SamplerState sampler_states_[kSamplerStates];
   uint32_t sampler_state_count_ = 0;
+  IBuffer* zero_vertex_buffer_ = nullptr;
 };
 
 }  // namespace graphics

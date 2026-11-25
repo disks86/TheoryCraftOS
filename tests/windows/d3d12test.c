@@ -1366,6 +1366,67 @@ static void test_bundle(Scene *c) {
   ID3D12CommandAllocator_Release(balloc);
 }
 
+/* Root arguments and bundles (Direct3D 12 "Bundle Semantics"): a bundle inherits the caller's root arguments; setting the caller's root signature again inside it keeps them
+ * (as setting the same one again on a list does); what the bundle sets is the caller's afterwards. The matrix of the root constants puts the triangle in one half. */
+static void test_bundle_root_arguments(Scene *c) {
+  ID3D12Device *dev = c->dev;
+  ID3D12CommandAllocator *balloc = NULL;
+  ID3D12GraphicsCommandList *same = NULL, *sets = NULL, *list = NULL;
+  CHECK_HR(ID3D12Device_CreateCommandAllocator(dev, D3D12_COMMAND_LIST_TYPE_BUNDLE, &IID_ID3D12CommandAllocator, (void **)&balloc));
+  if (!balloc) return;
+  CHECK_HR(ID3D12Device_CreateCommandList(dev, 0, D3D12_COMMAND_LIST_TYPE_BUNDLE, balloc, NULL, &IID_ID3D12GraphicsCommandList, (void **)&same));
+  CHECK_HR(ID3D12Device_CreateCommandList(dev, 0, D3D12_COMMAND_LIST_TYPE_BUNDLE, balloc, NULL, &IID_ID3D12GraphicsCommandList, (void **)&sets));
+  CHECK_HR(ID3D12Device_CreateCommandList(dev, 0, D3D12_COMMAND_LIST_TYPE_DIRECT, c->allocator, NULL, &IID_ID3D12GraphicsCommandList, (void **)&list));
+  if (same && sets && list) {
+    float left[16], right[16];
+    memcpy(left, kIdentity, sizeof left);
+    left[0] = left[5] = 0.5f;
+    memcpy(right, left, sizeof right);
+    left[3] = -0.5f;
+    right[3] = 0.5f;
+    D3D12_VERTEX_BUFFER_VIEW vbv = {ID3D12Resource_GetGPUVirtualAddress(c->vb), 256, 28};
+    /* (the caller's root signature again, the pipeline, the buffers and a draw: no root constants of its own) */
+    ID3D12GraphicsCommandList_SetGraphicsRootSignature(same, c->rs);
+    ID3D12GraphicsCommandList_SetPipelineState(same, c->pso);
+    ID3D12GraphicsCommandList_IASetPrimitiveTopology(same, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    ID3D12GraphicsCommandList_IASetVertexBuffers(same, 0, 1, &vbv);
+    ID3D12GraphicsCommandList_DrawInstanced(same, 3, 1, 0, 0);
+    CHECK_HR(ID3D12GraphicsCommandList_Close(same));
+    /* (one that sets the caller's signature and new constants, and draws nothing) */
+    ID3D12GraphicsCommandList_SetGraphicsRootSignature(sets, c->rs);
+    ID3D12GraphicsCommandList_SetGraphicsRoot32BitConstants(sets, 0, 16, left, 0);
+    CHECK_HR(ID3D12GraphicsCommandList_Close(sets));
+    for (int k = 0; k < 3; ++k) {
+      if (k) CHECK_HR(ID3D12GraphicsCommandList_Reset(list, c->allocator, NULL));      /* (made open) */
+      scene_begin(c, list, 1);
+      ID3D12GraphicsCommandList_SetGraphicsRootSignature(list, c->rs);
+      ID3D12GraphicsCommandList_SetGraphicsRoot32BitConstants(list, 0, 16, right, 0);
+      if (k == 0) {
+        ID3D12GraphicsCommandList_ExecuteBundle(list, same);      /* (inherits the right half) */
+      } else {
+        if (k == 1) ID3D12GraphicsCommandList_SetGraphicsRootSignature(list, c->rs);      /* (the same signature again on the list: the constants stay) */
+        else ID3D12GraphicsCommandList_ExecuteBundle(list, sets);                          /* (the bundle's constants are the caller's after it: the left half) */
+        ID3D12GraphicsCommandList_SetPipelineState(list, c->pso);
+        ID3D12GraphicsCommandList_IASetPrimitiveTopology(list, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        ID3D12GraphicsCommandList_IASetVertexBuffers(list, 0, 1, &vbv);
+        ID3D12GraphicsCommandList_DrawInstanced(list, 3, 1, 0, 0);
+      }
+      scene_read_target(c, list);
+      scene_run(c, list);
+      const int l_n = scene_coloured(c, 0, 0, 32, 64), r_n = scene_coloured(c, 32, 0, 64, 64);
+      printf("bundle root arguments %d: %d pixels left, %d right\n", k, l_n, r_n);
+      if (k == 2) CHECK(l_n > 150 && r_n == 0);
+      else CHECK(r_n > 150 && l_n == 0);
+    }
+  } else {
+    CHECK(0);
+  }
+  if (list) ID3D12GraphicsCommandList_Release(list);
+  if (same) ID3D12GraphicsCommandList_Release(same);
+  if (sets) ID3D12GraphicsCommandList_Release(sets);
+  ID3D12CommandAllocator_Release(balloc);
+}
+
 static void test_tiled(Scene *c) {
   ID3D12Device *dev = c->dev;
   D3D12_FEATURE_DATA_D3D12_OPTIONS opts;
@@ -2201,6 +2262,89 @@ static void test_all_vertex_formats(Scene *c) {
   }
   ID3D12Resource_Release(positions);
   ID3D12Resource_Release(offsets);
+  ID3D12Resource_Release(colours);
+}
+
+/* Vertex buffer slots with no buffer and of stride 0 (Direct3D 12: a null vertex buffer view reads 0 - the components the format lacks 0, 0, 0, 1 -; a stride of 0 gives every vertex
+ * the first element). vs_fmt shows COLOR * 0.5 + 0.5 (vs_fmt_uint: xyz / 1023 and w / 3). A list that draws with the colours bound and then without them sees zeros the second
+ * time, not the buffer bound before. */
+static void test_unbound_vertex_buffers(Scene *c) {
+  const float big[9] = {-1, -1, 0.5f, -1, 3, 0.5f, 3, -1, 0.5f};
+  const float tints[12] = {-1, 1, -1, 1, 1, -1, -1, 1, 1, -1, -1, 1};      /* (green, then red: one element at stride 0 is green everywhere) */
+  ID3D12Resource *positions = upload_floats(c->dev, big, 9), *colours = upload_floats(c->dev, tints, 12);
+  if (!positions || !colours) { CHECK(0); return; }
+  D3D12_VERTEX_BUFFER_VIEW views[8];
+  memset(views, 0, sizeof views);
+  views[0].BufferLocation = ID3D12Resource_GetGPUVirtualAddress(positions), views[0].SizeInBytes = 36, views[0].StrideInBytes = 12;
+  struct { DXGI_FORMAT format; int shader; int rgba[4]; } cases[] = {
+    {DXGI_FORMAT_R32G32B32A32_FLOAT, 0, {128, 128, 128, 128}},      /* (0, 0, 0, 0) */
+    {DXGI_FORMAT_R32G32_FLOAT, 0, {128, 128, 128, 255}},            /* (0, 0, 0, 1) */
+    {DXGI_FORMAT_R8G8B8A8_UNORM, 0, {128, 128, 128, 128}},
+    {DXGI_FORMAT_R16_SNORM, 0, {128, 128, 128, 255}},
+    {DXGI_FORMAT_R32G32_UINT, 1, {0, 0, 0, 85}},                    /* (0, 0, 0, 1 as an integer: w / 3) */
+  };
+  int ok_all = 1;
+  for (UINT k = 0; k < sizeof cases / sizeof cases[0]; ++k) {
+    /* (COLOR from slot 4 and OFFSET per instance from slot 7, neither bound) */
+    const D3D12_INPUT_ELEMENT_DESC e[3] = {{"POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
+                                           {"COLOR", 0, cases[k].format, 4, 0, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
+                                           {"OFFSET", 0, DXGI_FORMAT_R32G32_FLOAT, 7, 0, D3D12_INPUT_CLASSIFICATION_PER_INSTANCE_DATA, 1}};
+    ID3D12PipelineState *pso = fmt_pipeline(c, e, 3, cases[k].shader, NULL);
+    UINT32 shown[5] = {0};
+    const int ok = pso && fmt_draw(c, pso, views, 2, 0, shown) && colour_is(shown[4], cases[k].rgba) && colour_is(shown[0], cases[k].rgba);
+    printf("unbound vertex buffers: format %u: %08x\n", (unsigned)cases[k].format, (unsigned)shown[4]);
+    ok_all = ok_all && ok;
+    if (pso) ID3D12PipelineState_Release(pso);
+  }
+  CHECK(ok_all);
+  /* Stride 0: every vertex reads the first colour (green); and the position slot unbound: every vertex at 0, 0 - nothing drawn. */
+  const D3D12_INPUT_ELEMENT_DESC e[3] = {{"POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
+                                         {"COLOR", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 4, 0, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
+                                         {"OFFSET", 0, DXGI_FORMAT_R32G32_FLOAT, 7, 0, D3D12_INPUT_CLASSIFICATION_PER_INSTANCE_DATA, 1}};
+  ID3D12PipelineState *pso = fmt_pipeline(c, e, 3, 0, NULL);
+  if (!pso) { CHECK(0); return; }
+  UINT32 shown[5] = {0};
+  views[4].BufferLocation = ID3D12Resource_GetGPUVirtualAddress(colours), views[4].SizeInBytes = 48, views[4].StrideInBytes = 0;
+  const int green[4] = {0, 255, 0, 255}, black[4] = {0, 0, 0, 255}, grey[4] = {128, 128, 128, 128};
+  CHECK(fmt_draw(c, pso, views, 1, 0, shown) && colour_is(shown[4], green) && colour_is(shown[0], green) && colour_is(shown[3], green));
+  printf("unbound vertex buffers: stride 0: %08x %08x\n", (unsigned)shown[0], (unsigned)shown[4]);
+  D3D12_VERTEX_BUFFER_VIEW no_position[8];
+  memcpy(no_position, views, sizeof no_position);
+  memset(&no_position[0], 0, sizeof no_position[0]);
+  CHECK(fmt_draw(c, pso, no_position, 1, 0, shown) && colour_is(shown[4], black));
+  /* In one list: the colours bound (at stride 16: the vertices' own), then unbound (IASetVertexBuffers with no views) and drawn again over the right half. */
+  {
+    ID3D12GraphicsCommandList *list = NULL;
+    CHECK_HR(ID3D12CommandAllocator_Reset(c->allocator));
+    CHECK_HR(ID3D12Device_CreateCommandList(c->dev, 0, D3D12_COMMAND_LIST_TYPE_DIRECT, c->allocator, pso, &IID_ID3D12GraphicsCommandList, (void **)&list));
+    if (list) {
+      views[4].StrideInBytes = 16;
+      scene_begin(c, list, 1);
+      ID3D12GraphicsCommandList_SetGraphicsRootSignature(list, c->rs);
+      ID3D12GraphicsCommandList_SetGraphicsRoot32BitConstants(list, 0, 16, kIdentity, 0);
+      ID3D12GraphicsCommandList_IASetPrimitiveTopology(list, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+      ID3D12GraphicsCommandList_IASetVertexBuffers(list, 0, 8, views);
+      ID3D12GraphicsCommandList_DrawInstanced(list, 3, 1, 0, 0);
+      const D3D12_RECT right = {32, 0, 64, 64};
+      ID3D12GraphicsCommandList_RSSetScissorRects(list, 1, &right);
+      ID3D12GraphicsCommandList_IASetVertexBuffers(list, 4, 1, NULL);
+      ID3D12GraphicsCommandList_DrawInstanced(list, 3, 1, 0, 0);
+      scene_read_target(c, list);
+      scene_run(c, list);
+      ID3D12GraphicsCommandList_Release(list);
+      const UINT32 *pixels = NULL;
+      if (SUCCEEDED(ID3D12Resource_Map(c->readback, 0, NULL, (void **)&pixels)) && pixels) {
+        const UINT32 left = pixels[4 * 64 + 4], right_px = pixels[4 * 64 + 60];
+        printf("unbound vertex buffers: in one list %08x then %08x\n", (unsigned)left, (unsigned)right_px);
+        CHECK(!colour_is(left, grey) && colour_is(right_px, grey));
+        ID3D12Resource_Unmap(c->readback, 0, NULL);
+      } else {
+        CHECK(0);
+      }
+    }
+  }
+  ID3D12PipelineState_Release(pso);
+  ID3D12Resource_Release(positions);
   ID3D12Resource_Release(colours);
 }
 
@@ -8189,12 +8333,14 @@ static void test_extras(ID3D12Device *dev, ID3D12CommandQueue *queue, ID3D12Fenc
   test_copy_queue_timestamps(&c);
   test_indirect(&c);
   test_bundle(&c);
+  test_bundle_root_arguments(&c);
   test_tiled(&c);
   test_predication(&c);
   test_stream_output(&c);
   test_mip_tails(&c);
   test_vertex_formats(&c);
   test_all_vertex_formats(&c);
+  test_unbound_vertex_buffers(&c);
   test_depth_only(&c);
   test_multisample(&c);
   test_limits(&c);

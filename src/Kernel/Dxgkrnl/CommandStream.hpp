@@ -31,7 +31,9 @@
 //                    draws into that level of each, all of one size, the pass's; the layers above are the level's layers - a volume's level has fewer slices -; 0 for the depth of a pass without one)]
 //   EndPass
 //   BindPipeline     pipeline handle
-//   BindVertexBuffer allocation_index, offset
+//   BindVertexBuffer allocation_index, offset [, slot]
+//                    (allocation_index kNoVertexBuffer, 0xFFFFFFFF, with an offset of 0: the slot has no buffer, and a draw whose attributes read it reads 0 - the components their
+//                    format lacks 0, 0, 0, 1, as Direct3D's unbound input slot - on an adapter with kFeature3NullVertexBuffers, and is refused elsewhere; a slot no stream bound is so too)
 //   BindIndexBuffer  allocation_index, index_type (0: 16 bit, 1: 32 bit), offset
 //   PushConstants    byte_count (a multiple of 16, at most the adapter's max_push_constant_bytes: 128 for most, 4096 for the CPU renderer and virgl), then the bytes padded to a whole word
 //   BindTexture      unit, allocation_index, filter (filter_word() of DxgTypes.hpp: the filter, a magnification filter of its own - kFeature2SeparateFilters -, the minimum or maximum
@@ -178,6 +180,7 @@ namespace dxgk {
 constexpr uint32_t kQueryKindPipelineStatistics1 = 12;   // D3D12_QUERY_DATA_PIPELINE_STATISTICS1 (14 values)
 constexpr uint32_t kQueryKindSoStatistics = 13;          // D3D12_QUERY_DATA_SO_STATISTICS (2 values: written, needed)
 constexpr uint32_t kQueryAccumulate = 1u << 16;
+constexpr uint32_t kNoVertexBuffer = 0xFFFFFFFFu;   // BindVertexBuffer's allocation index for a slot with no buffer (kFeature3NullVertexBuffers)
 
 enum class Op : uint16_t {
   BeginPass = 1,
@@ -325,6 +328,7 @@ class CommandWriter {
   void bind_pipeline(Handle pipeline) { packet(Op::BindPipeline, {pipeline}); }
   void bind_vertex_buffer(uint32_t allocation, uint32_t offset = 0) { packet(Op::BindVertexBuffer, {allocation, offset}); }
   void bind_vertex_buffer_slot(uint32_t slot, uint32_t allocation, uint32_t offset = 0) { packet(Op::BindVertexBuffer, {allocation, offset, slot}); }
+  void unbind_vertex_buffer_slot(uint32_t slot) { packet(Op::BindVertexBuffer, {kNoVertexBuffer, 0, slot}); }
   void bind_index_buffer(uint32_t allocation, graphics::IndexType type, uint32_t offset = 0) { packet(Op::BindIndexBuffer, {allocation, type == graphics::IndexType::Uint32 ? 1u : 0u, offset}); }
   void push_constants(ConstByteView data) {
     const uint32_t words = static_cast<uint32_t>((data.size() + 3) / 4);

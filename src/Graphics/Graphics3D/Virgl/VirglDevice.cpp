@@ -1666,6 +1666,17 @@ bool VirglDevice::wait_for_gpu() {
 
 VirglDevice::~VirglDevice() {
   for (uint32_t i = 0; i < sampler_state_count_; ++i) destroy_object(sampler_states_[i].handle);
+  if (zero_vertex_buffer_) destroy_buffer(zero_vertex_buffer_);
+}
+
+// (Called from submit, one at a time.) The attributes of a slot lie within the first 2048 bytes of an element plus the widest format (16 bytes) - the kernel's kMaxVertexStride -,
+// so a page of zeros read at stride 0 is enough for any. The guest's copy starts out zero; unmap sends it to the host.
+IBuffer* VirglDevice::zero_vertex_buffer() {
+  if (!zero_vertex_buffer_) {
+    zero_vertex_buffer_ = create_buffer(4096, kBufferVertex);
+    if (zero_vertex_buffer_) zero_vertex_buffer_->unmap();
+  }
+  return zero_vertex_buffer_;
 }
 
 // (Called from submit, which RenderNode's LockedDevice runs one at a time: the table needs no lock of its own.)
@@ -2794,8 +2805,14 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
       case RecordedCommand::Type::Draw:
       case RecordedCommand::Type::DrawIndexed: {
         if (!in_pass || !pipeline || pipeline->desc().color_target_count > target_count) return false;
+        // (a slot the pipeline reads with no buffer reads a buffer of zeros at stride 0: kFeature3NullVertexBuffers)
+        VirglBuffer* zeros = nullptr;
         for (uint32_t binding = 0; binding < pipeline->binding_count(); ++binding)
-          if (!vertex_buffers[pipeline->binding_slot(binding)]) return false;   // (a slot the pipeline reads with no buffer)
+          if (!vertex_buffers[pipeline->binding_slot(binding)] && !zeros) {
+            zeros = static_cast<VirglBuffer*>(zero_vertex_buffer());
+            if (!zeros || !(info().features3 & kFeature3NullVertexBuffers)) return false;
+            use(zeros);
+          }
         const bool indexed = cmd.type == RecordedCommand::Type::DrawIndexed;
         if (indexed && !index_buffer) return false;
         if (pipeline->desc().stream_output_count && !begin_stream_output()) return false;
@@ -2856,9 +2873,10 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
           stream.command(virgl::kSetVertexBuffers, 0, bindings * 3);
           for (uint32_t binding = 0; binding < bindings; ++binding) {
             const uint32_t slot = pipeline->binding_slot(binding);
-            stream.put(slot == 0 ? pipeline->desc().vertex_stride : pipeline->desc().slot_strides[slot]);
-            stream.put(static_cast<uint32_t>(vertex_offsets[slot]));
-            stream.put(vertex_buffers[slot]->id());
+            const bool unbound = !vertex_buffers[slot];
+            stream.put(unbound ? 0u : slot == 0 ? pipeline->desc().vertex_stride : pipeline->desc().slot_strides[slot]);
+            stream.put(unbound ? 0u : static_cast<uint32_t>(vertex_offsets[slot]));
+            stream.put(unbound ? zeros->id() : vertex_buffers[slot]->id());
           }
         }
         if (indexed) {

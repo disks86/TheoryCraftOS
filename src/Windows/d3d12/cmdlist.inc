@@ -793,7 +793,7 @@ static int prepare_draw(CmdList *l, int indexed) {
     /* (the pipeline first: the kernel copies only the images it reads - a view's own, or its array for a unit declared one -; the pass sends it again) */
     UINT strides[8] = {0};
     for (UINT slot = 0; slot < 8; ++slot)
-      if (l->pso->slots_used >> slot & 1) strides[slot] = l->vb[slot].stride;
+      if ((l->pso->slots_used >> slot & 1) && l->vb[slot].alloc) strides[slot] = l->vb[slot].stride;
     const UINT pipeline = pso_pipeline(l->pso, strides, l->stencil_ref, l->stencil_ref_back, l->depth_bias, l->blend_factor);
     if (pipeline && list_bind_pipeline(l, l->pso, pipeline)) packet(l, OP_BIND_PIPELINE, &pipeline, 1);
     send_binding(l, &l->gfx, 1);
@@ -811,7 +811,7 @@ static int prepare_draw(CmdList *l, int indexed) {
   }
   UINT strides[8] = {0};
   for (UINT slot = 0; slot < 8; ++slot)
-    if (l->pso->slots_used >> slot & 1) strides[slot] = l->vb[slot].stride;
+    if ((l->pso->slots_used >> slot & 1) && l->vb[slot].alloc) strides[slot] = l->vb[slot].stride;      /* (a slot with no buffer: 0) */
   const UINT pipeline = pso_pipeline(l->pso, strides, l->stencil_ref, l->stencil_ref_back, l->depth_bias, l->blend_factor);
   if (!pipeline) return 0;
   if (!list_bind_pipeline(l, l->pso, pipeline)) return 0;
@@ -852,7 +852,16 @@ static int prepare_draw(CmdList *l, int indexed) {
     l->sent_strip_cut = l->strip_cut;
   }
   for (UINT slot = 0; slot < 8; ++slot) {
-    if (!(l->pso->slots_used >> slot & 1) || !l->vb[slot].alloc) continue;
+    if (!(l->pso->slots_used >> slot & 1)) continue;
+    if (!l->vb[slot].alloc) {
+      /* (a slot with no buffer the pipeline reads: its elements are 0 (and the format's missing components 0, 0, 0, 1), as Direct3D 12's null vertex buffer view; a kernel
+       * without DEV_FEATURE3_NULL_VERTEX_BUFFERS refuses the draw) */
+      if (l->sent_vb_alloc[slot] == VB_NONE) continue;
+      const UINT w[3] = {VB_NONE, 0, slot};
+      packet(l, OP_BIND_VB, w, 3);
+      l->sent_vb_alloc[slot] = VB_NONE;
+      continue;
+    }
     if (l->vb[slot].alloc == l->sent_vb_alloc[slot] && l->vb[slot].offset == l->sent_vb_offset[slot]) continue;
     UINT w[3] = {alloc_index(l, l->vb[slot].alloc), (UINT)l->vb[slot].offset, slot};
     packet(l, OP_BIND_VB, w, slot ? 3 : 2);      /* (the slot is a third word, left out for the first buffer) */
@@ -1084,7 +1093,10 @@ static void STDMETHODCALLTYPE list_SetDescriptorHeaps(CmdList *l, UINT count, ID
 
 /* ---- the root signature ------------------------------------------------------------------------------------------------------------------------------------------------------- */
 
+/* (the root signature set again - in a list, or in a bundle the caller's own -: the root arguments stay, as Direct3D 12 says ("If the root signature is redundantly set to
+ * the same one currently set, existing root signature bindings do not become stale"); a bundle that changes some of the caller's arguments sets the caller's signature first) */
 static void set_signature(CmdList *l, Binding *b, ID3D12RootSignature *rs, int *dirty) {
+  if (b->rs == (RootSig *)rs && rs) return;
   b->rs = (RootSig *)rs;
   memset(b->args, 0, sizeof b->args);
   keep(l, (IUnknown *)rs);

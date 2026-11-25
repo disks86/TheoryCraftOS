@@ -791,9 +791,9 @@ bool Replay::draw(const RecordedCommand& c, bool indexed) {
   }
   for (uint32_t b = 0; b < p.binding_count(); ++b) {
     const VertexBinding& vb = vertex_[p.binding_slot(b)];
-    if (!vb.buffer) return false;
-    const VkBuffer buffer = vb.buffer->buffer();
-    const VkDeviceSize offset = vb.offset & 0xFFFFFFFFu;
+    if (!vb.buffer && !d_.context().caps().null_descriptor) return false;   // (no buffer: the null descriptor, kFeature3NullVertexBuffers)
+    const VkBuffer buffer = vb.buffer ? vb.buffer->buffer() : VK_NULL_HANDLE;
+    const VkDeviceSize offset = vb.buffer ? vb.offset & 0xFFFFFFFFu : 0;
     vk_.CmdBindVertexBuffers(cb_, b, 1, &buffer, &offset);
   }
   if (depth_bounds_dirty_) set_depth_bounds_state();
