@@ -9630,8 +9630,8 @@ static UINT32 scene_pixel(Scene *c, int x, int y) {
   return v;
 }
 
-/* What the device says of the five features, the same throughout: the CPU renderer has them all, virgl none, the Venus device (RADV here) all but coarse shading, whose
- * coarse pixels stop at 2x2 there (Direct3D's tier 2 has 4x4 with AdditionalShadingRatesSupported). */
+/* What the device says of the five features, the same throughout: the CPU renderer has them all, virgl none, the Venus device (RADV here) all, coarse shading without
+ * AdditionalShadingRatesSupported (its coarse pixels stop at 2x2 there). */
 static void test_raster_caps(ID3D12Device *dev, D3D12_FEATURE_DATA_D3D12_OPTIONS2 *o2, D3D12_FEATURE_DATA_D3D12_OPTIONS3 *o3, D3D12_FEATURE_DATA_D3D12_OPTIONS6 *o6) {
   D3D12_FEATURE_DATA_D3D12_OPTIONS10 o10;
   CHECK_HR(ID3D12Device_CheckFeatureSupport(dev, D3D12_FEATURE_D3D12_OPTIONS2, o2, sizeof *o2));
@@ -9650,6 +9650,9 @@ static void test_raster_caps(ID3D12Device *dev, D3D12_FEATURE_DATA_D3D12_OPTIONS
   if (g_venus) {
     CHECK(o2->DepthBoundsTestSupported && o2->ProgrammableSamplePositionsTier == D3D12_PROGRAMMABLE_SAMPLE_POSITIONS_TIER_2);
     CHECK(o3->ViewInstancingTier == D3D12_VIEW_INSTANCING_TIER_2 && o3->BarycentricsSupported);
+    /* (RADV's coarse pixels stop at 2x2: tier 2 without the additional rates, which are made 2x2) */
+    CHECK(o6->VariableShadingRateTier == D3D12_VARIABLE_SHADING_RATE_TIER_2 && o6->ShadingRateImageTileSize == 16 && !o6->AdditionalShadingRatesSupported &&
+          !o6->BackgroundProcessingSupported);
   }
   /* (tier 2 has the tile size of 8 or 16, the others none; the SUM combiner goes with tier 2) */
   CHECK(o6->VariableShadingRateTier == D3D12_VARIABLE_SHADING_RATE_TIER_2 ? o6->ShadingRateImageTileSize == 8 || o6->ShadingRateImageTileSize == 16 : o6->ShadingRateImageTileSize == 0);
@@ -10125,11 +10128,19 @@ static void test_shading_rate(Scene *c, const D3D12_FEATURE_DATA_D3D12_OPTIONS6 
       const UINT32 q16 = scene_pixel(c, 16, 8), q17 = scene_pixel(c, 17, 8), q32 = scene_pixel(c, 32, 8), q35 = scene_pixel(c, 35, 8), q48 = scene_pixel(c, 48, 8), q49 = scene_pixel(c, 49, 8);
       if (k == 0) CHECK(px_red(p0) >= 15 && px_red(p0) <= 16 && px_red(p1) >= 47 && px_red(p1) <= 48 && px_blue(p0) == 0);
       if (k == 1) CHECK(px_red(p0) == px_red(p1) && px_red(p0) >= 31 && px_red(p0) <= 32 && px_red(p2) >= 95 && px_red(p2) <= 96 && px_blue(p0) >= 79 && px_blue(p0) <= 80);
-      if (k == 2) CHECK(px_red(p0) == px_red(p3) && px_red(p0) >= 63 && px_red(p0) <= 64 && px_blue(p0) >= 159 && px_blue(p0) <= 160);      /* (4x4: the centre at x 2) */
-      if (k == 3) CHECK(px_red(p0) != px_red(p1) && px_red(q16) == px_red(q17) && px_red(q32) == px_red(q35) && px_red(q48) == px_red(q49) && px_blue(q32) >= 159 && px_blue(q32) <= 160);
-      /* (SUM of 1x2 and the tiles': 1x2, 2x4, 4x4 - the axes added and held at 4x -, 2x2) */
-      if (k == 4) CHECK(px_red(p0) != px_red(p1) && px_blue(p0) >= 15 && px_blue(p0) <= 16 && px_blue(q16) >= 95 && px_blue(q16) <= 96 && px_blue(q32) >= 159 && px_blue(q32) <= 160 &&
-                        px_blue(q48) >= 79 && px_blue(q48) <= 80);
+      if (o6->AdditionalShadingRatesSupported) {
+        if (k == 2) CHECK(px_red(p0) == px_red(p3) && px_red(p0) >= 63 && px_red(p0) <= 64 && px_blue(p0) >= 159 && px_blue(p0) <= 160);      /* (4x4: the centre at x 2) */
+        if (k == 3) CHECK(px_red(p0) != px_red(p1) && px_red(q16) == px_red(q17) && px_red(q32) == px_red(q35) && px_red(q48) == px_red(q49) && px_blue(q32) >= 159 && px_blue(q32) <= 160);
+        /* (SUM of 1x2 and the tiles': 1x2, 2x4, 4x4 - the axes added and held at 4x -, 2x2) */
+        if (k == 4) CHECK(px_red(p0) != px_red(p1) && px_blue(p0) >= 15 && px_blue(p0) <= 16 && px_blue(q16) >= 95 && px_blue(q16) <= 96 && px_blue(q32) >= 159 && px_blue(q32) <= 160 &&
+                          px_blue(q48) >= 79 && px_blue(q48) <= 80);
+      } else {
+        /* (without the additional rates 4x4, 2x4 and 4x2 are made 2x2: the centre at x 1, blue 5 / 16) */
+        if (k == 2) CHECK(px_red(p0) == px_red(p1) && px_red(p0) != px_red(p3) && px_red(p0) >= 31 && px_red(p0) <= 32 && px_blue(p0) >= 79 && px_blue(p0) <= 80);
+        if (k == 3) CHECK(px_red(p0) != px_red(p1) && px_red(q16) == px_red(q17) && px_red(q32) != px_red(q35) && px_red(q48) == px_red(q49) && px_blue(q32) >= 79 && px_blue(q32) <= 80);
+        if (k == 4) CHECK(px_red(p0) != px_red(p1) && px_blue(p0) >= 15 && px_blue(p0) <= 16 && px_blue(q16) >= 79 && px_blue(q16) <= 80 && px_blue(q32) >= 79 && px_blue(q32) <= 80 &&
+                          px_blue(q48) >= 79 && px_blue(q48) <= 80);
+      }
       ID3D12GraphicsCommandList_Release(list);
     }
   }

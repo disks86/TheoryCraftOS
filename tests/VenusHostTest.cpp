@@ -148,9 +148,8 @@ int main() {
   }
   // Coarse shading (kFeature2ShadingRate) on the device itself: the pipeline's rate, a vertex shader's per-primitive rate and a shading-rate image, each with its
   // combiner. The fragment shader shows where it ran (red: frac(x / 8) of SV_Position, the coarse pixel's centre) and the rate it reads (blue: rate / 16). Rates of
-  // 2x2 and less, which every host with the extension has (RADV's coarse pixels stop there: the device offers the feature only with 4x4, so it is turned on here).
-  if (device.context().caps().shading_rate) {
-    device.offer_for_tests(graphics::kFeature2ShadingRate);
+  // 2x2 and less, which every host with the extension has (RADV's coarse pixels stop there: the device says so with kFeature3CoarsePixels2x2Only).
+  if (device.info().features2 & graphics::kFeature2ShadingRate) {
     static const char kVs[] = "VERT\nDCL IN[0]\nDCL OUT[0], POSITION\nDCL OUT[1], SHADINGRATE\nIMM[0] UINT32 {5, 5, 5, 5}\n"
                               "  0: MOV OUT[0], IN[0]\n  1: MOV OUT[1].x, IMM[0].xxxx\n  2: END\n";
     static const char kVsPlain[] = "VERT\nDCL IN[0]\nDCL OUT[0], POSITION\n  0: MOV OUT[0], IN[0]\n  1: END\n";
@@ -230,7 +229,6 @@ int main() {
     if (fs) device.destroy_shader_module(fs);
     if (vs_rate) device.destroy_shader_module(vs_rate);
     if (vs) device.destroy_shader_module(vs);
-    device.offer_for_tests(0);
   }
   // what format_caps says of each format is what create_image does (the kernel hands the caps to user mode as format support)
   for (uint32_t fi = 64; fi < 128; ++fi) {

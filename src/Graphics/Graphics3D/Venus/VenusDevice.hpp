@@ -107,9 +107,7 @@ class VenusDevice final : public IGraphicsDevice {
     kGapDepthClamp = 1u << 6,         // depthClamp: pipelines without depth clipping
   };
   uint32_t parity_gaps() const;
-  // For the host test only: features info() offers although the host lacks a part of them (kFeature2ShadingRate on a host whose coarse pixels stop at 2x2: the
-  // device clamps to what the host does, which Direct3D's AdditionalShadingRatesSupported would have to say), so that the rest of them can be checked there.
-  void offer_for_tests(uint32_t features2) { test_features2_ = features2; }
+
   // Whether the device offers coarse shading (its pipelines then have the rate as dynamic state, and may draw with a shading-rate attachment).
   bool offers_shading_rate() const { return (info().features2 & kFeature2ShadingRate) != 0; }
 
@@ -220,7 +218,6 @@ class VenusDevice final : public IGraphicsDevice {
   uint32_t uniform_alignment_ = 256;
   uint32_t max_image_dimension_ = 4096;
   uint32_t sample_counts_ = 0;
-  uint32_t test_features2_ = 0;
   bool shading_rate_usable_ = false;   // (the host's coarse shading with its R8_UINT attachment, whatever its largest coarse pixel)
   kernel::Mutex staging_lock_;        // staging_ and what is in it
   kernel::Mutex queue_lock_;          // the queue and the two command buffers (images are written from several threads)

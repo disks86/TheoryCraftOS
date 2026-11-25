@@ -1332,6 +1332,9 @@ enum DeviceFeature2 : uint32_t {
 // (DEV_FEATURE3_*, TcosD3D12DeviceFeatures3). Bits are taken in ranges so work on different parts does not collide: 0-7 multisampled reads and interpolation, 8-15 feature
 // levels 11_1 / 12_x (rasterizer ordered views, forced sample counts), 16-23 shader model 6 (wave operations), 24-31 the rest.
 enum DeviceFeature3 : uint32_t {
+  // With kFeature2ShadingRate: the device's coarse pixels stop at 2x2 - the 2x4, 4x2 and 4x4 rates are made 2x2 (Direct3D's AdditionalShadingRatesSupported FALSE; the
+  // Venus device on hosts such as RADV whose fragment sizes end there). Without it a device that has the feature takes every rate.
+  kFeature3CoarsePixels2x2Only = 1u << 23,
 };
 
 constexpr uint32_t sampler_features2(const SamplerDesc& s) {

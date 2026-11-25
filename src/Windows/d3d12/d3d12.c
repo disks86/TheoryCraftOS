@@ -57,8 +57,8 @@
  *     d3d12_types.h), the features reported at their "not supported" tier: ray tracing, mesh shaders, sampler feedback, work graphs, protected sessions, meta commands
  *     (D3D12_SAMPLER_DESC2, the strip cut of the command list and triangle fans are done: heaps.inc sampler_descriptor, cmdlist1.inc IASetIndexBufferStripCutValue); and on
  *     virgl (the CPU renderer has them: cmdlist1.inc) the depth bounds test, programmable sample positions, view instancing, variable-rate shading and barycentrics; on
- *     Venus variable-rate shading where the host's coarse pixels reach 4x4 (AdditionalShadingRatesSupported is not a feature of its own yet: RADV's stop at 2x2, so Venus there
- *     reports tier 0), the others where the host's Vulkan has them (sample locations, fragment shader barycentrics; view instancing is the draw loop)
+ *     Venus all of them where the host's Vulkan has them (sample locations, fragment shading rate, fragment shader barycentrics; view instancing is the draw loop), the
+ *     variable-rate shading tier 2 without AdditionalShadingRatesSupported where the host's coarse pixels stop at 2x2 (RADV: DEV_FEATURE3_COARSE_PIXELS_2X2_ONLY)
  *   - of those: view instancing is tier 2 (draw-call looping; every stage runs for every view), no centroid or sample interpolation (EvaluateAttributeSnapped, per-sample
  *     shading) or SV_Coverage, and HighestShaderModel stays 5.1 (DXIL of 6.1 - 6.6 with SV_ViewID, SV_Barycentrics, GetAttributeAtVertex, SV_ShadingRate and IsHelperLane is
  *     taken, but the wave operations of 6.0 are not translated)

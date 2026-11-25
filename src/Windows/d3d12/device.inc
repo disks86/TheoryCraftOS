@@ -511,10 +511,11 @@ static HRESULT STDMETHODCALLTYPE dev_CheckFeatureSupport(Dev *This, D3D12_FEATUR
     case D3D12_FEATURE_D3D12_OPTIONS6: {
       FEATURE(D3D12_FEATURE_DATA_D3D12_OPTIONS6, o);
       memset(o, 0, sizeof *o);
-      /* (coarse pixel shading on the CPU renderer: tier 2 with the 2x4, 4x2 and 4x4 rates, per-primitive rates with any viewport, 16 x 16 tiles; nothing runs in the background) */
+      /* (coarse pixel shading: tier 2 with per-primitive rates with any viewport, 16 x 16 tiles, nothing in the background; the 2x4, 4x2 and 4x4 rates unless the device's
+       * coarse pixels stop at 2x2 - Venus on RADV -, which then makes them 2x2 as Direct3D says) */
       const BOOL vrs = (This->caps.features2 & DEV_FEATURE2_SHADING_RATE) != 0;
       o->VariableShadingRateTier = vrs ? D3D12_VARIABLE_SHADING_RATE_TIER_2 : D3D12_VARIABLE_SHADING_RATE_TIER_NOT_SUPPORTED;
-      o->AdditionalShadingRatesSupported = vrs;
+      o->AdditionalShadingRatesSupported = vrs && !(This->caps.features3 & DEV_FEATURE3_COARSE_PIXELS_2X2_ONLY);
       o->PerPrimitiveShadingRateSupportedWithViewportIndexing = vrs;
       o->ShadingRateImageTileSize = vrs ? SHADING_RATE_TILE : 0;
       o->BackgroundProcessingSupported = FALSE;

@@ -142,10 +142,10 @@ compositor, the windows of Wayland and X11 clients, and the Vulkan driver's Dire
     the status is 1 when every texel was resident (OpImageSparseTexelsResident);
   * coarse shading (`kFeature2ShadingRate`): VK_KHR_fragment_shading_rate with the pipeline's, the primitive's (`SHADINGRATE` output: PrimitiveShadingRateKHR) and an
     attachment's rate, the combiners as Direct3D's (SUM is MUL), SV_ShadingRate in the pixel shader (ShadingRateKHR), the shading-rate image's 16-pixel tiles blitted
-    into an R8_UINT attachment of the host's texel size before each rendering that reads it (`VenusDevice::rate_attachment`, one image for the largest target). Offered
-    only where the host's coarse pixels reach 4x4: Direct3D's tier 2 reports AdditionalShadingRatesSupported, which RADV (coarse pixels up to 2x2) cannot give, and
-    there is no feature bit yet that would let d3d12.dll say otherwise. VenusHostTest turns it on (`offer_for_tests`) to check the rest of it with rates up to 2x2.
-  Results after gap pass 5 (RADV RX 9070 XT): emulator `VENUS=1` and QEMU Venus d3d12test 6245/0, d3d11test 530/530, d3d9test 166/166; QEMU virgl unchanged
+    into an R8_UINT attachment of the host's texel size before each rendering that reads it (`VenusDevice::rate_attachment`, one image for the largest target). On a host
+    whose coarse pixels stop below 4x4 (RADV: 2x2) the device also says `kFeature3CoarsePixels2x2Only` (DeviceFeature3 bit 23), and d3d12.dll reports tier 2 with
+    AdditionalShadingRatesSupported FALSE: the host makes 2x4, 4x2 and 4x4 into 2x2, as Direct3D does then.
+  Results after gap pass 5 (RADV RX 9070 XT): emulator `VENUS=1` and QEMU Venus d3d12test 6286/0 (with coarse shading), d3d11test 530/530, d3d9test 166/166; QEMU virgl unchanged
   (5821/0, 520, 166); VenusHostTest 122 Direct3D scenes the same (the coordinates-in-texels scene is no longer refused) and the shading-rate checks; TgsiSpirvTest 450/0.
 * **present()** copies the image into the virtio-gpu's 2D screen (`blit` + `present` of the display driver), one copy through guest memory per frame.
 * **Which device** (`RenderNode::build_venus`): with `TCOS_GPU_BACKEND=AUTO` (the default) the Venus device is used when it opens, draws the self-test picture and offers
@@ -225,9 +225,7 @@ Gaps of the kernel's Venus device:
 * Images are always in the GENERAL layout (no compression a driver keeps for attachment layouts); barriers are full memory barriers at every pass, dispatch and storing
   draw, not the narrow ones Vulkan allows.
 * As on virgl: depth resolves to the least or greatest sample are not offered (`kFeatureResolveModes`).
-* Coarse shading is not offered on hosts whose coarse pixels stop at 2x2 (RADV), for want of a way to report AdditionalShadingRatesSupported = FALSE (a feature bit of
-  its own); the device clamps to the host's rates (as Direct3D does without them) and works when turned on. At 8 samples RADV shades every pixel (its coarse pixels
-  take 4 samples at most), where Direct3D's rule allows 2x1.
+* Coarse shading at 8 samples: RADV shades every pixel (its coarse pixels take 4 samples at most), where Direct3D's rule allows 2x1.
 * Residency feedback is the host's footprint (the texels the hardware reads, which may include ones a linear filter weighs 0 - the CPU renderer leaves those out); an
   image whose format's block is not Direct3D's tile, or whose mip tail does not begin at Direct3D's packed levels, keeps no residency (`set_residency` is false: its
   lookups report everything resident); sparse volumes cannot be render targets (no 2D-array view of a sparse 3D image).

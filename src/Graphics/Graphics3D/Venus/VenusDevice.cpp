@@ -177,7 +177,12 @@ DeviceInfo VenusDevice::info() const {
   if (c.sample_locations && c.variable_sample_locations && (c.sample_location_quad_counts & (1u << 1)) && (i.sample_counts & ~c.sample_location_quad_counts) == 0)
     i.features2 |= kFeature2SamplePositions;
   if (c.multi_viewport && c.shader_output_layer && c.shader_output_viewport_index) i.features2 |= kFeature2ViewInstancing;
-  if (shading_rate_usable_ && ((c.max_fragment_width >= 4 && c.max_fragment_height >= 4) || (test_features2_ & kFeature2ShadingRate))) i.features2 |= kFeature2ShadingRate;
+  if (shading_rate_usable_) {
+    // (coarse pixels up to the host's largest: below 4x4 - RADV's stop at 2x2 - the device says so, kFeature3CoarsePixels2x2Only, and the host clamps the larger rates to
+    // 2x2 as Direct3D does without AdditionalShadingRatesSupported)
+    i.features2 |= kFeature2ShadingRate;
+    if (c.max_fragment_width < 4 || c.max_fragment_height < 4) i.features3 |= kFeature3CoarsePixels2x2Only;
+  }
   if (c.fragment_barycentric) i.features2 |= kFeature2Barycentrics;
   i.features2 |= kFeature2UnnormalizedCoordinates;   // (normalised samplers of one level, the shaders dividing by its size: VenusDevice::sampler_for)
   // (residency feedback - Direct3D's tiled resources tier 2, and with volumes and arrays of levels tiers 3 and 4 -: sparse 2D and 3D images of the standard block
