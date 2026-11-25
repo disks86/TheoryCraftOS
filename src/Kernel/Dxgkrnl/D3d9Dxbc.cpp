@@ -571,7 +571,7 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
     if (read_operand(peek, &first) != status::kSuccess) return false;
     if (op >= 180 && read_operand(peek, &second) != status::kSuccess) return false;
     const Operand& u = op >= 180 ? second : first;
-    return u.type == kOpUav && u.dims == 1 && u.index[0] < graphics::kMaxStorageImages && (program->image_mask_ >> u.index[0] & 1) != 0;
+    return u.type == kOpUav && u.dims == 1 && u.index[0] < graphics::kMaxStorageImages && program->image_mask_.test(u.index[0]);
   };
 
   // One-dimensional textures (texture1d, texture1darray) are two-dimensional ones a texel high, and arrays of those. An access to one goes through the last three
@@ -724,6 +724,21 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
         Operand o;
         s = read_operand(p, &o);
         if (s != status::kSuccess) return s;
+        if (((token >> 11) & 0x1F) == 1 && !v51) {
+          // dcl_resource_buffer (return types) t#: a typed view of a buffer (Buffer<>), read with ld - a read-only storage image of the slots after the u# ones
+          const uint32_t returns = p.le32();
+          if (!p.ok()) return status::kInvalidParameter;
+          if (o.type != kOpResource || o.dims != 1 || o.index[0] >= graphics::kMaxTexelBufferViews) return status::kNotSupported;
+          const uint32_t slot = graphics::kTexelBufferSlotBase + o.index[0];
+          if (program->image_mask_.test(slot)) return status::kInvalidParameter;
+          const uint32_t type = returns & 0xF;   // (D3D10_SB_RESOURCE_RETURN_TYPE of the first component: 1 unorm, 2 snorm, 5 float - floats; 3 sint; 4 uint)
+          if (type != 1 && type != 2 && type != 3 && type != 4 && type != 5) return status::kNotSupported;
+          program->image_dim_[slot] = D3d9Program::ImageDim::Buffer;
+          program->image_return_[slot] = type == 3 ? D3d9Program::ImageReturn::Sint : type == 4 ? D3d9Program::ImageReturn::Uint : D3d9Program::ImageReturn::Float;
+          program->image_mask_.set(slot);
+          if (!compute) program->uses_system_values_ = true;   // (the function with the context, which has them)
+          continue;
+        }
         if (v51) {
           // dcl_resource_texture2d t[ID][lower:upper], return type, space
           const uint32_t return_type = p.le32(), space = p.le32();
@@ -920,23 +935,24 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
         continue;
       }
       case kDclUavTyped4: {
-        // dcl_uav_typed_texture1d / 1darray / 2d / 2darray / 3d (return types) u#: a storage image of a compute or pixel shader (typed buffers are not taken)
+        // dcl_uav_typed_buffer / texture1d / 1darray / 2d / 2darray / 3d (return types) u#: a storage image (a typed view of a buffer, or of a texture), in any stage
         Operand o;
         s = read_operand(p, &o);
         if (s != status::kSuccess) return s;
         const uint32_t returns = p.le32();
         if (!p.ok()) return status::kInvalidParameter;
-        if ((!compute && !pixel) || o.type != kOpUav || o.dims != 1 || o.index[0] >= graphics::kMaxStorageImages) return status::kNotSupported;
+        if (o.type != kOpUav || o.dims != 1 || o.index[0] >= graphics::kMaxStorageImages) return status::kNotSupported;
         const uint32_t slot = o.index[0];
-        if ((program->image_mask_ >> slot & 1) || (slot < graphics::kMaxUavBuffers && program->uav_kind_[slot] != D3d9Program::BufferKind::None)) return status::kInvalidParameter;
+        if (program->image_mask_.test(slot) || (slot < graphics::kMaxUavBuffers && program->uav_kind_[slot] != D3d9Program::BufferKind::None)) return status::kInvalidParameter;
         D3d9Program::ImageDim dim;
         switch ((token >> 11) & 0x1F) {
+          case 1: dim = D3d9Program::ImageDim::Buffer; break;
           case 2: dim = D3d9Program::ImageDim::Texture1D; break;
           case 3: dim = D3d9Program::ImageDim::Texture2D; break;
           case 5: dim = D3d9Program::ImageDim::Texture3D; break;
           case 7: dim = D3d9Program::ImageDim::Texture1DArray; break;
           case 8: dim = D3d9Program::ImageDim::Texture2DArray; break;
-          default: return status::kNotSupported;   // (a typed buffer)
+          default: return status::kNotSupported;
         }
         // (D3D10_SB_RESOURCE_RETURN_TYPE of the first component: 1 unorm, 2 snorm, 5 float - floats; 3 sint; 4 uint)
         const uint32_t type = returns & 0xF;
@@ -947,8 +963,12 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
         else return status::kNotSupported;
         program->image_dim_[slot] = dim;
         program->image_return_[slot] = ret;
-        program->image_mask_ |= 1u << slot;
-        if (pixel) program->uses_system_values_ = true;   // (a pixel shader that reads and writes images: the function with the context, which has them)
+        program->image_mask_.set(slot);
+        program->writes_images_ = true;
+        if (!compute) program->uses_system_values_ = true;   // (a shader of a draw that reads and writes images: the function with the context, which has them)
+        if (vertex) program->uses_vertex_stores_ = true;
+        if (geometry) program->uses_geometry_stores_ = true;
+        if (hull || domain) program->uses_tessellation_stores_ = true;
         continue;
       }
       case kDclUavRaw4: case kDclUavStructured4: case kDclResourceRaw4: case kDclResourceStructured4: {
@@ -960,7 +980,7 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
         const uint32_t stride = structured_decl ? p.le32() : 0;
         if ((!compute && !srv && !pixel && !vertex && !geometry && !hull && !domain) || !p.ok() || o.type != (srv ? kOpResource : kOpUav) || o.dims != 1 || o.index[0] >= (srv ? graphics::kMaxSrvBuffers : graphics::kMaxUavBuffers)) return status::kNotSupported;
         const uint32_t slot = srv ? graphics::kMaxUavBuffers + o.index[0] : o.index[0];
-        if (program->uav_kind_[slot] != D3d9Program::BufferKind::None || (!srv && (program->image_mask_ >> slot & 1))) return status::kNotSupported;
+        if (program->uav_kind_[slot] != D3d9Program::BufferKind::None || (!srv && program->image_mask_.test(slot))) return status::kNotSupported;
         if (structured_decl && (stride == 0 || stride > 2048 || stride % 4)) return status::kNotSupported;
         program->uav_kind_[slot] = structured_decl ? D3d9Program::BufferKind::Structured : D3d9Program::BufferKind::Raw;
         program->uav_stride_[slot] = stride;
@@ -1005,6 +1025,48 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
       s = to_src(c, &ins.src[0]);
       if (s != status::kSuccess) return s;
       ins.src_count = 1;
+    } else if (!compute && opcode == kSync4) {
+      // sync_uglobal in a shader of a draw (the only sync it may have): what it wrote is in memory before what follows - one invocation runs at a time here, a GPU's is a memory barrier
+      if (((token >> 11) & 0xF) != 8) return status::kNotSupported;
+      ins.op = kNop;
+    } else if (opcode == 178 || opcode == 179) {
+      // imm_atomic_alloc / imm_atomic_consume dst, u#: the hidden counter of a structured unordered access view (an append, consume or counter view)
+      Operand d, uav;
+      if ((s = read_operand(p, &d)) != status::kSuccess || (s = read_operand(p, &uav)) != status::kSuccess) return s;
+      if (uav.type != kOpUav || uav.dims != 1 || uav.index[0] >= graphics::kMaxUavBuffers || program->uav_kind_[uav.index[0]] != D3d9Program::BufferKind::Structured) return status::kNotSupported;
+      const uint32_t slot = graphics::kCounterSlotBase + uav.index[0];
+      program->uav_kind_[slot] = D3d9Program::BufferKind::Raw;   // (the counter's word: a buffer the draw or dispatch must bind)
+      ins.op = kBufCounter;
+      ins.control = opcode == 178 ? 0 : 1;
+      ins.uav = static_cast<uint16_t>(slot);
+      if ((s = to_dst(d, &ins.dst)) != status::kSuccess) return s;
+      ins.src_count = 0;
+      if (pixel) program->uses_fragment_stores_ = true;
+      if (vertex) program->uses_vertex_stores_ = true;
+      if (geometry) program->uses_geometry_stores_ = true;
+      if (hull || domain) program->uses_tessellation_stores_ = true;
+    } else if (opcode == 121) {
+      // bufinfo dst, t# / u#: the size of a buffer view - in elements for a typed one, structures for a structured one, bytes for a raw one
+      Operand d, resource;
+      if ((s = read_operand(p, &d)) != status::kSuccess || (s = read_operand(p, &resource)) != status::kSuccess) return s;
+      if ((resource.type != kOpUav && resource.type != kOpResource) || resource.dims != 1) return status::kNotSupported;
+      const bool view = resource.type == kOpResource;
+      const uint32_t n = resource.index[0];
+      if (n >= (view ? graphics::kMaxSrvBuffers : graphics::kMaxUavBuffers)) return status::kNotSupported;
+      const uint32_t image_slot = view ? graphics::kTexelBufferSlotBase + n : n, storage_slot = view ? graphics::kMaxUavBuffers + n : n;
+      if (image_slot < graphics::kMaxImageSlots && program->image_mask_.test(image_slot) && program->image_dim_[image_slot] == D3d9Program::ImageDim::Buffer) {
+        ins.control = 1;
+        ins.uav = static_cast<uint16_t>(image_slot);
+      } else if (program->uav_kind_[storage_slot] != D3d9Program::BufferKind::None) {
+        ins.control = 0;
+        ins.uav = static_cast<uint16_t>(storage_slot);
+        ins.stride = program->uav_stride_[storage_slot];
+      } else {
+        return status::kNotSupported;   // (not a buffer the shader declared)
+      }
+      ins.op = kBufInfo;
+      if ((s = to_dst(d, &ins.dst)) != status::kSuccess) return s;
+      ins.src_count = 0;
     } else if (compute && opcode == kSync4) {
       // sync_g / sync_ug...: the flags say what it waits for; only the threads of the group matter here (everything else a thread does is already in order for the one running)
       const uint32_t flags = (token >> 11) & 0xF;
@@ -1098,12 +1160,27 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
       if (opcode == 46 && (s = read_operand(p, &lod)) != status::kSuccess) return s;   // (ld_ms: the sample)
       if (opcode == 61 && resource.type == kOpUav) {
         // resinfo of a storage image: its size (the level operand names the view's one level)
-        if (v51 || resource.dims != 1 || resource.index[0] >= graphics::kMaxStorageImages || !(program->image_mask_ >> resource.index[0] & 1)) return status::kNotSupported;
+        if (v51 || resource.dims != 1 || resource.index[0] >= graphics::kMaxStorageImages || !program->image_mask_.test(resource.index[0]) ||
+            program->image_dim_[resource.index[0]] == D3d9Program::ImageDim::Buffer)
+          return status::kNotSupported;   // (a buffer's size is bufinfo's)
         const uint32_t mode = (token >> 11) & 3;
         if (mode > 2) return status::kNotSupported;
         ins.op = kImgSize;
         ins.control = static_cast<uint8_t>(mode);
-        ins.uav = static_cast<uint8_t>(resource.index[0]);
+        ins.uav = static_cast<uint16_t>(resource.index[0]);
+        if ((s = to_dst(d, &ins.dst)) != status::kSuccess || (s = to_src(address, &ins.src[0])) != status::kSuccess) return s;
+        ins.src_count = 1;
+        if (resource.components == 2)
+          for (uint32_t k = 0; k < 4; ++k) ins.tex_swizzle[k] = resource.swizzle[k];
+        if (!p.at_end()) return status::kInvalidParameter;
+        if ((s = emit(ins)) != status::kSuccess) return s;
+        continue;
+      }
+      if (opcode == 45 && !v51 && resource.type == kOpResource && resource.dims == 1 && resource.index[0] < graphics::kMaxTexelBufferViews &&
+          program->image_mask_.test(graphics::kTexelBufferSlotBase + resource.index[0])) {
+        // ld of a typed view of a buffer (Buffer<>): the element the address's x names, through its read-only image slot
+        ins.op = kImgLoad;
+        ins.uav = static_cast<uint16_t>(graphics::kTexelBufferSlotBase + resource.index[0]);
         if ((s = to_dst(d, &ins.dst)) != status::kSuccess || (s = to_src(address, &ins.src[0])) != status::kSuccess) return s;
         ins.src_count = 1;
         if (resource.components == 2)
@@ -1175,8 +1252,8 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
         if (exchange && (s = read_operand(p, &compare)) != status::kSuccess) return s;
         if ((s = read_operand(p, &value)) != status::kSuccess) return s;
       }
-      if (uav.type != kOpUav || uav.dims != 1 || uav.index[0] >= graphics::kMaxStorageImages || !(program->image_mask_ >> uav.index[0] & 1)) return status::kNotSupported;
-      ins.uav = static_cast<uint8_t>(uav.index[0]);
+      if (uav.type != kOpUav || uav.dims != 1 || uav.index[0] >= graphics::kMaxStorageImages || !program->image_mask_.test(uav.index[0])) return status::kNotSupported;
+      ins.uav = static_cast<uint16_t>(uav.index[0]);
       if (load) {
         ins.op = kImgLoad;
         if ((s = to_dst(d, &ins.dst)) != status::kSuccess || (s = to_src(address, &ins.src[0])) != status::kSuccess) return s;
@@ -1227,7 +1304,7 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
       const uint32_t slot = group_shared ? graphics::kMaxStorageBuffers + uav.index[0] : read_only_view ? graphics::kMaxUavBuffers + uav.index[0] : uav.index[0];
       const D3d9Program::BufferKind kind = program->uav_kind_[slot];
       if (kind == D3d9Program::BufferKind::None || ((load || store) && structured != (kind == D3d9Program::BufferKind::Structured))) return status::kNotSupported;   // (an atomic works on either kind)
-      ins.uav = static_cast<uint8_t>(slot);
+      ins.uav = static_cast<uint16_t>(slot);
       ins.stride = program->uav_stride_[slot];
       if (load) {
         ins.op = kBufLoad;

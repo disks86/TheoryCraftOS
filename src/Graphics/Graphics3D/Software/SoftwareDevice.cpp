@@ -579,22 +579,39 @@ class TextureSet final : public ITextureSet {
   mutable float lambda_[kMaxTextureUnits] = {};
 };
 
-// The storage images bound (bind_storage_image), as the shaders read and write them: a texel of the view is texel (x, y) of layer first_layer + z (of level `level`).
+// The storage images bound (bind_storage_image), as the shaders read and write them: a texel of the view is texel (x, y) of layer first_layer + z (of level `level`). A slot may instead
+// hold a typed view of a buffer (bind_storage_texel_buffer): element x of the view, at y = z = 0.
 class StorageImageSet final : public IStorageImages {
  public:
   void bind(uint32_t slot, SoftwareImage* image, const StorageImageView& view) {
-    if (slot >= kMaxStorageImages) return;
+    if (slot >= kMaxImageSlots) return;
     images_[slot] = image;
     views_[slot] = view;
+    elements_[slot] = ByteView();
+  }
+  // `elements`: the bytes of the view's elements (empty unbinds).
+  void bind_texel_buffer(uint32_t slot, ByteView elements, TexelFormat format) {
+    if (slot >= kMaxImageSlots) return;
+    images_[slot] = nullptr;
+    elements_[slot] = elements;
+    texel_formats_[slot] = format;
   }
   bool size(uint32_t slot, uint32_t* width, uint32_t* height, uint32_t* layers) const override {
-    if (slot >= kMaxStorageImages || !images_[slot]) return false;
+    if (slot < kMaxImageSlots && !elements_[slot].empty()) {
+      *width = static_cast<uint32_t>(elements_[slot].size() / texel_bytes(texel_formats_[slot]));
+      *height = 1;
+      *layers = 1;
+      return true;
+    }
+    if (slot >= kMaxImageSlots || !images_[slot]) return false;
     *width = mip_extent(images_[slot]->extent().width, views_[slot].level);
     *height = mip_extent(images_[slot]->extent().height, views_[slot].level);
     *layers = views_[slot].layer_count;
     return true;
   }
   Vec4 load(uint32_t slot, uint32_t x, uint32_t y, uint32_t z) const override {
+    ByteView element;
+    if (texel_element(slot, x, y, z, &element)) return element.empty() ? Vec4{0, 0, 0, 0} : decode_texel(texel_formats_[slot], element);   // (outside the view: zero)
     Surface surface;
     if (!texel_surface(slot, x, y, z, &surface)) return {0, 0, 0, 0};
     if (!surface.floats.empty()) return as_view(slot, surface.format, surface.float_row(y)[x]);
@@ -604,6 +621,11 @@ class StorageImageSet final : public IStorageImages {
     return unpack_color(argb);
   }
   void store(uint32_t slot, uint32_t x, uint32_t y, uint32_t z, Vec4 value) const override {
+    ByteView element;
+    if (texel_element(slot, x, y, z, &element)) {
+      if (slot < kMaxStorageImages) encode_texel(texel_formats_[slot], value, element);   // (the views of t# are read only)
+      return;
+    }
     Surface surface;
     if (!texel_surface(slot, x, y, z, &surface)) return;
     if (!surface.floats.empty()) {
@@ -620,13 +642,22 @@ class StorageImageSet final : public IStorageImages {
   }
   bool atomic(uint32_t slot, uint32_t x, uint32_t y, uint32_t z, ImageAtomic op, uint32_t operand, uint32_t compare, uint32_t* old) const override {
     *old = 0;
+    ByteView element;
     Surface surface;
-    // (a 32-bit integer view: of an R32Uint or R32Sint image, or of an R32Float one, whose texel's bits it is)
-    if (!texel_surface(slot, x, y, z, &surface) || !is_single_channel_format(surface.format)) return false;
-    const Format view = view_format(slot, surface.format);
-    if (view != Format::R32Uint && view != Format::R32Sint) return false;
-    Vec4& texel = surface.float_row(y)[x];
-    const uint32_t before = __builtin_bit_cast(uint32_t, texel.x);
+    uint32_t before = 0;
+    Vec4* texel = nullptr;
+    if (texel_element(slot, x, y, z, &element)) {
+      // (an element of a 32-bit integer view of a buffer: its little-endian word)
+      if (element.empty() || slot >= kMaxStorageImages || !texel_format_atomic(texel_formats_[slot])) return false;
+      before = ByteReader(element).le32();
+    } else {
+      // (a 32-bit integer view: of an R32Uint or R32Sint image, or of an R32Float one, whose texel's bits it is)
+      if (!texel_surface(slot, x, y, z, &surface) || !is_single_channel_format(surface.format)) return false;
+      const Format view = view_format(slot, surface.format);
+      if (view != Format::R32Uint && view != Format::R32Sint) return false;
+      texel = &surface.float_row(y)[x];
+      before = __builtin_bit_cast(uint32_t, texel->x);
+    }
     uint32_t after = before;
     switch (op) {
       case ImageAtomic::Add: after = before + operand; break;
@@ -640,7 +671,8 @@ class StorageImageSet final : public IStorageImages {
       case ImageAtomic::Exchange: after = operand; break;
       case ImageAtomic::CompareExchange: after = before == compare ? operand : before; break;
     }
-    texel.x = __builtin_bit_cast(float, after);
+    if (texel) texel->x = __builtin_bit_cast(float, after);
+    else ByteWriter(element).le32(after);
     *old = before;
     return true;
   }
@@ -664,16 +696,25 @@ class StorageImageSet final : public IStorageImages {
     ByteReader in{ConstByteView(bits, bytes_per_pixel(from))};
     return decode_wide_pixel(to, in);
   }
+  // The bytes of element x of a typed view of a buffer (false for a slot that has none, and - as nothing - outside the view: `out` then stays empty).
+  bool texel_element(uint32_t slot, uint32_t x, uint32_t y, uint32_t z, ByteView* out) const {
+    if (slot >= kMaxImageSlots || elements_[slot].empty()) return false;
+    const uint32_t bytes = texel_bytes(texel_formats_[slot]);
+    if (y != 0 || z != 0 || !elements_[slot].try_subview(uint64_t{x} * bytes, bytes, out)) *out = ByteView();
+    return true;
+  }
   // The surface the texel is in (false outside the view, or nothing bound).
   bool texel_surface(uint32_t slot, uint32_t x, uint32_t y, uint32_t z, Surface* out) const {
-    if (slot >= kMaxStorageImages || !images_[slot]) return false;
+    if (slot >= kMaxImageSlots || !images_[slot]) return false;
     const StorageImageView& view = views_[slot];
     if (z >= view.layer_count || view.level >= images_[slot]->mip_levels() || view.first_layer + z >= images_[slot]->layer_count()) return false;
     *out = images_[slot]->surface(view.level, view.first_layer + z);
     return x < out->width && y < out->height;
   }
-  SoftwareImage* images_[kMaxStorageImages] = {};
-  StorageImageView views_[kMaxStorageImages];
+  SoftwareImage* images_[kMaxImageSlots] = {};
+  StorageImageView views_[kMaxImageSlots];
+  ByteView elements_[kMaxImageSlots];
+  TexelFormat texel_formats_[kMaxImageSlots] = {};
 };
 
 // --- Rasterization -------------------------------------------------------------
@@ -1414,6 +1455,7 @@ void run_geometry_shader(const DrawState& s, const SoftwareShaderModule& module,
   const ShaderModuleDesc& md = module.desc();
   GeometryInputData input;
   input.storage = s.storage;
+  input.images = s.images;
   for (uint32_t k = 0; k < count && k < kMaxGeometryInputVertices; ++k) {
     input.position[k] = v[k].position;
     for (uint32_t i = 0; i < kMaxVaryings; ++i) input.varying[k][i] = v[k].varying[i];
@@ -1432,6 +1474,7 @@ void run_tessellation(allocators::IAllocator& allocator, const DrawState& s, Tes
   const ShaderModuleDesc& hd = hull.desc();
   HullInputData input;
   input.storage = s.storage;
+  input.images = s.images;
   input.control_points = count;
   input.primitive_id = s.primitive_id;
   for (uint32_t k = 0; k < count && k < kMaxPatchControlPoints; ++k) {
@@ -1441,6 +1484,7 @@ void run_tessellation(allocators::IAllocator& allocator, const DrawState& s, Tes
   HullOutputData patch;
   hd.hull_function(input, s.constants, &patch);
   patch.storage = s.storage;
+  patch.images = s.images;
   if (!tessellator.tessellate(hd.tess_domain, hd.tess_partitioning, hd.tess_output, patch.outer, patch.inner)) return;
   const DomainShaderFn ds = domain.desc().domain_function;
   const bool triangles = hd.tess_domain == TessDomain::Triangle;
@@ -1837,6 +1881,21 @@ bool SoftwareDevice::submit(ICommandBuffer* commands) {
         images.bind(cmd.unit, image, view);
         break;
       }
+      case RecordedCommand::Type::BindStorageTexelBuffer: {
+        // (a typed view of a buffer: a format the slot takes - the u# ones a format that can be stored -, and elements that lie in the buffer from an offset of whole elements)
+        const TexelBufferView& view = cmd.texel_view;
+        if (cmd.unit >= kMaxImageSlots) return false;
+        if (!cmd.buffer) {
+          images.bind_texel_buffer(cmd.unit, ByteView(), TexelFormat::Undefined);
+          break;
+        }
+        const uint32_t bytes = texel_bytes(view.format);
+        if (!texel_format_valid(view.format) || (cmd.unit < kMaxStorageImages && !texel_format_storable(view.format)) || view.elements == 0 || view.offset % bytes) return false;
+        ByteView part;
+        if (!cmd.buffer->map().try_subview(view.offset, uint64_t{view.elements} * bytes, &part)) return false;
+        images.bind_texel_buffer(cmd.unit, part, view.format);
+        break;
+      }
       case RecordedCommand::Type::BindStorageBuffer: {
         if (cmd.unit >= kMaxStorageBuffers || !cmd.buffer) return false;   // (the bindings may change between draws)
         ByteView whole = cmd.buffer->map(), part;
@@ -2013,6 +2072,7 @@ bool SoftwareDevice::submit(ICommandBuffer* commands) {
           context.vertex_id = static_cast<uint32_t>(v);
           context.instance_id = cmd.first_instance + instance;
           context.storage = s.storage;
+          context.images = s.images;
           context.textures = &s.textures;
           ++stat_vs;
           *out = run_vertex_shader(*s.pipeline, streams, static_cast<uint64_t>(v), instance_number, s.constants, context);

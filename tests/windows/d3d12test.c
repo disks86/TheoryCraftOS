@@ -26,6 +26,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include <math.h>
 #include <d3d12.h>
 #include <dxgi1_6.h>
 #include "dxfixtures.h"
@@ -3182,10 +3183,12 @@ static void test_uav_format_support(ID3D12Device *dev) {
   f.Format = DXGI_FORMAT_NV12;
   CHECK_HR(ID3D12Device_CheckFeatureSupport(dev, D3D12_FEATURE_FORMAT_SUPPORT, &f, sizeof f));
   CHECK((f.Support1 & D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW) && (f.Support2 & D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE));
-  /* (not every format of the list TypedUAVLoadAdditionalFormats names is a texture here: no) */
+  /* (TypedUAVLoadAdditionalFormats: typed loads of every format a typed unordered access view can have - the typed views of buffers read them all, where the adapter has them) */
   D3D12_FEATURE_DATA_D3D12_OPTIONS o;
   CHECK_HR(ID3D12Device_CheckFeatureSupport(dev, D3D12_FEATURE_D3D12_OPTIONS, &o, sizeof o));
-  CHECK(!o.TypedUAVLoadAdditionalFormats && !o.VPAndRTArrayIndexFromAnyShaderFeedingRasterizerSupportedWithoutGSEmulation);
+  f.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+  CHECK_HR(ID3D12Device_CheckFeatureSupport(dev, D3D12_FEATURE_FORMAT_SUPPORT, &f, sizeof f));
+  CHECK(!o.TypedUAVLoadAdditionalFormats == !(f.Support1 & D3D12_FORMAT_SUPPORT1_BUFFER) && !o.VPAndRTArrayIndexFromAnyShaderFeedingRasterizerSupportedWithoutGSEmulation);
 }
 
 /* Compute shaders writing and reading a 2D array storage image, typed loads of R32_FLOAT, the atomics on R32_UINT / R32_SINT images of one, two and three dimensions, and
@@ -3411,6 +3414,386 @@ static void test_pixel_uavs(Scene *c) {
   ID3D12Resource_Release(marks);
 }
 
+/* ---- buffers: typed views, append and consume views and their counters, slots far up, draws that write only unordered access views -------------------------------------------- */
+
+/* `bytes` of `data` into a buffer of the GPU's memory (by way of an upload buffer and a copy), and back out of one. */
+static void buffer_upload(Scene *c, ID3D12Resource *to, UINT64 offset, const void *data, UINT bytes) {
+  ID3D12Resource *up = make_buffer(c->dev, D3D12_HEAP_TYPE_UPLOAD, bytes, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ);
+  void *p = NULL;
+  if (!up || FAILED(ID3D12Resource_Map(up, 0, NULL, &p)) || !p) { CHECK(0); return; }
+  memcpy(p, data, bytes);
+  ID3D12Resource_Unmap(up, 0, NULL);
+  ID3D12GraphicsCommandList *list = NULL;
+  CHECK_HR(ID3D12CommandAllocator_Reset(c->allocator));
+  CHECK_HR(ID3D12Device_CreateCommandList(c->dev, 0, D3D12_COMMAND_LIST_TYPE_DIRECT, c->allocator, NULL, &IID_ID3D12GraphicsCommandList, (void **)&list));
+  if (list) {
+    ID3D12GraphicsCommandList_CopyBufferRegion(list, to, offset, up, 0, bytes);
+    scene_run(c, list);
+    ID3D12GraphicsCommandList_Release(list);
+  }
+  ID3D12Resource_Release(up);
+}
+static int buffer_download(Scene *c, ID3D12Resource *from, UINT64 offset, void *out, UINT bytes) {
+  ID3D12Resource *back = make_buffer(c->dev, D3D12_HEAP_TYPE_READBACK, bytes, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);
+  ID3D12GraphicsCommandList *list = NULL;
+  int ok = 0;
+  CHECK_HR(ID3D12CommandAllocator_Reset(c->allocator));
+  CHECK_HR(ID3D12Device_CreateCommandList(c->dev, 0, D3D12_COMMAND_LIST_TYPE_DIRECT, c->allocator, NULL, &IID_ID3D12GraphicsCommandList, (void **)&list));
+  if (back && list) {
+    ID3D12GraphicsCommandList_CopyBufferRegion(list, back, 0, from, offset, bytes);
+    scene_run(c, list);
+    void *p = NULL;
+    if (SUCCEEDED(ID3D12Resource_Map(back, 0, NULL, &p)) && p) { memcpy(out, p, bytes); ID3D12Resource_Unmap(back, 0, NULL); ok = 1; }
+  }
+  if (list) ID3D12GraphicsCommandList_Release(list);
+  if (back) ID3D12Resource_Release(back);
+  return ok;
+}
+/* A root signature of one table of `count` ranges (each one register of `types[k]` - SRV or UAV - at `regs[k]`, in table order) and 16 root constants first. */
+static ID3D12RootSignature *ranges_signature(ID3D12Device *dev, UINT count, const D3D12_DESCRIPTOR_RANGE_TYPE *types, const UINT *regs, const UINT *sizes, int graphics) {
+  D3D12_DESCRIPTOR_RANGE ranges[8];
+  UINT offset = 0;
+  for (UINT k = 0; k < count && k < 8; ++k) {
+    D3D12_DESCRIPTOR_RANGE r = {types[k], sizes ? sizes[k] : 1, regs[k], 0, offset};
+    ranges[k] = r;
+    offset += r.NumDescriptors;
+  }
+  D3D12_ROOT_PARAMETER params[2];
+  memset(params, 0, sizeof params);
+  params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+  params[0].Constants.Num32BitValues = 16;
+  params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+  params[1].DescriptorTable.NumDescriptorRanges = count;
+  params[1].DescriptorTable.pDescriptorRanges = ranges;
+  D3D12_ROOT_SIGNATURE_DESC rsd = {2, params, 0, NULL, graphics ? D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT : D3D12_ROOT_SIGNATURE_FLAG_NONE};
+  ID3DBlob *blob = NULL, *error = NULL;
+  ID3D12RootSignature *rs = NULL;
+  CHECK_HR(D3D12SerializeRootSignature(&rsd, D3D_ROOT_SIGNATURE_VERSION_1_0, &blob, &error));
+  if (blob) {
+    CHECK_HR(ID3D12Device_CreateRootSignature(dev, 0, ID3D10Blob_GetBufferPointer(blob), ID3D10Blob_GetBufferSize(blob), &IID_ID3D12RootSignature, (void **)&rs));
+    ID3D10Blob_Release(blob);
+  }
+  if (error) ID3D10Blob_Release(error);
+  return rs;
+}
+static void buffer_srv(ID3D12Device *dev, ID3D12DescriptorHeap *heap, UINT i, ID3D12Resource *r, DXGI_FORMAT format, UINT first, UINT count, UINT stride, UINT flags) {
+  D3D12_SHADER_RESOURCE_VIEW_DESC s;
+  memset(&s, 0, sizeof s);
+  s.Format = format;
+  s.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+  s.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+  s.Buffer.FirstElement = first;
+  s.Buffer.NumElements = count;
+  s.Buffer.StructureByteStride = stride;
+  s.Buffer.Flags = flags;
+  ID3D12Device_CreateShaderResourceView(dev, r, &s, heap_cpu(dev, heap, i));
+}
+static void buffer_uav(ID3D12Device *dev, ID3D12DescriptorHeap *heap, ID3D12DescriptorHeap *cpu, UINT i, ID3D12Resource *r, ID3D12Resource *counter, UINT64 counter_offset, DXGI_FORMAT format,
+                       UINT first, UINT count, UINT stride, UINT flags) {
+  D3D12_UNORDERED_ACCESS_VIEW_DESC u;
+  memset(&u, 0, sizeof u);
+  u.Format = format;
+  u.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+  u.Buffer.FirstElement = first;
+  u.Buffer.NumElements = count;
+  u.Buffer.StructureByteStride = stride;
+  u.Buffer.CounterOffsetInBytes = counter_offset;
+  u.Buffer.Flags = flags;
+  ID3D12Device_CreateUnorderedAccessView(dev, r, counter, &u, heap_cpu(dev, heap, i));
+  if (cpu) ID3D12Device_CreateUnorderedAccessView(dev, r, counter, &u, heap_cpu(dev, cpu, i));
+}
+static UINT16 half_of(float f) {
+  /* (round to nearest even; the values here are normal) */
+  UINT32 b;
+  memcpy(&b, &f, 4);
+  const UINT32 sign = (b >> 16) & 0x8000u;
+  const INT32 exponent = (INT32)((b >> 23) & 0xFF) - 127 + 15;
+  if (exponent <= 0) return (UINT16)sign;
+  UINT32 h = sign | ((UINT32)exponent << 10) | ((b >> 13) & 0x3FF);
+  const UINT32 rest = b & 0x1FFF;
+  if (rest > 0x1000 || (rest == 0x1000 && (h & 1))) ++h;
+  return (UINT16)h;
+}
+static float float_of_half(UINT16 h) {
+  const UINT32 exponent = (h >> 10) & 0x1F, mantissa = h & 0x3FF;
+  float v = exponent == 0 ? (float)mantissa / 1024.0f / 16384.0f : (1.0f + (float)mantissa / 1024.0f) * (float)(1u << exponent) / 32768.0f;
+  return (h & 0x8000) ? -v : v;
+}
+
+/* Typed views of buffers in a compute shader (cs_typed_buffer: R8G8B8A8_UNORM and R16G16_FLOAT shader resource views of t2 and t9, an R16G16B16A16_FLOAT unordered access view of u5
+ * stored and loaded, atomics on an R32_UINT one of u1), the buffer formats' support, and a typed buffer view cleared with ClearUnorderedAccessViewUint. */
+static void test_typed_buffers(Scene *c) {
+  ID3D12Device *dev = c->dev;
+  D3D12_FEATURE_DATA_FORMAT_SUPPORT f = {DXGI_FORMAT_R16G16B16A16_FLOAT, D3D12_FORMAT_SUPPORT1_NONE, D3D12_FORMAT_SUPPORT2_NONE};
+  CHECK_HR(ID3D12Device_CheckFeatureSupport(dev, D3D12_FEATURE_FORMAT_SUPPORT, &f, sizeof f));
+  const int typed = (f.Support1 & D3D12_FORMAT_SUPPORT1_BUFFER) != 0;
+  if (!typed) { printf("typed buffers: not on this adapter\n"); return; }
+  CHECK((f.Support1 & D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW) && (f.Support2 & D3D12_FORMAT_SUPPORT2_UAV_TYPED_LOAD));
+  f.Format = DXGI_FORMAT_R32G32B32_FLOAT;      /* (read, not stored) */
+  CHECK_HR(ID3D12Device_CheckFeatureSupport(dev, D3D12_FEATURE_FORMAT_SUPPORT, &f, sizeof f));
+  CHECK((f.Support1 & D3D12_FORMAT_SUPPORT1_BUFFER) && !(f.Support2 & D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE));
+  D3D12_FEATURE_DATA_D3D12_OPTIONS o;
+  CHECK_HR(ID3D12Device_CheckFeatureSupport(dev, D3D12_FEATURE_D3D12_OPTIONS, &o, sizeof o));
+  CHECK(o.TypedUAVLoadAdditionalFormats);
+  const D3D12_RESOURCE_FLAGS uav = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+  ID3D12Resource *colours = make_buffer(dev, D3D12_HEAP_TYPE_DEFAULT, 16, uav, D3D12_RESOURCE_STATE_COMMON);
+  ID3D12Resource *halves = make_buffer(dev, D3D12_HEAP_TYPE_DEFAULT, 20, uav, D3D12_RESOURCE_STATE_COMMON);
+  ID3D12Resource *counts = make_buffer(dev, D3D12_HEAP_TYPE_DEFAULT, 32, uav, D3D12_RESOURCE_STATE_COMMON);
+  ID3D12Resource *results = make_buffer(dev, D3D12_HEAP_TYPE_DEFAULT, 40, uav, D3D12_RESOURCE_STATE_COMMON);
+  const D3D12_DESCRIPTOR_RANGE_TYPE types[4] = {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, D3D12_DESCRIPTOR_RANGE_TYPE_SRV, D3D12_DESCRIPTOR_RANGE_TYPE_UAV, D3D12_DESCRIPTOR_RANGE_TYPE_UAV};
+  const UINT regs[4] = {2, 9, 1, 5};
+  ID3D12RootSignature *rs = ranges_signature(dev, 4, types, regs, NULL, 0);
+  ID3D12PipelineState *pso = rs ? compute_pso(dev, rs, dx_cs_typed_buffer_dxbc, sizeof dx_cs_typed_buffer_dxbc) : NULL;
+  ID3D12DescriptorHeap *heap = view_heap(dev, 4, 1), *cpu = view_heap(dev, 4, 0);
+  if (!colours || !halves || !counts || !results || !rs || !pso || !heap || !cpu) { CHECK(0); return; }
+  BYTE colour_bytes[16];
+  UINT16 half_words[10] = {0};
+  for (UINT i = 0; i < 4; ++i) {
+    colour_bytes[i * 4] = (BYTE)(i * 40), colour_bytes[i * 4 + 1] = 100, colour_bytes[i * 4 + 2] = 0, colour_bytes[i * 4 + 3] = 255;
+    half_words[2 + i * 2] = half_of(0.5f * (float)i), half_words[3 + i * 2] = half_of(2.0f + (float)i);
+  }
+  buffer_upload(c, colours, 0, colour_bytes, 16);
+  buffer_upload(c, halves, 0, half_words, 20);
+  buffer_srv(dev, heap, 0, colours, DXGI_FORMAT_R8G8B8A8_UNORM, 0, 4, 0, 0);
+  buffer_srv(dev, heap, 1, halves, DXGI_FORMAT_R16G16_FLOAT, 1, 4, 0, 0);
+  buffer_uav(dev, heap, cpu, 2, counts, NULL, 0, DXGI_FORMAT_R32_UINT, 0, 8, 0, 0);
+  buffer_uav(dev, heap, cpu, 3, results, NULL, 0, DXGI_FORMAT_R16G16B16A16_FLOAT, 1, 4, 0, 0);
+  ID3D12GraphicsCommandList *list = NULL;
+  CHECK_HR(ID3D12CommandAllocator_Reset(c->allocator));
+  CHECK_HR(ID3D12Device_CreateCommandList(dev, 0, D3D12_COMMAND_LIST_TYPE_DIRECT, c->allocator, pso, &IID_ID3D12GraphicsCommandList, (void **)&list));
+  if (!list) return;
+  ID3D12GraphicsCommandList_SetDescriptorHeaps(list, 1, &heap);
+  /* (the typed views cleared: the counts to 0, the results to 7, elements of their format) */
+  const UINT zero[4] = {0, 0, 0, 0};
+  const float seven[4] = {7, 7, 7, 7};
+  ID3D12GraphicsCommandList_ClearUnorderedAccessViewUint(list, heap_gpu(dev, heap, 2), heap_cpu(dev, cpu, 2), counts, zero, 0, NULL);
+  ID3D12GraphicsCommandList_ClearUnorderedAccessViewFloat(list, heap_gpu(dev, heap, 3), heap_cpu(dev, cpu, 3), results, seven, 0, NULL);
+  ID3D12GraphicsCommandList_SetComputeRootSignature(list, rs);
+  ID3D12GraphicsCommandList_SetComputeRoot32BitConstants(list, 0, 16, kIdentity, 0);
+  ID3D12GraphicsCommandList_SetComputeRootDescriptorTable(list, 1, heap_gpu(dev, heap, 0));
+  ID3D12GraphicsCommandList_Dispatch(list, 1, 1, 1);
+  scene_run(c, list);
+  ID3D12GraphicsCommandList_Release(list);
+  UINT16 r[20];
+  UINT k[8];
+  CHECK(buffer_download(c, results, 0, r, 40) && buffer_download(c, counts, 0, k, 32));
+  int wrong = 0;
+  wrong += r[0] != 0 || r[1] != 0 || r[2] != 0 || r[3] != 0;      /* (element 0 is outside the view: not cleared, not written) */
+  for (UINT i = 0; i < 4; ++i) {
+    const UINT16 *e = &r[4 + i * 4];
+    const float want_x = float_of_half(half_of((float)(i * 40) / 255.0f + 0.5f * (float)i));
+    const float got[4] = {float_of_half(e[0]), float_of_half(e[1]), float_of_half(e[2]), float_of_half(e[3])};
+    const int bad = fabsf(got[0] - want_x) > 0.002f || fabsf(got[1] - 200.0f / 255.0f) > 0.002f || got[2] != 2.0f + (float)i || got[3] != 4.0f ||
+                    k[2 + i] != (UINT)(got[0] * 100.0f + 0.5f) + 4000;
+    if (bad && !wrong) printf("  typed buffers: element %u %f %f %f %f, count %u\n", i, got[0], got[1], got[2], got[3], k[2 + i]);
+    wrong += bad;
+  }
+  if (k[0] != 10 || k[1] != 30) printf("  typed buffers: atomics %u %u\n", k[0], k[1]);
+  CHECK(wrong == 0 && k[0] == 10 && k[1] == 30 && k[6] == 0 && k[7] == 0);
+  ID3D12PipelineState_Release(pso);
+  ID3D12RootSignature_Release(rs);
+  ID3D12DescriptorHeap_Release(cpu);
+  ID3D12DescriptorHeap_Release(heap);
+  ID3D12Resource_Release(results);
+  ID3D12Resource_Release(counts);
+  ID3D12Resource_Release(halves);
+  ID3D12Resource_Release(colours);
+}
+
+/* Append, consume and counter views with their counters in a buffer of their own (cs_append: imm_atomic_alloc / imm_atomic_consume, bufinfo), a structured view of u60 and a raw one of
+ * t100: the counters start where an upload put them and the counts the shader left are copied out (CopyBufferRegion of the counter resource). */
+static void test_counters(Scene *c) {
+  ID3D12Device *dev = c->dev;
+  const D3D12_RESOURCE_FLAGS uav = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+  ID3D12Resource *appended = make_buffer(dev, D3D12_HEAP_TYPE_DEFAULT, 64, uav, D3D12_RESOURCE_STATE_COMMON);
+  ID3D12Resource *consumed = make_buffer(dev, D3D12_HEAP_TYPE_DEFAULT, 32, uav, D3D12_RESOURCE_STATE_COMMON);
+  ID3D12Resource *counted = make_buffer(dev, D3D12_HEAP_TYPE_DEFAULT, 32, uav, D3D12_RESOURCE_STATE_COMMON);
+  ID3D12Resource *wide = make_buffer(dev, D3D12_HEAP_TYPE_DEFAULT, 40, uav, D3D12_RESOURCE_STATE_COMMON);
+  ID3D12Resource *distant = make_buffer(dev, D3D12_HEAP_TYPE_DEFAULT, 32, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COMMON);
+  ID3D12Resource *counters = make_buffer(dev, D3D12_HEAP_TYPE_DEFAULT, 3 * 4096, uav, D3D12_RESOURCE_STATE_COMMON);      /* (D3D12_UAV_COUNTER_PLACEMENT_ALIGNMENT apart) */
+  const D3D12_DESCRIPTOR_RANGE_TYPE types[3] = {D3D12_DESCRIPTOR_RANGE_TYPE_UAV, D3D12_DESCRIPTOR_RANGE_TYPE_UAV, D3D12_DESCRIPTOR_RANGE_TYPE_SRV};
+  const UINT regs[3] = {0, 60, 100}, sizes[3] = {3, 1, 1};
+  ID3D12RootSignature *rs = ranges_signature(dev, 3, types, regs, sizes, 0);
+  ID3D12PipelineState *pso = rs ? compute_pso(dev, rs, dx_cs_append_dxbc, sizeof dx_cs_append_dxbc) : NULL;
+  ID3D12DescriptorHeap *heap = view_heap(dev, 5, 1);
+  if (!appended || !consumed || !counted || !wide || !distant || !counters || !rs || !pso || !heap) { CHECK(0); return; }
+  const UINT values[8] = {100, 101, 102, 103, 104, 105, 106, 107}, raw[8] = {1000, 1001, 1002, 1003, 1004, 1005, 1006, 1007}, six = 6, nothing[16] = {0};
+  buffer_upload(c, consumed, 0, values, 32);
+  buffer_upload(c, distant, 0, raw, 32);
+  buffer_upload(c, appended, 0, nothing, 64);
+  buffer_upload(c, counted, 0, nothing, 32);
+  buffer_upload(c, wide, 0, nothing, 40);
+  buffer_upload(c, counters, 0, nothing, 4);
+  buffer_upload(c, counters, 4096, &six, 4);
+  buffer_upload(c, counters, 8192, nothing, 4);
+  buffer_uav(dev, heap, NULL, 0, appended, counters, 0, DXGI_FORMAT_UNKNOWN, 0, 8, 8, 0);
+  buffer_uav(dev, heap, NULL, 1, consumed, counters, 4096, DXGI_FORMAT_UNKNOWN, 0, 8, 4, 0);
+  buffer_uav(dev, heap, NULL, 2, counted, counters, 8192, DXGI_FORMAT_UNKNOWN, 0, 8, 4, 0);
+  buffer_uav(dev, heap, NULL, 3, wide, NULL, 0, DXGI_FORMAT_UNKNOWN, 0, 10, 4, 0);
+  buffer_srv(dev, heap, 4, distant, DXGI_FORMAT_R32_TYPELESS, 0, 8, 0, D3D12_BUFFER_SRV_FLAG_RAW);
+  ID3D12GraphicsCommandList *list = NULL;
+  CHECK_HR(ID3D12CommandAllocator_Reset(c->allocator));
+  CHECK_HR(ID3D12Device_CreateCommandList(dev, 0, D3D12_COMMAND_LIST_TYPE_DIRECT, c->allocator, pso, &IID_ID3D12GraphicsCommandList, (void **)&list));
+  if (!list) return;
+  ID3D12GraphicsCommandList_SetDescriptorHeaps(list, 1, &heap);
+  ID3D12GraphicsCommandList_SetComputeRootSignature(list, rs);
+  ID3D12GraphicsCommandList_SetComputeRoot32BitConstants(list, 0, 16, kIdentity, 0);
+  ID3D12GraphicsCommandList_SetComputeRootDescriptorTable(list, 1, heap_gpu(dev, heap, 0));
+  ID3D12GraphicsCommandList_Dispatch(list, 1, 1, 1);
+  scene_run(c, list);
+  ID3D12GraphicsCommandList_Release(list);
+  UINT a[16], k[8], w[10], n[3];
+  CHECK(buffer_download(c, appended, 0, a, 64) && buffer_download(c, counted, 0, k, 32) && buffer_download(c, wide, 0, w, 40));
+  CHECK(buffer_download(c, counters, 0, &n[0], 4) && buffer_download(c, counters, 4096, &n[1], 4) && buffer_download(c, counters, 8192, &n[2], 4));
+  /* (the threads take the values and places in an order of the GPU's: the six appended pairs are the six values 100 .. 105, each with a thread below 6, each thread once) */
+  int wrong = 0;
+  UINT seen_values = 0, seen_threads = 0, seen_places = 0;
+  for (UINT i = 0; i < 6; ++i) {
+    if (a[i * 2] < 100 || a[i * 2] > 105 || a[i * 2 + 1] > 5) { ++wrong; continue; }
+    seen_values |= 1u << (a[i * 2] - 100);
+    seen_threads |= 1u << a[i * 2 + 1];
+  }
+  for (UINT i = 0; i < 8; ++i) {
+    if (k[i] % 3 != 1 || k[i] / 3 > 7) { ++wrong; continue; }
+    seen_places |= 1u << (k[i] / 3);
+  }
+  for (UINT i = 0; i < 8; ++i) wrong += w[i] != 1007 + i;
+  printf("append and consume: counters %u %u %u, bufinfo %u %u\n", n[0], n[1], n[2], w[8], w[9]);
+  CHECK(wrong == 0 && seen_values == 0x3F && seen_threads == 0x3F && seen_places == 0xFF && n[0] == 6 && n[1] == 0 && n[2] == 8 && w[8] == 32 && w[9] == 8);
+  ID3D12PipelineState_Release(pso);
+  ID3D12RootSignature_Release(rs);
+  ID3D12DescriptorHeap_Release(heap);
+  ID3D12Resource_Release(counters);
+  ID3D12Resource_Release(distant);
+  ID3D12Resource_Release(wide);
+  ID3D12Resource_Release(counted);
+  ID3D12Resource_Release(consumed);
+  ID3D12Resource_Release(appended);
+}
+
+/* A draw with no render target and no depth buffer (UAV-only rendering): a triangle over the 16 x 16 viewport whose pixel shader adds one to each pixel's element of a typed view, and
+ * again with ForcedSampleCount 4 (where the device has four samples): still once a pixel. And a vertex shader that writes unordered access views (vs_uav). */
+static void test_uav_only_draws(Scene *c) {
+  ID3D12Device *dev = c->dev;
+  const D3D12_RESOURCE_FLAGS uav = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+  ID3D12Resource *hits = make_buffer(dev, D3D12_HEAP_TYPE_DEFAULT, 256 * 4, uav, D3D12_RESOURCE_STATE_COMMON);
+  ID3D12Resource *seen = make_buffer(dev, D3D12_HEAP_TYPE_DEFAULT, 16, uav, D3D12_RESOURCE_STATE_COMMON);
+  ID3D12Resource *positions = make_buffer(dev, D3D12_HEAP_TYPE_DEFAULT, 48, uav, D3D12_RESOURCE_STATE_COMMON);
+  ID3D12Resource *vb = make_buffer(dev, D3D12_HEAP_TYPE_UPLOAD, 3 * 28, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ);
+  const D3D12_DESCRIPTOR_RANGE_TYPE types[1] = {D3D12_DESCRIPTOR_RANGE_TYPE_UAV};
+  const UINT regs[1] = {0}, sizes[1] = {3};
+  ID3D12RootSignature *rs = ranges_signature(dev, 1, types, regs, sizes, 1);
+  ID3D12DescriptorHeap *heap = view_heap(dev, 3, 1), *cpu = view_heap(dev, 3, 0);
+  if (!hits || !seen || !positions || !vb || !rs || !heap || !cpu) { CHECK(0); return; }
+  const float tri[21] = {-1, -1, 0.5f, 1, 1, 1, 1, 3, -1, 0.5f, 1, 1, 1, 1, -1, 3, 0.5f, 1, 1, 1, 1};
+  void *p = NULL;
+  if (SUCCEEDED(ID3D12Resource_Map(vb, 0, NULL, &p)) && p) { memcpy(p, tri, sizeof tri); ID3D12Resource_Unmap(vb, 0, NULL); }
+  buffer_uav(dev, heap, cpu, 0, hits, NULL, 0, DXGI_FORMAT_R32_UINT, 0, 256, 0, 0);
+  buffer_uav(dev, heap, cpu, 1, seen, NULL, 0, DXGI_FORMAT_R32_UINT, 0, 4, 0, 0);
+  buffer_uav(dev, heap, cpu, 2, positions, NULL, 0, DXGI_FORMAT_UNKNOWN, 0, 3, 16, 0);
+  D3D12_INPUT_ELEMENT_DESC layout[2] = {{"POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
+                                        {"COLOR", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 12, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0}};
+  D3D12_GRAPHICS_PIPELINE_STATE_DESC pd;
+  memset(&pd, 0, sizeof pd);
+  pd.pRootSignature = rs;
+  pd.VS.pShaderBytecode = dx_vs_dxbc;
+  pd.VS.BytecodeLength = sizeof dx_vs_dxbc;
+  pd.PS.pShaderBytecode = dx_ps_uav_only_dxbc;
+  pd.PS.BytecodeLength = sizeof dx_ps_uav_only_dxbc;
+  pd.SampleMask = 0xFFFFFFFFu;
+  pd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+  pd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+  pd.InputLayout.pInputElementDescs = layout;
+  pd.InputLayout.NumElements = 2;
+  pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+  pd.NumRenderTargets = 0;
+  pd.SampleDesc.Count = 1;
+  ID3D12PipelineState *pso = NULL, *forced = NULL, *vertex = NULL, *refused = NULL;
+  CHECK_HR(ID3D12Device_CreateGraphicsPipelineState(dev, &pd, &IID_ID3D12PipelineState, (void **)&pso));
+  D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS q = {DXGI_FORMAT_B8G8R8A8_UNORM, 4, D3D12_MULTISAMPLE_QUALITY_LEVELS_FLAG_NONE, 0};
+  const int four = SUCCEEDED(ID3D12Device_CheckFeatureSupport(dev, D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS, &q, sizeof q)) && q.NumQualityLevels > 0;
+  pd.RasterizerState.ForcedSampleCount = 4;
+  if (four) CHECK_HR(ID3D12Device_CreateGraphicsPipelineState(dev, &pd, &IID_ID3D12PipelineState, (void **)&forced));
+  /* (refused: a forced count of 3, and a forced count with a render target) */
+  pd.RasterizerState.ForcedSampleCount = 3;
+  CHECK(ID3D12Device_CreateGraphicsPipelineState(dev, &pd, &IID_ID3D12PipelineState, (void **)&refused) == E_INVALIDARG && !refused);
+  pd.RasterizerState.ForcedSampleCount = 4;
+  pd.NumRenderTargets = 1;
+  pd.RTVFormats[0] = DXGI_FORMAT_B8G8R8A8_UNORM;
+  CHECK(ID3D12Device_CreateGraphicsPipelineState(dev, &pd, &IID_ID3D12PipelineState, (void **)&refused) == E_INVALIDARG && !refused);
+  /* (the vertex shader that writes u1 and u2, and the same pixel shader) */
+  pd.RasterizerState.ForcedSampleCount = 0;
+  pd.NumRenderTargets = 0;
+  pd.RTVFormats[0] = DXGI_FORMAT_UNKNOWN;
+  D3D12_INPUT_ELEMENT_DESC position[1] = {{"POSITION", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 0, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0}};
+  pd.InputLayout.pInputElementDescs = position;
+  pd.InputLayout.NumElements = 1;
+  pd.VS.pShaderBytecode = dx_vs_uav_dxbc;
+  pd.VS.BytecodeLength = sizeof dx_vs_uav_dxbc;
+  const HRESULT vertex_made = ID3D12Device_CreateGraphicsPipelineState(dev, &pd, &IID_ID3D12PipelineState, (void **)&vertex);
+  if (!pso) return;
+  const UINT zero[4] = {0, 0, 0, 0};
+  ID3D12GraphicsCommandList *list = NULL;
+  CHECK_HR(ID3D12CommandAllocator_Reset(c->allocator));
+  CHECK_HR(ID3D12Device_CreateCommandList(dev, 0, D3D12_COMMAND_LIST_TYPE_DIRECT, c->allocator, pso, &IID_ID3D12GraphicsCommandList, (void **)&list));
+  if (!list) return;
+  ID3D12GraphicsCommandList_SetDescriptorHeaps(list, 1, &heap);
+  for (UINT i = 0; i < 3; ++i) ID3D12GraphicsCommandList_ClearUnorderedAccessViewUint(list, heap_gpu(dev, heap, i), heap_cpu(dev, cpu, i), i == 0 ? hits : i == 1 ? seen : positions, zero, 0, NULL);
+  D3D12_VIEWPORT vp = {0, 0, 16, 16, 0, 1};
+  D3D12_RECT sc = {0, 0, 16, 16};
+  ID3D12GraphicsCommandList_OMSetRenderTargets(list, 0, NULL, FALSE, NULL);
+  ID3D12GraphicsCommandList_RSSetViewports(list, 1, &vp);
+  ID3D12GraphicsCommandList_RSSetScissorRects(list, 1, &sc);
+  D3D12_VERTEX_BUFFER_VIEW vbv = {ID3D12Resource_GetGPUVirtualAddress(vb), 3 * 28, 28};
+  ID3D12GraphicsCommandList_SetGraphicsRootSignature(list, rs);
+  ID3D12GraphicsCommandList_SetGraphicsRoot32BitConstants(list, 0, 16, kIdentity, 0);
+  ID3D12GraphicsCommandList_SetGraphicsRootDescriptorTable(list, 1, heap_gpu(dev, heap, 0));
+  ID3D12GraphicsCommandList_IASetPrimitiveTopology(list, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+  ID3D12GraphicsCommandList_IASetVertexBuffers(list, 0, 1, &vbv);
+  ID3D12GraphicsCommandList_DrawInstanced(list, 3, 1, 0, 0);
+  if (forced) {
+    ID3D12GraphicsCommandList_SetPipelineState(list, forced);
+    ID3D12GraphicsCommandList_DrawInstanced(list, 3, 1, 0, 0);
+  }
+  if (vertex) {
+    D3D12_VERTEX_BUFFER_VIEW pv = {ID3D12Resource_GetGPUVirtualAddress(vb), 48, 16};      /* (the first 48 bytes as three float4 positions) */
+    ID3D12GraphicsCommandList_SetPipelineState(list, vertex);
+    ID3D12GraphicsCommandList_IASetVertexBuffers(list, 0, 1, &pv);
+    ID3D12GraphicsCommandList_DrawInstanced(list, 3, 1, 0, 0);
+  }
+  scene_run(c, list);
+  ID3D12GraphicsCommandList_Release(list);
+  UINT h[256], s[4];
+  float pos[12];
+  CHECK(buffer_download(c, hits, 0, h, sizeof h) && buffer_download(c, seen, 0, s, sizeof s) && buffer_download(c, positions, 0, pos, sizeof pos));
+  /* (each pixel once a draw: by the first, the forced one, and - its triangle is the first 48 bytes of floats as positions - none or some of them by the vertex one) */
+  const UINT draws = forced ? 2u : 1u;
+  int wrong = 0, extra = 0;
+  for (UINT i = 0; i < 256; ++i) {
+    if (h[i] < draws || h[i] > draws + 1) { if (!wrong++) printf("  UAV-only draw: element %u = %u, want %u\n", i, h[i], draws); }
+    extra += h[i] == draws + 1;
+  }
+  printf("UAV-only draws: %u draws, %d pixels of the vertex shader's triangle; vertex shader UAVs %s (%u vertices)\n", draws, extra, vertex ? "made" : "refused", s[0]);
+  CHECK(wrong == 0);
+  if (vertex) {
+    int bad = s[0] != 3;
+    for (UINT i = 0; i < 12; ++i) bad += pos[i] != tri[i];
+    CHECK(bad == 0);
+  } else {
+    CHECK(FAILED(vertex_made));
+  }
+  if (vertex) ID3D12PipelineState_Release(vertex);
+  if (forced) ID3D12PipelineState_Release(forced);
+  ID3D12PipelineState_Release(pso);
+  ID3D12DescriptorHeap_Release(cpu);
+  ID3D12DescriptorHeap_Release(heap);
+  ID3D12RootSignature_Release(rs);
+  ID3D12Resource_Release(vb);
+  ID3D12Resource_Release(positions);
+  ID3D12Resource_Release(seen);
+  ID3D12Resource_Release(hits);
+}
+
 /* A geometry shader sending triangle n to layer n (SV_RenderTargetArrayIndex) of a render target and a depth buffer of three slices, a clear of a view of two of them, and
  * a view that starts at slice 1. */
 static void test_layers(Scene *c) {
@@ -3629,6 +4012,9 @@ static void test_extras(ID3D12Device *dev, ID3D12CommandQueue *queue, ID3D12Fenc
   test_cpu_planar(&c);
   test_packed_yuv(&c);
   test_texture_uavs(&c);
+  test_typed_buffers(&c);
+  test_counters(&c);
+  test_uav_only_draws(&c);
   test_pixel_uavs(&c);
   test_layers(&c);
   test_plane_uavs(&c);

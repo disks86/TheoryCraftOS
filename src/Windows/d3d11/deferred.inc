@@ -297,7 +297,9 @@ static void command_run(Ctx *c, const Command *m) {
       /* (the hidden counts of append and counter views, set when the bind is run) */
       for (UINT i = 0; i < 8 && i < u[0]; ++i) {
         View *v = (View *)m->obj[i];
-        if (v && v->buf && (v->desc.uav.Buffer.Flags & (D3D11_BUFFER_UAV_FLAG_APPEND | D3D11_BUFFER_UAV_FLAG_COUNTER)) && m->data) memcpy(&v->counter, m->data + 4 * i, 4);
+        UINT count = 0;
+        if (m->data) memcpy(&count, m->data + 4 * i, 4);
+        if (v && v->buf && v->counter_buf && m->data && count != (UINT)-1) v->counter = count, v->counter_dirty = TRUE;      /* (-1: kept as it is) */
       }
       break;
     case REC_MIN_LOD: ctx_SetResourceMinLOD(c, (ID3D11Resource *)m->obj[0], m->f[0]); break;

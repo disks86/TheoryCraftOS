@@ -29,7 +29,7 @@ namespace graphics {
 struct RecordedCommand {
   enum class Type : uint8_t {
     BeginRenderPass, BindPipeline, BindVertexBuffer, BindIndexBuffer, PushConstants, BindTexture, SetViewport, SetScissor,
-    Draw, DrawIndexed, EndRenderPass, SetTopology, BeginQuery, EndQuery, BindComputePipeline, BindStorageBuffer, Dispatch, Resolve, SetPatchPoints, BindStreamOutput, BindStorageImage,
+    Draw, DrawIndexed, EndRenderPass, SetTopology, BeginQuery, EndQuery, BindComputePipeline, BindStorageBuffer, Dispatch, Resolve, SetPatchPoints, BindStreamOutput, BindStorageImage, BindStorageTexelBuffer,
   };
   Type type = Type::Draw;
   RenderPassBegin pass;
@@ -49,6 +49,7 @@ struct RecordedCommand {
   IImage* image2 = nullptr;   // Resolve: the source (image is the destination)
   SamplerDesc sampler;
   StorageImageView storage_view;   // BindStorageImage (the slot in `unit`, the image in `image`)
+  TexelBufferView texel_view;      // BindStorageTexelBuffer (the slot in `unit`, the buffer in `buffer`)
 };
 
 class CommandRecorder : public ICommandBuffer {
@@ -213,6 +214,18 @@ class CommandRecorder : public ICommandBuffer {
     c.unit = slot;
     c.image = image;
     c.storage_view = view;
+    add(c);
+  }
+  void bind_storage_texel_buffer(uint32_t slot, IBuffer* buffer, const TexelBufferView& view) override {
+    if (slot >= kMaxImageSlots) {
+      ok_ = false;
+      return;
+    }
+    RecordedCommand c;
+    c.type = RecordedCommand::Type::BindStorageTexelBuffer;
+    c.unit = slot;
+    c.buffer = buffer;
+    c.texel_view = view;
     add(c);
   }
   void dispatch(uint32_t groups_x, uint32_t groups_y, uint32_t groups_z) override {

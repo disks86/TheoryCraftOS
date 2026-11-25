@@ -30,6 +30,8 @@
 
 namespace dxgk {
 
+using StorageMask = graphics::SlotMask<graphics::kMaxStorageBuffers>;   // (the storage buffer slots a shader or pipeline uses)
+
 class Adapter;
 
 class SyncObject {
@@ -88,7 +90,7 @@ class ShaderObject {
   uint32_t texture_mask_ = 0;               // ... the units it reads (bit n: unit n)
   bool knows_textures_ = false;             // made from DXBC: texture_mask_ says all it reads
   uint32_t thread_group_[3] = {1, 1, 1};     // a compute shader's thread group
-  uint32_t storage_mask_ = 0;                // ... and the storage buffer slots it uses (bit n: u<n>)
+  StorageMask storage_mask_;                 // ... and the storage buffer slots it uses (u<n>, the views of buffers after them, the counters)
   bool fragment_stores_ = false;             // a pixel shader that writes them
   bool vertex_stores_ = false;               // ... or a vertex shader
   bool geometry_stores_ = false;             // ... or a geometry shader
@@ -97,10 +99,11 @@ class ShaderObject {
   uint32_t geometry_streams_ = 1;                          // ... and how many output streams it has
   uint32_t tess_input_points_ = 0, tess_output_points_ = 0;   // a hull or domain shader's control points
   graphics::TessDomain tess_domain_ = graphics::TessDomain::Triangle;   // ... and the domain it tessellates
-  // The storage images a compute or pixel shader declares (bit n: u<n>), their dimensions and the values they read and write; a geometry shader that writes SV_RenderTargetArrayIndex.
-  uint32_t image_mask_ = 0;
-  D3d9Program::ImageDim image_dims_[graphics::kMaxStorageImages] = {};
-  D3d9Program::ImageReturn image_returns_[graphics::kMaxStorageImages] = {};
+  // The storage images a shader declares (the u# ones, and the typed views of buffers of t#: graphics::kMaxImageSlots), their dimensions and the values they read and write; a geometry
+  // shader that writes SV_RenderTargetArrayIndex.
+  D3d9Program::ImageMask image_mask_;
+  D3d9Program::ImageDim image_dims_[graphics::kMaxImageSlots] = {};
+  D3d9Program::ImageReturn image_returns_[graphics::kMaxImageSlots] = {};
   bool writes_layer_ = false;
   D3d9Binding d3d9_;              // Direct3D 9 bytecode being interpreted (the module's function finds the program through it)
 };
@@ -132,7 +135,7 @@ class PipelineObject {
   uint32_t tess_input_points() const { return tess_input_points_; }
   graphics::GeometryPrimitive geometry_input() const { return geometry_input_; }
   uint32_t thread_group(uint32_t axis) const { return axis < 3 ? thread_group_[axis] : 1; }
-  uint32_t storage_mask() const { return storage_mask_; }
+  const StorageMask& storage_mask() const { return storage_mask_; }
   uint32_t texture_mask() const { return texture_mask_; }   // a compute pipeline: the texture units its shader reads
   bool writes_storage() const { return fragment_stores_ || vertex_stores_ || geometry_stores_ || tessellation_stores_; }   // a shader of the pipeline writes buffers
   bool has_per_instance() const { return per_instance_; }
@@ -141,17 +144,17 @@ class PipelineObject {
   bool has_stream_output() const { return stream_output_buffers_ != 0; }
   // The kind of texture the shaders declared for a unit (2D when they do not say: only a DXBC program does).
   graphics::TextureKind texture_kind(uint32_t unit) const { return unit < graphics::kMaxTextureUnits ? texture_kinds_[unit] : graphics::TextureKind::Texture2D; }
-  // The storage images the compute shader or the pixel shader declares (bit n: u<n>), with each one's dimension and the values it reads and writes: a dispatch or draw needs them bound.
-  uint32_t image_mask() const { return image_mask_; }
-  D3d9Program::ImageDim image_dim(uint32_t slot) const { return slot < graphics::kMaxStorageImages ? image_dims_[slot] : D3d9Program::ImageDim::None; }
-  D3d9Program::ImageReturn image_return(uint32_t slot) const { return slot < graphics::kMaxStorageImages ? image_returns_[slot] : D3d9Program::ImageReturn::Float; }
+  // The storage images (and typed views of buffers) the pipeline's shaders declare, with each one's dimension and the values it reads and writes: a dispatch or draw needs them bound.
+  const D3d9Program::ImageMask& image_mask() const { return image_mask_; }
+  D3d9Program::ImageDim image_dim(uint32_t slot) const { return slot < graphics::kMaxImageSlots ? image_dims_[slot] : D3d9Program::ImageDim::None; }
+  D3d9Program::ImageReturn image_return(uint32_t slot) const { return slot < graphics::kMaxImageSlots ? image_returns_[slot] : D3d9Program::ImageReturn::Float; }
 
  private:
   friend class Adapter;
   graphics::IGraphicsDevice& device_;
-  uint32_t image_mask_ = 0;
-  D3d9Program::ImageDim image_dims_[graphics::kMaxStorageImages] = {};
-  D3d9Program::ImageReturn image_returns_[graphics::kMaxStorageImages] = {};
+  D3d9Program::ImageMask image_mask_;
+  D3d9Program::ImageDim image_dims_[graphics::kMaxImageSlots] = {};
+  D3d9Program::ImageReturn image_returns_[graphics::kMaxImageSlots] = {};
   graphics::IPipeline* pipeline_ = nullptr;
   bool per_instance_ = false;
   uint32_t stream_output_buffers_ = 0;
@@ -161,7 +164,7 @@ class PipelineObject {
   uint32_t tess_input_points_ = 0;
   graphics::GeometryPrimitive geometry_input_ = graphics::GeometryPrimitive::Triangle;
   uint32_t thread_group_[3] = {1, 1, 1};
-  uint32_t storage_mask_ = 0;
+  StorageMask storage_mask_;
   bool fragment_stores_ = false, vertex_stores_ = false, geometry_stores_ = false, tessellation_stores_ = false;
   SharedPointer<ShaderObject> vertex_, fragment_;   // (kept alive for as long as the pipeline is)
   graphics::TextureKind texture_kinds_[graphics::kMaxTextureUnits] = {};

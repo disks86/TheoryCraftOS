@@ -1229,9 +1229,26 @@ NtStatus Kernel::write_descriptor(ProcessId pid, Handle heap, uint32_t index, co
                                            : !alloc.is_buffer() || alloc.is_query_result())
       return status::kInvalidParameter;
     if (desc.kind != DescriptorKind::Srv || buffer_view) {
-      if (desc.offset > alloc.desc().size || desc.offset % 4 || desc.size > alloc.desc().size - desc.offset || desc.size % 4) return status::kInvalidParameter;
+      // (a typed view: whole elements of its format - an unordered access view's a format that can be stored -; the others whole words)
+      const graphics::TexelFormat texel = static_cast<graphics::TexelFormat>(desc.texel_format);
+      const bool typed = desc.texel_format != 0 && desc.kind != DescriptorKind::Cbv;
+      if (typed && (!graphics::texel_format_valid(texel) || (desc.kind == DescriptorKind::Uav && !graphics::texel_format_storable(texel)))) return status::kInvalidParameter;
+      const uint64_t unit = typed ? graphics::texel_bytes(texel) : 4;
+      if (desc.offset > alloc.desc().size || desc.offset % unit || desc.size > alloc.desc().size - desc.offset || desc.size % unit) return status::kInvalidParameter;
       d.offset = desc.offset;
-      d.size = desc.size ? desc.size : alloc.desc().size - desc.offset;
+      d.size = desc.size ? desc.size : (alloc.desc().size - desc.offset) / unit * unit;
+      if (typed) d.texel_format = desc.texel_format;
+      if (desc.counter) {
+        // (an unordered access view's counter: a word of a buffer of the same device that shaders write)
+        SharedPointer<AllocRec> c = p->allocations.get(desc.counter);
+        if (!c || c->device != h->device) return status::kInvalidHandle;
+        const Allocation& ca = *c->allocation;
+        if (desc.kind != DescriptorKind::Uav || !ca.is_buffer() || !(ca.desc().flags & kAllocUnorderedAccess) || desc.counter_offset % 4 || desc.counter_offset > ca.desc().size ||
+            ca.desc().size - desc.counter_offset < 4)
+          return status::kInvalidParameter;
+        d.counter = c->allocation;
+        d.counter_offset = desc.counter_offset;
+      }
     }
     d.allocation = a->allocation;
     if (desc.alternate) {
@@ -1422,6 +1439,14 @@ NtStatus Kernel::escape_d3d12(ProcessId pid, Handle device, uint32_t op, ByteRea
         if (d.kind == DescriptorKind::Srv && size_hi == 0xFFFFFFFFu) {
           d.alternate = size_lo;
           d.size = 0;
+        }
+        // (a view of a buffer has no sampler: those words are the view's element format - typed views - and an unordered access view's counter, its buffer and offset)
+        if (d.kind == DescriptorKind::Srv || d.kind == DescriptorKind::Uav) {
+          d.texel_format = bias;
+          d.counter = min_lod;
+          d.counter_offset = max_lod;
+          d.sampler.lod_bias = d.sampler.min_lod = 0.0f;
+          d.sampler.max_lod = 1000.0f;
         }
         // (a texture's unordered access view: the level, the first layer and the layer count)
         if (d.kind == DescriptorKind::UavTexture) {

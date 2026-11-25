@@ -107,13 +107,16 @@ class D3d9Program {
   uint32_t storage_stride(uint32_t slot) const { return slot < graphics::kMaxStorageBuffers ? uav_stride_[slot] : 0; }
   // Runs the shader for one thread. `constants` are the push constants; the buffers are the context's.
   void run_compute(const graphics::ComputeContext& context, const uint8_t* constants) const;
-  // Storage images (typed unordered access views of textures, dcl_uav_typed u#: compute and pixel shaders): what the shader declared slot u<slot> to be - its dimension and the type of
-  // the values it reads and writes (a float, unorm or snorm view: floats; uint or sint: the integers' bits). A register is a storage buffer or an image, never both.
-  enum class ImageDim : uint8_t { None, Texture1D, Texture1DArray, Texture2D, Texture2DArray, Texture3D };
+  // Storage images (typed unordered access views of textures and of buffers, dcl_uav_typed u#; and typed shader resource views of buffers, dcl_resource_buffer t#, in the image slots from
+  // graphics::kTexelBufferSlotBase): what the shader declared slot <slot> to be - its dimension and the type of the values it reads and writes (a float, unorm or snorm view: floats; uint
+  // or sint: the integers' bits). A u# register is a storage buffer or an image, never both.
+  enum class ImageDim : uint8_t { None, Texture1D, Texture1DArray, Texture2D, Texture2DArray, Texture3D, Buffer };
   enum class ImageReturn : uint8_t { Float, Uint, Sint };
-  ImageDim image_dim(uint32_t slot) const { return slot < graphics::kMaxStorageImages ? image_dim_[slot] : ImageDim::None; }
-  ImageReturn image_return(uint32_t slot) const { return slot < graphics::kMaxStorageImages ? image_return_[slot] : ImageReturn::Float; }
-  uint32_t image_mask() const { return image_mask_; }   // (bit n: u<n> is a storage image)
+  using ImageMask = graphics::SlotMask<graphics::kMaxImageSlots>;
+  ImageDim image_dim(uint32_t slot) const { return slot < graphics::kMaxImageSlots ? image_dim_[slot] : ImageDim::None; }
+  ImageReturn image_return(uint32_t slot) const { return slot < graphics::kMaxImageSlots ? image_return_[slot] : ImageReturn::Float; }
+  const ImageMask& image_mask() const { return image_mask_; }   // (slot n: a storage image or a typed view of a buffer)
+  bool writes_images() const { return writes_images_; }         // (a u# image is declared: the shader may write it)
   // A geometry shader that writes SV_RenderTargetArrayIndex (ShaderIo::layer).
   bool writes_layer() const { return writes_layer_; }
   // The graphics::DeviceFeature2 bits the program needs (storage images; the layer output).
@@ -148,7 +151,8 @@ class D3d9Program {
   // GENERIC[0..3] are the four of the mapping above, CONST[0..7] the push constants and the shader's `def`s immediates, the position gets the same Y flip as run_vertex. kNotSupported for
   // what the text cannot say (see D3d9Tgsi.cpp), kNoMemory.
   // `varyings`: how many interpolants the host's vertex and pixel shaders declare (DeviceLimits::varyings).
-  NtStatus emit_tgsi(String* out, uint32_t varyings = graphics::kBaseVaryings) const;
+  // `bindings` (or null): where the text's BUFFER, IMAGE and buffer SVIEW registers are bound (graphics::TgsiBindings).
+  NtStatus emit_tgsi(String* out, uint32_t varyings = graphics::kBaseVaryings, graphics::TgsiBindings* bindings = nullptr) const;
 
   // For a vertex shader: whether it is the matrix transform of the fixed vertex kernel, found by running it on test vectors against the built-in shader. `colour_varying` is the varying
   // the colour attribute goes to.
@@ -199,9 +203,10 @@ class D3d9Program {
   uint32_t shared_bytes_[graphics::kMaxSharedMemories] = {};
   bool uses_barrier_ = false;
   uint32_t texture_unit_mask_ = 0, attributes_used_ = 0;
-  ImageDim image_dim_[graphics::kMaxStorageImages] = {};
-  ImageReturn image_return_[graphics::kMaxStorageImages] = {};
-  uint32_t image_mask_ = 0;
+  ImageDim image_dim_[graphics::kMaxImageSlots] = {};
+  ImageReturn image_return_[graphics::kMaxImageSlots] = {};
+  ImageMask image_mask_;
+  bool writes_images_ = false;
   bool writes_layer_ = false;
   graphics::TextureKind texture_kind_[graphics::kMaxTextureUnits] = {};
   uint8_t texture_samples_[graphics::kMaxTextureUnits] = {};   // the sample count a multisampled texture was declared with

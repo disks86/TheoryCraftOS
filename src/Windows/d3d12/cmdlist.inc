@@ -146,6 +146,7 @@ struct CmdList {
   UINT dsv;
   UINT dsv_layers[2];          /* ... and of the depth buffer */
   int pass_open;
+  UINT uav_only_samples, uav_only_width, uav_only_height;      /* the pass open is on a target of the device's for draws with no target (ensure_pass): its samples and size (0: not such a pass) */
   int pending_clear;           /* a depth/stencil clear waiting for a pass */
   UINT pending_width, pending_height, pending_samples;      /* (the buffer's size: for its companion, if no pass takes the clear) */
   UINT dsv_width, dsv_height, dsv_samples;                  /* the size of the depth buffer in `dsv` */
@@ -449,6 +450,47 @@ static void depth_companion_drop(Dev *dev, UINT depth) {
   if (color) kmt_destroy_allocation(dev->kdev, color);
 }
 
+/* The colour target of a pass with no render target and no depth buffer (a draw that writes unordered access views only: Direct3D's UAV-only rendering, ForcedSampleCount): the
+ * kernel's passes need one, so it is a target of the device's of at least `width` x `height` with `samples` samples that nothing reads (the viewport says what is rasterized); made
+ * the first time one that size is needed and kept until the device goes. 0 if it cannot be made. */
+static UINT uav_only_target(Dev *dev, UINT width, UINT height, UINT samples) {
+  UINT color = 0;
+  if (!width || !height || width > 16384 || height > 16384) return 0;
+  AcquireSRWLockExclusive(&dev->companion_lock);
+  for (UINT i = 0; i < dev->uav_target_count; ++i)
+    if (dev->uav_targets[i].width >= width && dev->uav_targets[i].height >= height && dev->uav_targets[i].samples == samples) { color = dev->uav_targets[i].color; break; }
+  if (!color) {
+    if (dev->uav_target_count == dev->uav_target_capacity) {
+      const UINT capacity = dev->uav_target_capacity ? dev->uav_target_capacity * 2 : 4;
+      struct UavOnlyTarget *grown = mem_alloc((SIZE_T)capacity * sizeof *grown);
+      if (grown) {
+        if (dev->uav_target_count) memcpy(grown, dev->uav_targets, (SIZE_T)dev->uav_target_count * sizeof *grown);
+        mem_free(dev->uav_targets);
+        dev->uav_targets = grown;
+        dev->uav_target_capacity = capacity;
+      }
+    }
+    if (dev->uav_target_count < dev->uav_target_capacity) {
+      KmtAllocDesc ad;
+      memset(&ad, 0, sizeof ad);
+      ad.flags = KA_RENDER_TARGET;
+      ad.format = KF_A8R8G8B8;
+      ad.width = width;
+      ad.height = height;
+      ad.mips = ad.layers = 1;
+      ad.samples = samples;
+      if (KMT_OK(kmt_create_allocation(dev->kdev, &ad, &color, NULL, NULL)) && color) {
+        struct UavOnlyTarget t = {color, width, height, samples};
+        dev->uav_targets[dev->uav_target_count++] = t;
+      } else {
+        color = 0;
+      }
+    }
+  }
+  ReleaseSRWLockExclusive(&dev->companion_lock);
+  return color;
+}
+
 /* A depth clear that no pass has taken (the next pass was of another depth buffer, or the list ends) is a pass of its own, on the buffer's companion. */
 static void flush_pending_clear(CmdList *l) {
   static const float zero[4] = {0, 0, 0, 0};
@@ -485,6 +527,18 @@ static int ensure_pass(CmdList *l) {
     color = l->d.dev->null_target;
     depth = 0;
   }
+  int uav_only = 0;
+  if (!color && !depth && l->pso && !l->pso->compute) {
+    /* no target at all: a draw that writes unordered access views only, over the viewport (with the pipeline's samples: ForcedSampleCount) */
+    const float right = l->have_viewport ? l->viewport.TopLeftX + l->viewport.Width : 0.0f, bottom = l->have_viewport ? l->viewport.TopLeftY + l->viewport.Height : 0.0f;
+    const UINT width = right >= 1.0f && right <= 16384.0f ? (UINT)(right + 0.999f) : 0, height = bottom >= 1.0f && bottom <= 16384.0f ? (UINT)(bottom + 0.999f) : 0;
+    color = uav_only_target(l->d.dev, width, height, l->pso->samples);
+    uav_only = color != 0;
+    l->uav_only_samples = uav_only ? l->pso->samples : 0;
+    l->uav_only_width = width, l->uav_only_height = height;
+  } else {
+    l->uav_only_samples = 0;
+  }
   if (!color) return 0;
   UINT flags = 0;
   float depth_value = 1.0f;
@@ -499,6 +553,11 @@ static int ensure_pass(CmdList *l) {
     const UINT saved = l->rtv_count;
     l->rtv_count = 1;
     begin_pass_packet_layers(l, color, depth, flags, zero, depth_value, stencil, NULL, l->dsv_layers);
+    l->rtv_count = saved;
+  } else if (uav_only) {
+    const UINT saved = l->rtv_count;
+    l->rtv_count = 1;
+    begin_pass_packet_layers(l, color, 0, flags, zero, depth_value, stencil, NULL, NULL);
     l->rtv_count = saved;
   } else {
     /* (the layers of the list's targets; a target of the device's own - stream output with none - is a 2D image) */
@@ -573,6 +632,7 @@ static void send_binding(CmdList *l, Binding *b, int which) {
             const SoftDesc *sd = &h->descs[index + k];
             if (sd->alloc && (sd->kind == DK_SRV || sd->kind == DK_SRV_BUFFER || sd->kind == DK_UAV || sd->kind == DK_CBV || sd->kind == DK_UAV_TEXTURE)) { alloc_index(l, sd->alloc); ++listed; }
             if (sd->kind == DK_SRV && (sd->size & SRV_ALTERNATE) == SRV_ALTERNATE) { alloc_index(l, (UINT)sd->size); ++listed; }      /* (a view's array mirror too) */
+            if (sd->kind == DK_UAV && sd->sampler[2]) { alloc_index(l, sd->sampler[2]); ++listed; }      /* (and an unordered access view's counter) */
           }
         }
         w[0] = i; w[1] = index;
@@ -652,6 +712,11 @@ static int prepare_draw(CmdList *l, int indexed) {
     if (pipeline && list_bind_pipeline(l, l->pso, pipeline)) packet(l, OP_BIND_PIPELINE, &pipeline, 1);
     send_binding(l, &l->gfx, 1);
     l->dirty_heaps = 0;
+  }
+  if (l->pass_open && l->uav_only_samples && !l->rtv_count && !l->dsv) {
+    /* (a pass on the device's target for draws with no target: another for a pipeline of other samples, or a viewport past it) */
+    const float right = l->have_viewport ? l->viewport.TopLeftX + l->viewport.Width : 0.0f, bottom = l->have_viewport ? l->viewport.TopLeftY + l->viewport.Height : 0.0f;
+    if (l->pso->samples != l->uav_only_samples || right > (float)l->uav_only_width || bottom > (float)l->uav_only_height) end_pass(l);
   }
   if (!ensure_pass(l)) return 0;
   if (l->sent_binding != 1 || l->dirty_gfx || l->dirty_heaps) {

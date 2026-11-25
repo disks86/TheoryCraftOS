@@ -46,7 +46,7 @@ i686-w64-mingw32-gcc -O1 -mcrtdll=msvcrt-os -o "$work/old32.exe" tests/windows/o
 python3 - "$work/dxfixtures.h" <<'PY'
 import sys
 out = open(sys.argv[1], "w")
-for n in ("vs", "ps_color", "ps_tex", "cs_fill", "vs_attrs6", "ps_tex4", "ps_mrt8", "ps_cbuf", "vs_packed", "ps_packed", "ps_planes", "vs_vol", "ps_texcube", "ps_texarray", "ps_tex3d", "gs_copy", "hs_tri_cb", "ds_shift", "cs_d3d11", "ps_sbuf", "ps_tex1d", "ps_tex1darray", "ps_int_load", "ps_int_write", "cs_uav_array", "cs_uav_load", "cs_uav_atomic", "ps_uav", "gs_layer", "cs_plane_uav"):
+for n in ("vs", "ps_color", "ps_tex", "cs_fill", "vs_attrs6", "ps_tex4", "ps_mrt8", "ps_cbuf", "vs_packed", "ps_packed", "ps_planes", "vs_vol", "ps_texcube", "ps_texarray", "ps_tex3d", "gs_copy", "hs_tri_cb", "ds_shift", "cs_d3d11", "ps_sbuf", "ps_tex1d", "ps_tex1darray", "ps_int_load", "ps_int_write", "cs_uav_array", "cs_uav_load", "cs_uav_atomic", "ps_uav", "gs_layer", "cs_plane_uav", "cs_typed_buffer", "cs_append", "cs_append_u3", "vs_uav", "ps_uav_only"):
     data = open("tests/data/dxbc/%s.dxbc" % n, "rb").read()
     out.write("static const unsigned char dx_%s_dxbc[] = {%s};\n" % (n, ",".join(str(b) for b in data)))
 PY

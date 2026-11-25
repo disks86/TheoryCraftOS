@@ -245,11 +245,13 @@ static void tex_before_read(Dev *d, const Tex *t) { settle(d, t->written); }
 
 /* What texture slot `i` of the table holds: the pixel shader's, else the first of the other stages' that has one bound (they share the kernel's units). */
 static View *slot_view(const Ctx *c, UINT i) {
+  if (i >= SRV_SLOTS) return NULL;
   if (c->srv[i]) return c->srv[i];
   for (UINT k = 0; k < 4; ++k) if (c->stage_srv[k][i]) return c->stage_srv[k][i];
   return NULL;
 }
 static Sampler *slot_sampler(const Ctx *c, UINT i) {
+  if (i >= TEXTURE_SLOTS) return NULL;
   if (c->sampler[i]) return c->sampler[i];
   for (UINT k = 0; k < 4; ++k) if (c->stage_sampler[k][i]) return c->stage_sampler[k][i];
   return NULL;
@@ -305,9 +307,48 @@ static BYTE slot_declared_kind(const Ctx *c, UINT i) {
   return 0xFF;
 }
 
-/* The descriptor of a buffer view (raw words: the kernel takes the stride from the shader's declaration). FALSE for one the kernel cannot bind (not whole words). */
-static BOOL buffer_descriptor(Dev *d, const View *v, BOOL unordered, D3D12_CPU_DESCRIPTOR_HANDLE at) {
+static void buf_write_any(Dev *d, Buf *b, UINT64 offset, const void *data, UINT64 bytes);
+static void buf_copy(Dev *d, Buf *to, UINT64 to_offset, Buf *from, UINT64 from_offset, UINT64 bytes);
+/* The descriptor of a buffer view: a typed view as Direct3D 12's typed view of the same elements; an append or counter view as a structured one with its counter (written
+ * first when it was set since); the others raw words (the kernel takes the stride from the shader's declaration). FALSE for one the kernel cannot bind (not whole words). */
+static BOOL buffer_descriptor(Dev *d, View *v, BOOL unordered, D3D12_CPU_DESCRIPTOR_HANDLE at) {
+  if (v->format != DXGI_FORMAT_UNKNOWN && v->stride) {
+    if (unordered) {
+      D3D12_UNORDERED_ACCESS_VIEW_DESC u;
+      memset(&u, 0, sizeof u);
+      u.Format = v->format;
+      u.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+      u.Buffer.FirstElement = v->offset / v->stride;
+      u.Buffer.NumElements = (UINT)(v->size / v->stride);
+      ID3D12Device_CreateUnorderedAccessView(d->d12, v->buf->res, NULL, &u, at);
+    } else {
+      D3D12_SHADER_RESOURCE_VIEW_DESC r;
+      memset(&r, 0, sizeof r);
+      r.Format = v->format;
+      r.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+      r.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+      r.Buffer.FirstElement = v->offset / v->stride;
+      r.Buffer.NumElements = (UINT)(v->size / v->stride);
+      ID3D12Device_CreateShaderResourceView(d->d12, v->buf->res, &r, at);
+    }
+    return TRUE;
+  }
   if (v->offset % 4 || v->size % 4) return FALSE;
+  if (unordered && v->counter_buf && v->stride) {
+    if (v->counter_dirty) {
+      buf_write_any(d, v->counter_buf, 0, &v->counter, 4);
+      v->counter_dirty = FALSE;
+    }
+    D3D12_UNORDERED_ACCESS_VIEW_DESC u;
+    memset(&u, 0, sizeof u);
+    u.Format = DXGI_FORMAT_UNKNOWN;
+    u.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+    u.Buffer.FirstElement = v->offset / v->stride;
+    u.Buffer.NumElements = (UINT)(v->size / v->stride);
+    u.Buffer.StructureByteStride = v->stride;
+    ID3D12Device_CreateUnorderedAccessView(d->d12, v->buf->res, v->counter_buf->res, &u, at);
+    return TRUE;
+  }
   if (unordered) {
     D3D12_UNORDERED_ACCESS_VIEW_DESC u;
     memset(&u, 0, sizeof u);
@@ -383,30 +424,36 @@ static void texture_uav_descriptor(Dev *d, const View *v, D3D12_CPU_DESCRIPTOR_H
   ID3D12Device_CreateUnorderedAccessView(d->d12, t->res, NULL, &x, at);
 }
 
-/* The tables of a draw or a dispatch: shader resources t0 .. t7 (`kinds`: what the shaders declare there, for what fills an empty slot), samplers s0 .. s7, and the
- * unordered access views u0 .. u7 the shaders declare (`uav_mask`). The handles go into Dev.table_*. `cache`: a table the same as the last one is used again. */
-static BOOL tables_record(Dev *d, View *const *srvs, Sampler *const *samplers, const BYTE *kinds, View *const *uavs, UINT uav_mask, BOOL cache) {
-  UINT view_ids[TEXTURE_SLOTS], sampler_ids[TEXTURE_SLOTS], uav_ids[UAV_SLOTS];
+/* The tables of a draw or a dispatch: shader resources t0 .. t<view_count - 1> (TEXTURE_SLOTS, or SRV_SLOTS for the wide root signature; `kinds`: what the shaders declare
+ * there, for what fills an empty slot), samplers s0 .. s7, and the unordered access views u0 .. u7 the shaders declare (`uav_mask`). The handles go into Dev.table_*. `cache`: a
+ * table the same as the last one is used again. */
+static BOOL tables_record(Dev *d, View *const *srvs, Sampler *const *samplers, const BYTE *kinds, View *const *uavs, UINT uav_mask, BOOL cache, UINT view_count) {
+  UINT view_ids[SRV_SLOTS], sampler_ids[TEXTURE_SLOTS], uav_ids[UAV_SLOTS];
   FLOAT min_lods[TEXTURE_SLOTS];
-  for (UINT i = 0; i < TEXTURE_SLOTS; ++i) {
+  for (UINT i = 0; i < view_count; ++i)
     view_ids[i] = srvs[i] ? srvs[i]->c.id : kinds[i] == KIND_BUFFER ? d->blank_buffer->c.id : (kinds[i] >= 1 && kinds[i] <= 3 && d->blank_kind[kinds[i]] ? d->blank_kind[kinds[i]] : d->blank)->c.id;
+  for (UINT i = 0; i < TEXTURE_SLOTS; ++i) {
     sampler_ids[i] = samplers[i] ? samplers[i]->s.c.id : 0;
     min_lods[i] = srvs[i] && srvs[i]->tex ? srvs[i]->tex->min_lod : 0.0f;      /* (the clamp goes into the sampler) */
   }
+  /* (an append or counter view whose count was set since: its counter is written now, in order with what the list did before; the table is made again) */
+  for (UINT i = 0; i < UAV_SLOTS; ++i)
+    if ((uav_mask >> i & 1) && uavs[i] && uavs[i]->counter_buf && uavs[i]->counter_dirty) cache = FALSE;
   for (UINT i = 0; i < UAV_SLOTS; ++i) uav_ids[i] = !(uav_mask >> i & 1) ? 0 : uavs[i] ? uavs[i]->c.id : d->blank_uav->c.id;
   const UINT step_views = ID3D12Device_GetDescriptorHandleIncrementSize(d->d12, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
   const UINT step_samplers = ID3D12Device_GetDescriptorHandleIncrementSize(d->d12, D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER);
   const D3D12_CPU_DESCRIPTOR_HANDLE view_start = ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(d->view_heap);
   const D3D12_GPU_DESCRIPTOR_HANDLE view_gpu = ID3D12DescriptorHeap_GetGPUDescriptorHandleForHeapStart(d->view_heap);
-  if (!cache || !d->tables_valid || memcmp(view_ids, d->table_view_ids, sizeof view_ids) != 0) {
+  if (!cache || !d->tables_valid || d->table_view_count != view_count || memcmp(view_ids, d->table_view_ids, view_count * sizeof view_ids[0]) != 0) {
     D3D12_CPU_DESCRIPTOR_HANDLE at = view_start;
     at.ptr += (SIZE_T)d->view_used * step_views;
     d->table_views = view_gpu.ptr + (UINT64)d->view_used * step_views;
-    for (UINT i = 0; i < TEXTURE_SLOTS; ++i) {
-      const View *v = srvs[i];
+    for (UINT i = 0; i < view_count; ++i) {
+      View *v = srvs[i];
       if (v && v->buf) { if (!buffer_descriptor(d, v, FALSE, at)) return FALSE; }
+      else if (!v && kinds[i] == 0xFF && i >= TEXTURE_SLOTS) ID3D12Device_CreateShaderResourceView(d->d12, NULL, NULL, at);      /* (the wide table past t7: nothing where no shader reads) */
       else if (!v && kinds[i] == KIND_BUFFER) {
-        const View blank = {.buf = d->blank_buffer, .offset = 0, .size = d->blank_buffer->desc.ByteWidth};
+        View blank = {.buf = d->blank_buffer, .offset = 0, .size = d->blank_buffer->desc.ByteWidth};
         buffer_descriptor(d, &blank, FALSE, at);
       } else if (v && v->tex->planar) {
         /* (a view of a plane of a slice - or of slices: a 2D array view of them, which Direct3D 12 below gives a shader that declares an array as a mirror of the
@@ -455,16 +502,17 @@ static BOOL tables_record(Dev *d, View *const *srvs, Sampler *const *samplers, c
       }
       at.ptr += step_views;
     }
-    d->view_used += TEXTURE_SLOTS;
-    memcpy(d->table_view_ids, view_ids, sizeof view_ids);
+    d->view_used += view_count;
+    memcpy(d->table_view_ids, view_ids, view_count * sizeof view_ids[0]);
+    d->table_view_count = view_count;
   }
   if (!cache || !d->tables_valid || memcmp(uav_ids, d->table_uav_ids, sizeof uav_ids) != 0) {
     D3D12_CPU_DESCRIPTOR_HANDLE at = view_start;
     at.ptr += (SIZE_T)d->view_used * step_views;
     d->table_uavs = view_gpu.ptr + (UINT64)d->view_used * step_views;
     for (UINT i = 0; i < UAV_SLOTS; ++i) {
-      const View *v = !(uav_mask >> i & 1) ? NULL : uavs[i] ? uavs[i] : NULL;
-      const View blank = {.buf = d->blank_uav, .offset = 0, .size = d->blank_uav->desc.ByteWidth};
+      View *v = !(uav_mask >> i & 1) ? NULL : uavs[i] ? uavs[i] : NULL;
+      View blank = {.buf = d->blank_uav, .offset = 0, .size = d->blank_uav->desc.ByteWidth};
       if (v && v->buf) { if (!buffer_descriptor(d, v, TRUE, at)) return FALSE; }
       else if ((uav_mask >> i & 1) && !v) buffer_descriptor(d, &blank, TRUE, at);      /* (D3D11: what is written to nothing is lost; here it goes into a buffer of its own) */
       else if (v && v->tex) texture_uav_descriptor(d, v, at);
@@ -496,9 +544,9 @@ static BOOL tables_record(Dev *d, View *const *srvs, Sampler *const *samplers, c
   d->tables_valid = cache;
   return TRUE;
 }
-/* What the tables name is used by the list: read (shader resources), and written (unordered access views). */
+/* What the tables name is used by the list: read (shader resources), and written (unordered access views, and the counters of append and counter views). */
 static void tables_mark_used(Dev *d, View *const *srvs, View *const *uavs, UINT uav_mask) {
-  for (UINT i = 0; i < TEXTURE_SLOTS; ++i) {
+  for (UINT i = 0; i < SRV_SLOTS; ++i) {
     if (!srvs[i]) continue;
     if (srvs[i]->tex) srvs[i]->tex->used = srvs[i]->tex->sampled = d->epoch;
     else srvs[i]->buf->used = d->epoch;
@@ -515,6 +563,7 @@ static void tables_mark_used(Dev *d, View *const *srvs, View *const *uavs, UINT 
     Buf *b = uavs[i]->buf;
     b->used = b->written = d->epoch;
     ++b->version;      /* (what the GPU writes: a converted copy of it is made again) */
+    if (uavs[i]->counter_buf) uavs[i]->counter_buf->used = uavs[i]->counter_buf->written = d->epoch;
   }
 }
 /* Before a draw or dispatch records anything: the textures its unordered access views write are brought up to date (what their render target views drew) and, if the list
@@ -647,7 +696,10 @@ static void STDMETHODCALLTYPE ctx_SOGetTargets(Ctx *c, UINT count, ID3D11Buffer 
 static BOOL draw_prepare(Ctx *c, BOOL indexed) {
   Dev *d = c->dev;
   const BOOL streams = c->gs && c->gs->so;
-  if (!c->vs || (c->rtv_count == 0 && !c->dsv && !streams) || (indexed && !c->ib)) return FALSE;      /* (d3d12.dll gives a pass without a colour target one) */
+  /* (d3d12.dll gives a pass without a colour target one: of the depth buffer's size, of the viewport's when the draw writes unordered access views only, a tiny one for stream
+   * output alone) */
+  const BOOL uav_only = c->rtv_count == 0 && !c->dsv && c->ps && c->ps->uav_mask;
+  if (!c->vs || (c->rtv_count == 0 && !c->dsv && !streams && !uav_only) || (indexed && !c->ib)) return FALSE;
   if (!c->hs != !c->ds) return FALSE;      /* (tessellation needs both) */
 
   /* what may have to send the list first */
@@ -658,8 +710,12 @@ static BOOL draw_prepare(Ctx *c, BOOL indexed) {
     sources[slot] = vertex_source(d, c, slot, &strides[slot], &offsets[slot], &sizes[slot]);
     if (!sources[slot]) return FALSE;
   }
+  /* (the table of shader resources: the wide one when a stage declares one above t7) */
+  const Shader *declaring[5] = {c->vs, c->ps, c->gs, c->hs, c->ds};
+  UINT view_count = TEXTURE_SLOTS;
+  for (UINT k = 0; k < 5; ++k) if (declaring[k] && declaring[k]->wide) view_count = SRV_SLOTS;
   /* (what views drew into the textures sampled goes into them first: rtshadow.inc) */
-  for (UINT i = 0; i < TEXTURE_SLOTS; ++i) if (slot_view(c, i) && slot_view(c, i)->tex) tex_sync(d, slot_view(c, i)->tex);
+  for (UINT i = 0; i < view_count; ++i) if (slot_view(c, i) && slot_view(c, i)->tex) tex_sync(d, slot_view(c, i)->tex);
   /* (a texture the list's draws sampled cannot become its target: the kernel keeps it bound as a texture for the whole list; a view with a target of its own is
    * drawn into there, loaded from the texture when that changed) */
   for (UINT i = 0; i < c->rtv_count; ++i) {
@@ -668,21 +724,24 @@ static BOOL draw_prepare(Ctx *c, BOOL indexed) {
   }
   if (c->dsv) tex_before_write(d, c->dsv->tex);
   /* (... nor be sampled after the list has drawn into it, cleared it or copied into it: the draw would see the texture as it was before the list) */
-  for (UINT i = 0; i < TEXTURE_SLOTS; ++i) if (slot_view(c, i) && slot_view(c, i)->tex) tex_before_read(d, slot_view(c, i)->tex);
+  for (UINT i = 0; i < view_count; ++i) if (slot_view(c, i) && slot_view(c, i)->tex) tex_before_read(d, slot_view(c, i)->tex);
   {
     UINT uav_mask = 0;
     const Shader *writers[5] = {c->vs, c->ps, c->gs, c->hs, c->ds};
     for (UINT k = 0; k < 5; ++k) if (writers[k]) uav_mask |= writers[k]->uav_mask;
     uav_textures_before(d, c->ps_uav, uav_mask);
   }
-  if (d->ring_used + CONSTANT_BLOCK > RING_BYTES || d->view_used + TEXTURE_SLOTS + UAV_SLOTS > VIEW_HEAP || d->sampler_used + TEXTURE_SLOTS > VIEW_HEAP) flush(d);
+  if (d->ring_used + CONSTANT_BLOCK > RING_BYTES || d->view_used + SRV_SLOTS + UAV_SLOTS > VIEW_HEAP || d->sampler_used + TEXTURE_SLOTS > VIEW_HEAP) flush(d);
   ID3D12PipelineState *pipeline = pipeline_get(d, c);
   if (!pipeline) return FALSE;
 
   ID3D12GraphicsCommandList *list = d->list;
+  ID3D12RootSignature *root = view_count == SRV_SLOTS ? d->root_wide : d->root;
+  if (d->bound_root != root) d->dirty |= DIRTY_ROOT;
   if (d->dirty & DIRTY_ROOT) {
     ID3D12DescriptorHeap *heaps[2] = {d->view_heap, d->sampler_heap};
-    ID3D12GraphicsCommandList_SetGraphicsRootSignature(list, d->root);
+    ID3D12GraphicsCommandList_SetGraphicsRootSignature(list, root);
+    d->bound_root = root;
     ID3D12GraphicsCommandList_SetDescriptorHeaps(list, 2, heaps);
   }
   if (d->dirty & DIRTY_TARGETS) {
@@ -697,6 +756,10 @@ static BOOL draw_prepare(Ctx *c, BOOL indexed) {
     D3D12_VIEWPORT vp = {0, 0, (FLOAT)tw, (FLOAT)th, 0, 1};
     D3D12_RECT sc = {0, 0, (LONG)tw, (LONG)th};
     if (c->viewport_count) memcpy(&vp, &c->viewports[0], sizeof vp);      /* (the two structures are the same; the kernel has one viewport) */
+    if (!c->rtv_count && !c->dsv && c->viewport_count) {      /* (no target: the viewport says what is rasterized, the scissor rectangle is all of it) */
+      sc.right = (LONG)(vp.TopLeftX + vp.Width + 0.999f);
+      sc.bottom = (LONG)(vp.TopLeftY + vp.Height + 0.999f);
+    }
     if (c->raster && c->raster->desc.ScissorEnable) {
       if (c->scissor_count) memcpy(&sc, &c->scissors[0], sizeof sc);
       else sc.right = sc.bottom = 0;      /* (the scissor test with no rectangle set: nothing passes) */
@@ -732,18 +795,19 @@ static BOOL draw_prepare(Ctx *c, BOOL indexed) {
 
   /* the textures (and buffer views) and the samplers of the stages, and the pixel shader's unordered access views: a table of each, made again when what is bound
    * changed */
-  View *srvs[TEXTURE_SLOTS];
+  View *srvs[SRV_SLOTS];
   Sampler *samplers_of[TEXTURE_SLOTS];
-  BYTE kinds[TEXTURE_SLOTS];
-  for (UINT i = 0; i < TEXTURE_SLOTS; ++i) {
+  BYTE kinds[SRV_SLOTS];
+  for (UINT i = 0; i < view_count; ++i) {
     srvs[i] = slot_view(c, i);
-    samplers_of[i] = slot_sampler(c, i);
     kinds[i] = slot_declared_kind(c, i);
   }
+  for (UINT i = view_count; i < SRV_SLOTS; ++i) srvs[i] = NULL;
+  for (UINT i = 0; i < TEXTURE_SLOTS; ++i) samplers_of[i] = slot_sampler(c, i);
   UINT uav_mask = 0;
   const Shader *graphics_stages[5] = {c->vs, c->ps, c->gs, c->hs, c->ds};
   for (UINT k = 0; k < 5; ++k) if (graphics_stages[k]) uav_mask |= graphics_stages[k]->uav_mask;
-  if (!tables_record(d, srvs, samplers_of, kinds, c->ps_uav, uav_mask, TRUE)) return FALSE;
+  if (!tables_record(d, srvs, samplers_of, kinds, c->ps_uav, uav_mask, TRUE, view_count)) return FALSE;
   D3D12_GPU_DESCRIPTOR_HANDLE views = {d->table_views}, samplers = {d->table_samplers}, uavs = {d->table_uavs};
   ID3D12GraphicsCommandList_SetGraphicsRootDescriptorTable(list, 1, views);
   ID3D12GraphicsCommandList_SetGraphicsRootDescriptorTable(list, 2, samplers);
@@ -871,23 +935,23 @@ static void STDMETHODCALLTYPE ctx_VSGetConstantBuffers(Ctx *c, UINT start, UINT 
 static void STDMETHODCALLTYPE ctx_VSGetConstantBuffers1(Ctx *c, UINT start, UINT count, ID3D11Buffer **buffers, UINT *first, UINT *number) { cb_get(c, 0, start, count, buffers, first, number); }
 static void STDMETHODCALLTYPE ctx_PSGetConstantBuffers(Ctx *c, UINT start, UINT count, ID3D11Buffer **buffers) { cb_get(c, 1, start, count, buffers, NULL, NULL); }
 static void STDMETHODCALLTYPE ctx_PSGetConstantBuffers1(Ctx *c, UINT start, UINT count, ID3D11Buffer **buffers, UINT *first, UINT *number) { cb_get(c, 1, start, count, buffers, first, number); }
-static void STDMETHODCALLTYPE ctx_PSGetShaderResources(Ctx *c, UINT start, UINT count, ID3D11ShaderResourceView **views) { get_range((void **)c->srv, TEXTURE_SLOTS, start, count, (void **)views); }
+static void STDMETHODCALLTYPE ctx_PSGetShaderResources(Ctx *c, UINT start, UINT count, ID3D11ShaderResourceView **views) { get_range((void **)c->srv, SRV_SLOTS, start, count, (void **)views); }
 static void STDMETHODCALLTYPE ctx_PSGetSamplers(Ctx *c, UINT start, UINT count, ID3D11SamplerState **samplers) { get_range((void **)c->sampler, TEXTURE_SLOTS, start, count, (void **)samplers); }
 /* the other stages' constant buffers, textures and samplers (written out: scripts/gen-dx-vtables.py finds the methods by their names) */
 static void STDMETHODCALLTYPE ctx_VSSetShaderResources(Ctx *c, UINT start, UINT count, ID3D11ShaderResourceView *const *views) { set_resources(c, c->stage_srv[SRV_VS], start, count, views, FALSE); }
-static void STDMETHODCALLTYPE ctx_VSGetShaderResources(Ctx *c, UINT start, UINT count, ID3D11ShaderResourceView **views) { get_range((void **)c->stage_srv[SRV_VS], TEXTURE_SLOTS, start, count, (void **)views); }
+static void STDMETHODCALLTYPE ctx_VSGetShaderResources(Ctx *c, UINT start, UINT count, ID3D11ShaderResourceView **views) { get_range((void **)c->stage_srv[SRV_VS], SRV_SLOTS, start, count, (void **)views); }
 static void STDMETHODCALLTYPE ctx_VSSetSamplers(Ctx *c, UINT start, UINT count, ID3D11SamplerState *const *samplers) { set_range((void **)c->stage_sampler[SRV_VS], TEXTURE_SLOTS, start, count, (void *const *)samplers); }
 static void STDMETHODCALLTYPE ctx_VSGetSamplers(Ctx *c, UINT start, UINT count, ID3D11SamplerState **samplers) { get_range((void **)c->stage_sampler[SRV_VS], TEXTURE_SLOTS, start, count, (void **)samplers); }
 static void STDMETHODCALLTYPE ctx_GSSetShaderResources(Ctx *c, UINT start, UINT count, ID3D11ShaderResourceView *const *views) { set_resources(c, c->stage_srv[SRV_GS], start, count, views, FALSE); }
-static void STDMETHODCALLTYPE ctx_GSGetShaderResources(Ctx *c, UINT start, UINT count, ID3D11ShaderResourceView **views) { get_range((void **)c->stage_srv[SRV_GS], TEXTURE_SLOTS, start, count, (void **)views); }
+static void STDMETHODCALLTYPE ctx_GSGetShaderResources(Ctx *c, UINT start, UINT count, ID3D11ShaderResourceView **views) { get_range((void **)c->stage_srv[SRV_GS], SRV_SLOTS, start, count, (void **)views); }
 static void STDMETHODCALLTYPE ctx_GSSetSamplers(Ctx *c, UINT start, UINT count, ID3D11SamplerState *const *samplers) { set_range((void **)c->stage_sampler[SRV_GS], TEXTURE_SLOTS, start, count, (void *const *)samplers); }
 static void STDMETHODCALLTYPE ctx_GSGetSamplers(Ctx *c, UINT start, UINT count, ID3D11SamplerState **samplers) { get_range((void **)c->stage_sampler[SRV_GS], TEXTURE_SLOTS, start, count, (void **)samplers); }
 static void STDMETHODCALLTYPE ctx_HSSetShaderResources(Ctx *c, UINT start, UINT count, ID3D11ShaderResourceView *const *views) { set_resources(c, c->stage_srv[SRV_HS], start, count, views, FALSE); }
-static void STDMETHODCALLTYPE ctx_HSGetShaderResources(Ctx *c, UINT start, UINT count, ID3D11ShaderResourceView **views) { get_range((void **)c->stage_srv[SRV_HS], TEXTURE_SLOTS, start, count, (void **)views); }
+static void STDMETHODCALLTYPE ctx_HSGetShaderResources(Ctx *c, UINT start, UINT count, ID3D11ShaderResourceView **views) { get_range((void **)c->stage_srv[SRV_HS], SRV_SLOTS, start, count, (void **)views); }
 static void STDMETHODCALLTYPE ctx_HSSetSamplers(Ctx *c, UINT start, UINT count, ID3D11SamplerState *const *samplers) { set_range((void **)c->stage_sampler[SRV_HS], TEXTURE_SLOTS, start, count, (void *const *)samplers); }
 static void STDMETHODCALLTYPE ctx_HSGetSamplers(Ctx *c, UINT start, UINT count, ID3D11SamplerState **samplers) { get_range((void **)c->stage_sampler[SRV_HS], TEXTURE_SLOTS, start, count, (void **)samplers); }
 static void STDMETHODCALLTYPE ctx_DSSetShaderResources(Ctx *c, UINT start, UINT count, ID3D11ShaderResourceView *const *views) { set_resources(c, c->stage_srv[SRV_DS], start, count, views, FALSE); }
-static void STDMETHODCALLTYPE ctx_DSGetShaderResources(Ctx *c, UINT start, UINT count, ID3D11ShaderResourceView **views) { get_range((void **)c->stage_srv[SRV_DS], TEXTURE_SLOTS, start, count, (void **)views); }
+static void STDMETHODCALLTYPE ctx_DSGetShaderResources(Ctx *c, UINT start, UINT count, ID3D11ShaderResourceView **views) { get_range((void **)c->stage_srv[SRV_DS], SRV_SLOTS, start, count, (void **)views); }
 static void STDMETHODCALLTYPE ctx_DSSetSamplers(Ctx *c, UINT start, UINT count, ID3D11SamplerState *const *samplers) { set_range((void **)c->stage_sampler[SRV_DS], TEXTURE_SLOTS, start, count, (void *const *)samplers); }
 static void STDMETHODCALLTYPE ctx_DSGetSamplers(Ctx *c, UINT start, UINT count, ID3D11SamplerState **samplers) { get_range((void **)c->stage_sampler[SRV_DS], TEXTURE_SLOTS, start, count, (void **)samplers); }
 static void STDMETHODCALLTYPE ctx_GSSetConstantBuffers(Ctx *c, UINT start, UINT count, ID3D11Buffer *const *buffers) { cb_set(c, 2, start, count, buffers, NULL, NULL); }
@@ -1001,7 +1065,7 @@ static void STDMETHODCALLTYPE ctx_OMSetRenderTargetsAndUnorderedAccessViews(Ctx 
     if (v) {
       unbind_reads_of(c, view_resource(v), FALSE);
       const UINT k = slot - uav_start;
-      if (counts && counts[k] != (UINT)-1 && (v->desc.uav.Buffer.Flags & (D3D11_BUFFER_UAV_FLAG_APPEND | D3D11_BUFFER_UAV_FLAG_COUNTER))) v->counter = counts[k];
+      if (counts && counts[k] != (UINT)-1 && v->counter_buf) v->counter = counts[k], v->counter_dirty = TRUE;
     }
     bind(&c->ps_uav[slot], v);
   }
@@ -1168,17 +1232,17 @@ static BOOL bound_for_writing(const Ctx *c, const void *resource, BOOL compute) 
 }
 static void unbind_reads_of(Ctx *c, const void *resource, BOOL compute) {
   if (compute) {
-    for (UINT i = 0; i < TEXTURE_SLOTS; ++i) if (c->cs_srv[i] && view_resource(c->cs_srv[i]) == resource) bind(&c->cs_srv[i], NULL);
+    for (UINT i = 0; i < SRV_SLOTS; ++i) if (c->cs_srv[i] && view_resource(c->cs_srv[i]) == resource) bind(&c->cs_srv[i], NULL);
     return;
   }
-  for (UINT i = 0; i < TEXTURE_SLOTS; ++i) {
+  for (UINT i = 0; i < SRV_SLOTS; ++i) {
     if (c->srv[i] && view_resource(c->srv[i]) == resource) bind(&c->srv[i], NULL);
     for (UINT k = 0; k < 4; ++k) if (c->stage_srv[k][i] && view_resource(c->stage_srv[k][i]) == resource) bind(&c->stage_srv[k][i], NULL);
   }
 }
 /* Shader resources into slots, each left empty when what it is of is bound for writing. */
 static void set_resources(Ctx *c, View **slots, UINT start, UINT count, ID3D11ShaderResourceView *const *views, BOOL compute) {
-  for (UINT i = 0; i < count && start + i < TEXTURE_SLOTS; ++i) {
+  for (UINT i = 0; i < count && start + i < SRV_SLOTS; ++i) {
     View *v = views ? (View *)views[i] : NULL;
     if (v && bound_for_writing(c, view_resource(v), compute)) v = NULL;
     bind(&slots[start + i], v);
@@ -1194,7 +1258,7 @@ static void STDMETHODCALLTYPE ctx_CSSetConstantBuffers1(Ctx *c, UINT start, UINT
 static void STDMETHODCALLTYPE ctx_CSGetConstantBuffers(Ctx *c, UINT start, UINT count, ID3D11Buffer **buffers) { cb_get(c, 5, start, count, buffers, NULL, NULL); }
 static void STDMETHODCALLTYPE ctx_CSGetConstantBuffers1(Ctx *c, UINT start, UINT count, ID3D11Buffer **buffers, UINT *first, UINT *number) { cb_get(c, 5, start, count, buffers, first, number); }
 static void STDMETHODCALLTYPE ctx_CSSetShaderResources(Ctx *c, UINT start, UINT count, ID3D11ShaderResourceView *const *views) { set_resources(c, c->cs_srv, start, count, views, TRUE); }
-static void STDMETHODCALLTYPE ctx_CSGetShaderResources(Ctx *c, UINT start, UINT count, ID3D11ShaderResourceView **views) { get_range((void **)c->cs_srv, TEXTURE_SLOTS, start, count, (void **)views); }
+static void STDMETHODCALLTYPE ctx_CSGetShaderResources(Ctx *c, UINT start, UINT count, ID3D11ShaderResourceView **views) { get_range((void **)c->cs_srv, SRV_SLOTS, start, count, (void **)views); }
 static void STDMETHODCALLTYPE ctx_CSSetSamplers(Ctx *c, UINT start, UINT count, ID3D11SamplerState *const *samplers) { set_range((void **)c->cs_sampler, TEXTURE_SLOTS, start, count, (void *const *)samplers); }
 static void STDMETHODCALLTYPE ctx_CSGetSamplers(Ctx *c, UINT start, UINT count, ID3D11SamplerState **samplers) { get_range((void **)c->cs_sampler, TEXTURE_SLOTS, start, count, (void **)samplers); }
 /* Unordered access views of the compute shader; `counts`: the hidden count of each append or counter view (-1: kept as it is). */
@@ -1210,7 +1274,7 @@ static void STDMETHODCALLTYPE ctx_CSSetUnorderedAccessViews(Ctx *c, UINT start, 
     View *v = views ? (View *)views[i] : NULL;
     if (v) {
       unbind_reads_of(c, view_resource(v), TRUE);
-      if (counts && counts[i] != (UINT)-1 && (v->desc.uav.Buffer.Flags & (D3D11_BUFFER_UAV_FLAG_APPEND | D3D11_BUFFER_UAV_FLAG_COUNTER))) v->counter = counts[i];
+      if (counts && counts[i] != (UINT)-1 && v->counter_buf) v->counter = counts[i], v->counter_dirty = TRUE;
     }
     bind(&c->cs_uav[start + i], v);
   }
@@ -1222,14 +1286,15 @@ static BOOL compute_prepare(Ctx *c) {
   Dev *d = c->dev;
   Shader *cs = c->cs;
   if (!cs) return FALSE;
-  for (UINT i = 0; i < TEXTURE_SLOTS; ++i) if (c->cs_srv[i] && c->cs_srv[i]->tex) tex_sync(d, c->cs_srv[i]->tex);
-  for (UINT i = 0; i < TEXTURE_SLOTS; ++i) if (c->cs_srv[i] && c->cs_srv[i]->tex) tex_before_read(d, c->cs_srv[i]->tex);
+  const UINT view_count = cs->wide ? SRV_SLOTS : TEXTURE_SLOTS;
+  for (UINT i = 0; i < view_count; ++i) if (c->cs_srv[i] && c->cs_srv[i]->tex) tex_sync(d, c->cs_srv[i]->tex);
+  for (UINT i = 0; i < view_count; ++i) if (c->cs_srv[i] && c->cs_srv[i]->tex) tex_before_read(d, c->cs_srv[i]->tex);
   uav_textures_before(d, c->cs_uav, cs->uav_mask);
-  if (d->ring_used + CONSTANT_BLOCK > RING_BYTES || d->view_used + TEXTURE_SLOTS + UAV_SLOTS > VIEW_HEAP || d->sampler_used + TEXTURE_SLOTS > VIEW_HEAP) flush(d);
+  if (d->ring_used + CONSTANT_BLOCK > RING_BYTES || d->view_used + SRV_SLOTS + UAV_SLOTS > VIEW_HEAP || d->sampler_used + TEXTURE_SLOTS > VIEW_HEAP) flush(d);
   if (!cs->compute) {
     D3D12_COMPUTE_PIPELINE_STATE_DESC pd;
     memset(&pd, 0, sizeof pd);
-    pd.pRootSignature = d->root;
+    pd.pRootSignature = cs->wide ? d->root_wide : d->root;
     pd.CS.pShaderBytecode = cs->code;
     pd.CS.BytecodeLength = cs->bytes;
     if (FAILED(ID3D12Device_CreateComputePipelineState(d->d12, &pd, &IID_ID3D12PipelineState, (void **)&cs->compute)) || !cs->compute) {
@@ -1241,14 +1306,14 @@ static BOOL compute_prepare(Ctx *c) {
   }
   ID3D12GraphicsCommandList *list = d->list;
   ID3D12DescriptorHeap *heaps[2] = {d->view_heap, d->sampler_heap};
-  ID3D12GraphicsCommandList_SetComputeRootSignature(list, d->root);
+  ID3D12GraphicsCommandList_SetComputeRootSignature(list, cs->wide ? d->root_wide : d->root);
   ID3D12GraphicsCommandList_SetDescriptorHeaps(list, 2, heaps);
   ID3D12GraphicsCommandList_SetPipelineState(list, cs->compute);
   const Shader *const stages[1] = {cs};
   static const UINT stage_of[1] = {5};
   constants_record(d, c, stages, stage_of, 1);
   ID3D12GraphicsCommandList_SetComputeRootConstantBufferView(list, 0, ID3D12Resource_GetGPUVirtualAddress(d->ring) + d->ring_last);
-  if (!tables_record(d, c->cs_srv, c->cs_sampler, cs->tex_kind, c->cs_uav, cs->uav_mask, FALSE)) return FALSE;
+  if (!tables_record(d, c->cs_srv, c->cs_sampler, cs->tex_kind, c->cs_uav, cs->uav_mask, FALSE, view_count)) return FALSE;
   D3D12_GPU_DESCRIPTOR_HANDLE views = {d->table_views}, samplers = {d->table_samplers}, uavs = {d->table_uavs};
   ID3D12GraphicsCommandList_SetComputeRootDescriptorTable(list, 1, views);
   ID3D12GraphicsCommandList_SetComputeRootDescriptorTable(list, 2, samplers);
@@ -1725,8 +1790,8 @@ static void STDMETHODCALLTYPE ctx_ClearUnorderedAccessViewFloat(Ctx *c, ID3D11Un
   uav_clear(c, (View *)view, none, values, TRUE);
   UNLOCK(c);
 }
-/* The hidden count of an append or counter view into a buffer (4 bytes at a multiple of 4). The kernel's shaders do not change it (it has no append and consume
- * instructions), so it is the count the program last set. */
+/* The hidden count of an append or counter view into a buffer (4 bytes at a multiple of 4): the count the program set, if no draw or dispatch took it since, else what the
+ * shaders left in the view's counter (copied in order with the commands before). */
 static void STDMETHODCALLTYPE ctx_CopyStructureCount(Ctx *c, ID3D11Buffer *buffer, UINT offset, ID3D11UnorderedAccessView *view) {
   if (c->deferred) { deferred_record(c, &(RecArgs){.op = REC_COPY_STRUCTURE_COUNT, .obj = {buffer, view}, .u = {offset}}); return; }
   Buf *b = (Buf *)buffer;
@@ -1735,7 +1800,8 @@ static void STDMETHODCALLTYPE ctx_CopyStructureCount(Ctx *c, ID3D11Buffer *buffe
       !(v->desc.uav.Buffer.Flags & (D3D11_BUFFER_UAV_FLAG_APPEND | D3D11_BUFFER_UAV_FLAG_COUNTER))) return;
   if (predicated_out(c->dev)) return;
   LOCK(c);
-  buf_write_any(c->dev, b, offset, &v->counter, 4);
+  if (v->counter_dirty || !v->counter_buf) buf_write_any(c->dev, b, offset, &v->counter, 4);
+  else buf_copy(c->dev, b, offset, v->counter_buf, 0, 4);
   UNLOCK(c);
 }
 

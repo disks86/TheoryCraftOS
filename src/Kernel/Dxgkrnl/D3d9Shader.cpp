@@ -138,8 +138,12 @@ int8_t semantic_slot(uint32_t usage, uint32_t index) {
 }  // namespace
 
 uint32_t D3d9Program::required_features2() const {
-  uint32_t needed = image_mask_ ? graphics::kFeature2StorageImages : 0u;
-  if (image_mask_ && stage_ != graphics::ShaderStage::Compute) needed |= graphics::kFeature2StorageImagesInDraws;
+  const bool images = image_mask_.any();
+  uint32_t needed = images ? graphics::kFeature2StorageImages : 0u;
+  if (images && stage_ != graphics::ShaderStage::Compute) needed |= graphics::kFeature2StorageImagesInDraws;
+  if (images && stage_ != graphics::ShaderStage::Compute && stage_ != graphics::ShaderStage::Fragment) needed |= graphics::kFeature2StorageImagesAllStages;
+  for (ImageDim d : image_dim_)
+    if (d == ImageDim::Buffer) needed |= graphics::kFeature2TexelBuffers;
   if (writes_layer_) needed |= graphics::kFeature2LayeredTargets;
   return needed;
 }
@@ -801,11 +805,35 @@ void D3d9Program::execute(State& s, uint64_t begin, uint64_t end) const {
         }
         break;
       }
+      case kBufCounter: {
+        // imm_atomic_alloc: the count before, and one more; imm_atomic_consume: one less, and the count after (a run that writes nothing sees the count as it is)
+        uint32_t count = 0;
+        ByteView word;
+        const bool bound = s.storage && ins.uav < graphics::kMaxStorageBuffers && s.storage[ins.uav].try_subview(0, 4, &word);
+        if (bound) count = ByteReader(ConstByteView(word.data(), word.size())).le32();
+        const uint32_t updated = ins.control == 0 ? count + 1 : count - 1;
+        if (bound && !s.no_stores && s.capture_at == ~uint64_t{0}) ByteWriter(word).le32(updated);
+        store(ins.dst, splat(from_bits(ins.control == 0 ? count : updated)));
+        break;
+      }
+      case kBufInfo: {
+        // bufinfo: the bytes of a raw buffer, the structures of a structured one, the elements of a typed view (0 for nothing bound)
+        uint32_t n = 0;
+        if (ins.control == 0 && s.storage && ins.uav < graphics::kMaxStorageBuffers) {
+          const uint64_t bytes = s.storage[ins.uav].size();
+          n = static_cast<uint32_t>(ins.stride ? bytes / ins.stride : bytes);
+        } else if (ins.control == 1 && s.images) {
+          uint32_t w = 0, h = 0, layers = 0;
+          if (s.images->size(ins.uav, &w, &h, &layers)) n = w;
+        }
+        store(ins.dst, splat(from_bits(n)));
+        break;
+      }
       case kImgLoad: case kImgStore: case kImgAtomic: case kImgImmAtomic: case kImgSize: {
         // Storage images: the shader's coordinate as the device's (x, y, layer): a one-dimensional image is a two-dimensional one a texel high, its array's layer in the second component.
         const uint32_t slot = ins.uav;
         const ImageDim dim = image_dim(slot);
-        uint32_t x = bits_of(a.f[0]), y = 0, z = 0;
+        uint32_t x = bits_of(a.f[0]), y = 0, z = 0;   // (a typed view of a buffer: x, the element)
         if (dim == ImageDim::Texture1DArray) z = bits_of(a.f[1]);
         else if (dim == ImageDim::Texture2D) y = bits_of(a.f[1]);
         else if (dim == ImageDim::Texture2DArray || dim == ImageDim::Texture3D) y = bits_of(a.f[1]), z = bits_of(a.f[2]);
@@ -1240,6 +1268,7 @@ void D3d9Program::run_vertex_ex(const graphics::Vec4* attributes, const uint8_t*
   s.sys[kSysVertexId].f[0] = from_bits(context.vertex_id);
   s.sys[kSysInstanceId].f[0] = from_bits(context.instance_id);
   s.storage = context.storage;
+  s.images = context.images;
   s.textures = context.textures;
   execute(s);
   out->position = {s.pos.f[0], -s.pos.f[1], s.pos.f[2], s.pos.f[3]};   // (Direct3D's +Y up to the device's +Y down)
@@ -1278,6 +1307,7 @@ void D3d9Program::run_hull(const graphics::HullInputData& input, const uint8_t* 
   for (uint32_t k = 0; k < upright.control_points && k < graphics::kMaxPatchControlPoints; ++k) upright.position[k].y = -upright.position[k].y;
   s.hull_in = &upright;
   s.storage = input.storage;
+  s.images = input.images;
   // The control point phase once for each output control point, then the fork and join phases (which make the patch constants).
   for (uint32_t cp = 0; cp < tess_output_points_ && cp < graphics::kMaxPatchControlPoints; ++cp) {
     s.sys[kSysOutputControlPointId].f[0] = from_bits(cp);
@@ -1301,6 +1331,7 @@ void D3d9Program::run_domain(const graphics::HullOutputData& patch, float u, flo
   s.constants = constants;
   s.patch_in = &patch;
   s.storage = patch.storage;
+  s.images = patch.images;
   s.sys[kSysDomainLocation] = {{u, v, w, 0.0f}};
   execute(s);
   out->position = {s.pos.f[0], -s.pos.f[1], s.pos.f[2], s.pos.f[3]};
@@ -1316,6 +1347,7 @@ void D3d9Program::run_geometry(const graphics::GeometryInputData& input, const u
   for (graphics::Vec4& p : upright.position) p.y = -p.y;
   s.geometry_in = &upright;
   s.storage = input.storage;
+  s.images = input.images;
   s.sys[kSysGsInstanceId].f[0] = from_bits(input.instance_id);
   s.sys[kSysPrimitiveId].f[0] = from_bits(input.primitive_id);
   s.geometry_out = output;

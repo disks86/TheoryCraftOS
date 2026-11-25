@@ -110,6 +110,53 @@ constexpr uint32_t kQueryPolls = 5000;   // how many empty commands to wait for 
 
 // --- Objects -------------------------------------------------------------------
 
+// The host's formats of the typed views of buffers (TexelFormat, DXGI's numbers): VIRGL_FORMAT_* (virglrenderer's virgl_hw.h) and Gallium's name of it, which the TGSI parser takes.
+struct TexelHostFormat {
+  TexelFormat format;
+  uint32_t virgl;
+  const char* name;
+};
+constexpr TexelHostFormat kTexelHostFormats[] = {
+    {TexelFormat::R32G32B32A32Float, 31, "PIPE_FORMAT_R32G32B32A32_FLOAT"}, {TexelFormat::R32G32B32A32Uint, 196, "PIPE_FORMAT_R32G32B32A32_UINT"},
+    {TexelFormat::R32G32B32A32Sint, 200, "PIPE_FORMAT_R32G32B32A32_SINT"}, {TexelFormat::R32G32B32Float, 30, "PIPE_FORMAT_R32G32B32_FLOAT"},
+    {TexelFormat::R32G32B32Uint, 195, "PIPE_FORMAT_R32G32B32_UINT"}, {TexelFormat::R32G32B32Sint, 199, "PIPE_FORMAT_R32G32B32_SINT"},
+    {TexelFormat::R16G16B16A16Float, 94, "PIPE_FORMAT_R16G16B16A16_FLOAT"}, {TexelFormat::R16G16B16A16Unorm, 51, "PIPE_FORMAT_R16G16B16A16_UNORM"},
+    {TexelFormat::R16G16B16A16Uint, 188, "PIPE_FORMAT_R16G16B16A16_UINT"}, {TexelFormat::R16G16B16A16Snorm, 59, "PIPE_FORMAT_R16G16B16A16_SNORM"},
+    {TexelFormat::R16G16B16A16Sint, 192, "PIPE_FORMAT_R16G16B16A16_SINT"}, {TexelFormat::R32G32Float, 29, "PIPE_FORMAT_R32G32_FLOAT"},
+    {TexelFormat::R32G32Uint, 194, "PIPE_FORMAT_R32G32_UINT"}, {TexelFormat::R32G32Sint, 198, "PIPE_FORMAT_R32G32_SINT"},
+    {TexelFormat::R10G10B10A2Unorm, 8, "PIPE_FORMAT_R10G10B10A2_UNORM"}, {TexelFormat::R10G10B10A2Uint, 253, "PIPE_FORMAT_R10G10B10A2_UINT"},
+    {TexelFormat::R11G11B10Float, 124, "PIPE_FORMAT_R11G11B10_FLOAT"}, {TexelFormat::R8G8B8A8Unorm, 67, "PIPE_FORMAT_R8G8B8A8_UNORM"},
+    {TexelFormat::R8G8B8A8Uint, 180, "PIPE_FORMAT_R8G8B8A8_UINT"}, {TexelFormat::R8G8B8A8Snorm, 77, "PIPE_FORMAT_R8G8B8A8_SNORM"},
+    {TexelFormat::R8G8B8A8Sint, 184, "PIPE_FORMAT_R8G8B8A8_SINT"}, {TexelFormat::R16G16Float, 92, "PIPE_FORMAT_R16G16_FLOAT"},
+    {TexelFormat::R16G16Unorm, 49, "PIPE_FORMAT_R16G16_UNORM"}, {TexelFormat::R16G16Uint, 186, "PIPE_FORMAT_R16G16_UINT"},
+    {TexelFormat::R16G16Snorm, 57, "PIPE_FORMAT_R16G16_SNORM"}, {TexelFormat::R16G16Sint, 190, "PIPE_FORMAT_R16G16_SINT"},
+    {TexelFormat::R32Float, 28, "PIPE_FORMAT_R32_FLOAT"}, {TexelFormat::R32Uint, 193, "PIPE_FORMAT_R32_UINT"}, {TexelFormat::R32Sint, 197, "PIPE_FORMAT_R32_SINT"},
+    {TexelFormat::R8G8Unorm, 65, "PIPE_FORMAT_R8G8_UNORM"}, {TexelFormat::R8G8Uint, 178, "PIPE_FORMAT_R8G8_UINT"}, {TexelFormat::R8G8Snorm, 75, "PIPE_FORMAT_R8G8_SNORM"},
+    {TexelFormat::R8G8Sint, 182, "PIPE_FORMAT_R8G8_SINT"}, {TexelFormat::R16Float, 91, "PIPE_FORMAT_R16_FLOAT"}, {TexelFormat::R16Unorm, 48, "PIPE_FORMAT_R16_UNORM"},
+    {TexelFormat::R16Uint, 185, "PIPE_FORMAT_R16_UINT"}, {TexelFormat::R16Snorm, 56, "PIPE_FORMAT_R16_SNORM"}, {TexelFormat::R16Sint, 189, "PIPE_FORMAT_R16_SINT"},
+    {TexelFormat::R8Unorm, 64, "PIPE_FORMAT_R8_UNORM"}, {TexelFormat::R8Uint, 177, "PIPE_FORMAT_R8_UINT"}, {TexelFormat::R8Snorm, 74, "PIPE_FORMAT_R8_SNORM"},
+    {TexelFormat::R8Sint, 181, "PIPE_FORMAT_R8_SINT"}, {TexelFormat::A8Unorm, 10, "PIPE_FORMAT_A8_UNORM"}, {TexelFormat::B5G6R5Unorm, 7, "PIPE_FORMAT_B5G6R5_UNORM"},
+    {TexelFormat::B5G5R5A1Unorm, 5, "PIPE_FORMAT_B5G5R5A1_UNORM"}, {TexelFormat::B8G8R8A8Unorm, 1, "PIPE_FORMAT_B8G8R8A8_UNORM"},
+    {TexelFormat::B8G8R8X8Unorm, 2, "PIPE_FORMAT_B8G8R8X8_UNORM"}, {TexelFormat::B4G4R4A4Unorm, 6, "PIPE_FORMAT_B4G4R4A4_UNORM"},
+};
+uint32_t texel_virgl_format(TexelFormat f) {
+  for (const TexelHostFormat& h : kTexelHostFormats)
+    if (h.format == f) return h.virgl;
+  return 0;
+}
+// Whether the host's buffer textures take the format (OpenGL's glTexBuffer formats, ARB_texture_buffer_object and _rgb32: one to four channels of 8, 16 and 32-bit unsigned normalised,
+// float and integer values, three of 32 bits): both the views of t# (sampler views of the buffer) and those of u# (images of it, which the host makes of a buffer texture) need one.
+// Not the snorm ones, R10G10B10A2, R11G11B10, A8 or the B-first packed ones.
+bool texel_host_buffer_format(TexelFormat f) {
+  const TexelLayout l = texel_layout(f);
+  return l.kind == TexelKind::Float || l.kind == TexelKind::Uint || l.kind == TexelKind::Sint || (l.kind == TexelKind::Unorm && f != TexelFormat::A8Unorm);
+}
+const char* texel_format_name(uint32_t virgl_format) {
+  for (const TexelHostFormat& h : kTexelHostFormats)
+    if (h.virgl == virgl_format) return h.name;
+  return nullptr;
+}
+
 class VirglBuffer final : public IBuffer {
  public:
   VirglBuffer(VirglDevice& device, uint64_t size, uint32_t usage, uint32_t extra_bind = 0) : device_(device) {
@@ -522,11 +569,11 @@ class VirglShaderModule final : public IShaderModule {
     streams_ = desc.geometry_streams;
     output_topology_ = desc.geometry_output;
     desc_ = desc;
-    // A shader with storage images names their formats IMGFMT<n> (ShaderModuleDesc::tgsi): the host's shader is made for the formats of the images a dispatch or draw binds
-    // (variant), not now.
-    if (find(desc.tgsi, "IMGFMT") >= 0 && (desc.stage == ShaderStage::Compute || desc.stage == ShaderStage::Fragment)) {
+    // A shader with storage images or typed views of buffers names their formats and views by marks (IMGFMT<k> and the others of TgsiBindings): the host's shader is made for what a
+    // dispatch or draw binds (variant), not now. A copy with a stream output declaration (a pipeline's) cannot be: the variants are made without one.
+    if (desc.tgsi && has_marks(desc.tgsi)) {
       has_images_ = true;
-      ok_ = true;
+      ok_ = stream_output == nullptr;
       return;
     }
     handle_ = device.new_handle();
@@ -574,24 +621,48 @@ class VirglShaderModule final : public IShaderModule {
   uint32_t handle() const { return handle_; }
   const char* tgsi() const { return tgsi_; }   // (the text the kernel keeps for the module's life)
   bool has_images() const { return has_images_; }
-  // The host's shader for storage images of the formats `formats` (VIRGL_FORMAT_*, by slot): IMGFMT<n> made the name of slot n's format; made on first use and kept with the
-  // module (kVariants of them; the oldest goes when there is no room). 0 when the host refuses it.
-  uint32_t variant(VirglDevice& device, const uint32_t (&formats)[kMaxStorageImages]) const {
+  const TgsiBindings& bindings() const { return desc_.tgsi_bindings; }
+  // What a variant of the shader is made for: the format of what is bound to each IMAGE[k] (VIRGL_FORMAT_*), the first element and the count of the views of buffers there, and those of
+  // the buffer views SVIEW[kTgsiTexelViewBase + k] (the elements the host's view starts before the view's first, and the view's count).
+  struct VariantKey {
+    uint32_t formats[kTgsiMaxImages] = {};
+    uint32_t image_first[kTgsiMaxImages] = {}, image_count[kTgsiMaxImages] = {};
+    uint32_t texel_first[kTgsiMaxTexelViews] = {}, texel_count[kTgsiMaxTexelViews] = {};
+  };
+  // The host's shader for `key`: each mark of the text made what the key says (IMGFMT<k> the name of IMAGE[k]'s format, IMGOFS<k> / IMGLEN<k> / TBOFS<k> / TBLEN<k> its numbers); made on
+  // first use and kept with the module (kVariants of them; the oldest goes when there is no room). 0 when the host refuses it.
+  uint32_t variant(VirglDevice& device, const VariantKey& key) const {
     for (const Variant& v : variants_)
-      if (v.handle && __builtin_memcmp(v.formats, formats, sizeof formats) == 0) return v.handle;
+      if (v.handle && __builtin_memcmp(&v.key, &key, sizeof key) == 0) return v.handle;
     const uint32_t length = string_length(tgsi_);
-    // (each IMGFMT<n> - seven characters - becomes a format's name, at most 32)
+    // (each mark becomes a format's name, at most 32 characters, or a number of at most 10)
     uint32_t marks = 0;
-    for (const char* p = tgsi_; (p = next_mark(p)) != nullptr; p += 6) ++marks;
+    for (const char* p = tgsi_; *p; ++p)
+      if (mark_at(p, nullptr, nullptr)) ++marks;
     const uint64_t capacity = uint64_t{length} + uint64_t{marks} * 32 + 1;
     char* text = static_cast<char*>(device.gpu().allocator().allocate(capacity));
     if (!text) return 0;
     uint64_t n = 0;
     for (const char* p = tgsi_; *p;) {
-      if (p[0] == 'I' && next_mark(p) == p && p[6] >= '0' && p[6] < '0' + static_cast<char>(kMaxStorageImages)) {
-        const char* name = format_name(formats[p[6] - '0']);
-        for (const char* c = name; *c && n + 1 < capacity; ++c) text[n++] = *c;
-        p += 7;
+      uint32_t kind = 0, index = 0;
+      if (const uint32_t taken = mark_at(p, &kind, &index)) {
+        char digits[12];
+        const char* replacement = digits;
+        if (kind == 0) {
+          replacement = format_name(index < kTgsiMaxImages ? key.formats[index] : 0);
+        } else {
+          const uint32_t value = kind == 1 ? (index < kTgsiMaxImages ? key.image_first[index] : 0) : kind == 2 ? (index < kTgsiMaxImages ? key.image_count[index] : 0)
+                                 : kind == 3 ? (index < kTgsiMaxTexelViews ? key.texel_first[index] : 0) : (index < kTgsiMaxTexelViews ? key.texel_count[index] : 0);
+          uint32_t v = value, at = sizeof digits - 1;
+          digits[at] = 0;
+          do {
+            digits[--at] = static_cast<char>('0' + v % 10);
+            v /= 10;
+          } while (v && at > 0);
+          replacement = digits + at;
+        }
+        for (const char* c = replacement; *c && n + 1 < capacity; ++c) text[n++] = *c;
+        p += taken;
         continue;
       }
       if (n + 1 < capacity) text[n++] = *p;
@@ -607,7 +678,7 @@ class VirglShaderModule final : public IShaderModule {
     next_variant_ = (next_variant_ + 1) % kVariants;
     if (slot.handle) device.destroy_object(slot.handle);
     slot.handle = module.handle();
-    for (uint32_t k = 0; k < kMaxStorageImages; ++k) slot.formats[k] = formats[k];
+    slot.key = key;
     return slot.handle;
   }
   void destroy_variants(VirglDevice& device) const {
@@ -631,9 +702,25 @@ class VirglShaderModule final : public IShaderModule {
     }
     return -1;
   }
-  static const char* next_mark(const char* p) {
-    const int64_t at = find(p, "IMGFMT");
-    return at < 0 ? nullptr : p + at;
+  // A mark of TgsiBindings at `p` (IMGFMT, IMGOFS, IMGLEN, TBOFS or TBLEN and a number): its length, with what it is (0 .. 4 in that order) and the number; 0 for none.
+  static uint32_t mark_at(const char* p, uint32_t* kind, uint32_t* index) {
+    static const char* const kNames[] = {"IMGFMT", "IMGOFS", "IMGLEN", "TBOFS", "TBLEN"};
+    for (uint32_t k = 0; k < 5; ++k) {
+      uint32_t i = 0;
+      while (kNames[k][i] && p[i] == kNames[k][i]) ++i;
+      if (kNames[k][i] || p[i] < '0' || p[i] > '9') continue;
+      uint32_t number = 0, length = i;
+      while (p[length] >= '0' && p[length] <= '9' && length < i + 4) number = number * 10 + static_cast<uint32_t>(p[length++] - '0');
+      if (kind) *kind = k;
+      if (index) *index = number;
+      return length;
+    }
+    return 0;
+  }
+  static bool has_marks(const char* text) {
+    for (const char* p = text; *p; ++p)
+      if (mark_at(p, nullptr, nullptr)) return true;
+    return false;
   }
   // The TGSI name of a storage image's format (Gallium's util_format names, which the host's parser takes).
   static const char* format_name(uint32_t format) {
@@ -651,14 +738,17 @@ class VirglShaderModule final : public IShaderModule {
       case virgl::kFormatR32Uint: return "PIPE_FORMAT_R32_UINT";
       case virgl::kFormatR32Sint: return "PIPE_FORMAT_R32_SINT";
       case virgl::kFormatR32Float: return "PIPE_FORMAT_R32_FLOAT";
-      default: return "PIPE_FORMAT_R8G8B8A8_UNORM";
+      default: {
+        const char* name = texel_format_name(format);
+        return name ? name : "PIPE_FORMAT_R8G8B8A8_UNORM";
+      }
     }
   }
   struct Variant {
-    uint32_t formats[kMaxStorageImages] = {};
+    VariantKey key;
     uint32_t handle = 0;
   };
-  static constexpr uint32_t kVariants = 4;
+  static constexpr uint32_t kVariants = 8;
   mutable Variant variants_[kVariants];
   mutable uint32_t next_variant_ = 0;
   bool has_images_ = false;
@@ -728,7 +818,7 @@ class VirglPipeline final : public VirglPipelineBase {
     else if (desc.hull_shader) capture_vertices_ = static_cast<const VirglShaderModule*>(desc.hull_shader)->tess_output() == TessOutput::Point ? 1 : static_cast<const VirglShaderModule*>(desc.hull_shader)->tess_output() == TessOutput::Line ? 2 : 3;
     // Stream output goes with the last vertex-processing shader on the host (the geometry shader, else the domain shader, else the vertex shader): a copy of it that has the declaration.
     if (desc.stream_output_count) {
-      if (!gs_ && !ds_) {
+      if (!desc.geometry_shader && !desc.domain_shader) {
         const auto* vertex = static_cast<const VirglShaderModule*>(desc.vertex_shader);
         if (!vertex->tgsi()) return;
         ShaderModuleDesc variant;
@@ -739,9 +829,9 @@ class VirglPipeline final : public VirglPipelineBase {
         vs_ = module.handle();
       }
     }
-    if (desc.stream_output_count && gs_) {
+    if (desc.stream_output_count && desc.geometry_shader) {
       const auto* geometry = static_cast<const VirglShaderModule*>(desc.geometry_shader);
-      if (!geometry->tgsi()) return;
+      if (!geometry->tgsi() || geometry->has_images()) return;   // (a copy with the declaration cannot be made per binding)
       // The host gives a register one stream: a shader output that two streams capture cannot be had.
       uint8_t streams_of_output[kMaxVaryings + 1] = {};
       for (uint32_t e = 0; e < desc.stream_output_count; ++e) {
@@ -785,10 +875,13 @@ class VirglPipeline final : public VirglPipelineBase {
     }
     // The output primitive of the tessellator is the hull shader's to say (Direct3D) but the evaluation shader's TGSI (OpenGL): a domain shader made for another one gets a copy of its text
     // with the winding and point mode of the hull shader it is used with.
-    if (hs_ && ds_) {
+    if (desc.hull_shader && desc.domain_shader) {
       const auto* hull = static_cast<const VirglShaderModule*>(desc.hull_shader);
       const auto* domain = static_cast<const VirglShaderModule*>(desc.domain_shader);
-      if ((hull->tess_output() != domain->tess_output() || hull->tess_partitioning() != domain->tess_partitioning() || (desc.stream_output_count && !gs_)) && domain->tgsi()) {
+      // (a domain shader with storage images or views of buffers is made per binding - variants of its own text, not of a copy: so it goes only with a hull shader of its own winding and
+      // partitioning, without stream output)
+      if ((hull->tess_output() != domain->tess_output() || hull->tess_partitioning() != domain->tess_partitioning() || (desc.stream_output_count && !desc.geometry_shader)) && domain->has_images()) return;
+      if ((hull->tess_output() != domain->tess_output() || hull->tess_partitioning() != domain->tess_partitioning() || (desc.stream_output_count && !desc.geometry_shader)) && domain->tgsi()) {
         const uint32_t length = string_length(domain->tgsi());
         char* text = static_cast<char*>(device.gpu().allocator().allocate(length + 1));
         if (!text) return;
@@ -813,7 +906,7 @@ class VirglPipeline final : public VirglPipelineBase {
         variant.tgsi = text;
         variant.tess_output = hull->tess_output();
         variant.tess_partitioning = hull->tess_partitioning();
-        VirglShaderModule module(device, variant, desc.stream_output_count && !gs_ ? &desc : nullptr);
+        VirglShaderModule module(device, variant, desc.stream_output_count && !desc.geometry_shader ? &desc : nullptr);
         device.gpu().allocator().deallocate(text);
         if (!module.valid()) return;
         ds_ = module.handle();
@@ -942,6 +1035,12 @@ class VirglPipeline final : public VirglPipelineBase {
   uint32_t fragment_shader() const { return fs_; }
   // A fragment shader with storage images: the host's shader is the module's variant for the images bound at the draw.
   const VirglShaderModule* fragment_module() const { return static_cast<const VirglShaderModule*>(desc_.fragment_shader); }
+  // The module of a stage (virgl::kShader*: vertex, fragment, geometry, tessellation control and evaluation), null for one the pipeline does not have.
+  const VirglShaderModule* stage_module(uint32_t stage) const {
+    const IShaderModule* m = stage == virgl::kShaderVertex ? desc_.vertex_shader : stage == virgl::kShaderFragment ? desc_.fragment_shader : stage == virgl::kShaderGeometry ? desc_.geometry_shader
+                             : stage == virgl::kShaderTessControl ? desc_.hull_shader : stage == virgl::kShaderTessEval ? desc_.domain_shader : nullptr;
+    return static_cast<const VirglShaderModule*>(m);
+  }
   uint32_t geometry_shader() const { return gs_; }   // (0: none)
   uint32_t hull_shader() const { return hs_; }
   uint32_t domain_shader() const { return ds_; }
@@ -1179,32 +1278,29 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
   uint64_t vertex_offsets[kMaxVertexBuffers] = {};
   const VirglImage* textures[kMaxTextureUnits] = {};
   SamplerDesc samplers[kMaxTextureUnits];
-  // The storage images bound (bind_storage_image), and the host's shaders bound for them (the variants of modules that have images).
+  // The storage images bound (bind_storage_image), the typed views of buffers (bind_storage_texel_buffer: of the u# slots and of the t# ones), and the host's shaders bound for each
+  // stage (virgl::kShader*: the variants of modules that have images).
   VirglImage* images[kMaxStorageImages] = {};
   StorageImageView image_views[kMaxStorageImages];
-  uint32_t bound_compute_shader = 0, bound_fragment_shader = 0;
-  // The formats the images bound now are seen as (VirglShaderModule::variant); the slots with nothing bound take RGBA8.
-  auto image_formats = [&](uint32_t (&out)[kMaxStorageImages]) {
-    for (uint32_t k = 0; k < kMaxStorageImages; ++k) out[k] = images[k] ? images[k]->image_format(image_views[k].format) : virgl::kFormatR8G8B8A8Unorm;
+  struct TexelBinding {
+    VirglBuffer* buffer = nullptr;
+    TexelBufferView view;
+    uint32_t host_view = 0;   // (a t# one: the host's buffer view of it, made when a draw or dispatch first needs it)
   };
-  // SET_SHADER_IMAGES for a stage: the slots up to the last one bound (format, access, the layers first | last << 16, the level, the resource).
-  auto emit_images = [&](uint32_t stage) {
+  TexelBinding texels[kMaxImageSlots];
+  uint32_t bound_shader[6] = {};
+  // The host's buffer views made in this submit: destroyed when it ends (after its commands went out), or when there are too many (all of them then, after what was recorded).
+  struct MadeViews {
+    VirglDevice& device;
+    uint32_t handles[256] = {};
     uint32_t count = 0;
-    for (uint32_t k = 0; k < kMaxStorageImages; ++k)
-      if (images[k]) count = k + 1;
-    if (!count) return;
-    stream.command(virgl::kSetShaderImages, 0, 2 + 5 * count);
-    stream.put(stage);
-    stream.put(0);
-    for (uint32_t k = 0; k < count; ++k) {
-      const StorageImageView& v = image_views[k];
-      stream.put(images[k] ? images[k]->image_format(v.format) : 0);
-      stream.put(virgl::kImageAccessReadWrite);
-      stream.put(images[k] ? v.first_layer | ((v.first_layer + v.layer_count - 1) << 16) : 0);
-      stream.put(images[k] ? v.level : 0);
-      stream.put(images[k] ? images[k]->id() : 0);
+    void destroy_all() {
+      for (uint32_t k = 0; k < count; ++k) device.destroy_object(handles[k]);
+      count = 0;
     }
-  };
+    ~MadeViews() { destroy_all(); }
+  } made_views{*this};
+  bool draw_bindings_dirty = false, compute_bindings_dirty = false;
   bool textures_dirty = false, compute_textures_dirty = false;
   VirglBuffer* index_buffer = nullptr;
   uint64_t index_offset = 0;
@@ -1222,7 +1318,7 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
     VirglBuffer* buffer = nullptr;
     uint64_t offset = 0, size = 0;
   } storage[kMaxStorageBuffers];
-  bool storage_dirty = false, draw_storage_dirty = false, compute_constants_dirty = false;
+  bool compute_constants_dirty = false;
   // Stream output: the buffers bound (kept here) and the host's target objects for them. The objects are made when a draw with stream output first needs them and live to the end of the submit:
   // the host's transform feedback goes on in them from draw to draw (the position in the buffers is the host's) and only ends when they are destroyed; it can only go on with the program it
   // began with, so another program that draws stream output ends it (and the buffers start again where they were bound). It makes the draws of other programs fail unless the targets are not
@@ -1271,6 +1367,111 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
       }
     }
     stream.reset();
+    return true;
+  };
+
+  // A stage's storage as its module's TgsiBindings number it: the host's shader made for what is bound (a variant, for a module with images or views of buffers), SET_SHADER_BUFFERS of
+  // its buffers, SET_SHADER_IMAGES of its images (a texture's level and layers, or a buffer: the host's image is the whole buffer, the view's first element and count are the variant's),
+  // and SET_SAMPLER_VIEWS of its buffer views from kTgsiTexelViewBase (a host view of the elements from the buffer's start to the view's last: the first element is the variant's) with
+  // the default sampler state. After the stage's textures (which the host sets as the units up to the last, forgetting the views after them).
+  auto bind_stage = [&](uint32_t stage, const VirglShaderModule* m) -> bool {
+    if (!m || stage >= 6) return true;
+    const TgsiBindings& b = m->bindings();
+    if (m->has_images()) {
+      VirglShaderModule::VariantKey key;
+      for (uint32_t k = 0; k < b.image_count && k < kTgsiMaxImages; ++k) {
+        const uint32_t slot = b.images[k];
+        const TexelBinding& t = texels[slot];
+        if (t.buffer) {
+          key.formats[k] = texel_virgl_format(t.view.format);
+          key.image_first[k] = static_cast<uint32_t>(t.view.offset / texel_bytes(t.view.format));
+          key.image_count[k] = t.view.elements;
+        } else {
+          key.formats[k] = images[slot] ? images[slot]->image_format(image_views[slot].format) : virgl::kFormatR8G8B8A8Unorm;
+        }
+      }
+      for (uint32_t k = 0; k < b.texel_count && k < kTgsiMaxTexelViews; ++k) {
+        const TexelBinding& t = texels[b.texels[k]];
+        if (!t.buffer) continue;
+        key.texel_first[k] = static_cast<uint32_t>(t.view.offset / texel_bytes(t.view.format));
+        key.texel_count[k] = t.view.elements;
+      }
+      const uint32_t shader = m->variant(*this, key);
+      if (!shader) return false;
+      if (shader != bound_shader[stage]) {
+        stream.command(virgl::kBindShader, 0, 2);
+        stream.put(shader);
+        stream.put(stage);
+        bound_shader[stage] = shader;
+      }
+    }
+    if (b.storage_count) {
+      stream.command(virgl::kSetShaderBuffers, 0, 2 + 3 * b.storage_count);
+      stream.put(stage);
+      stream.put(0);
+      for (uint32_t k = 0; k < b.storage_count; ++k) {
+        const StorageBinding& s = storage[b.storage[k] < kMaxStorageBuffers ? b.storage[k] : 0];
+        stream.put(static_cast<uint32_t>(s.offset));
+        stream.put(static_cast<uint32_t>(s.size));
+        stream.put(s.buffer ? s.buffer->id() : 0);
+      }
+    }
+    if (b.image_count) {
+      stream.command(virgl::kSetShaderImages, 0, 2 + 5 * b.image_count);
+      stream.put(stage);
+      stream.put(0);
+      for (uint32_t k = 0; k < b.image_count; ++k) {
+        const uint32_t slot = b.images[k] < kMaxStorageImages ? b.images[k] : 0;
+        const TexelBinding& t = texels[slot];
+        if (t.buffer) {
+          stream.put(texel_virgl_format(t.view.format));
+          stream.put(virgl::kImageAccessReadWrite);
+          stream.put(0);
+          stream.put(static_cast<uint32_t>(t.buffer->size()));
+          stream.put(t.buffer->id());
+          continue;
+        }
+        const StorageImageView& v = image_views[slot];
+        stream.put(images[slot] ? images[slot]->image_format(v.format) : 0);
+        stream.put(virgl::kImageAccessReadWrite);
+        stream.put(images[slot] ? v.first_layer | ((v.first_layer + v.layer_count - 1) << 16) : 0);
+        stream.put(images[slot] ? v.level : 0);
+        stream.put(images[slot] ? images[slot]->id() : 0);
+      }
+    }
+    if (b.texel_count) {
+      uint32_t handles[kTgsiMaxTexelViews] = {};
+      for (uint32_t k = 0; k < b.texel_count && k < kTgsiMaxTexelViews; ++k) {
+        TexelBinding& t = texels[b.texels[k] < kMaxImageSlots ? b.texels[k] : kMaxStorageImages];
+        if (!t.buffer) continue;
+        if (!t.host_view) {
+          if (made_views.count == sizeof made_views.handles / sizeof made_views.handles[0]) {
+            // (out of room: what was recorded goes out, the views go, and those still bound are made again as they are needed)
+            if (!flush()) return false;
+            made_views.destroy_all();
+            for (TexelBinding& other : texels) other.host_view = 0;
+          }
+          const uint32_t last = static_cast<uint32_t>(t.view.offset / texel_bytes(t.view.format)) + t.view.elements - 1;
+          const uint32_t view = new_handle();
+          const uint32_t create[] = {virgl::header(virgl::kCreateObject, virgl::kObjectSamplerView, 6), view, t.buffer->id(), texel_virgl_format(t.view.format) /* | PIPE_BUFFER << 24 */, 0, last,
+                                     virgl::kSwizzleRgba};
+          if (!send_commands(create, 7)) return false;
+          made_views.handles[made_views.count++] = view;
+          t.host_view = view;
+        }
+        handles[k] = t.host_view;
+      }
+      const uint32_t state = sampler_state(SamplerDesc());
+      if (!state) return false;
+      stream.command(virgl::kSetSamplerViews, 0, 2 + b.texel_count);
+      stream.put(stage);
+      stream.put(kTgsiTexelViewBase);
+      for (uint32_t k = 0; k < b.texel_count; ++k) stream.put(handles[k]);
+      stream.command(virgl::kBindSamplerStates, 0, 2 + b.texel_count);
+      stream.put(stage);
+      stream.put(kTgsiTexelViewBase);
+      for (uint32_t k = 0; k < b.texel_count; ++k) stream.put(state);
+    }
     return true;
   };
 
@@ -1476,8 +1677,9 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
         stream.command(virgl::kBindShader, 0, 2);
         stream.put(compute->shader());
         stream.put(virgl::kShaderCompute);
-        bound_compute_shader = compute->shader();   // (0 for a shader with images: its variant goes with the dispatch)
+        bound_shader[virgl::kShaderCompute] = compute->shader();   // (0 for a shader with images: its variant goes with the dispatch)
         compute_constants_dirty = constants_dwords != 0;
+        compute_bindings_dirty = true;
         break;
       }
       case RecordedCommand::Type::BindStreamOutput: {
@@ -1508,31 +1710,36 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
           return false;
         images[cmd.unit] = image;
         image_views[cmd.unit] = v;
+        texels[cmd.unit] = TexelBinding();
+        draw_bindings_dirty = compute_bindings_dirty = true;
+        break;
+      }
+      case RecordedCommand::Type::BindStorageTexelBuffer: {
+        // (a typed view of a buffer: a format the host has - one that can be stored for a u# slot -, a whole number of elements in the buffer)
+        if (cmd.unit >= kMaxImageSlots) return false;
+        VirglBuffer* buffer = static_cast<VirglBuffer*>(cmd.buffer);
+        const TexelBufferView& v = cmd.texel_view;
+        if (buffer) {
+          const uint32_t bytes = texel_bytes(v.format);
+          if (!texel_format_valid(v.format) || !texel_virgl_format(v.format) || !texel_host_buffer_format(v.format) || (cmd.unit < kMaxStorageImages && !texel_format_storable(v.format)) ||
+              v.elements == 0 || v.offset % bytes ||
+              v.offset > buffer->size() || uint64_t{v.elements} * bytes > buffer->size() - v.offset)
+            return false;
+          use(buffer);
+        }
+        texels[cmd.unit] = {buffer, v, 0};
+        if (cmd.unit < kMaxStorageImages) images[cmd.unit] = nullptr;
+        draw_bindings_dirty = compute_bindings_dirty = true;
         break;
       }
       case RecordedCommand::Type::BindStorageBuffer:
         if (cmd.unit >= kMaxStorageBuffers || !cmd.buffer) return false;   // (the bindings may change between draws)
         storage[cmd.unit] = {static_cast<VirglBuffer*>(cmd.buffer), cmd.offset, cmd.count};
         use(storage[cmd.unit].buffer);
-        storage_dirty = true;
-        draw_storage_dirty = true;
+        draw_bindings_dirty = compute_bindings_dirty = true;
         break;
       case RecordedCommand::Type::Dispatch: {
         if (in_pass || !compute) return false;
-        uint32_t slots = 0;   // (bound slots are a prefix: the host takes them from slot 0 up to the last)
-        for (uint32_t k = 0; k < kMaxStorageBuffers; ++k)
-          if (storage[k].buffer) slots = k + 1;
-        if (storage_dirty && slots) {
-          stream.command(virgl::kSetShaderBuffers, 0, 2 + 3 * slots);
-          stream.put(virgl::kShaderCompute);
-          stream.put(0);
-          for (uint32_t k = 0; k < slots; ++k) {
-            stream.put(static_cast<uint32_t>(storage[k].offset));
-            stream.put(static_cast<uint32_t>(storage[k].size));
-            stream.put(storage[k].buffer ? storage[k].buffer->id() : 0);
-          }
-          storage_dirty = false;
-        }
         if (compute_textures_dirty) {
           // The textures bound (a prefix of the units, up to the last one bound: the kernel has checked that those the shader reads are there), for the compute stage.
           uint32_t unit_count = 0;
@@ -1552,6 +1759,7 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
             for (uint32_t unit = 0; unit < unit_count; ++unit) stream.put(states[unit]);
           }
           compute_textures_dirty = false;
+          compute_bindings_dirty = true;   // (the buffer views after the textures)
         }
         if (compute_constants_dirty) {
           stream.command(virgl::kSetConstantBuffer, 0, 2 + constants_dwords);
@@ -1560,19 +1768,10 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
           for (uint32_t k = 0; k < constants_dwords; ++k) stream.put(constants[k]);
           compute_constants_dirty = false;
         }
-        if (compute->module()->has_images()) {
-          // (the host's shader for the formats of the images bound, and the images)
-          uint32_t formats[kMaxStorageImages];
-          image_formats(formats);
-          const uint32_t shader = compute->module()->variant(*this, formats);
-          if (!shader) return false;
-          if (shader != bound_compute_shader) {
-            stream.command(virgl::kBindShader, 0, 2);
-            stream.put(shader);
-            stream.put(virgl::kShaderCompute);
-            bound_compute_shader = shader;
-          }
-          emit_images(virgl::kShaderCompute);
+        if (compute_bindings_dirty) {
+          // (the host's shader for what is bound, and the buffers, images and buffer views as the shader numbers them)
+          if (!bind_stage(virgl::kShaderCompute, compute->module())) return false;
+          compute_bindings_dirty = false;
         }
         stream.command(virgl::kLaunchGrid, 0, 8);
         stream.put(compute->group(0));
@@ -1656,7 +1855,12 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
         stream.command(virgl::kBindShader, 0, 2);
         stream.put(pipeline->fragment_shader());
         stream.put(virgl::kShaderFragment);
-        bound_fragment_shader = pipeline->fragment_shader();
+        bound_shader[virgl::kShaderVertex] = pipeline->vertex_shader();
+        bound_shader[virgl::kShaderFragment] = pipeline->fragment_shader();
+        bound_shader[virgl::kShaderGeometry] = pipeline->geometry_shader();
+        bound_shader[virgl::kShaderTessControl] = pipeline->hull_shader();
+        bound_shader[virgl::kShaderTessEval] = pipeline->domain_shader();
+        draw_bindings_dirty = true;
         // (always: the host keeps a geometry shader bound, across submits too, until another bind - none, handle 0, for a pipeline without one)
         stream.command(virgl::kBindShader, 0, 2);
         stream.put(pipeline->geometry_shader());
@@ -1724,32 +1928,7 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
         const bool indexed = cmd.type == RecordedCommand::Type::DrawIndexed;
         if (indexed && !index_buffer) return false;
         if (pipeline->desc().stream_output_count && !begin_stream_output()) return false;
-        if (draw_storage_dirty) {
-          // The buffers the stages of a draw read and write, from the host's binding point 0: the views first (t0 .. t3), the unordered access buffers after them (u0 .. u3), the way their TGSI
-          // numbers them; the compute shader's bindings are made again before a dispatch.
-          StorageBinding host[kMaxStorageBuffers];
-          uint32_t slots = 0;
-          for (uint32_t k = 0; k < kMaxStorageBuffers; ++k) {
-            host[k] = storage[k < kMaxSrvBuffers ? kMaxUavBuffers + k : k - kMaxSrvBuffers];
-            if (host[k].buffer) slots = k + 1;
-          }
-          const GraphicsPipelineDesc& pd = pipeline->desc();
-          const uint32_t stages[5] = {virgl::kShaderVertex, virgl::kShaderFragment, virgl::kShaderGeometry, virgl::kShaderTessControl, virgl::kShaderTessEval};
-          for (uint32_t which = 0; which < 5; ++which) {
-            if ((which == 2 && !pd.geometry_shader) || ((which == 3 || which == 4) && !pd.hull_shader)) continue;   // (only the stages the pipeline has)
-            const uint32_t stage = stages[which];
-            stream.command(virgl::kSetShaderBuffers, 0, 2 + 3 * slots);
-            stream.put(stage);
-            stream.put(0);
-            for (uint32_t k = 0; k < slots; ++k) {
-              stream.put(static_cast<uint32_t>(host[k].offset));
-              stream.put(static_cast<uint32_t>(host[k].size));
-              stream.put(host[k].buffer ? host[k].buffer->id() : 0);
-            }
-          }
-          storage_dirty = true;
-          draw_storage_dirty = false;
-        }
+
         if (const uint32_t unit_count = pipeline->desc().texture_count) {
           for (uint32_t unit = 0; unit < unit_count; ++unit)
             if (!textures[unit] || textures[unit] == color || textures[unit] == depth) return false;   // unbound, or the image being drawn into
@@ -1765,8 +1944,7 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
             }
             // (and to the geometry, control and evaluation stages the pipeline has: a texture read there, by the same numbers)
             for (const uint32_t stage : {virgl::kShaderVertex, virgl::kShaderFragment, virgl::kShaderGeometry, virgl::kShaderTessControl, virgl::kShaderTessEval}) {
-              if ((stage == virgl::kShaderGeometry && !pipeline->geometry_shader()) || (stage == virgl::kShaderTessControl && !pipeline->hull_shader()) ||
-                  (stage == virgl::kShaderTessEval && !pipeline->domain_shader()))
+              if (!pipeline->stage_module(stage))   // (the stages the pipeline has)
                 continue;
               stream.command(virgl::kSetSamplerViews, 0, 2 + unit_count);
               stream.put(stage);
@@ -1778,12 +1956,20 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
               for (uint32_t unit = 0; unit < unit_count; ++unit) stream.put(states[unit]);
             }
             textures_dirty = false;
+            draw_bindings_dirty = true;   // (the buffer views after the textures)
           }
+        }
+        if (draw_bindings_dirty) {
+          // The storage of each stage the pipeline has, as its shader numbers it (and the host's shader for what is bound, for one with images); the compute shader's go with a dispatch.
+          for (const uint32_t stage : {virgl::kShaderVertex, virgl::kShaderFragment, virgl::kShaderGeometry, virgl::kShaderTessControl, virgl::kShaderTessEval})
+            if (!bind_stage(stage, pipeline->stage_module(stage))) return false;
+          draw_bindings_dirty = false;
+          compute_bindings_dirty = true;   // (the compute stage's own are made again before a dispatch)
         }
         if (constants_dirty) {
           // (the vertex and fragment shaders' stages, and those of the geometry, hull and domain shaders the pipeline has: shader types 2, 3 and 4)
           for (uint32_t shader = 0; shader < 5; ++shader) {
-            if ((shader == 2 && !pipeline->geometry_shader()) || (shader == 3 && !pipeline->hull_shader()) || (shader == 4 && !pipeline->domain_shader())) continue;
+            if (!pipeline->stage_module(shader)) continue;
             stream.command(virgl::kSetConstantBuffer, 0, 2 + constants_dwords);
             stream.put(shader);
             stream.put(0);
@@ -1806,20 +1992,6 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
           stream.put(index_type == IndexType::Uint16 ? 2 : 4);
           // (the host draws from the index buffer's offset and does not look at the draw's first index: the first index is part of the offset)
           stream.put(static_cast<uint32_t>(index_offset + uint64_t{cmd.first} * (index_type == IndexType::Uint16 ? 2 : 4)));
-        }
-        if (pipeline->fragment_module()->has_images()) {
-          // (a pixel shader with storage images: its host shader for their formats, and the images)
-          uint32_t formats[kMaxStorageImages];
-          image_formats(formats);
-          const uint32_t shader = pipeline->fragment_module()->variant(*this, formats);
-          if (!shader) return false;
-          if (shader != bound_fragment_shader) {
-            stream.command(virgl::kBindShader, 0, 2);
-            stream.put(shader);
-            stream.put(virgl::kShaderFragment);
-            bound_fragment_shader = shader;
-          }
-          emit_images(virgl::kShaderFragment);
         }
         const bool patches = topology == PrimitiveTopology::PatchList;
         stream.command(virgl::kDrawVbo, 0, patches ? 14 : 12);

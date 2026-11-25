@@ -26,6 +26,7 @@
 #include <windows.h>
 #include <stdio.h>
 #include <string.h>
+#include <math.h>
 #include <d3d11.h>
 #include <d3d11_1.h>
 #include <d3d11_4.h>
@@ -1370,6 +1371,219 @@ static void test_compute(void) {
   ID3D11Buffer_Release(dst);
   ID3D11Buffer_Release(total);
   ID3D11Buffer_Release(constants);
+}
+
+/* ---- typed views of buffers, append and consume views, a view above t7, draws with no target ----------------------------------------------------------------------------- */
+
+static UINT16 half_bits(float f) {
+  UINT32 b;
+  memcpy(&b, &f, 4);
+  const UINT32 sign = (b >> 16) & 0x8000u;
+  const INT32 exponent = (INT32)((b >> 23) & 0xFF) - 127 + 15;
+  if (exponent <= 0) return (UINT16)sign;
+  UINT32 h = sign | ((UINT32)exponent << 10) | ((b >> 13) & 0x3FF);
+  const UINT32 rest = b & 0x1FFF;
+  if (rest > 0x1000 || (rest == 0x1000 && (h & 1))) ++h;
+  return (UINT16)h;
+}
+static float half_value(UINT16 h) {
+  const UINT32 exponent = (h >> 10) & 0x1F, mantissa = h & 0x3FF;
+  const float v = exponent == 0 ? (float)mantissa / 1024.0f / 16384.0f : (1.0f + (float)mantissa / 1024.0f) * (float)(1u << exponent) / 32768.0f;
+  return (h & 0x8000) ? -v : v;
+}
+static ID3D11ShaderResourceView *typed_srv(ID3D11Buffer *b, DXGI_FORMAT format, UINT first, UINT count) {
+  D3D11_SHADER_RESOURCE_VIEW_DESC d;
+  memset(&d, 0, sizeof d);
+  d.Format = format;
+  d.ViewDimension = D3D11_SRV_DIMENSION_BUFFER;
+  d.Buffer.FirstElement = first;
+  d.Buffer.NumElements = count;
+  ID3D11ShaderResourceView *v = NULL;
+  if (b) ID3D11Device_CreateShaderResourceView(g_device, (ID3D11Resource *)b, &d, &v);
+  return v;
+}
+static ID3D11UnorderedAccessView *buffer_uav(ID3D11Buffer *b, DXGI_FORMAT format, UINT first, UINT count, UINT flags) {
+  D3D11_UNORDERED_ACCESS_VIEW_DESC d;
+  memset(&d, 0, sizeof d);
+  d.Format = format;
+  d.ViewDimension = D3D11_UAV_DIMENSION_BUFFER;
+  d.Buffer.FirstElement = first;
+  d.Buffer.NumElements = count;
+  d.Buffer.Flags = flags;
+  ID3D11UnorderedAccessView *v = NULL;
+  if (b) ID3D11Device_CreateUnorderedAccessView(g_device, (ID3D11Resource *)b, &d, &v);
+  return v;
+}
+
+/* Typed views (Buffer<> of R8G8B8A8_UNORM at t2 and of R16G16_FLOAT at t9 - above t7 -, RWBuffer<> of R16G16B16A16_FLOAT at u5 stored and loaded and of R32_UINT at u1 with atomics), what
+ * typed views are refused, and a typed view cleared with ClearUnorderedAccessViewFloat. */
+static void test_typed_buffers(void) {
+  BYTE colour_bytes[16];
+  UINT16 half_words[10] = {0};
+  for (UINT i = 0; i < 4; ++i) {
+    colour_bytes[i * 4] = (BYTE)(i * 40), colour_bytes[i * 4 + 1] = 100, colour_bytes[i * 4 + 2] = 0, colour_bytes[i * 4 + 3] = 255;
+    half_words[2 + i * 2] = half_bits(0.5f * (float)i), half_words[3 + i * 2] = half_bits(2.0f + (float)i);
+  }
+  ID3D11Buffer *colours = make_buffer(D3D11_BIND_SHADER_RESOURCE, D3D11_USAGE_DEFAULT, 0, colour_bytes, 16);
+  ID3D11Buffer *halves = make_buffer(D3D11_BIND_SHADER_RESOURCE, D3D11_USAGE_DEFAULT, 0, half_words, 20);
+  ID3D11Buffer *counts = make_buffer(D3D11_BIND_UNORDERED_ACCESS, D3D11_USAGE_DEFAULT, 0, NULL, 32);
+  ID3D11Buffer *results = make_buffer(D3D11_BIND_UNORDERED_ACCESS, D3D11_USAGE_DEFAULT, 0, NULL, 40);
+  ID3D11ShaderResourceView *t2 = typed_srv(colours, DXGI_FORMAT_R8G8B8A8_UNORM, 0, 4), *t9 = typed_srv(halves, DXGI_FORMAT_R16G16_FLOAT, 1, 4);
+  ID3D11UnorderedAccessView *u1 = buffer_uav(counts, DXGI_FORMAT_R32_UINT, 0, 8, 0), *u5 = buffer_uav(results, DXGI_FORMAT_R16G16B16A16_FLOAT, 1, 4, 0);
+  ID3D11ComputeShader *cs = NULL;
+  ID3D11Device_CreateComputeShader(g_device, dx_cs_typed_buffer_dxbc, sizeof dx_cs_typed_buffer_dxbc, NULL, &cs);
+  check(colours && halves && counts && results && t2 && t9 && u1 && u5 && cs, "typed shader resource and unordered access views of buffers");
+  /* (refused: a typed unordered access view of a format that cannot be stored, a typed view of a block-compressed format, a typed view past the end) */
+  ID3D11UnorderedAccessView *bad_uav = buffer_uav(results, DXGI_FORMAT_R32G32B32_FLOAT, 0, 3, 0);
+  ID3D11ShaderResourceView *bad_srv = typed_srv(colours, DXGI_FORMAT_BC1_UNORM, 0, 1), *past = typed_srv(colours, DXGI_FORMAT_R8G8B8A8_UNORM, 1, 4);
+  check(!bad_uav && !bad_srv && !past, "typed views that are refused: R32G32B32_FLOAT unordered access, BC1, past the end");
+  if (!colours || !halves || !counts || !results || !t2 || !t9 || !u1 || !u5 || !cs) return;
+  const UINT zero[4] = {0, 0, 0, 0};
+  const float seven[4] = {7, 7, 7, 7};
+  ID3D11DeviceContext_ClearUnorderedAccessViewUint(g_context, u1, zero);
+  ID3D11DeviceContext_ClearUnorderedAccessViewFloat(g_context, u5, seven);
+  UINT16 r[20];
+  check(read_buffer(results, r, sizeof r) && r[0] == 0 && r[3] == 0 && r[4] == 0x4700 && r[19] == 0x4700, "ClearUnorderedAccessViewFloat of a typed view: elements of its format, the view's alone");
+  ID3D11DeviceContext_CSSetShader(g_context, cs, NULL, 0);
+  ID3D11ShaderResourceView *views[10] = {NULL, NULL, t2, NULL, NULL, NULL, NULL, NULL, NULL, t9};
+  ID3D11DeviceContext_CSSetShaderResources(g_context, 0, 10, views);
+  ID3D11UnorderedAccessView *uavs[6] = {NULL, u1, NULL, NULL, NULL, u5};
+  ID3D11DeviceContext_CSSetUnorderedAccessViews(g_context, 0, 6, uavs, NULL);
+  ID3D11ShaderResourceView *got_back = NULL;
+  ID3D11DeviceContext_CSGetShaderResources(g_context, 9, 1, &got_back);
+  check(got_back == t9, "CSGetShaderResources gives back a view of t9");
+  if (got_back) ID3D11ShaderResourceView_Release(got_back);
+  ID3D11DeviceContext_Dispatch(g_context, 1, 1, 1);
+  UINT k[8];
+  int ok = read_buffer(results, r, sizeof r) && read_buffer(counts, k, sizeof k);
+  int wrong = 0;
+  for (UINT i = 0; ok && i < 4; ++i) {
+    const UINT16 *e = &r[4 + i * 4];
+    const float want_x = half_value(half_bits((float)(i * 40) / 255.0f + 0.5f * (float)i));
+    const float x = half_value(e[0]), y = half_value(e[1]), z = half_value(e[2]), w = half_value(e[3]);
+    const int bad = fabsf(x - want_x) > 0.002f || fabsf(y - 200.0f / 255.0f) > 0.002f || z != 2.0f + (float)i || w != 4.0f || k[2 + i] != (UINT)(x * 100.0f + 0.5f) + 4000;
+    if (bad && !wrong) printf("d3d11test: (typed buffers: element %u %f %f %f %f, count %u)\n", i, x, y, z, w, k[2 + i]);
+    wrong += bad;
+  }
+  check(ok && wrong == 0 && k[0] == 10 && k[1] == 30, "a compute shader reads typed views of buffers (t2, t9), stores and loads one (u5), adds to one atomically (u1)");
+  ID3D11ShaderResourceView *none_srv[10] = {NULL};
+  ID3D11UnorderedAccessView *none_uav[6] = {NULL};
+  ID3D11DeviceContext_CSSetShaderResources(g_context, 0, 10, none_srv);
+  ID3D11DeviceContext_CSSetUnorderedAccessViews(g_context, 0, 6, none_uav, NULL);
+  ID3D11DeviceContext_CSSetShader(g_context, NULL, NULL, 0);
+  ID3D11ComputeShader_Release(cs);
+  ID3D11UnorderedAccessView_Release(u5);
+  ID3D11UnorderedAccessView_Release(u1);
+  ID3D11ShaderResourceView_Release(t9);
+  ID3D11ShaderResourceView_Release(t2);
+  ID3D11Buffer_Release(results);
+  ID3D11Buffer_Release(counts);
+  ID3D11Buffer_Release(halves);
+  ID3D11Buffer_Release(colours);
+}
+
+/* Append, consume and counter views (cs_append_u3): their hidden counts set when they are bound, changed by the shader (Append, Consume, IncrementCounter), and copied out with
+ * CopyStructureCount; a raw view of t100. */
+static void test_append_consume(void) {
+  const UINT values[8] = {100, 101, 102, 103, 104, 105, 106, 107}, raw[8] = {1000, 1001, 1002, 1003, 1004, 1005, 1006, 1007};
+  ID3D11Buffer *appended = structured(D3D11_BIND_UNORDERED_ACCESS, 8, 8, NULL, 0), *consumed = structured(D3D11_BIND_UNORDERED_ACCESS, 4, 8, values, 0);
+  ID3D11Buffer *counted = structured(D3D11_BIND_UNORDERED_ACCESS, 4, 8, NULL, 0), *wide = structured(D3D11_BIND_UNORDERED_ACCESS, 4, 10, NULL, 0);
+  D3D11_BUFFER_DESC distant_desc = {32, D3D11_USAGE_DEFAULT, D3D11_BIND_SHADER_RESOURCE, 0, D3D11_RESOURCE_MISC_BUFFER_ALLOW_RAW_VIEWS, 0};
+  D3D11_SUBRESOURCE_DATA distant_data = {raw, 0, 0};
+  ID3D11Buffer *distant = NULL, *count = make_buffer(D3D11_BIND_SHADER_RESOURCE, D3D11_USAGE_DEFAULT, 0, NULL, 16);
+  ID3D11Device_CreateBuffer(g_device, &distant_desc, &distant_data, &distant);
+  ID3D11UnorderedAccessView *u[4] = {buffer_uav(appended, DXGI_FORMAT_UNKNOWN, 0, 8, D3D11_BUFFER_UAV_FLAG_APPEND), buffer_uav(consumed, DXGI_FORMAT_UNKNOWN, 0, 8, D3D11_BUFFER_UAV_FLAG_APPEND),
+                                     buffer_uav(counted, DXGI_FORMAT_UNKNOWN, 0, 8, D3D11_BUFFER_UAV_FLAG_COUNTER), buffer_uav(wide, DXGI_FORMAT_UNKNOWN, 0, 10, 0)};
+  D3D11_SHADER_RESOURCE_VIEW_DESC rd;
+  memset(&rd, 0, sizeof rd);
+  rd.Format = DXGI_FORMAT_R32_TYPELESS;
+  rd.ViewDimension = D3D11_SRV_DIMENSION_BUFFEREX;
+  rd.BufferEx.NumElements = 8;
+  rd.BufferEx.Flags = D3D11_BUFFEREX_SRV_FLAG_RAW;
+  ID3D11ShaderResourceView *t100 = NULL;
+  if (distant) ID3D11Device_CreateShaderResourceView(g_device, (ID3D11Resource *)distant, &rd, &t100);
+  ID3D11ComputeShader *cs = NULL;
+  ID3D11Device_CreateComputeShader(g_device, dx_cs_append_u3_dxbc, sizeof dx_cs_append_u3_dxbc, NULL, &cs);
+  check(appended && consumed && counted && wide && distant && count && u[0] && u[1] && u[2] && u[3] && t100 && cs, "append, consume and counter views, a raw view (BUFFEREX) of t100");
+  if (!appended || !consumed || !counted || !wide || !distant || !count || !u[0] || !u[1] || !u[2] || !u[3] || !t100 || !cs) return;
+  const UINT starts[4] = {0, 6, 0, (UINT)-1};
+  ID3D11DeviceContext_CSSetShader(g_context, cs, NULL, 0);
+  ID3D11DeviceContext_CSSetShaderResources(g_context, 100, 1, &t100);
+  ID3D11DeviceContext_CSSetUnorderedAccessViews(g_context, 0, 4, u, starts);
+  ID3D11DeviceContext_Dispatch(g_context, 1, 1, 1);
+  for (UINT i = 0; i < 3; ++i) ID3D11DeviceContext_CopyStructureCount(g_context, count, i * 4, u[i]);
+  UINT n[4], a[16], c[8], w[10];
+  int ok = read_buffer(count, n, sizeof n) && read_buffer(appended, a, sizeof a) && read_buffer(counted, c, sizeof c) && read_buffer(wide, w, sizeof w);
+  UINT seen_values = 0, seen_threads = 0, seen_places = 0;
+  int wrong = 0;
+  for (UINT i = 0; ok && i < 6; ++i) {
+    if (a[i * 2] < 100 || a[i * 2] > 105 || a[i * 2 + 1] > 5) { ++wrong; continue; }
+    seen_values |= 1u << (a[i * 2] - 100), seen_threads |= 1u << a[i * 2 + 1];
+  }
+  for (UINT i = 0; ok && i < 8; ++i) {
+    if (c[i] % 3 != 1 || c[i] / 3 > 7) { ++wrong; continue; }
+    seen_places |= 1u << (c[i] / 3);
+  }
+  for (UINT i = 0; ok && i < 8; ++i) wrong += w[i] != 1007 + i;
+  if (ok) printf("d3d11test: (append and consume: counts %u %u %u, bufinfo %u %u)\n", n[0], n[1], n[2], w[8], w[9]);
+  check(ok && wrong == 0 && seen_values == 0x3F && seen_threads == 0x3F && seen_places == 0xFF && w[8] == 32 && w[9] == 8,
+        "Append / Consume / IncrementCounter on views whose counts were set by CSSetUnorderedAccessViews; a raw view of t100");
+  check(ok && n[0] == 6 && n[1] == 0 && n[2] == 8, "CopyStructureCount copies the counts the shader left");
+  /* (bound again without counts: they are kept; with counts: set again) */
+  ID3D11DeviceContext_CSSetUnorderedAccessViews(g_context, 0, 4, u, NULL);
+  ID3D11DeviceContext_CopyStructureCount(g_context, count, 0, u[2]);
+  const UINT again[3] = {(UINT)-1, (UINT)-1, 3};
+  ID3D11DeviceContext_CSSetUnorderedAccessViews(g_context, 0, 3, u, again);
+  ID3D11DeviceContext_CopyStructureCount(g_context, count, 4, u[2]);
+  check(read_buffer(count, n, sizeof n) && n[0] == 8 && n[1] == 3, "a count kept by a bind without counts, and set by one with");
+  ID3D11ShaderResourceView *none_srv = NULL;
+  ID3D11UnorderedAccessView *none_uav[4] = {NULL};
+  ID3D11DeviceContext_CSSetShaderResources(g_context, 100, 1, &none_srv);
+  ID3D11DeviceContext_CSSetUnorderedAccessViews(g_context, 0, 4, none_uav, NULL);
+  ID3D11DeviceContext_CSSetShader(g_context, NULL, NULL, 0);
+  ID3D11ComputeShader_Release(cs);
+  ID3D11ShaderResourceView_Release(t100);
+  for (UINT i = 0; i < 4; ++i) ID3D11UnorderedAccessView_Release(u[i]);
+  ID3D11Buffer_Release(count);
+  ID3D11Buffer_Release(distant);
+  ID3D11Buffer_Release(wide);
+  ID3D11Buffer_Release(counted);
+  ID3D11Buffer_Release(consumed);
+  ID3D11Buffer_Release(appended);
+}
+
+/* A draw with no render target and no depth buffer, whose pixel shader writes an unordered access view only (UAV-only rendering): each pixel of the 16 x 16 viewport adds one to
+ * its element of a typed view. */
+static void test_uav_only_draw(void) {
+  ID3D11Buffer *hits = make_buffer(D3D11_BIND_UNORDERED_ACCESS, D3D11_USAGE_DEFAULT, 0, NULL, 256 * 4);
+  ID3D11UnorderedAccessView *view = buffer_uav(hits, DXGI_FORMAT_R32_UINT, 0, 256, 0);
+  ID3D11PixelShader *ps = NULL;
+  ID3D11Device_CreatePixelShader(g_device, dx_ps_uav_only_dxbc, sizeof dx_ps_uav_only_dxbc, NULL, &ps);
+  const VertexF v[3] = {{-1, -1, 0.5f, 1, 1, 1, 1}, {3, -1, 0.5f, 1, 1, 1, 1}, {-1, 3, 0.5f, 1, 1, 1, 1}};
+  ID3D11Buffer *vertices = make_buffer(D3D11_BIND_VERTEX_BUFFER, D3D11_USAGE_DEFAULT, 0, v, sizeof v);
+  check(hits && view && ps && vertices, "a pixel shader that writes a typed view of a buffer only");
+  if (!hits || !view || !ps || !vertices) return;
+  const UINT zero[4] = {0, 0, 0, 0};
+  ID3D11DeviceContext_ClearUnorderedAccessViewUint(g_context, view, zero);
+  begin(NULL);
+  D3D11_VIEWPORT viewport = {0, 0, 16, 16, 0, 1};
+  ID3D11DeviceContext_OMSetRenderTargetsAndUnorderedAccessViews(g_context, 0, NULL, NULL, 0, 1, &view, NULL);
+  ID3D11DeviceContext_RSSetViewports(g_context, 1, &viewport);
+  ID3D11DeviceContext_PSSetShader(g_context, ps, NULL, 0);
+  bind_floats(vertices);
+  ID3D11DeviceContext_Draw(g_context, 3, 0);
+  UINT h[256];
+  int ok = read_buffer(hits, h, sizeof h), wrong = 0;
+  for (UINT i = 0; ok && i < 256; ++i)
+    if (h[i] != 1 && !wrong++) printf("d3d11test: (UAV-only draw: element %u = %u)\n", i, h[i]);
+  check(ok && wrong == 0, "a draw with no render target and no depth buffer, writing an unordered access view only, shades each pixel of the viewport once");
+  ID3D11UnorderedAccessView *none = NULL;
+  ID3D11DeviceContext_OMSetRenderTargetsAndUnorderedAccessViews(g_context, 1, &g_target_view, NULL, 1, 1, &none, NULL);
+  ID3D11DeviceContext_PSSetShader(g_context, NULL, NULL, 0);
+  ID3D11Buffer_Release(vertices);
+  ID3D11PixelShader_Release(ps);
+  ID3D11UnorderedAccessView_Release(view);
+  ID3D11Buffer_Release(hits);
 }
 
 /* ---- the pixel shader's unordered access views, queries, predication ----------------------------------------------------------------------------------- */
@@ -2796,6 +3010,9 @@ int main(void) {
       test_shader_stages();
       test_compressed();
       test_compute();
+      test_typed_buffers();
+      test_append_consume();
+      test_uav_only_draw();
       test_pixel_uav_and_queries();
       test_stream_output();
       test_indirect_draws();

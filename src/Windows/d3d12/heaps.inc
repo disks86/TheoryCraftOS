@@ -26,6 +26,26 @@
 
 enum { DK_NONE, DK_SRV, DK_SRV_BUFFER, DK_UAV, DK_CBV, DK_SAMPLER, DK_RTV, DK_DSV, DK_UAV_TEXTURE };
 
+/* Whether a format is one of the kernel's element formats of typed views of buffers (graphics::TexelFormat, which numbers them as DXGI does): 1 for a view that is read, 2 for one
+ * that can also be an unordered access view (stored), 0 for none - typeless, sRGB, depth, block-compressed and video formats. */
+static UINT texel_buffer_format(DXGI_FORMAT f) {
+  switch (f) {
+    case DXGI_FORMAT_R32G32B32_FLOAT: case DXGI_FORMAT_R32G32B32_UINT: case DXGI_FORMAT_R32G32B32_SINT: case DXGI_FORMAT_A8_UNORM: case DXGI_FORMAT_B5G6R5_UNORM:
+    case DXGI_FORMAT_B5G5R5A1_UNORM: case DXGI_FORMAT_B8G8R8A8_UNORM: case DXGI_FORMAT_B8G8R8X8_UNORM: case DXGI_FORMAT_B4G4R4A4_UNORM:
+      return 1;
+    case DXGI_FORMAT_R32G32B32A32_FLOAT: case DXGI_FORMAT_R32G32B32A32_UINT: case DXGI_FORMAT_R32G32B32A32_SINT: case DXGI_FORMAT_R16G16B16A16_FLOAT: case DXGI_FORMAT_R16G16B16A16_UNORM:
+    case DXGI_FORMAT_R16G16B16A16_UINT: case DXGI_FORMAT_R16G16B16A16_SNORM: case DXGI_FORMAT_R16G16B16A16_SINT: case DXGI_FORMAT_R32G32_FLOAT: case DXGI_FORMAT_R32G32_UINT:
+    case DXGI_FORMAT_R32G32_SINT: case DXGI_FORMAT_R10G10B10A2_UNORM: case DXGI_FORMAT_R10G10B10A2_UINT: case DXGI_FORMAT_R11G11B10_FLOAT: case DXGI_FORMAT_R8G8B8A8_UNORM:
+    case DXGI_FORMAT_R8G8B8A8_UINT: case DXGI_FORMAT_R8G8B8A8_SNORM: case DXGI_FORMAT_R8G8B8A8_SINT: case DXGI_FORMAT_R16G16_FLOAT: case DXGI_FORMAT_R16G16_UNORM:
+    case DXGI_FORMAT_R16G16_UINT: case DXGI_FORMAT_R16G16_SNORM: case DXGI_FORMAT_R16G16_SINT: case DXGI_FORMAT_R32_FLOAT: case DXGI_FORMAT_R32_UINT: case DXGI_FORMAT_R32_SINT:
+    case DXGI_FORMAT_R8G8_UNORM: case DXGI_FORMAT_R8G8_UINT: case DXGI_FORMAT_R8G8_SNORM: case DXGI_FORMAT_R8G8_SINT: case DXGI_FORMAT_R16_FLOAT: case DXGI_FORMAT_R16_UNORM:
+    case DXGI_FORMAT_R16_UINT: case DXGI_FORMAT_R16_SNORM: case DXGI_FORMAT_R16_SINT: case DXGI_FORMAT_R8_UNORM: case DXGI_FORMAT_R8_UINT: case DXGI_FORMAT_R8_SNORM:
+    case DXGI_FORMAT_R8_SINT:
+      return 2;
+    default: return 0;
+  }
+}
+
 /* One descriptor: exactly DESCRIPTOR_STRIDE bytes, the increment size the device reports. */
 typedef struct SoftDesc {
   UINT kind;
@@ -34,7 +54,8 @@ typedef struct SoftDesc {
                             * `offset` has SRV_MIRRORS when it or the alternate is a mirror the kernel brings up to date (res_mirror) */
   UINT format;
   UINT mip;
-  UINT sampler[4];         /* filter | address_u << 8 | address_v << 16 | mip_filter << 24, lod bias, min lod, max lod (floats as bits) */
+  UINT sampler[4];         /* filter | address_u << 8 | address_v << 16 | mip_filter << 24, lod bias, min lod, max lod (floats as bits). A view of a buffer (DK_SRV_BUFFER, DK_UAV): 0, then
+                            * the element format of a typed view (0: raw or structured), and an unordered access view's counter - the kernel's allocation and the word's offset (0: none) */
   UINT dimension;
   UINT slice;
   UINT stride;             /* buffer unordered access views: the bytes of an element (ClearUnorderedAccessView* rectangles count elements); render target, depth stencil and
@@ -172,12 +193,19 @@ static void STDMETHODCALLTYPE dev_CreateShaderResourceView(Dev *This, ID3D12Reso
     if (r->desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
       UINT stride = 4;
       UINT64 first = 0, count = (r->desc.Width) / 4;
+      int typed = 0;
       if (desc && desc->ViewDimension == D3D12_SRV_DIMENSION_BUFFER) {
         stride = desc->Buffer.StructureByteStride ? desc->Buffer.StructureByteStride : (desc->Format != DXGI_FORMAT_UNKNOWN && desc->Format != DXGI_FORMAT_R32_TYPELESS ? format_bytes(desc->Format) : 4);
         first = desc->Buffer.FirstElement;
         count = desc->Buffer.NumElements;
+        /* (a typed view - not structured, not raw - is of elements of its format: the kernel's typed view of a buffer, Buffer<>) */
+        typed = !desc->Buffer.StructureByteStride && !(desc->Buffer.Flags & D3D12_BUFFER_SRV_FLAG_RAW) && desc->Format != DXGI_FORMAT_UNKNOWN && desc->Format != DXGI_FORMAT_R32_TYPELESS;
       }
       d.kind = DK_SRV_BUFFER;
+      if (typed) {
+        if (texel_buffer_format(desc->Format)) d.sampler[1] = desc->Format;
+        else d.kind = 0;      /* (no typed view of this format) */
+      }
       d.offset = first * stride;
       d.size = count * stride;
     } else {
@@ -304,11 +332,23 @@ static void STDMETHODCALLTYPE dev_CreateUnorderedAccessView(Dev *This, ID3D12Res
       count = desc->Buffer.NumElements;
       if (!desc->Buffer.StructureByteStride && !(desc->Buffer.Flags & D3D12_BUFFER_UAV_FLAG_RAW)) d.format = desc->Format;      /* (typed: ClearUnorderedAccessView* converts to it) */
     }
-    d.kind = DK_UAV;
+    d.kind = (r->desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) ? DK_UAV : 0;      /* (no unordered access view of a buffer made without the flag) */
     d.stride = stride;
     d.alloc = r->alloc;
     d.offset = first * stride;
     d.size = count * stride;
+    /* (a typed view: of elements of a format that can be stored, the kernel's typed view of a buffer, RWBuffer<>) */
+    if (d.format != DXGI_FORMAT_UNKNOWN && d.format != DXGI_FORMAT_R32_TYPELESS) {
+      if (texel_buffer_format(d.format) == 2) d.sampler[1] = d.format;
+      else d.kind = 0;
+    }
+    /* (the counter of a structured view - an append, consume or counter buffer: the word at CounterOffsetInBytes of the counter resource, a buffer) */
+    const Resource *c = (const Resource *)counter;
+    if (c && desc && desc->ViewDimension == D3D12_UAV_DIMENSION_BUFFER && desc->Buffer.StructureByteStride && c->desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER &&
+        desc->Buffer.CounterOffsetInBytes % 4 == 0 && desc->Buffer.CounterOffsetInBytes + 4 <= c->desc.Width && desc->Buffer.CounterOffsetInBytes <= 0xFFFFFFFFu) {
+      d.sampler[2] = c->alloc;
+      d.sampler[3] = (UINT)desc->Buffer.CounterOffsetInBytes;
+    }
   }
   desc_write(handle, &d);
 }

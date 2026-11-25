@@ -109,6 +109,11 @@
 //                    allocation, a level it has and layers it has (an array's layers, a volume's slices); the view's Format, 0 (or left out) the allocation's
 //                    own, another wide format of the same pixel size for a wide allocation. Outside a pass, and in one with the adapter's kFeature2StorageImagesInDraws;
 //                    kAllocationIndex kNoAllocation: none. What the shaders write is in the image after the dispatch or the draw)
+//   BindTexelBuffer  slot, allocation_index, first_element, element_count, format   (a typed view of a buffer, the adapter's kFeature2TexelBuffers: image slot `slot` - below kMaxStorageImages
+//                    the u# of a shader that declares a typed buffer (RWBuffer<>), from kTexelBufferSlotBase the t# ones (Buffer<>, slot kTexelBufferSlotBase + n), read only - is `element_count`
+//                    elements of `format` (a graphics::TexelFormat: DXGI_FORMAT's number; a u# view one texel_format_storable says) from element `first_element` of a kAllocUnorderedAccess buffer,
+//                    within it. Outside a pass, and in one with kFeature2StorageImagesInDraws; kNoAllocation: none. The counter of an append, consume or counter view u<n> is BindUav's slot
+//                    kCounterSlotBase + n: a word of a kAllocUnorderedAccess buffer)
 //   EndQuery         (the count of fragments that passed the depth and stencil tests since BeginQuery is written there - a little-endian 64-bit number - once the stream has run)
 #pragma once
 #include "Kernel/Dxgkrnl/DxgTypes.hpp"
@@ -155,6 +160,7 @@ enum class Op : uint16_t {
   EncodeFrame,
   ResolveEncoderMetadata,
   BindUavImage,   // (37)
+  BindTexelBuffer,   // (38)
 };
 constexpr uint32_t kVideoProcessStreamWords = 15;
 constexpr uint32_t kVideoProcessExtension = 0x31585056;   // 'VPX1': VideoProcess's optional part follows
@@ -299,6 +305,9 @@ class CommandWriter {
   void bind_uav(uint32_t slot, uint32_t allocation, uint32_t offset, uint32_t size) { packet(Op::BindUav, {slot, allocation, offset, size}); }
   void bind_uav_image(uint32_t slot, uint32_t allocation, uint32_t level = 0, uint32_t first_layer = 0, uint32_t layer_count = 1, Format view = Format::Unknown) {
     packet(Op::BindUavImage, {slot, allocation, level, first_layer, layer_count, static_cast<uint32_t>(view)});
+  }
+  void bind_texel_buffer(uint32_t slot, uint32_t allocation, uint32_t first_element, uint32_t element_count, graphics::TexelFormat format) {
+    packet(Op::BindTexelBuffer, {slot, allocation, first_element, element_count, static_cast<uint32_t>(format)});
   }
   struct DecodeArgs {
     Handle decoder = 0;

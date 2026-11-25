@@ -25,6 +25,8 @@ static void dev_destroy(DxObj *o) {
   if (d->null_target) kmt_destroy_allocation(d->kdev, d->null_target);
   for (UINT i = 0; i < d->companion_count; ++i) kmt_destroy_allocation(d->kdev, d->companions[i].color);
   mem_free(d->companions);
+  for (UINT i = 0; i < d->uav_target_count; ++i) kmt_destroy_allocation(d->kdev, d->uav_targets[i].color);
+  mem_free(d->uav_targets);
   if (d->kdev) kmt_destroy_device(d->kdev);
   if (d->adapter) kmt_close_adapter(d->adapter);
 }
@@ -240,6 +242,8 @@ static HRESULT STDMETHODCALLTYPE dev_CheckFeatureSupport(Dev *This, D3D12_FEATUR
       if (size != sizeof *o) return E_INVALIDARG;
       memset(o, 0, sizeof *o);
       o->ResourceBindingTier = D3D12_RESOURCE_BINDING_TIER_1;
+      /* (typed loads of every format a typed unordered access view can have: the kernel's storage images and typed views of buffers read them all) */
+      o->TypedUAVLoadAdditionalFormats = (This->caps.features2 & (DEV_FEATURE2_STORAGE_IMAGES | DEV_FEATURE2_TEXEL_BUFFERS)) == (DEV_FEATURE2_STORAGE_IMAGES | DEV_FEATURE2_TEXEL_BUFFERS);
       o->ConservativeRasterizationTier = D3D12_CONSERVATIVE_RASTERIZATION_TIER_NOT_SUPPORTED;
       o->TiledResourcesTier = D3D12_TILED_RESOURCES_TIER_1;
       o->ResourceHeapTier = D3D12_RESOURCE_HEAP_TIER_2;
@@ -299,6 +303,21 @@ static HRESULT STDMETHODCALLTYPE dev_CheckFeatureSupport(Dev *This, D3D12_FEATUR
       }
       if (f->Format == DXGI_FORMAT_R16_UINT || f->Format == DXGI_FORMAT_R32_UINT) f->Support1 |= D3D12_FORMAT_SUPPORT1_IA_INDEX_BUFFER;
       format_uav_support(This, f->Format, &f->Support1, &f->Support2);
+      if (This->caps.features2 & DEV_FEATURE2_TEXEL_BUFFERS) {
+        /* (typed views of buffers: the kernel's element formats - shader resource views of all of them, unordered access views of those that can be stored, with typed loads, and the
+         * atomic operations on the 32-bit integers) */
+        const UINT texel = texel_buffer_format(f->Format);
+        if (texel) {
+          f->Support1 |= D3D12_FORMAT_SUPPORT1_BUFFER | D3D12_FORMAT_SUPPORT1_SHADER_LOAD;
+          if (texel == 2) {
+            f->Support1 |= D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW;
+            f->Support2 |= D3D12_FORMAT_SUPPORT2_UAV_TYPED_LOAD | D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE;
+          }
+          if (f->Format == DXGI_FORMAT_R32_UINT || f->Format == DXGI_FORMAT_R32_SINT)
+            f->Support2 |= D3D12_FORMAT_SUPPORT2_UAV_ATOMIC_ADD | D3D12_FORMAT_SUPPORT2_UAV_ATOMIC_BITWISE_OPS | D3D12_FORMAT_SUPPORT2_UAV_ATOMIC_COMPARE_STORE_OR_COMPARE_EXCHANGE |
+                           D3D12_FORMAT_SUPPORT2_UAV_ATOMIC_EXCHANGE | D3D12_FORMAT_SUPPORT2_UAV_ATOMIC_SIGNED_MIN_OR_MAX | D3D12_FORMAT_SUPPORT2_UAV_ATOMIC_UNSIGNED_MIN_OR_MAX;
+        }
+      }
       return S_OK;
     }
     case D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS: {

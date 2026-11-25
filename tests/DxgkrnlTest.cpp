@@ -5449,6 +5449,313 @@ void test_d3d12_reserved_texture() {
 }
 
 
+// Typed views of buffers (BindTexelBuffer, Buffer<> and RWBuffer<>) on the CPU renderer: a compute shader reads R8G8B8A8_UNORM and R16G16_FLOAT views of t2 and t9, writes and reads
+// back an R16G16B16A16_FLOAT view of u5 and adds to an R32_UINT view of u1 atomically; the same through descriptors of a root signature's table; and what is refused.
+void test_texel_buffers_kernel() {
+  Env e;
+  auto blob_shader = [&](const char* name, graphics::ShaderStage stage, Handle* out) {
+    const std::vector<uint8_t> code = read_blob(name);
+    ShaderDesc sd;
+    sd.kind = ShaderKind::Dxbc, sd.stage = stage, sd.code = ConstByteView(code.data(), code.size());
+    return !code.empty() && e.kernel.create_shader(kPid, e.dev, sd, out) == status::kSuccess;
+  };
+  Handle cs = 0, pipe = 0;
+  CHECK(blob_shader("cs_typed_buffer.dxbc", graphics::ShaderStage::Compute, &cs));
+  PipelineDesc pd;
+  pd.compute_shader = cs;
+  CHECK(e.kernel.create_pipeline(kPid, e.dev, pd, &pipe) == status::kSuccess);
+  const Handle colours = e.buffer(kAllocUnorderedAccess, 16), halves = e.buffer(kAllocUnorderedAccess, 20), counts = e.buffer(kAllocUnorderedAccess, 32),
+               results = e.buffer(kAllocUnorderedAccess, 40);
+  uint8_t colour_bytes[16];
+  uint16_t half_words[10] = {};
+  for (uint32_t i = 0; i < 4; ++i) {
+    colour_bytes[i * 4] = static_cast<uint8_t>(i * 40), colour_bytes[i * 4 + 1] = 100, colour_bytes[i * 4 + 2] = 0, colour_bytes[i * 4 + 3] = 255;
+    half_words[2 + i * 2] = graphics::float_to_half(0.5f * static_cast<float>(i)), half_words[2 + i * 2 + 1] = graphics::float_to_half(2.0f + static_cast<float>(i));   // (from element 1)
+  }
+  CHECK(e.write(colours, ConstByteView(colour_bytes, 16)) && e.write(halves, ConstByteView(reinterpret_cast<const uint8_t*>(half_words), 20)) && e.fill(counts, 0) && e.fill(results, 0));
+  auto check = [&](const char* what) {
+    LockResult lock;
+    int wrong = 0;
+    CHECK(e.kernel.lock(kPid, results, kLockReadOnly, 0, &lock) == status::kSuccess);
+    float x[4] = {};
+    for (uint32_t i = 0; i < 4; ++i) {
+      ByteReader in(lock.data.subview(8 + i * 8, 8));   // (the view of u5 starts at element 1)
+      const float c[4] = {graphics::half_to_float(in.le16()), graphics::half_to_float(in.le16()), graphics::half_to_float(in.le16()), graphics::half_to_float(in.le16())};
+      const float want_x = graphics::half_to_float(graphics::float_to_half(static_cast<float>(i * 40) / 255.0f + 0.5f * static_cast<float>(i)));
+      x[i] = want_x;
+      wrong += c[0] != want_x || c[1] != graphics::half_to_float(graphics::float_to_half(200.0f / 255.0f)) || c[2] != 2.0f + static_cast<float>(i) || c[3] != 4.0f;
+    }
+    e.kernel.unlock(kPid, results);
+    CHECK(e.kernel.lock(kPid, counts, kLockReadOnly, 0, &lock) == status::kSuccess);
+    ByteReader in(lock.data);
+    const uint32_t sum = in.le32(), most = in.le32();
+    wrong += sum != 10 || most != 30;
+    for (uint32_t i = 0; i < 4; ++i) wrong += in.le32() != static_cast<uint32_t>(x[i] * 100.0f + 0.5f) + 4000;
+    e.kernel.unlock(kPid, counts);
+    if (wrong) std::printf("  texel buffers (%s): %d wrong\n", what, wrong);
+    CHECK(wrong == 0);
+  };
+  using graphics::TexelFormat;
+  const uint32_t t2 = graphics::kTexelBufferSlotBase + 2, t9 = graphics::kTexelBufferSlotBase + 9;
+  auto bind_all = [&](CommandWriter& w) {
+    w.bind_pipeline(pipe);
+    w.bind_texel_buffer(t2, 0, 0, 4, TexelFormat::R8G8B8A8Unorm);
+    w.bind_texel_buffer(t9, 1, 1, 4, TexelFormat::R16G16Float);
+    w.bind_texel_buffer(1, 2, 0, 8, TexelFormat::R32Uint);
+    w.bind_texel_buffer(5, 3, 1, 4, TexelFormat::R16G16B16A16Float);
+  };
+  auto run = [&](auto build) {
+    CommandWriter w(e.allocator);
+    build(w);
+    return w.ok() ? e.render(w, {colours, halves, counts, results}) : status::kNoMemory;
+  };
+  CHECK(run([&](CommandWriter& w) { bind_all(w); w.dispatch(1); }) == status::kSuccess);
+  check("bound");
+
+  // Refused: a slot left unbound, a view of another kind of values (floats where the shader reads integers), a format a u# view cannot store, elements past the end or a view that wraps,
+  // a slot past the last, a format that is none, a buffer that shaders cannot use.
+  CHECK(run([&](CommandWriter& w) { bind_all(w); w.bind_texel_buffer(t9, kNoAllocation, 0, 0, TexelFormat::Undefined); w.dispatch(1); }) == status::kInvalidParameter);
+  CHECK(run([&](CommandWriter& w) { bind_all(w); w.bind_texel_buffer(1, 2, 0, 8, TexelFormat::R32Float); w.dispatch(1); }) == status::kInvalidParameter);
+  CHECK(run([&](CommandWriter& w) { w.bind_texel_buffer(5, 3, 0, 3, TexelFormat::R32G32B32Float); }) == status::kInvalidParameter);
+  CHECK(run([&](CommandWriter& w) { w.bind_texel_buffer(t2, 0, 1, 4, TexelFormat::R8G8B8A8Unorm); }) == status::kInvalidParameter);
+  CHECK(run([&](CommandWriter& w) { w.bind_texel_buffer(t2, 0, 0xFFFFFFFFu, 2, TexelFormat::R8G8B8A8Unorm); }) == status::kInvalidParameter);
+  CHECK(run([&](CommandWriter& w) { w.bind_texel_buffer(graphics::kMaxImageSlots, 0, 0, 1, TexelFormat::R8G8B8A8Unorm); }) == status::kInvalidParameter);
+  CHECK(run([&](CommandWriter& w) { w.bind_texel_buffer(t2, 0, 0, 1, static_cast<TexelFormat>(1)); }) == status::kInvalidParameter);   // (R32G32B32A32_TYPELESS)
+  const Handle vertices = e.buffer(kAllocVertexBuffer, 64);
+  {
+    CommandWriter w(e.allocator);
+    w.bind_texel_buffer(t2, 0, 0, 4, TexelFormat::R8G8B8A8Unorm);
+    CHECK(e.render(w, {vertices}) == status::kInvalidParameter);
+  }
+
+  // Through a root signature: a table of the four views (t2 and t9 typed shader resource views, u1 and u5 typed unordered access views of the same elements).
+  CHECK(e.fill(counts, 0) && e.fill(results, 0));
+  const std::vector<uint8_t> blob = serialize_signature(1, {{0, 0, {{0, 1, 2, 0, 0}, {0, 1, 9, 0, 1}, {1, 1, 1, 0, 2}, {1, 1, 5, 0, 3}}}});
+  Handle sig = 0, views = 0;
+  CHECK(e.kernel.create_root_signature(kPid, e.dev, ConstByteView(blob.data(), blob.size()), &sig) == status::kSuccess);
+  CHECK(e.kernel.create_descriptor_heap(kPid, e.dev, DescriptorHeapType::CbvSrvUav, 4, &views) == status::kSuccess);
+  auto view = [&](uint32_t index, DescriptorKind kind, Handle a, uint64_t offset, uint64_t size, TexelFormat f) {
+    DescriptorDesc d;
+    d.kind = kind, d.allocation = a, d.offset = offset, d.size = size, d.texel_format = static_cast<uint32_t>(f);
+    return e.kernel.write_descriptor(kPid, views, index, d);
+  };
+  CHECK(view(0, DescriptorKind::Srv, colours, 0, 16, TexelFormat::R8G8B8A8Unorm) == status::kSuccess);
+  CHECK(view(1, DescriptorKind::Srv, halves, 4, 16, TexelFormat::R16G16Float) == status::kSuccess);
+  CHECK(view(2, DescriptorKind::Uav, counts, 0, 32, TexelFormat::R32Uint) == status::kSuccess);
+  CHECK(view(3, DescriptorKind::Uav, results, 8, 32, TexelFormat::R16G16B16A16Float) == status::kSuccess);
+  // (descriptors refused: an offset that is not a whole element, a format an unordered access view cannot store, a format that is none)
+  CHECK(view(3, DescriptorKind::Uav, results, 4, 32, TexelFormat::R16G16B16A16Float) == status::kInvalidParameter);
+  CHECK(view(3, DescriptorKind::Uav, results, 0, 36, TexelFormat::R32G32B32Float) == status::kInvalidParameter);
+  CHECK(view(0, DescriptorKind::Srv, colours, 0, 16, static_cast<TexelFormat>(5)) == status::kInvalidParameter);
+  CHECK(run([&](CommandWriter& w) {
+          w.set_root_signature(sig);
+          w.set_descriptor_heaps({views});
+          w.set_root_table(0, 0);
+          w.bind_pipeline(pipe);
+          w.dispatch(1);
+        }) == status::kSuccess);
+  check("table");
+  // (a raw view where the shader declares a typed one is refused)
+  CHECK(view(0, DescriptorKind::Srv, colours, 0, 16, TexelFormat::Undefined) == status::kSuccess);
+  CHECK(run([&](CommandWriter& w) {
+          w.set_root_signature(sig);
+          w.set_descriptor_heaps({views});
+          w.set_root_table(0, 0);
+          w.bind_pipeline(pipe);
+          w.dispatch(1);
+        }) == status::kInvalidParameter);
+
+  // The decoding and encoding of every format, against values worked out by hand; and elements outside a view read as zero.
+  {
+    using graphics::decode_texel;
+    using graphics::encode_texel;
+    uint8_t b[16] = {};
+    const graphics::Vec4 v = {0.25f, -0.5f, 1.5f, 1.0f};
+    encode_texel(TexelFormat::R8G8B8A8Snorm, v, ByteView(b, 4));
+    CHECK(b[0] == 32 && b[1] == 0xC0 && b[2] == 127 && b[3] == 127);   // (0.25 * 127 = 31.75 -> 32, -63.5 -> -64, 1.5 clamped)
+    const graphics::Vec4 s = decode_texel(TexelFormat::R8G8B8A8Snorm, ConstByteView(b, 4));
+    CHECK(s.x == 32.0f / 127.0f && s.y == -64.0f / 127.0f && s.z == 1.0f);
+    const uint8_t lowest[1] = {0x80};
+    CHECK(decode_texel(TexelFormat::R8Snorm, ConstByteView(lowest, 1)).x == -1.0f);   // (-128 reads as -1, as -127 does)
+    encode_texel(TexelFormat::R11G11B10Float, {1.0f, 2.5f, -3.0f, 0}, ByteView(b, 4));
+    const graphics::Vec4 f = decode_texel(TexelFormat::R11G11B10Float, ConstByteView(b, 4));
+    CHECK(f.x == 1.0f && f.y == 2.5f && f.z == 0.0f && f.w == 1.0f);
+    encode_texel(TexelFormat::R11G11B10Float, {1e10f, 65024.0f, 0.0f, 0}, ByteView(b, 4));   // (saturated to the largest finite value: 65024, and 64512 for the 10-bit one)
+    const graphics::Vec4 big = decode_texel(TexelFormat::R11G11B10Float, ConstByteView(b, 4));
+    CHECK(big.x == 65024.0f && big.y == 65024.0f);
+    encode_texel(TexelFormat::R10G10B10A2Uint, {__builtin_bit_cast(float, 5000u), __builtin_bit_cast(float, 7u), __builtin_bit_cast(float, 1023u), __builtin_bit_cast(float, 9u)}, ByteView(b, 4));
+    CHECK((b[0] | b[1] << 8 | b[2] << 16 | static_cast<uint32_t>(b[3]) << 24) == (1023u | 7u << 10 | 1023u << 20 | 3u << 30));   // (integers clamped to the channel)
+    encode_texel(TexelFormat::R16Sint, {__builtin_bit_cast(float, static_cast<uint32_t>(-40000)), 0, 0, 0}, ByteView(b, 2));
+    CHECK(b[0] == 0x00 && b[1] == 0x80);
+    CHECK(__builtin_bit_cast(uint32_t, decode_texel(TexelFormat::R16Sint, ConstByteView(b, 2)).x) == static_cast<uint32_t>(-32768));
+    CHECK(__builtin_bit_cast(uint32_t, decode_texel(TexelFormat::R16Sint, ConstByteView(b, 2)).w) == 1u);   // (the alpha of an integer format: the integer 1)
+    encode_texel(TexelFormat::B5G6R5Unorm, {1.0f, 0.0f, 1.0f, 1.0f}, ByteView(b, 2));
+    CHECK(b[0] == 0x1F && b[1] == 0xF8);
+    encode_texel(TexelFormat::A8Unorm, {0, 0, 0, 0.5f}, ByteView(b, 1));
+    CHECK(b[0] == 128 && decode_texel(TexelFormat::A8Unorm, ConstByteView(b, 1)).x == 0.0f);
+    CHECK(decode_texel(TexelFormat::R32Float, ConstByteView(b, 2)).x == 0.0f);   // (a short element: nothing read)
+  }
+}
+
+// Append, consume and counter views (the hidden counters: BindUav's slots from kCounterSlotBase, imm_atomic_alloc / imm_atomic_consume), bufinfo, and buffers in slots far above the
+// first ones (u60, t100): directly, and through descriptors with counters.
+void test_uav_counters_kernel() {
+  Env e;
+  const std::vector<uint8_t> code = read_blob("cs_append.dxbc");
+  ShaderDesc sd;
+  sd.kind = ShaderKind::Dxbc, sd.stage = graphics::ShaderStage::Compute, sd.code = ConstByteView(code.data(), code.size());
+  Handle cs = 0, pipe = 0;
+  CHECK(!code.empty() && e.kernel.create_shader(kPid, e.dev, sd, &cs) == status::kSuccess);
+  PipelineDesc pd;
+  pd.compute_shader = cs;
+  CHECK(e.kernel.create_pipeline(kPid, e.dev, pd, &pipe) == status::kSuccess);
+  const Handle appended = e.buffer(kAllocUnorderedAccess, 64), consumed = e.buffer(kAllocUnorderedAccess, 32), counted = e.buffer(kAllocUnorderedAccess, 32),
+               wide = e.buffer(kAllocUnorderedAccess, 40), far = e.buffer(kAllocUnorderedAccess, 32), counters = e.buffer(kAllocUnorderedAccess, 16);
+  auto words = [](std::initializer_list<uint32_t> list) {
+    std::vector<uint8_t> out;
+    for (uint32_t w : list)
+      for (uint32_t k = 0; k < 4; ++k) out.push_back(static_cast<uint8_t>(w >> (8 * k)));
+    return out;
+  };
+  auto read = [&](Handle a, uint32_t index) {
+    LockResult lock;
+    if (e.kernel.lock(kPid, a, kLockReadOnly, 0, &lock) != status::kSuccess) return 0xDEADDEADu;
+    ByteReader in(lock.data);
+    in.skip(uint64_t{index} * 4);
+    const uint32_t v = in.le32();
+    e.kernel.unlock(kPid, a);
+    return v;
+  };
+  auto reset = [&]() {
+    const std::vector<uint8_t> values = words({100, 101, 102, 103, 104, 105, 106, 107}), raw = words({1000, 1001, 1002, 1003, 1004, 1005, 1006, 1007}), start = words({0, 6, 0, 0});
+    return e.fill(appended, 0) && e.fill(counted, 0) && e.fill(wide, 0) && e.write(consumed, ConstByteView(values.data(), values.size())) &&
+           e.write(far, ConstByteView(raw.data(), raw.size())) && e.write(counters, ConstByteView(start.data(), start.size()));
+  };
+  auto check = [&](const char* what) {
+    int wrong = 0;
+    for (uint32_t k = 0; k < 6; ++k) wrong += read(appended, k * 2) != 105 - k || read(appended, k * 2 + 1) != k;   // (the threads in order: each took the last value left)
+    for (uint32_t k = 0; k < 8; ++k) wrong += read(counted, k) != k * 3 + 1 || read(wide, k) != 1007 + k;
+    wrong += read(wide, 8) != 32 || read(wide, 9) != 8;   // (bufinfo: the raw view's bytes, the structured view's structures)
+    wrong += read(counters, 0) != 6 || read(counters, 1) != 0 || read(counters, 2) != 8;
+    if (wrong) std::printf("  counters (%s): %d wrong\n", what, wrong);
+    CHECK(wrong == 0);
+  };
+  const uint32_t c = graphics::kCounterSlotBase;
+  auto bind_all = [&](CommandWriter& w) {
+    w.bind_pipeline(pipe);
+    w.bind_uav(0, 0, 0, 64), w.bind_uav(1, 1, 0, 32), w.bind_uav(2, 2, 0, 32), w.bind_uav(60, 3, 0, 40), w.bind_uav(graphics::kMaxUavBuffers + 100, 4, 0, 32);
+    w.bind_uav(c + 0, 5, 0, 4), w.bind_uav(c + 1, 5, 4, 4), w.bind_uav(c + 2, 5, 8, 4);
+  };
+  auto run = [&](auto build) {
+    CommandWriter w(e.allocator);
+    build(w);
+    return w.ok() ? e.render(w, {appended, consumed, counted, wide, far, counters}) : status::kNoMemory;
+  };
+  CHECK(reset());
+  CHECK(run([&](CommandWriter& w) { bind_all(w); w.dispatch(1); }) == status::kSuccess);
+  check("bound");
+  // (a counter left unbound refuses the dispatch)
+  {
+    CommandWriter w(e.allocator);
+    w.bind_pipeline(pipe);
+    w.bind_uav(0, 0, 0, 64), w.bind_uav(1, 1, 0, 32), w.bind_uav(2, 2, 0, 32), w.bind_uav(60, 3, 0, 40), w.bind_uav(graphics::kMaxUavBuffers + 100, 4, 0, 32);
+    w.bind_uav(c + 0, 5, 0, 4), w.bind_uav(c + 1, 5, 4, 4);
+    w.dispatch(1);
+    CHECK(e.render(w, {appended, consumed, counted, wide, far, counters}) == status::kInvalidParameter);
+  }
+
+  // Through a root signature: u0 .. u2 descriptors with counters (words of one buffer), u60 and t100 descriptors of their own ranges.
+  CHECK(reset());
+  const std::vector<uint8_t> blob = serialize_signature(1, {{0, 0, {{1, 3, 0, 0, 0}, {1, 1, 60, 0, 3}, {0, 1, 100, 0, 4}}}});
+  Handle sig = 0, views = 0;
+  CHECK(e.kernel.create_root_signature(kPid, e.dev, ConstByteView(blob.data(), blob.size()), &sig) == status::kSuccess);
+  CHECK(e.kernel.create_descriptor_heap(kPid, e.dev, DescriptorHeapType::CbvSrvUav, 5, &views) == status::kSuccess);
+  auto view = [&](uint32_t index, DescriptorKind kind, Handle a, uint64_t size, Handle counter, uint64_t counter_offset) {
+    DescriptorDesc d;
+    d.kind = kind, d.allocation = a, d.size = size, d.counter = counter, d.counter_offset = counter_offset;
+    return e.kernel.write_descriptor(kPid, views, index, d);
+  };
+  CHECK(view(0, DescriptorKind::Uav, appended, 64, counters, 0) == status::kSuccess && view(1, DescriptorKind::Uav, consumed, 32, counters, 4) == status::kSuccess &&
+        view(2, DescriptorKind::Uav, counted, 32, counters, 8) == status::kSuccess && view(3, DescriptorKind::Uav, wide, 40, 0, 0) == status::kSuccess &&
+        view(4, DescriptorKind::Srv, far, 32, 0, 0) == status::kSuccess);
+  // (counters refused: misaligned, past the end, of a shader resource view, of a buffer shaders cannot write)
+  const Handle vertices = e.buffer(kAllocVertexBuffer, 64);
+  CHECK(view(2, DescriptorKind::Uav, counted, 32, counters, 2) == status::kInvalidParameter);
+  CHECK(view(2, DescriptorKind::Uav, counted, 32, counters, 16) == status::kInvalidParameter);
+  CHECK(view(4, DescriptorKind::Srv, far, 32, counters, 0) == status::kInvalidParameter);
+  CHECK(view(2, DescriptorKind::Uav, counted, 32, vertices, 0) == status::kInvalidParameter);
+  CHECK(run([&](CommandWriter& w) {
+          w.set_root_signature(sig);
+          w.set_descriptor_heaps({views});
+          w.set_root_table(0, 0);
+          w.bind_pipeline(pipe);
+          w.dispatch(1);
+        }) == status::kSuccess);
+  check("table");
+  // (a view without a counter where the shader counts is refused)
+  CHECK(view(2, DescriptorKind::Uav, counted, 32, 0, 0) == status::kSuccess);
+  CHECK(run([&](CommandWriter& w) {
+          w.set_root_signature(sig);
+          w.set_descriptor_heaps({views});
+          w.set_root_table(0, 0);
+          w.bind_pipeline(pipe);
+          w.dispatch(1);
+        }) == status::kInvalidParameter);
+}
+
+// Unordered access views in a vertex shader (Direct3D 11.1's UAVs at every stage): it counts its vertices into a typed view and keeps their positions in a structured one.
+void test_vertex_uav_kernel() {
+  Env e;
+  namespace b = conformance_blobs;
+  const std::vector<uint8_t> code = read_blob("vs_uav.dxbc");
+  Handle vs = 0, ps = 0, pipe = 0;
+  ShaderDesc sd;
+  sd.kind = ShaderKind::Dxbc, sd.stage = graphics::ShaderStage::Vertex, sd.code = ConstByteView(code.data(), code.size());
+  CHECK(!code.empty() && e.kernel.create_shader(kPid, e.dev, sd, &vs) == status::kSuccess);
+  const std::vector<uint8_t> pcode = read_blob("ps_color.dxbc");
+  sd.stage = graphics::ShaderStage::Fragment, sd.code = ConstByteView(pcode.data(), pcode.size());
+  CHECK(!pcode.empty() && e.kernel.create_shader(kPid, e.dev, sd, &ps) == status::kSuccess);
+  (void)b::k_vs;
+  PipelineDesc pd;
+  pd.vertex_shader = vs, pd.fragment_shader = ps, pd.vertex_stride = 16, pd.attribute_count = 1, pd.varying_count = 1;
+  pd.attributes[0] = {0, graphics::VertexFormat::Float4, 0};
+  pd.cull_mode = graphics::CullMode::None;
+  const NtStatus made = e.kernel.create_pipeline(kPid, e.dev, pd, &pipe);
+  CHECK(made == status::kSuccess);
+  if (made != status::kSuccess) return;
+  const Handle target = e.alloc(kTarget, Format::A8R8G8B8, 8, 8), vb = e.buffer(kAllocVertexBuffer, 48), seen = e.buffer(kAllocUnorderedAccess, 16), positions = e.buffer(kAllocUnorderedAccess, 48);
+  const float tri[12] = {-1, -1, 0.5f, 1, 3, -1, 0.5f, 1, -1, 3, 0.5f, 1};
+  CHECK(e.write(vb, floats(tri, 12)) && e.fill(seen, 0) && e.fill(positions, 0));
+  CommandWriter w(e.allocator);
+  w.begin_pass(0, kNoAllocation, kPassClearColor, {0, 0, 0, 1}, 1, 0);
+  w.bind_texel_buffer(1, 2, 0, 4, graphics::TexelFormat::R32Uint);
+  w.bind_uav(2, 3, 0, 48);
+  w.bind_pipeline(pipe);
+  w.bind_vertex_buffer(1);
+  w.draw(3);
+  w.end_pass();
+  CHECK(e.render(w, {target, vb, seen, positions}) == status::kSuccess);
+  LockResult lock;
+  CHECK(e.kernel.lock(kPid, seen, kLockReadOnly, 0, &lock) == status::kSuccess);
+  CHECK(ByteReader(lock.data).le32() == 3);
+  e.kernel.unlock(kPid, seen);
+  CHECK(e.kernel.lock(kPid, positions, kLockReadOnly, 0, &lock) == status::kSuccess);
+  ByteReader in(lock.data);
+  int wrong = 0;
+  for (float v : tri) wrong += __builtin_bit_cast(float, in.le32()) != v;
+  e.kernel.unlock(kPid, positions);
+  CHECK(wrong == 0);
+  // The TGSI of the shader: its typed view is IMAGE[0] of a buffer with the marks the device fills in, the structured one BUFFER[0].
+  UniquePointer<D3d9Program> program;
+  CHECK(D3d9Program::compile_dxbc(e.allocator, ConstByteView(code.data(), code.size()), &program) == status::kSuccess);
+  String text(e.allocator);
+  graphics::TgsiBindings bindings;
+  CHECK(program && program->emit_tgsi(&text, graphics::kMaxVaryings, &bindings) == status::kSuccess);
+  CHECK(bindings.image_count == 1 && bindings.images[0] == 1 && bindings.storage_count == 1 && bindings.storage[0] == 2);
+  CHECK(text.view().find("DCL IMAGE[0], BUFFER, IMGFMT0, WR") != StringView::npos && text.view().find("IMGOFS0") != StringView::npos && text.view().find("IMGLEN0") != StringView::npos);
+}
+
+
 // Views of buffers in a draw through a root signature: the root descriptor (t0) and a table entry (t1) reach the pixel shader, and the picture is the one a direct bind gives.
 void test_d3d12_buffer_views_in_draw() {
   Env e;
@@ -8558,6 +8865,9 @@ int main() {
   test_compute();
   test_compute_kernel();
   test_storage_images_kernel();
+  test_texel_buffers_kernel();
+  test_uav_counters_kernel();
+  test_vertex_uav_kernel();
   test_layered_pass_kernel();
   test_multisample();
   test_geometry_kernel();

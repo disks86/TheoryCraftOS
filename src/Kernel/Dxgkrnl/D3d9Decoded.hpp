@@ -56,6 +56,10 @@ enum Opcode : uint16_t {
   // words), kBufStore (dst.mask: how many words; src[2] the value), kBufAtomic / kBufImmAtomic (src[0] the address, src[1] the operand; the second also writes the old value to dst). The
   // buffer is `uav`; `stride` is 0 for a raw buffer (byte address) and the structure size for a structured one; an atomic's kind is `control` (AtomicKind).
   kBufLoad = 0x1400, kBufStore, kBufAtomic, kBufImmAtomic,
+  // The hidden counter of an append, consume or counter view (imm_atomic_alloc / imm_atomic_consume): `uav` is its storage slot (graphics::kCounterSlotBase + n), control 0 increments and
+  // gives the value before, 1 decrements and gives the value after. kBufInfo (bufinfo): the size of a buffer view - the bytes of a raw one, the structures of a structured one (control 0:
+  // `uav` a storage slot), the elements of a typed one (control 1: `uav` an image slot).
+  kBufCounter, kBufInfo,
   // Storage images (typed unordered access views of textures): kImgLoad (dst; src[0] the integer coordinate as the image's dimension has it - x, x and layer, x y, x y and layer or slice;
   // tex_swizzle picks the components), kImgStore (src[0] the coordinate, src[1] the value), kImgAtomic / kImgImmAtomic (src[0] the coordinate, src[1] the operand, src[2] the compare
   // value of a compare-exchange; the second writes the old value to dst; `control` the AtomicKind), kImgSize (resinfo of a u#: dst, src[0] the level; control as kTexSize's). The image
@@ -116,7 +120,7 @@ struct D3d9Program::Instruction {
   uint8_t control = 0;
   bool mask_result = false;   // seq / sne / slt / sge of a Shader Model 4 shader: all ones for true (not 1.0), as its integer instructions and movc read them
   bool vector = false;   // rsq / exp / log of a Shader Model 4 shader: per component, not from x
-  uint8_t uav = 0;       // kBufLoad ..: the storage buffer slot
+  uint16_t uav = 0;      // kBufLoad ..: the storage buffer slot (kImgLoad ..: the image slot)
   uint32_t stride = 0;
   uint8_t tex_swizzle[4] = {0, 1, 2, 3};   // texld: which texel component each result component takes
   int8_t texel_offset[2] = {0, 0};          // gather4: the static offset of the footprint, in texels (the extended opcode token's)
