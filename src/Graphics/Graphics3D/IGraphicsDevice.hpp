@@ -1174,10 +1174,10 @@ enum DeviceFeature2 : uint32_t {
   kFeature2SamplerState = 1u << 11,         // SamplerDesc::max_anisotropy and custom_border / border_rgba
   kFeature2Viewports = 1u << 12,            // ICommandBuffer::set_viewports / set_scissors and ShaderIo::viewport from geometry shaders
   kFeature2LayerFromAnyStage = 1u << 13,    // ShaderIo::layer and ShaderIo::viewport written by vertex and domain shaders (Direct3D 11.3's VPAndRTArrayIndexFromAnyShaderFeedingRasterizer)
-  kFeature2SeparateFilters = 1u << 24,      // SamplerDesc::separate_mag / mag_filter: a magnification filter apart from the minification one (Direct3D's MIN_POINT_MAG_LINEAR ...)
-  kFeature2SamplerReductions = 1u << 25,    // SamplerDesc::reduction Minimum / Maximum (Direct3D's MINIMUM_* / MAXIMUM_* filters)
-  kFeature2UnnormalizedCoordinates = 1u << 26,   // SamplerDesc::unnormalized: coordinates in texels (Direct3D 12's D3D12_SAMPLER_FLAG_NON_NORMALIZED_COORDINATES)
-  kFeature2LineModes = 1u << 27,            // GraphicsPipelineDesc::line_mode other than Aliased: alpha-antialiased lines and quadrilateral lines of 1.4 and 1.0 pixels
+  kFeature2SeparateFilters = 1u << 18,      // SamplerDesc::separate_mag / mag_filter: a magnification filter apart from the minification one (Direct3D's MIN_POINT_MAG_LINEAR ...)
+  kFeature2SamplerReductions = 1u << 19,    // SamplerDesc::reduction Minimum / Maximum (Direct3D's MINIMUM_* / MAXIMUM_* filters)
+  kFeature2UnnormalizedCoordinates = 1u << 20,   // SamplerDesc::unnormalized: coordinates in texels (Direct3D 12's D3D12_SAMPLER_FLAG_NON_NORMALIZED_COORDINATES)
+  kFeature2LineModes = 1u << 21,            // GraphicsPipelineDesc::line_mode other than Aliased: alpha-antialiased lines and quadrilateral lines of 1.4 and 1.0 pixels
 };
 // The features a sampler needs beyond the base ones (kFeature2SeparateFilters, ..; 0 for one every device takes).
 constexpr uint32_t sampler_features2(const SamplerDesc& s) {

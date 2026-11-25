@@ -6700,12 +6700,12 @@ static void test_line_modes(Scene *c) {
     CHECK_HR(ID3D12Device_QueryInterface(c->dev, &IID_ID3D12Device2, (void **)&dev2));
     if (dev2) {
       struct {
-        struct { D3D12_PIPELINE_STATE_SUBOBJECT_TYPE t; ID3D12RootSignature *v; } __attribute__((aligned(8))) rs;
-        struct { D3D12_PIPELINE_STATE_SUBOBJECT_TYPE t; D3D12_SHADER_BYTECODE v; } __attribute__((aligned(8))) vs, ps;
-        struct { D3D12_PIPELINE_STATE_SUBOBJECT_TYPE t; D3D12_INPUT_LAYOUT_DESC v; } __attribute__((aligned(8))) il;
-        struct { D3D12_PIPELINE_STATE_SUBOBJECT_TYPE t; D3D12_PRIMITIVE_TOPOLOGY_TYPE v; } __attribute__((aligned(8))) topology;
-        struct { D3D12_PIPELINE_STATE_SUBOBJECT_TYPE t; struct D3D12_RT_FORMAT_ARRAY v; } __attribute__((aligned(8))) rt;
-        struct { D3D12_PIPELINE_STATE_SUBOBJECT_TYPE t; D3D12_RASTERIZER_DESC2 v; } __attribute__((aligned(8))) raster;
+        struct { D3D12_PIPELINE_STATE_SUBOBJECT_TYPE t; ID3D12RootSignature *v; } __attribute__((aligned(sizeof(void *)))) rs;
+        struct { D3D12_PIPELINE_STATE_SUBOBJECT_TYPE t; D3D12_SHADER_BYTECODE v; } __attribute__((aligned(sizeof(void *)))) vs, ps;
+        struct { D3D12_PIPELINE_STATE_SUBOBJECT_TYPE t; D3D12_INPUT_LAYOUT_DESC v; } __attribute__((aligned(sizeof(void *)))) il;
+        struct { D3D12_PIPELINE_STATE_SUBOBJECT_TYPE t; D3D12_PRIMITIVE_TOPOLOGY_TYPE v; } __attribute__((aligned(sizeof(void *)))) topology;
+        struct { D3D12_PIPELINE_STATE_SUBOBJECT_TYPE t; struct D3D12_RT_FORMAT_ARRAY v; } __attribute__((aligned(sizeof(void *)))) rt;
+        struct { D3D12_PIPELINE_STATE_SUBOBJECT_TYPE t; D3D12_RASTERIZER_DESC2 v; } __attribute__((aligned(sizeof(void *)))) raster;
       } st;
       memset(&st, 0, sizeof st);
       st.rs.t = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, st.rs.v = c->rs;

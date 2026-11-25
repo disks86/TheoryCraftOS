@@ -65,7 +65,7 @@ typedef struct FormatInfo {
  * the maximum), so an R8 / R8G8 / R16 / R16G16 view of it samples what Direct3D says it does; render targets of these formats write their channels only (pso.inc). */
 /* NARROW_R1: R1_UNORM, a bit a pixel (the first of a row the most significant bit of its first byte), which the kernel keeps as bytes of 0 or 255 in red - its R8Unorm image, or
  * widened into A8B8G8R8 - and its copies pack and unpack (NarrowLayout::R1); `bytes` is 1, a row's bytes are (width + 7) / 8 (format_row_bytes). */
-enum { NARROW_NONE, NARROW_R8, NARROW_R8G8, NARROW_R16, NARROW_R16G16, NARROW_R1 };
+enum { NARROW_NONE, NARROW_R8, NARROW_R8G8, NARROW_R16, NARROW_R16G16, NARROW_R1 = 9 };
 enum { PLANAR_NONE, PLANAR_8, PLANAR_16, PLANAR_P208, PLANAR_V208, PLANAR_V408 };
 
 static const FormatInfo g_formats[] = {
@@ -353,10 +353,10 @@ struct Dev {
 #define DEV_FEATURE2_SAMPLER_STATE (1u << 11)            /* anisotropy, border colours of any value */
 #define DEV_FEATURE2_VIEWPORTS (1u << 12)                /* sixteen viewports and scissor rectangles, SV_ViewportArrayIndex from geometry shaders */
 #define DEV_FEATURE2_LAYER_ANY_STAGE (1u << 13)          /* SV_RenderTargetArrayIndex and SV_ViewportArrayIndex from vertex and domain shaders */
-#define DEV_FEATURE2_SEPARATE_FILTERS (1u << 24)         /* graphics::kFeature2SeparateFilters: minification and magnification filters of their own (MIN_POINT_MAG_LINEAR ...) */
-#define DEV_FEATURE2_SAMPLER_REDUCTIONS (1u << 25)       /* graphics::kFeature2SamplerReductions: the MINIMUM_ and MAXIMUM_ filters */
-#define DEV_FEATURE2_UNNORMALIZED_COORDINATES (1u << 26) /* graphics::kFeature2UnnormalizedCoordinates: samplers with D3D12_SAMPLER_FLAG_NON_NORMALIZED_COORDINATES */
-#define DEV_FEATURE2_LINE_MODES (1u << 27)               /* graphics::kFeature2LineModes: alpha-antialiased and quadrilateral lines (the CreatePipeline part 'LIN1') */
+#define DEV_FEATURE2_SEPARATE_FILTERS (1u << 18)         /* graphics::kFeature2SeparateFilters: minification and magnification filters of their own (MIN_POINT_MAG_LINEAR ...) */
+#define DEV_FEATURE2_SAMPLER_REDUCTIONS (1u << 19)       /* graphics::kFeature2SamplerReductions: the MINIMUM_ and MAXIMUM_ filters */
+#define DEV_FEATURE2_UNNORMALIZED_COORDINATES (1u << 20) /* graphics::kFeature2UnnormalizedCoordinates: samplers with D3D12_SAMPLER_FLAG_NON_NORMALIZED_COORDINATES */
+#define DEV_FEATURE2_LINE_MODES (1u << 21)               /* graphics::kFeature2LineModes: alpha-antialiased and quadrilateral lines (the CreatePipeline part 'LIN1') */
 /* What allocations of a kernel format numbered from KF_FIRST_EXTRA may be on the device's adapter (KFC_* bits; 0 for any other format, or from a kernel that has no table) */
 static UINT dev_format_caps(const Dev *d, UINT kf) {
   const KmtCaps *c = &d->caps;

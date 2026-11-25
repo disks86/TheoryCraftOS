@@ -2495,7 +2495,7 @@ static HRESULT STDMETHODCALLTYPE dev_CreateSamplerState(Dev *d, const D3D11_SAMP
   if (((UINT)desc->Filter >> 7 & 3u) >= 2) {
     UINT features2 = 0;
     TcosD3D12DeviceFeatures(d->d12, NULL, &features2);
-    if (!(features2 & (1u << 25))) return E_INVALIDARG;
+    if (!(features2 & (1u << 19))) return E_INVALIDARG;      /* (graphics::kFeature2SamplerReductions) */
   }
   D3D11_SAMPLER_DESC key = *desc;
   if (((UINT)desc->Filter & 0x7Fu) != 0x55) key.MaxAnisotropy = 0;

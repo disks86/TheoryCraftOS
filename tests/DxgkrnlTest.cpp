@@ -5610,7 +5610,7 @@ void test_d3d12_copies_and_escapes() {
       Handle bgra = e.alloc(kTexture, Format::A8R8G8B8, 4, 2);
       if (bad == 0) w.copy_buffer_image_narrow(0, 0, 0, 0, 0, 0, 2, 1, 1, 0, 8, NarrowLayout::R8);
       if (bad == 1) w.copy_buffer_image_narrow(0, 2, 0, 0, 0, 0, 2, 1, 1, 0, 8, NarrowLayout::R8);
-      if (bad == 2) w.copy_buffer_image_narrow(0, 3, 0, 0, 0, 0, 2, 1, 1, 0, 8, static_cast<NarrowLayout>(9));
+      if (bad == 2) w.copy_buffer_image_narrow(0, 3, 0, 0, 0, 0, 2, 1, 1, 0, 8, static_cast<NarrowLayout>(0x7F));
       if (bad == 3) w.copy_buffer_image_narrow(0, 3, 0, 0, 0, 0, 4, 1, 1, 0, 6, NarrowLayout::R8G8);
       CHECK(e.render(w, {wide16, n16, bgra, wide8}) == status::kInvalidParameter);
     }

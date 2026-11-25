@@ -261,7 +261,7 @@ static HRESULT STDMETHODCALLTYPE dev_CheckFeatureSupport(Dev *d, D3D11_FEATURE f
       {
         UINT features2 = 0;
         TcosD3D12DeviceFeatures(d->d12, NULL, &features2);
-        ((D3D11_FEATURE_DATA_D3D11_OPTIONS1 *)data)->MinMaxFiltering = (features2 & (1u << 25)) ? TRUE : FALSE;
+        ((D3D11_FEATURE_DATA_D3D11_OPTIONS1 *)data)->MinMaxFiltering = (features2 & (1u << 19)) ? TRUE : FALSE;
       }
       return S_OK;
     }

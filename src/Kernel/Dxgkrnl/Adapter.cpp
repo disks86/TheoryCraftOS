@@ -1265,7 +1265,7 @@ class Adapter::StreamRunner {
   NtStatus copy_buffer_image(ByteReader& p) {
     const uint32_t direction = p.le32(), ii = p.le32(), level = p.le32(), layer = p.le32(), x = p.le32(), y = p.le32(), w = p.le32(), h = p.le32(), bi = p.le32(), boff = p.le32(), pitch = p.le32();
     const uint32_t narrow_word = p.at_end() ? 0 : p.le32();      // (the optional twelfth word)
-    if (!exact(p) || in_pass_ || direction > 1 || w == 0 || h == 0 || narrow_word > static_cast<uint32_t>(NarrowLayout::R1)) return kBad;
+    if (!exact(p) || in_pass_ || direction > 1 || w == 0 || h == 0 || (narrow_word > static_cast<uint32_t>(NarrowLayout::R16G16) && narrow_word != static_cast<uint32_t>(NarrowLayout::R1))) return kBad;
     const NarrowLayout narrow = static_cast<NarrowLayout>(narrow_word);
     Allocation* image = alloc(ii);
     Allocation* buffer = alloc(bi);

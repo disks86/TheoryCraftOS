@@ -234,7 +234,7 @@ constexpr uint32_t kNoAllocation = 0xFFFFFFFFu;
 // CopyBufferImage's last word: how a buffer's pixels are narrower than the image's.
 // R1: a bit a pixel, the first pixel of a row in the most significant bit of its first byte (Direct3D's R1_UNORM), of an R8Unorm image or an A8B8G8R8 / X8B8G8R8 one: copied into the
 // image a pixel becomes 0 or the maximum in red (the widened one's alpha the maximum), out of it a red of at least half is a 1.
-enum class NarrowLayout : uint32_t { None = 0, R8 = 1, R8G8 = 2, R16 = 3, R16G16 = 4, R1 = 5 };
+enum class NarrowLayout : uint32_t { None = 0, R8 = 1, R8G8 = 2, R16 = 3, R16G16 = 4, R1 = 9 };      // (5 .. 8: kept for the layouts of another branch)
 constexpr uint32_t narrow_pixel_bytes(NarrowLayout n) { return n == NarrowLayout::R8 ? 1 : n == NarrowLayout::R8G8 || n == NarrowLayout::R16 ? 2 : n == NarrowLayout::R16G16 ? 4 : 0; }
 constexpr uint32_t kStreamOutputAppendOffset = 0xFFFFFFFFu;   // SetStreamOutput's offset for "after what the last stream output into the buffer wrote"
 // (the longest packets: PushConstants - the byte count, then up to kMaxPushConstantBytes of constants - and a VideoProcess of every stream with both optional parts)

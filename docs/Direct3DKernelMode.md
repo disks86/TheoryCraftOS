@@ -989,7 +989,7 @@ kernel's pipelines, samplers and streams. `graphics::DeviceFeature2` bits say wh
   after each pass or dispatch). A view of another family, or of a typeless format, is a null descriptor. d3d11.dll passes the view's format for such textures (`view_format12`)
   and keeps an `R16_TYPELESS` colour texture typeless (it was R16_UNORM).
 - **`R1_UNORM`**: a bit a pixel, the first pixel of a row the most significant bit of its first byte (as DirectXTex reads it), rows of `(width + 7) / 8` bytes in footprints. The
-  kernel keeps it as bytes of 0 or 255 in red of an `R8Unorm` image (or widened into `A8B8G8R8`), and `CopyBufferImage` with `NarrowLayout::R1` (5) packs and unpacks the bits (a
+  kernel keeps it as bytes of 0 or 255 in red of an `R8Unorm` image (or widened into `A8B8G8R8`), and `CopyBufferImage` with `NarrowLayout::R1` (9) packs and unpacks the bits (a
   red of 128 or more is a 1; bits of the last byte past the width are left as they are). Direct3D 12: 1D and 2D textures, arrays and levels, sampled (as 0 and 1 in red) and
   loaded - no render target, unordered access, volume, cube, tiles, multisampling or CPU-visible memory (`E_INVALIDARG`; the format support says the same); a footprint box
   or place that does not start on a byte is not copied. Direct3D 11 the same (initial data, `UpdateSubresource`, copies; no staging or dynamic texture). Direct3D 10's
