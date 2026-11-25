@@ -219,6 +219,9 @@ class D3d9Program {
   ImageMask image_mask_;
   bool writes_images_ = false;
   bool writes_layer_ = false, writes_viewport_ = false, layer_before_geometry_ = false;
+  // The graphics::DeviceFeature2 bits of what the front end met besides (SV_Barycentrics and GetAttributeAtVertex: kFeature2Barycentrics; SV_ShadingRate read or written:
+  // kFeature2ShadingRate; SV_ViewID needs none: without view instancing it is 0).
+  uint32_t extra_features2_ = 0;
   // The components of their output registers the layer and the viewport are in, and whether the viewport is in the layer's register (both integers packed into one).
   uint8_t layer_component_ = 0, viewport_component_ = 0;
   bool viewport_shares_layer_ = false;

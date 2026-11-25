@@ -463,6 +463,9 @@ struct ShaderIo {
   // The viewport and scissor rectangle the primitive is drawn with (SV_ViewportArrayIndex, kFeature2Viewports; from the same stages): its first vertex's, 0 when that is not below the
   // number set (ICommandBuffer::set_viewports).
   uint32_t viewport = 0;
+  // The shading rate of the primitive (SV_ShadingRate, kFeature2ShadingRate): written by a vertex or geometry shader, a D3D12_SHADING_RATE value (see ShadingRate below); the primitive takes
+  // its first vertex's. It counts only where the combiners of set_shading_rate take it.
+  uint32_t shading_rate = 0;
 };
 
 // --- Storage images (DeviceInfo::features2 kFeature2StorageImages) -----------
@@ -531,18 +534,32 @@ struct VertexContext {
   const ITextureSet* textures = nullptr;   // the textures bound for the draw (kFeatureTexelAccess): a vertex shader reads them at a level it names (no derivatives)
   uint32_t vertex_id = 0;     // the index of the vertex (or its number in a draw without indices), before the base vertex offset is added in
   uint32_t instance_id = 0;
+  uint32_t view_id = 0;       // SV_ViewID (kFeature2ViewInstancing: ICommandBuffer::set_view_instance; 0 without)
 };
 struct FragmentContext {
   const IStorageImages* images = nullptr;   // ... as for the vertex shader
   const ByteView* storage = nullptr;   // ... as for the vertex shader
   bool helper = false;                 // a run made only to learn something about a neighbour (the level of detail, a derivative): it writes no buffer
+  // The pixel's centre - with coarse shading (kFeature2ShadingRate) the coarse pixel's, whose size `shading_rate` says (a ShadingRate value, 0 when each pixel is shaded) -, its depth
+  // and 1 / w there.
   Vec4 position;
   bool front_facing = true;
   uint32_t primitive_id = 0;
+  uint32_t view_id = 0;        // SV_ViewID (kFeature2ViewInstancing)
+  uint32_t shading_rate = 0;   // SV_ShadingRate (kFeature2ShadingRate)
+  // Barycentrics (kFeature2Barycentrics): the weights of the primitive's three vertices, in the order the draw gave them (SV_Barycentrics), at the shaded point - perspective-correct, and
+  // linear in the screen (noperspective) -, and the varyings of those vertices as their last stage before the rasterizer made them (GetAttributeAtVertex). A line has (1 - t, t, 0) and
+  // its second vertex in the third place too, a point (1, 0, 0) and its vertex in all three. Null pointers where the device gives none.
+  Vec4 barycentrics = {1, 0, 0, 0};
+  Vec4 barycentrics_linear = {1, 0, 0, 0};
+  const Vec4* vertex_varyings[3] = {};
   // Derivatives (ddx / ddy): the pixel is one of the four of a 2 x 2 quad (`quad_corner`: x & 1 | (y & 1) << 1), and `quad_fn` gives the varyings and the position of any corner, at its
   // pixel's centre, extended out of the primitive if it is not covered. A shader asks only when it takes a derivative; without the function (points, lines) the derivatives are zero.
+  // (With coarse shading the quad is one of coarse pixels.) `quad_bary_fn`, when there is one, gives the barycentrics of a corner: perspective-correct, then linear.
   using QuadFn = void (*)(const void* user, uint32_t corner, Vec4* varyings, Vec4* position);
+  using QuadBaryFn = void (*)(const void* user, uint32_t corner, Vec4* barycentrics);
   QuadFn quad_fn = nullptr;
+  QuadBaryFn quad_bary_fn = nullptr;
   const void* quad_user = nullptr;
   uint32_t quad_corner = 0;
 };
@@ -573,6 +590,7 @@ struct GeometryInputData {
   Vec4 varying[kMaxGeometryInputVertices][kMaxVaryings];
   uint32_t primitive_id = 0;   // the number of the primitive in the draw
   uint32_t instance_id = 0;    // SV_GSInstanceID: which of the shader's instances this run is (it runs geometry_instances times for each primitive)
+  uint32_t view_id = 0;        // SV_ViewID (kFeature2ViewInstancing)
 };
 struct GeometryOutputData {
   uint32_t count = 0;
@@ -597,12 +615,14 @@ struct HullInputData {
   const IStorageImages* images = nullptr;   // (kFeature2StorageImagesAllStages)
   uint32_t control_points = 0;
   uint32_t primitive_id = 0;
+  uint32_t view_id = 0;        // SV_ViewID (kFeature2ViewInstancing)
   Vec4 position[kMaxPatchControlPoints];
   Vec4 varying[kMaxPatchControlPoints][kMaxVaryings];
 };
 struct HullOutputData {
   const ByteView* storage = nullptr;                // (the domain shader's views of buffers: the draw's)
   const IStorageImages* images = nullptr;           // (and its storage images, kFeature2StorageImagesAllStages)
+  uint32_t view_id = 0;                             // (and SV_ViewID, kFeature2ViewInstancing)
   ShaderIo control_point[kMaxPatchControlPoints];   // the output control points
   Vec4 patch[kMaxPatchRegisters];                   // the patch constant registers (the tessellation factors are in the x of theirs)
   float outer[4] = {};                              // edge factors (triangle: the u = 0, v = 0 and w = 0 edges; quad: u = 0, v = 0, u = 1, v = 1; isoline: line density, line detail)
@@ -978,6 +998,54 @@ struct Viewport {
   float min_depth = 0, max_depth = 1;
 };
 
+// Where a sample of a pixel is (kFeature2SamplePositions): sixteenths of a pixel from its centre, -8 .. 7 each way (+y down), as D3D12_SAMPLE_POSITION.
+struct SamplePosition {
+  int8_t x = 0, y = 0;
+};
+constexpr uint32_t kMaxSamplePositions = 16;   // (the most a set_sample_positions call carries: samples x pixels)
+
+// Coarse pixel shading (kFeature2ShadingRate). A rate is D3D12_SHADING_RATE: (x axis << 2) | y axis, an axis 0 for 1 pixel, 1 for 2, 2 for 4 (0x0 1x1, 0x1 1x2, 0x4 2x1, 0x5 2x2,
+// 0x6 2x4, 0x9 4x2, 0xA 4x4). The rate of a pixel is combiner 1 of (combiner 0 of (the rate set, the primitive's), the image's): a combiner is D3D12_SHADING_RATE_COMBINER, applied to each
+// axis (passthrough keeps the first, override takes the second, min, max, sum - the axes added, at most 4x). A rate the samples of the pass do not allow is made smaller: with two or more
+// samples an axis is at most 2x, 4x of the other axis only with two, and a coarse pixel never covers more than 16 samples. The coarse pixels lie on a grid from the target's origin, inside
+// the tiles of the shading-rate image (kShadingRateTileSize pixels square), one rate a tile for each primitive.
+enum class ShadingRateCombiner : uint8_t { Passthrough = 0, Override = 1, Min = 2, Max = 3, Sum = 4 };
+constexpr uint32_t kShadingRateTileSize = 16;
+constexpr bool valid_shading_rate(uint32_t rate) { return rate == 0x0 || rate == 0x1 || rate == 0x4 || rate == 0x5 || rate == 0x6 || rate == 0x9 || rate == 0xA; }
+constexpr uint32_t shading_rate_x(uint32_t rate) { return 1u << (rate >> 2 & 3); }   // (the coarse pixel's width in pixels)
+constexpr uint32_t shading_rate_y(uint32_t rate) { return 1u << (rate & 3); }
+// One combiner on two rates (each axis; an invalid rate counts as 1x1).
+constexpr uint32_t combine_shading_rate(ShadingRateCombiner c, uint32_t a, uint32_t b) {
+  if (!valid_shading_rate(a)) a = 0;
+  if (!valid_shading_rate(b)) b = 0;
+  const uint32_t ax = a >> 2 & 3, ay = a & 3, bx = b >> 2 & 3, by = b & 3;
+  uint32_t x = ax, y = ay;
+  switch (c) {
+    case ShadingRateCombiner::Passthrough: break;
+    case ShadingRateCombiner::Override: x = bx, y = by; break;
+    case ShadingRateCombiner::Min: x = ax < bx ? ax : bx, y = ay < by ? ay : by; break;
+    case ShadingRateCombiner::Max: x = ax > bx ? ax : bx, y = ay > by ? ay : by; break;
+    case ShadingRateCombiner::Sum: x = ax + bx > 2 ? 2 : ax + bx, y = ay + by > 2 ? 2 : ay + by; break;
+  }
+  return x << 2 | y;
+}
+// The rate as the pass's `samples` take it (and a combination that is not a rate - 4x1, 1x4 - as the nearest one that is).
+constexpr uint32_t sanitize_shading_rate(uint32_t rate, uint32_t samples) {
+  uint32_t x = rate >> 2 & 3, y = rate & 3;
+  if (x > 2) x = 2;
+  if (y > 2) y = 2;
+  if (samples >= 2 && x > 1) x = 1;                       // (4x across only without multisampling)
+  if (samples >= 4 && y > 1) y = 1;                       // (2x4 only with two samples)
+  while ((1u << x) * (1u << y) * (samples ? samples : 1) > 16) {   // (at most 16 samples a coarse pixel)
+    if (y >= x && y > 0) --y;
+    else if (x > 0) --x;
+    else break;
+  }
+  if (x == 2 && y == 0) x = 1;   // (4x1 and 1x4 are not rates: the finer 2x1 and 1x2)
+  if (y == 2 && x == 0) y = 1;
+  return x << 2 | y;
+}
+
 // The queries one command buffer can hold (kFeatureOcclusionQueries): slots 0 .. kMaxOcclusionQueries - 1.
 constexpr uint32_t kMaxOcclusionQueries = 256;
 
@@ -1034,6 +1102,22 @@ class ICommandBuffer {
   virtual void set_scissors(ArrayView<const Rect2D> scissors) {
     if (!scissors.empty()) set_scissor(scissors[0]);
   }
+  // The state below holds for the draws that follow until it is set again, across passes; begin() sets the defaults. A device without the feature ignores the call.
+  // Depth bounds (kFeature2DepthBounds): with `enable` a sample whose depth buffer value (before the draw) is outside min .. max is not drawn - no shader result, depth or stencil is
+  // written for it, and an occlusion query does not count it -; a pass without a depth buffer passes every sample. Default: off, 0 .. 1.
+  virtual void set_depth_bounds(bool enable, float min, float max) { (void)enable, (void)min, (void)max; }
+  // Sample positions (kFeature2SamplePositions): `samples` (1, 2, 4, 8 or 16) positions for each of `pixels` pixels - 1: every pixel has the same; 4: the pixels of each 2 x 2 quad
+  // aligned to even coordinates, upper left, upper right, lower left, lower right - in place of the standard ones, for triangles' coverage and the depth at each sample. `samples` must be
+  // the pass's samples (a single-sample pass then covers a pixel by its one sample's position). pixels 0: the standard positions again.
+  virtual void set_sample_positions(uint32_t samples, uint32_t pixels, ArrayView<const SamplePosition> positions) { (void)samples, (void)pixels, (void)positions; }
+  // View instancing (kFeature2ViewInstancing): the view the draws that follow make, which every stage reads as SV_ViewID, and what is added (as 32-bit unsigned numbers, wrapping) to the
+  // viewport and the layer of each primitive (ShaderIo::viewport / layer: 0 when the shaders write neither). Default: view 0, nothing added.
+  virtual void set_view_instance(uint32_t view_id, uint32_t viewport_offset, uint32_t layer_offset) { (void)view_id, (void)viewport_offset, (void)layer_offset; }
+  // Coarse pixel shading (kFeature2ShadingRate, see ShadingRate above): the rate set and the two combiners. Default: 1x1, passthrough, passthrough.
+  virtual void set_shading_rate(uint32_t rate, ShadingRateCombiner primitive, ShadingRateCombiner image) { (void)rate, (void)primitive, (void)image; }
+  // ... and the shading-rate image (an R8Uint image of one level and one sample, kImageSampled; nullptr: none, 1x1 everywhere): texel (x, y) is the rate of the tile of pixels from
+  // (x, y) * kShadingRateTileSize; a tile past the image's edge is 1x1. It is read when the draws run.
+  virtual void set_shading_rate_image(IImage* image) { (void)image; }
   // Several instances (kFeatureInstancing): the draw is made instance_count times with instance numbers first_instance ..; a device without it draws once.
   virtual void draw(uint32_t vertex_count, uint32_t first_vertex = 0, uint32_t instance_count = 1, uint32_t first_instance = 0) = 0;
   virtual void draw_indexed(uint32_t index_count, uint32_t first_index = 0, int32_t vertex_offset = 0, uint32_t instance_count = 1, uint32_t first_instance = 0) = 0;
@@ -1049,6 +1133,9 @@ class ICommandBuffer {
   virtual void resolve_image(IImage* destination, IImage* source, ResolveMode mode = ResolveMode::Average) {
     (void)destination, (void)source, (void)mode;
   }
+  // Copies `region` of a multisampled image - every sample of each pixel, a depth image's depth and stencil - to (x, y) of another of the same format, sample count and kind (kFeature2SampleCopies),
+  // outside a render pass; both regions inside their images, the two images not the same.
+  virtual void copy_samples(IImage* destination, IImage* source, const Rect2D& region, uint32_t x, uint32_t y) { (void)destination, (void)source, (void)region, (void)x, (void)y; }
   // Compute (kFeatureCompute), outside a render pass: bind_compute_pipeline makes the pipeline of create_compute_pipeline current for the dispatches that follow, bind_storage_buffer
   // puts `size` bytes of a kBufferStorage buffer from `offset` in slot 0 .. kMaxStorageBuffers - 1, and dispatch runs x * y * z thread groups. A device without the feature ignores all three.
   virtual void bind_compute_pipeline(const IPipeline* pipeline) { (void)pipeline; }
@@ -1176,6 +1263,13 @@ enum DeviceFeature2 : uint32_t {
   // IImage::copy_subresource (a whole subresource of a depth image or of a multisampled image into another of the same format, size and samples, on the device). (Bit 24: a high bit,
   // the ones between are left for the other features being added.)
   kFeature2DepthCopies = 1u << 24,
+  // The optional rasterizer features of Direct3D 12 (high bits: the ones below are left for the other features being added).
+  kFeature2DepthBounds = 1u << 30,          // ICommandBuffer::set_depth_bounds (OPTIONS2 DepthBoundsTestSupported)
+  kFeature2SamplePositions = 1u << 25,      // ICommandBuffer::set_sample_positions, one pattern or one for each pixel of a 2 x 2 quad (ProgrammableSamplePositionsTier 2)
+  kFeature2ViewInstancing = 1u << 26,       // ICommandBuffer::set_view_instance: the view id every stage reads (SV_ViewID) and the offsets of the primitives' viewport and layer
+  kFeature2ShadingRate = 1u << 31,          // coarse pixel shading: ICommandBuffer::set_shading_rate / set_shading_rate_image, ShaderIo::shading_rate, FragmentContext::shading_rate (VariableShadingRateTier 2)
+  kFeature2Barycentrics = 1u << 28,         // FragmentContext::barycentrics / barycentrics_linear / vertex_varyings (SV_Barycentrics, GetAttributeAtVertex)
+  kFeature2SampleCopies = 1u << 29,         // ICommandBuffer::copy_samples: a region of a multisampled image, every sample, into another of its format and samples (D3D12_RESOLVE_MODE_DECOMPRESS)
 };
 constexpr uint32_t kMaxViewports = 16;
 

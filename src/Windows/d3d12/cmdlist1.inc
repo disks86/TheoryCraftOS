@@ -20,9 +20,10 @@
  *
  * Done: atomic buffer copies (the queue runs a list's commands one after the other, so a copy of 4 or 8 bytes is atomic), regions resolved with a mode,
  * WriteBufferImmediate, render passes (tier 0: the targets bound, the beginning accesses' clears, the ending accesses' resolves), the enhanced barriers (the
- * kernel's allocations are not state tracked: as ResourceBarrier, nothing to do). The calls of the features CheckFeatureSupport reports at their "not supported"
- * tier - depth bounds, programmable sample positions, view instancing, protected sessions, meta commands, raytracing, variable-rate shading, mesh shaders - are
- * calls a program may not make on this device; they are left out, as Direct3D 12 leaves out an invalid call. */
+ * kernel's allocations are not state tracked: as ResourceBarrier, nothing to do), the depth bounds test, programmable sample positions (tier 2), the view instance
+ * mask (view instancing tier 2: cmdlist.inc draw_views), variable-rate shading (tier 2) and DECOMPRESS - where the adapter has them (the CPU renderer). The calls of the
+ * features CheckFeatureSupport reports at their "not supported" tier - protected sessions, meta commands, raytracing, mesh shaders, and those above on an adapter
+ * without them (virgl) - are calls a program may not make on this device; they are left out, as Direct3D 12 leaves out an invalid call. */
 
 /* ---- ID3D12GraphicsCommandList1 ------------------------------------------------------------------------------------------------------------------------------- */
 
@@ -40,17 +41,112 @@ static void STDMETHODCALLTYPE list_AtomicCopyBufferUINT64(CmdList *l, ID3D12Reso
   keep(l, (IUnknown *)src);
   list_CopyBufferRegion(l, dst, dst_offset, src, src_offset, 8);
 }
-/* (D3D12_FEATURE_DATA_D3D12_OPTIONS2.DepthBoundsTestSupported is FALSE) */
-static void STDMETHODCALLTYPE list_OMSetDepthBounds(CmdList *l, FLOAT min, FLOAT max) { (void)l; (void)min; (void)max; }
-/* (ProgrammableSamplePositionsTier: not supported) */
-static void STDMETHODCALLTYPE list_SetSamplePositions(CmdList *l, UINT samples, UINT pixels, D3D12_SAMPLE_POSITION *positions) { (void)l; (void)samples; (void)pixels; (void)positions; }
-/* (ViewInstancingTier: not supported; a mask of the one view is all there is) */
-static void STDMETHODCALLTYPE list_SetViewInstanceMask(CmdList *l, UINT mask) { (void)l; (void)mask; }
+/* ---- the optional rasterizer state: depth bounds, sample positions, view instancing, variable-rate shading ------------------------------------------------------------ */
+/* What the list sets is kept in it and sent to the kernel (its SetDepthBounds, SetSamplePositions, SetShadingRate; SetViewInstance goes with each draw: cmdlist.inc
+ * draw_views) before a draw that needs it, once a chunk for what has not changed. Where the device lacks the feature (OPTIONS2 DepthBoundsTestSupported FALSE,
+ * ProgrammableSamplePositionsTier and VariableShadingRateTier NOT_SUPPORTED: virgl) the calls are ones a program may not make, and are left out, as Direct3D 12 leaves
+ * out an invalid call. */
+static void send_raster_state(CmdList *l) {
+  const UINT features2 = l->d.dev->caps.features2;
+  if (features2 & DEV_FEATURE2_DEPTH_BOUNDS) {
+    /* (the test is the PSO's DepthBoundsTestEnable; the range OMSetDepthBounds') */
+    const UINT w[3] = {l->pso && l->pso->depth_bounds ? 1u : 0u, bits_of(l->depth_bounds[0]), bits_of(l->depth_bounds[1])};
+    if (l->sent_bounds == 0 ? w[0] != 0 : l->sent_bounds == 2 || memcmp(w, l->sent_bounds_words, sizeof w) != 0) {
+      packet(l, OP_SET_DEPTH_BOUNDS, w, 3);
+      memcpy(l->sent_bounds_words, w, sizeof w);
+      l->sent_bounds = 1;
+    }
+  }
+  if ((features2 & DEV_FEATURE2_SAMPLE_POSITIONS) && !l->sent_positions) {
+    UINT w[2 + 16];
+    const UINT n = l->sample_count_set * l->sample_pixels;
+    w[0] = l->sample_count_set, w[1] = l->sample_pixels;
+    for (UINT k = 0; k < n && k < 16; ++k) w[2 + k] = (UINT)(BYTE)l->sample_positions[k].X | (UINT)(BYTE)l->sample_positions[k].Y << 8;
+    packet(l, OP_SET_SAMPLE_POSITIONS, w, 2 + n);      /* (none: the standard positions again, which the stream may have changed) */
+    l->sent_positions = 1;
+  }
+  if (features2 & DEV_FEATURE2_SHADING_RATE) {
+    const UINT w[4] = {l->shading_rate, l->rate_combiners[0], l->rate_combiners[1], l->rate_image && l->rate_image->alloc ? alloc_index(l, l->rate_image->alloc) : 0xFFFFFFFFu};
+    const int plain = w[0] == 0 && w[1] == 0 && w[2] == 0 && w[3] == 0xFFFFFFFFu;
+    if (l->sent_rate == 0 ? !plain : l->sent_rate == 2 || memcmp(w, l->sent_rate_words, sizeof w) != 0) {
+      packet(l, OP_SET_SHADING_RATE, w, 4);
+      memcpy(l->sent_rate_words, w, sizeof w);
+      l->sent_rate = 1;
+    }
+  }
+}
+
+/* The range of the depth bounds test (each 0 .. 1, min at most max; outside that the call is left out), for the PSOs made with DepthBoundsTestEnable. */
+static void STDMETHODCALLTYPE list_OMSetDepthBounds(CmdList *l, FLOAT min, FLOAT max) {
+  { const UINT a = bits_of(min), b = bits_of(max); BUNDLE_LOG(l, B_DEPTH_BOUNDS, a, b); }
+  if (!(l->d.dev->caps.features2 & DEV_FEATURE2_DEPTH_BOUNDS)) return;
+  if (!(min >= 0.0f && min <= 1.0f) || !(max >= 0.0f && max <= 1.0f) || min > max) return;
+  l->depth_bounds[0] = min;
+  l->depth_bounds[1] = max;
+}
+/* Programmable sample positions, tier 2: NumSamplesPerPixel 1, 2, 4, 8 or 16 positions for each of NumPixels 1 or 4 pixels (a 2 x 2 quad, at most 16 positions in all),
+ * each -8 .. 7; (0, 0, NULL) the standard positions again. Anything else is dropped, as Direct3D 12 drops it. A bundle takes its caller's positions and sets none. The
+ * sample count must be the PSO's at the draw (the device uses the standard positions where it is not). */
+static void STDMETHODCALLTYPE list_SetSamplePositions(CmdList *l, UINT samples, UINT pixels, D3D12_SAMPLE_POSITION *positions) {
+  if (l->bundle || l->type != D3D12_COMMAND_LIST_TYPE_DIRECT || !(l->d.dev->caps.features2 & DEV_FEATURE2_SAMPLE_POSITIONS)) return;
+  if (samples == 0 && pixels == 0) {
+    l->sample_count_set = l->sample_pixels = 0;
+    l->sent_positions = 0;
+    return;
+  }
+  if ((samples != 1 && samples != 2 && samples != 4 && samples != 8 && samples != 16) || (pixels != 1 && pixels != 4) || samples * pixels > 16 || !positions) return;
+  if (samples > 1 && !(l->d.dev->caps.sample_counts >> samples & 1)) return;      /* (a count no target of the device has: no draw can match it) */
+  for (UINT k = 0; k < samples * pixels; ++k)
+    if (positions[k].X < -8 || positions[k].X > 7 || positions[k].Y < -8 || positions[k].Y > 7) return;
+  l->sample_count_set = samples;
+  l->sample_pixels = pixels;
+  memcpy(l->sample_positions, positions, samples * pixels * sizeof positions[0]);
+  l->sent_positions = 0;
+}
+/* The views of the draws that follow for the PSOs made with D3D12_VIEW_INSTANCING_FLAG_ENABLE_VIEW_INSTANCE_MASKING (bit n: view n; 0 when the list is reset). A bundle
+ * starts with a mask of 0 and what it sets stays after it (list_ExecuteBundle). */
+static void STDMETHODCALLTYPE list_SetViewInstanceMask(CmdList *l, UINT mask) {
+  BUNDLE_LOG(l, B_VIEW_MASK, mask);
+  l->view_mask = mask;
+}
+
+/* DECOMPRESS: the region's samples as they are, into another resource of the same format and sample count at (x, y) - what a program does to read part of a depth buffer
+ * drawn with programmable sample positions (SetSamplePositions) without decompressing the whole of it; nothing is compressed here, so it is a copy of every sample, depth and
+ * stencil too (the kernel's ResolveRegion of kResolveCopySamples, the adapter's DEV_FEATURE2_SAMPLE_COPIES; one sample: an ordinary copy). In place - the same subresource, the
+ * region where it is - there is nothing to do. */
+static void resolve_decompress(CmdList *l, ID3D12Resource *dst, UINT dst_sub, UINT x, UINT y, ID3D12Resource *src, UINT src_sub, const D3D12_RECT *rect) {
+  Resource *d = (Resource *)dst, *s = (Resource *)src;
+  if (d->desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || s->desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || d->desc.Format != s->desc.Format ||
+      d->desc.SampleDesc.Count != s->desc.SampleDesc.Count || d->planes || s->planes)
+    return;
+  if (src_sub >= res_subresources(s) || dst_sub >= res_subresources(d)) return;
+  const LONG w = (LONG)s->desc.Width, h = (LONG)s->desc.Height;
+  const D3D12_RECT whole_rect = {0, 0, w, h};
+  const D3D12_RECT r = rect ? *rect : whole_rect;
+  if (r.left < 0 || r.top < 0 || r.right > w || r.bottom > h || r.left >= r.right || r.top >= r.bottom) return;
+  const UINT rw = (UINT)(r.right - r.left), rh = (UINT)(r.bottom - r.top);
+  if (d == s && dst_sub == src_sub) return;      /* (in place: the samples are what they are; a region moved within one subresource is not a decompression) */
+  if (s->desc.SampleDesc.Count == 1) {
+    const D3D12_BOX box = {(UINT)r.left, (UINT)r.top, 0, (UINT)r.right, (UINT)r.bottom, 1};
+    D3D12_TEXTURE_COPY_LOCATION to = {dst, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, {.SubresourceIndex = dst_sub}};
+    D3D12_TEXTURE_COPY_LOCATION from = {src, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, {.SubresourceIndex = src_sub}};
+    list_CopyTextureRegion(l, &to, x, y, 0, &from, &box);
+    return;
+  }
+  if (!(l->d.dev->caps.features2 & DEV_FEATURE2_SAMPLE_COPIES) || !d->alloc || !s->alloc) return;      /* (an adapter that cannot copy samples: virgl) */
+  if (x > d->desc.Width || rw > d->desc.Width - x || y > d->desc.Height || rh > d->desc.Height - y) return;
+  keep(l, (IUnknown *)dst);
+  keep(l, (IUnknown *)src);
+  end_pass(l);
+  ensure_room(l, 64, 4);
+  const UINT payload[9] = {alloc_index(l, d->alloc), alloc_index(l, s->alloc), 16 /* kResolveCopySamples */, (UINT)r.left, (UINT)r.top, rw, rh, x, y};
+  packet(l, OP_RESOLVE_REGION, payload, 9);
+}
 
 /* A region of a multisampled texture's samples into a subresource of a texture, at (x, y): averaged, or the least or greatest of each pixel's (the kernel's resolve
  * modes). The whole of it at (0, 0) of a plain texture of its size (one level, one layer) is resolved in place. Anything else is resolved into a texture of the
  * source's size first and the region copied from there: straight into a plain texture, or through a buffer of the list's into a level or layer of a texture with
- * several (the kernel copies buffers to any level and layer). DECOMPRESS resolves in place, and nothing is compressed here, so there is nothing to do; the sampler
+ * several (the kernel copies buffers to any level and layer). DECOMPRESS is resolve_decompress's; the sampler
  * feedback modes need SamplerFeedbackTier, which is NOT_SUPPORTED. A call outside the rules (a subresource that is not there, a region outside the source or the
  * destination, a mode the adapter has not) is left out, as Direct3D 12 leaves out an invalid call. */
 static void STDMETHODCALLTYPE list_ResolveSubresourceRegion(CmdList *l, ID3D12Resource *dst, UINT dst_sub, UINT x, UINT y, ID3D12Resource *src, UINT src_sub, D3D12_RECT *rect,
@@ -58,7 +154,7 @@ static void STDMETHODCALLTYPE list_ResolveSubresourceRegion(CmdList *l, ID3D12Re
   Resource *d = (Resource *)dst, *s = (Resource *)src;
   (void)format;      /* (the resources' own formats: a typeless resource is not made here) */
   if (!d || !s || l->bundle) return;
-  if (mode == D3D12_RESOLVE_MODE_DECOMPRESS) return;
+  if (mode == D3D12_RESOLVE_MODE_DECOMPRESS) { resolve_decompress(l, dst, dst_sub, x, y, src, src_sub, rect); return; }
   if (mode != D3D12_RESOLVE_MODE_AVERAGE && mode != D3D12_RESOLVE_MODE_MIN && mode != D3D12_RESOLVE_MODE_MAX) return;
   if (s->desc.SampleDesc.Count < 2 || d->desc.SampleDesc.Count > 1 || d->planes || d->desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D) return;
   if (src_sub >= res_subresources(s) || dst_sub >= res_subresources(d)) return;      /* (a multisampled texture has one subresource here) */
@@ -256,9 +352,29 @@ static void STDMETHODCALLTYPE list_DispatchRays(CmdList *l, const D3D12_DISPATCH
 
 /* ---- ID3D12GraphicsCommandList5, 6, 7 -------------------------------------------------------------------------------------------------------------------------------- */
 
-/* (VariableShadingRateTier: not supported - every pixel is shaded once, which is the 1x1 rate) */
-static void STDMETHODCALLTYPE list_RSSetShadingRate(CmdList *l, D3D12_SHADING_RATE rate, const D3D12_SHADING_RATE_COMBINER *combiners) { (void)l; (void)rate; (void)combiners; }
-static void STDMETHODCALLTYPE list_RSSetShadingRateImage(CmdList *l, ID3D12Resource *image) { (void)l; (void)image; }
+/* Variable-rate shading, tier 2: the base rate and the two combiners (NULL: passthrough, passthrough), and the screen-space image (an R8_UINT 2D texture of one level
+ * and one sample, a byte for each SHADING_RATE_TILE x SHADING_RATE_TILE tile of the target; NULL: none). A rate or combiner that is not one of Direct3D's, or an image of
+ * another kind, is a call left out. The image is read when the list runs, in D3D12_RESOURCE_STATE_SHADING_RATE_SOURCE. */
+static void STDMETHODCALLTYPE list_RSSetShadingRate(CmdList *l, D3D12_SHADING_RATE rate, const D3D12_SHADING_RATE_COMBINER *combiners) {
+  BUNDLE_LOG(l, B_SHADING_RATE, (UINT)rate, combiners ? (UINT)combiners[0] : 0, combiners ? (UINT)combiners[1] : 0);
+  if (!(l->d.dev->caps.features2 & DEV_FEATURE2_SHADING_RATE)) return;
+  const UINT r = (UINT)rate;
+  if (r != 0x0 && r != 0x1 && r != 0x4 && r != 0x5 && r != 0x6 && r != 0x9 && r != 0xA) return;
+  if (combiners && ((UINT)combiners[0] > D3D12_SHADING_RATE_COMBINER_SUM || (UINT)combiners[1] > D3D12_SHADING_RATE_COMBINER_SUM)) return;
+  l->shading_rate = r;
+  l->rate_combiners[0] = combiners ? (UINT)combiners[0] : 0;
+  l->rate_combiners[1] = combiners ? (UINT)combiners[1] : 0;
+}
+static void STDMETHODCALLTYPE list_RSSetShadingRateImage(CmdList *l, ID3D12Resource *image) {
+  keep(l, (IUnknown *)image);
+  BUNDLE_LOG(l, B_SHADING_RATE_IMAGE, (UINT64)(UINT_PTR)image);
+  if (!(l->d.dev->caps.features2 & DEV_FEATURE2_SHADING_RATE)) return;
+  Resource *r = (Resource *)image;
+  if (r && (r->desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || r->desc.Format != DXGI_FORMAT_R8_UINT || r->desc.SampleDesc.Count != 1 || r->mips != 1 ||
+            r->desc.DepthOrArraySize != 1 || !r->alloc))
+    return;
+  l->rate_image = r;
+}
 /* (MeshShaderTier: not supported) */
 static void STDMETHODCALLTYPE list_DispatchMesh(CmdList *l, UINT x, UINT y, UINT z) { (void)l; (void)x; (void)y; (void)z; }
 /* The enhanced barriers. The kernel's allocations are not state tracked (as with ResourceBarrier), so layouts and accesses need no transition, and a layout of

@@ -52,10 +52,10 @@ python3 - "$work/dxfixtures.h" <<'PY'
 import sys
 out = open(sys.argv[1], "w")
 import glob, os
-for path in sorted(glob.glob("tests/data/dxbc/*.dxbc")):
-    n = os.path.basename(path)[:-5]
+for path in sorted(glob.glob("tests/data/dxbc/*.dxbc") + glob.glob("tests/data/dxbc/*.dxil")):      # (dx_<name>_dxbc, dx_<name>_dxil: as tests/d3d12_qemu.sh names them)
+    n = os.path.basename(path).replace(".", "_")
     data = open(path, "rb").read()
-    out.write("static const unsigned char dx_%s_dxbc[] = {%s};\n" % (n, ",".join(str(b) for b in data)))
+    out.write("static const unsigned char dx_%s[] = {%s};\n" % (n, ",".join(str(b) for b in data)))
 PY
 
 programs=("$@")

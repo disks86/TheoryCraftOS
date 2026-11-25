@@ -462,6 +462,10 @@ static void STDMETHODCALLTYPE list_ExecuteBundle(CmdList *l, ID3D12GraphicsComma
   CmdList *b = (CmdList *)bundle;
   if (!b || !b->bundle || !b->closed || l->bundle) return;
   keep(l, (IUnknown *)bundle);
+  /* (the view instance mask: a bundle starts with 0, not its caller's, and the caller has the bundle's last mask after it - its own if the bundle set none) */
+  const UINT caller_mask = l->view_mask;
+  int mask_set = 0;
+  l->view_mask = 0;
   for (UINT i = 0; i < b->nlog; ++i) {
     const LogEntry *e = &b->log[i];
     const UINT64 *a = e->a;
@@ -521,9 +525,23 @@ static void STDMETHODCALLTYPE list_ExecuteBundle(CmdList *l, ID3D12GraphicsComma
       case B_INDIRECT:
         list_ExecuteIndirect(l, (ID3D12CommandSignature *)(UINT_PTR)a[0], (UINT)a[1], (ID3D12Resource *)(UINT_PTR)a[2], a[3], (ID3D12Resource *)(UINT_PTR)a[4], a[5]);
         break;
+      case B_DEPTH_BOUNDS: {
+        float f[2];
+        for (UINT c = 0; c < 2; ++c) { const UINT bits = (UINT)a[c]; memcpy(&f[c], &bits, 4); }
+        list_OMSetDepthBounds(l, f[0], f[1]);
+        break;
+      }
+      case B_VIEW_MASK: list_SetViewInstanceMask(l, (UINT)a[0]); mask_set = 1; break;
+      case B_SHADING_RATE: {
+        const D3D12_SHADING_RATE_COMBINER c[2] = {(D3D12_SHADING_RATE_COMBINER)a[1], (D3D12_SHADING_RATE_COMBINER)a[2]};
+        list_RSSetShadingRate(l, (D3D12_SHADING_RATE)a[0], c);
+        break;
+      }
+      case B_SHADING_RATE_IMAGE: list_RSSetShadingRateImage(l, (ID3D12Resource *)(UINT_PTR)a[0]); break;
       default: break;
     }
   }
+  if (!mask_set) l->view_mask = caller_mask;
 }
 
 /* ---- tiled resources ----------------------------------------------------------------------------------------------------------------------------------------------------- */

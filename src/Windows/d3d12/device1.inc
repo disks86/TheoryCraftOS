@@ -472,7 +472,8 @@ static HRESULT stream_parse(Dev *dev, const D3D12_PIPELINE_STATE_STREAM_DESC *st
       case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL1: {
         D3D12_DEPTH_STENCIL_DESC1 d1;
         memcpy(&d1, p, inner);
-        if (d1.DepthBoundsTestEnable) STREAM_FAIL(E_INVALIDARG);      /* (DepthBoundsTestSupported is FALSE) */
+        if (d1.DepthBoundsTestEnable && !(dev->caps.features2 & DEV_FEATURE2_DEPTH_BOUNDS)) STREAM_FAIL(E_INVALIDARG);      /* (DepthBoundsTestSupported is FALSE there) */
+        x->depth_bounds = d1.DepthBoundsTestEnable != FALSE;
         g.DepthStencilState.DepthEnable = d1.DepthEnable;
         g.DepthStencilState.DepthWriteMask = d1.DepthWriteMask;
         g.DepthStencilState.DepthFunc = d1.DepthFunc;
@@ -500,15 +501,28 @@ static HRESULT stream_parse(Dev *dev, const D3D12_PIPELINE_STATE_STREAM_DESC *st
       case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CACHED_PSO: memcpy(&g.CachedPSO, p, inner); c.CachedPSO = g.CachedPSO; break;
       case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_FLAGS: memcpy(&g.Flags, p, 4); c.Flags = g.Flags; break;
       case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VIEW_INSTANCING: {
+        /* (at most D3D12_MAX_VIEW_INSTANCE_COUNT views - more than one needs the device's view instancing -, each with its location: a viewport below
+         * D3D12_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE and a render target array index below D3D12_REQ_TEXTURE2D_ARRAY_AXIS_DIMENSION; the flags NONE or
+         * ENABLE_VIEW_INSTANCE_MASKING. A count of 0 is none; one view counts where its location or the mask does: pso.inc views_on.) */
         D3D12_VIEW_INSTANCING_DESC v;
         memcpy(&v, p, inner);
-        if (v.ViewInstanceCount > 1) STREAM_FAIL(E_INVALIDARG);      /* (D3D12_VIEW_INSTANCING_TIER_NOT_SUPPORTED) */
+        if (v.ViewInstanceCount > D3D12_MAX_VIEW_INSTANCE_COUNT || (v.Flags & ~D3D12_VIEW_INSTANCING_FLAG_ENABLE_VIEW_INSTANCE_MASKING)) STREAM_FAIL(E_INVALIDARG);
+        if (v.ViewInstanceCount && !v.pViewInstanceLocations) STREAM_FAIL(E_INVALIDARG);
+        if (v.ViewInstanceCount > 1 && !(dev->caps.features2 & DEV_FEATURE2_VIEW_INSTANCING)) STREAM_FAIL(E_INVALIDARG);      /* (D3D12_VIEW_INSTANCING_TIER_NOT_SUPPORTED there) */
+        for (UINT k = 0; k < v.ViewInstanceCount; ++k)
+          if (v.pViewInstanceLocations[k].ViewportArrayIndex >= D3D12_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE ||
+              v.pViewInstanceLocations[k].RenderTargetArrayIndex >= D3D12_REQ_TEXTURE2D_ARRAY_AXIS_DIMENSION)
+            STREAM_FAIL(E_INVALIDARG);
+        x->view_count = v.ViewInstanceCount;
+        x->view_flags = (UINT)v.Flags;
+        for (UINT k = 0; k < v.ViewInstanceCount; ++k) x->views[k] = v.pViewInstanceLocations[k];
         break;
       }
       case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL2: {
         D3D12_DEPTH_STENCIL_DESC2 d2;
         memcpy(&d2, p, inner);
-        if (d2.DepthBoundsTestEnable) STREAM_FAIL(E_INVALIDARG);      /* (DepthBoundsTestSupported is FALSE) */
+        if (d2.DepthBoundsTestEnable && !(dev->caps.features2 & DEV_FEATURE2_DEPTH_BOUNDS)) STREAM_FAIL(E_INVALIDARG);      /* (DepthBoundsTestSupported is FALSE there) */
+        x->depth_bounds = d2.DepthBoundsTestEnable != FALSE;
         if (d2.StencilEnable && (d2.FrontFace.StencilReadMask != d2.BackFace.StencilReadMask || d2.FrontFace.StencilWriteMask != d2.BackFace.StencilWriteMask) &&
             !(dev->caps.features2 & DEV_FEATURE2_RASTERIZER_STATE))
           STREAM_FAIL(E_INVALIDARG);      /* (IndependentFrontAndBackStencilRefMaskSupported is FALSE there) */

@@ -249,6 +249,7 @@ class Adapter::StreamRunner {
     device_topology_ = graphics::PrimitiveTopology::TriangleList;
     device_patch_points_ = 0;
     cb_->begin();
+    raster_sent_ = false;   // (a new command buffer has the rasterizer state's defaults: the next draw sends the stream's)
     // (the queries still open go on in this command buffer: a segment each)
     for (StreamQuery& q : queries_.view())
       if (q.open) begin_segment(q);
@@ -436,6 +437,10 @@ class Adapter::StreamRunner {
       }
       case Op::BindUavImage: return bind_uav_image(p);
       case Op::BindTexelBuffer: return bind_texel_buffer(p);
+      case Op::SetDepthBounds: return set_depth_bounds(p);
+      case Op::SetSamplePositions: return set_sample_positions(p);
+      case Op::SetViewInstance: return set_view_instance(p);
+      case Op::SetShadingRate: return set_shading_rate(p);
       case Op::BindPipeline: return bind_pipeline(p);
       case Op::BindVertexBuffer: return bind_vertex_buffer(p);
       case Op::BindIndexBuffer: return bind_index_buffer(p);
@@ -691,6 +696,7 @@ class Adapter::StreamRunner {
     const uint32_t to_index = p.le32(), from_index = p.le32();
     uint32_t mode = 0;
     if (!p.at_end()) mode = p.le32();
+    if (mode == kResolveCopySamples) return copy_samples(p, to_index, from_index);
     if (!exact(p) || in_pass_ || !(adapter_.caps_.features & graphics::kFeatureMultisample) || mode > static_cast<uint32_t>(graphics::ResolveMode::Max)) return kBad;
     Allocation* to = alloc(to_index);
     Allocation* from = alloc(from_index);
@@ -712,6 +718,30 @@ class Adapter::StreamRunner {
     if (s == status::kSuccess) s = ensure_cb();
     if (s != status::kSuccess) return s;
     cb_->resolve_image(to->image(), from->image(), static_cast<graphics::ResolveMode>(mode));
+    mm_.note_gpu_write(*to);
+    return status::kSuccess;
+  }
+
+  // ResolveRegion's copy of samples: a region of a multisampled image (colour, or depth with its stencil) into another of its format, samples and size kind (one level, one layer).
+  NtStatus copy_samples(ByteReader& p, uint32_t to_index, uint32_t from_index) {
+    const uint32_t sx = p.le32(), sy = p.le32(), w = p.le32(), h = p.le32(), dx = p.le32(), dy = p.le32();
+    if (!exact(p) || in_pass_ || !(adapter_.caps_.features2 & graphics::kFeature2SampleCopies)) return refuse(__LINE__);
+    Allocation* to = alloc(to_index);
+    Allocation* from = alloc(from_index);
+    if (!to || !from || to == from || !to->is_image() || !from->is_image() || to->is_staging() || from->is_staging() || !use(to, state::kResolveDest) || !use(from, state::kResolveSource)) return refuse(__LINE__);
+    if (to->desc().format != from->desc().format || to->desc().samples != from->desc().samples || from->desc().samples < 2 || to->mip_levels() != 1 || from->mip_levels() != 1 ||
+        to->layers() != 1 || from->layers() != 1)
+      return refuse(__LINE__);
+    if (w == 0 || h == 0 || sx > from->desc().width || w > from->desc().width - sx || sy > from->desc().height || h > from->desc().height - sy || dx > to->desc().width ||
+        w > to->desc().width - dx || dy > to->desc().height || h > to->desc().height - dy)
+      return refuse(__LINE__);
+    unbind_textures_of(to);
+    if (!exec_) return status::kSuccess;
+    NtStatus s = resident(*to);
+    if (s == status::kSuccess) s = resident(*from);
+    if (s == status::kSuccess) s = ensure_cb();
+    if (s != status::kSuccess) return s;
+    cb_->copy_samples(to->image(), from->image(), {static_cast<int32_t>(sx), static_cast<int32_t>(sy), w, h}, dx, dy);
     mm_.note_gpu_write(*to);
     return status::kSuccess;
   }
@@ -940,6 +970,102 @@ class Adapter::StreamRunner {
     }
   }
 
+  // --- The optional rasterizer state of Direct3D 12 (depth bounds, sample positions, view instancing, coarse shading): kept for the stream, across passes and command buffers, and given
+  // to the device's command buffer before the next draw (apply_raster).
+  struct RasterState {
+    bool depth_bounds = false;
+    float depth_min = 0.0f, depth_max = 1.0f;
+    uint32_t samples = 0, pixels = 0;
+    graphics::SamplePosition positions[graphics::kMaxSamplePositions] = {};
+    uint32_t view = 0, viewport_offset = 0, layer_offset = 0;
+    uint32_t rate = 0;
+    graphics::ShadingRateCombiner combiners[2] = {graphics::ShadingRateCombiner::Passthrough, graphics::ShadingRateCombiner::Passthrough};
+    Allocation* rate_image = nullptr;
+  };
+  RasterState raster_;
+  bool raster_sent_ = false;   // (the device's command buffer has raster_)
+  bool raster_used_ = false;   // (the stream set any of it: a stream that did not leaves the device's defaults alone)
+
+  NtStatus set_depth_bounds(ByteReader& p) {
+    const uint32_t enable = p.le32();
+    const float min = bits_float(p.le32()), max = bits_float(p.le32());
+    if (!exact(p) || enable > 1 || !(min >= 0.0f && min <= 1.0f) || !(max >= 0.0f && max <= 1.0f)) return refuse(__LINE__);   // (NaN fails both)
+    if (!(adapter_.caps_.features2 & graphics::kFeature2DepthBounds)) return refuse(__LINE__);
+    raster_.depth_bounds = enable != 0, raster_.depth_min = min, raster_.depth_max = max;
+    raster_used_ = true, raster_sent_ = false;
+    return status::kSuccess;
+  }
+  NtStatus set_sample_positions(ByteReader& p) {
+    const uint32_t samples = p.le32(), pixels = p.le32();
+    if (!p.ok() || !(adapter_.caps_.features2 & graphics::kFeature2SamplePositions)) return refuse(__LINE__);
+    RasterState next = raster_;
+    if (pixels == 0) {
+      if (!exact(p) || samples != 0) return refuse(__LINE__);
+      next.samples = next.pixels = 0;
+    } else {
+      // (1, 2, 4, 8 or 16 samples - a count the adapter has, or one -, one pixel or a quad of four, at most 16 positions)
+      if ((pixels != 1 && pixels != 4) || (samples != 1 && samples != 2 && samples != 4 && samples != 8 && samples != 16) || samples * pixels > graphics::kMaxSamplePositions) return refuse(__LINE__);
+      if (samples > 1 && !(adapter_.caps_.sample_counts >> samples & 1)) return refuse(__LINE__);
+      for (uint32_t k = 0; k < samples * pixels; ++k) {
+        const uint32_t w = p.le32();
+        const int8_t x = static_cast<int8_t>(w & 0xFF), y = static_cast<int8_t>(w >> 8 & 0xFF);
+        if (!p.ok() || (w >> 16) != 0 || x < -8 || x > 7 || y < -8 || y > 7) return refuse(__LINE__);
+        next.positions[k] = {x, y};
+      }
+      if (!exact(p)) return refuse(__LINE__);
+      next.samples = samples, next.pixels = pixels;
+    }
+    raster_ = next;
+    raster_used_ = true, raster_sent_ = false;
+    return status::kSuccess;
+  }
+  NtStatus set_view_instance(ByteReader& p) {
+    const uint32_t view = p.le32(), viewport = p.le32(), layer = p.le32();
+    if (!exact(p) || view >= kMaxViewInstances || viewport >= graphics::kMaxViewports || layer >= 2048) return refuse(__LINE__);
+    if (!(adapter_.caps_.features2 & graphics::kFeature2ViewInstancing)) return refuse(__LINE__);
+    raster_.view = view, raster_.viewport_offset = viewport, raster_.layer_offset = layer;
+    raster_used_ = true, raster_sent_ = false;
+    return status::kSuccess;
+  }
+  NtStatus set_shading_rate(ByteReader& p) {
+    const uint32_t rate = p.le32(), primitive = p.le32(), image = p.le32(), index = p.le32();
+    const uint32_t last = static_cast<uint32_t>(graphics::ShadingRateCombiner::Sum);
+    if (!exact(p) || !graphics::valid_shading_rate(rate) || primitive > last || image > last) return refuse(__LINE__);
+    if (!(adapter_.caps_.features2 & graphics::kFeature2ShadingRate)) return refuse(__LINE__);
+    Allocation* a = nullptr;
+    if (index != kNoAllocation) {
+      // (an R8_UINT texture of one level, one layer and one sample, which no shader of the draws writes: D3D12_RESOURCE_STATE_SHADING_RATE_SOURCE)
+      a = alloc(index);
+      if (!a || !a->is_image() || a->is_staging() || a->is_depth() || a->desc().format != Format::R8Uint || a->desc().samples > 1 || a->mip_levels() != 1 || a->layers() != 1 ||
+          !use(a, state::kShadingRateSource))
+        return refuse(__LINE__);
+    }
+    raster_.rate = rate;
+    raster_.combiners[0] = static_cast<graphics::ShadingRateCombiner>(primitive);
+    raster_.combiners[1] = static_cast<graphics::ShadingRateCombiner>(image);
+    raster_.rate_image = a;
+    raster_used_ = true, raster_sent_ = false;
+    return status::kSuccess;
+  }
+  // Before a draw: the device's command buffer gets the stream's rasterizer state if it does not have it (the shading-rate image made resident).
+  NtStatus apply_raster() {
+    if (!raster_used_ || raster_sent_) return status::kSuccess;
+    if (raster_.rate_image) {
+      const NtStatus s = resident(*raster_.rate_image);
+      if (s != status::kSuccess) return s;
+    }
+    const uint32_t features2 = adapter_.caps_.features2;
+    if (features2 & graphics::kFeature2DepthBounds) cb_->set_depth_bounds(raster_.depth_bounds, raster_.depth_min, raster_.depth_max);
+    if (features2 & graphics::kFeature2SamplePositions) cb_->set_sample_positions(raster_.samples, raster_.pixels, ArrayView<const graphics::SamplePosition>(raster_.positions, raster_.samples * raster_.pixels));
+    if (features2 & graphics::kFeature2ViewInstancing) cb_->set_view_instance(raster_.view, raster_.viewport_offset, raster_.layer_offset);
+    if (features2 & graphics::kFeature2ShadingRate) {
+      cb_->set_shading_rate(raster_.rate, raster_.combiners[0], raster_.combiners[1]);
+      cb_->set_shading_rate_image(raster_.rate_image ? raster_.rate_image->image() : nullptr);
+    }
+    raster_sent_ = true;
+    return status::kSuccess;
+  }
+
   // One viewport, or several (kFeature2Viewports): six words each.
   NtStatus set_viewport(ByteReader& p) {
     graphics::Viewport list[graphics::kMaxViewports];
@@ -1071,7 +1197,8 @@ class Adapter::StreamRunner {
       for (uint32_t slot = 0; slot < graphics::kMaxVertexBuffers; ++slot)
         if ((pipeline_->per_vertex_slots() >> slot & 1) && vertex_offset_[slot] + static_cast<uint64_t>(highest + 1) * pipeline_->slot_stride(slot) > vertex_[slot]->desc().size) return refuse(__LINE__);
     }
-    const NtStatus s = ensure_cb();
+    NtStatus s = ensure_cb();
+    if (s == status::kSuccess) s = apply_raster();
     if (s != status::kSuccess) return s;
     align_planes(pipeline_->declared_units(), pipeline_->texture_count());
     if (topology_ == Topology::TriangleStrip || topology_ == Topology::TriangleFan || topology_ == Topology::LineStrip) {

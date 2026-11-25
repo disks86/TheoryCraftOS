@@ -10511,6 +10511,518 @@ void test_depth_copies() {
   }
 }
 
+// --- Direct3D 12's optional rasterizer features on the CPU renderer: depth bounds, programmable sample positions, view instancing, coarse shading, barycentrics ---------------
+
+// A colored pipeline (BuiltinShaders) with the given depth state and multisampling.
+Handle colored_pipeline(Env& e, bool depth_test, bool depth_write, bool multisample = false) {
+  Handle vs = 0, fs = 0, pipe = 0;
+  CHECK(e.kernel.create_shader(kPid, e.dev, {ShaderKind::ColoredVertex, graphics::ShaderStage::Vertex, {}}, &vs) == status::kSuccess);
+  CHECK(e.kernel.create_shader(kPid, e.dev, {ShaderKind::ColoredFragment, graphics::ShaderStage::Fragment, {}}, &fs) == status::kSuccess);
+  graphics::GraphicsPipelineDesc d;
+  graphics::describe_colored_pipeline(&d);
+  PipelineDesc pd;
+  pd.vertex_shader = vs, pd.fragment_shader = fs, pd.vertex_stride = d.vertex_stride, pd.attribute_count = 2, pd.varying_count = 1;
+  pd.attributes[0] = d.attributes[0], pd.attributes[1] = d.attributes[1];
+  pd.cull_mode = graphics::CullMode::None;
+  pd.depth_test = depth_test, pd.depth_write = depth_write;
+  pd.depth_compare = depth_test ? graphics::CompareOp::LessEqual : graphics::CompareOp::Always;
+  pd.multisample = multisample;
+  CHECK(e.kernel.create_pipeline(kPid, e.dev, pd, &pipe) == status::kSuccess);
+  return pipe;
+}
+
+// Two triangles of a rectangle from (x0, y0) to (x1, y1) in clip space at depth z, of one colour: 6 vertices of 7 floats.
+void rect_vertices(float* v, float x0, float y0, float x1, float y1, float z, float r, float g, float b) {
+  const float corners[6][2] = {{x0, y0}, {x1, y0}, {x0, y1}, {x1, y0}, {x1, y1}, {x0, y1}};
+  for (uint32_t k = 0; k < 6; ++k) {
+    float* p = v + 7 * k;
+    p[0] = corners[k][0], p[1] = corners[k][1], p[2] = z, p[3] = r, p[4] = g, p[5] = b, p[6] = 1;
+  }
+}
+
+const float kIdentity[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+
+// The depth bounds test (SetDepthBounds): a depth buffer of 0.25 on the left half and 0.75 on the right, then a green rectangle over the whole target with the depth test off - only where
+// the depth buffer's value is inside the bounds is it drawn; off, it is drawn everywhere. Lines and points are tested too. A device without the feature refuses the op.
+void test_depth_bounds_kernel() {
+  Env e;
+  const Handle writer = colored_pipeline(e, true, true), over = colored_pipeline(e, false, false);
+  const Handle rt = e.alloc(kTarget, Format::A8R8G8B8, 16, 16), ds = e.alloc(kAllocDepthStencil, Format::D32Float, 16, 16), vb = e.buffer(kAllocVertexBuffer, 18 * 28);
+  float v[18 * 7];
+  rect_vertices(v, -1, -1, 0, 1, 0.25f, 1, 0, 0);
+  rect_vertices(v + 42, 0, -1, 1, 1, 0.75f, 1, 0, 0);
+  rect_vertices(v + 84, -1, -1, 1, 1, 0.5f, 0, 1, 0);
+  CHECK(e.write(vb, floats(v, 18 * 7)));
+  auto draw = [&](bool enable, float min, float max) {
+    CommandWriter w(e.allocator);
+    w.begin_pass(0, 1, kPassClearColor | kPassClearDepth, {0, 0, 0, 1}, 1, 0);
+    w.bind_pipeline(writer);
+    w.bind_vertex_buffer(2);
+    w.push_constants(floats(kIdentity, 16));
+    w.draw(12);
+    w.set_depth_bounds(enable, min, max);
+    w.bind_pipeline(over);
+    w.draw(6, 12);
+    w.end_pass();
+    return e.render(w, {rt, ds, vb});
+  };
+  CHECK(draw(true, 0.5f, 1.0f) == status::kSuccess);
+  CHECK(e.pixel(rt, 3, 8) == 0xFFFF0000u && e.pixel(rt, 12, 8) == 0xFF00FF00u);
+  CHECK(draw(true, 0.0f, 0.5f) == status::kSuccess);
+  CHECK(e.pixel(rt, 3, 8) == 0xFF00FF00u && e.pixel(rt, 12, 8) == 0xFFFF0000u);
+  CHECK(draw(true, 0.25f, 0.25f) == status::kSuccess);   // (inclusive bounds: exactly 0.25 passes)
+  CHECK(e.pixel(rt, 3, 8) == 0xFF00FF00u && e.pixel(rt, 12, 8) == 0xFFFF0000u);
+  CHECK(draw(true, 0.8f, 0.7f) == status::kSuccess);     // (min above max: nothing passes)
+  CHECK(e.pixel(rt, 3, 8) == 0xFFFF0000u && e.pixel(rt, 12, 8) == 0xFFFF0000u);
+  CHECK(draw(false, 0.5f, 1.0f) == status::kSuccess);
+  CHECK(e.pixel(rt, 3, 8) == 0xFF00FF00u && e.pixel(rt, 12, 8) == 0xFF00FF00u);
+  // (the state holds across passes of the stream, and a stream starts with it off)
+  {
+    CommandWriter w(e.allocator);
+    w.set_depth_bounds(true, 0.5f, 1.0f);
+    w.begin_pass(0, 1, kPassClearColor | kPassClearDepth, {0, 0, 0, 1}, 1, 0);
+    w.bind_pipeline(writer);
+    w.bind_vertex_buffer(2);
+    w.push_constants(floats(kIdentity, 16));
+    w.draw(12);
+    w.end_pass();
+    w.begin_pass(0, 1, 0, {0, 0, 0, 1}, 1, 0);
+    w.bind_pipeline(over);
+    w.bind_vertex_buffer(2);
+    w.push_constants(floats(kIdentity, 16));
+    w.draw(6, 12);
+    w.end_pass();
+    CHECK(e.render(w, {rt, ds, vb}) == status::kSuccess);
+    // (the writer's own draw tested the cleared buffer, 1.0, inside 0.5 .. 1: drawn)
+    CHECK(e.pixel(rt, 3, 8) == 0xFFFF0000u && e.pixel(rt, 12, 8) == 0xFF00FF00u);
+  }
+  // Refused: a bound outside 0 .. 1, NaN, an enable word other than 0 or 1.
+  auto bad = [&](uint32_t enable, float min, float max) {
+    CommandWriter w(e.allocator);
+    w.set_depth_bounds(enable != 0, min, max);
+    w.begin_pass(0, 1, kPassClearColor, {0, 0, 0, 1}, 1, 0);
+    w.end_pass();
+    return e.render(w, {rt, ds});
+  };
+  CHECK(bad(1, -0.1f, 1) == status::kInvalidParameter && bad(1, 0, 1.5f) == status::kInvalidParameter && bad(1, __builtin_nanf(""), 1) == status::kInvalidParameter);
+  FakeScreen screen(8, 6);
+  graphics::SoftwareDevice software(e.allocator, &screen);
+  SpyDevice limited(software);
+  limited.feature2_mask = ~graphics::kFeature2DepthBounds;
+  Kernel kernel(e.allocator);
+  AdapterConfig c;
+  c.display = &screen;
+  kernel.add_adapter(limited, c);
+  Handle adapter = 0, dev = 0, ctx = 0, target = 0;
+  CHECK(kernel.open_process(kPid) == status::kSuccess && kernel.open_adapter_from_index(kPid, 0, &adapter) == status::kSuccess && kernel.create_device(kPid, adapter, &dev) == status::kSuccess);
+  CHECK(kernel.create_context(kPid, dev, ContextPriority::Normal, &ctx) == status::kSuccess);
+  AllocationDesc ad;
+  ad.flags = kTarget, ad.format = Format::A8R8G8B8, ad.width = ad.height = 8;
+  CHECK(kernel.create_allocation(kPid, dev, ad, &target) == status::kSuccess);
+  CommandWriter w(e.allocator);
+  w.set_depth_bounds(true, 0, 1);
+  w.begin_pass(0, kNoAllocation, kPassClearColor, {0, 0, 0, 1}, 1, 0);
+  w.end_pass();
+  CHECK(kernel.render(kPid, ctx, w.view(), ArrayView<const Handle>(&target, 1)) == status::kInvalidParameter);
+}
+
+// Programmable sample positions (SetSamplePositions): a white rectangle whose right edge is at x 3.75 of an 8 x 8 target of 4 samples, resolved. The standard positions cover 3 of the 4
+// samples of pixel 3; positions for each pixel of a quad - the even columns' at -8 / 16, the odd ones' at 7 / 16 - cover pixel 2 wholly and pixel 3 not at all; the standard ones again
+// after pixels 0. A single-sample pass takes its one position too. Malformed positions are refused.
+void test_sample_positions_kernel() {
+  Env e;
+  const Handle pipe = colored_pipeline(e, false, false, true), plain = colored_pipeline(e, false, false, false);
+  AllocationDesc d;
+  d.flags = kAllocRenderTarget, d.format = Format::A8R8G8B8, d.width = d.height = 8, d.samples = 4;
+  Handle ms = 0;
+  CHECK(e.kernel.create_allocation(kPid, e.dev, d, &ms) == status::kSuccess);
+  const Handle resolved = e.alloc(kTarget, Format::A8R8G8B8, 8, 8), single = e.alloc(kTarget, Format::A8R8G8B8, 8, 8), vb = e.buffer(kAllocVertexBuffer, 6 * 28);
+  float v[6 * 7];
+  rect_vertices(v, -1, -1, 3.75f / 4.0f - 1.0f, 1, 0.5f, 1, 1, 1);
+  CHECK(e.write(vb, floats(v, 6 * 7)));
+  auto draw = [&](std::initializer_list<graphics::SamplePosition> positions, uint32_t samples, uint32_t pixels, bool reset) {
+    CommandWriter w(e.allocator);
+    std::vector<graphics::SamplePosition> list(positions);
+    if (pixels) w.set_sample_positions(samples, pixels, ArrayView<const graphics::SamplePosition>(list.data(), list.size()));
+    if (reset) w.set_sample_positions(0, 0, ArrayView<const graphics::SamplePosition>());
+    w.begin_pass(0, kNoAllocation, kPassClearColor, {0, 0, 0, 1}, 1, 0);
+    w.bind_pipeline(pipe);
+    w.bind_vertex_buffer(2);
+    w.push_constants(floats(kIdentity, 16));
+    w.draw(6);
+    w.end_pass();
+    w.resolve_region(1, 0);
+    return e.render(w, {ms, resolved, vb});
+  };
+  auto red = [&](uint32_t x) { return (e.pixel(resolved, x, 4) >> 16) & 0xFF; };
+  CHECK(draw({}, 0, 0, false) == status::kSuccess);
+  CHECK(red(2) == 0xFF && red(3) >= 0xBE && red(3) <= 0xC0 && red(4) == 0);   // (3 of 4 samples)
+  const graphics::SamplePosition l = {-8, 0}, r = {7, 0};
+  CHECK(draw({l, l, l, l, r, r, r, r, l, l, l, l, r, r, r, r}, 4, 4, false) == status::kSuccess);
+  CHECK(red(2) == 0xFF && red(3) == 0 && red(1) == 0xFF);
+  CHECK(draw({l, l, l, l}, 4, 1, false) == status::kSuccess);   // (one pattern for every pixel: pixel 3's samples at 3.0)
+  CHECK(red(3) == 0xFF && red(4) == 0);
+  CHECK(draw({l, l, l, l}, 4, 1, true) == status::kSuccess);    // (and the standard ones again)
+  CHECK(red(3) >= 0xBE && red(3) <= 0xC0);
+  {
+    // A single sample: pixel 3's centre (3.5) is inside, its sample moved to 3.9375 is not.
+    CommandWriter w(e.allocator);
+    const graphics::SamplePosition one[1] = {r};
+    w.set_sample_positions(1, 1, ArrayView<const graphics::SamplePosition>(one, 1));
+    w.begin_pass(0, kNoAllocation, kPassClearColor, {0, 0, 0, 1}, 1, 0);
+    w.bind_pipeline(plain);
+    w.bind_vertex_buffer(1);
+    w.push_constants(floats(kIdentity, 16));
+    w.draw(6);
+    w.end_pass();
+    CHECK(e.render(w, {single, vb}) == status::kSuccess);
+    CHECK(e.pixel(single, 2, 4) == 0xFFFFFFFFu && e.pixel(single, 3, 4) == 0xFF000000u);
+  }
+  // Refused: 3 samples, 2 pixels, 4 pixels of 8 samples, a position past 7, words missing, and 16 samples (a count the device has not).
+  auto refused = [&](uint32_t samples, uint32_t pixels, std::initializer_list<graphics::SamplePosition> positions) {
+    CommandWriter w(e.allocator);
+    std::vector<graphics::SamplePosition> list(positions);
+    w.set_sample_positions(samples, pixels, ArrayView<const graphics::SamplePosition>(list.data(), list.size()));
+    return e.render(w, {ms});
+  };
+  CHECK(refused(3, 1, {l, l, l}) == status::kInvalidParameter && refused(4, 2, {l, l, l, l, l, l, l, l}) == status::kInvalidParameter);
+  CHECK(refused(8, 4, {}) == status::kInvalidParameter && refused(1, 1, {{8, 0}}) == status::kInvalidParameter && refused(4, 1, {l, l}) == status::kInvalidParameter);
+  CHECK(refused(16, 1, {l, l, l, l, l, l, l, l, l, l, l, l, l, l, l, l}) == status::kInvalidParameter);
+  // Copies of samples (ResolveRegion's kResolveCopySamples, Direct3D 12's DECOMPRESS into another resource): columns 2 .. 5 of the drawing into columns 4 .. 7 of a second image of
+  // 4 samples, cleared - resolved, its column 5 is the drawing's column 3, three samples of four, exactly.
+  Handle other = 0;
+  CHECK(e.kernel.create_allocation(kPid, e.dev, d, &other) == status::kSuccess);
+  CHECK(draw({}, 0, 0, false) == status::kSuccess);
+  {
+    CommandWriter w(e.allocator);
+    w.begin_pass(1, kNoAllocation, kPassClearColor, {0, 0, 1, 1}, 1, 0);
+    w.end_pass();
+    w.copy_samples(1, 0, {2, 0, 4, 8}, 4, 0);
+    w.resolve_region(2, 1);
+    CHECK(e.render(w, {ms, other, resolved}) == status::kSuccess);
+    CHECK(e.pixel(resolved, 4, 4) == 0xFFFFFFFFu && e.pixel(resolved, 6, 4) == 0xFF000000u && e.pixel(resolved, 1, 4) == 0xFF0000FFu);
+    CHECK(red(5) >= 0xBE && red(5) <= 0xC0);
+  }
+  auto copy = [&](uint32_t to, uint32_t from, graphics::Rect2D region, uint32_t x, uint32_t y) {
+    CommandWriter w(e.allocator);
+    w.copy_samples(to, from, region, x, y);
+    return e.render(w, {ms, other, resolved});
+  };
+  CHECK(copy(1, 0, {0, 0, 8, 8}, 0, 0) == status::kSuccess);
+  CHECK(copy(0, 0, {0, 0, 4, 4}, 4, 4) == status::kInvalidParameter);   // (one image)
+  CHECK(copy(2, 0, {0, 0, 4, 4}, 0, 0) == status::kInvalidParameter);   // (one sample: not the same count)
+  CHECK(copy(1, 0, {4, 0, 5, 4}, 0, 0) == status::kInvalidParameter && copy(1, 0, {0, 0, 4, 4}, 5, 0) == status::kInvalidParameter && copy(1, 0, {0, 0, 0, 4}, 0, 0) == status::kInvalidParameter);
+}
+
+// The view instance (SetViewInstance): the layer and viewport offsets of the view are added to what the shaders choose (here nothing: 0), so draws of views 0 .. 2 at layer offsets
+// 0 .. 2 fill the three layers of an array; a viewport offset picks the second viewport. A view of 4 or more, or offsets past the limits, are refused.
+void test_view_instance_kernel() {
+  Env e;
+  const Handle pipe = colored_pipeline(e, false, false);
+  AllocationDesc d;
+  d.flags = kAllocTexture | kAllocRenderTarget, d.format = Format::A8R8G8B8, d.width = d.height = 16, d.kind = graphics::TextureKind::Texture2DArray, d.layers = 3;
+  Handle slices = 0;
+  CHECK(e.kernel.create_allocation(kPid, e.dev, d, &slices) == status::kSuccess);
+  const Handle vb = e.buffer(kAllocVertexBuffer, 18 * 28);
+  float v[18 * 7];
+  rect_vertices(v, -1, -1, 1, 1, 0.5f, 1, 0, 0);
+  rect_vertices(v + 42, -1, -1, 1, 1, 0.5f, 0, 1, 0);
+  rect_vertices(v + 84, -1, -1, 1, 1, 0.5f, 0, 0, 1);
+  CHECK(e.write(vb, floats(v, 18 * 7)));
+  auto layer_pixel = [&](uint32_t layer, uint32_t x, uint32_t y) {
+    LockResult lk;
+    uint32_t out = 0;
+    if (e.kernel.lock(kPid, slices, kLockReadOnly, 0, &lk) == status::kSuccess) {
+      ByteReader in(lk.data.subview(uint64_t{layer} * 16 * 16 * 4 + (uint64_t{y} * 16 + x) * 4, 4));
+      out = in.le32();
+      e.kernel.unlock(kPid, slices);
+    }
+    return out;
+  };
+  CommandWriter w(e.allocator);
+  w.begin_pass_layers(0, {}, kNoAllocation, kPassClearColor, {0, 0, 0, 1}, 1, 0, {0, 3, 0, 1});
+  w.bind_pipeline(pipe);
+  w.bind_vertex_buffer(1);
+  w.push_constants(floats(kIdentity, 16));
+  for (uint32_t view = 0; view < 3; ++view) {
+    w.set_view_instance(view, 0, view);
+    w.draw(6, 6 * view);
+  }
+  w.end_pass();
+  CHECK(e.render(w, {slices, vb}) == status::kSuccess);
+  CHECK(layer_pixel(0, 8, 8) == 0xFFFF0000u && layer_pixel(1, 8, 8) == 0xFF00FF00u && layer_pixel(2, 8, 8) == 0xFF0000FFu);
+  // Viewport offsets: viewport 0 the left half, 1 the right half; the second draw at offset 1 lands in the right half.
+  const Handle rt = e.alloc(kTarget, Format::A8R8G8B8, 16, 16);
+  CommandWriter w2(e.allocator);
+  w2.begin_pass(0, kNoAllocation, kPassClearColor, {0, 0, 0, 1}, 1, 0);
+  w2.bind_pipeline(pipe);
+  w2.bind_vertex_buffer(1);
+  w2.push_constants(floats(kIdentity, 16));
+  {
+    const graphics::Viewport vps[2] = {{0, 0, 8, 16, 0, 1}, {8, 0, 8, 16, 0, 1}};
+    const graphics::Rect2D scs[2] = {{0, 0, 8, 16}, {8, 0, 8, 16}};
+    w2.set_viewports(ArrayView<const graphics::Viewport>(vps, 2));
+    w2.set_scissors(ArrayView<const graphics::Rect2D>(scs, 2));
+  }
+  w2.set_view_instance(1, 1, 0);
+  w2.draw(6, 6);   // (green, right half)
+  w2.set_view_instance(0, 0, 0);
+  w2.draw(6, 0);   // (red, left half)
+  w2.end_pass();
+  CHECK(e.render(w2, {rt, vb}) == status::kSuccess);
+  CHECK(e.pixel(rt, 3, 8) == 0xFFFF0000u && e.pixel(rt, 12, 8) == 0xFF00FF00u);
+  auto refused = [&](uint32_t view, uint32_t vp, uint32_t layer) {
+    CommandWriter b(e.allocator);
+    b.set_view_instance(view, vp, layer);
+    return e.render(b, {rt});
+  };
+  CHECK(refused(4, 0, 0) == status::kInvalidParameter && refused(0, 16, 0) == status::kInvalidParameter && refused(0, 0, 2048) == status::kInvalidParameter);
+  CHECK(refused(3, 15, 2047) == status::kSuccess);
+}
+
+// Coarse pixel shading (SetShadingRate): a gradient across a 32 x 32 target (the colour of the colored pipeline's vertices, interpolated) drawn at 2x2 has the same colour in each 2 x 2
+// block, at 1x1 not; 4x4 blocks of 4; the shading-rate image's tiles (16 x 16) choose their own rate with the image combiner OVERRIDE; MIN of the set rate and the image's. The rate
+// sanitizing is checked on its own: what a pass of 4 samples makes of 4x4.
+void test_shading_rate_kernel() {
+  CHECK(graphics::sanitize_shading_rate(0xA, 1) == 0xA && graphics::sanitize_shading_rate(0xA, 2) == 0x6 && graphics::sanitize_shading_rate(0xA, 4) == 0x5);
+  CHECK(graphics::sanitize_shading_rate(0x5, 8) == 0x4 && graphics::sanitize_shading_rate(0x5, 16) == 0x0 && graphics::sanitize_shading_rate(0x9, 2) == 0x5);
+  CHECK(graphics::combine_shading_rate(graphics::ShadingRateCombiner::Sum, 0x5, 0x5) == 0xA && graphics::combine_shading_rate(graphics::ShadingRateCombiner::Sum, 0x9, 0x5) == 0xA);
+  CHECK(graphics::combine_shading_rate(graphics::ShadingRateCombiner::Min, 0x1, 0x4) == 0x0 && graphics::combine_shading_rate(graphics::ShadingRateCombiner::Max, 0x1, 0x4) == 0x5);
+  CHECK(graphics::combine_shading_rate(graphics::ShadingRateCombiner::Override, 0x1, 0x6) == 0x6 && graphics::combine_shading_rate(graphics::ShadingRateCombiner::Passthrough, 0x1, 0x6) == 0x1);
+  Env e;
+  const Handle pipe = colored_pipeline(e, false, false);
+  const Handle rt = e.alloc(kTarget, Format::A8R8G8B8, 32, 32), vb = e.buffer(kAllocVertexBuffer, 6 * 28);
+  // (red from 0 at the left edge to 1 at the right, green from 0 at the top to 1 at the bottom)
+  const float v[6 * 7] = {-1, -1, 0.5f, 0, 0, 0, 1, 1, -1, 0.5f, 1, 0, 0, 1, -1, 1, 0.5f, 0, 1, 0, 1, 1, -1, 0.5f, 1, 0, 0, 1, 1, 1, 0.5f, 1, 1, 0, 1, -1, 1, 0.5f, 0, 1, 0, 1};
+  CHECK(e.write(vb, floats(v, 6 * 7)));
+  AllocationDesc id;
+  id.flags = kAllocTexture, id.format = Format::R8Uint, id.width = id.height = 2;
+  Handle image = 0;
+  CHECK(e.kernel.create_allocation(kPid, e.dev, id, &image) == status::kSuccess);
+  auto draw = [&](uint32_t rate, uint32_t primitive_combiner, uint32_t image_combiner, bool with_image) {
+    CommandWriter w(e.allocator);
+    w.set_shading_rate(rate, primitive_combiner, image_combiner, with_image ? 2 : kNoAllocation);
+    w.begin_pass(0, kNoAllocation, kPassClearColor, {0, 0, 0, 1}, 1, 0);
+    w.bind_pipeline(pipe);
+    w.bind_vertex_buffer(1);
+    w.push_constants(floats(kIdentity, 16));
+    w.draw(6);
+    w.end_pass();
+    return e.render(w, {rt, vb, image});
+  };
+  // Whether every block of bw x bh pixels from (x0, y0) of w x h has one colour ...
+  auto uniform = [&](uint32_t x0, uint32_t y0, uint32_t w, uint32_t h, uint32_t bw, uint32_t bh) {
+    for (uint32_t y = y0; y < y0 + h; ++y)
+      for (uint32_t x = x0; x < x0 + w; ++x)
+        if (e.pixel(rt, x, y) != e.pixel(rt, x - (x - x0) % bw, y - (y - y0) % bh)) return false;
+    return true;
+  };
+  // ... and the blocks twice as wide, or twice as high, have not (the gradient runs both ways): the coarse pixels are bw x bh.
+  auto blocks = [&](uint32_t x0, uint32_t y0, uint32_t w, uint32_t h, uint32_t bw, uint32_t bh) {
+    return uniform(x0, y0, w, h, bw, bh) && !uniform(x0, y0, w, h, 2 * bw, bh) && !uniform(x0, y0, w, h, bw, 2 * bh);
+  };
+  CHECK(draw(0x0, 0, 0, false) == status::kSuccess && blocks(0, 0, 32, 32, 1, 1));
+  CHECK(draw(0x5, 0, 0, false) == status::kSuccess && blocks(0, 0, 32, 32, 2, 2));
+  CHECK(draw(0xA, 0, 0, false) == status::kSuccess && blocks(0, 0, 32, 32, 4, 4));
+  CHECK(draw(0x6, 0, 0, false) == status::kSuccess && blocks(0, 0, 32, 32, 2, 4));
+  CHECK(draw(0x9, 0, 0, false) == status::kSuccess && blocks(0, 0, 32, 32, 4, 2));
+  // (the coarse pixel's colour is the gradient at its centre: the 2x2 block at (0, 0) has the colour of (1, 1), which is between pixel (0, 0)'s and (1, 1)'s at 1x1)
+  CHECK(draw(0x5, 0, 0, false) == status::kSuccess);
+  const uint32_t coarse = e.pixel(rt, 4, 4);
+  CHECK(draw(0x0, 0, 0, false) == status::kSuccess);
+  const uint32_t fine_lo = e.pixel(rt, 4, 4), fine_hi = e.pixel(rt, 5, 5);
+  CHECK(((coarse >> 16) & 0xFF) >= ((fine_lo >> 16) & 0xFF) && ((coarse >> 16) & 0xFF) <= ((fine_hi >> 16) & 0xFF) && coarse != fine_lo);
+  // The image: tiles (0, 0) 1x1, (1, 0) 2x2, (0, 1) 4x4, (1, 1) 2x1 - stored rows as the image's rows (the device reads texel (x, y) of tile (x, y)).
+  {
+    LockResult lk;
+    CHECK(e.kernel.lock(kPid, image, kLockDiscard, 0, &lk) == status::kSuccess);
+    const uint8_t rates[4] = {0x0, 0x5, 0xA, 0x4};
+    for (uint32_t y = 0; y < 2; ++y)
+      for (uint32_t x = 0; x < 2; ++x) lk.data[uint64_t{y} * lk.pitch + x] = rates[y * 2 + x];
+    e.kernel.unlock(kPid, image);
+  }
+  CHECK(draw(0x0, 0, 1, true) == status::kSuccess);   // (image combiner OVERRIDE)
+  // (tile rows: the image's row y is the target's pixel rows 16y .. 16y + 15 as the device keeps them - check either way up)
+  const bool top_first = uniform(16, 0, 16, 16, 2, 2);
+  const uint32_t t0 = top_first ? 0 : 16, t1 = top_first ? 16 : 0;
+  CHECK(blocks(0, t0, 16, 16, 1, 1) && blocks(16, t0, 16, 16, 2, 2) && blocks(0, t1, 16, 16, 4, 4) && blocks(16, t1, 16, 16, 2, 1));
+  CHECK(draw(0x1, 0, 2, true) == status::kSuccess);   // (MIN of 1x2 and each tile's: 1x1, 1x2, 1x2, 1x1)
+  CHECK(blocks(0, t0, 16, 16, 1, 1) && blocks(16, t0, 16, 16, 1, 2) && blocks(0, t1, 16, 16, 1, 2) && blocks(16, t1, 16, 16, 1, 1));
+  CHECK(draw(0x0, 0, 0, true) == status::kSuccess && blocks(0, 0, 32, 32, 1, 1));   // (PASSTHROUGH: the image is not used)
+  // Refused: a rate that is not one, a combiner past SUM, an image that is not R8_UINT.
+  const Handle wrong = e.alloc(kTexture, Format::A8R8G8B8, 2, 2);
+  auto refused = [&](uint32_t rate, uint32_t c0, uint32_t c1, Handle img) {
+    CommandWriter w(e.allocator);
+    w.set_shading_rate(rate, c0, c1, img ? 0 : kNoAllocation);
+    return img ? e.render(w, {img}) : e.render(w, {rt});
+  };
+  CHECK(refused(0x2, 0, 0, 0) == status::kInvalidParameter && refused(0x0, 5, 0, 0) == status::kInvalidParameter && refused(0x0, 0, 5, 0) == status::kInvalidParameter);
+  CHECK(refused(0x0, 0, 1, wrong) == status::kInvalidParameter && refused(0x0, 0, 1, image) == status::kSuccess);
+}
+
+// The Shader Model 6.1+ values the DXIL translator reads, run on the interpreter: SV_ViewID in a vertex and a pixel shader, SV_Barycentrics (perspective-correct and noperspective),
+// GetAttributeAtVertex, SV_ShadingRate written by a vertex shader and read by a pixel shader, IsHelperLane; what each needs of the device; the TGSI emitter refuses them; truncated and
+// flipped blobs never crash.
+void test_dxil_sm61_values() {
+  HostAllocator allocator;
+  auto compile = [&](const char* name, UniquePointer<D3d9Program>* out) {
+    const std::vector<uint8_t> blob = read_blob(name);
+    return !blob.empty() && D3d9Program::compile_dxbc(allocator, ConstByteView(blob.data(), blob.size()), out) == status::kSuccess && *out;
+  };
+  UniquePointer<D3d9Program> vs_view, ps_view, ps_bary, ps_attr, ps_rate, vs_rate, ps_helper;
+  CHECK(compile("dxil_vs_view.dxil", &vs_view) && compile("dxil_ps_view.dxil", &ps_view) && compile("dxil_ps_bary.dxil", &ps_bary) && compile("dxil_ps_attr.dxil", &ps_attr));
+  CHECK(compile("dxil_ps_rate.dxil", &ps_rate) && compile("dxil_vs_rate.dxil", &vs_rate) && compile("dxil_ps_helper.dxil", &ps_helper));
+  if (!vs_view || !ps_view || !ps_bary || !ps_attr || !ps_rate || !vs_rate || !ps_helper) return;
+  CHECK(!(vs_view->required_features2() & graphics::kFeature2ViewInstancing) && !(ps_view->required_features2() & graphics::kFeature2ViewInstancing));   // (SV_ViewID is 0 without it)
+  CHECK((ps_bary->required_features2() & graphics::kFeature2Barycentrics) && (ps_attr->required_features2() & graphics::kFeature2Barycentrics));
+  CHECK((ps_rate->required_features2() & graphics::kFeature2ShadingRate) && (vs_rate->required_features2() & graphics::kFeature2ShadingRate));
+  const uint8_t constants[256] = {};
+  graphics::Vec4 attributes[graphics::kMaxVertexAttributes] = {{0.5f, 0.25f, 0.5f, 1}, {0.1f, 0.2f, 0.3f, 6}};
+  // SV_ViewID of a vertex shader: red for view 0, green for 1.
+  for (uint32_t view = 0; view < 2; ++view) {
+    graphics::VertexContext vc;
+    vc.view_id = view;
+    graphics::ShaderIo io;
+    vs_view->run_vertex_ex(attributes, constants, vc, &io);
+    CHECK(io.varying[0].x == (view == 0 ? 1.0f : 0.0f) && io.varying[0].y == (view == 1 ? 1.0f : 0.0f));
+  }
+  // ... of a pixel shader: blue for view 1.
+  graphics::Vec4 varyings[graphics::kMaxVaryings] = {{0.25f, 0.5f, 0, 1}};
+  graphics::Vec4 color[graphics::kMaxColorTargets];
+  graphics::FragmentContext fc;
+  fc.view_id = 1;
+  CHECK(ps_view->run_fragment_ex(varyings, fc, constants, nullptr, color) && color[0].x == 0.25f && color[0].y == 0.5f && color[0].z == 1.0f);
+  fc.view_id = 0;
+  CHECK(ps_view->run_fragment_ex(varyings, fc, constants, nullptr, color) && color[0].z == 0.0f);
+  // SV_Barycentrics: the perspective-correct weights in red, green, blue, the noperspective first one in alpha.
+  fc.barycentrics = {0.2f, 0.3f, 0.5f, 0};
+  fc.barycentrics_linear = {0.7f, 0.1f, 0.2f, 0};
+  CHECK(ps_bary->run_fragment_ex(varyings, fc, constants, nullptr, color) && color[0].x == 0.2f && color[0].y == 0.3f && color[0].z == 0.5f && color[0].w == 0.7f);
+  // GetAttributeAtVertex: vertex 1's colour, and the alpha of the three mixed by the barycentrics.
+  const graphics::Vec4 v0[graphics::kMaxVaryings] = {{1, 0, 0, 0.0f}}, v1[graphics::kMaxVaryings] = {{0, 1, 0, 1.0f}}, v2[graphics::kMaxVaryings] = {{0, 0, 1, 0.5f}};
+  fc.vertex_varyings[0] = v0, fc.vertex_varyings[1] = v1, fc.vertex_varyings[2] = v2;
+  CHECK(ps_attr->run_fragment_ex(varyings, fc, constants, nullptr, color) && color[0].x == 0 && color[0].y == 1 && color[0].z == 0);
+  CHECK(color[0].w > 0.549f && color[0].w < 0.551f);   // (0.3 * 1 + 0.5 * 0.5)
+  // SV_ShadingRate: a vertex shader's from the colour's alpha (6: 2x4), a pixel shader's in blue (rate / 16) with its position.
+  {
+    graphics::ShaderIo io;
+    vs_rate->run_vertex_ex(attributes, constants, graphics::VertexContext(), &io);
+    CHECK(io.shading_rate == 6);
+    fc.position = {4, 12, 0.5f, 1};
+    fc.shading_rate = 5;
+    CHECK(ps_rate->run_fragment_ex(varyings, fc, constants, nullptr, color) && color[0].x == 0.5f && color[0].y == 0.5f && color[0].z == 5.0f / 16.0f);
+  }
+  // IsHelperLane: 0 for a pixel that is drawn, 1 for a helper run.
+  fc.helper = false;
+  CHECK(ps_helper->run_fragment_ex(varyings, fc, constants, nullptr, color) && color[0].x == 0.0f);
+  fc.helper = true;
+  CHECK(ps_helper->run_fragment_ex(varyings, fc, constants, nullptr, color) && color[0].x == 1.0f);
+  // (no TGSI for the barycentric and shading-rate ones: virgl is not given them; SV_ViewID is the immediate 0 there - every draw is view 0 without view instancing)
+  for (D3d9Program* p : {ps_bary.get(), ps_attr.get(), ps_rate.get(), vs_rate.get()}) {
+    String text(allocator);
+    CHECK(p->emit_tgsi(&text, graphics::kMaxVaryings) != status::kSuccess);
+  }
+  for (D3d9Program* p : {vs_view.get(), ps_view.get()}) {
+    String text(allocator);
+    CHECK(p->emit_tgsi(&text, graphics::kMaxVaryings) == status::kSuccess);
+  }
+  // Truncated and with a bit flipped: refused or compiled, never a crash.
+  for (const char* name : {"dxil_vs_view.dxil", "dxil_ps_view.dxil", "dxil_ps_bary.dxil", "dxil_ps_attr.dxil", "dxil_ps_rate.dxil", "dxil_vs_rate.dxil", "dxil_ps_helper.dxil"}) {
+    const std::vector<uint8_t> blob = read_blob(name);
+    for (size_t n = 0; n < blob.size(); n += 13) {
+      UniquePointer<D3d9Program> program;
+      D3d9Program::compile_dxbc(allocator, ConstByteView(blob.data(), n), &program);
+    }
+    for (size_t bit = 0; bit < blob.size() * 8; bit += 41) {
+      std::vector<uint8_t> flipped = blob;
+      flipped[bit / 8] ^= static_cast<uint8_t>(1u << (bit % 8));
+      UniquePointer<D3d9Program> program;
+      D3d9Program::compile_dxbc(allocator, ConstByteView(flipped.data(), flipped.size()), &program);
+    }
+  }
+}
+
+// Barycentrics on the CPU renderer through the kernel: the DXIL pixel shader of SV_Barycentrics on a triangle whose vertices have w 1 (perspective-correct and linear agree), and
+// GetAttributeAtVertex - the triangle all of vertex 1's colour. A clipped triangle (one vertex past the near plane) keeps the weights of the whole triangle.
+void test_barycentrics_kernel() {
+  Env e;
+  namespace b = conformance_blobs;
+  auto shader = [&](const char* name, graphics::ShaderStage stage, Handle* out) {
+    const std::vector<uint8_t> code = read_blob(name);
+    ShaderDesc sd;
+    sd.kind = ShaderKind::Dxbc, sd.stage = stage, sd.code = ConstByteView(code.data(), code.size());
+    return !code.empty() && e.kernel.create_shader(kPid, e.dev, sd, out) == status::kSuccess;
+  };
+  Handle vs = 0, bary = 0, attr = 0;
+  ShaderDesc sd;
+  sd.kind = ShaderKind::Dxbc, sd.stage = graphics::ShaderStage::Vertex, sd.code = ConstByteView(b::k_vs, sizeof b::k_vs);
+  CHECK(e.kernel.create_shader(kPid, e.dev, sd, &vs) == status::kSuccess);
+  CHECK(shader("dxil_ps_bary.dxil", graphics::ShaderStage::Fragment, &bary) && shader("dxil_ps_attr.dxil", graphics::ShaderStage::Fragment, &attr));
+  auto pipeline = [&](Handle ps) {
+    PipelineDesc pd;
+    pd.vertex_shader = vs, pd.fragment_shader = ps, pd.vertex_stride = 28, pd.attribute_count = 2, pd.varying_count = 3;
+    pd.attributes[0] = {0, graphics::VertexFormat::Float3, 0};
+    pd.attributes[1] = {1, graphics::VertexFormat::Float4, 12};
+    pd.cull_mode = graphics::CullMode::None;
+    Handle out = 0;
+    CHECK(e.kernel.create_pipeline(kPid, e.dev, pd, &out) == status::kSuccess);
+    return out;
+  };
+  const Handle with_bary = pipeline(bary), with_attr = pipeline(attr);
+  const Handle rt = e.alloc(kTarget, Format::A8R8G8B8, 16, 16), vb = e.buffer(kAllocVertexBuffer, 3 * 28);
+  // (vertices at pixels (0, 16), (16, 16), (0, 0) of the target - y up in clip space -: red, green, blue)
+  const float v[21] = {-1, -1, 0.5f, 1, 0, 0, 1, 1, -1, 0.5f, 0, 1, 0, 1, -1, 1, 0.5f, 0, 0, 1, 1};
+  CHECK(e.write(vb, floats(v, 21)));
+  auto draw = [&](Handle pipe) {
+    CommandWriter w(e.allocator);
+    w.begin_pass(0, kNoAllocation, kPassClearColor, {0, 0, 0, 0}, 1, 0);
+    w.bind_pipeline(pipe);
+    w.bind_vertex_buffer(1);
+    w.push_constants(floats(kIdentity, 16));
+    w.draw(3);
+    w.end_pass();
+    return e.render(w, {rt, vb});
+  };
+  CHECK(draw(with_bary) == status::kSuccess);
+  // Pixel (2, 2) from the top - centre (2.5, 2.5): weights of vertex 1 (16, 16) is x / 16 = 0.156, of vertex 2 (0, 0) is 1 - y / 16 = 0.844 ... for a pixel counted from the top;
+  // look for the lit pixel whose weights sum to one and check them against its own coordinates.
+  bool found = false;
+  for (uint32_t y = 0; y < 16 && !found; ++y)
+    for (uint32_t x = 0; x < 16 && !found; ++x) {
+      const uint32_t p = e.pixel(rt, x, y);
+      const float r = static_cast<float>((p >> 16) & 0xFF) / 255.0f, g = static_cast<float>((p >> 8) & 0xFF) / 255.0f, bl = static_cast<float>(p & 0xFF) / 255.0f, a = static_cast<float>(p >> 24) / 255.0f;
+      if (x != 4 || p == 0) continue;
+      found = true;
+      // (the sum is 1; green is (x + 0.5) / 16; red equals alpha - perspective-correct and linear agree with w 1)
+      CHECK(r + g + bl > 0.98f && r + g + bl < 1.02f && g > 4.5f / 16.0f - 0.01f && g < 4.5f / 16.0f + 0.01f && r > a - 0.01f && r < a + 0.01f);
+    }
+  CHECK(found);
+  CHECK(draw(with_attr) == status::kSuccess);
+  uint32_t lit = 0, green = 0;
+  for (uint32_t y = 0; y < 16; ++y)
+    for (uint32_t x = 0; x < 16; ++x) {
+      const uint32_t p = e.pixel(rt, x, y);
+      if (p == 0) continue;
+      ++lit;
+      if ((p & 0x00FFFFFFu) == 0x0000FF00u) ++green;
+    }
+  CHECK(lit > 100 && green == lit);
+  // A device without barycentrics refuses the pixel shader.
+  FakeScreen screen(8, 6);
+  graphics::SoftwareDevice software(e.allocator, &screen);
+  SpyDevice limited(software);
+  limited.feature2_mask = ~graphics::kFeature2Barycentrics;
+  Kernel kernel(e.allocator);
+  AdapterConfig c;
+  c.display = &screen;
+  kernel.add_adapter(limited, c);
+  Handle adapter = 0, dev = 0, ps = 0;
+  CHECK(kernel.open_process(kPid) == status::kSuccess && kernel.open_adapter_from_index(kPid, 0, &adapter) == status::kSuccess && kernel.create_device(kPid, adapter, &dev) == status::kSuccess);
+  const std::vector<uint8_t> code = read_blob("dxil_ps_bary.dxil");
+  sd.stage = graphics::ShaderStage::Fragment, sd.code = ConstByteView(code.data(), code.size());
+  CHECK(kernel.create_shader(kPid, dev, sd, &ps) == status::kNotSupported);
+}
+
 int main() {
   test_handle_table();
   test_adapters_and_processes();
@@ -10597,6 +11109,12 @@ int main() {
   test_geometry_kernel();
   test_formats();
   test_tessellation_kernel();
+  test_depth_bounds_kernel();
+  test_sample_positions_kernel();
+  test_view_instance_kernel();
+  test_shading_rate_kernel();
+  test_dxil_sm61_values();
+  test_barycentrics_kernel();
   if (g_failed) {
     printf("%d check(s) failed\n", g_failed);
     return 1;

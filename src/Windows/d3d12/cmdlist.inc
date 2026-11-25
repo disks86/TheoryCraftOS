@@ -81,7 +81,7 @@ typedef struct CmdAlloc {
 typedef struct CmdList CmdList;
 enum { B_PSO = 1, B_TOPOLOGY, B_STENCIL_REF, B_INDEX_BUFFER, B_VERTEX_BUFFERS, B_HEAPS, B_GRAPHICS_SIGNATURE, B_COMPUTE_SIGNATURE, B_GRAPHICS_CONSTANTS, B_COMPUTE_CONSTANTS,
        B_GRAPHICS_CBV, B_GRAPHICS_SRV, B_GRAPHICS_UAV, B_COMPUTE_CBV, B_COMPUTE_SRV, B_COMPUTE_UAV, B_GRAPHICS_TABLE, B_COMPUTE_TABLE, B_DRAW, B_DRAW_INDEXED, B_DISPATCH, B_INDIRECT,
-       B_BLEND_FACTOR, B_STENCIL_REFS, B_DEPTH_BIAS };
+       B_BLEND_FACTOR, B_STENCIL_REFS, B_DEPTH_BIAS, B_DEPTH_BOUNDS, B_VIEW_MASK, B_SHADING_RATE, B_SHADING_RATE_IMAGE };
 static void bundle_log(CmdList *l, UINT id, const UINT64 a[6], const UINT *data, UINT ndata);
 #define BUNDLE_LOG(l, id, ...) do { if ((l)->bundle) { UINT64 a_[6] = {__VA_ARGS__}; bundle_log((l), (id), a_, NULL, 0); return; } } while (0)
 #define BUNDLE_LOG_DATA(l, id, data, n, ...) do { if ((l)->bundle) { UINT64 a_[6] = {__VA_ARGS__}; bundle_log((l), (id), a_, (data), (n)); return; } } while (0)
@@ -178,6 +178,17 @@ struct CmdList {
   D3D12_RENDER_PASS_RENDER_TARGET_DESC rp_rts[8];
   D3D12_RENDER_PASS_DEPTH_STENCIL_DESC rp_ds;
   int rp_has_ds;
+  /* (cmdlist1.inc) the optional rasterizer state: OMSetDepthBounds (0 .. 1 when reset), SetSamplePositions (no pixels: the standard positions), SetViewInstanceMask (0),
+   * RSSetShadingRate / RSSetShadingRateImage (1x1, passthrough, none); and what the chunk being recorded has sent of it (raster_sent: words of each op, 0 not sent) */
+  float depth_bounds[2];
+  UINT sample_count_set, sample_pixels;
+  D3D12_SAMPLE_POSITION sample_positions[16];
+  UINT view_mask;
+  UINT shading_rate, rate_combiners[2];
+  struct Resource *rate_image;
+  int sent_bounds, sent_positions, sent_rate;      /* (bounds, rate: 0 the stream's defaults, 1 the words, 2 not known) */
+  UINT sent_bounds_words[3], sent_rate_words[4];
+  UINT sent_view;              /* (the SetViewInstance words sent, view | viewport << 8 | layer << 12; 0xFFFFFFFF none) */
 };
 
 static const GUID *const g_alloc_iids[] = {&IID_ID3D12Object, &IID_ID3D12DeviceChild, &IID_ID3D12Pageable, &IID_ID3D12CommandAllocator, NULL};
@@ -231,6 +242,9 @@ static int chunk_new(CmdList *l) {
   memset(l->sent_vb_alloc, 0, sizeof l->sent_vb_alloc);
   l->sent_ib_alloc = 0;
   l->sent_viewport = l->sent_scissor = 0;
+  l->sent_bounds = l->sent_rate = 0;      /* (a stream starts with the kernel's defaults of the rasterizer state: the standard sample positions too) */
+  l->sent_positions = l->sample_pixels == 0;
+  l->sent_view = 0;
   l->dirty_heaps = 1;
   if (l->nopen_q) queries_resume(l);
   return 1;
@@ -267,6 +281,9 @@ enum { OP_BEGIN_PASS = 1, OP_END_PASS, OP_BIND_PIPELINE, OP_BIND_VB, OP_BIND_IB,
        OP_GENERATE_MIPMAPS, OP_SET_TOPOLOGY, OP_DRAW_INSTANCED, OP_DRAW_INDEXED_INSTANCED, OP_BEGIN_QUERY, OP_END_QUERY, OP_BIND_UAV, OP_DISPATCH, OP_RESOLVE_REGION, OP_SET_STREAM_OUTPUT,
        OP_SET_ROOT_SIGNATURE, OP_SET_DESCRIPTOR_HEAPS, OP_SET_ROOT_CONSTANTS, OP_SET_ROOT_DESCRIPTOR, OP_SET_ROOT_TABLE, OP_RESOURCE_BARRIER, OP_COPY_BUFFER, OP_COPY_BUFFER_IMAGE,
        OP_DECODE_FRAME, OP_VIDEO_PROCESS };
+/* (the kernel's ops of the optional rasterizer state, numbered apart: CommandStream.hpp) */
+enum { OP_SET_DEPTH_BOUNDS = 56, OP_SET_SAMPLE_POSITIONS = 57, OP_SET_VIEW_INSTANCE = 58, OP_SET_SHADING_RATE = 59 };
+static void send_raster_state(CmdList *l);
 
 static void end_pass(CmdList *l) {
   if (!l->pass_open) return;
@@ -314,6 +331,9 @@ static void list_free_recording(CmdList *l) {
 static void list_reset_state(CmdList *l) {
   memset(&l->pso, 0, sizeof *l - offsetof(CmdList, pso));
   l->topology = D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
+  l->depth_bounds[1] = 1.0f;
+  l->sent_view = 0xFFFFFFFFu;      /* (what the stream has is not known - ClearState in the middle of one -: sent again) */
+  l->sent_bounds = l->sent_rate = 2;
   l->dirty_gfx = l->dirty_cs = l->dirty_heaps = 1;
 }
 
@@ -815,29 +835,67 @@ static int prepare_draw(CmdList *l, int indexed) {
     packet(l, OP_SET_SCISSOR, w, 4 * n);
     l->sent_scissor = 1;
   }
+  send_raster_state(l);
   return 1;
 }
 
 /* ---- drawing and dispatching ------------------------------------------------------------------------------------------------------------------------------------------- */
 
+/* View instancing (a PSO with more than one view) is draw-call looping: the draw is made once for each view of the mask - all the PSO's views, or with
+ * D3D12_VIEW_INSTANCING_FLAG_ENABLE_VIEW_INSTANCE_MASKING those of SetViewInstanceMask's mask -, each after the kernel's SetViewInstance of the view (SV_ViewID) and its
+ * location (added to the shaders' viewport and render target array index). The views of one draw come one after the other: Direct3D 12 orders a view's primitives and
+ * leaves the order between views open. A PSO without views draws as view 0 at no offset. Returns the views (bit n: view n) and sends view 0's state for a plain PSO. */
+static UINT draw_views(CmdList *l) {
+  const Pso *p = l->pso;
+  if (!p->views_on) {
+    if (l->sent_view != 0 && (l->d.dev->caps.features2 & DEV_FEATURE2_VIEW_INSTANCING)) {
+      const UINT w[3] = {0, 0, 0};
+      packet(l, OP_SET_VIEW_INSTANCE, w, 3);
+      l->sent_view = 0;
+    }
+    return 1;
+  }
+  const UINT all = (1u << p->view_count) - 1;
+  return (p->view_flags & D3D12_VIEW_INSTANCING_FLAG_ENABLE_VIEW_INSTANCE_MASKING) ? l->view_mask & all : all;
+}
+static void view_select(CmdList *l, UINT view) {
+  const Pso *p = l->pso;
+  if (!p->views_on) return;
+  const UINT vp = p->view_loc[view].ViewportArrayIndex, rt = p->view_loc[view].RenderTargetArrayIndex;
+  const UINT key = view | vp << 8 | rt << 12;
+  if (key == l->sent_view) return;
+  const UINT w[3] = {view, vp, rt};
+  packet(l, OP_SET_VIEW_INSTANCE, w, 3);
+  l->sent_view = key;
+}
 static void STDMETHODCALLTYPE list_DrawInstanced(CmdList *l, UINT vertices, UINT instances, UINT first_vertex, UINT first_instance) { BUNDLE_LOG(l, B_DRAW, vertices, instances, first_vertex, first_instance);
   if (!vertices || !instances || !prepare_draw(l, 0)) return;
-  if (instances == 1 && first_instance == 0) {
-    UINT w[2] = {vertices, first_vertex};
-    packet(l, OP_DRAW, w, 2);
-  } else {
-    UINT w[4] = {vertices, first_vertex, instances, first_instance};
-    packet(l, OP_DRAW_INSTANCED, w, 4);
+  const UINT views = draw_views(l);
+  for (UINT view = 0; view < 4; ++view) {
+    if (!(views >> view & 1)) continue;
+    view_select(l, view);
+    if (instances == 1 && first_instance == 0) {
+      UINT w[2] = {vertices, first_vertex};
+      packet(l, OP_DRAW, w, 2);
+    } else {
+      UINT w[4] = {vertices, first_vertex, instances, first_instance};
+      packet(l, OP_DRAW_INSTANCED, w, 4);
+    }
   }
 }
 static void STDMETHODCALLTYPE list_DrawIndexedInstanced(CmdList *l, UINT indices, UINT instances, UINT first_index, INT base_vertex, UINT first_instance) { BUNDLE_LOG(l, B_DRAW_INDEXED, indices, instances, first_index, (UINT)base_vertex, first_instance);
   if (!indices || !instances || !l->ib_alloc || !prepare_draw(l, 1)) return;
-  if (instances == 1 && first_instance == 0) {
-    UINT w[3] = {indices, first_index, (UINT)base_vertex};
-    packet(l, OP_DRAW_INDEXED, w, 3);
-  } else {
-    UINT w[5] = {indices, first_index, (UINT)base_vertex, instances, first_instance};
-    packet(l, OP_DRAW_INDEXED_INSTANCED, w, 5);
+  const UINT views = draw_views(l);
+  for (UINT view = 0; view < 4; ++view) {
+    if (!(views >> view & 1)) continue;
+    view_select(l, view);
+    if (instances == 1 && first_instance == 0) {
+      UINT w[3] = {indices, first_index, (UINT)base_vertex};
+      packet(l, OP_DRAW_INDEXED, w, 3);
+    } else {
+      UINT w[5] = {indices, first_index, (UINT)base_vertex, instances, first_instance};
+      packet(l, OP_DRAW_INDEXED_INSTANCED, w, 5);
+    }
   }
 }
 static void STDMETHODCALLTYPE list_Dispatch(CmdList *l, UINT x, UINT y, UINT z) { BUNDLE_LOG(l, B_DISPATCH, x, y, z);

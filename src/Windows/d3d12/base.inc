@@ -359,6 +359,13 @@ struct Dev {
 #define DEV_FEATURE2_SAMPLER_STATE (1u << 11)            /* anisotropy, border colours of any value */
 #define DEV_FEATURE2_VIEWPORTS (1u << 12)                /* sixteen viewports and scissor rectangles, SV_ViewportArrayIndex from geometry shaders */
 #define DEV_FEATURE2_LAYER_ANY_STAGE (1u << 13)          /* SV_RenderTargetArrayIndex and SV_ViewportArrayIndex from vertex and domain shaders */
+#define DEV_FEATURE2_DEPTH_BOUNDS (1u << 30)             /* the depth bounds test (the kernel's SetDepthBounds) */
+#define DEV_FEATURE2_SAMPLE_POSITIONS (1u << 25)         /* programmable sample positions, one pattern or one for each pixel of a 2 x 2 quad (SetSamplePositions) */
+#define DEV_FEATURE2_VIEW_INSTANCING (1u << 26)          /* SV_ViewID and the view's viewport and layer offsets (SetViewInstance): view instancing by draw-call looping */
+#define DEV_FEATURE2_SHADING_RATE (1u << 31)             /* coarse pixel shading: the rate, the combiners, the shading-rate image, SV_ShadingRate (SetShadingRate) */
+#define DEV_FEATURE2_BARYCENTRICS (1u << 28)             /* SV_Barycentrics and GetAttributeAtVertex in pixel shaders */
+#define DEV_FEATURE2_SAMPLE_COPIES (1u << 29)            /* a region of a multisampled image, every sample, into another (ResolveRegion's kResolveCopySamples): DECOMPRESS */
+#define SHADING_RATE_TILE 16                             /* graphics::kShadingRateTileSize: the pixels of a tile of the shading-rate image each way */
 /* What allocations of a kernel format numbered from KF_FIRST_EXTRA may be on the device's adapter (KFC_* bits; 0 for any other format, or from a kernel that has no table) */
 static UINT dev_format_caps(const Dev *d, UINT kf) {
   const KmtCaps *c = &d->caps;

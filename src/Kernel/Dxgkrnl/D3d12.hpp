@@ -38,10 +38,11 @@ constexpr uint32_t kVertexAndConstantBuffer = 0x1, kIndexBuffer = 0x2, kRenderTa
 // (the video queues' states: D3D12_RESOURCE_STATE_VIDEO_DECODE_READ / _WRITE, VIDEO_PROCESS_READ / _WRITE)
 constexpr uint32_t kVideoDecodeRead = 0x10000, kVideoDecodeWrite = 0x20000, kVideoProcessRead = 0x40000, kVideoProcessWrite = 0x80000;
 constexpr uint32_t kVideoEncodeRead = 0x200000, kVideoEncodeWrite = 0x800000;   // (VIDEO_ENCODE_READ / _WRITE)
+constexpr uint32_t kShadingRateSource = 0x1000000;   // (D3D12_RESOURCE_STATE_SHADING_RATE_SOURCE: a variable-rate shading image a draw reads)
 constexpr uint32_t kGenericRead = kVertexAndConstantBuffer | kIndexBuffer | kNonPixelShaderResource | kPixelShaderResource | kIndirectArgument | kCopySource;
 constexpr uint32_t kAll = kVertexAndConstantBuffer | kIndexBuffer | kRenderTarget | kUnorderedAccess | kDepthWrite | kDepthRead | kNonPixelShaderResource | kPixelShaderResource | kStreamOut |
                           kIndirectArgument | kCopyDest | kCopySource | kResolveDest | kResolveSource | kVideoDecodeRead | kVideoDecodeWrite | kVideoProcessRead | kVideoProcessWrite |
-                          kVideoEncodeRead | kVideoEncodeWrite;
+                          kVideoEncodeRead | kVideoEncodeWrite | kShadingRateSource;
 // The states that write: one of them cannot be combined with another.
 constexpr uint32_t kWrite = kRenderTarget | kUnorderedAccess | kDepthWrite | kStreamOut | kCopyDest | kResolveDest | kVideoDecodeWrite | kVideoProcessWrite | kVideoEncodeWrite;
 // What an allocation in the common state may be used for without a barrier (D3D12 promotes it implicitly): reads and copies.
