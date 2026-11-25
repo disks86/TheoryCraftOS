@@ -289,6 +289,10 @@ uint32_t query_adapter_info(Session& s, Call& call, uint64_t arg) {
       // After the name (a user-mode driver that reads only the head does not see them): the multisample counts, the kind of device, the vendor and device numbers. The Vulkan driver reports them.
       for (uint32_t w : {caps.sample_counts, caps.device_kind, caps.vendor_id, caps.device_id}) out.put32(w);
       out.put32(caps.features2);   // (graphics::DeviceFeature2: storage images, layered targets, the single-channel formats)
+      // Then the first format number of a table and its length, and what allocations of each of those formats may be (graphics::FormatCap bits: the formats numbered from 64).
+      out.put32(dxgk::kFirstExtraFormat);
+      out.put32(static_cast<uint32_t>(sizeof caps.format_caps / sizeof caps.format_caps[0]));
+      for (uint32_t w : caps.format_caps) out.put32(w);
       break;
     }
     case kQaiWddm12Caps: case kQaiWddm13Caps: case kQaiWddm20Caps: case kQaiDirectFlipSupport: case kQaiMultiPlaneOverlaySupport: case kQaiMultiPlaneOverlayHudSupport:

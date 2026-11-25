@@ -77,17 +77,18 @@ the vertex shader's end. `d3d11.dll` reads the sizes out of the shaders (`dcl_co
 
 ## Formats
 
-`formats.inc` says how each texture format is kept. The kernel's images have four channels (RGBA32 float/uint/sint, RGBA16 float/unorm/snorm/uint/sint,
-RGB10A2, RGBA8 unorm/sRGB/uint, BGRA8, the depth formats, BC1 - BC3). A format of fewer channels is kept in the four-channel format of its kind, with
-8-bit snorm and sint channels in 16 bits; the channels it does not have read as 0 and alpha as 1, as Direct3D reads them, and a draw into one writes
-only its own channels. R11G11B10_FLOAT, B5G6R5, B5G5R5A1, B4G4R4A4, R10G10B10A2_UINT and R9G9B9E5 are converted texel by texel. D16 is kept in 32-bit
-float, D32_FLOAT_S8X24_UINT in D24S8 (with its stencil, 24 bits of depth). R24G8_TYPELESS and R32G8X24_TYPELESS not made for depth keep their bytes.
-`CheckFormatSupport` answers from the table.
+`formats.inc` says how each texture format is kept. Every colour format of feature level 11_1 is kept as it is: Direct3D 12 below has each with its own channels and
+encoding (R8 / R8G8 / R16 / R16G16 in every kind, A8, R8G8B8A8 snorm and sint, R32G32 and R32G32B32, R11G11B10_FLOAT, R9G9B9E5, R10G10B10A2_UINT, B5G6R5, B5G5R5A1,
+B4G4R4A4, BC1 - BC7 with their sRGB forms; docs/Direct3DKernelMode.md "More texture formats"), so the CPU's bytes are the GPU's. D16 is kept in 32-bit float,
+D32_FLOAT_S8X24_UINT in D24S8 (with its stencil, 24 bits of depth). R24G8_TYPELESS and R32G8X24_TYPELESS not made for depth keep their bytes. `CheckFormatSupport`
+answers from the table, and for the formats whose textures depend on the adapter (`FMT_EXTRA`: the ones the kernel numbers from 64) from Direct3D 12's format support,
+which is what the adapter's device does with each (on virgl, the host's sampler and render masks). Textures are up to 16384 a side where the adapter has them (the CPU
+renderer does; virgl as large as the host's `max_texture_2d_size`).
 
 ## What is not there
 
 - Below `d3d11.dll`, in the kernel: depth buffers of several samples, or levels past the first, read by shaders, a depth texture read while it is the bound (read-only) depth
-  buffer, a view of part of a depth array, a stencil view of a cube; dynamic shader linkage; textures above 4096 a side; BC4 - BC7; `SV_ViewportArrayIndex` (several
+  buffer, a view of part of a depth array, a stencil view of a cube; dynamic shader linkage; `R1_UNORM` (not a format here: `CheckFormatSupport` answers none); `SV_ViewportArrayIndex` (several
   viewports: the first is drawn with), and `SV_RenderTargetArrayIndex` from a vertex or domain shader; dual-source blend factors (`D3D11_BLEND_SRC1_*`: the pipeline is refused), the blend factor on GPUs other than virgl, wireframe, depth bias, the back face's stencil operations, anisotropy, border colours.
 - A vertex and a pixel shader that read one texture unit as different texture and sampler pairs (each stage numbers the units of its own extra pairs) do not go together in a
   pipeline (`E_INVALIDARG` at the draw's pipeline); SampleCmp of a mipmapped colour texture compares the base level on the GPU.

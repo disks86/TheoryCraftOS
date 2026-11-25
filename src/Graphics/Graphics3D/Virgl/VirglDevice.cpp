@@ -281,6 +281,10 @@ class VirglImage final : public IImage {
       // (R8G8B8A8Unorm too is a BGRA image on the host: pixels go in and come out as 0xAARRGGBB words whatever the format's memory order, and a shader sees colours, not bytes.
       // A storage image is an RGBA one - the host's image units have no BGRA format -, its pixels' red and blue swapped on the way in and out)
       default:
+        if (static_cast<uint32_t>(desc.format) >= static_cast<uint32_t>(Format::R8Unorm)) {
+          color_format_ = virgl::extra_format(desc.format);   // (the formats numbered from 64: the host's format of the same layout)
+          break;
+        }
         color_format_ = (desc.usage & kImageStorage) ? virgl::kFormatR8G8B8A8Unorm : virgl::kFormatB8G8R8A8Unorm;
         swap_rb_ = (desc.usage & kImageStorage) != 0;
         break;
@@ -289,7 +293,9 @@ class VirglImage final : public IImage {
     // A sampled image is stored top row first, the way write_pixels() gives it and the sampler reads it, so it does not take the Y_0_TOP flip of the images that are only
     // drawn into (and shown).
     const bool sampled = (desc.usage & kImageSampled) != 0;
-    uint32_t bind = depth ? virgl::kBindDepthStencil | (sampled ? virgl::kBindSamplerView : 0u) : is_compressed_format(desc.format) ? virgl::kBindSamplerView : (virgl::kBindRenderTarget | virgl::kBindSamplerView);
+    // (a format the host cannot draw into - block-compressed, and the formats numbered from 64 its render mask does not have - is a sampler view alone)
+    const bool renderable = !is_compressed_format(desc.format) && (static_cast<uint32_t>(desc.format) < static_cast<uint32_t>(Format::R8Unorm) || gpu.virgl_format_renderable(color_format_));
+    uint32_t bind = depth ? virgl::kBindDepthStencil | (sampled ? virgl::kBindSamplerView : 0u) : renderable ? (virgl::kBindRenderTarget | virgl::kBindSamplerView) : virgl::kBindSamplerView;
     if (desc.usage & kImagePresent) bind |= virgl::kBindScanout;
     // A volume has its slices as the depth; an array, a cube or a cube array its layers as the array size (a cube: six). A cube that is a storage image is an array on the host -
     // the image units take a 2D array of its faces, which a texture of the cube target is not - and is sampled as a cube through a view of that target.
@@ -431,7 +437,7 @@ class VirglImage final : public IImage {
       case Format::R32Uint: return virgl::kFormatR32Uint;
       case Format::R32Sint: return virgl::kFormatR32Sint;
       case Format::R32Float: return virgl::kFormatR32Float;
-      default: return virgl::kFormatR8G8B8A8Unorm;
+      default: return static_cast<uint32_t>(f) >= static_cast<uint32_t>(Format::R8Unorm) ? virgl::extra_format(f) : virgl::kFormatR8G8B8A8Unorm;
     }
   }
   uint32_t view() const { return view_; }
@@ -485,10 +491,9 @@ class VirglImage final : public IImage {
     if (desc_.samples != 1 || desc_.format == Format::D32Float || is_wide_format(desc_.format) || is_compressed_format(desc_.format) || level >= desc_.mip_levels ||
         layer >= level_layers(level) || pixels.size() != count || !ensure_backing(uint64_t{desc_.extent.width} * desc_.extent.height))
       return false;
-    const ArrayView<uint32_t> staged = backing_.cast<uint32_t>();
-    for (uint64_t i = 0; i < count; ++i) staged[i] = pixels[i];
-    swap_words(staged.first(count));
-    TransferHost3d transfer{header(kCmdTransferToHost3d), {0, 0, layer, width, height, 1}, 0, id_, level, width * 4, 0};
+    const uint32_t texel = stage(pixels);   // (0xAARRGGBB words, or the 1 or 2 bytes of a packed 32-bit format)
+    if (!texel) return false;
+    TransferHost3d transfer{header(kCmdTransferToHost3d), {0, 0, layer, width, height, 1}, 0, id_, level, width * texel, 0};
     return device_.gpu().command(as_bytes(transfer), /*fence=*/false);
   }
   bool read_subresource(uint32_t level, uint32_t layer, ArrayView<uint32_t> out) override {
@@ -498,12 +503,9 @@ class VirglImage final : public IImage {
     if (desc_.samples != 1 || desc_.format == Format::D32Float || is_wide_format(desc_.format) || is_compressed_format(desc_.format) || level >= desc_.mip_levels ||
         layer >= level_layers(level) || out.size() < count || !ensure_backing(uint64_t{desc_.extent.width} * desc_.extent.height))
       return false;
-    TransferHost3d transfer{header(kCmdTransferFromHost3d), {0, 0, layer, width, height, 1}, 0, id_, level, width * 4, 0};
+    TransferHost3d transfer{header(kCmdTransferFromHost3d), {0, 0, layer, width, height, 1}, 0, id_, level, width * staged_texel_bytes(), 0};
     if (!device_.gpu().command(as_bytes(transfer))) return false;
-    const ArrayView<uint32_t> pixels = backing_.cast<uint32_t>();
-    for (uint64_t i = 0; i < count; ++i) out[i] = pixels[i];
-    swap_words(out.first(count));
-    return true;
+    return unstage(out.first(count));
   }
   bool write_subresource_float(uint32_t level, uint32_t layer, ArrayView<const Vec4> pixels) override {
     if (level == 0 && layer == 0 && layer_count() == 1) return write_pixels_float(pixels);
@@ -537,10 +539,9 @@ class VirglImage final : public IImage {
     const uint32_t width = mip_extent(desc_.extent.width, level), height = mip_extent(desc_.extent.height, level);
     const uint64_t count = uint64_t{width} * height;
     if (level >= desc_.mip_levels || pixels.size() != count || !ensure_backing(uint64_t{desc_.extent.width} * desc_.extent.height)) return false;
-    const ArrayView<uint32_t> staged = backing_.cast<uint32_t>();
-    for (uint64_t i = 0; i < count; ++i) staged[i] = pixels[i];
-    swap_words(staged.first(count));
-    TransferHost3d transfer{header(kCmdTransferToHost3d), {0, 0, 0, width, height, 1}, 0, id_, level, width * 4, 0};
+    const uint32_t texel = stage(pixels);
+    if (!texel) return false;
+    TransferHost3d transfer{header(kCmdTransferToHost3d), {0, 0, 0, width, height, 1}, 0, id_, level, width * texel, 0};
     return device_.gpu().command(as_bytes(transfer), /*fence=*/false);
   }
   // The blocks of a level of a layer (a slice, a face; 0 for a plain texture) of a block-compressed image: staged at the start of the backing (room for level 0 of a layer, as
@@ -558,10 +559,9 @@ class VirglImage final : public IImage {
   bool write_layer_pixels(uint32_t layer, ArrayView<const uint32_t> pixels) override {
     const uint64_t count = uint64_t{desc_.extent.width} * desc_.extent.height;
     if (desc_.kind == TextureKind::Texture2D || layer >= layer_count() || pixels.size() != count || !ensure_backing(count)) return false;
-    const ArrayView<uint32_t> staged = backing_.cast<uint32_t>();
-    for (uint64_t i = 0; i < count; ++i) staged[i] = pixels[i];
-    swap_words(staged.first(count));
-    TransferHost3d transfer{header(kCmdTransferToHost3d), {0, 0, layer, desc_.extent.width, desc_.extent.height, 1}, 0, id_, 0, desc_.extent.width * 4, 0};
+    const uint32_t texel = stage(pixels);
+    if (!texel) return false;
+    TransferHost3d transfer{header(kCmdTransferToHost3d), {0, 0, layer, desc_.extent.width, desc_.extent.height, 1}, 0, id_, 0, desc_.extent.width * texel, 0};
     return device_.gpu().command(as_bytes(transfer), /*fence=*/false);
   }
   bool write_layer_pixels_float(uint32_t layer, ArrayView<const Vec4> pixels) override {
@@ -576,12 +576,9 @@ class VirglImage final : public IImage {
   bool read_layer_pixels(uint32_t layer, ArrayView<uint32_t> out) override {
     const uint64_t count = uint64_t{desc_.extent.width} * desc_.extent.height;
     if (desc_.kind == TextureKind::Texture2D || layer >= layer_count() || out.size() < count || !ensure_backing(count)) return false;
-    TransferHost3d transfer{header(kCmdTransferFromHost3d), {0, 0, layer, desc_.extent.width, desc_.extent.height, 1}, 0, id_, 0, desc_.extent.width * 4, 0};
+    TransferHost3d transfer{header(kCmdTransferFromHost3d), {0, 0, layer, desc_.extent.width, desc_.extent.height, 1}, 0, id_, 0, desc_.extent.width * staged_texel_bytes(), 0};
     if (!device_.gpu().command(as_bytes(transfer))) return false;
-    const ArrayView<uint32_t> pixels = backing_.cast<uint32_t>();
-    for (uint64_t i = 0; i < count; ++i) out[i] = pixels[i];
-    swap_words(out.first(count));
-    return true;
+    return unstage(out.first(count));
   }
   bool read_layer_pixels_float(uint32_t layer, ArrayView<Vec4> out) override {
     const uint64_t count = uint64_t{desc_.extent.width} * desc_.extent.height;
@@ -598,12 +595,9 @@ class VirglImage final : public IImage {
     const uint32_t width = mip_extent(desc_.extent.width, level), height = mip_extent(desc_.extent.height, level);
     const uint64_t count = uint64_t{width} * height;
     if (level >= desc_.mip_levels || is_wide_format(desc_.format) || out.size() < count || !ensure_backing(uint64_t{desc_.extent.width} * desc_.extent.height)) return false;
-    TransferHost3d transfer{header(kCmdTransferFromHost3d), {0, 0, 0, width, height, 1}, 0, id_, level, width * 4, 0};
+    TransferHost3d transfer{header(kCmdTransferFromHost3d), {0, 0, 0, width, height, 1}, 0, id_, level, width * staged_texel_bytes(), 0};
     if (!device_.gpu().command(as_bytes(transfer))) return false;
-    const ArrayView<uint32_t> pixels = backing_.cast<uint32_t>();
-    for (uint64_t i = 0; i < count; ++i) out[i] = pixels[i];
-    swap_words(out.first(count));
-    return true;
+    return unstage(out.first(count));
   }
   // Stored with window y 0 at the top (drawn into and shown: the Y_0_TOP flag), or the way a texture is - row 0 first, window y 0 at the bottom of GL's window - which is what a
   // render target that is also sampled needs, so that the sampler reads it the way a texture is read (drawn upright by an unflipped viewport, see VirglPipeline).
@@ -616,12 +610,9 @@ class VirglImage final : public IImage {
     if (!ensure_backing(count)) return false;
     TransferHost3d transfer{header(kCmdTransferFromHost3d),
                             {0, 0, 0, desc_.extent.width, desc_.extent.height, 1}, 0, id_, 0,
-                            desc_.extent.width * 4, 0};
+                            desc_.extent.width * staged_texel_bytes(), 0};
     if (!gpu.command(as_bytes(transfer))) return false;
-    const ArrayView<uint32_t> pixels = backing_.cast<uint32_t>();
-    for (uint64_t i = 0; i < count; ++i) out[i] = pixels[i];
-    swap_words(out.first(count));
-    return true;
+    return unstage(out.first(count));
   }
 
   bool read_pixels_float(ArrayView<Vec4> out) override {
@@ -650,17 +641,16 @@ class VirglImage final : public IImage {
     const uint64_t count = uint64_t{desc_.extent.width} * desc_.extent.height;
     if (desc_.samples > 1 || desc_.format == Format::D32Float || is_wide_format(desc_.format) || pixels.size() != count) return false;
     if (!ensure_backing(count)) return false;
-    const ArrayView<uint32_t> staged = backing_.cast<uint32_t>();
-    for (uint64_t i = 0; i < count; ++i) staged[i] = pixels[i];
-    swap_words(staged.first(count));
-    TransferHost3d transfer{header(kCmdTransferToHost3d), {0, 0, 0, desc_.extent.width, desc_.extent.height, 1}, 0, id_, 0, desc_.extent.width * 4, 0};
+    const uint32_t texel = stage(pixels);
+    if (!texel) return false;
+    TransferHost3d transfer{header(kCmdTransferToHost3d), {0, 0, 0, desc_.extent.width, desc_.extent.height, 1}, 0, id_, 0, desc_.extent.width * texel, 0};
     return device_.gpu().command(as_bytes(transfer), /*fence=*/false);
   }
 
   // A rectangle: its rows go to the same place in the backing (the backing is the whole image), and the host copies just that box.
   bool write_rect(const Rect2D& area, ArrayView<const uint32_t> pixels, uint32_t pitch) override {
     const Extent2D e = desc_.extent;
-    if (desc_.samples > 1 || desc_.format == Format::D32Float || is_wide_format(desc_.format) || !area.width || !area.height || pitch < area.width) return false;
+    if (desc_.samples > 1 || desc_.format == Format::D32Float || is_wide_format(desc_.format) || is_packed32_format(desc_.format) || !area.width || !area.height || pitch < area.width) return false;
     if (area.x < 0 || area.y < 0 || uint64_t{static_cast<uint32_t>(area.x)} + area.width > e.width || uint64_t{static_cast<uint32_t>(area.y)} + area.height > e.height) return false;
     if (pixels.size() < uint64_t{area.height - 1} * pitch + area.width) return false;
     if (!ensure_backing(uint64_t{e.width} * e.height)) return false;
@@ -689,6 +679,40 @@ class VirglImage final : public IImage {
     return true;
   }
 
+  // The bytes of a texel in the backing: 4 (0xAARRGGBB words), or the 1 or 2 of a packed 32-bit format, which the host keeps in its own layout.
+  uint32_t staged_texel_bytes() const { return is_packed32_format(desc_.format) ? bytes_per_pixel(desc_.format) : 4u; }
+  // 0xAARRGGBB words into the start of the backing as the host takes them; the texel bytes (0: they do not fit).
+  uint32_t stage(ArrayView<const uint32_t> pixels) {
+    if (!is_packed32_format(desc_.format)) {
+      ArrayView<uint32_t> staged;
+      if (!backing_.try_cast<uint32_t>(&staged) || staged.size() < pixels.size()) return 0;
+      for (uint64_t i = 0; i < pixels.size(); ++i) staged[i] = pixels[i];
+      swap_words(staged.first(pixels.size()));
+      return 4;
+    }
+    const uint32_t texel = bytes_per_pixel(desc_.format);
+    ByteWriter out{backing_};
+    for (const uint32_t p : pixels) {
+      const uint32_t v = packed32_from_argb(desc_.format, p);
+      if (texel == 1) out.u8(static_cast<uint8_t>(v));
+      else out.le16(static_cast<uint16_t>(v));
+    }
+    return out.ok() ? texel : 0;
+  }
+  // The start of the backing (what the host copied into it) as 0xAARRGGBB words.
+  bool unstage(ArrayView<uint32_t> out) const {
+    if (!is_packed32_format(desc_.format)) {
+      ArrayView<uint32_t> pixels;
+      if (!backing_.try_cast<uint32_t>(&pixels) || pixels.size() < out.size()) return false;
+      for (uint64_t i = 0; i < out.size(); ++i) out[i] = pixels[i];
+      swap_words(out);
+      return true;
+    }
+    const uint32_t texel = bytes_per_pixel(desc_.format);
+    ByteReader in{ConstByteView(backing_)};
+    for (uint32_t& p : out) p = packed32_to_argb(desc_.format, texel == 1 ? in.u8() : in.le16());
+    return in.ok();
+  }
   // (a storage image of 8-bit colour is RGBA on the host: the 0xAARRGGBB words it is written and read in have red and blue turned around)
   uint32_t swap_word(uint32_t w) const { return swap_rb_ ? (w & 0xFF00FF00u) | ((w & 0xFF) << 16) | ((w >> 16) & 0xFF) : w; }
   void swap_words(ArrayView<uint32_t> words) const {
@@ -1411,6 +1435,18 @@ VirglDevice::~VirglDevice() {
 }
 
 // (Called from submit, which RenderNode's LockedDevice runs one at a time: the table needs no lock of its own.)
+// The sampler a texture unit is bound with: an integer texture's is nearest - the host's GL takes an integer texture with a linear filter as incomplete and reads zeros, also in
+// texel fetches, where Direct3D's Load ignores the sampler -, any other's as it is.
+namespace {
+SamplerDesc unfiltered_for(SamplerDesc sampler, const VirglImage* texture) {
+  if (texture && is_integer_format(texture->format())) {
+    sampler.filter = Filter::Nearest;
+    if (sampler.mip_filter == MipFilter::Linear) sampler.mip_filter = MipFilter::Nearest;
+  }
+  return sampler;
+}
+}  // namespace
+
 uint32_t VirglDevice::sampler_state(const SamplerDesc& sampler) {
   // (PIPE_TEX_WRAP_*: repeat 0, clamp to edge 2, clamp to border 3, mirror repeat 4, mirror clamp to edge 6; PIPE_TEX_MIPFILTER_*: nearest 0, linear 1, none 2)
   static const uint32_t kWrap[] = {virgl::kWrapRepeat, virgl::kWrapClampToEdge, 4, 3, 6};
@@ -1465,7 +1501,35 @@ IBuffer* VirglDevice::create_buffer(uint64_t size, uint32_t usage) {
 }
 void VirglDevice::destroy_buffer(IBuffer* buffer) { destroy(gpu_.allocator(), static_cast<VirglBuffer*>(buffer)); }
 
+uint32_t VirglDevice::format_caps(Format f) const {
+  const uint32_t host = virgl::extra_format(f);
+  if (!host || !gpu_.virgl_format_sampled(host)) return 0;
+  if (is_compressed_format(f)) return kFormatSampled | kFormatFiltered | kFormatMipmaps | kFormatNative;
+  const bool integer = is_integer_format(f);
+  uint32_t caps = kFormatSampled | (integer ? 0u : kFormatFiltered);
+  if (gpu_.virgl_format_renderable(host) && f != Format::R9G9B9E5Float) caps |= kFormatRenderTarget | (integer ? 0u : kFormatBlendable);
+  // (levels: of the packed 32-bit formats, staged as the host keeps them; of every format where the device has levels of every image - the host's texture views, kFeature2MipmappedLayers)
+  if (is_packed32_format(f) || (info().features2 & kFeature2MipmappedLayers)) caps |= kFormatMipmaps;
+  const bool image_unit = f != Format::A8Unorm && f != Format::B5G6R5Unorm && f != Format::B5G5R5A1Unorm && f != Format::B4G4R4A4Unorm && f != Format::R9G9B9E5Float &&
+                          f != Format::R32G32B32Uint && f != Format::R32G32B32Sint && f != Format::R32G32B32Float;
+  if (image_unit && (info().features2 & kFeature2StorageImages)) caps |= kFormatStorage;
+  return caps;
+}
+uint32_t VirglDevice::max_image_dimension() const {
+  const uint32_t host = gpu_.virgl_max_texture_2d();
+  return host < 4096 ? 4096 : host > 16384 ? 16384 : host;
+}
+
 IImage* VirglDevice::create_image(const ImageDesc& desc) {
+  if (desc.extent.width > max_image_dimension() || desc.extent.height > max_image_dimension()) return nullptr;
+  // (a format numbered from 64: what format_caps says of it)
+  const bool extra = static_cast<uint32_t>(desc.format) >= static_cast<uint32_t>(Format::R8Unorm);
+  if (extra) {
+    const uint32_t caps = format_caps(desc.format);
+    if (!(caps & kFormatSampled) || ((desc.usage & kImageColorAttachment) && !(caps & kFormatRenderTarget)) || ((desc.usage & kImageStorage) && !(caps & kFormatStorage)) ||
+        (desc.mip_levels > 1 && !(caps & kFormatMipmaps)) || desc.samples != 1)
+      return nullptr;
+  }
   // (mipmaps: a plain texture of 8-bit colour that is only sampled, as the kernel's own; with kFeature2MipmappedLayers any image of one sample - arrays, volumes, cubes, cube arrays,
   // targets, depth buffers, storage images, the wide formats -; its levels are written one by one)
   if (desc.mip_levels == 0 || desc.mip_levels > mip_level_limit(desc.extent)) return nullptr;
@@ -1491,7 +1555,7 @@ IImage* VirglDevice::create_image(const ImageDesc& desc) {
                                        !(info().features2 & kFeature2StorageImages)))
     return nullptr;
   if (desc.mip_levels != 1 && !all_levels && ((desc.usage & ~kImageStorage) != kImageSampled || desc.kind != TextureKind::Texture2D || desc.samples != 1 || desc.layers != 1 ||
-                                               (desc.format != Format::B8G8R8A8Unorm && desc.format != Format::B8G8R8A8Srgb && desc.format != Format::R8G8B8A8Unorm && desc.format != Format::R8G8B8A8Srgb)))
+                                               (desc.format != Format::B8G8R8A8Unorm && desc.format != Format::B8G8R8A8Srgb && desc.format != Format::R8G8B8A8Unorm && desc.format != Format::R8G8B8A8Srgb && !is_packed32_format(desc.format))))
     return nullptr;
   if (desc.mip_levels != 1 && (desc.samples != 1 || (desc.usage & kImagePresent))) return nullptr;
   if (desc.samples != 1) {
@@ -1504,7 +1568,7 @@ IImage* VirglDevice::create_image(const ImageDesc& desc) {
     // staged as such: write_subresource_float), one level or with kFeature2MipmappedLayers several; or a depth buffer of layers, an array, a cube or a cube array - maybe sampled too)
     const bool depth_layers = desc.format == Format::D32Float && (desc.usage & ~kImageSampled) == kImageDepthAttachment && desc.kind != TextureKind::Texture3D;
     const bool colour = (desc.usage & kImageSampled) && !(desc.usage & ~(kImageSampled | kImageColorAttachment | kImageStorage)) &&
-                        (desc.format == Format::B8G8R8A8Unorm || desc.format == Format::R8G8B8A8Unorm || is_wide_format(desc.format));
+                        (desc.format == Format::B8G8R8A8Unorm || desc.format == Format::R8G8B8A8Unorm || is_wide_format(desc.format) || is_packed32_format(desc.format));
     if ((!colour && !depth_layers) || layers == 0 || layers > kMaxTextureLayers || (desc.mip_levels != 1 && !all_levels) || (cube && desc.extent.width != desc.extent.height)) return nullptr;
     if ((depth_layers || (desc.usage & kImageColorAttachment)) && !(info().features2 & kFeature2LayeredTargets)) return nullptr;
   } else if (desc.layers != 1) {
@@ -1517,7 +1581,7 @@ IImage* VirglDevice::create_image(const ImageDesc& desc) {
   if ((desc.usage & kImageSampled) && (desc.usage & kImageDepthAttachment) &&
       (desc.format != Format::D32Float || desc.samples != 1 || (desc.mip_levels != 1 && !all_levels) || (desc.usage & ~(kImageSampled | kImageDepthAttachment))))
     return nullptr;
-  if ((desc.usage & kImageSampled) && desc.format != Format::D32Float && desc.format != Format::B8G8R8A8Unorm && desc.format != Format::B8G8R8A8Srgb && desc.format != Format::R8G8B8A8Unorm && desc.format != Format::R8G8B8A8Srgb && !is_wide_format(desc.format)) return nullptr;
+  if ((desc.usage & kImageSampled) && desc.format != Format::D32Float && desc.format != Format::B8G8R8A8Unorm && desc.format != Format::B8G8R8A8Srgb && desc.format != Format::R8G8B8A8Unorm && desc.format != Format::R8G8B8A8Srgb && !is_wide_format(desc.format) && !is_packed32_format(desc.format)) return nullptr;
   if (!desc.extent.width || !desc.extent.height || desc.format == Format::Undefined) return nullptr;
   if (desc.stencil && desc.format != Format::D32Float) return nullptr;
   VirglImage* image = make<VirglImage>(gpu_.allocator(), *this, desc);
@@ -2171,7 +2235,7 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
           if (unit_count) {
             uint32_t states[kMaxTextureUnits] = {};
             for (uint32_t unit = 0; unit < unit_count; ++unit)
-              if (textures[unit] && !(states[unit] = sampler_state(samplers[unit]))) return false;
+              if (textures[unit] && !(states[unit] = sampler_state(unfiltered_for(samplers[unit], textures[unit])))) return false;
             bool depth_views = false;   // (see the draws': the host's depth texture mode is set as a view is bound)
             for (uint32_t unit = 0; unit < unit_count; ++unit) depth_views = depth_views || (textures[unit] && textures[unit]->sampled_depth());
             if (depth_views) {
@@ -2380,7 +2444,7 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
             // (to the vertex and the pixel stage alike: a vertex shader may read the units too, numbered as the pipeline's)
             uint32_t states[kMaxTextureUnits];
             for (uint32_t unit = 0; unit < unit_count; ++unit) {
-              states[unit] = sampler_state(samplers[unit]);   // (created straight away, so it exists before the stream that uses it)
+              states[unit] = sampler_state(unfiltered_for(samplers[unit], textures[unit]));   // (created straight away, so it exists before the stream that uses it)
               if (!states[unit]) return false;
             }
             // (and to the geometry, control and evaluation stages the pipeline has: a texture read there, by the same numbers)

@@ -82,17 +82,40 @@ struct Luid {
 // R32Uint, R32Sint, R32Float (DXGI R32_UINT / R32_SINT / R32_FLOAT, values 25 .. 27) keep one 32-bit channel (the adapter's kFeature2SingleChannelFormats): wide formats as well, read as
 // (r, 0, 0, 1); the integer ones are what the atomic operations of storage images take.
 enum class Format : uint32_t { Unknown, A8R8G8B8, X8R8G8B8, A8B8G8R8, X8B8G8R8, D32Float, D24S8, A16B16G16R16F, A32B32G32R32F, A8R8G8B8Srgb, A8B8G8R8Srgb, A16B16G16R16, A32B32G32R32Uint, A32B32G32R32Sint, A16B16G16R16Uint, A16B16G16R16Sint, A8B8G8R8Uint, A16B16G16R16Snorm, A2B10G10R10,
-                               Bc1, Bc2, Bc3, Bc1Srgb, Bc2Srgb, Bc3Srgb, R32Uint, R32Sint, R32Float };   // (BC1 .. BC3: block-compressed, 4 x 4 pixels a block of 8 or 16 bytes - see is_compressed)
+                               Bc1, Bc2, Bc3, Bc1Srgb, Bc2Srgb, Bc3Srgb, R32Uint, R32Sint, R32Float,   // (BC1 .. BC3: block-compressed, 4 x 4 pixels a block of 8 or 16 bytes - see is_compressed)
+                               // The rest of Direct3D's colour formats, numbered from 64 as graphics::Format numbers them (the same value is the same format: device_format_of). Each is what
+                               // its DXGI name says, in memory as Direct3D lays it out (pixel_bytes); what a device does with each is its graphics::FormatCap bits (AdapterCaps::format_caps).
+                               // R8Unorm .. B4G4R4A4Unorm have mip levels (the devices keep them in 32-bit pixels); the others up to R10G10B10A2Uint are wide (Vec4s, one level).
+                               R8Unorm = 64, R8G8Unorm, A8Unorm, B5G6R5Unorm, B5G5R5A1Unorm, B4G4R4A4Unorm,
+                               R8Snorm, R8Uint, R8Sint, R8G8Snorm, R8G8Uint, R8G8Sint, R8G8B8A8Snorm, R8G8B8A8Sint,
+                               R16Unorm, R16Snorm, R16Uint, R16Sint, R16Float, R16G16Unorm, R16G16Snorm, R16G16Uint, R16G16Sint, R16G16Float,
+                               R32G32Uint, R32G32Sint, R32G32Float, R32G32B32Uint, R32G32B32Sint, R32G32B32Float,
+                               R11G11B10Float, R9G9B9E5Float, R10G10B10A2Uint,
+                               Bc4Unorm, Bc4Snorm, Bc5Unorm, Bc5Snorm, Bc6hUfloat, Bc6hSfloat, Bc7Unorm, Bc7Srgb };
+// The last value of the first run of formats, and the first and last of the second (a format number from user mode is one of these).
+constexpr uint32_t kLastBaseFormat = static_cast<uint32_t>(Format::R32Float), kFirstExtraFormat = 64, kLastExtraFormat = static_cast<uint32_t>(Format::Bc7Srgb);
+constexpr bool is_known_format(uint32_t f) { return f <= kLastBaseFormat || (f >= kFirstExtraFormat && f <= kLastExtraFormat); }
+constexpr bool is_extra(Format f) { return static_cast<uint32_t>(f) >= kFirstExtraFormat; }
+constexpr bool is_packed32(Format f) { return f >= Format::R8Unorm && f <= Format::B4G4R4A4Unorm; }
+constexpr bool is_extra_wide(Format f) { return f >= Format::R8Snorm && f <= Format::R10G10B10A2Uint; }
+constexpr bool is_extra_compressed(Format f) { return f >= Format::Bc4Unorm && f <= Format::Bc7Srgb; }
 
 constexpr bool is_depth(Format f) { return f == Format::D32Float || f == Format::D24S8; }
 constexpr bool is_float(Format f) { return f == Format::A16B16G16R16F || f == Format::A32B32G32R32F; }
 constexpr bool is_srgb(Format f) { return f == Format::A8R8G8B8Srgb || f == Format::A8B8G8R8Srgb; }
-constexpr bool is_integer(Format f) { return f == Format::A32B32G32R32Uint || f == Format::A32B32G32R32Sint || f == Format::A16B16G16R16Uint || f == Format::A16B16G16R16Sint || f == Format::A8B8G8R8Uint || f == Format::R32Uint || f == Format::R32Sint; }
+constexpr bool is_integer(Format f) {
+  switch (f) {
+    case Format::A32B32G32R32Uint: case Format::A32B32G32R32Sint: case Format::A16B16G16R16Uint: case Format::A16B16G16R16Sint: case Format::A8B8G8R8Uint: case Format::R32Uint: case Format::R32Sint:
+    case Format::R8Uint: case Format::R8Sint: case Format::R8G8Uint: case Format::R8G8Sint: case Format::R8G8B8A8Sint: case Format::R16Uint: case Format::R16Sint: case Format::R16G16Uint:
+    case Format::R16G16Sint: case Format::R32G32Uint: case Format::R32G32Sint: case Format::R32G32B32Uint: case Format::R32G32B32Sint: case Format::R10G10B10A2Uint: return true;
+    default: return false;
+  }
+}
 constexpr bool is_single_channel(Format f) { return f == Format::R32Uint || f == Format::R32Sint || f == Format::R32Float; }
 // Formats that are read and written as Vec4s (no 32-bit words), one level.
-constexpr bool is_wide(Format f) { return is_float(f) || f == Format::A16B16G16R16 || f == Format::A16B16G16R16Snorm || f == Format::A2B10G10R10 || is_integer(f) || f == Format::R32Float; }
-constexpr bool is_color(Format f) { return f == Format::A8R8G8B8 || f == Format::X8R8G8B8 || f == Format::A8B8G8R8 || f == Format::X8B8G8R8 || is_srgb(f) || is_wide(f); }
-constexpr bool has_alpha(Format f) { return f == Format::A8R8G8B8 || f == Format::A8B8G8R8 || is_srgb(f) || is_wide(f); }
+constexpr bool is_wide(Format f) { return is_float(f) || f == Format::A16B16G16R16 || f == Format::A16B16G16R16Snorm || f == Format::A2B10G10R10 || is_integer(f) || f == Format::R32Float || is_extra_wide(f); }
+constexpr bool is_color(Format f) { return f == Format::A8R8G8B8 || f == Format::X8R8G8B8 || f == Format::A8B8G8R8 || f == Format::X8B8G8R8 || is_srgb(f) || is_wide(f) || is_packed32(f); }
+constexpr bool has_alpha(Format f) { return f == Format::A8R8G8B8 || f == Format::A8B8G8R8 || is_srgb(f) || is_wide(f) || is_packed32(f); }
 // Bytes of one pixel of a colour format.
 // A sampler's address mode in a command stream or a descriptor: the graphics::AddressMode in the low byte and, in the word of the u direction, the graphics::BorderColor in
 // bits 8-9. False for a word that is neither.
@@ -121,11 +144,13 @@ constexpr graphics::AddressMode base_address_mode(graphics::AddressMode mode) {
 
 // Block-compressed (BC1 = DXT1, BC2 = DXT3, BC3 = DXT5, and their sRGB forms): sampled textures only (kAllocTexture, kAllocShared), any kind, with mip levels; the backing is rows of
 // 4 x 4 blocks (image_row_bytes / image_rows), and the device samples them as they are (graphics::kFeatureCompressedFormats) or gets them decoded to 8-bit pixels.
-constexpr bool is_compressed(Format f) { return f == Format::Bc1 || f == Format::Bc2 || f == Format::Bc3 || f == Format::Bc1Srgb || f == Format::Bc2Srgb || f == Format::Bc3Srgb; }
+constexpr bool is_compressed(Format f) { return f == Format::Bc1 || f == Format::Bc2 || f == Format::Bc3 || f == Format::Bc1Srgb || f == Format::Bc2Srgb || f == Format::Bc3Srgb || is_extra_compressed(f); }
+// The bytes of a 4 x 4 block of a block-compressed format: 8 for BC1 and BC4, 16 for the others.
+constexpr uint32_t block_bytes(Format f) { return f == Format::Bc1 || f == Format::Bc1Srgb || f == Format::Bc4Unorm || f == Format::Bc4Snorm ? 8 : 16; }
 constexpr uint32_t pixel_bytes(Format f);
 // The bytes of one row of the backing of a level `w` pixels wide (of pixels, or of blocks), and the number of such rows of a level `h` high.
 constexpr uint64_t image_row_bytes(Format f, uint32_t w) {
-  return is_compressed(f) ? uint64_t{(w + 3) / 4} * (f == Format::Bc1 || f == Format::Bc1Srgb ? 8u : 16u) : uint64_t{w} * pixel_bytes(f);
+  return is_compressed(f) ? (uint64_t{w} + 3) / 4 * block_bytes(f) : uint64_t{w} * pixel_bytes(f);
 }
 constexpr uint32_t image_rows(Format f, uint32_t h) { return is_compressed(f) ? (h + 3) / 4 : h; }
 constexpr uint64_t image_level_bytes(Format f, uint32_t w, uint32_t h) { return image_row_bytes(f, w) * image_rows(f, h); }
@@ -133,6 +158,11 @@ constexpr uint32_t pixel_bytes(Format f) {
   switch (f) {
     case Format::A16B16G16R16F: case Format::A16B16G16R16: case Format::A16B16G16R16Snorm: case Format::A16B16G16R16Uint: case Format::A16B16G16R16Sint: return 8;
     case Format::A32B32G32R32F: case Format::A32B32G32R32Uint: case Format::A32B32G32R32Sint: return 16;
+    case Format::R8Unorm: case Format::A8Unorm: case Format::R8Snorm: case Format::R8Uint: case Format::R8Sint: return 1;
+    case Format::R8G8Unorm: case Format::B5G6R5Unorm: case Format::B5G5R5A1Unorm: case Format::B4G4R4A4Unorm: case Format::R8G8Snorm: case Format::R8G8Uint: case Format::R8G8Sint:
+    case Format::R16Unorm: case Format::R16Snorm: case Format::R16Uint: case Format::R16Sint: case Format::R16Float: return 2;
+    case Format::R32G32Uint: case Format::R32G32Sint: case Format::R32G32Float: return 8;
+    case Format::R32G32B32Uint: case Format::R32G32B32Sint: case Format::R32G32B32Float: return 12;
     default: return 4;
   }
 }
@@ -182,7 +212,8 @@ constexpr TileShape tile_shape(uint32_t texel_bytes) {
     default: return {};
   }
 }
-constexpr uint32_t kMaxTextureDimension = 4096;
+// The largest width and height of a texture (Direct3D 11's 16384); an adapter whose device has smaller images says so (AdapterCaps::max_texture_dimension, at least kMinTextureDimension).
+constexpr uint32_t kMaxTextureDimension = 16384, kMinTextureDimension = 4096;
 constexpr uint64_t kMaxBufferBytes = 256ull * 1024 * 1024;
 
 struct AllocationDesc {
@@ -271,6 +302,8 @@ struct AdapterCaps {
   uint32_t vendor_id = 0;            // PCI vendor of the GPU behind the device (0x10005: the CPU renderer), from its name; a Vulkan driver reports it as VkPhysicalDeviceProperties::vendorID
   uint32_t device_id = 0;            // a number of the device within its vendor (what the kind of device says; the OS has no marketing ids for them)
   uint32_t features2 = 0;            // graphics::DeviceFeature2 bits: storage images (in draws), layered render targets and depth buffers, the single-channel formats
+  // What allocations of each format numbered from 64 may be (graphics::FormatCap bits: VidMm::format_caps), index format - kFirstExtraFormat.
+  uint32_t format_caps[kLastExtraFormat - kFirstExtraFormat + 1] = {};
   char name[64] = {};
 };
 

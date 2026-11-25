@@ -35,6 +35,21 @@ class SoftwareDevice final : public IGraphicsDevice {
   DeviceInfo info() const override { return {"software rasterizer", DeviceKind::Software, false, kMaxPushConstantBytes, kFeatureBlendState | kFeatureVertexFormats | kFeatureAddressModes | kFeatureTexelAccess | kFeatureSystemInputs | kFeatureInstancing | kFeatureLines | kFeatureMultipleTargets | kFeatureFloatFormats | kFeatureOcclusionQueries | kFeatureStatisticsQueries | kFeatureTimestampQueries | kFeatureDepthResolve | kFeatureResolveModes | kFeatureStreamOutput | kFeatureTextureKinds | kFeatureIndependentBlend | kFeatureCompute | kFeatureMultisample | kFeatureGeometryShaders | kFeatureSrgbFormats | kFeatureUnorm16Formats | kFeatureIntegerFormats | kFeatureSnormFormats | kFeatureTessellation | kFeatureStorageInDraws | kFeatureFragmentStores | kFeatureVertexStores | kFeatureGeometryStores | kFeatureTessellationStores, (1u << 2) | (1u << 4) | (1u << 8),
             DeviceLimits{kMaxVertexAttributes, kMaxVaryings, kMaxTextureUnits, kMaxColorTargets, kMaxVertexBuffers}, true, kFeature2StorageImages | kFeature2StorageImagesInDraws | kFeature2LayeredTargets | kFeature2SingleChannelFormats | kFeature2ConservativeRaster | kFeature2DepthTextures | kFeature2DepthAndStencilPlanes | kFeature2TexelBuffers | kFeature2StorageImagesAllStages | kFeature2MipmappedLayers}; }   // (the CPU renderer takes all the capacity)
 
+  // Every format numbered from 64: the packed 32-bit ones as the 8-bit formats (levels, filtering, blending, storage), the wide ones with levels too - every image has them,
+  // kFeature2MipmappedLayers - (the integer ones not filtered or blended; R9G9B9E5 only sampled, the 96-bit ones not storage images - Direct3D has neither), the block-compressed
+  // ones decoded by the memory manager.
+  uint32_t format_caps(Format f) const override {
+    // (storage images of R8 and R8G8 alone: Direct3D has no unordered access to alpha-only or 5:6:5 / 5:5:5:1 / 4:4:4:4 textures)
+    if (is_packed32_format(f)) return kFormatSampled | kFormatFiltered | kFormatRenderTarget | kFormatBlendable | kFormatMipmaps | (f == Format::R8Unorm || f == Format::R8G8Unorm ? kFormatStorage : 0u);
+    if (f == Format::R9G9B9E5Float) return kFormatSampled | kFormatFiltered | kFormatMipmaps;
+    if (is_extra_wide_format(f)) {
+      const bool rgb32 = f == Format::R32G32B32Uint || f == Format::R32G32B32Sint || f == Format::R32G32B32Float;
+      return kFormatSampled | kFormatRenderTarget | kFormatMipmaps | (rgb32 ? 0u : kFormatStorage) | (is_integer_format(f) ? 0u : kFormatFiltered | kFormatBlendable);
+    }
+    return f >= Format::Bc4Unorm && f <= Format::Bc7Srgb ? kFormatSampled | kFormatFiltered | kFormatMipmaps : 0u;
+  }
+  uint32_t max_image_dimension() const override { return 16384; }
+
   IBuffer* create_buffer(uint64_t size, uint32_t usage) override;
   void destroy_buffer(IBuffer* buffer) override;
   IImage* create_image(const ImageDesc& desc) override;

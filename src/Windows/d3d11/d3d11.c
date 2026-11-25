@@ -1205,7 +1205,11 @@ static HRESULT tex_make(Dev *d, const D3D11_TEXTURE2D_DESC *in, UINT slices, ID3
   if ((bind & D3D11_BIND_SHADER_RESOURCE) && (desc.Format == DXGI_FORMAT_D16_UNORM || desc.Format == DXGI_FORMAT_D24_UNORM_S8_UINT || desc.Format == DXGI_FORMAT_D32_FLOAT ||
                                                desc.Format == DXGI_FORMAT_D32_FLOAT_S8X24_UINT))
     return E_INVALIDARG;
-  if (desc.Width > 4096 || desc.Height > 4096 || slices > 256) { tex_refused(&desc, "larger than 4096 (or a volume deeper than 256)"); return E_INVALIDARG; }
+  /* (Direct3D 11's limit is 16384 a side; an adapter with smaller textures refuses larger ones below, in Direct3D 12) */
+  if (desc.Width > D3D11_REQ_TEXTURE2D_U_OR_V_DIMENSION || desc.Height > D3D11_REQ_TEXTURE2D_U_OR_V_DIMENSION || slices > 256) {
+    tex_refused(&desc, "larger than 16384 (or a volume deeper than 256)");
+    return E_INVALIDARG;
+  }
   const BOOL cube = (desc.MiscFlags & D3D11_RESOURCE_MISC_TEXTURECUBE) != 0;
   if (cube && (desc.ArraySize % 6 || desc.Width != desc.Height)) return E_INVALIDARG;
   const BOOL all_levels = !res && dev_all_levels(d);

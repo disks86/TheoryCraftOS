@@ -770,6 +770,11 @@ class TextureSet final : public ITextureSet {
     if (!surface.floats.empty()) return surface.float_row(static_cast<uint32_t>(y))[x];
     const uint32_t argb = surface.decode(surface.row(static_cast<uint32_t>(y))[x]);
     constexpr float k = 1.0f / 255.0f;
+    if (is_packed32_format(surface.format)) {   // (the exact values of the 5-, 6- and 4-bit codes)
+      float c[4];
+      packed32_to_floats(surface.format, argb, c);
+      return {c[0], c[1], c[2], c[3]};
+    }
     if (is_srgb_format(surface.format)) {   // (the colour channels are decoded to linear values, the alpha is linear)
       const float* table = srgb_to_linear_table();
       return {table[(argb >> 16) & 0xFF], table[(argb >> 8) & 0xFF], table[argb & 0xFF], static_cast<float>(argb >> 24) * k};
@@ -1774,7 +1779,14 @@ IBuffer* SoftwareDevice::create_buffer(uint64_t size, uint32_t) {
 void SoftwareDevice::destroy_buffer(IBuffer* buffer) { destroy(allocator_, static_cast<SoftwareBuffer*>(buffer)); }
 
 IImage* SoftwareDevice::create_image(const ImageDesc& desc) {
-  if (!desc.extent.width || !desc.extent.height || desc.format == Format::Undefined) return nullptr;
+  if (!desc.extent.width || !desc.extent.height || desc.format == Format::Undefined || desc.extent.width > max_image_dimension() || desc.extent.height > max_image_dimension()) return nullptr;
+  // (a format numbered from 64: what format_caps says; block-compressed images are decoded by the memory manager before they get here)
+  if (static_cast<uint32_t>(desc.format) >= static_cast<uint32_t>(Format::R8Unorm)) {
+    const uint32_t caps = format_caps(desc.format);
+    if (is_compressed_format(desc.format) || !(caps & kFormatSampled) || ((desc.usage & kImageColorAttachment) && !(caps & kFormatRenderTarget)) ||
+        ((desc.usage & kImageStorage) && !(caps & kFormatStorage)) || (desc.mip_levels > 1 && !(caps & kFormatMipmaps)) || desc.samples != 1)
+      return nullptr;
+  }
   // (any image of one sample may have levels, as many as the extent has: kFeature2MipmappedLayers)
   if (desc.mip_levels == 0 || desc.mip_levels > mip_level_limit(desc.extent) || desc.mip_levels > kMaxMipLevels) return nullptr;
   if (desc.samples != 1) {

@@ -1708,7 +1708,7 @@ class Adapter::StreamRunner {
     Allocation* heap = alloc(mi);
     Allocation* image = alloc(ii);
     if (!buffer_range(heap, m_off, kMotionVectorHeapHeader) || !image || !image->is_image() || image->desc().kind != graphics::TextureKind::Texture2D || image->mip_levels() != 1 ||
-        image->layers() != 1 || image->desc().samples != 1 || image->desc().format != Format::A16B16G16R16Sint)
+        image->layers() != 1 || image->desc().samples != 1 || (image->desc().format != Format::A16B16G16R16Sint && image->desc().format != Format::R16G16Sint))
       return refuse(__LINE__);
     if (!use(image, state::kVideoEncodeWrite)) return refuse(__LINE__);
     if (!exec_) return status::kSuccess;
@@ -1717,7 +1717,7 @@ class Adapter::StreamRunner {
     if (!mm_.read_back(*heap) || !mm_.read_back(*image)) return status::kInvalidDeviceState;
     VideoWritablePlaneImage out = {image->writable_backing(), image_row_bytes(image->desc().format, image->desc().width), image->desc().width, image->desc().height};
     // (a heap that does not hold vectors of that size, or that do not fit at (x, y), leaves the image as it was)
-    if (resolve_motion_vectors(heap->backing().subview(m_off, heap->desc().size - m_off), width, height, out, x, y)) {
+    if (resolve_motion_vectors(heap->backing().subview(m_off, heap->desc().size - m_off), width, height, out, x, y, pixel_bytes(image->desc().format))) {
       mm_.note_cpu_write(*image);
       unbind_textures_of(image);
     }
@@ -2094,7 +2094,7 @@ class Adapter::StreamRunner {
     Allocation* a = alloc(index);
     graphics::Format view = graphics::Format::Undefined;
     if (!a || !a->is_image() || !(a->desc().flags & kAllocStorageImage) || level >= a->mip_levels() || count == 0 || first >= a->level_layers(level) || count > a->level_layers(level) - first ||
-        view_format > static_cast<uint32_t>(Format::R32Float) || !storage_view_format(a->desc().format, static_cast<Format>(view_format), &view) || !use(a, state::kUnorderedAccess))
+        !is_known_format(view_format) || !storage_view_format(a->desc().format, static_cast<Format>(view_format), &view) || !use(a, state::kUnorderedAccess))
       return refuse(__LINE__);
     image_bound_[slot] = true;
     texel_bound_[slot] = false;
@@ -2483,7 +2483,7 @@ class Adapter::StreamRunner {
 Adapter::Adapter(allocators::IAllocator& allocator, graphics::IGraphicsDevice& device, const AdapterConfig& config, uint32_t index, Luid luid)
     : allocator_(allocator), device_(device), display_(config.display), index_(index), luid_(luid), vidmm_(allocator, device, config.local_memory_budget, config.system_memory_limit), contexts_(allocator) {
   const graphics::DeviceInfo info = device.info();
-  caps_.max_texture_dimension = kMaxTextureDimension;
+  caps_.max_texture_dimension = vidmm_.max_image_dimension();
   // What the device takes (DeviceInfo::limits, never more than the capacity of the structures).
   auto limit = [](uint32_t value, uint32_t capacity) { return value < capacity ? value : capacity; };
   caps_.max_vertex_attributes = limit(info.limits.vertex_attributes, graphics::kMaxVertexAttributes);
@@ -2500,6 +2500,7 @@ Adapter::Adapter(allocators::IAllocator& allocator, graphics::IGraphicsDevice& d
   caps_.sample_counts = info.sample_counts;
   caps_.blend_constant = info.blend_constant;
   caps_.features2 = info.features2;
+  for (uint32_t f = kFirstExtraFormat; f <= kLastExtraFormat; ++f) caps_.format_caps[f - kFirstExtraFormat] = vidmm_.format_caps(static_cast<Format>(f));
   caps_.device_kind = static_cast<uint32_t>(info.kind);
   // The vendor the name says (the names are those of the devices in src/Graphics/Graphics3D); the virtual GPUs have their hypervisor's.
   auto name_has = [&](const char* part) {

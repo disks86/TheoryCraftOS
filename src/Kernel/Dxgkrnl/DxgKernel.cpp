@@ -1215,7 +1215,7 @@ NtStatus Kernel::write_descriptor(ProcessId pid, Handle heap, uint32_t index, co
       const graphics::StorageImageView& v = desc.image;
       graphics::Format view = graphics::Format::Undefined;
       if (!alloc.is_image() || !(alloc.desc().flags & kAllocStorageImage) || v.level >= alloc.mip_levels() || v.layer_count == 0 || v.first_layer >= alloc.level_layers(v.level) ||
-          v.layer_count > alloc.level_layers(v.level) - v.first_layer || desc.view_format > static_cast<uint32_t>(Format::R32Float) ||
+          v.layer_count > alloc.level_layers(v.level) - v.first_layer || !is_known_format(desc.view_format) ||
           !storage_view_format(alloc.desc().format, static_cast<Format>(desc.view_format), &view))
         return status::kInvalidParameter;
       d.allocation = a->allocation;
@@ -1336,7 +1336,7 @@ NtStatus Kernel::set_mirror(ProcessId pid, Handle mirror, uint32_t mode, uint32_
 
 bool Kernel::video_decode_supported(uint32_t profile, uint32_t surface_format, uint32_t width, uint32_t height) const {
   // (the planes are 2D images: no bigger than the kernel's textures)
-  if (profile >= hardware::kDxvaProfileCount || surface_format >= hardware::kDxvaSurfaceFormatCount || width > kMaxTextureDimension || height > kMaxTextureDimension) return false;
+  if (profile >= hardware::kDxvaProfileCount || surface_format >= hardware::kDxvaSurfaceFormatCount || width > kMinTextureDimension || height > kMinTextureDimension) return false;
   return hardware::dxva_profile_supports(static_cast<hardware::DxvaProfile>(profile), static_cast<hardware::DxvaSurfaceFormat>(surface_format), width, height);
 }
 

@@ -45,7 +45,7 @@ graphics::Format wide_format_of(Format f) {
     case Format::R32Uint: return graphics::Format::R32Uint;
     case Format::R32Sint: return graphics::Format::R32Sint;
     case Format::R32Float: return graphics::Format::R32Float;
-    default: return graphics::Format::Undefined;
+    default: return is_extra_wide(f) ? static_cast<graphics::Format>(f) : graphics::Format::Undefined;   // (numbered as graphics::Format numbers them)
   }
 }
 
@@ -85,7 +85,7 @@ graphics::Format compressed_format_of(Format f) {
     case Format::Bc1Srgb: return graphics::Format::Bc1Srgb;
     case Format::Bc2Srgb: return graphics::Format::Bc2Srgb;
     case Format::Bc3Srgb: return graphics::Format::Bc3Srgb;
-    default: return graphics::Format::Undefined;
+    default: return is_extra_compressed(f) ? static_cast<graphics::Format>(f) : graphics::Format::Undefined;
   }
 }
 
@@ -131,6 +131,25 @@ VidMm::VidMm(allocators::IAllocator& allocator, graphics::IGraphicsDevice& devic
     : allocator_(allocator), device_(device), budget_(local_budget), system_limit_(system_limit), resident_(allocator), scratch_(allocator) {}
 
 VidMm::~VidMm() {}
+
+// What allocations of a format numbered from 64 may be (graphics::FormatCap bits): the device's own answer, except that a block-compressed format the device does not sample as blocks
+// is decoded on upload (graphics::decoded_format), so it is what an image of the decoded format can be - sampled and filtered, with levels when it decodes to 8-bit pixels, or to
+// floats on a device with levels of every image.
+uint32_t VidMm::format_caps(Format f) const {
+  if (!is_extra(f)) return 0;
+  if (!is_extra_compressed(f)) return device_.format_caps(static_cast<graphics::Format>(f));
+  const uint32_t native = device_.format_caps(static_cast<graphics::Format>(f));
+  if (native & graphics::kFormatNative) return native & (graphics::kFormatSampled | graphics::kFormatFiltered | graphics::kFormatMipmaps | graphics::kFormatNative);
+  const graphics::DeviceInfo info = device_.info();
+  // (decoded into floats: the float image has levels where the device has levels of every image, kFeature2MipmappedLayers)
+  if (graphics::decodes_to_floats(static_cast<graphics::Format>(f)))
+    return (info.features & graphics::kFeatureFloatFormats) ? graphics::kFormatSampled | graphics::kFormatFiltered | ((info.features2 & graphics::kFeature2MipmappedLayers) ? graphics::kFormatMipmaps : 0u) : 0u;
+  return graphics::kFormatSampled | graphics::kFormatFiltered | graphics::kFormatMipmaps;
+}
+uint32_t VidMm::max_image_dimension() const {
+  const uint32_t d = device_.max_image_dimension();
+  return d < kMinTextureDimension ? kMinTextureDimension : d > kMaxTextureDimension ? kMaxTextureDimension : d;
+}
 
 uint32_t VidMm::to_logical(Format f, uint32_t word) {
   if (is_rgba_order(f)) word = (word & 0xFF00FF00u) | ((word & 0xFF) << 16) | ((word >> 16) & 0xFF);
@@ -349,6 +368,15 @@ NtStatus VidMm::create(const AllocationDesc& requested, SharedPointer<Allocation
     cpu_bytes = device_bytes = desc.size;
   } else {
     if (desc.width == 0 || desc.height == 0 || desc.width > kMaxTextureDimension || desc.height > kMaxTextureDimension) return status::kInvalidParameter;
+    // (larger than the device's images can be: a size Direct3D allows that this adapter has not got)
+    if (!(desc.flags & kAllocStaging) && (desc.width > max_image_dimension() || desc.height > max_image_dimension())) return status::kNotSupported;
+    if (is_extra(desc.format) && !(desc.flags & kAllocStaging)) {
+      // (the formats numbered from 64: what the device does with them, format_caps)
+      const uint32_t caps = format_caps(desc.format);
+      if (!(caps & graphics::kFormatSampled) || ((desc.flags & kAllocRenderTarget) && !(caps & graphics::kFormatRenderTarget)) || ((desc.flags & kAllocStorageImage) && !(caps & graphics::kFormatStorage)) ||
+          (desc.mip_levels > 1 && !(caps & graphics::kFormatMipmaps)) || (desc.samples > 1 && !(caps & graphics::kFormatMultisample)) || (desc.flags & kAllocPresent))
+        return status::kNotSupported;
+    }
     if (desc.mip_levels == 0 || desc.mip_levels > graphics::mip_level_limit({desc.width, desc.height})) return status::kInvalidParameter;
     const bool depth_flag = (desc.flags & kAllocDepthStencil) != 0;
     if (depth_flag != dxgk::is_depth(desc.format)) return status::kInvalidParameter;
@@ -372,7 +400,7 @@ NtStatus VidMm::create(const AllocationDesc& requested, SharedPointer<Allocation
       // (the wide formats: not presented; of several levels on a device with kFeature2MipmappedLayers)
       if (desc.flags & kAllocPresent) return status::kInvalidParameter;
       if (desc.mip_levels != 1 && !(desc.flags & kAllocStaging) && !levels_anywhere) return status::kNotSupported;
-      const uint32_t needed = dxgk::is_single_channel(desc.format) ? 0u : dxgk::is_float(desc.format) ? graphics::kFeatureFloatFormats : dxgk::is_integer(desc.format) ? graphics::kFeatureIntegerFormats : (desc.format == Format::A16B16G16R16Snorm || desc.format == Format::A2B10G10R10) ? graphics::kFeatureSnormFormats : graphics::kFeatureUnorm16Formats;
+      const uint32_t needed = dxgk::is_single_channel(desc.format) || is_extra(desc.format) ? 0u : dxgk::is_float(desc.format) ? graphics::kFeatureFloatFormats : dxgk::is_integer(desc.format) ? graphics::kFeatureIntegerFormats : (desc.format == Format::A16B16G16R16Snorm || desc.format == Format::A2B10G10R10) ? graphics::kFeatureSnormFormats : graphics::kFeatureUnorm16Formats;
       if (!(desc.flags & kAllocStaging) && (device_.info().features & needed) != needed) return status::kNotSupported;
     }
     if (dxgk::is_srgb(desc.format)) {
@@ -516,9 +544,10 @@ bool VidMm::create_device_object(Allocation& a) {
     return a.image_ != nullptr;
   }
   // (a compressed texture: as it is on a device that samples it so, else decoded to 8-bit pixels when it is uploaded)
-  const bool native_blocks = (device_.info().features & graphics::kFeatureCompressedFormats) != 0;
+  const bool native_blocks = native_compressed(d.format);
   id.format = dxgk::is_compressed(d.format) ? (native_blocks ? compressed_format_of(d.format) : graphics::decoded_format(compressed_format_of(d.format)))
               : dxgk::is_wide(d.format) ? wide_format_of(d.format)
+              : is_packed32(d.format) ? static_cast<graphics::Format>(d.format)
               : dxgk::is_srgb(d.format) ? (is_rgba_order(d.format) ? graphics::Format::R8G8B8A8Srgb : graphics::Format::B8G8R8A8Srgb)
               : is_rgba_order(d.format) ? graphics::Format::R8G8B8A8Unorm : graphics::Format::B8G8R8A8Unorm;
   id.usage = 0;
@@ -635,6 +664,11 @@ bool VidMm::upload(Allocation& a) {
     a.device_stale_ = false;
     return true;
   }
+  if (is_packed32(f)) {
+    if (!upload_packed32(a)) return false;
+    a.device_stale_ = false;
+    return true;
+  }
   const bool wide = dxgk::is_wide(f), convert = !is_plain_bgra(f);
   const graphics::Format device_format = wide ? wide_format_of(f) : graphics::Format::Undefined;
   for (uint32_t level = 0; level < a.desc_.mip_levels; ++level) {
@@ -678,9 +712,15 @@ bool VidMm::upload(Allocation& a) {
 
 // The blocks of a compressed texture to its device image: each level (or each layer of a volume, an array or a cube, which have one), as blocks where the device samples them
 // (kFeatureCompressedFormats), else decoded into 32-bit pixels (the image was made of graphics::decoded_format).
+bool VidMm::native_compressed(Format f) const {
+  if (!dxgk::is_compressed(f)) return false;
+  if (is_extra_compressed(f)) return (device_.format_caps(static_cast<graphics::Format>(f)) & graphics::kFormatNative) != 0;
+  return (device_.info().features & graphics::kFeatureCompressedFormats) != 0;
+}
+
 bool VidMm::upload_compressed(Allocation& a) {
   const graphics::Format blocks_format = compressed_format_of(a.desc_.format);
-  const bool native = (device_.info().features & graphics::kFeatureCompressedFormats) != 0;
+  const bool native = native_compressed(a.desc_.format);
   for (uint32_t level = 0; level < a.desc_.mip_levels; ++level)
     for (uint32_t layer = 0; layer < a.level_layers(level); ++layer) {
       uint64_t offset = 0, bytes = 0;
@@ -692,6 +732,14 @@ bool VidMm::upload_compressed(Allocation& a) {
       if (native) {
         // (a volume's slices are the layers of the backing here; the device takes each slice as a layer of the transfer)
         ok = a.image_->write_compressed(level, layer, blocks);
+      } else if (graphics::decodes_to_floats(blocks_format)) {
+        // (BC4 / BC5 signed and BC6H: decoded into a float image - of several levels on a device with kFeature2MipmappedLayers, VidMm::format_caps)
+        scratch_.clear();
+        ArrayView<graphics::Vec4> pixels;
+        if (!scratch_.put_zeros(uint64_t{w} * h * sizeof(graphics::Vec4)) || !scratch_.writable_view().try_cast<graphics::Vec4>(&pixels) ||
+            !graphics::decode_blocks_float(blocks_format, blocks, w, h, pixels))
+          return false;
+        ok = a.image_->write_subresource_float(level, layer, ArrayView<const graphics::Vec4>(pixels.data(), pixels.size()));
       } else {
         scratch_.clear();
         ArrayView<uint32_t> pixels;
@@ -699,6 +747,57 @@ bool VidMm::upload_compressed(Allocation& a) {
         ok = a.image_->write_subresource(level, layer, ArrayView<const uint32_t>(pixels.data(), pixels.size()));
       }
       if (!ok && a.cpu_written_) return false;
+    }
+  return true;
+}
+
+// The levels (or the layers of a volume, an array or a cube, which have one) of an image of a packed 32-bit format (R8Unorm .. B4G4R4A4Unorm: pixels of 1 or 2 bytes in the backing)
+// to its device image, as the 0xAARRGGBB words the devices take; and back.
+bool VidMm::upload_packed32(Allocation& a) {
+  const graphics::Format gf = static_cast<graphics::Format>(a.desc_.format);
+  const uint32_t texel = pixel_bytes(a.desc_.format);
+  // (every layer of every level, a 2D image of its own: IImage::write_subresource)
+  for (uint32_t level = 0; level < a.desc_.mip_levels; ++level)
+    for (uint32_t layer = 0; layer < a.level_layers(level); ++layer) {
+      uint64_t offset = 0, bytes = 0;
+      if (!a.subresource_range(level, layer, &offset, &bytes)) return false;
+      ConstByteView source;
+      if (!ConstByteView(a.cpu_).try_subview(offset, bytes, &source)) return false;
+      const uint64_t count = bytes / texel;
+      scratch_.clear();
+      ArrayView<uint32_t> pixels;
+      if (!scratch_.put_zeros(count * 4) || !as_words(scratch_.writable_view(), &pixels)) return false;
+      ByteReader in(source);
+      for (uint32_t& p : pixels) p = graphics::packed32_to_argb(gf, texel == 1 ? in.u8() : in.le16());
+      if (!in.ok()) return false;
+      const bool ok = a.image_->write_subresource(level, layer, ArrayView<const uint32_t>(pixels.data(), pixels.size()));
+      if (!ok && a.cpu_written_) return false;
+    }
+  return true;
+}
+bool VidMm::read_back_packed32(Allocation& a) {
+  const graphics::Format gf = static_cast<graphics::Format>(a.desc_.format);
+  const uint32_t texel = pixel_bytes(a.desc_.format);
+  // (every layer of every level - on a device without kFeature2MipmappedLayers, the levels above 0 of a storage image only, the only ones its shaders could have written)
+  const bool all_levels = (device_.info().features2 & graphics::kFeature2MipmappedLayers) || (a.desc_.flags & kAllocStorageImage);
+  const uint32_t levels = all_levels ? a.desc_.mip_levels : 1;
+  for (uint32_t level = 0; level < levels; ++level)
+    for (uint32_t layer = 0; layer < a.level_layers(level); ++layer) {
+      uint64_t offset = 0, bytes = 0;
+      ByteView to;
+      if (!a.subresource_range(level, layer, &offset, &bytes) || !a.cpu_.try_subview(offset, bytes, &to)) return false;
+      const uint64_t count = bytes / texel;
+      scratch_.clear();
+      ArrayView<uint32_t> pixels;
+      if (!scratch_.put_zeros(count * 4) || !as_words(scratch_.writable_view(), &pixels)) return false;
+      if (!a.image_->read_subresource(level, layer, pixels)) return false;
+      ByteWriter out(to);
+      for (const uint32_t p : pixels) {
+        const uint32_t v = graphics::packed32_from_argb(gf, p);
+        if (texel == 1) out.u8(static_cast<uint8_t>(v));
+        else out.le16(static_cast<uint16_t>(v));
+      }
+      if (!out.ok()) return false;
     }
   return true;
 }
@@ -727,6 +826,11 @@ bool VidMm::read_back(Allocation& a) {
   }
   // (every layer of every level - on a device without kFeature2MipmappedLayers, the levels above 0 of a storage image only, the only ones its shaders could have written)
   const Format f = a.desc_.format;
+  if (is_packed32(f)) {
+    if (!read_back_packed32(a)) return false;
+    a.gpu_newer_ = false;
+    return true;
+  }
   const bool wide = dxgk::is_wide(f);
   const graphics::Format device_format = wide ? wide_format_of(f) : graphics::Format::Undefined;
   const bool all_levels = (device_.info().features2 & graphics::kFeature2MipmappedLayers) || (a.desc_.flags & kAllocStorageImage);

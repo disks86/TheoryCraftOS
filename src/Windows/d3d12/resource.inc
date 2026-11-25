@@ -534,15 +534,27 @@ static UINT kernel_pixel_bytes(UINT kf) {
   switch (kf) {
     case KF_RGBA16F: case KF_RGBA16: case KF_RGBA16UINT: case KF_RGBA16SINT: case KF_RGBA16SNORM: case KF_BC1: case KF_BC1_SRGB: return 8;
     case KF_RGBA32F: case KF_RGBA32UINT: case KF_RGBA32SINT: case KF_BC2: case KF_BC3: case KF_BC2_SRGB: case KF_BC3_SRGB: return 16;
+    /* (the formats numbered from 64: their own bytes; a block-compressed one's block) */
+    case KF_R8: case KF_A8: case KF_R8SNORM: case KF_R8UINT: case KF_R8SINT: return 1;
+    case KF_R8G8: case KF_B5G6R5: case KF_B5G5R5A1: case KF_B4G4R4A4: case KF_R8G8SNORM: case KF_R8G8UINT: case KF_R8G8SINT: case KF_R16: case KF_R16SNORM: case KF_R16UINT: case KF_R16SINT: case KF_R16F:
+      return 2;
+    case KF_R32G32UINT: case KF_R32G32SINT: case KF_R32G32F: case KF_BC4: case KF_BC4_SNORM: return 8;
+    case KF_R32G32B32UINT: case KF_R32G32B32SINT: case KF_R32G32B32F: return 12;
+    case KF_BC5: case KF_BC5_SNORM: case KF_BC6H_UF16: case KF_BC6H_SF16: case KF_BC7: case KF_BC7_SRGB: return 16;
     default: return 4;
   }
 }
 /* Whether the kernel's images of the format may have mip levels: its 8-bit and block-compressed ones do, its wider ones (16 and 32-bit channels, 10-bit, integer) have one. */
 static int kernel_format_levels(UINT kf) {
-  return (kf >= KF_A8R8G8B8 && kf <= KF_X8B8G8R8) || kf == KF_BGRA8_SRGB || kf == KF_RGBA8_SRGB || (kf >= KF_BC1 && kf <= KF_BC3_SRGB);
+  return (kf >= KF_A8R8G8B8 && kf <= KF_X8B8G8R8) || kf == KF_BGRA8_SRGB || kf == KF_RGBA8_SRGB || (kf >= KF_BC1 && kf <= KF_BC3_SRGB) || (kf >= KF_R8 && kf <= KF_B4G4R4A4) ||
+         (kf >= KF_BC4 && kf <= KF_BC7_SRGB);
 }
-/* ... on this device: every format has them where the device has levels of every image (DEV_FEATURE2_MIPMAPPED_LAYERS). */
-static int device_format_levels(const Dev *dev, UINT kf) { return kernel_format_levels(kf) || (dev->caps.features2 & DEV_FEATURE2_MIPMAPPED_LAYERS) != 0; }
+/* ... on this device: a format numbered from 64 has levels where its adapter says so (KmtCaps::format_caps: a block-compressed one decoded into a float image, ...); the
+ * others where the kernel has them, and every one where the device has levels of every image (DEV_FEATURE2_MIPMAPPED_LAYERS). */
+static int device_format_levels(const Dev *dev, UINT kf) {
+  if (kf >= KF_FIRST_EXTRA) return (dev_format_caps(dev, kf) & KFC_MIPMAPS) != 0;
+  return kernel_format_levels(kf) || (dev->caps.features2 & DEV_FEATURE2_MIPMAPPED_LAYERS) != 0;
+}
 /* The size of plane allocation `i` of a planar texture (plane_alloc's order: plane * layers + slice) of `fi`: the kernel's image of the plane (plane_extent; a packed YUV
  * array's one plane in the kernel's pixels, format_kw). */
 static void planar_extent(const D3D12_RESOURCE_DESC *d, const FormatInfo *fi, UINT layers, UINT i, UINT *w, UINT *h) {
@@ -668,7 +680,16 @@ static HRESULT resource_make_from(Dev *dev, const D3D12_HEAP_PROPERTIES *props, 
     if (desc->Format == DXGI_FORMAT_R32G8X24_TYPELESS && want_depth) fi = format_info(DXGI_FORMAT_D32_FLOAT_S8X24_UINT);
     if (!fi || !fi->kernel || !!fi->depth != want_depth) { hr = fi && fi->kernel ? E_INVALIDARG : DXGI_ERROR_UNSUPPORTED; goto fail; }
     if (fi->compressed && (desc->Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS))) { hr = E_INVALIDARG; goto fail; }      /* (sampled only) */
-    if (desc->Width == 0 || desc->Height == 0 || desc->Width > KMAX_TEXTURE_DIMENSION || desc->Height > KMAX_TEXTURE_DIMENSION) { hr = E_INVALIDARG; goto fail; }
+    if (desc->Width == 0 || desc->Height == 0 || desc->Width > D3D12_REQ_TEXTURE2D_U_OR_V_DIMENSION || desc->Height > D3D12_REQ_TEXTURE2D_U_OR_V_DIMENSION) { hr = E_INVALIDARG; goto fail; }
+    /* (larger than this adapter's textures, which Direct3D allows up to 16384: its devices have smaller ones) */
+    if (desc->Width > dev_max_texture(dev) || desc->Height > dev_max_texture(dev)) { hr = DXGI_ERROR_UNSUPPORTED; goto fail; }
+    /* (a format numbered from 64: what the adapter does with it - sampled at all, drawn into, unordered access, levels, samples) */
+    if (fi->kernel >= KF_FIRST_EXTRA) {
+      const UINT kc = dev_format_caps(dev, fi->kernel), want_mips = desc->MipLevels != 1;
+      if (!(kc & KFC_SAMPLED) || ((desc->Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET) && !(kc & KFC_RENDER_TARGET)) ||
+          ((desc->Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) && !(kc & KFC_STORAGE)) || (want_mips && !(kc & KFC_MIPMAPS) && mip_count_for((UINT)desc->Width, desc->Height) > 1) ||
+          (samples > 1 && !(kc & KFC_MULTISAMPLE))) { hr = DXGI_ERROR_UNSUPPORTED; goto fail; }
+    }
     r->fmt = fi;
     r->mips = samples > 1 ? 1 : desc->MipLevels ? desc->MipLevels : mip_count_for((UINT)desc->Width, desc->Height);
     r->layers = 1;
@@ -724,6 +745,8 @@ static HRESULT resource_make_from(Dev *dev, const D3D12_HEAP_PROPERTIES *props, 
      * - res_mirror -, so its own images are not storage images; a cube's views are of an array, which the kernel's cube is not: no unordered access to cubes) */
     const int uav = (desc->Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) != 0;
     if (uav && (fi->depth || fi->kernel == KF_BGRA8_SRGB || fi->kernel == KF_RGBA8_SRGB || samples > 1)) { hr = E_INVALIDARG; goto fail; }
+    /* (a narrow format is written through mirrors of 8- or 16-bit RGBA: R16G16_SINT's widened image has none - format_uav_support says so) */
+    if (uav && fi->narrow && !fi->planar && fi->kernel != KF_A8B8G8R8 && fi->kernel != KF_RGBA16) { hr = DXGI_ERROR_UNSUPPORTED; goto fail; }
     if (uav && (!(dev->caps.features2 & DEV_FEATURE2_STORAGE_IMAGES) || ((r->kind == 3 || r->kind == 5) && !all_levels))) { hr = DXGI_ERROR_UNSUPPORTED; goto fail; }
     ad.flags = want_depth ? KA_DEPTH : (target ? (KA_RENDER_TARGET | KA_TEXTURE) : KA_TEXTURE);
     /* (a depth buffer is a texture too - shader resource views of its depth, or of a D24S8's stencil: shadow maps - unless the program says it never will be, on a device that

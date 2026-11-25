@@ -116,7 +116,8 @@ struct VideoEncodeJob {
 [[nodiscard]] bool run_motion_estimation(allocators::IAllocator& allocator, const VideoPlaneImage& current, const VideoPlaneImage& reference, uint32_t width, uint32_t height,
                                          uint32_t block, ConstByteView hints, ByteView heap);
 // The vectors of `heap` (for a picture of width x height) as R16G16_SINT pixels of an image kept widened (A16B16G16R16Sint: 8 bytes a pixel) at (x, y) of `image`.
-[[nodiscard]] bool resolve_motion_vectors(ConstByteView heap, uint32_t width, uint32_t height, const VideoWritablePlaneImage& image, uint32_t x, uint32_t y);
+// (`texel`: the bytes of a pixel of the image - 4 for an R16G16Sint one, the vector alone; 8 for an A16B16G16R16Sint one, the vector, 0 and an integer 1)
+[[nodiscard]] bool resolve_motion_vectors(ConstByteView heap, uint32_t width, uint32_t height, const VideoWritablePlaneImage& image, uint32_t x, uint32_t y, uint32_t texel = 8);
 // The bytes a motion vector heap of a picture of at most width x height needs.
 inline uint64_t motion_vector_heap_bytes(uint32_t width, uint32_t height, uint32_t block) {
   return kMotionVectorHeapHeader + uint64_t{(width + block - 1) / block} * ((height + block - 1) / block) * kMotionVectorEntryBytes;

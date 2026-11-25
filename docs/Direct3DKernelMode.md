@@ -132,7 +132,7 @@ The kernel-mode driver is the D3DKMT layer, which Direct3D 9, 10, 11 and 12 all 
   per-instance input) from Wine's HLSL compiler run through the kernel on the software device with the expected pictures.
 - **Not done for Direct3D 10:** stream output and geometry shader features beyond the basics (see Geometry shaders below), `sample_b` / derivatives, more than four vertex attributes, more than four varyings (and semantics
   beyond COLOR0/1 and TEXCOORD0/1), more than one vertex buffer slot, multisampling, predication and queries other than occlusion counts (`D3D10_QUERY_OCCLUSION`; `OCCLUSION_PREDICATE` and `SO_STATISTICS` etc. are not done), depth bias and wireframe fill, texture arrays
-  with mipmaps, mipmapped / filtered-across-faces cube and 3D textures, cube arrays, packed formats (float, half-float, sRGB, 16-bit unorm and R32G32B32A32_UINT colour formats are done; the other integer widths, SNORM and 10-bit formats are not), UAV textures, typed UAV loads and stores, append / consume buffers, group-shared memory and barriers, indirect dispatch (Direct3D 11 compute without those). The other devices (virgl, SVGA3D, Intel Gen9, V3D) have none of the features above, so
+  with mipmaps, mipmapped / filtered-across-faces cube and 3D textures, cube arrays, packed formats (float, half-float, sRGB, 16-bit unorm and R32G32B32A32_UINT colour formats are done; the other integer widths, SNORM and 10-bit formats and the rest are in "More texture formats"), UAV textures, typed UAV loads and stores, append / consume buffers, group-shared memory and barriers, indirect dispatch (Direct3D 11 compute without those). The other devices (virgl, SVGA3D, Intel Gen9, V3D) have none of the features above, so
   they run the Direct3D 9 level only.
 
 ## Conformance on a real GPU
@@ -292,7 +292,7 @@ block and ends on one or at the level's edge, the buffer's rows are rows of bloc
 them as they are: VidMm gives it the blocks with `IImage::write_compressed` (virgl: the host's `DXT1_RGBA` 106, `DXT3_RGBA` 107, `DXT5_RGBA` 108 and the `SRGBA` forms 110 - 112 of
 virglrenderer's `virgl_hw.h`, bound as sampler views only, each level and layer transferred with a stride of a row of blocks); for the others (the CPU renderer) the device image is
 B8G8R8A8 and VidMm decodes the blocks when it uploads them (`Graphics/BlockCompression.hpp`, the decoding the Direct3D 10 specification gives; `BlockCompressionTest` checks it
-with values worked out by hand, shortened views and every bit turned). BC4 - BC7 are not there.
+with values worked out by hand, shortened views and every bit turned). BC4 - BC7 are formats of their own (Bc4Unorm .. Bc7Srgb, below: "More texture formats").
 
 ## Compute shaders and unordered access views
 
@@ -543,7 +543,7 @@ Direct3D 11's and 12's video interfaces run on the kernel's codecs, on the CPU, 
   (docs/Direct3D11.md).
 - Encoding and motion estimation (Direct3D 12 only; `src/Kernel/Dxgkrnl/VideoEncode.{hpp,cpp}`, stream ops EstimateMotion / ResolveMotionVectors / EncodeFrame /
   ResolveEncoderMetadata, states kVideoEncodeRead / Write; d3d12.dll `encode.inc`): the motion estimator (`Software/MotionEstimator`: 8x8 / 16x16 blocks, SAD, whole-sample
-  search +-8 around the predictors, then half and quarter refinement with H.264's interpolation; resolved into an R16G16_SINT texture, kept as A16B16G16R16Sint (x, y, 0, 1))
+  search +-8 around the predictors, then half and quarter refinement with H.264's interpolation; resolved into an R16G16_SINT texture - an R16G16Sint image of its own, or (x, y, 0, 1) in an A16B16G16R16Sint one)
   and an H.264 encoder driven like a D3D12 driver is (`Software/H264PictureEncoder` + `H264PictureEncoderSyntax`: the program keeps the DPB, names lists / marking /
   modifications and writes SPS and PPS; the slices are Main or High, CAVLC or CABAC, Intra16x16 and Intra8x8 (all 9 modes), 16x16 P / B partitions with 4x4 or adaptive 8x8
   transforms, P_Skip, B_Skip / B_Direct_16x16 by spatial or temporal direct prediction (direct_8x8_inference 1), quarter-sample vectors, filter modes 0-2, row-based intra
@@ -629,7 +629,7 @@ Direct3D 11's and 12's video interfaces run on the kernel's codecs, on the CPU, 
 - **Shaders**: SM2 / SM3 / SM4 / SM5.0 / SM5.1 vertex and pixel shaders (no geometry / tessellation / compute shaders, no 5.1 register spaces or arrays of resources). The pixel stage of Intel Gen9 is two fixed kernels, so a general pixel
   shader runs there only on the software, virgl (as unvalidated TGSI) and SVGA3D (unvalidated) paths. No loops, calls, predication, ps_1_x, constants above c7 (push constants are
   128 bytes), depth output, fog / point size, cube and volume samplers. Pipeline state is limited to what `IGraphicsDevice` offers (one colour target, 2 textures, alpha blend on/off, depth and stencil).
-- No group-shared memory or barriers (a compute shader that needs `sync` or `dcl_tgsm` is refused), no multisampled shader resources (`Texture2DMS`, `ld2dms`), no depth resolve, no alpha-to-coverage or sample mask, no per-sample shading, no centroid interpolation, no mipmapped / render-target / float cube, volume or array textures (`d3d11.dll` and `d3d9.dll` keep the first level of the ones a program makes with more), no integer formats but R32G32B32A32_UINT, no signed or 10-bit formats.
+- No group-shared memory or barriers (a compute shader that needs `sync` or `dcl_tgsm` is refused), no multisampled shader resources (`Texture2DMS`, `ld2dms`), no depth resolve, no alpha-to-coverage or sample mask, no per-sample shading, no centroid interpolation, no mipmapped / render-target / float cube, volume or array textures (`d3d11.dll` and `d3d9.dll` keep the first level of the ones a program makes with more), and of the colour formats only what "More colour formats" and "More texture formats" below list.
 - Sync objects cannot be shared between processes. No timeout detection and recovery (a hung device cannot be reset), no vblank / scan line, gamma, overlays or VidPN topology
   (multi-monitor); display mode listing and switching go straight to the GPU driver.
 - Video memory is accounted per adapter but there is no per-process budget or priority-based paging between processes.
@@ -639,6 +639,48 @@ Direct3D 11's and 12's video interfaces run on the kernel's codecs, on the CPU, 
 ### More colour formats
 
 `A32B32G32R32Sint`, `A16B16G16R16Uint` / `Sint`, `A8B8G8R8Uint` (the integer formats, narrow ones saturate), `A16B16G16R16Snorm` and `A2B10G10R10` (10-bit colour with two bits of alpha) join the wide formats: pixels travel as `Vec4`s, laid out and quantised by `Graphics/WidePixels.hpp` (one place for the software device, the memory manager and virgl). Features: `kFeatureIntegerFormats`, `kFeatureSnormFormats`. virgl ids (from virglrenderer's `virgl_hw.h`): R32G32B32A32_SINT 200, R16G16B16A16_UINT 188, _SINT 192, R8G8B8A8_UINT 180, R16G16B16A16_SNORM 59, R10G10B10A2_UNORM 8. Two conformance scenes match the real GPU. `SV_PrimitiveID` is a `PRIMID` input on virgl and matches too.
+
+### More texture formats
+
+The rest of Direct3D 11 / 12's colour formats are allocation formats, numbered from 64 in `dxgk::Format` as in `graphics::Format` (the same number is the same format, so other
+changes can append to the first run below 64): `R8Unorm` .. `B4G4R4A4Unorm` (64 .. 69: R8, R8G8, A8, B5G6R5, B5G5R5A1, B4G4R4A4), `R8Snorm` .. `R10G10B10A2Uint` (70 .. 96:
+R8 / R8G8 snorm, uint, sint; R8G8B8A8 snorm and sint; R16 and R16G16 unorm, snorm, uint, sint, float; R32G32 and R32G32B32 uint, sint, float; R11G11B10_FLOAT; R9G9B9E5;
+R10G10B10A2_UINT) and `Bc4Unorm` .. `Bc7Srgb` (97 .. 104: BC4 and BC5 unorm and snorm, BC6H unsigned and signed, BC7 and its sRGB form). Each is in memory as Direct3D lays it
+out (`pixel_bytes`: 1, 2, 4, 8 or 12 bytes; BC4 blocks are 8 bytes, the others 16), so locks, `CopyBufferImage`, `CopyRegion` and the reserved textures' tiles move its own bytes.
+`is_known_format` is what a format number from user mode may be.
+
+- **The packed 32-bit ones** (64 .. 69) are kept by the devices as 0xAARRGGBB words with what the format holds of a colour (`quantize_packed32`: the channels it has rounded to
+  their bits, the others 0, alpha 255) - so they have mip levels, multisampling aside, as the 8-bit formats do; VidMm turns the backing's texels into words and back
+  (`packed32_to_argb` / `packed32_from_argb`), and the software device samples the 5-, 6- and 4-bit codes as their exact values (`packed32_to_floats`).
+- **The wide ones** (70 .. 96) travel as `Vec4`s (`Graphics/WidePixels.hpp`: every layout from one table - count, bits and kind of the channels -, R11G11B10's unsigned
+  small floats rounded to nearest even with infinity and NaN kept and negative values 0, RGB9E5's shared exponent as `EXT_texture_shared_exponent` and Direct3D compute it);
+  the channels a format does not have read as 0 and alpha as 1 (an integer 1). They have one level, as the other wide formats.
+- **BC4 - BC7**: decoded by `Graphics/BlockCompression.hpp` (all BC6H and BC7 modes, partitions, anchors and p-bits; BC4 / BC5 snorm with -128 as -127; reserved BC6H modes and
+  a BC7 block without a mode bit decode to zero) where the device does not sample them as blocks: BC4 / BC5 unorm and BC7 into 8-bit pixels (with levels), BC4 / BC5 snorm into
+  R32G32B32A32Float and BC6H into R16G16B16A16Float (one level). `BlockCompressionTest` compares the decoder with Mesa's (softpipe, through `scripts/bc-reference.c`; the
+  reference is `tests/data/bc/reference.bin`): BC6H and BC7 bit for bit on blocks of every mode, BC4 / BC5 within a code; plus blocks worked out by hand, every bit of a block
+  turned, shortened views.
+- **What a device does with each** is `IGraphicsDevice::format_caps` (`graphics::FormatCap`: sampled, filtered, render target, blendable, storage image, mip levels,
+  multisample, native blocks), and what allocations of it may be is `VidMm::format_caps` (a block-compressed format the device does not sample is what its decoded image can
+  be). `VidMm::create` refuses what the device cannot do with `kNotSupported`; the adapter hands the table to user mode at the end of the capabilities blob (`AdapterCaps::format_caps`:
+  the first format, the count, a word each), which d3d12.dll's `CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT)` and resource creation follow. The CPU renderer has all of them
+  (no render targets of R9G9B9E5, no storage images of the 96-bit formats, of A8 or of the 16-bit packed ones - Direct3D has none -, the integer ones not filtered or blended).
+  virgl reads the host's sampler and render masks (`virgl_caps_v1`) and gives each format the host format of the same layout (`virgl::extra_format`, from virglrenderer's
+  `virgl_hw.h`: R8 64, R8G8 65, A8 10, B5G6R5 7, B5G5R5A1 5, B4G4R4A4 6, R8 snorm / uint / sint 74 / 177 / 181, R8G8 75 / 178 / 182, R8G8B8A8 snorm / sint 77 / 184, R16 unorm
+  / snorm / uint / sint / float 48 / 56 / 185 / 189 / 91, R16G16 49 / 57 / 186 / 190 / 92, R32G32 uint / sint / float 194 / 198 / 29, R32G32B32 195 / 199 / 30, R11G11B10 124,
+  R9G9B9E5 125, R10G10B10A2_UINT 253, RGTC1 113 / 114, RGTC2 115 / 116, BPTC_RGB_FLOAT 257 (BC6H signed), BPTC_RGB_UFLOAT 258, BPTC_RGBA_UNORM 255, BPTC_SRGBA 256); a format
+  the host does not draw into is a sampler view alone, the packed 32-bit ones are transferred in their own bytes, and an integer texture is bound with a nearest sampler
+  (GL takes an integer texture with a linear filter as incomplete and reads zeros, also in texel fetches; Direct3D's `Load` ignores the sampler). `LockedDevice` passes both
+  questions on to the device it wraps. The other devices have none of them.
+- **Sizes**: `kMaxTextureDimension` is 16384 (Direct3D 11's); `IGraphicsDevice::max_image_dimension` says what a device has (4096 unless it says more: the CPU renderer 16384,
+  virgl the host's `max_texture_2d_size` from `virgl_caps_v2`, read with version 2 of the second capability set), and `AdapterCaps::max_texture_dimension` is that (VidMm
+  refuses larger textures with `kNotSupported`). Video surfaces stay at most 4096 (`kMinTextureDimension`).
+- d3d12.dll keeps R8 / R8G8 / R16 / R16G16 unorm as it did - widened into four-channel images, the planes of the video formats
+  and their mirrors depend on that -; every other format above is a format of its own there (`KF_R8` .. `KF_BC7_SRGB`), and d3d11.dll keeps every format as it is.
+  `TextureFormatsTest` checks the conversions (every code of the packed and the 8- and 16-bit formats, the small floats, the shared exponent); d3d12test's `test_formats`
+  checks on each adapter that the support answers are what can be made, that a shader's `Load` reads what was written in each format, copies keep the bytes, render targets of
+  each kind keep what a pixel shader wrote in their encoding, BC4 - BC7 blocks are read as their decoded texels (BC7's sRGB form linearised and filtered on linear values), a
+  typed clear of R11G11B10 and 16384-wide textures.
 
 ### More queries
 
@@ -806,7 +848,7 @@ later stream subobjects, `OPTIONS19` .. `21`, the GPU upload heap, `ID3D12Device
   virgl, `DeviceInfo::blend_constant`); a pipeline is made for each factor a draw uses, as for each stencil reference. d3d11 and d3d9 (`D3DRS_BLENDFACTOR`,
   `D3DBLEND_BOTHSRCALPHA`) pass theirs on.
 
-Not done, in the order a program is likely to meet them: texture formats of fewer than four channels, packed floats and block compression beyond BC1 - BC3 (above); a depth buffer read
+Not done, in the order a program is likely to meet them: views of a typeless R8 / R8G8 / R16 / R16G16 texture in a format of another kind than unorm (the texture is kept widened; its other views are not made); `R1_UNORM` (no format here); a depth buffer read
 by shaders while it is also the pass's (read-only) depth buffer, depth buffers of several samples or levels read as textures, SampleCmp of the levels of a mipmapped colour texture on virgl
 (the base level is compared), a vertex and a pixel shader that read one unit as different texture and sampler pairs; unordered access to the slices of a narrow (R8 / R8G8 /
 R16 / R16G16) volume (its mirror would be a volume); copies of depth buffers (the kernel keeps no memory of them: `CopyRegion` refuses them);

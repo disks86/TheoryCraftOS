@@ -828,21 +828,24 @@ bool run_motion_estimation(allocators::IAllocator& allocator, const VideoPlaneIm
   return w.ok();
 }
 
-bool resolve_motion_vectors(ConstByteView heap, uint32_t width, uint32_t height, const VideoWritablePlaneImage& image, uint32_t x, uint32_t y) {
+bool resolve_motion_vectors(ConstByteView heap, uint32_t width, uint32_t height, const VideoWritablePlaneImage& image, uint32_t x, uint32_t y, uint32_t texel) {
+  if (texel != 4 && texel != 8) return false;
   ByteReader r(heap);
   const uint32_t magic = r.le32(), block = r.le32(), cols = r.le32(), rows = r.le32();
   if (!r.ok() || magic != kMotionVectorHeapMagic || (block != 8 && block != 16) || cols != (width + block - 1) / block || rows != (height + block - 1) / block) return false;
-  if (uint64_t{x} + cols > image.width || uint64_t{y} + rows > image.height || image.pitch < uint64_t{image.width} * 8) return false;
-  if (image.memory.size() < image.pitch * (uint64_t{y} + rows - 1) + (uint64_t{x} + cols) * 8) return false;
+  if (uint64_t{x} + cols > image.width || uint64_t{y} + rows > image.height || image.pitch < uint64_t{image.width} * texel) return false;
+  if (image.memory.size() < image.pitch * (uint64_t{y} + rows - 1) + (uint64_t{x} + cols) * texel) return false;
   for (uint32_t row = 0; row < rows; ++row)
     for (uint32_t col = 0; col < cols; ++col) {
       const uint16_t mx = r.le16(), my = r.le16();
       r.le32();
-      ByteWriter px(image.memory.subview(image.pitch * (y + row) + (uint64_t{x} + col) * 8, 8));
+      ByteWriter px(image.memory.subview(image.pitch * (y + row) + (uint64_t{x} + col) * texel, texel));
       px.le16(mx);
       px.le16(my);
-      px.le16(0);
-      px.le16(1);   // (an integer format's missing alpha is 1)
+      if (texel == 8) {
+        px.le16(0);
+        px.le16(1);   // (an integer format's missing alpha is 1)
+      }
     }
   return r.ok();
 }

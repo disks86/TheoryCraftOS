@@ -1042,6 +1042,14 @@ struct DeviceInfo {
 class IGraphicsDevice {
  public:
   virtual DeviceInfo info() const = 0;
+  // What the device does with images of one of the formats numbered from 64 (graphics::FormatCap bits; the formats before those are described by DeviceInfo::features). 0: images of the
+  // format are refused (create_image gives nullptr). A block-compressed format without kFormatNative is not created as such: the memory manager makes an image of its decoded_format.
+  virtual uint32_t format_caps(Format format) const {
+    (void)format;
+    return 0;
+  }
+  // The largest width and height of a 2D image (and of the faces of a cube); at least 4096.
+  virtual uint32_t max_image_dimension() const { return 4096; }
 
   // Resources come back nullptr on failure and are freed with the matching destroy_*.
   virtual IBuffer* create_buffer(uint64_t size, uint32_t usage) = 0;

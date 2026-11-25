@@ -32,6 +32,10 @@ class VirglDevice final : public IGraphicsDevice {
   explicit VirglDevice(hardware::VirtioGpu& gpu) : gpu_(gpu) {}
   ~VirglDevice();
 
+  // The formats numbered from 64: what the host's sampler and render masks say of each one's host format (virgl_caps_v1), and what the image units take (no 96-bit, shared-exponent,
+  // 5:6:5 / 5:5:5:1 / 4:4:4:4 or alpha-only images in GLSL); levels for the packed 32-bit ones (the wide images here have one); the block-compressed ones as blocks.
+  uint32_t format_caps(Format f) const override;
+  uint32_t max_image_dimension() const override;
   DeviceInfo info() const override {
     // (compute only when the host says it has it: a compute shader on a host without loses the whole context)
     return {"virgl (virtio-gpu)", DeviceKind::VirtualGpu, true, kMaxPushConstantBytes, kFeatureBlendState | kFeatureVertexFormats | kFeatureAddressModes | kFeatureClipDistances | kFeatureTexelAccess | kFeatureSystemInputs | kFeatureInstancing | kFeatureLines | kFeatureMultipleTargets | kFeatureFloatFormats | kFeatureOcclusionQueries | kFeatureStatisticsQueries | kFeatureTimestampQueries | kFeatureDepthResolve | kFeatureStreamOutput | kFeatureTextureKinds | kFeatureCompressedFormats | kFeatureIndependentBlend | (gpu_.virgl_has_compute() ? kFeatureCompute | kFeatureStorageInDraws | kFeatureFragmentStores | kFeatureVertexStores | kFeatureGeometryStores | (gpu_.virgl_has_tessellation() ? kFeatureTessellationStores : 0u) : 0u) | (gpu_.virgl_has_geometry() ? kFeatureGeometryShaders : 0u) | (gpu_.virgl_has_tessellation() ? kFeatureTessellation : 0u) | kFeatureSrgbFormats | kFeatureUnorm16Formats | kFeatureIntegerFormats | kFeatureSnormFormats | (gpu_.virgl_max_samples() >= 2 ? kFeatureMultisample : 0u),
