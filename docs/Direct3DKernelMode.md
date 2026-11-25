@@ -1109,7 +1109,9 @@ Not done, in the order a program is likely to meet them: views of a typeless R8 
 kept widened there, its other views not made); a depth buffer read
 by shaders while it is also the pass's (read-only) depth buffer, depth buffers of several samples read as textures, SampleCmp of the levels of a mipmapped texture on virgl
 (the view's first level is compared), a vertex and a pixel shader that read one unit as different texture and sampler pairs; CPU access to the samples of a multisampled image
-(`read_depth_subresource` and the depth layouts are of one sample; multisampled images are copied whole, image to image, only); the layer and viewport from a vertex or domain shader on virgl,
+(`read_depth_subresource` and the depth layouts are of one sample; multisampled images are copied whole, image to image, only); on virgl, a whole-subresource copy between a
+sampled depth image of one level and an unsampled one (a staging depth texture of Direct3D 11) comes out turned over or not at all - the two are kept in the two row orders
+(`VirglImage::y0_top`) and the blit's turning over does not agree with the depth transfers' (found in gap pass 5, d3d11test test_d32s8_11; not fixed); the layer and viewport from a vertex or domain shader on virgl,
 anisotropic filtering on virgl (virglrenderer 1.3.0 drops it; the CPU renderer filters 2D textures, arrays, cubes, cube arrays and volumes anisotropically), the minimum and maximum filters and coordinates in texels on virgl (its sampler state has neither), virgl's
 quadrilateral lines on a target of one sample (the host's aliased line) and its smooth lines' coverage (the host's); more than four unordered access buffers; heaps and textures shared across adapters (`D3D12_HEAP_FLAG_SHARED_CROSS_ADAPTER`: `DXGI_ERROR_UNSUPPORTED`,
 `CrossAdapterRowMajorTextureSupported` FALSE: an allocation is of one adapter's memory manager, and sharing one needs a backing both adapters' memory managers keep coherent
