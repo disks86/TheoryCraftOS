@@ -4246,6 +4246,8 @@ static void test_dxil_resources(Scene *c) {
   if (a && b) {
     int same = 0, bad = 0;
     for (UINT k = 0; k < sizeof dxbc / sizeof dxbc[0]; ++k) {
+      /* (on a GPU the threads' atomics come in any order: the old values they return - words 1 .. 9 of each thread - are not compared there; what memory holds after is) */
+      if (g_hardware && k < 8 * 16 && k % 16 >= 1 && k % 16 <= 9) continue;
       if (dxbc[k] == dxil[k]) { ++same; continue; }
       if (bad++ < 8) printf("dxil resources: word %u: DXIL %08x, DXBC %08x\n", k, (unsigned)dxil[k], (unsigned)dxbc[k]);
     }
