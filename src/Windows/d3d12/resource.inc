@@ -376,6 +376,12 @@ static int heap_cpu_access(const D3D12_HEAP_PROPERTIES *p, int *upload, int *rea
       *upload = 1;
       *readback = p->CPUPageProperty == D3D12_CPU_PAGE_PROPERTY_WRITE_BACK;
       return 1;
+    /* (a GPU upload heap - OPTIONS16 GPUUploadHeapSupported: GPU memory the CPU maps, written and read by both. The kernel's memory is the CPU's, so it is what a
+     * custom heap the CPU writes back is here: the program's writes go to the GPU's copy and the GPU's writes come back for the CPU to read) */
+    case D3D12_HEAP_TYPE_GPU_UPLOAD:
+      *upload = 1;
+      *readback = 1;
+      return 1;
     default: return 0;
   }
 }
@@ -454,7 +460,8 @@ static int share_desc_read(const BYTE *in, UINT size, ShareDesc *s) {
 }
 /* Whether heap properties are of memory the CPU sees (a shared heap may not be: Direct3D 12 shares GPU memory). */
 static int heap_cpu_visible(const D3D12_HEAP_PROPERTIES *p) {
-  return p->Type == D3D12_HEAP_TYPE_UPLOAD || p->Type == D3D12_HEAP_TYPE_READBACK || (p->Type == D3D12_HEAP_TYPE_CUSTOM && p->CPUPageProperty != D3D12_CPU_PAGE_PROPERTY_NOT_AVAILABLE);
+  return p->Type == D3D12_HEAP_TYPE_UPLOAD || p->Type == D3D12_HEAP_TYPE_READBACK || p->Type == D3D12_HEAP_TYPE_GPU_UPLOAD ||
+         (p->Type == D3D12_HEAP_TYPE_CUSTOM && p->CPUPageProperty != D3D12_CPU_PAGE_PROPERTY_NOT_AVAILABLE);
 }
 
 /* A resource made around the allocations another process made (OpenSharedHandle): its handles and backing size - a planar texture's `count` allocations, in its order of
@@ -573,7 +580,7 @@ static HRESULT resource_make_from(Dev *dev, const D3D12_HEAP_PROPERTIES *props, 
     /* (a texture the CPU sees: only in a custom heap - an upload or readback heap holds buffers - with the driver's layout, not a depth buffer or multisampled, and
      * reached with WriteToSubresource / ReadFromSubresource) */
     if (cpu) {
-      if (props->Type != D3D12_HEAP_TYPE_CUSTOM || desc->Layout != D3D12_TEXTURE_LAYOUT_UNKNOWN || samples > 1 || reserved ||
+      if ((props->Type != D3D12_HEAP_TYPE_CUSTOM && props->Type != D3D12_HEAP_TYPE_GPU_UPLOAD) || desc->Layout != D3D12_TEXTURE_LAYOUT_UNKNOWN || samples > 1 || reserved ||
           (desc->Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL)) { hr = E_INVALIDARG; goto fail; }
       r->cpu_texture = 1;
       r->cpu_upload = r->cpu_readback = 0;      /* (no shadow: the image itself is written and read) */

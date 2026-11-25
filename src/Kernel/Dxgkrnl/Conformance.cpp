@@ -1621,7 +1621,9 @@ void scene_dxil_compute_shared(Rig& rig, ArrayView<uint32_t> out) { compute_shar
 // tested per sample) and resolved. Vertical and horizontal edges are covered the same by every device that uses the standard 4x pattern, whatever the order of the samples.
 // `mode`: how the colour samples are combined (a graphics::ResolveMode: 0 the average, 2 the least and 3 the greatest of each channel, kFeatureResolveModes).
 void multisample_scene(Rig& rig, ArrayView<uint32_t> out, uint32_t mode) {
-  if (!rig.has(graphics::kFeatureMultisample | graphics::kFeatureBlendState | (mode == 0 ? 0u : graphics::kFeatureResolveModes)))
+  // (the least and greatest colour samples: kFeatureResolveModes, or kFeature2ColorResolveModes without the depth modes)
+  const bool colour_modes = rig.has(graphics::kFeatureResolveModes) || (rig.caps().features2 & graphics::kFeature2ColorResolveModes);
+  if (!rig.has(graphics::kFeatureMultisample | graphics::kFeatureBlendState) || (mode != 0 && !colour_modes))
     return void(rig.step(mode == 0 ? "multisampling" : "colour resolve modes", status::kNotSupported));
   auto rect = [](Vertex* v, float x0, float y0, float x1, float y1, float z, float r, float g, float b) {
     auto at = [&](float px, float py) { return Vertex{px / 16.0f - 1.0f, py / 16.0f - 1.0f, z, r, g, b, 1}; };

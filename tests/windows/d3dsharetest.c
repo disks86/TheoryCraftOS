@@ -289,8 +289,30 @@ static void test_fences(D12 *a, D12 *b) {
   ID3D12Fence *fence = NULL, *plain = NULL, *opened = NULL;
   CHECK_HR(ID3D12Device_CreateFence(a->dev, 3, D3D12_FENCE_FLAG_SHARED, &IID_ID3D12Fence, (void **)&fence));
   CHECK_HR(ID3D12Device_CreateFence(a->dev, 0, D3D12_FENCE_FLAG_NONE, &IID_ID3D12Fence, (void **)&plain));
-  CHECK(ID3D12Device_CreateFence(a->dev, 0, D3D12_FENCE_FLAG_SHARED_CROSS_ADAPTER | D3D12_FENCE_FLAG_SHARED, &IID_ID3D12Fence, (void **)&opened) == DXGI_ERROR_UNSUPPORTED);
   if (!fence || !plain) return;
+  /* a fence shared across adapters: opened by the other device (of another adapter when there is one), signalled by its queue, seen by the first */
+  ID3D12Fence *cross = NULL, *cross_b = NULL;
+  CHECK_HR(ID3D12Device_CreateFence(a->dev, 1, D3D12_FENCE_FLAG_SHARED_CROSS_ADAPTER | D3D12_FENCE_FLAG_SHARED, &IID_ID3D12Fence, (void **)&cross));
+  if (cross) {
+    HANDLE cross_handle = NULL;
+    CHECK_HR(ID3D12Device_CreateSharedHandle(a->dev, (ID3D12DeviceChild *)cross, NULL, GENERIC_ALL, NULL, &cross_handle));
+    if (cross_handle) CHECK_HR(ID3D12Device_OpenSharedHandle(b->dev, cross_handle, &IID_ID3D12Fence, (void **)&cross_b));
+    if (cross_b) {
+      CHECK(ID3D12Fence_GetCompletedValue(cross_b) == 1);
+      CHECK_HR(ID3D12CommandQueue_Signal(b->queue, cross_b, 4));
+      HANDLE event = CreateEventW(NULL, FALSE, FALSE, NULL);
+      CHECK_HR(ID3D12Fence_SetEventOnCompletion(cross, 4, event));
+      CHECK(WaitForSingleObject(event, 10000) == WAIT_OBJECT_0);
+      CloseHandle(event);
+      CHECK(ID3D12Fence_GetCompletedValue(cross) == 4);
+      ID3D12Fence_Release(cross_b);
+    }
+    ID3D12Fence1 *f1 = NULL;
+    CHECK_HR(ID3D12Fence_QueryInterface(cross, &IID_ID3D12Fence1, (void **)&f1));
+    if (f1) { CHECK(ID3D12Fence1_GetCreationFlags(f1) & D3D12_FENCE_FLAG_SHARED_CROSS_ADAPTER); ID3D12Fence1_Release(f1); }
+    if (cross_handle) CloseHandle(cross_handle);
+    ID3D12Fence_Release(cross);
+  }
   HANDLE handle = NULL, none = NULL;
   CHECK(ID3D12Device_CreateSharedHandle(a->dev, (ID3D12DeviceChild *)plain, NULL, GENERIC_ALL, NULL, &none) == E_INVALIDARG && !none);
   CHECK_HR(ID3D12Device_CreateSharedHandle(a->dev, (ID3D12DeviceChild *)fence, NULL, GENERIC_ALL, L"TcosShareTestFence", &handle));
@@ -320,6 +342,65 @@ static void test_fences(D12 *a, D12 *b) {
   if (handle) CloseHandle(handle);
   ID3D12Fence_Release(fence);
   ID3D12Fence_Release(plain);
+}
+
+/* Across adapters: a fence shared across adapters opened by a device of the second adapter when the machine has one (a GPU and the CPU renderer's), its queue's signal
+ * seen by the first; heaps across adapters are refused (DXGI_ERROR_UNSUPPORTED: the kernel's allocations are each of one adapter's memory), as the options say. */
+static void test_cross_adapter(D12 *a) {
+  D3D12_FEATURE_DATA_D3D12_OPTIONS o;
+  CHECK_HR(ID3D12Device_CheckFeatureSupport(a->dev, D3D12_FEATURE_D3D12_OPTIONS, &o, sizeof o));
+  CHECK(!o.CrossAdapterRowMajorTextureSupported && o.CrossNodeSharingTier == D3D12_CROSS_NODE_SHARING_TIER_NOT_SUPPORTED);
+  D3D12_HEAP_DESC hd = {65536, {D3D12_HEAP_TYPE_DEFAULT, D3D12_CPU_PAGE_PROPERTY_UNKNOWN, D3D12_MEMORY_POOL_UNKNOWN, 1, 1}, 0,
+                        D3D12_HEAP_FLAG_SHARED | D3D12_HEAP_FLAG_SHARED_CROSS_ADAPTER | D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS};
+  ID3D12Heap *heap = NULL;
+  CHECK(ID3D12Device_CreateHeap(a->dev, &hd, &IID_ID3D12Heap, (void **)&heap) == DXGI_ERROR_UNSUPPORTED && !heap);
+  IDXGIFactory1 *factory = NULL;
+  IDXGIAdapter1 *second = NULL;
+  CHECK_HR(CreateDXGIFactory1(&IID_IDXGIFactory1, (void **)&factory));
+  const LUID mine = ID3D12Device_GetAdapterLuid(a->dev);
+  for (UINT i = 0; factory && !second; ++i) {
+    IDXGIAdapter1 *adapter = NULL;
+    if (FAILED(IDXGIFactory1_EnumAdapters1(factory, i, &adapter))) break;
+    DXGI_ADAPTER_DESC1 desc;
+    if (SUCCEEDED(IDXGIAdapter1_GetDesc1(adapter, &desc)) && (desc.AdapterLuid.LowPart != mine.LowPart || desc.AdapterLuid.HighPart != mine.HighPart)) second = adapter;
+    else IDXGIAdapter1_Release(adapter);
+  }
+  if (factory) IDXGIFactory1_Release(factory);
+  if (!second) { printf("cross adapter: one adapter\n"); return; }
+  ID3D12Device *other = NULL;
+  ID3D12CommandQueue *queue = NULL;
+  CHECK_HR(D3D12CreateDevice((IUnknown *)second, D3D_FEATURE_LEVEL_11_0, &IID_ID3D12Device, (void **)&other));
+  IDXGIAdapter1_Release(second);
+  D3D12_COMMAND_QUEUE_DESC qd = {D3D12_COMMAND_LIST_TYPE_DIRECT, 0, D3D12_COMMAND_QUEUE_FLAG_NONE, 0};
+  if (other) CHECK_HR(ID3D12Device_CreateCommandQueue(other, &qd, &IID_ID3D12CommandQueue, (void **)&queue));
+  ID3D12Fence *fence = NULL, *opened = NULL;
+  CHECK_HR(ID3D12Device_CreateFence(a->dev, 2, D3D12_FENCE_FLAG_SHARED | D3D12_FENCE_FLAG_SHARED_CROSS_ADAPTER, &IID_ID3D12Fence, (void **)&fence));
+  HANDLE handle = NULL;
+  if (fence) CHECK_HR(ID3D12Device_CreateSharedHandle(a->dev, (ID3D12DeviceChild *)fence, NULL, GENERIC_ALL, NULL, &handle));
+  if (handle && other) CHECK_HR(ID3D12Device_OpenSharedHandle(other, handle, &IID_ID3D12Fence, (void **)&opened));
+  if (opened && queue) {
+    CHECK(ID3D12Fence_GetCompletedValue(opened) == 2);
+    HANDLE event = CreateEventW(NULL, FALSE, FALSE, NULL);
+    CHECK_HR(ID3D12Fence_SetEventOnCompletion(fence, 6, event));
+    CHECK_HR(ID3D12CommandQueue_Signal(queue, opened, 6));
+    CHECK(WaitForSingleObject(event, 10000) == WAIT_OBJECT_0);
+    CloseHandle(event);
+    /* (and the other way: the first adapter's queue signals, the second adapter's queue waits for it, then signals) */
+    CHECK_HR(ID3D12CommandQueue_Wait(queue, opened, 7));
+    CHECK_HR(ID3D12CommandQueue_Signal(queue, opened, 8));
+    CHECK_HR(ID3D12CommandQueue_Signal(a->queue, fence, 7));
+    event = CreateEventW(NULL, FALSE, FALSE, NULL);
+    CHECK_HR(ID3D12Fence_SetEventOnCompletion(fence, 8, event));
+    CHECK(WaitForSingleObject(event, 10000) == WAIT_OBJECT_0);
+    CloseHandle(event);
+    printf("cross adapter fence: %llu\n", (unsigned long long)ID3D12Fence_GetCompletedValue(fence));
+    CHECK(ID3D12Fence_GetCompletedValue(fence) == 8);
+  }
+  if (opened) ID3D12Fence_Release(opened);
+  if (handle) CloseHandle(handle);
+  if (fence) ID3D12Fence_Release(fence);
+  if (queue) ID3D12CommandQueue_Release(queue);
+  if (other) ID3D12Device_Release(other);
 }
 
 /* ---- Direct3D 11 ------------------------------------------------------------------------------------------------------------------------------------------------ */
@@ -467,7 +548,8 @@ static void test_d3d11_fences(D12 *a) {
   CHECK_HR(ID3D11Device5_CreateFence(x, 3, D3D11_FENCE_FLAG_SHARED, &IID_ID3D11Fence, (void **)&fence));
   CHECK_HR(ID3D11Device5_CreateFence(x, 0, (D3D11_FENCE_FLAG)0, &IID_ID3D11Fence, (void **)&plain));
   CHECK_HR(ID3D11Device5_CreateFence(x, 0, D3D11_FENCE_FLAG_NONE, &IID_ID3D11Fence, (void **)&none1));
-  CHECK(ID3D11Device5_CreateFence(x, 0, D3D11_FENCE_FLAG_SHARED | D3D11_FENCE_FLAG_SHARED_CROSS_ADAPTER, &IID_ID3D11Fence, (void **)&bad) == DXGI_ERROR_UNSUPPORTED && !bad);
+  CHECK_HR(ID3D11Device5_CreateFence(x, 0, D3D11_FENCE_FLAG_SHARED | D3D11_FENCE_FLAG_SHARED_CROSS_ADAPTER, &IID_ID3D11Fence, (void **)&bad));      /* (shared across adapters) */
+  if (bad) { ID3D11Fence_Release(bad); bad = NULL; }
   CHECK(ID3D11Device5_CreateFence(x, 0, (D3D11_FENCE_FLAG)0x10, &IID_ID3D11Fence, (void **)&bad) == E_INVALIDARG && !bad);
   CHECK(ID3D11Device5_CreateFence(x, 0, D3D11_FENCE_FLAG_NONE, &IID_ID3D11Device, (void **)&bad) == E_NOINTERFACE && !bad);
   if (!fence || !plain) goto fences_done;
@@ -1382,6 +1464,7 @@ int main(int argc, char **argv) {
   test_textures(&a, &b);
   test_heaps(&a, &b);
   test_fences(&a, &b);
+  test_cross_adapter(&a);
   test_d3d11(&a);
   test_kmt_direct(&a);
   test_keyed_mutex();

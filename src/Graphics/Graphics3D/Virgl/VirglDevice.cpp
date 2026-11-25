@@ -273,6 +273,7 @@ class VirglImage final : public IImage {
   ~VirglImage() {
     hardware::VirtioGpu& gpu = device_.gpu();
     if (view_) device_.destroy_object(view_);
+    if (fetch_view_) device_.destroy_object(fetch_view_);
     for (const LayerSurface& s : surfaces_)
       if (s.handle) device_.destroy_object(s.handle);
     if (id_) {
@@ -323,6 +324,16 @@ class VirglImage final : public IImage {
     }
   }
   uint32_t view() const { return view_; }
+  // A view for texel fetches: the sampled image's own, or one made on first use for an image that is not sampled (a multisampled render target, which the least /
+  // greatest resolve reads sample by sample). 0 for a depth image or if the host refuses it.
+  uint32_t fetch_view() {
+    if (view_) return view_;
+    if (fetch_view_ || desc_.format == Format::D32Float || is_compressed_format(desc_.format)) return fetch_view_;
+    const uint32_t handle = device_.new_handle();
+    const uint32_t cmd[] = {virgl::header(virgl::kCreateObject, virgl::kObjectSamplerView, 6), handle, id_, color_format_, 0, 0, virgl::kSwizzleRgba};
+    if (device_.send_commands(cmd, 7)) fetch_view_ = handle;
+    return fetch_view_;
+  }
   Extent2D extent() const override { return desc_.extent; }
   Format format() const override { return desc_.format; }
   uint32_t usage() const { return desc_.usage; }
@@ -506,6 +517,7 @@ class VirglImage final : public IImage {
   VirglDevice& device_;
   ImageDesc desc_;
   uint32_t id_ = 0, surface_ = 0, view_ = 0, color_format_ = 0;
+  uint32_t fetch_view_ = 0;   // (fetch_view)
   uint64_t accounted_ = 0;   // what the GPU's video memory figure counts for this image
   ByteView backing_;
   bool ok_ = false;
@@ -961,6 +973,157 @@ class VirglPipeline final : public VirglPipelineBase {
   uint32_t binding_count_ = 0;
   bool ok_ = false;
 };
+
+// The least or greatest of each pixel's samples of a multisampled colour image `from` into the plain image `to` of its size: a triangle over the whole of `to` whose pixel
+// shader fetches every sample of its pixel (TXF on the 2D_MSAA view, the sample in the fourth component) and keeps the least or the greatest of each channel. The shaders and
+// states are made for the resolve and destroyed after it in the stream (the host runs the stream in order); the framebuffer, viewport, shaders, blend, depth, rasterizer
+// and vertex elements it binds are the caller's to set again.
+bool extreme_resolve(VirglDevice& device, Stream& stream, VirglImage& to, VirglImage& from, bool greatest) {
+  const uint32_t samples = from.samples();
+  const uint32_t view = from.fetch_view(), surface = to.surface(0, 1);
+  if (samples < 2 || samples > 16 || !view || !surface) return false;
+  // (the vertex shader: a triangle from (-1, -1) to (3, -1) and (-1, 3), from the vertex number alone - x is 4 * (id & 1) - 1, y 4 * ((id & 2) != 0) - 1)
+  static const char kVertex[] =
+      "VERT\n"
+      "DCL SV[0], VERTEXID\n"
+      "DCL OUT[0], POSITION\n"
+      "DCL TEMP[0]\n"
+      "IMM[0] UINT32 {1, 2, 0, 1065353216}\n"
+      "IMM[1] FLT32 {4.0000, -1.0000, 0.0000, 1.0000}\n"
+      "  0: AND TEMP[0].xy, SV[0].xxxx, IMM[0].xyyy\n"
+      "  1: USNE TEMP[0].xy, TEMP[0].xyyy, IMM[0].zzzz\n"
+      "  2: AND TEMP[0].xy, TEMP[0].xyyy, IMM[0].wwww\n"
+      "  3: MAD OUT[0].xy, TEMP[0].xyyy, IMM[1].xxxx, IMM[1].yyyy\n"
+      "  4: MOV OUT[0].zw, IMM[1].zzzw\n"
+      "  5: END\n";
+  // (the pixel shader: the pixel's coordinate as integers, then each sample fetched and folded in with MIN or MAX)
+  char fragment[2048];
+  uint32_t n = 0;
+  auto add = [&](const char* text) {
+    for (const char* c = text; *c && n + 1 < sizeof fragment; ++c) fragment[n++] = *c;
+    fragment[n] = 0;
+  };
+  auto add_number = [&](uint32_t v) {
+    char digits[12];
+    uint32_t d = 0;
+    do { digits[d++] = static_cast<char>('0' + v % 10); v /= 10; } while (v && d < sizeof digits);
+    while (d && n + 1 < sizeof fragment) fragment[n++] = digits[--d];
+    fragment[n] = 0;
+  };
+  add("FRAG\nPROPERTY FS_COLOR0_WRITES_ALL_CBUFS 1\nDCL IN[0], POSITION, LINEAR\nDCL OUT[0], COLOR\nDCL SAMP[0]\nDCL SVIEW[0], 2D_MSAA, FLOAT\nDCL TEMP[0..2]\n");
+  add("IMM[0] UINT32 {0, 0, 0, 0}\n");
+  for (uint32_t k = 1; k < samples; ++k) {
+    add("IMM[");
+    add_number(k);
+    add("] UINT32 {");
+    add_number(k);
+    add(", 0, 0, 0}\n");
+  }
+  uint32_t line = 0;
+  auto instruction = [&](const char* text) {
+    add("  ");
+    add_number(line++);
+    add(": ");
+    add(text);
+    add("\n");
+  };
+  instruction("F2I TEMP[0].xy, IN[0].xyyy");
+  instruction("MOV TEMP[0].zw, IMM[0].xxxx");
+  instruction("TXF TEMP[1], TEMP[0], SAMP[0], 2D_MSAA");
+  for (uint32_t k = 1; k < samples; ++k) {
+    add("  ");
+    add_number(line++);
+    add(": MOV TEMP[0].w, IMM[");
+    add_number(k);
+    add("].xxxx\n");
+    instruction("TXF TEMP[2], TEMP[0], SAMP[0], 2D_MSAA");
+    instruction(greatest ? "MAX TEMP[1], TEMP[1], TEMP[2]" : "MIN TEMP[1], TEMP[1], TEMP[2]");
+  }
+  instruction("MOV OUT[0], TEMP[1]");
+  instruction("END");
+  if (n + 1 >= sizeof fragment) return false;
+  // (the objects, made straight away so that they exist before the stream that uses them)
+  const uint32_t vs = device.new_handle(), fs = device.new_handle(), blend = device.new_handle(), dsa = device.new_handle(), rasterizer = device.new_handle(), elements = device.new_handle();
+  auto shader = [&](uint32_t handle, uint32_t stage, const char* text) {
+    const uint32_t length = string_length(text) + 1;
+    const uint32_t dwords = (length + 3) / 4;
+    uint32_t cmd[6 + 2048 / 4 + 1] = {};
+    if (6 + dwords > sizeof cmd / sizeof cmd[0]) return false;
+    cmd[0] = virgl::header(virgl::kCreateObject, virgl::kObjectShader, 5 + dwords);
+    cmd[1] = handle;
+    cmd[2] = stage;
+    cmd[3] = length;
+    cmd[4] = 300;   // (the TGSI tokens the host reserves)
+    cmd[5] = 0;     // (no stream output)
+    __builtin_memcpy(&cmd[6], text, length);
+    return device.send_commands(cmd, 6 + dwords);
+  };
+  const uint32_t states[] = {
+      virgl::header(virgl::kCreateObject, virgl::kObjectBlend, 11), blend, 0, 0, 0xFu << 27, 0, 0, 0, 0, 0, 0, 0,
+      virgl::header(virgl::kCreateObject, virgl::kObjectDsa, 5), dsa, 0, 0, 0, 0,
+      // (depth clip, a 0..1 clip volume, no culling, no scissor, GL pixel conventions)
+      virgl::header(virgl::kCreateObject, virgl::kObjectRasterizer, 9), rasterizer, (1u << 1) | (1u << 2) | (virgl::kFaceNone << 8) | (1u << 29) | (1u << 30), float_bits(1.0f), 0, 0,
+      float_bits(1.0f), 0, 0, 0,
+      // (one element the vertex shader does not read)
+      virgl::header(virgl::kCreateObject, virgl::kObjectVertexElements, 5), elements, 0, 0, 0, virgl::kFormatR32G32B32A32Float,
+  };
+  if (!shader(vs, virgl::kShaderVertex, kVertex) || !shader(fs, virgl::kShaderFragment, fragment) || !device.send_commands(states, sizeof states / sizeof states[0])) return false;
+  const uint32_t sampler = device.sampler_state(SamplerDesc());
+  if (!sampler) return false;
+  const Extent2D e = to.extent();
+  stream.command(virgl::kSetFramebufferState, 0, 3);
+  stream.put(1);
+  stream.put(0);
+  stream.put(surface);
+  stream.command(virgl::kSetViewportState, 0, 7);
+  stream.put(0);
+  stream.putf(e.width * 0.5f);
+  stream.putf((to.y0_top() ? -1.0f : 1.0f) * e.height * 0.5f);
+  stream.putf(1.0f);
+  stream.putf(e.width * 0.5f);
+  stream.putf(e.height * 0.5f);
+  stream.putf(0.0f);
+  stream.command(virgl::kBindObject, virgl::kObjectBlend, 1);
+  stream.put(blend);
+  stream.command(virgl::kBindObject, virgl::kObjectDsa, 1);
+  stream.put(dsa);
+  stream.command(virgl::kBindObject, virgl::kObjectRasterizer, 1);
+  stream.put(rasterizer);
+  stream.command(virgl::kBindObject, virgl::kObjectVertexElements, 1);
+  stream.put(elements);
+  const uint32_t binds[][2] = {{vs, virgl::kShaderVertex}, {fs, virgl::kShaderFragment}, {0, virgl::kShaderGeometry}, {0, virgl::kShaderTessControl}, {0, virgl::kShaderTessEval}};
+  for (const auto& b : binds) {
+    stream.command(virgl::kBindShader, 0, 2);
+    stream.put(b[0]);
+    stream.put(b[1]);
+  }
+  stream.command(virgl::kSetSamplerViews, 0, 3);
+  stream.put(virgl::kShaderFragment);
+  stream.put(0);
+  stream.put(view);
+  stream.command(virgl::kBindSamplerStates, 0, 3);
+  stream.put(virgl::kShaderFragment);
+  stream.put(0);
+  stream.put(sampler);
+  stream.command(virgl::kDrawVbo, 0, 12);
+  stream.put(0);   // (first vertex)
+  stream.put(3);
+  stream.put(virgl::kPrimTriangles);
+  stream.put(0);   // (not indexed)
+  stream.put(1);   // (instances)
+  stream.put(0);
+  stream.put(0);
+  stream.put(0);
+  stream.put(0);
+  stream.put(0);
+  stream.put(0xFFFFFFFFu);
+  stream.put(0);
+  for (const uint32_t handle : {vs, fs, blend, dsa, rasterizer, elements}) {
+    stream.command(virgl::kDestroyObject, 0, 1);
+    stream.put(handle);
+  }
+  return !stream.overflow();
+}
 
 }  // namespace
 
@@ -1452,13 +1615,25 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
         break;
       case RecordedCommand::Type::Resolve: {
         // A blit from the multisampled image to the plain one; one kept upright (an image that is only drawn into) is turned over.
-        const VirglImage* to = static_cast<const VirglImage*>(cmd.image);
+        VirglImage* to = static_cast<VirglImage*>(cmd.image);
         const VirglImage* from = static_cast<const VirglImage*>(cmd.image2);
         if (in_pass || !to || !from || to->samples() != 1 || from->samples() < 2 || to->extent().width != from->extent().width || to->extent().height != from->extent().height) return false;
         const Extent2D e = from->extent();
         const bool depth = to->format() == Format::D32Float;
-        // (the host's blit averages colour and takes the first sample of depth: the other modes are not made)
-        if (static_cast<ResolveMode>(cmd.count) != (depth ? ResolveMode::Sample0 : ResolveMode::Average)) return false;
+        const ResolveMode mode = static_cast<ResolveMode>(cmd.count);
+        if (!depth && (mode == ResolveMode::Min || mode == ResolveMode::Max)) {
+          // (the least or greatest samples of a colour image - kFeature2ColorResolveModes: the host's blit only averages - drawn, and the state it took set again by
+          // the next pass and draw)
+          unset_stream_output();
+          if (!extreme_resolve(*this, stream, *to, *const_cast<VirglImage*>(from), mode == ResolveMode::Max)) return false;
+          pipeline = nullptr;
+          textures_dirty = true;
+          constants_dirty = constants_dwords != 0;
+          bound_fragment_shader = 0;
+          break;
+        }
+        // (the host's blit averages colour and takes the first sample of depth: the other modes of a depth image are not made)
+        if (mode != (depth ? ResolveMode::Sample0 : ResolveMode::Average)) return false;
         const bool flip = !depth && to->y0_top();   // (a multisampled image does not take the flag: the host stores it the way GL does, and only a destination kept upright needs the blit to turn it over)
         stream.command(virgl::kBlit, 0, 21);
         stream.put(depth ? (to->has_stencil() ? 0x30u : 0x10u) : 0xFu);   // (all four channels, or depth and stencil; nearest, no scissor)

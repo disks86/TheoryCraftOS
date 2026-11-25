@@ -357,10 +357,30 @@ static void STDMETHODCALLTYPE dev_CreateSamplerFeedbackUnorderedAccessView(Dev *
 /* A stream is subobjects one after the other, each its type (a UINT) and then its contents at their alignment, the whole aligned to a pointer
  * (CD3DX12_PIPELINE_STATE_STREAM_SUBOBJECT). It is made into a graphics or a compute pipeline description. */
 
+/* A float depth bias (RASTERIZER1 / 2) as the integer of D3D12_RASTERIZER_DESC: the nearest, within an INT. */
+static INT depth_bias_int(FLOAT bias) {
+  if (!(bias == bias)) return 0;
+  if (bias >= 2147483520.0f) return 0x7FFFFFFF;
+  if (bias <= -2147483648.0f) return (INT)0x80000000u;
+  return (INT)(bias < 0 ? bias - 0.5f : bias + 0.5f);
+}
 static const D3D12_BLEND_DESC g_default_blend12 = {FALSE, FALSE, {{FALSE, FALSE, D3D12_BLEND_ONE, D3D12_BLEND_ZERO, D3D12_BLEND_OP_ADD, D3D12_BLEND_ONE, D3D12_BLEND_ZERO, D3D12_BLEND_OP_ADD,
                                                                    D3D12_LOGIC_OP_NOOP, D3D12_COLOR_WRITE_ENABLE_ALL}}};
-/* The stream as a graphics or a compute description (`*is_compute`); the descriptions point into the stream. */
-static HRESULT stream_parse(const D3D12_PIPELINE_STATE_STREAM_DESC *stream, D3D12_GRAPHICS_PIPELINE_STATE_DESC *gp, D3D12_COMPUTE_PIPELINE_STATE_DESC *cp, BOOL *is_compute) {
+/* The stream as a graphics or a compute description (`*is_compute`); the descriptions point into the stream. A SERIALIZED_ROOT_SIGNATURE subobject is made into a root
+ * signature of `dev`'s, returned in `*made` (NULL when there is none), which the caller releases once the pipeline is made (the pipeline holds its own reference).
+ *
+ * The subobjects of the later Agility SDKs map to the state the kernel's pipelines have:
+ *   - DEPTH_STENCIL2: front and back faces with their own stencil masks. IndependentFrontAndBackStencilRefMaskSupported is FALSE (OPTIONS14), so masks that differ
+ *     with the stencil test on are E_INVALIDARG, as Direct3D 12 refuses them on such a device; the masks go to the pipeline's one pair.
+ *   - RASTERIZER1 / RASTERIZER2: the depth bias as a float. The pipeline's bias is D3D12_RASTERIZER_DESC's integer, so it is rounded to the nearest; the clamp and the
+ *     slope go as they are. RASTERIZER2's line mode is the pair of MultisampleEnable / AntialiasedLineEnable it replaces (aliased, alpha-antialiased, wide quadrilateral);
+ *     narrow quadrilateral lines are E_INVALIDARG (NarrowQuadrilateralLinesSupported is FALSE, OPTIONS19).
+ *   - one subobject of each kind: DEPTH_STENCIL, DEPTH_STENCIL1 and DEPTH_STENCIL2 are one kind, the three rasterizers another, ROOT_SIGNATURE and SERIALIZED_ROOT_SIGNATURE
+ *     a third; a second of a kind is E_INVALIDARG.
+ *   - PSDB and the subobject types after it: E_INVALIDARG (a type this runtime does not know). */
+static HRESULT stream_parse(Dev *dev, const D3D12_PIPELINE_STATE_STREAM_DESC *stream, D3D12_GRAPHICS_PIPELINE_STATE_DESC *gp, D3D12_COMPUTE_PIPELINE_STATE_DESC *cp, BOOL *is_compute,
+                            ID3D12RootSignature **made) {
+  *made = NULL;
   if (!stream || !stream->pPipelineStateSubobjectStream || stream->SizeInBytes < sizeof(UINT)) return E_INVALIDARG;
   D3D12_GRAPHICS_PIPELINE_STATE_DESC g;
   D3D12_COMPUTE_PIPELINE_STATE_DESC c;
@@ -385,10 +405,19 @@ static HRESULT stream_parse(const D3D12_PIPELINE_STATE_STREAM_DESC *stream, D3D1
   UINT seen = 0;
   BOOL compute = FALSE, graphics = FALSE;
   SIZE_T at = 0;
+  const UINT depth_kinds = 1u << D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL | 1u << D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL1 |
+                           1u << D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL2;
+  const UINT raster_kinds = 1u << D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER | 1u << D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER1 |
+                            1u << D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER2;
+  const UINT root_kinds = 1u << D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE | 1u << D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SERIALIZED_ROOT_SIGNATURE;
+  HRESULT hr = S_OK;
+#define STREAM_FAIL(code) do { hr = (code); goto fail; } while (0)
   while (at + sizeof(UINT) <= size) {
     UINT type;
     memcpy(&type, base + at, 4);
-    if (type >= 32 || (seen >> type & 1)) return E_INVALIDARG;      /* (each subobject at most once) */
+    if (type >= 32 || (seen >> type & 1)) STREAM_FAIL(E_INVALIDARG);      /* (each subobject at most once) */
+    const UINT kinds = (depth_kinds >> type & 1) ? depth_kinds : (raster_kinds >> type & 1) ? raster_kinds : (root_kinds >> type & 1) ? root_kinds : 1u << type;
+    if (seen & kinds) STREAM_FAIL(E_INVALIDARG);      /* (one of each kind) */
     seen |= 1u << type;
     SIZE_T inner = 0, align = 4;
     switch (type) {
@@ -409,10 +438,14 @@ static HRESULT stream_parse(const D3D12_PIPELINE_STATE_STREAM_DESC *stream, D3D1
       case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_DESC: inner = sizeof(DXGI_SAMPLE_DESC); break;
       case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CACHED_PSO: inner = sizeof(D3D12_CACHED_PIPELINE_STATE); align = sizeof(void *); break;
       case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VIEW_INSTANCING: inner = sizeof(D3D12_VIEW_INSTANCING_DESC); align = sizeof(void *); break;
-      default: return E_INVALIDARG;
+      case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL2: inner = sizeof(D3D12_DEPTH_STENCIL_DESC2); break;
+      case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER1: inner = sizeof(D3D12_RASTERIZER_DESC1); break;
+      case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER2: inner = sizeof(D3D12_RASTERIZER_DESC2); break;
+      case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SERIALIZED_ROOT_SIGNATURE: inner = sizeof(D3D12_SERIALIZED_ROOT_SIGNATURE_DESC); align = sizeof(void *); break;
+      default: STREAM_FAIL(E_INVALIDARG);
     }
     const SIZE_T data_at = (at + 4 + align - 1) & ~(align - 1), next = (data_at + inner + sizeof(void *) - 1) & ~(sizeof(void *) - 1);
-    if (data_at + inner > size) return E_INVALIDARG;
+    if (data_at > size || inner > size - data_at) STREAM_FAIL(E_INVALIDARG);
     const void *p = base + data_at;
     switch (type) {
       case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE: memcpy(&g.pRootSignature, p, sizeof(void *)); c.pRootSignature = g.pRootSignature; break;
@@ -425,7 +458,7 @@ static HRESULT stream_parse(const D3D12_PIPELINE_STATE_STREAM_DESC *stream, D3D1
       case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS: case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS: {
         D3D12_SHADER_BYTECODE s;
         memcpy(&s, p, inner);
-        if (s.pShaderBytecode && s.BytecodeLength) return E_INVALIDARG;      /* (no mesh shaders: D3D12_MESH_SHADER_TIER_NOT_SUPPORTED) */
+        if (s.pShaderBytecode && s.BytecodeLength) STREAM_FAIL(E_INVALIDARG);      /* (no mesh shaders: D3D12_MESH_SHADER_TIER_NOT_SUPPORTED) */
         break;
       }
       case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_STREAM_OUTPUT: memcpy(&g.StreamOutput, p, inner); break;
@@ -436,7 +469,7 @@ static HRESULT stream_parse(const D3D12_PIPELINE_STATE_STREAM_DESC *stream, D3D1
       case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL1: {
         D3D12_DEPTH_STENCIL_DESC1 d1;
         memcpy(&d1, p, inner);
-        if (d1.DepthBoundsTestEnable) return E_INVALIDARG;      /* (DepthBoundsTestSupported is FALSE) */
+        if (d1.DepthBoundsTestEnable) STREAM_FAIL(E_INVALIDARG);      /* (DepthBoundsTestSupported is FALSE) */
         g.DepthStencilState.DepthEnable = d1.DepthEnable;
         g.DepthStencilState.DepthWriteMask = d1.DepthWriteMask;
         g.DepthStencilState.DepthFunc = d1.DepthFunc;
@@ -453,7 +486,7 @@ static HRESULT stream_parse(const D3D12_PIPELINE_STATE_STREAM_DESC *stream, D3D1
       case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS: {
         struct D3D12_RT_FORMAT_ARRAY f;
         memcpy(&f, p, inner);
-        if (f.NumRenderTargets > 8) return E_INVALIDARG;
+        if (f.NumRenderTargets > 8) STREAM_FAIL(E_INVALIDARG);
         g.NumRenderTargets = f.NumRenderTargets;
         memcpy(g.RTVFormats, f.RTFormats, sizeof g.RTVFormats);
         break;
@@ -466,25 +499,87 @@ static HRESULT stream_parse(const D3D12_PIPELINE_STATE_STREAM_DESC *stream, D3D1
       case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VIEW_INSTANCING: {
         D3D12_VIEW_INSTANCING_DESC v;
         memcpy(&v, p, inner);
-        if (v.ViewInstanceCount > 1) return E_INVALIDARG;      /* (D3D12_VIEW_INSTANCING_TIER_NOT_SUPPORTED) */
+        if (v.ViewInstanceCount > 1) STREAM_FAIL(E_INVALIDARG);      /* (D3D12_VIEW_INSTANCING_TIER_NOT_SUPPORTED) */
+        break;
+      }
+      case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL2: {
+        D3D12_DEPTH_STENCIL_DESC2 d2;
+        memcpy(&d2, p, inner);
+        if (d2.DepthBoundsTestEnable) STREAM_FAIL(E_INVALIDARG);      /* (DepthBoundsTestSupported is FALSE) */
+        if (d2.StencilEnable && (d2.FrontFace.StencilReadMask != d2.BackFace.StencilReadMask || d2.FrontFace.StencilWriteMask != d2.BackFace.StencilWriteMask))
+          STREAM_FAIL(E_INVALIDARG);      /* (IndependentFrontAndBackStencilRefMaskSupported is FALSE) */
+        g.DepthStencilState.DepthEnable = d2.DepthEnable;
+        g.DepthStencilState.DepthWriteMask = d2.DepthWriteMask;
+        g.DepthStencilState.DepthFunc = d2.DepthFunc;
+        g.DepthStencilState.StencilEnable = d2.StencilEnable;
+        g.DepthStencilState.StencilReadMask = d2.FrontFace.StencilReadMask;
+        g.DepthStencilState.StencilWriteMask = d2.FrontFace.StencilWriteMask;
+        const D3D12_DEPTH_STENCILOP_DESC1 *faces[2] = {&d2.FrontFace, &d2.BackFace};
+        D3D12_DEPTH_STENCILOP_DESC *to[2] = {&g.DepthStencilState.FrontFace, &g.DepthStencilState.BackFace};
+        for (UINT f = 0; f < 2; ++f) {
+          to[f]->StencilFailOp = faces[f]->StencilFailOp;
+          to[f]->StencilDepthFailOp = faces[f]->StencilDepthFailOp;
+          to[f]->StencilPassOp = faces[f]->StencilPassOp;
+          to[f]->StencilFunc = faces[f]->StencilFunc;
+        }
+        break;
+      }
+      case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER1: {
+        D3D12_RASTERIZER_DESC1 r1;
+        memcpy(&r1, p, inner);
+        D3D12_RASTERIZER_DESC *r = &g.RasterizerState;
+        r->FillMode = r1.FillMode; r->CullMode = r1.CullMode; r->FrontCounterClockwise = r1.FrontCounterClockwise;
+        r->DepthBias = depth_bias_int(r1.DepthBias); r->DepthBiasClamp = r1.DepthBiasClamp; r->SlopeScaledDepthBias = r1.SlopeScaledDepthBias;
+        r->DepthClipEnable = r1.DepthClipEnable; r->MultisampleEnable = r1.MultisampleEnable; r->AntialiasedLineEnable = r1.AntialiasedLineEnable;
+        r->ForcedSampleCount = r1.ForcedSampleCount; r->ConservativeRaster = r1.ConservativeRaster;
+        break;
+      }
+      case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER2: {
+        D3D12_RASTERIZER_DESC2 r2;
+        memcpy(&r2, p, inner);
+        if ((UINT)r2.LineRasterizationMode > D3D12_LINE_RASTERIZATION_MODE_QUADRILATERAL_NARROW) STREAM_FAIL(E_INVALIDARG);
+        if (r2.LineRasterizationMode == D3D12_LINE_RASTERIZATION_MODE_QUADRILATERAL_NARROW) STREAM_FAIL(E_INVALIDARG);      /* (NarrowQuadrilateralLinesSupported is FALSE) */
+        D3D12_RASTERIZER_DESC *r = &g.RasterizerState;
+        r->FillMode = r2.FillMode; r->CullMode = r2.CullMode; r->FrontCounterClockwise = r2.FrontCounterClockwise;
+        r->DepthBias = depth_bias_int(r2.DepthBias); r->DepthBiasClamp = r2.DepthBiasClamp; r->SlopeScaledDepthBias = r2.SlopeScaledDepthBias;
+        r->DepthClipEnable = r2.DepthClipEnable;
+        r->MultisampleEnable = r2.LineRasterizationMode == D3D12_LINE_RASTERIZATION_MODE_QUADRILATERAL_WIDE;
+        r->AntialiasedLineEnable = r2.LineRasterizationMode == D3D12_LINE_RASTERIZATION_MODE_ALPHA_ANTIALIASED;
+        r->ForcedSampleCount = r2.ForcedSampleCount; r->ConservativeRaster = r2.ConservativeRaster;
+        break;
+      }
+      case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SERIALIZED_ROOT_SIGNATURE: {
+        D3D12_SERIALIZED_ROOT_SIGNATURE_DESC sr;
+        memcpy(&sr, p, inner);
+        if (!sr.pSerializedBlob || !sr.SerializedBlobSizeInBytes) STREAM_FAIL(E_INVALIDARG);
+        hr = dev_CreateRootSignature(dev, 0, sr.pSerializedBlob, sr.SerializedBlobSizeInBytes, &IID_ID3D12RootSignature, (void **)made);
+        if (FAILED(hr)) goto fail;
+        g.pRootSignature = c.pRootSignature = *made;
         break;
       }
     }
     at = next;
   }
-  if (compute == graphics) return E_INVALIDARG;      /* (a compute shader alone, or the stages of a graphics pipeline) */
+  if (compute == graphics) STREAM_FAIL(E_INVALIDARG);      /* (a compute shader alone, or the stages of a graphics pipeline) */
   *gp = g;
   *cp = c;
   *is_compute = compute;
   return S_OK;
+fail:
+  if (*made) { ID3D12RootSignature_Release(*made); *made = NULL; }
+  return hr;
+#undef STREAM_FAIL
 }
 static HRESULT pipeline_stream(Dev *This, const D3D12_PIPELINE_STATE_STREAM_DESC *stream, REFIID riid, void **out) {
   D3D12_GRAPHICS_PIPELINE_STATE_DESC g;
   D3D12_COMPUTE_PIPELINE_STATE_DESC c;
   BOOL compute;
-  const HRESULT hr = stream_parse(stream, &g, &c, &compute);
+  ID3D12RootSignature *made;
+  const HRESULT hr = stream_parse(This, stream, &g, &c, &compute, &made);
   if (FAILED(hr)) return hr;
-  return compute ? dev_CreateComputePipelineState(This, &c, riid, out) : dev_CreateGraphicsPipelineState(This, &g, riid, out);
+  const HRESULT created = compute ? dev_CreateComputePipelineState(This, &c, riid, out) : dev_CreateGraphicsPipelineState(This, &g, riid, out);
+  if (made) ID3D12RootSignature_Release(made);
+  return created;
 }
 static HRESULT STDMETHODCALLTYPE dev_CreatePipelineState(Dev *This, const D3D12_PIPELINE_STATE_STREAM_DESC *desc, REFIID riid, void **out) {
   if (out) *out = NULL;
@@ -519,4 +614,51 @@ static D3D12_RESOURCE_DESC1 *STDMETHODCALLTYPE res_GetDesc1(Resource *This, D3D1
   out->Layout = This->desc.Layout;
   out->Flags = This->desc.Flags;
   return out;
+}
+
+/* ---- ID3D12Device11 .. 14 ------------------------------------------------------------------------------------------------------------------------------------------------ */
+
+/* CreateSampler2: the sampler of D3D12_SAMPLER_DESC2 - D3D12_SAMPLER_DESC with an integer border colour (D3D12_SAMPLER_FLAG_UINT_BORDER_COLOR: the colour is taken
+ * as transparent black, opaque black or opaque white by the same rule as a float one, a channel that is not 0 counting as 1) or coordinates in texels, which no
+ * device here samples with (NonNormalizedCoordinateSamplersSupported is FALSE, OPTIONS17): such a call, and one with flags that do not exist, is left out, as an
+ * invalid call is. */
+static void STDMETHODCALLTYPE dev_CreateSampler2(Dev *This, const D3D12_SAMPLER_DESC2 *desc, D3D12_CPU_DESCRIPTOR_HANDLE handle) {
+  if (!desc) { dev_CreateSampler(This, NULL, handle); return; }
+  if ((desc->Flags & ~(UINT)D3D12_SAMPLER_FLAG_UINT_BORDER_COLOR)) return;
+  D3D12_SAMPLER_DESC d;
+  d.Filter = desc->Filter;
+  d.AddressU = desc->AddressU;
+  d.AddressV = desc->AddressV;
+  d.AddressW = desc->AddressW;
+  d.MipLODBias = desc->MipLODBias;
+  d.MaxAnisotropy = desc->MaxAnisotropy;
+  d.ComparisonFunc = desc->ComparisonFunc;
+  for (UINT c = 0; c < 4; ++c)
+    d.BorderColor[c] = (desc->Flags & D3D12_SAMPLER_FLAG_UINT_BORDER_COLOR) ? (desc->UintBorderColor[c] ? 1.0f : 0.0f) : desc->FloatBorderColor[c];
+  d.MinLOD = desc->MinLOD;
+  d.MaxLOD = desc->MaxLOD;
+  dev_CreateSampler(This, &d, handle);
+}
+/* GetResourceAllocationInfo3: GetResourceAllocationInfo2 with castable formats - which need RelaxedFormatCastingSupported (FALSE): a description with any is one that
+ * cannot be had (a size of ~0). */
+static D3D12_RESOURCE_ALLOCATION_INFO *STDMETHODCALLTYPE dev_GetResourceAllocationInfo3(Dev *This, D3D12_RESOURCE_ALLOCATION_INFO *ret, UINT mask, UINT count,
+                                                                                          const D3D12_RESOURCE_DESC1 *descs, const UINT32 *castable_counts,
+                                                                                          const DXGI_FORMAT *const *castable, D3D12_RESOURCE_ALLOCATION_INFO1 *each) {
+  allocation_infos(This, count, NULL, descs, ret, each);
+  for (UINT i = 0; castable_counts && i < count; ++i)
+    if (castable_counts[i]) { ret->SizeInBytes = ~(UINT64)0; break; }
+  return ret;
+}
+/* OpenExistingHeapFromAddress1: as OpenExistingHeapFromAddress, of `size` bytes (D3D12_FEATURE_EXISTING_HEAPS: not supported). */
+static HRESULT STDMETHODCALLTYPE dev_OpenExistingHeapFromAddress1(Dev *This, const void *address, SIZE_T size, REFIID riid, void **out) {
+  if (out) *out = NULL;
+  return address && size ? DXGI_ERROR_UNSUPPORTED : E_INVALIDARG;
+}
+/* CreateRootSignatureFromSubobjectInLibrary: the root signature of a DXIL library's GlobalRootSignature / LocalRootSignature subobject of that name (rootsig.inc). */
+static HRESULT STDMETHODCALLTYPE dev_CreateRootSignatureFromSubobjectInLibrary(Dev *This, UINT mask, const void *library, SIZE_T size, LPCWSTR name, REFIID riid, void **out) {
+  const BYTE *bytes;
+  SIZE_T n;
+  if (out) *out = NULL;
+  if (!rs_library_subobject(library, size, name, &bytes, &n)) return E_INVALIDARG;
+  return dev_CreateRootSignature(This, mask, bytes, n, riid, out);
 }

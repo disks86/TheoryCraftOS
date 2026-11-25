@@ -49,10 +49,12 @@ graphics::AddressMode address_of(uint32_t mode) {
 NtStatus parse_blob(ConstByteView blob, RootSignatureDesc* out) {
   ByteReader head(blob);
   const uint32_t version = head.le32(), parameter_count = head.le32(), parameters_offset = head.le32(), sampler_count = head.le32(), samplers_offset = head.le32();
-  const uint32_t flags = version == 1 || version == 2 ? head.le32() : 0;
-  if (!head.ok() || (version != 1 && version != 2)) return status::kInvalidParameter;
+  const uint32_t flags = head.le32();
+  // (1 is version 1.0, 2 is 1.1 - flags on ranges and root descriptors -, 3 is 1.2: 1.1 with D3D12_SAMPLER_FLAGS after each static sampler)
+  if (!head.ok() || version < 1 || version > 3) return status::kInvalidParameter;
   if (parameter_count > kMaxRootParameters || sampler_count > kMaxStaticSamplers) return status::kInvalidParameter;
-  const bool v11 = version == 2;
+  const bool v11 = version >= 2;
+  const uint64_t sampler_stride = version == 3 ? 56 : 52;
   out->flags = flags;
   out->parameter_count = parameter_count;
   out->sampler_count = sampler_count;
@@ -116,23 +118,28 @@ NtStatus parse_blob(ConstByteView blob, RootSignatureDesc* out) {
   out->dwords = dwords;
   for (uint32_t i = 0; i < sampler_count; ++i) {
     ByteReader at;
-    if (!reader_at(blob, uint64_t{samplers_offset} + uint64_t{i} * 52, &at)) return status::kInvalidParameter;
+    if (!reader_at(blob, uint64_t{samplers_offset} + uint64_t{i} * sampler_stride, &at)) return status::kInvalidParameter;
     const uint32_t filter = at.le32(), address_u = at.le32(), address_v = at.le32();
     at.le32();   // (address w)
     const float bias = word_float(at.le32());
     at.le32();   // (anisotropy)
     at.le32();   // (comparison)
-    const uint32_t border = at.le32();   // (D3D12_STATIC_BORDER_COLOR: transparent black, opaque black, opaque white)
+    const uint32_t border = at.le32();   // (D3D12_STATIC_BORDER_COLOR: transparent black, opaque black, opaque white; 1.2 also opaque black and white of integers)
     const float min_lod = word_float(at.le32()), max_lod = word_float(at.le32());
     const uint32_t reg = at.le32(), space = at.le32(), visibility = at.le32();
-    if (!at.ok() || address_u < 1 || address_u > 5 || address_v < 1 || address_v > 5 || visibility > 5) return status::kInvalidParameter;
+    const uint32_t sampler_flags = version == 3 ? at.le32() : 0;   // (D3D12_SAMPLER_FLAGS: 1 integer border colour, 2 coordinates in texels)
+    if (!at.ok() || address_u < 1 || address_u > 5 || address_v < 1 || address_v > 5 || visibility > 5 || border > 4) return status::kInvalidParameter;
+    // (an integer border colour goes with its flag and the flag with it; no device takes coordinates in texels - the device reports
+    // NonNormalizedCoordinateSamplersSupported FALSE - so such a sampler is a root signature this adapter cannot have)
+    if ((sampler_flags & ~3u) || (sampler_flags & 2u) || ((border >= 3) != ((sampler_flags & 1u) != 0))) return status::kInvalidParameter;
     StaticSampler& s = out->samplers[i];
     // (the filter: bit 0 mip, bit 2 mag, bit 4 min; anisotropic filtering (0x55) and comparison filters are the linear ones)
     s.sampler.filter = (filter & 0x4) || filter == 0x55 || filter == 0xD5 ? graphics::Filter::Linear : graphics::Filter::Nearest;
     s.sampler.mip_filter = filter & 0x1 ? graphics::MipFilter::Linear : graphics::MipFilter::Nearest;
     s.sampler.address_u = address_of(address_u);
     s.sampler.address_v = address_of(address_v);
-    s.sampler.border = border == 1 ? graphics::BorderColor::OpaqueBlack : border == 2 ? graphics::BorderColor::OpaqueWhite : graphics::BorderColor::TransparentBlack;
+    // (the integer opaque black and white are (0, 0, 0, 1) and (1, 1, 1, 1) as integers: the same values as the float ones, which is what a lookup returns)
+    s.sampler.border = border == 1 || border == 3 ? graphics::BorderColor::OpaqueBlack : border == 2 || border == 4 ? graphics::BorderColor::OpaqueWhite : graphics::BorderColor::TransparentBlack;
     s.sampler.lod_bias = bias == bias && bias > -100.0f && bias < 100.0f ? bias : 0.0f;
     s.sampler.min_lod = min_lod == min_lod && min_lod > -100.0f && min_lod < 1000.0f ? min_lod : 0.0f;
     s.sampler.max_lod = max_lod == max_lod && max_lod > -100.0f && max_lod < 1000.0f ? max_lod : 1000.0f;

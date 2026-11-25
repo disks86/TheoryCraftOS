@@ -454,7 +454,9 @@ class Adapter::StreamRunner {
     // (which modes the adapter has: the average of a colour image, the first sample of a depth image, all of them with kFeatureResolveModes)
     const bool plain = depth ? mode == static_cast<uint32_t>(graphics::ResolveMode::Sample0) : mode == static_cast<uint32_t>(graphics::ResolveMode::Average);
     if (depth && !(adapter_.caps_.features & graphics::kFeatureDepthResolve)) return kBad;
-    if (!plain && !(adapter_.caps_.features & graphics::kFeatureResolveModes)) return kBad;
+    // (a colour image's least or greatest samples also with kFeature2ColorResolveModes)
+    const bool colour_extreme = !depth && (mode == static_cast<uint32_t>(graphics::ResolveMode::Min) || mode == static_cast<uint32_t>(graphics::ResolveMode::Max));
+    if (!plain && !(adapter_.caps_.features & graphics::kFeatureResolveModes) && !(colour_extreme && (adapter_.caps_.features2 & graphics::kFeature2ColorResolveModes))) return kBad;
     unbind_textures_of(to);
     if (!exec_) return status::kSuccess;
     NtStatus s = resident(*to);

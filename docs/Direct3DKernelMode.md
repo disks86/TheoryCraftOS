@@ -272,7 +272,11 @@ sixteenths of a pixel) it contains, depth and stencil are tested for each, the s
 `multisample` the pixel is all or nothing by its centre. Lines and points cover every sample. Occlusion queries count samples. The contents of a multisampled image do not survive being
 evicted from video memory (there is nothing to read them back into). virgl: resources with `nr_samples`, the rasterizer's multisample bit, and `VIRGL_CCMD_BLIT` for the resolve (the host
 keeps a multisampled image the GL way up whatever flag it was made with, so the blit turns the picture over only for a destination kept upright); 2 and 4 samples, as far as the host's
-`max_samples` goes. The conformance scene uses only vertical and horizontal edges, which every device with the standard patterns covers the same whatever the order of the samples.
+`max_samples` goes. The conformance scene uses only vertical and horizontal edges, which every device with the standard patterns covers the same whatever the order of the samples. The least and greatest
+samples of a colour image (`ResolveRegion`'s mode 2 / 3) are `kFeatureResolveModes` on the CPU renderer and, without the depth modes, `kFeature2ColorResolveModes`
+(1 << 16 of `features2`) on virgl, where the blit only averages: `extreme_resolve` draws a triangle over the destination with a pixel shader that fetches each sample of
+its pixel (TXF on the source's 2D_MSAA view, one made for it when the image is not sampled) and folds them with MIN or MAX; its shaders and states are made for the
+resolve and destroyed after it in the stream, and the next pass and draw set the state again.
 
 ## Geometry shaders
 
@@ -559,7 +563,7 @@ virgl, in more detail than above: the declaration goes with the last vertex-proc
 
 `src/Kernel/Dxgkrnl/D3d12.hpp` / `.cpp`. This is the *binding model* of Direct3D 12 on the existing devices; the command-list model, DXIL and resource heaps are not done (below).
 
-- **Root signatures**: `Kernel::create_root_signature(pid, device, blob, &handle)` parses what `D3D12SerializeRootSignature` writes (versions 1.0 and 1.1) or the `RTS0` chunk of a DXBC container: up to 16 parameters (a descriptor table of up to 8 ranges of SRV / UAV / CBV / sampler with offsets, "append" and an unbounded last range; 32-bit root constants; root CBV / SRV / UAV descriptors), 8 static samplers, 64 DWORDs in all. A table is of views or of samplers, never both. The parser is bounds-checked and has truncation and bit-flip tests.
+- **Root signatures**: `Kernel::create_root_signature(pid, device, blob, &handle)` parses what `D3D12SerializeRootSignature` writes (versions 1.0, 1.1 and 1.2) or the `RTS0` chunk of a DXBC container: up to 16 parameters (a descriptor table of up to 8 ranges of SRV / UAV / CBV / sampler with offsets, "append" and an unbounded last range; 32-bit root constants; root CBV / SRV / UAV descriptors), 8 static samplers, 64 DWORDs in all. A table is of views or of samplers, never both. The parser is bounds-checked and has truncation and bit-flip tests.
 - **Descriptor heaps**: `create_descriptor_heap(type, count <= 4096)` (views or samplers), `write_descriptor` (what `CreateShaderResourceView` and friends say: a texture, a buffer range as unordered access or constant buffer view, a sampler; the allocation is held by the heap), `copy_descriptors` (memmove semantics). A `kAllocConstantBuffer` allocation (16-byte multiples, system memory only, never resident) is what a constant buffer view names: the CPU reads it when a draw needs it.
 - **Stream ops** (`CommandStream.hpp`): `SetRootSignature`, `SetDescriptorHeaps` (one of each type), `SetRootConstants`, `SetRootDescriptor` (CBV / UAV; a buffer SRV is refused: no device has buffer shader resources), `SetRootTable`, `ResourceBarrier`. Root signature and heaps are named by handle and collected at queue time like pipelines (`Submission::signatures` / `heaps`).
 - **Lowering**: at each draw and dispatch the runner turns the root arguments into the bindings the devices have, through the same code as the plain ops, so the checks are the same: `b0` (root constants, a root CBV, or the CBV at b0 of a table) becomes the push constants (one constant buffer; any other register or a non-zero space is refused), `t<n>` texture unit *n* with the sampler `s<n>` (a sampler table, a static sampler, else `s0`, else the defaults; the pairing of a texture with a sampler is by register number), `u<n>` storage slot *n*. A descriptor that was never written leaves its unit unbound; every allocation a descriptor names has to be in the stream's allocation list (D3D12's residency list), else the draw is refused.
@@ -625,23 +629,53 @@ option `TCOS_RESOURCE_GLOBAL_SHARE`; `TcosD3D12OpenShared` takes one kind only).
 Direct3D 12's open in either runtime (`ID3D11Device5::OpenSharedFence`). Tested by tests/windows/d3dsharetest.c (two devices on the emulator; `ARGS=processes tests/d3d12_qemu.sh d3dsharetest` also a second process
 that inherits the handles).
 
-**The later interfaces** (`ID3D12Device1` .. `ID3D12Device10`, `ID3D12GraphicsCommandList1` .. `7`, `ID3D12Fence1`, `ID3D12Resource2`, `ID3D12Heap1`; every vtable slot
-has its method, `scripts/gen-dx-vtables.py` names the latest interface of each object). What each part does:
+**The later interfaces** (`ID3D12Device1` .. `ID3D12Device14`, `ID3D12GraphicsCommandList1` .. `10`, `ID3D12Fence1`, `ID3D12Resource2`, `ID3D12Heap1`; every vtable slot
+has its method, `scripts/gen-dx-vtables.py` names the latest interface of each object; what mingw's headers lack - root signature 1.2, `D3D12_SAMPLER_DESC2`, the
+later stream subobjects, `OPTIONS19` .. `21`, the GPU upload heap, `ID3D12Device11` .. `14` and `ID3D12GraphicsCommandList8` .. `10` - is in
+`src/Windows/d3d12/d3d12_types.h`, laid out as Microsoft's DirectX-Headers have it, which the generator and the test programs read too). What each part does:
 
 - `device1.inc`: the `*1`/`*2`/`*3` resource and heap creation (`D3D12_RESOURCE_DESC1`, initial layouts as states; protected sessions and castable formats refused with
   `E_INVALIDARG`), `GetResourceAllocationInfo1/2`, `GetCopyableFootprints1`, `CreateCommandList1` (a closed list), `CreateCommandQueue1`, residency
   (`SetResidencyPriority`, `EnqueueMakeResident` signals its fence), `SetEventOnMultipleFenceCompletion` (any or all, on a thread of its own), `RemoveDevice` (every fence
-  of the device signalled with `UINT64_MAX`), lifetime trackers, pipeline state streams (`CreatePipelineState`, `stream_parse`: the CD3DX12 defaults, duplicates refused),
-  `CheckDriverMatchingIdentifier`, and the later fence/resource/heap methods. What the device does not have answers what Direct3D 12 answers for it: no meta commands are
-  enumerated, state objects and protected sessions are `DXGI_ERROR_UNSUPPORTED`, the raytracing prebuild info is zeros.
+  of the device signalled with `UINT64_MAX`), lifetime trackers, pipeline state streams (`CreatePipelineState`, `stream_parse`: the CD3DX12 defaults, one subobject of
+  each kind - `DEPTH_STENCIL`/`1`/`2`, the three rasterizers, `ROOT_SIGNATURE` and `SERIALIZED_ROOT_SIGNATURE` are each one kind -; `DEPTH_STENCIL2`'s front and back
+  masks must match with the stencil test on, `IndependentFrontAndBackStencilRefMaskSupported` being FALSE; `RASTERIZER1/2`'s float depth bias is rounded to the
+  rasterizer state's integer; `RASTERIZER2`'s line mode is the multisample / antialiased-line pair it replaces, narrow quadrilateral lines `E_INVALIDARG`
+  (`NarrowQuadrilateralLinesSupported` FALSE); `SERIALIZED_ROOT_SIGNATURE` makes the root signature, which the pipeline keeps; `PSDB` and later types `E_INVALIDARG`;
+  `D3D12_PIPELINE_STATE_FLAG_DYNAMIC_DEPTH_BIAS` / `_DYNAMIC_INDEX_BUFFER_STRIP_CUT` `E_INVALIDARG`, `OPTIONS16` / `15` saying the device has neither),
+  `CheckDriverMatchingIdentifier`, and the later fence/resource/heap methods. `ID3D12Device11::CreateSampler2` (an integer border colour is the nearest of the three
+  colours, as a float one; coordinates in texels - `NonNormalizedCoordinateSamplersSupported` FALSE - and unknown flags leave the call out),
+  `ID3D12Device12::GetResourceAllocationInfo3` (castable formats: a size of ~0, `RelaxedFormatCastingSupported` FALSE), `ID3D12Device13::OpenExistingHeapFromAddress1`
+  (`DXGI_ERROR_UNSUPPORTED`, as the other existing-heap calls), `ID3D12Device14::CreateRootSignatureFromSubobjectInLibrary`. The `*3`/`*2` creation calls take initial
+  layouts as states (as `Barrier` needs none). GPU upload heaps (`D3D12_HEAP_TYPE_GPU_UPLOAD`, `OPTIONS16.GPUUploadHeapSupported`): buffers and textures the CPU maps and
+  the GPU writes, kept as a custom heap the CPU writes back is (the CPU's writes go up before a list runs, the GPU's come back after); `GetCustomHeapProperties` describes the
+  type as Windows does (write-combined, L1). What the device does not have answers what Direct3D 12 answers for it: no meta commands are enumerated, state objects and
+  protected sessions are `DXGI_ERROR_UNSUPPORTED`, the raytracing prebuild info is zeros.
 - `library.inc`: pipeline libraries (`ID3D12PipelineLibrary1`, a `TCOSPLB1` blob of names, kinds and FNV fingerprints of the descriptions: a load with another description or
   a name not stored is `E_INVALIDARG`, a foreign blob `D3D12_ERROR_DRIVER_VERSION_MISMATCH`) and shader cache sessions (`ID3D12ShaderCacheSession`, in memory or in a
-  `TCOSSCC1` file under `%LOCALAPPDATA%\D3DSCache`, `ShaderCacheControl` clearing the application's).
-- `rootsig.inc`: `D3D12CreateRootSignatureDeserializer` and `D3D12CreateVersionedRootSignatureDeserializer` (raw blobs and DXBC `RTS0` parts, bounds-checked; 1.0 to 1.1 makes
-  ranges and root descriptors volatile as Windows does, 1.1 to 1.0 drops the flags).
-- `cmdlist1.inc`: atomic buffer copies, `WriteBufferImmediate` (through an upload buffer of the list's), `ResolveSubresourceRegion` (average, least, greatest; a partial region
-  through a texture of the source's size), render passes (tier 0: targets bound, beginning-access clears, ending-access resolves), the enhanced barriers (nothing to
-  transition), and `ClearUnorderedAccessViewUint/Float` of buffer views (raw, structured and typed, each format's conversion). The calls of the features the device reports at
+  `TCOSSCC1` file under `%LOCALAPPDATA%\D3DSCache`, `ShaderCacheControl` clearing the application's). A session is a view of a store of the process: sessions of one
+  identifier, mode and file are one store (`CacheStore`), so what one stores the others find and a disk store's file has all of it; a second
+  `CreateShaderCacheSession` with the description of a session open on the same device gives that session, on another device a session of the same store, and with
+  another description (version, limits, flags) `DXGI_ERROR_ALREADY_EXISTS`. The store goes with its last session (and its file, when one asked with
+  `SetDeleteOnDestroy`).
+- `rootsig.inc`: the serializer (`D3D12SerializeRootSignature`, `D3D12SerializeVersionedRootSignature`) and deserializers (`D3D12CreateRootSignatureDeserializer`,
+  `D3D12CreateVersionedRootSignatureDeserializer`, `D3D12CreateVersionedRootSignatureDeserializerFromSubobjectInLibrary`) of versions 1.0, 1.1 and 1.2 (version word 3:
+  1.1 with static samplers of 56 bytes, `D3D12_SAMPLER_FLAGS` last). Raw blobs, DXBC `RTS0` parts, and the `GlobalRootSignature` / `LocalRootSignature` subobjects of a DXIL
+  library's `RDAT` part (version 0x10: the string buffer, raw bytes and subobject table parts; `tests/data/dxbc/rootsig_lib.dxbc` is dxc's `lib_6_3` of
+  `rootsig_lib.hlsl`), everything bounds-checked (truncation and bit-flip cases in d3d12test and DxgkrnlTest). Every version is read into the 1.2 form and each version's
+  description made from it: 1.0 to 1.1 / 1.2 makes ranges and root descriptors volatile as Windows does, to 1.0 the flags are dropped, a 1.2 static sampler with flags has
+  no 1.0 / 1.1 description (`E_INVALIDARG`). The serializer refuses a border colour outside the five, the integer ones before 1.2 or without
+  `D3D12_SAMPLER_FLAG_UINT_BORDER_COLOR` (and the flag without them), unknown flags. The kernel (`D3d12.cpp parse_root_signature`) takes 1.2: the integer opaque black and
+  white are the float ones' values; a sampler of coordinates in texels is refused (`NonNormalizedCoordinateSamplersSupported` is FALSE), so `CreateRootSignature` is
+  `E_INVALIDARG` for it. `D3D12_FEATURE_ROOT_SIGNATURE` answers 1.2.
+- `cmdlist1.inc`: atomic buffer copies, `WriteBufferImmediate` (through an upload buffer of the list's), `ResolveSubresourceRegion` (average, least, greatest into any
+  subresource, with a rectangle and an offset: the whole image into a plain texture of its size in place; anything else through a texture of the source's size, copied
+  straight into a plain texture or through a buffer of the list's into a level or layer; `DECOMPRESS` has nothing to do, the sampler feedback modes are left out -
+  `SamplerFeedbackTier` NOT_SUPPORTED -, as is a region outside the source or the destination), render passes (tier 0: targets bound, beginning-access clears,
+  ending-access resolves), the enhanced barriers (`ID3D12GraphicsCommandList7::Barrier`, `OPTIONS12.EnhancedBarriersSupported`: layouts and accesses need no transition;
+  a placed resource whose access after is `NO_ACCESS` goes out of use as with an aliasing barrier - its bytes written to the heap's memory and the allocations sharing
+  them marked to take them up), `ID3D12GraphicsCommandList8::OMSetFrontAndBackStencilRef` (one reference for both faces), `List9::RSSetDepthBias` /
+  `IASetIndexBufferStripCutValue` and `List10::SetProgram` / `DispatchGraph` (features at "not supported": left out), and `ClearUnorderedAccessViewUint/Float` of buffer views (raw, structured and typed, each format's conversion). The calls of the features the device reports at
   the "not supported" tier (depth bounds, sample positions, view instancing, meta commands, raytracing, shading rate, mesh shaders) are calls a program may not make here.
 - `resource.inc`: textures in custom heaps the CPU sees (`D3D12_CPU_PAGE_PROPERTY_WRITE_BACK` / `WRITE_COMBINE`, the driver's layout), `Map` with no pointer and
   `WriteToSubresource` / `ReadFromSubresource`, which lock the kernel's image of the subresource (a plane of a planar texture's slice, a slice of a packed YUV array; the
@@ -654,13 +688,22 @@ Not done, in the order a program is likely to meet them: texture formats of fewe
 kernel refuses the combination); rendering into a mip level; unordered access to cubes, to mipmapped arrays and volumes (the kernel keeps one level of them), to narrow
 arrays or narrow textures with levels, to typed buffers; `CopyResource` of arrays, volumes and textures with levels; depth bias
 and back-face stencil state; dual-source blending (`SRC1_*` factors: the pipeline is refused with `DXGI_ERROR_UNSUPPORTED`); several viewports; more than four unordered
-access buffers; pipeline statistics queries from the DLL; shared resources across adapters (`D3D12_HEAP_FLAG_SHARED_CROSS_ADAPTER`,
-`D3D12_FENCE_FLAG_SHARED_CROSS_ADAPTER`: `DXGI_ERROR_UNSUPPORTED`); the blend factor on Vega and the other fixed backends; ray tracing,
-mesh shaders, variable rate shading, view instancing, sampler feedback, protected sessions and meta commands (reported unsupported); `ResolveSubresourceRegion` into a
-subresource other than 0 and the least / greatest colour resolves on virgl (its resolves are averages: the call is left out there); typed UAV clears of formats outside
-`g_uav_formats` (R11G11B10, B5G6R5 ...); root signature version 1.2 and the pipeline-stream subobjects of the later Agility SDKs (`DEPTH_STENCIL2`, `RASTERIZER1/2`,
-serialized root signatures: `E_INVALIDARG`); two shader cache sessions of one identifier are two stores (the later file write wins); and all of it on the GPU backends
-other than virgl.
+access buffers; pipeline statistics queries from the DLL; heaps and textures shared across adapters (`D3D12_HEAP_FLAG_SHARED_CROSS_ADAPTER`: `DXGI_ERROR_UNSUPPORTED`,
+`CrossAdapterRowMajorTextureSupported` FALSE: an allocation is of one adapter's memory manager, and sharing one needs a backing both adapters' memory managers keep coherent
+at the fences - read back after one adapter's work, uploaded before the other's -, which `VidMm` does not have; fences shared across adapters are done, the kernel's
+synchronization objects being of no adapter); the blend factor on Vega and the other fixed backends; ray tracing, mesh shaders, variable rate shading, view instancing,
+sampler feedback, work graphs, protected sessions and meta commands (reported unsupported - see below); a depth image's average, least and greatest resolves on virgl
+(the host's blit takes sample 0, and its multisampled depth buffers are attachments a shader does not read); typed UAV clears of formats outside `g_uav_formats`
+(R11G11B10, B5G6R5 ...); a float depth bias and front and back stencil masks of their own from `RASTERIZER1/2` and `DEPTH_STENCIL2` (the pipeline's state has one integer
+bias and one pair of masks); and all of it on the GPU backends other than virgl.
+
+What the Shader Model 6 features would take (the DXIL front end, `DxilTranslate.cpp`, translates one entry function of vertex, pixel, geometry, hull, domain and compute
+shaders into Shader Model 5 tokens): **ray tracing** - DXIL libraries of many entry functions and their `RDAT` (the root signature subobjects are read already),
+state objects and shader tables, acceleration structures built on the device (a BVH in a buffer), and `TraceRay` / `ReportHit` / `CallShader` lowered into a compute
+program with a traversal loop and the hit groups called as functions (inline ray queries, `RayQuery`, are the smaller first step); **mesh and amplification shaders** -
+the two stages translated and run as compute dispatches whose output primitives feed an indirect draw; **variable rate shading** - coarse pixel shading in the CPU
+renderer, and nothing on virgl (the host's GL has no shading-rate extension through virglrenderer); **sampler feedback** - `WriteSamplerFeedback` writing MinMip and
+MipRegionUsed maps (opaque formats) from the sampler's footprint; **work graphs** - node shaders and a scheduler of records between dispatches.
 
 ### The other GPU backends and feature level 11_0
 

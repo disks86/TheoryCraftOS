@@ -47,31 +47,45 @@ static void STDMETHODCALLTYPE list_SetSamplePositions(CmdList *l, UINT samples, 
 /* (ViewInstancingTier: not supported; a mask of the one view is all there is) */
 static void STDMETHODCALLTYPE list_SetViewInstanceMask(CmdList *l, UINT mask) { (void)l; (void)mask; }
 
-/* A region of a multisampled texture's samples into a texture: averaged, or the least or greatest of each pixel's (the kernel's resolve modes). A region of all of
- * it at (0, 0) is resolved in place; another goes into a texture of the source's size first, and the region is copied from there. */
+/* A region of a multisampled texture's samples into a subresource of a texture, at (x, y): averaged, or the least or greatest of each pixel's (the kernel's resolve
+ * modes). The whole of it at (0, 0) of a plain texture of its size (one level, one layer) is resolved in place. Anything else is resolved into a texture of the
+ * source's size first and the region copied from there: straight into a plain texture, or through a buffer of the list's into a level or layer of a texture with
+ * several (the kernel copies buffers to any level and layer). DECOMPRESS resolves in place, and nothing is compressed here, so there is nothing to do; the sampler
+ * feedback modes need SamplerFeedbackTier, which is NOT_SUPPORTED. A call outside the rules (a subresource that is not there, a region outside the source or the
+ * destination, a mode the adapter has not) is left out, as Direct3D 12 leaves out an invalid call. */
 static void STDMETHODCALLTYPE list_ResolveSubresourceRegion(CmdList *l, ID3D12Resource *dst, UINT dst_sub, UINT x, UINT y, ID3D12Resource *src, UINT src_sub, D3D12_RECT *rect,
                                                             DXGI_FORMAT format, D3D12_RESOLVE_MODE mode) {
   Resource *d = (Resource *)dst, *s = (Resource *)src;
-  if (!d || !s || l->bundle || dst_sub || src_sub) return;
-  if (mode == D3D12_RESOLVE_MODE_DECOMPRESS) return;      /* (nothing is compressed: decompressing in place changes nothing) */
-  if (mode != D3D12_RESOLVE_MODE_AVERAGE && mode != D3D12_RESOLVE_MODE_MIN && mode != D3D12_RESOLVE_MODE_MAX) return;      /* (no sampler feedback) */
-  if (s->desc.SampleDesc.Count < 2 || d->desc.SampleDesc.Count > 1) return;
+  (void)format;      /* (the resources' own formats: a typeless resource is not made here) */
+  if (!d || !s || l->bundle) return;
+  if (mode == D3D12_RESOLVE_MODE_DECOMPRESS) return;
+  if (mode != D3D12_RESOLVE_MODE_AVERAGE && mode != D3D12_RESOLVE_MODE_MIN && mode != D3D12_RESOLVE_MODE_MAX) return;
+  if (s->desc.SampleDesc.Count < 2 || d->desc.SampleDesc.Count > 1 || d->planes || d->desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D) return;
+  if (src_sub >= res_subresources(s) || dst_sub >= res_subresources(d)) return;      /* (a multisampled texture has one subresource here) */
   const UINT kmode = mode == D3D12_RESOLVE_MODE_AVERAGE ? 0 : mode == D3D12_RESOLVE_MODE_MIN ? 2 : 3;
   const int depth = (s->desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL) != 0;
-  /* (a mode the adapter does not have - a colour image's least or greatest samples, any of a depth image's three - is a call this device does not take, as an invalid
-   * call is left out: the kernel's resolves without kFeatureResolveModes are a colour image's average and a depth image's sample 0) */
+  /* (a mode the adapter does not have - a colour image's least or greatest samples, any of a depth image's three - is a call this device does not take: the kernel's
+   * resolves without kFeatureResolveModes are a colour image's average and a depth image's sample 0) */
   const UINT features = l->d.dev->caps.features;
-  if ((depth || kmode != 0) && !(features & DEV_FEATURE_RESOLVE_MODES)) return;
+  const BOOL colour_extremes = (features & DEV_FEATURE_RESOLVE_MODES) || (l->d.dev->caps.features2 & DEV_FEATURE2_COLOR_RESOLVE_MODES);
+  if (depth ? !(features & DEV_FEATURE_RESOLVE_MODES) : kmode != 0 && !colour_extremes) return;
   if (depth && !(features & DEV_FEATURE_DEPTH_RESOLVE)) return;
   const LONG w = (LONG)s->desc.Width, h = (LONG)s->desc.Height;
-  const BOOL whole = (!rect || (rect->left == 0 && rect->top == 0 && rect->right == w && rect->bottom == h)) && x == 0 && y == 0 && d->desc.Width == s->desc.Width &&
-                     d->desc.Height == s->desc.Height;
+  const D3D12_RECT whole_rect = {0, 0, w, h};
+  const D3D12_RECT r = rect ? *rect : whole_rect;
+  if (r.left < 0 || r.top < 0 || r.right > w || r.bottom > h || r.left >= r.right || r.top >= r.bottom) return;
+  UINT level, layer;
+  sub_split(d, dst_sub, &level, &layer);
+  const UINT dw = (UINT)(d->desc.Width >> level) ? (UINT)(d->desc.Width >> level) : 1, dh = (d->desc.Height >> level) ? (d->desc.Height >> level) : 1;
+  const UINT rw = (UINT)(r.right - r.left), rh = (UINT)(r.bottom - r.top);
+  if (x > dw || rw > dw - x || y > dh || rh > dh - y) return;
+  const BOOL plain = d->mips == 1 && d->kind == 0;
+  const BOOL direct = plain && x == 0 && y == 0 && r.left == 0 && r.top == 0 && r.right == w && r.bottom == h && d->desc.Width == s->desc.Width && d->desc.Height == s->desc.Height;
   keep(l, (IUnknown *)dst);
   keep(l, (IUnknown *)src);
   ID3D12Resource *target = dst;
   Resource *temp = NULL;
-  if (!whole) {
-    if (rect && (rect->left < 0 || rect->top < 0 || rect->right > w || rect->bottom > h || rect->left >= rect->right || rect->top >= rect->bottom)) return;
+  if (!direct) {
     D3D12_RESOURCE_DESC td = s->desc;
     td.SampleDesc.Count = 1;
     td.SampleDesc.Quality = 0;
@@ -88,11 +102,30 @@ static void STDMETHODCALLTYPE list_ResolveSubresourceRegion(CmdList *l, ID3D12Re
   ensure_room(l, 64, 4);
   UINT payload[3] = {alloc_index(l, t->alloc), alloc_index(l, s->alloc), kmode};
   packet(l, OP_RESOLVE_REGION, payload, 3);
-  if (!whole) {
-    D3D12_TEXTURE_COPY_LOCATION to = {dst, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, {.SubresourceIndex = 0}}, from = {target, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, {.SubresourceIndex = 0}};
-    const D3D12_BOX box = {rect ? (UINT)rect->left : 0, rect ? (UINT)rect->top : 0, 0, rect ? (UINT)rect->right : (UINT)w, rect ? (UINT)rect->bottom : (UINT)h, 1};
+  if (direct) return;
+  const D3D12_BOX box = {(UINT)r.left, (UINT)r.top, 0, (UINT)r.right, (UINT)r.bottom, 1};
+  D3D12_TEXTURE_COPY_LOCATION from = {target, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, {.SubresourceIndex = 0}};
+  if (plain) {
+    D3D12_TEXTURE_COPY_LOCATION to = {dst, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, {.SubresourceIndex = dst_sub}};
     list_CopyTextureRegion(l, &to, x, y, 0, &from, &box);
+    return;
   }
+  /* (a level or layer: the resolved texture into a buffer, and the region from there into the subresource) */
+  D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp;
+  UINT64 total = 0;
+  get_footprints(&t->desc, 0, 1, 0, &fp, NULL, NULL, &total);
+  if (!total || total == ~(UINT64)0) return;
+  const D3D12_RESOURCE_DESC bd = {D3D12_RESOURCE_DIMENSION_BUFFER, 0, KALIGN(total, 256), 1, 1, 1, DXGI_FORMAT_UNKNOWN, {1, 0}, D3D12_TEXTURE_LAYOUT_ROW_MAJOR, D3D12_RESOURCE_FLAG_NONE};
+  const D3D12_HEAP_PROPERTIES bprops = {D3D12_HEAP_TYPE_DEFAULT, D3D12_CPU_PAGE_PROPERTY_UNKNOWN, D3D12_MEMORY_POOL_UNKNOWN, 1, 1};
+  Resource *staging = NULL;
+  if (FAILED(resource_make(l->d.dev, &bprops, D3D12_HEAP_FLAG_NONE, &bd, NULL, 0, 0, &staging))) return;
+  const int kept_staging = keep(l, (IUnknown *)staging);
+  dx_Release(OBJ(staging));
+  if (!kept_staging) return;
+  D3D12_TEXTURE_COPY_LOCATION buffer = {(ID3D12Resource *)staging, D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, {.PlacedFootprint = fp}};
+  list_CopyTextureRegion(l, &buffer, 0, 0, 0, &from, NULL);
+  D3D12_TEXTURE_COPY_LOCATION to = {dst, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, {.SubresourceIndex = dst_sub}};
+  list_CopyTextureRegion(l, &to, x, y, 0, &buffer, &box);
 }
 
 /* ---- ID3D12GraphicsCommandList2: WriteBufferImmediate ------------------------------------------------------------------------------------------------------------ */
@@ -226,9 +259,34 @@ static void STDMETHODCALLTYPE list_RSSetShadingRate(CmdList *l, D3D12_SHADING_RA
 static void STDMETHODCALLTYPE list_RSSetShadingRateImage(CmdList *l, ID3D12Resource *image) { (void)l; (void)image; }
 /* (MeshShaderTier: not supported) */
 static void STDMETHODCALLTYPE list_DispatchMesh(CmdList *l, UINT x, UINT y, UINT z) { (void)l; (void)x; (void)y; (void)z; }
-/* The enhanced barriers: the kernel's allocations are not state tracked (as with ResourceBarrier), so there is no transition to make; a layout of UNDEFINED discards,
- * which leaves the contents as they are. */
-static void STDMETHODCALLTYPE list_Barrier(CmdList *l, UINT32 count, const D3D12_BARRIER_GROUP *groups) { (void)l; (void)count; (void)groups; }
+/* The enhanced barriers. The kernel's allocations are not state tracked (as with ResourceBarrier), so layouts and accesses need no transition, and a layout of
+ * UNDEFINED discards (the contents are not kept, which is what the kernel does anyway). What does need doing is aliasing: a placed resource whose access after the
+ * barrier is NO_ACCESS goes out of use, which Direct3D 12's enhanced barriers say instead of an aliasing barrier - the kernel's aliasing barrier with that resource
+ * going out and none named coming in (ResourceBarrier's: what the GPU holds of it is written to the heap's memory and every allocation sharing those bytes is
+ * marked to take them up on its next use). A resource coming into use (access before NO_ACCESS) needs nothing more: the outgoing one's barrier did the work. */
+static void barrier_alias_out(CmdList *l, ID3D12Resource *resource) {
+  Resource *r = (Resource *)resource;
+  if (!r || !r->heap) return;      /* (a committed resource shares its bytes with nothing) */
+  D3D12_RESOURCE_BARRIER b;
+  memset(&b, 0, sizeof b);
+  b.Type = D3D12_RESOURCE_BARRIER_TYPE_ALIASING;
+  b.Aliasing.pResourceBefore = resource;
+  b.Aliasing.pResourceAfter = NULL;
+  list_ResourceBarrier(l, 1, &b);
+}
+static void STDMETHODCALLTYPE list_Barrier(CmdList *l, UINT32 count, const D3D12_BARRIER_GROUP *groups) {
+  if (!groups) return;
+  for (UINT32 g = 0; g < count; ++g) {
+    const D3D12_BARRIER_GROUP *group = &groups[g];
+    if (group->Type == D3D12_BARRIER_TYPE_TEXTURE && group->pTextureBarriers) {
+      for (UINT32 i = 0; i < group->NumBarriers; ++i)
+        if (group->pTextureBarriers[i].AccessAfter == D3D12_BARRIER_ACCESS_NO_ACCESS) barrier_alias_out(l, group->pTextureBarriers[i].pResource);
+    } else if (group->Type == D3D12_BARRIER_TYPE_BUFFER && group->pBufferBarriers) {
+      for (UINT32 i = 0; i < group->NumBarriers; ++i)
+        if (group->pBufferBarriers[i].AccessAfter == D3D12_BARRIER_ACCESS_NO_ACCESS) barrier_alias_out(l, group->pBufferBarriers[i].pResource);
+    }
+  }
+}
 
 /* ---- clearing unordered access views ------------------------------------------------------------------------------------------------------------------------------ */
 /* A buffer's range (the view's elements), filled with the value: Uint writes each 32-bit word (raw and structured views) or each element of a typed view's format;
@@ -409,3 +467,19 @@ static void uav_clear_list(CmdList *l, D3D12_CPU_DESCRIPTOR_HANDLE cpu, ID3D12Re
     packet(l, OP_COPY_BUFFER, w, 5);
   }
 }
+
+/* ---- ID3D12GraphicsCommandList8 .. 10 ------------------------------------------------------------------------------------------------------------------------------- */
+
+/* OMSetFrontAndBackStencilRef: one reference for both faces here (IndependentFrontAndBackStencilRefMaskSupported is FALSE, OPTIONS14: a program gives the two the same
+ * value), so the front one is the list's stencil reference. */
+static void STDMETHODCALLTYPE list_OMSetFrontAndBackStencilRef(CmdList *l, UINT front, UINT back) {
+  (void)back;
+  list_OMSetStencilRef(l, front);
+}
+/* RSSetDepthBias / IASetIndexBufferStripCutValue: the state of a pipeline made with D3D12_PIPELINE_STATE_FLAG_DYNAMIC_DEPTH_BIAS / _DYNAMIC_INDEX_BUFFER_STRIP_CUT, which
+ * this device refuses (DynamicDepthBiasSupported, DynamicIndexBufferStripCutSupported are FALSE, OPTIONS16 / 15): calls a program may not make here, left out. */
+static void STDMETHODCALLTYPE list_RSSetDepthBias(CmdList *l, FLOAT bias, FLOAT clamp, FLOAT slope) { (void)l; (void)bias; (void)clamp; (void)slope; }
+static void STDMETHODCALLTYPE list_IASetIndexBufferStripCutValue(CmdList *l, D3D12_INDEX_BUFFER_STRIP_CUT_VALUE value) { (void)l; (void)value; }
+/* SetProgram / DispatchGraph: work graphs (WorkGraphsTier is NOT_SUPPORTED, OPTIONS21: no program can be made to set) - left out. */
+static void STDMETHODCALLTYPE list_SetProgram(CmdList *l, const D3D12_SET_PROGRAM_DESC *desc) { (void)l; (void)desc; }
+static void STDMETHODCALLTYPE list_DispatchGraph(CmdList *l, const D3D12_DISPATCH_GRAPH_DESC *desc) { (void)l; (void)desc; }

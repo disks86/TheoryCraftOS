@@ -815,6 +815,8 @@ enum DeviceFeature2 : uint32_t {
   kFeature2StorageImagesInDraws = 1u << 1,  // ... also bound inside passes and read and written by pixel shaders (FragmentContext::images): they run for every fragment the rasterizer makes
   kFeature2LayeredTargets = 1u << 2,        // colour and depth attachments that are arrays, volumes or cubes (one level), RenderPassBegin::first_layer / layer_count, ShaderIo::layer from geometry shaders
   kFeature2SingleChannelFormats = 1u << 3,  // Format::R32Uint, R32Sint, R32Float: render targets, textures and storage images (the integer ones with atomics)
+  // (a bit of its own, away from the low ones, so that the bits added beside it do not meet it)
+  kFeature2ColorResolveModes = 1u << 16,    // resolve_image of a colour image with ResolveMode::Min / Max (what kFeatureResolveModes has, without the depth modes)
 };
 
 
